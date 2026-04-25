@@ -270,42 +270,77 @@ func (m *Manager) DetachXDP(ifindex int) error {
 }
 
 // setXDPAttachedFlag sets or clears IFACE_FLAG_XDP_ATTACHED on every
-// iface_zone_map entry whose key.Ifindex matches.
+// iface_zone_map entry that represents the same ingress surface as
+// the XDP attachment described by ifindex.
 //
-// xpf attaches XDP only to physical ifindexes (PFs, virtio NICs);
-// the compiler at pkg/dataplane/compiler_iface.go writes
-// iface_zone_map entries keyed by {parent_ifindex, vlan_id} for
-// every VLAN sub-interface of that parent. Iterating by
-// `key.Ifindex == ifindex` therefore covers BOTH the native-VLAN
-// entry (vlan_id=0) AND every VLAN sub-iface entry derived from this
-// physical parent — which is exactly what tc_main needs to gate the
-// tunnel-egress bypass for both untagged and VLAN-tagged ingress
-// (after vlan_iface_map resolution).
+// xpf attaches XDP to two kinds of ifindexes:
+//   - Physical ifindexes (native-mode XDP on PFs, virtio NICs). The
+//     compiler writes iface_zone_map entries keyed by
+//     {phys_ifindex, vlan_id} for every VLAN sub-interface of that
+//     parent. Iterating by `key.Ifindex == phys_ifindex` covers the
+//     native-VLAN entry AND every VLAN sub-iface entry.
+//   - VLAN sub-iface ifindexes (generic-mode XDP on `enpXsY.VLAN`
+//     when the parent went generic — see pkg/dataplane/compiler.go
+//     for the fallback rules). The sub-iface itself has no
+//     iface_zone_map entry; the entry is keyed under the PARENT
+//     physical ifindex plus the VLAN ID. Resolve sub→parent via
+//     vlan_iface_map and flag the {parent, vlan_id} entry.
 //
-// If a future configuration ever attached XDP to a VLAN sub-iface
-// directly, no iface_zone_map entry would match key.Ifindex ==
-// sub_ifindex, the flag would never get set, and the tc_main bypass
-// would deny — packets get full screen/conntrack treatment, which is
-// safe (more enforcement, not less) but loses the optimization.
+// Without the sub→parent resolution, AttachXDP on a VLAN sub-iface
+// would set the flag on no entries → tc_main's tunnel-egress bypass
+// would never fire for that ingress surface (incorrectly denied —
+// not a security bug but defeats the optimization #863 enables for
+// legitimate XDP-validated traffic).
 //
 // Iterator and per-entry Update errors are logged at WARN. The flag
-// is best-effort (a leftover stale flag after DetachXDP only matters
-// if the same ifindex is re-bound to a different XDP program later;
-// the next AttachXDP/SetZone re-establishes the correct value), so
-// we don't fail the surrounding operation.
+// is best-effort: a stale flag after a failed DetachXDP clear leaves
+// tc_main treating the now-detached ingress as XDP-validated until
+// the next AttachXDP or SetZone re-establishes the correct value.
+// In practice the iface_zone_map is BPF-kernel-managed (no I/O), so
+// updates rarely fail; the WARN is a breadcrumb for the operator
+// who notices unexpected bypass behavior.
 func (m *Manager) setXDPAttachedFlag(ifindex int, attached bool) {
 	zm, ok := m.maps["iface_zone_map"]
 	if !ok {
 		return
 	}
-	var key IfaceZoneKey
-	var val IfaceZoneValue
-	iter := zm.Iterate()
 	type kv struct {
 		k IfaceZoneKey
 		v IfaceZoneValue
 	}
 	var updates []kv
+
+	// Resolve sub→parent: if ifindex is a VLAN sub-iface, the entry
+	// to flag lives at {parent_ifindex, vlan_id}.
+	if vmap, ok := m.maps["vlan_iface_map"]; ok {
+		var vinfo VlanIfaceInfo
+		if err := vmap.Lookup(uint32(ifindex), &vinfo); err == nil {
+			parentKey := IfaceZoneKey{Ifindex: vinfo.ParentIfindex, VlanID: vinfo.VlanID}
+			var pv IfaceZoneValue
+			if err := zm.Lookup(parentKey, &pv); err == nil {
+				newFlags := pv.Flags
+				if attached {
+					newFlags |= IfaceFlagXDPAttached
+				} else {
+					newFlags &^= IfaceFlagXDPAttached
+				}
+				if newFlags != pv.Flags {
+					pv.Flags = newFlags
+					updates = append(updates, kv{k: parentKey, v: pv})
+				}
+			}
+		}
+	}
+
+	// Flag every entry whose Key.Ifindex matches the AttachXDP
+	// ifindex. For a physical ifindex this covers the native-VLAN
+	// entry (vlan_id=0) and every {phys, vlan_id} VLAN sub-iface
+	// entry. For a VLAN sub-iface ifindex this loop typically finds
+	// nothing (entries are keyed under the parent), but we iterate
+	// in case a future schema change introduces sub-iface entries.
+	var key IfaceZoneKey
+	var val IfaceZoneValue
+	iter := zm.Iterate()
 	for iter.Next(&key, &val) {
 		if key.Ifindex != uint32(ifindex) {
 			continue
