@@ -703,6 +703,32 @@ nat_pool_alloc_deterministic_v6(__u8 pool_id, __u8 *src_v6,
 }
 
 /*
+ * #871: Wrap a REJECT builder's XDP_TX result with a post-call VLAN
+ * tag push. Builders rebuild an UNTAGGED Ethernet frame; if the
+ * original packet arrived on a VLAN sub-interface (vlan_present),
+ * the reply must carry that tag or the egress wire never receives it
+ * (REJECT silently degrades to DROP). Push happens AFTER the builder
+ * returns, in the caller's frame — keeps the builder's stack budget
+ * untouched and the new chain `caller -> xdp_vlan_tag_push` is
+ * separate from the existing `caller -> builder` chain.
+ *
+ * Usage: return reject_with_vlan(ctx, meta, send_tcp_rst_v4(ctx, meta));
+ */
+static __always_inline int
+reject_with_vlan(struct xdp_md *ctx, struct pkt_meta *meta, int ret)
+{
+	if (ret != XDP_TX)
+		return ret;
+	if (!meta->ingress_vlan_present)
+		return ret;
+	if (xdp_vlan_tag_push(ctx, meta->ingress_vlan_id) < 0) {
+		inc_counter(GLOBAL_CTR_VLAN_PUSH_FAIL);
+		return XDP_DROP;
+	}
+	return XDP_TX;
+}
+
+/*
  * Send a TCP RST reply for IPv4 REJECT action.
  * Swaps MACs, IPs, ports, sets RST flag, recomputes checksums.
  * Returns XDP_TX to send the packet back out the ingress interface.
@@ -1872,9 +1898,11 @@ int xdp_policy_prog(struct xdp_md *ctx)
 			/* TCP: send RST */
 			if (meta->protocol == PROTO_TCP) {
 				if (meta->addr_family == AF_INET)
-					return send_tcp_rst_v4(ctx, meta);
+					return reject_with_vlan(ctx, meta,
+						send_tcp_rst_v4(ctx, meta));
 				else
-					return send_tcp_rst_v6(ctx, meta);
+					return reject_with_vlan(ctx, meta,
+						send_tcp_rst_v6(ctx, meta));
 			}
 			/*
 			 * RFC 792/4443: never send ICMP error about ICMP error.
@@ -1892,9 +1920,11 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				return XDP_DROP;
 			/* Send ICMP unreachable for UDP, ICMP queries, etc. */
 			if (meta->addr_family == AF_INET)
-				return send_icmp_unreach_v4(ctx, meta);
+				return reject_with_vlan(ctx, meta,
+					send_icmp_unreach_v4(ctx, meta));
 			else
-				return send_icmp_unreach_v6(ctx, meta);
+				return reject_with_vlan(ctx, meta,
+					send_icmp_unreach_v6(ctx, meta));
 		}
 
 		/* Zone tcp-rst: send RST for non-SYN TCP without session */
@@ -1905,9 +1935,11 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				bpf_map_lookup_elem(&zone_configs, &zk);
 			if (zc && zc->tcp_rst) {
 				if (meta->addr_family == AF_INET)
-					return send_tcp_rst_v4(ctx, meta);
+					return reject_with_vlan(ctx, meta,
+						send_tcp_rst_v4(ctx, meta));
 				else
-					return send_tcp_rst_v6(ctx, meta);
+					return reject_with_vlan(ctx, meta,
+						send_tcp_rst_v6(ctx, meta));
 			}
 		}
 		return XDP_DROP;
@@ -1947,9 +1979,11 @@ int xdp_policy_prog(struct xdp_md *ctx)
 			bpf_map_lookup_elem(&zone_configs, &zk);
 		if (zc && zc->tcp_rst) {
 			if (meta->addr_family == AF_INET)
-				return send_tcp_rst_v4(ctx, meta);
+				return reject_with_vlan(ctx, meta,
+					send_tcp_rst_v4(ctx, meta));
 			else
-				return send_tcp_rst_v6(ctx, meta);
+				return reject_with_vlan(ctx, meta,
+					send_tcp_rst_v6(ctx, meta));
 		}
 	}
 	return XDP_DROP;
