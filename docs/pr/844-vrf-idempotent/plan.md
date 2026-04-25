@@ -1,5 +1,13 @@
 # #844 Idempotent VRF reconcile in applyConfig
 
+> **Note (post-#847):** This plan documented an earlier "external
+> VRFs are left strictly alone" model. PR #847 superseded that with
+> a namespace-claim policy: xpfd now reaps any orphan `vrf-*` device
+> that is neither in `desired` nor in `m.vrfs`. The current contract
+> is in the godoc on `routing.ReconcileVRFs`. The historical text
+> below is preserved for context but is NO longer the operative
+> behavior.
+
 ## Problem (see #844 for full repro)
 
 Each call to `applyConfig` in `pkg/daemon/daemon.go`:

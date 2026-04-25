@@ -118,8 +118,10 @@ func (m *Manager) CreateVRF(name string, tableID int) error {
 }
 
 // createVRFLocked creates a VRF and appends it to m.vrfs. Caller must
-// hold vrfsMu. External VRFs (already present) are left alone and not
-// adopted into m.vrfs.
+// hold vrfsMu. If the named VRF already exists in the kernel,
+// createVRFLocked leaves it alone and does NOT adopt it into m.vrfs
+// (this single-VRF helper is a fast path; ReconcileVRFs is the
+// adoption / orphan-reap entry point per the namespace-claim policy).
 func (m *Manager) createVRFLocked(name string, tableID int) error {
 	vrfName := "vrf-" + name
 	if existing, err := m.nlHandle.LinkByName(vrfName); err == nil {

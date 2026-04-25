@@ -1721,8 +1721,12 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) {
 	// namespace — orphan vrf-* devices not in desired and not in
 	// m.vrfs (e.g. left over from a routing-instance rename across
 	// a daemon restart) are also reaped. Operators MUST NOT
-	// pre-create vrf-<name> outside xpfd config. See
-	// docs/pr/844-vrf-idempotent/plan.md.
+	// pre-create vrf-<name> outside xpfd config.
+	//
+	// (The original docs/pr/844-vrf-idempotent/plan.md described an
+	// earlier design where external VRFs were left alone; the
+	// namespace-claim policy in this code supersedes that plan. See
+	// the godoc on routing.ReconcileVRFs for the current contract.)
 	const mgmtVRFName = "mgmt"
 	const mgmtTableID = 999
 	mgmtIfaces := make(map[string]bool)
