@@ -239,6 +239,18 @@ func applyRSSIndirectionOne(iface string, workers int, execer rssExecutor) {
 	if weights == nil {
 		slog.Info("linksetup: rss indirection skipped", "iface", iface,
 			"workers", workers, "queues", queues, "reason", reason)
+		// #805: When workers >= queues > 1 we previously left the
+		// indirection table alone. That's correct on a fresh install
+		// (kernel default is round-robin = what we want) but wrong on
+		// the workers<queues → workers>=queues transition, where a
+		// concentrated `[1,...,1,0,...,0]` table written by an earlier
+		// applyRSSIndirectionOne for the prior worker count stays live
+		// and starves queues that now host worker-bound AF_XDP sockets.
+		// Inspect the live table; if it isn't the round-robin default,
+		// restore it.
+		if workers > 1 && workers >= queues && queues > 0 {
+			maybeRestoreDefault(iface, queues, execer)
+		}
 		return
 	}
 
@@ -281,6 +293,96 @@ func applyRSSIndirectionOne(iface string, workers int, execer rssExecutor) {
 	slog.Info("linksetup: applied rss indirection",
 		"iface", iface, "workers", workers, "queues", len(weights),
 		"weights", weights)
+}
+
+// maybeRestoreDefault reads the live RSS indirection table and, if it
+// is not the kernel's default round-robin shape, runs
+// `ethtool -X <iface> default` to restore it. Used on the
+// workers >= queues skip path (#805) to undo a concentrated table
+// left behind by a prior workers < queues apply when the operator
+// has since increased the worker count to match queue count.
+//
+// Best-effort: ethtool probe failures are logged and skipped without
+// attempting a write, mirroring the apply path's error handling.
+func maybeRestoreDefault(iface string, queues int, execer rssExecutor) {
+	out, err := execer.runEthtool("-x", iface)
+	if err != nil {
+		if isExecNotFound(err) {
+			slog.Warn("linksetup: ethtool binary not found, cannot probe for default rss indirection",
+				"iface", iface)
+			return
+		}
+		slog.Warn("linksetup: ethtool -x failed, cannot probe for default rss indirection",
+			"iface", iface, "err", err,
+			"output", strings.TrimSpace(string(out)))
+		return
+	}
+	if indirectionTableIsDefault(out, queues) {
+		slog.Debug("linksetup: rss indirection already default, no restore needed",
+			"iface", iface)
+		return
+	}
+	if out, err := execer.runEthtool("-X", iface, "default"); err != nil {
+		if isExecNotFound(err) {
+			slog.Warn("linksetup: ethtool binary not found, cannot restore default rss indirection",
+				"iface", iface)
+			return
+		}
+		slog.Warn("linksetup: ethtool -X default failed",
+			"iface", iface, "err", err,
+			"output", strings.TrimSpace(string(out)))
+		return
+	}
+	slog.Info("linksetup: restored default round-robin rss indirection",
+		"iface", iface,
+		"reason", "workers>=queues with stale constrained table")
+}
+
+// indirectionTableIsDefault reports true iff the live `ethtool -x`
+// output describes a round-robin indirection table where
+// entry[i] == i mod queueCount. This is the exact shape mlx5
+// produces on `ethtool -X iface default` (verified live on the
+// loss:xpf-userspace-fw0 cluster, 6-queue ge-0-0-2).
+//
+// Stricter than indirectionTableMatches: rejects any custom table
+// that uses every queue at least once but doesn't match the
+// round-robin pattern.
+//
+// Returns false on empty/unparseable input, or on any row whose
+// entries don't all match the expected (rowIdx + j) % queueCount
+// position. Returns true only when at least one entry has been
+// successfully parsed AND verified.
+func indirectionTableIsDefault(output []byte, queueCount int) bool {
+	if queueCount <= 0 {
+		return false
+	}
+	sawAnyEntry := false
+	for _, line := range bytes.Split(output, []byte{'\n'}) {
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			continue
+		}
+		colon := bytes.IndexByte(trimmed, ':')
+		if colon <= 0 {
+			continue
+		}
+		rowIdx, err := strconv.Atoi(string(trimmed[:colon]))
+		if err != nil {
+			continue
+		}
+		for j, tok := range bytes.Fields(trimmed[colon+1:]) {
+			q, err := strconv.Atoi(string(tok))
+			if err != nil {
+				return false
+			}
+			expected := (rowIdx + j) % queueCount
+			if q != expected {
+				return false
+			}
+			sawAnyEntry = true
+		}
+	}
+	return sawAnyEntry
 }
 
 // computeWeightVector returns the weight vector for the given worker and

@@ -486,6 +486,252 @@ func TestReapplyRSSIndirection_EndToEndWritesWeights(t *testing.T) {
 	}
 }
 
+// ─── #805: workers≥queues stale-table refresh ────────────────────────
+
+// staleTable6q4w: indirection layout left behind by an
+// applyRSSIndirectionOne run with workers=4, queues=6 — the
+// ethtool-style "uses only queues 0..3" output that
+// indirectionTableMatches([1,1,1,1,0,0]) returns true on but
+// indirectionTableIsDefault(_, 6) must return false on.
+const staleTable6q4w = `RX flow hash indirection table for eth0 with 6 RX ring(s):
+    0:      0     1     2     3     0     1
+    8:      2     3     0     1     2     3
+   16:      0     1     2     3     0     1
+`
+
+// defaultTable6q: kernel default round-robin layout for queueCount=6,
+// captured live from loss:xpf-userspace-fw0/ge-0-0-2 via
+// `ethtool -X iface default; ethtool -x iface`.
+const defaultTable6q = `RX flow hash indirection table for eth0 with 6 RX ring(s):
+    0:      0     1     2     3     4     5     0     1
+    8:      2     3     4     5     0     1     2     3
+   16:      4     5     0     1     2     3     4     5
+   24:      0     1     2     3     4     5     0     1
+`
+
+// defaultTable4q: round-robin layout for queueCount=4 (synthesized from
+// the formula entry[i] == i mod queueCount, the same shape mlx5
+// produces).
+const defaultTable4q = `RX flow hash indirection table for eth0 with 4 RX ring(s):
+    0:      0     1     2     3     0     1     2     3
+    8:      0     1     2     3     0     1     2     3
+`
+
+// #805 test 1: workers==queues, live table is from the prior
+// workers<queues apply (stale concentrated). maybeRestoreDefault must
+// fire `ethtool -X iface default`.
+func TestApplyRSSIndirectionOne_WorkersEqualsQueues_StaleTable_RestoresDefault(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"eth0": mlx5Driver},
+		queues:   map[string]int{"eth0": 6},
+		ethtoolX: map[string][]byte{"eth0": []byte(staleTable6q4w)},
+	}
+	applyRSSIndirectionOne("eth0", 6, f)
+
+	if len(f.calls) != 2 {
+		t.Fatalf("expected 2 ethtool calls (probe + restore), got %d: %v",
+			len(f.calls), f.calls)
+	}
+	if !reflect.DeepEqual(f.calls[0], []string{"-x", "eth0"}) {
+		t.Errorf("call 0: want probe, got %v", f.calls[0])
+	}
+	if !reflect.DeepEqual(f.calls[1], []string{"-X", "eth0", "default"}) {
+		t.Errorf("call 1: want -X default, got %v", f.calls[1])
+	}
+}
+
+// #805 test 2: workers > queues (e.g. operator over-allocated workers).
+// Same restore-default behavior as workers==queues case.
+func TestApplyRSSIndirectionOne_WorkersGreaterThanQueues_StaleTable_RestoresDefault(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"eth0": mlx5Driver},
+		queues:   map[string]int{"eth0": 6},
+		ethtoolX: map[string][]byte{"eth0": []byte(staleTable6q4w)},
+	}
+	applyRSSIndirectionOne("eth0", 8, f)
+
+	sawRestore := false
+	for _, c := range f.calls {
+		if len(c) >= 3 && c[0] == "-X" && c[2] == "default" {
+			sawRestore = true
+		}
+	}
+	if !sawRestore {
+		t.Fatalf("expected ethtool -X default invocation, got %v", f.calls)
+	}
+}
+
+// #805 test 3: workers >= queues but live table IS default. No write.
+func TestApplyRSSIndirectionOne_WorkersGreaterEqualQueues_DefaultTable_NoOp(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"eth0": mlx5Driver},
+		queues:   map[string]int{"eth0": 6},
+		ethtoolX: map[string][]byte{"eth0": []byte(defaultTable6q)},
+	}
+	applyRSSIndirectionOne("eth0", 6, f)
+
+	for _, c := range f.calls {
+		if len(c) >= 1 && c[0] == "-X" {
+			t.Errorf("default table → must not invoke -X, got %v", c)
+		}
+	}
+}
+
+// #805 test 4: workers == 1 with stale table — must NOT touch.
+// Single-worker deploys keep default RSS regardless of stale state;
+// "stale" is only meaningful when transitioning from workers<queues
+// where some prior apply wrote concentrated weights.
+func TestApplyRSSIndirectionOne_WorkersIsOne_StaleTable_NotTouched(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"eth0": mlx5Driver},
+		queues:   map[string]int{"eth0": 6},
+		ethtoolX: map[string][]byte{"eth0": []byte(staleTable6q4w)},
+	}
+	applyRSSIndirectionOne("eth0", 1, f)
+
+	if len(f.calls) != 0 {
+		t.Errorf("workers=1 must issue zero ethtool calls, got %v", f.calls)
+	}
+}
+
+// #805 test 5: workers == 0 with stale table — must NOT touch.
+func TestApplyRSSIndirectionOne_WorkersIsZero_StaleTable_NotTouched(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"eth0": mlx5Driver},
+		queues:   map[string]int{"eth0": 6},
+		ethtoolX: map[string][]byte{"eth0": []byte(staleTable6q4w)},
+	}
+	applyRSSIndirectionOne("eth0", 0, f)
+
+	if len(f.calls) != 0 {
+		t.Errorf("workers=0 must issue zero ethtool calls, got %v", f.calls)
+	}
+}
+
+// #805 test 6: queueCount==0 (sysfs read failed). The
+// workers>=queues>0 guard must short-circuit.
+func TestApplyRSSIndirectionOne_QueueCountZero_NoOp(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"eth0": mlx5Driver},
+		queues:   map[string]int{"eth0": 0},
+		ethtoolX: map[string][]byte{"eth0": []byte(staleTable6q4w)},
+	}
+	applyRSSIndirectionOne("eth0", 6, f)
+
+	if len(f.calls) != 0 {
+		t.Errorf("queueCount=0 must issue zero ethtool calls, got %v", f.calls)
+	}
+}
+
+// #805 test 7: ethtool -x probe returns ErrNotFound on the
+// restore-default path. Must log warning, NOT attempt -X default.
+func TestApplyRSSIndirectionOne_RestoreEthtoolXProbeMissing_LogAndSkip(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers: map[string]string{"eth0": mlx5Driver},
+		queues:  map[string]int{"eth0": 6},
+		// No ethtoolX entry → fakeRSSExecutor returns ErrNotFound on -x.
+	}
+	applyRSSIndirectionOne("eth0", 6, f)
+
+	for _, c := range f.calls {
+		if len(c) >= 1 && c[0] == "-X" {
+			t.Errorf("probe failure → must not invoke -X, got %v", c)
+		}
+	}
+}
+
+// #805 test 8: parser — true round-robin for the given queueCount.
+func TestIndirectionTableIsDefault_RoundRobin_True(t *testing.T) {
+	if !indirectionTableIsDefault([]byte(defaultTable6q), 6) {
+		t.Error("captured ge-0-0-2 default table must parse as default")
+	}
+	if !indirectionTableIsDefault([]byte(defaultTable4q), 4) {
+		t.Error("synthetic 4-queue default must parse as default")
+	}
+}
+
+// #805 test 9: parser — concentrated [1,1,1,1,0,0]-style table is NOT
+// default.
+func TestIndirectionTableIsDefault_Concentrated_False(t *testing.T) {
+	if indirectionTableIsDefault([]byte(staleTable6q4w), 6) {
+		t.Error("stale concentrated table must NOT parse as default")
+	}
+}
+
+// #805 test 10: parser — table that uses every queue at least once but
+// in non-round-robin order is NOT default. Tightens R2 #3.
+func TestIndirectionTableIsDefault_EveryQueueOnceButNonRoundRobin_False(t *testing.T) {
+	custom := []byte(`RX flow hash indirection table for eth0 with 6 RX ring(s):
+    0:      5     4     3     2     1     0     5     4
+    8:      3     2     1     0     5     4     3     2
+`)
+	if indirectionTableIsDefault(custom, 6) {
+		t.Error("non-round-robin table that uses every queue must NOT parse as default")
+	}
+}
+
+// #805 test 11: parser — empty / unparseable / value-less inputs all
+// return false. The R3 sawAnyEntry guard must reject "row index with
+// no values".
+func TestIndirectionTableIsDefault_EmptyOutput_False(t *testing.T) {
+	if indirectionTableIsDefault([]byte(""), 6) {
+		t.Error("empty output must NOT be default")
+	}
+	headerOnly := []byte("RX flow hash indirection table for eth0 with 6 RX ring(s):\nRSS hash key:\n  0a:1b:2c:3d:4e\n")
+	if indirectionTableIsDefault(headerOnly, 6) {
+		t.Error("header-only output (no row data) must NOT be default")
+	}
+	emptyRow := []byte("    0:\n")
+	if indirectionTableIsDefault(emptyRow, 6) {
+		t.Error("row index with no values must NOT be default (sawAnyEntry guard)")
+	}
+}
+
+// #805 test 12: full end-to-end transition. Step 1: workers=4, queues=6
+// with a default starting table → write concentrated. Step 2: same
+// iface, workers=6, queues=6 with the now-stale concentrated table →
+// restore default.
+func TestApplyRSSIndirectionOne_BootSequence_4then6_RestoresDefault(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"eth0": mlx5Driver},
+		queues:   map[string]int{"eth0": 6},
+		ethtoolX: map[string][]byte{"eth0": []byte(defaultTable6q)},
+	}
+
+	// Step 1: workers=4. computeWeightVector → [1,1,1,1,0,0]. Live
+	// table is default (doesn't match [1,1,1,1,0,0]) so a write fires.
+	applyRSSIndirectionOne("eth0", 4, f)
+	step1Calls := len(f.calls)
+	sawWeight := false
+	for _, c := range f.calls {
+		if len(c) >= 3 && c[0] == "-X" && c[2] == "weight" {
+			sawWeight = true
+		}
+	}
+	if !sawWeight {
+		t.Fatalf("step 1 (workers=4): expected -X weight write, got %v", f.calls)
+	}
+
+	// Simulate the kernel-side outcome: live table is now the stale
+	// concentrated layout.
+	f.ethtoolX["eth0"] = []byte(staleTable6q4w)
+
+	// Step 2: workers=6. computeWeightVector returns nil; the new
+	// maybeRestoreDefault path must detect the stale table and fire
+	// `ethtool -X eth0 default`.
+	applyRSSIndirectionOne("eth0", 6, f)
+	sawRestore := false
+	for _, c := range f.calls[step1Calls:] {
+		if len(c) >= 3 && c[0] == "-X" && c[2] == "default" {
+			sawRestore = true
+		}
+	}
+	if !sawRestore {
+		t.Fatalf("step 2 (workers=6): expected -X default restore, got %v",
+			f.calls[step1Calls:])
+	}
+}
+
 // Sanity: the production isExecNotFound detects the stable sentinel that
 // `exec.Command("missing").CombinedOutput()` wraps, without substring
 // matching (Go MEDIUM #1).
