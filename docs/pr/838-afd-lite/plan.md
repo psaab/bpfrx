@@ -278,112 +278,193 @@ pub(super) fn afd_threshold(state: &AFDLiteState) -> u64 { ... }  // helper for 
 
 ### 6.3 Edits to `userspace-dp/src/afxdp/tx.rs`
 
-#### 6.3.1 FIFO-pop accounting (single-packet path)
+R4 review forced grounding in the real code. The actual
+flow-fair+exact dispatch path (the workload our test matrix
+hits) is:
 
-For the FIFO single-packet pop sites, the accounting hook
-goes inside the success branch immediately after the per-
-packet `bytes` sum is incremented. The R1-identified sites
-in this category map to the actual success-after-insert
-points:
+```
+service_exact_local_queue_direct (tx.rs:1932)
+  └ flow_fair branch (tx.rs:1946-1949)
+    └ service_exact_local_queue_direct_flow_fair (tx.rs:2082)
+      └ submit_cos_batch (returns bool)
+      └ settle_exact_local_scratch_submission_flow_fair (tx.rs:2945)
+            ↑ THIS is the post-TX commit point
+```
 
-- `tx.rs:2922-2927` (FIFO local request: after
-  `sent_bytes += req.bytes.len() as u64` per Codex R3
-  Area 6, in the `Some(Local(req))` branch).
-- The matching prepared-frame branch in the same FIFO loop.
+And the prepared-frame variant:
 
-At each, gate on `queue.flow_fair && !queue.shared_exact`
-and call `afd_account_dispatch(state, bucket, bytes,
-now_ns)`. The `bucket` here is computed via
-`cos_flow_bucket_index(queue.flow_hash_seed, flow_key)`
-on the popped item, before the item is consumed.
+```
+service_exact_prepared_queue_direct_flow_fair (tx.rs:2368)
+  └ submit_cos_batch
+  └ settle_exact_prepared_scratch_submission_flow_fair (tx.rs:3000)
+        ↑ post-TX commit point
+```
 
-#### 6.3.2 Batch-pop accounting (R3 HIGH 4 fix)
+#### 6.3.1 The accepted-prefix discrimination is already done
 
-The R3 review correctly flagged that the batch-pop sites
-at `tx.rs:3129/3170` happen DURING batch construction
-(pre-TX), while the true success sites at `tx.rs:3214/3272`
-only have aggregate `(packets, bytes)` and retry-tail state
-— per-flow bucket identity is lost by then.
+The `settle_*_flow_fair` functions take `inserted: usize`
+(R4 HIGH 2: `inserted` is the accepted-packet-count from
+the xsk send return) and iterate the scratch buffer
+backwards. For each item:
 
-**Redesigned batch accounting (matches the no-rollback
-design)**:
+- If `scratch_*.len() >= inserted` (rejected tail): push
+  the item back via `cos_queue_push_front`.
+- Else (accepted prefix): increment `sent_packets` /
+  `sent_bytes`.
 
-1. **During pop**: each batch-pop iteration that adds an
-   item to the in-flight batch buffer ALSO appends a
-   `(bucket_idx, bytes)` tuple to a per-batch staging
-   buffer. The staging buffer is a small `SmallVec` or
-   stack-allocated array (typical batch size ≤ 64; bound
-   to TX_BATCH_SIZE = 256 worst case).
-2. **After `submit_cos_batch` returns the accepted count
-   `N`**: iterate the first `N` staging tuples and call
-   `afd_account_dispatch` for each. The unaccepted tail
-   (positions N..staging_len) is left untouched — those
-   items are pushed back via push_front (existing code),
-   AFD never accounted them.
-3. **On full-batch failure (`inserted == 0`)**: don't
-   iterate at all. Staging buffer dropped. AFD untouched.
+So **no separate staging buffer is needed** (R3 HIGH 4
+proposed redesign was reinventing this). The existing
+settle functions ARE the staging-prefix walkers. AFD-lite's
+hook just goes in the accepted branch.
 
-This matches the no-rollback contract: AFD is only
-incremented for bytes that successfully transmitted. Partial
-batch acceptance is correctly handled.
+R4 HIGH 1 (staging buffer location) and R4 HIGH 5
+(signature chain) are dropped — there is no new staging
+buffer.
 
-**Per-batch staging buffer**: a new `Vec<(u16, u32)>`
-(bucket_idx + bytes_u32, since per-packet bytes ≤ 9000)
-allocated once and reused across batches via clear/reuse.
-Add as a field on `BindingWorker` or as a function-local
-that's reused across calls. Hot-path overhead: one extra
-push-tuple per packet popped (8-16 bytes); insignificant.
+#### 6.3.2 AFD hooks: settle-function accepted branches
 
-**Sites to edit**:
-- `tx.rs:3129/3170` (pop-during-batch): stage tuple.
-- `tx.rs:3214/3272` (submit success): iterate staging
-  prefix N and call `afd_account_dispatch`.
-- `tx.rs:6206/6215/6433/6442` (settle / partial-success):
-  these may also need staging-prefix accounting depending
-  on which path they're on. Verify against actual code at
-  implementation time.
+Two sites:
 
-#### 6.3.3 Failure / rollback paths
+**Local TX** — `settle_exact_local_scratch_submission_flow_fair`
+at tx.rs:2945. Edit the `else` branch (currently
+tx.rs:2961-2964):
 
-Per §5.2, do nothing. Failed TX simply doesn't account.
-The staging buffer for batch paths is dropped/cleared.
+```rust
+} else {
+    sent_packets += 1;
+    sent_bytes += req.bytes.len() as u64;
+    // #838 AFD-lite hook (v3 single-binding):
+    if !queue.shared_exact {
+        if let Some(afd) = queue.afd.as_mut() {
+            let flow_key = req_flow_key(&req);
+            let bucket = cos_flow_bucket_index(queue.flow_hash_seed, flow_key);
+            afd_account_dispatch(afd, usize::from(bucket), req.bytes.len() as u64, now_ns);
+        }
+    }
+}
+```
 
-#### 6.3.4 Selection sites
+**Prepared TX** — `settle_exact_prepared_scratch_submission_flow_fair`
+at tx.rs:3000. Edit the `else` branch (currently
+tx.rs:3015-3019):
 
-- `cos_queue_front` (`tx.rs:4262`) → call
-  `cos_queue_select_bucket(queue, now_ns)`.
-- `cos_queue_pop_front_inner` (`tx.rs:4464`-area) → same.
+```rust
+} else {
+    remember_prepared_recycle(in_flight_prepared_recycles, &req);
+    sent_packets += 1;
+    sent_bytes += req.len as u64;
+    // #838 AFD-lite hook:
+    if !queue.shared_exact {
+        if let Some(afd) = queue.afd.as_mut() {
+            let bucket = cos_flow_bucket_index(queue.flow_hash_seed, req_flow_key_prepared(&req));
+            afd_account_dispatch(afd, usize::from(bucket), req.len as u64, now_ns);
+        }
+    }
+}
+```
 
-The `now_ns` argument is plumbed from the existing call
-chain. Per Codex R3 Area 3, this also requires threading
-through `build_cos_batch_from_queue` and the drain helpers
-(call sites at `tx.rs:2602/2780/3102`). Worker hot-paths
-already have a `now_ns` (from the polling loop's
-`monotonic_ns()`); pass through. Bounded surface — every
-caller already has a clock value at hand.
+The `flow_fair` gate is already implicit (these settle
+functions are only called from the flow-fair dispatch
+branch at tx.rs:1947).
 
-#### 6.3.5 One-packet-stale on selection (R3 MED 10)
+The `!queue.shared_exact` gate keeps v3 scope to single-
+binding queues.
 
-Selection (`cos_queue_select_bucket`) reads `now_ns` but
-does **not** rotate. Rotation happens only inside
-`afd_account_dispatch`, which runs on the success path
-AFTER selection. Consequence: the first selection AFTER a
-window expiry (e.g. window N→N+1 boundary) uses stale
-window-N counters. Once that packet's dispatch hook fires,
-rotation moves state to N+1; subsequent selections are
-fresh.
+`req_flow_key` / `req_flow_key_prepared` extract the 5-tuple
+from the request; helpers already exist for this. Verify
+exact name during implementation.
 
-This is acceptable:
-- 2 ms window × 150 K pps = ~300 packets per window. One
-  stale-selection per window is < 0.4 % of selections.
-- The stale data biases ONE selection toward whatever
-  was over-share at the end of the previous window;
-  bounded by the previous window's threshold (already a
-  fair-share-ish value).
+#### 6.3.3 now_ns plumbing
 
-Documented; not mitigated. Mitigation would require
-`cos_queue_front` to take `&mut CoSQueueRuntime`, which
-broadens the call-site change beyond v3 scope.
+Both settle functions don't currently take `now_ns`. Add a
+parameter. Callers:
+
+- `service_exact_local_queue_direct_flow_fair` at tx.rs:2082
+  — already has `now_ns` from its caller chain.
+- `service_exact_prepared_queue_direct_flow_fair` at tx.rs:2368
+  — same.
+
+Selection sites for `cos_queue_select_bucket(queue, now_ns)`:
+- `cos_queue_front` at tx.rs:4262
+- `cos_queue_pop_front_inner` at tx.rs:4464-area
+- Called from `select_cos_guarantee_batch` (tx.rs:1740,
+  1836), `select_cos_surplus_batch` (tx.rs:1890), and
+  `build_cos_batch_from_queue` (tx.rs:3102) per R4 MED 11.
+  Each caller has `now_ns` available (from its parent dispatch
+  loop); thread through.
+
+Total signature change surface: ~10 functions. Mechanical.
+
+#### 6.3.4 Out-of-scope dispatch paths
+
+- **FIFO path** (`tx.rs:2922-2927`, where `sent_bytes +=
+  req.bytes.len()` lives in the FIFO settle): R4 LOW 4 +
+  LOW 6 — this is the non-flow-fair path. Skipped by the
+  v3 gate (`flow_fair == false` → no `afd` field). No
+  hook needed. State this here so the implementer doesn't
+  look for one.
+- **Surplus / Guarantee batch paths** (`select_cos_*_batch`
+  → `build_cos_batch_from_queue`): these are also
+  non-flow-fair (the path checks `queue.exact` and skips
+  exact queues at line 1887). Selection-side `now_ns`
+  threading is needed (per §6.3.3) for the
+  `cos_queue_select_bucket` call, but no AFD accounting
+  hook is needed here.
+- **Settle FIFO** (tx.rs:2969 `settle_exact_prepared_fifo_submission`):
+  this is the `!flow_fair` branch. Non-flow-fair → no
+  AFD state → no hook.
+
+#### 6.3.5 Failure / rollback paths
+
+Per §5.2, do nothing. Failed-TX items go back to the queue
+via `cos_queue_push_front` (already in the settle code at
+tx.rs:2960 and 3014). AFD hook is in the OTHER branch
+(accepted), so failed items naturally bypass accounting.
+
+This closes R3 HIGH 6 (rollback overcharge) — there is no
+rollback path that touches AFD; the byte-count ledger is
+write-only.
+
+#### 6.3.6 One-packet-stale on selection — recomputed (R4 HIGH 3)
+
+R4 HIGH 3 correctly flagged my <0.4% calc was at high pps.
+At lower pps (small CoS class, small flow count), the stale
+rate climbs.
+
+Recomputed worst-case stale-rate per class, assuming the
+2 ms window:
+
+| Class | Shaped rate | 16-stream pps | Pkts/window | 1 stale = |
+|-------|-------------|---------------|-------------|-----------|
+| iperf-c (25 Gb/s) | ~2 M pps | 2 M / 16 ≈ 125 K per stream, total 2 M | ~4000 | 0.025 % |
+| iperf-b (10 Gb/s) | ~830 K pps | total 830 K | ~1660 | 0.06 % |
+| iperf-a (1 Gb/s) | ~83 K pps | total 83 K | ~166 | 0.6 % |
+| best-effort (100 Mb/s) | ~8.3 K pps | total 8.3 K | ~16.6 | **6 %** |
+
+(Assumes 1500-byte packets.)
+
+For the small classes (iperf-a and best-effort), one stale
+selection per window is non-trivial (0.6 % and 6 %
+respectively). For best-effort 16 streams, ~6 % of selections
+might use stale state.
+
+**Two mitigation options**:
+
+(a) Accept it: the stale state is at-most-2 ms-old and is
+itself a fair-share-bounded threshold. The over-share skip
+might fail to engage on one bucket per window, letting one
+"hot" flow get one extra packet through every 2 ms. Bounded.
+
+(b) Rotate-in-selection: change `cos_queue_select_bucket`
+to take `&mut CoSQueueRuntime` and call `afd_maybe_rotate`
+at entry. This requires changing `cos_queue_front`
+(tx.rs:4262) to take `&mut`, which cascades through callers.
+
+**Decision**: go with (a) for v3. Document the worst-case
+6 % stale rate on best-effort. If empirical CoV measurement
+shows best-effort doesn't meet acceptance, switch to (b) in
+a follow-up. The merge gate (per §8) is non-regression, not
+absolute CoV — so a small stale impact won't block merge.
 
 ### 6.4 Stale-comment cleanup (Codex R2 #8)
 
@@ -591,3 +672,19 @@ addressed below.
 | 8 | MED | Acceptance bar inconsistency         | §8 split into "merge gates" (non-regression: ≤ baseline + 1pp, no collapses, ≥0.95× throughput, no retransmit regression) and "targets" (the absolute CoV bars from #786 Slice C, reported but non-gating) |
 | 9 | MED | Partial TX-ring success test gap     | §7 tests #15 (partial), #16 (full failure), #17 (full success) added |
 | 10| MED | now_ns unused in selection           | §6.3.5: documented one-packet-stale on selection. ~0.4% of selections at 2ms window × 150K pps. Acceptable; mitigation requires &mut signature change beyond v3 scope |
+
+### Round 4 (6 HIGH + 3 MED + 2 LOW; R4 forced grounding in actual code paths)
+
+| # | Sev | Topic                                | Resolution |
+|---|-----|--------------------------------------|-----------|
+| 1 | HIGH| Staging buffer location not pinned   | DROPPED — §6.3.1 shows the existing `settle_*_flow_fair` functions already do the accepted-prefix walk. No staging buffer needed |
+| 2 | HIGH| Accepted-count unit wrong            | RESOLVED — §6.3.1 correctly identifies `inserted: usize` as the accepted-packet-count parameter to settle |
+| 3 | HIGH| Stale-window math cherry-picked      | RESOLVED — §6.3.6 recomputes per-class, including 6% worst-case on best-effort. Mitigation option (b) flagged for follow-up if empirical regresses |
+| 4 | HIGH| Baseline comparison undefined        | RESOLVED — §8 pins median-of-10 vs median-of-10 + 1 pp per class |
+| 5 | HIGH| `build_cos_batch_from_queue` signature chain missing | DROPPED — no staging buffer to thread (per #1) |
+| 6 | HIGH| Exact-flow-fair accounting path absent | RESOLVED — §6.3.2 hooks at `settle_exact_local_scratch_submission_flow_fair:2961-2964` and `settle_exact_prepared_scratch_submission_flow_fair:3015-3019`. The PRIMARY workload path |
+| 3 | MED | Settle-site hand-wave                | RESOLVED — §6.3.4 explicitly excludes FIFO/surplus/guarantee paths from AFD hooks; §6.3.2 names the only two hook sites |
+| 8 | MED | Test #15 level not pinned            | UNIT test on `account_staging_prefix` helper (clarified — though the v4 design doesn't use a separate helper, the equivalent is a unit test on `settle_*_flow_fair` with a constructed scratch buffer and varying `inserted` values) |
+| 11| MED | now_ns plumbing surface incomplete  | RESOLVED — §6.3.3 enumerates the full caller surface including `select_cos_guarantee_batch`, `select_cos_surplus_batch`, `build_cos_batch_from_queue` |
+| 4 | LOW | FIFO path irrelevance                | RESOLVED — §6.3.4 explicit |
+| 6 | LOW | No FIFO ring revert                  | RESOLVED — §6.3.4 + §6.3.5 explicit |
