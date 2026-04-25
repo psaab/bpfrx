@@ -75,12 +75,22 @@ ports give 100 distinct 5-tuples for the SFQ hash, fanning into
 ### 4.2 Mice
 
 100 paced TCP_RR streams via `netperf`. **Paced** is critical
-(Codex finding #6): unpaced 100×TCP_RR can deliver tens of
-Gbps of offered load, making the mice indistinguishable from
-elephants. We pace each mouse at **1000 RR/s**, giving aggregate
-offered mouse load of ~51 Mbps (100 × 1000 × 64 B × 8) ≈ 5%
-of the 1 Gb/s class shaper — clearly distinguishable from
-elephant load.
+(Codex R1#6): unpaced 100×TCP_RR can deliver tens of Gbps of
+offered load, making the mice indistinguishable from elephants.
+We pace each mouse at **1000 RR/s**.
+
+**Wire load (Codex R2 A4)**: each TCP_RR transaction is
+REQ(64B payload) + RESP(64B payload) + 2 × ACK. Including
+TCP/IP/Eth headers (~54 B), each transaction puts on the wire
+roughly 64+54 (REQ) + 64+54 (RESP) + 40+40 (ACKs) ≈ 316 B,
+or ~288 B if delayed-ACK coalesces some ACKs (Codex's
+arithmetic). Per-mouse wire rate at 1000 RR/s is
+~2.3-2.5 Mbps. Aggregate across 100 mice ≈ 230-250 Mbps,
+which is **23-25% of the 1 Gb/s shaper** — still meaningfully
+under the elephants' demand and well below saturation, but
+NOT the 5% the prior plan stated. The test is a coexistence
+test, not a tiny-mice-vs-fat-elephants test; both classes
+contend for shaped capacity.
 
 ```
 netperf -H 172.16.80.200 -p 12866 -t TCP_RR -l <duration> \
@@ -101,25 +111,32 @@ classifier path); wrk2 is HTTP (extra application stack noise).
 TCP_RR keeps classification tight to the firewall's CoS path
 and exercises the same shaper / SFQ that elephants hit.
 
-**Aggregating per-mouse percentiles (Codex finding #2):**
-percentile-of-percentiles is biased when per-process sample
-counts differ. Netperf does NOT emit per-transaction samples
-through `-O`, only summary statistics from its internal
-histogram. Two options:
+**Aggregating per-mouse percentiles (Codex R1#2 / R2 A2):**
+percentile-of-percentiles is biased. Counterexample: with 49
+of 100 mice at L+1ms p99 and 51 at L p99, median-of-p99 reports
+L — a 1 ms regression on half the mice would be invisible.
 
-- Option A: netperf `-V` (verbose) + custom histogram parser.
-  Each process emits a histogram; we sum histograms across
-  processes and compute global p50/p99 from the merged
-  distribution. This requires per-version netperf compatibility
-  testing.
-- Option B: drop p99.9 from reporting; report **median-of-p99**
-  across the 100 mice as a robust summary. Acknowledge this
-  approximates the actual p99-across-all-samples and document
-  the bias direction (median-of-p99 ≤ true global p99).
+Netperf does NOT emit per-transaction samples through `-O`
+(only summary statistics from its internal histogram). The
+aggregation strategy is: report the **full distribution** of
+per-mouse p99 values, exposing four order statistics so a
+regression on any minority of mice surfaces:
 
-Implementation will start with **Option B** and revisit if the
-results are inconclusive. p99 deltas of ≥ 1 ms will be visible
-under either method; sub-100 µs deltas may need Option A.
+- `p99_min` = min across the 100 mice's p99 values
+- `p99_p50` = median
+- `p99_p90` = 90th percentile (catches the 49/100 case above:
+  90th of {L×51, (L+1ms)×49} = L+1ms)
+- `p99_max` = max (worst-flow watermark)
+
+Plus archive the full sorted list of 100 p99 values per phase
+per rep. Headline reports `p99_p90` and `p99_max` as deltas
+vs baseline.
+
+**Sub-100 µs deltas remain out of scope** (Codex R2 A2): the
+netperf histogram bin width is on the order of 100 µs in
+default mode, so claims below that resolution are not
+defensible from this data. A future enhancement could add
+histogram-merge via netperf `-V`.
 
 ### 4.3 Phases
 
@@ -130,15 +147,28 @@ under either method; sub-100 µs deltas may need Option A.
    classification path.
 3. **Cool-down.** 10 s idle between phases so any CoS queue
    backlog drains.
-4. **Loaded — proper warm-up sequencing (Codex finding #1):**
-   - Start iperf3 elephants.
-   - Wait 10 s for elephant TCP cwnd to settle (verify by
-     reading per-second iperf3 intervals via `-i 1 -J`; require
-     two consecutive seconds within 10% of each other before
-     starting mice).
+4. **Loaded — proper warm-up sequencing (Codex R1#1 / R2 A1):**
+   - Start `iperf3 -c <target> -p 5201 -P 100 -t 60 -i 1 -J`
+     in background. Run length is exactly 60 s = 10 s warm-up
+     + 50 s mouse-load (Codex R2 B2/B5: prior plan had 80 s,
+     fixed).
+   - **Cwnd-settle gate**: poll the iperf3 JSON output for
+     completed `intervals[]` entries (each represents a 1 s
+     summary). Compute `agg_t = intervals[t].sum.bits_per_second`
+     (the 100-stream aggregate at second `t`). Mice start when
+     **3 consecutive `agg_t` samples are within ±10% of their
+     median AND that median is ≥ 0.5 Gb/s** (the latter rules
+     out the cold-start ramp). If the gate doesn't fire within
+     20 s, abort the rep and mark it invalid.
    - Start 100 paced netperf mice for 50 s.
-   - Stop elephants when mice finish.
-5. **Cool-down.** 10 s idle.
+   - When mice finish, also wait for iperf3 to finish (it will
+     stop ~1 s later, since mice started at t=10s and run for
+     50s, ending at t=60s = same as iperf3 -t 60).
+5. **Cool-down.** 10 s idle. Drain math: queue 4 buffer is
+   1.19 MiB observed live; at 1 Gb/s drain rate the time to
+   drain a full buffer is ≈ 10 ms. 10 s is ~1000× the worst-
+   case drain time — generous to accommodate any TCP
+   teardown / FIN / TIME_WAIT settling.
 6. **Repeat steps 2-5** per repetition.
 
 ### 4.4 Class collision fix (Codex finding #3)
@@ -189,18 +219,23 @@ Per-mouse from netperf:
 - transactions/sec achieved (compare to 1000 target — if
   below, that mouse was bottlenecked).
 
-Across 100 mice:
-- **median-of-p99** µs (the headline percentile).
-- min, max, IQR (25th–75th percentile across the 100 mice's
-  reported p99 values).
+Across the 100 mice's per-process p99 values, report the
+**full distribution** (R2 A2):
+- `p99_min` (best-flow watermark)
+- `p99_p50` (median)
+- `p99_p90` (catches the 49/100 mice regression case)
+- `p99_max` (worst-flow watermark)
+- raw sorted list archived per phase per rep
+
+Headline reports `p99_p90` AND `p99_max` as deltas vs baseline.
 
 ### 5.3 Comparison
 
 The headline numbers are **deltas from baseline**:
 
 - `elephant_cov_loaded` (%, vs reporting reference 15%)
-- `mouse_p99_loaded - mouse_p99_baseline` (µs)
-- `mouse_p99_loaded / mouse_p99_baseline` (× factor)
+- `mouse_p99_p90_loaded - mouse_p99_p90_baseline` (µs)
+- `mouse_p99_max_loaded - mouse_p99_max_baseline` (µs)
 
 These are reporting thresholds only. No issue is closed against
 them by this PR (Codex finding #9). A follow-up issue with a
@@ -234,7 +269,7 @@ environmental issue requiring fix before continuing).
 
 ## 6. Implementation outline
 
-### 6.1 Preflight (Codex finding #8)
+### 6.1 Preflight (Codex R1#8 / R2 A6/B1/C1/C2/N1)
 
 ```
 1. Verify both firewall VMs RUNNING via `incus list`.
@@ -242,49 +277,89 @@ environmental issue requiring fix before continuing).
    "active". Same for fw1.
 3. Verify RG0 primary == node0 via cli on fw0; fail loudly
    if not (manual operator action needed).
-4. Kill any stale iperf3 / netperf / netserver processes on
-   `cluster-userspace-host` and on the iperf3 target VM
-   (`pkill -9` then sleep 1).
-5. Apply CoS config via `apply-cos-config.sh` (idempotent).
-6. Apply mouse classifier extension (§4.4).
-7. Start netserver on iperf3 target on port 12866 if not
-   running.
-8. Verify `cli show class-of-service interface` reports
-   queue 4 owner=1, exact=yes, transmit-rate=1Gb/s. Fail if
-   not.
-9. Assert iperf-a queue runtime backlog == 0 (queued_pkts == 0
-   in the show output) — if non-zero, sleep 5 s and retry up
-   to 3 times.
-10. Install netperf on the source container if missing
-    (`apt-get install -y netperf`).
+4. Track harness PIDs (R2 A6): the harness assigns itself a
+   process group via `setsid` at start; teardown only sends
+   signals to that pgid. Stale processes from prior CRASHED
+   runs of THIS harness are cleaned by reading
+   /tmp/100e100m/last-pgid (written on each successful start)
+   and `kill -KILL -<pgid>` only that. Do NOT use a global
+   `pkill iperf3` — the loss: remote may host other tenants.
+5. Verify the iperf3 target VM is reachable. Resolve which
+   incus instance owns 172.16.80.200 by reading
+   `loss-userspace-cluster.env` (or hard-coded constant) and
+   `incus exec` into that instance for management. If the
+   instance is not listed in env, fail preflight with a clear
+   message (R2 N1).
+6. On the iperf3 target instance:
+   a. `command -v netserver` || `apt-get update -qq` && `apt-get install -y netperf` (R2 C1: with explicit
+      apt-get update and exit-code check).
+   b. Kill stale netserver in our pgid only.
+   c. Start netserver on port 12866 (`netserver -p 12866`) and
+      verify with `nc -zv 172.16.80.200 12866`.
+7. On `cluster-userspace-host`:
+   a. `command -v netperf` || `apt-get update -qq && apt-get install -y netperf`. Capture stderr; abort
+      with logged error on failure (R2 C1).
+   b. `command -v mpstat` || `apt-get install -y sysstat`
+      (R2 B1).
+8. Apply CoS config via `apply-cos-config.sh` (idempotent).
+9. Apply mouse classifier extension (§4.4) atomically via cli
+   `commit check && commit`.
+10. Register an EXIT trap (R2 C2) that on any exit (success
+    or failure) issues a single `cli` rollback that removes
+    the mouse-classifier term added in step 9, restoring the
+    base CoS fixture. Also kills the harness pgid and
+    netserver-in-our-pgid on the target.
+11. Verify `cli show class-of-service interface` reports
+    queue 4 owner=1, exact=yes, transmit-rate=1Gb/s. Fail if
+    not.
+12. Assert iperf-a queue runtime backlog == 0 (queued_pkts ==
+    0 in the show output) — if non-zero, sleep 5 s and retry
+    up to 3 times.
+13. Snapshot baseline cluster-event log offset on fw0/fw1
+    so per-rep failover detection (R2 A7) can grep
+    journalctl --since=<rep_T0> for cluster transition lines.
 ```
 
 ### 6.2 Per-rep loop
 
+Output paths use the form `/tmp/100e100m/<run-ts>/<rep-N>/<phase>/`
+where `<run-ts>` is a single timestamp captured at harness
+start, so re-runs do not overwrite (R2 B3).
+
 ```
-1. Mark T0 = now.
-2. Snapshot CoS counters via cli on fw0.
-3. Start mpstat 1 in background on source, redirected to
-   /tmp/100e100m/<rep>/baseline-mpstat.log.
-4. Start RG-watcher in background polling `cli show chassis
-   cluster status` every 5 s.
-5. Run 100 netperf mice for 60 s; capture each stdout to
-   /tmp/100e100m/<rep>/baseline-mice/<i>.txt
+1. Mark rep_T0 = now.
+2. Snapshot CoS counters via cli on fw0 (before).
+3. Start `mpstat 1 -o JSON` in background on source,
+   redirected to <rep>/baseline-mpstat.json. Track the pid.
+4. Run 100 netperf mice for 60 s; capture each stdout to
+   <rep>/baseline-mice/<i>.txt. Track aggregate netperf pids
+   in the harness pgid.
+5. Stop mpstat (kill the tracked pid).
 6. Sleep 10 s cool-down.
 7. Snapshot CoS counters (mid).
-8. Restart mpstat for loaded phase.
-9. Start iperf3 -P 100 -i 1 -J for ~80 s in background to
-   /tmp/100e100m/<rep>/loaded-elephants.json.
-10. Wait for cwnd settle: poll iperf3 stderr or read JSON
-    progress; require 10 s of stable per-stream rate.
-11. Run 100 netperf mice for 50 s; capture as in step 5.
-12. Wait for iperf3 to finish (will exit after ~80 s).
+8. Start mpstat 1 -o JSON for loaded phase.
+9. Start `iperf3 -c <target> -p 5201 -P 100 -t 60 -i 1 -J`
+   in background, output to <rep>/loaded-elephants.json.
+10. Apply cwnd-settle gate (§4.3 step 4): poll the JSON for
+    `intervals[]` entries every 500 ms. Compute
+    `agg_t = intervals[t].sum.bits_per_second`. Pass when
+    3 consecutive `agg_t` are within ±10% of their median
+    AND median ≥ 0.5 Gb/s. Abort + invalidate rep if no pass
+    within 20 s.
+11. Run 100 netperf mice for 50 s; capture as in step 4.
+12. Wait for iperf3 to finish (-t 60, will end ~10 s after
+    mice start, so finishes roughly when mice finish).
 13. Snapshot CoS counters (after).
-14. Stop RG-watcher and mpstat.
-15. Compute per-rep validity flags (§5.4).
-16. Compute per-rep summary (elephant CoV, mouse median p99,
-    deltas).
-17. Sleep 10 s cool-down.
+14. Stop loaded-phase mpstat.
+15. Pull `journalctl -u xpfd --since=<rep_T0>` from fw0 and
+    fw1 (R2 A7); grep for cluster transition lines.
+    Invalidate rep if any "cluster: primary transition",
+    "cluster: secondary transition", or
+    "RG readiness: not-ready" appears.
+16. Compute per-rep validity flags (§5.4).
+17. Compute per-rep summary (elephant CoV, mouse p99
+    distribution, deltas).
+18. Sleep 10 s cool-down.
 ```
 
 ### 6.3 Aggregation
@@ -334,7 +409,11 @@ stick with fixed-N reps and explicit IQR reporting.
 ## 8. Acceptance for this PR
 
 - Script lands in `test/incus/test-100e100m.sh`, single-command
-  run with optional `--reps N` flag.
+  run with optional `--reps N` and `--dry-run` flags. The
+  `--dry-run` flag (R2 C3) executes preflight, validates the
+  classifier extension applies and rolls back cleanly, but
+  does NOT run the elephant/mouse phases — for fast harness
+  debugging without paying the full 27-minute test cost.
 - Baseline measurement (with the **current** code, no algorithm
   change) is captured and committed to the PR description as a
   table:
@@ -402,17 +481,40 @@ out of scope for this PR.
   for sub-100 µs delta resolution.
 - Adaptive bootstrap CI for variable rep count.
 
-## 12. Codex round 1 review responses
+## 12. Review responses
 
-| # | Severity | Topic                         | Resolution |
-|---|----------|-------------------------------|------------|
-| 1 | HIGH     | Methodology rigor             | Bumped to 10 reps default; warm-up uses cwnd-settle gate; report median/IQR |
-| 2 | HIGH     | Mouse percentile aggregation  | Drop p99.9 from headline; report median-of-p99 with documented bias |
-| 3 | HIGH     | Class collision               | Add 12865/12866 to firewall classifier in §4.4 |
-| 4 | HIGH     | Source CPU bottleneck         | mpstat collection + 90% CPU validity flag |
-| 5 | LOW      | Per-flow distinction          | Sufficient (100 < 1024 buckets, negligible collision); record bucket-peak as observability |
-| 6 | HIGH     | Per-mouse RR rate             | Pace at 1000 RR/s = ~51 Mbps aggregate; verify achieved RPS |
-| 7 | MED      | CoS counter delta             | Parse before/after into deltas; invalidate on counter regression |
-| 8 | MED      | Reproducibility after fail    | Preflight kills stale procs, asserts xpfd healthy, checks queue backlog |
-| 9 | HIGH     | Acceptance gate values        | Demoted to reporting thresholds; explicit caveat that PR does not close #897/#898/#899 |
-| 10| MED      | HA failover protection        | RG-watcher polls every 5 s; per-rep validity flag on primary change |
+### Round 1 (9 findings)
+
+| # | Sev | Topic                         | Resolution |
+|---|-----|-------------------------------|------------|
+| 1 | HIGH| Methodology rigor             | 10 reps default; cwnd-settle gate; median+IQR |
+| 2 | HIGH| Mouse percentile aggregation  | report full p99 distribution (min/p50/p90/max) |
+| 3 | HIGH| Class collision               | 12865/12866 firewall filter in §4.4 |
+| 4 | HIGH| Source CPU bottleneck         | mpstat + 90% CPU validity flag |
+| 5 | LOW | Per-flow distinction          | record bucket-peak as observability |
+| 6 | HIGH| Per-mouse RR rate             | pace 1000 RR/s; verify achieved RPS |
+| 7 | MED | CoS counter delta             | per-counter deltas; invalidate on regression |
+| 8 | MED | Reproducibility after fail    | preflight kills stale procs in our pgid |
+| 9 | HIGH| Acceptance gate values        | reporting thresholds; PR doesn't close #897-899 |
+| 10| MED | HA failover protection        | RG-watcher + journalctl grep |
+
+### Round 2 (12 findings)
+
+| # | Sev | Topic                         | Resolution |
+|---|-----|-------------------------------|------------|
+| A1| HIGH| Cwnd-settle gate ambiguity    | Pinned: 3 consecutive `intervals[].sum.bits_per_second` within ±10% of median, ≥0.5 Gb/s, 20s timeout |
+| A2| HIGH| Median-of-p99 hides regression| Report full p99 distribution: p99_min/p99_p50/p99_p90/p99_max + sorted list archive |
+| A3| -   | Port-range syntax check       | CLOSED — confirmed supported per `lexer.go:235`, `parser_security_test.go:337` |
+| A4| LOW | Wire-load math                | Corrected to ~230-250 Mbps aggregate (TCP_RR with headers + ACKs); 23-25% of shaper |
+| A5| -   | Plan honesty on no-SLO closure| CLOSED — §9 explicit |
+| A6| MED | Global pkill kills tenants    | Track harness pgid; kill only ours via `kill -KILL -<pgid>` |
+| A7| MED | 5s RG poll misses sub-second  | Cross-check journalctl cluster transition messages since `rep_T0` |
+| B1| HIGH| sysstat not installed         | Preflight `command -v mpstat` || `apt-get install -y sysstat` |
+| B2| MED | iperf3 -t 80 inconsistency    | Fixed to `-t 60` (10s warm-up + 50s mouse window) |
+| B3| LOW | Output path inconsistency     | Standardized: `/tmp/100e100m/<run-ts>/<rep-N>/<phase>/` |
+| B4| LOW | Cool-down drain math          | Documented: 1.19 MiB / 1 Gb/s ≈ 10 ms drain; 10s is 1000× margin |
+| B5| MED | Elephants-only tail inflates CoV| Eliminated by trimming to -t 60 (no tail) |
+| C1| MED | apt-get error path missing    | `apt-get update -qq` + exit-code check + abort with logged error |
+| C2| HIGH| No EXIT trap for filter teardown| EXIT trap in step 10 of preflight: cli rollback removes mouse classifier term, kills pgid |
+| C3| LOW | No --dry-run for development  | `--dry-run` flag added: runs preflight + filter apply + rollback only |
+| N1| HIGH| netserver target undefined    | Preflight reads target from env, `incus exec` for management, fails clearly if not present |
