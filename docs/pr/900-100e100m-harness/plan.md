@@ -295,24 +295,42 @@ from the bpfrx-fw0 host (the dev machine where this script
 runs).
 
 For each backgrounded container process, the launch pattern is
-(R4#4: variables passed as positional args so they expand
-on the host side BEFORE single-quoted-body reaches the
-remote shell):
+(R4#4 + R5 self-audit: variables passed as positional args so
+they expand on the host side BEFORE single-quoted-body reaches
+the remote shell, AND the body uses `shift 2` to consume the
+two metadata args before `"$@"` expands to the actual command):
 
 ```bash
 incus exec ${instance} -- bash -c '
-    "$@" > "/tmp/$1" 2>&1 &
-    echo $! > "/tmp/$2"
-' _ "${out}" "${pidfile}" -- ${cmd_args[@]}
+    out_path="$1"; pidfile_path="$2"; shift 2
+    "$@" > "${out_path}" 2>&1 &
+    echo $! > "${pidfile_path}"
+' _ "/tmp/${out}" "/tmp/${pidfile}" ${cmd_args[@]}
 ```
 
-Where `_` is `$0` (script name), `${out}` becomes `$1`,
-`${pidfile}` becomes `$2`, then a literal `--` separator, then
-the command and its args. Inside the inner shell `"$@"`
-expands to the command and its args (after the `--`).
+`_` is `$0` (script-name slot), `/tmp/${out}` is `$1` (out
+path), `/tmp/${pidfile}` is `$2` (pid file), `${cmd_args[@]}`
+becomes `$3+`. Inside the body, `shift 2` removes the two
+metadata args so `"$@"` expands to ONLY the cmd_args (R5#5
+fix: prior pattern had `"$@"` see all 4+ args including the
+path-args, running the wrong command).
 
-For simple cases without complex command args, a clearer
-form uses `printf -v` or explicit substitution:
+For commands with embedded shell metacharacters (pipes,
+redirects, complex quoting) where positional pass-through is
+awkward, use the double-quoted alternative below.
+
+**When to use which pattern (R5#6):**
+
+- **Positional pass-through (preferred)**: simple invocations
+  like `mpstat 1 60 -o JSON`, `netserver -p 12866`. Args don't
+  contain shell metacharacters; the `shift 2` + `"$@"` shape
+  is clean.
+- **Double-quoted body (fallback)**: when the command is a
+  template containing pipes (`cmd1 | cmd2`) or shell builtins
+  that can't survive the positional split. Carefully escape
+  any `$` that should expand on the remote (`\$!`, `\$(...)`).
+
+Double-quoted form:
 
 ```bash
 incus exec ${instance} -- bash -c \
@@ -320,8 +338,8 @@ incus exec ${instance} -- bash -c \
      echo \$! > /tmp/${pidfile}"
 ```
 
-(Double-quoted `bash -c` body: host vars expand, `$!`
-escaped via `\$!` so it expands on the remote.)
+Host vars (`${cmd_template}`, `${out}`, `${pidfile}`) expand
+on the host; `\$!` survives unexpanded into the remote shell.
 
 To stop:
 
@@ -523,9 +541,18 @@ start, so re-runs do not overwrite (R2 B3).
 5. Stop mpstat (kill the tracked pid).
 6. Sleep 10 s cool-down.
 7. Snapshot CoS counters (mid).
-8. Start `mpstat 1 60 -o JSON` for loaded phase (R4 MED#6:
-   count-bounded so SIGTERM is not needed; mpstat finishes
-   on its own with valid JSON).
+8. Start `mpstat 1 60 -o JSON` for loaded phase, output
+   to per-rep path
+   `/tmp/<container-rep-dir>/loaded-mpstat.json`
+   (R4 MED#6 + R5 self-audit #3: parameterized output path
+   for incus file pull).
+   - mpstat is backgrounded but tracked via pidfile so the
+     end-of-rep step can `wait` for its 60 samples to
+     complete (R5 #2 fix: prior plan didn't specify mpstat
+     completion barrier; if rep advanced before mpstat
+     finished, the next rep's mpstat would write to a path
+     potentially colliding with this one's still-open
+     handle).
 9. Start `iperf3 -c <target> -p 5201 -P 100 -t 90 -i 1`
    (text mode, R4#1+#2) in background, output to
    <rep>/loaded-elephants.txt.
@@ -538,8 +565,13 @@ start, so re-runs do not overwrite (R2 B3).
 12. SIGTERM iperf3 when mice finish (R4#1: stops the
     elephants-only tail from inflating CoV).
 13. Snapshot CoS counters (after).
-14. mpstat ran for 60 s and exited on its own (no kill
-    needed).
+14. **Wait for mpstat to complete**: poll the mpstat
+    pidfile target via `incus exec ... bash -c "kill -0
+    \$(cat /tmp/${pidfile}) 2>/dev/null"` every 1 s; once
+    the process is gone, mpstat's JSON is finalized.
+    Pull mpstat output to host. (R5 #2 fix: explicit
+    completion barrier so backgrounded mpstat doesn't
+    bleed into the next rep.)
 15. Pull `journalctl -u xpfd --since=<rep_T0>` from fw0 and
     fw1 (R2 A7); grep for cluster transition lines.
     Invalidate rep if any "cluster: primary transition",
@@ -566,7 +598,13 @@ start, so re-runs do not overwrite (R2 B3).
 ### 6.4 Run count, IQR, and auto-extension
 
 **Default 10 reps.** Total runtime ≈ 10 × (60 + 10 + 70 + 10)
-≈ 25 min.
+≈ 25 min for measurement work, plus ~3-5 min for `incus exec`
+overhead (R5 self-audit #8: a single rep does ~50-100 incus
+exec round trips for mpstat start/stop, netperf launch, file
+pulls, cli queries; over 10 reps that's 500-1000 round trips
+at typically ~10-50 ms each = 5-50 s of overhead per rep).
+Total realistic runtime: **~28-30 min** for the default 10
+reps; up to **~60 min** if auto-extension to 20 reps fires.
 
 **IQR definition** (R3 MED#12): all percentile reporting uses
 **nearest-rank percentiles**:
@@ -639,10 +677,32 @@ with a 95% CI stopping rule.
   `journalctl -u xpfd --since=<run-T0>` from fw0 and fw1 and
   snapshot alongside the metrics. Captures any rebalance / SFQ
   / flow_share warnings.
-- **CoS counter deltas** (Codex finding #7): parse before/mid/
-  after snapshots into per-counter deltas (after − before for
-  loaded phase, mid − before for baseline phase). Emit deltas
-  in the summary; invalidate the rep if any decreases.
+- **CoS counter deltas** (Codex finding #7 + R5 self-audit
+  #7): parse before/mid/after snapshots into per-counter
+  deltas (after − before for loaded, mid − before for
+  baseline). Emit deltas; invalidate the rep on regression.
+
+  **Parsing approach**: `cli show class-of-service interface`
+  emits text, not JSON. Sample from the live cluster:
+  ```
+      4   1   iperf-a   5   yes   1.00 Gb/s  ...
+          Drops: flow_share=944  buffer=0  ecn_marked=4975584
+          DrainShape: sent_bytes=151885438893  park_root=0  park_queue=24292230
+  ```
+  Regex captures (Python `re.findall`):
+  - `flow_share=(\d+)`   → admission_flow_share_drops
+  - `ecn_marked=(\d+)`   → admission_ecn_marked
+  - `park_root=(\d+)`    → drain_park_root_tokens
+  - `park_queue=(\d+)`   → drain_park_queue_tokens
+  - `sent_bytes=(\d+)`   → sanity-check on shaper output
+    (~ class shaper × phase duration)
+
+  These show-output field names are shorter than the wire
+  field names in `pkg/dataplane/userspace/protocol.go`. If a
+  future xpfd version renames any, the harness will silently
+  fail to parse — the harness MUST emit a clear warning if
+  any expected regex returns zero matches across all queues
+  in any snapshot.
 - **mpstat per rep** (Codex finding #4): captured in
   background; 90% CPU saturation detection from this log
   drives the per-rep validity flag.
@@ -799,6 +859,22 @@ out of scope for this PR.
 | 9 | MED | Env file placeholder invalid shell | Use `IPERF3_TARGET_INSTANCE="cluster-userspace-host"` (real value committed in the harness PR) |
 | 10| LOW | Auto-extension loop unpinned     | §6.4 specifies the exact while/break conditions with strict-less-than gates |
 | 11| LOW | Pruning step order unpinned      | Pruning is preflight step 3.5: AFTER trap registration, BEFORE any cli mutation |
+
+### Round 5 (Codex CLI runtime unavailable; Claude self-audit)
+
+Codex runtime returned a CLI-not-installed error during R5;
+self-audit applied for the questions queued for that round.
+
+| # | Sev | Topic                            | Resolution |
+|---|-----|----------------------------------|------------|
+| 1 | -   | Consistency sweep                | CLEAN — only explanatory mentions of "median-of-p99" remain in §4.2 (counterexample explanation) and §12 history |
+| 2 | MED | mpstat completion barrier        | §6.2 step 14 now waits for mpstat pidfile to clear before pulling output and advancing rep |
+| 3 | LOW | mpstat output path parameterized | §6.2 step 8 specifies per-rep path `/tmp/<container-rep-dir>/loaded-mpstat.json` |
+| 4 | -   | Auto-extend math                 | CLEAN — strict-less-than gates verified: 10 + 5 + 5 = 20 max attempts |
+| 5 | HIGH| `bash -c "$@"` includes ALL args | §6.0 fixed: `shift 2` consumes the two metadata args before `"$@"` expands to the actual command |
+| 6 | MED | Pattern-selection ambiguity      | §6.0 now pins: positional pass-through for simple invocations, double-quoted body for templates with shell metacharacters |
+| 7 | MED | CoS counter parsing approach     | §7 now specifies regex captures from `cli show class-of-service interface` text output, mapping to protocol.go fields |
+| 8 | LOW | Incus exec runtime overhead      | §6.4 runtime estimate now includes 3-5 min overhead acknowledgment; total realistic runtime ~28-30 min for 10 reps |
 
 ## 13. Environmental config addition
 
