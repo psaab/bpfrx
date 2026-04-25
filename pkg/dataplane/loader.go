@@ -129,6 +129,16 @@ func (m *Manager) AttachXDP(ifindex int, forceGeneric bool) error {
 		return fmt.Errorf("XDP already attached to ifindex %d", ifindex)
 	}
 
+	// #863: defer setting IFACE_FLAG_XDP_ATTACHED on iface_zone_map
+	// entries for this ifindex until AFTER a successful attach. The
+	// flag is the tc_main tunnel-egress bypass's positive proof; if
+	// attach fails, the flag must NOT be set.
+	defer func() {
+		if _, ok := m.xdpLinks[ifindex]; ok {
+			m.setXDPAttachedFlag(ifindex, true)
+		}
+	}()
+
 	// Try to load a previously pinned link and update it atomically.
 	//
 	// #864: before reusing, verify the pinned link's attach mode matches
@@ -251,8 +261,49 @@ func (m *Manager) DetachXDP(ifindex int) error {
 		return fmt.Errorf("detach XDP from ifindex %d: %w", ifindex, err)
 	}
 	delete(m.xdpLinks, ifindex)
+	// #863: clear IFACE_FLAG_XDP_ATTACHED so the tc_main tunnel-egress
+	// bypass stops accepting traffic from this ingress ifindex as
+	// XDP-validated.
+	m.setXDPAttachedFlag(ifindex, false)
 	slog.Info("detached XDP program", "ifindex", ifindex)
 	return nil
+}
+
+// setXDPAttachedFlag sets or clears IFACE_FLAG_XDP_ATTACHED on every
+// iface_zone_map entry whose key.Ifindex matches. Covers all VLAN
+// sub-interface entries derived from this physical ifindex.
+func (m *Manager) setXDPAttachedFlag(ifindex int, attached bool) {
+	zm, ok := m.maps["iface_zone_map"]
+	if !ok {
+		return
+	}
+	var key IfaceZoneKey
+	var val IfaceZoneValue
+	iter := zm.Iterate()
+	type kv struct {
+		k IfaceZoneKey
+		v IfaceZoneValue
+	}
+	var updates []kv
+	for iter.Next(&key, &val) {
+		if key.Ifindex != uint32(ifindex) {
+			continue
+		}
+		newFlags := val.Flags
+		if attached {
+			newFlags |= IfaceFlagXDPAttached
+		} else {
+			newFlags &^= IfaceFlagXDPAttached
+		}
+		if newFlags == val.Flags {
+			continue
+		}
+		val.Flags = newFlags
+		updates = append(updates, kv{k: key, v: val})
+	}
+	for _, u := range updates {
+		zm.Update(u.k, u.v, ebpf.UpdateAny)
+	}
 }
 
 // SetZone maps an {ifindex, vlanID} to a security zone and routing table in the BPF map.
@@ -260,6 +311,14 @@ func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTabl
 	zm, ok := m.maps["iface_zone_map"]
 	if !ok {
 		return fmt.Errorf("iface_zone_map not found")
+	}
+	// #863: preserve IFACE_FLAG_XDP_ATTACHED across config-driven
+	// rewrites. The flag is owned by AttachXDP/DetachXDP based on the
+	// live link state; the compiler doesn't know about it. If XDP is
+	// currently attached, OR the bit in so the new entry doesn't lose
+	// the tc_main bypass guard until DetachXDP clears it.
+	if _, attached := m.xdpLinks[ifindex]; attached {
+		flags |= IfaceFlagXDPAttached
 	}
 	key := IfaceZoneKey{Ifindex: uint32(ifindex), VlanID: vlanID}
 	val := IfaceZoneValue{

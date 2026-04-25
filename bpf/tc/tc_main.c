@@ -99,10 +99,25 @@ int tc_main_prog(struct __sk_buff *skb)
 	 * TC conntrack won't find a session match (post-NAT IPs don't
 	 * match pre-NAT session keys), and the ingress_ifindex != 0 drop
 	 * would kill the packet.  Pass it through — kernel handles
-	 * encapsulation after TC returns. */
+	 * encapsulation after TC returns.
+	 *
+	 * #863: gate the bypass on positive evidence that XDP actually ran
+	 * on the ingress side. Look up iface_zone_map for the ingress
+	 * ifindex (vlan_id=0; VLAN sub-ifs inherit from the parent's flag
+	 * via the loader's set-on-attach logic) and require
+	 * IFACE_FLAG_XDP_ATTACHED to be set. Without this gate, packets
+	 * from interfaces without XDP (loopback, veth, mgmt NIC, tunnel-
+	 * decap netdev) routed out via a tunnel skip enforcement. */
 	if (zone_ptr && (zone_ptr->flags & IFACE_FLAG_TUNNEL) &&
 	    skb->ingress_ifindex != 0) {
-		return TC_ACT_OK;
+		struct iface_zone_key ik = {
+			.ifindex = skb->ingress_ifindex,
+			.vlan_id = 0,
+		};
+		struct iface_zone_value *iv = bpf_map_lookup_elem(&iface_zone_map, &ik);
+		if (iv && (iv->flags & IFACE_FLAG_XDP_ATTACHED)) {
+			return TC_ACT_OK;
+		}
 	}
 
 	/* Suppress outgoing MLDv2 reports on RETH member interfaces.
