@@ -676,31 +676,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// WaitGroup for coordinated shutdown of background goroutines
 	var wg sync.WaitGroup
 
-	// #840 Slice D v2 — start the RSS rebalance loop. Reads live
-	// config state from the rss_indirection.go atomic vars on each
-	// tick, so runtime changes (config reload, kill switch) take
-	// effect on the next tick without restart. The signal source is
-	// the userspace dataplane helper's per-binding RX-packet counter
-	// (1:1 with RX rings under AF_XDP zero-copy). For non-userspace
-	// deploys, a nil reader is passed and the loop is a pure no-op.
-	//
-	// Codex MED 1: spawned with the post-NotifyContext ctx so SIGTERM
-	// / SIGINT cancels the loop directly (rather than waiting for the
-	// outer parent ctx to cancel), and tracked via wg so daemon
-	// shutdown waits for the loop to exit before tearing down the
-	// userspace manager.
-	if !d.opts.NoDataplane {
-		var rssReader bindingRXReader
-		if um, ok := d.dp.(*dpuserspace.Manager); ok {
-			rssReader = userspaceBindingRXReader{mgr: um}
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			runRSSRebalanceLoop(ctx, realRSSExecutor{}, rssReader)
-		}()
-	}
-
 	// NOTE: session sync dp wiring + sweep start moved into startClusterComms
 	// goroutine to avoid race: d.sessionSync is created asynchronously.
 
@@ -1733,32 +1708,6 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) {
 	}
 	// Reset VIP warning suppression so new config gets fresh warnings.
 	d.vipWarnedIfaces = nil
-
-	// Codex R2 Q2 (#840 RSS rebalance race): mark the entire
-	// applyConfigLocked window so the rebalance loop, after
-	// acquiring rssWriteMu, can abandon any in-flight rebalance
-	// without depending on a generation snapshot/recheck pair.
-	//
-	// Why a flag, not a single ConfigGen bump at entry: the terminal
-	// publishRSSState + BumpRSSConfigGen happens deep inside
-	// reapplyRSSIndirection (Step 21, line ~2603) → applyRSSIndirection
-	// → publishRSSState (rss_indirection.go:228). A bump-only
-	// approach leaves a window after the entry bump where the
-	// rebalance loop's tick-start snapshot equals its post-lock
-	// recheck — both see the bumped-once gen — and the rebalance
-	// passes its abandon gates while applyConfigLocked is mid-flight
-	// (i.e. d.dp.Compile at line ~2018 may have already changed
-	// helper bindings).
-	//
-	// The flag is checked under rssWriteMu in the rebalance loop, so
-	// applyConfigLocked → applyRSSIndirection (which takes
-	// rssWriteMu) and the rebalance write path are mutually
-	// exclusive. The flag clears AFTER that terminal apply, by which
-	// point publishRSSState has updated rssEnabled / rssWorkers /
-	// rssAllowed for the new config — so any rebalance that runs
-	// next sees consistent state.
-	SetRSSApplyInProgress(true)
-	defer SetRSSApplyInProgress(false)
 
 	// Log config validation warnings
 	for _, w := range cfg.Warnings {
