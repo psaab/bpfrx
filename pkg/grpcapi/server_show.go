@@ -30,6 +30,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -1272,7 +1273,7 @@ func (s *Server) GetSystemInfo(_ context.Context, req *pb.GetSystemInfoRequest) 
 
 // --- ShowText RPC ---
 
-func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowTextResponse, error) {
+func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.ShowTextResponse, error) {
 	cfg := s.store.ActiveConfig()
 	var buf strings.Builder
 
@@ -3986,27 +3987,41 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		}
 
 	case "chassis-hardware":
-		// Alias: same output as "chassis" (CPU, memory, NICs)
-		return s.ShowText(nil, &pb.ShowTextRequest{Topic: "chassis"})
+		// Alias: same output as "chassis" (CPU, memory, NICs).
+		// Forward the caller's context so metadata like #879's
+		// xpf-no-peer guard propagates correctly through the alias.
+		return s.ShowText(ctx, &pb.ShowTextRequest{Topic: "chassis"})
 
 	case "chassis-forwarding":
 		// #877: Junos-style forwarding-daemon health view.
 		// #881: CPU rows are 5s/1m/5m windows from s.fwdSampler.
-		var snap fwdstatus.SamplerSnapshot
-		if s.fwdSampler != nil {
-			snap = s.fwdSampler.Snapshot()
+		// #879: cluster mode renders BOTH node0:/node1: blocks. To
+		// prevent infinite recursion, peer calls carry the
+		// `xpf-no-peer:1` gRPC metadata; when present we skip the
+		// peer dial-back and emit a single local block.
+		md, _ := metadata.FromIncomingContext(ctx)
+		isPeerCall := len(md.Get("xpf-no-peer")) > 0
+
+		localBuf := s.buildLocalForwarding()
+
+		if s.cluster == nil || isPeerCall {
+			buf.WriteString(localBuf)
+			break
 		}
-		fs, err := fwdstatus.Build(
-			s.dp,
-			fwdstatus.OSProcReader{},
-			s.startTime,
-			s.cluster != nil,
-			snap,
-		)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "build forwarding status: %v", err)
+
+		// Cluster mode, original (non-peer) call — compose two blocks.
+		localNodeID := s.cluster.NodeID()
+		fmt.Fprintf(&buf, "node%d:\n%s\n%s",
+			localNodeID, chassisForwardingSeparator, localBuf)
+
+		peerBuf, peerErr := s.dialAndShowForwarding(ctx)
+		peerNodeID := s.cluster.PeerNodeID()
+		fmt.Fprintf(&buf, "\nnode%d:\n%s\n", peerNodeID, chassisForwardingSeparator)
+		if peerErr != nil {
+			fmt.Fprintf(&buf, "FWDD status:\n  (peer unreachable: %s)\n", peerErr)
+		} else {
+			buf.WriteString(peerBuf)
 		}
-		buf.WriteString(fwdstatus.Format(fs))
 
 	case "chassis-cluster", "chassis-cluster-status":
 		if s.cluster != nil {
@@ -5208,4 +5223,54 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 	}
 
 	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+// chassisForwardingSeparator is the dashed separator that frames each
+// per-node block in cluster-mode `show chassis forwarding` output,
+// matching the shape used by `show chassis cluster`.
+const chassisForwardingSeparator = "--------------------------------------------------------------------------"
+
+// buildLocalForwarding renders a single-node FWDD-status block for
+// the local node. Used both for standalone-mode output and as the
+// local half of cluster-mode composition.
+func (s *Server) buildLocalForwarding() string {
+	var snap fwdstatus.SamplerSnapshot
+	if s.fwdSampler != nil {
+		snap = s.fwdSampler.Snapshot()
+	}
+	fs, err := fwdstatus.Build(
+		s.dp,
+		fwdstatus.OSProcReader{},
+		s.startTime,
+		snap,
+	)
+	if err != nil {
+		return fmt.Sprintf("FWDD status:\n  (build failed: %s)\n", err)
+	}
+	return fwdstatus.Format(fs)
+}
+
+// dialAndShowForwarding queries the cluster peer for its single-node
+// FWDD-status block. Injects the `xpf-no-peer:1` outgoing metadata
+// so the peer renders local-only and never recurses back. Returns
+// the peer's formatted block or an error if the peer is unreachable.
+func (s *Server) dialAndShowForwarding(ctx context.Context) (string, error) {
+	conn, err := s.dialPeer()
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	client := pb.NewBpfrxServiceClient(conn)
+	// dialPeer already runs a 2s GetStatus probe per fabric (up to
+	// 4s for fab0+fab1). 5s additional outer budget for the actual
+	// ShowText keeps total under ~9s — comfortable headroom for a
+	// peer mid-failover holding userspace.Manager.mu.
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ctx = metadata.AppendToOutgoingContext(ctx, "xpf-no-peer", "1")
+	resp, err := client.ShowText(ctx, &pb.ShowTextRequest{Topic: "chassis-forwarding"})
+	if err != nil {
+		return "", err
+	}
+	return resp.Output, nil
 }
