@@ -1,6 +1,7 @@
 package dataplane
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -48,6 +49,17 @@ type Manager struct {
 	VlanSubInterfaces      map[int]bool       // VLAN sub-interface ifindexes (skip XDP swap for these)
 	mu                     sync.Mutex         // protects userspaceCounterOffsets
 	userspaceCounterOffsets map[uint32]uint64  // userspace counter deltas merged in ReadGlobalCounter
+
+	// #863: refcount of XDP-attached ifindexes that "claim" the
+	// IFACE_FLAG_XDP_ATTACHED bit on each iface_zone_map entry.
+	// Compiler.go allows BOTH parent (native) and sub-iface (generic)
+	// XDP simultaneously; both AttachXDP calls flag the same
+	// {parent, vlan_id} entry, and the first DetachXDP must NOT
+	// clear the bit while the other link is still live. Refcount
+	// makes the flag state correct under overlap: bit set when
+	// claimants > 0, cleared on the last drop. Mutated only under
+	// the implicit single-threaded compile path; no separate lock.
+	xdpFlagClaims map[IfaceZoneKey]map[int]bool
 }
 
 // New creates a new dataplane Manager.
@@ -60,6 +72,7 @@ func New() *Manager {
 		PersistentNAT:     NewPersistentNATTable(),
 		XDPEntryProg:      "xdp_main_prog",
 		VlanSubInterfaces: make(map[int]bool),
+		xdpFlagClaims:     make(map[IfaceZoneKey]map[int]bool),
 	}
 }
 
@@ -288,32 +301,32 @@ func (m *Manager) DetachXDP(ifindex int) error {
 // iface_zone_map entry that represents the same ingress surface as
 // the XDP attachment described by ifindex.
 //
-// xpf attaches XDP to two kinds of ifindexes:
-//   - Physical ifindexes (native-mode XDP on PFs, virtio NICs). The
-//     compiler writes iface_zone_map entries keyed by
-//     {phys_ifindex, vlan_id} for every VLAN sub-interface of that
-//     parent. Iterating by `key.Ifindex == phys_ifindex` covers the
-//     native-VLAN entry AND every VLAN sub-iface entry.
-//   - VLAN sub-iface ifindexes (generic-mode XDP on `enpXsY.VLAN`
-//     when the parent went generic — see pkg/dataplane/compiler.go
-//     for the fallback rules). The sub-iface itself has no
+// xpf attaches XDP to two kinds of ifindexes (sometimes BOTH for the
+// same {parent, vlan_id} surface — compiler.go allows native XDP on
+// the parent AND generic XDP on a VLAN sub-iface):
+//   - Physical ifindexes (PFs, virtio NICs). The compiler writes
+//     iface_zone_map entries keyed by {phys_ifindex, vlan_id} for
+//     every VLAN of that parent. Iterating by
+//     `key.Ifindex == phys_ifindex` covers the native-VLAN entry
+//     plus every VLAN sub-iface entry.
+//   - VLAN sub-iface ifindexes. The sub-iface itself has no
 //     iface_zone_map entry; the entry is keyed under the PARENT
-//     physical ifindex plus the VLAN ID. Resolve sub→parent via
-//     vlan_iface_map and flag the {parent, vlan_id} entry.
+//     ifindex plus the VLAN ID. Resolve sub→parent via
+//     vlan_iface_map and flag that {parent, vlan_id} entry.
 //
-// Without the sub→parent resolution, AttachXDP on a VLAN sub-iface
-// would set the flag on no entries → tc_main's tunnel-egress bypass
-// would never fire for that ingress surface (incorrectly denied —
-// not a security bug but defeats the optimization #863 enables for
-// legitimate XDP-validated traffic).
+// Refcount semantics: m.xdpFlagClaims[entry] tracks the SET of
+// ifindexes currently flagging each iface_zone_map entry. The bit
+// is OR'd in when the set transitions empty → non-empty, cleared
+// when it transitions non-empty → empty. Without refcount the
+// first DetachXDP on a parent+sub-iface overlap would clear the bit
+// while the other link is still live, reintroducing the
+// enforcement-bypass #863 is fixing.
 //
-// Iterator and per-entry Update errors are logged at WARN. The flag
-// is best-effort: a stale flag after a failed DetachXDP clear leaves
-// tc_main treating the now-detached ingress as XDP-validated until
-// the next AttachXDP or SetZone re-establishes the correct value.
-// In practice the iface_zone_map is BPF-kernel-managed (no I/O), so
-// updates rarely fail; the WARN is a breadcrumb for the operator
-// who notices unexpected bypass behavior.
+// Iterator and Update errors are logged AND returned. DetachXDP
+// propagates the error so a stale flag is operator-visible.
+// AttachXDP's deferred set logs at WARN but doesn't unwind — the
+// attach succeeded; the next SetZone re-applies the bit per the
+// claim set.
 func (m *Manager) setXDPAttachedFlag(ifindex int, attached bool) error {
 	zm, ok := m.maps["iface_zone_map"]
 	if !ok {
@@ -321,69 +334,105 @@ func (m *Manager) setXDPAttachedFlag(ifindex int, attached bool) error {
 		// to flag. Caller treats this as a no-op success.
 		return nil
 	}
-	type kv struct {
-		k IfaceZoneKey
-		v IfaceZoneValue
-	}
-	var updates []kv
 
-	// Resolve sub→parent: if ifindex is a VLAN sub-iface, the entry
-	// to flag lives at {parent_ifindex, vlan_id}.
+	// Collect the set of {ifindex, vlan_id} keys this XDP attachment
+	// represents. For a physical ifindex this is every entry whose
+	// key.Ifindex matches; for a VLAN sub-iface this is the single
+	// {parent, vlan_id} entry resolved via vlan_iface_map.
+	targets := make(map[IfaceZoneKey]struct{})
+
+	// Sub→parent resolution. Distinguish "not a sub-iface" (ENOENT
+	// is the legitimate fast path: lookup returns ErrKeyNotExist
+	// for any non-VLAN ifindex) from a real lookup error (which we
+	// propagate so the caller can retry).
 	if vmap, ok := m.maps["vlan_iface_map"]; ok {
 		var vinfo VlanIfaceInfo
-		if err := vmap.Lookup(uint32(ifindex), &vinfo); err == nil {
-			parentKey := IfaceZoneKey{Ifindex: vinfo.ParentIfindex, VlanID: vinfo.VlanID}
-			var pv IfaceZoneValue
-			if err := zm.Lookup(parentKey, &pv); err == nil {
-				newFlags := pv.Flags
-				if attached {
-					newFlags |= IfaceFlagXDPAttached
-				} else {
-					newFlags &^= IfaceFlagXDPAttached
-				}
-				if newFlags != pv.Flags {
-					pv.Flags = newFlags
-					updates = append(updates, kv{k: parentKey, v: pv})
-				}
-			}
+		switch err := vmap.Lookup(uint32(ifindex), &vinfo); {
+		case err == nil:
+			targets[IfaceZoneKey{Ifindex: vinfo.ParentIfindex, VlanID: vinfo.VlanID}] = struct{}{}
+		case errors.Is(err, ebpf.ErrKeyNotExist):
+			// Not a sub-iface — fine, fall through to physical-ifindex iter.
+		default:
+			slog.Warn("setXDPAttachedFlag: vlan_iface_map lookup failed",
+				"ifindex", ifindex, "attached", attached, "err", err)
+			return fmt.Errorf("vlan_iface_map lookup: %w", err)
 		}
 	}
 
-	// Flag every entry whose Key.Ifindex matches the AttachXDP
-	// ifindex. For a physical ifindex this covers the native-VLAN
-	// entry (vlan_id=0) and every {phys, vlan_id} VLAN sub-iface
-	// entry. For a VLAN sub-iface ifindex this loop typically finds
-	// nothing (entries are keyed under the parent), but we iterate
-	// in case a future schema change introduces sub-iface entries.
+	// Physical-ifindex iter: collect every {ifindex, *} entry.
 	var key IfaceZoneKey
 	var val IfaceZoneValue
 	iter := zm.Iterate()
 	for iter.Next(&key, &val) {
-		if key.Ifindex != uint32(ifindex) {
-			continue
+		if key.Ifindex == uint32(ifindex) {
+			targets[key] = struct{}{}
 		}
-		newFlags := val.Flags
-		if attached {
-			newFlags |= IfaceFlagXDPAttached
-		} else {
-			newFlags &^= IfaceFlagXDPAttached
-		}
-		if newFlags == val.Flags {
-			continue
-		}
-		val.Flags = newFlags
-		updates = append(updates, kv{k: key, v: val})
 	}
 	if err := iter.Err(); err != nil {
 		slog.Warn("setXDPAttachedFlag: iface_zone_map iterate failed",
 			"ifindex", ifindex, "attached", attached, "err", err)
 		return fmt.Errorf("iface_zone_map iterate: %w", err)
 	}
+
+	// Apply refcount semantics per target. For each entry: update
+	// the claim set; if the set transitions across the empty
+	// boundary, write the bit change to the BPF map.
 	var firstUpdateErr error
-	for _, u := range updates {
-		if err := zm.Update(u.k, u.v, ebpf.UpdateAny); err != nil {
+	for tk := range targets {
+		claims, exists := m.xdpFlagClaims[tk]
+		if !exists {
+			claims = make(map[int]bool)
+		}
+
+		var wantSet bool // bit value AFTER this op
+		if attached {
+			claims[ifindex] = true
+			wantSet = true // we just added a claimant; bit must be set
+			if !exists {
+				// First claimant at this entry — store the new map.
+				m.xdpFlagClaims[tk] = claims
+			}
+		} else {
+			delete(claims, ifindex)
+			if len(claims) == 0 {
+				delete(m.xdpFlagClaims, tk)
+				wantSet = false
+			} else {
+				m.xdpFlagClaims[tk] = claims
+				wantSet = true // others still hold; leave the bit set
+			}
+		}
+
+		// Read current entry, decide whether the bit needs to flip.
+		var cur IfaceZoneValue
+		if err := zm.Lookup(tk, &cur); err != nil {
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				// Entry not present yet (race with compiler's SetZone, or
+				// already deleted). The claim set has been updated above;
+				// SetZone will pick it up via m.xdpFlagClaims when it
+				// re-creates the entry.
+				continue
+			}
+			slog.Warn("setXDPAttachedFlag: iface_zone_map lookup failed",
+				"ifindex", ifindex, "key", tk, "attached", attached, "err", err)
+			if firstUpdateErr == nil {
+				firstUpdateErr = err
+			}
+			continue
+		}
+		newFlags := cur.Flags
+		if wantSet {
+			newFlags |= IfaceFlagXDPAttached
+		} else {
+			newFlags &^= IfaceFlagXDPAttached
+		}
+		if newFlags == cur.Flags {
+			continue
+		}
+		cur.Flags = newFlags
+		if err := zm.Update(tk, cur, ebpf.UpdateAny); err != nil {
 			slog.Warn("setXDPAttachedFlag: iface_zone_map update failed",
-				"ifindex", ifindex, "vlan", u.k.VlanID, "attached", attached, "err", err)
+				"ifindex", ifindex, "key", tk, "attached", attached, "err", err)
 			if firstUpdateErr == nil {
 				firstUpdateErr = err
 			}
@@ -402,14 +451,16 @@ func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTabl
 		return fmt.Errorf("iface_zone_map not found")
 	}
 	// #863: preserve IFACE_FLAG_XDP_ATTACHED across config-driven
-	// rewrites. The flag is owned by AttachXDP/DetachXDP based on the
-	// live link state; the compiler doesn't know about it. If XDP is
-	// currently attached, OR the bit in so the new entry doesn't lose
-	// the tc_main bypass guard until DetachXDP clears it.
-	if _, attached := m.xdpLinks[ifindex]; attached {
+	// rewrites. The flag is owned by AttachXDP/DetachXDP via the
+	// xdpFlagClaims refcount; SetZone consults the claim set for THIS
+	// {ifindex, vlanID} entry. Any non-empty claim set means at least
+	// one XDP attachment still flags this surface (parent native
+	// XDP, sub-iface generic XDP, or both — see compiler.go for the
+	// overlap rules).
+	key := IfaceZoneKey{Ifindex: uint32(ifindex), VlanID: vlanID}
+	if claims := m.xdpFlagClaims[key]; len(claims) > 0 {
 		flags |= IfaceFlagXDPAttached
 	}
-	key := IfaceZoneKey{Ifindex: uint32(ifindex), VlanID: vlanID}
 	val := IfaceZoneValue{
 		ZoneID:       zoneID,
 		Flags:        flags,
