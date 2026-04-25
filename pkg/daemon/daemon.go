@@ -647,6 +647,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}
 
+	// #840 Slice D v2 — start the RSS rebalance loop. Reads live
+	// config state from the rss_indirection.go atomic vars on each
+	// tick, so runtime changes (config reload, kill switch) take
+	// effect on the next tick without restart. The signal source is
+	// the userspace dataplane helper's per-binding RX-packet counter
+	// (1:1 with RX rings under AF_XDP zero-copy). For non-userspace
+	// deploys, a nil reader is passed and the loop is a pure no-op.
+	// Spawned exactly once; ctx cancellation stops it cleanly.
+	// Skipped only when xpfd is run without a dataplane (--no-dataplane).
+	if !d.opts.NoDataplane {
+		var rssReader bindingRXReader
+		if um, ok := d.dp.(*dpuserspace.Manager); ok {
+			rssReader = userspaceBindingRXReader{mgr: um}
+		}
+		go runRSSRebalanceLoop(ctx, realRSSExecutor{}, rssReader)
+	}
+
 	// Remove stale blackhole routes from previous daemon runs before
 	// cluster comms start (which may inject new ones).
 	if d.cluster != nil {

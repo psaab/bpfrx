@@ -1,0 +1,1016 @@
+// #840 Slice D v2 unit tests — RSS indirection rebalance loop.
+//
+// Tests covering imbalance/stability/cooldown, weight computation,
+// degenerate-sample guards, ethtool-X invocation + failure, lifecycle
+// + driver gate, concurrency + ConfigGen / Epoch race semantics
+// (#835 R2 F6, R4 F3, R5 F1+2, R6 F2, R7 F1, R8 F1), and live-reload
+// (R9 F2). Carried over from the original #835 test suite with the
+// signal source swapped from `ethtool -S` to bindingRXReader so the
+// algorithm runs against the live data plane the helper actually
+// sees under AF_XDP zero-copy.
+
+package daemon
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// stubRSSExecutor is a minimal rssExecutor fake for tests. Only the
+// apply path uses ethtool now; the signal path is via bindingRXReader.
+type stubRSSExecutor struct {
+	mu             sync.Mutex
+	driver         map[string]string // iface -> driver name
+	queueCount     map[string]int    // iface -> queue count
+	ethtoolXErr    error             // returned by next runEthtool("-X", ...) call
+	ethtoolXErrOut []byte
+	ethtoolXCalls  [][]string // recorded -X invocations
+}
+
+func newStubRSSExecutor() *stubRSSExecutor {
+	return &stubRSSExecutor{
+		driver:     map[string]string{},
+		queueCount: map[string]int{},
+	}
+}
+
+func (s *stubRSSExecutor) runEthtool(args ...string) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(args) >= 1 && args[0] == "-X" {
+		s.ethtoolXCalls = append(s.ethtoolXCalls, append([]string(nil), args...))
+		if s.ethtoolXErr != nil {
+			return s.ethtoolXErrOut, s.ethtoolXErr
+		}
+		return nil, nil
+	}
+	return nil, nil
+}
+
+func (s *stubRSSExecutor) readDriver(iface string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.driver[iface]
+}
+
+func (s *stubRSSExecutor) readQueueCount(iface string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.queueCount[iface]
+}
+
+func (s *stubRSSExecutor) listInterfaces() []string { return nil }
+
+// stubBindingRXReader is the test impl of bindingRXReader. Stores
+// scripted per-iface cumulative RX-packet counters keyed by ring
+// index. err override forces ReadBindingRX to fail (used for the
+// failure-path test).
+type stubBindingRXReader struct {
+	mu      sync.Mutex
+	samples map[string]map[int]uint64 // iface -> ring -> cumulative pkts
+	err     error
+	calls   int
+}
+
+func newStubBindingRXReader() *stubBindingRXReader {
+	return &stubBindingRXReader{
+		samples: map[string]map[int]uint64{},
+	}
+}
+
+func (r *stubBindingRXReader) set(iface string, rings map[int]uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cp := make(map[int]uint64, len(rings))
+	for k, v := range rings {
+		cp[k] = v
+	}
+	r.samples[iface] = cp
+}
+
+func (r *stubBindingRXReader) ReadBindingRX(iface string) (map[int]uint64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	if r.err != nil {
+		return nil, r.err
+	}
+	src, ok := r.samples[iface]
+	if !ok {
+		// No scripted sample for this iface — return empty map.
+		// Matches a helper that has no bindings on this interface.
+		return map[int]uint64{}, nil
+	}
+	out := make(map[int]uint64, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out, nil
+}
+
+// resetRSSGlobals resets the package-level atomic state so tests are
+// independent. Safe to call from any test; tests are not parallel
+// because they share package-level state.
+func resetRSSGlobals(t *testing.T) {
+	t.Helper()
+	rssIndirectionEpoch.Store(0)
+	rssConfigGen.Store(0)
+	rssEnabled.Store(false)
+	rssWorkers.Store(0)
+	rssAllowedRef.Store(nil)
+}
+
+// ---------------- 5.1 Imbalance + stability + cooldown -----------
+
+func TestImbalance_UnderTriggerDoesNotFire(t *testing.T) {
+	delta := map[int]uint64{0: 100, 1: 95, 2: 98, 3: 92, 4: 97, 5: 99}
+	max, mean := maxMeanOverDomain(delta, 6)
+	if float64(max) > mean*rssRebalanceTriggerRatio {
+		t.Errorf("expected no trigger, got max=%d mean=%.2f ratio=%.2f",
+			max, mean, float64(max)/mean)
+	}
+}
+
+func TestImbalance_OverTriggerFires(t *testing.T) {
+	delta := map[int]uint64{0: 500, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100}
+	max, mean := maxMeanOverDomain(delta, 6)
+	if !(float64(max) > mean*rssRebalanceTriggerRatio) {
+		t.Errorf("expected trigger, got max=%d mean=%.2f ratio=%.2f",
+			max, mean, float64(max)/mean)
+	}
+}
+
+func TestImbalance_ExactlyAtTriggerDoesNotFire(t *testing.T) {
+	// Construct rates so max/mean = exactly 1.8. Mean = 100 → max =
+	// 180, others sum to 5*100 - (180-100) = 500-80 = 420 → 5 rings
+	// each 84.
+	delta := map[int]uint64{0: 180, 1: 84, 2: 84, 3: 84, 4: 84, 5: 84}
+	max, mean := maxMeanOverDomain(delta, 6)
+	if float64(max) > mean*rssRebalanceTriggerRatio {
+		t.Errorf("expected strict-> not trigger; max=%d mean=%.2f ratio=%.2f",
+			max, mean, float64(max)/mean)
+	}
+}
+
+// #835 R3 new-issue #1 / R4 Finding #1 pin: idle-ring skew fires.
+func TestImbalance_IdleRingSkewFires(t *testing.T) {
+	delta := map[int]uint64{0: 24} // rings 1..5 absent (= 0)
+	max, mean := maxMeanOverDomain(delta, 6)
+	if max != 24 {
+		t.Errorf("max: got %d, want 24", max)
+	}
+	if mean != 4.0 {
+		t.Errorf("mean: got %.2f, want 4.0", mean)
+	}
+	if !(float64(max) > mean*rssRebalanceTriggerRatio) {
+		t.Errorf("expected trigger, got ratio=%.2f", float64(max)/mean)
+	}
+}
+
+func TestStability_RequiresConsecutive(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights: equalWeights(6),
+		firstSample:    true,
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+
+	// Seed: first tick captures baseline.
+	reader.set("e0", map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0})
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	s.lastSampleTime = time.Now().Add(-2 * time.Second)
+
+	// Imbalanced sample 1.
+	reader.set("e0", map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if s.consecutiveImbalanced != 1 {
+		t.Errorf("after 1 imbalanced: got %d, want 1", s.consecutiveImbalanced)
+	}
+	s.lastSampleTime = time.Now().Add(-2 * time.Second)
+
+	// Imbalanced sample 2.
+	reader.set("e0", map[int]uint64{0: 10000, 1: 200, 2: 200, 3: 200, 4: 200, 5: 200})
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if s.consecutiveImbalanced != 2 {
+		t.Errorf("after 2 imbalanced: got %d, want 2", s.consecutiveImbalanced)
+	}
+	s.lastSampleTime = time.Now().Add(-2 * time.Second)
+
+	// Balanced sample — must reset.
+	reader.set("e0", map[int]uint64{0: 11000, 1: 1200, 2: 1200, 3: 1200, 4: 1200, 5: 1200})
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if s.consecutiveImbalanced != 0 {
+		t.Errorf("after balanced: got %d, want 0", s.consecutiveImbalanced)
+	}
+}
+
+func TestStability_NonConsecutiveResets(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{currentWeights: equalWeights(6), firstSample: true}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	reader.set("e0", map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0})
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+
+	s.lastSampleTime = time.Now().Add(-2 * time.Second)
+	reader.set("e0", map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if s.consecutiveImbalanced != 1 {
+		t.Errorf("imbalanced 1: got %d", s.consecutiveImbalanced)
+	}
+
+	// Zero-traffic (no delta over previous): all rings stay at same totals.
+	s.lastSampleTime = time.Now().Add(-2 * time.Second)
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if s.consecutiveImbalanced != 0 {
+		t.Errorf("after zero-traffic: got %d, want 0", s.consecutiveImbalanced)
+	}
+}
+
+func TestCooldown_BlocksWithinWindow(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights:        equalWeights(6),
+		consecutiveImbalanced: rssRebalanceStability,
+		lastRebalanceTime:     time.Now(), // just rebalanced
+		lastSampleCounters:    map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	reader.set("e0", map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if len(exec.ethtoolXCalls) != 0 {
+		t.Errorf("cooldown should block: got %d -X calls", len(exec.ethtoolXCalls))
+	}
+}
+
+func TestCooldown_AllowsAfterWindow(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights:        equalWeights(6),
+		consecutiveImbalanced: rssRebalanceStability,
+		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
+		lastSampleCounters:    map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	reader.set("e0", map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if len(exec.ethtoolXCalls) != 1 {
+		t.Errorf("cooldown should allow: got %d -X calls", len(exec.ethtoolXCalls))
+	}
+}
+
+// ---------------- 5.2 Weight computation -------------------------
+
+func TestComputeWeightShift_ShiftsHotToCold(t *testing.T) {
+	delta := map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100}
+	cur := equalWeights(6)
+	got := computeWeightShift(delta, cur)
+	want := []int{15, 25, 20, 20, 20, 20}
+	if !sliceEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestComputeWeightShift_NeverDropsBelowMinWeight(t *testing.T) {
+	delta := map[int]uint64{0: 9999, 1: 1}
+	cur := []int{2, 100}
+	got := computeWeightShift(delta, cur)
+	if got[0] < rssRebalanceMinWeight {
+		t.Errorf("hot ring went below MIN_WEIGHT: got %v", got)
+	}
+}
+
+func TestComputeWeightShift_NoopWhenBalanced(t *testing.T) {
+	delta := map[int]uint64{0: 100, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100}
+	cur := equalWeights(6)
+	got := computeWeightShift(delta, cur)
+	want := equalWeights(6)
+	if !sliceEqual(got, want) {
+		t.Errorf("balanced: got %v, want %v", got, want)
+	}
+}
+
+func TestComputeWeightShift_TiebreakByLowestIndex(t *testing.T) {
+	delta := map[int]uint64{0: 5000, 1: 0, 2: 100, 3: 0, 4: 100, 5: 0}
+	cur := equalWeights(6)
+	got := computeWeightShift(delta, cur)
+	want := []int{15, 25, 20, 20, 20, 20}
+	if !sliceEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+// ---------------- 5.3 Guards (#835 R1 HIGH-4 closure) ------------
+
+func TestGuard_FirstSampleSeedsOnly(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{currentWeights: equalWeights(6), firstSample: true}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	reader.set("e0", map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if s.consecutiveImbalanced != 0 {
+		t.Errorf("first sample should not increment consecutiveImbalanced: got %d", s.consecutiveImbalanced)
+	}
+	if s.firstSample {
+		t.Error("firstSample should be false after seeding")
+	}
+}
+
+func TestGuard_ZeroTotalTrafficResetsImbalance(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights:        equalWeights(6),
+		consecutiveImbalanced: 2,
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+		lastSampleCounters:    map[int]uint64{0: 5000},
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	// Same counter as last → zero delta.
+	reader.set("e0", map[int]uint64{0: 5000})
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if s.consecutiveImbalanced != 0 {
+		t.Errorf("zero-traffic should reset to 0: got %d", s.consecutiveImbalanced)
+	}
+}
+
+// #835 R5 Finding 3 inverted: was SkipsRatio, now FiresRatio.
+func TestGuard_SingleNonZeroRingFiresRatio(t *testing.T) {
+	delta := map[int]uint64{0: 1500} // rings 1..5 absent = 0
+	max, mean := maxMeanOverDomain(delta, 6)
+	if !(float64(max) > mean*rssRebalanceTriggerRatio) {
+		t.Errorf("single-ring skew should fire: max=%d mean=%.2f", max, mean)
+	}
+}
+
+func TestGuard_CounterResetTreatedAsZeroDelta(t *testing.T) {
+	cur := map[int]uint64{0: 50}     // counter went BACKWARDS (helper restart)
+	prev := map[int]uint64{0: 10000} // was much higher
+	d := deltaSafeAgainstResets(cur, prev)
+	if d[0] != 0 {
+		t.Errorf("expected delta=0 on counter reset, got %d", d[0])
+	}
+}
+
+func TestGuard_ManagedDomainLessThan2SkipsRatio(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights:        []int{rssRebalanceDefaultWeight}, // domain=1 — pin
+		consecutiveImbalanced: 2,
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+		lastSampleCounters:    map[int]uint64{0: 0},
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 1
+	reader := newStubBindingRXReader()
+	reader.set("e0", map[int]uint64{0: 5000})
+	rssEnabled.Store(true)
+	rssWorkers.Store(6) // > 1: tick body runs, hits the per-iface guard
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if len(exec.ethtoolXCalls) != 0 {
+		t.Errorf("managed domain < 2 should skip: got %d -X calls", len(exec.ethtoolXCalls))
+	}
+	if s.consecutiveImbalanced != 0 {
+		t.Errorf("guard must reset consecutiveImbalanced: got %d", s.consecutiveImbalanced)
+	}
+}
+
+// ---------------- 5.4 Ethtool invocation + failure --------------
+
+func TestApplyWeights_InvokesEthtoolXWithExpectedArgs(t *testing.T) {
+	exec := newStubRSSExecutor()
+	weights := []int{15, 25, 20, 20, 20, 20}
+	if err := applyWeights("e0", weights, exec); err != nil {
+		t.Fatal(err)
+	}
+	if len(exec.ethtoolXCalls) != 1 {
+		t.Fatalf("expected 1 -X call, got %d", len(exec.ethtoolXCalls))
+	}
+	got := exec.ethtoolXCalls[0]
+	want := []string{"-X", "e0", "weight", "15", "25", "20", "20", "20", "20"}
+	if !stringSliceEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestApplyWeights_StderrExitCodeSurfaced(t *testing.T) {
+	exec := newStubRSSExecutor()
+	exec.ethtoolXErr = errors.New("exit status 1")
+	exec.ethtoolXErrOut = []byte("invalid weight value")
+	err := applyWeights("e0", []int{15, 25, 20, 20, 20, 20}, exec)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !contains(err.Error(), "invalid weight value") {
+		t.Errorf("error should contain stderr; got: %v", err)
+	}
+}
+
+func TestApplyWeights_PermanentSkipAfterMaxFailures(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights:        equalWeights(6),
+		consecutiveImbalanced: rssRebalanceStability,
+		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+		lastSampleCounters:    map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	exec.ethtoolXErr = errors.New("simulated failure")
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	st := map[string]*rssRebalanceState{"e0": s}
+	for i := 0; i < rssRebalanceMaxFailures; i++ {
+		// Reset cooldown each iteration to allow retries.
+		s.lastRebalanceTime = time.Now().Add(-2 * rssRebalanceCooldown)
+		s.consecutiveImbalanced = rssRebalanceStability
+		s.lastSampleTime = time.Now().Add(-2 * time.Second)
+		// Bump sample counters monotonically so each tick has a
+		// non-zero delta (otherwise the zero-traffic guard would
+		// skip the rebalance attempt and no failure is recorded).
+		base := uint64(5000 * (i + 2))
+		reader.set("e0", map[int]uint64{
+			0: base, 1: base / 50, 2: base / 50, 3: base / 50, 4: base / 50, 5: base / 50,
+		})
+		rebalanceTick(st, exec, reader)
+	}
+	if !s.permanentSkip {
+		t.Errorf("expected permanentSkip after %d failures, got consecutiveFailures=%d",
+			rssRebalanceMaxFailures, s.consecutiveFailures)
+	}
+}
+
+// Sample-source failures (helper unreachable) accumulate
+// consecutiveFailures and eventually permanentSkip — same gate as
+// apply failures but on the read path.
+func TestSampleFailure_PermanentSkipAfterMaxFailures(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{currentWeights: equalWeights(6), firstSample: true}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	reader.err = errors.New("helper unreachable")
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	st := map[string]*rssRebalanceState{"e0": s}
+	for i := 0; i < rssRebalanceMaxFailures; i++ {
+		rebalanceTick(st, exec, reader)
+	}
+	if !s.permanentSkip {
+		t.Errorf("expected permanentSkip after %d sample failures, got %d",
+			rssRebalanceMaxFailures, s.consecutiveFailures)
+	}
+}
+
+// ---------------- 5.5 Lifecycle + driver gate -------------------
+
+func TestLoop_StopsOnContextCancel(t *testing.T) {
+	resetRSSGlobals(t)
+	exec := newStubRSSExecutor()
+	reader := newStubBindingRXReader()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runRSSRebalanceLoop(ctx, exec, reader)
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+		// ok
+	case <-time.After(2 * rssRebalanceSampleInterval):
+		t.Fatal("loop did not exit within 2 sample intervals after cancel")
+	}
+}
+
+func TestLoop_SkipsNonMlx5Iface(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{currentWeights: equalWeights(6), firstSample: true}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = "virtio_net"
+	reader := newStubBindingRXReader()
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if len(exec.ethtoolXCalls) != 0 {
+		t.Errorf("non-mlx5 should skip: got %d -X calls", len(exec.ethtoolXCalls))
+	}
+}
+
+func TestLoop_SkipsOnRSSDisabled(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights:        equalWeights(6),
+		consecutiveImbalanced: rssRebalanceStability,
+		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	reader.set("e0", map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rssEnabled.Store(false) // disabled
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if len(exec.ethtoolXCalls) != 0 {
+		t.Errorf("disabled: got %d -X calls", len(exec.ethtoolXCalls))
+	}
+}
+
+func TestLoop_SkipsOnNilReader(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{currentWeights: equalWeights(6), firstSample: true}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	// nil reader — the loop must early-return so non-userspace
+	// deploys see the rebalance loop as a pure no-op.
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, nil)
+	if len(exec.ethtoolXCalls) != 0 {
+		t.Errorf("nil reader: got %d -X calls", len(exec.ethtoolXCalls))
+	}
+}
+
+func TestLoop_MultiInterfaceStateIsolation(t *testing.T) {
+	resetRSSGlobals(t)
+	sa := &rssRebalanceState{currentWeights: equalWeights(6), firstSample: true}
+	sb := &rssRebalanceState{currentWeights: equalWeights(6), firstSample: true}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	exec.driver["e1"] = mlx5Driver
+	exec.queueCount["e1"] = 6
+	reader := newStubBindingRXReader()
+	reader.set("e0", map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	reader.set("e1", map[int]uint64{0: 100, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0", "e1"}
+	rssAllowedRef.Store(&a)
+	st := map[string]*rssRebalanceState{"e0": sa, "e1": sb}
+	rebalanceTick(st, exec, reader)
+	if &sa.currentWeights[0] == &sb.currentWeights[0] {
+		t.Error("state isolation broken: two ifaces share weight slice")
+	}
+}
+
+// ---------------- 5.6 Concurrency + ConfigGen / Epoch -----------
+
+// bumpingReader simulates a control-plane ConfigGen bump arriving
+// between the rebalance tick's snapshot and its post-lock re-check.
+type bumpingReader struct {
+	base          *stubBindingRXReader
+	bumpOnRCalled *atomic.Bool
+}
+
+func (r *bumpingReader) ReadBindingRX(iface string) (map[int]uint64, error) {
+	if !r.bumpOnRCalled.Load() {
+		BumpRSSConfigGen()
+		r.bumpOnRCalled.Store(true)
+	}
+	return r.base.ReadBindingRX(iface)
+}
+
+// epochBumpingReader simulates a control-plane apply that bumps
+// rssIndirectionEpoch between snapshot and post-lock re-check.
+type epochBumpingReader struct {
+	base          *stubBindingRXReader
+	bumpOnRCalled *atomic.Bool
+}
+
+func (r *epochBumpingReader) ReadBindingRX(iface string) (map[int]uint64, error) {
+	if !r.bumpOnRCalled.Load() {
+		BumpRSSEpoch()
+		r.bumpOnRCalled.Store(true)
+	}
+	return r.base.ReadBindingRX(iface)
+}
+
+func TestConcurrency_StaleWeightsAbandonedOnConfigGenChange(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights:        equalWeights(6),
+		consecutiveImbalanced: rssRebalanceStability,
+		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+		lastSampleCounters:    map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	base := newStubBindingRXReader()
+	base.set("e0", map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	bumped := atomic.Bool{}
+	wrapped := &bumpingReader{base: base, bumpOnRCalled: &bumped}
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, wrapped)
+	if len(exec.ethtoolXCalls) != 0 {
+		t.Errorf("expected abandon (no -X call), got %d", len(exec.ethtoolXCalls))
+	}
+	if !bumped.Load() {
+		t.Error("test wiring: bump never fired")
+	}
+}
+
+func TestConcurrency_EpochBumpResetsCurrentWeights(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights:        []int{10, 30, 20, 20, 20, 20},
+		consecutiveImbalanced: 3,
+		lastSeenEpoch:         0,
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+		lastSampleCounters:    map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	reader.set("e0", map[int]uint64{0: 1000, 1: 1000, 2: 1000, 3: 1000, 4: 1000, 5: 1000})
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	BumpRSSEpoch() // simulates external control-plane write
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	want := equalWeights(6)
+	if !sliceEqual(s.currentWeights, want) {
+		t.Errorf("epoch bump should reset to equal: got %v, want %v", s.currentWeights, want)
+	}
+	if s.consecutiveImbalanced != 0 {
+		t.Errorf("epoch bump should reset counter: got %d", s.consecutiveImbalanced)
+	}
+}
+
+func TestConcurrency_WorkersGreaterThanRingCount(t *testing.T) {
+	got := computeRingCount(8, 6)
+	if got != 6 {
+		t.Errorf("workers > ring_count: got %d, want 6", got)
+	}
+	got = computeRingCount(2, 6)
+	if got != 2 {
+		t.Errorf("workers < ring_count: got %d, want 2", got)
+	}
+	got = computeRingCount(0, 6)
+	if got != 0 {
+		t.Errorf("workers=0: got %d, want 0", got)
+	}
+}
+
+func TestConcurrency_FailedApplyStillBumpsConfigGen(t *testing.T) {
+	resetRSSGlobals(t)
+	exec := newStubRSSExecutor()
+	exec.ethtoolXErr = errors.New("simulated failure")
+	a := []string{"e0"}
+	gen0 := LoadRSSConfigGen()
+	applyRSSIndirection(true, 6, a, exec)
+	gen1 := LoadRSSConfigGen()
+	if gen1 == gen0 {
+		t.Errorf("ConfigGen should bump on every invocation regardless of write outcome; gen0=%d gen1=%d", gen0, gen1)
+	}
+}
+
+func TestConcurrency_RebalanceWriteDoesNotBumpGlobalCounters(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights:        equalWeights(6),
+		consecutiveImbalanced: rssRebalanceStability,
+		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+		lastSampleCounters:    map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	reader.set("e0", map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	epochBefore := LoadRSSEpoch()
+	genBefore := LoadRSSConfigGen()
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if len(exec.ethtoolXCalls) != 1 {
+		t.Fatalf("expected 1 -X call, got %d", len(exec.ethtoolXCalls))
+	}
+	if LoadRSSEpoch() != epochBefore {
+		t.Errorf("rebalance write must NOT bump Epoch: was %d, now %d", epochBefore, LoadRSSEpoch())
+	}
+	if LoadRSSConfigGen() != genBefore {
+		t.Errorf("rebalance write must NOT bump ConfigGen: was %d, now %d", genBefore, LoadRSSConfigGen())
+	}
+}
+
+func TestConcurrency_AbandonsWhenControlPlaneFiresBetweenSnapshotAndLock(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights:        equalWeights(6),
+		consecutiveImbalanced: rssRebalanceStability,
+		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+		lastSampleCounters:    map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	base := newStubBindingRXReader()
+	base.set("e0", map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	bumped := atomic.Bool{}
+	wrapped := &bumpingReader{base: base, bumpOnRCalled: &bumped}
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, wrapped)
+	if len(exec.ethtoolXCalls) != 0 {
+		t.Errorf("expected abandon, got %d -X calls", len(exec.ethtoolXCalls))
+	}
+}
+
+// #835 R2 FA2 pin: post-lock Epoch re-check abandons stale rebalance
+// writes when a successful control-plane apply landed during our
+// compute / lock-wait window.
+func TestConcurrency_AbandonsWhenEpochBumpsBetweenSnapshotAndLock(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights:        equalWeights(6),
+		consecutiveImbalanced: rssRebalanceStability,
+		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+		lastSampleCounters:    map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+		lastSeenEpoch:         LoadRSSEpoch(),
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	base := newStubBindingRXReader()
+	base.set("e0", map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	bumped := atomic.Bool{}
+	wrapped := &epochBumpingReader{base: base, bumpOnRCalled: &bumped}
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, wrapped)
+	if len(exec.ethtoolXCalls) != 0 {
+		t.Errorf("expected abandon on Epoch change, got %d -X calls", len(exec.ethtoolXCalls))
+	}
+}
+
+// ---------------- 5.7 Live reload (#835 R9 F2) ------------------
+
+func TestLiveReload_AllowlistShrinkTakesEffectNextTick(t *testing.T) {
+	resetRSSGlobals(t)
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.driver["e1"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	exec.queueCount["e1"] = 6
+	reader := newStubBindingRXReader()
+	reader.set("e0", map[int]uint64{0: 100, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	reader.set("e1", map[int]uint64{0: 100, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0", "e1"}
+	rssAllowedRef.Store(&a)
+	state := map[string]*rssRebalanceState{}
+	rebalanceTick(state, exec, reader)
+	if _, ok := state["e0"]; !ok {
+		t.Fatal("e0 state not created on first tick")
+	}
+	if _, ok := state["e1"]; !ok {
+		t.Fatal("e1 state not created on first tick")
+	}
+	a2 := []string{"e0"}
+	rssAllowedRef.Store(&a2)
+	preCalls := len(exec.ethtoolXCalls)
+	state["e0"].lastSampleTime = time.Now().Add(-2 * time.Second)
+	state["e1"].lastSampleTime = time.Now().Add(-2 * time.Second)
+	rebalanceTick(state, exec, reader)
+	for _, call := range exec.ethtoolXCalls[preCalls:] {
+		for _, arg := range call {
+			if arg == "e1" {
+				t.Errorf("e1 was touched after allowlist shrink: %v", call)
+			}
+		}
+	}
+}
+
+// #835 R2 FA4 pin: a worker-count change that arrives via an
+// idempotent reapply (no Epoch bump because table already matches)
+// still triggers re-seed because the size-mismatch detector fires.
+func TestLiveReload_WorkerCountChangeWithoutEpochBumpReseeds(t *testing.T) {
+	resetRSSGlobals(t)
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	reader.set("e0", map[int]uint64{0: 100, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rssEnabled.Store(true)
+	rssWorkers.Store(4)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	state := map[string]*rssRebalanceState{}
+	rebalanceTick(state, exec, reader) // first sample, seeds currentWeights len=4
+	if len(state["e0"].currentWeights) != 4 {
+		t.Fatalf("first tick should seed len=4, got %d", len(state["e0"].currentWeights))
+	}
+	rssWorkers.Store(2)
+	state["e0"].lastSampleTime = time.Now().Add(-2 * time.Second)
+	rebalanceTick(state, exec, reader)
+	if len(state["e0"].currentWeights) != 2 {
+		t.Errorf("size-mismatch reseed should resize to 2, got %d", len(state["e0"].currentWeights))
+	}
+}
+
+// FA5 regression pin: weightsEqual no-op path doesn't fire ethtool.
+func TestRebalance_NoOpWeightsSkipsEthtoolCall(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights:        []int{rssRebalanceMinWeight, 50, 50, 50, 50, 50},
+		consecutiveImbalanced: rssRebalanceStability,
+		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+		lastSampleCounters:    map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+		lastSeenEpoch:         LoadRSSEpoch(),
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	reader.set("e0", map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if len(exec.ethtoolXCalls) != 0 {
+		t.Errorf("no-op weights path should skip ethtool: got %d -X calls", len(exec.ethtoolXCalls))
+	}
+}
+
+// FA4 first-creation seed regression pin.
+func TestRebalance_FirstCreationSeedsCurrentWeights(t *testing.T) {
+	resetRSSGlobals(t)
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	reader.set("e0", map[int]uint64{0: 100, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rssEnabled.Store(true)
+	rssWorkers.Store(4)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	state := map[string]*rssRebalanceState{}
+	rebalanceTick(state, exec, reader)
+	if state["e0"] == nil {
+		t.Fatal("state entry not created")
+	}
+	if got := state["e0"].currentWeights; len(got) != 4 {
+		t.Errorf("expected first-creation seed len=4, got len=%d (%v)", len(got), got)
+	}
+}
+
+func TestLiveReload_WorkerCountChangeTakesEffectNextTick(t *testing.T) {
+	resetRSSGlobals(t)
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	reader.set("e0", map[int]uint64{0: 100, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rssEnabled.Store(true)
+	rssWorkers.Store(4)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	state := map[string]*rssRebalanceState{}
+	rebalanceTick(state, exec, reader) // first sample
+	state["e0"].lastSampleTime = time.Now().Add(-2 * time.Second)
+	rebalanceTick(state, exec, reader) // baseline established with workers=4
+	rssWorkers.Store(2)
+	BumpRSSEpoch()
+	state["e0"].lastSampleTime = time.Now().Add(-2 * time.Second)
+	rebalanceTick(state, exec, reader)
+	if len(state["e0"].currentWeights) != 2 {
+		t.Errorf("worker count change: weights len = %d, want 2", len(state["e0"].currentWeights))
+	}
+}
+
+// ---------------- helpers ----------------
+
+func sliceEqual(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func stringSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func contains(haystack, needle string) bool {
+	return len(haystack) >= len(needle) && indexOf(haystack, needle) >= 0
+}
+
+func indexOf(haystack, needle string) int {
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] == needle {
+			return i
+		}
+	}
+	return -1
+}
