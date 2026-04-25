@@ -338,9 +338,13 @@ func reconcileVRFs(ops vrfOps, tracked []string, desired []VRFSpec) ([]string, e
 	// managed VRFs no longer desired" loop above can't catch it
 	// (oldname isn't in tracked). Walk the kernel `vrf-*` namespace
 	// and delete any VRF that is neither in `desired` nor in
-	// `tracked` (already handled). xpfd claims the entire `vrf-*`
-	// namespace per the #844 ownership model — operators must not
-	// pre-create vrf-<X> outside config.
+	// `tracked` (already handled).
+	//
+	// xpfd claims the ENTIRE `vrf-*` kernel namespace — operators
+	// must not pre-create vrf-<X> outside config. This is a
+	// stricter policy than the original #844 plan (which preserved
+	// "external" VRFs); the godoc on ReconcileVRFs is the
+	// authoritative contract.
 	links, err := ops.LinkList()
 	if err != nil {
 		// Best-effort: log and continue. The desired/tracked sets
