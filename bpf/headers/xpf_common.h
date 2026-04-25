@@ -440,7 +440,12 @@ struct pkt_meta {
 	__u16 l3_offset;
 	__u16 l4_offset;
 	__u16 payload_offset;
-	__u16 pkt_len;
+	/* #860: pkt_len is u32, not u16. IPv4 tot_len fits in u16, but
+	 * IPv6 payload_len + sizeof(ipv6hdr) can wrap u16 for jumbo
+	 * frames (payload > 65495). Widening also makes the
+	 * SCREEN_PING_OF_DEATH `pkt_len > 65535` check meaningful —
+	 * with u16 the comparison was always false (dead code). */
+	__u32 pkt_len;
 
 	/* Zone classification */
 	__u16 ingress_zone;
