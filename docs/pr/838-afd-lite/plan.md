@@ -38,20 +38,50 @@ back to #837.
   - `172.16.80.200:5201` — iperf3 server (existing).
   - `172.16.80.200:7` — TCP echo (operator-enabled,
     confirmed reachable).
-- CoS class: **iperf-a** (1 Gb/s shaped) for tightest CoV.
+- CoS classes (ALL four covered per operator direction):
+  - port 5201 → **iperf-a** (1 Gb/s shaped) — tightest CoV
+  - port 5202 → **iperf-b** (10 Gb/s shaped)
+  - port 5203 → **iperf-c** (25 Gb/s shaped)
+  - port 5204 → **best-effort** (100 Mb/s shaped)
+  Queue ownership per `cos-iperf-config.set` + the live
+  `show class-of-service interface`: queue 0
+  (best-effort, owner 0), queue 4 (iperf-a, owner 1),
+  queue 5 (iperf-b, owner 2), queue 6 (iperf-c, owner 3).
+  All four queues are `exact=yes` and `flow_fair=true` (the
+  AFD-lite scope) on a single binding each.
 - Workers=6.
 
 ## 4. Workload
 
-Same as v1/v2 (acceptance unchanged):
+Each test is `iperf3 -P 16 -t 60 -p <port>` against
+`172.16.80.200`. Run 10× per port (40 runs total).
 
-- **p5201 16 streams 60 s × 10**: CoV ≤ 15 % on ≥ 8 of 10.
-- **p5202 16 streams 60 s × 10**: CoV ≤ 25 % on ≥ 8 of 10.
+Per-class acceptance (per #786 Slice C convention,
+adapted to each class's shaped rate):
+
+- **p5204 (best-effort, 100 Mb/s)**: CoV ≤ 25 % on ≥ 8 of 10.
+- **p5201 (iperf-a, 1 Gb/s)**: CoV ≤ 15 % on ≥ 8 of 10.
+- **p5202 (iperf-b, 10 Gb/s)**: CoV ≤ 25 % on ≥ 8 of 10.
+- **p5203 (iperf-c, 25 Gb/s)**: CoV ≤ 25 % on ≥ 8 of 10.
+
+Plus:
 - **p5202 128 streams 60 s × 1**: CoV ≤ 16.6 % (#900
   baseline; do not regress).
-- 0 collapses.
-- Aggregate throughput ≥ 0.95 × baseline.
+- 0 collapses on every test.
+- Aggregate per-class throughput ≥ 0.95 × shaped rate.
 - 0 retransmit regression.
+
+Per-class commentary:
+- **p5201 (1 Gb/s)** has the tightest CoV bar — limited
+  shaper tokens means per-flow contention is sharpest.
+- **p5202 (10 Gb/s)** and **p5203 (25 Gb/s)** are
+  abundance-regime: most flows can saturate without
+  contending. CoV bar is looser, but AFD-lite must not
+  regress them.
+- **p5204 (100 Mb/s, best-effort)** is the smallest pipe.
+  16 streams × 6 Mbps fair share. AFD-lite's biggest
+  potential win is here — the smaller the per-flow share,
+  the tighter the over-share threshold gates noisy flows.
 
 ## 5. Algorithm specification
 
@@ -348,14 +378,22 @@ test setup for flow-fair-non-shared-exact cases.
 - All Go tests pass.
 - `cargo build --release` clean.
 - Live deploy on `loss:xpf-userspace-fw0/fw1`:
-  - **p5201 16 streams 60 s × 10**: CoV ≤ 15 % on ≥ 8 of 10
-    runs.
-  - **p5202 16 streams 60 s × 10**: CoV ≤ 25 % on ≥ 8 of 10
-    runs.
+  - All four CoS classes covered, 16 streams × 60 s × 10 runs
+    each:
+    - **p5201 (iperf-a, 1 Gb/s)**: CoV ≤ 15 % on ≥ 8 of 10.
+    - **p5202 (iperf-b, 10 Gb/s)**: CoV ≤ 25 % on ≥ 8 of 10.
+    - **p5203 (iperf-c, 25 Gb/s)**: CoV ≤ 25 % on ≥ 8 of 10.
+    - **p5204 (best-effort, 100 Mb/s)**: CoV ≤ 25 % on ≥ 8
+      of 10.
   - **p5202 128 streams 60 s × 1**: CoV ≤ 16.6 %
     (#900 baseline; do not regress).
-  - 0 collapses (every stream ≥ 1 Mbps).
-  - Aggregate throughput ≥ 0.95 × baseline.
+  - **No regression** vs the equivalent baseline (run with
+    AFD-lite disabled at compile-time via a feature gate, OR
+    captured before this PR's deploy) on ANY of the four
+    classes' CoV or aggregate throughput.
+  - 0 collapses (every stream ≥ 1 Mbps for shaped > 16 Mbps;
+    every stream ≥ shaped/16 × 0.5 for narrower classes).
+  - Aggregate per-class throughput ≥ 0.95 × shaped rate.
   - 0 retransmit regression.
 - `make test-failover`: pass (defense — touching the
   CoS dataplane).
