@@ -16,6 +16,7 @@ import (
 	"io/fs"
 	"os/exec"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -37,12 +38,37 @@ type fakeRSSExecutor struct {
 	ethtoolC map[string][]byte
 	// Recorded argvs, in call order. `{"-X", "eth0", "weight", "1", "1", "0", "0"}`, etc.
 	calls [][]string
+	// argvErr returns a scripted (output, error) for an exact argv
+	// prefix match. Used by tests that need to exercise the
+	// generic-error branches in maybeRestoreDefault. Key matches via
+	// strings.HasPrefix on a space-joined argv. For example, key
+	// "-X eth0 default" makes the `ethtool -X eth0 default` invocation
+	// return the scripted error. Checked AFTER the per-iface ethtoolX
+	// / ethtoolC path so test fixtures keep working unchanged.
+	argvErr map[string]argvErrSpec
+}
+
+// argvErrSpec scripts a (combinedOutput, error) tuple for an argv match.
+type argvErrSpec struct {
+	out []byte
+	err error
 }
 
 func (f *fakeRSSExecutor) runEthtool(args ...string) ([]byte, error) {
 	cp := make([]string, len(args))
 	copy(cp, args)
 	f.calls = append(f.calls, cp)
+	// Argv-keyed scripted errors (Codex code-review LOW #2) take
+	// precedence so tests can override default behavior for a
+	// specific invocation.
+	if f.argvErr != nil {
+		joined := strings.Join(args, " ")
+		for prefix, spec := range f.argvErr {
+			if strings.HasPrefix(joined, prefix) {
+				return spec.out, spec.err
+			}
+		}
+	}
 	if len(args) >= 2 && args[0] == "-x" {
 		if out, ok := f.ethtoolX[args[1]]; ok {
 			return out, nil
@@ -729,6 +755,89 @@ func TestApplyRSSIndirectionOne_BootSequence_4then6_RestoresDefault(t *testing.T
 	if !sawRestore {
 		t.Fatalf("step 2 (workers=6): expected -X default restore, got %v",
 			f.calls[step1Calls:])
+	}
+}
+
+// #805 test 13 (Codex LOW #2): generic -x probe error suppresses
+// the -X default call. The probe itself fails with a non-ErrNotFound
+// error; maybeRestoreDefault must log Warn and return without
+// attempting -X default.
+func TestApplyRSSIndirectionOne_RestoreEthtoolXProbeGenericError_LogAndSkip(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"eth0": mlx5Driver},
+		queues:   map[string]int{"eth0": 6},
+		ethtoolX: map[string][]byte{"eth0": []byte(staleTable6q4w)},
+		argvErr: map[string]argvErrSpec{
+			"-x eth0": {out: []byte("ethtool: bad request"), err: errors.New("exit status 1")},
+		},
+	}
+	applyRSSIndirectionOne("eth0", 6, f)
+
+	for _, c := range f.calls {
+		if len(c) >= 1 && c[0] == "-X" {
+			t.Errorf("generic probe failure → must not invoke -X, got %v", c)
+		}
+	}
+}
+
+// #805 test 14 (Codex LOW #2): generic -X default error is logged
+// and swallowed (D3 is best-effort). Ensures the function returns
+// normally without panicking or propagating.
+func TestApplyRSSIndirectionOne_RestoreEthtoolXDefaultGenericError_LoggedAndSwallowed(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"eth0": mlx5Driver},
+		queues:   map[string]int{"eth0": 6},
+		ethtoolX: map[string][]byte{"eth0": []byte(staleTable6q4w)},
+		argvErr: map[string]argvErrSpec{
+			"-X eth0 default": {out: []byte("ethtool: kernel rejected"), err: errors.New("exit status 1")},
+		},
+	}
+	// Should not panic. Both the -x probe and the failed -X default
+	// should be recorded; the function returns normally.
+	applyRSSIndirectionOne("eth0", 6, f)
+
+	if len(f.calls) != 2 {
+		t.Fatalf("want 2 calls (probe + failed -X default), got %d: %v",
+			len(f.calls), f.calls)
+	}
+	if !reflect.DeepEqual(f.calls[0], []string{"-x", "eth0"}) {
+		t.Errorf("call 0: want probe, got %v", f.calls[0])
+	}
+	if !reflect.DeepEqual(f.calls[1], []string{"-X", "eth0", "default"}) {
+		t.Errorf("call 1: want -X default, got %v", f.calls[1])
+	}
+}
+
+// #805 test 15 (Codex LOW #3): non-mlx5 driver on the new branch.
+// applyRSSIndirectionOne's first check is the driver guard; it must
+// short-circuit BEFORE the new restore-default logic.
+func TestApplyRSSIndirectionOne_NonMlxDriver_WorkersEqualsQueues_NotTouched(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"eth0": "virtio_net"},
+		queues:   map[string]int{"eth0": 6},
+		ethtoolX: map[string][]byte{"eth0": []byte(staleTable6q4w)},
+	}
+	applyRSSIndirectionOne("eth0", 6, f)
+
+	if len(f.calls) != 0 {
+		t.Errorf("non-mlx5 driver on workers>=queues path → zero ethtool calls, got %v",
+			f.calls)
+	}
+}
+
+// #805 test 16 (Codex LOW #3): empty driver string (sysfs unreadable
+// for that iface). Same expectation as non-mlx5: short-circuit.
+func TestApplyRSSIndirectionOne_EmptyDriver_WorkersEqualsQueues_NotTouched(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{}, // readDriver returns ""
+		queues:   map[string]int{"eth0": 6},
+		ethtoolX: map[string][]byte{"eth0": []byte(staleTable6q4w)},
+	}
+	applyRSSIndirectionOne("eth0", 6, f)
+
+	if len(f.calls) != 0 {
+		t.Errorf("empty driver on workers>=queues path → zero ethtool calls, got %v",
+			f.calls)
 	}
 }
 

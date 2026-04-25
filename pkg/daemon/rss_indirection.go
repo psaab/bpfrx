@@ -129,8 +129,10 @@ func (realRSSExecutor) listInterfaces() []string {
 //   - workers == 1 is skipped (single worker benefits from default RSS
 //     spreading across all HW queues / IRQ lines; weight-pinning to a
 //     single queue would serialize the worker on one IRQ — reviewer #L1).
-//   - workers >= queue_count is skipped (default table already delivers
-//     traffic to every queue; reshaping does nothing useful).
+//   - workers >= queue_count: weight reshaping is skipped (default
+//     table already delivers to every queue), BUT the live table is
+//     probed and reset to default if it carries a stale concentrated
+//     layout left over from a prior workers < queue_count apply (#805).
 //   - Idempotent: if the live indirection table already matches the
 //     computed layout, no write is issued.
 //   - Never returns a non-nil error — D3 regressions must not break
