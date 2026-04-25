@@ -379,8 +379,11 @@ struct iface_zone_value {
  * issues (bridge filtering, SKB vlan_tci stripping in generic XDP). */
 #define FABRIC_ZONE_MAC_MAGIC 0xfe
 
-#define IFACE_FLAG_TUNNEL     (1 << 0)  /* GRE/IPsec tunnel interface */
-#define IFACE_FLAG_NATIVE_XDP (1 << 1)  /* interface runs native/driver XDP */
+#define IFACE_FLAG_TUNNEL       (1 << 0)  /* GRE/IPsec tunnel interface */
+#define IFACE_FLAG_NATIVE_XDP   (1 << 1)  /* interface runs native/driver XDP */
+#define IFACE_FLAG_XDP_ATTACHED (1 << 2)  /* #863: XDP (native or generic) attached on
+                                           * the ingress side; positive proof for the
+                                           * tc_main tunnel-egress bypass */
 
 #ifndef BPF_FIB_LOOKUP_DIRECT
 #define BPF_FIB_LOOKUP_DIRECT (1U << 0)

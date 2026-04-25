@@ -737,6 +737,14 @@ const IfaceFlagTunnel = 1 << 0
 // IfaceFlagNativeXDP marks an interface with native/driver XDP (no CHECKSUM_PARTIAL).
 const IfaceFlagNativeXDP = 1 << 1
 
+// IfaceFlagXDPAttached (#863) marks an interface where XDP is actually
+// attached on the ingress side (native or generic). Set by AttachXDP,
+// cleared by DetachXDP. Used by the tc_main tunnel-egress bypass to
+// prove the inner packet went through the XDP pipeline; without this
+// gate, packets from non-XDP interfaces (loopback, veth, mgmt NIC)
+// routed via a tunnel device would skip screen/conntrack/NAT.
+const IfaceFlagXDPAttached = 1 << 2
+
 // VlanIfaceInfo mirrors the C struct vlan_iface_info.
 type VlanIfaceInfo struct {
 	ParentIfindex uint32

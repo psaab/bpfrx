@@ -99,10 +99,42 @@ int tc_main_prog(struct __sk_buff *skb)
 	 * TC conntrack won't find a session match (post-NAT IPs don't
 	 * match pre-NAT session keys), and the ingress_ifindex != 0 drop
 	 * would kill the packet.  Pass it through — kernel handles
-	 * encapsulation after TC returns. */
+	 * encapsulation after TC returns.
+	 *
+	 * #863: gate the bypass on positive evidence that XDP actually ran
+	 * on the ingress side. Without this gate, packets from interfaces
+	 * without XDP (loopback, veth, mgmt NIC, tunnel-decap netdev)
+	 * routed out via a tunnel skip enforcement.
+	 *
+	 * Resolve ingress to (parent_ifindex, vlan_id) via vlan_iface_map
+	 * first — VLAN sub-interfaces have their own ifindex, and XDP
+	 * may be attached to either the physical parent (native mode)
+	 * or the sub-iface itself (generic mode when the parent fell
+	 * back; see pkg/dataplane/compiler.go). Either way, the
+	 * IFACE_FLAG_XDP_ATTACHED bit lives on the {parent, vlan_id}
+	 * iface_zone_map entry — the loader's setXDPAttachedFlag does
+	 * sub→parent resolution at attach time so the bit is keyed by
+	 * surface, not by which ifindex was attached. For non-VLAN
+	 * ingress this is one extra map miss and we fall back to
+	 * {ingress_ifindex, 0}. */
 	if (zone_ptr && (zone_ptr->flags & IFACE_FLAG_TUNNEL) &&
 	    skb->ingress_ifindex != 0) {
-		return TC_ACT_OK;
+		__u32 lookup_ifindex = skb->ingress_ifindex;
+		__u16 lookup_vlan = 0;
+		__u32 sub_ifindex = skb->ingress_ifindex;
+		struct vlan_iface_info *vi = bpf_map_lookup_elem(&vlan_iface_map, &sub_ifindex);
+		if (vi) {
+			lookup_ifindex = vi->parent_ifindex;
+			lookup_vlan = vi->vlan_id;
+		}
+		struct iface_zone_key ik = {
+			.ifindex = lookup_ifindex,
+			.vlan_id = lookup_vlan,
+		};
+		struct iface_zone_value *iv = bpf_map_lookup_elem(&iface_zone_map, &ik);
+		if (iv && (iv->flags & IFACE_FLAG_XDP_ATTACHED)) {
+			return TC_ACT_OK;
+		}
 	}
 
 	/* Suppress outgoing MLDv2 reports on RETH member interfaces.
