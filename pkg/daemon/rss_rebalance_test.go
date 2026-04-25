@@ -246,6 +246,7 @@ func TestCooldown_BlocksWithinWindow(t *testing.T) {
 	resetRSSGlobals(t)
 	s := &rssRebalanceState{
 		currentWeights:        equalWeights(6),
+		domainSize:            6,
 		consecutiveImbalanced: rssRebalanceStability,
 		lastRebalanceTime:     time.Now(), // just rebalanced
 		lastSampleCounters:    map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
@@ -271,6 +272,7 @@ func TestCooldown_AllowsAfterWindow(t *testing.T) {
 	resetRSSGlobals(t)
 	s := &rssRebalanceState{
 		currentWeights:        equalWeights(6),
+		domainSize:            6,
 		consecutiveImbalanced: rssRebalanceStability,
 		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
 		lastSampleCounters:    map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
@@ -297,7 +299,7 @@ func TestCooldown_AllowsAfterWindow(t *testing.T) {
 func TestComputeWeightShift_ShiftsHotToCold(t *testing.T) {
 	delta := map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100}
 	cur := equalWeights(6)
-	got := computeWeightShift(delta, cur)
+	got := computeWeightShift(delta, cur, 6)
 	want := []int{15, 25, 20, 20, 20, 20}
 	if !sliceEqual(got, want) {
 		t.Errorf("got %v, want %v", got, want)
@@ -307,7 +309,7 @@ func TestComputeWeightShift_ShiftsHotToCold(t *testing.T) {
 func TestComputeWeightShift_NeverDropsBelowMinWeight(t *testing.T) {
 	delta := map[int]uint64{0: 9999, 1: 1}
 	cur := []int{2, 100}
-	got := computeWeightShift(delta, cur)
+	got := computeWeightShift(delta, cur, 2)
 	if got[0] < rssRebalanceMinWeight {
 		t.Errorf("hot ring went below MIN_WEIGHT: got %v", got)
 	}
@@ -316,7 +318,7 @@ func TestComputeWeightShift_NeverDropsBelowMinWeight(t *testing.T) {
 func TestComputeWeightShift_NoopWhenBalanced(t *testing.T) {
 	delta := map[int]uint64{0: 100, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100}
 	cur := equalWeights(6)
-	got := computeWeightShift(delta, cur)
+	got := computeWeightShift(delta, cur, 6)
 	want := equalWeights(6)
 	if !sliceEqual(got, want) {
 		t.Errorf("balanced: got %v, want %v", got, want)
@@ -326,8 +328,25 @@ func TestComputeWeightShift_NoopWhenBalanced(t *testing.T) {
 func TestComputeWeightShift_TiebreakByLowestIndex(t *testing.T) {
 	delta := map[int]uint64{0: 5000, 1: 0, 2: 100, 3: 0, 4: 100, 5: 0}
 	cur := equalWeights(6)
-	got := computeWeightShift(delta, cur)
+	got := computeWeightShift(delta, cur, 6)
 	want := []int{15, 25, 20, 20, 20, 20}
+	if !sliceEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+// Codex R3 pin: workers<queues case. seedWeightVector(4,6) returns
+// [20,20,20,20,0,0]. computeWeightShift with domainSize=4 must
+// only manipulate [0..3] and leave [4..5] at 0.
+func TestComputeWeightShift_WorkersLessThanQueues_PreservesPadding(t *testing.T) {
+	cur := seedWeightVector(4, 6)
+	want0 := []int{20, 20, 20, 20, 0, 0}
+	if !sliceEqual(cur, want0) {
+		t.Fatalf("seed: got %v, want %v", cur, want0)
+	}
+	delta := map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 0, 5: 0}
+	got := computeWeightShift(delta, cur, 4)
+	want := []int{15, 25, 20, 20, 0, 0}
 	if !sliceEqual(got, want) {
 		t.Errorf("got %v, want %v", got, want)
 	}
@@ -360,6 +379,7 @@ func TestGuard_ZeroTotalTrafficResetsImbalance(t *testing.T) {
 	resetRSSGlobals(t)
 	s := &rssRebalanceState{
 		currentWeights:        equalWeights(6),
+		domainSize:            6,
 		consecutiveImbalanced: 2,
 		firstSample:           false,
 		lastSampleTime:        time.Now().Add(-2 * time.Second),
@@ -461,6 +481,7 @@ func TestApplyWeights_PermanentSkipAfterMaxFailures(t *testing.T) {
 	resetRSSGlobals(t)
 	s := &rssRebalanceState{
 		currentWeights:        equalWeights(6),
+		domainSize:            6,
 		consecutiveImbalanced: rssRebalanceStability,
 		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
 		firstSample:           false,
@@ -609,6 +630,58 @@ func TestUserspaceReader_FiltersUnusableBindings(t *testing.T) {
 	}
 }
 
+// Codex R3 HIGH pin: workers<queues end-to-end. Helper emits
+// bindings on queues 0..queueCount-1 (5 queues here) regardless of
+// workers (4). Rebalance domain is min(workers, queueCount) = 4,
+// covering only queues 0..3. Sample includes all 5 keys; the
+// shape guard requires keys [0..3] present (pass) and IGNORES
+// extras like key 4. Trigger fires from imbalance among queues
+// 0..3; weight migration happens within that domain. Queue 4 stays
+// at weight 0 (unchanged) so traffic distribution honors #785.
+func TestWorkersLessThanQueues_EndToEnd(t *testing.T) {
+	resetRSSGlobals(t)
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 5
+	reader := newStubBindingRXReader()
+	rssEnabled.Store(true)
+	rssWorkers.Store(4)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+
+	// Pre-construct state at "ready to rebalance" point so we can
+	// directly observe what the rebalance writes to ethtool.
+	s := &rssRebalanceState{
+		currentWeights:        seedWeightVector(4, 5),
+		domainSize:            4,
+		consecutiveImbalanced: rssRebalanceStability,
+		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+		lastSampleCounters:    map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0},
+	}
+	wantSeed := []int{20, 20, 20, 20, 0}
+	if !sliceEqual(s.currentWeights, wantSeed) {
+		t.Fatalf("seed: got %v, want %v", s.currentWeights, wantSeed)
+	}
+
+	// Sample includes 5 keys (queue 4 is the extra outside the
+	// active domain). Queue 0 hot, queues 1-3 cold within active
+	// domain.
+	reader.set("e0", map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 0})
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if len(exec.ethtoolXCalls) != 1 {
+		t.Fatalf("expected 1 -X call, got %d", len(exec.ethtoolXCalls))
+	}
+	// Expected vector: [15, 25, 20, 20, 0] — 5 weights including
+	// queue 4 padding at 0, preserving the workers-vs-queues shape.
+	got := exec.ethtoolXCalls[0]
+	wantArgs := []string{"-X", "e0", "weight", "15", "25", "20", "20", "0"}
+	if !stringSliceEqual(got, wantArgs) {
+		t.Errorf("ethtool args: got %v, want %v", got, wantArgs)
+	}
+}
+
 // Codex R2 Q2 pin: applyConfigLocked sets rssApplyInProgress=true
 // for its entire window. The rebalance loop, after acquiring
 // rssWriteMu, must abandon when this flag is set — even when its
@@ -620,6 +693,7 @@ func TestConcurrency_AbandonsWhileApplyInProgress(t *testing.T) {
 	resetRSSGlobals(t)
 	s := &rssRebalanceState{
 		currentWeights:        equalWeights(6),
+		domainSize:            6,
 		consecutiveImbalanced: rssRebalanceStability,
 		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
 		firstSample:           false,
@@ -654,6 +728,7 @@ func TestSampleShape_NonContiguousKeysSkipsRebalance(t *testing.T) {
 	resetRSSGlobals(t)
 	s := &rssRebalanceState{
 		currentWeights:        equalWeights(6),
+		domainSize:            6,
 		consecutiveImbalanced: rssRebalanceStability,
 		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
 		firstSample:           false,
@@ -690,6 +765,7 @@ func TestSampleShape_MismatchSkipsRebalance(t *testing.T) {
 	resetRSSGlobals(t)
 	s := &rssRebalanceState{
 		currentWeights:        equalWeights(6),
+		domainSize:            6,
 		consecutiveImbalanced: rssRebalanceStability,
 		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
 		firstSample:           false,
@@ -762,6 +838,7 @@ func TestLoop_SkipsOnRSSDisabled(t *testing.T) {
 	resetRSSGlobals(t)
 	s := &rssRebalanceState{
 		currentWeights:        equalWeights(6),
+		domainSize:            6,
 		consecutiveImbalanced: rssRebalanceStability,
 		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
 		firstSample:           false,
@@ -859,6 +936,7 @@ func TestConcurrency_StaleWeightsAbandonedOnConfigGenChange(t *testing.T) {
 	resetRSSGlobals(t)
 	s := &rssRebalanceState{
 		currentWeights:        equalWeights(6),
+		domainSize:            6,
 		consecutiveImbalanced: rssRebalanceStability,
 		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
 		firstSample:           false,
@@ -947,6 +1025,7 @@ func TestConcurrency_RebalanceWriteDoesNotBumpGlobalCounters(t *testing.T) {
 	resetRSSGlobals(t)
 	s := &rssRebalanceState{
 		currentWeights:        equalWeights(6),
+		domainSize:            6,
 		consecutiveImbalanced: rssRebalanceStability,
 		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
 		firstSample:           false,
@@ -980,6 +1059,7 @@ func TestConcurrency_AbandonsWhenControlPlaneFiresBetweenSnapshotAndLock(t *test
 	resetRSSGlobals(t)
 	s := &rssRebalanceState{
 		currentWeights:        equalWeights(6),
+		domainSize:            6,
 		consecutiveImbalanced: rssRebalanceStability,
 		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
 		firstSample:           false,
@@ -1010,6 +1090,7 @@ func TestConcurrency_AbandonsWhenEpochBumpsBetweenSnapshotAndLock(t *testing.T) 
 	resetRSSGlobals(t)
 	s := &rssRebalanceState{
 		currentWeights:        equalWeights(6),
+		domainSize:            6,
 		consecutiveImbalanced: rssRebalanceStability,
 		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
 		firstSample:           false,
@@ -1075,7 +1156,9 @@ func TestLiveReload_AllowlistShrinkTakesEffectNextTick(t *testing.T) {
 
 // #835 R2 FA4 pin: a worker-count change that arrives via an
 // idempotent reapply (no Epoch bump because table already matches)
-// still triggers re-seed because the size-mismatch detector fires.
+// still triggers re-seed because the domain-mismatch detector fires.
+// Codex R3: currentWeights is now full queue_count length; the
+// rebalance domain shrinks via domainSize, not vector length.
 func TestLiveReload_WorkerCountChangeWithoutEpochBumpReseeds(t *testing.T) {
 	resetRSSGlobals(t)
 	exec := newStubRSSExecutor()
@@ -1088,15 +1171,22 @@ func TestLiveReload_WorkerCountChangeWithoutEpochBumpReseeds(t *testing.T) {
 	a := []string{"e0"}
 	rssAllowedRef.Store(&a)
 	state := map[string]*rssRebalanceState{}
-	rebalanceTick(state, exec, reader) // first sample, seeds currentWeights len=4
-	if len(state["e0"].currentWeights) != 4 {
-		t.Fatalf("first tick should seed len=4, got %d", len(state["e0"].currentWeights))
+	rebalanceTick(state, exec, reader) // first sample, seeds domainSize=4
+	if state["e0"].domainSize != 4 {
+		t.Fatalf("first tick should seed domainSize=4, got %d", state["e0"].domainSize)
+	}
+	if len(state["e0"].currentWeights) != 6 {
+		t.Fatalf("currentWeights stays at queueCount=6, got %d", len(state["e0"].currentWeights))
 	}
 	rssWorkers.Store(2)
 	state["e0"].lastSampleTime = time.Now().Add(-2 * time.Second)
 	rebalanceTick(state, exec, reader)
-	if len(state["e0"].currentWeights) != 2 {
-		t.Errorf("size-mismatch reseed should resize to 2, got %d", len(state["e0"].currentWeights))
+	if state["e0"].domainSize != 2 {
+		t.Errorf("domain-mismatch reseed should shrink domainSize to 2, got %d", state["e0"].domainSize)
+	}
+	if len(state["e0"].currentWeights) != 6 {
+		t.Errorf("currentWeights stays at queueCount=6 across worker change, got %d",
+			len(state["e0"].currentWeights))
 	}
 }
 
@@ -1127,7 +1217,9 @@ func TestRebalance_NoOpWeightsSkipsEthtoolCall(t *testing.T) {
 	}
 }
 
-// FA4 first-creation seed regression pin.
+// FA4 first-creation seed regression pin. Codex R3: currentWeights
+// is full queue_count length with first domainSize entries at
+// default; domainSize is min(workers, queueCount).
 func TestRebalance_FirstCreationSeedsCurrentWeights(t *testing.T) {
 	resetRSSGlobals(t)
 	exec := newStubRSSExecutor()
@@ -1144,8 +1236,13 @@ func TestRebalance_FirstCreationSeedsCurrentWeights(t *testing.T) {
 	if state["e0"] == nil {
 		t.Fatal("state entry not created")
 	}
-	if got := state["e0"].currentWeights; len(got) != 4 {
-		t.Errorf("expected first-creation seed len=4, got len=%d (%v)", len(got), got)
+	gotW := state["e0"].currentWeights
+	wantW := []int{20, 20, 20, 20, 0, 0}
+	if !sliceEqual(gotW, wantW) {
+		t.Errorf("expected seedWeightVector(4,6)=%v, got %v", wantW, gotW)
+	}
+	if state["e0"].domainSize != 4 {
+		t.Errorf("expected domainSize=4, got %d", state["e0"].domainSize)
 	}
 }
 
@@ -1168,8 +1265,12 @@ func TestLiveReload_WorkerCountChangeTakesEffectNextTick(t *testing.T) {
 	BumpRSSEpoch()
 	state["e0"].lastSampleTime = time.Now().Add(-2 * time.Second)
 	rebalanceTick(state, exec, reader)
-	if len(state["e0"].currentWeights) != 2 {
-		t.Errorf("worker count change: weights len = %d, want 2", len(state["e0"].currentWeights))
+	// currentWeights stays len=queueCount=6; domainSize shrinks to 2.
+	if len(state["e0"].currentWeights) != 6 {
+		t.Errorf("currentWeights stays at queueCount: got len=%d", len(state["e0"].currentWeights))
+	}
+	if state["e0"].domainSize != 2 {
+		t.Errorf("worker count change: domainSize = %d, want 2", state["e0"].domainSize)
 	}
 }
 
