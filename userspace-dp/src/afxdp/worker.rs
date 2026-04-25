@@ -1480,12 +1480,23 @@ pub(crate) fn worker_loop(
                     // divide by `umem_total_frames` without torn-load risk.
                     // Computed in this thread from worker-local state, so
                     // the inputs are mutually consistent at sample time.
+                    //
+                    // "Idle" frames are: free_tx_frames (worker's TX-available
+                    // pool), pending_fill_frames (worker's queue waiting to
+                    // push to the kernel's fill ring), AND fill_pending (the
+                    // kernel's fill ring itself, which holds frames the
+                    // kernel can place RX data into — those are NOT in
+                    // flight). Without subtracting fill_pending the gauge
+                    // reads ~70-80% at idle because AF_XDP keeps the fill
+                    // ring pre-populated by design.
                     let total = b.umem.total_frames();
                     let free_tx = b.free_tx_frames.len() as u32;
                     let pending_fill = b.pending_fill_frames.len() as u32;
+                    let kernel_fill = b.device.pending();
                     let inflight = total
                         .saturating_sub(free_tx)
-                        .saturating_sub(pending_fill);
+                        .saturating_sub(pending_fill)
+                        .saturating_sub(kernel_fill);
                     b.live
                         .umem_inflight_frames
                         .store(inflight, Ordering::Relaxed);
