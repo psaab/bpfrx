@@ -57,13 +57,15 @@ type ForwardingStatus struct {
 	// WorkerCPUWindowValid.
 	WorkerCPUMode CPUMode
 
-	HeapPercent        float64
-	BufferPercent      float64 // Only valid if BufferKnown.
-	BufferKnown        bool    // False on userspace-dp until UMEM telemetry lands.
-	BufferFollowupRef  int     // GitHub issue number printed in place of buffer %.
-	Uptime             time.Duration
-	ClusterMode        bool
-	ClusterFollowupRef int
+	HeapPercent       float64
+	BufferPercent     float64 // Only valid if BufferKnown.
+	BufferKnown       bool    // False on userspace-dp until UMEM telemetry lands.
+	BufferFollowupRef int     // GitHub issue number printed in place of buffer %.
+	Uptime            time.Duration
+
+	// (Cluster peer rendering moved to the gRPC handler in #879.
+	// fwdstatus now produces pure single-block output; the handler
+	// composes node0:/node1: blocks externally.)
 }
 
 // Format renders a ForwardingStatus in the Junos-style one-screen
@@ -107,10 +109,9 @@ func Format(fs *ForwardingStatus) string {
 
 	writeRow(&b, "Uptime:", formatUptime(fs.Uptime))
 
-	if fs.ClusterMode {
-		fmt.Fprintf(&b, "\nNote: peer-node rendering deferred to #%d.\n",
-			fs.ClusterFollowupRef)
-	}
+	// (#879: cluster framing — node0:/node1: headers, peer block —
+	// is composed by the gRPC handler on top of this single-node
+	// output. fwdstatus stays a pure single-block formatter.)
 	return b.String()
 }
 

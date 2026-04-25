@@ -17,20 +17,14 @@ import (
 // not crash the daemon.
 const userHZ = 100
 
-// Well-known follow-up issue numbers printed in the rendered output.
-const (
-	followupUMEMBuffer  = 878 // UMEM utilization telemetry for userspace-dp.
-	followupClusterPeer = 879 // Cluster peer rendering for show chassis forwarding.
-)
+// Well-known follow-up issue number printed in the rendered output
+// when Buffer% cannot be read on userspace-dp.
+const followupUMEMBuffer = 878
 
 // UMEMBufferFollowup returns the issue number printed when Buffer%
 // cannot be read on userspace-dp.  Callers may override to 0 if they
 // want to suppress the reference.
 func UMEMBufferFollowup() int { return followupUMEMBuffer }
-
-// ClusterPeerFollowup returns the issue number printed when cluster
-// mode is detected but peer data is not yet plumbed.
-func ClusterPeerFollowup() int { return followupClusterPeer }
 
 // DataPlaneAccessor is the small surface Build needs from the
 // dataplane.  Both `dataplane.DataPlane` and mocks in tests satisfy
@@ -48,20 +42,21 @@ type DataPlaneAccessor interface {
 // maps that into State=Unknown with uptime falling back to
 // `startTime`.  `snap` carries the 5s/1m/5m CPU history; an empty
 // snapshot renders all window columns as invalid (`-`).
+//
+// (#879: dropped clusterMode parameter — peer rendering moved to the
+// gRPC handler. fwdstatus now produces a pure single-block output;
+// callers in cluster mode compose two blocks externally.)
 func Build(
 	dp DataPlaneAccessor,
 	proc ProcReader,
 	startTime time.Time,
-	clusterMode bool,
 	snap SamplerSnapshot,
 ) (*ForwardingStatus, error) {
 	fs := &ForwardingStatus{
-		State:              StateUnknown,
-		WorkerCPUMode:      CPUModeEBPFNoWorkers,
-		BufferKnown:        false,
-		BufferFollowupRef:  followupUMEMBuffer,
-		ClusterMode:        clusterMode,
-		ClusterFollowupRef: followupClusterPeer,
+		State:             StateUnknown,
+		WorkerCPUMode:     CPUModeEBPFNoWorkers,
+		BufferKnown:       false,
+		BufferFollowupRef: followupUMEMBuffer,
 	}
 
 	// --- Uptime: shared PID-start anchor ---------------------------

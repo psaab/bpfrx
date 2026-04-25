@@ -102,15 +102,17 @@ func TestFormat_BufferKnownPercent(t *testing.T) {
 	}
 }
 
-func TestFormat_ClusterModeNote(t *testing.T) {
-	fs := &ForwardingStatus{
-		State:              StateOnline,
-		ClusterMode:        true,
-		ClusterFollowupRef: 879,
-	}
+// TestFormat_NoClusterNote — fwdstatus is a pure single-block
+// formatter post-#879. The cluster framing (node0:/node1: headers,
+// peer block) is now composed in the gRPC handler, not here.
+func TestFormat_NoClusterNote(t *testing.T) {
+	fs := &ForwardingStatus{State: StateOnline}
 	out := Format(fs)
-	if !strings.Contains(out, "Note: peer-node rendering deferred to #879") {
-		t.Errorf("expected cluster note: %s", out)
+	if strings.Contains(out, "peer-node rendering deferred") {
+		t.Errorf("fwdstatus should no longer emit cluster note: %s", out)
+	}
+	if strings.Contains(out, "node0:") || strings.Contains(out, "node1:") {
+		t.Errorf("fwdstatus should not render node headers: %s", out)
 	}
 }
 
@@ -225,7 +227,7 @@ func TestBuild_Online_eBPF(t *testing.T) {
 	dp := &fakeDP{loaded: true, mapStats: []dataplane.MapStats{
 		{Name: "sessions", MaxEntries: 100, UsedCount: 30},
 	}}
-	fs, err := Build(dp, freshProcReader(), time.Now(), false, SamplerSnapshot{})
+	fs, err := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +246,7 @@ func TestBuild_Online_eBPF(t *testing.T) {
 }
 
 func TestBuild_Unknown_DpNil(t *testing.T) {
-	fs, _ := Build(nil, freshProcReader(), time.Now(), false, SamplerSnapshot{})
+	fs, _ := Build(nil, freshProcReader(), time.Now(), SamplerSnapshot{})
 	if fs.State != StateUnknown {
 		t.Errorf("dp==nil: state %q, want Unknown", fs.State)
 	}
@@ -252,7 +254,7 @@ func TestBuild_Unknown_DpNil(t *testing.T) {
 
 func TestBuild_Unknown_NotLoaded(t *testing.T) {
 	dp := &fakeDP{loaded: false}
-	fs, _ := Build(dp, freshProcReader(), time.Now(), false, SamplerSnapshot{})
+	fs, _ := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
 	if fs.State != StateUnknown {
 		t.Errorf("!IsLoaded: state %q, want Unknown", fs.State)
 	}
@@ -262,7 +264,7 @@ func TestBuild_Unknown_SelfStatErr(t *testing.T) {
 	dp := &fakeDP{loaded: true}
 	proc := freshProcReader()
 	proc.selfStatErr = os.ErrNotExist
-	fs, _ := Build(dp, proc, time.Now(), false, SamplerSnapshot{})
+	fs, _ := Build(dp, proc, time.Now(), SamplerSnapshot{})
 	if fs.State != StateUnknown {
 		t.Errorf("selfStat err: state %q, want Unknown", fs.State)
 	}
@@ -272,7 +274,7 @@ func TestBuild_Unknown_StatmErr(t *testing.T) {
 	dp := &fakeDP{loaded: true}
 	proc := freshProcReader()
 	proc.selfStatmErr = os.ErrNotExist
-	fs, _ := Build(dp, proc, time.Now(), false, SamplerSnapshot{})
+	fs, _ := Build(dp, proc, time.Now(), SamplerSnapshot{})
 	if fs.State != StateUnknown {
 		t.Errorf("statm err: state %q, want Unknown", fs.State)
 	}
@@ -283,7 +285,7 @@ func TestBuild_Unknown_UserspaceStatusErr(t *testing.T) {
 		fakeDP: fakeDP{loaded: true},
 		err:    errors.New("status unavailable"),
 	}
-	fs, _ := Build(dp, freshProcReader(), time.Now(), false, SamplerSnapshot{})
+	fs, _ := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
 	if fs.State != StateUnknown {
 		t.Errorf("userspace Status err: state %q, want Unknown", fs.State)
 	}
@@ -300,7 +302,7 @@ func TestBuild_Degraded_StaleHeartbeat(t *testing.T) {
 			},
 		},
 	}
-	fs, _ := Build(dp, freshProcReader(), time.Now(), false, SamplerSnapshot{})
+	fs, _ := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
 	if fs.State != StateDegraded {
 		t.Errorf("stale hb: state %q, want Degraded", fs.State)
 	}
@@ -321,7 +323,7 @@ func TestBuild_Online_UserspaceFreshHeartbeats(t *testing.T) {
 			},
 		},
 	}
-	fs, _ := Build(dp, freshProcReader(), time.Now(), false, SamplerSnapshot{})
+	fs, _ := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
 	if fs.State != StateOnline {
 		t.Errorf("fresh hb: state %q, want Online", fs.State)
 	}
@@ -344,13 +346,6 @@ func TestBuild_Online_UserspaceFreshHeartbeats(t *testing.T) {
 	}
 }
 
-func TestBuild_ClusterMode(t *testing.T) {
-	dp := &fakeDP{loaded: true}
-	fs, _ := Build(dp, freshProcReader(), time.Now(), true, SamplerSnapshot{})
-	if !fs.ClusterMode {
-		t.Error("ClusterMode should be true")
-	}
-	if fs.ClusterFollowupRef != followupClusterPeer {
-		t.Errorf("cluster follow-up: got %d, want %d", fs.ClusterFollowupRef, followupClusterPeer)
-	}
-}
+// (Cluster-mode rendering moved to the gRPC handler in #879;
+// fwdstatus.Build no longer takes a clusterMode flag. Cluster
+// composition tests live in pkg/grpcapi/.)
