@@ -346,6 +346,160 @@ func TestBuild_Online_UserspaceFreshHeartbeats(t *testing.T) {
 	}
 }
 
+// #878 Buffer% derivation tests for the userspace-dp path. Pin the
+// contract that:
+//   - No bindings → BufferKnown=false (legacy "unknown" rendering).
+//   - Pre-#878 helper (UmemTotalFrames=0) → still BufferKnown=false.
+//   - Mixed bindings → only those with capacities count; max wins.
+//   - max(umem%, tx%) per binding; max across bindings overall.
+
+func TestBuild_UserspaceBuffer_NoBindings_StaysUnknown(t *testing.T) {
+	now := time.Now()
+	dp := &fakeUserspaceDP{
+		fakeDP: fakeDP{loaded: true},
+		status: userspace.ProcessStatus{
+			WorkerHeartbeats: []time.Time{now.Add(-100 * time.Millisecond)},
+		},
+	}
+	fs, _ := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
+	if fs.BufferKnown {
+		t.Error("no bindings: BufferKnown must stay false")
+	}
+	if fs.BufferFollowupRef != followupUMEMBuffer {
+		t.Errorf("no bindings: BufferFollowupRef=%d, want %d", fs.BufferFollowupRef, followupUMEMBuffer)
+	}
+}
+
+func TestBuild_UserspaceBuffer_PreHelper_StaysUnknown(t *testing.T) {
+	now := time.Now()
+	dp := &fakeUserspaceDP{
+		fakeDP: fakeDP{loaded: true},
+		status: userspace.ProcessStatus{
+			WorkerHeartbeats: []time.Time{now.Add(-100 * time.Millisecond)},
+			Bindings: []userspace.BindingStatus{
+				// Pre-#878 helper: capacities zero. Even with
+				// nonzero OutstandingTX, must stay unknown.
+				{UmemTotalFrames: 0, TxRingCapacity: 0, OutstandingTX: 100},
+			},
+		},
+	}
+	fs, _ := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
+	if fs.BufferKnown {
+		t.Error("pre-#878 helper: BufferKnown must stay false")
+	}
+}
+
+func TestBuild_UserspaceBuffer_UMEMHeavy(t *testing.T) {
+	now := time.Now()
+	dp := &fakeUserspaceDP{
+		fakeDP: fakeDP{loaded: true},
+		status: userspace.ProcessStatus{
+			WorkerHeartbeats: []time.Time{now.Add(-100 * time.Millisecond)},
+			Bindings: []userspace.BindingStatus{
+				// UMEM 80%, TX 5% → max = 80.
+				{UmemTotalFrames: 1000, UmemInflightFrames: 800, TxRingCapacity: 200, OutstandingTX: 10},
+			},
+		},
+	}
+	fs, _ := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
+	if !fs.BufferKnown {
+		t.Fatal("BufferKnown must be true")
+	}
+	if fs.BufferFollowupRef != 0 {
+		t.Errorf("BufferFollowupRef=%d, want 0 once known", fs.BufferFollowupRef)
+	}
+	if fs.BufferPercent != 80.0 {
+		t.Errorf("BufferPercent=%v, want 80", fs.BufferPercent)
+	}
+}
+
+func TestBuild_UserspaceBuffer_TXHeavy(t *testing.T) {
+	now := time.Now()
+	dp := &fakeUserspaceDP{
+		fakeDP: fakeDP{loaded: true},
+		status: userspace.ProcessStatus{
+			WorkerHeartbeats: []time.Time{now.Add(-100 * time.Millisecond)},
+			Bindings: []userspace.BindingStatus{
+				// UMEM 10%, TX 90% → max = 90.
+				{UmemTotalFrames: 1000, UmemInflightFrames: 100, TxRingCapacity: 100, OutstandingTX: 90},
+			},
+		},
+	}
+	fs, _ := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
+	if !fs.BufferKnown {
+		t.Fatal("BufferKnown must be true")
+	}
+	if fs.BufferPercent != 90.0 {
+		t.Errorf("BufferPercent=%v, want 90", fs.BufferPercent)
+	}
+}
+
+func TestBuild_UserspaceBuffer_MaxAcrossBindings(t *testing.T) {
+	now := time.Now()
+	dp := &fakeUserspaceDP{
+		fakeDP: fakeDP{loaded: true},
+		status: userspace.ProcessStatus{
+			WorkerHeartbeats: []time.Time{now.Add(-100 * time.Millisecond)},
+			Bindings: []userspace.BindingStatus{
+				{UmemTotalFrames: 1000, UmemInflightFrames: 100, TxRingCapacity: 100, OutstandingTX: 10}, // 10%
+				{UmemTotalFrames: 1000, UmemInflightFrames: 750, TxRingCapacity: 100, OutstandingTX: 20}, // 75%
+				{UmemTotalFrames: 1000, UmemInflightFrames: 50, TxRingCapacity: 100, OutstandingTX: 5},   // 5%
+			},
+		},
+	}
+	fs, _ := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
+	if !fs.BufferKnown {
+		t.Fatal("BufferKnown must be true")
+	}
+	if fs.BufferPercent != 75.0 {
+		t.Errorf("BufferPercent=%v, want 75 (max across bindings)", fs.BufferPercent)
+	}
+}
+
+func TestBuild_UserspaceBuffer_MixedKnownAndUnknown(t *testing.T) {
+	now := time.Now()
+	dp := &fakeUserspaceDP{
+		fakeDP: fakeDP{loaded: true},
+		status: userspace.ProcessStatus{
+			WorkerHeartbeats: []time.Time{now.Add(-100 * time.Millisecond)},
+			Bindings: []userspace.BindingStatus{
+				// Skipped (UmemTotalFrames=0).
+				{UmemTotalFrames: 0, OutstandingTX: 999},
+				// Counted: 50%.
+				{UmemTotalFrames: 200, UmemInflightFrames: 100, TxRingCapacity: 100, OutstandingTX: 30},
+			},
+		},
+	}
+	fs, _ := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
+	if !fs.BufferKnown {
+		t.Fatal("at least one binding has capacities; BufferKnown must be true")
+	}
+	if fs.BufferPercent != 50.0 {
+		t.Errorf("BufferPercent=%v, want 50 (only the binding with capacities counts)", fs.BufferPercent)
+	}
+}
+
+func TestBuild_UserspaceBuffer_ClampedTo100(t *testing.T) {
+	now := time.Now()
+	dp := &fakeUserspaceDP{
+		fakeDP: fakeDP{loaded: true},
+		status: userspace.ProcessStatus{
+			WorkerHeartbeats: []time.Time{now.Add(-100 * time.Millisecond)},
+			Bindings: []userspace.BindingStatus{
+				// Pathological: OutstandingTX > capacity (cross-field tearing or bug).
+				{UmemTotalFrames: 100, UmemInflightFrames: 50, TxRingCapacity: 100, OutstandingTX: 200},
+			},
+		},
+	}
+	fs, _ := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
+	if !fs.BufferKnown {
+		t.Fatal("BufferKnown must be true")
+	}
+	if fs.BufferPercent != 100.0 {
+		t.Errorf("BufferPercent=%v, want 100 (clamped)", fs.BufferPercent)
+	}
+}
+
 // (Cluster-mode rendering moved to the gRPC handler in #879;
 // fwdstatus.Build no longer takes a clusterMode flag. Cluster
 // composition tests live in pkg/grpcapi/.)

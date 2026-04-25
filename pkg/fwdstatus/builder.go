@@ -138,6 +138,14 @@ func Build(
 		fs.BufferPercent = maxPct
 		fs.BufferKnown = true
 	}
+	// #878: userspace-dp Buffer% is the max across bindings of
+	// max(umem_inflight%, tx_ring%).  An idle binding with no
+	// published capacities (UmemTotalFrames==0) is skipped, so a
+	// fresh boot before the first per-binding publish keeps
+	// BufferKnown=false and the legacy "unknown (#878)" rendering.
+	// Userspace-dp status fetch happens below for State
+	// classification — fold the buffer computation into that lookup
+	// to avoid a second Status() call.
 
 	// --- Worker path detection (for State + Mode) ----------------
 	// Worker CPU values come from the sampler (above); here we only
@@ -154,6 +162,46 @@ func Build(
 	}
 	if isUserspace && usErr == nil {
 		fs.WorkerCPUMode = CPUModeWorkers
+		// #878: derive Buffer% from per-binding UMEM in-flight and
+		// TX-ring depth. Both inputs come from atomics published by
+		// the worker thread itself in a single store per signal per
+		// ~1s debug tick — no torn-load risk on the read side. For
+		// each binding with published capacities, compute
+		// max(umem%, tx_ring%) and aggregate as max across bindings.
+		// Bindings whose UmemTotalFrames is zero (helper hasn't
+		// published yet, or pre-#878 helper) are skipped entirely:
+		// the Rust worker writes both capacities atomically at
+		// startup, so a binding without UmemTotalFrames also has no
+		// meaningful TxRingCapacity. Gating on UmemTotalFrames alone
+		// keeps the "all unknown" backward-compat path clean.
+		maxPct := 0.0
+		anyKnown := false
+		for _, b := range usStatus.Bindings {
+			if b.UmemTotalFrames == 0 {
+				continue
+			}
+			anyKnown = true
+			umemPct := float64(b.UmemInflightFrames) * 100.0 / float64(b.UmemTotalFrames)
+			var txPct float64
+			if b.TxRingCapacity > 0 {
+				txPct = float64(b.OutstandingTX) * 100.0 / float64(b.TxRingCapacity)
+			}
+			pct := umemPct
+			if txPct > pct {
+				pct = txPct
+			}
+			if pct > maxPct {
+				maxPct = pct
+			}
+		}
+		if anyKnown {
+			if maxPct > 100.0 {
+				maxPct = 100.0
+			}
+			fs.BufferPercent = maxPct
+			fs.BufferKnown = true
+			fs.BufferFollowupRef = 0
+		}
 	}
 
 	// --- State ---------------------------------------------------
