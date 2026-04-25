@@ -72,14 +72,20 @@ type CLI struct {
 	// wired — Build() falls back to all-invalid windows.
 	fwdSampler *fwdstatus.Sampler
 
-	// applyConfigFn is the daemon's full reconcile callback. When set,
-	// local CLI commits invoke this (the single source of truth used by
-	// gRPC/HTTP commits via ApplyFn) so every commit path runs through
-	// the same reconcile — including D3 RSS indirection reapply (#797
-	// H2). When nil (not wired), the CLI falls back to the legacy
-	// applyToDataplane() which covers dataplane/FRR/IPsec but misses
-	// daemon-level steps like D3 and cluster/VRRP reconcile.
+	// applyConfigFn is the daemon's full reconcile callback used by
+	// non-commit paths (e.g. confirm/rollback). For commits, the CLI
+	// prefers commitFn / commitConfirmedFn so the commit→apply pair
+	// is atomic under the daemon's apply semaphore (#846). When
+	// commitFn is nil (CLI spawned outside daemon), the CLI falls
+	// back to store.Commit() + applyConfigFn, and ultimately to
+	// applyToDataplane when neither is wired.
 	applyConfigFn func(*config.Config)
+	// #846: atomic commit+apply callbacks. When set, handleCommit
+	// routes through these instead of calling store.Commit directly.
+	// Same callback the HTTP/gRPC handlers use, so commits from all
+	// three paths serialize against each other.
+	commitFn          func(ctx context.Context, comment string) (*config.Config, error)
+	commitConfirmedFn func(ctx context.Context, minutes int) (*config.Config, error)
 
 	// Fabric peer dialing for cluster-wide queries (fab0 + optional fab1).
 	fabricPeerAddrFn   func() []string
@@ -90,8 +96,12 @@ type CLI struct {
 	monitorFlow *monitorFlowState
 
 	// Command cancellation: Ctrl-C during a running external command cancels it.
-	cmdMu     sync.Mutex
-	cmdCancel context.CancelFunc
+	// commitCancel is a SEPARATE slot used by handleCommit so an
+	// external-command cancel and a commit cancel can never displace
+	// each other (the slots are single-writer per call site).
+	cmdMu        sync.Mutex
+	cmdCancel    context.CancelFunc
+	commitCancel context.CancelFunc
 }
 
 // New creates a new CLI.
@@ -168,6 +178,18 @@ func (c *CLI) SetVRRPManager(m *vrrp.Manager) {
 // applyToDataplane() path.
 func (c *CLI) SetApplyConfigFn(fn func(*config.Config)) {
 	c.applyConfigFn = fn
+}
+
+// SetCommitFns wires the daemon's atomic commit+apply callbacks
+// (#846). When set, handleCommit routes through these instead of
+// calling store.Commit directly so the commit→apply pair is atomic
+// against HTTP/gRPC/event-engine commits.
+func (c *CLI) SetCommitFns(
+	commitFn func(ctx context.Context, comment string) (*config.Config, error),
+	commitConfirmedFn func(ctx context.Context, minutes int) (*config.Config, error),
+) {
+	c.commitFn = commitFn
+	c.commitConfirmedFn = commitConfirmedFn
 }
 
 // SetFabricPeer configures fabric peer dialing for cluster-wide queries.
@@ -613,12 +635,21 @@ func (c *CLI) Run() error {
 	go func() {
 		var lastInterrupt time.Time
 		for range sigCh {
-			// If an external command is running, cancel it.
+			// If a commit or an external command is running, cancel
+			// it. commitCancel takes priority because a commit
+			// hanging on the apply semaphore is the only path that
+			// actually needs ctx-aware cancellation; external
+			// commands fall back if no commit is in flight.
 			c.cmdMu.Lock()
-			cancel := c.cmdCancel
+			commitCancel := c.commitCancel
+			cmdCancel := c.cmdCancel
 			c.cmdMu.Unlock()
-			if cancel != nil {
-				cancel()
+			if commitCancel != nil {
+				commitCancel()
+				continue
+			}
+			if cmdCancel != nil {
+				cmdCancel()
 				continue
 			}
 			now := time.Now()

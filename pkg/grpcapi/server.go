@@ -49,7 +49,14 @@ type Config struct {
 	RPMResultsFn     func() []*rpm.ProbeResult        // returns live RPM results
 	FeedsFn          func() map[string]feeds.FeedInfo // returns live feed status
 	LLDPNeighborsFn  func() []*lldp.Neighbor          // returns live LLDP neighbors
-	ApplyFn          func(*config.Config)             // daemon's applyConfig callback
+	// #846: atomic commit+apply callbacks. The daemon holds its
+	// apply semaphore across configstore.Commit, applyConfig, and
+	// (for gRPC) syncConfigToPeer, so two concurrent committers
+	// can't interleave their commit→apply pairs. Returns ctx.Err()
+	// if the request is canceled before the semaphore is acquired
+	// (handlers translate to DeadlineExceeded/Canceled).
+	CommitFn          func(ctx context.Context, comment string) (*config.Config, error)
+	CommitConfirmedFn func(ctx context.Context, minutes int) (*config.Config, error)
 	VRRPMgr          *vrrp.Manager                    // native VRRP manager
 	RAMgr            *ra.Manager                      // embedded RA sender manager
 	Version          string                           // software version string
@@ -74,7 +81,8 @@ type Server struct {
 	rpmResultsFn       func() []*rpm.ProbeResult
 	feedsFn            func() map[string]feeds.FeedInfo
 	lldpNeighborsFn    func() []*lldp.Neighbor
-	applyFn            func(*config.Config)
+	commitFn           func(ctx context.Context, comment string) (*config.Config, error)
+	commitConfirmedFn  func(ctx context.Context, minutes int) (*config.Config, error)
 	vrrpMgr            *vrrp.Manager
 	raMgr              *ra.Manager
 	fwdSampler         *fwdstatus.Sampler
@@ -133,9 +141,10 @@ func NewServer(addr string, cfg Config) *Server {
 		dhcp:             cfg.DHCP,
 		dhcpServer:       cfg.DHCPServer,
 		rpmResultsFn:     cfg.RPMResultsFn,
-		feedsFn:          cfg.FeedsFn,
-		lldpNeighborsFn:  cfg.LLDPNeighborsFn,
-		applyFn:          cfg.ApplyFn,
+		feedsFn:           cfg.FeedsFn,
+		lldpNeighborsFn:   cfg.LLDPNeighborsFn,
+		commitFn:          cfg.CommitFn,
+		commitConfirmedFn: cfg.CommitConfirmedFn,
 		vrrpMgr:          cfg.VRRPMgr,
 		raMgr:            cfg.RAMgr,
 		fwdSampler:       cfg.FwdSampler,

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/psaab/xpf/pkg/api"
 	"github.com/psaab/xpf/pkg/cli"
@@ -113,6 +114,24 @@ type Daemon struct {
 	vrrpMgr                    *vrrp.Manager
 	gc                         *conntrack.GC
 	startTime                  time.Time // daemon start time; used to suppress stale config sync
+
+	// #846: applySem (capacity 1) serializes applyConfig + the
+	// commit→apply pair across all entry points (HTTP/gRPC commits,
+	// cluster sync recv, DHCP callbacks, config-poll, dynamic feeds,
+	// event engine, in-process CLI commits, CLI auto-rollback).
+	// Without this, two concurrent callers can interleave across
+	// VRF/tunnel/FRR-reload steps, or one caller's commit can
+	// interleave between another's commit and apply, leaving
+	// configstore/kernel divergent. Used as a semaphore (not a
+	// sync.Mutex) so handlers can Acquire(ctx, 1) and surface a 503
+	// to the client when the lock holder is slow, instead of
+	// hanging the request indefinitely.
+	applySem *semaphore.Weighted
+	// applyBodyForTest, when non-nil, replaces applyConfigLocked's
+	// body. Test-only seam used by apply_serialize_test.go to
+	// exercise the semaphore contract through the real applyConfig
+	// / commitAndApply paths without standing up the full dataplane.
+	applyBodyForTest func(*config.Config)
 
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
 	// Used by collectDHCPRoutes to exclude management routes from FRR.
@@ -399,6 +418,7 @@ func New(opts Options) *Daemon {
 		localFailoverCommitTimeout: 3 * time.Second,
 		localFailoverCommitDelay:   200 * time.Millisecond,
 		userspaceDemotionPrepUntil: make(map[int]time.Time),
+		applySem:                   semaphore.NewWeighted(1),
 	}
 }
 
@@ -834,7 +854,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Start event-options engine if configured.
 	if cfg := d.store.ActiveConfig(); cfg != nil && len(cfg.EventOptions) > 0 {
-		d.eventEngine = eventengine.New(d.store, d.applyConfig)
+		// #846: route through commitAndApply so the engine's commit
+		// serializes with HTTP/gRPC commits under d.applySem.
+		// Event-options changes don't sync to peer (the engine fires
+		// independently on each node based on local RPM events).
+		d.eventEngine = eventengine.New(d.store, func(ctx context.Context, comment string) (*config.Config, error) {
+			return d.commitAndApply(ctx, comment, false)
+		})
 		d.eventEngine.Apply(cfg.EventOptions)
 		if d.rpm != nil {
 			d.rpm.SetEventCallback(d.eventEngine.HandleEvent)
@@ -988,7 +1014,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 			IPsec:    d.ipsec,
 			DHCP:     d.dhcp,
 			VRRPMgr:  d.vrrpMgr,
-			ApplyFn:  d.applyConfig,
+			// HTTP commits don't sync to peer (preserves prior
+			// behavior; see #846 for follow-up).
+			CommitFn: func(ctx context.Context, comment string) (*config.Config, error) {
+				return d.commitAndApply(ctx, comment, false)
+			},
+			CommitConfirmedFn: func(ctx context.Context, minutes int) (*config.Config, error) {
+				return d.commitConfirmedAndApply(ctx, minutes, false)
+			},
 			// #758: surface compile state so /health returns 503
 			// when the dataplane has never compiled successfully.
 			CompileHealthFn: func() api.CompileHealthSnapshot {
@@ -1057,11 +1090,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Start gRPC API server.
 	{
-		// Wrap applyConfig to also sync config to cluster peer after commit.
-		applyAndSync := func(cfg *config.Config) {
-			d.applyConfig(cfg)
-			d.syncConfigToPeer()
-		}
 		grpcSrv := grpcapi.NewServer(d.opts.GRPCAddr, grpcapi.Config{
 			Store:      d.store,
 			DP:         d.dp,
@@ -1091,7 +1119,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 				return nil
 			},
-			ApplyFn: applyAndSync,
+			// gRPC commits sync to cluster peer atomically inside
+			// the apply lock so the peer can never observe an apply
+			// that hasn't yet been propagated.
+			CommitFn: func(ctx context.Context, comment string) (*config.Config, error) {
+				return d.commitAndApply(ctx, comment, true)
+			},
+			CommitConfirmedFn: func(ctx context.Context, minutes int) (*config.Config, error) {
+				return d.commitConfirmedAndApply(ctx, minutes, true)
+			},
 			VRRPMgr: d.vrrpMgr,
 			RAMgr:   d.ra,
 			Version: d.opts.Version,
@@ -1145,11 +1181,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 		shell := cli.New(d.store, d.dp, eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp, d.dhcpRelay, d.cluster)
 		shell.SetVersion(d.opts.Version)
 		shell.SetForwardingSampler(fwdSampler)
-		// #797 H2: route in-process CLI commits through the daemon's
-		// full reconcile (same path gRPC/HTTP use via ApplyFn) so D3
-		// RSS indirection reapply, cluster/VRRP, DHCP etc. converge
-		// on every commit — not only the subset applyToDataplane() did.
+		// #797 H2 / #846: route in-process CLI commits through the
+		// daemon's atomic commit+apply so they serialize against
+		// HTTP/gRPC/event-engine commits under d.applySem.
+		// applyConfigFn stays wired for non-commit paths (rollback,
+		// confirm) that still need the full reconcile.
 		shell.SetApplyConfigFn(d.applyConfig)
+		shell.SetCommitFns(
+			func(ctx context.Context, comment string) (*config.Config, error) {
+				// In-process CLI commits don't sync to peer (the
+				// CLI is local; preserves prior per-transport
+				// behavior, same as HTTP).
+				return d.commitAndApply(ctx, comment, false)
+			},
+			func(ctx context.Context, minutes int) (*config.Config, error) {
+				return d.commitConfirmedAndApply(ctx, minutes, false)
+			},
+		)
 		shell.SetRPMResultsFn(func() []*rpm.ProbeResult {
 			if d.rpm != nil {
 				return d.rpm.Results()
@@ -1531,8 +1579,6 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]
 	return resolved
 }
 
-// applyConfig applies a compiled config in the correct order:
-// 0. Create VRF devices and bind interfaces (routing instances)
 // bootstrapFromFile reads the text Junos config file and imports it as the
 // initial active configuration. This is called on first start when the DB
 // has no active config yet.
@@ -1561,12 +1607,105 @@ func (d *Daemon) bootstrapFromFile() error {
 	return nil
 }
 
-// 1. Create tunnels (so interfaces exist for zone binding)
-// 2. Compile eBPF (attaches XDP/TC to interfaces including tunnels)
-// 3. Install static routes (global + per-instance)
-// 4. Apply FRR config (OSPF/BGP, global + per-VRF)
-// 5. Apply IPsec config (strongSwan)
+// applyConfig applies a compiled config to the dataplane / kernel.
+// Wraps applyConfigLocked under the apply semaphore for non-context
+// callers (DHCP callbacks, config-poll, dynamic feeds, event engine,
+// in-process CLI commits, CLI auto-rollback, cluster sync recv).
+// Always succeeds in acquiring the lock because Background never
+// cancels.
+//
+// #846: HTTP/gRPC commit handlers go through commitAndApply /
+// commitConfirmedAndApply instead, which take the same semaphore
+// with a request-bound context so a slow lock holder surfaces 503
+// to the client rather than hanging the request.
 func (d *Daemon) applyConfig(cfg *config.Config) {
+	_ = d.applySem.Acquire(context.Background(), 1)
+	defer d.applySem.Release(1)
+	d.applyConfigLocked(cfg)
+}
+
+// commitAndApply atomically promotes the candidate config and
+// applies it. Holds applySem across configstore.Commit and
+// applyConfigLocked so two concurrent committers can't interleave
+// their commit→apply pairs (which would let kernel state lag store
+// state). Optionally syncs to the cluster peer inside the lock.
+//
+// If ctx is canceled before the semaphore is acquired, returns
+// ctx.Err() and NEITHER commit nor apply runs — no divergence. Once
+// the semaphore is held, commit and apply run to completion;
+// cancellation past that point is ignored (applyConfigLocked is not
+// safe to interrupt mid-stream — kernel route writes, FRR reload,
+// etc.).
+func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bool) (*config.Config, error) {
+	if err := d.applySem.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+	defer d.applySem.Release(1)
+
+	var compiled *config.Config
+	var err error
+	if comment != "" {
+		compiled, err = d.store.CommitWithDescription(comment)
+	} else {
+		compiled, err = d.store.Commit()
+	}
+	if err != nil {
+		return nil, err
+	}
+	d.applyConfigLocked(compiled)
+	if syncPeer {
+		d.syncConfigToPeer()
+	}
+	return compiled, nil
+}
+
+// syncAndApply is the cluster-sync-recv analogue of commitAndApply.
+// Holds applySem across configstore.SyncApply (peer-driven active
+// promotion) + applyConfigLocked, so a peer-sync can't interleave
+// between a local committer's Commit and applyConfig (which would
+// briefly leave store=peer-config but kernel=local-config).
+func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPreserve func(*config.ConfigTree)) (*config.Config, error) {
+	if err := d.applySem.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+	defer d.applySem.Release(1)
+
+	compiled, err := d.store.SyncApply(configText, chassisPreserve)
+	if err != nil {
+		return nil, err
+	}
+	if compiled != nil {
+		d.applyConfigLocked(compiled)
+	}
+	return compiled, nil
+}
+
+// commitConfirmedAndApply is the commit-confirmed analogue of
+// commitAndApply. Same atomicity guarantees.
+func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncPeer bool) (*config.Config, error) {
+	if err := d.applySem.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+	defer d.applySem.Release(1)
+
+	compiled, err := d.store.CommitConfirmed(minutes)
+	if err != nil {
+		return nil, err
+	}
+	d.applyConfigLocked(compiled)
+	if syncPeer {
+		d.syncConfigToPeer()
+	}
+	return compiled, nil
+}
+
+// applyConfigLocked runs the actual reconcile pipeline. MUST be
+// called with d.applySem held.
+func (d *Daemon) applyConfigLocked(cfg *config.Config) {
+	if d.applyBodyForTest != nil {
+		d.applyBodyForTest(cfg)
+		return
+	}
 	// Reset VIP warning suppression so new config gets fresh warnings.
 	d.vipWarnedIfaces = nil
 

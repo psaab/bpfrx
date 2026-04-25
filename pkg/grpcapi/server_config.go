@@ -2,9 +2,9 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"strings"
 
-	"github.com/psaab/xpf/pkg/config"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -140,7 +140,7 @@ func (s *Server) Load(_ context.Context, req *pb.LoadRequest) (*pb.LoadResponse,
 	return &pb.LoadResponse{}, nil
 }
 
-func (s *Server) Commit(_ context.Context, req *pb.CommitRequest) (*pb.CommitResponse, error) {
+func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitResponse, error) {
 	// If a confirmed commit is pending, confirm it
 	if s.store.IsConfirmPending() {
 		if err := s.store.ConfirmCommit(); err != nil {
@@ -152,18 +152,18 @@ func (s *Server) Commit(_ context.Context, req *pb.CommitRequest) (*pb.CommitRes
 	// Capture diff summary before commit (active will change)
 	summary := s.store.CommitDiffSummary()
 
-	var compiled *config.Config
-	var err error
-	if req.Comment != "" {
-		compiled, err = s.store.CommitWithDescription(req.Comment)
-	} else {
-		compiled, err = s.store.Commit()
+	if s.commitFn == nil {
+		return nil, status.Errorf(codes.Internal, "commit handler not wired")
 	}
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
-	}
-	if s.applyFn != nil {
-		s.applyFn(compiled)
+	if _, err := s.commitFn(ctx, req.Comment); err != nil {
+		switch {
+		case errors.Is(err, context.Canceled):
+			return nil, status.Errorf(codes.Canceled, "commit busy: %v", err)
+		case errors.Is(err, context.DeadlineExceeded):
+			return nil, status.Errorf(codes.DeadlineExceeded, "commit busy: %v", err)
+		default:
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
 	}
 	return &pb.CommitResponse{Summary: summary}, nil
 }
@@ -175,13 +175,19 @@ func (s *Server) CommitCheck(_ context.Context, _ *pb.CommitCheckRequest) (*pb.C
 	return &pb.CommitCheckResponse{}, nil
 }
 
-func (s *Server) CommitConfirmed(_ context.Context, req *pb.CommitConfirmedRequest) (*pb.CommitConfirmedResponse, error) {
-	compiled, err := s.store.CommitConfirmed(int(req.Minutes))
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+func (s *Server) CommitConfirmed(ctx context.Context, req *pb.CommitConfirmedRequest) (*pb.CommitConfirmedResponse, error) {
+	if s.commitConfirmedFn == nil {
+		return nil, status.Errorf(codes.Internal, "commit-confirmed handler not wired")
 	}
-	if s.applyFn != nil {
-		s.applyFn(compiled)
+	if _, err := s.commitConfirmedFn(ctx, int(req.Minutes)); err != nil {
+		switch {
+		case errors.Is(err, context.Canceled):
+			return nil, status.Errorf(codes.Canceled, "commit busy: %v", err)
+		case errors.Is(err, context.DeadlineExceeded):
+			return nil, status.Errorf(codes.DeadlineExceeded, "commit busy: %v", err)
+		default:
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
 	}
 	return &pb.CommitConfirmedResponse{}, nil
 }

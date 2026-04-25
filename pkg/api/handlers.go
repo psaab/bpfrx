@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -1515,7 +1516,7 @@ func (s *Server) configDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]string{"status": "ok"})
 }
 
-func (s *Server) configCommitHandler(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) configCommitHandler(w http.ResponseWriter, r *http.Request) {
 	if s.store.IsConfirmPending() {
 		if err := s.store.ConfirmCommit(); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -1525,13 +1526,18 @@ func (s *Server) configCommitHandler(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 
-	compiled, err := s.store.Commit()
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if s.commitFn == nil {
+		writeError(w, http.StatusInternalServerError, "commit handler not wired")
 		return
 	}
-	if s.applyFn != nil {
-		s.applyFn(compiled)
+	if _, err := s.commitFn(r.Context(), ""); err != nil {
+		switch {
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			writeError(w, http.StatusServiceUnavailable, "commit busy: "+err.Error())
+		default:
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
+		return
 	}
 	writeOK(w, map[string]string{"status": "ok"})
 }
@@ -1682,14 +1688,18 @@ func (s *Server) configCommitConfirmedHandler(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-
-	compiled, err := s.store.CommitConfirmed(req.Minutes)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if s.commitConfirmedFn == nil {
+		writeError(w, http.StatusInternalServerError, "commit-confirmed handler not wired")
 		return
 	}
-	if s.applyFn != nil {
-		s.applyFn(compiled)
+	if _, err := s.commitConfirmedFn(r.Context(), req.Minutes); err != nil {
+		switch {
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			writeError(w, http.StatusServiceUnavailable, "commit busy: "+err.Error())
+		default:
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
+		return
 	}
 	writeOK(w, map[string]string{"status": "ok"})
 }

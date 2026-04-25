@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -191,12 +192,11 @@ func (c *CLI) handleCommit(args []string) error {
 
 		diffSummary := c.store.CommitDiffSummary()
 
-		compiled, err := c.store.CommitWithDescription(desc)
+		compiled, err := c.runCommit(desc)
 		if err != nil {
 			return fmt.Errorf("commit failed: %w", err)
 		}
 
-		c.commitApply(compiled)
 		c.reloadSyslog(compiled)
 		c.refreshPrompt()
 
@@ -216,13 +216,11 @@ func (c *CLI) handleCommit(args []string) error {
 			}
 		}
 
-		compiled, err := c.store.CommitConfirmed(minutes)
+		compiled, err := c.runCommitConfirmed(minutes)
 		if err != nil {
 			return fmt.Errorf("commit confirmed failed: %w", err)
 		}
 
-		// Apply to dataplane (daemon full reconcile when wired).
-		c.commitApply(compiled)
 		c.reloadSyslog(compiled)
 		c.refreshPrompt()
 
@@ -242,13 +240,10 @@ func (c *CLI) handleCommit(args []string) error {
 	// Capture diff summary before commit (active will change)
 	diffSummary := c.store.CommitDiffSummary()
 
-	compiled, err := c.store.Commit()
+	compiled, err := c.runCommit("")
 	if err != nil {
 		return fmt.Errorf("commit failed: %w", err)
 	}
-
-	// Apply to dataplane (daemon full reconcile when wired).
-	c.commitApply(compiled)
 
 	// Hot-reload syslog clients
 	c.reloadSyslog(compiled)
@@ -260,4 +255,68 @@ func (c *CLI) handleCommit(args []string) error {
 		fmt.Println("commit complete")
 	}
 	return nil
+}
+
+// runCommit dispatches to the daemon's atomic commit+apply when
+// wired (#846); otherwise falls back to store.Commit followed by
+// commitApply (the legacy path used by standalone CLI without a
+// daemon). The atomic path serializes against HTTP/gRPC/event-engine
+// commits via d.applySem.
+//
+// Uses a cancellable context registered with the CLI's Ctrl-C
+// handler so an operator can interrupt a commit that's hung
+// waiting for the apply lock (e.g. a long-running peer-sync apply
+// holding it).
+func (c *CLI) runCommit(comment string) (*config.Config, error) {
+	if c.commitFn != nil {
+		ctx, done := c.commitCtx()
+		defer done()
+		return c.commitFn(ctx, comment)
+	}
+	var compiled *config.Config
+	var err error
+	if comment != "" {
+		compiled, err = c.store.CommitWithDescription(comment)
+	} else {
+		compiled, err = c.store.Commit()
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.commitApply(compiled)
+	return compiled, nil
+}
+
+// runCommitConfirmed is the commit-confirmed analogue of runCommit.
+func (c *CLI) runCommitConfirmed(minutes int) (*config.Config, error) {
+	if c.commitConfirmedFn != nil {
+		ctx, done := c.commitCtx()
+		defer done()
+		return c.commitConfirmedFn(ctx, minutes)
+	}
+	compiled, err := c.store.CommitConfirmed(minutes)
+	if err != nil {
+		return nil, err
+	}
+	c.commitApply(compiled)
+	return compiled, nil
+}
+
+// commitCtx returns a cancellable context registered with the CLI's
+// Ctrl-C handler via the dedicated commitCancel slot (separate from
+// cmdCancel which is used by external commands). Single-writer per
+// call site means the cleanup can clear unconditionally — the slot
+// is only ever set/cleared by a runCommit pair. The returned `done`
+// MUST be deferred by the caller.
+func (c *CLI) commitCtx() (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	c.cmdMu.Lock()
+	c.commitCancel = cancel
+	c.cmdMu.Unlock()
+	return ctx, func() {
+		c.cmdMu.Lock()
+		c.commitCancel = nil
+		c.cmdMu.Unlock()
+		cancel()
+	}
 }
