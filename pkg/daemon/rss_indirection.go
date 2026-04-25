@@ -70,6 +70,17 @@ var (
 	rssEnabled    atomic.Bool
 	rssWorkers    atomic.Int32
 	rssAllowedRef atomic.Pointer[[]string]
+
+	// rssApplyInProgress is true for the duration of applyConfigLocked
+	// (Codex R2 Q2). The rebalance loop must abandon any in-flight
+	// rebalance when this is set, because publishRSSState +
+	// BumpRSSConfigGen happen INSIDE applyRSSIndirection (called from
+	// reapplyRSSIndirection at the END of applyConfigLocked) — so a
+	// single top-of-apply bump alone leaves a window where snapshot
+	// and post-lock recheck both see the bumped-once gen, allowing
+	// the rebalance loop to write weights based on (old config view,
+	// new helper bindings).
+	rssApplyInProgress atomic.Bool
 )
 
 // LoadRSSEpoch returns the current write-completion epoch. Bumped on
@@ -110,6 +121,16 @@ func RssWriteMuLock() { rssWriteMu.Lock() }
 
 // RssWriteMuUnlock releases the write mutex.
 func RssWriteMuUnlock() { rssWriteMu.Unlock() }
+
+// SetRSSApplyInProgress marks an applyConfigLocked window in flight
+// (Codex R2 Q2). Rebalance must abandon any in-flight write while
+// this is true.
+func SetRSSApplyInProgress(b bool) { rssApplyInProgress.Store(b) }
+
+// LoadRSSApplyInProgress reports whether applyConfigLocked is
+// currently running. Read by the rebalance loop after acquiring
+// rssWriteMu so the check is observed atomically with the lock.
+func LoadRSSApplyInProgress() bool { return rssApplyInProgress.Load() }
 
 // publishRSSState updates the live atomic config snapshot. Called by
 // the three public entry points on every invocation. Must be called

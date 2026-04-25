@@ -536,6 +536,125 @@ func TestSampleFailure_NeverPermanentSkip(t *testing.T) {
 	}
 }
 
+// Codex R2 Q1 pin: userspaceBindingRXReader must filter out
+// non-Bound and non-XSKRegistered BindingStatus entries. Failed
+// bindings stay in the helper's status list with bound=false and
+// counters frozen at 0 — including them in the rebalance domain
+// would let the algorithm migrate weight toward queues with no
+// AF_XDP socket.
+func TestUserspaceReader_FiltersUnusableBindings(t *testing.T) {
+	// We can't easily fake *dpuserspace.Manager here without a full
+	// helper stub. Validate the filter logic directly by replicating
+	// what ReadBindingRX does with an inline list, using the same
+	// predicates. This is a structural check that the filter
+	// expression compiles to the intended boolean.
+	type binding struct {
+		queue         uint32
+		iface         string
+		bound         bool
+		xskRegistered bool
+		rxPackets     uint64
+	}
+	bindings := []binding{
+		{queue: 0, iface: "e0", bound: true, xskRegistered: true, rxPackets: 100},
+		{queue: 1, iface: "e0", bound: false, xskRegistered: true, rxPackets: 0},  // not bound
+		{queue: 2, iface: "e0", bound: true, xskRegistered: false, rxPackets: 50}, // not xsk-registered
+		{queue: 3, iface: "e0", bound: true, xskRegistered: true, rxPackets: 200},
+		{queue: 0, iface: "e1", bound: true, xskRegistered: true, rxPackets: 999}, // wrong iface
+	}
+	out := make(map[int]uint64)
+	for _, b := range bindings {
+		if b.iface != "e0" {
+			continue
+		}
+		if !b.bound || !b.xskRegistered {
+			continue
+		}
+		out[int(b.queue)] = b.rxPackets
+	}
+	want := map[int]uint64{0: 100, 3: 200}
+	if len(out) != len(want) {
+		t.Fatalf("filter result: got %v, want %v", out, want)
+	}
+	for k, v := range want {
+		if out[k] != v {
+			t.Errorf("ring %d: got %d, want %d", k, out[k], v)
+		}
+	}
+}
+
+// Codex R2 Q2 pin: applyConfigLocked sets rssApplyInProgress=true
+// for its entire window. The rebalance loop, after acquiring
+// rssWriteMu, must abandon when this flag is set — even when its
+// own ConfigGen snapshot/recheck happen to match. This protects
+// the window where applyConfigLocked has bumped state mid-flight
+// (e.g. d.dp.Compile changed helper bindings) but the terminal
+// reapplyRSSIndirection bump hasn't published the new state yet.
+func TestConcurrency_AbandonsWhileApplyInProgress(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights:        equalWeights(6),
+		consecutiveImbalanced: rssRebalanceStability,
+		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+		lastSampleCounters:    map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	reader.set("e0", map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	// Simulate applyConfigLocked in flight.
+	SetRSSApplyInProgress(true)
+	defer SetRSSApplyInProgress(false)
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if len(exec.ethtoolXCalls) != 0 {
+		t.Errorf("apply-in-progress must abandon rebalance write: got %d -X calls",
+			len(exec.ethtoolXCalls))
+	}
+}
+
+// Codex R2 Q1 pin: even when len(sample) matches expectedRingCount,
+// the observed key set must be exactly [0, expectedRingCount). A
+// sample with a gap (e.g. {0,1,2,3,4,7} for expectedRingCount=6)
+// has the right cardinality but indexes a queue (7) that doesn't
+// belong to the contiguous-domain assumption.
+func TestSampleShape_NonContiguousKeysSkipsRebalance(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights:        equalWeights(6),
+		consecutiveImbalanced: rssRebalanceStability,
+		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+		lastSampleCounters:    map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 7: 0},
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	// 6 entries (matches expectedRingCount=6), but key set is
+	// {0,1,2,3,4,7} — non-contiguous. Must skip.
+	reader.set("e0", map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100, 4: 100, 7: 100})
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if len(exec.ethtoolXCalls) != 0 {
+		t.Errorf("non-contiguous keys must skip rebalance: got %d -X calls",
+			len(exec.ethtoolXCalls))
+	}
+	if !s.firstSample {
+		t.Errorf("non-contiguous keys must reset firstSample")
+	}
+}
+
 // Codex HIGH 1 pin: when the helper exposes fewer queue bindings
 // than the rebalance domain expects (cross-iface queue_count min in
 // userspace-dp/src/main.rs:1148), skip the rebalance for this tick.

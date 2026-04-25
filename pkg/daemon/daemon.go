@@ -1734,17 +1734,31 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) {
 	// Reset VIP warning suppression so new config gets fresh warnings.
 	d.vipWarnedIfaces = nil
 
-	// Codex HIGH 2 (#840 RSS rebalance race): bump ConfigGen at the
-	// top of applyConfigLocked, BEFORE d.dp.Compile (line ~1998)
-	// changes helper bindings. The rebalance loop's tick-start
-	// ConfigGen snapshot taken before this bump will mismatch the
-	// post-lock re-check, causing any in-flight rebalance to
-	// abandon. Step 21 below (reapplyRSSIndirection at ~line 2583)
-	// bumps ConfigGen again with the new state once the apply
-	// completes — that bump is what publishes the new
-	// (rssEnabled, rssWorkers, rssAllowed). Between these two bumps
-	// the rebalance loop sees no consistent ConfigGen and abandons.
-	BumpRSSConfigGen()
+	// Codex R2 Q2 (#840 RSS rebalance race): mark the entire
+	// applyConfigLocked window so the rebalance loop, after
+	// acquiring rssWriteMu, can abandon any in-flight rebalance
+	// without depending on a generation snapshot/recheck pair.
+	//
+	// Why a flag, not a single ConfigGen bump at entry: the terminal
+	// publishRSSState + BumpRSSConfigGen happens deep inside
+	// reapplyRSSIndirection (Step 21, line ~2603) → applyRSSIndirection
+	// → publishRSSState (rss_indirection.go:228). A bump-only
+	// approach leaves a window after the entry bump where the
+	// rebalance loop's tick-start snapshot equals its post-lock
+	// recheck — both see the bumped-once gen — and the rebalance
+	// passes its abandon gates while applyConfigLocked is mid-flight
+	// (i.e. d.dp.Compile at line ~2018 may have already changed
+	// helper bindings).
+	//
+	// The flag is checked under rssWriteMu in the rebalance loop, so
+	// applyConfigLocked → applyRSSIndirection (which takes
+	// rssWriteMu) and the rebalance write path are mutually
+	// exclusive. The flag clears AFTER that terminal apply, by which
+	// point publishRSSState has updated rssEnabled / rssWorkers /
+	// rssAllowed for the new config — so any rebalance that runs
+	// next sees consistent state.
+	SetRSSApplyInProgress(true)
+	defer SetRSSApplyInProgress(false)
 
 	// Log config validation warnings
 	for _, w := range cfg.Warnings {

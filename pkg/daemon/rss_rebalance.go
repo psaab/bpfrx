@@ -78,6 +78,16 @@ type userspaceBindingRXReader struct {
 }
 
 // ReadBindingRX returns map[ring_index]cumulative_rx_packets for iface.
+//
+// Codex R2 Q1: filter to usable bindings only (Bound &&
+// XSKRegistered). The helper keeps failed/unlive bindings in the
+// BindingStatus list with bound=false, xsk_registered=false, and
+// counters frozen at zero. Including them in the rebalance domain
+// would let the algorithm move RSS weight onto queues with no
+// AF_XDP socket — exactly the failure mode the shape-mismatch
+// guard was added to prevent. Filtering at the reader also makes
+// `len(sample)` reflect truly usable queues, so the downstream
+// shape and exact-key-set guards work as intended.
 func (r userspaceBindingRXReader) ReadBindingRX(iface string) (map[int]uint64, error) {
 	if r.mgr == nil {
 		return nil, fmt.Errorf("userspace dataplane manager not available")
@@ -89,6 +99,9 @@ func (r userspaceBindingRXReader) ReadBindingRX(iface string) (map[int]uint64, e
 	out := make(map[int]uint64, len(status.Bindings))
 	for _, b := range status.Bindings {
 		if b.Interface != iface {
+			continue
+		}
+		if !b.Bound || !b.XSKRegistered {
 			continue
 		}
 		out[int(b.QueueID)] = b.RXPackets
@@ -246,20 +259,41 @@ func rebalanceTick(state map[string]*rssRebalanceState, execer rssExecutor, read
 		// Reset sample failure counter on any successful read.
 		s.sampleFailures = 0
 
-		// Codex HIGH 1: defensive guard against helper bindings
-		// covering fewer queues than the rebalance domain expects
-		// (e.g. cross-iface queue_count min — see
-		// userspace-dp/src/main.rs:1148). Without this, queues with
-		// no AF_XDP socket look "cold" and the rebalance moves
-		// weight toward them, redirecting traffic into the kernel
-		// fallback path.
+		// Codex R1 HIGH 1 / R2 Q1 strengthened: defensive guard
+		// against helper bindings covering fewer (or different)
+		// queues than the rebalance domain expects. Two failure
+		// modes this protects against:
 		//
-		// expectedRingCount mirrors the indirection-table active
-		// width (#785). If sample shape doesn't match (helper
-		// covers fewer queues, or sample is empty during a
-		// helper-side reconfigure), skip this tick rather than
-		// rebalance with a partial domain.
-		if len(sample) != expectedRingCount {
+		//  (a) Cross-iface queue_count min — userspace-dp/src/main.rs:1148
+		//      lays out queues 0..queue_count-1 across ALL
+		//      candidate interfaces, so an iface with 6 RX queues
+		//      paired with one having 4 only gets bindings on
+		//      queues 0..3. Without the guard, queues 4..5 look
+		//      "cold" and the rebalance migrates weight toward
+		//      them, redirecting traffic into the kernel fallback
+		//      path.
+		//
+		//  (b) Failed / non-bound bindings — userspaceBindingRXReader
+		//      filters out !Bound || !XSKRegistered entries, so
+		//      sample only contains usable AF_XDP sockets. If the
+		//      observed key set doesn't match exactly
+		//      [0, expectedRingCount), that ring is unusable.
+		//
+		// Require an exact contiguous key set rather than just
+		// `len(sample) == expectedRingCount`: a sample with
+		// {0,1,2,3,4,7} would have len=6 but a non-contiguous
+		// domain that the indexing in computeWeightShift can't
+		// handle correctly.
+		shapeOK := len(sample) == expectedRingCount
+		if shapeOK {
+			for q := 0; q < expectedRingCount; q++ {
+				if _, ok := sample[q]; !ok {
+					shapeOK = false
+					break
+				}
+			}
+		}
+		if !shapeOK {
 			if !s.sampleShapeWarned {
 				slog.Warn("rss rebalance: sample shape != expected domain — skipping",
 					"iface", iface,
@@ -347,6 +381,18 @@ func rebalanceTick(state map[string]*rssRebalanceState, execer rssExecutor, read
 		}
 
 		RssWriteMuLock()
+		// Codex R2 Q2: hard abandon if applyConfigLocked is in
+		// flight. publishRSSState + the terminal ConfigGen bump
+		// happen INSIDE the apply window (via reapplyRSSIndirection
+		// at the end), so the snapshot/recheck-pair semantics break:
+		// a rebalance that ticks after the entry mark could see
+		// snapshot==recheck and write weights based on stale config
+		// while helper bindings have already changed.
+		if LoadRSSApplyInProgress() {
+			RssWriteMuUnlock()
+			s.lastSeenEpoch = LoadRSSEpoch() - 1
+			continue
+		}
 		// Post-lock ConfigGen re-check (#835 R2 F6 + R4 F3 + R5 F1 + R8 F1).
 		if LoadRSSConfigGen() != genBefore {
 			RssWriteMuUnlock()
