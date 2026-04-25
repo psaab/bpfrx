@@ -46,9 +46,15 @@ reverted. The fix here MUST work against this simpler contract:
 
 - No locking required: there is no concurrent writer of the RSS
   indirection table in master. The only callers are
-  daemon-startup (`linksetup.go:113`) and reconcile-on-commit
-  (`daemon.go:2566`); both are serialized by the daemon's
-  config-apply semaphore.
+  daemon-startup (`linksetup.go:113`, runs from
+  `enumerateAndRenameInterfaces` BEFORE the API / gRPC / CLI
+  commit paths are wired up) and reconcile-on-commit
+  (`daemon.go:2566`, runs under the config-apply path which the
+  daemon enforces serially). Startup-vs-reconcile serialization
+  is **lifecycle ordering** (R2#1: not the apply semaphore as a
+  prior revision incorrectly claimed), but the practical
+  outcome is the same: no two RSS-indirection writers ever run
+  concurrently in master.
 - No bool return: `applyRSSIndirectionOne` stays void. The
   caller is unaware whether a write happened.
 - No epoch bump: not present in master.
@@ -177,6 +183,7 @@ func indirectionTableIsDefault(output []byte, queueCount int) bool {
     if queueCount <= 0 {
         return false
     }
+    sawAnyRow := false  // R2#2: prevent vacuously-true on empty/unparseable output
     for _, line := range bytes.Split(output, []byte{'\n'}) {
         trimmed := bytes.TrimSpace(line)
         if len(trimmed) == 0 {
@@ -190,6 +197,7 @@ func indirectionTableIsDefault(output []byte, queueCount int) bool {
         if err != nil {
             continue
         }
+        sawAnyRow = true
         for j, tok := range bytes.Fields(trimmed[colon+1:]) {
             q, err := strconv.Atoi(string(tok))
             if err != nil {
@@ -201,7 +209,7 @@ func indirectionTableIsDefault(output []byte, queueCount int) bool {
             }
         }
     }
-    return true
+    return sawAnyRow
 }
 ```
 
@@ -250,13 +258,27 @@ locking (none) preserved.
    MED #6.)
 8. `TestIndirectionTableIsDefault_RoundRobin_True`: pure-parser
    test using the captured `ethtool -x` output from
-   `loss:xpf-userspace-fw0/ge-0-0-2` (committed as a fixture).
+   `loss:xpf-userspace-fw0/ge-0-0-2`. Fixture is **inline
+   string literal** in the test (R2#4: pinned — small enough
+   to embed, keeps the test self-contained without a
+   `testdata/` file).
 9. `TestIndirectionTableIsDefault_Concentrated_False`: pure
    parser test on the `[1,1,1,1,0,0]` shape.
 10. `TestIndirectionTableIsDefault_EveryQueueOnceButNonRoundRobin_False`:
     pure parser test on a hand-built table that uses every queue
     but in non-round-robin order. Asserts the stricter check.
     (R1 MED #3.)
+11. `TestIndirectionTableIsDefault_EmptyOutput_False`: pure parser
+    test on empty / unparseable output (e.g. from a failed `ethtool
+    -x` that returned 0 bytes). Asserts `sawAnyRow` guard prevents
+    vacuously-true return. (R2 MED #2.)
+12. `TestApplyRSSIndirectionOne_BootSequence_4then6_RestoresDefault`:
+    multi-cycle test simulating the actual operator scenario.
+    Step 1: workers=4, queues=6, default round-robin live table —
+    expect concentrated `[1,1,1,1,0,0]` write. Step 2: same iface,
+    workers=6, queues=6, live table now constrained — expect
+    `ethtool -X iface default` write. Asserts the full transition
+    behavior end-to-end. (R2 LOW #5.)
 
 Existing `TestApplyRSSIndirectionOne_*` tests (workers < queues
 path) must still pass unchanged.
@@ -298,6 +320,16 @@ path) must still pass unchanged.
 - General `ethtool -X` state-machine refactor.
 - D3 enable on non-mlx5 NICs.
 - Re-introduction of the #840 lock/epoch infrastructure.
+- **Runtime queue-count changes without a config commit** (R2#3):
+  if the operator runs `ethtool -L iface combined N` to change
+  the NIC's queue count without bumping `system dataplane
+  workers` afterwards, the daemon won't notice and the live
+  indirection table may reference non-existent queues until the
+  next config commit triggers `reapplyRSSIndirection`. Operators
+  changing queue counts are expected to follow up with a config
+  commit (or restart the daemon). This change does NOT add a
+  netlink-watch loop for ringparam changes — that's a separate
+  scope of work.
 
 ## 13. Codex round-1 review responses
 
@@ -312,3 +344,13 @@ path) must still pass unchanged.
 | 7 | MED | Missing tests: queueCount=0, workers>queues | §9 tests #2 (workers>queues) and #6 (queueCount=0) |
 | 8 | LOW | Missing regression: workers∈{0,1}     | §9 tests #4 and #5 |
 | 9 | LOW | `make test-failover` overbroad         | §10: demoted to optional defense, not a merge blocker |
+
+### Round 2 (5 findings)
+
+| # | Sev | Topic                                  | Resolution |
+|---|-----|----------------------------------------|------------|
+| 1 | LOW | §3 wrongly cited apply semaphore       | §3 reworded: serialization is lifecycle ordering (startup runs from enumerateAndRenameInterfaces before API/CLI are wired up), not the apply semaphore |
+| 2 | MED | indirectionTableIsDefault vacuously true | §7 added `sawAnyRow` guard (mirrors existing `indirectionTableMatches` shape); §9 test #11 pins empty-output behavior |
+| 3 | MED | Runtime queue-count-only changes       | §12 explicit out-of-scope: operator changing `ethtool -L` without config commit is not auto-handled; netlink-watch for ringparam is separate scope |
+| 4 | LOW | Test fixture path unpinned             | §9 test #8 specifies inline-string-literal in the test (small enough to embed, keeps test self-contained) |
+| 5 | LOW | Multi-cycle boot scenario untested     | §9 test #12 added: `BootSequence_4then6_RestoresDefault` covers the full transition end-to-end |
