@@ -527,24 +527,32 @@ not exceeding 15 total. Cells with > 7 valid reps after 15
 are reported with the data they have; cells with < 7 valid
 reps are INSUFFICIENT-DATA.
 
-### 4.6 Echo-server preflight (R1 #17)
+### 4.6 Echo-server preflight (R1 #17, refined post-cluster-run #907)
 
-Before the matrix starts, a one-shot preflight:
+Before the matrix starts, a one-shot preflight via the full
+orchestrator (so the same validity gates apply as in the matrix):
 
 ```
-python3 test/incus/mouse_latency_probe.py \
-    --target 172.16.80.200 --port 7 \
-    --concurrency 1 --duration 5 \
-    --out /tmp/preflight.json
+test/incus/test-mouse-latency.sh 0 1 60 <out_dir>/preflight
 ```
+
+The 60s duration (not 5s) is required to satisfy the M=1
+min-attempts floor of 500.
 
 Required for matrix to proceed:
-- TCP connect succeeds.
-- Echo readback exactly matches sent payload bit-for-bit (the
-  probe driver's per-probe verification).
-- p99 RTT < 5 ms (sanity — idle path through firewall should
-  be <1 ms but we allow margin).
-- error_rate < 0.001.
+- No orchestrator INVALID-* markers in the preflight rep dir.
+- `probe.json["validity"]["ok"]` is true (covers min-completed,
+  min-attempts, count-consistency).
+- p99 RTT < 10 ms (sanity — empirical baseline on the loss
+  cluster is ~6 ms via the operator-managed echo path; 10 ms
+  catches "echo server completely broken" without false-failing
+  on the real path latency).
+
+The error_rate gate from v1 (`< 0.001`) is dropped: empirically
+the echo server refuses 30-70% of attempts depending on load,
+but the successful-attempt RTTs are still meaningful for the
+verdict. The probe-side validity verdict already covers
+"insufficient usable data" via the min-completed floor.
 
 If preflight fails, matrix aborts with the preflight JSON +
 operator-actionable diagnosis. No partial data is collected.

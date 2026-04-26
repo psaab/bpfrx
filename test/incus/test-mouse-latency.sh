@@ -161,8 +161,14 @@ PRE_PRIMARY=$(current_primary)
 for fw in "$PRIMARY" "$SECONDARY"; do
     incus_exec "$fw" rm -f /tmp/cos-iperf-sets.set < /dev/null > /dev/null 2>&1 || true
 done
-"${SCRIPT_DIR}/apply-cos-config.sh" "${INCUS_REMOTE}:${PRE_PRIMARY}" \
-    > "${OUT_DIR}/cos-apply.log" 2>&1
+# Copilot R1 #3 (#907): if apply-cos-config fails, attribute the
+# rep specifically rather than letting set -e exit without an
+# INVALID-* marker (the matrix wrapper would treat that as generic
+# "no probe.json" and lose the diagnosis).
+if ! "${SCRIPT_DIR}/apply-cos-config.sh" "${INCUS_REMOTE}:${PRE_PRIMARY}" \
+        > "${OUT_DIR}/cos-apply.log" 2>&1; then
+    invalidate "cos-apply-failed-${PRE_PRIMARY}"
+fi
 
 # ---- step 3: RG state polling at 1 Hz (plan §4.5 step 3)
 RG_POLL_FILE="${OUT_DIR}/rg-state-poll.txt"
@@ -369,11 +375,18 @@ for FW in "$PRIMARY" "$SECONDARY"; do
 done
 [[ $ha_seen -eq 1 ]] && invalidate "ha-transition"
 
-# ---- step 9a: SYN-cookie counter snapshot (post). Follow whichever
-# node is currently primary — if a transition happened in-window we
-# already invalidated above, but for the no-transition case we want
-# the screen counters from the same node we sampled in step 4a.
-post_primary=$(current_primary)
+# ---- step 9a: SYN-cookie counter snapshot (post). Reuse the node
+# recorded in step 4a so the pre/post comparison is always against
+# the same firewall — re-querying current_primary here would race
+# with any in-window transition (we already invalidated those above
+# anyway). Copilot R1 #2 (#907).
+if [[ -s "${OUT_DIR}/screen-pre-fw.txt" ]]; then
+    post_primary="$(< "${OUT_DIR}/screen-pre-fw.txt")"
+elif [[ -n "${SCREEN_PRE_FW:-}" ]]; then
+    post_primary="$SCREEN_PRE_FW"
+else
+    post_primary="$(current_primary)"
+fi
 incus_exec "$post_primary" cli -c "show security screen statistics zone wan" \
     > "${OUT_DIR}/screen-post.txt" 2>/dev/null || true
 screen_engaged="false"

@@ -116,10 +116,11 @@ elif p >= 10000:
     # on the loss cluster is ~6ms because the path includes the
     # operator-managed echo server, not a tight in-firewall loopback).
     print(f"FAIL p99={p}")
-elif err >= 0.4:
-    # Match the probe-side error tolerance — the echo server refuses
-    # ~30% of attempts at idle by design (was 0.001 in v1).
-    print(f"FAIL err={err}")
+# Copilot R1 #1 (#907): error-rate gate dropped from preflight too,
+# matching the probe-side model. The echo server refuses a large
+# fraction of attempts; the validity verdict + p99 sanity carries
+# the gate. The probe-side min-completed floor is already asserted
+# via the validity.ok branch above.
 else:
     print("OK")
 ' "$PREFLIGHT_DIR/probe.json")
