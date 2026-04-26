@@ -243,11 +243,19 @@ for FW in "$PRIMARY" "$SECONDARY"; do
     echo "$cursor" > "${OUT_DIR}/jc-cursor-${FW}.txt"
 done
 
-# ---- step 4a: SYN-cookie counter snapshot (pre).
-# Copilot R3 #6: capture from the same node identity the post-run
-# comparison will follow (current primary at the time of the snapshot).
-# Mismatch between pre (always fw0) and post (current_primary) made the
-# screen_engaged delta meaningless when fw0 wasn't primary.
+# ---- step 4a: Screen flood-counter snapshot (pre).
+# `show security screen statistics zone wan` reports SCREEN flood-event
+# counters (SYN/UDP/ICMP flood event counts), NOT SYN-cookie-specific
+# counters — Copilot R3 (#907) corrected the prior misnaming. The
+# `screen_engaged` manifest field reflects "did any screen flood
+# counter advance during the rep", which is still the signal we want
+# (any screen activation contaminates mouse-latency data).
+#
+# Copilot R3 #6 (earlier): capture from the same node identity the
+# post-run comparison will follow (current primary at the time of
+# the snapshot). Mismatch between pre (always fw0) and post
+# (current_primary) made the screen_engaged delta meaningless when
+# fw0 wasn't primary.
 SCREEN_PRE_FW=$(current_primary)
 echo "$SCREEN_PRE_FW" > "${OUT_DIR}/screen-pre-fw.txt"
 incus_exec "$SCREEN_PRE_FW" cli -c "show security screen statistics zone wan" \
@@ -415,7 +423,7 @@ for FW in "$PRIMARY" "$SECONDARY"; do
 done
 [[ $ha_seen -eq 1 ]] && invalidate "ha-transition"
 
-# ---- step 9a: SYN-cookie counter snapshot (post). Reuse the node
+# ---- step 9a: Screen flood-counter snapshot (post). Reuse the node
 # recorded in step 4a so the pre/post comparison is always against
 # the same firewall — re-querying current_primary here would race
 # with any in-window transition (we already invalidated those above

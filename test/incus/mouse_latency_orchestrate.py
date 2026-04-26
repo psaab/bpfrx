@@ -113,7 +113,11 @@ def cmd_rg_state_flapped(args: argparse.Namespace) -> int:
     if not by_ts:
         print("no RG poll samples", file=sys.stderr)
         return 2
-    samples = sorted(by_ts.items())
+    # Copilot R3: sort by integer ts so a future change in
+    # timestamp digit width (e.g. mixed second/ms granularity in a
+    # synthetic test) doesn't mis-pick the initial sample via
+    # lexicographic ordering.
+    samples = sorted(by_ts.items(), key=lambda kv: int(kv[0]))
     initial = samples[0][1]
     if not initial:
         # First sample collected an empty triple set (cli succeeded

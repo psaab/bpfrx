@@ -78,16 +78,36 @@ def load_cell_reps(cell_dir: str) -> List[dict]:
 
 
 def select_valid_reps(reps: List[dict]) -> List[dict]:
-    return [r for r in reps if r.get("validity", {}).get("ok")]
+    """Return reps that are validity.ok AND have a numeric p99.
+
+    Copilot R3: a rep with validity.ok=True but missing/None p99
+    (malformed JSON, schema drift) would previously be sorted with
+    a coerced 0 and could be mis-picked as the median, skewing the
+    cell verdict. Tighten the gate so "valid for the verdict" =
+    "validity.ok AND p99 is a usable number".
+    """
+    out: List[dict] = []
+    for r in reps:
+        if not r.get("validity", {}).get("ok"):
+            continue
+        p99 = r.get("rtt_us", {}).get("p99")
+        if not isinstance(p99, (int, float)):
+            continue
+        out.append(r)
+    return out
 
 
 def median_rep_by_p99(valid_reps: List[dict]) -> Optional[dict]:
-    """Return the rep at the median position of p99 across valid reps."""
+    """Return the rep at the median position of p99 across valid reps.
+
+    Caller is expected to pass select_valid_reps() output, which
+    already guarantees p99 is numeric.
+    """
     if not valid_reps:
         return None
     sortable = sorted(
         valid_reps,
-        key=lambda r: r.get("rtt_us", {}).get("p99") or 0,
+        key=lambda r: r["rtt_us"]["p99"],
     )
     return sortable[len(sortable) // 2]
 
