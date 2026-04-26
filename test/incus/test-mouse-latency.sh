@@ -29,9 +29,27 @@ PRIMARY="xpf-userspace-fw0"
 SECONDARY="xpf-userspace-fw1"
 SOURCE="cluster-userspace-host"
 TARGET_V4="172.16.80.200"
-ELEPHANT_PORT=5201
+# Elephant CoS class is selected by destination port (matching the
+# classifier terms in test/incus/cos-iperf-config.set):
+#   5201 → iperf-a    (1   Gb/s shaped)
+#   5202 → iperf-b    (10  Gb/s shaped)
+#   5203 → iperf-c    (25  Gb/s shaped)
+#   5204 → best-effort(100 Mb/s shaped)
+# Default is 5201 (iperf-a, 1 Gb/s) — pick a different class via the
+# ELEPHANT_PORT env var. The shaper used by the cwnd-settle and
+# collapse gates is auto-derived below.
+ELEPHANT_PORT="${ELEPHANT_PORT:-5201}"
+case "$ELEPHANT_PORT" in
+    5201) SHAPER_BPS=$((1  * 1000 * 1000 * 1000)) ;;  # iperf-a
+    5202) SHAPER_BPS=$((10 * 1000 * 1000 * 1000)) ;;  # iperf-b
+    5203) SHAPER_BPS=$((25 * 1000 * 1000 * 1000)) ;;  # iperf-c
+    5204) SHAPER_BPS=$((100      * 1000 * 1000)) ;;   # best-effort
+    *)
+        echo "error: unsupported ELEPHANT_PORT=${ELEPHANT_PORT} (expected 5201|5202|5203|5204)" >&2
+        exit 1
+        ;;
+esac
 MOUSE_PORT=7
-SHAPER_BPS=$((1 * 1000 * 1000 * 1000))  # 1 Gb/s for iperf-a
 SETTLE_BUDGET=20
 SLACK=10
 

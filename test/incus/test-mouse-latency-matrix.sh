@@ -33,6 +33,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DURATION=60          # per-rep probe seconds
 WALL_CAP=$((6*3600)) # seconds, plan §4.7
 
+# Elephant CoS class is selected via the ELEPHANT_PORT env var (passed
+# straight through to test-mouse-latency.sh). Default 5201 (iperf-a,
+# 1 Gb/s); use 5203 for iperf-c at 25 Gb/s, 5202 for iperf-b at 10 Gb/s.
+# See test-mouse-latency.sh for the full port → shaper mapping.
+ELEPHANT_PORT="${ELEPHANT_PORT:-5201}"
+export ELEPHANT_PORT
+echo "matrix elephant port: ${ELEPHANT_PORT}"
+
 mkdir -p "$OUT_ROOT"
 
 # Prioritized cell order: gate cells first, then remaining M=10 cells,
