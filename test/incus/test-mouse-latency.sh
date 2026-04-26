@@ -36,7 +36,14 @@ SETTLE_BUDGET=20
 SLACK=10
 
 mkdir -p "$OUT_DIR"
-REP_TAG="${OUT_DIR##*/}"
+# Include the cell name in REP_TAG so per-rep temp files on the
+# remote source container don't collide across cells (e.g.
+# cell_N0_M10/rep_00 vs cell_N128_M10/rep_00 — without the cell
+# prefix, both write to /tmp/probe-rep_00.json and a failed pull
+# in the second cell silently picks up the first cell's data).
+# Codex R6 HIGH.
+CELL_DIR="$(basename "$(dirname "$OUT_DIR")")"
+REP_TAG="${CELL_DIR}_${OUT_DIR##*/}"
 
 # `incus_run` wraps incus calls so they work both inside and outside
 # the incus-admin group. Only the user's own group needs to differ —
@@ -101,6 +108,16 @@ cleanup() {
     [[ -n "${MPSTAT_PID:-}" ]] && kill "$MPSTAT_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# Defense in depth: remove any stale per-rep temp files on the
+# remote source before this rep starts (Codex R6 HIGH: without
+# REP_TAG including the cell name, two cells with the same rep
+# index would collide; even with that fix, a failed pull
+# previously left a stale file behind that the next reuse with the
+# same tag would inherit. Belt-and-suspenders.)
+incus_exec "$SOURCE" sh -c \
+    "rm -f /tmp/probe-${REP_TAG}.json /tmp/mpstat-${REP_TAG}.txt /tmp/iperf3-${REP_TAG}.txt" \
+    < /dev/null > /dev/null 2>&1 || true
 
 # Push helper scripts to the source container (probe driver runs there).
 incus_run file push "${SCRIPT_DIR}/mouse_latency_probe.py" \
@@ -298,9 +315,31 @@ if ! diff -q "${OUT_DIR}/screen-pre.txt" "${OUT_DIR}/screen-post.txt" \
     screen_engaged="true"
 fi
 
-# ---- step 10: RG state poll review
+# ---- step 10: RG state poll review.
 kill "$RG_POLL_PID" 2>/dev/null || true
 wait "$RG_POLL_PID" 2>/dev/null || true
+
+# Final RG state one-shot, compared to the initial snapshot from
+# step 3 (Codex R6 MED: catches an in-window state change that
+# slipped through gaps in the 1Hz polling — even if individual
+# `cli` calls failed during the rep, the initial vs final pair
+# is two extra independent samples).
+incus_exec "$PRIMARY" cli -c "show chassis cluster status" \
+    > "${OUT_DIR}/rg-state-final.txt" 2>/dev/null || true
+
+initial_triples=$(python3 "${SCRIPT_DIR}/mouse_latency_orchestrate.py" \
+    parse-cluster-state 0 < "${OUT_DIR}/rg-state-initial.txt" 2>/dev/null \
+    | sort -u || true)
+final_triples=$(python3 "${SCRIPT_DIR}/mouse_latency_orchestrate.py" \
+    parse-cluster-state 0 < "${OUT_DIR}/rg-state-final.txt" 2>/dev/null \
+    | sort -u || true)
+if [[ -n "$initial_triples" && "$initial_triples" != "$final_triples" ]]; then
+    {
+        echo "initial vs final RG state mismatch:"
+        diff <(echo "$initial_triples") <(echo "$final_triples") || true
+    } > "${OUT_DIR}/rg-state-final-diff.log"
+    invalidate "rg-state-initial-vs-final"
+fi
 
 # Exit codes: 0 = drift detected (INVALID), 1 = stable, 2 = no data (INVALID).
 set +e
