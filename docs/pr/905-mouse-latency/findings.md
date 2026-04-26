@@ -6,24 +6,53 @@ Harness PR: #906 (merged); follow-up fixes PR: #907 (open)
 
 ## TL;DR
 
-Mouse-latency tail under elephant load was measured across two
+Mouse-latency tail under elephant load was measured across **three**
 elephant CoS classes on the loss userspace HA cluster:
 
 | Setup | Gate ratio | Verdict |
 |---|---:|---|
 | iperf-a same-class (1 Gb/s shaper) | **1.10×** | **PASS** |
+| iperf-b same-class (10 Gb/s shaper) | **34.95×** | **FAIL** |
 | iperf-c same-class (25 Gb/s shaper, post #910 + 1500 hugepages) | **31.80×** | **FAIL** |
 
-The PASS in iperf-a class was the original #905 question; the FAIL
-in iperf-c class is the consequential follow-up the user added
-("test at 25 Gb/s with mice in the same class"). The headline:
+The PASS in iperf-a class answered the original #905 question. The
+FAIL across iperf-b and iperf-c was the user's follow-up
+("test at 10 / 25 Gb/s with mice in the same class").
 
-- The firewall holds mouse latency well when the **shaper** is the
-  bottleneck (iperf-a, 1 Gb/s). Per-flow fairness across the queue
-  works as designed.
-- The firewall does **not** hold mouse latency when the **firewall
-  hot path itself** is the bottleneck (iperf-c, capacity-bound at
-  ~15 Gb/s well below the 25 Gb/s shaper). Mice get HOL-blocked.
+**Root cause** (diagnosed via live CoS counters + source review):
+SFQ bucket collision in shared_exact MQFQ.
+
+- `cos-iperf-config.set` queues are configured as `flow_fair = exact`.
+  At low rates (iperf-a, 1 Gb/s) the per-flow admission cap
+  (`COS_FLOW_FAIR_MIN_SHARE_BYTES = 16 × 1500`) actively bounds each
+  flow's bytes-in-bucket — `flow_share=247` drops observed live.
+- At higher rates (iperf-b 10 Gb/s, iperf-c 25 Gb/s) the
+  `shared_exact` path BYPASSES the per-flow admission cap (see
+  `userspace-dp/src/afxdp/tx.rs:4076` —
+  `cos_queue_flow_share_limit` returns `buffer_limit` unchanged).
+  The disabling was deliberate; the static 24 KB cap was rate-unaware
+  and tail-dropped TCP at multi-Gbps per-flow rates (retrospective
+  Attempt A: 22.3 → 16.3 Gbps regression, see comment at
+  `userspace-dp/src/afxdp/tx.rs:5402-5407`).
+- Without the cap, fairness on shared_exact relies entirely on MQFQ
+  virtual-finish-time ordering at dequeue. MQFQ orders **between**
+  buckets, not within. With 1024 SFQ buckets and 8 elephant flows,
+  per-mouse bucket-collision probability is ~0.78 % — when a mouse
+  hashes into the same bucket as an elephant, the mouse sits FIFO
+  behind the elephant's queued bytes.
+- iperf-b: shaper IS engaging at ~10 Gb/s (15 Gb/s firewall capacity
+  > 10 Gb/s shaper), queue depth ~10 ms. On collision, mouse waits
+  the full elephant burst behind it. p99 ≈ 100-700 ms across reps.
+- iperf-c: shaper does NOT engage (15 Gb/s firewall capacity <
+  25 Gb/s shaper); queue stays shallow even on collision. p99 ≈
+  10-20 ms.
+- iperf-a: per-flow cap active so even on collision the elephant
+  footprint per bucket is bounded ≤ 24 KB. Drain time tiny. PASS.
+
+**Distribution shape confirms collision hypothesis**: at iperf-b
+N=8 M=10, p50 stays at idle (~2.5 ms — most mice no collision)
+while p99 blows up to 100-770 ms across reps (the ~1 % collision
+fraction).
 
 The cross-NIC userspace memcpy (~13 % of CPU, structural at the
 AF_XDP layer on this hardware) sets the upper bound on hot-path
@@ -61,6 +90,43 @@ iperf-a's 1 Gb/s shaper holds elephants below the firewall's
 hot-path capacity. The shaper queue's per-flow scheduler keeps
 mice within ~1 ms of the idle p99 across the entire elephant
 sweep. PASS.
+
+## iperf-b same-class: FAIL at 34.95×
+
+Full data at `docs/pr/905-mouse-latency/results-iperf-b-shared/`
+(committed when matrix completes). M=10 row (full 10 valid reps each):
+
+| N | p99 | p95 | p50 |
+|---:|---:|---:|---:|
+| 0 (idle) | 7.35 ms | 5.07 ms | 2.54 ms |
+| 8 | **323.62 ms** | 159.55 ms | 2.55 ms (!) |
+| 32 | TBD | TBD | TBD |
+| 128 | 257.02 ms | 100.14 ms | 41.01 ms |
+
+**Gate**: p99(N=128, M=10) / p99(N=0, M=10) = 257.02 / 7.35 = **34.95×**.
+
+Notable patterns:
+
+- p50 at N=8 stays at IDLE (2.55 ms) while p99 jumps to 323 ms —
+  classic collision-driven tail. ~1 % of mice are the collision
+  victims and see the full elephant burst.
+- iperf3 confirms shaper engagement: 0.00-90.00 sec aggregate
+  9.53 Gb/s at N=8, 8.83 Gb/s at N=128. The 10 Gb/s shaper IS
+  capping (firewall capacity > 10 Gb/s), so queueing is real.
+- Live CoS counters at the time of capture:
+  - `Drops: flow_share=0  buffer=0  ecn_marked=1120488` for iperf-b
+  - vs `flow_share=247  buffer=0  ecn_marked=30057` for iperf-a
+  - vs `flow_share=0  buffer=0  ecn_marked=0` for iperf-c
+  - The contrast confirms: iperf-a's per-flow cap is engaged;
+    iperf-b's is not (shared_exact bypass); iperf-c's queue is
+    barely doing work.
+- `park_queue=554,993,462` for iperf-b: shaper actively parking
+  the queue when tokens exhaust. Park duration is microseconds
+  (token refill at 10 Gb/s = ~1.2 µs per 1500 B), so park alone
+  doesn't explain 200+ ms tails.
+- The harness cwnd-not-settled INVALID rate is higher for iperf-b
+  cells than iperf-c (3 of 36 invalid vs 0 of 36 across the
+  N>0 cells of the M=10 row); we still got 10 valid reps each.
 
 ## iperf-c same-class: FAIL at 31.80×
 
@@ -157,33 +223,90 @@ with EINVAL when the UMEM is already DMA-mapped by another NIC).
   idle baseline change. The loaded p99 (the actual mouse-latency
   pain point) is unchanged at ~211-212 ms.
 
+## Candidate fixes for the bucket-collision HOL
+
+Three candidates in increasing implementation effort:
+
+### A. Raise SFQ bucket count (cheapest)
+
+Currently `COS_FLOW_FAIR_BUCKETS = 1024`. With 8 elephants the per-
+mouse collision probability is ~0.78 %. Raising to 16,384 cuts that
+to ~0.05 % — the 1 % tail moves into the noise floor.
+
+Cost surface:
+- `flow_bucket_bytes: [u64; N]` grows from 8 KB to 128 KB per queue.
+- `flow_bucket_head_finish_bytes` similar.
+- Per-queue scratch grows ~16×; with 4 active queues per binding,
+  ~512 KB per binding (was 32 KB) — still tiny.
+- `cos_queue_min_finish_bucket` is O(active_buckets), not O(N), so
+  the dequeue path doesn't slow down.
+
+Risk: array allocation + cache footprint. Each queue's flow-bucket
+state goes from fitting in 1 cache line of metadata + small array
+to spanning multiple cache lines of the array. At 128 KB per queue
+the L1 spill is real but L2 (1 MB / core typically) holds it.
+
+Recommended **first experiment**. Cheap to revert, easy to measure.
+
+### B. Rate-aware per-flow admission cap (medium)
+
+Re-engage the per-flow admission cap on shared_exact, but with a
+RATE-aware threshold: `cap = bdp(flow) × headroom_factor` where
+`bdp(flow) = transmit_rate × cluster_rtt`. At 10 Gb/s × 100 µs
+= 125 KB per flow — much larger than the static 24 KB but still
+bounded.
+
+This is what retrospective Attempt A failed at — the fix scope
+in #785 retrospective. Brings back fair admission on shared_exact
+while avoiding the multi-Gbps tail-drop regression.
+
+### C. Hierarchical SFQ (most work)
+
+Within-bucket per-flow ordering on top of the existing between-
+bucket MQFQ. When a mouse and elephant collide in the same
+bucket, the inner SFQ promotes the mouse ahead.
+
+Significant code surface (per-bucket SFQ state, second-level
+finish-time accounting, more complex dequeue). Highest risk.
+
 ## Recommended next steps
 
-1. **Dataplane is fast enough; queueing layer is the new
-   bottleneck.** Future mouse-latency work on iperf-c-class loads
-   should target the SFQ / per-flow scheduler / CoS queue
-   pressure, not the per-packet processing speed.
+1. **Implement (A) first.** Cheapest experiment, directly attacks
+   the diagnosed root cause. Re-run the iperf-b matrix; if mouse
+   p99 drops by ≥ 10× at N=8 M=10, the diagnosis is confirmed and
+   we ship.
 
-2. **Operational**: the 1500 hugepage reservation is now persisted
+2. **(B) is the proper fix** if (A) doesn't move the needle far
+   enough. Requires careful design to avoid the Attempt A
+   regression. File as separate issue.
+
+3. **(C) is reserve.** Only pursue if A+B together don't pass the
+   2.0× gate.
+
+4. **Operational**: the 1500 hugepage reservation is now persisted
    on both loss userspace cluster nodes. Other test environments
    should add the same conf file to actually use the in-tree
    hugepage UMEM path (THP fallback works but explicit
    MAP_HUGETLB is faster on cold-start).
 
-3. **Harness limitation**: if the N=128 M=1 cell matters for a
+5. **Harness limitation**: if the N=128 M=1 cell matters for a
    future investigation, raise the `SETTLE_BUDGET` (currently 20s)
    or relax the `0.5 × shaper` floor for the M=1 case. Tracked
    informally; not blocking the iperf-c verdict.
 
-4. **The #905 PASS-gate question is answered both ways**:
+6. **The #905 PASS-gate question is answered three ways**:
    - For iperf-a-shared (1 Gb/s class): mice survive elephant
      load. PASS.
+   - For iperf-b-shared (10 Gb/s class): mice get HOL-blocked
+     under collision. FAIL.
    - For iperf-c-shared (25 Gb/s class): mice get HOL-blocked
      under heavy elephant count. FAIL.
-   The right disposition for #905 is to close it with this
-   findings doc as the reference; any further fairness algorithm
-   work should be a fresh issue scoped on the queueing layer
-   findings above.
+
+   The headline is the iperf-b finding: a CoS class shaped well
+   below firewall capacity, with the per-flow scheduler nominally
+   active, still HOL-blocks mice on bucket collision. The fix
+   targets the bucket-collision rate (option A) as the cheapest
+   experiment that addresses the diagnosed root cause.
 
 ## Files
 
