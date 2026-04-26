@@ -79,17 +79,35 @@ if [[ ! -f "$PREFLIGHT_DIR/probe.json" ]]; then
 fi
 preflight=$(python3 -c '
 import json, sys
-with open(sys.argv[1]) as f:
-    d = json.load(f)
-p = d["rtt_us"]["p99"]
-err = d["totals"]["error_rate"]
-v = d.get("validity", {}).get("ok", False)
-reasons = d.get("validity", {}).get("reasons", [])
-# R3 MED: also gate on the probes own validity verdict (e.g.
-# min-attempts floor, degenerate-coroutine), not just p99/error_rate.
+# Copilot R2 #4: defensive JSON parsing — partial writes or schema
+# drift should produce an actionable preflight FAIL line, not a
+# stack trace that aborts the matrix.
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except Exception as e:
+    print(f"FAIL invalid-json={e}")
+    sys.exit(0)
+rtt = d.get("rtt_us")
+totals = d.get("totals")
+validity = d.get("validity") or {}
+if not isinstance(rtt, dict):
+    print("FAIL missing-field=rtt_us"); sys.exit(0)
+if not isinstance(totals, dict):
+    print("FAIL missing-field=totals"); sys.exit(0)
+p = rtt.get("p99")
+err = totals.get("error_rate")
+v = validity.get("ok", False)
+reasons = validity.get("reasons", [])
+# R3 MED: gate on the probes own validity verdict (min-attempts
+# floor, degenerate-coroutine, etc.), not just p99/error_rate.
 if not v:
     print(f"FAIL validity={reasons}")
-elif p is None or p >= 5000:
+elif p is None:
+    print("FAIL missing-field=rtt_us.p99")
+elif err is None:
+    print("FAIL missing-field=totals.error_rate")
+elif p >= 5000:
     print(f"FAIL p99={p}")
 elif err >= 0.001:
     print(f"FAIL err={err}")

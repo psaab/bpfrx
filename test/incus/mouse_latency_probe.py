@@ -7,18 +7,20 @@ per-coroutine attempt counts, and a validity verdict.
 
 Validity model (plan §4.2):
 - error_rate < 0.01.
-- min(attempts_per_coroutine) >= 0.5 × median(attempts).
-- M >= 10: total attempts >= 5000.
-- M == 1: total attempts >= 500.
+- min(attempts_per_coroutine) >= 0.5 × median(attempts) (only when M >= 2).
+- Min-attempts floor:
+    - M == 1:  total attempts >= 500.
+    - 2 <= M < 10:  total attempts >= 1000 (intermediate-concurrency
+      cells are not in the matrix; the 1000 floor is a defensive default
+      so a manual smoke run at e.g. M=5 still has a meaningful gate).
+    - M >= 10: total attempts >= 5000.
 """
 
 import argparse
 import asyncio
 import json
 import os
-import random
 import statistics
-import struct
 import sys
 import time
 from typing import List

@@ -202,9 +202,17 @@ if [[ "$N" -gt 0 ]]; then
     # cwnd-settle gate. (Live tailing inside incus exec is hard to
     # plumb reliably; the budget is the gate.)
     sleep "$SETTLE_BUDGET"
+    set +e
     incus_run file pull \
         "${INCUS_REMOTE}:${SOURCE}/tmp/iperf3-${REP_TAG}.txt" \
-        "${OUT_DIR}/iperf3-settle.txt" 2>/dev/null || true
+        "${OUT_DIR}/iperf3-settle.txt" 2>/dev/null
+    pull_rc=$?
+    set -e
+    # Distinguish pull failure from a real cwnd-not-settled (Copilot R2 #1):
+    # the cwnd-settle gate fires only when we actually have iperf3 output.
+    if [[ $pull_rc -ne 0 || ! -s "${OUT_DIR}/iperf3-settle.txt" ]]; then
+        invalidate "iperf3-settle-pull-failed"
+    fi
     if ! python3 "${SCRIPT_DIR}/mouse_latency_orchestrate.py" \
             check-cwnd-settle "${OUT_DIR}/iperf3-settle.txt" "$SHAPER_BPS"; then
         invalidate "cwnd-not-settled"
@@ -228,9 +236,25 @@ incus_exec "$SOURCE" python3 /tmp/mouse_latency_probe.py \
     --payload-bytes 64 --out "/tmp/probe-${REP_TAG}.json" \
     > "${OUT_DIR}/probe-stdout.log" 2>&1 || true
 
+set +e
 incus_run file pull \
     "${INCUS_REMOTE}:${SOURCE}/tmp/probe-${REP_TAG}.json" \
-    "${OUT_DIR}/probe.json" 2>/dev/null || true
+    "${OUT_DIR}/probe.json" 2>/dev/null
+probe_pull_rc=$?
+set -e
+# Catch a missing/empty/malformed probe.json early (Copilot R2 #2)
+# instead of letting the matrix wrapper silently treat the absence
+# as "validity false" and lose attribution.
+if [[ $probe_pull_rc -ne 0 ]]; then
+    invalidate "probe-pull-failed"
+fi
+if [[ ! -s "${OUT_DIR}/probe.json" ]]; then
+    invalidate "probe-missing"
+fi
+if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
+        "${OUT_DIR}/probe.json" 2>/dev/null; then
+    invalidate "probe-invalid-json"
+fi
 
 # ---- step 8: elephant stop + collapse check
 if [[ -n "${IPERF_PID:-}" ]]; then
@@ -302,7 +326,7 @@ for FW in "$PRIMARY" "$SECONDARY"; do
         invalidate "jc-cursor-missing-${FW}"
     fi
     set +e
-    matches=$(incus_exec "$FW" journalctl --after-cursor="$cursor" -u xpfd 2>"/tmp/jc-stderr-${REP_TAG}-${FW}")
+    matches=$(incus_exec "$FW" journalctl --after-cursor="$cursor" -u xpfd 2>"${OUT_DIR}/jc-stderr-${FW}.txt")
     jc_rc=$?
     set -e
     if [[ $jc_rc -ne 0 ]]; then
