@@ -58,9 +58,10 @@ MOUSE_PORT=7
 MOUSE_CLASS="${MOUSE_CLASS:-}"
 case "$MOUSE_CLASS" in
     "")        EXTRA_COS_FIXTURE="" ;;
+    iperf-b)   EXTRA_COS_FIXTURE="${SCRIPT_DIR}/cos-mouse-shared-iperf-b.set" ;;
     iperf-c)   EXTRA_COS_FIXTURE="${SCRIPT_DIR}/cos-mouse-shared-iperf-c.set" ;;
     *)
-        echo "error: unsupported MOUSE_CLASS=${MOUSE_CLASS} (expected '' or 'iperf-c')" >&2
+        echo "error: unsupported MOUSE_CLASS=${MOUSE_CLASS} (expected ''|'iperf-b'|'iperf-c')" >&2
         exit 1
         ;;
 esac
