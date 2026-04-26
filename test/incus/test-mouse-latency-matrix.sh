@@ -90,11 +90,15 @@ except Exception as e:
     sys.exit(0)
 rtt = d.get("rtt_us")
 totals = d.get("totals")
-validity = d.get("validity") or {}
+validity = d.get("validity")
 if not isinstance(rtt, dict):
     print("FAIL missing-field=rtt_us"); sys.exit(0)
 if not isinstance(totals, dict):
     print("FAIL missing-field=totals"); sys.exit(0)
+# Codex R9: validity may be missing or wrong-type from schema drift;
+# coerce to dict so the .get() calls below cannot stack-trace.
+if not isinstance(validity, dict):
+    validity = {}
 p = rtt.get("p99")
 err = totals.get("error_rate")
 v = validity.get("ok", False)

@@ -67,6 +67,7 @@ rm -f "${OUT_DIR}"/probe.json \
       "${OUT_DIR}"/manifest.json \
       "${OUT_DIR}"/cos-apply.log \
       "${OUT_DIR}"/jc-cursor-* \
+      "${OUT_DIR}"/jc-stderr-*.txt \
       "${OUT_DIR}"/INVALID-*
 
 # `incus_run` wraps incus calls so they work both inside and outside
