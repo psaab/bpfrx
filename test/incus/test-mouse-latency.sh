@@ -50,6 +50,20 @@ case "$ELEPHANT_PORT" in
         ;;
 esac
 MOUSE_PORT=7
+# Optional: classify the mouse echo port (TCP 7) into the same CoS
+# class as the elephants. By default mice fall through to best-effort
+# (cross-class isolation test). Setting MOUSE_CLASS=iperf-c puts mice
+# in the same iperf-c queue (same-class HOL test). The orchestrator
+# loads cos-mouse-shared-${MOUSE_CLASS}.set as an extension fixture.
+MOUSE_CLASS="${MOUSE_CLASS:-}"
+case "$MOUSE_CLASS" in
+    "")        EXTRA_COS_FIXTURE="" ;;
+    iperf-c)   EXTRA_COS_FIXTURE="${SCRIPT_DIR}/cos-mouse-shared-iperf-c.set" ;;
+    *)
+        echo "error: unsupported MOUSE_CLASS=${MOUSE_CLASS} (expected '' or 'iperf-c')" >&2
+        exit 1
+        ;;
+esac
 SETTLE_BUDGET=20
 SLACK=10
 
@@ -186,7 +200,12 @@ done
 # rep specifically rather than letting set -e exit without an
 # INVALID-* marker (the matrix wrapper would treat that as generic
 # "no probe.json" and lose the diagnosis).
+#
+# Pass the optional MOUSE_CLASS extension fixture so port-7 traffic
+# gets classified into the same queue as the elephants when running
+# the same-class HOL test.
 if ! "${SCRIPT_DIR}/apply-cos-config.sh" "${INCUS_REMOTE}:${PRE_PRIMARY}" \
+        ${EXTRA_COS_FIXTURE} \
         > "${OUT_DIR}/cos-apply.log" 2>&1; then
     invalidate "cos-apply-failed-${PRE_PRIMARY}"
 fi

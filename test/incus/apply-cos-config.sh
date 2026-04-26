@@ -28,6 +28,7 @@
 set -euo pipefail
 
 TARGET="${1:-loss:xpf-userspace-fw0}"
+EXTRA_FILE="${2:-}"   # optional extension fixture (additional `set` lines)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/cos-iperf-config.set"
 REMOTE_SETS="/tmp/cos-iperf-sets.set"
@@ -36,13 +37,23 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 	echo "error: cannot find $CONFIG_FILE" >&2
 	exit 1
 fi
+if [[ -n "$EXTRA_FILE" && ! -f "$EXTRA_FILE" ]]; then
+	echo "error: cannot find extra fixture $EXTRA_FILE" >&2
+	exit 1
+fi
 
 # Strip `delete` / blank / comment lines from the fixture: we inject
 # our own curated delete list (below) so the candidate config is
 # idempotent against both fresh-post-deploy and already-applied states.
+# If an EXTRA_FILE was passed, append its `set` lines too — this is
+# how MOUSE_CLASS=iperf-c (etc.) gets extra term overrides into the
+# same atomic candidate.
 SETS_TMP="$(mktemp)"
 trap "rm -f '$SETS_TMP'" EXIT
 grep -E '^set ' "$CONFIG_FILE" > "$SETS_TMP"
+if [[ -n "$EXTRA_FILE" ]]; then
+	grep -E '^set ' "$EXTRA_FILE" >> "$SETS_TMP"
+fi
 
 incus file push --mode 0644 "$SETS_TMP" "${TARGET}/${REMOTE_SETS}" >/dev/null
 

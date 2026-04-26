@@ -41,6 +41,13 @@ ELEPHANT_PORT="${ELEPHANT_PORT:-5201}"
 export ELEPHANT_PORT
 echo "matrix elephant port: ${ELEPHANT_PORT}"
 
+# Mouse-class selector. Default empty = mice on best-effort
+# (cross-class isolation test). MOUSE_CLASS=iperf-c puts mice in
+# the same queue as iperf-c elephants (same-class HOL test).
+MOUSE_CLASS="${MOUSE_CLASS:-}"
+export MOUSE_CLASS
+echo "matrix mouse class: ${MOUSE_CLASS:-best-effort (default)}"
+
 mkdir -p "$OUT_ROOT"
 
 # Prioritized cell order: gate cells first, then remaining M=10 cells,

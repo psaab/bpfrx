@@ -1,0 +1,16 @@
+# #905 same-class extension: classify the mouse echo port (TCP 7) into
+# iperf-c so mouse and elephant traffic share the same 25 Gb/s shaper
+# queue. Used when MOUSE_CLASS=iperf-c is set on the orchestrator.
+#
+# Term number 4 sits AFTER the four base terms (0..3) in
+# cos-iperf-config.set. Order matters in stateful filter evaluation —
+# we want the explicit port-7 match to win over the default
+# fallthrough to best-effort.
+#
+# IPv4 only for now (the test target is 172.16.80.200). v6 mirror
+# would be a follow-up if the harness adds 2001:559:8585:80::200.
+
+set firewall family inet filter bandwidth-output term 4 from destination-port 7
+set firewall family inet filter bandwidth-output term 4 then forwarding-class iperf-c
+set firewall family inet filter bandwidth-output term 4 then count iperf-c-mice
+set firewall family inet filter bandwidth-output term 4 then accept
