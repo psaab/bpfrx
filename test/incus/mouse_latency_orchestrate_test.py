@@ -13,11 +13,12 @@ def _write(tmpdir: str, name: str, content: str) -> str:
 
 
 class CheckCwndSettleTests(unittest.TestCase):
-    def _make_args(self, txt_path: str, shaper: int):
+    def _make_args(self, txt_path: str, shaper: int, floor_fraction: float = 0.5):
         class A: pass
         a = A()
         a.iperf3_txt = txt_path
         a.shaper_bps = shaper
+        a.floor_fraction = floor_fraction
         return a
 
     def test_settled(self):
@@ -54,13 +55,14 @@ class CheckCwndSettleTests(unittest.TestCase):
 
 
 class CheckCollapseTests(unittest.TestCase):
-    def _make_args(self, txt_path: str, shaper: int, n_rows: int = 0, skip_front: int = 0):
+    def _make_args(self, txt_path: str, shaper: int, n_rows: int = 0, skip_front: int = 0, threshold_fraction: float = 0.3):
         class A: pass
         a = A()
         a.iperf3_txt = txt_path
         a.shaper_bps = shaper
         a.n_rows = n_rows
         a.skip_front = skip_front
+        a.threshold_fraction = threshold_fraction
         return a
 
     def test_settle_window_drops_ignored_with_skip_front(self):

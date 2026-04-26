@@ -32,7 +32,17 @@ def _last_n_sum_bps(text: str, n: int) -> list:
 
 
 def cmd_check_cwnd_settle(args: argparse.Namespace) -> int:
-    """Exit 0 if cwnd is settled; non-zero otherwise."""
+    """Exit 0 if cwnd is settled; non-zero otherwise.
+
+    Settle is defined as: 3 consecutive [SUM] rows within ±15% of
+    each other AND aggregate rate >= floor_fraction × shaper_bps.
+
+    The floor_fraction default is 0.5 (down from the original 0.7).
+    Empirically the loss userspace cluster hits ~14-15 Gbps when
+    targeting a 25 Gbps shaper — i.e. capacity-bound below the
+    shaper. 0.7 × 25 = 17.5 was unreachable; 0.5 × 25 = 12.5 lets
+    the gate pass on actual steady-state.
+    """
     with open(args.iperf3_txt) as f:
         text = f.read()
     last3 = _last_n_sum_bps(text, 3)
@@ -41,7 +51,7 @@ def cmd_check_cwnd_settle(args: argparse.Namespace) -> int:
     mn, mx = min(last3), max(last3)
     if mx > 0 and (mx - mn) > 0.15 * mx:
         return 1
-    if mn < 0.7 * args.shaper_bps:
+    if mn < args.floor_fraction * args.shaper_bps:
         return 1
     return 0
 
@@ -55,8 +65,15 @@ def cmd_check_collapse(args: argparse.Namespace) -> int:
     gains SLACK seconds of post-probe teardown. Take rows
     [skip_front : skip_front + n_rows] from the per-second prefix
     instead.
+
+    Threshold default lowered to 0.3 × shaper (was 0.5): empirically
+    iperf-c at 25 Gbps shaper hits ~14-15 Gbps actual (cluster is
+    capacity-bound below the shaper). 0.5 × 25 = 12.5 was within
+    striking distance of that empirical floor and could trigger
+    spurious collapse on a normal cell. 0.3 × 25 = 7.5 still catches
+    a real collapse (e.g. iperf3 client died) without false-firing.
     """
-    threshold = args.shaper_bps * 0.5
+    threshold = args.shaper_bps * args.threshold_fraction
     rows = []
     with open(args.iperf3_txt) as f:
         for line in f:
@@ -141,6 +158,10 @@ def main() -> int:
     p1 = sub.add_parser("check-cwnd-settle")
     p1.add_argument("iperf3_txt")
     p1.add_argument("shaper_bps", type=int)
+    p1.add_argument(
+        "--floor-fraction", type=float, default=0.5,
+        help="Min last-3 mean as fraction of shaper_bps. Default 0.5.",
+    )
     p1.set_defaults(func=cmd_check_cwnd_settle)
 
     p2 = sub.add_parser("check-collapse")
@@ -153,6 +174,10 @@ def main() -> int:
     p2.add_argument(
         "--skip-front", type=int, default=0,
         help="Skip this many leading [SUM] rows (settle warmup) before scanning.",
+    )
+    p2.add_argument(
+        "--threshold-fraction", type=float, default=0.3,
+        help="Collapse threshold as fraction of shaper_bps. Default 0.3.",
     )
     p2.set_defaults(func=cmd_check_collapse)
 
