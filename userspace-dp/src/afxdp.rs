@@ -667,6 +667,47 @@ fn poll_binding_process_descriptor(
         binding.scratch_forwards.clear();
         binding.scratch_rst_teardowns.clear();
         while let Some(desc) = received.read() {
+            // Prefetch the userspace-dp metadata header (96 bytes) at
+            // desc.addr - meta_len. try_parse_metadata reads this
+            // first, on the magic/version/length compare; before this
+            // prefetch landed, that compare consumed ~33 % of
+            // poll_binding_process_descriptor self-time on a perf
+            // profile under iperf3 -P 128 / 25 Gb/s shaper (#909).
+            //
+            // The metadata is exactly 96 bytes (UserspaceDpMeta has a
+            // const-asserted size; first field is `magic`) and starts
+            // 96 bytes before the frame. UMEM frames are 4096-byte
+            // aligned with a 256-byte headroom, so desc.addr is
+            // 64-byte aligned by construction; the 96 bytes therefore
+            // straddle exactly two cache lines and we issue two
+            // prefetches.
+            #[cfg(target_arch = "x86_64")]
+            {
+                debug_assert!(
+                    desc.addr % 64 == 0,
+                    "UMEM frame at desc.addr={} should be 64-byte aligned",
+                    desc.addr,
+                );
+                let meta_len = std::mem::size_of::<UserspaceDpMeta>();
+                if (desc.addr as usize) >= meta_len {
+                    let meta_offset = (desc.addr as usize) - meta_len;
+                    if let Some(pf_meta) =
+                        unsafe { &*area }.slice(meta_offset, meta_len)
+                    {
+                        unsafe {
+                            core::arch::x86_64::_mm_prefetch(
+                                pf_meta.as_ptr() as *const i8,
+                                core::arch::x86_64::_MM_HINT_T0,
+                            );
+                            core::arch::x86_64::_mm_prefetch(
+                                pf_meta.as_ptr().add(64) as *const i8,
+                                core::arch::x86_64::_MM_HINT_T0,
+                            );
+                        }
+                    }
+                }
+            }
+
             // Prefetch frame data into L1 while processing counters.
             // UMEM frames are cold (last touched by NIC DMA); this hides
             // ~100ns DRAM latency before metadata parse.
