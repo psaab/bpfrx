@@ -123,6 +123,19 @@ class ValidityTests(unittest.TestCase):
         v = compute_validity(1, [500], completed=500, errors=0)
         self.assertTrue(v["ok"])
 
+    def test_inconsistent_counts_completed_more_than_attempted(self):
+        # Copilot R1 #4: surface the bookkeeping invariant rather
+        # than letting completed go unused.
+        v = compute_validity(10, [600] * 10, completed=7000, errors=0)
+        self.assertFalse(v["ok"])
+        self.assertTrue(any("inconsistent-counts" in r for r in v["reasons"]))
+
+    def test_inconsistent_counts_completed_plus_errors_neq_attempted(self):
+        # 6000 attempts, 5500 completed, 100 errors → 5600 ≠ 6000
+        v = compute_validity(10, [600] * 10, completed=5500, errors=100)
+        self.assertFalse(v["ok"])
+        self.assertTrue(any("inconsistent-counts" in r for r in v["reasons"]))
+
 
 if __name__ == "__main__":
     unittest.main()

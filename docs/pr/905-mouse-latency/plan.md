@@ -207,14 +207,14 @@ invalidate.
 
 ## 4. Harness design
 
-### 4.1 Probe driver — `test/incus/mouse-latency-probe.py`
+### 4.1 Probe driver — `test/incus/mouse_latency_probe.py`
 
 Python 3 script (no third-party deps; aggregator in §4.5 uses
 the stdlib `statistics` module — no `numpy`, R1 #13).
 
 Per-cell invocation contract:
 ```
-python3 test/incus/mouse-latency-probe.py \
+python3 test/incus/mouse_latency_probe.py \
     --target 172.16.80.200 --port 7 \
     --concurrency 10 \
     --duration 60 --payload-bytes 64 \
@@ -376,13 +376,20 @@ Steps per rep:
    re-attempt a port-7→best-effort dynamic assertion here —
    §3.3 v3 explicitly removed that check; the static config
    carries the assertion. Step 1 is fixture-apply only.)
-2. **Source-CPU sampling** (R1 #11): `mpstat 1 <duration+30>`
-   in background on `cluster-userspace-host`, output to
-   `<out_dir>/mpstat.txt`. If average user+sys > 80 % during
-   the probe window, mark rep as INVALID-client-saturated.
-3. **RG state polling** on both nodes — initial sample at
-   t=0, plus a background poll every 1 s for the duration of
-   the rep (R3 fresh #2 + R4 HIGH 1).
+2. **Source-CPU sampling** (R1 #11, Copilot R1 #3): launch
+   `mpstat 1 <duration>` on `cluster-userspace-host` JUST BEFORE
+   the probe (not at top-of-rep), so its count completes naturally
+   when the probe ends and the `Average:` summary row is emitted.
+   If `Average:` busy > 80 %, mark rep as INVALID-client-saturated;
+   if mpstat output is missing or unparseable, INVALIDATE rather
+   than silently passing.
+3. **RG state polling** — query the primary at 1 Hz (Copilot R1
+   #7: a single `cli -c "show chassis cluster status"` query
+   from the local node returns BOTH nodes' RG-state rows because
+   `Manager.FormatStatus` includes peer state in the same
+   output, so polling one node is sufficient to detect any
+   transition). Initial sample at t=0, plus continuous poll
+   throughout the rep (R3 fresh #2 + R4 HIGH 1).
 
    **CLI command pinned (R4 HIGH 1):**
    ```
@@ -525,7 +532,7 @@ reps are INSUFFICIENT-DATA.
 Before the matrix starts, a one-shot preflight:
 
 ```
-python3 test/incus/mouse-latency-probe.py \
+python3 test/incus/mouse_latency_probe.py \
     --target 172.16.80.200 --port 7 \
     --concurrency 1 --duration 5 \
     --out /tmp/preflight.json
@@ -579,7 +586,7 @@ M=10 cells (the gate's measurement cells), then the rest —
 so the gate-relevant data lands first and a wall-budget
 truncation degrades gracefully.
 
-## 5. Aggregator — `test/incus/mouse-latency-aggregate.py`
+## 5. Aggregator — `test/incus/mouse_latency_aggregate.py`
 
 Reads `<out_dir>/cell_N{n}_M{m}/`, picks median rep per cell
 (by p99), produces:
@@ -641,11 +648,16 @@ The 2× threshold is from the #905 issue body. It is a
   discovery to find anything).
 - Echo-server preflight succeeds (§4.6).
 - Smoke cell `N=0 M=1` runs end-to-end with valid output.
-- `findings.md` exists with the 12-cell table + decision verdict
-  (PASS / FAIL / INSUFFICIENT-DATA).
 - Codex hostile plan + code review: PLAN-READY YES + MERGE YES,
   every finding disposed.
 - Copilot inline review: addressed.
+
+The harness PR ships first; the matrix is run separately on the
+loss cluster and `findings.md` lands in a follow-up commit (or a
+follow-up PR) once the data is collected. Copilot R1 #2 correctly
+flagged that v4 had `findings.md exists` as a merge gate while
+the PR contained no findings file — the gate is dropped here in
+favor of "harness PR merges; findings PR adds the data".
 
 ### 7.2 Decision threshold (per #905; reported, not gating)
 
@@ -666,12 +678,12 @@ New files (planned deliverables):
 - `docs/pr/905-mouse-latency/plan.md` (this file)
 - `docs/pr/905-mouse-latency/findings.md` (post-data)
 - `docs/pr/905-mouse-latency/results/cell_N{n}_M{m}/...` (raw)
-- `test/incus/mouse-latency-probe.py`
-- `test/incus/mouse-latency-aggregate.py`
+- `test/incus/mouse_latency_probe.py`
+- `test/incus/mouse_latency_aggregate.py`
 - `test/incus/test-mouse-latency.sh`
 - `test/incus/test-mouse-latency-matrix.sh`
-- `test/incus/mouse-latency-probe_test.py`
-- `test/incus/mouse-latency-aggregate_test.py`
+- `test/incus/mouse_latency_probe_test.py`
+- `test/incus/mouse_latency_aggregate_test.py`
 - `test/incus/iperf3_sum_parse.py`
 - `test/incus/iperf3_sum_parse_test.py`
 - `test/incus/cluster_status_parse.py`
@@ -683,7 +695,7 @@ Modified files: none.
 
 ### 9.1 Unit tests (R1 #13)
 
-`mouse-latency-probe_test.py`:
+`mouse_latency_probe_test.py`:
 - Histogram bucket assignment correct at boundaries.
 - p99/p95/p50 from synthetic input matches `statistics.quantiles`
   output (no `numpy` dependency).
@@ -697,7 +709,7 @@ Modified files: none.
 - Achieved-RPS computation correct for synthetic input.
 - Duration-elapsed loop exit — no off-by-one.
 
-`mouse-latency-aggregate_test.py`:
+`mouse_latency_aggregate_test.py`:
 - Median-of-10 by p99 picks the 5th-or-6th rep, not the mean.
 - Decision-threshold computes correctly for synthetic inputs at
   PASS, FAIL, exactly-2.0× boundary.

@@ -121,13 +121,15 @@ def summarize_cell(reps: List[dict]) -> dict:
             "p95_us": rtt.get("p95"),
             "p99_us": rtt.get("p99"),
             "achieved_rps_total": totals.get("achieved_rps_total"),
-            # R2 fresh MED 1: propagate per-coroutine RPS distribution
-            # to the summary so the diagnosis surface MED-4 promised
-            # actually reaches the report.
-            "achieved_rps_per_coroutine_median":
-                totals.get("achieved_rps_per_coroutine_median"),
-            "achieved_rps_per_coroutine_iqr":
-                totals.get("achieved_rps_per_coroutine_iqr"),
+            # R2 fresh MED 1: propagate per-coroutine attempt-rate
+            # distribution to the summary so the diagnosis surface
+            # MED-4 promised actually reaches the report. Field
+            # renamed (Copilot R1): per-coroutine values are
+            # workload-offered (attempts), not completion-rate.
+            "attempts_per_second_per_coroutine_median":
+                totals.get("attempts_per_second_per_coroutine_median"),
+            "attempts_per_second_per_coroutine_iqr":
+                totals.get("attempts_per_second_per_coroutine_iqr"),
             "attempts_per_coroutine": totals.get("attempts_per_coroutine"),
         }
     summary["status"] = "OK"

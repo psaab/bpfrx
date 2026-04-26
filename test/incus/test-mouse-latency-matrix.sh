@@ -4,9 +4,12 @@
 # Usage: test-mouse-latency-matrix.sh <out_root>
 #
 # 12 cells: N ∈ {0, 8, 32, 128} × M ∈ {1, 10, 50}.
-# Per cell: 10 reps baseline, auto-extend to 15 if INVALID rate > 30%
-# in the first 10. Cell stops at 10 valid reps OR 15 total, whichever
-# is first.
+# Per cell: run up to 15 total reps as needed to reach 10 valid reps.
+# Cell stops at 10 valid reps OR 15 total, whichever is first.
+# (Replacements + extensions both draw from the 15-rep ceiling per
+# plan §4.7; the >30% conditional was simplified out — we always
+# allow up to 15 since the 30% trigger doesn't help if a cell lands
+# 1-3 invalid reps and the conditional path was a footgun.)
 #
 # Cells run in PASS-gate-relevant order so a wall-budget truncation
 # degrades gracefully:
@@ -55,6 +58,11 @@ start_t=$(date +%s)
 PREFLIGHT_DIR="${OUT_ROOT}/preflight"
 mkdir -p "$PREFLIGHT_DIR"
 echo "Running echo-server preflight..."
+# Use a 60s probe to satisfy the M=1 min-attempts floor of 500
+# (plan §4.2). The plan §4.6 originally specified 5s, but with the
+# probe driver's M=1 floor that would always INVALIDATE on
+# min-attempts. 60s costs us 60s once, vs. losing the validity
+# verdict entirely.
 "${SCRIPT_DIR}/test-mouse-latency.sh" 0 1 60 "$PREFLIGHT_DIR" || true
 
 # R2 fresh MED 2: orchestrator INVALIDates by writing a marker file

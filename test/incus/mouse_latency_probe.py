@@ -135,6 +135,18 @@ def compute_validity(
     """Apply the §4.2 validity gates. Pure function — easy to unit-test."""
     reasons: List[str] = []
     attempted = sum(attempts_per_coroutine)
+    # Internal consistency: each attempt is either completed or errored.
+    # Copilot R1: surface the bookkeeping invariant rather than letting
+    # `completed` go unused.
+    if completed > attempted:
+        reasons.append(
+            f"inconsistent-counts: completed={completed} > attempted={attempted}"
+        )
+    if completed + errors != attempted:
+        reasons.append(
+            "inconsistent-counts: "
+            f"completed+errors={completed + errors} != attempted={attempted}"
+        )
     error_rate = errors / max(1, attempted)
     if error_rate >= 0.01:
         reasons.append(f"error_rate={error_rate:.4f} >= 0.01")
@@ -175,18 +187,23 @@ async def _run(args: argparse.Namespace) -> dict:
     attempted = sum(attempts)
     achieved_rps_total = completed / max(0.001, args.duration)
 
-    # R1 MED 4: report the distribution of achieved RPS across
-    # coroutines so closed-loop overload diagnosis can distinguish
-    # client-side saturation (uniform low RPS) from probe-path
-    # asymmetry (one slow coroutine).
-    per_coro_rps = [a / max(0.001, args.duration) for a in attempts]
-    if len(per_coro_rps) >= 2:
-        cuts4 = statistics.quantiles(per_coro_rps, n=4, method="inclusive")
+    # R1 MED 4: report the distribution of achieved attempt-rate
+    # across coroutines so closed-loop overload diagnosis can
+    # distinguish client-side saturation (uniform low rate) from
+    # probe-path asymmetry (one slow coroutine).
+    #
+    # Copilot R1: name the field `attempts_per_second` so it doesn't
+    # get conflated with the completion-rate `achieved_rps_total`.
+    # An attempt counts whether or not the echo round-trip completed,
+    # so this is a workload-offered metric, not a completion metric.
+    per_coro_aps = [a / max(0.001, args.duration) for a in attempts]
+    if len(per_coro_aps) >= 2:
+        cuts4 = statistics.quantiles(per_coro_aps, n=4, method="inclusive")
         per_coro_iqr = cuts4[2] - cuts4[0]
-        per_coro_median = statistics.median(per_coro_rps)
-    elif per_coro_rps:
+        per_coro_median = statistics.median(per_coro_aps)
+    elif per_coro_aps:
         per_coro_iqr = 0.0
-        per_coro_median = per_coro_rps[0]
+        per_coro_median = per_coro_aps[0]
     else:
         per_coro_iqr = 0.0
         per_coro_median = 0.0
@@ -205,8 +222,8 @@ async def _run(args: argparse.Namespace) -> dict:
             "error_rate": errors / max(1, attempted),
             "attempts_per_coroutine": attempts,
             "achieved_rps_total": achieved_rps_total,
-            "achieved_rps_per_coroutine_median": per_coro_median,
-            "achieved_rps_per_coroutine_iqr": per_coro_iqr,
+            "attempts_per_second_per_coroutine_median": per_coro_median,
+            "attempts_per_second_per_coroutine_iqr": per_coro_iqr,
         },
         "rtt_us": _compute_percentiles(rtts_us),
         "histogram_us": {
