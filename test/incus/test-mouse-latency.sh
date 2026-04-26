@@ -45,6 +45,30 @@ mkdir -p "$OUT_DIR"
 CELL_DIR="$(basename "$(dirname "$OUT_DIR")")"
 REP_TAG="${CELL_DIR}_${OUT_DIR##*/}"
 
+# Local-side stale-artifact guard (Codex R7 HIGH): if OUT_DIR is
+# reused (rerun into an existing rep dir) and the new probe run
+# fails before overwriting probe.json, the previous run's data
+# would silently masquerade as the current rep's result. Wipe
+# the artifacts at rep start; INVALID-* markers from a prior run
+# are also cleared so the new rep's verdict is clean.
+rm -f "${OUT_DIR}"/probe.json \
+      "${OUT_DIR}"/probe-stdout.log \
+      "${OUT_DIR}"/iperf3.txt \
+      "${OUT_DIR}"/iperf3-settle.txt \
+      "${OUT_DIR}"/mpstat.txt \
+      "${OUT_DIR}"/screen-pre.txt \
+      "${OUT_DIR}"/screen-post.txt \
+      "${OUT_DIR}"/rg-state-poll.txt \
+      "${OUT_DIR}"/rg-state-initial.txt \
+      "${OUT_DIR}"/rg-state-final.txt \
+      "${OUT_DIR}"/rg-state-flap.log \
+      "${OUT_DIR}"/rg-state-final-diff.log \
+      "${OUT_DIR}"/ha-transitions.log \
+      "${OUT_DIR}"/manifest.json \
+      "${OUT_DIR}"/cos-apply.log \
+      "${OUT_DIR}"/jc-cursor-* \
+      "${OUT_DIR}"/INVALID-*
+
 # `incus_run` wraps incus calls so they work both inside and outside
 # the incus-admin group. Only the user's own group needs to differ —
 # if the user isn't already in incus-admin, `sg` runs the command
