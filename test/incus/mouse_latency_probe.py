@@ -95,9 +95,12 @@ async def _run_probe_coro(
                     timeout=min(5.0, remaining),
                 )
                 if data != payload:
+                    # Copilot R2 (#907): no `continue` — fall through
+                    # so the bottom-of-loop backoff runs on payload
+                    # mismatch too, otherwise that error mode reverts
+                    # to a tight loop.
                     error_counter[0] += 1
                     errored = True
-                    continue
             finally:
                 writer.close()
                 try:
@@ -114,7 +117,7 @@ async def _run_probe_coro(
         ):
             error_counter[0] += 1
             errored = True
-        else:
+        if not errored:
             t1 = time.monotonic_ns()
             rtts_us.append((t1 - t0) // 1000)
         if errored:

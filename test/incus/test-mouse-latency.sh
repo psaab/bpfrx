@@ -79,7 +79,10 @@ rm -f "${OUT_DIR}"/probe.json \
 # R1 MED 1: `sg ... -c "incus $*"` collapses argv across word
 # boundaries. We use `printf '%q '` to safely re-quote each arg.
 incus_run() {
-    if id -nG "$USER" 2>/dev/null | grep -qw incus-admin; then
+    # Copilot R2 (#907): `id -nG` defaults to the current user; using
+    # bare $USER would abort under `set -u` in CI / cron contexts
+    # where USER is unset.
+    if id -nG 2>/dev/null | grep -qw incus-admin; then
         incus "$@"
         return
     fi
