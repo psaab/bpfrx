@@ -598,14 +598,19 @@ pub(super) const COS_FAST_QUEUE_INDEX_MISS: u16 = u16::MAX;
 /// SFQ dequeue slot and one admission-cap slice (#705) — so making
 /// them rare is directly fairness-load-bearing. See #711.
 ///
-/// Per-queue memory overhead:
-///   `flow_bucket_bytes: [u64; N]`    =  8 KB
-///   `flow_bucket_items: [VecDeque; N]` = 24 KB inline headers
-///   `flow_rr_buckets: FlowRrRing` (`[u16; N] + head + len`) = 2 KB
-/// = ~34 KB per flow-fair queue. Non-flow-fair queues pay the same
-/// inline footprint but never touch the storage; it stays cold. At
-/// 4 workers × 8 queues × 1 iface = ~1 MB, well within tolerance.
-pub(super) const COS_FLOW_FAIR_BUCKETS: usize = 1024;
+/// Per-queue heap-resident overhead at 16384 buckets (after #912's
+/// Box<[T; N]> conversion of the bucket-sized fields):
+///   `flow_bucket_bytes: Box<[u64; N]>`              = 128 KB
+///   `flow_bucket_head_finish_bytes: Box<[u64; N]>`  = 128 KB
+///   `flow_bucket_tail_finish_bytes: Box<[u64; N]>`  = 128 KB
+///   `flow_bucket_items: Box<[VecDeque; N]>`         = 512 KB inline handles
+///   `flow_rr_buckets: FlowRrRing` (Box<[u16; N]>)   =  32 KB
+/// = ~928 KB per flow-fair queue. Non-flow-fair queues pay the same
+/// allocation but never touch the storage; it stays cold. At 6 workers
+/// × ~4 queues × 1 iface = ~22 MB system-wide. Heap-only — the struct
+/// itself is small (5 pointers + scalars) so Vec growth doesn't
+/// memcpy bucket arrays.
+pub(super) const COS_FLOW_FAIR_BUCKETS: usize = 16384;
 
 // Compile-time invariants for COS_FLOW_FAIR_BUCKETS — the #711 design
 // depends on both and a future refactor that changes the constant
@@ -626,14 +631,51 @@ const _: () = assert!(COS_FLOW_FAIR_BUCKETS <= u16::MAX as usize);
 /// each call site.
 pub(super) const COS_FLOW_FAIR_BUCKET_MASK: usize = COS_FLOW_FAIR_BUCKETS - 1;
 
+/// Heap-allocate a zeroed `[u64; N]` without ever constructing the
+/// array on the stack. `vec![0u64; N]` heap-allocates on the spot;
+/// `into_boxed_slice` shrinks to fit; `try_into` reinterprets the
+/// `Box<[u64]>` as `Box<[u64; N]>` (succeeds because lengths match
+/// by construction). #912.
+pub(super) fn boxed_zero_array_u64<const N: usize>() -> Box<[u64; N]> {
+    let v: Vec<u64> = vec![0u64; N];
+    v.into_boxed_slice()
+        .try_into()
+        .ok()
+        .expect("boxed array len matches N")
+}
+
+/// Same as `boxed_zero_array_u64` but for `u16`. Used by
+/// `FlowRrRing.buf` which stores bucket IDs as u16. #912.
+pub(super) fn boxed_zero_array_u16<const N: usize>() -> Box<[u16; N]> {
+    let v: Vec<u16> = vec![0u16; N];
+    v.into_boxed_slice()
+        .try_into()
+        .ok()
+        .expect("boxed array len matches N")
+}
+
+/// Heap-allocate a `[VecDeque<T>; N]` of empty deques without
+/// landing the array on the stack. `VecDeque::new()` allocates no
+/// heap until first push, so the per-bucket lazy-allocation
+/// behavior is preserved. #912.
+pub(super) fn boxed_vecdeque_array<T, const N: usize>() -> Box<[VecDeque<T>; N]> {
+    let v: Vec<VecDeque<T>> = (0..N).map(|_| VecDeque::new()).collect();
+    v.into_boxed_slice()
+        .try_into()
+        .ok()
+        .expect("boxed array len matches N")
+}
+
 /// #694: Fixed-capacity ring buffer holding the set of currently-active
 /// flow bucket IDs, driving SFQ round-robin dequeue.
 ///
-/// Storage is exactly `COS_FLOW_FAIR_BUCKETS` u16 slots — no heap
-/// allocation. Replaces a prior `VecDeque<u8>` which paid allocator
-/// cost per queue and capped bucket IDs at 256 (incompatible with the
-/// #711 bucket-count grow). The ring is accessed exclusively through
-/// the associated methods, which are all O(1).
+/// Storage is exactly `COS_FLOW_FAIR_BUCKETS` u16 slots, heap-
+/// allocated as `Box<[u16; N]>` (#912 — at 16K buckets the inline
+/// 32 KB array would create stack pressure during init). Replaces
+/// a prior `VecDeque<u8>` which paid allocator cost per queue and
+/// capped bucket IDs at 256 (incompatible with the #711 bucket-
+/// count grow). The ring is accessed exclusively through the
+/// associated methods, which are all O(1).
 ///
 /// Invariant: the ring contains no duplicate bucket IDs. The callers
 /// in `cos_queue_push_*` / `cos_queue_pop_front` already gate on
@@ -642,7 +684,7 @@ pub(super) const COS_FLOW_FAIR_BUCKET_MASK: usize = COS_FLOW_FAIR_BUCKETS - 1;
 /// ring itself does not revalidate on the hot path.
 #[derive(Debug)]
 pub(super) struct FlowRrRing {
-    buf: [u16; COS_FLOW_FAIR_BUCKETS],
+    buf: Box<[u16; COS_FLOW_FAIR_BUCKETS]>,
     head: u16,
     len: u16,
 }
@@ -650,7 +692,7 @@ pub(super) struct FlowRrRing {
 impl Default for FlowRrRing {
     fn default() -> Self {
         Self {
-            buf: [0; COS_FLOW_FAIR_BUCKETS],
+            buf: boxed_zero_array_u16::<COS_FLOW_FAIR_BUCKETS>(),
             head: 0,
             len: 0,
         }
@@ -745,7 +787,7 @@ impl FlowRrRing {
     ///
     /// O(len) — scans the ring. `len` is bounded by the number of
     /// concurrently active flow buckets, typically 2-16 on
-    /// iperf3-style workloads, up to `COS_FLOW_FAIR_BUCKETS = 1024`
+    /// iperf3-style workloads, up to `COS_FLOW_FAIR_BUCKETS = 16384`
     /// worst case. Returns `true` if the bucket was found and
     /// removed.
     ///
@@ -1078,7 +1120,7 @@ pub(super) struct CoSQueueRuntime {
     /// without resetting (Codex review: do NOT reset on
     /// snapshot, the doc here is the contract).
     pub(super) active_flow_buckets_peak: u16,
-    pub(super) flow_bucket_bytes: [u64; COS_FLOW_FAIR_BUCKETS],
+    pub(super) flow_bucket_bytes: Box<[u64; COS_FLOW_FAIR_BUCKETS]>,
     /// #785 Phase 3 — MQFQ virtual-finish-time ordering: per-bucket
     /// HEAD-packet finish time.
     ///
@@ -1111,7 +1153,7 @@ pub(super) struct CoSQueueRuntime {
     ///
     /// Read by `cos_queue_min_finish_bucket` as the selection key
     /// for MQFQ dequeue ordering.
-    pub(super) flow_bucket_head_finish_bytes: [u64; COS_FLOW_FAIR_BUCKETS],
+    pub(super) flow_bucket_head_finish_bytes: Box<[u64; COS_FLOW_FAIR_BUCKETS]>,
     /// #785 Phase 3 — MQFQ per-bucket TAIL finish: the finish
     /// time of the LAST-enqueued packet on this bucket. Used by
     /// enqueue to compute the next packet's finish (tail + bytes)
@@ -1119,7 +1161,7 @@ pub(super) struct CoSQueueRuntime {
     /// re-anchor at `queue.vtime`. Distinct from head-finish —
     /// see above. Invariants: `head[b] <= tail[b]` when bucket
     /// is active; both 0 when bucket is idle.
-    pub(super) flow_bucket_tail_finish_bytes: [u64; COS_FLOW_FAIR_BUCKETS],
+    pub(super) flow_bucket_tail_finish_bytes: Box<[u64; COS_FLOW_FAIR_BUCKETS]>,
     /// #785 Phase 3 — MQFQ queue virtual time. Updated on every
     /// dequeue to `finish[bucket]` of the drained bucket. Serves
     /// as the "catch-up anchor" in the enqueue formula:
@@ -1167,8 +1209,9 @@ pub(super) struct CoSQueueRuntime {
     /// catch regressions in dev/test. Preallocated to that capacity
     /// so no hot-path realloc occurs. Each entry is 24 bytes
     /// (`CoSQueuePopSnapshot`), so the worst-case footprint is
-    /// 256 × 24 = ~6 KB per queue — on top of the 1024-bucket
-    /// bookkeeping arrays already resident in `CoSQueueRuntime`.
+    /// 256 × 24 = ~6 KB per queue — on top of the 16384-bucket
+    /// bookkeeping arrays already resident in `CoSQueueRuntime`
+    /// (heap-allocated post-#912).
     ///
     /// Why a stack and not a single `Option`: earlier drained
     /// buckets in a batched rollback (e.g. N pops across M buckets,
@@ -1181,12 +1224,12 @@ pub(super) struct CoSQueueRuntime {
     /// #785 Phase 3 — active-set tracking for flow-fair MQFQ.
     /// Still populated on bucket 0→>0 / >0→0 transitions so that
     /// `cos_queue_front`/`cos_queue_pop_front` can scan just the
-    /// small active set rather than all 1024 SFQ buckets to find
+    /// small active set rather than all 16384 SFQ buckets to find
     /// the minimum finish time. Semantically a set (membership),
     /// not a DRR ring — the ordering is governed by
     /// `flow_bucket_finish_bytes`, not ring position.
     pub(super) flow_rr_buckets: FlowRrRing,
-    pub(super) flow_bucket_items: [VecDeque<CoSPendingTxItem>; COS_FLOW_FAIR_BUCKETS],
+    pub(super) flow_bucket_items: Box<[VecDeque<CoSPendingTxItem>; COS_FLOW_FAIR_BUCKETS]>,
     pub(super) runnable: bool,
     pub(super) parked: bool,
     pub(super) next_wakeup_tick: u64,
@@ -1780,15 +1823,16 @@ mod tests {
 
     #[test]
     fn flow_rr_ring_memory_footprint_fits_expected_budget() {
-        // Sanity pin: `FlowRrRing` should be ~2 KB at the chosen
-        // bucket count (1024 u16 entries + two u16 indices +
-        // padding). A future refactor that accidentally widens the
-        // entry type to u32 would double this without a loud signal;
-        // this bound catches it.
+        // Sanity pin: `FlowRrRing` is now small (Box pointer + two
+        // u16 indices) per #912's heap-box of `buf`. Was inline
+        // [u16; 1024] = ~2 KB pre-#912; now ~16 bytes. A future
+        // refactor that re-inlined the array would jump back to
+        // ~32 KB at the new 16K bucket count and re-introduce the
+        // stack-pressure regression #912 was avoiding.
         let size = std::mem::size_of::<FlowRrRing>();
         assert!(
-            size <= 2 * 1024 + 64,
-            "FlowRrRing unexpectedly large: {size} bytes"
+            size <= 64,
+            "FlowRrRing unexpectedly large: {size} bytes (expected ≤ 64)"
         );
     }
 

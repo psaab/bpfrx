@@ -3989,8 +3989,8 @@ pub(super) fn cos_flow_hash_seed_from_os() -> u64 {
     nonzero(fallback)
 }
 
-// #711: returns `u16` (was `u8`). With `COS_FLOW_FAIR_BUCKETS = 1024`
-// the mask in `cos_flow_bucket_index` is 10 bits wide; a `u8` return
+// #711: returns `u16` (was `u8`). With `COS_FLOW_FAIR_BUCKETS = 16384`
+// the mask in `cos_flow_bucket_index` is 14 bits wide; a `u8` return
 // would silently re-collapse the hash into 256 buckets and give no
 // benefit from the bucket grow. Returning `u16` preserves the full
 // hash width through the mask step.
@@ -4108,7 +4108,7 @@ fn cos_queue_flow_share_limit(
 /// on the high side by `delay_cap = transmit_rate_bytes ×
 /// COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS / 1e9`, i.e. the number of bytes
 /// the queue can drain in the max tolerated residence time. Without
-/// this, at 1024 active buckets the cap reaches ~24 MB, which on a
+/// this, at 16384 active buckets the cap reaches ~24 MB, which on a
 /// 1 Gbps queue is ~190 ms of queueing — far outside the scheduler's
 /// predictable regime. The clamp is applied as
 /// `.min(delay_cap.max(base))`: it never shrinks below the operator's
@@ -4236,7 +4236,7 @@ pub(super) fn cos_queue_len(queue: &CoSQueueRuntime) -> usize {
 /// whose ordering actually matters.
 ///
 /// Linear scan over the active ring. Size bound: `active_flow_buckets
-/// <= COS_FLOW_FAIR_BUCKETS = 1024`, typical workloads 2-16. At 12
+/// <= COS_FLOW_FAIR_BUCKETS = 16384`, typical workloads 2-16. At 12
 /// active buckets this is 12 × (u64 load + compare) ≈ 20 ns — well
 /// below NAPI batch pacing.
 ///
@@ -4460,7 +4460,7 @@ fn cos_queue_pop_front_inner(
         // rotation order. The active set (`flow_rr_buckets`) is
         // still maintained on 0↔>0 transitions so the min-scan
         // only iterates the currently-active buckets (typically
-        // 2-16), not all 1024.
+        // 2-16), not all 16384.
         let bucket_u16 = cos_queue_min_finish_bucket(queue)?;
         let bucket = usize::from(bucket_u16);
         if push_snapshot {
@@ -4527,7 +4527,7 @@ fn cos_queue_pop_front_inner(
         } else {
             // Bucket drained — deregister from the active set.
             // `FlowRrRing::remove` is O(active_count), typically
-            // 2-16 compares; bounded by 1024 worst case.
+            // 2-16 compares; bounded by 16384 worst case.
             queue.flow_rr_buckets.remove(bucket_u16);
         }
         item
@@ -5458,13 +5458,13 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 queued_bytes: 0,
                 active_flow_buckets: 0,
             active_flow_buckets_peak: 0,
-                flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                flow_bucket_bytes: boxed_zero_array_u64::<COS_FLOW_FAIR_BUCKETS>(),
+            flow_bucket_head_finish_bytes: boxed_zero_array_u64::<COS_FLOW_FAIR_BUCKETS>(),
+            flow_bucket_tail_finish_bytes: boxed_zero_array_u64::<COS_FLOW_FAIR_BUCKETS>(),
             queue_vtime: 0,
             pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
                 flow_rr_buckets: FlowRrRing::default(),
-                flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+                flow_bucket_items: boxed_vecdeque_array::<CoSPendingTxItem, COS_FLOW_FAIR_BUCKETS>(),
                 runnable: false,
                 parked: false,
                 next_wakeup_tick: 0,
@@ -10476,7 +10476,7 @@ mod tests {
 
     #[test]
     fn cos_flow_aware_buffer_limit_clamps_high_flow_count_to_max_delay() {
-        // #717: at the architectural maximum of 1024 active buckets
+        // #717: at the architectural maximum of 16384 active buckets
         // the pre-clamp flow-aware expansion reaches
         // 1024 × COS_FLOW_FAIR_MIN_SHARE_BYTES ≈ 24 MB. On a 1 Gbps
         // queue that is ~190 ms of queue residence — far outside the
@@ -10504,7 +10504,7 @@ mod tests {
         let queue = &mut root.queues[0];
         queue.flow_fair = true;
 
-        // Drive to the architectural maximum: 1024 populated buckets.
+        // Drive to the architectural maximum: 16384 populated buckets.
         queue.active_flow_buckets = COS_FLOW_FAIR_BUCKETS as u16;
         for bucket in 0..COS_FLOW_FAIR_BUCKETS {
             queue.flow_bucket_bytes[bucket] = 1_000;
@@ -12234,23 +12234,19 @@ mod tests {
         flow_v6.addr_family = libc::AF_INET6 as u8;
         let b_v4 = cos_flow_bucket_index(0, Some(&flow_v4));
         let b_v6 = cos_flow_bucket_index(0, Some(&flow_v6));
-        // #711: hash-mix regression pins, updated for the bucket-count
-        // grow from 64 → 1024. The hash function itself is unchanged
-        // at seed=0; the values moved only because the mask widened
-        // from 6 bits (0x3F) to 10 bits (0x3FF). Under the previous
-        // 6-bit mask these values were 26 (v4) and 4 (v6); the
-        // low 10 bits of the same hash output give the new pins below.
-        // A refactor that reorders the mix or adds a term still fails
-        // here and becomes an explicit decision. Update baselines only
-        // after live re-validation of 5201 fairness on the loss HA
-        // cluster.
-        // Sanity: low 6 bits of the new pins equal the old pins
-        // (26 and 4 respectively), confirming the mask-widening
-        // interpretation above.
+        // #711 / #912: hash-mix regression pins. The original
+        // full-mask pins (b_v4 = 410, b_v6 = 260 at 1024 buckets /
+        // mask 0x3FF) were removed when COS_FLOW_FAIR_BUCKETS grew
+        // to 16384 (mask 0x3FFF) because the absolute value re-pins
+        // every time the bucket count widens, adding churn without
+        // catching real hash regressions. The low-6-bits invariant
+        // (26 for v4, 4 for v6) is stable across all mask widenings
+        // and IS what catches a real hash-function regression: a
+        // refactor that reorders the mix or adds a term changes the
+        // low bits and trips this. Re-pin only after live
+        // re-validation of 5201 fairness on the loss HA cluster.
         assert_eq!(b_v4 & 0x3F, 26);
         assert_eq!(b_v6 & 0x3F, 4);
-        assert_eq!(b_v4, 410);
-        assert_eq!(b_v6, 260);
     }
 
     #[test]
@@ -12265,7 +12261,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_cos_flow_bucket_distribution_at_1024_keeps_collisions_below_budget() {
+    fn exact_cos_flow_bucket_distribution_keeps_collisions_below_budget() {
         // #711 correctness pin. The whole point of growing buckets
         // 64 → 1024 is collision reduction. A hash-mix regression can
         // produce acceptable distribution on one seed while clustering
@@ -12331,7 +12327,7 @@ mod tests {
     /// buffer / prospective_active_flows, halved/thirded if a
     /// bucket holds 2-3 flows).
     ///
-    /// Budget: for 12 narrow-input flows in 1024 buckets under a
+    /// Budget: for 12 narrow-input flows in COS_FLOW_FAIR_BUCKETS buckets under a
     /// good hash, E[colliding pairs] ≈ 12*11/(2*1024) ≈ 0.06 —
     /// essentially always 12 distinct buckets. Under the prior
     /// boost-style hash_combine, narrow inputs observably collapse
@@ -13342,13 +13338,13 @@ mod tests {
             queued_bytes: 1500,
             active_flow_buckets: 0,
             active_flow_buckets_peak: 0,
-            flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+            flow_bucket_bytes: boxed_zero_array_u64::<COS_FLOW_FAIR_BUCKETS>(),
+            flow_bucket_head_finish_bytes: boxed_zero_array_u64::<COS_FLOW_FAIR_BUCKETS>(),
+            flow_bucket_tail_finish_bytes: boxed_zero_array_u64::<COS_FLOW_FAIR_BUCKETS>(),
             queue_vtime: 0,
             pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
             flow_rr_buckets: FlowRrRing::default(),
-            flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+            flow_bucket_items: boxed_vecdeque_array::<CoSPendingTxItem, COS_FLOW_FAIR_BUCKETS>(),
             runnable: false,
             parked: false,
             next_wakeup_tick: 0,
@@ -13386,13 +13382,13 @@ mod tests {
             queued_bytes: 0,
             active_flow_buckets: 0,
             active_flow_buckets_peak: 0,
-            flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+            flow_bucket_bytes: boxed_zero_array_u64::<COS_FLOW_FAIR_BUCKETS>(),
+            flow_bucket_head_finish_bytes: boxed_zero_array_u64::<COS_FLOW_FAIR_BUCKETS>(),
+            flow_bucket_tail_finish_bytes: boxed_zero_array_u64::<COS_FLOW_FAIR_BUCKETS>(),
             queue_vtime: 0,
             pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
             flow_rr_buckets: FlowRrRing::default(),
-            flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+            flow_bucket_items: boxed_vecdeque_array::<CoSPendingTxItem, COS_FLOW_FAIR_BUCKETS>(),
             runnable: false,
             parked: false,
             next_wakeup_tick: 0,
@@ -13441,13 +13437,13 @@ mod tests {
             queued_bytes: 0,
             active_flow_buckets: 0,
             active_flow_buckets_peak: 0,
-            flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+            flow_bucket_bytes: boxed_zero_array_u64::<COS_FLOW_FAIR_BUCKETS>(),
+            flow_bucket_head_finish_bytes: boxed_zero_array_u64::<COS_FLOW_FAIR_BUCKETS>(),
+            flow_bucket_tail_finish_bytes: boxed_zero_array_u64::<COS_FLOW_FAIR_BUCKETS>(),
             queue_vtime: 0,
             pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
             flow_rr_buckets: FlowRrRing::default(),
-            flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+            flow_bucket_items: boxed_vecdeque_array::<CoSPendingTxItem, COS_FLOW_FAIR_BUCKETS>(),
             runnable: false,
             parked: false,
             next_wakeup_tick: 0,
