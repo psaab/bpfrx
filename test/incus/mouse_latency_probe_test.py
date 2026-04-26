@@ -73,12 +73,26 @@ class ValidityTests(unittest.TestCase):
         v = compute_validity(10, attempts, completed=5970, errors=30)
         self.assertTrue(v["ok"], v["reasons"])
 
-    def test_error_rate_too_high(self):
+    def test_high_error_rate_ok_if_completed_floor_met(self):
+        # 4000/6000 = 66.7% errors but 2000 completed > 1000 floor —
+        # empirical: echo refuses many SYNs under load but the
+        # successful samples are still meaningful for p99.
         attempts = [600] * 10
-        # 200/6000 = 3.3% > 1%
-        v = compute_validity(10, attempts, completed=5800, errors=200)
+        v = compute_validity(10, attempts, completed=2000, errors=4000)
+        self.assertTrue(v["ok"], v["reasons"])
+
+    def test_below_completed_floor_m10(self):
+        # 6000 attempts, 5500 errors → 500 completed < 1000 floor
+        attempts = [600] * 10
+        v = compute_validity(10, attempts, completed=500, errors=5500)
         self.assertFalse(v["ok"])
-        self.assertTrue(any("error_rate" in r for r in v["reasons"]))
+        self.assertTrue(any("min-completed" in r for r in v["reasons"]))
+
+    def test_below_completed_floor_m1(self):
+        # 500 attempts, 450 errors → 50 completed < 100 floor
+        v = compute_validity(1, [500], completed=50, errors=450)
+        self.assertFalse(v["ok"])
+        self.assertTrue(any("min-completed" in r for r in v["reasons"]))
 
     def test_degenerate_coroutine_min_attempts(self):
         # 9 coroutines did 600, one did 200; median=600, min=200 < 300

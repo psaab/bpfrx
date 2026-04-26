@@ -142,7 +142,7 @@ trap cleanup EXIT
 # previously left a stale file behind that the next reuse with the
 # same tag would inherit. Belt-and-suspenders.)
 incus_exec "$SOURCE" sh -c \
-    "rm -f /tmp/probe-${REP_TAG}.json /tmp/mpstat-${REP_TAG}.txt /tmp/iperf3-${REP_TAG}.txt" \
+    "rm -f /tmp/probe-${REP_TAG}.json /tmp/mpstat-${REP_TAG}.txt /tmp/iperf3-${REP_TAG}.txt /tmp/mouse_latency_probe.py" \
     < /dev/null > /dev/null 2>&1 || true
 
 # Push helper scripts to the source container (probe driver runs there).
@@ -155,6 +155,12 @@ incus_run file push "${SCRIPT_DIR}/mouse_latency_probe.py" \
 # already failed over before the rep starts, hard-coding fw0 would
 # attempt to apply on the secondary.
 PRE_PRIMARY=$(current_primary)
+# Clean stale /tmp/cos-iperf-sets.set on both nodes — prior runs as
+# a different uid leave it owned by 1000, which breaks the next
+# `incus file push` from this script (empirical fix from smoke run).
+for fw in "$PRIMARY" "$SECONDARY"; do
+    incus_exec "$fw" rm -f /tmp/cos-iperf-sets.set < /dev/null > /dev/null 2>&1 || true
+done
 "${SCRIPT_DIR}/apply-cos-config.sh" "${INCUS_REMOTE}:${PRE_PRIMARY}" \
     > "${OUT_DIR}/cos-apply.log" 2>&1
 
