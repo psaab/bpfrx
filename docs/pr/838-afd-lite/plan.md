@@ -578,9 +578,11 @@ focus on the non-regression merge gate; the targets are
 ambitions to compare against, not pass/fail thresholds.
 - `make test-failover`: pass (defense — touching the
   CoS dataplane).
-- Codex hostile plan + code review: PLAN-READY YES,
-  MERGE YES.
-- Copilot inline review: addressed.
+- Codex hostile plan + code review: NOT ACHIEVED. The plan
+  closed at R5 with a PLAN-NEEDS-MAJOR-REWORK verdict (see
+  §11 Round 5 + `findings.md`); MERGE was never pursued.
+- Copilot inline review: addressed for the closing docs PR
+  (#904); not pursued for the unwritten implementation.
 
 ## 9. Risks
 
@@ -598,10 +600,10 @@ ambitions to compare against, not pass/fail thresholds.
     a target, not a gate; merge is justified by code
     quality + zero-harm even if the empirical bar isn't
     hit.
-- **Period-rotation cost**: `Box::fill(0)` on 8 KB at 500
-  Hz = ~120 µs/sec/queue. With ~2-4 flow-fair-non-shared
-  queues per worker × 6 workers, total ~1-3 ms/sec of CPU.
-  Bounded.
+- **Period-rotation cost**: `state.bytes_per_flow.fill(0)`
+  on 8 KB at 500 Hz = ~120 µs/sec/queue. With ~2-4
+  flow-fair-non-shared queues per worker × 6 workers,
+  total ~1-3 ms/sec of CPU. Bounded.
 - **Selection cost**: 1024-u64 linear scan per `cos_queue_front`
   + per pop. Profile shows the existing
   `cos_queue_min_finish_bucket` is a hot site; this adds a
