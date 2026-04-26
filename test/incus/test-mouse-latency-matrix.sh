@@ -135,9 +135,18 @@ rep_is_valid() {
     if [[ ! -f "${rep_dir}/probe.json" ]]; then
         return 1
     fi
-    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["validity"]["ok"] else 1)' \
-        "${rep_dir}/probe.json"
+    # Copilot R3 #4: defensive parse — malformed JSON / schema drift
+    # treated as invalid instead of stack-tracing into the matrix log.
+    python3 -c 'import json,sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    sys.exit(0 if d["validity"]["ok"] else 1)
+except Exception:
+    sys.exit(1)' "${rep_dir}/probe.json"
 }
+
+WALL_CAP_HIT=0
 
 run_cell() {
     local N="$1" M="$2"
@@ -150,10 +159,14 @@ run_cell() {
     # ordinary replacements (any INVALID rep) AND auto-extension
     # (the >30% rule) draw from the same ceiling. R1 HIGH 2.
     while [[ $total -lt $hard_cap && $valid -lt 10 ]]; do
-        # Wall budget guard.
+        # Wall budget guard. Copilot R3 #3: signal the outer cell
+        # loop via WALL_CAP_HIT so it stops scheduling additional
+        # cells; previously `return 0` only exited run_cell and the
+        # outer loop kept iterating, hitting the cap on each cell.
         local now=$(date +%s)
         if [[ $((now - start_t)) -gt $WALL_CAP ]]; then
             echo "wall-budget cap reached, stopping matrix" >&2
+            WALL_CAP_HIT=1
             return 0
         fi
         local rep_dir="${cell_dir}/rep_$(printf '%02d' $total)"
@@ -172,6 +185,10 @@ run_cell() {
 for cell in "${CELLS[@]}"; do
     read -r N M <<< "$cell"
     run_cell "$N" "$M"
+    if [[ $WALL_CAP_HIT -eq 1 ]]; then
+        echo "wall-budget cap hit; remaining cells skipped" >&2
+        break
+    fi
 done
 
 echo "Matrix complete; running aggregator..."

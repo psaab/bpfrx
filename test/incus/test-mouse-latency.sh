@@ -57,6 +57,7 @@ rm -f "${OUT_DIR}"/probe.json \
       "${OUT_DIR}"/iperf3-settle.txt \
       "${OUT_DIR}"/mpstat.txt \
       "${OUT_DIR}"/screen-pre.txt \
+      "${OUT_DIR}"/screen-pre-fw.txt \
       "${OUT_DIR}"/screen-post.txt \
       "${OUT_DIR}"/rg-state-poll.txt \
       "${OUT_DIR}"/rg-state-initial.txt \
@@ -148,8 +149,13 @@ incus_exec "$SOURCE" sh -c \
 incus_run file push "${SCRIPT_DIR}/mouse_latency_probe.py" \
     "${INCUS_REMOTE}:${SOURCE}/tmp/mouse_latency_probe.py"
 
-# ---- step 1: CoS preflight (fixture-apply only, plan §3.3 + R4 MED 4)
-"${SCRIPT_DIR}/apply-cos-config.sh" "${INCUS_REMOTE}:${PRIMARY}" \
+# ---- step 1: CoS preflight (fixture-apply only, plan §3.3 + R4 MED 4).
+# Copilot R3 #5: apply-cos-config replicates from primary to peer, so
+# it must run against the current RG0 primary. If the cluster has
+# already failed over before the rep starts, hard-coding fw0 would
+# attempt to apply on the secondary.
+PRE_PRIMARY=$(current_primary)
+"${SCRIPT_DIR}/apply-cos-config.sh" "${INCUS_REMOTE}:${PRE_PRIMARY}" \
     > "${OUT_DIR}/cos-apply.log" 2>&1
 
 # ---- step 3: RG state polling at 1 Hz (plan §4.5 step 3)
@@ -185,8 +191,14 @@ for FW in "$PRIMARY" "$SECONDARY"; do
     echo "$cursor" > "${OUT_DIR}/jc-cursor-${FW}.txt"
 done
 
-# ---- step 4a: SYN-cookie counter snapshot (pre)
-incus_exec "$PRIMARY" cli -c "show security screen statistics zone wan" \
+# ---- step 4a: SYN-cookie counter snapshot (pre).
+# Copilot R3 #6: capture from the same node identity the post-run
+# comparison will follow (current primary at the time of the snapshot).
+# Mismatch between pre (always fw0) and post (current_primary) made the
+# screen_engaged delta meaningless when fw0 wasn't primary.
+SCREEN_PRE_FW=$(current_primary)
+echo "$SCREEN_PRE_FW" > "${OUT_DIR}/screen-pre-fw.txt"
+incus_exec "$SCREEN_PRE_FW" cli -c "show security screen statistics zone wan" \
     > "${OUT_DIR}/screen-pre.txt" 2>/dev/null || true
 
 # ---- step 5: elephant launch (if N > 0). Background; let it run for

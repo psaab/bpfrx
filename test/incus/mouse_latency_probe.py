@@ -41,22 +41,40 @@ async def _run_probe_coro(
     attempt_counter: List[int],
     error_counter: List[int],
 ) -> None:
-    """One coroutine: closed-loop probe loop until deadline."""
-    while time.monotonic() < deadline:
+    """One coroutine: closed-loop probe loop until deadline.
+
+    Copilot R3 #2: payload is generated once per coroutine — the
+    echo server is byte-stateless and we don't need uniqueness
+    across attempts; per-attempt `os.urandom` was avoidable CPU on
+    the source.
+
+    Copilot R3 #1: per-attempt connect/recv timeouts are bounded
+    by remaining time to the deadline so the probe runtime is
+    consistently ≤ duration + small constant, never the full 5s+5s
+    above deadline.
+    """
+    payload = os.urandom(payload_bytes)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         attempt_counter[0] += 1
-        payload = os.urandom(payload_bytes)
         t0 = time.monotonic_ns()
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(target, port),
-                timeout=5.0,
+                timeout=min(5.0, remaining),
             )
             try:
                 writer.write(payload)
                 await writer.drain()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    error_counter[0] += 1
+                    break
                 data = await asyncio.wait_for(
                     reader.readexactly(payload_bytes),
-                    timeout=5.0,
+                    timeout=min(5.0, remaining),
                 )
                 if data != payload:
                     error_counter[0] += 1
