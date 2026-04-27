@@ -34,7 +34,12 @@ fi
 # Concurrent runs would alternately overwrite each other's CoS
 # fixture and silently corrupt both datasets. flock -n fails fast
 # instead of waiting.
-LOCK_FILE="${TMPDIR:-/tmp}/test-mouse-latency-matrix.lock"
+#
+# Copilot D.1: hard-code /tmp rather than ${TMPDIR:-/tmp} — two
+# invocations with different TMPDIR env values would lock
+# different files and bypass the mutex. The CoS state being
+# protected is per-host, so the lock must be per-host.
+LOCK_FILE="/tmp/test-mouse-latency-matrix.lock"
 exec 9>"$LOCK_FILE"
 flock -n 9 || {
     echo "ABORT: another mouse-latency matrix is already running" >&2
