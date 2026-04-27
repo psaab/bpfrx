@@ -5421,6 +5421,37 @@ fn demote_prepared_cos_queue_to_local(
     if !queue.exact || cos_queue_is_empty(queue) {
         return false;
     }
+
+    // #926: snapshot MQFQ frontier state BEFORE drain_all so we
+    // can restore on the success path. cos_queue_drain_all uses
+    // the no-snapshot pop variant (aggregate-bytes vtime advance:
+    // queue_vtime += bytes per pop) which inflates queue_vtime
+    // by the entire drained backlog. cos_queue_push_back then
+    // re-anchors finish-times against the inflated vtime
+    // (max(tail, queue_vtime) + bytes), letting any new flow Y
+    // enqueued immediately after demotion jump ahead of the
+    // demoted backlog — the temporal-inversion bug class #911 /
+    // #913 was supposed to prevent. The failure-rollback path
+    // (cos_queue_restore_front) is round-trip neutral per #913
+    // §3.7 and stays correct without snapshot/restore.
+    //
+    // Single-worker invariant (Gemini R2): demote and pop run
+    // in the same worker thread, and any in-flight pop's
+    // snapshot is cleared by cos_queue_drain_all below
+    // (tx.rs:4742). So no cross-batch pop_snapshot_stack
+    // entries can be live at this point — restoring vtime +
+    // head/tail finish-times can't race with a concurrent
+    // pop's snapshot interpretation.
+    //
+    // Footprint: 16 KB stack memcpy of two [u64; 1024] arrays
+    // already cache-resident in the queue. demote is a rare
+    // TX-frame-exhaustion fallback called from
+    // enqueue_local_into_cos at tx.rs:5211, not a hot-path
+    // operation.
+    let saved_queue_vtime = queue.queue_vtime;
+    let saved_head_finish = queue.flow_bucket_head_finish_bytes;
+    let saved_tail_finish = queue.flow_bucket_tail_finish_bytes;
+
     let drained = cos_queue_drain_all(queue);
     let mut local_items = VecDeque::with_capacity(drained.len());
     let mut recycles = Vec::with_capacity(drained.len());
@@ -5448,6 +5479,16 @@ fn demote_prepared_cos_queue_to_local(
             offset,
         );
     }
+
+    // #926: restore MQFQ frontier on the success path. Same
+    // flow_keys → same cos_flow_bucket_index → same buckets,
+    // so the saved per-bucket head/tail finish-times still
+    // apply. Restoring queue_vtime alongside keeps the three
+    // values internally consistent.
+    queue.queue_vtime = saved_queue_vtime;
+    queue.flow_bucket_head_finish_bytes = saved_head_finish;
+    queue.flow_bucket_tail_finish_bytes = saved_tail_finish;
+
     true
 }
 
@@ -8110,6 +8151,159 @@ mod tests {
         assert_eq!(free_tx_frames, VecDeque::from([512, 64]));
         assert_eq!(pending_fill_frames, VecDeque::from([128]));
         assert!(!cos_queue_accepts_prepared(&root, Some(5)));
+    }
+
+    /// #926: regression test for the success-path
+    /// queue_vtime / head-finish preservation. Prepared items
+    /// across multiple flows are queued, demoted to Local, and
+    /// the MQFQ frontier (queue_vtime + per-bucket head/tail
+    /// finish-times) MUST be unchanged. A new flow Y enqueued
+    /// immediately after demotion MUST anchor at a finish-time
+    /// that respects the demoted backlog's frontier — i.e. Y
+    /// cannot jump ahead of the demoted backlog.
+    #[test]
+    fn demote_prepared_cos_queue_to_local_preserves_mqfq_frontier() {
+        let area = MmapArea::new(4096).expect("mmap");
+        unsafe { area.slice_mut_unchecked(64, 4) }
+            .expect("frame")
+            .copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        unsafe { area.slice_mut_unchecked(128, 4) }
+            .expect("frame")
+            .copy_from_slice(&[0xca, 0xfe, 0xba, 0xbe]);
+
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
+
+        // Two distinct flows, each one Prepared item. Bucket
+        // indices computed under flow_hash_seed=0 for use in
+        // post-demote frontier assertions.
+        let key_a = test_session_key(8001, 5201);
+        let key_b = test_session_key(8002, 5201);
+        let bucket_a = cos_flow_bucket_index(0, Some(&key_a));
+        let bucket_b = cos_flow_bucket_index(0, Some(&key_b));
+        assert_ne!(
+            bucket_a, bucket_b,
+            "test setup: ports 8001/8002 must hash to distinct buckets"
+        );
+
+        cos_queue_push_back(
+            queue,
+            CoSPendingTxItem::Prepared(PreparedTxRequest {
+                offset: 64,
+                len: 1500,
+                recycle: PreparedTxRecycle::FreeTxFrame,
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: Some(key_a.clone()),
+                egress_ifindex: 42,
+                cos_queue_id: Some(4),
+                dscp_rewrite: None,
+            }),
+        );
+        cos_queue_push_back(
+            queue,
+            CoSPendingTxItem::Prepared(PreparedTxRequest {
+                offset: 128,
+                len: 1500,
+                recycle: PreparedTxRecycle::FreeTxFrame,
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: Some(key_b.clone()),
+                egress_ifindex: 42,
+                cos_queue_id: Some(4),
+                dscp_rewrite: None,
+            }),
+        );
+
+        // Snapshot pre-demote MQFQ frontier.
+        let pre_vtime = queue.queue_vtime;
+        let pre_head_a = queue.flow_bucket_head_finish_bytes[bucket_a];
+        let pre_head_b = queue.flow_bucket_head_finish_bytes[bucket_b];
+        let pre_tail_a = queue.flow_bucket_tail_finish_bytes[bucket_a];
+        let pre_tail_b = queue.flow_bucket_tail_finish_bytes[bucket_b];
+        assert!(pre_head_a > 0);
+        assert!(pre_head_b > 0);
+
+        // Demote (success path).
+        let mut free_tx_frames = VecDeque::from([512]);
+        let mut pending_fill_frames = VecDeque::new();
+        assert!(demote_prepared_cos_queue_to_local(
+            &area,
+            &mut free_tx_frames,
+            &mut pending_fill_frames,
+            7,
+            &mut root,
+            Some(4),
+        ));
+
+        let queue = &mut root.queues[0];
+
+        // Frontier MUST be unchanged across the success path.
+        assert_eq!(
+            queue.queue_vtime, pre_vtime,
+            "#926 regression: queue_vtime must be preserved across \
+             demote success path. Pre={pre_vtime} post={}",
+            queue.queue_vtime
+        );
+        assert_eq!(
+            queue.flow_bucket_head_finish_bytes[bucket_a], pre_head_a,
+            "#926: head_finish[A] must be preserved (pre={pre_head_a})"
+        );
+        assert_eq!(
+            queue.flow_bucket_head_finish_bytes[bucket_b], pre_head_b,
+            "#926: head_finish[B] must be preserved (pre={pre_head_b})"
+        );
+        assert_eq!(
+            queue.flow_bucket_tail_finish_bytes[bucket_a], pre_tail_a,
+            "#926: tail_finish[A] must be preserved"
+        );
+        assert_eq!(
+            queue.flow_bucket_tail_finish_bytes[bucket_b], pre_tail_b,
+            "#926: tail_finish[B] must be preserved"
+        );
+
+        // Items now Local. flow_fair=true stores items in
+        // per-bucket VecDeques at `flow_bucket_items[bucket]`,
+        // not in `queue.items`.
+        let mut total_items = 0;
+        for bucket in [bucket_a, bucket_b] {
+            for item in queue.flow_bucket_items[bucket].iter() {
+                assert!(
+                    matches!(item, CoSPendingTxItem::Local(_)),
+                    "demote should convert Prepared → Local"
+                );
+                total_items += 1;
+            }
+        }
+        assert_eq!(total_items, 2);
+
+        // The frontier-preservation assertions above are the
+        // load-bearing test (Codex code review caught that an
+        // earlier "Y does not jump ahead" assertion was
+        // logically muddled — without the fix, the four
+        // assert_eq calls already FAIL at the queue_vtime / head /
+        // tail checks; demote_prepared without snapshot/restore
+        // leaves queue_vtime=3000 and head_a=head_b=4500, all
+        // mismatching the captured pre-state). The Y-anchor
+        // behavior at this scenario is identical with-or-without
+        // the fix (Y is small enough to anchor below A/B in
+        // both cases) so it's not a useful gate.
     }
 
     #[test]
