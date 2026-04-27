@@ -1016,16 +1016,36 @@ pub(super) struct CoSInterfaceRuntime {
 /// snapshot exactly is the only path to true round-trip neutrality.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct CoSQueuePopSnapshot {
-    /// The bucket that was popped from. Used to verify the
-    /// push_front is restoring the SAME bucket; a mismatch means
-    /// the snapshot is stale (some other bucket drained in between)
-    /// and the push_front falls back to the standard re-anchor
-    /// path.
+    /// The bucket that was popped from. Used by
+    /// `cos_queue_push_front` to verify it is restoring the SAME
+    /// bucket the snapshot was captured for.
+    ///
+    /// **#913 contract**: a bucket mismatch on push_front is a
+    /// HARD INVARIANT VIOLATION and panics via `assert!(false)`
+    /// (see `cos_queue_push_front`). Stale-snapshot prevention is
+    /// the responsibility of the surrounding helpers, NOT a
+    /// runtime fallback:
+    ///   - Batch-start clears at `tx.rs:2620`/`:2797` (hot-path
+    ///     scratch builders) and `tx.rs:4292` (push_back).
+    ///   - Drain-start clear in `cos_queue_drain_all` (#913).
+    ///   - Orphan-drop cleanup at the four scratch-builder Drop
+    ///     sites via `cos_queue_clear_orphan_snapshot_after_drop`
+    ///     (#913 §3.4).
+    /// With those in place, mismatch is believed unreachable in
+    /// current code; the assert is a defensive tripwire for any
+    /// future caller that introduces a new pop+drop site without
+    /// the cleanup.
     pub(super) bucket: u16,
     /// Bucket's HEAD finish time BEFORE the pop-time advance.
     pub(super) pre_pop_head_finish: u64,
     /// Bucket's TAIL finish time BEFORE the pop-time advance.
     pub(super) pre_pop_tail_finish: u64,
+    /// #913 — `queue.queue_vtime` BEFORE the pop-time advance.
+    /// Captured so push_front can exactly restore vtime under the
+    /// new MQFQ served-finish semantics, where the advance is
+    /// `max(vtime, served_finish)` (no fixed delta — symmetric
+    /// rewind by `item_len` is wrong).
+    pub(super) pre_pop_queue_vtime: u64,
 }
 
 pub(super) struct CoSQueueRuntime {

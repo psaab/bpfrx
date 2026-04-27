@@ -1,0 +1,17 @@
+Interface: reth0.80
+  Scheduler map:            bandwidth-limit
+  DSCP classifier:          -
+  IEEE 802.1 classifier:    -
+  DSCP rewrite-rule:        -
+  Shaping rate:             25.00 Gb/s
+  Burst size:               -
+  Output filter (inet):     bandwidth-output
+  Output filter (inet6):    bandwidth-output
+  Runtime:                  unavailable
+  Queues:
+    Queue  Owner  Class        Priority  Exact  Transmit rate  Buffer  Queued pkts  Queued bytes  Runnable  Parked  Next wake  Surplus deficit
+    0      -      best-effort  -         yes    100.00 Mb/s    -       0            -             0         0       -          -
+    4      -      iperf-a      -         yes    1.00 Gb/s      -       0            -             0         0       -          -
+    5      -      iperf-b      -         yes    10.00 Gb/s     -       0            -             0         0       -          -
+    6      -      iperf-c      -         yes    25.00 Gb/s     -       0            -             0         0       -          -
+apply-cos-config: atomic commit + verification OK
