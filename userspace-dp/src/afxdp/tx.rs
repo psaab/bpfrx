@@ -4083,10 +4083,27 @@ fn cos_queue_prospective_active_flows(queue: &CoSQueueRuntime, flow_bucket: usiz
 /// post-shaper; 10 ms gives ~1.5× headroom.
 const RTT_TARGET_NS: u64 = 10_000_000;
 
+/// Burst headroom multiplier applied to the per-flow `fair_share`
+/// inside `cos_queue_flow_share_limit` for shared_exact queues. Set
+/// to 2 to admit short bursts up to 2× the steady-state per-flow
+/// allocation without tail-drops. Only binding in the moderate-N
+/// regime where it exceeds `bdp_floor` and is below `buffer_limit`;
+/// at high N `bdp_floor` dominates and at low N `buffer_limit` clamps.
+const SHARED_EXACT_BURST_HEADROOM: u64 = 2;
+
 /// Per-flow BDP at the queue's rate divided across `active_flows`.
 /// Used as a floor in the shared_exact rate-aware cap — TCP cwnd
 /// must reach approximately one BDP for the per-flow rate to fit
 /// the queue's transmit rate without tail-drops.
+///
+/// Truncation: result truncates to 0 when `per_flow_rate <
+/// 1e9 / RTT_TARGET_NS = 100 bytes/sec`. At cluster-scale rates
+/// (≥ 1 Gbps queues with ≤ 1024 flows → ≥ 122 KB/s/flow) this is
+/// far from the truncation floor. On user-configured low-rate
+/// queues (e.g., 64 kbps WAN class with 100+ flows) the BDP floor
+/// silently degenerates to 0 and the `MIN_SHARE` (24 KB) clamp
+/// becomes the effective floor. Acceptable because the MIN_SHARE
+/// floor still keeps TCP recoverable via fast-retransmit.
 #[inline]
 fn bdp_floor_bytes(transmit_rate_bytes: u64, active_flows: u64) -> u64 {
     let per_flow_rate = transmit_rate_bytes / active_flows.max(1);
@@ -4137,7 +4154,7 @@ fn cos_queue_flow_share_limit(
         let fair_share = buffer_limit / prospective.max(1);
         let bdp = bdp_floor_bytes(queue.transmit_rate_bytes, prospective);
         return fair_share
-            .saturating_mul(2)
+            .saturating_mul(SHARED_EXACT_BURST_HEADROOM)
             .max(bdp)
             .clamp(COS_FLOW_FAIR_MIN_SHARE_BYTES, buffer_limit);
     }
