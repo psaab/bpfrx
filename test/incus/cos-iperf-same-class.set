@@ -1,9 +1,16 @@
 # #929: same-class iperf-b CoS fixture for the mouse-latency
 # tail measurement. Same as cos-iperf-config.set but adds
-# term 4 mapping destination-port 5212 → iperf-b, so mice
-# (sent to port 5212) share the iperf-b queue with elephants
-# (port 5202). Used to characterize the same-class HOL gate
-# that #913/#918/#914/#920 target.
+# term 4 mapping destination-port 7 → iperf-b, so mice (sent
+# to the operator's existing TCP echo daemon on port 7) share
+# the iperf-b queue with elephants (port 5202). Used to
+# characterize the same-class HOL gate that #913/#918/#914/#920
+# target. Port 7 was chosen because the operator's echo daemon
+# already listens there for the cross-class default — no second
+# listener required.
+#
+# Cross-class default (cos-iperf-config.set) leaves port 7
+# unclassified, so it falls back to best-effort. The same-class
+# fixture below overrides that classification with term 4.
 
 delete class-of-service
 delete firewall family inet filter bandwidth-output
@@ -56,8 +63,8 @@ set firewall family inet filter bandwidth-output term 3 then forwarding-class be
 set firewall family inet filter bandwidth-output term 3 then count best-effort
 set firewall family inet filter bandwidth-output term 3 then accept
 
-# #929 same-class: mice on port 5212 → iperf-b (queue 5).
-set firewall family inet filter bandwidth-output term 4 from destination-port 5212
+# #929 same-class: mice on port 7 → iperf-b (queue 5).
+set firewall family inet filter bandwidth-output term 4 from destination-port 7
 set firewall family inet filter bandwidth-output term 4 then forwarding-class iperf-b
 set firewall family inet filter bandwidth-output term 4 then count iperf-b-mouse
 set firewall family inet filter bandwidth-output term 4 then accept
@@ -85,7 +92,7 @@ set firewall family inet6 filter bandwidth-output term 3 then count best-effort
 set firewall family inet6 filter bandwidth-output term 3 then accept
 
 # #929 same-class: IPv6 mirror of term 4.
-set firewall family inet6 filter bandwidth-output term 4 from destination-port 5212
+set firewall family inet6 filter bandwidth-output term 4 from destination-port 7
 set firewall family inet6 filter bandwidth-output term 4 then forwarding-class iperf-b
 set firewall family inet6 filter bandwidth-output term 4 then count iperf-b-mouse
 set firewall family inet6 filter bandwidth-output term 4 then accept

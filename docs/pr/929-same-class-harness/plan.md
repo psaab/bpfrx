@@ -21,12 +21,20 @@ matrix without breaking the existing cross-class baseline:
 - Existing default invocation continues to produce cross-class
   data (no regression in the #905 dataset).
 - A new code path runs the matrix with elephants + mice both in
-  iperf-b at port 5202 (elephants) + port 5212 (mice), with a
-  CoS classifier term mapping 5212 → iperf-b.
-- The cluster-side TCP echo daemon listens on both port 7
-  (existing) and port 5212 (new). UDP echo on 5212 is OUT OF
-  SCOPE for this PR — `mouse_latency_probe.py` exercises TCP
-  only (per §3.3), so adding UDP would be unverified scope creep.
+  iperf-b: port 5202 (elephants) + port 7 (mice, hitting the
+  operator's existing echo daemon), with a CoS classifier term
+  that overrides port 7's default best-effort classification and
+  routes it to iperf-b instead.
+- **No new echo daemon required** — the port 7 listener that the
+  cross-class default already uses is reused. The cross-class
+  fixture leaves port 7 as best-effort; the same-class fixture
+  reclassifies it as iperf-b. Switch by re-applying the fixture.
+
+(Plan v1 specified a separate port 5212 listener that the
+operator would stand up. v2 simplified to reuse port 7 after
+the operator confirmed they only run a single echo. The CoS
+term still differentiates same-class from cross-class via the
+fixture being applied, not the destination port.)
 
 ## 3. Approach
 
@@ -68,20 +76,25 @@ Existing `cos-iperf-config.set` maps:
 - 5204 → best-effort
 
 New same-class file inherits everything from `cos-iperf-config.set`
-plus adds a term that maps the same-class mouse port (5212) to
-iperf-b. Choose 5212 (= 5202 + 10) so the mouse port is visually
-related to the elephant class but doesn't collide with iperf3's
-listener on 5202.
+plus adds a term that overrides port 7's default best-effort
+classification and routes it to iperf-b — putting mouse traffic
+into the same queue as the elephants on port 5202.
 
 ```text
 # Append to cos-iperf-same-class.set:
-set firewall family inet filter bandwidth-output term 4 from destination-port 5212
+set firewall family inet filter bandwidth-output term 4 from destination-port 7
 set firewall family inet filter bandwidth-output term 4 then forwarding-class iperf-b
 set firewall family inet filter bandwidth-output term 4 then count iperf-b-mouse
 set firewall family inet filter bandwidth-output term 4 then accept
 ```
 
 (Plus matching IPv6 term.)
+
+(v2 note: an earlier revision used port 5212 for the mouse so
+that port 7 would never be classified as iperf-b. v2 dropped
+that requirement — using port 7 means no second echo listener
+on 172.16.80.200, and the same-class-vs-cross-class distinction
+lives entirely in which CoS fixture is applied.)
 
 `apply-cos-config.sh` learns a `--same-class` flag that selects
 which file to apply. Default stays cross-class.
@@ -106,38 +119,20 @@ TARGET="${1:?target required}"
 Without explicit parsing, `--same-class` would be silently
 treated as the target hostname — easy to miss in CI logs.
 
-### 3.3 Echo daemon on 5212 — host correction (Codex R1)
+### 3.3 Echo daemon (no new listener required)
 
 `TARGET_V4=172.16.80.200` is the iperf3 target host (the
-operator's external echo server), NOT
-`cluster-userspace-host` (which is the SOURCE of the test
-traffic). Codex R1 caught my earlier confusion: the new echo
-listener for port 5212 must run on `172.16.80.200`, not on
-the source container.
+operator's external echo server), NOT `cluster-userspace-host`
+(which is the SOURCE of the test traffic).
 
-Plan A and B below both run on `172.16.80.200`. Decide at
-implementation time after operator confirms which method is
-preferred (the existing port-7 service may already be one of
-these patterns):
-
-- (A) **Extend the existing echo service** on 172.16.80.200 to
-  listen on multiple ports. If the existing service is
-  systemd-socket-activated, append a `ListenStream=5212` /
-  `ListenDatagram=5212` entry. If it's xinetd, add a port-7-
-  twin block for 5212.
-- (B) **Stand up a second echo daemon** on 172.16.80.200 via
-  `socat` or a small Rust echo binary as a systemd service.
+v2 design: the same-class wrapper reuses the existing port 7
+TCP echo daemon on 172.16.80.200 — no new listener required.
+Same-class vs cross-class is a CoS-fixture distinction, not a
+destination-port distinction.
 
 The probe currently exercises **TCP only** (per
-`mouse_latency_probe.py`). UDP echo on 5212 is a nice-to-have
-but NOT validated by the existing probe; document that TCP
-is the required path.
-
-If the operator can't or won't add port 5212 to 172.16.80.200,
-fallback option (C): out of scope for this PR (would require
-spawning a new `cluster-target-aux` container with separate
-network plumbing — separate work item to file if A and B both
-fail).
+`mouse_latency_probe.py`). UDP same-class is OUT OF SCOPE for
+this PR — there's no UDP echo path the probe would exercise.
 
 ### 3.4 New wrapper `test-mouse-latency-same-class.sh`
 
@@ -148,16 +143,16 @@ Wraps `test-mouse-latency-matrix.sh` with the right env:
 set -euo pipefail
 exec env \
     ELEPHANT_PORT=5202 \
-    MOUSE_PORT=5212 \
+    MOUSE_PORT=7 \
     MOUSE_CLASS=iperf-b \
     SHAPER_BPS=$((10 * 1000 * 1000 * 1000)) \
     "$(dirname "$0")/test-mouse-latency-matrix.sh" "$@"
 ```
 
 `apply-cos-config.sh` is invoked with the `--same-class` flag
-when `MOUSE_CLASS == iperf-b`. The target-side echo daemon is
-assumed already running on 172.16.80.200:5212 (verified via
-preflight, §3.5).
+when `MOUSE_CLASS == iperf-b`. The target-side echo daemon on
+172.16.80.200:7 is the same one the cross-class default uses
+(verified via preflight, §3.5).
 
 **CoS apply is per-rep** (per existing harness behavior at
 `test-mouse-latency.sh:157`). Switching `MOUSE_CLASS` between
@@ -189,11 +184,15 @@ double-runs fail loudly instead of silently interleaving.
 ### 3.5 Preflight check
 
 Add a preflight step in `test-mouse-latency.sh` that probes the
-mouse port:
+mouse port. Uses `bash /dev/tcp` rather than `nc -zw1` because
+the source container doesn't ship netcat by default (cluster
+smoke v2 caught this: the original `nc` form aborted every rep
+with "command not found"):
 
 ```bash
-incus_exec "$SOURCE" timeout 1 nc -zw1 "$TARGET_V4" "$MOUSE_PORT" \
-    < /dev/null > /dev/null 2>&1 \
+incus_exec "$SOURCE" timeout 2 bash -c \
+    "exec 3<>/dev/tcp/${TARGET_V4}/${MOUSE_PORT}" \
+    > /dev/null 2>&1 \
     || { echo "ABORT: mouse echo not reachable on ${TARGET_V4}:${MOUSE_PORT}"; exit 1; }
 ```
 
@@ -215,10 +214,9 @@ Fails fast if echo daemon isn't up on the target port.
   terms.
 - `test/incus/test-mouse-latency-same-class.sh` — NEW; thin
   wrapper.
-- Echo daemon on **172.16.80.200** (the iperf-3 target host,
-  NOT cluster-userspace-host which is the source of test
-  traffic) — implementation approach decided at impl time
-  (option A vs B vs fallback C, see §3.3).
+- No new echo daemon required (v2 design): same-class wrapper
+  reuses the existing port 7 listener on 172.16.80.200 that the
+  cross-class default already exercises.
 - `docs/pr/929-same-class-harness/findings.md` — smoke results.
 
 ## 6. Test strategy
@@ -226,17 +224,18 @@ Fails fast if echo daemon isn't up on the target port.
 ### 6.1 Smoke
 
 ```bash
-MOUSE_PORT=5212 MOUSE_CLASS=iperf-b SHAPER_BPS=$((10*1000*1000*1000)) \
+ELEPHANT_PORT=5202 MOUSE_PORT=7 MOUSE_CLASS=iperf-b \
+SHAPER_BPS=$((10*1000*1000*1000)) \
     ./test/incus/test-mouse-latency.sh 0 1 60 /tmp/sm
 ```
 
 Asserts:
-- Preflight passes (echo reachable on 172.16.80.200:5212).
+- Preflight passes (echo reachable on 172.16.80.200:7).
 - `cos-apply.log` shows the same-class term applied.
 - **Firewall classifier verification (Codex R1)**: extract
   `show configuration | display set | match "filter
   bandwidth-output term 4"` from the post-apply config and
-  assert it contains `from destination-port 5212` and
+  assert it contains `from destination-port 7` and
   `forwarding-class iperf-b`. Don't rely on
   `show class-of-service interface` alone — that only verifies
   scheduler/shaper binding, not the firewall term ordering.
@@ -279,7 +278,7 @@ This dataset is the validation gate for #913/#918/#914/#920.
   **Verify post-apply by extracting the firewall config**:
   `show configuration | display set | match "filter
   bandwidth-output term 4"` and asserting it contains
-  `from destination-port 5212` and `forwarding-class iperf-b`
+  `from destination-port 7` and `forwarding-class iperf-b`
   (per §6.1). `show class-of-service interface` is supplemental
   only — it shows scheduler/shaper binding, not firewall term
   ordering.

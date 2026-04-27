@@ -171,8 +171,11 @@ fi
 # #929: preflight check that the echo daemon is reachable on the
 # configured MOUSE_PORT. Fails fast if same-class wrapper is run
 # without the operator standing up port 5212 on TARGET_V4.
-if ! incus_exec "$SOURCE" timeout 1 nc -zw1 "$TARGET_V4" "$MOUSE_PORT" \
-        < /dev/null > /dev/null 2>&1; then
+# Uses bash /dev/tcp rather than `nc -zw1` because the source
+# container doesn't ship netcat by default.
+if ! incus_exec "$SOURCE" timeout 2 bash -c \
+        "exec 3<>/dev/tcp/${TARGET_V4}/${MOUSE_PORT}" \
+        > /dev/null 2>&1; then
     echo "ABORT: mouse echo not reachable on ${TARGET_V4}:${MOUSE_PORT}" >&2
     echo "       (set MOUSE_PORT or stand up the echo daemon)" >&2
     exit 1
