@@ -28,6 +28,21 @@ if [[ $# -ne 1 ]]; then
     exit 1
 fi
 
+# #929: enforce mutual exclusion against concurrent matrix runs
+# (cross-class default vs same-class wrapper). Both call into this
+# script and both apply CoS, which is global mutable cluster state.
+# Concurrent runs would alternately overwrite each other's CoS
+# fixture and silently corrupt both datasets. flock -n fails fast
+# instead of waiting.
+LOCK_FILE="${TMPDIR:-/tmp}/test-mouse-latency-matrix.lock"
+exec 9>"$LOCK_FILE"
+flock -n 9 || {
+    echo "ABORT: another mouse-latency matrix is already running" >&2
+    echo "       (lock held on $LOCK_FILE)" >&2
+    echo "       wait for it to finish or kill it before retrying" >&2
+    exit 1
+}
+
 OUT_ROOT="$1"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DURATION=60          # per-rep probe seconds

@@ -29,9 +29,14 @@ PRIMARY="xpf-userspace-fw0"
 SECONDARY="xpf-userspace-fw1"
 SOURCE="cluster-userspace-host"
 TARGET_V4="172.16.80.200"
-ELEPHANT_PORT=5201
-MOUSE_PORT=7
-SHAPER_BPS=$((1 * 1000 * 1000 * 1000))  # 1 Gb/s for iperf-a
+# #929: env-var overridable so test-mouse-latency-same-class.sh
+# can route mice into the iperf-b class (port 5212) at the
+# 10 Gb/s shaper rate. SHAPER_BPS MUST move with ELEPHANT_PORT
+# because the cwnd-settle and collapse gates compare against it.
+ELEPHANT_PORT="${ELEPHANT_PORT:-5201}"
+MOUSE_PORT="${MOUSE_PORT:-7}"
+MOUSE_CLASS="${MOUSE_CLASS:-best-effort}"
+SHAPER_BPS="${SHAPER_BPS:-$((1 * 1000 * 1000 * 1000))}"  # default 1 Gb/s (iperf-a); same-class iperf-b sets 10 Gb/s
 SETTLE_BUDGET=20
 SLACK=10
 
@@ -155,8 +160,23 @@ incus_run file push "${SCRIPT_DIR}/mouse_latency_probe.py" \
 # already failed over before the rep starts, hard-coding fw0 would
 # attempt to apply on the secondary.
 PRE_PRIMARY=$(current_primary)
-"${SCRIPT_DIR}/apply-cos-config.sh" "${INCUS_REMOTE}:${PRE_PRIMARY}" \
+APPLY_COS_FLAGS=()
+if [[ "$MOUSE_CLASS" == "iperf-b" ]]; then
+    APPLY_COS_FLAGS+=(--same-class)
+fi
+"${SCRIPT_DIR}/apply-cos-config.sh" "${APPLY_COS_FLAGS[@]}" \
+    "${INCUS_REMOTE}:${PRE_PRIMARY}" \
     > "${OUT_DIR}/cos-apply.log" 2>&1
+
+# #929: preflight check that the echo daemon is reachable on the
+# configured MOUSE_PORT. Fails fast if same-class wrapper is run
+# without the operator standing up port 5212 on TARGET_V4.
+if ! incus_exec "$SOURCE" timeout 1 nc -zw1 "$TARGET_V4" "$MOUSE_PORT" \
+        < /dev/null > /dev/null 2>&1; then
+    echo "ABORT: mouse echo not reachable on ${TARGET_V4}:${MOUSE_PORT}" >&2
+    echo "       (set MOUSE_PORT or stand up the echo daemon)" >&2
+    exit 1
+fi
 
 # ---- step 3: RG state polling at 1 Hz (plan §4.5 step 3)
 RG_POLL_FILE="${OUT_DIR}/rg-state-poll.txt"
@@ -425,7 +445,11 @@ cat > "${OUT_DIR}/manifest.json" <<EOF
   "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "screen_engaged": $screen_engaged,
   "ha_transition_seen": $ha_seen,
-  "mpstat_avg_busy": "${mpstat_busy:-0}"
+  "mpstat_avg_busy": "${mpstat_busy:-0}",
+  "elephant_port": $ELEPHANT_PORT,
+  "mouse_port": $MOUSE_PORT,
+  "mouse_class": "$MOUSE_CLASS",
+  "shaper_bps": $SHAPER_BPS
 }
 EOF
 

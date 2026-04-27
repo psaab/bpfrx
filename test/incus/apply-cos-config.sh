@@ -27,9 +27,27 @@
 #
 set -euo pipefail
 
+# #929: --same-class flag selects the same-class iperf-b CoS
+# fixture (cos-iperf-same-class.set), which adds term 4 mapping
+# port 5212 → iperf-b. Default stays cross-class. Flag must be
+# parsed BEFORE the positional TARGET argument so it isn't
+# silently treated as a hostname.
+SAME_CLASS=0
+while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+        --same-class) SAME_CLASS=1; shift ;;
+        --) shift; break ;;
+        *) echo "unknown flag: $1" >&2; exit 2 ;;
+    esac
+done
+
 TARGET="${1:-loss:xpf-userspace-fw0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${SCRIPT_DIR}/cos-iperf-config.set"
+if [[ "$SAME_CLASS" -eq 1 ]]; then
+    CONFIG_FILE="${SCRIPT_DIR}/cos-iperf-same-class.set"
+else
+    CONFIG_FILE="${SCRIPT_DIR}/cos-iperf-config.set"
+fi
 REMOTE_SETS="/tmp/cos-iperf-sets.set"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
