@@ -1191,6 +1191,13 @@ pub(crate) struct BindingStatus {
     pub flow_cache_misses: u64,
     #[serde(rename = "flow_cache_evictions", default)]
     pub flow_cache_evictions: u64,
+    /// #918: collision-driven subset of `flow_cache_evictions`. An
+    /// insert that displaced a different-key entry from the LRU way
+    /// of a full set increments this; stale-on-lookup evictions do
+    /// not. Acceptance gate watches `collision_evictions / hits`
+    /// under load.
+    #[serde(rename = "flow_cache_collision_evictions", default)]
+    pub flow_cache_collision_evictions: u64,
     #[serde(rename = "session_hits", default)]
     pub session_hits: u64,
     #[serde(rename = "session_misses", default)]
@@ -1512,6 +1519,14 @@ pub(crate) struct BindingCountersSnapshot {
     pub tx_kick_latency_sum_ns: u64,
     #[serde(rename = "tx_kick_retry_count", default)]
     pub tx_kick_retry_count: u64,
+    /// #918: collision-driven subset of flow-cache evictions
+    /// (full-set LRU displacement). Surfaces hot-set thrash so
+    /// the post-merge acceptance gate (`collision_evictions /
+    /// hits < 1 %` under 100E100M load) is observable from the
+    /// standard binding-counter snapshot. `default` keeps pre-#918
+    /// consumers parseable — the field simply deserializes as 0.
+    #[serde(rename = "flow_cache_collision_evictions", default)]
+    pub flow_cache_collision_evictions: u64,
 }
 
 // #812 (plan §3.5a / §6.1 test #8): compile-time assertion that
@@ -1578,6 +1593,9 @@ impl From<&BindingStatus> for BindingCountersSnapshot {
             tx_kick_latency_count: b.tx_kick_latency_count,
             tx_kick_latency_sum_ns: b.tx_kick_latency_sum_ns,
             tx_kick_retry_count: b.tx_kick_retry_count,
+            // #918: flow under by-value u64; same Send/'static
+            // discipline as the other counters.
+            flow_cache_collision_evictions: b.flow_cache_collision_evictions,
         }
     }
 }

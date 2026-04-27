@@ -560,8 +560,11 @@ fn poll_binding(
         let mut rst_teardowns = core::mem::take(&mut binding.scratch_rst_teardowns);
         for (forward_key, nat) in rst_teardowns.drain(..) {
             // Evict from flow cache so stale entries aren't used after RST.
-            let idx = FlowCache::slot(&forward_key, binding.ifindex);
-            binding.flow_cache.entries[idx] = None;
+            // #918: 4-way set-associative cache requires walking the set
+            // for the matching key — `invalidate_slot` does that.
+            binding
+                .flow_cache
+                .invalidate_slot(&forward_key, binding.ifindex);
             teardown_tcp_rst_flow(
                 left,
                 binding,

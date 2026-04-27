@@ -1789,6 +1789,12 @@ pub(super) struct BindingLiveState {
     pub(super) flow_cache_hits: AtomicU64,
     pub(super) flow_cache_misses: AtomicU64,
     pub(super) flow_cache_evictions: AtomicU64,
+    /// #918: subset of `flow_cache_evictions` driven by full-set LRU
+    /// displacement (i.e. an insert kicked out a different-key entry
+    /// from the LRU way). Surfaces hot-set thrash distinctly from
+    /// stale-on-lookup evictions so the acceptance gate
+    /// (`collision_evictions / hits < 1 %`) is observable at runtime.
+    pub(super) flow_cache_collision_evictions: AtomicU64,
     pub(super) session_hits: AtomicU64,
     pub(super) session_misses: AtomicU64,
     pub(super) session_creates: AtomicU64,
@@ -1981,6 +1987,7 @@ impl BindingLiveState {
             flow_cache_hits: AtomicU64::new(0),
             flow_cache_misses: AtomicU64::new(0),
             flow_cache_evictions: AtomicU64::new(0),
+            flow_cache_collision_evictions: AtomicU64::new(0),
             session_hits: AtomicU64::new(0),
             session_misses: AtomicU64::new(0),
             session_creates: AtomicU64::new(0),
@@ -2194,6 +2201,9 @@ impl BindingLiveState {
             flow_cache_hits: self.flow_cache_hits.load(Ordering::Relaxed),
             flow_cache_misses: self.flow_cache_misses.load(Ordering::Relaxed),
             flow_cache_evictions: self.flow_cache_evictions.load(Ordering::Relaxed),
+            flow_cache_collision_evictions: self
+                .flow_cache_collision_evictions
+                .load(Ordering::Relaxed),
             session_hits: self.session_hits.load(Ordering::Relaxed),
             session_misses: self.session_misses.load(Ordering::Relaxed),
             session_creates: self.session_creates.load(Ordering::Relaxed),
@@ -2585,5 +2595,16 @@ pub(super) fn update_binding_debug_state(binding: &mut BindingWorker) {
             .flow_cache_evictions
             .fetch_add(binding.flow_cache.evictions, Ordering::Relaxed);
         binding.flow_cache.evictions = 0;
+    }
+    // #918: surface collision-driven evictions distinctly from
+    // stale-on-lookup evictions so the post-merge acceptance gate
+    // (`collision_evictions / hits < 1 %` under 100E100M load) is
+    // observable from the standard binding-counter snapshot.
+    if binding.flow_cache.collision_evictions != 0 {
+        binding
+            .live
+            .flow_cache_collision_evictions
+            .fetch_add(binding.flow_cache.collision_evictions, Ordering::Relaxed);
+        binding.flow_cache.collision_evictions = 0;
     }
 }
