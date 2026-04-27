@@ -4716,17 +4716,39 @@ fn cos_queue_pop_front_inner(
 /// vtime=3000. Restore A: vtime=3000. Z's vtime contribution
 /// preserved across the rollback.
 fn cos_queue_clear_orphan_snapshot_after_drop(queue: &mut CoSQueueRuntime) {
-    let popped = queue.pop_snapshot_stack.pop();
-    if popped.is_none() {
+    let Some(orphan) = queue.pop_snapshot_stack.pop() else {
         return;
-    }
+    };
     // queue.queue_vtime here reflects the dropped item's pop
     // advance (already applied in cos_queue_pop_front_inner).
     // Clamp remaining snapshots to preserve it across rollback.
     let z_committed_vtime = queue.queue_vtime;
+    // #927: also preserve the dropped item's bucket-frontier
+    // contribution. The dropped item's served_finish equals
+    // `orphan.pre_pop_head_finish` (served_finish is read from
+    // `flow_bucket_head_finish_bytes[bucket]` BEFORE the
+    // post-pop overwrite at the orphan's pop site, so it
+    // matches the snapshot's pre_pop_head_finish capture).
+    // Older same-bucket snapshots were captured before the
+    // dropped item's pop, so their pre_pop_head/tail_finish
+    // do not include the dropped item's frontier. When such a
+    // snapshot is later restored via the `was_empty` snapshot
+    // path in `cos_queue_push_front`, the bucket would be
+    // re-anchored at a stale (lower) finish-time — competing
+    // active buckets could be incorrectly scheduled before
+    // it. Bumping to `orphan_served_finish` via .max() is
+    // monotone (only raises) and never crosses a committed
+    // boundary, so it is safe across all rollback orderings.
+    let orphan_served_finish = orphan.pre_pop_head_finish;
     for snap in queue.pop_snapshot_stack.iter_mut() {
         if snap.pre_pop_queue_vtime < z_committed_vtime {
             snap.pre_pop_queue_vtime = z_committed_vtime;
+        }
+        if snap.bucket == orphan.bucket {
+            snap.pre_pop_head_finish =
+                snap.pre_pop_head_finish.max(orphan_served_finish);
+            snap.pre_pop_tail_finish =
+                snap.pre_pop_tail_finish.max(orphan_served_finish);
         }
     }
 }
@@ -12049,6 +12071,102 @@ mod tests {
              that were originally scheduled in the [3000, 4500) \
              window — exactly the temporal inversion #913 was \
              supposed to prevent."
+        );
+    }
+
+    /// #927: drained-bucket scenario. Bucket A holds [A1=1000B,
+    /// A2=2000B], bucket C holds [C=2500B]. Scratch builder pops
+    /// A1+C+A2 in that order. A2's pop drains bucket A (last item).
+    /// A2 is then dropped (frame too big, etc.). The orphan-cleanup
+    /// helper must preserve A2's served_finish = 3000 across the
+    /// restore so that A1's restored frontier is ≥ 3000. Otherwise
+    /// the `was_empty` snapshot path in `cos_queue_push_front`
+    /// would restore A.head=1000 (the snap_1.pre_pop_head_finish
+    /// captured before A2's pop), and MQFQ would pop A1 BEFORE
+    /// C — inverting their original scheduling order.
+    #[test]
+    fn mqfq_drained_bucket_orphan_drop_preserves_served_finish() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
+
+        // Bucket A: [A1=1000, A2=2000]. Bucket C: [C=2500].
+        // Two distinct flow keys so they hash to distinct buckets.
+        cos_queue_push_back(queue, test_flow_cos_item(8001, 1000));
+        cos_queue_push_back(queue, test_flow_cos_item(8001, 2000));
+        cos_queue_push_back(queue, test_flow_cos_item(8002, 2500));
+        let key_a = test_session_key(8001, 5201);
+        let key_c = test_session_key(8002, 5201);
+        let bucket_a = cos_flow_bucket_index(0, Some(&key_a));
+        let bucket_c = cos_flow_bucket_index(0, Some(&key_c));
+        assert_ne!(
+            bucket_a, bucket_c,
+            "test setup: ports 8001/8002 must hash to distinct buckets"
+        );
+
+        // Pre-pop frontier:
+        //   A.head=1000 (A1 finish), A.tail=3000 (A2 finish).
+        //   C.head=C.tail=2500.
+        assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_a], 1000);
+        assert_eq!(queue.flow_bucket_tail_finish_bytes[bucket_a], 3000);
+        assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_c], 2500);
+
+        // Pop A1: head_finish[A] advances to 3000 (A2 finish-time).
+        let popped_a1 = cos_queue_pop_front(queue).expect("pop A1");
+        assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_a], 3000);
+
+        // Pop C: MQFQ picks min-finish-first; with A.head=3000
+        // and C.head=2500, C.head < A.head so C is the next pop.
+        // After pop: bucket C empty; C.head_finish reset to 0.
+        let popped_c = cos_queue_pop_front(queue).expect("pop C");
+        assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_c], 0);
+
+        // Pop A2 (last in A): bucket A drains, A.head_finish reset
+        // to 0. queue_vtime reflects all three pops.
+        let _popped_a2 = cos_queue_pop_front(queue).expect("pop A2");
+        assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_a], 0);
+        assert_eq!(queue.pop_snapshot_stack.len(), 3);
+
+        // Simulate A2 dropped (e.g., frame too big to transmit).
+        cos_queue_clear_orphan_snapshot_after_drop(queue);
+        assert_eq!(queue.pop_snapshot_stack.len(), 2);
+
+        // Restore C via push_front: bucket C is empty so the
+        // `was_empty` snapshot path applies. C.head should restore
+        // to snap_C.pre_pop_head_finish = 2500.
+        cos_queue_push_front(queue, popped_c);
+        assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_c], 2500);
+
+        // Restore A1 via push_front: bucket A is empty so the
+        // `was_empty` snapshot path applies. WITHOUT #927, A.head
+        // would restore to snap_1.pre_pop_head_finish = 1000 —
+        // inverting MQFQ order vs C (1000 < 2500). WITH #927, the
+        // orphan-cleanup helper bumped snap_1.pre_pop_head_finish
+        // up to A2's served_finish = 3000, so the restored A.head
+        // = 3000 > C.head = 2500 — MQFQ correctly picks C first.
+        cos_queue_push_front(queue, popped_a1);
+        assert!(
+            queue.flow_bucket_head_finish_bytes[bucket_a]
+                > queue.flow_bucket_head_finish_bytes[bucket_c],
+            "#927 regression: A.head ({}) must be strictly greater than \
+             C.head ({}) so MQFQ picks C first. Without the orphan-cleanup \
+             same-bucket frontier bump, A.head would restore to 1000 and \
+             A1 would pop before C — inverting their original schedule.",
+            queue.flow_bucket_head_finish_bytes[bucket_a],
+            queue.flow_bucket_head_finish_bytes[bucket_c],
         );
     }
 
