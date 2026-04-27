@@ -1828,6 +1828,8 @@ mod tests {
             umem_total_frames: 24,
             umem_inflight_frames: 25,
             tx_ring_capacity: 26,
+            // #918: per-set LRU collision-eviction counter.
+            flow_cache_collision_evictions: 27,
         };
         let value: serde_json::Value =
             serde_json::to_value(&snap).expect("serialize snapshot to Value");
@@ -1858,6 +1860,14 @@ mod tests {
             "tx_kick_latency_count",
             "tx_kick_latency_sum_ns",
             "tx_kick_retry_count",
+            // #878: UMEM / TX-ring utilization wire keys (Copilot
+            // A.1: must be in the asserted list since the comment
+            // above claims wire-key assertions cover them).
+            "umem_total_frames",
+            "umem_inflight_frames",
+            "tx_ring_capacity",
+            // #918: per-set LRU collision-eviction counter wire key.
+            "flow_cache_collision_evictions",
         ] {
             assert!(
                 obj.contains_key(key),
@@ -1946,6 +1956,8 @@ mod tests {
             umem_total_frames: 12_288,
             umem_inflight_frames: 4_096,
             tx_ring_capacity: 2_048,
+            // #918: per-set LRU collision-eviction counter.
+            flow_cache_collision_evictions: 17,
         };
         let json = serde_json::to_string(&snap).expect("serialize snapshot");
         let back: BindingCountersSnapshot =

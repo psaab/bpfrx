@@ -634,6 +634,10 @@ type BindingStatus struct {
 	FlowCacheHits                     uint64    `json:"flow_cache_hits,omitempty"`
 	FlowCacheMisses                   uint64    `json:"flow_cache_misses,omitempty"`
 	FlowCacheEvictions                uint64    `json:"flow_cache_evictions,omitempty"`
+	// #918: collision-driven subset of flow_cache_evictions (full-set
+	// LRU displacement vs stale-on-lookup eviction). Acceptance gate
+	// watches collision_evictions / hits under load.
+	FlowCacheCollisionEvictions       uint64    `json:"flow_cache_collision_evictions,omitempty"`
 	SessionHits                       uint64    `json:"session_hits,omitempty"`
 	SessionMisses                     uint64    `json:"session_misses,omitempty"`
 	SessionCreates                    uint64    `json:"session_creates,omitempty"`

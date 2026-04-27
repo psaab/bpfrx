@@ -4241,6 +4241,7 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) flow_cache_hits: u64,
     pub(crate) flow_cache_misses: u64,
     pub(crate) flow_cache_evictions: u64,
+    pub(crate) flow_cache_collision_evictions: u64,
     pub(crate) session_hits: u64,
     pub(crate) session_misses: u64,
     pub(crate) session_creates: u64,
