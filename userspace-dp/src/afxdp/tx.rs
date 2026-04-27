@@ -8293,34 +8293,17 @@ mod tests {
         }
         assert_eq!(total_items, 2);
 
-        // Now enqueue a new tiny flow Y. Y must anchor at a
-        // finish-time that respects the demoted backlog —
-        // specifically Y.head_finish ≥ queue_vtime so MQFQ
-        // does NOT pop Y before A or B.
-        let key_y = test_session_key(8099, 5201);
-        let bucket_y = cos_flow_bucket_index(0, Some(&key_y));
-        assert!(bucket_y != bucket_a && bucket_y != bucket_b);
-        cos_queue_push_back(queue, test_flow_cos_item(8099, 100));
-        let y_head = queue.flow_bucket_head_finish_bytes[bucket_y];
-
-        // Without the #926 fix, queue_vtime would have inflated
-        // to 1500 + 1500 = 3000 across drain_all, and Y's
-        // anchor would be max(0, 3000) + 100 = 3100 — fine on
-        // its own merits but the demoted backlog A/B would
-        // have re-anchored at 3000 + 1500 = 4500 each, so Y's
-        // 3100 would JUMP AHEAD of A's 4500 and B's 4500. WITH
-        // the fix, the demoted backlog stays at its original
-        // pre_head values (1500 each) and Y anchors at
-        // max(0, 0) + 100 = 100 < pre_head — Y still doesn't
-        // jump ahead because pre_head_{a,b} > Y.head.
-        assert!(
-            y_head <= pre_head_a && y_head <= pre_head_b,
-            "#926 regression: new flow Y (head={y_head}) must NOT \
-             anchor ahead of demoted backlog A (head={pre_head_a}) \
-             or B (head={pre_head_b}). Without the success-path \
-             frontier-restore, queue_vtime would have inflated and Y \
-             would jump ahead. y_head must be ≤ both pre_head values."
-        );
+        // The frontier-preservation assertions above are the
+        // load-bearing test (Codex code review caught that an
+        // earlier "Y does not jump ahead" assertion was
+        // logically muddled — without the fix, the four
+        // assert_eq calls already FAIL at the queue_vtime / head /
+        // tail checks; demote_prepared without snapshot/restore
+        // leaves queue_vtime=3000 and head_a=head_b=4500, all
+        // mismatching the captured pre-state). The Y-anchor
+        // behavior at this scenario is identical with-or-without
+        // the fix (Y is small enough to anchor below A/B in
+        // both cases) so it's not a useful gate.
     }
 
     #[test]
