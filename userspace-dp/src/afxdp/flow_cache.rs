@@ -3,7 +3,19 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 const FLOW_CACHE_SIZE: usize = 4096;
-const FLOW_CACHE_MASK: usize = FLOW_CACHE_SIZE - 1;
+// #918: 4-way set-associative layout. Total entry count stays
+// at 4096 (1024 sets × 4 ways) so memory footprint is unchanged
+// in the entries array; the new `lru: [u8; 4]` per set adds 4 KB
+// of bookkeeping. Per-set scan touches ~6 cache lines (4 × ~96 B
+// + 4 B lru) which is prefetcher-friendly. Compare to the old
+// 1-way direct-mapped layout where any 2 flows that hashed to the
+// same slot evicted each other on every packet.
+const FLOW_CACHE_WAYS: usize = 4;
+const FLOW_CACHE_SETS: usize = FLOW_CACHE_SIZE / FLOW_CACHE_WAYS;
+const FLOW_CACHE_SET_MASK: usize = FLOW_CACHE_SETS - 1;
+const _: () = assert!(FLOW_CACHE_SETS.is_power_of_two());
+const _: () = assert!(FLOW_CACHE_WAYS == 4);
+const _: () = assert!(FLOW_CACHE_SETS * FLOW_CACHE_WAYS == FLOW_CACHE_SIZE);
 
 /// Maximum number of redundancy groups for epoch-based cache invalidation.
 pub(super) const MAX_RG_EPOCHS: usize = 16;
@@ -206,32 +218,96 @@ impl FlowCacheEntry {
     }
 }
 
-/// Per-worker flow cache. Direct-mapped, indexed by hash of 5-tuple.
+/// Per-worker flow cache. 4-way set-associative with LRU eviction
+/// within each set (#918). Layout: `FLOW_CACHE_SETS = 1024` sets,
+/// each holding `FLOW_CACHE_WAYS = 4` ways. The `entries` vec
+/// is stored row-major: set `s` occupies indices
+/// `[s * WAYS, s * WAYS + WAYS)`. Per set, `lru[s]` is a
+/// permutation of `[0, 1, 2, 3]` where index 0 is MRU and
+/// index 3 is LRU.
 pub(super) struct FlowCache {
     pub(super) entries: Vec<Option<FlowCacheEntry>>,
+    /// Per-set LRU permutation. `lru[s][0]` = MRU way, `lru[s][3]` = LRU way.
+    /// Initialized to `[0, 1, 2, 3]` for every set so eviction order on a
+    /// fresh set is deterministic.
+    pub(super) lru: Vec<[u8; FLOW_CACHE_WAYS]>,
     pub(super) hits: u64,
     pub(super) misses: u64,
     pub(super) evictions: u64,
+    /// Collision evictions = inserts that displaced a different-key entry
+    /// (i.e. the set was full and we kicked out the LRU way). Tracked
+    /// separately from `evictions` (which also counts stale-on-lookup
+    /// evictions) for hot-set diagnosis.
+    pub(super) collision_evictions: u64,
 }
 
 impl FlowCache {
     pub(super) fn new() -> Self {
         Self {
             entries: (0..FLOW_CACHE_SIZE).map(|_| None).collect(),
+            lru: vec![[0u8, 1, 2, 3]; FLOW_CACHE_SETS],
             hits: 0,
             misses: 0,
             evictions: 0,
+            collision_evictions: 0,
         }
     }
 
+    /// Set index = low bits of the FxHasher-produced flow hash.
+    /// Same hash function as the prior 1-way layout to preserve
+    /// behavior for non-collision keys.
     #[inline]
-    pub(super) fn slot(key: &crate::session::SessionKey, ingress_ifindex: i32) -> usize {
+    pub(super) fn set_index(key: &crate::session::SessionKey, ingress_ifindex: i32) -> usize {
         use std::hash::{Hash, Hasher};
 
         let mut hasher = rustc_hash::FxHasher::default();
         key.hash(&mut hasher);
         (ingress_ifindex as u32).hash(&mut hasher);
-        hasher.finish() as usize & FLOW_CACHE_MASK
+        hasher.finish() as usize & FLOW_CACHE_SET_MASK
+    }
+
+    /// Promote `way` to the MRU position in `lru[set]`, shifting the
+    /// preceding entries down by one. Branchless 3-element shuffle.
+    #[inline]
+    fn promote_lru(&mut self, set: usize, way: u8) {
+        let row = &mut self.lru[set];
+        // Find current position of `way`.
+        let mut pos = 0usize;
+        for i in 0..FLOW_CACHE_WAYS {
+            if row[i] == way {
+                pos = i;
+                break;
+            }
+        }
+        if pos == 0 {
+            return; // already MRU
+        }
+        // Shift row[0..pos] down by one, write `way` at row[0].
+        for i in (1..=pos).rev() {
+            row[i] = row[i - 1];
+        }
+        row[0] = way;
+    }
+
+    /// Demote `way` to the LRU position in `lru[set]`, shifting the
+    /// following entries up by one.
+    #[inline]
+    fn demote_lru(&mut self, set: usize, way: u8) {
+        let row = &mut self.lru[set];
+        let mut pos = 0usize;
+        for i in 0..FLOW_CACHE_WAYS {
+            if row[i] == way {
+                pos = i;
+                break;
+            }
+        }
+        if pos == FLOW_CACHE_WAYS - 1 {
+            return; // already LRU
+        }
+        for i in pos..(FLOW_CACHE_WAYS - 1) {
+            row[i] = row[i + 1];
+        }
+        row[FLOW_CACHE_WAYS - 1] = way;
     }
 
     #[inline]
@@ -242,36 +318,53 @@ impl FlowCache {
         now_secs: u64,
         rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
     ) -> Option<&FlowCacheEntry> {
-        let idx = Self::slot(key, lookup.ingress_ifindex);
-        if let Some(entry) = &self.entries[idx] {
-            if entry.key == *key
-                && entry.ingress_ifindex == lookup.ingress_ifindex
-                && entry.stamp.config_generation == lookup.config_generation
-                && entry.stamp.fib_generation == lookup.fib_generation
-            {
-                // Epoch-based RG invalidation: if the owner RG's epoch has
-                // advanced since this entry was inserted, treat as a miss.
+        let set = Self::set_index(key, lookup.ingress_ifindex);
+        let base = set * FLOW_CACHE_WAYS;
+        // Key-first, generation-second: scan the set for a key match.
+        // A key-match with stale generation is a guaranteed-bad cache
+        // entry under the §3.4.2 dedup invariant (at most one way per
+        // set holds a given key), so it's safe to evict immediately
+        // and return MISS.
+        for way in 0..FLOW_CACHE_WAYS {
+            let entry_idx = base + way;
+            if let Some(entry) = &self.entries[entry_idx] {
+                if entry.key != *key || entry.ingress_ifindex != lookup.ingress_ifindex {
+                    continue;
+                }
+                // Key match. Validate generation/epoch/lease.
+                if entry.stamp.config_generation != lookup.config_generation
+                    || entry.stamp.fib_generation != lookup.fib_generation
+                {
+                    self.entries[entry_idx] = None;
+                    self.evictions += 1;
+                    self.demote_lru(set, way as u8);
+                    self.misses += 1;
+                    return None;
+                }
                 let owner = entry.stamp.owner_rg_id;
                 if owner > 0 && (owner as usize) < MAX_RG_EPOCHS {
                     let current_epoch = rg_epochs[owner as usize].load(Ordering::Relaxed);
                     if current_epoch != entry.stamp.owner_rg_epoch {
-                        self.misses += 1;
-                        // Evict stale entry.
-                        self.entries[idx] = None;
+                        self.entries[entry_idx] = None;
                         self.evictions += 1;
+                        self.demote_lru(set, way as u8);
+                        self.misses += 1;
                         return None;
                     }
                 }
                 if entry.stamp.owner_rg_lease_until != 0
                     && now_secs > entry.stamp.owner_rg_lease_until
                 {
-                    self.misses += 1;
-                    self.entries[idx] = None;
+                    self.entries[entry_idx] = None;
                     self.evictions += 1;
+                    self.demote_lru(set, way as u8);
+                    self.misses += 1;
                     return None;
                 }
+                // Fresh hit.
+                self.promote_lru(set, way as u8);
                 self.hits += 1;
-                return self.entries[idx].as_ref();
+                return self.entries[entry_idx].as_ref();
             }
         }
         self.misses += 1;
@@ -279,11 +372,42 @@ impl FlowCache {
     }
 
     pub(super) fn insert(&mut self, entry: FlowCacheEntry) {
-        let idx = Self::slot(&entry.key, entry.ingress_ifindex);
-        if self.entries[idx].is_some() {
-            self.evictions += 1;
+        let set = Self::set_index(&entry.key, entry.ingress_ifindex);
+        let base = set * FLOW_CACHE_WAYS;
+        // Dedup-on-insert: if this set already holds the same key
+        // (e.g. a stale entry that the caller is about to overwrite
+        // with a fresh decision), find-and-replace that way rather
+        // than allocating a new way. Preserves the "at most one way
+        // per set holds a given key" invariant the lookup path relies
+        // on.
+        for way in 0..FLOW_CACHE_WAYS {
+            let entry_idx = base + way;
+            if let Some(existing) = &self.entries[entry_idx] {
+                if existing.key == entry.key
+                    && existing.ingress_ifindex == entry.ingress_ifindex
+                {
+                    self.entries[entry_idx] = Some(entry);
+                    self.promote_lru(set, way as u8);
+                    return;
+                }
+            }
         }
-        self.entries[idx] = Some(entry);
+        // No matching key: prefer an empty way; otherwise evict LRU.
+        for way in 0..FLOW_CACHE_WAYS {
+            let entry_idx = base + way;
+            if self.entries[entry_idx].is_none() {
+                self.entries[entry_idx] = Some(entry);
+                self.promote_lru(set, way as u8);
+                return;
+            }
+        }
+        // Set is full — evict the LRU way.
+        let lru_way = self.lru[set][FLOW_CACHE_WAYS - 1];
+        let entry_idx = base + (lru_way as usize);
+        self.entries[entry_idx] = Some(entry);
+        self.evictions += 1;
+        self.collision_evictions += 1;
+        self.promote_lru(set, lru_way);
     }
 
     /// Nuclear invalidation — clears every entry. Reserved for rare events
@@ -294,6 +418,11 @@ impl FlowCache {
         for entry in &mut self.entries {
             *entry = None;
         }
+        // LRU permutations are reset to canonical order; eviction
+        // order on the next inserts to a cleared set is deterministic.
+        for row in &mut self.lru {
+            *row = [0, 1, 2, 3];
+        }
     }
 
     pub(super) fn invalidate_slot(
@@ -301,8 +430,17 @@ impl FlowCache {
         key: &crate::session::SessionKey,
         ingress_ifindex: i32,
     ) {
-        let idx = Self::slot(key, ingress_ifindex);
-        self.entries[idx] = None;
+        let set = Self::set_index(key, ingress_ifindex);
+        let base = set * FLOW_CACHE_WAYS;
+        for way in 0..FLOW_CACHE_WAYS {
+            let entry_idx = base + way;
+            if let Some(existing) = &self.entries[entry_idx] {
+                if existing.key == *key && existing.ingress_ifindex == ingress_ifindex {
+                    self.entries[entry_idx] = None;
+                    self.demote_lru(set, way as u8);
+                }
+            }
+        }
     }
 }
 
@@ -927,5 +1065,305 @@ mod tests {
         assert_eq!(entry.metadata.owner_rg_id, 2);
         assert!(entry.descriptor.fabric_redirect);
         assert_eq!(entry.descriptor.target_binding_index, Some(3));
+    }
+
+    // ----------------------------------------------------------------
+    // #918: 4-way set-associative LRU tests
+    // ----------------------------------------------------------------
+
+    /// Synthesize a key whose `set_index()` matches `target_set` so
+    /// tests can exercise the full set-collision pipeline rather than
+    /// rely on harness chance.
+    fn key_in_set(target_set: usize, salt: u16) -> crate::session::SessionKey {
+        // Iterate src_port until we land in `target_set`. FxHasher is
+        // deterministic, so this terminates in O(SETS) on average.
+        // Inclusive range covers the full 16-bit port space.
+        for port in salt..=u16::MAX {
+            let key = crate::session::SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 1, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 50, 200)),
+                src_port: port,
+                dst_port: 443,
+            };
+            if FlowCache::set_index(&key, 7) == target_set {
+                return key;
+            }
+        }
+        panic!("could not find key in set {target_set}");
+    }
+
+    #[test]
+    fn flow_cache_4way_no_eviction_under_4_distinct_keys_in_same_set() {
+        let rg_epochs = default_rg_epochs();
+        let mut cache = FlowCache::new();
+        let stamp = FlowCacheStamp {
+            config_generation: 1,
+            fib_generation: 1,
+            owner_rg_id: 0,
+            owner_rg_epoch: 0,
+            owner_rg_lease_until: 0,
+        };
+        let target_set = 42;
+        let mut keys = Vec::new();
+        let mut salt = 0u16;
+        while keys.len() < 4 {
+            let key = key_in_set(target_set, salt);
+            salt = key.src_port + 1;
+            if !keys.iter().any(|k: &crate::session::SessionKey| k == &key) {
+                keys.push(key);
+            }
+        }
+        for key in &keys {
+            cache.insert(make_entry(key.clone(), stamp, 0));
+        }
+        assert_eq!(
+            cache.collision_evictions, 0,
+            "4 distinct keys in same set must not collision-evict"
+        );
+        // All 4 lookups should hit.
+        for key in &keys {
+            let lookup = FlowCacheLookup {
+                ingress_ifindex: 7,
+                config_generation: 1,
+                fib_generation: 1,
+            };
+            assert!(cache.lookup(key, lookup, 0, &rg_epochs).is_some());
+        }
+    }
+
+    #[test]
+    fn flow_cache_4way_lru_evicts_oldest_on_5th_insert() {
+        let rg_epochs = default_rg_epochs();
+        let mut cache = FlowCache::new();
+        let stamp = FlowCacheStamp {
+            config_generation: 1,
+            fib_generation: 1,
+            owner_rg_id: 0,
+            owner_rg_epoch: 0,
+            owner_rg_lease_until: 0,
+        };
+        let target_set = 99;
+        let mut keys = Vec::new();
+        let mut salt = 0u16;
+        while keys.len() < 5 {
+            let key = key_in_set(target_set, salt);
+            salt = key.src_port + 1;
+            if !keys.iter().any(|k: &crate::session::SessionKey| k == &key) {
+                keys.push(key);
+            }
+        }
+        // Insert 4 keys (set fills).
+        for key in &keys[..4] {
+            cache.insert(make_entry(key.clone(), stamp, 0));
+        }
+        assert_eq!(cache.collision_evictions, 0);
+        // Insert 5th: must collision-evict the LRU (= keys[0], inserted first).
+        cache.insert(make_entry(keys[4].clone(), stamp, 0));
+        assert_eq!(cache.collision_evictions, 1);
+        // keys[0] must be gone, keys[1..=4] present.
+        let lookup = FlowCacheLookup {
+            ingress_ifindex: 7,
+            config_generation: 1,
+            fib_generation: 1,
+        };
+        assert!(
+            cache.lookup(&keys[0], lookup, 0, &rg_epochs).is_none(),
+            "LRU way (keys[0]) must have been evicted"
+        );
+        for key in &keys[1..=4] {
+            assert!(
+                cache.lookup(key, lookup, 0, &rg_epochs).is_some(),
+                "remaining 4 keys must still hit"
+            );
+        }
+    }
+
+    #[test]
+    fn flow_cache_4way_lookup_promotes_to_mru() {
+        let rg_epochs = default_rg_epochs();
+        let mut cache = FlowCache::new();
+        let stamp = FlowCacheStamp {
+            config_generation: 1,
+            fib_generation: 1,
+            owner_rg_id: 0,
+            owner_rg_epoch: 0,
+            owner_rg_lease_until: 0,
+        };
+        let target_set = 200;
+        let mut keys = Vec::new();
+        let mut salt = 0u16;
+        while keys.len() < 5 {
+            let key = key_in_set(target_set, salt);
+            salt = key.src_port + 1;
+            if !keys.iter().any(|k: &crate::session::SessionKey| k == &key) {
+                keys.push(key);
+            }
+        }
+        // Insert 4 keys (now LRU-order: keys[0] = LRU, keys[3] = MRU).
+        for key in &keys[..4] {
+            cache.insert(make_entry(key.clone(), stamp, 0));
+        }
+        // Look up keys[0] — should promote it to MRU.
+        let lookup = FlowCacheLookup {
+            ingress_ifindex: 7,
+            config_generation: 1,
+            fib_generation: 1,
+        };
+        assert!(cache.lookup(&keys[0], lookup, 0, &rg_epochs).is_some());
+        // Insert 5th: now keys[1] is LRU (since keys[0] was promoted).
+        cache.insert(make_entry(keys[4].clone(), stamp, 0));
+        assert_eq!(cache.collision_evictions, 1);
+        assert!(
+            cache.lookup(&keys[0], lookup, 0, &rg_epochs).is_some(),
+            "keys[0] was promoted, must still be in cache"
+        );
+        assert!(
+            cache.lookup(&keys[1], lookup, 0, &rg_epochs).is_none(),
+            "keys[1] became LRU after the promotion, must have been evicted"
+        );
+    }
+
+    #[test]
+    fn flow_cache_4way_invalidate_clears_only_matching_way() {
+        let rg_epochs = default_rg_epochs();
+        let mut cache = FlowCache::new();
+        let stamp = FlowCacheStamp {
+            config_generation: 1,
+            fib_generation: 1,
+            owner_rg_id: 0,
+            owner_rg_epoch: 0,
+            owner_rg_lease_until: 0,
+        };
+        let target_set = 300;
+        let mut keys = Vec::new();
+        let mut salt = 0u16;
+        while keys.len() < 4 {
+            let key = key_in_set(target_set, salt);
+            salt = key.src_port + 1;
+            if !keys.iter().any(|k: &crate::session::SessionKey| k == &key) {
+                keys.push(key);
+            }
+        }
+        for key in &keys {
+            cache.insert(make_entry(key.clone(), stamp, 0));
+        }
+        cache.invalidate_slot(&keys[1], 7);
+        let lookup = FlowCacheLookup {
+            ingress_ifindex: 7,
+            config_generation: 1,
+            fib_generation: 1,
+        };
+        assert!(
+            cache.lookup(&keys[1], lookup, 0, &rg_epochs).is_none(),
+            "invalidated key must miss"
+        );
+        for (i, key) in keys.iter().enumerate() {
+            if i == 1 {
+                continue;
+            }
+            assert!(
+                cache.lookup(key, lookup, 0, &rg_epochs).is_some(),
+                "non-invalidated keys must still hit"
+            );
+        }
+    }
+
+    /// Codex+Gemini R2 follow-up: explicitly exercise the §3.4.2
+    /// dedup-on-insert path. Insert stale-generation entry, then
+    /// fresh-generation entry with the same key — the existing way
+    /// must be replaced and promoted to MRU rather than allocating
+    /// a new way.
+    #[test]
+    fn flow_cache_4way_dedup_replaces_existing_and_promotes() {
+        let rg_epochs = default_rg_epochs();
+        let mut cache = FlowCache::new();
+        let key = make_key();
+        let stale_stamp = FlowCacheStamp {
+            config_generation: 1,
+            fib_generation: 1,
+            owner_rg_id: 0,
+            owner_rg_epoch: 0,
+            owner_rg_lease_until: 0,
+        };
+        let fresh_stamp = FlowCacheStamp {
+            config_generation: 2, // bumped
+            fib_generation: 1,
+            owner_rg_id: 0,
+            owner_rg_epoch: 0,
+            owner_rg_lease_until: 0,
+        };
+        cache.insert(make_entry(key.clone(), stale_stamp, 0));
+        // Re-insert with fresh stamp via insert(): dedup path replaces
+        // the existing way, no eviction counted.
+        let evictions_before = cache.evictions;
+        cache.insert(make_entry(key.clone(), fresh_stamp, 0));
+        assert_eq!(
+            cache.evictions, evictions_before,
+            "dedup-replace must not increment evictions counter"
+        );
+        // Lookup at fresh generation must hit (proves the entry was
+        // overwritten with fresh data, not the stale entry that would
+        // have been evicted on lookup).
+        let lookup = FlowCacheLookup {
+            ingress_ifindex: 7,
+            config_generation: 2,
+            fib_generation: 1,
+        };
+        assert!(
+            cache.lookup(&key, lookup, 0, &rg_epochs).is_some(),
+            "fresh-stamp lookup must hit after dedup-replace"
+        );
+    }
+
+    /// Codex+Gemini R2 follow-up: verify the LRU permutation is
+    /// always a permutation of [0,1,2,3] across any sequence of
+    /// inserts/lookups/invalidates. Catches off-by-one shift errors.
+    #[test]
+    fn flow_cache_4way_lru_permutation_invariant_holds() {
+        let rg_epochs = default_rg_epochs();
+        let mut cache = FlowCache::new();
+        let stamp = FlowCacheStamp {
+            config_generation: 1,
+            fib_generation: 1,
+            owner_rg_id: 0,
+            owner_rg_epoch: 0,
+            owner_rg_lease_until: 0,
+        };
+        let target_set = 500;
+        let mut keys = Vec::new();
+        let mut salt = 0u16;
+        while keys.len() < 6 {
+            let key = key_in_set(target_set, salt);
+            salt = key.src_port + 1;
+            if !keys.iter().any(|k: &crate::session::SessionKey| k == &key) {
+                keys.push(key);
+            }
+        }
+        let lookup = FlowCacheLookup {
+            ingress_ifindex: 7,
+            config_generation: 1,
+            fib_generation: 1,
+        };
+        // Hammer the set with mixed inserts/lookups/invalidates.
+        for (i, key) in keys.iter().enumerate() {
+            cache.insert(make_entry(key.clone(), stamp, 0));
+            if i % 2 == 0 {
+                let _ = cache.lookup(key, lookup, 0, &rg_epochs);
+            }
+            if i == 4 {
+                cache.invalidate_slot(&keys[0], 7);
+            }
+        }
+        // Verify lru[target_set] is a permutation of [0,1,2,3].
+        let row = cache.lru[target_set];
+        let mut sorted = row;
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            [0u8, 1, 2, 3],
+            "lru row must be a permutation of [0,1,2,3], got {row:?}"
+        );
     }
 }
