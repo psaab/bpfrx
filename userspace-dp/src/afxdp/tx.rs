@@ -3728,8 +3728,10 @@ fn apply_cos_admission_ecn_policy(
     //
     // #722: per-flow threshold derived from the same share cap
     // the admission gate uses. `cos_queue_flow_share_limit` is
-    // pure and inlined (saturating_add + max + div_ceil + clamp),
-    // ~5 ns.
+    // pure and inlined: ~5 ns on the legacy owner-local path
+    // (saturating_add + max + div_ceil + clamp); ~8 ns on the
+    // post-#914 shared_exact path (adds one division + multiply
+    // for `bdp_floor_bytes`).
     let aggregate_ecn_threshold = buffer_limit
         .saturating_mul(COS_ECN_MARK_THRESHOLD_NUM)
         / COS_ECN_MARK_THRESHOLD_DEN.max(1);
@@ -4071,6 +4073,43 @@ fn cos_queue_prospective_active_flows(queue: &CoSQueueRuntime, flow_bucket: usiz
         .max(1)
 }
 
+/// Per-flow BDP-equivalent floor used by `cos_queue_flow_share_limit`
+/// on `shared_exact` queues (#914). Computed against the cluster's
+/// post-shaper RTT envelope; intentionally larger than the
+/// `cos_flow_aware_buffer_limit`'s 5 ms `delay_cap` because they
+/// serve different purposes — the aggregate buffer ceiling targets
+/// queue-residence latency, the per-flow floor targets TCP cwnd
+/// build-up at queue rate. Project memory: cluster RTT 5-7 ms
+/// post-shaper; 10 ms gives ~1.5× headroom.
+const RTT_TARGET_NS: u64 = 10_000_000;
+
+/// Burst headroom multiplier applied to the per-flow `fair_share`
+/// inside `cos_queue_flow_share_limit` for shared_exact queues. Set
+/// to 2 to admit short bursts up to 2× the steady-state per-flow
+/// allocation without tail-drops. Only binding in the moderate-N
+/// regime where it exceeds `bdp_floor` and is below `buffer_limit`;
+/// at high N `bdp_floor` dominates and at low N `buffer_limit` clamps.
+const SHARED_EXACT_BURST_HEADROOM: u64 = 2;
+
+/// Per-flow BDP at the queue's rate divided across `active_flows`.
+/// Used as a floor in the shared_exact rate-aware cap — TCP cwnd
+/// must reach approximately one BDP for the per-flow rate to fit
+/// the queue's transmit rate without tail-drops.
+///
+/// Truncation: result truncates to 0 when `per_flow_rate <
+/// 1e9 / RTT_TARGET_NS = 100 bytes/sec`. At cluster-scale rates
+/// (≥ 1 Gbps queues with ≤ 1024 flows → ≥ 122 KB/s/flow) this is
+/// far from the truncation floor. On user-configured low-rate
+/// queues (e.g., 64 kbps WAN class with 100+ flows) the BDP floor
+/// silently degenerates to 0 and the `MIN_SHARE` (24 KB) clamp
+/// becomes the effective floor. Acceptable because the MIN_SHARE
+/// floor still keeps TCP recoverable via fast-retransmit.
+#[inline]
+fn bdp_floor_bytes(transmit_rate_bytes: u64, active_flows: u64) -> u64 {
+    let per_flow_rate = transmit_rate_bytes / active_flows.max(1);
+    per_flow_rate.saturating_mul(RTT_TARGET_NS) / 1_000_000_000
+}
+
 #[inline]
 fn cos_queue_flow_share_limit(
     queue: &CoSQueueRuntime,
@@ -4080,22 +4119,50 @@ fn cos_queue_flow_share_limit(
     if !queue.flow_fair {
         return buffer_limit;
     }
-    // #785 Phase 3: shared_exact queues enforce per-flow fairness via
-    // MQFQ virtual-finish-time ordering in the dequeue path
-    // (`cos_queue_pop_front`), NOT via the per-flow share cap. The
-    // share cap's `COS_FLOW_FAIR_MIN_SHARE_BYTES` floor (24 KB) is
-    // rate-unaware and tail-drops TCP at multi-Gbps per-flow rates on
-    // a 25 Gbps queue with 12 flows. Retrospective Attempt A
-    // measured 22.3 → 16.3 Gbps + 25k retrans when the cap was
-    // enforced on shared_exact.
+    // #914 (post-#785 Phase 3): shared_exact queues now enforce a
+    // RATE-AWARE per-flow cap rather than passing through buffer_limit
+    // unchanged. The previous unconditional return was correct as far
+    // as it preserved TCP cwnd build-up (Attempt A had regressed
+    // 22.3 → 16.3 Gbps + 25k retrans because the rate-unaware
+    // `COS_FLOW_FAIR_MIN_SHARE_BYTES` floor of 24 KB was used as the
+    // cap), but it allowed a single elephant to occupy the entire
+    // queue buffer, starving mice in the same shared_exact class.
     //
-    // Aggregate-only admission here keeps TCP able to build cwnd
-    // up to BDP while MQFQ ordering equalises per-flow byte rates.
+    // The new cap = `max(fair_share*2, bdp_floor).clamp(MIN, buffer_limit)`:
+    //
+    //   - `fair_share*2` = aggregate buffer split N ways with 2×
+    //     headroom for transient bursts.
+    //   - `bdp_floor` = per-flow BDP at queue rate / N flows; ensures
+    //     TCP cwnd can build to one BDP without tail-drops.
+    //   - Clamped above by `buffer_limit` so the per-flow allocation
+    //     never exceeds the aggregate; clamped below by MIN_SHARE
+    //     (24 KB) for the existing guarantee.
+    //
+    // Behavior at low N (where bdp_floor > buffer_limit): the cap
+    // clamps to buffer_limit, i.e. the formula degenerates to today's
+    // behavior. This is intentional — at low N the buffer_limit
+    // ceiling is the binding constraint anyway, and forcing a tighter
+    // cap would regress TCP cwnd. The cap actively splits the buffer
+    // only at moderate-to-high N (around N ≈ 23 flows on a 10 G
+    // shared_exact queue).
+    //
     // Owner-local-exact queues (low-rate, #784 workload) keep the
-    // per-flow cap — at 1 Gbps / 12 flows the 24 KB cap matches
-    // TCP cwnd at 77 Mbps/flow.
+    // legacy aggregate/N share cap — at 1 Gbps / 12 flows the
+    // 24 KB MIN floor matches TCP cwnd at 77 Mbps/flow.
     if queue.shared_exact {
-        return buffer_limit;
+        let prospective = cos_queue_prospective_active_flows(queue, flow_bucket);
+        // Copilot C.2: use `div_ceil` to match the legacy owner-local
+        // path below. Truncating division systematically undersizes
+        // the per-flow cap by up to (prospective - 1) bytes when
+        // `buffer_limit` is not divisible by `prospective`, increasing
+        // boundary-condition tail-drops. The legacy path picked
+        // div_ceil for that reason; shared_exact should follow.
+        let fair_share = buffer_limit.div_ceil(prospective.max(1));
+        let bdp = bdp_floor_bytes(queue.transmit_rate_bytes, prospective);
+        return fair_share
+            .saturating_mul(SHARED_EXACT_BURST_HEADROOM)
+            .max(bdp)
+            .clamp(COS_FLOW_FAIR_MIN_SHARE_BYTES, buffer_limit);
     }
     let prospective_active = cos_queue_prospective_active_flows(queue, flow_bucket);
     buffer_limit
@@ -5450,44 +5517,39 @@ fn apply_cos_queue_flow_fair_promotion(
 /// `shared_exact` signal onto the runtime so future work on this
 /// surface can branch on it without another iface_fast lookup.
 ///
-/// **Current policy:** `flow_fair = queue.exact && !shared_exact`.
-/// Only the owner-local-exact path runs SFQ today; shared_exact
-/// (high-rate, >= `COS_SHARED_EXACT_MIN_RATE_BYTES` = 2.5 Gbps)
-/// queues stay on the single-FIFO-per-worker drain.
+/// **Current policy (post-#785 Phase 3, post-#914):** `flow_fair =
+/// queue.exact` for both owner-local-exact AND shared_exact. The
+/// dequeue-ordering mechanism is MQFQ virtual-finish-time (#913 fixed
+/// the snapshot-rollback bug). The admission-side per-flow cap on
+/// shared_exact is RATE-AWARE (#914): `cos_queue_flow_share_limit`
+/// returns `max(fair_share*2, bdp_floor).clamp(MIN, buffer_limit)`
+/// rather than the rate-unaware MIN floor that regressed throughput
+/// in the historical attempts described below.
 ///
-/// **Why shared_exact is held back (issue #785):** two attempts
-/// have been made to enable SFQ on shared_exact queues and both
-/// were rolled back after empirical regression:
+/// **Historical retrospective (issue #785):** two earlier attempts
+/// to enable SFQ on shared_exact were rolled back:
 ///
 /// 1. Naïve flip (flow_fair=queue.exact, no admission change).
 ///    iperf3 -P 12 on the 25 Gbps iperf-c cap regressed from
 ///    22.3 Gbps / 0 retrans to 16.3 Gbps / 25 k+ retrans. Root
 ///    cause: the per-flow share cap (`cos_queue_flow_share_limit`
 ///    → floor `COS_FLOW_FAIR_MIN_SHARE_BYTES` = 24 KB) and the
-///    per-flow ECN arm (`apply_cos_admission_ecn_policy`) are
+///    per-flow ECN arm (`apply_cos_admission_ecn_policy`) were
 ///    rate-unaware; on a 25 Gbps queue with 12 flows the per-flow
-///    cap collapses to ~24 KB, far below the ~5 MB BDP a
+///    cap collapsed to ~24 KB, far below the ~5 MB BDP a
 ///    2 Gbps / 20 ms TCP flow needs, so admission drops and ECN
-///    marks fired on nearly every packet.
+///    marks fired on nearly every packet. **#914 fixes this** by
+///    making the cap rate-aware via `bdp_floor_bytes`.
 ///
 /// 2. SFQ + aggregate-only admission (flow_fair=queue.exact;
 ///    `cos_queue_flow_share_limit` returns `buffer_limit` on
-///    shared_exact; `apply_cos_admission_ecn_policy` uses the
-///    aggregate arm on shared_exact). Throughput preserved
-///    (22-23 Gbps) but per-flow CoV went UP from ~33 % to
-///    ~40-51 % over three runs. Root cause: per-worker SFQ DRR
-///    cannot equalise flows that are distributed unevenly across
-///    workers by NIC RSS — which is the dominant imbalance source
-///    at P=12 / 8 workers. The SFQ cycle also appears to cost
-///    batch-drain efficiency on the high-rate path (a tangible
-///    but unquantified secondary effect).
-///
-/// The architecturally-correct lever is cross-worker flow steering
-/// (or a single shared-SFQ across all workers), not within-worker
-/// SFQ. Follow-up issue tracks that work. Do not flip this gate
-/// again without landing the cross-worker fairness mechanism first
-/// and validating `iperf3 -P 12 -p 5203` at 25 Gbps produces
-/// SUM ≥ 22 Gbps AND per-flow CoV ≤ 20 %.
+///    shared_exact). Throughput preserved (22-23 Gbps) but per-flow
+///    CoV went UP from ~33 % to ~40-51 % over three runs because
+///    per-worker SFQ DRR cannot equalise flows that are distributed
+///    unevenly across workers by NIC RSS — the dominant imbalance
+///    source at P=12 / 8 workers. The DRR primitive was replaced
+///    with MQFQ (#913) which uses byte-rate fairness, the
+///    architecturally correct primitive for TCP under pacing.
 ///
 /// **Contract shape:** `queue_fast: &WorkerCoSQueueFastPath` is the
 /// live classifier output from `build_worker_cos_fast_interfaces`,
@@ -5500,11 +5562,17 @@ fn apply_cos_queue_flow_fair_promotion(
 /// fast-path struct (e.g. a `min_local_flow_count` guarantee for
 /// the cross-worker DRR work) is automatically visible here.
 ///
-/// **Adversarial review posture (campaign #775 / issue #785):**
-/// reviewers MUST reject PRs that drop the `!shared_exact` clause
-/// without also landing a cross-worker fairness mechanism AND
-/// re-validating the CoV target. The `shared_exact` shadow cached
-/// onto `CoSQueueRuntime` is the hook a future fix will branch on.
+/// **Adversarial review posture (post-#914):** the historical
+/// `!shared_exact` gate is no longer in policy — `flow_fair =
+/// queue.exact` for both shared_exact and owner-local-exact. The
+/// `shared_exact` shadow cached onto `CoSQueueRuntime` is now the
+/// branch point used by `cos_queue_flow_share_limit` to apply the
+/// rate-aware admission cap (`max(fair_share*2, bdp_floor)`)
+/// instead of the legacy aggregate/N share cap. Reviewers should
+/// reject PRs that re-introduce the rate-unaware MIN-floor cap on
+/// shared_exact without also re-validating iperf-c P=12 ≥ 22 Gbps
+/// and the same-class iperf-b mouse-latency p99 (the regressions
+/// historical Attempts A and B hit).
 ///
 /// The SFQ salt is drawn only for queues that actually use the
 /// flow-fair path — non-flow-fair queues never consult the seed
@@ -5526,12 +5594,14 @@ fn promote_cos_queue_flow_fair(
     // retrospective analysis, and `docs/785-perf-fairness-plan.md`
     // for the phased plan.
     //
-    // Admission gates downgrade to aggregate-only on shared_exact
-    // (see `cos_queue_flow_share_limit` and
-    // `apply_cos_admission_ecn_policy`) so the rate-unaware 24 KB
-    // per-flow share cap doesn't tail-drop TCP at multi-Gbps per-
-    // flow rates. Proven necessary by Attempt A in the retrospective
-    // (22.3 → 16.3 Gbps regression on the 24 KB cap).
+    // Admission gates: `cos_queue_flow_share_limit` is RATE-AWARE
+    // on shared_exact post-#914 — it returns
+    // `max(fair_share*2, bdp_floor).clamp(MIN, buffer_limit)` so the
+    // per-flow cap follows BDP at queue rate / N flows rather than
+    // collapsing to the rate-unaware 24 KB MIN floor that caused the
+    // Attempt A regression (22.3 → 16.3 Gbps).
+    // `apply_cos_admission_ecn_policy` still uses the aggregate arm
+    // on shared_exact (per-flow ECN remains rate-unaware).
     queue.flow_fair = queue.exact;
     if queue.flow_fair {
         queue.flow_hash_seed = cos_flow_hash_seed_from_os();
@@ -10552,6 +10622,214 @@ mod tests {
         );
     }
 
+    /// #914: shared_exact rate-aware cap — verify the formula
+    /// `max(fair_share*2, bdp_floor).clamp(MIN, buffer_limit)`
+    /// scales correctly with `transmit_rate_bytes` and active flows
+    /// rather than collapsing to the rate-unaware MIN floor.
+    #[test]
+    fn flow_share_limit_shared_exact_scales_with_rate() {
+        // 10 Gbps shared_exact queue at N=128 → per_flow_rate = 9.77 MB/s,
+        // bdp_floor = 9.77 MB/s × 10 ms = 97.6 KB. Buffer_limit ≫ that,
+        // so the cap should follow bdp_floor.
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 0,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.shared_exact = true;
+        queue.active_flow_buckets = 128;
+        for bucket in 0..128 {
+            queue.flow_bucket_bytes[bucket] = 1_000;
+        }
+        let buffer_limit = cos_flow_aware_buffer_limit(queue, 0);
+        let share = cos_queue_flow_share_limit(queue, buffer_limit, 0);
+        // bdp_floor = (1.25 GB/s / 128) × 10 ms = 97_656 bytes (rounded).
+        let expected_bdp = bdp_floor_bytes(queue.transmit_rate_bytes, 128);
+        assert_eq!(
+            share, expected_bdp,
+            "shared_exact cap should follow bdp_floor at N=128 (cap={share}, bdp={expected_bdp})"
+        );
+        assert!(
+            share > COS_FLOW_FAIR_MIN_SHARE_BYTES,
+            "rate-aware cap ({share}) must exceed the rate-unaware MIN floor ({COS_FLOW_FAIR_MIN_SHARE_BYTES})"
+        );
+        assert!(
+            share <= buffer_limit,
+            "cap ({share}) must not exceed buffer_limit ({buffer_limit})"
+        );
+    }
+
+    /// #914: at low N, `bdp_floor` exceeds `buffer_limit`; the formula
+    /// must clamp to buffer_limit and degenerate to today's behavior
+    /// rather than capping below per-flow BDP (which would collapse
+    /// TCP cwnd).
+    #[test]
+    fn flow_share_limit_shared_exact_caps_at_aggregate_for_single_flow() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 0,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.shared_exact = true;
+        queue.active_flow_buckets = 1;
+        queue.flow_bucket_bytes[0] = 1_000;
+        let buffer_limit = cos_flow_aware_buffer_limit(queue, 0);
+        let share = cos_queue_flow_share_limit(queue, buffer_limit, 0);
+        // At N=1 the bdp_floor (~12.5 MB) is way above buffer_limit,
+        // so we clamp to buffer_limit.
+        assert_eq!(
+            share, buffer_limit,
+            "single-flow shared_exact cap must clamp to buffer_limit (no regression vs current)"
+        );
+    }
+
+    /// #914 (Codex review): at moderate N where `bdp_floor` exceeds
+    /// `buffer_limit` (the degeneration regime per plan §3.2), the
+    /// cap must clamp to `buffer_limit` rather than below it. Pins
+    /// the low-N behavior so a future regression where the formula
+    /// caps below buffer_limit fails this test rather than slipping
+    /// through.
+    #[test]
+    fn flow_share_limit_shared_exact_clamps_to_buffer_at_low_n() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 0,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.shared_exact = true;
+        // N = 8: per-flow rate = 156 MB/s, bdp_floor = 1.56 MB,
+        // far above buffer_limit (which at default base = 96 KB and
+        // 8 × MIN_SHARE = 192 KB clamps to ~192 KB).
+        queue.active_flow_buckets = 8;
+        for bucket in 0..8 {
+            queue.flow_bucket_bytes[bucket] = 1_000;
+        }
+        let buffer_limit = cos_flow_aware_buffer_limit(queue, 0);
+        let bdp = bdp_floor_bytes(queue.transmit_rate_bytes, 8);
+        assert!(
+            bdp > buffer_limit,
+            "test premise: bdp_floor ({bdp}) must exceed buffer_limit ({buffer_limit}) at N=8"
+        );
+        let share = cos_queue_flow_share_limit(queue, buffer_limit, 0);
+        assert_eq!(
+            share, buffer_limit,
+            "low-N shared_exact must clamp to buffer_limit, not below"
+        );
+    }
+
+    /// #914: at high N where bdp_floor < buffer_limit, the cap is
+    /// active and protects mice from elephant starvation (the actual
+    /// design goal).
+    #[test]
+    fn flow_share_limit_shared_exact_protects_against_dominant_flow() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 0,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.shared_exact = true;
+        queue.active_flow_buckets = 128;
+        for bucket in 0..128 {
+            queue.flow_bucket_bytes[bucket] = 1_000;
+        }
+        let buffer_limit = cos_flow_aware_buffer_limit(queue, 0);
+        let share = cos_queue_flow_share_limit(queue, buffer_limit, 0);
+        // The cap must be strictly less than buffer_limit at N=128 —
+        // i.e. one flow cannot fill the entire queue.
+        assert!(
+            share < buffer_limit,
+            "rate-aware cap ({share}) must split the buffer at N=128 (buffer_limit={buffer_limit})"
+        );
+        // And strictly greater than buffer_limit / N (the rate-unaware
+        // arithmetic share) because of the bdp_floor and 2× headroom.
+        assert!(
+            share >= buffer_limit / 128,
+            "cap ({share}) must be at least buffer_limit/N ({})",
+            buffer_limit / 128
+        );
+    }
+
+    /// #914: owner-local-exact queues (NOT shared_exact) keep the
+    /// legacy `buffer_limit / prospective_active` arithmetic share.
+    /// Verify the new shared_exact branch does not affect them.
+    #[test]
+    fn flow_share_limit_owner_local_exact_unchanged() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 125_000,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.shared_exact = false; // owner-local-exact
+        queue.active_flow_buckets = 12;
+        for bucket in 0..12 {
+            queue.flow_bucket_bytes[bucket] = 1_000;
+        }
+        let buffer_limit = cos_flow_aware_buffer_limit(queue, 0);
+        let share = cos_queue_flow_share_limit(queue, buffer_limit, 0);
+        // Legacy formula: buffer_limit / prospective_active, clamped to
+        // [MIN_SHARE, buffer_limit]. With 12 buckets and the prospective
+        // +1 for empty target bucket, the divisor is 13 (or 12 if the
+        // target bucket is non-empty).
+        let prospective = cos_queue_prospective_active_flows(queue, 0);
+        let expected = buffer_limit
+            .div_ceil(prospective)
+            .clamp(COS_FLOW_FAIR_MIN_SHARE_BYTES, buffer_limit);
+        assert_eq!(
+            share, expected,
+            "owner-local-exact cap must use the legacy aggregate/N formula"
+        );
+    }
+
     #[test]
     fn cos_queue_flow_share_limit_never_drops_below_fast_retransmit_floor() {
         // At 16 flows with a 125 KB buffer, the naive arithmetic share
@@ -15141,13 +15419,16 @@ mod tests {
     // steering (or a single shared SFQ across workers), tracked in
     // the follow-up issue.
     //
-    // Adversarial review posture (campaign #775 / issue #785):
-    // reviewers MUST reject PRs that drop the `!shared_exact` clause
-    // from `promote_cos_queue_flow_fair` without also landing a
-    // cross-worker fairness mechanism AND re-validating
-    // `iperf3 -P 12 -p 5203` at 25 Gbps (expect SUM ≥ 22 Gbps AND
-    // per-flow CoV ≤ 20 %). The tests below drive the full
-    // production promotion path (via
+    // Adversarial review posture (post-#914): the historical
+    // `!shared_exact` gate is no longer in policy. shared_exact
+    // now runs MQFQ flow-fair AND a rate-aware admission cap
+    // (`max(fair_share*2, bdp_floor).clamp(MIN, buffer_limit)` —
+    // see `cos_queue_flow_share_limit`). Reviewers should reject
+    // PRs that re-introduce the rate-unaware MIN-floor cap on
+    // shared_exact without also re-validating
+    // `iperf3 -P 12 -p 5203` ≥ 22 Gbps AND per-flow CoV ≤ 20 %
+    // (the regression Attempt A hit). The tests below drive the
+    // full production promotion path (via
     // `apply_cos_queue_flow_fair_promotion` with hand-authored
     // `WorkerCoSQueueFastPath` vectors) so breaking the zip alignment
     // at the `ensure_cos_interface_runtime` call site — or feeding
