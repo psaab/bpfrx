@@ -61,8 +61,10 @@ const TX_BATCH_SIZE: usize = 64; // was 256
 
 `pop_snapshot_stack` is preallocated to `TX_BATCH_SIZE` capacity
 (per #913 plan §3.2 and verified at `tx.rs:cos_queue_pop_front_inner`
-debug_assert). Halving 256→64 reduces the preallocated stack from
-8 KB to 2 KB — strictly improvement for L1d residency.
+debug_assert). Quartering 256→64 reduces the preallocated stack
+from ~6 KB to ~1.5 KB at 24 bytes per `CoSQueuePopSnapshot`
+(per `types.rs` size note) — strictly improvement for L1d
+residency.
 
 The debug_assert that the stack stays within `TX_BATCH_SIZE` still
 holds; nothing in the existing code paths inserts more than one
@@ -127,7 +129,10 @@ shrinks initial Vec allocations and is harmless or beneficial):
   hint.
 - `tx.rs:5592, 13852, 13896, 13951`, `worker.rs:2442, 2582,
   2788, ...` — `pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE)`.
-  Reduction lowers initial alloc from 8 KB to 2 KB per stack.
+  At 24 bytes per `CoSQueuePopSnapshot` element, reduction lowers
+  the initial element-storage allocation from ~6 KB (256 × 24) to
+  ~1.5 KB (64 × 24) per stack, plus per-Vec header/allocator
+  overhead.
 
 The cumulative effect: more frequent but smaller iterations through
 the entire RX→XDP→TX pipeline. The hypothesis: the L1d-resident
@@ -154,11 +159,22 @@ The constants are internal to the `afxdp` module. Nothing escapes.
 
 ## 5. Files touched
 
-- `userspace-dp/src/afxdp.rs`: change two `const`s.
-- (No other code change; existing call sites all reference the
-  constants symbolically.)
-- `docs/pr/920-batch-size-l1d/findings.md`: NEW. Document the
-  measurement: throughput pre/post + mouse p99 pre/post.
+- `userspace-dp/src/afxdp.rs`: change `RX_BATCH_SIZE` and
+  `TX_BATCH_SIZE` consts; add `const_assert!` pins; expand the
+  comment block with sizing math + per-poll budget rationale.
+- `userspace-dp/src/afxdp/tx.rs`: update `guarantee_phase_*_visit_quantum`
+  test to assert the new TX_BATCH_SIZE cap; add new
+  `guarantee_phase_quantum_scales_with_rate` test guarding the
+  rate-quantum invariant; refresh stale 256-batch comments in
+  the drain-cost analysis.
+- `userspace-dp/src/afxdp/types.rs`: refresh stale 256 × 24
+  comment on the `pop_snapshot_stack` worst-case footprint.
+- `userspace-dp/src/main.rs`: cherry-picked unrelated #878
+  `BindingCountersSnapshot` test fix (pre-existing build break
+  on origin/master) so cargo test can run.
+- Cluster-side measurement results will be collected post-merge
+  via the #929 same-class harness; not a separate file in this
+  PR.
 
 ## 6. Test strategy
 

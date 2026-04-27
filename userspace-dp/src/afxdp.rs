@@ -162,11 +162,14 @@ const UMEM_HEADROOM: u32 = 256;
 // vs 122 µs at the prior batch of 256. Also caps the kernel-side
 // NAPI busy-poll budget via SO_BUSY_POLL_BUDGET in bind.rs at 64.
 //
-// Tradeoff: per-poll throughput drops from `MAX_RX_BATCHES_PER_POLL ×
-// 256 = 1024` packets to `4 × 64 = 256` per binding poll cycle.
-// Kept `MAX_RX_BATCHES_PER_POLL = 4` (rather than raising to 16)
-// because the latency goal of #920 directly benefits from more
-// frequent yields. Throughput regression-checked in cluster smoke.
+// Tradeoff: per-poll throughput drops from
+// `MAX_RX_BATCHES_PER_POLL × <pre-#920 RX_BATCH_SIZE = 256>`
+// to `MAX_RX_BATCHES_PER_POLL × RX_BATCH_SIZE` packets per binding
+// poll cycle (4 × 256 = 1024 → 4 × 64 = 256 at the current
+// constants). Kept `MAX_RX_BATCHES_PER_POLL = 4` (rather than
+// raising to 16) because the latency goal of #920 directly
+// benefits from more frequent yields. Throughput
+// regression-checked in cluster smoke.
 //
 // Future bumps require re-validating: (a) L1d footprint vs
 // per-batch allocation; (b) per-poll budget interaction with
