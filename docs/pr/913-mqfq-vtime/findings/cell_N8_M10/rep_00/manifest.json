@@ -1,0 +1,9 @@
+{
+  "N": 8,
+  "M": 10,
+  "duration_s": 60,
+  "started_at": "2026-04-27T10:21:41Z",
+  "screen_engaged": false,
+  "ha_transition_seen": 0,
+  "mpstat_avg_busy": "50.36"
+}

@@ -1,0 +1,5 @@
+Screen statistics for zone 'wan':
+  Counter                        Value
+  SYN flood events               0
+  ICMP flood events              0
+  UDP flood events               0

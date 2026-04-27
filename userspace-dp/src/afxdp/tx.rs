@@ -2647,6 +2647,17 @@ fn drain_exact_local_items_to_scratch_flow_fair(
             let _ = apply_dscp_rewrite_to_frame(&mut req.bytes, dscp_rewrite);
         }
         if req.bytes.len() > tx_frame_capacity() {
+            // #913: clean up the orphan snapshot for this dropped
+            // item. The matching pop pushed a snapshot; on Drop
+            // we abandon the item, so the snapshot would
+            // otherwise sit at the top of the stack and trip a
+            // bucket-mismatch panic when the subsequent
+            // restore_front push_fronts a different surviving
+            // item. Codex code review (HIGH): also clamp
+            // remaining snapshots' pre_pop_queue_vtime so
+            // survivor restores preserve this dropped item's
+            // committed vtime advance — see helper docstring.
+            cos_queue_clear_orphan_snapshot_after_drop(queue);
             return ExactCoSScratchBuild::Drop {
                 error: format!(
                     "local tx frame exceeds UMEM frame capacity: len={} cap={}",
@@ -2663,6 +2674,9 @@ fn drain_exact_local_items_to_scratch_flow_fair(
         let Some(frame) = (unsafe { area.slice_mut_unchecked(offset as usize, req.bytes.len()) })
         else {
             free_tx_frames.push_front(offset);
+            // #913: same orphan-snapshot cleanup as above (slice
+            // failure path).
+            cos_queue_clear_orphan_snapshot_after_drop(queue);
             return ExactCoSScratchBuild::Drop {
                 error: format!(
                     "tx frame slice out of range: offset={offset} len={}",
@@ -2826,6 +2840,10 @@ fn drain_exact_prepared_items_to_scratch_flow_fair(
                 req.recycle,
                 req.offset,
             );
+            // #913: orphan snapshot cleanup with vtime preservation.
+            // See helper docstring; same as local-builder
+            // capacity-fail site.
+            cos_queue_clear_orphan_snapshot_after_drop(queue);
             return ExactCoSScratchBuild::Drop {
                 error: format!(
                     "prepared tx frame exceeds UMEM frame capacity: len={} cap={}",
@@ -2854,6 +2872,9 @@ fn drain_exact_prepared_items_to_scratch_flow_fair(
                 req.recycle,
                 req.offset,
             );
+            // #913: orphan snapshot cleanup with vtime preservation
+            // (slice failure path). See helper docstring.
+            cos_queue_clear_orphan_snapshot_after_drop(queue);
             return ExactCoSScratchBuild::Drop {
                 error: format!(
                     "prepared tx frame slice out of range: offset={} len={}",
@@ -4317,51 +4338,77 @@ pub(super) fn cos_queue_push_front(queue: &mut CoSQueueRuntime, item: CoSPending
         return;
     }
     let bucket = cos_flow_bucket_index(queue.flow_hash_seed, flow_key);
-    // #785 Phase 3 — Codex round-3 HIGH: `queue_vtime` must be
-    // round-trip neutral across pop→push_front. The pop advanced
-    // vtime by the popped item's bytes; on push_front we rewind
-    // by the same amount so a complete rollback returns vtime to
-    // its pre-pop value.
+    // #913: peek-then-pop snapshot consumption.
     //
-    // Why per-item symmetric rewind (not a single snapshot):
-    // TX-ring-full settle paths pop multiple items into a scratch
-    // Vec, submit the head slice, and push_front the tail slice
-    // in LIFO order. A single pre-batch snapshot would only
-    // restore fully when NONE of the batch committed; a per-item
-    // rewind handles partial-commit too — vtime ends at
-    // `vtime_pre_batch + bytes(committed)` regardless of how many
-    // items the TX ring accepted.
-    queue.queue_vtime = queue.queue_vtime.saturating_sub(item_len);
-    // #785 Phase 3 — Codex NEW-1: pop the most recent snapshot off
-    // the LIFO stack. In a batched rollback (scratch popped in LIFO
-    // order), this matches the push order from `cos_queue_pop_front`
-    // — the last pop's snapshot comes off first, restoring its
-    // bucket, then the second-to-last, etc. With a single `Option`
-    // slot, only the first restored item ever got its pre-pop
-    // head/tail; earlier drained buckets fell back to the
-    // `max(tail, queue_vtime) + bytes` re-anchor and could overshoot
-    // their pre-pop head.
-    let snapshot = queue.pop_snapshot_stack.pop();
+    // Three states:
+    //   1. Empty stack: legitimate (drain_all cleared it; or
+    //      fresh-flow / non-Phase-3 caller). Aggregate-bytes
+    //      rewind path — `vtime -= item_len` pairs with the
+    //      no-snapshot pop's `vtime += bytes` for round-trip
+    //      neutrality (see plan §3.7 walkthrough for
+    //      drain_all→restore_front).
+    //   2. Top entry's bucket matches: hot-path matched
+    //      rollback. Pop and restore vtime + head/tail
+    //      from snapshot (closes #913 max-based advance).
+    //   3. Top entry's bucket DOES NOT match: hard contract
+    //      violation. With §3.4's scratch-builder orphan
+    //      cleanup in place, this is believed unreachable in
+    //      current code. `assert!(false)` panics in BOTH dev
+    //      and release.
+    //
+    //      No supervisor in this PR (#913 R4 revert): the
+    //      panic propagates to the default Rust panic
+    //      handler, which emits the panic message to stderr
+    //      → journald and kills the worker thread. The
+    //      helper process keeps running with one fewer
+    //      worker; bindings served by that worker stall
+    //      until the daemon is restarted via config change
+    //      or operator intervention. SAME blast radius as
+    //      every existing `unwrap`/`expect`/`panic!` site
+    //      in `worker_loop` — #913 introduces zero
+    //      incremental panic risk. Cross-cutting panic
+    //      supervision (catch_unwind on helper side +
+    //      parent-side restart in xpfd) tracked in #925.
+    let stack_top_bucket = queue
+        .pop_snapshot_stack
+        .last()
+        .map(|s| usize::from(s.bucket));
+    let snapshot = match stack_top_bucket {
+        None => None,
+        Some(top) if top == bucket => queue.pop_snapshot_stack.pop(),
+        Some(top) => {
+            assert!(
+                false,
+                "pop_snapshot_stack bucket mismatch on push_front: \
+                 top entry's bucket {} != target bucket {}; a \
+                 caller pop+dropped an item without §3.4 cleanup, \
+                 or violated the pop→push_front-same-item contract",
+                top, bucket,
+            );
+            unreachable!()
+        }
+    };
+
+    // #913: vtime restore — symmetric inverse of the §3.1 advance.
+    // Matched-snapshot path: restore from snapshot for both the
+    // was_empty (drained-bucket) and active-bucket branches.
+    // Empty-stack path: legacy aggregate-bytes rewind paired with
+    // the no-snapshot pop's `vtime += bytes`.
+    match snapshot.as_ref() {
+        Some(snap) => {
+            queue.queue_vtime = snap.pre_pop_queue_vtime;
+        }
+        None => {
+            queue.queue_vtime = queue.queue_vtime.saturating_sub(item_len);
+        }
+    }
+
     let was_empty = queue.flow_bucket_items[bucket].is_empty();
     if was_empty {
-        // Bucket is idle (either this item is being restored to a
-        // bucket the caller drained, or push_front was called on a
-        // genuinely fresh flow). If we have a fresh pop snapshot
-        // for THIS bucket, restore head/tail exactly from it —
-        // that's the only way to make the round-trip neutral when
-        // the pop drained the bucket (Rust reviewer MEDIUM #1:
-        // without the snapshot, the re-anchor formula
-        // `max(0, queue_vtime) + bytes` writes one packet past
-        // the pre-pop head).
-        //
-        // Snapshot match test: snapshot.bucket == this bucket. A
-        // mismatch means either no pop preceded this push_front
-        // (e.g. a non-Phase-3 caller) or the snapshot was taken
-        // for a different bucket (pop from X, push_front onto Y —
-        // not a pattern any current caller emits, but harmless if
-        // it ever does). In either case fall back to the fresh
-        // re-anchor path.
-        if let Some(snap) = snapshot.filter(|s| usize::from(s.bucket) == bucket) {
+        // Bucket was drained by the matching pop. Snapshot (if
+        // present) holds the exact pre-pop head/tail so we can
+        // restore them.
+        if let Some(snap) = snapshot {
             queue.flow_bucket_bytes[bucket] =
                 queue.flow_bucket_bytes[bucket].saturating_add(item_len);
             queue.flow_bucket_head_finish_bytes[bucket] = snap.pre_pop_head_finish;
@@ -4374,11 +4421,11 @@ pub(super) fn cos_queue_push_front(queue: &mut CoSQueueRuntime, item: CoSPending
             queue.flow_rr_buckets.push_front(bucket as u16);
             return;
         }
-        // No usable snapshot — fall through to the standard
-        // idle-bucket re-anchor. Correctness-safe (new head/tail
-        // at `max(tail, vtime) + bytes` is a valid MQFQ state for
-        // a flow that's genuinely returning from idle) but not
-        // strictly neutral across the drain-reset case.
+        // No snapshot — drain_all/restore_front path or fresh-flow
+        // caller. Standard idle-bucket re-anchor.
+        // The aggregate-bytes vtime rewind above leaves vtime
+        // correctly positioned for `max(tail, vtime) + bytes`
+        // (see plan §3.7 walkthrough for the drain_all case).
         account_cos_queue_flow_enqueue(queue, flow_key, item_len);
         queue.flow_bucket_items[bucket].push_front(item);
         queue.flow_rr_buckets.push_front(bucket as u16);
@@ -4407,12 +4454,28 @@ pub(super) fn cos_queue_push_front(queue: &mut CoSQueueRuntime, item: CoSPending
     // pop-and-restore round-trip is finish-time neutral, which is
     // what correctness on the error-retry path demands.
     //
-    // If a caller ever push_fronts a DIFFERENT item from what was
-    // popped, the math still produces a sensible (if not strictly-
-    // original) finish: the new head takes over the old head's
-    // position in the ordering. That's acceptable — a no-RMA
-    // invariant violation, not a correctness hole, and every
-    // current caller preserves the pop→push_front identity.
+    // #913: vtime is already restored above (snapshot path or
+    // aggregate-bytes path). The active-bucket head reversal
+    // here is unchanged from pre-#913 — `head -= bytes(current_head)`
+    // is correct under MQFQ "drops consume virtual service"
+    // semantics. Reasoning:
+    //
+    // - Single-pop case: push_front is the exact inverse of the
+    //   most recent pop. head was advanced by bytes(current_head);
+    //   subtracting reverses it.
+    // - Multi-pop case with mid-Drop (e.g., pop A1, pop A2, drop A2,
+    //   restore A1 while A3 is in bucket): head=4500 after pop A2.
+    //   Arithmetic gives head=4500-bytes(A3=1500)=3000. Subsequent
+    //   pop A1 then advances head to 3000+bytes(A3)=4500. A3 ends
+    //   up at finish=4500, preserving A2's "consumed virtual
+    //   service" — competing buckets between 3000 and 4500
+    //   correctly drain before A3.
+    //
+    // (Codex code-review R8 initially flagged this as wrong with
+    // recommendation to use snap.pre_pop_head_finish; R9 then
+    // reversed when its own walkthrough showed the arithmetic
+    // result is needed for the post-restore-pop case. Documented
+    // in §3.3 of the plan.)
     let current_head_bytes = queue.flow_bucket_items[bucket]
         .front()
         .map(cos_item_len)
@@ -4501,16 +4564,36 @@ fn cos_queue_pop_front_inner(
                 bucket: bucket_u16,
                 pre_pop_head_finish: queue.flow_bucket_head_finish_bytes[bucket],
                 pre_pop_tail_finish: queue.flow_bucket_tail_finish_bytes[bucket],
+                pre_pop_queue_vtime: queue.queue_vtime,
             });
         }
+        // #913: capture served_finish (the popped packet's finish
+        // time) BEFORE pop_front + head-advance below mutate it.
+        let served_finish = queue.flow_bucket_head_finish_bytes[bucket];
         let item = queue.flow_bucket_items[bucket].pop_front()?;
-        // Advance queue virtual time by the drained packet's byte
-        // count (classical SFQ V(t): total bytes drained across
-        // all flows in virtual-time units). Idle-bucket re-anchor
-        // `max(tail, vtime) + bytes` on enqueue uses this vtime
-        // to keep returning flows from sweeping the active set.
-        let bytes = cos_item_len(&item);
-        queue.queue_vtime = queue.queue_vtime.saturating_add(bytes);
+        // #913: branched vtime advance.
+        // - push_snapshot=true (hot path / `cos_queue_pop_front`):
+        //   MQFQ served-finish semantics — `vtime = max(vtime,
+        //   served_finish)`. Closes #911 same-class HOL by
+        //   tracking the system frontier (smallest head_finish
+        //   across active buckets at pop time) instead of
+        //   aggregate bytes.
+        // - push_snapshot=false (`cos_queue_pop_front_no_snapshot`,
+        //   used by drain_all + worker.rs:1859 teardown):
+        //   legacy `vtime += bytes` retained. The
+        //   `demote_prepared_cos_queue_to_local` failure-restore
+        //   path (drain_all → restore_front) relies on this
+        //   symmetry with push_front's `vtime -= item_len`
+        //   rewind for round-trip neutrality. drain_all clears
+        //   the snapshot stack at start so push_front of the
+        //   restored items takes the empty-stack aggregate
+        //   path. See plan §3.5 / §3.7.
+        if push_snapshot {
+            queue.queue_vtime = queue.queue_vtime.max(served_finish);
+        } else {
+            let bytes = cos_item_len(&item);
+            queue.queue_vtime = queue.queue_vtime.saturating_add(bytes);
+        }
         if let Some(next_head) = queue.flow_bucket_items[bucket].front() {
             // Bucket still has packets. Advance head-finish to
             // the NEW head packet's finish: head += bytes(new head).
@@ -4545,7 +4628,51 @@ fn cos_queue_pop_front_inner(
     Some(item)
 }
 
+/// #913 — used by scratch-builder Drop paths to clean up the
+/// orphan snapshot for an item that was popped and then dropped
+/// (frame-too-big, slice-fail). The naive `pop_snapshot_stack.pop()`
+/// loses the dropped item's vtime contribution: subsequent
+/// survivor restores via `cos_queue_push_front` would rewind vtime
+/// below the dropped item's commit, breaking MQFQ ordering.
+///
+/// Fix (Codex code review HIGH): after popping the orphan, clamp
+/// every remaining snapshot's `pre_pop_queue_vtime` to ≥ the
+/// post-drop `queue_vtime`. This preserves the "drops consume
+/// virtual service" semantic: when surviving items are restored,
+/// their vtime restores can't go below the dropped item's
+/// committed advance.
+///
+/// Walkthrough: pre-batch vtime=0; pop A (head=1500) → vtime=1500;
+/// pop B (head=2000) → vtime=2000; pop Z (head=3000) → vtime=3000.
+/// Drop Z: z_committed_vtime=3000; pop snap_Z; clamp snap_B and
+/// snap_A pre_pop_queue_vtime to max(orig, 3000)=3000. Restore B:
+/// vtime=3000. Restore A: vtime=3000. Z's vtime contribution
+/// preserved across the rollback.
+fn cos_queue_clear_orphan_snapshot_after_drop(queue: &mut CoSQueueRuntime) {
+    let popped = queue.pop_snapshot_stack.pop();
+    if popped.is_none() {
+        return;
+    }
+    // queue.queue_vtime here reflects the dropped item's pop
+    // advance (already applied in cos_queue_pop_front_inner).
+    // Clamp remaining snapshots to preserve it across rollback.
+    let z_committed_vtime = queue.queue_vtime;
+    for snap in queue.pop_snapshot_stack.iter_mut() {
+        if snap.pre_pop_queue_vtime < z_committed_vtime {
+            snap.pre_pop_queue_vtime = z_committed_vtime;
+        }
+    }
+}
+
 fn cos_queue_drain_all(queue: &mut CoSQueueRuntime) -> VecDeque<CoSPendingTxItem> {
+    // #913 / Codex R3: clear stale snapshots from any prior
+    // committed hot-path drain. Without this, a subsequent
+    // `cos_queue_restore_front` would consume orphan snapshots
+    // and apply them to the wrong items (the failure-restore
+    // path in `demote_prepared_cos_queue_to_local`). The §3.7
+    // round-trip-neutrality walkthrough relies on the stack
+    // being EMPTY when restore_front begins.
+    queue.pop_snapshot_stack.clear();
     let mut items = VecDeque::new();
     // #785 Phase 3 — Codex round-3 NEW-2 / Rust reviewer LOW:
     // drain-all is a teardown/reconfigure helper. Unlike the
@@ -10808,7 +10935,20 @@ mod tests {
         );
         assert_eq!(queue.active_flow_buckets, 0);
         assert!(queue.flow_rr_buckets.is_empty());
-        assert_eq!(queue.queue_vtime, 6000);
+        // #913 — MQFQ served-finish semantics: vtime tracks the
+        // finish time of the last served packet, not the
+        // aggregate bytes drained. With pop order
+        // [1111, 1112, 1113, 1111] each picking a bucket whose
+        // head_finish=1500 (and the last pop seeing head_finish=
+        // 3000 after head-advance), `max(0,1500,1500,1500,3000)
+        // = 3000`. Pre-#913 (aggregate-bytes) would have given
+        // Σbytes = 6000.
+        assert_eq!(
+            queue.queue_vtime, 3000,
+            "vtime tracks last served packet's finish-time \
+             (MQFQ served-finish), not aggregate bytes drained \
+             (pre-#913 SFQ V(t))"
+        );
     }
 
     /// #785 Phase 3 — MQFQ byte-rate fairness on MIXED packet sizes.
@@ -11217,22 +11357,25 @@ mod tests {
         );
     }
 
-    /// Pin the `queue.vtime` semantics: classical SFQ V(t) — the
-    /// cumulative byte count drained from this queue across all
-    /// flows in virtual-time units. Advances by `bytes_popped` on
-    /// every dequeue. This is the "total work done" anchor that
-    /// re-enqueued idle buckets compare against in
-    /// `max(bucket_finish, queue_vtime) + bytes` so a returning
-    /// flow starts at the current frontier, not back at 0.
+    /// #913 — Pin the `queue.vtime` semantics: MQFQ served-finish.
+    /// Vtime advances to track the served packet's finish time
+    /// (which equals the smallest head_finish across active
+    /// buckets at pop time, since MQFQ pops min-finish-first).
+    /// This is the "system frontier" — re-enqueued idle buckets
+    /// compare against it in `max(bucket_finish, queue_vtime) +
+    /// bytes` so a returning flow starts at the current
+    /// frontier, not back at 0.
     ///
-    /// Why `vtime += bytes` and NOT `vtime = bucket_finish`:
-    /// `bucket_finish` is the LAST-ENQUEUED packet's finish for
-    /// that bucket, which overshoots the popped-packet's actual
-    /// finish whenever the bucket has multiple packets queued.
-    /// Reading it would over-advance vtime past work actually
-    /// completed, letting the anchor drift ahead of reality.
+    /// In this single-flow test, served_finish progresses
+    /// 1500 → 3000 → 4500 (head advances by next-packet bytes
+    /// after each pop). vtime = max(prev, served) tracks the
+    /// progression — same numerical result as the pre-#913
+    /// aggregate-bytes formulation, by coincidence in the
+    /// single-flow case. The cross-flow test
+    /// `mqfq_vtime_does_not_accumulate_across_flows` (below)
+    /// shows where the two semantics actually diverge.
     #[test]
-    fn mqfq_queue_vtime_advances_by_drained_bytes() {
+    fn mqfq_queue_vtime_tracks_served_finish_time() {
         let mut root = test_cos_runtime_with_queues(
             25_000_000_000 / 8,
             vec![CoSQueueConfig {
@@ -11262,13 +11405,373 @@ mod tests {
         let _ = cos_queue_pop_front(queue);
         assert_eq!(
             queue.queue_vtime, 1500,
-            "first pop: vtime advances by bytes_drained (1500), NOT \
-             jumps to bucket_finish (4500)",
+            "first pop: vtime tracks served packet's finish_time \
+             (1500 = head_finish of the 1st packet)",
         );
         let _ = cos_queue_pop_front(queue);
         assert_eq!(queue.queue_vtime, 3000);
         let _ = cos_queue_pop_front(queue);
         assert_eq!(queue.queue_vtime, 4500);
+    }
+
+    /// #913 — Distinguishing test: vtime must NOT accumulate
+    /// across flows. This test would FAIL under the pre-#913
+    /// aggregate-bytes formulation and PASS under the new MQFQ
+    /// served-finish formulation. It's the bug-trip that would
+    /// have caught the original SFQ-V(t) implementation if it
+    /// had existed at the time the original code landed.
+    ///
+    /// Setup: 10 distinct flows, one 1500-byte packet each. Pop
+    /// one packet from each flow in MQFQ order (10 pops). Every
+    /// flow's bucket has head_finish=1500 at enqueue (vtime=0).
+    ///
+    /// Pre-#913 (aggregate-bytes): vtime advances by 1500 per
+    /// pop → final = 10 × 1500 = 15000.
+    ///
+    /// New (MQFQ served-finish): each pop sees served_finish=
+    /// 1500 (every flow's first packet); `vtime = max(prev,
+    /// 1500)` never advances past the first round → final =
+    /// 1500.
+    ///
+    /// Why this matters for #911: under the old semantics, a
+    /// mouse arriving after N rounds of elephant draining
+    /// anchored at vtime + bytes = N × MTU + small ≫ active
+    /// buckets' head_finish, so MQFQ served the mouse LAST.
+    /// Under new semantics, vtime tracks the served frontier
+    /// and the mouse interleaves with elephants.
+    #[test]
+    fn mqfq_vtime_does_not_accumulate_across_flows() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
+
+        // Enqueue one 1500-byte packet on each of 10 distinct
+        // flows. After enqueue, every bucket has head=tail=1500.
+        // Copilot review: select flow IDs dynamically so the test
+        // doesn't couple to a specific hash distribution. We
+        // sweep candidate IDs and accept the first 10 that land
+        // in distinct buckets.
+        let mut buckets: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        let mut accepted: Vec<u16> = Vec::with_capacity(10);
+        for flow_id in 1000u16..2000u16 {
+            let key = test_session_key(flow_id, 5201);
+            let bucket = cos_flow_bucket_index(0, Some(&key));
+            if buckets.insert(bucket) {
+                accepted.push(flow_id);
+                if accepted.len() == 10 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            accepted.len(),
+            10,
+            "test setup: 10 distinct buckets must be selectable in [1000, 2000)"
+        );
+        for flow_id in accepted {
+            cos_queue_push_back(queue, test_flow_cos_item(flow_id, 1500));
+        }
+        assert_eq!(queue.queue_vtime, 0);
+        assert_eq!(queue.active_flow_buckets, 10);
+
+        // Pop all 10 items via MQFQ (min head_finish first).
+        for _ in 0..10 {
+            assert!(cos_queue_pop_front(queue).is_some());
+        }
+
+        assert_eq!(
+            queue.queue_vtime, 1500,
+            "#913 MQFQ: vtime tracks served-packet finish, \
+             not aggregate bytes drained. Each pop sees the \
+             same head_finish=1500 across the 10 distinct \
+             flows; max(0,1500,1500,...,1500) = 1500. \
+             Pre-#913 aggregate-bytes would have given \
+             10 × 1500 = 15000."
+        );
+        assert_eq!(queue.active_flow_buckets, 0);
+    }
+
+    /// #913 — Codex code review HIGH regression. Scratch-builder
+    /// Drop must preserve the dropped item's vtime contribution
+    /// across multi-survivor restore, otherwise a new idle flow
+    /// can jump ahead of the restored active buckets — exactly
+    /// the temporal-inversion class of bug #913 was supposed to
+    /// fix.
+    ///
+    /// Setup: 3 distinct flows X (head 1500), Y (head 2000), Z
+    /// (head 3000). Pop in MQFQ order (X→Y→Z); `queue_vtime`
+    /// advances 0 → 1500 → 2000 → 3000.
+    ///
+    /// Simulate Z dropped: invoke
+    /// `cos_queue_clear_orphan_snapshot_after_drop` (the helper
+    /// the four scratch-builder Drop sites call). Z's snapshot is
+    /// removed and remaining (X, Y) snapshots get clamped so
+    /// their `pre_pop_queue_vtime` ≥ 3000.
+    ///
+    /// Restore Y, then X via `cos_queue_push_front`. After both
+    /// restores, `queue_vtime` MUST be ≥ 3000 (Z's commit
+    /// preserved). Bucket heads/tails restored exactly.
+    ///
+    /// Then enqueue a new idle flow W (small bytes) and assert
+    /// W's head_finish ≥ X/Y's head_finish so W cannot jump the
+    /// restored active set.
+    #[test]
+    fn mqfq_scratch_drop_preserves_vtime_for_multi_survivor_restore() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
+
+        // Distinct buckets X / Y / Z with mixed packet sizes so
+        // each has a unique head_finish (avoids the "all-equal"
+        // numeric-coincidence case). Copilot review: select flow
+        // IDs dynamically so the test doesn't couple to a
+        // specific hash distribution.
+        let mut seen: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        let mut picks: Vec<u16> = Vec::with_capacity(3);
+        for flow_id in 7001u16..8001u16 {
+            let bucket = cos_flow_bucket_index(
+                0,
+                Some(&test_session_key(flow_id, 5201)),
+            );
+            if seen.insert(bucket) {
+                picks.push(flow_id);
+                if picks.len() == 3 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            picks.len(),
+            3,
+            "test setup: 3 distinct buckets must be selectable in [7001, 8001)"
+        );
+        let (flow_x_id, flow_y_id, flow_z_id) = (picks[0], picks[1], picks[2]);
+        cos_queue_push_back(queue, test_flow_cos_item(flow_x_id, 1500));
+        cos_queue_push_back(queue, test_flow_cos_item(flow_y_id, 2000));
+        cos_queue_push_back(queue, test_flow_cos_item(flow_z_id, 3000));
+        let key_x = test_session_key(flow_x_id, 5201);
+        let key_y = test_session_key(flow_y_id, 5201);
+        let key_z = test_session_key(flow_z_id, 5201);
+        let bucket_x = cos_flow_bucket_index(0, Some(&key_x));
+        let bucket_y = cos_flow_bucket_index(0, Some(&key_y));
+        let bucket_z = cos_flow_bucket_index(0, Some(&key_z));
+
+        let pre_batch_head_x = queue.flow_bucket_head_finish_bytes[bucket_x];
+        let pre_batch_head_y = queue.flow_bucket_head_finish_bytes[bucket_y];
+        let pre_batch_head_z = queue.flow_bucket_head_finish_bytes[bucket_z];
+        assert_eq!(pre_batch_head_x, 1500);
+        assert_eq!(pre_batch_head_y, 2000);
+        assert_eq!(pre_batch_head_z, 3000);
+
+        // Pop X, Y, Z in MQFQ order.
+        let popped_x = cos_queue_pop_front(queue).expect("pop X");
+        let popped_y = cos_queue_pop_front(queue).expect("pop Y");
+        let _popped_z = cos_queue_pop_front(queue).expect("pop Z");
+        assert_eq!(
+            queue.queue_vtime, 3000,
+            "after X→Y→Z pops, vtime tracks served-finish frontier (max=3000)"
+        );
+        assert_eq!(queue.pop_snapshot_stack.len(), 3);
+
+        // Simulate Z dropped (e.g., frame too big in scratch builder).
+        cos_queue_clear_orphan_snapshot_after_drop(queue);
+        assert_eq!(queue.pop_snapshot_stack.len(), 2);
+        assert_eq!(
+            queue.queue_vtime, 3000,
+            "Drop preserves the committed vtime advance"
+        );
+
+        // Restore Y first (LIFO), then X.
+        cos_queue_push_front(queue, popped_y);
+        assert!(
+            queue.queue_vtime >= 3000,
+            "after Y restore, vtime must NOT regress below Z's commit \
+             (got {})",
+            queue.queue_vtime
+        );
+        cos_queue_push_front(queue, popped_x);
+        assert!(
+            queue.queue_vtime >= 3000,
+            "after X restore, vtime must NOT regress below Z's commit \
+             (got {})",
+            queue.queue_vtime
+        );
+        assert!(
+            queue.pop_snapshot_stack.is_empty(),
+            "all snapshots consumed by restore"
+        );
+
+        // X and Y bucket head_finish restored to pre-pop values.
+        assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_x], pre_batch_head_x);
+        assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_y], pre_batch_head_y);
+
+        // Now enqueue a new idle flow W with a small packet. Pick
+        // its flow ID dynamically so its bucket is distinct from
+        // the restored X and Y buckets.
+        let mut flow_w_id: u16 = 0;
+        for candidate in 8001u16..9001u16 {
+            let bucket = cos_flow_bucket_index(
+                0,
+                Some(&test_session_key(candidate, 5201)),
+            );
+            if bucket != bucket_x && bucket != bucket_y && bucket != bucket_z {
+                flow_w_id = candidate;
+                break;
+            }
+        }
+        assert_ne!(flow_w_id, 0, "test setup: distinct W bucket selectable");
+        cos_queue_push_back(queue, test_flow_cos_item(flow_w_id, 100));
+        let key_w = test_session_key(flow_w_id, 5201);
+        let bucket_w = cos_flow_bucket_index(0, Some(&key_w));
+        let w_head = queue.flow_bucket_head_finish_bytes[bucket_w];
+
+        // CORE ASSERTION: W cannot jump ahead of the restored
+        // active buckets X/Y. Pre-#913 (or pre-Drop-vtime-fix),
+        // vtime would have regressed to 0 and W would anchor at
+        // max(0,0)+100 = 100, jumping ahead of X (1500) and Y
+        // (2000). With Drop's vtime preserved at ≥ 3000, W
+        // anchors at max(0, 3000) + 100 = 3100, which is past
+        // X and Y.
+        assert!(
+            w_head >= pre_batch_head_x,
+            "Codex regression: new idle flow W (head={}) must NOT \
+             jump ahead of restored bucket X (head={}) — \
+             dropped Z's vtime contribution must be preserved",
+            w_head, pre_batch_head_x
+        );
+        assert!(
+            w_head >= pre_batch_head_y,
+            "Codex regression: new idle flow W (head={}) must NOT \
+             jump ahead of restored bucket Y (head={})",
+            w_head, pre_batch_head_y
+        );
+    }
+
+    /// #913 — Codex code review R8/R9 regression. Same-bucket
+    /// multi-pop with intermediate Drop: under MQFQ
+    /// "drops consume virtual service" semantics, the dropped
+    /// item's contribution must be preserved so that surviving
+    /// packets in the same bucket retain their original
+    /// finish-time positions.
+    ///
+    /// Setup: bucket A has 3 packets [1000, 2000, 1500].
+    /// Initial state at enqueue: head_A=1000, tail_A=4500.
+    /// Original finish times: A1=1000, A2=3000, A3=4500.
+    ///
+    /// Pop A1 (1000-byte): head advances to 3000 (bytes(A2)).
+    /// Pop A2 (2000-byte): head advances to 4500 (bytes(A3)).
+    /// Drop A2 (frame too big). Orphan-cleanup helper pops
+    /// snap_2 and clamps snap_1.pre_pop_queue_vtime.
+    ///
+    /// Restore A1 via push_front. Bucket has [A3] at this point
+    /// (was_empty=false), so the active-bucket arithmetic runs:
+    /// `head -= bytes(current_head=A3=1500) = 4500-1500 = 3000`.
+    ///
+    /// THIS IS CORRECT under MQFQ drops-consume semantics:
+    /// head=3000 means "the bucket's frontier is at 3000 (post-
+    /// A2's virtual service)." When A1 is then popped:
+    /// `head += bytes(A3=1500) = 4500`. A3 ends up at finish=4500
+    /// — its ORIGINAL position — preserving A2's contribution.
+    /// Competing buckets with finish 3000-4500 correctly drain
+    /// before A3, no scheduling inversion.
+    ///
+    /// (Naive alternative: restore head from snap.pre_pop_head=1000
+    /// would lose A2's contribution. After pop A1: head=1000+1500=
+    /// 2500; A3 ends up at 2500 instead of 4500. Competing buckets
+    /// at finish 2500-4500 would unfairly drain after A3 — that's
+    /// the scheduling inversion Codex R9 flagged.)
+    #[test]
+    fn mqfq_same_bucket_multipop_drop_preserves_dropped_item_finish() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
+
+        // Single bucket A, 3 packets with mixed sizes.
+        cos_queue_push_back(queue, test_flow_cos_item(8001, 1000));
+        cos_queue_push_back(queue, test_flow_cos_item(8001, 2000));
+        cos_queue_push_back(queue, test_flow_cos_item(8001, 1500));
+        let key_a = test_session_key(8001, 5201);
+        let bucket_a = cos_flow_bucket_index(0, Some(&key_a));
+
+        // Pop A1 (1000B). head_finish advances to 3000.
+        let popped_a1 = cos_queue_pop_front(queue).expect("pop A1");
+        assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_a], 3000);
+
+        // Pop A2 (2000B). head_finish advances to 4500.
+        let _popped_a2 = cos_queue_pop_front(queue).expect("pop A2");
+        assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_a], 4500);
+        assert_eq!(queue.pop_snapshot_stack.len(), 2);
+
+        // Simulate A2 dropped via the scratch-builder Drop helper.
+        cos_queue_clear_orphan_snapshot_after_drop(queue);
+        assert_eq!(queue.pop_snapshot_stack.len(), 1);
+
+        // Restore A1 via push_front. Active-bucket arithmetic:
+        // head=4500 - bytes(A3=1500) = 3000. This is the
+        // post-A2-pop value; A2's "virtual service" is preserved.
+        cos_queue_push_front(queue, popped_a1);
+        assert_eq!(
+            queue.flow_bucket_head_finish_bytes[bucket_a], 3000,
+            "post-restore head_finish should be 3000 (post-A2-pop \
+             value, preserving A2's virtual-service contribution)"
+        );
+
+        // Critical Codex R9 assertion: pop A1 again, then verify
+        // A3 lands at its original finish=4500, NOT 2500.
+        // This is the scheduling-correctness gate — A3 must NOT
+        // jump ahead of competing buckets that were originally
+        // scheduled between A2's and A3's finish times.
+        let _popped_a1_again = cos_queue_pop_front(queue).expect("pop A1 again");
+        assert_eq!(
+            queue.flow_bucket_head_finish_bytes[bucket_a], 4500,
+            "Codex R9 regression: after dropping A2 and re-popping \
+             A1, A3 must remain at its original finish=4500 (not \
+             2500). Otherwise A3 jumps ahead of competing buckets \
+             that were originally scheduled in the [3000, 4500) \
+             window — exactly the temporal inversion #913 was \
+             supposed to prevent."
+        );
     }
 
     /// Pin that `FlowRrRing::remove` correctly de-registers a bucket

@@ -1,0 +1,75 @@
+{
+  "config": {
+    "target": "172.16.80.200",
+    "port": 7,
+    "concurrency": 10,
+    "duration_s": 60.0,
+    "payload_bytes": 64
+  },
+  "totals": {
+    "attempted": 502615,
+    "completed": 2136,
+    "errors": 500479,
+    "error_rate": 0.9957502263163654,
+    "attempts_per_coroutine": [
+      51364,
+      50764,
+      49302,
+      51550,
+      49624,
+      49162,
+      48596,
+      51192,
+      51281,
+      49780
+    ],
+    "achieved_rps_total": 35.6,
+    "attempts_per_second_per_coroutine_median": 837.8666666666667,
+    "attempts_per_second_per_coroutine_iqr": 31.270833333333258
+  },
+  "rtt_us": {
+    "p50": 2284,
+    "p95": 3136,
+    "p99": 5122,
+    "min": 967,
+    "max": 1028359,
+    "mean": 4566,
+    "iqr": 1035
+  },
+  "histogram_us": {
+    "buckets": [
+      10,
+      20,
+      50,
+      100,
+      250,
+      500,
+      1000,
+      2500,
+      5000,
+      10000,
+      25000,
+      100000
+    ],
+    "counts": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      6,
+      1607,
+      500,
+      6,
+      2,
+      15
+    ]
+  },
+  "validity": {
+    "ok": false,
+    "reasons": [
+      "error_rate=0.9958 >= 0.01"
+    ]
+  }
+}
