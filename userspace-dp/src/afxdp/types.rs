@@ -1025,8 +1025,12 @@ pub(super) struct CoSQueuePopSnapshot {
     /// (see `cos_queue_push_front`). Stale-snapshot prevention is
     /// the responsibility of the surrounding helpers, NOT a
     /// runtime fallback:
-    ///   - Batch-start clears at `tx.rs:2620`/`:2797` (hot-path
-    ///     scratch builders) and `tx.rs:4292` (push_back).
+    ///   - Batch-start clears in
+    ///     `drain_exact_local_items_to_scratch_flow_fair` and
+    ///     `drain_exact_prepared_items_to_scratch_flow_fair`
+    ///     (the hot-path scratch builders) and in
+    ///     `cos_queue_push_back` (any new enqueue invalidates
+    ///     all outstanding pop snapshots).
     ///   - Drain-start clear in `cos_queue_drain_all` (#913).
     ///   - Orphan-drop cleanup at the four scratch-builder Drop
     ///     sites via `cos_queue_clear_orphan_snapshot_after_drop`

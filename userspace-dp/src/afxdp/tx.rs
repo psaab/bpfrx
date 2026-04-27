@@ -11460,19 +11460,31 @@ mod tests {
 
         // Enqueue one 1500-byte packet on each of 10 distinct
         // flows. After enqueue, every bucket has head=tail=1500.
+        // Copilot review: select flow IDs dynamically so the test
+        // doesn't couple to a specific hash distribution. We
+        // sweep candidate IDs and accept the first 10 that land
+        // in distinct buckets.
         let mut buckets: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
-        for flow_id in 1000u16..1010 {
-            cos_queue_push_back(queue, test_flow_cos_item(flow_id, 1500));
+        let mut accepted: Vec<u16> = Vec::with_capacity(10);
+        for flow_id in 1000u16..2000u16 {
             let key = test_session_key(flow_id, 5201);
-            buckets.insert(cos_flow_bucket_index(0, Some(&key)));
+            let bucket = cos_flow_bucket_index(0, Some(&key));
+            if buckets.insert(bucket) {
+                accepted.push(flow_id);
+                if accepted.len() == 10 {
+                    break;
+                }
+            }
         }
         assert_eq!(
-            buckets.len(),
+            accepted.len(),
             10,
-            "test setup: all 10 flows must land in distinct \
-             buckets (no hash collision)"
+            "test setup: 10 distinct buckets must be selectable in [1000, 2000)"
         );
+        for flow_id in accepted {
+            cos_queue_push_back(queue, test_flow_cos_item(flow_id, 1500));
+        }
         assert_eq!(queue.queue_vtime, 0);
         assert_eq!(queue.active_flow_buckets, 10);
 
@@ -11538,19 +11550,39 @@ mod tests {
 
         // Distinct buckets X / Y / Z with mixed packet sizes so
         // each has a unique head_finish (avoids the "all-equal"
-        // numeric-coincidence case).
-        cos_queue_push_back(queue, test_flow_cos_item(7001, 1500));
-        cos_queue_push_back(queue, test_flow_cos_item(7002, 2000));
-        cos_queue_push_back(queue, test_flow_cos_item(7003, 3000));
-        let key_x = test_session_key(7001, 5201);
-        let key_y = test_session_key(7002, 5201);
-        let key_z = test_session_key(7003, 5201);
+        // numeric-coincidence case). Copilot review: select flow
+        // IDs dynamically so the test doesn't couple to a
+        // specific hash distribution.
+        let mut seen: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        let mut picks: Vec<u16> = Vec::with_capacity(3);
+        for flow_id in 7001u16..8001u16 {
+            let bucket = cos_flow_bucket_index(
+                0,
+                Some(&test_session_key(flow_id, 5201)),
+            );
+            if seen.insert(bucket) {
+                picks.push(flow_id);
+                if picks.len() == 3 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            picks.len(),
+            3,
+            "test setup: 3 distinct buckets must be selectable in [7001, 8001)"
+        );
+        let (flow_x_id, flow_y_id, flow_z_id) = (picks[0], picks[1], picks[2]);
+        cos_queue_push_back(queue, test_flow_cos_item(flow_x_id, 1500));
+        cos_queue_push_back(queue, test_flow_cos_item(flow_y_id, 2000));
+        cos_queue_push_back(queue, test_flow_cos_item(flow_z_id, 3000));
+        let key_x = test_session_key(flow_x_id, 5201);
+        let key_y = test_session_key(flow_y_id, 5201);
+        let key_z = test_session_key(flow_z_id, 5201);
         let bucket_x = cos_flow_bucket_index(0, Some(&key_x));
         let bucket_y = cos_flow_bucket_index(0, Some(&key_y));
         let bucket_z = cos_flow_bucket_index(0, Some(&key_z));
-        assert_ne!(bucket_x, bucket_y, "test setup: distinct buckets");
-        assert_ne!(bucket_y, bucket_z, "test setup: distinct buckets");
-        assert_ne!(bucket_x, bucket_z, "test setup: distinct buckets");
 
         let pre_batch_head_x = queue.flow_bucket_head_finish_bytes[bucket_x];
         let pre_batch_head_y = queue.flow_bucket_head_finish_bytes[bucket_y];
@@ -11601,12 +11633,24 @@ mod tests {
         assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_x], pre_batch_head_x);
         assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_y], pre_batch_head_y);
 
-        // Now enqueue a new idle flow W with a small packet.
-        cos_queue_push_back(queue, test_flow_cos_item(7004, 100));
-        let key_w = test_session_key(7004, 5201);
+        // Now enqueue a new idle flow W with a small packet. Pick
+        // its flow ID dynamically so its bucket is distinct from
+        // the restored X and Y buckets.
+        let mut flow_w_id: u16 = 0;
+        for candidate in 8001u16..9001u16 {
+            let bucket = cos_flow_bucket_index(
+                0,
+                Some(&test_session_key(candidate, 5201)),
+            );
+            if bucket != bucket_x && bucket != bucket_y && bucket != bucket_z {
+                flow_w_id = candidate;
+                break;
+            }
+        }
+        assert_ne!(flow_w_id, 0, "test setup: distinct W bucket selectable");
+        cos_queue_push_back(queue, test_flow_cos_item(flow_w_id, 100));
+        let key_w = test_session_key(flow_w_id, 5201);
         let bucket_w = cos_flow_bucket_index(0, Some(&key_w));
-        assert_ne!(bucket_w, bucket_x);
-        assert_ne!(bucket_w, bucket_y);
         let w_head = queue.flow_bucket_head_finish_bytes[bucket_w];
 
         // CORE ASSERTION: W cannot jump ahead of the restored
