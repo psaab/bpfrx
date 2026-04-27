@@ -12128,9 +12128,9 @@ mod tests {
         let popped_a1 = cos_queue_pop_front(queue).expect("pop A1");
         assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_a], 3000);
 
-        // Pop C: bucket C drains (A.head_finish=3000 < C=2500? No,
-        // 3000 > 2500 so MQFQ picks C next). After pop: C empty;
-        // C.head_finish reset to 0.
+        // Pop C: MQFQ picks min-finish-first; with A.head=3000
+        // and C.head=2500, C.head < A.head so C is the next pop.
+        // After pop: bucket C empty; C.head_finish reset to 0.
         let popped_c = cos_queue_pop_front(queue).expect("pop C");
         assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_c], 0);
 
