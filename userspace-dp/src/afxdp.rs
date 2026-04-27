@@ -153,10 +153,42 @@ const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_FRAME_SHIFT: u32 = 12;
 const _: () = assert!(1u32 << UMEM_FRAME_SHIFT == UMEM_FRAME_SIZE);
 const UMEM_HEADROOM: u32 = 256;
-const RX_BATCH_SIZE: u32 = 256;
+// #920: batch sizes lowered from 256 to 64 to keep the per-batch
+// working set within typical 32 KB L1d (~10-14 KB at 64 packets:
+// 64 × 96 B `UserspaceDpMeta` + 64 × 64-128 B headers + scratch
+// state) and reduce the worst-case head-of-line latency for a
+// mouse packet trailing an elephant burst by 4× — at 25 Gb/s and
+// 1500-byte MTU each packet is ~480 ns, so 63 packets ahead = 30 µs
+// vs 122 µs at the prior batch of 256. Also caps the kernel-side
+// NAPI busy-poll budget via SO_BUSY_POLL_BUDGET in bind.rs at 64.
+//
+// Tradeoff: per-poll throughput drops from
+// `MAX_RX_BATCHES_PER_POLL × <pre-#920 RX_BATCH_SIZE = 256>`
+// to `MAX_RX_BATCHES_PER_POLL × RX_BATCH_SIZE` packets per binding
+// poll cycle (4 × 256 = 1024 → 4 × 64 = 256 at the current
+// constants). Kept `MAX_RX_BATCHES_PER_POLL = 4` (rather than
+// raising to 16) because the latency goal of #920 directly
+// benefits from more frequent yields. Throughput
+// regression-checked in cluster smoke.
+//
+// Future bumps require re-validating: (a) L1d footprint vs
+// per-batch allocation; (b) per-poll budget interaction with
+// `MAX_RX_BATCHES_PER_POLL`; (c) the rate-quantum test
+// `guarantee_phase_*_visit_quantum` in tx.rs. The const_asserts
+// below force the change to fail compilation rather than silently
+// regress the validation surface.
+const RX_BATCH_SIZE: u32 = 64;
+const _: () = assert!(
+    RX_BATCH_SIZE == 64,
+    "changing RX_BATCH_SIZE requires re-validating L1d footprint and per-poll budget"
+);
 const MIN_RESERVED_TX_FRAMES: u32 = 256;
 const MAX_RESERVED_TX_FRAMES: u32 = 8192;
-const TX_BATCH_SIZE: usize = 256;
+const TX_BATCH_SIZE: usize = 64;
+const _: () = assert!(
+    TX_BATCH_SIZE == 64,
+    "changing TX_BATCH_SIZE requires re-validating COS guarantee quantum + snapshot stack bound"
+);
 const PENDING_TX_LIMIT_MULTIPLIER: usize = 2;
 const FILL_BATCH_SIZE: usize = 1024;
 const MAX_RX_BATCHES_PER_POLL: usize = 4;
