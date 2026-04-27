@@ -1191,8 +1191,10 @@ pub(super) struct CoSQueueRuntime {
     /// catch regressions in dev/test. Preallocated to that capacity
     /// so no hot-path realloc occurs. Each entry is 24 bytes
     /// (`CoSQueuePopSnapshot`), so the worst-case footprint is
-    /// 256 × 24 = ~6 KB per queue — on top of the 1024-bucket
-    /// bookkeeping arrays already resident in `CoSQueueRuntime`.
+    /// `TX_BATCH_SIZE × 24` bytes per queue — on top of the
+    /// 1024-bucket bookkeeping arrays already resident in
+    /// `CoSQueueRuntime`. Lowered from 256 → 64 in #920 (worst-case
+    /// stack ~1.5 KB).
     ///
     /// Why a stack and not a single `Option`: earlier drained
     /// buckets in a batched rollback (e.g. N pops across M buckets,

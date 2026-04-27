@@ -178,10 +178,10 @@ pub(super) fn reap_tx_completions(
     drop(completed);
     // #812: completion stamp — single fresh `monotonic_nanos()` for
     // the entire reap batch (plan §3.1 completion-ts site). Amortised
-    // one VDSO call per reap (worst-case ~15 ns / 256-packet batch =
-    // 0.06 ns/pkt on the steady-state path; ~15 ns/pkt on the
-    // `reaped == 1` partial-batch worst case — same shape as the
-    // submit-stamp cost analysis in plan §3.4).
+    // one VDSO call per reap (worst-case ~15 ns / TX_BATCH_SIZE-packet
+    // batch = ~0.23 ns/pkt at the post-#920 batch of 64;
+    // ~15 ns/pkt on the `reaped == 1` partial-batch worst case —
+    // same shape as the submit-stamp cost analysis in plan §3.4).
     let ts_completion = monotonic_nanos();
     // #812: delegate the per-offset fold to the shared helper so
     // tests exercising `record_tx_completions_with_stamp` cover the
@@ -13127,12 +13127,61 @@ mod tests {
         root.nonempty_queues = 1;
         root.runnable_queues = 1;
 
+        // #920: TX_BATCH_SIZE lowered 256 → 64 caps a single visit at
+        // 64 items even when token budget would permit more (~166).
+        // The remaining tokens stay with the queue for the next visit;
+        // throughput is preserved across multiple shorter visits, with
+        // the trade-off that mouse packets get an interleave point
+        // every 64 packets instead of every 256.
         let batch = select_cos_guarantee_batch(&mut root, 1).expect("guarantee batch");
         match batch {
-            CoSBatch::Local { items, .. } => assert_eq!(items.len(), 166),
+            CoSBatch::Local { items, .. } => assert_eq!(items.len(), TX_BATCH_SIZE),
             CoSBatch::Prepared { .. } => panic!("expected local batch"),
         }
-        assert_eq!(root.queues[0].items.len(), 34);
+        assert_eq!(root.queues[0].items.len(), 200 - TX_BATCH_SIZE);
+    }
+
+    /// #920: separate from the batch-cap test above. Asserts the
+    /// rate-quantum invariant guarded by the original test name —
+    /// a 10 Gbps queue gets a strictly larger byte-budget visit
+    /// quantum than a 100 Mbps queue, regardless of TX_BATCH_SIZE.
+    /// Guards against silent regression if `cos_guarantee_quantum_bytes`
+    /// stops scaling with `transmit_rate_bytes`.
+    #[test]
+    fn guarantee_phase_quantum_scales_with_rate() {
+        use super::cos_guarantee_quantum_bytes;
+        let high_rate = test_cos_runtime_with_queues(
+            10_000_000_000u64 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000u64 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 256 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let low_rate = test_cos_runtime_with_queues(
+            100_000_000u64 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-low".into(),
+                priority: 5,
+                transmit_rate_bytes: 100_000_000u64 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 256 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let high_q = cos_guarantee_quantum_bytes(&high_rate.queues[0]);
+        let low_q = cos_guarantee_quantum_bytes(&low_rate.queues[0]);
+        assert!(
+            high_q > low_q,
+            "high-rate quantum ({high_q}) must exceed low-rate quantum ({low_q})"
+        );
     }
 
     #[test]
@@ -13443,7 +13492,9 @@ mod tests {
     //     is a ring-buffer write + release store on the producer index,
     //     ~20 ns combined on x86-64, amortized away at TX_BATCH_SIZE).
     //   - The `sendto()` syscall used for kernel TX wakeup (amortized
-    //     over TX_BATCH_SIZE = 256 packets, ~2–4 ns per packet).
+    //     over TX_BATCH_SIZE packets — ~2–4 ns per packet at the
+    //     pre-#920 batch of 256; ~10–15 ns per packet at the new
+    //     batch of 64).
     //   - Completion ring reap (`reap_tx_completions`) — ~20–50 ns per
     //     completion, mostly ring-buffer read + VecDeque push-back.
     //   - All non-drain per-worker cost: RX, forwarding, NAT, session
