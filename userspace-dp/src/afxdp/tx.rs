@@ -4151,7 +4151,13 @@ fn cos_queue_flow_share_limit(
     // 24 KB MIN floor matches TCP cwnd at 77 Mbps/flow.
     if queue.shared_exact {
         let prospective = cos_queue_prospective_active_flows(queue, flow_bucket);
-        let fair_share = buffer_limit / prospective.max(1);
+        // Copilot C.2: use `div_ceil` to match the legacy owner-local
+        // path below. Truncating division systematically undersizes
+        // the per-flow cap by up to (prospective - 1) bytes when
+        // `buffer_limit` is not divisible by `prospective`, increasing
+        // boundary-condition tail-drops. The legacy path picked
+        // div_ceil for that reason; shared_exact should follow.
+        let fair_share = buffer_limit.div_ceil(prospective.max(1));
         let bdp = bdp_floor_bytes(queue.transmit_rate_bytes, prospective);
         return fair_share
             .saturating_mul(SHARED_EXACT_BURST_HEADROOM)
@@ -5556,11 +5562,17 @@ fn apply_cos_queue_flow_fair_promotion(
 /// fast-path struct (e.g. a `min_local_flow_count` guarantee for
 /// the cross-worker DRR work) is automatically visible here.
 ///
-/// **Adversarial review posture (campaign #775 / issue #785):**
-/// reviewers MUST reject PRs that drop the `!shared_exact` clause
-/// without also landing a cross-worker fairness mechanism AND
-/// re-validating the CoV target. The `shared_exact` shadow cached
-/// onto `CoSQueueRuntime` is the hook a future fix will branch on.
+/// **Adversarial review posture (post-#914):** the historical
+/// `!shared_exact` gate is no longer in policy — `flow_fair =
+/// queue.exact` for both shared_exact and owner-local-exact. The
+/// `shared_exact` shadow cached onto `CoSQueueRuntime` is now the
+/// branch point used by `cos_queue_flow_share_limit` to apply the
+/// rate-aware admission cap (`max(fair_share*2, bdp_floor)`)
+/// instead of the legacy aggregate/N share cap. Reviewers should
+/// reject PRs that re-introduce the rate-unaware MIN-floor cap on
+/// shared_exact without also re-validating iperf-c P=12 ≥ 22 Gbps
+/// and the same-class iperf-b mouse-latency p99 (the regressions
+/// historical Attempts A and B hit).
 ///
 /// The SFQ salt is drawn only for queues that actually use the
 /// flow-fair path — non-flow-fair queues never consult the seed
@@ -15407,13 +15419,16 @@ mod tests {
     // steering (or a single shared SFQ across workers), tracked in
     // the follow-up issue.
     //
-    // Adversarial review posture (campaign #775 / issue #785):
-    // reviewers MUST reject PRs that drop the `!shared_exact` clause
-    // from `promote_cos_queue_flow_fair` without also landing a
-    // cross-worker fairness mechanism AND re-validating
-    // `iperf3 -P 12 -p 5203` at 25 Gbps (expect SUM ≥ 22 Gbps AND
-    // per-flow CoV ≤ 20 %). The tests below drive the full
-    // production promotion path (via
+    // Adversarial review posture (post-#914): the historical
+    // `!shared_exact` gate is no longer in policy. shared_exact
+    // now runs MQFQ flow-fair AND a rate-aware admission cap
+    // (`max(fair_share*2, bdp_floor).clamp(MIN, buffer_limit)` —
+    // see `cos_queue_flow_share_limit`). Reviewers should reject
+    // PRs that re-introduce the rate-unaware MIN-floor cap on
+    // shared_exact without also re-validating
+    // `iperf3 -P 12 -p 5203` ≥ 22 Gbps AND per-flow CoV ≤ 20 %
+    // (the regression Attempt A hit). The tests below drive the
+    // full production promotion path (via
     // `apply_cos_queue_flow_fair_promotion` with hand-authored
     // `WorkerCoSQueueFastPath` vectors) so breaking the zip alignment
     // at the `ensure_cos_interface_runtime` call site — or feeding
