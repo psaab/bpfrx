@@ -29,9 +29,31 @@ PRIMARY="xpf-userspace-fw0"
 SECONDARY="xpf-userspace-fw1"
 SOURCE="cluster-userspace-host"
 TARGET_V4="172.16.80.200"
-ELEPHANT_PORT=5201
-MOUSE_PORT=7
-SHAPER_BPS=$((1 * 1000 * 1000 * 1000))  # 1 Gb/s for iperf-a
+# #929: env-var overridable so test-mouse-latency-same-class.sh
+# can run the same-class variant at the iperf-b 10 Gb/s shaper
+# rate while still sending mice to port 7; the same-class CoS
+# fixture reclassifies port 7 as iperf-b instead of best-effort.
+# SHAPER_BPS MUST move with ELEPHANT_PORT because the cwnd-settle
+# and collapse gates compare against it.
+ELEPHANT_PORT="${ELEPHANT_PORT:-5201}"
+MOUSE_PORT="${MOUSE_PORT:-7}"
+MOUSE_CLASS="${MOUSE_CLASS:-best-effort}"
+SHAPER_BPS="${SHAPER_BPS:-$((1 * 1000 * 1000 * 1000))}"  # default 1 Gb/s (iperf-a); same-class iperf-b sets 10 Gb/s
+# Validate env-overrides (Copilot D.5): ports/bps must be
+# digits only so they can't smuggle shell metacharacters into
+# the remote `bash -c` interpolations below, and MOUSE_CLASS is
+# whitelisted to the four configured forwarding classes so a
+# typo can't slip a stray value into manifest.json.
+[[ "$ELEPHANT_PORT" =~ ^[0-9]+$ ]] \
+    || { echo "ABORT: ELEPHANT_PORT='$ELEPHANT_PORT' must be digits" >&2; exit 1; }
+[[ "$MOUSE_PORT" =~ ^[0-9]+$ ]] \
+    || { echo "ABORT: MOUSE_PORT='$MOUSE_PORT' must be digits" >&2; exit 1; }
+[[ "$SHAPER_BPS" =~ ^[0-9]+$ ]] \
+    || { echo "ABORT: SHAPER_BPS='$SHAPER_BPS' must be digits" >&2; exit 1; }
+case "$MOUSE_CLASS" in
+    best-effort|iperf-a|iperf-b|iperf-c) ;;
+    *) echo "ABORT: MOUSE_CLASS='$MOUSE_CLASS' must be one of best-effort/iperf-a/iperf-b/iperf-c" >&2; exit 1 ;;
+esac
 SETTLE_BUDGET=20
 SLACK=10
 
@@ -149,13 +171,31 @@ incus_exec "$SOURCE" sh -c \
 incus_run file push "${SCRIPT_DIR}/mouse_latency_probe.py" \
     "${INCUS_REMOTE}:${SOURCE}/tmp/mouse_latency_probe.py"
 
+# ---- step 0: echo-daemon preflight (Copilot D.3: must run BEFORE
+# any CoS state mutation so a failure leaves the cluster in
+# whatever state preceded this rep, not in the same-class fixture).
+# Uses bash /dev/tcp rather than `nc -zw1` because the source
+# container doesn't ship netcat by default.
+if ! incus_exec "$SOURCE" timeout 2 bash -c \
+        "exec 3<>/dev/tcp/${TARGET_V4}/${MOUSE_PORT}" \
+        > /dev/null 2>&1; then
+    echo "ABORT: mouse echo not reachable on ${TARGET_V4}:${MOUSE_PORT}" >&2
+    echo "       (set MOUSE_PORT or stand up the echo daemon)" >&2
+    exit 1
+fi
+
 # ---- step 1: CoS preflight (fixture-apply only, plan §3.3 + R4 MED 4).
 # Copilot R3 #5: apply-cos-config replicates from primary to peer, so
 # it must run against the current RG0 primary. If the cluster has
 # already failed over before the rep starts, hard-coding fw0 would
 # attempt to apply on the secondary.
 PRE_PRIMARY=$(current_primary)
-"${SCRIPT_DIR}/apply-cos-config.sh" "${INCUS_REMOTE}:${PRE_PRIMARY}" \
+APPLY_COS_FLAGS=()
+if [[ "$MOUSE_CLASS" == "iperf-b" ]]; then
+    APPLY_COS_FLAGS+=(--same-class)
+fi
+"${SCRIPT_DIR}/apply-cos-config.sh" "${APPLY_COS_FLAGS[@]}" \
+    "${INCUS_REMOTE}:${PRE_PRIMARY}" \
     > "${OUT_DIR}/cos-apply.log" 2>&1
 
 # ---- step 3: RG state polling at 1 Hz (plan §4.5 step 3)
@@ -417,16 +457,34 @@ case "$rg_rc" in
 esac
 
 # ---- step 11: manifest write
-cat > "${OUT_DIR}/manifest.json" <<EOF
-{
-  "N": $N,
-  "M": $M,
-  "duration_s": $DURATION,
-  "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "screen_engaged": $screen_engaged,
-  "ha_transition_seen": $ha_seen,
-  "mpstat_avg_busy": "${mpstat_busy:-0}"
+# Copilot D.4: emit via python3 -c json.dump so string fields are
+# properly JSON-escaped and numeric fields are typed correctly.
+# The env-var validation block at the top of the script enforces
+# digits-only ports/bps and a whitelisted MOUSE_CLASS, but
+# defensive escaping here costs nothing and keeps the manifest
+# schema-stable if the validation ever drifts.
+STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+N="$N" M="$M" DURATION="$DURATION" STARTED_AT="$STARTED_AT" \
+SCREEN_ENGAGED="$screen_engaged" HA_TRANSITION_SEEN="$ha_seen" \
+MPSTAT_AVG_BUSY="${mpstat_busy:-0}" \
+ELEPHANT_PORT="$ELEPHANT_PORT" MOUSE_PORT="$MOUSE_PORT" \
+MOUSE_CLASS="$MOUSE_CLASS" SHAPER_BPS="$SHAPER_BPS" \
+python3 -c '
+import json, os
+manifest = {
+    "N": int(os.environ["N"]),
+    "M": int(os.environ["M"]),
+    "duration_s": int(os.environ["DURATION"]),
+    "started_at": os.environ["STARTED_AT"],
+    "screen_engaged": os.environ["SCREEN_ENGAGED"].lower() == "true",
+    "ha_transition_seen": int(os.environ["HA_TRANSITION_SEEN"]),
+    "mpstat_avg_busy": os.environ["MPSTAT_AVG_BUSY"],
+    "elephant_port": int(os.environ["ELEPHANT_PORT"]),
+    "mouse_port": int(os.environ["MOUSE_PORT"]),
+    "mouse_class": os.environ["MOUSE_CLASS"],
+    "shaper_bps": int(os.environ["SHAPER_BPS"]),
 }
-EOF
+print(json.dumps(manifest, indent=2))
+' > "${OUT_DIR}/manifest.json"
 
 echo "REP OK"
