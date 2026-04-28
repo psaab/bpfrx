@@ -1,292 +1,281 @@
 # #949 PR1: Sharded mutex for `dynamic_neighbors`
 
-Plan v2 — 2026-04-28. Addresses Codex hostile review (task-moivkugr-o7whtp,
-verdict NEEDS-MAJOR).
+Plan v3 — 2026-04-28. Addresses Codex re-review (task-moiwejlv-xpf4w1).
 
 ## Issue scope correction
 
-#949 originally proposed BOTH RCU/ArcSwap (for routing/config/FIB) AND
-sharded mutex (for sessions/neighbors). Codex investigation
-(task-moivbi68-p0r5vx) found the ArcSwap part is **already done**:
-
-- `shared_forwarding`, `shared_validation`, `ha_state`, fabrics, CoS
-  maps are already `ArcSwap` (`coordinator.rs:15-31`,
-  `worker.rs:716-773,796`).
-- TX inbox is already lock-free (`mpsc_inbox.rs`).
-- Telemetry is already atomics.
-
-**Honest framing**: this PR is **NOT RCU and NOT immutable-state**.
-It is "reduce mutex contention for the dynamic neighbor cache via
-sharding." The plan title and any commit / PR description must reflect
-this (per Codex Q2). The original issue title's "RCU / Immutable State
-Pattern" framing is incorrect for the remaining work.
+#949 originally proposed BOTH RCU/ArcSwap AND sharded mutex. ArcSwap
+is **already done** in current code (`coordinator.rs:15-31`). Honest
+framing for this PR: **NOT RCU and NOT immutable-state**. It is
+"reduce mutex contention for the dynamic neighbor cache via
+sharding." The PR title and commit message reflect this.
 
 ## Why dynamic_neighbors first (and only in PR 1)
 
 - Smallest blast radius. Fewer call sites than session maps.
 - Cleanest pattern. `(key, NeighborEntry)` lookup/insert with
-  `NeighborEntry: Copy` (verified at `userspace-dp/src/afxdp/types.rs:382`,
-  Codex Q4 AGREE).
-- Established read pattern. Reads always lock → get → copy MAC →
-  release. No held references across syscalls.
-- Real contention. Every flow-cache miss performs a neighbor lookup
-  on this mutex.
+  `NeighborEntry: Copy` (`userspace-dp/src/afxdp/types.rs:382`).
+- Reads always lock → get → copy MAC → release. No held references.
+- Real contention: every flow-cache miss does a neighbor lookup.
 
-Session maps (`shared_sessions` × 3) and the `OwnerRgSessionIndex` are
-**deeply coupled** — Codex Q8 confirms PR 2 needs a composite
-abstraction with explicit lock ordering, not a simple mechanical
-shard. PR 2 has its own plan.
+Session maps (`shared_sessions` × 3) and `OwnerRgSessionIndex` are
+deeply coupled — PR 2 needs a composite abstraction with explicit
+lock ordering, not a simple mechanical shard. PR 2 has its own plan.
 
-## Affected files (corrected per Codex Q6)
+## Honest production effect of poison policy
 
-The v1 estimate "~30 line-level edits across 5-6 files" was wrong.
-Actual scope:
+The v2 plan claimed `#925` worker supervisor would respawn on panic.
+**This is wrong**: workers are plain `thread::spawn(move || worker_loop(...))`
+at `coordinator.rs:709` with no `catch_unwind`, and #925 is not yet
+implemented. A panic on poisoned mutex would terminate the worker
+thread and leave the binding dead until daemon restart.
 
-| File | `.lock()` sites | Type-occurrence sites |
+Decision: use **`.lock().unwrap_or_else(|e| e.into_inner())`** —
+ignore poison. Rationale:
+
+- `NeighborEntry` is plain `[u8; 6]` (no invariants to corrupt).
+- The shard `FastMap` may have a half-applied insert/remove — at
+  worst, one key's MAC is wrong or stale. The next ARP/NA learn or
+  netlink update overwrites it.
+- A panic-then-thread-death is operationally worse than a stale MAC.
+- This is also what `parking_lot::Mutex` would do natively (no
+  poisoning at all).
+
+When #925 lands with `catch_unwind` + respawn, the policy can
+revisit fail-loud as a follow-up. Documented in code comments.
+
+## Affected files (corrected per Codex Q6 round 2)
+
+| File | `.lock()` runtime sites | Type-occurrence sites |
 |---|---|---|
-| `coordinator.rs` | 4 | 5 |
-| `neighbor.rs` | 4 | 4 (param sigs) |
+| `coordinator.rs` | 5 | 5 |
+| `worker.rs` | 0 | 1 (param sig at L446) |
+| `neighbor.rs` | 4 | 4 |
 | `forwarding.rs` | 2 | 2 |
-| `afxdp.rs` | 2 | ~6 |
+| `afxdp.rs` | 3 | ~6 |
 | `shared_ops.rs` | 0 | 4 (passed-through) |
-| `session_glue.rs` | 0 | ~3 (passed-through, tests) |
+| `session_glue.rs` | 0 | ~3 (passed-through) |
 | `tunnel.rs` | 0 | ~2 |
 | `ha.rs` | 0 | ~2 |
-| `icmp.rs`, `icmp_embed.rs` | 0 | ~4 (passed-through) |
-| **Test constructors** | 0 | ~10 (test-only) |
-| **Production runtime** | **12** | **~44** |
+| `icmp.rs`, `icmp_embed.rs` | 0 | ~4 |
+| `frame.rs` | 0 | 1 (test constructor at L3722) |
+| **Test constructors** (across all `*_test.rs` and inline tests) | 0 | **~49** |
+| **Production runtime total** | **~14** | **~50** |
 
-Total: ~12 runtime `.lock()` sites + ~44 type-occurrence rewrites.
-Realistic edit volume: 100-150 line-level changes including tests.
+Realistic edit volume: 200-250 line-level changes including all 49
+test constructors. Bigger than v2's "100-150" estimate.
 
-Affected files explicitly: `coordinator.rs`, `neighbor.rs`,
-`forwarding.rs`, `afxdp.rs`, `shared_ops.rs`, `session_glue.rs`,
-`tunnel.rs`, `ha.rs`, `icmp.rs`, `icmp_embed.rs`, plus test files.
-This is more than the v1 plan claimed.
+## Existing single-lock batch semantics
 
-## Existing single-lock batch semantics (Codex Q3 — DISAGREE on prior)
+The single mutex is held across multi-key sequences at four sites
+that must be preserved as atomic-vs-readers:
 
-The v1 plan missed three production sites that hold the single lock
-across multiple operations and depend on atomicity-vs-readers:
+1. **`apply_manager_neighbors`** at `coordinator.rs:177-186` — under
+   one lock: removes old manager keys, inserts new entries. Readers
+   see pre-replace or post-replace, never a half-replaced set.
+2. **`reset_dynamic_neighbors`** at `coordinator.rs:295` (clear).
+3. **Bulk-remove of stale manager keys** at `coordinator.rs:1029`.
+4. **Multi-ifindex insert** at `afxdp.rs:3379-3383` — same `(src_ip,
+   src_mac)` inserted under both physical and logical ifindexes
+   (corrected from v2's mis-classification of this as "clear").
 
-1. **Manager replace** at `coordinator.rs:177-185` — removes/inserts
-   multiple manager-owned entries under a single lock. Readers see
-   either pre-replace or post-replace state, never a half-replaced
-   set.
-2. **Map clear** at `coordinator.rs:295` — single-lock clear.
-3. **Bulk-remove of stale manager keys** at `coordinator.rs:1029` —
-   removes a set of entries under a single lock.
-
-Sharded per-key calls would make these partial across shards. The
-sharded API must therefore include **bulk operations with deterministic
-shard lock ordering**:
+The sharded API exposes both per-key methods AND a `with_all_shards`
+escape hatch for true atomic-across-keys writes:
 
 ```rust
 impl ShardedNeighborMap {
-    /// Replace all manager entries atomically across shards.
-    /// Locks all shards in shard-index order, applies the change, releases.
-    pub fn replace_manager_entries(
-        &self,
-        new_entries: impl IntoIterator<Item = ((i32, IpAddr), NeighborEntry)>,
-        is_manager_owned: impl Fn(&NeighborEntry) -> bool,
-    );
+    /// Per-key fast path (sub-microsecond).
+    pub fn get(&self, key: &(i32, IpAddr)) -> Option<NeighborEntry>;
+    pub fn insert(&self, key: (i32, IpAddr), val: NeighborEntry);
+    pub fn remove(&self, key: &(i32, IpAddr));
 
-    /// Clear the map across all shards. Lock-all-then-clear.
-    pub fn clear(&self);
+    /// Returns true if the cache changed (new key OR different MAC).
+    /// Maps to current `update_dynamic_neighbor` semantics at
+    /// `neighbor.rs:189`.
+    pub fn insert_if_changed(&self, key: (i32, IpAddr), val: NeighborEntry) -> bool;
 
-    /// Remove a set of keys atomically across shards.
-    pub fn remove_many<I>(&self, keys: I) where I: IntoIterator<Item = (i32, IpAddr)>;
+    /// Returns true if the key was present before removal.
+    /// Maps to current `remove_dynamic_neighbor` semantics at
+    /// `neighbor.rs:206`.
+    pub fn remove_if_present(&self, key: &(i32, IpAddr)) -> bool;
+
+    /// Lock all shards in shard-index order (ascending) and run the
+    /// closure. Used by replace/clear/multi-key-insert sites.
+    /// Deadlock-free as long as ALL bulk operations also lock in
+    /// ascending shard-index order.
+    pub fn with_all_shards<R, F>(&self, f: F) -> R
+    where F: FnOnce(&mut [FastMap<(i32, IpAddr), NeighborEntry>; NUM_SHARDS]) -> R;
+
+    /// Sum of len() across all shards. Used by
+    /// `dynamic_neighbor_status` at `coordinator.rs:208`.
+    /// Locks all shards in order.
+    pub fn len(&self) -> usize;
 }
 ```
 
-Lock-all-in-shard-order avoids deadlock with any future caller that
-locks individual shards (deadlock-free as long as everyone uses
-ascending shard order). Documented invariant in the type.
+`apply_manager_neighbors` becomes:
+
+```rust
+self.dynamic_neighbors.with_all_shards(|shards| {
+    if replace {
+        for key in &old_manager_keys {
+            shards[shard_idx(key)].remove(key);
+        }
+    }
+    for (ifindex, ip, entry) in neighbors {
+        shards[shard_idx(&(*ifindex, *ip))].insert((*ifindex, *ip), *entry);
+    }
+});
+```
+
+`afxdp.rs:3379` (multi-ifindex insert for one IP) becomes:
+
+```rust
+dynamic_neighbors.with_all_shards(|shards| {
+    for ifindex in ifindexes {
+        shards[shard_idx(&(ifindex, src_ip))]
+            .insert((ifindex, src_ip), NeighborEntry { mac: src_mac });
+    }
+});
+```
+
+(Two ifindexes likely hash to different shards. Locking all 64 for
+two keys is wasteful per-call but the call site is rare; correctness
+trumps micro-perf here. Alternative: a `with_keys_locked(&[k1, k2],
+f)` API that locks only the affected shards in shard-index order.
+Defer optimization.)
 
 ## Design
 
-### Shard hash independent of FastMap inner hash (Codex Q1 — DISAGREE on prior)
+### Shard hash independent of FastMap inner hash
 
-The v1 plan used FxHash for shard selection AND the inner FastMap.
-Both `hashbrown`/`FastMap` and `FxHasher` use low hash bits for bucket
-selection. Using the same hash means keys in shard `i` all share the
-same low 6 bits → can poison the inner FastMap distribution.
-
-Fix: use **rotated/mixed FxHash** for shard selection:
+Use rotated/mixed FxHash for shard selection to break correlation
+with the inner `FastMap` bucket-selection hash:
 
 ```rust
-fn shard_idx(&self, key: &(i32, IpAddr)) -> usize {
+fn shard_idx(key: &(i32, IpAddr)) -> usize {
     let mut hasher = FxHasher::default();
     key.hash(&mut hasher);
     let h = hasher.finish();
-    // Mix high bits into low to break correlation with FastMap's inner
-    // bucket-selection hash.
     let mixed = h.wrapping_mul(0x9E3779B97F4A7C15) ^ (h >> 32);
     (mixed as usize) & (NUM_SHARDS - 1)
 }
 ```
 
-Test plan covers `/24`, `/16`, IPv6 SLAAC-like, and constant-ifindex
-key distributions. Acceptance: max-shard load within 2× ideal
-(64-shard ideal = 1/64; max ≤ 2/64).
-
-### Cache-line padded shards (Codex High issue)
-
-`Mutex<FastMap<...>>` is small. Adjacent shards share cache lines, so
-contention on shard `i+1` causes false-sharing on shard `i`.
-
-Fix: cache-line padding (64 B on x86_64):
+### Cache-line padded shards
 
 ```rust
 #[repr(align(64))]
 struct PaddedShard(Mutex<FastMap<(i32, IpAddr), NeighborEntry>>);
 ```
 
-Verified via `mem::size_of::<PaddedShard>()` ≥ 64 in a unit test.
-
-### Poison policy (Codex High issue)
-
-A poisoned `Mutex` shard silently blackholes that key range if every
-caller uses `.lock().ok()`. Three policies considered:
-
-| Policy | Pros | Cons |
-|---|---|---|
-| `into_inner()` recovery + log | Self-healing | Hides bugs; non-deterministic |
-| Fail-loud (panic on poison) | Loud, debuggable | Worker death on rare bug |
-| Re-init the shard on poison | Self-healing, deterministic | Adds complexity |
-
-**Decision**: fail-loud. Match existing project style — workers
-already panic on programmer errors; supervisor (#925) will respawn.
-Implementation:
-
-```rust
-fn shard_lock(&self, key: &(i32, IpAddr)) -> MutexGuard<'_, FastMap<...>> {
-    self.shards[self.shard_idx(key)].0.lock()
-        .unwrap_or_else(|e| {
-            log::error!("dynamic_neighbors shard mutex poisoned: {:?}", e);
-            panic!("poisoned mutex on dynamic_neighbors fast path");
-        })
-}
-```
-
-Worker supervisor will respawn the worker; the shard re-initializes
-on the next epoch.
-
-### Audit of all production callers (Codex Q5 — DISAGREE on prior)
-
-Explicit list of every production `.lock()` on `dynamic_neighbors`:
-
-| Site | Operation | Pattern after refactor |
-|---|---|---|
-| `afxdp.rs:928` | insert (ARP learn) | `.insert(key, val)` |
-| `afxdp.rs:996` | insert (NA learn) | `.insert(key, val)` |
-| `afxdp.rs:3115` | get + retry pending | `.get(&key)` |
-| `afxdp.rs:3379` | clear (reset epoch) | `.clear()` (bulk) |
-| `coordinator.rs:177` | replace manager entries | `.replace_manager_entries(...)` (bulk) |
-| `coordinator.rs:295` | clear | `.clear()` (bulk) |
-| `coordinator.rs:1029` | bulk-remove stale | `.remove_many(...)` (bulk) |
-| `forwarding.rs:216` | get | `.get(&key)` |
-| `forwarding.rs:1509` | get | `.get(&key)` |
-| `neighbor.rs:189-214` | netlink read+write | mixed get/insert |
-
-Zero callers iterate the map (`.iter()` / `.values()` / `.keys()`).
-Confirmed by Codex.
+Verified via `mem::align_of::<PaddedShard>() >= 64` in a unit test
+(corrected from v2's `mem::size_of` per Codex).
 
 ### Final type
 
 ```rust
+pub(crate) const NUM_SHARDS: usize = 64;
+
 pub(crate) struct ShardedNeighborMap {
-    shards: [PaddedShard; NUM_SHARDS],  // NUM_SHARDS = 64
+    shards: [PaddedShard; NUM_SHARDS],
 }
 
 #[repr(align(64))]
 struct PaddedShard(Mutex<FastMap<(i32, IpAddr), NeighborEntry>>);
-
-impl ShardedNeighborMap {
-    pub fn new() -> Self { /* default-init 64 padded shards */ }
-    pub fn get(&self, key: &(i32, IpAddr)) -> Option<NeighborEntry> { /* ... */ }
-    pub fn insert(&self, key: (i32, IpAddr), val: NeighborEntry) { /* ... */ }
-    pub fn remove(&self, key: &(i32, IpAddr)) { /* ... */ }
-    pub fn clear(&self) { /* lock-all-in-order, clear all */ }
-    pub fn remove_many<I>(&self, keys: I) where I: IntoIterator<Item = (i32, IpAddr)> { /* ... */ }
-    pub fn replace_manager_entries<E, F>(&self, new: E, is_manager: F)
-    where E: IntoIterator<Item = ((i32, IpAddr), NeighborEntry)>,
-          F: Fn(&NeighborEntry) -> bool { /* ... */ }
-}
 ```
 
-No `for_each` API in PR 1 (no caller needs it).
+## Audit of all production callers (extended)
+
+| Site | Operation | Replacement |
+|---|---|---|
+| `afxdp.rs:928` | insert (ARP learn) | `.insert(...)` |
+| `afxdp.rs:996` | insert (NA learn) | `.insert(...)` |
+| `afxdp.rs:3115` | get + retry pending | `.get(&key)` |
+| `afxdp.rs:3379` | multi-ifindex insert | `.with_all_shards(\|s\| ...)` |
+| `coordinator.rs:177-186` | replace (remove + insert) | `.with_all_shards(\|s\| ...)` |
+| `coordinator.rs:208` | `len()` for status | `.len()` |
+| `coordinator.rs:295` | clear | `.with_all_shards(\|s\| s.iter_mut().for_each(\|m\| m.clear()))` |
+| `coordinator.rs:1029` | bulk-remove stale | `.with_all_shards(\|s\| ...)` |
+| `forwarding.rs:216` | get | `.get(&key)` |
+| `forwarding.rs:1509` | get | `.get(&key)` |
+| `neighbor.rs:189` | `update_dynamic_neighbor` (returns bool) | `.insert_if_changed(...)` |
+| `neighbor.rs:206` | `remove_dynamic_neighbor` (returns bool) | `.remove_if_present(...)` |
+| `neighbor.rs:217-380` | `parse_neighbor_msg` (delegates to update/remove) | unchanged |
+
+Zero callers iterate the map (no `.iter()` / `.values()` / `.keys()`).
 
 ## Implementation steps
 
 1. **Add `ShardedNeighborMap`** in
-   `userspace-dp/src/afxdp/sharded_neighbor.rs` (new file ~150 lines).
-2. **Unit tests** in same file:
+   `userspace-dp/src/afxdp/sharded_neighbor.rs` (~200 lines + tests).
+2. **Unit tests in same file**:
    - `get_returns_inserted_value`
-   - `remove_clears_entry`
-   - `clear_removes_all`
-   - `remove_many_atomic` (mid-call concurrent reader sees pre-or-post,
-     never partial)
-   - `replace_manager_entries_atomic`
-   - `shard_distribution_ipv4_24` (insert /24, max shard ≤ 2× ideal)
-   - `shard_distribution_ipv6_slaac` (insert SLAAC-pattern v6 keys,
-     max shard ≤ 2× ideal)
-   - `shard_distribution_constant_ifindex` (real test-env pattern)
-   - `padded_shard_is_cache_aligned` (`mem::size_of` check)
-   - `poison_panics_loudly` (verify the poison policy fires)
-3. **Swap type alias** at `coordinator.rs:32`.
+   - `remove_if_present_returns_true_when_existing_false_when_absent`
+   - `insert_if_changed_returns_true_on_first_insert_false_on_same_mac`
+   - `insert_if_changed_returns_true_on_mac_change`
+   - `len_sums_across_shards`
+   - `with_all_shards_observes_atomic_replace`
+     (concurrent reader sees pre-replace or post-replace, never partial)
+   - `padded_shard_align_at_least_64` (`mem::align_of`)
+   - `shard_distribution_ipv4_24` (max-shard ≤ 2× ideal)
+   - `shard_distribution_ipv4_16`
+   - `shard_distribution_ipv6_slaac`
+   - `shard_distribution_constant_ifindex`
+   - `poison_ignored_via_into_inner`
+3. **Swap type alias** at `coordinator.rs:32` and `worker.rs:446`.
 4. **Update field type and constructor** at `coordinator.rs:32`.
-5. **Update all 12 runtime `.lock()` sites** to method calls.
-6. **Update all ~44 type-occurrence sites** (param signatures).
-7. **Update test constructors** (~10 sites).
+5. **Update all 14 runtime `.lock()` sites** to method calls per the
+   audit table above.
+6. **Update all ~50 type-occurrence sites** (param signatures, struct
+   fields).
+7. **Update all ~49 test constructors** (`Arc::new(Mutex::new(FastMap::default()))` →
+   `Arc::new(ShardedNeighborMap::new())`).
 8. **Run `cargo test --release`** — must pass with new tests.
 
 ## Test plan
 
-- **`cargo test --release`** (existing 800 tests + new ~10) must pass.
+- **`cargo test --release`** (existing 800 tests + ~12 new) must pass.
 - **Cluster smoke** (HARD gate):
   - iperf-c P=12 ≥ 22 Gb/s
   - iperf-c P=1 ≥ 6 Gb/s
   - iperf-b P=12 ≥ 9.5 Gb/s, 0 retx
   - mouse p99 within ±5% of 27.77 ms
-- **Contention measurement (HARD gate per Codex Q7)**: `perf c2c
-  record` on a 60s iperf3-P=128 run before/after. Acceptance:
-  cache-line bouncing on the dynamic_neighbors mutex line drops by
-  ≥ 50%. If contention does NOT drop measurably, the refactor's
-  premise is unproven and the PR should be closed without merge.
+- **Contention measurement (HARD gate)**: `perf c2c record` on a 60s
+  iperf3-P=128 run before/after. Acceptance: cache-line bouncing on
+  the dynamic_neighbors mutex line drops by ≥ 50%. PR closes without
+  merge if not met.
 
 ## Risk
 
-**High.** (Corrected from v1's "Medium" per Codex Q9.)
+**High.**
 
-- 12 production sites + ~44 type sigs + bulk-API correctness
-  invariants — large surface area.
-- Single-lock batch semantics (replace, clear, bulk-remove) must be
-  preserved via bulk APIs. Getting deterministic lock ordering wrong
-  could deadlock under concurrent bulk + key ops.
+- ~14 production sites + ~50 type sigs + ~49 test constructors —
+  large surface area.
+- Single-lock batch semantics (replace, clear, bulk-remove,
+  multi-ifindex insert) preserved via `with_all_shards`. Deadlock-free
+  invariant: all bulk operations lock in ascending shard-index order.
 - Shard hash distribution must be empirically validated; bad
   distribution undercuts the entire premise.
-- False-sharing risk (mitigated via `#[repr(align(64))]`).
-- Poison policy: fail-loud is project-consistent but a real
-  supervisor-respawn event under bug conditions.
+- False-sharing risk mitigated via `#[repr(align(64))]`.
+- Poison policy is `into_inner()` — silent, but the only honest
+  choice given no supervisor today.
 
 ## Out of scope (PR 2 follow-up)
 
-- Sharding the three shared session maps (`shared_sessions`,
-  `shared_nat_sessions`, `shared_forward_wire_sessions`). Per
-  Codex Q8: requires a composite abstraction with `OwnerRgSessionIndex`
-  redesign and explicit lock ordering. High risk; separate plan.
+- Sharding the three shared session maps + `OwnerRgSessionIndex`.
+  Requires composite abstraction with explicit lock ordering.
 - Worker command queues. Acceptable as full mutex.
-- Control-plane mutexes (`ServerState`, `recent_exceptions`). Not on
-  the fast path.
+- Control-plane mutexes. Not on the fast path.
+- `with_keys_locked(&[k], f)` optimization for the multi-ifindex
+  insert site (locks only affected shards). PR 1 uses
+  `with_all_shards` for simplicity.
 
 ## Acceptance gates
 
 1. `cargo build --release` clean.
-2. `cargo test --release` (~810 tests) pass.
+2. `cargo test --release` (~812 tests) pass.
 3. Cluster smoke: all four gates green.
-4. **Contention measurement: cache-line bouncing on the
-   dynamic_neighbors mutex line drops ≥ 50%** (HARD gate; closes PR
-   if not met).
+4. Contention measurement: cache-line bouncing drops ≥ 50%.
 5. Codex hostile review: AGREE-TO-MERGE.
 6. Gemini adversarial review: AGREE-TO-MERGE.
