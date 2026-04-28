@@ -415,7 +415,16 @@ fn drain_exact_local_items_to_scratch_flow_fair(
 }
 ```
 
-Same pattern in `drain_exact_prepared_items_to_scratch_flow_fair`.
+**Implementation deviation (#942 deferral)**: this PR (#952)
+implements suspension consume only in
+`drain_exact_local_items_to_scratch_flow_fair`. The
+`drain_exact_prepared_items_to_scratch_flow_fair` function does NOT
+get the suspension preflight/consume because the #942 wiring (the
+`cos_queue_v_min_continue` call inside Prepared) is not landing in
+this PR. When #942 lands in its separate PR, it will add the same
+preflight + `suspended` flag pattern to the Prepared drain. See
+`smoke.md` for the temporary-wiring acceptance test that validated
+this dependency.
 
 Note on the `cos_queue_v_min_continue` sketch above: it does NOT
 include a suspension check inside the function (suspension is
