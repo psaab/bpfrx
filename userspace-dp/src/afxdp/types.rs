@@ -1272,6 +1272,26 @@ pub(super) struct CoSQueueRuntime {
     // on BindingLiveState was specifically for owner/peer split;
     // here both are owner-side so no separate pad is needed.
     pub(super) owner_profile: CoSQueueOwnerProfile,
+    /// #941 Work item D: counts back-to-back V_min throttle decisions
+    /// (cos_queue_v_min_continue returning false → caller breaks).
+    /// Resets on a successful pop (V_min check returns true). When
+    /// it reaches `V_MIN_CONSECUTIVE_SKIP_HARD_CAP`, hard-cap fires:
+    /// `v_min_suspended_remaining` is set to
+    /// `V_MIN_SUSPENSION_BATCHES`, suspending V_min checks for that
+    /// many drain calls so the worker can drain at full rate.
+    pub(super) consecutive_v_min_skips: u32,
+    /// #941 Work item D: countdown of drain calls during which the
+    /// V_min check is suspended. Decremented once per drain call
+    /// after the `free_tx_frames.is_empty()` preflight passes (so a
+    /// no-progress drain doesn't burn a suspension slot). When 0,
+    /// V_min checks resume normally.
+    pub(super) v_min_suspended_remaining: u32,
+    /// #941 Work item D: per-queue scratch counter for hard-cap
+    /// activations. Flushed to
+    /// `BindingLiveState::v_min_throttle_hard_cap_overrides` in
+    /// `update_binding_debug_state` (mirrors flow_cache_collision_evictions
+    /// pattern at umem.rs:2603-2607).
+    pub(super) v_min_hard_cap_overrides_scratch: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2069,6 +2089,13 @@ pub(super) enum WorkerCommand {
     RefreshOwnerRGS { owner_rgs: Vec<i32> },
     ExportOwnerRGSessions { sequence: u64, owner_rgs: Vec<i32> },
     EnqueueShapedLocal(TxRequest),
+    /// #941 Work item C: vacate ALL V_min slots owned by this worker
+    /// across every binding's shared_exact queues. Enqueued by the
+    /// coordinator on HA demotion (RG primary→secondary). The actual
+    /// vacate runs on the worker thread (single-writer invariant) —
+    /// this command sets a flag in `WorkerCommandResults`; the outer
+    /// poll loop dispatches via `vacate_all_shared_exact_slots`.
+    VacateAllSharedExactSlots,
 }
 
 #[derive(Default)]

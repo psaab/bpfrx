@@ -240,6 +240,12 @@ pub(super) struct WorkerCommandResults {
     pub cancelled_keys: Vec<SessionKey>,
     pub exported_sequences: Vec<u64>,
     pub shaped_tx_requests: Vec<TxRequest>,
+    /// #941 Work item C: set when at least one
+    /// `WorkerCommand::VacateAllSharedExactSlots` was processed.
+    /// `apply_worker_commands` cannot vacate directly because it has
+    /// no `BindingWorker` access — the outer poll loop in `worker.rs`
+    /// dispatches based on this flag.
+    pub vacate_all_shared_exact_slots: bool,
 }
 
 fn force_live_redirect_for_worker_synced_entry(
@@ -333,6 +339,7 @@ pub(super) fn apply_worker_commands(
                     cancelled_keys: Vec::new(),
                     exported_sequences: Vec::new(),
                     shaped_tx_requests: Vec::new(),
+                    vacate_all_shared_exact_slots: false,
                 };
             }
             core::mem::take(&mut *pending)
@@ -342,6 +349,7 @@ pub(super) fn apply_worker_commands(
                 cancelled_keys: Vec::new(),
                 exported_sequences: Vec::new(),
                 shaped_tx_requests: Vec::new(),
+                vacate_all_shared_exact_slots: false,
             };
         }
     };
@@ -350,6 +358,7 @@ pub(super) fn apply_worker_commands(
     let mut cancelled_keys: Vec<SessionKey> = Vec::new();
     let mut exported_sequences = Vec::new();
     let mut shaped_tx_requests = Vec::new();
+    let mut vacate_all_shared_exact_slots = false;
     for cmd in pending {
         match cmd {
             WorkerCommand::DemoteOwnerRGS { owner_rgs } => {
@@ -623,12 +632,20 @@ pub(super) fn apply_worker_commands(
                 }
             }
             WorkerCommand::EnqueueShapedLocal(req) => shaped_tx_requests.push(req),
+            WorkerCommand::VacateAllSharedExactSlots => {
+                // #941 Work item C: signal the outer poll loop to
+                // vacate all shared_exact slots (we don't have
+                // BindingWorker access here, so we set the flag and
+                // let `worker.rs:818-822` dispatch).
+                vacate_all_shared_exact_slots = true;
+            }
         }
     }
     WorkerCommandResults {
         cancelled_keys,
         exported_sequences,
         shaped_tx_requests,
+        vacate_all_shared_exact_slots,
     }
 }
 

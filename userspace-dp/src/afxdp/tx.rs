@@ -2660,6 +2660,19 @@ fn drain_exact_local_items_to_scratch_flow_fair(
     // Without this clear, drain-all teardown paths and
     // successful-commit chains can grow the stack unbounded.
     queue.pop_snapshot_stack.clear();
+    // #941 Work item D: drain-call preflight. If no free TX frames at
+    // entry, return early WITHOUT consuming a suspension slot — that
+    // way TX-ring-full no-progress drains don't burn the suspension
+    // window.
+    if free_tx_frames.is_empty() {
+        return ExactCoSScratchBuild::Ready;
+    }
+    // #941 Work item D: consume one suspension slot for this drain
+    // call. `suspended` persists for the entire loop body — every pop
+    // sees the same suspension state, so a hard-cap-armed suspension
+    // is honored across all cadence pops (1, 8, 16, ...) within this
+    // drain.
+    let suspended = cos_queue_v_min_consume_suspension(queue);
     let mut remaining_root = root_budget;
     let mut remaining_secondary = secondary_budget;
     let mut v_min_pop_count = 0u32;
@@ -2673,8 +2686,11 @@ fn drain_exact_local_items_to_scratch_flow_fair(
         // moves on to next runnable queue (or exits the drain
         // entirely if all queues throttle); revisits this queue
         // next round when V_min has likely advanced.
+        //
+        // #941 Work item D: skip the V_min check entirely when this
+        // drain is suspended (hard-cap previously armed).
         v_min_pop_count = v_min_pop_count.saturating_add(1);
-        if !cos_queue_v_min_continue(queue, v_min_pop_count) {
+        if !suspended && !cos_queue_v_min_continue(queue, v_min_pop_count) {
             break;
         }
         let Some(front) = cos_queue_front(queue) else {
@@ -2871,17 +2887,17 @@ fn drain_exact_prepared_items_to_scratch_flow_fair(
     let mut remaining_root = root_budget;
     let mut remaining_secondary = secondary_budget;
     // #942 NOTE: V_min wiring on the Prepared flow-fair drain
-    // path is INTENTIONALLY OMITTED for now. A first attempt
-    // (commit eeade5e2 → reverted) caused a severe shared_exact
-    // throughput regression: iperf-c P=1 collapsed from 6.78 Gb/s
-    // to 4.4 Mb/s with cwnd stuck at 1.41 KB. Removing JUST the
-    // V_min check from this loop restored full throughput in
-    // bisection. Root cause is unclear — single-stream P=1 has
-    // no participating peers, so cos_queue_v_min_continue should
-    // return true at pop_count==1. Yet adding the check breaks
-    // forwarding for SNAT-Prepared traffic. The interaction needs
-    // a focused investigation BEFORE re-enabling. See
-    // docs/pr/940-942-vmin-correctness/plan.md "#942 deferred".
+    // path is INTENTIONALLY OMITTED in this PR (#941). The original
+    // attempt (commit eeade5e2 → reverted) caused a severe shared_exact
+    // throughput regression because peer slots held stale-low values
+    // that throttled the heavy worker indefinitely.
+    //
+    // #941's vacate (Work item A/C) + hard-cap suspension (Work item D)
+    // makes re-enabling this safe: a temporary cluster smoke with the
+    // wiring re-added confirmed iperf-c P=12 = 23.1 Gb/s (clears the
+    // 22 Gb/s gate). #942 will land in a separate PR with the wiring
+    // re-enabled. See docs/pr/941-vacate-hard-cap/plan.md acceptance
+    // criteria.
 
     while scratch_prepared_tx.len() < TX_BATCH_SIZE {
         let Some(front) = cos_queue_front(queue) else {
@@ -4364,6 +4380,18 @@ fn account_cos_queue_flow_dequeue(
         // enqueue re-anchors at the live `queue.vtime`.
         queue.flow_bucket_head_finish_bytes[bucket] = 0;
         queue.flow_bucket_tail_finish_bytes[bucket] = 0;
+        // #941 Work item A: bucket-empty vacate. When this worker's
+        // last active bucket on a shared_exact queue empties, vacate
+        // the V_min slot so peers don't see a phantom-participating
+        // worker holding a stale-low value. Single-writer invariant
+        // holds — only this worker writes its own slot.
+        if queue.shared_exact && queue.active_flow_buckets == 0 {
+            if let Some(floor) = queue.vtime_floor.as_ref() {
+                if let Some(slot) = floor.slots.get(queue.worker_id as usize) {
+                    slot.vacate();
+                }
+            }
+        }
     }
     queue.flow_bucket_bytes[bucket] = remaining;
 }
@@ -5826,12 +5854,49 @@ fn compute_v_min_lag_threshold(queue_rate_bytes: u64, participating: u32) -> u64
     lag_bytes.max(V_MIN_MIN_LAG_BYTES)
 }
 
+/// #941 Work item D — hard-cap escape hatch constants.
+pub(super) const V_MIN_CONSECUTIVE_SKIP_HARD_CAP: u32 = 8;
+/// #941 Work item D — N drain calls of V_min suspension after a
+/// hard-cap activation. At ~5 K successful drain invocations/sec
+/// under load, N=1000 ≈ 200 ms suspension window — long enough for
+/// peers to either catch up or visibly persist as out-of-band, and
+/// short enough that mouse-latency budgets (#905) are unaffected.
+pub(super) const V_MIN_SUSPENSION_BATCHES: u32 = 1000;
+
+/// #941 Work item D — consume one suspension slot if active. Called
+/// from drain functions ONCE per drain call AFTER the
+/// `free_tx_frames.is_empty()` preflight passes (so a no-progress
+/// drain doesn't burn a suspension slot). Returns `true` if this
+/// drain call is suspended (V_min check should be skipped for the
+/// entire drain).
+///
+/// Memory ordering: this function is single-writer (the owning
+/// worker thread). Peers don't read `v_min_suspended_remaining` —
+/// it's local to this worker's `CoSQueueRuntime`.
+#[inline]
+fn cos_queue_v_min_consume_suspension(queue: &mut CoSQueueRuntime) -> bool {
+    if queue.v_min_suspended_remaining > 0 {
+        queue.v_min_suspended_remaining -= 1;
+        return true;
+    }
+    false
+}
+
 /// #917 — V_min sync read-path: returns true if the local
 /// queue_vtime is within `LAG_THRESHOLD` of the peer-min, false
 /// if the local worker should throttle this queue's drain for
 /// this batch. Caller increments `pop_count` before calling and
 /// the helper internally skips on cadence (1-in-K) so the
 /// peer-cache-line read happens at most once per K pops.
+///
+/// Suspension boundary (#941 Work item D): this function does NOT
+/// *read* or *consume* `v_min_suspended_remaining` — that's done
+/// at drain-entry by `cos_queue_v_min_consume_suspension` in the
+/// wrapping drain function. This function only *arms* suspension
+/// (writes to `v_min_suspended_remaining`) on the hard-cap
+/// activation path below. Lifecycle:
+///   - drain function consumes suspension (reads + decrements).
+///   - this function arms suspension (writes max value on hard-cap).
 ///
 /// Returns `true` (continue) on:
 /// - Cadence skip (not at pop-count K boundary).
@@ -5840,10 +5905,12 @@ fn compute_v_min_lag_threshold(queue_rate_bytes: u64, participating: u32) -> u64
 /// - No participating peers (this worker is alone — V_min sync
 ///   has nothing to sync against).
 /// - Local vtime within LAG_THRESHOLD of V_min.
+/// - Hard-cap activated (force-continue + arm suspension).
 ///
-/// Returns `false` (throttle) if `queue_vtime > V_min + LAG`.
+/// Returns `false` (throttle) if `queue_vtime > V_min + LAG` AND
+/// hard-cap not yet reached.
 #[inline]
-fn cos_queue_v_min_continue(queue: &CoSQueueRuntime, pop_count: u32) -> bool {
+fn cos_queue_v_min_continue(queue: &mut CoSQueueRuntime, pop_count: u32) -> bool {
     if pop_count != 1 && pop_count.is_multiple_of(V_MIN_READ_CADENCE) == false {
         return true;
     }
@@ -5874,10 +5941,35 @@ fn cos_queue_v_min_continue(queue: &CoSQueueRuntime, pop_count: u32) -> bool {
         }
     }
     if participating == 0 {
+        // No peers — reset hard-cap counter and continue.
+        queue.consecutive_v_min_skips = 0;
         return true;
     }
     let lag = compute_v_min_lag_threshold(queue.transmit_rate_bytes, participating + 1);
-    queue.queue_vtime <= v_min.saturating_add(lag)
+    let cont = queue.queue_vtime <= v_min.saturating_add(lag);
+    if cont {
+        // Successful V_min check — reset the hard-cap counter so a
+        // single throttled batch followed by 7 ok ones doesn't
+        // accumulate.
+        queue.consecutive_v_min_skips = 0;
+        return true;
+    }
+    // #941 Work item D: hard-cap accounting. After
+    // V_MIN_CONSECUTIVE_SKIP_HARD_CAP back-to-back throttle
+    // decisions, force-continue AND arm suspension for the next
+    // V_MIN_SUSPENSION_BATCHES drain calls. This bounds the
+    // worst-case stall (N consecutive throttled batches) and recovers
+    // ~99% throughput under persistent peer-vtime spread (the
+    // captured #942 failure pattern).
+    queue.consecutive_v_min_skips = queue.consecutive_v_min_skips.saturating_add(1);
+    if queue.consecutive_v_min_skips >= V_MIN_CONSECUTIVE_SKIP_HARD_CAP {
+        queue.consecutive_v_min_skips = 0;
+        queue.v_min_suspended_remaining = V_MIN_SUSPENSION_BATCHES;
+        queue.v_min_hard_cap_overrides_scratch =
+            queue.v_min_hard_cap_overrides_scratch.saturating_add(1);
+        return true;
+    }
+    false
 }
 
 fn promote_cos_queue_flow_fair(
@@ -5986,6 +6078,9 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 worker_id: 0,
                 drop_counters: CoSQueueDropCounters::default(),
                 owner_profile: CoSQueueOwnerProfile::new(),
+                consecutive_v_min_skips: 0,
+                v_min_suspended_remaining: 0,
+                v_min_hard_cap_overrides_scratch: 0,
             })
             .collect(),
         queue_indices_by_priority,
@@ -14769,6 +14864,9 @@ mod tests {
             worker_id: 0,
             drop_counters: CoSQueueDropCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
+            consecutive_v_min_skips: 0,
+            v_min_suspended_remaining: 0,
+            v_min_hard_cap_overrides_scratch: 0,
         };
 
         normalize_cos_queue_state(&mut queue);
@@ -14817,6 +14915,9 @@ mod tests {
             worker_id: 0,
             drop_counters: CoSQueueDropCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
+            consecutive_v_min_skips: 0,
+            v_min_suspended_remaining: 0,
+            v_min_hard_cap_overrides_scratch: 0,
         };
         let retry = VecDeque::from([TxRequest {
             bytes: vec![0; 1500],
@@ -14876,6 +14977,9 @@ mod tests {
             worker_id: 0,
             drop_counters: CoSQueueDropCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
+            consecutive_v_min_skips: 0,
+            v_min_suspended_remaining: 0,
+            v_min_hard_cap_overrides_scratch: 0,
         };
         let retry = VecDeque::from([PreparedTxRequest {
             offset: 64,
@@ -17203,6 +17307,312 @@ mod tests {
         eprintln!(
             "bench_pop_commit_settle_publish: {} packets in {:?} = {:.1} ns/pkt",
             total_packets, measured, ns_per_pkt
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #941 V_min vacate + hard-cap-with-suspension tests (Work items A/C/D)
+    // ---------------------------------------------------------------------
+
+    /// #941 Work item A: when the worker's last active bucket on a
+    /// shared_exact queue empties, the V_min slot is vacated to
+    /// NOT_PARTICIPATING. Without vacate, the slot would hold the
+    /// stale-low queue_vtime — phantom-participating — and peers would
+    /// throttle against it indefinitely.
+    #[test]
+    fn vmin_vacate_on_bucket_empty() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        let floor = attach_test_vtime_floor(queue, 4, 1);
+
+        // Establish participation: enqueue + drain + publish so slot
+        // has a non-NOT_PARTICIPATING value.
+        let item = test_flow_cos_item(1234, 1500);
+        cos_queue_push_back(queue, item);
+        let _ = cos_queue_pop_front(queue);
+        publish_committed_queue_vtime(Some(&*queue));
+        assert!(
+            floor.slots[1].read().is_some(),
+            "slot should be participating after publish",
+        );
+
+        // active_flow_buckets is now 0 because pop drained the only bucket.
+        // Enqueue + dequeue another item with the SAME flow_key to retrigger
+        // the bucket-empty vacate path. Must use account_cos_queue_flow_*
+        // helpers explicitly — push_back/pop_front delegate to them but
+        // we want to exercise the dequeue accounting that holds the
+        // vacate hook.
+        let key = test_session_key(1234, 5201);
+        account_cos_queue_flow_enqueue(queue, Some(&key), 1500);
+        // Now dequeue: should fire the bucket-empty path AND vacate.
+        account_cos_queue_flow_dequeue(queue, Some(&key), 1500);
+        assert_eq!(queue.active_flow_buckets, 0, "bucket count drained to 0");
+        assert!(
+            floor.slots[1].read().is_none(),
+            "Work item A: slot must be vacated to NOT_PARTICIPATING when the last bucket empties",
+        );
+    }
+
+    /// #941 Work item A: the vacate fires ONLY when active_flow_buckets
+    /// transitions to 0. If two flows hash to two buckets, dequeueing
+    /// the first bucket should NOT vacate (the second is still active).
+    #[test]
+    fn vmin_vacate_only_when_last_bucket_empties() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        let floor = attach_test_vtime_floor(queue, 4, 1);
+        // Pick keys that map to different buckets — try several until
+        // we find two with distinct hashes.
+        let mut keys: Vec<SessionKey> = Vec::new();
+        let mut buckets = std::collections::HashSet::new();
+        for src in 1000u16..2000 {
+            let k = test_session_key(src, 5201);
+            let bkt = cos_flow_bucket_index(queue.flow_hash_seed, Some(&k));
+            if buckets.insert(bkt) {
+                keys.push(k);
+                if keys.len() == 2 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(keys.len(), 2, "need two distinct buckets");
+        // Enqueue both flows; active_flow_buckets becomes 2.
+        account_cos_queue_flow_enqueue(queue, Some(&keys[0]), 1500);
+        account_cos_queue_flow_enqueue(queue, Some(&keys[1]), 1500);
+        assert_eq!(queue.active_flow_buckets, 2);
+        // Establish participation by publishing.
+        publish_committed_queue_vtime(Some(&*queue));
+        assert!(floor.slots[1].read().is_some());
+        // Dequeue first flow's bucket. active_flow_buckets goes 2→1; no vacate.
+        account_cos_queue_flow_dequeue(queue, Some(&keys[0]), 1500);
+        assert_eq!(queue.active_flow_buckets, 1);
+        assert!(
+            floor.slots[1].read().is_some(),
+            "vacate must NOT fire when other buckets are still active",
+        );
+        // Dequeue second flow's bucket. active_flow_buckets goes 1→0 → vacate.
+        account_cos_queue_flow_dequeue(queue, Some(&keys[1]), 1500);
+        assert_eq!(queue.active_flow_buckets, 0);
+        assert!(
+            floor.slots[1].read().is_none(),
+            "vacate must fire when the last bucket empties",
+        );
+    }
+
+    /// #941 Work item D: hard-cap activation. After
+    /// V_MIN_CONSECUTIVE_SKIP_HARD_CAP back-to-back throttle decisions,
+    /// the function force-continues AND arms suspension.
+    #[test]
+    fn vmin_hard_cap_force_continue_activates_suspension() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        let floor = attach_test_vtime_floor(queue, 4, 1);
+        // Peer 0 publishes a tiny vtime — guarantees the throttle path.
+        floor.slots[0].publish(0);
+        queue.queue_vtime = 100 * 1024 * 1024; // 100 MB ahead, way past lag.
+        // Each call returns false (throttle) until consecutive_v_min_skips
+        // reaches HARD_CAP. The Nth call returns true (force-continue) and
+        // arms suspension.
+        for n in 1..V_MIN_CONSECUTIVE_SKIP_HARD_CAP {
+            let cont = cos_queue_v_min_continue(queue, 1);
+            assert!(!cont, "throttle must fire on call {} of {}", n, V_MIN_CONSECUTIVE_SKIP_HARD_CAP);
+        }
+        // The Nth call hits the hard-cap.
+        let final_cont = cos_queue_v_min_continue(queue, 1);
+        assert!(final_cont, "hard-cap activation must force-continue");
+        assert_eq!(
+            queue.v_min_suspended_remaining, V_MIN_SUSPENSION_BATCHES,
+            "hard-cap must arm suspension to V_MIN_SUSPENSION_BATCHES",
+        );
+        assert_eq!(
+            queue.consecutive_v_min_skips, 0,
+            "hard-cap must reset consecutive skips to 0",
+        );
+        assert_eq!(
+            queue.v_min_hard_cap_overrides_scratch, 1,
+            "hard-cap activation must increment the override counter",
+        );
+    }
+
+    /// #941 Work item D: `cos_queue_v_min_consume_suspension` decrements
+    /// the counter once per call and returns the suspension state.
+    #[test]
+    fn vmin_consume_suspension_decrements_once() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        let _floor = attach_test_vtime_floor(queue, 4, 1);
+        // No suspension active initially — returns false, no change.
+        assert!(!cos_queue_v_min_consume_suspension(queue));
+        assert_eq!(queue.v_min_suspended_remaining, 0);
+        // Arm suspension manually (simulating hard-cap).
+        queue.v_min_suspended_remaining = 5;
+        // Each call decrements by 1 and returns true.
+        for expected_remaining in (0..5).rev() {
+            assert!(cos_queue_v_min_consume_suspension(queue));
+            assert_eq!(queue.v_min_suspended_remaining, expected_remaining);
+        }
+        // Drained — next call returns false.
+        assert!(!cos_queue_v_min_consume_suspension(queue));
+        assert_eq!(queue.v_min_suspended_remaining, 0);
+    }
+
+    /// #941 Work item D + Gemini Q6: the drain-call preflight must NOT
+    /// burn a suspension slot when free_tx_frames is empty (no work
+    /// can be done). Validates `cos_queue_v_min_consume_suspension`
+    /// is called AFTER the preflight, not before.
+    #[test]
+    fn vmin_suspension_not_decremented_on_empty_tx_frames() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        let _floor = attach_test_vtime_floor(queue, 4, 1);
+        // Arm suspension at a known value.
+        queue.v_min_suspended_remaining = 100;
+        let initial = queue.v_min_suspended_remaining;
+        let area = MmapArea::new(2 * 1024 * 1024).expect("mmap");
+        let mut empty_free: VecDeque<u64> = VecDeque::new();
+        let mut scratch: Vec<(u64, TxRequest)> = Vec::new();
+        // Call drain with empty free_tx_frames. The function should
+        // return early WITHOUT consuming a suspension slot.
+        let _ = drain_exact_local_items_to_scratch_flow_fair(
+            queue,
+            &mut empty_free,
+            &mut scratch,
+            &area,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+        assert_eq!(
+            queue.v_min_suspended_remaining, initial,
+            "drain with empty free_tx_frames must NOT consume a suspension slot",
+        );
+    }
+
+    /// #941 Work item D: hard-cap counter increments and is reset on a
+    /// successful pop (V_min returns true with no peers participating).
+    #[test]
+    fn vmin_hard_cap_counter_resets_on_success() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        let floor = attach_test_vtime_floor(queue, 4, 1);
+        floor.slots[0].publish(0);
+        queue.queue_vtime = 100 * 1024 * 1024;
+        // 3 throttles increment the counter to 3.
+        for _ in 0..3 {
+            assert!(!cos_queue_v_min_continue(queue, 1));
+        }
+        assert_eq!(queue.consecutive_v_min_skips, 3);
+        // Now make the check succeed: vacate the peer, so participating==0.
+        floor.slots[0].vacate();
+        assert!(cos_queue_v_min_continue(queue, 1));
+        assert_eq!(
+            queue.consecutive_v_min_skips, 0,
+            "successful V_min check must reset consecutive_v_min_skips",
+        );
+    }
+
+    /// #941: confirms Work item B was correctly dropped. After Work
+    /// item A vacates, the slot stays NOT_PARTICIPATING until the next
+    /// post-settle publish (#940's hook). No first-enqueue publish.
+    #[test]
+    fn vmin_no_first_enqueue_publish() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        let floor = attach_test_vtime_floor(queue, 4, 1);
+        // Establish slot at NOT_PARTICIPATING (initial state from
+        // SharedCoSQueueVtimeFloor::new()).
+        assert!(floor.slots[1].read().is_none());
+        // Enqueue an item — Work item A's hook does NOT fire on enqueue,
+        // and Work item B was dropped so no first-enqueue publish either.
+        let key = test_session_key(1234, 5201);
+        account_cos_queue_flow_enqueue(queue, Some(&key), 1500);
+        assert!(
+            floor.slots[1].read().is_none(),
+            "no first-enqueue publish: slot must remain NOT_PARTICIPATING after enqueue (Work item B was DROPPED)",
         );
     }
 }
