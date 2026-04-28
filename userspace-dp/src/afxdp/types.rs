@@ -1234,6 +1234,21 @@ pub(super) struct CoSQueueRuntime {
     /// the hot path at line rate. Owner-only writes; no atomic
     /// needed (same discipline as `queued_bytes`).
     pub(super) local_item_count: u32,
+    /// #917 — V_min cross-worker coordination. Set by
+    /// `promote_cos_queue_flow_fair` when the queue is shared_exact
+    /// (matches the queue.shared_exact policy). Each worker
+    /// servicing this shared queue holds its own `CoSQueueRuntime`
+    /// instance; all instances point to the same
+    /// `SharedCoSQueueVtimeFloor` Arc but read/write their own slot
+    /// indexed by `worker_id`.
+    ///
+    /// `None` for owner-local-exact and best-effort queues — V_min
+    /// sync only applies to shared_exact.
+    pub(super) vtime_floor: Option<Arc<SharedCoSQueueVtimeFloor>>,
+    /// Worker id of the local thread holding this `CoSQueueRuntime`
+    /// instance. Used to index into `vtime_floor.slots` for publish
+    /// (this worker's own slot) and to skip self in V_min reads.
+    pub(super) worker_id: u32,
     // #710: per-queue drop-reason counters. Single-writer (the owner
     // worker is the only code path that mutates this queue's runtime),
     // so plain `u64` is sufficient — no atomics needed on the hot path.

@@ -4469,6 +4469,16 @@ pub(super) fn cos_queue_push_front(queue: &mut CoSQueueRuntime, item: CoSPending
             queue.queue_vtime = queue.queue_vtime.saturating_sub(item_len);
         }
     }
+    // #917 Phase 3: republish the rolled-back queue_vtime so peers
+    // see the restored value, not the speculative pop's advanced
+    // value. Without this, a peer reading mid-rollback would see
+    // an inflated V_min slot for this worker — over-throttling
+    // peers until the next pop fixes it.
+    if let Some(floor) = queue.vtime_floor.as_ref() {
+        if let Some(slot) = floor.slots.get(queue.worker_id as usize) {
+            slot.publish(queue.queue_vtime);
+        }
+    }
 
     let was_empty = queue.flow_bucket_items[bucket].is_empty();
     if was_empty {
@@ -4660,6 +4670,19 @@ fn cos_queue_pop_front_inner(
         } else {
             let bytes = cos_item_len(&item);
             queue.queue_vtime = queue.queue_vtime.saturating_add(bytes);
+        }
+        // #917 Phase 3: publish the just-advanced queue_vtime to
+        // this worker's slot in the shared V_min floor. Both pop
+        // variants publish — the snapshot variant's "speculative"
+        // vtime is invisible to peers anyway because peers read
+        // the SLOT (Release-stored only here / on rollback /
+        // vacate), not queue_vtime directly. If a rollback later
+        // restores queue_vtime, the rollback path republishes the
+        // restored value (see `cos_queue_push_front`).
+        if let Some(floor) = queue.vtime_floor.as_ref() {
+            if let Some(slot) = floor.slots.get(queue.worker_id as usize) {
+                slot.publish(queue.queue_vtime);
+            }
         }
         if let Some(next_head) = queue.flow_bucket_items[bucket].front() {
             // Bucket still has packets. Advance head-finish to
@@ -5537,7 +5560,11 @@ fn ensure_cos_interface_runtime(
     {
         let mut runtime = build_cos_interface_runtime(config, now_ns);
         if let Some(iface_fast) = binding.cos_fast_interfaces.get(&egress_ifindex) {
-            apply_cos_queue_flow_fair_promotion(&mut runtime, &iface_fast.queue_fast_path);
+            apply_cos_queue_flow_fair_promotion(
+                &mut runtime,
+                &iface_fast.queue_fast_path,
+                binding.worker_id,
+            );
         }
         binding.cos_interfaces.insert(egress_ifindex, runtime);
         binding.cos_interface_order.push(egress_ifindex);
@@ -5569,9 +5596,10 @@ fn ensure_cos_interface_runtime(
 fn apply_cos_queue_flow_fair_promotion(
     runtime: &mut CoSInterfaceRuntime,
     queue_fast_path: &[WorkerCoSQueueFastPath],
+    worker_id: u32,
 ) {
     for (queue, queue_fast) in runtime.queues.iter_mut().zip(queue_fast_path) {
-        promote_cos_queue_flow_fair(queue, queue_fast);
+        promote_cos_queue_flow_fair(queue, queue_fast, worker_id);
     }
 }
 
@@ -5646,8 +5674,19 @@ fn apply_cos_queue_flow_fair_promotion(
 fn promote_cos_queue_flow_fair(
     queue: &mut CoSQueueRuntime,
     queue_fast: &WorkerCoSQueueFastPath,
+    worker_id: u32,
 ) {
     queue.shared_exact = queue_fast.shared_exact;
+    // #917: pull V_min coordination Arc from the fast-path
+    // struct. Only allocated on shared_exact queues (per
+    // `build_shared_cos_queue_vtime_floors_reusing_existing`
+    // in coordinator.rs). The runtime caches it so hot-path
+    // pop/push_front helpers can publish without an
+    // iface_fast lookup. `worker_id` is the local thread's
+    // 0-based id — used to index `vtime_floor.slots` for
+    // self-publish and to skip self in V_min reads.
+    queue.vtime_floor = queue_fast.vtime_floor.clone();
+    queue.worker_id = worker_id;
     // #785 Phase 3 — flow-fair is enabled on EVERY exact queue,
     // including shared_exact. The dequeue-ordering mechanism is
     // MQFQ virtual-finish-time (byte-rate fair), not DRR round-robin
@@ -5732,6 +5771,10 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 wheel_slot: 0,
                 items: VecDeque::new(),
                 local_item_count: 0,
+
+                vtime_floor: None,
+
+                worker_id: 0,
                 drop_counters: CoSQueueDropCounters::default(),
                 owner_profile: CoSQueueOwnerProfile::new(),
             })
@@ -14501,6 +14544,10 @@ mod tests {
             wheel_slot: 0,
             items: VecDeque::from([test_cos_item(1500)]),
             local_item_count: 0,
+
+            vtime_floor: None,
+
+            worker_id: 0,
             drop_counters: CoSQueueDropCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
         };
@@ -14545,6 +14592,10 @@ mod tests {
             wheel_slot: 0,
             items: VecDeque::new(),
             local_item_count: 0,
+
+            vtime_floor: None,
+
+            worker_id: 0,
             drop_counters: CoSQueueDropCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
         };
@@ -14600,6 +14651,10 @@ mod tests {
             wheel_slot: 0,
             items: VecDeque::new(),
             local_item_count: 0,
+
+            vtime_floor: None,
+
+            worker_id: 0,
             drop_counters: CoSQueueDropCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
         };
@@ -15805,7 +15860,7 @@ mod tests {
 
         // Drive the full ensure_cos_interface_runtime promotion loop.
         let fast_path = vec![test_queue_fast_path_for_promotion(true)];
-        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path);
+        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path, 0);
 
         assert!(
             runtime.queues[0].flow_fair,
@@ -15864,7 +15919,7 @@ mod tests {
             }],
         );
         let fast_path = vec![test_queue_fast_path_for_promotion(false)];
-        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path);
+        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path, 0);
 
         assert!(
             runtime.queues[0].flow_fair,
@@ -15914,7 +15969,7 @@ mod tests {
         // non-exact queue off the flow-fair path, because the gate's
         // LHS (`queue.exact`) fails regardless of the fast-path bit.
         let fast_path_owner_local = vec![test_queue_fast_path_for_promotion(false)];
-        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path_owner_local);
+        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path_owner_local, 0);
         assert!(
             !runtime.queues[0].flow_fair,
             "non-exact queues must stay off the flow-fair path: SFQ \
@@ -15923,7 +15978,7 @@ mod tests {
         );
 
         let fast_path_shared = vec![test_queue_fast_path_for_promotion(true)];
-        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path_shared);
+        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path_shared, 0);
         assert!(
             !runtime.queues[0].flow_fair,
             "non-exact queues must stay off the flow-fair path \
@@ -15975,7 +16030,7 @@ mod tests {
             test_queue_fast_path_for_promotion(false),
             test_queue_fast_path_for_promotion(true),
         ];
-        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path);
+        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path, 0);
 
         assert!(
             runtime.queues[0].flow_fair,

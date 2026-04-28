@@ -2479,6 +2479,10 @@ mod tests {
                     wheel_slot: 0,
                     items: VecDeque::from([CoSPendingTxItem::Local(test_tx_request(80))]),
                     local_item_count: 1,
+
+                    vtime_floor: None,
+
+                    worker_id: 0,
                     drop_counters,
                     owner_profile: CoSQueueOwnerProfile::new(),
                 }],
@@ -2619,6 +2623,10 @@ mod tests {
                 wheel_slot: 0,
                 items: VecDeque::new(),
                 local_item_count: 0,
+
+                vtime_floor: None,
+
+                worker_id: 0,
                 drop_counters: CoSQueueDropCounters::default(),
                 owner_profile: CoSQueueOwnerProfile::new(),
             }],
@@ -2825,6 +2833,10 @@ mod tests {
                     wheel_slot: 0,
                     items: VecDeque::new(),
                     local_item_count: 0,
+
+                    vtime_floor: None,
+
+                    worker_id: 0,
                 drop_counters: CoSQueueDropCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
@@ -2859,6 +2871,10 @@ mod tests {
                     wheel_slot: 0,
                     items: VecDeque::new(),
                     local_item_count: 0,
+
+                    vtime_floor: None,
+
+                    worker_id: 0,
                 drop_counters: CoSQueueDropCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
@@ -2893,6 +2909,10 @@ mod tests {
                     wheel_slot: 0,
                     items: VecDeque::new(),
                     local_item_count: 0,
+
+                    vtime_floor: None,
+
+                    worker_id: 0,
                 drop_counters: CoSQueueDropCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
@@ -3052,6 +3072,10 @@ mod tests {
                     wheel_slot: 0,
                     items: VecDeque::new(),
                     local_item_count: 0,
+
+                    vtime_floor: None,
+
+                    worker_id: 0,
                 drop_counters: CoSQueueDropCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
@@ -3086,6 +3110,10 @@ mod tests {
                     wheel_slot: 0,
                     items: VecDeque::new(),
                     local_item_count: 0,
+
+                    vtime_floor: None,
+
+                    worker_id: 0,
                 drop_counters: CoSQueueDropCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
@@ -3210,6 +3238,10 @@ mod tests {
                 wheel_slot: 0,
                 items: VecDeque::new(),
                 local_item_count: 0,
+
+                vtime_floor: None,
+
+                worker_id: 0,
                 drop_counters: CoSQueueDropCounters::default(),
                 owner_profile: CoSQueueOwnerProfile::new(),
             }],
@@ -3379,6 +3411,10 @@ mod tests {
                     wheel_slot: 0,
                     items: VecDeque::new(),
                     local_item_count: 0,
+
+                    vtime_floor: None,
+
+                    worker_id: 0,
                 drop_counters: CoSQueueDropCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
@@ -3413,6 +3449,10 @@ mod tests {
                     wheel_slot: 0,
                     items: VecDeque::new(),
                     local_item_count: 0,
+
+                    vtime_floor: None,
+
+                    worker_id: 0,
                 drop_counters: CoSQueueDropCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
