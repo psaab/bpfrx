@@ -1,6 +1,6 @@
 # #945: Context Object refactor of `poll_binding_process_descriptor`
 
-Plan v2 — 2026-04-28. Addresses Codex hostile review (task-moivkfnx-5e9v6g).
+Plan v3 — 2026-04-28. Addresses Codex re-review (task-moiwe5bh-vn43w7).
 
 ## Problem
 
@@ -61,8 +61,11 @@ Doc-comment on the struct will state this explicitly.
 
 The contexts are constructed **per RX batch call** at `afxdp.rs:526`
 (corrected from v1's "per outer poll iteration" claim per Codex
-Style finding). Construction cost is 16 pointer copies (~64 bytes);
-this is a single rep-stos in optimized codegen.
+Style finding). Construction cost is 16 pointer copies (128 B on
+64-bit) plus 2 mutable references (16 B). Total ~144 B written into
+the local stack frame per call. Whether codegen folds this into
+SROA-promoted scalars or a memcpy is determined by the compiler; the
+codegen gate below catches any pessimization.
 
 ## Safety invariant: `area: *const MmapArea`
 
@@ -155,13 +158,40 @@ swaps. Specific risk groups identified by Codex:
 - `conntrack_v4_fd` / `conntrack_v6_fd` — both `c_int`.
 - `now_ns` / `now_secs` / `ha_startup_grace_until_secs` — all `u64`.
 
-**Mitigation**: the refactor will be done as a single mechanical pass
-where the field name in the struct **matches the parameter name** in
-the original signature. Construction at the call site uses
-**named-field shorthand** (`WorkerContext { forwarding, ... }`) which
-the compiler verifies against the local-variable identifiers,
-catching any swap. Reviewer checklist explicitly verifies each field
-assignment against the original parameter order.
+**Mitigation has TWO parts:**
+
+**(a) Context fields**: the struct field names match the original
+parameter names exactly. Construction at the call site uses
+**named-field shorthand** (`WorkerContext { forwarding, ... }`),
+which the compiler verifies against the local-variable identifiers.
+Any swap requires the developer to rename a local variable, which
+breaks compilation elsewhere.
+
+**(b) Direct params** (the 13 that stay positional, including the
+two `c_int` conntrack fds and three `u64` timestamps): named-field
+shorthand does NOT cover these. They remain swap-vulnerable. The
+mitigation is a **mandatory reviewer checklist** included in the PR
+description:
+
+```
+Direct-param checklist (verify against afxdp.rs:526 call-site order):
+[ ] binding: same identifier as before
+[ ] binding_index: same identifier as before
+[ ] area: same identifier as before
+[ ] available: same identifier as before
+[ ] sessions: same identifier as before
+[ ] screen: same identifier as before
+[ ] validation: same identifier as before
+[ ] now_ns: matches now_ns at call site (NOT now_secs / grace)
+[ ] now_secs: matches now_secs at call site (NOT now_ns / grace)
+[ ] ha_startup_grace_until_secs: matches grace at call site
+[ ] worker_id: same identifier as before
+[ ] conntrack_v4_fd: matches v4 (NOT v6)
+[ ] conntrack_v6_fd: matches v6 (NOT v4)
+```
+
+Codex hostile re-review at impl time will spot-verify the three
+timestamp params and two conntrack fd params against the original.
 
 ## Implementation steps
 
