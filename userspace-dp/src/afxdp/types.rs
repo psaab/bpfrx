@@ -1369,6 +1369,141 @@ pub(super) struct SharedCoSRootLease {
     state: SharedCoSLeaseState,
 }
 
+/// #917 — cross-worker MQFQ V_min synchronization. Per-worker
+/// slot of the most recent committed `queue_vtime` for a
+/// shared_exact CoS queue. Each worker writes its OWN slot
+/// (Release store, single-writer) and reads peers' slots
+/// (Acquire load) on each scheduling decision (subject to
+/// the K-cadence throttle in tx.rs). The minimum across
+/// participating workers' slots is the cross-worker V_min;
+/// a worker whose local `queue_vtime` advances more than
+/// `LAG_THRESHOLD` past V_min throttles itself for one
+/// timer-wheel tick to let slower peers catch up.
+///
+/// Sentinel value `NOT_PARTICIPATING = u64::MAX` means the
+/// slot's worker has no flows on this queue. Peers skip
+/// `NOT_PARTICIPATING` slots in the V_min reduction so an
+/// idle worker doesn't peg V_min near zero.
+///
+/// Memory ordering (plan §3.4): `publish` and `vacate` use
+/// Release stores; readers use Acquire loads. This
+/// establishes a happens-before ordering so any observed
+/// vtime is paired with the corresponding pre-vtime queue
+/// state mutations.
+///
+/// Cache layout: each `PaddedVtimeSlot` is 64-byte aligned
+/// to prevent false sharing across the worker writers; reads
+/// pull each peer's line into Shared once per K-cadence
+/// check. See plan §3.3 for the cost analysis.
+#[repr(align(64))]
+pub(super) struct PaddedVtimeSlot {
+    pub(super) vtime: AtomicU64,
+    _pad: [u8; 56],
+}
+
+pub(super) const NOT_PARTICIPATING: u64 = u64::MAX;
+
+impl PaddedVtimeSlot {
+    pub(super) const fn not_participating() -> Self {
+        Self {
+            vtime: AtomicU64::new(NOT_PARTICIPATING),
+            _pad: [0; 56],
+        }
+    }
+
+    /// Worker calls this on commit boundary publish (after a
+    /// drain commits or push_front rolls back) AND on first
+    /// enqueue when the bucket count transitions 0 → ≥1.
+    /// Release ordering ensures any prior writes to
+    /// `flow_bucket_*_finish_bytes` and `queue_vtime` are
+    /// visible to peers that observe this slot Acquire.
+    pub(super) fn publish(&self, vtime: u64) {
+        debug_assert_ne!(
+            vtime, NOT_PARTICIPATING,
+            "live vtime must not equal sentinel"
+        );
+        self.vtime.store(vtime, Ordering::Release);
+    }
+
+    /// Worker calls this when the queue's last bucket drains
+    /// for this worker — i.e., the worker has no more
+    /// flows on this queue.
+    pub(super) fn vacate(&self) {
+        self.vtime.store(NOT_PARTICIPATING, Ordering::Release);
+    }
+
+    /// Peer reads. Returns `Some(vtime)` if the slot's
+    /// worker is participating, `None` otherwise (skip in
+    /// the V_min reduction).
+    pub(super) fn read(&self) -> Option<u64> {
+        let v = self.vtime.load(Ordering::Acquire);
+        if v == NOT_PARTICIPATING {
+            None
+        } else {
+            Some(v)
+        }
+    }
+}
+
+/// #917 V_min coordination structure for a shared_exact CoS
+/// queue. Allocated lazily on shared_exact promotion (see
+/// `coordinator.rs`). The slot count is fixed at construction
+/// time and matches the configured worker count. Holding an
+/// `Arc` of this structure pins it across HA / config-commit
+/// transitions.
+pub(super) struct SharedCoSQueueVtimeFloor {
+    /// One slot per worker. Index by the worker's
+    /// 0-based id.
+    pub(super) slots: Box<[PaddedVtimeSlot]>,
+}
+
+impl SharedCoSQueueVtimeFloor {
+    pub(super) fn new(num_workers: usize) -> Self {
+        let slots = (0..num_workers)
+            .map(|_| PaddedVtimeSlot::not_participating())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { slots }
+    }
+
+    /// Compute V_min across participating peers. Skips
+    /// `worker_id`'s own slot to avoid self-throttling.
+    /// Returns `None` if no peer is participating (so the
+    /// caller treats the queue as unthrottled).
+    #[inline]
+    pub(super) fn read_v_min(&self, worker_id: u32) -> Option<u64> {
+        let mut v_min = u64::MAX;
+        let mut found = false;
+        for (idx, slot) in self.slots.iter().enumerate() {
+            if idx == worker_id as usize {
+                continue;
+            }
+            if let Some(peer) = slot.read() {
+                v_min = v_min.min(peer);
+                found = true;
+            }
+        }
+        if found { Some(v_min) } else { None }
+    }
+
+    /// Count of currently-participating peers (excludes
+    /// `worker_id`'s own slot). Used to size LAG_THRESHOLD
+    /// per plan §3.5.
+    #[inline]
+    pub(super) fn participating_peer_count(&self, worker_id: u32) -> u32 {
+        let mut count = 0u32;
+        for (idx, slot) in self.slots.iter().enumerate() {
+            if idx == worker_id as usize {
+                continue;
+            }
+            if slot.read().is_some() {
+                count += 1;
+            }
+        }
+        count
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SharedCoSLeaseConfig {
     rate_bytes: u64,
