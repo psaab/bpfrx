@@ -1539,6 +1539,7 @@ mod tests {
                 owner_live: None,
                 shared_queue_lease: shared_exact
                     .then(|| Arc::new(SharedCoSQueueLease::new(1_250_000_000, 256 * 1024, 2))),
+                vtime_floor: None,
             });
         }
         let mut interfaces = FastMap::default();

@@ -6826,6 +6826,7 @@ mod tests {
             owner_worker_id,
             owner_live,
             shared_queue_lease,
+            vtime_floor: None,
         }
     }
 
@@ -15759,6 +15760,7 @@ mod tests {
             owner_worker_id: 0,
             owner_live: None,
             shared_queue_lease: None,
+            vtime_floor: None,
         }
     }
 

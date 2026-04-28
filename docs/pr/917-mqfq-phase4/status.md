@@ -120,6 +120,41 @@ When resuming this work:
       degenerate RSS) vs revisiting #899 feasibility (the
       actual ceiling-lifter).
 
+## Phase 2a complete (committed)
+
+`vtime_floor: Option<Arc<SharedCoSQueueVtimeFloor>>` field
+added to `WorkerCoSQueueFastPath` (types.rs). Defaults to
+`None` at all four initializer sites:
+
+- `worker.rs:1734` (production builder)
+- `frame_tx.rs:1536` (test scaffolding)
+- `tx.rs:6824` (test helper `make_queue_fast_path_for_test`)
+- `tx.rs:15758` (test helper `test_queue_fast_path_for_promotion`)
+
+Build clean; 780/780 tests pass. The field is dormant —
+no allocator, no caller reads it. Functionally equivalent
+to before Phase 2a.
+
+## Phase 2b remaining
+
+The actual lifecycle wiring:
+
+- New `shared_cos_queue_vtime_floors: Arc<ArcSwap<BTreeMap<(i32, u8),
+  Arc<SharedCoSQueueVtimeFloor>>>>` field on `ServerState` in
+  coordinator.rs (mirror of `shared_cos_queue_leases`).
+- New `build_shared_cos_queue_vtime_floors_reusing_existing()`
+  function in coordinator.rs (mirror of
+  `build_shared_cos_queue_leases_reusing_existing`). Allocates
+  one `Arc<SharedCoSQueueVtimeFloor>` per shared_exact queue,
+  sized by `num_workers`.
+- Thread the map through `build_worker_cos_fast_interfaces`
+  in worker.rs (param + 2 caller updates + 3 test caller
+  updates). Replace the current `vtime_floor: None` with
+  `shared_queue_vtime_floors.get(&queue_key).cloned()`.
+
+Once Phase 2b lands, the Arc is allocated and reaches every
+worker's fast-path struct — but no publish/read happens yet.
+
 ## Phase 1 details (already on this branch, uncommitted)
 
 `userspace-dp/src/afxdp/types.rs` adds:

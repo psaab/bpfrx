@@ -1742,6 +1742,14 @@ fn build_worker_cos_fast_interfaces(
                     .exact
                     .then(|| shared_queue_leases.get(&queue_key).cloned())
                     .flatten(),
+                // #917 Phase 2a: field added but always None until
+                // Phase 2b wires the SharedCoSQueueVtimeFloor allocator
+                // in coordinator.rs and threads the map through this
+                // builder (mirror of `shared_queue_leases`). No
+                // functional change yet — V_min publish/read path
+                // (Phases 3-4) keys off `vtime_floor.is_some()` so an
+                // always-None field is a no-op.
+                vtime_floor: None,
             });
         }
         let default_queue_index = match queue_index_by_id[usize::from(iface.default_queue)] {

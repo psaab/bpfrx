@@ -803,6 +803,13 @@ pub(super) struct WorkerCoSQueueFastPath {
     pub(super) owner_worker_id: u32,
     pub(super) owner_live: Option<Arc<BindingLiveState>>,
     pub(super) shared_queue_lease: Option<Arc<SharedCoSQueueLease>>,
+    /// #917 — cross-worker MQFQ V_min coordination structure.
+    /// Allocated lazily on `shared_exact` promotion (one per
+    /// shared queue, not per worker). All workers servicing the
+    /// same shared queue receive the same `Arc`. `None` on
+    /// non-shared queues (V_min sync only applies to
+    /// `shared_exact`).
+    pub(super) vtime_floor: Option<Arc<SharedCoSQueueVtimeFloor>>,
 }
 
 #[derive(Clone)]
