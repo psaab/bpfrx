@@ -2660,6 +2660,19 @@ fn drain_exact_local_items_to_scratch_flow_fair(
     // Without this clear, drain-all teardown paths and
     // successful-commit chains can grow the stack unbounded.
     queue.pop_snapshot_stack.clear();
+    // #941 Work item D: drain-call preflight. If no free TX frames at
+    // entry, return early WITHOUT consuming a suspension slot — that
+    // way TX-ring-full no-progress drains don't burn the suspension
+    // window.
+    if free_tx_frames.is_empty() {
+        return ExactCoSScratchBuild::Ready;
+    }
+    // #941 Work item D: consume one suspension slot for this drain
+    // call. `suspended` persists for the entire loop body — every pop
+    // sees the same suspension state, so a hard-cap-armed suspension
+    // is honored across all cadence pops (1, 8, 16, ...) within this
+    // drain.
+    let suspended = cos_queue_v_min_consume_suspension(queue);
     let mut remaining_root = root_budget;
     let mut remaining_secondary = secondary_budget;
     let mut v_min_pop_count = 0u32;
@@ -2673,8 +2686,11 @@ fn drain_exact_local_items_to_scratch_flow_fair(
         // moves on to next runnable queue (or exits the drain
         // entirely if all queues throttle); revisits this queue
         // next round when V_min has likely advanced.
+        //
+        // #941 Work item D: skip the V_min check entirely when this
+        // drain is suspended (hard-cap previously armed).
         v_min_pop_count = v_min_pop_count.saturating_add(1);
-        if !cos_queue_v_min_continue(queue, v_min_pop_count) {
+        if !suspended && !cos_queue_v_min_continue(queue, v_min_pop_count) {
             break;
         }
         let Some(front) = cos_queue_front(queue) else {
@@ -5838,12 +5854,49 @@ fn compute_v_min_lag_threshold(queue_rate_bytes: u64, participating: u32) -> u64
     lag_bytes.max(V_MIN_MIN_LAG_BYTES)
 }
 
+/// #941 Work item D — hard-cap escape hatch constants.
+pub(super) const V_MIN_CONSECUTIVE_SKIP_HARD_CAP: u32 = 8;
+/// #941 Work item D — N drain calls of V_min suspension after a
+/// hard-cap activation. At ~5 K successful drain invocations/sec
+/// under load, N=1000 ≈ 200 ms suspension window — long enough for
+/// peers to either catch up or visibly persist as out-of-band, and
+/// short enough that mouse-latency budgets (#905) are unaffected.
+pub(super) const V_MIN_SUSPENSION_BATCHES: u32 = 1000;
+
+/// #941 Work item D — consume one suspension slot if active. Called
+/// from drain functions ONCE per drain call AFTER the
+/// `free_tx_frames.is_empty()` preflight passes (so a no-progress
+/// drain doesn't burn a suspension slot). Returns `true` if this
+/// drain call is suspended (V_min check should be skipped for the
+/// entire drain).
+///
+/// Memory ordering: this function is single-writer (the owning
+/// worker thread). Peers don't read `v_min_suspended_remaining` —
+/// it's local to this worker's `CoSQueueRuntime`.
+#[inline]
+fn cos_queue_v_min_consume_suspension(queue: &mut CoSQueueRuntime) -> bool {
+    if queue.v_min_suspended_remaining > 0 {
+        queue.v_min_suspended_remaining -= 1;
+        return true;
+    }
+    false
+}
+
 /// #917 — V_min sync read-path: returns true if the local
 /// queue_vtime is within `LAG_THRESHOLD` of the peer-min, false
 /// if the local worker should throttle this queue's drain for
 /// this batch. Caller increments `pop_count` before calling and
 /// the helper internally skips on cadence (1-in-K) so the
 /// peer-cache-line read happens at most once per K pops.
+///
+/// Suspension boundary (#941 Work item D): this function does NOT
+/// *read* or *consume* `v_min_suspended_remaining` — that's done
+/// at drain-entry by `cos_queue_v_min_consume_suspension` in the
+/// wrapping drain function. This function only *arms* suspension
+/// (writes to `v_min_suspended_remaining`) on the hard-cap
+/// activation path below. Lifecycle:
+///   - drain function consumes suspension (reads + decrements).
+///   - this function arms suspension (writes max value on hard-cap).
 ///
 /// Returns `true` (continue) on:
 /// - Cadence skip (not at pop-count K boundary).
@@ -5852,10 +5905,12 @@ fn compute_v_min_lag_threshold(queue_rate_bytes: u64, participating: u32) -> u64
 /// - No participating peers (this worker is alone — V_min sync
 ///   has nothing to sync against).
 /// - Local vtime within LAG_THRESHOLD of V_min.
+/// - Hard-cap activated (force-continue + arm suspension).
 ///
-/// Returns `false` (throttle) if `queue_vtime > V_min + LAG`.
+/// Returns `false` (throttle) if `queue_vtime > V_min + LAG` AND
+/// hard-cap not yet reached.
 #[inline]
-fn cos_queue_v_min_continue(queue: &CoSQueueRuntime, pop_count: u32) -> bool {
+fn cos_queue_v_min_continue(queue: &mut CoSQueueRuntime, pop_count: u32) -> bool {
     if pop_count != 1 && pop_count.is_multiple_of(V_MIN_READ_CADENCE) == false {
         return true;
     }
@@ -5886,10 +5941,35 @@ fn cos_queue_v_min_continue(queue: &CoSQueueRuntime, pop_count: u32) -> bool {
         }
     }
     if participating == 0 {
+        // No peers — reset hard-cap counter and continue.
+        queue.consecutive_v_min_skips = 0;
         return true;
     }
     let lag = compute_v_min_lag_threshold(queue.transmit_rate_bytes, participating + 1);
-    queue.queue_vtime <= v_min.saturating_add(lag)
+    let cont = queue.queue_vtime <= v_min.saturating_add(lag);
+    if cont {
+        // Successful V_min check — reset the hard-cap counter so a
+        // single throttled batch followed by 7 ok ones doesn't
+        // accumulate.
+        queue.consecutive_v_min_skips = 0;
+        return true;
+    }
+    // #941 Work item D: hard-cap accounting. After
+    // V_MIN_CONSECUTIVE_SKIP_HARD_CAP back-to-back throttle
+    // decisions, force-continue AND arm suspension for the next
+    // V_MIN_SUSPENSION_BATCHES drain calls. This bounds the
+    // worst-case stall (N consecutive throttled batches) and recovers
+    // ~99% throughput under persistent peer-vtime spread (the
+    // captured #942 failure pattern).
+    queue.consecutive_v_min_skips = queue.consecutive_v_min_skips.saturating_add(1);
+    if queue.consecutive_v_min_skips >= V_MIN_CONSECUTIVE_SKIP_HARD_CAP {
+        queue.consecutive_v_min_skips = 0;
+        queue.v_min_suspended_remaining = V_MIN_SUSPENSION_BATCHES;
+        queue.v_min_hard_cap_overrides_scratch =
+            queue.v_min_hard_cap_overrides_scratch.saturating_add(1);
+        return true;
+    }
+    false
 }
 
 fn promote_cos_queue_flow_fair(
@@ -5998,6 +6078,9 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 worker_id: 0,
                 drop_counters: CoSQueueDropCounters::default(),
                 owner_profile: CoSQueueOwnerProfile::new(),
+                consecutive_v_min_skips: 0,
+                v_min_suspended_remaining: 0,
+                v_min_hard_cap_overrides_scratch: 0,
             })
             .collect(),
         queue_indices_by_priority,
@@ -14781,6 +14864,9 @@ mod tests {
             worker_id: 0,
             drop_counters: CoSQueueDropCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
+            consecutive_v_min_skips: 0,
+            v_min_suspended_remaining: 0,
+            v_min_hard_cap_overrides_scratch: 0,
         };
 
         normalize_cos_queue_state(&mut queue);
@@ -14829,6 +14915,9 @@ mod tests {
             worker_id: 0,
             drop_counters: CoSQueueDropCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
+            consecutive_v_min_skips: 0,
+            v_min_suspended_remaining: 0,
+            v_min_hard_cap_overrides_scratch: 0,
         };
         let retry = VecDeque::from([TxRequest {
             bytes: vec![0; 1500],
@@ -14888,6 +14977,9 @@ mod tests {
             worker_id: 0,
             drop_counters: CoSQueueDropCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
+            consecutive_v_min_skips: 0,
+            v_min_suspended_remaining: 0,
+            v_min_hard_cap_overrides_scratch: 0,
         };
         let retry = VecDeque::from([PreparedTxRequest {
             offset: 64,

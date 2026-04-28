@@ -1795,6 +1795,17 @@ pub(super) struct BindingLiveState {
     /// stale-on-lookup evictions so the acceptance gate
     /// (`collision_evictions / hits < 1 %`) is observable at runtime.
     pub(super) flow_cache_collision_evictions: AtomicU64,
+    /// #941 Work item D: count of hard-cap activations. When V_min
+    /// throttle would have fired for V_MIN_CONSECUTIVE_SKIP_HARD_CAP
+    /// consecutive batches, hard-cap force-continues AND arms
+    /// suspension. Each such activation increments this counter.
+    /// Acceptance gate: under normal load (e.g. iperf-c P=12 saturating),
+    /// per-binding hard-cap-override-rate = this / drain_invocations
+    /// stays below 5 %. Counter is flushed from each queue's per-queue
+    /// scratch field (`v_min_hard_cap_overrides_scratch`) in
+    /// `update_binding_debug_state` (mirrors flow_cache_collision_evictions
+    /// flush pattern).
+    pub(super) v_min_throttle_hard_cap_overrides: AtomicU64,
     pub(super) session_hits: AtomicU64,
     pub(super) session_misses: AtomicU64,
     pub(super) session_creates: AtomicU64,
@@ -1988,6 +1999,7 @@ impl BindingLiveState {
             flow_cache_misses: AtomicU64::new(0),
             flow_cache_evictions: AtomicU64::new(0),
             flow_cache_collision_evictions: AtomicU64::new(0),
+            v_min_throttle_hard_cap_overrides: AtomicU64::new(0),
             session_hits: AtomicU64::new(0),
             session_misses: AtomicU64::new(0),
             session_creates: AtomicU64::new(0),
@@ -2203,6 +2215,9 @@ impl BindingLiveState {
             flow_cache_evictions: self.flow_cache_evictions.load(Ordering::Relaxed),
             flow_cache_collision_evictions: self
                 .flow_cache_collision_evictions
+                .load(Ordering::Relaxed),
+            v_min_throttle_hard_cap_overrides: self
+                .v_min_throttle_hard_cap_overrides
                 .load(Ordering::Relaxed),
             session_hits: self.session_hits.load(Ordering::Relaxed),
             session_misses: self.session_misses.load(Ordering::Relaxed),
@@ -2606,5 +2621,27 @@ pub(super) fn update_binding_debug_state(binding: &mut BindingWorker) {
             .flow_cache_collision_evictions
             .fetch_add(binding.flow_cache.collision_evictions, Ordering::Relaxed);
         binding.flow_cache.collision_evictions = 0;
+    }
+    // #941 Work item D: flush each queue's per-queue scratch counter
+    // for hard-cap activations into the binding-wide AtomicU64.
+    // Mirrors the flow_cache_collision_evictions pattern. Single-
+    // writer (worker thread) on both ends, so no atomicity issue.
+    let mut hard_cap_overrides_total = 0u64;
+    for root in binding.cos_interfaces.values_mut() {
+        for queue in &mut root.queues {
+            if queue.v_min_hard_cap_overrides_scratch != 0 {
+                hard_cap_overrides_total =
+                    hard_cap_overrides_total.saturating_add(
+                        u64::from(queue.v_min_hard_cap_overrides_scratch),
+                    );
+                queue.v_min_hard_cap_overrides_scratch = 0;
+            }
+        }
+    }
+    if hard_cap_overrides_total != 0 {
+        binding
+            .live
+            .v_min_throttle_hard_cap_overrides
+            .fetch_add(hard_cap_overrides_total, Ordering::Relaxed);
     }
 }
