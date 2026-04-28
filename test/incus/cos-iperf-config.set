@@ -5,6 +5,9 @@ delete firewall family inet6 filter bandwidth-output
 delete interfaces reth0 unit 80 family inet6 filter output
 
 set class-of-service forwarding-classes queue 0 best-effort
+set class-of-service forwarding-classes queue 1 iperf-d
+set class-of-service forwarding-classes queue 2 iperf-e
+set class-of-service forwarding-classes queue 3 iperf-f
 set class-of-service forwarding-classes queue 4 iperf-a
 set class-of-service forwarding-classes queue 5 iperf-b
 set class-of-service forwarding-classes queue 6 iperf-c
@@ -21,10 +24,22 @@ set class-of-service schedulers scheduler-iperf-b transmit-rate exact
 set class-of-service schedulers scheduler-iperf-c transmit-rate 25.0g
 set class-of-service schedulers scheduler-iperf-c transmit-rate exact
 
+set class-of-service schedulers scheduler-iperf-d transmit-rate 13.0g
+set class-of-service schedulers scheduler-iperf-d transmit-rate exact
+
+set class-of-service schedulers scheduler-iperf-e transmit-rate 16.0g
+set class-of-service schedulers scheduler-iperf-e transmit-rate exact
+
+set class-of-service schedulers scheduler-iperf-f transmit-rate 19.0g
+set class-of-service schedulers scheduler-iperf-f transmit-rate exact
+
 set class-of-service scheduler-maps bandwidth-limit forwarding-class best-effort scheduler scheduler-be
 set class-of-service scheduler-maps bandwidth-limit forwarding-class iperf-a scheduler scheduler-iperf-a
 set class-of-service scheduler-maps bandwidth-limit forwarding-class iperf-b scheduler scheduler-iperf-b
 set class-of-service scheduler-maps bandwidth-limit forwarding-class iperf-c scheduler scheduler-iperf-c
+set class-of-service scheduler-maps bandwidth-limit forwarding-class iperf-d scheduler scheduler-iperf-d
+set class-of-service scheduler-maps bandwidth-limit forwarding-class iperf-e scheduler scheduler-iperf-e
+set class-of-service scheduler-maps bandwidth-limit forwarding-class iperf-f scheduler scheduler-iperf-f
 
 set class-of-service interfaces reth0 unit 80 scheduler-map bandwidth-limit
 set class-of-service interfaces reth0 unit 80 shaping-rate 25g
@@ -45,9 +60,24 @@ set firewall family inet filter bandwidth-output term 2 then count iperf-c
 set firewall family inet filter bandwidth-output term 2 then accept
 
 set firewall family inet filter bandwidth-output term 3 from destination-port 5204
-set firewall family inet filter bandwidth-output term 3 then forwarding-class best-effort
-set firewall family inet filter bandwidth-output term 3 then count best-effort
+set firewall family inet filter bandwidth-output term 3 then forwarding-class iperf-d
+set firewall family inet filter bandwidth-output term 3 then count iperf-d
 set firewall family inet filter bandwidth-output term 3 then accept
+
+set firewall family inet filter bandwidth-output term 4 from destination-port 5205
+set firewall family inet filter bandwidth-output term 4 then forwarding-class iperf-e
+set firewall family inet filter bandwidth-output term 4 then count iperf-e
+set firewall family inet filter bandwidth-output term 4 then accept
+
+set firewall family inet filter bandwidth-output term 5 from destination-port 5206
+set firewall family inet filter bandwidth-output term 5 then forwarding-class iperf-f
+set firewall family inet filter bandwidth-output term 5 then count iperf-f
+set firewall family inet filter bandwidth-output term 5 then accept
+
+set firewall family inet filter bandwidth-output term 6 from destination-port 5207
+set firewall family inet filter bandwidth-output term 6 then forwarding-class best-effort
+set firewall family inet filter bandwidth-output term 6 then count best-effort
+set firewall family inet filter bandwidth-output term 6 then accept
 
 set interfaces reth0 unit 80 family inet filter output bandwidth-output
 
@@ -67,8 +97,23 @@ set firewall family inet6 filter bandwidth-output term 2 then count iperf-c
 set firewall family inet6 filter bandwidth-output term 2 then accept
 
 set firewall family inet6 filter bandwidth-output term 3 from destination-port 5204
-set firewall family inet6 filter bandwidth-output term 3 then forwarding-class best-effort
-set firewall family inet6 filter bandwidth-output term 3 then count best-effort
+set firewall family inet6 filter bandwidth-output term 3 then forwarding-class iperf-d
+set firewall family inet6 filter bandwidth-output term 3 then count iperf-d
 set firewall family inet6 filter bandwidth-output term 3 then accept
+
+set firewall family inet6 filter bandwidth-output term 4 from destination-port 5205
+set firewall family inet6 filter bandwidth-output term 4 then forwarding-class iperf-e
+set firewall family inet6 filter bandwidth-output term 4 then count iperf-e
+set firewall family inet6 filter bandwidth-output term 4 then accept
+
+set firewall family inet6 filter bandwidth-output term 5 from destination-port 5206
+set firewall family inet6 filter bandwidth-output term 5 then forwarding-class iperf-f
+set firewall family inet6 filter bandwidth-output term 5 then count iperf-f
+set firewall family inet6 filter bandwidth-output term 5 then accept
+
+set firewall family inet6 filter bandwidth-output term 6 from destination-port 5207
+set firewall family inet6 filter bandwidth-output term 6 then forwarding-class best-effort
+set firewall family inet6 filter bandwidth-output term 6 then count best-effort
+set firewall family inet6 filter bandwidth-output term 6 then accept
 
 set interfaces reth0 unit 80 family inet6 filter output bandwidth-output
