@@ -1,6 +1,6 @@
 # #949 PR1: Sharded mutex for `dynamic_neighbors`
 
-Plan v4 — 2026-04-28. Addresses Codex re-review round 3 (task-moiwp0dd-8ni1g0).
+Plan v5 — 2026-04-28. Addresses Codex re-review round 4 (task-moj2a439-ksdy1y) consistency fixes.
 
 ## Issue scope correction
 
@@ -60,7 +60,7 @@ revisit fail-loud as a follow-up. Documented in code comments.
 | `icmp.rs`, `icmp_embed.rs` | 0 | ~4 |
 | `frame.rs` | 0 | 2 (test constructors) |
 | `session_glue.rs` (test sites) | 0 | 36 (test constructors) |
-| `forwarding.rs` (test sites) | 2 (`dynamic_neighbors_ref().lock()` at L2088, L2287) | 21 (test constructors) |
+| `forwarding.rs` (test sites) | 7 (`dynamic_neighbors_ref().lock()` at L2080, L2088, L2116, L2220, L2230, L2287, L2352) | 21 (test constructors) |
 | `tests.rs` | 0 | 7 (test constructors) |
 | **Test constructors total** | 0 | **~66** |
 | **Production runtime total** | **~14** | **~50** |
@@ -242,7 +242,7 @@ struct PaddedShard(Mutex<FastMap<(i32, IpAddr), NeighborEntry>>);
 | `afxdp.rs:3379` | multi-ifindex insert | `.with_all_shards(\|s\| ...)` |
 | `coordinator.rs:177-186` | replace (remove + insert) | `.with_all_shards(\|s\| ...)` |
 | `coordinator.rs:208` | `len()` for status | `.len()` |
-| `coordinator.rs:295` | clear | `.with_all_shards(\|s\| s.iter_mut().for_each(\|m\| m.clear()))` |
+| `coordinator.rs:295` | clear | `.with_all_shards(\|bulk\| bulk.each_shard_mut().for_each(\|m\| m.clear()))` |
 | `coordinator.rs:1029` | bulk-remove stale | `.with_all_shards(\|s\| ...)` |
 | `forwarding.rs:216` | get | `.get(&key)` |
 | `forwarding.rs:1509` | get | `.get(&key)` |
@@ -276,7 +276,7 @@ Zero callers iterate the map (no `.iter()` / `.values()` / `.keys()`).
    audit table above.
 6. **Update all ~50 type-occurrence sites** (param signatures, struct
    fields).
-7. **Update all ~49 test constructors** (`Arc::new(Mutex::new(FastMap::default()))` →
+7. **Update all ~66 test constructors** (`Arc::new(Mutex::new(FastMap::default()))` →
    `Arc::new(ShardedNeighborMap::new())`).
 8. **Run `cargo test --release`** — must pass with new tests.
 
@@ -297,7 +297,7 @@ Zero callers iterate the map (no `.iter()` / `.values()` / `.keys()`).
 
 **High.**
 
-- ~14 production sites + ~50 type sigs + ~49 test constructors —
+- ~14 production sites + ~50 type sigs + ~66 test constructors + ~7 test direct-lock sites —
   large surface area.
 - Single-lock batch semantics (replace, clear, bulk-remove,
   multi-ifindex insert) preserved via `with_all_shards`. Deadlock-free
