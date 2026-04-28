@@ -2886,20 +2886,41 @@ fn drain_exact_prepared_items_to_scratch_flow_fair(
     queue.pop_snapshot_stack.clear();
     let mut remaining_root = root_budget;
     let mut remaining_secondary = secondary_budget;
-    // #942 NOTE: V_min wiring on the Prepared flow-fair drain
-    // path is INTENTIONALLY OMITTED in this PR (#941). The original
-    // attempt (commit eeade5e2 → reverted) caused a severe shared_exact
-    // throughput regression because peer slots held stale-low values
-    // that throttled the heavy worker indefinitely.
+    // #942: V_min wiring on the Prepared flow-fair drain. Mirrors
+    // the Local-flow pattern at `drain_exact_local_items_to_scratch_flow_fair`.
     //
-    // #941's vacate (Work item A/C) + hard-cap suspension (Work item D)
-    // makes re-enabling this safe: a temporary cluster smoke with the
-    // wiring re-added confirmed iperf-c P=12 = 23.1 Gb/s (clears the
-    // 22 Gb/s gate). #942 will land in a separate PR with the wiring
-    // re-enabled. See docs/pr/941-vacate-hard-cap/plan.md acceptance
-    // criteria.
+    // The original attempt (commit eeade5e2 in #950) caused a severe
+    // regression because peer slots held stale-low values that
+    // throttled the heavy worker indefinitely. #941 (PR #952) added
+    // bucket-empty vacate + hard-cap-with-suspension to make this
+    // safe: a temporary smoke with the wiring confirmed iperf-c P=12 =
+    // 23.1 Gb/s (clears the 22 Gb/s gate).
+    //
+    // Preflight (mirrors Local's `free_tx_frames.is_empty()` early-
+    // return): if there is no Prepared item at the front of the queue,
+    // return early WITHOUT consuming a suspension slot. This prevents
+    // a no-progress Prepared drain (e.g. queue head is Local) from
+    // eroding the hard-cap suspension window.
+    match cos_queue_front(queue) {
+        Some(CoSPendingTxItem::Prepared(_)) => {}
+        _ => return ExactCoSScratchBuild::Ready,
+    }
+    // #942: consume one suspension slot for this drain call. The
+    // `suspended` flag persists for the entire loop body so cadence
+    // pops at pop_count=1, 8, 16, ... all see the same suspension
+    // state. See `cos_queue_v_min_consume_suspension` doc.
+    let suspended = cos_queue_v_min_consume_suspension(queue);
+    let mut v_min_pop_count = 0u32;
 
     while scratch_prepared_tx.len() < TX_BATCH_SIZE {
+        // #942: V_min check on the Prepared flow-fair drain path,
+        // mirroring the Local-flow wiring. Same K=8 cadence with
+        // mandatory check at pop_count==1 (drain-batch start).
+        // Skipped entirely when the drain is suspended (#941 hard-cap).
+        v_min_pop_count = v_min_pop_count.saturating_add(1);
+        if !suspended && !cos_queue_v_min_continue(queue, v_min_pop_count) {
+            break;
+        }
         let Some(front) = cos_queue_front(queue) else {
             break;
         };
@@ -17613,6 +17634,130 @@ mod tests {
         assert!(
             floor.slots[1].read().is_none(),
             "no first-enqueue publish: slot must remain NOT_PARTICIPATING after enqueue (Work item B was DROPPED)",
+        );
+    }
+
+    /// #942: Prepared flow-fair drain MUST honor the V_min throttle.
+    /// Mirrors Local-flow's `vmin_throttle_function_fires_on_lag_breach`
+    /// pattern: synthetic peer slot pegged at 0; local qvtime well past
+    /// LAG_THRESHOLD; cos_queue_v_min_continue must return false. Then
+    /// the suspended path: when v_min_suspended_remaining is non-zero,
+    /// the drain consumes one slot and skips V_min entirely.
+    #[test]
+    fn vmin_prepared_flow_fair_throttle_and_suspension() {
+        let umem = MmapArea::new(2 * 1024 * 1024).expect("umem");
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        let floor = attach_test_vtime_floor(queue, 4, 1);
+        floor.slots[0].publish(0);
+        queue.queue_vtime = 100 * 1024 * 1024;
+
+        // Push a Prepared item so the preflight passes.
+        let packet = vec![0u8; 1500];
+        let prepared = test_prepared_item_in_umem(&umem, 0, &packet, libc::AF_INET as u8);
+        cos_queue_push_back(queue, prepared);
+
+        let mut scratch: Vec<PreparedTxRequest> = Vec::new();
+        let mut free_tx: VecDeque<u64> = VecDeque::new();
+        let mut pending_fill: VecDeque<u64> = VecDeque::new();
+        let _ = drain_exact_prepared_items_to_scratch_flow_fair(
+            queue,
+            &mut scratch,
+            &umem,
+            &mut free_tx,
+            &mut pending_fill,
+            0,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+        assert!(
+            scratch.is_empty(),
+            "V_min throttle must break Prepared drain before any item is committed",
+        );
+        assert_eq!(queue.consecutive_v_min_skips, 1);
+
+        // Arm suspension; next drain consumes one slot and skips V_min,
+        // draining the pending Prepared item.
+        queue.v_min_suspended_remaining = 5;
+        let mut scratch2: Vec<PreparedTxRequest> = Vec::new();
+        let _ = drain_exact_prepared_items_to_scratch_flow_fair(
+            queue,
+            &mut scratch2,
+            &umem,
+            &mut free_tx,
+            &mut pending_fill,
+            0,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+        assert_eq!(
+            queue.v_min_suspended_remaining, 4,
+            "drain MUST consume one suspension slot",
+        );
+        assert!(
+            !scratch2.is_empty(),
+            "with suspension active, drain must NOT throttle; Prepared item must reach scratch",
+        );
+    }
+
+    /// #942: preflight returns early without consuming suspension when
+    /// queue head is Local (not Prepared). Mirrors Local-flow's
+    /// `vmin_suspension_not_decremented_on_empty_tx_frames`.
+    #[test]
+    fn vmin_prepared_no_suspension_burn_when_head_is_local() {
+        let umem = MmapArea::new(2 * 1024 * 1024).expect("umem");
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        let _floor = attach_test_vtime_floor(queue, 4, 1);
+        queue.v_min_suspended_remaining = 100;
+        let initial = queue.v_min_suspended_remaining;
+
+        // Queue head is Local — preflight returns Ready early.
+        cos_queue_push_back(queue, test_cos_item(1500));
+
+        let mut scratch: Vec<PreparedTxRequest> = Vec::new();
+        let mut free_tx: VecDeque<u64> = VecDeque::new();
+        let mut pending_fill: VecDeque<u64> = VecDeque::new();
+        let _ = drain_exact_prepared_items_to_scratch_flow_fair(
+            queue,
+            &mut scratch,
+            &umem,
+            &mut free_tx,
+            &mut pending_fill,
+            0,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+        assert_eq!(
+            queue.v_min_suspended_remaining, initial,
+            "Prepared drain with non-Prepared head MUST NOT consume a suspension slot",
         );
     }
 }
