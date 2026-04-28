@@ -1,6 +1,6 @@
 # #949 PR1: Sharded mutex for `dynamic_neighbors`
 
-Plan v5 — 2026-04-28. Addresses Codex re-review round 4 (task-moj2a439-ksdy1y) consistency fixes.
+Plan v6 — 2026-04-28. Addresses Codex re-review round 5 (task-moj2ez6l-9azykt) final consistency fix.
 
 ## Issue scope correction
 
@@ -66,8 +66,9 @@ revisit fail-loud as a follow-up. Documented in code comments.
 | **Production runtime total** | **~14** | **~50** |
 
 Realistic edit volume: 250-300 line-level changes including all 66
-test constructors and 2 test-site direct lock sites (corrected from
-v3's "~49" per Codex round 3).
+test constructors (corrected from v3's "~49" per Codex round 3) and
+all 7 test-site direct lock sites in `forwarding.rs` (L2080, L2088,
+L2116, L2220, L2230, L2287, L2352).
 
 ## Existing single-lock batch semantics
 
