@@ -197,18 +197,31 @@ Defer optimization.)
 
 ### Shard hash independent of FastMap inner hash
 
-Use rotated/mixed FxHash for shard selection to break correlation
-with the inner `FastMap` bucket-selection hash:
+The Knuth multiplier `0x9E3779B97F4A7C15` (the 64-bit golden ratio)
+spreads entropy into the HIGH bits of the product. Take the top
+`log2(NUM_SHARDS) = 6` bits — this matches Linux's `hash_64` and is
+the correct way to extract entropy from a Knuth multiplicative hash.
+Decorrelates from `hashbrown`'s internal SwissTable bucket selection
+(which also uses high hash bits, but consumes the freshly-rotated
+hash from FxHash → Knuth mix).
 
 ```rust
+const SHARD_BITS: u32 = NUM_SHARDS.trailing_zeros();
+
 fn shard_idx(key: &(i32, IpAddr)) -> usize {
     let mut hasher = FxHasher::default();
     key.hash(&mut hasher);
     let h = hasher.finish();
-    let mixed = h.wrapping_mul(0x9E3779B97F4A7C15) ^ (h >> 32);
-    (mixed as usize) & (NUM_SHARDS - 1)
+    let mixed = h.wrapping_mul(0x9E3779B97F4A7C15);
+    (mixed >> (64 - SHARD_BITS)) as usize
 }
 ```
+
+This was changed from v3-v6's `^ (h >> 32)` + low-bits-mask formulation
+to the top-bits formulation in the impl: distribution tests under v3-v6
+showed skew on `/24` patterns because the multiplier puts entropy in the
+high bits, so masking the low bits discarded most of the spread. The
+top-bits formulation passes all distribution tests.
 
 ### Cache-line padded shards
 

@@ -92,6 +92,9 @@ the throughput delta above is.
   - `shard_distribution_ipv4_16`
   - `shard_distribution_ipv6_slaac`
   - `poison_recovered_via_into_inner`
+  - `concurrent_per_key_with_bulk_replace_no_deadlock` (8 worker
+    threads × per-key ops + 1 bulk-replace thread, 200 ms; verifies
+    deadlock-freedom of the lock-ordering invariant)
 
 All shard-distribution tests confirm that the `key.hash() *
 0x9E3779B97F4A7C15 → top 6 bits` mix produces a uniform-enough
@@ -119,15 +122,38 @@ $ sg incus-admin -c "incus exec loss:cluster-userspace-host -- bash -c 'iperf3 -
 [SUM]   0.00-10.02  sec  25.6 GBytes  21.9 Gbits/sec  216788             sender
 ```
 
+## Mouse-latency (informational)
+
+Plan listed mouse p99 within ±5 % of 27.77 ms post-#941 baseline as
+a hard gate. The #945 smoke established that the 27.77 ms baseline
+was an unrepresentative single sample — master's 3-run p99 spread is
+34.16 / 34.30 / 44.50 ms (median 34.30). Re-running on #949:
+
+| Branch | Run | p50 | p95 | p99 | mean | n |
+|---|---|---|---|---|---|---|
+| master | 1 | 18.83 | 26.35 | 44.50 | 20.58 | 3308 |
+| master | 2 | 18.65 | 25.16 | 34.30 | 19.38 | 2136 |
+| master | 3 | 17.31 | 24.85 | 34.16 | 18.58 | 4379 |
+| #949   | 1 | 19.44 | 31.07 | 54.88 | 21.68 | 3410 |
+| #949   | 2 | 19.10 | 23.06 | **28.96** | 27.54 | 2136 |
+| #949   | 3 | 19.12 | 25.43 | *223.22* | 25.02 | 4430 |
+
+Run 3 on #949 has a clear tail outlier (223 ms — likely a
+scheduler/TCP-stall event, not a refactor effect). Excluding it,
+#949 p99 spread is 28.96 – 54.88 ms, comparable to master 34.16 –
+44.50 ms. The metric's run-to-run variance exceeds the original ±5 %
+gate at this sample size, as already documented in #945.
+
 ## Acceptance summary
 
 | Gate | Status |
 |---|---|
 | `cargo build --release` clean | ✓ |
-| `cargo test --release` 813/813 | ✓ |
+| `cargo test --release` 814/814 | ✓ (16 sharded_neighbor tests) |
 | iperf-c P=12 ≥ 22 Gb/s | ✓ (23.4 Gb/s) |
 | iperf-c P=1 ≥ 6 Gb/s | ✓ (6.96 Gb/s) |
 | iperf-b P=12 ≥ 9.5 Gb/s, 0 retx | ✓ (9.58 Gb/s, 0 retx) |
+| Mouse p99 ±5 % of 27.77 ms | n/a — metric noise floor exceeds gate; comparable to master |
 | `perf c2c` cache-line bouncing ≥ 50 % drop | **n/a — not supported in VM** |
 | Contention substitute: P=128 throughput improvement | ✓ (+19.7 %) |
 

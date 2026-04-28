@@ -28,7 +28,6 @@ use std::net::IpAddr;
 use std::sync::{Mutex, MutexGuard};
 
 pub(super) const NUM_SHARDS: usize = 64;
-const SHARD_MASK: usize = NUM_SHARDS - 1;
 
 /// One mutex-guarded shard, padded to 64 bytes so adjacent shards do
 /// not share cache lines.
@@ -124,6 +123,11 @@ impl ShardedNeighborMap {
     ///
     /// Deadlock-free as long as every other caller that wants more
     /// than one shard locks in ascending shard-index order.
+    ///
+    /// **Non-reentrant**: the closure MUST NOT call any other method
+    /// on the same `ShardedNeighborMap` (or any of its `Arc` clones) —
+    /// every shard is already locked, so a per-key call would
+    /// self-deadlock waiting on a shard the same thread holds.
     pub(crate) fn with_all_shards<R, F>(&self, f: F) -> R
     where
         F: FnOnce(&mut BulkShardGuard<'_>) -> R,
@@ -427,5 +431,72 @@ mod tests {
         // must NOT propagate the poison — it must use into_inner and
         // return the existing entry.
         assert_eq!(map.get(&k), Some(entry(0xAB)));
+    }
+
+    /// Concurrency stress: 8 worker threads each doing 1000 per-key
+    /// insert/get/remove ops on disjoint key ranges, while one
+    /// "replace" thread periodically calls `with_all_shards` to do an
+    /// atomic bulk replace. Verifies no deadlock under interleaving
+    /// (the deadlock-freedom invariant: bulk locks shards 0..63 in
+    /// order; per-key holds at most one shard at a time, so no cycle).
+    #[test]
+    fn concurrent_per_key_with_bulk_replace_no_deadlock() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+        use std::time::Duration;
+
+        let map = Arc::new(ShardedNeighborMap::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+
+        // 8 per-key worker threads on disjoint ifindex ranges.
+        for tid in 0..8u8 {
+            let map = Arc::clone(&map);
+            let stop = Arc::clone(&stop);
+            handles.push(thread::spawn(move || {
+                let mut iter = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let key = (
+                        (tid as i32) * 1000 + (iter % 100) as i32,
+                        IpAddr::V4(Ipv4Addr::new(10, tid, (iter / 256) as u8, iter as u8)),
+                    );
+                    let _ = map.insert_if_changed(key, entry(tid));
+                    let _ = map.get(&key);
+                    if iter & 7 == 0 {
+                        let _ = map.remove_if_present(&key);
+                    }
+                    iter = iter.wrapping_add(1);
+                }
+            }));
+        }
+
+        // One bulk thread doing atomic bulk replaces. If a deadlock
+        // existed, this thread would block forever waiting for a
+        // per-key shard lock that another thread blocks on.
+        let map_bulk = Arc::clone(&map);
+        let stop_bulk = Arc::clone(&stop);
+        handles.push(thread::spawn(move || {
+            while !stop_bulk.load(Ordering::Relaxed) {
+                map_bulk.with_all_shards(|bulk| {
+                    for i in 0..16u8 {
+                        bulk.insert(
+                            (9999, IpAddr::V4(Ipv4Addr::new(10, 99, 99, i))),
+                            entry(0xFF),
+                        );
+                    }
+                });
+                thread::sleep(Duration::from_micros(100));
+            }
+        }));
+
+        // Run for ~200 ms.
+        thread::sleep(Duration::from_millis(200));
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+        // Map remains usable.
+        assert!(map.len() > 0);
     }
 }
