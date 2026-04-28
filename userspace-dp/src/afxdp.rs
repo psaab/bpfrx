@@ -1116,7 +1116,7 @@ fn poll_binding_process_descriptor(
                                 meta,
                                 ipsec_decision,
                                 worker_ctx.recent_exceptions,
-                                "worker_ctx.slow_path",
+                                "slow_path",
                             );
                             binding.scratch_recycle.push(desc.addr);
                             continue;
@@ -3039,7 +3039,7 @@ fn poll_binding_process_descriptor(
                             meta,
                             decision,
                             worker_ctx.recent_exceptions,
-                            "worker_ctx.slow_path",
+                            "slow_path",
                         );
                     }
                 } else {
