@@ -2069,6 +2069,13 @@ pub(super) enum WorkerCommand {
     RefreshOwnerRGS { owner_rgs: Vec<i32> },
     ExportOwnerRGSessions { sequence: u64, owner_rgs: Vec<i32> },
     EnqueueShapedLocal(TxRequest),
+    /// #941 Work item C: vacate ALL V_min slots owned by this worker
+    /// across every binding's shared_exact queues. Enqueued by the
+    /// coordinator on HA demotion (RG primary→secondary). The actual
+    /// vacate runs on the worker thread (single-writer invariant) —
+    /// this command sets a flag in `WorkerCommandResults`; the outer
+    /// poll loop dispatches via `vacate_all_shared_exact_slots`.
+    VacateAllSharedExactSlots,
 }
 
 #[derive(Default)]

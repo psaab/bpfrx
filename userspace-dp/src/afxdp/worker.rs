@@ -813,13 +813,26 @@ pub(crate) fn worker_loop(
                 cancelled_keys: Vec::new(),
                 exported_sequences: Vec::new(),
                 shaped_tx_requests: Vec::new(),
+                vacate_all_shared_exact_slots: false,
             }
         };
         let WorkerCommandResults {
             cancelled_keys,
             exported_sequences,
             shaped_tx_requests,
+            vacate_all_shared_exact_slots,
         } = command_results;
+        // #941 Work item C: HA-demotion vacate. The
+        // VacateAllSharedExactSlots WorkerCommand cannot be processed
+        // inside `apply_worker_commands` (no BindingWorker access);
+        // it sets this flag and the dispatch happens here, where we
+        // hold `&mut bindings`. Single-writer invariant: only this
+        // worker writes its own slots.
+        if vacate_all_shared_exact_slots {
+            for binding in bindings.iter_mut() {
+                vacate_all_shared_exact_slots_for_binding(binding);
+            }
+        }
         if !shaped_tx_requests.is_empty() {
             apply_worker_shaped_tx_requests(
                 &mut bindings,
@@ -1872,6 +1885,28 @@ fn cos_runtime_config_changed(current: &ForwardingState, next: &ForwardingState)
     current.cos != next.cos
 }
 
+/// #941 Work item C: vacate every shared_exact V_min slot owned by
+/// this worker across all bindings' CoS interfaces. Called from two
+/// paths: (1) the worker poll loop on
+/// `WorkerCommand::VacateAllSharedExactSlots` (HA-demotion), and
+/// (2) `reset_binding_cos_runtime` before clearing `cos_interfaces`
+/// (config-reload reset-epoch). Single-writer invariant: this worker
+/// owns its slots; race-free against peer Acquire reads.
+fn vacate_all_shared_exact_slots_for_binding(binding: &BindingWorker) {
+    for root in binding.cos_interfaces.values() {
+        for queue in &root.queues {
+            if !queue.shared_exact {
+                continue;
+            }
+            if let Some(floor) = queue.vtime_floor.as_ref() {
+                if let Some(slot) = floor.slots.get(queue.worker_id as usize) {
+                    slot.vacate();
+                }
+            }
+        }
+    }
+}
+
 fn reset_binding_cos_runtime(binding: &mut BindingWorker) {
     release_all_cos_root_leases(binding);
     release_all_cos_queue_leases(binding);
@@ -1902,20 +1937,17 @@ fn reset_binding_cos_runtime(binding: &mut BindingWorker) {
         root.nonempty_queues = 0;
         root.runnable_queues = 0;
     }
-    // FIXME(#941 work item D): vacate any V_min slots owned by
-    // this worker before clearing cos_interfaces. The
+    // #941 Work item C (reset-epoch path): vacate any V_min slots
+    // owned by this worker before clearing cos_interfaces. The
     // coordinator's `build_shared_cos_queue_vtime_floors_reusing_existing`
-    // (coordinator.rs ~2061) reuses an existing floor Arc when
-    // the (ifindex, queue_id, worker_count) tuple matches across
-    // rebuilds. After this clear, the next runtime starts with
-    // queue_vtime=0 but the floor's slot for this worker still
-    // holds the OLD high vtime. Peers reading the slot will use
-    // the stale value in their V_min calculation until the first
-    // post-reset post-settle publish (potentially > 100 ms on
-    // sparse traffic). Without vacate, peers may erroneously
-    // throttle for one or more drain batches at reset-epoch.
-    // See `docs/issue-refinements/941-body.md` Work item D and
-    // `docs/pr/940-942-vmin-correctness/plan.md` "Known gap".
+    // reuses an existing floor Arc when the (ifindex, queue_id,
+    // worker_count) tuple matches across rebuilds. After this clear,
+    // the next runtime starts with queue_vtime=0 but the floor's
+    // slot for this worker would still hold the OLD high vtime
+    // without this vacate — peers reading the slot would use the
+    // stale value in their V_min calculation, throttling them
+    // unnecessarily until the first post-reset post-settle publish.
+    vacate_all_shared_exact_slots_for_binding(binding);
     binding.cos_interfaces.clear();
     binding.cos_interface_order.clear();
     binding.cos_interface_rr = 0;

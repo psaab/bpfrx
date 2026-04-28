@@ -48,6 +48,11 @@ impl super::Coordinator {
                 pending.push_back(WorkerCommand::DemoteOwnerRGS {
                     owner_rgs: demoted_rgs.clone(),
                 });
+                // #941 Work item C: vacate V_min slots on demotion.
+                // Stale-low slot values would cause peer workers to
+                // throttle unnecessarily until the first post-settle
+                // publish from this worker after re-promotion.
+                pending.push_back(WorkerCommand::VacateAllSharedExactSlots);
             }
             demote_shared_owner_rgs(
                 &self.shared_sessions,
