@@ -2620,8 +2620,19 @@ fn drain_exact_local_items_to_scratch_flow_fair(
     queue.pop_snapshot_stack.clear();
     let mut remaining_root = root_budget;
     let mut remaining_secondary = secondary_budget;
+    let mut v_min_pop_count = 0u32;
     while scratch_local_tx.len() < TX_BATCH_SIZE {
         if free_tx_frames.is_empty() {
+            break;
+        }
+        // #917 Phase 4: V_min check on drain-batch start (pop_count
+        // transitions 0→1) and every K=8 pops thereafter. Throttle
+        // = early break out of this queue's drain. The fast worker
+        // moves on to next runnable queue (or exits the drain
+        // entirely if all queues throttle); revisits this queue
+        // next round when V_min has likely advanced.
+        v_min_pop_count = v_min_pop_count.saturating_add(1);
+        if !cos_queue_v_min_continue(queue, v_min_pop_count) {
             break;
         }
         let Some(front) = cos_queue_front(queue) else {
@@ -5670,7 +5681,69 @@ fn apply_cos_queue_flow_fair_promotion(
 /// (`exact_cos_flow_bucket` is only called from the flow-fair
 /// callers). Keeping them at seed=0 also preserves byte-identical
 /// legacy behavior on that path.
+
+/// #917 — V_min sync throttle decision. Plan §3.3 v2 cadence:
+/// K=8 + mandatory check at drain-batch start (`pop_count == 1`).
+const V_MIN_READ_CADENCE: u32 = 8;
+
+/// #917 — per-flow drift budget that V_min sync tolerates before
+/// throttling the fast worker. Plan §3.5: `per_worker_rate × 1 ms`.
+const V_MIN_LAG_THRESHOLD_NS: u64 = 1_000_000;
+/// Floor for the lag budget so the throttle never fires below the
+/// minimum forward-progress unit (~16 MTU at 1500 B = 24 KB).
+const V_MIN_MIN_LAG_BYTES: u64 = 24_000;
+
 #[inline]
+fn compute_v_min_lag_threshold(queue_rate_bytes: u64, participating: u32) -> u64 {
+    let participating = participating.max(1) as u64;
+    let per_worker_rate = queue_rate_bytes / participating;
+    let lag_bytes =
+        (per_worker_rate as u128 * V_MIN_LAG_THRESHOLD_NS as u128 / 1_000_000_000u128) as u64;
+    lag_bytes.max(V_MIN_MIN_LAG_BYTES)
+}
+
+/// #917 — V_min sync read-path: returns true if the local
+/// queue_vtime is within `LAG_THRESHOLD` of the peer-min, false
+/// if the local worker should throttle this queue's drain for
+/// this batch. Caller increments `pop_count` before calling and
+/// the helper internally skips on cadence (1-in-K) so the
+/// peer-cache-line read happens at most once per K pops.
+///
+/// Returns `true` (continue) on:
+/// - Cadence skip (not at pop-count K boundary).
+/// - No `vtime_floor` (non-shared_exact queue or floor not yet
+///   allocated).
+/// - No participating peers (this worker is alone — V_min sync
+///   has nothing to sync against).
+/// - Local vtime within LAG_THRESHOLD of V_min.
+///
+/// Returns `false` (throttle) if `queue_vtime > V_min + LAG`.
+#[inline]
+fn cos_queue_v_min_continue(queue: &CoSQueueRuntime, pop_count: u32) -> bool {
+    if pop_count != 1 && pop_count.is_multiple_of(V_MIN_READ_CADENCE) == false {
+        return true;
+    }
+    let Some(floor) = queue.vtime_floor.as_ref() else {
+        return true;
+    };
+    let mut participating = 0u32;
+    let mut v_min = u64::MAX;
+    for (w, slot) in floor.slots.iter().enumerate() {
+        if w == queue.worker_id as usize {
+            continue;
+        }
+        if let Some(peer_vtime) = slot.read() {
+            participating += 1;
+            v_min = v_min.min(peer_vtime);
+        }
+    }
+    if participating == 0 {
+        return true;
+    }
+    let lag = compute_v_min_lag_threshold(queue.transmit_rate_bytes, participating + 1);
+    queue.queue_vtime <= v_min.saturating_add(lag)
+}
+
 fn promote_cos_queue_flow_fair(
     queue: &mut CoSQueueRuntime,
     queue_fast: &WorkerCoSQueueFastPath,
