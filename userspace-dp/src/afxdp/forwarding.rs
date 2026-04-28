@@ -85,7 +85,7 @@ pub(super) fn resolve_forwarding(
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     state: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
 ) -> ForwardingResolution {
     let Some(dst) = parse_packet_destination(area, desc, meta) else {
         return ForwardingResolution {
@@ -199,7 +199,7 @@ pub(super) fn ingress_is_fabric_overlay(
 pub(super) fn resolve_fabric_links_from_snapshots(
     snapshots: &[crate::FabricSnapshot],
     egress: &FastMap<i32, EgressInterface>,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
 ) -> Vec<FabricLink> {
     let mut out = Vec::with_capacity(snapshots.len());
     for fabric in snapshots {
@@ -213,11 +213,10 @@ pub(super) fn resolve_fabric_links_from_snapshots(
             .or_else(|| egress.get(&fabric.parent_ifindex).map(|e| e.src_mac));
         let Some(local_mac) = local_mac else { continue };
         let peer_mac = parse_mac(&fabric.peer_mac).or_else(|| {
-            dynamic_neighbors.lock().ok().and_then(|n| {
-                n.get(&(fabric.overlay_ifindex, peer_addr))
-                    .or_else(|| n.get(&(fabric.parent_ifindex, peer_addr)))
-                    .map(|e| e.mac)
-            })
+            dynamic_neighbors
+                .get(&(fabric.overlay_ifindex, peer_addr))
+                .or_else(|| dynamic_neighbors.get(&(fabric.parent_ifindex, peer_addr)))
+                .map(|e| e.mac)
         });
         let Some(peer_mac) = peer_mac else { continue };
         out.push(FabricLink {
@@ -287,7 +286,7 @@ pub(super) fn redirect_via_fabric_if_needed(
 pub(super) fn prefer_local_forward_candidate_for_fabric_ingress(
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     now_secs: u64,
     fabric_ingress: bool,
     target_ip: IpAddr,
@@ -330,7 +329,7 @@ pub(super) fn prefer_local_forward_candidate_for_fabric_ingress(
 
 pub(super) fn cluster_peer_return_fast_path(
     forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     packet_frame: &[u8],
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<&str>,
@@ -479,7 +478,7 @@ pub(super) fn enforce_ha_resolution_snapshot(
 pub(super) fn cached_flow_decision_valid(
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     now_secs: u64,
     cached_owner_rg_id: i32,
     fabric_ingress: bool,
@@ -831,7 +830,7 @@ pub(super) fn lookup_forwarding_resolution(
 
 pub(super) fn lookup_forwarding_resolution_with_dynamic(
     state: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     dst: IpAddr,
 ) -> ForwardingResolution {
     lookup_forwarding_resolution_inner(state, Some(dynamic_neighbors), dst, None)
@@ -839,7 +838,7 @@ pub(super) fn lookup_forwarding_resolution_with_dynamic(
 
 pub(super) fn lookup_forwarding_resolution_in_table_with_dynamic(
     state: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     dst: IpAddr,
     table: Option<&str>,
 ) -> ForwardingResolution {
@@ -848,7 +847,7 @@ pub(super) fn lookup_forwarding_resolution_in_table_with_dynamic(
 
 pub(super) fn lookup_forwarding_resolution_inner(
     state: &ForwardingState,
-    dynamic_neighbors: Option<&Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>>,
+    dynamic_neighbors: Option<&Arc<ShardedNeighborMap>>,
     dst: IpAddr,
     table: Option<&str>,
 ) -> ForwardingResolution {
@@ -1141,7 +1140,7 @@ pub(super) fn ingress_interface_local_resolution_on_session_miss(
 
 pub(super) fn lookup_forwarding_resolution_v4(
     state: &ForwardingState,
-    dynamic_neighbors: Option<&Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>>,
+    dynamic_neighbors: Option<&Arc<ShardedNeighborMap>>,
     ip: Ipv4Addr,
     table: &str,
     depth: usize,
@@ -1289,7 +1288,7 @@ pub(super) fn lookup_forwarding_resolution_v4(
 
 pub(super) fn lookup_forwarding_resolution_v6(
     state: &ForwardingState,
-    dynamic_neighbors: Option<&Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>>,
+    dynamic_neighbors: Option<&Arc<ShardedNeighborMap>>,
     ip: Ipv6Addr,
     table: &str,
     depth: usize,
@@ -1451,7 +1450,7 @@ pub(super) fn no_route_resolution(next_hop: Option<IpAddr>) -> ForwardingResolut
 
 pub(super) fn resolve_tunnel_forwarding_resolution(
     state: &ForwardingState,
-    dynamic_neighbors: Option<&Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>>,
+    dynamic_neighbors: Option<&Arc<ShardedNeighborMap>>,
     tunnel_endpoint_id: u16,
     depth: usize,
 ) -> ForwardingResolution {
@@ -1496,7 +1495,7 @@ pub(super) fn resolve_tunnel_forwarding_resolution(
 
 pub(super) fn lookup_neighbor_entry(
     state: &ForwardingState,
-    dynamic_neighbors: Option<&Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>>,
+    dynamic_neighbors: Option<&Arc<ShardedNeighborMap>>,
     ifindex: i32,
     target: IpAddr,
 ) -> Option<NeighborEntry> {
@@ -1506,10 +1505,8 @@ pub(super) fn lookup_neighbor_entry(
     let Some(dynamic_neighbors) = dynamic_neighbors else {
         return None;
     };
-    if let Ok(cache) = dynamic_neighbors.lock() {
-        if let Some(entry) = cache.get(&(ifindex, target)).copied() {
-            return Some(entry);
-        }
+    if let Some(entry) = dynamic_neighbors.get(&(ifindex, target)) {
+        return Some(entry);
     }
     // The worker hot path must not block on shelling out to `ip neigh` or
     // active probes. Runtime neighbor discovery is maintained asynchronously
@@ -1746,7 +1743,7 @@ mod tests {
         let resolution =
             lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         let now_secs = monotonic_nanos() / 1_000_000_000;
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
 
         assert!(cached_flow_decision_valid(
             &state,
@@ -1776,7 +1773,7 @@ mod tests {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let resolution = resolve_fabric_redirect(&state).expect("fabric redirect");
 
         assert!(!cached_flow_decision_valid(
@@ -1797,7 +1794,7 @@ mod tests {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let resolution = resolve_fabric_redirect(&state).expect("fabric redirect");
 
         assert!(!cached_flow_decision_valid(
@@ -1817,7 +1814,7 @@ mod tests {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let resolution = resolve_fabric_redirect(&state).expect("fabric redirect");
 
         assert!(cached_flow_decision_valid(
@@ -1838,7 +1835,7 @@ mod tests {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let resolution = resolve_fabric_redirect(&state).expect("fabric redirect");
 
         assert!(cached_flow_decision_valid(
@@ -1858,7 +1855,7 @@ mod tests {
         let state = build_forwarding_state(&nat_snapshot());
         let active = BTreeMap::from([(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
         let demoted = BTreeMap::from([(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let resolution = interface_nat_local_resolution(&state, "172.16.80.8".parse().expect("v4"))
             .expect("interface nat local delivery");
         let now_secs = monotonic_nanos() / 1_000_000_000;
@@ -2055,7 +2052,7 @@ mod tests {
         area.slice_mut(0, frame.len())
             .expect("slice")
             .copy_from_slice(&frame);
-        let neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let neighbors = Arc::new(ShardedNeighborMap::new());
         let mut last_learned = None;
         let meta = UserspaceDpMeta {
             magic: USERSPACE_META_MAGIC,
@@ -2077,29 +2074,23 @@ mod tests {
             &state,
             &neighbors,
         );
-        assert!(neighbors.lock().expect("neighbors").is_empty());
+        assert!(neighbors.is_empty());
     }
 
     #[test]
     fn manager_neighbor_replace_preserves_packet_learned_entries() {
         let mut coordinator = Coordinator::new();
-        {
-            let mut neighbors = coordinator
-                .dynamic_neighbors_ref()
-                .lock()
-                .expect("neighbors");
-            neighbors.insert(
-                (
-                    5,
-                    IpAddr::V6(Ipv6Addr::new(
-                        0x2001, 0x559, 0x8585, 0xef00, 0x1266, 0x6aff, 0xfe0b, 0xd017,
-                    )),
-                ),
-                NeighborEntry {
-                    mac: [0x10, 0x66, 0x6a, 0x0b, 0xd0, 0x17],
-                },
-            );
-        }
+        coordinator.dynamic_neighbors_ref().insert(
+            (
+                5,
+                IpAddr::V6(Ipv6Addr::new(
+                    0x2001, 0x559, 0x8585, 0xef00, 0x1266, 0x6aff, 0xfe0b, 0xd017,
+                )),
+            ),
+            NeighborEntry {
+                mac: [0x10, 0x66, 0x6a, 0x0b, 0xd0, 0x17],
+            },
+        );
 
         coordinator.apply_manager_neighbors(
             true,
@@ -2112,10 +2103,7 @@ mod tests {
             )],
         );
 
-        let neighbors = coordinator
-            .dynamic_neighbors_ref()
-            .lock()
-            .expect("neighbors");
+        let neighbors = coordinator.dynamic_neighbors_ref();
         assert_eq!(neighbors.len(), 2);
         assert!(neighbors.contains_key(&(
             5,
@@ -2215,23 +2203,11 @@ mod tests {
                 },
             )],
         );
-        assert!(
-            coordinator
-                .dynamic_neighbors_ref()
-                .lock()
-                .expect("neighbors")
-                .contains_key(&(13, target))
-        );
+        assert!(coordinator.dynamic_neighbors_ref().contains_key(&(13, target)));
 
         coordinator.refresh_runtime_snapshot(&ConfigSnapshot::default());
 
-        assert!(
-            !coordinator
-                .dynamic_neighbors_ref()
-                .lock()
-                .expect("neighbors")
-                .contains_key(&(13, target))
-        );
+        assert!(!coordinator.dynamic_neighbors_ref().contains_key(&(13, target)));
         assert!(
             lookup_neighbor_entry(
                 &coordinator.forwarding,
@@ -2283,8 +2259,8 @@ mod tests {
     fn fabric_originated_reverse_session_prefers_local_client_delivery_when_rg_active() {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
         let ha_state = BTreeMap::from([(2, active_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        dynamic_neighbors.lock().expect("neighbors").insert(
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+        dynamic_neighbors.insert(
             (24, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
             NeighborEntry {
                 mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
@@ -2316,7 +2292,7 @@ mod tests {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
         let ha_state =
             BTreeMap::from([(2, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
 
         let resolved = reverse_resolution_for_session(
             &state,
@@ -2348,8 +2324,8 @@ mod tests {
             peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
             local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
         });
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        dynamic_neighbors.lock().expect("neighbors").insert(
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+        dynamic_neighbors.insert(
             (5, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
             NeighborEntry {
                 mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
@@ -2394,7 +2370,7 @@ mod tests {
             peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
             local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
         });
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let meta = UserspaceDpMeta {
             ingress_ifindex: 4,
             protocol: PROTO_TCP,
@@ -2425,7 +2401,7 @@ mod tests {
             peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
             local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
         });
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let meta = UserspaceDpMeta {
             ingress_ifindex: 4,
             protocol: PROTO_ICMP,
@@ -2457,7 +2433,7 @@ mod tests {
             peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
             local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
         });
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let meta = UserspaceDpMeta {
             ingress_ifindex: 4,
             protocol: PROTO_ICMPV6,
@@ -2526,7 +2502,7 @@ mod tests {
     fn reverse_session_prefers_interface_snat_ipv4_local_delivery() {
         let state = build_forwarding_state(&nat_snapshot());
         let ha_state = BTreeMap::new();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
 
         let resolved = reverse_resolution_for_session(
             &state,
@@ -2550,7 +2526,7 @@ mod tests {
         let state = build_forwarding_state(&nat_snapshot());
         let ha_state =
             BTreeMap::from([(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
 
         let resolved = reverse_resolution_for_session(
             &state,
@@ -2572,7 +2548,7 @@ mod tests {
     fn reverse_session_prefers_interface_snat_ipv6_local_delivery() {
         let state = build_forwarding_state(&nat_snapshot());
         let ha_state = BTreeMap::new();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
 
         let resolved = reverse_resolution_for_session(
             &state,
@@ -2594,7 +2570,7 @@ mod tests {
     #[test]
     fn session_hit_keeps_interface_snat_ipv4_local_delivery() {
         let state = build_forwarding_state(&nat_snapshot());
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let flow = SessionFlow {
             src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
@@ -2623,7 +2599,7 @@ mod tests {
     #[test]
     fn inactive_interface_snat_session_hit_redirects_to_fabric() {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
             1,
             inactive_ha_runtime(monotonic_nanos() / 1_000_000_000),
@@ -2662,7 +2638,7 @@ mod tests {
     #[test]
     fn session_hit_keeps_interface_snat_ipv6_local_delivery() {
         let state = build_forwarding_state(&nat_snapshot());
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let flow = SessionFlow {
             src_ip: "2001:559:8585:80::200".parse().expect("src"),
             dst_ip: "2001:559:8585:80::8".parse().expect("dst"),
@@ -3517,12 +3493,13 @@ mod tests {
     #[test]
     fn dynamic_neighbor_cache_enables_forward_candidate() {
         let state = build_forwarding_state(&forwarding_snapshot(false));
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::from_iter([(
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+        dynamic_neighbors.insert(
             (12, IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1))),
             NeighborEntry {
                 mac: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
             },
-        )])));
+        );
         let resolved = lookup_forwarding_resolution_with_dynamic(
             &state,
             &dynamic_neighbors,
@@ -3556,7 +3533,7 @@ mod tests {
     #[test]
     fn learned_ingress_neighbor_enables_reverse_lan_resolution() {
         let state = build_forwarding_state(&nat_snapshot());
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         learn_dynamic_neighbor(
             &state,
             &dynamic_neighbors,
@@ -3584,7 +3561,7 @@ mod tests {
     #[test]
     fn learned_vlan_ingress_neighbor_maps_to_logical_ifindex() {
         let state = build_forwarding_state(&nat_snapshot());
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         learn_dynamic_neighbor(
             &state,
             &dynamic_neighbors,

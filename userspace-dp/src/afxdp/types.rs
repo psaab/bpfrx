@@ -380,7 +380,7 @@ pub(super) struct RouteEntryV6 {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NeighborEntry {
     pub mac: [u8; 6],
 }
@@ -2178,7 +2178,7 @@ pub(super) struct WorkerContext<'a> {
     pub(super) binding_lookup: &'a WorkerBindingLookup,
     pub(super) forwarding: &'a ForwardingState,
     pub(super) ha_state: &'a BTreeMap<i32, HAGroupRuntime>,
-    pub(super) dynamic_neighbors: &'a Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    pub(super) dynamic_neighbors: &'a Arc<super::sharded_neighbor::ShardedNeighborMap>,
     pub(super) shared_sessions: &'a Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     pub(super) shared_nat_sessions: &'a Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     pub(super) shared_forward_wire_sessions:

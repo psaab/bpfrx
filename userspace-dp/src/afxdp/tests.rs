@@ -514,7 +514,7 @@ fn session_resolution_falls_back_to_cached_neighbor_on_miss() {
     };
     let resolved = lookup_forwarding_resolution_for_session(
         &state,
-        &Arc::new(Mutex::new(FastMap::default())),
+        &Arc::new(ShardedNeighborMap::new()),
         &flow,
         decision,
     );
@@ -1149,7 +1149,7 @@ fn build_local_time_exceeded_request_returns_prebuilt_forward_for_ttl_expiry() {
         &ingress_ident,
         &flow,
         &forwarding,
-        &Arc::new(Mutex::new(FastMap::default())),
+        &Arc::new(ShardedNeighborMap::new()),
         &BTreeMap::new(),
         0,
     )
@@ -1220,7 +1220,7 @@ fn build_local_time_exceeded_request_skips_fabric_ingress_packets() {
         &ingress_ident,
         &flow,
         &forwarding,
-        &Arc::new(Mutex::new(FastMap::default())),
+        &Arc::new(ShardedNeighborMap::new()),
         &BTreeMap::new(),
         0,
     );
@@ -2013,7 +2013,7 @@ fn icmpv6_te_nptv6_reverse_lookup_restores_internal_client() {
         0,
     ));
 
-    let neighbors = Arc::new(Mutex::new(FastMap::default()));
+    let neighbors = Arc::new(ShardedNeighborMap::new());
     let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -2161,7 +2161,7 @@ fn icmpv6_te_prefers_reverse_session_resolution_for_client_return_path() {
         0,
     ));
 
-    let neighbors = Arc::new(Mutex::new(FastMap::default()));
+    let neighbors = Arc::new(ShardedNeighborMap::new());
     let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -2243,7 +2243,7 @@ fn embedded_icmp_nat_match_uses_shared_nat_session_for_ipv4() {
 
     let mut sessions = SessionTable::new();
     let forwarding = build_forwarding_state(&nat_snapshot());
-    let neighbors = Arc::new(Mutex::new(FastMap::default()));
+    let neighbors = Arc::new(ShardedNeighborMap::new());
     learn_dynamic_neighbor(
         &forwarding,
         &neighbors,
@@ -2350,7 +2350,7 @@ fn embedded_icmp_nat_match_ignores_non_error_echo() {
 
     let mut sessions = SessionTable::new();
     let forwarding = ForwardingState::default();
-    let neighbors = Arc::new(Mutex::new(FastMap::default()));
+    let neighbors = Arc::new(ShardedNeighborMap::new());
     let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));

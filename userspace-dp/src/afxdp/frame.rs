@@ -3719,7 +3719,7 @@ mod tests {
             1,
             active_ha_runtime(monotonic_nanos() / 1_000_000_000),
         )])));
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let packet = build_icmp_echo_frame_v4(
             Ipv4Addr::new(10, 255, 192, 42),
             Ipv4Addr::new(10, 255, 192, 41),
@@ -3750,7 +3750,7 @@ mod tests {
             1,
             inactive_ha_runtime(monotonic_nanos() / 1_000_000_000),
         )])));
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let packet = build_icmp_echo_frame_v4(
             Ipv4Addr::new(10, 255, 192, 42),
             Ipv4Addr::new(10, 255, 192, 41),
