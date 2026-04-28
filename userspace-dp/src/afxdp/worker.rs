@@ -468,6 +468,9 @@ pub(crate) fn worker_loop(
     shared_cos_owner_live_by_queue: Arc<ArcSwap<BTreeMap<(i32, u8), Arc<BindingLiveState>>>>,
     shared_cos_root_leases: Arc<ArcSwap<BTreeMap<i32, Arc<SharedCoSRootLease>>>>,
     shared_cos_queue_leases: Arc<ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>>>,
+    shared_cos_queue_vtime_floors: Arc<
+        ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueVtimeFloor>>>,
+    >,
     cos_status: Arc<ArcSwap<Vec<crate::protocol::CoSInterfaceStatus>>>,
     // #869: worker-runtime telemetry publish slot.  Worker writes its
     // local counters here on a ~1s cadence; coordinator reads for status.
@@ -483,6 +486,7 @@ pub(crate) fn worker_loop(
     let mut cos_owner_live_by_queue = shared_cos_owner_live_by_queue.load_full();
     let mut cos_shared_root_leases = shared_cos_root_leases.load_full();
     let mut cos_shared_queue_leases = shared_cos_queue_leases.load_full();
+    let mut cos_shared_queue_vtime_floors = shared_cos_queue_vtime_floors.load_full();
     let mut sessions = SessionTable::new();
     let mut screen_state = ScreenState::new();
     screen_state.update_profiles(forwarding.screen_profiles.clone());
@@ -534,6 +538,7 @@ pub(crate) fn worker_loop(
         cos_owner_live_by_queue.as_ref(),
         cos_shared_root_leases.as_ref(),
         cos_shared_queue_leases.as_ref(),
+        cos_shared_queue_vtime_floors.as_ref(),
     );
     for binding in bindings.iter_mut() {
         binding.cos_fast_interfaces = cos_fast_interfaces.clone();
@@ -752,6 +757,22 @@ pub(crate) fn worker_loop(
             cos_shared_queue_leases = live_cos_shared_queue_leases;
             rebuild_cos_fast_interfaces = true;
         }
+        let live_cos_shared_queue_vtime_floors = shared_cos_queue_vtime_floors.load_full();
+        if !Arc::ptr_eq(
+            &cos_shared_queue_vtime_floors,
+            &live_cos_shared_queue_vtime_floors,
+        ) {
+            // #917: Arc-replacement of the V_min floors map.
+            // Each shared_exact queue's per-worker slots default
+            // to NOT_PARTICIPATING in the new Arc. Workers will
+            // re-publish their committed vtime on the next
+            // commit-boundary publish; until then peers reading
+            // this slot see "not participating" and skip it in
+            // V_min reduction (per plan §3.4 / §3.7 lifecycle
+            // rules).
+            cos_shared_queue_vtime_floors = live_cos_shared_queue_vtime_floors;
+            rebuild_cos_fast_interfaces = true;
+        }
         if rebuild_cos_fast_interfaces {
             let cos_owner_live_by_tx_ifindex = build_worker_cos_owner_live_by_tx_ifindex(
                 bindings
@@ -766,6 +787,7 @@ pub(crate) fn worker_loop(
                 cos_owner_live_by_queue.as_ref(),
                 cos_shared_root_leases.as_ref(),
                 cos_shared_queue_leases.as_ref(),
+                cos_shared_queue_vtime_floors.as_ref(),
             );
             for binding in bindings.iter_mut() {
                 binding.cos_fast_interfaces = cos_fast_interfaces.clone();
@@ -1721,6 +1743,7 @@ fn build_worker_cos_fast_interfaces(
     owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
     shared_root_leases: &BTreeMap<i32, Arc<SharedCoSRootLease>>,
     shared_queue_leases: &BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>,
+    shared_queue_vtime_floors: &BTreeMap<(i32, u8), Arc<SharedCoSQueueVtimeFloor>>,
 ) -> FastMap<i32, WorkerCoSInterfaceFastPath> {
     let mut out = FastMap::default();
     for (&egress_ifindex, iface) in &forwarding.cos.interfaces {
@@ -1742,14 +1765,13 @@ fn build_worker_cos_fast_interfaces(
                     .exact
                     .then(|| shared_queue_leases.get(&queue_key).cloned())
                     .flatten(),
-                // #917 Phase 2a: field added but always None until
-                // Phase 2b wires the SharedCoSQueueVtimeFloor allocator
-                // in coordinator.rs and threads the map through this
-                // builder (mirror of `shared_queue_leases`). No
-                // functional change yet — V_min publish/read path
-                // (Phases 3-4) keys off `vtime_floor.is_some()` so an
-                // always-None field is a no-op.
-                vtime_floor: None,
+                // #917 Phase 2b: V_min coordination Arc, allocated
+                // once per shared_exact CoS queue by the coordinator
+                // (per `build_shared_cos_queue_vtime_floors_reusing_existing`
+                // in coordinator.rs). Cloned to every worker servicing
+                // this queue. Single-owner / non-shared queues get
+                // None — V_min sync only applies to shared_exact.
+                vtime_floor: shared_queue_vtime_floors.get(&queue_key).cloned(),
             });
         }
         let default_queue_index = match queue_index_by_id[usize::from(iface.default_queue)] {
@@ -3552,6 +3574,7 @@ mod tests {
             &owner_live_by_queue,
             &shared_root_leases,
             &shared_queue_leases,
+            &BTreeMap::new(),
         );
 
         let iface = fast.get(&80).expect("fast cos interface");
@@ -3675,6 +3698,7 @@ mod tests {
             &owner_live_by_queue,
             &shared_root_leases,
             &shared_queue_leases,
+            &BTreeMap::new(),
         );
 
         let iface = fast.get(&80).expect("fast cos interface");
@@ -3769,6 +3793,7 @@ mod tests {
             &owner_live_by_queue,
             &shared_root_leases,
             &shared_queue_leases,
+            &BTreeMap::new(),
         );
 
         let iface = fast.get(&80).expect("fast cos interface");
@@ -3917,6 +3942,7 @@ mod tests {
             &owner_live_by_queue,
             &shared_root_leases,
             &shared_queue_leases,
+            &BTreeMap::new(),
         );
 
         let iface = fast.get(&80).expect("fast cos interface");

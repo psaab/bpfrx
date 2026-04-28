@@ -20,6 +20,14 @@ pub struct Coordinator {
         Arc<ArcSwap<BTreeMap<(i32, u8), Arc<BindingLiveState>>>>,
     pub(crate) shared_cos_root_leases: Arc<ArcSwap<BTreeMap<i32, Arc<SharedCoSRootLease>>>>,
     pub(crate) shared_cos_queue_leases: Arc<ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>>>,
+    /// #917: per-shared_exact-queue V_min coordination Arcs.
+    /// Allocated once per shared_exact CoS queue (mirror of
+    /// `shared_cos_queue_leases`) and Arc-cloned to every
+    /// worker servicing the queue. Slot count = configured
+    /// num_workers; updated by the same reconcile pass that
+    /// rebuilds leases.
+    pub(crate) shared_cos_queue_vtime_floors:
+        Arc<ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueVtimeFloor>>>>,
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
     pub(crate) dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     pub(crate) neighbor_generation: Arc<AtomicU64>,
@@ -73,6 +81,7 @@ impl Coordinator {
             shared_cos_owner_live_by_queue: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_cos_root_leases: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_cos_queue_leases: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
+            shared_cos_queue_vtime_floors: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
             dynamic_neighbors: Arc::new(Mutex::new(FastMap::default())),
             neighbor_generation: Arc::new(AtomicU64::new(0)),
@@ -260,6 +269,8 @@ impl Coordinator {
             .store(Arc::new(BTreeMap::new()));
         self.shared_cos_root_leases.store(Arc::new(BTreeMap::new()));
         self.shared_cos_queue_leases
+            .store(Arc::new(BTreeMap::new()));
+        self.shared_cos_queue_vtime_floors
             .store(Arc::new(BTreeMap::new()));
         self.last_slow_path_status = self
             .slow_path
@@ -691,6 +702,7 @@ impl Coordinator {
             let shared_cos_owner_live_by_queue = self.shared_cos_owner_live_by_queue.clone();
             let shared_cos_root_leases = self.shared_cos_root_leases.clone();
             let shared_cos_queue_leases = self.shared_cos_queue_leases.clone();
+            let shared_cos_queue_vtime_floors = self.shared_cos_queue_vtime_floors.clone();
             let runtime_atomics =
                 std::sync::Arc::new(super::worker_runtime::WorkerRuntimeAtomics::new());
             let runtime_atomics_clone = runtime_atomics.clone();
@@ -728,6 +740,7 @@ impl Coordinator {
                         shared_cos_owner_live_by_queue,
                         shared_cos_root_leases,
                         shared_cos_queue_leases,
+                        shared_cos_queue_vtime_floors,
                         cos_status_clone,
                         runtime_atomics_clone,
                     );
@@ -1125,6 +1138,18 @@ impl Coordinator {
             &active_shards_by_egress_ifindex,
             current_queue_leases.as_ref(),
         );
+        // #917: V_min coordination Arcs sized by worker count.
+        // last_planned_workers is set in apply_planned_workers
+        // before this reconcile fires; defaults to 0 at first
+        // boot which produces zero-slot floors (the reconcile
+        // re-fires once workers are planned).
+        let current_queue_vtime_floors = self.shared_cos_queue_vtime_floors.load();
+        let num_workers = self.last_planned_workers.max(1);
+        let next_queue_vtime_floors = build_shared_cos_queue_vtime_floors_reusing_existing(
+            &self.forwarding,
+            num_workers,
+            current_queue_vtime_floors.as_ref(),
+        );
         if owner_changed {
             self.cos_owner_worker_by_queue = owner_map.clone();
             self.shared_cos_owner_worker_by_queue
@@ -1140,6 +1165,13 @@ impl Coordinator {
         if !shared_cos_queue_leases_match(current_queue_leases.as_ref(), &next_queue_leases) {
             self.shared_cos_queue_leases
                 .store(Arc::new(next_queue_leases));
+        }
+        if !shared_cos_queue_vtime_floors_match(
+            current_queue_vtime_floors.as_ref(),
+            &next_queue_vtime_floors,
+        ) {
+            self.shared_cos_queue_vtime_floors
+                .store(Arc::new(next_queue_vtime_floors));
         }
     }
 
@@ -1993,6 +2025,53 @@ fn shared_cos_root_leases_match(
         && current.iter().all(|(ifindex, lease)| {
             next.get(ifindex)
                 .is_some_and(|next| Arc::ptr_eq(lease, next))
+        })
+}
+
+/// #917: build/reuse the per-shared_exact-queue V_min
+/// coordination Arcs. Mirror of
+/// `build_shared_cos_queue_leases_reusing_existing` — same
+/// keying ((ifindex, queue_id)), same Arc-reuse discipline.
+/// Each queue's `SharedCoSQueueVtimeFloor` is sized by the
+/// configured worker count; if the worker count changes we
+/// reallocate (slot count is fixed for the Arc's lifetime).
+fn build_shared_cos_queue_vtime_floors_reusing_existing(
+    forwarding: &ForwardingState,
+    num_workers: usize,
+    existing: &BTreeMap<(i32, u8), Arc<SharedCoSQueueVtimeFloor>>,
+) -> BTreeMap<(i32, u8), Arc<SharedCoSQueueVtimeFloor>> {
+    let num_workers = num_workers.max(1);
+    let mut out = BTreeMap::new();
+    for (&ifindex, iface) in &forwarding.cos.interfaces {
+        for queue in &iface.queues {
+            // Only allocate for queues that COULD be shared_exact.
+            // The queue.exact gate matches the lease builder's gate
+            // so V_min Arcs and leases stay in lockstep. Worker
+            // fast-path init filters again per-worker, so non-
+            // shared queues just get an unused Arc here — cheap
+            // (one box of N atomics).
+            if !queue.exact || queue.transmit_rate_bytes == 0 {
+                continue;
+            }
+            let key = (ifindex, queue.queue_id);
+            if let Some(floor) = existing.get(&key).filter(|f| f.slots.len() == num_workers) {
+                out.insert(key, floor.clone());
+                continue;
+            }
+            out.insert(key, Arc::new(SharedCoSQueueVtimeFloor::new(num_workers)));
+        }
+    }
+    out
+}
+
+fn shared_cos_queue_vtime_floors_match(
+    current: &BTreeMap<(i32, u8), Arc<SharedCoSQueueVtimeFloor>>,
+    next: &BTreeMap<(i32, u8), Arc<SharedCoSQueueVtimeFloor>>,
+) -> bool {
+    current.len() == next.len()
+        && current.iter().all(|(key, floor)| {
+            next.get(key)
+                .is_some_and(|next| Arc::ptr_eq(floor, next))
         })
 }
 
