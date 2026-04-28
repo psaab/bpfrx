@@ -1,13 +1,15 @@
-# #945 cluster smoke + codegen evidence
+# #945 cluster smoke + codegen + IPC evidence
 
-Captured 2026-04-28 on `loss:xpf-userspace-fw0/fw1` userspace cluster
-after deploying the #945 Context Object refactor (initial impl
-commit `981dc104`; final commit including string-literal fix at
-HEAD of branch refactor/945-context-object).
+Captured 2026-04-28 on `loss:xpf-userspace-fw0/fw1` userspace cluster.
+
+- Initial impl commit: `981dc104`
+- Final commit (with string-literal fix): `90ddd36b` on branch
+  `refactor/945-context-object`
+- All measurements below were taken with `90ddd36b` deployed.
 
 ## Setup
 
-- Branch: `refactor/945-context-object` (commit `981dc104`).
+- Branch: `refactor/945-context-object` (final commit `90ddd36b`).
 - Cluster: 2-node HA, fresh deploy.
 - Source: cluster-userspace-host (10.0.61.102).
 - Target: 172.16.80.200.
@@ -55,6 +57,29 @@ This is the expected pattern for a context-object refactor:
 
 **Acceptance**: no significant rise in stack-spill count or function
 epilogue size. Met.
+
+## perf stat IPC (HARD gate per plan §259)
+
+`perf stat -e instructions,cycles,branch-misses -p <xpf-userspace-dp PID> -- sleep 10`
+captured on the primary while running `iperf3 -P 12 -t 10` from
+`cluster-userspace-host` to `172.16.80.200:5203`. Daemon was freshly
+started for both samples to avoid steady-state cache effects.
+
+| Metric | BEFORE (origin/master) | AFTER (#945 commit `90ddd36b`) | Δ |
+|---|---|---|---|
+| Instructions | 149,525,430,477 | 133,206,127,635 | −10.9 % |
+| Cycles       | 128,541,759,275 | 115,170,416,404 | −10.4 % |
+| **IPC**      | **1.163**       | **1.157**       | **−0.52 %** |
+| Branch misses | 115,642,784    | 92,796,124      | **−19.7 %** |
+
+**Acceptance**: plan gate is "IPC within ±1 %". Measured −0.52 %, met.
+
+The branch-miss reduction (−19.7 %) is a genuine improvement,
+consistent with fewer arg-spill loads and better register pressure
+on the hot path. Combined with the smaller stack frame (−6.2 %),
+this confirms the codegen claim that the refactor moves the function
+toward a tighter calling convention rather than introducing extra
+indirection.
 
 ## Mouse-latency: BEFORE/AFTER comparison
 
