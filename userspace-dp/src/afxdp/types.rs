@@ -2161,3 +2161,41 @@ pub(super) struct DebugPollCounters {
     pub(super) fwd_tcp_rst: u64,
     pub(super) fwd_tcp_zero_window: u64,
 }
+
+/// #945: shared/passed-through context for `poll_binding_process_descriptor`.
+///
+/// All 16 fields are shared (`&'a` or `&'a Arc<...>`) references that
+/// the function reads from or that wrap interior-mutable state behind
+/// `Mutex`/`Arc`. NOT read-only in the strict sense — several entries
+/// like `dynamic_neighbors` are mutated through their inner `Mutex`
+/// (e.g. `dynamic_neighbors.lock().insert(...)` at afxdp.rs ARP/NA
+/// learn sites).
+///
+/// Constructed once per RX-batch call at the
+/// `poll_binding_process_descriptor` call site. `'a` is covariant.
+pub(super) struct WorkerContext<'a> {
+    pub(super) ident: &'a BindingIdentity,
+    pub(super) binding_lookup: &'a WorkerBindingLookup,
+    pub(super) forwarding: &'a ForwardingState,
+    pub(super) ha_state: &'a BTreeMap<i32, HAGroupRuntime>,
+    pub(super) dynamic_neighbors: &'a Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    pub(super) shared_sessions: &'a Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    pub(super) shared_nat_sessions: &'a Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    pub(super) shared_forward_wire_sessions:
+        &'a Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    pub(super) shared_owner_rg_indexes: &'a SharedSessionOwnerRgIndexes,
+    pub(super) slow_path: Option<&'a Arc<SlowPathReinjector>>,
+    pub(super) local_tunnel_deliveries:
+        &'a Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
+    pub(super) recent_exceptions: &'a Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    pub(super) last_resolution: &'a Arc<Mutex<Option<PacketResolution>>>,
+    pub(super) peer_worker_commands: &'a [Arc<Mutex<VecDeque<WorkerCommand>>>],
+    pub(super) dnat_fds: &'a DnatTableFds,
+    pub(super) rg_epochs: &'a [AtomicU32; MAX_RG_EPOCHS],
+}
+
+/// #945: mutable telemetry context for `poll_binding_process_descriptor`.
+pub(super) struct TelemetryContext<'a> {
+    pub(super) dbg: &'a mut DebugPollCounters,
+    pub(super) counters: &'a mut BatchCounters,
+}

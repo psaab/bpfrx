@@ -523,19 +523,15 @@ fn poll_binding(
             .as_ref()
             .expect("identity initialized when RX has work");
 
-        poll_binding_process_descriptor(
-            binding,
-            binding_index,
-            area,
+        // #945: WorkerContext groups 16 shared/passed-through references
+        // (interior mutability via locks is preserved). TelemetryContext
+        // groups the two mutable counter sinks. Named-field shorthand
+        // ensures the compiler verifies field name == local-variable
+        // name; any swap of two shared-typed fields would require
+        // renaming a local elsewhere and break compilation.
+        let worker_ctx = WorkerContext {
             ident,
-            available,
             binding_lookup,
-            sessions,
-            screen,
-            validation,
-            now_ns,
-            now_secs,
-            ha_startup_grace_until_secs,
             forwarding,
             ha_state,
             dynamic_neighbors,
@@ -548,13 +544,29 @@ fn poll_binding(
             recent_exceptions,
             last_resolution,
             peer_worker_commands,
-            worker_id,
             dnat_fds,
+            rg_epochs,
+        };
+        let mut telemetry = TelemetryContext {
+            dbg,
+            counters: &mut counters,
+        };
+        poll_binding_process_descriptor(
+            binding,
+            binding_index,
+            area,
+            available,
+            sessions,
+            screen,
+            validation,
+            now_ns,
+            now_secs,
+            ha_startup_grace_until_secs,
+            worker_id,
             conntrack_v4_fd,
             conntrack_v6_fd,
-            dbg,
-            rg_epochs,
-            &mut counters,
+            &worker_ctx,
+            &mut telemetry,
         );
         let mut pending_forwards = core::mem::take(&mut binding.scratch_forwards);
         let mut rst_teardowns = core::mem::take(&mut binding.scratch_rst_teardowns);
@@ -668,34 +680,18 @@ fn poll_binding_process_descriptor(
     binding: &mut BindingWorker,
     binding_index: usize,
     area: *const MmapArea,
-    ident: &BindingIdentity,
     available: u32,
-    binding_lookup: &WorkerBindingLookup,
     sessions: &mut SessionTable,
     screen: &mut ScreenState,
     validation: ValidationState,
     now_ns: u64,
     now_secs: u64,
     ha_startup_grace_until_secs: u64,
-    forwarding: &ForwardingState,
-    ha_state: &BTreeMap<i32, HAGroupRuntime>,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
-    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
-    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
-    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
-    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
-    slow_path: Option<&Arc<SlowPathReinjector>>,
-    local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
-    last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
-    peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     worker_id: u32,
-    dnat_fds: &DnatTableFds,
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
-    dbg: &mut DebugPollCounters,
-    rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
-    counters: &mut BatchCounters,
+    worker_ctx: &WorkerContext,
+    telemetry: &mut TelemetryContext,
 ) {
         let mut received = binding.rx.receive(available);
         binding.scratch_recycle.clear();
@@ -743,7 +739,7 @@ fn poll_binding_process_descriptor(
                 }
             }
 
-            // Prefetch frame data into L1 while processing counters.
+            // Prefetch frame data into L1 while processing telemetry.counters.
             // UMEM frames are cold (last touched by NIC DMA); this hides
             // ~100ns DRAM latency before metadata parse.
             #[cfg(target_arch = "x86_64")]
@@ -756,16 +752,16 @@ fn poll_binding_process_descriptor(
                     );
                 }
             }
-            counters.touched = true;
-            counters.rx_packets += 1;
-            counters.rx_bytes += desc.len as u64;
-            dbg.rx += 1;
-            dbg.rx_bytes_total += desc.len as u64;
-            if desc.len > dbg.rx_max_frame {
-                dbg.rx_max_frame = desc.len;
+            telemetry.counters.touched = true;
+            telemetry.counters.rx_packets += 1;
+            telemetry.counters.rx_bytes += desc.len as u64;
+            telemetry.dbg.rx += 1;
+            telemetry.dbg.rx_bytes_total += desc.len as u64;
+            if desc.len > telemetry.dbg.rx_max_frame {
+                telemetry.dbg.rx_max_frame = desc.len;
             }
             if desc.len > 1514 {
-                dbg.rx_oversized += 1;
+                telemetry.dbg.rx_oversized += 1;
                 if cfg!(feature = "debug-log") {
                     thread_local! {
                         static OVERSIZED_RX_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -775,7 +771,7 @@ fn poll_binding_process_descriptor(
                         if n < 20 {
                             c.set(n + 1);
                             eprintln!("DBG OVERSIZED_RX[{}]: if={} q={} desc.len={} (exceeds ETH+MTU 1514)",
-                                n, ident.ifindex, ident.queue_id, desc.len,
+                                n, worker_ctx.ident.ifindex, worker_ctx.ident.queue_id, desc.len,
                             );
                         }
                     });
@@ -791,21 +787,21 @@ fn poll_binding_process_descriptor(
                         if let Some(tcp_info) = extract_tcp_flags_and_window(rx_frame) {
                             if (tcp_info.0 & 0x01) != 0 {
                                 // FIN
-                                dbg.rx_tcp_fin += 1;
+                                telemetry.dbg.rx_tcp_fin += 1;
                             }
                             if (tcp_info.0 & 0x12) == 0x12 {
                                 // SYN+ACK
-                                dbg.rx_tcp_synack += 1;
+                                telemetry.dbg.rx_tcp_synack += 1;
                             }
                             if tcp_info.1 == 0 && (tcp_info.0 & 0x02) == 0 {
                                 // zero window, not SYN
-                                dbg.rx_tcp_zero_window += 1;
-                                if dbg.rx_tcp_zero_window <= 10 {
+                                telemetry.dbg.rx_tcp_zero_window += 1;
+                                if telemetry.dbg.rx_tcp_zero_window <= 10 {
                                     eprintln!(
                                         "RX_TCP_ZERO_WIN[{}]: if={} q={} len={} flags=0x{:02x}",
-                                        dbg.rx_tcp_zero_window,
-                                        ident.ifindex,
-                                        ident.queue_id,
+                                        telemetry.dbg.rx_tcp_zero_window,
+                                        worker_ctx.ident.ifindex,
+                                        worker_ctx.ident.queue_id,
                                         desc.len,
                                         tcp_info.0,
                                     );
@@ -813,7 +809,7 @@ fn poll_binding_process_descriptor(
                             }
                         }
                         if frame_has_tcp_rst(rx_frame) {
-                            dbg.rx_tcp_rst += 1;
+                            telemetry.dbg.rx_tcp_rst += 1;
                             thread_local! {
                                 static RX_RST_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
                             }
@@ -824,7 +820,7 @@ fn poll_binding_process_descriptor(
                                     let summary = decode_frame_summary(rx_frame);
                                     eprintln!(
                                         "RST_DETECT RX[{}]: if={} q={} len={} {}",
-                                        n, ident.ifindex, ident.queue_id, desc.len, summary,
+                                        n, worker_ctx.ident.ifindex, worker_ctx.ident.queue_id, desc.len, summary,
                                     );
                                     if n < 5 {
                                         let hex_len =
@@ -849,14 +845,14 @@ fn poll_binding_process_descriptor(
                         if first8 == &0xDEAD_BEEF_DEAD_BEEFu64.to_ne_bytes() {
                             eprintln!(
                                 "DBG POISON_DETECTED: if={} q={} desc.addr={:#x} desc.len={} — kernel returned poisoned frame!",
-                                ident.ifindex, ident.queue_id, desc.addr, desc.len,
+                                worker_ctx.ident.ifindex, worker_ctx.ident.queue_id, desc.addr, desc.len,
                             );
                         }
                     }
                 }
             }
             if cfg!(feature = "debug-log") {
-                if dbg.rx <= 10 {
+                if telemetry.dbg.rx <= 10 {
                     if let Some(rx_frame) =
                         unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
                     {
@@ -864,28 +860,28 @@ fn poll_binding_process_descriptor(
                         let pkt_detail = decode_frame_summary(rx_frame);
                         eprintln!(
                             "DBG RX_ETH[{}]: if={} q={} len={} {}",
-                            dbg.rx, ident.ifindex, ident.queue_id, desc.len, pkt_detail,
+                            telemetry.dbg.rx, worker_ctx.ident.ifindex, worker_ctx.ident.queue_id, desc.len, pkt_detail,
                         );
                         // Full hex dump for first 3 packets
-                        if dbg.rx <= 3 {
+                        if telemetry.dbg.rx <= 3 {
                             let dump_len = (desc.len as usize).min(rx_frame.len()).min(80);
                             let hex: String = rx_frame[..dump_len]
                                 .iter()
                                 .map(|b| format!("{:02x}", b))
                                 .collect::<Vec<_>>()
                                 .join(" ");
-                            eprintln!("DBG RX_HEX[{}]: {}", dbg.rx, hex);
+                            eprintln!("DBG RX_HEX[{}]: {}", telemetry.dbg.rx, hex);
                         }
                     }
                 }
             }
             let mut recycle_now = true;
             if let Some(meta) = try_parse_metadata(unsafe { &*area }, desc) {
-                counters.metadata_packets += 1;
+                telemetry.counters.metadata_packets += 1;
                 let disposition = classify_metadata(meta, validation);
                 if disposition == PacketDisposition::Valid {
-                    counters.validated_packets += 1;
-                    counters.validated_bytes += desc.len as u64;
+                    telemetry.counters.validated_packets += 1;
+                    telemetry.counters.validated_bytes += desc.len as u64;
                     let Some(raw_frame) =
                         unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
                     else {
@@ -925,7 +921,7 @@ fn poll_binding_process_descriptor(
                                     raw_frame[arp_start + 17],
                                 ));
                                 // Update dynamic neighbor cache
-                                if let Ok(mut neighbors) = dynamic_neighbors.lock() {
+                                if let Ok(mut neighbors) = worker_ctx.dynamic_neighbors.lock() {
                                     neighbors.insert(
                                         (meta.ingress_ifindex as i32, sender_ip),
                                         NeighborEntry { mac: sender_mac },
@@ -936,7 +932,7 @@ fn poll_binding_process_descriptor(
                                 // in sync (needed for XDP_PASS fallback and
                                 // kernel-originated traffic).
                                 let neigh_ifindex = resolve_ingress_logical_ifindex(
-                                    forwarding,
+                                    worker_ctx.forwarding,
                                     meta.ingress_ifindex as i32,
                                     meta.ingress_vlan_id,
                                 )
@@ -993,7 +989,7 @@ fn poll_binding_process_descriptor(
                                                 raw_frame[opt_off + 6],
                                                 raw_frame[opt_off + 7],
                                             ];
-                                            if let Ok(mut neighbors) = dynamic_neighbors.lock() {
+                                            if let Ok(mut neighbors) = worker_ctx.dynamic_neighbors.lock() {
                                                 neighbors.insert(
                                                     (meta.ingress_ifindex as i32, target_ip),
                                                     NeighborEntry { mac },
@@ -1003,7 +999,7 @@ fn poll_binding_process_descriptor(
                                             // Use the logical VLAN sub-interface ifindex
                                             // so the kernel associates it correctly.
                                             let neigh_ifindex = resolve_ingress_logical_ifindex(
-                                                forwarding,
+                                                worker_ctx.forwarding,
                                                 meta.ingress_ifindex as i32,
                                                 meta.ingress_vlan_id,
                                             )
@@ -1019,7 +1015,7 @@ fn poll_binding_process_descriptor(
                         }
                     }
                     let native_gre_packet =
-                        try_native_gre_decap_from_frame(raw_frame, meta, forwarding);
+                        try_native_gre_decap_from_frame(raw_frame, meta, worker_ctx.forwarding);
                     let mut meta = native_gre_packet
                         .as_ref()
                         .map(|packet| packet.meta)
@@ -1036,17 +1032,17 @@ fn poll_binding_process_descriptor(
                             meta,
                             flow.src_ip,
                             &mut binding.last_learned_neighbor,
-                            forwarding,
-                            dynamic_neighbors,
+                            worker_ctx.forwarding,
+                            worker_ctx.dynamic_neighbors,
                         );
                     }
                     let ingress_zone_override = parse_zone_encoded_fabric_ingress_from_frame(
                         packet_frame,
                         meta,
-                        forwarding,
+                        worker_ctx.forwarding,
                     );
                     let packet_fabric_ingress = ingress_zone_override.is_some()
-                        || ingress_is_fabric_overlay(forwarding, meta.ingress_ifindex as i32);
+                        || ingress_is_fabric_overlay(worker_ctx.forwarding, meta.ingress_ifindex as i32);
                     // Flag fabric-ingress packets so rewrite functions skip TTL
                     // decrement. The sending peer already decremented TTL when
                     // it forwarded the packet across the fabric link.
@@ -1058,7 +1054,7 @@ fn poll_binding_process_descriptor(
                     if screen.has_profiles() {
                         if let Some(flow) = flow.as_ref() {
                             let zone_name = ingress_zone_override.as_deref().or_else(|| {
-                                forwarding
+                                worker_ctx.forwarding
                                     .ifindex_to_zone
                                     .get(&(meta.ingress_ifindex as i32))
                                     .map(|s| s.as_str())
@@ -1112,15 +1108,15 @@ fn poll_binding_process_descriptor(
                                 nat: NatDecision::default(),
                             };
                             maybe_reinject_slow_path_from_frame(
-                                &ident,
+                                &worker_ctx.ident,
                                 &binding.live,
-                                slow_path,
-                                local_tunnel_deliveries,
+                                worker_ctx.slow_path,
+                                worker_ctx.local_tunnel_deliveries,
                                 packet_frame,
                                 meta,
                                 ipsec_decision,
-                                recent_exceptions,
-                                "slow_path",
+                                worker_ctx.recent_exceptions,
+                                "worker_ctx.slow_path",
                             );
                             binding.scratch_recycle.push(desc.addr);
                             continue;
@@ -1138,12 +1134,12 @@ fn poll_binding_process_descriptor(
                             &flow.forward_key,
                             FlowCacheLookup::for_packet(meta, validation),
                             now_secs,
-                            &rg_epochs,
+                            &worker_ctx.rg_epochs,
                         ) {
                             if !cached_flow_decision_valid(
-                                forwarding,
-                                ha_state,
-                                dynamic_neighbors,
+                                worker_ctx.forwarding,
+                                worker_ctx.ha_state,
+                                worker_ctx.dynamic_neighbors,
                                 now_secs,
                                 cached.stamp.owner_rg_id,
                                 packet_fabric_ingress,
@@ -1188,11 +1184,11 @@ fn poll_binding_process_descriptor(
                                                 frame,
                                                 desc,
                                                 meta,
-                                                &ident,
+                                                &worker_ctx.ident,
                                                 flow,
-                                                forwarding,
-                                                dynamic_neighbors,
-                                                ha_state,
+                                                worker_ctx.forwarding,
+                                                worker_ctx.dynamic_neighbors,
+                                                worker_ctx.ha_state,
                                                 now_secs,
                                             )
                                         });
@@ -1203,12 +1199,12 @@ fn poll_binding_process_descriptor(
                                         // when processing the prebuilt TE response.
                                         continue;
                                     }
-                                    counters.forward_candidate_packets += 1;
+                                    telemetry.counters.forward_candidate_packets += 1;
                                     if cached_decision.nat.rewrite_src.is_some() {
-                                        counters.snat_packets += 1;
+                                        telemetry.counters.snat_packets += 1;
                                     }
                                     if cached_decision.nat.rewrite_dst.is_some() {
-                                        counters.dnat_packets += 1;
+                                        telemetry.counters.dnat_packets += 1;
                                     }
                                     // ── Inline in-place rewrite fast path ──
                                     // Skip PendingForwardRequest + enqueue_pending_forwards entirely.
@@ -1218,7 +1214,7 @@ fn poll_binding_process_descriptor(
                                             cached_decision.resolution.tx_ifindex
                                         } else {
                                             resolve_tx_binding_ifindex(
-                                                forwarding,
+                                                worker_ctx.forwarding,
                                                 cached_decision.resolution.egress_ifindex,
                                             )
                                         };
@@ -1229,7 +1225,7 @@ fn poll_binding_process_descriptor(
                                             if cached_decision.resolution.disposition
                                                 == ForwardingDisposition::FabricRedirect
                                             {
-                                                binding_lookup.fabric_target_index(
+                                                worker_ctx.binding_lookup.fabric_target_index(
                                                     target_ifindex,
                                                     fabric_queue_hash(
                                                         Some(flow),
@@ -1238,10 +1234,10 @@ fn poll_binding_process_descriptor(
                                                     ),
                                                 )
                                             } else {
-                                                binding_lookup.target_index(
+                                                worker_ctx.binding_lookup.target_index(
                                                     binding_index,
-                                                    ident.ifindex,
-                                                    ident.queue_id,
+                                                    worker_ctx.ident.ifindex,
+                                                    worker_ctx.ident.queue_id,
                                                     target_ifindex,
                                                 )
                                             }
@@ -1296,8 +1292,8 @@ fn poll_binding_process_descriptor(
                                                 },
                                             );
                                             binding.pending_in_place_tx_packets += 1;
-                                            dbg.forward += 1;
-                                            dbg.tx += 1;
+                                            telemetry.dbg.forward += 1;
+                                            telemetry.dbg.tx += 1;
                                             recycle_now = false;
                                         }
                                     }
@@ -1305,14 +1301,14 @@ fn poll_binding_process_descriptor(
                                     if recycle_now {
                                         if let Some(mut request) =
                                             build_live_forward_request_from_frame(
-                                                binding_lookup,
+                                                worker_ctx.binding_lookup,
                                                 binding_index,
-                                                ident,
+                                                worker_ctx.ident,
                                                 desc,
                                                 packet_frame,
                                                 meta,
                                                 &cached_decision,
-                                                forwarding,
+                                                worker_ctx.forwarding,
                                                 Some(flow),
                                                 Some(&cached_metadata.ingress_zone),
                                                 cached_descriptor.apply_nat_on_fabric,
@@ -1327,8 +1323,8 @@ fn poll_binding_process_descriptor(
                                                 .take()
                                                 .map(PendingForwardFrame::Owned)
                                                 .unwrap_or(PendingForwardFrame::Live);
-                                            dbg.forward += 1;
-                                            dbg.tx += 1;
+                                            telemetry.dbg.forward += 1;
+                                            telemetry.dbg.tx += 1;
                                             binding.scratch_forwards.push(request);
                                             recycle_now = false;
                                         }
@@ -1352,14 +1348,14 @@ fn poll_binding_process_descriptor(
                         if let Some(resolved) = resolve_flow_session_decision(
                             sessions,
                             binding.session_map_fd,
-                            shared_sessions,
-                            shared_nat_sessions,
-                            shared_forward_wire_sessions,
-                            &shared_owner_rg_indexes,
-                            peer_worker_commands,
-                            forwarding,
-                            ha_state,
-                            dynamic_neighbors,
+                            worker_ctx.shared_sessions,
+                            worker_ctx.shared_nat_sessions,
+                            worker_ctx.shared_forward_wire_sessions,
+                            &worker_ctx.shared_owner_rg_indexes,
+                            worker_ctx.peer_worker_commands,
+                            worker_ctx.forwarding,
+                            worker_ctx.ha_state,
+                            worker_ctx.dynamic_neighbors,
                             flow,
                             now_ns,
                             now_secs,
@@ -1369,11 +1365,11 @@ fn poll_binding_process_descriptor(
                             packet_fabric_ingress,
                             ha_startup_grace_until_secs,
                         ) {
-                            counters.session_hits += 1;
-                            dbg.session_hit += 1;
+                            telemetry.counters.session_hits += 1;
+                            telemetry.dbg.session_hit += 1;
                             if resolved.created {
-                                counters.session_creates += 1;
-                                dbg.session_create += 1;
+                                telemetry.counters.session_creates += 1;
+                                telemetry.dbg.session_create += 1;
                                 // Mirror new session to BPF conntrack map for
                                 // `show security flow session` zone/interface display.
                                 publish_bpf_conntrack_entry(
@@ -1382,18 +1378,18 @@ fn poll_binding_process_descriptor(
                                     &flow.forward_key,
                                     resolved.decision,
                                     &resolved.metadata,
-                                    &forwarding.zone_name_to_id,
+                                    &worker_ctx.forwarding.zone_name_to_id,
                                 );
                             }
                             // Log first N session hits from WAN (return path)
                             if cfg!(feature = "debug-log")
                                 && meta.ingress_ifindex == 6
-                                && dbg.wan_return_hits < 5
+                                && telemetry.dbg.wan_return_hits < 5
                             {
-                                dbg.wan_return_hits += 1;
+                                telemetry.dbg.wan_return_hits += 1;
                                 debug_log!(
                                     "DBG WAN_RETURN_HIT[{}]: {}:{} -> {}:{} proto={} tcp_flags=0x{:02x} nat=({:?},{:?}) rev={}",
-                                    dbg.wan_return_hits,
+                                    telemetry.dbg.wan_return_hits,
                                     flow.src_ip,
                                     flow.forward_key.src_port,
                                     flow.dst_ip,
@@ -1429,11 +1425,11 @@ fn poll_binding_process_descriptor(
                                             frame,
                                             desc,
                                             meta,
-                                            &ident,
+                                            &worker_ctx.ident,
                                             flow,
-                                            forwarding,
-                                            dynamic_neighbors,
-                                            ha_state,
+                                            worker_ctx.forwarding,
+                                            worker_ctx.dynamic_neighbors,
+                                            worker_ctx.ha_state,
                                             now_secs,
                                         )
                                     });
@@ -1447,8 +1443,8 @@ fn poll_binding_process_descriptor(
                             }
                             resolved.decision
                         } else {
-                            counters.session_misses += 1;
-                            dbg.session_miss += 1;
+                            telemetry.counters.session_misses += 1;
+                            telemetry.dbg.session_miss += 1;
                             let resolution_target =
                                 parse_packet_destination_from_frame(packet_frame, meta)
                                     .unwrap_or(flow.dst_ip);
@@ -1460,8 +1456,8 @@ fn poll_binding_process_descriptor(
                             // brand-new connects still require local session ownership.
                             if let Some((fabric_return_decision, fabric_return_metadata)) =
                                 cluster_peer_return_fast_path(
-                                    forwarding,
-                                    dynamic_neighbors,
+                                    worker_ctx.forwarding,
+                                    worker_ctx.dynamic_neighbors,
                                     packet_frame,
                                     meta,
                                     ingress_zone_override.as_deref(),
@@ -1476,14 +1472,14 @@ fn poll_binding_process_descriptor(
                                     ifindex: binding.ifindex,
                                 };
                                 if let Some(mut request) = build_live_forward_request_from_frame(
-                                    binding_lookup,
+                                    worker_ctx.binding_lookup,
                                     binding_index,
                                     &ingress_ident,
                                     desc,
                                     packet_frame,
                                     meta,
                                     &fabric_return_decision,
-                                    forwarding,
+                                    worker_ctx.forwarding,
                                     Some(flow),
                                     None,
                                     false,
@@ -1522,14 +1518,14 @@ fn poll_binding_process_descriptor(
                             let ingress_zone_name = ingress_zone_override
                                 .as_deref()
                                 .or_else(|| {
-                                    forwarding
+                                    worker_ctx.forwarding
                                         .ifindex_to_zone
                                         .get(&(meta.ingress_ifindex as i32))
                                         .map(|s| s.as_str())
                                 })
                                 .unwrap_or("");
-                            let dnat_decision = if !forwarding.dnat_table.is_empty() {
-                                forwarding.dnat_table.lookup(
+                            let dnat_decision = if !worker_ctx.forwarding.dnat_table.is_empty() {
+                                worker_ctx.forwarding.dnat_table.lookup(
                                     meta.protocol,
                                     resolution_target,
                                     flow.forward_key.dst_port,
@@ -1539,7 +1535,7 @@ fn poll_binding_process_descriptor(
                                 None
                             };
                             let static_dnat_decision = if dnat_decision.is_none() {
-                                forwarding
+                                worker_ctx.forwarding
                                     .static_nat
                                     .match_dnat(resolution_target, ingress_zone_name)
                             } else {
@@ -1553,7 +1549,7 @@ fn poll_binding_process_descriptor(
                             // prefix translation (RFC 6296) -- no L4 checksum update.
                             let nptv6_inbound = if pre_routing_dnat.is_none() {
                                 if let IpAddr::V6(mut dst_v6) = resolution_target {
-                                    if forwarding.nptv6.translate_inbound(&mut dst_v6) {
+                                    if worker_ctx.forwarding.nptv6.translate_inbound(&mut dst_v6) {
                                         Some(dst_v6)
                                     } else {
                                         None
@@ -1572,10 +1568,10 @@ fn poll_binding_process_descriptor(
                             let nat64_match =
                                 if pre_routing_dnat.is_none() && nptv6_inbound.is_none() {
                                     if let IpAddr::V6(dst_v6) = resolution_target {
-                                        forwarding.nat64.match_ipv6_dest(dst_v6).and_then(
+                                        worker_ctx.forwarding.nat64.match_ipv6_dest(dst_v6).and_then(
                                             |(idx, dst_v4)| {
                                                 let snat_v4 =
-                                                    forwarding.nat64.allocate_v4_source(idx)?;
+                                                    worker_ctx.forwarding.nat64.allocate_v4_source(idx)?;
                                                 Some((idx, dst_v4, snat_v4, dst_v6))
                                             },
                                         )
@@ -1598,17 +1594,17 @@ fn poll_binding_process_descriptor(
                                     }
                                 };
                             let route_table_override =
-                                ingress_route_table_override(forwarding, meta, flow);
+                                ingress_route_table_override(worker_ctx.forwarding, meta, flow);
 
                             let resolution = if should_block_tunnel_interface_nat_session_miss(
-                                forwarding,
+                                worker_ctx.forwarding,
                                 effective_resolution_target,
                                 meta.protocol,
                             ) {
                                 no_route_resolution(Some(effective_resolution_target))
                             } else {
                                 ingress_interface_local_resolution_on_session_miss(
-                                    forwarding,
+                                    worker_ctx.forwarding,
                                     meta.ingress_ifindex as i32,
                                     meta.ingress_vlan_id,
                                     effective_resolution_target,
@@ -1616,19 +1612,19 @@ fn poll_binding_process_descriptor(
                                 )
                                 .or_else(|| {
                                     interface_nat_local_resolution_on_session_miss(
-                                        forwarding,
+                                        worker_ctx.forwarding,
                                         effective_resolution_target,
                                         meta.protocol,
                                     )
                                 })
                                 .unwrap_or_else(|| {
                                     enforce_ha_resolution_snapshot(
-                                        forwarding,
-                                        ha_state,
+                                        worker_ctx.forwarding,
+                                        worker_ctx.ha_state,
                                         now_secs,
                                         lookup_forwarding_resolution_in_table_with_dynamic(
-                                            forwarding,
-                                            dynamic_neighbors,
+                                            worker_ctx.forwarding,
+                                            worker_ctx.dynamic_neighbors,
                                             effective_resolution_target,
                                             route_table_override.as_deref(),
                                         ),
@@ -1637,9 +1633,9 @@ fn poll_binding_process_descriptor(
                             };
                             let fabric_ingress = packet_fabric_ingress;
                             let resolution = prefer_local_forward_candidate_for_fabric_ingress(
-                                forwarding,
-                                ha_state,
-                                dynamic_neighbors,
+                                worker_ctx.forwarding,
+                                worker_ctx.ha_state,
+                                worker_ctx.dynamic_neighbors,
                                 now_secs,
                                 fabric_ingress,
                                 effective_resolution_target,
@@ -1657,7 +1653,7 @@ fn poll_binding_process_descriptor(
                                 nat: nptv6_nat.or(pre_routing_dnat).unwrap_or_default(),
                             };
                             let (from_zone, to_zone) = zone_pair_for_flow_with_override(
-                                forwarding,
+                                worker_ctx.forwarding,
                                 meta.ingress_ifindex as i32,
                                 ingress_zone_override.as_deref(),
                                 resolution.egress_ifindex,
@@ -1665,8 +1661,8 @@ fn poll_binding_process_descriptor(
                             let from_zone_arc = Arc::<str>::from(from_zone.as_str());
                             let to_zone_arc = Arc::<str>::from(to_zone.as_str());
                             decision.resolution = finalize_new_flow_ha_resolution(
-                                forwarding,
-                                ha_state,
+                                worker_ctx.forwarding,
+                                worker_ctx.ha_state,
                                 now_secs,
                                 decision.resolution,
                                 packet_fabric_ingress,
@@ -1680,10 +1676,10 @@ fn poll_binding_process_descriptor(
                                 || matches!(flow.src_ip, IpAddr::V4(ip) if ip.octets()[0] == 10);
                             // Debug: log session miss with flow details (throttled)
                             if cfg!(feature = "debug-log") {
-                                if dbg.session_miss <= 10 || is_trust_flow {
+                                if telemetry.dbg.session_miss <= 10 || is_trust_flow {
                                     eprintln!(
                                         "DBG SESS_MISS[{}]: {}:{} -> {}:{} proto={} tcp_flags=0x{:02x} ingress_if={} disp={:?} egress_if={} neigh={:?} zone={}->{}",
-                                        dbg.session_miss,
+                                        telemetry.dbg.session_miss,
                                         flow.src_ip,
                                         flow.forward_key.src_port,
                                         flow.dst_ip,
@@ -1714,7 +1710,7 @@ fn poll_binding_process_descriptor(
                                             sessions.len(),
                                         );
                                         // Dump all local sessions to compare
-                                        if dbg.session_miss <= 3 {
+                                        if telemetry.dbg.session_miss <= 3 {
                                             let mut sess_dump = String::new();
                                             let mut count = 0;
                                             sessions.iter_with_origin(|key, decision, metadata, origin| {
@@ -1745,7 +1741,7 @@ fn poll_binding_process_descriptor(
                             // the BPF session map publish for ICMP errors. Publishing
                             // them as PASS_TO_KERNEL causes subsequent ICMP errors to
                             // bypass the userspace embedded ICMP NAT reversal.
-                            let is_embedded_icmp_error = if forwarding.allow_embedded_icmp
+                            let is_embedded_icmp_error = if worker_ctx.forwarding.allow_embedded_icmp
                                 && matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
                             {
                                 unsafe { &*area }
@@ -1759,7 +1755,7 @@ fn poll_binding_process_descriptor(
                             if resolution.disposition == ForwardingDisposition::LocalDelivery
                                 && !is_embedded_icmp_error
                                 && should_cache_local_delivery_session_on_miss(
-                                    forwarding,
+                                    worker_ctx.forwarding,
                                     effective_resolution_target,
                                     resolution,
                                     meta.protocol,
@@ -1781,10 +1777,10 @@ fn poll_binding_process_descriptor(
                                 if install_helper_local_session_on_miss(
                                     sessions,
                                     binding.session_map_fd,
-                                    shared_sessions,
-                                    shared_nat_sessions,
-                                    shared_forward_wire_sessions,
-                                    &shared_owner_rg_indexes,
+                                    worker_ctx.shared_sessions,
+                                    worker_ctx.shared_nat_sessions,
+                                    worker_ctx.shared_forward_wire_sessions,
+                                    &worker_ctx.shared_owner_rg_indexes,
                                     &flow.forward_key,
                                     decision,
                                     local_metadata.clone(),
@@ -1793,15 +1789,15 @@ fn poll_binding_process_descriptor(
                                     meta.protocol,
                                     meta.tcp_flags,
                                 ) {
-                                    counters.session_creates += 1;
-                                    dbg.session_create += 1;
+                                    telemetry.counters.session_creates += 1;
+                                    telemetry.dbg.session_create += 1;
                                     publish_bpf_conntrack_entry(
                                         conntrack_v4_fd,
                                         conntrack_v6_fd,
                                         &flow.forward_key,
                                         decision,
                                         &local_metadata,
-                                        &forwarding.zone_name_to_id,
+                                        &worker_ctx.forwarding.zone_name_to_id,
                                     );
                                 }
                             }
@@ -1814,11 +1810,11 @@ fn poll_binding_process_descriptor(
                                     desc,
                                     meta,
                                     sessions,
-                                    forwarding,
-                                    dynamic_neighbors,
-                                    shared_sessions,
-                                    shared_nat_sessions,
-                                    shared_forward_wire_sessions,
+                                    worker_ctx.forwarding,
+                                    worker_ctx.dynamic_neighbors,
+                                    worker_ctx.shared_sessions,
+                                    worker_ctx.shared_nat_sessions,
+                                    worker_ctx.shared_forward_wire_sessions,
                                     now_ns,
                                 ) {
                                     #[cfg(feature = "debug-log")]
@@ -1836,8 +1832,8 @@ fn poll_binding_process_descriptor(
                                     }
                                     if icmp_match.nat.rewrite_src.is_some() {
                                         let icmp_resolution = finalize_embedded_icmp_resolution(
-                                            forwarding,
-                                            ha_state,
+                                            worker_ctx.forwarding,
+                                            worker_ctx.ha_state,
                                             now_secs,
                                             meta.ingress_ifindex as i32,
                                             &icmp_match,
@@ -1869,25 +1865,25 @@ fn poll_binding_process_descriptor(
                                                     icmp_decision.resolution.tx_ifindex
                                                 } else {
                                                     resolve_tx_binding_ifindex(
-                                                        forwarding,
+                                                        worker_ctx.forwarding,
                                                         icmp_decision.resolution.egress_ifindex,
                                                     )
                                                 };
                                             let cos = resolve_cos_tx_selection(
-                                                forwarding,
+                                                worker_ctx.forwarding,
                                                 icmp_decision.resolution.egress_ifindex,
                                                 meta,
                                                 None,
                                             );
                                             binding.scratch_forwards.push(PendingForwardRequest {
                                                 target_ifindex,
-                                                target_binding_index: binding_lookup.target_index(
+                                                target_binding_index: worker_ctx.binding_lookup.target_index(
                                                     binding_index,
-                                                    ident.ifindex,
-                                                    ident.queue_id,
+                                                    worker_ctx.ident.ifindex,
+                                                    worker_ctx.ident.queue_id,
                                                     target_ifindex,
                                                 ),
-                                                ingress_queue_id: ident.queue_id,
+                                                ingress_queue_id: worker_ctx.ident.queue_id,
                                                 desc,
                                                 frame: PendingForwardFrame::Prebuilt(
                                                     rewritten_frame,
@@ -1955,7 +1951,7 @@ fn poll_binding_process_descriptor(
                                 == ForwardingDisposition::ForwardCandidate
                             {
                                 let owner_rg_id =
-                                    owner_rg_for_resolution(forwarding, decision.resolution);
+                                    owner_rg_for_resolution(worker_ctx.forwarding, decision.resolution);
                                 flow_cache_owner_rg_id = owner_rg_id;
                                 // #850: allow-dns-reply admits sessionless DNS replies
                                 // through policy (not around it). Always evaluate policy;
@@ -1963,7 +1959,7 @@ fn poll_binding_process_descriptor(
                                 // the knob matches AND no NAT is required (to avoid
                                 // orphan NAT state without a session anchor).
                                 if let PolicyAction::Permit = evaluate_policy(
-                                    &forwarding.policy,
+                                    &worker_ctx.forwarding.policy,
                                     &from_zone,
                                     &to_zone,
                                     flow.src_ip,
@@ -2002,7 +1998,7 @@ fn poll_binding_process_descriptor(
                                             let nptv6_snat = if let IpAddr::V6(mut src_v6) =
                                                 nat_match_flow.src_ip
                                             {
-                                                if forwarding.nptv6.translate_outbound(&mut src_v6)
+                                                if worker_ctx.forwarding.nptv6.translate_outbound(&mut src_v6)
                                                 {
                                                     Some(NatDecision {
                                                         rewrite_src: Some(IpAddr::V6(src_v6)),
@@ -2019,14 +2015,14 @@ fn poll_binding_process_descriptor(
                                             };
                                             decision.nat = nptv6_snat
                                                 .or_else(|| {
-                                                    forwarding.static_nat.match_snat(
+                                                    worker_ctx.forwarding.static_nat.match_snat(
                                                         nat_match_flow.src_ip,
                                                         &from_zone,
                                                     )
                                                 })
                                                 .or_else(|| {
                                                     match_source_nat_for_flow(
-                                                        forwarding,
+                                                        worker_ctx.forwarding,
                                                         &from_zone,
                                                         &to_zone,
                                                         decision.resolution.egress_ifindex,
@@ -2035,12 +2031,12 @@ fn poll_binding_process_descriptor(
                                                 })
                                                 .unwrap_or_default();
                                         } else {
-                                            let snat_decision = forwarding
+                                            let snat_decision = worker_ctx.forwarding
                                                 .static_nat
                                                 .match_snat(nat_match_flow.src_ip, &from_zone)
                                                 .or_else(|| {
                                                     match_source_nat_for_flow(
-                                                        forwarding,
+                                                        worker_ctx.forwarding,
                                                         &from_zone,
                                                         &to_zone,
                                                         decision.resolution.egress_ifindex,
@@ -2059,11 +2055,11 @@ fn poll_binding_process_descriptor(
                                                 frame,
                                                 desc,
                                                 meta,
-                                                &ident,
+                                                &worker_ctx.ident,
                                                 flow,
-                                                forwarding,
-                                                dynamic_neighbors,
-                                                ha_state,
+                                                worker_ctx.forwarding,
+                                                worker_ctx.dynamic_neighbors,
+                                                worker_ctx.ha_state,
                                                 now_secs,
                                             )
                                         });
@@ -2077,7 +2073,7 @@ fn poll_binding_process_descriptor(
                                         // through to normal session install so NAT state is
                                         // anchored for GC.
                                         let dns_fastpath_admit =
-                                            allow_unsolicited_dns_reply(forwarding, flow)
+                                            allow_unsolicited_dns_reply(worker_ctx.forwarding, flow)
                                                 && decision.nat.rewrite_src.is_none()
                                                 && decision.nat.rewrite_dst.is_none()
                                                 && !decision.nat.nat64
@@ -2125,28 +2121,28 @@ fn poll_binding_process_descriptor(
                                                 false,
                                             );
                                             publish_shared_session(
-                                                shared_sessions,
-                                                shared_nat_sessions,
-                                                shared_forward_wire_sessions,
-                                                &shared_owner_rg_indexes,
+                                                worker_ctx.shared_sessions,
+                                                worker_ctx.shared_nat_sessions,
+                                                worker_ctx.shared_forward_wire_sessions,
+                                                &worker_ctx.shared_owner_rg_indexes,
                                                 &forward_entry,
                                             );
                                             // Populate BPF dnat_table for embedded ICMP NAT reversal.
                                             // Without this, mtr/traceroute intermediate hops are invisible.
                                             publish_dnat_table_entry(
-                                                &dnat_fds,
+                                                &worker_ctx.dnat_fds,
                                                 &flow.forward_key,
                                                 decision.nat,
                                             );
                                             replicate_session_upsert(
-                                                peer_worker_commands,
+                                                worker_ctx.peer_worker_commands,
                                                 &forward_entry,
                                             );
                                         }
                                         let reverse_resolution = reverse_resolution_for_session(
-                                            forwarding,
-                                            ha_state,
-                                            dynamic_neighbors,
+                                            worker_ctx.forwarding,
+                                            worker_ctx.ha_state,
+                                            worker_ctx.dynamic_neighbors,
                                             flow.src_ip,
                                             from_zone_arc.as_ref(),
                                             fabric_ingress,
@@ -2324,30 +2320,30 @@ fn poll_binding_process_descriptor(
                                                 tcp_flags: meta.tcp_flags,
                                             };
                                             publish_shared_session(
-                                                shared_sessions,
-                                                shared_nat_sessions,
-                                                shared_forward_wire_sessions,
-                                                &shared_owner_rg_indexes,
+                                                worker_ctx.shared_sessions,
+                                                worker_ctx.shared_nat_sessions,
+                                                worker_ctx.shared_forward_wire_sessions,
+                                                &worker_ctx.shared_owner_rg_indexes,
                                                 &reverse_entry,
                                             );
                                             replicate_session_upsert(
-                                                peer_worker_commands,
+                                                worker_ctx.peer_worker_commands,
                                                 &reverse_entry,
                                             );
                                         }
                                         if created > 0 {
-                                            counters.session_creates += created;
-                                            dbg.session_create += created;
+                                            telemetry.counters.session_creates += created;
+                                            telemetry.dbg.session_create += created;
                                         }
                                     }
                                 } else {
-                                    dbg.policy_deny += 1;
+                                    telemetry.dbg.policy_deny += 1;
                                     if cfg!(feature = "debug-log")
-                                        && (dbg.policy_deny <= 3 || is_trust_flow)
+                                        && (telemetry.dbg.policy_deny <= 3 || is_trust_flow)
                                     {
                                         debug_log!(
                                             "DBG POLICY_DENY[{}]: {}:{} -> {}:{} proto={} zone={}->{}  ingress_if={} egress_if={}",
-                                            dbg.policy_deny,
+                                            telemetry.dbg.policy_deny,
                                             flow.src_ip,
                                             flow.forward_key.src_port,
                                             flow.dst_ip,
@@ -2367,7 +2363,7 @@ fn poll_binding_process_descriptor(
                                 && !packet_fabric_ingress
                             {
                                 let owner_rg_id =
-                                    owner_rg_for_resolution(forwarding, decision.resolution);
+                                    owner_rg_for_resolution(worker_ctx.forwarding, decision.resolution);
                                 if owner_rg_id > 0 {
                                     flow_cache_owner_rg_id = owner_rg_id;
                                 }
@@ -2376,10 +2372,10 @@ fn poll_binding_process_descriptor(
                                 // (always in scope) rather than going through the debug
                                 // struct which may not have been populated.
                                 if let Some(redirect) = resolve_zone_encoded_fabric_redirect(
-                                    forwarding,
+                                    worker_ctx.forwarding,
                                     from_zone_arc.as_ref(),
                                 )
-                                .or_else(|| resolve_fabric_redirect(forwarding))
+                                .or_else(|| resolve_fabric_redirect(worker_ctx.forwarding))
                                 {
                                     decision.resolution = redirect;
                                 }
@@ -2388,15 +2384,15 @@ fn poll_binding_process_descriptor(
                         }
                     } else {
                         let non_flow_resolution = enforce_ha_resolution_snapshot(
-                            forwarding,
-                            ha_state,
+                            worker_ctx.forwarding,
+                            worker_ctx.ha_state,
                             now_secs,
                             resolve_forwarding(
                                 unsafe { &*area },
                                 desc,
                                 meta,
-                                forwarding,
-                                dynamic_neighbors,
+                                worker_ctx.forwarding,
+                                worker_ctx.dynamic_neighbors,
                             ),
                         );
                         // For non-flow packets (no L4 ports), also attempt fabric
@@ -2405,7 +2401,7 @@ fn poll_binding_process_descriptor(
                             == ForwardingDisposition::HAInactive
                             && !packet_fabric_ingress
                         {
-                            resolve_fabric_redirect(forwarding).unwrap_or(non_flow_resolution)
+                            resolve_fabric_redirect(worker_ctx.forwarding).unwrap_or(non_flow_resolution)
                         } else {
                             non_flow_resolution
                         };
@@ -2424,7 +2420,7 @@ fn poll_binding_process_descriptor(
                     // Only redirect when the egress maps to a known RG.
                     // HAInactive with unknown ownership (rg=0) means unresolved
                     // — those should NOT be fabric-redirected.
-                    let egress_rg = owner_rg_for_resolution(forwarding, decision.resolution);
+                    let egress_rg = owner_rg_for_resolution(worker_ctx.forwarding, decision.resolution);
                     if decision.resolution.disposition == ForwardingDisposition::HAInactive
                         && egress_rg > 0
                         && !packet_fabric_ingress
@@ -2435,15 +2431,15 @@ fn poll_binding_process_descriptor(
                         let zone_name = session_ingress_zone
                             .as_deref()
                             .or_else(|| {
-                                forwarding
+                                worker_ctx.forwarding
                                     .ifindex_to_zone
                                     .get(&(meta.ingress_ifindex as i32))
                                     .map(|s| s.as_str())
                             })
                             .unwrap_or("");
                         if let Some(redirect) =
-                            resolve_zone_encoded_fabric_redirect(forwarding, zone_name)
-                                .or_else(|| resolve_fabric_redirect(forwarding))
+                            resolve_zone_encoded_fabric_redirect(worker_ctx.forwarding, zone_name)
+                                .or_else(|| resolve_fabric_redirect(worker_ctx.forwarding))
                         {
                             decision.resolution = redirect;
                         }
@@ -2453,32 +2449,32 @@ fn poll_binding_process_descriptor(
                         ForwardingDisposition::ForwardCandidate
                             | ForwardingDisposition::FabricRedirect
                     ) {
-                        dbg.forward += 1;
+                        telemetry.dbg.forward += 1;
                         // Direction-specific tracking
                         let ingress_if = meta.ingress_ifindex as i32;
                         let egress_if = decision.resolution.egress_ifindex;
                         if ingress_if == 5 {
-                            dbg.rx_from_trust += 1;
-                            dbg.fwd_trust_to_wan += 1;
+                            telemetry.dbg.rx_from_trust += 1;
+                            telemetry.dbg.fwd_trust_to_wan += 1;
                         } else if ingress_if == 6 {
-                            dbg.rx_from_wan += 1;
-                            dbg.fwd_wan_to_trust += 1;
+                            telemetry.dbg.rx_from_wan += 1;
+                            telemetry.dbg.fwd_wan_to_trust += 1;
                         }
                         // NAT decision tracking
                         if decision.nat.rewrite_src.is_some() && decision.nat.rewrite_dst.is_some()
                         {
-                            dbg.nat_applied_snat += 1;
-                            dbg.nat_applied_dnat += 1;
+                            telemetry.dbg.nat_applied_snat += 1;
+                            telemetry.dbg.nat_applied_dnat += 1;
                         } else if decision.nat.rewrite_src.is_some() {
-                            dbg.nat_applied_snat += 1;
+                            telemetry.dbg.nat_applied_snat += 1;
                         } else if decision.nat.rewrite_dst.is_some() {
-                            dbg.nat_applied_dnat += 1;
+                            telemetry.dbg.nat_applied_dnat += 1;
                         } else {
-                            dbg.nat_applied_none += 1;
+                            telemetry.dbg.nat_applied_none += 1;
                         }
                         // Log NAT details for first few forward-candidate packets
                         if cfg!(feature = "debug-log") {
-                            if dbg.forward <= 10 {
+                            if telemetry.dbg.forward <= 10 {
                                 let flow_str = flow
                                     .as_ref()
                                     .map(|f| {
@@ -2497,7 +2493,7 @@ fn poll_binding_process_descriptor(
                                 );
                                 eprintln!(
                                     "DBG FWD_DECISION[{}]: ingress_if={} egress_if={} {} {} proto={}",
-                                    dbg.forward,
+                                    telemetry.dbg.forward,
                                     ingress_if,
                                     egress_if,
                                     flow_str,
@@ -2517,7 +2513,7 @@ fn poll_binding_process_descriptor(
                                 let raw_flags = raw_tcp_info.map(|(f, _)| f);
                                 let raw_window = raw_tcp_info.map(|(_, w)| w);
                                 // Log first 20 forwarded TCP packets: compare meta vs raw
-                                if dbg.forward <= 20 {
+                                if telemetry.dbg.forward <= 20 {
                                     let flow_str = flow
                                         .as_ref()
                                         .map(|f| {
@@ -2532,7 +2528,7 @@ fn poll_binding_process_descriptor(
                                         .unwrap_or_else(|| "no-flow".into());
                                     eprintln!(
                                         "FWD_TCP_CMP[{}]: meta_flags=0x{:02x} raw_flags={} raw_win={} len={} l4_off={} {}",
-                                        dbg.forward,
+                                        telemetry.dbg.forward,
                                         meta.tcp_flags,
                                         raw_flags
                                             .map(|f| format!("0x{:02x}", f))
@@ -2555,15 +2551,15 @@ fn poll_binding_process_descriptor(
                                                 .join(" ");
                                             eprintln!(
                                                 "FWD_TCP_HDR[{}]: offset={} {}",
-                                                dbg.forward, l4, tcp_hdr
+                                                telemetry.dbg.forward, l4, tcp_hdr
                                             );
                                         }
                                     }
                                 }
                                 if (meta.tcp_flags & 0x04) != 0 {
                                     // RST
-                                    dbg.fwd_tcp_rst += 1;
-                                    if dbg.fwd_tcp_rst <= 5 {
+                                    telemetry.dbg.fwd_tcp_rst += 1;
+                                    if telemetry.dbg.fwd_tcp_rst <= 5 {
                                         let flow_str = flow
                                             .as_ref()
                                             .map(|f| {
@@ -2578,7 +2574,7 @@ fn poll_binding_process_descriptor(
                                             .unwrap_or_else(|| "no-flow".into());
                                         eprintln!(
                                             "FWD_TCP_RST_DETECT[{}]: meta_flags=0x{:02x} raw_flags={} raw_win={} len={} fwd#={} {}",
-                                            dbg.fwd_tcp_rst,
+                                            telemetry.dbg.fwd_tcp_rst,
                                             meta.tcp_flags,
                                             raw_flags
                                                 .map(|f| format!("0x{:02x}", f))
@@ -2587,7 +2583,7 @@ fn poll_binding_process_descriptor(
                                                 .map(|w| format!("{}", w))
                                                 .unwrap_or_else(|| "NONE".into()),
                                             desc.len,
-                                            dbg.forward,
+                                            telemetry.dbg.forward,
                                             flow_str,
                                         );
                                         // Hex dump TCP header when RST detected
@@ -2601,7 +2597,7 @@ fn poll_binding_process_descriptor(
                                                     .join(" ");
                                                 eprintln!(
                                                     "FWD_TCP_RST_HDR[{}]: meta_off={} raw_off={} {}",
-                                                    dbg.fwd_tcp_rst,
+                                                    telemetry.dbg.fwd_tcp_rst,
                                                     l4,
                                                     frame_l3_offset(data).unwrap_or(0),
                                                     tcp_hdr
@@ -2612,8 +2608,8 @@ fn poll_binding_process_descriptor(
                                 }
                                 if (meta.tcp_flags & 0x01) != 0 {
                                     // FIN
-                                    dbg.fwd_tcp_fin += 1;
-                                    if dbg.fwd_tcp_fin <= 5 {
+                                    telemetry.dbg.fwd_tcp_fin += 1;
+                                    if telemetry.dbg.fwd_tcp_fin <= 5 {
                                         let flow_str = flow
                                             .as_ref()
                                             .map(|f| {
@@ -2628,7 +2624,7 @@ fn poll_binding_process_descriptor(
                                             .unwrap_or_else(|| "no-flow".into());
                                         eprintln!(
                                             "FWD_TCP_FIN[{}]: ingress_if={} {} tcp_flags=0x{:02x}",
-                                            dbg.fwd_tcp_fin,
+                                            telemetry.dbg.fwd_tcp_fin,
                                             meta.ingress_ifindex,
                                             flow_str,
                                             meta.tcp_flags,
@@ -2638,8 +2634,8 @@ fn poll_binding_process_descriptor(
                                 // Detect zero-window in TCP frames by inspecting raw packet
                                 if let Some(win) = raw_window {
                                     if win == 0 {
-                                        dbg.fwd_tcp_zero_window += 1;
-                                        if dbg.fwd_tcp_zero_window <= 10 {
+                                        telemetry.dbg.fwd_tcp_zero_window += 1;
+                                        if telemetry.dbg.fwd_tcp_zero_window <= 10 {
                                             let flow_str = flow
                                                 .as_ref()
                                                 .map(|f| {
@@ -2654,7 +2650,7 @@ fn poll_binding_process_descriptor(
                                                 .unwrap_or_else(|| "no-flow".into());
                                             eprintln!(
                                                 "FWD_TCP_ZERO_WIN[{}]: ingress_if={} {} meta_flags=0x{:02x} raw_flags={}",
-                                                dbg.fwd_tcp_zero_window,
+                                                telemetry.dbg.fwd_tcp_zero_window,
                                                 meta.ingress_ifindex,
                                                 flow_str,
                                                 meta.tcp_flags,
@@ -2674,22 +2670,22 @@ fn poll_binding_process_descriptor(
                                 .scratch_rst_teardowns
                                 .push((flow.forward_key.clone(), decision.nat));
                         }
-                        counters.forward_candidate_packets += 1;
+                        telemetry.counters.forward_candidate_packets += 1;
                         if decision.nat.rewrite_src.is_some() {
-                            counters.snat_packets += 1;
+                            telemetry.counters.snat_packets += 1;
                         }
                         if decision.nat.rewrite_dst.is_some() {
-                            counters.dnat_packets += 1;
+                            telemetry.counters.dnat_packets += 1;
                         }
                         if let Some(mut request) = build_live_forward_request_from_frame(
-                            binding_lookup,
+                            worker_ctx.binding_lookup,
                             binding_index,
-                            &ident,
+                            &worker_ctx.ident,
                             desc,
                             packet_frame,
                             meta,
                             &decision,
-                            forwarding,
+                            worker_ctx.forwarding,
                             flow.as_ref(),
                             session_ingress_zone.as_ref(),
                             apply_nat_on_fabric,
@@ -2700,9 +2696,9 @@ fn poll_binding_process_descriptor(
                                 .take()
                                 .map(PendingForwardFrame::Owned)
                                 .unwrap_or(PendingForwardFrame::Live);
-                            dbg.tx += 1; // track forward requests queued
+                            telemetry.dbg.tx += 1; // track forward requests queued
                             if cfg!(feature = "debug-log") {
-                                if dbg.tx <= 5 {
+                                if telemetry.dbg.tx <= 5 {
                                     let dst_mac_str = decision
                                         .resolution
                                         .neighbor_mac
@@ -2764,19 +2760,19 @@ fn poll_binding_process_descriptor(
                                     flow_cache_owner_rg_id,
                                     session_ingress_zone.as_ref().cloned(),
                                     request_target_binding_index,
-                                    forwarding,
-                                    ha_state,
+                                    worker_ctx.forwarding,
+                                    worker_ctx.ha_state,
                                     apply_nat_on_fabric,
-                                    &rg_epochs,
+                                    &worker_ctx.rg_epochs,
                                 )
                             {
                                 binding.flow_cache.insert(entry);
                             }
                             // ── End flow cache population ────────────────
                         } else {
-                            dbg.build_fail += 1;
+                            telemetry.dbg.build_fail += 1;
                             if cfg!(feature = "debug-log") {
-                                if dbg.build_fail <= 3 {
+                                if telemetry.dbg.build_fail <= 3 {
                                     eprintln!(
                                         "DBG FWD_BUILD_NONE: egress_if={} tx_if={} neigh={:?} src_mac={:?} len={} proto={}",
                                         decision.resolution.egress_ifindex,
@@ -2799,29 +2795,29 @@ fn poll_binding_process_descriptor(
                         // Debug: count non-forward dispositions
                         match decision.resolution.disposition {
                             ForwardingDisposition::LocalDelivery => {
-                                dbg.local += 1;
+                                telemetry.dbg.local += 1;
                                 // Reinject to slow-path TUN so the kernel
                                 // processes host-bound traffic (NDP, ICMP echo,
                                 // BGP, etc.).  The first packet creates a BPF
                                 // session map entry so subsequent packets bypass
                                 // userspace entirely.
                                 maybe_reinject_slow_path(
-                                    ident,
+                                    worker_ctx.ident,
                                     &binding.live,
-                                    slow_path.as_deref(),
-                                    local_tunnel_deliveries,
+                                    worker_ctx.slow_path.as_deref(),
+                                    worker_ctx.local_tunnel_deliveries,
                                     unsafe { &*area },
                                     desc,
                                     meta,
                                     decision,
-                                    recent_exceptions,
+                                    worker_ctx.recent_exceptions,
                                 );
                                 recycle_now = true;
                             }
                             ForwardingDisposition::NoRoute => {
-                                dbg.no_route += 1;
+                                telemetry.dbg.no_route += 1;
                                 if cfg!(feature = "debug-log") {
-                                    if dbg.no_route <= 3 {
+                                    if telemetry.dbg.no_route <= 3 {
                                         if let Some(flow) = flow.as_ref() {
                                             eprintln!(
                                                 "DBG NO_ROUTE: {}:{} -> {}:{} proto={} ingress_if={}",
@@ -2837,9 +2833,9 @@ fn poll_binding_process_descriptor(
                                 }
                             }
                             ForwardingDisposition::MissingNeighbor => {
-                                dbg.missing_neigh += 1;
+                                telemetry.dbg.missing_neigh += 1;
                                 let (from_zone, to_zone) = zone_pair_for_flow_with_override(
-                                    forwarding,
+                                    worker_ctx.forwarding,
                                     meta.ingress_ifindex as i32,
                                     ingress_zone_override.as_deref(),
                                     decision.resolution.egress_ifindex,
@@ -2866,7 +2862,7 @@ fn poll_binding_process_descriptor(
                                             && p.decision.resolution.next_hop == Some(next_hop)
                                     });
                                     if !already_probing {
-                                        let iface_name = forwarding
+                                        let iface_name = worker_ctx.forwarding
                                             .ifindex_to_name
                                             .get(&decision.resolution.egress_ifindex)
                                             .cloned();
@@ -2884,7 +2880,7 @@ fn poll_binding_process_descriptor(
                                 let mut pending_decision = decision;
                                 if let Some(flow) = flow.as_ref() {
                                     if let PolicyAction::Permit = evaluate_policy(
-                                        &forwarding.policy,
+                                        &worker_ctx.forwarding.policy,
                                         &from_zone,
                                         &to_zone,
                                         flow.src_ip,
@@ -2897,12 +2893,12 @@ fn poll_binding_process_descriptor(
                                             pending_decision.nat.rewrite_dst.unwrap_or(flow.dst_ip),
                                         );
                                         if pending_decision.nat.rewrite_dst.is_none() {
-                                            pending_decision.nat = forwarding
+                                            pending_decision.nat = worker_ctx.forwarding
                                                 .static_nat
                                                 .match_snat(nat_match_flow.src_ip, &from_zone)
                                                 .or_else(|| {
                                                     match_source_nat_for_flow(
-                                                        forwarding,
+                                                        worker_ctx.forwarding,
                                                         &from_zone,
                                                         &to_zone,
                                                         pending_decision.resolution.egress_ifindex,
@@ -2911,12 +2907,12 @@ fn poll_binding_process_descriptor(
                                                 })
                                                 .unwrap_or_default();
                                         } else {
-                                            let snat_decision = forwarding
+                                            let snat_decision = worker_ctx.forwarding
                                                 .static_nat
                                                 .match_snat(nat_match_flow.src_ip, &from_zone)
                                                 .or_else(|| {
                                                     match_source_nat_for_flow(
-                                                        forwarding,
+                                                        worker_ctx.forwarding,
                                                         &from_zone,
                                                         &to_zone,
                                                         pending_decision.resolution.egress_ifindex,
@@ -2929,7 +2925,7 @@ fn poll_binding_process_descriptor(
                                         }
                                     }
                                     let sess_meta = build_missing_neighbor_session_metadata(
-                                        forwarding,
+                                        worker_ctx.forwarding,
                                         &from_zone_arc,
                                         &to_zone_arc,
                                         packet_fabric_ingress,
@@ -2953,10 +2949,10 @@ fn poll_binding_process_descriptor(
                                             tcp_flags: meta.tcp_flags,
                                         };
                                         publish_shared_session(
-                                            shared_sessions,
-                                            shared_nat_sessions,
-                                            shared_forward_wire_sessions,
-                                            &shared_owner_rg_indexes,
+                                            worker_ctx.shared_sessions,
+                                            worker_ctx.shared_nat_sessions,
+                                            worker_ctx.shared_forward_wire_sessions,
+                                            &worker_ctx.shared_owner_rg_indexes,
                                             &entry,
                                         );
                                         let _ = publish_session_map_entry_for_session(
@@ -2971,14 +2967,14 @@ fn poll_binding_process_descriptor(
                                             &flow.forward_key,
                                             pending_decision,
                                             &entry.metadata,
-                                            &forwarding.zone_name_to_id,
+                                            &worker_ctx.forwarding.zone_name_to_id,
                                         );
                                         publish_dnat_table_entry(
-                                            &dnat_fds,
+                                            &worker_ctx.dnat_fds,
                                             &flow.forward_key,
                                             pending_decision.nat,
                                         );
-                                        counters.session_creates += 1;
+                                        telemetry.counters.session_creates += 1;
                                     }
                                 }
                                 // Buffer the packet. The ICMP probe resolves ARP
@@ -3003,7 +2999,7 @@ fn poll_binding_process_descriptor(
                                     recycle_now = false;
                                 }
                                 if cfg!(feature = "debug-log") {
-                                    if dbg.missing_neigh <= 3 {
+                                    if telemetry.dbg.missing_neigh <= 3 {
                                         if let Some(flow) = flow.as_ref() {
                                             eprintln!(
                                                 "DBG MISS_NEIGH→{}: {}:{} -> {}:{} proto={} egress_if={} next_hop={:?}",
@@ -3020,48 +3016,48 @@ fn poll_binding_process_descriptor(
                                     }
                                 }
                             }
-                            ForwardingDisposition::PolicyDenied => dbg.policy_deny += 1,
-                            ForwardingDisposition::HAInactive => dbg.ha_inactive += 1,
-                            _ => dbg.disposition_other += 1,
+                            ForwardingDisposition::PolicyDenied => telemetry.dbg.policy_deny += 1,
+                            ForwardingDisposition::HAInactive => telemetry.dbg.ha_inactive += 1,
+                            _ => telemetry.dbg.disposition_other += 1,
                         }
                         record_forwarding_disposition(
-                            &ident,
+                            &worker_ctx.ident,
                             &binding.live,
                             decision.resolution,
                             desc.len as u32,
                             Some(meta),
                             debug.as_ref(),
-                            recent_exceptions,
-                            last_resolution,
+                            worker_ctx.recent_exceptions,
+                            worker_ctx.last_resolution,
                         );
                         maybe_reinject_slow_path_from_frame(
-                            &ident,
+                            &worker_ctx.ident,
                             &binding.live,
-                            slow_path,
-                            local_tunnel_deliveries,
+                            worker_ctx.slow_path,
+                            worker_ctx.local_tunnel_deliveries,
                             packet_frame,
                             meta,
                             decision,
-                            recent_exceptions,
-                            "slow_path",
+                            worker_ctx.recent_exceptions,
+                            "worker_ctx.slow_path",
                         );
                     }
                 } else {
                     record_disposition(
-                        &ident,
+                        &worker_ctx.ident,
                         &binding.live,
                         disposition,
                         desc.len as u32,
                         Some(meta),
-                        recent_exceptions,
+                        worker_ctx.recent_exceptions,
                     );
                 }
             } else {
-                dbg.metadata_err += 1;
+                telemetry.dbg.metadata_err += 1;
                 binding.live.metadata_errors.fetch_add(1, Ordering::Relaxed);
                 record_exception(
-                    recent_exceptions,
-                    &ident,
+                    worker_ctx.recent_exceptions,
+                    &worker_ctx.ident,
                     "metadata_parse",
                     desc.len as u32,
                     None,
