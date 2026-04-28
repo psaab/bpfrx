@@ -1,6 +1,6 @@
 # #949 PR1: Sharded mutex for `dynamic_neighbors`
 
-Plan v3 — 2026-04-28. Addresses Codex re-review (task-moiwejlv-xpf4w1).
+Plan v4 — 2026-04-28. Addresses Codex re-review round 3 (task-moiwp0dd-8ni1g0).
 
 ## Issue scope correction
 
@@ -58,12 +58,16 @@ revisit fail-loud as a follow-up. Documented in code comments.
 | `tunnel.rs` | 0 | ~2 |
 | `ha.rs` | 0 | ~2 |
 | `icmp.rs`, `icmp_embed.rs` | 0 | ~4 |
-| `frame.rs` | 0 | 1 (test constructor at L3722) |
-| **Test constructors** (across all `*_test.rs` and inline tests) | 0 | **~49** |
+| `frame.rs` | 0 | 2 (test constructors) |
+| `session_glue.rs` (test sites) | 0 | 36 (test constructors) |
+| `forwarding.rs` (test sites) | 2 (`dynamic_neighbors_ref().lock()` at L2088, L2287) | 21 (test constructors) |
+| `tests.rs` | 0 | 7 (test constructors) |
+| **Test constructors total** | 0 | **~66** |
 | **Production runtime total** | **~14** | **~50** |
 
-Realistic edit volume: 200-250 line-level changes including all 49
-test constructors. Bigger than v2's "100-150" estimate.
+Realistic edit volume: 250-300 line-level changes including all 66
+test constructors and 2 test-site direct lock sites (corrected from
+v3's "~49" per Codex round 3).
 
 ## Existing single-lock batch semantics
 
@@ -100,11 +104,11 @@ impl ShardedNeighborMap {
     pub fn remove_if_present(&self, key: &(i32, IpAddr)) -> bool;
 
     /// Lock all shards in shard-index order (ascending) and run the
-    /// closure. Used by replace/clear/multi-key-insert sites.
+    /// closure with a `BulkShardGuard` that holds all guards.
     /// Deadlock-free as long as ALL bulk operations also lock in
     /// ascending shard-index order.
     pub fn with_all_shards<R, F>(&self, f: F) -> R
-    where F: FnOnce(&mut [FastMap<(i32, IpAddr), NeighborEntry>; NUM_SHARDS]) -> R;
+    where F: FnOnce(&mut BulkShardGuard<'_>) -> R;
 
     /// Sum of len() across all shards. Used by
     /// `dynamic_neighbor_status` at `coordinator.rs:208`.
@@ -113,17 +117,53 @@ impl ShardedNeighborMap {
 }
 ```
 
+### `BulkShardGuard<'a>` helper type
+
+Holds all `NUM_SHARDS` `MutexGuard<'a, FastMap<...>>`s. Provides
+key-routed and explicit-shard access without exposing the underlying
+guard array directly:
+
+```rust
+pub struct BulkShardGuard<'a> {
+    guards: [MutexGuard<'a, FastMap<(i32, IpAddr), NeighborEntry>>; NUM_SHARDS],
+}
+
+impl<'a> BulkShardGuard<'a> {
+    /// Insert a key (computes shard internally).
+    pub fn insert(&mut self, key: (i32, IpAddr), val: NeighborEntry) {
+        let i = shard_idx(&key);
+        self.guards[i].insert(key, val);
+    }
+
+    /// Remove a key (computes shard internally).
+    pub fn remove(&mut self, key: &(i32, IpAddr)) {
+        let i = shard_idx(key);
+        self.guards[i].remove(key);
+    }
+
+    /// Iterate every shard's map mutably (for `clear` etc.).
+    pub fn each_shard_mut(&mut self) -> impl Iterator<Item = &mut FastMap<(i32, IpAddr), NeighborEntry>> {
+        self.guards.iter_mut().map(|g| &mut **g)
+    }
+
+    /// `len()` summed across all shards.
+    pub fn total_len(&self) -> usize {
+        self.guards.iter().map(|g| g.len()).sum()
+    }
+}
+```
+
 `apply_manager_neighbors` becomes:
 
 ```rust
-self.dynamic_neighbors.with_all_shards(|shards| {
+self.dynamic_neighbors.with_all_shards(|bulk| {
     if replace {
         for key in &old_manager_keys {
-            shards[shard_idx(key)].remove(key);
+            bulk.remove(key);
         }
     }
     for (ifindex, ip, entry) in neighbors {
-        shards[shard_idx(&(*ifindex, *ip))].insert((*ifindex, *ip), *entry);
+        bulk.insert((*ifindex, *ip), *entry);
     }
 });
 ```
@@ -131,11 +171,18 @@ self.dynamic_neighbors.with_all_shards(|shards| {
 `afxdp.rs:3379` (multi-ifindex insert for one IP) becomes:
 
 ```rust
-dynamic_neighbors.with_all_shards(|shards| {
+dynamic_neighbors.with_all_shards(|bulk| {
     for ifindex in ifindexes {
-        shards[shard_idx(&(ifindex, src_ip))]
-            .insert((ifindex, src_ip), NeighborEntry { mac: src_mac });
+        bulk.insert((ifindex, src_ip), NeighborEntry { mac: src_mac });
     }
+});
+```
+
+Clear (used at `coordinator.rs:295`):
+
+```rust
+self.dynamic_neighbors.with_all_shards(|bulk| {
+    for shard in bulk.each_shard_mut() { shard.clear(); }
 });
 ```
 
