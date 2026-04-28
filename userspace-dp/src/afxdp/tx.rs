@@ -2887,17 +2887,17 @@ fn drain_exact_prepared_items_to_scratch_flow_fair(
     let mut remaining_root = root_budget;
     let mut remaining_secondary = secondary_budget;
     // #942 NOTE: V_min wiring on the Prepared flow-fair drain
-    // path is INTENTIONALLY OMITTED for now. A first attempt
-    // (commit eeade5e2 → reverted) caused a severe shared_exact
-    // throughput regression: iperf-c P=1 collapsed from 6.78 Gb/s
-    // to 4.4 Mb/s with cwnd stuck at 1.41 KB. Removing JUST the
-    // V_min check from this loop restored full throughput in
-    // bisection. Root cause is unclear — single-stream P=1 has
-    // no participating peers, so cos_queue_v_min_continue should
-    // return true at pop_count==1. Yet adding the check breaks
-    // forwarding for SNAT-Prepared traffic. The interaction needs
-    // a focused investigation BEFORE re-enabling. See
-    // docs/pr/940-942-vmin-correctness/plan.md "#942 deferred".
+    // path is INTENTIONALLY OMITTED in this PR (#941). The original
+    // attempt (commit eeade5e2 → reverted) caused a severe shared_exact
+    // throughput regression because peer slots held stale-low values
+    // that throttled the heavy worker indefinitely.
+    //
+    // #941's vacate (Work item A/C) + hard-cap suspension (Work item D)
+    // makes re-enabling this safe: a temporary cluster smoke with the
+    // wiring re-added confirmed iperf-c P=12 = 23.1 Gb/s (clears the
+    // 22 Gb/s gate). #942 will land in a separate PR with the wiring
+    // re-enabled. See docs/pr/941-vacate-hard-cap/plan.md acceptance
+    // criteria.
 
     while scratch_prepared_tx.len() < TX_BATCH_SIZE {
         let Some(front) = cos_queue_front(queue) else {
