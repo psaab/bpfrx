@@ -2044,13 +2044,18 @@ fn build_shared_cos_queue_vtime_floors_reusing_existing(
     let mut out = BTreeMap::new();
     for (&ifindex, iface) in &forwarding.cos.interfaces {
         for queue in &iface.queues {
-            // Only allocate for queues that COULD be shared_exact.
-            // The queue.exact gate matches the lease builder's gate
-            // so V_min Arcs and leases stay in lockstep. Worker
-            // fast-path init filters again per-worker, so non-
-            // shared queues just get an unused Arc here — cheap
-            // (one box of N atomics).
-            if !queue.exact || queue.transmit_rate_bytes == 0 {
+            // #917 Codex Q8: gate on shared_exact at allocation
+            // time so owner-local-exact queues don't carry a
+            // V_min floor. Owner-local queues have no peers
+            // (single-owner by definition); a floor on those
+            // would only consume memory and risk false
+            // throttling if the read-path gate ever
+            // regresses. The shared_exact promotion check
+            // mirrors `queue_uses_shared_exact_service` in
+            // worker.rs.
+            if !queue.exact
+                || queue.transmit_rate_bytes < super::worker::COS_SHARED_EXACT_MIN_RATE_BYTES
+            {
                 continue;
             }
             let key = (ifindex, queue.queue_id);

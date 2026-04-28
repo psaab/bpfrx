@@ -5723,6 +5723,18 @@ fn cos_queue_v_min_continue(queue: &CoSQueueRuntime, pop_count: u32) -> bool {
     if pop_count != 1 && pop_count.is_multiple_of(V_MIN_READ_CADENCE) == false {
         return true;
     }
+    // #917 Codex Q8: V_min sync only applies to shared_exact
+    // queues. Owner-local-exact queues by definition have no
+    // peers; throttling them against other workers' slots
+    // would falsely starve them. Even though
+    // `build_shared_cos_queue_vtime_floors_reusing_existing`
+    // currently allocates floors for all exact queues, this
+    // gate prevents the check from firing on non-shared
+    // queues. Belt-and-suspenders against future floor-
+    // allocator changes.
+    if !queue.shared_exact {
+        return true;
+    }
     let Some(floor) = queue.vtime_floor.as_ref() else {
         return true;
     };
