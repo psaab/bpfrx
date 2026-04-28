@@ -1902,6 +1902,20 @@ fn reset_binding_cos_runtime(binding: &mut BindingWorker) {
         root.nonempty_queues = 0;
         root.runnable_queues = 0;
     }
+    // FIXME(#941 work item D): vacate any V_min slots owned by
+    // this worker before clearing cos_interfaces. The
+    // coordinator's `build_shared_cos_queue_vtime_floors_reusing_existing`
+    // (coordinator.rs ~2061) reuses an existing floor Arc when
+    // the (ifindex, queue_id, worker_count) tuple matches across
+    // rebuilds. After this clear, the next runtime starts with
+    // queue_vtime=0 but the floor's slot for this worker still
+    // holds the OLD high vtime. Peers reading the slot will use
+    // the stale value in their V_min calculation until the first
+    // post-reset post-settle publish (potentially > 100 ms on
+    // sparse traffic). Without vacate, peers may erroneously
+    // throttle for one or more drain batches at reset-epoch.
+    // See `docs/issue-refinements/941-body.md` Work item D and
+    // `docs/pr/940-942-vmin-correctness/plan.md` "Known gap".
     binding.cos_interfaces.clear();
     binding.cos_interface_order.clear();
     binding.cos_interface_rr = 0;

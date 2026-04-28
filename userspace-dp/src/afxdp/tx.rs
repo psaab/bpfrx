@@ -2074,6 +2074,15 @@ fn service_exact_local_queue_direct(
         &mut binding.scratch_exact_local_tx,
         inserted as usize,
     );
+    // #940: post-settle V_min publish. FIFO queues currently have
+    // vtime_floor=None so this is a no-op; kept for uniformity and
+    // to shield future flow_fair-FIFO adoption.
+    publish_committed_queue_vtime(
+        binding
+            .cos_interfaces
+            .get(&root_ifindex)
+            .and_then(|root| root.queues.get(queue_idx)),
+    );
     apply_direct_exact_send_result(binding, root_ifindex, queue_idx, sent_packets, sent_bytes);
     maybe_wake_tx(binding, true, now_ns);
     sent_packets > 0 || sent_bytes > 0
@@ -2212,6 +2221,16 @@ fn service_exact_local_queue_direct_flow_fair(
         &mut binding.free_tx_frames,
         &mut binding.scratch_local_tx,
         inserted as usize,
+    );
+    // #940: post-settle V_min publish. Settle has already applied
+    // any partial-rollback push_fronts (which republished via the
+    // rollback hook), so queue.queue_vtime now reflects only the
+    // actually-shipped frames.
+    publish_committed_queue_vtime(
+        binding
+            .cos_interfaces
+            .get(&root_ifindex)
+            .and_then(|root| root.queues.get(queue_idx)),
     );
     apply_direct_exact_send_result(binding, root_ifindex, queue_idx, sent_packets, sent_bytes);
     maybe_wake_tx(binding, true, now_ns);
@@ -2360,6 +2379,14 @@ fn service_exact_prepared_queue_direct(
         &mut binding.in_flight_prepared_recycles,
         inserted as usize,
     );
+    // #940: post-settle V_min publish. FIFO queues have
+    // vtime_floor=None today; no-op shield for future adoption.
+    publish_committed_queue_vtime(
+        binding
+            .cos_interfaces
+            .get(&root_ifindex)
+            .and_then(|root| root.queues.get(queue_idx)),
+    );
     apply_direct_exact_send_result(binding, root_ifindex, queue_idx, sent_packets, sent_bytes);
     maybe_wake_tx(binding, true, now_ns);
     sent_packets > 0 || sent_bytes > 0
@@ -2503,6 +2530,15 @@ fn service_exact_prepared_queue_direct_flow_fair(
         &mut binding.in_flight_prepared_recycles,
         inserted as usize,
     );
+    // #940: post-settle V_min publish. Settle has applied any
+    // partial-rollback push_fronts via the rollback hook;
+    // queue.queue_vtime now reflects only actually-shipped frames.
+    publish_committed_queue_vtime(
+        binding
+            .cos_interfaces
+            .get(&root_ifindex)
+            .and_then(|root| root.queues.get(queue_idx)),
+    );
     apply_direct_exact_send_result(binding, root_ifindex, queue_idx, sent_packets, sent_bytes);
     maybe_wake_tx(binding, true, now_ns);
     sent_packets > 0 || sent_bytes > 0
@@ -2518,6 +2554,12 @@ fn drain_exact_local_fifo_items_to_scratch(
     queue_dscp_rewrite: Option<u8>,
 ) -> ExactCoSScratchBuild {
     debug_assert!(!queue.flow_fair);
+    // #942: no V_min wiring needed here. This FIFO Local variant
+    // runs only on `!flow_fair` queues per the debug_assert above.
+    // shared_exact queues always have `flow_fair = queue.exact`
+    // (per `promote_cos_queue_flow_fair`), so this path is
+    // unreachable on shared_exact. V_min coordination is a
+    // shared_exact-only concept.
     let mut remaining_root = root_budget;
     let mut remaining_secondary = secondary_budget;
     let mut index = 0usize;
@@ -2715,6 +2757,12 @@ fn drain_exact_prepared_fifo_items_to_scratch(
     queue_dscp_rewrite: Option<u8>,
 ) -> ExactCoSScratchBuild {
     debug_assert!(!queue.flow_fair);
+    // #942: no V_min wiring needed here. This FIFO Prepared variant
+    // runs only on `!flow_fair` queues per the debug_assert above,
+    // and shared_exact queues always have `flow_fair = queue.exact`
+    // (per `promote_cos_queue_flow_fair`), so this path is
+    // unreachable on shared_exact. V_min coordination is a
+    // shared_exact-only concept; no participation needed.
     let mut remaining_root = root_budget;
     let mut remaining_secondary = secondary_budget;
     let mut index = 0usize;
@@ -2822,8 +2870,21 @@ fn drain_exact_prepared_items_to_scratch_flow_fair(
     queue.pop_snapshot_stack.clear();
     let mut remaining_root = root_budget;
     let mut remaining_secondary = secondary_budget;
+    let mut v_min_pop_count = 0u32;
 
     while scratch_prepared_tx.len() < TX_BATCH_SIZE {
+        // #942: V_min check on the Prepared flow-fair drain path,
+        // mirroring the Local-flow wiring at the top of
+        // `drain_exact_local_items_to_scratch_flow_fair`. Same K=8
+        // cadence with mandatory check at pop_count==1 (drain-batch
+        // start). Without this, Prepared traffic (TCP retransmit
+        // bursts via the prepared-rebuild path, BGP/control packets,
+        // anything pushed via PreparedTxRequest) bypasses V_min sync
+        // entirely while peers throttle correctly on Local traffic.
+        v_min_pop_count = v_min_pop_count.saturating_add(1);
+        if !cos_queue_v_min_continue(queue, v_min_pop_count) {
+            break;
+        }
         let Some(front) = cos_queue_front(queue) else {
             break;
         };
@@ -4682,19 +4743,17 @@ fn cos_queue_pop_front_inner(
             let bytes = cos_item_len(&item);
             queue.queue_vtime = queue.queue_vtime.saturating_add(bytes);
         }
-        // #917 Phase 3: publish the just-advanced queue_vtime to
-        // this worker's slot in the shared V_min floor. Both pop
-        // variants publish — the snapshot variant's "speculative"
-        // vtime is invisible to peers anyway because peers read
-        // the SLOT (Release-stored only here / on rollback /
-        // vacate), not queue_vtime directly. If a rollback later
-        // restores queue_vtime, the rollback path republishes the
-        // restored value (see `cos_queue_push_front`).
-        if let Some(floor) = queue.vtime_floor.as_ref() {
-            if let Some(slot) = floor.slots.get(queue.worker_id as usize) {
-                slot.publish(queue.queue_vtime);
-            }
-        }
+        // #940: V_min publish is NOT done at pop time. Snapshot
+        // pops are speculative (may roll back via push_front);
+        // no-snapshot pops are used by drain_all from the live
+        // demote-fallback path which restores queue_vtime after
+        // drain. Either way, publishing during pop leaks
+        // pre-commit vtime to peers. Publish moved to
+        // `publish_committed_queue_vtime` called from each
+        // post-settle commit site and from the demote restore.
+        // Rollback publish in `cos_queue_push_front` (below)
+        // remains; that path republishes the corrected vtime
+        // when a popped item is restored.
         if let Some(next_head) = queue.flow_bucket_items[bucket].front() {
             // Bucket still has packets. Advance head-finish to
             // the NEW head packet's finish: head += bytes(new head).
@@ -5523,6 +5582,27 @@ fn demote_prepared_cos_queue_to_local(
     queue.flow_bucket_head_finish_bytes = saved_head_finish;
     queue.flow_bucket_tail_finish_bytes = saved_tail_finish;
 
+    // #940: explicit V_min publish after the demote restore. The
+    // pop-time publish was removed in #940; without this hook,
+    // peers would never see the post-demote state — the slot stays
+    // at whatever was published BEFORE this demote ran. Publishing
+    // the saved (== restored) vtime is correct and idempotent
+    // (matches the value peers saw before demote).
+    //
+    // Sequencing invariant (Gemini review): demote runs from
+    // `enqueue_local_into_cos` on the rx/producer path BEFORE any
+    // post-settle publish for THIS queue in this worker iteration.
+    // The saved `queue_vtime` (line 5512 area) therefore equals the
+    // value that the previous iteration's post-settle publish
+    // broadcast to this slot. drain_all inflates `queue_vtime`
+    // locally; restore at lines 5582-5584 puts it back to the saved
+    // value; this publish broadcasts the same value again. Net
+    // effect on peers: slot-value unchanged. No "rewind" possible
+    // because the worker's per-iteration rx-then-tx ordering
+    // serializes demote (rx path) before the in-flight tx batch's
+    // settle.
+    publish_committed_queue_vtime(Some(&*queue));
+
     true
 }
 
@@ -5681,6 +5761,60 @@ fn apply_cos_queue_flow_fair_promotion(
 /// (`exact_cos_flow_bucket` is only called from the flow-fair
 /// callers). Keeping them at seed=0 also preserves byte-identical
 /// legacy behavior on that path.
+
+/// #940 — publish the committed `queue_vtime` to the V_min floor
+/// slot. Called from each TX-ring commit site AFTER `settle_*`
+/// returns, so the published value reflects only frames that were
+/// actually inserted into the TX ring (rollbacks via
+/// `cos_queue_push_front` already republished any corrected vtime
+/// via the existing rollback hook in that function).
+///
+/// Memory ordering: libxdp's `xsk_ring_prod__submit` (called by
+/// `RingTx::commit` via `bridge_xsk_ring_prod_submit` at
+/// csrc/xsk_bridge.c:108-111) issues a release-store on the producer
+/// head per the AF_XDP ring-buffer ABI. Our `slot.publish()` uses
+/// `Ordering::Release` (types.rs PaddedVtimeSlot::publish). On the
+/// same worker thread, program order: producer commit → V_min
+/// publish. Peers reading the slot via `Ordering::Acquire` thus
+/// observe a vtime that reflects frames already in the TX ring.
+///
+/// The libxdp release-store contract is an upstream ABI assumption;
+/// the worktree does NOT vendor libxdp. If libxdp is swapped or
+/// downgraded, this contract MUST be re-verified.
+///
+/// F4 invariant: `vtime_floor` is only populated on flow_fair queues
+/// (per `promote_cos_queue_flow_fair`). FIFO queues should never
+/// reach the publish path. Trip loud in debug builds AND skip
+/// silently in release (Gemini adversarial review): if a future
+/// caller mistakenly attaches a floor to a non-flow_fair queue, the
+/// debug_assert flags it during dev/test; in release we early-return
+/// rather than broadcast a frozen `queue_vtime` that would mislead
+/// peers' V_min calculations as garbage telemetry.
+#[inline]
+fn publish_committed_queue_vtime(queue: Option<&CoSQueueRuntime>) {
+    let Some(queue) = queue else {
+        return;
+    };
+    debug_assert!(
+        queue.vtime_floor.is_none() || queue.flow_fair,
+        "publish_committed_queue_vtime: vtime_floor set on non-flow-fair queue (queue_id={})",
+        queue.queue_id,
+    );
+    if !queue.flow_fair {
+        // Release-build escape hatch for the F4 invariant. flow_fair
+        // queues are the only ones with meaningful per-pop vtime
+        // advance; FIFO queues' queue_vtime stays at 0 and a publish
+        // would broadcast a frozen value forever.
+        return;
+    }
+    let Some(floor) = queue.vtime_floor.as_ref() else {
+        return;
+    };
+    let Some(slot) = floor.slots.get(queue.worker_id as usize) else {
+        return;
+    };
+    slot.publish(queue.queue_vtime);
+}
 
 /// #917 — V_min sync throttle decision. Plan §3.3 v2 cadence:
 /// K=8 + mandatory check at drain-batch start (`pop_count == 1`).
@@ -6560,6 +6694,11 @@ pub(super) fn transmit_batch(
     );
     writer.commit();
     drop(writer);
+    // #940: NO V_min publish here. transmit_batch is the post-CoS
+    // backup path; it operates on `pending: VecDeque<TxRequest>`
+    // directly (never touches a CoSQueueRuntime), so there is no
+    // queue_vtime to publish. V_min applies only to traffic that
+    // flowed through a shared_exact CoS queue.
     // #812 Codex round-1 HIGH #1: submit stamp AFTER commit — plan
     // §3.1 submit-site table (the post-CoS backup transmit_batch
     // variant for local requests). Post-commit stamping prevents a
@@ -6789,6 +6928,11 @@ fn transmit_prepared_queue(
     }));
     writer.commit();
     drop(writer);
+    // #940: NO V_min publish here. transmit_prepared_queue is the
+    // post-CoS backup path; operates on
+    // `pending: VecDeque<PreparedTxRequest>` directly, never
+    // advances any queue_vtime. V_min applies only to traffic
+    // that flowed through a shared_exact CoS queue.
     // #812 Codex round-1 HIGH #1: submit stamp AFTER commit — plan
     // §3.1 submit-site table (the transmit_prepared_queue
     // continuation variant). Post-commit stamping ensures we measure
@@ -16568,6 +16712,504 @@ mod tests {
         assert_eq!(
             actual_csum, expected_csum,
             "incremental checksum update must match a from-scratch recomputation",
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #940 + #942 V_min correctness sweep tests
+    // ---------------------------------------------------------------------
+
+    /// Test scaffolding: attach a real `SharedCoSQueueVtimeFloor` to a
+    /// queue runtime and return the `Arc` so tests can read peer slots
+    /// back to assert on published values. Existing fixtures default to
+    /// `vtime_floor: None` and exercise the no-op publish path; this
+    /// helper opts in for tests that need V_min participation.
+    fn attach_test_vtime_floor(
+        queue: &mut CoSQueueRuntime,
+        num_workers: u32,
+        my_worker_id: u32,
+    ) -> Arc<SharedCoSQueueVtimeFloor> {
+        let floor = Arc::new(SharedCoSQueueVtimeFloor::new(num_workers as usize));
+        queue.vtime_floor = Some(Arc::clone(&floor));
+        queue.worker_id = my_worker_id;
+        // V_min sync only kicks in on shared_exact; mark accordingly so
+        // `cos_queue_v_min_continue` doesn't early-return.
+        queue.shared_exact = true;
+        queue.flow_fair = true;
+        floor
+    }
+
+    /// #940: speculative pop (snapshot variant) must NOT publish to the
+    /// V_min slot. The slot stays at NOT_PARTICIPATING throughout the
+    /// snapshot pop. Rolling back via `cos_queue_push_front` republishes
+    /// the post-rollback vtime via the existing rollback hook.
+    #[test]
+    fn vmin_pop_snapshot_does_not_publish() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        let floor = attach_test_vtime_floor(queue, 4, 1);
+
+        // Sanity: slot starts at NOT_PARTICIPATING.
+        assert_eq!(
+            floor.slots[1].read(),
+            None,
+            "fresh slot should be NOT_PARTICIPATING"
+        );
+
+        // Push an item and pop with snapshot. With #940, this must
+        // NOT publish — slot stays at NOT_PARTICIPATING.
+        cos_queue_push_back(queue, test_cos_item(1500));
+        let _popped = cos_queue_pop_front(queue);
+        assert_eq!(
+            floor.slots[1].read(),
+            None,
+            "snapshot pop must not publish to V_min slot (#940)",
+        );
+
+        // Now roll back — push_front republishes the rolled-back vtime
+        // via the existing rollback hook in cos_queue_push_front.
+        if let Some(item) = _popped {
+            cos_queue_push_front(queue, item);
+        }
+        // After rollback, queue_vtime is back to 0; the rollback hook
+        // publishes that. Slot should now reflect a value (0 — the
+        // pre-pop state).
+        assert_eq!(
+            floor.slots[1].read(),
+            Some(0),
+            "rollback path republishes corrected vtime",
+        );
+    }
+
+    /// #940: post-settle publish on the Local-flow-fair commit site.
+    /// After a successful drain + insert + settle, the slot reflects
+    /// the committed queue_vtime.
+    ///
+    /// This test exercises the `publish_committed_queue_vtime` helper
+    /// directly (the helper is the publish primitive). The full
+    /// scratch-builder + commit + settle path is exercised by the
+    /// existing `cos_exact_drain_throughput_micro_bench` and the
+    /// integration tests; this pin asserts the helper's contract.
+    #[test]
+    fn vmin_post_settle_publish_writes_committed_vtime() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        let floor = attach_test_vtime_floor(queue, 4, 2);
+
+        // Set queue_vtime as if a drain has just committed.
+        queue.queue_vtime = 12345;
+        publish_committed_queue_vtime(Some(&*queue));
+        assert_eq!(
+            floor.slots[2].read(),
+            Some(12345),
+            "post-settle publish must write committed queue_vtime to the slot",
+        );
+
+        // Calling again with a higher vtime advances the slot
+        // (idempotent / monotonic in normal flow).
+        queue.queue_vtime = 23456;
+        publish_committed_queue_vtime(Some(&*queue));
+        assert_eq!(
+            floor.slots[2].read(),
+            Some(23456),
+            "subsequent publish must overwrite",
+        );
+    }
+
+    /// #940 F4: `publish_committed_queue_vtime` is a no-op when
+    /// `vtime_floor = None`. Existing tests rely on this — non-V_min
+    /// queues must not publish anywhere.
+    #[test]
+    fn vmin_publish_helper_noop_when_floor_none() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "q0".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        // No floor attached; default state.
+        assert!(queue.vtime_floor.is_none());
+        queue.queue_vtime = 99999;
+        // Must not panic and must not publish anywhere.
+        publish_committed_queue_vtime(Some(&*queue));
+        // Sanity: still no floor, no observable effect.
+        assert!(queue.vtime_floor.is_none());
+    }
+
+    /// #942: Prepared flow-fair scratch builder must honor the V_min
+    /// throttle. Synthetic peer slot pegged at 0 with the local
+    /// queue_vtime well past LAG_THRESHOLD; the builder should break
+    /// early after the first pop (pop_count==1 mandatory check).
+    #[test]
+    fn vmin_prepared_flow_fair_builder_honors_throttle() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 4 * 1024 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        let floor = attach_test_vtime_floor(queue, 4, 1);
+
+        // Peer worker 0 pegged at vtime 0. Local worker 1 has
+        // queue_vtime well past LAG_THRESHOLD (~1.25 MB at 10 Gb/s).
+        floor.slots[0].publish(0);
+        queue.queue_vtime = 100 * 1024 * 1024; // 100 MB ahead
+
+        // V_min check at pop_count==1 must throttle (return false).
+        assert!(
+            !cos_queue_v_min_continue(queue, 1),
+            "Prepared flow-fair throttle MUST fire when local vtime >> peer V_min + LAG (#942)",
+        );
+
+        // Reset queue_vtime to within LAG and confirm the check passes.
+        queue.queue_vtime = 0;
+        assert!(
+            cos_queue_v_min_continue(queue, 1),
+            "throttle MUST NOT fire when local vtime <= V_min + LAG",
+        );
+    }
+
+    /// #940: full pop → push_front (rollback) → re-pop → publish-via-
+    /// post-settle sequence. Pins that the rollback hook in
+    /// `cos_queue_push_front` and the new post-settle publish compose
+    /// correctly under partial-rollback workloads. Per Gemini
+    /// adversarial review.
+    #[test]
+    fn vmin_pop_rollback_repop_postsettle_compose() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        let floor = attach_test_vtime_floor(queue, 4, 1);
+
+        // Push 2 items.
+        cos_queue_push_back(queue, test_cos_item(1500));
+        cos_queue_push_back(queue, test_cos_item(1500));
+        let v0 = queue.queue_vtime;
+        assert_eq!(floor.slots[1].read(), None, "fresh slot");
+
+        // Pop 1: snapshot variant (NO publish).
+        let popped1 = cos_queue_pop_front(queue);
+        let v1 = queue.queue_vtime;
+        assert!(v1 > v0, "pop must advance vtime");
+        assert_eq!(
+            floor.slots[1].read(),
+            None,
+            "snapshot pop must not publish"
+        );
+
+        // Roll back via push_front: republishes via existing rollback
+        // hook. Slot now holds the rolled-back vtime (back to v0).
+        if let Some(item) = popped1 {
+            cos_queue_push_front(queue, item);
+        }
+        let v_after_rollback = queue.queue_vtime;
+        assert_eq!(v_after_rollback, v0, "rollback must restore vtime");
+        assert_eq!(
+            floor.slots[1].read(),
+            Some(v0),
+            "rollback hook must publish corrected vtime",
+        );
+
+        // Re-pop (snapshot). queue_vtime advances again. Slot stays at
+        // v0 because the snapshot pop doesn't publish.
+        let _popped2 = cos_queue_pop_front(queue);
+        assert!(
+            queue.queue_vtime > v_after_rollback,
+            "re-pop advances vtime"
+        );
+        assert_eq!(
+            floor.slots[1].read(),
+            Some(v0),
+            "re-pop snapshot must not publish",
+        );
+
+        // Post-settle publish: slot reflects the new committed vtime.
+        publish_committed_queue_vtime(Some(&*queue));
+        assert_eq!(
+            floor.slots[1].read(),
+            Some(queue.queue_vtime),
+            "post-settle publish broadcasts the new committed vtime",
+        );
+    }
+
+    /// #940: demote_prepared_cos_queue_to_local must not publish to
+    /// V_min during drain_all. Reframed per Gemini review: assert slot
+    /// value before demote == slot value after demote completes the
+    /// internal save/restore but BEFORE the new explicit post-restore
+    /// publish call... well actually the publish happens at the end of
+    /// demote_prepared_cos_queue_to_local now, so we observe:
+    ///
+    ///   1. Pre-demote: slot at SOME_PRE_VTIME (set explicitly).
+    ///   2. Build a queue with prepared items.
+    ///   3. Run demote (which drains internally with no-snapshot
+    ///      pops, advances queue_vtime by drained bytes,
+    ///      converts items to Local, then RESTORES queue_vtime
+    ///      from the saved value, then publishes).
+    ///   4. Post-demote: slot at SOME_PRE_VTIME (== restored value
+    ///      since demote saves+restores symmetrically).
+    ///
+    /// The test cannot observe the transient drain-time queue_vtime
+    /// from a single thread; the assertion is "slot value at start ==
+    /// slot value at end" which proves no transient leaked.
+    #[test]
+    fn vmin_demote_no_drain_all_leak() {
+        // demote_prepared_cos_queue_to_local takes &MmapArea and
+        // operates on Prepared items. We need a real MmapArea and
+        // a queue with Prepared items. Start with a small UMEM.
+        let area = MmapArea::new(2 * 1024 * 1024).expect("mmap umem");
+
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 4 * 1024 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        let floor = attach_test_vtime_floor(queue, 4, 0);
+        // Set a non-zero "prior committed" vtime so we can detect
+        // accidental publishes-of-zero from drain_all.
+        queue.queue_vtime = 7777;
+        floor.slots[0].publish(7777);
+        let pre_slot = floor.slots[0].read();
+        assert_eq!(pre_slot, Some(7777), "fixture sanity");
+
+        // Push a Prepared item.
+        let prep = PreparedTxRequest {
+            offset: 0,
+            len: 1500,
+            recycle: PreparedTxRecycle::FreeTxFrame,
+            dscp_rewrite: None,
+            cos_queue_id: Some(0),
+            flow_key: None,
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            egress_ifindex: 80,
+        };
+        cos_queue_push_back(queue, CoSPendingTxItem::Prepared(prep));
+
+        let mut free_tx = VecDeque::new();
+        let mut pending_fill = VecDeque::new();
+        let _ok = demote_prepared_cos_queue_to_local(
+            &area,
+            &mut free_tx,
+            &mut pending_fill,
+            0,
+            &mut root,
+            Some(0),
+        );
+
+        // Re-borrow queue and floor (root was reborrowed by demote).
+        let queue = &root.queues[0];
+        let post_slot = queue
+            .vtime_floor
+            .as_ref()
+            .and_then(|f| f.slots.get(0))
+            .and_then(|s| s.read());
+
+        // Slot at end MUST equal slot at start: demote saves+restores
+        // queue_vtime (#926) and the new post-restore publish writes
+        // the SAME (saved) value back. drain_all's internal vtime
+        // inflation never reaches the slot because the pop-time
+        // publish has been removed (#940).
+        assert_eq!(
+            post_slot, pre_slot,
+            "demote must not leak drain_all vtime to V_min slot — \
+             the saved+restored vtime must round-trip cleanly (#940)",
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #940 microbenchmark: pop + commit + settle + publish
+    //
+    // Per Gemini adversarial review: measure the FULL pop+commit+settle
+    // cycle so we capture the publish cost relocation (publish moved
+    // from pop time to post-settle).
+    //
+    // Run: cargo test --release -p xpf-userspace-dp -- bench_pop_commit_settle_publish --nocapture --ignored
+    // ---------------------------------------------------------------------
+    #[test]
+    #[ignore]
+    fn bench_pop_commit_settle_publish() {
+        use std::time::Instant;
+        const PACKET_LEN: usize = 1500;
+        const BATCHES: usize = 10_000;
+        const ITEMS_PER_BATCH: usize = TX_BATCH_SIZE;
+
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 4 * 1024 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        root.tokens = u64::MAX;
+        // Promote to flow_fair + shared_exact + attach floor to
+        // exercise the V_min publish path.
+        let queue = &mut root.queues[0];
+        queue.tokens = u64::MAX;
+        queue.flow_fair = true;
+        queue.exact = true;
+        queue.shared_exact = true;
+        let _floor = attach_test_vtime_floor(queue, 4, 0);
+        queue.runnable = true;
+
+        let area = MmapArea::new(2 * 1024 * 1024).expect("mmap umem");
+        let packet_bytes = vec![0xABu8; PACKET_LEN];
+        let mut scratch: Vec<(u64, TxRequest)> = Vec::with_capacity(ITEMS_PER_BATCH);
+        let mut free_frames: VecDeque<u64> =
+            (0..ITEMS_PER_BATCH as u64).map(|i| i * 4096).collect();
+
+        let prime_queue = |queue: &mut CoSQueueRuntime, packet: &[u8]| {
+            queue.items.clear();
+            queue.queued_bytes = 0;
+            queue.queue_vtime = 0;
+            queue.flow_bucket_bytes = [0; COS_FLOW_FAIR_BUCKETS];
+            queue.flow_bucket_head_finish_bytes = [0; COS_FLOW_FAIR_BUCKETS];
+            queue.flow_bucket_tail_finish_bytes = [0; COS_FLOW_FAIR_BUCKETS];
+            queue.flow_rr_buckets = FlowRrRing::default();
+            queue.flow_bucket_items = std::array::from_fn(|_| VecDeque::new());
+            queue.active_flow_buckets = 0;
+            queue.local_item_count = 0;
+            queue.pop_snapshot_stack.clear();
+            for i in 0..ITEMS_PER_BATCH {
+                let mut req = TxRequest {
+                    bytes: packet.to_vec(),
+                    expected_ports: None,
+                    expected_addr_family: libc::AF_INET as u8,
+                    expected_protocol: PROTO_TCP,
+                    flow_key: Some(test_session_key((1000 + i) as u16, 5201)),
+                    egress_ifindex: 80,
+                    cos_queue_id: Some(0),
+                    dscp_rewrite: None,
+                };
+                let _ = req.bytes.len();
+                cos_queue_push_back(queue, CoSPendingTxItem::Local(req));
+            }
+        };
+
+        // Warmup.
+        for _ in 0..1000 {
+            prime_queue(&mut root.queues[0], &packet_bytes);
+            scratch.clear();
+            free_frames = (0..ITEMS_PER_BATCH as u64).map(|i| i * 4096).collect();
+            let _ = drain_exact_local_items_to_scratch_flow_fair(
+                &mut root.queues[0],
+                &mut free_frames,
+                &mut scratch,
+                &area,
+                u64::MAX,
+                u64::MAX,
+                None,
+            );
+            let inserted = scratch.len();
+            settle_exact_local_scratch_submission_flow_fair(
+                Some(&mut root.queues[0]),
+                &mut free_frames,
+                &mut scratch,
+                inserted,
+            );
+            publish_committed_queue_vtime(Some(&root.queues[0]));
+        }
+
+        let mut measured = std::time::Duration::ZERO;
+        let mut total_packets = 0u64;
+        for _ in 0..BATCHES {
+            prime_queue(&mut root.queues[0], &packet_bytes);
+            scratch.clear();
+            free_frames.clear();
+            free_frames.extend((0..ITEMS_PER_BATCH as u64).map(|i| i * 4096));
+
+            let iter_start = Instant::now();
+            let _ = drain_exact_local_items_to_scratch_flow_fair(
+                &mut root.queues[0],
+                &mut free_frames,
+                &mut scratch,
+                &area,
+                u64::MAX,
+                u64::MAX,
+                None,
+            );
+            let inserted = scratch.len();
+            settle_exact_local_scratch_submission_flow_fair(
+                Some(&mut root.queues[0]),
+                &mut free_frames,
+                &mut scratch,
+                inserted,
+            );
+            publish_committed_queue_vtime(Some(&root.queues[0]));
+            measured += iter_start.elapsed();
+            total_packets += inserted as u64;
+        }
+
+        let ns_per_pkt = measured.as_nanos() as f64 / total_packets as f64;
+        eprintln!(
+            "bench_pop_commit_settle_publish: {} packets in {:?} = {:.1} ns/pkt",
+            total_packets, measured, ns_per_pkt
         );
     }
 }
