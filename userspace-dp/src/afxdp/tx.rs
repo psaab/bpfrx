@@ -4364,6 +4364,18 @@ fn account_cos_queue_flow_dequeue(
         // enqueue re-anchors at the live `queue.vtime`.
         queue.flow_bucket_head_finish_bytes[bucket] = 0;
         queue.flow_bucket_tail_finish_bytes[bucket] = 0;
+        // #941 Work item A: bucket-empty vacate. When this worker's
+        // last active bucket on a shared_exact queue empties, vacate
+        // the V_min slot so peers don't see a phantom-participating
+        // worker holding a stale-low value. Single-writer invariant
+        // holds — only this worker writes its own slot.
+        if queue.shared_exact && queue.active_flow_buckets == 0 {
+            if let Some(floor) = queue.vtime_floor.as_ref() {
+                if let Some(slot) = floor.slots.get(queue.worker_id as usize) {
+                    slot.vacate();
+                }
+            }
+        }
     }
     queue.flow_bucket_bytes[bucket] = remaining;
 }
