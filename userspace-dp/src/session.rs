@@ -70,6 +70,28 @@ impl SessionWheel {
     }
 }
 
+/// Per-call statistics for `expire_stale_entries` pop work, used by
+/// the timer-wheel unit tests to assert K-bounds and entry
+/// classification under specific synthetic workloads. Fields are
+/// accumulated over all buckets popped in a single call.
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct WheelPopStats {
+    /// Total `WheelEntry`s scanned (popped from a bucket and
+    /// classified) during the call.
+    pub(crate) scanned: usize,
+    /// Entries dropped because the canonical key is no longer in
+    /// `sessions` (already removed by another path).
+    pub(crate) dropped_gone: usize,
+    /// Entries dropped because `wheel_tick != scheduled_tick` (a
+    /// fresher entry has superseded this one).
+    pub(crate) dropped_stale: usize,
+    /// Entries that actually expired and were removed.
+    pub(crate) expired: usize,
+    /// Entries that were re-bucketed (long-timeout / not yet
+    /// expired).
+    pub(crate) re_bucketed: usize,
+}
+
 /// Configurable session timeout values (in nanoseconds).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SessionTimeouts {
@@ -295,6 +317,12 @@ pub(crate) struct SessionTable {
     /// #965: bucketed timer wheel that mirrors `sessions`. Pop one
     /// bucket per tick (1 s) instead of scanning the whole HashMap.
     wheel: SessionWheel,
+    /// #965: stats from the most-recent `expire_stale_entries` call.
+    /// Reset at the start of each call. Used by unit tests to assert
+    /// K-bounds and classification (scanned / dropped_stale /
+    /// dropped_gone / expired / re_bucketed). Accumulator overhead
+    /// is 4-5 increments per popped entry — sub-µs at typical loads.
+    last_pop_stats: WheelPopStats,
 }
 
 impl SessionTable {
@@ -315,7 +343,15 @@ impl SessionTable {
             delta_drops: 0,
             delta_drained: 0,
             wheel: SessionWheel::new(),
+            last_pop_stats: WheelPopStats::default(),
         }
+    }
+
+    /// #965: stats from the most-recent `expire_stale_entries` call.
+    /// Used by tests to validate K-bounds and entry classification.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn last_pop_stats(&self) -> WheelPopStats {
+        self.last_pop_stats
     }
 
     /// #965: lazily initialize the wheel cursor to the first observed
@@ -419,6 +455,8 @@ impl SessionTable {
         }
         self.last_gc_ns = now_ns;
         self.wheel_observe(now_ns);
+        // Reset per-call stats; tests read them via last_pop_stats().
+        self.last_pop_stats = WheelPopStats::default();
         let now_tick = now_ns / WHEEL_TICK_NS;
         let mut expired_entries: Vec<ExpiredSession> = Vec::new();
         while self.wheel.cursor_tick < now_tick {
@@ -434,20 +472,24 @@ impl SessionTable {
                 let WheelEntry { key, scheduled_tick } = self.wheel.buckets[bucket_idx]
                     .pop_front()
                     .expect("len snapshot bounds the iteration");
+                self.last_pop_stats.scanned += 1;
                 // Case 1: entry already removed elsewhere — drop hint.
                 let Some(entry) = self.sessions.get(&key) else {
+                    self.last_pop_stats.dropped_gone += 1;
                     continue;
                 };
                 // Case 2: stale duplicate — entry's canonical wheel_tick
                 // has advanced past this scheduled_tick, so the new tick
                 // already has its own wheel entry. Drop.
                 if entry.wheel_tick != scheduled_tick {
+                    self.last_pop_stats.dropped_stale += 1;
                     continue;
                 }
                 // Case 3 vs 4: canonical entry. Match today's strict `>`
                 // expiration semantics.
                 if now_ns.saturating_sub(entry.last_seen_ns) > entry.expires_after_ns {
                     if let Some(removed) = self.remove_entry(&key) {
+                        self.last_pop_stats.expired += 1;
                         let decision = removed.decision;
                         let metadata = removed.metadata;
                         if key.protocol == PROTO_TCP {
@@ -502,6 +544,7 @@ impl SessionTable {
                         key,
                         scheduled_tick: new_target_tick,
                     });
+                    self.last_pop_stats.re_bucketed += 1;
                 }
             }
             self.wheel.cursor_tick = self.wheel.cursor_tick.saturating_add(1);
@@ -1722,53 +1765,142 @@ mod tests {
         assert_eq!(table.len(), 0);
     }
 
-    /// Compile-only test: ensure the alias path's `lookup_with_origin`
-    /// body type-checks (the &mut self.sessions borrow is scoped before
-    /// self.wheel.buckets is touched). Codex round-3/4 caught the
-    /// `.map(|entry| { ... self.wheel ... })` shape that wouldn't
-    /// compile. This test exists to guard against future refactors
-    /// that reintroduce that shape — failure is a compile-time error
-    /// not a runtime assertion.
+    /// Alias path: lookup_with_origin called on a NAT-translated
+    /// reverse alias key resolves to the canonical forward key (via
+    /// reverse_translated_index), then pushes the CANONICAL key into
+    /// the wheel — never the alias. Round-3/4 of plan iteration caught
+    /// that the .map(|entry| { ... self.wheel ... }) shape wouldn't
+    /// compile; this test additionally validates the runtime
+    /// invariant that the canonical key, not the alias, lands in the
+    /// wheel after a sub-tick advance.
     #[test]
-    fn wheel_alias_lookup_does_not_double_borrow_self() {
-        // The body of lookup_with_origin compiles iff the &mut
-        // self.sessions borrow is dropped before push_to_wheel.
-        // Existence of this test = the file compiled with the correct
-        // borrow shape.
+    fn wheel_alias_lookup_refreshes_canonical_key() {
         let mut table = SessionTable::new();
-        let key = key_v4();
-        let now = 1_000_000_000u64;
-        // The actual lookup does the alias resolution + wheel push.
-        let _ = table.lookup_with_origin(&key, now, 0);
+        // Install a forward session with NAT rewrite_dst so that the
+        // alias index gets populated automatically by index_forward_nat_key.
+        let canonical_key = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 42)),
+            src_port: 5201,
+            dst_port: 42424,
+        };
+        let alias_key = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            src_port: 5201,
+            dst_port: 42424,
+        };
+        let mut reverse_metadata = metadata();
+        reverse_metadata.is_reverse = true;
+        let nat = SessionDecision {
+            resolution: resolution(),
+            nat: NatDecision {
+                rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+                ..NatDecision::default()
+            },
+        };
+        let install_ns = 1_000_000_000u64;
+        assert!(table.install_with_protocol(
+            canonical_key.clone(),
+            nat,
+            reverse_metadata,
+            install_ns,
+            PROTO_TCP,
+            0x10,
+        ));
+        // Sanity: install pushed the canonical key to its bucket.
+        let initial_canonical_count: usize = table
+            .wheel
+            .buckets
+            .iter()
+            .map(|b| b.iter().filter(|e| e.key == canonical_key).count())
+            .sum();
+        assert_eq!(initial_canonical_count, 1, "install pushed canonical");
+        let initial_alias_count: usize = table
+            .wheel
+            .buckets
+            .iter()
+            .map(|b| b.iter().filter(|e| e.key == alias_key).count())
+            .sum();
+        assert_eq!(initial_alias_count, 0, "alias key MUST NOT be in wheel");
+        // Now look up via the ALIAS, advancing the canonical entry's
+        // expiration tick by enough to cross the second-grid (so the
+        // throttle fires a new push).
+        let lookup_ns = install_ns + 2 * WHEEL_TICK_NS;
+        let hit = table.lookup_with_origin(&alias_key, lookup_ns, 0x10);
+        assert!(hit.is_some(), "alias lookup must hit");
+        // Wheel state after alias lookup: canonical key has a NEW
+        // entry (the one pushed by lookup_with_origin); alias key
+        // STILL has no entries.
+        let canonical_count: usize = table
+            .wheel
+            .buckets
+            .iter()
+            .map(|b| b.iter().filter(|e| e.key == canonical_key).count())
+            .sum();
+        assert!(
+            canonical_count >= 2,
+            "alias lookup must push a fresh wheel entry under the canonical key; \
+             canonical_count={}",
+            canonical_count
+        );
+        let alias_count: usize = table
+            .wheel
+            .buckets
+            .iter()
+            .map(|b| b.iter().filter(|e| e.key == alias_key).count())
+            .sum();
+        assert_eq!(
+            alias_count, 0,
+            "alias key MUST never appear in any bucket; alias_count={}",
+            alias_count
+        );
     }
 
-    /// Sustained per-second touch on every session: K (entries scanned
-    /// per popped bucket) is bounded. Catches a regression where touch
-    /// inadvertently adds multiple wheel entries per call.
+    /// Sustained per-second touch on every session: K (entries
+    /// scanned per popped bucket) is bounded by N, and pop
+    /// classification matches the plan's expected pattern: every
+    /// scanned entry is a stale duplicate (entries_dropped_stale ≈ K),
+    /// no entries get re-bucketed (sessions are kept alive by
+    /// per-second touches that update wheel_tick), and no entries
+    /// expire.
     ///
-    /// This is the per-second-touch K-bound from §Acceptance gate 4b.
+    /// This is the per-second-touch K-bound from §Acceptance gate 4b
+    /// (corrected per Codex round-7 #2 classifications and round-12
+    /// instrumentation requirement).
+    ///
+    /// Test scale: N = 1000 (smaller than the 10K plan target to keep
+    /// CI runtime under 1 s; the assertion shape is what matters).
     #[test]
     fn wheel_per_second_touch_bounds_k_per_bucket() {
         let mut table = SessionTable::new();
         const N: usize = 1000;
         let install_ns = 1_000_000_000u64;
-        // Install N sessions.
+        // Install N sessions, each at a distinct sub-tick install
+        // offset so they spread across buckets after warm-up.
         let keys: Vec<SessionKey> = (0..N)
             .map(|i| make_v4_key((i % 250) as u8, 1024 + (i / 250) as u16))
             .collect();
-        for k in &keys {
+        for (i, k) in keys.iter().enumerate() {
             assert!(table.install_with_protocol(
                 k.clone(),
                 decision(),
                 metadata(),
-                install_ns,
+                install_ns + (i as u64) * 1_000, // 1 µs spacing
                 PROTO_UDP,
                 0
             ));
         }
-        // Touch every session once per second for 256 seconds. After
-        // each touch round, advance the GC.
-        for tick_off in 1..=256u64 {
+        // Warm-up: touch every session once per tick for ≥ 300 ticks
+        // so the wheel reaches steady state under per-second touch on
+        // every session. After each touch round, run GC at the
+        // matching tick.
+        const WARMUP_TICKS: u64 = 300;
+        for tick_off in 1..=WARMUP_TICKS {
             let now = install_ns + tick_off * WHEEL_TICK_NS;
             for k in &keys {
                 table.touch(k, now);
@@ -1776,30 +1908,119 @@ mod tests {
             table.last_gc_ns = now - SESSION_GC_INTERVAL_NS;
             let _ = table.expire_stale_entries(now);
         }
-        // Total wheel entries across all buckets should be bounded by
-        // N x 256 (the absolute ceiling, never reached because GC
-        // drains stale entries on visit).
-        let total_entries: usize = table.wheel.buckets.iter().map(|b| b.len()).sum();
+        // Measurement tick: advance one more, capture the next pop's
+        // stats via last_pop_stats().
+        let measure_now = install_ns + (WARMUP_TICKS + 1) * WHEEL_TICK_NS;
+        for k in &keys {
+            table.touch(k, measure_now);
+        }
+        table.last_gc_ns = measure_now - SESSION_GC_INTERVAL_NS;
+        let _ = table.expire_stale_entries(measure_now);
+        let stats = table.last_pop_stats();
+
+        // §Acceptance gate 4b classifications under sustained per-
+        // second touch: every popped entry is stale duplicate, no
+        // re-bucketing, no expirations.
         assert!(
-            total_entries <= N * (WHEEL_BUCKETS - 1) + N,
-            "wheel entries should be bounded by N x WHEEL_BUCKETS; got {}",
-            total_entries
+            stats.scanned > 0,
+            "must have scanned entries; stats={:?}",
+            stats
         );
-        // Per-bucket K (max) under per-second-touch on every session
-        // is bounded by N (after one full rotation). With 20% headroom
-        // matches §Acceptance gate 4b's K <= 12,000 bound at N=10K.
-        let max_bucket = table
-            .wheel
-            .buckets
-            .iter()
-            .map(|b| b.len())
-            .max()
-            .unwrap_or(0);
+        // K bound: scanned ≤ N × 1.2 (20 % headroom — a 2× duplicate-
+        // push regression would scan >2 N and fail this).
+        let k_bound = (N as f64 * 1.2) as usize;
         assert!(
-            max_bucket <= (N as f64 * 1.2) as usize,
-            "max K per bucket must be bounded by ~N; got {} (N={})",
-            max_bucket,
-            N
+            stats.scanned <= k_bound,
+            "K (scanned) must be bounded by N×1.2 = {}; got scanned={} stats={:?}",
+            k_bound,
+            stats.scanned,
+            stats
+        );
+        // No re-bucketing under sustained-per-tick touch: each
+        // session's canonical wheel_tick advances every tick, so all
+        // popped entries with stale `scheduled_tick != wheel_tick`
+        // hit the dropped_stale path, not re-bucket.
+        assert_eq!(
+            stats.re_bucketed, 0,
+            "expected 0 re-bucketed under per-second touch; stats={:?}",
+            stats
+        );
+        assert_eq!(
+            stats.expired, 0,
+            "expected 0 expirations under per-second touch; stats={:?}",
+            stats
+        );
+        // dropped_stale + dropped_gone + expired + re_bucketed = scanned.
+        assert_eq!(
+            stats.dropped_stale + stats.dropped_gone + stats.expired + stats.re_bucketed,
+            stats.scanned,
+            "case classification must sum to scanned; stats={:?}",
+            stats
+        );
+        // dropped_stale dominates (the lazy-delete discriminator is
+        // the right path for this workload).
+        assert!(
+            stats.dropped_stale >= stats.scanned * 9 / 10,
+            "expected dropped_stale ≈ scanned (≥90 %); stats={:?}",
+            stats
+        );
+    }
+
+    /// Across one full wheel rotation under sustained per-second
+    /// touch, the total number of entries scanned ≈ 256 × N (every
+    /// bucket pops N stale duplicates). Catches leakage of stale
+    /// entries that the lazy-delete discriminator should drop on
+    /// visit but didn't.
+    #[test]
+    fn wheel_per_second_touch_total_scan_per_rotation_matches_model() {
+        let mut table = SessionTable::new();
+        const N: usize = 500;
+        let install_ns = 1_000_000_000u64;
+        let keys: Vec<SessionKey> = (0..N)
+            .map(|i| make_v4_key((i % 250) as u8, 1024 + (i / 250) as u16))
+            .collect();
+        for (i, k) in keys.iter().enumerate() {
+            assert!(table.install_with_protocol(
+                k.clone(),
+                decision(),
+                metadata(),
+                install_ns + (i as u64) * 1_000,
+                PROTO_UDP,
+                0
+            ));
+        }
+        // Warm up beyond one full rotation so steady-state holds.
+        const WARMUP_TICKS: u64 = 300;
+        for tick_off in 1..=WARMUP_TICKS {
+            let now = install_ns + tick_off * WHEEL_TICK_NS;
+            for k in &keys {
+                table.touch(k, now);
+            }
+            table.last_gc_ns = now - SESSION_GC_INTERVAL_NS;
+            let _ = table.expire_stale_entries(now);
+        }
+        // Now measure across exactly WHEEL_BUCKETS=256 ticks.
+        let mut total_scanned = 0usize;
+        for tick_off in 1..=WHEEL_BUCKETS as u64 {
+            let now = install_ns + (WARMUP_TICKS + tick_off) * WHEEL_TICK_NS;
+            for k in &keys {
+                table.touch(k, now);
+            }
+            table.last_gc_ns = now - SESSION_GC_INTERVAL_NS;
+            let _ = table.expire_stale_entries(now);
+            total_scanned += table.last_pop_stats().scanned;
+        }
+        // Plan §Acceptance gate 4b: total_scanned ∈ [0.9, 1.1] × 256 × N.
+        let model = WHEEL_BUCKETS * N;
+        let lower = (model as f64 * 0.9) as usize;
+        let upper = (model as f64 * 1.1) as usize;
+        assert!(
+            (lower..=upper).contains(&total_scanned),
+            "total_scanned ({}) must be within ±10% of model ({}); range [{}, {}]",
+            total_scanned,
+            model,
+            lower,
+            upper
         );
     }
 
