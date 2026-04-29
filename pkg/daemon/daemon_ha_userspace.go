@@ -185,8 +185,17 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	key.DstPort = userspaceHostToNetwork16(delta.DstPort)
 	key.Protocol = delta.Protocol
 
-	ingressZone := zoneIDs[delta.IngressZone]
-	egressZone := zoneIDs[delta.EgressZone]
+	// #919/#922: prefer the u16 zone IDs from the binary event-stream
+	// payload (bytes [21]/[22] in eventstream.go); fall back to legacy
+	// name-string lookup for older helpers that emit JSON deltas only.
+	ingressZone := delta.IngressZoneID
+	if ingressZone == 0 {
+		ingressZone = zoneIDs[delta.IngressZone]
+	}
+	egressZone := delta.EgressZoneID
+	if egressZone == 0 {
+		egressZone = zoneIDs[delta.EgressZone]
+	}
 	if ingressZone == 0 || egressZone == 0 {
 		return dataplane.SessionKey{}, dataplane.SessionValue{}, false
 	}
@@ -254,8 +263,16 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	key.DstPort = userspaceHostToNetwork16(delta.DstPort)
 	key.Protocol = delta.Protocol
 
-	ingressZone := zoneIDs[delta.IngressZone]
-	egressZone := zoneIDs[delta.EgressZone]
+	// #919/#922: prefer the u16 zone IDs from the binary event-stream
+	// payload; fall back to legacy name-string lookup for JSON deltas.
+	ingressZone := delta.IngressZoneID
+	if ingressZone == 0 {
+		ingressZone = zoneIDs[delta.IngressZone]
+	}
+	egressZone := delta.EgressZoneID
+	if egressZone == 0 {
+		egressZone = zoneIDs[delta.EgressZone]
+	}
 	if ingressZone == 0 || egressZone == 0 {
 		return dataplane.SessionKeyV6{}, dataplane.SessionValueV6{}, false
 	}

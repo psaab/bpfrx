@@ -879,6 +879,12 @@ type SessionDeltaInfo struct {
 	DstPort          uint16    `json:"dst_port,omitempty"`
 	IngressZone      string    `json:"ingress_zone,omitempty"`
 	EgressZone       string    `json:"egress_zone,omitempty"`
+	// #919/#922: u16 zone-id mirrors decoded directly from the binary
+	// event-stream payload (bytes [21],[22] u8 → u16 here for symmetry
+	// with SessionSyncRequest). The HA delta path prefers these IDs;
+	// the legacy strings stay populated when JSON callers fill them.
+	IngressZoneID    uint16    `json:"ingress_zone_id,omitempty"`
+	EgressZoneID     uint16    `json:"egress_zone_id,omitempty"`
 	OwnerRGID        int       `json:"owner_rg_id,omitempty"`
 	Disposition      string    `json:"disposition,omitempty"`
 	Origin           string    `json:"origin,omitempty"`

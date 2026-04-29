@@ -456,8 +456,13 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 		TXIfindex:        int(int16(binary.LittleEndian.Uint16(payload[14:16]))),
 		TunnelEndpointID: binary.LittleEndian.Uint16(payload[16:18]),
 		TXVLANID:         binary.LittleEndian.Uint16(payload[18:20]),
-		FabricRedirect:   flags&SessionEventFlagFabricRedirect != 0,
-		FabricIngress:    flags&SessionEventFlagFabricIngress != 0,
+		// #919/#922: bytes [21]/[22] are u8 ingress/egress zone IDs
+		// written by the Rust codec at event_stream/codec.rs:144-156.
+		// Promote to uint16 for symmetry with SessionSyncRequest.
+		IngressZoneID:  uint16(payload[21]),
+		EgressZoneID:   uint16(payload[22]),
+		FabricRedirect: flags&SessionEventFlagFabricRedirect != 0,
+		FabricIngress:  flags&SessionEventFlagFabricIngress != 0,
 	}
 
 	// Disposition mapping: 0=Accept, 1=LocalDelivery

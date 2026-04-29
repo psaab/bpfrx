@@ -716,11 +716,10 @@ mod tests {
         );
     }
 
-    /// #919/#922: when `parse_policy_state` cannot translate a snapshot
-    /// rule's zone names through `zone_name_to_id`, the resolved IDs
-    /// fall through to 0. `evaluate_policy` for any non-global zone
-    /// pair therefore returns the default action (deny). Compiler
-    /// sentinel for the "unknown zone" path.
+    /// #919/#922: snapshot rules whose zone names are absent from
+    /// `zone_name_to_id` are dropped by `parse_policy_state` (logged
+    /// and not indexed). A real `LAN→WAN` lookup therefore finds
+    /// nothing and falls through to the default action.
     #[test]
     fn evaluate_policy_unknown_zone_pair_returns_default_action() {
         let zones = test_zone_name_to_id();
@@ -738,8 +737,7 @@ mod tests {
             }],
             &zones,
         );
-        // The rule's zones map to id 0 (unknown). A real LAN→WAN lookup
-        // does not match anything in the index → default deny.
+        // Unknown-zone rule was not indexed; LAN→WAN lookup finds nothing → default deny.
         assert_eq!(
             evaluate_policy(
                 &state,

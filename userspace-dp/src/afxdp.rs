@@ -3250,11 +3250,11 @@ fn build_live_forward_request_from_frame(
         }
     });
     let mut decision = *decision;
+    // #919/#922: ID-keyed redirect — no `zone_id_to_name` round-trip.
     if decision.resolution.disposition == ForwardingDisposition::FabricRedirect
         && let Some(ingress_zone_id) = fabric_ingress_zone
-        && let Some(zone_name) = forwarding.zone_id_to_name.get(&ingress_zone_id)
         && let Some(zone_redirect) =
-            resolve_zone_encoded_fabric_redirect(forwarding, zone_name.as_str())
+            resolve_zone_encoded_fabric_redirect_by_id(forwarding, ingress_zone_id)
     {
         decision.resolution.src_mac = zone_redirect.src_mac;
     }
