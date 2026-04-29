@@ -1,6 +1,24 @@
 # #965: bucketed timer-wheel session GC (replace O(N) scan)
 
-Plan v8 — 2026-04-29. Addresses Codex round-7 (task-mok1ojg3-0esulj):
+Plan v9 — 2026-04-29. Addresses Codex round-8 wording fixes
+(task-mok24765-mmf95n; no blocking findings, all substantive
+claims verified correct):
+
+a. Sub-tick lag wording now gives explicit absolute bounds
+   (today's gated scan ≤ 1 s; wheel ≤ 2 s) and frames the
+   wheel's contribution as "additional deviation < 1 wheel-tick"
+   instead of "same worst-case lag".
+
+b. Stale "Drain in place into a local Vec" comment replaced with
+   "Drain the bucket allocation-free" to match the v8 no-Vec
+   redesign.
+
+c. "Not popped during this call" tightened to "not popped during
+   this bucket drain" with an explicit note that re-pushes into
+   later buckets WILL be popped within the same multi-tick
+   catch-up call (intentional and correct).
+
+v8 — Addresses Codex round-7 (task-mok1ojg3-0esulj):
 
 1. Acceptance gate 4a workload was self-contradictory: "10 %
    touched per second" produces K ≈ 5K (every active session pushes
@@ -11,26 +29,22 @@ Plan v8 — 2026-04-29. Addresses Codex round-7 (task-mok1ojg3-0esulj):
 
 2. Per-second-touch test classification was wrong: under sustained
    per-second touch on every session, popped entries are ALL stale
-   duplicates (canonical wheel_tick has advanced beyond every
-   bucket's scheduled_tick by the time the bucket is popped). So
-   `entries_re_bucketed = 0`, not = N; `entries_dropped_stale ≈ K`,
-   not `≈ N × 255`. Test rewritten with the correct classification.
+   duplicates. So `entries_re_bucketed = 0`, not = N;
+   `entries_dropped_stale ≈ K`, not `≈ N × 255`. Test rewritten
+   with the correct classification.
 
 3. Drain pseudocode allocated `Vec::with_capacity(due_count)` per
    pop, contradicting the "no per-second Vec allocation" claim.
    Redesigned: snapshot bucket length, iterate via `pop_front`
    exactly that many times, no scratch buffer needed. Re-pushed
-   entries land at the back of the VecDeque and are NOT popped
-   during this call (next rotation handles them).
+   entries land at the back of the VecDeque and are not popped
+   during this BUCKET drain (the next wheel rotation handles
+   same-bucket re-pushes; re-pushes into later buckets are
+   processed within the same multi-tick catch-up call).
 
 4. "No production caller can observe the difference" softened to
-   "same worst-case bounded lag, slightly different GC-phase
-   alignment". The wheel preserves the existing 1-s lag bound but
-   may pick up an expiration up to 1 tick later than today's gated
-   scan does, depending on relative phase of `target_tick` vs.
-   wheel cursor at expiration time. Bounded above by
-   `WHEEL_TICK_NS`, strictly less than today's `SESSION_GC_INTERVAL_NS`,
-   no user-visible regression.
+   "additional deviation < 1 wheel-tick" with explicit absolute
+   bounds — see point (a) above for the corrected wording.
 
 Earlier rounds remain in effect: round-3 (bucket-helper / pop
 race + alias `WheelEntry`), round-4 (memory math + alias borrow
@@ -552,11 +566,18 @@ pub fn expire_stale_entries(&mut self, now_ns: u64) -> Vec<ExpiredSession> {
                 // bucket at the new absolute target tick. The new
                 // bucket may be `bucket_idx` again (e.g. exactly
                 // 256s timeout repeats); that's fine because the
-                // outer `for _ in 0..due_count` loop iterates
+                // inner `for _ in 0..due_count` loop iterates
                 // exactly `due_count` times — re-pushed entries
-                // land at the back of the VecDeque and are NOT
-                // popped during this call. They get processed at
-                // the next wheel rotation.
+                // into THIS bucket land at the back of the
+                // VecDeque and are not popped during this BUCKET
+                // drain. They get processed at the next wheel
+                // rotation that visits this bucket. (Re-pushes
+                // into a LATER bucket — e.g. target_tick > current
+                // cursor + 1 — that the OUTER `while cursor_tick
+                // < now_tick` loop will visit in this same call
+                // ARE popped before the call returns; that case
+                // represents an entry re-bucketed forward into a
+                // tick that has already arrived.)
                 let new_target_tick = target_tick_for(
                     now_ns,
                     entry.last_seen_ns + entry.expires_after_ns,
@@ -795,19 +816,40 @@ continue to pass.
 3. Cluster smoke (HARD): no regression on the unloaded-session path.
    Run on `loss:xpf-userspace-fw0/fw1` (the userspace-dp HA cluster
    that is the default deploy target — NOT the legacy eBPF
-   `bpfrx-fw0/fw1` cluster) AND with CoS configured on every iperf3
-   forwarding-class. CoS state is wiped by `cluster-deploy`, so the
-   smoke runner must re-apply CoS classes before measurement.
-   - Apply CoS config covering all configured forwarding classes
-     (best-effort, expedited-forwarding, assured-forwarding, etc.)
-     before the first iperf3 run.
-   - iperf-c P=12 ≥ 22 Gb/s, repeated once per CoS class. Each run
-     must hit the gate independently.
-   - iperf-c P=1 ≥ 6 Gb/s, repeated once per CoS class.
-   - Verify `show class-of-service interface` reports the expected
-     class queues are non-zero on the egress side; an iperf3 run
-     that never lights up the queue counter is a config-misapplied
-     smoke that doesn't validate the CoS path.
+   `bpfrx-fw0/fw1` cluster) AND with CoS configured on every
+   iperf3 forwarding-class via `test/incus/cos-iperf-config.set`.
+   CoS state is wiped by `cluster-deploy`, so the smoke runner
+   must re-apply that fixture before measurement.
+
+   Per-class enumeration (matches the fixture's shaped rates,
+   ~10 % headroom for L2 overhead and TCP RTT variance):
+
+   | Class       | Port  | Shaped rate | P=12 gate     | P=1 gate     |
+   |-------------|-------|-------------|---------------|--------------|
+   | iperf-c     | 5203  | 25 g exact  | ≥ 22 Gb/s     | ≥ 6 Gb/s     |
+   | iperf-f     | 5206  | 19 g exact  | ≥ 17.1 Gb/s   | counter-only |
+   | iperf-e     | 5205  | 16 g exact  | ≥ 14.4 Gb/s   | counter-only |
+   | iperf-d     | 5204  | 13 g exact  | ≥ 11.7 Gb/s   | counter-only |
+   | iperf-b     | 5202  | 10 g exact  | ≥ 9.0 Gb/s    | counter-only |
+   | iperf-a     | 5201  | 1 g exact   | ≥ 0.9 Gb/s    | counter-only |
+   | best-effort | 5207  | 100 m exact | ≥ 90 Mb/s     | counter-only |
+
+   - "P=12 gate" runs `iperf3 -P 12 -p <port>` and asserts the
+     achieved Gb/s is ≥ the listed minimum. iperf-c is the
+     historical 22 Gb/s smoke; the others get a shaped-rate
+     gate scaled to their queue.
+   - "counter-only" rows still run an iperf3 P=1 against the
+     class but only assert that the egress class counter
+     (`show class-of-service interface reth0 unit 80`) lights
+     up by at least the iperf3 byte count. This validates the
+     classifier / queue path lit up without imposing a hard
+     throughput gate on classes whose shape would make a fixed
+     gate brittle.
+   - **Hard gate on iperf-c only.** The other rows are smoke for
+     "the queue path actually executed". A class whose iperf3
+     run lights up best-effort (queue 0) instead of the targeted
+     class is a config-misapplied smoke that does NOT validate
+     the refactor; treat it as a failure of step 3.
 4. **Mouse-latency gate** — TWO synthetic workloads (per Codex
    round-5 #2 + round-6 #4 / #5). The numbers below are the
    single source of truth; any other section that mentions "the
