@@ -3544,11 +3544,18 @@ const _: () = assert!(COS_ECN_MARK_THRESHOLD_DEN > 0);
 // policy `apply_cos_admission_ecn_policy` (and the threshold
 // constants `COS_ECN_MARK_THRESHOLD_NUM/_DEN`) stay here; they
 // move with admission to cos/admission.rs in Phase 2.
+//
+// Production code uses only the marker entry points; the
+// codepoint masks + parser + per-family helpers are referenced
+// only by `tx::tests` (admission tests + ECN unit tests that
+// stay here for Phase 1). The test-only imports are gated
+// behind `#[cfg(test)]` to avoid `unused_imports` warnings in
+// non-test builds (Copilot review on PR #976).
+use super::cos::{maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared};
+#[cfg(test)]
 use super::cos::ecn::{ethernet_l3, mark_ecn_ce_ipv4, mark_ecn_ce_ipv6, EthernetL3};
-use super::cos::{
-    maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared, ECN_CE, ECN_ECT_0, ECN_ECT_1, ECN_MASK,
-    ECN_NOT_ECT,
-};
+#[cfg(test)]
+use super::cos::{ECN_CE, ECN_ECT_0, ECN_ECT_1, ECN_MASK, ECN_NOT_ECT};
 
 /// Core ECN admission decision, factored out so tests can drive it
 /// without spinning up a full `BindingWorker` while still exercising

@@ -78,7 +78,13 @@ pub(in crate::afxdp) fn ethernet_l3(bytes: &[u8]) -> Option<EthernetL3> {
         // tag.
         0x8100 | 0x88A8 => {
             let inner_off = ETH_HDR_LEN + VLAN_TAG_LEN;
-            if bytes.len() < inner_off + 2 {
+            // Inner ethertype lives at bytes[inner_off-2..inner_off],
+            // so we only need `bytes.len() >= inner_off`. The downstream
+            // markers (`mark_ecn_ce_ipv4` / `_ipv6`) have their own
+            // bounds checks for the IP header itself; the parser must
+            // not over-reject frames that ARE long enough to identify
+            // the L3 family (Copilot review on PR #976).
+            if bytes.len() < inner_off {
                 return None;
             }
             let inner = u16::from_be_bytes([bytes[inner_off - 2], bytes[inner_off - 1]]);
@@ -175,8 +181,10 @@ pub(in crate::afxdp) fn mark_ecn_ce_ipv6(bytes: &mut [u8], l3_offset: usize) -> 
     true
 }
 
-/// Dispatch ECN marking based on the L3 protocol family stamped on
-/// the TxRequest. Returns true iff the packet was marked.
+/// Dispatch ECN marking based on the L3 protocol family parsed
+/// from the TxRequest's bytes (NOT the `expected_addr_family`
+/// sideband — see the dispatch body for the rationale). Returns
+/// true iff the packet was marked.
 #[inline]
 pub(in crate::afxdp) fn maybe_mark_ecn_ce(req: &mut TxRequest) -> bool {
     // Dispatch off the parsed Ethernet header, not the sideband

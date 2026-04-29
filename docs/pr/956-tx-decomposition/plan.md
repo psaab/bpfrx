@@ -334,33 +334,38 @@ and is reused; do not add a duplicate.
   generated code if visibilities and `#[inline]` attributes are
   preserved.
 
-## Files touched
+## Files touched (as actually shipped)
 
-- **NEW** `userspace-dp/src/afxdp/cos/ecn.rs`: ~250 LOC (moved
-  code + 15 tests).
+After 6 rounds of plan iteration, the implementation took a
+narrower cut than the plan originally specified: the production
+code moved to `cos/ecn.rs`, but the 15 ECN unit tests + the 5
+shared fixtures stayed in `tx::tests`. They reach the moved items
+via the new `use super::cos::{...}` import. This avoided a same-PR
+fixture relocation while admission tests (which share those
+fixtures) still live in `tx.rs`. Test reorganization is deferred
+to Phase 2 alongside the admission move (Copilot review on
+PR #976 flagged the original plan-text vs implementation drift).
+
+- **NEW** `userspace-dp/src/afxdp/cos/ecn.rs`: ~210 LOC of
+  production code only (no tests in this Phase 1).
 - **NEW** `userspace-dp/src/afxdp/cos/mod.rs`: ~5 LOC — `mod ecn;`
   plus `pub(super) use ecn::{maybe_mark_ecn_ce,
   maybe_mark_ecn_ce_prepared, ECN_MASK, ECN_NOT_ECT, ECN_ECT_0,
-  ECN_ECT_1, ECN_CE};`. (Codex round-5 #2 caught a duplicate entry
-  in v5.)
-- `userspace-dp/src/afxdp/test_fixtures.rs` (EXISTS, currently
-  ~663 LOC at this commit; round-5 #3 corrected the v4 ~860 LOC
-  estimate): EXTENDED with the ~80 LOC of shared fixtures moved
-  out of `tx::tests` (`build_ipv4_test_packet`,
-  `build_ipv6_test_packet`, `compute_ipv4_header_checksum`,
-  `insert_single_vlan_tag`, `test_prepared_item_in_umem`). Existing
-  `pub(super)` visibility pattern preserved.
-- `userspace-dp/src/afxdp/tx.rs`: removes ~250 LOC (moved code +
-  marker tests), removes ~80 LOC (fixtures moved to `test_fixtures.rs`),
-  adds `use` statements pointing at `cos::{...}` and
-  `test_fixtures::*`. Net: ~330 LOC smaller.
+  ECN_ECT_1, ECN_CE};`.
+- `userspace-dp/src/afxdp/tx.rs`: removes the ~210 LOC of moved
+  production code; adds `use super::cos::{maybe_mark_ecn_ce,
+  maybe_mark_ecn_ce_prepared}` for the production marker calls
+  and `#[cfg(test)] use super::cos::ecn::{...}` /
+  `#[cfg(test)] use super::cos::{ECN_*}` for the test-only
+  imports (Copilot review #4 caught that test-only items were
+  reachable in non-test builds and would trigger
+  `unused_imports`). Marker tests + shared fixtures stay in
+  `tx::tests`.
 - `userspace-dp/src/afxdp.rs`: adds `#[path = "afxdp/cos/mod.rs"]
   mod cos;` (private, explicit path, matching the existing
-  `#[path = "afxdp/tx.rs"] mod tx;` pattern at line 97 — Codex
-  round-5 #1 caught a stale `pub(super) mod cos;` residue in v4).
-  The existing `#[cfg(test)] #[path = "afxdp/test_fixtures.rs"]
-  mod test_fixtures;` line at `afxdp.rs:93-94` already declares the
-  test_fixtures module — DO NOT add a duplicate (Codex round-3 #3).
+  `#[path = "afxdp/tx.rs"] mod tx;` pattern at line 97).
+- `userspace-dp/src/afxdp/test_fixtures.rs`: **NOT modified in
+  Phase 1**. Fixture relocation deferred (see preface above).
 
 ## Tests
 
@@ -385,11 +390,16 @@ All **15 existing tests** for the moved code must continue to pass
 The **15 admission-path tests** that exercise the marker indirectly
 through `apply_cos_admission_ecn_policy` (including the Prepared
 UMEM path and VLAN Prepared path) STAY in `tx::tests` because the
-admission policy stays in `tx.rs` (see Phase 1 scope). They depend
-on shared fixtures that this PR moves out of `tx::tests` into the
-existing `afxdp::test_fixtures` module (per the Test fixtures
-section above), so both staying admission tests and moving marker
-tests can `use crate::afxdp::test_fixtures::*;`.
+admission policy stays in `tx.rs` (see Phase 1 scope). The 15 ECN
+marker tests and the 5 shared fixtures (`build_ipv4_test_packet`,
+`build_ipv6_test_packet`, `compute_ipv4_header_checksum`,
+`insert_single_vlan_tag`, `test_prepared_item_in_umem`) ALSO stay
+in `tx::tests` for this Phase 1 (Copilot review on PR #976 caught
+the plan/implementation drift here — original plan text said
+fixtures move to `afxdp::test_fixtures`, but the actual Phase 1
+shipped without that move to keep the diff minimal while
+admission tests still need the same fixtures). Fixture relocation
+is deferred to Phase 2 alongside the admission move.
 
 No new tests required — the refactor is structure-only and the
 existing test suite has dense branch coverage.
