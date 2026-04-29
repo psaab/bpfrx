@@ -1,11 +1,19 @@
 # #965: bucketed timer-wheel session GC (replace O(N) scan)
 
-Plan v4 — 2026-04-29. Addresses Codex round-3 (task-mojzzne7-vm90vz):
-two real bugs — bucket helper semantics inconsistent (relative vs
-absolute index), and a same-bucket-reinsert race during pop (drain
-takes the bucket, re-bucket push lands in the drained slot, then
-the empty `due` overwrites it). Alias pseudocode still pushed
-`SessionKey` instead of `WheelEntry`.
+Plan v6 — 2026-04-29. Addresses Codex round-5
+(task-mok0rvip-n6iba1): per-tick complexity model conflated
+"sessions / 256" with "live wheel entries / 256". Under sustained
+per-second touch the wheel can hold up to N × 256 entries (mostly
+stale duplicates), giving ~N entries per popped bucket — not N/256.
+Plan now distinguishes realistic-mixed vs. sustained-per-second-touch
+cost regimes, fixes the contradictory "low single-digit GB" claim
+against the 12.3 GB ceiling at 1M × per-second-touch, removes the
+residual ~30× slab claim, and adds an explicit acceptance gate for
+the sustained-per-second-touch worst-plausible hot-path workload.
+
+Earlier iterations (round 3 fixed the bucket-helper / pop race and
+the alias `WheelEntry` payload; round 4 fixed memory math and the
+alias borrow shape) remain in effect.
 
 ## Investigation findings (Claude, on commit 08ff1838)
 
@@ -251,8 +259,15 @@ accumulate over the full session lifetime.
 #964 (slot-handle compaction) replaces the 40-B `SessionKey` with a
 ~4-B slot index, taking `WheelEntry` from 48 B to ~16 B — roughly
 **3× smaller** (not 30×; the 30× figure assumed the 248-B miscount).
-That follow-up is still worth doing, but #965 alone keeps the
-absolute memory ceiling at low single-digit GB even at 1M sessions.
+That follow-up is meaningful at scale: at 1M sessions × per-second
+touch, 12.3 GB drops to ~4 GB. Active deletion (per Out of scope)
+takes that further by bounding live entries to N (one per
+session) — at 1M × 16 B = ~16 MB. Either follow-up is the right
+venue for solving the ceiling at the per-second-touch worst case;
+#965 alone delivers the realistic-deployment win and the
+per-tick-bound shape, with a documented memory ceiling that grows
+proportionally to N × WHEEL_BUCKETS under adversarial touch
+patterns.
 
 **Decision**: ship #965 with the corrected algorithm + this
 honest memory math. Document the "every-session-touched-every-tick
@@ -269,44 +284,112 @@ boundary all need explicit pseudocode.
 
 Decision per Codex finding #2: **no per-tick cap**. The cap was a
 flawed knob — at 5K/tick when due-rate is ≥5K/s the backlog grows
-unbounded. Two options remained:
+unbounded. We pay the bucket cost. Multi-level wheels and active
+deletion are deferred to follow-ups (see Out of scope).
 
-(a) Multi-level wheel — extra complexity and a follow-up.
-(b) Just pay the bucket cost. Under the assumption that scheduled
-    ticks are spread roughly uniformly across the wheel (the
-    typical case: sessions installed and touched at independent
-    times produce expirations spread across `WHEEL_BUCKETS`
-    distinct ticks), per-tick work is `O(N / WHEEL_BUCKETS)`. At
-    1M sessions / 256-tick wheel that's ~4K entries per bucket;
-    at ~1.7 µs per entry (HashMap lookup + state update) the
-    per-tick cost is **~7 ms under uniform distribution**, well
-    under sub-ms for realistic loads of ≤100K sessions.
+#### Per-tick cost model (corrected per Codex round-5 #1)
 
-We choose (b). Worst-case caveat: this is **average-case**, not
-absolute worst-case. Adversarial / synthetic workloads that bunch
-all installs into a single tick (all sessions installed at boot
-with identical timeouts, then idle) place every entry in one
-bucket. That bucket sees `O(N)` work at the moment the wheel sweep
-reaches it. We accept this because (i) it requires a synthetic
-load shape — real traffic does not install N sessions in one
-tick, (ii) the cost is paid exactly once per 256 s at most for
-that bucket, and (iii) the resulting latency spike (≈ same as
-today's StW for that one tick) is no worse than today's pre-#965
-behavior, and is dramatically better for the other 255 ticks.
+Per-tick work = `O(K)` where `K` is the number of `WheelEntry`s
+sitting in the popped bucket at that moment. Each entry costs:
 
-The plan is honest: this is *bounded per-bucket* work, not
-*fixed per-tick* work. The "Stop the World" #965 issue goes away
-because per-tick work is now `O(N / WHEEL_BUCKETS)` under uniform
-distribution instead of `O(N)` every tick.
+  - 1 FxHashMap lookup on `self.sessions[key]` (~80–150 ns)
+  - 1 tick-comparison branch (entry-gone / stale / expired / re-bucket)
+  - In the stale and gone cases: O(1) drop and continue
+  - In the expired case: 1 HashMap remove + delta push
+  - In the re-bucket case: 1 HashMap mut + 1 wheel push
 
-The acceptance-gate "mouse-latency" check (Acceptance gate §4
-below) installs sessions at a *uniform* rate over many ticks
-before triggering GC and asserts p99 GC-tick wall time ≤ 1 ms
-under a 50K-session synthetic load. That gate is explicit about
-the uniform-distribution shape; clustered-install adversarial
-shapes (every session installed in the same tick) are out of
-scope for #965 and tracked under #964 / multi-level wheel
-follow-up.
+Per-entry cost is dominated by the HashMap lookup. Realistic
+estimate: ~100 ns per stale/gone entry, ~300 ns per expired/re-
+bucketed entry.
+
+`K` is bounded by the number of pushes that landed in this bucket
+since it was last popped (one wheel rotation = 256 s ago) minus
+those popped at the start of this rotation. Push frequency per
+session is throttled to "1 per second-aligned `scheduled_tick`
+that the canonical `wheel_tick` advances onto". So under the
+**worst plausible hot-path workload — every session touched at
+least once per second**, each session contributes one push per
+second, and over a full 256-s rotation produces 256 entries (255
+of which are stale duplicates by the time their bucket is popped).
+
+Concretely:
+
+  total_wheel_entries ≤ Σ over sessions of
+                        (distinct `scheduled_tick`s pushed in last 256 s)
+                      ≤ N_sessions × min(touches_per_256s, 256)
+
+For a population with **uniform per-second touch on every session**:
+
+  total_wheel_entries ≈ N_sessions × 256
+  K (per bucket)      ≈ N_sessions
+  per-tick cost       ≈ N_sessions × 100 ns
+
+| N (sessions) | per-second touch | mostly idle (avg ≤5 active ticks/sess) |
+|---|---|---|
+| 10K | 1 ms | 200 µs |
+| 100K | **10 ms** | 2 ms |
+| 1M | **100 ms** | 20 ms |
+
+#### What this means for "Stop the World goes away"
+
+Today's StW does ~100 ms once per `SESSION_GC_INTERVAL_NS = 1 s`
+at 1M sessions. The wheel does **the same total work over the
+1 s window**, but spread across 256 ticks at the same per-second
+*shape* — so each tick still has to drain its bucket at full
+size. **The wheel does not dramatically reduce the worst-case
+tick wall-time under sustained per-second touch on every
+session**: at 1M sessions × per-second touch, both today's StW
+and the wheel produce ~100 ms of GC work per second, just paid in
+different shapes (one 100-ms blast vs. ~256 × ~0.4-ms drains —
+but each of those 256 drains visits a *different* bucket, and
+only ONE of them holds the per-second-touch crowd).
+
+The win, restated honestly:
+
+1. **Realistic mixed-traffic deployments** (most sessions idle,
+   some bursty): per-tick cost drops from O(N) to
+   O(N × distinct_active_ticks / 256), which at 100K sessions is
+   sub-ms — a **>50× improvement** in the typical case.
+
+2. **All-active per-second-touch on every session at 100K**:
+   per-tick cost is ~10 ms, vs. today's ~10 ms StW (same scale).
+   The win here is *not* a wall-time reduction; it's that the
+   work is bounded per-tick rather than appearing as a single
+   blocking call. Mouse-latency p99 stops correlating with the
+   GC interval.
+
+3. **All-active per-second-touch on every session at 1M**:
+   per-tick cost is ~100 ms. **This is the same wall time as
+   today's StW.** The wheel does not solve this case; it tracks
+   under "active deletion" and "multi-level wheel" follow-ups.
+   At this scale we recommend operators tune
+   `SESSION_GC_INTERVAL_NS` higher or land #964 first.
+
+4. **Same-bucket install bursts** (synthetic: all N sessions
+   installed in one tick, then idle): bucket sees O(N) work *once*
+   per 256 s, then idles. No worse than today's StW for that one
+   tick; better for the other 255 ticks.
+
+#### Acceptance gate (corrected per Codex round-5 #2)
+
+The mouse-latency gate (Acceptance gates §4) needs two distinct
+synthetic workloads:
+
+A. **Realistic mostly-idle**: 50K sessions, ~10% touched per
+   second (5K touches/s), the rest idle. Assert p99 GC-tick wall
+   time ≤ 1 ms. This is the realistic-deployment claim.
+
+B. **Sustained per-second touch (worst-plausible hot path)**:
+   100K sessions, EVERY session touched once per second for ≥
+   300 s before assertion. Assert p99 GC-tick wall time ≤ 15 ms
+   (matches the ~10 ms model + headroom). This proves the wheel
+   bounds per-tick work and prevents StW spikes even under the
+   worst sustained refresh pattern; it does NOT claim a
+   wall-time win at this load.
+
+Adversarial same-bucket install bursts are out of scope for #965
+and tracked under the active-deletion / multi-level-wheel follow-
+ups.
 
 ```rust
 pub fn expire_stale_entries(&mut self, now_ns: u64) -> Vec<ExpiredSession> {
@@ -472,14 +555,16 @@ amortizes across the bucket lifetime (up to 256 ticks).
 
 Drop the "no allocations on the hot path" claim entirely. The
 honest phrasing is: "amortized O(1) push, occasional reallocation
-during bucket warmup". The expected number of bucket-reallocations
-across the wheel's first 256 ticks is `O(WHEEL_BUCKETS × log(B_avg))`
-≈ 256 × ~5 = ~1300 reallocations total during warm-up. Each is a
-VecDeque buffer copy of size ~B/2 — for B=3K that's 3K × 48 B =
-~144 KB per realloc × 1300 reallocs = ~180 MB of memory churn
-during warm-up. Spread over 256 ticks (256 s wall time), that's
-~720 KB/s of allocator traffic. Negligible vs the per-packet hot
-path.
+during bucket warmup". `VecDeque` doubles its backing buffer
+geometrically, so for a steady-state size of ~B entries it
+reallocates `~log2(B)` times during warm-up; each realloc copies
+*all* current elements (so the realloc just before reaching
+capacity B copies up to B−1 elements). For B=3K and B_avg ≈ B/2
+across the warm-up, the per-bucket warm-up moves ≈ B − 1 ≈ 3K
+elements total. Across 256 buckets that's 256 × 3K = ~768K
+element-moves during warm-up at 48 B each ≈ ~36 MB total. Spread
+over 256 ticks (256 s wall time), that's ~150 KB/s of allocator
+traffic. Negligible vs the per-packet hot path.
 
 After warm-up (after first wheel rotation), each bucket's VecDeque
 has settled at ~max-bucket-size capacity. New pushes don't grow.
@@ -543,6 +628,14 @@ buffers grow to fit avg load × geometric headroom. For typical
   sessions all with same expiration; advance time past expiration;
   verify expire_stale_entries returns all 50K in a single call
   (no per-tick cap; one tick = one bucket = O(B) work, not capped).
+- `wheel_per_second_touch_bound_per_tick_work` (Codex round-5 #2):
+  install N=10K sessions, then touch every session once per
+  second for 300 s of simulated time before measuring. After
+  warm-up, advance one tick and measure `wheel_pop_one_bucket`
+  wall time. Assert ≤ 5 ms (allows 2.5× headroom over the 100 ns
+  × 10K = 1 ms model). This catches regressions where a refactor
+  inadvertently makes `lookup_with_origin` or `update_session`
+  add multiple wheel pushes per touch.
 - `wheel_alias_lookup_does_not_double_borrow_self`: compile-time
   test that the alias path's `lookup_with_origin` body type-checks
   (i.e. the &mut self.sessions borrow is scoped before
@@ -559,16 +652,29 @@ continue to pass.
 ## Acceptance gates
 
 1. `cargo build --release` clean.
-2. `cargo test --release` ≥ baseline (851 post-#921) + 8 new = 859.
+2. `cargo test --release` ≥ baseline (851 post-#921) + 10 new = 861.
 3. Cluster smoke (HARD): no regression on the unloaded-session path.
    - iperf-c P=12 ≥ 22 Gb/s
    - iperf-c P=1 ≥ 6 Gb/s
-4. **Mouse-latency gate** (the actual #965 win): when the daemon
-   is loaded with ≥10K sessions and GC ticks fire under load, p99
-   mouse latency stays within ±5% of the unloaded baseline. Today
-   without this PR, p99 spikes correlate with GC ticks. Hard to
-   reproduce in a 30s smoke run; we'll instrument the GC-tick
-   wall time and assert ≤1 ms p99 under synthetic 50K-session load.
+4. **Mouse-latency gate** — TWO synthetic workloads (per Codex
+   round-5 #2):
+
+   4a. **Realistic mostly-idle**: 50K sessions, ~10% touched per
+       second (5K touches/s), the rest idle for ≥ 300 s before
+       measurement. Assert p99 GC-tick wall time ≤ 1 ms. This is
+       the typical-deployment win.
+
+   4b. **Sustained per-second touch**: 10K sessions, EVERY session
+       touched once per second for ≥ 300 s. Assert p99 GC-tick
+       wall time ≤ 5 ms (matches the 100 ns × 10K = 1 ms model
+       with 5× headroom). This proves the wheel keeps per-tick
+       work bounded under the hot-path refresh shape; it does NOT
+       claim a wall-time win at this load — see "Per-tick cost
+       model" in §Per-tick GC work.
+
+   Both gates must hold. Adversarial same-bucket install bursts
+   are out of scope for #965 and tracked under the active-
+   deletion / multi-level-wheel follow-ups (see Out of scope).
 5. Codex hostile review: AGREE-TO-MERGE.
 6. Gemini adversarial review: AGREE-TO-MERGE.
 
@@ -602,10 +708,18 @@ Risk areas:
   `WheelEntry { SessionKey, scheduled_tick }` as the bucket
   payload. After #964, the payload becomes
   `WheelEntry { SlotHandle, scheduled_tick }` — same structure,
-  ~30× smaller. The path between #965 and #964 is mechanical.
+  ~3× smaller (16 B vs 48 B). The path between #965 and #964 is
+  mechanical.
+- Active wheel-entry deletion (intrusive doubly-linked list per
+  bucket with back-reference in SessionEntry). Would bound live
+  wheel entries at exactly N (one per session) instead of up to
+  N × 256 under sustained per-tick touch. Significantly more code;
+  defer to a follow-up if the per-tick cost under adversarial
+  workloads becomes a problem.
 - Multi-level wheels (hashed timing wheels): the single wheel +
   re-bucket-on-still-alive is enough for the typical 100K-session
   / ≤300 s timeout case. Multi-level is a follow-up if profiling
-  shows the per-bucket spike (≤7 ms at 1M sessions) is an issue.
+  shows the per-bucket spike under sustained per-tick touch
+  (analyzed below) is an issue.
 - Per-protocol expire policy refactor: timeouts are still computed
   from `key.protocol` and `tcp_flags` at insert/update time.
