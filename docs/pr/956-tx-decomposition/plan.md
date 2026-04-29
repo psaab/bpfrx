@@ -1,6 +1,24 @@
 # #956 Phase 1: extract cos/ecn.rs from tx.rs (establish the cos/ submodule)
 
-Plan v4 — 2026-04-29. Addresses Codex round-3 (task-mokbrce8-p76zar):
+Plan v5 — 2026-04-29. Addresses Codex round-4 (task-mokc037q-sjefmd):
+three stale-text findings.
+
+A. Module declaration style: v4 said `pub(super) mod cos;` and
+   claimed to match `pub(super) mod tx;` — but the existing local
+   style is `#[path = "afxdp/tx.rs"] mod tx;` (private, explicit
+   path). Now matches: `#[path = "afxdp/cos/mod.rs"] mod cos;`.
+
+B. Stale fixture-history at the round-1 changelog still said the
+   plan "keeps fixtures in `tx::tests`" — superseded by v2+. Now
+   says fixtures move to the existing `afxdp::test_fixtures`
+   module (with a back-reference to the corrected actionable
+   section).
+
+C. v3-changelog summary said "8-phase plan ends at builders" —
+   wrong, builders is Phase 6, queue_service Phase 7, cross_binding
+   Phase 8. Corrected.
+
+v4 — Addresses Codex round-3 (task-mokbrce8-p76zar):
 three findings.
 
 i. ECN codepoint masks (`ECN_MASK`, `ECN_NOT_ECT`, `ECN_ECT_0`,
@@ -69,9 +87,11 @@ five blocking findings, all fixed.
    `_rejects_unknown_ethertype`).
 
 4. Test fixtures (`build_ipv4_test_packet` etc.) are shared between
-   moving marker tests AND staying admission tests. Plan now keeps
-   fixtures in `tx::tests` (made `pub(super)`) so `cos::ecn::tests`
-   can import them. Fixtures re-evaluate their home in Phase 2.
+   moving marker tests AND staying admission tests. v2 superseded
+   the v1 plan and now moves the shared fixtures out of `tx::tests`
+   into the existing `afxdp::test_fixtures` module (see the
+   actionable Test fixtures section in v3+ for the corrected
+   approach).
 
 5. Path import: `super::ethernet` is wrong from inside `cos::ecn`.
    Use `crate::afxdp::ethernet::{ETH_HDR_LEN, VLAN_TAG_LEN}` (or
@@ -85,7 +105,8 @@ Plus future-phase ordering corrected:
   service depends on `cos_queue_push/pop` and the `CoSBatch` enum
   having a clear home.
 
-Now an 8-phase plan (Phase 1 = ECN; ends at builders).
+Now an 8-phase plan (Phase 1 = ECN; Phase 6 = builders; Phase 7 =
+queue_service; Phase 8 = cross_binding).
 
 ## Investigation findings (Claude, on commit 76384e9a)
 
@@ -271,15 +292,23 @@ DO NOT add a duplicate `#[cfg(test)] mod test_fixtures;` declaration
 in `afxdp.rs` — the existing `#[cfg(test)] #[path = ...] mod
 test_fixtures;` line at `afxdp.rs:93-94` is already in place.
 
-### Module declaration
+### Module declaration (Codex round-4 #1)
 
-Update `userspace-dp/src/afxdp.rs` to declare the new submodule:
+Match the existing local style at `afxdp.rs:97`:
 ```rust
-pub(super) mod cos;
+#[path = "afxdp/tx.rs"]
+mod tx;
 ```
 
-(or whatever visibility matches the existing `pub(super) mod tx;`
-pattern — investigation will pin the exact form.)
+So the new `cos` module declaration is:
+```rust
+#[path = "afxdp/cos/mod.rs"]
+mod cos;
+```
+
+Private (no `pub`), explicit path. The `#[cfg(test)] #[path = ...]
+mod test_fixtures;` declaration at `afxdp.rs:93-94` already exists
+and is reused; do not add a duplicate.
 
 ### What this is NOT
 
