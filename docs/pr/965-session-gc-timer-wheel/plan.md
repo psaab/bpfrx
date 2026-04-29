@@ -212,20 +212,27 @@ if now_ns.saturating_sub(self.last_gc_ns) < SESSION_GC_INTERVAL_NS {
 }
 ```
 
-with `SESSION_GC_INTERVAL_NS = 1 s`, so today's scan also has
-a ~1 s expiration lag in production. Both the existing scan and
-the wheel are bounded by the same worst-case lag (one wheel-
-tick = one second). What CAN differ is the GC-phase alignment:
-today's scan picks an entry up the moment the gate releases
-after expiration, while the wheel picks it up at the next bucket
-visit, which can be up to one tick later depending on the
-relative phase of the entry's `target_tick` vs. the wheel cursor
-at expiration time. The honest claim is therefore "same worst-
-case bounded lag, slightly different phase alignment", not "no
-production caller can observe the difference". The behavioral
-deviation is bounded above by `WHEEL_TICK_NS = 1 s` and is
-strictly less than the existing GC interval's resolution, so no
-documented user-visible behavior changes.
+with `SESSION_GC_INTERVAL_NS = 1 s`, so today's scan already has
+up to ~1 s of lag in production. The wheel can add **up to one
+more tick** on top of that depending on the relative phase of
+the entry's `target_tick` vs. the wheel cursor at expiration
+time. So the honest bound is:
+
+  - Today's scan: absolute expiry-detection lag ≤ 1 s
+    (`SESSION_GC_INTERVAL_NS`).
+  - Wheel: absolute expiry-detection lag ≤ 2 s (existing 1 s
+    gate lag + up to one wheel-tick of phase deviation).
+  - Additional deviation introduced by the wheel vs. today:
+    **strictly less than one wheel-tick = 1 s.**
+
+That additional ≤1 s deviation is the only behavioral change
+the wheel introduces. No documented user-visible behavior is
+specified at sub-second precision (timeout knobs are second-
+granular in Junos config), so the deviation is below the
+resolution at which any operator can observe it; but the
+correct phrasing is "additional deviation < 1 tick" / "absolute
+expiry can approach 2 s in the worst phase", not "same worst-
+case lag".
 
 The existing `expiry_boundary_strict_greater_than` test asserts
 the exact-boundary case (`now == last_seen + expires_after`,
@@ -486,10 +493,10 @@ pub fn expire_stale_entries(&mut self, now_ns: u64) -> Vec<ExpiredSession> {
     // after init is a no-op (loop body runs zero times).
     while self.wheel.cursor_tick < now_tick {
         let bucket_idx = bucket_for_tick(self.wheel.cursor_tick);
-        // Drain in place into a local Vec, then process. We cannot
-        // hold a `&mut VecDeque` from the wheel and simultaneously
-        // call `self.wheel.buckets[new_bucket].push_back(...)` for
-        // a re-bucket whose target may equal `bucket_idx`. Round-3
+        // Drain the bucket allocation-free. We cannot hold a
+        // `&mut VecDeque` from the wheel and simultaneously call
+        // `self.wheel.buckets[new_bucket].push_back(...)` for a
+        // re-bucket whose target may equal `bucket_idx`. Round-3
         // caught the v3 same-bucket-reinsert race that arose from
         // `mem::take` followed by `buckets[idx] = due` overwriting
         // re-bucketed entries. Round-7 (#3) caught that the v4
@@ -501,10 +508,20 @@ pub fn expire_stale_entries(&mut self, now_ns: u64) -> Vec<ExpiredSession> {
         // Allocation-free design: snapshot the bucket length BEFORE
         // iterating, then `pop_front` exactly that many times. Any
         // `push_back` re-bucket targeting this same bucket lands at
-        // the back of the VecDeque and is NOT popped during this
-        // call (we stop after `due_count` iterations). The next
-        // wheel rotation visits this bucket and processes the
-        // re-pushed entries normally.
+        // the back of the VecDeque and is NOT popped during THIS
+        // BUCKET DRAIN (the inner `for _ in 0..due_count` loop
+        // stops after `due_count` iterations). The next wheel
+        // rotation that visits this bucket processes the re-pushed
+        // entries normally. NOTE: a single `expire_stale_entries`
+        // call may catch up multiple ticks (the outer `while
+        // cursor_tick < now_tick` advances the cursor across
+        // several buckets). A re-push from bucket A whose target
+        // lands in a later bucket B that the OUTER loop will visit
+        // in this same call IS popped before the call returns —
+        // that's intentional and correct (it represents an entry
+        // that was re-bucketed forward into a tick that has already
+        // arrived). Only same-bucket re-pushes are deferred to the
+        // next wheel rotation, by design.
         let due_count = self.wheel.buckets[bucket_idx].len();
         for _ in 0..due_count {
             let entry_snap = self.wheel.buckets[bucket_idx]
