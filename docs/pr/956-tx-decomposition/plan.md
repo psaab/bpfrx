@@ -1,6 +1,24 @@
 # #956 Phase 1: extract cos/ecn.rs from tx.rs (establish the cos/ submodule)
 
-Plan v3 — 2026-04-29. Addresses Codex round-2 (task-mokbj8l7-x8capj):
+Plan v4 — 2026-04-29. Addresses Codex round-3 (task-mokbrce8-p76zar):
+three findings.
+
+i. ECN codepoint masks (`ECN_MASK`, `ECN_NOT_ECT`, `ECN_ECT_0`,
+   `ECN_ECT_1`, `ECN_CE`) cannot stay file-private to `cos::ecn`
+   because 15 admission tests in `tx::tests` use them directly.
+   Now `pub(in crate::afxdp)` and re-exported from `cos/mod.rs`.
+
+ii. Stale text in the Tests section still said fixtures "stay in
+    `tx::tests`" — contradicted the corrected Test-fixtures
+    section. Now consistent: fixtures move to the existing
+    `afxdp::test_fixtures` module.
+
+iii. `test_fixtures.rs` already EXISTS in the repo (declared at
+    `afxdp.rs:93-94` via `#[path = ...]` form). v3 said NEW;
+    v4 says EXTEND, and notes not to add a duplicate `mod`
+    declaration.
+
+v3 — Addresses Codex round-2 (task-mokbj8l7-x8capj):
 four blocking findings + one stale-text fix.
 
 a. Visibility re-export model corrected. `pub(super) use ecn::{...}`
@@ -194,9 +212,16 @@ re-export is a convenience so call sites can write
 
 The internal `EthernetL3` enum, `ethernet_l3` parser, and the
 `mark_ecn_ce_ipv4`/`_ipv6` helpers stay file-private (no `pub`)
-since they have no callers outside `cos::ecn` after the move. The 5
-codepoint masks (`ECN_MASK`, `ECN_NOT_ECT`, `ECN_ECT_0`, `ECN_ECT_1`,
-`ECN_CE`) likewise stay file-private.
+since they have no callers outside `cos::ecn` after the move.
+
+**ECN codepoint masks (Codex round-3 #1)**: the 5 codepoint masks
+(`ECN_MASK`, `ECN_NOT_ECT`, `ECN_ECT_0`, `ECN_ECT_1`, `ECN_CE`)
+ARE used by 15 admission tests that stay in `tx::tests` (at
+`tx.rs:15612` and `tx.rs:16462`). They cannot stay file-private to
+`cos::ecn`. Make them `pub(in crate::afxdp)` so internal tests and
+admission code can still import them via
+`use crate::afxdp::cos::ecn::{ECN_MASK, ...};` (or via a
+`pub(super) use ecn::{ECN_MASK, ...};` re-export from `cos/mod.rs`).
 
 ### Path imports (Codex round-1 #5)
 
@@ -219,29 +244,32 @@ flagged that my proposed fix (`pub(super) fn` inside
 cross-importing from another module's `mod tests` is brittle even
 with `pub(super)` on the helpers.
 
-**Decision (Codex round-2 #2 preferred fix)**: introduce a new
-`#[cfg(test)] mod test_fixtures;` at `userspace-dp/src/afxdp/`
-(sibling of `tx.rs` and the new `cos/`). It carries the shared
-fixture functions with `pub(in crate::afxdp)` visibility:
+**Decision (Codex round-2 #2 preferred fix, refined per round-3 #3)**:
+extend the EXISTING `userspace-dp/src/afxdp/test_fixtures.rs`
+module (already declared at `afxdp.rs:93-94` via
+`#[cfg(test)] #[path = "afxdp/test_fixtures.rs"] mod test_fixtures;`).
+Move the shared fixtures out of `tx::tests` into
+`test_fixtures.rs`, matching the existing `pub(super)` visibility
+pattern used by `forwarding_snapshot`, `nat_snapshot`, etc.:
 
 ```rust
-// userspace-dp/src/afxdp/test_fixtures.rs
-#![cfg(test)]
-pub(in crate::afxdp) fn build_ipv4_test_packet(...) -> Vec<u8> { ... }
-pub(in crate::afxdp) fn build_ipv6_test_packet(...) -> Vec<u8> { ... }
-pub(in crate::afxdp) fn compute_ipv4_header_checksum(hdr: &[u8]) -> u16 { ... }
-pub(in crate::afxdp) fn insert_single_vlan_tag(...) -> Vec<u8> { ... }
-pub(in crate::afxdp) fn test_prepared_item_in_umem(...) -> ... { ... }
+// userspace-dp/src/afxdp/test_fixtures.rs (extended)
+pub(super) fn build_ipv4_test_packet(...) -> Vec<u8> { ... }
+pub(super) fn build_ipv6_test_packet(...) -> Vec<u8> { ... }
+pub(super) fn compute_ipv4_header_checksum(hdr: &[u8]) -> u16 { ... }
+pub(super) fn insert_single_vlan_tag(...) -> Vec<u8> { ... }
+pub(super) fn test_prepared_item_in_umem(...) -> ... { ... }
 ```
 
-`tx::tests` and `cos::ecn::tests` both import via
-`use crate::afxdp::test_fixtures::*;`. This is robust against
-future moves and works with the existing `mod tests` private-by-
-default convention.
+`pub(super)` here exposes the items to `afxdp` (the parent of
+`afxdp::test_fixtures`); `afxdp::tx::tests` and
+`afxdp::cos::ecn::tests` reach them via
+`use crate::afxdp::test_fixtures::*;` (descendants of `afxdp` can
+access items visible to `afxdp` itself).
 
-The fixtures get moved out of `tx::tests` in this PR (small,
-self-contained move) so the marker tests can reach them from
-`cos::ecn::tests`.
+DO NOT add a duplicate `#[cfg(test)] mod test_fixtures;` declaration
+in `afxdp.rs` — the existing `#[cfg(test)] #[path = ...] mod
+test_fixtures;` line at `afxdp.rs:93-94` is already in place.
 
 ### Module declaration
 
@@ -269,17 +297,25 @@ pattern — investigation will pin the exact form.)
 - **NEW** `userspace-dp/src/afxdp/cos/mod.rs`: ~5 LOC declaring
   `pub(super) mod ecn;`.
 - **NEW** `userspace-dp/src/afxdp/cos/ecn.rs`: ~250 LOC (moved
-  code + 15 tests; round-2 #5 caught a stale "13 tests" residue).
+  code + 15 tests).
 - **NEW** `userspace-dp/src/afxdp/cos/mod.rs`: ~5 LOC (`pub(super)
-  mod ecn;` + `pub(super) use ecn::{maybe_mark_ecn_ce, ...};`).
-- **NEW** `userspace-dp/src/afxdp/test_fixtures.rs`: ~80 LOC of
-  shared test fixtures moved out of `tx::tests`.
+  mod ecn;` + `pub(super) use ecn::{maybe_mark_ecn_ce,
+  maybe_mark_ecn_ce_prepared, ECN_MASK, ECN_NOT_ECT, ECN_ECT_0,
+  ECN_ECT_1, ECN_CE};`).
+- `userspace-dp/src/afxdp/test_fixtures.rs` (EXISTS,
+  ~860 LOC currently): EXTENDED with the ~80 LOC of shared fixtures
+  moved out of `tx::tests` (`build_ipv4_test_packet`,
+  `build_ipv6_test_packet`, `compute_ipv4_header_checksum`,
+  `insert_single_vlan_tag`, `test_prepared_item_in_umem`). Existing
+  `pub(super)` visibility pattern preserved.
 - `userspace-dp/src/afxdp/tx.rs`: removes ~250 LOC (moved code +
   marker tests), removes ~80 LOC (fixtures moved to `test_fixtures.rs`),
-  adds `use` statements pointing at `cos::ecn` and
-  `test_fixtures`. Net: ~330 LOC smaller.
-- `userspace-dp/src/afxdp.rs`: adds `pub(super) mod cos;` and
-  `#[cfg(test)] pub(in crate::afxdp) mod test_fixtures;` (~2 LOC).
+  adds `use` statements pointing at `cos::{...}` and
+  `test_fixtures::*`. Net: ~330 LOC smaller.
+- `userspace-dp/src/afxdp.rs`: adds `pub(super) mod cos;` (~1 LOC).
+  The existing `#[cfg(test)] #[path = "afxdp/test_fixtures.rs"]
+  mod test_fixtures;` line at `afxdp.rs:93-94` already declares the
+  test_fixtures module — DO NOT add a duplicate (Codex round-3 #3).
 
 ## Tests
 
@@ -305,8 +341,10 @@ The **15 admission-path tests** that exercise the marker indirectly
 through `apply_cos_admission_ecn_policy` (including the Prepared
 UMEM path and VLAN Prepared path) STAY in `tx::tests` because the
 admission policy stays in `tx.rs` (see Phase 1 scope). They depend
-on shared fixtures that also stay in `tx::tests` and are made
-`pub(super)` so `cos::ecn::tests` can import them.
+on shared fixtures that this PR moves out of `tx::tests` into the
+existing `afxdp::test_fixtures` module (per the Test fixtures
+section above), so both staying admission tests and moving marker
+tests can `use crate::afxdp::test_fixtures::*;`.
 
 No new tests required — the refactor is structure-only and the
 existing test suite has dense branch coverage.
