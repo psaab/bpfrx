@@ -132,8 +132,9 @@ pub struct WorkerRuntimeStatus {
     #[serde(rename = "dead", default)]
     pub dead: bool,
     /// #925: panic payload string (if any), for operator diagnosis.
-    /// Empty string when alive or when the panic payload was not a
-    /// string-like type.
+    /// - String payload (`&str` / `String`): the panic argument.
+    /// - Non-string payload: literal "non-string panic payload".
+    /// - Worker alive (no panic): empty string.
     #[serde(rename = "panic_message", default)]
     pub panic_message: String,
 }
