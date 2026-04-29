@@ -1,0 +1,220 @@
+# #956 Phase 2: extract cos/flow_hash.rs from tx.rs
+
+Plan v1 — 2026-04-29.
+
+Continues the phased decomposition started by #956 Phase 1
+(cos/ecn.rs at PR #976). Phase 2 extracts the flow-hashing
+helpers next per the plan committed in Phase 1 (see
+docs/pr/956-tx-decomposition/plan.md "Out of scope" section).
+
+## Investigation findings (Claude, on commit d719decb)
+
+The flow-hash subsystem in tx.rs comprises 6 functions at
+`userspace-dp/src/afxdp/tx.rs:3833-3981`:
+
+| Item | Line | Visibility | Callers |
+|---|---|---|---|
+| `mix_cos_flow_bucket` | 3833 | private (file) | `exact_cos_flow_bucket`, `cos_flow_hash_seed_from_os` (only) |
+| `cos_flow_hash_seed_from_os` | 3857 | `pub(super)` | external (worker.rs / queue init) |
+| `exact_cos_flow_bucket` | 3927 | private | `cos_flow_bucket_index` (only) |
+| `cos_item_flow_key` | 3954 | private | `apply_cos_admission_ecn_policy`, `account_cos_queue_flow_*` |
+| `cos_flow_bucket_index` | 3962 | private | admission + promotion paths |
+| `cos_queue_prospective_active_flows` | 3976 | private | admission per-flow gate |
+
+Phase 1's lesson: items used outside the moved module need to be
+declared `pub(in crate::afxdp)` so re-exports from `cos/mod.rs`
+work.
+
+`cos_flow_hash_seed_from_os` is already `pub(super)` because
+`worker.rs` calls it during queue initialization. After the move
+its source declaration becomes `pub(in crate::afxdp)` and the
+re-export from `cos/mod.rs` keeps the existing call site
+import path the same (or wrapped through `super::cos::{...}`).
+
+8 existing tests at `tx.rs:13455-13750` exercise the moved
+functions (5× `exact_cos_flow_bucket_*`, 2× distribution tests,
+1× `cos_flow_hash_seed_from_os_draws_nonzero_entropy`).
+
+### Phase 1 lesson applied: keep tests in place
+
+Phase 1 originally planned to move tests + fixtures with the
+production code; the implementation walked that back to avoid a
+same-PR fixture relocation. Phase 2 takes the lesson up front:
+**leave the 8 tests in `tx::tests`** for this PR. They reach the
+moved items via `use super::cos::flow_hash::{...}`. Test
+relocation is deferred to a later cleanup PR (or to whichever
+phase finally consolidates `tx::tests`).
+
+The flow-hash tests are simpler than ECN's — they don't share
+fixtures with admission tests. So they're easier to move later
+than ECN's were.
+
+## Approach
+
+Create `userspace-dp/src/afxdp/cos/flow_hash.rs` with the 6
+moved functions. Each item that needs cross-module visibility
+gets `pub(in crate::afxdp)`. `cos/mod.rs` adds a `pub(super) mod
+flow_hash;` line plus re-exports for the items called from
+`tx.rs` and `worker.rs`.
+
+Move list (production code only, ~150 LOC):
+
+```rust
+// cos/flow_hash.rs
+use crate::afxdp::session::SessionKey;     // exact_cos_flow_bucket reads
+use crate::afxdp::types::{CoSPendingTxItem, CoSQueueRuntime};
+                                            // cos_item_flow_key matches,
+                                            // cos_queue_prospective_active_flows
+                                            //   reads queue.flow_bucket_bytes
+
+pub(in crate::afxdp) fn mix_cos_flow_bucket(seed: &mut u64, value: u64) { ... }
+pub(in crate::afxdp) fn cos_flow_hash_seed_from_os() -> u64 { ... }
+pub(in crate::afxdp) fn exact_cos_flow_bucket(
+    queue_seed: u64, flow_key: Option<&SessionKey>) -> u16 { ... }
+pub(in crate::afxdp) fn cos_item_flow_key(
+    item: &CoSPendingTxItem) -> Option<&SessionKey> { ... }
+pub(in crate::afxdp) fn cos_flow_bucket_index(
+    queue_seed: u64, flow_key: Option<&SessionKey>) -> usize { ... }
+pub(in crate::afxdp) fn cos_queue_prospective_active_flows(
+    queue: &CoSQueueRuntime, flow_bucket: usize) -> u64 { ... }
+```
+
+`cos_flow_bucket_index` references `COS_FLOW_FAIR_BUCKET_MASK`
+(currently a constant in tx.rs). Investigation needed: is that
+constant in `tx.rs` or `types.rs`? If in tx.rs, two options:
+(a) Move it with the helpers (preferred — it's the bucket-mask
+    invariant for the hash function).
+(b) Make it `pub(in crate::afxdp)` and import from tx.rs.
+
+Plan picks (a): move `COS_FLOW_FAIR_BUCKETS` and
+`COS_FLOW_FAIR_BUCKET_MASK` (plus the `const_assert` invariant
+that ties them together) with `cos_flow_bucket_index`. They are
+the bucket-count parameters of the hash function; admission
+references `COS_FLOW_FAIR_BUCKETS` for sizing
+`flow_bucket_bytes` arrays in queue init, but that's the only
+external use, and admission moves with Phase 3 anyway.
+
+Actual decision deferred until investigation in implementation.
+
+### Visibility model (Phase 1 R1+R2 pattern)
+
+Items in `cos/flow_hash.rs` are declared `pub(in crate::afxdp)`
+for cross-module visibility. `cos/mod.rs` re-exports the
+externally-called ones via `pub(super) use`:
+
+```rust
+// cos/mod.rs (extended)
+pub(super) mod ecn;
+pub(super) mod flow_hash;
+
+pub(super) use ecn::{maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared,
+    ECN_MASK, ECN_NOT_ECT, ECN_ECT_0, ECN_ECT_1, ECN_CE};
+pub(super) use flow_hash::{cos_flow_bucket_index,
+    cos_flow_hash_seed_from_os, cos_item_flow_key,
+    cos_queue_prospective_active_flows, exact_cos_flow_bucket,
+    mix_cos_flow_bucket};
+```
+
+`tx.rs` and `worker.rs` import via `super::cos::{...}`.
+
+### Test-only imports (Phase 1 Copilot lesson)
+
+The Phase 1 PR caught that `EthernetL3` / `mark_ecn_ce_*` /
+codepoint masks were referenced only by `tx::tests` and would
+trigger `unused_imports` in non-test builds. Same risk applies to
+flow_hash:
+
+- Production code in `tx.rs` uses `cos_item_flow_key`,
+  `cos_flow_bucket_index`, `cos_queue_prospective_active_flows`
+  via `apply_cos_admission_ecn_policy` and
+  `account_cos_queue_flow_*` — all production paths.
+- `mix_cos_flow_bucket` is a private helper inside flow_hash;
+  not imported anywhere outside (will move with no caller).
+- `exact_cos_flow_bucket` is called by `cos_flow_bucket_index`
+  internally; tests also reference it directly.
+
+Verify during implementation which imports are test-only and
+gate them behind `#[cfg(test)]`.
+
+## Files touched
+
+- **NEW** `userspace-dp/src/afxdp/cos/flow_hash.rs`: ~150 LOC
+  of moved production code (6 functions + the mask constants
+  if moved with).
+- `userspace-dp/src/afxdp/cos/mod.rs`: append `pub(super) mod
+  flow_hash;` + extend the `pub(super) use` block.
+- `userspace-dp/src/afxdp/tx.rs`: removes ~150 LOC; adds `use
+  super::cos::{...}`. Net ~150 LOC smaller.
+- `userspace-dp/src/afxdp/worker.rs` (if it imports
+  `cos_flow_hash_seed_from_os` directly): update import path
+  from `super::tx::...` to `super::cos::...`.
+- The 8 existing tests stay in `tx::tests`; reach moved items
+  via the new use statements.
+
+## Tests
+
+8 existing tests must continue to pass:
+- `exact_cos_flow_bucket_is_stable_for_same_seed_and_flow`
+- `exact_cos_flow_bucket_diverges_across_seeds_for_same_flow`
+- `exact_cos_flow_bucket_preserves_legacy_behavior_at_zero_seed`
+- `exact_cos_flow_bucket_handles_missing_flow_key`
+- `exact_cos_flow_bucket_distribution_at_1024_keeps_collisions_below_budget`
+- `exact_cos_flow_bucket_distribution_narrow_inputs_all_v4`
+- `exact_cos_flow_bucket_distribution_narrow_inputs_scattered_ports`
+- `cos_flow_hash_seed_from_os_draws_nonzero_entropy`
+
+No new tests required — pure structural refactor.
+
+## Acceptance gates
+
+1. `cargo build --release --manifest-path userspace-dp/Cargo.toml`
+   clean (no new warnings beyond baseline).
+2. `cargo test --release --manifest-path userspace-dp/Cargo.toml`
+   ≥ baseline (865 post-#976), 0 failed.
+3. Cluster smoke (HARD): no regression. Run on
+   `loss:xpf-userspace-fw0/fw1` AND with CoS configured via
+   `test/incus/cos-iperf-config.set`.
+
+   | Class       | Port  | Shape | P=12 gate     |
+   |-------------|-------|-------|---------------|
+   | iperf-c     | 5203  | 25 g  | ≥ 22 Gb/s     |
+   | iperf-f     | 5206  | 19 g  | ≥ 17.1 Gb/s   |
+   | iperf-e     | 5205  | 16 g  | ≥ 14.4 Gb/s   |
+   | iperf-d     | 5204  | 13 g  | ≥ 11.7 Gb/s   |
+   | iperf-b     | 5202  | 10 g  | ≥ 9.0 Gb/s    |
+   | iperf-a     | 5201  | 1 g   | ≥ 0.9 Gb/s    |
+   | best-effort | 5207  | 100 m | ≥ 90 Mb/s     |
+
+   Every P=12 row blocking. iperf-c also keeps P=1 ≥ 6 Gb/s.
+
+   Per-CoS-class smoke specifically validates the flow-hash path
+   for the SHARED_EXACT iperf-c queue (multiple TCP flows hashed
+   into per-flow buckets for fairness).
+
+4. Failover smoke: 90-s iperf3 -P 12 through fw0, force-reboot
+   fw0 at +20s, fw1 takes over <10s, iperf3 ≥ 1 Gb/s avg / ≥ 5 GB.
+5. Codex hostile review (plan + impl): AGREE-TO-MERGE.
+6. Gemini adversarial review (plan + impl): AGREE-TO-MERGE.
+7. Copilot review on PR: all valid findings addressed.
+
+## Risk
+
+**Low.** Pure structural refactor. The 6 moved functions are
+leaf-level pure functions (no internal state, no side effects
+except the syscalls in `cos_flow_hash_seed_from_os`). Existing
+tests have dense coverage — including 3 distribution tests that
+verify hash quality at scale.
+
+The only realistic risk is a missed import or visibility tweak,
+caught at compile time.
+
+## Out of scope
+
+This PR is Phase 2 of the multi-phase #956 plan. Subsequent
+phases (preserved from Phase 1's plan):
+- **Phase 3**: `cos/admission.rs`
+- **Phase 4**: `cos/token_bucket.rs`
+- **Phase 5**: `cos/queue_ops.rs`
+- **Phase 6**: `cos/builders.rs`
+- **Phase 7**: `cos/queue_service.rs`
+- **Phase 8**: `cos/cross_binding.rs`
