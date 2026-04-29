@@ -1,10 +1,11 @@
 # #965: bucketed timer-wheel session GC (replace O(N) scan)
 
-Plan v3 — 2026-04-29. Addresses Codex round-2 (task-mojzpydq-t17ylf):
-algorithm bug — round-2 v2 pop dropped still-alive long-timeout
-entries from the wheel forever; bucket payload extended to
-`WheelEntry { key, scheduled_tick }` with explicit re-bucket-or-
-drop pop logic; memory math corrected; doc contradictions cleaned.
+Plan v4 — 2026-04-29. Addresses Codex round-3 (task-mojzzne7-vm90vz):
+two real bugs — bucket helper semantics inconsistent (relative vs
+absolute index), and a same-bucket-reinsert race during pop (drain
+takes the bucket, re-bucket push lands in the drained slot, then
+the empty `due` overwrites it). Alias pseudocode still pushed
+`SessionKey` instead of `WheelEntry`.
 
 ## Investigation findings (Claude, on commit 08ff1838)
 
@@ -117,29 +118,42 @@ Every public method that takes `now_ns` calls `wheel_observe(now_ns)`
 before any wheel push or pop. Test:
 `first_gc_with_large_monotonic_now_doesnt_walk_billions_of_buckets`.
 
-### Bucket-index calculation (Codex finding #4 — exact-256s trap)
+### Bucket-index calculation (Codex round-3 finding #1 — absolute, not relative)
+
+There is exactly ONE bucket helper. It takes an absolute target
+tick (the tick the entry should be checked at) and returns
+`(target_tick & WHEEL_MASK) as usize`. Both `push` and `pop` use
+the same formula.
 
 ```rust
 const FAR_FUTURE_OFFSET: u64 = WHEEL_BUCKETS as u64 - 1;
 
-fn bucket_for_expiration(&self, expiration_ns: u64, now_ns: u64) -> usize {
+#[inline]
+fn bucket_for_tick(tick: u64) -> usize {
+    (tick & WHEEL_MASK) as usize
+}
+
+/// Compute the absolute target tick at which an entry with the
+/// given expiration_ns should be checked, given the current
+/// `now_ns`. Returns `now_tick + delta.min(FAR_FUTURE_OFFSET)`.
+/// An entry with delta >= WHEEL_BUCKETS lands FAR_FUTURE_OFFSET
+/// ticks ahead and gets re-checked there (still-alive case
+/// triggers re-bucketing in pop).
+fn target_tick_for(now_ns: u64, expiration_ns: u64) -> u64 {
     let now_tick = now_ns / WHEEL_TICK_NS;
     let expiration_tick = expiration_ns / WHEEL_TICK_NS;
     let delta = expiration_tick.saturating_sub(now_tick);
-    // Cap at WHEEL_BUCKETS - 1 to make the "far future" bucket
-    // unambiguously distinct from the current bucket. An entry
-    // with delta >= WHEEL_BUCKETS lands in the far-future bucket
-    // and gets re-bucketed on pop. An entry with delta < WHEEL_BUCKETS
-    // lands at its precise position.
-    let offset = delta.min(FAR_FUTURE_OFFSET);
-    ((self.wheel.cursor_tick + offset) & WHEEL_MASK) as usize
+    now_tick + delta.min(FAR_FUTURE_OFFSET)
 }
 ```
 
-Use `>= WHEEL_BUCKETS` (i.e., `delta` clamped to FAR_FUTURE_OFFSET)
-not `> WHEEL_TIMEOUT_CAP_NS`. The clamping makes "exactly 256s"
-land at FAR_FUTURE_OFFSET ahead — distinct from the current bucket
-and correctly delayed. Test: `wheel_handles_exact_256s_timeout`.
+Use absolute target ticks throughout. The `target_tick` is what's
+written into `entry.wheel_tick` and `WheelEntry.scheduled_tick`.
+At pop time, `self.wheel.cursor_tick` advances absolutely; the
+bucket index is just `(cursor_tick & WHEEL_MASK)`. The
+"exactly 256s" case lands at `now_tick + 255`, which the wheel
+will revisit only after a full rotation — distinct from the
+current bucket. Test: `wheel_handles_exact_256s_timeout`.
 
 ### Coverage of long-lived TCP
 
@@ -157,11 +171,13 @@ When `install` / `upsert_synced` / `lookup_with_origin` / `update_session`
 need to add a wheel entry. To bound duplicates we throttle:
 
 ```rust
-let new_expiration_tick = (entry.last_seen_ns + entry.expires_after_ns)
-    / WHEEL_TICK_NS;
+let new_expiration_tick = target_tick_for(
+    now_ns,
+    entry.last_seen_ns + entry.expires_after_ns,
+);
 if new_expiration_tick != entry.wheel_tick {
     entry.wheel_tick = new_expiration_tick;
-    let bucket = self.bucket_for_tick(new_expiration_tick);
+    let bucket = bucket_for_tick(new_expiration_tick);
     self.wheel.buckets[bucket].push_back(WheelEntry {
         key: actual_key.clone(),
         scheduled_tick: new_expiration_tick,
@@ -244,49 +260,63 @@ pub fn expire_stale_entries(&mut self, now_ns: u64) -> Vec<ExpiredSession> {
     // Cursor starts at the lazy-init now_tick, so the first call
     // after init is a no-op (loop body runs zero times).
     while self.wheel.cursor_tick < now_tick {
-        let bucket_idx = (self.wheel.cursor_tick & WHEEL_MASK) as usize;
-        // Take ownership of the bucket for the drain.
-        let mut due = std::mem::take(&mut self.wheel.buckets[bucket_idx]);
-        for WheelEntry { key, scheduled_tick } in due.drain(..) {
+        let bucket_idx = bucket_for_tick(self.wheel.cursor_tick);
+        // Drain in place into a local Vec, then process. We cannot
+        // hold a `&mut VecDeque` from the wheel and simultaneously
+        // call `self.wheel.buckets[new_bucket].push_back(...)` for
+        // a re-bucket whose target may equal `bucket_idx` — that
+        // would alias the same VecDeque mutably. Round-3 caught
+        // the v3 same-bucket-reinsert race that arose from
+        // `mem::take` followed by `buckets[idx] = due` overwriting
+        // re-bucketed entries. Drain → local Vec → free up the
+        // wheel reference → process from the local Vec.
+        let due_count = self.wheel.buckets[bucket_idx].len();
+        let mut due_buf: Vec<WheelEntry> = Vec::with_capacity(due_count);
+        while let Some(entry) = self.wheel.buckets[bucket_idx].pop_front() {
+            due_buf.push(entry);
+        }
+        for WheelEntry { key, scheduled_tick } in due_buf.drain(..) {
             let Some(entry) = self.sessions.get(&key) else {
                 // Already removed elsewhere — drop hint.
                 continue;
             };
             if entry.wheel_tick != scheduled_tick {
                 // Stale duplicate: the entry has been re-scheduled
-                // to a different tick (touched + tick changed).
-                // The new scheduled tick has its own wheel entry.
+                // to a different tick. The new tick has its own
+                // wheel entry already.
                 continue;
             }
-            // scheduled_tick matches the entry's recorded wheel_tick
-            // — this is the canonical scheduled-check entry. Now
-            // determine: actually expired vs. needs re-bucketing.
-            // Match today's strict `>` semantics (Codex finding #8).
+            // scheduled_tick matches entry.wheel_tick — this is the
+            // canonical scheduled-check entry. Match today's strict
+            // `>` semantics for "actually expired".
             if now_ns.saturating_sub(entry.last_seen_ns) > entry.expires_after_ns {
-                // Genuinely expired.
                 if let Some(removed) = self.remove_entry(&key) {
                     // ... emit SessionDelta + ExpiredSession ...
                     expired.push(...);
                 }
             } else {
-                // Still alive — happens for long-timeout sessions
-                // (>= 256s) and for sessions that were re-scheduled
-                // exactly back to this tick. Re-bucket at the new
-                // expiration tick.
-                let new_tick = (entry.last_seen_ns + entry.expires_after_ns)
-                    / WHEEL_TICK_NS;
-                let new_bucket = self.bucket_for_tick(new_tick);
+                // Still alive — long-timeout (>= 256s) case, or a
+                // session re-scheduled to exactly this tick. Re-
+                // bucket at the new absolute target tick. The new
+                // bucket may be `bucket_idx` again (e.g. exactly
+                // 256s timeout repeats); that's fine because the
+                // wheel's bucket VecDeque is now empty (we drained
+                // into due_buf above), so the push goes to the
+                // correct slot and is NOT overwritten on loop exit.
+                let new_target_tick = target_tick_for(
+                    now_ns,
+                    entry.last_seen_ns + entry.expires_after_ns,
+                );
+                let new_bucket = bucket_for_tick(new_target_tick);
                 let entry_mut = self.sessions.get_mut(&key)
                     .expect("entry was just read");
-                entry_mut.wheel_tick = new_tick;
+                entry_mut.wheel_tick = new_target_tick;
                 self.wheel.buckets[new_bucket].push_back(WheelEntry {
                     key,
-                    scheduled_tick: new_tick,
+                    scheduled_tick: new_target_tick,
                 });
             }
         }
-        // Return the (now-empty) VecDeque buffer for reuse.
-        self.wheel.buckets[bucket_idx] = due;
         self.wheel.cursor_tick = self.wheel.cursor_tick.saturating_add(1);
     }
     self.wheel.base_tick = now_tick;
@@ -322,13 +352,20 @@ let actual_key = if self.sessions.contains_key(key) {
 };
 self.sessions.get_mut(&actual_key).map(|entry| {
     // ... last_seen_ns / expires_after_ns updates ...
-    let new_expiration_tick = (entry.last_seen_ns + entry.expires_after_ns)
-        / WHEEL_TICK_NS;
+    let new_expiration_tick = target_tick_for(
+        now_ns,
+        entry.last_seen_ns + entry.expires_after_ns,
+    );
     if new_expiration_tick != entry.wheel_tick {
         entry.wheel_tick = new_expiration_tick;
-        // PUSH actual_key, not the alias `key`.
-        let bucket = self.wheel.bucket_for_tick(new_expiration_tick);
-        self.wheel.buckets[bucket].push_back(actual_key.clone());
+        // PUSH actual_key, not the alias `key`. Payload must be
+        // a WheelEntry carrying the canonical scheduled_tick so
+        // pop's lazy-delete discriminator can detect staleness.
+        let bucket = bucket_for_tick(new_expiration_tick);
+        self.wheel.buckets[bucket].push_back(WheelEntry {
+            key: actual_key.clone(),
+            scheduled_tick: new_expiration_tick,
+        });
     }
     // ... return SessionLookup ...
 })
