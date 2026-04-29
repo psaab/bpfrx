@@ -1,10 +1,10 @@
 # #965: bucketed timer-wheel session GC (replace O(N) scan)
 
-Plan v2 — 2026-04-29. Addresses Codex round-1 (task-mojzeozp-8bzfr7):
-8 blocking findings — cursor init, per-tick cap drainage,
-deferred-tail semantics, exact-256s correctness trap, alias
-lookup, hot-path allocation claim, duplicate-wheel-entry bound,
-expiry boundary off-by-1ns.
+Plan v3 — 2026-04-29. Addresses Codex round-2 (task-mojzpydq-t17ylf):
+algorithm bug — round-2 v2 pop dropped still-alive long-timeout
+entries from the wheel forever; bucket payload extended to
+`WheelEntry { key, scheduled_tick }` with explicit re-bucket-or-
+drop pop logic; memory math corrected; doc contradictions cleaned.
 
 ## Investigation findings (Claude, on commit 08ff1838)
 
@@ -64,12 +64,21 @@ const WHEEL_TICK_NS: u64 = 1_000_000_000;        // 1 s
 const WHEEL_BUCKETS: usize = 256;                // 256 s window
 const WHEEL_MASK: u64 = (WHEEL_BUCKETS as u64) - 1; // 0xFF
 
+/// What a wheel bucket holds. The `scheduled_tick` is the
+/// expiration tick at the moment of bucketing — used by `pop`
+/// to distinguish stale duplicates (`scheduled_tick !=
+/// entry.wheel_tick`) from genuinely-due entries
+/// (`scheduled_tick == entry.wheel_tick`).
+pub(crate) struct WheelEntry {
+    pub key: SessionKey,
+    pub scheduled_tick: u64,
+}
+
 pub(crate) struct SessionWheel {
     /// 256 buckets indexed by `expiration_tick & WHEEL_MASK`.
-    /// Each bucket holds keys whose computed `expiration_tick`
-    /// (= `(last_seen_ns + expires_after_ns) / WHEEL_TICK_NS`)
-    /// modulo 256 equals the bucket index.
-    buckets: Box<[VecDeque<SessionKey>; WHEEL_BUCKETS]>,
+    /// Each bucket holds entries whose `scheduled_tick` modulo
+    /// 256 equals the bucket index.
+    buckets: Box<[VecDeque<WheelEntry>; WHEEL_BUCKETS]>,
     /// Tick that bucket index 0 represents on the *current*
     /// wheel revolution. Advanced lazily as `cursor_tick`
     /// crosses bucket boundaries.
@@ -141,63 +150,65 @@ the entry's actual `last_seen + expires_after` against `now_ns`,
 finds it still in the future, and re-buckets via the same logic.
 Cost: one HashMap lookup + one push per long session per 256 s.
 
-### Lazy delete on touch (Codex finding #7 — duplicate bound)
+### Push-to-wheel: when, and the duplicate bound (Codex round-2 #2)
 
-When `touch` / `lookup_with_origin` / `update_session` updates
-`last_seen_ns`, the old bucket entry becomes stale. We use **lazy
-delete**: leave the stale entry, push a new one, re-check on pop.
-
-The bound on duplicates per session matters because
-`lookup_with_origin` is called per session-cache-touch on the hot
-path. Without throttling, a session that's touched 1000 times
-during its lifetime would have 1000 stale wheel entries — that's
-240 KB of `SessionKey` (240 B each) per long session. At 1M
-sessions × 1000 touches that's 240 GB of stale wheel garbage.
-
-**Per-tick throttle**: only re-push to the wheel if the new
-expiration tick differs from the previously-recorded one. Embed a
-`wheel_tick: u64` field on SessionEntry (16 B added). On
-touch/lookup_with_origin/update_session/refresh_*:
+When `install` / `upsert_synced` / `lookup_with_origin` / `update_session`
+/ `refresh_*` updates `last_seen_ns` or `expires_after_ns`, we may
+need to add a wheel entry. To bound duplicates we throttle:
 
 ```rust
 let new_expiration_tick = (entry.last_seen_ns + entry.expires_after_ns)
     / WHEEL_TICK_NS;
 if new_expiration_tick != entry.wheel_tick {
     entry.wheel_tick = new_expiration_tick;
-    self.wheel.push(key.clone(), new_expiration_tick);
+    let bucket = self.bucket_for_tick(new_expiration_tick);
+    self.wheel.buckets[bucket].push_back(WheelEntry {
+        key: actual_key.clone(),
+        scheduled_tick: new_expiration_tick,
+    });
 }
-// Same-tick touches: no wheel push.
+// Same-tick touches: no push.
 ```
 
-This bounds duplicates per session to:
-`(session_lifetime_secs / WHEEL_TICK_NS_secs) ≈ session_lifetime_secs`.
+The wheel push happens only when the expiration TICK changes. A
+session touched 1000 times within the same second produces ZERO
+extra wheel entries.
 
-For a 30-second session: max 30 wheel duplicates. For a 7200-s TCP
-session: max 7200 entries (one per second the session is touched).
-At 1M long sessions × 7200 entries = 7.2B entries × 240 B/entry =
-1.7 TB worst case. That's still bad.
+#### Memory math (corrected per Codex round-2 #2)
 
-**Tighter bound**: bucket the wheel at *touch granularity*, not
-expiration granularity. The wheel only cares about
-"approximately when this key SHOULD be checked again". Push at
-`expiration_tick` only when the key's next expiration is more
-than 1 tick away from its previously-recorded one. The 1-tick
-granularity is fine because GC pops one bucket = 1 tick of wall
-time anyway.
+Each push costs `WheelEntry` size = `SessionKey + u64` = ~248 B
+on 64-bit. The total live wheel-entry count is:
 
-This is the same algorithm as above, but the bound is now:
-`(session_lifetime_secs / 1 sec) = session_lifetime_secs`.
+  total_wheel_entries = sum over sessions of (distinct expiration ticks visited during the session's lifetime)
 
-For typical session lifetimes (≤300 s) and ≤1M sessions, that's
-1M × 300 = 300M entries × 240 B = 72 GB. Still bad for pathological
-workloads but realistic deployments stay well under.
+For a session whose `last_seen_ns + expires_after_ns` shifts
+linearly with each touch (typical), every touch in a new second
+produces one push. Realistic touch-tick distributions:
 
-**Decision**: ship with the per-tick throttle. Document the
-"pathological worst case" honestly. The ultimate fix is the #964
-slab: SlotHandle is 8 B not 240 B (30× smaller), so 300M handles
-= 2.4 GB — same workload, manageable. #964 is the right place to
-solve the duplicate-storage problem; #965 ships with a usable
-bound and an explicit "pathological-only" caveat.
+| Workload | Touches / sec | Lifetime | Pushes / session | Total at 100K sessions |
+|---|---|---|---|---|
+| Idle TCP keepalive (rare touch) | <0.1 | 7200s | ~1 | 100K (~24 MB) |
+| Mostly-idle session table | <1 | 300s | ~3 | 300K (~72 MB) |
+| Active TCP throughput | per-packet rate, but tick changes ≤1/s | 300s | ~300 | 30M (~7.2 GB) |
+| Pathological per-tick touch | 1/s | 300s | 300 | 30M (~7.2 GB) |
+
+The worst case (every session active and touched per tick) is
+~7.2 GB at 100K sessions, growing linearly with N × lifetime_secs.
+For 1M × 300s × 248 B = ~72 GB — pathological territory.
+
+This is honest: the wheel storage cost grows with the throughput
+of touch-tick changes. For typical deployments (most sessions
+mostly idle between brief activity bursts) it's well-bounded.
+For pathological dense-throughput workloads we hit a memory
+ceiling that #964's slab (8-B SlotHandle vs 248-B WheelEntry, ~30×
+smaller) is the right place to solve.
+
+**Decision**: ship #965 with the corrected algorithm + this
+honest memory math. Document the "every-session-touched-every-tick
+at 1M scale" worst case as the boundary. The bigger #964 slab
+refactor is the right venue for solving the duplicate-storage
+size; #965 alone delivers the "no Stop-the-World" win for the
+realistic case.
 
 ### Per-tick GC work — the algorithm in full
 
@@ -230,39 +241,68 @@ pub fn expire_stale_entries(&mut self, now_ns: u64) -> Vec<ExpiredSession> {
 
     let now_tick = now_ns / WHEEL_TICK_NS;
     let mut expired = Vec::new();
-    // Process every bucket from cursor_tick up to (but not including)
-    // now_tick. cursor_tick starts at the lazy-init now_tick, so the
-    // first call after init is a no-op (loop body runs zero times).
+    // Cursor starts at the lazy-init now_tick, so the first call
+    // after init is a no-op (loop body runs zero times).
     while self.wheel.cursor_tick < now_tick {
         let bucket_idx = (self.wheel.cursor_tick & WHEEL_MASK) as usize;
-        // Take ownership of the bucket for the duration of this drain.
-        // Reusing `due` after the loop returns the buffer to the wheel,
-        // amortizing allocation.
+        // Take ownership of the bucket for the drain.
         let mut due = std::mem::take(&mut self.wheel.buckets[bucket_idx]);
-        for key in due.drain(..) {
-            // Lookup + boundary check matches today's exact semantics
-            // (Codex finding #8): `now - last_seen > expires_after`
-            // (strict `>`), not `>=`.
-            let Some(entry) = self.sessions.get(&key) else { continue };
-            if now_ns.saturating_sub(entry.last_seen_ns) <= entry.expires_after_ns {
-                // Touched after bucketing — already re-bucketed in the
-                // new tick. Stale hint; drop.
+        for WheelEntry { key, scheduled_tick } in due.drain(..) {
+            let Some(entry) = self.sessions.get(&key) else {
+                // Already removed elsewhere — drop hint.
+                continue;
+            };
+            if entry.wheel_tick != scheduled_tick {
+                // Stale duplicate: the entry has been re-scheduled
+                // to a different tick (touched + tick changed).
+                // The new scheduled tick has its own wheel entry.
                 continue;
             }
-            if let Some(removed) = self.remove_entry(&key) {
-                // ... existing remove_entry path produces SessionDelta
-                // and ExpiredSession; same logic as today's GC ...
-                expired.push(...);
+            // scheduled_tick matches the entry's recorded wheel_tick
+            // — this is the canonical scheduled-check entry. Now
+            // determine: actually expired vs. needs re-bucketing.
+            // Match today's strict `>` semantics (Codex finding #8).
+            if now_ns.saturating_sub(entry.last_seen_ns) > entry.expires_after_ns {
+                // Genuinely expired.
+                if let Some(removed) = self.remove_entry(&key) {
+                    // ... emit SessionDelta + ExpiredSession ...
+                    expired.push(...);
+                }
+            } else {
+                // Still alive — happens for long-timeout sessions
+                // (>= 256s) and for sessions that were re-scheduled
+                // exactly back to this tick. Re-bucket at the new
+                // expiration tick.
+                let new_tick = (entry.last_seen_ns + entry.expires_after_ns)
+                    / WHEEL_TICK_NS;
+                let new_bucket = self.bucket_for_tick(new_tick);
+                let entry_mut = self.sessions.get_mut(&key)
+                    .expect("entry was just read");
+                entry_mut.wheel_tick = new_tick;
+                self.wheel.buckets[new_bucket].push_back(WheelEntry {
+                    key,
+                    scheduled_tick: new_tick,
+                });
             }
         }
-        // Return the (now-empty) VecDeque buffer back to the wheel for reuse.
+        // Return the (now-empty) VecDeque buffer for reuse.
         self.wheel.buckets[bucket_idx] = due;
         self.wheel.cursor_tick = self.wheel.cursor_tick.saturating_add(1);
     }
-    self.wheel.base_tick = now_tick;  // for far-future bucket arithmetic
+    self.wheel.base_tick = now_tick;
     expired
 }
 ```
+
+This algorithm correctly handles four cases on pop:
+1. **Entry gone** (already removed by another path) — drop hint.
+2. **Stale duplicate** (`wheel_tick != scheduled_tick`) — drop, the
+   new scheduled tick has its own entry.
+3. **Actually expired** — remove, emit ExpiredSession + delta.
+4. **Still alive at the canonical scheduled tick** — long-timeout
+   case (e.g. 300s TCP-ESTABLISHED). Re-bucket at the new
+   expiration tick. This is the case that v2's pseudocode dropped
+   incorrectly (Codex round-2 finding #1).
 
 ### Alias correctness in lookup_with_origin (Codex finding #5)
 
@@ -296,38 +336,52 @@ self.sessions.get_mut(&actual_key).map(|entry| {
 
 Test: `wheel_alias_lookup_refreshes_canonical_key`.
 
-### Hot-path allocation honesty (Codex finding #6)
+### Hot-path allocation: lazy-grow with documented warm-up (Codex round-2 #3)
 
-`Box<[VecDeque<SessionKey>; 256]>` preallocates the 256 VecDeque
-*headers* (24 B each = 6 KB total). Each VecDeque allocates its
-backing buffer on first `push_back`. To avoid per-tick allocation
-on the hot path, we pre-reserve `max_sessions / WHEEL_BUCKETS`
-slots per bucket at construction:
+Round-1's `max_sessions / WHEEL_BUCKETS` reserve was wrong: short-
+timeout workloads concentrate sessions in a small number of "live"
+buckets (those between `cursor_tick` and `cursor_tick +
+typical_timeout_ticks`). For a 30s timeout × 100K sessions, only
+30 of 256 buckets see traffic at steady state, and each holds
+~3300 entries — far above the proposed 100K/256 = 390 reserve.
+Pre-reserving 390 per bucket means every active bucket reallocates
+2-3× as it grows.
+
+**Decision**: don't pre-reserve at all. Construct each VecDeque
+empty (24 B header). On the hot path, the FIRST `push_back` to
+each bucket allocates a small backing buffer; subsequent pushes
+amortize Vec-style geometric growth. Steady-state allocation
+amortizes across the bucket lifetime (up to 256 ticks).
+
+Drop the "no allocations on the hot path" claim entirely. The
+honest phrasing is: "amortized O(1) push, occasional reallocation
+during bucket warmup". The expected number of bucket-reallocations
+across the wheel's first 256 ticks is `O(WHEEL_BUCKETS × log(B_avg))`
+≈ 256 × ~5 = ~1300 reallocations total during warm-up. Each is a
+VecDeque buffer copy of size ~B/2 — for B=3K that's 3K × 248 B =
+~750 KB per realloc × 1300 reallocs = ~1 GB of memory churn during
+warm-up. Spread over 256 ticks (256 s wall time), that's ~4 MB/s of
+allocator traffic. Negligible vs the per-packet hot path.
+
+After warm-up (after first wheel rotation), each bucket's VecDeque
+has settled at ~max-bucket-size capacity. New pushes don't grow.
 
 ```rust
-fn new_wheel(max_sessions: usize) -> SessionWheel {
-    let initial_cap = (max_sessions / WHEEL_BUCKETS).max(64);
-    let mut buckets: Vec<VecDeque<SessionKey>> = Vec::with_capacity(WHEEL_BUCKETS);
+fn new_wheel() -> SessionWheel {
+    let mut buckets: Vec<VecDeque<WheelEntry>> = Vec::with_capacity(WHEEL_BUCKETS);
     for _ in 0..WHEEL_BUCKETS {
-        buckets.push(VecDeque::with_capacity(initial_cap));
+        // Lazy: first push allocates the backing buffer.
+        buckets.push(VecDeque::new());
     }
-    let buckets: Box<[VecDeque<SessionKey>; WHEEL_BUCKETS]> =
+    let buckets: Box<[VecDeque<WheelEntry>; WHEEL_BUCKETS]> =
         buckets.into_boxed_slice().try_into().expect("right size");
     SessionWheel { buckets, base_tick: 0, cursor_tick: 0, initialized: false }
 }
 ```
 
-For default `max_sessions = 1M`, that's 256 × 4096 SessionKeys =
-~250 MB of preallocated buffers. Drop to `max_sessions = 256K` for
-typical deployments and it's 64 MB. The `initial_cap` calc errs on
-the side of "no growth needed at steady state" — explicit
-`with_capacity` calls so the claim "no allocations on the hot path"
-is true at steady state, with a documented warm-up cost.
-
-Fallback: when bucket spikes past initial_cap (rare but possible
-if a config change creates many sessions with the same expiration
-bucket), `push_back` reallocates. This is rare enough that the
-"no allocations on hot path" claim is honest for the common case.
+Construction memory cost: 256 × 24 B = 6 KB. Steady state: bucket
+buffers grow to fit avg load × geometric headroom. For typical
+100K × 30s workloads, ~30 active buckets × 3K × 248 B = ~22 MB.
 
 ### Files touched
 
@@ -395,28 +449,38 @@ continue to pass.
 
 ## Risk
 
-**Medium-low.**
+**Medium.**
 
-- Wheel is purely an index; sessions HashMap is authoritative.
-- Lazy-delete is correct: we re-check actual expiration on pop.
-- Long-timeout fallback (re-bucket past the wheel cap) tested.
-- Per-tick cap bounds the spike.
+- Wheel is purely an index; `sessions` HashMap is authoritative
+  state.
+- Stale-duplicate vs. canonical pop is decided by
+  `entry.wheel_tick == scheduled_tick`. Long-timeout entries get
+  re-bucketed correctly per the algorithm in §"Per-tick GC work".
+- Memory growth scales with sessions × distinct expiration ticks
+  visited per session. For typical workloads that's ≤MB; for
+  pathological dense-throughput workloads it grows toward GB
+  scale. #964's slab is the right place to fix this; #965 ships
+  with this caveat documented.
+- `wheel_tick: u64` adds 8 B to `SessionEntry`. At 100K sessions
+  ≈ 800 KB. Acceptable.
 
 Risk areas:
-- `touch` / `lookup_with_origin` are hot — they currently just
-  update `last_seen_ns` in-place. After this PR they ALSO push to
-  a wheel bucket. The push is `VecDeque::push_back` on a
-  preallocated Box<[VecDeque; 256]>. No allocations on the hot
-  path (the VecDeques start empty and grow as needed; capacity
-  hints can avoid allocations under steady-state).
+- `touch` / `lookup_with_origin` add a wheel push when the
+  expiration tick changes. Same-tick touches are no-ops. The push
+  is amortized O(1) `VecDeque::push_back` with occasional
+  reallocation during bucket warm-up.
 
 ## Out of scope
 
-- #964 (slab + integer handles): keep `sessions: FxHashMap<SessionKey, SessionEntry>`.
-  The wheel uses `SessionKey` as the bucket payload. After #964,
-  the wheel can switch to `SlotHandle` payload (smaller, faster).
-- Multi-level wheels (hashed timing wheels): single wheel + per-tick
-  cap is enough for the bounds we need. Multi-level is a follow-up
-  if profiling shows the cap deferral causes work pile-up.
+- #964 (slab + integer handles): `sessions` stays as
+  `FxHashMap<SessionKey, SessionEntry>`. The wheel uses
+  `WheelEntry { SessionKey, scheduled_tick }` as the bucket
+  payload. After #964, the payload becomes
+  `WheelEntry { SlotHandle, scheduled_tick }` — same structure,
+  ~30× smaller. The path between #965 and #964 is mechanical.
+- Multi-level wheels (hashed timing wheels): the single wheel +
+  re-bucket-on-still-alive is enough for the typical 100K-session
+  / ≤300 s timeout case. Multi-level is a follow-up if profiling
+  shows the per-bucket spike (≤7 ms at 1M sessions) is an issue.
 - Per-protocol expire policy refactor: timeouts are still computed
-  from `key.protocol` and `tcp_flags` at insert time.
+  from `key.protocol` and `tcp_flags` at insert/update time.
