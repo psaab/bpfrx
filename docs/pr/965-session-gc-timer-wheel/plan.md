@@ -1,19 +1,40 @@
 # #965: bucketed timer-wheel session GC (replace O(N) scan)
 
-Plan v6 — 2026-04-29. Addresses Codex round-5
-(task-mok0rvip-n6iba1): per-tick complexity model conflated
-"sessions / 256" with "live wheel entries / 256". Under sustained
-per-second touch the wheel can hold up to N × 256 entries (mostly
-stale duplicates), giving ~N entries per popped bucket — not N/256.
-Plan now distinguishes realistic-mixed vs. sustained-per-second-touch
-cost regimes, fixes the contradictory "low single-digit GB" claim
-against the 12.3 GB ceiling at 1M × per-second-touch, removes the
-residual ~30× slab claim, and adds an explicit acceptance gate for
-the sustained-per-second-touch worst-plausible hot-path workload.
+Plan v7 — 2026-04-29. Addresses Codex round-6 (task-mok16mh6-7dzy54).
+Five fixes:
 
-Earlier iterations (round 3 fixed the bucket-helper / pop race and
-the alias `WheelEntry` payload; round 4 fixed memory math and the
-alias borrow shape) remain in effect.
+1. Sub-tick expiration lag (round-6 #1): documented the up-to-1-
+   wheel-tick lag introduced by `target_tick = floor(...)` + strict
+   `cursor < now_tick` pop. Production GC has the same lag (gated
+   to 1 s by `SESSION_GC_INTERVAL_NS`), so this is a non-regression
+   in deployed code. Added test `wheel_lags_today_subtick_by_at_most_one_tick`.
+
+2. Internal contradiction in the per-tick cost section (round-6 #2):
+   removed the "256 × ~0.4-ms drains, only ONE bucket holds the
+   per-second-touch crowd" wording — it conflicted with the K ≈ N
+   bound stated five lines above. Under sustained per-second touch
+   every bucket holds ~N entries after warm-up.
+
+3. Mostly-idle table miscalculated (round-6 #3): the column was
+   off by 10× because it failed to divide by 256. Fixed: 100K ×
+   T_active=5 → ~200 µs per tick, not 2 ms.
+
+4. Acceptance gate spec was duplicated with conflicting numbers
+   (round-6 #4): removed the duplicate inside §Per-tick GC work;
+   §Acceptance gates is now the single source of truth, with
+   workload sizes 50K (4a) and 10K (4b) and explicit K-bounds
+   plus wall-time targets.
+
+5. Unit test was wall-time-only (round-6 #5): rewrote
+   `wheel_per_second_touch_bounds_K_per_bucket` to assert K ≤ 12K
+   directly (catches a 2× duplicate-push regression that a 5×
+   wall-time bound would not), with wall-time as a separate
+   informational gate.
+
+Earlier rounds remain in effect: round-3 fixed bucket-helper /
+pop race and alias `WheelEntry` payload; round-4 fixed memory math
+and the alias borrow shape; round-5 fixed the per-tick cost model
+to use K = entries-per-bucket instead of N / 256.
 
 ## Investigation findings (Claude, on commit 08ff1838)
 
@@ -162,6 +183,49 @@ bucket index is just `(cursor_tick & WHEEL_MASK)`. The
 "exactly 256s" case lands at `now_tick + 255`, which the wheel
 will revisit only after a full rotation — distinct from the
 current bucket. Test: `wheel_handles_exact_256s_timeout`.
+
+#### Sub-tick expiration semantics (Codex round-6 #1)
+
+The pop loop is `while cursor_tick < now_tick { pop bucket; cursor++ }`,
+and `target_tick = floor((last_seen + expires_after) / WHEEL_TICK_NS)`.
+A session expiring at `last_seen + expires_after + 1ns` has
+`target_tick = (last_seen + expires_after) / TICK_NS` and
+`now_tick = (last_seen + expires_after + 1) / TICK_NS` —
+when the +1 ns does not cross a tick boundary, both are equal,
+so the bucket containing this entry is NOT popped on this call;
+it will be popped on the next tick (cursor_tick advances when
+now_tick advances by ≥ 1).
+
+So the wheel introduces **up to one wheel-tick (1 s) of lag**
+between the exact instant `last_seen + expires_after + 1 ns` and
+the wheel's detection of the expiration.
+
+Why this is a non-regression in production: the existing
+`expire_stale_entries` is gated by
+
+```rust
+if now_ns.saturating_sub(self.last_gc_ns) < SESSION_GC_INTERVAL_NS {
+    return Vec::new();
+}
+```
+
+with `SESSION_GC_INTERVAL_NS = 1 s`, so today's scan also has
+a ~1 s expiration lag in production. The behavioral change is
+visible only in unit tests that bypass the gate by manipulating
+`last_gc_ns` directly, and only at sub-tick precision (the
+`+1 ns` case Codex flagged). No production caller can observe
+the difference.
+
+The existing `expiry_boundary_strict_greater_than` test asserts
+the exact-boundary case (`now == last_seen + expires_after`,
+which is NOT expired under either today's `>` semantics or the
+wheel). It continues to pass. A sibling test
+`wheel_lags_today_subtick_by_at_most_one_tick` asserts the
+documented bound: at `now == last_seen + expires_after + 1 ns`
+the wheel reports not-yet-expired, but at `now == last_seen +
+expires_after + WHEEL_TICK_NS + 1` (one tick past the expiration
+ceiling) the wheel does report expired. This guards the
+documented semantics from drifting silently.
 
 ### Coverage of long-lived sessions
 
@@ -318,78 +382,84 @@ Concretely:
                         (distinct `scheduled_tick`s pushed in last 256 s)
                       ≤ N_sessions × min(touches_per_256s, 256)
 
-For a population with **uniform per-second touch on every session**:
+For a population with **uniform per-second touch on every session**
+(each session touches at a different sub-tick offset within each
+1-second tick, so scheduled ticks spread roughly uniformly across
+the wheel after warm-up):
 
-  total_wheel_entries ≈ N_sessions × 256
-  K (per bucket)      ≈ N_sessions
+  total_wheel_entries ≈ N_sessions × 256        (1 push/sess/tick × 256 ticks)
+  K (per popped bucket) ≈ N_sessions            (entries spread evenly)
   per-tick cost       ≈ N_sessions × 100 ns
 
-| N (sessions) | per-second touch | mostly idle (avg ≤5 active ticks/sess) |
+For **mostly-idle** workloads where each session is touched in
+≈ T_active distinct ticks across the 256-tick window (T_active ≪ 256):
+
+  total_wheel_entries ≈ N_sessions × T_active
+  K (per popped bucket) ≈ N_sessions × T_active / 256
+  per-tick cost       ≈ (N_sessions × T_active / 256) × 100 ns
+
+Per-tick cost table (assuming 100 ns per stale/canonical entry):
+
+| N (sessions) | per-second touch (T_active=256, K=N) | mostly idle (T_active=5, K = N × 5/256) |
 |---|---|---|
-| 10K | 1 ms | 200 µs |
-| 100K | **10 ms** | 2 ms |
-| 1M | **100 ms** | 20 ms |
+| 10K | 1 ms (10K × 100 ns) | ~20 µs (~195 entries) |
+| 100K | **10 ms** (100K × 100 ns) | ~200 µs (~1.95K entries) |
+| 1M | **100 ms** (1M × 100 ns) | ~2 ms (~19.5K entries) |
 
 #### What this means for "Stop the World goes away"
 
-Today's StW does ~100 ms once per `SESSION_GC_INTERVAL_NS = 1 s`
-at 1M sessions. The wheel does **the same total work over the
-1 s window**, but spread across 256 ticks at the same per-second
-*shape* — so each tick still has to drain its bucket at full
-size. **The wheel does not dramatically reduce the worst-case
-tick wall-time under sustained per-second touch on every
-session**: at 1M sessions × per-second touch, both today's StW
-and the wheel produce ~100 ms of GC work per second, just paid in
-different shapes (one 100-ms blast vs. ~256 × ~0.4-ms drains —
-but each of those 256 drains visits a *different* bucket, and
-only ONE of them holds the per-second-touch crowd).
+Today's StW scans `self.sessions` (N entries) once per
+`SESSION_GC_INTERVAL_NS = 1 s`, producing one ~100 ms blocking
+call per second at 1M sessions. The wheel pops **one bucket per
+tick** (one per second, at the same cadence), so under the
+worst-plausible hot-path workload — sustained per-second touch
+on every session — each tick still pays K ≈ N work because
+every bucket is full of N entries (one per session, mostly
+stale duplicates) after warm-up.
+
+So the wheel does **NOT** reduce per-tick wall time under that
+workload; it preserves it (~100 ms per tick at 1M, ~10 ms per
+tick at 100K). What it changes is the *shape*: today's StW is a
+single blocking call inside `expire_stale_entries`; the wheel's
+work is paid as a steady drain on the same call, with no
+allocation of a Vec<SessionKey> for the candidate set. (The
+allocation savings are real but secondary.)
 
 The win, restated honestly:
 
 1. **Realistic mixed-traffic deployments** (most sessions idle,
-   some bursty): per-tick cost drops from O(N) to
-   O(N × distinct_active_ticks / 256), which at 100K sessions is
-   sub-ms — a **>50× improvement** in the typical case.
+   T_active ≈ 5): per-tick cost drops from O(N) to O(N × 5 / 256),
+   which at 100K sessions is ~200 µs vs. today's ~10 ms — a
+   **~50× improvement** in the typical case.
 
-2. **All-active per-second-touch on every session at 100K**:
-   per-tick cost is ~10 ms, vs. today's ~10 ms StW (same scale).
-   The win here is *not* a wall-time reduction; it's that the
-   work is bounded per-tick rather than appearing as a single
-   blocking call. Mouse-latency p99 stops correlating with the
-   GC interval.
+2. **All-active per-second-touch at 100K**: per-tick cost is
+   ~10 ms, same as today's ~10 ms StW. The wall-time at this
+   load is the same; the win is that work doesn't pile up into
+   an even larger periodic spike when GC is delayed.
 
-3. **All-active per-second-touch on every session at 1M**:
-   per-tick cost is ~100 ms. **This is the same wall time as
-   today's StW.** The wheel does not solve this case; it tracks
-   under "active deletion" and "multi-level wheel" follow-ups.
-   At this scale we recommend operators tune
-   `SESSION_GC_INTERVAL_NS` higher or land #964 first.
+3. **All-active per-second-touch at 1M**: per-tick cost is
+   ~100 ms — **the same wall time as today's StW.** The wheel
+   does not solve this case; it tracks under "active deletion"
+   and "multi-level wheel" follow-ups (see Out of scope). At
+   this scale we recommend operators tune `SESSION_GC_INTERVAL_NS`
+   higher or land #964 first.
 
 4. **Same-bucket install bursts** (synthetic: all N sessions
    installed in one tick, then idle): bucket sees O(N) work *once*
-   per 256 s, then idles. No worse than today's StW for that one
-   tick; better for the other 255 ticks.
+   per 256 s, then idles for 255 ticks. The other 255 ticks have
+   no GC work at all — strictly better than today's "100ms blast
+   every 1s".
 
-#### Acceptance gate (corrected per Codex round-5 #2)
+The single-line summary: **for realistic deployments the wheel
+delivers a ~50× per-tick latency win; for synthetic worst-case
+sustained-per-second-touch the wheel matches today's wall time
+but with bounded per-tick shape; for any workload this PR removes
+the per-second `Vec<SessionKey>` allocation that today's
+expire_stale_entries does inside its hot path.**
 
-The mouse-latency gate (Acceptance gates §4) needs two distinct
-synthetic workloads:
-
-A. **Realistic mostly-idle**: 50K sessions, ~10% touched per
-   second (5K touches/s), the rest idle. Assert p99 GC-tick wall
-   time ≤ 1 ms. This is the realistic-deployment claim.
-
-B. **Sustained per-second touch (worst-plausible hot path)**:
-   100K sessions, EVERY session touched once per second for ≥
-   300 s before assertion. Assert p99 GC-tick wall time ≤ 15 ms
-   (matches the ~10 ms model + headroom). This proves the wheel
-   bounds per-tick work and prevents StW spikes even under the
-   worst sustained refresh pattern; it does NOT claim a
-   wall-time win at this load.
-
-Adversarial same-bucket install bursts are out of scope for #965
-and tracked under the active-deletion / multi-level-wheel follow-
-ups.
+The acceptance-gate workloads, latency targets, and unit-test
+specifications live in §Acceptance gates below — that section is
+the single source of truth for what we will measure.
 
 ```rust
 pub fn expire_stale_entries(&mut self, now_ns: u64) -> Vec<ExpiredSession> {
@@ -620,6 +690,16 @@ buffers grow to fit avg load × geometric headroom. For typical
   entry with `expires_after_ns = 1_000_000_000`; advance to
   exactly `last_seen + 1_000_000_000` (boundary); verify entry is
   NOT expired (matches today's `>` semantics, not `>=`).
+- `wheel_lags_today_subtick_by_at_most_one_tick` (Codex round-6
+  #1): bypass the gc-interval gate by setting `last_gc_ns`
+  directly. Insert entry with `expires_after_ns = 1_000_000_000`.
+  Call `expire_stale_entries(last_seen + 1_000_000_000 + 1)`
+  (one ns past expiration). Assert wheel returns it as NOT
+  expired (acceptable 1-tick lag vs today's hypothetical sub-
+  tick `>` scan). Then call `expire_stale_entries(last_seen +
+  1_000_000_000 + WHEEL_TICK_NS + 1)` (one tick past
+  expiration). Assert wheel returns it as EXPIRED. This guards
+  the documented bound from drifting.
 - `wheel_duplicate_count_per_session_bounded` (Codex finding #7):
   insert one session; touch it 100 times within the same tick;
   count wheel entries for that key; assert ≤ 2 (the initial push
@@ -628,14 +708,24 @@ buffers grow to fit avg load × geometric headroom. For typical
   sessions all with same expiration; advance time past expiration;
   verify expire_stale_entries returns all 50K in a single call
   (no per-tick cap; one tick = one bucket = O(B) work, not capped).
-- `wheel_per_second_touch_bound_per_tick_work` (Codex round-5 #2):
-  install N=10K sessions, then touch every session once per
-  second for 300 s of simulated time before measuring. After
-  warm-up, advance one tick and measure `wheel_pop_one_bucket`
-  wall time. Assert ≤ 5 ms (allows 2.5× headroom over the 100 ns
-  × 10K = 1 ms model). This catches regressions where a refactor
-  inadvertently makes `lookup_with_origin` or `update_session`
-  add multiple wheel pushes per touch.
+- `wheel_per_second_touch_bounds_K_per_bucket` (Codex round-5 #2,
+  hardened per round-6 #5): install N=10K sessions, then touch
+  every session once per second for 300 s of simulated time
+  before measuring. After warm-up, instrument the next pop to
+  count entries scanned (`K`) and entries dropped/expired/re-
+  bucketed. Assert:
+    * `K ≤ 12,000` (model says 10,000; 20 % headroom catches a
+      2× duplicate-push regression — a 5× wall-time bound would
+      not).
+    * `entries_re_bucketed = N` (the live canonical entry per
+      session lands in its new tick).
+    * `entries_dropped_stale ≈ N × (256 − 1)` summed across one
+      full wheel rotation (256 ticks). Assert
+      `total_dropped ∈ [0.9, 1.1] × N × 255` to catch leakage of
+      stale entries that the lazy-delete discriminator should
+      drop.
+  The point of the test is to bound *work shape*, not wall time;
+  wall-time perf is the §Acceptance gate 4b informational gate.
 - `wheel_alias_lookup_does_not_double_borrow_self`: compile-time
   test that the alias path's `lookup_with_origin` body type-checks
   (i.e. the &mut self.sessions borrow is scoped before
@@ -652,27 +742,47 @@ continue to pass.
 ## Acceptance gates
 
 1. `cargo build --release` clean.
-2. `cargo test --release` ≥ baseline (851 post-#921) + 10 new = 861.
+2. `cargo test --release` ≥ baseline (851 post-#921) + 11 new = 862.
 3. Cluster smoke (HARD): no regression on the unloaded-session path.
    - iperf-c P=12 ≥ 22 Gb/s
    - iperf-c P=1 ≥ 6 Gb/s
 4. **Mouse-latency gate** — TWO synthetic workloads (per Codex
-   round-5 #2):
+   round-5 #2 + round-6 #4 / #5). The numbers below are the
+   single source of truth; any other section that mentions "the
+   acceptance gate" defers to this list.
 
-   4a. **Realistic mostly-idle**: 50K sessions, ~10% touched per
-       second (5K touches/s), the rest idle for ≥ 300 s before
-       measurement. Assert p99 GC-tick wall time ≤ 1 ms. This is
-       the typical-deployment win.
+   4a. **Realistic mostly-idle workload**:
+       - N = 50K sessions installed.
+       - 10% (5K) of sessions touched once per second; the rest
+         idle for the duration of the measurement.
+       - Run for ≥ 300 s of simulated time before measuring (so
+         the wheel reaches steady state and any warm-up
+         allocations have settled).
+       - Assert: p99 GC-tick wall time ≤ 1 ms over a 60-s
+         measurement window.
+       - Assert: per-pop K (entries scanned per popped bucket)
+         ≤ 1500 (the model gives 50K × 5 / 256 = 977; 1500 is
+         ~50% headroom and catches a regression where touch
+         pushes more than one entry per tick-change).
 
-   4b. **Sustained per-second touch**: 10K sessions, EVERY session
-       touched once per second for ≥ 300 s. Assert p99 GC-tick
-       wall time ≤ 5 ms (matches the 100 ns × 10K = 1 ms model
-       with 5× headroom). This proves the wheel keeps per-tick
-       work bounded under the hot-path refresh shape; it does NOT
-       claim a wall-time win at this load — see "Per-tick cost
-       model" in §Per-tick GC work.
+   4b. **Sustained per-second touch** (worst-plausible hot path):
+       - N = 10K sessions installed.
+       - EVERY session touched once per second.
+       - Run for ≥ 300 s before measuring.
+       - Assert: per-pop K ≤ 12,000 (model gives 10K; 20%
+         headroom catches a 2× duplicate-push regression). This
+         is the **primary** correctness assertion — wall time is
+         a derivative of K and is hardware-dependent.
+       - Wall-time perf gate (informational, not blocking):
+         p99 GC-tick wall time ≤ 5 ms on the cluster test host
+         (model gives 10K × 100 ns = 1 ms; 5× margin allows for
+         alloc churn and HashMap probe variance). Failure here
+         flags a perf regression but does not block CI by itself
+         since wall time depends on the runner.
 
-   Both gates must hold. Adversarial same-bucket install bursts
+   Both correctness gates (4a and 4b K-bounds) must hold. The
+   wall-time gate at 4a must hold; the wall-time perf gate at
+   4b is informational. Adversarial same-bucket install bursts
    are out of scope for #965 and tracked under the active-
    deletion / multi-level-wheel follow-ups (see Out of scope).
 5. Codex hostile review: AGREE-TO-MERGE.
