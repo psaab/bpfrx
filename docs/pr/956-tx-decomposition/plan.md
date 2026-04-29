@@ -1,6 +1,37 @@
 # #956 Phase 1: extract cos/ecn.rs from tx.rs (establish the cos/ submodule)
 
-Plan v2 — 2026-04-29. Addresses Codex round-1 (task-mokb9f8h-mwlbl8):
+Plan v3 — 2026-04-29. Addresses Codex round-2 (task-mokbj8l7-x8capj):
+four blocking findings + one stale-text fix.
+
+a. Visibility re-export model corrected. `pub(super) use ecn::{...}`
+   in `cos/mod.rs` does NOT widen visibility past what the source
+   items permit. Items must be `pub(in crate::afxdp)` in `ecn.rs`
+   AND re-exported with `pub(super) use` in `cos/mod.rs`. Plan now
+   shows both halves.
+
+b. Test-fixture sharing via `tx::tests` was broken: `pub(super) fn`
+   inside `tx::tests` makes it visible to `tx`, not to a sibling
+   `cos::ecn::tests`. And `mod tests` is private. v3 introduces a
+   new `#[cfg(test)] mod test_fixtures;` at `afxdp/` (sibling of
+   `tx.rs`/`cos/`) with `pub(in crate::afxdp)` helpers. Both
+   `tx::tests` and `cos::ecn::tests` import via
+   `crate::afxdp::test_fixtures::*`.
+
+c. Stale Risk-section prose said the const_assert invariants "must
+   move with the constants" — flipped from v1, but the surrounding
+   plan now says they STAY in tx.rs for Phase 1 and only move with
+   admission later. Risk text now consistent.
+
+d. Phase order: queue_service depends on builders
+   (`prime_cos_root_for_service`, `build_cos_batch_from_queue`,
+   `apply_cos_send_result`, `apply_cos_prepared_result`). v2 had
+   builders in Phase 8 — would leave queue_service depending back
+   on `tx.rs`. Swapped: Phase 6 = builders, Phase 7 = queue_service.
+
+e. Stale "+ 13 tests" residue in Files-touched section — replaced
+   with 15.
+
+v2 — Addresses Codex round-1 (task-mokb9f8h-mwlbl8):
 five blocking findings, all fixed.
 
 1. Visibility: `pub(super)` from `afxdp::cos::ecn` only exposes to
@@ -138,26 +169,34 @@ Move from `tx.rs`:
 - The two `const _: () = assert!` compile-time invariants for the
   threshold (move only when admission moves in Phase 2).
 
-### Visibility model (Codex round-1 #1)
+### Visibility model (Codex round-1 #1, refined per round-2 #1)
 
 `pub(super)` from inside `afxdp::cos::ecn` only exposes to
-`afxdp::cos`, NOT back up to `afxdp::tx`. To make the moved
-functions callable from `tx.rs`, the cleanest options are:
+`afxdp::cos` — NOT back up to `afxdp::tx`. And `pub(super) use ...`
+in `cos/mod.rs` does NOT widen visibility past what the source
+items already permit; it can only re-export at a visibility ≤ the
+source. So the round-1 fix needs both halves:
 
-(a) Declare each exported item as `pub(in crate::afxdp)` —
-    visible to anything inside the `afxdp` module tree.
-(b) Re-export from `cos/mod.rs`:
-    ```rust
-    pub(super) use ecn::{maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared};
-    ```
-    where `pub(super)` here means "visible to `afxdp`" because
-    `cos/mod.rs` lives at `afxdp::cos`.
+```rust
+// userspace-dp/src/afxdp/cos/ecn.rs
+pub(in crate::afxdp) fn maybe_mark_ecn_ce(req: &mut TxRequest) -> bool { ... }
+pub(in crate::afxdp) fn maybe_mark_ecn_ce_prepared(...) -> bool { ... }
 
-**Decision**: use option (b). Re-exporting from `cos/mod.rs` keeps
-the per-file visibility within `cos/ecn.rs` as `pub(super)` (i.e.
-"visible to siblings within `cos/`") and lets `cos/mod.rs` decide
-the surface area exposed to `afxdp`. This is the pattern the codebase
-already follows for `afxdp` itself (see `afxdp.rs`).
+// userspace-dp/src/afxdp/cos/mod.rs
+pub(super) use ecn::{maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared};
+```
+
+Items declared `pub(in crate::afxdp)` are visible to anything in the
+`afxdp` module tree (including `afxdp::tx`). The `pub(super) use`
+re-export is a convenience so call sites can write
+`use super::cos::{maybe_mark_ecn_ce, ...}` instead of the longer
+`use super::cos::ecn::{...}` path.
+
+The internal `EthernetL3` enum, `ethernet_l3` parser, and the
+`mark_ecn_ce_ipv4`/`_ipv6` helpers stay file-private (no `pub`)
+since they have no callers outside `cos::ecn` after the move. The 5
+codepoint masks (`ECN_MASK`, `ECN_NOT_ECT`, `ECN_ECT_0`, `ECN_ECT_1`,
+`ECN_CE`) likewise stay file-private.
 
 ### Path imports (Codex round-1 #5)
 
@@ -167,22 +206,42 @@ in tx.rs becomes `use crate::afxdp::ethernet::{ETH_HDR_LEN, VLAN_TAG_LEN};`
 qualified `crate::afxdp::ethernet::...` form is preferred for
 readability and stability across future module reshuffles.
 
-### Test fixtures (Codex round-1 #4)
+### Test fixtures (Codex round-1 #4, refined per round-2 #2)
 
 `tx::tests` contains shared fixtures used by BOTH the marker tests
 (moving) AND admission/V_min tests (staying):
 `build_ipv4_test_packet`, `build_ipv6_test_packet`,
 `compute_ipv4_header_checksum`, `insert_single_vlan_tag`,
 `test_prepared_item_in_umem`. A naive helper move would break the
-remaining `tx::tests`.
+remaining `tx::tests`. Round-1 #4 noted the problem; round-2 #2
+flagged that my proposed fix (`pub(super) fn` inside
+`tx::tests`) doesn't actually compile — `mod tests` is private and
+cross-importing from another module's `mod tests` is brittle even
+with `pub(super)` on the helpers.
 
-**Decision**: keep the fixtures in `tx::tests` and make them
-`pub(super)` (or `pub(in crate::afxdp)`) so `cos::ecn::tests` can
-import them via
-`use crate::afxdp::tx::tests::{build_ipv4_test_packet, ...};`.
-Fixtures don't move in Phase 1; they get re-evaluated when admission
-extracts in Phase 2 (likely the right place for them is
-`cos/test_helpers.rs` once both admission and ecn live in `cos/`).
+**Decision (Codex round-2 #2 preferred fix)**: introduce a new
+`#[cfg(test)] mod test_fixtures;` at `userspace-dp/src/afxdp/`
+(sibling of `tx.rs` and the new `cos/`). It carries the shared
+fixture functions with `pub(in crate::afxdp)` visibility:
+
+```rust
+// userspace-dp/src/afxdp/test_fixtures.rs
+#![cfg(test)]
+pub(in crate::afxdp) fn build_ipv4_test_packet(...) -> Vec<u8> { ... }
+pub(in crate::afxdp) fn build_ipv6_test_packet(...) -> Vec<u8> { ... }
+pub(in crate::afxdp) fn compute_ipv4_header_checksum(hdr: &[u8]) -> u16 { ... }
+pub(in crate::afxdp) fn insert_single_vlan_tag(...) -> Vec<u8> { ... }
+pub(in crate::afxdp) fn test_prepared_item_in_umem(...) -> ... { ... }
+```
+
+`tx::tests` and `cos::ecn::tests` both import via
+`use crate::afxdp::test_fixtures::*;`. This is robust against
+future moves and works with the existing `mod tests` private-by-
+default convention.
+
+The fixtures get moved out of `tx::tests` in this PR (small,
+self-contained move) so the marker tests can reach them from
+`cos::ecn::tests`.
 
 ### Module declaration
 
@@ -210,11 +269,17 @@ pattern — investigation will pin the exact form.)
 - **NEW** `userspace-dp/src/afxdp/cos/mod.rs`: ~5 LOC declaring
   `pub(super) mod ecn;`.
 - **NEW** `userspace-dp/src/afxdp/cos/ecn.rs`: ~250 LOC (moved
-  code + 13 tests).
+  code + 15 tests; round-2 #5 caught a stale "13 tests" residue).
+- **NEW** `userspace-dp/src/afxdp/cos/mod.rs`: ~5 LOC (`pub(super)
+  mod ecn;` + `pub(super) use ecn::{maybe_mark_ecn_ce, ...};`).
+- **NEW** `userspace-dp/src/afxdp/test_fixtures.rs`: ~80 LOC of
+  shared test fixtures moved out of `tx::tests`.
 - `userspace-dp/src/afxdp/tx.rs`: removes ~250 LOC (moved code +
-  tests), adds 1 `use` statement + visibility tweak. Net: ~250 LOC
-  smaller.
-- `userspace-dp/src/afxdp.rs`: adds `mod cos;` declaration (1 LOC).
+  marker tests), removes ~80 LOC (fixtures moved to `test_fixtures.rs`),
+  adds `use` statements pointing at `cos::ecn` and
+  `test_fixtures`. Net: ~330 LOC smaller.
+- `userspace-dp/src/afxdp.rs`: adds `pub(super) mod cos;` and
+  `#[cfg(test)] pub(in crate::afxdp) mod test_fixtures;` (~2 LOC).
 
 ## Tests
 
@@ -295,8 +360,10 @@ The compile-time invariants
 `const _: () = assert!(COS_ECN_MARK_THRESHOLD_NUM < COS_ECN_MARK_THRESHOLD_DEN);`
 and
 `const _: () = assert!(COS_ECN_MARK_THRESHOLD_DEN > 0);`
-must move with the constants and continue to fire — verified by
-the build still succeeding.
+**stay with the constants in `tx.rs` for Phase 1** (round-2 #3
+caught a stale prose flip from v1 that said they "must move"). They
+move with admission and the threshold constants in Phase 2 to
+`cos/admission.rs`. The build asserts continue to fire either way.
 
 ## Out of scope (future Phase 2+ PRs)
 
@@ -332,17 +399,22 @@ container helpers:
   `CoSServicePhase` / `ExactCoSQueueKind` enums and
   `CoSPendingTxItem` accessors. Required before queue service can
   cleanly extract.
-- **Phase 6**: `cos/queue_service.rs` — `select_cos_guarantee_batch`,
+- **Phase 6**: `cos/builders.rs` — `build_cos_interface_runtime`,
+  `build_cos_batch_from_queue`, `apply_cos_send_result`,
+  `apply_cos_prepared_result`, `prime_cos_root_for_service`.
+  Codex round-2 #4 caught that `queue_service` calls all of these,
+  so builders must extract BEFORE queue_service or queue_service
+  will be left dependent on `tx.rs`. Phase 6 in v3 (was Phase 8 in
+  v2).
+- **Phase 7**: `cos/queue_service.rs` — `select_cos_guarantee_batch`,
   `select_cos_surplus_batch`, `service_exact_*`, `drain_shaped_tx`,
   MQFQ virtual-time logic, `select_exact_cos_guarantee_queue_*`.
-- **Phase 7**: `cos/cross_binding.rs` —
+  Pulls in builders/appliers from Phase 6.
+- **Phase 8**: `cos/cross_binding.rs` —
   `redirect_local_cos_request_to_owner`,
   `redirect_prepared_cos_request_to_owner`,
   `prepared_cos_request_stays_on_current_tx_binding`, the MPSC
-  inbox handling.
-- **Phase 8**: `cos/builders.rs` — `build_cos_interface_runtime`,
-  `build_cos_batch_from_queue`, `apply_cos_send_result`,
-  `apply_cos_prepared_result`, `prime_cos_root_for_service`.
+  inbox handling. Was Phase 7 in v2.
 
 After Phase 8 the `tx.rs` left in place is just XSK ring management
 (descriptor pop/push, kick threshold, completion reap) +
