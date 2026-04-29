@@ -155,14 +155,18 @@ bucket index is just `(cursor_tick & WHEEL_MASK)`. The
 will revisit only after a full rotation — distinct from the
 current bucket. Test: `wheel_handles_exact_256s_timeout`.
 
-### Coverage of long-lived TCP
+### Coverage of long-lived sessions
 
-`TCP_ESTABLISHED_TIMEOUT_NS` ≈ 7200 s exceeds the 256-s window.
-Such an entry lands in the far-future bucket. When that bucket is
-popped (256 s after insertion), `wheel_pop_one_bucket` re-checks
-the entry's actual `last_seen + expires_after` against `now_ns`,
-finds it still in the future, and re-buckets via the same logic.
-Cost: one HashMap lookup + one push per long session per 256 s.
+The default established-TCP timeout in `userspace-dp/src/session.rs`
+is 300 s (`DEFAULT_TCP_SESSION_TIMEOUT_NS = 300_000_000_000`), which
+is already larger than the 256-s wheel window. Operators can set
+arbitrarily long per-protocol timeouts (Junos allows up to days).
+Any timeout that exceeds the 256-s window lands in the far-future
+bucket. When that bucket is popped (256 s after insertion),
+`wheel_pop_one_bucket` re-checks the entry's actual
+`last_seen + expires_after` against `now_ns`, finds it still in the
+future, and re-buckets via the same logic. Cost: one HashMap
+lookup + one push per long session per 256 s.
 
 ### Push-to-wheel: when, and the duplicate bound (Codex round-2 #2)
 
@@ -190,34 +194,65 @@ The wheel push happens only when the expiration TICK changes. A
 session touched 1000 times within the same second produces ZERO
 extra wheel entries.
 
-#### Memory math (corrected per Codex round-2 #2)
+Note: this snippet is the throttle *condition* in isolation. In a
+real call site (e.g. `update_session`, `lookup_with_origin`), the
+`&mut SessionEntry` borrow on `self.sessions` MUST be scoped to
+end before the `self.wheel.buckets[...]` push, or the borrow
+checker will reject the compound `&mut self` aliasing. See the
+alias correctness section below for the full borrow-scoped shape.
 
-Each push costs `WheelEntry` size = `SessionKey + u64` = ~248 B
-on 64-bit. The total live wheel-entry count is:
+#### Memory math (corrected per Codex rounds 2 + 4)
 
-  total_wheel_entries = sum over sessions of (distinct expiration ticks visited during the session's lifetime)
+Measured (`rustc 1.x`, 64-bit):
+- `size_of::<SessionKey>()` = **40 B** (u8 + u8 + 2×IpAddr(17 B) + u16 + u16, align 2)
+- `size_of::<WheelEntry>()` = **48 B** (40 B SessionKey + u64 + alignment padding to 8 B, align 8)
 
-For a session whose `last_seen_ns + expires_after_ns` shifts
-linearly with each touch (typical), every touch in a new second
-produces one push. Realistic touch-tick distributions:
+Live wheel storage is bounded by the wheel itself: the wheel only
+holds entries whose `scheduled_tick ∈ [cursor_tick, cursor_tick +
+FAR_FUTURE_OFFSET]`, i.e. at most 256 distinct future-tick slots.
+For each session, throttling caps push frequency at one push per
+TICK in which `(last_seen + expires_after)` produces a new
+`scheduled_tick`. Stale entries (where the canonical `wheel_tick`
+has moved on) are not deleted eagerly — they sit in the wheel until
+their bucket is popped, at which point the lazy-delete discriminator
+drops them in O(1).
 
-| Workload | Touches / sec | Lifetime | Pushes / session | Total at 100K sessions |
-|---|---|---|---|---|
-| Idle TCP keepalive (rare touch) | <0.1 | 7200s | ~1 | 100K (~24 MB) |
-| Mostly-idle session table | <1 | 300s | ~3 | 300K (~72 MB) |
-| Active TCP throughput | per-packet rate, but tick changes ≤1/s | 300s | ~300 | 30M (~7.2 GB) |
-| Pathological per-tick touch | 1/s | 300s | 300 | 30M (~7.2 GB) |
+Therefore:
 
-The worst case (every session active and touched per tick) is
-~7.2 GB at 100K sessions, growing linearly with N × lifetime_secs.
-For 1M × 300s × 248 B = ~72 GB — pathological territory.
+  live_wheel_entries ≤ Σ over live sessions of
+                       min(distinct_active_touch_ticks_in_last_256s, 256)
+                       + recently-superseded duplicates not yet drained
 
-This is honest: the wheel storage cost grows with the throughput
-of touch-tick changes. For typical deployments (most sessions
-mostly idle between brief activity bursts) it's well-bounded.
-For pathological dense-throughput workloads we hit a memory
-ceiling that #964's slab (8-B SlotHandle vs 248-B WheelEntry, ~30×
-smaller) is the right place to solve.
+The drain time of a stale duplicate is bounded by one wheel
+rotation: ≤ 256 s after it was superseded. So the steady-state
+upper bound is ≈ N_sessions × 256 entries (the absolute ceiling),
+and the realistic value is much smaller because most sessions are
+idle and touch in <<256 distinct ticks.
+
+| Workload | Active touch ticks / sess | Live entries at 100K sessions | Memory |
+|---|---|---|---|
+| Idle TCP keepalive (rare touch) | ~1 | ~100K | ~4.8 MB |
+| Mostly-idle session table | ~3–5 | ~300K–500K | ~14–24 MB |
+| Active TCP throughput (touch ≤1/s) | up to 256 | ≤25.6M | ≤1.2 GB |
+| Pathological (every session, every tick) | 256 | 25.6M | 1.2 GB |
+
+At 1M sessions × 256 × 48 B the absolute ceiling is **~12.3 GB**.
+That ceiling is reached only when every session is touched in 256
+distinct seconds inside a 256-s window, which already implies a 1M-
+session steady state with continuous activity. The realistic value
+is well under 100 MB.
+
+This is honest: the wheel storage cost is bounded by `N × WHEEL_BUCKETS`,
+not by session lifetime. The earlier draft's "linear with
+lifetime_secs" claim was wrong — once GC keeps up with the wheel
+rotation, stale duplicates are drained within 256 s and don't
+accumulate over the full session lifetime.
+
+#964 (slot-handle compaction) replaces the 40-B `SessionKey` with a
+~4-B slot index, taking `WheelEntry` from 48 B to ~16 B — roughly
+**3× smaller** (not 30×; the 30× figure assumed the 248-B miscount).
+That follow-up is still worth doing, but #965 alone keeps the
+absolute memory ceiling at low single-digit GB even at 1M sessions.
 
 **Decision**: ship #965 with the corrected algorithm + this
 honest memory math. Document the "every-session-touched-every-tick
@@ -237,15 +272,41 @@ flawed knob — at 5K/tick when due-rate is ≥5K/s the backlog grows
 unbounded. Two options remained:
 
 (a) Multi-level wheel — extra complexity and a follow-up.
-(b) Just pay the bucket cost — ≤7 ms per tick at 1M sessions / 30s
-    timeouts in the worst case, but small (sub-ms) for realistic
-    loads. This still beats today's O(N) which is 100+ ms at the
-    same scale.
+(b) Just pay the bucket cost. Under the assumption that scheduled
+    ticks are spread roughly uniformly across the wheel (the
+    typical case: sessions installed and touched at independent
+    times produce expirations spread across `WHEEL_BUCKETS`
+    distinct ticks), per-tick work is `O(N / WHEEL_BUCKETS)`. At
+    1M sessions / 256-tick wheel that's ~4K entries per bucket;
+    at ~1.7 µs per entry (HashMap lookup + state update) the
+    per-tick cost is **~7 ms under uniform distribution**, well
+    under sub-ms for realistic loads of ≤100K sessions.
 
-We choose (b). The plan is honest: this is *bounded per-bucket*
-work, not *fixed per-tick* work. The "Stop the World" #965 issue
-goes away because per-tick work is now O(N/T) instead of O(N) —
-~30× lower at typical timeout/session-count ratios.
+We choose (b). Worst-case caveat: this is **average-case**, not
+absolute worst-case. Adversarial / synthetic workloads that bunch
+all installs into a single tick (all sessions installed at boot
+with identical timeouts, then idle) place every entry in one
+bucket. That bucket sees `O(N)` work at the moment the wheel sweep
+reaches it. We accept this because (i) it requires a synthetic
+load shape — real traffic does not install N sessions in one
+tick, (ii) the cost is paid exactly once per 256 s at most for
+that bucket, and (iii) the resulting latency spike (≈ same as
+today's StW for that one tick) is no worse than today's pre-#965
+behavior, and is dramatically better for the other 255 ticks.
+
+The plan is honest: this is *bounded per-bucket* work, not
+*fixed per-tick* work. The "Stop the World" #965 issue goes away
+because per-tick work is now `O(N / WHEEL_BUCKETS)` under uniform
+distribution instead of `O(N)` every tick.
+
+The acceptance-gate "mouse-latency" check (Acceptance gate §4
+below) installs sessions at a *uniform* rate over many ticks
+before triggering GC and asserts p99 GC-tick wall time ≤ 1 ms
+under a 50K-session synthetic load. That gate is explicit about
+the uniform-distribution shape; clustered-install adversarial
+shapes (every session installed in the same tick) are out of
+scope for #965 and tracked under #964 / multi-level wheel
+follow-up.
 
 ```rust
 pub fn expire_stale_entries(&mut self, now_ns: u64) -> Vec<ExpiredSession> {
@@ -350,7 +411,15 @@ let actual_key = if self.sessions.contains_key(key) {
 } else {
     return None;
 };
-self.sessions.get_mut(&actual_key).map(|entry| {
+
+// Scope the &mut self.sessions borrow so it ends BEFORE we touch
+// self.wheel. Without this scoping the closure form
+// `self.sessions.get_mut(...).map(|entry| { ... self.wheel ... })`
+// holds a mutable borrow on `self` (via `self.sessions`) and a
+// second mutable borrow on `self.wheel` simultaneously, which the
+// borrow checker rejects.
+let push_tick: Option<u64> = {
+    let entry = self.sessions.get_mut(&actual_key)?;
     // ... last_seen_ns / expires_after_ns updates ...
     let new_expiration_tick = target_tick_for(
         now_ns,
@@ -358,15 +427,26 @@ self.sessions.get_mut(&actual_key).map(|entry| {
     );
     if new_expiration_tick != entry.wheel_tick {
         entry.wheel_tick = new_expiration_tick;
-        // PUSH actual_key, not the alias `key`. Payload must be
-        // a WheelEntry carrying the canonical scheduled_tick so
-        // pop's lazy-delete discriminator can detect staleness.
-        let bucket = bucket_for_tick(new_expiration_tick);
-        self.wheel.buckets[bucket].push_back(WheelEntry {
-            key: actual_key.clone(),
-            scheduled_tick: new_expiration_tick,
-        });
+        Some(new_expiration_tick)
+    } else {
+        None
     }
+}; // <-- &mut self.sessions borrow ends here
+
+if let Some(tick) = push_tick {
+    // PUSH actual_key, not the alias `key`. Payload must be a
+    // WheelEntry carrying the canonical scheduled_tick so pop's
+    // lazy-delete discriminator can detect staleness.
+    let bucket = bucket_for_tick(tick);
+    self.wheel.buckets[bucket].push_back(WheelEntry {
+        key: actual_key.clone(),
+        scheduled_tick: tick,
+    });
+}
+
+// Build the SessionLookup return value via a fresh & immutable
+// borrow on self.sessions (the &mut borrow above has dropped).
+self.sessions.get(&actual_key).map(|entry| {
     // ... return SessionLookup ...
 })
 ```
@@ -395,10 +475,11 @@ honest phrasing is: "amortized O(1) push, occasional reallocation
 during bucket warmup". The expected number of bucket-reallocations
 across the wheel's first 256 ticks is `O(WHEEL_BUCKETS × log(B_avg))`
 ≈ 256 × ~5 = ~1300 reallocations total during warm-up. Each is a
-VecDeque buffer copy of size ~B/2 — for B=3K that's 3K × 248 B =
-~750 KB per realloc × 1300 reallocs = ~1 GB of memory churn during
-warm-up. Spread over 256 ticks (256 s wall time), that's ~4 MB/s of
-allocator traffic. Negligible vs the per-packet hot path.
+VecDeque buffer copy of size ~B/2 — for B=3K that's 3K × 48 B =
+~144 KB per realloc × 1300 reallocs = ~180 MB of memory churn
+during warm-up. Spread over 256 ticks (256 s wall time), that's
+~720 KB/s of allocator traffic. Negligible vs the per-packet hot
+path.
 
 After warm-up (after first wheel rotation), each bucket's VecDeque
 has settled at ~max-bucket-size capacity. New pushes don't grow.
@@ -418,7 +499,8 @@ fn new_wheel() -> SessionWheel {
 
 Construction memory cost: 256 × 24 B = 6 KB. Steady state: bucket
 buffers grow to fit avg load × geometric headroom. For typical
-100K × 30s workloads, ~30 active buckets × 3K × 248 B = ~22 MB.
+100K × 30s workloads, ~30 active buckets × ~3K entries × 48 B =
+~4.3 MB.
 
 ### Files touched
 
@@ -461,6 +543,12 @@ buffers grow to fit avg load × geometric headroom. For typical
   sessions all with same expiration; advance time past expiration;
   verify expire_stale_entries returns all 50K in a single call
   (no per-tick cap; one tick = one bucket = O(B) work, not capped).
+- `wheel_alias_lookup_does_not_double_borrow_self`: compile-time
+  test that the alias path's `lookup_with_origin` body type-checks
+  (i.e. the &mut self.sessions borrow is scoped before
+  self.wheel.buckets is touched). This is enforced by the borrow
+  checker; the test exists to guard against future refactors that
+  reintroduce a `.map(|entry| { ... self.wheel ... })` shape.
 - `wheel_handles_concurrent_insert_and_pop`: not relevant
   (SessionTable is not Send + Sync — owned by a single worker;
   Codex confirmed worker.rs:490 has `let mut sessions = ...`).
