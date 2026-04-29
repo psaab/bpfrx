@@ -1,6 +1,19 @@
 # #956 Phase 1: extract cos/ecn.rs from tx.rs (establish the cos/ submodule)
 
-Plan v5 — 2026-04-29. Addresses Codex round-4 (task-mokc037q-sjefmd):
+Plan v6 — 2026-04-29. Addresses Codex round-5 (task-mokc6mah-pcctmc):
+three minor inventory cleanups.
+
+α. Files-touched section duplicated the `cos/mod.rs` entry — kept
+   only the fuller one with the `pub(super) use` re-export list.
+
+β. Files-touched section's `afxdp.rs` bullet still said `pub(super)
+   mod cos;` — contradicted the corrected actionable section.
+   Updated to `#[path = "afxdp/cos/mod.rs"] mod cos;`.
+
+γ. v4 estimated test_fixtures.rs at ~860 LOC; actual at this commit
+   is 663 LOC. Corrected.
+
+v5 — Addresses Codex round-4 (task-mokc037q-sjefmd):
 three stale-text findings.
 
 A. Module declaration style: v4 said `pub(super) mod cos;` and
@@ -323,17 +336,17 @@ and is reused; do not add a duplicate.
 
 ## Files touched
 
-- **NEW** `userspace-dp/src/afxdp/cos/mod.rs`: ~5 LOC declaring
-  `pub(super) mod ecn;`.
 - **NEW** `userspace-dp/src/afxdp/cos/ecn.rs`: ~250 LOC (moved
   code + 15 tests).
-- **NEW** `userspace-dp/src/afxdp/cos/mod.rs`: ~5 LOC (`pub(super)
-  mod ecn;` + `pub(super) use ecn::{maybe_mark_ecn_ce,
+- **NEW** `userspace-dp/src/afxdp/cos/mod.rs`: ~5 LOC — `mod ecn;`
+  plus `pub(super) use ecn::{maybe_mark_ecn_ce,
   maybe_mark_ecn_ce_prepared, ECN_MASK, ECN_NOT_ECT, ECN_ECT_0,
-  ECN_ECT_1, ECN_CE};`).
-- `userspace-dp/src/afxdp/test_fixtures.rs` (EXISTS,
-  ~860 LOC currently): EXTENDED with the ~80 LOC of shared fixtures
-  moved out of `tx::tests` (`build_ipv4_test_packet`,
+  ECN_ECT_1, ECN_CE};`. (Codex round-5 #2 caught a duplicate entry
+  in v5.)
+- `userspace-dp/src/afxdp/test_fixtures.rs` (EXISTS, currently
+  ~663 LOC at this commit; round-5 #3 corrected the v4 ~860 LOC
+  estimate): EXTENDED with the ~80 LOC of shared fixtures moved
+  out of `tx::tests` (`build_ipv4_test_packet`,
   `build_ipv6_test_packet`, `compute_ipv4_header_checksum`,
   `insert_single_vlan_tag`, `test_prepared_item_in_umem`). Existing
   `pub(super)` visibility pattern preserved.
@@ -341,7 +354,10 @@ and is reused; do not add a duplicate.
   marker tests), removes ~80 LOC (fixtures moved to `test_fixtures.rs`),
   adds `use` statements pointing at `cos::{...}` and
   `test_fixtures::*`. Net: ~330 LOC smaller.
-- `userspace-dp/src/afxdp.rs`: adds `pub(super) mod cos;` (~1 LOC).
+- `userspace-dp/src/afxdp.rs`: adds `#[path = "afxdp/cos/mod.rs"]
+  mod cos;` (private, explicit path, matching the existing
+  `#[path = "afxdp/tx.rs"] mod tx;` pattern at line 97 — Codex
+  round-5 #1 caught a stale `pub(super) mod cos;` residue in v4).
   The existing `#[cfg(test)] #[path = "afxdp/test_fixtures.rs"]
   mod test_fixtures;` line at `afxdp.rs:93-94` already declares the
   test_fixtures module — DO NOT add a duplicate (Codex round-3 #3).
