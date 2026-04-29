@@ -1059,6 +1059,18 @@ pub struct WorkerRuntimeStatus {
     pub work_loops: u64,
     #[serde(rename = "idle_loops", default)]
     pub idle_loops: u64,
+    /// #925: true if the worker_loop thread panicked and the supervisor
+    /// caught it. Set once on first panic; never cleared in Phase 1.
+    /// Operators see DEAD in `cli show chassis forwarding` and must
+    /// restart the daemon for the dead worker's bindings to recover.
+    #[serde(rename = "dead", default)]
+    pub dead: bool,
+    /// #925: panic payload string for operator diagnosis.
+    /// Cases: `&str` payload → the argument; `String` payload → its
+    /// content; non-string payload → literal "non-string panic payload";
+    /// worker alive (no panic) → empty.
+    #[serde(rename = "panic_message", default)]
+    pub panic_message: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

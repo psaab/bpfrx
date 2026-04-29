@@ -58,6 +58,11 @@ pub struct Coordinator {
     /// Per-RG epoch counters for O(1) flow cache invalidation on demotion.
     /// Shared with all worker threads; bumped atomically on demotion/activation.
     pub(crate) rg_epochs: Arc<[AtomicU32; MAX_RG_EPOCHS]>,
+    /// #925 Phase 1: panic-payload slot per worker, keyed by `worker_id`.
+    /// `BTreeMap` (not `Vec`) so non-contiguous or reused worker IDs map
+    /// stably; written exactly once when the worker dies, read at most
+    /// once per gRPC status poll (~1 Hz). Not on the packet hot path.
+    pub(crate) worker_panics: BTreeMap<u32, Arc<Mutex<Option<String>>>>,
 }
 
 impl Coordinator {
@@ -111,6 +116,7 @@ impl Coordinator {
             cos_owner_worker_by_queue: BTreeMap::new(),
             last_cache_flush_at: Arc::new(AtomicU64::new(0)),
             rg_epochs: Arc::new(std::array::from_fn(|_| AtomicU32::new(0))),
+            worker_panics: BTreeMap::new(),
         }
     }
 
@@ -274,6 +280,10 @@ impl Coordinator {
         self.workers.clear();
         self.identities.clear();
         self.live.clear();
+        // #925 Phase 1: drop the per-worker panic slots alongside the
+        // workers themselves so a long-running daemon that reconciles
+        // through many worker-id sets doesn't accumulate stale slots.
+        self.worker_panics.clear();
         self.cos_owner_worker_by_queue.clear();
         self.shared_cos_owner_worker_by_queue
             .store(Arc::new(BTreeMap::new()));
@@ -721,9 +731,14 @@ impl Coordinator {
             let runtime_atomics =
                 std::sync::Arc::new(super::worker_runtime::WorkerRuntimeAtomics::new());
             let runtime_atomics_clone = runtime_atomics.clone();
-            let join = thread::Builder::new()
-                .name(format!("xpf-userspace-worker-{worker_id}"))
-                .spawn(move || {
+            // #925 Phase 1: per-worker panic slot, keyed by worker_id.
+            let panic_slot = Arc::new(Mutex::new(None::<String>));
+            self.worker_panics.insert(worker_id, panic_slot.clone());
+            let join = spawn_supervised_worker(
+                worker_id,
+                runtime_atomics.clone(),
+                panic_slot,
+                move || {
                     worker_loop(
                         worker_id,
                         binding_plans,
@@ -759,7 +774,8 @@ impl Coordinator {
                         cos_status_clone,
                         runtime_atomics_clone,
                     );
-                });
+                },
+            );
             match join {
                 Ok(join) => {
                     eprintln!(
@@ -785,6 +801,10 @@ impl Coordinator {
                         worker_id, err
                     );
                     self.last_reconcile_stage = format!("spawn_worker_failed:{worker_id}:{err}");
+                    // #925 Phase 1: the panic slot was inserted before
+                    // spawn; drop it now so a snapshot reader doesn't
+                    // see a phantom slot for a worker that never ran.
+                    self.worker_panics.remove(&worker_id);
                     if let Ok(mut recent) = self.recent_exceptions.lock() {
                         push_recent_exception(
                             &mut recent,
@@ -1221,11 +1241,29 @@ impl Coordinator {
     /// #869: snapshot per-worker busy/idle runtime counters.  Each row is
     /// the current `WorkerRuntimeAtomics` publish, most recently written
     /// on the worker's ~1s publish cadence.
+    /// #925: also surfaces `dead` (one-shot AtomicBool set when the
+    /// supervisor catches a worker_loop panic) and the rendered panic
+    /// payload from the per-worker slot in `worker_panics`.
     pub fn worker_runtime_snapshots(&self) -> Vec<crate::protocol::WorkerRuntimeStatus> {
         self.workers
             .iter()
             .map(|(worker_id, handle)| {
                 let s = handle.runtime_atomics.snapshot();
+                let dead = handle
+                    .runtime_atomics
+                    .dead
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let panic_message = if dead {
+                    self.worker_panics
+                        .get(worker_id)
+                        .and_then(|slot| match slot.lock() {
+                            Ok(g) => g.clone(),
+                            Err(poisoned) => poisoned.into_inner().clone(),
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 crate::protocol::WorkerRuntimeStatus {
                     worker_id: *worker_id,
                     tid: handle.runtime_atomics.tid(),
@@ -1236,6 +1274,8 @@ impl Coordinator {
                     thread_cpu_ns: s.thread_cpu_ns,
                     work_loops: s.work_loops,
                     idle_loops: s.idle_loops,
+                    dead,
+                    panic_message,
                 }
             })
             .collect()
@@ -2121,6 +2161,71 @@ fn shared_cos_owner_live_by_queue_match(
         })
 }
 
+/// #925 Phase 1: render a panic payload as an operator-readable string.
+///
+/// Cases:
+/// - `&str` payload → the panic argument verbatim.
+/// - `String` payload → its content.
+/// - Anything else → literal `"non-string panic payload"`.
+///
+/// We deliberately do NOT try to extract a concrete type name from a
+/// `dyn Any` payload — `type_name_of_val` on a `Box<dyn Any>` returns
+/// the trait object's name, not the inner type, which would mislead.
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        String::from("non-string panic payload")
+    }
+}
+
+/// #925 Phase 1: spawn `body` on a named thread and wrap it with
+/// `catch_unwind`. On panic, mark `runtime_atomics.dead = true` and
+/// publish the rendered payload to `panic_slot`.
+///
+/// `AssertUnwindSafe` rationale (narrow): `worker_loop` takes owned
+/// values and `Arc`s — there are no `&mut` parameters to invalidate
+/// across an unwind. Owned values get dropped on unwind. Shared
+/// `Arc<Mutex<…>>` state MAY become poisoned; per #925's "detection
+/// only" framing this PR does not promise full state recovery — see
+/// `docs/pr/925-worker-supervisor/plan.md` §"AssertUnwindSafe rationale".
+fn spawn_supervised_worker<F>(
+    worker_id: u32,
+    runtime_atomics: Arc<super::worker_runtime::WorkerRuntimeAtomics>,
+    panic_slot: Arc<Mutex<Option<String>>>,
+    body: F,
+) -> std::io::Result<thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    thread::Builder::new()
+        .name(format!("xpf-userspace-worker-{worker_id}"))
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+            if let Err(payload) = result {
+                let msg = panic_payload_message(&payload);
+                eprintln!(
+                    "xpf-userspace-dp: worker_loop panicked (worker_id={worker_id}): {msg}",
+                );
+                // Write the message under the slot mutex; on poison
+                // (a prior panic during read), use into_inner — same
+                // pattern as #949's dynamic_neighbors policy.
+                match panic_slot.lock() {
+                    Ok(mut slot) => *slot = Some(msg),
+                    Err(poisoned) => *poisoned.into_inner() = Some(msg),
+                }
+                // Mark dead. Relaxed is fine — the panic_slot mutex
+                // publishes the message; the dead flag is a one-shot
+                // diagnostic, not a synchronization barrier.
+                runtime_atomics
+                    .dead
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2935,5 +3040,61 @@ mod tests {
         assert_eq!(snap.dbg_cos_queue_overflow, 41);
         assert_eq!(snap.rx_fill_ring_empty_descs, 19);
         assert_eq!(snap.debug_outstanding_tx, 23);
+    }
+
+    // -------------------------------------------------------------
+    // #925 Phase 1: worker supervisor catch_unwind tests.
+    // -------------------------------------------------------------
+
+    /// Helper: extract the message from a caught panic payload using
+    /// the same renderer the supervisor uses.
+    fn caught_message<F: FnOnce() + std::panic::UnwindSafe>(f: F) -> String {
+        let r = std::panic::catch_unwind(f);
+        let payload = r.unwrap_err();
+        super::panic_payload_message(&payload)
+    }
+
+    #[test]
+    fn panic_payload_message_renders_str_panic() {
+        assert_eq!(caught_message(|| panic!("hello world")), "hello world");
+    }
+
+    #[test]
+    fn panic_payload_message_renders_string_panic() {
+        let s = String::from("owned message");
+        assert_eq!(caught_message(move || panic!("{}", s)), "owned message");
+    }
+
+    #[test]
+    fn panic_payload_message_falls_back_for_non_string() {
+        // panic_any unwinds with a non-string payload (i32 here).
+        let msg = caught_message(|| std::panic::panic_any(42_i32));
+        assert_eq!(msg, "non-string panic payload");
+    }
+
+    /// Integration test against the same `spawn_supervised_worker`
+    /// production uses (the spawn-closure body is the only thing we
+    /// substitute — the supervisor wrapper is the real one).
+    #[test]
+    fn spawn_supervised_worker_catches_string_panic_and_marks_dead() {
+        use std::sync::atomic::Ordering;
+        let atomics = Arc::new(super::super::worker_runtime::WorkerRuntimeAtomics::new());
+        let slot = Arc::new(Mutex::new(None::<String>));
+        let join = super::spawn_supervised_worker(
+            7,
+            atomics.clone(),
+            slot.clone(),
+            || panic!("intentional test panic"),
+        )
+        .expect("spawn_supervised_worker");
+        // The supervisor must NOT propagate the panic to the joiner.
+        join.join().expect("supervisor must catch worker panic");
+        assert!(atomics.dead.load(Ordering::Relaxed));
+        let msg = slot
+            .lock()
+            .expect("panic slot lock")
+            .clone()
+            .expect("panic message published");
+        assert_eq!(msg, "intentional test panic");
     }
 }

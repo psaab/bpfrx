@@ -526,15 +526,21 @@ type HAStateUpdateRequest struct {
 // refreshed on the worker's ~1s publish cadence.  All fields omit when
 // zero so older daemons parse correctly.
 type WorkerRuntimeStatus struct {
-	WorkerID     uint32 `json:"worker_id,omitempty"`
-	TID          uint64 `json:"tid,omitempty"`
-	WallNS       uint64 `json:"wall_ns,omitempty"`
-	ActiveNS     uint64 `json:"active_ns,omitempty"`
-	IdleSpinNS   uint64 `json:"idle_spin_ns,omitempty"`
-	IdleBlockNS  uint64 `json:"idle_block_ns,omitempty"`
-	ThreadCPUNS  uint64 `json:"thread_cpu_ns,omitempty"`
-	WorkLoops    uint64 `json:"work_loops,omitempty"`
-	IdleLoops    uint64 `json:"idle_loops,omitempty"`
+	WorkerID    uint32 `json:"worker_id,omitempty"`
+	TID         uint64 `json:"tid,omitempty"`
+	WallNS      uint64 `json:"wall_ns,omitempty"`
+	ActiveNS    uint64 `json:"active_ns,omitempty"`
+	IdleSpinNS  uint64 `json:"idle_spin_ns,omitempty"`
+	IdleBlockNS uint64 `json:"idle_block_ns,omitempty"`
+	ThreadCPUNS uint64 `json:"thread_cpu_ns,omitempty"`
+	WorkLoops   uint64 `json:"work_loops,omitempty"`
+	IdleLoops   uint64 `json:"idle_loops,omitempty"`
+	// #925 Phase 1 (catch+report): Dead == true means the worker_loop
+	// panicked and the supervisor caught it. Cleared only by daemon
+	// restart in Phase 1; Phase 2 (respawn) will clear on relaunch.
+	// PanicMessage holds the rendered payload for operator diagnosis.
+	Dead         bool   `json:"dead,omitempty"`
+	PanicMessage string `json:"panic_message,omitempty"`
 }
 
 type HAGroupStatus struct {

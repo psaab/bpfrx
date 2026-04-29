@@ -312,6 +312,14 @@ func FormatStatusSummary(status ProcessStatus) string {
 		fmt.Fprintf(&b, "  %-6s %-8s %-8s %-10s %-11s %-8s %-12s %-12s\n",
 			"Worker", "TID", "Active%", "SpinIdle%", "BlockIdle%", "CPU%", "WorkLoops", "IdleLoops")
 		for _, w := range status.WorkerRuntime {
+			// #925 Phase 1: dead workers replace the runtime row with
+			// a DEAD marker + the rendered panic payload. Operator
+			// must restart the daemon to recover the worker's bindings.
+			if w.Dead {
+				fmt.Fprintf(&b, "  %-6d %-8d   DEAD - panicked: %s\n",
+					w.WorkerID, w.TID, w.PanicMessage)
+				continue
+			}
 			wall := float64(w.WallNS)
 			if wall <= 0 {
 				fmt.Fprintf(&b, "  %-6d %-8d    -        -          -        -   %-12d %-12d\n",
