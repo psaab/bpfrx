@@ -23,9 +23,12 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Threshold below which a `Linear` variant is used. See
 /// `docs/pr/923-policy-prefix-set/plan.md` §"Threshold rationale".
-/// 16 is a starting tunable; criterion microbench in
-/// `benches/prefix_set_lookup.rs` sweeps {4,8,16,32,64} for a
-/// future retune.
+/// 16 is a starting tunable; the companion bench
+/// `benches/prefix_set_lookup.rs` gates the worst-case build cost
+/// (`Box<TrieNode>` allocation footprint for 256 random /32
+/// prefixes) at p95 ≤ 2 ms — it does NOT sweep thresholds yet.
+/// A threshold-sweep + lookup-cost microbench is a follow-up if
+/// the constant turns out to be poorly tuned in production traces.
 pub(crate) const PREFIX_SET_LINEAR_MAX: usize = 16;
 
 /// IPv4 prefix membership set. See module docs.
