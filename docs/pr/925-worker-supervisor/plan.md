@@ -1,6 +1,6 @@
 # #925: worker thread supervisor (Phase 1 — catch + report)
 
-Plan v3 — 2026-04-29. Addresses Codex round-2 review (task-mojk796g-0nm5pi): poison-safety overclaim narrowed, real spawn path identified, doc inconsistency fixed.
+Plan v4 — 2026-04-29. Addresses Gemini final-pass (task-mojkn285-83bz47): switch panic slots from Vec to BTreeMap<u32, ...> for stable worker_id mapping (Phase 2 respawn-friendly).
 
 ## Investigation findings (Claude, first-hand)
 
@@ -108,11 +108,18 @@ pub(crate) struct WorkerRuntimeAtomics {
 ### Panic message slot
 
 Stored on `Coordinator`, not on the per-worker atomics struct. One
-`Arc<Mutex<Option<String>>>` per worker, indexed by `worker_id`.
+`Arc<Mutex<Option<String>>>` per worker, **indexed by `worker_id`**.
+
+Per Gemini final-pass: use `BTreeMap<u32, ...>`, NOT `Vec`. With
+`Vec` the index is spawn-order, not `worker_id`. If `worker_id`s are
+non-contiguous, gappy (e.g. binding plan reduces from 8 → 4
+workers), or reused after a Phase 2 respawn, a `Vec` mapping
+diverges from `worker_id` semantics. `BTreeMap` is robust to all
+of these and adds negligible per-lookup cost (status poll is ~1 Hz).
 
 ```rust
 // In Coordinator:
-worker_panics: Vec<Arc<Mutex<Option<String>>>>,
+worker_panics: BTreeMap<u32, Arc<Mutex<Option<String>>>>,
 ```
 
 The `Mutex` is fine here because:
@@ -177,7 +184,7 @@ fine.
 
 ```rust
 let panic_slot = Arc::new(Mutex::new(None::<String>));
-self.worker_panics.push(panic_slot.clone());
+self.worker_panics.insert(worker_id, panic_slot.clone());
 let runtime_atomics_supervisor = runtime_atomics.clone();
 let worker_id_supervisor = worker_id;
 let join = thread::Builder::new()
@@ -298,7 +305,7 @@ Test for the fallback: panic with `i32`; assert message ==
 
 1. **Rust types**: add `dead: AtomicBool` to `WorkerRuntimeAtomics`
    (`worker_runtime.rs`).
-2. **Coordinator**: add `worker_panics: Vec<Arc<Mutex<Option<String>>>>`
+2. **Coordinator**: add `worker_panics: BTreeMap<u32, Arc<Mutex<Option<String>>>>`
    field. Push a slot per worker spawn.
 3. **Rust protocol**: add `dead` and `panic_message` to
    `WorkerRuntimeStatus` (`protocol.rs:1043`).
