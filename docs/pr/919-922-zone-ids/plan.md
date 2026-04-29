@@ -1,6 +1,6 @@
 # #919 + #922: zone strings → integer IDs
 
-Plan v3 — 2026-04-29. Addresses Codex round-2 review (task-mojk78nr-8xwzo3): HA/session-sync import path missed; `_by_id` helper location.
+Plan v4 — 2026-04-29. Addresses Gemini final-pass (task-mojklwhz-pnqsfx): cycle estimate, session-setup gate methodology, codec debug_assert, test-helper constants.
 
 ## Combined scope
 
@@ -67,6 +67,27 @@ pub(crate) struct SessionMetadata {
 
 After change: 28 bytes saved per `SessionMetadata` plus eliminates
 the per-clone atomic.
+
+**Order-of-magnitude cycle estimate** (per Gemini Q3):
+
+- `LOCK XADD` on x86_64: ~10-20 cycles for the atomic, plus
+  cross-core MESI/QPI traffic when other cores have the cache line
+  (the common case for shared session-table reads).
+- Two `Arc::clone` calls per `SessionMetadata.clone()` (one per
+  zone field) × every session-table read path that clones metadata
+  (`session.rs:340-393` clones per lookup hit).
+- At 25 Gb/s = ~2M pps and one clone per packet that hits a session,
+  that's roughly **40-80M atomic ops/s saved**, or ~7-15M cycles/s
+  on the critical path — order of 0.1-0.3 % of a 6 GHz core per
+  worker.
+- Bigger win: the 28-byte struct shrinkage means more
+  `SessionMetadata` fits per cache line, improving hit-path locality.
+  Harder to quantify analytically; the smoke + perf stat after impl
+  measures it directly.
+
+The dominant win is on **higher-PPS / smaller-MTU** workloads
+where clone-rate scales linearly. At MTU 64 (microbench scenarios)
+the same 25 Gb/s pipe carries ~50M pps — 25× more clone ops.
 
 ### Sites that construct `SessionMetadata` (corrected scope)
 
@@ -360,6 +381,11 @@ invariant: zone IDs that need to cross the wire MUST fit in u8 (i.e.,
 < 256). `forwarding_build.rs` already enforces by-construction
 (IDs are `i+1` in Go, capped at 64).
 
+**Defensive check** (per Gemini Q5): add `debug_assert!(id < 256,
+"zone id {} exceeds wire u8 capacity", id)` at the codec write
+site. Catches future regressions (e.g. a `MAX_ZONES` bump) at test
+time without paying the assertion cost in release builds.
+
 ## Implementation steps
 
 1. **`policy.rs`**: add `JUNOS_GLOBAL_ZONE_ID` and `ZONE_ID_RESERVED_MIN` constants. Change `ZonePairKey` to `u32`. Change `evaluate_policy` and `parse_policy_state` signatures.
@@ -388,7 +414,23 @@ invariant: zone IDs that need to cross the wire MUST fit in u8 (i.e.,
     `IngressZoneID uint16` / `EgressZoneID uint16` fields. Update
     any session-sync builder in `pkg/dataplane/userspace/` to emit
     them. Go already has the IDs available pre-stringify.
-14. **`tests`**: ~73 test sites construct `SessionMetadata` with `Arc::<str>::from("name")` literals. Update each. Some tests construct a `forwarding` state with custom zones — those tests need to populate `zone_name_to_id` and `zone_id_to_name` accordingly.
+14. **`tests`** (refactor strategy per Gemini Q6): with ~73
+    `SessionMetadata` sites, raw `u16` literals would harm
+    readability. Define test-helper constants (e.g. in a
+    `userspace-dp/src/test_zone_ids.rs` module gated on
+    `#[cfg(test)]`):
+    ```rust
+    pub(crate) const TEST_LAN_ZONE_ID: u16 = 1;
+    pub(crate) const TEST_WAN_ZONE_ID: u16 = 2;
+    pub(crate) const TEST_TRUST_ZONE_ID: u16 = 3;
+    pub(crate) const TEST_UNTRUST_ZONE_ID: u16 = 4;
+    pub(crate) const TEST_SFMIX_ZONE_ID: u16 = 5;
+    pub(crate) const TEST_FABRIC_ZONE_ID: u16 = 6;
+    ```
+    Use these in test fixtures and in any `forwarding` state
+    construction so `zone_name_to_id` / `zone_id_to_name` populate
+    consistently. Keeps tests readable while exercising the new u16
+    contract.
 
 ## Test plan
 
@@ -408,10 +450,22 @@ invariant: zone IDs that need to cross the wire MUST fit in u8 (i.e.,
   - iperf-c P=1 ≥ 6 Gb/s
   - iperf-b P=12 ≥ 9.5 Gb/s, 0 retx
   - mouse p99 comparable to master 3-run baseline
-- **Session-setup throughput** (NEW gate): run a session-churn
-  workload (e.g. `iperf3 -P 256` reconnect loop) and confirm
-  new-session rate is at least at master baseline. Without this
-  gate, the perf-motivation in the issues is unverified.
+- **Session-setup throughput** (NEW gate, methodology per Gemini Q4):
+  - **Workload**: tight reconnect loop —
+    `for i in $(seq 1 5000); do nc -z -w 1 172.16.80.200 5203; done`
+    sustained over 30 s. Each connection is a one-shot
+    SYN/SYN-ACK/RST that creates and tears down a session,
+    exercising `evaluate_policy` per connection.
+  - **Measurement**: `cli show chassis forwarding sessions` exposes
+    a session-install counter. Sample at start and end; compute
+    delta / duration = sessions/s. (Verify exact metric name at
+    impl time; if absent, add one.)
+  - **Baseline**: 3 runs on `origin/master`, take median.
+  - **Acceptance**: refactored branch median ≥ 95 % of master
+    median (5 % regression headroom for measurement noise).
+    Improvement is expected; equality is sufficient.
+  - **Stretch goal**: ≥ 110 % of master median (10 % improvement),
+    consistent with 5-allocations-removed-per-call.
 
 ## Risk
 
