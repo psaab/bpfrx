@@ -3538,17 +3538,20 @@ const COS_ECN_MARK_THRESHOLD_DEN: u64 = 3;
 const _: () = assert!(COS_ECN_MARK_THRESHOLD_NUM < COS_ECN_MARK_THRESHOLD_DEN);
 const _: () = assert!(COS_ECN_MARK_THRESHOLD_DEN > 0);
 
-// #956 Phase 1: ECN codepoint masks, EthernetL3 enum, ethernet_l3
-// parser, mark_ecn_ce_ipv4/ipv6, and maybe_mark_ecn_ce/_prepared
-// were extracted to userspace-dp/src/afxdp/cos/ecn.rs. Admission
-// policy `apply_cos_admission_ecn_policy` (and the threshold
-// constants `COS_ECN_MARK_THRESHOLD_NUM/_DEN`) stay here; they
-// move with admission to cos/admission.rs in Phase 2.
+// #956: cos/ submodule imports.
 //
-// Production code uses only the marker entry points; the
-// codepoint masks + parser + per-family helpers are referenced
-// only by `tx::tests` (admission tests + ECN unit tests that
-// stay here for Phase 1). The test-only imports are gated
+// Phase 1 (PR #976) extracted ECN marking into cos/ecn.rs.
+// Phase 2 (this PR) extracts the flow-hash helpers into
+// cos/flow_hash.rs. Admission policy
+// `apply_cos_admission_ecn_policy` (and the threshold constants
+// `COS_ECN_MARK_THRESHOLD_NUM/_DEN`) stay in tx.rs; they move
+// with admission to cos/admission.rs in **Phase 3**.
+//
+// Production code uses the entry points re-exported from
+// cos/mod.rs (marker fns + flow-hash production helpers).
+// The codepoint masks + ECN parser + per-family ECN helpers are
+// referenced only by `tx::tests` (admission tests + ECN unit
+// tests that stay here for Phase 1). Their imports are gated
 // behind `#[cfg(test)]` to avoid `unused_imports` warnings in
 // non-test builds (Copilot review on PR #976).
 use super::cos::{

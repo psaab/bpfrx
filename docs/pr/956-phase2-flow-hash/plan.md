@@ -94,9 +94,12 @@ Phase 1 originally planned to move tests + fixtures with the
 production code; the implementation walked that back to avoid a
 same-PR fixture relocation. Phase 2 takes the lesson up front:
 **leave the 8 tests in `tx::tests`** for this PR. They reach the
-moved items via `use super::cos::flow_hash::{...}`. Test
-relocation is deferred to a later cleanup PR (or to whichever
-phase finally consolidates `tx::tests`).
+moved items via `use super::cos::{...}` — the re-exports from
+`cos/mod.rs` deliver `cos_flow_bucket_index` and
+`cos_flow_hash_seed_from_os` at the short path, matching the
+production import shape. Test relocation is deferred to a later
+cleanup PR (or to whichever phase finally consolidates
+`tx::tests`).
 
 The flow-hash tests are simpler than ECN's — they don't share
 fixtures with admission tests. So they're easier to move later
