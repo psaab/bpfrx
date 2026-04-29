@@ -2431,6 +2431,7 @@ fn maybe_reinject_slow_path_ignores_forward_candidate_disposition() {
         meta,
         decision,
         &recent_exceptions,
+    &ForwardingState::default(),
     );
 
     assert_eq!(live.slow_path_packets.load(Ordering::Relaxed), 0);
@@ -2491,6 +2492,7 @@ fn maybe_reinject_slow_path_records_extract_failure_for_invalid_desc() {
         meta,
         decision,
         &recent_exceptions,
+    &ForwardingState::default(),
     );
 
     assert_eq!(live.slow_path_drops.load(Ordering::Relaxed), 1);
@@ -2549,6 +2551,7 @@ fn maybe_reinject_slow_path_from_frame_records_unavailable() {
         decision,
         &recent_exceptions,
         "forward_build_slow_path",
+    &ForwardingState::default(),
     );
 
     assert_eq!(live.slow_path_packets.load(Ordering::Relaxed), 0);
@@ -2612,6 +2615,7 @@ fn handle_forward_build_failure_records_build_and_slow_path_failures() {
         meta,
         decision,
         true,
+    &ForwardingState::default(),
     );
 
     assert_eq!(dbg.build_fail, 1);
@@ -2682,6 +2686,7 @@ fn handle_forward_build_failure_without_fallback_only_records_build_failure() {
         meta,
         decision,
         false,
+    &ForwardingState::default(),
     );
 
     assert_eq!(dbg.build_fail, 1);

@@ -1567,6 +1567,89 @@ mod tests {
         );
     }
 
+    /// #919/#922: when a peer sends both legacy zone names and the new
+    /// u16 IDs, the daemon must trust the IDs. Models a new-peer-to-new-
+    /// daemon flow where the IDs are authoritative even if the names
+    /// drift (e.g., a name string is misspelled or unresolved).
+    #[test]
+    fn build_synced_session_entry_prefers_id_over_legacy_zone_name() {
+        let req = SessionSyncRequest {
+            operation: "upsert".to_string(),
+            addr_family: libc::AF_INET as u8,
+            protocol: 6,
+            src_ip: "10.0.61.102".to_string(),
+            dst_ip: "172.16.80.200".to_string(),
+            src_port: 40000,
+            dst_port: 5201,
+            ingress_zone: "stale-name".to_string(),
+            egress_zone: "stale-name".to_string(),
+            ingress_zone_id: 1,
+            egress_zone_id: 2,
+            owner_rg_id: 1,
+            egress_ifindex: 5,
+            tx_ifindex: 5,
+            ..SessionSyncRequest::default()
+        };
+        let entry = build_synced_session_entry(&req, &test_zone_name_to_id())
+            .expect("synced session entry");
+        assert_eq!(entry.metadata.ingress_zone, 1);
+        assert_eq!(entry.metadata.egress_zone, 2);
+    }
+
+    /// #919/#922: an old peer (legacy strings, no IDs) lands at a new
+    /// daemon. `ingress_zone_id == 0` triggers the name-lookup
+    /// fallback; the session is still installed with the resolved ID.
+    #[test]
+    fn build_synced_session_entry_falls_back_to_zone_name_when_id_zero() {
+        let req = SessionSyncRequest {
+            operation: "upsert".to_string(),
+            addr_family: libc::AF_INET as u8,
+            protocol: 6,
+            src_ip: "10.0.61.102".to_string(),
+            dst_ip: "172.16.80.200".to_string(),
+            src_port: 40000,
+            dst_port: 5201,
+            ingress_zone: "lan".to_string(),
+            egress_zone: "wan".to_string(),
+            owner_rg_id: 1,
+            egress_ifindex: 5,
+            tx_ifindex: 5,
+            ..SessionSyncRequest::default()
+        };
+        let entry = build_synced_session_entry(&req, &test_zone_name_to_id())
+            .expect("synced session entry");
+        let m = test_zone_name_to_id();
+        assert_eq!(entry.metadata.ingress_zone, m["lan"]);
+        assert_eq!(entry.metadata.egress_zone, m["wan"]);
+    }
+
+    /// #919/#922: an old peer with strings that the new daemon doesn't
+    /// know about. Both legacy and ID lookups fail; metadata zone IDs
+    /// are 0. The session is still installed (we don't drop it) — the
+    /// caller observes zone-id 0 and treats it as "unknown".
+    #[test]
+    fn build_synced_session_entry_unknown_zone_name_does_not_drop_session() {
+        let req = SessionSyncRequest {
+            operation: "upsert".to_string(),
+            addr_family: libc::AF_INET as u8,
+            protocol: 6,
+            src_ip: "10.0.61.102".to_string(),
+            dst_ip: "172.16.80.200".to_string(),
+            src_port: 40000,
+            dst_port: 5201,
+            ingress_zone: "totally-unknown".to_string(),
+            egress_zone: "another-unknown".to_string(),
+            owner_rg_id: 1,
+            egress_ifindex: 5,
+            tx_ifindex: 5,
+            ..SessionSyncRequest::default()
+        };
+        let entry = build_synced_session_entry(&req, &test_zone_name_to_id())
+            .expect("synced session entry");
+        assert_eq!(entry.metadata.ingress_zone, 0);
+        assert_eq!(entry.metadata.egress_zone, 0);
+    }
+
     #[test]
     fn queue_planner_preserves_existing_state() {
         let existing = vec![BindingStatus {

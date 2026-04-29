@@ -131,21 +131,6 @@ pub(super) fn zone_pair_for_flow(
     zone_pair_for_flow_with_override(forwarding, ingress_ifindex, None, egress_ifindex)
 }
 
-/// #919/#922 test helper: returns zone IDs (u16, u16) by translating
-/// `zone_pair_for_flow` strings through the forwarding state's
-/// `zone_name_to_id` map. Returns `(0, 0)` for unknown zones.
-#[cfg(test)]
-pub(super) fn zone_pair_ids_for_flow(
-    forwarding: &ForwardingState,
-    ingress_ifindex: i32,
-    egress_ifindex: i32,
-) -> (u16, u16) {
-    let (from, to) = zone_pair_for_flow(forwarding, ingress_ifindex, egress_ifindex);
-    let from_id = forwarding.zone_name_to_id.get(&from).copied().unwrap_or(0);
-    let to_id = forwarding.zone_name_to_id.get(&to).copied().unwrap_or(0);
-    (from_id, to_id)
-}
-
 pub(super) fn zone_pair_for_flow_with_override(
     forwarding: &ForwardingState,
     ingress_ifindex: i32,
@@ -162,6 +147,45 @@ pub(super) fn zone_pair_for_flow_with_override(
         .map(|iface| iface.zone.clone())
         .unwrap_or_default();
     (from_zone, to_zone)
+}
+
+/// #919/#922: zero-allocation production zone-pair resolver. Returns
+/// `(from_id, to_id)` u16 pair directly without `String` materialisation.
+/// `ingress_zone_override` is `Option<u16>` (parsed from fabric MAC),
+/// not `Option<&str>` — callers no longer round-trip through names.
+/// Returns `(0, 0)` segments for ifindexes not in the zone maps; the
+/// caller treats `0` as "unknown" and falls back to default policy.
+#[inline]
+pub(super) fn zone_pair_ids_for_flow_with_override(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    ingress_zone_override: Option<u16>,
+    egress_ifindex: i32,
+) -> (u16, u16) {
+    let from_id = ingress_zone_override
+        .or_else(|| {
+            forwarding
+                .ifindex_to_zone
+                .get(&ingress_ifindex)
+                .and_then(|name| forwarding.zone_name_to_id.get(name.as_str()).copied())
+        })
+        .unwrap_or(0);
+    let to_id = forwarding
+        .egress
+        .get(&egress_ifindex)
+        .and_then(|iface| forwarding.zone_name_to_id.get(iface.zone.as_str()).copied())
+        .unwrap_or(0);
+    (from_id, to_id)
+}
+
+/// #919/#922 test convenience: ID-pair without override.
+#[cfg(test)]
+pub(super) fn zone_pair_ids_for_flow(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    egress_ifindex: i32,
+) -> (u16, u16) {
+    zone_pair_ids_for_flow_with_override(forwarding, ingress_ifindex, None, egress_ifindex)
 }
 
 pub(super) fn allow_unsolicited_dns_reply(
@@ -357,18 +381,13 @@ pub(super) fn cluster_peer_return_fast_path(
     dynamic_neighbors: &Arc<ShardedNeighborMap>,
     packet_frame: &[u8],
     meta: UserspaceDpMeta,
-    ingress_zone_override: Option<&str>,
+    ingress_zone_override: Option<u16>,
     resolution_target: IpAddr,
 ) -> Option<(SessionDecision, SessionMetadata)> {
     if !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32) {
         return None;
     }
-    let ingress_zone_name = ingress_zone_override?;
-    let ingress_zone = forwarding
-        .zone_name_to_id
-        .get(ingress_zone_name)
-        .copied()
-        .unwrap_or(0);
+    let ingress_zone = ingress_zone_override?;
     if is_icmp_echo_request(packet_frame, meta) {
         return None;
     }
@@ -2074,7 +2093,7 @@ mod tests {
                 meta,
                 &state,
             ),
-            Some("lan".to_string())
+            Some(TEST_LAN_ZONE_ID)
         );
     }
 
@@ -2379,7 +2398,7 @@ mod tests {
             &dynamic_neighbors,
             &packet_frame,
             meta,
-            Some("sfmix"),
+            Some(TEST_SFMIX_ZONE_ID),
             IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
         )
         .expect("fabric return fast path");
@@ -2419,7 +2438,7 @@ mod tests {
                 &dynamic_neighbors,
                 &[],
                 meta,
-                Some("sfmix"),
+                Some(TEST_SFMIX_ZONE_ID),
                 IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
             )
             .is_none()
@@ -2451,7 +2470,7 @@ mod tests {
                 &dynamic_neighbors,
                 &packet_frame,
                 meta,
-                Some("lan"),
+                Some(TEST_LAN_ZONE_ID),
                 IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
             )
             .is_none()
@@ -2483,7 +2502,7 @@ mod tests {
                 &dynamic_neighbors,
                 &packet_frame,
                 meta,
-                Some("lan"),
+                Some(TEST_LAN_ZONE_ID),
                 IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
             )
             .is_none()

@@ -802,16 +802,19 @@ pub(super) fn parse_zone_encoded_fabric_ingress(
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     forwarding: &ForwardingState,
-) -> Option<String> {
+) -> Option<u16> {
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
     parse_zone_encoded_fabric_ingress_from_frame(frame, meta, forwarding)
 }
 
+/// #919/#922: returns the encoded zone ID (u8 → u16) directly, no
+/// `zone_id_to_name` lookup or `String` clone. Callers that need a
+/// name resolve via `forwarding.zone_id_to_name` on the slow path.
 pub(super) fn parse_zone_encoded_fabric_ingress_from_frame(
     frame: &[u8],
     meta: UserspaceDpMeta,
     forwarding: &ForwardingState,
-) -> Option<String> {
+) -> Option<u16> {
     if !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32) {
         return None;
     }
@@ -826,7 +829,16 @@ pub(super) fn parse_zone_encoded_fabric_ingress_from_frame(
     {
         return None;
     }
-    forwarding.zone_id_to_name.get(&(frame[11] as u16)).cloned()
+    let id = frame[11] as u16;
+    if id == 0 {
+        return None;
+    }
+    // Validate the encoded ID exists in the configured zone map; an
+    // unknown id is a stale or hostile frame.
+    if !forwarding.zone_id_to_name.contains_key(&id) {
+        return None;
+    }
+    Some(id)
 }
 
 pub(super) fn parse_packet_destination_from_frame(

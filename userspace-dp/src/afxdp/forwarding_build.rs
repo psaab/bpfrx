@@ -1127,6 +1127,37 @@ mod tests {
         assert!(state.tx_selection_enabled_v4);
         assert!(state.tx_selection_enabled_v6);
     }
+
+    /// #919/#922: any zone with id ≥ ZONE_ID_RESERVED_MIN must be
+    /// dropped at config-build time so a hostile/buggy snapshot cannot
+    /// collide with the JUNOS_GLOBAL_ZONE_ID sentinel (u16::MAX).
+    #[test]
+    fn build_forwarding_state_rejects_reserved_zone_ids() {
+        use crate::ZoneSnapshot;
+        let snapshot = ConfigSnapshot {
+            zones: vec![
+                ZoneSnapshot {
+                    name: "ok".into(),
+                    id: 5,
+                },
+                ZoneSnapshot {
+                    name: "reserved-edge".into(),
+                    id: crate::policy::ZONE_ID_RESERVED_MIN,
+                },
+                ZoneSnapshot {
+                    name: "global-sentinel".into(),
+                    id: crate::policy::JUNOS_GLOBAL_ZONE_ID,
+                },
+            ],
+            ..Default::default()
+        };
+        let state = build_forwarding_state(&snapshot);
+        assert_eq!(state.zone_name_to_id.get("ok").copied(), Some(5));
+        assert!(state.zone_name_to_id.get("reserved-edge").is_none());
+        assert!(state.zone_name_to_id.get("global-sentinel").is_none());
+        assert!(state.zone_id_to_name.get(&crate::policy::ZONE_ID_RESERVED_MIN).is_none());
+        assert!(state.zone_id_to_name.get(&crate::policy::JUNOS_GLOBAL_ZONE_ID).is_none());
+    }
 }
 
 pub(super) fn pick_interface_v4(iface: &InterfaceSnapshot) -> Option<Ipv4Addr> {

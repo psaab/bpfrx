@@ -1292,6 +1292,7 @@ impl Coordinator {
                 packet_length,
                 Some(meta),
                 &self.recent_exceptions,
+                &self.forwarding,
             );
             if disposition == PacketDisposition::Valid && !req.destination_ip.is_empty() {
                 if let Ok(dst) = req.destination_ip.parse::<IpAddr>() {
@@ -1373,6 +1374,7 @@ impl Coordinator {
                         packet_length,
                         Some(meta),
                         None,
+                        &self.forwarding,
                     );
                 }
             } else if req.emit_on_wire {
@@ -1389,6 +1391,7 @@ impl Coordinator {
             packet_length,
             None,
             None,
+            &self.forwarding,
         );
         Ok(())
     }

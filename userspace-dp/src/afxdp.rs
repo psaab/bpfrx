@@ -981,14 +981,21 @@ fn poll_binding_process_descriptor(
                     }
                     // Screen/IDS check — runs BEFORE session lookup.
                     // Resolve ingress zone name for screen profile lookup.
+                    // Slow path — only runs when screen profiles configured.
+                    // #919: ingress_zone_override is now Option<u16>; resolve
+                    // ID → name via zone_id_to_name when present.
                     if screen.has_profiles() {
                         if let Some(flow) = flow.as_ref() {
-                            let zone_name = ingress_zone_override.as_deref().or_else(|| {
-                                worker_ctx.forwarding
-                                    .ifindex_to_zone
-                                    .get(&(meta.ingress_ifindex as i32))
-                                    .map(|s| s.as_str())
-                            });
+                            let zone_name = ingress_zone_override
+                                .and_then(|id| {
+                                    worker_ctx.forwarding.zone_id_to_name.get(&id).map(|s| s.as_str())
+                                })
+                                .or_else(|| {
+                                    worker_ctx.forwarding
+                                        .ifindex_to_zone
+                                        .get(&(meta.ingress_ifindex as i32))
+                                        .map(|s| s.as_str())
+                                });
                             if let Some(zone_name) = zone_name {
                                 let l3_off = if meta.ingress_vlan_id > 0 {
                                     18
@@ -1047,6 +1054,7 @@ fn poll_binding_process_descriptor(
                                 ipsec_decision,
                                 worker_ctx.recent_exceptions,
                                 "slow_path",
+                                worker_ctx.forwarding,
                             );
                             binding.scratch_recycle.push(desc.addr);
                             continue;
@@ -1390,7 +1398,7 @@ fn poll_binding_process_descriptor(
                                     worker_ctx.dynamic_neighbors,
                                     packet_frame,
                                     meta,
-                                    ingress_zone_override.as_deref(),
+                                    ingress_zone_override,
                                     resolution_target,
                                 )
                             {
@@ -1445,8 +1453,13 @@ fn poll_binding_process_descriptor(
                             // Check DNAT table first (port-based DNAT), then
                             // fall back to static NAT DNAT (IP-only 1:1).
                             // The translated destination affects FIB lookup.
+                            // #919: ingress_zone_override is now Option<u16>;
+                            // DNAT/static NAT lookups still take zone names,
+                            // so resolve ID→name lazily on this miss path.
                             let ingress_zone_name = ingress_zone_override
-                                .as_deref()
+                                .and_then(|id| {
+                                    worker_ctx.forwarding.zone_id_to_name.get(&id).map(|s| s.as_str())
+                                })
                                 .or_else(|| {
                                     worker_ctx.forwarding
                                         .ifindex_to_zone
@@ -1582,28 +1595,34 @@ fn poll_binding_process_descriptor(
                                 resolution,
                                 nat: nptv6_nat.or(pre_routing_dnat).unwrap_or_default(),
                             };
-                            let (from_zone, to_zone) = zone_pair_for_flow_with_override(
+                            // #919/#922: zero-allocation zone-pair resolution
+                            // direct from u16 IDs — no String materialisation
+                            // on the per-flow miss path.
+                            let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
                                 worker_ctx.forwarding,
                                 meta.ingress_ifindex as i32,
-                                ingress_zone_override.as_deref(),
+                                ingress_zone_override,
                                 resolution.egress_ifindex,
                             );
-                            // #919: zone names live on the slow path only.
-                            // Translate to u16 IDs for SessionMetadata; name
-                            // strings are kept locally as &str for downstream
-                            // string-typed callers (HA finalize, NAT, debug).
-                            let from_zone_id = worker_ctx
+                            // Borrow zone names as &str for string-typed downstream
+                            // callers (static_nat, match_source_nat_for_flow, debug
+                            // log). No clone — the borrow lives only inside this
+                            // miss-path block while `worker_ctx.forwarding` is held.
+                            let from_zone: &str = worker_ctx
                                 .forwarding
-                                .zone_name_to_id
-                                .get(from_zone.as_str())
-                                .copied()
-                                .unwrap_or(0);
-                            let to_zone_id = worker_ctx
+                                .zone_id_to_name
+                                .get(&from_zone_id)
+                                .map(|s| s.as_str())
+                                .unwrap_or("");
+                            let to_zone: &str = worker_ctx
                                 .forwarding
-                                .zone_name_to_id
-                                .get(to_zone.as_str())
-                                .copied()
-                                .unwrap_or(0);
+                                .zone_id_to_name
+                                .get(&to_zone_id)
+                                .map(|s| s.as_str())
+                                .unwrap_or("");
+                            let is_trust_flow = meta.ingress_ifindex == 5
+                                || from_zone == "lan"
+                                || matches!(flow.src_ip, IpAddr::V4(ip) if ip.octets()[0] == 10);
                             decision.resolution = finalize_new_flow_ha_resolution(
                                 worker_ctx.forwarding,
                                 worker_ctx.ha_state,
@@ -1614,10 +1633,6 @@ fn poll_binding_process_descriptor(
                                 from_zone_id,
                                 ha_startup_grace_until_secs,
                             );
-                            // Always log trust/lan traffic (iperf3) regardless of throttle
-                            let is_trust_flow = meta.ingress_ifindex == 5
-                                || from_zone == "lan"
-                                || matches!(flow.src_ip, IpAddr::V4(ip) if ip.octets()[0] == 10);
                             // Debug: log session miss with flow details (throttled)
                             if cfg!(feature = "debug-log") {
                                 if telemetry.dbg.session_miss <= 10 || is_trust_flow {
@@ -2315,9 +2330,10 @@ fn poll_binding_process_descriptor(
                                 // that owns the egress RG.  Use from_zone_arc directly
                                 // (always in scope) rather than going through the debug
                                 // struct which may not have been populated.
-                                if let Some(redirect) = resolve_zone_encoded_fabric_redirect(
+                                // #919/#922: ID-keyed redirect — no name lookup.
+                                if let Some(redirect) = resolve_zone_encoded_fabric_redirect_by_id(
                                     worker_ctx.forwarding,
-                                    from_zone.as_str(),
+                                    from_zone_id,
                                 )
                                 .or_else(|| resolve_fabric_redirect(worker_ctx.forwarding))
                                 {
@@ -2766,6 +2782,7 @@ fn poll_binding_process_descriptor(
                                     meta,
                                     decision,
                                     worker_ctx.recent_exceptions,
+                                    worker_ctx.forwarding,
                                 );
                                 recycle_now = true;
                             }
@@ -2789,24 +2806,27 @@ fn poll_binding_process_descriptor(
                             }
                             ForwardingDisposition::MissingNeighbor => {
                                 telemetry.dbg.missing_neigh += 1;
-                                let (from_zone, to_zone) = zone_pair_for_flow_with_override(
+                                // #919/#922: zero-allocation ID-native resolution.
+                                let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
                                     worker_ctx.forwarding,
                                     meta.ingress_ifindex as i32,
-                                    ingress_zone_override.as_deref(),
+                                    ingress_zone_override,
                                     decision.resolution.egress_ifindex,
                                 );
-                                let from_zone_id = worker_ctx
+                                // Borrow zone names as &str (no clone) for the
+                                // string-typed downstream NAT helpers.
+                                let from_zone: &str = worker_ctx
                                     .forwarding
-                                    .zone_name_to_id
-                                    .get(from_zone.as_str())
-                                    .copied()
-                                    .unwrap_or(0);
-                                let to_zone_id = worker_ctx
+                                    .zone_id_to_name
+                                    .get(&from_zone_id)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("");
+                                let to_zone: &str = worker_ctx
                                     .forwarding
-                                    .zone_name_to_id
-                                    .get(to_zone.as_str())
-                                    .copied()
-                                    .unwrap_or(0);
+                                    .zone_id_to_name
+                                    .get(&to_zone_id)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("");
                                 // Send ARP/NDP solicitation via RAW socket (not XSK)
                                 // so the reply goes through the kernel's normal RX
                                 // path (cpumap_or_pass), bypassing XSK fill ring issues.
@@ -3006,6 +3026,7 @@ fn poll_binding_process_descriptor(
                             decision,
                             worker_ctx.recent_exceptions,
                             "slow_path",
+                            worker_ctx.forwarding,
                         );
                     }
                 } else {
@@ -3016,6 +3037,7 @@ fn poll_binding_process_descriptor(
                         desc.len as u32,
                         Some(meta),
                         worker_ctx.recent_exceptions,
+                        worker_ctx.forwarding,
                     );
                 }
             } else {
@@ -3028,6 +3050,7 @@ fn poll_binding_process_descriptor(
                     desc.len as u32,
                     None,
                     None,
+                    worker_ctx.forwarding,
                 );
             }
             if recycle_now {
@@ -3570,7 +3593,18 @@ fn record_exception(
     packet_length: u32,
     meta: Option<UserspaceDpMeta>,
     debug: Option<&ResolutionDebug>,
+    forwarding: &ForwardingState,
 ) {
+    // #919: zone IDs render as zone names through `zone_id_to_name`;
+    // unknown IDs render as the empty string (was the original
+    // behaviour for unknown zone names too).
+    let zone_name_for = |id: u16| -> String {
+        forwarding
+            .zone_id_to_name
+            .get(&id)
+            .cloned()
+            .unwrap_or_default()
+    };
     if let Ok(mut recent) = recent_exceptions.lock() {
         push_recent_exception(
             &mut recent,
@@ -3598,12 +3632,8 @@ fn record_exception(
                     .unwrap_or_default(),
                 src_port: debug.map(|d| d.src_port).unwrap_or_default(),
                 dst_port: debug.map(|d| d.dst_port).unwrap_or_default(),
-                from_zone: debug
-                    .and_then(|d| d.from_zone.as_ref().map(|zone| zone.to_string()))
-                    .unwrap_or_default(),
-                to_zone: debug
-                    .and_then(|d| d.to_zone.as_ref().map(|zone| zone.to_string()))
-                    .unwrap_or_default(),
+                from_zone: debug.and_then(|d| d.from_zone).map(zone_name_for).unwrap_or_default(),
+                to_zone: debug.and_then(|d| d.to_zone).map(zone_name_for).unwrap_or_default(),
             },
         );
     }
@@ -3616,6 +3646,7 @@ fn record_disposition(
     packet_length: u32,
     meta: Option<UserspaceDpMeta>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    forwarding: &ForwardingState,
 ) {
     match disposition {
         PacketDisposition::Valid => {
@@ -3632,6 +3663,7 @@ fn record_disposition(
                 packet_length,
                 meta,
                 None,
+                forwarding,
             );
         }
         PacketDisposition::ConfigGenerationMismatch => {
@@ -3644,6 +3676,7 @@ fn record_disposition(
                 packet_length,
                 meta,
                 None,
+                forwarding,
             );
         }
         PacketDisposition::FibGenerationMismatch => {
@@ -3656,6 +3689,7 @@ fn record_disposition(
                 packet_length,
                 meta,
                 None,
+                forwarding,
             );
         }
         PacketDisposition::UnsupportedPacket => {
@@ -3668,6 +3702,7 @@ fn record_disposition(
                 packet_length,
                 meta,
                 None,
+                forwarding,
             );
         }
     }
@@ -3702,6 +3737,7 @@ fn record_forwarding_disposition(
                 packet_length,
                 meta,
                 debug,
+                forwarding,
             );
         }
         ForwardingDisposition::PolicyDenied => {
@@ -3714,6 +3750,7 @@ fn record_forwarding_disposition(
                 packet_length,
                 meta,
                 debug,
+                forwarding,
             );
         }
         ForwardingDisposition::NoRoute => {
@@ -3726,6 +3763,7 @@ fn record_forwarding_disposition(
                 packet_length,
                 meta,
                 debug,
+                forwarding,
             );
         }
         ForwardingDisposition::MissingNeighbor => {
@@ -3738,6 +3776,7 @@ fn record_forwarding_disposition(
                 packet_length,
                 meta,
                 debug,
+                forwarding,
             );
         }
         ForwardingDisposition::DiscardRoute => {
@@ -3750,6 +3789,7 @@ fn record_forwarding_disposition(
                 packet_length,
                 meta,
                 debug,
+                forwarding,
             );
         }
         ForwardingDisposition::NextTableUnsupported => {
@@ -3762,6 +3802,7 @@ fn record_forwarding_disposition(
                 packet_length,
                 meta,
                 debug,
+                forwarding,
             );
         }
     }

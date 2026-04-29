@@ -715,4 +715,43 @@ mod tests {
             PolicyAction::Permit
         );
     }
+
+    /// #919/#922: when `parse_policy_state` cannot translate a snapshot
+    /// rule's zone names through `zone_name_to_id`, the resolved IDs
+    /// fall through to 0. `evaluate_policy` for any non-global zone
+    /// pair therefore returns the default action (deny). Compiler
+    /// sentinel for the "unknown zone" path.
+    #[test]
+    fn evaluate_policy_unknown_zone_pair_returns_default_action() {
+        let zones = test_zone_name_to_id();
+        let state = parse_policy_state(
+            "deny",
+            &[PolicyRuleSnapshot {
+                name: "rule".into(),
+                from_zone: "ghost-from".into(),
+                to_zone: "ghost-to".into(),
+                source_addresses: vec!["any".into()],
+                destination_addresses: vec!["any".into()],
+                applications: vec!["any".into()],
+                application_terms: Vec::new(),
+                action: "permit".into(),
+            }],
+            &zones,
+        );
+        // The rule's zones map to id 0 (unknown). A real LAN→WAN lookup
+        // does not match anything in the index → default deny.
+        assert_eq!(
+            evaluate_policy(
+                &state,
+                TEST_LAN_ZONE_ID,
+                TEST_WAN_ZONE_ID,
+                "10.0.0.1".parse().expect("src"),
+                "8.8.8.8".parse().expect("dst"),
+                PROTO_TCP,
+                12345,
+                80,
+            ),
+            PolicyAction::Deny
+        );
+    }
 }
