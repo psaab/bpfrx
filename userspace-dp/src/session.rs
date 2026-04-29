@@ -20,8 +20,20 @@ const OTHER_SESSION_TIMEOUT_NS: u64 = 30_000_000_000;
 // pop; see plan docs/pr/965-session-gc-timer-wheel/plan.md.
 const WHEEL_BUCKETS: usize = 256;
 const WHEEL_MASK: u64 = (WHEEL_BUCKETS as u64) - 1;
-const WHEEL_TICK_NS: u64 = 1_000_000_000;
+// Wheel tick must equal the GC interval — `expire_stale_entries`
+// is gated by `SESSION_GC_INTERVAL_NS` and the cursor advances one
+// bucket per tick. If these diverge the cadence math gets silently
+// out of sync (Copilot review: bind WHEEL_TICK_NS to the gate).
+const WHEEL_TICK_NS: u64 = SESSION_GC_INTERVAL_NS;
 const FAR_FUTURE_OFFSET: u64 = (WHEEL_BUCKETS as u64) - 1;
+// Compile-time invariant: bucket_for_tick uses `tick & WHEEL_MASK`
+// which only computes `tick % WHEEL_BUCKETS` correctly when
+// WHEEL_BUCKETS is a power of two (Copilot review: footgun if
+// someone changes the bucket count without updating the helper).
+const _: () = assert!(
+    WHEEL_BUCKETS.is_power_of_two(),
+    "WHEEL_BUCKETS must be a power of two for the WHEEL_MASK trick to compute tick % WHEEL_BUCKETS",
+);
 
 #[inline]
 fn bucket_for_tick(tick: u64) -> usize {
@@ -50,7 +62,9 @@ struct WheelEntry {
 
 struct SessionWheel {
     buckets: Box<[VecDeque<WheelEntry>]>,
-    base_tick: u64,
+    /// Absolute tick of the next bucket to pop. Advances 1 per
+    /// elapsed wheel tick during `expire_stale_entries`. The bucket
+    /// index is `cursor_tick & WHEEL_MASK`.
     cursor_tick: u64,
     initialized: bool,
 }
@@ -63,7 +77,6 @@ impl SessionWheel {
         }
         Self {
             buckets: buckets.into_boxed_slice(),
-            base_tick: 0,
             cursor_tick: 0,
             initialized: false,
         }
@@ -363,9 +376,7 @@ impl SessionTable {
     #[inline]
     fn wheel_observe(&mut self, now_ns: u64) {
         if !self.wheel.initialized {
-            let now_tick = now_ns / WHEEL_TICK_NS;
-            self.wheel.base_tick = now_tick;
-            self.wheel.cursor_tick = now_tick;
+            self.wheel.cursor_tick = now_ns / WHEEL_TICK_NS;
             self.wheel.initialized = true;
         }
     }
@@ -533,15 +544,23 @@ impl SessionTable {
                 } else {
                     // Case 4: still alive — long-timeout (>= 256s) case
                     // or a session re-scheduled to exactly this tick.
-                    // Re-bucket at the new absolute target tick.
+                    // Re-bucket at the new absolute target tick. The
+                    // entry was just read via `self.sessions.get(&key)`
+                    // immediately above with no intervening mutation,
+                    // so `get_mut(&key)` is a hard invariant — use
+                    // `expect` instead of `if let Some` so an invariant
+                    // violation surfaces loudly instead of silently
+                    // pushing a stale-tick wheel entry (Copilot review).
                     let new_target_tick = target_tick_for(
                         now_ns,
                         entry.last_seen_ns.saturating_add(entry.expires_after_ns),
                     );
                     let new_bucket = bucket_for_tick(new_target_tick);
-                    if let Some(entry_mut) = self.sessions.get_mut(&key) {
-                        entry_mut.wheel_tick = new_target_tick;
-                    }
+                    let entry_mut = self
+                        .sessions
+                        .get_mut(&key)
+                        .expect("entry was just read via .get(); no concurrent mutation");
+                    entry_mut.wheel_tick = new_target_tick;
                     self.wheel.buckets[new_bucket].push_back(WheelEntry {
                         key,
                         scheduled_tick: new_target_tick,
@@ -551,7 +570,6 @@ impl SessionTable {
             }
             self.wheel.cursor_tick = self.wheel.cursor_tick.saturating_add(1);
         }
-        self.wheel.base_tick = now_tick;
         let expired = expired_entries.len() as u64;
         self.expired = self.expired.saturating_add(expired);
         expired_entries
