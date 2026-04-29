@@ -1,38 +1,54 @@
 # #919 + #922: zone strings → integer IDs
 
-Plan v1 — 2026-04-29.
+Plan v2 — 2026-04-29. Addresses Codex hostile review (task-mojjrpl5-u8ym7j, NEEDS-MAJOR).
 
 ## Combined scope
 
 Two issues, one data-flow change. They share the same fix: stop
 storing zone names as `Arc<str>` / `String` on the fast and warm
 paths; use the existing `u16` zone ID instead. Slow-path consumers
-that need a name look it up via a new `zone_id_to_name` reverse map.
+that need a name look it up via the **already-existing**
+`zone_id_to_name` reverse map.
 
 - **#919**: `SessionMetadata.{ingress,egress}_zone: Arc<str>` triggers
-  `LOCK XADD` on every `metadata.clone()` and `ingress_zone.clone()`.
-  At 14.8M pps these atomic increments saturate the cross-core
-  coherency bus.
+  `LOCK XADD` on every `metadata.clone()`. `SessionTable::lookup`
+  clones metadata on every session hit (`session.rs:340-393`), so
+  the Arc refcount cost is on the packet path. At 25 Gb/s this is
+  ~2M pps (corrected from the issue's overstated "14.8M pps"),
+  still material at higher PPS / smaller-MTU workloads.
 - **#922**: `ZonePairKey { from: String, to: String }` is built per
-  `evaluate_policy` call (per session miss) by cloning two `String`s.
-  At 10K new sessions/s under SYN flood, that's 20K heap allocations.
+  `evaluate_policy` call (per session miss, NOT per packet) by
+  cloning two `String`s. Real cost only under miss-heavy floods
+  (SYN flood, new-app churn).
 
-## Existing infrastructure (already there)
+## Existing infrastructure (corrected per Codex review)
 
-- `forwarding.zone_name_to_id: FastMap<String, u16>` — name → ID
-  (`userspace-dp/src/afxdp/types.rs:237`). Populated at config-compile
-  time; consumed by `event_stream/codec.rs:135-143`,
-  `bpf_map.rs:458-462`, `ha.rs:389,440`.
-- `UserspaceDpMeta.ingress_zone: u16` (`types.rs:64`) — the BPF
-  metadata struct ALREADY uses u16 zone IDs. So `SessionMetadata`'s
-  `Arc<str>` is the odd one out.
-- `forwarding.ifindex_to_zone: FastMap<i32, String>` (`types.rs:236`)
-  — stores zone NAMES indexed by ifindex. Used at session-install
-  time to resolve egress zone (`forwarding.rs:357`).
+- `forwarding.zone_name_to_id: FastMap<String, u16>` —
+  `types.rs:237`, populated at `forwarding_build.rs:80`.
+- **`forwarding.zone_id_to_name: FastMap<u16, String>` ALREADY
+  EXISTS** — `types.rs:238`, populated at `forwarding_build.rs:81`.
+  v1 plan incorrectly proposed adding it. We just use it.
+- `UserspaceDpMeta.ingress_zone: u16` — `types.rs:64`. **No
+  `egress_zone` u16 in this struct** (corrected from v1's false
+  claim). The egress zone is computed at session-install time from
+  `forwarding.egress[ifindex].zone` (a String) or `ifindex_to_zone`.
+- BPF-side `pkt_meta` has both `ingress_zone` and `egress_zone`
+  (`bpf/headers/xpf_common.h:451-452`); BPF zone cap is 64
+  (`MAX_ZONES`).
+- Go config compiler assigns zone IDs as `i + 1`
+  (`pkg/dataplane/userspace/snapshot.go:183-187`), so IDs are dense
+  starting at 1. `0` is the "unset" sentinel.
 
-What's missing: a **u16 → name** reverse map for slow-path consumers
-(logging, gRPC export). I'll add `zone_id_to_name: Vec<Arc<str>>`
-indexed by `u16`.
+## Why `u16::MAX` for `junos-global` needs validation
+
+Codex Q3: Rust accepts any nonzero `ZoneSnapshot.id` into
+`zone_name_to_id` (`forwarding_build.rs:80`). A malformed snapshot
+with id == `u16::MAX` would collide with the `JUNOS_GLOBAL_ZONE_ID`
+sentinel.
+
+**Fix**: at `forwarding_build.rs:80`, reject `zone.id >= u16::MAX - 1`
+with a logged warning and skip. Document the reservation in a
+`pub(crate) const JUNOS_GLOBAL_ZONE_ID: u16 = u16::MAX;` comment.
 
 ## Investigation findings (Claude, first-hand)
 
@@ -40,8 +56,8 @@ indexed by `u16`.
 
 ```rust
 pub(crate) struct SessionMetadata {
-    pub(crate) ingress_zone: Arc<str>,  // ← target for #919
-    pub(crate) egress_zone: Arc<str>,   // ← target for #919
+    pub(crate) ingress_zone: Arc<str>,  // → u16
+    pub(crate) egress_zone: Arc<str>,   // → u16
     pub(crate) owner_rg_id: i32,
     pub(crate) fabric_ingress: bool,
     pub(crate) is_reverse: bool,
@@ -49,129 +65,104 @@ pub(crate) struct SessionMetadata {
 }
 ```
 
-After change: replace `Arc<str>` (16 bytes each) with `u16` (2 bytes
-each) — saves **28 bytes per SessionMetadata**, plus eliminates the
-per-clone atomic refcount op.
+After change: 28 bytes saved per `SessionMetadata` plus eliminates
+the per-clone atomic.
 
-### Clone sites
+### Sites that construct `SessionMetadata` (corrected scope)
 
-`metadata.clone()` / `ingress_zone.clone()` / `egress_zone.clone()`
-appear at (production paths only):
+Codex grep finds **80 `SessionMetadata {` occurrences** and **73
+`ingress_zone: ...` / `egress_zone: ...` field lines** across:
 
-- `session_glue.rs:418, 435, 505, 518, 588, 864, 1407, 1452, 1477` —
-  session install/lookup paths
-- `flow_cache.rs:886` — flow cache promotion
-- `ha.rs:431` — HA session sync
-- `shared_ops.rs:470, 471` — shared session manipulation (currently
-  swaps ingress/egress for reverse sessions)
-- `afxdp.rs:1335-1338` — debug logging, clones into a debug struct
+- `userspace-dp/src/afxdp.rs`
+- `userspace-dp/src/afxdp/bpf_map.rs`
+- `userspace-dp/src/afxdp/flow_cache.rs`
+- `userspace-dp/src/afxdp/forwarding.rs`
+- `userspace-dp/src/afxdp/ha.rs`
+- `userspace-dp/src/afxdp/session_glue.rs`
+- `userspace-dp/src/afxdp/shared_ops.rs`
+- `userspace-dp/src/afxdp/tests.rs`
+- `userspace-dp/src/event_stream/codec.rs`
+- `userspace-dp/src/main.rs`
+- `userspace-dp/src/session.rs`
+- `userspace-dp/src/afxdp/tunnel.rs`
 
-After change: each clone becomes a `u16` copy. No atomic op. ~10×
-faster per clone, plus removes the cross-core MESI coherency traffic.
+Most are tests. Production constructors are at:
+`forwarding.rs:362-363, 2692`, `session_glue.rs:1271, 896`,
+`flow_cache.rs:202`, `ha.rs:595`, `shared_ops.rs:470-471`, plus a
+few in forwarding-state-build paths.
 
-### Consumer sites that need the NAME
+### Where `evaluate_policy` callers get their zones (corrected)
 
-(These need `zone_id_to_name` reverse lookup or to take ID directly.)
-
-- `bpf_map.rs:458, 462` — `forwarding.zone_name_to_id.get(metadata.ingress_zone.as_ref())` — already calling `zone_name_to_id`! This is gratuitous: passes a NAME to look up an ID that we already have. Direct simplification: just use `metadata.ingress_zone` (u16).
-- `event_stream/codec.rs:135, 143` — same pattern, `zone_name_to_id.get(metadata.ingress_zone.as_ref())`. Same simplification.
-- `icmp_embed.rs:755` — passes `metadata.ingress_zone.as_ref()` to a `&str`-typed API. Need name lookup OR change downstream API to take u16.
-- `session_glue.rs:201, 409, 501, 1087, 1165` — same pattern (passes &str to downstream). Need name lookup.
-- `shared_ops.rs:463` — same.
-- `forwarding.rs:357-363` — at session-install time, builds metadata
-  from `ifindex_to_zone` (returns String). Need to look up `u16` from
-  the name via `zone_name_to_id`.
-- `afxdp.rs:1335-1338` — `debug.from_zone = Some(resolved.metadata.ingress_zone.clone())` — debug logging path. Lookup name only when actually emitting.
-- `afxdp.rs:3405-3406` — gRPC delta export `delta.metadata.ingress_zone.to_string()`. Slow path, name lookup OK.
-
-### `ZonePairKey` (policy.rs:163-178)
+Production callers at `afxdp.rs:1891-1899` and
+`afxdp.rs:2812-2821` get their zones from
+`zone_pair_for_flow_with_override` (`forwarding.rs:134-150`):
 
 ```rust
-struct ZonePairKey {
-    from: String,
-    to: String,
-}
-
-pub(crate) struct PolicyState {
-    pub(crate) default_action: PolicyAction,
-    pub(crate) rules: Vec<PolicyRule>,
-    zone_pair_index: FxHashMap<ZonePairKey, Vec<usize>>,
-    global_indices: Vec<usize>,
+fn zone_pair_for_flow_with_override(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    ingress_zone_override: Option<&str>,
+    egress_ifindex: i32,
+) -> (String, String) {
+    let from_zone = ingress_zone_override
+        .map(|zone| zone.to_string())                    // alloc 1
+        .or_else(|| forwarding.ifindex_to_zone.get(&ingress_ifindex).cloned())  // alloc 2 if no override
+        .unwrap_or_default();
+    let to_zone = forwarding
+        .egress
+        .get(&egress_ifindex)
+        .map(|iface| iface.zone.clone())                  // alloc 3
+        .unwrap_or_default();
+    (from_zone, to_zone)
 }
 ```
 
-After change: `ZonePairKey = u32` packed (`(from as u32) << 16 | to as u32`).
+The function builds and returns `(String, String)` allocating up to
+3 strings per call, then hands them to `evaluate_policy` which
+allocates 2 more in `ZonePairKey`. **Five allocations per session
+miss.** All eliminable.
 
-### `evaluate_policy` (policy.rs:233-279)
+### `ZonePairKey` (policy.rs:163-178) and `evaluate_policy` (policy.rs:233-279)
 
-Currently takes `from_zone: &str, to_zone: &str` and builds
-`ZonePairKey { from: from_zone.to_string(), to: to_zone.to_string() }`
-on every call.
-
-After change: takes `from_id: u16, to_id: u16` and packs the key
-inline — no allocation.
-
-Callers:
-
-- `afxdp.rs:1891-1899, 2812-...` — passes `&from_zone, &to_zone` as
-  `&str`. After: pass `meta.ingress_zone, meta.egress_zone` (already
-  u16 in `UserspaceDpMeta`).
-- `forwarding.rs:3379, 3410` — same.
+Same as v1 — change `(String, String)` to packed `u32` key.
 
 ### `parse_policy_state` (policy.rs:191-231)
 
-Builds the index from `PolicyRuleSnapshot` strings at
-config-compile time. The function needs access to `zone_name_to_id`
-to translate snapshot names to IDs.
+Called from `forwarding_build.rs:335`, where `zone_name_to_id` is
+already populated by line 80. Plumbing it in is straightforward.
 
-After change: signature becomes
-`parse_policy_state(default_policy: &str, rules: &[PolicyRuleSnapshot], zone_name_to_id: &FastMap<String, u16>) -> PolicyState`.
-
-### `junos-global` policies
-
-Currently detected by `from_zone == "junos-global" || to_zone == "junos-global"` (policy.rs:217). After change: reserve a sentinel
-`u16` (e.g. `0xFFFF` or a reserved ID at a known position) for
-`junos-global`. Or look it up at parse time and store as
-`Option<u16>` in PolicyState.
+**Unknown-zone behavior** (Codex Q7): current code indexes any
+string without validation. After the change, an unknown zone
+becomes "no ID; skip from index but keep in `rules`". This is
+behavior-equivalent to today (a rule referencing an unknown zone
+becomes a dead rule) plus a WARN log. Don't drop from `rules` —
+that would break the `hit_count` reporting at `policy.rs:29-42`.
 
 ## Design
 
-### `ForwardingState` change
-
-Add a reverse-lookup vector built whenever `zone_name_to_id` is
-populated:
+### `JUNOS_GLOBAL_ZONE_ID` constant + validation
 
 ```rust
-pub(super) struct ForwardingState {
-    // ... existing fields ...
-    pub(super) ifindex_to_zone: FastMap<i32, String>,   // unchanged
-    pub(super) zone_name_to_id: FastMap<String, u16>,   // unchanged
-    // NEW: indexed by u16 zone ID; entry at index i is the name
-    // of zone with ID i. Sized to max(zone_name_to_id values)+1.
-    pub(super) zone_id_to_name: Vec<Arc<str>>,
-    // ... existing fields ...
-}
+// In policy.rs:
+pub(crate) const JUNOS_GLOBAL_ZONE_ID: u16 = u16::MAX;
+pub(crate) const ZONE_ID_RESERVED_MIN: u16 = u16::MAX - 1;
 ```
 
-Helper method:
+In `forwarding_build.rs:80`, before inserting:
 
 ```rust
-impl ForwardingState {
-    pub(super) fn zone_name(&self, id: u16) -> Option<&str> {
-        self.zone_id_to_name.get(id as usize).map(|s| s.as_ref())
-    }
+if zone.id >= ZONE_ID_RESERVED_MIN {
+    log::warn!("zone {:?} has reserved id {}; skipping", zone.name, zone.id);
+    continue;
 }
 ```
-
-Built in the same place `zone_name_to_id` is populated (the
-forwarding compiler / `forwarding_build.rs`).
 
 ### `SessionMetadata` change
 
 ```rust
 pub(crate) struct SessionMetadata {
-    pub(crate) ingress_zone: u16,    // was Arc<str>
-    pub(crate) egress_zone: u16,     // was Arc<str>
+    pub(crate) ingress_zone: u16,
+    pub(crate) egress_zone: u16,
     pub(crate) owner_rg_id: i32,
     pub(crate) fabric_ingress: bool,
     pub(crate) is_reverse: bool,
@@ -179,11 +170,9 @@ pub(crate) struct SessionMetadata {
 }
 ```
 
-Sentinel: `0` for "unknown / not-set" (matches the existing
-`UserspaceDpMeta.ingress_zone: u16` default). Tests at
-`forwarding.rs:2495-2496` etc. need to update assertions from
-`metadata.ingress_zone.as_ref() == "lan"` to
-`metadata.ingress_zone == ZONE_LAN_ID`.
+`0` = "unset / unknown" (matches `UserspaceDpMeta.ingress_zone`'s
+existing default). The `shared_ops.rs:470-471` swap stays correct:
+`u16` copy.
 
 ### `ZonePairKey` change
 
@@ -198,13 +187,46 @@ fn zone_pair_key(from: u16, to: u16) -> u32 {
 
 `PolicyState.zone_pair_index: FxHashMap<u32, Vec<usize>>`.
 
+### New `zone_pair_ids_for_flow_with_override`
+
+To replace `zone_pair_for_flow_with_override` at production call
+sites:
+
+```rust
+pub(super) fn zone_pair_ids_for_flow_with_override(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    ingress_zone_override: Option<u16>,   // u16 because session metadata
+                                          // is u16 after this refactor
+    egress_ifindex: i32,
+) -> (u16, u16) {
+    let from = ingress_zone_override
+        .or_else(|| {
+            let name = forwarding.ifindex_to_zone.get(&ingress_ifindex)?;
+            forwarding.zone_name_to_id.get(name.as_str()).copied()
+        })
+        .unwrap_or(0);
+    let to = forwarding
+        .egress
+        .get(&egress_ifindex)
+        .and_then(|iface| forwarding.zone_name_to_id.get(iface.zone.as_str()).copied())
+        .unwrap_or(0);
+    (from, to)
+}
+```
+
+Zero allocations on the hot path. Existing
+`zone_pair_for_flow_with_override` (returning Strings) stays only
+for any test fixture that demands it; production callers move to
+the new function.
+
 ### `evaluate_policy` signature
 
 ```rust
 pub(crate) fn evaluate_policy(
     state: &PolicyState,
-    from_id: u16,           // was &str
-    to_id: u16,             // was &str
+    from_id: u16,
+    to_id: u16,
     src_ip: IpAddr,
     dst_ip: IpAddr,
     protocol: u8,
@@ -219,90 +241,106 @@ pub(crate) fn evaluate_policy(
 pub(crate) fn parse_policy_state(
     default_policy: &str,
     rules: &[PolicyRuleSnapshot],
-    zone_name_to_id: &FastMap<String, u16>,  // NEW
+    zone_name_to_id: &FastMap<String, u16>,
 ) -> PolicyState
 ```
 
-Translates `snap.from_zone` / `snap.to_zone` strings to IDs at parse
-time. If a rule references an unknown zone, log a warning and skip.
+`junos-global` references in snapshots are translated to
+`JUNOS_GLOBAL_ZONE_ID` and stored in `global_indices` as today.
 
-`junos-global` is a special sentinel — reserve a constant
-`pub(crate) const JUNOS_GLOBAL_ZONE_ID: u16 = u16::MAX;` and the
-policy compiler stamps that ID on `junos-global` references.
+### Slow-path consumers that need names
+
+Codex Q5: `bpf_map.rs:457-464` and `event_stream/codec.rs:134-145`
+currently round-trip `name → zone_name_to_id → ID`. These become
+trivial: just use the metadata's u16 directly.
+
+`icmp_embed.rs:755`, `session_glue.rs:201,409,501,1087,1165` pass
+zone strings to fabric redirect helpers
+(`resolve_zone_encoded_fabric_redirect` at `shared_ops.rs:528`).
+Those helpers are downstream of session metadata and need either:
+- (a) a `_by_id` variant that takes u16 (preferred — eliminates the
+  string lookup); OR
+- (b) a name lookup via `forwarding.zone_id_to_name.get(&id)` at the
+  caller boundary.
+
+This plan does (a): adds `resolve_zone_encoded_fabric_redirect_by_id`.
+
+### `event_stream/codec.rs` u8 caveat
+
+Codex notes the codec writes a `u8` for zone IDs. At max 64 zones
+(MAX_ZONES BPF cap) this is safe today. The plan documents the
+invariant: zone IDs that need to cross the wire MUST fit in u8 (i.e.,
+< 256). `forwarding_build.rs` already enforces by-construction
+(IDs are `i+1` in Go, capped at 64).
 
 ## Implementation steps
 
-1. **Add `zone_id_to_name`** to `ForwardingState` and populate it
-   wherever `zone_name_to_id` is populated (one site in the
-   forwarding compiler).
-2. **Reserve `JUNOS_GLOBAL_ZONE_ID`** constant in `policy.rs`.
-3. **Change `SessionMetadata`** to u16 zones.
-4. **Update all `SessionMetadata` constructors** (forwarding.rs,
-   session_glue.rs, flow_cache.rs, ha.rs, bpf_map.rs, tests).
-5. **Update consumer sites** that need a name string — `&str` API
-   downstream becomes name lookup via `forwarding.zone_name(id)`.
-6. **Change `ZonePairKey`** to u32 and `evaluate_policy` signature.
-7. **Update `parse_policy_state`** to take `zone_name_to_id`.
-8. **Update all `evaluate_policy` callers** (afxdp.rs:1891, 2812;
-   forwarding.rs:3379, 3410). Already have u16 IDs available via
-   `meta.ingress_zone` (UserspaceDpMeta).
-9. **Update tests**. ~30 test sites construct `SessionMetadata` with
-   `Arc::<str>::from("...")` literals; replace with named constants
-   or `to_id` lookups.
-
-## Risk
-
-**Medium.**
-
-- ~30-50 site updates, but mostly mechanical (same data, different
-  type).
-- Compile gate catches missed conversions (the compiler enforces u16
-  vs Arc<str>).
-- Same-type-swap hazard: ingress vs egress are both u16; reviewer
-  checklist at impl time, plus `shared_ops.rs:470-471` deliberately
-  swaps them for reverse sessions (preserve that).
-- Slow-path consumers that need names need to thread `&forwarding`
-  (or a name-lookup closure) through to the call site. Most already
-  have it.
+1. **`policy.rs`**: add `JUNOS_GLOBAL_ZONE_ID` and `ZONE_ID_RESERVED_MIN` constants. Change `ZonePairKey` to `u32`. Change `evaluate_policy` and `parse_policy_state` signatures.
+2. **`forwarding_build.rs:80`**: reject zone IDs >= `ZONE_ID_RESERVED_MIN`. Pass `zone_name_to_id` to `parse_policy_state`.
+3. **`session.rs`**: change `SessionMetadata.{ingress,egress}_zone` to u16.
+4. **`forwarding.rs`**: add `zone_pair_ids_for_flow_with_override`. Convert `SessionMetadata` constructors at lines 362, 2692.
+5. **`shared_ops.rs`**: add `resolve_zone_encoded_fabric_redirect_by_id`. Update `shared_ops.rs:463-471` to use u16.
+6. **`session_glue.rs`**: update production callers (`:201, 409, 501, 1087, 1165`) and `SessionMetadata` constructors at `:896, 1271`.
+7. **`afxdp.rs`**: update `evaluate_policy` callers at `:1891, :2812`. Update debug logging at `:1335-1338` (look up name via `forwarding.zone_id_to_name` only for the actual log emit). Update gRPC export at `:3405-3406` (look up name).
+8. **`flow_cache.rs`**: update line 149 (`Option<Arc<str>>` parameter) → `Option<u16>`. Update constructors.
+9. **`bpf_map.rs:457-464`**: replace `zone_name_to_id.get(metadata.ingress_zone.as_ref())` round-trip with direct u16 use.
+10. **`event_stream/codec.rs:134-145`**: same.
+11. **`tests`**: ~73 test sites construct `SessionMetadata` with `Arc::<str>::from("name")` literals. Update each. Some tests construct a `forwarding` state with custom zones — those tests need to populate `zone_name_to_id` and `zone_id_to_name` accordingly.
 
 ## Test plan
 
-- `cargo test --release` (819 tests): some test fixtures construct
-  SessionMetadata directly with `Arc<str>` literals. Need to update
-  tests in `session_glue.rs`, `flow_cache.rs`, `forwarding.rs`,
-  `bpf_map.rs`. Compile-driven.
-- **New tests**:
+- **Unit tests (new)**:
   - `evaluate_policy_returns_correct_action_for_zone_id_pair`
   - `parse_policy_state_translates_snapshot_zones_to_ids`
-  - `parse_policy_state_warns_on_unknown_zone` (skip + warn, not panic)
+  - `parse_policy_state_skips_unknown_zone_with_warning`
+  - `parse_policy_state_routes_junos_global_to_global_indices`
+  - `forwarding_build_rejects_reserved_zone_id`
   - `zone_pair_key_packing_round_trip`
-  - `forwarding_state_zone_name_round_trip` (id → name → id)
-  - `junos_global_sentinel_id_routes_through_global_indices`
+  - `forwarding_state_zone_id_to_name_round_trip`
+- **Compile gate**: many test sites construct `SessionMetadata`
+  with literal `Arc::<str>::from`; the compiler enforces every site
+  is updated. Expect ~73 mechanical edits.
 - **Cluster smoke** (HARD gate):
   - iperf-c P=12 ≥ 22 Gb/s
   - iperf-c P=1 ≥ 6 Gb/s
   - iperf-b P=12 ≥ 9.5 Gb/s, 0 retx
   - mouse p99 comparable to master 3-run baseline
-- **Session-setup throughput** (NEW gate, motivated by #922):
-  measure new-session establishment rate under SYN burst (e.g.
-  `iperf3 -P 256` or a SYN-flood-shaped microbenchmark) and confirm
-  no regression vs master. The whole point of #922 is that
-  session-setup-rate improves; if smoke shows no change, we measured
-  wrong.
+- **Session-setup throughput** (NEW gate): run a session-churn
+  workload (e.g. `iperf3 -P 256` reconnect loop) and confirm
+  new-session rate is at least at master baseline. Without this
+  gate, the perf-motivation in the issues is unverified.
+
+## Risk
+
+**High** (corrected from v1's "Medium" per Codex Q11). Once data
+flow is corrected per this v2, implementation risk drops to
+Medium.
+
+- 80 SessionMetadata sites, 73 zone field lines, ~5 production
+  evaluate_policy / fabric redirect call paths.
+- Same-type-swap hazard (ingress vs egress, both u16). Reviewer
+  checklist at impl time. Plus `shared_ops.rs:470-471` deliberately
+  swaps them — preserve.
+- Sentinel validation must land BEFORE any code starts treating
+  `u16::MAX` as JUNOS_GLOBAL_ZONE_ID. Otherwise a malformed
+  snapshot can cause a global-policy collision.
+- Test surface is large (~80 sites). Compile-driven, but reviewer
+  must verify the spot-checked production paths.
 
 ## Acceptance gates
 
 1. `cargo build --release` clean.
-2. `cargo test --release` ≥ 825 + 6 new = 831/831 pass.
+2. `cargo test --release` ≥ 825 + ~7 new = 832/832 pass.
 3. Cluster smoke: all four gates green.
-4. Session-setup rate: ≥ master baseline (no regression; ideally improvement).
+4. Session-setup rate gate: ≥ master baseline.
 5. Codex hostile review: AGREE-TO-MERGE.
 6. Gemini adversarial review: AGREE-TO-MERGE.
 
-## Out of scope
+## Out of scope (follow-ups)
 
-- `ifindex_to_zone` still returns `String` — separate cleanup; this
-  PR doesn't need it.
-- The full data-oriented SessionTable redesign (#964) — separate
-  long-term work.
-- Other `Arc<str>` cleanups (e.g. fabric zones #924) — separate PRs.
+- Removing `Arc<str>` more broadly (e.g., other `Arc<str>` fields on
+  `SessionDecision`, `ForwardingResolution`).
+- `ifindex_to_zone` String → ID (would close another string churn
+  path; separate cleanup).
+- `forwarding.egress[ifindex].zone` String → ID (same).
+- The full data-oriented SessionTable redesign (#964).
