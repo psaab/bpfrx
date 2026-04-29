@@ -136,6 +136,13 @@ func TestDecodeSessionEventV4(t *testing.T) {
 	if d.AddrFamily != dataplane.AFInet {
 		t.Fatalf("AddrFamily = %d, want %d (AFInet)", d.AddrFamily, dataplane.AFInet)
 	}
+	// #919/#922: zone IDs decoded from payload[21]/[22].
+	if d.IngressZoneID != 1 {
+		t.Fatalf("IngressZoneID = %d, want 1", d.IngressZoneID)
+	}
+	if d.EgressZoneID != 2 {
+		t.Fatalf("EgressZoneID = %d, want 2", d.EgressZoneID)
+	}
 	if d.Protocol != 6 {
 		t.Fatalf("Protocol = %d, want 6", d.Protocol)
 	}
