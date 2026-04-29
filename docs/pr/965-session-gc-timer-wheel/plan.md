@@ -1,40 +1,43 @@
 # #965: bucketed timer-wheel session GC (replace O(N) scan)
 
-Plan v7 — 2026-04-29. Addresses Codex round-6 (task-mok16mh6-7dzy54).
-Five fixes:
+Plan v8 — 2026-04-29. Addresses Codex round-7 (task-mok1ojg3-0esulj):
 
-1. Sub-tick expiration lag (round-6 #1): documented the up-to-1-
-   wheel-tick lag introduced by `target_tick = floor(...)` + strict
-   `cursor < now_tick` pop. Production GC has the same lag (gated
-   to 1 s by `SESSION_GC_INTERVAL_NS`), so this is a non-regression
-   in deployed code. Added test `wheel_lags_today_subtick_by_at_most_one_tick`.
+1. Acceptance gate 4a workload was self-contradictory: "10 %
+   touched per second" produces K ≈ 5K (every active session pushes
+   to every bucket once per 256 s), not K ≈ 977. Redefined 4a as a
+   Poisson touch process tuned to T_active = 5 (~1000 touches/s
+   spread across 50K sessions), which actually matches the
+   N × T_active / 256 = 977 model and the K ≤ 1500 bound.
 
-2. Internal contradiction in the per-tick cost section (round-6 #2):
-   removed the "256 × ~0.4-ms drains, only ONE bucket holds the
-   per-second-touch crowd" wording — it conflicted with the K ≈ N
-   bound stated five lines above. Under sustained per-second touch
-   every bucket holds ~N entries after warm-up.
+2. Per-second-touch test classification was wrong: under sustained
+   per-second touch on every session, popped entries are ALL stale
+   duplicates (canonical wheel_tick has advanced beyond every
+   bucket's scheduled_tick by the time the bucket is popped). So
+   `entries_re_bucketed = 0`, not = N; `entries_dropped_stale ≈ K`,
+   not `≈ N × 255`. Test rewritten with the correct classification.
 
-3. Mostly-idle table miscalculated (round-6 #3): the column was
-   off by 10× because it failed to divide by 256. Fixed: 100K ×
-   T_active=5 → ~200 µs per tick, not 2 ms.
+3. Drain pseudocode allocated `Vec::with_capacity(due_count)` per
+   pop, contradicting the "no per-second Vec allocation" claim.
+   Redesigned: snapshot bucket length, iterate via `pop_front`
+   exactly that many times, no scratch buffer needed. Re-pushed
+   entries land at the back of the VecDeque and are NOT popped
+   during this call (next rotation handles them).
 
-4. Acceptance gate spec was duplicated with conflicting numbers
-   (round-6 #4): removed the duplicate inside §Per-tick GC work;
-   §Acceptance gates is now the single source of truth, with
-   workload sizes 50K (4a) and 10K (4b) and explicit K-bounds
-   plus wall-time targets.
+4. "No production caller can observe the difference" softened to
+   "same worst-case bounded lag, slightly different GC-phase
+   alignment". The wheel preserves the existing 1-s lag bound but
+   may pick up an expiration up to 1 tick later than today's gated
+   scan does, depending on relative phase of `target_tick` vs.
+   wheel cursor at expiration time. Bounded above by
+   `WHEEL_TICK_NS`, strictly less than today's `SESSION_GC_INTERVAL_NS`,
+   no user-visible regression.
 
-5. Unit test was wall-time-only (round-6 #5): rewrote
-   `wheel_per_second_touch_bounds_K_per_bucket` to assert K ≤ 12K
-   directly (catches a 2× duplicate-push regression that a 5×
-   wall-time bound would not), with wall-time as a separate
-   informational gate.
+Earlier rounds remain in effect: round-3 (bucket-helper / pop
+race + alias `WheelEntry`), round-4 (memory math + alias borrow
+shape), round-5 (per-tick cost model uses K not N/256), round-6
+(sub-tick lag documentation, mostly-idle table arithmetic, single
+acceptance-gate spec, K-bound assertions in unit test).
 
-Earlier rounds remain in effect: round-3 fixed bucket-helper /
-pop race and alias `WheelEntry` payload; round-4 fixed memory math
-and the alias borrow shape; round-5 fixed the per-tick cost model
-to use K = entries-per-bucket instead of N / 256.
 
 ## Investigation findings (Claude, on commit 08ff1838)
 
@@ -210,11 +213,19 @@ if now_ns.saturating_sub(self.last_gc_ns) < SESSION_GC_INTERVAL_NS {
 ```
 
 with `SESSION_GC_INTERVAL_NS = 1 s`, so today's scan also has
-a ~1 s expiration lag in production. The behavioral change is
-visible only in unit tests that bypass the gate by manipulating
-`last_gc_ns` directly, and only at sub-tick precision (the
-`+1 ns` case Codex flagged). No production caller can observe
-the difference.
+a ~1 s expiration lag in production. Both the existing scan and
+the wheel are bounded by the same worst-case lag (one wheel-
+tick = one second). What CAN differ is the GC-phase alignment:
+today's scan picks an entry up the moment the gate releases
+after expiration, while the wheel picks it up at the next bucket
+visit, which can be up to one tick later depending on the
+relative phase of the entry's `target_tick` vs. the wheel cursor
+at expiration time. The honest claim is therefore "same worst-
+case bounded lag, slightly different phase alignment", not "no
+production caller can observe the difference". The behavioral
+deviation is bounded above by `WHEEL_TICK_NS = 1 s` and is
+strictly less than the existing GC interval's resolution, so no
+documented user-visible behavior changes.
 
 The existing `expiry_boundary_strict_greater_than` test asserts
 the exact-boundary case (`now == last_seen + expires_after`,
@@ -478,18 +489,28 @@ pub fn expire_stale_entries(&mut self, now_ns: u64) -> Vec<ExpiredSession> {
         // Drain in place into a local Vec, then process. We cannot
         // hold a `&mut VecDeque` from the wheel and simultaneously
         // call `self.wheel.buckets[new_bucket].push_back(...)` for
-        // a re-bucket whose target may equal `bucket_idx` — that
-        // would alias the same VecDeque mutably. Round-3 caught
-        // the v3 same-bucket-reinsert race that arose from
+        // a re-bucket whose target may equal `bucket_idx`. Round-3
+        // caught the v3 same-bucket-reinsert race that arose from
         // `mem::take` followed by `buckets[idx] = due` overwriting
-        // re-bucketed entries. Drain → local Vec → free up the
-        // wheel reference → process from the local Vec.
+        // re-bucketed entries. Round-7 (#3) caught that the v4
+        // drain-into-Vec design re-introduced a per-pop allocation
+        // — `Vec::with_capacity(due_count)` once per popped bucket
+        // = once per tick, more than today's StW which allocates
+        // once per gc-interval.
+        //
+        // Allocation-free design: snapshot the bucket length BEFORE
+        // iterating, then `pop_front` exactly that many times. Any
+        // `push_back` re-bucket targeting this same bucket lands at
+        // the back of the VecDeque and is NOT popped during this
+        // call (we stop after `due_count` iterations). The next
+        // wheel rotation visits this bucket and processes the
+        // re-pushed entries normally.
         let due_count = self.wheel.buckets[bucket_idx].len();
-        let mut due_buf: Vec<WheelEntry> = Vec::with_capacity(due_count);
-        while let Some(entry) = self.wheel.buckets[bucket_idx].pop_front() {
-            due_buf.push(entry);
-        }
-        for WheelEntry { key, scheduled_tick } in due_buf.drain(..) {
+        for _ in 0..due_count {
+            let entry_snap = self.wheel.buckets[bucket_idx]
+                .pop_front()
+                .expect("len snapshot bounds the iteration");
+            let WheelEntry { key, scheduled_tick } = entry_snap;
             let Some(entry) = self.sessions.get(&key) else {
                 // Already removed elsewhere — drop hint.
                 continue;
@@ -514,9 +535,11 @@ pub fn expire_stale_entries(&mut self, now_ns: u64) -> Vec<ExpiredSession> {
                 // bucket at the new absolute target tick. The new
                 // bucket may be `bucket_idx` again (e.g. exactly
                 // 256s timeout repeats); that's fine because the
-                // wheel's bucket VecDeque is now empty (we drained
-                // into due_buf above), so the push goes to the
-                // correct slot and is NOT overwritten on loop exit.
+                // outer `for _ in 0..due_count` loop iterates
+                // exactly `due_count` times — re-pushed entries
+                // land at the back of the VecDeque and are NOT
+                // popped during this call. They get processed at
+                // the next wheel rotation.
                 let new_target_tick = target_tick_for(
                     now_ns,
                     entry.last_seen_ns + entry.expires_after_ns,
@@ -709,21 +732,30 @@ buffers grow to fit avg load × geometric headroom. For typical
   verify expire_stale_entries returns all 50K in a single call
   (no per-tick cap; one tick = one bucket = O(B) work, not capped).
 - `wheel_per_second_touch_bounds_K_per_bucket` (Codex round-5 #2,
-  hardened per round-6 #5): install N=10K sessions, then touch
-  every session once per second for 300 s of simulated time
-  before measuring. After warm-up, instrument the next pop to
-  count entries scanned (`K`) and entries dropped/expired/re-
-  bucketed. Assert:
+  hardened per round-6 #5, classifications corrected per round-7
+  #2): install N=10K sessions, then touch every session once per
+  second for ≥ 300 s of simulated time before measuring. After
+  warm-up, instrument the next pop to count entries scanned (`K`)
+  and entries dropped/expired/re-bucketed. **Under sustained
+  per-second touch on every session, every entry in the popped
+  bucket is a stale duplicate** — the canonical `wheel_tick` for
+  every session has advanced beyond the bucket's `scheduled_tick`
+  because each session pushed a fresher entry every second since
+  the bucket was last popped. So:
     * `K ≤ 12,000` (model says 10,000; 20 % headroom catches a
       2× duplicate-push regression — a 5× wall-time bound would
       not).
-    * `entries_re_bucketed = N` (the live canonical entry per
-      session lands in its new tick).
-    * `entries_dropped_stale ≈ N × (256 − 1)` summed across one
-      full wheel rotation (256 ticks). Assert
-      `total_dropped ∈ [0.9, 1.1] × N × 255` to catch leakage of
-      stale entries that the lazy-delete discriminator should
-      drop.
+    * `entries_dropped_stale ≈ K` (every entry is dropped via
+      the `wheel_tick != scheduled_tick` discriminator).
+    * `entries_re_bucketed = 0` (no canonical entry expires in
+      this regime; sessions are kept alive by the per-second
+      touch).
+    * `entries_expired = 0` (same reason).
+    * Across a full 256-tick rotation: total entries scanned
+      ≈ 256 × K ≈ 256 × N. Assert
+      `total_scanned ∈ [0.9, 1.1] × 256 × N` to catch leakage
+      of stale entries the lazy-delete discriminator should
+      drop on visit but didn't.
   The point of the test is to bound *work shape*, not wall time;
   wall-time perf is the §Acceptance gate 4b informational gate.
 - `wheel_alias_lookup_does_not_double_borrow_self`: compile-time
@@ -753,17 +785,30 @@ continue to pass.
 
    4a. **Realistic mostly-idle workload**:
        - N = 50K sessions installed.
-       - 10% (5K) of sessions touched once per second; the rest
-         idle for the duration of the measurement.
+       - Touch rate calibrated so that each session contributes
+         ≈ T_active = 5 distinct expiration ticks over the 256-s
+         wheel window. Concretely: a Poisson touch process at
+         rate ~5/256 ≈ 0.02 per session per second, i.e. roughly
+         1000 touches/s spread across the 50K-session population.
        - Run for ≥ 300 s of simulated time before measuring (so
          the wheel reaches steady state and any warm-up
          allocations have settled).
-       - Assert: p99 GC-tick wall time ≤ 1 ms over a 60-s
-         measurement window.
        - Assert: per-pop K (entries scanned per popped bucket)
-         ≤ 1500 (the model gives 50K × 5 / 256 = 977; 1500 is
-         ~50% headroom and catches a regression where touch
-         pushes more than one entry per tick-change).
+         ≤ 1500 (the model gives N × T_active / 256 = 50K × 5 /
+         256 = 977; 1500 is ~50 % headroom and catches a
+         regression where touch pushes more than one entry per
+         tick-change).
+       - Assert: p99 GC-tick wall time ≤ 1 ms over a 60-s
+         measurement window (model: 977 × 100 ns = 98 µs; 10×
+         margin allows for HashMap probe variance and alloc
+         churn during warm-up).
+       - **NOT** a "10 % touched per second" workload — that
+         shape produces ≈ 5K active sessions each pushing once
+         per second, so K ≈ 5K, not 977. The two-rate framing
+         of T_active vs. per-second touch fraction was the
+         source of the round-6 → round-7 contradiction; the
+         spec above pins the rate to a Poisson process tuned to
+         T_active = 5.
 
    4b. **Sustained per-second touch** (worst-plausible hot path):
        - N = 10K sessions installed.
