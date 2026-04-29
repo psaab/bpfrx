@@ -14,6 +14,97 @@ const DEFAULT_UDP_SESSION_TIMEOUT_NS: u64 = 60_000_000_000;
 const DEFAULT_ICMP_SESSION_TIMEOUT_NS: u64 = 60_000_000_000;
 const OTHER_SESSION_TIMEOUT_NS: u64 = 30_000_000_000;
 
+// #965: bucketed timer-wheel session GC.
+// 256 buckets x 1-second ticks = 256-second window. Long-timeout
+// sessions (> 256 s) re-bucket via the FAR_FUTURE_OFFSET path on
+// pop; see plan docs/pr/965-session-gc-timer-wheel/plan.md.
+const WHEEL_BUCKETS: usize = 256;
+const WHEEL_MASK: u64 = (WHEEL_BUCKETS as u64) - 1;
+// Wheel tick must equal the GC interval — `expire_stale_entries`
+// is gated by `SESSION_GC_INTERVAL_NS` and the cursor advances one
+// bucket per tick. If these diverge the cadence math gets silently
+// out of sync (Copilot review: bind WHEEL_TICK_NS to the gate).
+const WHEEL_TICK_NS: u64 = SESSION_GC_INTERVAL_NS;
+const FAR_FUTURE_OFFSET: u64 = (WHEEL_BUCKETS as u64) - 1;
+// Compile-time invariant: bucket_for_tick uses `tick & WHEEL_MASK`
+// which only computes `tick % WHEEL_BUCKETS` correctly when
+// WHEEL_BUCKETS is a power of two (Copilot review: footgun if
+// someone changes the bucket count without updating the helper).
+const _: () = assert!(
+    WHEEL_BUCKETS.is_power_of_two(),
+    "WHEEL_BUCKETS must be a power of two for the WHEEL_MASK trick to compute tick % WHEEL_BUCKETS",
+);
+
+#[inline]
+fn bucket_for_tick(tick: u64) -> usize {
+    (tick & WHEEL_MASK) as usize
+}
+
+/// Compute the absolute wheel tick at which an entry expiring at
+/// `expiration_ns` should be checked, given the current `now_ns`.
+/// Floors the expiration to a tick boundary; entries past their
+/// expiration land in the current tick (delta=0), entries in the
+/// far future are clamped to FAR_FUTURE_OFFSET ticks ahead and get
+/// re-checked there (still-alive case triggers re-bucketing in pop).
+#[inline]
+fn target_tick_for(now_ns: u64, expiration_ns: u64) -> u64 {
+    let now_tick = now_ns / WHEEL_TICK_NS;
+    let expiration_tick = expiration_ns / WHEEL_TICK_NS;
+    let delta = expiration_tick.saturating_sub(now_tick);
+    now_tick + delta.min(FAR_FUTURE_OFFSET)
+}
+
+#[derive(Clone, Debug)]
+struct WheelEntry {
+    key: SessionKey,
+    scheduled_tick: u64,
+}
+
+struct SessionWheel {
+    buckets: Box<[VecDeque<WheelEntry>]>,
+    /// Absolute tick of the next bucket to pop. Advances 1 per
+    /// elapsed wheel tick during `expire_stale_entries`. The bucket
+    /// index is `cursor_tick & WHEEL_MASK`.
+    cursor_tick: u64,
+    initialized: bool,
+}
+
+impl SessionWheel {
+    fn new() -> Self {
+        let mut buckets: Vec<VecDeque<WheelEntry>> = Vec::with_capacity(WHEEL_BUCKETS);
+        for _ in 0..WHEEL_BUCKETS {
+            buckets.push(VecDeque::new());
+        }
+        Self {
+            buckets: buckets.into_boxed_slice(),
+            cursor_tick: 0,
+            initialized: false,
+        }
+    }
+}
+
+/// Per-call statistics for `expire_stale_entries` pop work, used by
+/// the timer-wheel unit tests to assert K-bounds and entry
+/// classification under specific synthetic workloads. Fields are
+/// accumulated over all buckets popped in a single call.
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct WheelPopStats {
+    /// Total `WheelEntry`s scanned (popped from a bucket and
+    /// classified) during the call.
+    pub(crate) scanned: usize,
+    /// Entries dropped because the canonical key is no longer in
+    /// `sessions` (already removed by another path).
+    pub(crate) dropped_gone: usize,
+    /// Entries dropped because `wheel_tick != scheduled_tick` (a
+    /// fresher entry has superseded this one).
+    pub(crate) dropped_stale: usize,
+    /// Entries that actually expired and were removed.
+    pub(crate) expired: usize,
+    /// Entries that were re-bucketed (long-timeout / not yet
+    /// expired).
+    pub(crate) re_bucketed: usize,
+}
+
 /// Configurable session timeout values (in nanoseconds).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SessionTimeouts {
@@ -90,6 +181,11 @@ struct SessionEntry {
     last_seen_ns: u64,
     expires_after_ns: u64,
     closing: bool,
+    /// #965: absolute wheel tick at which this session is scheduled to
+    /// be checked for expiration. Updated on every push to the wheel.
+    /// A WheelEntry whose `scheduled_tick != entry.wheel_tick` is a
+    /// stale duplicate (lazy-delete discriminator).
+    wheel_tick: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,6 +327,15 @@ pub(crate) struct SessionTable {
     create_drops: u64,
     delta_drops: u64,
     delta_drained: u64,
+    /// #965: bucketed timer wheel that mirrors `sessions`. Pop one
+    /// bucket per tick (1 s) instead of scanning the whole HashMap.
+    wheel: SessionWheel,
+    /// #965: stats from the most-recent `expire_stale_entries` call.
+    /// Reset at the start of each call. Used by unit tests to assert
+    /// K-bounds and classification (scanned / dropped_stale /
+    /// dropped_gone / expired / re_bucketed). Accumulator overhead
+    /// is 4-5 increments per popped entry — sub-µs at typical loads.
+    last_pop_stats: WheelPopStats,
 }
 
 impl SessionTable {
@@ -250,6 +355,67 @@ impl SessionTable {
             create_drops: 0,
             delta_drops: 0,
             delta_drained: 0,
+            wheel: SessionWheel::new(),
+            last_pop_stats: WheelPopStats::default(),
+        }
+    }
+
+    /// #965: stats from the most-recent `expire_stale_entries` call.
+    /// Used by tests to validate K-bounds and entry classification.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn last_pop_stats(&self) -> WheelPopStats {
+        self.last_pop_stats
+    }
+
+    /// #965: lazily initialize the wheel cursor to the first observed
+    /// `now_ns`. SessionTable::new() does not have a `now_ns`, so we
+    /// must initialize on the first call to any method that takes one.
+    /// Without this, `now_tick = now_ns / TICK_NS` can be billions
+    /// (monotonic time) and the pop loop would walk billions of empty
+    /// buckets on the first GC.
+    #[inline]
+    fn wheel_observe(&mut self, now_ns: u64) {
+        if !self.wheel.initialized {
+            self.wheel.cursor_tick = now_ns / WHEEL_TICK_NS;
+            self.wheel.initialized = true;
+        }
+    }
+
+    /// #965: schedule (or re-schedule) `key` for an expiration check
+    /// at the tick implied by its `last_seen_ns + expires_after_ns`.
+    /// Throttled: only pushes when the canonical wheel tick changes,
+    /// so per-second touches within the same tick produce zero new
+    /// wheel entries.
+    ///
+    /// MUST be called only AFTER `last_seen_ns` / `expires_after_ns`
+    /// have been written and the &mut borrow on `self.sessions` has
+    /// dropped — otherwise the borrow checker will reject the
+    /// `self.wheel.buckets[bucket].push_back(...)` line because it
+    /// aliases `self` through both `self.sessions` and `self.wheel`.
+    #[inline]
+    fn push_to_wheel(&mut self, key: &SessionKey, now_ns: u64) {
+        self.wheel_observe(now_ns);
+        let new_tick = match self.sessions.get_mut(key) {
+            Some(entry) => {
+                let nt = target_tick_for(
+                    now_ns,
+                    entry.last_seen_ns.saturating_add(entry.expires_after_ns),
+                );
+                if nt != entry.wheel_tick {
+                    entry.wheel_tick = nt;
+                    Some(nt)
+                } else {
+                    None
+                }
+            }
+            None => return,
+        };
+        if let Some(tick) = new_tick {
+            let bucket = bucket_for_tick(tick);
+            self.wheel.buckets[bucket].push_back(WheelEntry {
+                key: key.clone(),
+                scheduled_tick: tick,
+            });
         }
     }
 
@@ -271,68 +437,138 @@ impl SessionTable {
     /// Used by the flow cache to amortize session keepalive.
     #[inline]
     pub fn touch(&mut self, key: &SessionKey, now_ns: u64) {
-        if let Some(entry) = self.sessions.get_mut(key) {
-            entry.last_seen_ns = now_ns;
+        if self.sessions.get_mut(key).is_some_and(|e| {
+            e.last_seen_ns = now_ns;
+            true
+        }) {
+            self.push_to_wheel(key, now_ns);
         }
     }
 
+    /// #965: GC pass over the timer wheel.
+    ///
+    /// Replaces the prior O(N) scan over `self.sessions` with a wheel
+    /// pop. For each tick that has elapsed since the last call (up to
+    /// `now_ns / WHEEL_TICK_NS`), drain the bucket at the current
+    /// cursor and process its entries via the lazy-delete discriminator:
+    ///
+    ///   1. Entry gone (HashMap miss) → drop.
+    ///   2. Stale duplicate (`wheel_tick != scheduled_tick`) → drop.
+    ///   3. Expired (`now > last_seen + expires_after`) → remove,
+    ///      emit delta + ExpiredSession.
+    ///   4. Still alive → re-bucket at the new absolute target tick.
+    ///
+    /// See docs/pr/965-session-gc-timer-wheel/plan.md for the full
+    /// algorithm and complexity analysis.
     pub fn expire_stale_entries(&mut self, now_ns: u64) -> Vec<ExpiredSession> {
+        // Reset per-call stats BEFORE the gc-interval gate so that a
+        // gated no-op call returns zeroed stats rather than leftovers
+        // from a prior call (Codex impl-review round-2 non-blocking note).
+        self.last_pop_stats = WheelPopStats::default();
         if self.last_gc_ns != 0 && now_ns.saturating_sub(self.last_gc_ns) < SESSION_GC_INTERVAL_NS {
             return Vec::new();
         }
         self.last_gc_ns = now_ns;
-        let stale = self
-            .sessions
-            .iter()
-            .filter_map(|(key, entry)| {
+        self.wheel_observe(now_ns);
+        let now_tick = now_ns / WHEEL_TICK_NS;
+        let mut expired_entries: Vec<ExpiredSession> = Vec::new();
+        while self.wheel.cursor_tick < now_tick {
+            let bucket_idx = bucket_for_tick(self.wheel.cursor_tick);
+            // Drain the bucket allocation-free: snapshot the length
+            // before iterating, then `pop_front` exactly that many
+            // times. Re-pushes targeting THIS bucket land at the back
+            // of the VecDeque and are not popped during this BUCKET
+            // drain (re-pushes into LATER buckets the outer loop
+            // visits will be popped within the same call — by design).
+            let due_count = self.wheel.buckets[bucket_idx].len();
+            for _ in 0..due_count {
+                let WheelEntry { key, scheduled_tick } = self.wheel.buckets[bucket_idx]
+                    .pop_front()
+                    .expect("len snapshot bounds the iteration");
+                self.last_pop_stats.scanned += 1;
+                // Case 1: entry already removed elsewhere — drop hint.
+                let Some(entry) = self.sessions.get(&key) else {
+                    self.last_pop_stats.dropped_gone += 1;
+                    continue;
+                };
+                // Case 2: stale duplicate — entry's canonical wheel_tick
+                // has advanced past this scheduled_tick, so the new tick
+                // already has its own wheel entry. Drop.
+                if entry.wheel_tick != scheduled_tick {
+                    self.last_pop_stats.dropped_stale += 1;
+                    continue;
+                }
+                // Case 3 vs 4: canonical entry. Match today's strict `>`
+                // expiration semantics.
                 if now_ns.saturating_sub(entry.last_seen_ns) > entry.expires_after_ns {
-                    Some(key.clone())
+                    if let Some(removed) = self.remove_entry(&key) {
+                        self.last_pop_stats.expired += 1;
+                        let decision = removed.decision;
+                        let metadata = removed.metadata;
+                        if key.protocol == PROTO_TCP {
+                            debug_log!(
+                                "SESS_EXPIRE: proto=TCP {}:{} -> {}:{} closing={} age_ns={} timeout_ns={} rev={} origin={} nat=({:?},{:?})",
+                                key.src_ip,
+                                key.src_port,
+                                key.dst_ip,
+                                key.dst_port,
+                                removed.closing,
+                                now_ns.saturating_sub(removed.last_seen_ns),
+                                removed.expires_after_ns,
+                                metadata.is_reverse,
+                                removed.origin.as_str(),
+                                decision.nat.rewrite_src,
+                                decision.nat.rewrite_dst,
+                            );
+                        }
+                        if !metadata.is_reverse
+                            && !removed.origin.is_peer_synced()
+                            && !removed.origin.is_transient_local_seed()
+                        {
+                            self.push_delta(SessionDelta {
+                                kind: SessionDeltaKind::Close,
+                                key: key.clone(),
+                                decision,
+                                metadata: metadata.clone(),
+                                origin: removed.origin,
+                                fabric_redirect_sync: false,
+                            });
+                        }
+                        expired_entries.push(ExpiredSession {
+                            key,
+                            decision,
+                            metadata,
+                            origin: removed.origin,
+                        });
+                    }
                 } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut expired_entries = Vec::with_capacity(stale.len());
-        for key in &stale {
-            if let Some(entry) = self.remove_entry(key) {
-                let decision = entry.decision;
-                let metadata = entry.metadata;
-                if key.protocol == PROTO_TCP {
-                    debug_log!(
-                        "SESS_EXPIRE: proto=TCP {}:{} -> {}:{} closing={} age_ns={} timeout_ns={} rev={} origin={} nat=({:?},{:?})",
-                        key.src_ip,
-                        key.src_port,
-                        key.dst_ip,
-                        key.dst_port,
-                        entry.closing,
-                        now_ns.saturating_sub(entry.last_seen_ns),
-                        entry.expires_after_ns,
-                        metadata.is_reverse,
-                        entry.origin.as_str(),
-                        decision.nat.rewrite_src,
-                        decision.nat.rewrite_dst,
+                    // Case 4: still alive — long-timeout (>= 256s) case
+                    // or a session re-scheduled to exactly this tick.
+                    // Re-bucket at the new absolute target tick. The
+                    // entry was just read via `self.sessions.get(&key)`
+                    // immediately above with no intervening mutation,
+                    // so `get_mut(&key)` is a hard invariant — use
+                    // `expect` instead of `if let Some` so an invariant
+                    // violation surfaces loudly instead of silently
+                    // pushing a stale-tick wheel entry (Copilot review).
+                    let new_target_tick = target_tick_for(
+                        now_ns,
+                        entry.last_seen_ns.saturating_add(entry.expires_after_ns),
                     );
-                }
-                if !metadata.is_reverse
-                    && !entry.origin.is_peer_synced()
-                    && !entry.origin.is_transient_local_seed()
-                {
-                    self.push_delta(SessionDelta {
-                        kind: SessionDeltaKind::Close,
-                        key: key.clone(),
-                        decision,
-                        metadata: metadata.clone(),
-                        origin: entry.origin,
-                        fabric_redirect_sync: false,
+                    let new_bucket = bucket_for_tick(new_target_tick);
+                    let entry_mut = self
+                        .sessions
+                        .get_mut(&key)
+                        .expect("entry was just read via .get(); no concurrent mutation");
+                    entry_mut.wheel_tick = new_target_tick;
+                    self.wheel.buckets[new_bucket].push_back(WheelEntry {
+                        key,
+                        scheduled_tick: new_target_tick,
                     });
+                    self.last_pop_stats.re_bucketed += 1;
                 }
-                expired_entries.push(ExpiredSession {
-                    key: key.clone(),
-                    decision,
-                    metadata,
-                    origin: entry.origin,
-                });
             }
+            self.wheel.cursor_tick = self.wheel.cursor_tick.saturating_add(1);
         }
         let expired = expired_entries.len() as u64;
         self.expired = self.expired.saturating_add(expired);
@@ -367,7 +603,16 @@ impl SessionTable {
         } else {
             return None;
         };
-        self.sessions.get_mut(&actual_key).map(|entry| {
+        // Pre-compute the timeout before borrowing &mut self.sessions
+        // so the inner block doesn't need to access self.timeouts.
+        let timeouts = self.timeouts;
+        // Scope the &mut self.sessions borrow so it ends BEFORE we
+        // touch self.wheel via push_to_wheel. Without this scoping
+        // the closure form `self.sessions.get_mut(...).map(|entry| { ... })`
+        // would hold &mut self via self.sessions and conflict with
+        // a second &mut self via self.wheel.
+        let result = {
+            let entry = self.sessions.get_mut(&actual_key)?;
             if matches!(key.protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0 {
                 if !entry.closing {
                     debug_log!(
@@ -391,7 +636,7 @@ impl SessionTable {
             entry.expires_after_ns = if matches!(key.protocol, PROTO_TCP) && entry.closing {
                 TCP_CLOSING_TIMEOUT_NS
             } else {
-                session_timeout_ns(key.protocol, tcp_flags, &self.timeouts)
+                session_timeout_ns(key.protocol, tcp_flags, &timeouts)
             };
             (
                 SessionLookup {
@@ -400,7 +645,14 @@ impl SessionTable {
                 },
                 entry.origin,
             )
-        })
+        }; // <-- &mut self.sessions borrow ends here
+        // Push the canonical key (NOT the alias `key`) into the wheel.
+        // push_to_wheel re-reads the entry to compute the throttled
+        // target_tick, so a second HashMap lookup is needed; that
+        // matches the model in the plan (~100 ns per FxHashMap lookup
+        // on the hot path).
+        self.push_to_wheel(&actual_key, now_ns);
+        Some(result)
     }
 
     pub fn find_forward_nat_match(&self, reply_key: &SessionKey) -> Option<ForwardSessionMatch> {
@@ -491,9 +743,12 @@ impl SessionTable {
                 last_seen_ns: now_ns,
                 expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
+                wheel_tick: 0,
             },
         );
         self.index_forward_nat_key(&key, decision, &metadata);
+        // #965: schedule the new entry for expiration check.
+        self.push_to_wheel(&key, now_ns);
         if !metadata.is_reverse && !origin.is_peer_synced() && !origin.is_transient_local_seed() {
             self.push_delta(SessionDelta {
                 kind: SessionDeltaKind::Open,
@@ -561,9 +816,12 @@ impl SessionTable {
                 last_seen_ns: now_ns,
                 expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
+                wheel_tick: 0,
             },
         );
         self.index_forward_nat_key(&index_key, decision, &metadata);
+        // #965: schedule the synced entry for expiration check.
+        self.push_to_wheel(&index_key, now_ns);
         true
     }
 
@@ -613,6 +871,10 @@ impl SessionTable {
         entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags, &self.timeouts);
         entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
         self.restore_entry(key.clone(), entry);
+        // #965: schedule the refreshed entry. Last_seen / expires_after
+        // were rewritten above; push_to_wheel is throttled and will only
+        // emit a new wheel entry if the canonical tick changed.
+        self.push_to_wheel(key, now_ns);
         // Emit open delta when promoting a peer-synced entry to local
         if was_peer_synced && !origin.is_peer_synced() && !metadata.is_reverse {
             self.push_delta(SessionDelta {
@@ -699,6 +961,8 @@ impl SessionTable {
         entry.install_epoch = self.next_epoch();
         entry.last_seen_ns = now_ns;
         self.restore_entry(key.clone(), entry);
+        // #965: schedule the refreshed entry for expiration check.
+        self.push_to_wheel(key, now_ns);
         true
     }
 
@@ -1237,6 +1501,547 @@ mod tests {
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].kind, SessionDeltaKind::Close);
         assert_eq!(deltas[0].key, key);
+    }
+
+    // === #965 timer-wheel tests =================================
+
+    fn make_v4_key(src_octet: u8, port: u16) -> SessionKey {
+        SessionKey {
+            addr_family: 2,
+            protocol: PROTO_UDP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, src_octet)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            src_port: port,
+            dst_port: 53,
+        }
+    }
+
+    /// Wheel pop expires an entry whose bucket the cursor advances past.
+    #[test]
+    fn wheel_pops_expired_entry_from_bucket() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let install_ns = 1_000_000_000u64;
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            install_ns,
+            PROTO_UDP,
+            0
+        ));
+        // UDP default timeout is 60 s. Advance past it; bypass GC gate.
+        let advance = install_ns + 65 * WHEEL_TICK_NS;
+        table.last_gc_ns = advance - SESSION_GC_INTERVAL_NS;
+        let expired = table.expire_stale_entries(advance);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].key, key);
+        assert!(table.lookup(&key, advance + 1_000_000, 0).is_none());
+    }
+
+    /// A touched entry is not popped from the wheel — its canonical
+    /// wheel_tick advanced, so the old bucket entry is dropped as stale
+    /// and the new bucket holds the live entry.
+    #[test]
+    fn wheel_skips_touched_entry() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let install_ns = 1_000_000_000u64;
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            install_ns,
+            PROTO_UDP,
+            0
+        ));
+        // Touch at install_ns + 30s — pushes the expiration target tick
+        // forward by 30 (from install+60 to install+90).
+        let touch_ns = install_ns + 30 * WHEEL_TICK_NS;
+        table.touch(&key, touch_ns);
+        // Advance past the ORIGINAL bucket (install+60) but not past
+        // the new one (install+90). Bypass GC gate.
+        let advance = install_ns + 65 * WHEEL_TICK_NS;
+        table.last_gc_ns = advance - SESSION_GC_INTERVAL_NS;
+        let expired = table.expire_stale_entries(advance);
+        assert!(
+            expired.is_empty(),
+            "touched session should not expire yet; got {:?}",
+            expired
+        );
+        assert!(table.lookup(&key, advance + 1_000_000, 0).is_some());
+    }
+
+    /// A timeout > 256 s lands in the FAR_FUTURE bucket; when popped,
+    /// re-checks expiration and re-buckets if still alive.
+    #[test]
+    fn wheel_handles_long_timeout_via_far_future_bucket() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let install_ns = 1_000_000_000u64;
+        // 7200 s timeout — far longer than the 256-s wheel.
+        let long_timeout_secs = 7200u64;
+        let mut t = SessionTimeouts::default();
+        t.udp_ns = long_timeout_secs * WHEEL_TICK_NS;
+        table.set_timeouts(t);
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            install_ns,
+            PROTO_UDP,
+            0
+        ));
+        // Advance 300 s — past one full rotation but well before the
+        // real timeout. Bypass GC gate at every check.
+        let advance = install_ns + 300 * WHEEL_TICK_NS;
+        table.last_gc_ns = advance - SESSION_GC_INTERVAL_NS;
+        let expired = table.expire_stale_entries(advance);
+        assert!(
+            expired.is_empty(),
+            "long-timeout session must not expire prematurely"
+        );
+        // Advance past the real timeout — should now expire.
+        let final_advance = install_ns + (long_timeout_secs + 5) * WHEEL_TICK_NS;
+        table.last_gc_ns = final_advance - SESSION_GC_INTERVAL_NS;
+        let expired = table.expire_stale_entries(final_advance);
+        assert_eq!(expired.len(), 1);
+    }
+
+    /// Entry with `expires_after = WHEEL_BUCKETS * TICK_NS` lands in
+    /// the FAR_FUTURE bucket (now_tick + 255), not the current bucket.
+    #[test]
+    fn wheel_handles_exact_256s_timeout() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let install_ns = 1_000_000_000u64;
+        let mut t = SessionTimeouts::default();
+        t.udp_ns = (WHEEL_BUCKETS as u64) * WHEEL_TICK_NS; // exactly 256 s
+        table.set_timeouts(t);
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            install_ns,
+            PROTO_UDP,
+            0
+        ));
+        // Verify the entry's wheel_tick is install_tick + 255, NOT
+        // install_tick (which would mean "current bucket").
+        let entry = table.sessions.get(&key).expect("entry");
+        let install_tick = install_ns / WHEEL_TICK_NS;
+        assert_eq!(
+            entry.wheel_tick,
+            install_tick + FAR_FUTURE_OFFSET,
+            "256-s timeout must land in FAR_FUTURE bucket, not current"
+        );
+    }
+
+    /// First GC with a large monotonic now_ns must not walk billions
+    /// of empty buckets — wheel_observe lazily initializes cursor_tick
+    /// to the first observed now_tick.
+    #[test]
+    fn first_gc_with_large_monotonic_now_doesnt_walk_billions_of_buckets() {
+        let mut table = SessionTable::new();
+        // 10^18 ns = a typical CLOCK_MONOTONIC value after ~31 years.
+        let huge_now = 1_000_000_000_000_000_000u64;
+        // Should return immediately, no panic, no infinite loop.
+        let expired = table.expire_stale_entries(huge_now);
+        assert!(expired.is_empty());
+        // Wheel should be initialized at the huge tick.
+        assert!(table.wheel.initialized);
+        assert_eq!(table.wheel.cursor_tick, huge_now / WHEEL_TICK_NS);
+    }
+
+    /// Sub-tick precision: at exactly `last_seen + expires_after`, the
+    /// session is NOT expired (matches today's strict `>` semantics).
+    /// This test exists in addition to the v8 sub-tick lag test.
+    #[test]
+    fn expiry_boundary_strict_greater_than() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let install_ns = 1_000_000_000u64;
+        let mut t = SessionTimeouts::default();
+        t.udp_ns = 1_000_000_000; // 1 s
+        table.set_timeouts(t);
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            install_ns,
+            PROTO_UDP,
+            0
+        ));
+        // Exactly at last_seen + expires_after: NOT expired.
+        let at_boundary = install_ns + 1_000_000_000;
+        table.last_gc_ns = at_boundary - SESSION_GC_INTERVAL_NS;
+        let expired = table.expire_stale_entries(at_boundary);
+        assert!(
+            expired.is_empty(),
+            "exact-boundary entry must not expire under strict `>`"
+        );
+    }
+
+    /// Wheel adds at most one tick of additional lag vs today's
+    /// hypothetical sub-tick scan. At +1 ns the wheel reports
+    /// not-yet-expired; at +TICK_NS+1 it reports expired.
+    #[test]
+    fn wheel_lags_today_subtick_by_at_most_one_tick() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let install_ns = 1_000_000_000u64;
+        let mut t = SessionTimeouts::default();
+        t.udp_ns = 1_000_000_000; // 1 s
+        table.set_timeouts(t);
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            install_ns,
+            PROTO_UDP,
+            0
+        ));
+        // +1 ns past expiration: wheel hasn't popped the bucket yet
+        // (cursor < now_tick is still false at this sub-tick offset).
+        let just_past = install_ns + 1_000_000_000 + 1;
+        table.last_gc_ns = just_past - SESSION_GC_INTERVAL_NS;
+        let expired = table.expire_stale_entries(just_past);
+        assert!(
+            expired.is_empty(),
+            "wheel may lag today's sub-tick scan by up to 1 tick"
+        );
+        // +1 wheel-tick + 1 ns past expiration: wheel MUST have caught
+        // it. The cursor advances when now_tick advances.
+        let one_tick_past = install_ns + 1_000_000_000 + WHEEL_TICK_NS + 1;
+        table.last_gc_ns = one_tick_past - SESSION_GC_INTERVAL_NS;
+        let expired = table.expire_stale_entries(one_tick_past);
+        assert_eq!(
+            expired.len(),
+            1,
+            "wheel must pop the entry once cursor advances one tick past target"
+        );
+    }
+
+    /// Session touched 100 times within a single tick produces at most
+    /// 2 wheel entries (the initial install push + at most one re-push
+    /// if the expiration tick changed). Throttle bounds duplicates.
+    #[test]
+    fn wheel_duplicate_count_per_session_bounded() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let install_ns = 1_000_000_000u64;
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            install_ns,
+            PROTO_UDP,
+            0
+        ));
+        // Touch 100 times within the same wheel tick (sub-second).
+        for i in 0..100u64 {
+            table.touch(&key, install_ns + i * 1_000_000); // 1 ms steps
+        }
+        // Count wheel entries for this key.
+        let count: usize = table
+            .wheel
+            .buckets
+            .iter()
+            .map(|b| b.iter().filter(|e| e.key == key).count())
+            .sum();
+        assert!(
+            count <= 2,
+            "same-tick touches should produce <=2 wheel entries; got {}",
+            count
+        );
+    }
+
+    /// 50K sessions all expiring at the same tick: a single GC call
+    /// drains all of them from the popped bucket. No per-tick cap.
+    #[test]
+    fn wheel_sustained_overload_drains_all_buckets() {
+        let mut table = SessionTable::new();
+        let install_ns = 1_000_000_000u64;
+        // Use 5K (not 50K) to keep test runtime sub-second; the
+        // assertion is about behavior shape, not absolute capacity.
+        const N: usize = 5000;
+        // Default UDP timeout is 60s. Install all sessions at the
+        // same install_ns so they share an expiration tick.
+        for i in 0..N {
+            let k = make_v4_key((i % 250) as u8, 1024 + (i / 250) as u16);
+            assert!(table.install_with_protocol(
+                k,
+                decision(),
+                metadata(),
+                install_ns,
+                PROTO_UDP,
+                0
+            ));
+        }
+        let advance = install_ns + 65 * WHEEL_TICK_NS;
+        table.last_gc_ns = advance - SESSION_GC_INTERVAL_NS;
+        let expired = table.expire_stale_entries(advance);
+        assert_eq!(expired.len(), N, "all sessions must drain in one call");
+        assert_eq!(table.len(), 0);
+    }
+
+    /// Alias path: lookup_with_origin called on a NAT-translated
+    /// reverse alias key resolves to the canonical forward key (via
+    /// reverse_translated_index), then pushes the CANONICAL key into
+    /// the wheel — never the alias. Round-3/4 of plan iteration caught
+    /// that the .map(|entry| { ... self.wheel ... }) shape wouldn't
+    /// compile; this test additionally validates the runtime
+    /// invariant that the canonical key, not the alias, lands in the
+    /// wheel after a sub-tick advance.
+    #[test]
+    fn wheel_alias_lookup_refreshes_canonical_key() {
+        let mut table = SessionTable::new();
+        // Install a forward session with NAT rewrite_dst so that the
+        // alias index gets populated automatically by index_forward_nat_key.
+        let canonical_key = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 42)),
+            src_port: 5201,
+            dst_port: 42424,
+        };
+        let alias_key = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            src_port: 5201,
+            dst_port: 42424,
+        };
+        let mut reverse_metadata = metadata();
+        reverse_metadata.is_reverse = true;
+        let nat = SessionDecision {
+            resolution: resolution(),
+            nat: NatDecision {
+                rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+                ..NatDecision::default()
+            },
+        };
+        let install_ns = 1_000_000_000u64;
+        assert!(table.install_with_protocol(
+            canonical_key.clone(),
+            nat,
+            reverse_metadata,
+            install_ns,
+            PROTO_TCP,
+            0x10,
+        ));
+        // Sanity: install pushed the canonical key to its bucket.
+        let initial_canonical_count: usize = table
+            .wheel
+            .buckets
+            .iter()
+            .map(|b| b.iter().filter(|e| e.key == canonical_key).count())
+            .sum();
+        assert_eq!(initial_canonical_count, 1, "install pushed canonical");
+        let initial_alias_count: usize = table
+            .wheel
+            .buckets
+            .iter()
+            .map(|b| b.iter().filter(|e| e.key == alias_key).count())
+            .sum();
+        assert_eq!(initial_alias_count, 0, "alias key MUST NOT be in wheel");
+        // Now look up via the ALIAS, advancing the canonical entry's
+        // expiration tick by enough to cross the second-grid (so the
+        // throttle fires a new push).
+        let lookup_ns = install_ns + 2 * WHEEL_TICK_NS;
+        let hit = table.lookup_with_origin(&alias_key, lookup_ns, 0x10);
+        assert!(hit.is_some(), "alias lookup must hit");
+        // Wheel state after alias lookup: canonical key has a NEW
+        // entry (the one pushed by lookup_with_origin); alias key
+        // STILL has no entries.
+        let canonical_count: usize = table
+            .wheel
+            .buckets
+            .iter()
+            .map(|b| b.iter().filter(|e| e.key == canonical_key).count())
+            .sum();
+        assert!(
+            canonical_count >= 2,
+            "alias lookup must push a fresh wheel entry under the canonical key; \
+             canonical_count={}",
+            canonical_count
+        );
+        let alias_count: usize = table
+            .wheel
+            .buckets
+            .iter()
+            .map(|b| b.iter().filter(|e| e.key == alias_key).count())
+            .sum();
+        assert_eq!(
+            alias_count, 0,
+            "alias key MUST never appear in any bucket; alias_count={}",
+            alias_count
+        );
+    }
+
+    /// Sustained per-second touch on every session: K (entries
+    /// scanned per popped bucket) is bounded by N, and pop
+    /// classification matches the plan's expected pattern: every
+    /// scanned entry is a stale duplicate (entries_dropped_stale ≈ K),
+    /// no entries get re-bucketed (sessions are kept alive by
+    /// per-second touches that update wheel_tick), and no entries
+    /// expire.
+    ///
+    /// This is the per-second-touch K-bound from §Acceptance gate 4b
+    /// (corrected per Codex round-7 #2 classifications and round-12
+    /// instrumentation requirement).
+    ///
+    /// Test scale: N = 1000 (smaller than the 10K plan target to keep
+    /// CI runtime under 1 s; the assertion shape is what matters).
+    #[test]
+    fn wheel_per_second_touch_bounds_k_per_bucket() {
+        let mut table = SessionTable::new();
+        const N: usize = 1000;
+        let install_ns = 1_000_000_000u64;
+        // Install N sessions, each at a distinct sub-tick install
+        // offset so they spread across buckets after warm-up.
+        let keys: Vec<SessionKey> = (0..N)
+            .map(|i| make_v4_key((i % 250) as u8, 1024 + (i / 250) as u16))
+            .collect();
+        for (i, k) in keys.iter().enumerate() {
+            assert!(table.install_with_protocol(
+                k.clone(),
+                decision(),
+                metadata(),
+                install_ns + (i as u64) * 1_000, // 1 µs spacing
+                PROTO_UDP,
+                0
+            ));
+        }
+        // Warm-up: touch every session once per tick for ≥ 300 ticks
+        // so the wheel reaches steady state under per-second touch on
+        // every session. After each touch round, run GC at the
+        // matching tick.
+        const WARMUP_TICKS: u64 = 300;
+        for tick_off in 1..=WARMUP_TICKS {
+            let now = install_ns + tick_off * WHEEL_TICK_NS;
+            for k in &keys {
+                table.touch(k, now);
+            }
+            table.last_gc_ns = now - SESSION_GC_INTERVAL_NS;
+            let _ = table.expire_stale_entries(now);
+        }
+        // Measurement tick: advance one more, capture the next pop's
+        // stats via last_pop_stats().
+        let measure_now = install_ns + (WARMUP_TICKS + 1) * WHEEL_TICK_NS;
+        for k in &keys {
+            table.touch(k, measure_now);
+        }
+        table.last_gc_ns = measure_now - SESSION_GC_INTERVAL_NS;
+        let _ = table.expire_stale_entries(measure_now);
+        let stats = table.last_pop_stats();
+
+        // §Acceptance gate 4b classifications under sustained per-
+        // second touch: every popped entry is stale duplicate, no
+        // re-bucketing, no expirations.
+        assert!(
+            stats.scanned > 0,
+            "must have scanned entries; stats={:?}",
+            stats
+        );
+        // K bound: scanned ≤ N × 1.2 (20 % headroom — a 2× duplicate-
+        // push regression would scan >2 N and fail this).
+        let k_bound = (N as f64 * 1.2) as usize;
+        assert!(
+            stats.scanned <= k_bound,
+            "K (scanned) must be bounded by N×1.2 = {}; got scanned={} stats={:?}",
+            k_bound,
+            stats.scanned,
+            stats
+        );
+        // No re-bucketing under sustained-per-tick touch: each
+        // session's canonical wheel_tick advances every tick, so all
+        // popped entries with stale `scheduled_tick != wheel_tick`
+        // hit the dropped_stale path, not re-bucket.
+        assert_eq!(
+            stats.re_bucketed, 0,
+            "expected 0 re-bucketed under per-second touch; stats={:?}",
+            stats
+        );
+        assert_eq!(
+            stats.expired, 0,
+            "expected 0 expirations under per-second touch; stats={:?}",
+            stats
+        );
+        // dropped_stale + dropped_gone + expired + re_bucketed = scanned.
+        assert_eq!(
+            stats.dropped_stale + stats.dropped_gone + stats.expired + stats.re_bucketed,
+            stats.scanned,
+            "case classification must sum to scanned; stats={:?}",
+            stats
+        );
+        // dropped_stale dominates (the lazy-delete discriminator is
+        // the right path for this workload).
+        assert!(
+            stats.dropped_stale >= stats.scanned * 9 / 10,
+            "expected dropped_stale ≈ scanned (≥90 %); stats={:?}",
+            stats
+        );
+    }
+
+    /// Across one full wheel rotation under sustained per-second
+    /// touch, the total number of entries scanned ≈ 256 × N (every
+    /// bucket pops N stale duplicates). Catches leakage of stale
+    /// entries that the lazy-delete discriminator should drop on
+    /// visit but didn't.
+    #[test]
+    fn wheel_per_second_touch_total_scan_per_rotation_matches_model() {
+        let mut table = SessionTable::new();
+        const N: usize = 500;
+        let install_ns = 1_000_000_000u64;
+        let keys: Vec<SessionKey> = (0..N)
+            .map(|i| make_v4_key((i % 250) as u8, 1024 + (i / 250) as u16))
+            .collect();
+        for (i, k) in keys.iter().enumerate() {
+            assert!(table.install_with_protocol(
+                k.clone(),
+                decision(),
+                metadata(),
+                install_ns + (i as u64) * 1_000,
+                PROTO_UDP,
+                0
+            ));
+        }
+        // Warm up beyond one full rotation so steady-state holds.
+        const WARMUP_TICKS: u64 = 300;
+        for tick_off in 1..=WARMUP_TICKS {
+            let now = install_ns + tick_off * WHEEL_TICK_NS;
+            for k in &keys {
+                table.touch(k, now);
+            }
+            table.last_gc_ns = now - SESSION_GC_INTERVAL_NS;
+            let _ = table.expire_stale_entries(now);
+        }
+        // Now measure across exactly WHEEL_BUCKETS=256 ticks.
+        let mut total_scanned = 0usize;
+        for tick_off in 1..=WHEEL_BUCKETS as u64 {
+            let now = install_ns + (WARMUP_TICKS + tick_off) * WHEEL_TICK_NS;
+            for k in &keys {
+                table.touch(k, now);
+            }
+            table.last_gc_ns = now - SESSION_GC_INTERVAL_NS;
+            let _ = table.expire_stale_entries(now);
+            total_scanned += table.last_pop_stats().scanned;
+        }
+        // Plan §Acceptance gate 4b: total_scanned ∈ [0.9, 1.1] × 256 × N.
+        let model = WHEEL_BUCKETS * N;
+        let lower = (model as f64 * 0.9) as usize;
+        let upper = (model as f64 * 1.1) as usize;
+        assert!(
+            (lower..=upper).contains(&total_scanned),
+            "total_scanned ({}) must be within ±10% of model ({}); range [{}, {}]",
+            total_scanned,
+            model,
+            lower,
+            upper
+        );
     }
 
     #[test]
