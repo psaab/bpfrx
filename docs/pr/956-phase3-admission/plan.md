@@ -1,0 +1,196 @@
+# #956 Phase 3: extract cos/admission.rs from tx.rs
+
+Plan v1 — 2026-04-29.
+
+Continues #956 Phase 1 (cos/ecn.rs at PR #976) and Phase 2
+(cos/flow_hash.rs at PR #977). Phase 3 extracts the admission /
+flow-fair-promotion subsystem.
+
+## Investigation findings (Claude, on commit e08710a9)
+
+The admission subsystem in tx.rs comprises 8 functions and 5+
+named constants spread across two regions:
+
+**Constants (lines 3481-3539)**:
+| Item | Line | Visibility | Notes |
+|---|---|---|---|
+| `COS_FLOW_FAIR_MIN_SHARE_BYTES` | 3481 | private | + const_assert at 3488 |
+| `COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS` | 3497 | private | + const_assert at 3501 |
+| `COS_ECN_MARK_THRESHOLD_NUM` | 3532 | private | Phase 1 left here for Phase 3 |
+| `COS_ECN_MARK_THRESHOLD_DEN` | 3533 | private | + 2 const_asserts at 3538-9 |
+
+**Functions (lines 3606-5698)**:
+| Item | Line | Visibility | Callers |
+|---|---|---|---|
+| `apply_cos_admission_ecn_policy` | 3606 | private | tx.rs admission entry (~6 sites) |
+| `bdp_floor_bytes` | 3881 | private | `cos_queue_flow_share_limit` only |
+| `cos_queue_flow_share_limit` | 3887 | private | admission + ECN policy + tests |
+| `cos_flow_aware_buffer_limit` | 3980 | private | admission + tests |
+| `account_cos_queue_flow_enqueue` | 3996 | private | enqueue path |
+| `account_cos_queue_flow_dequeue` | 4046 | private | dequeue path |
+| `apply_cos_queue_flow_fair_promotion` | 5391 | private | tx.rs queue-build entry |
+| `promote_cos_queue_flow_fair` | 5661 | private | called only by `apply_*_promotion` |
+
+Plus two SHARED_EXACT-specific constants near the share-limit fn:
+- `RTT_TARGET_NS` at 3857
+- `SHARED_EXACT_BURST_HEADROOM` at 3865
+
+Total move: ~700 LOC of production code (functions + constants +
+their dense doc comments).
+
+## Approach
+
+Create `userspace-dp/src/afxdp/cos/admission.rs` with the 8
+moved functions and all 5 (+2 SHARED_EXACT) named constants and
+their `const_assert` invariants. Items needing cross-module
+visibility get `pub(in crate::afxdp)`. `cos/mod.rs` extends the
+re-export block.
+
+### Move list (~700 LOC)
+
+```rust
+// cos/admission.rs
+use crate::afxdp::types::{CoSInterfaceRuntime, CoSPendingTxItem,
+    CoSQueueRuntime, WorkerCoSQueueFastPath};
+use crate::afxdp::umem::MmapArea;
+use super::flow_hash::{cos_flow_bucket_index, cos_flow_hash_seed_from_os};
+use super::ecn::{maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared,
+    ECN_MASK, ECN_NOT_ECT};
+
+// Constants (all private to admission.rs unless tests need them).
+const COS_FLOW_FAIR_MIN_SHARE_BYTES: u64 = 16 * 1500;
+const _: () = assert!(COS_FLOW_FAIR_MIN_SHARE_BYTES >= 16 * 1500);
+const COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS: u64 = 5_000_000;
+const _: () = assert!(COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS >= 1_000_000);
+const COS_ECN_MARK_THRESHOLD_NUM: u64 = 1;
+const COS_ECN_MARK_THRESHOLD_DEN: u64 = 3;
+const _: () = assert!(COS_ECN_MARK_THRESHOLD_NUM < COS_ECN_MARK_THRESHOLD_DEN);
+const _: () = assert!(COS_ECN_MARK_THRESHOLD_DEN > 0);
+const RTT_TARGET_NS: u64 = 10_000_000;
+const SHARED_EXACT_BURST_HEADROOM: u64 = 2;
+
+// Functions — pub(in crate::afxdp) for the 4 with external callers.
+fn bdp_floor_bytes(...) -> u64 { ... }
+pub(in crate::afxdp) fn cos_queue_flow_share_limit(...) -> u64 { ... }
+pub(in crate::afxdp) fn cos_flow_aware_buffer_limit(...) -> u64 { ... }
+pub(in crate::afxdp) fn account_cos_queue_flow_enqueue(...) { ... }
+pub(in crate::afxdp) fn account_cos_queue_flow_dequeue(...) { ... }
+pub(in crate::afxdp) fn apply_cos_admission_ecn_policy(...) -> bool { ... }
+pub(in crate::afxdp) fn apply_cos_queue_flow_fair_promotion(...) { ... }
+fn promote_cos_queue_flow_fair(...) { ... }
+```
+
+`cos/mod.rs` re-exports the 6 cross-module items via
+`pub(super) use`. Tests stay in `tx::tests` — same Phase 1+2
+pattern.
+
+### Visibility model (Phase 1 R1+R2 pattern, validated by Phase 2)
+
+- File-private inside `cos/admission.rs`: `bdp_floor_bytes`,
+  `promote_cos_queue_flow_fair`, all named constants (none called
+  outside this module).
+- `pub(in crate::afxdp)` (re-exported from `cos/mod.rs`):
+  `cos_queue_flow_share_limit`, `cos_flow_aware_buffer_limit`,
+  `account_cos_queue_flow_enqueue`, `account_cos_queue_flow_dequeue`,
+  `apply_cos_admission_ecn_policy`, `apply_cos_queue_flow_fair_promotion`.
+
+Tests in `tx::tests` reach the moved items via the re-exports.
+Investigation phase 1 of implementation will verify each
+production call site and grep for any test-only references that
+may need additional cfg-gated imports (Phase 1 lesson).
+
+## Files touched
+
+- **NEW** `userspace-dp/src/afxdp/cos/admission.rs`: ~700 LOC of
+  moved production code.
+- `userspace-dp/src/afxdp/cos/mod.rs`: append `pub(super) mod
+  admission;` + extend `pub(super) use admission::{...}` block.
+- `userspace-dp/src/afxdp/tx.rs`: removes ~700 LOC; adds `use
+  super::cos::{...}` for the 6 cross-module items. Net ~700
+  LOC smaller.
+- 0 new tests required — pure structural refactor. ~30 admission-
+  related tests stay in `tx::tests`.
+
+### Phase-1 stale-text cleanup
+
+Phase 1 left a comment in `tx.rs` (the block at the cos/use site)
+saying admission moves "in Phase 3" — already correct after the
+Copilot fix on PR #977. No additional cleanup needed.
+
+`cos/ecn.rs` has the same correct "Phase 3" reference as of
+PR #977. No update needed.
+
+## Tests
+
+~30 admission-related tests at `tx.rs:10664+` must continue to pass:
+- `flow_fair_exact_queue_limits_dominant_flow_share`
+- `cos_flow_aware_buffer_limit_respects_non_flow_fair_queues`
+- `flow_share_limit_shared_exact_*` (5 tests)
+- `cos_queue_flow_share_limit_never_drops_below_fast_retransmit_floor`
+- `cos_flow_aware_buffer_limit_preserves_non_flow_fair_path_after_clamp`
+- `flow_fair_queue_pops_in_virtual_finish_order_local`
+- ~15 `admission_ecn_*` tests
+- promotion / share-cap / accounting tests
+
+No new tests required — pure structural refactor.
+
+## Acceptance gates
+
+The repo has no root `Cargo.toml`; cargo commands must run with
+`--manifest-path userspace-dp/Cargo.toml`.
+
+1. `cargo build --release --manifest-path userspace-dp/Cargo.toml`
+   clean (no new warnings beyond baseline).
+2. `cargo test --release --manifest-path userspace-dp/Cargo.toml`
+   ≥ baseline (865 post-#977), 0 failed.
+3. Cluster smoke (HARD): no regression. Run on
+   `loss:xpf-userspace-fw0/fw1` AND with CoS configured via
+   `test/incus/cos-iperf-config.set`.
+
+   | Class       | Port  | Shape | P=12 gate     |
+   |-------------|-------|-------|---------------|
+   | iperf-c     | 5203  | 25 g  | ≥ 22 Gb/s     |
+   | iperf-f     | 5206  | 19 g  | ≥ 17.1 Gb/s   |
+   | iperf-e     | 5205  | 16 g  | ≥ 14.4 Gb/s   |
+   | iperf-d     | 5204  | 13 g  | ≥ 11.7 Gb/s   |
+   | iperf-b     | 5202  | 10 g  | ≥ 9.0 Gb/s    |
+   | iperf-a     | 5201  | 1 g   | ≥ 0.9 Gb/s    |
+   | best-effort | 5207  | 100 m | ≥ 90 Mb/s     |
+
+   Every P=12 row blocking. iperf-c also keeps P=1 ≥ 6 Gb/s.
+
+   Per-CoS-class smoke EXERCISES the moved code (admission
+   policy + flow-share gates fire on every iperf3 packet that
+   hits a flow-fair queue).
+
+4. Failover smoke: 90-s iperf3 -P 12 through fw0, force-reboot
+   fw0 at +20s, fw1 takes over <10s, iperf3 ≥ 1 Gb/s avg / ≥ 5 GB.
+5. Codex hostile review (plan + impl): AGREE-TO-MERGE.
+6. Gemini adversarial (plan + impl): AGREE-TO-MERGE (or skip if
+   daemon unavailable, per Phase 2 precedent).
+7. Copilot review on PR: all valid findings addressed.
+
+## Risk
+
+**Medium.** Larger move than Phases 1+2 (~700 LOC vs ~210/~150)
+and admission is the hottest CoS path — every iperf3 packet on a
+flow-fair queue routes through it. Risks:
+
+- Hidden visibility leak (a function pulled into admission.rs
+  references a tx.rs-private item that needs widening).
+- Stale-comment / phase-numbering churn (Phase 1+2 each generated
+  Copilot findings here; mitigated by Phase 2's already-fixed
+  references).
+
+The core design is the same successful pattern Phases 1+2
+validated: pub(in crate::afxdp) source items + pub(super) use
+re-exports + tests stay in place. Existing test coverage on
+admission paths is dense (~30 tests).
+
+## Out of scope
+
+- Phase 4: `cos/token_bucket.rs`
+- Phase 5: `cos/queue_ops.rs`
+- Phase 6: `cos/builders.rs`
+- Phase 7: `cos/queue_service.rs`
+- Phase 8: `cos/cross_binding.rs`
