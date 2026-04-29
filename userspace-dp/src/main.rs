@@ -7,6 +7,7 @@ mod nat64;
 mod nptv6;
 mod policy;
 mod prefix;
+mod prefix_set;
 mod screen;
 mod session;
 mod slowpath;
