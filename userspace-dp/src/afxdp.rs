@@ -87,6 +87,8 @@ mod rst;
 mod sharded_neighbor;
 #[path = "afxdp/session_glue.rs"]
 mod session_glue;
+#[path = "afxdp/cos/mod.rs"]
+mod cos;
 #[path = "afxdp/shared_ops.rs"]
 mod shared_ops;
 #[cfg(test)]

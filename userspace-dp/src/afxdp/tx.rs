@@ -3538,222 +3538,24 @@ const COS_ECN_MARK_THRESHOLD_DEN: u64 = 3;
 const _: () = assert!(COS_ECN_MARK_THRESHOLD_NUM < COS_ECN_MARK_THRESHOLD_DEN);
 const _: () = assert!(COS_ECN_MARK_THRESHOLD_DEN > 0);
 
-/// ECN codepoint masks (low 2 bits of IPv4 TOS / IPv6 tclass).
-const ECN_MASK: u8 = 0b0000_0011;
-const ECN_NOT_ECT: u8 = 0b0000_0000;
-const ECN_ECT_0: u8 = 0b0000_0010;
-const ECN_ECT_1: u8 = 0b0000_0001;
-const ECN_CE: u8 = 0b0000_0011;
-
-use super::ethernet::{ETH_HDR_LEN, VLAN_TAG_LEN};
-
-/// Parsed L3 discriminator + offset from a forwarded Ethernet frame.
-/// Carries both pieces together so the ECN mark path dispatches off the
-/// bytes it actually parsed, not the `expected_addr_family` sideband —
-/// a malformed frame whose sideband says AF_INET but whose ethertype
-/// says something else must not get its "TOS byte" stamped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EthernetL3 {
-    Ipv4(usize),
-    Ipv6(usize),
-}
-
-/// Parse the outer Ethernet header, transparently walk a single 802.1Q
-/// / 802.1ad VLAN tag, and report the L3 family + header offset. The
-/// CoS admission path sees frames post-forward-build, so VLAN tags
-/// from tagged subinterfaces (e.g. `reth0 unit 80`) are already
-/// present. Callers use the returned family to dispatch to the
-/// matching ECN marker and the offset to locate the TOS / tclass byte.
-///
-/// Returns `None` for:
-/// - buffers shorter than the parse requires (no slice-out-of-bounds
-///   panic on the hot path),
-/// - non-IP ethertypes (including ARP, MPLS, and the tail of a QinQ
-///   stack) — we refuse to guess rather than stamp a byte that is not
-///   a TOS / tclass byte,
-/// - nested VLAN tags (QinQ / 802.1ad-over-Q) — not implemented yet;
-///   adding support means one more 4-byte hop plus recursive inner-
-///   ethertype inspection. The single-tag path covers the only lab
-///   fixture we currently exercise.
-///
-/// Historically this helper just returned an offset, and dispatch was
-/// based on `expected_addr_family`. The gap that exposed was: if the
-/// sideband said AF_INET but the frame was ARP-inside-VLAN, we would
-/// still compute offset = 18 and stamp byte 19 inside the ARP body.
-/// Returning the parsed family here closes that drift permanently —
-/// the marker cannot disagree with the wire bytes it is mutating.
-#[inline]
-fn ethernet_l3(bytes: &[u8]) -> Option<EthernetL3> {
-    if bytes.len() < ETH_HDR_LEN {
-        return None;
-    }
-    let outer = u16::from_be_bytes([bytes[12], bytes[13]]);
-    match outer {
-        0x0800 => Some(EthernetL3::Ipv4(ETH_HDR_LEN)),
-        0x86DD => Some(EthernetL3::Ipv6(ETH_HDR_LEN)),
-        // 802.1Q / 802.1ad single VLAN tag. The inner ethertype lives
-        // 4 bytes after the outer one; if that inner ethertype is
-        // *itself* a VLAN TPID we have a QinQ stack that we do not
-        // support yet — reject it rather than stamping into an inner
-        // tag.
-        0x8100 | 0x88A8 => {
-            let inner_off = ETH_HDR_LEN + VLAN_TAG_LEN;
-            if bytes.len() < inner_off + 2 {
-                return None;
-            }
-            let inner = u16::from_be_bytes([bytes[inner_off - 2], bytes[inner_off - 1]]);
-            match inner {
-                0x0800 => Some(EthernetL3::Ipv4(inner_off)),
-                0x86DD => Some(EthernetL3::Ipv6(inner_off)),
-                // QinQ or unknown inner — refuse to guess.
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Mark the IPv4 packet at `l3_offset` within `bytes` as ECN CE if it
-/// is already ECT(0) or ECT(1). Updates the IP header checksum
-/// incrementally (RFC 1624). Returns true iff the packet was marked.
-/// Never modifies a NOT-ECT packet (protects non-ECN flows per RFC
-/// 3168 section 6.1.1.1).
-#[inline]
-fn mark_ecn_ce_ipv4(bytes: &mut [u8], l3_offset: usize) -> bool {
-    // Need the full 20-byte base IPv4 header (through the checksum field).
-    // Short buffers are returned false rather than panicking — this path
-    // runs per admission on the hot path and cannot trust upstream
-    // length validation to have covered every corner.
-    let end = l3_offset.saturating_add(20);
-    if bytes.len() < end {
-        return false;
-    }
-    let tos_idx = l3_offset + 1;
-    let old_tos = bytes[tos_idx];
-    let ecn = old_tos & ECN_MASK;
-    // Branchless: only ECT(0) and ECT(1) cross to CE; NOT-ECT and CE
-    // are left unchanged. A non-ECT packet returning false routes into
-    // the existing admission drop path unchanged.
-    if ecn != ECN_ECT_0 && ecn != ECN_ECT_1 {
-        return false;
-    }
-    let new_tos = (old_tos & !ECN_MASK) | ECN_CE;
-    bytes[tos_idx] = new_tos;
-
-    // RFC 1624 incremental checksum update for a single byte change to
-    // the TOS field (16-bit word = [version/IHL, TOS]). The header
-    // checksum sits at l3_offset+10..l3_offset+12 in network byte order.
-    //
-    //   HC' = ~(~HC + ~m + m')
-    //
-    // where m and m' are the 16-bit words at the mutated position. The
-    // version/IHL byte is unchanged so it cancels inside `old_word` /
-    // `new_word` — but keeping it in the word avoids a conditional on
-    // which half of the 16-bit word we touched.
-    let ihl = bytes[l3_offset];
-    let old_word = ((ihl as u32) << 8) | old_tos as u32;
-    let new_word = ((ihl as u32) << 8) | new_tos as u32;
-    let csum_idx = l3_offset + 10;
-    let old_csum = ((bytes[csum_idx] as u32) << 8) | bytes[csum_idx + 1] as u32;
-    // ~HC + ~m + m' in 32-bit arithmetic, then fold carries.
-    let mut sum = (!old_csum & 0xffff) + (!old_word & 0xffff) + new_word;
-    // Fold any carries out of the low 16 bits. Two folds are sufficient
-    // for the three 16-bit addends above (max ~3 * 0xffff fits in 18
-    // bits, one fold collapses to 17 bits, second to 16 bits).
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    let new_csum = (!sum) & 0xffff;
-    bytes[csum_idx] = (new_csum >> 8) as u8;
-    bytes[csum_idx + 1] = (new_csum & 0xff) as u8;
-    true
-}
-
-/// Mark the IPv6 packet at `l3_offset` within `bytes` as ECN CE if it
-/// is already ECT(0) or ECT(1). IPv6 has no header checksum so no
-/// incremental update is needed. Returns true iff the packet was marked.
-#[inline]
-fn mark_ecn_ce_ipv6(bytes: &mut [u8], l3_offset: usize) -> bool {
-    // tclass spans the low nibble of byte[l3_offset] and the high
-    // nibble of byte[l3_offset+1]. We need both bytes in range.
-    let end = l3_offset.saturating_add(2);
-    if bytes.len() < end {
-        return false;
-    }
-    // Version/tclass-high byte: [vvvv tttt]. ECN bits are the low 2
-    // bits of tclass, which sit in the high nibble of byte[l3_offset+1]
-    // as bits 5..4. Extract with a simple shift-mask.
-    let b1 = bytes[l3_offset + 1];
-    let ecn = (b1 >> 4) & ECN_MASK;
-    if ecn != ECN_ECT_0 && ecn != ECN_ECT_1 {
-        return false;
-    }
-    // Clear the old ECN bits (bits 5..4 of byte[l3_offset+1]) and OR in
-    // CE shifted into place.
-    let cleared = b1 & !(ECN_MASK << 4);
-    bytes[l3_offset + 1] = cleared | (ECN_CE << 4);
-    true
-}
-
-/// Dispatch ECN marking based on the L3 protocol family stamped on
-/// the TxRequest. Returns true iff the packet was marked.
-#[inline]
-fn maybe_mark_ecn_ce(req: &mut TxRequest) -> bool {
-    // Dispatch off the parsed Ethernet header, not the sideband
-    // `expected_addr_family`. The sideband is populated at RX time and
-    // can drift for injected or re-queued frames whose wire bytes got
-    // rewritten (e.g. NAT64, tunnel transit). Trusting the parse keeps
-    // the marker from stamping the wrong protocol body on any frame
-    // where the two disagree.
-    match ethernet_l3(&req.bytes) {
-        Some(EthernetL3::Ipv4(l3_offset)) => mark_ecn_ce_ipv4(&mut req.bytes, l3_offset),
-        Some(EthernetL3::Ipv6(l3_offset)) => mark_ecn_ce_ipv6(&mut req.bytes, l3_offset),
-        None => false,
-    }
-}
-
-/// Mark a prepared (zero-copy) TX frame as ECN CE in place inside the
-/// UMEM. Only fires on ECT(0)/ECT(1) per RFC 3168 §6.1.1.1. Returns
-/// true iff the packet was marked. Out-of-range offset/len pairs
-/// (e.g. a PreparedTxRequest that somehow escaped bounds checks)
-/// return false without panicking — the caller falls through into
-/// the existing admission path unchanged.
-///
-/// This is the Prepared-variant counterpart to `maybe_mark_ecn_ce`;
-/// #718 / #722 originally only handled the Local variant, leaving
-/// the XSK-RX→XSK-TX zero-copy hot path (iperf3, NAT'd flows) with
-/// the marker dormant. See `docs/cos-validation-notes.md` for the
-/// counter-reading methodology.
-///
-/// # Safety
-///
-/// The caller must hold exclusive access to the frame at
-/// `[req.offset, req.offset + req.len)` within `umem`. On the CoS
-/// admission path this is guaranteed: admission runs *before* the
-/// frame is enqueued into the CoS queue, let alone submitted to the
-/// XSK TX ring, so the worker that built the frame is still the sole
-/// owner. Callers that invoke this outside of the admission gate
-/// must provide the same guarantee.
-#[inline]
-fn maybe_mark_ecn_ce_prepared(req: &PreparedTxRequest, umem: &MmapArea) -> bool {
-    let offset = req.offset as usize;
-    let len = req.len as usize;
-    // SAFETY: see function-level doc. The admission path owns the
-    // frame until `cos_queue_push_back` takes it, which is strictly
-    // after this call. Out-of-range slices return None (handled
-    // below) rather than producing a dangling reference.
-    let Some(bytes) = (unsafe { umem.slice_mut_unchecked(offset, len) }) else {
-        return false;
-    };
-    // Same rationale as `maybe_mark_ecn_ce`: dispatch off the parsed
-    // wire bytes, not `expected_addr_family`. See that helper's
-    // comment for the drift scenarios this protects against.
-    match ethernet_l3(bytes) {
-        Some(EthernetL3::Ipv4(l3_offset)) => mark_ecn_ce_ipv4(bytes, l3_offset),
-        Some(EthernetL3::Ipv6(l3_offset)) => mark_ecn_ce_ipv6(bytes, l3_offset),
-        None => false,
-    }
-}
+// #956 Phase 1: ECN codepoint masks, EthernetL3 enum, ethernet_l3
+// parser, mark_ecn_ce_ipv4/ipv6, and maybe_mark_ecn_ce/_prepared
+// were extracted to userspace-dp/src/afxdp/cos/ecn.rs. Admission
+// policy `apply_cos_admission_ecn_policy` (and the threshold
+// constants `COS_ECN_MARK_THRESHOLD_NUM/_DEN`) stay here; they
+// move with admission to cos/admission.rs in Phase 2.
+//
+// Production code uses only the marker entry points; the
+// codepoint masks + parser + per-family helpers are referenced
+// only by `tx::tests` (admission tests + ECN unit tests that
+// stay here for Phase 1). The test-only imports are gated
+// behind `#[cfg(test)]` to avoid `unused_imports` warnings in
+// non-test builds (Copilot review on PR #976).
+use super::cos::{maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared};
+#[cfg(test)]
+use super::cos::ecn::{ethernet_l3, mark_ecn_ce_ipv4, mark_ecn_ce_ipv6, EthernetL3};
+#[cfg(test)]
+use super::cos::{ECN_CE, ECN_ECT_0, ECN_ECT_1, ECN_MASK, ECN_NOT_ECT};
 
 /// Core ECN admission decision, factored out so tests can drive it
 /// without spinning up a full `BindingWorker` while still exercising
@@ -16735,6 +16537,7 @@ mod tests {
     /// between the MAC addresses and the ethertype. Used by the
     /// VLAN-aware regression tests for both Local and Prepared paths.
     fn insert_single_vlan_tag(packet: Vec<u8>, vid: u16, priority: u8) -> Vec<u8> {
+        use crate::afxdp::ethernet::{ETH_HDR_LEN, VLAN_TAG_LEN};
         assert!(packet.len() >= ETH_HDR_LEN, "packet must be eth-framed");
         let mut tagged = Vec::with_capacity(packet.len() + VLAN_TAG_LEN);
         tagged.extend_from_slice(&packet[..12]); // dst + src MAC
