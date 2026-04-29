@@ -6,7 +6,7 @@ pub(super) fn demote_shared_owner_rgs(
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     owner_rgs: &[i32],
 ) {
     if owner_rgs.is_empty() {
@@ -78,7 +78,7 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     session_map_fd: c_int,
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     owner_rgs: &[i32],
     now_secs: u64,
 ) {
@@ -448,7 +448,7 @@ pub(super) fn lookup_forward_nat_across_scopes(
 pub(super) fn build_reverse_session_from_forward_match(
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     forward_match: ForwardSessionMatch,
     now_secs: u64,
     ha_startup_grace_until_secs: u64,
@@ -494,7 +494,7 @@ pub(super) fn build_reverse_session_from_forward_match(
 pub(super) fn synthesized_synced_reverse_entry(
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     entry: &SyncedSessionEntry,
     now_secs: u64,
 ) -> Option<SyncedSessionEntry> {
@@ -528,7 +528,7 @@ pub(super) fn synthesized_synced_reverse_entry(
 pub(super) fn reverse_resolution_for_session(
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     target_ip: IpAddr,
     ingress_zone: &str,
     fabric_ingress: bool,
@@ -570,7 +570,7 @@ pub(super) fn install_reverse_session_from_forward_match(
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     reverse_key: &SessionKey,
     forward_match: ForwardSessionMatch,
     now_ns: u64,
@@ -760,7 +760,7 @@ pub(super) fn owner_rg_session_keys_serialized(
 pub(super) fn refresh_reverse_prewarm_owner_rg_indexes(
     index: &Arc<Mutex<OwnerRgSessionIndex>>,
     forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     previous_entry: Option<&SyncedSessionEntry>,
     next_entry: Option<&SyncedSessionEntry>,
 ) {
@@ -788,7 +788,7 @@ pub(super) fn refresh_reverse_prewarm_owner_rg_indexes(
 
 fn reverse_prewarm_owner_rg_candidates(
     forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     entry: &SyncedSessionEntry,
 ) -> FastSet<i32> {
     let mut owner_rgs = FastSet::default();

@@ -93,7 +93,7 @@ pub(super) fn populate_egress_resolution(
 
 pub(super) fn lookup_forwarding_resolution_for_session(
     forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     flow: &SessionFlow,
     decision: SessionDecision,
 ) -> ForwardingResolution {
@@ -108,7 +108,7 @@ pub(super) fn lookup_forwarding_resolution_for_session(
 
 fn lookup_forwarding_resolution_for_session_with_cache(
     forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     flow: &SessionFlow,
     decision: SessionDecision,
     allow_cached_fast_path: bool,
@@ -150,7 +150,7 @@ fn lookup_forwarding_resolution_for_session_with_cache(
 
 fn lookup_forwarding_resolution_for_synced_session(
     forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     flow: &SessionFlow,
     decision: SessionDecision,
 ) -> ForwardingResolution {
@@ -327,7 +327,7 @@ pub(super) fn apply_worker_commands(
     _conntrack_v6_fd: c_int,
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
 ) -> WorkerCommandResults {
     // Hot path: try_lock avoids blocking on the mutex when another thread
     // holds it (rare) and avoids the cost of lock+unlock on empty queues
@@ -997,7 +997,7 @@ pub(super) fn resolve_flow_session_decision(
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     flow: &SessionFlow,
     now_ns: u64,
     now_secs: u64,
@@ -1511,7 +1511,7 @@ mod tests {
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let mut ha_state = BTreeMap::new();
         ha_state.insert(1, active_ha_runtime(1));
 
@@ -2291,7 +2291,7 @@ mod tests {
             forward_key: translated_key.clone(),
         };
         let forwarding = ForwardingState::default();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let peer_worker_commands = Vec::new();
         let resolved = resolve_flow_session_decision(
             &mut sessions,
@@ -2370,7 +2370,7 @@ mod tests {
             &shared_owner_rg_indexes,
             &entry,
         );
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let peer_worker_commands = Vec::new();
         let mut ha_state = BTreeMap::new();
         ha_state.insert(1, active_ha_runtime(1));
@@ -2462,7 +2462,7 @@ mod tests {
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let peer_worker_commands = Vec::new();
         let mut ha_state = BTreeMap::new();
         ha_state.insert(1, active_ha_runtime(1));
@@ -2552,7 +2552,7 @@ mod tests {
             &shared_owner_rg_indexes,
             &entry,
         );
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let peer_worker_commands = Vec::new();
         let mut ha_state = BTreeMap::new();
         ha_state.insert(1, inactive_ha_runtime(0));
@@ -2633,7 +2633,7 @@ mod tests {
             &shared_owner_rg_indexes,
             &entry,
         );
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let peer_worker_commands = Vec::new();
         let mut ha_state = BTreeMap::new();
         ha_state.insert(1, inactive_ha_runtime(0));
@@ -2708,7 +2708,7 @@ mod tests {
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let peer_worker_commands = Vec::new();
         let mut ha_state = BTreeMap::new();
         ha_state.insert(1, inactive_ha_runtime(0));
@@ -2780,7 +2780,7 @@ mod tests {
         let mut ha_state = BTreeMap::new();
         ha_state.insert(1, inactive_ha_runtime(0));
         let forwarding = test_forwarding_state();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         apply_worker_commands(
             &commands,
             &mut sessions,
@@ -2843,7 +2843,7 @@ mod tests {
         let mut ha_state = BTreeMap::new();
         ha_state.insert(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000));
         let forwarding = test_forwarding_state();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         apply_worker_commands(
             &commands,
             &mut sessions,
@@ -2899,7 +2899,7 @@ mod tests {
             .push_back(WorkerCommand::DemoteOwnerRGS { owner_rgs: vec![1] });
         let forwarding = test_forwarding_state();
         let ha_state = BTreeMap::from([(1, inactive_ha_runtime(0))]);
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
 
         apply_worker_commands(
             &commands,
@@ -2938,7 +2938,7 @@ mod tests {
             .expect("commands lock")
             .push_back(WorkerCommand::DemoteOwnerRGS { owner_rgs: vec![1] });
         let forwarding = test_forwarding_state();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let inactive_state = BTreeMap::from([(1, inactive_ha_runtime(0))]);
 
         apply_worker_commands(
@@ -3169,7 +3169,7 @@ mod tests {
                 owner_rgs: vec![1],
             });
         let forwarding = test_forwarding_state_with_fabric();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let mut ha_state = BTreeMap::new();
         ha_state.insert(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000));
         let results = apply_worker_commands(
@@ -3229,7 +3229,7 @@ mod tests {
                 owner_rgs: vec![1],
             });
         let forwarding = test_forwarding_state_with_fabric();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let mut ha_state = BTreeMap::new();
         ha_state.insert(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000));
         let results = apply_worker_commands(
@@ -3273,7 +3273,7 @@ mod tests {
             });
 
         let forwarding = test_forwarding_state_with_fabric();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let mut ha_state = BTreeMap::new();
         ha_state.insert(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000));
 
@@ -3336,7 +3336,7 @@ mod tests {
             &shared_forward_wire_sessions,
             &shared_owner_rg_indexes,
             &test_forwarding_state_with_fabric(),
-            &Arc::new(Mutex::new(FastMap::default())),
+            &Arc::new(ShardedNeighborMap::new()),
             &[1],
         );
 
@@ -3371,7 +3371,7 @@ mod tests {
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let forwarding = test_forwarding_state_split_rgs();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let mut entry = SyncedSessionEntry {
             key: test_key(),
             decision: test_decision(),
@@ -3419,7 +3419,7 @@ mod tests {
         let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let worker_commands = vec![Arc::new(Mutex::new(VecDeque::new()))];
         let forwarding = test_forwarding_state_split_rgs();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let mut ha_state = BTreeMap::new();
         ha_state.insert(2, active_ha_runtime(1));
         let mut entry = SyncedSessionEntry {
@@ -3507,7 +3507,7 @@ mod tests {
             -1,
             &test_forwarding_state_with_fabric(),
             &BTreeMap::new(),
-            &Arc::new(Mutex::new(FastMap::default())),
+            &Arc::new(ShardedNeighborMap::new()),
         );
 
         assert_eq!(results.cancelled_keys, vec![key.clone()]);
@@ -3547,7 +3547,7 @@ mod tests {
             -1,
             &test_forwarding_state_with_fabric(),
             &ha_state,
-            &Arc::new(Mutex::new(FastMap::default())),
+            &Arc::new(ShardedNeighborMap::new()),
         );
 
         assert_eq!(results.cancelled_keys, vec![key.clone()]);
@@ -3616,7 +3616,7 @@ mod tests {
             -1,
             &test_forwarding_state_split_rgs(),
             &ha_state,
-            &Arc::new(Mutex::new(FastMap::default())),
+            &Arc::new(ShardedNeighborMap::new()),
         );
 
         assert_eq!(results.cancelled_keys, vec![reverse_key.clone()]);
@@ -3687,7 +3687,7 @@ mod tests {
             -1,
             &test_forwarding_state_split_rgs(),
             &ha_state,
-            &Arc::new(Mutex::new(FastMap::default())),
+            &Arc::new(ShardedNeighborMap::new()),
         );
 
         assert!(results.cancelled_keys.is_empty());
@@ -3766,7 +3766,7 @@ mod tests {
             -1,
             &test_forwarding_state_split_rgs(),
             &ha_state,
-            &Arc::new(Mutex::new(FastMap::default())),
+            &Arc::new(ShardedNeighborMap::new()),
         );
 
         assert!(results.cancelled_keys.is_empty());
@@ -3845,7 +3845,7 @@ mod tests {
             -1,
             &test_forwarding_state_split_rgs(),
             &ha_state,
-            &Arc::new(Mutex::new(FastMap::default())),
+            &Arc::new(ShardedNeighborMap::new()),
         );
 
         assert!(results.cancelled_keys.is_empty());
@@ -3924,7 +3924,7 @@ mod tests {
             -1,
             &test_forwarding_state_split_rgs(),
             &ha_state,
-            &Arc::new(Mutex::new(FastMap::default())),
+            &Arc::new(ShardedNeighborMap::new()),
         );
 
         assert!(results.cancelled_keys.is_empty());
@@ -3998,7 +3998,7 @@ mod tests {
             -1,
             &test_forwarding_state_split_rgs(),
             &ha_state,
-            &Arc::new(Mutex::new(FastMap::default())),
+            &Arc::new(ShardedNeighborMap::new()),
         );
 
         assert!(results.cancelled_keys.is_empty());
@@ -4049,7 +4049,7 @@ mod tests {
             -1,
             &test_forwarding_state_with_fabric(),
             &BTreeMap::new(),
-            &Arc::new(Mutex::new(FastMap::default())),
+            &Arc::new(ShardedNeighborMap::new()),
         );
 
         assert_eq!(results.exported_sequences, vec![11]);
@@ -4062,7 +4062,7 @@ mod tests {
     #[test]
     fn synthesized_synced_reverse_entry_preserves_fabric_ingress_and_reverse_flag() {
         let forwarding = test_forwarding_state();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let mut metadata = test_metadata();
         metadata.fabric_ingress = true;
         let entry = SyncedSessionEntry {
@@ -4097,7 +4097,7 @@ mod tests {
     #[test]
     fn synthesized_synced_reverse_entry_tracks_local_client_when_owner_rg_active() {
         let forwarding = test_forwarding_state();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let mut metadata = test_metadata();
         metadata.fabric_ingress = true;
         let entry = SyncedSessionEntry {
@@ -4125,7 +4125,7 @@ mod tests {
     #[test]
     fn synthesized_synced_reverse_entry_uses_fabric_redirect_when_client_rg_inactive() {
         let forwarding = test_forwarding_state_split_rgs();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let mut metadata = test_metadata();
         metadata.ingress_zone = Arc::<str>::from("lan");
         metadata.egress_zone = Arc::<str>::from("wan");
@@ -4270,7 +4270,7 @@ mod tests {
     #[test]
     fn reverse_session_from_tunnel_forward_bypasses_unseeded_ha_during_startup_grace() {
         let forwarding = test_forwarding_state_split_rgs_with_tunnel();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let ha_state = BTreeMap::from([(2, inactive_ha_runtime(0))]);
         let reverse = build_reverse_session_from_forward_match(
             &forwarding,
@@ -4330,7 +4330,7 @@ mod tests {
         let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let worker_commands = vec![Arc::new(Mutex::new(VecDeque::new()))];
         let forwarding = test_forwarding_state();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let mut ha_state = BTreeMap::new();
         ha_state.insert(1, active_ha_runtime(1));
         let entry = SyncedSessionEntry {
@@ -4394,7 +4394,7 @@ mod tests {
         let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let worker_commands = vec![Arc::new(Mutex::new(VecDeque::new()))];
         let forwarding = test_forwarding_state_split_rgs();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let mut ha_state = BTreeMap::new();
         ha_state.insert(1, active_ha_runtime(1));
         ha_state.insert(2, inactive_ha_runtime(1));
@@ -4472,7 +4472,7 @@ mod tests {
         let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let worker_commands = vec![Arc::new(Mutex::new(VecDeque::new()))];
         let forwarding = test_forwarding_state_split_rgs();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let mut ha_state = BTreeMap::new();
         ha_state.insert(2, active_ha_runtime(1));
         let mut entry = SyncedSessionEntry {
@@ -4535,7 +4535,7 @@ mod tests {
     #[test]
     fn reverse_prewarm_index_tracks_split_reverse_owner_rg_candidate() {
         let forwarding = test_forwarding_state_split_rgs();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let mut entry = SyncedSessionEntry {
             key: test_key(),
@@ -4570,7 +4570,7 @@ mod tests {
     fn reverse_session_from_split_owner_fabric_redirect_uses_fabric_return_when_client_rg_inactive()
     {
         let forwarding = test_forwarding_state_split_rgs();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let ha_state = BTreeMap::from([(2, inactive_ha_runtime(1))]);
         let reverse = build_reverse_session_from_forward_match(
             &forwarding,
@@ -4744,7 +4744,7 @@ mod tests {
             },
         );
         let peer_worker_commands = Vec::new();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let ha_state = BTreeMap::from([(
             1,
             HAGroupRuntime {

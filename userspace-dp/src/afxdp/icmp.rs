@@ -24,7 +24,7 @@ pub(super) fn build_local_time_exceeded_request(
     ingress_ident: &BindingIdentity,
     _flow: &SessionFlow,
     forwarding: &ForwardingState,
-    _dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    _dynamic_neighbors: &Arc<ShardedNeighborMap>,
     _ha_state: &BTreeMap<i32, HAGroupRuntime>,
     _now_secs: u64,
 ) -> Option<PendingForwardRequest> {

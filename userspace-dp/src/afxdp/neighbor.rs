@@ -187,37 +187,26 @@ pub(super) fn add_kernel_neighbor(ifindex: i32, ip: IpAddr, mac: [u8; 6]) {
 /// so the next packet for that destination finds the neighbor and forwards
 /// directly through XSK — no waiting for the Go-side snapshot refresh.
 pub(super) fn update_dynamic_neighbor(
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     ifindex: i32,
     ip: IpAddr,
     entry: NeighborEntry,
 ) -> bool {
-    let Ok(mut neighbors) = dynamic_neighbors.lock() else {
-        return false;
-    };
-    let key = (ifindex, ip);
-    if neighbors.get(&key).map(|existing| existing.mac) == Some(entry.mac) {
-        return false;
-    }
-    neighbors.insert(key, entry);
-    true
+    dynamic_neighbors.insert_if_changed((ifindex, ip), entry)
 }
 
 pub(super) fn remove_dynamic_neighbor(
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     ifindex: i32,
     ip: IpAddr,
 ) -> bool {
-    let Ok(mut neighbors) = dynamic_neighbors.lock() else {
-        return false;
-    };
-    neighbors.remove(&(ifindex, ip)).is_some()
+    dynamic_neighbors.remove_if_present(&(ifindex, ip))
 }
 
 pub(super) fn parse_neighbor_msg(
     nlmsg_type: u16,
     body: &[u8],
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
 ) -> bool {
     if body.len() < 12 {
         return false;
@@ -313,7 +302,7 @@ pub(super) fn request_neighbor_dump(fd: c_int, family: u8, seq: u32) -> io::Resu
 
 pub(super) fn initial_neighbor_dump(
     fd: c_int,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
 ) -> io::Result<u64> {
     const NLMSG_DONE: u16 = 3;
     const NLMSG_ERROR: u16 = 2;
@@ -384,7 +373,7 @@ pub(super) fn initial_neighbor_dump(
 
 pub(super) fn neigh_monitor_thread(
     stop: Arc<AtomicBool>,
-    dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: Arc<ShardedNeighborMap>,
     neighbor_generation: Arc<AtomicU64>,
 ) {
     // Create NETLINK_ROUTE socket and subscribe to neighbor events

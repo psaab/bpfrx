@@ -79,6 +79,8 @@ mod icmp_embed;
 mod neighbor;
 #[path = "afxdp/rst.rs"]
 mod rst;
+#[path = "afxdp/sharded_neighbor.rs"]
+mod sharded_neighbor;
 #[path = "afxdp/session_glue.rs"]
 mod session_glue;
 #[path = "afxdp/shared_ops.rs"]
@@ -132,6 +134,7 @@ use self::icmp_embed::{
 use self::neighbor::*;
 pub use self::neighbor::{neighbor_state_usable_str, parse_mac_str};
 pub(crate) use self::rst::remove_kernel_rst_suppression;
+use self::sharded_neighbor::ShardedNeighborMap;
 use self::rst::*;
 use self::session_glue::*;
 use self::shared_ops::*;
@@ -391,7 +394,7 @@ fn poll_binding(
     ha_startup_grace_until_secs: u64,
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -921,12 +924,10 @@ fn poll_binding_process_descriptor(
                                     raw_frame[arp_start + 17],
                                 ));
                                 // Update dynamic neighbor cache
-                                if let Ok(mut neighbors) = worker_ctx.dynamic_neighbors.lock() {
-                                    neighbors.insert(
-                                        (meta.ingress_ifindex as i32, sender_ip),
-                                        NeighborEntry { mac: sender_mac },
-                                    );
-                                }
+                                worker_ctx.dynamic_neighbors.insert(
+                                    (meta.ingress_ifindex as i32, sender_ip),
+                                    NeighborEntry { mac: sender_mac },
+                                );
                                 // Add learned ARP entry to kernel neighbor table
                                 // via netlink. This keeps the kernel's ARP table
                                 // in sync (needed for XDP_PASS fallback and
@@ -989,12 +990,10 @@ fn poll_binding_process_descriptor(
                                                 raw_frame[opt_off + 6],
                                                 raw_frame[opt_off + 7],
                                             ];
-                                            if let Ok(mut neighbors) = worker_ctx.dynamic_neighbors.lock() {
-                                                neighbors.insert(
-                                                    (meta.ingress_ifindex as i32, target_ip),
-                                                    NeighborEntry { mac },
-                                                );
-                                            }
+                                            worker_ctx.dynamic_neighbors.insert(
+                                                (meta.ingress_ifindex as i32, target_ip),
+                                                NeighborEntry { mac },
+                                            );
                                             // Add to kernel neighbor table via netlink.
                                             // Use the logical VLAN sub-interface ifindex
                                             // so the kernel associates it correctly.
@@ -3080,7 +3079,7 @@ fn retry_pending_neigh(
     right: &mut [BindingWorker],
     binding_lookup: &WorkerBindingLookup,
     forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     now_ns: u64,
     area: &MmapArea,
 ) {
@@ -3107,12 +3106,7 @@ fn retry_pending_neigh(
                     .neighbors
                     .get(&neigh_key)
                     .map(|e| e.mac)
-                    .or_else(|| {
-                        dynamic_neighbors
-                            .lock()
-                            .ok()
-                            .and_then(|n| n.get(&neigh_key).map(|e| e.mac))
-                    })
+                    .or_else(|| dynamic_neighbors.get(&neigh_key).map(|e| e.mac))
             } else {
                 None
             };
@@ -3315,7 +3309,7 @@ fn learn_dynamic_neighbor_from_packet(
     src_ip: IpAddr,
     last_learned_neighbor: &mut Option<LearnedNeighborKey>,
     forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
 ) {
     let Some(frame) = area.slice(desc.addr as usize, desc.len as usize) else {
         return;
@@ -3358,7 +3352,7 @@ fn learn_dynamic_neighbor_from_packet(
 
 fn learn_dynamic_neighbor(
     forwarding: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
     ingress_ifindex: i32,
     ingress_vlan_id: u16,
     src_ip: IpAddr,
@@ -3372,11 +3366,15 @@ fn learn_dynamic_neighbor(
             ifindexes.push(logical_ifindex);
         }
     }
-    if let Ok(mut cache) = dynamic_neighbors.lock() {
+    // #949: multi-ifindex insert atomically vs readers — both
+    // ingress_ifindex and the resolved logical (VLAN sub-) ifindex
+    // get the same MAC under one bulk acquisition so a reader sees
+    // either both or neither, never a stale half.
+    dynamic_neighbors.with_all_shards(|bulk| {
         for ifindex in ifindexes {
-            cache.insert((ifindex, src_ip), NeighborEntry { mac: src_mac });
+            bulk.insert((ifindex, src_ip), NeighborEntry { mac: src_mac });
         }
-    }
+    });
 }
 
 fn build_missing_neighbor_session_metadata(

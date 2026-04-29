@@ -29,7 +29,7 @@ pub struct Coordinator {
     pub(crate) shared_cos_queue_vtime_floors:
         Arc<ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueVtimeFloor>>>>,
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
-    pub(crate) dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    pub(crate) dynamic_neighbors: Arc<ShardedNeighborMap>,
     pub(crate) neighbor_generation: Arc<AtomicU64>,
     pub(crate) manager_neighbor_keys: Arc<Mutex<FastSet<(i32, IpAddr)>>>,
     pub(crate) neigh_monitor_stop: Option<Arc<AtomicBool>>,
@@ -83,7 +83,7 @@ impl Coordinator {
             shared_cos_queue_leases: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_cos_queue_vtime_floors: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
-            dynamic_neighbors: Arc::new(Mutex::new(FastMap::default())),
+            dynamic_neighbors: Arc::new(ShardedNeighborMap::new()),
             neighbor_generation: Arc::new(AtomicU64::new(0)),
             manager_neighbor_keys: Arc::new(Mutex::new(FastSet::default())),
             neigh_monitor_stop: None,
@@ -149,7 +149,7 @@ impl Coordinator {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn dynamic_neighbors_ref(&self) -> &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>> {
+    pub fn dynamic_neighbors_ref(&self) -> &Arc<ShardedNeighborMap> {
         &self.dynamic_neighbors
     }
 
@@ -174,16 +174,20 @@ impl Coordinator {
                 manager_keys.insert((*ifindex, *ip));
             }
         }
-        if let Ok(mut cache) = self.dynamic_neighbors.lock() {
+        // #949: replace + insert under a single bulk acquisition so
+        // readers see either the pre-replace or post-replace state,
+        // never a half-replaced set. `with_all_shards` locks all 64
+        // shards in shard-index order (deadlock-free invariant).
+        self.dynamic_neighbors.with_all_shards(|bulk| {
             if replace {
                 for key in &old_manager_keys {
-                    cache.remove(key);
+                    bulk.remove(key);
                 }
             }
             for (ifindex, ip, entry) in neighbors {
-                cache.insert((*ifindex, *ip), *entry);
+                bulk.insert((*ifindex, *ip), *entry);
             }
-        }
+        });
         if replace {
             for key in &old_manager_keys {
                 self.forwarding.neighbors.remove(key);
@@ -205,7 +209,7 @@ impl Coordinator {
     }
 
     pub fn dynamic_neighbor_status(&self) -> (usize, u64) {
-        let entries = self.dynamic_neighbors.lock().map(|n| n.len()).unwrap_or(0);
+        let entries = self.dynamic_neighbors.len();
         let generation = self.neighbor_generation.load(Ordering::Relaxed);
         (entries, generation)
     }
@@ -292,9 +296,12 @@ impl Coordinator {
             .store(Arc::new(ValidationState::default()));
         self.shared_fabrics.store(Arc::new(Vec::new()));
         self.neighbor_generation.store(0, Ordering::Relaxed);
-        if let Ok(mut neighbors) = self.dynamic_neighbors.lock() {
-            neighbors.clear();
-        }
+        // #949: clear all shards atomically vs readers.
+        self.dynamic_neighbors.with_all_shards(|bulk| {
+            for shard in bulk.each_shard_mut() {
+                shard.clear();
+            }
+        });
         if let Ok(mut manager_keys) = self.manager_neighbor_keys.lock() {
             manager_keys.clear();
         }
@@ -1026,11 +1033,12 @@ impl Coordinator {
         } else {
             Vec::new()
         };
-        if let Ok(mut cache) = self.dynamic_neighbors.lock() {
+        // #949: bulk-remove stale manager keys atomically vs readers.
+        self.dynamic_neighbors.with_all_shards(|bulk| {
             for key in &old_manager_keys {
-                cache.remove(key);
+                bulk.remove(key);
             }
-        }
+        });
         self.validation = ValidationState {
             snapshot_installed: true,
             config_generation: snapshot.generation,

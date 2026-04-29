@@ -21,7 +21,7 @@ pub(super) fn local_tunnel_source_loop(
     tunnel_endpoint_id: u16,
     forwarding: ForwardingState,
     ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
-    dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: Arc<ShardedNeighborMap>,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     identities: BTreeMap<u32, BindingIdentity>,
     shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -148,7 +148,7 @@ pub(super) fn build_local_origin_tunnel_tx_request(
     tunnel_endpoint_id: u16,
     forwarding: &ForwardingState,
     ha_state: &Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
 ) -> Result<LocalTunnelTxPlan, String> {
     let mut meta = local_origin_packet_meta(packet)
         .ok_or_else(|| "unsupported_local_origin_packet".to_string())?;

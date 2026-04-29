@@ -443,7 +443,7 @@ pub(crate) fn worker_loop(
     shared_validation: Arc<ArcSwap<ValidationState>>,
     shared_forwarding: Arc<ArcSwap<ForwardingState>>,
     ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
-    dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dynamic_neighbors: Arc<ShardedNeighborMap>,
     shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
