@@ -1,7 +1,45 @@
 # #956 Phase 3: extract cos/admission.rs from tx.rs
 
-Plan v2 — 2026-04-29. Addresses Codex round-1 (task-mokgkrf5-99cau9):
-five MAJOR findings + minor notes.
+Plan v3 — 2026-04-29. Addresses Codex round-2
+(task-mok8bo19-r2vheq), four MAJOR findings on top of the
+round-1 fixes that produced v2.
+
+Round-2 changelog (v2 → v3):
+
+R2-1. **Visibility model contradiction (round-2 finding 1).**
+v2 still carried prose listing `bdp_floor_bytes` and the four
+test-referenced constants as "file-private" while the round-1
+corrections elsewhere upgraded them to `pub(in crate::afxdp)`.
+Visibility model section rewritten as the canonical
+classification (4 buckets: file-private / pub-for-prod /
+pub-for-tests / stays-in-tx) and earlier prose marked as
+superseded.
+
+R2-2. **`account_*` rationale was false (round-2 finding 3).**
+v2 said the account_* helpers "exist solely to maintain
+flow_bucket_bytes/active_flow_buckets". They actually update
+MQFQ head/tail finish-time state (enqueue at tx.rs:4016) and
+vacate the V-min slot (dequeue at tx.rs:4058). Rationale
+rewritten to acknowledge the three-way coupling
+(admission lifecycle + MQFQ ordering + V-min) and justify
+keeping them in admission.rs by lockstep-landing cost rather
+than asserting they are admission-only.
+
+R2-3. **COS_MIN_BURST_BYTES wording (round-2 finding 2).** v2's
+Approach paragraph still implied "all 5 (+2)" constants would
+move and described the dependency edge as "tx → admission"
+(it's actually admission → tx, since admission imports the
+constant from tx). The 9-callers claim was off — actual count
+is 91 (`grep -nE COS_MIN_BURST_BYTES` in tx.rs). Approach
+paragraph updated, dependency direction corrected, count fixed.
+
+R2-4. **Stale-text site missed (round-2 finding 4).**
+`cos/flow_hash.rs:15` still says "Phase 3 will import the
+public-to-afxdp helpers". Added to the Stale-text cleanup
+list alongside the three sites already noted in v2
+(`tx.rs:3543`, `cos/ecn.rs:2`, `cos/mod.rs:1`).
+
+Round-1 changelog (v1 → v2) preserved below for context:
 
 1. `bdp_floor_bytes` is called by tests at `tx.rs:10917, 10998`,
    so it MUST be `pub(in crate::afxdp)`. v1 wrongly classified it
@@ -16,9 +54,10 @@ five MAJOR findings + minor notes.
 
 3. **Big finding**: `COS_MIN_BURST_BYTES` (currently in tx.rs
    private) is referenced inside `cos_flow_aware_buffer_limit`
-   (which moves to admission.rs). It also has 9 other tx.rs
-   callers — moving it would force tx.rs to import back from
-   admission. Decision: leave in tx.rs but bump visibility to
+   (which moves to admission.rs). It has 91 total uses across
+   tx.rs (only 1 inside the moving admission code) — moving
+   it would force tx.rs to import back from admission for the
+   other 90. Decision: leave in tx.rs but bump visibility to
    `pub(in crate::afxdp)`; admission.rs imports via
    `use crate::afxdp::tx::COS_MIN_BURST_BYTES`. Phase 4+ may
    consolidate to a shared location.
@@ -76,10 +115,12 @@ their dense doc comments).
 ## Approach
 
 Create `userspace-dp/src/afxdp/cos/admission.rs` with the 8
-moved functions and all 5 (+2 SHARED_EXACT) named constants and
-their `const_assert` invariants. Items needing cross-module
-visibility get `pub(in crate::afxdp)`. `cos/mod.rs` extends the
-re-export block.
+moved functions and the named constants/asserts that admission
+owns. `COS_MIN_BURST_BYTES` STAYS in `tx.rs` with bumped
+visibility (it has 91 uses across tx.rs and only 1 in moving
+admission code). Items needing cross-module visibility from
+admission.rs get `pub(in crate::afxdp)`; `cos/mod.rs` extends
+the re-export block.
 
 ### Move list (~700 LOC)
 
@@ -149,30 +190,71 @@ fn promote_cos_queue_flow_fair(...) { ... }
   to admission.rs so the documentation stays attached to the function
   it documents.
 
-- `account_cos_queue_flow_enqueue`/`_dequeue` are queue-accounting
-  state helpers; Codex round-1 flagged them as arguably belonging
-  to Phase 5 (`cos/queue_ops.rs`). **Decision**: keep in admission.rs.
-  Both functions exist solely to maintain the
-  `flow_bucket_bytes`/`active_flow_buckets` state that
-  `cos_queue_flow_share_limit` and
-  `cos_queue_prospective_active_flows` consume; treating them as
-  admission-state lifecycle hooks is more accurate than calling
-  them queue-ops. Phase 5 may revisit if queue_ops grows a clearer
-  abstraction boundary.
+- `account_cos_queue_flow_enqueue`/`_dequeue` are queue-state
+  lifecycle helpers; Codex round-1 flagged them as arguably
+  belonging to Phase 5 (`cos/queue_ops.rs`), and round-2 #2
+  corrected my v2 rationale (they don't ONLY maintain
+  `flow_bucket_bytes`/`active_flow_buckets`):
+  - `enqueue` updates MQFQ head/tail finish-time state
+    at `tx.rs:4016`.
+  - `dequeue` resets that state and vacates the shared V-min slot
+    at `tx.rs:4058`.
 
-`cos/mod.rs` re-exports the 6 cross-module items via
-`pub(super) use`. Tests stay in `tx::tests` — same Phase 1+2
-pattern.
+  **Decision**: keep in admission.rs in Phase 3, with explicit
+  acknowledgment that `cos/admission.rs` ends up coupling three
+  responsibilities: admission lifecycle, MQFQ ordering bookkeeping,
+  and V-min slot participation. The alternative (defer to Phase 5)
+  has higher coordination cost — Phase 3's admission gates
+  (`cos_queue_flow_share_limit`, `apply_cos_admission_ecn_policy`)
+  consume the same `flow_bucket_bytes` / `active_flow_buckets`
+  fields these helpers maintain, so splitting them across two
+  PRs forces both to land in lockstep or temporarily import
+  back. Phase 5 can revisit when queue_ops has a cleaner
+  boundary; the helpers will likely move to wherever MQFQ /
+  V-min state ends up living.
 
-### Visibility model (Phase 1 R1+R2 pattern, validated by Phase 2)
+`cos/mod.rs` re-exports the production-callable items via
+`pub(super) use`; test-only items get `#[cfg(test)] pub(super) use`.
+Tests stay in `tx::tests` — same Phase 1+2 pattern.
 
-- File-private inside `cos/admission.rs`: `bdp_floor_bytes`,
-  `promote_cos_queue_flow_fair`, all named constants (none called
-  outside this module).
-- `pub(in crate::afxdp)` (re-exported from `cos/mod.rs`):
-  `cos_queue_flow_share_limit`, `cos_flow_aware_buffer_limit`,
-  `account_cos_queue_flow_enqueue`, `account_cos_queue_flow_dequeue`,
-  `apply_cos_admission_ecn_policy`, `apply_cos_queue_flow_fair_promotion`.
+### Visibility model (corrected per Codex round-2 #1)
+
+This is the canonical visibility classification. Earlier prose
+in this plan got the picture wrong; treat this section as the
+source of truth.
+
+- **File-private inside `cos/admission.rs`** (no callers outside
+  the module after the move):
+  - `promote_cos_queue_flow_fair` (only called by
+    `apply_cos_queue_flow_fair_promotion`)
+  - `RTT_TARGET_NS`, `SHARED_EXACT_BURST_HEADROOM` (zero test
+    references; verified by grep)
+
+- **`pub(in crate::afxdp)` (re-exported from `cos/mod.rs` for
+  production callers)**:
+  - `cos_queue_flow_share_limit`
+  - `cos_flow_aware_buffer_limit`
+  - `account_cos_queue_flow_enqueue`
+  - `account_cos_queue_flow_dequeue`
+  - `apply_cos_admission_ecn_policy`
+  - `apply_cos_queue_flow_fair_promotion`
+
+- **`pub(in crate::afxdp)` (test-referenced; either always-on or
+  cfg-gated re-exports are both acceptable, plan implementation
+  picks always-on for simplicity)**:
+  - `bdp_floor_bytes` (called by tests at `tx.rs:10917, 10998`)
+  - `COS_FLOW_FAIR_MIN_SHARE_BYTES` (17 test references)
+  - `COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS` (2 test references)
+  - `COS_ECN_MARK_THRESHOLD_NUM`, `COS_ECN_MARK_THRESHOLD_DEN`
+    (11 test references each)
+
+- **STAYS in `tx.rs` with bumped `pub(in crate::afxdp)` visibility**:
+  - `COS_MIN_BURST_BYTES` — 91 uses across tx.rs make moving it
+    impractical. admission.rs imports via
+    `use crate::afxdp::tx::COS_MIN_BURST_BYTES`. The Rust
+    dependency edge is `admission -> tx` (admission imports from
+    tx); Phase 4+ may consolidate to a shared location to remove
+    even that one back-reference.
 
 Tests in `tx::tests` reach the moved items via the re-exports.
 Investigation phase 1 of implementation will verify each
@@ -209,6 +291,9 @@ Items to fix in this PR's implementation:
   in Phase 3. Same past-tense fix.
 - `cos/mod.rs:1` — phase-order header. Update to call out the
   current state (Phase 3 = admission; Phase 4+ are still future).
+- `cos/flow_hash.rs:15` — Phase 2 docstring still says "Phase 3
+  will import the public-to-afxdp helpers". Update to past tense
+  once Phase 3 lands (Codex round-2 #4).
 
 ## Tests
 
