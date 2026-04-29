@@ -1,6 +1,42 @@
 # #956 Phase 1: extract cos/ecn.rs from tx.rs (establish the cos/ submodule)
 
-Plan v1 — 2026-04-29.
+Plan v2 — 2026-04-29. Addresses Codex round-1 (task-mokb9f8h-mwlbl8):
+five blocking findings, all fixed.
+
+1. Visibility: `pub(super)` from `afxdp::cos::ecn` only exposes to
+   `afxdp::cos`, not back up to `afxdp::tx`. Plan now uses
+   `pub(super) use ecn::{...}` re-export from `cos/mod.rs` so the
+   parent `afxdp` module can reach the symbols.
+
+2. Constants belong with policy, not the marker. Threshold
+   `COS_ECN_MARK_THRESHOLD_*` constants STAY in tx.rs alongside
+   `apply_cos_admission_ecn_policy` (which also stays in Phase 1).
+   They move with admission to `cos/admission.rs` in Phase 2 — the
+   correct dependency direction.
+
+3. Test count was 13; actual is 15 — corrected (added
+   `maybe_mark_ecn_ce_dispatches_by_addr_family`,
+   `_handles_single_vlan_tagged_frame`,
+   `_rejects_unknown_ethertype`).
+
+4. Test fixtures (`build_ipv4_test_packet` etc.) are shared between
+   moving marker tests AND staying admission tests. Plan now keeps
+   fixtures in `tx::tests` (made `pub(super)`) so `cos::ecn::tests`
+   can import them. Fixtures re-evaluate their home in Phase 2.
+
+5. Path import: `super::ethernet` is wrong from inside `cos::ecn`.
+   Use `crate::afxdp::ethernet::{ETH_HDR_LEN, VLAN_TAG_LEN}` (or
+   the equivalent `super::super::ethernet::{...}`). Plan picks the
+   fully-qualified form for stability.
+
+Plus future-phase ordering corrected:
+- `flow_hash` now precedes admission (admission's flow-fair
+  promotion calls `cos_flow_hash_seed_from_os`).
+- Added explicit `queue_ops` phase before `queue_service` — queue
+  service depends on `cos_queue_push/pop` and the `CoSBatch` enum
+  having a clear home.
+
+Now an 8-phase plan (Phase 1 = ECN; ends at builders).
 
 ## Investigation findings (Claude, on commit 76384e9a)
 
@@ -39,25 +75,40 @@ The major subsystems currently colocated in tx.rs:
 
 ### Phase 1 scope (this PR): extract `cos/ecn.rs`
 
-ECN marking is the most self-contained subsystem in the file. It
-has:
+ECN marking is the most self-contained byte-mutation subsystem in
+the file. It has:
 - A small bounded surface: 4 mutating functions
   (`maybe_mark_ecn_ce`, `maybe_mark_ecn_ce_prepared`,
   `mark_ecn_ce_ipv4`, `mark_ecn_ce_ipv6`) plus the `ethernet_l3`
   parser + `EthernetL3` enum.
-- 8 named ECN constants (`COS_ECN_MARK_THRESHOLD_NUM`,
-  `COS_ECN_MARK_THRESHOLD_DEN`, `ECN_MASK`, `ECN_NOT_ECT`,
-  `ECN_ECT_0`, `ECN_ECT_1`, `ECN_CE`) with two compile-time
-  invariants (`const _: () = assert!`).
-- 13 existing unit tests dense across all branches (ECT-0/ECT-1/
-  not-ECT/CE-untouched/short-buffer × v4/v6, plus QinQ rejection
-  and tagged-non-IP rejection).
-- Three call sites in tx.rs: `apply_cos_admission_ecn_policy`
-  (lines ~3700-3796 within tx.rs) and elsewhere.
+- 5 ECN codepoint masks (`ECN_MASK`, `ECN_NOT_ECT`,
+  `ECN_ECT_0`, `ECN_ECT_1`, `ECN_CE`) — these belong with the
+  byte mutator since they describe IP TOS / IPv6 tclass low bits.
+- **15 existing unit tests** (Codex round-1 #3 corrected my count
+  of 13): `mark_ecn_ce_ipv4_*` (5), `mark_ecn_ce_ipv6_*` (5),
+  `maybe_mark_ecn_ce_dispatches_by_addr_family`,
+  `maybe_mark_ecn_ce_handles_single_vlan_tagged_frame`,
+  `maybe_mark_ecn_ce_rejects_unknown_ethertype`, plus 2
+  `ethernet_l3_*` tests (QinQ rejection + tagged-non-IP rejection).
+- Two main call sites in tx.rs: the in-tx-request marker path and
+  the prepared-UMEM marker path (both inside or near
+  `apply_cos_admission_ecn_policy`).
 
 It does NOT depend on other CoS subsystems (token bucket, queue ops,
-builders) — only on `super::ethernet::{ETH_HDR_LEN, VLAN_TAG_LEN}`,
-`TxRequest`, `PreparedTxRequest`, and `MmapArea`. Self-contained.
+builders) — only on `crate::afxdp::ethernet::{ETH_HDR_LEN,
+VLAN_TAG_LEN}`, `TxRequest`, `PreparedTxRequest`, and `MmapArea`.
+Self-contained for the byte-mutation surface.
+
+**What stays in tx.rs (Codex round-1 #2)**:
+
+The threshold constants `COS_ECN_MARK_THRESHOLD_NUM` and
+`COS_ECN_MARK_THRESHOLD_DEN` (plus their two `const _: () = assert!`
+compile-time invariants) belong with `apply_cos_admission_ecn_policy`,
+not with the byte mutator. They are admission-policy tuning knobs,
+not ECN codepoint definitions. Moving them into `cos::ecn` and
+having admission reach back creates exactly the wrong dependency
+direction (a byte-mutation module owning admission tuning). Phase 2
+will extract them when admission policy moves to `cos/admission.rs`.
 
 Phase 1 establishes the `cos/` submodule pattern that Phase 2+ PRs
 will extend.
@@ -73,28 +124,75 @@ userspace-dp/src/afxdp/cos/
 ```
 
 Move from `tx.rs`:
-- All 8 ECN constants + the two compile-time invariants.
+- 5 ECN codepoint masks (`ECN_MASK`, `ECN_NOT_ECT`, `ECN_ECT_0`,
+  `ECN_ECT_1`, `ECN_CE`).
 - `EthernetL3` enum.
 - `ethernet_l3` parser.
 - `mark_ecn_ce_ipv4` and `mark_ecn_ce_ipv6` helpers.
 - `maybe_mark_ecn_ce` and `maybe_mark_ecn_ce_prepared`.
-- All 13 unit tests for the above.
+- All **15** unit tests for the above (Codex round-1 #3).
 
-Update `tx.rs`:
-- Remove the moved items.
-- `use super::cos::ecn::{maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared};`
-  for the call sites that survive in tx.rs.
-- Make `COS_ECN_MARK_THRESHOLD_NUM` / `_DEN` `pub(super) const` in
-  `cos::ecn` so `apply_cos_admission_ecn_policy` (which stays in
-  tx.rs in this phase) can still reach them.
+**Stays in tx.rs**:
+- `COS_ECN_MARK_THRESHOLD_NUM` / `_DEN` (admission tuning, used by
+  `apply_cos_admission_ecn_policy` which also stays).
+- The two `const _: () = assert!` compile-time invariants for the
+  threshold (move only when admission moves in Phase 2).
+
+### Visibility model (Codex round-1 #1)
+
+`pub(super)` from inside `afxdp::cos::ecn` only exposes to
+`afxdp::cos`, NOT back up to `afxdp::tx`. To make the moved
+functions callable from `tx.rs`, the cleanest options are:
+
+(a) Declare each exported item as `pub(in crate::afxdp)` —
+    visible to anything inside the `afxdp` module tree.
+(b) Re-export from `cos/mod.rs`:
+    ```rust
+    pub(super) use ecn::{maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared};
+    ```
+    where `pub(super)` here means "visible to `afxdp`" because
+    `cos/mod.rs` lives at `afxdp::cos`.
+
+**Decision**: use option (b). Re-exporting from `cos/mod.rs` keeps
+the per-file visibility within `cos/ecn.rs` as `pub(super)` (i.e.
+"visible to siblings within `cos/`") and lets `cos/mod.rs` decide
+the surface area exposed to `afxdp`. This is the pattern the codebase
+already follows for `afxdp` itself (see `afxdp.rs`).
+
+### Path imports (Codex round-1 #5)
+
+From inside `afxdp::cos::ecn`, the existing `use super::ethernet::{...}`
+in tx.rs becomes `use crate::afxdp::ethernet::{ETH_HDR_LEN, VLAN_TAG_LEN};`
+(or equivalently `use super::super::ethernet::{...}`). The fully-
+qualified `crate::afxdp::ethernet::...` form is preferred for
+readability and stability across future module reshuffles.
+
+### Test fixtures (Codex round-1 #4)
+
+`tx::tests` contains shared fixtures used by BOTH the marker tests
+(moving) AND admission/V_min tests (staying):
+`build_ipv4_test_packet`, `build_ipv6_test_packet`,
+`compute_ipv4_header_checksum`, `insert_single_vlan_tag`,
+`test_prepared_item_in_umem`. A naive helper move would break the
+remaining `tx::tests`.
+
+**Decision**: keep the fixtures in `tx::tests` and make them
+`pub(super)` (or `pub(in crate::afxdp)`) so `cos::ecn::tests` can
+import them via
+`use crate::afxdp::tx::tests::{build_ipv4_test_packet, ...};`.
+Fixtures don't move in Phase 1; they get re-evaluated when admission
+extracts in Phase 2 (likely the right place for them is
+`cos/test_helpers.rs` once both admission and ecn live in `cos/`).
+
+### Module declaration
 
 Update `userspace-dp/src/afxdp.rs` to declare the new submodule:
 ```rust
-mod cos;
+pub(super) mod cos;
 ```
 
-(Or the appropriate spot in the existing `mod` declarations —
-investigation will pin the exact location.)
+(or whatever visibility matches the existing `pub(super) mod tx;`
+pattern — investigation will pin the exact form.)
 
 ### What this is NOT
 
@@ -120,7 +218,8 @@ investigation will pin the exact location.)
 
 ## Tests
 
-All 13 existing ECN/ethernet_l3 tests must continue to pass:
+All **15 existing tests** for the moved code must continue to pass
+(Codex round-1 #3):
 - `mark_ecn_ce_ipv4_converts_ect0_to_ce_and_updates_checksum`
 - `mark_ecn_ce_ipv4_converts_ect1_to_ce_and_updates_checksum`
 - `mark_ecn_ce_ipv4_leaves_not_ect_untouched`
@@ -131,9 +230,18 @@ All 13 existing ECN/ethernet_l3 tests must continue to pass:
 - `mark_ecn_ce_ipv6_leaves_not_ect_untouched`
 - `mark_ecn_ce_ipv6_leaves_ce_untouched`
 - `mark_ecn_ce_ipv6_rejects_short_buffer`
+- `maybe_mark_ecn_ce_dispatches_by_addr_family`
+- `maybe_mark_ecn_ce_handles_single_vlan_tagged_frame`
+- `maybe_mark_ecn_ce_rejects_unknown_ethertype`
 - `ethernet_l3_rejects_qinq_until_explicitly_supported`
 - `ethernet_l3_rejects_vlan_tagged_non_ip_payload`
-- (one more `ethernet_l3` test — verified during investigation)
+
+The **15 admission-path tests** that exercise the marker indirectly
+through `apply_cos_admission_ecn_policy` (including the Prepared
+UMEM path and VLAN Prepared path) STAY in `tx::tests` because the
+admission policy stays in `tx.rs` (see Phase 1 scope). They depend
+on shared fixtures that also stay in `tx::tests` and are made
+`pub(super)` so `cos::ecn::tests` can import them.
 
 No new tests required — the refactor is structure-only and the
 existing test suite has dense branch coverage.
@@ -193,26 +301,55 @@ the build still succeeding.
 ## Out of scope (future Phase 2+ PRs)
 
 This PR is the first in a chain. Subsequent PRs (one issue, one PR
-each, but tracked under #956 umbrella) will extract:
+each, tracked under the #956 umbrella) extract additional
+subsystems. Order revised per Codex round-1 #6 — `flow_hash` must
+precede admission because `apply_cos_queue_flow_fair_promotion`
+calls `cos_flow_hash_seed_from_os`, and a `queue_ops` phase is
+broken out explicitly so queue service has somewhere to land its
+container helpers:
 
-- **Phase 2**: `cos/admission.rs` — `apply_cos_admission_ecn_policy`,
-  `apply_cos_queue_flow_fair_promotion`, the per-flow share-cap
-  helpers (`cos_queue_flow_share_limit`,
-  `cos_flow_aware_buffer_limit`, account_*).
-- **Phase 3**: `cos/token_bucket.rs` — `refill_cos_tokens`,
-  `maybe_top_up_*`, `cos_tick_for_ns`, `cos_timer_wheel_*`.
-- **Phase 4**: `cos/flow_hash.rs` — flow-bucket hashing helpers.
-- **Phase 5**: `cos/queue_service.rs` — `select_cos_*`,
-  `service_exact_*`, `drain_shaped_tx`, MQFQ virtual-time logic.
-- **Phase 6**: `cos/cross_binding.rs` — redirect logic + MPSC.
-- **Phase 7**: `cos/builders.rs` — `build_cos_interface_runtime`,
-  `apply_cos_send_result`, etc.
+- **Phase 2**: `cos/flow_hash.rs` — `mix_cos_flow_bucket`,
+  `exact_cos_flow_bucket`, `cos_item_flow_key`,
+  `cos_flow_bucket_index`, `cos_flow_hash_seed_from_os`,
+  `cos_queue_prospective_active_flows`. Pure functions; few callers
+  outside admission/promotion.
+- **Phase 3**: `cos/admission.rs` — `apply_cos_admission_ecn_policy`
+  (and the `COS_ECN_MARK_THRESHOLD_*` constants currently kept in
+  `tx.rs` move with it), `apply_cos_queue_flow_fair_promotion`, the
+  per-flow share-cap helpers (`cos_queue_flow_share_limit`,
+  `cos_flow_aware_buffer_limit`, `account_cos_queue_flow_enqueue`,
+  `account_cos_queue_flow_dequeue`, `bdp_floor_bytes`).
+- **Phase 4**: `cos/token_bucket.rs` — `refill_cos_tokens`,
+  `maybe_top_up_cos_root_lease`, `maybe_top_up_cos_queue_lease`,
+  `cos_tick_for_ns`, `cos_timer_wheel_level_and_slot`,
+  `cos_refill_ns_until`, `cos_surplus_quantum_bytes`,
+  `cos_guarantee_quantum_bytes`.
+- **Phase 5**: `cos/queue_ops.rs` — `cos_queue_push_back`,
+  `cos_queue_push_front`, `cos_queue_pop_front`,
+  `cos_queue_pop_front_no_snapshot`, `cos_queue_front`,
+  `cos_queue_len`, `cos_queue_is_empty`,
+  `cos_queue_min_finish_bucket`, plus the `CoSBatch` /
+  `CoSServicePhase` / `ExactCoSQueueKind` enums and
+  `CoSPendingTxItem` accessors. Required before queue service can
+  cleanly extract.
+- **Phase 6**: `cos/queue_service.rs` — `select_cos_guarantee_batch`,
+  `select_cos_surplus_batch`, `service_exact_*`, `drain_shaped_tx`,
+  MQFQ virtual-time logic, `select_exact_cos_guarantee_queue_*`.
+- **Phase 7**: `cos/cross_binding.rs` —
+  `redirect_local_cos_request_to_owner`,
+  `redirect_prepared_cos_request_to_owner`,
+  `prepared_cos_request_stays_on_current_tx_binding`, the MPSC
+  inbox handling.
+- **Phase 8**: `cos/builders.rs` — `build_cos_interface_runtime`,
+  `build_cos_batch_from_queue`, `apply_cos_send_result`,
+  `apply_cos_prepared_result`, `prime_cos_root_for_service`.
 
-After Phase 7 the `tx.rs` left in place is just XSK ring management
-+ orchestration glue (~3-5K LOC). Each phase is independently
-reviewable, smokeable, and mergeable.
+After Phase 8 the `tx.rs` left in place is just XSK ring management
+(descriptor pop/push, kick threshold, completion reap) +
+orchestration glue (`drain_pending_tx`, `bound_pending_tx_*`)
+(~3-5K LOC). Each phase is independently reviewable, smokeable,
+and mergeable.
 
-If during Phase 1 review a smaller or different first cut emerges
-(e.g., extract token-bucket first because it has even fewer call
-sites), the plan can swap order — Phase 1 must just be the
-smallest defensible cohesive piece.
+If during Phase 1 review a smaller or different first cut emerges,
+the plan can swap order — Phase 1 must just be the smallest
+defensible cohesive piece.
