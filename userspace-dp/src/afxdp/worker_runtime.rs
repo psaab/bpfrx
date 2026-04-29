@@ -23,7 +23,7 @@
 //   4. All atomics use Ordering::Relaxed — these are diagnostic monotonic
 //      counters, not synchronization primitives.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Classification applied to the previous worker-loop iteration.
 /// Determines which counter the elapsed delta is added to.
@@ -68,6 +68,13 @@ pub(crate) struct WorkerRuntimeAtomics {
     pub work_loops: AtomicU64,
     pub idle_loops: AtomicU64,
     pub tid: AtomicU64,
+    /// #925 Phase 1 (catch + report only): set to true exactly once when
+    /// the supervisor catches a worker_loop panic. Never cleared in
+    /// Phase 1; Phase 2 (respawn) will clear on successful relaunch.
+    /// Adding this flag pushes the struct from 64 B → 128 B due to
+    /// `#[repr(align(64))]` rounding; cost is negligible (a few hundred
+    /// bytes total across all workers).
+    pub dead: AtomicBool,
     /// Cacheline padding after the atomics so that adjacent workers in
     /// a `Vec<WorkerRuntimeAtomics>` don't false-share.
     _pad: [u8; 0],
@@ -84,6 +91,7 @@ impl WorkerRuntimeAtomics {
             work_loops: AtomicU64::new(0),
             idle_loops: AtomicU64::new(0),
             tid: AtomicU64::new(0),
+            dead: AtomicBool::new(false),
             _pad: [],
         }
     }
