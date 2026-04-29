@@ -776,8 +776,21 @@ continue to pass.
 1. `cargo build --release` clean.
 2. `cargo test --release` ≥ baseline (851 post-#921) + 11 new = 862.
 3. Cluster smoke (HARD): no regression on the unloaded-session path.
-   - iperf-c P=12 ≥ 22 Gb/s
-   - iperf-c P=1 ≥ 6 Gb/s
+   Run on `loss:xpf-userspace-fw0/fw1` (the userspace-dp HA cluster
+   that is the default deploy target — NOT the legacy eBPF
+   `bpfrx-fw0/fw1` cluster) AND with CoS configured on every iperf3
+   forwarding-class. CoS state is wiped by `cluster-deploy`, so the
+   smoke runner must re-apply CoS classes before measurement.
+   - Apply CoS config covering all configured forwarding classes
+     (best-effort, expedited-forwarding, assured-forwarding, etc.)
+     before the first iperf3 run.
+   - iperf-c P=12 ≥ 22 Gb/s, repeated once per CoS class. Each run
+     must hit the gate independently.
+   - iperf-c P=1 ≥ 6 Gb/s, repeated once per CoS class.
+   - Verify `show class-of-service interface` reports the expected
+     class queues are non-zero on the egress side; an iperf3 run
+     that never lights up the queue counter is a config-misapplied
+     smoke that doesn't validate the CoS path.
 4. **Mouse-latency gate** — TWO synthetic workloads (per Codex
    round-5 #2 + round-6 #4 / #5). The numbers below are the
    single source of truth; any other section that mentions "the
