@@ -198,7 +198,7 @@ pub(super) fn redirect_session_resolution_for_metadata(
     if resolution.disposition != ForwardingDisposition::HAInactive || metadata.fabric_ingress {
         return resolution;
     }
-    resolve_zone_encoded_fabric_redirect(forwarding, metadata.ingress_zone.as_ref())
+    resolve_zone_encoded_fabric_redirect_by_id(forwarding, metadata.ingress_zone)
         .or_else(|| resolve_fabric_redirect(forwarding))
         .unwrap_or(resolution)
 }
@@ -406,7 +406,7 @@ pub(super) fn apply_worker_commands(
                                 forwarding,
                                 enforced_resolution,
                                 metadata.fabric_ingress,
-                                metadata.ingress_zone.as_ref(),
+                                metadata.ingress_zone,
                             ),
                             ..decision
                         };
@@ -498,7 +498,7 @@ pub(super) fn apply_worker_commands(
                             forwarding,
                             enforced_resolution,
                             metadata.fabric_ingress,
-                            metadata.ingress_zone.as_ref(),
+                            metadata.ingress_zone,
                         ),
                         ..decision
                     };
@@ -1084,7 +1084,7 @@ pub(super) fn resolve_flow_session_decision(
             forwarding,
             enforced_resolution,
             fabric_ingress,
-            resolved.metadata.ingress_zone.as_ref(),
+            resolved.metadata.ingress_zone,
         );
         let metadata = if keep_transient {
             resolved.metadata
@@ -1162,7 +1162,7 @@ pub(super) fn resolve_flow_session_decision(
         forwarding,
         enforced_resolution,
         fabric_ingress,
-        resolved.metadata.ingress_zone.as_ref(),
+        resolved.metadata.ingress_zone,
     );
     // Reverse sessions created from forward NAT matches are locally
     // created (ReverseFlow), not peer-synced, so they won't be promoted.
@@ -1195,7 +1195,7 @@ pub(super) fn redirect_session_via_fabric_if_needed(
     forwarding: &ForwardingState,
     resolution: ForwardingResolution,
     fabric_ingress: bool,
-    ingress_zone: &str,
+    ingress_zone: u16,
 ) -> ForwardingResolution {
     if resolution.disposition != ForwardingDisposition::HAInactive {
         return resolution;
@@ -1203,7 +1203,7 @@ pub(super) fn redirect_session_via_fabric_if_needed(
     if fabric_ingress {
         return resolution;
     }
-    resolve_zone_encoded_fabric_redirect(forwarding, ingress_zone)
+    resolve_zone_encoded_fabric_redirect_by_id(forwarding, ingress_zone)
         .or_else(|| resolve_fabric_redirect(forwarding))
         .unwrap_or(resolution)
 }
@@ -4086,8 +4086,8 @@ mod tests {
         assert!(reverse.metadata.is_reverse);
         assert!(reverse.origin.is_peer_synced());
         assert!(reverse.metadata.fabric_ingress);
-        assert_eq!(reverse.metadata.ingress_zone.as_ref(), "wan");
-        assert_eq!(reverse.metadata.egress_zone.as_ref(), "lan");
+        assert_eq!(reverse.metadata.ingress_zone, "wan");
+        assert_eq!(reverse.metadata.egress_zone, "lan");
         assert_eq!(
             reverse.key,
             reverse_session_key(&entry.key, entry.decision.nat)

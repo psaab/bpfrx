@@ -98,10 +98,17 @@ pub(crate) struct SessionDecision {
     pub(crate) nat: NatDecision,
 }
 
+/// #919: zone names dropped from the fast path. `ingress_zone` and
+/// `egress_zone` are now `u16` IDs that index into
+/// `forwarding.zone_id_to_name` for slow-path consumers (logging,
+/// gRPC export, status). `0` means "unknown / unset" (matches the
+/// existing `UserspaceDpMeta.ingress_zone` default at types.rs:64).
+/// Removing the `Arc<str>` saves 28 bytes per `SessionMetadata` and
+/// eliminates the `LOCK XADD` atomic on every `metadata.clone()`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionMetadata {
-    pub(crate) ingress_zone: Arc<str>,
-    pub(crate) egress_zone: Arc<str>,
+    pub(crate) ingress_zone: u16,
+    pub(crate) egress_zone: u16,
     pub(crate) owner_rg_id: i32,
     pub(crate) fabric_ingress: bool,
     pub(crate) is_reverse: bool,

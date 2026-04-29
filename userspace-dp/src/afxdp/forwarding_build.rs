@@ -77,6 +77,18 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
         if zone.id == 0 || zone.name.is_empty() {
             continue;
         }
+        // #919/#922: reserve the top of the u16 space for the
+        // `JUNOS_GLOBAL_ZONE_ID` sentinel. Reject any snapshot that
+        // would collide.
+        if zone.id >= crate::policy::ZONE_ID_RESERVED_MIN {
+            eprintln!(
+                "xpf-userspace-dp: zone {:?} has reserved id {}; skipping (max usable id is {})",
+                zone.name,
+                zone.id,
+                crate::policy::ZONE_ID_RESERVED_MIN - 1
+            );
+            continue;
+        }
         state.zone_name_to_id.insert(zone.name.clone(), zone.id);
         state.zone_id_to_name.insert(zone.id, zone.name.clone());
     }
@@ -332,7 +344,11 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
             local_mac,
         });
     }
-    state.policy = parse_policy_state(&snapshot.default_policy, &snapshot.policies);
+    state.policy = parse_policy_state(
+        &snapshot.default_policy,
+        &snapshot.policies,
+        &state.zone_name_to_id,
+    );
     state.allow_dns_reply = snapshot.flow.allow_dns_reply;
     state.allow_embedded_icmp = snapshot.flow.allow_embedded_icmp;
     state.session_timeouts = crate::session::SessionTimeouts::from_seconds(

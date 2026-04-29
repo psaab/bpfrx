@@ -598,7 +598,10 @@ fn handle_stream(
             "sync_session" => {
                 if let Some(sync_req) = request.session_sync {
                     match sync_req.operation.as_str() {
-                        "upsert" => match build_synced_session_entry(&sync_req) {
+                        "upsert" => match build_synced_session_entry(
+                            &sync_req,
+                            guard.afxdp.zone_name_to_id_ref(),
+                        ) {
                             Ok(entry) => {
                                 guard.afxdp.upsert_synced_session(entry);
                             }
@@ -854,7 +857,10 @@ fn build_synced_session_key(
     })
 }
 
-fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionEntry, String> {
+fn build_synced_session_entry(
+    req: &SessionSyncRequest,
+    zone_name_to_id: &rustc_hash::FxHashMap<String, u16>,
+) -> Result<SyncedSessionEntry, String> {
     let key = build_synced_session_key(req)?;
     let next_hop = if req.next_hop.is_empty() {
         None
@@ -936,8 +942,24 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
             },
         },
         metadata: crate::session::SessionMetadata {
-            ingress_zone: req.ingress_zone.clone().into(),
-            egress_zone: req.egress_zone.clone().into(),
+            // #919: prefer the wire u16 IDs when populated; fall back
+            // to name lookup for older peers that only sent strings.
+            ingress_zone: if req.ingress_zone_id != 0 {
+                req.ingress_zone_id
+            } else {
+                zone_name_to_id
+                    .get(req.ingress_zone.as_str())
+                    .copied()
+                    .unwrap_or(0)
+            },
+            egress_zone: if req.egress_zone_id != 0 {
+                req.egress_zone_id
+            } else {
+                zone_name_to_id
+                    .get(req.egress_zone.as_str())
+                    .copied()
+                    .unwrap_or(0)
+            },
             owner_rg_id: req.owner_rg_id,
             fabric_ingress: req.fabric_ingress,
             is_reverse: req.is_reverse,

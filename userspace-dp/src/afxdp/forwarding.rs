@@ -260,8 +260,18 @@ pub(super) fn resolve_zone_encoded_fabric_redirect(
     forwarding: &ForwardingState,
     ingress_zone: &str,
 ) -> Option<ForwardingResolution> {
-    let mut resolution = resolve_fabric_redirect(forwarding)?;
     let zone_id = forwarding.zone_name_to_id.get(ingress_zone).copied()?;
+    resolve_zone_encoded_fabric_redirect_by_id(forwarding, zone_id)
+}
+
+/// #919/#922: ID-keyed variant of `resolve_zone_encoded_fabric_redirect`.
+/// Avoids the name-string round-trip when the caller already has a u16
+/// zone ID (e.g. from `SessionMetadata.ingress_zone`).
+pub(super) fn resolve_zone_encoded_fabric_redirect_by_id(
+    forwarding: &ForwardingState,
+    zone_id: u16,
+) -> Option<ForwardingResolution> {
+    let mut resolution = resolve_fabric_redirect(forwarding)?;
     if zone_id == 0 || zone_id > u8::MAX as u16 {
         return None;
     }
@@ -338,7 +348,12 @@ pub(super) fn cluster_peer_return_fast_path(
     if !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32) {
         return None;
     }
-    let ingress_zone = ingress_zone_override?;
+    let ingress_zone_name = ingress_zone_override?;
+    let ingress_zone = forwarding
+        .zone_name_to_id
+        .get(ingress_zone_name)
+        .copied()
+        .unwrap_or(0);
     if is_icmp_echo_request(packet_frame, meta) {
         return None;
     }
@@ -354,13 +369,17 @@ pub(super) fn cluster_peer_return_fast_path(
     if fabric_return_resolution.disposition != ForwardingDisposition::ForwardCandidate {
         return None;
     }
-    let egress_zone = forwarding
+    let egress_zone_name = forwarding
         .ifindex_to_zone
-        .get(&fabric_return_resolution.egress_ifindex)?
-        .clone();
+        .get(&fabric_return_resolution.egress_ifindex)?;
+    let egress_zone = forwarding
+        .zone_name_to_id
+        .get(egress_zone_name.as_str())
+        .copied()
+        .unwrap_or(0);
     let metadata = SessionMetadata {
-        ingress_zone: Arc::<str>::from(ingress_zone),
-        egress_zone: Arc::<str>::from(egress_zone),
+        ingress_zone,
+        egress_zone,
         owner_rg_id: owner_rg_for_resolution(forwarding, fabric_return_resolution),
         fabric_ingress: true,
         is_reverse: true,
@@ -542,7 +561,7 @@ pub(super) fn finalize_new_flow_ha_resolution(
     resolution: ForwardingResolution,
     fabric_ingress: bool,
     ingress_ifindex: i32,
-    ingress_zone: &str,
+    ingress_zone: u16,
     ha_startup_grace_until_secs: u64,
 ) -> ForwardingResolution {
     let enforced = super::session_glue::enforce_session_ha_resolution(

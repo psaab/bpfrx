@@ -153,6 +153,14 @@ impl Coordinator {
         &self.dynamic_neighbors
     }
 
+    /// #919: zone name → ID lookup, used by main.rs's
+    /// `build_synced_session_entry` to translate legacy
+    /// `SessionSyncRequest.ingress_zone` strings to u16 IDs when
+    /// older peers don't populate the new ID fields.
+    pub fn zone_name_to_id_ref(&self) -> &FastMap<String, u16> {
+        &self.forwarding.zone_name_to_id
+    }
+
     pub fn apply_manager_neighbors(
         &mut self,
         replace: bool,
@@ -1301,6 +1309,7 @@ impl Coordinator {
                         None,
                         &self.recent_exceptions,
                         &self.last_resolution,
+                        &self.forwarding,
                     );
                     if req.emit_on_wire {
                         let Some(egress) = self.forwarding.egress.get(&resolution.egress_ifindex)
@@ -1313,7 +1322,7 @@ impl Coordinator {
                         if resolution.disposition != ForwardingDisposition::ForwardCandidate {
                             return Err(format!(
                                 "destination is not forwardable via userspace TX: {}",
-                                resolution.status(None).disposition
+                                resolution.status(None, &self.forwarding).disposition
                             ));
                         }
                         let target_slot = self

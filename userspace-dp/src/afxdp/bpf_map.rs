@@ -452,16 +452,12 @@ pub(super) fn publish_bpf_conntrack_entry(
     key: &SessionKey,
     decision: SessionDecision,
     metadata: &SessionMetadata,
-    zone_name_to_id: &FastMap<String, u16>,
+    _zone_name_to_id: &FastMap<String, u16>,
 ) {
-    let ingress_zone_id = zone_name_to_id
-        .get(metadata.ingress_zone.as_ref())
-        .copied()
-        .unwrap_or(0);
-    let egress_zone_id = zone_name_to_id
-        .get(metadata.egress_zone.as_ref())
-        .copied()
-        .unwrap_or(0);
+    // #919: zones are now u16 in SessionMetadata; the round-trip
+    // name→id lookup the old code did is gone.
+    let ingress_zone_id = metadata.ingress_zone;
+    let egress_zone_id = metadata.egress_zone;
 
     let now_secs = monotonic_nanos() / 1_000_000_000;
 

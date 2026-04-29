@@ -5,6 +5,22 @@ use rustc_hash::FxHashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// #922: zone-pair key packed as u32 (`from_id << 16 | to_id`).
+/// Replaces the previous `(String, String)` key that allocated two
+/// `String`s on every `evaluate_policy` call.
+pub(crate) type ZonePairKey = u32;
+
+#[inline]
+pub(crate) fn zone_pair_key(from_id: u16, to_id: u16) -> ZonePairKey {
+    ((from_id as u32) << 16) | (to_id as u32)
+}
+
+/// #919/#922: sentinel for `junos-global` policy rules. Reserved at
+/// the top of the u16 space; `forwarding_build` rejects any zone
+/// snapshot with id ≥ ZONE_ID_RESERVED_MIN.
+pub(crate) const JUNOS_GLOBAL_ZONE_ID: u16 = u16::MAX;
+pub(crate) const ZONE_ID_RESERVED_MIN: u16 = u16::MAX - 1;
+
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 const PROTO_ICMP: u8 = 1;
@@ -158,22 +174,15 @@ impl CompiledApplications {
     }
 }
 
-/// Zone-pair key for the policy index.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct ZonePairKey {
-    from: String,
-    to: String,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct PolicyState {
     pub(crate) default_action: PolicyAction,
     /// All rules in original order (kept for hit-counter reporting).
     pub(crate) rules: Vec<PolicyRule>,
-    /// Zone-pair index: maps (from_zone, to_zone) → indices into `rules`.
-    /// Avoids scanning unrelated zone-pairs during evaluation.
+    /// Zone-pair index: maps `(from_id, to_id)` packed u32 →
+    /// indices into `rules`. Avoids scanning unrelated zone-pairs.
     zone_pair_index: FxHashMap<ZonePairKey, Vec<usize>>,
-    /// Indices of global rules (from_zone = "junos-global").
+    /// Indices of global rules (from_zone or to_zone = "junos-global").
     global_indices: Vec<usize>,
 }
 
@@ -191,6 +200,7 @@ impl Default for PolicyState {
 pub(crate) fn parse_policy_state(
     default_policy: &str,
     rules: &[PolicyRuleSnapshot],
+    zone_name_to_id: &FxHashMap<String, u16>,
 ) -> PolicyState {
     let mut state = PolicyState {
         default_action: parse_action(default_policy),
@@ -220,11 +230,26 @@ pub(crate) fn parse_policy_state(
         if is_global {
             state.global_indices.push(idx);
         } else {
-            let key = ZonePairKey {
-                from: snap.from_zone.clone(),
-                to: snap.to_zone.clone(),
-            };
-            state.zone_pair_index.entry(key).or_default().push(idx);
+            // #922: translate zone names to IDs at config-load time.
+            // A rule referencing an unknown zone is kept in `rules`
+            // (so hit-counter reporting still works) but omitted from
+            // the index — it becomes a dead rule with the same
+            // semantics as today's "name not in any session" case.
+            match (
+                zone_name_to_id.get(&snap.from_zone).copied(),
+                zone_name_to_id.get(&snap.to_zone).copied(),
+            ) {
+                (Some(from_id), Some(to_id)) => {
+                    let key = zone_pair_key(from_id, to_id);
+                    state.zone_pair_index.entry(key).or_default().push(idx);
+                }
+                _ => {
+                    eprintln!(
+                        "xpf-userspace-dp: policy rule references unknown zone(s): from={:?} to={:?} (rule kept, but not indexed)",
+                        snap.from_zone, snap.to_zone
+                    );
+                }
+            }
         }
     }
     state
@@ -232,8 +257,8 @@ pub(crate) fn parse_policy_state(
 
 pub(crate) fn evaluate_policy(
     state: &PolicyState,
-    from_zone: &str,
-    to_zone: &str,
+    from_id: u16,
+    to_id: u16,
     src_ip: IpAddr,
     dst_ip: IpAddr,
     protocol: u8,
@@ -242,12 +267,8 @@ pub(crate) fn evaluate_policy(
 ) -> PolicyAction {
     // Phase 2 optimisation: look up only the rules for this zone-pair
     // instead of scanning all rules. Global rules are checked afterward.
-    // The ZonePairKey allocation is acceptable because evaluate_policy
-    // only runs on session miss (new flows), not on the hot path.
-    let key = ZonePairKey {
-        from: from_zone.to_string(),
-        to: to_zone.to_string(),
-    };
+    // #922: zero-allocation key (packed u32).
+    let key = zone_pair_key(from_id, to_id);
     if let Some(indices) = state.zone_pair_index.get(&key) {
         for &idx in indices {
             if let Some(action) = try_match_rule(

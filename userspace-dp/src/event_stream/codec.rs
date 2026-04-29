@@ -61,7 +61,7 @@ impl EventFrame {
         key: &SessionKey,
         decision: &SessionDecision,
         metadata: &SessionMetadata,
-        zone_name_to_id: &FxHashMap<String, u16>,
+        _zone_name_to_id: &FxHashMap<String, u16>,
         fabric_redirect_sync: bool,
     ) -> Self {
         let mut buf = [0u8; 256];
@@ -131,18 +131,27 @@ impl EventFrame {
         pos += 1;
 
         // [21] IngressZoneID u8
-        let ingress_id = zone_name_to_id
-            .get(metadata.ingress_zone.as_ref())
-            .copied()
-            .unwrap_or(0) as u8;
+        // #919/#922: SessionMetadata.ingress_zone is now u16 directly;
+        // no name→id round-trip. Wire format remains u8 — assert this
+        // at debug time. forwarding_build.rs:80 enforces zone IDs
+        // ≤ ZONE_ID_RESERVED_MIN-1 ≪ 256 by construction (Go assigns
+        // i+1 capped at MAX_ZONES=64).
+        debug_assert!(
+            metadata.ingress_zone < 256,
+            "zone id {} exceeds wire u8 capacity",
+            metadata.ingress_zone
+        );
+        let ingress_id = metadata.ingress_zone as u8;
         buf[pos] = ingress_id;
         pos += 1;
 
         // [22] EgressZoneID u8
-        let egress_id = zone_name_to_id
-            .get(metadata.egress_zone.as_ref())
-            .copied()
-            .unwrap_or(0) as u8;
+        debug_assert!(
+            metadata.egress_zone < 256,
+            "zone id {} exceeds wire u8 capacity",
+            metadata.egress_zone
+        );
+        let egress_id = metadata.egress_zone as u8;
         buf[pos] = egress_id;
         pos += 1;
 
