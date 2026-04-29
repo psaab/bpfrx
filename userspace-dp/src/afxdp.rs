@@ -75,6 +75,8 @@ mod ha;
 mod icmp;
 #[path = "afxdp/icmp_embed.rs"]
 mod icmp_embed;
+#[path = "afxdp/ethernet.rs"]
+mod ethernet;
 #[path = "afxdp/neighbor.rs"]
 mod neighbor;
 #[path = "afxdp/parser.rs"]

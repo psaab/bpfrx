@@ -16,11 +16,8 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-const ETHERTYPE_ARP: u16 = 0x0806;
-const ETHERTYPE_IPV6: u16 = 0x86DD;
-const ETHERTYPE_VLAN: u16 = 0x8100;
-const VLAN_TAG_BYTES: usize = 4;
-const ETH_HDR_LEN: usize = 14;
+use super::ethernet::{ETH_HDR_LEN, ETHERTYPE_ARP, ETHERTYPE_IPV6, ETHERTYPE_VLAN, VLAN_TAG_LEN};
+
 const ARP_BODY_LEN: usize = 28;
 const IPV6_HDR_LEN: usize = 40;
 const ICMPV6_NA_HDR_LEN: usize = 24;
@@ -34,18 +31,18 @@ const NDP_OPT_TARGET_LL: u8 = 2;
 ///
 /// Returns `(l3_start, ethertype)` if the frame is large enough to
 /// contain the L2 header, otherwise `None`.
-#[inline]
+#[inline(always)]
 pub(super) fn parse_eth_offsets(raw_frame: &[u8]) -> Option<(usize, u16)> {
     if raw_frame.len() < ETH_HDR_LEN {
         return None;
     }
     let outer_ethertype = u16::from_be_bytes([raw_frame[12], raw_frame[13]]);
     if outer_ethertype == ETHERTYPE_VLAN {
-        if raw_frame.len() < ETH_HDR_LEN + VLAN_TAG_BYTES {
+        if raw_frame.len() < ETH_HDR_LEN + VLAN_TAG_LEN {
             return None;
         }
         let inner = u16::from_be_bytes([raw_frame[16], raw_frame[17]]);
-        Some((ETH_HDR_LEN + VLAN_TAG_BYTES, inner))
+        Some((ETH_HDR_LEN + VLAN_TAG_LEN, inner))
     } else {
         Some((ETH_HDR_LEN, outer_ethertype))
     }
@@ -79,7 +76,7 @@ pub(super) enum ArpClassification {
 /// (ARP does not transit); if it's specifically an ARP reply, also
 /// learn the neighbor entry. The enum captures both branches without
 /// re-parsing.
-#[inline]
+#[inline(always)]
 pub(super) fn classify_arp(raw_frame: &[u8]) -> ArpClassification {
     let Some((l3_start, ethertype)) = parse_eth_offsets(raw_frame) else {
         return ArpClassification::NotArp;
@@ -129,7 +126,7 @@ pub(super) struct NdpNeighborAdvert {
 /// is not an NA or is too short. Handles VLAN-tagged frames.
 ///
 /// Replaces the inline parser at `afxdp.rs:948-1014` (pre-#947).
-#[inline]
+#[inline(always)]
 pub(super) fn parse_ndp_neighbor_advert(raw_frame: &[u8]) -> Option<NdpNeighborAdvert> {
     let (l3_start, ethertype) = parse_eth_offsets(raw_frame)?;
     if ethertype != ETHERTYPE_IPV6 {

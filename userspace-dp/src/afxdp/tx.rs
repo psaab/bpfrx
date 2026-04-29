@@ -3545,10 +3545,7 @@ const ECN_ECT_0: u8 = 0b0000_0010;
 const ECN_ECT_1: u8 = 0b0000_0001;
 const ECN_CE: u8 = 0b0000_0011;
 
-/// Size of a bare Ethernet header (6 dst MAC + 6 src MAC + 2 ethertype).
-const ETH_HDR_LEN: usize = 14;
-/// Size of a single 802.1Q / 802.1ad VLAN tag (TPID + TCI).
-const VLAN_TAG_LEN: usize = 4;
+use super::ethernet::{ETH_HDR_LEN, VLAN_TAG_LEN};
 
 /// Parsed L3 discriminator + offset from a forwarded Ethernet frame.
 /// Carries both pieces together so the ECN mark path dispatches off the
