@@ -162,16 +162,21 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
             linux_to_ifindex.insert(iface.linux_name.clone(), iface.ifindex);
         }
         if !iface.zone.is_empty() {
-            state
-                .ifindex_to_zone
-                .insert(iface.ifindex, iface.zone.clone());
+            // #921: resolve zone NAME → u16 once at config build, so
+            // every read on the hot path is one HashMap lookup
+            // (ifindex → u16). Unknown / dropped zones map to 0 (the
+            // canonical "unknown" sentinel).
+            let zone_id = state
+                .zone_name_to_id
+                .get(&iface.zone)
+                .copied()
+                .unwrap_or(0);
+            state.ifindex_to_zone_id.insert(iface.ifindex, zone_id);
             if iface.parent_ifindex > 0 {
-                match state.ifindex_to_zone.get(&iface.parent_ifindex) {
-                    Some(existing) if existing != &iface.zone => {}
+                match state.ifindex_to_zone_id.get(&iface.parent_ifindex) {
+                    Some(existing) if *existing != zone_id => {}
                     _ => {
-                        state
-                            .ifindex_to_zone
-                            .insert(iface.parent_ifindex, iface.zone.clone());
+                        state.ifindex_to_zone_id.insert(iface.parent_ifindex, zone_id);
                     }
                 }
             }
@@ -247,6 +252,9 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
             Some(mac) => mac,
             None => continue,
         };
+        // #921: resolve zone name → u16 at build time. 0 for
+        // unknown / dropped zones (consistent with ifindex_to_zone_id).
+        let zone_id = state.zone_name_to_id.get(&iface.zone).copied().unwrap_or(0);
         state.egress.insert(
             iface.ifindex,
             EgressInterface {
@@ -254,7 +262,7 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
                 vlan_id: iface.vlan_id.max(0) as u16,
                 mtu: iface.mtu.max(0) as usize,
                 src_mac,
-                zone: iface.zone.clone(),
+                zone_id,
                 redundancy_group: iface.redundancy_group,
                 primary_v4: pick_interface_v4(iface),
                 primary_v6: pick_interface_v6(iface),
@@ -437,17 +445,37 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
     // Debug: dump zone mappings and policy rules
     #[cfg(feature = "debug-log")]
     {
-        debug_log!("FWD_STATE: ifindex_to_zone={:?}", state.ifindex_to_zone);
+        // #921: ifindex_to_zone_id is u16 — render with names via
+        // zone_id_to_name for log readability.
+        let ifindex_to_zone_named: Vec<(i32, &str)> = state
+            .ifindex_to_zone_id
+            .iter()
+            .map(|(&ifidx, id)| {
+                let name = state
+                    .zone_id_to_name
+                    .get(id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                (ifidx, name)
+            })
+            .collect();
+        debug_log!("FWD_STATE: ifindex_to_zone={:?}", ifindex_to_zone_named);
         debug_log!(
             "FWD_STATE: egress keys={:?}",
             state.egress.keys().collect::<Vec<_>>()
         );
         for (ifidx, eg) in &state.egress {
+            // #921: render eg.zone_id back to name for debug.
+            let zone_name = state
+                .zone_id_to_name
+                .get(&eg.zone_id)
+                .map(|s| s.as_str())
+                .unwrap_or("");
             debug_log!(
                 "FWD_STATE: egress[{}] bind={} zone={} vlan={} mtu={}",
                 ifidx,
                 eg.bind_ifindex,
-                eg.zone,
+                zone_name,
                 eg.vlan_id,
                 eg.mtu,
             );
@@ -1170,6 +1198,103 @@ mod tests {
         assert!(state.zone_name_to_id.get("global-sentinel").is_none());
         assert!(state.zone_id_to_name.get(&crate::policy::ZONE_ID_RESERVED_MIN).is_none());
         assert!(state.zone_id_to_name.get(&crate::policy::JUNOS_GLOBAL_ZONE_ID).is_none());
+    }
+
+    /// #921: ifindex_to_zone_id is populated at config build time
+    /// from the snapshot's per-interface zone NAME via zone_name_to_id.
+    #[test]
+    fn ifindex_to_zone_id_populated_from_snapshot_at_build_time() {
+        use crate::ZoneSnapshot;
+        let snapshot = ConfigSnapshot {
+            zones: vec![ZoneSnapshot {
+                name: "trust".into(),
+                id: 7,
+            }],
+            interfaces: vec![InterfaceSnapshot {
+                name: "ge-0/0/0".into(),
+                zone: "trust".into(),
+                ifindex: 42,
+                hardware_addr: "02:00:00:00:00:42".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let state = build_forwarding_state(&snapshot);
+        assert_eq!(state.ifindex_to_zone_id.get(&42).copied(), Some(7));
+    }
+
+    /// #921: EgressInterface.zone_id is set from the snapshot at
+    /// config build time.
+    #[test]
+    fn egress_interface_zone_id_set_from_snapshot() {
+        use crate::ZoneSnapshot;
+        let snapshot = ConfigSnapshot {
+            zones: vec![ZoneSnapshot {
+                name: "wan".into(),
+                id: 11,
+            }],
+            interfaces: vec![InterfaceSnapshot {
+                name: "ge-0/0/1".into(),
+                zone: "wan".into(),
+                ifindex: 99,
+                hardware_addr: "02:00:00:00:00:99".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let state = build_forwarding_state(&snapshot);
+        let eg = state.egress.get(&99).expect("egress");
+        assert_eq!(eg.zone_id, 11);
+    }
+
+    /// #921: an interface whose zone snapshot field references a zone
+    /// that was DROPPED at config build time (reserved id, > u8 max)
+    /// collapses to zone_id == 0 (the canonical "unknown" sentinel).
+    #[test]
+    fn interface_pointing_at_skipped_zone_collapses_to_zone_id_zero() {
+        use crate::ZoneSnapshot;
+        let snapshot = ConfigSnapshot {
+            zones: vec![ZoneSnapshot {
+                name: "reserved".into(),
+                id: crate::policy::ZONE_ID_RESERVED_MIN, // dropped at build
+            }],
+            interfaces: vec![InterfaceSnapshot {
+                name: "ge-0/0/2".into(),
+                zone: "reserved".into(),
+                ifindex: 23,
+                hardware_addr: "02:00:00:00:00:23".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let state = build_forwarding_state(&snapshot);
+        // Zone was dropped; the interface still appears in the
+        // ifindex_to_zone_id map but with the unknown sentinel 0.
+        assert_eq!(state.ifindex_to_zone_id.get(&23).copied(), Some(0));
+    }
+
+    /// #921: an EgressInterface whose snapshot zone string isn't in
+    /// the zones list collapses to zone_id == 0.
+    #[test]
+    fn egress_with_unknown_zone_name_collapses_to_zone_id_zero() {
+        use crate::ZoneSnapshot;
+        let snapshot = ConfigSnapshot {
+            zones: vec![ZoneSnapshot {
+                name: "trust".into(),
+                id: 3,
+            }],
+            interfaces: vec![InterfaceSnapshot {
+                name: "ge-0/0/3".into(),
+                zone: "ghost".into(), // not in zones
+                ifindex: 56,
+                hardware_addr: "02:00:00:00:00:56".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let state = build_forwarding_state(&snapshot);
+        let eg = state.egress.get(&56).expect("egress");
+        assert_eq!(eg.zone_id, 0);
     }
 }
 

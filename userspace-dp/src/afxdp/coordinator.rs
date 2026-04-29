@@ -2229,6 +2229,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_zone_ids::*;
     use crate::{
         ClassOfServiceSnapshot, CoSForwardingClassSnapshot, CoSSchedulerMapEntrySnapshot,
         CoSSchedulerMapSnapshot,
@@ -2267,7 +2268,7 @@ mod tests {
                 vlan_id: 0,
                 mtu: 1500,
                 src_mac: [0; 6],
-                zone: "wan".to_string(),
+                zone_id: TEST_WAN_ZONE_ID,
                 redundancy_group: 0,
                 primary_v4: None,
                 primary_v6: None,
@@ -2341,7 +2342,7 @@ mod tests {
                 vlan_id: 0,
                 mtu: 1500,
                 src_mac: [0; 6],
-                zone: "wan".to_string(),
+                zone_id: TEST_WAN_ZONE_ID,
                 redundancy_group: 0,
                 primary_v4: None,
                 primary_v6: None,
@@ -2407,7 +2408,7 @@ mod tests {
                 vlan_id: 0,
                 mtu: 1500,
                 src_mac: [0; 6],
-                zone: "wan".to_string(),
+                zone_id: TEST_WAN_ZONE_ID,
                 redundancy_group: 0,
                 primary_v4: None,
                 primary_v6: None,
@@ -2460,7 +2461,7 @@ mod tests {
                 vlan_id: 0,
                 mtu: 1500,
                 src_mac: [0; 6],
-                zone: "wan".to_string(),
+                zone_id: TEST_WAN_ZONE_ID,
                 redundancy_group: 0,
                 primary_v4: None,
                 primary_v6: None,
@@ -2794,7 +2795,7 @@ mod tests {
                 vlan_id: 0,
                 mtu: 1500,
                 src_mac: [0; 6],
-                zone: "wan".to_string(),
+                zone_id: TEST_WAN_ZONE_ID,
                 redundancy_group: 0,
                 primary_v4: None,
                 primary_v6: None,

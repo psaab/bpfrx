@@ -137,14 +137,24 @@ pub(super) fn zone_pair_for_flow_with_override(
     ingress_zone_override: Option<&str>,
     egress_ifindex: i32,
 ) -> (String, String) {
+    // #921: this helper is `#[cfg_attr(not(test), allow(dead_code))]`
+    // (see zone_pair_for_flow above) and is only called from tests.
+    // After #921, `ifindex_to_zone_id` and `EgressInterface.zone_id`
+    // are u16. Resolve back to the name via `zone_id_to_name` for
+    // the test-only String API. Slow path; allocations are fine.
     let from_zone = ingress_zone_override
         .map(|zone| zone.to_string())
-        .or_else(|| forwarding.ifindex_to_zone.get(&ingress_ifindex).cloned())
+        .or_else(|| {
+            forwarding
+                .ifindex_to_zone_id
+                .get(&ingress_ifindex)
+                .and_then(|id| forwarding.zone_id_to_name.get(id).cloned())
+        })
         .unwrap_or_default();
     let to_zone = forwarding
         .egress
         .get(&egress_ifindex)
-        .map(|iface| iface.zone.clone())
+        .and_then(|iface| forwarding.zone_id_to_name.get(&iface.zone_id).cloned())
         .unwrap_or_default();
     (from_zone, to_zone)
 }
@@ -162,18 +172,16 @@ pub(super) fn zone_pair_ids_for_flow_with_override(
     ingress_zone_override: Option<u16>,
     egress_ifindex: i32,
 ) -> (u16, u16) {
+    // #921: single-hop direct lookup. Was two HashMap lookups
+    // (ifindex → String → u16) and one String hash; now one
+    // (ifindex → u16) for ingress and a struct field load for egress.
     let from_id = ingress_zone_override
-        .or_else(|| {
-            forwarding
-                .ifindex_to_zone
-                .get(&ingress_ifindex)
-                .and_then(|name| forwarding.zone_name_to_id.get(name.as_str()).copied())
-        })
+        .or_else(|| forwarding.ifindex_to_zone_id.get(&ingress_ifindex).copied())
         .unwrap_or(0);
     let to_id = forwarding
         .egress
         .get(&egress_ifindex)
-        .and_then(|iface| forwarding.zone_name_to_id.get(iface.zone.as_str()).copied())
+        .map(|iface| iface.zone_id)
         .unwrap_or(0);
     (from_id, to_id)
 }
@@ -403,14 +411,11 @@ pub(super) fn cluster_peer_return_fast_path(
     if fabric_return_resolution.disposition != ForwardingDisposition::ForwardCandidate {
         return None;
     }
-    let egress_zone_name = forwarding
-        .ifindex_to_zone
-        .get(&fabric_return_resolution.egress_ifindex)?;
+    // #921: direct ifindex → u16 lookup (was a two-hop name round-trip).
     let egress_zone = forwarding
-        .zone_name_to_id
-        .get(egress_zone_name.as_str())
-        .copied()
-        .unwrap_or(0);
+        .ifindex_to_zone_id
+        .get(&fabric_return_resolution.egress_ifindex)
+        .copied()?;
     let metadata = SessionMetadata {
         ingress_zone,
         egress_zone,
