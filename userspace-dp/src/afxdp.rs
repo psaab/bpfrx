@@ -77,6 +77,8 @@ mod icmp;
 mod icmp_embed;
 #[path = "afxdp/neighbor.rs"]
 mod neighbor;
+#[path = "afxdp/parser.rs"]
+mod parser;
 #[path = "afxdp/rst.rs"]
 mod rst;
 #[path = "afxdp/sharded_neighbor.rs"]
@@ -891,127 +893,54 @@ fn poll_binding_process_descriptor(
                         binding.scratch_recycle.push(desc.addr);
                         continue;
                     };
-                    // Check for ARP reply (ethertype 0x0806, opcode 0x0002).
-                    // Parse it and update the dynamic neighbor cache.
-                    // Handles both untagged and VLAN-tagged (802.1Q) ARP frames.
-                    if raw_frame.len() >= 42 {
-                        let (arp_start, ethertype) = if raw_frame.len() >= 18
-                            && u16::from_be_bytes([raw_frame[12], raw_frame[13]]) == 0x8100
-                        {
-                            (18, u16::from_be_bytes([raw_frame[16], raw_frame[17]]))
-                        } else {
-                            (14, u16::from_be_bytes([raw_frame[12], raw_frame[13]]))
-                        };
-                        if ethertype == 0x0806 && raw_frame.len() >= arp_start + 28 {
-                            let opcode = u16::from_be_bytes([
-                                raw_frame[arp_start + 6],
-                                raw_frame[arp_start + 7],
-                            ]);
-                            if opcode == 2 {
-                                // ARP reply — extract sender MAC and IP
-                                let sender_mac = [
-                                    raw_frame[arp_start + 8],
-                                    raw_frame[arp_start + 9],
-                                    raw_frame[arp_start + 10],
-                                    raw_frame[arp_start + 11],
-                                    raw_frame[arp_start + 12],
-                                    raw_frame[arp_start + 13],
-                                ];
-                                let sender_ip = IpAddr::V4(Ipv4Addr::new(
-                                    raw_frame[arp_start + 14],
-                                    raw_frame[arp_start + 15],
-                                    raw_frame[arp_start + 16],
-                                    raw_frame[arp_start + 17],
-                                ));
-                                // Update dynamic neighbor cache
-                                worker_ctx.dynamic_neighbors.insert(
-                                    (meta.ingress_ifindex as i32, sender_ip),
-                                    NeighborEntry { mac: sender_mac },
-                                );
-                                // Add learned ARP entry to kernel neighbor table
-                                // via netlink. This keeps the kernel's ARP table
-                                // in sync (needed for XDP_PASS fallback and
-                                // kernel-originated traffic).
-                                let neigh_ifindex = resolve_ingress_logical_ifindex(
-                                    worker_ctx.forwarding,
-                                    meta.ingress_ifindex as i32,
-                                    meta.ingress_vlan_id,
-                                )
-                                .unwrap_or(meta.ingress_ifindex as i32);
-                                add_kernel_neighbor(neigh_ifindex, sender_ip, sender_mac);
-                            }
-                            // Recycle frame — ARP is not a transit packet
+                    // #947: ARP classification + reply parsing extracted to
+                    // `parser.rs`. Any ARP frame (request/reply/etc.) is
+                    // recycled — ARP does not transit the firewall. ARP
+                    // replies additionally update the dynamic neighbor cache
+                    // and the kernel's neighbor table.
+                    match parser::classify_arp(raw_frame) {
+                        parser::ArpClassification::Reply(arp) => {
+                            worker_ctx.dynamic_neighbors.insert(
+                                (meta.ingress_ifindex as i32, arp.sender_ip),
+                                NeighborEntry {
+                                    mac: arp.sender_mac,
+                                },
+                            );
+                            let neigh_ifindex = resolve_ingress_logical_ifindex(
+                                worker_ctx.forwarding,
+                                meta.ingress_ifindex as i32,
+                                meta.ingress_vlan_id,
+                            )
+                            .unwrap_or(meta.ingress_ifindex as i32);
+                            add_kernel_neighbor(neigh_ifindex, arp.sender_ip, arp.sender_mac);
                             binding.scratch_recycle.push(desc.addr);
                             continue;
                         }
-                    }
-                    // Check for ICMPv6 Neighbor Advertisement (type 136).
-                    // Parse the target address and target link-layer address option,
-                    // then update the dynamic neighbor cache.
-                    // Handles both untagged and VLAN-tagged (802.1Q) IPv6 frames.
-                    if raw_frame.len() >= 78 {
-                        let (l3_start, ethertype) = if raw_frame.len() >= 18
-                            && u16::from_be_bytes([raw_frame[12], raw_frame[13]]) == 0x8100
-                        {
-                            (18, u16::from_be_bytes([raw_frame[16], raw_frame[17]]))
-                        } else {
-                            (14, u16::from_be_bytes([raw_frame[12], raw_frame[13]]))
-                        };
-                        if ethertype == 0x86dd && raw_frame.len() >= l3_start + 40 {
-                            let next_header = raw_frame[l3_start + 6];
-                            let l4_start = l3_start + 40;
-                            // ICMPv6 NA: next_header=58, type=136, need at least 24 bytes of ICMPv6 body
-                            if next_header == 58
-                                && raw_frame.len() >= l4_start + 24
-                                && raw_frame[l4_start] == 136
-                            {
-                                // Target address at ICMPv6 offset + 8 (after type/code/checksum/flags)
-                                if let Ok(target_bytes) =
-                                    <[u8; 16]>::try_from(&raw_frame[l4_start + 8..l4_start + 24])
-                                {
-                                    let target_ip = IpAddr::V6(Ipv6Addr::from(target_bytes));
-                                    // Look for target link-layer address option (type 2)
-                                    let mut opt_off = l4_start + 24;
-                                    while opt_off + 2 <= raw_frame.len() {
-                                        let opt_type = raw_frame[opt_off];
-                                        let opt_len = raw_frame[opt_off + 1] as usize * 8;
-                                        if opt_len == 0 {
-                                            break;
-                                        }
-                                        if opt_type == 2
-                                            && opt_len >= 8
-                                            && opt_off + 8 <= raw_frame.len()
-                                        {
-                                            let mac = [
-                                                raw_frame[opt_off + 2],
-                                                raw_frame[opt_off + 3],
-                                                raw_frame[opt_off + 4],
-                                                raw_frame[opt_off + 5],
-                                                raw_frame[opt_off + 6],
-                                                raw_frame[opt_off + 7],
-                                            ];
-                                            worker_ctx.dynamic_neighbors.insert(
-                                                (meta.ingress_ifindex as i32, target_ip),
-                                                NeighborEntry { mac },
-                                            );
-                                            // Add to kernel neighbor table via netlink.
-                                            // Use the logical VLAN sub-interface ifindex
-                                            // so the kernel associates it correctly.
-                                            let neigh_ifindex = resolve_ingress_logical_ifindex(
-                                                worker_ctx.forwarding,
-                                                meta.ingress_ifindex as i32,
-                                                meta.ingress_vlan_id,
-                                            )
-                                            .unwrap_or(meta.ingress_ifindex as i32);
-                                            add_kernel_neighbor(neigh_ifindex, target_ip, mac);
-                                            break;
-                                        }
-                                        opt_off += opt_len;
-                                    }
-                                }
-                                // Also let the NA fall through to normal processing.
-                            }
+                        parser::ArpClassification::OtherArp => {
+                            binding.scratch_recycle.push(desc.addr);
+                            continue;
                         }
+                        parser::ArpClassification::NotArp => {}
+                    }
+                    // #947: NDP Neighbor Advertisement parsing extracted to
+                    // `parser.rs`. NA with a Target Link-Layer Address option
+                    // updates the dynamic neighbor cache and the kernel's
+                    // neighbor table. Unlike ARP, the NA frame falls through
+                    // to normal IPv6 forwarding processing afterward.
+                    if let Some(na) = parser::parse_ndp_neighbor_advert(raw_frame)
+                        && let Some(mac) = na.target_mac
+                    {
+                        worker_ctx.dynamic_neighbors.insert(
+                            (meta.ingress_ifindex as i32, na.target_ip),
+                            NeighborEntry { mac },
+                        );
+                        let neigh_ifindex = resolve_ingress_logical_ifindex(
+                            worker_ctx.forwarding,
+                            meta.ingress_ifindex as i32,
+                            meta.ingress_vlan_id,
+                        )
+                        .unwrap_or(meta.ingress_ifindex as i32);
+                        add_kernel_neighbor(neigh_ifindex, na.target_ip, mac);
                     }
                     let native_gre_packet =
                         try_native_gre_decap_from_frame(raw_frame, meta, worker_ctx.forwarding);
