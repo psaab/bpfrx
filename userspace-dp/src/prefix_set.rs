@@ -80,9 +80,16 @@ impl PrefixSetV4 {
         }
     }
 
-    /// Number of prefixes in the set. `MatchAny` reports 0 to match
-    /// the legacy `Vec::is_empty()` reading the debug-log code at
-    /// `forwarding_build.rs:467` did.
+    /// Set cardinality (count of unique terminal prefixes), used
+    /// only for the `forwarding_build.rs:467` debug-log readout.
+    /// Two intentional changes vs the legacy `Vec::len()`:
+    /// - `MatchAny` reports 0 (matches the legacy "empty Vec ⇒ 0"
+    ///   read; new path is `["any"]` or all-malformed-input or any
+    ///   `/0` collapse).
+    /// - `Trie` reports the deduped count: inserting the same
+    ///   prefix N times yields size 1, not N. Linear preserves the
+    ///   raw input length.
+    /// Debug-only; not on any data-path.
     pub(crate) fn prefix_count(&self) -> usize {
         match self {
             Self::MatchAny => 0,
@@ -171,9 +178,13 @@ impl PrefixTrieV4 {
     fn insert(&mut self, prefix: &PrefixV4) {
         let bits = u32::from(prefix.addr());
         let depth = prefix.prefix_len() as usize;
-        // /0 is filtered to MatchAny by the constructor; assert in
-        // debug builds. In release we still walk 0 bits and set
-        // root.covers = true, which would create a match-all trie.
+        // /0 is filtered to MatchAny by `from_prefixes` before any
+        // call to insert(). In release a /0 insert is a no-op
+        // because the loop body runs zero iterations and `node`
+        // remains the root — root.covers gets set, but `contains()`
+        // never inspects root.covers (it always descends a child
+        // first), so a private bypass-insert of /0 would NOT match
+        // all. Behaviour is "silently ineffective", not unsafe.
         debug_assert!(depth > 0, "/0 must be filtered to MatchAny");
         let mut node = &mut self.root;
         for i in 0..depth {
@@ -190,8 +201,8 @@ impl PrefixTrieV4 {
     fn contains(&self, ip: Ipv4Addr) -> bool {
         let bits = u32::from(ip);
         let mut node = &self.root;
-        // Root.covers is never set (constructor filters /0). Skip
-        // checking it; descend bit-by-bit.
+        // Skip root: any covering prefix has length ≥ 1 and lives
+        // at depth ≥ 1. (See insert() for the /0-was-filtered note.)
         for i in 0..32 {
             let bit = ((bits >> (31 - i)) & 1) as usize;
             match node.children[bit].as_deref() {
@@ -212,6 +223,7 @@ impl PrefixTrieV6 {
     fn insert(&mut self, prefix: &PrefixV6) {
         let bits = u128::from(prefix.addr());
         let depth = prefix.prefix_len() as usize;
+        // See PrefixTrieV4::insert for the ::/0 filtering note.
         debug_assert!(depth > 0, "::/0 must be filtered to MatchAny");
         let mut node = &mut self.root;
         for i in 0..depth {
@@ -227,6 +239,8 @@ impl PrefixTrieV6 {
     fn contains(&self, ip: Ipv6Addr) -> bool {
         let bits = u128::from(ip);
         let mut node = &self.root;
+        // Skip root: any covering prefix has length ≥ 1. See
+        // PrefixTrieV4::contains.
         for i in 0..128 {
             let bit = ((bits >> (127 - i)) & 1) as usize;
             match node.children[bit].as_deref() {

@@ -30,3 +30,10 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 [[bench]]
 name = "tx_kick_latency"
 harness = false
+
+# #923: config-commit latency gate for the worst-case prefix trie
+# build (256 random /32 prefixes → ~8K Box<TrieNode> allocations).
+# Gated on p95 ≤ 10 ms per plan §"Acceptance gates" #3.
+[[bench]]
+name = "prefix_set_lookup"
+harness = false
