@@ -1089,6 +1089,7 @@ pub(crate) fn reverse_canonical_key(forward_key: &SessionKey, _nat: NatDecision)
 
 #[cfg(test)]
 mod tests {
+    use crate::test_zone_ids::*;
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -1137,8 +1138,8 @@ mod tests {
 
     fn metadata() -> SessionMetadata {
         SessionMetadata {
-            ingress_zone: Arc::<str>::from("lan"),
-            egress_zone: Arc::<str>::from("wan"),
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,

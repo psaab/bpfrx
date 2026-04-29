@@ -449,6 +449,7 @@ impl super::Coordinator {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_zone_ids::*;
     use super::*;
 
     fn active_ha_runtime(now_secs: u64) -> HAGroupRuntime {
@@ -593,8 +594,8 @@ mod tests {
 
     fn test_metadata() -> SessionMetadata {
         SessionMetadata {
-            ingress_zone: Arc::<str>::from("lan"),
-            egress_zone: Arc::<str>::from("wan"),
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
             owner_rg_id: 1,
             fabric_ingress: true,
             is_reverse: false,

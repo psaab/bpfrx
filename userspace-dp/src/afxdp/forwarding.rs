@@ -131,6 +131,21 @@ pub(super) fn zone_pair_for_flow(
     zone_pair_for_flow_with_override(forwarding, ingress_ifindex, None, egress_ifindex)
 }
 
+/// #919/#922 test helper: returns zone IDs (u16, u16) by translating
+/// `zone_pair_for_flow` strings through the forwarding state's
+/// `zone_name_to_id` map. Returns `(0, 0)` for unknown zones.
+#[cfg(test)]
+pub(super) fn zone_pair_ids_for_flow(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    egress_ifindex: i32,
+) -> (u16, u16) {
+    let (from, to) = zone_pair_for_flow(forwarding, ingress_ifindex, egress_ifindex);
+    let from_id = forwarding.zone_name_to_id.get(&from).copied().unwrap_or(0);
+    let to_id = forwarding.zone_name_to_id.get(&to).copied().unwrap_or(0);
+    (from_id, to_id)
+}
+
 pub(super) fn zone_pair_for_flow_with_override(
     forwarding: &ForwardingState,
     ingress_ifindex: i32,
@@ -1651,6 +1666,7 @@ fn choose_v6_route(
 
 #[cfg(test)]
 mod tests {
+    use crate::test_zone_ids::*;
     use super::super::forwarding_build::*;
     use super::super::test_fixtures::*;
     use super::*;
@@ -2246,7 +2262,7 @@ mod tests {
         let routed = lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         let (from_zone, _) = zone_pair_for_flow(&state, 24, routed.egress_ifindex);
         let redirected = finalize_new_flow_ha_resolution(
-            &state, &ha_state, now_secs, routed, false, 24, &from_zone, 0,
+            &state, &ha_state, now_secs, routed, false, 24, state.zone_name_to_id.get(&from_zone).copied().unwrap_or(0), 0,
         );
         assert_eq!(
             redirected.disposition,
@@ -2265,7 +2281,7 @@ mod tests {
         let ha_state = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
         let routed = lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         let resolved = finalize_new_flow_ha_resolution(
-            &state, &ha_state, now_secs, routed, true, 21, "lan", 0,
+            &state, &ha_state, now_secs, routed, true, 21, 1, 0,
         );
         assert_eq!(
             resolved.disposition,
@@ -2291,7 +2307,7 @@ mod tests {
             &ha_state,
             &dynamic_neighbors,
             IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-            "lan",
+            1,
             true,
             monotonic_nanos() / 1_000_000_000,
             false,
@@ -2318,7 +2334,7 @@ mod tests {
             &ha_state,
             &dynamic_neighbors,
             IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-            "lan",
+            1,
             true,
             monotonic_nanos() / 1_000_000_000,
             false,
@@ -2373,8 +2389,8 @@ mod tests {
             ForwardingDisposition::ForwardCandidate
         );
         assert_eq!(decision.resolution.egress_ifindex, 5);
-        assert_eq!(metadata.ingress_zone.as_ref(), "sfmix");
-        assert_eq!(metadata.egress_zone.as_ref(), "lan");
+        assert_eq!(metadata.ingress_zone, 5);
+        assert_eq!(metadata.egress_zone, 1);
         assert!(metadata.fabric_ingress);
         assert!(metadata.is_reverse);
     }
@@ -2501,18 +2517,16 @@ mod tests {
             nat: NatDecision::default(),
         };
 
-        let ingress_zone = Arc::<str>::from("lan");
-        let egress_zone = Arc::<str>::from("wan");
         let metadata = build_missing_neighbor_session_metadata(
             &state,
-            &ingress_zone,
-            &egress_zone,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
             true,
             decision,
         );
 
-        assert_eq!(metadata.ingress_zone.as_ref(), "lan");
-        assert_eq!(metadata.egress_zone.as_ref(), "wan");
+        assert_eq!(metadata.ingress_zone, 1);
+        assert_eq!(metadata.egress_zone, 2);
         assert!(metadata.fabric_ingress);
         assert!(!metadata.is_reverse);
     }
@@ -2528,7 +2542,7 @@ mod tests {
             &ha_state,
             &dynamic_neighbors,
             IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
-            "wan",
+            2,
             false,
             monotonic_nanos() / 1_000_000_000,
             false,
@@ -2552,7 +2566,7 @@ mod tests {
             &ha_state,
             &dynamic_neighbors,
             IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
-            "wan",
+            2,
             false,
             monotonic_nanos() / 1_000_000_000,
             false,
@@ -2574,7 +2588,7 @@ mod tests {
             &ha_state,
             &dynamic_neighbors,
             "2001:559:8585:80::8".parse().expect("dst"),
-            "wan",
+            2,
             false,
             monotonic_nanos() / 1_000_000_000,
             false,
@@ -2708,8 +2722,8 @@ mod tests {
                 tx_vlan_id: 0,
             },
             metadata: SessionMetadata {
-                ingress_zone: Arc::<str>::from("wan"),
-                egress_zone: Arc::<str>::from("lan"),
+                ingress_zone: TEST_WAN_ZONE_ID,
+                egress_zone: TEST_LAN_ZONE_ID,
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: false,
@@ -2757,8 +2771,8 @@ mod tests {
                 tx_vlan_id: 0,
             },
             metadata: SessionMetadata {
-                ingress_zone: Arc::<str>::from("wan"),
-                egress_zone: Arc::<str>::from("lan"),
+                ingress_zone: TEST_WAN_ZONE_ID,
+                egress_zone: TEST_LAN_ZONE_ID,
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: false,
@@ -2806,8 +2820,8 @@ mod tests {
                 tx_vlan_id: 0,
             },
             metadata: SessionMetadata {
-                ingress_zone: Arc::<str>::from("wan"),
-                egress_zone: Arc::<str>::from("lan"),
+                ingress_zone: TEST_WAN_ZONE_ID,
+                egress_zone: TEST_LAN_ZONE_ID,
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: false,
@@ -2852,8 +2866,8 @@ mod tests {
                 tx_vlan_id: 0,
             },
             metadata: SessionMetadata {
-                ingress_zone: Arc::<str>::from("wan"),
-                egress_zone: Arc::<str>::from("lan"),
+                ingress_zone: TEST_WAN_ZONE_ID,
+                egress_zone: TEST_LAN_ZONE_ID,
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: false,
@@ -3227,8 +3241,8 @@ mod tests {
             nat: NatDecision::default(),
         };
         let metadata = SessionMetadata {
-            ingress_zone: Arc::<str>::from("lan"),
-            egress_zone: Arc::<str>::from("wan"),
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -3291,8 +3305,8 @@ mod tests {
             nat: NatDecision::default(),
         };
         let metadata = SessionMetadata {
-            ingress_zone: Arc::<str>::from("lan"),
-            egress_zone: Arc::<str>::from("wan"),
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -3393,12 +3407,12 @@ mod tests {
                 dst_port: 5201,
             },
         };
-        let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
+        let (from_id, to_id) = zone_pair_ids_for_flow(&state, 24, 12);
         assert_eq!(
             evaluate_policy(
                 &state.policy,
-                &from_zone,
-                &to_zone,
+                from_id,
+                to_id,
                 flow.src_ip,
                 flow.dst_ip,
                 flow.forward_key.protocol,
@@ -3424,12 +3438,12 @@ mod tests {
                 dst_port: 5201,
             },
         };
-        let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
+        let (from_id, to_id) = zone_pair_ids_for_flow(&state, 24, 12);
         assert_eq!(
             evaluate_policy(
                 &state.policy,
-                &from_zone,
-                &to_zone,
+                from_id,
+                to_id,
                 flow.src_ip,
                 flow.dst_ip,
                 flow.forward_key.protocol,

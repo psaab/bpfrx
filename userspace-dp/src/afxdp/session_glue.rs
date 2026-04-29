@@ -1235,6 +1235,7 @@ pub(super) fn enforce_session_ha_resolution(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_zone_ids::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn active_ha_runtime(now_secs: u64) -> HAGroupRuntime {
@@ -1269,8 +1270,8 @@ mod tests {
 
     fn test_metadata() -> SessionMetadata {
         SessionMetadata {
-            ingress_zone: Arc::<str>::from("lan"),
-            egress_zone: Arc::<str>::from("wan"),
+            ingress_zone: 1,
+            egress_zone: 2,
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,
@@ -1346,9 +1347,15 @@ mod tests {
 
     fn test_forwarding_state_with_fabric() -> ForwardingState {
         let mut forwarding = test_forwarding_state();
-        forwarding.zone_name_to_id.insert("lan".to_string(), 1);
-        forwarding.zone_name_to_id.insert("sfmix".to_string(), 2);
-        forwarding.zone_name_to_id.insert("wan".to_string(), 3);
+        forwarding
+            .zone_name_to_id
+            .insert("lan".to_string(), TEST_LAN_ZONE_ID);
+        forwarding
+            .zone_name_to_id
+            .insert("sfmix".to_string(), TEST_SFMIX_ZONE_ID);
+        forwarding
+            .zone_name_to_id
+            .insert("wan".to_string(), TEST_WAN_ZONE_ID);
         forwarding.fabrics.push(FabricLink {
             parent_ifindex: 21,
             overlay_ifindex: 101,
@@ -3594,8 +3601,8 @@ mod tests {
                 ),
             },
             SessionMetadata {
-                ingress_zone: Arc::<str>::from("wan"),
-                egress_zone: Arc::<str>::from("lan"),
+                ingress_zone: 2,
+                egress_zone: 1,
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: true,
@@ -3665,8 +3672,8 @@ mod tests {
                 ),
             },
             SessionMetadata {
-                ingress_zone: Arc::<str>::from("wan"),
-                egress_zone: Arc::<str>::from("lan"),
+                ingress_zone: 2,
+                egress_zone: 1,
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: true,
@@ -3741,8 +3748,8 @@ mod tests {
                 ),
             },
             SessionMetadata {
-                ingress_zone: Arc::<str>::from("wan"),
-                egress_zone: Arc::<str>::from("lan"),
+                ingress_zone: 2,
+                egress_zone: 1,
                 owner_rg_id: 1,
                 fabric_ingress: false,
                 is_reverse: true,
@@ -3820,8 +3827,8 @@ mod tests {
                 ),
             },
             SessionMetadata {
-                ingress_zone: Arc::<str>::from("wan"),
-                egress_zone: Arc::<str>::from("lan"),
+                ingress_zone: 2,
+                egress_zone: 1,
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: true,
@@ -3899,8 +3906,8 @@ mod tests {
                 ),
             },
             SessionMetadata {
-                ingress_zone: Arc::<str>::from("wan"),
-                egress_zone: Arc::<str>::from("lan"),
+                ingress_zone: 2,
+                egress_zone: 1,
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: true,
@@ -3973,8 +3980,8 @@ mod tests {
                 ),
             },
             SessionMetadata {
-                ingress_zone: Arc::<str>::from("wan"),
-                egress_zone: Arc::<str>::from("lan"),
+                ingress_zone: 2,
+                egress_zone: 1,
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: true,
@@ -4086,8 +4093,8 @@ mod tests {
         assert!(reverse.metadata.is_reverse);
         assert!(reverse.origin.is_peer_synced());
         assert!(reverse.metadata.fabric_ingress);
-        assert_eq!(reverse.metadata.ingress_zone, "wan");
-        assert_eq!(reverse.metadata.egress_zone, "lan");
+        assert_eq!(reverse.metadata.ingress_zone, 2);
+        assert_eq!(reverse.metadata.egress_zone, 1);
         assert_eq!(
             reverse.key,
             reverse_session_key(&entry.key, entry.decision.nat)
@@ -4127,8 +4134,8 @@ mod tests {
         let forwarding = test_forwarding_state_split_rgs();
         let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
         let mut metadata = test_metadata();
-        metadata.ingress_zone = Arc::<str>::from("lan");
-        metadata.egress_zone = Arc::<str>::from("wan");
+        metadata.ingress_zone = TEST_LAN_ZONE_ID;
+        metadata.egress_zone = TEST_WAN_ZONE_ID;
         metadata.fabric_ingress = false;
         let entry = SyncedSessionEntry {
             key: test_key(),
@@ -4153,7 +4160,7 @@ mod tests {
         assert_eq!(reverse.decision.resolution.egress_ifindex, 21);
         assert_eq!(
             reverse.decision.resolution.src_mac,
-            Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x03])
+            Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, TEST_WAN_ZONE_ID as u8])
         );
         assert_eq!(reverse.metadata.owner_rg_id, 2);
         assert!(reverse.metadata.is_reverse);
@@ -4176,7 +4183,7 @@ mod tests {
                 tx_vlan_id: 0,
             },
             false,
-            "sfmix",
+            TEST_SFMIX_ZONE_ID,
         );
         assert_eq!(
             redirected.disposition,
@@ -4186,7 +4193,7 @@ mod tests {
         assert_eq!(redirected.tx_ifindex, 21);
         assert_eq!(
             redirected.src_mac,
-            Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x02])
+            Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, TEST_SFMIX_ZONE_ID as u8])
         );
     }
 
@@ -4207,7 +4214,7 @@ mod tests {
                 tx_vlan_id: 0,
             },
             true,
-            "sfmix",
+            5,
         );
         assert_eq!(resolved.disposition, ForwardingDisposition::HAInactive);
     }
@@ -4303,8 +4310,8 @@ mod tests {
                     },
                 },
                 metadata: SessionMetadata {
-                    ingress_zone: Arc::<str>::from("lan"),
-                    egress_zone: Arc::<str>::from("sfmix"),
+                    ingress_zone: 1,
+                    egress_zone: 5,
                     owner_rg_id: 2,
                     fabric_ingress: false,
                     is_reverse: false,
@@ -4399,8 +4406,8 @@ mod tests {
         ha_state.insert(1, active_ha_runtime(1));
         ha_state.insert(2, inactive_ha_runtime(1));
         let mut metadata = test_metadata();
-        metadata.ingress_zone = Arc::<str>::from("lan");
-        metadata.egress_zone = Arc::<str>::from("wan");
+        metadata.ingress_zone = 1;
+        metadata.egress_zone = 2;
         metadata.fabric_ingress = false;
         metadata.owner_rg_id = 1;
         let entry = SyncedSessionEntry {
@@ -4603,8 +4610,8 @@ mod tests {
                     },
                 },
                 metadata: SessionMetadata {
-                    ingress_zone: Arc::<str>::from("lan"),
-                    egress_zone: Arc::<str>::from("wan"),
+                    ingress_zone: 1,
+                    egress_zone: 2,
                     owner_rg_id: 1,
                     fabric_ingress: false,
                     is_reverse: false,

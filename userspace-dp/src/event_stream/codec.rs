@@ -347,8 +347,8 @@ mod tests {
     use super::*;
     use crate::afxdp::ForwardingResolution;
     use crate::nat::NatDecision;
+    use crate::test_zone_ids::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
-    use std::sync::Arc;
 
     fn test_zone_map() -> FxHashMap<String, u16> {
         let mut m = FxHashMap::default();
@@ -406,8 +406,8 @@ mod tests {
 
     fn test_metadata() -> SessionMetadata {
         SessionMetadata {
-            ingress_zone: Arc::from("trust"),
-            egress_zone: Arc::from("untrust"),
+            ingress_zone: TEST_TRUST_ZONE_ID,
+            egress_zone: TEST_UNTRUST_ZONE_ID,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -449,8 +449,8 @@ mod tests {
         assert_eq!(i16::from_le_bytes([p[12], p[13]]), 3); // EgressIfindex
         assert_eq!(i16::from_le_bytes([p[14], p[15]]), 3); // TXIfindex
         assert_eq!(p[20], 0); // Flags (no fabric redirect, no fabric ingress)
-        assert_eq!(p[21], 1); // IngressZoneID (trust=1)
-        assert_eq!(p[22], 2); // EgressZoneID (untrust=2)
+        assert_eq!(p[21], TEST_TRUST_ZONE_ID as u8); // IngressZoneID
+        assert_eq!(p[22], TEST_UNTRUST_ZONE_ID as u8); // EgressZoneID
         assert_eq!(p[23], DISP_FORWARD_CANDIDATE); // Disposition
     }
 
@@ -519,8 +519,8 @@ mod tests {
             key: test_key_v4(),
             decision: test_decision(),
             metadata: SessionMetadata {
-                ingress_zone: Arc::from("trust"),
-                egress_zone: Arc::from("untrust"),
+                ingress_zone: TEST_TRUST_ZONE_ID,
+                egress_zone: TEST_UNTRUST_ZONE_ID,
                 owner_rg_id: 0,
                 fabric_ingress: true,
                 is_reverse: false,

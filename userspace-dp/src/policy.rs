@@ -452,12 +452,21 @@ fn nets_match_v6(nets: &[PrefixV6], ip: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_zone_ids::*;
+
+    fn test_zone_name_to_id() -> FxHashMap<String, u16> {
+        let mut m = FxHashMap::default();
+        m.insert("lan".to_string(), TEST_LAN_ZONE_ID);
+        m.insert("wan".to_string(), TEST_WAN_ZONE_ID);
+        m.insert("trust".to_string(), TEST_TRUST_ZONE_ID);
+        m.insert("untrust".to_string(), TEST_UNTRUST_ZONE_ID);
+        m.insert("sfmix".to_string(), TEST_SFMIX_ZONE_ID);
+        m
+    }
 
     #[test]
     fn allow_all_matches_zone_pair() {
-        let state = parse_policy_state(
-            "deny",
-            &[PolicyRuleSnapshot {
+        let state = parse_policy_state("deny", &[PolicyRuleSnapshot {
                 name: "allow-all".to_string(),
                 from_zone: "lan".to_string(),
                 to_zone: "wan".to_string(),
@@ -466,13 +475,12 @@ mod tests {
                 applications: vec!["any".to_string()],
                 application_terms: Vec::new(),
                 action: "permit".to_string(),
-            }],
-        );
+            }], &test_zone_name_to_id());
         assert_eq!(
             evaluate_policy(
                 &state,
-                "lan",
-                "wan",
+                TEST_LAN_ZONE_ID,
+                TEST_WAN_ZONE_ID,
                 "10.0.61.100".parse().expect("src"),
                 "172.16.80.200".parse().expect("dst"),
                 PROTO_TCP,
@@ -485,12 +493,12 @@ mod tests {
 
     #[test]
     fn default_deny_applies_without_match() {
-        let state = parse_policy_state("deny", &[]);
+        let state = parse_policy_state("deny", &[], &test_zone_name_to_id());
         assert_eq!(
             evaluate_policy(
                 &state,
-                "lan",
-                "wan",
+                TEST_LAN_ZONE_ID,
+                TEST_WAN_ZONE_ID,
                 "10.0.61.100".parse().expect("src"),
                 "172.16.80.200".parse().expect("dst"),
                 PROTO_TCP,
@@ -503,9 +511,7 @@ mod tests {
 
     #[test]
     fn cidr_matches_ipv6() {
-        let state = parse_policy_state(
-            "deny",
-            &[PolicyRuleSnapshot {
+        let state = parse_policy_state("deny", &[PolicyRuleSnapshot {
                 name: "allow-v6".to_string(),
                 from_zone: "lan".to_string(),
                 to_zone: "wan".to_string(),
@@ -514,13 +520,12 @@ mod tests {
                 applications: vec!["any".to_string()],
                 application_terms: Vec::new(),
                 action: "permit".to_string(),
-            }],
-        );
+            }], &test_zone_name_to_id());
         assert_eq!(
             evaluate_policy(
                 &state,
-                "lan",
-                "wan",
+                TEST_LAN_ZONE_ID,
+                TEST_WAN_ZONE_ID,
                 "2001:559:8585:ef00::100".parse().expect("src"),
                 "2001:559:8585:80::200".parse().expect("dst"),
                 PROTO_TCP,
@@ -533,9 +538,7 @@ mod tests {
 
     #[test]
     fn named_application_matches_protocol_and_port() {
-        let state = parse_policy_state(
-            "deny",
-            &[PolicyRuleSnapshot {
+        let state = parse_policy_state("deny", &[PolicyRuleSnapshot {
                 name: "allow-http".to_string(),
                 from_zone: "lan".to_string(),
                 to_zone: "wan".to_string(),
@@ -549,13 +552,12 @@ mod tests {
                     destination_port: "80".to_string(),
                 }],
                 action: "permit".to_string(),
-            }],
-        );
+            }], &test_zone_name_to_id());
         assert_eq!(
             evaluate_policy(
                 &state,
-                "lan",
-                "wan",
+                TEST_LAN_ZONE_ID,
+                TEST_WAN_ZONE_ID,
                 "10.0.61.100".parse().expect("src"),
                 "172.16.80.200".parse().expect("dst"),
                 PROTO_TCP,
@@ -567,8 +569,8 @@ mod tests {
         assert_eq!(
             evaluate_policy(
                 &state,
-                "lan",
-                "wan",
+                TEST_LAN_ZONE_ID,
+                TEST_WAN_ZONE_ID,
                 "10.0.61.100".parse().expect("src"),
                 "172.16.80.200".parse().expect("dst"),
                 PROTO_TCP,
@@ -581,9 +583,7 @@ mod tests {
 
     #[test]
     fn application_set_matches_any_expanded_term() {
-        let state = parse_policy_state(
-            "deny",
-            &[PolicyRuleSnapshot {
+        let state = parse_policy_state("deny", &[PolicyRuleSnapshot {
                 name: "allow-web".to_string(),
                 from_zone: "lan".to_string(),
                 to_zone: "wan".to_string(),
@@ -605,13 +605,12 @@ mod tests {
                     },
                 ],
                 action: "permit".to_string(),
-            }],
-        );
+            }], &test_zone_name_to_id());
         assert_eq!(
             evaluate_policy(
                 &state,
-                "lan",
-                "wan",
+                TEST_LAN_ZONE_ID,
+                TEST_WAN_ZONE_ID,
                 "10.0.61.100".parse().expect("src"),
                 "172.16.80.200".parse().expect("dst"),
                 PROTO_TCP,
@@ -624,9 +623,7 @@ mod tests {
 
     #[test]
     fn global_policy_matches_any_zone_pair() {
-        let state = parse_policy_state(
-            "deny",
-            &[PolicyRuleSnapshot {
+        let state = parse_policy_state("deny", &[PolicyRuleSnapshot {
                 name: "global-allow".to_string(),
                 from_zone: "junos-global".to_string(),
                 to_zone: "junos-global".to_string(),
@@ -635,14 +632,13 @@ mod tests {
                 applications: vec!["any".to_string()],
                 application_terms: Vec::new(),
                 action: "permit".to_string(),
-            }],
-        );
+            }], &test_zone_name_to_id());
         // Should match any zone pair
         assert_eq!(
             evaluate_policy(
                 &state,
-                "trust",
-                "untrust",
+                TEST_TRUST_ZONE_ID,
+                TEST_UNTRUST_ZONE_ID,
                 "10.0.0.1".parse().expect("src"),
                 "8.8.8.8".parse().expect("dst"),
                 PROTO_TCP,
@@ -654,8 +650,8 @@ mod tests {
         assert_eq!(
             evaluate_policy(
                 &state,
-                "dmz",
-                "wan",
+                TEST_DMZ_ZONE_ID,
+                TEST_WAN_ZONE_ID,
                 "192.168.1.1".parse().expect("src"),
                 "1.1.1.1".parse().expect("dst"),
                 PROTO_UDP,
@@ -668,9 +664,7 @@ mod tests {
 
     #[test]
     fn global_policy_evaluated_after_zone_specific() {
-        let state = parse_policy_state(
-            "deny",
-            &[
+        let state = parse_policy_state("deny", &[
                 PolicyRuleSnapshot {
                     name: "deny-trust-to-untrust".to_string(),
                     from_zone: "trust".to_string(),
@@ -691,14 +685,13 @@ mod tests {
                     application_terms: Vec::new(),
                     action: "permit".to_string(),
                 },
-            ],
-        );
+            ], &test_zone_name_to_id());
         // Zone-specific deny should take precedence (evaluated first)
         assert_eq!(
             evaluate_policy(
                 &state,
-                "trust",
-                "untrust",
+                TEST_TRUST_ZONE_ID,
+                TEST_UNTRUST_ZONE_ID,
                 "10.0.0.1".parse().expect("src"),
                 "8.8.8.8".parse().expect("dst"),
                 PROTO_TCP,
@@ -711,8 +704,8 @@ mod tests {
         assert_eq!(
             evaluate_policy(
                 &state,
-                "dmz",
-                "wan",
+                TEST_SFMIX_ZONE_ID,
+                TEST_WAN_ZONE_ID,
                 "10.0.0.1".parse().expect("src"),
                 "8.8.8.8".parse().expect("dst"),
                 PROTO_TCP,

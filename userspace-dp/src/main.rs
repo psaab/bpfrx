@@ -10,6 +10,8 @@ mod prefix;
 mod screen;
 mod session;
 mod slowpath;
+#[cfg(test)]
+mod test_zone_ids;
 mod state_writer;
 #[allow(dead_code)]
 mod xsk_ffi;
@@ -1281,6 +1283,17 @@ fn write_state(state_file: &str, state: &Arc<Mutex<ServerState>>) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_zone_ids::*;
+
+    fn test_zone_name_to_id() -> rustc_hash::FxHashMap<String, u16> {
+        let mut m = rustc_hash::FxHashMap::default();
+        m.insert("lan".to_string(), TEST_LAN_ZONE_ID);
+        m.insert("wan".to_string(), TEST_WAN_ZONE_ID);
+        m.insert("trust".to_string(), TEST_TRUST_ZONE_ID);
+        m.insert("untrust".to_string(), TEST_UNTRUST_ZONE_ID);
+        m.insert("sfmix".to_string(), TEST_SFMIX_ZONE_ID);
+        m
+    }
 
     #[test]
     fn same_binding_plan_ignores_runtime_only_snapshot_changes() {
@@ -1521,7 +1534,8 @@ mod tests {
             ..SessionSyncRequest::default()
         };
 
-        let entry = build_synced_session_entry(&req).expect("synced session entry");
+        let entry = build_synced_session_entry(&req, &test_zone_name_to_id())
+            .expect("synced session entry");
         assert!(entry.metadata.fabric_ingress);
         assert!(entry.origin.is_peer_synced());
         assert_eq!(entry.metadata.owner_rg_id, 1);
@@ -1543,7 +1557,8 @@ mod tests {
             ..SessionSyncRequest::default()
         };
 
-        let entry = build_synced_session_entry(&req).expect("synced session entry");
+        let entry = build_synced_session_entry(&req, &test_zone_name_to_id())
+            .expect("synced session entry");
         assert_eq!(entry.decision.resolution.tunnel_endpoint_id, 3);
         assert_eq!(entry.decision.resolution.egress_ifindex, 586);
         assert_eq!(

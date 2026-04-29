@@ -446,6 +446,7 @@ impl FlowCache {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_zone_ids::*;
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::AtomicU32;
@@ -510,8 +511,8 @@ mod tests {
 
     fn make_metadata(owner_rg_id: i32) -> SessionMetadata {
         SessionMetadata {
-            ingress_zone: Arc::<str>::from("trust"),
-            egress_zone: Arc::<str>::from("untrust"),
+            ingress_zone: TEST_TRUST_ZONE_ID,
+            egress_zone: TEST_UNTRUST_ZONE_ID,
             owner_rg_id,
             fabric_ingress: false,
             is_reverse: false,
@@ -858,7 +859,7 @@ mod tests {
                 nptv6: false,
             },
         };
-        let ingress_zone = Some(Arc::<str>::from("trust"));
+        let ingress_zone = Some(3);
 
         // ForwardingState needs egress entry so owner_rg_for_resolution can
         // look up the redundancy_group for egress_ifindex=6.
@@ -945,7 +946,7 @@ mod tests {
         assert_eq!(entry.stamp.owner_rg_lease_until, 100);
 
         // Metadata carries ingress zone and owner RG.
-        assert_eq!(&*entry.metadata.ingress_zone, "trust");
+        assert_eq!(entry.metadata.ingress_zone, TEST_TRUST_ZONE_ID);
         assert_eq!(entry.metadata.owner_rg_id, 1);
         assert!(!entry.metadata.fabric_ingress);
     }
@@ -1045,7 +1046,7 @@ mod tests {
             validation,
             decision,
             2,
-            Some(Arc::<str>::from("trust")),
+            Some(3),
             Some(3),
             &forwarding,
             &BTreeMap::from([(

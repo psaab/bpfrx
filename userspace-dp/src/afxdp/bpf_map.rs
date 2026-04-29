@@ -1182,6 +1182,7 @@ pub(super) fn delete_session_map_entry_for_removed_session_with_origin(
 
 #[cfg(test)]
 mod tests {
+    use crate::test_zone_ids::*;
     use super::*;
 
     fn local_delivery_decision(tunnel_endpoint_id: u16) -> SessionDecision {
@@ -1203,8 +1204,8 @@ mod tests {
 
     fn synced_forward_metadata() -> SessionMetadata {
         SessionMetadata {
-            ingress_zone: Arc::<str>::from("trust"),
-            egress_zone: Arc::<str>::from("trust"),
+            ingress_zone: TEST_TRUST_ZONE_ID,
+            egress_zone: TEST_TRUST_ZONE_ID,
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,
@@ -1297,8 +1298,8 @@ mod tests {
             },
         };
         let metadata = SessionMetadata {
-            ingress_zone: Arc::<str>::from("lan"),
-            egress_zone: Arc::<str>::from("wan"),
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,

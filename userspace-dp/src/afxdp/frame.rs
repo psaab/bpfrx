@@ -3114,6 +3114,7 @@ pub(super) fn try_parse_metadata(area: &MmapArea, desc: XdpDesc) -> Option<Users
 mod tests {
     use super::super::test_fixtures::*;
     use super::*;
+    use crate::test_zone_ids::*;
 
     fn active_ha_runtime(now_secs: u64) -> HAGroupRuntime {
         HAGroupRuntime {
@@ -5107,7 +5108,7 @@ mod tests {
             &decision,
             &forwarding,
             Some(&flow),
-            Some(&Arc::<str>::from("wan")),
+            Some(TEST_WAN_ZONE_ID),
             true,
         )
         .expect("request");
