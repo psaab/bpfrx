@@ -1,4 +1,5 @@
 use crate::prefix::{PrefixV4, PrefixV6};
+use crate::prefix_set::{PrefixSetV4, PrefixSetV6};
 use crate::{PolicyApplicationSnapshot, PolicyRuleSnapshot};
 use ipnet::IpNet;
 use rustc_hash::FxHashMap;
@@ -46,10 +47,14 @@ impl Default for PolicyAction {
 pub(crate) struct PolicyRule {
     pub(crate) from_zone: String,
     pub(crate) to_zone: String,
-    pub(crate) source_v4: Vec<PrefixV4>,
-    pub(crate) source_v6: Vec<PrefixV6>,
-    pub(crate) destination_v4: Vec<PrefixV4>,
-    pub(crate) destination_v6: Vec<PrefixV6>,
+    /// #923: adaptive prefix set (MatchAny / Linear ≤16 / Trie >16).
+    /// Replaces the legacy `Vec<PrefixV*>` linear scan in
+    /// `nets_match_v4/v6`. Empty input collapses to `MatchAny`,
+    /// preserving the legacy `is_empty()` match-all behavior.
+    pub(crate) source_v4: PrefixSetV4,
+    pub(crate) source_v6: PrefixSetV6,
+    pub(crate) destination_v4: PrefixSetV4,
+    pub(crate) destination_v6: PrefixSetV6,
     pub(crate) applications: Vec<ApplicationMatch>,
     /// Precompiled application matcher (protocol-indexed, exact-port sets).
     compiled_apps: CompiledApplications,
@@ -62,10 +67,10 @@ impl Default for PolicyRule {
         Self {
             from_zone: String::new(),
             to_zone: String::new(),
-            source_v4: Vec::new(),
-            source_v6: Vec::new(),
-            destination_v4: Vec::new(),
-            destination_v6: Vec::new(),
+            source_v4: PrefixSetV4::default(),
+            source_v6: PrefixSetV6::default(),
+            destination_v4: PrefixSetV4::default(),
+            destination_v6: PrefixSetV6::default(),
             applications: Vec::new(),
             compiled_apps: CompiledApplications {
                 match_any: true,
@@ -209,18 +214,29 @@ pub(crate) fn parse_policy_state(
         global_indices: Vec::new(),
     };
     for snap in rules {
+        // #923: buffer prefixes in temporary Vecs, then collapse
+        // each side to a `PrefixSet*` (MatchAny / Linear / Trie)
+        // when the rule is fully parsed.
+        let mut src_v4: Vec<PrefixV4> = Vec::new();
+        let mut src_v6: Vec<PrefixV6> = Vec::new();
+        let mut dst_v4: Vec<PrefixV4> = Vec::new();
+        let mut dst_v6: Vec<PrefixV6> = Vec::new();
+        for prefix in &snap.source_addresses {
+            parse_address(prefix, &mut src_v4, &mut src_v6);
+        }
+        for prefix in &snap.destination_addresses {
+            parse_address(prefix, &mut dst_v4, &mut dst_v6);
+        }
         let mut rule = PolicyRule {
             from_zone: snap.from_zone.clone(),
             to_zone: snap.to_zone.clone(),
             action: parse_action(&snap.action),
+            source_v4: PrefixSetV4::from_prefixes(src_v4),
+            source_v6: PrefixSetV6::from_prefixes(src_v6),
+            destination_v4: PrefixSetV4::from_prefixes(dst_v4),
+            destination_v6: PrefixSetV6::from_prefixes(dst_v6),
             ..PolicyRule::default()
         };
-        for prefix in &snap.source_addresses {
-            parse_address(prefix, &mut rule.source_v4, &mut rule.source_v6);
-        }
-        for prefix in &snap.destination_addresses {
-            parse_address(prefix, &mut rule.destination_v4, &mut rule.destination_v6);
-        }
         rule.applications = parse_applications(&snap.application_terms);
         rule.compiled_apps = CompiledApplications::from_matches(&rule.applications);
         let idx = state.rules.len();
@@ -315,13 +331,13 @@ fn try_match_rule(
     }
     match (src_ip, dst_ip) {
         (IpAddr::V4(src), IpAddr::V4(dst))
-            if nets_match_v4(&rule.source_v4, src) && nets_match_v4(&rule.destination_v4, dst) =>
+            if rule.source_v4.contains(src) && rule.destination_v4.contains(dst) =>
         {
             rule.hit_count.fetch_add(1, Ordering::Relaxed);
             Some(rule.action)
         }
         (IpAddr::V6(src), IpAddr::V6(dst))
-            if nets_match_v6(&rule.source_v6, src) && nets_match_v6(&rule.destination_v6, dst) =>
+            if rule.source_v6.contains(src) && rule.destination_v6.contains(dst) =>
         {
             rule.hit_count.fetch_add(1, Ordering::Relaxed);
             Some(rule.action)
@@ -439,14 +455,6 @@ fn port_ranges_match(ranges: &[PortRange], port: u16) -> bool {
         || ranges
             .iter()
             .any(|range| port >= range.low && port <= range.high)
-}
-
-fn nets_match_v4(nets: &[PrefixV4], ip: Ipv4Addr) -> bool {
-    nets.is_empty() || nets.iter().any(|net| net.contains(ip))
-}
-
-fn nets_match_v6(nets: &[PrefixV6], ip: Ipv6Addr) -> bool {
-    nets.is_empty() || nets.iter().any(|net| net.contains(ip))
 }
 
 #[cfg(test)]
@@ -750,6 +758,50 @@ mod tests {
                 80,
             ),
             PolicyAction::Deny
+        );
+    }
+
+    /// #923: legacy permissive parse — addresses that fail to parse
+    /// are silently dropped by `parse_address`. If ALL configured
+    /// addresses are malformed the resulting Vec is empty, which
+    /// `PrefixSet::from_prefixes(Vec::new())` collapses to
+    /// `MatchAny` — preserving the legacy `Vec::is_empty()` =
+    /// match-all behavior. This is intentional; a strict-parse
+    /// follow-up issue tracks fixing the silent-drop.
+    #[test]
+    fn malformed_only_input_yields_match_all_via_evaluate_policy() {
+        let zones = test_zone_name_to_id();
+        let state = parse_policy_state(
+            "deny",
+            &[PolicyRuleSnapshot {
+                name: "permit-with-typo".into(),
+                from_zone: "lan".into(),
+                to_zone: "wan".into(),
+                source_addresses: vec![
+                    "totally-bogus".into(),
+                    "192.18.1/24".into(), // invalid (missing octet)
+                ],
+                destination_addresses: vec!["any".into()],
+                applications: vec!["any".into()],
+                application_terms: Vec::new(),
+                action: "permit".into(),
+            }],
+            &zones,
+        );
+        // The malformed source becomes MatchAny; an arbitrary src
+        // hits the rule and returns Permit.
+        assert_eq!(
+            evaluate_policy(
+                &state,
+                TEST_LAN_ZONE_ID,
+                TEST_WAN_ZONE_ID,
+                "8.8.8.8".parse().expect("src"),
+                "1.1.1.1".parse().expect("dst"),
+                PROTO_TCP,
+                12345,
+                80,
+            ),
+            PolicyAction::Permit
         );
     }
 }

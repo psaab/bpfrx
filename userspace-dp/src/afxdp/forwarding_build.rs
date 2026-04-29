@@ -464,8 +464,8 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
                 rule.from_zone,
                 rule.to_zone,
                 rule.action,
-                rule.source_v4.len(),
-                rule.destination_v4.len(),
+                rule.source_v4.prefix_count(),
+                rule.destination_v4.prefix_count(),
                 rule.applications.len(),
             );
         }
