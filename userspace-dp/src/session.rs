@@ -450,13 +450,15 @@ impl SessionTable {
     /// See docs/pr/965-session-gc-timer-wheel/plan.md for the full
     /// algorithm and complexity analysis.
     pub fn expire_stale_entries(&mut self, now_ns: u64) -> Vec<ExpiredSession> {
+        // Reset per-call stats BEFORE the gc-interval gate so that a
+        // gated no-op call returns zeroed stats rather than leftovers
+        // from a prior call (Codex impl-review round-2 non-blocking note).
+        self.last_pop_stats = WheelPopStats::default();
         if self.last_gc_ns != 0 && now_ns.saturating_sub(self.last_gc_ns) < SESSION_GC_INTERVAL_NS {
             return Vec::new();
         }
         self.last_gc_ns = now_ns;
         self.wheel_observe(now_ns);
-        // Reset per-call stats; tests read them via last_pop_stats().
-        self.last_pop_stats = WheelPopStats::default();
         let now_tick = now_ns / WHEEL_TICK_NS;
         let mut expired_entries: Vec<ExpiredSession> = Vec::new();
         while self.wheel.cursor_tick < now_tick {
