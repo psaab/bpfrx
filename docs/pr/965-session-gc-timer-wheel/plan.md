@@ -1,18 +1,30 @@
 # #965: bucketed timer-wheel session GC (replace O(N) scan)
 
-Plan v10 — 2026-04-29. Addresses Codex round-9 wording fixes
+Plan v11 — 2026-04-29. Addresses Codex round-10 wording fixes
+(task-mok33z3b-yg8x1d):
+
+α. CoS gate ambiguity resolved. The per-class table listed P=12
+   minimum throughput for every row, but the trailing prose said
+   "Hard gate on iperf-c only", which left CI behavior unclear.
+   Now: every P=12 row is a blocking gate (shaped-rate thresholds
+   at ≈ 90 % of each class's shape). P=1 stays as counter-only
+   smoke for non-iperf-c classes (single-stream variance makes a
+   hard P=1 throughput gate brittle for low-shape classes);
+   iperf-c keeps its historical P=1 ≥ 6 Gb/s hard gate.
+
+β. Stale top-of-doc version banner caught up with the round-9
+   work. The previous commit said "Plan v9 / round-8 fixes" while
+   the file already had v9-and-v10 changes; bumped to v11 with a
+   proper changelog stack.
+
+v10 — Addresses Codex round-9 wording fixes
 (task-mok2wa0n-cvx3es):
 
 i. CoS smoke gate enumerated per-class against the actual
    `test/incus/cos-iperf-config.set` fixture. Each iperf-{a,b,c,
    d,e,f} class plus best-effort gets its own P=12 throughput
    gate scaled to ≈ 90 % of its shape (iperf-c at 88 %, the
-   historical 25 g → 22 Gb/s smoke). All P=12 rows are blocking
-   gates; iperf-c also keeps the P=1 ≥ 6 Gb/s historical gate.
-   Other classes get a P=1 counter-only smoke (assert egress
-   queue counter increments by the iperf3 byte count) that
-   validates the classifier path lit up without imposing a
-   single-stream throughput gate.
+   historical 25 g → 22 Gb/s smoke).
 
 ii. v8 changelog header rewritten to reference the corrected
    sub-tick lag bounds (today ≤ 1 s; wheel ≤ 2 s; additional
