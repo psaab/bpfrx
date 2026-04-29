@@ -1,8 +1,26 @@
 # #956 Phase 3: extract cos/admission.rs from tx.rs
 
-Plan v3 — 2026-04-29. Addresses Codex round-2
-(task-mok8bo19-r2vheq), four MAJOR findings on top of the
-round-1 fixes that produced v2.
+Plan v4 — 2026-04-29. Addresses Codex round-3 (gpt-5.5
+local exec), three MINOR findings on top of v3.
+
+Round-3 changelog (v3 → v4):
+
+R3-1. Stale Round-2 wording at the (former) line 180 still
+said `tx -> admission` and "9 callers", contradicting the
+canonical section. Note rewritten to `admission -> tx` with
+the verified 91-occurrence count and a pointer to the
+canonical block below.
+
+R3-2. Inconsistency between two re-export wordings: one place
+said test-only items get `#[cfg(test)] pub(super) use` while
+the canonical section said the plan picks always-on. Picked
+always-on uniformly.
+
+R3-3. V-min vacate line reference was sloppy: dequeue resets
+MQFQ state at `tx.rs:4058` and vacates the shared V-min slot
+at `tx.rs:4069-4077`. Updated the precise line span.
+
+Round-2 changelog (v2 → v3):
 
 Round-2 changelog (v2 → v3):
 
@@ -179,9 +197,12 @@ fn promote_cos_queue_flow_fair(...) { ... }
 **Notes**:
 - `tx.rs` declares `pub(in crate::afxdp) const COS_MIN_BURST_BYTES`
   (was private). admission.rs imports it via
-  `use crate::afxdp::tx::COS_MIN_BURST_BYTES`. The `tx -> admission`
-  edge isn't ideal, but the const has 9 callers in `tx.rs` itself,
-  so leaving it there until a later cleanup is the smaller risk.
+  `use crate::afxdp::tx::COS_MIN_BURST_BYTES`, so the dependency
+  edge is `admission -> tx`. The const has 91 occurrences in
+  `tx.rs` itself (only 1 in moving admission code), so leaving it
+  there until a later cleanup is the smaller risk. See the
+  canonical block under "STAYS in `tx.rs`" below for the full
+  rationale.
 
 - The promotion-rationale doc block currently at `tx.rs:5401-5467`
   (Codex round-1 unrelated note) is separated from
@@ -197,8 +218,8 @@ fn promote_cos_queue_flow_fair(...) { ... }
   `flow_bucket_bytes`/`active_flow_buckets`):
   - `enqueue` updates MQFQ head/tail finish-time state
     at `tx.rs:4016`.
-  - `dequeue` resets that state and vacates the shared V-min slot
-    at `tx.rs:4058`.
+  - `dequeue` resets that state at `tx.rs:4058` and vacates the
+    shared V-min slot at `tx.rs:4069-4077`.
 
   **Decision**: keep in admission.rs in Phase 3, with explicit
   acknowledgment that `cos/admission.rs` ends up coupling three
@@ -214,7 +235,11 @@ fn promote_cos_queue_flow_fair(...) { ... }
   V-min state ends up living.
 
 `cos/mod.rs` re-exports the production-callable items via
-`pub(super) use`; test-only items get `#[cfg(test)] pub(super) use`.
+`pub(super) use`. Test-referenced items (`bdp_floor_bytes` and
+the four test-touched constants) are simply
+`pub(in crate::afxdp)` and re-exported always-on — see the
+canonical Visibility model section below for the rationale
+for picking always-on over `#[cfg(test)]`-gated re-exports.
 Tests stay in `tx::tests` — same Phase 1+2 pattern.
 
 ### Visibility model (corrected per Codex round-2 #1)
