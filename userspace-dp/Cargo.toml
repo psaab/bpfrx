@@ -33,7 +33,9 @@ harness = false
 
 # #923: config-commit latency gate for the worst-case prefix trie
 # build (256 random /32 prefixes → ~8K Box<TrieNode> allocations).
-# Gated on p95 ≤ 10 ms per plan §"Acceptance gates" #3.
+# Gated on p95 ≤ 1.5 ms (catches a 10× regression from the current
+# ~150 µs working point; tightened twice from the plan's initial
+# 10 ms target, see bench file header).
 [[bench]]
 name = "prefix_set_lookup"
 harness = false

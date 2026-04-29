@@ -1,9 +1,11 @@
 // #923 acceptance gate #3: config-commit latency on the worst-case
 // trie build (256 random /32 prefixes → ~8K Box<TrieNode> allocations).
-// Plan target: <2 ms p95 (tightened from the plan's initial 10 ms
-// after Codex round-2 noted 10 ms is too loose to catch a 10×
-// regression — first measurement on the dev VM was 148 µs, so 2 ms
-// gives ~14× headroom while still catching a 10× regression).
+// Plan target: <1.5 ms p95. Tightened from the plan's initial 10 ms
+// (Codex round-2) and again from a stated 2 ms (Codex round-3, which
+// observed that 2 ms doesn't actually catch a 10× regression from
+// the ~150 µs working point — 150 µs × 10 = 1.5 ms ≤ 2 ms passes).
+// 1.5 ms catches a 10× regression precisely; current measurements
+// (mean 122 µs, p95 169 µs) leave ~9× headroom under the gate.
 //
 // Like `tx_kick_latency`, the daemon code lives in a bin crate
 // (`xpf-userspace-dp` is a binary target with `pub(crate)`-only
@@ -85,10 +87,9 @@ fn main() {
     println!("  p50:  {} µs", p50_ns / 1_000);
     println!("  p95:  {} µs", p95_ns / 1_000);
     println!("  p99:  {} µs", p99_ns / 1_000);
-    // Acceptance gate: p95 ≤ 2 ms = 2_000_000 ns. Tighter than the
-    // plan's initial 10 ms because 10 ms doesn't catch a 10× regression
-    // from the current ~150 µs working point.
-    let p95_threshold_ns: u128 = 2_000_000;
+    // Acceptance gate: p95 ≤ 1.5 ms = 1_500_000 ns. Catches a 10×
+    // regression from the current ~150 µs working point.
+    let p95_threshold_ns: u128 = 1_500_000;
     if p95_ns > p95_threshold_ns {
         eprintln!(
             "FAIL: p95 {} ns > {} ns threshold; consider arena allocation",
@@ -96,5 +97,5 @@ fn main() {
         );
         std::process::exit(1);
     }
-    println!("PASS: p95 under 2 ms threshold");
+    println!("PASS: p95 under 1.5 ms threshold");
 }
