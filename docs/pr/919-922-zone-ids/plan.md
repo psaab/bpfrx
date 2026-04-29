@@ -1,6 +1,6 @@
 # #919 + #922: zone strings → integer IDs
 
-Plan v2 — 2026-04-29. Addresses Codex hostile review (task-mojjrpl5-u8ym7j, NEEDS-MAJOR).
+Plan v3 — 2026-04-29. Addresses Codex round-2 review (task-mojk78nr-8xwzo3): HA/session-sync import path missed; `_by_id` helper location.
 
 ## Combined scope
 
@@ -265,6 +265,93 @@ Those helpers are downstream of session metadata and need either:
 
 This plan does (a): adds `resolve_zone_encoded_fabric_redirect_by_id`.
 
+### HA / session-sync import path (added in v3)
+
+Codex round-2 caught: `userspace-dp/src/main.rs:857` builds
+`SessionMetadata` from a `SessionSyncRequest` whose
+`ingress_zone` / `egress_zone` fields are `String`. After this
+refactor, those need to become `u16` IDs.
+
+The wire protocol struct is `SessionSyncRequest`
+(`userspace-dp/src/protocol.rs:1664`):
+
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct SessionSyncRequest {
+    // ... existing fields ...
+    #[serde(rename = "ingress_zone", default)]
+    pub ingress_zone: String,
+    #[serde(rename = "egress_zone", default)]
+    pub egress_zone: String,
+    // ... + a near-duplicate struct around L1740-1760 ...
+}
+```
+
+**Approach** — additive wire change with backward compat:
+
+Add new `u16` fields beside the strings, both with
+`#[serde(default)]`:
+
+```rust
+pub struct SessionSyncRequest {
+    // ... existing fields ...
+    /// LEGACY (kept for HA peer compat): zone name. Populated by
+    /// older peers; new peers populate `ingress_zone_id` and may
+    /// leave this empty.
+    #[serde(rename = "ingress_zone", default)]
+    pub ingress_zone: String,
+    #[serde(rename = "egress_zone", default)]
+    pub egress_zone: String,
+    /// #919: zone IDs preferred over names. Populated by post-#919
+    /// peers. Older peers populate the string fields.
+    #[serde(rename = "ingress_zone_id", default)]
+    pub ingress_zone_id: u16,
+    #[serde(rename = "egress_zone_id", default)]
+    pub egress_zone_id: u16,
+}
+```
+
+**Build logic** in `main.rs:857`:
+
+```rust
+fn build_synced_session_entry(
+    req: &SessionSyncRequest,
+    forwarding: &ForwardingState,
+) -> Result<SyncedSessionEntry, String> {
+    let ingress_zone = if req.ingress_zone_id != 0 {
+        req.ingress_zone_id
+    } else {
+        forwarding
+            .zone_name_to_id
+            .get(req.ingress_zone.as_str())
+            .copied()
+            .unwrap_or(0)
+    };
+    let egress_zone = /* same */;
+    // ...
+}
+```
+
+**Compatibility window**: helper emits BOTH the legacy string AND
+the new u16 fields for one release cycle. Receiving side prefers
+ID when nonzero, falls back to name lookup. After all peers are on
+the new schema (operationally observable), the strings can be
+dropped in a follow-up PR.
+
+**Go side**: `pkg/dataplane/userspace/` builds and consumes
+`SessionSyncRequest` JSON. Need matching Go field additions.
+Affected files (Codex grep):
+
+- `pkg/dataplane/userspace/protocol.go` — Go mirror of
+  `SessionSyncRequest`. Add `IngressZoneID uint16` /
+  `EgressZoneID uint16`.
+- Any builder of `SessionSyncRequest` on the Go side. Go already
+  has the zone IDs available pre-stringify, so wiring them in is
+  small.
+
+This is **+~30 LOC + Go wire changes** beyond the v2 scope. Worth
+calling out as a separate "wire-protocol" sub-deliverable.
+
 ### `event_stream/codec.rs` u8 caveat
 
 Codex notes the codec writes a `u8` for zone IDs. At max 64 zones
@@ -279,13 +366,29 @@ invariant: zone IDs that need to cross the wire MUST fit in u8 (i.e.,
 2. **`forwarding_build.rs:80`**: reject zone IDs >= `ZONE_ID_RESERVED_MIN`. Pass `zone_name_to_id` to `parse_policy_state`.
 3. **`session.rs`**: change `SessionMetadata.{ingress,egress}_zone` to u16.
 4. **`forwarding.rs`**: add `zone_pair_ids_for_flow_with_override`. Convert `SessionMetadata` constructors at lines 362, 2692.
-5. **`shared_ops.rs`**: add `resolve_zone_encoded_fabric_redirect_by_id`. Update `shared_ops.rs:463-471` to use u16.
+5. **`forwarding.rs`** (per Codex round-2 minor): add
+   `resolve_zone_encoded_fabric_redirect_by_id` here, NOT in
+   `shared_ops.rs` — it lives beside the existing string variant.
+   Update `shared_ops.rs:463-471` to call the new id variant.
 6. **`session_glue.rs`**: update production callers (`:201, 409, 501, 1087, 1165`) and `SessionMetadata` constructors at `:896, 1271`.
 7. **`afxdp.rs`**: update `evaluate_policy` callers at `:1891, :2812`. Update debug logging at `:1335-1338` (look up name via `forwarding.zone_id_to_name` only for the actual log emit). Update gRPC export at `:3405-3406` (look up name).
 8. **`flow_cache.rs`**: update line 149 (`Option<Arc<str>>` parameter) → `Option<u16>`. Update constructors.
 9. **`bpf_map.rs:457-464`**: replace `zone_name_to_id.get(metadata.ingress_zone.as_ref())` round-trip with direct u16 use.
 10. **`event_stream/codec.rs:134-145`**: same.
-11. **`tests`**: ~73 test sites construct `SessionMetadata` with `Arc::<str>::from("name")` literals. Update each. Some tests construct a `forwarding` state with custom zones — those tests need to populate `zone_name_to_id` and `zone_id_to_name` accordingly.
+11. **`protocol.rs`** (added in v3): add `ingress_zone_id: u16` /
+    `egress_zone_id: u16` fields to `SessionSyncRequest` (both
+    instances around L1664 and L1740). Keep legacy string fields
+    for backward compat for one release.
+12. **`main.rs:857`** (added in v3): rewrite
+    `build_synced_session_entry` to prefer the new ID fields, fall
+    back to name lookup via `forwarding.zone_name_to_id`. Pass
+    `&forwarding` through.
+13. **Go side** (added in v3):
+    `pkg/dataplane/userspace/protocol.go` Go mirror — add
+    `IngressZoneID uint16` / `EgressZoneID uint16` fields. Update
+    any session-sync builder in `pkg/dataplane/userspace/` to emit
+    them. Go already has the IDs available pre-stringify.
+14. **`tests`**: ~73 test sites construct `SessionMetadata` with `Arc::<str>::from("name")` literals. Update each. Some tests construct a `forwarding` state with custom zones — those tests need to populate `zone_name_to_id` and `zone_id_to_name` accordingly.
 
 ## Test plan
 
