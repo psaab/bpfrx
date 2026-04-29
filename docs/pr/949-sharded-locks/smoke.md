@@ -74,9 +74,9 @@ the throughput delta above is.
 
 ## Test suite
 
-`cargo test --release`: **813 passed, 0 failed, 2 ignored.**
+`cargo test --release`: **814 passed, 0 failed, 2 ignored.**
 - 798 prior tests unchanged.
-- 15 new unit tests for `ShardedNeighborMap`:
+- 16 new unit tests for `ShardedNeighborMap`:
   - `get_returns_inserted_value`
   - `get_returns_none_for_missing_key`
   - `remove_clears_entry`
