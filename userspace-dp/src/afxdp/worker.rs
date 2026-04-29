@@ -1043,7 +1043,7 @@ pub(crate) fn worker_loop(
                         &recent_session_deltas,
                         &peer_worker_commands,
                         &event_stream,
-                        &forwarding.zone_name_to_id,
+                        forwarding.as_ref(),
                     );
                 }
             }
@@ -1069,7 +1069,7 @@ pub(crate) fn worker_loop(
                     &recent_session_deltas,
                     &peer_worker_commands,
                     &event_stream,
-                    &forwarding.zone_name_to_id,
+                    forwarding.as_ref(),
                 );
             }
         }

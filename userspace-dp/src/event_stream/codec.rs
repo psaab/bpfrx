@@ -61,7 +61,7 @@ impl EventFrame {
         key: &SessionKey,
         decision: &SessionDecision,
         metadata: &SessionMetadata,
-        zone_name_to_id: &FxHashMap<String, u16>,
+        _zone_name_to_id: &FxHashMap<String, u16>,
         fabric_redirect_sync: bool,
     ) -> Self {
         let mut buf = [0u8; 256];
@@ -131,18 +131,27 @@ impl EventFrame {
         pos += 1;
 
         // [21] IngressZoneID u8
-        let ingress_id = zone_name_to_id
-            .get(metadata.ingress_zone.as_ref())
-            .copied()
-            .unwrap_or(0) as u8;
+        // #919/#922: SessionMetadata.ingress_zone is now u16 directly;
+        // no name→id round-trip. Wire format remains u8 — assert this
+        // at debug time. forwarding_build.rs:80 enforces zone IDs
+        // ≤ ZONE_ID_RESERVED_MIN-1 ≪ 256 by construction (Go assigns
+        // i+1 capped at MAX_ZONES=64).
+        debug_assert!(
+            metadata.ingress_zone < 256,
+            "zone id {} exceeds wire u8 capacity",
+            metadata.ingress_zone
+        );
+        let ingress_id = metadata.ingress_zone as u8;
         buf[pos] = ingress_id;
         pos += 1;
 
         // [22] EgressZoneID u8
-        let egress_id = zone_name_to_id
-            .get(metadata.egress_zone.as_ref())
-            .copied()
-            .unwrap_or(0) as u8;
+        debug_assert!(
+            metadata.egress_zone < 256,
+            "zone id {} exceeds wire u8 capacity",
+            metadata.egress_zone
+        );
+        let egress_id = metadata.egress_zone as u8;
         buf[pos] = egress_id;
         pos += 1;
 
@@ -183,11 +192,17 @@ impl EventFrame {
     }
 
     /// Encode a SessionClose (type 2) frame -- minimal payload.
+    /// #919/#922: extended with u8 ingress_zone_id + u8 egress_zone_id
+    /// after the flags byte. Old daemons that don't read those bytes
+    /// see them as trailing payload (the frame length lets them
+    /// length-skip), so this is wire-additive within the same MSG type.
     pub(crate) fn encode_session_close(
         seq: u64,
         key: &SessionKey,
         owner_rg_id: i32,
         close_flags: u8,
+        ingress_zone_id: u16,
+        egress_zone_id: u16,
     ) -> Self {
         let mut buf = [0u8; 256];
         let mut pos = FRAME_HEADER_SIZE;
@@ -220,6 +235,14 @@ impl EventFrame {
 
         // Flags
         buf[pos] = close_flags;
+        pos += 1;
+
+        // #919/#922: IngressZoneID u8, EgressZoneID u8.
+        debug_assert!(ingress_zone_id < 256, "zone id {ingress_zone_id} > u8");
+        debug_assert!(egress_zone_id < 256, "zone id {egress_zone_id} > u8");
+        buf[pos] = ingress_zone_id as u8;
+        pos += 1;
+        buf[pos] = egress_zone_id as u8;
         pos += 1;
 
         let payload_len = (pos - FRAME_HEADER_SIZE) as u32;
@@ -338,8 +361,8 @@ mod tests {
     use super::*;
     use crate::afxdp::ForwardingResolution;
     use crate::nat::NatDecision;
+    use crate::test_zone_ids::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
-    use std::sync::Arc;
 
     fn test_zone_map() -> FxHashMap<String, u16> {
         let mut m = FxHashMap::default();
@@ -397,8 +420,8 @@ mod tests {
 
     fn test_metadata() -> SessionMetadata {
         SessionMetadata {
-            ingress_zone: Arc::from("trust"),
-            egress_zone: Arc::from("untrust"),
+            ingress_zone: TEST_TRUST_ZONE_ID,
+            egress_zone: TEST_UNTRUST_ZONE_ID,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -440,8 +463,8 @@ mod tests {
         assert_eq!(i16::from_le_bytes([p[12], p[13]]), 3); // EgressIfindex
         assert_eq!(i16::from_le_bytes([p[14], p[15]]), 3); // TXIfindex
         assert_eq!(p[20], 0); // Flags (no fabric redirect, no fabric ingress)
-        assert_eq!(p[21], 1); // IngressZoneID (trust=1)
-        assert_eq!(p[22], 2); // EgressZoneID (untrust=2)
+        assert_eq!(p[21], TEST_TRUST_ZONE_ID as u8); // IngressZoneID
+        assert_eq!(p[22], TEST_UNTRUST_ZONE_ID as u8); // EgressZoneID
         assert_eq!(p[23], DISP_FORWARD_CANDIDATE); // Disposition
     }
 
@@ -469,7 +492,14 @@ mod tests {
 
     #[test]
     fn test_encode_session_close_v4() {
-        let frame = EventFrame::encode_session_close(7, &test_key_v4(), 1, FLAG_FABRIC_REDIRECT);
+        let frame = EventFrame::encode_session_close(
+            7,
+            &test_key_v4(),
+            1,
+            FLAG_FABRIC_REDIRECT,
+            TEST_TRUST_ZONE_ID,
+            TEST_UNTRUST_ZONE_ID,
+        );
 
         assert_eq!(frame.data[4], MSG_SESSION_CLOSE);
         assert_eq!(frame.seq, 7);
@@ -479,12 +509,14 @@ mod tests {
         assert_eq!(p[1], 6); // Protocol
         assert_eq!(u16::from_le_bytes([p[2], p[3]]), 12345); // SrcPort
         assert_eq!(u16::from_le_bytes([p[4], p[5]]), 80); // DstPort
-        // After addresses (4+4 = 8 bytes starting at p[6]):
         // p[6..10] SrcIP, p[10..14] DstIP
         // p[14..16] OwnerRGID
         assert_eq!(i16::from_le_bytes([p[14], p[15]]), 1);
         // p[16] Flags
         assert_eq!(p[16], FLAG_FABRIC_REDIRECT);
+        // #919/#922: p[17] IngressZoneID, p[18] EgressZoneID
+        assert_eq!(p[17], TEST_TRUST_ZONE_ID as u8);
+        assert_eq!(p[18], TEST_UNTRUST_ZONE_ID as u8);
     }
 
     #[test]
@@ -510,8 +542,8 @@ mod tests {
             key: test_key_v4(),
             decision: test_decision(),
             metadata: SessionMetadata {
-                ingress_zone: Arc::from("trust"),
-                egress_zone: Arc::from("untrust"),
+                ingress_zone: TEST_TRUST_ZONE_ID,
+                egress_zone: TEST_UNTRUST_ZONE_ID,
                 owner_rg_id: 0,
                 fabric_ingress: true,
                 is_reverse: false,

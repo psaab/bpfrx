@@ -203,6 +203,7 @@ pub(super) fn enqueue_pending_forwards(
                         request.decision,
                         recent_exceptions,
                         "slow_path",
+                        forwarding,
                     );
                 } else {
                     maybe_reinject_slow_path(
@@ -215,6 +216,7 @@ pub(super) fn enqueue_pending_forwards(
                         request.meta,
                         request.decision,
                         recent_exceptions,
+                        forwarding,
                     );
                 }
                 recycle_ingress_frame(ingress_binding, source_offset, now_ns);
@@ -236,6 +238,7 @@ pub(super) fn enqueue_pending_forwards(
                 request.desc.len,
                 None,
                 None,
+            forwarding,
             );
             recycle_ingress_frame(ingress_binding, source_offset, now_ns);
             continue;
@@ -318,6 +321,7 @@ pub(super) fn enqueue_pending_forwards(
                                     frame.len() as u32,
                                     Some(request.meta.into()),
                                     None,
+                                forwarding,
                                 );
                                 build_failed = true;
                                 break;
@@ -485,6 +489,7 @@ pub(super) fn enqueue_pending_forwards(
                                             frame.len() as u32,
                                             Some(request.meta.into()),
                                             None,
+                                        forwarding,
                                         );
                                         // Don't continue — the frame was built successfully,
                                         // forward it anyway. Mismatch is diagnostic only.
@@ -499,6 +504,7 @@ pub(super) fn enqueue_pending_forwards(
                                         cp1_len as u32,
                                         Some(request.meta.into()),
                                         None,
+                                    forwarding,
                                     );
                                     continue;
                                 }
@@ -635,6 +641,7 @@ pub(super) fn enqueue_pending_forwards(
                                         written as u32,
                                         Some(request.meta.into()),
                                         None,
+                                    forwarding,
                                     );
                                     build_failed = true;
                                 }
@@ -651,6 +658,7 @@ pub(super) fn enqueue_pending_forwards(
                                     written as u32,
                                     Some(request.meta.into()),
                                     None,
+                                forwarding,
                                 );
                                 true
                             } else {
@@ -740,6 +748,7 @@ pub(super) fn enqueue_pending_forwards(
                                             frame.len() as u32,
                                             Some(request.meta.into()),
                                             None,
+                                        forwarding,
                                         );
                                         // Don't continue — the frame was built successfully,
                                         // forward it anyway. Mismatch is diagnostic only.
@@ -754,6 +763,7 @@ pub(super) fn enqueue_pending_forwards(
                                         cp2_len as u32,
                                         Some(request.meta.into()),
                                         None,
+                                    forwarding,
                                     );
                                     continue;
                                 }
@@ -829,6 +839,7 @@ pub(super) fn enqueue_pending_forwards(
                 request.meta,
                 request.decision,
                 fallback_to_slow_path,
+                forwarding,
             );
             if !retained_source_frame {
                 recycle_ingress_frame(ingress_binding, source_offset, now_ns);
@@ -887,6 +898,7 @@ pub(super) fn handle_forward_build_failure(
     meta: impl Into<UserspaceDpMeta>,
     decision: SessionDecision,
     fallback_to_slow_path: bool,
+    forwarding: &ForwardingState,
 ) {
     let meta = meta.into();
     dbg.build_fail += 1;
@@ -906,6 +918,7 @@ pub(super) fn handle_forward_build_failure(
         packet_length,
         Some(meta),
         None,
+    forwarding,
     );
     if fallback_to_slow_path {
         maybe_reinject_slow_path_from_frame(
@@ -918,6 +931,7 @@ pub(super) fn handle_forward_build_failure(
             decision,
             recent_exceptions,
             "forward_build_slow_path",
+            forwarding,
         );
     }
 }
@@ -983,6 +997,7 @@ pub(super) fn maybe_reinject_slow_path(
     meta: impl Into<UserspaceDpMeta>,
     decision: SessionDecision,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    forwarding: &ForwardingState,
 ) {
     let meta = meta.into();
     if !matches!(
@@ -1003,6 +1018,7 @@ pub(super) fn maybe_reinject_slow_path(
             desc.len as u32,
             Some(meta),
             None,
+        forwarding,
         );
         return;
     };
@@ -1016,6 +1032,7 @@ pub(super) fn maybe_reinject_slow_path(
         decision,
         recent_exceptions,
         "slow_path",
+        forwarding,
     );
 }
 
@@ -1029,6 +1046,7 @@ pub(super) fn maybe_reinject_slow_path_from_frame(
     decision: SessionDecision,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     reason: &str,
+    forwarding: &ForwardingState,
 ) {
     let meta = meta.into();
     let Some(packet) = extract_l3_packet_with_nat(frame, meta, decision.nat) else {
@@ -1040,6 +1058,7 @@ pub(super) fn maybe_reinject_slow_path_from_frame(
             frame.len() as u32,
             Some(meta),
             None,
+        forwarding,
         );
         return;
     };
@@ -1068,6 +1087,7 @@ pub(super) fn maybe_reinject_slow_path_from_frame(
                     frame.len() as u32,
                     Some(meta),
                     None,
+                forwarding,
                 );
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
@@ -1079,6 +1099,7 @@ pub(super) fn maybe_reinject_slow_path_from_frame(
                     frame.len() as u32,
                     Some(meta),
                     None,
+                forwarding,
                 );
             }
         }
@@ -1094,6 +1115,7 @@ pub(super) fn maybe_reinject_slow_path_from_frame(
             frame.len() as u32,
             Some(meta),
             None,
+        forwarding,
         );
         return;
     };
@@ -1111,6 +1133,7 @@ pub(super) fn maybe_reinject_slow_path_from_frame(
                 frame.len() as u32,
                 Some(meta),
                 None,
+            forwarding,
             );
         }
         Ok(EnqueueOutcome::QueueFull) => {
@@ -1122,6 +1145,7 @@ pub(super) fn maybe_reinject_slow_path_from_frame(
                 frame.len() as u32,
                 Some(meta),
                 None,
+            forwarding,
             );
         }
         Err(err) => {
@@ -1134,6 +1158,7 @@ pub(super) fn maybe_reinject_slow_path_from_frame(
                 frame.len() as u32,
                 Some(meta),
                 None,
+            forwarding,
             );
         }
     }

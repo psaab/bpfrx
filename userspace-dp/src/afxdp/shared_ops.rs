@@ -460,15 +460,15 @@ pub(super) fn build_reverse_session_from_forward_match(
         ha_state,
         dynamic_neighbors,
         forward_match.key.src_ip,
-        forward_match.metadata.ingress_zone.as_ref(),
+        forward_match.metadata.ingress_zone,
         requires_fabric_return,
         now_secs,
         forward_match.decision.resolution.tunnel_endpoint_id != 0
             && now_secs <= ha_startup_grace_until_secs,
     );
     let metadata = SessionMetadata {
-        ingress_zone: forward_match.metadata.egress_zone.clone(),
-        egress_zone: forward_match.metadata.ingress_zone.clone(),
+        ingress_zone: forward_match.metadata.egress_zone,
+        egress_zone: forward_match.metadata.ingress_zone,
         // Reverse companions are owned by the RG that currently owns the
         // client-side egress resolution, not necessarily the RG that owned the
         // original forward session. This matters during failback when a second
@@ -530,7 +530,7 @@ pub(super) fn reverse_resolution_for_session(
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
     dynamic_neighbors: &Arc<ShardedNeighborMap>,
     target_ip: IpAddr,
-    ingress_zone: &str,
+    ingress_zone: u16,
     fabric_ingress: bool,
     now_secs: u64,
     allow_unseeded_tunnel_local: bool,
@@ -546,7 +546,8 @@ pub(super) fn reverse_resolution_for_session(
             ha_state.get(&owner_rg_id),
             Some(group) if group.is_forwarding_active(now_secs)
         )
-        && let Some(redirect) = resolve_zone_encoded_fabric_redirect(forwarding, ingress_zone)
+        && let Some(redirect) =
+            super::forwarding::resolve_zone_encoded_fabric_redirect_by_id(forwarding, ingress_zone)
     {
         return redirect;
     }

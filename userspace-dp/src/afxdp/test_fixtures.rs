@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_zone_ids::*;
 use crate::{
     FabricSnapshot, FirewallFilterSnapshot, FirewallTermSnapshot, InterfaceAddressSnapshot,
     InterfaceSnapshot, NeighborSnapshot, PolicyRuleSnapshot, RouteSnapshot, SourceNATRuleSnapshot,
@@ -9,7 +10,7 @@ pub(super) fn forwarding_snapshot(include_neighbor: bool) -> ConfigSnapshot {
     ConfigSnapshot {
         zones: vec![ZoneSnapshot {
             name: "wan".to_string(),
-            id: 1,
+            id: TEST_WAN_ZONE_ID,
         }],
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/0.50".to_string(),
@@ -92,11 +93,11 @@ pub(super) fn native_gre_snapshot(include_neighbor: bool) -> ConfigSnapshot {
         zones: vec![
             ZoneSnapshot {
                 name: "wan".to_string(),
-                id: 1,
+                id: TEST_WAN_ZONE_ID,
             },
             ZoneSnapshot {
                 name: "sfmix".to_string(),
-                id: 2,
+                id: TEST_SFMIX_ZONE_ID,
             },
         ],
         interfaces: vec![
@@ -191,7 +192,7 @@ pub(super) fn native_gre_pbr_snapshot(include_neighbor: bool) -> ConfigSnapshot 
         0,
         ZoneSnapshot {
             name: "lan".to_string(),
-            id: 3,
+            id: TEST_LAN_ZONE_ID,
         },
     );
     snapshot.interfaces.push(InterfaceSnapshot {
@@ -332,11 +333,11 @@ pub(super) fn nat_snapshot() -> ConfigSnapshot {
         zones: vec![
             ZoneSnapshot {
                 name: "lan".to_string(),
-                id: 1,
+                id: TEST_LAN_ZONE_ID,
             },
             ZoneSnapshot {
                 name: "wan".to_string(),
-                id: 2,
+                id: TEST_WAN_ZONE_ID,
             },
         ],
         interfaces: vec![
@@ -565,11 +566,11 @@ pub(super) fn static_nat_snapshot() -> ConfigSnapshot {
         zones: vec![
             ZoneSnapshot {
                 name: "trust".to_string(),
-                id: 1,
+                id: TEST_TRUST_ZONE_ID,
             },
             ZoneSnapshot {
                 name: "untrust".to_string(),
-                id: 2,
+                id: TEST_UNTRUST_ZONE_ID,
             },
         ],
         interfaces: vec![

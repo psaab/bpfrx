@@ -170,7 +170,7 @@ pub(super) fn build_local_origin_tunnel_tx_request(
     if resolution.disposition != ForwardingDisposition::ForwardCandidate {
         return Err(format!(
             "local_tunnel_resolution:{}",
-            resolution.status(None).disposition
+            resolution.status(None, forwarding).disposition
         ));
     }
     let decision = SessionDecision {
@@ -179,19 +179,21 @@ pub(super) fn build_local_origin_tunnel_tx_request(
     };
     let flow = parse_session_flow_from_bytes(&inner_frame, meta)
         .ok_or_else(|| "parse_local_origin_session_flow_failed".to_string())?;
-    let zone = forwarding
+    // #919: zone IDs throughout. Look up the egress interface's zone
+    // name and translate to a u16 ID.
+    let zone_id = forwarding
         .egress
         .get(&decision.resolution.egress_ifindex)
-        .map(|iface| Arc::<str>::from(iface.zone.as_str()))
-        .unwrap_or_else(|| Arc::<str>::from(""));
+        .and_then(|iface| forwarding.zone_name_to_id.get(iface.zone.as_str()).copied())
+        .unwrap_or(0);
     let bytes = encapsulate_native_gre_frame(&inner_frame, meta, &decision, forwarding)
         .ok_or_else(|| "encapsulate_native_gre_frame_failed".to_string())?;
     let session_entry = SyncedSessionEntry {
         key: flow.forward_key,
         decision,
         metadata: SessionMetadata {
-            ingress_zone: zone.clone(),
-            egress_zone: zone,
+            ingress_zone: zone_id,
+            egress_zone: zone_id,
             owner_rg_id: owner_rg_for_resolution(forwarding, decision.resolution),
             fabric_ingress: false,
             is_reverse: false,

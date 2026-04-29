@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 // EventStream manages the daemon-side event socket for receiving session events
@@ -420,6 +422,21 @@ func (es *EventStream) writeFrame(typ uint8, seq uint64, payload []byte) error {
 //	[N..]   NeighborMAC (6 bytes)
 //	[N+6..] SrcMAC (6 bytes)
 //	[N+12..]NextHop (4 or 16 bytes)
+// wireAFToDataplane maps the 1-byte wire encoding (4 = IPv4, 6 = IPv6
+// — chosen by the Rust codec to match the protocol number; see
+// userspace-dp/src/event_stream/codec.rs:88) to the Linux dataplane
+// constants used throughout the Go side (`AFInet` = 2, `AFInet6` = 10).
+// Returns 0 for unknown values; callers reject 0.
+func wireAFToDataplane(wire uint8) uint8 {
+	switch wire {
+	case 4:
+		return dataplane.AFInet
+	case 6:
+		return dataplane.AFInet6
+	}
+	return 0
+}
+
 func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 	if len(payload) < 24 {
 		return SessionDeltaInfo{}, false
@@ -444,8 +461,15 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 
 	flags := payload[20]
 
+	// #919/#922: normalise the wire AF (4/6) to the dataplane AF
+	// constants (2/10) consumed by daemon_ha_userspace.go's switch.
+	dpAF := wireAFToDataplane(af)
+	if dpAF == 0 {
+		return SessionDeltaInfo{}, false
+	}
+
 	d := SessionDeltaInfo{
-		AddrFamily:       af,
+		AddrFamily:       dpAF,
 		Protocol:         payload[1],
 		SrcPort:          binary.LittleEndian.Uint16(payload[2:4]),
 		DstPort:          binary.LittleEndian.Uint16(payload[4:6]),
@@ -456,8 +480,13 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 		TXIfindex:        int(int16(binary.LittleEndian.Uint16(payload[14:16]))),
 		TunnelEndpointID: binary.LittleEndian.Uint16(payload[16:18]),
 		TXVLANID:         binary.LittleEndian.Uint16(payload[18:20]),
-		FabricRedirect:   flags&SessionEventFlagFabricRedirect != 0,
-		FabricIngress:    flags&SessionEventFlagFabricIngress != 0,
+		// #919/#922: bytes [21]/[22] are u8 ingress/egress zone IDs
+		// written by the Rust codec at event_stream/codec.rs:144-156.
+		// Promote to uint16 for symmetry with SessionSyncRequest.
+		IngressZoneID:  uint16(payload[21]),
+		EgressZoneID:   uint16(payload[22]),
+		FabricRedirect: flags&SessionEventFlagFabricRedirect != 0,
+		FabricIngress:  flags&SessionEventFlagFabricIngress != 0,
 	}
 
 	// Disposition mapping: 0=Accept, 1=LocalDelivery
@@ -517,14 +546,20 @@ func decodeSessionCloseEvent(payload []byte) (SessionDeltaInfo, bool) {
 		return SessionDeltaInfo{}, false
 	}
 
-	// 6 (fixed) + 2*addrSize + 2 (OwnerRGID) + 1 (Flags)
-	minLen := 6 + 2*addrSize + 3
-	if len(payload) < minLen {
+	// Legacy minimum: 6 (fixed) + 2*addrSize + 2 (OwnerRGID) + 1 (Flags).
+	// New helpers append +2 (ZoneIDs); accept both for rolling upgrade.
+	legacyMin := 6 + 2*addrSize + 3
+	if len(payload) < legacyMin {
+		return SessionDeltaInfo{}, false
+	}
+
+	dpAF := wireAFToDataplane(af)
+	if dpAF == 0 {
 		return SessionDeltaInfo{}, false
 	}
 
 	d := SessionDeltaInfo{
-		AddrFamily: af,
+		AddrFamily: dpAF,
 		Protocol:   payload[1],
 		SrcPort:    binary.LittleEndian.Uint16(payload[2:4]),
 		DstPort:    binary.LittleEndian.Uint16(payload[4:6]),
@@ -538,8 +573,17 @@ func decodeSessionCloseEvent(payload []byte) (SessionDeltaInfo, bool) {
 	d.OwnerRGID = int(int16(binary.LittleEndian.Uint16(payload[off : off+2])))
 	off += 2
 	flags := payload[off]
+	off++
 	d.FabricRedirect = flags&SessionEventFlagFabricRedirect != 0
 	d.FabricIngress = flags&SessionEventFlagFabricIngress != 0
+	// #919/#922: zone IDs are present iff the helper sent the +2-byte
+	// trailer. Older helpers leave them as 0 and the daemon falls back
+	// to the legacy zone-name string (empty for close events, which
+	// drops the close, matching pre-#919 behavior on a malformed close).
+	if len(payload) >= off+2 {
+		d.IngressZoneID = uint16(payload[off])
+		d.EgressZoneID = uint16(payload[off+1])
+	}
 
 	return d, true
 }

@@ -77,6 +77,31 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
         if zone.id == 0 || zone.name.is_empty() {
             continue;
         }
+        // #919/#922: reserve the top of the u16 space for the
+        // `JUNOS_GLOBAL_ZONE_ID` sentinel. Reject any snapshot that
+        // would collide.
+        if zone.id >= crate::policy::ZONE_ID_RESERVED_MIN {
+            eprintln!(
+                "xpf-userspace-dp: zone {:?} has reserved id {}; skipping (max usable id is {})",
+                zone.name,
+                zone.id,
+                crate::policy::ZONE_ID_RESERVED_MIN - 1
+            );
+            continue;
+        }
+        // #919/#922: defense-in-depth. The event-stream codec writes
+        // zone IDs as u8 (release builds elide the debug_assert). A
+        // hostile or future malformed snapshot with id > 255 would
+        // silently corrupt wire-level zone IDs without this gate.
+        if zone.id > u8::MAX as u16 {
+            eprintln!(
+                "xpf-userspace-dp: zone {:?} has id {} > wire u8 max {}; skipping",
+                zone.name,
+                zone.id,
+                u8::MAX
+            );
+            continue;
+        }
         state.zone_name_to_id.insert(zone.name.clone(), zone.id);
         state.zone_id_to_name.insert(zone.id, zone.name.clone());
     }
@@ -332,7 +357,11 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
             local_mac,
         });
     }
-    state.policy = parse_policy_state(&snapshot.default_policy, &snapshot.policies);
+    state.policy = parse_policy_state(
+        &snapshot.default_policy,
+        &snapshot.policies,
+        &state.zone_name_to_id,
+    );
     state.allow_dns_reply = snapshot.flow.allow_dns_reply;
     state.allow_embedded_icmp = snapshot.flow.allow_embedded_icmp;
     state.session_timeouts = crate::session::SessionTimeouts::from_seconds(
@@ -1110,6 +1139,37 @@ mod tests {
         let state = build_forwarding_state(&snapshot);
         assert!(state.tx_selection_enabled_v4);
         assert!(state.tx_selection_enabled_v6);
+    }
+
+    /// #919/#922: any zone with id ≥ ZONE_ID_RESERVED_MIN must be
+    /// dropped at config-build time so a hostile/buggy snapshot cannot
+    /// collide with the JUNOS_GLOBAL_ZONE_ID sentinel (u16::MAX).
+    #[test]
+    fn build_forwarding_state_rejects_reserved_zone_ids() {
+        use crate::ZoneSnapshot;
+        let snapshot = ConfigSnapshot {
+            zones: vec![
+                ZoneSnapshot {
+                    name: "ok".into(),
+                    id: 5,
+                },
+                ZoneSnapshot {
+                    name: "reserved-edge".into(),
+                    id: crate::policy::ZONE_ID_RESERVED_MIN,
+                },
+                ZoneSnapshot {
+                    name: "global-sentinel".into(),
+                    id: crate::policy::JUNOS_GLOBAL_ZONE_ID,
+                },
+            ],
+            ..Default::default()
+        };
+        let state = build_forwarding_state(&snapshot);
+        assert_eq!(state.zone_name_to_id.get("ok").copied(), Some(5));
+        assert!(state.zone_name_to_id.get("reserved-edge").is_none());
+        assert!(state.zone_name_to_id.get("global-sentinel").is_none());
+        assert!(state.zone_id_to_name.get(&crate::policy::ZONE_ID_RESERVED_MIN).is_none());
+        assert!(state.zone_id_to_name.get(&crate::policy::JUNOS_GLOBAL_ZONE_ID).is_none());
     }
 }
 

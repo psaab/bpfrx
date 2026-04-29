@@ -98,10 +98,17 @@ pub(crate) struct SessionDecision {
     pub(crate) nat: NatDecision,
 }
 
+/// #919: zone names dropped from the fast path. `ingress_zone` and
+/// `egress_zone` are now `u16` IDs that index into
+/// `forwarding.zone_id_to_name` for slow-path consumers (logging,
+/// gRPC export, status). `0` means "unknown / unset" (matches the
+/// existing `UserspaceDpMeta.ingress_zone` default at types.rs:64).
+/// Removing the `Arc<str>` saves 28 bytes per `SessionMetadata` and
+/// eliminates the `LOCK XADD` atomic on every `metadata.clone()`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionMetadata {
-    pub(crate) ingress_zone: Arc<str>,
-    pub(crate) egress_zone: Arc<str>,
+    pub(crate) ingress_zone: u16,
+    pub(crate) egress_zone: u16,
     pub(crate) owner_rg_id: i32,
     pub(crate) fabric_ingress: bool,
     pub(crate) is_reverse: bool,
@@ -1082,6 +1089,7 @@ pub(crate) fn reverse_canonical_key(forward_key: &SessionKey, _nat: NatDecision)
 
 #[cfg(test)]
 mod tests {
+    use crate::test_zone_ids::*;
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -1130,8 +1138,8 @@ mod tests {
 
     fn metadata() -> SessionMetadata {
         SessionMetadata {
-            ingress_zone: Arc::<str>::from("lan"),
-            egress_zone: Arc::<str>::from("wan"),
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,

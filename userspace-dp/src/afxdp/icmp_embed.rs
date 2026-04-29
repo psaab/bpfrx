@@ -750,9 +750,9 @@ pub(super) fn finalize_embedded_icmp_resolution(
                 | ForwardingDisposition::DiscardRoute
         )
     {
-        if let Some(redirect) = resolve_zone_encoded_fabric_redirect(
+        if let Some(redirect) = resolve_zone_encoded_fabric_redirect_by_id(
             forwarding,
-            icmp_match.metadata.ingress_zone.as_ref(),
+            icmp_match.metadata.ingress_zone,
         ) {
             return redirect;
         }

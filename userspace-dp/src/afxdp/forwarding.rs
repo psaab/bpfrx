@@ -149,6 +149,45 @@ pub(super) fn zone_pair_for_flow_with_override(
     (from_zone, to_zone)
 }
 
+/// #919/#922: zero-allocation production zone-pair resolver. Returns
+/// `(from_id, to_id)` u16 pair directly without `String` materialisation.
+/// `ingress_zone_override` is `Option<u16>` (parsed from fabric MAC),
+/// not `Option<&str>` — callers no longer round-trip through names.
+/// Returns `(0, 0)` segments for ifindexes not in the zone maps; the
+/// caller treats `0` as "unknown" and falls back to default policy.
+#[inline]
+pub(super) fn zone_pair_ids_for_flow_with_override(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    ingress_zone_override: Option<u16>,
+    egress_ifindex: i32,
+) -> (u16, u16) {
+    let from_id = ingress_zone_override
+        .or_else(|| {
+            forwarding
+                .ifindex_to_zone
+                .get(&ingress_ifindex)
+                .and_then(|name| forwarding.zone_name_to_id.get(name.as_str()).copied())
+        })
+        .unwrap_or(0);
+    let to_id = forwarding
+        .egress
+        .get(&egress_ifindex)
+        .and_then(|iface| forwarding.zone_name_to_id.get(iface.zone.as_str()).copied())
+        .unwrap_or(0);
+    (from_id, to_id)
+}
+
+/// #919/#922 test convenience: ID-pair without override.
+#[cfg(test)]
+pub(super) fn zone_pair_ids_for_flow(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    egress_ifindex: i32,
+) -> (u16, u16) {
+    zone_pair_ids_for_flow_with_override(forwarding, ingress_ifindex, None, egress_ifindex)
+}
+
 pub(super) fn allow_unsolicited_dns_reply(
     forwarding: &ForwardingState,
     flow: &SessionFlow,
@@ -260,8 +299,18 @@ pub(super) fn resolve_zone_encoded_fabric_redirect(
     forwarding: &ForwardingState,
     ingress_zone: &str,
 ) -> Option<ForwardingResolution> {
-    let mut resolution = resolve_fabric_redirect(forwarding)?;
     let zone_id = forwarding.zone_name_to_id.get(ingress_zone).copied()?;
+    resolve_zone_encoded_fabric_redirect_by_id(forwarding, zone_id)
+}
+
+/// #919/#922: ID-keyed variant of `resolve_zone_encoded_fabric_redirect`.
+/// Avoids the name-string round-trip when the caller already has a u16
+/// zone ID (e.g. from `SessionMetadata.ingress_zone`).
+pub(super) fn resolve_zone_encoded_fabric_redirect_by_id(
+    forwarding: &ForwardingState,
+    zone_id: u16,
+) -> Option<ForwardingResolution> {
+    let mut resolution = resolve_fabric_redirect(forwarding)?;
     if zone_id == 0 || zone_id > u8::MAX as u16 {
         return None;
     }
@@ -332,7 +381,7 @@ pub(super) fn cluster_peer_return_fast_path(
     dynamic_neighbors: &Arc<ShardedNeighborMap>,
     packet_frame: &[u8],
     meta: UserspaceDpMeta,
-    ingress_zone_override: Option<&str>,
+    ingress_zone_override: Option<u16>,
     resolution_target: IpAddr,
 ) -> Option<(SessionDecision, SessionMetadata)> {
     if !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32) {
@@ -354,13 +403,17 @@ pub(super) fn cluster_peer_return_fast_path(
     if fabric_return_resolution.disposition != ForwardingDisposition::ForwardCandidate {
         return None;
     }
-    let egress_zone = forwarding
+    let egress_zone_name = forwarding
         .ifindex_to_zone
-        .get(&fabric_return_resolution.egress_ifindex)?
-        .clone();
+        .get(&fabric_return_resolution.egress_ifindex)?;
+    let egress_zone = forwarding
+        .zone_name_to_id
+        .get(egress_zone_name.as_str())
+        .copied()
+        .unwrap_or(0);
     let metadata = SessionMetadata {
-        ingress_zone: Arc::<str>::from(ingress_zone),
-        egress_zone: Arc::<str>::from(egress_zone),
+        ingress_zone,
+        egress_zone,
         owner_rg_id: owner_rg_for_resolution(forwarding, fabric_return_resolution),
         fabric_ingress: true,
         is_reverse: true,
@@ -542,7 +595,7 @@ pub(super) fn finalize_new_flow_ha_resolution(
     resolution: ForwardingResolution,
     fabric_ingress: bool,
     ingress_ifindex: i32,
-    ingress_zone: &str,
+    ingress_zone: u16,
     ha_startup_grace_until_secs: u64,
 ) -> ForwardingResolution {
     let enforced = super::session_glue::enforce_session_ha_resolution(
@@ -1632,6 +1685,7 @@ fn choose_v6_route(
 
 #[cfg(test)]
 mod tests {
+    use crate::test_zone_ids::*;
     use super::super::forwarding_build::*;
     use super::super::test_fixtures::*;
     use super::*;
@@ -2039,7 +2093,7 @@ mod tests {
                 meta,
                 &state,
             ),
-            Some("lan".to_string())
+            Some(TEST_LAN_ZONE_ID)
         );
     }
 
@@ -2227,7 +2281,7 @@ mod tests {
         let routed = lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         let (from_zone, _) = zone_pair_for_flow(&state, 24, routed.egress_ifindex);
         let redirected = finalize_new_flow_ha_resolution(
-            &state, &ha_state, now_secs, routed, false, 24, &from_zone, 0,
+            &state, &ha_state, now_secs, routed, false, 24, state.zone_name_to_id.get(&from_zone).copied().unwrap_or(0), 0,
         );
         assert_eq!(
             redirected.disposition,
@@ -2246,7 +2300,7 @@ mod tests {
         let ha_state = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
         let routed = lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         let resolved = finalize_new_flow_ha_resolution(
-            &state, &ha_state, now_secs, routed, true, 21, "lan", 0,
+            &state, &ha_state, now_secs, routed, true, 21, 1, 0,
         );
         assert_eq!(
             resolved.disposition,
@@ -2272,7 +2326,7 @@ mod tests {
             &ha_state,
             &dynamic_neighbors,
             IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-            "lan",
+            1,
             true,
             monotonic_nanos() / 1_000_000_000,
             false,
@@ -2299,7 +2353,7 @@ mod tests {
             &ha_state,
             &dynamic_neighbors,
             IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-            "lan",
+            1,
             true,
             monotonic_nanos() / 1_000_000_000,
             false,
@@ -2344,7 +2398,7 @@ mod tests {
             &dynamic_neighbors,
             &packet_frame,
             meta,
-            Some("sfmix"),
+            Some(TEST_SFMIX_ZONE_ID),
             IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
         )
         .expect("fabric return fast path");
@@ -2354,8 +2408,8 @@ mod tests {
             ForwardingDisposition::ForwardCandidate
         );
         assert_eq!(decision.resolution.egress_ifindex, 5);
-        assert_eq!(metadata.ingress_zone.as_ref(), "sfmix");
-        assert_eq!(metadata.egress_zone.as_ref(), "lan");
+        assert_eq!(metadata.ingress_zone, 5);
+        assert_eq!(metadata.egress_zone, 1);
         assert!(metadata.fabric_ingress);
         assert!(metadata.is_reverse);
     }
@@ -2384,7 +2438,7 @@ mod tests {
                 &dynamic_neighbors,
                 &[],
                 meta,
-                Some("sfmix"),
+                Some(TEST_SFMIX_ZONE_ID),
                 IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
             )
             .is_none()
@@ -2416,7 +2470,7 @@ mod tests {
                 &dynamic_neighbors,
                 &packet_frame,
                 meta,
-                Some("lan"),
+                Some(TEST_LAN_ZONE_ID),
                 IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
             )
             .is_none()
@@ -2448,7 +2502,7 @@ mod tests {
                 &dynamic_neighbors,
                 &packet_frame,
                 meta,
-                Some("lan"),
+                Some(TEST_LAN_ZONE_ID),
                 IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
             )
             .is_none()
@@ -2482,18 +2536,16 @@ mod tests {
             nat: NatDecision::default(),
         };
 
-        let ingress_zone = Arc::<str>::from("lan");
-        let egress_zone = Arc::<str>::from("wan");
         let metadata = build_missing_neighbor_session_metadata(
             &state,
-            &ingress_zone,
-            &egress_zone,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
             true,
             decision,
         );
 
-        assert_eq!(metadata.ingress_zone.as_ref(), "lan");
-        assert_eq!(metadata.egress_zone.as_ref(), "wan");
+        assert_eq!(metadata.ingress_zone, 1);
+        assert_eq!(metadata.egress_zone, 2);
         assert!(metadata.fabric_ingress);
         assert!(!metadata.is_reverse);
     }
@@ -2509,7 +2561,7 @@ mod tests {
             &ha_state,
             &dynamic_neighbors,
             IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
-            "wan",
+            2,
             false,
             monotonic_nanos() / 1_000_000_000,
             false,
@@ -2533,7 +2585,7 @@ mod tests {
             &ha_state,
             &dynamic_neighbors,
             IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
-            "wan",
+            2,
             false,
             monotonic_nanos() / 1_000_000_000,
             false,
@@ -2555,7 +2607,7 @@ mod tests {
             &ha_state,
             &dynamic_neighbors,
             "2001:559:8585:80::8".parse().expect("dst"),
-            "wan",
+            2,
             false,
             monotonic_nanos() / 1_000_000_000,
             false,
@@ -2689,8 +2741,8 @@ mod tests {
                 tx_vlan_id: 0,
             },
             metadata: SessionMetadata {
-                ingress_zone: Arc::<str>::from("wan"),
-                egress_zone: Arc::<str>::from("lan"),
+                ingress_zone: TEST_WAN_ZONE_ID,
+                egress_zone: TEST_LAN_ZONE_ID,
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: false,
@@ -2738,8 +2790,8 @@ mod tests {
                 tx_vlan_id: 0,
             },
             metadata: SessionMetadata {
-                ingress_zone: Arc::<str>::from("wan"),
-                egress_zone: Arc::<str>::from("lan"),
+                ingress_zone: TEST_WAN_ZONE_ID,
+                egress_zone: TEST_LAN_ZONE_ID,
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: false,
@@ -2787,8 +2839,8 @@ mod tests {
                 tx_vlan_id: 0,
             },
             metadata: SessionMetadata {
-                ingress_zone: Arc::<str>::from("wan"),
-                egress_zone: Arc::<str>::from("lan"),
+                ingress_zone: TEST_WAN_ZONE_ID,
+                egress_zone: TEST_LAN_ZONE_ID,
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: false,
@@ -2833,8 +2885,8 @@ mod tests {
                 tx_vlan_id: 0,
             },
             metadata: SessionMetadata {
-                ingress_zone: Arc::<str>::from("wan"),
-                egress_zone: Arc::<str>::from("lan"),
+                ingress_zone: TEST_WAN_ZONE_ID,
+                egress_zone: TEST_LAN_ZONE_ID,
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: false,
@@ -3208,8 +3260,8 @@ mod tests {
             nat: NatDecision::default(),
         };
         let metadata = SessionMetadata {
-            ingress_zone: Arc::<str>::from("lan"),
-            egress_zone: Arc::<str>::from("wan"),
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -3272,8 +3324,8 @@ mod tests {
             nat: NatDecision::default(),
         };
         let metadata = SessionMetadata {
-            ingress_zone: Arc::<str>::from("lan"),
-            egress_zone: Arc::<str>::from("wan"),
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -3374,12 +3426,12 @@ mod tests {
                 dst_port: 5201,
             },
         };
-        let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
+        let (from_id, to_id) = zone_pair_ids_for_flow(&state, 24, 12);
         assert_eq!(
             evaluate_policy(
                 &state.policy,
-                &from_zone,
-                &to_zone,
+                from_id,
+                to_id,
                 flow.src_ip,
                 flow.dst_ip,
                 flow.forward_key.protocol,
@@ -3405,12 +3457,12 @@ mod tests {
                 dst_port: 5201,
             },
         };
-        let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
+        let (from_id, to_id) = zone_pair_ids_for_flow(&state, 24, 12);
         assert_eq!(
             evaluate_policy(
                 &state.policy,
-                &from_zone,
-                &to_zone,
+                from_id,
+                to_id,
                 flow.src_ip,
                 flow.dst_ip,
                 flow.forward_key.protocol,

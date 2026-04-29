@@ -10,6 +10,8 @@ mod prefix;
 mod screen;
 mod session;
 mod slowpath;
+#[cfg(test)]
+mod test_zone_ids;
 mod state_writer;
 #[allow(dead_code)]
 mod xsk_ffi;
@@ -598,7 +600,10 @@ fn handle_stream(
             "sync_session" => {
                 if let Some(sync_req) = request.session_sync {
                     match sync_req.operation.as_str() {
-                        "upsert" => match build_synced_session_entry(&sync_req) {
+                        "upsert" => match build_synced_session_entry(
+                            &sync_req,
+                            guard.afxdp.zone_name_to_id_ref(),
+                        ) {
                             Ok(entry) => {
                                 guard.afxdp.upsert_synced_session(entry);
                             }
@@ -854,7 +859,10 @@ fn build_synced_session_key(
     })
 }
 
-fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionEntry, String> {
+fn build_synced_session_entry(
+    req: &SessionSyncRequest,
+    zone_name_to_id: &rustc_hash::FxHashMap<String, u16>,
+) -> Result<SyncedSessionEntry, String> {
     let key = build_synced_session_key(req)?;
     let next_hop = if req.next_hop.is_empty() {
         None
@@ -936,8 +944,24 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
             },
         },
         metadata: crate::session::SessionMetadata {
-            ingress_zone: req.ingress_zone.clone().into(),
-            egress_zone: req.egress_zone.clone().into(),
+            // #919: prefer the wire u16 IDs when populated; fall back
+            // to name lookup for older peers that only sent strings.
+            ingress_zone: if req.ingress_zone_id != 0 {
+                req.ingress_zone_id
+            } else {
+                zone_name_to_id
+                    .get(req.ingress_zone.as_str())
+                    .copied()
+                    .unwrap_or(0)
+            },
+            egress_zone: if req.egress_zone_id != 0 {
+                req.egress_zone_id
+            } else {
+                zone_name_to_id
+                    .get(req.egress_zone.as_str())
+                    .copied()
+                    .unwrap_or(0)
+            },
             owner_rg_id: req.owner_rg_id,
             fabric_ingress: req.fabric_ingress,
             is_reverse: req.is_reverse,
@@ -1259,6 +1283,17 @@ fn write_state(state_file: &str, state: &Arc<Mutex<ServerState>>) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_zone_ids::*;
+
+    fn test_zone_name_to_id() -> rustc_hash::FxHashMap<String, u16> {
+        let mut m = rustc_hash::FxHashMap::default();
+        m.insert("lan".to_string(), TEST_LAN_ZONE_ID);
+        m.insert("wan".to_string(), TEST_WAN_ZONE_ID);
+        m.insert("trust".to_string(), TEST_TRUST_ZONE_ID);
+        m.insert("untrust".to_string(), TEST_UNTRUST_ZONE_ID);
+        m.insert("sfmix".to_string(), TEST_SFMIX_ZONE_ID);
+        m
+    }
 
     #[test]
     fn same_binding_plan_ignores_runtime_only_snapshot_changes() {
@@ -1499,7 +1534,8 @@ mod tests {
             ..SessionSyncRequest::default()
         };
 
-        let entry = build_synced_session_entry(&req).expect("synced session entry");
+        let entry = build_synced_session_entry(&req, &test_zone_name_to_id())
+            .expect("synced session entry");
         assert!(entry.metadata.fabric_ingress);
         assert!(entry.origin.is_peer_synced());
         assert_eq!(entry.metadata.owner_rg_id, 1);
@@ -1521,13 +1557,97 @@ mod tests {
             ..SessionSyncRequest::default()
         };
 
-        let entry = build_synced_session_entry(&req).expect("synced session entry");
+        let entry = build_synced_session_entry(&req, &test_zone_name_to_id())
+            .expect("synced session entry");
         assert_eq!(entry.decision.resolution.tunnel_endpoint_id, 3);
         assert_eq!(entry.decision.resolution.egress_ifindex, 586);
         assert_eq!(
             entry.decision.resolution.disposition,
             afxdp::ForwardingDisposition::ForwardCandidate
         );
+    }
+
+    /// #919/#922: when a peer sends both legacy zone names and the new
+    /// u16 IDs, the daemon must trust the IDs. Models a new-peer-to-new-
+    /// daemon flow where the IDs are authoritative even if the names
+    /// drift (e.g., a name string is misspelled or unresolved).
+    #[test]
+    fn build_synced_session_entry_prefers_id_over_legacy_zone_name() {
+        let req = SessionSyncRequest {
+            operation: "upsert".to_string(),
+            addr_family: libc::AF_INET as u8,
+            protocol: 6,
+            src_ip: "10.0.61.102".to_string(),
+            dst_ip: "172.16.80.200".to_string(),
+            src_port: 40000,
+            dst_port: 5201,
+            ingress_zone: "stale-name".to_string(),
+            egress_zone: "stale-name".to_string(),
+            ingress_zone_id: 1,
+            egress_zone_id: 2,
+            owner_rg_id: 1,
+            egress_ifindex: 5,
+            tx_ifindex: 5,
+            ..SessionSyncRequest::default()
+        };
+        let entry = build_synced_session_entry(&req, &test_zone_name_to_id())
+            .expect("synced session entry");
+        assert_eq!(entry.metadata.ingress_zone, 1);
+        assert_eq!(entry.metadata.egress_zone, 2);
+    }
+
+    /// #919/#922: an old peer (legacy strings, no IDs) lands at a new
+    /// daemon. `ingress_zone_id == 0` triggers the name-lookup
+    /// fallback; the session is still installed with the resolved ID.
+    #[test]
+    fn build_synced_session_entry_falls_back_to_zone_name_when_id_zero() {
+        let req = SessionSyncRequest {
+            operation: "upsert".to_string(),
+            addr_family: libc::AF_INET as u8,
+            protocol: 6,
+            src_ip: "10.0.61.102".to_string(),
+            dst_ip: "172.16.80.200".to_string(),
+            src_port: 40000,
+            dst_port: 5201,
+            ingress_zone: "lan".to_string(),
+            egress_zone: "wan".to_string(),
+            owner_rg_id: 1,
+            egress_ifindex: 5,
+            tx_ifindex: 5,
+            ..SessionSyncRequest::default()
+        };
+        let entry = build_synced_session_entry(&req, &test_zone_name_to_id())
+            .expect("synced session entry");
+        let m = test_zone_name_to_id();
+        assert_eq!(entry.metadata.ingress_zone, m["lan"]);
+        assert_eq!(entry.metadata.egress_zone, m["wan"]);
+    }
+
+    /// #919/#922: an old peer with strings that the new daemon doesn't
+    /// know about. Both legacy and ID lookups fail; metadata zone IDs
+    /// are 0. The session is still installed (we don't drop it) — the
+    /// caller observes zone-id 0 and treats it as "unknown".
+    #[test]
+    fn build_synced_session_entry_unknown_zone_name_does_not_drop_session() {
+        let req = SessionSyncRequest {
+            operation: "upsert".to_string(),
+            addr_family: libc::AF_INET as u8,
+            protocol: 6,
+            src_ip: "10.0.61.102".to_string(),
+            dst_ip: "172.16.80.200".to_string(),
+            src_port: 40000,
+            dst_port: 5201,
+            ingress_zone: "totally-unknown".to_string(),
+            egress_zone: "another-unknown".to_string(),
+            owner_rg_id: 1,
+            egress_ifindex: 5,
+            tx_ifindex: 5,
+            ..SessionSyncRequest::default()
+        };
+        let entry = build_synced_session_entry(&req, &test_zone_name_to_id())
+            .expect("synced session entry");
+        assert_eq!(entry.metadata.ingress_zone, 0);
+        assert_eq!(entry.metadata.egress_zone, 0);
     }
 
     #[test]

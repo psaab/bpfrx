@@ -484,7 +484,11 @@ pub(crate) struct ForwardingResolution {
 }
 
 impl ForwardingResolution {
-    pub(super) fn status(self, debug: Option<&ResolutionDebug>) -> PacketResolution {
+    pub(super) fn status(
+        self,
+        debug: Option<&ResolutionDebug>,
+        forwarding: &ForwardingState,
+    ) -> PacketResolution {
         PacketResolution {
             disposition: match self.disposition {
                 ForwardingDisposition::LocalDelivery => "local_delivery",
@@ -514,10 +518,12 @@ impl ForwardingResolution {
             src_port: debug.map(|d| d.src_port).unwrap_or_default(),
             dst_port: debug.map(|d| d.dst_port).unwrap_or_default(),
             from_zone: debug
-                .and_then(|d| d.from_zone.as_ref().map(|zone| zone.to_string()))
+                .and_then(|d| d.from_zone)
+                .and_then(|id| forwarding.zone_id_to_name.get(&id).cloned())
                 .unwrap_or_default(),
             to_zone: debug
-                .and_then(|d| d.to_zone.as_ref().map(|zone| zone.to_string()))
+                .and_then(|d| d.to_zone)
+                .and_then(|id| forwarding.zone_id_to_name.get(&id).cloned())
                 .unwrap_or_default(),
         }
     }
@@ -878,8 +884,10 @@ pub(super) struct ResolutionDebug {
     pub(super) dst_ip: Option<IpAddr>,
     pub(super) src_port: u16,
     pub(super) dst_port: u16,
-    pub(super) from_zone: Option<Arc<str>>,
-    pub(super) to_zone: Option<Arc<str>>,
+    /// #919: stored as zone IDs; the slow-path `into_*` conversion
+    /// looks up the name via `forwarding.zone_id_to_name`.
+    pub(super) from_zone: Option<u16>,
+    pub(super) to_zone: Option<u16>,
 }
 
 impl ResolutionDebug {

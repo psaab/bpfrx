@@ -1676,10 +1676,20 @@ pub(crate) struct SessionSyncRequest {
     pub src_port: u16,
     #[serde(rename = "dst_port", default)]
     pub dst_port: u16,
+    /// Legacy zone-name field. New peers populate `ingress_zone_id`
+    /// instead and may leave this empty; preserved for one-release
+    /// peer-compat window.
     #[serde(rename = "ingress_zone", default)]
     pub ingress_zone: String,
     #[serde(rename = "egress_zone", default)]
     pub egress_zone: String,
+    /// #919: zone IDs preferred over names. Receiving side prefers
+    /// these when nonzero; falls back to name lookup via
+    /// `zone_name_to_id` otherwise.
+    #[serde(rename = "ingress_zone_id", default)]
+    pub ingress_zone_id: u16,
+    #[serde(rename = "egress_zone_id", default)]
+    pub egress_zone_id: u16,
     #[serde(rename = "owner_rg_id", default)]
     pub owner_rg_id: i32,
     #[serde(rename = "egress_ifindex", default)]
@@ -1755,6 +1765,14 @@ pub(crate) struct SessionDeltaInfo {
     pub ingress_zone: String,
     #[serde(rename = "egress_zone", default)]
     pub egress_zone: String,
+    /// #919/#922: u16 zone-id mirrors. New peers populate these from
+    /// `SessionMetadata`; the legacy string fields hold the resolved
+    /// zone NAME (or empty when unknown). Older daemons that don't
+    /// know about the IDs ignore the new fields and use the names.
+    #[serde(rename = "ingress_zone_id", default)]
+    pub ingress_zone_id: u16,
+    #[serde(rename = "egress_zone_id", default)]
+    pub egress_zone_id: u16,
     #[serde(rename = "owner_rg_id", default)]
     pub owner_rg_id: i32,
     #[serde(default)]

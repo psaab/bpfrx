@@ -981,14 +981,21 @@ fn poll_binding_process_descriptor(
                     }
                     // Screen/IDS check — runs BEFORE session lookup.
                     // Resolve ingress zone name for screen profile lookup.
+                    // Slow path — only runs when screen profiles configured.
+                    // #919: ingress_zone_override is now Option<u16>; resolve
+                    // ID → name via zone_id_to_name when present.
                     if screen.has_profiles() {
                         if let Some(flow) = flow.as_ref() {
-                            let zone_name = ingress_zone_override.as_deref().or_else(|| {
-                                worker_ctx.forwarding
-                                    .ifindex_to_zone
-                                    .get(&(meta.ingress_ifindex as i32))
-                                    .map(|s| s.as_str())
-                            });
+                            let zone_name = ingress_zone_override
+                                .and_then(|id| {
+                                    worker_ctx.forwarding.zone_id_to_name.get(&id).map(|s| s.as_str())
+                                })
+                                .or_else(|| {
+                                    worker_ctx.forwarding
+                                        .ifindex_to_zone
+                                        .get(&(meta.ingress_ifindex as i32))
+                                        .map(|s| s.as_str())
+                                });
                             if let Some(zone_name) = zone_name {
                                 let l3_off = if meta.ingress_vlan_id > 0 {
                                     18
@@ -1047,6 +1054,7 @@ fn poll_binding_process_descriptor(
                                 ipsec_decision,
                                 worker_ctx.recent_exceptions,
                                 "slow_path",
+                                worker_ctx.forwarding,
                             );
                             binding.scratch_recycle.push(desc.addr);
                             continue;
@@ -1240,7 +1248,7 @@ fn poll_binding_process_descriptor(
                                                 &cached_decision,
                                                 worker_ctx.forwarding,
                                                 Some(flow),
-                                                Some(&cached_metadata.ingress_zone),
+                                                Some(cached_metadata.ingress_zone),
                                                 cached_descriptor.apply_nat_on_fabric,
                                                 Some(PendingForwardHints {
                                                     expected_ports,
@@ -1271,7 +1279,7 @@ fn poll_binding_process_descriptor(
                     let mut debug = flow
                         .as_ref()
                         .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
-                    let mut session_ingress_zone: Option<Arc<str>> = None;
+                    let mut session_ingress_zone: Option<u16> = None;
                     let mut flow_cache_owner_rg_id = 0i32;
                     let mut apply_nat_on_fabric = false;
                     let mut decision = if let Some(flow) = flow.as_ref() {
@@ -1332,10 +1340,10 @@ fn poll_binding_process_descriptor(
                                 );
                             }
                             if let Some(debug) = debug.as_mut() {
-                                debug.from_zone = Some(resolved.metadata.ingress_zone.clone());
-                                debug.to_zone = Some(resolved.metadata.egress_zone.clone());
+                                debug.from_zone = Some(resolved.metadata.ingress_zone);
+                                debug.to_zone = Some(resolved.metadata.egress_zone);
                             }
-                            session_ingress_zone = Some(resolved.metadata.ingress_zone.clone());
+                            session_ingress_zone = Some(resolved.metadata.ingress_zone);
                             flow_cache_owner_rg_id = resolved.metadata.owner_rg_id;
                             apply_nat_on_fabric = true;
                             // TTL/hop-limit check on session-hit path: generate
@@ -1390,7 +1398,7 @@ fn poll_binding_process_descriptor(
                                     worker_ctx.dynamic_neighbors,
                                     packet_frame,
                                     meta,
-                                    ingress_zone_override.as_deref(),
+                                    ingress_zone_override,
                                     resolution_target,
                                 )
                             {
@@ -1445,8 +1453,13 @@ fn poll_binding_process_descriptor(
                             // Check DNAT table first (port-based DNAT), then
                             // fall back to static NAT DNAT (IP-only 1:1).
                             // The translated destination affects FIB lookup.
+                            // #919: ingress_zone_override is now Option<u16>;
+                            // DNAT/static NAT lookups still take zone names,
+                            // so resolve ID→name lazily on this miss path.
                             let ingress_zone_name = ingress_zone_override
-                                .as_deref()
+                                .and_then(|id| {
+                                    worker_ctx.forwarding.zone_id_to_name.get(&id).map(|s| s.as_str())
+                                })
                                 .or_else(|| {
                                     worker_ctx.forwarding
                                         .ifindex_to_zone
@@ -1582,14 +1595,34 @@ fn poll_binding_process_descriptor(
                                 resolution,
                                 nat: nptv6_nat.or(pre_routing_dnat).unwrap_or_default(),
                             };
-                            let (from_zone, to_zone) = zone_pair_for_flow_with_override(
+                            // #919/#922: zero-allocation zone-pair resolution
+                            // direct from u16 IDs — no String materialisation
+                            // on the per-flow miss path.
+                            let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
                                 worker_ctx.forwarding,
                                 meta.ingress_ifindex as i32,
-                                ingress_zone_override.as_deref(),
+                                ingress_zone_override,
                                 resolution.egress_ifindex,
                             );
-                            let from_zone_arc = Arc::<str>::from(from_zone.as_str());
-                            let to_zone_arc = Arc::<str>::from(to_zone.as_str());
+                            // Borrow zone names as &str for string-typed downstream
+                            // callers (static_nat, match_source_nat_for_flow, debug
+                            // log). No clone — the borrow lives only inside this
+                            // miss-path block while `worker_ctx.forwarding` is held.
+                            let from_zone: &str = worker_ctx
+                                .forwarding
+                                .zone_id_to_name
+                                .get(&from_zone_id)
+                                .map(|s| s.as_str())
+                                .unwrap_or("");
+                            let to_zone: &str = worker_ctx
+                                .forwarding
+                                .zone_id_to_name
+                                .get(&to_zone_id)
+                                .map(|s| s.as_str())
+                                .unwrap_or("");
+                            let is_trust_flow = meta.ingress_ifindex == 5
+                                || from_zone == "lan"
+                                || matches!(flow.src_ip, IpAddr::V4(ip) if ip.octets()[0] == 10);
                             decision.resolution = finalize_new_flow_ha_resolution(
                                 worker_ctx.forwarding,
                                 worker_ctx.ha_state,
@@ -1597,13 +1630,9 @@ fn poll_binding_process_descriptor(
                                 decision.resolution,
                                 packet_fabric_ingress,
                                 meta.ingress_ifindex as i32,
-                                from_zone_arc.as_ref(),
+                                from_zone_id,
                                 ha_startup_grace_until_secs,
                             );
-                            // Always log trust/lan traffic (iperf3) regardless of throttle
-                            let is_trust_flow = meta.ingress_ifindex == 5
-                                || from_zone == "lan"
-                                || matches!(flow.src_ip, IpAddr::V4(ip) if ip.octets()[0] == 10);
                             // Debug: log session miss with flow details (throttled)
                             if cfg!(feature = "debug-log") {
                                 if telemetry.dbg.session_miss <= 10 || is_trust_flow {
@@ -1664,8 +1693,8 @@ fn poll_binding_process_descriptor(
                                 }
                             }
                             if let Some(debug) = debug.as_mut() {
-                                debug.from_zone = Some(from_zone_arc.clone());
-                                debug.to_zone = Some(to_zone_arc.clone());
+                                debug.from_zone = Some(from_zone_id);
+                                debug.to_zone = Some(to_zone_id);
                             }
                             // Compute embedded ICMP error flag early so we can skip
                             // the BPF session map publish for ICMP errors. Publishing
@@ -1693,8 +1722,8 @@ fn poll_binding_process_descriptor(
                                 )
                             {
                                 let local_metadata = SessionMetadata {
-                                    ingress_zone: from_zone_arc.clone(),
-                                    egress_zone: to_zone_arc.clone(),
+                                    ingress_zone: from_zone_id,
+                                    egress_zone: to_zone_id,
                                     owner_rg_id: 0,
                                     fabric_ingress: false,
                                     is_reverse: false,
@@ -1890,8 +1919,8 @@ fn poll_binding_process_descriptor(
                                 // orphan NAT state without a session anchor).
                                 if let PolicyAction::Permit = evaluate_policy(
                                     &worker_ctx.forwarding.policy,
-                                    &from_zone,
-                                    &to_zone,
+                                    from_zone_id,
+                                    to_zone_id,
                                     flow.src_ip,
                                     flow.dst_ip,
                                     flow.forward_key.protocol,
@@ -2017,8 +2046,8 @@ fn poll_binding_process_descriptor(
                                                 fabric_ingress,
                                             );
                                         let forward_metadata = SessionMetadata {
-                                            ingress_zone: from_zone_arc.clone(),
-                                            egress_zone: to_zone_arc.clone(),
+                                            ingress_zone: from_zone_id,
+                                            egress_zone: to_zone_id,
                                             owner_rg_id,
                                             fabric_ingress,
                                             is_reverse: false,
@@ -2074,7 +2103,7 @@ fn poll_binding_process_descriptor(
                                             worker_ctx.ha_state,
                                             worker_ctx.dynamic_neighbors,
                                             flow.src_ip,
-                                            from_zone_arc.as_ref(),
+                                            from_zone_id,
                                             fabric_ingress,
                                             now_secs,
                                             false,
@@ -2145,8 +2174,8 @@ fn poll_binding_process_descriptor(
                                         };
                                         let _ = reverse_protocol; // used below for install
                                         let reverse_metadata = SessionMetadata {
-                                            ingress_zone: to_zone_arc,
-                                            egress_zone: from_zone_arc,
+                                            ingress_zone: to_zone_id,
+                                            egress_zone: from_zone_id,
                                             owner_rg_id,
                                             fabric_ingress,
                                             is_reverse: true,
@@ -2301,9 +2330,10 @@ fn poll_binding_process_descriptor(
                                 // that owns the egress RG.  Use from_zone_arc directly
                                 // (always in scope) rather than going through the debug
                                 // struct which may not have been populated.
-                                if let Some(redirect) = resolve_zone_encoded_fabric_redirect(
+                                // #919/#922: ID-keyed redirect — no name lookup.
+                                if let Some(redirect) = resolve_zone_encoded_fabric_redirect_by_id(
                                     worker_ctx.forwarding,
-                                    from_zone_arc.as_ref(),
+                                    from_zone_id,
                                 )
                                 .or_else(|| resolve_fabric_redirect(worker_ctx.forwarding))
                                 {
@@ -2358,18 +2388,29 @@ fn poll_binding_process_descriptor(
                         if flow_cache_owner_rg_id <= 0 {
                             flow_cache_owner_rg_id = egress_rg;
                         }
-                        let zone_name = session_ingress_zone
-                            .as_deref()
-                            .or_else(|| {
-                                worker_ctx.forwarding
-                                    .ifindex_to_zone
-                                    .get(&(meta.ingress_ifindex as i32))
-                                    .map(|s| s.as_str())
+                        // #919: prefer the cached u16 zone ID; fall back to
+                        // looking up the ifindex's zone name and translating
+                        // to an ID. resolve_zone_encoded_fabric_redirect_by_id
+                        // skips the name round-trip.
+                        let zone_id = session_ingress_zone.or_else(|| {
+                            let name = worker_ctx
+                                .forwarding
+                                .ifindex_to_zone
+                                .get(&(meta.ingress_ifindex as i32))?;
+                            worker_ctx
+                                .forwarding
+                                .zone_name_to_id
+                                .get(name.as_str())
+                                .copied()
+                        });
+                        if let Some(redirect) = zone_id
+                            .and_then(|id| {
+                                resolve_zone_encoded_fabric_redirect_by_id(
+                                    worker_ctx.forwarding,
+                                    id,
+                                )
                             })
-                            .unwrap_or("");
-                        if let Some(redirect) =
-                            resolve_zone_encoded_fabric_redirect(worker_ctx.forwarding, zone_name)
-                                .or_else(|| resolve_fabric_redirect(worker_ctx.forwarding))
+                            .or_else(|| resolve_fabric_redirect(worker_ctx.forwarding))
                         {
                             decision.resolution = redirect;
                         }
@@ -2617,7 +2658,7 @@ fn poll_binding_process_descriptor(
                             &decision,
                             worker_ctx.forwarding,
                             flow.as_ref(),
-                            session_ingress_zone.as_ref(),
+                            session_ingress_zone,
                             apply_nat_on_fabric,
                             None,
                             None,
@@ -2688,7 +2729,7 @@ fn poll_binding_process_descriptor(
                                     validation,
                                     decision,
                                     flow_cache_owner_rg_id,
-                                    session_ingress_zone.as_ref().cloned(),
+                                    session_ingress_zone,
                                     request_target_binding_index,
                                     worker_ctx.forwarding,
                                     worker_ctx.ha_state,
@@ -2741,6 +2782,7 @@ fn poll_binding_process_descriptor(
                                     meta,
                                     decision,
                                     worker_ctx.recent_exceptions,
+                                    worker_ctx.forwarding,
                                 );
                                 recycle_now = true;
                             }
@@ -2764,14 +2806,27 @@ fn poll_binding_process_descriptor(
                             }
                             ForwardingDisposition::MissingNeighbor => {
                                 telemetry.dbg.missing_neigh += 1;
-                                let (from_zone, to_zone) = zone_pair_for_flow_with_override(
+                                // #919/#922: zero-allocation ID-native resolution.
+                                let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
                                     worker_ctx.forwarding,
                                     meta.ingress_ifindex as i32,
-                                    ingress_zone_override.as_deref(),
+                                    ingress_zone_override,
                                     decision.resolution.egress_ifindex,
                                 );
-                                let from_zone_arc = Arc::<str>::from(from_zone.as_str());
-                                let to_zone_arc = Arc::<str>::from(to_zone.as_str());
+                                // Borrow zone names as &str (no clone) for the
+                                // string-typed downstream NAT helpers.
+                                let from_zone: &str = worker_ctx
+                                    .forwarding
+                                    .zone_id_to_name
+                                    .get(&from_zone_id)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("");
+                                let to_zone: &str = worker_ctx
+                                    .forwarding
+                                    .zone_id_to_name
+                                    .get(&to_zone_id)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("");
                                 // Send ARP/NDP solicitation via RAW socket (not XSK)
                                 // so the reply goes through the kernel's normal RX
                                 // path (cpumap_or_pass), bypassing XSK fill ring issues.
@@ -2811,8 +2866,8 @@ fn poll_binding_process_descriptor(
                                 if let Some(flow) = flow.as_ref() {
                                     if let PolicyAction::Permit = evaluate_policy(
                                         &worker_ctx.forwarding.policy,
-                                        &from_zone,
-                                        &to_zone,
+                                        from_zone_id,
+                                        to_zone_id,
                                         flow.src_ip,
                                         flow.dst_ip,
                                         flow.forward_key.protocol,
@@ -2856,8 +2911,8 @@ fn poll_binding_process_descriptor(
                                     }
                                     let sess_meta = build_missing_neighbor_session_metadata(
                                         worker_ctx.forwarding,
-                                        &from_zone_arc,
-                                        &to_zone_arc,
+                                        from_zone_id,
+                                        to_zone_id,
                                         packet_fabric_ingress,
                                         pending_decision,
                                     );
@@ -2959,6 +3014,7 @@ fn poll_binding_process_descriptor(
                             debug.as_ref(),
                             worker_ctx.recent_exceptions,
                             worker_ctx.last_resolution,
+                            worker_ctx.forwarding,
                         );
                         maybe_reinject_slow_path_from_frame(
                             &worker_ctx.ident,
@@ -2970,6 +3026,7 @@ fn poll_binding_process_descriptor(
                             decision,
                             worker_ctx.recent_exceptions,
                             "slow_path",
+                            worker_ctx.forwarding,
                         );
                     }
                 } else {
@@ -2980,6 +3037,7 @@ fn poll_binding_process_descriptor(
                         desc.len as u32,
                         Some(meta),
                         worker_ctx.recent_exceptions,
+                        worker_ctx.forwarding,
                     );
                 }
             } else {
@@ -2992,6 +3050,7 @@ fn poll_binding_process_descriptor(
                     desc.len as u32,
                     None,
                     None,
+                    worker_ctx.forwarding,
                 );
             }
             if recycle_now {
@@ -3121,7 +3180,7 @@ fn build_live_forward_request(
     decision: &SessionDecision,
     forwarding: &ForwardingState,
     flow: Option<&SessionFlow>,
-    fabric_ingress_zone: Option<&Arc<str>>,
+    fabric_ingress_zone: Option<u16>,
     apply_nat_on_fabric: bool,
 ) -> Option<PendingForwardRequest> {
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
@@ -3158,7 +3217,7 @@ fn build_live_forward_request_from_frame(
     decision: &SessionDecision,
     forwarding: &ForwardingState,
     flow: Option<&SessionFlow>,
-    fabric_ingress_zone: Option<&Arc<str>>,
+    fabric_ingress_zone: Option<u16>,
     apply_nat_on_fabric: bool,
     hints: Option<PendingForwardHints>,
     precomputed_tx_selection: Option<&CachedTxSelectionDescriptor>,
@@ -3191,10 +3250,11 @@ fn build_live_forward_request_from_frame(
         }
     });
     let mut decision = *decision;
+    // #919/#922: ID-keyed redirect — no `zone_id_to_name` round-trip.
     if decision.resolution.disposition == ForwardingDisposition::FabricRedirect
-        && let Some(ingress_zone) = fabric_ingress_zone
+        && let Some(ingress_zone_id) = fabric_ingress_zone
         && let Some(zone_redirect) =
-            resolve_zone_encoded_fabric_redirect(forwarding, ingress_zone.as_ref())
+            resolve_zone_encoded_fabric_redirect_by_id(forwarding, ingress_zone_id)
     {
         decision.resolution.src_mac = zone_redirect.src_mac;
     }
@@ -3310,14 +3370,14 @@ fn learn_dynamic_neighbor(
 
 fn build_missing_neighbor_session_metadata(
     forwarding: &ForwardingState,
-    ingress_zone: &Arc<str>,
-    egress_zone: &Arc<str>,
+    ingress_zone: u16,
+    egress_zone: u16,
     fabric_ingress: bool,
     decision: SessionDecision,
 ) -> SessionMetadata {
     SessionMetadata {
-        ingress_zone: ingress_zone.clone(),
-        egress_zone: egress_zone.clone(),
+        ingress_zone,
+        egress_zone,
         owner_rg_id: owner_rg_for_resolution(forwarding, decision.resolution),
         fabric_ingress,
         is_reverse: false,
@@ -3385,9 +3445,25 @@ fn flush_session_deltas(
     recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     event_stream: &Option<crate::event_stream::EventStreamWorkerHandle>,
-    zone_name_to_id: &FastMap<String, u16>,
+    forwarding: &ForwardingState,
 ) {
+    let zone_name_to_id = &forwarding.zone_name_to_id;
+    let zone_id_to_name = &forwarding.zone_id_to_name;
     for delta in deltas {
+        // #919/#922: emit both the resolved zone NAMES (legacy field,
+        // empty when the ID is unknown) and the u16 IDs. New daemons
+        // prefer the IDs; older daemons read the names. The previous
+        // code wrote `metadata.ingress_zone.to_string()` here, which
+        // produced "1"/"2" string literals that broke `zoneIDs[name]`
+        // on the Go side.
+        let ingress_name = zone_id_to_name
+            .get(&delta.metadata.ingress_zone)
+            .cloned()
+            .unwrap_or_default();
+        let egress_name = zone_id_to_name
+            .get(&delta.metadata.egress_zone)
+            .cloned()
+            .unwrap_or_default();
         let info = SessionDeltaInfo {
             timestamp: Utc::now(),
             slot: ident.slot,
@@ -3402,8 +3478,10 @@ fn flush_session_deltas(
             dst_ip: delta.key.dst_ip.to_string(),
             src_port: delta.key.src_port,
             dst_port: delta.key.dst_port,
-            ingress_zone: delta.metadata.ingress_zone.to_string(),
-            egress_zone: delta.metadata.egress_zone.to_string(),
+            ingress_zone: ingress_name,
+            egress_zone: egress_name,
+            ingress_zone_id: delta.metadata.ingress_zone,
+            egress_zone_id: delta.metadata.egress_zone,
             owner_rg_id: delta.metadata.owner_rg_id,
             disposition: match delta.decision.resolution.disposition {
                 ForwardingDisposition::ForwardCandidate => "forward_candidate",
@@ -3533,7 +3611,18 @@ fn record_exception(
     packet_length: u32,
     meta: Option<UserspaceDpMeta>,
     debug: Option<&ResolutionDebug>,
+    forwarding: &ForwardingState,
 ) {
+    // #919: zone IDs render as zone names through `zone_id_to_name`;
+    // unknown IDs render as the empty string (was the original
+    // behaviour for unknown zone names too).
+    let zone_name_for = |id: u16| -> String {
+        forwarding
+            .zone_id_to_name
+            .get(&id)
+            .cloned()
+            .unwrap_or_default()
+    };
     if let Ok(mut recent) = recent_exceptions.lock() {
         push_recent_exception(
             &mut recent,
@@ -3561,12 +3650,8 @@ fn record_exception(
                     .unwrap_or_default(),
                 src_port: debug.map(|d| d.src_port).unwrap_or_default(),
                 dst_port: debug.map(|d| d.dst_port).unwrap_or_default(),
-                from_zone: debug
-                    .and_then(|d| d.from_zone.as_ref().map(|zone| zone.to_string()))
-                    .unwrap_or_default(),
-                to_zone: debug
-                    .and_then(|d| d.to_zone.as_ref().map(|zone| zone.to_string()))
-                    .unwrap_or_default(),
+                from_zone: debug.and_then(|d| d.from_zone).map(zone_name_for).unwrap_or_default(),
+                to_zone: debug.and_then(|d| d.to_zone).map(zone_name_for).unwrap_or_default(),
             },
         );
     }
@@ -3579,6 +3664,7 @@ fn record_disposition(
     packet_length: u32,
     meta: Option<UserspaceDpMeta>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    forwarding: &ForwardingState,
 ) {
     match disposition {
         PacketDisposition::Valid => {
@@ -3595,6 +3681,7 @@ fn record_disposition(
                 packet_length,
                 meta,
                 None,
+                forwarding,
             );
         }
         PacketDisposition::ConfigGenerationMismatch => {
@@ -3607,6 +3694,7 @@ fn record_disposition(
                 packet_length,
                 meta,
                 None,
+                forwarding,
             );
         }
         PacketDisposition::FibGenerationMismatch => {
@@ -3619,6 +3707,7 @@ fn record_disposition(
                 packet_length,
                 meta,
                 None,
+                forwarding,
             );
         }
         PacketDisposition::UnsupportedPacket => {
@@ -3631,6 +3720,7 @@ fn record_disposition(
                 packet_length,
                 meta,
                 None,
+                forwarding,
             );
         }
     }
@@ -3645,6 +3735,7 @@ fn record_forwarding_disposition(
     debug: Option<&ResolutionDebug>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
+    forwarding: &ForwardingState,
 ) {
     match resolution.disposition {
         ForwardingDisposition::LocalDelivery => {
@@ -3655,7 +3746,7 @@ fn record_forwarding_disposition(
                 .fetch_add(1, Ordering::Relaxed);
         }
         ForwardingDisposition::HAInactive => {
-            update_last_resolution(last_resolution, resolution, debug);
+            update_last_resolution(last_resolution, resolution, debug, forwarding);
             live.exception_packets.fetch_add(1, Ordering::Relaxed);
             record_exception(
                 recent_exceptions,
@@ -3664,10 +3755,11 @@ fn record_forwarding_disposition(
                 packet_length,
                 meta,
                 debug,
+                forwarding,
             );
         }
         ForwardingDisposition::PolicyDenied => {
-            update_last_resolution(last_resolution, resolution, debug);
+            update_last_resolution(last_resolution, resolution, debug, forwarding);
             live.policy_denied_packets.fetch_add(1, Ordering::Relaxed);
             record_exception(
                 recent_exceptions,
@@ -3676,10 +3768,11 @@ fn record_forwarding_disposition(
                 packet_length,
                 meta,
                 debug,
+                forwarding,
             );
         }
         ForwardingDisposition::NoRoute => {
-            update_last_resolution(last_resolution, resolution, debug);
+            update_last_resolution(last_resolution, resolution, debug, forwarding);
             live.route_miss_packets.fetch_add(1, Ordering::Relaxed);
             record_exception(
                 recent_exceptions,
@@ -3688,10 +3781,11 @@ fn record_forwarding_disposition(
                 packet_length,
                 meta,
                 debug,
+                forwarding,
             );
         }
         ForwardingDisposition::MissingNeighbor => {
-            update_last_resolution(last_resolution, resolution, debug);
+            update_last_resolution(last_resolution, resolution, debug, forwarding);
             live.neighbor_miss_packets.fetch_add(1, Ordering::Relaxed);
             record_exception(
                 recent_exceptions,
@@ -3700,10 +3794,11 @@ fn record_forwarding_disposition(
                 packet_length,
                 meta,
                 debug,
+                forwarding,
             );
         }
         ForwardingDisposition::DiscardRoute => {
-            update_last_resolution(last_resolution, resolution, debug);
+            update_last_resolution(last_resolution, resolution, debug, forwarding);
             live.discard_route_packets.fetch_add(1, Ordering::Relaxed);
             record_exception(
                 recent_exceptions,
@@ -3712,10 +3807,11 @@ fn record_forwarding_disposition(
                 packet_length,
                 meta,
                 debug,
+                forwarding,
             );
         }
         ForwardingDisposition::NextTableUnsupported => {
-            update_last_resolution(last_resolution, resolution, debug);
+            update_last_resolution(last_resolution, resolution, debug, forwarding);
             live.next_table_packets.fetch_add(1, Ordering::Relaxed);
             record_exception(
                 recent_exceptions,
@@ -3724,6 +3820,7 @@ fn record_forwarding_disposition(
                 packet_length,
                 meta,
                 debug,
+                forwarding,
             );
         }
     }
@@ -3733,8 +3830,9 @@ fn update_last_resolution(
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
     resolution: ForwardingResolution,
     debug: Option<&ResolutionDebug>,
+    forwarding: &ForwardingState,
 ) {
     if let Ok(mut last) = last_resolution.lock() {
-        *last = Some(resolution.status(debug));
+        *last = Some(resolution.status(debug, forwarding));
     }
 }

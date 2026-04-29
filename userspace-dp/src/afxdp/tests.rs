@@ -1,5 +1,6 @@
 use super::test_fixtures::*;
 use super::*;
+use crate::test_zone_ids::*;
 use crate::{
     DestinationNATRuleSnapshot, InterfaceAddressSnapshot, PolicyRuleSnapshot,
     SourceNATRuleSnapshot, StaticNATRuleSnapshot,
@@ -275,8 +276,8 @@ fn synced_replica_entry_keeps_peer_synced_entries_promotable() {
             },
         },
         metadata: SessionMetadata {
-            ingress_zone: Arc::<str>::from("lan"),
-            egress_zone: Arc::<str>::from("wan"),
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,
@@ -315,8 +316,8 @@ fn synced_replica_entry_marks_local_entries_worker_local() {
             },
         },
         metadata: SessionMetadata {
-            ingress_zone: Arc::<str>::from("lan"),
-            egress_zone: Arc::<str>::from("wan"),
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,
@@ -357,8 +358,8 @@ fn reconcile_stop_preserves_shared_synced_sessions() {
             },
         },
         metadata: SessionMetadata {
-            ingress_zone: Arc::<str>::from("lan"),
-            egress_zone: Arc::<str>::from("wan"),
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,
@@ -410,8 +411,8 @@ fn replay_synced_sessions_requeues_preserved_entries_for_new_workers() {
             },
         },
         metadata: SessionMetadata {
-            ingress_zone: Arc::<str>::from("lan"),
-            egress_zone: Arc::<str>::from("wan"),
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,
@@ -1489,8 +1490,8 @@ fn icmp_te_nat_reversal_v4_rewrites_outer_dst_and_embedded_src() {
             tx_vlan_id: 0,
         },
         metadata: SessionMetadata {
-            ingress_zone: Arc::<str>::from("untrust"),
-            egress_zone: Arc::<str>::from("trust"),
+            ingress_zone: TEST_UNTRUST_ZONE_ID,
+            egress_zone: TEST_TRUST_ZONE_ID,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -1611,8 +1612,8 @@ fn icmp_te_nat_reversal_v4_with_port_snat() {
             tx_vlan_id: 0,
         },
         metadata: SessionMetadata {
-            ingress_zone: Arc::<str>::from("untrust"),
-            egress_zone: Arc::<str>::from("trust"),
+            ingress_zone: TEST_UNTRUST_ZONE_ID,
+            egress_zone: TEST_TRUST_ZONE_ID,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -1726,8 +1727,8 @@ fn icmp_dest_unreach_nat_reversal_v4() {
             tx_vlan_id: 0,
         },
         metadata: SessionMetadata {
-            ingress_zone: Arc::<str>::from("untrust"),
-            egress_zone: Arc::<str>::from("trust"),
+            ingress_zone: TEST_UNTRUST_ZONE_ID,
+            egress_zone: TEST_TRUST_ZONE_ID,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -1858,8 +1859,8 @@ fn icmpv6_te_nat_reversal_v6_rewrites_outer_dst_and_embedded_src() {
             tx_vlan_id: 0,
         },
         metadata: SessionMetadata {
-            ingress_zone: Arc::<str>::from("untrust"),
-            egress_zone: Arc::<str>::from("trust"),
+            ingress_zone: TEST_UNTRUST_ZONE_ID,
+            egress_zone: TEST_TRUST_ZONE_ID,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -1989,8 +1990,8 @@ fn icmpv6_te_nptv6_reverse_lookup_restores_internal_client() {
         },
     };
     let metadata = SessionMetadata {
-        ingress_zone: Arc::<str>::from("lan"),
-        egress_zone: Arc::<str>::from("wan"),
+        ingress_zone: TEST_LAN_ZONE_ID,
+        egress_zone: TEST_WAN_ZONE_ID,
         owner_rg_id: 0,
         fabric_ingress: false,
         is_reverse: false,
@@ -2105,8 +2106,8 @@ fn icmpv6_te_prefers_reverse_session_resolution_for_client_return_path() {
         },
     };
     let forward_metadata = SessionMetadata {
-        ingress_zone: Arc::<str>::from("lan"),
-        egress_zone: Arc::<str>::from("wan"),
+        ingress_zone: TEST_LAN_ZONE_ID,
+        egress_zone: TEST_WAN_ZONE_ID,
         owner_rg_id: 0,
         fabric_ingress: false,
         is_reverse: false,
@@ -2135,8 +2136,8 @@ fn icmpv6_te_prefers_reverse_session_resolution_for_client_return_path() {
         ),
     };
     let reverse_metadata = SessionMetadata {
-        ingress_zone: Arc::<str>::from("wan"),
-        egress_zone: Arc::<str>::from("lan"),
+        ingress_zone: TEST_WAN_ZONE_ID,
+        egress_zone: TEST_LAN_ZONE_ID,
         owner_rg_id: 0,
         fabric_ingress: false,
         is_reverse: true,
@@ -2286,8 +2287,8 @@ fn embedded_icmp_nat_match_uses_shared_nat_session_for_ipv4() {
             },
         },
         metadata: SessionMetadata {
-            ingress_zone: Arc::<str>::from("lan"),
-            egress_zone: Arc::<str>::from("wan"),
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -2430,6 +2431,7 @@ fn maybe_reinject_slow_path_ignores_forward_candidate_disposition() {
         meta,
         decision,
         &recent_exceptions,
+    &ForwardingState::default(),
     );
 
     assert_eq!(live.slow_path_packets.load(Ordering::Relaxed), 0);
@@ -2490,6 +2492,7 @@ fn maybe_reinject_slow_path_records_extract_failure_for_invalid_desc() {
         meta,
         decision,
         &recent_exceptions,
+    &ForwardingState::default(),
     );
 
     assert_eq!(live.slow_path_drops.load(Ordering::Relaxed), 1);
@@ -2548,6 +2551,7 @@ fn maybe_reinject_slow_path_from_frame_records_unavailable() {
         decision,
         &recent_exceptions,
         "forward_build_slow_path",
+    &ForwardingState::default(),
     );
 
     assert_eq!(live.slow_path_packets.load(Ordering::Relaxed), 0);
@@ -2611,6 +2615,7 @@ fn handle_forward_build_failure_records_build_and_slow_path_failures() {
         meta,
         decision,
         true,
+    &ForwardingState::default(),
     );
 
     assert_eq!(dbg.build_fail, 1);
@@ -2681,6 +2686,7 @@ fn handle_forward_build_failure_without_fallback_only_records_build_failure() {
         meta,
         decision,
         false,
+    &ForwardingState::default(),
     );
 
     assert_eq!(dbg.build_fail, 1);
