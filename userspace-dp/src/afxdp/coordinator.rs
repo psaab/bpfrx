@@ -280,6 +280,10 @@ impl Coordinator {
         self.workers.clear();
         self.identities.clear();
         self.live.clear();
+        // #925 Phase 1: drop the per-worker panic slots alongside the
+        // workers themselves so a long-running daemon that reconciles
+        // through many worker-id sets doesn't accumulate stale slots.
+        self.worker_panics.clear();
         self.cos_owner_worker_by_queue.clear();
         self.shared_cos_owner_worker_by_queue
             .store(Arc::new(BTreeMap::new()));
@@ -797,6 +801,10 @@ impl Coordinator {
                         worker_id, err
                     );
                     self.last_reconcile_stage = format!("spawn_worker_failed:{worker_id}:{err}");
+                    // #925 Phase 1: the panic slot was inserted before
+                    // spawn; drop it now so a snapshot reader doesn't
+                    // see a phantom slot for a worker that never ran.
+                    self.worker_panics.remove(&worker_id);
                     if let Ok(mut recent) = self.recent_exceptions.lock() {
                         push_recent_exception(
                             &mut recent,
