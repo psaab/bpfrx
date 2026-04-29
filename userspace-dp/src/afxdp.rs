@@ -991,9 +991,13 @@ fn poll_binding_process_descriptor(
                                     worker_ctx.forwarding.zone_id_to_name.get(&id).map(|s| s.as_str())
                                 })
                                 .or_else(|| {
+                                    // #921: ifindex → u16 → name via
+                                    // zone_id_to_name. Slow path (only
+                                    // when screen profiles configured).
                                     worker_ctx.forwarding
-                                        .ifindex_to_zone
+                                        .ifindex_to_zone_id
                                         .get(&(meta.ingress_ifindex as i32))
+                                        .and_then(|id| worker_ctx.forwarding.zone_id_to_name.get(id))
                                         .map(|s| s.as_str())
                                 });
                             if let Some(zone_name) = zone_name {
@@ -1461,9 +1465,12 @@ fn poll_binding_process_descriptor(
                                     worker_ctx.forwarding.zone_id_to_name.get(&id).map(|s| s.as_str())
                                 })
                                 .or_else(|| {
+                                    // #921: ifindex → u16 → name (slow path; DNAT/static-NAT
+                                    // takes &str names).
                                     worker_ctx.forwarding
-                                        .ifindex_to_zone
+                                        .ifindex_to_zone_id
                                         .get(&(meta.ingress_ifindex as i32))
+                                        .and_then(|id| worker_ctx.forwarding.zone_id_to_name.get(id))
                                         .map(|s| s.as_str())
                                 })
                                 .unwrap_or("");
@@ -2392,15 +2399,13 @@ fn poll_binding_process_descriptor(
                         // looking up the ifindex's zone name and translating
                         // to an ID. resolve_zone_encoded_fabric_redirect_by_id
                         // skips the name round-trip.
+                        // #921: direct ifindex → u16 (was a two-hop
+                        // name round-trip).
                         let zone_id = session_ingress_zone.or_else(|| {
-                            let name = worker_ctx
-                                .forwarding
-                                .ifindex_to_zone
-                                .get(&(meta.ingress_ifindex as i32))?;
                             worker_ctx
                                 .forwarding
-                                .zone_name_to_id
-                                .get(name.as_str())
+                                .ifindex_to_zone_id
+                                .get(&(meta.ingress_ifindex as i32))
                                 .copied()
                         });
                         if let Some(redirect) = zone_id

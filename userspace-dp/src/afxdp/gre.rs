@@ -257,10 +257,12 @@ pub(super) fn try_native_gre_decap_from_frame(
         }
     }
 
+    // #921: GRE decap fires from afxdp.rs (pre-flow-cache), so this
+    // is the per-packet path on GRE-tunnel workloads. Direct ID
+    // lookup — was a two-hop name round-trip.
     let ingress_zone = forwarding
-        .ifindex_to_zone
+        .ifindex_to_zone_id
         .get(&endpoint.logical_ifindex)
-        .and_then(|zone| forwarding.zone_name_to_id.get(zone))
         .copied()
         .unwrap_or_default();
     let pkt_len = u16::try_from(inner_packet.len()).ok()?;

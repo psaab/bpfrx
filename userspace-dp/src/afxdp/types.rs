@@ -233,7 +233,12 @@ pub(super) struct ForwardingState {
     pub(super) neighbors: FastMap<(i32, IpAddr), NeighborEntry>,
     pub(super) ifindex_to_name: FastMap<i32, String>,
     pub(super) ifindex_to_config_name: FastMap<i32, String>,
-    pub(super) ifindex_to_zone: FastMap<i32, String>,
+    /// #921: ifindex → zone ID (was `FastMap<i32, String>`). Built
+    /// at config-commit time from the snapshot's per-interface
+    /// zone NAME via the `zone_name_to_id` lookup. Hot-path callers
+    /// read u16 directly; slow-path display sites translate via
+    /// `zone_id_to_name`. Unknown / dropped zones map to `0`.
+    pub(super) ifindex_to_zone_id: FastMap<i32, u16>,
     pub(super) zone_name_to_id: FastMap<String, u16>,
     pub(super) zone_id_to_name: FastMap<u16, String>,
     pub(super) egress: FastMap<i32, EgressInterface>,
@@ -391,7 +396,11 @@ pub(super) struct EgressInterface {
     pub(super) vlan_id: u16,
     pub(super) mtu: usize,
     pub(super) src_mac: [u8; 6],
-    pub(super) zone: String,
+    /// #921: u16 zone ID (was `zone: String`). Resolved at config
+    /// build time via `zone_name_to_id`; `0` means "unknown" (the
+    /// zone wasn't in the snapshot's zones list, or had a reserved
+    /// id and was dropped).
+    pub(super) zone_id: u16,
     pub(super) redundancy_group: i32,
     pub(super) primary_v4: Option<Ipv4Addr>,
     pub(super) primary_v6: Option<Ipv6Addr>,

@@ -3622,7 +3622,7 @@ mod tests {
     fn native_gre_logical_egress_retains_zone_without_mac() {
         let state = build_forwarding_state(&native_gre_pbr_snapshot(true));
         let egress = state.egress.get(&362).expect("logical tunnel egress");
-        assert_eq!(egress.zone, "sfmix");
+        assert_eq!(egress.zone_id, TEST_SFMIX_ZONE_ID);
         assert_eq!(egress.primary_v4, Some(Ipv4Addr::new(10, 255, 192, 42)));
     }
 
@@ -4845,7 +4845,7 @@ mod tests {
                 vlan_id: 80,
                 mtu: 1500,
                 src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
-                zone: "wan".to_string(),
+                zone_id: TEST_WAN_ZONE_ID,
                 redundancy_group: 1,
                 primary_v4: None,
                 primary_v6: Some("2001:559:8585:80::8".parse().unwrap()),
@@ -4947,7 +4947,7 @@ mod tests {
                 vlan_id: 80,
                 mtu: 1500,
                 src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
-                zone: "wan".to_string(),
+                zone_id: TEST_WAN_ZONE_ID,
                 redundancy_group: 1,
                 primary_v4: None,
                 primary_v6: Some("2001:559:8585:80::8".parse().unwrap()),
@@ -5176,7 +5176,7 @@ mod tests {
                 vlan_id: 80,
                 mtu: 1500,
                 src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
-                zone: "wan".to_string(),
+                zone_id: TEST_WAN_ZONE_ID,
                 redundancy_group: 1,
                 primary_v4: Some(Ipv4Addr::new(172, 16, 80, 8)),
                 primary_v6: None,
@@ -5680,7 +5680,7 @@ mod tests {
                 vlan_id: 80,
                 mtu: 1500,
                 src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
-                zone: "wan".to_string(),
+                zone_id: TEST_WAN_ZONE_ID,
                 redundancy_group: 1,
                 primary_v4: None,
                 primary_v6: Some("2001:559:8585:80::8".parse().unwrap()),
@@ -5798,7 +5798,7 @@ mod tests {
                 vlan_id: 80,
                 mtu: 1500,
                 src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
-                zone: "wan".to_string(),
+                zone_id: TEST_WAN_ZONE_ID,
                 redundancy_group: 1,
                 primary_v4: None,
                 primary_v6: Some("2001:559:8585:80::8".parse().unwrap()),
@@ -5902,7 +5902,7 @@ mod tests {
                 vlan_id: 80,
                 mtu: 1500,
                 src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
-                zone: "wan".to_string(),
+                zone_id: TEST_WAN_ZONE_ID,
                 redundancy_group: 1,
                 primary_v4: None,
                 primary_v6: Some("2001:559:8585:80::8".parse().unwrap()),
@@ -6009,7 +6009,7 @@ mod tests {
                 vlan_id: 80,
                 mtu: 1500,
                 src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
-                zone: "wan".to_string(),
+                zone_id: TEST_WAN_ZONE_ID,
                 redundancy_group: 1,
                 primary_v4: None,
                 primary_v6: Some("2001:559:8585:80::8".parse().unwrap()),
@@ -6339,7 +6339,7 @@ mod tests {
                 vlan_id: 80,
                 mtu: 1500,
                 src_mac: [0x02, 0xbf, 0x72, 0x16, 0x01, 0x00],
-                zone: "wan".to_string(),
+                zone_id: TEST_WAN_ZONE_ID,
                 redundancy_group: 1,
                 primary_v4: Some(Ipv4Addr::new(172, 16, 80, 8)),
                 primary_v6: None,

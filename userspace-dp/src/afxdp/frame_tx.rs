@@ -1514,6 +1514,7 @@ fn forwarded_tcp_may_need_segmentation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_zone_ids::*;
 
     fn test_forwarding_with_egress_mtu(mtu: usize) -> ForwardingState {
         let mut forwarding = ForwardingState::default();
@@ -1524,7 +1525,7 @@ mod tests {
                 vlan_id: 80,
                 mtu,
                 src_mac: [0; 6],
-                zone: "wan".into(),
+                zone_id: TEST_WAN_ZONE_ID,
                 redundancy_group: 0,
                 primary_v4: None,
                 primary_v6: None,

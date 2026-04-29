@@ -179,12 +179,12 @@ pub(super) fn build_local_origin_tunnel_tx_request(
     };
     let flow = parse_session_flow_from_bytes(&inner_frame, meta)
         .ok_or_else(|| "parse_local_origin_session_flow_failed".to_string())?;
-    // #919: zone IDs throughout. Look up the egress interface's zone
-    // name and translate to a u16 ID.
+    // #921: zone_id is now a u16 field on EgressInterface — direct
+    // load, no name round-trip.
     let zone_id = forwarding
         .egress
         .get(&decision.resolution.egress_ifindex)
-        .and_then(|iface| forwarding.zone_name_to_id.get(iface.zone.as_str()).copied())
+        .map(|iface| iface.zone_id)
         .unwrap_or(0);
     let bytes = encapsulate_native_gre_frame(&inner_frame, meta, &decision, forwarding)
         .ok_or_else(|| "encapsulate_native_gre_frame_failed".to_string())?;
