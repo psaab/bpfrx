@@ -182,11 +182,13 @@ in both maps. Two new tests pin this:
 - `userspace-dp/src/afxdp/frame.rs:3625` (test-only assertion):
   update for `zone_id` field rename.
 - **EgressInterface constructors** (per Codex round-1 finding #3):
-  31 ctor sites across 9 files — `coordinator.rs`, `flow_cache.rs`,
-  `frame.rs`, `frame_tx.rs`, `tests.rs`, `worker.rs`, plus
-  `forwarding_build.rs` (the production source) and a couple of
-  test-helper sites in `forwarding.rs`/`session_glue.rs`. Each
-  ctor changes `zone: "lan".to_string()` → `zone_id: TEST_LAN_ZONE_ID`.
+  31 ctor sites across **9 files**:
+  `coordinator.rs`, `flow_cache.rs`, `forwarding_build.rs`,
+  `frame.rs`, `frame_tx.rs`, `ha.rs`, `session_glue.rs`,
+  `tests.rs`, `worker.rs`. Each ctor changes
+  `zone: "lan".to_string()` → `zone_id: TEST_LAN_ZONE_ID`.
+  (Codex round-2 nit: v1 listed `forwarding.rs` and missed `ha.rs`;
+  fixed here.)
 - **Inventory correction**: `test_fixtures.rs` does NOT construct
   `EgressInterface` (it uses `InterfaceSnapshot` for config
   fixtures); the v1 plan was wrong about that file. Real
