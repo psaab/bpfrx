@@ -546,13 +546,10 @@ func decodeSessionCloseEvent(payload []byte) (SessionDeltaInfo, bool) {
 		return SessionDeltaInfo{}, false
 	}
 
-	// 6 (fixed) + 2*addrSize + 2 (OwnerRGID) + 1 (Flags) + 2 (ZoneIDs)
-	// #919/#922: minimum is +2 for the new ingress/egress zone-id u8
-	// fields; older helpers without those bytes will be rejected here
-	// but never coexist with this decoder (the helper and daemon are
-	// shipped together).
-	minLen := 6 + 2*addrSize + 5
-	if len(payload) < minLen {
+	// Legacy minimum: 6 (fixed) + 2*addrSize + 2 (OwnerRGID) + 1 (Flags).
+	// New helpers append +2 (ZoneIDs); accept both for rolling upgrade.
+	legacyMin := 6 + 2*addrSize + 3
+	if len(payload) < legacyMin {
 		return SessionDeltaInfo{}, false
 	}
 
@@ -579,9 +576,14 @@ func decodeSessionCloseEvent(payload []byte) (SessionDeltaInfo, bool) {
 	off++
 	d.FabricRedirect = flags&SessionEventFlagFabricRedirect != 0
 	d.FabricIngress = flags&SessionEventFlagFabricIngress != 0
-	// #919/#922: bytes at [off]/[off+1] are u8 ingress/egress zone IDs.
-	d.IngressZoneID = uint16(payload[off])
-	d.EgressZoneID = uint16(payload[off+1])
+	// #919/#922: zone IDs are present iff the helper sent the +2-byte
+	// trailer. Older helpers leave them as 0 and the daemon falls back
+	// to the legacy zone-name string (empty for close events, which
+	// drops the close, matching pre-#919 behavior on a malformed close).
+	if len(payload) >= off+2 {
+		d.IngressZoneID = uint16(payload[off])
+		d.EgressZoneID = uint16(payload[off+1])
+	}
 
 	return d, true
 }

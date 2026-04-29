@@ -89,6 +89,19 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
             );
             continue;
         }
+        // #919/#922: defense-in-depth. The event-stream codec writes
+        // zone IDs as u8 (release builds elide the debug_assert). A
+        // hostile or future malformed snapshot with id > 255 would
+        // silently corrupt wire-level zone IDs without this gate.
+        if zone.id > u8::MAX as u16 {
+            eprintln!(
+                "xpf-userspace-dp: zone {:?} has id {} > wire u8 max {}; skipping",
+                zone.name,
+                zone.id,
+                u8::MAX
+            );
+            continue;
+        }
         state.zone_name_to_id.insert(zone.name.clone(), zone.id);
         state.zone_id_to_name.insert(zone.id, zone.name.clone());
     }

@@ -834,11 +834,9 @@ pub(super) fn parse_zone_encoded_fabric_ingress_from_frame(
         return None;
     }
     // Validate the encoded ID exists in the configured zone map; an
-    // unknown id is a stale or hostile frame.
-    if !forwarding.zone_id_to_name.contains_key(&id) {
-        return None;
-    }
-    Some(id)
+    // unknown id is a stale or hostile frame. Single hash lookup —
+    // the value isn't needed, just presence.
+    forwarding.zone_id_to_name.get(&id).map(|_| id)
 }
 
 pub(super) fn parse_packet_destination_from_frame(
