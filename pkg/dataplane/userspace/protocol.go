@@ -841,6 +841,12 @@ type SessionSyncRequest struct {
 	DstPort          uint16 `json:"dst_port,omitempty"`
 	IngressZone      string `json:"ingress_zone,omitempty"`
 	EgressZone       string `json:"egress_zone,omitempty"`
+	// #919/#922: u16 zone-id mirrors. Additive — the Rust daemon
+	// prefers the IDs when nonzero and falls back to the legacy
+	// name strings otherwise. Old peers without these fields
+	// continue to work (Rust serde sets the IDs to 0).
+	IngressZoneID    uint16 `json:"ingress_zone_id,omitempty"`
+	EgressZoneID     uint16 `json:"egress_zone_id,omitempty"`
 	OwnerRGID        int    `json:"owner_rg_id,omitempty"`
 	EgressIfindex    int    `json:"egress_ifindex,omitempty"`
 	TXIfindex        int    `json:"tx_ifindex,omitempty"`
