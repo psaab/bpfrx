@@ -1,6 +1,33 @@
 # #956 Phase 2: extract cos/flow_hash.rs from tx.rs
 
-Plan v2 — 2026-04-29. Addresses Codex round-1 (task-mokelx3b-mo5av4):
+Plan v3 — 2026-04-29. Addresses Codex round-2 (task-mokeuga7-ksgioj):
+five factual drift fixes.
+
+A. `exact_cos_flow_bucket` is NOT test-referenced. Tests use
+   `cos_flow_bucket_index` (which calls it internally), not the
+   raw function. v2 over-engineered a `pub(in crate::afxdp)` +
+   cfg-gated test-visibility scheme — none of it is needed.
+   `exact_cos_flow_bucket` stays file-private. Removed the
+   visibility-trick branch from the plan.
+
+B. Files-touched bullet still claimed `worker.rs` might need an
+   import-path update. Removed — Codex round-1 already
+   established the only call site is `tx.rs:5830`.
+
+C. Production-call-site list missed `tx.rs:4305, 4326` for
+   `cos_flow_bucket_index` and the nested call at `tx.rs:5987`
+   for `cos_item_flow_key`. Added.
+
+D. Files-touched bullet for `flow_hash.rs` still said "6
+   functions + the mask constants if moved with". Mask
+   constants stay in `types.rs` (round-1 #1); the bullet now
+   says 6 functions only.
+
+E. `cos/mod.rs` has a stale module-level comment referencing
+   the Phase 1 phase-order; updated to call out current Phase 2
+   = flow_hash; admission Phase 3.
+
+v2 — Addresses Codex round-1 (task-mokelx3b-mo5av4):
 five factual corrections.
 
 1. COS_FLOW_FAIR_BUCKETS / COS_FLOW_FAIR_BUCKET_MASK already live
@@ -40,7 +67,7 @@ The flow-hash subsystem in tx.rs comprises 6 functions at
 | Item | Line | Visibility | Callers |
 |---|---|---|---|
 | `mix_cos_flow_bucket` | 3833 | private (file) | `exact_cos_flow_bucket`, `cos_flow_hash_seed_from_os` (only) |
-| `cos_flow_hash_seed_from_os` | 3857 | `pub(super)` | external (worker.rs / queue init) |
+| `cos_flow_hash_seed_from_os` | 3857 | `pub(super)` | tx.rs:5830 (promotion) |
 | `exact_cos_flow_bucket` | 3927 | private | `cos_flow_bucket_index` (only) |
 | `cos_item_flow_key` | 3954 | private | `apply_cos_admission_ecn_policy`, `account_cos_queue_flow_*` |
 | `cos_flow_bucket_index` | 3962 | private | admission + promotion paths |
@@ -50,11 +77,12 @@ Phase 1's lesson: items used outside the moved module need to be
 declared `pub(in crate::afxdp)` so re-exports from `cos/mod.rs`
 work.
 
-`cos_flow_hash_seed_from_os` is already `pub(super)` because
-`worker.rs` calls it during queue initialization. After the move
-its source declaration becomes `pub(in crate::afxdp)` and the
-re-export from `cos/mod.rs` keeps the existing call site
-import path the same (or wrapped through `super::cos::{...}`).
+`cos_flow_hash_seed_from_os` is already `pub(super)` because it
+is called from `tx.rs:5830` (the promotion path that
+re-randomizes the per-queue hash seed). After the move its
+source declaration becomes `pub(in crate::afxdp)` and the
+re-export from `cos/mod.rs` keeps the call site import path
+short via `super::cos::{...}`.
 
 8 existing tests at `tx.rs:13455-13750` exercise the moved
 functions (5× `exact_cos_flow_bucket_*`, 2× distribution tests,
@@ -80,9 +108,9 @@ Create `userspace-dp/src/afxdp/cos/flow_hash.rs` with the 6
 moved functions. Each item that needs cross-module visibility
 gets `pub(in crate::afxdp)`. `cos/mod.rs` adds a `pub(super) mod
 flow_hash;` line plus re-exports for the items called from
-`tx.rs` and `worker.rs`.
+`tx.rs` (the only consumer; `worker.rs` does not call any of these).
 
-Move list (production code only, ~150 LOC):
+Move list (production code only, ~150 LOC, 6 functions):
 
 ```rust
 // cos/flow_hash.rs
@@ -93,8 +121,9 @@ use std::net::IpAddr;
 use crate::afxdp::types::{CoSPendingTxItem, CoSQueueRuntime,
     COS_FLOW_FAIR_BUCKET_MASK};            // mask import per Codex r1 #1
 
-// File-private (no callers outside flow_hash); per Codex round-1 #3
-// do NOT widen visibility just for the move.
+// File-private (no callers outside flow_hash). Codex round-2 #1
+// confirmed neither has a direct external caller — `tests` use
+// `cos_flow_bucket_index`, not `exact_cos_flow_bucket` directly.
 fn mix_cos_flow_bucket(seed: &mut u64, value: u64) { ... }
 fn exact_cos_flow_bucket(
     queue_seed: u64, flow_key: Option<&SessionKey>) -> u16 { ... }
@@ -109,38 +138,15 @@ pub(in crate::afxdp) fn cos_queue_prospective_active_flows(
     queue: &CoSQueueRuntime, flow_bucket: usize) -> u64 { ... }
 ```
 
-**Note on test reach**: 5 of the 8 staying tests directly call
-`exact_cos_flow_bucket` and the
-`cos_flow_hash_seed_from_os_draws_nonzero_entropy` test calls
-that function. Tests need module-private items reachable from
-`tx::tests`. Since `mix_cos_flow_bucket` and
-`exact_cos_flow_bucket` are file-private to `flow_hash.rs`, the
-8 tests CANNOT live in `tx::tests` and import
-`exact_cos_flow_bucket` directly without one of:
-(a) Widening `exact_cos_flow_bucket` to `pub(in crate::afxdp)`
-    behind `#[cfg(test)]` only,
-(b) Moving the 5 `exact_cos_flow_bucket_*` tests into
-    `cos::flow_hash::tests`, leaving the 3 admission-coupled
-    ones (none — they're all flow-hash unit tests) wherever.
-
-**Decision**: option (a). Add a `#[cfg(test)]
-pub(in crate::afxdp) fn exact_cos_flow_bucket_for_tests` thin
-wrapper, OR more cleanly: gate the visibility itself with
-`#[cfg(test)]`:
-
-```rust
-#[cfg(test)]
-pub(in crate::afxdp) use exact_cos_flow_bucket_impl as exact_cos_flow_bucket;
-#[cfg(not(test))]
-use exact_cos_flow_bucket_impl as exact_cos_flow_bucket;
-```
-
-The simpler approach (and what the implementation will actually
-do): make `exact_cos_flow_bucket` `pub(in crate::afxdp)`
-unconditionally — the function is harmless to expose (pure
-hash, no state), and the convoluted cfg-gated visibility tricks
-are not worth the readability cost. `mix_cos_flow_bucket` stays
-file-private (not called from tests).
+**Note on test reach** (Codex round-2 #1): the 8 tests staying
+in `tx::tests` reference `cos_flow_bucket_index` and
+`cos_flow_hash_seed_from_os` (production-exposed) directly, NOT
+`exact_cos_flow_bucket`. So no visibility widening is needed
+for the file-private helpers. If a future PR wants to test
+`exact_cos_flow_bucket` directly, those tests should land in
+`cos::flow_hash::tests` (where the file-private item is
+in-scope) rather than going through cross-module visibility
+tricks.
 
 `cos_flow_bucket_index` references `COS_FLOW_FAIR_BUCKET_MASK`.
 Investigation (Codex round-1 #1): the constants
@@ -188,31 +194,46 @@ masks were referenced only by `tx::tests` and would trigger
 `unused_imports` in non-test builds. Codex round-1 #5 verified
 the actual situation for flow_hash:
 
-- **Production paths** (do NOT gate):
+- **Production paths** (do NOT gate; Codex round-2 #4 added the
+  missed call sites):
   - `cos_queue_prospective_active_flows` at `tx.rs:4060, 4074, 4119`
-  - `cos_flow_bucket_index` at `tx.rs:4138, 4188, 5987`
-  - `cos_item_flow_key` at `tx.rs:4283, 4317, 4624`
+  - `cos_flow_bucket_index` at `tx.rs:4138, 4188, 4305, 4326, 5987`
+  - `cos_item_flow_key` at `tx.rs:4283, 4317, 4624` (plus a
+    nested call inside `cos_flow_bucket_index` at `tx.rs:5987`)
   - `cos_flow_hash_seed_from_os` at `tx.rs:5830` (promotion)
-- **Test-only**: `exact_cos_flow_bucket` is referenced by 5 tests
-  in `tx::tests`. The use statement for it must be behind
-  `#[cfg(test)]` to avoid `unused_imports` in non-test builds.
-  (`mix_cos_flow_bucket` stays file-private to flow_hash.rs and
-  has no external callers at all.)
+- **No test-only imports** (Codex round-2 #1): tests reference
+  `cos_flow_bucket_index` (production) and
+  `cos_flow_hash_seed_from_os` (production) directly. They do
+  NOT call `exact_cos_flow_bucket` or `mix_cos_flow_bucket` —
+  both stay file-private inside `cos/flow_hash.rs` and need no
+  cross-module exposure.
 
 ## Files touched
 
 - **NEW** `userspace-dp/src/afxdp/cos/flow_hash.rs`: ~150 LOC
-  of moved production code (6 functions + the mask constants
-  if moved with).
+  of moved production code (6 functions only — constants stay
+  in `types.rs`, see Codex round-1 #1).
 - `userspace-dp/src/afxdp/cos/mod.rs`: append `pub(super) mod
-  flow_hash;` + extend the `pub(super) use` block.
+  flow_hash;` + extend the `pub(super) use` block. Also update
+  the existing module-level comment (Codex round-2 unrelated
+  note) to reflect the current phase order: Phase 2 = flow_hash;
+  admission is Phase 3.
 - `userspace-dp/src/afxdp/tx.rs`: removes ~150 LOC; adds `use
-  super::cos::{...}`. Net ~150 LOC smaller.
-- `userspace-dp/src/afxdp/worker.rs` (if it imports
-  `cos_flow_hash_seed_from_os` directly): update import path
-  from `super::tx::...` to `super::cos::...`.
+  super::cos::{...}`. Net ~150 LOC smaller. Also update the
+  Phase 1 comment at `tx.rs:3546` that says admission moves
+  "in Phase 2" — admission is Phase 3 now (Codex round-1
+  unrelated note).
+- `userspace-dp/src/afxdp/cos/ecn.rs`: update the Phase 1
+  comment at `ecn.rs:5` that says admission moves "in Phase 2"
+  — admission is Phase 3 now.
+- `userspace-dp/src/afxdp/worker.rs`: NO change. Codex round-1
+  #2 verified that `cos_flow_hash_seed_from_os` is called from
+  `tx.rs:5830`, not from worker.rs.
 - The 8 existing tests stay in `tx::tests`; reach moved items
-  via the new use statements.
+  (`cos_flow_bucket_index`, `cos_flow_hash_seed_from_os`) via
+  the new use statements. None of them reference the file-
+  private helpers `mix_cos_flow_bucket` or
+  `exact_cos_flow_bucket` directly (Codex round-2 #1).
 
 ## Tests
 
