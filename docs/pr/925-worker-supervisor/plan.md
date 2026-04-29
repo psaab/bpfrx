@@ -1,6 +1,6 @@
 # #925: worker thread supervisor (Phase 1 — catch + report)
 
-Plan v2 — 2026-04-29. Addresses Codex hostile review (task-mojjrq43-8h1u9c, NEEDS-REVISION).
+Plan v3 — 2026-04-29. Addresses Codex round-2 review (task-mojk796g-0nm5pi): poison-safety overclaim narrowed, real spawn path identified, doc inconsistency fixed.
 
 ## Investigation findings (Claude, first-hand)
 
@@ -211,7 +211,7 @@ let join = thread::Builder::new()
     .expect("spawn worker");
 ```
 
-### `AssertUnwindSafe` rationale (corrected per Codex Q2)
+### `AssertUnwindSafe` rationale (narrowed per Codex round-2)
 
 `worker_loop` does NOT take `&mut` parameters; it takes owned
 values and `Arc`s. After a panic:
@@ -221,24 +221,56 @@ values and `Arc`s. After a panic:
   the closure.
 - **`Arc<Mutex<>>` shared state** (sessions, neighbors, etc.) MAY
   become poisoned if `worker_loop` panicked while holding a lock.
-  This is acceptable per #949's poison policy: every shared mutex
-  read uses `lock().unwrap_or_else(|e| e.into_inner())`, ignoring
-  poison. The data may be in a partial-update state, but that's the
-  same hazard #949 already accepted.
 
-So `AssertUnwindSafe` is sound here for the specific reason
-"poison-tolerant shared state plus owned-value drop", NOT v1's
-incorrect "references are dropped" reasoning.
+**Important narrowing**: #949's `into_inner` poison policy is
+**scoped to `dynamic_neighbors` only**. Session maps
+(`shared_sessions`, `shared_nat_sessions`,
+`shared_forward_wire_sessions`) and worker command queues still
+use `if let Ok(mut g) = mutex.lock()` (e.g.
+`shared_ops.rs:627,639,665,689,718`). On poison those `if let`
+branches silently fail — subsequent operations on poisoned shared
+maps are skipped, not retried.
 
-### Shared-state invariant audit (Codex Q3)
+This means **a worker_loop panic that poisons a shared session
+mutex causes silent dropouts** in those maps until the daemon is
+restarted. This PR does NOT fix that. Phase 1 is "detection only":
+- Operator sees the dead worker via `cli show chassis forwarding`.
+- Operator restarts the daemon to recover.
+- HA peer continues serving traffic in the meantime.
+
+So `AssertUnwindSafe` is sound here in the narrow sense: "the
+panic is captured for diagnostics; full state recovery is NOT
+promised." Phase 2 (respawn) will need to either (a) extend the
+#949 `into_inner` policy to all shared mutexes, or (b) tear
+down and rebuild the shared state.
+
+The plan's promise is honest: catch + report + degraded operation,
+nothing more.
+
+### Shared-state invariant audit (Codex Q3 + round-2)
 
 `publish_shared_session` updates the primary session map, owner
 index, NAT alias map, and forward-wire map in **separate** lock
 regions (`shared_ops.rs:620`). A panic between steps could leave
 map/index skew. **This pre-exists this PR.** The plan does not
 introduce new invariant hazards; it just reports the panic that
-caused them. Document this honestly: catching a panic does not
-imply recoverable-state semantics.
+caused them.
+
+**Plan-1 scope of poison damage** (per Codex round-2 narrowing):
+
+| Mutex | Read pattern | What breaks on poison |
+|---|---|---|
+| `dynamic_neighbors` (sharded, #949) | `into_inner` recovery | Stale or partial MAC entries; next ARP/NA learn overwrites. Self-healing. |
+| `shared_sessions` | `if let Ok` skip-on-poison | Session inserts/lookups skipped on the affected shard. Manifests as policy re-evaluation per packet. |
+| `shared_nat_sessions` | `if let Ok` skip-on-poison | Same; NAT sessions silently leak. |
+| `shared_forward_wire_sessions` | `if let Ok` skip-on-poison | Same. |
+| `shared_owner_rg_indexes` | `if let Ok` skip-on-poison | HA index updates skipped on the affected shard. |
+| `worker_commands` (per-worker `VecDeque`) | `try_lock` then move/drain | Commands accumulate undrained; dead worker never processes them anyway. |
+
+In all "skip-on-poison" cases the daemon stays up but the affected
+shard becomes a black hole. **Operator action**: restart the
+daemon. The dead-worker indicator in `cli show chassis forwarding`
+is the trigger.
 
 ### `panic_payload_message` helper (corrected per Codex Q6)
 
@@ -282,28 +314,87 @@ Test for the fallback: panic with `i32`; assert message ==
 
 ## Tests
 
-### Real spawn-path test (Codex Q9)
+### Real spawn-path test (Codex round-2 — corrected)
 
-The plan adds a `#[cfg(test)]`-only `WorkerCommand::PanicInjection`
-variant. Production builds do not include this variant. The test
-spawns a worker through the actual `Coordinator::spawn_workers`
-path, sends a `PanicInjection` command, joins the thread, and
-asserts the dead flag is set + panic message is published via
-`worker_runtime_snapshots()`.
+Codex round-2 noted v2 referenced `Coordinator::spawn_workers`
+which doesn't exist. The actual spawn happens inside
+`Coordinator::reconcile` at `coordinator.rs:670-748`.
+
+The test exercises the same helper that production uses. Strategy:
+extract the spawn-closure body into a private helper
+`spawn_supervised_worker` so the test can call it directly with
+a no-op `worker_loop` substitute that panics on demand. This
+keeps the production spawn path intact (still called from
+`reconcile`) while making it testable.
 
 ```rust
-#[cfg(test)]
+// In coordinator.rs:
+fn spawn_supervised_worker<F: FnOnce() + Send + 'static>(
+    worker_id: u32,
+    runtime_atomics: Arc<WorkerRuntimeAtomics>,
+    panic_slot: Arc<Mutex<Option<String>>>,
+    body: F,
+) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name(format!("xpf-userspace-worker-{worker_id}"))
+        .spawn(move || {
+            let result = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(body),
+            );
+            if let Err(payload) = result {
+                let msg = panic_payload_message(&payload);
+                eprintln!(
+                    "xpf-userspace-dp: worker_loop panicked (worker_id={}): {}",
+                    worker_id, msg
+                );
+                match panic_slot.lock() {
+                    Ok(mut slot) => *slot = Some(msg),
+                    Err(poisoned) => *poisoned.into_inner() = Some(msg),
+                }
+                runtime_atomics.dead.store(true, Ordering::Relaxed);
+            }
+        })
+        .expect("spawn worker")
+}
+
+// In tests module:
 #[test]
-fn worker_panic_is_caught_and_reported() {
-    let mut coordinator = Coordinator::new_minimal_for_test();
-    coordinator.spawn_workers(/* test config */);
-    coordinator.send_command_to_worker(0, WorkerCommand::PanicInjection);
-    coordinator.wait_for_worker_dead(0, Duration::from_secs(2));
-    let snapshots = coordinator.worker_runtime_snapshots();
-    assert!(snapshots[0].dead);
-    assert!(snapshots[0].panic_message.contains("PanicInjection"));
+fn supervisor_catches_string_panic_and_marks_dead() {
+    let atomics = Arc::new(WorkerRuntimeAtomics::new());
+    let slot = Arc::new(Mutex::new(None));
+    let join = spawn_supervised_worker(
+        7,
+        atomics.clone(),
+        slot.clone(),
+        || panic!("intentional test panic"),
+    );
+    join.join().expect("supervisor must not propagate panic");
+    assert!(atomics.dead.load(Ordering::Relaxed));
+    let msg = slot.lock().unwrap().clone().unwrap_or_default();
+    assert_eq!(msg, "intentional test panic");
+}
+
+#[test]
+fn supervisor_catches_string_payload_panic() { /* String, not &str */ }
+
+#[test]
+fn supervisor_falls_back_for_non_string_panic() {
+    /* panic_any(42_i32); assert_eq!(msg, "non-string panic payload") */
 }
 ```
+
+Production usage in `reconcile` becomes:
+
+```rust
+let join = spawn_supervised_worker(
+    worker_id,
+    runtime_atomics.clone(),
+    panic_slot.clone(),
+    move || worker_loop(/* args */),
+);
+```
+
+The test exercises the same helper. No parallel-harness drift.
 
 ### Unit tests for `panic_payload_message`
 
