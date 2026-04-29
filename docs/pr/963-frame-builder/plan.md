@@ -1,7 +1,26 @@
 # #963: decompose rewrite_forwarded_frame_in_place (the slow-path
 # god function) into v4/v6 specialized helpers + extracted subroutines
 
-Plan v2 — 2026-04-29. Addresses Codex round-1 (task-mok8bo19-r2vheq):
+Plan v3 — 2026-04-29. Addresses Codex round-2 (task-mok8khp9-0jm235):
+
+a. Stale Risk section still claimed "compiler's lowering options
+   identical" via `#[inline]`. Rewrote to say `#[inline]` is a hint,
+   not a guarantee; perf parity is validated by the smoke gate.
+
+b. "Improves I-cache locality" deterministic claim softened to a
+   *possible* side-benefit, since `#[inline]` doesn't guarantee
+   the v6 helper is kept out-of-line.
+
+c. Removed the phantom `debug_log_inplace_eth(...)` 4th helper
+   from the body sketch. The cfg(debug-log) block stays inline
+   (it captures local prep state; extracting it would just widen
+   the helper signature with no benefit).
+
+Plus: TTL sentinel test extended to be table-driven over IPv4
+TTL and IPv6 hop-limit so it validates the skip_ttl gate in
+both rewrite_apply_v4 and rewrite_apply_v6.
+
+v2 — Addresses Codex round-1 (task-mok8bo19-r2vheq):
 five blocking findings, all fixed.
 
 1. Payload-shift / eth-header ordering corrected. Plan v1 prose
@@ -87,9 +106,11 @@ This is the minimal scope that addresses the issue:
   small dispatch on address family.
 - Keeps every existing call site identical (no API change).
 - Preserves all existing tests (no behavioral change).
-- Improves I-cache locality for the v4 hot path: when a binding only
-  sees IPv4 traffic, the v6 code is cold and gets evicted from
-  I-cache instead of being interleaved.
+- *May* improve I-cache locality for the v4-only branch in
+  bindings that see only IPv4 traffic — but this depends on
+  whether the compiler keeps the v6 helper out-of-line, which
+  `#[inline]` does not guarantee. Treat as a possible
+  side-benefit, NOT a deterministic outcome (Codex round-2 #2).
 
 ### Decomposition
 
@@ -180,9 +201,19 @@ pub(super) fn rewrite_forwarded_frame_in_place(
         )?,
         _ => return None,
     }
-    // Debug log block + checksum verification (unchanged shape, just
-    // moved to live next to the dispatch).
-    debug_log_inplace_eth(packet, &prep, meta);
+    // The cfg(feature = "debug-log") header-dump block and the
+    // verify_built_frame_checksums call stay INLINE here (not
+    // extracted into a 4th helper). They reference local state
+    // (vlan_id from prep, frame_len, ip_start, addr_family) and
+    // moving them into a helper would either widen the helper's
+    // signature with all those params or require a captured
+    // state struct — either way more code, no benefit. Keep the
+    // existing inline block under the new dispatch.
+    #[cfg(feature = "debug-log")]
+    {
+        // Same thread_local INPLACE_FWD_DBG_COUNT block as today's
+        // body, lines 1696-1726, just relocated below the dispatch.
+    }
     if cfg!(feature = "debug-log") {
         verify_built_frame_checksums(packet);
     }
@@ -245,13 +276,17 @@ function extraction. Add:
    correctly suppresses NAT.
 
 2. `rewrite_forwarded_frame_in_place_skips_ttl_when_fabric_ingress_flag_set`:
-   set `meta.meta_flags = FABRIC_INGRESS_FLAG (0x80)` so the
-   sending peer is treated as having already decremented TTL.
-   Capture the IP TTL before and after the rewrite; assert
-   pre == post (no decrement).
+   table-driven over IPv4 TTL (offset 8) and IPv6 hop-limit
+   (offset 7). For each address family, set
+   `meta.meta_flags = FABRIC_INGRESS_FLAG (0x80)` so the sending
+   peer is treated as having already decremented TTL. Capture the
+   relevant byte before and after the rewrite; assert pre == post
+   (no decrement). Covering both families validates the skip_ttl
+   gate in both extracted helpers (rewrite_apply_v4 and
+   rewrite_apply_v6) — Codex round-2 suggestion.
 
 These guard the `apply_nat` and `skip_ttl` booleans through the
-extraction.
+extraction across both families.
 
 ### Port-enforcement behavior (Codex round-1 #3)
 
@@ -329,10 +364,12 @@ The repo has no root `Cargo.toml`; cargo commands must run with
 
 ## Risk
 
-**Low.** Pure structural refactor with no behavior change. The
-helpers all `#[inline]`, so the compiler's lowering options are
-identical to today. Existing test coverage is dense (~30 tests
-exercising every branch axis in the function).
+**Low.** Pure structural refactor with no behavior change.
+`#[inline]` is a hint to the compiler, not a guarantee — codegen
+may shift either direction (size, register allocation, layout).
+Perf parity is validated by the cluster smoke gate, not asserted
+by the inline attribute. Existing test coverage is dense (~30
+tests exercising every branch axis in the function).
 
 The only realistic risk is an off-by-one or borrow-checker mistake
 during the cut — caught by the test suite.
