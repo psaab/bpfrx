@@ -75,8 +75,8 @@ pub(crate) enum PrefixSetV4 {
     /// 1..=16 prefixes; linear scan on the IP. Cache-friendly and
     /// branch-predictable for small sets.
     Linear(Vec<PrefixV4>),
-    /// >16 prefixes; binary Patricia trie. Walk MSB→LSB; if any
-    /// prefix-end node is hit along the path, return true.
+    /// >16 prefixes; uncompressed binary trie. Walk MSB→LSB; if
+    /// any prefix-end node is hit along the path, return true.
     Trie(PrefixTrieV4),
 }
 ```
