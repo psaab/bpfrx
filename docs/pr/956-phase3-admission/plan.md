@@ -1,6 +1,41 @@
 # #956 Phase 3: extract cos/admission.rs from tx.rs
 
-Plan v1 — 2026-04-29.
+Plan v2 — 2026-04-29. Addresses Codex round-1 (task-mokgkrf5-99cau9):
+five MAJOR findings + minor notes.
+
+1. `bdp_floor_bytes` is called by tests at `tx.rs:10917, 10998`,
+   so it MUST be `pub(in crate::afxdp)`. v1 wrongly classified it
+   as file-private.
+
+2. Test-referenced constants (verified by grep): tests use
+   `COS_FLOW_FAIR_MIN_SHARE_BYTES` (17×), `COS_ECN_MARK_THRESHOLD_NUM/_DEN`
+   (11× each), `COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS` (2×). All four
+   need `pub(in crate::afxdp)`. `RTT_TARGET_NS` and
+   `SHARED_EXACT_BURST_HEADROOM` are not test-referenced and stay
+   private.
+
+3. **Big finding**: `COS_MIN_BURST_BYTES` (currently in tx.rs
+   private) is referenced inside `cos_flow_aware_buffer_limit`
+   (which moves to admission.rs). It also has 9 other tx.rs
+   callers — moving it would force tx.rs to import back from
+   admission. Decision: leave in tx.rs but bump visibility to
+   `pub(in crate::afxdp)`; admission.rs imports via
+   `use crate::afxdp::tx::COS_MIN_BURST_BYTES`. Phase 4+ may
+   consolidate to a shared location.
+
+4. Stale-text cleanup IS needed in this PR (`tx.rs:3543`,
+   `cos/ecn.rs:2`, `cos/mod.rs:1`) — those comments correctly say
+   admission moves "in Phase 3" but Phase 3 lands in this PR, so
+   they should switch to past tense.
+
+5. The promotion doc block at `tx.rs:5401-5467` is separated from
+   `promote_cos_queue_flow_fair` by V-min code. Implementation
+   must keep the doc attached to its function during the move.
+
+Plus minor notes: import `crate::session::SessionKey` for
+accounting fns, do NOT import `ECN_MASK`/`ECN_NOT_ECT` (not used
+by admission code), `account_*` accounting fns stay in admission
+(treated as admission-state lifecycle, not Phase 5 queue_ops).
 
 Continues #956 Phase 1 (cos/ecn.rs at PR #976) and Phase 2
 (cos/flow_hash.rs at PR #977). Phase 3 extracts the admission /
@@ -48,29 +83,49 @@ re-export block.
 
 ### Move list (~700 LOC)
 
+Codex round-1 verified call sites and corrected several
+visibility decisions:
+
 ```rust
 // cos/admission.rs
+use crate::afxdp::ethernet::*; // if needed by admission policy parse
 use crate::afxdp::types::{CoSInterfaceRuntime, CoSPendingTxItem,
     CoSQueueRuntime, WorkerCoSQueueFastPath};
 use crate::afxdp::umem::MmapArea;
+use crate::session::SessionKey;     // accounting fns reach SessionKey
+                                     // (Codex round-1 noted missing
+                                     // import)
 use super::flow_hash::{cos_flow_bucket_index, cos_flow_hash_seed_from_os};
-use super::ecn::{maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared,
-    ECN_MASK, ECN_NOT_ECT};
+use super::ecn::{maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared};
+                                     // do NOT import ECN_MASK / ECN_NOT_ECT —
+                                     // not used by admission code (Codex r1)
+use crate::afxdp::tx::COS_MIN_BURST_BYTES;
+                                     // (Codex round-1 #3) — referenced by
+                                     // cos_flow_aware_buffer_limit. Leave
+                                     // the const in tx.rs because multiple
+                                     // tx.rs sites consume it; bump
+                                     // visibility to pub(in crate::afxdp)
+                                     // so admission can reach. Phase 4+
+                                     // may consolidate to types.rs or
+                                     // cos/mod.rs.
 
-// Constants (all private to admission.rs unless tests need them).
-const COS_FLOW_FAIR_MIN_SHARE_BYTES: u64 = 16 * 1500;
+// Constants used by tests in tx::tests are pub(in crate::afxdp);
+// purely-internal ones stay private (Codex round-1 #2).
+pub(in crate::afxdp) const COS_FLOW_FAIR_MIN_SHARE_BYTES: u64 = 16 * 1500;
 const _: () = assert!(COS_FLOW_FAIR_MIN_SHARE_BYTES >= 16 * 1500);
-const COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS: u64 = 5_000_000;
+pub(in crate::afxdp) const COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS: u64 = 5_000_000;
 const _: () = assert!(COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS >= 1_000_000);
-const COS_ECN_MARK_THRESHOLD_NUM: u64 = 1;
-const COS_ECN_MARK_THRESHOLD_DEN: u64 = 3;
+pub(in crate::afxdp) const COS_ECN_MARK_THRESHOLD_NUM: u64 = 1;
+pub(in crate::afxdp) const COS_ECN_MARK_THRESHOLD_DEN: u64 = 3;
 const _: () = assert!(COS_ECN_MARK_THRESHOLD_NUM < COS_ECN_MARK_THRESHOLD_DEN);
 const _: () = assert!(COS_ECN_MARK_THRESHOLD_DEN > 0);
 const RTT_TARGET_NS: u64 = 10_000_000;
 const SHARED_EXACT_BURST_HEADROOM: u64 = 2;
 
-// Functions — pub(in crate::afxdp) for the 4 with external callers.
-fn bdp_floor_bytes(...) -> u64 { ... }
+// Functions — pub(in crate::afxdp) where production callers OR
+// tests reach them directly. bdp_floor_bytes is test-called at
+// tx.rs:10917, 10998 (Codex round-1 #1) so it MUST be visible.
+pub(in crate::afxdp) fn bdp_floor_bytes(...) -> u64 { ... }
 pub(in crate::afxdp) fn cos_queue_flow_share_limit(...) -> u64 { ... }
 pub(in crate::afxdp) fn cos_flow_aware_buffer_limit(...) -> u64 { ... }
 pub(in crate::afxdp) fn account_cos_queue_flow_enqueue(...) { ... }
@@ -79,6 +134,31 @@ pub(in crate::afxdp) fn apply_cos_admission_ecn_policy(...) -> bool { ... }
 pub(in crate::afxdp) fn apply_cos_queue_flow_fair_promotion(...) { ... }
 fn promote_cos_queue_flow_fair(...) { ... }
 ```
+
+**Notes**:
+- `tx.rs` declares `pub(in crate::afxdp) const COS_MIN_BURST_BYTES`
+  (was private). admission.rs imports it via
+  `use crate::afxdp::tx::COS_MIN_BURST_BYTES`. The `tx -> admission`
+  edge isn't ideal, but the const has 9 callers in `tx.rs` itself,
+  so leaving it there until a later cleanup is the smaller risk.
+
+- The promotion-rationale doc block currently at `tx.rs:5401-5467`
+  (Codex round-1 unrelated note) is separated from
+  `promote_cos_queue_flow_fair` by intervening V-min code. The
+  implementation must ensure it moves with `promote_cos_queue_flow_fair`
+  to admission.rs so the documentation stays attached to the function
+  it documents.
+
+- `account_cos_queue_flow_enqueue`/`_dequeue` are queue-accounting
+  state helpers; Codex round-1 flagged them as arguably belonging
+  to Phase 5 (`cos/queue_ops.rs`). **Decision**: keep in admission.rs.
+  Both functions exist solely to maintain the
+  `flow_bucket_bytes`/`active_flow_buckets` state that
+  `cos_queue_flow_share_limit` and
+  `cos_queue_prospective_active_flows` consume; treating them as
+  admission-state lifecycle hooks is more accurate than calling
+  them queue-ops. Phase 5 may revisit if queue_ops grows a clearer
+  abstraction boundary.
 
 `cos/mod.rs` re-exports the 6 cross-module items via
 `pub(super) use`. Tests stay in `tx::tests` — same Phase 1+2
@@ -111,14 +191,24 @@ may need additional cfg-gated imports (Phase 1 lesson).
 - 0 new tests required — pure structural refactor. ~30 admission-
   related tests stay in `tx::tests`.
 
-### Phase-1 stale-text cleanup
+### Phase-1+2 stale-text cleanup
 
-Phase 1 left a comment in `tx.rs` (the block at the cos/use site)
-saying admission moves "in Phase 3" — already correct after the
-Copilot fix on PR #977. No additional cleanup needed.
+Codex round-1 #4 caught that prior phases' comments will be
+factually stale once Phase 3 ships. As of PR #977 those comments
+correctly say admission moves "in Phase 3" — but in this PR
+admission has already moved, so the comments need to be updated
+again to past tense (or removed).
 
-`cos/ecn.rs` has the same correct "Phase 3" reference as of
-PR #977. No update needed.
+Items to fix in this PR's implementation:
+- `tx.rs:3543` — the `use super::cos::{...}` block comment
+  currently says "they move with admission to cos/admission.rs in
+  **Phase 3**". After Phase 3 ships, this should read:
+  "Admission policy was extracted to cos/admission.rs in Phase 3
+  (PR #...)." Fix the wording in this PR's tx.rs edit.
+- `cos/ecn.rs:2` — Phase 1 docstring's reference to admission moving
+  in Phase 3. Same past-tense fix.
+- `cos/mod.rs:1` — phase-order header. Update to call out the
+  current state (Phase 3 = admission; Phase 4+ are still future).
 
 ## Tests
 
