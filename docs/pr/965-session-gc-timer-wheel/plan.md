@@ -1,6 +1,31 @@
 # #965: bucketed timer-wheel session GC (replace O(N) scan)
 
-Plan v9 — 2026-04-29. Addresses Codex round-8 wording fixes
+Plan v10 — 2026-04-29. Addresses Codex round-9 wording fixes
+(task-mok2wa0n-cvx3es):
+
+i. CoS smoke gate enumerated per-class against the actual
+   `test/incus/cos-iperf-config.set` fixture. Each iperf-{a,b,c,
+   d,e,f} class plus best-effort gets its own P=12 throughput
+   gate scaled to ≈ 90 % of its shape (iperf-c at 88 %, the
+   historical 25 g → 22 Gb/s smoke). All P=12 rows are blocking
+   gates; iperf-c also keeps the P=1 ≥ 6 Gb/s historical gate.
+   Other classes get a P=1 counter-only smoke (assert egress
+   queue counter increments by the iperf3 byte count) that
+   validates the classifier path lit up without imposing a
+   single-stream throughput gate.
+
+ii. v8 changelog header rewritten to reference the corrected
+   sub-tick lag bounds (today ≤ 1 s; wheel ≤ 2 s; additional
+   deviation < 1 wheel-tick) instead of the wrong "preserves
+   the existing 1-s lag bound" prose.
+
+iii. "Not popped during this call" wording tightened to "not
+   popped during this BUCKET drain" both in the inline drain
+   comment and the v8 changelog summary, with explicit note
+   that re-pushes into LATER buckets the outer multi-tick
+   catch-up loop visits ARE popped within the same call.
+
+v9 — Addresses Codex round-8 wording fixes
 (task-mok24765-mmf95n; no blocking findings, all substantive
 claims verified correct):
 
@@ -835,21 +860,23 @@ continue to pass.
    | best-effort | 5207  | 100 m exact | ≥ 90 Mb/s     | counter-only |
 
    - "P=12 gate" runs `iperf3 -P 12 -p <port>` and asserts the
-     achieved Gb/s is ≥ the listed minimum. iperf-c is the
-     historical 22 Gb/s smoke; the others get a shaped-rate
-     gate scaled to their queue.
-   - "counter-only" rows still run an iperf3 P=1 against the
-     class but only assert that the egress class counter
-     (`show class-of-service interface reth0 unit 80`) lights
-     up by at least the iperf3 byte count. This validates the
+     achieved Gb/s is ≥ the listed minimum. **Every P=12 row is
+     a blocking gate.** iperf-c is the historical 22 Gb/s smoke
+     (≈ 88 % of its 25 g shape); the others use ≈ 90 % of their
+     respective shapes (matches typical TCP/L2 overhead).
+   - "P=1 counter-only" rows run `iperf3 -P 1 -p <port>` against
+     the class and assert that the egress class counter
+     (`show class-of-service interface reth0 unit 80`) increments
+     by at least the iperf3 byte count. This validates the
      classifier / queue path lit up without imposing a hard
-     throughput gate on classes whose shape would make a fixed
-     gate brittle.
-   - **Hard gate on iperf-c only.** The other rows are smoke for
-     "the queue path actually executed". A class whose iperf3
-     run lights up best-effort (queue 0) instead of the targeted
-     class is a config-misapplied smoke that does NOT validate
-     the refactor; treat it as a failure of step 3.
+     throughput gate at single-stream P=1 (where small-packet
+     overhead can drag below the shape under noise). iperf-c is
+     the only class with a P=1 throughput gate (≥ 6 Gb/s) and
+     stays as the historical hard gate.
+   - A class whose iperf3 run lights up best-effort (queue 0)
+     instead of the targeted class is a config-misapplied smoke
+     that does NOT validate the refactor; treat it as a failure
+     of step 3 regardless of the iperf3 number.
 4. **Mouse-latency gate** — TWO synthetic workloads (per Codex
    round-5 #2 + round-6 #4 / #5). The numbers below are the
    single source of truth; any other section that mentions "the
