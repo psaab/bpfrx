@@ -1557,18 +1557,34 @@ pub(super) fn build_forwarded_frame_into(
     )
 }
 
-pub(super) fn rewrite_forwarded_frame_in_place(
-    area: &MmapArea,
+/// Common preamble for `rewrite_forwarded_frame_in_place`: validate
+/// L3 offset, compute payload_len, resolve src_mac/vlan_id/apply_nat,
+/// SHIFT the payload to its new position FIRST, then write the
+/// Ethernet header.
+///
+/// Order matters: when VLAN tag is added (eth_len 14 → 18) the
+/// payload shifts forward by 4 bytes. If we wrote the new Ethernet
+/// header first, the `copy_within(14.., 18)` payload shift would
+/// read from bytes that have just been overwritten by the VLAN tag
+/// and corrupt the IP header.
+struct RewritePrep {
+    eth_len: usize,
+    ip_start: usize,
+    frame_len: usize,
+    apply_nat: bool,
+    skip_ttl: bool,
+    vlan_id: u16, // for the cfg-gated debug-log block
+}
+
+#[inline]
+fn rewrite_prepare_eth(
+    frame: &mut [u8],
     desc: XdpDesc,
-    meta: impl Into<ForwardPacketMeta>,
+    meta: ForwardPacketMeta,
     decision: &SessionDecision,
     apply_nat_on_fabric: bool,
-    expected_ports: Option<(u16, u16)>,
-) -> Option<u32> {
-    let meta = meta.into();
+) -> Option<RewritePrep> {
     let dst_mac = decision.resolution.neighbor_mac?;
-    let enforced_ports = expected_ports;
-    let frame = unsafe { area.slice_mut_unchecked(desc.addr as usize, UMEM_FRAME_SIZE as usize)? };
     let current_len = desc.len as usize;
     let l3 = match meta.l3_offset {
         14 | 18 => meta.l3_offset as usize,
@@ -1602,6 +1618,8 @@ pub(super) fn rewrite_forwarded_frame_in_place(
     if frame_len > frame.len() {
         return None;
     }
+    // Shift payload BEFORE writing the new Ethernet header (see
+    // doc-comment above for why the order matters on VLAN push).
     if eth_len != l3 {
         frame.copy_within(l3..l3 + payload_len, eth_len);
     }
@@ -1612,90 +1630,153 @@ pub(super) fn rewrite_forwarded_frame_in_place(
         vlan_id,
         ether_type,
     )?;
-    let packet = &mut frame[..frame_len];
-    let ip_start = eth_len;
-    // Fabric-ingress packets already had TTL decremented by the sending peer.
+    // Fabric-ingress packets already had TTL decremented by the
+    // sending peer (FABRIC_INGRESS_FLAG = 0x80).
     let skip_ttl = (meta.meta_flags & 0x80) != 0;
+    Some(RewritePrep {
+        eth_len,
+        ip_start: eth_len,
+        frame_len,
+        apply_nat,
+        skip_ttl,
+        vlan_id,
+    })
+}
+
+#[inline]
+fn rewrite_apply_v4(
+    packet: &mut [u8],
+    ip_start: usize,
+    meta: ForwardPacketMeta,
+    decision: &SessionDecision,
+    apply_nat: bool,
+    skip_ttl: bool,
+    expected_ports: Option<(u16, u16)>,
+) -> Option<()> {
+    if packet.len() < ip_start + 20 {
+        return None;
+    }
+    let ihl = ((packet[ip_start] & 0x0f) as usize) * 4;
+    if ihl < 20 || packet.len() < ip_start + ihl {
+        return None;
+    }
+    if !skip_ttl && packet[ip_start + 8] <= 1 {
+        return None;
+    }
+    let old_src = Ipv4Addr::new(
+        packet[ip_start + 12],
+        packet[ip_start + 13],
+        packet[ip_start + 14],
+        packet[ip_start + 15],
+    );
+    let old_dst = Ipv4Addr::new(
+        packet[ip_start + 16],
+        packet[ip_start + 17],
+        packet[ip_start + 18],
+        packet[ip_start + 19],
+    );
+    let old_ttl = packet[ip_start + 8];
+    let rel_l4 = ihl;
+    let repaired_ports =
+        restore_l4_tuple_from_meta(&mut packet[ip_start..], meta, rel_l4).unwrap_or(false);
+    if apply_nat {
+        apply_nat_ipv4(&mut packet[ip_start..], meta.protocol, decision.nat)?;
+    }
+    if !skip_ttl {
+        packet[ip_start + 8] -= 1;
+    }
+    adjust_ipv4_header_checksum(
+        &mut packet[ip_start..ip_start + ihl],
+        old_src,
+        old_dst,
+        old_ttl,
+    )?;
+    let enforced = enforce_expected_ports(packet, meta.addr_family, meta.protocol, expected_ports)
+        .unwrap_or(false);
+    if repaired_ports && !enforced {
+        recompute_l4_checksum_ipv4(&mut packet[ip_start..], ihl, meta.protocol, true)?;
+    }
+    Some(())
+}
+
+#[inline]
+fn rewrite_apply_v6(
+    packet: &mut [u8],
+    ip_start: usize,
+    meta: ForwardPacketMeta,
+    decision: &SessionDecision,
+    apply_nat: bool,
+    skip_ttl: bool,
+    expected_ports: Option<(u16, u16)>,
+) -> Option<()> {
+    if packet.len() < ip_start + 40 {
+        return None;
+    }
+    if !skip_ttl && packet[ip_start + 7] <= 1 {
+        return None;
+    }
+    let meta_rel = meta.l4_offset.wrapping_sub(meta.l3_offset) as usize;
+    let rel_l4 = if meta_rel >= 40 && meta.l4_offset > meta.l3_offset {
+        meta_rel
+    } else {
+        packet_rel_l4_offset(&packet[ip_start..], meta.addr_family)?
+    };
+    let repaired_ports =
+        restore_l4_tuple_from_meta(&mut packet[ip_start..], meta, rel_l4).unwrap_or(false);
+    if apply_nat {
+        apply_nat_ipv6(&mut packet[ip_start..], meta.protocol, decision.nat)?;
+    }
+    if !skip_ttl {
+        packet[ip_start + 7] -= 1;
+    }
+    let enforced = enforce_expected_ports(packet, meta.addr_family, meta.protocol, expected_ports)
+        .unwrap_or(false);
+    if repaired_ports && !enforced {
+        recompute_l4_checksum_ipv6(&mut packet[ip_start..], meta.protocol)?;
+    }
+    Some(())
+}
+
+pub(super) fn rewrite_forwarded_frame_in_place(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: impl Into<ForwardPacketMeta>,
+    decision: &SessionDecision,
+    apply_nat_on_fabric: bool,
+    expected_ports: Option<(u16, u16)>,
+) -> Option<u32> {
+    let meta = meta.into();
+    let frame = unsafe { area.slice_mut_unchecked(desc.addr as usize, UMEM_FRAME_SIZE as usize)? };
+    let prep = rewrite_prepare_eth(frame, desc, meta, decision, apply_nat_on_fabric)?;
+    let packet = &mut frame[..prep.frame_len];
     match meta.addr_family as i32 {
-        libc::AF_INET => {
-            if packet.len() < ip_start + 20 {
-                return None;
-            }
-            let ihl = ((packet[ip_start] & 0x0f) as usize) * 4;
-            if ihl < 20 || packet.len() < ip_start + ihl {
-                return None;
-            }
-            if !skip_ttl && packet[ip_start + 8] <= 1 {
-                return None;
-            }
-            let old_src = Ipv4Addr::new(
-                packet[ip_start + 12],
-                packet[ip_start + 13],
-                packet[ip_start + 14],
-                packet[ip_start + 15],
-            );
-            let old_dst = Ipv4Addr::new(
-                packet[ip_start + 16],
-                packet[ip_start + 17],
-                packet[ip_start + 18],
-                packet[ip_start + 19],
-            );
-            let old_ttl = packet[ip_start + 8];
-            let rel_l4 = ihl;
-            let repaired_ports =
-                restore_l4_tuple_from_meta(&mut packet[ip_start..], meta, rel_l4).unwrap_or(false);
-            if apply_nat {
-                apply_nat_ipv4(&mut packet[ip_start..], meta.protocol, decision.nat)?;
-            }
-            if !skip_ttl {
-                packet[ip_start + 8] -= 1;
-            }
-            adjust_ipv4_header_checksum(
-                &mut packet[ip_start..ip_start + ihl],
-                old_src,
-                old_dst,
-                old_ttl,
-            )?;
-            let enforced =
-                enforce_expected_ports(packet, meta.addr_family, meta.protocol, enforced_ports)
-                    .unwrap_or(false);
-            if repaired_ports && !enforced {
-                recompute_l4_checksum_ipv4(&mut packet[ip_start..], ihl, meta.protocol, true)?;
-            }
-        }
-        libc::AF_INET6 => {
-            if packet.len() < ip_start + 40 {
-                return None;
-            }
-            if !skip_ttl && packet[ip_start + 7] <= 1 {
-                return None;
-            }
-            let meta_rel = meta.l4_offset.wrapping_sub(meta.l3_offset) as usize;
-            let rel_l4 = if meta_rel >= 40 && meta.l4_offset > meta.l3_offset {
-                meta_rel
-            } else {
-                packet_rel_l4_offset(&packet[ip_start..], meta.addr_family)?
-            };
-            let repaired_ports =
-                restore_l4_tuple_from_meta(&mut packet[ip_start..], meta, rel_l4).unwrap_or(false);
-            if apply_nat {
-                apply_nat_ipv6(&mut packet[ip_start..], meta.protocol, decision.nat)?;
-            }
-            if !skip_ttl {
-                packet[ip_start + 7] -= 1;
-            }
-            let enforced =
-                enforce_expected_ports(packet, meta.addr_family, meta.protocol, enforced_ports)
-                    .unwrap_or(false);
-            if repaired_ports && !enforced {
-                recompute_l4_checksum_ipv6(&mut packet[ip_start..], meta.protocol)?;
-            }
-        }
+        libc::AF_INET => rewrite_apply_v4(
+            packet,
+            prep.ip_start,
+            meta,
+            decision,
+            prep.apply_nat,
+            prep.skip_ttl,
+            expected_ports,
+        )?,
+        libc::AF_INET6 => rewrite_apply_v6(
+            packet,
+            prep.ip_start,
+            meta,
+            decision,
+            prep.apply_nat,
+            prep.skip_ttl,
+            expected_ports,
+        )?,
         _ => return None,
     }
     // Debug: dump first N in-place rewritten frames' Ethernet headers
     #[cfg(feature = "debug-log")]
     {
+        let eth_len = prep.eth_len;
+        let ip_start = prep.ip_start;
+        let frame_len = prep.frame_len;
+        let vlan_id = prep.vlan_id;
         thread_local! {
             static INPLACE_FWD_DBG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
@@ -1726,9 +1807,9 @@ pub(super) fn rewrite_forwarded_frame_in_place(
     }
     // Checksum verification for in-place path.
     if cfg!(feature = "debug-log") {
-        verify_built_frame_checksums(&packet[..frame_len]);
+        verify_built_frame_checksums(&packet[..prep.frame_len]);
     }
-    Some(frame_len as u32)
+    Some(prep.frame_len as u32)
 }
 
 #[inline(always)]
@@ -6726,6 +6807,204 @@ mod tests {
         assert_eq!(&out[30..34], &[172, 16, 80, 200]);
         assert_eq!(out[22], 63);
         assert!(tcp_checksum_ok_ipv4(&out[14..]));
+    }
+
+    /// Sentinel for #963 round-1 #2: inverse of the
+    /// `_when_enabled` test above. Set
+    /// `disposition = FabricRedirect`, `apply_nat_on_fabric = false`,
+    /// SNAT rewrite_src to 198.51.100.99. After the rewrite, assert
+    /// the source IP in the frame is the ORIGINAL — confirms the
+    /// `apply_nat` gate at the dispatch correctly suppresses NAT
+    /// when fabric NAT is disabled.
+    #[test]
+    fn rewrite_forwarded_frame_in_place_skips_nat_for_fabric_redirect_when_disabled() {
+        let mut frame = Vec::new();
+        write_eth_header(&mut frame, [0xaa; 6], [0xbb; 6], 0, 0x0800);
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61,
+            102, 172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't',
+            b'd', b'a', b't', b'a',
+        ]);
+        let ip_sum = checksum16(&frame[14..34]);
+        frame[24] = (ip_sum >> 8) as u8;
+        frame[25] = ip_sum as u8;
+        recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("tcp sum");
+
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            ..UserspaceDpMeta::default()
+        };
+        let frame_len = rewrite_forwarded_frame_in_place(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &SessionDecision {
+                resolution: ForwardingResolution {
+                    disposition: ForwardingDisposition::FabricRedirect,
+                    local_ifindex: 0,
+                    egress_ifindex: 21,
+                    tx_ifindex: 21,
+                    tunnel_endpoint_id: 0,
+                    next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2))),
+                    neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+                    src_mac: Some([0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]),
+                    tx_vlan_id: 0,
+                },
+                nat: NatDecision {
+                    rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 99))),
+                    ..NatDecision::default()
+                },
+            },
+            false, // apply_nat_on_fabric = false
+            None,
+        )
+        .expect("rewrite in place");
+
+        let out = area.slice(0, frame_len as usize).expect("rewritten frame");
+        // Source IP MUST be the original 10.0.61.102, not the SNAT'd
+        // 198.51.100.99. This validates that apply_nat=false is
+        // correctly threaded through the dispatch into rewrite_apply_v4.
+        assert_eq!(
+            &out[26..30],
+            &[10, 0, 61, 102],
+            "apply_nat_on_fabric=false must suppress SNAT"
+        );
+        assert_eq!(&out[30..34], &[172, 16, 80, 200]);
+        assert_eq!(out[22], 63); // TTL still decremented (skip_ttl=false)
+    }
+
+    /// Sentinel for #963 round-1 #2 (extended in round-2): table-
+    /// driven over IPv4 TTL (offset 8 from IP start) and IPv6
+    /// hop-limit (offset 7 from IP start). For each address family,
+    /// set `meta.meta_flags = 0x80 (FABRIC_INGRESS_FLAG)` so the
+    /// sending peer is treated as having already decremented TTL.
+    /// Capture the relevant byte before and after; assert pre == post
+    /// (no decrement). Validates the skip_ttl gate in BOTH
+    /// rewrite_apply_v4 and rewrite_apply_v6.
+    #[test]
+    fn rewrite_forwarded_frame_in_place_skips_ttl_when_fabric_ingress_flag_set() {
+        // Table-driven: (addr_family, ether_type, ip_header,
+        //                 ttl_rel_offset_from_ip_start)
+        // ttl_rel_offset is HEADER-relative (not Ethernet-relative)
+        // to avoid confusion (Codex round-3 non-blocking note).
+        let v4_header: Vec<u8> = vec![
+            0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61,
+            102, 172, 16, 80, 200,
+        ];
+        let v4_payload: Vec<u8> = vec![
+            0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x50, 0x10,
+            0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't',
+        ];
+        let v6_header: Vec<u8> = vec![
+            0x60, 0x00, 0x00, 0x00, 0x00, 0x14, PROTO_TCP, 64,
+            // src 2001:db8::1
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+            // dst 2001:db8::200
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0x00,
+        ];
+        let v6_payload: Vec<u8> = vec![
+            0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x50, 0x10,
+            0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        for (label, addr_family, ether_type, ip_header, ip_payload, ttl_rel_offset, src_ip) in [
+            (
+                "v4",
+                libc::AF_INET as u8,
+                0x0800u16,
+                v4_header,
+                v4_payload,
+                8usize,
+                IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            ),
+            (
+                "v6",
+                libc::AF_INET6 as u8,
+                0x86ddu16,
+                v6_header,
+                v6_payload,
+                7usize,
+                IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+            ),
+        ] {
+            let mut frame = Vec::new();
+            write_eth_header(&mut frame, [0xaa; 6], [0xbb; 6], 0, ether_type);
+            frame.extend_from_slice(&ip_header);
+            frame.extend_from_slice(&ip_payload);
+            if addr_family == libc::AF_INET as u8 {
+                let ip_sum = checksum16(&frame[14..14 + ip_header.len()]);
+                frame[24] = (ip_sum >> 8) as u8;
+                frame[25] = ip_sum as u8;
+                recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false)
+                    .expect("v4 tcp sum");
+            } else {
+                recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("v6 tcp sum");
+            }
+            let pre_ttl = frame[14 + ttl_rel_offset];
+
+            let mut area = MmapArea::new(4096).expect("mmap");
+            area.slice_mut(0, frame.len())
+                .expect("slice")
+                .copy_from_slice(&frame);
+            let meta = UserspaceDpMeta {
+                magic: USERSPACE_META_MAGIC,
+                version: USERSPACE_META_VERSION,
+                length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+                l3_offset: 14,
+                addr_family,
+                protocol: PROTO_TCP,
+                meta_flags: 0x80, // FABRIC_INGRESS_FLAG — peer already decremented TTL
+                ..UserspaceDpMeta::default()
+            };
+            let frame_len = rewrite_forwarded_frame_in_place(
+                &area,
+                XdpDesc {
+                    addr: 0,
+                    len: frame.len() as u32,
+                    options: 0,
+                },
+                meta,
+                &SessionDecision {
+                    resolution: ForwardingResolution {
+                        disposition: ForwardingDisposition::ForwardCandidate,
+                        local_ifindex: 0,
+                        egress_ifindex: 12,
+                        tx_ifindex: 12,
+                        tunnel_endpoint_id: 0,
+                        next_hop: Some(src_ip),
+                        neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+                        src_mac: Some([0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]),
+                        tx_vlan_id: 0,
+                    },
+                    nat: NatDecision::default(),
+                },
+                false,
+                None,
+            )
+            .unwrap_or_else(|| panic!("[{}] rewrite_in_place returned None", label));
+
+            let out = area.slice(0, frame_len as usize).expect("rewritten frame");
+            let post_ttl = out[14 + ttl_rel_offset];
+            assert_eq!(
+                pre_ttl, post_ttl,
+                "[{}] FABRIC_INGRESS_FLAG must suppress TTL/hop-limit decrement \
+                 (pre={} post={})",
+                label, pre_ttl, post_ttl
+            );
+        }
     }
 
     // --- apply_rewrite_descriptor tests ---
