@@ -6901,8 +6901,11 @@ mod tests {
         //                 ttl_rel_offset_from_ip_start)
         // ttl_rel_offset is HEADER-relative (not Ethernet-relative)
         // to avoid confusion (Codex round-3 non-blocking note).
+        // IP total_len = 0x002c (44 bytes = 20 IP + 24 TCP/data) so
+        // the IP header total_len matches the actual constructed
+        // frame (Codex impl review round-1 caught a 0x0030 mismatch).
         let v4_header: Vec<u8> = vec![
-            0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61,
+            0x45, 0x00, 0x00, 0x2c, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61,
             102, 172, 16, 80, 200,
         ];
         let v4_payload: Vec<u8> = vec![
