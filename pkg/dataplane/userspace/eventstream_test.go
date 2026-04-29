@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 // buildSessionOpenV4Payload builds a binary SessionOpen payload for an IPv4 session.
@@ -55,15 +57,17 @@ func buildSessionOpenV4Payload(
 }
 
 // buildSessionCloseV4Payload builds a binary SessionClose payload for IPv4.
+// #919/#922: includes the trailing ingress/egress zone-id u8 bytes.
 func buildSessionCloseV4Payload(
 	proto uint8,
 	srcPort, dstPort uint16,
 	srcIP, dstIP [4]byte,
 	ownerRG int16,
 	flags uint8,
+	ingressZoneID, egressZoneID uint8,
 ) []byte {
-	// 6 + 4+4 + 2 + 1 = 17 bytes
-	buf := make([]byte, 17)
+	// 6 + 4+4 + 2 + 1 + 2 = 19 bytes
+	buf := make([]byte, 19)
 	buf[0] = 4 // AddrFamily
 	buf[1] = proto
 	binary.LittleEndian.PutUint16(buf[2:4], srcPort)
@@ -72,6 +76,8 @@ func buildSessionCloseV4Payload(
 	copy(buf[10:14], dstIP[:])
 	binary.LittleEndian.PutUint16(buf[14:16], uint16(ownerRG))
 	buf[16] = flags
+	buf[17] = ingressZoneID
+	buf[18] = egressZoneID
 	return buf
 }
 
@@ -127,8 +133,8 @@ func TestDecodeSessionEventV4(t *testing.T) {
 	if !ok {
 		t.Fatal("decodeSessionEvent returned false")
 	}
-	if d.AddrFamily != 4 {
-		t.Fatalf("AddrFamily = %d, want 4", d.AddrFamily)
+	if d.AddrFamily != dataplane.AFInet {
+		t.Fatalf("AddrFamily = %d, want %d (AFInet)", d.AddrFamily, dataplane.AFInet)
 	}
 	if d.Protocol != 6 {
 		t.Fatalf("Protocol = %d, want 6", d.Protocol)
@@ -209,14 +215,18 @@ func TestDecodeSessionCloseEventV4(t *testing.T) {
 		[4]byte{10, 0, 1, 102}, [4]byte{172, 16, 80, 200},
 		1,                              // ownerRG
 		SessionEventFlagFabricRedirect, // flags
+		3, 4,                           // ingress/egress zone IDs
 	)
 
 	d, ok := decodeSessionCloseEvent(payload)
 	if !ok {
 		t.Fatal("decodeSessionCloseEvent returned false")
 	}
-	if d.AddrFamily != 4 {
-		t.Fatalf("AddrFamily = %d, want 4", d.AddrFamily)
+	if d.IngressZoneID != 3 || d.EgressZoneID != 4 {
+		t.Fatalf("ZoneIDs = (%d,%d), want (3,4)", d.IngressZoneID, d.EgressZoneID)
+	}
+	if d.AddrFamily != dataplane.AFInet {
+		t.Fatalf("AddrFamily = %d, want %d (AFInet)", d.AddrFamily, dataplane.AFInet)
 	}
 	if d.Protocol != 6 {
 		t.Fatalf("Protocol = %d, want 6", d.Protocol)

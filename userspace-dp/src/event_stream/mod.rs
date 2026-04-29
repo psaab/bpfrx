@@ -245,6 +245,8 @@ impl EventStreamWorkerHandle {
                 &delta.key,
                 delta.metadata.owner_rg_id,
                 close_flags(delta),
+                delta.metadata.ingress_zone,
+                delta.metadata.egress_zone,
             ),
         }
     }

@@ -192,11 +192,17 @@ impl EventFrame {
     }
 
     /// Encode a SessionClose (type 2) frame -- minimal payload.
+    /// #919/#922: extended with u8 ingress_zone_id + u8 egress_zone_id
+    /// after the flags byte. Old daemons that don't read those bytes
+    /// see them as trailing payload (the frame length lets them
+    /// length-skip), so this is wire-additive within the same MSG type.
     pub(crate) fn encode_session_close(
         seq: u64,
         key: &SessionKey,
         owner_rg_id: i32,
         close_flags: u8,
+        ingress_zone_id: u16,
+        egress_zone_id: u16,
     ) -> Self {
         let mut buf = [0u8; 256];
         let mut pos = FRAME_HEADER_SIZE;
@@ -229,6 +235,14 @@ impl EventFrame {
 
         // Flags
         buf[pos] = close_flags;
+        pos += 1;
+
+        // #919/#922: IngressZoneID u8, EgressZoneID u8.
+        debug_assert!(ingress_zone_id < 256, "zone id {ingress_zone_id} > u8");
+        debug_assert!(egress_zone_id < 256, "zone id {egress_zone_id} > u8");
+        buf[pos] = ingress_zone_id as u8;
+        pos += 1;
+        buf[pos] = egress_zone_id as u8;
         pos += 1;
 
         let payload_len = (pos - FRAME_HEADER_SIZE) as u32;
@@ -478,7 +492,14 @@ mod tests {
 
     #[test]
     fn test_encode_session_close_v4() {
-        let frame = EventFrame::encode_session_close(7, &test_key_v4(), 1, FLAG_FABRIC_REDIRECT);
+        let frame = EventFrame::encode_session_close(
+            7,
+            &test_key_v4(),
+            1,
+            FLAG_FABRIC_REDIRECT,
+            TEST_TRUST_ZONE_ID,
+            TEST_UNTRUST_ZONE_ID,
+        );
 
         assert_eq!(frame.data[4], MSG_SESSION_CLOSE);
         assert_eq!(frame.seq, 7);
@@ -488,12 +509,14 @@ mod tests {
         assert_eq!(p[1], 6); // Protocol
         assert_eq!(u16::from_le_bytes([p[2], p[3]]), 12345); // SrcPort
         assert_eq!(u16::from_le_bytes([p[4], p[5]]), 80); // DstPort
-        // After addresses (4+4 = 8 bytes starting at p[6]):
         // p[6..10] SrcIP, p[10..14] DstIP
         // p[14..16] OwnerRGID
         assert_eq!(i16::from_le_bytes([p[14], p[15]]), 1);
         // p[16] Flags
         assert_eq!(p[16], FLAG_FABRIC_REDIRECT);
+        // #919/#922: p[17] IngressZoneID, p[18] EgressZoneID
+        assert_eq!(p[17], TEST_TRUST_ZONE_ID as u8);
+        assert_eq!(p[18], TEST_UNTRUST_ZONE_ID as u8);
     }
 
     #[test]

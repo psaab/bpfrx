@@ -3445,9 +3445,25 @@ fn flush_session_deltas(
     recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     event_stream: &Option<crate::event_stream::EventStreamWorkerHandle>,
-    zone_name_to_id: &FastMap<String, u16>,
+    forwarding: &ForwardingState,
 ) {
+    let zone_name_to_id = &forwarding.zone_name_to_id;
+    let zone_id_to_name = &forwarding.zone_id_to_name;
     for delta in deltas {
+        // #919/#922: emit both the resolved zone NAMES (legacy field,
+        // empty when the ID is unknown) and the u16 IDs. New daemons
+        // prefer the IDs; older daemons read the names. The previous
+        // code wrote `metadata.ingress_zone.to_string()` here, which
+        // produced "1"/"2" string literals that broke `zoneIDs[name]`
+        // on the Go side.
+        let ingress_name = zone_id_to_name
+            .get(&delta.metadata.ingress_zone)
+            .cloned()
+            .unwrap_or_default();
+        let egress_name = zone_id_to_name
+            .get(&delta.metadata.egress_zone)
+            .cloned()
+            .unwrap_or_default();
         let info = SessionDeltaInfo {
             timestamp: Utc::now(),
             slot: ident.slot,
@@ -3462,8 +3478,10 @@ fn flush_session_deltas(
             dst_ip: delta.key.dst_ip.to_string(),
             src_port: delta.key.src_port,
             dst_port: delta.key.dst_port,
-            ingress_zone: delta.metadata.ingress_zone.to_string(),
-            egress_zone: delta.metadata.egress_zone.to_string(),
+            ingress_zone: ingress_name,
+            egress_zone: egress_name,
+            ingress_zone_id: delta.metadata.ingress_zone,
+            egress_zone_id: delta.metadata.egress_zone,
             owner_rg_id: delta.metadata.owner_rg_id,
             disposition: match delta.decision.resolution.disposition {
                 ForwardingDisposition::ForwardCandidate => "forward_candidate",
