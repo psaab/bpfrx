@@ -1,5 +1,4 @@
-# #963: decompose rewrite_forwarded_frame_in_place (the slow-path
-# god function) into v4/v6 specialized helpers + extracted subroutines
+# #963: decompose rewrite_forwarded_frame_in_place (the slow-path god function) into v4/v6 specialized helpers + extracted subroutines
 
 Plan v3 — 2026-04-29. Addresses Codex round-2 (task-mok8khp9-0jm235):
 
