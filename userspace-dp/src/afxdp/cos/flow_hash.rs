@@ -12,7 +12,7 @@
 // (`FlowRrRing`, `CoSQueueRuntime` arrays). flow_hash imports
 // them rather than owning them.
 //
-// Phase 3 (admission) will import the public-to-afxdp helpers
+// Phase 3 (admission) imports the public-to-afxdp helpers
 // re-exported from `cos/mod.rs`.
 
 use crate::afxdp::types::{CoSPendingTxItem, CoSQueueRuntime, COS_FLOW_FAIR_BUCKET_MASK};
