@@ -1,9 +1,30 @@
 # #956 Phase 4: extract cos/token_bucket.rs from tx.rs
 
-Plan v2 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
+Plan v3 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
 Phase 1 (cos/ecn.rs) shipped at PR #976; Phase 2 (cos/flow_hash.rs)
 at PR #977; Phase 3 (cos/admission.rs) at PR #978. Phase 4 = the
 token-bucket lease/refill subsystem.
+
+Round-2 changelog (v2 → v3): addresses 5 Codex round-2 wording /
+line-number fixes (move set + visibility unchanged):
+- R1-1 follow-up (still wrong in v2): the Risk-section claim
+  that `refill_cos_tokens` is called "3 times per enqueue cycle
+  in production" was still naming tx.rs:1651 as a production
+  site. tx.rs:1651 is inside the `#[cfg(test)]` legacy selector
+  starting at tx.rs:1625 — corrected.
+- R1-3 follow-up (still wrong in v2): non-test
+  `COS_MIN_BURST_BYTES` consumer set was missing tx.rs:5264 and
+  tx.rs:5269 (`build_cos_interface_runtime` queue construction).
+  Added.
+- N1 (new): `maybe_top_up_cos_root_lease` test caller is
+  tx.rs:6824, but tx.rs:6380 is `mod tests {`, so 6824 is a
+  test-module call. Re-labelled.
+- N2 (new): `release_all_cos_queue_leases` caller line numbers
+  in worker.rs were off by one — root calls at 746/1613, queue
+  calls at 747/1614/1912. Corrected to 747/755/1614/1912.
+- N3 (new): admission.rs header-note text in the Phase-1+2+3
+  cleanup section had to be aligned with R1-5 (use the
+  cos/mod.rs re-export, not a direct token_bucket path).
 
 Round-1 changelog (v1 → v2): addresses 4 Codex round-1 findings,
 all wording-level (move list and visibility unchanged):
@@ -41,13 +62,13 @@ back-reference is gone.
 
 | Item | Line | Visibility | Production callers | Test callers |
 |---|---|---|---|---|
-| `maybe_top_up_cos_root_lease` | 3511 | private | tx.rs:1515 | tx.rs:6824 (production), tx.rs test sites |
-| `maybe_top_up_cos_queue_lease` | 3533 | private | tx.rs:1733 | tx.rs:1643, 6873 (#[cfg(test)] selector starts at tx.rs:1626) |
-| `refill_cos_tokens` | 3582 | private | tx.rs:1829 + internal call from `maybe_top_up_cos_queue_lease` body at tx.rs:3558 | tx.rs:1651 (#[cfg(test)] selector at tx.rs:1626) |
+| `maybe_top_up_cos_root_lease` | 3511 | private | tx.rs:1515 | tx.rs:6824 (inside `mod tests {` at tx.rs:6380) |
+| `maybe_top_up_cos_queue_lease` | 3533 | private | tx.rs:1733 | tx.rs:1643 (inside `#[cfg(test)] fn` at tx.rs:1625-1626), tx.rs:6873 (inside test module) |
+| `refill_cos_tokens` | 3582 | private | tx.rs:1829 (`select_nonexact_cos_guarantee_batch` at tx.rs:1814 — non-test) + internal call from `maybe_top_up_cos_queue_lease` body at tx.rs:3558 | tx.rs:1651 (inside `#[cfg(test)] fn` at tx.rs:1625-1626) |
 | `cos_refill_ns_until` | 3625 | private | tx.rs:4257, 4259 | none |
 | `release_cos_root_lease` | 5524 | private | tx.rs:5509 (refresh_cos_interface_activity), tx.rs:5545 (release_all_cos_root_leases) | none |
 | `release_all_cos_root_leases` | 5542 | `pub(super)` | worker.rs:746, 1613, 1911 | none |
-| `release_all_cos_queue_leases` | 5549 | `pub(super)` | worker.rs:746, 755, 1613, 1912 | none |
+| `release_all_cos_queue_leases` | 5549 | `pub(super)` | worker.rs:747, 755, 1614, 1912 | none |
 
 Production-vs-test note (Codex round-1 R1-1): tx.rs:1626 starts a
 `#[cfg(test)]` legacy-selector block, so call sites at tx.rs:1643,
@@ -59,7 +80,7 @@ relies on the production sites listed above, not the test ones.
 
 | Item | Line | Visibility | Use count |
 |---|---|---|---|
-| `COS_MIN_BURST_BYTES` | 3472 | `pub(in crate::afxdp)` | tx.rs: 91 total (most are tests below tx.rs:6380); non-test consumers: tx.rs:1832 (refill), 7 sites at 3522 inside the moving top-up helpers, tx.rs:5237 (runtime construction). cos/admission.rs: 3. |
+| `COS_MIN_BURST_BYTES` | 3472 | `pub(in crate::afxdp)` | tx.rs: 91 total (most are tests below tx.rs:6380); non-test consumers: tx.rs:1832 (`refill_cos_tokens` body in `select_nonexact_cos_guarantee_batch`), 7 sites at tx.rs:3522/3530/3545/3553/3561/3570/3578 inside the moving top-up helpers, tx.rs:5237/5264/5269 (runtime construction in `build_cos_interface_runtime`). cos/admission.rs: 3 (admission gates). |
 
 `COS_MIN_BURST_BYTES` is the burst-cap argument applied uniformly across
 every `maybe_top_up_*` and `refill_cos_tokens` call. It logically belongs
@@ -154,9 +175,13 @@ become `pub(in crate::afxdp)` and are reachable via
   cos/token_bucket.rs. Remove the comment block (the constant is gone
   from tx.rs).
 - `cos/admission.rs:24-27` — header note about COS_MIN_BURST_BYTES
-  staying in tx.rs needs to switch to past-tense "Phase 4 moved
-  COS_MIN_BURST_BYTES into cos/token_bucket.rs; admission imports
-  from there now."
+  staying in tx.rs needs to switch to past-tense (Codex round-2 N3:
+  the wording must align with R1-5's chosen import path). Replace
+  with: "Phase 4 moved `COS_MIN_BURST_BYTES` into cos/token_bucket.rs.
+  This module imports it via `super::COS_MIN_BURST_BYTES` (resolves
+  to the cos/mod.rs re-export), not via direct
+  `super::token_bucket::COS_MIN_BURST_BYTES` — that keeps admission
+  agnostic to the cos/* internal file layout."
 - `cos/mod.rs:1-5` — phase-order header. Update to call out Phase 4
   as the current state.
 
@@ -166,10 +191,16 @@ become `pub(in crate::afxdp)` and are reachable via
 touches the hot-path enqueue/refill loop — every TX byte goes through
 `maybe_top_up_cos_*` and `refill_cos_tokens`. Risks:
 
-- **Hot-path inline cost.** `refill_cos_tokens` is called 3 times per
-  enqueue cycle in production (tx.rs:1651, 1829, 3558). Need
-  `#[inline]` to survive the cross-module move. Verify against the
-  pre-move hot path.
+- **Hot-path inline cost.** `refill_cos_tokens` non-test call sites are
+  tx.rs:1829 (in `select_nonexact_cos_guarantee_batch`) and the
+  internal call from `maybe_top_up_cos_queue_lease`'s body at
+  tx.rs:3558 (which itself moves to token_bucket.rs and stays
+  intra-file). The third syntactic site at tx.rs:1651 is inside a
+  `#[cfg(test)]` legacy-selector fn, so it's not part of the
+  production hot path. Even so, `refill_cos_tokens` and the
+  `maybe_top_up_*` helpers must keep `#[inline]` on the move so the
+  compiler can still inline across the cos/* boundary the same way
+  Phases 2+3 validated.
 - **worker.rs import migration.** worker.rs picks up the release
   helpers via a module-level `use super::*` glob at worker.rs:1
   (with afxdp.rs:149 glob-importing tx — Codex round-1 R1-4
