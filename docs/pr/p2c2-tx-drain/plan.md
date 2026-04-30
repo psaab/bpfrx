@@ -1,7 +1,22 @@
 # P2c2: extract afxdp/tx/drain.rs from tx/mod.rs
 
-Plan v2 — 2026-04-30. Stage 2 step 4 of the long sequence after #993
+Plan v3 — 2026-04-30. Stage 2 step 4 of the long sequence after #993
 (P2c: tx/transmit.rs) merged at master `e2b99aa9`.
+
+## v3 changelog vs v2 (from Codex round-2)
+
+- R2-1 [MEDIUM]: missed test pin
+  `process_pending_queue_in_place_preserves_failed_item_order` at
+  `tx/mod.rs:1795` directly calls `process_pending_queue_in_place`.
+  Since v2 moves that helper file-private into `drain.rs`, the test
+  must also move to `drain.rs::tests`. v3 adds it to the test-move
+  list.
+- R2-2 [LOW]: stale wording — earlier section said partition tests
+  stay in `tx/mod.rs::tests` via re-export, but the chosen approach
+  is moving them into `drain.rs::tests`. v3 drops the stale "option (b)"
+  wording.
+- Codex r2 also confirmed: 3 pending helpers correctly in scope,
+  cached-selection deferral clean, import-block deferral acceptable.
 
 ## v2 changelog vs v1 (from Codex round-1)
 
@@ -154,15 +169,18 @@ the plan.
 ## Tests
 
 Pre-existing test pins relevant to the moved items:
-- `partition_cos_bound_local_with_rescue` test at tx/mod.rs:1712, 1761.
-  After move, this fn is file-private in drain.rs. Two options:
-  (a) move the test to drain.rs's own `mod tests` block, OR
-  (b) bump `partition_cos_bound_local_with_rescue` to
-  `pub(in crate::afxdp)` for cfg-test re-export from tx/mod.rs.
-  v2 chooses option (a) — moves the test alongside the fn. Cleaner
-  than bumping a private helper for test access.
+Tests that move to `drain.rs::tests` (since their target fns become
+file-private in drain.rs after the move):
+- `partition_cos_bound_local_with_rescue_*` tests at tx/mod.rs:1712,
+  1761 — exercise `partition_cos_bound_local_with_rescue`.
+- `process_pending_queue_in_place_preserves_failed_item_order` at
+  tx/mod.rs:1795 — exercises `process_pending_queue_in_place`.
 
-Round-1 reviewer: enumerate any other test pin I missed.
+The chosen approach (moving tests with their fn) is cleaner than
+bumping the private helpers to `pub(in crate::afxdp)` for cfg-test
+re-export.
+
+Round-2 reviewer: enumerate any other test pin I missed.
 
 ## Risk
 
