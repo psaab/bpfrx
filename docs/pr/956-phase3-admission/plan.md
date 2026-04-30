@@ -1,7 +1,39 @@
 # #956 Phase 3: extract cos/admission.rs from tx.rs
 
-Plan v4 — 2026-04-29. Addresses Codex round-3 (gpt-5.5
-local exec), three MINOR findings on top of v3.
+Plan v5 — 2026-04-29. Addresses Gemini adversarial round-1,
+which returned PLAN-NEEDS-MINOR but with one substantive
+architectural finding that round-1/2/3 of Codex did not catch.
+
+Round-G1 changelog (v4 → v5):
+
+G1-1. **Drop `account_cos_queue_flow_enqueue` and
+`account_cos_queue_flow_dequeue` from Phase 3 — defer to Phase
+5 (`cos/queue_ops.rs`).** The "lockstep landing cost"
+rationale used in v2-v4 is false: admission gates only *read*
+`flow_bucket_bytes` / `active_flow_buckets`; they never call
+`account_*`. Both modules can independently access those
+`pub(super)` fields. Moving the helpers without the rest of
+the MQFQ + V-min state would split two cross-cutting
+invariants across files (selection/pop stay in tx; enqueue/
+dequeue move) for a marginal LOC win. Phase 5 will move all
+of this state cohesively. Move list shrinks 8 → 6 fns,
+~700 LOC → ~600 LOC.
+
+G1-2. **Acknowledge `promote_cos_queue_flow_fair` may move to
+Phase 6 (`cos/builders.rs`).** Gemini correctly noted that
+promotion is initialization/builder logic. Kept in Phase 3
+because the apply/promote pair is internally cohesive
+(`promote_*` is only called by `apply_*`) and they enforce
+admission-gate invariants. Plan now records the risk that
+Phase 6 may relocate the pair.
+
+G1-3. **`COS_MIN_BURST_BYTES` forward-debt note added.** Phase
+4 (`token_bucket.rs`) inherits the `<other_module> -> tx`
+import edge for the same constant. Plan now explicitly says
+Phase 4 or 5 should consolidate shared CoS burst-sizing
+constants into `types.rs` or `cos/mod.rs`.
+
+Round-3 changelog (v3 → v4):
 
 Round-3 changelog (v3 → v4):
 
@@ -118,21 +150,27 @@ named constants spread across two regions:
 | `bdp_floor_bytes` | 3881 | private | `cos_queue_flow_share_limit` only |
 | `cos_queue_flow_share_limit` | 3887 | private | admission + ECN policy + tests |
 | `cos_flow_aware_buffer_limit` | 3980 | private | admission + tests |
-| `account_cos_queue_flow_enqueue` | 3996 | private | enqueue path |
-| `account_cos_queue_flow_dequeue` | 4046 | private | dequeue path |
 | `apply_cos_queue_flow_fair_promotion` | 5391 | private | tx.rs queue-build entry |
 | `promote_cos_queue_flow_fair` | 5661 | private | called only by `apply_*_promotion` |
+
+**Deferred to Phase 5 (`cos/queue_ops.rs`) — not moved here**:
+| Item | Line | Why deferred |
+|---|---|---|
+| `account_cos_queue_flow_enqueue` | 3996 | MQFQ head/tail finish-time state lives with selection (`cos_queue_min_finish_bucket`) and pop (`cos_queue_pop_front_inner`) which stay in tx.rs through Phase 4 |
+| `account_cos_queue_flow_dequeue` | 4046 | V-min `vacate` half — `publish_committed_queue_vtime` and `read` paths stay in tx.rs through Phase 4 |
 
 Plus two SHARED_EXACT-specific constants near the share-limit fn:
 - `RTT_TARGET_NS` at 3857
 - `SHARED_EXACT_BURST_HEADROOM` at 3865
 
-Total move: ~700 LOC of production code (functions + constants +
-their dense doc comments).
+Total move: ~600 LOC of production code (6 functions + 6
+constants + dense doc comments). v5 dropped the 2 `account_*`
+helpers (~100 LOC) per Gemini round-1 architectural finding —
+they belong with the rest of MQFQ + V-min state in Phase 5.
 
 ## Approach
 
-Create `userspace-dp/src/afxdp/cos/admission.rs` with the 8
+Create `userspace-dp/src/afxdp/cos/admission.rs` with the 6
 moved functions and the named constants/asserts that admission
 owns. `COS_MIN_BURST_BYTES` STAYS in `tx.rs` with bumped
 visibility (it has 91 uses across tx.rs and only 1 in moving
@@ -140,7 +178,7 @@ admission code). Items needing cross-module visibility from
 admission.rs get `pub(in crate::afxdp)`; `cos/mod.rs` extends
 the re-export block.
 
-### Move list (~700 LOC)
+### Move list (~600 LOC)
 
 Codex round-1 verified call sites and corrected several
 visibility decisions:
@@ -151,9 +189,8 @@ use crate::afxdp::ethernet::*; // if needed by admission policy parse
 use crate::afxdp::types::{CoSInterfaceRuntime, CoSPendingTxItem,
     CoSQueueRuntime, WorkerCoSQueueFastPath};
 use crate::afxdp::umem::MmapArea;
-use crate::session::SessionKey;     // accounting fns reach SessionKey
-                                     // (Codex round-1 noted missing
-                                     // import)
+// SessionKey import was needed for the dropped account_* helpers;
+// no longer required after v5 removed them from this phase.
 use super::flow_hash::{cos_flow_bucket_index, cos_flow_hash_seed_from_os};
 use super::ecn::{maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared};
                                      // do NOT import ECN_MASK / ECN_NOT_ECT —
@@ -187,8 +224,6 @@ const SHARED_EXACT_BURST_HEADROOM: u64 = 2;
 pub(in crate::afxdp) fn bdp_floor_bytes(...) -> u64 { ... }
 pub(in crate::afxdp) fn cos_queue_flow_share_limit(...) -> u64 { ... }
 pub(in crate::afxdp) fn cos_flow_aware_buffer_limit(...) -> u64 { ... }
-pub(in crate::afxdp) fn account_cos_queue_flow_enqueue(...) { ... }
-pub(in crate::afxdp) fn account_cos_queue_flow_dequeue(...) { ... }
 pub(in crate::afxdp) fn apply_cos_admission_ecn_policy(...) -> bool { ... }
 pub(in crate::afxdp) fn apply_cos_queue_flow_fair_promotion(...) { ... }
 fn promote_cos_queue_flow_fair(...) { ... }
@@ -200,9 +235,15 @@ fn promote_cos_queue_flow_fair(...) { ... }
   `use crate::afxdp::tx::COS_MIN_BURST_BYTES`, so the dependency
   edge is `admission -> tx`. The const has 91 occurrences in
   `tx.rs` itself (only 1 in moving admission code), so leaving it
-  there until a later cleanup is the smaller risk. See the
-  canonical block under "STAYS in `tx.rs`" below for the full
-  rationale.
+  there until a later cleanup is the smaller risk. **Forward
+  debt** (Gemini round-1 #4): Phase 4 (`token_bucket.rs`) will
+  inherit this `<other_module> -> tx` edge for the same constant
+  via `maybe_top_up_cos_root_lease` and similar token-bucket
+  call sites. Phase 4 or Phase 5 should extract the shared CoS
+  burst-sizing constants into `types.rs` or `cos/mod.rs` to
+  break the back-reference once the consumers are settled. See
+  the canonical block under "STAYS in `tx.rs`" below for the
+  Phase-3-specific rationale.
 
 - The promotion-rationale doc block currently at `tx.rs:5401-5467`
   (Codex round-1 unrelated note) is separated from
@@ -211,28 +252,49 @@ fn promote_cos_queue_flow_fair(...) { ... }
   to admission.rs so the documentation stays attached to the function
   it documents.
 
-- `account_cos_queue_flow_enqueue`/`_dequeue` are queue-state
-  lifecycle helpers; Codex round-1 flagged them as arguably
-  belonging to Phase 5 (`cos/queue_ops.rs`), and round-2 #2
-  corrected my v2 rationale (they don't ONLY maintain
-  `flow_bucket_bytes`/`active_flow_buckets`):
-  - `enqueue` updates MQFQ head/tail finish-time state
-    at `tx.rs:4016`.
-  - `dequeue` resets that state at `tx.rs:4058` and vacates the
-    shared V-min slot at `tx.rs:4069-4077`.
+- **`account_cos_queue_flow_enqueue` / `_dequeue` deferred to
+  Phase 5** (Gemini round-1 architectural finding). Earlier plan
+  versions (v2-v4) moved these to admission.rs and justified the
+  decision with a "lockstep landing cost" argument. Gemini
+  showed the lockstep claim is false: admission gates
+  (`apply_cos_admission_ecn_policy`,
+  `apply_cos_queue_flow_fair_promotion`,
+  `cos_queue_flow_share_limit`) **only read**
+  `flow_bucket_bytes` / `active_flow_buckets`, they never call
+  `account_*`. Both modules can independently access those
+  `pub(super)` fields on `CoSQueueRuntime`, so there is no
+  function-level coupling that demands lockstep PRs.
 
-  **Decision**: keep in admission.rs in Phase 3, with explicit
-  acknowledgment that `cos/admission.rs` ends up coupling three
-  responsibilities: admission lifecycle, MQFQ ordering bookkeeping,
-  and V-min slot participation. The alternative (defer to Phase 5)
-  has higher coordination cost — Phase 3's admission gates
-  (`cos_queue_flow_share_limit`, `apply_cos_admission_ecn_policy`)
-  consume the same `flow_bucket_bytes` / `active_flow_buckets`
-  fields these helpers maintain, so splitting them across two
-  PRs forces both to land in lockstep or temporarily import
-  back. Phase 5 can revisit when queue_ops has a cleaner
-  boundary; the helpers will likely move to wherever MQFQ /
-  V-min state ends up living.
+  Moving `account_*` to admission.rs would actively *split* two
+  cross-cutting invariants:
+  - **MQFQ:** enqueue-advance and dequeue-reset of virtual finish
+    time would land in admission.rs, while bucket selection
+    (`cos_queue_min_finish_bucket`) and pop-advance
+    (`cos_queue_pop_front_inner`) stay in tx.rs.
+  - **V-min:** the slot-vacate path (`tx.rs:4069-4077`) would
+    move to admission.rs, while publish
+    (`publish_committed_queue_vtime`) and read paths stay in
+    tx.rs.
+
+  Splitting these for a ~100-LOC reduction in tx.rs trades real
+  architectural debt for a marginal size win. The MQFQ +
+  V-min helpers move cohesively in Phase 5
+  (`cos/queue_ops.rs`) where the rest of selection / pop /
+  vtime publish state can come along.
+
+- `apply_cos_queue_flow_fair_promotion` + `promote_cos_queue_flow_fair`
+  are kept in admission.rs in this phase even though
+  Gemini round-1 #3 correctly notes that "promotion" is closer
+  to builder logic (called from `ensure_cos_interface_runtime`)
+  than admission policy. They are kept because (a) the
+  apply/promote pair is internally cohesive — `promote_*` is
+  only called by `apply_*` — and (b) the share-limit and
+  flow-fair invariants the promotion enforces are part of the
+  same admission-gate code-paths these PRs are extracting.
+  **Acknowledged risk**: Phase 6 (`cos/builders.rs`) may
+  re-relocate this pair if the builder boundary is sharper than
+  admission's. That is acceptable — small re-shuffles between
+  cos/* sub-modules are within scope of the multi-phase plan.
 
 `cos/mod.rs` re-exports the production-callable items via
 `pub(super) use`. Test-referenced items (`bdp_floor_bytes` and
@@ -259,8 +321,6 @@ source of truth.
   production callers)**:
   - `cos_queue_flow_share_limit`
   - `cos_flow_aware_buffer_limit`
-  - `account_cos_queue_flow_enqueue`
-  - `account_cos_queue_flow_dequeue`
   - `apply_cos_admission_ecn_policy`
   - `apply_cos_queue_flow_fair_promotion`
 
@@ -288,15 +348,17 @@ may need additional cfg-gated imports (Phase 1 lesson).
 
 ## Files touched
 
-- **NEW** `userspace-dp/src/afxdp/cos/admission.rs`: ~700 LOC of
+- **NEW** `userspace-dp/src/afxdp/cos/admission.rs`: ~600 LOC of
   moved production code.
 - `userspace-dp/src/afxdp/cos/mod.rs`: append `pub(super) mod
   admission;` + extend `pub(super) use admission::{...}` block.
-- `userspace-dp/src/afxdp/tx.rs`: removes ~700 LOC; adds `use
-  super::cos::{...}` for the 6 cross-module items. Net ~700
-  LOC smaller.
+- `userspace-dp/src/afxdp/tx.rs`: removes ~600 LOC; adds `use
+  super::cos::{...}` for the 4 production-callable cross-module
+  items + 1 import for `bdp_floor_bytes` and the four
+  test-touched constants. Net ~600 LOC smaller.
 - 0 new tests required — pure structural refactor. ~30 admission-
-  related tests stay in `tx::tests`.
+  related tests stay in `tx::tests`. `account_*`-touching tests
+  are unaffected because those helpers stay in tx.rs.
 
 ### Phase-1+2 stale-text cleanup
 
