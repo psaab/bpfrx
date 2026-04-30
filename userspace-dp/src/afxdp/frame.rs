@@ -1160,8 +1160,8 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
                 // L4 checksum: incremental adjustment for NAT and TTL
                 // changes instead of full payload recompute. O(1) vs
                 // O(payload_size) — saves ~3.6% CPU at fabric throughput.
-                let post_src_ip = [packet[12], packet[13], packet[14], packet[15]];
-                let post_dst_ip = [packet[16], packet[17], packet[18], packet[19]];
+                let _post_src_ip = [packet[12], packet[13], packet[14], packet[15]];
+                let _post_dst_ip = [packet[16], packet[17], packet[18], packet[19]];
                 // L4 checksum: use incremental adjustment when
                 // enforce_expected_ports was a no-op (the common fabric
                 // case where expected_ports=None). This is O(1) vs

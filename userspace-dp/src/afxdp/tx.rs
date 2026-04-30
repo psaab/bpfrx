@@ -1475,14 +1475,11 @@ const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 // non-test builds (Copilot review on PR #976).
 use super::cos::{
     apply_cos_admission_ecn_policy, cos_flow_aware_buffer_limit, cos_flow_bucket_index,
-    cos_item_flow_key, cos_item_len, cos_queue_clear_orphan_snapshot_after_drop,
-    cos_queue_drain_all, cos_queue_flow_share_limit, cos_queue_front, cos_queue_is_empty,
-    cos_queue_pop_front, cos_queue_push_back, cos_queue_push_front, cos_queue_restore_front,
-    cos_queue_v_min_consume_suspension, cos_queue_v_min_continue, cos_refill_ns_until,
-    drain_shaped_tx, ensure_cos_interface_runtime, maybe_top_up_cos_queue_lease,
-    maybe_top_up_cos_root_lease, park_cos_queue, publish_committed_queue_vtime, refill_cos_tokens,
-    release_cos_root_lease, CoSBatch, CoSServicePhase, DrainedQueueRef, ExactCoSQueueSelection,
-    ExactCoSScratchBuild, COS_MIN_BURST_BYTES,
+    cos_item_flow_key,
+    cos_queue_drain_all, cos_queue_flow_share_limit, cos_queue_is_empty, cos_queue_push_back, cos_queue_push_front, cos_queue_restore_front,
+    drain_shaped_tx, ensure_cos_interface_runtime,
+    maybe_top_up_cos_root_lease, park_cos_queue, publish_committed_queue_vtime,
+    release_cos_root_lease, CoSServicePhase,
 };
 #[cfg(test)]
 use super::cos::ecn::{ethernet_l3, mark_ecn_ce_ipv4, mark_ecn_ce_ipv6, EthernetL3};
@@ -1491,7 +1488,10 @@ use super::cos::{
     account_cos_queue_flow_dequeue, account_cos_queue_flow_enqueue,
     apply_cos_queue_flow_fair_promotion, assign_local_dscp_rewrite, bdp_floor_bytes,
     build_cos_interface_runtime, cos_batch_tx_made_progress, cos_flow_hash_seed_from_os,
-    cos_queue_prospective_active_flows, count_park_reason,
+    cos_guarantee_quantum_bytes, cos_queue_clear_orphan_snapshot_after_drop,
+    cos_queue_pop_front, cos_queue_prospective_active_flows,
+    cos_queue_v_min_consume_suspension, cos_queue_v_min_continue, count_park_reason,
+    maybe_top_up_cos_queue_lease, CoSBatch, ExactCoSScratchBuild, COS_MIN_BURST_BYTES,
     drain_exact_local_fifo_items_to_scratch, drain_exact_local_items_to_scratch_flow_fair,
     drain_exact_prepared_fifo_items_to_scratch,
     drain_exact_prepared_items_to_scratch_flow_fair, estimate_cos_queue_wakeup_tick,
@@ -10084,7 +10084,7 @@ mod tests {
     /// stops scaling with `transmit_rate_bytes`.
     #[test]
     fn guarantee_phase_quantum_scales_with_rate() {
-        use super::super::cos::cos_guarantee_quantum_bytes;
+        // cos_guarantee_quantum_bytes is already imported at the top of tx.rs (cfg(test) block).
         let high_rate = test_cos_runtime_with_queues(
             10_000_000_000u64 / 8,
             vec![CoSQueueConfig {

@@ -30,15 +30,14 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use crate::afxdp::frame::{apply_dscp_rewrite_to_frame, frame_has_tcp_rst};
 use crate::afxdp::neighbor::monotonic_nanos;
 use crate::afxdp::types::{
-    CoSInterfaceConfig, CoSInterfaceRuntime, CoSPendingTxItem,
-    CoSQueueRuntime, ExactLocalScratchTxRequest, ExactPreparedScratchTxRequest, ForwardingState,
-    PreparedTxRecycle, PreparedTxRequest, TxRequest, WorkerCoSInterfaceFastPath,
-    WorkerCoSQueueFastPath, COS_FLOW_FAIR_BUCKETS, COS_PRIORITY_LEVELS,
+    CoSInterfaceRuntime, CoSPendingTxItem,
+    CoSQueueRuntime, ExactLocalScratchTxRequest, ExactPreparedScratchTxRequest,
+    PreparedTxRecycle, PreparedTxRequest, TxRequest,
+    WorkerCoSQueueFastPath, COS_PRIORITY_LEVELS,
 };
 use crate::afxdp::umem::MmapArea;
 use crate::afxdp::worker::BindingWorker;
@@ -46,15 +45,11 @@ use crate::xsk_ffi::xdp::XdpDesc;
 use crate::afxdp::{tx_frame_capacity, FastMap, TX_BATCH_SIZE};
 
 use super::{
-    apply_cos_admission_ecn_policy, cos_flow_aware_buffer_limit,
-    cos_flow_bucket_index, cos_item_flow_key, cos_item_len,
-    cos_queue_clear_orphan_snapshot_after_drop, cos_queue_drain_all,
-    cos_queue_flow_share_limit, cos_queue_front, cos_queue_is_empty,
-    cos_queue_pop_front, cos_queue_pop_front_no_snapshot,
-    cos_queue_push_back, cos_queue_push_front, cos_queue_restore_front,
+    cos_item_len,
+    cos_queue_clear_orphan_snapshot_after_drop, cos_queue_front, cos_queue_is_empty,
+    cos_queue_pop_front, cos_queue_push_front,
     cos_queue_v_min_consume_suspension, cos_queue_v_min_continue,
-    cos_refill_ns_until, maybe_top_up_cos_queue_lease,
-    maybe_top_up_cos_root_lease, publish_committed_queue_vtime,
+    cos_refill_ns_until, maybe_top_up_cos_queue_lease, publish_committed_queue_vtime,
     refill_cos_tokens, COS_MIN_BURST_BYTES,
 };
 
@@ -62,7 +57,7 @@ use super::{
 // binding family). Visibility bumped to pub(in crate::afxdp) so this
 // module can reach them.
 use crate::afxdp::tx::{
-    advance_cos_timer_wheel, apply_cos_prepared_result, apply_cos_send_result,
+    apply_cos_prepared_result, apply_cos_send_result,
     apply_direct_exact_send_result, cos_queue_dscp_rewrite, cos_tick_for_ns,
     cos_timer_wheel_level_and_slot, count_tx_ring_full_submit_stall, maybe_wake_tx,
     prime_cos_root_for_service, reap_tx_completions, recycle_cancelled_prepared_offset,

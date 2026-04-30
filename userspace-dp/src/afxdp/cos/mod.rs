@@ -29,10 +29,7 @@ pub(super) use queue_ops::{
     cos_queue_restore_front, cos_queue_v_min_consume_suspension, cos_queue_v_min_continue,
     publish_committed_queue_vtime,
 };
-pub(super) use queue_service::{
-    cos_guarantee_quantum_bytes, cos_surplus_quantum_bytes, drain_shaped_tx, park_cos_queue,
-    CoSBatch, CoSServicePhase, DrainedQueueRef, ExactCoSQueueSelection, ExactCoSScratchBuild,
-};
+pub(super) use queue_service::{drain_shaped_tx, park_cos_queue, CoSServicePhase};
 pub(super) use token_bucket::{
     cos_refill_ns_until, maybe_top_up_cos_queue_lease, maybe_top_up_cos_root_lease,
     refill_cos_tokens, release_all_cos_queue_leases, release_all_cos_root_leases,
@@ -57,14 +54,14 @@ pub(super) use queue_ops::{
 };
 #[cfg(test)]
 pub(super) use queue_service::{
-    assign_local_dscp_rewrite, cos_batch_tx_made_progress, count_park_reason,
-    drain_exact_local_fifo_items_to_scratch, drain_exact_local_items_to_scratch_flow_fair,
-    drain_exact_prepared_fifo_items_to_scratch,
+    assign_local_dscp_rewrite, cos_batch_tx_made_progress, cos_guarantee_quantum_bytes,
+    count_park_reason, drain_exact_local_fifo_items_to_scratch,
+    drain_exact_local_items_to_scratch_flow_fair, drain_exact_prepared_fifo_items_to_scratch,
     drain_exact_prepared_items_to_scratch_flow_fair, estimate_cos_queue_wakeup_tick,
     release_exact_local_scratch_frames, release_exact_prepared_scratch,
     select_cos_guarantee_batch, select_cos_guarantee_batch_with_fast_path,
     select_cos_surplus_batch, select_exact_cos_guarantee_queue_with_fast_path,
     select_nonexact_cos_guarantee_batch, settle_exact_local_fifo_submission,
     settle_exact_local_scratch_submission_flow_fair, settle_exact_prepared_fifo_submission,
-    ParkReason,
+    CoSBatch, ExactCoSScratchBuild, ParkReason,
 };

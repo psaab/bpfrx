@@ -4,7 +4,6 @@ use crate::nat64::Nat64ReverseInfo;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use std::net::IpAddr;
-use std::sync::Arc;
 
 const SESSION_GC_INTERVAL_NS: u64 = 1_000_000_000;
 const DEFAULT_MAX_SESSIONS: usize = 131072;
