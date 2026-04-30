@@ -14,8 +14,9 @@
 //     gate predicate for prepared requests.
 //   - `redirect_prepared_cos_request_to_owner` + `_binding`
 //     handle the prepared (zero-copy UMEM) variant; the binding-
-//     side call invokes `tx::recycle_prepared_immediately` if
-//     ownership transfer fails.
+//     side call invokes `tx::recycle_prepared_immediately` after
+//     a successful redirect/enqueue, once the data has been copied
+//     out of UMEM (the original frame is no longer referenced).
 //   - `cos_fast_interface` / `cos_fast_queue` are the binding
 //     fast-path lookups consumed by the redirect logic.
 //
@@ -158,6 +159,7 @@ pub(in crate::afxdp) fn redirect_local_cos_request_to_owner(
     Err(req)
 }
 
+#[cfg(test)]
 #[inline]
 pub(in crate::afxdp) fn redirect_local_cos_request_to_owner_binding(
     current_live: &Arc<BindingLiveState>,

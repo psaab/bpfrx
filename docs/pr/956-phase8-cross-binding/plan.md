@@ -67,21 +67,25 @@ Visibility:
   follow Phase 7 precedent for similar-sized fns: leave un-
   attributed; LLVM heuristic should cover.
 
-## cos/mod.rs additions
+## cos/mod.rs additions (final implementation)
 
 ```rust
 pub(super) mod cross_binding;
 
 pub(super) use cross_binding::{
-    cos_fast_interface, cos_fast_queue, prepared_cos_request_stays_on_current_tx_binding,
-    redirect_local_cos_request_to_owner, redirect_prepared_cos_request_to_owner,
-    redirect_prepared_cos_request_to_owner_binding, resolve_local_routing_decision,
-    LocalRoutingDecision, Step1Action,
+    prepared_cos_request_stays_on_current_tx_binding, redirect_local_cos_request_to_owner,
+    redirect_prepared_cos_request_to_owner, redirect_prepared_cos_request_to_owner_binding,
+    resolve_local_routing_decision, LocalRoutingDecision, Step1Action,
 };
 
 #[cfg(test)]
 pub(super) use cross_binding::redirect_local_cos_request_to_owner_binding;
 ```
+
+`cos_fast_interface` / `cos_fast_queue` ended up not needing
+re-export because tx.rs's only direct callers of the lookup
+helpers are tests and the moving fns themselves
+(`resolve_local_routing_decision` reaches them inline).
 
 ## Files touched
 
