@@ -1,7 +1,32 @@
 # P2b: extract afxdp/tx/rings.rs from tx/mod.rs
 
-Plan v2 — 2026-04-30. Stage 2 step 2 of the long sequence after #991
+Plan v3 — 2026-04-30. Stage 2 step 2 of the long sequence after #991
 (P2a: tx/stats.rs) merged at master `290b4502`.
+
+## v3 changelog vs v2 (from Codex round-2)
+
+- R2-1 [BLOCKER]: import block was still source-inaccurate. v3
+  fixes:
+  - Add `std::collections::VecDeque` (apply_prepared_recycle takes
+    `&mut VecDeque<u64>`).
+  - Remove `PreparedTxRequest` (no moved body uses it directly —
+    `recycle_prepared_immediately` is NOT a moving-body callee).
+  - Remove `PENDING_TX_LIMIT_MULTIPLIER` and `TX_BATCH_SIZE` (these
+    belong to the deferred `pending_tx_capacity` body, not the
+    rings cluster).
+  - Remove `recycle_prepared_immediately` import (the moved
+    `recycle_completed_tx_offset` body calls
+    `apply_prepared_recycle` only — no path goes through
+    `recycle_prepared_immediately`).
+- R2-2 [MINOR]: `apply_prepared_recycle` was overexposed as
+  `pub(in crate::afxdp)` — that makes it reachable as
+  `crate::afxdp::tx::rings::apply_prepared_recycle` everywhere in
+  afxdp, even in non-test builds, when its only legitimate non-test
+  caller is `recycle_completed_tx_offset` (file-private,
+  co-located in rings.rs). v3 tightens to `pub(super)` in rings.rs
+  (visible only to `tx/`) plus a `#[cfg(test)] use rings::apply_prepared_recycle;`
+  inside `tx/mod.rs` so the existing test at `tx/mod.rs:3329` keeps
+  working — same pattern as P1's cfg-test re-exports.
 
 ## v2 changelog vs v1 (from Codex round-1)
 
@@ -55,7 +80,7 @@ sequence).
 | `maybe_wake_rx` | 126 | `pub(in crate::afxdp)` (bumped from `pub(super)`) | `pub(super) use rings::maybe_wake_rx;` |
 | `maybe_wake_tx` | 2234 | `pub(in crate::afxdp)` (preserved) | `pub(in crate::afxdp) use rings::maybe_wake_tx;` |
 | `recycle_completed_tx_offset` | 1784 | file-private | not re-exported (sole caller `reap_tx_completions` moves with it) |
-| `apply_prepared_recycle` | 1772 | `pub(in crate::afxdp)` (bumped from file-private — test access) | `pub(in crate::afxdp) use rings::apply_prepared_recycle;` (cfg-test only since the only non-test caller is `recycle_completed_tx_offset` which moves with it) |
+| `apply_prepared_recycle` | 1772 | `pub(super)` in rings.rs (visible to `tx/` only) | `#[cfg(test)] use rings::apply_prepared_recycle;` in `tx/mod.rs` (test-only re-export so the unit pin at `tx/mod.rs:3329` keeps working through `mod tests { use super::*; }`) |
 
 ## Why this exact set
 
@@ -107,23 +132,23 @@ Reconciled against actual moved-fn bodies (tx/mod.rs:14-63 / 65-124 /
 126-174 / 1772-1798 / 2234-2330):
 
 ```rust
+use std::collections::VecDeque;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
 
 use crate::afxdp::neighbor::monotonic_nanos;
-use crate::afxdp::types::{PreparedTxRecycle, PreparedTxRequest};
+use crate::afxdp::types::PreparedTxRecycle;
 use crate::afxdp::worker::BindingWorker;
 use crate::afxdp::{
     FILL_BATCH_SIZE, FILL_WAKE_SAFETY_INTERVAL_NS,
-    PENDING_TX_LIMIT_MULTIPLIER, RX_WAKE_IDLE_POLLS,
-    RX_WAKE_MIN_INTERVAL_NS, TX_BATCH_SIZE, TX_WAKE_MIN_INTERVAL_NS,
-    XskBindMode,
+    RX_WAKE_IDLE_POLLS, RX_WAKE_MIN_INTERVAL_NS,
+    TX_WAKE_MIN_INTERVAL_NS, XskBindMode,
 };
 
 use super::stats::{record_kick_latency, record_tx_completions_with_stamp};
 
 // Sibling tx/* helpers still in tx/mod.rs (deferred to P2c):
-use super::{recycle_prepared_immediately, update_binding_debug_state};
+use super::update_binding_debug_state;
 ```
 
 (Round-2 reviewer: re-verify on impl. The exact list may shrink if
