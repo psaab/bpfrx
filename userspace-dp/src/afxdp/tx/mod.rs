@@ -40,7 +40,7 @@ pub(in crate::afxdp) use transmit::{
     remember_prepared_recycle, transmit_batch, transmit_prepared_queue, TxError,
 };
 // transmit_prepared_batch is sibling-internal (only caller in tx/mod.rs);
-// private re-export keeps that resolution.
+// this private import keeps it available within this module.
 use transmit::transmit_prepared_batch;
 
 

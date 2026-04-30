@@ -7,7 +7,7 @@
 //   - recycle_prepared_immediately: prepared-frame eager-cleanup helper.
 //   - remember_prepared_recycle: per-offset PreparedTxRecycle bookkeeping.
 //   - transmit_batch: XSK TX-ring submit for local TxRequests.
-//   - transmit_prepared_batch (pub(super)): tx/mod.rs:220 caller hook.
+//   - transmit_prepared_batch (pub(super)): caller hook from tx/mod.rs.
 //   - transmit_prepared_queue: XSK TX-ring submit for prepared frames.
 //
 // Single-writer (owner worker), all atomic ops Ordering::Relaxed.

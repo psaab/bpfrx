@@ -1,7 +1,14 @@
 # P2c: extract afxdp/tx/transmit.rs from tx/mod.rs
 
-Plan v2 — 2026-04-30. Stage 2 step 3 of the long sequence after #992
+Plan v3 — 2026-04-30. Stage 2 step 3 of the long sequence after #992
 (P2b: tx/rings.rs) merged at master `e7d66795`.
+
+## v3 changelog vs v2 (from Codex round-2)
+
+- Codex r2 found 2 minor doc fixes: `recycle_prepared_immediately`
+  caller list now includes `worker.rs:1974` (in addition to
+  cos/cross_binding.rs); LOC estimates corrected (~570→~450,
+  ~580→~460, ~12320→~12440).
 
 ## v2 changelog vs v1 (from Codex round-1)
 
