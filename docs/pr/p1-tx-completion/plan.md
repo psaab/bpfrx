@@ -1,7 +1,41 @@
 # P1: extract cos/tx_completion.rs from tx.rs
 
-Plan v3 — 2026-04-30. First PR after #956's 8-phase cos/ submodule
+Plan v4 — 2026-04-30. First PR after #956's 8-phase cos/ submodule
 decomposition merged at PR #983.
+
+## v4 changelog vs v3 (from Codex round-3)
+
+- R3-B1 [BLOCKER]: `tx_completion.rs` import block was still wrong.
+  `maybe_top_up_cos_root_lease` and `release_cos_root_lease` live in
+  `cos/token_bucket.rs` (lines 52, 164), not `cos/queue_service.rs`.
+  And the v3 block listed unused imports (`ParkReason`,
+  `count_park_reason`, `PreparedTxRecycle`, `CoSTimerWheelRuntime`,
+  several `queue_ops` items, the entire `crate::afxdp::tx::{...}`
+  back-edge block). Plan v4 import block reconciled by reading the
+  moved-fn bodies symbol-by-symbol.
+- R3-B2 [BLOCKER]: "every Phase 6/7/8 back-edge closed" was overstated.
+  Plan v4 narrows the claim: P1 closes the **Phase 6 builder edge**
+  (`cos/builders.rs -> tx::cos_tick_for_ns`) AND the
+  **TX-completion / timer-wheel subset of Phase 7 deferrals** (the 10
+  symbols moved out of queue_service.rs's tx import block). Phase 7's
+  XSK-ring helpers (transmit_*, reap_tx_completions, etc.) and Phase
+  8's `cross_binding -> tx::recycle_prepared_immediately` edge stay,
+  scoped to #984.
+- R3-M1 [MINOR]: `advance_cos_timer_wheel` reclassified. It has NO
+  queue_service production caller — only the moving
+  `prime_cos_root_for_service` (tx.rs:1135) and tests
+  (tx.rs:10533/10537/10558/10562). Visibility stays
+  `pub(in crate::afxdp)` for the test-only access; the rationale text
+  is corrected (was: "queue_service caller", actual: "test-visible +
+  internally used by moved cluster").
+- R3-M2 [MINOR]: atomic-ordering paragraph rewritten. Moved
+  `apply_cos_send_result` body does NOT call
+  `publish_committed_queue_vtime` — that callsite is in
+  `queue_service.rs` (lines 770/920/1076/1229), which is NOT moving.
+  The Release/Acquire boundary stays inside `queue_service` /
+  `queue_ops`. The moved `apply_*` bodies only touch existing
+  `Ordering::Relaxed` counters (per-byte / per-packet
+  `fetch_add`s) — no cross-thread happens-before changes.
 
 ## v3 changelog vs v2 (from Codex round-2)
 
@@ -50,14 +84,22 @@ decomposition merged at PR #983.
 
 Move the TX-completion + timer-wheel cluster from tx.rs into
 `userspace-dp/src/afxdp/cos/tx_completion.rs`. After this PR:
-- Every cos→tx back-edge introduced by #956 Phases 6/7/8 is closed.
-- `cos/queue_service.rs` no longer imports any of the 10 moving symbols
-  from `crate::afxdp::tx`.
-- `cos/builders.rs` no longer imports `cos_tick_for_ns` from tx.
+- The **Phase 6 builder edge** (`cos/builders.rs -> tx::cos_tick_for_ns`)
+  is closed.
+- The **TX-completion / timer-wheel subset of the Phase 7 back-edge
+  cluster** is closed: 10 of the 18 symbols imported by
+  `cos/queue_service.rs` from `crate::afxdp::tx::` move to
+  `super::tx_completion::`.
 
-Remaining cos→tx back-edges after P1 are XSK-ring / worker-binding /
-prepared-frame primitives (transmit_*, reap_tx_completions, maybe_wake_tx,
-recycle_*), slated for #984 (afxdp/tx/ split).
+Remaining (NOT in P1 scope):
+- Phase 7's XSK-ring / worker-binding / per-byte primitives
+  (`maybe_wake_tx`, `reap_tx_completions`, `transmit_*`,
+  `recycle_cancelled_prepared_offset`, `remember_prepared_recycle`,
+  `stamp_submits`, `cos_queue_dscp_rewrite`, `TxError`, the
+  guarantee/quantum constants).
+- Phase 8's `cross_binding -> tx::recycle_prepared_immediately`.
+
+All deferred to #984 (afxdp/tx/ split).
 
 ## Move list (19 fns + 2 constants)
 
@@ -100,19 +142,26 @@ recycle_*), slated for #984 (afxdp/tx/ split).
 outside `cos/tx_completion.rs`:
 
 Constants (1):
-- `COS_TIMER_WHEEL_TICK_NS` — tests at tx.rs:10533, 10537, 10558, 10562
+- `COS_TIMER_WHEEL_TICK_NS` — tests at tx.rs:10533, 10537, 10558, 10562.
 
 Functions (13):
-- 11 with cos/queue_service.rs callers (most named in queue_service.rs:59-65):
+- 10 with cos/queue_service.rs production callers (verified against
+  queue_service.rs:59-65 import list AND actual usage):
   `prime_cos_root_for_service`, `apply_direct_exact_send_result`,
   `apply_cos_send_result`, `apply_cos_prepared_result`,
   `cos_tick_for_ns`, `cos_timer_wheel_level_and_slot`,
   `count_tx_ring_full_submit_stall`, `refresh_cos_interface_activity`,
-  `restore_cos_local_items_inner`, `restore_cos_prepared_items_inner`,
-  `advance_cos_timer_wheel`.
+  `restore_cos_local_items_inner`, `restore_cos_prepared_items_inner`.
 - 1 with cos/builders.rs caller: `cos_tick_for_ns` (already counted).
-- 1 with tx.rs production caller: `mark_cos_queue_runnable` (tx.rs:2080).
-- 1 with test caller: `normalize_cos_queue_state` (tx.rs:10612).
+- 1 with tx.rs production caller: `mark_cos_queue_runnable` (tx.rs:2080
+  inside `enqueue_cos_item`, NOT moving).
+- 1 with test caller only: `normalize_cos_queue_state` (tx.rs:10612).
+- 1 with test caller + internal-to-cluster only:
+  `advance_cos_timer_wheel` — sole production caller is the moving
+  `prime_cos_root_for_service` at tx.rs:1135; tests at tx.rs:10533,
+  10537, 10558, 10562. NOT a queue_service item — visibility is
+  `pub(in crate::afxdp)` purely for the test-only and (post-move)
+  intra-cluster reach via `cos/mod.rs` re-export.
 
 File-private (5 fns + 1 const) — only callers are co-located in the
 move set:
@@ -149,9 +198,10 @@ Not inlined (off per-byte path; preserve existing attributes):
 (Round-3 reviewer: verify which of these already carry `#[inline]` and
 preserve them — never silently downgrade.)
 
-## Imports for cos/tx_completion.rs (source-verified)
+## Imports for cos/tx_completion.rs (source-verified, v4)
 
-Reconciled against the moved-fn bodies (tx.rs:1127-1422, 2114-2310):
+Reconciled symbol-by-symbol against the moved-fn bodies (tx.rs:1127-1207,
+1266-1422, 2114-2156, 2159-2218, 2220-2283, 2285-2312):
 
 ```rust
 use std::collections::VecDeque;
@@ -159,32 +209,36 @@ use std::sync::atomic::Ordering;
 
 use crate::afxdp::types::{
     CoSInterfaceRuntime, CoSPendingTxItem, CoSQueueRuntime,
-    CoSTimerWheelRuntime, PreparedTxRequest, PreparedTxRecycle,
-    TxRequest, COS_TIMER_WHEEL_L0_SLOTS, COS_TIMER_WHEEL_L1_SLOTS,
+    PreparedTxRequest, TxRequest,
+    COS_TIMER_WHEEL_L0_SLOTS, COS_TIMER_WHEEL_L1_SLOTS,
 };
-use crate::afxdp::worker::BindingWorker;     // worker.rs:13
+use crate::afxdp::worker::BindingWorker;        // worker.rs:13
 
-use super::queue_ops::{
-    cos_item_len, cos_queue_clear_orphan_snapshot_after_drop,
-    cos_queue_drain_all, cos_queue_is_empty, cos_queue_pop_front,
-    cos_queue_push_back, cos_queue_push_front, cos_queue_restore_front,
-    publish_committed_queue_vtime,
-};
-use super::queue_service::{
-    count_park_reason, maybe_top_up_cos_root_lease, park_cos_queue,
-    release_cos_root_lease, CoSServicePhase, ParkReason,
-};
-
-// Back-edges remaining to tx.rs (slated for #984 — afxdp/tx/ split):
-use crate::afxdp::tx::{
-    maybe_wake_tx, reap_tx_completions, recycle_cancelled_prepared_offset,
-    recycle_prepared_immediately, transmit_batch, transmit_prepared_queue,
+use super::queue_ops::{cos_queue_is_empty, cos_queue_push_front};
+use super::queue_service::{park_cos_queue, CoSServicePhase};
+use super::token_bucket::{
+    maybe_top_up_cos_root_lease, release_cos_root_lease,
 };
 ```
 
-(Round-3 reviewers: verify the exact list against the moved bodies
-once written; this is the upper bound. Unused imports trigger build
-warnings.)
+NOT imported (verified absent from moved bodies):
+- `crate::afxdp::tx::*` — the moved bodies do NOT call any tx-resident
+  helper. There is **no remaining cos→tx import in tx_completion.rs**.
+- `CoSTimerWheelRuntime` (only `CoSInterfaceRuntime` is used directly;
+  the wheel is reached via `root.timer_wheel`).
+- `PreparedTxRecycle`, `ParkReason`, `count_park_reason`,
+  `publish_committed_queue_vtime` — not referenced.
+- `cos_item_len`, `cos_queue_clear_orphan_snapshot_after_drop`,
+  `cos_queue_drain_all`, `cos_queue_pop_front`, `cos_queue_push_back`,
+  `cos_queue_restore_front` — not referenced.
+
+`VecDeque` is used as the parameter type on the two
+`restore_cos_*_items_inner` fns; importing from `std::collections` is
+explicit per project style.
+
+(Round-4 reviewer: re-verify on the implementation diff. If the
+implementation discovers a needed symbol not in the list above, add it
+in v5; if a listed symbol turns out unused, drop it.)
 
 ## cos/queue_service.rs import migration
 
@@ -357,11 +411,13 @@ block in tx.rs. The cos/mod.rs re-export chain backs that import.
   hit the slow path when timer slots have queued queues. No per-byte
   overhead concern.
 
-Atomic ordering: `apply_cos_send_result` advances queue state and
-calls `publish_committed_queue_vtime` (cos/queue_ops.rs) — that fn's
-Release ordering is preserved by the move (already-extracted
-publish_* doesn't change). `Ordering::Release` / `Ordering::Acquire`
-explicitly imported from `std::sync::atomic`.
+Atomic ordering: the moved bodies only touch existing
+`Ordering::Relaxed` counters via `fetch_add` (drain_sent_bytes,
+sent_packets, etc.). They do NOT call `publish_committed_queue_vtime`
+— that callsite stays in `cos/queue_service.rs:770/920/1076/1229`
+which is NOT moving. The Release/Acquire publish boundary is
+unchanged by P1. `Ordering::Relaxed` is the only ordering symbol used
+inside tx_completion.rs.
 
 After this PR, every `pub(in crate::afxdp)` visibility bump from
 Phases 6/7/8 except those tied to XSK-ring helpers (#984 scope) is
