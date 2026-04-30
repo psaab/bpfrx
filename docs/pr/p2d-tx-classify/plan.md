@@ -1,7 +1,25 @@
 # P2d: extract afxdp/tx/cos_classify.rs from tx/mod.rs (final carve)
 
-Plan v1 — 2026-04-30. Stage 2 step 5 (final) of the long sequence
+Plan v2 — 2026-04-30. Stage 2 step 5 (final) of the long sequence
 after #994 (P2c2: tx/drain.rs) merged at master `ff982ad1`.
+
+## v2 changelog vs v1 (from Codex round-1)
+
+- R1-1: `enqueue_prepared_into_cos` is called from drain.rs:488. v1
+  marked it file-private. v2 makes it `pub(super)` in cos_classify.rs
+  with a `pub(super) use cos_classify::enqueue_prepared_into_cos;`
+  re-export from tx/mod.rs so drain.rs's `use super::*;` resolves.
+- R1-2: tx/mod.rs facade sketch dropped `use super::cos::{...}`
+  imports that drain.rs uses (`drain_shaped_tx`, redirect helpers,
+  `resolve_local_routing_decision`, `Step1Action`). v2 keeps those
+  in the facade so drain.rs's `use super::*;` keeps resolving.
+- R1-3: tests stay in tx/mod.rs::tests for this PR. v2 adds explicit
+  cfg-test re-exports for helpers directly pinned in tx/mod.rs
+  (resolve_cos_queue_idx, clone_prepared_request_for_cos,
+  prepare_local_request_for_cos, cos_queue_accepts_prepared,
+  demote_prepared_cos_queue_to_local). No test splitting in this PR.
+- R1-4: corrected count-table headings (was "Public items (4)" /
+  "Private helpers (8)" — actual = 6 / 10).
 
 ## Goal
 
@@ -16,7 +34,7 @@ This is the FINAL carve — closes #984.
 
 ## Move list (~870 LOC)
 
-### Public items (4)
+### Public items (6)
 
 | Item | Line | Source visibility | Facade re-export |
 |---|---|---|---|
@@ -27,7 +45,14 @@ This is the FINAL carve — closes #984.
 | `enqueue_local_into_cos` | 518 | `pub(in crate::afxdp)` (bumped) | `pub(super) use cos_classify::enqueue_local_into_cos;` |
 | `cos_queue_dscp_rewrite` | 860+ | `pub(in crate::afxdp)` (preserved) | `pub(in crate::afxdp) use cos_classify::cos_queue_dscp_rewrite;` |
 
-### Private helpers (8)
+### Private helpers (10) + 1 sibling-visible
+
+`enqueue_prepared_into_cos` becomes `pub(super)` in cos_classify.rs
+(called by drain.rs:488); tx/mod.rs adds
+`pub(super) use cos_classify::enqueue_prepared_into_cos;` so
+drain.rs's `use super::*;` resolves it.
+
+The remaining 9 helpers are file-private inside cos_classify.rs:
 
 | Item | Line |
 |---|---|
