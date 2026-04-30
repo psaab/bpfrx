@@ -1,6 +1,33 @@
 # #956 Phase 5: extract cos/queue_ops.rs from tx.rs
 
-Plan v2 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
+Plan v3 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
+
+Round-2 changelog (v2 → v3): Codex round-2 returned PLAN-NEEDS-MAJOR
+with 2 MAJOR + 2 MINOR defects, all addressed:
+
+- R2-1 MAJOR (re-export block placement): v2 wrongly put
+  `cos_queue_clear_orphan_snapshot_after_drop` and
+  `cos_queue_restore_front` ONLY in the cfg-gated section. Both
+  have production callers that stay in tx.rs (the 4 drain paths
+  at tx.rs:2729/2748/2954/2985 and the demote path at
+  tx.rs:4807/4811). Must be in the always-on `pub(super) use`
+  re-export block too. Compiled as written, tx.rs prod build
+  would fail.
+- R2-2 MAJOR (prelude incomplete): queue_ops.rs body uses
+  `TX_BATCH_SIZE` (afxdp.rs:196 — parent module) and constructs
+  `CoSQueuePopSnapshot` (types.rs:1042). Plan prelude listed
+  only `CoSPendingTxItem`, `CoSQueueRuntime`,
+  `COS_FLOW_FAIR_BUCKET_MASK`. Added the two missing imports.
+- R2-3 MINOR (visibility cleanup): `cos_queue_min_finish_bucket`
+  has only co-located callers (`cos_queue_front` at tx.rs:3692
+  and `cos_queue_pop_front_inner` at tx.rs:3939, both moving).
+  Should be file-private, not pub. Conversely
+  `cos_queue_clear_orphan_snapshot_after_drop` has 3 test sites
+  (tx.rs:11498/11640/11737) — needs cfg-gated re-export AS WELL
+  AS the prod re-export (R2-1). v3 lists it in BOTH blocks.
+- R2-4 MINOR (V_MIN test-count): `V_MIN_CONSECUTIVE_SKIP_HARD_CAP`
+  also tested at tx.rs:16821/16838/16993; `V_MIN_SUSPENSION_BATCHES`
+  at tx.rs:16871/16996. Visibility unchanged; counts updated.
 
 Round-1 changelog (v1 → v2): Codex round-1 returned PLAN-NEEDS-MAJOR
 with 3 substantive defects, all addressed in v2:
@@ -146,21 +173,30 @@ functions. Visibility classification:
   - `cos_item_len` (tx.rs production — small accessor, hot path
     via every push/pop)
 
-- **`pub(in crate::afxdp)` (test-touched — needs cfg-gated
-  re-export from cos/mod.rs)** (Codex round-1 R1-1):
+- **`pub(in crate::afxdp)` AND in always-on re-export block**
+  (production callers stay in tx.rs — R2-1):
+  - `cos_queue_clear_orphan_snapshot_after_drop` (4 prod
+    callers at tx.rs:2729/2748/2954/2985)
+  - `cos_queue_restore_front` (prod callers at tx.rs:4807/4811)
+
+- **`pub(in crate::afxdp)` AND in cfg-gated re-export block**
+  (test-only or test-additional sites — R1-1, R2-3, R2-4):
   - `account_cos_queue_flow_enqueue` (10 direct test sites)
   - `account_cos_queue_flow_dequeue` (4 direct test sites)
-  - `V_MIN_CONSECUTIVE_SKIP_HARD_CAP` (test sites at 16494/16496)
-  - `V_MIN_SUSPENSION_BATCHES` (test site at 16502)
-  - `cos_queue_min_finish_bucket` (tests exercise directly)
-  - `cos_queue_clear_orphan_snapshot_after_drop` (production
-    callers all stay in tx.rs at 2729/2748/2954/2985)
-  - `cos_queue_restore_front` (production caller
-    `demote_prepared_cos_queue_to_local` stays in tx.rs)
+  - `V_MIN_CONSECUTIVE_SKIP_HARD_CAP` (test sites at
+    16494/16496/16821/16838/16993)
+  - `V_MIN_SUSPENSION_BATCHES` (test sites at 16502/16871/16996)
+  - `cos_queue_clear_orphan_snapshot_after_drop` ALSO cfg-gated
+    (test sites at 11498/11640/11737 — same fn appears in BOTH
+    blocks because it has both prod and test callers — R2-3)
 
-- **File-private (post-move)**:
+- **File-private (post-move) — Codex round-2 R2-3 corrected
+  classification**:
   - `cos_queue_pop_front_inner` (only called by `pop_front` and
     `pop_front_no_snapshot`, both moving)
+  - `cos_queue_min_finish_bucket` (only called by `cos_queue_front`
+    and `cos_queue_pop_front_inner`, both moving — was wrongly
+    in the test-touched bucket in v2)
   - `compute_v_min_lag_threshold` (only called by
     `cos_queue_v_min_continue`, both moving)
   - `V_MIN_READ_CADENCE`, `V_MIN_LAG_THRESHOLD_NS`,
@@ -184,8 +220,12 @@ functions. Visibility classification:
 use std::collections::VecDeque;
 
 use crate::afxdp::types::{
-    CoSPendingTxItem, CoSQueueRuntime, COS_FLOW_FAIR_BUCKET_MASK,
+    CoSPendingTxItem, CoSQueuePopSnapshot, CoSQueueRuntime,
+    COS_FLOW_FAIR_BUCKET_MASK,
 };
+use crate::afxdp::TX_BATCH_SIZE;     // pop_front_inner uses this for
+                                      // snapshot ring sizing
+                                      // (Codex round-2 R2-2)
 use crate::session::SessionKey;     // account_*, push_back, pop need
                                      // SessionKey for flow-key extraction
                                      // (cos_item_flow_key returns SessionKey)
