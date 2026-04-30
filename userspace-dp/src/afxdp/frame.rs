@@ -196,7 +196,7 @@ pub(super) fn parse_session_flow(
 }
 
 /// Check if a frame contains a TCP RST flag. Returns (is_rst, summary) for logging.
-pub(super) fn frame_has_tcp_rst(frame: &[u8]) -> bool {
+pub(in crate::afxdp) fn frame_has_tcp_rst(frame: &[u8]) -> bool {
     let l3 = match frame_l3_offset(frame) {
         Some(off) => off,
         None => return false,
@@ -307,7 +307,7 @@ pub(super) fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
     Some(14)
 }
 
-pub(super) fn apply_dscp_rewrite_to_frame(frame: &mut [u8], dscp: u8) -> Option<()> {
+pub(in crate::afxdp) fn apply_dscp_rewrite_to_frame(frame: &mut [u8], dscp: u8) -> Option<()> {
     let dscp = dscp & 0x3f;
     let l3 = frame_l3_offset(frame)?;
     let ip = frame.get_mut(l3..)?;

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn monotonic_nanos() -> u64 {
+pub(in crate::afxdp) fn monotonic_nanos() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
