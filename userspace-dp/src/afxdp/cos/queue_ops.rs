@@ -606,7 +606,6 @@ pub(in crate::afxdp) fn cos_queue_clear_orphan_snapshot_after_drop(queue: &mut C
     }
 }
 
-#[inline]
 pub(in crate::afxdp) fn cos_queue_drain_all(queue: &mut CoSQueueRuntime) -> VecDeque<CoSPendingTxItem> {
     // #913 / Codex R3: clear stale snapshots from any prior
     // committed hot-path drain. Without this, a subsequent
@@ -839,4 +838,3 @@ pub(in crate::afxdp) fn cos_item_len(item: &CoSPendingTxItem) -> u64 {
         CoSPendingTxItem::Prepared(req) => req.len as u64,
     }
 }
-
