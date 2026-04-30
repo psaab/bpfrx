@@ -94,21 +94,27 @@ use cos_classify::{
 so `mod tests { use super::*; }` resolves them. (Tests stay in
 `tx/mod.rs::tests` — no test split in this PR.)
 
-The remaining 4 helpers are file-private (no external callers,
-no test pins):
+All 10 helpers, with their final visibility in cos_classify.rs:
 
-| Item | Line |
-|---|---|
-| `map_cached_forwarding_class_queue` | 127 |
-| `resolve_cos_dscp_classifier_queue_id` | 501 |
-| `resolve_cos_ieee8021_classifier_queue_id` | 506 |
-| `prepare_local_request_for_cos` | 616 |
-| `enqueue_prepared_into_cos` | 647 |
-| `clone_prepared_request_for_cos` | 703 |
-| `resolve_cos_queue_idx` | 717 |
-| `demote_prepared_cos_queue_to_local` | 734 |
-| `cos_queue_accepts_prepared` | 850 |
-| `enqueue_cos_item` | 872 |
+| Item | Line | Visibility | Reason |
+|---|---|---|---|
+| `map_cached_forwarding_class_queue` | 127 | file-private | only caller is `resolve_cached_cos_tx_selection` (moving) |
+| `resolve_cos_dscp_classifier_queue_id` | 501 | file-private | only caller is `resolve_cos_tx_selection` (moving) |
+| `resolve_cos_ieee8021_classifier_queue_id` | 506 | file-private | only caller is `resolve_cos_tx_selection` (moving) |
+| `prepare_local_request_for_cos` | 616 | `pub(super)` | direct test pin in `tx/mod.rs::tests` |
+| `enqueue_prepared_into_cos` | 647 | `pub(super)` | sibling `drain.rs:488` caller (private `use` from tx/mod.rs) |
+| `clone_prepared_request_for_cos` | 703 | `pub(super)` | direct test pin in `tx/mod.rs::tests` |
+| `resolve_cos_queue_idx` | 717 | `pub(super)` | direct test pin in `tx/mod.rs::tests` |
+| `demote_prepared_cos_queue_to_local` | 734 | `pub(super)` | direct test pin in `tx/mod.rs::tests` |
+| `cos_queue_accepts_prepared` | 850 | `pub(super)` | direct test pin in `tx/mod.rs::tests` |
+| `enqueue_cos_item` | 872 | file-private | only callers are `enqueue_local_into_cos` / `enqueue_prepared_into_cos` (both moving) |
+
+Summary: 4 file-private + 6 `pub(super)` (1 sibling-visible for
+drain.rs + 5 test-pin-visible). The 6 `pub(super)` items get
+`#[cfg(test)] use cos_classify::{...};` re-exports in tx/mod.rs for
+the 5 test-pinned ones, plus a non-test `use cos_classify::enqueue_prepared_into_cos;`
+for the drain.rs sibling caller (private import, not re-export — see
+final facade sketch).
 
 (Round-1 reviewer: verify the line numbers and the full set against
 source — there may be additional small private helpers nested in.)
