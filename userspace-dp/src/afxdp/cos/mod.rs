@@ -3,14 +3,15 @@
 // policy + flow-fair promotion; Phase 4 extracted token-bucket
 // lease/refill; Phase 5 extracted queue ops + MQFQ ordering +
 // V-min lifecycle; Phase 6 extracted CoS interface-runtime
-// builders; Phase 7 (this commit) extracts the dispatch / drain /
-// submit subsystem (~2400 LOC). Subsequent phase: Phase 8
-// cross-binding.
-// See docs/pr/956-phase7-queue-service/plan.md for the current
-// phase and docs/pr/956-tx-decomposition/plan.md for the full plan.
+// builders; Phase 7 extracted the dispatch / drain / submit
+// subsystem; Phase 8 (this commit) extracts the cross-binding
+// redirect helpers — FINAL phase of #956.
+// See docs/pr/956-phase8-cross-binding/plan.md for this phase
+// and docs/pr/956-tx-decomposition/plan.md for the full plan.
 
 pub(super) mod admission;
 pub(super) mod builders;
+pub(super) mod cross_binding;
 pub(super) mod ecn;
 pub(super) mod flow_hash;
 pub(super) mod queue_ops;
@@ -21,6 +22,11 @@ pub(super) use admission::{
     apply_cos_admission_ecn_policy, cos_flow_aware_buffer_limit, cos_queue_flow_share_limit,
 };
 pub(super) use builders::ensure_cos_interface_runtime;
+pub(super) use cross_binding::{
+    prepared_cos_request_stays_on_current_tx_binding, redirect_local_cos_request_to_owner,
+    redirect_prepared_cos_request_to_owner, redirect_prepared_cos_request_to_owner_binding,
+    resolve_local_routing_decision, LocalRoutingDecision, Step1Action,
+};
 pub(super) use flow_hash::{cos_flow_bucket_index, cos_item_flow_key};
 pub(super) use queue_ops::{
     cos_item_len, cos_queue_clear_orphan_snapshot_after_drop, cos_queue_drain_all,
@@ -43,6 +49,8 @@ pub(super) use admission::{
 };
 #[cfg(test)]
 pub(super) use builders::build_cos_interface_runtime;
+#[cfg(test)]
+pub(super) use cross_binding::redirect_local_cos_request_to_owner_binding;
 #[cfg(test)]
 pub(super) use ecn::{maybe_mark_ecn_ce, ECN_CE, ECN_ECT_0, ECN_ECT_1, ECN_MASK, ECN_NOT_ECT};
 #[cfg(test)]
