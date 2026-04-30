@@ -182,4 +182,3 @@ pub(in crate::afxdp) fn record_tx_completions_with_stamp(
     }
     (hist_fire_count, hist_fire_sum_ns)
 }
-

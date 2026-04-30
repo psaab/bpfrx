@@ -118,9 +118,18 @@ use std::sync::atomic::Ordering;
 
 use crate::afxdp::umem::{
     bucket_index_for_ns, OwnerProfileOwnerWrites,
-    TX_SIDECAR_UNSTAMPED, TX_SUBMIT_LAT_BUCKETS, UMEM_FRAME_SHIFT,
+    TX_SIDECAR_UNSTAMPED, TX_SUBMIT_LAT_BUCKETS,
 };
+use crate::afxdp::UMEM_FRAME_SHIFT;
 ```
+
+(`UMEM_FRAME_SHIFT` is defined at `afxdp.rs:162` as a module-private
+const, NOT in `umem.rs`. The pre-move tx.rs reached it via
+`use super::*;` inheriting from afxdp; the post-move tx/stats.rs
+imports it explicitly as `crate::afxdp::UMEM_FRAME_SHIFT`. Submodules
+of afxdp can read its non-pub items via the absolute path because
+visibility defaults to `pub(self)` for the defining module's
+descendants.)
 
 NOT imported (verified absent from moved bodies):
 - `BindingWorker` — these fns take owner-profile slices directly.
