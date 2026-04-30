@@ -1,9 +1,30 @@
 # #956 Phase 4: extract cos/token_bucket.rs from tx.rs
 
-Plan v1 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
+Plan v2 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
 Phase 1 (cos/ecn.rs) shipped at PR #976; Phase 2 (cos/flow_hash.rs)
 at PR #977; Phase 3 (cos/admission.rs) at PR #978. Phase 4 = the
 token-bucket lease/refill subsystem.
+
+Round-1 changelog (v1 → v2): addresses 4 Codex round-1 findings,
+all wording-level (move list and visibility unchanged):
+- R1-1: corrected production-vs-test caller counts (some cited
+  call sites are inside `#[cfg(test)]` blocks at tx.rs:1626+).
+- R1-2: `tx_frame_capacity()` lives in parent `afxdp.rs:273`,
+  not tx.rs. Dependency direction is `cos/token_bucket -> afxdp`,
+  not `cos/token_bucket -> tx`.
+- R1-3: clarified COS_MIN_BURST_BYTES non-test consumer set
+  inside tx.rs (mostly tests after line 6380; production sites
+  at 1832, 5237, plus 7 inside the moving top-up helpers).
+- R1-4: worker.rs gets the release helpers via a module-level
+  `use super::*` glob at worker.rs:1, with `afxdp.rs:149`
+  glob-importing tx — not via `super::tx::*`. The plan's fix
+  (explicit `use super::cos::{...}` import in worker.rs) is
+  still right; rationale wording corrected.
+- R1-5 (new preference): admission.rs should import
+  COS_MIN_BURST_BYTES via `use super::COS_MIN_BURST_BYTES`
+  (cos/mod.rs re-export) rather than reaching directly into
+  `super::token_bucket::COS_MIN_BURST_BYTES`. Avoids leaking
+  the cos/* internal file layout.
 
 ## Goal
 
@@ -20,28 +41,36 @@ back-reference is gone.
 
 | Item | Line | Visibility | Production callers | Test callers |
 |---|---|---|---|---|
-| `maybe_top_up_cos_root_lease` | 3511 | private | tx.rs:1515 | tx.rs:6824 (1 site) |
-| `maybe_top_up_cos_queue_lease` | 3533 | private | tx.rs:1643, 1733 | tx.rs:6873 (1 site) |
-| `refill_cos_tokens` | 3582 | private | tx.rs:1651, 1829 (+ inside maybe_top_up_cos_queue_lease at 3558) | none |
+| `maybe_top_up_cos_root_lease` | 3511 | private | tx.rs:1515 | tx.rs:6824 (production), tx.rs test sites |
+| `maybe_top_up_cos_queue_lease` | 3533 | private | tx.rs:1733 | tx.rs:1643, 6873 (#[cfg(test)] selector starts at tx.rs:1626) |
+| `refill_cos_tokens` | 3582 | private | tx.rs:1829 + internal call from `maybe_top_up_cos_queue_lease` body at tx.rs:3558 | tx.rs:1651 (#[cfg(test)] selector at tx.rs:1626) |
 | `cos_refill_ns_until` | 3625 | private | tx.rs:4257, 4259 | none |
 | `release_cos_root_lease` | 5524 | private | tx.rs:5509 (refresh_cos_interface_activity), tx.rs:5545 (release_all_cos_root_leases) | none |
 | `release_all_cos_root_leases` | 5542 | `pub(super)` | worker.rs:746, 1613, 1911 | none |
 | `release_all_cos_queue_leases` | 5549 | `pub(super)` | worker.rs:746, 755, 1613, 1912 | none |
 
+Production-vs-test note (Codex round-1 R1-1): tx.rs:1626 starts a
+`#[cfg(test)]` legacy-selector block, so call sites at tx.rs:1643,
+1651 are test-only. The move set is unchanged — every fn still has
+at least one production caller — but the visibility justification
+relies on the production sites listed above, not the test ones.
+
 **Constant**:
 
 | Item | Line | Visibility | Use count |
 |---|---|---|---|
-| `COS_MIN_BURST_BYTES` | 3472 | `pub(in crate::afxdp)` | tx.rs: 91 (mostly token-bucket / refill paths); cos/admission.rs: 3 |
+| `COS_MIN_BURST_BYTES` | 3472 | `pub(in crate::afxdp)` | tx.rs: 91 total (most are tests below tx.rs:6380); non-test consumers: tx.rs:1832 (refill), 7 sites at 3522 inside the moving top-up helpers, tx.rs:5237 (runtime construction). cos/admission.rs: 3. |
 
 `COS_MIN_BURST_BYTES` is the burst-cap argument applied uniformly across
 every `maybe_top_up_*` and `refill_cos_tokens` call. It logically belongs
 with the token-bucket module that consumes it.
 
 `tx_frame_capacity()` is referenced by `maybe_top_up_*` to floor lease
-size — that helper stays in tx.rs (it's about TX-ring frame sizing, not
-token-bucket logic). admission.rs already imports it analogously; tx.rs
-can keep it as the owner.
+size — Codex round-1 R1-2 caught that this helper lives in the parent
+module at `afxdp.rs:273`, not `tx.rs`. So the dependency direction
+after the move is `cos/token_bucket -> afxdp::tx_frame_capacity`,
+which is a parent-module reference (not a sibling `tx` import). The
+moved file should `use crate::afxdp::tx_frame_capacity;` directly.
 
 ## Approach
 
@@ -88,9 +117,11 @@ worker.rs:
 
 cos/admission.rs:
 - Replace `use crate::afxdp::tx::COS_MIN_BURST_BYTES` with
-  `use super::token_bucket::COS_MIN_BURST_BYTES` (or via the
-  cos/mod.rs re-export). This eliminates the admission → tx
-  back-reference noted as forward-debt in Phase 3.
+  `use super::COS_MIN_BURST_BYTES` (resolves to the cos/mod.rs
+  re-export rather than the file-internal token_bucket path).
+  Codex round-1 R1-5 prefers this form so admission.rs doesn't
+  encode the cos/* internal file layout. Eliminates the
+  admission → tx back-reference noted as forward-debt in Phase 3.
 
 ## Files touched
 
@@ -139,10 +170,12 @@ touches the hot-path enqueue/refill loop — every TX byte goes through
   enqueue cycle in production (tx.rs:1651, 1829, 3558). Need
   `#[inline]` to survive the cross-module move. Verify against the
   pre-move hot path.
-- **worker.rs import migration.** worker.rs currently calls
-  `release_all_cos_*_leases` via plain identifier (they're in tx.rs,
-  worker.rs already `use super::tx::*`). After the move worker.rs
-  needs an explicit import path (or rely on a re-export from tx).
+- **worker.rs import migration.** worker.rs picks up the release
+  helpers via a module-level `use super::*` glob at worker.rs:1
+  (with afxdp.rs:149 glob-importing tx — Codex round-1 R1-4
+  correction). After the move worker.rs needs an explicit
+  `use super::cos::{release_all_cos_root_leases,
+  release_all_cos_queue_leases};`.
 - **Stale-comment churn.** Phase 3 added a comment block flagging
   the forward-debt; that comment becomes false in this PR.
 
