@@ -44,7 +44,7 @@ backpressure helpers stay for a separate later PR (P2c2 or P2d).
 `cos_queue_dscp_rewrite` also stays in `tx/mod.rs` until that
 later carve since it's a CoS-side helper.
 
-## Move list (6 fns + 1 enum, ~570 LOC)
+## Move list (6 fns + 1 enum, ~450 LOC)
 
 | Item | Line (post-P2b) | Source visibility (transmit.rs) | Facade re-export (tx/mod.rs) |
 |---|---|---|---|
@@ -58,7 +58,9 @@ later carve since it's a CoS-side helper.
 
 5 of 7 items have known external (cos/queue_service.rs) callers via
 `crate::afxdp::tx::*`. `transmit_prepared_batch` is internal to `tx/`.
-`recycle_prepared_immediately` is called from `cos/cross_binding.rs`.
+`recycle_prepared_immediately` is called from `cos/cross_binding.rs`
+**and** `worker.rs:1974` (reached via `afxdp.rs:149`'s `use self::tx::*`
++ `worker.rs:1`'s `use super::*`).
 
 ## NOT in P2c scope (deferred)
 
@@ -85,10 +87,10 @@ Before P2c:
 
 After P2c:
   userspace-dp/src/afxdp/tx/
-    mod.rs       (~12320 LOC)
+    mod.rs       (~12440 LOC)
     stats.rs     (unchanged)
     rings.rs     (unchanged)
-    transmit.rs  (~580 LOC)
+    transmit.rs  (~460 LOC)
 ```
 
 `afxdp.rs:99` already points at `afxdp/tx/mod.rs`. No parent-module
@@ -158,7 +160,7 @@ Round-2 reviewer: enumerate any test pin I missed.
 
 ## Risk
 
-**Medium.** ~570 LOC across 6 fns + 1 enum. Single-writer (owner
+**Medium.** ~450 LOC across 6 fns + 1 enum. Single-writer (owner
 worker) for the fns that touch BindingWorker. All atomic ops
 `Ordering::Relaxed`.
 
