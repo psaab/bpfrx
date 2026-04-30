@@ -8984,8 +8984,8 @@ mod tests {
 
         let tclass = (0x2eu8 << 2) | ECN_ECT_0;
         let packet = build_ipv6_test_packet(tclass);
-        // Pick a non-zero offset to prove that `slice_mut_unchecked`
-        // is honouring `req.offset` rather than always slicing from 0.
+        // Pick a non-zero offset to prove that `slice_mut` is
+        // honouring `req.offset` rather than always slicing from 0.
         let offset: u64 = 128;
         let mut umem = test_admission_umem();
         let mut item =
@@ -9216,7 +9216,7 @@ mod tests {
         let tagged = insert_single_vlan_tag(packet, vid, priority);
 
         // Non-zero UMEM offset so we also prove offset arithmetic
-        // (slice_mut_unchecked + l3_offset) composes correctly on a
+        // (slice_mut + l3_offset) composes correctly on a
         // non-head frame.
         let frame_offset: u64 = 128;
         let mut umem = test_admission_umem();
