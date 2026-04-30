@@ -486,7 +486,6 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::afxdp::tx::test_support::*;
     use crate::afxdp::PROTO_TCP;
 
     #[test]
