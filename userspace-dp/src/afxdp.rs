@@ -96,7 +96,7 @@ mod shared_ops;
 mod test_fixtures;
 #[path = "afxdp/tunnel.rs"]
 mod tunnel;
-#[path = "afxdp/tx.rs"]
+#[path = "afxdp/tx/mod.rs"]
 mod tx;
 #[path = "afxdp/types.rs"]
 mod types;
