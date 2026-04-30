@@ -184,9 +184,9 @@ continue gates (`cos_queue_v_min_consume_suspension`,
 | `cos_queue_drain_all` | 4103 | private | tx.rs:4802 (`demote_prepared_cos_queue_to_local`, stays in tx) | tx.rs:12455 |
 | `cos_queue_restore_front` | 4127 | private | tx.rs:4807/4811 (`demote_prepared_cos_queue_to_local`, stays in tx) | none |
 | `publish_committed_queue_vtime` | 4950 | private | tx.rs (TX commit boundaries) | tests |
-| `cos_queue_v_min_consume_suspension` | 5015 | private | tx.rs (drain throttle gate) | tests |
-| `cos_queue_v_min_continue` | 5051 | private | tx.rs:2693/2921 (drain throttle gate) | tx.rs:16039/16046/16495/16499/16616/16621/16994 (16535/16541/16545 belong to `cos_queue_v_min_consume_suspension` — Codex round-4 #4) |
 | `compute_v_min_lag_threshold` | 4987 | private | tx.rs:5086 (only `cos_queue_v_min_continue`, moving) — file-private after move | tx.rs (indirect via v_min_continue) |
+| `cos_queue_v_min_consume_suspension` | 5015 | private | tx.rs (drain throttle gate) | tx.rs:16535/16541/16545 |
+| `cos_queue_v_min_continue` | 5051 | private | tx.rs:2693/2921 (drain throttle gate) | tx.rs:16039/16046/16495/16499/16616/16621/16994 |
 | `cos_item_len` | 5409 | private | tx.rs (many — accessor on `CoSPendingTxItem`) | tests |
 
 (Codex round-1 will verify the call-site accounting; the table is
