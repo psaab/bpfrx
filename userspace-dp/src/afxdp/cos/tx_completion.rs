@@ -569,3 +569,103 @@ pub(in crate::afxdp) fn restore_cos_prepared_items_inner(
     }
     retry_bytes
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::afxdp::tx::test_support::*;
+    use crate::afxdp::cos::token_bucket::COS_MIN_BURST_BYTES;
+    use crate::afxdp::types::{
+        COS_FLOW_FAIR_BUCKETS, CoSQueueDropCounters, CoSQueueOwnerProfile, FlowRrRing,
+    };
+    use crate::afxdp::TX_BATCH_SIZE;
+
+    #[test]
+    fn normalize_cos_queue_state_repairs_nonempty_unparked_queue_to_runnable() {
+        let mut queue = CoSQueueRuntime {
+            queue_id: 5,
+            priority: 5,
+            transmit_rate_bytes: 11_000_000_000 / 8,
+            exact: true,
+            flow_fair: false,
+            shared_exact: false,
+            flow_hash_seed: 0,
+            surplus_weight: 1,
+            surplus_deficit: 0,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            tokens: 0,
+            last_refill_ns: 0,
+            queued_bytes: 1500,
+            active_flow_buckets: 0,
+            active_flow_buckets_peak: 0,
+            flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+            flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+            flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+            queue_vtime: 0,
+            pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
+            flow_rr_buckets: FlowRrRing::default(),
+            flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+            runnable: false,
+            parked: false,
+            next_wakeup_tick: 0,
+            wheel_level: 0,
+            wheel_slot: 0,
+            items: VecDeque::from([test_cos_item(1500)]),
+            local_item_count: 0,
+
+            vtime_floor: None,
+
+            worker_id: 0,
+            drop_counters: CoSQueueDropCounters::default(),
+            owner_profile: CoSQueueOwnerProfile::new(),
+            consecutive_v_min_skips: 0,
+            v_min_suspended_remaining: 0,
+            v_min_hard_cap_overrides_scratch: 0,
+        };
+
+        normalize_cos_queue_state(&mut queue);
+
+        assert!(queue.runnable);
+        assert!(!queue.parked);
+        assert_eq!(queue.next_wakeup_tick, 0);
+    }
+
+    #[test]
+    fn count_park_reason_helper_advances_exact_counter() {
+        // Low-level test of the helper itself — paranoia pin against a
+        // refactor that accidentally writes to the wrong field.
+        let mut root = test_cos_runtime_with_exact(true);
+        let before = snapshot_counters(&root.queues[0]);
+
+        count_park_reason(&mut root, 0, ParkReason::RootTokenStarvation);
+        let mid = snapshot_counters(&root.queues[0]);
+        assert_eq!(
+            mid.root_token_starvation_parks,
+            before.root_token_starvation_parks + 1
+        );
+        assert_eq!(
+            mid.queue_token_starvation_parks,
+            before.queue_token_starvation_parks
+        );
+
+        count_park_reason(&mut root, 0, ParkReason::QueueTokenStarvation);
+        let after = snapshot_counters(&root.queues[0]);
+        assert_eq!(
+            after.queue_token_starvation_parks,
+            before.queue_token_starvation_parks + 1
+        );
+        assert_eq!(
+            after.root_token_starvation_parks,
+            mid.root_token_starvation_parks
+        );
+
+        // Out-of-range queue_idx is a no-op, not a panic.
+        count_park_reason(&mut root, 999, ParkReason::RootTokenStarvation);
+        assert_eq!(
+            snapshot_counters(&root.queues[0]).root_token_starvation_parks,
+            after.root_token_starvation_parks
+        );
+    }
+
+}
