@@ -343,7 +343,7 @@ visibility from cos/mod.rs. File-private items are NOT re-exported.)
 
 ## tx.rs changes
 
-1. Remove the 19 fn definitions + 2 constants.
+1. Remove the 17 fn definitions + 2 constants.
 2. Remove the Phase-6 visibility-bump comment block above
    `cos_tick_for_ns` (will not exist post-move).
 3. **Always-on import** (cos:: block at tx.rs:1227 / 1240) — add ONLY
