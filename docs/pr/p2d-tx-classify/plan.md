@@ -69,14 +69,33 @@ This is the FINAL carve — closes #984.
 | `enqueue_local_into_cos` | 518 | `pub(in crate::afxdp)` (bumped) | `pub(super) use cos_classify::enqueue_local_into_cos;` |
 | `cos_queue_dscp_rewrite` | 860+ | `pub(in crate::afxdp)` (preserved) | `pub(in crate::afxdp) use cos_classify::cos_queue_dscp_rewrite;` |
 
-### Private helpers (10) + 1 sibling-visible
+### Helpers (10 total)
 
-`enqueue_prepared_into_cos` becomes `pub(super)` in cos_classify.rs
-(called by drain.rs:488); tx/mod.rs adds
-`pub(super) use cos_classify::enqueue_prepared_into_cos;` so
-drain.rs's `use super::*;` resolves it.
+`enqueue_prepared_into_cos` is `pub(super)` in cos_classify.rs
+(called by drain.rs:488). tx/mod.rs adds a **private**
+`use cos_classify::enqueue_prepared_into_cos;` (NOT a re-export —
+re-exporting would be E0364 since pub(super) source can't be
+re-exported as pub(super) from tx/mod.rs's perspective). Same
+pattern as `transmit_prepared_batch` from P2c. drain.rs's
+`use super::*;` then resolves it transitively through tx/mod.rs.
 
-The remaining 9 helpers are file-private inside cos_classify.rs:
+5 of the helpers have direct test pins in `tx/mod.rs::tests`. They
+become `pub(super)` in cos_classify.rs and tx/mod.rs adds:
+
+```rust
+#[cfg(test)]
+use cos_classify::{
+    clone_prepared_request_for_cos, cos_queue_accepts_prepared,
+    demote_prepared_cos_queue_to_local, prepare_local_request_for_cos,
+    resolve_cos_queue_idx,
+};
+```
+
+so `mod tests { use super::*; }` resolves them. (Tests stay in
+`tx/mod.rs::tests` — no test split in this PR.)
+
+The remaining 4 helpers are file-private (no external callers,
+no test pins):
 
 | Item | Line |
 |---|---|
@@ -165,6 +184,31 @@ pub(super) use cos_classify::{
     resolve_cos_queue_id, resolve_cos_tx_selection,
 };
 pub(in crate::afxdp) use cos_classify::cos_queue_dscp_rewrite;
+// Private import (NOT re-export — would be E0364): drain.rs:488
+// reaches it via `use super::*;` through this private use.
+use cos_classify::enqueue_prepared_into_cos;
+// Test pins for 5 helpers in tx/mod.rs::tests (resolve via super::*).
+#[cfg(test)]
+use cos_classify::{
+    clone_prepared_request_for_cos, cos_queue_accepts_prepared,
+    demote_prepared_cos_queue_to_local, prepare_local_request_for_cos,
+    resolve_cos_queue_idx,
+};
+
+// Existing load-bearing imports (preserved from pre-P2d tx/mod.rs):
+// drain.rs uses these via `use super::*;` for drain_shaped_tx, redirect
+// helpers, resolve_local_routing_decision, LocalRoutingDecision, Step1Action.
+use super::cos::{
+    apply_cos_admission_ecn_policy, cos_flow_aware_buffer_limit,
+    cos_flow_bucket_index, cos_item_flow_key, cos_queue_drain_all,
+    cos_queue_flow_share_limit, cos_queue_is_empty, cos_queue_push_back,
+    cos_queue_restore_front, drain_shaped_tx, ensure_cos_interface_runtime,
+    mark_cos_queue_runnable, publish_committed_queue_vtime,
+    redirect_prepared_cos_request_to_owner,
+    redirect_prepared_cos_request_to_owner_binding,
+    resolve_local_routing_decision, LocalRoutingDecision, Step1Action,
+};
+// (Plus the existing #[cfg(test)] cos:: imports — preserved verbatim.)
 
 #[cfg(test)]
 mod tests {
