@@ -13,16 +13,25 @@ pub(super) mod flow_hash;
 // Re-export the items consumed by sibling `tx.rs`. The items
 // themselves are `pub(in crate::afxdp)` in their source files;
 // these re-exports shorten the import path on call sites.
+//
+// Production-side: only the entry points tx.rs's non-test code
+// consumes. Test-only re-exports are gated below to avoid
+// `unused_imports` warnings on non-test builds.
 pub(super) use admission::{
-    apply_cos_admission_ecn_policy, apply_cos_queue_flow_fair_promotion, bdp_floor_bytes,
-    cos_flow_aware_buffer_limit, cos_queue_flow_share_limit, COS_ECN_MARK_THRESHOLD_DEN,
-    COS_ECN_MARK_THRESHOLD_NUM, COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS, COS_FLOW_FAIR_MIN_SHARE_BYTES,
+    apply_cos_admission_ecn_policy, apply_cos_queue_flow_fair_promotion,
+    cos_flow_aware_buffer_limit, cos_queue_flow_share_limit,
 };
+pub(super) use flow_hash::{cos_flow_bucket_index, cos_item_flow_key};
+
+#[cfg(test)]
+pub(super) use admission::{
+    bdp_floor_bytes, COS_ECN_MARK_THRESHOLD_DEN, COS_ECN_MARK_THRESHOLD_NUM,
+    COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS, COS_FLOW_FAIR_MIN_SHARE_BYTES,
+};
+#[cfg(test)]
 pub(super) use ecn::{
     maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared, ECN_CE, ECN_ECT_0, ECN_ECT_1, ECN_MASK,
     ECN_NOT_ECT,
 };
-pub(super) use flow_hash::{
-    cos_flow_bucket_index, cos_flow_hash_seed_from_os, cos_item_flow_key,
-    cos_queue_prospective_active_flows,
-};
+#[cfg(test)]
+pub(super) use flow_hash::{cos_flow_hash_seed_from_os, cos_queue_prospective_active_flows};
