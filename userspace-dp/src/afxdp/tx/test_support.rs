@@ -507,4 +507,3 @@ pub(in crate::afxdp) fn attach_test_vtime_floor(
     queue.flow_fair = true;
     floor
 }
-
