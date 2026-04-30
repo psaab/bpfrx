@@ -110,9 +110,11 @@ Move the TX-completion + timer-wheel cluster from tx.rs into
 - The **Phase 6 builder edge** (`cos/builders.rs -> tx::cos_tick_for_ns`)
   is closed.
 - The **TX-completion / timer-wheel subset of the Phase 7 back-edge
-  cluster** is closed: 10 of the 18 symbols imported by
+  cluster** is closed: 10 of the 18 functions imported by
   `cos/queue_service.rs` from `crate::afxdp::tx::` move to
-  `super::tx_completion::`.
+  `super::tx_completion::`. The other 8 functions plus `TxError` plus
+  4 guarantee/quantum constants stay on `crate::afxdp::tx::`,
+  deferred to #984.
 
 Remaining (NOT in P1 scope):
 - Phase 7's XSK-ring / worker-binding / per-byte primitives
@@ -281,9 +283,10 @@ use crate::afxdp::tx::{
 };
 ```
 
-After P1: split into two `use` blocks. The 10 moved symbols come from
+After P1: split into two `use` blocks. The 10 moved fns come from
 `super::tx_completion` (or `super::` via cos/mod.rs re-export); the
-unmoved 8 stay on `crate::afxdp::tx`:
+remaining 8 unmoved fns + `TxError` + 4 quantum/guarantee constants
+stay on `crate::afxdp::tx`:
 
 ```rust
 use super::tx_completion::{
@@ -384,7 +387,7 @@ afxdp/tx/ module split (#984). After P1's queue_service.rs migration,
 the remaining cos→tx imports in queue_service.rs and cross_binding.rs
 are:
 
-`cos/queue_service.rs` (the 8 unmoved symbols + 4 constants):
+`cos/queue_service.rs` (the 8 unmoved fns + `TxError` + 4 guarantee/quantum constants):
 - `cos_queue_dscp_rewrite` (tx.rs:1966)
 - `maybe_wake_tx` (tx.rs:2808)
 - `reap_tx_completions`
@@ -418,10 +421,11 @@ location in `cos/tx_completion.rs`.
   (~600 moved + ~50 lines header/imports/notes).
 - `userspace-dp/src/afxdp/cos/mod.rs`: register module + re-exports.
 - `userspace-dp/src/afxdp/cos/queue_service.rs`: split tx import block
-  (10 symbols → super::tx_completion::, 8 stay on crate::afxdp::tx);
-  update the now-stale "back-edges to tx.rs" header comment at lines
-  23-29 to reflect that the TX-completion/timer-wheel symbols moved
-  to `cos/tx_completion.rs`.
+  (10 fns → super::tx_completion::; 8 unmoved fns + TxError + 4
+  guarantee/quantum constants stay on crate::afxdp::tx); update the
+  now-stale "back-edges to tx.rs" header comment at lines 23-29 to
+  reflect that the TX-completion/timer-wheel symbols moved to
+  `cos/tx_completion.rs`.
 - `userspace-dp/src/afxdp/cos/builders.rs`: switch single
   `cos_tick_for_ns` import; update comment block.
 - `userspace-dp/src/afxdp/tx.rs`: −600 LOC; one always-on cos:: import,
