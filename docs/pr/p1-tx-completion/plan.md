@@ -159,7 +159,7 @@ All deferred to #984 (afxdp/tx/ split).
 
 **~600 LOC** moved. After this PR, `tx.rs` size drops from 13731 → ~13130.
 
-## Visibility rules — source-verified (14 + 6)
+## Visibility rules — source-verified
 
 `pub(in crate::afxdp)` (14 items) — required because they have callers
 outside `cos/tx_completion.rs`:
