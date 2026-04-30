@@ -193,8 +193,8 @@ the re-export — same pattern as P2a's stamp_submits.
 Pre-existing tests that touch the moved fns:
 - `tx/mod.rs:3329-3340` exercises `apply_prepared_recycle` directly.
   Stays in `tx/mod.rs::tests`; reaches the moved fn through the
-  `pub(in crate::afxdp) use rings::apply_prepared_recycle;` re-export
-  via the `mod tests { use super::*; }` resolution chain.
+  `#[cfg(test)] use rings::apply_prepared_recycle;` re-export in
+  `tx/mod.rs` (visible to the test mod via `super::*`).
 - The 4 pub fns (`reap_tx_completions`, `drain_pending_fill`,
   `maybe_wake_rx`, `maybe_wake_tx`) have no direct unit pins but are
   exercised end-to-end by integration smoke + cluster failover.
