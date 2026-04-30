@@ -1,7 +1,48 @@
 # #956 Phase 7: extract cos/queue_service.rs from tx.rs
 
-Plan v2 — 2026-04-30. Continues #956. Phases 1-6 merged at PRs
+Plan v3 — 2026-04-30. Continues #956. Phases 1-6 merged at PRs
 #976-#981.
+
+Round-2 changelog (v2 → v3): Codex round-2 returned PLAN-NEEDS-MAJOR
+with 6 partial-resolutions + 2 new MAJOR findings. v3:
+
+- NEW-1 MAJOR: `enum CoSServicePhase` (771) cannot be file-private
+  — deferred TX-completion fns in tx.rs (4521/4539/4582/4600)
+  pattern-match it. Reclassified as `pub(in crate::afxdp)` with
+  cfg-gated test re-export.
+- NEW-2 MAJOR: `enum ExactCoSScratchBuild` (804) missing from move
+  list. Returned by `drain_exact_*_to_scratch`; tests pattern-
+  match it. Added to type list, `pub(in crate::afxdp)` plus
+  cfg-gated test re-export.
+- F1: added 7 missing fns:
+  - `release_exact_local_scratch_frames` (3000)
+  - `restore_exact_local_scratch_to_queue_head_flow_fair` (3009)
+  - `release_exact_prepared_scratch` (3024)
+  - `restore_exact_prepared_scratch_to_queue_head_flow_fair` (3028)
+  - `settle_exact_local_fifo_submission` (3041)
+  - `settle_exact_local_scratch_submission_flow_fair` (3074)
+  - `settle_exact_prepared_fifo_submission` (3098)
+  - `settle_exact_prepared_scratch_submission_flow_fair` (3129)
+  - `cos_batch_tx_made_progress` (3461)
+- F2: added submit_cos_batch's missing companions:
+  - `assign_local_dscp_rewrite` (4315)
+  - `assign_prepared_dscp_rewrite` (4324)
+  - outer `restore_cos_local_items` (4643)
+  - outer `restore_cos_prepared_items` (4665)
+- F3: drain_exact_*_to_scratch + scheduler helpers
+  (count_park_reason, park_cos_queue, estimate_cos_queue_wakeup_tick)
+  + ExactCoSScratchBuild get cfg-gated re-exports for the tests
+  at tx.rs:6920/6930/7077/7258/12071/12242/12929/13245.
+- F4: enumerated additional back-edges
+  (`count_tx_ring_full_submit_stall` 3619,
+  `recycle_cancelled_prepared_offset` 4161,
+  `remember_prepared_recycle` 4799,
+  `restore_cos_local_items_inner` / `_prepared_items_inner`).
+- F5: `count_park_reason` already has `#[inline]` in source —
+  preserve. `cos_batch_tx_made_progress` is hot-path — add `#[inline]`.
+
+Total v3: 7 types + ~38 fns ≈ 2400 LOC (significantly larger than
+v2's 1900).
 
 Round-1 changelog (v1 → v2): Codex round-1 returned PLAN-NEEDS-MAJOR
 with substantive scope incompleteness; Gemini round-1 returned
