@@ -32,8 +32,6 @@ calling out the Codex catch.
 
 Round-G1 changelog (v4 → v5):
 
-Round-G1 changelog (v4 → v5):
-
 G1-1. **Drop `account_cos_queue_flow_enqueue` and
 `account_cos_queue_flow_dequeue` from Phase 3 — defer to Phase
 5 (`cos/queue_ops.rs`).** The "lockstep landing cost"
@@ -63,8 +61,6 @@ constants into `types.rs` or `cos/mod.rs`.
 
 Round-3 changelog (v3 → v4):
 
-Round-3 changelog (v3 → v4):
-
 R3-1. Stale Round-2 wording at the (former) line 180 still
 said `tx -> admission` and "9 callers", contradicting the
 canonical section. Note rewritten to `admission -> tx` with
@@ -74,13 +70,16 @@ canonical block below.
 R3-2. Inconsistency between two re-export wordings: one place
 said test-only items get `#[cfg(test)] pub(super) use` while
 the canonical section said the plan picks always-on. Picked
-always-on uniformly.
+always-on uniformly at plan stage. (Implementation later
+reverted to `#[cfg(test)]`-gated re-exports — Codex impl
+round-1 flagged unused-import warnings on non-test builds, so
+the original `#[cfg(test)] pub(super) use` shape was the right
+call after all. See the Visibility model section below for the
+shipped state.)
 
 R3-3. V-min vacate line reference was sloppy: dequeue resets
 MQFQ state at `tx.rs:4058` and vacates the shared V-min slot
 at `tx.rs:4069-4077`. Updated the precise line span.
-
-Round-2 changelog (v2 → v3):
 
 Round-2 changelog (v2 → v3):
 
@@ -341,11 +340,15 @@ fn promote_cos_queue_flow_fair(...) { ... }
 
 `cos/mod.rs` re-exports the production-callable items via
 `pub(super) use`. Test-referenced items (`bdp_floor_bytes` and
-the four test-touched constants) are simply
-`pub(in crate::afxdp)` and re-exported always-on — see the
-canonical Visibility model section below for the rationale
-for picking always-on over `#[cfg(test)]`-gated re-exports.
-Tests stay in `tx::tests` — same Phase 1+2 pattern.
+the four test-touched constants) are `pub(in crate::afxdp)` in
+their source files and re-exported via `#[cfg(test)] pub(super)
+use` so non-test builds don't pull them in. (v5 originally
+proposed always-on for simplicity; Codex impl rounds 1+2 caught
+unused-import warnings on non-test builds, so the impl gates
+the re-exports under `#[cfg(test)]`. The cfg-gated approach is
+what shipped — Copilot review on PR #978 flagged the older
+"always-on" plan wording as out of date.) Tests stay in
+`tx::tests` — same Phase 1+2 pattern.
 
 ### Visibility model (corrected per Codex round-2 #1)
 
@@ -367,14 +370,18 @@ source of truth.
   - `apply_cos_admission_ecn_policy`
   - `apply_cos_queue_flow_fair_promotion`
 
-- **`pub(in crate::afxdp)` (test-referenced; either always-on or
-  cfg-gated re-exports are both acceptable, plan implementation
-  picks always-on for simplicity)**:
+- **`pub(in crate::afxdp)` (test-referenced; re-exported under
+  `#[cfg(test)]` to avoid non-test unused-import warnings —
+  this matches what shipped after Codex impl rounds 1+2):**
   - `bdp_floor_bytes` (called by tests at `tx.rs:10917, 10998`)
   - `COS_FLOW_FAIR_MIN_SHARE_BYTES` (17 test references)
-  - `COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS` (2 test references)
   - `COS_ECN_MARK_THRESHOLD_NUM`, `COS_ECN_MARK_THRESHOLD_DEN`
     (11 test references each)
+  - (`COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS` was originally listed
+    here too but the cargo-test build flagged it as unused —
+    its only references in `tx::tests` were in comments — so
+    impl commit `4276eac0` dropped it from the test re-export
+    set.)
 
 - **STAYS in `tx.rs` with bumped `pub(in crate::afxdp)` visibility**:
   - `COS_MIN_BURST_BYTES` — 91 uses across tx.rs make moving it
