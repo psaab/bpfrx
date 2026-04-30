@@ -39,10 +39,10 @@ Plan v3 — 2026-04-30. Stage 2 step 4 of the long sequence after #993
 - R1-4 [MEDIUM]: cached-selection move was scope-weak — confirmed by
   R1-2 deferral.
 - R1-5 [MEDIUM]: Direct test pins for `partition_cos_bound_local_with_rescue`
-  (tx/mod.rs:1712, 1761) exist. v2 documents that those tests stay
-  in `tx/mod.rs::tests` and reach the moved fn via `super::*`
-  resolution through the `pub(super) use drain::partition_cos_bound_local_with_rescue;`
-  re-export (or move the tests into drain.rs::tests if cleaner).
+  (tx/mod.rs:1712, 1761) and `process_pending_queue_in_place` (1795)
+  exist. v2/v3 moves those tests into `drain.rs::tests` alongside
+  their target fns (file-private helpers stay file-private; no
+  re-export). See the Tests section.
 
 ## Goal
 
