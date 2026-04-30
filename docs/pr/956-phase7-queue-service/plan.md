@@ -1,195 +1,247 @@
 # #956 Phase 7: extract cos/queue_service.rs from tx.rs
 
-Plan v1 — 2026-04-30. Continues #956. Phases 1-6 merged at PRs
+Plan v2 — 2026-04-30. Continues #956. Phases 1-6 merged at PRs
 #976-#981.
 
-## Goal
+Round-1 changelog (v1 → v2): Codex round-1 returned PLAN-NEEDS-MAJOR
+with substantive scope incompleteness; Gemini round-1 returned
+PLAN-NEEDS-MINOR pointing at the same submit_cos_batch / inline /
+test-visibility concerns. v2 expands the move list to capture the
+full dispatch + drain + submit + scheduler-helpers cluster.
+This is the largest move of the campaign (~1900 LOC).
 
-Move the CoS dispatch / drain / service-path subsystem from tx.rs
-into `userspace-dp/src/afxdp/cos/queue_service.rs`. This is the
-largest move of the campaign (~1100 LOC) and brings together:
+## Move list (v2 expanded)
 
-- The 3 dispatch enums (`CoSBatch`, `CoSServicePhase`,
-  `ExactCoSQueueKind`).
-- The select/dispatch entry points
-  (`drain_shaped_tx`, `select_cos_guarantee_batch` +
-  `_with_fast_path`, `select_exact_cos_guarantee_queue_with_fast_path`,
-  `select_cos_surplus_batch`, `select_nonexact_cos_guarantee_batch`).
-- The service-direct paths (`service_exact_guarantee_queue_direct` +
-  `_with_info`, `service_exact_local_queue_direct` + `_flow_fair`,
-  `service_exact_prepared_queue_direct` + `_flow_fair`).
-- The batch-construction primitive (`build_cos_batch_from_queue` —
-  deferred from Phase 6 because it uses the dispatch enums and
-  mutates queue state).
+### Types (6)
+| Item | Line | Notes |
+|---|---|---|
+| `enum CoSServicePhase` | 771 | dispatch-internal |
+| `enum CoSBatch` | 776 | pattern-matched in `submit_cos_batch` (moving) and TX-completion appliers (staying in tx.rs through future TX-completion phase) — needs `pub(in crate::afxdp)` plus cfg-gated re-export for tests |
+| `enum ExactCoSQueueKind` | 792 | dispatch-internal, file-private after move |
+| `struct ExactCoSQueueSelection` | 798 | tests access `.queue_idx` (12418, 12474) — `pub(in crate::afxdp)` + cfg-gated re-export |
+| `struct DrainedQueueRef` | 1431 | currently `pub(super)`; consumers `cos_batch_queue_ref` + `submit_cos_batch` move with it |
+| `enum ParkReason` | 3600 | dispatch-internal |
 
-## Move list (12 fns + 3 enums)
+### Selector / dispatch (8)
+| Item | Line |
+|---|---|
+| `drain_shaped_tx` | 1437 |
+| `cos_batch_queue_ref` | 1490 |
+| `build_nonexact_cos_batch` | 1520 |
+| `service_exact_guarantee_queue_direct` | 1536 |
+| `service_exact_guarantee_queue_direct_with_info` | 1560 |
+| `select_cos_guarantee_batch` | 1612 |
+| `select_cos_guarantee_batch_with_fast_path` | 1626 (`#[cfg(test)]`) |
+| `select_exact_cos_guarantee_queue_with_fast_path` | 1717 |
 
-| Item | Line | Visibility | Production callers |
-|---|---|---|---|
-| `enum CoSServicePhase` | 771 | private | dispatch internals |
-| `enum CoSBatch` | 776 | private | dispatch internals |
-| `enum ExactCoSQueueKind` | 792 | private | dispatch internals |
-| `drain_shaped_tx` | 1437 | private | tx.rs (6 sites) + worker.rs:1 |
-| `service_exact_guarantee_queue_direct` | 1536 | private | tx.rs |
-| `service_exact_guarantee_queue_direct_with_info` | 1560 | private | tx.rs |
-| `select_cos_guarantee_batch` | 1612 | private | tx.rs (production) + tests |
-| `select_cos_guarantee_batch_with_fast_path` | 1626 | `#[cfg(test)]` | tests only |
-| `select_exact_cos_guarantee_queue_with_fast_path` | 1717 | private | tx.rs |
-| `select_nonexact_cos_guarantee_batch` | 1814 | private | tx.rs |
-| `select_cos_surplus_batch` | 1876 | private | tx.rs |
-| `service_exact_local_queue_direct` | 1932 | private | tx.rs |
-| `service_exact_local_queue_direct_flow_fair` | 2091 | private | tx.rs |
-| `service_exact_prepared_queue_direct` | 2240 | private | tx.rs |
-| `service_exact_prepared_queue_direct_flow_fair` | 2395 | private | tx.rs |
-| `build_cos_batch_from_queue` | 3231 | private | dispatch internals |
+### Selector / dispatch (cont.) (3)
+| Item | Line |
+|---|---|
+| `select_nonexact_cos_guarantee_batch` | 1814 |
+| `select_cos_surplus_batch` | 1876 |
 
-(Codex round-1 verifies the call-site classification — same
-`#[cfg(test)]` selector trap as Phase 4-6. Items with at-least-one
-non-test caller in tx.rs become `pub(in crate::afxdp)`; pure-test
-items go cfg-gated.)
+### Service-direct paths (4)
+| Item | Line |
+|---|---|
+| `service_exact_local_queue_direct` | 1932 |
+| `service_exact_local_queue_direct_flow_fair` | 2091 |
+| `service_exact_prepared_queue_direct` | 2240 |
+| `service_exact_prepared_queue_direct_flow_fair` | 2395 |
 
-## Deferred to a future TX-completion phase
+### Scratch + drain helpers (4)
+| Item | Line |
+|---|---|
+| `drain_exact_local_fifo_items_to_scratch` | 2547 |
+| `drain_exact_local_items_to_scratch_flow_fair` | 2644 |
+| `drain_exact_prepared_fifo_items_to_scratch` | 2764 |
+| `drain_exact_prepared_items_to_scratch_flow_fair` | 2869 |
 
-These were also flagged for Phase 7 scope review but architecturally
-belong to TX-completion (post-send result reconciliation), not the
-service-dispatch path:
+### Build / submit / accounting helpers (3)
+| Item | Line |
+|---|---|
+| `subtract_direct_cos_queue_bytes` | 3153 |
+| `build_cos_batch_from_queue` | 3231 |
+| `submit_cos_batch` | 3325 |
 
-- `apply_cos_send_result` (tx.rs:4635)
-- `apply_cos_prepared_result` (tx.rs:4696)
-- `apply_direct_exact_send_result` (tx.rs:3171)
-- `apply_direct_exact_prepared_result` (verify exists)
-- `prime_cos_root_for_service` (tx.rs:1505)
-- `advance_cos_timer_wheel` + timer helpers + restore helpers
+### Scheduler helpers (5)
+| Item | Line |
+|---|---|
+| `cos_surplus_quantum_bytes` | 3533 |
+| `cos_guarantee_quantum_bytes` | 3537 |
+| `estimate_cos_queue_wakeup_tick` | 3556 |
+| `count_park_reason` | 3639 |
+| `park_cos_queue` | 3658 |
 
-Phase 7 keeps these in tx.rs. Since the moving service paths CALL
-some of them (e.g., `service_exact_local_queue_direct` calls
-`apply_cos_send_result`), the move list creates a **back-edge**
-`cos/queue_service.rs -> tx::apply_cos_send_result` etc. That's
-explicit forward-debt cleaned up by the eventual TX-completion
-phase. Visibility bumped to `pub(in crate::afxdp)` for the back-
-referenced items.
+**Total: 6 types + 27 fns ≈ 1900 LOC**
 
-## Approach
+## What STAYS in tx.rs (Phase 7 deferrals)
 
-Visibility:
-- Items with cross-module production callers: `pub(in crate::afxdp)`.
-- `select_cos_guarantee_batch_with_fast_path` is already
-  `#[cfg(test)]` in source — preserve as cfg-gated.
-- Enums get `pub(in crate::afxdp)` so they can be re-exported via
-  cos/mod.rs and used by the moving fns' signatures.
+These were considered for Phase 7 but architecturally belong to
+later phases or are tightly coupled to non-CoS infrastructure:
 
-`#[inline]` per the Phase 4-6 lesson:
-- `drain_shaped_tx` is the per-poll-cycle entry point — preserve
-  any existing `#[inline]`.
-- The select_* variants and service_*_direct fns fire per drain
-  iteration — they sit on the per-byte-batch hot path; preserve
-  existing `#[inline]` and add where the source lacked it on
-  per-byte fns.
-- `build_cos_batch_from_queue` is per-batch-build hot path —
-  needs `#[inline]`.
+- `restore_cos_local_items_inner` (4687) /
+  `restore_cos_prepared_items_inner` (4702) — TX-completion
+  rollback helpers, family with `apply_cos_*_result` (deferred
+  to TX-completion phase).
+- `apply_cos_send_result` / `apply_cos_prepared_result` /
+  `apply_direct_exact_send_result` / `prime_cos_root_for_service` /
+  `advance_cos_timer_wheel` — TX-completion family. Visibility
+  bumped to `pub(in crate::afxdp)` so the moving code can call
+  them via back-edge `cos/queue_service -> tx`. Documented as
+  forward-debt for a future TX-completion phase.
+- `transmit_batch`, `transmit_prepared_queue`, `reap_tx_completions`,
+  `maybe_wake_tx`, `stamp_submits`, `monotonic_nanos`,
+  `cos_queue_dscp_rewrite`, frame-rewrite + RST helpers —
+  worker-binding / TX-ring infrastructure that doesn't belong in
+  cos/.
+- `refresh_cos_interface_activity` — coupled to interface-lifecycle
+  bookkeeping in tx.rs.
 
-`#[inline]` decisions are subject to source verification (Codex
-round-1 will list which fns currently carry `#[inline]` and which
-need it added).
+For each back-referenced item, this PR bumps visibility from
+`fn` (private) or `pub(super) fn` to `pub(in crate::afxdp) fn`
+so `cos/queue_service.rs` can call it. The full back-edge set
+(Codex round-1 #4):
+1. `apply_cos_send_result` (tx.rs:4517 — verify line)
+2. `apply_cos_prepared_result` (tx.rs:4578)
+3. `apply_direct_exact_send_result` (tx.rs:3171)
+4. `prime_cos_root_for_service` (tx.rs:1505)
+5. `advance_cos_timer_wheel` (tx.rs:3707)
+6. `restore_cos_local_items_inner` (tx.rs:4687)
+7. `restore_cos_prepared_items_inner` (tx.rs:4702)
+8. `transmit_batch` + `transmit_prepared_queue` + `reap_tx_completions`
+   + `maybe_wake_tx` + `stamp_submits`
+9. `cos_queue_dscp_rewrite`
+10. `refresh_cos_interface_activity`
+11. Frame-rewrite + RST helpers consumed by service-direct paths.
 
-## Imports for cos/queue_service.rs
+(Codex round-2 will verify the EXACT back-edge set by line — v2's
+list is the broad shape; the implementation will pin every `use
+crate::afxdp::tx::...` line.)
 
-The moving fns reach into many existing cos/* + tx items. Expected
-import surface (Codex round-1 verifies completeness):
+## Visibility classification
 
-```rust
-use std::collections::VecDeque;
+- **`pub(in crate::afxdp)`** (cross-module callers — production
+  tx.rs entry points or test-required):
+  - `drain_shaped_tx` (worker.rs reaches it via super::*)
+  - `enum CoSBatch` (`submit_cos_batch` matches it; if
+    `submit_cos_batch` moves WITH it as planned, this becomes
+    file-private — but test sites at 12122/12189/12432/12852
+    need access too, so cfg-gated `pub(in crate::afxdp)` it is)
+  - `struct ExactCoSQueueSelection` (test access at
+    12418/12474)
+  - Test-touched selector variants: `select_exact_cos_guarantee_queue_with_fast_path`,
+    `select_nonexact_cos_guarantee_batch`, `select_cos_surplus_batch`
+    (cfg-gated)
+- **File-private** (no callers outside the moving set):
+  - `enum CoSServicePhase`, `enum ExactCoSQueueKind`,
+    `enum ParkReason`
+  - `cos_batch_queue_ref`, `build_nonexact_cos_batch`,
+    `service_exact_guarantee_queue_direct(_with_info)`
+  - `service_exact_local_queue_direct(_flow_fair)`,
+    `service_exact_prepared_queue_direct(_flow_fair)`
+  - All `drain_exact_*_to_scratch`
+  - `subtract_direct_cos_queue_bytes`, `build_cos_batch_from_queue`,
+    `submit_cos_batch`
+  - `cos_surplus_quantum_bytes`, `cos_guarantee_quantum_bytes`,
+    `estimate_cos_queue_wakeup_tick`, `count_park_reason`,
+    `park_cos_queue`
+  - `select_cos_guarantee_batch` + `_with_fast_path` (already
+    `#[cfg(test)]` in source — preserve)
 
-use crate::afxdp::types::{
-    BindingWorker, // service_*_direct mutates the binding
-    CoSInterfaceConfig, CoSInterfaceRuntime, CoSPendingTxItem,
-    CoSQueueRuntime, ForwardingState, PreparedTxRequest, TxRequest,
-    WorkerCoSInterfaceFastPath, WorkerCoSQueueFastPath,
-    // plus drop counter / timer / batch-state types
-};
-use crate::afxdp::worker::BindingWorker;
-use crate::afxdp::{TX_BATCH_SIZE, /* ring/frame helpers */};
-use super::admission::{
-    apply_cos_admission_ecn_policy, cos_flow_aware_buffer_limit,
-    cos_queue_flow_share_limit,
-};
-use super::flow_hash::{cos_flow_bucket_index, cos_item_flow_key};
-use super::queue_ops::{
-    cos_item_len, cos_queue_clear_orphan_snapshot_after_drop,
-    cos_queue_drain_all, cos_queue_front, cos_queue_is_empty,
-    cos_queue_pop_front, cos_queue_pop_front_no_snapshot,
-    cos_queue_push_back, cos_queue_push_front,
-    cos_queue_restore_front, cos_queue_v_min_consume_suspension,
-    cos_queue_v_min_continue, publish_committed_queue_vtime,
-};
-use super::token_bucket::{
-    cos_refill_ns_until, maybe_top_up_cos_queue_lease,
-    maybe_top_up_cos_root_lease, refill_cos_tokens,
-    COS_MIN_BURST_BYTES,
-};
-// Back-edges to tx.rs (deferred TX-completion phase will resolve):
-use crate::afxdp::tx::{
-    apply_cos_send_result, apply_cos_prepared_result,
-    apply_direct_exact_send_result, prime_cos_root_for_service,
-    advance_cos_timer_wheel,
-    // restore helpers if used directly
-};
-```
+## #[inline] (Codex round-1 #5, Gemini round-1 #1)
+
+None of the moving fns currently carry `#[inline]` in source.
+Per the Phase 4-6 lesson — `pub(in crate::afxdp)` plus `#[inline]`
+preserves cross-module inlining; absent `#[inline]` the compiler
+falls back on heuristics that may not survive the cross-module
+boundary. v2 commits to ADD `#[inline]` on these per-byte / per-
+batch hot-path fns:
+
+- `drain_shaped_tx` (per-poll-cycle entry)
+- All `select_cos_*_batch` variants (per drain iteration)
+- All `select_exact_cos_guarantee_queue_with_fast_path`
+- All `service_exact_*_queue_direct(_flow_fair)` (per drain
+  iteration; ~800+ LOC of hot-path code)
+- `build_cos_batch_from_queue` (per batch)
+- `cos_batch_queue_ref`, `build_nonexact_cos_batch`,
+  `submit_cos_batch`
+- `cos_guarantee_quantum_bytes`, `cos_surplus_quantum_bytes`
+  (per dispatch tick)
+- `subtract_direct_cos_queue_bytes` (per dequeue)
+
+The non-hot-path helpers stay un-attributed:
+- `select_cos_guarantee_batch_with_fast_path` (test-only)
+- `count_park_reason`, `park_cos_queue` (per-park, not per-byte)
+- `estimate_cos_queue_wakeup_tick` (per-park)
+- The `drain_exact_*_to_scratch` helpers — these are per-drain
+  but their bodies are large; LLVM's heuristic threshold should
+  cover them. Add `#[inline]` only if a post-merge perf
+  regression points at one of them.
+
+## tx.rs changes
+
+- Remove the 6 type definitions + 27 fn definitions (~1900 LOC).
+- Bump visibility on the 11+ back-referenced helpers to
+  `pub(in crate::afxdp)`.
+- Extend cos:: import block with the 1+ production-callable
+  re-exports + the cfg-gated set.
 
 ## cos/mod.rs additions
 
 ```rust
 pub(super) mod queue_service;
 
+pub(super) use queue_service::drain_shaped_tx;
+
+#[cfg(test)]
 pub(super) use queue_service::{
-    drain_shaped_tx,
-    // any other items production tx.rs calls; rest stay
-    // file-private inside queue_service.rs.
+    select_cos_guarantee_batch, select_cos_guarantee_batch_with_fast_path,
+    select_exact_cos_guarantee_queue_with_fast_path,
+    select_nonexact_cos_guarantee_batch, select_cos_surplus_batch,
+    CoSBatch, ExactCoSQueueSelection,
+    // any other type/fn tests reach by name
 };
 ```
 
-## tx.rs changes
+(Codex round-2 verifies completeness.)
 
-- Remove the 12 fn definitions + 3 enum definitions.
-- Bump visibility on the back-referenced TX-completion fns to
-  `pub(in crate::afxdp)`:
-  - `apply_cos_send_result`, `apply_cos_prepared_result`,
-    `apply_direct_exact_send_result`,
-    `prime_cos_root_for_service`, `advance_cos_timer_wheel`.
-- Add `use super::cos::drain_shaped_tx;` (and any other production
-  re-exports the move list determines).
+## worker.rs
+
+- Already has `use super::*` glob plus explicit cos:: imports
+  added in earlier phases. After this PR, add `drain_shaped_tx`
+  to the explicit `use super::cos::{...}` block.
 
 ## Files touched
 
-- **NEW** `userspace-dp/src/afxdp/cos/queue_service.rs`: ~1100 LOC.
+- **NEW** `userspace-dp/src/afxdp/cos/queue_service.rs`: ~1900 LOC.
 - `userspace-dp/src/afxdp/cos/mod.rs`: register module + re-exports.
-- `userspace-dp/src/afxdp/tx.rs`: -1100 LOC; bump visibility on
-  ~5 helpers; extend cos:: imports.
+- `userspace-dp/src/afxdp/tx.rs`: -1900 LOC; bump visibility on
+  ~11+ back-referenced helpers; extend cos:: imports.
 - `userspace-dp/src/afxdp/worker.rs`: extend cos:: import for
-  `drain_shaped_tx` if not already reached via glob.
+  `drain_shaped_tx`.
 
 ## Risk
 
-**High.** Largest move yet (~1100 LOC, 12 fns + 3 enums). Touches
-the absolute hot path: every TX byte goes through `drain_shaped_tx
--> select_cos_*_batch -> service_exact_*_queue_direct -> push/pop`.
+**High.** Largest move of the campaign (~1900 LOC, 27 fns + 6
+types). Touches the absolute hot path: every TX byte goes through
+`drain_shaped_tx -> select_cos_*_batch -> service_exact_*_queue_direct
+-> drain_exact_*_to_scratch -> submit_cos_batch`.
 
 Risks:
-- **Hot-path inline preservation.** Phase 4-6 lesson: `pub(in
-  crate::afxdp)` + `#[inline]` preserves cross-module inlining;
-  losing either causes regression. Verify the move keeps every
-  source `#[inline]` and adds where needed.
-- **Back-edges.** Multiple `cos/queue_service -> tx` edges for
-  TX-completion helpers. Documented as forward-debt; not a
-  release-build correctness concern.
-- **Enum visibility.** Moving the enums forces rethinking pattern-
-  match exhaustiveness checks if any tx.rs comment-only references
-  remain.
-- **Test surface.** ~30+ test sites in `tx::tests` exercise these
-  fns; cfg-gated re-exports must cover everything they reach.
-
-The move pattern itself is the same as Phases 1-6: pub(in
-crate::afxdp) + cos/mod.rs re-exports + tests stay in tx::tests.
+- **Hot-path inline.** v2 explicitly adds `#[inline]` on the
+  per-byte/per-batch chain (Codex #5 + Gemini #1).
+- **Back-edges.** ~11+ explicit `cos/queue_service -> tx` edges
+  for TX-completion + worker-binding helpers. Documented as
+  forward-debt.
+- **Enum visibility.** `CoSBatch` and `ExactCoSQueueSelection`
+  pattern-matched in tx.rs `submit_cos_batch` / TX-completion
+  appliers / tests — visibility bumped, re-exports added.
+- **Test surface.** ~30+ test sites reach moved fns by name;
+  cfg-gated re-exports must cover them.
+- **Single-PR size.** ~1900 LOC is a lot. The alternative is
+  splitting Phase 7 into 7a (selectors) + 7b (drain/submit), but
+  that breaks the policy/mechanism cohesion Gemini round-1
+  flagged. Single-PR is the right call here.
 
 ## Acceptance
 
