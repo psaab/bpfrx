@@ -48,7 +48,7 @@ after #994 (P2c2: tx/drain.rs) merged at master `ff982ad1`.
 ## Goal
 
 Extract the **CoS classify + enqueue + cached-selection cluster**
-(~870 LOC, 14 fns + 1 struct) from `tx/mod.rs` into a sibling
+(~870 LOC, 15 fns + 1 struct) from `tx/mod.rs` into a sibling
 `tx/cos_classify.rs`. After this PR, `tx/mod.rs` becomes a thin
 facade containing only `mod` declarations + re-exports + the test
 mod block (the test mod stays in mod.rs as the canonical pin
@@ -99,8 +99,8 @@ All 10 helpers, with their final visibility in cos_classify.rs:
 | Item | Line | Visibility | Reason |
 |---|---|---|---|
 | `map_cached_forwarding_class_queue` | 127 | file-private | only caller is `resolve_cached_cos_tx_selection` (moving) |
-| `resolve_cos_dscp_classifier_queue_id` | 501 | file-private | only caller is `resolve_cos_tx_selection` (moving) |
-| `resolve_cos_ieee8021_classifier_queue_id` | 506 | file-private | only caller is `resolve_cos_tx_selection` (moving) |
+| `resolve_cos_dscp_classifier_queue_id` | 501 | file-private | callers are `resolve_cos_tx_selection` and `resolve_cached_cos_tx_selection:234` (both moving) |
+| `resolve_cos_ieee8021_classifier_queue_id` | 506 | file-private | callers are `resolve_cos_tx_selection` and `resolve_cached_cos_tx_selection:236` (both moving) |
 | `prepare_local_request_for_cos` | 616 | `pub(super)` | direct test pin in `tx/mod.rs::tests` |
 | `enqueue_prepared_into_cos` | 647 | `pub(super)` | sibling `drain.rs:488` caller (private `use` from tx/mod.rs) |
 | `clone_prepared_request_for_cos` | 703 | `pub(super)` | direct test pin in `tx/mod.rs::tests` |
@@ -243,7 +243,7 @@ with explicit enumeration deferred to a cleanup PR.
 
 ## Risk
 
-**High.** ~870 LOC across 14 fns + 1 struct. The CoS classify path
+**High.** ~870 LOC across 15 fns + 1 struct. The CoS classify path
 is on the steady-state enqueue hot path. Single-writer (owner
 worker), all atomic ops Ordering::Relaxed.
 
