@@ -16,10 +16,11 @@
 //   - `promote_cos_queue_flow_fair` — per-queue policy (file-private)
 //
 // `account_cos_queue_flow_enqueue` / `_dequeue` (MQFQ + V-min state
-// lifecycle) intentionally STAY in tx.rs through Phase 4 and move
-// cohesively with selection / pop / publish in Phase 5
-// (`cos/queue_ops.rs`). See docs/pr/956-phase3-admission/plan.md
-// for the rationale (Gemini round-1 architectural finding).
+// lifecycle) stayed in tx.rs through Phase 4 and moved cohesively
+// with selection / pop / publish in Phase 5 — see
+// `cos/queue_ops.rs` and docs/pr/956-phase5-queue-ops/plan.md.
+// (Gemini round-1 of Phase 3 was the original architectural
+// finding requiring the deferral.)
 //
 // `COS_MIN_BURST_BYTES` lived in tx.rs through Phase 3 with a
 // `pub(in crate::afxdp)` visibility bump so this module could reach
