@@ -1,10 +1,14 @@
 use super::*;
 
-// #956 Phase 4: explicit imports for items that moved out of tx.rs into
-// cos/token_bucket.rs. Without this, neither the local `use super::*;`
-// glob nor afxdp.rs's `use self::tx::*;` parent-module glob still reaches
-// them — the items no longer originate from tx.rs after the move.
-use super::cos::{release_all_cos_queue_leases, release_all_cos_root_leases};
+// #956 Phase 4-5: explicit imports for items that moved out of tx.rs into
+// cos/token_bucket.rs (Phase 4) and cos/queue_ops.rs (Phase 5). Without
+// this, neither the local `use super::*;` glob nor afxdp.rs's
+// `use self::tx::*;` parent-module glob still reaches them — the items
+// no longer originate from tx.rs after the moves.
+use super::cos::{
+    cos_queue_len, cos_queue_pop_front_no_snapshot, release_all_cos_queue_leases,
+    release_all_cos_root_leases,
+};
 
 pub(crate) struct BindingWorker {
     pub(crate) slot: u32,
