@@ -20,13 +20,17 @@
 // LLVM's heuristic threshold should cover them; revisit only if a
 // post-merge perf regression points at one.
 //
-// Back-edges to tx.rs are deferred TX-completion + worker-binding
-// helpers (apply_cos_*_result, restore_cos_*_inner,
-// prime_cos_root_for_service, advance_cos_timer_wheel, transmit_*,
-// reap_tx_completions, refresh_cos_interface_activity, etc).
-// Visibility on those bumped to pub(in crate::afxdp) in tx.rs as
-// part of this PR. They will move with the future TX-completion
-// extraction.
+// TX-completion + timer-wheel back-edges (apply_cos_*_result,
+// restore_cos_*_inner, prime_cos_root_for_service,
+// refresh_cos_interface_activity, cos_tick_for_ns +
+// cos_timer_wheel_level_and_slot + count_tx_ring_full_submit_stall)
+// moved to cos/tx_completion.rs in #956 P1.
+//
+// Remaining back-edges to crate::afxdp::tx are XSK-ring /
+// worker-binding / prepared-frame primitives (transmit_*,
+// reap_tx_completions, maybe_wake_tx, recycle_*, stamp_submits,
+// cos_queue_dscp_rewrite, TxError, the guarantee/quantum constants).
+// Those move with the afxdp/tx/ split in #984.
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
@@ -53,25 +57,29 @@ use super::{
     refill_cos_tokens, COS_MIN_BURST_BYTES,
 };
 
-// Back-edges to tx.rs (Phase 7 deferrals — TX-completion + worker-
-// binding family). Visibility bumped to pub(in crate::afxdp) so this
-// module can reach them.
-use crate::afxdp::tx::{
+// #956 P1: TX-completion + timer-wheel symbols + scheduling primitives
+// (CoSServicePhase, ParkReason, count_park_reason, park_cos_queue)
+// moved to cos/tx_completion.rs. Moving the scheduling primitives
+// breaks the previous cyclic queue_service <-> tx_completion module
+// dependency (Copilot review on PR #990).
+use super::tx_completion::{
     apply_cos_prepared_result, apply_cos_send_result,
-    apply_direct_exact_send_result, cos_queue_dscp_rewrite, cos_tick_for_ns,
-    cos_timer_wheel_level_and_slot, count_tx_ring_full_submit_stall, maybe_wake_tx,
-    prime_cos_root_for_service, reap_tx_completions, recycle_cancelled_prepared_offset,
-    refresh_cos_interface_activity, remember_prepared_recycle, restore_cos_local_items_inner,
-    restore_cos_prepared_items_inner, stamp_submits, transmit_batch, transmit_prepared_queue,
-    TxError, COS_GUARANTEE_QUANTUM_MAX_BYTES, COS_GUARANTEE_QUANTUM_MIN_BYTES,
+    apply_direct_exact_send_result, cos_tick_for_ns,
+    count_park_reason, count_tx_ring_full_submit_stall,
+    park_cos_queue, prime_cos_root_for_service, refresh_cos_interface_activity,
+    restore_cos_local_items_inner, restore_cos_prepared_items_inner, CoSServicePhase,
+    ParkReason,
+};
+// Remaining back-edges to tx.rs (XSK-ring / worker-binding /
+// prepared-frame primitives + TxError + guarantee/quantum constants —
+// deferred to #984 / afxdp/tx/ split).
+use crate::afxdp::tx::{
+    cos_queue_dscp_rewrite, maybe_wake_tx, reap_tx_completions,
+    recycle_cancelled_prepared_offset, remember_prepared_recycle, stamp_submits,
+    transmit_batch, transmit_prepared_queue, TxError,
+    COS_GUARANTEE_QUANTUM_MAX_BYTES, COS_GUARANTEE_QUANTUM_MIN_BYTES,
     COS_GUARANTEE_VISIT_NS, COS_SURPLUS_ROUND_QUANTUM_BYTES,
 };
-
-#[derive(Clone, Copy)]
-pub(in crate::afxdp) enum CoSServicePhase {
-    Guarantee,
-    Surplus,
-}
 
 pub(in crate::afxdp) enum CoSBatch {
     Local {
@@ -2133,59 +2141,6 @@ pub(in crate::afxdp) fn estimate_cos_queue_wakeup_tick(
     Some(cos_tick_for_ns(wake_ns).max(cos_tick_for_ns(now_ns).saturating_add(1)))
 }
 
-// #710: park-reason classification used at every `park_cos_queue` call
-// site to attribute the wait to its upstream cause. `RootTokenStarvation`
-// means the interface-level shaper token bucket was empty; the queue
-// itself had work and tokens to send but the root could not admit more
-// bytes this tick. `QueueTokenStarvation` means the per-queue (exact)
-// token bucket was empty — the queue's own rate cap is the limiter.
-// Both are "parks" rather than "drops" because the timer wheel will
-// wake the queue when tokens refill; no packet is lost.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::afxdp) enum ParkReason {
-    RootTokenStarvation,
-    QueueTokenStarvation,
-}
-
-#[inline]
-pub(in crate::afxdp) fn count_park_reason(root: &mut CoSInterfaceRuntime, queue_idx: usize, reason: ParkReason) {
-    if let Some(queue) = root.queues.get_mut(queue_idx) {
-        match reason {
-            ParkReason::RootTokenStarvation => {
-                queue.drop_counters.root_token_starvation_parks = queue
-                    .drop_counters
-                    .root_token_starvation_parks
-                    .wrapping_add(1);
-            }
-            ParkReason::QueueTokenStarvation => {
-                queue.drop_counters.queue_token_starvation_parks = queue
-                    .drop_counters
-                    .queue_token_starvation_parks
-                    .wrapping_add(1);
-            }
-        }
-    }
-}
-
-pub(in crate::afxdp) fn park_cos_queue(root: &mut CoSInterfaceRuntime, queue_idx: usize, wake_tick: u64) {
-    let (level, slot) = cos_timer_wheel_level_and_slot(root.timer_wheel.current_tick, wake_tick);
-    let Some(queue) = root.queues.get_mut(queue_idx) else {
-        return;
-    };
-    if queue.runnable {
-        root.runnable_queues = root.runnable_queues.saturating_sub(1);
-    }
-    queue.runnable = false;
-    queue.parked = true;
-    queue.next_wakeup_tick = wake_tick;
-    queue.wheel_level = level;
-    queue.wheel_slot = slot;
-    if level == 0 {
-        root.timer_wheel.level0[slot].push(queue_idx);
-    } else {
-        root.timer_wheel.level1[slot].push(queue_idx);
-    }
-}
 
 #[inline]
 pub(in crate::afxdp) fn assign_local_dscp_rewrite(items: &mut VecDeque<TxRequest>, queue_dscp_rewrite: Option<u8>) {
