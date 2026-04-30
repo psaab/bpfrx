@@ -126,7 +126,7 @@ Steps:
 3. Add the re-export blocks (mixed visibility per the table).
 4. Existing call sites stay unchanged via re-export.
 
-## Imports for tx/rings.rs (source-verified upper bound, v2)
+## Imports for tx/rings.rs (source-verified upper bound, v3)
 
 Reconciled against actual moved-fn bodies (tx/mod.rs:14-63 / 65-124 /
 126-174 / 1772-1798 / 2234-2330):
