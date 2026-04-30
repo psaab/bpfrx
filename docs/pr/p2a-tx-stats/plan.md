@@ -1,8 +1,33 @@
 # P2a: extract afxdp/tx/stats.rs from tx.rs
 
-Plan v1 — 2026-04-30. First PR after #990 (P1: cos/tx_completion.rs)
+Plan v2 — 2026-04-30. First PR after #990 (P1: cos/tx_completion.rs)
 merged. Stage 2 of the long sequence — opens the `afxdp/tx/` module
 directory split (#984 P2a..P2d).
+
+## v2 changelog vs v1 (from Codex round-1)
+
+- R1-MA [BLOCKER]: `afxdp.rs:99` declares `tx` with
+  `#[path = "afxdp/tx.rs"]`. A raw `git mv tx.rs tx/mod.rs` will not
+  compile until that attribute changes to `#[path = "afxdp/tx/mod.rs"]`
+  (matching the project's existing `#[path]` convention). v1's claim
+  "`afxdp/mod.rs` does NOT need to change" was false — the actual file
+  to update is `afxdp.rs` (which is the parent module file, not
+  mod.rs). v2 adds this fix to the move steps.
+- R1-MB [MINOR]: the canonical test pins for the three moved fns live
+  in `umem.rs::tests` (umem.rs:950+), not `tx.rs::tests`. Tests at
+  `umem.rs:965`, `1011`, etc. call
+  `crate::afxdp::tx::{stamp_submits, record_tx_completions_with_stamp}`
+  via the explicit absolute path, so the `tx/mod.rs` re-export is
+  load-bearing for those tests too — not optional.
+- R1-MC [MINOR]: visibility-bump rationale corrected. Only
+  `stamp_submits` has a `cos/queue_service.rs` caller. Both
+  `record_*` fns need `pub(in crate::afxdp)` because `umem::tests`
+  reach them through `crate::afxdp::tx::...` (the file boundary
+  changes the same as for the cos/* extraction in #956).
+- Acceptance: added an explicit compile-check after the path fix so
+  the directory rename is verified before the move proceeds. Added a
+  note that we trust LLVM cross-module inlining (per Phase 4-8
+  lesson) but do not gate this PR on a microbench.
 
 ## Goal
 
@@ -66,16 +91,16 @@ After:
       stats.rs             (~140 LOC — 110 moved + ~30 imports/header)
 ```
 
-Required steps in this PR:
-1. `mkdir userspace-dp/src/afxdp/tx/`.
-2. `git mv userspace-dp/src/afxdp/tx.rs userspace-dp/src/afxdp/tx/mod.rs`.
-3. Create `userspace-dp/src/afxdp/tx/stats.rs` with the moved helpers.
-4. In `tx/mod.rs`, add `pub(super) mod stats;` + `pub(in crate::afxdp) use stats::{stamp_submits, record_kick_latency, record_tx_completions_with_stamp};`.
-5. Existing import paths everywhere else in the crate (`crate::afxdp::tx::stamp_submits`, etc.) keep working unchanged because the re-export from `tx/mod.rs` makes them visible at the same path.
-
-`afxdp/mod.rs` (or wherever `tx` is declared via `pub(super) mod tx;`)
-does NOT need to change — directory modules and file modules have the
-same `mod tx;` declaration.
+Required steps in this PR (in this order):
+1. **Update `userspace-dp/src/afxdp.rs:99`**: change
+   `#[path = "afxdp/tx.rs"]` to `#[path = "afxdp/tx/mod.rs"]`. This
+   MUST land before the rename or the build breaks.
+2. `mkdir userspace-dp/src/afxdp/tx/`.
+3. `git mv userspace-dp/src/afxdp/tx.rs userspace-dp/src/afxdp/tx/mod.rs`.
+4. Verify compile: `cargo check --bins` clean.
+5. Create `userspace-dp/src/afxdp/tx/stats.rs` with the moved helpers.
+6. In `tx/mod.rs`, add `pub(super) mod stats;` + `pub(in crate::afxdp) use stats::{stamp_submits, record_kick_latency, record_tx_completions_with_stamp};` next to the existing `use super::cos::{...}` block.
+7. Existing import paths everywhere else in the crate (`crate::afxdp::tx::stamp_submits`, etc., including `umem::tests` at umem.rs:965, 1011, ...) keep working unchanged because the re-export from `tx/mod.rs` makes them visible at the same path.
 
 ## Imports for tx/stats.rs (source-verified)
 
@@ -127,15 +152,25 @@ update (re-export preserves identifiers).
 
 ## Tests
 
-No new tests required — pure structural refactor. The existing tests
-for the three moved fns live at `tx.rs:1449+` (`tx_kick_latency_*`,
-`tx_kick_retry_*` pins) and stay in `tx/mod.rs`'s `mod tests` block;
-they reach the moved fns via `super::*` (which now finds them via
-the cos-style re-export chain at the top of `mod.rs`).
+No new tests required — pure structural refactor.
 
-If the test block needs explicit access to symbols that don't
-re-export through `tx/mod.rs`, add a `#[cfg(test)] use super::stats::*;`
-inside the test mod. Round-1 reviewers verify whether this is needed.
+The canonical pins for the three moved fns live in `umem.rs::tests`
+at `umem.rs:950+` (`tx_kick_latency_*`, `tx_kick_retry_*`, sidecar
+sentinel pins, and shared-UMEM OOB tests). They reach the moved fns
+via the explicit absolute path `crate::afxdp::tx::{stamp_submits,
+record_tx_completions_with_stamp, record_kick_latency}` — the
+`tx/mod.rs` `pub(in crate::afxdp) use stats::...` re-export keeps
+that path resolving after the move. **The re-export is load-bearing,
+not optional.**
+
+`tx/mod.rs::tests` (the `mod tests` block at the bottom of the
+ex-tx.rs file) reaches symbols via `super::*`, which after the
+re-export will pull moved-fn names into the test scope.
+
+If on impl any test fails to resolve a symbol, add a `#[cfg(test)]
+use super::stats::*;` inside the test mod or bump cos/mod.rs-style
+re-exports for it. Round-2+ reviewers verify against the actual
+build.
 
 ## Risk
 
@@ -159,14 +194,28 @@ is single-writer (owner worker), so plain non-atomic writes via
 
 ## Acceptance
 
-- `cargo build --bins` clean (no new unused-import warnings).
-- `cargo test --bins` 865/0/2 (current rolling baseline post-#990).
+- After the path-attribute fix in step 1, `cargo check --bins` MUST
+  pass before the rename proceeds.
+- After the move + re-export (steps 2-6), `cargo build --bins` clean
+  (no new unused-import warnings).
+- `cargo test --bins` 865/0/2 (current rolling baseline post-#990) —
+  notably exercises `umem.rs::tests` against the re-exported moved
+  fns.
 - Cluster smoke: `cluster-setup.sh deploy`, `apply-cos-config.sh`,
   per-CoS-class iperf3 (5201–5207), failover (RG1 cycled twice,
   ≥95% intervals ≥3 Gbps, 0 zero-bps).
 - **Triadic plan + impl review**: Codex + Gemini converge
   PLAN-READY/IMPL-READY with NO new findings on the cross-reviews.
 - Copilot review on the PR addressed.
+
+Cross-module inlining: this PR trusts LLVM's cross-module inliner
+(per the Phase 4-8 lesson — `pub(in crate::afxdp) #[inline]` is
+sufficient for inlining across the new boundary, not contradicted
+by any prior data). We do NOT gate on a microbench in this PR. If
+post-merge profiling shows a per-batch regression at the
+`stamp_submits` / `record_tx_completions_with_stamp` call sites,
+the fix is to add `#[inline(always)]` (escalation) rather than
+back out the move.
 
 ## After P2a
 
