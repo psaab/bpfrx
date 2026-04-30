@@ -305,10 +305,16 @@ pub(in crate::afxdp) fn drain_pending_tx(
 /// through the post-CoS backup path bypasses the shaper. The
 /// UMEM frame slot each request holds is recycled immediately so
 /// the free-frame allocator stays in balance. A non-zero drop
-/// count here indicates a cross-worker routing failure
-/// (redirect-to-owner returned Err AND local-enqueue returned
-/// Err), which is the narrow failure mode the re-ingest + drop
-/// pair is designed to defend against.
+/// count here means the prepared-request re-ingest cascade left
+/// CoS-bound residue: `ingest_cos_pending_tx_with_provenance`
+/// first attempts `redirect_prepared_cos_request_to_owner`, then
+/// `redirect_prepared_cos_request_to_owner_binding`, then
+/// `enqueue_prepared_into_cos`. Any item dropped here therefore
+/// indicates that all applicable redirect/enqueue attempts
+/// failed (or otherwise left the request unconsumed), so this
+/// counter should be interpreted as a leftover-after-reingest
+/// defense rather than only a narrow redirect-to-owner +
+/// local-enqueue failure.
 fn drop_cos_bound_prepared_leftovers(binding: &mut BindingWorker) {
     if binding.pending_tx_prepared.is_empty() {
         return;
