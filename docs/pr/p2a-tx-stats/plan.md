@@ -136,7 +136,7 @@ calls `record_kick_latency`; `transmit_*` paths call `stamp_submits`)
 keep working through the re-export — same identifier, same path
 relative to the file.
 
-External call sites (cos/queue_service.rs:65 imports `stamp_submits`
+External call sites (cos/queue_service.rs:76-78 imports `stamp_submits`
 from `crate::afxdp::tx::`) keep working unchanged — the re-export
 preserves the public path.
 
@@ -194,8 +194,12 @@ is single-writer (owner worker), so plain non-atomic writes via
 
 ## Acceptance
 
-- After the path-attribute fix in step 1, `cargo check --bins` MUST
-  pass before the rename proceeds.
+- After the path-attribute fix + mkdir + `git mv` (steps 1-3),
+  `cargo check --bins` MUST pass before extracting `stats.rs`.
+  (Updating only the `#[path]` attribute without the file move would
+  break the build because the file at the new path doesn't exist
+  yet — both halves of the rename land together as a single atomic
+  step before the stats extraction.)
 - After the move + re-export (steps 2-6), `cargo build --bins` clean
   (no new unused-import warnings).
 - `cargo test --bins` 865/0/2 (current rolling baseline post-#990) —
