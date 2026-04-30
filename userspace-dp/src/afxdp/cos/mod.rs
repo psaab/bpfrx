@@ -12,13 +12,21 @@ pub(super) mod ecn;
 pub(super) mod flow_hash;
 pub(super) mod token_bucket;
 
-// Re-export the items consumed by sibling `tx.rs`. The items
-// themselves are `pub(in crate::afxdp)` in their source files;
-// these re-exports shorten the import path on call sites.
+// Re-export the items consumed by callers across the afxdp module.
+// The items themselves are `pub(in crate::afxdp)` in their source
+// files; these re-exports shorten the import path on call sites.
+// Consumers as of Phase 4:
+//   - `tx.rs` consumes admission gates, flow_hash helpers,
+//     and 5 of the 7 token-bucket helpers + COS_MIN_BURST_BYTES.
+//   - `worker.rs` consumes the 2 `release_all_cos_*_leases`
+//     helpers (called on RG transitions / shutdown).
+//   - `cos/admission.rs` consumes `COS_MIN_BURST_BYTES` (Phase 4
+//     replaced the Phase-3 admission -> tx back-edge with a
+//     `super::COS_MIN_BURST_BYTES` re-export here).
 //
-// Production-side: only the entry points tx.rs's non-test code
-// consumes. Test-only re-exports are gated below to avoid
-// `unused_imports` warnings on non-test builds.
+// Production-side: only the entry points production code consumes.
+// Test-only re-exports are gated below to avoid `unused_imports`
+// warnings on non-test builds.
 pub(super) use admission::{
     apply_cos_admission_ecn_policy, apply_cos_queue_flow_fair_promotion,
     cos_flow_aware_buffer_limit, cos_queue_flow_share_limit,
