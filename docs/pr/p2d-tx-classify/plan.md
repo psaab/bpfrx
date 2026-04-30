@@ -1,0 +1,171 @@
+# P2d: extract afxdp/tx/cos_classify.rs from tx/mod.rs (final carve)
+
+Plan v1 — 2026-04-30. Stage 2 step 5 (final) of the long sequence
+after #994 (P2c2: tx/drain.rs) merged at master `ff982ad1`.
+
+## Goal
+
+Extract the **CoS classify + enqueue + cached-selection cluster**
+(~870 LOC, 14 fns + 1 struct) from `tx/mod.rs` into a sibling
+`tx/cos_classify.rs`. After this PR, `tx/mod.rs` becomes a thin
+facade containing only `mod` declarations + re-exports + the test
+mod block (the test mod stays in mod.rs as the canonical pin
+location that reaches all 5 sibling modules via `super::*`).
+
+This is the FINAL carve — closes #984.
+
+## Move list (~870 LOC)
+
+### Public items (4)
+
+| Item | Line | Source visibility | Facade re-export |
+|---|---|---|---|
+| `CoSTxSelection` (struct) | 122 | `pub(in crate::afxdp)` (bumped from `pub(super)`; struct fields also bumped to `pub(in crate::afxdp)`) | `pub(super) use cos_classify::CoSTxSelection;` |
+| `resolve_cached_cos_tx_selection` | 134 | `pub(in crate::afxdp)` (bumped) | `pub(super) use cos_classify::resolve_cached_cos_tx_selection;` |
+| `resolve_cos_queue_id` | 335 | `pub(in crate::afxdp)` (bumped) | `pub(super) use cos_classify::resolve_cos_queue_id;` |
+| `resolve_cos_tx_selection` | 344 | `pub(in crate::afxdp)` (bumped) | `pub(super) use cos_classify::resolve_cos_tx_selection;` |
+| `enqueue_local_into_cos` | 518 | `pub(in crate::afxdp)` (bumped) | `pub(super) use cos_classify::enqueue_local_into_cos;` |
+| `cos_queue_dscp_rewrite` | 860+ | `pub(in crate::afxdp)` (preserved) | `pub(in crate::afxdp) use cos_classify::cos_queue_dscp_rewrite;` |
+
+### Private helpers (8)
+
+| Item | Line |
+|---|---|
+| `map_cached_forwarding_class_queue` | 127 |
+| `resolve_cos_dscp_classifier_queue_id` | 501 |
+| `resolve_cos_ieee8021_classifier_queue_id` | 506 |
+| `prepare_local_request_for_cos` | 616 |
+| `enqueue_prepared_into_cos` | 647 |
+| `clone_prepared_request_for_cos` | 703 |
+| `resolve_cos_queue_idx` | 717 |
+| `demote_prepared_cos_queue_to_local` | 734 |
+| `cos_queue_accepts_prepared` | 850 |
+| `enqueue_cos_item` | 872 |
+
+(Round-1 reviewer: verify the line numbers and the full set against
+source — there may be additional small private helpers nested in.)
+
+## After P2d
+
+`tx/mod.rs` becomes a thin facade (~150 LOC: `use super::*;`, 5 `mod`
+declarations, ~4 re-export blocks, ~5 cfg-test re-exports for tests
+in `mod tests`). The actual test mod block (~10K LOC) STAYS in
+`tx/mod.rs::tests` since it's the canonical pin location for the
+whole tx subsystem and moving it would require shuffling tests across
+5 files.
+
+Final tx/ structure:
+```
+userspace-dp/src/afxdp/tx/
+  mod.rs            (~150 LOC + ~10K LOC tests)
+  stats.rs          (P2a)
+  rings.rs          (P2b)
+  transmit.rs       (P2c)
+  drain.rs          (P2c2)
+  cos_classify.rs   (P2d, ~900 LOC)
+```
+
+## Module-structure change
+
+```
+Before P2d:
+  tx/mod.rs       (11733 LOC, ~1020 production + ~10700 tests)
+
+After P2d:
+  tx/mod.rs       (~10870 LOC, ~150 production facade + ~10700 tests)
+  tx/cos_classify.rs (~900 LOC)
+```
+
+## tx/mod.rs final shape
+
+```rust
+use super::*;
+
+pub(super) mod stats;
+pub(super) mod rings;
+pub(super) mod transmit;
+pub(super) mod drain;
+pub(super) mod cos_classify;
+
+pub(in crate::afxdp) use stats::stamp_submits;
+#[cfg(test)]
+pub(in crate::afxdp) use stats::{record_kick_latency, record_tx_completions_with_stamp};
+
+pub(in crate::afxdp) use rings::{maybe_wake_tx, reap_tx_completions};
+pub(super) use rings::{drain_pending_fill, maybe_wake_rx};
+#[cfg(test)]
+use rings::apply_prepared_recycle;
+
+pub(in crate::afxdp) use transmit::{
+    recycle_cancelled_prepared_offset, recycle_prepared_immediately,
+    remember_prepared_recycle, transmit_batch, transmit_prepared_queue, TxError,
+};
+use transmit::transmit_prepared_batch;
+
+pub(super) use drain::{
+    bound_pending_tx_local, bound_pending_tx_prepared, drain_pending_tx,
+    drain_pending_tx_local_owner, pending_tx_capacity,
+};
+pub(in crate::afxdp) use drain::{
+    COS_GUARANTEE_QUANTUM_MAX_BYTES, COS_GUARANTEE_QUANTUM_MIN_BYTES,
+    COS_GUARANTEE_VISIT_NS, COS_SURPLUS_ROUND_QUANTUM_BYTES,
+};
+
+pub(super) use cos_classify::{
+    CoSTxSelection, enqueue_local_into_cos, resolve_cached_cos_tx_selection,
+    resolve_cos_queue_id, resolve_cos_tx_selection,
+};
+pub(in crate::afxdp) use cos_classify::cos_queue_dscp_rewrite;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // ... ~10K LOC of unit tests, unchanged ...
+}
+```
+
+## Tests
+
+Pre-existing tests in `tx/mod.rs::tests` reference many of the moved
+fns. After this PR, `super::*` in the test mod resolves to the
+re-export chain. Tests that reach moved private helpers will need
+either `#[cfg(test)] use cos_classify::PRIVATE_FN;` re-exports OR
+those tests move into `cos_classify.rs::tests`.
+
+Round-1 reviewer: enumerate the test pins and decide per-test:
+move-with-fn vs cfg-test re-export.
+
+## Imports for tx/cos_classify.rs
+
+Likely a wide import surface (the moved bodies touch BindingWorker,
+CoSInterfaceConfig, CoSPendingTxItem, ForwardingState, FastMap,
+session helpers, etc). Same as P2c2: use `use super::*;` initially
+with explicit enumeration deferred to a cleanup PR.
+
+## Risk
+
+**High.** ~870 LOC across 14 fns + 1 struct. The CoS classify path
+is on the steady-state enqueue hot path. Single-writer (owner
+worker), all atomic ops Ordering::Relaxed.
+
+`CoSTxSelection` has external callers (afxdp.rs, icmp.rs, tunnel.rs,
+coordinator.rs, frame_tx.rs per Codex's earlier flag) — bumping its
+field visibility to `pub(in crate::afxdp)` is required and must be
+verified to not break those sites.
+
+## Acceptance
+
+- `cargo build --bins` clean.
+- `cargo test --bins` 865/0/2.
+- Cluster smoke: per-CoS iperf3 + RG1 cycled-twice failover ≥95% ≥3
+  Gbps.
+- Triadic plan + impl review.
+- Copilot review on the PR.
+
+## After P2d
+
+This closes #984 (afxdp/tx/ module decomposition) and the long
+sequence started with #956. Next stages:
+- Stage 3 (#987): HAL traits + MockDriver
+- Stage 4 (#985 / #986): Coordinator decompose, umem/ split
+- Stage 5: Test consolidation, doc pass, profiling pass
