@@ -26,12 +26,9 @@ pub(super) use flow_hash::{cos_flow_bucket_index, cos_item_flow_key};
 #[cfg(test)]
 pub(super) use admission::{
     bdp_floor_bytes, COS_ECN_MARK_THRESHOLD_DEN, COS_ECN_MARK_THRESHOLD_NUM,
-    COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS, COS_FLOW_FAIR_MIN_SHARE_BYTES,
+    COS_FLOW_FAIR_MIN_SHARE_BYTES,
 };
 #[cfg(test)]
-pub(super) use ecn::{
-    maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared, ECN_CE, ECN_ECT_0, ECN_ECT_1, ECN_MASK,
-    ECN_NOT_ECT,
-};
+pub(super) use ecn::{maybe_mark_ecn_ce, ECN_CE, ECN_ECT_0, ECN_ECT_1, ECN_MASK, ECN_NOT_ECT};
 #[cfg(test)]
 pub(super) use flow_hash::{cos_flow_hash_seed_from_os, cos_queue_prospective_active_flows};

@@ -3504,8 +3504,7 @@ use super::cos::ecn::{ethernet_l3, mark_ecn_ce_ipv4, mark_ecn_ce_ipv6, EthernetL
 #[cfg(test)]
 use super::cos::{
     bdp_floor_bytes, cos_flow_hash_seed_from_os, cos_queue_prospective_active_flows,
-    maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared, COS_ECN_MARK_THRESHOLD_DEN,
-    COS_ECN_MARK_THRESHOLD_NUM, COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS,
+    maybe_mark_ecn_ce, COS_ECN_MARK_THRESHOLD_DEN, COS_ECN_MARK_THRESHOLD_NUM,
     COS_FLOW_FAIR_MIN_SHARE_BYTES, ECN_CE, ECN_ECT_0, ECN_ECT_1, ECN_MASK, ECN_NOT_ECT,
 };
 
