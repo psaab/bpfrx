@@ -1,9 +1,44 @@
 # #956 Phase 4: extract cos/token_bucket.rs from tx.rs
 
-Plan v3 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
+Plan v4 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
 Phase 1 (cos/ecn.rs) shipped at PR #976; Phase 2 (cos/flow_hash.rs)
 at PR #977; Phase 3 (cos/admission.rs) at PR #978. Phase 4 = the
 token-bucket lease/refill subsystem.
+
+Round-3 changelog (v3 → v4): Codex round-3 returned PLAN-NEEDS-MAJOR
+with 1 substantive issue + 5 minor + 2 nits. All 8 are fixed in v4:
+
+- #1 (MAJOR): tx.rs is NOT a caller of `release_all_cos_root_leases`
+  or `release_all_cos_queue_leases` — those callers all live in
+  worker.rs. Plan v3 told tx.rs to import all 7 helpers, which
+  would trip a Phase-4-introduced unused-import warning. v4 narrows
+  the tx.rs import block to the 5 fns it actually calls plus
+  `COS_MIN_BURST_BYTES`, and moves the 2 release helpers into the
+  worker.rs explicit-import line.
+- #2 (minor): existing definitions at tx.rs:3511, 3533, 3582 have
+  no `#[inline]` attribute — the previous claim that the move
+  must "preserve `#[inline]`" was wrong. v4 calls the move
+  byte-identical and notes that any post-merge regression is a
+  follow-up rather than a Phase-4 blocker.
+- #3 (minor): stale-text cleanup must include `tx.rs:3479-3491`
+  (the cos/ submodule import-header still says "Phase 3 (this PR)"
+  and lists Phase-1+2+3 imports without token-bucket helpers).
+- #4 (minor): cos/mod.rs cleanup is lines 1-7, not 1-5 (line 6 also
+  references `docs/pr/956-phase3-admission/plan.md` as "the current
+  phase").
+- #5 (minor): test-invariant wording — root-lease floor is
+  `lease_bytes().max(tx_frame_capacity())`, not
+  `tx_frame_capacity().max(COS_MIN_BURST_BYTES)`. Updated.
+- #6 (nit): COS_MIN_BURST_BYTES non-test list extended to include
+  tx.rs:5237, 5264, 5269 (added in R1-3 follow-up; v3 list was
+  consistent with the table but the Round-1 changelog sentence
+  had only `1832, 5237, plus 7 inside top-up helpers`).
+- #7 (nit): worker.rs caller-line wording in the Round-2 changelog
+  updated to match the table — root at 746/1613/1911, queue at
+  747/755/1614/1912.
+- #8 (nit): "tests call 2 of them" is misleading — direct
+  tx::tests call sites are 2 fns, but #[cfg(test)]-gated call
+  sites cover 3 fns. Tests section corrected.
 
 Round-2 changelog (v2 → v3): addresses 5 Codex round-2 wording /
 line-number fixes (move set + visibility unchanged):
@@ -127,14 +162,28 @@ non-test build will use them all.
 
 tx.rs:
 - Remove the 7 fn definitions and the `COS_MIN_BURST_BYTES` const.
-- Update the existing `use super::cos::{...}` block to add the 7 fns
-  and the constant.
+- Update the existing `use super::cos::{...}` block to add ONLY the 5
+  helpers tx.rs actually calls in non-test code plus the constant
+  (Codex round-3 #1 — tx.rs is NOT a caller of either
+  `release_all_cos_*_leases`; those callers all live in worker.rs):
+  ```rust
+  use super::cos::{
+      cos_refill_ns_until, maybe_top_up_cos_queue_lease,
+      maybe_top_up_cos_root_lease, refill_cos_tokens,
+      release_cos_root_lease, COS_MIN_BURST_BYTES,
+  };
+  ```
+  Adding the two `release_all_*` helpers to tx.rs's import block
+  would trip a Phase-4-introduced unused-import warning, just like
+  Phase 3 commit 4276eac0 had to clean up.
 
 worker.rs:
-- `release_all_cos_*_leases` calls already work via the existing
-  `pub(super)` wiring — but after the move they live in cos/, so
-  worker.rs needs `use super::cos::{release_all_cos_root_leases,
-  release_all_cos_queue_leases}` (or `use crate::afxdp::cos::...`).
+- `release_all_cos_*_leases` are called from worker.rs:746, 747, 755,
+  1613, 1614, 1911, 1912. Today they're picked up via worker.rs:1's
+  `use super::*` glob (Codex round-1 R1-4). After the move worker.rs
+  needs an explicit `use super::cos::{release_all_cos_root_leases,
+  release_all_cos_queue_leases};` so the symbol resolution is
+  unambiguous.
 
 cos/admission.rs:
 - Replace `use crate::afxdp::tx::COS_MIN_BURST_BYTES` with
@@ -160,9 +209,20 @@ cos/admission.rs:
 No new tests required — pure structural refactor. Existing tests in
 `tx::tests` exercise:
 - `maybe_top_up_cos_root_lease` at tx.rs:6824 (root-lease behaviour
-  pinned by `tx_frame_capacity().max(COS_MIN_BURST_BYTES)` floor)
+  pinned by the `lease_bytes().max(tx_frame_capacity())` floor — the
+  invariant that lease size never falls below a max-sized frame; the
+  test comment at tx.rs:6794 names this exact form). Codex round-3 #5
+  caught the previous wording that wrote it as
+  `tx_frame_capacity().max(COS_MIN_BURST_BYTES)` — wrong direction.
 - `maybe_top_up_cos_queue_lease` at tx.rs:6873 (queue-lease grant
   vs queue.tokens prerequisite)
+- Three additional fns have test-only call sites that the refactor
+  must keep reachable: `refill_cos_tokens` at tx.rs:1651,
+  `maybe_top_up_cos_queue_lease` at tx.rs:1643, and
+  `maybe_top_up_cos_root_lease` at tx.rs:6824. (Codex round-3 #8
+  flagged the earlier "tests call 2" wording — direct
+  `tx::tests` calls happen to two helpers but #[cfg(test)] -gated
+  call sites cover three.)
 
 Both tests will continue to compile after the move because both fns
 become `pub(in crate::afxdp)` and are reachable via
@@ -174,6 +234,11 @@ become `pub(in crate::afxdp)` and are reachable via
   comment block becomes false once the constant moves to
   cos/token_bucket.rs. Remove the comment block (the constant is gone
   from tx.rs).
+- `tx.rs:3479-3491` — the cos/ submodule import-header (Codex round-3
+  #3). Currently says "Phase 3 (this PR)" and the `use super::cos::{...}`
+  block lists only Phase-1+2+3 items. Update header text to
+  "Phase 4 (this PR)" plus drop the now-stale Phase-3-tense wording,
+  and refresh the imported-items list.
 - `cos/admission.rs:24-27` — header note about COS_MIN_BURST_BYTES
   staying in tx.rs needs to switch to past-tense (Codex round-2 N3:
   the wording must align with R1-5's chosen import path). Replace
@@ -182,8 +247,10 @@ become `pub(in crate::afxdp)` and are reachable via
   to the cos/mod.rs re-export), not via direct
   `super::token_bucket::COS_MIN_BURST_BYTES` — that keeps admission
   agnostic to the cos/* internal file layout."
-- `cos/mod.rs:1-5` — phase-order header. Update to call out Phase 4
-  as the current state.
+- `cos/mod.rs:1-7` — phase-order header (Codex round-3 #4: line 6
+  also references `docs/pr/956-phase3-admission/plan.md` as "the
+  current phase"). Update lines 1-7 to call out Phase 4 as the
+  current state.
 
 ## Risk
 
@@ -197,10 +264,14 @@ touches the hot-path enqueue/refill loop — every TX byte goes through
   tx.rs:3558 (which itself moves to token_bucket.rs and stays
   intra-file). The third syntactic site at tx.rs:1651 is inside a
   `#[cfg(test)]` legacy-selector fn, so it's not part of the
-  production hot path. Even so, `refill_cos_tokens` and the
-  `maybe_top_up_*` helpers must keep `#[inline]` on the move so the
-  compiler can still inline across the cos/* boundary the same way
-  Phases 2+3 validated.
+  production hot path. **Implementation note** (Codex round-3 #2):
+  the source definitions at tx.rs:3511, 3533, 3582 do NOT currently
+  carry an `#[inline]` attribute — they rely on the compiler's
+  cross-module inlining via `pub(in crate::afxdp)` visibility, the
+  same pattern Phases 2+3 validated. The implementation should
+  reproduce them unchanged (no `#[inline]` added or removed). If a
+  post-merge perf regression points at a missing inline, that's a
+  follow-up rather than a Phase-4-blocking decision.
 - **worker.rs import migration.** worker.rs picks up the release
   helpers via a module-level `use super::*` glob at worker.rs:1
   (with afxdp.rs:149 glob-importing tx — Codex round-1 R1-4
