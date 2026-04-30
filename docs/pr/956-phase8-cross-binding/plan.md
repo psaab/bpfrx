@@ -1,72 +1,101 @@
 # #956 Phase 8: extract cos/cross_binding.rs from tx.rs
 
-Plan v1 — 2026-04-30. **Final phase** of #956. Phases 1-7 merged
+Plan v2 — 2026-04-30. **Final phase** of #956. Phases 1-7 merged
 at PRs #976-#982.
 
-## Goal
+Round-1 changelog (v1 → v2): Codex round-1 returned
+PLAN-NEEDS-MAJOR with 7 findings. v2 expands scope to capture the
+true cross-binding cluster:
 
-Move 5 cross-binding redirect helpers from tx.rs into
-`userspace-dp/src/afxdp/cos/cross_binding.rs`. These resolve the
-"is this request bound to the owner of the egress, or do we hand
-off via MPSC inbox?" question for both Local and Prepared TX
-requests.
+- v1 listed only the 5 redirect_* fns; v2 adds the helpers they
+  depend on (cos_fast_interface, cos_fast_queue,
+  resolve_local_routing_decision) and the routing-decision types
+  (Step1Action, LocalRoutingDecision).
+- Visibility corrected: `redirect_local_cos_request_to_owner_binding`
+  has only test callers (tx.rs:3941, 3989) — needs cfg-gated re-
+  export, not always-on.
+- Back-edge to `recycle_prepared_immediately` (tx.rs:2622, stays
+  in tx.rs) acknowledged; visibility already pub(super), bumped
+  to pub(in crate::afxdp).
+- cos/mod.rs wiring made explicit.
 
-## Move list (5 fns)
+## Move list (v2)
 
-| Item | Line | Visibility | Notes |
+### Types (2)
+| Item | Line | Kind |
+|---|---|---|
+| `Step1Action` | 1131 | enum |
+| `LocalRoutingDecision` | 1147 | struct |
+
+### Helpers (3)
+| Item | Line | Notes |
+|---|---|---|
+| `resolve_local_routing_decision` | 1164 | step-1 owner resolution |
+| `cos_fast_interface` | 1199 | binding fast-path lookup |
+| `cos_fast_queue` | 1207 | binding queue fast-path lookup |
+
+### Redirect fns (5)
+| Item | Line | Visibility | Callers |
 |---|---|---|---|
-| `redirect_local_cos_request_to_owner` | 1217 | private | step-1 entry |
-| `redirect_local_cos_request_to_owner_binding` | 1248 | private | step-2 inbox handoff |
-| `prepared_cos_request_stays_on_current_tx_binding` | 1268 | private | gate predicate |
-| `redirect_prepared_cos_request_to_owner` | 1276 | private | prepared step-1 |
-| `redirect_prepared_cos_request_to_owner_binding` | 1328 | private | prepared step-2 |
+| `redirect_local_cos_request_to_owner` | 1217 | pub | production |
+| `redirect_local_cos_request_to_owner_binding` | 1248 | cfg-gated | tests only (tx.rs:3941, 3989) |
+| `prepared_cos_request_stays_on_current_tx_binding` | 1268 | pub | production |
+| `redirect_prepared_cos_request_to_owner` | 1276 | pub | production |
+| `redirect_prepared_cos_request_to_owner_binding` | 1328 | pub | production |
 
-(Codex round-1 verifies callers. Plan-stage assumption: each fn
-has tx.rs production callers — non-test — so all 5 become
-`pub(in crate::afxdp)`.)
+**Total: 2 types + 8 fns ≈ 250 LOC**
+
+## Back-edges to tx.rs (deferred TX-completion / worker-binding)
+
+`recycle_prepared_immediately` (tx.rs:2622) — currently
+`pub(super)`. Bumped to `pub(in crate::afxdp)` so cos/cross_binding.rs
+can call it. Stays in tx.rs because it touches XSK ring frame
+recycling — worker-binding territory, not cos.
 
 ## Approach
 
-`cos/cross_binding.rs` (~160 LOC) hosts the 5 fns + module-level
-docs explaining the two-step redirect model (resolve owner →
-hand off via MPSC inbox if it's a different binding).
+Visibility:
+- `pub(in crate::afxdp)`: 4 redirect fns + 3 helpers + 2 types.
+- cfg-gated `pub(super) use`: redirect_local_cos_request_to_owner_binding
+  (test-only after move).
 
-Visibility: all 5 → `pub(in crate::afxdp)`. tx.rs's existing cos::
-import block extends with the new entries.
+`#[inline]` per Phase 4-7 lesson:
+- Per-byte hot path (called from enqueue): all 4 production
+  redirect fns + 3 helpers + resolve_local_routing_decision —
+  add `#[inline]`.
+- Larger memcpy bodies (redirect_prepared variants ~47-51 lines)
+  follow Phase 7 precedent for similar-sized fns: leave un-
+  attributed; LLVM heuristic should cover.
 
-`#[inline]` per Phase 4-7 lesson: all 5 are per-enqueue hot path
-helpers — add `#[inline]` on the move.
+## cos/mod.rs additions
+
+```rust
+pub(super) mod cross_binding;
+
+pub(super) use cross_binding::{
+    cos_fast_interface, cos_fast_queue, prepared_cos_request_stays_on_current_tx_binding,
+    redirect_local_cos_request_to_owner, redirect_prepared_cos_request_to_owner,
+    redirect_prepared_cos_request_to_owner_binding, resolve_local_routing_decision,
+    LocalRoutingDecision, Step1Action,
+};
+
+#[cfg(test)]
+pub(super) use cross_binding::redirect_local_cos_request_to_owner_binding;
+```
 
 ## Files touched
 
-- **NEW** `userspace-dp/src/afxdp/cos/cross_binding.rs`: ~180 LOC.
+- **NEW** `userspace-dp/src/afxdp/cos/cross_binding.rs`: ~280 LOC.
 - `userspace-dp/src/afxdp/cos/mod.rs`: register module + re-exports.
-- `userspace-dp/src/afxdp/tx.rs`: -160 LOC; extend cos:: imports.
-
-## After this Phase 8
-
-`tx.rs` left in place is just XSK ring management (descriptor
-pop/push, kick threshold, completion reap) + orchestration glue
-(drain_pending_tx, bound_pending_tx_*) + the deferred TX-completion
-family that was bumped to `pub(in crate::afxdp)` during Phase 7
-(apply_cos_*_result, restore_cos_*_inner, transmit_*, etc).
-
-The umbrella plan called for those to also extract eventually
-(probably as cos/tx_completion.rs and a coordinator/worker-side
-cross-binding extraction). Those are explicitly OUT-OF-SCOPE for
-this PR and tracked as future work.
-
-## Tests
-
-No new tests — pure structural refactor. Existing tests in
-`tx::tests` exercise the 5 fns indirectly via the `enqueue_*` and
-`drain_*` paths.
+- `userspace-dp/src/afxdp/tx.rs`: -250 LOC; bump
+  `recycle_prepared_immediately` to `pub(in crate::afxdp)`; extend
+  cos:: imports.
 
 ## Risk
 
-**Low.** Smallest move in the campaign (~160 LOC). Forward
-dependencies clean: cross_binding.rs imports types and a few
-helpers from existing cos/* modules. No new back-edges expected.
+**Low.** Smallest move of remaining work (~250 LOC). Forward
+dependencies clean: cross_binding.rs imports types from afxdp::types,
+worker::BindingWorker, and one back-edge to tx::recycle_prepared_immediately.
 
 ## Acceptance
 
@@ -74,3 +103,15 @@ helpers from existing cos/* modules. No new back-edges expected.
 - `cargo test --bins` 865/0/2
 - Cluster smoke per the standard 7-class iperf3 + failover
 - Both reviewers (Codex hostile + Gemini adversarial) sign off
+
+## After this Phase 8
+
+`tx.rs` left in place is XSK ring management + worker-binding glue
++ deferred TX-completion family (apply_cos_*_result, restore_*_inner,
+transmit_*, etc — bumped to `pub(in crate::afxdp)` during Phase 7).
+
+Future work (out of scope for #956):
+- TX-completion phase: extract apply_cos_*_result + restore_*_inner
+  + advance_cos_timer_wheel + timer-wheel constants.
+- Worker-binding extraction: extract transmit_batch, reap_tx_completions,
+  cos_queue_dscp_rewrite, etc.
