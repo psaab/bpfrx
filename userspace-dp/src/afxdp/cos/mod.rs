@@ -77,10 +77,13 @@ pub(super) use tx_completion::{
     COS_TIMER_WHEEL_TICK_NS,
 };
 #[cfg(test)]
+pub(super) use tx_completion::{
+    count_park_reason, park_cos_queue, CoSServicePhase, ParkReason,
+};
+#[cfg(test)]
 pub(super) use queue_service::{
     assign_local_dscp_rewrite, cos_batch_tx_made_progress, cos_guarantee_quantum_bytes,
-    park_cos_queue, CoSServicePhase,
-    count_park_reason, drain_exact_local_fifo_items_to_scratch,
+    drain_exact_local_fifo_items_to_scratch,
     drain_exact_local_items_to_scratch_flow_fair, drain_exact_prepared_fifo_items_to_scratch,
     drain_exact_prepared_items_to_scratch_flow_fair, estimate_cos_queue_wakeup_tick,
     release_exact_local_scratch_frames, release_exact_prepared_scratch,
@@ -88,5 +91,5 @@ pub(super) use queue_service::{
     select_cos_surplus_batch, select_exact_cos_guarantee_queue_with_fast_path,
     select_nonexact_cos_guarantee_batch, settle_exact_local_fifo_submission,
     settle_exact_local_scratch_submission_flow_fair, settle_exact_prepared_fifo_submission,
-    CoSBatch, ExactCoSScratchBuild, ParkReason,
+    CoSBatch, ExactCoSScratchBuild,
 };

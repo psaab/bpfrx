@@ -29,8 +29,83 @@ use crate::afxdp::types::{
 use crate::afxdp::worker::BindingWorker;
 
 use super::queue_ops::{cos_queue_is_empty, cos_queue_push_front};
-use super::queue_service::{park_cos_queue, CoSServicePhase};
 use super::token_bucket::{maybe_top_up_cos_root_lease, release_cos_root_lease};
+
+// ============================================================================
+// Service phase + park-reason types
+// ============================================================================
+
+/// Drain phases the scheduler walks through per tick. `Guarantee`
+/// services queues against their per-queue token bucket; `Surplus`
+/// distributes remaining root-bucket bytes across runnable queues
+/// using deficit round-robin.
+#[derive(Clone, Copy)]
+pub(in crate::afxdp) enum CoSServicePhase {
+    Guarantee,
+    Surplus,
+}
+
+// #710: park-reason classification used at every `park_cos_queue` call
+// site to attribute the wait to its upstream cause. `RootTokenStarvation`
+// means the interface-level shaper token bucket was empty; the queue
+// itself had work and tokens to send but the root could not admit more
+// bytes this tick. `QueueTokenStarvation` means the per-queue (exact)
+// token bucket was empty — the queue's own rate cap is the limiter.
+// Both are "parks" rather than "drops" because the timer wheel will
+// wake the queue when tokens refill; no packet is lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::afxdp) enum ParkReason {
+    RootTokenStarvation,
+    QueueTokenStarvation,
+}
+
+#[inline]
+pub(in crate::afxdp) fn count_park_reason(
+    root: &mut CoSInterfaceRuntime,
+    queue_idx: usize,
+    reason: ParkReason,
+) {
+    if let Some(queue) = root.queues.get_mut(queue_idx) {
+        match reason {
+            ParkReason::RootTokenStarvation => {
+                queue.drop_counters.root_token_starvation_parks = queue
+                    .drop_counters
+                    .root_token_starvation_parks
+                    .wrapping_add(1);
+            }
+            ParkReason::QueueTokenStarvation => {
+                queue.drop_counters.queue_token_starvation_parks = queue
+                    .drop_counters
+                    .queue_token_starvation_parks
+                    .wrapping_add(1);
+            }
+        }
+    }
+}
+
+pub(in crate::afxdp) fn park_cos_queue(
+    root: &mut CoSInterfaceRuntime,
+    queue_idx: usize,
+    wake_tick: u64,
+) {
+    let (level, slot) = cos_timer_wheel_level_and_slot(root.timer_wheel.current_tick, wake_tick);
+    let Some(queue) = root.queues.get_mut(queue_idx) else {
+        return;
+    };
+    if queue.runnable {
+        root.runnable_queues = root.runnable_queues.saturating_sub(1);
+    }
+    queue.runnable = false;
+    queue.parked = true;
+    queue.next_wakeup_tick = wake_tick;
+    queue.wheel_level = level;
+    queue.wheel_slot = slot;
+    if level == 0 {
+        root.timer_wheel.level0[slot].push(queue_idx);
+    } else {
+        root.timer_wheel.level1[slot].push(queue_idx);
+    }
+}
 
 // ============================================================================
 // Constants
