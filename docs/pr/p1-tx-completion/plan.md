@@ -1,7 +1,30 @@
 # P1: extract cos/tx_completion.rs from tx.rs
 
-Plan v4 — 2026-04-30. First PR after #956's 8-phase cos/ submodule
+Plan v5 — 2026-04-30. First PR after #956's 8-phase cos/ submodule
 decomposition merged at PR #983.
+
+## v5 changelog vs v4 (from Codex round-4)
+
+- R4-MA: stale back-edge wording at the bottom of the "Back-edges
+  remaining" section (was "P1 does NOT claim 'every back-edge resolved'
+  — only 'every back-edge introduced by #956 Phases 6/7/8 closed.'")
+  was contradicting the Goal section's narrowed claim. Fixed to
+  reference the Phase 6 + TX-completion-subset-of-Phase-7 scope
+  consistently.
+- R4-MB: move count corrected from "19 fns + 2 constants" to
+  "17 fns + 2 constants" (matching the actual table rows: 12 timer
+  wheel = 10 fns + 2 const, 7 TX-completion = 7 fns).
+- R4-MC: file-private count corrected from "5 fns + 1 const" to
+  "4 fns + 1 const". `wake_cos_queue` caller-evidence citation
+  corrected — sole call site is tx.rs:1419 (the line 1305 reference
+  was actually inside `wake_cos_queue`'s own body).
+- R4-MD: atomic-ordering paragraph rewritten to mention the indirect
+  Acquire/AcqRel chain via `shared_*_lease.consume()` calls
+  (types.rs:1669-1679). The direct Ordering::Relaxed claim still
+  holds for the moved-body imports.
+- R4-ME: Files-touched bullet for `cos/queue_service.rs` now
+  explicitly instructs the implementor to update the now-stale
+  "back-edges to tx.rs" header comment at lines 23-29.
 
 ## v4 changelog vs v3 (from Codex round-3)
 
@@ -101,7 +124,7 @@ Remaining (NOT in P1 scope):
 
 All deferred to #984 (afxdp/tx/ split).
 
-## Move list (19 fns + 2 constants)
+## Move list (17 fns + 2 constants)
 
 ### Timer wheel cluster (~150 LOC)
 
@@ -163,14 +186,16 @@ Functions (13):
   `pub(in crate::afxdp)` purely for the test-only and (post-move)
   intra-cluster reach via `cos/mod.rs` re-export.
 
-File-private (5 fns + 1 const) — only callers are co-located in the
+File-private (4 fns + 1 const) — only callers are co-located in the
 move set:
-- `wake_cos_queue` (tx.rs:1305 inside cos_tick_for_ns area, 1419 inside
-  wake_due_cos_timer_slot — both moving).
-- `rearm_cos_queue` (tx.rs:1396 inside cascade, 1422 inside wake_due —
-  both moving).
-- `cascade_cos_timer_wheel_level1` (tx.rs:1375 inside advance_cos_timer_wheel).
-- `wake_due_cos_timer_slot` (tx.rs:1377 inside advance_cos_timer_wheel).
+- `wake_cos_queue` (sole caller tx.rs:1419 inside `wake_due_cos_timer_slot`,
+  which is moving).
+- `rearm_cos_queue` (callers tx.rs:1396 inside cascade and 1422 inside
+  wake_due — both moving).
+- `cascade_cos_timer_wheel_level1` (sole caller tx.rs:1375 inside
+  `advance_cos_timer_wheel`, which is moving).
+- `wake_due_cos_timer_slot` (sole caller tx.rs:1377 inside
+  `advance_cos_timer_wheel`, which is moving).
 - `COS_TIMER_WHEEL_L0_HORIZON_TICKS`.
 
 `COS_TIMER_WHEEL_L0_SLOTS` / `_L1_SLOTS` (referenced by
@@ -375,8 +400,17 @@ are:
 `cos/cross_binding.rs:30`:
 - `recycle_prepared_immediately` (tx.rs:2375)
 
-P1 does NOT claim "every back-edge resolved" — only "every back-edge
-introduced by #956 Phases 6/7/8 closed."
+P1's narrowed scope (matching the Goal section above): closes the
+**Phase 6 builder edge** AND the **TX-completion / timer-wheel subset
+of Phase 7 deferrals**. The remaining Phase 7 XSK-ring helpers and
+Phase 8's `cross_binding -> tx::recycle_prepared_immediately` stay in
+tx.rs, deferred to #984. P1 does NOT claim "every Phase 6/7/8
+back-edge closed" — that was a v3 wording error corrected in v4.
+
+The implementor should also update the now-stale TX-completion
+back-edge commentary in `cos/queue_service.rs:23-29` (which describes
+the moved symbols as "back-edges to tx.rs") to reflect their new
+location in `cos/tx_completion.rs`.
 
 ## Files touched
 
@@ -384,7 +418,10 @@ introduced by #956 Phases 6/7/8 closed."
   (~600 moved + ~50 lines header/imports/notes).
 - `userspace-dp/src/afxdp/cos/mod.rs`: register module + re-exports.
 - `userspace-dp/src/afxdp/cos/queue_service.rs`: split tx import block
-  (10 symbols → super::tx_completion::, 8 stay on crate::afxdp::tx).
+  (10 symbols → super::tx_completion::, 8 stay on crate::afxdp::tx);
+  update the now-stale "back-edges to tx.rs" header comment at lines
+  23-29 to reflect that the TX-completion/timer-wheel symbols moved
+  to `cos/tx_completion.rs`.
 - `userspace-dp/src/afxdp/cos/builders.rs`: switch single
   `cos_tick_for_ns` import; update comment block.
 - `userspace-dp/src/afxdp/tx.rs`: −600 LOC; one always-on cos:: import,
@@ -411,13 +448,20 @@ block in tx.rs. The cos/mod.rs re-export chain backs that import.
   hit the slow path when timer slots have queued queues. No per-byte
   overhead concern.
 
-Atomic ordering: the moved bodies only touch existing
-`Ordering::Relaxed` counters via `fetch_add` (drain_sent_bytes,
-sent_packets, etc.). They do NOT call `publish_committed_queue_vtime`
-— that callsite stays in `cos/queue_service.rs:770/920/1076/1229`
-which is NOT moving. The Release/Acquire publish boundary is
-unchanged by P1. `Ordering::Relaxed` is the only ordering symbol used
-inside tx_completion.rs.
+Atomic ordering: direct atomic ops inside the moved bodies are all
+`Ordering::Relaxed` `fetch_add`s on per-byte / per-packet counters
+(drain_sent_bytes, sent_packets, etc.). They do NOT call
+`publish_committed_queue_vtime` — that callsite stays in
+`cos/queue_service.rs:770/920/1076/1229` which is NOT moving, so the
+Release/Acquire publish boundary is unchanged by P1.
+
+Indirect ordering: the apply bodies call `shared_root_lease.consume(...)`
+and `shared_queue_lease.consume(...)` at tx.rs:1170/1178/2205/2214/
+2270/2279. Those `consume` impls (afxdp/types.rs:1669-1679) use
+`Ordering::Acquire` / `Ordering::AcqRel` internally. P1 does not
+change those orderings — the move just relocates the call site, not
+the lease implementation. Only `Ordering::Relaxed` is named directly
+in the moved bodies, hence the import.
 
 After this PR, every `pub(in crate::afxdp)` visibility bump from
 Phases 6/7/8 except those tied to XSK-ring helpers (#984 scope) is
