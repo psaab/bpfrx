@@ -770,7 +770,7 @@ pub(in crate::afxdp) fn cos_queue_v_min_consume_suspension(queue: &mut CoSQueueR
 /// hard-cap not yet reached.
 #[inline]
 pub(in crate::afxdp) fn cos_queue_v_min_continue(queue: &mut CoSQueueRuntime, pop_count: u32) -> bool {
-    if pop_count != 1 && pop_count.is_multiple_of(V_MIN_READ_CADENCE) == false {
+    if pop_count != 1 && !pop_count.is_multiple_of(V_MIN_READ_CADENCE) {
         return true;
     }
     // #917 Codex Q8: V_min sync only applies to shared_exact
