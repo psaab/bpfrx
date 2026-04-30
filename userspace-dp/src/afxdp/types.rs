@@ -2098,7 +2098,7 @@ pub(super) struct LearnedNeighborKey {
 }
 
 #[derive(Clone, Debug)]
-pub(super) enum WorkerCommand {
+pub(in crate::afxdp) enum WorkerCommand {
     UpsertSynced(SyncedSessionEntry),
     UpsertLocal(SyncedSessionEntry),
     DeleteSynced(SessionKey),

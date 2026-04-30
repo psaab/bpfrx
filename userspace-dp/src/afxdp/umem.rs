@@ -1760,7 +1760,7 @@ mod tests {
 }
 
 /// Raw ring state: (rxP, rxC, frP, frC, txP, txC, crP, crC)
-pub(super) struct BindingLiveState {
+pub(in crate::afxdp) struct BindingLiveState {
     pub(super) bound: AtomicBool,
     pub(super) xsk_registered: AtomicBool,
     pub(super) bind_mode: AtomicU8,
