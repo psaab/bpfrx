@@ -1,7 +1,27 @@
 # #956 Phase 6: extract cos/builders.rs from tx.rs
 
-Plan v2 — 2026-04-30. Continues #956 (cos/ submodule decomposition).
+Plan v3 — 2026-04-30. Continues #956 (cos/ submodule decomposition).
 Phases 1-5 merged at PRs #976-#980.
+
+Round-2 changelog (v2 → v3): Codex round-2 returned PLAN-NEEDS-MAJOR
+with 3 concrete fixes; Gemini round-2 returned PLAN-READY (accepting
+the narrow approach):
+
+- Codex #1 (#[inline]): v2 wrongly claimed both moved fns are
+  bring-up-only. `ensure_cos_interface_runtime` sits on the
+  steady-state enqueue path (callers at tx.rs:3948/4077/4298/4308)
+  and already carries `#[inline]`. The move must preserve it. v3
+  flips the inline note.
+- Codex #2 (imports incomplete): the planned cos/builders.rs
+  import block missed `BindingWorker`, `ForwardingState`,
+  `FlowRrRing`, `CoSTimerWheelRuntime`, `CoSQueueDropCounters`,
+  `CoSQueueOwnerProfile`, `COS_PRIORITY_LEVELS`,
+  `COS_FLOW_FAIR_BUCKETS`, `TX_BATCH_SIZE`, `VecDeque`. Listed
+  `WorkerCoSInterfaceFastPath` was unused. v3 has the complete
+  surface.
+- Codex #3 (Risk-section contradiction): v2's Risk text said "No
+  new back-edges" while the import discussion documented the
+  `cos_tick_for_ns` back-edge two paragraphs earlier. v3 reworded.
 
 Round-1 changelog (v1 → v2): Codex round-1 returned PLAN-NEEDS-MAJOR
 ("scope too broad — narrow to interface-runtime") and Gemini round-1
@@ -71,23 +91,31 @@ the flow-fair path." Nothing else.
 | `ensure_cos_interface_runtime` | 4299 | private | tx.rs:3948, 4077 | none |
 | `build_cos_interface_runtime` | 4339 | private | called by `ensure_cos_interface_runtime` (moving) at tx.rs:4324; production caller list contains only that one site | tx.rs:5972 / 9124 / 9169 (`#[cfg(test)] mod tests` at tx.rs:5425) |
 
-**Imports needed in cos/builders.rs**:
+**Imports needed in cos/builders.rs** (Codex round-2 verified the
+full surface — v2's list was incomplete):
 
 ```rust
+use std::collections::VecDeque;
+
 use crate::afxdp::types::{
-    CoSInterfaceConfig, CoSInterfaceRuntime, CoSQueueRuntime,
-    WorkerCoSInterfaceFastPath,
+    BindingWorker, CoSInterfaceConfig, CoSInterfaceRuntime,
+    CoSQueueDropCounters, CoSQueueOwnerProfile, CoSQueueRuntime,
+    CoSTimerWheelRuntime, FlowRrRing, ForwardingState,
+    COS_FLOW_FAIR_BUCKETS, COS_PRIORITY_LEVELS, TX_BATCH_SIZE,
 };
 use super::admission::apply_cos_queue_flow_fair_promotion;
-// build_cos_interface_runtime currently calls cos_tick_for_ns;
-// after the move it imports from crate::afxdp::tx
-// (parent-module-internal helper, stays in tx.rs through the
-// drain-scheduler phase).
+// build_cos_interface_runtime calls cos_tick_for_ns. The helper
+// stays in tx.rs through the drain-scheduler phase; this PR bumps
+// its visibility to pub(in crate::afxdp) so cos/builders.rs can
+// reach it. ONE explicit back-edge from cos -> tx, documented
+// as drain-scheduler-phase forward-debt — same shape Phase 3
+// originally had with COS_MIN_BURST_BYTES (which Phase 4 then
+// resolved by relocating the constant).
 use crate::afxdp::tx::cos_tick_for_ns;
 ```
 
-(Codex round-1 will verify the exact import set — `cos_tick_for_ns`
-visibility may need bumping if it's currently private.)
+`WorkerCoSInterfaceFastPath` was in v2's import list but is NOT
+referenced by either moving fn (Codex round-2 catch). Removed.
 
 ## Approach
 
@@ -99,8 +127,14 @@ Visibility:
   (3 direct `tx::tests` callers; production caller is
   `ensure_cos_interface_runtime`, also moving).
 
-`#[inline]`: not warranted on either fn — both fire once per
-interface bring-up, not on the per-byte path.
+`#[inline]` (Codex round-2 #1 corrected v2's wrong claim):
+`ensure_cos_interface_runtime` is NOT bring-up-only. It sits on
+the steady-state enqueue path — production callers at tx.rs:3948,
+4077, 4298, 4308 — and already carries `#[inline]` in source.
+The move MUST preserve that attribute (per the Phase 4/5 hot-path
+inline lesson). `build_cos_interface_runtime` is a one-shot
+constructor and stays without `#[inline]` (matches its current
+state in tx.rs).
 
 `tx.rs` import additions:
 ```rust
@@ -133,9 +167,14 @@ through the cfg-gated re-export.
 ## Risk
 
 **Low.** Smallest move yet (~100 LOC vs 600-800 in earlier
-phases). Clean dependency graph: `cos/builders.rs` →
+phases). Forward dependencies clean: `cos/builders.rs` →
 `cos/admission.rs` → `cos/queue_ops.rs` → `cos/flow_hash.rs`
-+ `cos/token_bucket.rs`. No new back-edges.
++ `cos/token_bucket.rs`. ONE back-edge introduced
+(`cos/builders -> tx::cos_tick_for_ns`), documented above as
+drain-scheduler-phase forward-debt. Codex round-2 caught the
+earlier "No new back-edges" wording in this section — it
+contradicted the back-edge already documented in the import
+discussion. Corrected.
 
 The deferral of `build_cos_batch_from_queue`, `apply_cos_*_result`,
 and `prime_cos_root_for_service` to later phases is documented
