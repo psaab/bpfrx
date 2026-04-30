@@ -1,9 +1,19 @@
 # #956 Phase 4: extract cos/token_bucket.rs from tx.rs
 
-Plan v5 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
+Plan v6 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
 Phase 1 (cos/ecn.rs) shipped at PR #976; Phase 2 (cos/flow_hash.rs)
 at PR #977; Phase 3 (cos/admission.rs) at PR #978. Phase 4 = the
 token-bucket lease/refill subsystem.
+
+Round-5 changelog (v5 → v6): Codex round-5 returned PLAN-NEEDS-MINOR
+with one residual nit — the Tests-section "Three additional fns"
+bullet double-counted `maybe_top_up_cos_root_lease@6824` as both
+a direct-test call and a cfg-gated-only call. Reworded the Tests
+section to cleanly distinguish: 2 helpers reached by direct
+tx::tests bodies (root@6824, queue@6873), and the cfg-gated legacy
+selector at tx.rs:1625 reaches a third helper (`refill_cos_tokens`
+at tx.rs:1651) plus duplicates the queue helper at tx.rs:1643.
+`maybe_top_up_cos_root_lease` is reached only by the direct test.
 
 Round-4 changelog (v4 → v5): Codex round-4 returned PLAN-NEEDS-MINOR
 flagging that 3 of the 8 round-3 nits were called out in changelogs
@@ -239,13 +249,18 @@ No new tests required — pure structural refactor. Existing tests in
   `tx_frame_capacity().max(COS_MIN_BURST_BYTES)` — wrong direction.
 - `maybe_top_up_cos_queue_lease` at tx.rs:6873 (queue-lease grant
   vs queue.tokens prerequisite)
-- Three additional fns have test-only call sites that the refactor
-  must keep reachable: `refill_cos_tokens` at tx.rs:1651,
-  `maybe_top_up_cos_queue_lease` at tx.rs:1643, and
-  `maybe_top_up_cos_root_lease` at tx.rs:6824. (Codex round-3 #8
-  flagged the earlier "tests call 2" wording — direct
-  `tx::tests` calls happen to two helpers but #[cfg(test)] -gated
-  call sites cover three.)
+- Additionally, the `#[cfg(test)]` legacy selector at tx.rs:1625-1626
+  (`select_cos_guarantee_batch_with_fast_path`) reaches a third
+  helper that the direct test calls above don't touch:
+  `refill_cos_tokens` at tx.rs:1651. Plus a duplicate-coverage
+  call to `maybe_top_up_cos_queue_lease` at tx.rs:1643 (already
+  exercised at tx.rs:6873). The refactor must keep all three
+  helpers reachable from cfg-gated code, not just the two
+  exercised by direct tx::tests bodies. (Codex round-3 #8 +
+  round-5 follow-up: the round-5 review caught a double-count of
+  `maybe_top_up_cos_root_lease` here — that helper is reached
+  ONLY by the direct test at tx.rs:6824 above, not by the
+  cfg-gated selector.)
 
 Both tests will continue to compile after the move because both fns
 become `pub(in crate::afxdp)` and are reachable via
