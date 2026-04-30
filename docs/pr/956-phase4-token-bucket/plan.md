@@ -1,9 +1,34 @@
 # #956 Phase 4: extract cos/token_bucket.rs from tx.rs
 
-Plan v6 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
+Plan v7 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
 Phase 1 (cos/ecn.rs) shipped at PR #976; Phase 2 (cos/flow_hash.rs)
 at PR #977; Phase 3 (cos/admission.rs) at PR #978. Phase 4 = the
 token-bucket lease/refill subsystem.
+
+Gemini round-1 changelog (v6 → v7): Codex returned PLAN-READY at v6;
+Gemini's adversarial pass returned PLAN-NEEDS-MINOR with 3 systems-
+level findings:
+
+- G1-1 (hot-path inline): Phase 2 + Phase 3 hot-path moves DID add
+  `#[inline]` (e.g. `cos_flow_aware_buffer_limit`,
+  `apply_cos_admission_ecn_policy`). v6 had dropped the inline
+  claim because the existing tx.rs versions had no `#[inline]` —
+  but the established pattern is to ADD `#[inline]` on hot-path
+  moves so cross-module inlining doesn't depend on compiler
+  heuristics. v7 commits implementation to add `#[inline]` to the
+  3 per-byte helpers (`maybe_top_up_cos_root_lease`,
+  `maybe_top_up_cos_queue_lease`, `refill_cos_tokens`); the other
+  4 fns are off the per-byte path and stay un-attributed.
+- G1-2 (timer-wheel scope): `cos_tick_for_ns` is "tightly
+  coupled" to `cos_refill_ns_until` via `calc_cos_wake_ns`.
+  Documented why this Phase 4 keeps the timer-wheel arithmetic
+  in tx.rs (it depends on `COS_TIMER_WHEEL_TICK_NS` etc., which
+  belong with the drain-scheduler extraction).
+- G1-3 (umbrella divergence): the original #956 umbrella plan
+  listed 8 fns for Phase 4 (added timer-wheel + quantum helpers).
+  This Phase 4 trims to the 7 lease/refill helpers; the 4
+  deferred fns will move with the drain-scheduler phase. Section
+  "Scope vs the umbrella plan" added under Goal.
 
 Round-5 changelog (v5 → v6): Codex round-5 returned PLAN-NEEDS-MINOR
 with one residual nit — the Tests-section "Three additional fns"
@@ -117,6 +142,45 @@ Resolve the Phase 3 forward-debt where admission.rs imports
 `COS_MIN_BURST_BYTES` from tx.rs (admission → tx edge); after Phase 4
 both admission.rs and tx.rs import the constant from cos/, so the
 back-reference is gone.
+
+### Scope vs the umbrella plan (Gemini round-1 #2/#3)
+
+The original #956 umbrella plan
+(`docs/pr/956-tx-decomposition/plan.md:482-486`) listed 8 fns for
+Phase 4: the 4 lease/refill helpers in this scope, plus
+`cos_tick_for_ns`, `cos_timer_wheel_level_and_slot`,
+`cos_surplus_quantum_bytes`, and `cos_guarantee_quantum_bytes`.
+
+This plan deliberately deviates and defers the 4 timer-wheel /
+quantum helpers to a future "drain scheduler" extraction (a
+separate phase, likely between current Phase 6 and Phase 7).
+Rationale (post-Codex round-1 + Gemini round-1 review):
+
+- `cos_tick_for_ns` is pure ns→tick arithmetic over
+  `COS_TIMER_WHEEL_TICK_NS`, and `cos_timer_wheel_level_and_slot`
+  depends on `COS_TIMER_WHEEL_L0_HORIZON_TICKS` /
+  `COS_TIMER_WHEEL_L0_SLOTS`. Moving them forces either moving
+  the timer-wheel constants too (scope creep into types.rs) or
+  adding back-references. The constants belong with
+  `park_cos_queue` / `advance_cos_timer_wheel`, which are the
+  drain-scheduler entry points.
+- `cos_guarantee_quantum_bytes` and `cos_surplus_quantum_bytes`
+  consume `COS_GUARANTEE_VISIT_NS`,
+  `COS_GUARANTEE_QUANTUM_MIN/MAX_BYTES`, and
+  `COS_SURPLUS_ROUND_QUANTUM_BYTES` — also drain-scheduler-side.
+- Gemini round-1 #2 noted `cos_refill_ns_until` is "tightly
+  coupled" to `cos_tick_for_ns` via `calc_cos_wake_ns`. True at
+  the call site, but the coupling is one-directional:
+  `calc_cos_wake_ns` consumes both, and after the move
+  `calc_cos_wake_ns` (which stays in tx.rs through Phase 4)
+  imports `cos_refill_ns_until` from cos/ and reaches
+  `cos_tick_for_ns` locally. That's no worse than the existing
+  `tx_frame_capacity()` parent-module reach.
+
+If the drain-scheduler phase later finds it cleaner to bundle
+`cos_refill_ns_until` with the timer-wheel helpers, that's a
+small relocation between cos/* sub-modules — within scope of
+the multi-phase plan.
 
 ## Investigation findings (Claude, on commit 1cb07118)
 
@@ -302,14 +366,23 @@ touches the hot-path enqueue/refill loop — every TX byte goes through
   tx.rs:3558 (which itself moves to token_bucket.rs and stays
   intra-file). The third syntactic site at tx.rs:1651 is inside a
   `#[cfg(test)]` legacy-selector fn, so it's not part of the
-  production hot path. **Implementation note** (Codex round-3 #2):
-  the source definitions at tx.rs:3511, 3533, 3582 do NOT currently
-  carry an `#[inline]` attribute — they rely on the compiler's
-  cross-module inlining via `pub(in crate::afxdp)` visibility, the
-  same pattern Phases 2+3 validated. The implementation should
-  reproduce them unchanged (no `#[inline]` added or removed). If a
-  post-merge perf regression points at a missing inline, that's a
-  follow-up rather than a Phase-4-blocking decision.
+  production hot path. **Implementation note** (Gemini round-1 #1
+  superseding Codex round-3 #2): Gemini correctly observed that
+  Phase 2 + Phase 3 hot-path moves DID add `#[inline]` (e.g.
+  `cos_flow_aware_buffer_limit`, `apply_cos_admission_ecn_policy`,
+  `cos_flow_bucket_index`). The source definitions at tx.rs:3511,
+  3533, 3582 lack `#[inline]` today, but the established Phase 2+3
+  pattern is to ADD `#[inline]` on the hot-path move so cross-module
+  inlining doesn't depend on compiler heuristics. Phase 4
+  implementation will add `#[inline]` to:
+  - `maybe_top_up_cos_root_lease`
+  - `maybe_top_up_cos_queue_lease`
+  - `refill_cos_tokens`
+  The other 4 helpers (`cos_refill_ns_until`, `release_cos_root_lease`,
+  `release_all_cos_root_leases`, `release_all_cos_queue_leases`) are
+  off the per-byte hot path — they fire at most once per drain loop
+  or once per binding shutdown, so the existing
+  no-`#[inline]` shape stays.
 - **worker.rs import migration.** worker.rs picks up the release
   helpers via a module-level `use super::*` glob at worker.rs:1
   (with afxdp.rs:149 glob-importing tx — Codex round-1 R1-4
