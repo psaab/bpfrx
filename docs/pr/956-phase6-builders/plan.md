@@ -1,7 +1,23 @@
 # #956 Phase 6: extract cos/builders.rs from tx.rs
 
-Plan v3 — 2026-04-30. Continues #956 (cos/ submodule decomposition).
+Plan v4 — 2026-04-30. Continues #956 (cos/ submodule decomposition).
 Phases 1-5 merged at PRs #976-#980.
+
+Round-3 changelog (v3 → v4): Codex round-3 returned PLAN-NEEDS-MAJOR
+with 3 import-correctness fixes:
+- #1 `BindingWorker` lives in `worker.rs` (re-exported at the
+  afxdp root), not in `types`. `TX_BATCH_SIZE` is a root const in
+  `afxdp.rs`, not in `types`. Both import lines split out.
+- #2 `COS_MIN_BURST_BYTES` is consumed at tx.rs:4348/4375/4380
+  inside `build_cos_interface_runtime`'s body — was missing from
+  the import surface. Added via `super::COS_MIN_BURST_BYTES`
+  (cos/mod.rs re-export from token_bucket).
+- #3 `apply_cos_queue_flow_fair_promotion`'s production caller
+  is `ensure_cos_interface_runtime` itself (moving). After the
+  move the only direct callers of this fn in tx.rs are in
+  `tx::tests`. cos/mod.rs must therefore relocate the re-export
+  from always-on to cfg-gated, mirroring the Phase 4 unused-
+  import cleanup at commits 0952a8a4 / 4276eac0.
 
 Round-2 changelog (v2 → v3): Codex round-2 returned PLAN-NEEDS-MAJOR
 with 3 concrete fixes; Gemini round-2 returned PLAN-READY (accepting
@@ -98,12 +114,22 @@ full surface — v2's list was incomplete):
 use std::collections::VecDeque;
 
 use crate::afxdp::types::{
-    BindingWorker, CoSInterfaceConfig, CoSInterfaceRuntime,
-    CoSQueueDropCounters, CoSQueueOwnerProfile, CoSQueueRuntime,
-    CoSTimerWheelRuntime, FlowRrRing, ForwardingState,
-    COS_FLOW_FAIR_BUCKETS, COS_PRIORITY_LEVELS, TX_BATCH_SIZE,
+    CoSInterfaceConfig, CoSInterfaceRuntime, CoSQueueDropCounters,
+    CoSQueueOwnerProfile, CoSQueueRuntime, CoSTimerWheelRuntime,
+    FlowRrRing, ForwardingState, COS_FLOW_FAIR_BUCKETS,
+    COS_PRIORITY_LEVELS,
 };
+use crate::afxdp::worker::BindingWorker;  // not in types — Phase 4
+                                          // pattern: pub(crate) struct
+                                          // lives in worker.rs.
+use crate::afxdp::TX_BATCH_SIZE;          // root const in afxdp.rs,
+                                          // not types — Codex round-3 #1.
 use super::admission::apply_cos_queue_flow_fair_promotion;
+use super::COS_MIN_BURST_BYTES;           // build_cos_interface_runtime
+                                          // body uses it at tx.rs:4348/
+                                          // 4375/4380 — Codex round-3 #2.
+                                          // Reaches via cos/mod.rs
+                                          // re-export from token_bucket.
 // build_cos_interface_runtime calls cos_tick_for_ns. The helper
 // stays in tx.rs through the drain-scheduler phase; this PR bumps
 // its visibility to pub(in crate::afxdp) so cos/builders.rs can
@@ -116,6 +142,16 @@ use crate::afxdp::tx::cos_tick_for_ns;
 
 `WorkerCoSInterfaceFastPath` was in v2's import list but is NOT
 referenced by either moving fn (Codex round-2 catch). Removed.
+
+`apply_cos_queue_flow_fair_promotion` is consumed inside the moved
+`ensure_cos_interface_runtime` body (tx.rs:4326). After the move,
+the only remaining direct callers in `tx.rs` are inside `tx::tests`
+(14446, 14505, 14555, 14564, 14616). cos/mod.rs must therefore
+relocate this re-export from the always-on block to the cfg-gated
+`#[cfg(test)] pub(super) use` block (Codex round-3 #3 — without
+this, the always-on re-export is unused in non-test builds and
+trips a Phase-6-introduced unused-import warning the same way
+Phase 4 commits 0952a8a4 / 4276eac0 had to clean up).
 
 ## Approach
 
