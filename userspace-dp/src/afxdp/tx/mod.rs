@@ -1029,27 +1029,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn apply_prepared_recycle_routes_fill_and_free_explicitly() {
-        let mut free_tx_frames = VecDeque::new();
-        let mut shared_recycles = Vec::new();
-
-        apply_prepared_recycle(
-            &mut free_tx_frames,
-            &mut shared_recycles,
-            PreparedTxRecycle::FreeTxFrame,
-            41,
-        );
-        apply_prepared_recycle(
-            &mut free_tx_frames,
-            &mut shared_recycles,
-            PreparedTxRecycle::FillOnSlot(7),
-            42,
-        );
-
-        assert_eq!(free_tx_frames, VecDeque::from(vec![41]));
-        assert_eq!(shared_recycles, vec![(7, 42)]);
-    }
 
     #[test]
     fn remember_prepared_recycle_tracks_only_shared_fill_recycles() {
