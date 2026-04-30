@@ -195,7 +195,7 @@ pub(in crate::afxdp) fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, 
     binding.empty_rx_polls = 0;
 }
 
-pub(super) fn apply_prepared_recycle(
+fn apply_prepared_recycle(
     free_tx_frames: &mut VecDeque<u64>,
     shared_recycles: &mut Vec<(u32, u64)>,
     recycle: PreparedTxRecycle,
@@ -324,7 +324,6 @@ pub(in crate::afxdp) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::afxdp::tx::test_support::*;
 
     #[test]
     fn apply_prepared_recycle_routes_fill_and_free_explicitly() {

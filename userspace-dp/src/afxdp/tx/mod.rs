@@ -24,8 +24,6 @@ pub(in crate::afxdp) use stats::{record_kick_latency, record_tx_completions_with
 pub(super) mod rings;
 pub(in crate::afxdp) use rings::{maybe_wake_tx, reap_tx_completions};
 pub(super) use rings::{drain_pending_fill, maybe_wake_rx};
-#[cfg(test)]
-use rings::apply_prepared_recycle;
 
 // #984 P2c: TX-ring submit + per-frame recycle cluster (transmit_batch,
 // transmit_prepared_queue, recycle_*, TxError) extracted to sibling
