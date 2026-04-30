@@ -3463,13 +3463,6 @@ fn cos_batch_tx_made_progress(result: Result<(u64, u64), TxError>) -> bool {
 }
 
 const COS_TIMER_WHEEL_TICK_NS: u64 = 50_000;
-// #956 Phase 3: visibility bumped from private so cos/admission.rs
-// can reach it via `use crate::afxdp::tx::COS_MIN_BURST_BYTES`.
-// Constant has 91 occurrences across tx.rs (only 1 in admission),
-// so leaving it here is the smaller-risk move. Phase 4 / 5 will
-// consolidate to types.rs or cos/mod.rs once token_bucket.rs and
-// queue_ops.rs land.
-pub(in crate::afxdp) const COS_MIN_BURST_BYTES: u64 = 64 * 1500;
 const COS_GUARANTEE_VISIT_NS: u64 = 200_000;
 const COS_GUARANTEE_QUANTUM_MIN_BYTES: u64 = 1500;
 const COS_GUARANTEE_QUANTUM_MAX_BYTES: u64 = 512 * 1024;
@@ -3480,15 +3473,16 @@ const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 //
 // Phase 1 (PR #976) extracted ECN marking into cos/ecn.rs.
 // Phase 2 (PR #977) extracted the flow-hash helpers into
-// cos/flow_hash.rs. Phase 3 (this PR) extracts admission policy +
-// flow-fair promotion into cos/admission.rs. The threshold
-// constants `COS_ECN_MARK_THRESHOLD_NUM/_DEN`,
-// `COS_FLOW_FAIR_MIN_SHARE_BYTES`, and
-// `COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS` moved with admission.
+// cos/flow_hash.rs. Phase 3 (PR #978) extracted admission policy +
+// flow-fair promotion into cos/admission.rs. Phase 4 (this PR)
+// extracts token-bucket lease/refill into cos/token_bucket.rs and
+// brings `COS_MIN_BURST_BYTES` along (it now lives in token_bucket
+// rather than tx, eliminating the Phase-3 admission -> tx
+// back-edge for that constant).
 //
 // Production code uses the entry points re-exported from
 // cos/mod.rs (marker fns + flow-hash + admission gates +
-// flow-fair promotion entry).
+// flow-fair promotion entry + token-bucket helpers).
 // The codepoint masks + ECN parser + per-family ECN helpers are
 // referenced only by `tx::tests` (admission tests + ECN unit
 // tests that stay here for Phase 1). Their imports are gated
@@ -3497,7 +3491,8 @@ const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 use super::cos::{
     apply_cos_admission_ecn_policy, apply_cos_queue_flow_fair_promotion,
     cos_flow_aware_buffer_limit, cos_flow_bucket_index, cos_item_flow_key,
-    cos_queue_flow_share_limit,
+    cos_queue_flow_share_limit, cos_refill_ns_until, maybe_top_up_cos_queue_lease,
+    maybe_top_up_cos_root_lease, refill_cos_tokens, release_cos_root_lease, COS_MIN_BURST_BYTES,
 };
 #[cfg(test)]
 use super::cos::ecn::{ethernet_l3, mark_ecn_ce_ipv4, mark_ecn_ce_ipv6, EthernetL3};
@@ -3507,104 +3502,6 @@ use super::cos::{
     maybe_mark_ecn_ce, COS_ECN_MARK_THRESHOLD_DEN, COS_ECN_MARK_THRESHOLD_NUM,
     COS_FLOW_FAIR_MIN_SHARE_BYTES, ECN_CE, ECN_ECT_0, ECN_ECT_1, ECN_MASK, ECN_NOT_ECT,
 };
-
-fn maybe_top_up_cos_root_lease(
-    root: &mut CoSInterfaceRuntime,
-    shared_root_lease: &SharedCoSRootLease,
-    now_ns: u64,
-) {
-    // Ensure the target is at least tx_frame_capacity() so that a maximum-sized frame
-    // can always become eligible.  shared_root_lease already sizes max_total_leased using
-    // lease_bytes.max(tx_frame_capacity()), so the shared pool can always satisfy this.
-    let lease_bytes = shared_root_lease
-        .lease_bytes()
-        .max(tx_frame_capacity() as u64)
-        .min(root.burst_bytes.max(COS_MIN_BURST_BYTES));
-    if root.tokens >= lease_bytes {
-        return;
-    }
-    let grant = shared_root_lease.acquire(now_ns, lease_bytes.saturating_sub(root.tokens));
-    root.tokens = root
-        .tokens
-        .saturating_add(grant)
-        .min(root.burst_bytes.max(COS_MIN_BURST_BYTES));
-}
-
-fn maybe_top_up_cos_queue_lease(
-    queue: &mut CoSQueueRuntime,
-    shared_queue_lease: Option<&Arc<SharedCoSQueueLease>>,
-    now_ns: u64,
-) {
-    if queue.exact {
-        let Some(shared_queue_lease) = shared_queue_lease else {
-            return;
-        };
-        let lease_bytes = shared_queue_lease
-            .lease_bytes()
-            .max(tx_frame_capacity() as u64)
-            .min(queue.buffer_bytes.max(COS_MIN_BURST_BYTES));
-        if queue.tokens >= lease_bytes {
-            return;
-        }
-        let grant = shared_queue_lease.acquire(now_ns, lease_bytes.saturating_sub(queue.tokens));
-        queue.tokens = queue
-            .tokens
-            .saturating_add(grant)
-            .min(queue.buffer_bytes.max(COS_MIN_BURST_BYTES));
-        queue.last_refill_ns = now_ns;
-        return;
-    }
-    let Some(shared_queue_lease) = shared_queue_lease else {
-        refill_cos_tokens(
-            &mut queue.tokens,
-            queue.transmit_rate_bytes,
-            queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
-            &mut queue.last_refill_ns,
-            now_ns,
-        );
-        return;
-    };
-    let lease_bytes = shared_queue_lease
-        .lease_bytes()
-        .max(tx_frame_capacity() as u64)
-        .min(queue.buffer_bytes.max(COS_MIN_BURST_BYTES));
-    if queue.tokens >= lease_bytes {
-        return;
-    }
-    let grant = shared_queue_lease.acquire(now_ns, lease_bytes.saturating_sub(queue.tokens));
-    queue.tokens = queue
-        .tokens
-        .saturating_add(grant)
-        .min(queue.buffer_bytes.max(COS_MIN_BURST_BYTES));
-    queue.last_refill_ns = now_ns;
-}
-
-fn refill_cos_tokens(
-    tokens: &mut u64,
-    rate_bytes_per_sec: u64,
-    burst_bytes: u64,
-    last_refill_ns: &mut u64,
-    now_ns: u64,
-) {
-    if burst_bytes == 0 {
-        return;
-    }
-    if *last_refill_ns == 0 {
-        *tokens = burst_bytes;
-        *last_refill_ns = now_ns;
-        return;
-    }
-    if now_ns <= *last_refill_ns || rate_bytes_per_sec == 0 {
-        return;
-    }
-    let elapsed_ns = now_ns - *last_refill_ns;
-    let added = ((elapsed_ns as u128) * (rate_bytes_per_sec as u128) / 1_000_000_000u128) as u64;
-    if added == 0 {
-        return;
-    }
-    *tokens = tokens.saturating_add(added).min(burst_bytes);
-    *last_refill_ns = now_ns;
-}
 
 fn cos_tick_for_ns(now_ns: u64) -> u64 {
     now_ns / COS_TIMER_WHEEL_TICK_NS
@@ -3620,18 +3517,6 @@ fn cos_timer_wheel_level_and_slot(current_tick: u64, wake_tick: u64) -> (u8, usi
                 as usize,
         )
     }
-}
-
-fn cos_refill_ns_until(tokens: u64, need: u64, rate_bytes_per_sec: u64) -> Option<u64> {
-    if tokens >= need {
-        return Some(0);
-    }
-    if rate_bytes_per_sec == 0 {
-        return None;
-    }
-    let deficit = need.saturating_sub(tokens) as u128;
-    let rate = rate_bytes_per_sec as u128;
-    Some(deficit.saturating_mul(1_000_000_000u128).div_ceil(rate) as u64)
 }
 
 fn cos_surplus_quantum_bytes(queue: &CoSQueueRuntime) -> u64 {
@@ -5517,64 +5402,6 @@ fn refresh_cos_interface_activity(binding: &mut BindingWorker, root_ifindex: i32
             {
                 shared_queue_lease.release_unused(released);
             }
-        }
-    }
-}
-
-fn release_cos_root_lease(binding: &mut BindingWorker, root_ifindex: i32) {
-    let released = binding
-        .cos_interfaces
-        .get_mut(&root_ifindex)
-        .map(|root| core::mem::take(&mut root.tokens))
-        .unwrap_or(0);
-    if released == 0 {
-        return;
-    }
-    if let Some(shared_root_lease) = binding
-        .cos_fast_interfaces
-        .get(&root_ifindex)
-        .and_then(|iface_fast| iface_fast.shared_root_lease.as_ref())
-    {
-        shared_root_lease.release_unused(released);
-    }
-}
-
-pub(super) fn release_all_cos_root_leases(binding: &mut BindingWorker) {
-    let root_ifindexes = binding.cos_interfaces.keys().copied().collect::<Vec<_>>();
-    for root_ifindex in root_ifindexes {
-        release_cos_root_lease(binding, root_ifindex);
-    }
-}
-
-pub(super) fn release_all_cos_queue_leases(binding: &mut BindingWorker) {
-    let queue_keys = binding
-        .cos_interfaces
-        .iter()
-        .flat_map(|(&root_ifindex, root)| {
-            root.queues
-                .iter()
-                .enumerate()
-                .filter(|(_, queue)| queue.exact && queue.tokens > 0)
-                .map(move |(queue_idx, _)| (root_ifindex, queue_idx))
-        })
-        .collect::<Vec<_>>();
-    for (root_ifindex, queue_idx) in queue_keys {
-        let released = binding
-            .cos_interfaces
-            .get_mut(&root_ifindex)
-            .and_then(|root| root.queues.get_mut(queue_idx))
-            .map(|queue| core::mem::take(&mut queue.tokens))
-            .unwrap_or(0);
-        if released == 0 {
-            continue;
-        }
-        if let Some(shared_queue_lease) = binding
-            .cos_fast_interfaces
-            .get(&root_ifindex)
-            .and_then(|iface_fast| iface_fast.queue_fast_path.get(queue_idx))
-            .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref())
-        {
-            shared_queue_lease.release_unused(released);
         }
     }
 }

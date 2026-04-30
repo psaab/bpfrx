@@ -1,14 +1,16 @@
 // #956 cos/ submodule. Phase 1 extracted ECN marking; Phase 2
-// extracted flow-hashing helpers; Phase 3 (this commit) extracts
-// admission policy + flow-fair promotion. Subsequent phases:
-// Phase 4 token bucket, Phase 5 queue ops, Phase 6 builders,
-// Phase 7 queue service, Phase 8 cross-binding.
-// See docs/pr/956-phase3-admission/plan.md for the current phase
+// extracted flow-hashing helpers; Phase 3 extracted admission
+// policy + flow-fair promotion; Phase 4 (this commit) extracts
+// the token-bucket lease/refill subsystem. Subsequent phases:
+// Phase 5 queue ops, Phase 6 builders, Phase 7 queue service,
+// Phase 8 cross-binding.
+// See docs/pr/956-phase4-token-bucket/plan.md for the current phase
 // and docs/pr/956-tx-decomposition/plan.md for the full plan.
 
 pub(super) mod admission;
 pub(super) mod ecn;
 pub(super) mod flow_hash;
+pub(super) mod token_bucket;
 
 // Re-export the items consumed by sibling `tx.rs`. The items
 // themselves are `pub(in crate::afxdp)` in their source files;
@@ -22,6 +24,11 @@ pub(super) use admission::{
     cos_flow_aware_buffer_limit, cos_queue_flow_share_limit,
 };
 pub(super) use flow_hash::{cos_flow_bucket_index, cos_item_flow_key};
+pub(super) use token_bucket::{
+    cos_refill_ns_until, maybe_top_up_cos_queue_lease, maybe_top_up_cos_root_lease,
+    refill_cos_tokens, release_all_cos_queue_leases, release_all_cos_root_leases,
+    release_cos_root_lease, COS_MIN_BURST_BYTES,
+};
 
 #[cfg(test)]
 pub(super) use admission::{
