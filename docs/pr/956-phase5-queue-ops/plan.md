@@ -1,6 +1,40 @@
 # #956 Phase 5: extract cos/queue_ops.rs from tx.rs
 
-Plan v4 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
+Plan v5 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
+
+Round-4 changelog (v4 → v5): Codex round-4 returned PLAN-NEEDS-MAJOR
+(R3-2 + R3-5 still broken in stale text + 4 new defects). Gemini
+round-1 returned PLAN-READY in parallel — but the Codex findings
+are concrete, so v5 fixes them all:
+
+- Codex new #1: queue_ops.rs prelude imported `COS_FLOW_FAIR_BUCKET_MASK`
+  but the queue ops bodies use `cos_flow_bucket_index` (which lives
+  in cos/flow_hash.rs and consumes the constant internally). Removed
+  the unused-import-bait line.
+- Codex new #2: "3 file-private helpers" wording cited `account_*`
+  + `pop_front_inner`, but `account_*` are pub(in crate::afxdp)
+  with cfg-gated re-export — they're not file-private. Truly
+  file-private set is `cos_queue_pop_front_inner`,
+  `cos_queue_min_finish_bucket`, `compute_v_min_lag_threshold`,
+  and the 3 V_MIN_* constants. Rewritten.
+- Codex new #3: account-helper test sites in the Tests section
+  cited tx.rs:1654/1643 (which are inside
+  `maybe_top_up_cos_queue_lease`, not the account helpers).
+  Replaced with the actual 10 enqueue + 4 dequeue sites.
+- Codex new #4: `cos_queue_v_min_continue` table row included
+  16535/16541/16545 — those belong to
+  `cos_queue_v_min_consume_suspension`. Re-attributed.
+- R3-2 follow-up: stale "test-only fns (e.g.
+  cos_queue_min_finish_bucket if test-only)" wording in tx.rs
+  section + "may need cfg-gated re-export if no production
+  caller" in Risk section. Both replaced with finalized
+  file-private statement.
+- R3-5 follow-up: "12 re-exports" in Files-touched section
+  bumped to "14 always-on + 4 cfg-gated". "Move list (16 fns)"
+  in Approach paragraph bumped to "all 18".
+
+Gemini PLAN-READY verdict stands; v5 just clears Codex's residual
+factual + count issues.
 
 Round-3 changelog (v3 → v4): Codex round-3 found that v3 updated
 the changelog narrative but left several concrete snippets stale.
@@ -124,7 +158,7 @@ continue gates (`cos_queue_v_min_consume_suspension`,
 | `account_cos_queue_flow_dequeue` | 3596 | private | tx.rs:4068 (inside `cos_queue_pop_front_inner`, moving) | 4 direct sites in `tx::tests` (10060/16402/16453/16460) |
 | `cos_queue_is_empty` | 3636 | `pub(super)` | tx.rs (multiple); admission gates short-circuit on it | none direct — used inside other moving fns |
 | `cos_queue_len` | 3644 | `pub(super)` | worker.rs:1 (via super::* glob until Phase 5) | tx.rs tests |
-| `cos_queue_min_finish_bucket` | 3671 | private | tx.rs:3949 (inside `cos_queue_pop_front_inner`, moving) | tests |
+| `cos_queue_min_finish_bucket` | 3671 | private | tx.rs:3692 (`cos_queue_front`, moving), tx.rs:3939 (`cos_queue_pop_front_inner`, moving) — only co-located callers, file-private after move | none |
 | `cos_queue_front` | 3685 | `pub(super)` | tx.rs (in select_cos_*_batch paths — staying through Phase 7) | tests |
 | `cos_queue_push_back` | 3697 | `pub(super)` | tx.rs (many: enqueue paths) | tests |
 | `cos_queue_push_front` | 3731 | `pub(super)` | tx.rs (rollback paths) | tests |
@@ -136,7 +170,7 @@ continue gates (`cos_queue_v_min_consume_suspension`,
 | `cos_queue_restore_front` | 4127 | private | tx.rs:4807/4811 (`demote_prepared_cos_queue_to_local`, stays in tx) | none |
 | `publish_committed_queue_vtime` | 4950 | private | tx.rs (TX commit boundaries) | tests |
 | `cos_queue_v_min_consume_suspension` | 5015 | private | tx.rs (drain throttle gate) | tests |
-| `cos_queue_v_min_continue` | 5051 | private | tx.rs:2693/2921 (drain throttle gate) | tx.rs:16039/16046/16495/16499/16535/16541/16545/16616/16621/16994 |
+| `cos_queue_v_min_continue` | 5051 | private | tx.rs:2693/2921 (drain throttle gate) | tx.rs:16039/16046/16495/16499/16616/16621/16994 (16535/16541/16545 belong to `cos_queue_v_min_consume_suspension` — Codex round-4 #4) |
 | `compute_v_min_lag_threshold` | 4987 | private | tx.rs:5086 (only `cos_queue_v_min_continue`, moving) — file-private after move | tx.rs (indirect via v_min_continue) |
 | `cos_item_len` | 5409 | private | tx.rs (many — accessor on `CoSPendingTxItem`) | tests |
 
@@ -176,7 +210,7 @@ back-edge fix):
 
 ## Approach
 
-Create `userspace-dp/src/afxdp/cos/queue_ops.rs` with all 16
+Create `userspace-dp/src/afxdp/cos/queue_ops.rs` with all 18
 functions. Visibility classification:
 
 - **`pub(in crate::afxdp)` (cross-module callers)**:
@@ -231,10 +265,18 @@ functions. Visibility classification:
   - All 14 cross-module-callable fns above EXCEPT
     `cos_queue_drain_all` (called once per queue-rebuild) and
     `cos_queue_v_min_consume_suspension` (called once per drain
-    iteration) carry `#[inline]`. The 3 file-private helpers also
-    carry `#[inline]` because they're inside per-byte hot paths
-    (`account_*` is per-enqueue/dequeue; `pop_front_inner` is
-    per-dequeue).
+    iteration) carry `#[inline]`. The cfg-gated test-only re-export
+    pair (`account_cos_queue_flow_enqueue/_dequeue`) also carry
+    `#[inline]` because in production they're called from inside
+    moving fns (`cos_queue_push_back/_front` and
+    `cos_queue_pop_front_inner`) on every per-byte enqueue/dequeue.
+    `cos_queue_pop_front_inner` is the one truly file-private
+    helper and also carries `#[inline]` because it's per-dequeue.
+    `cos_queue_min_finish_bucket` is the second truly file-private
+    helper (selection-side); it's per-dequeue too — `#[inline]`.
+    Codex round-4 #2 caught the earlier "3 file-private helpers"
+    wording — the file-private set is 2 helpers + 3 V_MIN_*
+    constants + the `compute_v_min_lag_threshold` helper.
 
 ### Imports
 
@@ -244,8 +286,11 @@ use std::collections::VecDeque;
 
 use crate::afxdp::types::{
     CoSPendingTxItem, CoSQueuePopSnapshot, CoSQueueRuntime,
-    COS_FLOW_FAIR_BUCKET_MASK,
 };
+// COS_FLOW_FAIR_BUCKET_MASK lives in cos/flow_hash.rs and is consumed
+// there by cos_flow_bucket_index; queue_ops.rs only calls
+// cos_flow_bucket_index, never the constant directly. Codex round-4 #1
+// caught the earlier import line as unused-import-bait.
 use crate::afxdp::TX_BATCH_SIZE;     // pop_front_inner uses this for
                                       // snapshot ring sizing
                                       // (Codex round-2 R2-2)
@@ -308,9 +353,11 @@ items (matches the 18-fn move scope).
   (`account_cos_queue_flow_enqueue/_dequeue`,
   `V_MIN_CONSECUTIVE_SKIP_HARD_CAP`, `V_MIN_SUSPENSION_BATCHES`)
   go behind `#[cfg(test)]` in the same way Phase 4 organized them.
-- Test-only fns (e.g., `cos_queue_min_finish_bucket` if test-only)
-  go under the `#[cfg(test)]` import block already established
-  by Phase 4.
+(Codex round-4 R3-2: `cos_queue_min_finish_bucket` is finalized
+file-private inside `cos/queue_ops.rs` — only co-located callers
+exist (`cos_queue_front` and `cos_queue_pop_front_inner`, both
+moving). It does NOT appear in any re-export, so tx.rs imports
+nothing for it.)
 
 ### worker.rs
 
@@ -327,8 +374,8 @@ items (matches the 18-fn move scope).
 ## Files touched
 
 - **NEW** `userspace-dp/src/afxdp/cos/queue_ops.rs`: ~600-700 LOC.
-- `userspace-dp/src/afxdp/cos/mod.rs`: register new module + 12
-  re-exports.
+- `userspace-dp/src/afxdp/cos/mod.rs`: register new module + 14
+  always-on re-exports + 4 cfg-gated re-exports.
 - `userspace-dp/src/afxdp/tx.rs`: -600-700 LOC; extend cos:: imports.
 - `userspace-dp/src/afxdp/worker.rs`: extend cos:: imports.
 
@@ -336,9 +383,13 @@ items (matches the 18-fn move scope).
 
 No new tests required — pure structural refactor. Existing
 `tx::tests` exercise:
-- The `account_cos_queue_flow_*` lifecycle (test sites at
-  tx.rs:1654 / 1643 inside the `#[cfg(test)]` legacy selector at
-  tx.rs:1625-1626).
+- The `account_cos_queue_flow_*` lifecycle (10 direct
+  `tx::tests` sites for enqueue at tx.rs:10047/10048/10052/
+  11183/11191/11199/16400/16446/16447/16654; 4 sites for
+  dequeue at tx.rs:10060/16402/16453/16460 — Codex round-4 #3
+  caught the earlier wrong attribution to tx.rs:1654/1643 which
+  are inside `maybe_top_up_cos_queue_lease`, not the account
+  helpers).
 - `cos_queue_push_back` / `pop_front` / `front` / `len` / `is_empty`
   via dozens of admission and CoS pacing tests.
 - `cos_queue_min_finish_bucket` via the MQFQ head-ordering pin
@@ -380,8 +431,11 @@ in the dataplane: every TX byte goes through
   Gemini round-1 of Phase 3 demanded.
 - **Test surface.** `tx::tests` has ~30+ sites that call the moving
   fns by name; they all need to keep compiling via the cos:: re-
-  exports. `cos_queue_min_finish_bucket` may need cfg-gated re-
-  export if no production caller (Codex round-1 to verify).
+  exports. `cos_queue_min_finish_bucket` is now finalized
+  file-private (Codex round-4 R3-2 verified zero direct test
+  callers — selection-side reachability is via
+  `cos_queue_front`/`pop_front_inner` which both move with this
+  PR).
 - **Deferred enums.** Plan defers `CoSBatch`/`CoSServicePhase`/
   `ExactCoSQueueKind` to Phase 7. They don't appear in the moving
   fns' bodies — verify by grep before commit.
