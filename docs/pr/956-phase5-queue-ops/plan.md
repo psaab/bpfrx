@@ -1,6 +1,21 @@
 # #956 Phase 5: extract cos/queue_ops.rs from tx.rs
 
-Plan v5 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
+Plan v6 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
+
+Round-5 changelog (v5 → v6): Codex round-5 returned PLAN-NEEDS-MINOR
+with 5 cleanup items. All fixed:
+- account_cos_queue_flow_dequeue call site corrected from
+  tx.rs:4068 → 4041 (verified by grep).
+- COS_FLOW_FAIR_BUCKET_MASK note rewritten to acknowledge it's
+  used INDIRECTLY via cos_flow_bucket_index (cos/flow_hash.rs:159).
+- Move-list table re-ordered to true tx.rs source order:
+  pop_front_inner (3926) → clear_orphan (4065) → drain_all (4103)
+  → restore_front (4127). v5 had clear_orphan after drain_all.
+- Stale "ALSO cfg-gated" note for clear_orphan removed — it's in
+  the always-on block only; tests reach it through that re-export.
+- #[inline] section corrected: cos_queue_v_min_consume_suspension
+  ALREADY has #[inline] at tx.rs:5014 in source. v5 wrongly
+  listed it as an exception.
 
 Round-4 changelog (v4 → v5): Codex round-4 returned PLAN-NEEDS-MAJOR
 (R3-2 + R3-5 still broken in stale text + 4 new defects). Gemini
@@ -155,7 +170,7 @@ continue gates (`cos_queue_v_min_consume_suspension`,
 | Item | Current line | Visibility | Production callers (non-test) | Test-only callers |
 |---|---|---|---|---|
 | `account_cos_queue_flow_enqueue` | 3546 | private | tx.rs:3716 (`cos_queue_push_back`), tx.rs:3738 / 3841 (`cos_queue_push_front`) — all moving | 10 direct sites in `tx::tests` (10047/10048/10052/11183/11191/11199/16400/16446/16447/16654) |
-| `account_cos_queue_flow_dequeue` | 3596 | private | tx.rs:4068 (inside `cos_queue_pop_front_inner`, moving) | 4 direct sites in `tx::tests` (10060/16402/16453/16460) |
+| `account_cos_queue_flow_dequeue` | 3596 | private | tx.rs:4041 (inside `cos_queue_pop_front_inner`, moving) | 4 direct sites in `tx::tests` (10060/16402/16453/16460) |
 | `cos_queue_is_empty` | 3636 | `pub(super)` | tx.rs (multiple); admission gates short-circuit on it | none direct — used inside other moving fns |
 | `cos_queue_len` | 3644 | `pub(super)` | worker.rs:1 (via super::* glob until Phase 5) | tx.rs tests |
 | `cos_queue_min_finish_bucket` | 3671 | private | tx.rs:3692 (`cos_queue_front`, moving), tx.rs:3939 (`cos_queue_pop_front_inner`, moving) — only co-located callers, file-private after move | none |
@@ -165,8 +180,8 @@ continue gates (`cos_queue_v_min_consume_suspension`,
 | `cos_queue_pop_front` | 3902 | `pub(super)` | tx.rs (drain paths) | tests |
 | `cos_queue_pop_front_no_snapshot` | 3919 | `pub(super)` | worker.rs:1 (via glob); tx.rs | tests |
 | `cos_queue_pop_front_inner` | 3926 | private | called by both `pop_front` and `pop_front_no_snapshot` (both moving) | none |
-| `cos_queue_drain_all` | 4103 | private | tx.rs:4802 (`demote_prepared_cos_queue_to_local`, stays in tx) | tx.rs:12455 |
 | `cos_queue_clear_orphan_snapshot_after_drop` | 4065 | private | tx.rs:2729/2748/2954/2985 (drain paths in tx.rs) | tx.rs:11498/11640/11737 |
+| `cos_queue_drain_all` | 4103 | private | tx.rs:4802 (`demote_prepared_cos_queue_to_local`, stays in tx) | tx.rs:12455 |
 | `cos_queue_restore_front` | 4127 | private | tx.rs:4807/4811 (`demote_prepared_cos_queue_to_local`, stays in tx) | none |
 | `publish_committed_queue_vtime` | 4950 | private | tx.rs (TX commit boundaries) | tests |
 | `cos_queue_v_min_consume_suspension` | 5015 | private | tx.rs (drain throttle gate) | tests |
@@ -181,9 +196,10 @@ based on a first-pass grep and may still mis-classify
 **Constants used by the moved fns**:
 
 External (stay in afxdp::types):
-- `COS_FLOW_FAIR_BUCKET_MASK` (afxdp::types) — used by
-  `cos_queue_push_back` and `pop_front_inner` for bucket-index
-  arithmetic.
+- `COS_FLOW_FAIR_BUCKET_MASK` (afxdp::types) — used INDIRECTLY
+  via `cos_flow_bucket_index` (cos/flow_hash.rs:159 consumes the
+  mask). queue_ops bodies call `cos_flow_bucket_index`, not the
+  mask directly. Codex round-5 #2 caught the earlier wording.
 
 Moving with this phase (V-min throttle constants — Codex round-1
 back-edge fix):
@@ -243,9 +259,10 @@ functions. Visibility classification:
   - `V_MIN_CONSECUTIVE_SKIP_HARD_CAP` (test sites at
     16494/16496/16821/16838/16993)
   - `V_MIN_SUSPENSION_BATCHES` (test sites at 16502/16871/16996)
-  - `cos_queue_clear_orphan_snapshot_after_drop` ALSO cfg-gated
-    (test sites at 11498/11640/11737 — same fn appears in BOTH
-    blocks because it has both prod and test callers — R2-3)
+  (`cos_queue_clear_orphan_snapshot_after_drop` does NOT need a
+  separate cfg-gated entry — it's in the always-on re-export block
+  because it has 4 prod callers in tx.rs at 2729/2748/2954/2985,
+  and tx::tests reach it through that same re-export path.)
 
 - **File-private (post-move) — Codex round-2 R2-3 corrected
   classification**:
@@ -260,12 +277,15 @@ functions. Visibility classification:
     `V_MIN_MIN_LAG_BYTES` (only consumed inside the V-min
     helper bodies, all moving)
 
-- **`#[inline]`** (Phase 4 lesson — hot-path moves get explicit
-  inline hints):
+- **`#[inline]`** (Phase 4 lesson — hot-path moves preserve any
+  existing `#[inline]` and add it on per-byte fns that didn't
+  carry one in tx.rs):
   - All 14 cross-module-callable fns above EXCEPT
-    `cos_queue_drain_all` (called once per queue-rebuild) and
-    `cos_queue_v_min_consume_suspension` (called once per drain
-    iteration) carry `#[inline]`. The cfg-gated test-only re-export
+    `cos_queue_drain_all` (called once per queue-rebuild) carry
+    `#[inline]`. (`cos_queue_v_min_consume_suspension` already
+    has `#[inline]` at tx.rs:5014 in the source — it's preserved
+    on the move; Codex round-5 #5 caught the earlier wrong
+    "exception" listing for it.) The cfg-gated test-only re-export
     pair (`account_cos_queue_flow_enqueue/_dequeue`) also carry
     `#[inline]` because in production they're called from inside
     moving fns (`cos_queue_push_back/_front` and
