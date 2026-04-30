@@ -1,8 +1,36 @@
 # #956 Phase 3: extract cos/admission.rs from tx.rs
 
-Plan v5 — 2026-04-29. Addresses Gemini adversarial round-1,
-which returned PLAN-NEEDS-MINOR but with one substantive
-architectural finding that round-1/2/3 of Codex did not catch.
+Plan v6 — 2026-04-29. Addresses Codex round-4 (4 minor cleanup
+findings on top of v5's architectural change). Round-G2 (Gemini
+adversarial after v5) returned PLAN-READY; Codex round-4
+returned PLAN-NEEDS-MINOR but explicitly stated "the substantive
+architecture is now correct" — only wording cleanup remaining.
+
+Round-4 changelog (v5 → v6):
+
+R4-1. Stale flow_hash import in the admission.rs sketch:
+v5 still imported `cos_flow_bucket_index` (only used by
+deferred `account_*` and tx-resident `cos_queue_push_back/
+pop_front`). Replaced with `cos_queue_prospective_active_flows`
+(used at tx.rs:3926, 3985 inside `cos_queue_flow_share_limit`
+and `cos_flow_aware_buffer_limit`).
+
+R4-2. Banner-list at line ~124 still claimed `account_*` stay
+in admission and `SessionKey` import is required. Replaced
+with explicit "Superseded by v5" note pointing at the Gemini
+round-1 deferral.
+
+R4-3. Risk section still said "~700 LOC". Updated to ~600 LOC
+to match the v5 move list / Files-touched section.
+
+R4-4. `apply_cos_queue_flow_fair_promotion` was incorrectly
+listed in the set of admission gates that "only read"
+flow_bucket_bytes/active_flow_buckets. It's an init/builder
+helper. Replaced with the correct third gate
+(`cos_flow_aware_buffer_limit`) and added a parenthetical
+calling out the Codex catch.
+
+Round-G1 changelog (v4 → v5):
 
 Round-G1 changelog (v4 → v5):
 
@@ -121,10 +149,12 @@ Round-1 changelog (v1 → v2) preserved below for context:
    `promote_cos_queue_flow_fair` by V-min code. Implementation
    must keep the doc attached to its function during the move.
 
-Plus minor notes: import `crate::session::SessionKey` for
-accounting fns, do NOT import `ECN_MASK`/`ECN_NOT_ECT` (not used
-by admission code), `account_*` accounting fns stay in admission
-(treated as admission-state lifecycle, not Phase 5 queue_ops).
+Plus minor notes: do NOT import `ECN_MASK`/`ECN_NOT_ECT` (not
+used by admission code). **Superseded by v5**: the original v2
+note that `account_*` stay in admission and that
+`crate::session::SessionKey` must be imported is no longer
+correct — v5 defers `account_*` to Phase 5 (Gemini round-1),
+so the `SessionKey` import is dropped from this phase entirely.
 
 Continues #956 Phase 1 (cos/ecn.rs at PR #976) and Phase 2
 (cos/flow_hash.rs at PR #977). Phase 3 extracts the admission /
@@ -191,7 +221,16 @@ use crate::afxdp::types::{CoSInterfaceRuntime, CoSPendingTxItem,
 use crate::afxdp::umem::MmapArea;
 // SessionKey import was needed for the dropped account_* helpers;
 // no longer required after v5 removed them from this phase.
-use super::flow_hash::{cos_flow_bucket_index, cos_flow_hash_seed_from_os};
+use super::flow_hash::{cos_flow_hash_seed_from_os, cos_queue_prospective_active_flows};
+                                     // (Codex round-4) admission needs
+                                     // `cos_queue_prospective_active_flows`
+                                     // for tx.rs:3926, 3985 inside
+                                     // `cos_queue_flow_share_limit` and
+                                     // `cos_flow_aware_buffer_limit`.
+                                     // `cos_flow_bucket_index` only feeds
+                                     // `account_*` (deferred to Phase 5)
+                                     // and `cos_queue_push_back/pop_front`
+                                     // (staying in tx.rs through Phase 4).
 use super::ecn::{maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared};
                                      // do NOT import ECN_MASK / ECN_NOT_ECT —
                                      // not used by admission code (Codex r1)
@@ -258,12 +297,16 @@ fn promote_cos_queue_flow_fair(...) { ... }
   decision with a "lockstep landing cost" argument. Gemini
   showed the lockstep claim is false: admission gates
   (`apply_cos_admission_ecn_policy`,
-  `apply_cos_queue_flow_fair_promotion`,
-  `cos_queue_flow_share_limit`) **only read**
+  `cos_queue_flow_share_limit`,
+  `cos_flow_aware_buffer_limit`) **only read**
   `flow_bucket_bytes` / `active_flow_buckets`, they never call
   `account_*`. Both modules can independently access those
   `pub(super)` fields on `CoSQueueRuntime`, so there is no
   function-level coupling that demands lockstep PRs.
+  (Codex round-4 caught that `apply_cos_queue_flow_fair_promotion`
+  was incorrectly listed in this set; it's an init/builder-side
+  helper, not an admission gate. Promotion is justified separately
+  in the next bullet.)
 
   Moving `account_*` to admission.rs would actively *split* two
   cross-cutting invariants:
@@ -434,7 +477,7 @@ The repo has no root `Cargo.toml`; cargo commands must run with
 
 ## Risk
 
-**Medium.** Larger move than Phases 1+2 (~700 LOC vs ~210/~150)
+**Medium.** Larger move than Phases 1+2 (~600 LOC vs ~210/~150)
 and admission is the hottest CoS path — every iperf3 packet on a
 flow-fair queue routes through it. Risks:
 
