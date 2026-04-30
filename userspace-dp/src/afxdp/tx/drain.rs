@@ -299,6 +299,16 @@ pub(in crate::afxdp) fn drain_pending_tx(
     did_work || binding_has_pending_tx_work(binding)
 }
 
+/// #760: drop any prepared TX requests whose `cos_queue_id` is
+/// `Some(_)` — these items should have been admitted to a CoS
+/// queue via `ingest_cos_pending_tx`, and transmitting them
+/// through the post-CoS backup path bypasses the shaper. The
+/// UMEM frame slot each request holds is recycled immediately so
+/// the free-frame allocator stays in balance. A non-zero drop
+/// count here indicates a cross-worker routing failure
+/// (redirect-to-owner returned Err AND local-enqueue returned
+/// Err), which is the narrow failure mode the re-ingest + drop
+/// pair is designed to defend against.
 fn drop_cos_bound_prepared_leftovers(binding: &mut BindingWorker) {
     if binding.pending_tx_prepared.is_empty() {
         return;
@@ -348,6 +358,46 @@ fn drop_cos_bound_prepared_leftovers(binding: &mut BindingWorker) {
     }
 }
 
+/// #760: symmetric to `drop_cos_bound_prepared_leftovers` but for
+/// local (non-prepared) TxRequests. `TxRequest::bytes` is a
+/// Vec<u8> owned by the request — dropping the request frees the
+/// buffer, so no explicit recycle is needed here.
+/// #784 rewrite: give CoS-bound items one final chance to route
+/// into their queue before dropping. The previous revision
+/// dropped unconditionally, which was correct for items that had
+/// failed ingest's full three-step cascade — BUT items pulled
+/// from the MPSC redirect inbox at `take_pending_tx_requests`
+/// (after the bounded ingest-drain loop exited) had never been
+/// attempted for ingest at all. On iperf3 -P 12 against a 1 Gbps
+/// cap with owner-local-exact queue 4, peer workers continuously
+/// push packets to the owner binding's inbox. The budget-loop
+/// exits while packets are still arriving; `take_pending_tx_requests`
+/// then pulls them; the drop filter killed them wholesale. That
+/// produced the reported bimodal fairness: flows whose packets
+/// happened to land on the owner worker's own RX got through;
+/// flows that crossed workers got dropped here.
+///
+/// The fix: attempt `enqueue_local_into_cos` here. If it succeeds,
+/// the item joins its queue and traverses the normal shaped path
+/// on the next drain. If it fails (the genuine cross-worker
+/// routing failure case this function was originally designed for),
+/// drop as before so the #760 CoS cap bypass stays closed.
+/// #784 pure-function scan: for each item in `pending`, classify
+/// by `cos_queue_id`. Non-CoS items are preserved (rotated back
+/// to tail). CoS-bound items get one last rescue attempt via
+/// `try_rescue`; if that returns Err, the item is dropped (not
+/// re-enqueued) and counted. Returns `(dropped_count, dropped_bytes)`.
+///
+/// **CRITICAL INVARIANT** (pinned by
+/// `partition_cos_bound_local_scans_mixed_head_deque` below): the
+/// scan walks the ENTIRE deque, not just the head. An earlier
+/// head-peek fast-exit was a correctness bug: items pulled from
+/// the redirect inbox via `take_pending_tx_requests` can
+/// interleave non-CoS and CoS-bound; exiting early on a non-CoS
+/// head lets later CoS-bound items escape to the unshaped
+/// `transmit_batch` backup path, bypassing the CoS cap.
+/// Adversarial reviewers MUST reject any PR that re-introduces
+/// an early-exit on head inspection.
 fn partition_cos_bound_local_with_rescue<F>(
     pending: &mut VecDeque<TxRequest>,
     mut try_rescue: F,
@@ -457,6 +507,19 @@ fn ingest_cos_pending_tx(
     );
 }
 
+/// #760: same as `ingest_cos_pending_tx` but skips the
+/// `owner_pps` / `peer_pps` attribution. `drain_pending_tx` calls
+/// ingest once at the top (attribution ON) and then again after
+/// the shaped-drain loop exits (attribution OFF). The second pass
+/// drains items that peers pushed to the MPSC inbox DURING the
+/// shaped drain; counting those as `owner_pps` would corrupt the
+/// provenance telemetry because items left over in
+/// `pending_tx_local` from the first pass get indistinguishably
+/// mixed with fresh inbox arrivals on the second pass. Per Codex
+/// adversarial review (PR #773): "The second pass reclassifies
+/// peer requests as owner-local; inflates owner_pps, deflates
+/// peer_pps — exactly the wrong signal for diagnosing owner
+/// hotspots."
 fn ingest_cos_pending_tx_with_provenance(
     binding: &mut BindingWorker,
     forwarding: &ForwardingState,
