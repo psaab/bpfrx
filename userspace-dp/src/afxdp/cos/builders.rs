@@ -10,11 +10,8 @@
 //     by `tx::tests`; pub(in crate::afxdp) plus cfg-gated
 //     re-export from cos/mod.rs.
 //
-// One back-edge: `cos/builders -> tx::cos_tick_for_ns` (timer-wheel
-// helper that depends on `COS_TIMER_WHEEL_TICK_NS` and friends).
-// Documented as drain-scheduler-phase forward-debt — the helper
-// + constants will move together when timer-wheel + drain-pacing
-// extraction lands.
+// `cos_tick_for_ns` moved to cos/tx_completion.rs in #956 P1; the
+// Phase-6 cos/builders -> tx back-edge is now closed.
 //
 // `apply_cos_queue_flow_fair_promotion` (cos/admission.rs) is
 // imported here. After this PR, ensure_cos_interface_runtime is
@@ -30,8 +27,8 @@ use crate::afxdp::types::{
 };
 use crate::afxdp::worker::BindingWorker;
 use crate::afxdp::TX_BATCH_SIZE;
-use crate::afxdp::tx::cos_tick_for_ns;
 use super::admission::apply_cos_queue_flow_fair_promotion;
+use super::tx_completion::cos_tick_for_ns;
 use super::COS_MIN_BURST_BYTES;
 
 #[inline]

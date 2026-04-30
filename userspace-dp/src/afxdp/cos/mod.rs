@@ -17,13 +17,13 @@ pub(super) mod flow_hash;
 pub(super) mod queue_ops;
 pub(super) mod queue_service;
 pub(super) mod token_bucket;
+pub(super) mod tx_completion;
 
 pub(super) use admission::{
     apply_cos_admission_ecn_policy, cos_flow_aware_buffer_limit, cos_queue_flow_share_limit,
 };
 pub(super) use builders::ensure_cos_interface_runtime;
 pub(super) use cross_binding::{
-    prepared_cos_request_stays_on_current_tx_binding, redirect_local_cos_request_to_owner,
     redirect_prepared_cos_request_to_owner, redirect_prepared_cos_request_to_owner_binding,
     resolve_local_routing_decision, LocalRoutingDecision, Step1Action,
 };
@@ -35,12 +35,19 @@ pub(super) use queue_ops::{
     cos_queue_restore_front, cos_queue_v_min_consume_suspension, cos_queue_v_min_continue,
     publish_committed_queue_vtime,
 };
-pub(super) use queue_service::{drain_shaped_tx, park_cos_queue, CoSServicePhase};
+pub(super) use queue_service::drain_shaped_tx;
 pub(super) use token_bucket::{
-    cos_refill_ns_until, maybe_top_up_cos_queue_lease, maybe_top_up_cos_root_lease,
+    cos_refill_ns_until, maybe_top_up_cos_queue_lease,
     refill_cos_tokens, release_all_cos_queue_leases, release_all_cos_root_leases,
-    release_cos_root_lease, COS_MIN_BURST_BYTES,
+    COS_MIN_BURST_BYTES,
 };
+#[cfg(test)]
+pub(super) use token_bucket::{maybe_top_up_cos_root_lease, release_cos_root_lease};
+// tx.rs reaches `mark_cos_queue_runnable` via `super::cos::` for its
+// non-moving `enqueue_cos_item` path. Other production callers
+// (queue_service, builders) reach moved items directly via
+// `super::tx_completion::*`.
+pub(super) use tx_completion::mark_cos_queue_runnable;
 
 #[cfg(test)]
 pub(super) use admission::{
@@ -50,7 +57,10 @@ pub(super) use admission::{
 #[cfg(test)]
 pub(super) use builders::build_cos_interface_runtime;
 #[cfg(test)]
-pub(super) use cross_binding::redirect_local_cos_request_to_owner_binding;
+pub(super) use cross_binding::{
+    prepared_cos_request_stays_on_current_tx_binding, redirect_local_cos_request_to_owner,
+    redirect_local_cos_request_to_owner_binding,
+};
 #[cfg(test)]
 pub(super) use ecn::{maybe_mark_ecn_ce, ECN_CE, ECN_ECT_0, ECN_ECT_1, ECN_MASK, ECN_NOT_ECT};
 #[cfg(test)]
@@ -61,8 +71,15 @@ pub(super) use queue_ops::{
     V_MIN_CONSECUTIVE_SKIP_HARD_CAP, V_MIN_SUSPENSION_BATCHES,
 };
 #[cfg(test)]
+pub(super) use tx_completion::{
+    advance_cos_timer_wheel, normalize_cos_queue_state,
+    restore_cos_local_items_inner, restore_cos_prepared_items_inner,
+    COS_TIMER_WHEEL_TICK_NS,
+};
+#[cfg(test)]
 pub(super) use queue_service::{
     assign_local_dscp_rewrite, cos_batch_tx_made_progress, cos_guarantee_quantum_bytes,
+    park_cos_queue, CoSServicePhase,
     count_park_reason, drain_exact_local_fifo_items_to_scratch,
     drain_exact_local_items_to_scratch_flow_fair, drain_exact_prepared_fifo_items_to_scratch,
     drain_exact_prepared_items_to_scratch_flow_fair, estimate_cos_queue_wakeup_tick,
