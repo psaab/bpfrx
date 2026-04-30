@@ -696,7 +696,7 @@ fn poll_binding_process_descriptor(
     now_ns: u64,
     now_secs: u64,
     ha_startup_grace_until_secs: u64,
-    worker_id: u32,
+    _worker_id: u32,
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
     worker_ctx: &WorkerContext,

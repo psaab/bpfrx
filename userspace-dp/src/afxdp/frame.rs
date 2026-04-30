@@ -196,7 +196,7 @@ pub(super) fn parse_session_flow(
 }
 
 /// Check if a frame contains a TCP RST flag. Returns (is_rst, summary) for logging.
-pub(super) fn frame_has_tcp_rst(frame: &[u8]) -> bool {
+pub(in crate::afxdp) fn frame_has_tcp_rst(frame: &[u8]) -> bool {
     let l3 = match frame_l3_offset(frame) {
         Some(off) => off,
         None => return false,
@@ -307,7 +307,7 @@ pub(super) fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
     Some(14)
 }
 
-pub(super) fn apply_dscp_rewrite_to_frame(frame: &mut [u8], dscp: u8) -> Option<()> {
+pub(in crate::afxdp) fn apply_dscp_rewrite_to_frame(frame: &mut [u8], dscp: u8) -> Option<()> {
     let dscp = dscp & 0x3f;
     let l3 = frame_l3_offset(frame)?;
     let ip = frame.get_mut(l3..)?;
@@ -1160,8 +1160,8 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
                 // L4 checksum: incremental adjustment for NAT and TTL
                 // changes instead of full payload recompute. O(1) vs
                 // O(payload_size) — saves ~3.6% CPU at fabric throughput.
-                let post_src_ip = [packet[12], packet[13], packet[14], packet[15]];
-                let post_dst_ip = [packet[16], packet[17], packet[18], packet[19]];
+                let _post_src_ip = [packet[12], packet[13], packet[14], packet[15]];
+                let _post_dst_ip = [packet[16], packet[17], packet[18], packet[19]];
                 // L4 checksum: use incremental adjustment when
                 // enforce_expected_ports was a no-op (the common fabric
                 // case where expected_ports=None). This is O(1) vs
