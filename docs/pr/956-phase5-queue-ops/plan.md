@@ -1,6 +1,28 @@
 # #956 Phase 5: extract cos/queue_ops.rs from tx.rs
 
-Plan v3 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
+Plan v4 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
+
+Round-3 changelog (v3 → v4): Codex round-3 found that v3 updated
+the changelog narrative but left several concrete snippets stale.
+All 5 fixes:
+- R3-1 (cos/mod.rs concrete snippet): rewrote the snippet to
+  show 14 always-on re-exports + 4 cfg-gated re-exports;
+  `cos_queue_clear_orphan_snapshot_after_drop` /
+  `cos_queue_restore_front` now correctly placed in the always-on
+  block (R2-1 fix only existed in narrative before).
+- R3-2 (cos_queue_min_finish_bucket): finalized as file-private
+  inside queue_ops.rs. No re-export. Hedging note removed.
+- R3-3 (cos_queue_clear_orphan_snapshot_after_drop test sites):
+  table now shows the 3 test sites (11498/11640/11737) explicitly.
+  No separate cfg-gated entry needed because tests reach it
+  through the same always-on re-export production code uses.
+- R3-4 (V_MIN test counts): table rows updated:
+  CONSECUTIVE_SKIP_HARD_CAP → 16494/16496/16821/16838/16993;
+  SUSPENSION_BATCHES → 16502/16871/16996.
+- R3-5 (count consistency): bumped all "16 fns" mentions to "18
+  fns + 1 helper + 5 constants" (Goal, Move list heading, tx.rs
+  removal instructions). "All 12 cross-module-callable fns" →
+  "All 14".
 
 Round-2 changelog (v2 → v3): Codex round-2 returned PLAN-NEEDS-MAJOR
 with 2 MAJOR + 2 MINOR defects, all addressed:
@@ -81,7 +103,8 @@ selection) + MQFQ ordering bookkeeping + V-min slot lifecycle.
 
 ## Goal
 
-Move 16 functions covering the queue-state lifecycle out of tx.rs
+Move 18 functions + 1 helper (`compute_v_min_lag_threshold`) +
+5 V_MIN_* constants covering the queue-state lifecycle out of tx.rs
 into `userspace-dp/src/afxdp/cos/queue_ops.rs`. Resolves the Phase 3
 deferral: `account_cos_queue_flow_enqueue` / `_dequeue` (the MQFQ
 finish-time bookkeeping + V-min slot vacate paths) move alongside
@@ -93,7 +116,7 @@ continue gates (`cos_queue_v_min_consume_suspension`,
 
 ## Investigation findings (Claude, on commit ea726fb4)
 
-**Move list (16 fns)** in tx.rs order:
+**Move list (18 fns + 1 helper + 5 constants)** in tx.rs order:
 
 | Item | Current line | Visibility | Production callers (non-test) | Test-only callers |
 |---|---|---|---|---|
@@ -109,7 +132,7 @@ continue gates (`cos_queue_v_min_consume_suspension`,
 | `cos_queue_pop_front_no_snapshot` | 3919 | `pub(super)` | worker.rs:1 (via glob); tx.rs | tests |
 | `cos_queue_pop_front_inner` | 3926 | private | called by both `pop_front` and `pop_front_no_snapshot` (both moving) | none |
 | `cos_queue_drain_all` | 4103 | private | tx.rs:4802 (`demote_prepared_cos_queue_to_local`, stays in tx) | tx.rs:12455 |
-| `cos_queue_clear_orphan_snapshot_after_drop` | 4065 | private | tx.rs:2729/2748/2954/2985 (drain paths in tx.rs) | none |
+| `cos_queue_clear_orphan_snapshot_after_drop` | 4065 | private | tx.rs:2729/2748/2954/2985 (drain paths in tx.rs) | tx.rs:11498/11640/11737 |
 | `cos_queue_restore_front` | 4127 | private | tx.rs:4807/4811 (`demote_prepared_cos_queue_to_local`, stays in tx) | none |
 | `publish_committed_queue_vtime` | 4950 | private | tx.rs (TX commit boundaries) | tests |
 | `cos_queue_v_min_consume_suspension` | 5015 | private | tx.rs (drain throttle gate) | tests |
@@ -136,8 +159,8 @@ back-edge fix):
 | `V_MIN_READ_CADENCE` | 4977 | private | only `cos_queue_v_min_continue` body — file-private after move |
 | `V_MIN_LAG_THRESHOLD_NS` | 4981 | private | only `compute_v_min_lag_threshold` body — file-private after move |
 | `V_MIN_MIN_LAG_BYTES` | 4984 | private | only `compute_v_min_lag_threshold` body — file-private after move |
-| `V_MIN_CONSECUTIVE_SKIP_HARD_CAP` | 4996 | `pub(super)` | `cos_queue_v_min_continue` body + tx::tests (16494/16496) — needs `pub(in crate::afxdp)` + `#[cfg(test)] pub(super) use` re-export |
-| `V_MIN_SUSPENSION_BATCHES` | 5002 | `pub(super)` | `cos_queue_v_min_continue` body + tx::tests (16502) — same treatment |
+| `V_MIN_CONSECUTIVE_SKIP_HARD_CAP` | 4996 | `pub(super)` | `cos_queue_v_min_continue` body + tx::tests (16494/16496/16821/16838/16993) — needs `pub(in crate::afxdp)` + `#[cfg(test)] pub(super) use` re-export |
+| `V_MIN_SUSPENSION_BATCHES` | 5002 | `pub(super)` | `cos_queue_v_min_continue` body + tx::tests (16502/16871/16996) — same treatment |
 
 ## Deferred to later phases
 
@@ -205,7 +228,7 @@ functions. Visibility classification:
 
 - **`#[inline]`** (Phase 4 lesson — hot-path moves get explicit
   inline hints):
-  - All 12 cross-module-callable fns above EXCEPT
+  - All 14 cross-module-callable fns above EXCEPT
     `cos_queue_drain_all` (called once per queue-rebuild) and
     `cos_queue_v_min_consume_suspension` (called once per drain
     iteration) carry `#[inline]`. The 3 file-private helpers also
@@ -238,25 +261,53 @@ use super::flow_hash::{cos_flow_bucket_index, cos_item_flow_key};
 ```rust
 pub(super) mod queue_ops;
 
+// Always-on re-exports — production callers stay in tx.rs / worker.rs.
 pub(super) use queue_ops::{
-    cos_item_len, cos_queue_drain_all, cos_queue_front,
-    cos_queue_is_empty, cos_queue_len, cos_queue_min_finish_bucket,
-    cos_queue_pop_front, cos_queue_pop_front_no_snapshot,
-    cos_queue_push_back, cos_queue_push_front,
-    cos_queue_v_min_consume_suspension, cos_queue_v_min_continue,
+    cos_item_len,
+    cos_queue_clear_orphan_snapshot_after_drop,
+    cos_queue_drain_all,
+    cos_queue_front,
+    cos_queue_is_empty,
+    cos_queue_len,
+    cos_queue_pop_front,
+    cos_queue_pop_front_no_snapshot,
+    cos_queue_push_back,
+    cos_queue_push_front,
+    cos_queue_restore_front,
+    cos_queue_v_min_consume_suspension,
+    cos_queue_v_min_continue,
     publish_committed_queue_vtime,
+};
+
+// Cfg-gated re-exports — only test code reaches these by name.
+#[cfg(test)]
+pub(super) use queue_ops::{
+    account_cos_queue_flow_dequeue,
+    account_cos_queue_flow_enqueue,
+    V_MIN_CONSECUTIVE_SKIP_HARD_CAP,
+    V_MIN_SUSPENSION_BATCHES,
 };
 ```
 
-(The 12-entry `pub(super) use` block — `cos_queue_min_finish_bucket`
-moves to a `#[cfg(test)] pub(super) use` block if the verification
-shows no production caller.)
+`cos_queue_min_finish_bucket` is intentionally absent from both
+re-export blocks — it's file-private inside queue_ops.rs (only
+co-located callers, R2-3). `cos_queue_clear_orphan_snapshot_after_drop`
+appears in the always-on block (4 prod callers in tx.rs) AND its
+test reachability is covered through that re-export — `tx::tests`
+sees the prod re-export, no separate cfg-gated entry needed.
+
+Total: 14 always-on re-exports + 4 cfg-gated = 18 cross-module
+items (matches the 18-fn move scope).
 
 ### tx.rs
 
-- Remove the 16 fn definitions.
+- Remove the 18 fn definitions + the helper
+  `compute_v_min_lag_threshold` + the 5 V_MIN_* constants.
 - Extend the existing `use super::cos::{...}` block to include the
-  12 production-callable fns.
+  14 always-on production-callable fns. Test-only re-exports
+  (`account_cos_queue_flow_enqueue/_dequeue`,
+  `V_MIN_CONSECUTIVE_SKIP_HARD_CAP`, `V_MIN_SUSPENSION_BATCHES`)
+  go behind `#[cfg(test)]` in the same way Phase 4 organized them.
 - Test-only fns (e.g., `cos_queue_min_finish_bucket` if test-only)
   go under the `#[cfg(test)]` import block already established
   by Phase 4.
