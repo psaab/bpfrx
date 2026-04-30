@@ -1,6 +1,52 @@
 # #956 Phase 5: extract cos/queue_ops.rs from tx.rs
 
-Plan v1 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
+Plan v2 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
+
+Round-1 changelog (v1 → v2): Codex round-1 returned PLAN-NEEDS-MAJOR
+with 3 substantive defects, all addressed in v2:
+
+- R1-1 (visibility): `account_cos_queue_flow_enqueue` / `_dequeue`
+  cannot be file-private after the move — `tx::tests` calls them
+  directly at 10+ sites (enqueue at tx.rs:10047/10048/10052, 11183/
+  11191/11199, 16400/16446/16447/16654; dequeue at tx.rs:10060,
+  16402, 16453, 16460). Both are now `pub(in crate::afxdp)` with
+  `#[cfg(test)] pub(super) use` re-export from cos/mod.rs (same
+  pattern Phase 4 used for test-touched constants).
+
+- R1-2 (back-edge): `cos_queue_v_min_continue` and the V-min
+  helpers it uses cannot compile in cos/queue_ops.rs without the
+  V-min lag-threshold constants and `compute_v_min_lag_threshold`.
+  v2 expands the move list to include:
+  - `compute_v_min_lag_threshold` (tx.rs:4987 — only called by
+    `cos_queue_v_min_continue` at tx.rs:5086, file-private in cos/queue_ops.rs)
+  - `V_MIN_READ_CADENCE` (tx.rs:4977)
+  - `V_MIN_LAG_THRESHOLD_NS` (tx.rs:4981)
+  - `V_MIN_MIN_LAG_BYTES` (tx.rs:4984)
+  - `V_MIN_CONSECUTIVE_SKIP_HARD_CAP` (tx.rs:4996, currently `pub(super)`,
+    test-referenced — needs `pub(in crate::afxdp)` + cfg-gated re-export)
+  - `V_MIN_SUSPENSION_BATCHES` (tx.rs:5002, currently `pub(super)`,
+    test-referenced — same treatment)
+
+- R1-3 (missing cohesive lifecycle fns): two MQFQ/V-min-related
+  helpers tightly coupled to the moving set were absent from v1's
+  list:
+  - `cos_queue_clear_orphan_snapshot_after_drop` (tx.rs:4065,
+    private, called from production at tx.rs:2729/2748/2954/2985 —
+    keeps snapshot-rollback invariant when bucket is dropped under
+    pop/push). Cohesive with `pop_front_inner`. v2 includes it.
+    Visibility: `pub(in crate::afxdp)` because all 4 production
+    callers stay in tx.rs.
+  - `cos_queue_restore_front` (tx.rs:4127, private, called from
+    `demote_prepared_cos_queue_to_local` at tx.rs:4807/4811 — pushes
+    drained items back when demotion fails). Cohesive with
+    `cos_queue_push_front` (which it calls internally) and
+    `cos_queue_drain_all`. v2 includes it. Visibility:
+    `pub(in crate::afxdp)` because the caller stays in tx.rs.
+
+Move list grew from 16 → 18 fns + 5 named constants + 1 helper fn
+(compute_v_min_lag_threshold). Total ~700-800 LOC.
+
+
 Phase 1 (cos/ecn.rs) shipped at PR #976; Phase 2 (cos/flow_hash.rs)
 at PR #977; Phase 3 (cos/admission.rs) at PR #978; Phase 4
 (cos/token_bucket.rs) at PR #979. Phase 5 = queue ops (push/pop/
@@ -24,8 +70,8 @@ continue gates (`cos_queue_v_min_consume_suspension`,
 
 | Item | Current line | Visibility | Production callers (non-test) | Test-only callers |
 |---|---|---|---|---|
-| `account_cos_queue_flow_enqueue` | 3546 | private | tx.rs:4166 (inside `cos_queue_push_back`, also moving) | tx.rs:1654 (`#[cfg(test)] fn` at tx.rs:1625-1626) |
-| `account_cos_queue_flow_dequeue` | 3596 | private | tx.rs:4068 (inside `cos_queue_pop_front_inner`, also moving) | none |
+| `account_cos_queue_flow_enqueue` | 3546 | private | tx.rs:3716 (`cos_queue_push_back`), tx.rs:3738 / 3841 (`cos_queue_push_front`) — all moving | 10 direct sites in `tx::tests` (10047/10048/10052/11183/11191/11199/16400/16446/16447/16654) |
+| `account_cos_queue_flow_dequeue` | 3596 | private | tx.rs:4068 (inside `cos_queue_pop_front_inner`, moving) | 4 direct sites in `tx::tests` (10060/16402/16453/16460) |
 | `cos_queue_is_empty` | 3636 | `pub(super)` | tx.rs (multiple); admission gates short-circuit on it | none direct — used inside other moving fns |
 | `cos_queue_len` | 3644 | `pub(super)` | worker.rs:1 (via super::* glob until Phase 5) | tx.rs tests |
 | `cos_queue_min_finish_bucket` | 3671 | private | tx.rs:3949 (inside `cos_queue_pop_front_inner`, moving) | tests |
@@ -35,21 +81,36 @@ continue gates (`cos_queue_v_min_consume_suspension`,
 | `cos_queue_pop_front` | 3902 | `pub(super)` | tx.rs (drain paths) | tests |
 | `cos_queue_pop_front_no_snapshot` | 3919 | `pub(super)` | worker.rs:1 (via glob); tx.rs | tests |
 | `cos_queue_pop_front_inner` | 3926 | private | called by both `pop_front` and `pop_front_no_snapshot` (both moving) | none |
-| `cos_queue_drain_all` | 4103 | private | tx.rs (queue rebuild paths) | tests |
+| `cos_queue_drain_all` | 4103 | private | tx.rs:4802 (`demote_prepared_cos_queue_to_local`, stays in tx) | tx.rs:12455 |
+| `cos_queue_clear_orphan_snapshot_after_drop` | 4065 | private | tx.rs:2729/2748/2954/2985 (drain paths in tx.rs) | none |
+| `cos_queue_restore_front` | 4127 | private | tx.rs:4807/4811 (`demote_prepared_cos_queue_to_local`, stays in tx) | none |
 | `publish_committed_queue_vtime` | 4950 | private | tx.rs (TX commit boundaries) | tests |
 | `cos_queue_v_min_consume_suspension` | 5015 | private | tx.rs (drain throttle gate) | tests |
-| `cos_queue_v_min_continue` | 5051 | private | tx.rs (drain throttle gate) | tests |
+| `cos_queue_v_min_continue` | 5051 | private | tx.rs:2693/2921 (drain throttle gate) | tx.rs:16039/16046/16495/16499/16535/16541/16545/16616/16621/16994 |
+| `compute_v_min_lag_threshold` | 4987 | private | tx.rs:5086 (only `cos_queue_v_min_continue`, moving) — file-private after move | tx.rs (indirect via v_min_continue) |
 | `cos_item_len` | 5409 | private | tx.rs (many — accessor on `CoSPendingTxItem`) | tests |
 
 (Codex round-1 will verify the call-site accounting; the table is
 based on a first-pass grep and may still mis-classify
 `#[cfg(test)]`-gated sites — same lesson Phase 4 round-1 surfaced.)
 
-**Constants used by the moved fns** (already in `cos/`):
+**Constants used by the moved fns**:
+
+External (stay in afxdp::types):
 - `COS_FLOW_FAIR_BUCKET_MASK` (afxdp::types) — used by
   `cos_queue_push_back` and `pop_front_inner` for bucket-index
-  arithmetic. Stays in types.
-- No new constant moves required.
+  arithmetic.
+
+Moving with this phase (V-min throttle constants — Codex round-1
+back-edge fix):
+
+| Item | Line | Visibility | Use sites |
+|---|---|---|---|
+| `V_MIN_READ_CADENCE` | 4977 | private | only `cos_queue_v_min_continue` body — file-private after move |
+| `V_MIN_LAG_THRESHOLD_NS` | 4981 | private | only `compute_v_min_lag_threshold` body — file-private after move |
+| `V_MIN_MIN_LAG_BYTES` | 4984 | private | only `compute_v_min_lag_threshold` body — file-private after move |
+| `V_MIN_CONSECUTIVE_SKIP_HARD_CAP` | 4996 | `pub(super)` | `cos_queue_v_min_continue` body + tx::tests (16494/16496) — needs `pub(in crate::afxdp)` + `#[cfg(test)] pub(super) use` re-export |
+| `V_MIN_SUSPENSION_BATCHES` | 5002 | `pub(super)` | `cos_queue_v_min_continue` body + tx::tests (16502) — same treatment |
 
 ## Deferred to later phases
 
@@ -85,17 +146,26 @@ functions. Visibility classification:
   - `cos_item_len` (tx.rs production — small accessor, hot path
     via every push/pop)
 
-- **`pub(in crate::afxdp)` (test-only)**:
-  - `cos_queue_min_finish_bucket` (tests grep — currently file-
-    private but tests exercise it directly)
+- **`pub(in crate::afxdp)` (test-touched — needs cfg-gated
+  re-export from cos/mod.rs)** (Codex round-1 R1-1):
+  - `account_cos_queue_flow_enqueue` (10 direct test sites)
+  - `account_cos_queue_flow_dequeue` (4 direct test sites)
+  - `V_MIN_CONSECUTIVE_SKIP_HARD_CAP` (test sites at 16494/16496)
+  - `V_MIN_SUSPENSION_BATCHES` (test site at 16502)
+  - `cos_queue_min_finish_bucket` (tests exercise directly)
+  - `cos_queue_clear_orphan_snapshot_after_drop` (production
+    callers all stay in tx.rs at 2729/2748/2954/2985)
+  - `cos_queue_restore_front` (production caller
+    `demote_prepared_cos_queue_to_local` stays in tx.rs)
 
 - **File-private (post-move)**:
-  - `account_cos_queue_flow_enqueue` (only called by
-    `cos_queue_push_back` which moves)
-  - `account_cos_queue_flow_dequeue` (only called by
-    `cos_queue_pop_front_inner` which moves)
   - `cos_queue_pop_front_inner` (only called by `pop_front` and
     `pop_front_no_snapshot`, both moving)
+  - `compute_v_min_lag_threshold` (only called by
+    `cos_queue_v_min_continue`, both moving)
+  - `V_MIN_READ_CADENCE`, `V_MIN_LAG_THRESHOLD_NS`,
+    `V_MIN_MIN_LAG_BYTES` (only consumed inside the V-min
+    helper bodies, all moving)
 
 - **`#[inline]`** (Phase 4 lesson — hot-path moves get explicit
   inline hints):
