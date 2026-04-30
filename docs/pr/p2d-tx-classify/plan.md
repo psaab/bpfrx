@@ -1,7 +1,31 @@
 # P2d: extract afxdp/tx/cos_classify.rs from tx/mod.rs (final carve)
 
-Plan v2 — 2026-04-30. Stage 2 step 5 (final) of the long sequence
+Plan v3 — 2026-04-30. Stage 2 step 5 (final) of the long sequence
 after #994 (P2c2: tx/drain.rs) merged at master `ff982ad1`.
+
+## v3 changelog vs v2 (from Codex round-2)
+
+- R2-1: `enqueue_prepared_into_cos` re-export shape — v2 said
+  `pub(super)` source + `pub(super) use` re-export, which fails
+  Rust privacy (E0364: re-export wider than source). v3 fixes:
+  use a **private** `use cos_classify::enqueue_prepared_into_cos;`
+  in tx/mod.rs (same pattern as `transmit_prepared_batch` from
+  P2c) — keeps the source `pub(super)` and gives drain.rs's
+  `use super::*;` the resolution it needs.
+- R2-2: tx/mod.rs facade sketch DROPPED the existing
+  `use super::cos::{...}` imports. drain.rs uses them via
+  `use super::*;` (drain_shaped_tx, redirect helpers,
+  resolve_local_routing_decision, LocalRoutingDecision, Step1Action).
+  v3 KEEPS the cos:: imports in the facade.
+- R2-3: cfg-test plan was inconsistent — parent's `tx/mod.rs::tests`
+  can't access private children of `cos_classify.rs`. v3 makes the
+  5 directly-pinned helpers (resolve_cos_queue_idx,
+  clone_prepared_request_for_cos, prepare_local_request_for_cos,
+  cos_queue_accepts_prepared, demote_prepared_cos_queue_to_local)
+  `pub(super)` in cos_classify.rs **with `#[cfg(test)]` re-exports
+  in tx/mod.rs**. Tests stay in tx/mod.rs::tests.
+- R2-4: count corrected — 10 helpers including
+  enqueue_prepared_into_cos.
 
 ## v2 changelog vs v1 (from Codex round-1)
 
