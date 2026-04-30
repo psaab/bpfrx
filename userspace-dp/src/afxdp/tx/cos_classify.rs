@@ -1,7 +1,7 @@
 // #984 P2d (FINAL): CoS classify + enqueue + cached-selection cluster,
 // extracted from tx/mod.rs.
 //
-// 6 public-ish items (5 pub(in crate::afxdp) + 1 pub(super) struct):
+// 6 public items (all pub(in crate::afxdp), incl CoSTxSelection struct):
 //   - CoSTxSelection (struct + fields)
 //   - resolve_cached_cos_tx_selection
 //   - resolve_cos_queue_id
@@ -665,6 +665,12 @@ pub(super) fn demote_prepared_cos_queue_to_local(
     true
 }
 
+/// #774: O(1) check replacing the prior O(n) scan. Profiled at
+/// 3.25% CPU on the hot path at line rate before this fix.
+/// `local_item_count` is maintained at every push/pop site in
+/// `cos_queue_push_*` / `cos_queue_pop_front`. Single-writer
+/// (owner worker), same discipline as `queued_bytes` — no atomic
+/// needed.
 #[inline]
 pub(super) fn cos_queue_accepts_prepared(root: &CoSInterfaceRuntime, requested_queue: Option<u8>) -> bool {
     let Some(queue_idx) = resolve_cos_queue_idx(root, requested_queue) else {
