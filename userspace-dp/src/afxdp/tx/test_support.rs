@@ -10,12 +10,6 @@
 #![cfg(test)]
 
 use super::*;
-use crate::{
-    ClassOfServiceSnapshot, CoSDSCPClassifierEntrySnapshot, CoSDSCPClassifierSnapshot,
-    CoSForwardingClassSnapshot, CoSIEEE8021ClassifierEntrySnapshot,
-    CoSIEEE8021ClassifierSnapshot, CoSSchedulerMapEntrySnapshot, CoSSchedulerMapSnapshot,
-    CoSSchedulerSnapshot, FirewallFilterSnapshot, FirewallTermSnapshot,
-};
 
 pub(in crate::afxdp) fn test_queue_fast_path(
     shared_exact: bool,
@@ -456,16 +450,13 @@ pub(in crate::afxdp) fn test_queue_fast_path_for_promotion(shared_exact: bool) -
 /// alive for the duration of the item's lifetime (each test
 /// keeps both on the stack).
 pub(in crate::afxdp) fn test_prepared_item_in_umem(
-    umem: &MmapArea,
+    umem: &mut MmapArea,
     offset: u64,
     packet_bytes: &[u8],
     expected_addr_family: u8,
 ) -> CoSPendingTxItem {
-    // SAFETY: in-range by construction (caller passes a valid
-    // offset into a freshly-allocated MmapArea that is larger
-    // than `packet_bytes`). Exclusive access holds because the
-    // MmapArea is stack-local to the test.
-    let dest = unsafe { umem.slice_mut_unchecked(offset as usize, packet_bytes.len()) }
+    let dest = umem
+        .slice_mut(offset as usize, packet_bytes.len())
         .expect("umem slice");
     dest.copy_from_slice(packet_bytes);
     CoSPendingTxItem::Prepared(PreparedTxRequest {

@@ -8917,9 +8917,9 @@ mod tests {
 
         let tos = (0x28u8 << 2) | ECN_ECT_0;
         let packet = build_ipv4_test_packet(tos);
-        let umem = test_admission_umem();
+        let mut umem = test_admission_umem();
         let mut item =
-            test_prepared_item_in_umem(&umem, 0, &packet, libc::AF_INET as u8);
+            test_prepared_item_in_umem(&mut umem, 0, &packet, libc::AF_INET as u8);
 
         // Pin (1): pre-state is ECT(0).
         let pre_bytes = umem
@@ -8987,9 +8987,9 @@ mod tests {
         // Pick a non-zero offset to prove that `slice_mut_unchecked`
         // is honouring `req.offset` rather than always slicing from 0.
         let offset: u64 = 128;
-        let umem = test_admission_umem();
+        let mut umem = test_admission_umem();
         let mut item =
-            test_prepared_item_in_umem(&umem, offset, &packet, libc::AF_INET6 as u8);
+            test_prepared_item_in_umem(&mut umem, offset, &packet, libc::AF_INET6 as u8);
 
         let pre_bytes = umem
             .slice(offset as usize, packet.len())
@@ -9051,9 +9051,9 @@ mod tests {
 
         let tos = 0xb8; // DSCP 46 (EF), ECN = 00 (NOT-ECT)
         let packet = build_ipv4_test_packet(tos);
-        let umem = test_admission_umem();
+        let mut umem = test_admission_umem();
         let mut item =
-            test_prepared_item_in_umem(&umem, 0, &packet, libc::AF_INET as u8);
+            test_prepared_item_in_umem(&mut umem, 0, &packet, libc::AF_INET as u8);
         let pre_bytes = umem
             .slice(0, packet.len())
             .expect("slice readback")
@@ -9149,7 +9149,7 @@ mod tests {
         queue.queued_bytes = (buffer_limit / 2) + 1;
         let before = snapshot_counters(queue);
 
-        let umem = test_admission_umem();
+        let mut umem = test_admission_umem();
 
         // Local variant first.
         let mut local_item = test_local_ipv4_item(ECN_ECT_0);
@@ -9167,7 +9167,7 @@ mod tests {
         // Prepared variant next.
         let packet = build_ipv4_test_packet(ECN_ECT_0);
         let mut prepared_item =
-            test_prepared_item_in_umem(&umem, 0, &packet, libc::AF_INET as u8);
+            test_prepared_item_in_umem(&mut umem, 0, &packet, libc::AF_INET as u8);
         let marked_prepared = apply_cos_admission_ecn_policy(
             queue,
             buffer_limit,
@@ -9219,9 +9219,9 @@ mod tests {
         // (slice_mut_unchecked + l3_offset) composes correctly on a
         // non-head frame.
         let frame_offset: u64 = 128;
-        let umem = test_admission_umem();
+        let mut umem = test_admission_umem();
         let mut item =
-            test_prepared_item_in_umem(&umem, frame_offset, &tagged, libc::AF_INET as u8);
+            test_prepared_item_in_umem(&mut umem, frame_offset, &tagged, libc::AF_INET as u8);
 
         let before = snapshot_counters(queue);
         let marked = apply_cos_admission_ecn_policy(
@@ -10066,7 +10066,7 @@ mod tests {
     /// the drain consumes one slot and skips V_min entirely.
     #[test]
     fn vmin_prepared_flow_fair_throttle_and_suspension() {
-        let umem = MmapArea::new(2 * 1024 * 1024).expect("umem");
+        let mut umem = MmapArea::new(2 * 1024 * 1024).expect("umem");
         let mut root = test_cos_runtime_with_queues(
             10_000_000_000 / 8,
             vec![CoSQueueConfig {
@@ -10087,7 +10087,7 @@ mod tests {
 
         // Push a Prepared item so the preflight passes.
         let packet = vec![0u8; 1500];
-        let prepared = test_prepared_item_in_umem(&umem, 0, &packet, libc::AF_INET as u8);
+        let prepared = test_prepared_item_in_umem(&mut umem, 0, &packet, libc::AF_INET as u8);
         cos_queue_push_back(queue, prepared);
 
         let mut scratch: Vec<PreparedTxRequest> = Vec::new();
@@ -10189,7 +10189,7 @@ mod tests {
     /// suspension, and successfully commits the head Prepared item.
     #[test]
     fn vmin_prepared_drain_arms_hard_cap_after_repeated_throttle() {
-        let umem = MmapArea::new(2 * 1024 * 1024).expect("umem");
+        let mut umem = MmapArea::new(2 * 1024 * 1024).expect("umem");
         let mut root = test_cos_runtime_with_queues(
             10_000_000_000 / 8,
             vec![CoSQueueConfig {
@@ -10209,7 +10209,7 @@ mod tests {
         queue.queue_vtime = 100 * 1024 * 1024;
 
         let packet = vec![0u8; 1500];
-        let prepared = test_prepared_item_in_umem(&umem, 0, &packet, libc::AF_INET as u8);
+        let prepared = test_prepared_item_in_umem(&mut umem, 0, &packet, libc::AF_INET as u8);
         cos_queue_push_back(queue, prepared);
 
         let mut free_tx: VecDeque<u64> = VecDeque::new();
@@ -10288,7 +10288,7 @@ mod tests {
     /// `vmin_throttle_function_fires_on_lag_breach`.
     #[test]
     fn vmin_prepared_drain_unblocks_when_peer_slot_vacates() {
-        let umem = MmapArea::new(2 * 1024 * 1024).expect("umem");
+        let mut umem = MmapArea::new(2 * 1024 * 1024).expect("umem");
         let mut root = test_cos_runtime_with_queues(
             10_000_000_000 / 8,
             vec![CoSQueueConfig {
@@ -10309,7 +10309,7 @@ mod tests {
         queue.queue_vtime = 100 * 1024 * 1024;
 
         let packet = vec![0u8; 1500];
-        let prepared = test_prepared_item_in_umem(&umem, 0, &packet, libc::AF_INET as u8);
+        let prepared = test_prepared_item_in_umem(&mut umem, 0, &packet, libc::AF_INET as u8);
         cos_queue_push_back(queue, prepared);
 
         // First drain: throttle fires, nothing committed.
@@ -10368,7 +10368,7 @@ mod tests {
     /// drain entry points.
     #[test]
     fn vmin_local_hard_cap_suspension_carries_into_prepared_drain() {
-        let umem = MmapArea::new(2 * 1024 * 1024).expect("umem");
+        let mut umem = MmapArea::new(2 * 1024 * 1024).expect("umem");
         let mut root = test_cos_runtime_with_queues(
             10_000_000_000 / 8,
             vec![CoSQueueConfig {
@@ -10401,7 +10401,7 @@ mod tests {
         // is skipped (no throttle), and the item drains. Suspension is
         // consumed once at drain entry.
         let packet = vec![0u8; 1500];
-        let prepared = test_prepared_item_in_umem(&umem, 0, &packet, libc::AF_INET as u8);
+        let prepared = test_prepared_item_in_umem(&mut umem, 0, &packet, libc::AF_INET as u8);
         cos_queue_push_back(queue, prepared);
         let suspension_before = queue.v_min_suspended_remaining;
 
