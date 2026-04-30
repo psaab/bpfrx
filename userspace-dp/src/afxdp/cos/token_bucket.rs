@@ -1,0 +1,220 @@
+// #956 Phase 4: token-bucket lease/refill helpers, extracted from
+// tx.rs. Provides the per-byte token-budget plumbing that admission
+// gates and the drain-scheduler use to throttle TX pacing:
+//
+//   - `refill_cos_tokens` — basic credit-driven refill against
+//     `transmit_rate_bytes` and a `burst_bytes` cap.
+//   - `maybe_top_up_cos_root_lease` / `maybe_top_up_cos_queue_lease`
+//     — pull bytes from the shared cross-binding lease pools and
+//     deposit them on the local root / queue runtime.
+//   - `cos_refill_ns_until` — pure-arithmetic helper used by the
+//     drain scheduler to compute "how long until enough tokens
+//     accrue for the next packet." (Stays in this module rather
+//     than the timer-wheel module because it has no dependency on
+//     `COS_TIMER_WHEEL_*` constants — the consumer
+//     `calc_cos_wake_ns` does the tick conversion separately.)
+//   - `release_cos_root_lease` / `release_all_cos_root_leases` /
+//     `release_all_cos_queue_leases` — return cross-binding lease
+//     bytes back to the shared pool on RG transitions / shutdown.
+//
+// `COS_MIN_BURST_BYTES` (64 × MTU) is the universal floor for both
+// root and per-queue burst caps and lives here as the canonical
+// owner of the constant.
+//
+// The 3 per-byte helpers (`refill_cos_tokens` and both
+// `maybe_top_up_*` helpers) carry `#[inline]` so the compiler still
+// inlines them across the cos/* boundary — same pattern Phase 2
+// (`cos_flow_bucket_index`, `cos_queue_prospective_active_flows`)
+// and Phase 3 (`cos_queue_flow_share_limit`,
+// `cos_flow_aware_buffer_limit`, `apply_cos_admission_ecn_policy`)
+// validated. The other 4 helpers fire at most once per drain loop
+// or once per RG-transition / shutdown, so they stay un-attributed.
+//
+// `tx_frame_capacity()` lives in the parent `afxdp` module and is
+// imported via `crate::afxdp::tx_frame_capacity` — Codex round-1
+// R1-2 caught the earlier mis-attribution to `super::tx::*`.
+
+use std::sync::Arc;
+
+use crate::afxdp::tx_frame_capacity;
+use crate::afxdp::types::{
+    CoSInterfaceRuntime, CoSQueueRuntime, SharedCoSQueueLease, SharedCoSRootLease,
+};
+use crate::afxdp::worker::BindingWorker;
+
+/// Universal floor for both root and per-queue burst-byte caps
+/// (64 × default MTU = 96 KB). Sized so a single max-len frame can
+/// always fit a freshly-allocated queue without immediately tripping
+/// the buffer-limit gate.
+pub(in crate::afxdp) const COS_MIN_BURST_BYTES: u64 = 64 * 1500;
+
+#[inline]
+pub(in crate::afxdp) fn maybe_top_up_cos_root_lease(
+    root: &mut CoSInterfaceRuntime,
+    shared_root_lease: &SharedCoSRootLease,
+    now_ns: u64,
+) {
+    // Ensure the target is at least tx_frame_capacity() so that a maximum-sized frame
+    // can always become eligible.  shared_root_lease already sizes max_total_leased using
+    // lease_bytes.max(tx_frame_capacity()), so the shared pool can always satisfy this.
+    let lease_bytes = shared_root_lease
+        .lease_bytes()
+        .max(tx_frame_capacity() as u64)
+        .min(root.burst_bytes.max(COS_MIN_BURST_BYTES));
+    if root.tokens >= lease_bytes {
+        return;
+    }
+    let grant = shared_root_lease.acquire(now_ns, lease_bytes.saturating_sub(root.tokens));
+    root.tokens = root
+        .tokens
+        .saturating_add(grant)
+        .min(root.burst_bytes.max(COS_MIN_BURST_BYTES));
+}
+
+#[inline]
+pub(in crate::afxdp) fn maybe_top_up_cos_queue_lease(
+    queue: &mut CoSQueueRuntime,
+    shared_queue_lease: Option<&Arc<SharedCoSQueueLease>>,
+    now_ns: u64,
+) {
+    if queue.exact {
+        let Some(shared_queue_lease) = shared_queue_lease else {
+            return;
+        };
+        let lease_bytes = shared_queue_lease
+            .lease_bytes()
+            .max(tx_frame_capacity() as u64)
+            .min(queue.buffer_bytes.max(COS_MIN_BURST_BYTES));
+        if queue.tokens >= lease_bytes {
+            return;
+        }
+        let grant = shared_queue_lease.acquire(now_ns, lease_bytes.saturating_sub(queue.tokens));
+        queue.tokens = queue
+            .tokens
+            .saturating_add(grant)
+            .min(queue.buffer_bytes.max(COS_MIN_BURST_BYTES));
+        queue.last_refill_ns = now_ns;
+        return;
+    }
+    let Some(shared_queue_lease) = shared_queue_lease else {
+        refill_cos_tokens(
+            &mut queue.tokens,
+            queue.transmit_rate_bytes,
+            queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
+            &mut queue.last_refill_ns,
+            now_ns,
+        );
+        return;
+    };
+    let lease_bytes = shared_queue_lease
+        .lease_bytes()
+        .max(tx_frame_capacity() as u64)
+        .min(queue.buffer_bytes.max(COS_MIN_BURST_BYTES));
+    if queue.tokens >= lease_bytes {
+        return;
+    }
+    let grant = shared_queue_lease.acquire(now_ns, lease_bytes.saturating_sub(queue.tokens));
+    queue.tokens = queue
+        .tokens
+        .saturating_add(grant)
+        .min(queue.buffer_bytes.max(COS_MIN_BURST_BYTES));
+    queue.last_refill_ns = now_ns;
+}
+
+#[inline]
+pub(in crate::afxdp) fn refill_cos_tokens(
+    tokens: &mut u64,
+    rate_bytes_per_sec: u64,
+    burst_bytes: u64,
+    last_refill_ns: &mut u64,
+    now_ns: u64,
+) {
+    if burst_bytes == 0 {
+        return;
+    }
+    if *last_refill_ns == 0 {
+        *tokens = burst_bytes;
+        *last_refill_ns = now_ns;
+        return;
+    }
+    if now_ns <= *last_refill_ns || rate_bytes_per_sec == 0 {
+        return;
+    }
+    let elapsed_ns = now_ns - *last_refill_ns;
+    let added = ((elapsed_ns as u128) * (rate_bytes_per_sec as u128) / 1_000_000_000u128) as u64;
+    if added == 0 {
+        return;
+    }
+    *tokens = tokens.saturating_add(added).min(burst_bytes);
+    *last_refill_ns = now_ns;
+}
+
+pub(in crate::afxdp) fn cos_refill_ns_until(tokens: u64, need: u64, rate_bytes_per_sec: u64) -> Option<u64> {
+    if tokens >= need {
+        return Some(0);
+    }
+    if rate_bytes_per_sec == 0 {
+        return None;
+    }
+    let deficit = need.saturating_sub(tokens) as u128;
+    let rate = rate_bytes_per_sec as u128;
+    Some(deficit.saturating_mul(1_000_000_000u128).div_ceil(rate) as u64)
+}
+
+pub(in crate::afxdp) fn release_cos_root_lease(binding: &mut BindingWorker, root_ifindex: i32) {
+    let released = binding
+        .cos_interfaces
+        .get_mut(&root_ifindex)
+        .map(|root| core::mem::take(&mut root.tokens))
+        .unwrap_or(0);
+    if released == 0 {
+        return;
+    }
+    if let Some(shared_root_lease) = binding
+        .cos_fast_interfaces
+        .get(&root_ifindex)
+        .and_then(|iface_fast| iface_fast.shared_root_lease.as_ref())
+    {
+        shared_root_lease.release_unused(released);
+    }
+}
+
+pub(in crate::afxdp) fn release_all_cos_root_leases(binding: &mut BindingWorker) {
+    let root_ifindexes = binding.cos_interfaces.keys().copied().collect::<Vec<_>>();
+    for root_ifindex in root_ifindexes {
+        release_cos_root_lease(binding, root_ifindex);
+    }
+}
+
+pub(in crate::afxdp) fn release_all_cos_queue_leases(binding: &mut BindingWorker) {
+    let queue_keys = binding
+        .cos_interfaces
+        .iter()
+        .flat_map(|(&root_ifindex, root)| {
+            root.queues
+                .iter()
+                .enumerate()
+                .filter(|(_, queue)| queue.exact && queue.tokens > 0)
+                .map(move |(queue_idx, _)| (root_ifindex, queue_idx))
+        })
+        .collect::<Vec<_>>();
+    for (root_ifindex, queue_idx) in queue_keys {
+        let released = binding
+            .cos_interfaces
+            .get_mut(&root_ifindex)
+            .and_then(|root| root.queues.get_mut(queue_idx))
+            .map(|queue| core::mem::take(&mut queue.tokens))
+            .unwrap_or(0);
+        if released == 0 {
+            continue;
+        }
+        if let Some(shared_queue_lease) = binding
+            .cos_fast_interfaces
+            .get(&root_ifindex)
+            .and_then(|iface_fast| iface_fast.queue_fast_path.get(queue_idx))
+            .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref())
+        {
+            shared_queue_lease.release_unused(released);
+        }
+    }
+}

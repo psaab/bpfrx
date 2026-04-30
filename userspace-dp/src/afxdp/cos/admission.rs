@@ -21,10 +21,13 @@
 // (`cos/queue_ops.rs`). See docs/pr/956-phase3-admission/plan.md
 // for the rationale (Gemini round-1 architectural finding).
 //
-// `COS_MIN_BURST_BYTES` STAYS in tx.rs (91 occurrences across
-// tx.rs, only 1 inside this module). Phase 4 (`token_bucket.rs`)
-// will inherit the same back-reference; the constant should be
-// consolidated to `types.rs` or `cos/mod.rs` in Phase 4 or 5.
+// `COS_MIN_BURST_BYTES` lived in tx.rs through Phase 3 with a
+// `pub(in crate::afxdp)` visibility bump so this module could reach
+// it via `use crate::afxdp::tx::COS_MIN_BURST_BYTES`. Phase 4 moved
+// the constant into `cos/token_bucket.rs`; this module now imports
+// it via `use super::COS_MIN_BURST_BYTES` (resolves to the
+// `cos/mod.rs` re-export). Importing via the parent re-export keeps
+// admission agnostic to which sibling module owns the constant.
 
 use crate::afxdp::types::{
     CoSInterfaceRuntime, CoSPendingTxItem, CoSQueueRuntime, WorkerCoSQueueFastPath,
@@ -33,7 +36,7 @@ use crate::afxdp::umem::MmapArea;
 
 use super::ecn::{maybe_mark_ecn_ce, maybe_mark_ecn_ce_prepared};
 use super::flow_hash::{cos_flow_hash_seed_from_os, cos_queue_prospective_active_flows};
-use crate::afxdp::tx::COS_MIN_BURST_BYTES;
+use super::COS_MIN_BURST_BYTES;
 
 /// Minimum per-flow admission share. Sized so TCP fast-retransmit can
 /// trigger reliably on a single-packet drop:

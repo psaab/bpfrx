@@ -1,5 +1,11 @@
 use super::*;
 
+// #956 Phase 4: explicit imports for items that moved out of tx.rs into
+// cos/token_bucket.rs. Without this, neither the local `use super::*;`
+// glob nor afxdp.rs's `use self::tx::*;` parent-module glob still reaches
+// them — the items no longer originate from tx.rs after the move.
+use super::cos::{release_all_cos_queue_leases, release_all_cos_root_leases};
+
 pub(crate) struct BindingWorker {
     pub(crate) slot: u32,
     pub(crate) queue_id: u32,
