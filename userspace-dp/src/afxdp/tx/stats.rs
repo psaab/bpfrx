@@ -94,7 +94,10 @@ where
         // resize up) corrupt an unrelated slot — `get_mut` returns
         // None on out-of-range, which keeps the hot path sound.
         // Pinned by the `tx_latency_hist_shared_umem_oob_offset_*`
-        // tests below.
+        // tests in `umem.rs::tests` (canonical pin location after
+        // #984 P2a — these tests reach this fn via
+        // `crate::afxdp::tx::stamp_submits` through the load-bearing
+        // re-export in `tx/mod.rs`).
         //
         // `debug_assert!` is deliberately NOT used here: tests drive
         // this path directly and we want release-parity semantics
@@ -105,18 +108,6 @@ where
     }
 }
 
-/// #812 test hook / decomposition aid: the pure per-offset fold from
-/// `reap_tx_completions`. Takes the sidecar slice, the list of
-/// completed offsets, and an injected `ts_completion` (so tests can
-/// drive deterministic deltas), plus the owner-profile atomic set.
-/// Same shape the live reap path runs — batched aggregation into
-/// local counters followed by at most N_buckets `fetch_add`s — so
-/// unit pins here exercise the production algorithm, not a test-only
-/// fake.
-///
-/// Returns `(count, sum_ns)` for callers that want to assert on the
-/// per-batch delta directly (rather than reading back the atomics
-/// afterward).
 /// #825: record a single `sendto` kick-latency sample into the owner
 /// atomics. Mirrors the shape of `record_tx_completions_with_stamp`
 /// but without the sidecar fold (the kick site stamps the bracket
@@ -139,6 +130,18 @@ pub(in crate::afxdp) fn record_kick_latency(owner: &OwnerProfileOwnerWrites, del
         .fetch_add(delta_ns, Ordering::Relaxed);
 }
 
+/// #812 test hook / decomposition aid: the pure per-offset fold from
+/// `reap_tx_completions`. Takes the sidecar slice, the list of
+/// completed offsets, and an injected `ts_completion` (so tests can
+/// drive deterministic deltas), plus the owner-profile atomic set.
+/// Same shape the live reap path runs — batched aggregation into
+/// local counters followed by at most N_buckets `fetch_add`s — so
+/// unit pins here exercise the production algorithm, not a test-only
+/// fake.
+///
+/// Returns `(count, sum_ns)` for callers that want to assert on the
+/// per-batch delta directly (rather than reading back the atomics
+/// afterward).
 #[inline]
 pub(in crate::afxdp) fn record_tx_completions_with_stamp(
     sidecar: &mut [u64],
