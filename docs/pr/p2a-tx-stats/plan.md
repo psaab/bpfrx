@@ -1,8 +1,15 @@
 # P2a: extract afxdp/tx/stats.rs from tx.rs
 
-Plan v2 — 2026-04-30. First PR after #990 (P1: cos/tx_completion.rs)
+Plan v4 — 2026-04-30. First PR after #990 (P1: cos/tx_completion.rs)
 merged. Stage 2 of the long sequence — opens the `afxdp/tx/` module
 directory split (#984 P2a..P2d).
+
+## v4 changelog vs v3 (from Codex cross-review on plan v3)
+
+- Plan version header updated from "v2" to "v4" (was stale).
+- Files-touched list now includes `userspace-dp/src/afxdp.rs` (step 1
+  modifies its `#[path]` attribute) — and removed the contradictory
+  "No other files change" line.
 
 ## v2 changelog vs v1 (from Codex round-1)
 
@@ -142,13 +149,16 @@ preserves the public path.
 
 ## Files touched
 
+- **MOD** `userspace-dp/src/afxdp.rs`: change `#[path = "afxdp/tx.rs"]`
+  to `#[path = "afxdp/tx/mod.rs"]` at line 99 (step 1).
 - **NEW** `userspace-dp/src/afxdp/tx/stats.rs`: ~140 LOC.
 - **RENAME** `userspace-dp/src/afxdp/tx.rs` → `userspace-dp/src/afxdp/tx/mod.rs`.
 - **MOD** `userspace-dp/src/afxdp/tx/mod.rs`: −110 LOC moved fns; +5
   LOC for the `mod stats;` + re-export.
 
-No other files change. `afxdp/mod.rs` does not change. No call sites
-update (re-export preserves identifiers).
+No call sites update (re-export preserves identifiers — every existing
+`crate::afxdp::tx::stamp_submits` etc. import resolves through the
+new `pub(in crate::afxdp) use stats::...` in `tx/mod.rs`).
 
 ## Tests
 
