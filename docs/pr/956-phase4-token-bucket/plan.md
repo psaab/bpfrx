@@ -1,9 +1,23 @@
 # #956 Phase 4: extract cos/token_bucket.rs from tx.rs
 
-Plan v4 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
+Plan v5 — 2026-04-29. Continues #956 (cos/ submodule decomposition).
 Phase 1 (cos/ecn.rs) shipped at PR #976; Phase 2 (cos/flow_hash.rs)
 at PR #977; Phase 3 (cos/admission.rs) at PR #978. Phase 4 = the
 token-bucket lease/refill subsystem.
+
+Round-4 changelog (v4 → v5): Codex round-4 returned PLAN-NEEDS-MINOR
+flagging that 3 of the 8 round-3 nits were called out in changelogs
+but never edited in the original body text. Fixed:
+- #6 nit: Round-1 changelog sentence (production sites for
+  COS_MIN_BURST_BYTES) now lists 1832, 5237, 5264, 5269 plus the
+  7 top-up-helper sites — matching the corrected main table.
+- #7 nit: Round-2 changelog sentence (worker.rs caller lines)
+  now lists root at 746/1613/1911 (not 746/1613) and queue at
+  747/755/1614/1912.
+- #8 nit: Approach-section visibility bullet rewritten to
+  acknowledge the cfg-gated test-reachable surface is 3 fns
+  (direct `tx::tests` calls 2; the `#[cfg(test)]` legacy
+  selector at tx.rs:1626 reaches a third).
 
 Round-3 changelog (v3 → v4): Codex round-3 returned PLAN-NEEDS-MAJOR
 with 1 substantive issue + 5 minor + 2 nits. All 8 are fixed in v4:
@@ -55,8 +69,9 @@ line-number fixes (move set + visibility unchanged):
   tx.rs:6824, but tx.rs:6380 is `mod tests {`, so 6824 is a
   test-module call. Re-labelled.
 - N2 (new): `release_all_cos_queue_leases` caller line numbers
-  in worker.rs were off by one — root calls at 746/1613, queue
-  calls at 747/1614/1912. Corrected to 747/755/1614/1912.
+  in worker.rs were off by one — root calls at 746/1613/1911,
+  queue calls at 747/755/1614/1912 (Codex round-3 #7 caught the
+  earlier wording also omitted worker.rs:1911 from the root list).
 - N3 (new): admission.rs header-note text in the Phase-1+2+3
   cleanup section had to be aligned with R1-5 (use the
   cos/mod.rs re-export, not a direct token_bucket path).
@@ -70,7 +85,9 @@ all wording-level (move list and visibility unchanged):
   not `cos/token_bucket -> tx`.
 - R1-3: clarified COS_MIN_BURST_BYTES non-test consumer set
   inside tx.rs (mostly tests after line 6380; production sites
-  at 1832, 5237, plus 7 inside the moving top-up helpers).
+  at 1832, 5237, 5264, 5269, plus 7 inside the moving top-up
+  helpers — round-3 #6 caught that 5264/5269 were missed in
+  this changelog sentence even though the table was correct).
 - R1-4: worker.rs gets the release helpers via a module-level
   `use super::*` glob at worker.rs:1, with `afxdp.rs:149`
   glob-importing tx — not via `super::tx::*`. The plan's fix
@@ -135,8 +152,14 @@ Create `userspace-dp/src/afxdp/cos/token_bucket.rs` with all 7 functions
 
 Visibility:
 - `pub(in crate::afxdp)`:
-  - All 7 functions (each has at least one cross-module caller in
-    tx.rs or worker.rs; tests call 2 of them).
+  - All 7 functions (each has at least one non-test cross-module
+    caller in tx.rs or worker.rs). Direct `tx::tests` calls land
+    on 2 helpers (`maybe_top_up_cos_root_lease` at tx.rs:6824 and
+    `maybe_top_up_cos_queue_lease` at tx.rs:6873); additional
+    `#[cfg(test)]`-gated call sites in `select_cos_guarantee_batch_with_fast_path`
+    at tx.rs:1626 cover a third helper (`refill_cos_tokens` at
+    tx.rs:1651) — so the cfg-gated reachable surface is 3 fns
+    (Codex round-3 #8 caught the earlier "tests call 2" wording).
   - `COS_MIN_BURST_BYTES` (91 tx.rs sites + 3 admission.rs sites).
 - File-private: nothing (token-bucket is a thin layer with no
   internal-only state helpers).
