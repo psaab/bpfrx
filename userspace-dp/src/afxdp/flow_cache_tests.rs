@@ -1,7 +1,7 @@
 // Tests for afxdp/flow_cache.rs — relocated from inline
 // `#[cfg(test)] mod tests` to keep flow_cache.rs under the modularity-discipline
 // LOC threshold. Loaded as a sibling submodule via
-// `#[path = "tests.rs"]` from mod.rs.
+// `#[path = "flow_cache_tests.rs"]` from flow_cache.rs.
 
 use super::*;
 use crate::test_zone_ids::*;
