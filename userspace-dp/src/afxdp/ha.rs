@@ -60,7 +60,7 @@ impl super::Coordinator {
                 &self.shared_forward_wire_sessions,
                 &self.shared_owner_rg_indexes,
                 &self.forwarding,
-                &self.neighbors.dynamic,
+                self.dynamic_neighbors_ref(),
                 &demoted_rgs,
             );
             // Bump RG epochs atomically — O(1) invalidation. Workers will
@@ -135,7 +135,7 @@ impl super::Coordinator {
             session_map_fd,
             &self.forwarding,
             current.as_ref(),
-            &self.neighbors.dynamic,
+            self.dynamic_neighbors_ref(),
             activated_rgs,
             now_secs,
         );
@@ -246,7 +246,7 @@ impl super::Coordinator {
             synthesized_synced_reverse_entry(
                 &self.forwarding,
                 ha_state.as_ref(),
-                &self.neighbors.dynamic,
+                self.dynamic_neighbors_ref(),
                 &entry,
                 now_secs,
             )
@@ -279,7 +279,7 @@ impl super::Coordinator {
         refresh_reverse_prewarm_owner_rg_indexes(
             &self.shared_owner_rg_indexes.reverse_prewarm_sessions,
             &self.forwarding,
-            &self.neighbors.dynamic,
+            self.dynamic_neighbors_ref(),
             previous_entry.as_ref(),
             Some(&entry),
         );
@@ -348,7 +348,7 @@ impl super::Coordinator {
         refresh_reverse_prewarm_owner_rg_indexes(
             &self.shared_owner_rg_indexes.reverse_prewarm_sessions,
             &self.forwarding,
-            &self.neighbors.dynamic,
+            self.dynamic_neighbors_ref(),
             removed_entry.as_ref(),
             None,
         );
