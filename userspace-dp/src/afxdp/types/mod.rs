@@ -26,6 +26,10 @@ pub(in crate::afxdp) use forwarding::*;
 pub use forwarding::NeighborEntry;
 pub(crate) use forwarding::{ForwardingDisposition, ForwardingResolution};
 
+// Issue 68.3: TX-request types extracted into types/tx.rs.
+mod tx;
+pub(in crate::afxdp) use tx::*;
+
 pub(super) type FastMap<K, V> = FxHashMap<K, V>;
 pub(super) type FastSet<T> = FxHashSet<T>;
 pub(super) type OwnerRgSessionIndex = FastMap<i32, FastSet<SessionKey>>;
@@ -279,20 +283,6 @@ impl HAGroupRuntime {
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SessionFlow {
     pub(super) src_ip: IpAddr,
@@ -343,90 +333,6 @@ impl ResolutionDebug {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct TxRequest {
-    pub(super) bytes: Vec<u8>,
-    #[allow(dead_code)]
-    pub(super) expected_ports: Option<(u16, u16)>,
-    #[allow(dead_code)]
-    pub(super) expected_addr_family: u8,
-    #[allow(dead_code)]
-    pub(super) expected_protocol: u8,
-    pub(super) flow_key: Option<SessionKey>,
-    pub(super) egress_ifindex: i32,
-    pub(super) cos_queue_id: Option<u8>,
-    pub(super) dscp_rewrite: Option<u8>,
-}
-
-pub(super) enum PendingForwardFrame {
-    Live,
-    Owned(Vec<u8>),
-    Prebuilt(Vec<u8>),
-}
-
-impl Default for PendingForwardFrame {
-    fn default() -> Self {
-        Self::Live
-    }
-}
-
-pub(super) struct PendingForwardRequest {
-    pub(super) target_ifindex: i32,
-    pub(super) target_binding_index: Option<usize>,
-    pub(super) ingress_queue_id: u32,
-    pub(super) desc: XdpDesc,
-    pub(super) frame: PendingForwardFrame,
-    pub(super) meta: ForwardPacketMeta,
-    pub(super) decision: SessionDecision,
-    pub(super) apply_nat_on_fabric: bool,
-    pub(super) expected_ports: Option<(u16, u16)>,
-    pub(super) flow_key: Option<SessionKey>,
-    pub(super) nat64_reverse: Option<Nat64ReverseInfo>,
-    pub(super) cos_queue_id: Option<u8>,
-    pub(super) dscp_rewrite: Option<u8>,
-}
-
-pub(super) struct PreparedTxRequest {
-    pub(super) offset: u64,
-    pub(super) len: u32,
-    pub(super) recycle: PreparedTxRecycle,
-    #[allow(dead_code)]
-    pub(super) expected_ports: Option<(u16, u16)>,
-    #[allow(dead_code)]
-    pub(super) expected_addr_family: u8,
-    #[allow(dead_code)]
-    pub(super) expected_protocol: u8,
-    pub(super) flow_key: Option<SessionKey>,
-    pub(super) egress_ifindex: i32,
-    pub(super) cos_queue_id: Option<u8>,
-    pub(super) dscp_rewrite: Option<u8>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ExactLocalScratchTxRequest {
-    pub(super) offset: u64,
-    pub(super) len: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ExactPreparedScratchTxRequest {
-    pub(super) offset: u64,
-    pub(super) len: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum PreparedTxRecycle {
-    FreeTxFrame,
-    FillOnSlot(u32),
-}
-
-#[derive(Debug)]
-pub(super) struct LocalTunnelTxPlan {
-    pub(super) tx_ifindex: i32,
-    pub(super) tx_request: TxRequest,
-    pub(super) session_entry: SyncedSessionEntry,
-    pub(super) reverse_session_entry: Option<SyncedSessionEntry>,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LearnedNeighborKey {
