@@ -850,7 +850,11 @@ pub(in crate::afxdp) fn try_parse_metadata(area: &MmapArea, desc: XdpDesc) -> Op
     }
     let meta_offset = (desc.addr as usize).checked_sub(meta_len)?;
     let bytes = area.slice(meta_offset, meta_len)?;
-    let meta = unsafe { *(bytes.as_ptr() as *const UserspaceDpMeta) };
+    // ptr::read_unaligned: bytes is &[u8] with no alignment guarantee;
+    // dereferencing as *const UserspaceDpMeta directly would be UB on
+    // architectures that fault on misaligned loads (the x86 host happens
+    // to tolerate it but it's still UB and a portability footgun).
+    let meta = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const UserspaceDpMeta) };
     if meta.magic != USERSPACE_META_MAGIC || meta.version != USERSPACE_META_VERSION {
         return None;
     }
