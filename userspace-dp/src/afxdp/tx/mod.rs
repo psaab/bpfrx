@@ -87,12 +87,7 @@ use cos_classify::enqueue_prepared_into_cos;
 // Production code uses the entry points re-exported from
 // cos/mod.rs (marker fns + flow-hash + admission gates +
 // flow-fair promotion entry + token-bucket helpers + queue-ops
-// fns). The remaining ECN constants/thresholds are referenced
-// only by admission tests in `tx::tests`; the ECN parser and
-// per-family ECN helpers (`ethernet_l3`, `mark_ecn_ce_*`) moved
-// with their unit tests to `cos/ecn.rs` in #984 P3 phase 2c.
-// Imports are gated behind `#[cfg(test)]` to avoid
-// `unused_imports` warnings in non-test builds.
+// fns).
 use super::cos::{
     apply_cos_admission_ecn_policy, cos_flow_aware_buffer_limit, cos_flow_bucket_index,
     cos_item_flow_key, cos_queue_drain_all, cos_queue_flow_share_limit,

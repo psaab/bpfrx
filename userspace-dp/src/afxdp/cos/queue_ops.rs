@@ -14,8 +14,8 @@
 //   - MQFQ ordering bookkeeping (Phase 3 deferred these — Gemini
 //     Phase 3 round-1 finding): account_cos_queue_flow_enqueue,
 //     account_cos_queue_flow_dequeue. Both are
-//     pub(in crate::afxdp) with cfg-gated re-export from cos/mod.rs
-//     because tx::tests still reaches them directly at 14 sites.
+//     pub(in crate::afxdp); colocated tests live in this file's
+//     `mod tests` (#984 P3 phase 5a).
 //   - V-min slot lifecycle: publish_committed_queue_vtime,
 //     cos_queue_v_min_consume_suspension, cos_queue_v_min_continue,
 //     and the file-private compute_v_min_lag_threshold helper plus
