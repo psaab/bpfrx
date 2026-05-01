@@ -1133,6 +1133,7 @@ fn restore_cos_prepared_items(
     refresh_cos_interface_activity(binding, root_ifindex);
 }
 
+
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

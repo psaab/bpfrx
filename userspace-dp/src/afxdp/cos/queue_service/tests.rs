@@ -4,8 +4,8 @@
 // `#[path = "tests.rs"]` from mod.rs.
 
 use super::*;
-use crate::afxdp::cos::admission::apply_cos_queue_flow_fair_promotion;
 use crate::afxdp::tx::test_support::*;
+use crate::afxdp::cos::admission::apply_cos_queue_flow_fair_promotion;
 use crate::afxdp::PROTO_TCP;
 
 #[test]
@@ -565,9 +565,7 @@ fn apply_promotion_pairs_queues_with_their_fast_path_entries() {
     );
 }
 
-use crate::afxdp::types::{
-    CoSQueueConfig, CoSQueueDropCounters, CoSQueueOwnerProfile, FlowRrRing, COS_FLOW_FAIR_BUCKETS,
-};
+use crate::afxdp::types::{COS_FLOW_FAIR_BUCKETS, CoSQueueConfig, CoSQueueDropCounters, CoSQueueOwnerProfile, FlowRrRing};
 
 #[test]
 fn cos_batch_tx_made_progress_requires_real_send_progress() {
