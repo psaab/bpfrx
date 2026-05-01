@@ -134,15 +134,15 @@ use super::cos::{
     account_cos_queue_flow_dequeue, account_cos_queue_flow_enqueue,
     apply_cos_queue_flow_fair_promotion, bdp_floor_bytes,
     build_cos_interface_runtime, redirect_local_cos_request_to_owner_binding,
-    cos_guarantee_quantum_bytes, cos_queue_clear_orphan_snapshot_after_drop,
+    cos_queue_clear_orphan_snapshot_after_drop,
     cos_queue_pop_front, cos_queue_prospective_active_flows,
     cos_queue_v_min_consume_suspension, cos_queue_v_min_continue,
-    CoSBatch, ExactCoSScratchBuild, COS_MIN_BURST_BYTES,
+    ExactCoSScratchBuild, COS_MIN_BURST_BYTES,
     drain_exact_local_fifo_items_to_scratch, drain_exact_local_items_to_scratch_flow_fair,
     drain_exact_prepared_fifo_items_to_scratch,
     drain_exact_prepared_items_to_scratch_flow_fair, select_cos_guarantee_batch, select_cos_guarantee_batch_with_fast_path,
-    select_cos_surplus_batch, select_exact_cos_guarantee_queue_with_fast_path,
-    select_nonexact_cos_guarantee_batch, settle_exact_local_fifo_submission,
+    select_exact_cos_guarantee_queue_with_fast_path,
+    settle_exact_local_fifo_submission,
     settle_exact_local_scratch_submission_flow_fair, settle_exact_prepared_fifo_submission, COS_ECN_MARK_THRESHOLD_DEN, COS_ECN_MARK_THRESHOLD_NUM,
     COS_FLOW_FAIR_MIN_SHARE_BYTES, ECN_CE, ECN_ECT_0, ECN_MASK, ECN_NOT_ECT,
     V_MIN_CONSECUTIVE_SKIP_HARD_CAP, V_MIN_SUSPENSION_BATCHES,
@@ -156,7 +156,7 @@ use super::cos::{
 #[cfg(test)]
 use super::cos::{
     advance_cos_timer_wheel, cos_queue_push_front, park_cos_queue,
-    CoSServicePhase, COS_TIMER_WHEEL_TICK_NS,
+    COS_TIMER_WHEEL_TICK_NS,
 };
 
 

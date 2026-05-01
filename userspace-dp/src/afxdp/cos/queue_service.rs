@@ -2354,7 +2354,7 @@ mod tests {
     /// stops scaling with `transmit_rate_bytes`.
     #[test]
     fn guarantee_phase_quantum_scales_with_rate() {
-        // cos_guarantee_quantum_bytes is already imported at the top of tx.rs (cfg(test) block).
+        // cos_guarantee_quantum_bytes reached via super in cos/queue_service.
         let high_rate = test_cos_runtime_with_queues(
             10_000_000_000u64 / 8,
             vec![CoSQueueConfig {
