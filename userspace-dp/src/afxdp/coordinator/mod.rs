@@ -1,6 +1,8 @@
 use super::*;
 mod bpf_maps;
+mod neighbor_manager;
 pub(crate) use bpf_maps::BpfMaps;
+pub(crate) use neighbor_manager::NeighborManager;
 
 pub struct Coordinator {
     pub(crate) bpf_maps: BpfMaps,
@@ -25,10 +27,7 @@ pub struct Coordinator {
     pub(crate) shared_cos_queue_vtime_floors:
         Arc<ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueVtimeFloor>>>>,
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
-    pub(crate) dynamic_neighbors: Arc<ShardedNeighborMap>,
-    pub(crate) neighbor_generation: Arc<AtomicU64>,
-    pub(crate) manager_neighbor_keys: Arc<Mutex<FastSet<(i32, IpAddr)>>>,
-    pub(crate) neigh_monitor_stop: Option<Arc<AtomicBool>>,
+    pub(crate) neighbors: NeighborManager,
     pub(crate) shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     pub(crate) shared_nat_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     pub(crate) shared_forward_wire_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -78,10 +77,7 @@ impl Coordinator {
             shared_cos_queue_leases: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_cos_queue_vtime_floors: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
-            dynamic_neighbors: Arc::new(ShardedNeighborMap::new()),
-            neighbor_generation: Arc::new(AtomicU64::new(0)),
-            manager_neighbor_keys: Arc::new(Mutex::new(FastSet::default())),
-            neigh_monitor_stop: None,
+            neighbors: NeighborManager::new(),
             shared_sessions: Arc::new(Mutex::new(FastMap::default())),
             shared_nat_sessions: Arc::new(Mutex::new(FastMap::default())),
             shared_forward_wire_sessions: Arc::new(Mutex::new(FastMap::default())),
@@ -146,7 +142,7 @@ impl Coordinator {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn dynamic_neighbors_ref(&self) -> &Arc<ShardedNeighborMap> {
-        &self.dynamic_neighbors
+        &self.neighbors.dynamic
     }
 
     /// #919: zone name → ID lookup, used by main.rs's
@@ -163,14 +159,14 @@ impl Coordinator {
         neighbors: &[(i32, IpAddr, NeighborEntry)],
     ) {
         let old_manager_keys = if replace {
-            self.manager_neighbor_keys
+            self.neighbors.manager_keys
                 .lock()
                 .map(|manager_keys| manager_keys.iter().copied().collect::<Vec<_>>())
                 .unwrap_or_default()
         } else {
             Vec::new()
         };
-        if let Ok(mut manager_keys) = self.manager_neighbor_keys.lock() {
+        if let Ok(mut manager_keys) = self.neighbors.manager_keys.lock() {
             if replace {
                 manager_keys.clear();
             }
@@ -182,7 +178,7 @@ impl Coordinator {
         // readers see either the pre-replace or post-replace state,
         // never a half-replaced set. `with_all_shards` locks all 64
         // shards in shard-index order (deadlock-free invariant).
-        self.dynamic_neighbors.with_all_shards(|bulk| {
+        self.neighbors.dynamic.with_all_shards(|bulk| {
             if replace {
                 for key in &old_manager_keys {
                     bulk.remove(key);
@@ -209,12 +205,12 @@ impl Coordinator {
             self.shared_forwarding
                 .store(Arc::new(self.forwarding.clone()));
         }
-        self.neighbor_generation.fetch_add(1, Ordering::Relaxed);
+        self.neighbors.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn dynamic_neighbor_status(&self) -> (usize, u64) {
-        let entries = self.dynamic_neighbors.len();
-        let generation = self.neighbor_generation.load(Ordering::Relaxed);
+        let entries = self.neighbors.dynamic.len();
+        let generation = self.neighbors.generation.load(Ordering::Relaxed);
         (entries, generation)
     }
 
@@ -235,7 +231,7 @@ impl Coordinator {
     }
 
     pub(crate) fn stop_inner(&mut self, clear_synced_state: bool) {
-        if let Some(stop) = self.neigh_monitor_stop.take() {
+        if let Some(stop) = self.neighbors.monitor_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
         for handle in self.tunnel_sources.values_mut() {
@@ -303,14 +299,14 @@ impl Coordinator {
         self.shared_validation
             .store(Arc::new(ValidationState::default()));
         self.shared_fabrics.store(Arc::new(Vec::new()));
-        self.neighbor_generation.store(0, Ordering::Relaxed);
+        self.neighbors.generation.store(0, Ordering::Relaxed);
         // #949: clear all shards atomically vs readers.
-        self.dynamic_neighbors.with_all_shards(|bulk| {
+        self.neighbors.dynamic.with_all_shards(|bulk| {
             for shard in bulk.each_shard_mut() {
                 shard.clear();
             }
         });
-        if let Ok(mut manager_keys) = self.manager_neighbor_keys.lock() {
+        if let Ok(mut manager_keys) = self.neighbors.manager_keys.lock() {
             manager_keys.clear();
         }
         if clear_synced_state {
@@ -707,7 +703,7 @@ impl Coordinator {
                 .collect::<Vec<_>>();
             let worker_commands_by_id = worker_command_queues.clone();
             let ha_state = self.ha_state.clone();
-            let dynamic_neighbors = self.dynamic_neighbors.clone();
+            let dynamic_neighbors = self.neighbors.dynamic.clone();
             let worker_poll_mode = self.poll_mode;
             let shared_fabrics = self.shared_fabrics.clone();
             let rg_epochs = self.rg_epochs.clone();
@@ -817,18 +813,18 @@ impl Coordinator {
         // Start the helper-owned neighbor sync path. It does an initial
         // RTM_GETNEIGH dump so startup sees the existing kernel table, then
         // subscribes to RTM_{NEW,DEL}NEIGH for incremental updates.
-        if self.neigh_monitor_stop.is_none() {
+        if self.neighbors.monitor_stop.is_none() {
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = stop.clone();
-            let dynamic_neighbors = self.dynamic_neighbors.clone();
-            let neighbor_generation = self.neighbor_generation.clone();
+            let dynamic_neighbors = self.neighbors.dynamic.clone();
+            let neighbor_generation = self.neighbors.generation.clone();
             thread::Builder::new()
                 .name("neigh-monitor".to_string())
                 .spawn(move || {
                     neigh_monitor_thread(stop_clone, dynamic_neighbors, neighbor_generation)
                 })
                 .ok();
-            self.neigh_monitor_stop = Some(stop);
+            self.neighbors.monitor_stop = Some(stop);
         }
         self.spawn_local_tunnel_sources();
         self.refresh_bindings(bindings);
@@ -852,7 +848,7 @@ impl Coordinator {
             let stop_clone = stop.clone();
             let forwarding = self.forwarding.clone();
             let ha_state = self.ha_state.clone();
-            let dynamic_neighbors = self.dynamic_neighbors.clone();
+            let dynamic_neighbors = self.neighbors.dynamic.clone();
             let live = self.live.clone();
             let identities = self.identities.clone();
             let shared_sessions = self.shared_sessions.clone();
@@ -1011,7 +1007,7 @@ impl Coordinator {
         let new_fabrics = resolve_fabric_links_from_snapshots(
             snapshots,
             &self.forwarding.egress,
-            &self.dynamic_neighbors,
+            &self.neighbors.dynamic,
         );
         if !new_fabrics.is_empty() {
             self.forwarding.fabrics = new_fabrics.clone();
@@ -1044,7 +1040,7 @@ impl Coordinator {
                     .map(|ip| (neigh.ifindex, ip))
             })
             .collect::<FastSet<_>>();
-        let old_manager_keys = if let Ok(mut manager_keys) = self.manager_neighbor_keys.lock() {
+        let old_manager_keys = if let Ok(mut manager_keys) = self.neighbors.manager_keys.lock() {
             let old = manager_keys.iter().copied().collect::<Vec<_>>();
             *manager_keys = next_manager_keys;
             old
@@ -1052,7 +1048,7 @@ impl Coordinator {
             Vec::new()
         };
         // #949: bulk-remove stale manager keys atomically vs readers.
-        self.dynamic_neighbors.with_all_shards(|bulk| {
+        self.neighbors.dynamic.with_all_shards(|bulk| {
             for key in &old_manager_keys {
                 bulk.remove(key);
             }
