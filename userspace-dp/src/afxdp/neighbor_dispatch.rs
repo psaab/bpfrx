@@ -173,7 +173,7 @@ pub(super) fn learn_dynamic_neighbor_from_packet(
     *last_learned_neighbor = Some(learned);
 }
 
-fn learn_dynamic_neighbor(
+pub(super) fn learn_dynamic_neighbor(
     forwarding: &ForwardingState,
     dynamic_neighbors: &Arc<ShardedNeighborMap>,
     ingress_ifindex: i32,
