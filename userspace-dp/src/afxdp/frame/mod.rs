@@ -1,9 +1,22 @@
 use super::*;
 
-#[cfg_attr(not(test), allow(dead_code))]
 mod checksum;
-pub(in crate::afxdp) use checksum::*;
+// Cross-module helpers reach into `frame::*` via the explicit list
+// below. `adjust_l4_checksum_ipv6_addr_bytes` is file-private to
+// `checksum.rs` (only the SNAT/DNAT rewrites here call it) and is
+// pulled in via a non-pub `use` to avoid a glob re-export at a
+// wider visibility than its own.
+pub(in crate::afxdp) use checksum::{
+    adjust_ipv4_header_checksum, adjust_l4_checksum_ipv4, adjust_l4_checksum_ipv4_dst,
+    adjust_l4_checksum_ipv4_src, adjust_l4_checksum_ipv4_words, adjust_l4_checksum_ipv6,
+    adjust_l4_checksum_ipv6_dst, adjust_l4_checksum_ipv6_src, adjust_l4_checksum_ipv6_words,
+    checksum16, checksum16_add_bytes, checksum16_adjust, checksum16_finish, checksum16_ipv4,
+    checksum16_ipv6, ipv4_words, ipv6_words, ipv6_words_from_octets, ipv6_words_from_slice,
+    recompute_l4_checksum_ipv4, recompute_l4_checksum_ipv6,
+};
+use checksum::adjust_l4_checksum_ipv6_addr_bytes;
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn authoritative_forward_ports(
     frame: &[u8],
     meta: UserspaceDpMeta,
