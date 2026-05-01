@@ -2209,3 +2209,618 @@ fn restore_cos_prepared_items(
     refresh_cos_interface_activity(binding, root_ifindex);
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::afxdp::tx::test_support::*;
+    use crate::afxdp::PROTO_TCP;
+    use crate::afxdp::types::{COS_FLOW_FAIR_BUCKETS, CoSQueueConfig, CoSQueueDropCounters, CoSQueueOwnerProfile, FlowRrRing};
+
+    #[test]
+    fn cos_batch_tx_made_progress_requires_real_send_progress() {
+        assert!(!cos_batch_tx_made_progress(Ok((0, 0))));
+        assert!(cos_batch_tx_made_progress(Ok((1, 0))));
+        assert!(cos_batch_tx_made_progress(Ok((0, 1500))));
+    }
+
+    #[test]
+    fn cos_batch_tx_made_progress_yields_on_retry_and_drop() {
+        assert!(!cos_batch_tx_made_progress(Err(TxError::Retry(
+            "no free TX frame available".to_string()
+        ))));
+        assert!(!cos_batch_tx_made_progress(Err(TxError::Drop(
+            "tx ring insert failed".to_string()
+        ))));
+    }
+
+    #[test]
+    fn drain_exact_local_fifo_items_to_scratch_keeps_queue_until_commit() {
+        let area = MmapArea::new(4096).expect("mmap");
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Local(TxRequest {
+                bytes: vec![1, 2, 3, 4],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Local(TxRequest {
+                bytes: vec![5, 6, 7, 8],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
+                offset: 256,
+                len: 4,
+                recycle: PreparedTxRecycle::FreeTxFrame,
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+
+        let mut free_tx_frames = VecDeque::from([64, 128, 192]);
+        let mut scratch_local_tx = Vec::new();
+
+        let build = drain_exact_local_fifo_items_to_scratch(
+            &mut root.queues[0],
+            &mut free_tx_frames,
+            &mut scratch_local_tx,
+            &area,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+
+        assert!(matches!(build, ExactCoSScratchBuild::Ready));
+        assert_eq!(scratch_local_tx.len(), 2);
+        assert_eq!(free_tx_frames, VecDeque::from([192]));
+        assert_eq!(area.slice(64, 4).expect("first frame"), &[1, 2, 3, 4]);
+        assert_eq!(area.slice(128, 4).expect("second frame"), &[5, 6, 7, 8]);
+        assert!(matches!(
+            root.queues[0].items.front(),
+            Some(CoSPendingTxItem::Local(_))
+        ));
+        assert!(matches!(
+            root.queues[0].items.get(2),
+            Some(CoSPendingTxItem::Prepared(_))
+        ));
+    }
+
+    #[test]
+    fn release_exact_local_scratch_frames_preserves_queue_after_failed_submit() {
+        let area = MmapArea::new(4096).expect("mmap");
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Local(TxRequest {
+                bytes: vec![1],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Local(TxRequest {
+                bytes: vec![2],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        let mut free_tx_frames = VecDeque::from([64, 128]);
+        let mut scratch_local_tx = Vec::new();
+
+        let build = drain_exact_local_fifo_items_to_scratch(
+            &mut root.queues[0],
+            &mut free_tx_frames,
+            &mut scratch_local_tx,
+            &area,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+
+        assert!(matches!(build, ExactCoSScratchBuild::Ready));
+        release_exact_local_scratch_frames(&mut free_tx_frames, &mut scratch_local_tx);
+        assert!(scratch_local_tx.is_empty());
+        assert_eq!(free_tx_frames, VecDeque::from([64, 128]));
+        assert_eq!(root.queues[0].items.len(), 2);
+        match root.queues[0].items.pop_front().expect("first queued") {
+            CoSPendingTxItem::Local(req) => assert_eq!(req.bytes, vec![1]),
+            CoSPendingTxItem::Prepared(_) => panic!("unexpected prepared item"),
+        }
+        match root.queues[0].items.pop_front().expect("second queued") {
+            CoSPendingTxItem::Local(req) => assert_eq!(req.bytes, vec![2]),
+            CoSPendingTxItem::Prepared(_) => panic!("unexpected prepared item"),
+        }
+    }
+
+    #[test]
+    fn settle_exact_local_fifo_submission_pops_only_committed_prefix() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Local(TxRequest {
+                bytes: vec![1],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Local(TxRequest {
+                bytes: vec![2],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Local(TxRequest {
+                bytes: vec![3],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        let mut free_tx_frames = VecDeque::new();
+        let mut scratch_local_tx = vec![
+            ExactLocalScratchTxRequest { offset: 64, len: 1 },
+            ExactLocalScratchTxRequest {
+                offset: 128,
+                len: 1,
+            },
+            ExactLocalScratchTxRequest {
+                offset: 192,
+                len: 1,
+            },
+        ];
+
+        let (sent_packets, sent_bytes) = settle_exact_local_fifo_submission(
+            Some(&mut root.queues[0]),
+            &mut free_tx_frames,
+            &mut scratch_local_tx,
+            1,
+        );
+
+        assert_eq!(sent_packets, 1);
+        assert_eq!(sent_bytes, 1);
+        assert!(scratch_local_tx.is_empty());
+        assert_eq!(free_tx_frames, VecDeque::from([128, 192]));
+        assert_eq!(root.queues[0].items.len(), 2);
+        match root.queues[0].items.pop_front().expect("first restored") {
+            CoSPendingTxItem::Local(req) => assert_eq!(req.bytes, vec![2]),
+            CoSPendingTxItem::Prepared(_) => panic!("unexpected prepared restored item"),
+        }
+        match root.queues[0].items.pop_front().expect("second restored") {
+            CoSPendingTxItem::Local(req) => assert_eq!(req.bytes, vec![3]),
+            CoSPendingTxItem::Prepared(_) => panic!("unexpected prepared restored item"),
+        }
+    }
+
+    #[test]
+    fn release_exact_prepared_scratch_preserves_queue_after_failed_submit() {
+        let area = MmapArea::new(4096).expect("mmap");
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
+                offset: 64,
+                len: 4,
+                recycle: PreparedTxRecycle::FreeTxFrame,
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        let frame = unsafe { area.slice_mut_unchecked(64, 4) }.expect("frame");
+        frame.copy_from_slice(&[1, 2, 3, 4]);
+        let mut scratch_prepared_tx = Vec::new();
+        let mut free_tx_frames = VecDeque::new();
+        let mut pending_fill_frames = VecDeque::new();
+
+        let build = drain_exact_prepared_fifo_items_to_scratch(
+            &mut root.queues[0],
+            &mut scratch_prepared_tx,
+            &area,
+            &mut free_tx_frames,
+            &mut pending_fill_frames,
+            7,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+
+        assert!(matches!(build, ExactCoSScratchBuild::Ready));
+        release_exact_prepared_scratch(&mut scratch_prepared_tx);
+        assert!(scratch_prepared_tx.is_empty());
+        assert_eq!(root.queues[0].items.len(), 1);
+        match root.queues[0].items.front().expect("queued prepared") {
+            CoSPendingTxItem::Prepared(req) => assert_eq!(req.offset, 64),
+            CoSPendingTxItem::Local(_) => panic!("unexpected local item"),
+        }
+    }
+
+    #[test]
+    fn settle_exact_prepared_fifo_submission_pops_only_committed_prefix() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
+                offset: 64,
+                len: 1,
+                recycle: PreparedTxRecycle::FillOnSlot(7),
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
+                offset: 128,
+                len: 1,
+                recycle: PreparedTxRecycle::FreeTxFrame,
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
+                offset: 192,
+                len: 1,
+                recycle: PreparedTxRecycle::FillOnSlot(9),
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        let mut scratch_prepared_tx = vec![
+            ExactPreparedScratchTxRequest { offset: 64, len: 1 },
+            ExactPreparedScratchTxRequest {
+                offset: 128,
+                len: 1,
+            },
+            ExactPreparedScratchTxRequest {
+                offset: 192,
+                len: 1,
+            },
+        ];
+        let mut in_flight_prepared_recycles = FastMap::default();
+
+        let (sent_packets, sent_bytes) = settle_exact_prepared_fifo_submission(
+            Some(&mut root.queues[0]),
+            &mut scratch_prepared_tx,
+            &mut in_flight_prepared_recycles,
+            1,
+        );
+
+        assert_eq!(sent_packets, 1);
+        assert_eq!(sent_bytes, 1);
+        assert!(scratch_prepared_tx.is_empty());
+        assert_eq!(
+            in_flight_prepared_recycles.get(&64),
+            Some(&PreparedTxRecycle::FillOnSlot(7))
+        );
+        assert!(!in_flight_prepared_recycles.contains_key(&128));
+        assert!(!in_flight_prepared_recycles.contains_key(&192));
+        assert_eq!(root.queues[0].items.len(), 2);
+        match root.queues[0].items.pop_front().expect("first restored") {
+            CoSPendingTxItem::Prepared(req) => assert_eq!(req.offset, 128),
+            CoSPendingTxItem::Local(_) => panic!("unexpected local restored item"),
+        }
+        match root.queues[0].items.pop_front().expect("second restored") {
+            CoSPendingTxItem::Prepared(req) => assert_eq!(req.offset, 192),
+            CoSPendingTxItem::Local(_) => panic!("unexpected local restored item"),
+        }
+    }
+
+    #[test]
+    fn assign_local_dscp_rewrite_preserves_existing_filter_rewrite() {
+        let mut items = VecDeque::from([
+            TxRequest {
+                bytes: vec![0; 64],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 42,
+                cos_queue_id: Some(0),
+                dscp_rewrite: None,
+            },
+            TxRequest {
+                bytes: vec![0; 64],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 42,
+                cos_queue_id: Some(0),
+                dscp_rewrite: Some(0),
+            },
+        ]);
+
+        assign_local_dscp_rewrite(&mut items, Some(46));
+
+        assert_eq!(items[0].dscp_rewrite, Some(46));
+        assert_eq!(items[1].dscp_rewrite, Some(0));
+    }
+
+    #[test]
+    fn estimate_cos_queue_wakeup_tick_uses_token_deficits() {
+        let mut root = test_cos_interface_runtime(0);
+        root.tokens = 0;
+        root.queues[0].tokens = 0;
+
+        let wake_tick = estimate_cos_queue_wakeup_tick(
+            root.tokens,
+            root.shaping_rate_bytes,
+            root.queues[0].tokens,
+            root.queues[0].transmit_rate_bytes,
+            1500,
+            0,
+            true,
+        )
+        .expect("wake tick");
+
+        assert_eq!(wake_tick, 30);
+    }
+
+    #[test]
+    fn estimate_cos_queue_wakeup_tick_ignores_queue_deficit_for_surplus() {
+        let mut root = test_cos_interface_runtime(0);
+        root.tokens = 0;
+        root.queues[0].tokens = 0;
+
+        let wake_tick = estimate_cos_queue_wakeup_tick(
+            root.tokens,
+            root.shaping_rate_bytes,
+            root.queues[0].tokens,
+            root.queues[0].transmit_rate_bytes,
+            1500,
+            0,
+            false,
+        )
+        .expect("wake tick");
+
+        assert_eq!(wake_tick, 30);
+    }
+
+    #[test]
+    fn restore_cos_local_items_marks_queue_runnable_after_retry() {
+        let mut queue = CoSQueueRuntime {
+            queue_id: 5,
+            priority: 5,
+            transmit_rate_bytes: 11_000_000_000 / 8,
+            exact: true,
+            flow_fair: false,
+            shared_exact: false,
+            flow_hash_seed: 0,
+            surplus_weight: 1,
+            surplus_deficit: 0,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            tokens: 0,
+            last_refill_ns: 0,
+            queued_bytes: 0,
+            active_flow_buckets: 0,
+            active_flow_buckets_peak: 0,
+            flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+            flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+            flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+            queue_vtime: 0,
+            pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
+            flow_rr_buckets: FlowRrRing::default(),
+            flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+            runnable: false,
+            parked: false,
+            next_wakeup_tick: 0,
+            wheel_level: 0,
+            wheel_slot: 0,
+            items: VecDeque::new(),
+            local_item_count: 0,
+
+            vtime_floor: None,
+
+            worker_id: 0,
+            drop_counters: CoSQueueDropCounters::default(),
+            owner_profile: CoSQueueOwnerProfile::new(),
+            consecutive_v_min_skips: 0,
+            v_min_suspended_remaining: 0,
+            v_min_hard_cap_overrides_scratch: 0,
+        };
+        let retry = VecDeque::from([TxRequest {
+            bytes: vec![0; 1500],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 80,
+            cos_queue_id: Some(5),
+            dscp_rewrite: None,
+        }]);
+
+        let retry_bytes = restore_cos_local_items_inner(&mut queue, retry);
+
+        assert_eq!(queue.items.len(), 1);
+        assert_eq!(retry_bytes, 1500);
+        assert!(queue.runnable);
+        assert!(!queue.parked);
+    }
+
+    #[test]
+    fn restore_cos_prepared_items_marks_queue_runnable_after_retry() {
+        let mut queue = CoSQueueRuntime {
+            queue_id: 5,
+            priority: 5,
+            transmit_rate_bytes: 11_000_000_000 / 8,
+            exact: true,
+            flow_fair: false,
+            shared_exact: false,
+            flow_hash_seed: 0,
+            surplus_weight: 1,
+            surplus_deficit: 0,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            tokens: 0,
+            last_refill_ns: 0,
+            queued_bytes: 0,
+            active_flow_buckets: 0,
+            active_flow_buckets_peak: 0,
+            flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+            flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+            flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+            queue_vtime: 0,
+            pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
+            flow_rr_buckets: FlowRrRing::default(),
+            flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+            runnable: false,
+            parked: false,
+            next_wakeup_tick: 0,
+            wheel_level: 0,
+            wheel_slot: 0,
+            items: VecDeque::new(),
+            local_item_count: 0,
+
+            vtime_floor: None,
+
+            worker_id: 0,
+            drop_counters: CoSQueueDropCounters::default(),
+            owner_profile: CoSQueueOwnerProfile::new(),
+            consecutive_v_min_skips: 0,
+            v_min_suspended_remaining: 0,
+            v_min_hard_cap_overrides_scratch: 0,
+        };
+        let retry = VecDeque::from([PreparedTxRequest {
+            offset: 64,
+            len: 1500,
+            recycle: PreparedTxRecycle::FreeTxFrame,
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 80,
+            cos_queue_id: Some(5),
+            dscp_rewrite: None,
+        }]);
+
+        let retry_bytes = restore_cos_prepared_items_inner(&mut queue, retry);
+
+        assert_eq!(queue.items.len(), 1);
+        assert_eq!(retry_bytes, 1500);
+        assert!(queue.runnable);
+        assert!(!queue.parked);
+    }
+
+}
