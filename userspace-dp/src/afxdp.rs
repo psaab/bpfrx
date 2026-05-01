@@ -277,7 +277,7 @@ mod coordinator;
 #[cfg(test)]
 #[path = "afxdp/tests.rs"]
 mod tests;
-#[path = "afxdp/worker.rs"]
+#[path = "afxdp/worker/mod.rs"]
 mod worker;
 #[path = "afxdp/worker_runtime.rs"]
 mod worker_runtime;
