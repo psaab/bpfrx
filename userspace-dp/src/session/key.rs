@@ -136,3 +136,54 @@ pub(crate) fn reverse_canonical_key(forward_key: &SessionKey, _nat: NatDecision)
         dst_port,
     }
 }
+
+// Issue 70 / #994: `reverse_session_key` extracted from
+// afxdp/session_glue (the audit's "abstraction-leak" junk drawer).
+// Pure SessionKey + NatDecision → SessionKey transformation, fits
+// alongside forward_wire_key / translated_session_key /
+// reverse_canonical_key already in this file. Visibility widened
+// from `pub(super)` (afxdp-internal) to `pub(crate)` so existing
+// callers in afxdp/{ha,session_delta,session_glue}.rs continue to
+// resolve through the session::* re-export.
+//
+// Note: the audit also called out resolution_target_for_session as
+// a candidate to move here, but it takes &SessionFlow and SessionFlow
+// lives in afxdp/types (46 references inside afxdp/ — moving it
+// would be a much larger refactor). Left in session_glue for now.
+
+pub(crate) fn reverse_session_key(key: &SessionKey, nat: NatDecision) -> SessionKey {
+    let (src_port, dst_port) = if matches!(key.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        (key.src_port, key.dst_port)
+    } else {
+        (
+            nat.rewrite_dst_port.unwrap_or(key.dst_port),
+            nat.rewrite_src_port.unwrap_or(key.src_port),
+        )
+    };
+    let wire_src = nat.rewrite_dst.unwrap_or(key.dst_ip);
+    let wire_dst = nat.rewrite_src.unwrap_or(key.src_ip);
+    let (addr_family, protocol) = if nat.nat64 {
+        let af = match wire_src {
+            IpAddr::V4(_) => libc::AF_INET as u8,
+            IpAddr::V6(_) => libc::AF_INET6 as u8,
+        };
+        let proto = if af == libc::AF_INET as u8 && key.protocol == PROTO_ICMPV6 {
+            PROTO_ICMP
+        } else if af == libc::AF_INET6 as u8 && key.protocol == PROTO_ICMP {
+            PROTO_ICMPV6
+        } else {
+            key.protocol
+        };
+        (af, proto)
+    } else {
+        (key.addr_family, key.protocol)
+    };
+    SessionKey {
+        addr_family,
+        protocol,
+        src_ip: wire_src,
+        dst_ip: wire_dst,
+        src_port,
+        dst_port,
+    }
+}

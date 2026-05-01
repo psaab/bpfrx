@@ -1,41 +1,5 @@
 use super::*;
 
-pub(super) fn reverse_session_key(key: &SessionKey, nat: NatDecision) -> SessionKey {
-    let (src_port, dst_port) = if matches!(key.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-        (key.src_port, key.dst_port)
-    } else {
-        (
-            nat.rewrite_dst_port.unwrap_or(key.dst_port),
-            nat.rewrite_src_port.unwrap_or(key.src_port),
-        )
-    };
-    let wire_src = nat.rewrite_dst.unwrap_or(key.dst_ip);
-    let wire_dst = nat.rewrite_src.unwrap_or(key.src_ip);
-    let (addr_family, protocol) = if nat.nat64 {
-        let af = match wire_src {
-            IpAddr::V4(_) => libc::AF_INET as u8,
-            IpAddr::V6(_) => libc::AF_INET6 as u8,
-        };
-        let proto = if af == libc::AF_INET as u8 && key.protocol == PROTO_ICMPV6 {
-            PROTO_ICMP
-        } else if af == libc::AF_INET6 as u8 && key.protocol == PROTO_ICMP {
-            PROTO_ICMPV6
-        } else {
-            key.protocol
-        };
-        (af, proto)
-    } else {
-        (key.addr_family, key.protocol)
-    };
-    SessionKey {
-        addr_family,
-        protocol,
-        src_ip: wire_src,
-        dst_ip: wire_dst,
-        src_port,
-        dst_port,
-    }
-}
 
 pub(super) fn resolution_target_for_session(
     flow: &SessionFlow,
