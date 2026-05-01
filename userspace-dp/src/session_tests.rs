@@ -1,6 +1,6 @@
 // Tests for session.rs — relocated from inline `#[cfg(test)] mod tests` to
 // keep session.rs under the modularity-discipline LOC threshold (#1047).
-// Loaded as a sibling module via `#[path = "session_tests.rs"]` from main.rs.
+// Loaded as a sibling module via `#[path = "session_tests.rs"]` from session.rs.
 
 use crate::test_zone_ids::*;
 use super::*;
