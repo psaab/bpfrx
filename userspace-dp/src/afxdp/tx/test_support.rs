@@ -10,6 +10,7 @@
 #![cfg(test)]
 
 use super::*;
+use crate::afxdp::cos::builders::build_cos_interface_runtime;
 
 pub(in crate::afxdp) fn test_queue_fast_path(
     shared_exact: bool,

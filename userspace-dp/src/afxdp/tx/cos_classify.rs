@@ -556,7 +556,7 @@ pub(super) fn resolve_cos_queue_idx(root: &CoSInterfaceRuntime, requested_queue:
         .or_else(|| (!root.queues.is_empty()).then_some(0))
 }
 
-pub(super) fn demote_prepared_cos_queue_to_local(
+pub(in crate::afxdp) fn demote_prepared_cos_queue_to_local(
     area: &MmapArea,
     free_tx_frames: &mut VecDeque<u64>,
     pending_fill_frames: &mut VecDeque<u64>,
@@ -672,7 +672,7 @@ pub(super) fn demote_prepared_cos_queue_to_local(
 /// (owner worker), same discipline as `queued_bytes` — no atomic
 /// needed.
 #[inline]
-pub(super) fn cos_queue_accepts_prepared(root: &CoSInterfaceRuntime, requested_queue: Option<u8>) -> bool {
+pub(in crate::afxdp) fn cos_queue_accepts_prepared(root: &CoSInterfaceRuntime, requested_queue: Option<u8>) -> bool {
     let Some(queue_idx) = resolve_cos_queue_idx(root, requested_queue) else {
         return false;
     };
