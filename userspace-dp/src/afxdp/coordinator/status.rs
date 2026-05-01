@@ -1,9 +1,13 @@
 use super::*;
 
-/// Operator-status accessors split out of `coordinator/mod.rs` to keep
-/// the gRPC / HTTP read-only surface in one place. These methods only
-/// read shared state — they don't mutate worker lifecycle, sessions,
-/// or HA reconciliation state.
+/// Operator-status surface split out of `coordinator/mod.rs` to keep
+/// the gRPC / HTTP status methods in one place. Most are pure-read
+/// snapshots (e.g. `cos_statuses` loads ArcSwap values and aggregates
+/// them); the one exception is `drain_session_deltas`, which mutates
+/// per-binding state by popping entries off `pending_session_deltas`
+/// and bumping `session_delta_drained`. Coordinator lifecycle
+/// (worker spawn / shutdown / reconcile) and HA reconciliation state
+/// stay in mod.rs and ha.rs.
 impl super::Coordinator {
     pub fn dynamic_neighbor_status(&self) -> (usize, u64) {
         let entries = self.neighbors.dynamic.len();
