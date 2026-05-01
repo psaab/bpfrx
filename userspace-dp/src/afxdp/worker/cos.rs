@@ -1,3 +1,73 @@
+
+
+
+// Empirical per-worker sustained exact throughput ceiling in bytes/sec. A
+// single owner worker can reliably drive an exact queue up to about this rate
+// before the drain loop backs up and throughput collapses (the collapse case
+// that motivated shared-worker execution in PR #680). This is the sole
+// shared-exact threshold: a queue at or above this rate shards across every
+// eligible worker; a queue below it runs under a single owner.
+//
+// Evidence basis (#698):
+// - Drain-path userspace micro-bench `cos_exact_drain_throughput_micro_bench`
+//   (in `afxdp::tx::tests`, run with
+//   `cargo test --release -- --ignored --nocapture`; debug-build numbers are
+//   not meaningful for this baseline) measures the inner
+//   `drain_exact_local_fifo_items_to_scratch` +
+//   `settle_exact_local_fifo_submission` loop in isolation with setup work
+//   excluded from the timed region. Baseline on the development host is
+//   comfortably above MIN (order of a few Mpps / tens of Gbps at 1500 B);
+//   drain alone is not the limiter there.
+// - This bench only rules out the inner drain loop as the immediate
+//   limiter on the development host. It does NOT by itself validate MIN
+//   on other deployment hardware, and it does not fully attribute the
+//   remaining ceiling to non-drain work without a live single-worker
+//   measurement.
+// - The 2.5 Gbps figure is best read as a per-worker *aggregate* budget
+//   threshold consistent with the PR #680 collapse shape: there the drain
+//   loop failed to absorb 10g line-rate despite drain alone being able
+//   to go much faster, because non-drain per-packet work (RX, forwarding,
+//   NAT, session-lookup, conntrack) consumed the per-packet cycle budget
+//   that drain+completion needed to keep up.
+// - The ceiling is a property of the full per-worker pipeline, not of
+//   the interface shaper — it does not scale with iface rate.
+pub(in crate::afxdp) const COS_SHARED_EXACT_MIN_RATE_BYTES: u64 = 2_500_000_000 / 8;
+
+
+
+
+
+
+
+
+
+
+/// #709: snapshot the owner-profile counter set from a `BindingLiveState`
+/// into a struct-local copy. Histograms are fixed-cap arrays on both
+/// sides; copying into an owned value lets the caller attribute the
+/// same snapshot to multiple queues without re-reading the atomics
+/// (which would tear across queues in the same scrape).
+pub(crate) struct OwnerProfileSnapshot {
+    pub(crate) drain_latency_hist: [u64; DRAIN_HIST_BUCKETS],
+    pub(crate) drain_invocations: u64,
+    pub(crate) drain_noop_invocations: u64,
+    pub(crate) redirect_acquire_hist: [u64; DRAIN_HIST_BUCKETS],
+    pub(crate) owner_pps: u64,
+    pub(crate) peer_pps: u64,
+    /// #760 instrumentation, binding-scoped. Bytes delivered via
+    /// the post-CoS backup transmit paths in `drain_pending_tx`
+    /// — these never passed a queue's token gate. Surfaced on
+    /// the same "unambiguous owner-local exact queue" row the
+    /// other binding-scoped fields use.
+    pub(crate) post_drain_backup_bytes: u64,
+    /// #760 instrumentation, binding-scoped. Bytes observed at the
+    /// three `apply_*` tx_bytes sites, incremented unconditionally.
+    /// Compare against the sum of per-queue `drain_sent_bytes`; any
+    /// gap is shaped traffic that bypassed the per-queue write via
+    /// an `apply_*` early-return.
+    pub(crate) drain_sent_bytes_shaped_unconditional: u64,
+}
+
 use super::*;
 
 // Worker-side CoS runtime helpers split out of `worker/mod.rs` per #957.
@@ -43,7 +113,7 @@ where
 /// which is the regime that previously mis-classified mid/high-rate exact
 /// queues as single-owner.
 #[inline]
-pub(super) fn queue_uses_shared_exact_service(_iface: &CoSInterfaceConfig, queue: &CoSQueueConfig) -> bool {
+fn queue_uses_shared_exact_service(_iface: &CoSInterfaceConfig, queue: &CoSQueueConfig) -> bool {
     if !queue.exact {
         return false;
     }
@@ -139,7 +209,7 @@ pub(super) fn build_worker_cos_statuses(
 /// across the whole binding is owner-local exact. Shared-exact,
 /// non-exact, and any multi-owner-local shape — whether within one
 /// interface or spread across interfaces — keep the binding silent.
-pub(super) fn unique_owner_profile_row(
+fn unique_owner_profile_row(
     cos_map: &FastMap<i32, CoSInterfaceRuntime>,
     forwarding: &ForwardingState,
 ) -> Option<(i32, u8)> {
@@ -445,7 +515,7 @@ pub(in crate::afxdp) fn merge_binding_scoped_owner_profile(
         .saturating_add(profile.drain_sent_bytes_shaped_unconditional);
 }
 
-pub(super) fn build_worker_cos_statuses_from_maps<'a, I>(
+fn build_worker_cos_statuses_from_maps<'a, I>(
     cos_maps: I,
     forwarding: &ForwardingState,
 ) -> Vec<crate::protocol::CoSInterfaceStatus>
