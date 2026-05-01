@@ -34,8 +34,6 @@ mod push;
 pub(in crate::afxdp) use pop::{cos_queue_pop_front, cos_queue_pop_front_no_snapshot};
 pub(in crate::afxdp) use push::{cos_queue_push_back, cos_queue_push_front};
 
-
-
 #[inline]
 pub(in crate::afxdp) fn cos_queue_is_empty(queue: &CoSQueueRuntime) -> bool {
     if !queue.flow_fair {
@@ -97,15 +95,6 @@ pub(in crate::afxdp) fn cos_queue_front(queue: &CoSQueueRuntime) -> Option<&CoSP
     queue.flow_bucket_items[bucket].front()
 }
 
-
-
-
-
-
-
-
-
-
 /// #917 — V_min sync throttle decision. Plan §3.3 v2 cadence:
 /// K=8 + mandatory check at drain-batch start (`pop_count == 1`).
 const V_MIN_READ_CADENCE: u32 = 8;
@@ -128,8 +117,6 @@ pub(in crate::afxdp) const V_MIN_CONSECUTIVE_SKIP_HARD_CAP: u32 = 8;
 /// peers to either catch up or visibly persist as out-of-band, and
 /// short enough that mouse-latency budgets (#905) are unaffected.
 pub(in crate::afxdp) const V_MIN_SUSPENSION_BATCHES: u32 = 1000;
-
-
 
 #[inline]
 pub(in crate::afxdp) fn cos_item_len(item: &CoSPendingTxItem) -> u64 {
@@ -2680,25 +2667,6 @@ mod tests {
              regardless of the shared_exact signal",
         );
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     // ---------------------------------------------------------------------
     // #698 — per-worker exact-drain micro-bench
