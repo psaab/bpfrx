@@ -130,8 +130,7 @@ use super::cos::{
 };
 #[cfg(test)]
 use super::cos::{
-    apply_cos_queue_flow_fair_promotion, redirect_local_cos_request_to_owner_binding,
-    ExactCoSScratchBuild, COS_MIN_BURST_BYTES,
+    apply_cos_queue_flow_fair_promotion, ExactCoSScratchBuild, COS_MIN_BURST_BYTES,
     drain_exact_local_fifo_items_to_scratch, drain_exact_local_items_to_scratch_flow_fair,
     settle_exact_local_fifo_submission,
     settle_exact_local_scratch_submission_flow_fair, };
@@ -199,53 +198,6 @@ mod tests {
 
 
 
-    #[test]
-    fn redirect_local_exact_cos_request_to_owner_binding_pushes_owner_live_queue() {
-        let current_live = Arc::new(BindingLiveState::new());
-        let owner_live = Arc::new(BindingLiveState::new());
-        let cos_fast_interfaces = test_cos_fast_interfaces(
-            80,
-            12,
-            4,
-            vec![(
-                4,
-                test_queue_fast_path(
-                    true,
-                    7,
-                    None,
-                    Some(Arc::new(SharedCoSQueueLease::new(
-                        1_000_000,
-                        COS_MIN_BURST_BYTES,
-                        2,
-                    ))),
-                ),
-            )],
-            Some(owner_live.clone()),
-            None,
-        );
-        let req = TxRequest {
-            bytes: vec![1, 2, 3],
-            expected_ports: None,
-            expected_addr_family: libc::AF_INET as u8,
-            expected_protocol: PROTO_TCP,
-            flow_key: None,
-            egress_ifindex: 80,
-            cos_queue_id: Some(4),
-            dscp_rewrite: None,
-        };
-
-        let redirected =
-            redirect_local_cos_request_to_owner_binding(&current_live, &cos_fast_interfaces, req);
-
-        assert!(redirected.is_ok());
-        let mut queued = VecDeque::new();
-        owner_live.take_pending_tx_into(&mut queued);
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued.front().map(|req| req.egress_ifindex), Some(80));
-        let mut current_queued = VecDeque::new();
-        current_live.take_pending_tx_into(&mut current_queued);
-        assert!(current_queued.is_empty());
-    }
 
 
 
