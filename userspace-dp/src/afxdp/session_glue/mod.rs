@@ -1233,5 +1233,5 @@ pub(super) fn enforce_session_ha_resolution(
 }
 
 #[cfg(test)]
-#[path = "session_glue_tests.rs"]
+#[path = "tests.rs"]
 mod tests;

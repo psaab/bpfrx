@@ -83,7 +83,8 @@ mod parser;
 mod rst;
 #[path = "afxdp/sharded_neighbor.rs"]
 mod sharded_neighbor;
-#[path = "afxdp/session_glue.rs"]
+// session_glue is a directory module (afxdp/session_glue/{mod.rs, tests.rs}),
+// so the explicit `#[path]` is unnecessary — auto-resolution finds mod.rs.
 mod session_glue;
 #[path = "afxdp/cos/mod.rs"]
 mod cos;
