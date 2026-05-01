@@ -57,7 +57,7 @@ mod bpf_map;
 mod checksum;
 #[path = "afxdp/flow_cache.rs"]
 mod flow_cache;
-#[path = "afxdp/forwarding.rs"]
+#[path = "afxdp/forwarding/mod.rs"]
 mod forwarding;
 #[path = "afxdp/forwarding_build.rs"]
 mod forwarding_build;
@@ -698,8 +698,8 @@ use neighbor_dispatch::{
     retry_pending_neigh,
 };
 // `learn_dynamic_neighbor` is only referenced by tests in
-// afxdp/forwarding.rs and afxdp/tests.rs; gate its import behind cfg(test)
-// so non-test builds don't trip `unused_imports`.
+// afxdp/forwarding/tests.rs and afxdp/tests.rs; gate its import behind
+// cfg(test) so non-test builds don't trip `unused_imports`.
 #[cfg(test)]
 use neighbor_dispatch::learn_dynamic_neighbor;
 
