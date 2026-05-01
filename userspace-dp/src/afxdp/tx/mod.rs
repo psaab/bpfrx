@@ -151,9 +151,11 @@ use super::cos::{
     V_MIN_CONSECUTIVE_SKIP_HARD_CAP, V_MIN_SUSPENSION_BATCHES,
 };
 // #956 P1: TX-completion + timer-wheel items reached by
-// `mod tests { use super::*; }` at the bottom of this file, plus
-// `` which is also test-only after
-// the cross_binding extraction in #956 Phase 8.
+// `mod tests { use super::*; }` at the bottom of this file.
+// (After the #984 P3 cross_binding test colocation, the
+// `redirect_local_cos_request_to_owner` and
+// `prepared_cos_request_stays_on_current_tx_binding` test pins
+// moved to `cos/cross_binding.rs::tests`.)
 #[cfg(test)]
 use super::cos::{
     advance_cos_timer_wheel, cos_queue_push_front, maybe_top_up_cos_root_lease, park_cos_queue,
