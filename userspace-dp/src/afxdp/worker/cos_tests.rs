@@ -1,7 +1,7 @@
 // Tests for afxdp/worker/cos.rs — relocated from inline
-// `#[cfg(test)] mod tests` to keep mod.rs under the modularity-discipline
+// `#[cfg(test)] mod tests` to keep cos.rs under the modularity-discipline
 // LOC threshold. Loaded as a sibling submodule via
-// `#[path = "tests.rs"]` from mod.rs.
+// `#[path = "cos_tests.rs"]` from cos.rs.
 
 use super::*;
 use crate::test_zone_ids::*;
