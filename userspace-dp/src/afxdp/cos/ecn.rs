@@ -8,8 +8,8 @@
 // ECN-marker unit tests now live in this file (`mod tests` at
 // the bottom). Pre-#984 P3 phase 2c they lived in `tx::tests` via
 // the `cos/mod.rs` re-exports; that pattern is now retired for
-// helpers in this module. Admission-path tests still live in
-// `tx::tests` because they share larger fixtures.
+// helpers in this module. Admission-path tests live in
+// `cos/admission.rs::tests` (#984 P3 phase 5b).
 
 use crate::afxdp::ethernet::{ETH_HDR_LEN, VLAN_TAG_LEN};
 use crate::afxdp::types::{PreparedTxRequest, TxRequest};
@@ -17,9 +17,8 @@ use crate::afxdp::umem::MmapArea;
 
 /// ECN codepoint masks (low 2 bits of IPv4 TOS / IPv6 tclass).
 ///
-/// `pub(in crate::afxdp)` because admission tests in `tx::tests`
-/// reference these masks directly (15 admission tests at
-/// `tx.rs:15612` and `tx.rs:16462` — see plan v3 round-3 #1).
+/// `pub(in crate::afxdp)` because admission tests in
+/// `cos/admission.rs::tests` reference these masks directly.
 pub(in crate::afxdp) const ECN_MASK: u8 = 0b0000_0011;
 pub(in crate::afxdp) const ECN_NOT_ECT: u8 = 0b0000_0000;
 pub(in crate::afxdp) const ECN_ECT_0: u8 = 0b0000_0010;
