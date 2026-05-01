@@ -1,5 +1,5 @@
 // Tests for afxdp/cos/admission.rs — relocated from inline
-// `#[cfg(test)] mod tests` to keep mod.rs under the modularity-discipline
+// `#[cfg(test)] mod tests` to keep admission.rs under the modularity-discipline
 // LOC threshold. Loaded as a sibling submodule via
 // `#[path = "admission_tests.rs"]` from admission.rs.
 
