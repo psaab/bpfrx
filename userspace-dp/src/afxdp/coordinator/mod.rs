@@ -309,7 +309,7 @@ impl Coordinator {
             *last = None;
         }
         self.validation = ValidationState::default();
-        self.workers.last_planned_count = 0;
+        self.workers.last_planned_workers = 0;
         self.workers.last_planned_bindings = 0;
         self.last_reconcile_stage = "stopped".to_string();
     }
@@ -587,11 +587,11 @@ impl Coordinator {
             plans.sort_by_key(|plan| (plan.status.queue_id, plan.status.ifindex, plan.status.slot));
         }
         let planned_bindings: usize = workers.values().map(|group| group.len()).sum();
-        self.workers.last_planned_count = workers.len();
+        self.workers.last_planned_workers = workers.len();
         self.workers.last_planned_bindings = planned_bindings;
         self.last_reconcile_stage = format!(
             "planned:workers={}:bindings={}:live={}",
-            self.workers.last_planned_count,
+            self.workers.last_planned_workers,
             self.workers.last_planned_bindings,
             self.workers.live.len()
         );
@@ -1141,12 +1141,12 @@ impl Coordinator {
             current_queue_leases.as_ref(),
         );
         // #917: V_min coordination Arcs sized by worker count.
-        // workers.last_planned_count is set in apply_planned_workers
+        // workers.last_planned_workers is set in apply_planned_workers
         // before this reconcile fires; defaults to 0 at first
         // boot which produces zero-slot floors (the reconcile
         // re-fires once workers are planned).
         let current_queue_vtime_floors = self.cos.queue_vtime_floors.load();
-        let num_workers = self.workers.last_planned_count.max(1);
+        let num_workers = self.workers.last_planned_workers.max(1);
         let next_queue_vtime_floors = build_shared_cos_queue_vtime_floors_reusing_existing(
             &self.forwarding,
             num_workers,
@@ -1256,7 +1256,7 @@ impl Coordinator {
     }
 
     pub fn planned_counts(&self) -> (usize, usize) {
-        (self.workers.last_planned_count, self.workers.last_planned_bindings)
+        (self.workers.last_planned_workers, self.workers.last_planned_bindings)
     }
 
     pub fn reconcile_debug(&self) -> (u64, String) {
