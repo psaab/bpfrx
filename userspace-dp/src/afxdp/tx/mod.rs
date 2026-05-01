@@ -133,8 +133,7 @@ use super::cos::{
     apply_cos_queue_flow_fair_promotion, redirect_local_cos_request_to_owner_binding,
     ExactCoSScratchBuild, COS_MIN_BURST_BYTES,
     drain_exact_local_fifo_items_to_scratch, drain_exact_local_items_to_scratch_flow_fair,
-    select_cos_guarantee_batch, select_cos_guarantee_batch_with_fast_path,
-    select_exact_cos_guarantee_queue_with_fast_path,
+    select_cos_guarantee_batch, select_exact_cos_guarantee_queue_with_fast_path,
     settle_exact_local_fifo_submission,
     settle_exact_local_scratch_submission_flow_fair, };
 // #956 P1: TX-completion + timer-wheel items reached by
