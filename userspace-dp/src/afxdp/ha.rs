@@ -55,10 +55,10 @@ impl super::Coordinator {
                 pending.push_back(WorkerCommand::VacateAllSharedExactSlots);
             }
             demote_shared_owner_rgs(
-                &self.shared_sessions,
-                &self.shared_nat_sessions,
-                &self.shared_forward_wire_sessions,
-                &self.shared_owner_rg_indexes,
+                &self.sessions.synced,
+                &self.sessions.nat,
+                &self.sessions.forward_wire,
+                &self.sessions.owner_rg_indexes,
                 &self.forwarding,
                 self.dynamic_neighbors_ref(),
                 &demoted_rgs,
@@ -79,7 +79,7 @@ impl super::Coordinator {
                 "xpf-ha: RG activation detected: {:?}, workers={}, shared_sessions={}",
                 activated_rgs,
                 self.workers.handles.len(),
-                self.shared_sessions.lock().map(|s| s.len()).unwrap_or(0),
+                self.sessions.synced.lock().map(|s| s.len()).unwrap_or(0),
             );
             self.handle_activated_rgs(&activated_rgs, now_secs);
         }
@@ -128,10 +128,10 @@ impl super::Coordinator {
         // entries and restoring any redirect aliases that were removed during
         // demotion. This is not the old worker-wide HA refresh scan.
         prewarm_reverse_synced_sessions_for_owner_rgs(
-            &self.shared_sessions,
-            &self.shared_nat_sessions,
-            &self.shared_forward_wire_sessions,
-            &self.shared_owner_rg_indexes,
+            &self.sessions.synced,
+            &self.sessions.nat,
+            &self.sessions.forward_wire,
+            &self.sessions.owner_rg_indexes,
             &worker_commands,
             session_map_fd,
             &self.forwarding,
@@ -142,8 +142,8 @@ impl super::Coordinator {
         );
         if session_map_fd >= 0 {
             let republished = republish_bpf_session_entries_for_owner_rgs(
-                &self.shared_sessions,
-                &self.shared_owner_rg_indexes,
+                &self.sessions.synced,
+                &self.sessions.owner_rg_indexes,
                 session_map_fd,
                 activated_rgs,
             );
@@ -165,7 +165,7 @@ impl super::Coordinator {
             return Ok(Vec::new());
         }
         let sequence = self
-            .session_export_seq
+            .sessions.export_seq
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         for handle in self.workers.handles.values() {
@@ -240,7 +240,7 @@ impl super::Coordinator {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = self.ha.rg_runtime.load();
         let previous_entry = self
-            .shared_sessions
+            .sessions.synced
             .lock()
             .ok()
             .and_then(|sessions| sessions.get(&entry.key).cloned());
@@ -256,10 +256,10 @@ impl super::Coordinator {
             None
         };
         publish_shared_session(
-            &self.shared_sessions,
-            &self.shared_nat_sessions,
-            &self.shared_forward_wire_sessions,
-            &self.shared_owner_rg_indexes,
+            &self.sessions.synced,
+            &self.sessions.nat,
+            &self.sessions.forward_wire,
+            &self.sessions.owner_rg_indexes,
             &entry,
         );
         // Keep the immediate BPF publish aligned with the worker-side
@@ -279,7 +279,7 @@ impl super::Coordinator {
             );
         }
         refresh_reverse_prewarm_owner_rg_indexes(
-            &self.shared_owner_rg_indexes.reverse_prewarm_sessions,
+            &self.sessions.owner_rg_indexes.reverse_prewarm_sessions,
             &self.forwarding,
             self.dynamic_neighbors_ref(),
             previous_entry.as_ref(),
@@ -287,10 +287,10 @@ impl super::Coordinator {
         );
         if let Some(reverse) = &reverse_entry {
             publish_shared_session(
-                &self.shared_sessions,
-                &self.shared_nat_sessions,
-                &self.shared_forward_wire_sessions,
-                &self.shared_owner_rg_indexes,
+                &self.sessions.synced,
+                &self.sessions.nat,
+                &self.sessions.forward_wire,
+                &self.sessions.owner_rg_indexes,
                 reverse,
             );
             if synced_entry_allows_local_replace(
@@ -319,7 +319,7 @@ impl super::Coordinator {
 
     pub fn delete_synced_session(&self, key: SessionKey) {
         let removed_entry = self
-            .shared_sessions
+            .sessions.synced
             .lock()
             .ok()
             .and_then(|sessions| sessions.get(&key).cloned());
@@ -341,14 +341,14 @@ impl super::Coordinator {
             }
         }
         remove_shared_session(
-            &self.shared_sessions,
-            &self.shared_nat_sessions,
-            &self.shared_forward_wire_sessions,
-            &self.shared_owner_rg_indexes,
+            &self.sessions.synced,
+            &self.sessions.nat,
+            &self.sessions.forward_wire,
+            &self.sessions.owner_rg_indexes,
             &key,
         );
         refresh_reverse_prewarm_owner_rg_indexes(
-            &self.shared_owner_rg_indexes.reverse_prewarm_sessions,
+            &self.sessions.owner_rg_indexes.reverse_prewarm_sessions,
             &self.forwarding,
             self.dynamic_neighbors_ref(),
             removed_entry.as_ref(),
@@ -356,10 +356,10 @@ impl super::Coordinator {
         );
         if let Some(reverse_key) = &reverse_key {
             remove_shared_session(
-                &self.shared_sessions,
-                &self.shared_nat_sessions,
-                &self.shared_forward_wire_sessions,
-                &self.shared_owner_rg_indexes,
+                &self.sessions.synced,
+                &self.sessions.nat,
+                &self.sessions.forward_wire,
+                &self.sessions.owner_rg_indexes,
                 reverse_key,
             );
         }
@@ -391,7 +391,7 @@ impl super::Coordinator {
         let zone_name_to_id = &self.forwarding.zone_name_to_id;
 
         let sessions = self
-            .shared_sessions
+            .sessions.synced
             .lock()
             .map_err(|_| "shared sessions lock poisoned".to_string())?;
 
@@ -704,14 +704,14 @@ mod tests {
             tcp_flags: 0x10,
         };
         publish_shared_session(
-            &coordinator.shared_sessions,
-            &coordinator.shared_nat_sessions,
-            &coordinator.shared_forward_wire_sessions,
-            &coordinator.shared_owner_rg_indexes,
+            &coordinator.sessions.synced,
+            &coordinator.sessions.nat,
+            &coordinator.sessions.forward_wire,
+            &coordinator.sessions.owner_rg_indexes,
             &entry,
         );
         refresh_reverse_prewarm_owner_rg_indexes(
-            &coordinator.shared_owner_rg_indexes.reverse_prewarm_sessions,
+            &coordinator.sessions.owner_rg_indexes.reverse_prewarm_sessions,
             &coordinator.forwarding,
             coordinator.dynamic_neighbors_ref(),
             None,
@@ -751,7 +751,7 @@ mod tests {
 
         let reverse_key = reverse_session_key(&entry.key, entry.decision.nat);
         let reverse = coordinator
-            .shared_sessions
+            .sessions.synced
             .lock()
             .expect("shared sessions")
             .get(&reverse_key)

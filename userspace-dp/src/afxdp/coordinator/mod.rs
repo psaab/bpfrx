@@ -3,11 +3,13 @@ mod bpf_maps;
 mod cos_state;
 mod ha_state;
 mod neighbor_manager;
+mod session_manager;
 mod worker_manager;
 pub(crate) use bpf_maps::BpfMaps;
 pub(crate) use cos_state::SharedCoSState;
 pub(in crate::afxdp) use ha_state::HaState;
 pub(crate) use neighbor_manager::NeighborManager;
+pub(in crate::afxdp) use session_manager::SessionManager;
 pub(in crate::afxdp) use worker_manager::WorkerManager;
 
 pub struct Coordinator {
@@ -20,12 +22,8 @@ pub struct Coordinator {
     pub(crate) cos: SharedCoSState,
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
     pub(crate) neighbors: NeighborManager,
-    pub(crate) shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
-    pub(crate) shared_nat_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
-    pub(crate) shared_forward_wire_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
-    pub(crate) shared_owner_rg_indexes: SharedSessionOwnerRgIndexes,
+    pub(in crate::afxdp) sessions: SessionManager,
     pub(in crate::afxdp) workers: WorkerManager,
-    pub(crate) session_export_seq: AtomicU64,
     pub(crate) forwarding: ForwardingState,
     pub(crate) recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     pub(crate) recent_session_deltas: Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
@@ -60,12 +58,8 @@ impl Coordinator {
             cos: SharedCoSState::new(),
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
             neighbors: NeighborManager::new(),
-            shared_sessions: Arc::new(Mutex::new(FastMap::default())),
-            shared_nat_sessions: Arc::new(Mutex::new(FastMap::default())),
-            shared_forward_wire_sessions: Arc::new(Mutex::new(FastMap::default())),
-            shared_owner_rg_indexes: SharedSessionOwnerRgIndexes::default(),
+            sessions: SessionManager::new(),
             workers: WorkerManager::new(),
-            session_export_seq: AtomicU64::new(0),
             forwarding: ForwardingState::default(),
             recent_exceptions: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RECENT_EXCEPTIONS))),
             recent_session_deltas: Arc::new(Mutex::new(VecDeque::with_capacity(
@@ -288,16 +282,16 @@ impl Coordinator {
             manager_keys.clear();
         }
         if clear_synced_state {
-            if let Ok(mut sessions) = self.shared_sessions.lock() {
+            if let Ok(mut sessions) = self.sessions.synced.lock() {
                 sessions.clear();
             }
-            if let Ok(mut nat_sessions) = self.shared_nat_sessions.lock() {
+            if let Ok(mut nat_sessions) = self.sessions.nat.lock() {
                 nat_sessions.clear();
             }
-            if let Ok(mut forward_wire_sessions) = self.shared_forward_wire_sessions.lock() {
+            if let Ok(mut forward_wire_sessions) = self.sessions.forward_wire.lock() {
                 forward_wire_sessions.clear();
             }
-            self.shared_owner_rg_indexes.clear();
+            self.sessions.owner_rg_indexes.clear();
         }
         if let Ok(mut recent) = self.recent_exceptions.lock() {
             recent.clear();
@@ -315,7 +309,7 @@ impl Coordinator {
     }
 
     pub(crate) fn snapshot_shared_session_entries(&self) -> Vec<SyncedSessionEntry> {
-        self.shared_sessions
+        self.sessions.synced
             .lock()
             .map(|sessions| sessions.values().cloned().collect())
             .unwrap_or_default()
@@ -666,10 +660,10 @@ impl Coordinator {
             let local_tunnel_deliveries = self.local_tunnel_deliveries.clone();
             let shared_forwarding = self.ha.forwarding.clone();
             let shared_validation = self.shared_validation.clone();
-            let shared_sessions = self.shared_sessions.clone();
-            let shared_nat_sessions = self.shared_nat_sessions.clone();
-            let shared_forward_wire_sessions = self.shared_forward_wire_sessions.clone();
-            let shared_owner_rg_indexes = self.shared_owner_rg_indexes.clone();
+            let shared_sessions = self.sessions.synced.clone();
+            let shared_nat_sessions = self.sessions.nat.clone();
+            let shared_forward_wire_sessions = self.sessions.forward_wire.clone();
+            let shared_owner_rg_indexes = self.sessions.owner_rg_indexes.clone();
             let stop_clone = stop.clone();
             let heartbeat_clone = heartbeat.clone();
             let session_export_ack_clone = session_export_ack.clone();
@@ -829,10 +823,10 @@ impl Coordinator {
             let dynamic_neighbors = self.neighbors.dynamic.clone();
             let live = self.workers.live.clone();
             let identities = self.workers.identities.clone();
-            let shared_sessions = self.shared_sessions.clone();
-            let shared_nat_sessions = self.shared_nat_sessions.clone();
-            let shared_forward_wire_sessions = self.shared_forward_wire_sessions.clone();
-            let shared_owner_rg_indexes = self.shared_owner_rg_indexes.clone();
+            let shared_sessions = self.sessions.synced.clone();
+            let shared_nat_sessions = self.sessions.nat.clone();
+            let shared_forward_wire_sessions = self.sessions.forward_wire.clone();
+            let shared_owner_rg_indexes = self.sessions.owner_rg_indexes.clone();
             let worker_commands = self
                 .workers
                 .handles
