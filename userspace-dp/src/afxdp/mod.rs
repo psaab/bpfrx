@@ -428,16 +428,19 @@ use forward_request::{build_live_forward_request_from_frame, should_install_loca
 #[cfg(test)]
 use forward_request::build_live_forward_request;
 
+
 #[derive(Clone, Copy, Debug, Default)]
 struct PendingForwardHints {
     expected_ports: Option<(u16, u16)>,
     target_binding_index: Option<usize>,
 }
 
+
 // Superseded by inline logic in build_live_forward_request() that reads ports
 // from the live UMEM area before .to_vec() copy (fixes #199).  Retained for
 // its unit test and potential future use.
 #[allow(dead_code)]
+
 
 fn binding_by_index_mut<'a>(
     left: &'a mut [BindingWorker],
@@ -472,4 +475,5 @@ fn find_target_binding_mut<'a>(
     )?;
     binding_by_index_mut(left, current_index, ingress_binding, right, target_index)
 }
+
 
