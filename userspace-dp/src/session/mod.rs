@@ -14,6 +14,11 @@ mod key;
 pub(crate) use key::*;
 mod entry;
 pub(crate) use entry::*;
+mod wheel;
+use wheel::{
+    bucket_for_tick, target_tick_for, FAR_FUTURE_OFFSET, SessionWheel, WheelEntry, WHEEL_BUCKETS,
+    WHEEL_TICK_NS,
+};
 
 const SESSION_GC_INTERVAL_NS: u64 = 1_000_000_000;
 const DEFAULT_MAX_SESSIONS: usize = 131072;
@@ -23,74 +28,6 @@ const DEFAULT_UDP_SESSION_TIMEOUT_NS: u64 = 60_000_000_000;
 const DEFAULT_ICMP_SESSION_TIMEOUT_NS: u64 = 60_000_000_000;
 const OTHER_SESSION_TIMEOUT_NS: u64 = 30_000_000_000;
 
-// #965: bucketed timer-wheel session GC.
-// 256 buckets x 1-second ticks = 256-second window. Long-timeout
-// sessions (> 256 s) re-bucket via the FAR_FUTURE_OFFSET path on
-// pop; see plan docs/pr/965-session-gc-timer-wheel/plan.md.
-const WHEEL_BUCKETS: usize = 256;
-const WHEEL_MASK: u64 = (WHEEL_BUCKETS as u64) - 1;
-// Wheel tick must equal the GC interval — `expire_stale_entries`
-// is gated by `SESSION_GC_INTERVAL_NS` and the cursor advances one
-// bucket per tick. If these diverge the cadence math gets silently
-// out of sync (Copilot review: bind WHEEL_TICK_NS to the gate).
-const WHEEL_TICK_NS: u64 = SESSION_GC_INTERVAL_NS;
-const FAR_FUTURE_OFFSET: u64 = (WHEEL_BUCKETS as u64) - 1;
-// Compile-time invariant: bucket_for_tick uses `tick & WHEEL_MASK`
-// which only computes `tick % WHEEL_BUCKETS` correctly when
-// WHEEL_BUCKETS is a power of two (Copilot review: footgun if
-// someone changes the bucket count without updating the helper).
-const _: () = assert!(
-    WHEEL_BUCKETS.is_power_of_two(),
-    "WHEEL_BUCKETS must be a power of two for the WHEEL_MASK trick to compute tick % WHEEL_BUCKETS",
-);
-
-#[inline]
-fn bucket_for_tick(tick: u64) -> usize {
-    (tick & WHEEL_MASK) as usize
-}
-
-/// Compute the absolute wheel tick at which an entry expiring at
-/// `expiration_ns` should be checked, given the current `now_ns`.
-/// Floors the expiration to a tick boundary; entries past their
-/// expiration land in the current tick (delta=0), entries in the
-/// far future are clamped to FAR_FUTURE_OFFSET ticks ahead and get
-/// re-checked there (still-alive case triggers re-bucketing in pop).
-#[inline]
-fn target_tick_for(now_ns: u64, expiration_ns: u64) -> u64 {
-    let now_tick = now_ns / WHEEL_TICK_NS;
-    let expiration_tick = expiration_ns / WHEEL_TICK_NS;
-    let delta = expiration_tick.saturating_sub(now_tick);
-    now_tick + delta.min(FAR_FUTURE_OFFSET)
-}
-
-#[derive(Clone, Debug)]
-struct WheelEntry {
-    key: SessionKey,
-    scheduled_tick: u64,
-}
-
-struct SessionWheel {
-    buckets: Box<[VecDeque<WheelEntry>]>,
-    /// Absolute tick of the next bucket to pop. Advances 1 per
-    /// elapsed wheel tick during `expire_stale_entries`. The bucket
-    /// index is `cursor_tick & WHEEL_MASK`.
-    cursor_tick: u64,
-    initialized: bool,
-}
-
-impl SessionWheel {
-    fn new() -> Self {
-        let mut buckets: Vec<VecDeque<WheelEntry>> = Vec::with_capacity(WHEEL_BUCKETS);
-        for _ in 0..WHEEL_BUCKETS {
-            buckets.push(VecDeque::new());
-        }
-        Self {
-            buckets: buckets.into_boxed_slice(),
-            cursor_tick: 0,
-            initialized: false,
-        }
-    }
-}
 
 /// Per-call statistics for `expire_stale_entries` pop work, used by
 /// the timer-wheel unit tests to assert K-bounds and entry
