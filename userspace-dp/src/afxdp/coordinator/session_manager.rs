@@ -3,7 +3,7 @@ use super::*;
 /// Cross-thread session-table state shared between the coordinator,
 /// HA worker, and packet workers via `Arc<Mutex<...>>`.
 ///
-/// The 4 session tables (synced + nat + forward-wire) plus the
+/// The 3 session tables (synced + nat + forward-wire) plus the
 /// owner-RG index live here together because they're written and
 /// queried as a unit by the HA bulk-sync, incremental-sync, and
 /// session-resolution paths. The `export_seq` counter is the
