@@ -63,7 +63,7 @@ fn cos_queue_pop_front_inner(
             // has advanced since the bucket's original enqueue.
             //
             // Stack capacity is preallocated to TX_BATCH_SIZE
-            // (see types.rs), so this push is amortized O(1) and
+            // (see types/mod.rs), so this push is amortized O(1) and
             // allocation-free.
             //
             // #785 Phase 3 — Codex round-3 NEW-2 / Rust reviewer LOW:

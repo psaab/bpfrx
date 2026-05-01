@@ -17,7 +17,7 @@ use super::*;
 /// `RingTx::commit` via `bridge_xsk_ring_prod_submit` at
 /// csrc/xsk_bridge.c:108-111) issues a release-store on the producer
 /// head per the AF_XDP ring-buffer ABI. Our `slot.publish()` uses
-/// `Ordering::Release` (types.rs PaddedVtimeSlot::publish). On the
+/// `Ordering::Release` (types/shared_cos_lease.rs PaddedVtimeSlot::publish). On the
 /// same worker thread, program order: producer commit → V_min
 /// publish. Peers reading the slot via `Ordering::Acquire` thus
 /// observe a vtime that reflects frames already in the TX ring.
