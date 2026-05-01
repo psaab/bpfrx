@@ -4,8 +4,10 @@
 //
 // This file is a thin index — declarations + re-exports only.
 
-pub(crate) mod handlers;
-pub(crate) mod state;
+// Submodules are private — external callers reach their items only
+// through the explicit `pub(crate) use` re-exports below.
+mod handlers;
+mod state;
 
 pub(crate) use handlers::handle_stream;
 pub(crate) use state::{Args, PollMode, ServerState};

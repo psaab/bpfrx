@@ -19,7 +19,10 @@ mod xsk_ffi;
 
 mod protocol;
 mod server;
-use server::{handle_stream, Args, PollMode, ServerState};
+// Re-export at the crate root so other modules (afxdp/bind, afxdp/coordinator)
+// can continue to reach `crate::PollMode` after the move into server/state.rs
+// without depending on ancestor-privacy of a private use statement.
+pub(crate) use server::{handle_stream, Args, PollMode, ServerState};
 
 use afxdp::SyncedSessionEntry;
 use chrono::Utc;
