@@ -6,9 +6,10 @@
 //     because every enqueue checks whether the runtime exists for
 //     the egress ifindex; carries `#[inline]`.
 //   - `build_cos_interface_runtime` — pure constructor from
-//     `CoSInterfaceConfig`. Called once by `ensure_*` and 3 times
-//     by `tx::tests`; pub(in crate::afxdp) plus cfg-gated
-//     re-export from cos/mod.rs.
+//     `CoSInterfaceConfig`. Called once by `ensure_*` and by
+//     `tx::test_support` fixture builders; pub(in crate::afxdp)
+//     plus cfg-gated re-export from cos/mod.rs. Direct unit tests
+//     for this fn live in this file's `mod tests` (#984 P3 phase 4b).
 //
 // `cos_tick_for_ns` moved to cos/tx_completion.rs in #956 P1; the
 // Phase-6 cos/builders -> tx back-edge is now closed.
