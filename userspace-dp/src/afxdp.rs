@@ -100,7 +100,7 @@ mod tunnel;
 mod tx;
 #[path = "afxdp/types.rs"]
 mod types;
-#[path = "afxdp/umem.rs"]
+#[path = "afxdp/umem/mod.rs"]
 mod umem;
 
 #[cfg(test)]
