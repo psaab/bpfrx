@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) struct CoSState {
+pub(crate) struct SharedCoSState {
     pub(crate) owner_worker_by_queue: Arc<ArcSwap<BTreeMap<(i32, u8), u32>>>,
     pub(crate) owner_live_by_queue: Arc<ArcSwap<BTreeMap<(i32, u8), Arc<BindingLiveState>>>>,
     pub(crate) root_leases: Arc<ArcSwap<BTreeMap<i32, Arc<SharedCoSRootLease>>>>,
@@ -13,7 +13,7 @@ pub(crate) struct CoSState {
     pub(crate) queue_vtime_floors: Arc<ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueVtimeFloor>>>>,
 }
 
-impl CoSState {
+impl SharedCoSState {
     pub(super) fn new() -> Self {
         Self {
             owner_worker_by_queue: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),

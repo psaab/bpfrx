@@ -3,7 +3,7 @@ mod bpf_maps;
 mod cos_state;
 mod neighbor_manager;
 pub(crate) use bpf_maps::BpfMaps;
-pub(crate) use cos_state::CoSState;
+pub(crate) use cos_state::SharedCoSState;
 pub(crate) use neighbor_manager::NeighborManager;
 
 pub struct Coordinator {
@@ -15,7 +15,7 @@ pub struct Coordinator {
     pub(crate) ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     pub(crate) shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
     pub(crate) shared_forwarding: Arc<ArcSwap<ForwardingState>>,
-    pub(crate) cos: CoSState,
+    pub(crate) cos: SharedCoSState,
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
     pub(crate) neighbors: NeighborManager,
     pub(crate) shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -61,7 +61,7 @@ impl Coordinator {
             ha_state: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_fabrics: Arc::new(ArcSwap::from_pointee(Vec::new())),
             shared_forwarding: Arc::new(ArcSwap::from_pointee(ForwardingState::default())),
-            cos: CoSState::new(),
+            cos: SharedCoSState::new(),
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
             neighbors: NeighborManager::new(),
             shared_sessions: Arc::new(Mutex::new(FastMap::default())),
