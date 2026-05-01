@@ -1578,3 +1578,156 @@ pub(super) struct TelemetryContext<'a> {
     pub(super) dbg: &'a mut DebugPollCounters,
     pub(super) counters: &'a mut BatchCounters,
 }
+
+#[cfg(test)]
+mod flow_rr_ring_tests {
+    use super::*;
+
+    // #694 / #711: `FlowRrRing` invariant pins. Colocated with the production
+    // FlowRrRing struct + impl in types/mod.rs (split back from the
+    // shared_cos_lease test mod per Codex P4 review).
+
+    #[test]
+    fn flow_rr_ring_push_pop_round_robin_order() {
+        let mut ring = FlowRrRing::default();
+        assert!(ring.is_empty());
+        assert_eq!(ring.len(), 0);
+        assert_eq!(ring.front(), None);
+
+        ring.push_back(7);
+        ring.push_back(11);
+        ring.push_back(13);
+        assert_eq!(ring.len(), 3);
+        assert_eq!(ring.front(), Some(7));
+
+        // FIFO dequeue preserves push order.
+        assert_eq!(ring.pop_front(), Some(7));
+        assert_eq!(ring.pop_front(), Some(11));
+        assert_eq!(ring.pop_front(), Some(13));
+        assert_eq!(ring.pop_front(), None);
+        assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn flow_rr_ring_push_front_places_at_head() {
+        let mut ring = FlowRrRing::default();
+        ring.push_back(5);
+        ring.push_back(9);
+        ring.push_front(3); // restore at head
+        assert_eq!(ring.len(), 3);
+        assert_eq!(ring.pop_front(), Some(3));
+        assert_eq!(ring.pop_front(), Some(5));
+        assert_eq!(ring.pop_front(), Some(9));
+    }
+
+    #[test]
+    fn flow_rr_ring_wraps_around_buffer_end_correctly() {
+        // Drive the head past the backing-array end and back around.
+        // A naive implementation that uses `head + len` without mod
+        // breaks exactly here.
+        let mut ring = FlowRrRing::default();
+        // Fill to 3/4 of capacity, drain half, then fill by another
+        // half-capacity worth — the tail write crosses the backing-
+        // array end and wraps. Total in-flight stays within capacity.
+        let first = COS_FLOW_FAIR_BUCKETS * 3 / 4;
+        let second = COS_FLOW_FAIR_BUCKETS / 2;
+        for i in 0..first {
+            ring.push_back(i as u16);
+        }
+        for _ in 0..(first / 2) {
+            ring.pop_front();
+        }
+        for i in 0..second {
+            ring.push_back((i + 10_000) as u16);
+        }
+        let mut drained = Vec::with_capacity(ring.len());
+        while let Some(b) = ring.pop_front() {
+            drained.push(b);
+        }
+        let mut expected: Vec<u16> = ((first / 2)..first).map(|i| i as u16).collect();
+        expected.extend((0..second).map(|i| (i + 10_000) as u16));
+        assert_eq!(drained, expected);
+    }
+
+    #[test]
+    fn flow_rr_ring_iter_yields_same_order_as_pop() {
+        let mut ring = FlowRrRing::default();
+        for v in [17u16, 3, 11, 29, 7] {
+            ring.push_back(v);
+        }
+        let iter_snapshot: Vec<u16> = ring.iter().collect();
+        let mut pop_snapshot = Vec::new();
+        while let Some(b) = ring.pop_front() {
+            pop_snapshot.push(b);
+        }
+        assert_eq!(iter_snapshot, pop_snapshot);
+    }
+
+    #[test]
+    fn flow_rr_ring_accepts_full_cap_minus_one_without_wraparound_bug() {
+        // Exactly-at-capacity-minus-one fills: common off-by-one site
+        // for ring buffers where the "full" condition is tested.
+        let mut ring = FlowRrRing::default();
+        let cap = COS_FLOW_FAIR_BUCKETS as u16;
+        for i in 0..(cap - 1) {
+            ring.push_back(i);
+        }
+        assert_eq!(ring.len(), usize::from(cap - 1));
+        // Drain and re-fill to force internal head advancement past
+        // 3/4 of the buffer.
+        for _ in 0..((cap - 1) / 2) {
+            ring.pop_front();
+        }
+        // Push enough to wrap past the buffer end.
+        for i in 0..((cap - 1) / 2) {
+            ring.push_back(i + 10_000);
+        }
+        // Drain and assert no duplicate IDs and no spurious values.
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(b) = ring.pop_front() {
+            assert!(seen.insert(b), "ring produced duplicate bucket id: {b}");
+        }
+        assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn flow_rr_ring_holds_full_bucket_count_without_panic() {
+        // The ring's own capacity is `COS_FLOW_FAIR_BUCKETS`. The
+        // caller guards against duplicate pushes, so in practice the
+        // ring holds at most `COS_FLOW_FAIR_BUCKETS` entries. Verify
+        // that exactly-at-capacity is well-defined (no push_back
+        // panic in release, no wrong head index) and that the ring
+        // empties correctly.
+        let mut ring = FlowRrRing::default();
+        for i in 0..COS_FLOW_FAIR_BUCKETS {
+            ring.push_back(i as u16);
+        }
+        assert_eq!(ring.len(), COS_FLOW_FAIR_BUCKETS);
+        // Front is 0, tail write would wrap — but we're not over-
+        // filling, so this is the well-defined "exactly at capacity"
+        // case.
+        assert_eq!(ring.front(), Some(0));
+        // Drain and verify every ID came back exactly once.
+        let mut count = 0usize;
+        while let Some(b) = ring.pop_front() {
+            assert_eq!(b, count as u16);
+            count += 1;
+        }
+        assert_eq!(count, COS_FLOW_FAIR_BUCKETS);
+    }
+
+    #[test]
+    fn flow_rr_ring_memory_footprint_fits_expected_budget() {
+        // Sanity pin: `FlowRrRing` should be ~2 KB at the chosen
+        // bucket count (1024 u16 entries + two u16 indices +
+        // padding). A future refactor that accidentally widens the
+        // entry type to u32 would double this without a loud signal;
+        // this bound catches it.
+        let size = std::mem::size_of::<FlowRrRing>();
+        assert!(
+            size <= 2 * 1024 + 64,
+            "FlowRrRing unexpectedly large: {size} bytes"
+        );
+    }
+}
+

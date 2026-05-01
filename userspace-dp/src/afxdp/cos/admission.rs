@@ -28,7 +28,7 @@ pub(in crate::afxdp) const COS_FLOW_FAIR_MIN_SHARE_BYTES: u64 = 16 * 1500;
 
 // Compile-time pin so the floor cannot silently drift below the
 // fast-retransmit-safe threshold on a rebase/refactor. Parallels the
-// `const _: () = assert!` invariants in `types.rs`. Lives here (at the
+// `const _: () = assert!` invariants in `types/mod.rs`. Lives here (at the
 // constant) rather than in `tests/` so `cargo build` enforces it, not
 // just `cargo test`.
 const _: () = assert!(COS_FLOW_FAIR_MIN_SHARE_BYTES >= 16 * 1500);
