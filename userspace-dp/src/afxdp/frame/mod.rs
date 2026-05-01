@@ -8,6 +8,7 @@ mod inspect;
 // `checksum.rs` (only the SNAT/DNAT rewrites here call it) and is
 // pulled in via a non-pub `use` to avoid a glob re-export at a
 // wider visibility than its own.
+use checksum::adjust_l4_checksum_ipv6_addr_bytes;
 pub(in crate::afxdp) use checksum::{
     adjust_ipv4_header_checksum, adjust_l4_checksum_ipv4, adjust_l4_checksum_ipv4_dst,
     adjust_l4_checksum_ipv4_src, adjust_l4_checksum_ipv4_words, adjust_l4_checksum_ipv6,
@@ -16,7 +17,6 @@ pub(in crate::afxdp) use checksum::{
     checksum16_ipv6, ipv4_words, ipv6_words, ipv6_words_from_octets, ipv6_words_from_slice,
     recompute_l4_checksum_ipv4, recompute_l4_checksum_ipv6,
 };
-use checksum::adjust_l4_checksum_ipv6_addr_bytes;
 
 // Phase 2: pure header-parsing leaf fns. `frame_has_tcp_rst` is
 // re-exported at `pub(in crate::afxdp)` (called from afxdp.rs,
@@ -224,10 +224,6 @@ pub(super) fn parse_session_flow(
     parse_session_flow_from_bytes(frame, meta)
 }
 
-
-
-
-
 pub(in crate::afxdp) fn apply_dscp_rewrite_to_frame(frame: &mut [u8], dscp: u8) -> Option<()> {
     let dscp = dscp & 0x3f;
     let l3 = frame_l3_offset(frame)?;
@@ -347,11 +343,6 @@ pub(super) fn decode_frame_summary(frame: &[u8]) -> String {
         String::new()
     }
 }
-
-
-
-
-
 
 pub(super) fn parse_session_flow_from_frame(
     frame: &[u8],
@@ -493,7 +484,6 @@ pub(super) fn parse_ipv4_session_flow_from_frame(
         },
     })
 }
-
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn parse_zone_encoded_fabric_ingress(
@@ -6197,8 +6187,7 @@ mod tests {
             0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't',
         ];
         let v6_header: Vec<u8> = vec![
-            0x60, 0x00, 0x00, 0x00, 0x00, 0x14, PROTO_TCP, 64,
-            // src 2001:db8::1
+            0x60, 0x00, 0x00, 0x00, 0x00, 0x14, PROTO_TCP, 64, // src 2001:db8::1
             0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
             // dst 2001:db8::200
             0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0x00,

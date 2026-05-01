@@ -6,7 +6,7 @@
 //! try_parse_metadata) remain in mod.rs for now and will land in a
 //! follow-on phase to keep this diff reviewable.
 
-use super::*;
+use super::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, SessionFlow, UserspaceDpMeta};
 
 /// Check if a frame contains a TCP RST flag.
 pub(in crate::afxdp) fn frame_has_tcp_rst(frame: &[u8]) -> bool {
@@ -330,7 +330,11 @@ pub(in crate::afxdp) fn metadata_tuple_complete(meta: UserspaceDpMeta, flow: &Se
     }
 }
 
-pub(in crate::afxdp) fn parse_flow_ports(frame: &[u8], l4: usize, protocol: u8) -> Option<(u16, u16)> {
+pub(in crate::afxdp) fn parse_flow_ports(
+    frame: &[u8],
+    l4: usize,
+    protocol: u8,
+) -> Option<(u16, u16)> {
     match protocol {
         PROTO_TCP | PROTO_UDP => {
             let bytes = frame.get(l4..l4 + 4)?;
