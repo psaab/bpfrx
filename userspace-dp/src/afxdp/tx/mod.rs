@@ -7660,36 +7660,6 @@ mod tests {
     }
 
 
-    // ---------------------------------------------------------------------
-    // #718 ECN CE-marking. The markers are the load-bearing helpers;
-    // the admission-path tests exercise `apply_cos_admission_ecn_policy`
-    // which is what `enqueue_cos_item` calls in-line. Keep the marker
-    // tests byte-precise so a future refactor that flips an endian /
-    // offset / masks a different bit fails loudly.
-    // ---------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn admission_ecn_marked_counter_increments_when_marking_above_threshold() {

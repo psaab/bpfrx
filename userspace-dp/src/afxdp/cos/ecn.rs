@@ -5,11 +5,11 @@
 // flow_hash; correct dependency direction — a byte-mutation
 // module should not own admission tuning).
 //
-// Tests that exercise these helpers continue to live in `tx::tests`;
-// they reach the moved items via the re-exports from `cos/mod.rs`
-// (`use super::cos::{...}`). Test placement was held here through
-// Phase 3 — admission-path tests share fixtures and stay in
-// `tx::tests` as the established Phase 1+2+3 pattern.
+// ECN-marker unit tests now live in this file (`mod tests` at
+// the bottom). Pre-#984 P3 phase 2c they lived in `tx::tests` via
+// the `cos/mod.rs` re-exports; that pattern is now retired for
+// helpers in this module. Admission-path tests still live in
+// `tx::tests` because they share larger fixtures.
 
 use crate::afxdp::ethernet::{ETH_HDR_LEN, VLAN_TAG_LEN};
 use crate::afxdp::types::{PreparedTxRequest, TxRequest};
@@ -435,7 +435,7 @@ mod tests {
     /// Regression pin for the VLAN-tagged admission path discovered in
     /// the #727 live validation: a single 802.1Q tag (ethertype 0x8100)
     /// pushes L3 four bytes deeper. `maybe_mark_ecn_ce` must detect
-    /// that via `ethernet_l3_offset` and still mark the ECN bits at
+    /// that via `ethernet_l3` and still mark the ECN bits at
     /// the correct offset rather than stamping into the VLAN TCI.
     #[test]
     fn maybe_mark_ecn_ce_handles_single_vlan_tagged_frame() {
