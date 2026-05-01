@@ -99,4 +99,3 @@ use super::cos::{
 };
 #[cfg(test)]
 use super::cos::COS_MIN_BURST_BYTES;
-

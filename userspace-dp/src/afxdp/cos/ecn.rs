@@ -8,8 +8,8 @@
 // ECN-marker unit tests now live in this file (`mod tests` at
 // the bottom). Pre-#984 P3 phase 2c they lived in `tx::tests` via
 // the `cos/mod.rs` re-exports; that pattern is now retired for
-// helpers in this module. Admission-path tests still live in
-// `tx::tests` because they share larger fixtures.
+// helpers in this module. Admission-path tests live in
+// `cos/admission.rs::tests` (#984 P3 phase 5b).
 
 use crate::afxdp::ethernet::{ETH_HDR_LEN, VLAN_TAG_LEN};
 use crate::afxdp::types::{PreparedTxRequest, TxRequest};

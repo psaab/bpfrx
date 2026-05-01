@@ -22,8 +22,8 @@
 //     the V_MIN_READ_CADENCE / V_MIN_LAG_THRESHOLD_NS /
 //     V_MIN_MIN_LAG_BYTES constants. The throttle-cap constants
 //     V_MIN_CONSECUTIVE_SKIP_HARD_CAP and V_MIN_SUSPENSION_BATCHES
-//     are pub(in crate::afxdp) with cfg-gated re-export — tx::tests
-//     references them directly.
+//     are pub(in crate::afxdp); colocated V-min tests live in
+//     this file's `mod tests`.
 //
 // 14 always-on cross-module fns get pub(in crate::afxdp); 4 items
 // (account_*, V_MIN_CONSECUTIVE_SKIP_HARD_CAP, V_MIN_SUSPENSION_BATCHES)
