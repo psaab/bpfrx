@@ -1,4 +1,3 @@
-use super::super::*;
 use super::*;
 
 // MQFQ V_min coordination split out of queue_ops/mod.rs per #1034 P1.
