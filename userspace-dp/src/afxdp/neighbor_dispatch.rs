@@ -127,23 +127,26 @@ pub(super) fn retry_pending_neigh(
             ) {
                 if let Some(hop) = pkt.decision.resolution.next_hop {
                     let key = (pkt.decision.resolution.egress_ifindex, hop);
-                    if probed_this_sweep.insert(key) {
-                        // First packet for this (egress, hop) in this
-                        // sweep slot — fire the probe (if iface name
-                        // resolves) and consume this slot.
-                        if let Some(name) = forwarding.ifindex_to_name.get(&key.0) {
-                            trigger_kernel_arp_probe(name, hop);
-                            pkt.probe_attempts = pkt.probe_attempts.saturating_add(1);
-                        }
-                        // else: ifindex unknown → cannot probe; do NOT
-                        // advance probe_attempts so the slot is
-                        // re-tried next sweep.
-                    } else {
-                        // Already probed this (egress, hop) this sweep
-                        // — slot is consumed, advance pkt's schedule
-                        // to avoid busy-looping on it.
+                    if probed_this_sweep.contains(&key) {
+                        // Another pkt for this (egress, hop) already
+                        // fired the probe this sweep. Advance this
+                        // pkt's schedule so it doesn't busy-loop on
+                        // the same slot next sweep.
+                        pkt.probe_attempts = pkt.probe_attempts.saturating_add(1);
+                    } else if let Some(name) = forwarding.ifindex_to_name.get(&key.0) {
+                        // First pkt for this (egress, hop) AND iface
+                        // resolves → fire the probe, mark the slot
+                        // consumed for the rest of this sweep, and
+                        // advance this pkt's schedule.
+                        trigger_kernel_arp_probe(name, hop);
+                        probed_this_sweep.insert(key);
                         pkt.probe_attempts = pkt.probe_attempts.saturating_add(1);
                     }
+                    // else: not yet probed AND iface lookup miss → no
+                    // probe fires, key NOT inserted, probe_attempts
+                    // NOT advanced. Subsequent same-key pkts will
+                    // also fall here, and the whole batch retries
+                    // this slot next sweep.
                 }
                 // else: no next_hop → cannot probe; do not advance.
             }
@@ -377,11 +380,15 @@ mod cold_start_probe_schedule_tests {
 
     /// Pure-function model of the per-sweep dedup logic in
     /// `retry_pending_neigh`'s still-pending branch. Mirrors the
-    /// real code path closely enough to test the burst-coalescing
-    /// behavior without spinning up a full `BindingWorker`.
+    /// real code path closely enough to test burst-coalescing
+    /// behavior — including the ifindex-miss path — without spinning
+    /// up a full `BindingWorker`.
+    ///
+    /// Returns (probes_fired, attempts_advanced).
     fn simulate_sweep_for_neighbor(
         packets_for_same_neigh: u32,
         slot_idx: u8,
+        iface_resolves: bool,
     ) -> (u32, u32) {
         let mut probed: std::collections::BTreeSet<(i32, std::net::IpAddr)> =
             std::collections::BTreeSet::new();
@@ -394,13 +401,17 @@ mod cold_start_probe_schedule_tests {
         let elapsed = PROBE_SCHEDULE_NS[slot_idx as usize];
         for _ in 0..packets_for_same_neigh {
             if probe_due(elapsed, slot_idx) {
-                if probed.insert(key) {
-                    probes_fired += 1;
+                if probed.contains(&key) {
+                    // Slot consumed by an earlier pkt this sweep.
                     attempts_advanced += 1;
-                } else {
-                    // Dedup hit: slot consumed by an earlier pkt.
+                } else if iface_resolves {
+                    // First pkt + iface resolves → fire + mark + advance.
+                    probes_fired += 1;
+                    probed.insert(key);
                     attempts_advanced += 1;
                 }
+                // else: iface miss + not yet probed → drop through,
+                // no probe, no insert, no advance.
             }
         }
         (probes_fired, attempts_advanced)
@@ -412,7 +423,7 @@ mod cold_start_probe_schedule_tests {
         // must produce exactly ONE probe per schedule slot. All 50
         // pkts still advance their probe_attempts so they don't
         // re-trigger the same slot next sweep.
-        let (fired, advanced) = simulate_sweep_for_neighbor(50, 0);
+        let (fired, advanced) = simulate_sweep_for_neighbor(50, 0, true);
         assert_eq!(
             fired, 1,
             "expected 1 probe for 50 same-neighbor packets, got {fired}",
@@ -424,8 +435,25 @@ mod cold_start_probe_schedule_tests {
     fn dedup_holds_across_all_schedule_slots() {
         // Same dedup property for every slot, not just slot 0.
         for slot in 0..(PROBE_SCHEDULE_NS.len() as u8) {
-            let (fired, _) = simulate_sweep_for_neighbor(8, slot);
+            let (fired, _) = simulate_sweep_for_neighbor(8, slot, true);
             assert_eq!(fired, 1, "slot {slot}: expected 1 probe, got {fired}",);
         }
+    }
+
+    #[test]
+    fn iface_miss_does_not_burn_slot_for_any_packet() {
+        // When ifindex_to_name lookup fails (e.g. iface flapped),
+        // NONE of the queued packets should consume their schedule
+        // slot — every pkt must stay at the same probe_attempts so
+        // the next sweep can re-try once the iface is back. Earlier
+        // bug: first pkt inserted into dedup set then bailed,
+        // causing later pkts to think the slot was consumed by a
+        // probe that never fired.
+        let (fired, advanced) = simulate_sweep_for_neighbor(50, 0, false);
+        assert_eq!(fired, 0, "no probes when iface lookup fails");
+        assert_eq!(
+            advanced, 0,
+            "no pkt should advance probe_attempts on iface miss",
+        );
     }
 }
