@@ -228,7 +228,7 @@ inlining. Treat the trend as a defect, not a style preference.
   machine → enum + dispatch fn, repeated parameter cluster → context
   struct). The standing cautionary example is
   `poll_binding_process_descriptor` in `afxdp.rs`: #945 brought it
-  down from 31 parameters to 13, but the body is still long and the
+  down from 31 parameters to 15, but the body is still long and the
   parameter cluster is still a refactor smell — tracked as #961.
 - **One responsibility per module.** A module that mixes admission
   policy with byte-mutation, or memory mapping with ring management,
