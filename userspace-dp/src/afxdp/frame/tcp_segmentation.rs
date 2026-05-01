@@ -3,8 +3,9 @@
 // `segment_forwarded_tcp_frames` is the XdpDesc adapter wrapper.
 // Pure relocation — bodies are byte-for-byte identical; only the
 // enclosing module is new and the visibility is rewritten from
-// `pub(super)` (visible to afxdp via frame::*) to
-// `pub(in crate::afxdp::frame)` so frame/mod.rs can `pub(in crate::afxdp) use` them.
+// `pub(super)` (visible to afxdp via frame::*) to `pub(in crate::afxdp)`
+// so frame/mod.rs can re-export them at the same effective surface
+// for tx/dispatch.rs's existing call sites.
 
 use super::*;
 
