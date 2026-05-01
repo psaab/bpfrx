@@ -13,7 +13,7 @@ use crate::screen::{ScreenProfile, ScreenState, ScreenVerdict, extract_screen_in
 use crate::session::{
     ForwardSessionMatch, SessionDecision, SessionDelta, SessionDeltaKind, SessionKey,
     SessionLookup, SessionMetadata, SessionOrigin, SessionTable, forward_wire_key,
-    reverse_canonical_key,
+    reverse_canonical_key, reverse_session_key,
 };
 use crate::slowpath::{EnqueueOutcome, SlowPathReinjector, SlowPathStatus, open_tun};
 use crate::xsk_ffi::xdp::XdpDesc;
