@@ -38,7 +38,7 @@ impl super::Coordinator {
         }
         self.ha.rg_runtime.store(Arc::new(state));
         if !demoted_rgs.is_empty() {
-            for handle in self.workers.values() {
+            for handle in self.workers.handles.values() {
                 let mut pending = handle.commands.lock().map_err(|_| {
                     format!(
                         "failed to enqueue DemoteOwnerRGS for demoted RGs {:?}: worker command queue lock poisoned",
@@ -78,7 +78,7 @@ impl super::Coordinator {
             eprintln!(
                 "xpf-ha: RG activation detected: {:?}, workers={}, shared_sessions={}",
                 activated_rgs,
-                self.workers.len(),
+                self.workers.handles.len(),
                 self.shared_sessions.lock().map(|s| s.len()).unwrap_or(0),
             );
             self.handle_activated_rgs(&activated_rgs, now_secs);
@@ -101,6 +101,7 @@ impl super::Coordinator {
 
         let worker_commands = self
             .workers
+            .handles
             .values()
             .map(|handle| handle.commands.clone())
             .collect::<Vec<_>>();
@@ -167,7 +168,7 @@ impl super::Coordinator {
             .session_export_seq
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        for handle in self.workers.values() {
+        for handle in self.workers.handles.values() {
             let mut pending = handle
                 .commands
                 .lock()
@@ -181,6 +182,7 @@ impl super::Coordinator {
         loop {
             if self
                 .workers
+                .handles
                 .values()
                 .all(|handle| handle.session_export_ack.load(Ordering::Acquire) >= sequence)
             {
@@ -305,7 +307,7 @@ impl super::Coordinator {
                 );
             }
         }
-        for handle in self.workers.values() {
+        for handle in self.workers.handles.values() {
             if let Ok(mut pending) = handle.commands.lock() {
                 pending.push_back(WorkerCommand::UpsertSynced(entry.clone()));
                 if let Some(reverse) = &reverse_entry {
@@ -361,7 +363,7 @@ impl super::Coordinator {
                 reverse_key,
             );
         }
-        for handle in self.workers.values() {
+        for handle in self.workers.handles.values() {
             if let Ok(mut pending) = handle.commands.lock() {
                 pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
                 if let Some(reverse_key) = &reverse_key {
@@ -678,7 +680,7 @@ mod tests {
         let mut coordinator = Coordinator::new();
         coordinator.forwarding = test_forwarding_state_split_rgs();
         let worker_commands = Arc::new(Mutex::new(VecDeque::new()));
-        coordinator.workers.insert(
+        coordinator.workers.handles.insert(
             0,
             WorkerHandle {
                 stop: Arc::new(AtomicBool::new(false)),
