@@ -8,6 +8,7 @@
 // through the explicit `pub(crate) use` re-exports below.
 mod handlers;
 pub(crate) mod helpers;
+pub(crate) mod lifecycle;
 mod state;
 
 pub(crate) use handlers::handle_stream;
