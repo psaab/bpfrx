@@ -5,7 +5,6 @@
 // from this child module via `use super::*` / direct paths.
 
 use super::*;
-use crate::protocol::*;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
