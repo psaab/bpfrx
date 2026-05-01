@@ -58,7 +58,6 @@ pub(super) use admission::{
 pub(super) use builders::build_cos_interface_runtime;
 #[cfg(test)]
 pub(super) use cross_binding::{
-    prepared_cos_request_stays_on_current_tx_binding, redirect_local_cos_request_to_owner,
     redirect_local_cos_request_to_owner_binding,
 };
 #[cfg(test)]

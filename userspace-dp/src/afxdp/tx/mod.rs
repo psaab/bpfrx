@@ -152,12 +152,11 @@ use super::cos::{
 };
 // #956 P1: TX-completion + timer-wheel items reached by
 // `mod tests { use super::*; }` at the bottom of this file, plus
-// `redirect_local_cos_request_to_owner` which is also test-only after
+// `` which is also test-only after
 // the cross_binding extraction in #956 Phase 8.
 #[cfg(test)]
 use super::cos::{
     advance_cos_timer_wheel, cos_queue_push_front, maybe_top_up_cos_root_lease, park_cos_queue,
-    prepared_cos_request_stays_on_current_tx_binding, redirect_local_cos_request_to_owner,
     restore_cos_local_items_inner, restore_cos_prepared_items_inner,
     CoSServicePhase, COS_TIMER_WHEEL_TICK_NS,
 };
