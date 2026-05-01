@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) mod mmap;
+mod mmap;
 pub(in crate::afxdp) use mmap::MmapArea;
 
 pub(super) struct WorkerUmemInner {
@@ -87,9 +87,6 @@ impl WorkerUmemPool {
         Ok(Self { umem, free_frames })
     }
 }
-
-
-/// 2 MB hugepage size.
 
 /// Hard capacity of the per-binding redirect inbox
 /// (`BindingLiveState::pending_tx`). Sized to cover the highest expected
@@ -394,8 +391,6 @@ impl OwnerProfilePeerWrites {
         }
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
