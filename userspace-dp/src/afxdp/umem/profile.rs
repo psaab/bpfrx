@@ -157,7 +157,7 @@ impl OwnerProfileOwnerWrites {
     /// does not compile; `from_fn` builds the array inline on the caller's
     /// stack — no heap.
     #[inline]
-    pub(in crate::afxdp) fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             drain_latency_hist: std::array::from_fn(|_| AtomicU64::new(0)),
             drain_invocations: AtomicU64::new(0),
@@ -182,7 +182,7 @@ impl OwnerProfileOwnerWrites {
 
 impl OwnerProfilePeerWrites {
     #[inline]
-    pub(in crate::afxdp) fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             redirect_acquire_hist: std::array::from_fn(|_| AtomicU64::new(0)),
             redirect_sample_counter: AtomicU64::new(0),
