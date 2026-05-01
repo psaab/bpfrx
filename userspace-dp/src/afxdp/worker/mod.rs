@@ -392,7 +392,13 @@ impl BindingWorker {
             // grow. `vec![...].into_boxed_slice()` produces an
             // exactly-sized heap allocation with no spare capacity.
             tx_submit_ns: vec![TX_SIDECAR_UNSTAMPED; total_frames as usize].into_boxed_slice(),
-            pending_neigh: VecDeque::with_capacity(MAX_PENDING_NEIGH),
+            // GEMINI-NEXT.md Section 3 cold start: lazy allocation. The
+            // 4096-cap is enforced at admission (poll_descriptor.rs check
+            // against MAX_PENDING_NEIGH), so pre-allocating that capacity
+            // up front would burn ~576 KB per binding at startup even when
+            // idle. Start at 0 capacity and let VecDeque grow on push as
+            // packets actually queue up.
+            pending_neigh: VecDeque::new(),
             scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
             scratch_rst_teardowns: Vec::with_capacity(16),
             in_flight_prepared_recycles: FastMap::default(),

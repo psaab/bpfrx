@@ -265,7 +265,18 @@ const XDP_OPTIONS: c_int = 8;
 const XDP_OPTIONS_ZEROCOPY: u32 = 1;
 
 const PENDING_NEIGH_TIMEOUT_NS: u64 = 2_000_000_000; // 2 seconds
-const MAX_PENDING_NEIGH: usize = 64;
+// GEMINI-NEXT.md Section 3 cold start: admission cap bumped 64 → 4096 so a
+// per-binding burst of new connections during the ARP/NDP probe window
+// doesn't drop frames. PendingNeighPacket is small (XdpDesc + UserspaceDpMeta
+// + decision + queued_ns ≈ 144 B), so worst-case per binding when the queue
+// is fully populated is ~576 KB. To avoid paying that ~576 KB up front per
+// binding × N bindings, the underlying VecDeque is now constructed with
+// `VecDeque::new()` (zero capacity) at worker init — see worker/mod.rs.
+// The buffer grows on push only when traffic actually queues up, and the
+// 4096 admission check in poll_descriptor.rs enforces the upper bound.
+// This unblocks parallel-connect storms during cluster failback while
+// keeping idle-binding RSS near zero.
+const MAX_PENDING_NEIGH: usize = 4096;
 
 #[inline]
 const fn tx_frame_capacity() -> usize {
