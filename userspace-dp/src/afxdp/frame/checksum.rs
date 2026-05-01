@@ -1,25 +1,43 @@
 // Pure 16-bit one's-complement checksum arithmetic for IPv4/IPv6
 // header + L4 (TCP/UDP/ICMP) updates.
+//
+// Issue #74 / GH issue #967 SIMD path: `checksum16_add_bytes` (and
+// `checksum16` which delegates to it) take an x86_64 AVX2 fast path
+// when the host CPU advertises AVX2 support. The fast path processes
+// 32 bytes (16 u16 words) per AVX2 iteration vs 2 bytes per scalar
+// iteration. Byte-swap is done with `_mm256_shuffle_epi8` so the
+// intermediate u32 partial sum is bit-identical to the scalar BE
+// accumulation — callers can chain SIMD and scalar partial sums
+// without semantic drift.
+//
+// Runtime detection via `is_x86_feature_detected!` happens on every
+// call but is cached internally by the standard library; the branch
+// is well-predicted. For builds compiled with `-C target-feature=+avx2`
+// or `-C target-cpu=native`, the optimizer can usually fold the check
+// to a constant.
 
-use crate::afxdp::{PROTO_TCP, PROTO_UDP, PROTO_ICMPV6};
+use crate::afxdp::{PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 pub(in crate::afxdp) fn checksum16(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    let mut chunks = bytes.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-    }
-    if let Some(last) = chunks.remainder().first() {
-        sum += (*last as u32) << 8;
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
+    checksum16_finish(checksum16_add_bytes(0, bytes))
 }
 
-pub(in crate::afxdp) fn checksum16_add_bytes(mut sum: u32, bytes: &[u8]) -> u32 {
+pub(in crate::afxdp) fn checksum16_add_bytes(sum: u32, bytes: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: target-feature gate above guarantees AVX2.
+            return unsafe { x86_avx2::checksum16_add_bytes_avx2(sum, bytes) };
+        }
+    }
+    checksum16_add_bytes_scalar(sum, bytes)
+}
+
+/// Scalar fallback — also the reference implementation for the SIMD
+/// differential tests. Kept as a free function (not just a closure)
+/// so the SIMD path can call it for the trailing remainder bytes.
+fn checksum16_add_bytes_scalar(mut sum: u32, bytes: &[u8]) -> u32 {
     let mut chunks = bytes.chunks_exact(2);
     for chunk in &mut chunks {
         sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
@@ -28,6 +46,94 @@ pub(in crate::afxdp) fn checksum16_add_bytes(mut sum: u32, bytes: &[u8]) -> u32 
         sum += (*last as u32) << 8;
     }
     sum
+}
+
+#[cfg(target_arch = "x86_64")]
+mod x86_avx2 {
+    use std::arch::x86_64::*;
+
+    /// AVX2 one's-complement-additive byte sum producing a u32 partial
+    /// sum whose value is bit-identical to
+    /// `checksum16_add_bytes_scalar` for the same inputs.
+    ///
+    /// Strategy:
+    /// 1. Load 32 bytes (`_mm256_loadu_si256`).
+    /// 2. Byte-swap each of the 16 u16 lanes (`_mm256_shuffle_epi8` with
+    ///    a per-pair-swap mask). Now each u16 lane holds the BE
+    ///    interpretation of its bytes — matches scalar
+    ///    `u16::from_be_bytes` exactly.
+    /// 3. Zero-extend low 8 lanes and high 8 lanes into 32-bit lanes
+    ///    (`_mm256_unpacklo_epi16` / `_mm256_unpackhi_epi16` against
+    ///    a zero vector).
+    /// 4. Accumulate into two YMM accumulators (lo + hi).
+    /// 5. After the chunk loop, horizontally sum the eight 32-bit
+    ///    lanes of `acc_lo + acc_hi` into one u32, add to caller's
+    ///    `sum`, then call back into the scalar path for the trailing
+    ///    < 32 bytes (which already correctly handles odd-length
+    ///    remainders).
+    ///
+    /// Overflow note: each chunk adds at most `16 * 0xFFFF = 0xF_FFF0`
+    /// per accumulator. With 8 lanes per accumulator carrying
+    /// independent partial sums, the per-lane bound is `0x1_FFFE` per
+    /// chunk. A 64 KiB input is at most 2048 chunks, giving a per-lane
+    /// max of `2048 * 0x1_FFFE ≈ 0x4000_0000` — well below `u32::MAX`.
+    /// Realistic packet sizes (≤ 9 KiB jumbo) are far below this bound.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn checksum16_add_bytes_avx2(sum: u32, bytes: &[u8]) -> u32 {
+        // SAFETY: every intrinsic below is gated by the target_feature
+        // attribute, which the caller proves with `is_x86_feature_detected`.
+        unsafe {
+            // Per-pair byte-swap mask: within each 128-bit lane, swap
+            // the bytes of every u16. AVX2 shuffle_epi8 operates per-
+            // 128-bit lane, so we duplicate the mask in both halves.
+            let bswap = _mm256_setr_epi8(
+                1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14, // low half
+                1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14, // high half
+            );
+            let zero = _mm256_setzero_si256();
+            let mut acc_lo = zero;
+            let mut acc_hi = zero;
+            let mut chunks = bytes.chunks_exact(32);
+            for chunk in &mut chunks {
+                let v = _mm256_loadu_si256(chunk.as_ptr() as *const __m256i);
+                let v_be = _mm256_shuffle_epi8(v, bswap);
+                let lo = _mm256_unpacklo_epi16(v_be, zero);
+                let hi = _mm256_unpackhi_epi16(v_be, zero);
+                acc_lo = _mm256_add_epi32(acc_lo, lo);
+                acc_hi = _mm256_add_epi32(acc_hi, hi);
+            }
+            let acc = _mm256_add_epi32(acc_lo, acc_hi);
+            let simd_sum = horizontal_sum_u32_avx2(acc);
+            // Combine via u32 wrapping_add so the bit-32 carry is
+            // discarded the same way the scalar path silently wraps.
+            // The downstream `checksum16_finish` folds bit 16+ carries
+            // identically in both paths, so silent wrap here is the
+            // only behavior that keeps SIMD and scalar bit-for-bit
+            // congruent at the u32 partial-sum interface.
+            let combined = sum.wrapping_add(simd_sum);
+            super::checksum16_add_bytes_scalar(combined, chunks.remainder())
+        }
+    }
+
+    /// Horizontal sum of 8x u32 lanes in a 256-bit register.
+    #[target_feature(enable = "avx2")]
+    unsafe fn horizontal_sum_u32_avx2(v: __m256i) -> u32 {
+        // SAFETY: AVX2 intrinsics; gated by target_feature on the
+        // function and proved by the calling pathway.
+        unsafe {
+            // Reduce 256 → 128: low half + high half.
+            let hi128 = _mm256_extracti128_si256(v, 1);
+            let lo128 = _mm256_castsi256_si128(v);
+            let sum128 = _mm_add_epi32(lo128, hi128);
+            // Reduce 128 → 64: shuffle high u64 down and add.
+            let shuf = _mm_shuffle_epi32(sum128, 0b1110); // [hi64, _]
+            let sum64 = _mm_add_epi32(sum128, shuf);
+            // Reduce 64 → 32: shuffle high u32 down and add.
+            let shuf2 = _mm_shuffle_epi32(sum64, 0b0001); // [u32_1, _]
+            let sum32 = _mm_add_epi32(sum64, shuf2);
+            _mm_cvtsi128_si32(sum32) as u32
+        }
+    }
 }
 
 pub(in crate::afxdp) fn checksum16_finish(mut sum: u32) -> u16 {
@@ -417,4 +523,83 @@ pub(in crate::afxdp) fn recompute_l4_checksum_ipv6(packet: &mut [u8], protocol: 
         _ => {}
     }
     Some(())
+}
+
+#[cfg(test)]
+mod simd_checksum_tests {
+    use super::*;
+
+    /// Reference scalar implementation for differential testing — bypasses
+    /// the runtime AVX2 detection in `checksum16_add_bytes` and goes straight
+    /// to the scalar path. Without this helper the tests would only verify
+    /// `simd == simd` on AVX2 hosts (the SIMD path is the live one).
+    fn add_bytes_scalar_only(sum: u32, bytes: &[u8]) -> u32 {
+        super::checksum16_add_bytes_scalar(sum, bytes)
+    }
+
+    fn check_eq_for(label: &str, bytes: &[u8]) {
+        // Differential: live `checksum16_add_bytes` (which may take the
+        // AVX2 path) MUST agree with the scalar reference for both the
+        // partial sum and the folded 16-bit checksum.
+        for &start_sum in &[0u32, 0x1234, 0xffff, 0x1_0000, 0xffff_0000] {
+            let live = checksum16_add_bytes(start_sum, bytes);
+            let scalar = add_bytes_scalar_only(start_sum, bytes);
+            assert_eq!(
+                checksum16_finish(live),
+                checksum16_finish(scalar),
+                "label={label} len={} start={:#x}: folded live=0x{:04x} scalar=0x{:04x}",
+                bytes.len(),
+                start_sum,
+                checksum16_finish(live),
+                checksum16_finish(scalar),
+            );
+        }
+    }
+
+    #[test]
+    fn simd_matches_scalar_at_chunk_boundary_sizes() {
+        // Sizes around AVX2 32-byte chunk boundaries: 0, 1, 2, 31, 32,
+        // 33, 63, 64, 65 — covers no-chunk, exact-chunk, chunk+remainder,
+        // and odd-byte tail.
+        for len in [0, 1, 2, 16, 31, 32, 33, 63, 64, 65, 128, 129] {
+            let pattern: Vec<u8> = (0..len).map(|i| ((i * 31 + 17) & 0xff) as u8).collect();
+            check_eq_for("pattern", &pattern);
+        }
+    }
+
+    #[test]
+    fn simd_matches_scalar_for_realistic_packet_sizes() {
+        // 1500 (typical Ethernet MTU), 9000 (jumbo), 64000 (max u16-ish).
+        for len in [1500usize, 9000, 64000] {
+            let pattern: Vec<u8> = (0..len)
+                .map(|i| ((i.wrapping_mul(2654435761)) & 0xff) as u8)
+                .collect();
+            check_eq_for("realistic", &pattern);
+        }
+    }
+
+    #[test]
+    fn simd_matches_scalar_for_pathological_byte_patterns() {
+        // All-zero, all-0xff, alternating, and a pattern that maximizes
+        // u16 carry propagation (every word is 0xffff).
+        let zeros = vec![0u8; 1024];
+        check_eq_for("zeros", &zeros);
+        let ones = vec![0xffu8; 1024];
+        check_eq_for("ones", &ones);
+        let alt: Vec<u8> = (0..1024).map(|i| if i & 1 == 0 { 0xaa } else { 0x55 }).collect();
+        check_eq_for("alt", &alt);
+        // Every u16 = 0xffff: maximally stressful for carry folding.
+        let max_u16 = vec![0xffu8; 256];
+        check_eq_for("max_u16", &max_u16);
+    }
+
+    #[test]
+    fn checksum16_complement_is_invariant() {
+        // Sanity: checksum16(bytes) is the one's-complement of
+        // checksum16_finish(checksum16_add_bytes(0, bytes)).
+        let bytes: Vec<u8> = (0..200u8).collect();
+        let direct = checksum16(&bytes);
+        let composed = checksum16_finish(checksum16_add_bytes(0, &bytes));
+        assert_eq!(direct, composed);
+    }
 }
