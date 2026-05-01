@@ -370,10 +370,10 @@ fn reconcile_stop_preserves_shared_synced_sessions() {
         tcp_flags: 0,
     };
     publish_shared_session(
-        &coordinator.shared_sessions,
-        &coordinator.shared_nat_sessions,
-        &coordinator.shared_forward_wire_sessions,
-        &coordinator.shared_owner_rg_indexes,
+        &coordinator.sessions.synced,
+        &coordinator.sessions.nat,
+        &coordinator.sessions.forward_wire,
+        &coordinator.sessions.owner_rg_indexes,
         &entry,
     );
 
