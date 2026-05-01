@@ -1,7 +1,7 @@
-use crate::test_zone_ids::*;
 use super::super::forwarding_build::*;
 use super::super::test_fixtures::*;
 use super::*;
+use crate::test_zone_ids::*;
 use crate::{FabricSnapshot, NeighborSnapshot, SourceNATRuleSnapshot};
 
 fn active_ha_runtime(now_secs: u64) -> HAGroupRuntime {
@@ -107,8 +107,7 @@ fn cached_flow_decision_invalidates_when_owner_rg_is_demoted() {
     let state = build_forwarding_state(&nat_snapshot());
     let active = BTreeMap::from([(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
     let demoted = BTreeMap::from([(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
-    let resolution =
-        lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+    let resolution = lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
     let now_secs = monotonic_nanos() / 1_000_000_000;
     let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
 
@@ -135,8 +134,7 @@ fn cached_flow_decision_invalidates_when_owner_rg_is_demoted() {
 }
 
 #[test]
-fn cached_flow_decision_invalidates_fabric_redirect_on_fabric_ingress_when_local_owner_active()
-{
+fn cached_flow_decision_invalidates_fabric_redirect_on_fabric_ingress_when_local_owner_active() {
     let state = build_forwarding_state(&nat_snapshot_with_fabric());
     let now_secs = monotonic_nanos() / 1_000_000_000;
     let ha_state = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
@@ -157,7 +155,7 @@ fn cached_flow_decision_invalidates_fabric_redirect_on_fabric_ingress_when_local
 
 #[test]
 fn cached_flow_decision_invalidates_fabric_redirect_on_non_fabric_ingress_when_local_owner_active()
- {
+{
     let state = build_forwarding_state(&nat_snapshot_with_fabric());
     let now_secs = monotonic_nanos() / 1_000_000_000;
     let ha_state = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
@@ -197,8 +195,7 @@ fn cached_flow_decision_keeps_fabric_redirect_on_fabric_ingress_when_local_owner
 }
 
 #[test]
-fn cached_flow_decision_keeps_fabric_redirect_on_non_fabric_ingress_when_local_owner_inactive()
-{
+fn cached_flow_decision_keeps_fabric_redirect_on_non_fabric_ingress_when_local_owner_inactive() {
     let state = build_forwarding_state(&nat_snapshot_with_fabric());
     let now_secs = monotonic_nanos() / 1_000_000_000;
     let ha_state = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
@@ -570,11 +567,19 @@ fn refresh_runtime_snapshot_clears_old_manager_neighbor_cache_entries() {
             },
         )],
     );
-    assert!(coordinator.dynamic_neighbors_ref().contains_key(&(13, target)));
+    assert!(
+        coordinator
+            .dynamic_neighbors_ref()
+            .contains_key(&(13, target))
+    );
 
     coordinator.refresh_runtime_snapshot(&ConfigSnapshot::default());
 
-    assert!(!coordinator.dynamic_neighbors_ref().contains_key(&(13, target)));
+    assert!(
+        !coordinator
+            .dynamic_neighbors_ref()
+            .contains_key(&(13, target))
+    );
     assert!(
         lookup_neighbor_entry(
             &coordinator.forwarding,
@@ -594,7 +599,14 @@ fn new_flow_to_inactive_owner_rg_uses_zone_encoded_fabric_redirect() {
     let routed = lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
     let (from_zone, _) = zone_pair_for_flow(&state, 24, routed.egress_ifindex);
     let redirected = finalize_new_flow_ha_resolution(
-        &state, &ha_state, now_secs, routed, false, 24, state.zone_name_to_id.get(&from_zone).copied().unwrap_or(0), 0,
+        &state,
+        &ha_state,
+        now_secs,
+        routed,
+        false,
+        24,
+        state.zone_name_to_id.get(&from_zone).copied().unwrap_or(0),
+        0,
     );
     assert_eq!(
         redirected.disposition,
@@ -612,9 +624,8 @@ fn new_flow_from_fabric_keeps_forward_candidate_when_owner_rg_inactive() {
     let now_secs = monotonic_nanos() / 1_000_000_000;
     let ha_state = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
     let routed = lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
-    let resolved = finalize_new_flow_ha_resolution(
-        &state, &ha_state, now_secs, routed, true, 21, 1, 0,
-    );
+    let resolved =
+        finalize_new_flow_ha_resolution(&state, &ha_state, now_secs, routed, true, 21, 1, 0);
     assert_eq!(
         resolved.disposition,
         ForwardingDisposition::ForwardCandidate
@@ -654,11 +665,9 @@ fn fabric_originated_reverse_session_prefers_local_client_delivery_when_rg_activ
 }
 
 #[test]
-fn fabric_originated_reverse_session_uses_zone_encoded_fabric_redirect_when_client_rg_inactive()
-{
+fn fabric_originated_reverse_session_uses_zone_encoded_fabric_redirect_when_client_rg_inactive() {
     let state = build_forwarding_state(&nat_snapshot_with_fabric());
-    let ha_state =
-        BTreeMap::from([(2, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
+    let ha_state = BTreeMap::from([(2, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
     let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
 
     let resolved = reverse_resolution_for_session(
@@ -889,8 +898,7 @@ fn reverse_session_prefers_interface_snat_ipv4_local_delivery() {
 #[test]
 fn reverse_session_blocks_inactive_interface_snat_ipv4_local_delivery() {
     let state = build_forwarding_state(&nat_snapshot());
-    let ha_state =
-        BTreeMap::from([(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
+    let ha_state = BTreeMap::from([(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
     let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
 
     let resolved = reverse_resolution_for_session(
@@ -1032,8 +1040,7 @@ fn session_hit_keeps_interface_snat_ipv6_local_delivery() {
 #[test]
 fn embedded_icmp_to_inactive_owner_rg_uses_zone_encoded_fabric_redirect() {
     let state = build_forwarding_state(&nat_snapshot_with_fabric());
-    let ha_state =
-        BTreeMap::from([(2, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
+    let ha_state = BTreeMap::from([(2, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
     let icmp_match = EmbeddedIcmpMatch {
         nat: NatDecision {
             rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
@@ -1176,8 +1183,7 @@ fn embedded_icmp_discard_route_uses_zone_encoded_fabric_redirect() {
 #[test]
 fn embedded_icmp_from_fabric_does_not_redirect_back_to_fabric() {
     let state = build_forwarding_state(&nat_snapshot_with_fabric());
-    let ha_state =
-        BTreeMap::from([(2, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
+    let ha_state = BTreeMap::from([(2, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
     let icmp_match = EmbeddedIcmpMatch {
         nat: NatDecision {
             rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
@@ -1308,9 +1314,8 @@ fn interface_snat_addresses_are_not_treated_as_local_delivery() {
 #[test]
 fn interface_snat_addresses_are_local_delivered_on_session_miss() {
     let state = build_forwarding_state(&nat_snapshot());
-    let resolved_v4 =
-        interface_nat_local_resolution(&state, "172.16.80.8".parse().expect("v4"))
-            .expect("v4 nat local delivery");
+    let resolved_v4 = interface_nat_local_resolution(&state, "172.16.80.8".parse().expect("v4"))
+        .expect("v4 nat local delivery");
     assert_eq!(
         resolved_v4.disposition,
         ForwardingDisposition::LocalDelivery
