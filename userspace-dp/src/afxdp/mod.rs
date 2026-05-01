@@ -49,57 +49,57 @@ macro_rules! debug_log {
     };
 }
 
-#[path = "afxdp/bind.rs"]
+#[path = "bind.rs"]
 mod bind;
-#[path = "afxdp/bpf_map.rs"]
+#[path = "bpf_map.rs"]
 mod bpf_map;
-#[path = "afxdp/checksum.rs"]
+#[path = "checksum.rs"]
 mod checksum;
-#[path = "afxdp/flow_cache.rs"]
+#[path = "flow_cache.rs"]
 mod flow_cache;
-#[path = "afxdp/forwarding/mod.rs"]
+#[path = "forwarding/mod.rs"]
 mod forwarding;
-#[path = "afxdp/forwarding_build.rs"]
+#[path = "forwarding_build.rs"]
 mod forwarding_build;
-#[path = "afxdp/frame/mod.rs"]
+#[path = "frame/mod.rs"]
 mod frame;
-#[path = "afxdp/mpsc_inbox.rs"]
+#[path = "mpsc_inbox.rs"]
 mod mpsc_inbox;
-#[path = "afxdp/gre.rs"]
+#[path = "gre.rs"]
 mod gre;
-#[path = "afxdp/ha.rs"]
+#[path = "ha.rs"]
 mod ha;
-#[path = "afxdp/icmp.rs"]
+#[path = "icmp.rs"]
 mod icmp;
-#[path = "afxdp/icmp_embed.rs"]
+#[path = "icmp_embed.rs"]
 mod icmp_embed;
-#[path = "afxdp/ethernet.rs"]
+#[path = "ethernet.rs"]
 mod ethernet;
-#[path = "afxdp/neighbor.rs"]
+#[path = "neighbor.rs"]
 mod neighbor;
-#[path = "afxdp/parser.rs"]
+#[path = "parser.rs"]
 mod parser;
-#[path = "afxdp/rst.rs"]
+#[path = "rst.rs"]
 mod rst;
-#[path = "afxdp/sharded_neighbor.rs"]
+#[path = "sharded_neighbor.rs"]
 mod sharded_neighbor;
 // session_glue is a directory module (afxdp/session_glue/{mod.rs, tests.rs}),
 // so the explicit `#[path]` is unnecessary — auto-resolution finds mod.rs.
 mod session_glue;
-#[path = "afxdp/cos/mod.rs"]
+#[path = "cos/mod.rs"]
 mod cos;
-#[path = "afxdp/shared_ops.rs"]
+#[path = "shared_ops.rs"]
 mod shared_ops;
 #[cfg(test)]
-#[path = "afxdp/test_fixtures.rs"]
+#[path = "test_fixtures.rs"]
 mod test_fixtures;
-#[path = "afxdp/tunnel.rs"]
+#[path = "tunnel.rs"]
 mod tunnel;
-#[path = "afxdp/tx/mod.rs"]
+#[path = "tx/mod.rs"]
 mod tx;
-#[path = "afxdp/types/mod.rs"]
+#[path = "types/mod.rs"]
 mod types;
-#[path = "afxdp/umem/mod.rs"]
+#[path = "umem/mod.rs"]
 mod umem;
 
 #[cfg(test)]
@@ -285,14 +285,14 @@ const fn tx_frame_capacity() -> usize {
     UMEM_FRAME_SIZE as usize
 }
 
-#[path = "afxdp/coordinator/mod.rs"]
+#[path = "coordinator/mod.rs"]
 mod coordinator;
 #[cfg(test)]
-#[path = "afxdp/tests.rs"]
+#[path = "tests.rs"]
 mod tests;
-#[path = "afxdp/worker/mod.rs"]
+#[path = "worker/mod.rs"]
 mod worker;
-#[path = "afxdp/worker_runtime.rs"]
+#[path = "worker_runtime.rs"]
 mod worker_runtime;
 pub use self::coordinator::Coordinator;
 pub(crate) use self::worker::{
