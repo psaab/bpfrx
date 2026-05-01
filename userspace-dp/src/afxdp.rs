@@ -63,8 +63,6 @@ mod forwarding;
 mod forwarding_build;
 #[path = "afxdp/frame.rs"]
 mod frame;
-#[path = "afxdp/frame_tx.rs"]
-mod frame_tx;
 #[path = "afxdp/mpsc_inbox.rs"]
 mod mpsc_inbox;
 #[path = "afxdp/gre.rs"]
@@ -121,7 +119,7 @@ use self::flow_cache::*;
 use self::forwarding::*;
 use self::forwarding_build::*;
 use self::frame::*;
-use self::frame_tx::*;
+use self::tx::dispatch::*;
 use self::gre::{encapsulate_native_gre_frame, try_native_gre_decap_from_frame};
 use self::icmp::{FABRIC_INGRESS_FLAG, build_local_time_exceeded_request, is_icmp_error};
 #[cfg(test)]

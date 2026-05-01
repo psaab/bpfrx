@@ -63,7 +63,7 @@ fn recycle_ingress_frame(ingress_binding: &mut BindingWorker, source_offset: u64
     }
 }
 
-pub(super) fn enqueue_pending_forwards(
+pub(in crate::afxdp) fn enqueue_pending_forwards(
     left: &mut [BindingWorker],
     ingress_index: usize,
     ingress_binding: &mut BindingWorker,
@@ -885,7 +885,7 @@ fn resolve_pending_forward_target_binding<'a>(
     )
 }
 
-pub(super) fn handle_forward_build_failure(
+pub(in crate::afxdp) fn handle_forward_build_failure(
     binding: &BindingIdentity,
     live: &BindingLiveState,
     slow_path: Option<&Arc<SlowPathReinjector>>,
@@ -936,7 +936,7 @@ pub(super) fn handle_forward_build_failure(
     }
 }
 
-pub(super) fn apply_shared_recycles(
+pub(in crate::afxdp) fn apply_shared_recycles(
     left: &mut [BindingWorker],
     current_index: usize,
     current: &mut BindingWorker,
@@ -959,7 +959,7 @@ pub(super) fn apply_shared_recycles(
     }
 }
 
-pub(super) fn resolve_tx_binding_ifindex(forwarding: &ForwardingState, egress_ifindex: i32) -> i32 {
+pub(in crate::afxdp) fn resolve_tx_binding_ifindex(forwarding: &ForwardingState, egress_ifindex: i32) -> i32 {
     if let Some(fabric) = forwarding
         .fabrics
         .iter()
@@ -987,7 +987,7 @@ fn resolve_pending_forward_cos_tx_selection(
     )
 }
 
-pub(super) fn maybe_reinject_slow_path(
+pub(in crate::afxdp) fn maybe_reinject_slow_path(
     binding: &BindingIdentity,
     live: &BindingLiveState,
     slow_path: Option<&Arc<SlowPathReinjector>>,
@@ -1036,7 +1036,7 @@ pub(super) fn maybe_reinject_slow_path(
     );
 }
 
-pub(super) fn maybe_reinject_slow_path_from_frame(
+pub(in crate::afxdp) fn maybe_reinject_slow_path_from_frame(
     binding: &BindingIdentity,
     live: &BindingLiveState,
     slow_path: Option<&Arc<SlowPathReinjector>>,
@@ -1186,7 +1186,7 @@ pub(super) fn extract_l3_packet_from_frame(
     Some(frame[l3..].to_vec())
 }
 
-pub(super) fn extract_l3_packet_with_nat(
+pub(in crate::afxdp) fn extract_l3_packet_with_nat(
     frame: &[u8],
     meta: impl Into<ForwardPacketMeta>,
     nat: NatDecision,
