@@ -350,6 +350,15 @@ inlining. Treat the trend as a defect, not a style preference.
 These are not "style" but are worth keeping next to the rest because
 they repeatedly bite:
 
+- **Smoke tests run ONLY on the loss userspace cluster.** The smoke
+  target is `loss:xpf-userspace-fw0` / `loss:xpf-userspace-fw1`,
+  driven by `INCUS_REMOTE=loss` + `test/incus/loss-userspace-cluster.env`.
+  Invocation: `BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env
+  ./test/incus/cluster-setup.sh deploy all`. Do NOT smoke on the
+  local `bpfrx-fw0/1` (legacy eBPF cluster, regression-only) or
+  `bpfrx-fw` (standalone eBPF reference). `make cluster-deploy`
+  without `BPFRX_CLUSTER_ENV` targets the legacy local cluster —
+  that is the wrong path for any userspace-dp validation.
 - **Deploy wipes CoS config.** After `cluster-setup.sh deploy`, re-run
   `./test/incus/apply-cos-config.sh <target>` before running iperf3
   for any #706 / #707 / #708 / #709 / #718 validation.

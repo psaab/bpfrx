@@ -57,17 +57,30 @@ make test-destroy    # Tear down VM
 If `incus` commands fail with permission errors, use `sg incus-admin -c "make ..."`.
 
 ## Cluster Test Environment (Two-VM HA)
+
+**Smoke tests run ONLY on the loss userspace cluster** (`loss:xpf-userspace-fw0/fw1`).
+The local `make cluster-*` targets drive the legacy eBPF cluster
+(`bpfrx-fw0/1`) which is regression-only; never use them for smoke.
+
 ```bash
-make cluster-init              # Create networks + profile for HA cluster
-make cluster-create            # Launch xpf-fw0, xpf-fw1, cluster-lan-host
-make cluster-deploy            # Build + push to both VMs + restart
-make cluster-destroy           # Tear down cluster VMs
+# === SMOKE (loss userspace cluster, default for all userspace-dp validation) ===
+export BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env
+./test/incus/cluster-setup.sh deploy all
+./test/incus/cluster-setup.sh ssh 0
+./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0   # deploy wipes CoS — re-apply
+
+# === LEGACY (local bpfrx-fw0/1, regression-only — do NOT use for smoke) ===
+make cluster-init              # Create networks + profile for legacy HA cluster
+make cluster-create            # Launch bpfrx-fw0, bpfrx-fw1, cluster-lan-host
+make cluster-deploy            # Build + push to both legacy VMs + restart
+make cluster-destroy           # Tear down legacy cluster VMs
 make test-failover             # Reboot fw0 during iperf3 — verify TCP survives failover+failback
 make test-ha-crash             # Force-stop/daemon-stop/multi-cycle crash recovery
 make test-restart-connectivity # Verify 0 packet loss during daemon restart
 ```
 
-Or use `test/incus/cluster-setup.sh` directly: `init`, `create`, `deploy all`, `destroy`, `ssh 0|1`, `status`, `logs 0|1`.
+Or use `test/incus/cluster-setup.sh` directly with `BPFRX_CLUSTER_ENV` set:
+`{init|create|deploy all|destroy|ssh 0|1|status|logs 0|1}`.
 
 **IMPORTANT:** Any change touching cluster, VRRP, session sync, or failover code MUST pass `make test-failover` before commit.
 
