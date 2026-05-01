@@ -385,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn maybe_mark_ecn_ce_dispatches_by_addr_family() {
+    fn maybe_mark_ecn_ce_dispatches_by_ethertype() {
         // IPv4 dispatch: ECT(0) → CE.
         let tos = ECN_ECT_0;
         let bytes = build_ipv4_test_packet(tos);
@@ -418,7 +418,11 @@ mod tests {
         assert!(maybe_mark_ecn_ce(&mut req));
         assert_eq!(ipv6_tclass(&req.bytes), ECN_CE);
 
-        // Unknown address family: no-op (and no panic).
+        // Unknown ethertype: no-op (and no panic). The all-zeros
+        // packet has zero in the ethertype slot, so `ethernet_l3`
+        // returns None and the marker bails. Note: dispatch is
+        // driven by the parsed L2 ethertype, not by
+        // `expected_addr_family` — that field is metadata only.
         let mut req = TxRequest {
             bytes: vec![0u8; 64],
             expected_ports: None,
