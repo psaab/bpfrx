@@ -1,6 +1,7 @@
-// Tests for filter.rs — relocated from inline `#[cfg(test)] mod tests` to
-// keep filter.rs under the modularity-discipline LOC threshold (#1049).
-// Loaded as a sibling module via `#[path = "filter_tests.rs"]` from filter.rs.
+// Tests for the filter module (#1049). Originally inline in filter.rs,
+// relocated as filter_tests.rs in P1 (PR #1052), then renamed to
+// filter/tests.rs alongside the structural split into compiler/engine/policer.
+// Loaded as a sibling submodule via `#[path = "tests.rs"]` from filter/mod.rs.
 
 use super::*;
 

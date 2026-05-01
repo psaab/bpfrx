@@ -1,0 +1,765 @@
+// Per-packet filter evaluation engine extracted from filter.rs (#1049 P2 structural split).
+// Pure relocation — bodies are byte-for-byte identical; only the
+// enclosing module and visibility paths change.
+
+use super::*;
+
+/// Evaluate a named filter against a packet flow. First matching term wins.
+/// If no term matches, the implicit action is Accept.
+pub(crate) fn evaluate_filter(
+    state: &FilterState,
+    filter_key: &str,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+) -> FilterResult {
+    evaluate_filter_counted(
+        state, filter_key, src_ip, dst_ip, protocol, src_port, dst_port, dscp, 0,
+    )
+}
+
+pub(crate) fn evaluate_filter_counted(
+    state: &FilterState,
+    filter_key: &str,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> FilterResult {
+    let Some(filter) = state.filters.get(filter_key) else {
+        return FilterResult::default();
+    };
+    evaluate_filter_ref_counted(
+        filter,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        dscp,
+        packet_bytes,
+    )
+}
+
+#[inline]
+fn evaluate_filter_ref_counted(
+    filter: &Filter,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> FilterResult {
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => evaluate_filter_ref_counted_v4(
+            filter,
+            src,
+            dst,
+            protocol,
+            src_port,
+            dst_port,
+            dscp,
+            packet_bytes,
+        ),
+        (IpAddr::V6(src), IpAddr::V6(dst)) => evaluate_filter_ref_counted_v6(
+            filter,
+            src,
+            dst,
+            protocol,
+            src_port,
+            dst_port,
+            dscp,
+            packet_bytes,
+        ),
+        _ => FilterResult::default(),
+    }
+}
+
+#[inline]
+pub(crate) fn evaluate_filter_ref_tx_selection_counted<'a>(
+    filter: &'a Filter,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> TxSelectionFilterResult<'a> {
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => evaluate_filter_ref_tx_selection_counted_v4(
+            filter,
+            src,
+            dst,
+            protocol,
+            src_port,
+            dst_port,
+            dscp,
+            packet_bytes,
+        ),
+        (IpAddr::V6(src), IpAddr::V6(dst)) => evaluate_filter_ref_tx_selection_counted_v6(
+            filter,
+            src,
+            dst,
+            protocol,
+            src_port,
+            dst_port,
+            dscp,
+            packet_bytes,
+        ),
+        _ => TxSelectionFilterResult::default(),
+    }
+}
+
+pub(crate) fn evaluate_filter_ref_tx_selection_cached(
+    filter: &Filter,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+) -> CachedTxSelectionFilterResult {
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => evaluate_filter_ref_tx_selection_cached_v4(
+            filter, src, dst, protocol, src_port, dst_port, dscp,
+        ),
+        (IpAddr::V6(src), IpAddr::V6(dst)) => evaluate_filter_ref_tx_selection_cached_v6(
+            filter, src, dst, protocol, src_port, dst_port, dscp,
+        ),
+        _ => CachedTxSelectionFilterResult::default(),
+    }
+}
+
+#[inline]
+fn evaluate_filter_ref_counted_v4(
+    filter: &Filter,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> FilterResult {
+    for term in &filter.terms {
+        if !term_matches_v4(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+            continue;
+        }
+        if term.has_count {
+            record_filter_counter(&term.counter, packet_bytes);
+        }
+        return FilterResult {
+            action: term.action.clone(),
+            dscp_rewrite: term.dscp_rewrite,
+            policer_name: term.policer_name.clone(),
+            routing_instance: term.routing_instance.clone(),
+            forwarding_class: term.forwarding_class.clone(),
+            log: term.log,
+        };
+    }
+    FilterResult::default()
+}
+
+#[inline]
+fn evaluate_filter_ref_counted_v6(
+    filter: &Filter,
+    src_ip: Ipv6Addr,
+    dst_ip: Ipv6Addr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> FilterResult {
+    for term in &filter.terms {
+        if !term_matches_v6(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+            continue;
+        }
+        if term.has_count {
+            record_filter_counter(&term.counter, packet_bytes);
+        }
+        return FilterResult {
+            action: term.action.clone(),
+            dscp_rewrite: term.dscp_rewrite,
+            policer_name: term.policer_name.clone(),
+            routing_instance: term.routing_instance.clone(),
+            forwarding_class: term.forwarding_class.clone(),
+            log: term.log,
+        };
+    }
+    FilterResult::default()
+}
+
+#[inline]
+fn evaluate_filter_ref_tx_selection_counted_v4<'a>(
+    filter: &'a Filter,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> TxSelectionFilterResult<'a> {
+    for term in &filter.terms {
+        if !term_matches_v4(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+            continue;
+        }
+        if term.has_count {
+            record_filter_counter(&term.counter, packet_bytes);
+        }
+        return TxSelectionFilterResult {
+            forwarding_class: (!term.forwarding_class.is_empty())
+                .then_some(term.forwarding_class.as_ref()),
+            dscp_rewrite: term.dscp_rewrite,
+        };
+    }
+    TxSelectionFilterResult::default()
+}
+
+#[inline]
+fn evaluate_filter_ref_tx_selection_counted_v6<'a>(
+    filter: &'a Filter,
+    src_ip: Ipv6Addr,
+    dst_ip: Ipv6Addr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> TxSelectionFilterResult<'a> {
+    for term in &filter.terms {
+        if !term_matches_v6(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+            continue;
+        }
+        if term.has_count {
+            record_filter_counter(&term.counter, packet_bytes);
+        }
+        return TxSelectionFilterResult {
+            forwarding_class: (!term.forwarding_class.is_empty())
+                .then_some(term.forwarding_class.as_ref()),
+            dscp_rewrite: term.dscp_rewrite,
+        };
+    }
+    TxSelectionFilterResult::default()
+}
+
+fn evaluate_filter_ref_tx_selection_cached_v4(
+    filter: &Filter,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+) -> CachedTxSelectionFilterResult {
+    for term in &filter.terms {
+        if !term_matches_v4(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+            continue;
+        }
+        return CachedTxSelectionFilterResult {
+            forwarding_class: (!term.forwarding_class.is_empty())
+                .then(|| term.forwarding_class.clone()),
+            dscp_rewrite: term.dscp_rewrite,
+            counter: term.has_count.then(|| term.counter.clone()),
+        };
+    }
+    CachedTxSelectionFilterResult::default()
+}
+
+fn evaluate_filter_ref_tx_selection_cached_v6(
+    filter: &Filter,
+    src_ip: Ipv6Addr,
+    dst_ip: Ipv6Addr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+) -> CachedTxSelectionFilterResult {
+    for term in &filter.terms {
+        if !term_matches_v6(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+            continue;
+        }
+        return CachedTxSelectionFilterResult {
+            forwarding_class: (!term.forwarding_class.is_empty())
+                .then(|| term.forwarding_class.clone()),
+            dscp_rewrite: term.dscp_rewrite,
+            counter: term.has_count.then(|| term.counter.clone()),
+        };
+    }
+    CachedTxSelectionFilterResult::default()
+}
+
+#[inline]
+fn evaluate_filter_ref_routing_instance_counted_v4<'a>(
+    filter: &'a Filter,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> Option<&'a str> {
+    for term in &filter.terms {
+        if !term_matches_v4(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+            continue;
+        }
+        if term.has_count {
+            record_filter_counter(&term.counter, packet_bytes);
+        }
+        return (!term.routing_instance.is_empty()).then_some(term.routing_instance.as_str());
+    }
+    None
+}
+
+#[inline]
+fn evaluate_filter_ref_routing_instance_counted_v6<'a>(
+    filter: &'a Filter,
+    src_ip: Ipv6Addr,
+    dst_ip: Ipv6Addr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> Option<&'a str> {
+    for term in &filter.terms {
+        if !term_matches_v6(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+            continue;
+        }
+        if term.has_count {
+            record_filter_counter(&term.counter, packet_bytes);
+        }
+        return (!term.routing_instance.is_empty()).then_some(term.routing_instance.as_str());
+    }
+    None
+}
+
+/// Evaluate the lo0 (host-bound) filter for a given address family.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn evaluate_lo0_filter(
+    state: &FilterState,
+    is_v6: bool,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+) -> FilterResult {
+    evaluate_lo0_filter_counted(
+        state, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, 0,
+    )
+}
+
+pub(crate) fn evaluate_lo0_filter_counted(
+    state: &FilterState,
+    is_v6: bool,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> FilterResult {
+    let filter = if is_v6 {
+        state.lo0_filter_v6_fast.as_deref()
+    } else {
+        state.lo0_filter_v4_fast.as_deref()
+    };
+    let Some(filter) = filter else {
+        return FilterResult::default();
+    };
+    evaluate_filter_ref_counted(
+        filter,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        dscp,
+        packet_bytes,
+    )
+}
+
+/// Evaluate the per-interface input filter for a given address family.
+pub(crate) fn evaluate_interface_filter(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+) -> FilterResult {
+    evaluate_interface_filter_counted(
+        state, ifindex, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, 0,
+    )
+}
+
+pub(crate) fn evaluate_interface_filter_counted(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> FilterResult {
+    let filter = if is_v6 {
+        state.iface_filter_v6_fast.get(&ifindex).map(Arc::as_ref)
+    } else {
+        state.iface_filter_v4_fast.get(&ifindex).map(Arc::as_ref)
+    };
+    let Some(filter) = filter else {
+        return FilterResult::default();
+    };
+    evaluate_filter_ref_counted(
+        filter,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        dscp,
+        packet_bytes,
+    )
+}
+
+pub(crate) fn evaluate_interface_filter_tx_selection_counted<'a>(
+    state: &'a FilterState,
+    ifindex: i32,
+    is_v6: bool,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> TxSelectionFilterResult<'a> {
+    let filter = if is_v6 {
+        state.iface_filter_v6_fast.get(&ifindex).map(Arc::as_ref)
+    } else {
+        state.iface_filter_v4_fast.get(&ifindex).map(Arc::as_ref)
+    };
+    let Some(filter) = filter else {
+        return TxSelectionFilterResult::default();
+    };
+    evaluate_filter_ref_tx_selection_counted(
+        filter,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        dscp,
+        packet_bytes,
+    )
+}
+
+pub(crate) fn evaluate_interface_filter_routing_instance_counted<'a>(
+    state: &'a FilterState,
+    ifindex: i32,
+    is_v6: bool,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> Option<&'a str> {
+    let filter = if is_v6 {
+        state.iface_filter_v6_fast.get(&ifindex).map(Arc::as_ref)
+    } else {
+        state.iface_filter_v4_fast.get(&ifindex).map(Arc::as_ref)
+    };
+    let Some(filter) = filter else {
+        return None;
+    };
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => evaluate_filter_ref_routing_instance_counted_v4(
+            filter,
+            src,
+            dst,
+            protocol,
+            src_port,
+            dst_port,
+            dscp,
+            packet_bytes,
+        ),
+        (IpAddr::V6(src), IpAddr::V6(dst)) => evaluate_filter_ref_routing_instance_counted_v6(
+            filter,
+            src,
+            dst,
+            protocol,
+            src_port,
+            dst_port,
+            dscp,
+            packet_bytes,
+        ),
+        _ => None,
+    }
+}
+
+/// Evaluate the per-interface output filter for a given address family.
+pub(crate) fn evaluate_interface_output_filter(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+) -> FilterResult {
+    evaluate_interface_output_filter_counted(
+        state, ifindex, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, 0,
+    )
+}
+
+pub(crate) fn evaluate_interface_output_filter_counted(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> FilterResult {
+    let filter = if is_v6 {
+        state
+            .iface_filter_out_v6_fast
+            .get(&ifindex)
+            .map(Arc::as_ref)
+    } else {
+        state
+            .iface_filter_out_v4_fast
+            .get(&ifindex)
+            .map(Arc::as_ref)
+    };
+    let Some(filter) = filter else {
+        return FilterResult::default();
+    };
+    evaluate_filter_ref_counted(
+        filter,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        dscp,
+        packet_bytes,
+    )
+}
+
+pub(crate) fn evaluate_interface_output_filter_tx_selection_counted<'a>(
+    state: &'a FilterState,
+    ifindex: i32,
+    is_v6: bool,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> TxSelectionFilterResult<'a> {
+    let filter = if is_v6 {
+        state
+            .iface_filter_out_v6_fast
+            .get(&ifindex)
+            .map(Arc::as_ref)
+    } else {
+        state
+            .iface_filter_out_v4_fast
+            .get(&ifindex)
+            .map(Arc::as_ref)
+    };
+    let Some(filter) = filter else {
+        return TxSelectionFilterResult::default();
+    };
+    evaluate_filter_ref_tx_selection_counted(
+        filter,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        dscp,
+        packet_bytes,
+    )
+}
+
+pub(crate) fn interface_filter_affects_tx_selection(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+) -> bool {
+    if is_v6 {
+        state
+            .iface_filter_v6_affects_tx_selection
+            .contains(&ifindex)
+    } else {
+        state
+            .iface_filter_v4_affects_tx_selection
+            .contains(&ifindex)
+    }
+}
+
+pub(crate) fn interface_filter_affects_route_lookup(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+) -> bool {
+    if is_v6 {
+        state
+            .iface_filter_v6_affects_route_lookup
+            .contains(&ifindex)
+    } else {
+        state
+            .iface_filter_v4_affects_route_lookup
+            .contains(&ifindex)
+    }
+}
+
+pub(crate) fn interface_output_filter_needs_tx_eval(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+) -> bool {
+    if is_v6 {
+        state.iface_filter_out_v6_needs_tx_eval.contains(&ifindex)
+    } else {
+        state.iface_filter_out_v4_needs_tx_eval.contains(&ifindex)
+    }
+}
+
+#[inline]
+pub(crate) fn filter_state_has_input_tx_selection(state: &FilterState, is_v6: bool) -> bool {
+    if is_v6 {
+        state.has_input_tx_selection_v6
+    } else {
+        state.has_input_tx_selection_v4
+    }
+}
+
+#[inline]
+pub(crate) fn filter_state_has_output_tx_selection(state: &FilterState, is_v6: bool) -> bool {
+    if is_v6 {
+        state.has_output_tx_selection_v6
+    } else {
+        state.has_output_tx_selection_v4
+    }
+}
+
+/// Check whether a single filter term matches the given packet fields.
+/// All specified criteria must match (AND logic). Empty criteria = match any.
+#[inline(always)]
+fn term_matches(
+    term: &FilterTerm,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+) -> bool {
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            term_matches_v4(term, src, dst, protocol, src_port, dst_port, dscp)
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            term_matches_v6(term, src, dst, protocol, src_port, dst_port, dscp)
+        }
+        _ => false,
+    }
+}
+
+#[inline(always)]
+fn term_matches_v4(
+    term: &FilterTerm,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+) -> bool {
+    if term.protocol_match_enabled
+        && (term.protocol_bitmap[(protocol / 64) as usize] & (1u64 << (protocol % 64))) == 0
+    {
+        return false;
+    }
+    if !term.source_v4.is_empty() && !term.source_v4.iter().any(|net| net.contains(src_ip)) {
+        return false;
+    }
+    if !term.dest_v4.is_empty() && !term.dest_v4.iter().any(|net| net.contains(dst_ip)) {
+        return false;
+    }
+    if !term.source_ports.matches(src_port) {
+        return false;
+    }
+    if !term.dest_ports.matches(dst_port) {
+        return false;
+    }
+    if term.dscp_match_enabled && (term.dscp_bitmap & (1u64 << dscp)) == 0 {
+        return false;
+    }
+    true
+}
+
+#[inline(always)]
+fn term_matches_v6(
+    term: &FilterTerm,
+    src_ip: Ipv6Addr,
+    dst_ip: Ipv6Addr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+) -> bool {
+    if term.protocol_match_enabled
+        && (term.protocol_bitmap[(protocol / 64) as usize] & (1u64 << (protocol % 64))) == 0
+    {
+        return false;
+    }
+    if !term.source_v6.is_empty() && !term.source_v6.iter().any(|net| net.contains(src_ip)) {
+        return false;
+    }
+    if !term.dest_v6.is_empty() && !term.dest_v6.iter().any(|net| net.contains(dst_ip)) {
+        return false;
+    }
+    if !term.source_ports.matches(src_port) {
+        return false;
+    }
+    if !term.dest_ports.matches(dst_port) {
+        return false;
+    }
+    if term.dscp_match_enabled && (term.dscp_bitmap & (1u64 << dscp)) == 0 {
+        return false;
+    }
+    true
+}
+
