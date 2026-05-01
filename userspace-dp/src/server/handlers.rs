@@ -1,10 +1,12 @@
-// Control-socket request dispatcher (#1048 P2). Pure relocation
-// of `handle_stream` from main.rs into a dedicated module.
+// Control-socket request dispatcher (#1048 P2 step 2 — relocated from
+// src/server.rs into src/server/handlers.rs as part of the directory-
+// module split). Pure relocation of `handle_stream`.
 // All helper functions called by handle_stream remain in main.rs;
 // they are private items at the crate root and thus accessible
-// from this child module via `use super::*` / direct paths.
+// from this grandchild module via `use super::super::*` (which
+// climbs server/handlers → server → crate root).
 
-use super::*;
+use super::super::*;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
