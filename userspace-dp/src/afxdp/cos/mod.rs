@@ -30,8 +30,4 @@ pub(super) use token_bucket::{
     refill_cos_tokens, release_all_cos_queue_leases, release_all_cos_root_leases,
     COS_MIN_BURST_BYTES,
 };
-// tx.rs reaches `mark_cos_queue_runnable` via `super::cos::` for its
-// non-moving `enqueue_cos_item` path. Other production callers
-// (queue_service, builders) reach moved items directly via
-// `super::tx_completion::*`.
 pub(super) use tx_completion::mark_cos_queue_runnable;

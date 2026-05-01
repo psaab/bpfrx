@@ -226,9 +226,10 @@ inlining. Treat the trend as a defect, not a style preference.
 - **No god functions.** A function with >100 lines or >8 parameters
   is a refactor cue. Pull subsystems into their own helpers (state
   machine → enum + dispatch fn, repeated parameter cluster → context
-  struct). The 31-parameter `poll_binding_process_descriptor` in
-  `afxdp.rs` is the standing cautionary example; tracked as #945 /
-  #961.
+  struct). The standing cautionary example is
+  `poll_binding_process_descriptor` in `afxdp.rs`: #945 brought it
+  down from 31 parameters to 13, but the body is still long and the
+  parameter cluster is still a refactor smell — tracked as #961.
 - **One responsibility per module.** A module that mixes admission
   policy with byte-mutation, or memory mapping with ring management,
   will get sliced apart eventually — do it on the way in. The
@@ -240,10 +241,10 @@ inlining. Treat the trend as a defect, not a style preference.
   smaller pieces. "I'll clean it up next sprint" doesn't survive
   contact with the next on-call rotation.
 - **Reviewers escalate monolith creep.** A PR that adds a new
-  helper to a 2,500-line file gets a Medium-severity review note
-  pointing to the relevant tracking issue (or asking the author to
-  open one). Don't let "but the surrounding code is already like
-  that" land.
+  helper to a 2,500-line file gets a Medium+ review note pointing
+  to the relevant tracking issue (or asking the author to open
+  one). Don't let "but the surrounding code is already like that"
+  land.
 
 ## Overflow / failure policy
 

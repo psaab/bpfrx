@@ -1,7 +1,7 @@
 //! Shared test fixtures for the TX module and its CoS-shaping
 //! siblings. Visibility is `pub(in crate::afxdp)` so any
 //! `#[cfg(test)] mod tests` under `crate::afxdp::*` can reach them
-//! via `crate::afxdp::tx::test_support::*`.
+//! via `use crate::afxdp::tx::test_support::*;`.
 
 #![cfg(test)]
 

@@ -37,11 +37,6 @@ use super::{
     refill_cos_tokens, COS_MIN_BURST_BYTES,
 };
 
-// #956 P1: TX-completion + timer-wheel symbols + scheduling primitives
-// (CoSServicePhase, ParkReason, count_park_reason, park_cos_queue)
-// moved to cos/tx_completion.rs. Moving the scheduling primitives
-// breaks the previous cyclic queue_service <-> tx_completion module
-// dependency (Copilot review on PR #990).
 use super::tx_completion::{
     apply_cos_prepared_result, apply_cos_send_result,
     apply_direct_exact_send_result, cos_tick_for_ns,
@@ -50,9 +45,9 @@ use super::tx_completion::{
     restore_cos_local_items_inner, restore_cos_prepared_items_inner, CoSServicePhase,
     ParkReason,
 };
-// Remaining back-edges to tx.rs (XSK-ring / worker-binding /
-// prepared-frame primitives + TxError + guarantee/quantum constants —
-// deferred to #984 / afxdp/tx/ split).
+// Back-edges to crate::afxdp::tx are XSK-ring / worker-binding /
+// prepared-frame primitives — primitives that own the kernel ring
+// state and are hosted there for that reason.
 use crate::afxdp::tx::{
     cos_queue_dscp_rewrite, maybe_wake_tx, reap_tx_completions,
     recycle_cancelled_prepared_offset, remember_prepared_recycle, stamp_submits,
