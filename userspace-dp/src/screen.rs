@@ -524,4 +524,3 @@ pub(crate) fn extract_screen_info(
 #[cfg(test)]
 #[path = "screen_tests.rs"]
 mod tests;
-

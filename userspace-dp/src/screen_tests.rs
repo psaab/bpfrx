@@ -1,5 +1,5 @@
 // Tests for screen.rs — relocated from inline
-// `#[cfg(test)] mod tests` to keep mod.rs under the modularity-discipline
+// `#[cfg(test)] mod tests` to keep screen.rs under the modularity-discipline
 // LOC threshold. Loaded as a sibling submodule via
 // `#[path = "screen_tests.rs"]` from screen.rs.
 
