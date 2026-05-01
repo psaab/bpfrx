@@ -32,24 +32,29 @@ pub(super) fn retry_pending_neigh(
     if binding.pending_neigh.is_empty() {
         return;
     }
-    // GEMINI-NEXT.md Section 3 cold start: drain-classify-restore pattern.
-    // The previous version did `binding.pending_neigh.remove(i)` inside the
-    // walk loop, which is O(n) per removal — scaled O(n²) in the queue
-    // depth. With MAX_PENDING_NEIGH bumped to 4096 (was 64), the quadratic
-    // cost becomes a real fairness hazard during connection bursts; even
-    // at the 64-cap it was wasteful relative to the cap.
+    // GEMINI-NEXT.md Section 3 cold start: in-place pop_front/push_back
+    // rotation. The previous version did `binding.pending_neigh.remove(i)`
+    // inside a while-i-loop, which is O(n) per removal — scaled O(n²) in
+    // the queue depth. With MAX_PENDING_NEIGH bumped to 4096 (was 64), the
+    // quadratic cost becomes a real fairness hazard during connection
+    // bursts; even at the 64-cap it was wasteful relative to the cap.
     //
-    // New pattern: take the entire VecDeque out via `mem::take`, walk it
-    // once consuming each PendingNeighPacket, classify into one of three
-    // outcomes (timeout-drop, neighbor-resolved-process, still-pending),
-    // and push the still-pending items back to `binding.pending_neigh`.
-    // Each item is touched exactly once → O(n).
-    let pending = std::mem::take(&mut binding.pending_neigh);
-    binding.pending_neigh.reserve(pending.len());
+    // We pop exactly the snapshotted-len items off the front and either
+    // (a) drop the packet (recycle frame), (b) push it back on the SAME
+    // VecDeque (FIFO order preserved for retained items), or (c) dispatch
+    // it. Items pushed back go to the tail and are NOT re-visited in this
+    // sweep because we iterate exactly `pending_len` times. Reusing the
+    // existing backing buffer avoids per-sweep alloc/free churn that the
+    // earlier `mem::take` + `reserve` draft would have introduced.
+    let pending_len = binding.pending_neigh.len();
     let ingress_slot = binding.slot;
     let ingress_ifindex = binding.ifindex;
     let ingress_queue = binding.queue_id;
-    for pkt in pending {
+    for _ in 0..pending_len {
+        let pkt = binding
+            .pending_neigh
+            .pop_front()
+            .expect("pending_neigh shrank during retry sweep");
         // Timeout: recycle frame and drop.
         if now_ns.saturating_sub(pkt.queued_ns) > PENDING_NEIGH_TIMEOUT_NS {
             binding.pending_fill_frames.push_back(pkt.addr);
