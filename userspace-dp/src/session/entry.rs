@@ -17,7 +17,7 @@ pub(crate) struct SessionDecision {
 /// `egress_zone` are now `u16` IDs that index into
 /// `forwarding.zone_id_to_name` for slow-path consumers (logging,
 /// gRPC export, status). `0` means "unknown / unset" (matches the
-/// existing `UserspaceDpMeta.ingress_zone` default at types.rs:64).
+/// existing `UserspaceDpMeta.ingress_zone` default at afxdp/types/mod.rs:64).
 /// Removing the `Arc<str>` saves 28 bytes per `SessionMetadata` and
 /// eliminates the `LOCK XADD` atomic on every `metadata.clone()`.
 #[derive(Clone, Debug, PartialEq, Eq)]
