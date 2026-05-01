@@ -57,7 +57,7 @@ mod bpf_map;
 mod checksum;
 #[path = "afxdp/flow_cache.rs"]
 mod flow_cache;
-#[path = "afxdp/forwarding.rs"]
+#[path = "afxdp/forwarding/mod.rs"]
 mod forwarding;
 #[path = "afxdp/forwarding_build.rs"]
 mod forwarding_build;
