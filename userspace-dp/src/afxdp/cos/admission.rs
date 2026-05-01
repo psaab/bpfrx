@@ -1786,7 +1786,8 @@ mod tests {
         assert_eq!(
             unclamped,
             COS_FLOW_FAIR_BUCKETS as u64 * COS_FLOW_FAIR_MIN_SHARE_BYTES,
-            "unclamped formula baseline: 1024 × 24 KB = ~24 MB"
+            "unclamped formula baseline: COS_FLOW_FAIR_BUCKETS × COS_FLOW_FAIR_MIN_SHARE_BYTES \
+             (4096 × 24 KB = ~96 MB after the GEMINI-NEXT.md fairness bump from 1024)"
         );
         assert!(
             cap < unclamped,

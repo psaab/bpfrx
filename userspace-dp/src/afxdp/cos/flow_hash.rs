@@ -228,12 +228,15 @@ mod tests {
         flow_v6.addr_family = libc::AF_INET6 as u8;
         let b_v4 = cos_flow_bucket_index(0, Some(&flow_v4));
         let b_v6 = cos_flow_bucket_index(0, Some(&flow_v6));
-        // #711: hash-mix regression pins, updated for the bucket-count
-        // grow from 64 → 1024. The hash function itself is unchanged
-        // at seed=0; the values moved only because the mask widened
-        // from 6 bits (0x3F) to 10 bits (0x3FF). Under the previous
-        // 6-bit mask these values were 26 (v4) and 4 (v6); the
-        // low 10 bits of the same hash output give the new pins below.
+        // #711 + GEMINI-NEXT.md fairness: hash-mix regression pins,
+        // updated for the bucket-count grow 1024 → 4096. The hash
+        // function itself is unchanged at seed=0; the values move only
+        // because the mask widens from 10 bits (0x3FF) to 12 bits
+        // (0xFFF). Under the original 6-bit (64-bucket) mask these were
+        // 26 (v4) and 4 (v6); under the 10-bit (1024-bucket) mask they
+        // were 410 and 260; under the new 12-bit (4096-bucket) mask
+        // they are 410 (unchanged — its bits 10/11 are zero) and 1284
+        // (= 260 + 1024).
         // A refactor that reorders the mix or adds a term still fails
         // here and becomes an explicit decision. Update baselines only
         // after live re-validation of 5201 fairness on the loss HA
@@ -244,7 +247,7 @@ mod tests {
         assert_eq!(b_v4 & 0x3F, 26);
         assert_eq!(b_v6 & 0x3F, 4);
         assert_eq!(b_v4, 410);
-        assert_eq!(b_v6, 260);
+        assert_eq!(b_v6, 1284);
     }
 
     #[test]

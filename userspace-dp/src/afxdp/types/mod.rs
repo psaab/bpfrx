@@ -376,15 +376,17 @@ mod flow_rr_ring_tests {
 
     #[test]
     fn flow_rr_ring_memory_footprint_fits_expected_budget() {
-        // Sanity pin: `FlowRrRing` should be ~2 KB at the chosen
-        // bucket count (1024 u16 entries + two u16 indices +
-        // padding). A future refactor that accidentally widens the
-        // entry type to u32 would double this without a loud signal;
-        // this bound catches it.
+        // Sanity pin: `FlowRrRing` should be ~`2 * COS_FLOW_FAIR_BUCKETS`
+        // bytes (N u16 entries + two u16 indices + padding). A future
+        // refactor that accidentally widens the entry type to u32 would
+        // double this without a loud signal; this bound catches it.
+        // Sized off the constant so it tracks with future bucket-count
+        // bumps automatically.
         let size = std::mem::size_of::<FlowRrRing>();
+        let budget = 2 * COS_FLOW_FAIR_BUCKETS + 64;
         assert!(
-            size <= 2 * 1024 + 64,
-            "FlowRrRing unexpectedly large: {size} bytes"
+            size <= budget,
+            "FlowRrRing unexpectedly large: {size} bytes (budget {budget})"
         );
     }
 }

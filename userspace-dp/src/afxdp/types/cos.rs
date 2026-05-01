@@ -62,14 +62,26 @@ pub(in crate::afxdp) const COS_FAST_QUEUE_INDEX_MISS: u16 = u16::MAX;
 
 /// Number of SFQ flow buckets per flow-fair CoS queue.
 ///
-/// GEMINI-NEXT.md Section 2 fairness: bumped 1024 → 4096. With 1024
-/// buckets the birthday-paradox collision rate at typical 100E100M
-/// (Elephant + Mouse) workloads with 200+ concurrent flows per queue
-/// approached 99% — flows hashed into the same bucket compete for one
-/// SFQ dequeue slot and one admission-cap slice (#705), which silently
-/// destroys fairness even when MQFQ ordering is correct. At 4096
-/// buckets the collision rate at 200 flows drops to ~5%; at 64 flows
-/// it's <1%. See #711 for the original sizing analysis.
+/// GEMINI-NEXT.md Section 2 fairness: bumped 1024 → 4096. The metric
+/// below is *per-flow* collision probability — i.e. the chance that any
+/// given flow ends up sharing a bucket with at least one of the other
+/// active flows in the queue, computed as `1 - (1 - 1/N)^(flows - 1)`
+/// where N is `COS_FLOW_FAIR_BUCKETS`. Per-flow probability is what
+/// directly governs that flow's fairness: colliding flows compete for
+/// one SFQ dequeue slot and one admission-cap slice (#705).
+///
+/// Under typical 100E100M (Elephant + Mouse) workloads with ~200
+/// concurrent flows per queue, 1024 buckets gave each flow ~17.7%
+/// chance of sharing — a fairness leak even when MQFQ ordering was
+/// correct. At 4096 buckets the same flow count drops the per-flow
+/// probability to ~4.7%; at 64 flows it falls to ~1.5%. See #711 for
+/// the original sizing analysis.
+///
+/// (The probability of *at least one* collision anywhere in the queue
+/// — the canonical birthday-paradox metric — is much higher and stays
+/// near 100% at 200 flows even at 4096 buckets. That metric is
+/// fairness-irrelevant: a single colliding pair somewhere doesn't hurt
+/// the other 198 flows.)
 ///
 /// Per-queue memory overhead at 4096 buckets:
 ///   `flow_bucket_bytes: [u64; N]`    = 32 KB
