@@ -1,7 +1,7 @@
 // Tests for afxdp/cos/queue_ops/v_min.rs — relocated from inline
 // `#[cfg(test)] mod tests` to keep v_min.rs under the modularity-discipline
 // LOC threshold. Loaded as a sibling submodule via
-// `#[path = "tests.rs"]` from mod.rs.
+// `#[path = "v_min_tests.rs"]` from v_min.rs.
 
 // V_min coordination tests colocated with the production fns,
 // moved here per #1034 P4 from queue_ops/mod.rs's `mod tests`
