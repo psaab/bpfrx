@@ -81,6 +81,11 @@ pub(super) struct PendingNeighPacket {
     pub(super) meta: UserspaceDpMeta,
     pub(super) decision: SessionDecision,
     pub(super) queued_ns: u64,
+    /// Cold-start probe schedule attempts (GEMINI-NEXT.md Section 3).
+    /// 0 means no retries fired yet beyond the initial probe; each
+    /// retry from `retry_pending_neigh` increments this. Capped by
+    /// `PROBE_SCHEDULE_NS.len()`.
+    pub(super) probe_attempts: u8,
 }
 
 #[repr(C)]

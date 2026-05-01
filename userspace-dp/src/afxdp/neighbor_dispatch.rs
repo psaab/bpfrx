@@ -18,6 +18,32 @@
 
 use super::*;
 
+/// GEMINI-NEXT.md Section 3 cold-start: re-fire ARP/NDP solicitation
+/// at exponential intervals after the initial probe in
+/// `poll_descriptor.rs`. Each entry is the cumulative ns delay from
+/// `PendingNeighPacket::queued_ns` at which to issue the next
+/// `trigger_kernel_arp_probe()`. After all entries elapse, no further
+/// probes — the packet just waits for kernel resolution or the
+/// PENDING_NEIGH_TIMEOUT.
+///
+/// 10/60/260 ms covers a 4-probe schedule (initial + 3 retries) over
+/// 260 ms total. The deltas (10, 50, 200 ms) match the cold-start
+/// exponential design in GEMINI-NEXT.md and give the kernel three
+/// retransmits if the first solicitation is dropped.
+pub(super) const PROBE_SCHEDULE_NS: &[u64] = &[
+    10_000_000,  // first retry at queued + 10 ms
+    60_000_000,  // second retry at queued + 60 ms (delta 50 ms)
+    260_000_000, // third retry at queued + 260 ms (delta 200 ms)
+];
+
+/// Returns true when the next scheduled probe is due. Pure function —
+/// no side effects, easy to unit-test the schedule edges.
+pub(super) fn probe_due(elapsed_ns: u64, attempts: u8) -> bool {
+    PROBE_SCHEDULE_NS
+        .get(attempts as usize)
+        .is_some_and(|&target| elapsed_ns >= target)
+}
+
 pub(super) fn retry_pending_neigh(
     binding: &mut BindingWorker,
     left: &mut [BindingWorker],
@@ -74,7 +100,27 @@ pub(super) fn retry_pending_neigh(
             None
         };
         let Some(neighbor_mac) = mac else {
-            // Still pending — keep for the next sweep.
+            // Still pending — re-fire ARP/NDP probe if the next slot
+            // in the exponential schedule is due (GEMINI-NEXT.md
+            // Section 3 cold-start). Each retry advances
+            // probe_attempts so each schedule entry fires at most
+            // once. Iface-name lookup mirrors the initial probe site
+            // in poll_descriptor.rs.
+            let mut pkt = pkt;
+            if probe_due(
+                now_ns.saturating_sub(pkt.queued_ns),
+                pkt.probe_attempts,
+            ) {
+                if let Some(hop) = pkt.decision.resolution.next_hop {
+                    if let Some(name) = forwarding
+                        .ifindex_to_name
+                        .get(&pkt.decision.resolution.egress_ifindex)
+                    {
+                        trigger_kernel_arp_probe(name, hop);
+                    }
+                }
+                pkt.probe_attempts = pkt.probe_attempts.saturating_add(1);
+            }
             binding.pending_neigh.push_back(pkt);
             continue;
         };
@@ -227,5 +273,68 @@ pub(super) fn build_missing_neighbor_session_metadata(
         fabric_ingress,
         is_reverse: false,
         nat64_reverse: None,
+    }
+}
+
+#[cfg(test)]
+mod cold_start_probe_schedule_tests {
+    use super::{PROBE_SCHEDULE_NS, probe_due};
+
+    #[test]
+    fn schedule_is_strictly_monotonic() {
+        for window in PROBE_SCHEDULE_NS.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "PROBE_SCHEDULE_NS must be strictly increasing: {:?}",
+                PROBE_SCHEDULE_NS
+            );
+        }
+    }
+
+    #[test]
+    fn probe_due_fires_only_at_or_after_schedule_boundary() {
+        let first = PROBE_SCHEDULE_NS[0];
+        assert!(!probe_due(first - 1, 0));
+        assert!(probe_due(first, 0));
+        assert!(probe_due(first + 1, 0));
+    }
+
+    #[test]
+    fn probe_due_walks_each_schedule_slot() {
+        // After attempts=0 fires, probe_due(elapsed, 1) must wait until
+        // PROBE_SCHEDULE_NS[1]; same for each subsequent slot.
+        for (idx, &target) in PROBE_SCHEDULE_NS.iter().enumerate() {
+            let attempts = idx as u8;
+            assert!(
+                !probe_due(target.saturating_sub(1), attempts),
+                "slot {idx} should not fire one ns before target",
+            );
+            assert!(
+                probe_due(target, attempts),
+                "slot {idx} should fire at target",
+            );
+        }
+    }
+
+    #[test]
+    fn probe_due_returns_false_after_schedule_exhausted() {
+        let exhausted = PROBE_SCHEDULE_NS.len() as u8;
+        // Even with elapsed_ns = u64::MAX, no further probes once
+        // every slot has fired.
+        assert!(!probe_due(u64::MAX, exhausted));
+        assert!(!probe_due(u64::MAX, exhausted.saturating_add(1)));
+    }
+
+    #[test]
+    fn schedule_total_window_under_pending_neigh_timeout() {
+        // The schedule must finish before PENDING_NEIGH_TIMEOUT_NS
+        // (2 s, see types/mod.rs) so all 3 retries fire while the
+        // packet is still queued. Otherwise the last retry is dead
+        // code: the packet will already be expired by then.
+        let last = *PROBE_SCHEDULE_NS.last().expect("schedule non-empty");
+        assert!(
+            last < super::PENDING_NEIGH_TIMEOUT_NS,
+            "last probe slot {last}ns must be < PENDING_NEIGH_TIMEOUT_NS",
+        );
     }
 }

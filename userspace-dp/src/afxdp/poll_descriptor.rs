@@ -2318,6 +2318,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         meta,
                                         decision: pending_decision,
                                         queued_ns: now_ns,
+                                        probe_attempts: 0,
                                     });
                                     recycle_now = false;
                                 }
