@@ -32,95 +32,103 @@ pub(super) fn retry_pending_neigh(
     if binding.pending_neigh.is_empty() {
         return;
     }
-    {
-        let mut i = 0;
-        while i < binding.pending_neigh.len() {
-            let pkt = &binding.pending_neigh[i];
-            // Timeout: recycle frame and drop
-            if now_ns.saturating_sub(pkt.queued_ns) > PENDING_NEIGH_TIMEOUT_NS {
-                let addr = pkt.addr;
-                binding.pending_neigh.remove(i);
-                binding.pending_fill_frames.push_back(addr);
-                continue;
-            }
-            // Check if neighbor MAC is now available, mirroring the lookup
-            // order from lookup_neighbor_entry(): static/permanent neighbors
-            // first, then dynamic_neighbors.
-            let mac = if let Some(hop) = pkt.decision.resolution.next_hop {
-                let neigh_key = (pkt.decision.resolution.egress_ifindex, hop);
-                forwarding
-                    .neighbors
-                    .get(&neigh_key)
-                    .map(|e| e.mac)
-                    .or_else(|| dynamic_neighbors.get(&neigh_key).map(|e| e.mac))
-            } else {
-                None
-            };
-            if let Some(neighbor_mac) = mac {
-                let ingress_slot = binding.slot;
-                let ingress_ifindex = binding.ifindex;
-                let ingress_queue = binding.queue_id;
-                let pkt = binding.pending_neigh.remove(i).unwrap();
-                let mut decision = pkt.decision;
-                decision.resolution.neighbor_mac = Some(neighbor_mac);
-                decision.resolution.disposition = ForwardingDisposition::ForwardCandidate;
-                let expected_ports = None;
-                if let Some(frame_len) = rewrite_forwarded_frame_in_place(
-                    &*area,
-                    pkt.desc,
-                    pkt.meta,
-                    &decision,
-                    false,
-                    expected_ports,
-                ) {
-                    let target_ifindex = if decision.resolution.tx_ifindex > 0 {
-                        decision.resolution.tx_ifindex
-                    } else {
-                        resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
-                    };
-                    if let Some(target_idx) = binding_lookup.target_index(
-                        binding_index,
-                        ingress_ifindex,
-                        ingress_queue,
-                        target_ifindex,
-                    ) {
-                        let cos = resolve_cos_tx_selection(
-                            forwarding,
-                            decision.resolution.egress_ifindex,
-                            pkt.meta,
-                            None,
-                        );
-                        let req = PreparedTxRequest {
-                            offset: pkt.desc.addr,
-                            len: frame_len,
-                            recycle: PreparedTxRecycle::FillOnSlot(ingress_slot),
-                            expected_ports: None,
-                            expected_addr_family: pkt.meta.addr_family,
-                            expected_protocol: pkt.meta.protocol,
-                            flow_key: None,
-                            egress_ifindex: decision.resolution.egress_ifindex,
-                            cos_queue_id: cos.queue_id,
-                            dscp_rewrite: cos.dscp_rewrite,
-                        };
-                        if target_idx == binding_index {
-                            binding.pending_tx_prepared.push_back(req);
-                        } else if let Some(target) =
-                            binding_by_index_mut(left, binding_index, binding, right, target_idx)
-                        {
-                            target.pending_tx_prepared.push_back(req);
-                            bound_pending_tx_prepared(target);
-                        } else {
-                            binding.pending_fill_frames.push_back(pkt.addr);
-                        }
-                    } else {
-                        binding.pending_fill_frames.push_back(pkt.addr);
-                    }
-                } else {
-                    binding.pending_fill_frames.push_back(pkt.addr);
-                }
-                continue;
-            }
-            i += 1;
+    // GEMINI-NEXT.md Section 3 cold start: drain-classify-restore pattern.
+    // The previous version did `binding.pending_neigh.remove(i)` inside the
+    // walk loop, which is O(n) per removal — scaled O(n²) in the queue
+    // depth. With MAX_PENDING_NEIGH bumped to 4096 (was 64), the quadratic
+    // cost becomes a real fairness hazard during connection bursts; even
+    // at the 64-cap it was wasteful relative to the cap.
+    //
+    // New pattern: take the entire VecDeque out via `mem::take`, walk it
+    // once consuming each PendingNeighPacket, classify into one of three
+    // outcomes (timeout-drop, neighbor-resolved-process, still-pending),
+    // and push the still-pending items back to `binding.pending_neigh`.
+    // Each item is touched exactly once → O(n).
+    let pending = std::mem::take(&mut binding.pending_neigh);
+    binding.pending_neigh.reserve(pending.len());
+    let ingress_slot = binding.slot;
+    let ingress_ifindex = binding.ifindex;
+    let ingress_queue = binding.queue_id;
+    for pkt in pending {
+        // Timeout: recycle frame and drop.
+        if now_ns.saturating_sub(pkt.queued_ns) > PENDING_NEIGH_TIMEOUT_NS {
+            binding.pending_fill_frames.push_back(pkt.addr);
+            continue;
+        }
+        // Check if neighbor MAC is now available, mirroring the lookup
+        // order from lookup_neighbor_entry(): static/permanent neighbors
+        // first, then dynamic_neighbors.
+        let mac = if let Some(hop) = pkt.decision.resolution.next_hop {
+            let neigh_key = (pkt.decision.resolution.egress_ifindex, hop);
+            forwarding
+                .neighbors
+                .get(&neigh_key)
+                .map(|e| e.mac)
+                .or_else(|| dynamic_neighbors.get(&neigh_key).map(|e| e.mac))
+        } else {
+            None
+        };
+        let Some(neighbor_mac) = mac else {
+            // Still pending — keep for the next sweep.
+            binding.pending_neigh.push_back(pkt);
+            continue;
+        };
+        let mut decision = pkt.decision;
+        decision.resolution.neighbor_mac = Some(neighbor_mac);
+        decision.resolution.disposition = ForwardingDisposition::ForwardCandidate;
+        let expected_ports = None;
+        let Some(frame_len) = rewrite_forwarded_frame_in_place(
+            &*area,
+            pkt.desc,
+            pkt.meta,
+            &decision,
+            false,
+            expected_ports,
+        ) else {
+            binding.pending_fill_frames.push_back(pkt.addr);
+            continue;
+        };
+        let target_ifindex = if decision.resolution.tx_ifindex > 0 {
+            decision.resolution.tx_ifindex
+        } else {
+            resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
+        };
+        let Some(target_idx) = binding_lookup.target_index(
+            binding_index,
+            ingress_ifindex,
+            ingress_queue,
+            target_ifindex,
+        ) else {
+            binding.pending_fill_frames.push_back(pkt.addr);
+            continue;
+        };
+        let cos = resolve_cos_tx_selection(
+            forwarding,
+            decision.resolution.egress_ifindex,
+            pkt.meta,
+            None,
+        );
+        let req = PreparedTxRequest {
+            offset: pkt.desc.addr,
+            len: frame_len,
+            recycle: PreparedTxRecycle::FillOnSlot(ingress_slot),
+            expected_ports: None,
+            expected_addr_family: pkt.meta.addr_family,
+            expected_protocol: pkt.meta.protocol,
+            flow_key: None,
+            egress_ifindex: decision.resolution.egress_ifindex,
+            cos_queue_id: cos.queue_id,
+            dscp_rewrite: cos.dscp_rewrite,
+        };
+        if target_idx == binding_index {
+            binding.pending_tx_prepared.push_back(req);
+        } else if let Some(target) =
+            binding_by_index_mut(left, binding_index, binding, right, target_idx)
+        {
+            target.pending_tx_prepared.push_back(req);
+            bound_pending_tx_prepared(target);
+        } else {
+            binding.pending_fill_frames.push_back(pkt.addr);
         }
     }
 }

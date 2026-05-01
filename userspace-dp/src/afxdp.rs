@@ -265,7 +265,13 @@ const XDP_OPTIONS: c_int = 8;
 const XDP_OPTIONS_ZEROCOPY: u32 = 1;
 
 const PENDING_NEIGH_TIMEOUT_NS: u64 = 2_000_000_000; // 2 seconds
-const MAX_PENDING_NEIGH: usize = 64;
+// GEMINI-NEXT.md Section 3 cold start: bumped 64 → 4096 so a per-binding
+// burst of new connections during the ARP/NDP probe window doesn't drop
+// frames. PendingNeighPacket is small (XdpDesc + UserspaceDpMeta + decision
+// + queued_ns ≈ 144 B), so worst-case per binding is ~576 KB even when fully
+// populated; allocated lazily, idle bindings stay near zero footprint. Also
+// unblocks parallel-connect storms during cluster failback.
+const MAX_PENDING_NEIGH: usize = 4096;
 
 #[inline]
 const fn tx_frame_capacity() -> usize {
