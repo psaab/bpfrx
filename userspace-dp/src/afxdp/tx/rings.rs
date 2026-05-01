@@ -12,9 +12,10 @@
 //     RX_WAKE_* / TX_WAKE_* constants in afxdp.rs).
 //   - `recycle_completed_tx_offset` (file-private helper): per-offset
 //     cleanup invoked from inside `reap_tx_completions`.
-//   - `apply_prepared_recycle` (pub(super) for tx/mod.rs's cfg-test
-//     re-export): `recycle_completed_tx_offset`'s
-//     `PreparedTxRecycle` dispatcher.
+//   - `apply_prepared_recycle` (file-private):
+//     `recycle_completed_tx_offset`'s `PreparedTxRecycle`
+//     dispatcher. Now exercised by a colocated test in this
+//     module's `mod tests`.
 //
 // Single-writer (owner worker), all atomic ops `Ordering::Relaxed`.
 
