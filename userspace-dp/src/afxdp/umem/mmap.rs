@@ -70,7 +70,11 @@ impl MmapArea {
         if ptr == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        // Request transparent hugepage backing (advisory, cannot fail).
+        // Best-effort: request transparent hugepage backing.
+        // `madvise(MADV_HUGEPAGE)` can fail (EINVAL on unsupported
+        // kernels, ENOMEM under pressure); the return is ignored
+        // intentionally because falling back to non-THP standard
+        // pages is correct.
         unsafe {
             libc::madvise(ptr, aligned_len, libc::MADV_HUGEPAGE);
         }
@@ -113,6 +117,18 @@ impl MmapArea {
         unsafe { self.slice_mut_unchecked(offset, len) }
     }
 
+    /// Returns a `&mut [u8]` view into the UMEM region from a
+    /// shared `&self` reference.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that no other borrow (mutable or
+    /// shared) into the same `[offset, offset + len)` byte range
+    /// is live for the lifetime of the returned slice, and that no
+    /// other thread is concurrently reading or writing that range.
+    /// AF_XDP single-writer (owner-worker) discipline plus per-frame
+    /// offset assignment from the free-frame ring is what holds
+    /// these invariants in production.
     pub(in crate::afxdp) unsafe fn slice_mut_unchecked(
         &self,
         offset: usize,
