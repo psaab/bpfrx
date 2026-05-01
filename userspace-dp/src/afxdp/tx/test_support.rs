@@ -1,11 +1,7 @@
-//! Shared test helpers for the TX module and its CoS-shaping siblings.
-//!
-//! Hoisted from `tx/mod.rs::tests` (#984 P3 follow-up) so that
-//! per-file test modules in `tx/*.rs` and `cos/*.rs` can colocate
-//! their tests with the code they exercise without duplicating
-//! these constructors. Visibility is `pub(in crate::afxdp)` so any
+//! Shared test fixtures for the TX module and its CoS-shaping
+//! siblings. Visibility is `pub(in crate::afxdp)` so any
 //! `#[cfg(test)] mod tests` under `crate::afxdp::*` can reach them
-//! via `use crate::afxdp::tx::test_support::*;`.
+//! via `crate::afxdp::tx::test_support::*`.
 
 #![cfg(test)]
 

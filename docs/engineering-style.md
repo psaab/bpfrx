@@ -210,6 +210,41 @@ the mechanics, so this section is sequencing only.
   the fixture is `buffer_bytes: 125_000`, not `125 * 1024`. Don't mix
   KB and KiB.
 
+## Modularity discipline
+
+Monolithic files and god functions silently degrade reviewability and
+inlining. Treat the trend as a defect, not a style preference.
+
+- **No monolithic files.** A `.rs` file that crosses ~2,000 LOC of
+  production code (excluding `mod tests`) is a smell. By the time it
+  hits ~3,000 LOC the next change to that file should split it before
+  adding new logic. Apply the same rule to test files: when a single
+  `mod tests` block accumulates >200 tests across unrelated subjects,
+  colocate the tests next to the code they exercise (per-file `mod
+  tests` blocks are the project pattern; see the `tx/` and `cos/`
+  layouts for examples).
+- **No god functions.** A function with >100 lines or >8 parameters
+  is a refactor cue. Pull subsystems into their own helpers (state
+  machine → enum + dispatch fn, repeated parameter cluster → context
+  struct). The 31-parameter `poll_binding_process_descriptor` in
+  `afxdp.rs` is the standing cautionary example; tracked as #945 /
+  #961.
+- **One responsibility per module.** A module that mixes admission
+  policy with byte-mutation, or memory mapping with ring management,
+  will get sliced apart eventually — do it on the way in. The
+  `userspace-dp/src/afxdp/` decomposition (`tx/`, `cos/`, the planned
+  `umem/` and `frame/` splits in #986/#988) is the working template.
+- **Refactor with new features, not after.** When a feature would
+  add ~200+ LOC to a module that's already approaching the threshold
+  above, the PR splits the module first, lands the feature on the
+  smaller pieces. "I'll clean it up next sprint" doesn't survive
+  contact with the next on-call rotation.
+- **Reviewers escalate monolith creep.** A PR that adds a new
+  helper to a 2,500-line file gets a Medium-severity review note
+  pointing to the relevant tracking issue (or asking the author to
+  open one). Don't let "but the surrounding code is already like
+  that" land.
+
 ## Overflow / failure policy
 
 | Scenario | Policy |

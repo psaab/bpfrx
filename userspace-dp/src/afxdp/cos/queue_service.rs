@@ -1,36 +1,16 @@
-// #956 Phase 7: CoS dispatch / drain / submit subsystem, extracted
-// from tx.rs. The largest move of the campaign — ~2400 LOC covering
-// the full per-byte hot-path chain:
+// CoS dispatch / drain / submit subsystem. Hot-path call chain:
 //
-//   drain_shaped_tx ->
-//     select_cos_*_batch (guarantee / nonexact / surplus / fast-path) ->
-//       service_exact_*_queue_direct(_flow_fair) ->
-//         drain_exact_*_to_scratch ->
-//           submit_cos_batch + cos_batch_tx_made_progress ->
-//             settle_exact_*_submission*
+//   drain_shaped_tx
+//    -> select_cos_*_batch (guarantee / nonexact / surplus)
+//      -> service_exact_*_queue_direct(_flow_fair)
+//        -> drain_exact_*_to_scratch
+//          -> submit_cos_batch + cos_batch_tx_made_progress
+//            -> settle_exact_*_submission*
 //
-// Plus the dispatch types (CoSBatch, CoSServicePhase, ExactCoSQueueKind,
-// ExactCoSQueueSelection, ExactCoSScratchBuild, DrainedQueueRef,
-// ParkReason) and scheduler helpers (cos_*_quantum_bytes,
-// estimate_cos_queue_wakeup_tick, count_park_reason, park_cos_queue).
-//
-// Per the Phase 4-6 lesson, all per-byte / per-batch hot-path fns
-// carry #[inline] (added on the move; the source bodies didn't have
-// it). Larger bodies (drain_*_to_scratch, settle_*) skip #[inline] —
-// LLVM's heuristic threshold should cover them; revisit only if a
-// post-merge perf regression points at one.
-//
-// TX-completion + timer-wheel back-edges (apply_cos_*_result,
-// restore_cos_*_inner, prime_cos_root_for_service,
-// refresh_cos_interface_activity, cos_tick_for_ns +
-// cos_timer_wheel_level_and_slot + count_tx_ring_full_submit_stall)
-// moved to cos/tx_completion.rs in #956 P1.
-//
-// Remaining back-edges to crate::afxdp::tx are XSK-ring /
-// worker-binding / prepared-frame primitives (transmit_*,
-// reap_tx_completions, maybe_wake_tx, recycle_*, stamp_submits,
-// cos_queue_dscp_rewrite, TxError, the guarantee/quantum constants).
-// Those move with the afxdp/tx/ split in #984.
+// All per-byte / per-batch hot-path fns carry `#[inline]` to
+// preserve cross-module inlining at the `pub(in crate::afxdp)`
+// boundary. Larger drain/settle bodies skip `#[inline]` — LLVM's
+// heuristic threshold covers them.
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;

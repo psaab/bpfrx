@@ -1,29 +1,7 @@
-// #984 P2d (FINAL): CoS classify + enqueue + cached-selection cluster,
-// extracted from tx/mod.rs.
-//
-// 6 public items (all pub(in crate::afxdp), incl CoSTxSelection struct):
-//   - CoSTxSelection (struct + fields)
-//   - resolve_cached_cos_tx_selection
-//   - resolve_cos_queue_id
-//   - resolve_cos_tx_selection
-//   - enqueue_local_into_cos
-//   - cos_queue_dscp_rewrite
-//
-// 10 helpers in cos_classify.rs (4 file-private + 6 pub(super)):
-//   pub(super):
-//     - prepare_local_request_for_cos (test pin)
-//     - enqueue_prepared_into_cos (drain.rs sibling caller)
-//     - clone_prepared_request_for_cos (test pin)
-//     - resolve_cos_queue_idx (test pin)
-//     - demote_prepared_cos_queue_to_local (test pin)
-//     - cos_queue_accepts_prepared (test pin)
-//   file-private:
-//     - map_cached_forwarding_class_queue
-//     - resolve_cos_dscp_classifier_queue_id
-//     - resolve_cos_ieee8021_classifier_queue_id
-//     - enqueue_cos_item
-//
-// Single-writer (owner worker), all atomic ops Ordering::Relaxed.
+// CoS classification: maps a packet's policy/filter/classifier
+// signals to a CoS queue id and an optional DSCP rewrite, then
+// enqueues onto the chosen queue. Single-writer (owner worker);
+// atomic ops use `Ordering::Relaxed`.
 
 use super::*;
 

@@ -1,38 +1,14 @@
-// #956 Phase 4: token-bucket lease/refill helpers, extracted from
-// tx.rs. Provides the per-byte token-budget plumbing that admission
-// gates and the drain-scheduler use to throttle TX pacing:
-//
-//   - `refill_cos_tokens` — basic credit-driven refill against
-//     `transmit_rate_bytes` and a `burst_bytes` cap.
-//   - `maybe_top_up_cos_root_lease` / `maybe_top_up_cos_queue_lease`
-//     — pull bytes from the shared cross-binding lease pools and
-//     deposit them on the local root / queue runtime.
-//   - `cos_refill_ns_until` — pure-arithmetic helper used by the
-//     drain scheduler to compute "how long until enough tokens
-//     accrue for the next packet." (Stays in this module rather
-//     than the timer-wheel module because it has no dependency on
-//     `COS_TIMER_WHEEL_*` constants — the consumer
-//     `calc_cos_wake_ns` does the tick conversion separately.)
-//   - `release_cos_root_lease` / `release_all_cos_root_leases` /
-//     `release_all_cos_queue_leases` — return cross-binding lease
-//     bytes back to the shared pool on RG transitions / shutdown.
+// Token-bucket lease/refill plumbing for TX pacing.
 //
 // `COS_MIN_BURST_BYTES` (64 × MTU) is the universal floor for both
-// root and per-queue burst caps and lives here as the canonical
-// owner of the constant.
+// root and per-queue burst caps and lives here as canonical owner.
 //
-// The 3 per-byte helpers (`refill_cos_tokens` and both
-// `maybe_top_up_*` helpers) carry `#[inline]` so the compiler still
-// inlines them across the cos/* boundary — same pattern Phase 2
-// (`cos_flow_bucket_index`, `cos_queue_prospective_active_flows`)
-// and Phase 3 (`cos_queue_flow_share_limit`,
-// `cos_flow_aware_buffer_limit`, `apply_cos_admission_ecn_policy`)
-// validated. The other 4 helpers fire at most once per drain loop
-// or once per RG-transition / shutdown, so they stay un-attributed.
-//
-// `tx_frame_capacity()` lives in the parent `afxdp` module and is
-// imported via `crate::afxdp::tx_frame_capacity` — Codex round-1
-// R1-2 caught the earlier mis-attribution to `super::tx::*`.
+// The 3 per-byte helpers (`refill_cos_tokens`,
+// `maybe_top_up_cos_root_lease`, `maybe_top_up_cos_queue_lease`)
+// carry `#[inline]` to preserve cross-module inlining at the
+// `pub(in crate::afxdp)` boundary. The other 4 helpers fire at
+// most once per drain loop or once per RG-transition / shutdown,
+// so they stay un-attributed.
 
 use std::sync::Arc;
 

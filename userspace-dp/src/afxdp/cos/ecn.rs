@@ -1,15 +1,7 @@
-// #956 Phase 1: ECN marking + Ethernet L3 parser, extracted from
-// tx.rs. The threshold constants `COS_ECN_MARK_THRESHOLD_NUM/_DEN`
-// and the admission policy `apply_cos_admission_ecn_policy` moved
-// with admission to `cos/admission.rs` in Phase 3 (Phase 2 was
-// flow_hash; correct dependency direction — a byte-mutation
-// module should not own admission tuning).
-//
-// ECN-marker unit tests now live in this file (`mod tests` at
-// the bottom). Pre-#984 P3 phase 2c they lived in `tx::tests` via
-// the `cos/mod.rs` re-exports; that pattern is now retired for
-// helpers in this module. Admission-path tests live in
-// `cos/admission.rs::tests` (#984 P3 phase 5b).
+// ECN CE-marking + Ethernet L3 parser. Threshold constants and the
+// `apply_cos_admission_ecn_policy` gate live with admission in
+// `cos/admission.rs` (a byte-mutation module shouldn't own
+// admission tuning).
 
 use crate::afxdp::ethernet::{ETH_HDR_LEN, VLAN_TAG_LEN};
 use crate::afxdp::types::{PreparedTxRequest, TxRequest};

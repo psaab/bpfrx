@@ -1,18 +1,5 @@
-// #984 P2c2: drain dispatch + queue-bound + pending-queue helpers,
-// extracted from tx/mod.rs.
-//
-// Items here:
-//   - pending_tx_capacity, bound_pending_tx_local,
-//     bound_pending_tx_prepared: queue-bound / backpressure helpers.
-//   - drain_pending_tx, drain_pending_tx_local_owner: per-tick drain
-//     dispatch entry points.
-//   - drop_cos_bound_*, partition_*, binding_has_pending_tx_work,
-//     ingest_*: file-private drain helpers.
-//   - process_pending_queue_in_place, take_/restore_pending_tx_requests:
-//     pending-queue manipulation helpers (file-private).
-//   - COS_GUARANTEE_*/COS_SURPLUS_* constants.
-//
-// Single-writer (owner worker), all atomic ops Ordering::Relaxed.
+// Per-tick drain dispatch + queue-bound / pending-queue helpers.
+// Single-writer (owner worker); atomic ops use `Ordering::Relaxed`.
 
 use super::*;
 

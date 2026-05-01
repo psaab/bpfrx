@@ -1,41 +1,7 @@
-// #956 Phase 5: queue ops + MQFQ ordering bookkeeping + V-min slot
-// lifecycle, extracted from tx.rs. Provides the full queue-state
-// surface that admission gates feed into and the drain scheduler
-// consumes:
-//
-//   - Queue accessors: cos_queue_is_empty, cos_queue_len,
-//     cos_queue_front, cos_queue_min_finish_bucket (file-private),
-//     cos_item_len.
-//   - Enqueue / dequeue: cos_queue_push_back, cos_queue_push_front,
-//     cos_queue_pop_front, cos_queue_pop_front_no_snapshot,
-//     cos_queue_pop_front_inner (file-private),
-//     cos_queue_drain_all, cos_queue_restore_front,
-//     cos_queue_clear_orphan_snapshot_after_drop.
-//   - MQFQ ordering bookkeeping (Phase 3 deferred these — Gemini
-//     Phase 3 round-1 finding): account_cos_queue_flow_enqueue,
-//     account_cos_queue_flow_dequeue. Both are
-//     pub(in crate::afxdp); colocated tests live in this file's
-//     `mod tests` (#984 P3 phase 5a).
-//   - V-min slot lifecycle: publish_committed_queue_vtime,
-//     cos_queue_v_min_consume_suspension, cos_queue_v_min_continue,
-//     and the file-private compute_v_min_lag_threshold helper plus
-//     the V_MIN_READ_CADENCE / V_MIN_LAG_THRESHOLD_NS /
-//     V_MIN_MIN_LAG_BYTES constants. The throttle-cap constants
-//     V_MIN_CONSECUTIVE_SKIP_HARD_CAP and V_MIN_SUSPENSION_BATCHES
-//     are pub(in crate::afxdp); colocated V-min tests live in
-//     this file's `mod tests`.
-//
-// 14 always-on cross-module fns get pub(in crate::afxdp); 4 items
-// (account_*, V_MIN_CONSECUTIVE_SKIP_HARD_CAP, V_MIN_SUSPENSION_BATCHES)
-// get pub(in crate::afxdp) with #[cfg(test)] pub(super) use
-// re-export from cos/mod.rs. Per-byte hot-path fns carry #[inline]
-// per the Phase 4 lesson — pub(in crate::afxdp) plus #[inline]
-// preserves cross-module inlining in release builds.
-//
-// CoSBatch / CoSServicePhase / ExactCoSQueueKind enums and their
-// consumers (select_cos_*_batch, service_exact_*_queue_direct)
-// stay in tx.rs through Phase 7 (queue_service) — they live with
-// the dispatch entry points, not the queue state primitives.
+// CoS queue primitives: accessors, enqueue/dequeue, MQFQ ordering
+// bookkeeping, V-min slot lifecycle. Per-byte hot-path fns carry
+// `#[inline]` to preserve cross-module inlining at the
+// `pub(in crate::afxdp)` boundary.
 
 use std::collections::VecDeque;
 

@@ -1,23 +1,5 @@
-// #984 P2a: TX latency-histogram + completion-sidecar helpers,
-// extracted from tx.rs (now tx/mod.rs).
-//
-// All three functions are pure stat-recorders:
-//   - `stamp_submits<I>`: write per-frame submit timestamps into the
-//     per-binding sidecar `&mut [u64]`, called once per writer.commit().
-//   - `record_tx_completions_with_stamp`: read sidecar at completion
-//     time, fold per-batch deltas into bucket-local counters, bump
-//     `OwnerProfileOwnerWrites.tx_submit_latency_*`.
-//   - `record_kick_latency`: kick-side analogue, bumps
-//     `OwnerProfileOwnerWrites.tx_kick_latency_*`.
-//
-// Single-writer: the owner worker is the only thread that calls these.
-// All counter updates use `Ordering::Relaxed`; the sidecar `&mut [u64]`
-// is non-atomic (single-writer guarantees plus per-frame timestamps).
-//
-// Canonical pins live in `umem.rs::tests` (umem.rs:950+); they reach
-// these fns via `crate::afxdp::tx::{stamp_submits,
-// record_tx_completions_with_stamp, record_kick_latency}` thanks to
-// the load-bearing re-export in `tx/mod.rs`.
+// Single-writer (owner worker thread): per-frame counters use
+// `Ordering::Relaxed` and the sidecar `&mut [u64]` is non-atomic.
 
 use std::sync::atomic::Ordering;
 
