@@ -1,13 +1,9 @@
 use super::*;
+mod bpf_maps;
+pub(crate) use bpf_maps::BpfMaps;
 
 pub struct Coordinator {
-    pub(crate) map_fd: Option<OwnedFd>,
-    pub(crate) heartbeat_map_fd: Option<OwnedFd>,
-    pub(crate) session_map_fd: Option<OwnedFd>,
-    pub(crate) conntrack_v4_fd: Option<OwnedFd>,
-    pub(crate) conntrack_v6_fd: Option<OwnedFd>,
-    pub(crate) dnat_table_fd: Option<OwnedFd>,
-    pub(crate) dnat_table_v6_fd: Option<OwnedFd>,
+    pub(crate) bpf_maps: BpfMaps,
     pub(crate) slow_path: Option<Arc<SlowPathReinjector>>,
     pub(crate) local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
     pub(crate) tunnel_sources: BTreeMap<u16, LocalTunnelSourceHandle>,
@@ -68,13 +64,7 @@ pub struct Coordinator {
 impl Coordinator {
     pub fn new() -> Self {
         Self {
-            map_fd: None,
-            heartbeat_map_fd: None,
-            session_map_fd: None,
-            conntrack_v4_fd: None,
-            conntrack_v6_fd: None,
-            dnat_table_fd: None,
-            dnat_table_v6_fd: None,
+            bpf_maps: BpfMaps::default(),
             slow_path: None,
             local_tunnel_deliveries: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             tunnel_sources: BTreeMap::new(),
@@ -267,12 +257,12 @@ impl Coordinator {
                 let _ = join.join();
             }
         }
-        if let Some(map_fd) = self.map_fd.as_ref() {
+        if let Some(map_fd) = self.bpf_maps.map_fd.as_ref() {
             for slot in self.live.keys().copied().collect::<Vec<_>>() {
                 let _ = delete_xsk_slot(map_fd.fd, slot);
             }
         }
-        if let Some(map_fd) = self.heartbeat_map_fd.as_ref() {
+        if let Some(map_fd) = self.bpf_maps.heartbeat_map_fd.as_ref() {
             for slot in self.live.keys().copied().collect::<Vec<_>>() {
                 let _ = delete_heartbeat_slot(map_fd.fd, slot);
             }
@@ -300,13 +290,13 @@ impl Coordinator {
             .map(|slow| slow.status())
             .unwrap_or_default();
         self.slow_path = None;
-        self.map_fd = None;
-        self.heartbeat_map_fd = None;
-        self.session_map_fd = None;
-        self.conntrack_v4_fd = None;
-        self.conntrack_v6_fd = None;
-        self.dnat_table_fd = None;
-        self.dnat_table_v6_fd = None;
+        self.bpf_maps.map_fd = None;
+        self.bpf_maps.heartbeat_map_fd = None;
+        self.bpf_maps.session_map_fd = None;
+        self.bpf_maps.conntrack_v4_fd = None;
+        self.bpf_maps.conntrack_v6_fd = None;
+        self.bpf_maps.dnat_table_fd = None;
+        self.bpf_maps.dnat_table_v6_fd = None;
         self.forwarding = ForwardingState::default();
         self.shared_forwarding
             .store(Arc::new(ForwardingState::default()));
@@ -638,13 +628,13 @@ impl Coordinator {
             self.live.len()
         );
         let session_map_raw_fd = session_map_fd.fd;
-        self.map_fd = Some(map_fd);
-        self.heartbeat_map_fd = Some(heartbeat_map_fd);
-        self.session_map_fd = Some(session_map_fd);
-        self.conntrack_v4_fd = conntrack_v4_fd;
-        self.conntrack_v6_fd = conntrack_v6_fd;
-        self.dnat_table_fd = dnat_table_fd;
-        self.dnat_table_v6_fd = dnat_table_v6_fd;
+        self.bpf_maps.map_fd = Some(map_fd);
+        self.bpf_maps.heartbeat_map_fd = Some(heartbeat_map_fd);
+        self.bpf_maps.session_map_fd = Some(session_map_fd);
+        self.bpf_maps.conntrack_v4_fd = conntrack_v4_fd;
+        self.bpf_maps.conntrack_v6_fd = conntrack_v6_fd;
+        self.bpf_maps.dnat_table_fd = dnat_table_fd;
+        self.bpf_maps.dnat_table_v6_fd = dnat_table_v6_fd;
         let worker_binding_ifindexes = workers
             .iter()
             .map(|(worker_id, binding_plans)| {

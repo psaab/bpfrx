@@ -272,7 +272,7 @@ const fn tx_frame_capacity() -> usize {
     UMEM_FRAME_SIZE as usize
 }
 
-#[path = "afxdp/coordinator.rs"]
+#[path = "afxdp/coordinator/mod.rs"]
 mod coordinator;
 #[cfg(test)]
 #[path = "afxdp/tests.rs"]

@@ -120,7 +120,7 @@ impl super::Coordinator {
             });
         }
         let current = self.ha_state.load();
-        let session_map_fd = self.session_map_fd.as_ref().map(|fd| fd.fd).unwrap_or(-1);
+        let session_map_fd = self.bpf_maps.session_map_fd.as_ref().map(|fd| fd.fd).unwrap_or(-1);
 
         // RG activation is still allowed to be a narrow ownership transition,
         // but split-RG continuity depends on rewarming the derived reverse
@@ -267,7 +267,7 @@ impl super::Coordinator {
             ha_state.as_ref(),
             entry.metadata.owner_rg_id,
             now_secs,
-        ) && let Some(session_map_fd) = self.session_map_fd.as_ref()
+        ) && let Some(session_map_fd) = self.bpf_maps.session_map_fd.as_ref()
         {
             let _ = publish_live_session_entry(
                 session_map_fd.fd,
@@ -295,7 +295,7 @@ impl super::Coordinator {
                 ha_state.as_ref(),
                 reverse.metadata.owner_rg_id,
                 now_secs,
-            ) && let Some(session_map_fd) = self.session_map_fd.as_ref()
+            ) && let Some(session_map_fd) = self.bpf_maps.session_map_fd.as_ref()
             {
                 let _ = publish_live_session_entry(
                     session_map_fd.fd,
@@ -329,7 +329,7 @@ impl super::Coordinator {
             }
         });
         if let Some(entry) = removed_entry.as_ref() {
-            if let Some(session_map_fd) = self.session_map_fd.as_ref() {
+            if let Some(session_map_fd) = self.bpf_maps.session_map_fd.as_ref() {
                 delete_session_map_entry_for_removed_session(
                     session_map_fd.fd,
                     &entry.key,
