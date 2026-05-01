@@ -63,7 +63,7 @@ pub(super) use cross_binding::{
 #[cfg(test)]
 pub(super) use ecn::{maybe_mark_ecn_ce, ECN_CE, ECN_ECT_0, ECN_ECT_1, ECN_MASK, ECN_NOT_ECT};
 #[cfg(test)]
-pub(super) use flow_hash::{cos_flow_hash_seed_from_os, cos_queue_prospective_active_flows};
+pub(super) use flow_hash::cos_queue_prospective_active_flows;
 #[cfg(test)]
 pub(super) use queue_ops::{
     account_cos_queue_flow_dequeue, account_cos_queue_flow_enqueue,
