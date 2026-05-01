@@ -20,95 +20,15 @@ pub(in crate::afxdp) use v_min::{
     publish_committed_queue_vtime,
 };
 
-#[inline]
-pub(in crate::afxdp) fn account_cos_queue_flow_enqueue(
-    queue: &mut CoSQueueRuntime,
-    flow_key: Option<&SessionKey>,
-    item_len: u64,
-) {
-    if !queue.flow_fair || item_len == 0 {
-        return;
-    }
-    let bucket = cos_flow_bucket_index(queue.flow_hash_seed, flow_key);
-    if queue.flow_bucket_bytes[bucket] == 0 {
-        queue.active_flow_buckets = queue.active_flow_buckets.saturating_add(1);
-        // #784 diagnostic: track the peak distinct-flow count.
-        // Operators can compare this to the test's -P N count to
-        // detect SFQ hash collisions under real workloads.
-        if queue.active_flow_buckets > queue.active_flow_buckets_peak {
-            queue.active_flow_buckets_peak = queue.active_flow_buckets;
-        }
-    }
-    let was_idle = queue.flow_bucket_bytes[bucket] == 0;
-    queue.flow_bucket_bytes[bucket] = queue.flow_bucket_bytes[bucket].saturating_add(item_len);
-    // #785 Phase 3 — MQFQ head/tail finish-time update.
-    //
-    // When the bucket was idle before this enqueue, the HEAD
-    // packet is THIS one, so both head and tail advance to
-    // `max(tail, queue.vtime) + bytes` — the `max` re-anchors
-    // the bucket at the current frontier (otherwise an idle bucket
-    // with tail=0 would sweep past all established flows in one
-    // bounded round, starving them).
-    //
-    // When the bucket was already active, this packet arrives at
-    // the TAIL of the bucket queue — advance only the tail. The
-    // head packet (and therefore head-finish) is unchanged because
-    // the drain-order key for this bucket is still the previously-
-    // queued packets. The new packet's finish is implicit: tail.
-    //
-    // Codex adversarial review flagged the original single-counter
-    // design as HIGH severity: keying selection off tail-finish
-    // rather than head-finish collapsed MQFQ to packet-count
-    // fairness for equal-byte flows (A,A,B,B bursts instead of
-    // A,B,A,B interleave).
-    let new_tail = queue.flow_bucket_tail_finish_bytes[bucket]
-        .max(queue.queue_vtime)
-        .saturating_add(item_len);
-    queue.flow_bucket_tail_finish_bytes[bucket] = new_tail;
-    if was_idle {
-        queue.flow_bucket_head_finish_bytes[bucket] = new_tail;
-    }
-}
+// #1034 P2: flow accounting + drain orchestration split into siblings.
+mod accounting;
+mod drain;
+use accounting::{account_cos_queue_flow_dequeue, account_cos_queue_flow_enqueue};
+pub(in crate::afxdp) use drain::{
+    cos_queue_clear_orphan_snapshot_after_drop, cos_queue_drain_all, cos_queue_restore_front,
+};
 
-#[inline]
-pub(in crate::afxdp) fn account_cos_queue_flow_dequeue(
-    queue: &mut CoSQueueRuntime,
-    flow_key: Option<&SessionKey>,
-    item_len: u64,
-) {
-    if !queue.flow_fair || item_len == 0 {
-        return;
-    }
-    let bucket = cos_flow_bucket_index(queue.flow_hash_seed, flow_key);
-    let remaining = queue.flow_bucket_bytes[bucket].saturating_sub(item_len);
-    if queue.flow_bucket_bytes[bucket] > 0 && remaining == 0 {
-        queue.active_flow_buckets = queue.active_flow_buckets.saturating_sub(1);
-        // #785 Phase 3 — MQFQ bucket-idle reset. When a bucket
-        // drains to 0 its head/tail finish-times are stale
-        // (they point at the virtual time when the LAST packet
-        // finished, not the current frontier). Without reset, a
-        // bucket that comes back active later would skip ahead
-        // of the enqueue-side `max(tail, vtime)` anchor and starve
-        // established buckets until its stale tail converges with
-        // vtime. Reset both head and tail to 0 so the next
-        // enqueue re-anchors at the live `queue.vtime`.
-        queue.flow_bucket_head_finish_bytes[bucket] = 0;
-        queue.flow_bucket_tail_finish_bytes[bucket] = 0;
-        // #941 Work item A: bucket-empty vacate. When this worker's
-        // last active bucket on a shared_exact queue empties, vacate
-        // the V_min slot so peers don't see a phantom-participating
-        // worker holding a stale-low value. Single-writer invariant
-        // holds — only this worker writes its own slot.
-        if queue.shared_exact && queue.active_flow_buckets == 0 {
-            if let Some(floor) = queue.vtime_floor.as_ref() {
-                if let Some(slot) = floor.slots.get(queue.worker_id as usize) {
-                    slot.vacate();
-                }
-            }
-        }
-    }
-    queue.flow_bucket_bytes[bucket] = remaining;
-}
+
 
 #[inline]
 pub(in crate::afxdp) fn cos_queue_is_empty(queue: &CoSQueueRuntime) -> bool {
@@ -520,95 +440,8 @@ fn cos_queue_pop_front_inner(
     Some(item)
 }
 
-/// #913 — used by scratch-builder Drop paths to clean up the
-/// orphan snapshot for an item that was popped and then dropped
-/// (frame-too-big, slice-fail). The naive `pop_snapshot_stack.pop()`
-/// loses the dropped item's vtime contribution: subsequent
-/// survivor restores via `cos_queue_push_front` would rewind vtime
-/// below the dropped item's commit, breaking MQFQ ordering.
-///
-/// Fix (Codex code review HIGH): after popping the orphan, clamp
-/// every remaining snapshot's `pre_pop_queue_vtime` to ≥ the
-/// post-drop `queue_vtime`. This preserves the "drops consume
-/// virtual service" semantic: when surviving items are restored,
-/// their vtime restores can't go below the dropped item's
-/// committed advance.
-///
-/// Walkthrough: pre-batch vtime=0; pop A (head=1500) → vtime=1500;
-/// pop B (head=2000) → vtime=2000; pop Z (head=3000) → vtime=3000.
-/// Drop Z: z_committed_vtime=3000; pop snap_Z; clamp snap_B and
-/// snap_A pre_pop_queue_vtime to max(orig, 3000)=3000. Restore B:
-/// vtime=3000. Restore A: vtime=3000. Z's vtime contribution
-/// preserved across the rollback.
-#[inline]
-pub(in crate::afxdp) fn cos_queue_clear_orphan_snapshot_after_drop(queue: &mut CoSQueueRuntime) {
-    let Some(orphan) = queue.pop_snapshot_stack.pop() else {
-        return;
-    };
-    // queue.queue_vtime here reflects the dropped item's pop
-    // advance (already applied in cos_queue_pop_front_inner).
-    // Clamp remaining snapshots to preserve it across rollback.
-    let z_committed_vtime = queue.queue_vtime;
-    // #927: also preserve the dropped item's bucket-frontier
-    // contribution. The dropped item's served_finish equals
-    // `orphan.pre_pop_head_finish` (served_finish is read from
-    // `flow_bucket_head_finish_bytes[bucket]` BEFORE the
-    // post-pop overwrite at the orphan's pop site, so it
-    // matches the snapshot's pre_pop_head_finish capture).
-    // Older same-bucket snapshots were captured before the
-    // dropped item's pop, so their pre_pop_head/tail_finish
-    // do not include the dropped item's frontier. When such a
-    // snapshot is later restored via the `was_empty` snapshot
-    // path in `cos_queue_push_front`, the bucket would be
-    // re-anchored at a stale (lower) finish-time — competing
-    // active buckets could be incorrectly scheduled before
-    // it. Bumping to `orphan_served_finish` via .max() is
-    // monotone (only raises) and never crosses a committed
-    // boundary, so it is safe across all rollback orderings.
-    let orphan_served_finish = orphan.pre_pop_head_finish;
-    for snap in queue.pop_snapshot_stack.iter_mut() {
-        if snap.pre_pop_queue_vtime < z_committed_vtime {
-            snap.pre_pop_queue_vtime = z_committed_vtime;
-        }
-        if snap.bucket == orphan.bucket {
-            snap.pre_pop_head_finish =
-                snap.pre_pop_head_finish.max(orphan_served_finish);
-            snap.pre_pop_tail_finish =
-                snap.pre_pop_tail_finish.max(orphan_served_finish);
-        }
-    }
-}
 
-pub(in crate::afxdp) fn cos_queue_drain_all(queue: &mut CoSQueueRuntime) -> VecDeque<CoSPendingTxItem> {
-    // #913 / Codex R3: clear stale snapshots from any prior
-    // committed hot-path drain. Without this, a subsequent
-    // `cos_queue_restore_front` would consume orphan snapshots
-    // and apply them to the wrong items (the failure-restore
-    // path in `demote_prepared_cos_queue_to_local`). The §3.7
-    // round-trip-neutrality walkthrough relies on the stack
-    // being EMPTY when restore_front begins.
-    queue.pop_snapshot_stack.clear();
-    let mut items = VecDeque::new();
-    // #785 Phase 3 — Codex round-3 NEW-2 / Rust reviewer LOW:
-    // drain-all is a teardown/reconfigure helper. Unlike the
-    // hot-path batch drains (which cap at TX_BATCH_SIZE and
-    // may be followed by a matching push_front rollback), this
-    // path pops the entire queue without a paired rollback and
-    // can visit >TX_BATCH_SIZE items. Use the no-snapshot
-    // variant so we don't grow the snapshot stack past its
-    // documented bound or trip the per-pop debug_assert.
-    while let Some(item) = cos_queue_pop_front_no_snapshot(queue) {
-        items.push_back(item);
-    }
-    items
-}
 
-#[inline]
-pub(in crate::afxdp) fn cos_queue_restore_front(queue: &mut CoSQueueRuntime, mut items: VecDeque<CoSPendingTxItem>) {
-    while let Some(item) = items.pop_back() {
-        cos_queue_push_front(queue, item);
-    }
-}
 
 
 /// #917 — V_min sync throttle decision. Plan §3.3 v2 cadence:
