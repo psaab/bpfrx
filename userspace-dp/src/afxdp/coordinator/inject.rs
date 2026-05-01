@@ -2,8 +2,13 @@ use super::*;
 
 /// `request inject-packet` RPC handler. Builds a synthetic packet
 /// against the live ForwardingState/HA snapshot, runs it through the
-/// resolution path, and reports the disposition. Mutates Coordinator
-/// to fill `last_resolution`; otherwise lifecycle-free.
+/// resolution path, and reports the disposition.
+///
+/// Side effects on success: fills `last_resolution`, may bump
+/// per-`BindingLiveState` counters, may push an entry into
+/// `recent_exceptions`, and may enqueue a TX request on the chosen
+/// binding. Lifecycle (worker spawn / shutdown / reconcile / HA) is
+/// never touched.
 impl super::Coordinator {
     pub fn inject_test_packet(&mut self, req: InjectPacketRequest) -> Result<(), String> {
         let binding = self
