@@ -1141,7 +1141,7 @@ impl Coordinator {
             current_queue_leases.as_ref(),
         );
         // #917: V_min coordination Arcs sized by worker count.
-        // last_planned_workers is set in apply_planned_workers
+        // workers.last_planned_count is set in apply_planned_workers
         // before this reconcile fires; defaults to 0 at first
         // boot which produces zero-slot floors (the reconcile
         // re-fires once workers are planned).
