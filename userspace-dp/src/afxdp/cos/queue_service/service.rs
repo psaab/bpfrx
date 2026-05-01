@@ -169,7 +169,7 @@ pub(super) fn service_exact_local_queue_direct(
 }
 
 #[inline]
-pub(super) fn service_exact_local_queue_direct_flow_fair(
+fn service_exact_local_queue_direct_flow_fair(
     binding: &mut BindingWorker,
     root_ifindex: i32,
     queue_idx: usize,
@@ -475,7 +475,7 @@ pub(super) fn service_exact_prepared_queue_direct(
 }
 
 #[inline]
-pub(super) fn service_exact_prepared_queue_direct_flow_fair(
+fn service_exact_prepared_queue_direct_flow_fair(
     binding: &mut BindingWorker,
     root_ifindex: i32,
     queue_idx: usize,

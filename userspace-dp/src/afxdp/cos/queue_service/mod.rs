@@ -48,10 +48,7 @@ pub(in crate::afxdp) use drain::{
 // #1035 P3: service stage of the queue service pipeline (the four
 // service_exact_*_queue_direct fns) split into a sibling submodule.
 mod service;
-use service::{
-    service_exact_local_queue_direct, service_exact_local_queue_direct_flow_fair,
-    service_exact_prepared_queue_direct, service_exact_prepared_queue_direct_flow_fair,
-};
+use service::{service_exact_local_queue_direct, service_exact_prepared_queue_direct};
 
 use super::tx_completion::{
     apply_cos_prepared_result, apply_cos_send_result,
