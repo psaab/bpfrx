@@ -153,4 +153,3 @@ fn cos_queue_pop_front_inner(
 #[cfg(test)]
 #[path = "pop_tests.rs"]
 mod tests;
-

@@ -1,5 +1,5 @@
 // Tests for afxdp/cos/queue_ops/pop.rs — relocated from inline
-// `#[cfg(test)] mod tests` to keep mod.rs under the modularity-discipline
+// `#[cfg(test)] mod tests` to keep pop.rs under the modularity-discipline
 // LOC threshold. Loaded as a sibling submodule via
 // `#[path = "pop_tests.rs"]` from pop.rs.
 
