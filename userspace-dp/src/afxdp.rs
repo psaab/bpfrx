@@ -61,7 +61,7 @@ mod flow_cache;
 mod forwarding;
 #[path = "afxdp/forwarding_build.rs"]
 mod forwarding_build;
-#[path = "afxdp/frame.rs"]
+#[path = "afxdp/frame/mod.rs"]
 mod frame;
 #[path = "afxdp/mpsc_inbox.rs"]
 mod mpsc_inbox;
