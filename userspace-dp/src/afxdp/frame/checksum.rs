@@ -72,12 +72,12 @@ mod x86_avx2 {
     ///    < 32 bytes (which already correctly handles odd-length
     ///    remainders).
     ///
-    /// Overflow note: each chunk adds at most `16 * 0xFFFF = 0xF_FFF0`
-    /// per accumulator. With 8 lanes per accumulator carrying
-    /// independent partial sums, the per-lane bound is `0x1_FFFE` per
-    /// chunk. A 64 KiB input is at most 2048 chunks, giving a per-lane
-    /// max of `2048 * 0x1_FFFE ≈ 0x4000_0000` — well below `u32::MAX`.
-    /// Realistic packet sizes (≤ 9 KiB jumbo) are far below this bound.
+    /// Overflow note: per chunk, each of the 8 final-merged lanes
+    /// (after `acc_lo + acc_hi`) absorbs the sum of two u16 values,
+    /// max `2 * 0xFFFF = 0x1_FFFE`. For a 64 KiB input (2048 chunks)
+    /// the per-lane max is `2048 * 0x1_FFFE = 0x0FFF_F000` — about
+    /// `2^28`, well below `u32::MAX`. Realistic packet sizes
+    /// (≤ 9 KiB jumbo) are far below this bound.
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn checksum16_add_bytes_avx2(sum: u32, bytes: &[u8]) -> u32 {
         // SAFETY: every intrinsic below is gated by the target_feature
@@ -539,11 +539,22 @@ mod simd_checksum_tests {
 
     fn check_eq_for(label: &str, bytes: &[u8]) {
         // Differential: live `checksum16_add_bytes` (which may take the
-        // AVX2 path) MUST agree with the scalar reference for both the
-        // partial sum and the folded 16-bit checksum.
+        // AVX2 path) MUST agree with the scalar reference for BOTH the
+        // raw u32 partial sum AND the folded 16-bit checksum. Comparing
+        // only the folded value would miss a class of accumulator bugs
+        // where SIMD and scalar differ by a value invariant under
+        // 16-bit fold (e.g. an extra 0x1_0000 that gets absorbed).
         for &start_sum in &[0u32, 0x1234, 0xffff, 0x1_0000, 0xffff_0000] {
             let live = checksum16_add_bytes(start_sum, bytes);
             let scalar = add_bytes_scalar_only(start_sum, bytes);
+            assert_eq!(
+                live, scalar,
+                "label={label} len={} start={:#x}: raw partial live=0x{:08x} scalar=0x{:08x}",
+                bytes.len(),
+                start_sum,
+                live,
+                scalar,
+            );
             assert_eq!(
                 checksum16_finish(live),
                 checksum16_finish(scalar),
