@@ -137,7 +137,7 @@ use super::cos::{
     cos_guarantee_quantum_bytes, cos_queue_clear_orphan_snapshot_after_drop,
     cos_queue_pop_front, cos_queue_prospective_active_flows,
     cos_queue_v_min_consume_suspension, cos_queue_v_min_continue,
-    maybe_top_up_cos_queue_lease, CoSBatch, ExactCoSScratchBuild, COS_MIN_BURST_BYTES,
+    CoSBatch, ExactCoSScratchBuild, COS_MIN_BURST_BYTES,
     drain_exact_local_fifo_items_to_scratch, drain_exact_local_items_to_scratch_flow_fair,
     drain_exact_prepared_fifo_items_to_scratch,
     drain_exact_prepared_items_to_scratch_flow_fair, select_cos_guarantee_batch, select_cos_guarantee_batch_with_fast_path,
@@ -155,7 +155,7 @@ use super::cos::{
 // moved to `cos/cross_binding.rs::tests`.)
 #[cfg(test)]
 use super::cos::{
-    advance_cos_timer_wheel, cos_queue_push_front, maybe_top_up_cos_root_lease, park_cos_queue,
+    advance_cos_timer_wheel, cos_queue_push_front, park_cos_queue,
     CoSServicePhase, COS_TIMER_WHEEL_TICK_NS,
 };
 
