@@ -5,7 +5,7 @@ use super::*;
 // Both fns are called from push/pop hot paths in queue_ops/mod.rs.
 
 #[inline]
-pub(in crate::afxdp) fn account_cos_queue_flow_enqueue(
+pub(super) fn account_cos_queue_flow_enqueue(
     queue: &mut CoSQueueRuntime,
     flow_key: Option<&SessionKey>,
     item_len: u64,
@@ -55,7 +55,7 @@ pub(in crate::afxdp) fn account_cos_queue_flow_enqueue(
 }
 
 #[inline]
-pub(in crate::afxdp) fn account_cos_queue_flow_dequeue(
+pub(super) fn account_cos_queue_flow_dequeue(
     queue: &mut CoSQueueRuntime,
     flow_key: Option<&SessionKey>,
     item_len: u64,
