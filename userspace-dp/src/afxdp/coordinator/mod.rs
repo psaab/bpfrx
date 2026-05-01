@@ -1,9 +1,11 @@
 use super::*;
 mod bpf_maps;
 mod cos_state;
+mod ha_state;
 mod neighbor_manager;
 pub(crate) use bpf_maps::BpfMaps;
 pub(crate) use cos_state::SharedCoSState;
+pub(in crate::afxdp) use ha_state::HaState;
 pub(crate) use neighbor_manager::NeighborManager;
 
 pub struct Coordinator {
@@ -12,9 +14,7 @@ pub struct Coordinator {
     pub(crate) local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
     pub(crate) tunnel_sources: BTreeMap<u16, LocalTunnelSourceHandle>,
     pub(crate) last_slow_path_status: SlowPathStatus,
-    pub(crate) ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
-    pub(crate) shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
-    pub(crate) shared_forwarding: Arc<ArcSwap<ForwardingState>>,
+    pub(in crate::afxdp) ha: HaState,
     pub(crate) cos: SharedCoSState,
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
     pub(crate) neighbors: NeighborManager,
@@ -58,9 +58,7 @@ impl Coordinator {
             local_tunnel_deliveries: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             tunnel_sources: BTreeMap::new(),
             last_slow_path_status: SlowPathStatus::default(),
-            ha_state: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
-            shared_fabrics: Arc::new(ArcSwap::from_pointee(Vec::new())),
-            shared_forwarding: Arc::new(ArcSwap::from_pointee(ForwardingState::default())),
+            ha: HaState::new(),
             cos: SharedCoSState::new(),
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
             neighbors: NeighborManager::new(),
@@ -188,7 +186,7 @@ impl Coordinator {
             // infrequently (only when kernel ARP/NDP changes, gated by
             // neighborsEqual in the Go manager). The clone cost is
             // negligible vs packet processing.
-            self.shared_forwarding
+            self.ha.forwarding
                 .store(Arc::new(self.forwarding.clone()));
         }
         self.neighbors.generation.fetch_add(1, Ordering::Relaxed);
@@ -280,11 +278,11 @@ impl Coordinator {
         self.bpf_maps.dnat_table_fd = None;
         self.bpf_maps.dnat_table_v6_fd = None;
         self.forwarding = ForwardingState::default();
-        self.shared_forwarding
+        self.ha.forwarding
             .store(Arc::new(ForwardingState::default()));
         self.shared_validation
             .store(Arc::new(ValidationState::default()));
-        self.shared_fabrics.store(Arc::new(Vec::new()));
+        self.ha.fabrics.store(Arc::new(Vec::new()));
         self.neighbors.generation.store(0, Ordering::Relaxed);
         // #949: clear all shards atomically vs readers.
         self.neighbors.dynamic.with_all_shards(|bulk| {
@@ -441,7 +439,7 @@ impl Coordinator {
         };
         self.forwarding = build_forwarding_state(snapshot);
         self.shared_validation.store(Arc::new(self.validation));
-        self.shared_forwarding
+        self.ha.forwarding
             .store(Arc::new(self.forwarding.clone()));
         self.slow_path = if let Some(slow_path) = preserved_slow_path {
             self.last_slow_path_status = slow_path.status();
@@ -463,7 +461,7 @@ impl Coordinator {
         };
         self.local_tunnel_deliveries
             .store(Arc::new(BTreeMap::new()));
-        self.shared_fabrics
+        self.ha.fabrics
             .store(Arc::new(self.forwarding.fabrics.clone()));
         if snapshot.map_pins.xsk.is_empty() {
             self.last_reconcile_stage = "missing_xsk_pin".to_string();
@@ -672,7 +670,7 @@ impl Coordinator {
             let last_resolution = self.last_resolution.clone();
             let slow_path = self.slow_path.clone();
             let local_tunnel_deliveries = self.local_tunnel_deliveries.clone();
-            let shared_forwarding = self.shared_forwarding.clone();
+            let shared_forwarding = self.ha.forwarding.clone();
             let shared_validation = self.shared_validation.clone();
             let shared_sessions = self.shared_sessions.clone();
             let shared_nat_sessions = self.shared_nat_sessions.clone();
@@ -688,10 +686,10 @@ impl Coordinator {
                 .map(|(_, queue)| queue.clone())
                 .collect::<Vec<_>>();
             let worker_commands_by_id = worker_command_queues.clone();
-            let ha_state = self.ha_state.clone();
+            let ha_state = self.ha.rg_runtime.clone();
             let dynamic_neighbors = self.neighbors.dynamic.clone();
             let worker_poll_mode = self.poll_mode;
-            let shared_fabrics = self.shared_fabrics.clone();
+            let shared_fabrics = self.ha.fabrics.clone();
             let rg_epochs = self.rg_epochs.clone();
             let event_stream_handle = self.event_stream_worker_handle();
             let cos_status_clone = cos_status.clone();
@@ -833,7 +831,7 @@ impl Coordinator {
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = stop.clone();
             let forwarding = self.forwarding.clone();
-            let ha_state = self.ha_state.clone();
+            let ha_state = self.ha.rg_runtime.clone();
             let dynamic_neighbors = self.neighbors.dynamic.clone();
             let live = self.live.clone();
             let identities = self.identities.clone();
@@ -997,12 +995,12 @@ impl Coordinator {
         );
         if !new_fabrics.is_empty() {
             self.forwarding.fabrics = new_fabrics.clone();
-            self.shared_fabrics.store(Arc::new(new_fabrics));
+            self.ha.fabrics.store(Arc::new(new_fabrics));
             // Also update shared_forwarding so workers see the new fabric
             // links for fabric redirect resolution. Without this, workers
             // use the snapshot's forwarding state which may have empty fabrics
             // if the peer MAC wasn't resolved at snapshot time.
-            self.shared_forwarding
+            self.ha.forwarding
                 .store(Arc::new(self.forwarding.clone()));
         }
     }
@@ -1067,10 +1065,10 @@ impl Coordinator {
             }
         }
         self.shared_validation.store(Arc::new(self.validation));
-        self.shared_forwarding
+        self.ha.forwarding
             .store(Arc::new(self.forwarding.clone()));
         self.refresh_cos_owner_worker_map_from_identities();
-        self.shared_fabrics
+        self.ha.fabrics
             .store(Arc::new(self.forwarding.fabrics.clone()));
     }
 
@@ -1310,7 +1308,7 @@ impl Coordinator {
                 if let Ok(dst) = req.destination_ip.parse::<IpAddr>() {
                     let resolution = enforce_ha_resolution(
                         &self.forwarding,
-                        &self.ha_state,
+                        &self.ha.rg_runtime,
                         lookup_forwarding_resolution(&self.forwarding, dst),
                     );
                     record_forwarding_disposition(
