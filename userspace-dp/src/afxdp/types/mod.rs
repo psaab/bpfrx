@@ -16,6 +16,16 @@ pub(super) use shared_cos_lease::{
 mod cos;
 pub(in crate::afxdp) use cos::*;
 
+// Issue 68.2: routing/forwarding types extracted into types/forwarding.rs.
+mod forwarding;
+pub(in crate::afxdp) use forwarding::*;
+// Three forwarding types had wider-than-pub(super) visibility in the original
+// types/mod.rs and are re-exported at their original surface so afxdp.rs's
+// `pub(crate) use self::types::{...};` and external pub callers continue to
+// resolve them.
+pub use forwarding::NeighborEntry;
+pub(crate) use forwarding::{ForwardingDisposition, ForwardingResolution};
+
 pub(super) type FastMap<K, V> = FxHashMap<K, V>;
 pub(super) type FastSet<T> = FxHashSet<T>;
 pub(super) type OwnerRgSessionIndex = FastMap<i32, FastSet<SessionKey>>;
@@ -233,55 +243,6 @@ pub(super) enum PacketDisposition {
     UnsupportedPacket,
 }
 
-#[derive(Clone, Debug, Default)]
-pub(super) struct ForwardingState {
-    pub(super) local_v4: FastSet<Ipv4Addr>,
-    pub(super) local_v6: FastSet<Ipv6Addr>,
-    pub(super) interface_nat_v4: FastMap<Ipv4Addr, i32>,
-    pub(super) interface_nat_v6: FastMap<Ipv6Addr, i32>,
-    pub(super) connected_v4: Vec<ConnectedRouteV4>,
-    pub(super) connected_v6: Vec<ConnectedRouteV6>,
-    pub(super) routes_v4: FastMap<String, Vec<RouteEntryV4>>,
-    pub(super) routes_v6: FastMap<String, Vec<RouteEntryV6>>,
-    pub(super) tunnel_endpoints: FastMap<u16, TunnelEndpoint>,
-    pub(super) tunnel_endpoint_by_ifindex: FastMap<i32, u16>,
-    pub(super) neighbors: FastMap<(i32, IpAddr), NeighborEntry>,
-    pub(super) ifindex_to_name: FastMap<i32, String>,
-    pub(super) ifindex_to_config_name: FastMap<i32, String>,
-    /// #921: ifindex → zone ID (was `FastMap<i32, String>`). Built
-    /// at config-commit time from the snapshot's per-interface
-    /// zone NAME via the `zone_name_to_id` lookup. Hot-path callers
-    /// read u16 directly; slow-path display sites translate via
-    /// `zone_id_to_name`. Unknown / dropped zones map to `0`.
-    pub(super) ifindex_to_zone_id: FastMap<i32, u16>,
-    pub(super) zone_name_to_id: FastMap<String, u16>,
-    pub(super) zone_id_to_name: FastMap<u16, String>,
-    pub(super) egress: FastMap<i32, EgressInterface>,
-    pub(super) ingress_logical_ifindex: FastMap<(i32, u16), i32>,
-    pub(super) fabrics: Vec<FabricLink>,
-    pub(super) allow_dns_reply: bool,
-    pub(super) allow_embedded_icmp: bool,
-    pub(super) session_timeouts: crate::session::SessionTimeouts,
-    pub(super) policy: PolicyState,
-    pub(super) source_nat_rules: Vec<SourceNatRule>,
-    pub(super) static_nat: StaticNatTable,
-    pub(super) dnat_table: DnatTable,
-    pub(super) nat64: Nat64State,
-    pub(super) nptv6: Nptv6State,
-    pub(super) screen_profiles: FastMap<String, ScreenProfile>,
-    pub(super) tunnel_interfaces: FastSet<i32>,
-    pub(super) filter_state: crate::filter::FilterState,
-    pub(super) cos: CoSState,
-    pub(super) tx_selection_enabled_v4: bool,
-    pub(super) tx_selection_enabled_v6: bool,
-    #[allow(dead_code)]
-    pub(super) gre_acceleration: bool,
-    pub(super) flow_export_config: Option<crate::flowexport::FlowExportConfig>,
-    pub(super) tcp_mss_all_tcp: u16,
-    pub(super) tcp_mss_ipsec_vpn: u16,
-    pub(super) tcp_mss_gre_in: u16,
-    pub(super) tcp_mss_gre_out: u16,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(super) enum HAForwardingLease {
@@ -317,257 +278,20 @@ impl HAGroupRuntime {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) struct ConnectedRouteV4 {
-    pub(super) prefix: PrefixV4,
-    pub(super) ifindex: i32,
-    pub(super) tunnel_endpoint_id: u16,
-}
 
-#[derive(Clone, Copy, Debug)]
-pub(super) struct ConnectedRouteV6 {
-    pub(super) prefix: PrefixV6,
-    pub(super) ifindex: i32,
-    pub(super) tunnel_endpoint_id: u16,
-}
 
-#[derive(Clone, Debug)]
-pub(super) struct RouteEntryV4 {
-    pub(super) prefix: PrefixV4,
-    pub(super) ifindex: i32,
-    pub(super) tunnel_endpoint_id: u16,
-    pub(super) next_hop: Option<Ipv4Addr>,
-    pub(super) discard: bool,
-    pub(super) next_table: String,
-}
 
-#[derive(Clone, Debug)]
-pub(super) struct RouteEntryV6 {
-    pub(super) prefix: PrefixV6,
-    pub(super) ifindex: i32,
-    pub(super) tunnel_endpoint_id: u16,
-    pub(super) next_hop: Option<Ipv6Addr>,
-    pub(super) discard: bool,
-    pub(super) next_table: String,
-}
 
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NeighborEntry {
-    pub mac: [u8; 6],
-}
 
-#[derive(Clone, Debug)]
-pub(super) struct EgressInterface {
-    pub(super) bind_ifindex: i32,
-    pub(super) vlan_id: u16,
-    pub(super) mtu: usize,
-    pub(super) src_mac: [u8; 6],
-    /// #921: u16 zone ID (was `zone: String`). Resolved at config
-    /// build time via `zone_name_to_id`; `0` means "unknown" (the
-    /// zone wasn't in the snapshot's zones list, or had a reserved
-    /// id and was dropped).
-    pub(super) zone_id: u16,
-    pub(super) redundancy_group: i32,
-    pub(super) primary_v4: Option<Ipv4Addr>,
-    pub(super) primary_v6: Option<Ipv6Addr>,
-}
 
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(super) struct TunnelEndpoint {
-    pub(super) id: u16,
-    pub(super) logical_ifindex: i32,
-    pub(super) redundancy_group: i32,
-    pub(super) mode: String,
-    pub(super) outer_family: i32,
-    pub(super) source: IpAddr,
-    pub(super) destination: IpAddr,
-    pub(super) key: u32,
-    pub(super) ttl: u8,
-    pub(super) transport_table: String,
-}
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct FabricLink {
-    pub(super) parent_ifindex: i32,
-    pub(super) overlay_ifindex: i32,
-    pub(super) peer_addr: IpAddr,
-    pub(super) peer_mac: [u8; 6],
-    pub(super) local_mac: [u8; 6],
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ForwardingDisposition {
-    LocalDelivery,
-    ForwardCandidate,
-    FabricRedirect,
-    HAInactive,
-    PolicyDenied,
-    NoRoute,
-    MissingNeighbor,
-    DiscardRoute,
-    NextTableUnsupported,
-}
 
-impl ForwardingDisposition {
-    /// Whether this disposition produces a stable forwarding decision that can
-    /// be stored in the per-worker flow cache.
-    ///
-    /// Cacheable:
-    ///   - `ForwardCandidate`: Normal forwarded traffic with a resolved
-    ///     neighbor and egress interface. The common fast path.
-    ///
-    /// Not cacheable:
-    ///   - `FabricRedirect`: Targets a fabric overlay binding that differs
-    ///     from the normal egress binding. Fabric target selection depends on
-    ///     per-packet queue hashing and binding availability, which the cache
-    ///     entry cannot capture. Also, fabric sessions may flip back to
-    ///     ForwardCandidate after failback, making cached fabric entries stale.
-    ///   - `LocalDelivery`: Delivered to the kernel stack, not forwarded
-    ///     through XSK bindings. No rewrite descriptor to cache.
-    ///   - `HAInactive`: The owning RG is not active on this node. Transient
-    ///     state that changes on failover — must never be cached.
-    ///   - `PolicyDenied`: Packet was denied by policy. Drop decisions are
-    ///     not cached to allow policy changes to take effect immediately.
-    ///   - `NoRoute`: No route to destination. Transient — may resolve when
-    ///     FIB is updated.
-    ///   - `MissingNeighbor`: Route exists but ARP/NDP is unresolved.
-    ///     Transient — resolves when the neighbor entry appears.
-    ///   - `DiscardRoute`: Matched a discard/reject route. Not cacheable for
-    ///     the same reason as PolicyDenied.
-    ///   - `NextTableUnsupported`: Inter-VRF route leaking hit an
-    ///     unsupported next-table. Permanent miss, not worth caching.
-    pub(super) fn is_cacheable(self) -> bool {
-        matches!(
-            self,
-            ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect
-        )
-    }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ForwardingResolution {
-    pub(crate) disposition: ForwardingDisposition,
-    pub(crate) local_ifindex: i32,
-    pub(crate) egress_ifindex: i32,
-    pub(crate) tx_ifindex: i32,
-    pub(crate) tunnel_endpoint_id: u16,
-    pub(crate) next_hop: Option<IpAddr>,
-    pub(crate) neighbor_mac: Option<[u8; 6]>,
-    pub(crate) src_mac: Option<[u8; 6]>,
-    pub(crate) tx_vlan_id: u16,
-}
 
-impl ForwardingResolution {
-    pub(super) fn status(
-        self,
-        debug: Option<&ResolutionDebug>,
-        forwarding: &ForwardingState,
-    ) -> PacketResolution {
-        PacketResolution {
-            disposition: match self.disposition {
-                ForwardingDisposition::LocalDelivery => "local_delivery",
-                ForwardingDisposition::ForwardCandidate => "forward_candidate",
-                ForwardingDisposition::FabricRedirect => "fabric_redirect",
-                ForwardingDisposition::HAInactive => "ha_inactive",
-                ForwardingDisposition::PolicyDenied => "policy_denied",
-                ForwardingDisposition::NoRoute => "no_route",
-                ForwardingDisposition::MissingNeighbor => "missing_neighbor",
-                ForwardingDisposition::DiscardRoute => "discard_route",
-                ForwardingDisposition::NextTableUnsupported => "next_table_unsupported",
-            }
-            .to_string(),
-            local_ifindex: self.local_ifindex,
-            egress_ifindex: self.egress_ifindex,
-            ingress_ifindex: debug.map(|d| d.ingress_ifindex).unwrap_or_default(),
-            next_hop: self.next_hop.map(|ip| ip.to_string()).unwrap_or_default(),
-            neighbor_mac: self.neighbor_mac.map(format_mac).unwrap_or_default(),
-            src_ip: debug
-                .and_then(|d| d.src_ip)
-                .map(|ip| ip.to_string())
-                .unwrap_or_default(),
-            dst_ip: debug
-                .and_then(|d| d.dst_ip)
-                .map(|ip| ip.to_string())
-                .unwrap_or_default(),
-            src_port: debug.map(|d| d.src_port).unwrap_or_default(),
-            dst_port: debug.map(|d| d.dst_port).unwrap_or_default(),
-            from_zone: debug
-                .and_then(|d| d.from_zone)
-                .and_then(|id| forwarding.zone_id_to_name.get(&id).cloned())
-                .unwrap_or_default(),
-            to_zone: debug
-                .and_then(|d| d.to_zone)
-                .and_then(|id| forwarding.zone_id_to_name.get(&id).cloned())
-                .unwrap_or_default(),
-        }
-    }
-}
 
-#[derive(Clone, Debug)]
-pub(super) struct BindingIdentity {
-    pub(super) slot: u32,
-    pub(super) queue_id: u32,
-    pub(super) worker_id: u32,
-    pub(super) interface: Arc<str>,
-    pub(super) ifindex: i32,
-}
 
-#[derive(Clone, Debug, Default)]
-pub(super) struct WorkerBindingLookup {
-    pub(super) by_if_queue: FastMap<(i32, u32), usize>,
-    pub(super) first_by_if: FastMap<i32, usize>,
-    pub(super) all_by_if: FastMap<i32, Vec<usize>>,
-    pub(super) by_slot: FastMap<u32, usize>,
-}
 
-impl WorkerBindingLookup {
-    pub(super) fn from_bindings(bindings: &[BindingWorker]) -> Self {
-        let mut lookup = Self::default();
-        for (index, binding) in bindings.iter().enumerate() {
-            lookup
-                .by_if_queue
-                .insert((binding.ifindex, binding.queue_id), index);
-            lookup.first_by_if.entry(binding.ifindex).or_insert(index);
-            lookup
-                .all_by_if
-                .entry(binding.ifindex)
-                .or_default()
-                .push(index);
-            lookup.by_slot.insert(binding.slot, index);
-        }
-        lookup
-    }
-
-    pub(super) fn target_index(
-        &self,
-        current_index: usize,
-        current_ifindex: i32,
-        ingress_queue_id: u32,
-        egress_ifindex: i32,
-    ) -> Option<usize> {
-        if current_ifindex == egress_ifindex {
-            return Some(current_index);
-        }
-        self.by_if_queue
-            .get(&(egress_ifindex, ingress_queue_id))
-            .copied()
-            .or_else(|| self.first_by_if.get(&egress_ifindex).copied())
-    }
-
-    pub(super) fn slot_index(&self, slot: u32) -> Option<usize> {
-        self.by_slot.get(&slot).copied()
-    }
-
-    pub(super) fn fabric_target_index(&self, egress_ifindex: i32, flow_hash: u64) -> Option<usize> {
-        let indices = self.all_by_if.get(&egress_ifindex)?;
-        if indices.is_empty() {
-            return None;
-        }
-        Some(indices[(flow_hash as usize) % indices.len()])
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SessionFlow {
