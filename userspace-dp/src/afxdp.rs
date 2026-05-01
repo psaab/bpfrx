@@ -286,12 +286,6 @@ pub(crate) use self::worker::{
     BindingLiveSnapshot, BindingWorker, SyncedSessionEntry, XskBindMode, fabric_queue_hash,
     push_recent_exception, push_recent_session_delta, worker_loop,
 };
-fn should_install_local_reverse_session(decision: SessionDecision, fabric_ingress: bool) -> bool {
-    let fabric_wire_placeholder =
-        shared_ops::is_fabric_wire_placeholder(fabric_ingress, false, decision);
-    decision.resolution.disposition != ForwardingDisposition::FabricRedirect
-        || (fabric_ingress && !fabric_wire_placeholder)
-}
 
 // Lifted from `poll_binding` so the per-descriptor batch function
 // (`poll_binding_process_descriptor`) can take `&mut BatchCounters`.
@@ -688,49 +682,33 @@ use session_delta::{flush_session_deltas, purge_queued_flows_for_closed_deltas};
 // afxdp/neighbor_dispatch.rs.
 mod neighbor_dispatch;
 use neighbor_dispatch::{
-    build_missing_neighbor_session_metadata, learn_dynamic_neighbor,
-    learn_dynamic_neighbor_from_packet, retry_pending_neigh,
+    build_missing_neighbor_session_metadata, learn_dynamic_neighbor_from_packet,
+    retry_pending_neigh,
 };
+// `learn_dynamic_neighbor` is only referenced by tests in
+// afxdp/forwarding.rs and afxdp/tests.rs; gate its import behind cfg(test)
+// so non-test builds don't trip `unused_imports`.
+#[cfg(test)]
+use neighbor_dispatch::learn_dynamic_neighbor;
 
 // Issue 67.3: disposition / telemetry recording extracted into
 // afxdp/disposition.rs.
 mod disposition;
-use disposition::{
-    record_disposition, record_exception, record_forwarding_disposition,
-    update_last_resolution,
-};
+use disposition::{record_disposition, record_exception, record_forwarding_disposition};
+// `update_last_resolution` is only referenced by tests in afxdp/tests.rs;
+// gate its import behind cfg(test).
+#[cfg(test)]
+use disposition::update_last_resolution;
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn build_live_forward_request(
-    area: &MmapArea,
-    binding_lookup: &WorkerBindingLookup,
-    current_binding_index: usize,
-    ingress_ident: &BindingIdentity,
-    desc: XdpDesc,
-    meta: UserspaceDpMeta,
-    decision: &SessionDecision,
-    forwarding: &ForwardingState,
-    flow: Option<&SessionFlow>,
-    fabric_ingress_zone: Option<u16>,
-    apply_nat_on_fabric: bool,
-) -> Option<PendingForwardRequest> {
-    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
-    build_live_forward_request_from_frame(
-        binding_lookup,
-        current_binding_index,
-        ingress_ident,
-        desc,
-        frame,
-        meta,
-        decision,
-        forwarding,
-        flow,
-        fabric_ingress_zone,
-        apply_nat_on_fabric,
-        None,
-        None,
-    )
-}
+// Issue 67.4: forward-request builders extracted into
+// afxdp/forward_request.rs.
+mod forward_request;
+use forward_request::{build_live_forward_request_from_frame, should_install_local_reverse_session};
+// `build_live_forward_request` is only referenced by tests in
+// afxdp/frame/tests.rs; gate its import behind cfg(test).
+#[cfg(test)]
+use forward_request::build_live_forward_request;
+
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PendingForwardHints {
@@ -738,86 +716,6 @@ struct PendingForwardHints {
     target_binding_index: Option<usize>,
 }
 
-fn build_live_forward_request_from_frame(
-    binding_lookup: &WorkerBindingLookup,
-    current_binding_index: usize,
-    ingress_ident: &BindingIdentity,
-    desc: XdpDesc,
-    frame: &[u8],
-    meta: UserspaceDpMeta,
-    decision: &SessionDecision,
-    forwarding: &ForwardingState,
-    flow: Option<&SessionFlow>,
-    fabric_ingress_zone: Option<u16>,
-    apply_nat_on_fabric: bool,
-    hints: Option<PendingForwardHints>,
-    precomputed_tx_selection: Option<&CachedTxSelectionDescriptor>,
-) -> Option<PendingForwardRequest> {
-    let hints = hints.unwrap_or_default();
-    let target_ifindex = if decision.resolution.tx_ifindex > 0 {
-        decision.resolution.tx_ifindex
-    } else {
-        resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
-    };
-    // Prefer session flow ports (set by conntrack, immune to DMA races),
-    // then live frame ports (lazy — only parsed if session ports unavailable),
-    // then metadata as last resort.
-    let expected_ports = hints
-        .expected_ports
-        .or_else(|| authoritative_forward_ports(frame, meta, flow));
-    let target_binding_index = hints.target_binding_index.or_else(|| {
-        if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
-            binding_lookup.fabric_target_index(
-                target_ifindex,
-                fabric_queue_hash(flow, expected_ports, meta),
-            )
-        } else {
-            binding_lookup.target_index(
-                current_binding_index,
-                ingress_ident.ifindex,
-                ingress_ident.queue_id,
-                target_ifindex,
-            )
-        }
-    });
-    let mut decision = *decision;
-    // #919/#922: ID-keyed redirect — no `zone_id_to_name` round-trip.
-    if decision.resolution.disposition == ForwardingDisposition::FabricRedirect
-        && let Some(ingress_zone_id) = fabric_ingress_zone
-        && let Some(zone_redirect) =
-            resolve_zone_encoded_fabric_redirect_by_id(forwarding, ingress_zone_id)
-    {
-        decision.resolution.src_mac = zone_redirect.src_mac;
-    }
-    let cos = precomputed_tx_selection
-        .map(|selection| CoSTxSelection {
-            queue_id: selection.queue_id,
-            dscp_rewrite: selection.dscp_rewrite,
-        })
-        .unwrap_or_else(|| {
-            resolve_cos_tx_selection(
-                forwarding,
-                decision.resolution.egress_ifindex,
-                meta,
-                flow.map(|flow| &flow.forward_key),
-            )
-        });
-    Some(PendingForwardRequest {
-        target_ifindex,
-        target_binding_index,
-        ingress_queue_id: ingress_ident.queue_id,
-        desc,
-        frame: PendingForwardFrame::Live,
-        meta: meta.into(),
-        decision,
-        apply_nat_on_fabric,
-        expected_ports,
-        flow_key: flow.map(|flow| flow.forward_key.clone()),
-        nat64_reverse: None,
-        cos_queue_id: cos.queue_id,
-        dscp_rewrite: cos.dscp_rewrite,
-    })
-}
 
 // Superseded by inline logic in build_live_forward_request() that reads ports
 // from the live UMEM area before .to_vec() copy (fixes #199).  Retained for
