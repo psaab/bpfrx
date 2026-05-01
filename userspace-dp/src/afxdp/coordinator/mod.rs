@@ -3,10 +3,12 @@ mod bpf_maps;
 mod cos_state;
 mod ha_state;
 mod neighbor_manager;
+mod worker_manager;
 pub(crate) use bpf_maps::BpfMaps;
 pub(crate) use cos_state::SharedCoSState;
 pub(in crate::afxdp) use ha_state::HaState;
 pub(crate) use neighbor_manager::NeighborManager;
+pub(in crate::afxdp) use worker_manager::WorkerManager;
 
 pub struct Coordinator {
     pub(crate) bpf_maps: BpfMaps,
@@ -22,17 +24,13 @@ pub struct Coordinator {
     pub(crate) shared_nat_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     pub(crate) shared_forward_wire_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     pub(crate) shared_owner_rg_indexes: SharedSessionOwnerRgIndexes,
-    pub(crate) live: BTreeMap<u32, Arc<BindingLiveState>>,
-    pub(crate) identities: BTreeMap<u32, BindingIdentity>,
-    pub(crate) workers: BTreeMap<u32, WorkerHandle>,
+    pub(in crate::afxdp) workers: WorkerManager,
     pub(crate) session_export_seq: AtomicU64,
     pub(crate) forwarding: ForwardingState,
     pub(crate) recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     pub(crate) recent_session_deltas: Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     pub(crate) last_resolution: Arc<Mutex<Option<PacketResolution>>>,
     pub(crate) validation: ValidationState,
-    pub(crate) last_planned_workers: usize,
-    pub(crate) last_planned_bindings: usize,
     pub(crate) reconcile_calls: u64,
     pub(crate) last_reconcile_stage: String,
     pub(crate) poll_mode: crate::PollMode,
@@ -66,9 +64,7 @@ impl Coordinator {
             shared_nat_sessions: Arc::new(Mutex::new(FastMap::default())),
             shared_forward_wire_sessions: Arc::new(Mutex::new(FastMap::default())),
             shared_owner_rg_indexes: SharedSessionOwnerRgIndexes::default(),
-            live: BTreeMap::new(),
-            identities: BTreeMap::new(),
-            workers: BTreeMap::new(),
+            workers: WorkerManager::new(),
             session_export_seq: AtomicU64::new(0),
             forwarding: ForwardingState::default(),
             recent_exceptions: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RECENT_EXCEPTIONS))),
@@ -77,8 +73,6 @@ impl Coordinator {
             ))),
             last_resolution: Arc::new(Mutex::new(None)),
             validation: ValidationState::default(),
-            last_planned_workers: 0,
-            last_planned_bindings: 0,
             reconcile_calls: 0,
             last_reconcile_stage: "idle".to_string(),
             poll_mode: crate::PollMode::BusyPoll,
@@ -208,7 +202,7 @@ impl Coordinator {
     /// worker's "first binding" the increments landed on. This is the
     /// only operator-facing surface for this counter.
     pub fn cos_no_owner_binding_drops_total(&self) -> u64 {
-        self.live
+        self.workers.live
             .values()
             .map(|live| live.no_owner_binding_drops.load(Ordering::Relaxed))
             .sum()
@@ -229,27 +223,27 @@ impl Coordinator {
         self.tunnel_sources.clear();
         self.local_tunnel_deliveries
             .store(Arc::new(BTreeMap::new()));
-        for handle in self.workers.values_mut() {
+        for handle in self.workers.handles.values_mut() {
             handle.stop.store(true, Ordering::Relaxed);
         }
-        for (_, handle) in self.workers.iter_mut() {
+        for (_, handle) in self.workers.handles.iter_mut() {
             if let Some(join) = handle.join.take() {
                 let _ = join.join();
             }
         }
         if let Some(map_fd) = self.bpf_maps.map_fd.as_ref() {
-            for slot in self.live.keys().copied().collect::<Vec<_>>() {
+            for slot in self.workers.live.keys().copied().collect::<Vec<_>>() {
                 let _ = delete_xsk_slot(map_fd.fd, slot);
             }
         }
         if let Some(map_fd) = self.bpf_maps.heartbeat_map_fd.as_ref() {
-            for slot in self.live.keys().copied().collect::<Vec<_>>() {
+            for slot in self.workers.live.keys().copied().collect::<Vec<_>>() {
                 let _ = delete_heartbeat_slot(map_fd.fd, slot);
             }
         }
-        self.workers.clear();
-        self.identities.clear();
-        self.live.clear();
+        self.workers.handles.clear();
+        self.workers.identities.clear();
+        self.workers.live.clear();
         // #925 Phase 1: drop the per-worker panic slots alongside the
         // workers themselves so a long-running daemon that reconciles
         // through many worker-id sets doesn't accumulate stale slots.
@@ -315,8 +309,8 @@ impl Coordinator {
             *last = None;
         }
         self.validation = ValidationState::default();
-        self.last_planned_workers = 0;
-        self.last_planned_bindings = 0;
+        self.workers.last_planned_count = 0;
+        self.workers.last_planned_bindings = 0;
         self.last_reconcile_stage = "stopped".to_string();
     }
 
@@ -357,7 +351,7 @@ impl Coordinator {
     ) {
         self.reconcile_calls += 1;
         self.last_reconcile_stage = "start".to_string();
-        let had_live_workers = !self.workers.is_empty();
+        let had_live_workers = !self.workers.handles.is_empty();
         let preserved_synced_sessions = self.snapshot_shared_session_entries();
         // Keep a healthy slow-path worker across back-to-back reconciles. The
         // userspace helper can receive multiple snapshot refreshes during HA
@@ -564,7 +558,7 @@ impl Coordinator {
                 continue;
             }
             let live = Arc::new(BindingLiveState::new());
-            self.live.insert(binding.slot, live.clone());
+            self.workers.live.insert(binding.slot, live.clone());
             let identity = BindingIdentity {
                 slot: binding.slot,
                 queue_id: binding.queue_id,
@@ -572,7 +566,7 @@ impl Coordinator {
                 interface: Arc::<str>::from(binding.interface.as_str()),
                 ifindex: binding.ifindex,
             };
-            self.identities.insert(binding.slot, identity);
+            self.workers.identities.insert(binding.slot, identity);
             workers
                 .entry(binding.worker_id)
                 .or_default()
@@ -593,19 +587,19 @@ impl Coordinator {
             plans.sort_by_key(|plan| (plan.status.queue_id, plan.status.ifindex, plan.status.slot));
         }
         let planned_bindings: usize = workers.values().map(|group| group.len()).sum();
-        self.last_planned_workers = workers.len();
-        self.last_planned_bindings = planned_bindings;
+        self.workers.last_planned_count = workers.len();
+        self.workers.last_planned_bindings = planned_bindings;
         self.last_reconcile_stage = format!(
             "planned:workers={}:bindings={}:live={}",
-            self.last_planned_workers,
-            self.last_planned_bindings,
-            self.live.len()
+            self.workers.last_planned_count,
+            self.workers.last_planned_bindings,
+            self.workers.live.len()
         );
         eprintln!(
             "xpf-userspace-dp: reconcile planned_workers={} planned_bindings={} live_slots={}",
             workers.len(),
             planned_bindings,
-            self.live.len()
+            self.workers.live.len()
         );
         let session_map_raw_fd = session_map_fd.fd;
         self.bpf_maps.map_fd = Some(map_fd);
@@ -752,7 +746,7 @@ impl Coordinator {
                         "xpf-userspace-dp: started worker thread worker_id={} planned_bindings={}",
                         worker_id, plan_count
                     );
-                    self.workers.insert(
+                    self.workers.handles.insert(
                         worker_id,
                         WorkerHandle {
                             stop,
@@ -790,9 +784,9 @@ impl Coordinator {
         }
         self.last_reconcile_stage = format!(
             "spawned:workers={}:identities={}:live={}",
-            self.workers.len(),
-            self.identities.len(),
-            self.live.len()
+            self.workers.handles.len(),
+            self.workers.identities.len(),
+            self.workers.live.len()
         );
         // Start the helper-owned neighbor sync path. It does an initial
         // RTM_GETNEIGH dump so startup sees the existing kernel table, then
@@ -833,14 +827,15 @@ impl Coordinator {
             let forwarding = self.forwarding.clone();
             let ha_state = self.ha.rg_runtime.clone();
             let dynamic_neighbors = self.neighbors.dynamic.clone();
-            let live = self.live.clone();
-            let identities = self.identities.clone();
+            let live = self.workers.live.clone();
+            let identities = self.workers.identities.clone();
             let shared_sessions = self.shared_sessions.clone();
             let shared_nat_sessions = self.shared_nat_sessions.clone();
             let shared_forward_wire_sessions = self.shared_forward_wire_sessions.clone();
             let shared_owner_rg_indexes = self.shared_owner_rg_indexes.clone();
             let worker_commands = self
                 .workers
+                .handles
                 .values()
                 .map(|handle| handle.commands.clone())
                 .collect::<Vec<_>>();
@@ -933,6 +928,7 @@ impl Coordinator {
     pub fn cos_statuses(&self) -> Vec<crate::protocol::CoSInterfaceStatus> {
         let snapshots: Vec<Vec<_>> = self
             .workers
+            .handles
             .values()
             .map(|worker| worker.cos_status.load().iter().cloned().collect())
             .collect();
@@ -969,7 +965,7 @@ impl Coordinator {
     pub fn drain_session_deltas(&self, max: usize) -> Vec<SessionDeltaInfo> {
         let mut remaining = max.max(1);
         let mut out = Vec::new();
-        for live in self.live.values() {
+        for live in self.workers.live.values() {
             if remaining == 0 {
                 break;
             }
@@ -1074,7 +1070,7 @@ impl Coordinator {
 
     fn refresh_cos_owner_worker_map_from_identities(&mut self) {
         let worker_binding_ifindexes =
-            build_worker_binding_ifindexes_from_identities(&self.identities);
+            build_worker_binding_ifindexes_from_identities(&self.workers.identities);
         let owner_map = build_cos_owner_worker_by_queue_from_binding_ifindexes(
             &self.forwarding,
             &worker_binding_ifindexes,
@@ -1099,7 +1095,7 @@ impl Coordinator {
             },
         );
         let fallback_worker_binding_ifindexes =
-            build_worker_binding_ifindexes_from_identities(&self.identities);
+            build_worker_binding_ifindexes_from_identities(&self.workers.identities);
         let owner_map = build_cos_owner_worker_by_queue_with_fallback_ifindexes(
             &self.forwarding,
             &ready_worker_binding_ifindexes,
@@ -1129,8 +1125,8 @@ impl Coordinator {
         let next_owner_live = build_cos_owner_live_by_queue(
             &self.forwarding,
             owner_map_for_runtime,
-            &self.identities,
-            &self.live,
+            &self.workers.identities,
+            &self.workers.live,
         );
         let current_leases = self.cos.root_leases.load();
         let next_leases = build_shared_cos_root_leases_reusing_existing(
@@ -1150,7 +1146,7 @@ impl Coordinator {
         // boot which produces zero-slot floors (the reconcile
         // re-fires once workers are planned).
         let current_queue_vtime_floors = self.cos.queue_vtime_floors.load();
-        let num_workers = self.last_planned_workers.max(1);
+        let num_workers = self.workers.last_planned_count.max(1);
         let next_queue_vtime_floors = build_shared_cos_queue_vtime_floors_reusing_existing(
             &self.forwarding,
             num_workers,
@@ -1191,7 +1187,7 @@ impl Coordinator {
     pub fn worker_heartbeats(&self) -> Vec<chrono::DateTime<Utc>> {
         let now_wall = Utc::now();
         let now_mono = monotonic_nanos();
-        self.workers
+        self.workers.handles
             .iter()
             .map(|(_, handle)| {
                 monotonic_timestamp_to_datetime(
@@ -1205,7 +1201,7 @@ impl Coordinator {
     }
 
     pub fn worker_count(&self) -> usize {
-        self.workers.len()
+        self.workers.handles.len()
     }
 
     /// #869: snapshot per-worker busy/idle runtime counters.  Each row is
@@ -1215,7 +1211,7 @@ impl Coordinator {
     /// supervisor catches a worker_loop panic) and the rendered panic
     /// payload from the per-worker slot in `worker_panics`.
     pub fn worker_runtime_snapshots(&self) -> Vec<crate::protocol::WorkerRuntimeStatus> {
-        self.workers
+        self.workers.handles
             .iter()
             .map(|(worker_id, handle)| {
                 let s = handle.runtime_atomics.snapshot();
@@ -1252,15 +1248,15 @@ impl Coordinator {
     }
 
     pub fn identity_count(&self) -> usize {
-        self.identities.len()
+        self.workers.identities.len()
     }
 
     pub fn live_count(&self) -> usize {
-        self.live.len()
+        self.workers.live.len()
     }
 
     pub fn planned_counts(&self) -> (usize, usize) {
-        (self.last_planned_workers, self.last_planned_bindings)
+        (self.workers.last_planned_count, self.workers.last_planned_bindings)
     }
 
     pub fn reconcile_debug(&self) -> (u64, String) {
@@ -1269,10 +1265,12 @@ impl Coordinator {
 
     pub fn inject_test_packet(&mut self, req: InjectPacketRequest) -> Result<(), String> {
         let binding = self
+            .workers
             .identities
             .get(&req.slot)
             .ok_or_else(|| format!("unknown binding slot {}", req.slot))?;
         let live = self
+            .workers
             .live
             .get(&req.slot)
             .ok_or_else(|| format!("binding slot {} has no live state", req.slot))?;
@@ -1337,6 +1335,7 @@ impl Coordinator {
                             ));
                         }
                         let target_slot = self
+                            .workers
                             .identities
                             .values()
                             .find(|candidate| {
@@ -1344,7 +1343,7 @@ impl Coordinator {
                                     && candidate.queue_id == ident.queue_id
                             })
                             .or_else(|| {
-                                self.identities
+                                self.workers.identities
                                     .values()
                                     .find(|candidate| candidate.ifindex == egress.bind_ifindex)
                             })
@@ -1355,7 +1354,7 @@ impl Coordinator {
                                     egress.bind_ifindex
                                 )
                             })?;
-                        let target_live = self.live.get(&target_slot).ok_or_else(|| {
+                        let target_live = self.workers.live.get(&target_slot).ok_or_else(|| {
                             format!("binding slot {} has no live state", target_slot)
                         })?;
                         let frame = build_injected_packet(&req, dst, resolution, egress)?;
@@ -1408,7 +1407,7 @@ impl Coordinator {
 
     pub fn refresh_bindings(&mut self, bindings: &mut [BindingStatus]) {
         for binding in bindings.iter_mut() {
-            if let Some(live) = self.live.get(&binding.slot) {
+            if let Some(live) = self.workers.live.get(&binding.slot) {
                 let snap = live.snapshot();
                 if snap.bound && !binding.bound {
                     eprintln!(
@@ -2497,7 +2496,7 @@ mod tests {
     #[test]
     fn refresh_runtime_snapshot_rebuilds_cos_owner_worker_map_from_identities() {
         let mut coordinator = Coordinator::new();
-        coordinator.identities.insert(
+        coordinator.workers.identities.insert(
             1,
             BindingIdentity {
                 slot: 1,
@@ -2507,7 +2506,7 @@ mod tests {
                 ifindex: 12,
             },
         );
-        coordinator.identities.insert(
+        coordinator.workers.identities.insert(
             2,
             BindingIdentity {
                 slot: 2,
