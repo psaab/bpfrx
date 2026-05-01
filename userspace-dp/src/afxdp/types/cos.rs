@@ -752,3 +752,15 @@ impl<'a> Iterator for FlowRrRingIter<'a> {
     }
 }
 
+// Compile-time invariants for COS_FLOW_FAIR_BUCKETS — the #711 design
+// depends on both and a future refactor that changes the constant
+// without checking these must fail at build time, not at runtime:
+//
+// 1. Power of two — `cos_flow_bucket_index` masks with
+//    `COS_FLOW_FAIR_BUCKETS - 1` instead of modulo, and `FlowRrRing`
+//    uses mask-based wrap math on the hot push/pop path. Without
+//    power-of-two sizing that math silently indexes off the end.
+// 2. Fits in `u16` — `FlowRrRing` stores bucket IDs as `u16`. A
+//    larger constant would silently truncate.
+const _: () = assert!(COS_FLOW_FAIR_BUCKETS.is_power_of_two());
+const _: () = assert!(COS_FLOW_FAIR_BUCKETS <= u16::MAX as usize);
