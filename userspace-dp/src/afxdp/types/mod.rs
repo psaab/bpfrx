@@ -81,7 +81,23 @@ pub(super) struct PendingNeighPacket {
     pub(super) meta: UserspaceDpMeta,
     pub(super) decision: SessionDecision,
     pub(super) queued_ns: u64,
+    /// Cold-start probe schedule attempts (GEMINI-NEXT.md Section 3).
+    /// 0 means no retries fired yet beyond the initial probe; each
+    /// retry from `retry_pending_neigh` increments this. Capped by
+    /// `PROBE_SCHEDULE_NS.len()`.
+    pub(super) probe_attempts: u8,
 }
+
+// Compile-time size guard: the `probe_attempts: u8` added in #1082
+// fit within the existing trailing alignment padding, so the struct
+// is the same 224 B as before. If a future field bumps this past 224,
+// re-evaluate the per-binding worst-case (224 B × MAX_PENDING_NEIGH
+// = ~896 KiB; the comment in afxdp.rs above MAX_PENDING_NEIGH must
+// be updated to match).
+const _: () = assert!(
+    core::mem::size_of::<PendingNeighPacket>() == 224,
+    "PendingNeighPacket size changed — update afxdp.rs MAX_PENDING_NEIGH commentary",
+);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]

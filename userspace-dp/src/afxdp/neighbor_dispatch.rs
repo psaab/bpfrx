@@ -18,6 +18,32 @@
 
 use super::*;
 
+/// GEMINI-NEXT.md Section 3 cold-start: re-fire ARP/NDP solicitation
+/// at exponential intervals after the initial probe in
+/// `poll_descriptor.rs`. Each entry is the cumulative ns delay from
+/// `PendingNeighPacket::queued_ns` at which to issue the next
+/// `trigger_kernel_arp_probe()`. After all entries elapse, no further
+/// probes — the packet just waits for kernel resolution or the
+/// PENDING_NEIGH_TIMEOUT.
+///
+/// 10/60/260 ms covers a 4-probe schedule (initial + 3 retries) over
+/// 260 ms total. The deltas (10, 50, 200 ms) match the cold-start
+/// exponential design in GEMINI-NEXT.md and give the kernel three
+/// retransmits if the first solicitation is dropped.
+const PROBE_SCHEDULE_NS: &[u64] = &[
+    10_000_000,  // first retry at queued + 10 ms
+    60_000_000,  // second retry at queued + 60 ms (delta 50 ms)
+    260_000_000, // third retry at queued + 260 ms (delta 200 ms)
+];
+
+/// Returns true when the next scheduled probe is due. Pure function —
+/// no side effects, easy to unit-test the schedule edges.
+fn probe_due(elapsed_ns: u64, attempts: u8) -> bool {
+    PROBE_SCHEDULE_NS
+        .get(attempts as usize)
+        .is_some_and(|&target| elapsed_ns >= target)
+}
+
 pub(super) fn retry_pending_neigh(
     binding: &mut BindingWorker,
     left: &mut [BindingWorker],
@@ -50,6 +76,19 @@ pub(super) fn retry_pending_neigh(
     let ingress_slot = binding.slot;
     let ingress_ifindex = binding.ifindex;
     let ingress_queue = binding.queue_id;
+    // Per-sweep dedup of probe re-fires by `(egress_ifindex, next_hop)`.
+    // Without this, N packets queued for the same unresolved neighbor
+    // would each re-fire `trigger_kernel_arp_probe()` at the same
+    // schedule slot — N redundant socket opens + N kernel ARP/NDP
+    // entries. The kernel coalesces solicits, but we still pay the
+    // syscall + alloc per call. Mirrors the dedup at the initial-probe
+    // site in poll_descriptor.rs (which uses `pending_neigh.iter().any`).
+    //
+    // BTreeSet is used because IpAddr is Ord and we expect the set to
+    // be small (handful of neighbors at most during cold start) — the
+    // log-N insert dominates over hash setup for tiny N.
+    let mut probed_this_sweep: std::collections::BTreeSet<(i32, IpAddr)> =
+        std::collections::BTreeSet::new();
     for _ in 0..pending_len {
         let pkt = binding
             .pending_neigh
@@ -74,7 +113,43 @@ pub(super) fn retry_pending_neigh(
             None
         };
         let Some(neighbor_mac) = mac else {
-            // Still pending — keep for the next sweep.
+            // Still pending — re-fire ARP/NDP probe if the next slot
+            // in the exponential schedule is due (GEMINI-NEXT.md
+            // Section 3 cold-start). Each retry advances
+            // probe_attempts so each schedule entry fires at most
+            // once per packet. Per-sweep dedup keyed on
+            // (egress_ifindex, next_hop) prevents probe-storm when
+            // many packets share the same unresolved neighbor.
+            let mut pkt = pkt;
+            if probe_due(
+                now_ns.saturating_sub(pkt.queued_ns),
+                pkt.probe_attempts,
+            ) {
+                if let Some(hop) = pkt.decision.resolution.next_hop {
+                    let key = (pkt.decision.resolution.egress_ifindex, hop);
+                    if probed_this_sweep.contains(&key) {
+                        // Another pkt for this (egress, hop) already
+                        // fired the probe this sweep. Advance this
+                        // pkt's schedule so it doesn't busy-loop on
+                        // the same slot next sweep.
+                        pkt.probe_attempts = pkt.probe_attempts.saturating_add(1);
+                    } else if let Some(name) = forwarding.ifindex_to_name.get(&key.0) {
+                        // First pkt for this (egress, hop) AND iface
+                        // resolves → fire the probe, mark the slot
+                        // consumed for the rest of this sweep, and
+                        // advance this pkt's schedule.
+                        trigger_kernel_arp_probe(name, hop);
+                        probed_this_sweep.insert(key);
+                        pkt.probe_attempts = pkt.probe_attempts.saturating_add(1);
+                    }
+                    // else: not yet probed AND iface lookup miss → no
+                    // probe fires, key NOT inserted, probe_attempts
+                    // NOT advanced. Subsequent same-key pkts will
+                    // also fall here, and the whole batch retries
+                    // this slot next sweep.
+                }
+                // else: no next_hop → cannot probe; do not advance.
+            }
             binding.pending_neigh.push_back(pkt);
             continue;
         };
@@ -227,5 +302,158 @@ pub(super) fn build_missing_neighbor_session_metadata(
         fabric_ingress,
         is_reverse: false,
         nat64_reverse: None,
+    }
+}
+
+#[cfg(test)]
+mod cold_start_probe_schedule_tests {
+    use super::{PROBE_SCHEDULE_NS, probe_due};
+
+    #[test]
+    fn schedule_values_match_design() {
+        // Pin the exact schedule so accidental edits fail the build
+        // rather than silently regressing the cold-start design from
+        // GEMINI-NEXT.md Section 3.
+        assert_eq!(
+            PROBE_SCHEDULE_NS,
+            &[10_000_000u64, 60_000_000u64, 260_000_000u64],
+        );
+    }
+
+    #[test]
+    fn schedule_is_strictly_monotonic() {
+        for window in PROBE_SCHEDULE_NS.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "PROBE_SCHEDULE_NS must be strictly increasing: {:?}",
+                PROBE_SCHEDULE_NS
+            );
+        }
+    }
+
+    #[test]
+    fn probe_due_fires_only_at_or_after_schedule_boundary() {
+        let first = PROBE_SCHEDULE_NS[0];
+        assert!(!probe_due(first - 1, 0));
+        assert!(probe_due(first, 0));
+        assert!(probe_due(first + 1, 0));
+    }
+
+    #[test]
+    fn probe_due_walks_each_schedule_slot() {
+        // After attempts=0 fires, probe_due(elapsed, 1) must wait until
+        // PROBE_SCHEDULE_NS[1]; same for each subsequent slot.
+        for (idx, &target) in PROBE_SCHEDULE_NS.iter().enumerate() {
+            let attempts = idx as u8;
+            assert!(
+                !probe_due(target.saturating_sub(1), attempts),
+                "slot {idx} should not fire one ns before target",
+            );
+            assert!(
+                probe_due(target, attempts),
+                "slot {idx} should fire at target",
+            );
+        }
+    }
+
+    #[test]
+    fn probe_due_returns_false_after_schedule_exhausted() {
+        let exhausted = PROBE_SCHEDULE_NS.len() as u8;
+        // Even with elapsed_ns = u64::MAX, no further probes once
+        // every slot has fired.
+        assert!(!probe_due(u64::MAX, exhausted));
+        assert!(!probe_due(u64::MAX, exhausted.saturating_add(1)));
+    }
+
+    #[test]
+    fn schedule_total_window_under_pending_neigh_timeout() {
+        // The schedule must finish before PENDING_NEIGH_TIMEOUT_NS
+        // (2 s, see types/mod.rs) so all 3 retries fire while the
+        // packet is still queued. Otherwise the last retry is dead
+        // code: the packet will already be expired by then.
+        let last = *PROBE_SCHEDULE_NS.last().expect("schedule non-empty");
+        assert!(
+            last < super::PENDING_NEIGH_TIMEOUT_NS,
+            "last probe slot {last}ns must be < PENDING_NEIGH_TIMEOUT_NS",
+        );
+    }
+
+    /// Pure-function model of the per-sweep dedup logic in
+    /// `retry_pending_neigh`'s still-pending branch. Mirrors the
+    /// real code path closely enough to test burst-coalescing
+    /// behavior — including the ifindex-miss path — without spinning
+    /// up a full `BindingWorker`.
+    ///
+    /// Returns (probes_fired, attempts_advanced).
+    fn simulate_sweep_for_neighbor(
+        packets_for_same_neigh: u32,
+        slot_idx: u8,
+        iface_resolves: bool,
+    ) -> (u32, u32) {
+        let mut probed: std::collections::BTreeSet<(i32, std::net::IpAddr)> =
+            std::collections::BTreeSet::new();
+        let mut probes_fired = 0u32;
+        let mut attempts_advanced = 0u32;
+        let key: (i32, std::net::IpAddr) = (
+            42,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+        );
+        let elapsed = PROBE_SCHEDULE_NS[slot_idx as usize];
+        for _ in 0..packets_for_same_neigh {
+            if probe_due(elapsed, slot_idx) {
+                if probed.contains(&key) {
+                    // Slot consumed by an earlier pkt this sweep.
+                    attempts_advanced += 1;
+                } else if iface_resolves {
+                    // First pkt + iface resolves → fire + mark + advance.
+                    probes_fired += 1;
+                    probed.insert(key);
+                    attempts_advanced += 1;
+                }
+                // else: iface miss + not yet probed → drop through,
+                // no probe, no insert, no advance.
+            }
+        }
+        (probes_fired, attempts_advanced)
+    }
+
+    #[test]
+    fn dedup_emits_one_probe_per_neighbor_per_slot() {
+        // 50 packets queued for the same (egress_ifindex, next_hop)
+        // must produce exactly ONE probe per schedule slot. All 50
+        // pkts still advance their probe_attempts so they don't
+        // re-trigger the same slot next sweep.
+        let (fired, advanced) = simulate_sweep_for_neighbor(50, 0, true);
+        assert_eq!(
+            fired, 1,
+            "expected 1 probe for 50 same-neighbor packets, got {fired}",
+        );
+        assert_eq!(advanced, 50, "all 50 pkts must advance probe_attempts");
+    }
+
+    #[test]
+    fn dedup_holds_across_all_schedule_slots() {
+        // Same dedup property for every slot, not just slot 0.
+        for slot in 0..(PROBE_SCHEDULE_NS.len() as u8) {
+            let (fired, _) = simulate_sweep_for_neighbor(8, slot, true);
+            assert_eq!(fired, 1, "slot {slot}: expected 1 probe, got {fired}",);
+        }
+    }
+
+    #[test]
+    fn iface_miss_does_not_burn_slot_for_any_packet() {
+        // When ifindex_to_name lookup fails (e.g. iface flapped),
+        // NONE of the queued packets should consume their schedule
+        // slot — every pkt must stay at the same probe_attempts so
+        // the next sweep can re-try once the iface is back. Earlier
+        // bug: first pkt inserted into dedup set then bailed,
+        // causing later pkts to think the slot was consumed by a
+        // probe that never fired.
+        let (fired, advanced) = simulate_sweep_for_neighbor(50, 0, false);
+        assert_eq!(fired, 0, "no probes when iface lookup fails");
+        assert_eq!(
+            advanced, 0,
+            "no pkt should advance probe_attempts on iface miss",
+        );
     }
 }
