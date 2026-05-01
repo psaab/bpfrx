@@ -133,7 +133,6 @@ use super::cos::{
     apply_cos_queue_flow_fair_promotion, redirect_local_cos_request_to_owner_binding,
     ExactCoSScratchBuild, COS_MIN_BURST_BYTES,
     drain_exact_local_fifo_items_to_scratch, drain_exact_local_items_to_scratch_flow_fair,
-    select_cos_guarantee_batch, select_exact_cos_guarantee_queue_with_fast_path,
     settle_exact_local_fifo_submission,
     settle_exact_local_scratch_submission_flow_fair, };
 // #956 P1: TX-completion + timer-wheel items reached by
@@ -144,9 +143,7 @@ use super::cos::{
 // moved to `cos/cross_binding.rs::tests`.)
 #[cfg(test)]
 use super::cos::{
-    advance_cos_timer_wheel, park_cos_queue,
-    COS_TIMER_WHEEL_TICK_NS,
-};
+    };
 
 
 
@@ -615,55 +612,7 @@ mod tests {
 
 
 
-    #[test]
-    fn timer_wheel_wakes_short_parked_queue() {
-        let mut root = test_cos_interface_runtime(0);
-        root.queues[0].items.push_back(test_cos_item(1500));
-        root.queues[0].queued_bytes = 1500;
-        root.queues[0].runnable = true;
-        root.nonempty_queues = 1;
-        root.runnable_queues = 1;
 
-        park_cos_queue(&mut root, 0, 5);
-
-        assert!(root.queues[0].parked);
-        assert!(!root.queues[0].runnable);
-        assert_eq!(root.runnable_queues, 0);
-
-        advance_cos_timer_wheel(&mut root, 4 * COS_TIMER_WHEEL_TICK_NS);
-        assert!(root.queues[0].parked);
-        assert!(!root.queues[0].runnable);
-
-        advance_cos_timer_wheel(&mut root, 5 * COS_TIMER_WHEEL_TICK_NS);
-        assert!(!root.queues[0].parked);
-        assert!(root.queues[0].runnable);
-        assert_eq!(root.runnable_queues, 1);
-    }
-
-    #[test]
-    fn timer_wheel_cascades_long_parked_queue() {
-        let mut root = test_cos_interface_runtime(0);
-        root.queues[0].items.push_back(test_cos_item(1500));
-        root.queues[0].queued_bytes = 1500;
-        root.queues[0].runnable = true;
-        root.nonempty_queues = 1;
-        root.runnable_queues = 1;
-
-        let wake_tick = COS_TIMER_WHEEL_L0_SLOTS as u64 + 10;
-        park_cos_queue(&mut root, 0, wake_tick);
-
-        assert_eq!(root.queues[0].wheel_level, 1);
-        assert!(root.queues[0].parked);
-
-        advance_cos_timer_wheel(&mut root, (wake_tick - 1) * COS_TIMER_WHEEL_TICK_NS);
-        assert!(root.queues[0].parked);
-        assert!(!root.queues[0].runnable);
-
-        advance_cos_timer_wheel(&mut root, wake_tick * COS_TIMER_WHEEL_TICK_NS);
-        assert!(!root.queues[0].parked);
-        assert!(root.queues[0].runnable);
-        assert_eq!(root.runnable_queues, 1);
-    }
 
 
 
@@ -678,83 +627,7 @@ mod tests {
     // ---------------------------------------------------------------------
 
 
-    #[test]
-    fn park_counter_root_token_starvation_ticks_only_its_reason() {
-        let mut root = test_cos_runtime_with_exact(true);
-        root.tokens = 0;
-        root.queues[0].tokens = 0;
-        root.queues[0].runnable = true;
-        root.queues[0].items.push_back(test_cos_item(1500));
-        root.queues[0].queued_bytes = 1500;
-        root.nonempty_queues = 1;
-        root.runnable_queues = 1;
 
-        let before = snapshot_counters(&root.queues[0]);
-        // Drive a selector that will park on root-token starvation.
-        assert!(select_cos_guarantee_batch(&mut root, 1).is_none());
-        let after = snapshot_counters(&root.queues[0]);
-
-        assert_eq!(
-            after.root_token_starvation_parks,
-            before.root_token_starvation_parks + 1,
-            "root-token park counter must advance by 1"
-        );
-        assert_eq!(
-            after.queue_token_starvation_parks,
-            before.queue_token_starvation_parks
-        );
-        assert_eq!(
-            after.admission_flow_share_drops,
-            before.admission_flow_share_drops
-        );
-        assert_eq!(after.admission_buffer_drops, before.admission_buffer_drops);
-        assert_eq!(
-            after.tx_ring_full_submit_stalls,
-            before.tx_ring_full_submit_stalls
-        );
-    }
-
-    #[test]
-    fn park_counter_queue_token_starvation_ticks_only_its_reason_on_exact() {
-        let mut root = test_cos_runtime_with_exact(true);
-        // Root has headroom; per-queue tokens do not. Forces the
-        // queue-token park branch on the exact selector.
-        root.tokens = 1_000_000;
-        root.queues[0].tokens = 0;
-        root.queues[0].last_refill_ns = 1; // skip the first-refill init path
-        root.queues[0].runnable = true;
-        root.queues[0].items.push_back(test_cos_item(1500));
-        root.queues[0].queued_bytes = 1500;
-        root.nonempty_queues = 1;
-        root.runnable_queues = 1;
-
-        let before = snapshot_counters(&root.queues[0]);
-        let selection = select_exact_cos_guarantee_queue_with_fast_path(&mut root, &[], 1);
-        assert!(
-            selection.is_none(),
-            "exact selector must park, not return a queue"
-        );
-        let after = snapshot_counters(&root.queues[0]);
-
-        assert_eq!(
-            after.queue_token_starvation_parks,
-            before.queue_token_starvation_parks + 1,
-            "queue-token park counter must advance by 1"
-        );
-        assert_eq!(
-            after.root_token_starvation_parks,
-            before.root_token_starvation_parks
-        );
-        assert_eq!(
-            after.admission_flow_share_drops,
-            before.admission_flow_share_drops
-        );
-        assert_eq!(after.admission_buffer_drops, before.admission_buffer_drops);
-        assert_eq!(
-            after.tx_ring_full_submit_stalls,
-            before.tx_ring_full_submit_stalls
-        );
-    }
 
 
 
