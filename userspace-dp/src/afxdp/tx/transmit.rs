@@ -1,16 +1,5 @@
-// #984 P2c: TX-ring submit + per-frame recycle cluster, extracted
-// from tx/mod.rs.
-//
-// Items here:
-//   - TxError: error type returned by submit fns.
-//   - recycle_cancelled_prepared_offset: prepared-frame cancel handler.
-//   - recycle_prepared_immediately: prepared-frame eager-cleanup helper.
-//   - remember_prepared_recycle: per-offset PreparedTxRecycle bookkeeping.
-//   - transmit_batch: XSK TX-ring submit for local TxRequests.
-//   - transmit_prepared_batch (pub(super)): caller hook from tx/mod.rs.
-//   - transmit_prepared_queue: XSK TX-ring submit for prepared frames.
-//
-// Single-writer (owner worker), all atomic ops Ordering::Relaxed.
+// XSK TX-ring submit + per-frame recycle. Single-writer (owner
+// worker); atomic ops use `Ordering::Relaxed`.
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;

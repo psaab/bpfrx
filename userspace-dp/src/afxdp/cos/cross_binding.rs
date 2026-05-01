@@ -1,28 +1,10 @@
-// #956 Phase 8: cross-binding redirect helpers, extracted from
-// tx.rs. Final phase of the cos/ submodule decomposition.
+// Cross-binding redirect: routes a TX request to the owner binding
+// of the egress (or hands off via MPSC inbox) for both Local and
+// Prepared variants.
 //
-// These helpers resolve the "is this request bound to the owner
-// of the egress, or do we hand off via MPSC inbox?" question for
-// both Local and Prepared TX requests:
-//
-//   - `resolve_local_routing_decision` returns the routing
-//     decision (enqueue locally / inbox-redirect / drop) for a
-//     local request.
-//   - `redirect_local_cos_request_to_owner` is step 1 of the
-//     two-step redirect; `_binding` (test-only) is step 2.
-//   - `prepared_cos_request_stays_on_current_tx_binding` is the
-//     gate predicate for prepared requests.
-//   - `redirect_prepared_cos_request_to_owner` + `_binding`
-//     handle the prepared (zero-copy UMEM) variant; the binding-
-//     side call invokes `tx::recycle_prepared_immediately` after
-//     a successful redirect/enqueue, once the data has been copied
-//     out of UMEM (the original frame is no longer referenced).
-//   - `cos_fast_interface` / `cos_fast_queue` are the binding
-//     fast-path lookups consumed by the redirect logic.
-//
-// One back-edge: `tx::recycle_prepared_immediately` (XSK frame
-// recycling — worker-binding territory). Visibility bumped to
-// `pub(in crate::afxdp)` in this PR.
+// Back-edge to `tx::recycle_prepared_immediately`: prepared
+// redirects copy the frame into the owner binding and then release
+// the source UMEM frame on this binding.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};

@@ -1,36 +1,16 @@
-// #956 Phase 7: CoS dispatch / drain / submit subsystem, extracted
-// from tx.rs. The largest move of the campaign — ~2400 LOC covering
-// the full per-byte hot-path chain:
+// CoS dispatch / drain / submit subsystem. Hot-path call chain:
 //
-//   drain_shaped_tx ->
-//     select_cos_*_batch (guarantee / nonexact / surplus / fast-path) ->
-//       service_exact_*_queue_direct(_flow_fair) ->
-//         drain_exact_*_to_scratch ->
-//           submit_cos_batch + cos_batch_tx_made_progress ->
-//             settle_exact_*_submission*
+//   drain_shaped_tx
+//    -> select_cos_*_batch (guarantee / nonexact / surplus)
+//      -> service_exact_*_queue_direct(_flow_fair)
+//        -> drain_exact_*_to_scratch
+//          -> submit_cos_batch + cos_batch_tx_made_progress
+//            -> settle_exact_*_submission*
 //
-// Plus the dispatch types (CoSBatch, CoSServicePhase, ExactCoSQueueKind,
-// ExactCoSQueueSelection, ExactCoSScratchBuild, DrainedQueueRef,
-// ParkReason) and scheduler helpers (cos_*_quantum_bytes,
-// estimate_cos_queue_wakeup_tick, count_park_reason, park_cos_queue).
-//
-// Per the Phase 4-6 lesson, all per-byte / per-batch hot-path fns
-// carry #[inline] (added on the move; the source bodies didn't have
-// it). Larger bodies (drain_*_to_scratch, settle_*) skip #[inline] —
-// LLVM's heuristic threshold should cover them; revisit only if a
-// post-merge perf regression points at one.
-//
-// TX-completion + timer-wheel back-edges (apply_cos_*_result,
-// restore_cos_*_inner, prime_cos_root_for_service,
-// refresh_cos_interface_activity, cos_tick_for_ns +
-// cos_timer_wheel_level_and_slot + count_tx_ring_full_submit_stall)
-// moved to cos/tx_completion.rs in #956 P1.
-//
-// Remaining back-edges to crate::afxdp::tx are XSK-ring /
-// worker-binding / prepared-frame primitives (transmit_*,
-// reap_tx_completions, maybe_wake_tx, recycle_*, stamp_submits,
-// cos_queue_dscp_rewrite, TxError, the guarantee/quantum constants).
-// Those move with the afxdp/tx/ split in #984.
+// All per-byte / per-batch hot-path fns carry `#[inline]` to
+// preserve cross-module inlining at the `pub(in crate::afxdp)`
+// boundary. Larger drain/settle bodies skip `#[inline]` — LLVM's
+// heuristic threshold covers them.
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
@@ -57,11 +37,6 @@ use super::{
     refill_cos_tokens, COS_MIN_BURST_BYTES,
 };
 
-// #956 P1: TX-completion + timer-wheel symbols + scheduling primitives
-// (CoSServicePhase, ParkReason, count_park_reason, park_cos_queue)
-// moved to cos/tx_completion.rs. Moving the scheduling primitives
-// breaks the previous cyclic queue_service <-> tx_completion module
-// dependency (Copilot review on PR #990).
 use super::tx_completion::{
     apply_cos_prepared_result, apply_cos_send_result,
     apply_direct_exact_send_result, cos_tick_for_ns,
@@ -70,9 +45,9 @@ use super::tx_completion::{
     restore_cos_local_items_inner, restore_cos_prepared_items_inner, CoSServicePhase,
     ParkReason,
 };
-// Remaining back-edges to tx.rs (XSK-ring / worker-binding /
-// prepared-frame primitives + TxError + guarantee/quantum constants —
-// deferred to #984 / afxdp/tx/ split).
+// Back-edges to crate::afxdp::tx are XSK-ring / worker-binding /
+// prepared-frame primitives — primitives that own the kernel ring
+// state and are hosted there for that reason.
 use crate::afxdp::tx::{
     cos_queue_dscp_rewrite, maybe_wake_tx, reap_tx_completions,
     recycle_cancelled_prepared_offset, remember_prepared_recycle, stamp_submits,

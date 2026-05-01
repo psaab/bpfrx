@@ -1,22 +1,9 @@
-// #956 P1 (PR following #983): TX-completion + timer-wheel cluster
-// extracted from tx.rs.
-//
-// This module owns:
-//   - The CoS interface timer wheel (advance / cascade / wake-due
-//     slot management + the COS_TIMER_WHEEL_TICK_NS / horizon
-//     constants).
-//   - The TX-completion apply path (apply_direct_exact_send_result,
-//     apply_cos_send_result, apply_cos_prepared_result) and the
-//     refresh / restore helpers they use.
-//   - prime_cos_root_for_service (single drain-cycle entry called by
-//     queue_service before each service pass).
-//
-// Closes the Phase 6 builder back-edge (cos/builders.rs ->
-// tx::cos_tick_for_ns) and the TX-completion / timer-wheel subset of
-// the Phase 7 deferrals (10 of the 18 fns imported by
-// cos/queue_service.rs from crate::afxdp::tx::). The remaining 8 fns
-// + TxError + 4 guarantee/quantum constants stay on
-// crate::afxdp::tx, deferred to #984 (afxdp/tx/ split).
+// CoS TX-completion + timer-wheel. Owns the interface timer wheel
+// (advance / cascade / wake-due slot management), the TX-completion
+// apply path (apply_direct_exact_send_result, apply_cos_send_result,
+// apply_cos_prepared_result) and the refresh / restore helpers they
+// use, plus prime_cos_root_for_service (single drain-cycle entry
+// called by queue_service before each service pass).
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;

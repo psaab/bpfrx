@@ -1,23 +1,7 @@
-// #956 Phase 6: CoS interface-runtime builders, extracted from
-// tx.rs. Provides the construction half of the binding lifecycle:
-//
-//   - `ensure_cos_interface_runtime` — production caller hook
-//     (binding lifecycle). Sits on the steady-state enqueue path
-//     because every enqueue checks whether the runtime exists for
-//     the egress ifindex; carries `#[inline]`.
-//   - `build_cos_interface_runtime` — pure constructor from
-//     `CoSInterfaceConfig`. Called once by `ensure_*` and by
-//     `tx::test_support` fixture builders; pub(in crate::afxdp)
-//     plus cfg-gated re-export from cos/mod.rs. Direct unit tests
-//     for this fn live in this file's `mod tests` (#984 P3 phase 4b).
-//
-// `cos_tick_for_ns` moved to cos/tx_completion.rs in #956 P1; the
-// Phase-6 cos/builders -> tx back-edge is now closed.
-//
-// `apply_cos_queue_flow_fair_promotion` (cos/admission.rs) is
-// imported here. After this PR, ensure_cos_interface_runtime is
-// the only non-test caller of that fn — cos/mod.rs's re-export
-// for it shifts from always-on to cfg-gated.
+// CoS interface-runtime construction. `ensure_cos_interface_runtime`
+// sits on the steady-state enqueue path (every enqueue checks
+// whether the runtime exists for the egress ifindex) and carries
+// `#[inline]`.
 
 use std::collections::VecDeque;
 

@@ -1,34 +1,8 @@
-// #956 Phase 3: admission policy (per-flow share/buffer caps,
-// ECN marking, flow-fair promotion), extracted from tx.rs.
-//
-// Provides the per-flow admission gates the TX hot-path consults
-// when enqueueing a packet onto a CoS queue:
-//   - `cos_queue_flow_share_limit` — per-flow byte cap on
-//     flow-fair queues, rate-aware on shared_exact (#914)
-//   - `cos_flow_aware_buffer_limit` — aggregate buffer cap that
-//     tracks active-flow count
-//   - `apply_cos_admission_ecn_policy` — per-flow / aggregate
-//     ECN CE marking (#722, #784)
-//
-// Plus the queue-runtime construction helpers that promote queues
-// onto the flow-fair (SFQ) path:
-//   - `apply_cos_queue_flow_fair_promotion` — whole-runtime entry
-//   - `promote_cos_queue_flow_fair` — per-queue policy (file-private)
-//
-// `account_cos_queue_flow_enqueue` / `_dequeue` (MQFQ + V-min state
-// lifecycle) stayed in tx.rs through Phase 4 and moved cohesively
-// with selection / pop / publish in Phase 5 — see
-// `cos/queue_ops.rs` and docs/pr/956-phase5-queue-ops/plan.md.
-// (Gemini round-1 of Phase 3 was the original architectural
-// finding requiring the deferral.)
-//
-// `COS_MIN_BURST_BYTES` lived in tx.rs through Phase 3 with a
-// `pub(in crate::afxdp)` visibility bump so this module could reach
-// it via `use crate::afxdp::tx::COS_MIN_BURST_BYTES`. Phase 4 moved
-// the constant into `cos/token_bucket.rs`; this module now imports
-// it via `use super::COS_MIN_BURST_BYTES` (resolves to the
-// `cos/mod.rs` re-export). Importing via the parent re-export keeps
-// admission agnostic to which sibling module owns the constant.
+// Per-flow admission gates (share/buffer caps, ECN CE-marking) +
+// flow-fair (SFQ) queue promotion. `COS_MIN_BURST_BYTES` is
+// imported via `super::COS_MIN_BURST_BYTES` (cos/mod.rs re-export)
+// so admission stays agnostic to which sibling module owns the
+// constant.
 
 use crate::afxdp::types::{
     CoSInterfaceRuntime, CoSPendingTxItem, CoSQueueRuntime, WorkerCoSQueueFastPath,

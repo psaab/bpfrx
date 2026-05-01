@@ -1,14 +1,3 @@
-// #956 cos/ submodule. Phase 1 extracted ECN marking; Phase 2
-// extracted flow-hashing helpers; Phase 3 extracted admission
-// policy + flow-fair promotion; Phase 4 extracted token-bucket
-// lease/refill; Phase 5 extracted queue ops + MQFQ ordering +
-// V-min lifecycle; Phase 6 extracted CoS interface-runtime
-// builders; Phase 7 extracted the dispatch / drain / submit
-// subsystem; Phase 8 (this commit) extracts the cross-binding
-// redirect helpers — FINAL phase of #956.
-// See docs/pr/956-phase8-cross-binding/plan.md for this phase
-// and docs/pr/956-tx-decomposition/plan.md for the full plan.
-
 pub(super) mod admission;
 pub(super) mod builders;
 pub(super) mod cross_binding;
@@ -41,8 +30,4 @@ pub(super) use token_bucket::{
     refill_cos_tokens, release_all_cos_queue_leases, release_all_cos_root_leases,
     COS_MIN_BURST_BYTES,
 };
-// tx.rs reaches `mark_cos_queue_runnable` via `super::cos::` for its
-// non-moving `enqueue_cos_item` path. Other production callers
-// (queue_service, builders) reach moved items directly via
-// `super::tx_completion::*`.
 pub(super) use tx_completion::mark_cos_queue_runnable;

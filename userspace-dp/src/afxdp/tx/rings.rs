@@ -1,23 +1,6 @@
-// #984 P2b: XSK kernel-ring discipline cluster, extracted from
-// tx/mod.rs.
-//
-// Six items live here:
-//   - `reap_tx_completions`: drain the XSK completion ring via
-//     `device.complete()` and feed completed offsets to the stats
-//     fold + per-offset cleanup.
-//   - `drain_pending_fill`: refill the XSK fill ring via
-//     `device.fill().insert(...)` + `commit()`.
-//   - `maybe_wake_rx` / `maybe_wake_tx`: kernel-wakeup gates that
-//     issue `sendto` after fill / TX submit (rate-limited per the
-//     RX_WAKE_* / TX_WAKE_* constants in afxdp.rs).
-//   - `recycle_completed_tx_offset` (file-private helper): per-offset
-//     cleanup invoked from inside `reap_tx_completions`.
-//   - `apply_prepared_recycle` (file-private):
-//     `recycle_completed_tx_offset`'s `PreparedTxRecycle`
-//     dispatcher. Now exercised by a colocated test in this
-//     module's `mod tests`.
-//
-// Single-writer (owner worker), all atomic ops `Ordering::Relaxed`.
+// XSK kernel-ring discipline: completion drain, fill submit, RX/TX
+// kernel wake. Single-writer (owner worker); atomic ops use
+// `Ordering::Relaxed`.
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;

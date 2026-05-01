@@ -1,19 +1,9 @@
-// #956 Phase 2: flow-hashing helpers, extracted from tx.rs.
+// Per-queue flow-hash machinery for SFQ admission + promotion.
 //
-// Provides the per-queue hash machinery used by SFQ admission +
-// promotion: a per-queue salt (`cos_flow_hash_seed_from_os`), a
-// 5-tuple → bucket-index mapper (`exact_cos_flow_bucket` /
-// `cos_flow_bucket_index`), the prospective-flow counter for
-// admission gates (`cos_queue_prospective_active_flows`), and the
-// `CoSPendingTxItem → SessionKey` accessor (`cos_item_flow_key`).
-//
-// Constants (`COS_FLOW_FAIR_BUCKETS`, `COS_FLOW_FAIR_BUCKET_MASK`)
-// stay in `afxdp::types` because they size other types there
-// (`FlowRrRing`, `CoSQueueRuntime` arrays). flow_hash imports
-// them rather than owning them.
-//
-// Phase 3 (admission) imports the public-to-afxdp helpers
-// re-exported from `cos/mod.rs`.
+// `COS_FLOW_FAIR_BUCKETS` / `COS_FLOW_FAIR_BUCKET_MASK` live in
+// `afxdp::types` because they size other types there (`FlowRrRing`,
+// `CoSQueueRuntime` arrays); flow_hash imports them rather than
+// owning them.
 
 use crate::afxdp::types::{CoSPendingTxItem, CoSQueueRuntime, COS_FLOW_FAIR_BUCKET_MASK};
 use crate::session::SessionKey;
