@@ -189,7 +189,7 @@ pub(super) fn flush_session_deltas(
     }
 }
 
-pub(super) fn session_delta_event(kind: SessionDeltaKind) -> &'static str {
+fn session_delta_event(kind: SessionDeltaKind) -> &'static str {
     match kind {
         SessionDeltaKind::Open => "open",
         SessionDeltaKind::Close => "close",
