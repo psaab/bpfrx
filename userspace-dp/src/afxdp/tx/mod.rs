@@ -129,8 +129,6 @@ use super::cos::{
     resolve_local_routing_decision, LocalRoutingDecision, Step1Action,
 };
 #[cfg(test)]
-use super::cos::ecn::{ethernet_l3, mark_ecn_ce_ipv4, mark_ecn_ce_ipv6, EthernetL3};
-#[cfg(test)]
 use super::cos::{
     account_cos_queue_flow_dequeue, account_cos_queue_flow_enqueue,
     apply_cos_queue_flow_fair_promotion, assign_local_dscp_rewrite, bdp_floor_bytes,
@@ -142,12 +140,12 @@ use super::cos::{
     drain_exact_local_fifo_items_to_scratch, drain_exact_local_items_to_scratch_flow_fair,
     drain_exact_prepared_fifo_items_to_scratch,
     drain_exact_prepared_items_to_scratch_flow_fair, estimate_cos_queue_wakeup_tick,
-    maybe_mark_ecn_ce, release_exact_local_scratch_frames, release_exact_prepared_scratch,
+    release_exact_local_scratch_frames, release_exact_prepared_scratch,
     select_cos_guarantee_batch, select_cos_guarantee_batch_with_fast_path,
     select_cos_surplus_batch, select_exact_cos_guarantee_queue_with_fast_path,
     select_nonexact_cos_guarantee_batch, settle_exact_local_fifo_submission,
     settle_exact_local_scratch_submission_flow_fair, settle_exact_prepared_fifo_submission, COS_ECN_MARK_THRESHOLD_DEN, COS_ECN_MARK_THRESHOLD_NUM,
-    COS_FLOW_FAIR_MIN_SHARE_BYTES, ECN_CE, ECN_ECT_0, ECN_ECT_1, ECN_MASK, ECN_NOT_ECT,
+    COS_FLOW_FAIR_MIN_SHARE_BYTES, ECN_CE, ECN_ECT_0, ECN_MASK, ECN_NOT_ECT,
     V_MIN_CONSECUTIVE_SKIP_HARD_CAP, V_MIN_SUSPENSION_BATCHES,
 };
 // #956 P1: TX-completion + timer-wheel items reached by
