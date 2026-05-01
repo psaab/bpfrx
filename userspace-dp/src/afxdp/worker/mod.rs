@@ -1,5 +1,10 @@
 use super::*;
 
+// Issue 73 step 2: per-poll BindingWorker lifecycle (the central
+// `poll_binding` orchestrator) lives in worker/lifecycle.rs.
+mod lifecycle;
+use lifecycle::poll_binding;
+
 // #957 P1: worker-side CoS runtime helpers split out into a sibling
 // submodule. Note this module is `worker::cos`, separate from the
 // `afxdp::cos` directory module imported below as `super::cos`.
