@@ -62,22 +62,38 @@ pub(in crate::afxdp) const COS_FAST_QUEUE_INDEX_MISS: u16 = u16::MAX;
 
 /// Number of SFQ flow buckets per flow-fair CoS queue.
 ///
-/// Sized to keep birthday-paradox collision probability well below 15%
-/// at the production-regime flow count (N ≤ 64 concurrent flows per
-/// queue). At 16 flows the collision rate is ~11% (was ~88% at the
-/// prior 64-bucket sizing); at 32 flows ~38%; at 64 flows ~87%.
-/// Collisions cost fairness — two flows in the same bucket share one
-/// SFQ dequeue slot and one admission-cap slice (#705) — so making
-/// them rare is directly fairness-load-bearing. See #711.
+/// GEMINI-NEXT.md Section 2 fairness: bumped 1024 → 4096. The metric
+/// below is *per-flow* collision probability — i.e. the chance that any
+/// given flow ends up sharing a bucket with at least one of the other
+/// active flows in the queue, computed as `1 - (1 - 1/N)^(flows - 1)`
+/// where N is `COS_FLOW_FAIR_BUCKETS`. Per-flow probability is what
+/// directly governs that flow's fairness: colliding flows compete for
+/// one SFQ dequeue slot and one admission-cap slice (#705).
 ///
-/// Per-queue memory overhead:
-///   `flow_bucket_bytes: [u64; N]`    =  8 KB
-///   `flow_bucket_items: [VecDeque; N]` = 24 KB inline headers
-///   `flow_rr_buckets: FlowRrRing` (`[u16; N] + head + len`) = 2 KB
-/// = ~34 KB per flow-fair queue. Non-flow-fair queues pay the same
-/// inline footprint but never touch the storage; it stays cold. At
-/// 4 workers × 8 queues × 1 iface = ~1 MB, well within tolerance.
-pub(in crate::afxdp) const COS_FLOW_FAIR_BUCKETS: usize = 1024;
+/// Under typical 100E100M (Elephant + Mouse) workloads with ~200
+/// concurrent flows per queue, 1024 buckets gave each flow ~17.7%
+/// chance of sharing — a fairness leak even when MQFQ ordering was
+/// correct. At 4096 buckets the same flow count drops the per-flow
+/// probability to ~4.7%; at 64 flows it falls to ~1.5%. See #711 for
+/// the original sizing analysis.
+///
+/// (The probability of *at least one* collision anywhere in the queue
+/// — the canonical birthday-paradox metric — is much higher and stays
+/// near 100% at 200 flows even at 4096 buckets. That metric is
+/// fairness-irrelevant: a single colliding pair somewhere doesn't hurt
+/// the other 198 flows.)
+///
+/// Per-queue memory overhead at 4096 buckets:
+///   `flow_bucket_bytes: [u64; N]`    = 32 KB
+///   `flow_bucket_head_finish_bytes: [u64; N]` = 32 KB
+///   `flow_bucket_tail_finish_bytes: [u64; N]` = 32 KB
+///   `flow_bucket_items: [VecDeque; N]` = 128 KB inline headers
+///   `flow_rr_buckets: FlowRrRing` (`[u16; N] + head + len`) = 8 KB
+/// = ~232 KB per flow-fair queue (was ~58 KB at 1024). Non-flow-fair
+/// queues pay the same inline footprint but never touch the storage;
+/// it stays cold. At 8 workers × 8 queues × 2 ifaces ≈ 30 MB total,
+/// within the per-worker memory budget for production deployments.
+pub(in crate::afxdp) const COS_FLOW_FAIR_BUCKETS: usize = 4096;
 
 /// Pre-computed mask for `COS_FLOW_FAIR_BUCKETS`-modulo on the hot
 /// path. Using a mask (rather than `%`) gives deterministic codegen
