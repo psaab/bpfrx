@@ -1,7 +1,7 @@
 // Tests for afxdp/tx/cos_classify.rs — relocated from inline
-// `#[cfg(test)] mod tests` to keep mod.rs under the modularity-discipline
+// `#[cfg(test)] mod tests` to keep cos_classify.rs under the modularity-discipline
 // LOC threshold. Loaded as a sibling submodule via
-// `#[path = "tests.rs"]` from mod.rs.
+// `#[path = "cos_classify_tests.rs"]` from cos_classify.rs.
 
 use super::*;
 use crate::afxdp::tx::test_support::*;
