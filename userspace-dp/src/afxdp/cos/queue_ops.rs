@@ -4400,6 +4400,16 @@ mod tests {
     // ---------------------------------------------------------------------
     // #698 — per-worker exact-drain micro-bench
     //
+    // Home: this file (`cos/queue_ops.rs`) rather than
+    // `cos/queue_service.rs`. The benches DO call drain_exact_local_*
+    // / settle_exact_local_* (which live in `cos/queue_service.rs`),
+    // but the steady-state cost they measure is dominated by the
+    // queue-side machinery owned here: V-min publish/consume slot
+    // bookkeeping, MQFQ pop snapshot/rollback, queue-vtime updates.
+    // Colocated with the queue_ops V-min + MQFQ unit-test suite so a
+    // future microarch tweak to either subsystem can be validated
+    // against the perf signal in the same file.
+    //
     // Purpose: establish an in-tree, reproducible measurement of the
     // userspace drain-path cost per packet. The value of
     // `COS_SHARED_EXACT_MIN_RATE_BYTES` (2.5 Gbps) is cited in commit
