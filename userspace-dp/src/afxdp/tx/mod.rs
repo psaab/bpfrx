@@ -73,32 +73,6 @@ pub(in crate::afxdp) use cos_classify::cos_queue_dscp_rewrite;
 // Private import (NOT re-export — E0364 if pub(super) re-export of
 // pub(super) source): drain.rs reaches it via `use super::*;`.
 use cos_classify::enqueue_prepared_into_cos;
-// cfg-test imports for 2 helpers still pinned in tx/mod.rs::tests
-// (the other 3 cos_classify helper tests moved to
-// cos_classify.rs::tests in #984 P3 phase 2a).
-#[cfg(test)]
-use cos_classify::{
-    };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // #956: cos/ submodule imports.
 //
@@ -129,39 +103,5 @@ use super::cos::{
     resolve_local_routing_decision, LocalRoutingDecision, Step1Action,
 };
 #[cfg(test)]
-use super::cos::{
-    apply_cos_queue_flow_fair_promotion, COS_MIN_BURST_BYTES,
-    settle_exact_local_scratch_submission_flow_fair, };
-// #956 P1: TX-completion + timer-wheel items reached by
-// `mod tests { use super::*; }` at the bottom of this file.
-// (After the #984 P3 cross_binding test colocation, the
-// `redirect_local_cos_request_to_owner` and
-// `prepared_cos_request_stays_on_current_tx_binding` test pins
-// moved to `cos/cross_binding.rs::tests`.)
-#[cfg(test)]
-use super::cos::{
-    };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+use super::cos::COS_MIN_BURST_BYTES;
 
