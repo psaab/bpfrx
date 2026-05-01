@@ -2,7 +2,7 @@ use super::*;
 
 impl super::Coordinator {
     pub fn update_ha_state(&self, groups: &[HAGroupStatus]) -> Result<(), String> {
-        let previous = self.ha_state.load();
+        let previous = self.ha.rg_runtime.load();
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let mut state = BTreeMap::new();
         for group in groups {
@@ -36,7 +36,7 @@ impl super::Coordinator {
                 );
             }
         }
-        self.ha_state.store(Arc::new(state));
+        self.ha.rg_runtime.store(Arc::new(state));
         if !demoted_rgs.is_empty() {
             for handle in self.workers.values() {
                 let mut pending = handle.commands.lock().map_err(|_| {
@@ -119,7 +119,7 @@ impl super::Coordinator {
                 owner_rgs: activated_rgs.to_vec(),
             });
         }
-        let current = self.ha_state.load();
+        let current = self.ha.rg_runtime.load();
         let session_map_fd = self.bpf_maps.session_map_fd.as_ref().map(|fd| fd.fd).unwrap_or(-1);
 
         // RG activation is still allowed to be a narrow ownership transition,
@@ -209,7 +209,7 @@ impl super::Coordinator {
 
     pub fn ha_groups(&self) -> Vec<HAGroupStatus> {
         let now_secs = monotonic_nanos() / 1_000_000_000;
-        self.ha_state
+        self.ha.rg_runtime
             .load()
             .iter()
             .map(|(rg_id, runtime)| {
@@ -236,7 +236,7 @@ impl super::Coordinator {
 
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) {
         let now_secs = monotonic_nanos() / 1_000_000_000;
-        let ha_state = self.ha_state.load();
+        let ha_state = self.ha.rg_runtime.load();
         let previous_entry = self
             .shared_sessions
             .lock()
@@ -393,7 +393,7 @@ impl super::Coordinator {
             .lock()
             .map_err(|_| "shared sessions lock poisoned".to_string())?;
 
-        let ha_state = self.ha_state.load();
+        let ha_state = self.ha.rg_runtime.load();
         let mut deltas = Vec::new();
         for entry in sessions.values() {
             // Only forward (non-reverse), locally-originated sessions.
@@ -499,7 +499,7 @@ mod tests {
             .expect("update ha state");
 
         let after = monotonic_nanos() / 1_000_000_000;
-        let state = coordinator.ha_state.load();
+        let state = coordinator.ha.rg_runtime.load();
         let group = state.get(&1).expect("ha group");
         assert!(group.active);
         assert_eq!(group.watchdog_timestamp, 0);
@@ -513,7 +513,7 @@ mod tests {
     fn ha_groups_reports_forwarding_lease_status() {
         let coordinator = Coordinator::new();
         let now_secs = monotonic_nanos() / 1_000_000_000;
-        coordinator.ha_state.store(Arc::new(BTreeMap::from([
+        coordinator.ha.rg_runtime.store(Arc::new(BTreeMap::from([
             (1, active_ha_runtime(now_secs)),
             (2, inactive_ha_runtime(0)),
         ])));
