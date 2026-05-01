@@ -482,3 +482,53 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
     maybe_wake_tx(binding, true, now_ns);
     Ok((sent_packets, sent_bytes))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::afxdp::PROTO_TCP;
+
+    #[test]
+    fn remember_prepared_recycle_tracks_only_shared_fill_recycles() {
+        let mut in_flight_prepared_recycles = FastMap::default();
+
+        remember_prepared_recycle(
+            &mut in_flight_prepared_recycles,
+            &PreparedTxRequest {
+                offset: 41,
+                len: 64,
+                recycle: PreparedTxRecycle::FreeTxFrame,
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 0,
+                cos_queue_id: None,
+                dscp_rewrite: None,
+            },
+        );
+        remember_prepared_recycle(
+            &mut in_flight_prepared_recycles,
+            &PreparedTxRequest {
+                offset: 42,
+                len: 64,
+                recycle: PreparedTxRecycle::FillOnSlot(7),
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 0,
+                cos_queue_id: None,
+                dscp_rewrite: None,
+            },
+        );
+
+        assert_eq!(in_flight_prepared_recycles.len(), 1);
+        assert_eq!(
+            in_flight_prepared_recycles.get(&42),
+            Some(&PreparedTxRecycle::FillOnSlot(7))
+        );
+        assert!(!in_flight_prepared_recycles.contains_key(&41));
+    }
+
+}
