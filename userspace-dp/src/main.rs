@@ -19,7 +19,7 @@ mod xsk_ffi;
 
 mod protocol;
 mod server;
-use server::handle_stream;
+use server::{handle_stream, Args, PollMode, ServerState};
 
 use afxdp::SyncedSessionEntry;
 use chrono::Utc;
@@ -37,36 +37,6 @@ use std::time::{Duration, Instant};
 
 use state_writer::StateWriter;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PollMode {
-    BusyPoll,
-    Interrupt,
-}
-
-impl PollMode {
-    fn from_str(s: &str) -> Self {
-        match s {
-            "interrupt" => PollMode::Interrupt,
-            _ => PollMode::BusyPoll,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Args {
-    control_socket: String,
-    state_file: String,
-    workers: usize,
-    ring_entries: usize,
-    poll_mode: PollMode,
-}
-
-struct ServerState {
-    status: ProcessStatus,
-    snapshot: Option<ConfigSnapshot>,
-    afxdp: afxdp::Coordinator,
-    state_writer: Arc<StateWriter>,
-}
 
 fn main() {
     if let Err(err) = run() {
