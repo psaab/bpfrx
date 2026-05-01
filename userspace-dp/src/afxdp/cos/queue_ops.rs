@@ -4402,7 +4402,7 @@ mod tests {
     //
     // Purpose: establish an in-tree, reproducible measurement of the
     // userspace drain-path cost per packet. The value of
-    // `COS_SHARED_EXACT_COS_SHARED_EXACT_MIN_RATE_BYTES` (2.5 Gbps) is cited in commit
+    // `COS_SHARED_EXACT_MIN_RATE_BYTES` (2.5 Gbps) is cited in commit
     // history as "the single-worker sustained exact throughput ceiling";
     // before this harness existed there was no checked-in data supporting
     // that number.
