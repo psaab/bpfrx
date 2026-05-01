@@ -1,7 +1,9 @@
 use super::*;
 mod bpf_maps;
+mod cos_state;
 mod neighbor_manager;
 pub(crate) use bpf_maps::BpfMaps;
+pub(crate) use cos_state::CoSState;
 pub(crate) use neighbor_manager::NeighborManager;
 
 pub struct Coordinator {
@@ -13,19 +15,7 @@ pub struct Coordinator {
     pub(crate) ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     pub(crate) shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
     pub(crate) shared_forwarding: Arc<ArcSwap<ForwardingState>>,
-    pub(crate) shared_cos_owner_worker_by_queue: Arc<ArcSwap<BTreeMap<(i32, u8), u32>>>,
-    pub(crate) shared_cos_owner_live_by_queue:
-        Arc<ArcSwap<BTreeMap<(i32, u8), Arc<BindingLiveState>>>>,
-    pub(crate) shared_cos_root_leases: Arc<ArcSwap<BTreeMap<i32, Arc<SharedCoSRootLease>>>>,
-    pub(crate) shared_cos_queue_leases: Arc<ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>>>,
-    /// #917: per-shared_exact-queue V_min coordination Arcs.
-    /// Allocated once per shared_exact CoS queue (mirror of
-    /// `shared_cos_queue_leases`) and Arc-cloned to every
-    /// worker servicing the queue. Slot count = configured
-    /// num_workers; updated by the same reconcile pass that
-    /// rebuilds leases.
-    pub(crate) shared_cos_queue_vtime_floors:
-        Arc<ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueVtimeFloor>>>>,
+    pub(crate) cos: CoSState,
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
     pub(crate) neighbors: NeighborManager,
     pub(crate) shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -71,11 +61,7 @@ impl Coordinator {
             ha_state: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_fabrics: Arc::new(ArcSwap::from_pointee(Vec::new())),
             shared_forwarding: Arc::new(ArcSwap::from_pointee(ForwardingState::default())),
-            shared_cos_owner_worker_by_queue: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
-            shared_cos_owner_live_by_queue: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
-            shared_cos_root_leases: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
-            shared_cos_queue_leases: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
-            shared_cos_queue_vtime_floors: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
+            cos: CoSState::new(),
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
             neighbors: NeighborManager::new(),
             shared_sessions: Arc::new(Mutex::new(FastMap::default())),
@@ -271,14 +257,14 @@ impl Coordinator {
         // through many worker-id sets doesn't accumulate stale slots.
         self.worker_panics.clear();
         self.cos_owner_worker_by_queue.clear();
-        self.shared_cos_owner_worker_by_queue
+        self.cos.owner_worker_by_queue
             .store(Arc::new(BTreeMap::new()));
-        self.shared_cos_owner_live_by_queue
+        self.cos.owner_live_by_queue
             .store(Arc::new(BTreeMap::new()));
-        self.shared_cos_root_leases.store(Arc::new(BTreeMap::new()));
-        self.shared_cos_queue_leases
+        self.cos.root_leases.store(Arc::new(BTreeMap::new()));
+        self.cos.queue_leases
             .store(Arc::new(BTreeMap::new()));
-        self.shared_cos_queue_vtime_floors
+        self.cos.queue_vtime_floors
             .store(Arc::new(BTreeMap::new()));
         self.last_slow_path_status = self
             .slow_path
@@ -709,11 +695,11 @@ impl Coordinator {
             let rg_epochs = self.rg_epochs.clone();
             let event_stream_handle = self.event_stream_worker_handle();
             let cos_status_clone = cos_status.clone();
-            let shared_cos_owner_worker_by_queue = self.shared_cos_owner_worker_by_queue.clone();
-            let shared_cos_owner_live_by_queue = self.shared_cos_owner_live_by_queue.clone();
-            let shared_cos_root_leases = self.shared_cos_root_leases.clone();
-            let shared_cos_queue_leases = self.shared_cos_queue_leases.clone();
-            let shared_cos_queue_vtime_floors = self.shared_cos_queue_vtime_floors.clone();
+            let shared_cos_owner_worker_by_queue = self.cos.owner_worker_by_queue.clone();
+            let shared_cos_owner_live_by_queue = self.cos.owner_live_by_queue.clone();
+            let shared_cos_root_leases = self.cos.root_leases.clone();
+            let shared_cos_queue_leases = self.cos.queue_leases.clone();
+            let shared_cos_queue_vtime_floors = self.cos.queue_vtime_floors.clone();
             let runtime_atomics =
                 std::sync::Arc::new(super::worker_runtime::WorkerRuntimeAtomics::new());
             let runtime_atomics_clone = runtime_atomics.clone();
@@ -1141,20 +1127,20 @@ impl Coordinator {
         } else {
             &self.cos_owner_worker_by_queue
         };
-        let current_owner_live = self.shared_cos_owner_live_by_queue.load();
+        let current_owner_live = self.cos.owner_live_by_queue.load();
         let next_owner_live = build_cos_owner_live_by_queue(
             &self.forwarding,
             owner_map_for_runtime,
             &self.identities,
             &self.live,
         );
-        let current_leases = self.shared_cos_root_leases.load();
+        let current_leases = self.cos.root_leases.load();
         let next_leases = build_shared_cos_root_leases_reusing_existing(
             &self.forwarding,
             &active_shards_by_egress_ifindex,
             current_leases.as_ref(),
         );
-        let current_queue_leases = self.shared_cos_queue_leases.load();
+        let current_queue_leases = self.cos.queue_leases.load();
         let next_queue_leases = build_shared_cos_queue_leases_reusing_existing(
             &self.forwarding,
             &active_shards_by_egress_ifindex,
@@ -1165,7 +1151,7 @@ impl Coordinator {
         // before this reconcile fires; defaults to 0 at first
         // boot which produces zero-slot floors (the reconcile
         // re-fires once workers are planned).
-        let current_queue_vtime_floors = self.shared_cos_queue_vtime_floors.load();
+        let current_queue_vtime_floors = self.cos.queue_vtime_floors.load();
         let num_workers = self.last_planned_workers.max(1);
         let next_queue_vtime_floors = build_shared_cos_queue_vtime_floors_reusing_existing(
             &self.forwarding,
@@ -1174,25 +1160,25 @@ impl Coordinator {
         );
         if owner_changed {
             self.cos_owner_worker_by_queue = owner_map.clone();
-            self.shared_cos_owner_worker_by_queue
+            self.cos.owner_worker_by_queue
                 .store(Arc::new(owner_map));
         }
         if !shared_cos_owner_live_by_queue_match(current_owner_live.as_ref(), &next_owner_live) {
-            self.shared_cos_owner_live_by_queue
+            self.cos.owner_live_by_queue
                 .store(Arc::new(next_owner_live));
         }
         if !shared_cos_root_leases_match(current_leases.as_ref(), &next_leases) {
-            self.shared_cos_root_leases.store(Arc::new(next_leases));
+            self.cos.root_leases.store(Arc::new(next_leases));
         }
         if !shared_cos_queue_leases_match(current_queue_leases.as_ref(), &next_queue_leases) {
-            self.shared_cos_queue_leases
+            self.cos.queue_leases
                 .store(Arc::new(next_queue_leases));
         }
         if !shared_cos_queue_vtime_floors_match(
             current_queue_vtime_floors.as_ref(),
             &next_queue_vtime_floors,
         ) {
-            self.shared_cos_queue_vtime_floors
+            self.cos.queue_vtime_floors
                 .store(Arc::new(next_queue_vtime_floors));
         }
     }
@@ -2568,7 +2554,7 @@ mod tests {
             coordinator.cos_owner_worker_by_queue.get(&(80, 0)),
             Some(&2)
         );
-        let shared = coordinator.shared_cos_owner_worker_by_queue.load();
+        let shared = coordinator.cos.owner_worker_by_queue.load();
         assert_eq!(shared.get(&(80, 0)), Some(&2));
     }
 
@@ -2795,14 +2781,14 @@ mod tests {
         }];
 
         coordinator.refresh_cos_owner_worker_map_from_binding_statuses(&bindings);
-        let owners_before = coordinator.shared_cos_owner_worker_by_queue.load_full();
-        let leases_before = coordinator.shared_cos_root_leases.load_full();
+        let owners_before = coordinator.cos.owner_worker_by_queue.load_full();
+        let leases_before = coordinator.cos.root_leases.load_full();
         let lease_before = leases_before.get(&80).expect("shared root lease").clone();
         assert_eq!(lease_before.acquire(1, 2500), 2500);
 
         coordinator.refresh_cos_owner_worker_map_from_binding_statuses(&bindings);
-        let owners_after = coordinator.shared_cos_owner_worker_by_queue.load_full();
-        let leases_after = coordinator.shared_cos_root_leases.load_full();
+        let owners_after = coordinator.cos.owner_worker_by_queue.load_full();
+        let leases_after = coordinator.cos.root_leases.load_full();
 
         assert!(Arc::ptr_eq(&owners_before, &owners_after));
         assert!(Arc::ptr_eq(
