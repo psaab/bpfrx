@@ -1,3 +1,8 @@
+// Tests for afxdp/coordinator/mod.rs — relocated from inline
+// `#[cfg(test)] mod tests` to keep mod.rs under the modularity-discipline
+// LOC threshold. Loaded as a sibling submodule via
+// `#[path = "tests.rs"]` from coordinator/mod.rs.
+
 use super::*;
 use crate::test_zone_ids::*;
 use crate::{
