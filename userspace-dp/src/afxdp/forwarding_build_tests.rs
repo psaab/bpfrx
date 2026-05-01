@@ -1,7 +1,7 @@
 // Tests for afxdp/forwarding_build.rs — relocated from inline
 // `#[cfg(test)] mod tests` to keep forwarding_build.rs under the modularity-discipline
 // LOC threshold. Loaded as a sibling submodule via
-// `#[path = "tests.rs"]` from mod.rs.
+// `#[path = "forwarding_build_tests.rs"]` from forwarding_build.rs.
 
 use super::*;
 use crate::{
