@@ -193,10 +193,6 @@ pub(super) fn bucket_index_for_ns(ns: u64) -> usize {
     b.min(DRAIN_HIST_BUCKETS - 1)
 }
 
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;
-
 /// Raw ring state: (rxP, rxC, frP, frC, txP, txC, crP, crC)
 pub(in crate::afxdp) struct BindingLiveState {
     pub(super) bound: AtomicBool,
@@ -1083,3 +1079,7 @@ pub(super) fn update_binding_debug_state(binding: &mut BindingWorker) {
             .fetch_add(hard_cap_overrides_total, Ordering::Relaxed);
     }
 }
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
