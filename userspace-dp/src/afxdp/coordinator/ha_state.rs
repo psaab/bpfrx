@@ -8,10 +8,10 @@ use super::*;
 /// forwarding rebuild) and read by the worker hot path. Splitting them
 /// further would create artificial cross-struct coupling on the
 /// reconcile call sites.
-pub(crate) struct HaState {
-    pub(crate) rg_runtime: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
-    pub(crate) fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
-    pub(crate) forwarding: Arc<ArcSwap<ForwardingState>>,
+pub(in crate::afxdp) struct HaState {
+    pub(in crate::afxdp) rg_runtime: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
+    pub(in crate::afxdp) fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
+    pub(in crate::afxdp) forwarding: Arc<ArcSwap<ForwardingState>>,
 }
 
 impl HaState {

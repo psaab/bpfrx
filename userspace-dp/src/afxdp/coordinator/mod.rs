@@ -5,7 +5,7 @@ mod ha_state;
 mod neighbor_manager;
 pub(crate) use bpf_maps::BpfMaps;
 pub(crate) use cos_state::SharedCoSState;
-pub(crate) use ha_state::HaState;
+pub(in crate::afxdp) use ha_state::HaState;
 pub(crate) use neighbor_manager::NeighborManager;
 
 pub struct Coordinator {
@@ -14,7 +14,7 @@ pub struct Coordinator {
     pub(crate) local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
     pub(crate) tunnel_sources: BTreeMap<u16, LocalTunnelSourceHandle>,
     pub(crate) last_slow_path_status: SlowPathStatus,
-    pub(crate) ha: HaState,
+    pub(in crate::afxdp) ha: HaState,
     pub(crate) cos: SharedCoSState,
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
     pub(crate) neighbors: NeighborManager,
