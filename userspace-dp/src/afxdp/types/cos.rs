@@ -62,22 +62,26 @@ pub(in crate::afxdp) const COS_FAST_QUEUE_INDEX_MISS: u16 = u16::MAX;
 
 /// Number of SFQ flow buckets per flow-fair CoS queue.
 ///
-/// Sized to keep birthday-paradox collision probability well below 15%
-/// at the production-regime flow count (N ≤ 64 concurrent flows per
-/// queue). At 16 flows the collision rate is ~11% (was ~88% at the
-/// prior 64-bucket sizing); at 32 flows ~38%; at 64 flows ~87%.
-/// Collisions cost fairness — two flows in the same bucket share one
-/// SFQ dequeue slot and one admission-cap slice (#705) — so making
-/// them rare is directly fairness-load-bearing. See #711.
+/// GEMINI-NEXT.md Section 2 fairness: bumped 1024 → 4096. With 1024
+/// buckets the birthday-paradox collision rate at typical 100E100M
+/// (Elephant + Mouse) workloads with 200+ concurrent flows per queue
+/// approached 99% — flows hashed into the same bucket compete for one
+/// SFQ dequeue slot and one admission-cap slice (#705), which silently
+/// destroys fairness even when MQFQ ordering is correct. At 4096
+/// buckets the collision rate at 200 flows drops to ~5%; at 64 flows
+/// it's <1%. See #711 for the original sizing analysis.
 ///
-/// Per-queue memory overhead:
-///   `flow_bucket_bytes: [u64; N]`    =  8 KB
-///   `flow_bucket_items: [VecDeque; N]` = 24 KB inline headers
-///   `flow_rr_buckets: FlowRrRing` (`[u16; N] + head + len`) = 2 KB
-/// = ~34 KB per flow-fair queue. Non-flow-fair queues pay the same
-/// inline footprint but never touch the storage; it stays cold. At
-/// 4 workers × 8 queues × 1 iface = ~1 MB, well within tolerance.
-pub(in crate::afxdp) const COS_FLOW_FAIR_BUCKETS: usize = 1024;
+/// Per-queue memory overhead at 4096 buckets:
+///   `flow_bucket_bytes: [u64; N]`    = 32 KB
+///   `flow_bucket_head_finish_bytes: [u64; N]` = 32 KB
+///   `flow_bucket_tail_finish_bytes: [u64; N]` = 32 KB
+///   `flow_bucket_items: [VecDeque; N]` = 128 KB inline headers
+///   `flow_rr_buckets: FlowRrRing` (`[u16; N] + head + len`) = 8 KB
+/// = ~232 KB per flow-fair queue (was ~58 KB at 1024). Non-flow-fair
+/// queues pay the same inline footprint but never touch the storage;
+/// it stays cold. At 8 workers × 8 queues × 2 ifaces ≈ 30 MB total,
+/// within the per-worker memory budget for production deployments.
+pub(in crate::afxdp) const COS_FLOW_FAIR_BUCKETS: usize = 4096;
 
 /// Pre-computed mask for `COS_FLOW_FAIR_BUCKETS`-modulo on the hot
 /// path. Using a mask (rather than `%`) gives deterministic codegen
