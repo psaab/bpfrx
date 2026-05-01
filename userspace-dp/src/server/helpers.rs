@@ -2,9 +2,10 @@
 // 20 helper fns called by both main::run() and server::handlers::handle_stream.
 //
 // All widened from file-private `fn` to `pub(crate) fn` so main.rs can
-// reach them via `use server::helpers::*;` and handlers.rs continues to
-// reach them via `use super::super::*;` (which now resolves through the
-// `pub(crate) use helpers::*;` re-export in server/mod.rs).
+// reach them via `use server::helpers::*;` and handlers.rs (a sibling
+// of this module) reaches them via `use super::helpers::*` or via the
+// `use super::super::*` chain that climbs to the crate root and back
+// through main.rs's helpers re-import.
 //
 // Pure relocation. Bodies byte-for-byte identical.
 
