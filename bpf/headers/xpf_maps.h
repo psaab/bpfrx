@@ -351,7 +351,7 @@ struct {
  * forwarding on mlx5 SR-IOV VFs running kernel 7.0.0-rc7+. Observed
  * symptoms: ping RTT 0.4 ms → 300 ms with 33% loss, iperf3 sustained
  * 0 bps, and the Rust helper emitted `DBG SEG_MISS` for every
- * frame it handled. (The SEG_MISS log fires from frame_tx.rs on
+ * frame it handled. (The SEG_MISS log fires from tx/dispatch.rs on
  * frame-length criteria independent of bpf_redirect_map's result,
  * so it's a symptom that packets reached the helper in a state the
  * TX path couldn't service — not direct evidence about the redirect.)
