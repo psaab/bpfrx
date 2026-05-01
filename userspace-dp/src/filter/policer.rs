@@ -2,8 +2,6 @@
 // Pure relocation — bodies are byte-for-byte identical; only the
 // enclosing module and visibility paths change.
 
-use super::*;
-
 /// Token-bucket policer state.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]

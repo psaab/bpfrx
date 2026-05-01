@@ -4,6 +4,7 @@
 
 use super::*;
 
+/// Evaluate a named filter against a packet flow. First matching term wins.
 /// If no term matches, the implicit action is Accept.
 pub(crate) fn evaluate_filter(
     state: &FilterState,

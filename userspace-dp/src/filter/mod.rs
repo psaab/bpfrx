@@ -196,19 +196,12 @@ mod compiler;
 mod engine;
 mod policer;
 
-pub(crate) use compiler::parse_filter_state;
-pub(crate) use engine::{
-    evaluate_filter, evaluate_filter_counted, evaluate_filter_ref_tx_selection_cached,
-    evaluate_filter_ref_tx_selection_counted, evaluate_interface_filter,
-    evaluate_interface_filter_counted, evaluate_interface_filter_routing_instance_counted,
-    evaluate_interface_filter_tx_selection_counted, evaluate_interface_output_filter,
-    evaluate_interface_output_filter_counted,
-    evaluate_interface_output_filter_tx_selection_counted, evaluate_lo0_filter,
-    evaluate_lo0_filter_counted, filter_state_has_input_tx_selection,
-    filter_state_has_output_tx_selection, interface_filter_affects_route_lookup,
-    interface_filter_affects_tx_selection, interface_output_filter_needs_tx_eval,
-};
-pub(crate) use policer::PolicerState;
+// Glob re-exports surface the `pub(crate) fn`/`pub(crate) struct` items from
+// each submodule. Private helpers inside compiler/engine stay invisible
+// because the glob only re-exports `pub`-visible items.
+pub(crate) use compiler::*;
+pub(crate) use engine::*;
+pub(crate) use policer::*;
 /// Aggregate filter state: all compiled filters and policers.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FilterState {
@@ -298,8 +291,6 @@ impl Default for FilterResult {
         }
     }
 }
-
-/// Evaluate a named filter against a packet flow. First matching term wins.
 
 #[cfg(test)]
 #[path = "tests.rs"]
