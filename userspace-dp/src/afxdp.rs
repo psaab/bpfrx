@@ -96,7 +96,7 @@ mod test_fixtures;
 mod tunnel;
 #[path = "afxdp/tx/mod.rs"]
 mod tx;
-#[path = "afxdp/types.rs"]
+#[path = "afxdp/types/mod.rs"]
 mod types;
 #[path = "afxdp/umem/mod.rs"]
 mod umem;
