@@ -137,7 +137,7 @@ use super::cos::{
     build_cos_interface_runtime, cos_batch_tx_made_progress, cos_flow_hash_seed_from_os, redirect_local_cos_request_to_owner_binding,
     cos_guarantee_quantum_bytes, cos_queue_clear_orphan_snapshot_after_drop,
     cos_queue_pop_front, cos_queue_prospective_active_flows,
-    cos_queue_v_min_consume_suspension, cos_queue_v_min_continue, count_park_reason,
+    cos_queue_v_min_consume_suspension, cos_queue_v_min_continue,
     maybe_top_up_cos_queue_lease, CoSBatch, ExactCoSScratchBuild, COS_MIN_BURST_BYTES,
     drain_exact_local_fifo_items_to_scratch, drain_exact_local_items_to_scratch_flow_fair,
     drain_exact_prepared_fifo_items_to_scratch,
@@ -146,8 +146,7 @@ use super::cos::{
     select_cos_guarantee_batch, select_cos_guarantee_batch_with_fast_path,
     select_cos_surplus_batch, select_exact_cos_guarantee_queue_with_fast_path,
     select_nonexact_cos_guarantee_batch, settle_exact_local_fifo_submission,
-    settle_exact_local_scratch_submission_flow_fair, settle_exact_prepared_fifo_submission,
-    ParkReason, COS_ECN_MARK_THRESHOLD_DEN, COS_ECN_MARK_THRESHOLD_NUM,
+    settle_exact_local_scratch_submission_flow_fair, settle_exact_prepared_fifo_submission, COS_ECN_MARK_THRESHOLD_DEN, COS_ECN_MARK_THRESHOLD_NUM,
     COS_FLOW_FAIR_MIN_SHARE_BYTES, ECN_CE, ECN_ECT_0, ECN_ECT_1, ECN_MASK, ECN_NOT_ECT,
     V_MIN_CONSECUTIVE_SKIP_HARD_CAP, V_MIN_SUSPENSION_BATCHES,
 };
@@ -157,8 +156,7 @@ use super::cos::{
 // the cross_binding extraction in #956 Phase 8.
 #[cfg(test)]
 use super::cos::{
-    advance_cos_timer_wheel, cos_queue_push_front, maybe_top_up_cos_root_lease,
-    normalize_cos_queue_state, park_cos_queue,
+    advance_cos_timer_wheel, cos_queue_push_front, maybe_top_up_cos_root_lease, park_cos_queue,
     prepared_cos_request_stays_on_current_tx_binding, redirect_local_cos_request_to_owner,
     restore_cos_local_items_inner, restore_cos_prepared_items_inner,
     CoSServicePhase, COS_TIMER_WHEEL_TICK_NS,
@@ -7448,56 +7446,6 @@ mod tests {
         assert_eq!(root.runnable_queues, 1);
     }
 
-    #[test]
-    fn normalize_cos_queue_state_repairs_nonempty_unparked_queue_to_runnable() {
-        let mut queue = CoSQueueRuntime {
-            queue_id: 5,
-            priority: 5,
-            transmit_rate_bytes: 11_000_000_000 / 8,
-            exact: true,
-            flow_fair: false,
-            shared_exact: false,
-            flow_hash_seed: 0,
-            surplus_weight: 1,
-            surplus_deficit: 0,
-            buffer_bytes: COS_MIN_BURST_BYTES,
-            dscp_rewrite: None,
-            tokens: 0,
-            last_refill_ns: 0,
-            queued_bytes: 1500,
-            active_flow_buckets: 0,
-            active_flow_buckets_peak: 0,
-            flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            queue_vtime: 0,
-            pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
-            flow_rr_buckets: FlowRrRing::default(),
-            flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
-            runnable: false,
-            parked: false,
-            next_wakeup_tick: 0,
-            wheel_level: 0,
-            wheel_slot: 0,
-            items: VecDeque::from([test_cos_item(1500)]),
-            local_item_count: 0,
-
-            vtime_floor: None,
-
-            worker_id: 0,
-            drop_counters: CoSQueueDropCounters::default(),
-            owner_profile: CoSQueueOwnerProfile::new(),
-            consecutive_v_min_skips: 0,
-            v_min_suspended_remaining: 0,
-            v_min_hard_cap_overrides_scratch: 0,
-        };
-
-        normalize_cos_queue_state(&mut queue);
-
-        assert!(queue.runnable);
-        assert!(!queue.parked);
-        assert_eq!(queue.next_wakeup_tick, 0);
-    }
 
     #[test]
     fn restore_cos_local_items_marks_queue_runnable_after_retry() {
@@ -7713,42 +7661,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn count_park_reason_helper_advances_exact_counter() {
-        // Low-level test of the helper itself — paranoia pin against a
-        // refactor that accidentally writes to the wrong field.
-        let mut root = test_cos_runtime_with_exact(true);
-        let before = snapshot_counters(&root.queues[0]);
-
-        count_park_reason(&mut root, 0, ParkReason::RootTokenStarvation);
-        let mid = snapshot_counters(&root.queues[0]);
-        assert_eq!(
-            mid.root_token_starvation_parks,
-            before.root_token_starvation_parks + 1
-        );
-        assert_eq!(
-            mid.queue_token_starvation_parks,
-            before.queue_token_starvation_parks
-        );
-
-        count_park_reason(&mut root, 0, ParkReason::QueueTokenStarvation);
-        let after = snapshot_counters(&root.queues[0]);
-        assert_eq!(
-            after.queue_token_starvation_parks,
-            before.queue_token_starvation_parks + 1
-        );
-        assert_eq!(
-            after.root_token_starvation_parks,
-            mid.root_token_starvation_parks
-        );
-
-        // Out-of-range queue_idx is a no-op, not a panic.
-        count_park_reason(&mut root, 999, ParkReason::RootTokenStarvation);
-        assert_eq!(
-            snapshot_counters(&root.queues[0]).root_token_starvation_parks,
-            after.root_token_starvation_parks
-        );
-    }
 
     // ---------------------------------------------------------------------
     // #718 ECN CE-marking. The markers are the load-bearing helpers;
