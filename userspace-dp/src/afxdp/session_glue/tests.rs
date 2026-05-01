@@ -1,8 +1,9 @@
-// Tests for afxdp/session_glue.rs — relocated from inline
-// `#[cfg(test)] mod tests` to keep the implementation file under
-// the modularity-discipline LOC threshold (Issue 72 / #996).
-// Loaded as a sibling submodule via
-// `#[path = "session_glue_tests.rs"]` from session_glue.rs.
+// Tests for afxdp/session_glue/mod.rs — originally inline in
+// session_glue.rs, relocated to session_glue_tests.rs in #1077, then
+// folded with mod.rs into the afxdp/session_glue/ directory module
+// (#1078) to keep afxdp/'s flat namespace tidy.
+// Loaded as a sibling submodule via `#[path = "tests.rs"]` from
+// session_glue/mod.rs.
 
 use super::*;
 use crate::test_zone_ids::*;
