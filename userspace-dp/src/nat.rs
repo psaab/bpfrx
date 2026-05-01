@@ -554,4 +554,3 @@ impl DnatTable {
 #[cfg(test)]
 #[path = "nat_tests.rs"]
 mod tests;
-

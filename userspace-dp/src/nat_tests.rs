@@ -1,5 +1,5 @@
 // Tests for nat.rs — relocated from inline
-// `#[cfg(test)] mod tests` to keep mod.rs under the modularity-discipline
+// `#[cfg(test)] mod tests` to keep nat.rs under the modularity-discipline
 // LOC threshold. Loaded as a sibling submodule via
 // `#[path = "nat_tests.rs"]` from nat.rs.
 
