@@ -24,8 +24,6 @@ pub(in crate::afxdp) use stats::{record_kick_latency, record_tx_completions_with
 pub(super) mod rings;
 pub(in crate::afxdp) use rings::{maybe_wake_tx, reap_tx_completions};
 pub(super) use rings::{drain_pending_fill, maybe_wake_rx};
-#[cfg(test)]
-use rings::apply_prepared_recycle;
 
 // #984 P2c: TX-ring submit + per-frame recycle cluster (transmit_batch,
 // transmit_prepared_queue, recycle_*, TxError) extracted to sibling
@@ -1029,27 +1027,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn apply_prepared_recycle_routes_fill_and_free_explicitly() {
-        let mut free_tx_frames = VecDeque::new();
-        let mut shared_recycles = Vec::new();
-
-        apply_prepared_recycle(
-            &mut free_tx_frames,
-            &mut shared_recycles,
-            PreparedTxRecycle::FreeTxFrame,
-            41,
-        );
-        apply_prepared_recycle(
-            &mut free_tx_frames,
-            &mut shared_recycles,
-            PreparedTxRecycle::FillOnSlot(7),
-            42,
-        );
-
-        assert_eq!(free_tx_frames, VecDeque::from(vec![41]));
-        assert_eq!(shared_recycles, vec![(7, 42)]);
-    }
 
     #[test]
     fn remember_prepared_recycle_tracks_only_shared_fill_recycles() {

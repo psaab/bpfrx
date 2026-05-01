@@ -12,9 +12,10 @@
 //     RX_WAKE_* / TX_WAKE_* constants in afxdp.rs).
 //   - `recycle_completed_tx_offset` (file-private helper): per-offset
 //     cleanup invoked from inside `reap_tx_completions`.
-//   - `apply_prepared_recycle` (pub(super) for tx/mod.rs's cfg-test
-//     re-export): `recycle_completed_tx_offset`'s
-//     `PreparedTxRecycle` dispatcher.
+//   - `apply_prepared_recycle` (file-private):
+//     `recycle_completed_tx_offset`'s `PreparedTxRecycle`
+//     dispatcher. Now exercised by a colocated test in this
+//     module's `mod tests`.
 //
 // Single-writer (owner worker), all atomic ops `Ordering::Relaxed`.
 
@@ -195,7 +196,7 @@ pub(in crate::afxdp) fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, 
     binding.empty_rx_polls = 0;
 }
 
-pub(super) fn apply_prepared_recycle(
+fn apply_prepared_recycle(
     free_tx_frames: &mut VecDeque<u64>,
     shared_recycles: &mut Vec<(u32, u64)>,
     recycle: PreparedTxRecycle,
@@ -319,4 +320,32 @@ pub(in crate::afxdp) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, 
         }
         binding.last_tx_wake_ns = now_ns;
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_prepared_recycle_routes_fill_and_free_explicitly() {
+        let mut free_tx_frames = VecDeque::new();
+        let mut shared_recycles = Vec::new();
+
+        apply_prepared_recycle(
+            &mut free_tx_frames,
+            &mut shared_recycles,
+            PreparedTxRecycle::FreeTxFrame,
+            41,
+        );
+        apply_prepared_recycle(
+            &mut free_tx_frames,
+            &mut shared_recycles,
+            PreparedTxRecycle::FillOnSlot(7),
+            42,
+        );
+
+        assert_eq!(free_tx_frames, VecDeque::from(vec![41]));
+        assert_eq!(shared_recycles, vec![(7, 42)]);
+    }
+
 }
