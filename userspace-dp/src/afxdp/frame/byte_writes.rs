@@ -1,17 +1,10 @@
 // #963 PR-B: unconditional byte-write kernels for L3/L4 packet
 // mutation. Extracted from inline call sites in
 // `apply_rewrite_descriptor` (frame/mod.rs, both v4 and v6 arms)
-// and from `apply_nat_ipv4` + `apply_nat_port_rewrite` so a single
-// source of truth defines "byte 12-15 is the IPv4 source address"
-// etc.
-//
-// `apply_nat_ipv6` is intentionally NOT refactored: that path
-// works in `[u8; 16]` octets directly (not `Ipv6Addr`), and
-// threading the helper through there would require a round-trip
-// via `Ipv6Addr::from(octets).octets()` for cosmetic gain. The
-// PR-B scope is "extract kernels", not "unify every byte-write
-// site"; future PR can revisit `apply_nat_ipv6` if it ever needs
-// to switch to `Ipv6Addr` for other reasons.
+// and from `apply_nat_ipv4`, `apply_nat_ipv6`, `apply_nat_port_rewrite`,
+// `enforce_expected_ports`, and `enforce_expected_ports_at` so a
+// single source of truth defines "byte 12-15 is the IPv4 source
+// address" etc.
 //
 // Design discipline (Codex + Gemini design review, rev 4):
 //
