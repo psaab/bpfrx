@@ -1977,3 +1977,112 @@ fn tx_binding_resolution_uses_fabric_parent_ifindex() {
     let state = build_forwarding_state(&nat_snapshot_with_fabric());
     assert_eq!(resolve_tx_binding_ifindex(&state, 21), 21);
 }
+
+// #989 prerequisite (PR-A): pre-existing checksum-update bug in
+// clamp_tcp_mss caught by an independent ones-complement
+// recomputation. The bug was sign-flipped delta:
+//
+//   buggy: sum = ~old_csum + old_val + ~new_val; HC' = ~sum
+//          → HC' = old_csum + (new_val - old_val)
+//   right: sum = old_csum + old_val + ~new_val;  HC' = sum
+//          → HC' = old_csum + (old_val - new_val)
+//
+// The right form preserves the sum-over-all=0xFFFF invariant that
+// validates a TCP checksum on the wire. The bug never surfaced as
+// dropped packets because clamp_tcp_mss is dead_code'd in master
+// and only reachable via the GRE encap path.
+
+fn csum_tcp_v4_oracle(src: [u8; 4], dst: [u8; 4], tcp: &[u8]) -> u16 {
+    let tcp_len = tcp.len() as u16;
+    let mut sum: u32 = 0;
+    for chunk in src.chunks(2).chain(dst.chunks(2)) {
+        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    }
+    sum += u32::from(6u16);
+    sum += u32::from(tcp_len);
+    let mut i = 0;
+    while i + 1 < tcp.len() {
+        sum += u32::from(u16::from_be_bytes([tcp[i], tcp[i + 1]]));
+        i += 2;
+    }
+    if i < tcp.len() {
+        sum += u32::from(u16::from_be_bytes([tcp[i], 0]));
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    sum as u16
+}
+
+fn set_v4_tcp_checksum(tcp: &mut [u8], src: [u8; 4], dst: [u8; 4]) {
+    tcp[16..18].copy_from_slice(&[0, 0]);
+    let raw = csum_tcp_v4_oracle(src, dst, tcp);
+    tcp[16..18].copy_from_slice(&(!raw).to_be_bytes());
+}
+
+/// Build a 24-byte TCP segment (20-byte header + 4-byte MSS option)
+/// with `flags` set and MSS=`mss`. Returns (packet=ip+tcp, src, dst).
+fn build_v4_syn_with_mss(flags: u8, mss: u16) -> (Vec<u8>, [u8; 4], [u8; 4]) {
+    let src = [10, 0, 0, 1];
+    let dst = [10, 0, 0, 2];
+    // IPv4 header (20 bytes) + TCP header (24 bytes) = 44 total.
+    let mut ip = vec![0u8; 20];
+    ip[0] = 0x45; // version=4, IHL=5
+    ip[2..4].copy_from_slice(&44u16.to_be_bytes()); // total length
+    ip[8] = 64; // TTL
+    ip[9] = 6; // proto = TCP
+    ip[12..16].copy_from_slice(&src);
+    ip[16..20].copy_from_slice(&dst);
+
+    let mut tcp = vec![0u8; 24];
+    tcp[0..2].copy_from_slice(&12345u16.to_be_bytes());
+    tcp[2..4].copy_from_slice(&80u16.to_be_bytes());
+    tcp[4..8].copy_from_slice(&1u32.to_be_bytes()); // seq
+    tcp[12] = 6 << 4; // data_offset = 6 (24 bytes)
+    tcp[13] = flags;
+    tcp[14..16].copy_from_slice(&65535u16.to_be_bytes()); // window
+    // MSS option at TCP offset 20: kind=2, len=4, value=mss
+    tcp[20] = 2;
+    tcp[21] = 4;
+    tcp[22..24].copy_from_slice(&mss.to_be_bytes());
+
+    set_v4_tcp_checksum(&mut tcp, src, dst);
+
+    let mut packet = ip;
+    packet.extend_from_slice(&tcp);
+    (packet, src, dst)
+}
+
+#[test]
+fn clamp_tcp_mss_v4_preserves_checksum_invariant() {
+    let (mut packet, src, dst) = build_v4_syn_with_mss(0x02, 1460);
+    // Sanity: the unmodified packet validates.
+    {
+        let tcp = &packet[20..];
+        assert_eq!(
+            csum_tcp_v4_oracle(src, dst, tcp),
+            0xFFFF,
+            "test fixture must produce a valid initial checksum"
+        );
+    }
+
+    let clamped = super::clamp_tcp_mss(&mut packet, 1200);
+    assert!(clamped, "MSS 1460 > 1200 → must clamp");
+
+    // MSS bytes rewritten.
+    let tcp = &packet[20..];
+    assert_eq!(
+        u16::from_be_bytes([tcp[22], tcp[23]]),
+        1200,
+        "MSS option rewritten to clamp value"
+    );
+    // The post-clamp TCP checksum must still validate against an
+    // independent ones-complement recomputation. The pre-fix code
+    // would store an HC that gives sum-over=0xFDF7 (off by 520);
+    // this assertion fails on the buggy formula.
+    assert_eq!(
+        csum_tcp_v4_oracle(src, dst, tcp),
+        0xFFFF,
+        "clamp_tcp_mss must maintain the TCP checksum sum-over-all = 0xFFFF invariant"
+    );
+}
