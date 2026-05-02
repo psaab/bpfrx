@@ -509,13 +509,20 @@ fn from_forward_decision_round_trip() {
 }
 
 // ----------------------------------------------------------------
-// (h-family) #963 PR-A: from_forward_decision refuses descriptors
-// whose decision.nat carries IPs of a different family than
-// meta.addr_family. The fast-path apply (apply_rewrite_descriptor)
+// (h-family) #963 PR-A: from_forward_decision refuses to *cache*
+// descriptors whose decision.nat carries IPs of a different family
+// than meta.addr_family. The fast-path apply (apply_rewrite_descriptor)
 // would silently skip IP NAT in that case while still applying port
 // NAT and a port-only checksum delta — a forwarding-correctness bug.
-// Returning None here forces the flow through the generic path which
-// dispatches by family correctly.
+//
+// Note on scope: the generic path's NAT helpers (apply_nat_ipv4 /
+// apply_nat_ipv6) also gate IP NAT on family-match, so the first
+// packet still gets its IP NAT silently skipped on either path. What
+// PR-A buys is preventing the bug from *persisting* in the cache and
+// re-firing on every subsequent packet. Refusing to cache here
+// forces the flow back through policy on the next miss, giving the
+// upstream NAT pipeline another chance to produce a family-
+// consistent decision.
 // ----------------------------------------------------------------
 
 /// Build the standard test inputs for a NAT44-shaped FlowCacheEntry.

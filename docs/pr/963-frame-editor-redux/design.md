@@ -1,6 +1,6 @@
 # Design: PacketEditor / Frame Builder Refactor (#963 redux)
 
-**Status:** Revision 3 (after two rounds of Codex hostile + Gemini Pro adversarial review).
+**Status:** Revision 4 (after three rounds of Codex hostile + Gemini Pro adversarial review of the design, plus two rounds of code review on the PR-A implementation).
 **Scope cut:** Steps 2 and 3 (NAT64 / NPTv6 fast paths) dropped per
 both reviewers — speculative without perf evidence. Doc focuses
 on **PR-A** (release-strength family-consistency guard in
@@ -30,11 +30,11 @@ that reconstructs frames from scratch — `frame/mod.rs:121-163`,
 called from `tx/dispatch.rs:391-419` and `tx/dispatch.rs:551-573`)
 or through the generic in-place rewrite.
 
-### 2.1 `RewriteDescriptor` (`flow_cache.rs:34-57`)
+### 2.1 `RewriteDescriptor` (in `flow_cache.rs`)
 
 Per-flow precomputed rewrite plan. Cached on first session miss for
 TCP/UDP NAT44 / NAT66 / non-NAT flows; explicitly *not* cached for
-NAT64 (`flow_cache.rs:130-158` `should_cache` rejects them).
+NAT64 (`should_cache` (in `flow_cache.rs`, `impl FlowCacheEntry`) rejects them).
 
 ```rust
 pub(super) struct RewriteDescriptor {
@@ -195,14 +195,14 @@ Gemini flagged the case where `RewriteDescriptor` is constructed with
 **Reachability — current code:**
 
 - `RewriteDescriptor` has exactly one production construction site:
-  `flow_cache.rs:171-200` (`FlowCacheEntry::from_forward_decision`). Test
+  `FlowCacheEntry::from_forward_decision` in `flow_cache.rs` (the descriptor literal at lines ~211-242 of HEAD). Test
   construction sites are at `flow_cache_tests.rs:25`,
   `session_glue/tests.rs:1787,1866`, `frame/tests.rs:3819,4366`.
-- At `flow_cache.rs:177-181`, `ether_type` is derived from
+- In `from_forward_decision`, `ether_type` is derived from
   `meta.addr_family`, so the eth side is always self-consistent.
 - `rewrite_src_ip` / `rewrite_dst_ip` come straight from
   `decision.nat`, with no family check at construction
-  (`flow_cache.rs:182-185`).
+  (in the same descriptor literal).
 - The upstream proof — that `decision.nat.rewrite_src` is typed by
   the same family as `meta.addr_family` — is *not visible at the
   cited construction site*. It depends on the NAT pipeline always
@@ -215,7 +215,7 @@ this" without a cited proof.
 
 **Proposal — release-strength guard, not just debug_assert:**
 
-Make `FlowCacheEntry::from_forward_decision` (`flow_cache.rs:155-225`) — the sole
+Make `FlowCacheEntry::from_forward_decision` (in `flow_cache.rs`) — the sole
 production construction site that builds a `RewriteDescriptor` —
 return `None` when the families of `decision.nat.rewrite_src` /
 `decision.nat.rewrite_dst` (when `Some`) don't match
@@ -253,7 +253,7 @@ fast path; rare traffic share).
 
 ### 5.1 PR-A — release-strength family-consistency guard
 
-Modify `FlowCacheEntry::from_forward_decision` (`flow_cache.rs:155-225`, the
+Modify `FlowCacheEntry::from_forward_decision` in `flow_cache.rs` (the
 production construction site) to validate that `ether_type` and the
 families of `rewrite_src_ip` / `rewrite_dst_ip` are consistent
 *before* the entry is returned:

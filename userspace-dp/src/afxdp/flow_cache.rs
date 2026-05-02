@@ -187,7 +187,7 @@ impl FlowCacheEntry {
         if !Self::should_cache(meta, decision) {
             return None;
         }
-        // #963 PR-A: refuse to build a fast-path descriptor whose
+        // #963 PR-A: refuse to *cache* a fast-path descriptor whose
         // ether_type (derived from `meta.addr_family` below) is
         // inconsistent with the address family of `decision.nat`'s
         // rewrite IPs. `apply_rewrite_descriptor`'s v4 arm only
@@ -195,17 +195,29 @@ impl FlowCacheEntry {
         // mismatched descriptor would silently skip IP NAT while
         // still applying port NAT and a port-only checksum delta —
         // a forwarding-correctness bug, not a memory or checksum
-        // bug, but still a bug. Falling through to the generic
-        // path (`rewrite_forwarded_frame_in_place`) handles each
-        // family correctly via separate `rewrite_apply_v4` /
-        // `rewrite_apply_v6` dispatch.
+        // bug, but still a bug.
+        //
+        // Scope of this guard: it prevents the *fast path from
+        // persisting* a mismatched descriptor in the flow cache.
+        // The generic in-place rewrite path
+        // (`rewrite_forwarded_frame_in_place`) and its NAT helpers
+        // (`apply_nat_ipv4` / `apply_nat_ipv6`) also gate IP NAT
+        // on family-match, so the first packet that triggers the
+        // bug still has its IP NAT silently skipped on either
+        // path. What PR-A buys is that the bug stays
+        // first-packet-only — without this guard, every subsequent
+        // packet on the same flow would re-hit the bad cached
+        // descriptor and re-skip IP NAT. The flow falls through
+        // uncached, gets re-evaluated from policy on each miss,
+        // and the upstream NAT pipeline (which should produce a
+        // family-consistent decision) gets another chance.
         //
         // The upstream invariant is that NAT rules are typed by
         // family in the policy compiler, so this guard should not
         // fire in practice. We don't rely on the upstream proof:
-        // a release-strength check converts a silent NAT skip into
-        // graceful (uncached) degradation. Cost is two enum-
-        // discriminant compares per cache miss, not per packet.
+        // a release-strength check converts unbounded persistent
+        // skip into bounded first-packet-only skip. Cost is two
+        // enum-discriminant compares per cache miss, not per packet.
         if !nat_family_matches_addr_family(meta.addr_family as i32, &decision.nat) {
             debug_assert!(
                 false,
