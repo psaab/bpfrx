@@ -1855,8 +1855,12 @@ fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 /// Used for control-plane helper threads that don't have per-worker
 /// `runtime_atomics` (e.g. `neigh-monitor`, `xpf-native-gre-origin-*`).
 /// Worker threads use `spawn_supervised_worker` which records the
-/// panic in the per-worker dead flag for gRPC observability; aux
-/// threads have no equivalent surface and rely on journald logs.
+/// panic in the per-worker `dead` flag exposed through
+/// `crate::protocol::WorkerRuntimeStatus` on the userspace
+/// control-socket JSON status path (NOT gRPC — the dataplane status
+/// is JSON-over-Unix-socket, only the daemon's outward-facing API
+/// is gRPC). Aux threads have no equivalent status surface and rely
+/// on journald log scraping.
 ///
 /// Operator-visible degradation when an aux thread dies (#925-A):
 /// - `neigh-monitor` death: dynamic neighbor cache stops updating;
