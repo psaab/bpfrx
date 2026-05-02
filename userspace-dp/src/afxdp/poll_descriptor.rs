@@ -38,7 +38,7 @@ pub(super) fn poll_binding_process_descriptor(
         binding.scratch_forwards.clear();
         binding.scratch_rst_teardowns.clear();
         while let Some(desc) = received.read() {
-            record_rx_batch_telemetry(desc, area, telemetry, worker_ctx);
+            record_rx_descriptor_telemetry(desc, area, telemetry, worker_ctx);
             let mut recycle_now = true;
             if let Some(meta) = try_parse_metadata(unsafe { &*area }, desc) {
                 telemetry.counters.metadata_packets += 1;
@@ -2227,29 +2227,35 @@ pub(super) fn poll_binding_process_descriptor(
 // #1128: per-descriptor RX-side bookkeeping lifted out of the inner
 // loop in `poll_binding_process_descriptor`.
 //
-// The work here is:
-//   - prefetch the metadata header (96 bytes, two cache lines) and
-//     the first 64 bytes of frame data into L1 (#909);
-//   - bump the per-binding counters that drive `show interfaces`
-//     and the live status RPCs;
-//   - emit `debug-log`-gated breadcrumbs for oversized RX, RX-side
-//     TCP flag census (FIN / SYN+ACK / zero-window / RST), poison-
-//     descriptor detection, and a per-binding first-10 frame dump.
+// The work here, in order, is:
+//   1. prefetch the metadata header (96 bytes, two cache lines) and
+//      the first 64 bytes of frame data into L1 (#909);
+//   2. bump the unconditional per-binding counters that drive
+//      `show interfaces` and the live status RPCs:
+//      `telemetry.counters.{touched, rx_packets, rx_bytes}` and
+//      `telemetry.dbg.{rx, rx_bytes_total, rx_max_frame}`;
+//   3. for desc.len > 1514, bump `telemetry.dbg.rx_oversized` and
+//      (only under `cfg!(feature = "debug-log")`) eprint up to 20
+//      oversized-frame breadcrumbs;
+//   4. under `cfg!(feature = "debug-log")` only: RX-side TCP flag
+//      census (FIN / SYN+ACK / zero-window / RST), poison-
+//      descriptor detection, and a per-binding first-10 frame dump.
 //
-// In release builds without `--features debug-log` the `cfg!(...)`
-// branches collapse to false and LLVM eliminates the entire
-// debug-only body, leaving just the prefetches and the four counter
-// bumps — small enough that LLVM will inline a single call site
-// regardless of any annotation. `#[inline]` (not `#[inline(always)]`)
-// is deliberate: with `--features debug-log` the body is ~200 LOC,
-// and forcing inline of that into the hot loop would bloat L1-i in
+// In release builds without `--features debug-log` every
+// `cfg!(...)` branch in steps 3 and 4 collapses to false and LLVM
+// eliminates the debug-only body, leaving just the prefetches plus
+// the unconditional counter increments in step 2. That residue is
+// small enough that LLVM will inline a single call site regardless
+// of any annotation. `#[inline]` (not `#[inline(always)]`) is
+// deliberate: with `--features debug-log` the body is ~200 LOC, and
+// forcing inline of that into the hot loop would bloat L1-i in
 // debug builds for no production gain. `#[inline]` lets the
 // compiler honor the body-size heuristic, which inlines tight
 // production builds and correctly declines on the bulky debug
 // path. The goal is *source-level* separation of housekeeping
 // noise from forwarding logic, per the modularity discipline in #1128.
 #[inline]
-pub(super) fn record_rx_batch_telemetry(
+fn record_rx_descriptor_telemetry(
     desc: XdpDesc,
     area: *const MmapArea,
     telemetry: &mut TelemetryContext,
