@@ -22,8 +22,22 @@ const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
 
 impl MmapArea {
     pub(in crate::afxdp) fn new(len: usize) -> io::Result<Self> {
-        // Round up to 2 MB boundary for hugepage eligibility.
-        let aligned_len = (len + HUGE_PAGE_SIZE - 1) & !(HUGE_PAGE_SIZE - 1);
+        // #1020: harden two corner cases that the syscall would otherwise
+        // surface as a less-direct EINVAL or — worse — silently under-
+        // allocate by wrapping past usize::MAX during alignment rounding.
+        if len == 0 {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        // Round up to 2 MB boundary for hugepage eligibility, with a
+        // checked add so a `len` near usize::MAX produces a clean error
+        // instead of a wrapped (smaller) `aligned_len` that would
+        // succeed mmap but under-allocate the UMEM.
+        let aligned_len = len
+            .checked_add(HUGE_PAGE_SIZE - 1)
+            .ok_or_else(|| {
+                io::Error::other("umem len would overflow on hugepage alignment")
+            })?
+            & !(HUGE_PAGE_SIZE - 1);
 
         // Attempt 1: explicit 2 MB hugepages (requires system reservation).
         let ptr = unsafe {
@@ -147,3 +161,8 @@ impl Drop for MmapArea {
         let _ = unsafe { libc::munmap(self.ptr.as_ptr().cast::<c_void>(), self.mapped_len) };
     }
 }
+
+
+#[cfg(test)]
+#[path = "mmap_tests.rs"]
+mod harden_tests;
