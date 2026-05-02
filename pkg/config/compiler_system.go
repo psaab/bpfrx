@@ -1,6 +1,9 @@
 package config
 
-import "strconv"
+import (
+	"fmt"
+	"strconv"
+)
 
 func compileSystem(node *Node, sys *SystemConfig) error {
 	for _, child := range node.Children {
@@ -427,6 +430,16 @@ func compileDPDKDataplane(node *Node, cfg *DPDKConfig) error {
 func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
 	for _, child := range node.Children {
 		switch child.Name() {
+		case "userspace":
+			// #903: `set system dataplane userspace ...` is a no-op path
+			// that the operator can write but xpfd never reads (we are
+			// already inside compileUserspaceDataplane, dispatched from
+			// `case "dataplane"` based on dataplane-type=userspace).
+			// Reject explicitly so the operator gets immediate feedback
+			// instead of silent acceptance + zero effect at runtime.
+			return fmt.Errorf("`system dataplane userspace ...` is not a valid path; " +
+				"set knobs directly under `system dataplane` " +
+				"(e.g. `set system dataplane workers N`)")
 		case "binary":
 			cfg.Binary = nodeVal(child)
 		case "control-socket":

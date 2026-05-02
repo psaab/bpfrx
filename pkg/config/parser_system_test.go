@@ -1300,3 +1300,54 @@ func TestArchivalConfigSetSyntax(t *testing.T) {
 		t.Errorf("archive-sites = %v", arch.ArchiveSites)
 	}
 }
+
+// #903: `set system dataplane userspace workers N` must be rejected at
+// compile time so the operator gets immediate feedback that the path is
+// a no-op (the canonical path is `set system dataplane workers N`,
+// dispatched via dataplane-type=userspace).
+func TestDataplaneUserspaceNestedPathRejected(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set system dataplane-type userspace",
+		"set system dataplane userspace workers 4",
+	}
+	for _, cmd := range setCommands {
+		fields := strings.Fields(cmd)
+		if err := tree.SetPath(fields[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected CompileConfig to reject `dataplane userspace workers`, got nil")
+	}
+	if !strings.Contains(err.Error(), "dataplane userspace") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// Counter-test: the canonical path `set system dataplane workers N` must
+// keep working.
+func TestDataplaneWorkersCanonicalPathParses(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set system dataplane-type userspace",
+		"set system dataplane workers 7",
+	}
+	for _, cmd := range setCommands {
+		fields := strings.Fields(cmd)
+		if err := tree.SetPath(fields[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	if cfg.System.UserspaceDataplane == nil {
+		t.Fatal("expected UserspaceDataplane to be populated")
+	}
+	if cfg.System.UserspaceDataplane.Workers != 7 {
+		t.Errorf("Workers: got %d, want 7", cfg.System.UserspaceDataplane.Workers)
+	}
+}
