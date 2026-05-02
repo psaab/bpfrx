@@ -363,9 +363,10 @@ type xpfXdpNat64PktMeta struct {
 	EgressVlanId       uint16
 	Direction          uint8
 	IsFragment         uint8
+	IsFirstFragment    uint8
 	CtState            uint8
 	CtDirection        uint8
-	_                  [2]byte
+	_                  [1]byte
 	PolicyId           uint32
 	NatSrcIp           struct {
 		_  structs.HostLayout

@@ -264,9 +264,14 @@ parse_iphdr(void *data, void *data_end, struct pkt_meta *meta)
 	meta->pkt_len   = bpf_ntohs(iph->tot_len);
 	meta->addr_family = AF_INET;
 
-	/* Fragmentation check */
+	/* Fragmentation check (#866).
+	 * 0x2000 = More Fragments (MF) bit, 0x1FFF = fragment offset.
+	 *   is_fragment       = MF || offset != 0   (any frag piece)
+	 *   is_first_fragment = MF && offset == 0   (frag piece WITH L4 hdr)
+	 * Subsequent fragments have is_fragment=1, is_first_fragment=0. */
 	__u16 frag_off = bpf_ntohs(iph->frag_off);
 	meta->is_fragment = (frag_off & 0x2000) || (frag_off & 0x1FFF);
+	meta->is_first_fragment = (frag_off & 0x2000) && !(frag_off & 0x1FFF);
 
 	return 0;
 }
@@ -298,6 +303,7 @@ parse_ipv6hdr(void *data, void *data_end, struct pkt_meta *meta)
 	meta->pkt_len     = (__u32)bpf_ntohs(ip6h->payload_len) + 40;
 	meta->addr_family = AF_INET6;
 	meta->is_fragment = 0;
+	meta->is_first_fragment = 0;
 
 	/* Walk extension header chain to find the upper-layer protocol */
 	__u8 nexthdr = ip6h->nexthdr;
@@ -330,10 +336,15 @@ parse_ipv6hdr(void *data, void *data_end, struct pkt_meta *meta)
 				return -1;
 			nexthdr = frag->nexthdr;
 			offset += sizeof(struct frag_hdr);
-			/* Check MF bit or fragment offset */
+			/* IPv6 frag header (#866).
+			 * 0x1 = MF bit (lowest), 0xFFF8 = offset (top 13 bits).
+			 *   is_fragment       = MF || offset != 0
+			 *   is_first_fragment = MF && offset == 0  (carries L4 hdr) */
 			__u16 frag_off = bpf_ntohs(frag->frag_off);
 			if ((frag_off & 0x1) || (frag_off & 0xFFF8))
 				meta->is_fragment = 1;
+			if ((frag_off & 0x1) && !(frag_off & 0xFFF8))
+				meta->is_first_fragment = 1;
 			break;
 		}
 		case NEXTHDR_NONE:
@@ -481,6 +492,9 @@ parse_ipv4_l4_fast(void *data, void *data_end, struct pkt_meta *meta)
 
 	__u16 frag_off = bpf_ntohs(iph->frag_off);
 	meta->is_fragment = (frag_off & 0x2000) || (frag_off & 0x1FFF);
+	meta->is_first_fragment = (frag_off & 0x2000) && !(frag_off & 0x1FFF);
+	/* Fast path bails on any fragment; first-fragment L4 parse is
+	 * handled by the slow-path parse_l4hdr (see xdp_main.c gate). */
 	if (meta->is_fragment)
 		return 0;
 
