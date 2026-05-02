@@ -161,10 +161,13 @@ impl ForwardingDisposition {
     ///   - `ForwardCandidate`: Normal forwarded traffic with a resolved
     ///     neighbor and egress interface. The common fast path.
     ///   - `FabricRedirect`: Targets a fabric overlay binding. Cacheable
-    ///     because the per-flow `flow_owner_rg_id` + `rg_epochs` invalidation
-    ///     in `flow_cache::should_invalidate_for_rg_change` flushes the
-    ///     entry when the owning RG flips on failover/failback, so the
-    ///     window in which a cached `FabricRedirect` could point at a stale
+    ///     because each cache entry captures the owning RG epoch into
+    ///     `FlowCacheStamp::owner_rg_epoch` at insert time
+    ///     (`flow_cache.rs:60-83`), and `FlowCache::lookup`
+    ///     (`flow_cache.rs:314-347`) treats the entry as a miss when
+    ///     `current_epoch != entry.stamp.owner_rg_epoch`. The owning RG
+    ///     bumps its epoch on every active/standby flip, so the window
+    ///     in which a cached `FabricRedirect` could point at a stale
     ///     fabric peer is bounded by the next RG epoch bump (#1065).
     ///
     /// Not cacheable:
