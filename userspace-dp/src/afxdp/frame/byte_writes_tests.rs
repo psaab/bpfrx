@@ -62,6 +62,9 @@ fn write_l4_src_port_writes_be_at_l4() {
     let l4 = 34; // typical TCP-after-IPv4 offset
     write_l4_src_port(&mut packet, l4, 0x1234);
     assert_eq!(&packet[l4..l4 + 2], &[0x12, 0x34]);
+    // Surrounding bytes untouched (matches the IPv4/IPv6 test discipline).
+    assert_eq!(&packet[..l4], &[0u8; 34]);
+    assert_eq!(&packet[l4 + 2..], &[0u8; 28]);
 }
 
 #[test]
@@ -70,6 +73,9 @@ fn write_l4_dst_port_writes_be_at_l4_plus_2() {
     let l4 = 34;
     write_l4_dst_port(&mut packet, l4, 0xabcd);
     assert_eq!(&packet[l4 + 2..l4 + 4], &[0xab, 0xcd]);
+    // Bytes before l4+2 (including src-port slot) and after l4+4 untouched.
+    assert_eq!(&packet[..l4 + 2], &[0u8; 36]);
+    assert_eq!(&packet[l4 + 4..], &[0u8; 26]);
 }
 
 #[test]

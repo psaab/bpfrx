@@ -1114,12 +1114,16 @@ pub(super) fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) 
     if packet.len() < 40 {
         return None;
     }
+    // #963 PR-B: keep `Ipv6Addr` here so the byte-write helpers fold
+    // cleanly. `Ipv6Addr` is `repr(transparent)` over `[u8; 16]`, so
+    // `addr.octets()` is a zero-cost conversion at the checksum
+    // call sites that need raw bytes.
     let new_src = nat.rewrite_src.and_then(|ip| match ip {
-        IpAddr::V6(ip) => Some(ip.octets()),
+        IpAddr::V6(ip) => Some(ip),
         _ => None,
     });
     let new_dst = nat.rewrite_dst.and_then(|ip| match ip {
-        IpAddr::V6(ip) => Some(ip.octets()),
+        IpAddr::V6(ip) => Some(ip),
         _ => None,
     });
 
@@ -1130,29 +1134,33 @@ pub(super) fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) 
     if new_src.is_some() && new_dst.is_none() {
         let new_src = new_src?;
         let old_src: [u8; 16] = packet.get(8..24)?.try_into().ok()?;
-        packet.get_mut(8..24)?.copy_from_slice(&new_src);
+        write_ipv6_src(packet, 0, new_src);
         if !skip_l4_csum {
-            adjust_l4_checksum_ipv6_addr_bytes(packet, protocol, &old_src, &new_src)?;
+            adjust_l4_checksum_ipv6_addr_bytes(packet, protocol, &old_src, &new_src.octets())?;
         }
     } else if new_dst.is_some() && new_src.is_none() {
         let new_dst = new_dst?;
         let old_dst: [u8; 16] = packet.get(24..40)?.try_into().ok()?;
-        packet.get_mut(24..40)?.copy_from_slice(&new_dst);
+        write_ipv6_dst(packet, 0, new_dst);
         if !skip_l4_csum {
-            adjust_l4_checksum_ipv6_addr_bytes(packet, protocol, &old_dst, &new_dst)?;
+            adjust_l4_checksum_ipv6_addr_bytes(packet, protocol, &old_dst, &new_dst.octets())?;
         }
     } else if new_src.is_some() || new_dst.is_some() {
         let old_src_words = ipv6_words_from_slice(packet.get(8..24)?)?;
         let old_dst_words = ipv6_words_from_slice(packet.get(24..40)?)?;
         if let Some(ip) = new_src {
-            packet.get_mut(8..24)?.copy_from_slice(&ip);
+            write_ipv6_src(packet, 0, ip);
         }
         if let Some(ip) = new_dst {
-            packet.get_mut(24..40)?.copy_from_slice(&ip);
+            write_ipv6_dst(packet, 0, ip);
         }
         if !skip_l4_csum {
-            let new_src_words = new_src.map(ipv6_words_from_octets).unwrap_or(old_src_words);
-            let new_dst_words = new_dst.map(ipv6_words_from_octets).unwrap_or(old_dst_words);
+            let new_src_words = new_src
+                .map(|a| ipv6_words_from_octets(a.octets()))
+                .unwrap_or(old_src_words);
+            let new_dst_words = new_dst
+                .map(|a| ipv6_words_from_octets(a.octets()))
+                .unwrap_or(old_dst_words);
             match protocol {
                 PROTO_TCP | PROTO_UDP | PROTO_ICMPV6 => {
                     adjust_l4_checksum_ipv6_words(
@@ -1275,16 +1283,16 @@ pub(super) fn enforce_expected_ports(
     }
     let packet = frame.get_mut(l3..)?;
     let rel_l4 = l4.checked_sub(l3)?;
+    // #963 PR-B: byte-write helpers replace the inline copy_from_slice.
+    // The earlier `frame.get(l4..l4 + 4)?` upstream guarantees
+    // `packet.len() >= rel_l4 + 4`, so the helper's internal length
+    // guard is redundant-but-correct.
     if current_src != expected_src {
-        packet
-            .get_mut(rel_l4..rel_l4 + 2)?
-            .copy_from_slice(&expected_src.to_be_bytes());
+        write_l4_src_port(packet, rel_l4, expected_src);
         adjust_l4_checksum_port(packet, rel_l4, protocol, current_src, expected_src)?;
     }
     if current_dst != expected_dst {
-        packet
-            .get_mut(rel_l4 + 2..rel_l4 + 4)?
-            .copy_from_slice(&expected_dst.to_be_bytes());
+        write_l4_dst_port(packet, rel_l4, expected_dst);
         adjust_l4_checksum_port(packet, rel_l4, protocol, current_dst, expected_dst)?;
     }
     Some(true)
@@ -1315,16 +1323,16 @@ pub(super) fn enforce_expected_ports_at(
     }
     let packet = frame.get_mut(l3..)?;
     let rel_l4 = l4.checked_sub(l3)?;
+    // #963 PR-B: byte-write helpers replace the inline copy_from_slice.
+    // The earlier `frame.get(l4..l4 + 4)?` upstream guarantees
+    // `packet.len() >= rel_l4 + 4`, so the helper's internal length
+    // guard is redundant-but-correct.
     if current_src != expected_src {
-        packet
-            .get_mut(rel_l4..rel_l4 + 2)?
-            .copy_from_slice(&expected_src.to_be_bytes());
+        write_l4_src_port(packet, rel_l4, expected_src);
         adjust_l4_checksum_port(packet, rel_l4, protocol, current_src, expected_src)?;
     }
     if current_dst != expected_dst {
-        packet
-            .get_mut(rel_l4 + 2..rel_l4 + 4)?
-            .copy_from_slice(&expected_dst.to_be_bytes());
+        write_l4_dst_port(packet, rel_l4, expected_dst);
         adjust_l4_checksum_port(packet, rel_l4, protocol, current_dst, expected_dst)?;
     }
     Some(true)

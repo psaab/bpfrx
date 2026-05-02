@@ -44,22 +44,22 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[inline(always)]
-pub(in crate::afxdp) fn write_ipv4_src(packet: &mut [u8], ip: usize, addr: Ipv4Addr) {
+pub(super) fn write_ipv4_src(packet: &mut [u8], ip: usize, addr: Ipv4Addr) {
     packet[ip + 12..ip + 16].copy_from_slice(&addr.octets());
 }
 
 #[inline(always)]
-pub(in crate::afxdp) fn write_ipv4_dst(packet: &mut [u8], ip: usize, addr: Ipv4Addr) {
+pub(super) fn write_ipv4_dst(packet: &mut [u8], ip: usize, addr: Ipv4Addr) {
     packet[ip + 16..ip + 20].copy_from_slice(&addr.octets());
 }
 
 #[inline(always)]
-pub(in crate::afxdp) fn write_ipv6_src(packet: &mut [u8], ip: usize, addr: Ipv6Addr) {
+pub(super) fn write_ipv6_src(packet: &mut [u8], ip: usize, addr: Ipv6Addr) {
     packet[ip + 8..ip + 24].copy_from_slice(&addr.octets());
 }
 
 #[inline(always)]
-pub(in crate::afxdp) fn write_ipv6_dst(packet: &mut [u8], ip: usize, addr: Ipv6Addr) {
+pub(super) fn write_ipv6_dst(packet: &mut [u8], ip: usize, addr: Ipv6Addr) {
     packet[ip + 24..ip + 40].copy_from_slice(&addr.octets());
 }
 
@@ -68,7 +68,7 @@ pub(in crate::afxdp) fn write_ipv6_dst(packet: &mut [u8], ip: usize, addr: Ipv6A
 /// truncated frame at the L4 boundary skips the write rather than
 /// panicking. Mirrors the inline pattern at the previous call sites.
 #[inline(always)]
-pub(in crate::afxdp) fn write_l4_src_port(packet: &mut [u8], l4: usize, port: u16) {
+pub(super) fn write_l4_src_port(packet: &mut [u8], l4: usize, port: u16) {
     if packet.len() >= l4 + 2 {
         packet[l4..l4 + 2].copy_from_slice(&port.to_be_bytes());
     }
@@ -77,7 +77,7 @@ pub(in crate::afxdp) fn write_l4_src_port(packet: &mut [u8], l4: usize, port: u1
 /// L4 destination-port write at offset `l4 + 2`. Same bounds-check
 /// discipline as `write_l4_src_port`.
 #[inline(always)]
-pub(in crate::afxdp) fn write_l4_dst_port(packet: &mut [u8], l4: usize, port: u16) {
+pub(super) fn write_l4_dst_port(packet: &mut [u8], l4: usize, port: u16) {
     if packet.len() >= l4 + 4 {
         packet[l4 + 2..l4 + 4].copy_from_slice(&port.to_be_bytes());
     }
