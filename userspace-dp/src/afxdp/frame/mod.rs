@@ -1115,9 +1115,9 @@ pub(super) fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) 
         return None;
     }
     // #963 PR-B: keep `Ipv6Addr` here so the byte-write helpers fold
-    // cleanly. `Ipv6Addr` is `repr(transparent)` over `[u8; 16]`, so
-    // `addr.octets()` is a zero-cost conversion at the checksum
-    // call sites that need raw bytes.
+    // cleanly. `addr.octets()` returns `[u8; 16]` and the optimizer
+    // elides the copy at the checksum call sites that need raw
+    // bytes -- no layout guarantee is being relied on, just inlining.
     let new_src = nat.rewrite_src.and_then(|ip| match ip {
         IpAddr::V6(ip) => Some(ip),
         _ => None,
