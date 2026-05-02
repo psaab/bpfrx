@@ -800,6 +800,63 @@ fn from_forward_decision_rejects_v4_rewrite_dst_on_v6_meta_release() {
     );
 }
 
+// The previous four tests cover (V6 src, V4 meta) and (V4 dst, V6 meta).
+// The next four cover the other two slot/family combinations so a
+// future refactor that drops the `slot_ok(&nat.rewrite_dst)` (or
+// `slot_ok(&nat.rewrite_src)`) check from the helper can't
+// accidentally validate only one slot without a test failing.
+// Per Copilot round-2 review on PR #1134.
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "RewriteDescriptor af-mismatch")]
+fn from_forward_decision_rejects_v6_rewrite_dst_on_v4_meta_debug() {
+    let (flow, meta, validation, mut decision, forwarding, ha_state) =
+        make_v4_round_trip_inputs();
+    decision.nat.rewrite_dst = Some(IpAddr::V6(std::net::Ipv6Addr::new(
+        0x2001, 0xdb8, 0, 0, 0, 0, 0, 4,
+    )));
+    let _ = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn from_forward_decision_rejects_v6_rewrite_dst_on_v4_meta_release() {
+    let (flow, meta, validation, mut decision, forwarding, ha_state) =
+        make_v4_round_trip_inputs();
+    decision.nat.rewrite_dst = Some(IpAddr::V6(std::net::Ipv6Addr::new(
+        0x2001, 0xdb8, 0, 0, 0, 0, 0, 4,
+    )));
+    let entry = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
+    assert!(
+        entry.is_none(),
+        "V6 rewrite_dst on a V4 session must not be cacheable"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "RewriteDescriptor af-mismatch")]
+fn from_forward_decision_rejects_v4_rewrite_src_on_v6_meta_debug() {
+    let (flow, meta, validation, mut decision, forwarding, ha_state) =
+        make_v6_round_trip_inputs();
+    decision.nat.rewrite_src = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8)));
+    let _ = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn from_forward_decision_rejects_v4_rewrite_src_on_v6_meta_release() {
+    let (flow, meta, validation, mut decision, forwarding, ha_state) =
+        make_v6_round_trip_inputs();
+    decision.nat.rewrite_src = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8)));
+    let entry = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
+    assert!(
+        entry.is_none(),
+        "V4 rewrite_src on a V6 session must not be cacheable"
+    );
+}
+
 #[cfg(not(debug_assertions))]
 #[test]
 fn from_forward_decision_rejects_junk_addr_family_release() {
