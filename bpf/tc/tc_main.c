@@ -73,8 +73,8 @@ int tc_main_prog(struct __sk_buff *skb)
 		return TC_ACT_OK; /* pass non-IP traffic */
 	}
 
-	/* Parse L4 header */
-	if (!meta->is_fragment) {
+	/* Parse L4 header (#866: include first-fragment for SCREEN_SYN_FRAG). */
+	if (!meta->is_fragment || meta->is_first_fragment) {
 		if (parse_l4hdr(data, data_end, meta) < 0)
 			return TC_ACT_SHOT;
 	}

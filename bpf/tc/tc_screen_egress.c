@@ -129,18 +129,15 @@ int tc_screen_egress_prog(struct __sk_buff *skb)
 
 	/* TCP-specific stateless checks.
 	 *
-	 * Gated on !is_fragment because tc_main skips parse_l4hdr for
-	 * fragments, so tcp_flags / src_port / dst_port are unreliable
-	 * (always 0 after the top-of-pipeline memset).  Without this
-	 * gate, any fragment of a legitimate TCP flow false-drops as
-	 * SCREEN_TCP_NO_FLAG when that screen is enabled (#853).
-	 *
-	 * TODO(#866): real SCREEN_SYN_FRAG detection requires L4 parse
-	 * on the first fragment (offset==0 && MF=1) so we can see the
-	 * TCP SYN bit.  Until that lands, the SYN_FRAG branch below is
-	 * gated off by !is_fragment and remains intentionally unreachable.
+	 * tc_main skips parse_l4hdr for non-first fragments, so
+	 * tcp_flags / src_port / dst_port are unreliable for those
+	 * (always 0 after top-of-pipeline memset). The outer guard
+	 * rules subsequent fragments out of SYN-centric checks below.
+	 * First fragments DO get parse_l4hdr (#866) so they pass the
+	 * guard and SCREEN_SYN_FRAG fires correctly.
 	 */
-	if (meta->protocol == PROTO_TCP && !meta->is_fragment) {
+	if (meta->protocol == PROTO_TCP &&
+	    (!meta->is_fragment || meta->is_first_fragment)) {
 		__u8 tf = meta->tcp_flags;
 
 		/* TCP SYN+FIN */
@@ -162,10 +159,11 @@ int tc_screen_egress_prog(struct __sk_buff *skb)
 		    (tf & 0x20) && meta->dst_port == bpf_htons(139))
 			return screen_drop_tc(meta, SCREEN_WINNUKE);
 
-		/* TCP SYN fragment: unreachable under current !is_fragment
-		 * guard; see TODO(#866) above. */
+		/* #866: TCP SYN on a first-fragment is the SYN-fragment
+		 * attack pattern. Subsequent fragments (no L4) have
+		 * is_first_fragment=0 and don't reach this branch. */
 		if ((sc->flags & SCREEN_SYN_FRAG) &&
-		    (tf & 0x02) && meta->is_fragment)
+		    (tf & 0x02) && meta->is_first_fragment)
 			return screen_drop_tc(meta, SCREEN_SYN_FRAG);
 	}
 

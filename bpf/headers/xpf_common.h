@@ -459,6 +459,19 @@ struct pkt_meta {
 	/* Pipeline state */
 	__u8  direction;    /* 0=ingress, 1=egress */
 	__u8  is_fragment;
+	/* #866: 1 = packet is a first-fragment by criteria
+	 * (IPv4: MF=1 && offset==0; IPv6: MF=1 && offset==0). The L4
+	 * header is *typically* present in the first fragment for
+	 * legitimate traffic given minimum MTUs, but the protocol
+	 * doesn't strictly guarantee it — an attacker can craft a
+	 * tiny first fragment that doesn't contain the full L4 header.
+	 * `parse_l4hdr` does bounds-check and drops if the L4 header
+	 * isn't fully present, so this flag is safe to use as a gate.
+	 * Subsequent fragments (offset>0) have is_fragment=1 and
+	 * is_first_fragment=0; non-fragmented datagrams have both 0.
+	 * Enables real SCREEN_SYN_FRAG detection — a SYN packet that's
+	 * also a first-fragment is a fragmentation-based attack. */
+	__u8  is_first_fragment;
 	__u8  ct_state;     /* SESS_STATE_* */
 	__u8  ct_direction; /* 0=forward, 1=reverse */
 
