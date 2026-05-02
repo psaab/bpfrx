@@ -802,14 +802,16 @@ pub(super) fn clamp_tcp_mss(packet: &mut [u8], max_mss: u16) -> bool {
                 // Clamp MSS and adjust TCP checksum
                 let old_bytes = [tcp[pos + 2], tcp[pos + 3]];
                 tcp[pos + 2..pos + 4].copy_from_slice(&max_mss.to_be_bytes());
-                // Incremental checksum update
+                // Incremental TCP checksum update per RFC 1624:
+                //   HC' = HC + m + ~m'  (ones-complement, end-around carry)
+                // The result is stored directly; no further negation.
                 let old_val = u16::from_be_bytes(old_bytes) as u32;
                 let new_val = max_mss as u32;
                 let old_csum = u16::from_be_bytes([tcp[16], tcp[17]]) as u32;
-                let mut sum = (!old_csum & 0xFFFF) + old_val + (!new_val & 0xFFFF);
+                let mut sum = old_csum + old_val + (!new_val & 0xFFFF);
                 sum = (sum & 0xFFFF) + (sum >> 16);
                 sum = (sum & 0xFFFF) + (sum >> 16);
-                tcp[16..18].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+                tcp[16..18].copy_from_slice(&(sum as u16).to_be_bytes());
                 return true;
             }
             return false;
