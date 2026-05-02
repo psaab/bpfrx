@@ -373,6 +373,8 @@ impl Coordinator {
             binding.flow_cache_misses = 0;
             binding.flow_cache_evictions = 0;
             binding.flow_cache_collision_evictions = 0;
+            binding.v_min_throttle_hard_cap_overrides = 0;
+            binding.v_min_throttles = 0;
             binding.session_hits = 0;
             binding.session_misses = 0;
             binding.session_creates = 0;
@@ -1142,6 +1144,11 @@ impl Coordinator {
                 binding.flow_cache_misses = snap.flow_cache_misses;
                 binding.flow_cache_evictions = snap.flow_cache_evictions;
                 binding.flow_cache_collision_evictions = snap.flow_cache_collision_evictions;
+                // #941 Work item D / #943: bridge V_min counters from
+                // BindingLiveSnapshot through to BindingStatus so the
+                // wire surface (BindingCountersSnapshot) sees them.
+                binding.v_min_throttle_hard_cap_overrides = snap.v_min_throttle_hard_cap_overrides;
+                binding.v_min_throttles = snap.v_min_throttles;
                 binding.session_hits = snap.session_hits;
                 binding.session_misses = snap.session_misses;
                 binding.session_creates = snap.session_creates;
@@ -1284,6 +1291,8 @@ impl Coordinator {
                 binding.flow_cache_misses = 0;
                 binding.flow_cache_evictions = 0;
                 binding.flow_cache_collision_evictions = 0;
+                binding.v_min_throttle_hard_cap_overrides = 0;
+                binding.v_min_throttles = 0;
                 binding.session_hits = 0;
                 binding.session_misses = 0;
                 binding.session_creates = 0;
