@@ -67,7 +67,10 @@ int xdp_cpumap_prog(struct xdp_md *ctx)
 		if (fast_rc == 0) {
 			if (parse_iphdr(data, data_end, meta) < 0)
 				return XDP_DROP;
-			if (!meta->is_fragment &&
+			/* #866: parse L4 on first-fragment too — cpumap path
+			 * is the full ingress pipeline when xdp_main redirects
+			 * via cpumap, so SCREEN_SYN_FRAG must work here too. */
+			if ((!meta->is_fragment || meta->is_first_fragment) &&
 			    parse_l4hdr(data, data_end, meta) < 0)
 				return XDP_DROP;
 		}
@@ -78,7 +81,8 @@ int xdp_cpumap_prog(struct xdp_md *ctx)
 		if (fast_rc == 0) {
 			if (parse_ipv6hdr(data, data_end, meta) < 0)
 				return XDP_DROP;
-			if (!meta->is_fragment &&
+			/* #866: same first-fragment L4 parse for IPv6 cpumap. */
+			if ((!meta->is_fragment || meta->is_first_fragment) &&
 			    parse_l4hdr(data, data_end, meta) < 0)
 				return XDP_DROP;
 		}
