@@ -1,7 +1,13 @@
 use super::*;
 
+mod byte_writes;
 mod checksum;
 mod inspect;
+
+use byte_writes::{
+    write_ipv4_dst, write_ipv4_src, write_ipv6_dst, write_ipv6_src, write_l4_dst_port,
+    write_l4_src_port,
+};
 
 // Cross-module helpers reach into `frame::*` via the explicit list
 // below. `adjust_l4_checksum_ipv6_addr_bytes` is file-private to
@@ -869,27 +875,27 @@ pub(super) fn apply_rewrite_descriptor(
                 }
             }
 
-            // NAT: direct byte writes for IP addresses.
+            // NAT: direct byte writes for IP addresses (#963 PR-B
+            // helpers). Caller-side `if let Some(IpAddr::V4(_))`
+            // matching keeps conditional logic visible at the call
+            // site and lets the `#[inline(always)]` helpers fold
+            // into a single MOV/MOVB instruction.
             if apply_nat {
                 if let Some(IpAddr::V4(new_src)) = rd.rewrite_src_ip {
-                    packet[ip + 12..ip + 16].copy_from_slice(&new_src.octets());
+                    write_ipv4_src(packet, ip, new_src);
                 }
                 if let Some(IpAddr::V4(new_dst)) = rd.rewrite_dst_ip {
-                    packet[ip + 16..ip + 20].copy_from_slice(&new_dst.octets());
+                    write_ipv4_dst(packet, ip, new_dst);
                 }
             }
 
             // NAT: direct byte writes for L4 ports.
             if apply_nat {
                 if let Some(new_sport) = rd.rewrite_src_port {
-                    if packet.len() >= l4 + 2 {
-                        packet[l4..l4 + 2].copy_from_slice(&new_sport.to_be_bytes());
-                    }
+                    write_l4_src_port(packet, l4, new_sport);
                 }
                 if let Some(new_dport) = rd.rewrite_dst_port {
-                    if packet.len() >= l4 + 4 {
-                        packet[l4 + 2..l4 + 4].copy_from_slice(&new_dport.to_be_bytes());
-                    }
+                    write_l4_dst_port(packet, l4, new_dport);
                 }
             }
 
@@ -974,27 +980,23 @@ pub(super) fn apply_rewrite_descriptor(
                 }
             }
 
-            // NAT: direct byte writes for IPv6 addresses.
+            // NAT: direct byte writes for IPv6 addresses (#963 PR-B).
             if apply_nat {
                 if let Some(IpAddr::V6(new_src)) = rd.rewrite_src_ip {
-                    packet[ip + 8..ip + 24].copy_from_slice(&new_src.octets());
+                    write_ipv6_src(packet, ip, new_src);
                 }
                 if let Some(IpAddr::V6(new_dst)) = rd.rewrite_dst_ip {
-                    packet[ip + 24..ip + 40].copy_from_slice(&new_dst.octets());
+                    write_ipv6_dst(packet, ip, new_dst);
                 }
             }
 
-            // NAT: direct byte writes for L4 ports.
+            // NAT: direct byte writes for L4 ports (#963 PR-B).
             if apply_nat {
                 if let Some(new_sport) = rd.rewrite_src_port {
-                    if packet.len() >= l4 + 2 {
-                        packet[l4..l4 + 2].copy_from_slice(&new_sport.to_be_bytes());
-                    }
+                    write_l4_src_port(packet, l4, new_sport);
                 }
                 if let Some(new_dport) = rd.rewrite_dst_port {
-                    if packet.len() >= l4 + 4 {
-                        packet[l4 + 2..l4 + 4].copy_from_slice(&new_dport.to_be_bytes());
-                    }
+                    write_l4_dst_port(packet, l4, new_dport);
                 }
             }
 
@@ -1058,21 +1060,24 @@ pub(super) fn apply_nat_ipv4(packet: &mut [u8], protocol: u8, nat: NatDecision) 
         return None;
     }
 
-    // --- IP address rewriting ---
+    // --- IP address rewriting (#963 PR-B helpers) ---
+    // The line above (`if ihl < 20 || packet.len() < ihl { return None; }`)
+    // guarantees `packet.len() >= 20`, so the unconditional byte-write
+    // helpers are safe; no None-propagation needed here.
     if new_src.is_some() && new_dst.is_none() {
         let new_src = new_src?;
-        packet.get_mut(12..16)?.copy_from_slice(&new_src.octets());
+        write_ipv4_src(packet, 0, new_src);
         adjust_l4_checksum_ipv4_src(packet, ihl, protocol, old_src, new_src)?;
     } else if new_dst.is_some() && new_src.is_none() {
         let new_dst = new_dst?;
-        packet.get_mut(16..20)?.copy_from_slice(&new_dst.octets());
+        write_ipv4_dst(packet, 0, new_dst);
         adjust_l4_checksum_ipv4_dst(packet, ihl, protocol, old_dst, new_dst)?;
     } else if new_src.is_some() || new_dst.is_some() {
         if let Some(ip) = new_src {
-            packet.get_mut(12..16)?.copy_from_slice(&ip.octets());
+            write_ipv4_src(packet, 0, ip);
         }
         if let Some(ip) = new_dst {
-            packet.get_mut(16..20)?.copy_from_slice(&ip.octets());
+            write_ipv4_dst(packet, 0, ip);
         }
         let new_src = new_src.unwrap_or(old_src);
         let new_dst = new_dst.unwrap_or(old_dst);
@@ -1191,11 +1196,16 @@ pub(super) fn apply_nat_port_rewrite(
         return Some(());
     }
 
+    // #963 PR-B: byte-write kernel + caller-side checksum delta. The
+    // helper only writes the port bytes; the surrounding `if old !=
+    // new` short-circuit and incremental-checksum call stay here,
+    // preserving the existing semantics (no checksum work when the
+    // port doesn't actually change).
     if let Some(new_src_port) = nat.rewrite_src_port {
         let port_offset = l4_offset; // TCP/UDP src port at offset +0
         let old_port = u16::from_be_bytes([packet[port_offset], packet[port_offset + 1]]);
         if old_port != new_src_port {
-            packet[port_offset..port_offset + 2].copy_from_slice(&new_src_port.to_be_bytes());
+            write_l4_src_port(packet, l4_offset, new_src_port);
             adjust_l4_checksum_port(packet, l4_offset, protocol, old_port, new_src_port)?;
         }
     }
@@ -1204,7 +1214,7 @@ pub(super) fn apply_nat_port_rewrite(
         let port_offset = l4_offset + 2; // TCP/UDP dst port at offset +2
         let old_port = u16::from_be_bytes([packet[port_offset], packet[port_offset + 1]]);
         if old_port != new_dst_port {
-            packet[port_offset..port_offset + 2].copy_from_slice(&new_dst_port.to_be_bytes());
+            write_l4_dst_port(packet, l4_offset, new_dst_port);
             adjust_l4_checksum_port(packet, l4_offset, protocol, old_port, new_dst_port)?;
         }
     }
