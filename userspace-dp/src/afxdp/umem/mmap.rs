@@ -22,8 +22,22 @@ const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
 
 impl MmapArea {
     pub(in crate::afxdp) fn new(len: usize) -> io::Result<Self> {
-        // Round up to 2 MB boundary for hugepage eligibility.
-        let aligned_len = (len + HUGE_PAGE_SIZE - 1) & !(HUGE_PAGE_SIZE - 1);
+        // #1020: harden two corner cases that the syscall would otherwise
+        // surface as a less-direct EINVAL or — worse — silently under-
+        // allocate by wrapping past usize::MAX during alignment rounding.
+        if len == 0 {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        // Round up to 2 MB boundary for hugepage eligibility, with a
+        // checked add so a `len` near usize::MAX produces a clean error
+        // instead of a wrapped (smaller) `aligned_len` that would
+        // succeed mmap but under-allocate the UMEM.
+        let aligned_len = len
+            .checked_add(HUGE_PAGE_SIZE - 1)
+            .ok_or_else(|| {
+                io::Error::other("umem len would overflow on hugepage alignment")
+            })?
+            & !(HUGE_PAGE_SIZE - 1);
 
         // Attempt 1: explicit 2 MB hugepages (requires system reservation).
         let ptr = unsafe {
@@ -145,5 +159,34 @@ impl MmapArea {
 impl Drop for MmapArea {
     fn drop(&mut self) {
         let _ = unsafe { libc::munmap(self.ptr.as_ptr().cast::<c_void>(), self.mapped_len) };
+    }
+}
+
+#[cfg(test)]
+mod harden_tests {
+    use super::*;
+
+    #[test]
+    fn new_rejects_zero_length() {
+        let err = match MmapArea::new(0) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn new_rejects_overflowing_aligned_len() {
+        // usize::MAX cannot be rounded up to the next 2 MB boundary —
+        // checked_add catches it before mmap.
+        let err = match MmapArea::new(usize::MAX) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("hugepage alignment"),
+            "expected hugepage-alignment error, got: {msg}",
+        );
     }
 }
