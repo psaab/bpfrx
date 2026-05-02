@@ -166,10 +166,13 @@ int xdp_main_prog(struct xdp_md *ctx)
 			if (parse_iphdr(data, data_end, meta) < 0)
 				return XDP_DROP;
 			/* #866: parse L4 on first-fragment too — first frag
-			 * carries the TCP header per RFC 791, needed for real
-			 * SCREEN_SYN_FRAG detection. Subsequent fragments
-			 * (is_fragment && !is_first_fragment) still skip L4
-			 * to preserve the SCREEN_TCP_NO_FLAG defense from #853. */
+			 * (MF=1 && offset==0) typically contains the TCP header
+			 * for legitimate traffic, needed for real SCREEN_SYN_FRAG
+			 * detection. parse_l4hdr bounds-checks and drops on
+			 * truncated headers (attacker-crafted tiny first frags).
+			 * Subsequent fragments (is_fragment && !is_first_fragment)
+			 * still skip L4 to preserve the SCREEN_TCP_NO_FLAG defense
+			 * from #853. */
 			if ((!meta->is_fragment || meta->is_first_fragment) &&
 			    parse_l4hdr(data, data_end, meta) < 0)
 				return XDP_DROP;

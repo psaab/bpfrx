@@ -267,8 +267,13 @@ parse_iphdr(void *data, void *data_end, struct pkt_meta *meta)
 	/* Fragmentation check (#866).
 	 * 0x2000 = More Fragments (MF) bit, 0x1FFF = fragment offset.
 	 *   is_fragment       = MF || offset != 0   (any frag piece)
-	 *   is_first_fragment = MF && offset == 0   (frag piece WITH L4 hdr)
-	 * Subsequent fragments have is_fragment=1, is_first_fragment=0. */
+	 *   is_first_fragment = MF && offset == 0   (first fragment by criteria)
+	 * The first fragment typically contains the full L4 header for
+	 * legitimate traffic, but RFC 791 doesn't strictly require it; a
+	 * crafted tiny first-fragment may truncate the L4 header. Callers
+	 * gating L4 parse on is_first_fragment rely on parse_l4hdr's
+	 * bounds checks to drop truncated frames. Subsequent fragments
+	 * (offset>0) have is_fragment=1, is_first_fragment=0. */
 	__u16 frag_off = bpf_ntohs(iph->frag_off);
 	meta->is_fragment = (frag_off & 0x2000) || (frag_off & 0x1FFF);
 	meta->is_first_fragment = (frag_off & 0x2000) && !(frag_off & 0x1FFF);
@@ -339,7 +344,11 @@ parse_ipv6hdr(void *data, void *data_end, struct pkt_meta *meta)
 			/* IPv6 frag header (#866).
 			 * 0x1 = MF bit (lowest), 0xFFF8 = offset (top 13 bits).
 			 *   is_fragment       = MF || offset != 0
-			 *   is_first_fragment = MF && offset == 0  (carries L4 hdr) */
+			 *   is_first_fragment = MF && offset == 0
+			 * As with IPv4, the first fragment typically contains
+			 * the upper-layer (L4) header for legitimate traffic,
+			 * but RFC 8200 doesn't strictly require it; parse_l4hdr
+			 * bounds-checks and drops truncated headers. */
 			__u16 frag_off = bpf_ntohs(frag->frag_off);
 			if ((frag_off & 0x1) || (frag_off & 0xFFF8))
 				meta->is_fragment = 1;
