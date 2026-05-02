@@ -240,8 +240,13 @@ scope" claim.
   identical to the inlined version).
 - No new acceptance gates. The closing-the-issues acceptance is
   "code matches what the issue asked for, with cited evidence".
-- No HA-failover smoke (#942 last AC). Out of scope; would need a
-  dedicated test harness.
+- No new HA-failover test harness. Per Gap 4, this PR DOES invoke
+  the existing `scripts/userspace-ha-failover-validation.sh` and
+  records the result; what's out of scope is BUILDING a new
+  harness (e.g., the HA-replay-storm scenario the original #942
+  acceptance described). The existing script's failover-correctness
+  checks substitute as evidence that V_min sync wiring on the
+  Prepared path doesn't break failover.
 
 ## Acceptance gate
 
