@@ -509,6 +509,317 @@ fn from_forward_decision_round_trip() {
 }
 
 // ----------------------------------------------------------------
+// (h-family) #963 PR-A: from_forward_decision refuses descriptors
+// whose decision.nat carries IPs of a different family than
+// meta.addr_family. The fast-path apply (apply_rewrite_descriptor)
+// would silently skip IP NAT in that case while still applying port
+// NAT and a port-only checksum delta — a forwarding-correctness bug.
+// Returning None here forces the flow through the generic path which
+// dispatches by family correctly.
+// ----------------------------------------------------------------
+
+/// Build the standard test inputs for a NAT44-shaped FlowCacheEntry.
+///
+/// Returns (flow, meta, validation, decision, forwarding, ha_state)
+/// configured for a v4 session through egress ifindex 6 in RG 1.
+/// Tests can mutate `decision.nat` to introduce mismatches.
+fn make_v4_round_trip_inputs() -> (
+    SessionFlow,
+    UserspaceDpMeta,
+    ValidationState,
+    SessionDecision,
+    ForwardingState,
+    BTreeMap<i32, HAGroupRuntime>,
+) {
+    let key = make_key();
+    let flow = SessionFlow {
+        src_ip: key.src_ip,
+        dst_ip: key.dst_ip,
+        forward_key: key,
+    };
+    let meta = UserspaceDpMeta {
+        protocol: PROTO_TCP,
+        addr_family: libc::AF_INET as u8,
+        ingress_ifindex: 7,
+        tcp_flags: 0x10,
+        config_generation: 10,
+        fib_generation: 3,
+        ..Default::default()
+    };
+    let validation = ValidationState {
+        snapshot_installed: true,
+        config_generation: 10,
+        fib_generation: 3,
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 6,
+            tx_ifindex: 6,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1))),
+            neighbor_mac: Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x01, 0x01]),
+            tx_vlan_id: 50,
+        },
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 8))),
+            rewrite_dst: None,
+            rewrite_src_port: Some(1024),
+            rewrite_dst_port: None,
+            nat64: false,
+            nptv6: false,
+        },
+    };
+    let mut forwarding = ForwardingState::default();
+    forwarding.egress.insert(
+        6,
+        EgressInterface {
+            bind_ifindex: 6,
+            vlan_id: 0,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x00, 0x01, 0x01],
+            zone_id: TEST_TRUST_ZONE_ID,
+            redundancy_group: 1,
+            primary_v4: Some(Ipv4Addr::new(10, 0, 1, 1)),
+            primary_v6: None,
+        },
+    );
+    let ha_state = BTreeMap::from([(
+        1,
+        HAGroupRuntime {
+            active: true,
+            watchdog_timestamp: 95,
+            lease: HAForwardingLease::ActiveUntil(100),
+        },
+    )]);
+    (flow, meta, validation, decision, forwarding, ha_state)
+}
+
+/// Build a self-consistent v6-meta + v6-NAT scenario for the
+/// mirror-image mismatch test (v4 rewrite_dst on v6 meta). Separate
+/// from `make_v4_round_trip_inputs` so the v6 test doesn't have to
+/// mutate seven fields off the v4 fixture.
+fn make_v6_round_trip_inputs() -> (
+    SessionFlow,
+    UserspaceDpMeta,
+    ValidationState,
+    SessionDecision,
+    ForwardingState,
+    BTreeMap<i32, HAGroupRuntime>,
+) {
+    use std::net::Ipv6Addr;
+    let src_ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2));
+    let dst_ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 3));
+    let key = crate::session::SessionKey {
+        src_ip,
+        dst_ip,
+        src_port: 49000,
+        dst_port: 443,
+        protocol: PROTO_TCP,
+        addr_family: libc::AF_INET6 as u8,
+    };
+    let flow = SessionFlow {
+        src_ip,
+        dst_ip,
+        forward_key: key,
+    };
+    let meta = UserspaceDpMeta {
+        protocol: PROTO_TCP,
+        addr_family: libc::AF_INET6 as u8,
+        ingress_ifindex: 7,
+        tcp_flags: 0x10,
+        config_generation: 10,
+        fib_generation: 3,
+        ..Default::default()
+    };
+    let validation = ValidationState {
+        snapshot_installed: true,
+        config_generation: 10,
+        fib_generation: 3,
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 6,
+            tx_ifindex: 6,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
+            neighbor_mac: Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x01, 0x01]),
+            tx_vlan_id: 50,
+        },
+        nat: NatDecision {
+            rewrite_src: None,
+            rewrite_dst: None,
+            rewrite_src_port: None,
+            rewrite_dst_port: None,
+            nat64: false,
+            nptv6: false,
+        },
+    };
+    let mut forwarding = ForwardingState::default();
+    forwarding.egress.insert(
+        6,
+        EgressInterface {
+            bind_ifindex: 6,
+            vlan_id: 0,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x00, 0x01, 0x01],
+            zone_id: TEST_TRUST_ZONE_ID,
+            redundancy_group: 1,
+            primary_v4: None,
+            primary_v6: Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        },
+    );
+    let ha_state = BTreeMap::from([(
+        1,
+        HAGroupRuntime {
+            active: true,
+            watchdog_timestamp: 95,
+            lease: HAForwardingLease::ActiveUntil(100),
+        },
+    )]);
+    (flow, meta, validation, decision, forwarding, ha_state)
+}
+
+/// Helper: invoke `from_forward_decision` with the standard knobs
+/// the family-guard tests use. Pulls 9 of the 11 args out of the
+/// per-test boilerplate so the test bodies can focus on the v4/v6
+/// inputs and the assertion.
+fn try_build_entry(
+    flow: &SessionFlow,
+    meta: UserspaceDpMeta,
+    validation: ValidationState,
+    decision: SessionDecision,
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+) -> Option<FlowCacheEntry> {
+    let rg_epochs = default_rg_epochs();
+    FlowCacheEntry::from_forward_decision(
+        flow,
+        meta,
+        validation,
+        decision,
+        1,
+        Some(3),
+        Some(7),
+        forwarding,
+        ha_state,
+        false,
+        &rg_epochs,
+    )
+}
+
+#[test]
+fn from_forward_decision_matching_family_returns_some() {
+    // Sanity: the standard v4 inputs (V4 meta + V4 NAT) build a cache
+    // entry. Companion to the negative tests below so a future
+    // refactor that breaks the constructor is obviously the cause and
+    // not an unrelated input change.
+    let (flow, meta, validation, decision, forwarding, ha_state) =
+        make_v4_round_trip_inputs();
+    let entry = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
+    assert!(entry.is_some(), "matching-family v4 NAT should be cacheable");
+}
+
+// The next four tests verify the family guard from both build modes.
+// The guard is `debug_assert!(false, ...)` then `return None`, so the
+// observable behavior differs by build mode:
+//
+// - Debug build: `debug_assert!` fires; the panic propagates up and
+//   the test passes via `#[should_panic]`.
+// - Release build: `debug_assert!` is stripped; the function returns
+//   `None`; the test passes via `assert!(entry.is_none())`.
+//
+// Each mismatch case is split into two `#[cfg(...)]`-gated test
+// functions so each build mode runs exactly the assertion that
+// applies to it. This avoids the trap of `#[cfg_attr(debug_assertions,
+// should_panic)]` on a single test, where the release-mode
+// `assert!(entry.is_none())` would only ever execute under
+// `cargo test --release` — easy to miss in a project without a
+// CI release-test step.
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "RewriteDescriptor af-mismatch")]
+fn from_forward_decision_rejects_v6_rewrite_src_on_v4_meta_debug() {
+    let (flow, meta, validation, mut decision, forwarding, ha_state) =
+        make_v4_round_trip_inputs();
+    decision.nat.rewrite_src = Some(IpAddr::V6(std::net::Ipv6Addr::new(
+        0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+    )));
+    // Expected to panic via debug_assert! before reaching this assert.
+    let _ = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn from_forward_decision_rejects_v6_rewrite_src_on_v4_meta_release() {
+    let (flow, meta, validation, mut decision, forwarding, ha_state) =
+        make_v4_round_trip_inputs();
+    decision.nat.rewrite_src = Some(IpAddr::V6(std::net::Ipv6Addr::new(
+        0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+    )));
+    let entry = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
+    assert!(
+        entry.is_none(),
+        "V6 rewrite_src on a V4 session must not be cacheable"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "RewriteDescriptor af-mismatch")]
+fn from_forward_decision_rejects_v4_rewrite_dst_on_v6_meta_debug() {
+    let (flow, meta, validation, mut decision, forwarding, ha_state) =
+        make_v6_round_trip_inputs();
+    decision.nat.rewrite_dst = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)));
+    let _ = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn from_forward_decision_rejects_v4_rewrite_dst_on_v6_meta_release() {
+    let (flow, meta, validation, mut decision, forwarding, ha_state) =
+        make_v6_round_trip_inputs();
+    decision.nat.rewrite_dst = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)));
+    let entry = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
+    assert!(
+        entry.is_none(),
+        "V4 rewrite_dst on a V6 session must not be cacheable"
+    );
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn from_forward_decision_rejects_junk_addr_family_release() {
+    // PR-A robustness: addr_family that's neither AF_INET nor
+    // AF_INET6 (e.g. uninitialised stack memory) must not slip
+    // through the guard. Codex round-1 review found that the
+    // earlier `want_v4 = addr_family == AF_INET` formulation
+    // accepted V6 IPs for any non-AF_INET value, including junk.
+    // The fix is the explicit three-arm match in
+    // `nat_family_matches_addr_family`. This test pins that
+    // behavior in release builds (debug builds also panic via
+    // debug_assert! before reaching the assertion, but the panic
+    // message identifies the same code path).
+    let (flow, mut meta, validation, mut decision, forwarding, ha_state) =
+        make_v4_round_trip_inputs();
+    meta.addr_family = 99; // junk value, not AF_INET / AF_INET6
+    decision.nat.rewrite_src = Some(IpAddr::V6(std::net::Ipv6Addr::new(
+        0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+    )));
+    let entry = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
+    assert!(
+        entry.is_none(),
+        "junk addr_family must reject the descriptor regardless of NAT slot families"
+    );
+}
+
+// ----------------------------------------------------------------
 // (h-extra) from_forward_decision returns None for non-cacheable
 // ----------------------------------------------------------------
 #[test]

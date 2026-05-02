@@ -125,6 +125,37 @@ pub(super) struct FlowCacheEntry {
     pub(super) stamp: FlowCacheStamp,
 }
 
+/// #963 PR-A: defense-in-depth check for `from_forward_decision`.
+///
+/// Returns `true` if every `Some(_)` IP in `nat.rewrite_src` /
+/// `nat.rewrite_dst` is the same address family as `addr_family`.
+/// `None` IPs match any family (they're "no rewrite for this slot").
+///
+/// `addr_family` MUST be `AF_INET` or `AF_INET6`. Any other value
+/// (junk meta from a malformed packet, uninitialised stack memory)
+/// returns `false` so the descriptor is rejected and the flow falls
+/// through to the generic in-place rewrite path. Without the
+/// explicit third arm, a `addr_family != AF_INET` value would
+/// silently pretend to be V6 (the `ether_type` derivation in
+/// `from_forward_decision` collapses the same way for any non-V4
+/// `meta.addr_family`), which is exactly the kind of latent
+/// invariant violation this guard is supposed to refuse.
+///
+/// Called once per cache miss, not per packet.
+fn nat_family_matches_addr_family(addr_family: i32, nat: &NatDecision) -> bool {
+    let want_v4 = match addr_family {
+        libc::AF_INET => true,
+        libc::AF_INET6 => false,
+        _ => return false,
+    };
+    let slot_ok = |opt: &Option<IpAddr>| match opt {
+        None => true,
+        Some(IpAddr::V4(_)) => want_v4,
+        Some(IpAddr::V6(_)) => !want_v4,
+    };
+    slot_ok(&nat.rewrite_src) && slot_ok(&nat.rewrite_dst)
+}
+
 impl FlowCacheEntry {
     #[inline]
     pub(super) fn packet_eligible(meta: UserspaceDpMeta) -> bool {
@@ -154,6 +185,34 @@ impl FlowCacheEntry {
         rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
     ) -> Option<Self> {
         if !Self::should_cache(meta, decision) {
+            return None;
+        }
+        // #963 PR-A: refuse to build a fast-path descriptor whose
+        // ether_type (derived from `meta.addr_family` below) is
+        // inconsistent with the address family of `decision.nat`'s
+        // rewrite IPs. `apply_rewrite_descriptor`'s v4 arm only
+        // writes V4 NAT and its v6 arm only writes V6 NAT, so a
+        // mismatched descriptor would silently skip IP NAT while
+        // still applying port NAT and a port-only checksum delta —
+        // a forwarding-correctness bug, not a memory or checksum
+        // bug, but still a bug. Falling through to the generic
+        // path (`rewrite_forwarded_frame_in_place`) handles each
+        // family correctly via separate `rewrite_apply_v4` /
+        // `rewrite_apply_v6` dispatch.
+        //
+        // The upstream invariant is that NAT rules are typed by
+        // family in the policy compiler, so this guard should not
+        // fire in practice. We don't rely on the upstream proof:
+        // a release-strength check converts a silent NAT skip into
+        // graceful (uncached) degradation. Cost is two enum-
+        // discriminant compares per cache miss, not per packet.
+        if !nat_family_matches_addr_family(meta.addr_family as i32, &decision.nat) {
+            debug_assert!(
+                false,
+                "RewriteDescriptor af-mismatch refused: addr_family={} \
+                 rewrite_src={:?} rewrite_dst={:?}",
+                meta.addr_family, decision.nat.rewrite_src, decision.nat.rewrite_dst,
+            );
             return None;
         }
         // Keep cache invalidation tied to the flow owner RG, not the current
