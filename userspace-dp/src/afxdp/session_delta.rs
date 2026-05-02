@@ -175,10 +175,10 @@ pub(super) fn flush_session_deltas(
                 &reverse_key,
             );
             replicate_session_delete(peer_worker_commands, &delta.key);
-            replicate_session_delete(
-                peer_worker_commands,
-                &reverse_session_key(&delta.key, delta.decision.nat),
-            );
+            // #1069: reuse the reverse_key already computed above instead of
+            // recomputing it. reverse_session_key is pure on its inputs and
+            // delta + nat are not modified between the two replicate calls.
+            replicate_session_delete(peer_worker_commands, &reverse_key);
             if cfg!(feature = "debug-log") {
                 debug_log!(
                     "SESS_DELETE_DONE: bpf_entries_after={}",
