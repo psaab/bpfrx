@@ -62,12 +62,36 @@ impl PaddedVtimeSlot {
         }
     }
 
-    /// Worker calls this on commit boundary publish (after a
-    /// drain commits or push_front rolls back) AND on first
-    /// enqueue when the bucket count transitions 0 → ≥1.
+    /// Worker calls this on commit boundary publish. Six call
+    /// sites total:
+    ///   - 4 post-settle TX-ring commit sites in
+    ///     `cos/queue_service/service.rs` (each immediately after
+    ///     `settle_*`/commit), via the `publish_committed_queue_vtime`
+    ///     helper.
+    ///   - 1 demote-restore site in `tx/cos_classify.rs:641` (after
+    ///     `demote_prepared_cos_queue_to_local` restores the saved
+    ///     `queue_vtime`), via the same helper.
+    ///   - 1 direct call in `cos/queue_ops/push.rs:126` on the
+    ///     rollback path of `cos_queue_push_front`, restoring the
+    ///     pre-pop `queue_vtime` so peers don't see the inflated
+    ///     speculative value.
+    ///
     /// Release ordering ensures any prior writes to
     /// `flow_bucket_*_finish_bytes` and `queue_vtime` are
     /// visible to peers that observe this slot Acquire.
+    ///
+    /// **No first-enqueue publish.** #941 Work item A's "symmetric
+    /// publish on bucket-count 0 → ≥1 transition" was deliberately
+    /// dropped during implementation. Rationale: a freshly-enqueued
+    /// (or freshly-vacated-then-re-entering) worker has no committed
+    /// vtime to broadcast, and peers correctly skip its slot via
+    /// `slot.read() == None` (NOT_PARTICIPATING) in the V_min
+    /// reduction (see `participating_v_min_snapshot` and its caller
+    /// `cos_queue_v_min_continue`). Publishing the stale
+    /// pre-vacate `queue_vtime` would broadcast a value that does
+    /// NOT correspond to committed work, falsely throttling peers.
+    /// The test `vmin_no_first_enqueue_publish` enforces this
+    /// invariant.
     pub(in crate::afxdp) fn publish(&self, vtime: u64) {
         debug_assert_ne!(
             vtime, NOT_PARTICIPATING,
@@ -117,41 +141,53 @@ impl SharedCoSQueueVtimeFloor {
         Self { slots }
     }
 
-    /// Compute V_min across participating peers. Skips
-    /// `worker_id`'s own slot to avoid self-throttling.
-    /// Returns `None` if no peer is participating (so the
-    /// caller treats the queue as unthrottled).
+    /// Single-pass snapshot of the participating peers' V_min
+    /// state, excluding `worker_id`'s own slot.
+    ///
+    /// Returns `(participating_count, Some(v_min))` if at least
+    /// one peer is participating, `(0, None)` if every peer is
+    /// `NOT_PARTICIPATING` (caller treats the queue as unthrottled).
+    /// `v_min` is the minimum across only participating peers.
+    ///
+    /// **Memory ordering**: each `slot.read()` is an independent
+    /// `Ordering::Acquire` load, paired with the corresponding
+    /// `Ordering::Release` store inside `PaddedVtimeSlot::publish` /
+    /// `vacate`. The iteration is **non-atomic across slots** —
+    /// a slot can transition `vtime → NOT_PARTICIPATING` (or
+    /// vice versa) between two reads in the same iteration. There
+    /// is no lock, seqlock, retry, or epoch; the result is the set
+    /// of values observed during the scan, where each individual
+    /// value is a valid Acquire-load of that slot at some moment
+    /// within the scan window. Cross-slot atomicity is not
+    /// provided. The throttle decision is a hint with staleness
+    /// bounded by the K-cadence read interval, not a hard barrier.
+    /// Introducing a global lock or seqlock would re-introduce
+    /// the contention the algorithm was designed to eliminate.
+    ///
+    /// Single-pass helper that `cos_queue_v_min_continue` calls
+    /// for the (count, v_min) pair on each cadence tick.
+    /// Centralizes the memory-ordering contract in one place.
     #[inline]
-    pub(in crate::afxdp) fn read_v_min(&self, worker_id: u32) -> Option<u64> {
+    pub(in crate::afxdp) fn participating_v_min_snapshot(
+        &self,
+        worker_id: u32,
+    ) -> (u32, Option<u64>) {
+        let mut participating = 0u32;
         let mut v_min = u64::MAX;
-        let mut found = false;
         for (idx, slot) in self.slots.iter().enumerate() {
             if idx == worker_id as usize {
                 continue;
             }
             if let Some(peer) = slot.read() {
+                participating += 1;
                 v_min = v_min.min(peer);
-                found = true;
             }
         }
-        if found { Some(v_min) } else { None }
-    }
-
-    /// Count of currently-participating peers (excludes
-    /// `worker_id`'s own slot). Used to size LAG_THRESHOLD
-    /// per plan §3.5.
-    #[inline]
-    pub(in crate::afxdp) fn participating_peer_count(&self, worker_id: u32) -> u32 {
-        let mut count = 0u32;
-        for (idx, slot) in self.slots.iter().enumerate() {
-            if idx == worker_id as usize {
-                continue;
-            }
-            if slot.read().is_some() {
-                count += 1;
-            }
+        if participating == 0 {
+            (0, None)
+        } else {
+            (participating, Some(v_min))
         }
-        count
     }
 }
 
