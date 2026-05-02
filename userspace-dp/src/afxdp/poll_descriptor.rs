@@ -2239,10 +2239,15 @@ pub(super) fn poll_binding_process_descriptor(
 // In release builds without `--features debug-log` the `cfg!(...)`
 // branches collapse to false and LLVM eliminates the entire
 // debug-only body, leaving just the prefetches and the four counter
-// bumps. The function is `#[inline]` so the optimizer is free to
-// fold it back into the caller — the goal is *source-level*
-// separation of housekeeping noise from forwarding logic, per the
-// modularity discipline in #1128.
+// bumps — small enough that LLVM will inline a single call site
+// regardless of any annotation. `#[inline]` (not `#[inline(always)]`)
+// is deliberate: with `--features debug-log` the body is ~200 LOC,
+// and forcing inline of that into the hot loop would bloat L1-i in
+// debug builds for no production gain. `#[inline]` lets the
+// compiler honor the body-size heuristic, which inlines tight
+// production builds and correctly declines on the bulky debug
+// path. The goal is *source-level* separation of housekeeping
+// noise from forwarding logic, per the modularity discipline in #1128.
 #[inline]
 pub(super) fn record_rx_batch_telemetry(
     desc: XdpDesc,
@@ -2267,7 +2272,7 @@ pub(super) fn record_rx_batch_telemetry(
     #[cfg(target_arch = "x86_64")]
     {
         debug_assert!(
-            desc.addr % 64 == 0,
+            desc.addr.is_multiple_of(64),
             "UMEM frame at desc.addr={} should be 64-byte aligned",
             desc.addr,
         );
