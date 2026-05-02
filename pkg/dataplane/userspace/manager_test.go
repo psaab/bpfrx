@@ -2857,6 +2857,37 @@ func TestBuildScreenSnapshotsIncludesAdvancedFields(t *testing.T) {
 	}
 }
 
+// #1137 Copilot review regression: a profile with ONLY syn_frag
+// enabled (and no other check) must still pass the
+// "at least one check enabled" emit gate. Without this, a future
+// refactor could drop SynFrag from the gate and silently omit the
+// whole profile from the userspace snapshot.
+func TestBuildScreenSnapshotsIncludesSynFragOnlyProfile(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"lan": {Name: "lan", ScreenProfile: "syn-frag-only"},
+	}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"syn-frag-only": {
+			Name: "syn-frag-only",
+			TCP:  config.TCPScreen{SynFrag: true},
+		},
+	}
+	snaps := buildScreenSnapshots(cfg)
+	if len(snaps) != 1 {
+		t.Fatalf("len(snaps) = %d, want 1 — syn_frag-only profile must pass the emit gate", len(snaps))
+	}
+	if !snaps[0].SynFrag {
+		t.Fatalf("SynFrag = false, want true")
+	}
+	// Sanity: nothing else should be on
+	if snaps[0].SynFin || snaps[0].NoFlag || snaps[0].FinNoAck ||
+		snaps[0].WinNuke || snaps[0].PingDeath || snaps[0].Teardrop ||
+		snaps[0].SourceRoute || snaps[0].Land {
+		t.Fatalf("unexpected other-checks set: %+v", snaps[0])
+	}
+}
+
 func TestBuildFlowExportSnapshot(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Services.FlowMonitoring = &config.FlowMonitoringConfig{

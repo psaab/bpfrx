@@ -468,6 +468,10 @@ pub(crate) struct ScreenProfileSnapshot {
     pub teardrop: bool,
     #[serde(rename = "icmp_fragment", default)]
     pub icmp_fragment: bool,
+    /// #1137: TCP SYN packet that's also the first fragment of a
+    /// fragmented datagram — a fragmentation-based attack signature.
+    #[serde(rename = "syn_frag", default)]
+    pub syn_frag: bool,
     #[serde(rename = "source_route", default)]
     pub source_route: bool,
     #[serde(rename = "icmp_flood_threshold", default)]

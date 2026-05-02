@@ -43,6 +43,11 @@ pub(crate) struct ScreenPacketInfo {
     pub dst_port: u16, // host byte order
     pub pkt_len: u16,  // total packet length from meta
     pub is_fragment: bool,
+    /// #1137: 1 = first fragment of a fragmented datagram (IPv4: MF=1
+    /// && offset==0; IPv6: MF=1 && offset==0). Mirrors the BPF
+    /// `is_first_fragment` flag in pkt_meta. `is_fragment=1 &&
+    /// is_first_fragment=0` indicates a subsequent fragment.
+    pub is_first_fragment: bool,
     pub ip_ihl: u8,        // IPv4 IHL field (header length in 32-bit words)
     pub ip_frag_off: u16,  // raw frag_off field (network byte order already parsed)
     pub ip_total_len: u16, // IPv4 total length
@@ -59,6 +64,10 @@ pub(crate) struct ScreenProfile {
     pub ping_death: bool,
     pub teardrop: bool,
     pub icmp_fragment: bool,
+    /// #1137: TCP SYN on a first-fragment is the fragmentation-based
+    /// attack pattern. Mirrors the BPF SCREEN_SYN_FRAG (#866) on the
+    /// userspace dataplane path.
+    pub syn_frag: bool,
     pub source_route: bool,
     pub icmp_flood_threshold: u32, // packets per second, 0 = disabled
     pub udp_flood_threshold: u32,  // packets per second, 0 = disabled
@@ -303,8 +312,18 @@ impl ScreenState {
             return ScreenVerdict::Drop("land-attack");
         }
 
-        // TCP-specific stateless checks
-        if pkt.protocol == PROTO_TCP {
+        // TCP-specific stateless checks.
+        //
+        // Outer guard `!is_fragment || is_first_fragment` mirrors the
+        // BPF #853 defense (#1137 / Copilot review): subsequent
+        // fragments don't carry the L4 header, so `tcp_flags` is
+        // unreliable for them. Without this guard a subsequent
+        // fragment whose payload bytes happen to look like flag bits
+        // could falsely trip syn_fin / no_flag / fin_no_ack / winnuke
+        // / syn_frag. First-fragments DO carry the TCP header, so
+        // they pass through the guard and the SYN-centric checks
+        // (including syn_frag) fire correctly.
+        if pkt.protocol == PROTO_TCP && (!pkt.is_fragment || pkt.is_first_fragment) {
             let tf = pkt.tcp_flags;
 
             // SYN+FIN
@@ -325,6 +344,14 @@ impl ScreenState {
             // WinNuke: URG flag to port 139
             if profile.winnuke && (tf & TCP_URG) != 0 && pkt.dst_port == 139 {
                 return ScreenVerdict::Drop("winnuke");
+            }
+
+            // #1137: SYN-fragment — TCP SYN on a first-fragment is the
+            // fragmentation-based attack pattern. The outer guard
+            // already excludes subsequent fragments; this check fires
+            // on first-fragment + SYN, which is the actual attack.
+            if profile.syn_frag && (tf & TCP_SYN) != 0 && pkt.is_first_fragment {
+                return ScreenVerdict::Drop("syn-frag");
             }
         }
 
@@ -503,19 +530,84 @@ pub(crate) fn extract_screen_info(
         dst_port,
         pkt_len,
         is_fragment: false,
+        is_first_fragment: false,
         ip_ihl: 5,
         ip_frag_off: 0,
         ip_total_len: 0,
     };
 
-    // Extract IPv4-specific fields from the frame
     if addr_family == libc::AF_INET as u8 && l3_offset + 20 <= frame.len() {
+        // IPv4: extract IHL, total_len, frag_off from the fixed 20-byte
+        // base header. frag_off is bytes 6-7, big-endian.
         let ip_hdr = &frame[l3_offset..];
         info.ip_ihl = ip_hdr[0] & 0x0F;
         info.ip_total_len = u16::from_be_bytes([ip_hdr[2], ip_hdr[3]]);
         info.ip_frag_off = u16::from_be_bytes([ip_hdr[6], ip_hdr[7]]);
-        // Fragment if MF bit set or fragment offset > 0
-        info.is_fragment = (info.ip_frag_off & 0x3FFF) != 0; // MF=0x2000, offset=0x1FFF
+        // Fragment if MF bit (0x2000) set OR fragment offset (0x1FFF) > 0.
+        // First fragment: MF=1 AND offset==0 (#1137, mirrors BPF #866).
+        info.is_fragment = (info.ip_frag_off & 0x3FFF) != 0;
+        info.is_first_fragment =
+            (info.ip_frag_off & 0x2000) != 0 && (info.ip_frag_off & 0x1FFF) == 0;
+    } else if addr_family == libc::AF_INET6 as u8 && l3_offset + 40 <= frame.len() {
+        // IPv6: walk the extension header chain looking for
+        // NEXTHDR_FRAGMENT (44). Fixed IPv6 base header is 40 bytes.
+        // We bound the walk to MAX_EXT_HDRS=8 like the BPF parser.
+        //
+        // Parity note (#1137 / Codex round-1): if the chain is
+        // truncated (out-of-bounds before we find a FRAGMENT
+        // header), we silently `break` and leave is_first_fragment
+        // at its default `false`. The BPF `parse_ipv6hdr` returns
+        // -1 on the same condition, causing the packet to be
+        // dropped earlier in the pipeline. On the userspace-dp
+        // path the upstream metadata parser (try_parse_metadata)
+        // should already have rejected malformed IPv6 packets
+        // before they reach extract_screen_info, so the parity
+        // gap is theoretical. If a SYN-bearing IPv6 frame with a
+        // truncated FRAGMENT header somehow reaches the screen
+        // layer, it would pass syn_frag — operators relying on
+        // that defense should keep the BPF screen path enabled
+        // upstream of userspace-dp.
+        const NEXTHDR_HOP: u8 = 0;
+        const NEXTHDR_ROUTING: u8 = 43;
+        const NEXTHDR_FRAGMENT: u8 = 44;
+        const NEXTHDR_DEST: u8 = 60;
+        const NEXTHDR_AUTH: u8 = 51;
+        let mut nexthdr = frame[l3_offset + 6];
+        let mut offset = l3_offset + 40;
+        for _ in 0..8 {
+            match nexthdr {
+                NEXTHDR_HOP | NEXTHDR_ROUTING | NEXTHDR_DEST => {
+                    if offset + 2 > frame.len() {
+                        break;
+                    }
+                    nexthdr = frame[offset];
+                    offset += (frame[offset + 1] as usize + 1) * 8;
+                }
+                NEXTHDR_AUTH => {
+                    if offset + 2 > frame.len() {
+                        break;
+                    }
+                    nexthdr = frame[offset];
+                    offset += (frame[offset + 1] as usize + 2) * 4;
+                }
+                NEXTHDR_FRAGMENT => {
+                    if offset + 8 > frame.len() {
+                        break;
+                    }
+                    // IPv6 frag_off layout (big-endian u16 at offset+2):
+                    //   offset (13 bits, top) | reserved (2 bits) | M (1 bit, lowest)
+                    // Mirrors BPF #866: MF=0x1, offset=0xFFF8.
+                    let frag_off =
+                        u16::from_be_bytes([frame[offset + 2], frame[offset + 3]]);
+                    info.ip_frag_off = frag_off;
+                    info.is_fragment = (frag_off & 0x1) != 0 || (frag_off & 0xFFF8) != 0;
+                    info.is_first_fragment =
+                        (frag_off & 0x1) != 0 && (frag_off & 0xFFF8) == 0;
+                    break;
+                }
+                _ => break,
+            }
+        }
     }
 
     info
