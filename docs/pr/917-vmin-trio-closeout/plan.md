@@ -77,7 +77,7 @@ issues with cited evidence.
 | FIFO Prepared drain documents unreachability | ✅ PASS | `cos/queue_service/drain.rs:238-244`. |
 | Synthetic Prepared-path V_min throttle test | ✅ PASS | `vmin_prepared_flow_fair_throttle_and_suspension`, `vmin_prepared_drain_arms_hard_cap_after_repeated_throttle`, `vmin_prepared_drain_unblocks_when_peer_slot_vacates`, `vmin_prepared_no_suspension_burn_when_head_is_local`. |
 | No regression on existing Prepared-path tests | ✅ PASS | `cargo test --release`. |
-| HA-failover replay smoke | ⚠️ NOT VERIFIED | Out of scope for closeout — would need a dedicated test harness; the existing cluster smoke does not exercise HA-replay storm specifically. |
+| HA-failover replay smoke | ⚠️ PARTIAL | This PR runs the existing `scripts/userspace-ha-failover-validation.sh`; failover-correctness checks (session sync, fabric forwarding, no zero-throughput intervals) all PASS. Building the original #942 acceptance's "HA-replay storm" harness is out of scope for this closeout — the existing script substitutes by exercising the V_min Prepared-path wiring on a real failover cycle. |
 
 ## Gap analysis
 
@@ -133,14 +133,15 @@ issues with cited evidence.
   capturing the "NOT_PARTICIPATING → peers skip → no stale-low
   publish" rationale.
 
-### Gap 2: `read_v_min` and `participating_peer_count` are dead code
+### Gap 2: pre-PR `read_v_min` and `participating_peer_count` were dead code
 
-**Issue**: Both methods on `SharedCoSQueueVtimeFloor` are defined
-`pub(in crate::afxdp)` but have **zero call sites**. The actual
-slot iteration happens inline at v_min.rs:140-148 in
-`cos_queue_v_min_continue`. The inlined version computes both
-v_min AND participating count in a single pass — the helper
-methods would require two passes.
+**Pre-PR state** (now fixed by this closeout): both methods on
+`SharedCoSQueueVtimeFloor` were defined `pub(in crate::afxdp)` in
+the pre-PR master but had **zero call sites**. The actual slot
+iteration was inlined in `cos_queue_v_min_continue`. The inlined
+version computed both v_min AND participating count in a single
+pass — the now-deleted helper methods would have required two
+passes.
 
 **Three options**:
 
