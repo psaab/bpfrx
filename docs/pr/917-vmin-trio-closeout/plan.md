@@ -55,7 +55,7 @@ issues with cited evidence.
 | AC | Status | Evidence |
 |----|--------|----------|
 | No publish on speculative pop | ✅ PASS | `cos/queue_ops/pop.rs:117-118` comment confirms publish moved out; no `slot.publish` call in `cos_queue_pop_front_inner`. Test: `vmin_pop_snapshot_does_not_publish` (v_min_tests.rs). |
-| Publish at TX-ring commit boundary | ✅ PASS | `publish_committed_queue_vtime` defined at `cos/queue_ops/v_min.rs:38`. **5 call sites total: 4 post-settle + 1 demote-restore.** Post-settle: `cos/queue_service/service.rs:160`, `:310`, `:466`, `:619` (each immediately after `settle_*`/`commit`). Demote-restore: `tx/cos_classify.rs:641` (after `demote_prepared_cos_queue_to_local` restores the saved `queue_vtime` — broadcasts the same value peers saw before demote, idempotent). Test: `vmin_post_settle_publish_writes_committed_vtime`. |
+| Publish at TX-ring commit boundary | ✅ PASS | `publish_committed_queue_vtime` defined at `cos/queue_ops/v_min.rs:38`. **6 publish sites total: 4 post-settle + 1 demote-restore + 1 direct rollback.** Indirect via the helper: `cos/queue_service/service.rs:160`, `:310`, `:466`, `:619` (post-settle, each immediately after `settle_*`/`commit`); `tx/cos_classify.rs:641` (after `demote_prepared_cos_queue_to_local` restores the saved `queue_vtime`). Direct `slot.publish`: `cos/queue_ops/push.rs:126` on the `cos_queue_push_front` rollback path, restoring the pre-pop `queue_vtime` so peers don't see the inflated speculative value. Test: `vmin_post_settle_publish_writes_committed_vtime`. |
 | Per-pop CPU regression < 1% | ⚠️ NOT VERIFIED | No automated micro-benchmark. PR #950 description likely captured pre/post measurements; not preserved as a regression test. |
 | Cluster smoke iperf-c P=12 ≥ 22 Gb/s | ⚠️ STALE | Last evidence at `docs/pr/940-942-vmin-correctness/smoke.md` (post-PR-#953). Re-verify on current master. |
 | iperf-b retx = 0 | ⚠️ STALE | Same. Re-verify. |
@@ -208,14 +208,18 @@ scope" claim.
 
 ### What this PR does
 
-1. **Fix Gap 1**: extend the doc comment on
-   `SharedCoSQueueVtimeFloor::read_v_min` (and
-   `participating_peer_count`) with the memory-ordering paragraph.
-   Add a forward-reference comment near the inlined slot loop in
-   `cos_queue_v_min_continue`.
+1. **Fix Gap 1**: rewrite the stale doc on `PaddedVtimeSlot::publish`
+   to drop the false "AND on first enqueue" claim and document the
+   omission rationale. Add the memory-ordering paragraph to the
+   replacement helper (`participating_v_min_snapshot` — see Gap 2)
+   so the contract lives where the algorithm reads happen, not on
+   helpers being deleted. Add a module-level invariant doc on
+   `cos/queue_ops/v_min.rs` capturing the publish-only-on-commit
+   rule and the no-first-enqueue rationale.
 
-2. **Fix Gap 2 via Option C**: replace the two unused helpers with
-   a single `participating_v_min_snapshot` that returns the
+2. **Fix Gap 2 via Option C**: replace the two unused helpers
+   (`read_v_min` + `participating_peer_count`) with a single
+   `participating_v_min_snapshot` that returns the
    `(participating_count, Option<v_min>)` pair in one pass. Rewrite
    `cos_queue_v_min_continue` to call it.
 

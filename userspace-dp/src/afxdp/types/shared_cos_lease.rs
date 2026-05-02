@@ -62,12 +62,19 @@ impl PaddedVtimeSlot {
         }
     }
 
-    /// Worker calls this on commit boundary publish — after a
-    /// post-settle TX-ring commit (`cos/queue_service/service.rs`
-    /// post-`settle_*` sites), after a `cos_queue_push_front`
-    /// rollback that restores `queue_vtime`, or after the
-    /// `demote_prepared_cos_queue_to_local` restore at
-    /// `tx/cos_classify.rs:641`.
+    /// Worker calls this on commit boundary publish. Six call
+    /// sites total:
+    ///   - 4 post-settle TX-ring commit sites in
+    ///     `cos/queue_service/service.rs` (each immediately after
+    ///     `settle_*`/commit), via the `publish_committed_queue_vtime`
+    ///     helper.
+    ///   - 1 demote-restore site in `tx/cos_classify.rs:641` (after
+    ///     `demote_prepared_cos_queue_to_local` restores the saved
+    ///     `queue_vtime`), via the same helper.
+    ///   - 1 direct call in `cos/queue_ops/push.rs:126` on the
+    ///     rollback path of `cos_queue_push_front`, restoring the
+    ///     pre-pop `queue_vtime` so peers don't see the inflated
+    ///     speculative value.
     ///
     /// Release ordering ensures any prior writes to
     /// `flow_bucket_*_finish_bytes` and `queue_vtime` are
@@ -148,13 +155,14 @@ impl SharedCoSQueueVtimeFloor {
     /// `vacate`. The iteration is **non-atomic across slots** —
     /// a slot can transition `vtime → NOT_PARTICIPATING` (or
     /// vice versa) between two reads in the same iteration. The
-    /// V_min reduction's correctness contract (#941 plan §3.4) is
-    /// "the result reflects SOME consistent snapshot of
-    /// participating peers at SOME point during iteration" — NOT
-    /// "all reads are atomic with each other". The throttle
-    /// decision is a hint, bounded staleness across the K-cadence
-    /// read window, not a hard barrier. Introducing a global lock
-    /// or seqlock would re-introduce the contention the algorithm
+    /// reduction does NOT produce a linearizable cross-slot
+    /// snapshot (no lock, seqlock, retry, or epoch); it produces
+    /// the set of values observed during the scan, where each
+    /// individual value is a valid Acquire-load of that slot at
+    /// some moment within the scan window. The throttle decision
+    /// is a hint with staleness bounded by the K-cadence read
+    /// interval, not a hard barrier. Introducing a global lock or
+    /// seqlock would re-introduce the contention the algorithm
     /// was designed to eliminate.
     ///
     /// Replaces the prior `read_v_min` + `participating_peer_count`
