@@ -5,6 +5,29 @@ use super::*;
 // across workers participating in shared-exact queues. Together they
 // implement the suspension / continuation handshake that prevents
 // runaway flows from monopolizing a shared-exact queue.
+//
+// Publish-only-on-commit invariant (#940 + #941):
+//
+// Slots are written ONLY at commit boundaries — post-settle TX-ring
+// commit sites in `cos/queue_service/service.rs`, the rollback path in
+// `cos_queue_push_front`, and the demote-restore site at
+// `tx/cos_classify.rs:641`. The original #939 implementation also
+// published on speculative pop AND on first-enqueue (bucket-count
+// 0 → ≥1 transition); both were removed. Tests
+// `vmin_pop_snapshot_does_not_publish` and `vmin_no_first_enqueue_publish`
+// enforce the absence.
+//
+// Why no first-enqueue publish: a worker that has just (re-)entered a
+// queue via enqueue has no committed work to broadcast. Its
+// `queue_vtime` is either the initial 0 (fresh queue) or the stale
+// pre-vacate value (re-entry after vacate). Publishing either would
+// inject a value into peers' V_min reduction that doesn't correspond
+// to in-flight TX-ring frames. The peer-side reduction
+// (`SharedCoSQueueVtimeFloor::participating_v_min_snapshot`) skips
+// `NOT_PARTICIPATING` slots, so a worker re-entering after vacate is
+// correctly invisible to peers until its first post-settle publish
+// broadcasts a real committed vtime. This preserves the algorithm's
+// "slot vtime ≤ committed-vtime" invariant.
 
 /// #940 — publish the committed `queue_vtime` to the V_min floor
 /// slot. Called from each TX-ring commit site AFTER `settle_*`
@@ -135,22 +158,16 @@ pub(in crate::afxdp) fn cos_queue_v_min_continue(queue: &mut CoSQueueRuntime, po
     let Some(floor) = queue.vtime_floor.as_ref() else {
         return true;
     };
-    let mut participating = 0u32;
-    let mut v_min = u64::MAX;
-    for (w, slot) in floor.slots.iter().enumerate() {
-        if w == queue.worker_id as usize {
-            continue;
-        }
-        if let Some(peer_vtime) = slot.read() {
-            participating += 1;
-            v_min = v_min.min(peer_vtime);
-        }
-    }
-    if participating == 0 {
+    // Single-pass snapshot of participating peers' V_min. See the
+    // memory-ordering doc on `participating_v_min_snapshot` for the
+    // non-atomic-across-slots contract. The replaced inline loop did
+    // exactly the same iteration; preserved byte-for-byte semantics.
+    let (participating, v_min) = floor.participating_v_min_snapshot(queue.worker_id);
+    let Some(v_min) = v_min else {
         // No peers — reset hard-cap counter and continue.
         queue.consecutive_v_min_skips = 0;
         return true;
-    }
+    };
     let lag = compute_v_min_lag_threshold(queue.transmit_rate_bytes, participating + 1);
     let cont = queue.queue_vtime <= v_min.saturating_add(lag);
     if cont {
