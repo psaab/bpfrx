@@ -1301,11 +1301,15 @@ func TestArchivalConfigSetSyntax(t *testing.T) {
 	}
 }
 
-// #903: `set system dataplane userspace workers N` must be rejected at
-// compile time so the operator gets immediate feedback that the path is
-// a no-op (the canonical path is `set system dataplane workers N`,
-// dispatched via dataplane-type=userspace).
-func TestDataplaneUserspaceNestedPathRejected(t *testing.T) {
+// #903: `set system dataplane userspace workers N` was a silent no-op
+// before this fix — the parser accepted it but xpfd never read the
+// resulting AST node. The fix recurses into the nested `userspace`
+// block from compileUserspaceDataplane so the inner setting takes
+// effect (operator-friendly: their existing config now actually works
+// instead of silently doing nothing). Backward-compatible: a stored
+// pre-fix config that uses this form still commits cleanly post-upgrade
+// AND now produces the intended runtime effect.
+func TestDataplaneUserspaceNestedPathRecurses(t *testing.T) {
 	tree := &ConfigTree{}
 	setCommands := []string{
 		"set system dataplane-type userspace",
@@ -1317,12 +1321,16 @@ func TestDataplaneUserspaceNestedPathRejected(t *testing.T) {
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}
 	}
-	_, err := CompileConfig(tree)
-	if err == nil {
-		t.Fatal("expected CompileConfig to reject `dataplane userspace workers`, got nil")
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
 	}
-	if !strings.Contains(err.Error(), "dataplane userspace") {
-		t.Errorf("unexpected error message: %v", err)
+	if cfg.System.UserspaceDataplane == nil {
+		t.Fatal("expected UserspaceDataplane to be populated")
+	}
+	if cfg.System.UserspaceDataplane.Workers != 4 {
+		t.Errorf("Workers via nested path: got %d, want 4",
+			cfg.System.UserspaceDataplane.Workers)
 	}
 }
 

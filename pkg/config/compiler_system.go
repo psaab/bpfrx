@@ -1,9 +1,6 @@
 package config
 
-import (
-	"fmt"
-	"strconv"
-)
+import "strconv"
 
 func compileSystem(node *Node, sys *SystemConfig) error {
 	for _, child := range node.Children {
@@ -431,15 +428,28 @@ func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
 	for _, child := range node.Children {
 		switch child.Name() {
 		case "userspace":
-			// #903: `set system dataplane userspace ...` is a no-op path
-			// that the operator can write but xpfd never reads (we are
-			// already inside compileUserspaceDataplane, dispatched from
-			// `case "dataplane"` based on dataplane-type=userspace).
-			// Reject explicitly so the operator gets immediate feedback
-			// instead of silent acceptance + zero effect at runtime.
-			return fmt.Errorf("`system dataplane userspace ...` is not a valid path; " +
-				"set knobs directly under `system dataplane` " +
-				"(e.g. `set system dataplane workers N`)")
+			// #903: `set system dataplane userspace ...` is a redundant
+			// path — the operator wrote `userspace` again under a
+			// dataplane block we are ALREADY processing as the userspace
+			// dataplane (entered via `case "dataplane"` after
+			// dataplane-type=userspace). Pre-fix this was a silent
+			// no-op; we now strip the leading "userspace" key and
+			// re-dispatch through this same switch so the inner setting
+			// (`workers 4`, `poll-mode interrupt`, etc.) actually takes
+			// effect. Backward-compatible: no commit-time hard error,
+			// so stored pre-fix configs replay cleanly on upgrade AND
+			// finally do what the operator intended.
+			if len(child.Keys) >= 2 {
+				synthetic := &Node{
+					Keys:     child.Keys[1:],
+					Children: child.Children,
+					IsLeaf:   child.IsLeaf,
+				}
+				synthParent := &Node{Children: []*Node{synthetic}}
+				if err := compileUserspaceDataplane(synthParent, cfg); err != nil {
+					return err
+				}
+			}
 		case "binary":
 			cfg.Binary = nodeVal(child)
 		case "control-socket":
