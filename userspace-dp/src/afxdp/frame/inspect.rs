@@ -8,103 +8,9 @@
 
 use super::*;
 
-/// Check if a frame contains a TCP RST flag.
-pub(in crate::afxdp) fn frame_has_tcp_rst(frame: &[u8]) -> bool {
-    let l3 = match frame_l3_offset(frame) {
-        Some(off) => off,
-        None => return false,
-    };
-    let ip = match frame.get(l3..) {
-        Some(ip) if ip.len() >= 20 => ip,
-        _ => return false,
-    };
-    let (protocol, l4_offset) = match ip[0] >> 4 {
-        4 => {
-            let ihl = ((ip[0] & 0x0f) as usize) * 4;
-            (ip[9], ihl)
-        }
-        6 if ip.len() >= 40 => (ip[6], 40usize),
-        _ => return false,
-    };
-    if protocol != PROTO_TCP {
-        return false;
-    }
-    let tcp = match ip.get(l4_offset..) {
-        Some(t) if t.len() >= 14 => t,
-        _ => return false,
-    };
-    // TCP flags at offset 13: RST = 0x04
-    (tcp[13] & 0x04) != 0
-}
-
-/// Extract TCP flags and window from raw frame, auto-detecting L3 from Ethernet header.
-/// Returns (tcp_flags, tcp_window) or None.
-pub(in crate::afxdp) fn extract_tcp_flags_and_window(frame: &[u8]) -> Option<(u8, u16)> {
-    let l3 = frame_l3_offset(frame)?;
-    let ip = frame.get(l3..)?;
-    let (protocol, l4_offset) = match ip.first()? >> 4 {
-        4 => {
-            if ip.len() < 20 {
-                return None;
-            }
-            let ihl = ((ip[0] & 0x0f) as usize) * 4;
-            (ip[9], ihl)
-        }
-        6 => {
-            if ip.len() < 40 {
-                return None;
-            }
-            (ip[6], 40usize)
-        }
-        _ => return None,
-    };
-    if protocol != PROTO_TCP {
-        return None;
-    }
-    let tcp = ip.get(l4_offset..)?;
-    if tcp.len() < 16 {
-        return None;
-    }
-    let flags = tcp[13];
-    let window = u16::from_be_bytes([tcp[14], tcp[15]]);
-    Some((flags, window))
-}
-
-/// Extract TCP window size from raw frame data.
-/// Returns None if not a TCP frame or if frame is too short.
-#[allow(dead_code)]
-pub(in crate::afxdp) fn extract_tcp_window(frame: &[u8], addr_family: u8) -> Option<u16> {
-    let l3 = match frame_l3_offset(frame) {
-        Some(off) => off,
-        None => return None,
-    };
-    let ip = frame.get(l3..)?;
-    let (protocol, l4_offset) = match addr_family as i32 {
-        libc::AF_INET => {
-            if ip.len() < 20 {
-                return None;
-            }
-            let ihl = ((ip[0] & 0x0f) as usize) * 4;
-            (ip[9], ihl)
-        }
-        libc::AF_INET6 => {
-            if ip.len() < 40 {
-                return None;
-            }
-            (ip[6], 40usize)
-        }
-        _ => return None,
-    };
-    if protocol != PROTO_TCP {
-        return None;
-    }
-    let tcp = ip.get(l4_offset..)?;
-    if tcp.len() < 16 {
-        return None;
-    }
-    // TCP window is at offset 14-15 (big-endian)
-    Some(u16::from_be_bytes([tcp[14], tcp[15]]))
-}
+// #989: TCP-specific inspection helpers (frame_has_tcp_rst,
+// extract_tcp_flags_and_window, extract_tcp_window) and tcp_flags_str
+// were relocated to `frame/tcp.rs`.
 
 pub(in crate::afxdp) fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
     if frame.len() < 14 {
@@ -120,34 +26,7 @@ pub(in crate::afxdp) fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
     Some(14)
 }
 
-pub(in crate::afxdp) fn tcp_flags_str(flags: u8) -> String {
-    let mut s = String::with_capacity(12);
-    if flags & 0x02 != 0 {
-        s.push_str("SYN ");
-    }
-    if flags & 0x10 != 0 {
-        s.push_str("ACK ");
-    }
-    if flags & 0x01 != 0 {
-        s.push_str("FIN ");
-    }
-    if flags & 0x04 != 0 {
-        s.push_str("RST ");
-    }
-    if flags & 0x08 != 0 {
-        s.push_str("PSH ");
-    }
-    if flags & 0x20 != 0 {
-        s.push_str("URG ");
-    }
-    if s.ends_with(' ') {
-        s.truncate(s.len() - 1);
-    }
-    if s.is_empty() {
-        s.push_str("none");
-    }
-    s
-}
+// #989: tcp_flags_str moved to `frame/tcp.rs`.
 
 pub(in crate::afxdp) fn frame_l4_offset(frame: &[u8], addr_family: u8) -> Option<usize> {
     let l3 = frame_l3_offset(frame)?;

@@ -3,6 +3,7 @@ use super::*;
 mod byte_writes;
 mod checksum;
 mod inspect;
+mod tcp;
 
 use byte_writes::{
     write_ipv4_dst, write_ipv4_src, write_ipv6_dst, write_ipv6_src, write_l4_dst_port,
@@ -32,17 +33,27 @@ pub(in crate::afxdp) use checksum::{
 // rest stay at `pub(super)` (afxdp-only callers in sibling files).
 pub(in crate::afxdp) use inspect::{
     authoritative_forward_ports, decode_frame_summary, forward_tuple_mismatch_reason,
-    frame_has_tcp_rst, parse_session_flow, try_parse_metadata,
+    parse_session_flow, try_parse_metadata,
 };
 pub(super) use inspect::{
-    extract_tcp_flags_and_window, extract_tcp_window, frame_l3_offset, frame_l4_offset,
-    live_frame_ports, live_frame_ports_bytes, live_frame_ports_from_meta_bytes,
-    metadata_tuple_complete, packet_rel_l4_offset, packet_rel_l4_offset_and_protocol,
-    parse_flow_ports, parse_ipv4_session_flow_from_frame, parse_packet_destination_from_frame,
-    parse_session_flow_from_bytes, parse_session_flow_from_frame, parse_session_flow_from_meta,
+    frame_l3_offset, frame_l4_offset, live_frame_ports, live_frame_ports_bytes,
+    live_frame_ports_from_meta_bytes, metadata_tuple_complete, packet_rel_l4_offset,
+    packet_rel_l4_offset_and_protocol, parse_flow_ports, parse_ipv4_session_flow_from_frame,
+    parse_packet_destination_from_frame, parse_session_flow_from_bytes,
+    parse_session_flow_from_frame, parse_session_flow_from_meta,
     parse_zone_encoded_fabric_ingress, parse_zone_encoded_fabric_ingress_from_frame,
-    tcp_flags_str,
 };
+
+// #989: TCP-specific inspection + mutation kernels relocated from
+// frame/inspect.rs and forwarding/mod.rs. Visibility split mirrors
+// the inspect re-exports above:
+//   - frame_has_tcp_rst: pub(in crate::afxdp) so afxdp.rs / tx
+//     callers continue to see it via the wider re-export path.
+//   - the remaining helpers stay at pub(super) (or fn-private for
+//     the clamp helpers, which are only used inside frame/mod.rs).
+pub(in crate::afxdp) use tcp::frame_has_tcp_rst;
+pub(super) use tcp::{extract_tcp_flags_and_window, extract_tcp_window, tcp_flags_str};
+use tcp::clamp_tcp_mss_frame;
 
 // #1046: TCP segmentation builders extracted into tcp_segmentation.rs
 // to keep frame/mod.rs under the modularity-discipline LOC threshold.
