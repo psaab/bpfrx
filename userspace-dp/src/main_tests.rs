@@ -608,6 +608,12 @@ fn binding_counters_snapshot_projects_ring_pressure_fields() {
         tx_errors: 29,
         tx_submit_error_drops: 31,
         pending_tx_local_overflow_drops: 37,
+        // #918 / #943: pin per-set LRU collision and V_min telemetry
+        // through the projection so a future refactor that drops
+        // either assignment surfaces here.
+        flow_cache_collision_evictions: 53,
+        v_min_throttle_hard_cap_overrides: 59,
+        v_min_throttles: 67,
         ..Default::default()
     };
     // #804: exercise the `impl From<&BindingStatus>` path. The old
@@ -627,6 +633,9 @@ fn binding_counters_snapshot_projects_ring_pressure_fields() {
     assert_eq!(snap.tx_errors, 29);
     assert_eq!(snap.tx_submit_error_drops, 31);
     assert_eq!(snap.pending_tx_local_overflow_drops, 37);
+    assert_eq!(snap.flow_cache_collision_evictions, 53);
+    assert_eq!(snap.v_min_throttle_hard_cap_overrides, 59);
+    assert_eq!(snap.v_min_throttles, 67);
 }
 
 #[test]
@@ -670,6 +679,8 @@ fn binding_counters_snapshot_serializes_with_expected_wire_keys() {
         tx_ring_capacity: 26,
         // #918: per-set LRU collision-eviction counter.
         flow_cache_collision_evictions: 27,
+        v_min_throttle_hard_cap_overrides: 28,
+        v_min_throttles: 29,
     };
     let value: serde_json::Value =
         serde_json::to_value(&snap).expect("serialize snapshot to Value");
@@ -708,6 +719,11 @@ fn binding_counters_snapshot_serializes_with_expected_wire_keys() {
         "tx_ring_capacity",
         // #918: per-set LRU collision-eviction counter wire key.
         "flow_cache_collision_evictions",
+        // #941 Work item D / #943: V_min throttle counter wire keys.
+        // Absence breaks the binding-counter snapshot consumer that
+        // gates fairness diagnostics on these fields.
+        "v_min_throttle_hard_cap_overrides",
+        "v_min_throttles",
     ] {
         assert!(
             obj.contains_key(key),
@@ -798,6 +814,8 @@ fn tx_latency_hist_serialization_roundtrip() {
         tx_ring_capacity: 2_048,
         // #918: per-set LRU collision-eviction counter.
         flow_cache_collision_evictions: 17,
+        v_min_throttle_hard_cap_overrides: 18,
+        v_min_throttles: 19,
     };
     let json = serde_json::to_string(&snap).expect("serialize snapshot");
     let back: BindingCountersSnapshot =

@@ -1214,6 +1214,23 @@ pub(crate) struct BindingStatus {
     /// under load.
     #[serde(rename = "flow_cache_collision_evictions", default)]
     pub flow_cache_collision_evictions: u64,
+    /// #941 Work item D / #943: count of V_min hard-cap activations
+    /// on this binding. Hard-cap is the escape hatch that fires
+    /// after V_MIN_CONSECUTIVE_SKIP_HARD_CAP back-to-back throttle
+    /// decisions, force-continuing the drain to recover throughput
+    /// under persistent peer-vtime spread. Acceptance gate: under
+    /// normal load, override-rate stays below 5 %.
+    #[serde(rename = "v_min_throttle_hard_cap_overrides", default)]
+    pub v_min_throttle_hard_cap_overrides: u64,
+    /// #943: count of regular V_min throttle decisions
+    /// (`cos_queue_v_min_continue` returned `false` and the drain
+    /// loop early-broke) on this binding. Distinct from the hard-cap
+    /// override path (which force-continues despite the throttle).
+    /// Together: `v_min_throttles` is "fairness brake fired",
+    /// `v_min_throttle_hard_cap_overrides` is "brake too tight, escape
+    /// hatch rescued throughput". Ratio is the LAG_THRESHOLD diagnostic.
+    #[serde(rename = "v_min_throttles", default)]
+    pub v_min_throttles: u64,
     #[serde(rename = "session_hits", default)]
     pub session_hits: u64,
     #[serde(rename = "session_misses", default)]
@@ -1543,6 +1560,14 @@ pub(crate) struct BindingCountersSnapshot {
     /// consumers parseable — the field simply deserializes as 0.
     #[serde(rename = "flow_cache_collision_evictions", default)]
     pub flow_cache_collision_evictions: u64,
+    /// #941 Work item D / #943: V_min hard-cap activation count.
+    /// Default keeps pre-#943 consumers parseable.
+    #[serde(rename = "v_min_throttle_hard_cap_overrides", default)]
+    pub v_min_throttle_hard_cap_overrides: u64,
+    /// #943: regular V_min throttle decisions. Default keeps
+    /// pre-#943 consumers parseable.
+    #[serde(rename = "v_min_throttles", default)]
+    pub v_min_throttles: u64,
 }
 
 // #812 (plan §3.5a / §6.1 test #8): compile-time assertion that
@@ -1612,6 +1637,11 @@ impl From<&BindingStatus> for BindingCountersSnapshot {
             // #918: flow under by-value u64; same Send/'static
             // discipline as the other counters.
             flow_cache_collision_evictions: b.flow_cache_collision_evictions,
+            // #941 Work item D / #943: V_min counters propagate from
+            // BindingDebugSnapshot through to the wire-visible
+            // BindingCountersSnapshot. By-value u64, no Send concerns.
+            v_min_throttle_hard_cap_overrides: b.v_min_throttle_hard_cap_overrides,
+            v_min_throttles: b.v_min_throttles,
         }
     }
 }
@@ -1904,5 +1934,62 @@ mod tests {
         assert_eq!(snap.tx_kick_latency_count, status.tx_kick_latency_count);
         assert_eq!(snap.tx_kick_latency_sum_ns, status.tx_kick_latency_sum_ns);
         assert_eq!(snap.tx_kick_retry_count, status.tx_kick_retry_count);
+    }
+
+    // #943 Copilot round-2 finding #3: the rich BindingStatus wire
+    // shape carries the two new V_min fields, but nothing pinned
+    // their wire keys at this layer. A future serde-rename typo
+    // would silently project as zeros into the Go consumer (which
+    // tolerates unknown fields). Round-trip + key-presence catches
+    // both directions of the contract here.
+    #[test]
+    fn v_min_throttle_binding_status_wire_roundtrip() {
+        let status = BindingStatus {
+            worker_id: 9,
+            slot: 1,
+            ifindex: 4,
+            queue_id: 6,
+            v_min_throttle_hard_cap_overrides: 71,
+            v_min_throttles: 73,
+            ..Default::default()
+        };
+        let value: serde_json::Value =
+            serde_json::to_value(&status).expect("serialize BindingStatus to Value");
+        let obj = value
+            .as_object()
+            .expect("BindingStatus serializes as a JSON object");
+        for key in ["v_min_throttle_hard_cap_overrides", "v_min_throttles"] {
+            assert!(
+                obj.contains_key(key),
+                "BindingStatus wire key `{key}` missing: {value}"
+            );
+        }
+        let json = serde_json::to_string(&status).expect("serialize BindingStatus");
+        let back: BindingStatus =
+            serde_json::from_str(&json).expect("deserialize BindingStatus");
+        assert_eq!(
+            back.v_min_throttle_hard_cap_overrides,
+            status.v_min_throttle_hard_cap_overrides
+        );
+        assert_eq!(back.v_min_throttles, status.v_min_throttles);
+    }
+
+    // #943 additive-wire contract: a pre-#943 BindingStatus payload
+    // with both V_min fields absent must decode with zero defaults,
+    // matching the same defaulting pattern the kick-latency fields
+    // use above. Without this, the projection's `..Default::default`
+    // would compile but the wire side could silently break.
+    #[test]
+    fn v_min_throttle_binding_status_backward_compat() {
+        let legacy_json = r#"{
+            "worker_id": 1,
+            "slot": 0,
+            "ifindex": 0,
+            "queue_id": 0
+        }"#;
+        let status: BindingStatus =
+            serde_json::from_str(legacy_json).expect("pre-#943 payload decodes");
+        assert_eq!(status.v_min_throttle_hard_cap_overrides, 0);
+        assert_eq!(status.v_min_throttles, 0);
     }
 }

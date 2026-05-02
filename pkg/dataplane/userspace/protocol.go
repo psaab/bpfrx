@@ -645,6 +645,14 @@ type BindingStatus struct {
 	// LRU displacement vs stale-on-lookup eviction). Acceptance gate
 	// watches collision_evictions / hits under load.
 	FlowCacheCollisionEvictions       uint64    `json:"flow_cache_collision_evictions,omitempty"`
+	// #941 Work item D / #943: V_min throttle counters. Hard-cap is
+	// the escape-hatch firing when fairness brake (regular throttle)
+	// has thrown V_MIN_CONSECUTIVE_SKIP_HARD_CAP back-to-back times.
+	// Together: VMinThrottles = "fairness brake fired",
+	// VMinThrottleHardCapOverrides = "brake too tight, escape hatch
+	// rescued throughput". Ratio is the LAG_THRESHOLD diagnostic.
+	VMinThrottleHardCapOverrides      uint64    `json:"v_min_throttle_hard_cap_overrides,omitempty"`
+	VMinThrottles                     uint64    `json:"v_min_throttles,omitempty"`
 	SessionHits                       uint64    `json:"session_hits,omitempty"`
 	SessionMisses                     uint64    `json:"session_misses,omitempty"`
 	SessionCreates                    uint64    `json:"session_creates,omitempty"`
@@ -793,6 +801,17 @@ type BindingCountersSnapshot struct {
 	TxKickLatencyCount   uint64   `json:"tx_kick_latency_count,omitempty"`
 	TxKickLatencySumNs   uint64   `json:"tx_kick_latency_sum_ns,omitempty"`
 	TxKickRetryCount     uint64   `json:"tx_kick_retry_count,omitempty"`
+	// #918: per-set LRU collision-eviction counter, brought through
+	// to the lean snapshot for fast-poll consumers that need the
+	// flow-cache thrash signal. Default keeps pre-#918 helpers parseable.
+	FlowCacheCollisionEvictions uint64 `json:"flow_cache_collision_evictions,omitempty"`
+	// #941 Work item D / #943: V_min throttle counters. The lean
+	// per_binding view is what fast-poll consumers (mouse-latency
+	// orchestrator, MQFQ diagnostics) read; without these here, V_min
+	// observability stops at the rich BindingStatus and ProcessStatus.per_binding
+	// projects zeros even when the atomics flushed real values.
+	VMinThrottleHardCapOverrides uint64 `json:"v_min_throttle_hard_cap_overrides,omitempty"`
+	VMinThrottles                uint64 `json:"v_min_throttles,omitempty"`
 }
 
 type ExceptionStatus struct {

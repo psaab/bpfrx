@@ -153,3 +153,85 @@ func TestBindingCountersSnapshotTxKickLatencyBackwardCompat(t *testing.T) {
 			back.TxKickRetryCount)
 	}
 }
+
+// #943: round-trip the V_min telemetry fields on both BindingStatus
+// and the lean BindingCountersSnapshot mirror. Without this test, a
+// future tag drift (e.g. someone renames `v_min_throttles` to
+// `v_min_throttle_count` on one side) would silently zero the
+// counter on the wire and the daemon would report no throttling.
+func TestBindingStatusVMinThrottleRoundTrip(t *testing.T) {
+	in := BindingStatus{
+		WorkerID:                     3,
+		Slot:                         7,
+		Ifindex:                      11,
+		QueueID:                      2,
+		FlowCacheCollisionEvictions:  53,
+		VMinThrottleHardCapOverrides: 59,
+		VMinThrottles:                67,
+	}
+	raw, err := json.Marshal(&in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	for _, key := range []string{"flow_cache_collision_evictions", "v_min_throttle_hard_cap_overrides", "v_min_throttles"} {
+		if _, ok := obj[key]; !ok {
+			t.Fatalf("wire key %q missing from BindingStatus JSON: %s", key, string(raw))
+		}
+	}
+
+	var back BindingStatus
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal BindingStatus: %v", err)
+	}
+	if back.FlowCacheCollisionEvictions != 53 {
+		t.Fatalf("FlowCacheCollisionEvictions: got %d, want 53", back.FlowCacheCollisionEvictions)
+	}
+	if back.VMinThrottleHardCapOverrides != 59 {
+		t.Fatalf("VMinThrottleHardCapOverrides: got %d, want 59", back.VMinThrottleHardCapOverrides)
+	}
+	if back.VMinThrottles != 67 {
+		t.Fatalf("VMinThrottles: got %d, want 67", back.VMinThrottles)
+	}
+}
+
+func TestBindingCountersSnapshotVMinThrottleRoundTrip(t *testing.T) {
+	in := BindingCountersSnapshot{
+		WorkerID:                     3,
+		Ifindex:                      11,
+		QueueID:                      2,
+		FlowCacheCollisionEvictions:  53,
+		VMinThrottleHardCapOverrides: 59,
+		VMinThrottles:                67,
+	}
+	raw, err := json.Marshal(&in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	for _, key := range []string{"flow_cache_collision_evictions", "v_min_throttle_hard_cap_overrides", "v_min_throttles"} {
+		if _, ok := obj[key]; !ok {
+			t.Fatalf("wire key %q missing from BindingCountersSnapshot JSON: %s", key, string(raw))
+		}
+	}
+
+	var back BindingCountersSnapshot
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal BindingCountersSnapshot: %v", err)
+	}
+	if back.FlowCacheCollisionEvictions != 53 {
+		t.Fatalf("FlowCacheCollisionEvictions: got %d, want 53", back.FlowCacheCollisionEvictions)
+	}
+	if back.VMinThrottleHardCapOverrides != 59 {
+		t.Fatalf("VMinThrottleHardCapOverrides: got %d, want 59", back.VMinThrottleHardCapOverrides)
+	}
+	if back.VMinThrottles != 67 {
+		t.Fatalf("VMinThrottles: got %d, want 67", back.VMinThrottles)
+	}
+}

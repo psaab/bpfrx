@@ -1224,3 +1224,134 @@ fn tx_kick_latency_cross_thread_snapshot_skew_within_bound() {
          max_w_read_ns={max_w_read_ns} count_final={count_final}",
     );
 }
+
+/// #943: pin the flush-into-atomic semantics. The two scratch
+/// counters on each `CoSQueueRuntime` accumulate per-pop V_min
+/// throttle decisions; once per drain (via `update_binding_debug_state`)
+/// they flush into the binding-wide atomics and reset. This test
+/// covers the flush body in isolation (extracted as
+/// `flush_v_min_scratches_into` so the unit test doesn't need a full
+/// `BindingWorker`).
+#[test]
+fn flush_v_min_scratches_sums_and_zeros_per_queue_counters() {
+    use crate::afxdp::types::CoSInterfaceConfig;
+    use crate::afxdp::cos::builders::build_cos_interface_runtime;
+
+    // Two queues so we exercise the per-queue iteration.
+    let cfg = CoSInterfaceConfig {
+        shaping_rate_bytes: 10_000_000,
+        burst_bytes: 1024 * 1024,
+        default_queue: 0,
+        dscp_classifier: String::new(),
+        ieee8021_classifier: String::new(),
+        dscp_queue_by_dscp: [0u8; 64],
+        ieee8021_queue_by_pcp: [0u8; 8],
+        queue_by_forwarding_class: Default::default(),
+        queues: vec![
+            crate::afxdp::types::CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "be".into(),
+                priority: 0,
+                transmit_rate_bytes: 1_000_000,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 64 * 1024,
+                dscp_rewrite: None,
+            },
+            crate::afxdp::types::CoSQueueConfig {
+                queue_id: 1,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: 5_000_000,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 64 * 1024,
+                dscp_rewrite: None,
+            },
+        ],
+    };
+    let mut runtime = build_cos_interface_runtime(&cfg, 0);
+
+    // Manually populate scratches as if v_min check fired.
+    runtime.queues[0].v_min_hard_cap_overrides_scratch = 3;
+    runtime.queues[0].v_min_throttles_scratch = 17;
+    runtime.queues[1].v_min_hard_cap_overrides_scratch = 5;
+    runtime.queues[1].v_min_throttles_scratch = 23;
+
+    let hard_cap = std::sync::atomic::AtomicU64::new(0);
+    let throttles = std::sync::atomic::AtomicU64::new(0);
+    let mut interfaces = std::collections::BTreeMap::new();
+    interfaces.insert(1, runtime);
+
+    crate::afxdp::umem::flush_v_min_scratches_into(
+        interfaces.values_mut(),
+        &hard_cap,
+        &throttles,
+    );
+
+    // Atomics carry the sums.
+    assert_eq!(
+        hard_cap.load(std::sync::atomic::Ordering::Relaxed),
+        3 + 5,
+        "hard_cap atomic must equal sum across queues",
+    );
+    assert_eq!(
+        throttles.load(std::sync::atomic::Ordering::Relaxed),
+        17 + 23,
+        "throttles atomic must equal sum across queues",
+    );
+
+    // Per-queue scratches reset to 0.
+    let r = interfaces.get(&1).unwrap();
+    assert_eq!(r.queues[0].v_min_hard_cap_overrides_scratch, 0);
+    assert_eq!(r.queues[0].v_min_throttles_scratch, 0);
+    assert_eq!(r.queues[1].v_min_hard_cap_overrides_scratch, 0);
+    assert_eq!(r.queues[1].v_min_throttles_scratch, 0);
+}
+
+/// #943: a second flush call with all scratches zero must NOT bump
+/// the atomics — the flush is a no-op in steady state when no
+/// throttling occurred since the last update_binding_debug_state.
+#[test]
+fn flush_v_min_scratches_no_op_when_all_zero() {
+    use crate::afxdp::types::CoSInterfaceConfig;
+    use crate::afxdp::cos::builders::build_cos_interface_runtime;
+
+    let cfg = CoSInterfaceConfig {
+        shaping_rate_bytes: 10_000_000,
+        burst_bytes: 1024 * 1024,
+        default_queue: 0,
+        dscp_classifier: String::new(),
+        ieee8021_classifier: String::new(),
+        dscp_queue_by_dscp: [0u8; 64],
+        ieee8021_queue_by_pcp: [0u8; 8],
+        queue_by_forwarding_class: Default::default(),
+        queues: vec![crate::afxdp::types::CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "be".into(),
+            priority: 0,
+            transmit_rate_bytes: 1_000_000,
+            exact: true,
+            surplus_weight: 1,
+            buffer_bytes: 64 * 1024,
+            dscp_rewrite: None,
+        }],
+    };
+    let runtime = build_cos_interface_runtime(&cfg, 0);
+    // Pre-load atomics with non-zero values to verify the flush
+    // doesn't accidentally store-zero.
+    let hard_cap = std::sync::atomic::AtomicU64::new(42);
+    let throttles = std::sync::atomic::AtomicU64::new(99);
+    let mut interfaces = std::collections::BTreeMap::new();
+    interfaces.insert(1, runtime);
+
+    crate::afxdp::umem::flush_v_min_scratches_into(
+        interfaces.values_mut(),
+        &hard_cap,
+        &throttles,
+    );
+
+    // Atomics unchanged — the no-zero-scratch path skips the fetch_add.
+    assert_eq!(hard_cap.load(std::sync::atomic::Ordering::Relaxed), 42);
+    assert_eq!(throttles.load(std::sync::atomic::Ordering::Relaxed), 99);
+}

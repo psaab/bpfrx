@@ -240,6 +240,18 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// `update_binding_debug_state` (mirrors flow_cache_collision_evictions
     /// flush pattern).
     pub(super) v_min_throttle_hard_cap_overrides: AtomicU64,
+    /// #943: count of V_min throttle decisions
+    /// (`cos_queue_v_min_continue` returned `false` and the caller
+    /// took the early-break path, exiting the drain loop). Distinct
+    /// from `v_min_throttle_hard_cap_overrides` which only counts
+    /// the hard-cap escape-hatch firings introduced by #941.
+    /// Acceptance gate: `v_min_throttles` non-zero under load when
+    /// V_min sync is active confirms the fairness brake is engaged;
+    /// `v_min_throttle_hard_cap_overrides / v_min_throttles` ratio
+    /// is the diagnostic for whether LAG_THRESHOLD is too tight.
+    /// Flushed from each queue's `v_min_throttles_scratch` in
+    /// `update_binding_debug_state` (mirrors flow_cache_collision_evictions).
+    pub(super) v_min_throttles: AtomicU64,
     pub(super) session_hits: AtomicU64,
     pub(super) session_misses: AtomicU64,
     pub(super) session_creates: AtomicU64,
@@ -434,6 +446,7 @@ impl BindingLiveState {
             flow_cache_evictions: AtomicU64::new(0),
             flow_cache_collision_evictions: AtomicU64::new(0),
             v_min_throttle_hard_cap_overrides: AtomicU64::new(0),
+            v_min_throttles: AtomicU64::new(0),
             session_hits: AtomicU64::new(0),
             session_misses: AtomicU64::new(0),
             session_creates: AtomicU64::new(0),
@@ -653,6 +666,7 @@ impl BindingLiveState {
             v_min_throttle_hard_cap_overrides: self
                 .v_min_throttle_hard_cap_overrides
                 .load(Ordering::Relaxed),
+            v_min_throttles: self.v_min_throttles.load(Ordering::Relaxed),
             session_hits: self.session_hits.load(Ordering::Relaxed),
             session_misses: self.session_misses.load(Ordering::Relaxed),
             session_creates: self.session_creates.load(Ordering::Relaxed),
@@ -1056,12 +1070,36 @@ pub(super) fn update_binding_debug_state(binding: &mut BindingWorker) {
             .fetch_add(binding.flow_cache.collision_evictions, Ordering::Relaxed);
         binding.flow_cache.collision_evictions = 0;
     }
-    // #941 Work item D: flush each queue's per-queue scratch counter
-    // for hard-cap activations into the binding-wide AtomicU64.
-    // Mirrors the flow_cache_collision_evictions pattern. Single-
-    // writer (worker thread) on both ends, so no atomicity issue.
+    // #941 Work item D + #943: flush each queue's per-queue scratch
+    // counters (hard-cap overrides AND regular V_min throttles) into
+    // the binding-wide AtomicU64s. Mirrors the
+    // flow_cache_collision_evictions pattern. Single-writer (worker
+    // thread) on both ends, so no atomicity issue. The body is in
+    // `flush_v_min_scratches_into` so it's directly unit-testable
+    // without needing to construct a full `BindingWorker`.
+    flush_v_min_scratches_into(
+        binding.cos_interfaces.values_mut(),
+        &binding.live.v_min_throttle_hard_cap_overrides,
+        &binding.live.v_min_throttles,
+    );
+}
+
+/// Flush each queue's per-queue V_min scratch counters
+/// (`v_min_hard_cap_overrides_scratch` + `v_min_throttles_scratch`)
+/// into the binding-wide `AtomicU64`s and zero the scratches. Single
+/// pass over `roots`, single-writer discipline. Extracted from
+/// `update_binding_debug_state` so the flush is testable without
+/// constructing a `BindingWorker` (which has ~40 fields).
+pub(super) fn flush_v_min_scratches_into<'a, I>(
+    roots: I,
+    hard_cap_target: &AtomicU64,
+    throttles_target: &AtomicU64,
+) where
+    I: IntoIterator<Item = &'a mut crate::afxdp::types::CoSInterfaceRuntime>,
+{
     let mut hard_cap_overrides_total = 0u64;
-    for root in binding.cos_interfaces.values_mut() {
+    let mut throttles_total = 0u64;
+    for root in roots {
         for queue in &mut root.queues {
             if queue.v_min_hard_cap_overrides_scratch != 0 {
                 hard_cap_overrides_total =
@@ -1070,13 +1108,18 @@ pub(super) fn update_binding_debug_state(binding: &mut BindingWorker) {
                     );
                 queue.v_min_hard_cap_overrides_scratch = 0;
             }
+            if queue.v_min_throttles_scratch != 0 {
+                throttles_total = throttles_total
+                    .saturating_add(u64::from(queue.v_min_throttles_scratch));
+                queue.v_min_throttles_scratch = 0;
+            }
         }
     }
     if hard_cap_overrides_total != 0 {
-        binding
-            .live
-            .v_min_throttle_hard_cap_overrides
-            .fetch_add(hard_cap_overrides_total, Ordering::Relaxed);
+        hard_cap_target.fetch_add(hard_cap_overrides_total, Ordering::Relaxed);
+    }
+    if throttles_total != 0 {
+        throttles_target.fetch_add(throttles_total, Ordering::Relaxed);
     }
 }
 
