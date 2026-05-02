@@ -175,6 +175,12 @@ pub(in crate::afxdp) fn cos_queue_v_min_continue(queue: &mut CoSQueueRuntime, po
             queue.v_min_hard_cap_overrides_scratch.saturating_add(1);
         return true;
     }
+    // #943: regular throttle path — caller will break out of the
+    // drain loop. Counted distinctly from the hard-cap override path
+    // (which fires above and returns true) so operators can tell
+    // "fairness brake working as designed" from "brake too tight,
+    // hard-cap rescuing throughput".
+    queue.v_min_throttles_scratch = queue.v_min_throttles_scratch.saturating_add(1);
     false
 }
 

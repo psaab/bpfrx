@@ -1091,6 +1091,7 @@ fn restore_cos_local_items_marks_queue_runnable_after_retry() {
         consecutive_v_min_skips: 0,
         v_min_suspended_remaining: 0,
         v_min_hard_cap_overrides_scratch: 0,
+                v_min_throttles_scratch: 0,
     };
     let retry = VecDeque::from([TxRequest {
         bytes: vec![0; 1500],
@@ -1153,6 +1154,7 @@ fn restore_cos_prepared_items_marks_queue_runnable_after_retry() {
         consecutive_v_min_skips: 0,
         v_min_suspended_remaining: 0,
         v_min_hard_cap_overrides_scratch: 0,
+                v_min_throttles_scratch: 0,
     };
     let retry = VecDeque::from([PreparedTxRequest {
         offset: 64,

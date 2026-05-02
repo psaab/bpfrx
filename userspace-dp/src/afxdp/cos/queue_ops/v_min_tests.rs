@@ -194,6 +194,110 @@ fn vmin_throttle_function_fires_on_lag_breach() {
     );
 }
 
+/// #943: every regular V_min throttle decision (i.e. not a hard-cap
+/// override) bumps `v_min_throttles_scratch`. The scratch flushes
+/// to `BindingLiveState::v_min_throttles` in `update_binding_debug_state`
+/// (covered separately under the umem flush tests). This test pins
+/// just the increment site so a future refactor that drops the
+/// counter increment from the throttle path surfaces here.
+#[test]
+fn vmin_throttle_increments_v_min_throttles_scratch() {
+    let mut root = test_cos_runtime_with_queues(
+        10_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "iperf-c".into(),
+            priority: 5,
+            transmit_rate_bytes: 10_000_000_000 / 8,
+            exact: true,
+            surplus_weight: 1,
+            buffer_bytes: 4 * 1024 * 1024,
+            dscp_rewrite: None,
+        }],
+    );
+    let queue = &mut root.queues[0];
+    let floor = attach_test_vtime_floor(queue, 4, 1);
+    floor.slots[0].publish(0);
+    queue.queue_vtime = 100 * 1024 * 1024; // 100 MB ahead → throttle
+
+    assert_eq!(
+        queue.v_min_throttles_scratch, 0,
+        "scratch starts at zero"
+    );
+
+    // Throttle decision (not a hard-cap override).
+    let cont = cos_queue_v_min_continue(queue, 1);
+    assert!(!cont, "expected throttle decision");
+    assert_eq!(
+        queue.v_min_throttles_scratch, 1,
+        "regular throttle MUST bump v_min_throttles_scratch by 1"
+    );
+    assert_eq!(
+        queue.v_min_hard_cap_overrides_scratch, 0,
+        "regular throttle MUST NOT bump the hard-cap counter"
+    );
+
+    // Two more throttles — counter increments cumulatively until
+    // hard-cap fires (default V_MIN_CONSECUTIVE_SKIP_HARD_CAP).
+    let _ = cos_queue_v_min_continue(queue, 1);
+    let _ = cos_queue_v_min_continue(queue, 1);
+    assert!(
+        queue.v_min_throttles_scratch >= 2,
+        "subsequent throttles continue incrementing the regular counter"
+    );
+}
+
+/// #943: when the hard-cap override fires (after
+/// V_MIN_CONSECUTIVE_SKIP_HARD_CAP back-to-back throttles), only
+/// `v_min_hard_cap_overrides_scratch` increments — the regular
+/// `v_min_throttles_scratch` does NOT. The two counters are
+/// disjoint diagnostics; double-counting would muddy the
+/// LAG_THRESHOLD ratio metric.
+#[test]
+fn vmin_hard_cap_override_does_not_double_count_throttle() {
+    let mut root = test_cos_runtime_with_queues(
+        10_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "iperf-c".into(),
+            priority: 5,
+            transmit_rate_bytes: 10_000_000_000 / 8,
+            exact: true,
+            surplus_weight: 1,
+            buffer_bytes: 4 * 1024 * 1024,
+            dscp_rewrite: None,
+        }],
+    );
+    let queue = &mut root.queues[0];
+    let floor = attach_test_vtime_floor(queue, 4, 1);
+    floor.slots[0].publish(0);
+    queue.queue_vtime = 100 * 1024 * 1024;
+
+    // Drive the throttle counter to V_MIN_CONSECUTIVE_SKIP_HARD_CAP - 1
+    // back-to-back throttle decisions. Each bumps v_min_throttles_scratch.
+    for _ in 0..(V_MIN_CONSECUTIVE_SKIP_HARD_CAP - 1) {
+        let cont = cos_queue_v_min_continue(queue, 1);
+        assert!(!cont, "expected throttle (not yet at hard-cap)");
+    }
+    let throttles_before_cap = queue.v_min_throttles_scratch;
+    let hard_cap_before = queue.v_min_hard_cap_overrides_scratch;
+    assert_eq!(hard_cap_before, 0, "hard-cap not yet fired");
+
+    // The next throttle decision triggers the hard-cap override:
+    // function returns true, hard-cap counter bumps, throttle counter
+    // does NOT bump (the override path is taken instead).
+    let cont = cos_queue_v_min_continue(queue, 1);
+    assert!(cont, "hard-cap override force-continues");
+    assert_eq!(
+        queue.v_min_hard_cap_overrides_scratch, 1,
+        "hard-cap counter bumps exactly once"
+    );
+    assert_eq!(
+        queue.v_min_throttles_scratch, throttles_before_cap,
+        "throttle counter MUST NOT increment on the hard-cap path"
+    );
+}
+
 /// #940: full pop → push_front (rollback) → re-pop → publish-via-
 /// post-settle sequence. Pins that the rollback hook in
 /// `cos_queue_push_front` and the new post-settle publish compose

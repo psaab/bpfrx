@@ -670,6 +670,8 @@ fn binding_counters_snapshot_serializes_with_expected_wire_keys() {
         tx_ring_capacity: 26,
         // #918: per-set LRU collision-eviction counter.
         flow_cache_collision_evictions: 27,
+        v_min_throttle_hard_cap_overrides: 28,
+        v_min_throttles: 29,
     };
     let value: serde_json::Value =
         serde_json::to_value(&snap).expect("serialize snapshot to Value");
@@ -708,6 +710,11 @@ fn binding_counters_snapshot_serializes_with_expected_wire_keys() {
         "tx_ring_capacity",
         // #918: per-set LRU collision-eviction counter wire key.
         "flow_cache_collision_evictions",
+        // #941 Work item D / #943: V_min throttle counter wire keys.
+        // Absence breaks the binding-counter snapshot consumer that
+        // gates fairness diagnostics on these fields.
+        "v_min_throttle_hard_cap_overrides",
+        "v_min_throttles",
     ] {
         assert!(
             obj.contains_key(key),
@@ -798,6 +805,8 @@ fn tx_latency_hist_serialization_roundtrip() {
         tx_ring_capacity: 2_048,
         // #918: per-set LRU collision-eviction counter.
         flow_cache_collision_evictions: 17,
+        v_min_throttle_hard_cap_overrides: 18,
+        v_min_throttles: 19,
     };
     let json = serde_json::to_string(&snap).expect("serialize snapshot");
     let back: BindingCountersSnapshot =

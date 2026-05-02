@@ -645,6 +645,14 @@ type BindingStatus struct {
 	// LRU displacement vs stale-on-lookup eviction). Acceptance gate
 	// watches collision_evictions / hits under load.
 	FlowCacheCollisionEvictions       uint64    `json:"flow_cache_collision_evictions,omitempty"`
+	// #941 Work item D / #943: V_min throttle counters. Hard-cap is
+	// the escape-hatch firing when fairness brake (regular throttle)
+	// has thrown V_MIN_CONSECUTIVE_SKIP_HARD_CAP back-to-back times.
+	// Together: VMinThrottles = "fairness brake fired",
+	// VMinThrottleHardCapOverrides = "brake too tight, escape hatch
+	// rescued throughput". Ratio is the LAG_THRESHOLD diagnostic.
+	VMinThrottleHardCapOverrides      uint64    `json:"v_min_throttle_hard_cap_overrides,omitempty"`
+	VMinThrottles                     uint64    `json:"v_min_throttles,omitempty"`
 	SessionHits                       uint64    `json:"session_hits,omitempty"`
 	SessionMisses                     uint64    `json:"session_misses,omitempty"`
 	SessionCreates                    uint64    `json:"session_creates,omitempty"`

@@ -635,6 +635,16 @@ pub(in crate::afxdp) struct CoSQueueRuntime {
     /// `update_binding_debug_state` (mirrors flow_cache_collision_evictions
     /// pattern at umem.rs:2603-2607).
     pub(in crate::afxdp) v_min_hard_cap_overrides_scratch: u32,
+    /// #943: per-queue scratch counter for V_min throttle decisions
+    /// (i.e. `cos_queue_v_min_continue` returned `false` and the
+    /// caller broke out of the drain loop without hard-cap firing).
+    /// Flushed to `BindingLiveState::v_min_throttles` in
+    /// `update_binding_debug_state` alongside the hard-cap counter.
+    /// Together with `v_min_throttle_hard_cap_overrides` this gives
+    /// operators visibility into both the regular throttle
+    /// (working-as-designed fairness brake) and the hard-cap
+    /// override path (escape hatch when the brake is too tight).
+    pub(in crate::afxdp) v_min_throttles_scratch: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

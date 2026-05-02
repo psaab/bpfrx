@@ -1765,6 +1765,12 @@ pub(crate) struct BindingLiveSnapshot {
     /// override-rate (this / `drain_invocations` aggregated across
     /// queues) stays below 5 %.
     pub(crate) v_min_throttle_hard_cap_overrides: u64,
+    /// #943: regular V_min throttle decisions on this binding (i.e.
+    /// `cos_queue_v_min_continue` returned `false` and the drain
+    /// loop early-broke). Counted distinctly from hard-cap overrides
+    /// so operators can tell the fairness brake is engaged from the
+    /// escape-hatch firing.
+    pub(crate) v_min_throttles: u64,
     pub(crate) session_hits: u64,
     pub(crate) session_misses: u64,
     pub(crate) session_creates: u64,

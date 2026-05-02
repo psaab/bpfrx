@@ -127,6 +127,7 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(config: &CoSInterfaceConfig,
                 consecutive_v_min_skips: 0,
                 v_min_suspended_remaining: 0,
                 v_min_hard_cap_overrides_scratch: 0,
+                v_min_throttles_scratch: 0,
             })
             .collect(),
         queue_indices_by_priority,

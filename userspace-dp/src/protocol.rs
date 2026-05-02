@@ -1214,6 +1214,23 @@ pub(crate) struct BindingStatus {
     /// under load.
     #[serde(rename = "flow_cache_collision_evictions", default)]
     pub flow_cache_collision_evictions: u64,
+    /// #941 Work item D / #943: count of V_min hard-cap activations
+    /// on this binding. Hard-cap is the escape hatch that fires
+    /// after V_MIN_CONSECUTIVE_SKIP_HARD_CAP back-to-back throttle
+    /// decisions, force-continuing the drain to recover throughput
+    /// under persistent peer-vtime spread. Acceptance gate: under
+    /// normal load, override-rate stays below 5 %.
+    #[serde(rename = "v_min_throttle_hard_cap_overrides", default)]
+    pub v_min_throttle_hard_cap_overrides: u64,
+    /// #943: count of regular V_min throttle decisions
+    /// (`cos_queue_v_min_continue` returned `false` and the drain
+    /// loop early-broke) on this binding. Distinct from the hard-cap
+    /// override path (which force-continues despite the throttle).
+    /// Together: `v_min_throttles` is "fairness brake fired",
+    /// `v_min_throttle_hard_cap_overrides` is "brake too tight, escape
+    /// hatch rescued throughput". Ratio is the LAG_THRESHOLD diagnostic.
+    #[serde(rename = "v_min_throttles", default)]
+    pub v_min_throttles: u64,
     #[serde(rename = "session_hits", default)]
     pub session_hits: u64,
     #[serde(rename = "session_misses", default)]
@@ -1543,6 +1560,14 @@ pub(crate) struct BindingCountersSnapshot {
     /// consumers parseable — the field simply deserializes as 0.
     #[serde(rename = "flow_cache_collision_evictions", default)]
     pub flow_cache_collision_evictions: u64,
+    /// #941 Work item D / #943: V_min hard-cap activation count.
+    /// Default keeps pre-#943 consumers parseable.
+    #[serde(rename = "v_min_throttle_hard_cap_overrides", default)]
+    pub v_min_throttle_hard_cap_overrides: u64,
+    /// #943: regular V_min throttle decisions. Default keeps
+    /// pre-#943 consumers parseable.
+    #[serde(rename = "v_min_throttles", default)]
+    pub v_min_throttles: u64,
 }
 
 // #812 (plan §3.5a / §6.1 test #8): compile-time assertion that
@@ -1612,6 +1637,11 @@ impl From<&BindingStatus> for BindingCountersSnapshot {
             // #918: flow under by-value u64; same Send/'static
             // discipline as the other counters.
             flow_cache_collision_evictions: b.flow_cache_collision_evictions,
+            // #941 Work item D / #943: V_min counters propagate from
+            // BindingDebugSnapshot through to the wire-visible
+            // BindingCountersSnapshot. By-value u64, no Send concerns.
+            v_min_throttle_hard_cap_overrides: b.v_min_throttle_hard_cap_overrides,
+            v_min_throttles: b.v_min_throttles,
         }
     }
 }
