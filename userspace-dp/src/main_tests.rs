@@ -608,6 +608,12 @@ fn binding_counters_snapshot_projects_ring_pressure_fields() {
         tx_errors: 29,
         tx_submit_error_drops: 31,
         pending_tx_local_overflow_drops: 37,
+        // #918 / #943: pin per-set LRU collision and V_min telemetry
+        // through the projection so a future refactor that drops
+        // either assignment surfaces here.
+        flow_cache_collision_evictions: 53,
+        v_min_throttle_hard_cap_overrides: 59,
+        v_min_throttles: 67,
         ..Default::default()
     };
     // #804: exercise the `impl From<&BindingStatus>` path. The old
@@ -627,6 +633,9 @@ fn binding_counters_snapshot_projects_ring_pressure_fields() {
     assert_eq!(snap.tx_errors, 29);
     assert_eq!(snap.tx_submit_error_drops, 31);
     assert_eq!(snap.pending_tx_local_overflow_drops, 37);
+    assert_eq!(snap.flow_cache_collision_evictions, 53);
+    assert_eq!(snap.v_min_throttle_hard_cap_overrides, 59);
+    assert_eq!(snap.v_min_throttles, 67);
 }
 
 #[test]

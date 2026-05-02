@@ -1935,4 +1935,61 @@ mod tests {
         assert_eq!(snap.tx_kick_latency_sum_ns, status.tx_kick_latency_sum_ns);
         assert_eq!(snap.tx_kick_retry_count, status.tx_kick_retry_count);
     }
+
+    // #943 Copilot round-2 finding #3: the rich BindingStatus wire
+    // shape carries the two new V_min fields, but nothing pinned
+    // their wire keys at this layer. A future serde-rename typo
+    // would silently project as zeros into the Go consumer (which
+    // tolerates unknown fields). Round-trip + key-presence catches
+    // both directions of the contract here.
+    #[test]
+    fn v_min_throttle_binding_status_wire_roundtrip() {
+        let status = BindingStatus {
+            worker_id: 9,
+            slot: 1,
+            ifindex: 4,
+            queue_id: 6,
+            v_min_throttle_hard_cap_overrides: 71,
+            v_min_throttles: 73,
+            ..Default::default()
+        };
+        let value: serde_json::Value =
+            serde_json::to_value(&status).expect("serialize BindingStatus to Value");
+        let obj = value
+            .as_object()
+            .expect("BindingStatus serializes as a JSON object");
+        for key in ["v_min_throttle_hard_cap_overrides", "v_min_throttles"] {
+            assert!(
+                obj.contains_key(key),
+                "BindingStatus wire key `{key}` missing: {value}"
+            );
+        }
+        let json = serde_json::to_string(&status).expect("serialize BindingStatus");
+        let back: BindingStatus =
+            serde_json::from_str(&json).expect("deserialize BindingStatus");
+        assert_eq!(
+            back.v_min_throttle_hard_cap_overrides,
+            status.v_min_throttle_hard_cap_overrides
+        );
+        assert_eq!(back.v_min_throttles, status.v_min_throttles);
+    }
+
+    // #943 additive-wire contract: a pre-#943 BindingStatus payload
+    // with both V_min fields absent must decode with zero defaults,
+    // matching the same defaulting pattern the kick-latency fields
+    // use above. Without this, the projection's `..Default::default`
+    // would compile but the wire side could silently break.
+    #[test]
+    fn v_min_throttle_binding_status_backward_compat() {
+        let legacy_json = r#"{
+            "worker_id": 1,
+            "slot": 0,
+            "ifindex": 0,
+            "queue_id": 0
+        }"#;
+        let status: BindingStatus =
+            serde_json::from_str(legacy_json).expect("pre-#943 payload decodes");
+        assert_eq!(status.v_min_throttle_hard_cap_overrides, 0);
+        assert_eq!(status.v_min_throttles, 0);
+    }
 }

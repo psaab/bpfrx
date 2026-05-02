@@ -908,3 +908,96 @@ fn spawn_supervised_aux_catches_non_string_panic_payload() {
     .expect("spawn_supervised_aux");
     join.join().expect("supervisor must catch non-string panic");
 }
+
+// -------------------------------------------------------------
+// #943 Copilot round-2 finding #6: refresh_bindings hop test.
+//
+// The wire pipeline is:
+//   BindingLiveState::v_min_throttles (AtomicU64)
+//     -> snapshot()  (umem/mod.rs)
+//     -> refresh_bindings (coordinator/mod.rs)  <-- THIS HOP
+//     -> BindingStatus.v_min_throttles
+//     -> BindingCountersSnapshot.v_min_throttles (wire JSON)
+//
+// Codex round-1 caught the BLOCKER where this exact hop was
+// missing — refresh_bindings did not bridge the V_min fields, so
+// the wire surface projected zeros despite the worker incrementing
+// the atomic correctly. That fix lives at coordinator/mod.rs:1149.
+//
+// This test exercises the production refresh_bindings call against
+// a real Coordinator + real BindingLiveState, so a future drop of
+// either bridge line surfaces here rather than silently re-zeroing
+// the wire field. Non-coprime-prime values per field catch a swap.
+// -------------------------------------------------------------
+#[test]
+fn refresh_bindings_bridges_v_min_counters_into_binding_status() {
+    use std::sync::atomic::Ordering;
+    let mut coordinator = Coordinator::new();
+    let live = std::sync::Arc::new(BindingLiveState::new());
+    live.v_min_throttle_hard_cap_overrides
+        .store(83, Ordering::Relaxed);
+    live.v_min_throttles.store(89, Ordering::Relaxed);
+    // Set an unrelated bridged field so the test also pins the
+    // surrounding bridge layout (a refactor that re-orders the
+    // assignments and drops one in the middle would surface here).
+    live.flow_cache_collision_evictions
+        .store(79, Ordering::Relaxed);
+    coordinator.workers.live.insert(0, live);
+
+    let mut bindings = vec![BindingStatus {
+        slot: 0,
+        worker_id: 1,
+        ifindex: 12,
+        // Pre-populate with junk values so the test also catches a
+        // refresh_bindings that fails to overwrite the field (a
+        // bridge that branches on `if x != 0` and skips, etc.).
+        v_min_throttle_hard_cap_overrides: 0xdead_beef,
+        v_min_throttles: 0xcafe_f00d,
+        flow_cache_collision_evictions: 0xbad_c0de,
+        ..Default::default()
+    }];
+
+    coordinator.refresh_bindings(&mut bindings);
+
+    assert_eq!(
+        bindings[0].v_min_throttle_hard_cap_overrides, 83,
+        "refresh_bindings must bridge v_min_throttle_hard_cap_overrides \
+         from BindingLiveState into BindingStatus"
+    );
+    assert_eq!(
+        bindings[0].v_min_throttles, 89,
+        "refresh_bindings must bridge v_min_throttles from \
+         BindingLiveState into BindingStatus"
+    );
+    assert_eq!(
+        bindings[0].flow_cache_collision_evictions, 79,
+        "refresh_bindings must bridge flow_cache_collision_evictions \
+         (companion bridge line — pinning the surrounding layout)"
+    );
+}
+
+#[test]
+fn refresh_bindings_zeroes_v_min_counters_when_worker_absent() {
+    // Codex BLOCKER fix at coordinator/mod.rs:~1294: when the
+    // BindingLiveState is missing for a slot, refresh_bindings
+    // resets the V_min fields to 0 rather than leaving stale
+    // counter values from a previous live snapshot. Without this,
+    // a worker death + slot reassignment would project ghost
+    // counters onto the new binding.
+    let mut coordinator = Coordinator::new();
+    // No insert into coordinator.workers.live for slot 7 — that's
+    // the precondition for the reset path.
+
+    let mut bindings = vec![BindingStatus {
+        slot: 7,
+        worker_id: 9,
+        v_min_throttle_hard_cap_overrides: 999,
+        v_min_throttles: 888,
+        ..Default::default()
+    }];
+
+    coordinator.refresh_bindings(&mut bindings);
+
+    assert_eq!(bindings[0].v_min_throttle_hard_cap_overrides, 0);
+    assert_eq!(bindings[0].v_min_throttles, 0);
+}

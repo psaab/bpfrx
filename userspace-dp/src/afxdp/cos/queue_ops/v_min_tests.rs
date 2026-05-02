@@ -237,13 +237,16 @@ fn vmin_throttle_increments_v_min_throttles_scratch() {
         "regular throttle MUST NOT bump the hard-cap counter"
     );
 
-    // Two more throttles — counter increments cumulatively until
-    // hard-cap fires (default V_MIN_CONSECUTIVE_SKIP_HARD_CAP).
+    // Two more throttles — counter increments by exactly +1 each.
+    // V_MIN_CONSECUTIVE_SKIP_HARD_CAP is fixed at 8 (mod.rs:112) so
+    // we're well below the hard-cap boundary; assert the exact
+    // count to catch off-by-one or dropped increments
+    // (Copilot review).
     let _ = cos_queue_v_min_continue(queue, 1);
     let _ = cos_queue_v_min_continue(queue, 1);
-    assert!(
-        queue.v_min_throttles_scratch >= 2,
-        "subsequent throttles continue incrementing the regular counter"
+    assert_eq!(
+        queue.v_min_throttles_scratch, 3,
+        "three throttles → scratch == 3 (not >= 2 — exact count catches off-by-one)"
     );
 }
 
