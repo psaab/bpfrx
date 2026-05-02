@@ -427,6 +427,29 @@ func compileDPDKDataplane(node *Node, cfg *DPDKConfig) error {
 func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
 	for _, child := range node.Children {
 		switch child.Name() {
+		case "userspace":
+			// #903: `set system dataplane userspace ...` is a redundant
+			// path — the operator wrote `userspace` again under a
+			// dataplane block we are ALREADY processing as the userspace
+			// dataplane (entered via `case "dataplane"` after
+			// dataplane-type=userspace). Pre-fix this was a silent
+			// no-op; we now strip the leading "userspace" key and
+			// re-dispatch through this same switch so the inner setting
+			// (`workers 4`, `poll-mode interrupt`, etc.) actually takes
+			// effect. Backward-compatible: no commit-time hard error,
+			// so stored pre-fix configs replay cleanly on upgrade AND
+			// finally do what the operator intended.
+			if len(child.Keys) >= 2 {
+				synthetic := &Node{
+					Keys:     child.Keys[1:],
+					Children: child.Children,
+					IsLeaf:   child.IsLeaf,
+				}
+				synthParent := &Node{Children: []*Node{synthetic}}
+				if err := compileUserspaceDataplane(synthParent, cfg); err != nil {
+					return err
+				}
+			}
 		case "binary":
 			cfg.Binary = nodeVal(child)
 		case "control-socket":
