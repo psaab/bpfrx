@@ -1992,7 +1992,7 @@ fn tx_binding_resolution_uses_fabric_parent_ifindex() {
 // dropped packets because clamp_tcp_mss is dead_code'd in master
 // and only reachable via the GRE encap path.
 
-fn _csum_tcp_v4_oracle(src: [u8; 4], dst: [u8; 4], tcp: &[u8]) -> u16 {
+fn csum_tcp_v4_oracle(src: [u8; 4], dst: [u8; 4], tcp: &[u8]) -> u16 {
     let tcp_len = tcp.len() as u16;
     let mut sum: u32 = 0;
     for chunk in src.chunks(2).chain(dst.chunks(2)) {
@@ -2014,15 +2014,15 @@ fn _csum_tcp_v4_oracle(src: [u8; 4], dst: [u8; 4], tcp: &[u8]) -> u16 {
     sum as u16
 }
 
-fn _set_v4_tcp_checksum(tcp: &mut [u8], src: [u8; 4], dst: [u8; 4]) {
+fn set_v4_tcp_checksum(tcp: &mut [u8], src: [u8; 4], dst: [u8; 4]) {
     tcp[16..18].copy_from_slice(&[0, 0]);
-    let raw = _csum_tcp_v4_oracle(src, dst, tcp);
+    let raw = csum_tcp_v4_oracle(src, dst, tcp);
     tcp[16..18].copy_from_slice(&(!raw).to_be_bytes());
 }
 
 /// Build a 24-byte TCP segment (20-byte header + 4-byte MSS option)
 /// with `flags` set and MSS=`mss`. Returns (packet=ip+tcp, src, dst).
-fn _build_v4_syn_with_mss(flags: u8, mss: u16) -> (Vec<u8>, [u8; 4], [u8; 4]) {
+fn build_v4_syn_with_mss(flags: u8, mss: u16) -> (Vec<u8>, [u8; 4], [u8; 4]) {
     let src = [10, 0, 0, 1];
     let dst = [10, 0, 0, 2];
     // IPv4 header (20 bytes) + TCP header (24 bytes) = 44 total.
@@ -2046,7 +2046,7 @@ fn _build_v4_syn_with_mss(flags: u8, mss: u16) -> (Vec<u8>, [u8; 4], [u8; 4]) {
     tcp[21] = 4;
     tcp[22..24].copy_from_slice(&mss.to_be_bytes());
 
-    _set_v4_tcp_checksum(&mut tcp, src, dst);
+    set_v4_tcp_checksum(&mut tcp, src, dst);
 
     let mut packet = ip;
     packet.extend_from_slice(&tcp);
@@ -2055,12 +2055,12 @@ fn _build_v4_syn_with_mss(flags: u8, mss: u16) -> (Vec<u8>, [u8; 4], [u8; 4]) {
 
 #[test]
 fn clamp_tcp_mss_v4_preserves_checksum_invariant() {
-    let (mut packet, src, dst) = _build_v4_syn_with_mss(0x02, 1460);
+    let (mut packet, src, dst) = build_v4_syn_with_mss(0x02, 1460);
     // Sanity: the unmodified packet validates.
     {
         let tcp = &packet[20..];
         assert_eq!(
-            _csum_tcp_v4_oracle(src, dst, tcp),
+            csum_tcp_v4_oracle(src, dst, tcp),
             0xFFFF,
             "test fixture must produce a valid initial checksum"
         );
@@ -2081,7 +2081,7 @@ fn clamp_tcp_mss_v4_preserves_checksum_invariant() {
     // would store an HC that gives sum-over=0xFDF7 (off by 520);
     // this assertion fails on the buggy formula.
     assert_eq!(
-        _csum_tcp_v4_oracle(src, dst, tcp),
+        csum_tcp_v4_oracle(src, dst, tcp),
         0xFFFF,
         "clamp_tcp_mss must maintain the TCP checksum sum-over-all = 0xFFFF invariant"
     );
