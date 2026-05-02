@@ -2,27 +2,21 @@
 
 ## Status
 
-REV-2 — addresses Codex round-1 PROCEED-WITH-CHANGES (6 concrete asks).
+REV-3 — final shipped state. Plan reflects what's in the merged
+diff, not what was originally proposed. Older revisions:
 
-Round-1 deltas:
-- §#940 audit row corrected: 5 publish sites (4 post-settle + 1
-  demote-restore at `tx/cos_classify.rs:641`), not "5 post-settle".
-- §Gap 1 widened to include the stale doc on `PaddedVtimeSlot::publish`
-  (`types/shared_cos_lease.rs:65-67`) which still claims a
-  first-enqueue publish that the implementation deliberately does NOT do.
-- §Gap 1 adds the documented rationale for omitting the first-enqueue
-  publish (NOT_PARTICIPATING peers are skipped in the V_min reduction;
-  no committed work exists pre-settle).
-- §Gap 4 reworded: the #940 microbench DOES exist as
-  `bench_pop_commit_settle_publish` at
-  `cos/queue_ops/tests.rs:1029` (`#[ignore]`'d). This PR runs it and
-  records the result rather than claiming "smoke substitutes" for a
-  microbench gate.
-- §Gap 4 (HA): `scripts/userspace-ha-failover-validation.sh` exists.
-  This PR invokes it as part of the closeout smoke; if not feasible,
-  the deferral is explicit rather than misstating the harness.
-- Issue closure mechanics: PR merges first, THEN issues are closed
-  with the merged-PR commit hash + final smoke evidence cited.
+- REV-1 → REV-2 (Codex round-1 plan review, 6 asks): widened Gap 1
+  to include the stale `publish` doc + first-enqueue rationale;
+  reworded Gap 4 to actually run the existing #940 microbench and
+  invoke `scripts/userspace-ha-failover-validation.sh`; aligned
+  issue-closure to "PR merges first, then close with cited evidence".
+- REV-2 → REV-3 (Codex code-review round-1, MERGE-NEEDS-MAJOR; round-2
+  MERGE-NEEDS-MINOR): corrected publish-site count from 5 to 6
+  (rollback `slot.publish` at `cos/queue_ops/push.rs:126` was
+  missing); weakened the memory-ordering claim from "consistent
+  snapshot" wording to "the set of values observed during the scan";
+  scrubbed residual references to the deleted `read_v_min` /
+  `participating_peer_count` helpers throughout this plan.
 
 ## Background
 
@@ -71,7 +65,7 @@ issues with cited evidence.
 | Symmetric first-enqueue publish | ❌ NOT IMPLEMENTED — see §Gap analysis below | Test `vmin_no_first_enqueue_publish` exists and **asserts the absence of this publish**, indicating an explicit decision to NOT do it. |
 | Phantom-participating worker test | ✅ PASS | Implicit in `vmin_vacate_only_when_last_bucket_empties` and the bucket-empty vacate tests. |
 | Hard-cap forced continue test | ✅ PASS | `vmin_hard_cap_override_does_not_double_count_throttle`, `vmin_prepared_drain_arms_hard_cap_after_repeated_throttle`. |
-| Memory-ordering doc on `read_v_min` | ❌ MISSING | `types/shared_cos_lease.rs:120-138` doc comment does not mention non-atomic-across-slots semantics. **This PR fixes this gap.** |
+| Memory-ordering doc on the slot-iteration helper | ❌ MISSING (now FIXED) | `types/shared_cos_lease.rs:120-138` (the prior `read_v_min` site) had no non-atomic-across-slots semantics doc. The replacement helper `participating_v_min_snapshot` carries the canonical memory-ordering paragraph; the prior helpers (`read_v_min`, `participating_peer_count`) were dead code and have been removed (see Gap 2). |
 | #943 telemetry counters | ✅ PASS | PR #1139 merged 2026-05-02 (commit `7438e92e`). Counters `v_min_throttles` + `v_min_throttle_hard_cap_overrides` plumbed through to wire surface. |
 | Cluster smoke: mouse-latency ≤ 59.51 ms | ⚠️ STALE | Re-verify. |
 
@@ -91,50 +85,53 @@ issues with cited evidence.
 
 **Three related doc bugs** in the same file (`types/shared_cos_lease.rs`):
 
-1. **Missing memory-ordering doc on `read_v_min`** (lines 120-124):
-   #941 acceptance criterion explicitly required documenting the
-   non-atomic-across-slots semantics. Current doc is a one-liner.
+1. **Missing memory-ordering doc on the slot-iteration helper**
+   (the prior `read_v_min` doc was a one-liner). #941 acceptance
+   criterion explicitly required documenting the
+   non-atomic-across-slots semantics.
 
-2. **Stale doc on `PaddedVtimeSlot::publish`** (lines 65-67): says
-   "Worker calls this on commit boundary publish (after a drain
-   commits or push_front rolls back) AND on first enqueue when
-   the bucket count transitions 0 → ≥1". The "AND on first enqueue"
-   clause is FALSE — the implementation deliberately omits this
+2. **Stale doc on `PaddedVtimeSlot::publish`** (the original lines
+   65-67 in the pre-PR doc claimed publish happens on first
+   enqueue when the bucket count transitions 0 → ≥1). That claim
+   was false: the implementation deliberately omits a first-enqueue
    publish (test `vmin_no_first_enqueue_publish` enforces the
-   absence). The doc lies.
+   absence).
 
 3. **Missing rationale for the first-enqueue-publish omission**:
    #941 work item A's "symmetric first-enqueue publish" was DROPPED
-   during implementation. The reason isn't documented anywhere
-   that a future reader can find. Without the rationale a future
+   during implementation. The reason wasn't documented anywhere
+   that a future reader could find — without the rationale a future
    PR could re-add the (unwanted) publish "to make work item A
    complete".
 
 **Why these matter**:
 - (1) is the durable artifact that prevents future "is this a race?"
   litigation.
-- (2) is a doc/code mismatch that misleads anyone reading the type.
+- (2) was a doc/code mismatch that misled anyone reading the type.
 - (3) is the load-bearing piece of context for why the algorithm
   is correct: NOT_PARTICIPATING peers are skipped in the V_min
-  reduction (`SharedCoSQueueVtimeFloor::read_v_min` and the inlined
-  iterator both `if let Some(peer_vtime) = slot.read()` — `None`
-  means skip), so a freshly-enqueued worker that hasn't yet popped
-  is correctly invisible to peer V_min until first commit. There
-  is no "stale-low publish" bug because there is no publish.
+  reduction (`participating_v_min_snapshot` does
+  `if let Some(peer) = slot.read()` — `None` means skip), so a
+  freshly-enqueued worker that hasn't yet popped is correctly
+  invisible to peer V_min until first commit. There is no
+  "stale-low publish" bug because there is no publish.
 
-**Fix**: Single edit pass on `types/shared_cos_lease.rs`:
-- Rewrite `PaddedVtimeSlot::publish` doc to drop the false
-  "AND on first enqueue" clause; cite the no-first-enqueue test as
-  the enforcement mechanism.
-- Extend `SharedCoSQueueVtimeFloor::read_v_min` doc with the
-  memory-ordering paragraph (per-slot Acquire/Release; non-atomic
-  across slots; algorithm tolerates inconsistent snapshots within
-  K=8 cadence).
-- Add the same paragraph (or a forward-reference) at the inlined
-  slot loop in `cos_queue_v_min_continue` (v_min.rs:140-148).
-- Add a sentence near `vmin_no_first_enqueue_publish` (or as a
-  module-level doc on v_min.rs) capturing the "NOT_PARTICIPATING
-  → peers skip → no stale-low publish" invariant.
+**What this PR shipped** in `types/shared_cos_lease.rs`:
+- Rewrote `PaddedVtimeSlot::publish` doc to drop the false
+  first-enqueue clause; lists all 6 publish sites; cites the
+  no-first-enqueue test as the enforcement mechanism.
+- Replaced the prior `read_v_min` + `participating_peer_count`
+  pair (both unused) with a single
+  `participating_v_min_snapshot(worker_id) -> (u32, Option<u64>)`
+  helper that returns the count + min in one pass.
+- Added the memory-ordering paragraph on
+  `participating_v_min_snapshot` (per-slot Acquire/Release;
+  non-atomic across slots; result is the set of values observed
+  during the scan, not a cross-slot atomic snapshot;
+  bounded staleness across K-cadence read window).
+- Added a module-level invariant doc on `cos/queue_ops/v_min.rs`
+  capturing the "NOT_PARTICIPATING → peers skip → no stale-low
+  publish" rationale.
 
 ### Gap 2: `read_v_min` and `participating_peer_count` are dead code
 
@@ -209,7 +206,7 @@ scope" claim.
 ### What this PR does
 
 1. **Fix Gap 1**: rewrite the stale doc on `PaddedVtimeSlot::publish`
-   to drop the false "AND on first enqueue" claim and document the
+   to drop the false first-enqueue-publish claim and document the
    omission rationale. Add the memory-ordering paragraph to the
    replacement helper (`participating_v_min_snapshot` — see Gap 2)
    so the contract lives where the algorithm reads happen, not on
@@ -217,10 +214,11 @@ scope" claim.
    `cos/queue_ops/v_min.rs` capturing the publish-only-on-commit
    rule and the no-first-enqueue rationale.
 
-2. **Fix Gap 2 via Option C**: replace the two unused helpers
-   (`read_v_min` + `participating_peer_count`) with a single
-   `participating_v_min_snapshot` that returns the
-   `(participating_count, Option<v_min>)` pair in one pass. Rewrite
+2. **Fix Gap 2 via Option C**: replace the two unused historical
+   helpers (named `read_v_min` and `participating_peer_count` in
+   pre-PR master) with a single
+   `participating_v_min_snapshot(worker_id) -> (u32, Option<u64>)`
+   that returns the count + min in one pass. Rewrite
    `cos_queue_v_min_continue` to call it.
 
 3. **Verify Gap 3**: cluster smoke on the loss userspace cluster

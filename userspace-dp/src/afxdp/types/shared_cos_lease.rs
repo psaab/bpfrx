@@ -86,7 +86,7 @@ impl PaddedVtimeSlot {
     /// (or freshly-vacated-then-re-entering) worker has no committed
     /// vtime to broadcast, and peers correctly skip its slot via
     /// `slot.read() == None` (NOT_PARTICIPATING) in the V_min
-    /// reduction (see `read_v_min` and the inlined iterator in
+    /// reduction (see `participating_v_min_snapshot` and its caller
     /// `cos_queue_v_min_continue`). Publishing the stale
     /// pre-vacate `queue_vtime` would broadcast a value that does
     /// NOT correspond to committed work, falsely throttling peers.
@@ -154,20 +154,18 @@ impl SharedCoSQueueVtimeFloor {
     /// `Ordering::Release` store inside `PaddedVtimeSlot::publish` /
     /// `vacate`. The iteration is **non-atomic across slots** —
     /// a slot can transition `vtime → NOT_PARTICIPATING` (or
-    /// vice versa) between two reads in the same iteration. The
-    /// reduction does NOT produce a linearizable cross-slot
-    /// snapshot (no lock, seqlock, retry, or epoch); it produces
-    /// the set of values observed during the scan, where each
-    /// individual value is a valid Acquire-load of that slot at
-    /// some moment within the scan window. The throttle decision
-    /// is a hint with staleness bounded by the K-cadence read
-    /// interval, not a hard barrier. Introducing a global lock or
-    /// seqlock would re-introduce the contention the algorithm
-    /// was designed to eliminate.
+    /// vice versa) between two reads in the same iteration. There
+    /// is no lock, seqlock, retry, or epoch; the result is the set
+    /// of values observed during the scan, where each individual
+    /// value is a valid Acquire-load of that slot at some moment
+    /// within the scan window. Cross-slot atomicity is not
+    /// provided. The throttle decision is a hint with staleness
+    /// bounded by the K-cadence read interval, not a hard barrier.
+    /// Introducing a global lock or seqlock would re-introduce
+    /// the contention the algorithm was designed to eliminate.
     ///
-    /// Replaces the prior `read_v_min` + `participating_peer_count`
-    /// pair (both unused) with a single-pass helper that the
-    /// inlined iterator in `cos_queue_v_min_continue` now calls.
+    /// Single-pass helper that `cos_queue_v_min_continue` calls
+    /// for the (count, v_min) pair on each cadence tick.
     /// Centralizes the memory-ordering contract in one place.
     #[inline]
     pub(in crate::afxdp) fn participating_v_min_snapshot(
