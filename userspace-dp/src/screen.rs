@@ -312,8 +312,18 @@ impl ScreenState {
             return ScreenVerdict::Drop("land-attack");
         }
 
-        // TCP-specific stateless checks
-        if pkt.protocol == PROTO_TCP {
+        // TCP-specific stateless checks.
+        //
+        // Outer guard `!is_fragment || is_first_fragment` mirrors the
+        // BPF #853 defense (#1137 / Copilot review): subsequent
+        // fragments don't carry the L4 header, so `tcp_flags` is
+        // unreliable for them. Without this guard a subsequent
+        // fragment whose payload bytes happen to look like flag bits
+        // could falsely trip syn_fin / no_flag / fin_no_ack / winnuke
+        // / syn_frag. First-fragments DO carry the TCP header, so
+        // they pass through the guard and the SYN-centric checks
+        // (including syn_frag) fire correctly.
+        if pkt.protocol == PROTO_TCP && (!pkt.is_fragment || pkt.is_first_fragment) {
             let tf = pkt.tcp_flags;
 
             // SYN+FIN
@@ -337,10 +347,9 @@ impl ScreenState {
             }
 
             // #1137: SYN-fragment — TCP SYN on a first-fragment is the
-            // fragmentation-based attack pattern. Subsequent fragments
-            // (is_fragment && !is_first_fragment) don't have an L4 header
-            // so tcp_flags is unreliable for them; gating on
-            // is_first_fragment avoids false positives.
+            // fragmentation-based attack pattern. The outer guard
+            // already excludes subsequent fragments; this check fires
+            // on first-fragment + SYN, which is the actual attack.
             if profile.syn_frag && (tf & TCP_SYN) != 0 && pkt.is_first_fragment {
                 return ScreenVerdict::Drop("syn-frag");
             }
@@ -543,6 +552,21 @@ pub(crate) fn extract_screen_info(
         // IPv6: walk the extension header chain looking for
         // NEXTHDR_FRAGMENT (44). Fixed IPv6 base header is 40 bytes.
         // We bound the walk to MAX_EXT_HDRS=8 like the BPF parser.
+        //
+        // Parity note (#1137 / Codex round-1): if the chain is
+        // truncated (out-of-bounds before we find a FRAGMENT
+        // header), we silently `break` and leave is_first_fragment
+        // at its default `false`. The BPF `parse_ipv6hdr` returns
+        // -1 on the same condition, causing the packet to be
+        // dropped earlier in the pipeline. On the userspace-dp
+        // path the upstream metadata parser (try_parse_metadata)
+        // should already have rejected malformed IPv6 packets
+        // before they reach extract_screen_info, so the parity
+        // gap is theoretical. If a SYN-bearing IPv6 frame with a
+        // truncated FRAGMENT header somehow reaches the screen
+        // layer, it would pass syn_frag — operators relying on
+        // that defense should keep the BPF screen path enabled
+        // upstream of userspace-dp.
         const NEXTHDR_HOP: u8 = 0;
         const NEXTHDR_ROUTING: u8 = 43;
         const NEXTHDR_FRAGMENT: u8 = 44;

@@ -375,7 +375,11 @@ fn teardrop_first_fragment_passes() {
         dst_port: 80,
         pkt_len: 24,
         is_fragment: true,
-        is_first_fragment: false,
+        // #1137 Copilot review: ip_frag_off=0x2000 means MF=1 &&
+        // offset==0, which IS a first-fragment. Keep the fields
+        // consistent with each other so future regressions don't
+        // hide behind misleading metadata.
+        is_first_fragment: true,
         ip_ihl: 5,
         ip_frag_off: 0x2000, // offset=0 (first frag), MF=1
         ip_total_len: 24,
@@ -639,6 +643,53 @@ fn extract_screen_info_ipv6_subsequent_fragment() {
         !info.is_first_fragment,
         "IPv6 offset>0 → is_first_fragment must be 0"
     );
+}
+
+#[test]
+fn tcp_no_flag_passes_on_subsequent_fragment_with_zero_flags() {
+    // #1137 Copilot review regression: subsequent fragments don't
+    // carry the L4 header, so tcp_flags is meaningless. Without the
+    // outer `!is_fragment || is_first_fragment` guard, a subsequent
+    // fragment with tcp_flags=0 (because the meta wasn't filled)
+    // would falsely trip SCREEN_TCP_NO_FLAG. Mirrors the BPF #853
+    // defense.
+    let mut profile = ScreenProfile::default();
+    profile.no_flag = true;
+    let mut state = make_state("trust", profile);
+    let mut pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        12345,
+        80,
+        0, // tcp_flags=0 on a subsequent fragment is normal — meta wasn't filled
+    );
+    pkt.is_fragment = true;
+    pkt.is_first_fragment = false;
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Pass,
+        "subsequent fragment must not trip TCP_NO_FLAG even with tf=0"
+    );
+}
+
+#[test]
+fn tcp_syn_fin_passes_on_subsequent_fragment_with_syn_fin_bytes() {
+    // Adversarial: subsequent fragment whose payload bytes happen to
+    // look like SYN+FIN. The outer guard must keep this from tripping
+    // syn_fin (the bytes aren't real TCP flags).
+    let mut profile = ScreenProfile::default();
+    profile.syn_fin = true;
+    let mut state = make_state("trust", profile);
+    let mut pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        12345,
+        80,
+        TCP_SYN | TCP_FIN,
+    );
+    pkt.is_fragment = true;
+    pkt.is_first_fragment = false;
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
 }
 
 // ================================================================
