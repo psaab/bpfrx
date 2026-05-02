@@ -51,9 +51,11 @@ fn ipv6_header(payload_len: u16, next_header: u8) -> [u8; IPV6_HDR_LEN] {
     ip6[4..6].copy_from_slice(&payload_len.to_be_bytes());
     ip6[6] = next_header;
     ip6[7] = 64; // hop limit
-    ip6[8] = 0xfe; // src ::1
+    // src = fe00::1, dst = fe00::2 — high byte 0xfe is just to
+    // make the address recognizably non-zero in failure dumps.
+    ip6[8] = 0xfe;
     ip6[8 + 15] = 0x01;
-    ip6[24] = 0xfe; // dst ::2
+    ip6[24] = 0xfe;
     ip6[24 + 15] = 0x02;
     ip6
 }

@@ -77,7 +77,7 @@ Total: ~335 LOC of TCP-only logic spread across 3 files.
 
 **Already-cohesive TCP module: `frame/tcp_segmentation.rs`** (338 LOC,
 extracted in #1046). Owns TCP segmentation builders for the
-forwarding hot path. This PR keeps it as a sibling sibling of the
+forwarding hot path. This PR keeps it as a sibling of the
 new `frame/tcp.rs` rather than merging — segmentation is a distinct
 concern from flag/window extraction and MSS clamping, and the file
 is already past the "module is too big to absorb more" threshold.
@@ -250,7 +250,9 @@ answer: `frame/tcp.rs`. The mutation is the cohesion axis.
 
 Q2. Should `packet_tcp_flags` be moved at all? It is a 25-LOC
 GRE-specific helper. Per the risk analysis above, **keep it in
-`gre.rs`**. Final §2.1 list is items 1-4.
+`gre.rs`**. Final §2.1 list is items 1-6 (the four inspection
+helpers plus the two clamp helpers; `packet_tcp_flags` was the
+only candidate dropped from rev-1's seven-item list).
 
 Q3. Should this PR also colocate TCP tests (move TCP-specific
 cases from `frame/tests.rs` into `frame/tcp_tests.rs`)? Proposed
@@ -271,7 +273,7 @@ that is out of scope here.
 
 ## Acceptance gate
 
-- `cargo test --release` — all existing tests pass + ~18 new
+- `cargo test --release` — all existing tests pass + ~26 new
   unit tests under `frame/tcp_tests.rs` pass.
 - `cargo build --release` — clean, no new warnings.
 - `clamp_tcp_mss` checksum sanity test — independent recomputation
