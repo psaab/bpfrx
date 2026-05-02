@@ -16,6 +16,7 @@ fn default_profile() -> ScreenProfile {
         ping_death: true,
         teardrop: true,
         icmp_fragment: true,
+        syn_frag: true,
         source_route: true,
         icmp_flood_threshold: 0,
         udp_flood_threshold: 0,
@@ -41,6 +42,7 @@ fn tcp_pkt(src: IpAddr, dst: IpAddr, src_port: u16, dst_port: u16, flags: u8) ->
         dst_port,
         pkt_len: 60,
         is_fragment: false,
+        is_first_fragment: false,
         ip_ihl: 5,
         ip_frag_off: 0,
         ip_total_len: 60,
@@ -65,6 +67,7 @@ fn icmp_pkt(src: IpAddr, dst: IpAddr, pkt_len: u16) -> ScreenPacketInfo {
         dst_port: 0,
         pkt_len,
         is_fragment: false,
+        is_first_fragment: false,
         ip_ihl: 5,
         ip_frag_off: 0,
         ip_total_len: pkt_len,
@@ -85,6 +88,7 @@ fn udp_pkt(src: IpAddr, dst: IpAddr) -> ScreenPacketInfo {
         dst_port: 5001,
         pkt_len: 100,
         is_fragment: false,
+        is_first_fragment: false,
         ip_ihl: 5,
         ip_frag_off: 0,
         ip_total_len: 100,
@@ -347,6 +351,7 @@ fn teardrop_drops() {
         dst_port: 80,
         pkt_len: 28,
         is_fragment: true,
+        is_first_fragment: false,
         ip_ihl: 5,
         ip_frag_off: 0x0001 | 0x2000, // offset=1 (non-first frag), MF=1
         ip_total_len: 24,             // 20 byte header + 4 byte payload (< 8)
@@ -370,6 +375,7 @@ fn teardrop_first_fragment_passes() {
         dst_port: 80,
         pkt_len: 24,
         is_fragment: true,
+        is_first_fragment: false,
         ip_ihl: 5,
         ip_frag_off: 0x2000, // offset=0 (first frag), MF=1
         ip_total_len: 24,
@@ -414,6 +420,224 @@ fn icmpv6_fragment_drops() {
     assert_eq!(
         state.check_packet("trust", &pkt, 1),
         ScreenVerdict::Drop("icmp-fragment")
+    );
+}
+
+// ================================================================
+// #1137 SCREEN_SYN_FRAG — TCP SYN on a first-fragment is the
+// fragmentation-based attack pattern. Mirrors BPF SCREEN_SYN_FRAG
+// (see #866 / docs/pr/bug-batch-866-867-916-925/design.md §1).
+// ================================================================
+
+#[test]
+fn syn_frag_drops_on_first_fragment_with_syn() {
+    let mut state = make_state("trust", default_profile());
+    let mut pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        12345,
+        80,
+        TCP_SYN,
+    );
+    pkt.is_fragment = true;
+    pkt.is_first_fragment = true;
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("syn-frag")
+    );
+}
+
+#[test]
+fn syn_frag_passes_when_first_fragment_without_syn() {
+    let mut state = make_state("trust", default_profile());
+    let mut pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        12345,
+        80,
+        TCP_ACK, // ACK without SYN — not a SYN-fragment
+    );
+    pkt.is_fragment = true;
+    pkt.is_first_fragment = true;
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
+#[test]
+fn syn_frag_passes_on_subsequent_fragment() {
+    // Subsequent fragments don't carry the L4 header, so tcp_flags is
+    // unreliable. is_first_fragment=0 keeps the check from firing on
+    // them — even if SYN bit is somehow set in the meta (e.g. a
+    // crafted attacker frame), is_first_fragment guards us.
+    let mut state = make_state("trust", default_profile());
+    let mut pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        12345,
+        80,
+        TCP_SYN,
+    );
+    pkt.is_fragment = true;
+    pkt.is_first_fragment = false;
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
+#[test]
+fn syn_frag_passes_on_non_fragmented_syn() {
+    // Non-fragmented TCP SYN is normal connection setup, not the
+    // syn-frag attack. Should pass regardless of profile.syn_frag.
+    let mut profile = ScreenProfile::default();
+    profile.syn_frag = true;
+    let mut state = make_state("trust", profile);
+    let pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        12345,
+        80,
+        TCP_SYN,
+    );
+    // Defaults: is_fragment=false, is_first_fragment=false
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
+#[test]
+fn syn_frag_disabled_when_profile_off() {
+    // Even a SYN-bearing first-fragment passes when the profile
+    // doesn't enable syn_frag.
+    let profile = ScreenProfile::default(); // all checks off
+    let mut state = make_state("trust", profile);
+    let mut pkt = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        12345,
+        80,
+        TCP_SYN,
+    );
+    pkt.is_fragment = true;
+    pkt.is_first_fragment = true;
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
+#[test]
+fn extract_screen_info_ipv4_first_fragment() {
+    // Build a synthetic IPv4 header at offset 14 (Ethernet) with
+    // MF=1 and offset=0. version=4, ihl=5, tot_len=40 (20 IP + 20 TCP),
+    // protocol=TCP, src=1.2.3.4 dst=5.6.7.8.
+    let mut frame = vec![0u8; 14 + 40];
+    // Ethernet: zeroed (we don't parse it here)
+    let ip = 14;
+    frame[ip] = 0x45; // version=4, ihl=5
+    frame[ip + 2..ip + 4].copy_from_slice(&40u16.to_be_bytes());
+    // frag_off: MF (0x2000) | offset 0 = 0x2000 BE
+    frame[ip + 6..ip + 8].copy_from_slice(&0x2000u16.to_be_bytes());
+    frame[ip + 9] = 6; // protocol = TCP
+    frame[ip + 12..ip + 16].copy_from_slice(&[1, 2, 3, 4]);
+    frame[ip + 16..ip + 20].copy_from_slice(&[5, 6, 7, 8]);
+
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET as u8,
+        6,    // TCP
+        0x02, // SYN
+        40,
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+        IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+        12345,
+        80,
+        14,
+    );
+    assert!(info.is_fragment, "MF=1 → is_fragment");
+    assert!(info.is_first_fragment, "MF=1 && offset==0 → is_first_fragment");
+}
+
+#[test]
+fn extract_screen_info_ipv4_subsequent_fragment() {
+    // offset=8 octets (encoded as 0x0001 since offset is in 8-byte units),
+    // MF=0 (last fragment).
+    let mut frame = vec![0u8; 14 + 40];
+    let ip = 14;
+    frame[ip] = 0x45;
+    frame[ip + 2..ip + 4].copy_from_slice(&40u16.to_be_bytes());
+    frame[ip + 6..ip + 8].copy_from_slice(&0x0001u16.to_be_bytes());
+    frame[ip + 9] = 6;
+
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET as u8,
+        6,
+        0,
+        40,
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+        IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+        0,
+        0,
+        14,
+    );
+    assert!(info.is_fragment, "offset>0 → is_fragment");
+    assert!(
+        !info.is_first_fragment,
+        "offset>0 → is_first_fragment must be 0"
+    );
+}
+
+#[test]
+fn extract_screen_info_ipv6_first_fragment() {
+    // IPv6 base header (40 bytes) at offset 14, with NextHdr=44 (FRAGMENT),
+    // followed by an 8-byte fragment ext header. MF=1, offset=0.
+    let mut frame = vec![0u8; 14 + 40 + 8];
+    // IPv6 first byte: version=6 in top nibble
+    frame[14] = 0x60;
+    frame[14 + 6] = 44; // NextHdr = FRAGMENT
+    // Fragment header at offset 14+40 = 54: nexthdr=6 (TCP), reserved=0,
+    // frag_off (MF=1, offset=0) = 0x0001 in big-endian.
+    let frag_off_pos = 14 + 40 + 2;
+    frame[14 + 40] = 6; // inner nexthdr = TCP
+    frame[frag_off_pos..frag_off_pos + 2].copy_from_slice(&0x0001u16.to_be_bytes());
+
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET6 as u8,
+        6,
+        0x02,
+        48,
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        12345,
+        80,
+        14,
+    );
+    assert!(info.is_fragment, "IPv6 MF=1 → is_fragment");
+    assert!(
+        info.is_first_fragment,
+        "IPv6 MF=1 && offset==0 → is_first_fragment"
+    );
+}
+
+#[test]
+fn extract_screen_info_ipv6_subsequent_fragment() {
+    // IPv6 fragment with offset>0 (e.g. offset=1 in 8-byte units → 0x0008).
+    let mut frame = vec![0u8; 14 + 40 + 8];
+    frame[14] = 0x60;
+    frame[14 + 6] = 44;
+    let frag_off_pos = 14 + 40 + 2;
+    frame[14 + 40] = 6;
+    frame[frag_off_pos..frag_off_pos + 2].copy_from_slice(&0x0008u16.to_be_bytes());
+
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET6 as u8,
+        6,
+        0,
+        48,
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        0,
+        0,
+        14,
+    );
+    assert!(info.is_fragment, "IPv6 offset>0 → is_fragment");
+    assert!(
+        !info.is_first_fragment,
+        "IPv6 offset>0 → is_first_fragment must be 0"
     );
 }
 

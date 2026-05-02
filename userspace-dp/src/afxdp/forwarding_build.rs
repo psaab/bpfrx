@@ -18,6 +18,7 @@ pub(super) fn build_screen_profiles(snapshot: &ConfigSnapshot) -> FxHashMap<Stri
                 ping_death: sp.ping_death,
                 teardrop: sp.teardrop,
                 icmp_fragment: sp.icmp_fragment,
+                syn_frag: sp.syn_frag,
                 source_route: sp.source_route,
                 icmp_flood_threshold: sp.icmp_flood_threshold,
                 udp_flood_threshold: sp.udp_flood_threshold,

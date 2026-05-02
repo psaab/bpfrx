@@ -1263,6 +1263,7 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 			WinNuke:     sp.TCP.WinNuke,
 			PingDeath:   sp.ICMP.PingDeath,
 			Teardrop:    sp.IP.TearDrop,
+			SynFrag:     sp.TCP.SynFrag, // #1137 — port from typed config
 			SourceRoute: sp.IP.SourceRouteOption,
 		}
 		if sp.ICMP.FloodThreshold > 0 {
@@ -1289,7 +1290,7 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 		// Only include profiles that have at least one check enabled
 		if snap.Land || snap.SynFin || snap.NoFlag || snap.FinNoAck ||
 			snap.WinNuke || snap.PingDeath || snap.Teardrop ||
-			snap.SourceRoute ||
+			snap.SynFrag || snap.SourceRoute ||
 			snap.ICMPFloodThreshold > 0 || snap.UDPFloodThreshold > 0 ||
 			snap.SYNFloodThreshold > 0 ||
 			snap.SessionLimitSrc > 0 || snap.SessionLimitDst > 0 ||

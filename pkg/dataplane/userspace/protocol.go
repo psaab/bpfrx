@@ -281,6 +281,7 @@ type ScreenProfileSnapshot struct {
 	PingDeath          bool   `json:"ping_death,omitempty"`
 	Teardrop           bool   `json:"teardrop,omitempty"`
 	ICMPFragment       bool   `json:"icmp_fragment,omitempty"`
+	SynFrag            bool   `json:"syn_frag,omitempty"`
 	SourceRoute        bool   `json:"source_route,omitempty"`
 	ICMPFloodThreshold uint32 `json:"icmp_flood_threshold,omitempty"`
 	UDPFloodThreshold  uint32 `json:"udp_flood_threshold,omitempty"`
