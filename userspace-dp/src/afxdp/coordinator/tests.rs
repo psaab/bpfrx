@@ -867,3 +867,44 @@ fn spawn_supervised_worker_catches_string_panic_and_marks_dead() {
         .expect("panic message published");
     assert_eq!(msg, "intentional test panic");
 }
+
+/// #925-A: same as the worker test above but for the auxiliary-thread
+/// helper. No `runtime_atomics` / `panic_slot` — aux threads only get
+/// catch_unwind + journald log + clean exit.
+#[test]
+fn spawn_supervised_aux_catches_string_panic_and_returns_cleanly() {
+    let join = super::spawn_supervised_aux("test-aux", || {
+        panic!("intentional aux test panic")
+    })
+    .expect("spawn_supervised_aux");
+    // Joiner must observe a clean Ok(()) — supervisor swallowed the panic.
+    join.join()
+        .expect("supervisor must catch aux thread panic and return Ok(())");
+}
+
+#[test]
+fn spawn_supervised_aux_runs_body_to_completion_when_no_panic() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran_clone = ran.clone();
+    let join = super::spawn_supervised_aux("test-aux-noop", move || {
+        ran_clone.store(true, Ordering::Relaxed);
+    })
+    .expect("spawn_supervised_aux");
+    join.join().expect("aux thread join");
+    assert!(
+        ran.load(Ordering::Relaxed),
+        "aux body must execute when no panic occurs"
+    );
+}
+
+#[test]
+fn spawn_supervised_aux_catches_non_string_panic_payload() {
+    // Non-string payload exercises the panic_payload_message fallback
+    // path, mirroring the worker_loop integration test above.
+    let join = super::spawn_supervised_aux("test-aux-i32", || {
+        std::panic::panic_any(99_i32)
+    })
+    .expect("spawn_supervised_aux");
+    join.join().expect("supervisor must catch non-string panic");
+}

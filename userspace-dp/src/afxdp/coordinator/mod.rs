@@ -772,12 +772,13 @@ impl Coordinator {
             let stop_clone = stop.clone();
             let dynamic_neighbors = self.neighbors.dynamic.clone();
             let neighbor_generation = self.neighbors.generation.clone();
-            thread::Builder::new()
-                .name("neigh-monitor".to_string())
-                .spawn(move || {
-                    neigh_monitor_thread(stop_clone, dynamic_neighbors, neighbor_generation)
-                })
-                .ok();
+            // #925-A: wrap aux thread in catch_unwind so a panic in the
+            // netlink path doesn't kill the daemon. No respawn — see
+            // spawn_supervised_aux doc for operator-visible degradation.
+            spawn_supervised_aux("neigh-monitor", move || {
+                neigh_monitor_thread(stop_clone, dynamic_neighbors, neighbor_generation)
+            })
+            .ok();
             self.neighbors.monitor_stop = Some(stop);
         }
         self.spawn_local_tunnel_sources();
@@ -820,9 +821,13 @@ impl Coordinator {
             let thread_tunnel_name = tunnel_name.clone();
             let logical_ifindex = endpoint.logical_ifindex;
             let (delivery_tx, delivery_rx) = mpsc::sync_channel(LOCAL_TUNNEL_DELIVERY_QUEUE_DEPTH);
-            let join = thread::Builder::new()
-                .name(format!("xpf-native-gre-origin-{}", tunnel_name))
-                .spawn(move || {
+            // #925-A: wrap aux tunnel-origin thread in catch_unwind.
+            // A panic here would otherwise silently stop locally-
+            // generated GRE traffic on this tunnel; transit packets
+            // continue through worker_loop unaffected.
+            let join = spawn_supervised_aux(
+                format!("xpf-native-gre-origin-{}", tunnel_name),
+                move || {
                     local_tunnel_source_loop(
                         thread_tunnel_name,
                         tunnel_endpoint_id,
@@ -840,7 +845,8 @@ impl Coordinator {
                         recent_exceptions,
                         stop_clone,
                     );
-                });
+                },
+            );
             match join {
                 Ok(join) => {
                     local_tunnel_deliveries.insert(logical_ifindex, delivery_tx);
@@ -1839,6 +1845,59 @@ fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     } else {
         String::from("non-string panic payload")
     }
+}
+
+/// #925 Phase 1.5: spawn an auxiliary (non-worker) thread on a
+/// named thread and wrap it with `catch_unwind`. On panic, log a
+/// stderr message that surfaces in journald, then exit the thread
+/// without respawning.
+///
+/// Used for control-plane helper threads that don't have per-worker
+/// `runtime_atomics` (e.g. `neigh-monitor`, `xpf-native-gre-origin-*`).
+/// Worker threads use `spawn_supervised_worker` which records the
+/// panic in the per-worker `dead` flag exposed through
+/// `crate::protocol::WorkerRuntimeStatus` on the userspace
+/// control-socket JSON status path (NOT gRPC — the dataplane status
+/// is JSON-over-Unix-socket, only the daemon's outward-facing API
+/// is gRPC). Aux threads have no equivalent status surface and rely
+/// on journald log scraping.
+///
+/// Operator-visible degradation when an aux thread dies (#925-A):
+/// - `neigh-monitor` death: dynamic neighbor cache stops updating;
+///   forwarding falls back to slow-path NDP/ARP resolution after
+///   kernel TTL expiration. Degrades over minutes.
+/// - `xpf-native-gre-origin-*` death: that tunnel's local-origin
+///   packet stream stops; transit packets through the tunnel are
+///   unaffected (those go through worker_loop).
+///
+/// `AssertUnwindSafe` rationale: aux thread bodies own their state
+/// and `Arc`s; no `&mut` parameters cross the unwind. Shared
+/// `Arc<Mutex<…>>` may become poisoned. Same-file consumers
+/// follow two poison-tolerant patterns: (a) `into_inner` recovery
+/// (e.g. the worker `panic_slot` write at the bottom of
+/// `spawn_supervised_worker`), and (b) `if let Ok(mut guard) =
+/// lock { ... }` which silently drops the guard on poison and
+/// proceeds — lossy for that one operation but never propagates
+/// the panic (see `recent_exceptions` users in this file). Aux
+/// threads only touch `Arc<Mutex<…>>` via the `(b)` pattern, so a
+/// poisoned mutex degrades a single error-recording attempt and
+/// does not cascade.
+fn spawn_supervised_aux<S, F>(name: S, body: F) -> std::io::Result<thread::JoinHandle<()>>
+where
+    S: Into<String>,
+    F: FnOnce() + Send + 'static,
+{
+    let name = name.into();
+    let log_name = name.clone();
+    thread::Builder::new().name(name).spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        if let Err(payload) = result {
+            let msg = panic_payload_message(&payload);
+            eprintln!(
+                "xpf-userspace-dp: aux thread '{log_name}' panicked: {msg}",
+            );
+        }
+    })
 }
 
 /// #925 Phase 1: spawn `body` on a named thread and wrap it with
