@@ -1,0 +1,137 @@
+// Tests for afxdp/tx/dispatch.rs — relocated from inline
+// `#[cfg(test)] mod tests` to keep dispatch.rs under the modularity-discipline
+// LOC threshold. Loaded as a sibling submodule via
+// `#[path = "dispatch_tests.rs"]` from dispatch.rs.
+
+use super::*;
+use crate::test_zone_ids::*;
+
+fn test_forwarding_with_egress_mtu(mtu: usize) -> ForwardingState {
+    let mut forwarding = ForwardingState::default();
+    forwarding.egress.insert(
+        80,
+        EgressInterface {
+            bind_ifindex: 11,
+            vlan_id: 80,
+            mtu,
+            src_mac: [0; 6],
+            zone_id: TEST_WAN_ZONE_ID,
+            redundancy_group: 0,
+            primary_v4: None,
+            primary_v6: None,
+        },
+    );
+    forwarding
+}
+fn test_decision() -> SessionDecision {
+    SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 80,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: None,
+            neighbor_mac: None,
+            src_mac: None,
+            tx_vlan_id: 80,
+        },
+        nat: NatDecision::default(),
+    }
+}
+
+fn test_cos_fast_interfaces(
+    egress_ifindex: i32,
+    default_queue: u8,
+    shared_exact_queues: &[(u8, bool)],
+) -> FastMap<i32, WorkerCoSInterfaceFastPath> {
+    let mut queue_index_by_id = [COS_FAST_QUEUE_INDEX_MISS; 256];
+    let mut queue_fast_path = Vec::new();
+    for (idx, (queue_id, shared_exact)) in shared_exact_queues.iter().copied().enumerate() {
+        queue_index_by_id[usize::from(queue_id)] = idx as u16;
+        queue_fast_path.push(WorkerCoSQueueFastPath {
+            shared_exact,
+            owner_worker_id: 0,
+            owner_live: None,
+            shared_queue_lease: shared_exact
+                .then(|| Arc::new(SharedCoSQueueLease::new(1_250_000_000, 256 * 1024, 2))),
+            vtime_floor: None,
+        });
+    }
+    let mut interfaces = FastMap::default();
+    interfaces.insert(
+        egress_ifindex,
+        WorkerCoSInterfaceFastPath {
+            tx_ifindex: 11,
+            default_queue_index: queue_index_by_id[usize::from(default_queue)] as usize,
+            queue_index_by_id,
+            tx_owner_live: None,
+            shared_root_lease: None,
+            queue_fast_path,
+        },
+    );
+    interfaces
+}
+
+#[test]
+fn forwarded_tcp_may_need_segmentation_skips_mtu_sized_frame() {
+    let forwarding = test_forwarding_with_egress_mtu(1500);
+    let meta = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        l3_offset: 14,
+        ..UserspaceDpMeta::default()
+    };
+    let frame = vec![0u8; 14 + 1500];
+    assert!(!forwarded_tcp_may_need_segmentation(
+        &frame,
+        meta,
+        &test_decision(),
+        &forwarding,
+    ));
+}
+
+#[test]
+fn forwarded_tcp_may_need_segmentation_flags_oversized_frame() {
+    let forwarding = test_forwarding_with_egress_mtu(1500);
+    let meta = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        l3_offset: 14,
+        ..UserspaceDpMeta::default()
+    };
+    let frame = vec![0u8; 14 + 1600];
+    assert!(forwarded_tcp_may_need_segmentation(
+        &frame,
+        meta,
+        &test_decision(),
+        &forwarding,
+    ));
+}
+
+#[test]
+fn shared_exact_queue_lease_uses_requested_queue_id() {
+    let cos_fast_interfaces = test_cos_fast_interfaces(80, 5, &[(5, true)]);
+
+    assert!(request_uses_shared_exact_queue_lease(
+        &cos_fast_interfaces,
+        80,
+        Some(5),
+    ));
+    assert!(!request_uses_shared_exact_queue_lease(
+        &cos_fast_interfaces,
+        80,
+        Some(4),
+    ));
+}
+
+#[test]
+fn shared_exact_queue_lease_uses_interface_default_queue() {
+    let cos_fast_interfaces = test_cos_fast_interfaces(80, 5, &[(5, true)]);
+
+    assert!(request_uses_shared_exact_queue_lease(
+        &cos_fast_interfaces,
+        80,
+        None,
+    ));
+}
