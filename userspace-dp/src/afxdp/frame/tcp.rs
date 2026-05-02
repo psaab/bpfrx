@@ -26,7 +26,7 @@
 use super::*;
 
 /// Check if a frame contains a TCP RST flag.
-#[inline]
+#[inline(always)]
 pub(in crate::afxdp) fn frame_has_tcp_rst(frame: &[u8]) -> bool {
     let l3 = match frame_l3_offset(frame) {
         Some(off) => off,
@@ -174,6 +174,7 @@ pub(super) fn clamp_tcp_mss(packet: &mut [u8], max_mss: u16) -> bool {
     if max_mss == 0 {
         return false;
     }
+    // Determine L3 header length and protocol.
     if packet.is_empty() {
         return false;
     }
@@ -251,7 +252,7 @@ pub(super) fn clamp_tcp_mss(packet: &mut [u8], max_mss: u16) -> bool {
 }
 
 /// Clamp TCP MSS in a full Ethernet frame starting at `l3_offset`.
-#[inline]
+#[inline(always)]
 #[allow(dead_code)]
 pub(super) fn clamp_tcp_mss_frame(frame: &mut [u8], l3_offset: usize, max_mss: u16) -> bool {
     if max_mss == 0 || l3_offset >= frame.len() {

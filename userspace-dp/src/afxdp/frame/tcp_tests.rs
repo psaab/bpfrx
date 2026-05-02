@@ -466,6 +466,35 @@ fn clamp_tcp_mss_malformed_option_length_bails_safely() {
 }
 
 #[test]
+fn clamp_tcp_mss_opt_len_past_data_offset_bails() {
+    // Gemini round-2 gap: a TCP option whose length field walks
+    // PAST the end of the TCP-options region (pos + opt_len >
+    // data_offset) must cause the parser to break out, not OOB.
+    //
+    // Construct: a single option at TCP offset 20 with kind=42 and
+    // len=20. data_offset for a 24-byte TCP header = 6 dwords, so
+    // the options region is exactly 4 bytes (20..24). An opt_len of
+    // 20 takes pos=20+20=40, which is well past data_offset=24.
+    // The parser must hit the `pos + opt_len > data_offset` branch
+    // at the bounds check inside clamp_tcp_mss and break out
+    // without rewriting anything or panicking.
+    let opts = [42, 20, 0xaa, 0xbb]; // kind=42, malformed len=20
+    let (mut packet, src, dst) = build_v4_ip_tcp_with_options(TCP_FLAG_SYN, &opts);
+    let pre = packet.clone();
+    let clamped = clamp_tcp_mss(&mut packet, 100);
+    assert!(!clamped, "opt_len past data_offset → no rewrite");
+    assert_eq!(
+        packet, pre,
+        "no bytes mutated when option length walks past options end"
+    );
+    assert_eq!(
+        checksum_tcp_v4(src, dst, tcp_segment_v4(&packet)),
+        0xFFFF,
+        "checksum unchanged on parser bail-out"
+    );
+}
+
+#[test]
 fn clamp_tcp_mss_non_syn_is_no_op() {
     // ACK-only (no SYN bit) → clamp_tcp_mss must not touch.
     let opts = [2, 4, 0x05, 0xb4];
