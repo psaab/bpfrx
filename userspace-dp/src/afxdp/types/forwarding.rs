@@ -160,13 +160,17 @@ impl ForwardingDisposition {
     /// Cacheable:
     ///   - `ForwardCandidate`: Normal forwarded traffic with a resolved
     ///     neighbor and egress interface. The common fast path.
+    ///   - `FabricRedirect`: Targets a fabric overlay binding. Cacheable
+    ///     because each cache entry captures the owning RG epoch into
+    ///     `FlowCacheStamp::owner_rg_epoch` at insert time
+    ///     (`flow_cache.rs:60-83`), and `FlowCache::lookup`
+    ///     (`flow_cache.rs:314-347`) treats the entry as a miss when
+    ///     `current_epoch != entry.stamp.owner_rg_epoch`. The owning RG
+    ///     bumps its epoch on every active/standby flip, so the window
+    ///     in which a cached `FabricRedirect` could point at a stale
+    ///     fabric peer is bounded by the next RG epoch bump (#1065).
     ///
     /// Not cacheable:
-    ///   - `FabricRedirect`: Targets a fabric overlay binding that differs
-    ///     from the normal egress binding. Fabric target selection depends on
-    ///     per-packet queue hashing and binding availability, which the cache
-    ///     entry cannot capture. Also, fabric sessions may flip back to
-    ///     ForwardCandidate after failback, making cached fabric entries stale.
     ///   - `LocalDelivery`: Delivered to the kernel stack, not forwarded
     ///     through XSK bindings. No rewrite descriptor to cache.
     ///   - `HAInactive`: The owning RG is not active on this node. Transient
