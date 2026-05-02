@@ -1074,11 +1074,32 @@ pub(super) fn update_binding_debug_state(binding: &mut BindingWorker) {
     // counters (hard-cap overrides AND regular V_min throttles) into
     // the binding-wide AtomicU64s. Mirrors the
     // flow_cache_collision_evictions pattern. Single-writer (worker
-    // thread) on both ends, so no atomicity issue. Single pass over
-    // queues to avoid two iterations.
+    // thread) on both ends, so no atomicity issue. The body is in
+    // `flush_v_min_scratches_into` so it's directly unit-testable
+    // without needing to construct a full `BindingWorker`.
+    flush_v_min_scratches_into(
+        binding.cos_interfaces.values_mut(),
+        &binding.live.v_min_throttle_hard_cap_overrides,
+        &binding.live.v_min_throttles,
+    );
+}
+
+/// Flush each queue's per-queue V_min scratch counters
+/// (`v_min_hard_cap_overrides_scratch` + `v_min_throttles_scratch`)
+/// into the binding-wide `AtomicU64`s and zero the scratches. Single
+/// pass over `roots`, single-writer discipline. Extracted from
+/// `update_binding_debug_state` so the flush is testable without
+/// constructing a `BindingWorker` (which has ~40 fields).
+pub(super) fn flush_v_min_scratches_into<'a, I>(
+    roots: I,
+    hard_cap_target: &AtomicU64,
+    throttles_target: &AtomicU64,
+) where
+    I: IntoIterator<Item = &'a mut crate::afxdp::types::CoSInterfaceRuntime>,
+{
     let mut hard_cap_overrides_total = 0u64;
     let mut throttles_total = 0u64;
-    for root in binding.cos_interfaces.values_mut() {
+    for root in roots {
         for queue in &mut root.queues {
             if queue.v_min_hard_cap_overrides_scratch != 0 {
                 hard_cap_overrides_total =
@@ -1095,16 +1116,10 @@ pub(super) fn update_binding_debug_state(binding: &mut BindingWorker) {
         }
     }
     if hard_cap_overrides_total != 0 {
-        binding
-            .live
-            .v_min_throttle_hard_cap_overrides
-            .fetch_add(hard_cap_overrides_total, Ordering::Relaxed);
+        hard_cap_target.fetch_add(hard_cap_overrides_total, Ordering::Relaxed);
     }
     if throttles_total != 0 {
-        binding
-            .live
-            .v_min_throttles
-            .fetch_add(throttles_total, Ordering::Relaxed);
+        throttles_target.fetch_add(throttles_total, Ordering::Relaxed);
     }
 }
 

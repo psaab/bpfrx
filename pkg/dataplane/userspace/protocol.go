@@ -801,6 +801,17 @@ type BindingCountersSnapshot struct {
 	TxKickLatencyCount   uint64   `json:"tx_kick_latency_count,omitempty"`
 	TxKickLatencySumNs   uint64   `json:"tx_kick_latency_sum_ns,omitempty"`
 	TxKickRetryCount     uint64   `json:"tx_kick_retry_count,omitempty"`
+	// #918: per-set LRU collision-eviction counter, brought through
+	// to the lean snapshot for fast-poll consumers that need the
+	// flow-cache thrash signal. Default keeps pre-#918 helpers parseable.
+	FlowCacheCollisionEvictions uint64 `json:"flow_cache_collision_evictions,omitempty"`
+	// #941 Work item D / #943: V_min throttle counters. The lean
+	// per_binding view is what fast-poll consumers (mouse-latency
+	// orchestrator, MQFQ diagnostics) read; without these here, V_min
+	// observability stops at the rich BindingStatus and ProcessStatus.per_binding
+	// projects zeros even when the atomics flushed real values.
+	VMinThrottleHardCapOverrides uint64 `json:"v_min_throttle_hard_cap_overrides,omitempty"`
+	VMinThrottles                uint64 `json:"v_min_throttles,omitempty"`
 }
 
 type ExceptionStatus struct {
