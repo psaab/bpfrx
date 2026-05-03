@@ -638,7 +638,14 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
 
     let mut state = CoSState::default();
     for iface in &snapshot.interfaces {
-        if iface.ifindex <= 0 || iface.cos_shaping_rate_bytes_per_sec == 0 {
+        // #916: zero `cos_shaping_rate_bytes_per_sec` is a valid Junos
+        // configuration meaning "no interface-level shaping cap"
+        // (transparent root). The runtime build path handles this
+        // case (see `maybe_top_up_cos_root_lease` /
+        // `estimate_cos_queue_wakeup_tick` rate-zero fast paths).
+        // Previously this condition skipped the entire interface,
+        // causing CoS classifier to silently not apply.
+        if iface.ifindex <= 0 {
             continue;
         }
         let burst_bytes = if iface.cos_shaping_burst_bytes > 0 {

@@ -188,3 +188,69 @@ fn maybe_top_up_cos_queue_lease_unblocks_local_exact_queue_without_tokens() {
             .is_some()
     );
 }
+
+#[test]
+fn maybe_top_up_cos_root_lease_transparent_when_shaping_rate_zero() {
+    // #916: transparent root. When the interface has shaping_rate=0,
+    // `maybe_top_up_cos_root_lease` MUST fast-path-fill the bucket
+    // to its burst cap and skip the (zero-rate) shared lease
+    // acquire. Without this, the shared lease's zero-rate refill
+    // never grants tokens and the queue never drains.
+    let lease = Arc::new(SharedCoSRootLease::new(0, 256 * 1024, 1));
+    let mut root = test_cos_runtime_with_queues(
+        0, // <- shaping_rate_bytes = 0 (transparent root)
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "best-effort".into(),
+            priority: 5,
+            transmit_rate_bytes: 1_000_000,
+            exact: false,
+            surplus_weight: 1,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+        }],
+    );
+    // Force tokens to 0 so the top-up has work to do.
+    root.tokens = 0;
+
+    maybe_top_up_cos_root_lease(&mut root, &lease, 1_000_000_000);
+
+    assert!(
+        root.tokens >= COS_MIN_BURST_BYTES,
+        "transparent-root top-up must fast-path-fill to >= COS_MIN_BURST_BYTES, got {}",
+        root.tokens,
+    );
+    assert_eq!(root.shaping_rate_bytes, 0);
+}
+
+#[test]
+fn maybe_top_up_cos_queue_lease_transparent_when_queue_rate_zero() {
+    // #916: transparent queue. When transmit_rate_bytes=0,
+    // `maybe_top_up_cos_queue_lease` MUST fast-path-fill the queue
+    // bucket to its buffer cap. Otherwise an exact queue with no
+    // shared lease (which is the case for rate=0 queues per
+    // coordinator allocation) would stay at 0 tokens forever.
+    let mut root = test_cos_runtime_with_queues(
+        0,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "best-effort".into(),
+            priority: 5,
+            transmit_rate_bytes: 0, // <- transparent queue
+            exact: false,
+            surplus_weight: 1,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+        }],
+    );
+    root.queues[0].tokens = 0;
+    root.queues[0].last_refill_ns = 0;
+
+    maybe_top_up_cos_queue_lease(&mut root.queues[0], None, 1_000_000_000);
+
+    assert!(
+        root.queues[0].tokens >= COS_MIN_BURST_BYTES,
+        "transparent-queue top-up must fast-path-fill to >= COS_MIN_BURST_BYTES, got {}",
+        root.queues[0].tokens,
+    );
+}

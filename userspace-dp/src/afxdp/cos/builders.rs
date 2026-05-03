@@ -64,10 +64,19 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(config: &CoSInterfaceConfig,
         let priority = usize::from(queue.priority).min(COS_PRIORITY_LEVELS - 1);
         queue_indices_by_priority[priority].push(idx);
     }
+    // #916: transparent root. When `shaping_rate_bytes == 0` the root
+    // bucket is bypassed by `maybe_top_up_cos_root_lease`; pre-fill
+    // tokens to the burst cap so the very first packet doesn't see
+    // an empty bucket on the cold path before the first top-up call.
+    let initial_root_tokens = if config.shaping_rate_bytes == 0 {
+        config.burst_bytes.max(COS_MIN_BURST_BYTES)
+    } else {
+        0
+    };
     CoSInterfaceRuntime {
         shaping_rate_bytes: config.shaping_rate_bytes,
         burst_bytes: config.burst_bytes.max(COS_MIN_BURST_BYTES),
-        tokens: 0,
+        tokens: initial_root_tokens,
         default_queue: config.default_queue,
         nonempty_queues: 0,
         runnable_queues: 0,
@@ -95,12 +104,22 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(config: &CoSInterfaceConfig,
                 surplus_deficit: 0,
                 buffer_bytes: queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
                 dscp_rewrite: queue.dscp_rewrite,
-                tokens: if queue.exact {
+                // #916: transparent queue (no scheduler rate AND
+                // no parent shaping rate). Pre-fill tokens to the
+                // buffer cap; otherwise an exact queue starts at 0
+                // and waits forever for a top-up that never arrives.
+                tokens: if queue.transmit_rate_bytes == 0 {
+                    queue.buffer_bytes.max(COS_MIN_BURST_BYTES)
+                } else if queue.exact {
                     0
                 } else {
                     queue.buffer_bytes.max(COS_MIN_BURST_BYTES)
                 },
-                last_refill_ns: if queue.exact { 0 } else { now_ns },
+                last_refill_ns: if queue.exact && queue.transmit_rate_bytes != 0 {
+                    0
+                } else {
+                    now_ns
+                },
                 queued_bytes: 0,
                 active_flow_buckets: 0,
             active_flow_buckets_peak: 0,
