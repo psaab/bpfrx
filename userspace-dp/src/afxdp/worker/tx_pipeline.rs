@@ -39,8 +39,14 @@ pub(crate) struct WorkerTxPipeline {
     pub(crate) max_pending_tx: usize,
     pub(crate) pending_fill_frames: VecDeque<u64>,
     pub(crate) in_flight_prepared_recycles: FastMap<u64, PreparedTxRecycle>,
-    /// #812 per-UMEM-frame submit timestamp sidecar; see module
-    /// docs and the original commentary preserved on the
-    /// `BindingWorker::tx_submit_ns` field history.
+    /// #812 per-UMEM-frame submit timestamp sidecar. Indexed by
+    /// `offset >> UMEM_FRAME_SHIFT`. Pre-allocated to total UMEM
+    /// frames at `BindingWorker::create` so the hot-path stamp
+    /// write is a single store — NO allocation, NO grow.
+    /// `Box<[u64]>` (not `Vec<u64>`) at the type level so any
+    /// future `push` attempt fails to compile (Rust round-1 MED-1).
+    /// Unstamped slots hold `TX_SIDECAR_UNSTAMPED` (`u64::MAX`); the
+    /// reap path skips the histogram increment for these to avoid
+    /// biasing the tail toward bucket 0 (plan §5.4).
     pub(crate) tx_submit_ns: Box<[u64]>,
 }
