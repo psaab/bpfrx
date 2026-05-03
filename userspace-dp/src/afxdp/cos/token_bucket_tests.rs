@@ -224,20 +224,23 @@ fn maybe_top_up_cos_root_lease_transparent_when_shaping_rate_zero() {
 }
 
 #[test]
-fn maybe_top_up_cos_queue_lease_transparent_when_queue_rate_zero() {
-    // #916: transparent queue. When transmit_rate_bytes=0,
-    // `maybe_top_up_cos_queue_lease` MUST fast-path-fill the queue
-    // bucket to its buffer cap. Otherwise an exact queue with no
-    // shared lease (which is the case for rate=0 queues per
-    // coordinator allocation) would stay at 0 tokens forever.
+fn maybe_top_up_cos_queue_lease_transparent_when_queue_rate_zero_exact_no_lease() {
+    // #916: transparent queue with `exact: true` and NO shared
+    // lease. This is the precise case the old code couldn't
+    // handle — pre-fix, `if queue.exact { let Some(lease) = ...
+    // else { return; } }` returned early without filling tokens.
+    // Asserting `tokens >= COS_MIN_BURST_BYTES` after the call
+    // fails on the old code (which would leave them at 0).
+    //
+    // Codex round-1: strengthened to fail against the old path.
     let mut root = test_cos_runtime_with_queues(
         0,
         vec![CoSQueueConfig {
             queue_id: 0,
             forwarding_class: "best-effort".into(),
             priority: 5,
-            transmit_rate_bytes: 0, // <- transparent queue
-            exact: false,
+            transmit_rate_bytes: 0,
+            exact: true, // <- precise old-code-failing branch
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
@@ -246,11 +249,104 @@ fn maybe_top_up_cos_queue_lease_transparent_when_queue_rate_zero() {
     root.queues[0].tokens = 0;
     root.queues[0].last_refill_ns = 0;
 
+    // No shared queue lease — old code would early-return with
+    // tokens still at 0; new code's transparent fast-path runs
+    // before the exact branch and fills to the buffer cap.
     maybe_top_up_cos_queue_lease(&mut root.queues[0], None, 1_000_000_000);
 
     assert!(
         root.queues[0].tokens >= COS_MIN_BURST_BYTES,
-        "transparent-queue top-up must fast-path-fill to >= COS_MIN_BURST_BYTES, got {}",
+        "transparent-queue + exact + no lease MUST fast-path-fill (old code would leave tokens=0); got {}",
+        root.queues[0].tokens,
+    );
+    assert_eq!(
+        root.queues[0].last_refill_ns, 1_000_000_000,
+        "last_refill_ns must be advanced to now_ns by the transparent fast path",
+    );
+}
+
+#[test]
+fn maybe_top_up_cos_queue_lease_transparent_non_exact_with_nonzero_last_refill() {
+    // #916: companion test covering the non-exact branch. With
+    // transmit_rate_bytes=0 + exact=false + no shared lease, the
+    // old code fell through to `refill_cos_tokens` which has its
+    // own `if rate_bytes_per_sec == 0 { return; }` early-return.
+    // Pre-pop last_refill_ns to non-zero so refill_cos_tokens'
+    // first-call init branch (line 111-114) doesn't accidentally
+    // fill tokens — old code would leave tokens at 0 in this
+    // configuration, the fast path fills them.
+    let mut root = test_cos_runtime_with_queues(
+        0,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "best-effort".into(),
+            priority: 5,
+            transmit_rate_bytes: 0,
+            exact: false,
+            surplus_weight: 1,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+        }],
+    );
+    root.queues[0].tokens = 0;
+    // Non-zero last_refill_ns — old code's refill_cos_tokens
+    // would skip refill at rate=0; new fast-path fills regardless.
+    root.queues[0].last_refill_ns = 500_000_000;
+
+    maybe_top_up_cos_queue_lease(&mut root.queues[0], None, 1_000_000_000);
+
+    assert!(
+        root.queues[0].tokens >= COS_MIN_BURST_BYTES,
+        "transparent-queue + non-exact + nonzero last_refill_ns MUST fast-path-fill; got {}",
+        root.queues[0].tokens,
+    );
+    assert_eq!(
+        root.queues[0].last_refill_ns, 1_000_000_000,
+        "last_refill_ns must advance even on the non-exact transparent path",
+    );
+}
+
+#[test]
+fn transparent_root_preserves_per_queue_exact_cap() {
+    // #916 plan §Tests: with transparent root (shaping_rate=0)
+    // AND a per-queue exact cap (e.g., 1 Gbps), the per-queue
+    // token bucket must still gate the queue. Confirms that
+    // transparent root does NOT bypass per-queue caps.
+    use std::sync::Arc;
+    let one_gbps_bytes: u64 = 1_000_000_000 / 8;
+    let lease = Arc::new(SharedCoSQueueLease::new(
+        one_gbps_bytes,
+        COS_MIN_BURST_BYTES,
+        1,
+    ));
+    let mut root = test_cos_runtime_with_queues(
+        0, // <- transparent root
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "iperf-a".into(),
+            priority: 5,
+            transmit_rate_bytes: one_gbps_bytes, // <- per-queue exact cap
+            exact: true,
+            surplus_weight: 1,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+        }],
+    );
+    root.queues[0].tokens = 0;
+
+    maybe_top_up_cos_queue_lease(&mut root.queues[0], Some(&lease), 1_000_000_000);
+
+    // Per-queue tokens populated by lease.acquire — bounded by the
+    // lease size and buffer cap. The transparent-queue fast-path
+    // is gated on `transmit_rate_bytes == 0` so it does NOT fire
+    // here (queue rate is 1G). Per-queue cap preserved.
+    assert!(
+        root.queues[0].tokens > 0,
+        "per-queue lease must still grant tokens at non-zero rate"
+    );
+    assert!(
+        root.queues[0].tokens <= COS_MIN_BURST_BYTES,
+        "per-queue tokens must be bounded by buffer cap (not u64::MAX); got {}",
         root.queues[0].tokens,
     );
 }
