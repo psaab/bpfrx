@@ -22,7 +22,14 @@ use super::*;
 /// struct so callers find the same field name with `.scratch.` in
 /// front: `binding.scratch.scratch_recycle` (was
 /// `binding.scratch_recycle`).
-#[derive(Default)]
+///
+/// **Intentionally NOT `Default`.** Codex round-1 review on
+/// PR #1168 flagged that a `#[derive(Default)]` would silently
+/// produce zero-capacity Vecs on accidental
+/// `WorkerScratch::default()` calls, regressing the no-allocation-
+/// on-hot-path contract. The only legal construction path is the
+/// explicit literal in `BindingWorker::create` which carries the
+/// per-Vec `with_capacity` hints.
 pub(crate) struct WorkerScratch {
     pub(crate) scratch_recycle: Vec<u64>,
     pub(crate) scratch_forwards: Vec<PendingForwardRequest>,
