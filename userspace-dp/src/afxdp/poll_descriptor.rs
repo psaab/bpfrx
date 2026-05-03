@@ -229,7 +229,7 @@ pub(super) fn poll_binding_process_descriptor(
                     if FlowCacheEntry::packet_eligible(meta)
                         && let Some(flow) = flow.as_ref()
                     {
-                        if let Some(cached) = binding.flow_cache.lookup(
+                        if let Some(cached) = binding.flow.flow_cache.lookup(
                             &flow.forward_key,
                             FlowCacheLookup::for_packet(meta, validation),
                             now_secs,
@@ -245,7 +245,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 resolution_target_for_session(flow, cached.decision),
                                 cached.decision.resolution,
                             ) {
-                                binding.flow_cache.invalidate_slot(
+                                binding.flow.flow_cache.invalidate_slot(
                                     &flow.forward_key,
                                     meta.ingress_ifindex as i32,
                                 );
@@ -264,8 +264,8 @@ pub(super) fn poll_binding_process_descriptor(
                                     );
                                 }
                                 // Amortize session timestamp touch — every 64 cache hits.
-                                binding.flow_cache_session_touch += 1;
-                                if binding.flow_cache_session_touch & 63 == 0 {
+                                binding.flow.flow_cache_session_touch += 1;
+                                if binding.flow.flow_cache_session_touch & 63 == 0 {
                                     sessions.touch(&flow.forward_key, now_ns);
                                 }
                                 if matches!(
@@ -1885,7 +1885,7 @@ pub(super) fn poll_binding_process_descriptor(
                                     &worker_ctx.rg_epochs,
                                 )
                             {
-                                binding.flow_cache.insert(entry);
+                                binding.flow.flow_cache.insert(entry);
                             }
                             // ── End flow cache population ────────────────
                         } else {

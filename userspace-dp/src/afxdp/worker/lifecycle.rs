@@ -211,7 +211,7 @@ pub(super) fn poll_binding(
             // #918: 4-way set-associative cache requires walking the set
             // for the matching key — `invalidate_slot` does that.
             binding
-                .flow_cache
+                .flow.flow_cache
                 .invalidate_slot(&forward_key, binding.ifindex);
             teardown_tcp_rst_flow(
                 left,
