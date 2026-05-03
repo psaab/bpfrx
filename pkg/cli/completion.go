@@ -144,3 +144,170 @@ func completePipeFilter(text string) (candidates []completionCandidate, handled 
 	}
 	return candidates, true
 }
+
+// #1044c Phase 1: valueProvider relocated from cli.go (no behavior change).
+func (c *CLI) valueProvider(hint config.ValueHint, path []string) []config.SchemaCompletion {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		return nil
+	}
+	switch hint {
+	case config.ValueHintZoneName:
+		var out []config.SchemaCompletion
+		for name, zone := range cfg.Security.Zones {
+			desc := zone.Description
+			if desc == "" {
+				desc = "(configured)"
+			}
+			out = append(out, config.SchemaCompletion{Name: name, Desc: desc})
+		}
+		return out
+	case config.ValueHintAddressName:
+		var out []config.SchemaCompletion
+		if cfg.Security.AddressBook != nil {
+			for _, addr := range cfg.Security.AddressBook.Addresses {
+				out = append(out, config.SchemaCompletion{Name: addr.Name, Desc: addr.Value})
+			}
+			for _, as := range cfg.Security.AddressBook.AddressSets {
+				out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "address-set"})
+			}
+		}
+		return out
+	case config.ValueHintAppName:
+		var out []config.SchemaCompletion
+		for _, app := range cfg.Applications.Applications {
+			out = append(out, config.SchemaCompletion{Name: app.Name, Desc: app.Description})
+		}
+		for _, as := range cfg.Applications.ApplicationSets {
+			out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "application-set"})
+		}
+		for name := range config.PredefinedApplications {
+			out = append(out, config.SchemaCompletion{Name: name, Desc: "predefined"})
+		}
+		return out
+	case config.ValueHintAppSetName:
+		var out []config.SchemaCompletion
+		for _, as := range cfg.Applications.ApplicationSets {
+			out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "application-set"})
+		}
+		return out
+	case config.ValueHintPoolName:
+		var out []config.SchemaCompletion
+		for name := range cfg.Security.NAT.SourcePools {
+			out = append(out, config.SchemaCompletion{Name: name, Desc: "source pool"})
+		}
+		if cfg.Security.NAT.Destination != nil {
+			for name := range cfg.Security.NAT.Destination.Pools {
+				out = append(out, config.SchemaCompletion{Name: name, Desc: "destination pool"})
+			}
+		}
+		return out
+	case config.ValueHintScreenProfile:
+		var out []config.SchemaCompletion
+		for name := range cfg.Security.Screen {
+			out = append(out, config.SchemaCompletion{Name: name, Desc: "screen profile"})
+		}
+		return out
+	case config.ValueHintStreamName:
+		var out []config.SchemaCompletion
+		for name := range cfg.Security.Log.Streams {
+			out = append(out, config.SchemaCompletion{Name: name, Desc: "log stream"})
+		}
+		return out
+	case config.ValueHintInterfaceName:
+		var out []config.SchemaCompletion
+		for name, iface := range cfg.Interfaces.Interfaces {
+			desc := iface.Description
+			if desc == "" {
+				desc = "(configured)"
+			}
+			out = append(out, config.SchemaCompletion{Name: name, Desc: desc})
+		}
+		return out
+	case config.ValueHintPolicyAddress:
+		out := []config.SchemaCompletion{
+			{Name: "any", Desc: "Any IPv4 or IPv6 address"},
+			{Name: "any-ipv4", Desc: "Any IPv4 address"},
+			{Name: "any-ipv6", Desc: "Any IPv6 address"},
+		}
+		if cfg.Security.AddressBook != nil {
+			for _, addr := range cfg.Security.AddressBook.Addresses {
+				out = append(out, config.SchemaCompletion{Name: addr.Name, Desc: addr.Value})
+			}
+			for _, as := range cfg.Security.AddressBook.AddressSets {
+				out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "address-set"})
+			}
+		}
+		return out
+	case config.ValueHintPolicyApp:
+		out := []config.SchemaCompletion{
+			{Name: "any", Desc: "Any application"},
+		}
+		for _, app := range cfg.Applications.Applications {
+			out = append(out, config.SchemaCompletion{Name: app.Name, Desc: app.Description})
+		}
+		for _, as := range cfg.Applications.ApplicationSets {
+			out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "application-set"})
+		}
+		for name := range config.PredefinedApplications {
+			out = append(out, config.SchemaCompletion{Name: name, Desc: "predefined"})
+		}
+		return out
+	case config.ValueHintPolicyName:
+		// Extract zone pair from path: ["security","policies","from-zone","X","to-zone","Y","policy"]
+		// or global: ["security","policies","global","policy"]
+		var policies []*config.Policy
+		for i, tok := range path {
+			if tok == "from-zone" && i+3 < len(path) && path[i+2] == "to-zone" {
+				fromZone := path[i+1]
+				toZone := path[i+3]
+				for _, zpp := range cfg.Security.Policies {
+					if zpp.FromZone == fromZone && zpp.ToZone == toZone {
+						policies = zpp.Policies
+						break
+					}
+				}
+				break
+			}
+			if tok == "global" {
+				policies = cfg.Security.GlobalPolicies
+				break
+			}
+		}
+		var out []config.SchemaCompletion
+		for _, pol := range policies {
+			desc := pol.Description
+			if desc == "" {
+				desc = "(configured)"
+			}
+			out = append(out, config.SchemaCompletion{Name: pol.Name, Desc: desc})
+		}
+		return out
+	case config.ValueHintUnitNumber:
+		// Find the interface name from the path context.
+		var ifaceName string
+		for i, tok := range path {
+			if tok == "interfaces" && i+1 < len(path) {
+				ifaceName = path[i+1]
+				break
+			}
+		}
+		if ifaceName == "" {
+			return nil
+		}
+		iface := cfg.Interfaces.Interfaces[ifaceName]
+		if iface == nil {
+			return nil
+		}
+		var out []config.SchemaCompletion
+		for num, unit := range iface.Units {
+			desc := unit.Description
+			if desc == "" {
+				desc = "(configured)"
+			}
+			out = append(out, config.SchemaCompletion{Name: fmt.Sprintf("%d", num), Desc: desc})
+		}
+		return out
+	}
+	return nil
+}

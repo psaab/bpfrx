@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/psaab/xpf/pkg/config"
 	"golang.org/x/sys/unix"
 )
 
@@ -763,4 +764,214 @@ func (c *CLI) showDaemonLog(args []string) error {
 	}
 	fmt.Print(string(out))
 	return nil
+}
+
+// #1044c Phase 1: handleShowSystem relocated from cli.go (no behavior change).
+func (c *CLI) handleShowSystem(args []string) error {
+	sysTree := operationalTree["show"].Children["system"].Children
+	if len(args) == 0 {
+		fmt.Println("show system:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(sysTree))
+		return nil
+	}
+
+	switch args[0] {
+	case "commit":
+		// "show system commit history"
+		if len(args) >= 2 && args[1] == "history" {
+			entries, err := c.store.ListCommitHistory(50)
+			if err != nil {
+				return fmt.Errorf("commit history: %v", err)
+			}
+			if len(entries) == 0 {
+				fmt.Println("No commit history available")
+				return nil
+			}
+			for i, e := range entries {
+				detail := ""
+				if e.Detail != "" {
+					detail = "  " + e.Detail
+				}
+				fmt.Printf("  %d  %s  %s%s\n", i, e.Timestamp.Format("2006-01-02 15:04:05"), e.Action, detail)
+			}
+			return nil
+		}
+		fmt.Println("show system commit:")
+		fmt.Println("  history              Show recent commit log")
+		return nil
+
+	case "rollback":
+		if len(args) >= 2 {
+			// "show system rollback compare N" — diff rollback N against active
+			if args[1] == "compare" {
+				if len(args) < 3 {
+					return fmt.Errorf("usage: show system rollback compare <N>")
+				}
+				n, err := strconv.Atoi(args[2])
+				if err != nil || n < 1 {
+					return fmt.Errorf("usage: show system rollback compare <N>")
+				}
+				diff, err := c.store.ShowCompareRollback(n)
+				if err != nil {
+					return err
+				}
+				if diff == "" {
+					fmt.Println("No differences found")
+				} else {
+					fmt.Print(diff)
+				}
+				return nil
+			}
+
+			// "show system rollback N" — show specific rollback content.
+			n, err := strconv.Atoi(args[1])
+			if err != nil || n < 1 {
+				return fmt.Errorf("usage: show system rollback <N>")
+			}
+			rest := strings.Join(args[2:], " ")
+			if strings.Contains(rest, "| display set") {
+				content, err := c.store.ShowRollbackSet(n)
+				if err != nil {
+					return err
+				}
+				fmt.Print(content)
+			} else if strings.Contains(rest, "compare") {
+				diff, err := c.store.ShowCompareRollback(n)
+				if err != nil {
+					return err
+				}
+				if diff == "" {
+					fmt.Println("No differences found")
+				} else {
+					fmt.Print(diff)
+				}
+			} else {
+				content, err := c.store.ShowRollback(n)
+				if err != nil {
+					return err
+				}
+				fmt.Print(content)
+			}
+			return nil
+		}
+
+		// List all rollback entries with timestamps.
+		entries := c.store.ListHistory()
+		if len(entries) == 0 {
+			fmt.Println("No rollback history available")
+			return nil
+		}
+		for i, entry := range entries {
+			fmt.Printf("  rollback %d: %s\n", i+1, entry.Timestamp.Format("2006-01-02 15:04:05"))
+		}
+		return nil
+
+	case "uptime":
+		return c.showSystemUptime()
+
+	case "memory":
+		return c.showSystemMemory()
+
+	case "processes":
+		summary := len(args) >= 2 && args[1] == "summary"
+		return c.showSystemProcesses(summary)
+
+	case "storage":
+		return c.showSystemStorage()
+
+	case "alarms":
+		cfg := c.store.ActiveConfig()
+		if cfg != nil {
+			warnings := config.ValidateConfig(cfg)
+			if len(warnings) == 0 {
+				fmt.Println("No alarms currently active")
+			} else {
+				fmt.Printf("%d active alarm(s):\n", len(warnings))
+				for _, w := range warnings {
+					fmt.Printf("  WARNING: %s\n", w)
+				}
+			}
+		} else {
+			fmt.Println("No active configuration loaded")
+		}
+		return nil
+
+	case "users":
+		return c.showSystemUsers()
+
+	case "connections":
+		return c.showSystemConnections()
+
+	case "boot-messages":
+		return c.showSystemBootMessages()
+
+	case "core-dumps":
+		return c.showCoreDumps()
+
+	case "license":
+		fmt.Println("License: open-source (no license required)")
+		return nil
+
+	case "backup-router":
+		return c.showBackupRouter()
+
+	case "ntp":
+		return c.showSystemNTP()
+
+	case "services":
+		return c.showSystemServices()
+
+	case "syslog":
+		return c.showSystemSyslog()
+
+	case "buffers":
+		if len(args) >= 2 && args[1] == "detail" {
+			return c.showSystemBuffersDetail()
+		}
+		return c.showSystemBuffers()
+
+	case "login":
+		cfg := c.store.ActiveConfig()
+		if cfg == nil {
+			return fmt.Errorf("no active configuration")
+		}
+		fmt.Print(c.store.ShowActivePath([]string{"system", "login"}))
+		return nil
+
+	case "internet-options":
+		cfg := c.store.ActiveConfig()
+		if cfg == nil {
+			return fmt.Errorf("no active configuration")
+		}
+		fmt.Print(c.store.ShowActivePath([]string{"system", "internet-options"}))
+		return nil
+
+	case "root-authentication":
+		cfg := c.store.ActiveConfig()
+		if cfg == nil {
+			return fmt.Errorf("no active configuration")
+		}
+		fmt.Print(c.store.ShowActivePath([]string{"system", "root-authentication"}))
+		return nil
+
+	case "configuration":
+		if len(args) >= 2 && args[1] == "rescue" {
+			content, err := c.store.LoadRescueConfig()
+			if err != nil {
+				return err
+			}
+			if content == "" {
+				fmt.Println("No rescue configuration saved")
+			} else {
+				fmt.Print(content)
+			}
+			return nil
+		}
+		fmt.Println("show system configuration:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["show"].Children["system"].Children["configuration"].Children))
+		return nil
+
+	default:
+		return fmt.Errorf("unknown show system target: %s", args[0])
+	}
 }

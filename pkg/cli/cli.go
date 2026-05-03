@@ -709,219 +709,103 @@ func (c *CLI) Run() error {
 	return nil
 }
 
-func (c *CLI) handleShow(args []string) error {
-	showTree := operationalTree["show"].Children
-	if len(args) == 0 {
-		fmt.Println("show: specify what to show")
-		writeCompletionHelp(os.Stdout, treeHelpCandidates(showTree))
-		return nil
+
+
+// parsePolicyZoneFilter extracts from-zone/to-zone filters from args.
+func enabledStr(v bool) string {
+	if v {
+		return "enabled"
 	}
+	return "disabled"
+}
 
-	resolved, err := resolveCommand(args[0], keysFromTree(showTree))
-	if err != nil {
-		return err
+func parsePolicyZoneFilter(args []string) (fromZone, toZone string) {
+	for i := 0; i < len(args)-1; i++ {
+		switch args[i] {
+		case "from-zone":
+			fromZone = args[i+1]
+		case "to-zone":
+			toZone = args[i+1]
+		}
 	}
-	args[0] = resolved
+	return
+}
 
-	switch args[0] {
-	case "version":
-		return c.showVersion()
-
-	case "chassis":
-		return c.showChassis(args[1:])
-
-	case "configuration":
-		rest := strings.Join(args[1:], " ")
-		// Build path (everything after "configuration" before "|")
-		var cfgPath []string
-		for _, a := range args[1:] {
-			if a == "|" {
-				break
-			}
-			cfgPath = append(cfgPath, a)
+// showPoliciesHitCount displays a Junos-style policy hit count table.
+func resolveAddressDetail(cfg *config.Config, name string) string {
+	ab := cfg.Security.AddressBook
+	if ab != nil {
+		if addr, ok := ab.Addresses[name]; ok && addr.Value != "" {
+			return addr.Value
 		}
-		if strings.Contains(rest, "| display json") {
-			if len(cfgPath) > 0 {
-				output := c.store.ShowActivePathJSON(cfgPath)
-				if output == "" {
-					fmt.Printf("configuration path not found: %s\n", strings.Join(cfgPath, " "))
-				} else {
-					fmt.Print(output)
-				}
-			} else {
-				fmt.Print(c.store.ShowActiveJSON())
-			}
-		} else if strings.Contains(rest, "| display set") {
-			if len(cfgPath) > 0 {
-				output := c.store.ShowActivePathSet(cfgPath)
-				if output == "" {
-					fmt.Printf("configuration path not found: %s\n", strings.Join(cfgPath, " "))
-				} else {
-					fmt.Print(output)
-				}
-			} else {
-				fmt.Print(c.store.ShowActiveSet())
-			}
-		} else if strings.Contains(rest, "| display xml") {
-			if len(cfgPath) > 0 {
-				output := c.store.ShowActivePathXML(cfgPath)
-				if output == "" {
-					fmt.Printf("configuration path not found: %s\n", strings.Join(cfgPath, " "))
-				} else {
-					fmt.Print(output)
-				}
-			} else {
-				fmt.Print(c.store.ShowActiveXML())
-			}
-		} else if strings.Contains(rest, "| display inheritance") {
-			if len(cfgPath) > 0 {
-				output := c.store.ShowActivePathInheritance(cfgPath)
-				if output == "" {
-					fmt.Printf("configuration path not found: %s\n", strings.Join(cfgPath, " "))
-				} else {
-					fmt.Print(output)
-				}
-			} else {
-				fmt.Print(c.store.ShowActiveInheritance())
-			}
-		} else if idx := strings.Index(rest, "| "); idx >= 0 {
-			pipeParts := strings.Fields(strings.TrimSpace(rest[idx+2:]))
-			if len(pipeParts) >= 2 && pipeParts[0] == "display" {
-				fmt.Printf("syntax error: unknown display option '%s'\n", pipeParts[1])
-			} else if len(pipeParts) > 0 {
-				fmt.Printf("syntax error: unknown pipe command '%s'\n", pipeParts[0])
-			}
-		} else if len(cfgPath) > 0 {
-			output := c.store.ShowActivePath(cfgPath)
-			if output == "" {
-				fmt.Printf("configuration path not found: %s\n", strings.Join(cfgPath, " "))
-			} else {
-				fmt.Print(output)
-			}
-		} else {
-			fmt.Print(c.store.ShowActive())
-		}
-		return nil
-
-	case "class-of-service":
-		return c.handleShowClassOfService(args[1:])
-
-	case "dhcp":
-		if len(args) >= 2 {
-			switch args[1] {
-			case "leases":
-				return c.showDHCPLeases()
-			case "client-identifier":
-				return c.showDHCPClientIdentifier()
-			}
-		}
-		cmdtree.PrintTreeHelp("show dhcp:", operationalTree, "show", "dhcp")
-		return nil
-
-	case "firewall":
-		if len(args) >= 3 && args[1] == "filter" {
-			family := ""
-			if len(args) >= 5 && args[3] == "family" {
-				family = args[4]
-			}
-			return c.showFirewallFilter(args[2], family)
-		}
-		return c.showFirewallFilters()
-
-	case "flow-monitoring":
-		return c.showFlowMonitoring()
-
-	case "log":
-		return c.showDaemonLog(args[1:])
-
-	case "route":
-		return c.handleShowRoute(args[1:])
-
-	case "security":
-		return c.handleShowSecurity(args[1:])
-
-	case "services":
-		return c.handleShowServices(args[1:])
-
-	case "interfaces":
-		return c.showInterfaces(args[1:])
-
-	case "protocols":
-		return c.handleShowProtocols(args[1:])
-
-	case "bgp":
-		// "show bgp ..." is a shorthand alias for "show protocols bgp ..."
-		return c.showBGP(args[1:])
-
-	case "system":
-		return c.handleShowSystem(args[1:])
-
-	case "schedulers":
-		return c.showSchedulers()
-
-	case "dhcp-relay":
-		return c.showDHCPRelay()
-
-	case "dhcp-server":
-		detail := len(args) >= 2 && args[1] == "detail"
-		return c.showDHCPServer(detail)
-
-	case "snmp":
-		if len(args) >= 2 && args[1] == "v3" {
-			return c.showSNMPv3()
-		}
-		return c.showSNMP()
-
-	case "lldp":
-		if len(args) >= 2 && args[1] == "neighbors" {
-			return c.showLLDPNeighbors()
-		}
-		return c.showLLDP()
-
-	case "arp":
-		return c.showARP(args[1:])
-
-	case "ipv6":
-		return c.handleShowIPv6(args[1:])
-
-	case "policy-options":
-		return c.showPolicyOptions()
-
-	case "route-map":
-		return c.showRouteMap()
-
-	case "event-options":
-		return c.showEventOptions()
-
-	case "routing-options":
-		return c.showRoutingOptions()
-
-	case "routing-instances":
-		detail := len(args) >= 2 && args[1] == "detail"
-		return c.showRoutingInstances(detail)
-
-	case "forwarding-options":
-		if len(args) >= 2 && args[1] == "port-mirroring" {
-			return c.showPortMirroring()
-		}
-		return c.showForwardingOptions()
-
-	case "vlans":
-		return c.showVlans()
-
-	case "task":
-		return c.showTask()
-
-	case "monitor":
-		if len(args) >= 3 && args[1] == "security" && args[2] == "flow" {
-			return c.showMonitorSecurityFlow()
-		}
-		cmdtree.PrintTreeHelp("show monitor:", operationalTree, "show", "monitor")
-		return nil
-
-	default:
-		return fmt.Errorf("unknown show target: %s", args[0])
 	}
+	return name
+}
+
+// printAppDetail prints Junos-style application detail lines (protocol, ports, timeout).
+func (c *CLI) printAppDetail(cfg *config.Config, appName string) {
+	if appName == "any" {
+		fmt.Printf("    IP protocol: 0, ALG: 0, Inactivity timeout: 0\n")
+		fmt.Printf("      Source port range: [0-0]\n")
+		fmt.Printf("      Destination ports: [0-0]\n")
+		return
+	}
+	if cfg.Applications.Applications == nil {
+		return
+	}
+	app, ok := cfg.Applications.Applications[appName]
+	if !ok {
+		return
+	}
+	proto := app.Protocol
+	if proto == "" {
+		proto = "0"
+	}
+	timeout := 0
+	if app.InactivityTimeout > 0 {
+		timeout = app.InactivityTimeout
+	}
+	algVal := "0"
+	if app.ALG != "" {
+		algVal = app.ALG
+	}
+	fmt.Printf("    IP protocol: %s, ALG: %s, Inactivity timeout: %d\n", proto, algVal, timeout)
+	srcPort := "0-0"
+	if app.SourcePort != "" {
+		srcPort = app.SourcePort
+	}
+	dstPort := "0-0"
+	if app.DestinationPort != "" {
+		dstPort = app.DestinationPort
+	}
+	fmt.Printf("      Source port range: [%s]\n", srcPort)
+	fmt.Printf("      Destination ports: [%s]\n", dstPort)
+}
+
+// resolveAddress looks up a named address in the global address book and returns its CIDR suffix.
+func resolveAddress(cfg *config.Config, name string) string {
+	if name == "any" {
+		return ""
+	}
+	ab := cfg.Security.AddressBook
+	if ab == nil {
+		return ""
+	}
+	if addr, ok := ab.Addresses[name]; ok && addr.Value != "" {
+		return " (" + addr.Value + ")"
+	}
+	if _, ok := ab.AddressSets[name]; ok {
+		return " (address-set)"
+	}
+	return ""
+}
+
+// capitalizeFirst returns the string with the first letter capitalized.
+func capitalizeFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 func (c *CLI) handleShowSecurity(args []string) error {
@@ -1174,103 +1058,6 @@ func (c *CLI) handleShowSecurity(args []string) error {
 	}
 }
 
-// parsePolicyZoneFilter extracts from-zone/to-zone filters from args.
-func enabledStr(v bool) string {
-	if v {
-		return "enabled"
-	}
-	return "disabled"
-}
-
-func parsePolicyZoneFilter(args []string) (fromZone, toZone string) {
-	for i := 0; i < len(args)-1; i++ {
-		switch args[i] {
-		case "from-zone":
-			fromZone = args[i+1]
-		case "to-zone":
-			toZone = args[i+1]
-		}
-	}
-	return
-}
-
-// showPoliciesHitCount displays a Junos-style policy hit count table.
-func resolveAddressDetail(cfg *config.Config, name string) string {
-	ab := cfg.Security.AddressBook
-	if ab != nil {
-		if addr, ok := ab.Addresses[name]; ok && addr.Value != "" {
-			return addr.Value
-		}
-	}
-	return name
-}
-
-// printAppDetail prints Junos-style application detail lines (protocol, ports, timeout).
-func (c *CLI) printAppDetail(cfg *config.Config, appName string) {
-	if appName == "any" {
-		fmt.Printf("    IP protocol: 0, ALG: 0, Inactivity timeout: 0\n")
-		fmt.Printf("      Source port range: [0-0]\n")
-		fmt.Printf("      Destination ports: [0-0]\n")
-		return
-	}
-	if cfg.Applications.Applications == nil {
-		return
-	}
-	app, ok := cfg.Applications.Applications[appName]
-	if !ok {
-		return
-	}
-	proto := app.Protocol
-	if proto == "" {
-		proto = "0"
-	}
-	timeout := 0
-	if app.InactivityTimeout > 0 {
-		timeout = app.InactivityTimeout
-	}
-	algVal := "0"
-	if app.ALG != "" {
-		algVal = app.ALG
-	}
-	fmt.Printf("    IP protocol: %s, ALG: %s, Inactivity timeout: %d\n", proto, algVal, timeout)
-	srcPort := "0-0"
-	if app.SourcePort != "" {
-		srcPort = app.SourcePort
-	}
-	dstPort := "0-0"
-	if app.DestinationPort != "" {
-		dstPort = app.DestinationPort
-	}
-	fmt.Printf("      Source port range: [%s]\n", srcPort)
-	fmt.Printf("      Destination ports: [%s]\n", dstPort)
-}
-
-// resolveAddress looks up a named address in the global address book and returns its CIDR suffix.
-func resolveAddress(cfg *config.Config, name string) string {
-	if name == "any" {
-		return ""
-	}
-	ab := cfg.Security.AddressBook
-	if ab == nil {
-		return ""
-	}
-	if addr, ok := ab.Addresses[name]; ok && addr.Value != "" {
-		return " (" + addr.Value + ")"
-	}
-	if _, ok := ab.AddressSets[name]; ok {
-		return " (address-set)"
-	}
-	return ""
-}
-
-// capitalizeFirst returns the string with the first letter capitalized.
-func capitalizeFirst(s string) string {
-	if s == "" {
-		return s
-	}
-	return strings.ToUpper(s[:1]) + s[1:]
-}
-
 func (c *CLI) handleShowScreen(args []string) error {
 	if len(args) == 0 {
 		return c.showScreen()
@@ -1294,129 +1081,6 @@ func (c *CLI) handleShowScreen(args []string) error {
 	}
 }
 
-func (c *CLI) handleConfigShow(args []string) error {
-	// Check for pipe commands
-	line := strings.Join(args, " ")
-
-	if strings.Contains(line, "| compare") {
-		// Check for "| compare rollback N"
-		if idx := strings.Index(line, "| compare rollback"); idx >= 0 {
-			rest := strings.TrimSpace(line[idx+len("| compare rollback"):])
-			n, err := strconv.Atoi(rest)
-			if err != nil || n < 1 {
-				return fmt.Errorf("usage: show | compare rollback <N>")
-			}
-			diff, err := c.store.ShowCompareRollback(n)
-			if err != nil {
-				return err
-			}
-			fmt.Print(diff)
-			return nil
-		}
-		fmt.Print(c.store.ShowCompare())
-		return nil
-	}
-
-	// Build path from editPath + args before the pipe (used by all display formats).
-	var displayPath []string
-	{
-		editPath := c.store.GetEditPath()
-		displayPath = append(displayPath, editPath...)
-		for _, a := range args {
-			if a == "|" {
-				break
-			}
-			displayPath = append(displayPath, a)
-		}
-	}
-
-	if strings.Contains(line, "| display json") {
-		if len(displayPath) > 0 {
-			output := c.store.ShowCandidatePathJSON(displayPath)
-			if output == "" {
-				fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
-			} else {
-				fmt.Print(output)
-			}
-		} else {
-			fmt.Print(c.store.ShowCandidateJSON())
-		}
-		return nil
-	}
-
-	if strings.Contains(line, "| display set") {
-		if len(displayPath) > 0 {
-			output := c.store.ShowCandidatePathSet(displayPath)
-			if output == "" {
-				fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
-			} else {
-				fmt.Print(output)
-			}
-		} else {
-			fmt.Print(c.store.ShowCandidateSet())
-		}
-		return nil
-	}
-
-	if strings.Contains(line, "| display xml") {
-		if len(displayPath) > 0 {
-			output := c.store.ShowCandidatePathXML(displayPath)
-			if output == "" {
-				fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
-			} else {
-				fmt.Print(output)
-			}
-		} else {
-			fmt.Print(c.store.ShowCandidateXML())
-		}
-		return nil
-	}
-
-	if strings.Contains(line, "| display inheritance") {
-		if len(displayPath) > 0 {
-			output := c.store.ShowCandidatePathInheritance(displayPath)
-			if output == "" {
-				fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
-			} else {
-				fmt.Print(output)
-			}
-		} else {
-			fmt.Print(c.store.ShowCandidateInheritance())
-		}
-		return nil
-	}
-
-	// Unknown pipe command
-	if idx := strings.Index(line, "| "); idx >= 0 {
-		pipeParts := strings.Fields(strings.TrimSpace(line[idx+2:]))
-		if len(pipeParts) >= 2 && pipeParts[0] == "display" {
-			fmt.Printf("syntax error: unknown display option '%s'\n", pipeParts[1])
-		} else if len(pipeParts) > 0 {
-			fmt.Printf("syntax error: unknown pipe command '%s'\n", pipeParts[0])
-		}
-		return nil
-	}
-
-	// Show scoped to path (editPath + args)
-	fullPath := append([]string{}, c.store.GetEditPath()...)
-	for _, a := range args {
-		if a == "|" {
-			break
-		}
-		fullPath = append(fullPath, a)
-	}
-	if len(fullPath) > 0 {
-		output := c.store.ShowCandidatePath(fullPath)
-		if output == "" {
-			fmt.Printf("configuration path not found: %s\n", strings.Join(fullPath, " "))
-		} else {
-			fmt.Print(output)
-		}
-	} else {
-		fmt.Print(c.store.ShowCandidate())
-	}
-	return nil
-}
 
 func (c *CLI) refreshPrompt() {
 	if h, err := os.Hostname(); err == nil && h != "" {
@@ -2073,214 +1737,6 @@ func formatDuplex(duplex string) string {
 	}
 }
 
-func (c *CLI) handleShowSystem(args []string) error {
-	sysTree := operationalTree["show"].Children["system"].Children
-	if len(args) == 0 {
-		fmt.Println("show system:")
-		writeCompletionHelp(os.Stdout, treeHelpCandidates(sysTree))
-		return nil
-	}
-
-	switch args[0] {
-	case "commit":
-		// "show system commit history"
-		if len(args) >= 2 && args[1] == "history" {
-			entries, err := c.store.ListCommitHistory(50)
-			if err != nil {
-				return fmt.Errorf("commit history: %v", err)
-			}
-			if len(entries) == 0 {
-				fmt.Println("No commit history available")
-				return nil
-			}
-			for i, e := range entries {
-				detail := ""
-				if e.Detail != "" {
-					detail = "  " + e.Detail
-				}
-				fmt.Printf("  %d  %s  %s%s\n", i, e.Timestamp.Format("2006-01-02 15:04:05"), e.Action, detail)
-			}
-			return nil
-		}
-		fmt.Println("show system commit:")
-		fmt.Println("  history              Show recent commit log")
-		return nil
-
-	case "rollback":
-		if len(args) >= 2 {
-			// "show system rollback compare N" — diff rollback N against active
-			if args[1] == "compare" {
-				if len(args) < 3 {
-					return fmt.Errorf("usage: show system rollback compare <N>")
-				}
-				n, err := strconv.Atoi(args[2])
-				if err != nil || n < 1 {
-					return fmt.Errorf("usage: show system rollback compare <N>")
-				}
-				diff, err := c.store.ShowCompareRollback(n)
-				if err != nil {
-					return err
-				}
-				if diff == "" {
-					fmt.Println("No differences found")
-				} else {
-					fmt.Print(diff)
-				}
-				return nil
-			}
-
-			// "show system rollback N" — show specific rollback content.
-			n, err := strconv.Atoi(args[1])
-			if err != nil || n < 1 {
-				return fmt.Errorf("usage: show system rollback <N>")
-			}
-			rest := strings.Join(args[2:], " ")
-			if strings.Contains(rest, "| display set") {
-				content, err := c.store.ShowRollbackSet(n)
-				if err != nil {
-					return err
-				}
-				fmt.Print(content)
-			} else if strings.Contains(rest, "compare") {
-				diff, err := c.store.ShowCompareRollback(n)
-				if err != nil {
-					return err
-				}
-				if diff == "" {
-					fmt.Println("No differences found")
-				} else {
-					fmt.Print(diff)
-				}
-			} else {
-				content, err := c.store.ShowRollback(n)
-				if err != nil {
-					return err
-				}
-				fmt.Print(content)
-			}
-			return nil
-		}
-
-		// List all rollback entries with timestamps.
-		entries := c.store.ListHistory()
-		if len(entries) == 0 {
-			fmt.Println("No rollback history available")
-			return nil
-		}
-		for i, entry := range entries {
-			fmt.Printf("  rollback %d: %s\n", i+1, entry.Timestamp.Format("2006-01-02 15:04:05"))
-		}
-		return nil
-
-	case "uptime":
-		return c.showSystemUptime()
-
-	case "memory":
-		return c.showSystemMemory()
-
-	case "processes":
-		summary := len(args) >= 2 && args[1] == "summary"
-		return c.showSystemProcesses(summary)
-
-	case "storage":
-		return c.showSystemStorage()
-
-	case "alarms":
-		cfg := c.store.ActiveConfig()
-		if cfg != nil {
-			warnings := config.ValidateConfig(cfg)
-			if len(warnings) == 0 {
-				fmt.Println("No alarms currently active")
-			} else {
-				fmt.Printf("%d active alarm(s):\n", len(warnings))
-				for _, w := range warnings {
-					fmt.Printf("  WARNING: %s\n", w)
-				}
-			}
-		} else {
-			fmt.Println("No active configuration loaded")
-		}
-		return nil
-
-	case "users":
-		return c.showSystemUsers()
-
-	case "connections":
-		return c.showSystemConnections()
-
-	case "boot-messages":
-		return c.showSystemBootMessages()
-
-	case "core-dumps":
-		return c.showCoreDumps()
-
-	case "license":
-		fmt.Println("License: open-source (no license required)")
-		return nil
-
-	case "backup-router":
-		return c.showBackupRouter()
-
-	case "ntp":
-		return c.showSystemNTP()
-
-	case "services":
-		return c.showSystemServices()
-
-	case "syslog":
-		return c.showSystemSyslog()
-
-	case "buffers":
-		if len(args) >= 2 && args[1] == "detail" {
-			return c.showSystemBuffersDetail()
-		}
-		return c.showSystemBuffers()
-
-	case "login":
-		cfg := c.store.ActiveConfig()
-		if cfg == nil {
-			return fmt.Errorf("no active configuration")
-		}
-		fmt.Print(c.store.ShowActivePath([]string{"system", "login"}))
-		return nil
-
-	case "internet-options":
-		cfg := c.store.ActiveConfig()
-		if cfg == nil {
-			return fmt.Errorf("no active configuration")
-		}
-		fmt.Print(c.store.ShowActivePath([]string{"system", "internet-options"}))
-		return nil
-
-	case "root-authentication":
-		cfg := c.store.ActiveConfig()
-		if cfg == nil {
-			return fmt.Errorf("no active configuration")
-		}
-		fmt.Print(c.store.ShowActivePath([]string{"system", "root-authentication"}))
-		return nil
-
-	case "configuration":
-		if len(args) >= 2 && args[1] == "rescue" {
-			content, err := c.store.LoadRescueConfig()
-			if err != nil {
-				return err
-			}
-			if content == "" {
-				fmt.Println("No rescue configuration saved")
-			} else {
-				fmt.Print(content)
-			}
-			return nil
-		}
-		fmt.Println("show system configuration:")
-		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["show"].Children["system"].Children["configuration"].Children))
-		return nil
-
-	default:
-		return fmt.Errorf("unknown show system target: %s", args[0])
-	}
-}
 
 func printChronyTracking(output string) {
 	fields := map[string]string{}
@@ -2442,171 +1898,6 @@ func monotonicSeconds() uint64 {
 	return uint64(ts.Sec)
 }
 
-func (c *CLI) valueProvider(hint config.ValueHint, path []string) []config.SchemaCompletion {
-	cfg := c.store.ActiveConfig()
-	if cfg == nil {
-		return nil
-	}
-	switch hint {
-	case config.ValueHintZoneName:
-		var out []config.SchemaCompletion
-		for name, zone := range cfg.Security.Zones {
-			desc := zone.Description
-			if desc == "" {
-				desc = "(configured)"
-			}
-			out = append(out, config.SchemaCompletion{Name: name, Desc: desc})
-		}
-		return out
-	case config.ValueHintAddressName:
-		var out []config.SchemaCompletion
-		if cfg.Security.AddressBook != nil {
-			for _, addr := range cfg.Security.AddressBook.Addresses {
-				out = append(out, config.SchemaCompletion{Name: addr.Name, Desc: addr.Value})
-			}
-			for _, as := range cfg.Security.AddressBook.AddressSets {
-				out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "address-set"})
-			}
-		}
-		return out
-	case config.ValueHintAppName:
-		var out []config.SchemaCompletion
-		for _, app := range cfg.Applications.Applications {
-			out = append(out, config.SchemaCompletion{Name: app.Name, Desc: app.Description})
-		}
-		for _, as := range cfg.Applications.ApplicationSets {
-			out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "application-set"})
-		}
-		for name := range config.PredefinedApplications {
-			out = append(out, config.SchemaCompletion{Name: name, Desc: "predefined"})
-		}
-		return out
-	case config.ValueHintAppSetName:
-		var out []config.SchemaCompletion
-		for _, as := range cfg.Applications.ApplicationSets {
-			out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "application-set"})
-		}
-		return out
-	case config.ValueHintPoolName:
-		var out []config.SchemaCompletion
-		for name := range cfg.Security.NAT.SourcePools {
-			out = append(out, config.SchemaCompletion{Name: name, Desc: "source pool"})
-		}
-		if cfg.Security.NAT.Destination != nil {
-			for name := range cfg.Security.NAT.Destination.Pools {
-				out = append(out, config.SchemaCompletion{Name: name, Desc: "destination pool"})
-			}
-		}
-		return out
-	case config.ValueHintScreenProfile:
-		var out []config.SchemaCompletion
-		for name := range cfg.Security.Screen {
-			out = append(out, config.SchemaCompletion{Name: name, Desc: "screen profile"})
-		}
-		return out
-	case config.ValueHintStreamName:
-		var out []config.SchemaCompletion
-		for name := range cfg.Security.Log.Streams {
-			out = append(out, config.SchemaCompletion{Name: name, Desc: "log stream"})
-		}
-		return out
-	case config.ValueHintInterfaceName:
-		var out []config.SchemaCompletion
-		for name, iface := range cfg.Interfaces.Interfaces {
-			desc := iface.Description
-			if desc == "" {
-				desc = "(configured)"
-			}
-			out = append(out, config.SchemaCompletion{Name: name, Desc: desc})
-		}
-		return out
-	case config.ValueHintPolicyAddress:
-		out := []config.SchemaCompletion{
-			{Name: "any", Desc: "Any IPv4 or IPv6 address"},
-			{Name: "any-ipv4", Desc: "Any IPv4 address"},
-			{Name: "any-ipv6", Desc: "Any IPv6 address"},
-		}
-		if cfg.Security.AddressBook != nil {
-			for _, addr := range cfg.Security.AddressBook.Addresses {
-				out = append(out, config.SchemaCompletion{Name: addr.Name, Desc: addr.Value})
-			}
-			for _, as := range cfg.Security.AddressBook.AddressSets {
-				out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "address-set"})
-			}
-		}
-		return out
-	case config.ValueHintPolicyApp:
-		out := []config.SchemaCompletion{
-			{Name: "any", Desc: "Any application"},
-		}
-		for _, app := range cfg.Applications.Applications {
-			out = append(out, config.SchemaCompletion{Name: app.Name, Desc: app.Description})
-		}
-		for _, as := range cfg.Applications.ApplicationSets {
-			out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "application-set"})
-		}
-		for name := range config.PredefinedApplications {
-			out = append(out, config.SchemaCompletion{Name: name, Desc: "predefined"})
-		}
-		return out
-	case config.ValueHintPolicyName:
-		// Extract zone pair from path: ["security","policies","from-zone","X","to-zone","Y","policy"]
-		// or global: ["security","policies","global","policy"]
-		var policies []*config.Policy
-		for i, tok := range path {
-			if tok == "from-zone" && i+3 < len(path) && path[i+2] == "to-zone" {
-				fromZone := path[i+1]
-				toZone := path[i+3]
-				for _, zpp := range cfg.Security.Policies {
-					if zpp.FromZone == fromZone && zpp.ToZone == toZone {
-						policies = zpp.Policies
-						break
-					}
-				}
-				break
-			}
-			if tok == "global" {
-				policies = cfg.Security.GlobalPolicies
-				break
-			}
-		}
-		var out []config.SchemaCompletion
-		for _, pol := range policies {
-			desc := pol.Description
-			if desc == "" {
-				desc = "(configured)"
-			}
-			out = append(out, config.SchemaCompletion{Name: pol.Name, Desc: desc})
-		}
-		return out
-	case config.ValueHintUnitNumber:
-		// Find the interface name from the path context.
-		var ifaceName string
-		for i, tok := range path {
-			if tok == "interfaces" && i+1 < len(path) {
-				ifaceName = path[i+1]
-				break
-			}
-		}
-		if ifaceName == "" {
-			return nil
-		}
-		iface := cfg.Interfaces.Interfaces[ifaceName]
-		if iface == nil {
-			return nil
-		}
-		var out []config.SchemaCompletion
-		for num, unit := range iface.Units {
-			desc := unit.Description
-			if desc == "" {
-				desc = "(configured)"
-			}
-			out = append(out, config.SchemaCompletion{Name: fmt.Sprintf("%d", num), Desc: desc})
-		}
-		return out
-	}
-	return nil
-}
 
 func (c *CLI) clusterPrefix() string {
 	if c.cluster == nil {
