@@ -121,7 +121,7 @@ pub(in crate::afxdp) fn drain_pending_fill(binding: &mut BindingWorker, now_ns: 
     // Without the needs_wakeup gate, every drain triggers a sendto() syscall
     // (142K/sec at line rate), spending ~20% CPU in syscall entry/exit.
     if binding.device.needs_wakeup()
-        || now_ns.saturating_sub(binding.last_rx_wake_ns) >= FILL_WAKE_SAFETY_INTERVAL_NS
+        || now_ns.saturating_sub(binding.timers.last_rx_wake_ns) >= FILL_WAKE_SAFETY_INTERVAL_NS
     {
         maybe_wake_rx(binding, true, now_ns);
     }
@@ -140,11 +140,11 @@ pub(in crate::afxdp) fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, 
     // processing — using sendto() for RX wake was the root cause of
     // fill ring starvation on idle interfaces with zero-copy mlx5.
     if !force {
-        binding.empty_rx_polls = binding.empty_rx_polls.saturating_add(1);
-        if binding.empty_rx_polls < RX_WAKE_IDLE_POLLS {
+        binding.timers.empty_rx_polls = binding.timers.empty_rx_polls.saturating_add(1);
+        if binding.timers.empty_rx_polls < RX_WAKE_IDLE_POLLS {
             return;
         }
-        if now_ns.saturating_sub(binding.last_rx_wake_ns) < RX_WAKE_MIN_INTERVAL_NS {
+        if now_ns.saturating_sub(binding.timers.last_rx_wake_ns) < RX_WAKE_MIN_INTERVAL_NS {
             return;
         }
     }
@@ -175,8 +175,8 @@ pub(in crate::afxdp) fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, 
     }
     binding.telemetry.dbg_rx_wakeups += 1;
     binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
-    binding.last_rx_wake_ns = now_ns;
-    binding.empty_rx_polls = 0;
+    binding.timers.last_rx_wake_ns = now_ns;
+    binding.timers.empty_rx_polls = 0;
 }
 
 fn apply_prepared_recycle(
@@ -213,7 +213,7 @@ pub(in crate::afxdp) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, 
     if !bind_mode.is_zerocopy()
         || binding.tx.needs_wakeup()
         || force
-        || now_ns.saturating_sub(binding.last_tx_wake_ns) >= TX_WAKE_MIN_INTERVAL_NS
+        || now_ns.saturating_sub(binding.timers.last_tx_wake_ns) >= TX_WAKE_MIN_INTERVAL_NS
     {
         // Use direct sendto() instead of binding.tx.wake() so we can capture errors.
         let fd = binding.tx.as_raw_fd();
@@ -301,7 +301,7 @@ pub(in crate::afxdp) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, 
                 }
             }
         }
-        binding.last_tx_wake_ns = now_ns;
+        binding.timers.last_tx_wake_ns = now_ns;
     }
 }
 

@@ -29,6 +29,11 @@ pub(crate) use tx_counters::WorkerTxCounters;
 mod bpf_maps;
 pub(crate) use bpf_maps::WorkerBpfMaps;
 
+// #959 Phase 6: per-binding timing / wake-pacing state lives in
+// worker/timers.rs.
+mod timers;
+pub(crate) use timers::WorkerTimers;
+
 // #957 P1: worker-side CoS runtime helpers split out into a sibling
 // submodule. Note this module is `worker::cos`, separate from the
 // `afxdp::cos` directory module imported below as `super::cos`.
@@ -117,12 +122,13 @@ pub(crate) struct BindingWorker {
     /// #959 Phase 5: 4 BPF map FDs extracted into `WorkerBpfMaps`.
     /// Field semantics unchanged; access via `binding.bpf_maps.X_fd`.
     pub(crate) bpf_maps: WorkerBpfMaps,
-    pub(crate) last_heartbeat_update_ns: u64,
-    pub(crate) debug_state_counter: u32,
-    pub(crate) last_rx_wake_ns: u64,
-    pub(crate) last_tx_wake_ns: u64,
+    /// #959 Phase 6: 5 timing / wake-pacing fields extracted into
+    /// `WorkerTimers`. Field semantics unchanged; access via
+    /// `binding.timers.last_X_ns` etc. `outstanding_tx` stays at
+    /// the BindingWorker level — it's a TX-pipeline counter
+    /// (sequenced for Phase 7), not a timer.
+    pub(crate) timers: WorkerTimers,
     pub(crate) outstanding_tx: u32,
-    pub(crate) empty_rx_polls: u32,
     pub(crate) last_learned_neighbor: Option<LearnedNeighborKey>,
     /// #959 Phase 1: 23 `dbg_*` debug counters extracted into
     /// `WorkerTelemetry` to reduce BindingWorker's mutable surface
@@ -396,12 +402,14 @@ impl BindingWorker {
                 conntrack_v4_fd,
                 conntrack_v6_fd,
             },
-            last_heartbeat_update_ns: init_now,
-            debug_state_counter: 0,
-            last_rx_wake_ns: init_now,
-            last_tx_wake_ns: init_now,
+            timers: WorkerTimers {
+                last_heartbeat_update_ns: init_now,
+                debug_state_counter: 0,
+                last_rx_wake_ns: init_now,
+                last_tx_wake_ns: init_now,
+                empty_rx_polls: 0,
+            },
             outstanding_tx: 0,
-            empty_rx_polls: 0,
             last_learned_neighbor: None,
             telemetry: WorkerTelemetry::default(),
             tx_counters: WorkerTxCounters {
