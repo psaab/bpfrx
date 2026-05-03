@@ -99,7 +99,7 @@ pub(in crate::afxdp) fn drain_pending_tx(
         if let Some(serviced) = serviced.as_ref() {
             let delta = monotonic_nanos().saturating_sub(start_ns);
             let bucket = bucket_index_for_ns(delta);
-            if let Some(root) = binding.cos_interfaces.get(&serviced.root_ifindex) {
+            if let Some(root) = binding.cos.cos_interfaces.get(&serviced.root_ifindex) {
                 if let Some(queue) = root.queues.get(serviced.queue_idx) {
                     if queue.queue_id == serviced.queue_id {
                         queue.owner_profile.drain_latency_hist[bucket]
@@ -159,7 +159,7 @@ pub(in crate::afxdp) fn drain_pending_tx(
                 if let Some(serviced) = serviced.as_ref() {
                     let delta = monotonic_nanos().saturating_sub(start_ns);
                     let bucket = bucket_index_for_ns(delta);
-                    if let Some(root) = binding.cos_interfaces.get(&serviced.root_ifindex) {
+                    if let Some(root) = binding.cos.cos_interfaces.get(&serviced.root_ifindex) {
                         if let Some(queue) = root.queues.get(serviced.queue_idx) {
                             if queue.queue_id == serviced.queue_id {
                                 queue.owner_profile.drain_latency_hist[bucket]
@@ -458,7 +458,7 @@ fn binding_has_pending_tx_work(binding: &BindingWorker) -> bool {
         || !binding.pending_tx_prepared.is_empty()
         || !binding.pending_tx_local.is_empty()
         || !binding.live.pending_tx_empty()
-        || binding.cos_nonempty_interfaces > 0
+        || binding.cos.cos_nonempty_interfaces > 0
 }
 
 pub(in crate::afxdp) fn drain_pending_tx_local_owner(
@@ -622,7 +622,7 @@ fn ingest_cos_pending_tx_with_provenance(
         let key = (req.egress_ifindex, req.cos_queue_id);
         if cached_key != Some(key) {
             cached_key = Some(key);
-            let iface_fast_opt = binding.cos_fast_interfaces.get(&req.egress_ifindex);
+            let iface_fast_opt = binding.cos.cos_fast_interfaces.get(&req.egress_ifindex);
             cached_decision = Some(resolve_local_routing_decision(
                 iface_fast_opt,
                 req.cos_queue_id,

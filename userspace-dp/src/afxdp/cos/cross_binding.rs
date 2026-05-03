@@ -179,7 +179,7 @@ pub(in crate::afxdp) fn redirect_prepared_cos_request_to_owner(
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
 ) -> Result<(), PreparedTxRequest> {
     let Some((iface_fast, queue_fast)) = cos_fast_queue(
-        &binding.cos_fast_interfaces,
+        &binding.cos.cos_fast_interfaces,
         req.egress_ifindex,
         req.cos_queue_id,
     ) else {
@@ -211,7 +211,7 @@ pub(in crate::afxdp) fn redirect_prepared_cos_request_to_owner(
         dscp_rewrite: req.dscp_rewrite,
     };
     if redirect_local_cos_request_to_owner(
-        &binding.cos_fast_interfaces,
+        &binding.cos.cos_fast_interfaces,
         local_req,
         current_worker_id,
         worker_commands_by_id,
@@ -230,7 +230,7 @@ pub(in crate::afxdp) fn redirect_prepared_cos_request_to_owner_binding(
     req: PreparedTxRequest,
 ) -> Result<(), PreparedTxRequest> {
     let Some((iface_fast, queue_fast)) = cos_fast_queue(
-        &binding.cos_fast_interfaces,
+        &binding.cos.cos_fast_interfaces,
         req.egress_ifindex,
         req.cos_queue_id,
     ) else {

@@ -330,7 +330,7 @@ pub(in crate::afxdp) fn enqueue_local_into_cos(
         return Err(req);
     }
     if binding
-        .cos_interfaces
+        .cos.cos_interfaces
         .get(&egress_ifindex)
         .is_some_and(|root| cos_queue_accepts_prepared(root, req.cos_queue_id))
     {
@@ -375,7 +375,7 @@ pub(in crate::afxdp) fn enqueue_local_into_cos(
                 // available or the request cannot be materialized safely.
                 let area = binding.umem.area();
                 let slot = binding.slot;
-                if let Some(root) = binding.cos_interfaces.get_mut(&egress_ifindex) {
+                if let Some(root) = binding.cos.cos_interfaces.get_mut(&egress_ifindex) {
                     let _ = demote_prepared_cos_queue_to_local(
                         area,
                         &mut binding.free_tx_frames,
@@ -459,7 +459,7 @@ pub(super) fn enqueue_prepared_into_cos(
         return Err(req);
     }
     if binding
-        .cos_interfaces
+        .cos.cos_interfaces
         .get(&egress_ifindex)
         .is_some_and(|root| cos_queue_accepts_prepared(root, req.cos_queue_id))
     {
@@ -666,7 +666,7 @@ pub(in crate::afxdp) fn cos_queue_dscp_rewrite(
     queue_idx: usize,
 ) -> Option<u8> {
     binding
-        .cos_interfaces
+        .cos.cos_interfaces
         .get(&root_ifindex)
         .and_then(|root| root.queues.get(queue_idx))
         .and_then(|queue| queue.dscp_rewrite)
@@ -683,7 +683,7 @@ fn enqueue_cos_item(
     let (accepted, queue_id, recycle) = {
         // Split-borrow: `umem` sits alongside `cos_interfaces` on
         // `BindingWorker`, so we can take a shared borrow on the umem
-        // field while holding `&mut binding.cos_interfaces` for the
+        // field while holding `&mut binding.cos.cos_interfaces` for the
         // admission-gate block. The Prepared-variant ECN marker
         // (#727) needs this to mutate frame bytes in the UMEM
         // in-place; the admission gate runs strictly before the
@@ -691,7 +691,7 @@ fn enqueue_cos_item(
         // the bytes concurrently. Both fields are borrowed explicitly
         // here so the borrow checker keeps us honest.
         let umem = binding.umem.area();
-        let Some(root) = binding.cos_interfaces.get_mut(&egress_ifindex) else {
+        let Some(root) = binding.cos.cos_interfaces.get_mut(&egress_ifindex) else {
             return Err(item);
         };
         let Some(mut queue_idx) = resolve_cos_queue_idx(root, requested_queue) else {
@@ -780,7 +780,7 @@ fn enqueue_cos_item(
         }
     };
     if root_became_nonempty {
-        binding.cos_nonempty_interfaces = binding.cos_nonempty_interfaces.saturating_add(1);
+        binding.cos.cos_nonempty_interfaces = binding.cos.cos_nonempty_interfaces.saturating_add(1);
     }
     if accepted {
         return Ok(());

@@ -188,7 +188,7 @@ pub(super) fn build_worker_cos_statuses(
     build_worker_cos_statuses_from_maps(
         bindings
             .iter()
-            .map(|binding| (&binding.cos_interfaces, Some(binding.live.as_ref()))),
+            .map(|binding| (&binding.cos.cos_interfaces, Some(binding.live.as_ref()))),
         forwarding,
     )
 }
@@ -199,7 +199,7 @@ pub(super) fn build_worker_cos_statuses(
 ///
 /// The snapshot source is `BindingLiveState`, which is binding-local,
 /// not queue-local. A binding can drain multiple interfaces (via
-/// `drain_shaped_tx` round-robining `binding.cos_interface_order`), so
+/// `drain_shaped_tx` round-robining `binding.cos.cos_interface_order`), so
 /// attribution has to be unambiguous at the BINDING level, not the
 /// interface level: if two interfaces on the same binding each have
 /// one owner-local exact queue, the binding-wide snapshot still has
@@ -265,7 +265,7 @@ pub(super) fn cos_runtime_config_changed(current: &ForwardingState, next: &Forwa
 /// (config-reload reset-epoch). Single-writer invariant: this worker
 /// owns its slots; race-free against peer Acquire reads.
 pub(super) fn vacate_all_shared_exact_slots_for_binding(binding: &BindingWorker) {
-    for root in binding.cos_interfaces.values() {
+    for root in binding.cos.cos_interfaces.values() {
         for queue in &root.queues {
             if !queue.shared_exact {
                 continue;
@@ -284,7 +284,7 @@ pub(super) fn reset_binding_cos_runtime(binding: &mut BindingWorker) {
     release_all_cos_queue_leases(binding);
     let mut dropped_local = 0u64;
     let mut dropped_prepared = Vec::new();
-    for root in binding.cos_interfaces.values_mut() {
+    for root in binding.cos.cos_interfaces.values_mut() {
         for queue in &mut root.queues {
             // #785 Phase 3 — Codex round-3 NEW-2 / Rust reviewer
             // LOW: teardown drains the whole queue without a
@@ -320,10 +320,10 @@ pub(super) fn reset_binding_cos_runtime(binding: &mut BindingWorker) {
     // stale value in their V_min calculation, throttling them
     // unnecessarily until the first post-reset post-settle publish.
     vacate_all_shared_exact_slots_for_binding(binding);
-    binding.cos_interfaces.clear();
-    binding.cos_interface_order.clear();
-    binding.cos_interface_rr = 0;
-    binding.cos_nonempty_interfaces = 0;
+    binding.cos.cos_interfaces.clear();
+    binding.cos.cos_interface_order.clear();
+    binding.cos.cos_interface_rr = 0;
+    binding.cos.cos_nonempty_interfaces = 0;
 
     let dropped_total = dropped_local.saturating_add(dropped_prepared.len() as u64);
     if dropped_total > 0 {
