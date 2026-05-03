@@ -215,7 +215,8 @@ pub(in crate::afxdp) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, 
         || force
         || now_ns.saturating_sub(binding.timers.last_tx_wake_ns) >= TX_WAKE_MIN_INTERVAL_NS
     {
-        // Use direct sendto() instead of binding.xsk.tx.wake() so we can capture errors.
+        // Use a direct sendto() syscall (not any wrapper) so we can
+        // observe errno and feed the #825 kick-latency telemetry.
         let fd = binding.xsk.tx.as_raw_fd();
         // #825 plan §3.3 site 1: two fresh `monotonic_nanos()` calls
         // bracket the `sendto` syscall. `now_ns` is caller-cached —

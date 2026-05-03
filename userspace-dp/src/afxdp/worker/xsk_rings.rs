@@ -27,8 +27,6 @@
 //! `binding`/`b`/`sb`/`target_binding` aliases used for the
 //! BindingWorker rings) so the rewrite is purely mechanical.
 
-use super::*;
-
 /// Per-binding XSK ring handles. See module-level docs.
 ///
 /// **Intentionally NOT `Default`** — the rings are constructed
