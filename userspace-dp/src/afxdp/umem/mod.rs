@@ -993,50 +993,50 @@ pub(super) fn update_binding_debug_state(binding: &mut BindingWorker) {
     if binding.debug_state_counter & 0xFFFF != 0 {
         return;
     }
-    if binding.pending_direct_tx_packets != 0 {
+    if binding.tx_counters.pending_direct_tx_packets != 0 {
         binding
             .live
             .direct_tx_packets
-            .fetch_add(binding.pending_direct_tx_packets, Ordering::Relaxed);
-        binding.pending_direct_tx_packets = 0;
+            .fetch_add(binding.tx_counters.pending_direct_tx_packets, Ordering::Relaxed);
+        binding.tx_counters.pending_direct_tx_packets = 0;
     }
-    if binding.pending_copy_tx_packets != 0 {
+    if binding.tx_counters.pending_copy_tx_packets != 0 {
         binding
             .live
             .copy_tx_packets
-            .fetch_add(binding.pending_copy_tx_packets, Ordering::Relaxed);
-        binding.pending_copy_tx_packets = 0;
+            .fetch_add(binding.tx_counters.pending_copy_tx_packets, Ordering::Relaxed);
+        binding.tx_counters.pending_copy_tx_packets = 0;
     }
-    if binding.pending_in_place_tx_packets != 0 {
+    if binding.tx_counters.pending_in_place_tx_packets != 0 {
         binding
             .live
             .in_place_tx_packets
-            .fetch_add(binding.pending_in_place_tx_packets, Ordering::Relaxed);
-        binding.pending_in_place_tx_packets = 0;
+            .fetch_add(binding.tx_counters.pending_in_place_tx_packets, Ordering::Relaxed);
+        binding.tx_counters.pending_in_place_tx_packets = 0;
     }
-    if binding.pending_direct_tx_no_frame_fallback_packets != 0 {
+    if binding.tx_counters.pending_direct_tx_no_frame_fallback_packets != 0 {
         binding.live.direct_tx_no_frame_fallback_packets.fetch_add(
-            binding.pending_direct_tx_no_frame_fallback_packets,
+            binding.tx_counters.pending_direct_tx_no_frame_fallback_packets,
             Ordering::Relaxed,
         );
-        binding.pending_direct_tx_no_frame_fallback_packets = 0;
+        binding.tx_counters.pending_direct_tx_no_frame_fallback_packets = 0;
     }
-    if binding.pending_direct_tx_build_fallback_packets != 0 {
+    if binding.tx_counters.pending_direct_tx_build_fallback_packets != 0 {
         binding.live.direct_tx_build_fallback_packets.fetch_add(
-            binding.pending_direct_tx_build_fallback_packets,
+            binding.tx_counters.pending_direct_tx_build_fallback_packets,
             Ordering::Relaxed,
         );
-        binding.pending_direct_tx_build_fallback_packets = 0;
+        binding.tx_counters.pending_direct_tx_build_fallback_packets = 0;
     }
-    if binding.pending_direct_tx_disallowed_fallback_packets != 0 {
+    if binding.tx_counters.pending_direct_tx_disallowed_fallback_packets != 0 {
         binding
             .live
             .direct_tx_disallowed_fallback_packets
             .fetch_add(
-                binding.pending_direct_tx_disallowed_fallback_packets,
+                binding.tx_counters.pending_direct_tx_disallowed_fallback_packets,
                 Ordering::Relaxed,
             );
-        binding.pending_direct_tx_disallowed_fallback_packets = 0;
+        binding.tx_counters.pending_direct_tx_disallowed_fallback_packets = 0;
     }
     if binding.flow_cache.hits != 0 {
         binding

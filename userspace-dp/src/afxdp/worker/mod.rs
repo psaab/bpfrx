@@ -20,6 +20,11 @@ pub(crate) use scratch::WorkerScratch;
 mod cos_state;
 pub(crate) use cos_state::WorkerCos;
 
+// #959 Phase 4: per-binding TX-disposition packet counters live in
+// worker/tx_counters.rs.
+mod tx_counters;
+pub(crate) use tx_counters::WorkerTxCounters;
+
 // #957 P1: worker-side CoS runtime helpers split out into a sibling
 // submodule. Note this module is `worker::cos`, separate from the
 // `afxdp::cos` directory module imported below as `super::cos`.
@@ -120,12 +125,10 @@ pub(crate) struct BindingWorker {
     /// `WorkerTelemetry` to reduce BindingWorker's mutable surface
     /// area. Field semantics unchanged; access via `binding.telemetry.dbg_X`.
     pub(crate) telemetry: WorkerTelemetry,
-    pub(crate) pending_direct_tx_packets: u64,
-    pub(crate) pending_copy_tx_packets: u64,
-    pub(crate) pending_in_place_tx_packets: u64,
-    pub(crate) pending_direct_tx_no_frame_fallback_packets: u64,
-    pub(crate) pending_direct_tx_build_fallback_packets: u64,
-    pub(crate) pending_direct_tx_disallowed_fallback_packets: u64,
+    /// #959 Phase 4: 6 `pending_*_tx_*` packet counters extracted
+    /// into `WorkerTxCounters`. Field semantics unchanged; access
+    /// via `binding.tx_counters.pending_X`.
+    pub(crate) tx_counters: WorkerTxCounters,
     pub(crate) flow_cache: FlowCache,
     pub(crate) flow_cache_session_touch: u64,
     /// Timestamp when this binding was created.
@@ -396,12 +399,14 @@ impl BindingWorker {
             empty_rx_polls: 0,
             last_learned_neighbor: None,
             telemetry: WorkerTelemetry::default(),
-            pending_direct_tx_packets: 0,
-            pending_copy_tx_packets: 0,
-            pending_in_place_tx_packets: 0,
-            pending_direct_tx_no_frame_fallback_packets: 0,
-            pending_direct_tx_build_fallback_packets: 0,
-            pending_direct_tx_disallowed_fallback_packets: 0,
+            tx_counters: WorkerTxCounters {
+                pending_direct_tx_packets: 0,
+                pending_copy_tx_packets: 0,
+                pending_in_place_tx_packets: 0,
+                pending_direct_tx_no_frame_fallback_packets: 0,
+                pending_direct_tx_build_fallback_packets: 0,
+                pending_direct_tx_disallowed_fallback_packets: 0,
+            },
             flow_cache: FlowCache::new(),
             flow_cache_session_touch: 0,
             bind_time_ns: {
