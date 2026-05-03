@@ -9,9 +9,15 @@ LOC across 8 domains. That is 8 commits' worth of mechanical churn
 — too large for a focused review gate AND too time-costly in a
 multi-batch grind. Splitting into single-domain PRs:
 
-- **Phase 1 (this PR)**: extract firewall (~465 LOC). server_show.go:
-  4,072 → ~3,610. Single-domain extraction. Establishes the pattern
-  for Phase 2-N (single-domain PRs each of comparable size).
+- **Phase 1 (this PR)**: extract the `firewall` case body alone
+  (~130 LOC — the largest single-case body, NOT the whole
+  firewall-family group). server_show.go: 4,072 → ~3,945.
+  Single-case-body extraction. Establishes the pattern for
+  Phase 2-N. The original "firewall-family" grouping (firewall +
+  policy-options + policies-hit-count + policies-detail + screen,
+  ~465 LOC) re-splits into per-case phases later if reviewers
+  prefer narrower diffs per PR; this Phase 1 demonstration is
+  intentionally minimal.
 - **Phase 2**: chassis (~371 LOC).
 - **Phase 3**: nat (~295 LOC).
 - **Phase 4**: dhcp_lldp_snmp (~242 LOC).

@@ -1,9 +1,13 @@
 // Phase 1 of #1043: extract the `firewall` ShowText case body into a
 // dedicated method to take the first ~130 LOC bite out of
 // `server_show.go`'s 4,072-LOC modularity-discipline violation.
-// Pure relocation — bytes are byte-for-byte identical to the original
-// case body; the dispatcher in `server_show.go` becomes a one-line
-// `s.showFirewall(cfg, &buf)` call.
+// Semantic relocation — the case body is moved verbatim apart from
+// (a) `&buf` references becoming `buf` (now a passed-in
+// `*strings.Builder`) and (b) the original `if !hasFilters { ... }
+// else { ... }` structure flattened into an early-return form
+// (`if !hasFilters { ...; return }; ...`). Output is unchanged.
+// The dispatcher in `server_show.go` becomes
+// `s.showFirewall(cfg, &buf)`.
 
 package grpcapi
 
