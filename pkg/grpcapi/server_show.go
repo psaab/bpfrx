@@ -21,7 +21,6 @@ import (
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
-	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -1236,21 +1235,8 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		}
 
 	case "version":
-		ver := s.version
-		if ver == "" {
-			ver = "dev"
-		}
-		fmt.Fprintf(&buf, "xpf eBPF firewall %s\n", ver)
-		var uts unix.Utsname
-		if err := unix.Uname(&uts); err == nil {
-			sysname := strings.TrimRight(string(uts.Sysname[:]), "\x00")
-			release := strings.TrimRight(string(uts.Release[:]), "\x00")
-			machine := strings.TrimRight(string(uts.Machine[:]), "\x00")
-			nodename := strings.TrimRight(string(uts.Nodename[:]), "\x00")
-			fmt.Fprintf(&buf, "Hostname: %s\n", nodename)
-			fmt.Fprintf(&buf, "Kernel: %s %s (%s)\n", sysname, release, machine)
-		}
-		fmt.Fprintf(&buf, "Daemon uptime: %s\n", time.Since(s.startTime).Truncate(time.Second))
+		// #1043 Phase 7: case body extracted to server_show_system.go
+		s.showVersion(&buf)
 
 	case "security-log":
 		if s.eventBuf == nil {
@@ -1311,65 +1297,18 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		s.showChassis(&buf)
 
 	case "storage":
-		var stat unix.Statfs_t
-		mounts := []struct{ path, name string }{
-			{"/", "Root (/)"},
-			{"/var", "/var"},
-			{"/tmp", "/tmp"},
-		}
-		fmt.Fprintf(&buf, "%-20s %12s %12s %12s %6s\n", "Filesystem", "Size", "Used", "Avail", "Use%")
-		for _, m := range mounts {
-			if err := unix.Statfs(m.path, &stat); err != nil {
-				continue
-			}
-			total := stat.Blocks * uint64(stat.Bsize)
-			free := stat.Bavail * uint64(stat.Bsize)
-			used := total - (stat.Bfree * uint64(stat.Bsize))
-			pct := float64(0)
-			if total > 0 {
-				pct = float64(used) / float64(total) * 100
-			}
-			fmt.Fprintf(&buf, "%-20s %11.1fG %11.1fG %11.1fG %5.0f%%\n",
-				m.name,
-				float64(total)/float64(1<<30),
-				float64(used)/float64(1<<30),
-				float64(free)/float64(1<<30),
-				pct)
-		}
+		// #1043 Phase 7: case body extracted to server_show_system.go
+		s.showStorage(&buf)
 
 	case "commit-history":
-		entries, err := s.store.ListCommitHistory(50)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "commit history: %v", err)
-		}
-		if len(entries) == 0 {
-			buf.WriteString("No commit history available\n")
-		} else {
-			for i, e := range entries {
-				detail := ""
-				if e.Detail != "" {
-					detail = "  " + e.Detail
-				}
-				fmt.Fprintf(&buf, "  %d  %s  %s%s\n", i, e.Timestamp.Format("2006-01-02 15:04:05"), e.Action, detail)
-			}
+		// #1043 Phase 7: case body extracted to server_show_system.go
+		if err := s.showCommitHistory(&buf); err != nil {
+			return nil, err
 		}
 
 	case "alarms":
-		// Compile current config to check for warnings
-		cfg := s.store.ActiveConfig()
-		if cfg != nil {
-			warnings := config.ValidateConfig(cfg)
-			if len(warnings) == 0 {
-				buf.WriteString("No alarms currently active\n")
-			} else {
-				fmt.Fprintf(&buf, "%d active alarm(s):\n", len(warnings))
-				for _, w := range warnings {
-					fmt.Fprintf(&buf, "  WARNING: %s\n", w)
-				}
-			}
-		} else {
-			buf.WriteString("No active configuration loaded\n")
-		}
+		// #1043 Phase 7: case body extracted to server_show_system.go
+		s.showAlarms(&buf)
 
 	case "security-alarms", "security-alarms-detail":
 		detail := req.Topic == "security-alarms-detail"
@@ -1840,177 +1779,20 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		fmt.Fprintln(&buf, "Use these counters or 'monitor interface <fab>' for fabric telemetry.")
 
 	case "chassis-environment":
-		thermalZones, _ := filepath.Glob("/sys/class/thermal/thermal_zone*/temp")
-		if len(thermalZones) > 0 {
-			fmt.Fprintln(&buf, "Temperature:")
-			for _, tz := range thermalZones {
-				data, err := os.ReadFile(tz)
-				if err != nil {
-					continue
-				}
-				millideg, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
-				if err != nil {
-					continue
-				}
-				typeFile := filepath.Join(filepath.Dir(tz), "type")
-				name := filepath.Base(filepath.Dir(tz))
-				if typeData, err := os.ReadFile(typeFile); err == nil {
-					name = strings.TrimSpace(string(typeData))
-				}
-				fmt.Fprintf(&buf, "  %-30s %d.%d C\n", name, millideg/1000, (millideg%1000)/100)
-			}
-			fmt.Fprintln(&buf)
-		}
-		var sysinfo unix.Sysinfo_t
-		if err := unix.Sysinfo(&sysinfo); err == nil {
-			days := sysinfo.Uptime / 86400
-			hours := (sysinfo.Uptime % 86400) / 3600
-			mins := (sysinfo.Uptime % 3600) / 60
-			fmt.Fprintf(&buf, "System uptime: %d days, %d:%02d\n", days, hours, mins)
-			fmt.Fprintf(&buf, "Load average: %.2f %.2f %.2f\n",
-				float64(sysinfo.Loads[0])/65536.0,
-				float64(sysinfo.Loads[1])/65536.0,
-				float64(sysinfo.Loads[2])/65536.0)
-		}
+		// #1043 Phase 7: case body extracted to server_show_system.go
+		s.showChassisEnvironment(&buf)
 
 	case "system-services":
-		cfg := s.store.ActiveConfig()
-		if cfg == nil {
-			fmt.Fprintln(&buf, "No active configuration")
-			break
-		}
-		fmt.Fprintln(&buf, "System services:")
-		fmt.Fprintln(&buf, "  gRPC:           127.0.0.1:50051 (always on)")
-		fmt.Fprintln(&buf, "  HTTP REST:      127.0.0.1:8080 (always on)")
-		if cfg.System.Services != nil {
-			if cfg.System.Services.SSH != nil {
-				rootLogin := cfg.System.Services.SSH.RootLogin
-				if rootLogin == "" {
-					rootLogin = "deny"
-				}
-				fmt.Fprintf(&buf, "  SSH:            enabled (root-login: %s)\n", rootLogin)
-			}
-			if cfg.System.Services.WebManagement != nil {
-				wm := cfg.System.Services.WebManagement
-				if wm.HTTP {
-					iface := "all"
-					if wm.HTTPInterface != "" {
-						iface = wm.HTTPInterface
-					}
-					fmt.Fprintf(&buf, "  Web HTTP:       enabled (interface: %s)\n", iface)
-				}
-				if wm.HTTPS {
-					iface := "all"
-					if wm.HTTPSInterface != "" {
-						iface = wm.HTTPSInterface
-					}
-					cert := ""
-					if wm.SystemGeneratedCert {
-						cert = ", system-generated-certificate"
-					}
-					fmt.Fprintf(&buf, "  Web HTTPS:      enabled (interface: %s%s)\n", iface, cert)
-				}
-			}
-			if cfg.System.Services.DNSEnabled {
-				fmt.Fprintln(&buf, "  DNS:            enabled")
-			}
-		}
-		if len(cfg.System.NameServers) > 0 {
-			fmt.Fprintf(&buf, "  DNS servers:    %s\n", strings.Join(cfg.System.NameServers, ", "))
-		}
-		if len(cfg.System.NTPServers) > 0 {
-			fmt.Fprintf(&buf, "  NTP servers:    %s\n", strings.Join(cfg.System.NTPServers, ", "))
-			if cfg.System.NTPThreshold > 0 && cfg.System.NTPThresholdAction != "" {
-				fmt.Fprintf(&buf, "  NTP threshold:  %d seconds (%s)\n", cfg.System.NTPThreshold, cfg.System.NTPThresholdAction)
-			}
-		}
-		if cfg.Security.Log.Mode != "" {
-			fmt.Fprintf(&buf, "  Security log:   mode %s\n", cfg.Security.Log.Mode)
-		}
-		if len(cfg.Security.Log.Streams) > 0 {
-			fmt.Fprintf(&buf, "  Syslog:         %d stream(s)\n", len(cfg.Security.Log.Streams))
-		}
-		if cfg.Services.FlowMonitoring != nil && cfg.Services.FlowMonitoring.Version9 != nil {
-			fmt.Fprintf(&buf, "  NetFlow v9:     %d template(s)\n", len(cfg.Services.FlowMonitoring.Version9.Templates))
-		}
-		if cfg.Services.FlowMonitoring != nil && cfg.Services.FlowMonitoring.VersionIPFIX != nil {
-			fmt.Fprintf(&buf, "  IPFIX:          %d template(s)\n", len(cfg.Services.FlowMonitoring.VersionIPFIX.Templates))
-		}
-		if cfg.Services.ApplicationIdentification {
-			fmt.Fprintln(&buf, "  AppID:          enabled")
-		}
-		if cfg.Services.RPM != nil && len(cfg.Services.RPM.Probes) > 0 {
-			total := 0
-			for _, probe := range cfg.Services.RPM.Probes {
-				total += len(probe.Tests)
-			}
-			fmt.Fprintf(&buf, "  RPM probes:     %d probe(s), %d test(s)\n", len(cfg.Services.RPM.Probes), total)
-		}
+		// #1043 Phase 7: case body extracted to server_show_system.go
+		s.showSystemServices(&buf)
 
 	case "ntp":
-		cfg := s.store.ActiveConfig()
-		if cfg == nil {
-			fmt.Fprintln(&buf, "No active configuration")
-			break
-		}
-		if len(cfg.System.NTPServers) == 0 {
-			fmt.Fprintln(&buf, "No NTP servers configured")
-			break
-		}
-		fmt.Fprintln(&buf, "NTP servers:")
-		for _, server := range cfg.System.NTPServers {
-			fmt.Fprintf(&buf, "  %s\n", server)
-		}
-		if cfg.System.NTPThreshold > 0 && cfg.System.NTPThresholdAction != "" {
-			fmt.Fprintf(&buf, "  Threshold: %d seconds (%s)\n", cfg.System.NTPThreshold, cfg.System.NTPThresholdAction)
-		}
-		if out, err := exec.Command("chronyc", "tracking").CombinedOutput(); err == nil {
-			writeChronyTracking(&buf, string(out))
-			if src, err := exec.Command("chronyc", "-n", "sources").CombinedOutput(); err == nil {
-				fmt.Fprintf(&buf, "\nNTP sources:\n%s", string(src))
-			}
-		} else if out, err := exec.Command("ntpq", "-pn").CombinedOutput(); err == nil {
-			fmt.Fprintf(&buf, "\nNTP peers:\n%s\n", string(out))
-		} else if out, err := exec.Command("timedatectl", "show", "--property=NTPSynchronized", "--value").CombinedOutput(); err == nil {
-			fmt.Fprintf(&buf, "\nNTP synchronized: %s\n", strings.TrimSpace(string(out)))
-		}
+		// #1043 Phase 7: case body extracted to server_show_system.go
+		s.showNTP(&buf)
 
 	case "system-syslog":
-		cfg := s.store.ActiveConfig()
-		if cfg == nil {
-			fmt.Fprintln(&buf, "No active configuration")
-			break
-		}
-		if cfg.System.Syslog == nil {
-			fmt.Fprintln(&buf, "No system syslog configuration")
-			break
-		}
-		sys := cfg.System.Syslog
-		if len(sys.Hosts) > 0 {
-			fmt.Fprintln(&buf, "Syslog hosts:")
-			for _, h := range sys.Hosts {
-				fmt.Fprintf(&buf, "  %-20s", h.Address)
-				if h.AllowDuplicates {
-					fmt.Fprint(&buf, " allow-duplicates")
-				}
-				fmt.Fprintln(&buf)
-				for _, f := range h.Facilities {
-					fmt.Fprintf(&buf, "    %-20s %s\n", f.Facility, f.Severity)
-				}
-			}
-		}
-		if len(sys.Files) > 0 {
-			fmt.Fprintln(&buf, "Syslog files:")
-			for _, f := range sys.Files {
-				fmt.Fprintf(&buf, "  %-20s %s %s\n", f.Name, f.Facility, f.Severity)
-			}
-		}
-		if len(sys.Users) > 0 {
-			fmt.Fprintln(&buf, "Syslog users:")
-			for _, u := range sys.Users {
-				fmt.Fprintf(&buf, "  %-20s %s %s\n", u.User, u.Facility, u.Severity)
-			}
-		}
+		// #1043 Phase 7: case body extracted to server_show_system.go
+		s.showSystemSyslog(&buf)
 
 	case "policy-options":
 		if cfg == nil {
