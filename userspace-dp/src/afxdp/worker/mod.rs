@@ -46,7 +46,7 @@ pub(crate) use bind_meta::WorkerBindMeta;
 
 // #959 Phase 9: per-binding flow-cache state lives in
 // worker/flow_cache_state.rs (the `flow_cache` name is taken by
-// the `FlowCache` data structure in src/flow_cache.rs).
+// the `FlowCache` data structure in src/afxdp/flow_cache.rs).
 mod flow_cache_state;
 pub(crate) use flow_cache_state::WorkerFlowCacheState;
 

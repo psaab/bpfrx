@@ -21,7 +21,7 @@ refresh in the descriptor loop.
 
 Filename is `flow_cache_state.rs` because `flow_cache.rs` is taken
 by the FlowCache data structure itself (in
-`userspace-dp/src/flow_cache.rs`).
+`userspace-dp/src/afxdp/flow_cache.rs`).
 
 ## Methodology
 
