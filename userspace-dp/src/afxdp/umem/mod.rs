@@ -1078,7 +1078,7 @@ pub(super) fn update_binding_debug_state(binding: &mut BindingWorker) {
     // `flush_v_min_scratches_into` so it's directly unit-testable
     // without needing to construct a full `BindingWorker`.
     flush_v_min_scratches_into(
-        binding.cos_interfaces.values_mut(),
+        binding.cos.cos_interfaces.values_mut(),
         &binding.live.v_min_throttle_hard_cap_overrides,
         &binding.live.v_min_throttles,
     );

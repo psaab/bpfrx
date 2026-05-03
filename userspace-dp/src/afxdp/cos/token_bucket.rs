@@ -183,7 +183,7 @@ pub(in crate::afxdp) fn cos_refill_ns_until(tokens: u64, need: u64, rate_bytes_p
 
 pub(in crate::afxdp) fn release_cos_root_lease(binding: &mut BindingWorker, root_ifindex: i32) {
     let released = binding
-        .cos_interfaces
+        .cos.cos_interfaces
         .get_mut(&root_ifindex)
         .map(|root| core::mem::take(&mut root.tokens))
         .unwrap_or(0);
@@ -191,7 +191,7 @@ pub(in crate::afxdp) fn release_cos_root_lease(binding: &mut BindingWorker, root
         return;
     }
     if let Some(shared_root_lease) = binding
-        .cos_fast_interfaces
+        .cos.cos_fast_interfaces
         .get(&root_ifindex)
         .and_then(|iface_fast| iface_fast.shared_root_lease.as_ref())
     {
@@ -200,7 +200,7 @@ pub(in crate::afxdp) fn release_cos_root_lease(binding: &mut BindingWorker, root
 }
 
 pub(in crate::afxdp) fn release_all_cos_root_leases(binding: &mut BindingWorker) {
-    let root_ifindexes = binding.cos_interfaces.keys().copied().collect::<Vec<_>>();
+    let root_ifindexes = binding.cos.cos_interfaces.keys().copied().collect::<Vec<_>>();
     for root_ifindex in root_ifindexes {
         release_cos_root_lease(binding, root_ifindex);
     }
@@ -208,7 +208,7 @@ pub(in crate::afxdp) fn release_all_cos_root_leases(binding: &mut BindingWorker)
 
 pub(in crate::afxdp) fn release_all_cos_queue_leases(binding: &mut BindingWorker) {
     let queue_keys = binding
-        .cos_interfaces
+        .cos.cos_interfaces
         .iter()
         .flat_map(|(&root_ifindex, root)| {
             root.queues
@@ -220,7 +220,7 @@ pub(in crate::afxdp) fn release_all_cos_queue_leases(binding: &mut BindingWorker
         .collect::<Vec<_>>();
     for (root_ifindex, queue_idx) in queue_keys {
         let released = binding
-            .cos_interfaces
+            .cos.cos_interfaces
             .get_mut(&root_ifindex)
             .and_then(|root| root.queues.get_mut(queue_idx))
             .map(|queue| core::mem::take(&mut queue.tokens))
@@ -229,7 +229,7 @@ pub(in crate::afxdp) fn release_all_cos_queue_leases(binding: &mut BindingWorker
             continue;
         }
         if let Some(shared_queue_lease) = binding
-            .cos_fast_interfaces
+            .cos.cos_fast_interfaces
             .get(&root_ifindex)
             .and_then(|iface_fast| iface_fast.queue_fast_path.get(queue_idx))
             .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref())

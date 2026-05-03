@@ -165,7 +165,7 @@ pub(in crate::afxdp) fn count_tx_ring_full_submit_stall(
     if stalled_packets == 0 {
         return;
     }
-    if let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) {
+    if let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) {
         if let Some(queue) = root.queues.get_mut(queue_idx) {
             queue.drop_counters.tx_ring_full_submit_stalls = queue
                 .drop_counters
@@ -274,10 +274,10 @@ pub(in crate::afxdp) fn prime_cos_root_for_service(
     now_ns: u64,
 ) -> bool {
     let shared_root_lease = binding
-        .cos_fast_interfaces
+        .cos.cos_fast_interfaces
         .get(&root_ifindex)
         .and_then(|iface_fast| iface_fast.shared_root_lease.clone());
-    let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) else {
+    let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) else {
         return false;
     };
     advance_cos_timer_wheel(root, now_ns);
@@ -295,7 +295,7 @@ pub(in crate::afxdp) fn apply_direct_exact_send_result(
     sent_packets: u64,
     sent_bytes: u64,
 ) {
-    if let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) {
+    if let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) {
         if let Some(queue) = root.queues.get_mut(queue_idx) {
             queue.queued_bytes = queue.queued_bytes.saturating_sub(sent_bytes);
             queue.tokens = queue.tokens.saturating_sub(sent_bytes);
@@ -312,14 +312,14 @@ pub(in crate::afxdp) fn apply_direct_exact_send_result(
         root.tokens = root.tokens.saturating_sub(sent_bytes);
     }
     if let Some(shared_root_lease) = binding
-        .cos_fast_interfaces
+        .cos.cos_fast_interfaces
         .get(&root_ifindex)
         .and_then(|iface_fast| iface_fast.shared_root_lease.as_ref())
     {
         shared_root_lease.consume(sent_bytes);
     }
     if let Some(shared_queue_lease) = binding
-        .cos_fast_interfaces
+        .cos.cos_fast_interfaces
         .get(&root_ifindex)
         .and_then(|iface_fast| iface_fast.queue_fast_path.get(queue_idx))
         .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref())
@@ -357,11 +357,11 @@ pub(in crate::afxdp) fn refresh_cos_interface_activity(
     let mut new_runnable = 0usize;
     let mut released_queue_leases = Vec::<(usize, u64)>::new();
     let old_nonempty = binding
-        .cos_interfaces
+        .cos.cos_interfaces
         .get(&root_ifindex)
         .map(|root| root.nonempty_queues)
         .unwrap_or(0);
-    if let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) {
+    if let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) {
         for (queue_idx, queue) in root.queues.iter_mut().enumerate() {
             normalize_cos_queue_state(queue);
             if cos_queue_is_empty(queue) && queue.exact && queue.tokens > 0 {
@@ -379,12 +379,12 @@ pub(in crate::afxdp) fn refresh_cos_interface_activity(
         root.runnable_queues = new_runnable;
     }
     if old_nonempty == 0 && new_nonempty > 0 {
-        binding.cos_nonempty_interfaces = binding.cos_nonempty_interfaces.saturating_add(1);
+        binding.cos.cos_nonempty_interfaces = binding.cos.cos_nonempty_interfaces.saturating_add(1);
     } else if old_nonempty > 0 && new_nonempty == 0 {
-        binding.cos_nonempty_interfaces = binding.cos_nonempty_interfaces.saturating_sub(1);
+        binding.cos.cos_nonempty_interfaces = binding.cos.cos_nonempty_interfaces.saturating_sub(1);
         release_cos_root_lease(binding, root_ifindex);
     }
-    if let Some(iface_fast) = binding.cos_fast_interfaces.get(&root_ifindex) {
+    if let Some(iface_fast) = binding.cos.cos_fast_interfaces.get(&root_ifindex) {
         for (queue_idx, released) in released_queue_leases {
             if let Some(shared_queue_lease) = iface_fast
                 .queue_fast_path
@@ -409,7 +409,7 @@ pub(in crate::afxdp) fn apply_cos_send_result(
 ) {
     let mut exact_queue_idx = None;
     {
-        let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) else {
+        let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) else {
             return;
         };
         if let Some(queue) = root.queues.get_mut(queue_idx) {
@@ -440,7 +440,7 @@ pub(in crate::afxdp) fn apply_cos_send_result(
         root.tokens = root.tokens.saturating_sub(sent_bytes);
     }
     if let Some(shared_root_lease) = binding
-        .cos_fast_interfaces
+        .cos.cos_fast_interfaces
         .get(&root_ifindex)
         .and_then(|iface_fast| iface_fast.shared_root_lease.as_ref())
     {
@@ -448,7 +448,7 @@ pub(in crate::afxdp) fn apply_cos_send_result(
     }
     if let Some(queue_idx) = exact_queue_idx {
         if let Some(shared_queue_lease) = binding
-            .cos_fast_interfaces
+            .cos.cos_fast_interfaces
             .get(&root_ifindex)
             .and_then(|iface_fast| iface_fast.queue_fast_path.get(queue_idx))
             .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref())
@@ -471,7 +471,7 @@ pub(in crate::afxdp) fn apply_cos_prepared_result(
 ) {
     let mut exact_queue_idx = None;
     {
-        let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) else {
+        let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) else {
             return;
         };
         if let Some(queue) = root.queues.get_mut(queue_idx) {
@@ -506,7 +506,7 @@ pub(in crate::afxdp) fn apply_cos_prepared_result(
         root.tokens = root.tokens.saturating_sub(sent_bytes);
     }
     if let Some(shared_root_lease) = binding
-        .cos_fast_interfaces
+        .cos.cos_fast_interfaces
         .get(&root_ifindex)
         .and_then(|iface_fast| iface_fast.shared_root_lease.as_ref())
     {
@@ -514,7 +514,7 @@ pub(in crate::afxdp) fn apply_cos_prepared_result(
     }
     if let Some(queue_idx) = exact_queue_idx {
         if let Some(shared_queue_lease) = binding
-            .cos_fast_interfaces
+            .cos.cos_fast_interfaces
             .get(&root_ifindex)
             .and_then(|iface_fast| iface_fast.queue_fast_path.get(queue_idx))
             .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref())

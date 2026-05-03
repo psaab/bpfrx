@@ -32,7 +32,7 @@ fn enqueue_local_request_to_target_or_owner(
     req: TxRequest,
 ) -> Result<(), TxRequest> {
     if request_uses_shared_exact_queue_lease(
-        &target_binding.cos_fast_interfaces,
+        &target_binding.cos.cos_fast_interfaces,
         req.egress_ifindex,
         req.cos_queue_id,
     ) {
@@ -41,7 +41,7 @@ fn enqueue_local_request_to_target_or_owner(
         return Ok(());
     }
     let owner_live = cos_owner_live_for_request(
-        &target_binding.cos_fast_interfaces,
+        &target_binding.cos.cos_fast_interfaces,
         req.egress_ifindex,
         req.cos_queue_id,
     );
@@ -394,11 +394,11 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                 let is_nat64 = request.decision.nat.nat64;
                 let uses_native_tunnel = request.decision.resolution.tunnel_endpoint_id != 0;
                 let owner_matches_target = request_uses_shared_exact_queue_lease(
-                    &target_binding.cos_fast_interfaces,
+                    &target_binding.cos.cos_fast_interfaces,
                     request.decision.resolution.egress_ifindex,
                     request.cos_queue_id,
                 ) || cos_owner_live_for_request(
-                    &target_binding.cos_fast_interfaces,
+                    &target_binding.cos.cos_fast_interfaces,
                     request.decision.resolution.egress_ifindex,
                     request.cos_queue_id,
                 )

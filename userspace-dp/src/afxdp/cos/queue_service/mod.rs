@@ -130,14 +130,14 @@ pub(in crate::afxdp) fn drain_shaped_tx(
     now_ns: u64,
     shared_recycles: &mut Vec<(u32, u64)>,
 ) -> Option<DrainedQueueRef> {
-    if binding.cos_nonempty_interfaces == 0 || binding.cos_interface_order.is_empty() {
+    if binding.cos.cos_nonempty_interfaces == 0 || binding.cos.cos_interface_order.is_empty() {
         return None;
     }
-    let start = binding.cos_interface_rr % binding.cos_interface_order.len();
-    for offset in 0..binding.cos_interface_order.len() {
+    let start = binding.cos.cos_interface_rr % binding.cos.cos_interface_order.len();
+    for offset in 0..binding.cos.cos_interface_order.len() {
         let root_ifindex =
-            binding.cos_interface_order[(start + offset) % binding.cos_interface_order.len()];
-        let Some(root) = binding.cos_interfaces.get(&root_ifindex) else {
+            binding.cos.cos_interface_order[(start + offset) % binding.cos.cos_interface_order.len()];
+        let Some(root) = binding.cos.cos_interfaces.get(&root_ifindex) else {
             continue;
         };
         if root.nonempty_queues == 0 {
@@ -152,7 +152,7 @@ pub(in crate::afxdp) fn drain_shaped_tx(
             now_ns,
             shared_recycles,
         ) {
-            binding.cos_interface_rr = (start + offset + 1) % binding.cos_interface_order.len();
+            binding.cos.cos_interface_rr = (start + offset + 1) % binding.cos.cos_interface_order.len();
             return serviced;
         }
         let Some(batch) = build_nonexact_cos_batch(binding, root_ifindex, now_ns) else {
@@ -165,7 +165,7 @@ pub(in crate::afxdp) fn drain_shaped_tx(
         // scan by id; now we carry the idx through for direct
         // indexed access.
         let located = cos_batch_queue_ref(binding, root_ifindex, &batch);
-        binding.cos_interface_rr = (start + offset + 1) % binding.cos_interface_order.len();
+        binding.cos.cos_interface_rr = (start + offset + 1) % binding.cos.cos_interface_order.len();
         if submit_cos_batch(binding, root_ifindex, batch, now_ns, shared_recycles) {
             return located.map(|(queue_idx, queue_id)| DrainedQueueRef {
                 root_ifindex,
@@ -188,7 +188,7 @@ fn cos_batch_queue_ref(
         CoSBatch::Local { queue_idx, .. } | CoSBatch::Prepared { queue_idx, .. } => *queue_idx,
     };
     binding
-        .cos_interfaces
+        .cos.cos_interfaces
         .get(&root_ifindex)
         .and_then(|root| root.queues.get(queue_idx))
         .map(|queue| (queue_idx, queue.queue_id))
@@ -201,7 +201,7 @@ fn build_nonexact_cos_batch(
     now_ns: u64,
 ) -> Option<CoSBatch> {
     let selected = {
-        let root = binding.cos_interfaces.get_mut(&root_ifindex)?;
+        let root = binding.cos.cos_interfaces.get_mut(&root_ifindex)?;
         select_nonexact_cos_guarantee_batch(root, now_ns)
             .or_else(|| select_cos_surplus_batch(root, now_ns))
     };
@@ -244,17 +244,17 @@ fn service_exact_guarantee_queue_direct_with_info(
     shared_recycles: &mut Vec<(u32, u64)>,
 ) -> Option<Option<DrainedQueueRef>> {
     let queue_fast_path = binding
-        .cos_fast_interfaces
+        .cos.cos_fast_interfaces
         .get(&root_ifindex)?
         .queue_fast_path
         .as_slice();
     let selection = {
-        let root = binding.cos_interfaces.get_mut(&root_ifindex)?;
+        let root = binding.cos.cos_interfaces.get_mut(&root_ifindex)?;
         select_exact_cos_guarantee_queue_with_fast_path(root, queue_fast_path, now_ns)?
     };
 
     let queue_id = binding
-        .cos_interfaces
+        .cos.cos_interfaces
         .get(&root_ifindex)
         .and_then(|root| root.queues.get(selection.queue_idx))
         .map(|queue| queue.queue_id);
@@ -786,7 +786,7 @@ fn subtract_direct_cos_queue_bytes(
         refresh_cos_interface_activity(binding, root_ifindex);
         return;
     }
-    if let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) {
+    if let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) {
         if let Some(queue) = root.queues.get_mut(queue_idx) {
             queue.queued_bytes = queue.queued_bytes.saturating_sub(dropped_bytes);
         }
@@ -1114,7 +1114,7 @@ fn restore_cos_local_items(
     retry: VecDeque<TxRequest>,
 ) {
     {
-        let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) else {
+        let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) else {
             return;
         };
         if let Some(queue) = root.queues.get_mut(queue_idx) {
@@ -1136,7 +1136,7 @@ fn restore_cos_prepared_items(
     retry: VecDeque<PreparedTxRequest>,
 ) {
     {
-        let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) else {
+        let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) else {
             return;
         };
         if let Some(queue) = root.queues.get_mut(queue_idx) {

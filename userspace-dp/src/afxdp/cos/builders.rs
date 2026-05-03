@@ -32,27 +32,27 @@ pub(in crate::afxdp) fn ensure_cos_interface_runtime(
     // forwarding.cos.interfaces + cos_fast_interfaces lookups
     // and the later-pass duplicate. Profiled at 0.9% CPU before
     // this fix.
-    if binding.cos_interfaces.contains_key(&egress_ifindex) {
+    if binding.cos.cos_interfaces.contains_key(&egress_ifindex) {
         return true;
     }
     let Some(config) = forwarding.cos.interfaces.get(&egress_ifindex) else {
         return false;
     };
-    if !binding.cos_fast_interfaces.contains_key(&egress_ifindex) {
+    if !binding.cos.cos_fast_interfaces.contains_key(&egress_ifindex) {
         return false;
     }
     {
         let mut runtime = build_cos_interface_runtime(config, now_ns);
-        if let Some(iface_fast) = binding.cos_fast_interfaces.get(&egress_ifindex) {
+        if let Some(iface_fast) = binding.cos.cos_fast_interfaces.get(&egress_ifindex) {
             apply_cos_queue_flow_fair_promotion(
                 &mut runtime,
                 &iface_fast.queue_fast_path,
                 binding.worker_id,
             );
         }
-        binding.cos_interfaces.insert(egress_ifindex, runtime);
-        binding.cos_interface_order.push(egress_ifindex);
-        binding.cos_interface_order.sort_unstable();
+        binding.cos.cos_interfaces.insert(egress_ifindex, runtime);
+        binding.cos.cos_interface_order.push(egress_ifindex);
+        binding.cos.cos_interface_order.sort_unstable();
     }
     true
 }

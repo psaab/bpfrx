@@ -14,6 +14,12 @@ pub(crate) use telemetry::WorkerTelemetry;
 mod scratch;
 pub(crate) use scratch::WorkerScratch;
 
+// #959 Phase 3: per-binding CoS scheduling state lives in
+// worker/cos_state.rs (the `cos` module name is taken by
+// worker/cos.rs which holds runtime helpers).
+mod cos_state;
+pub(crate) use cos_state::WorkerCos;
+
 // #957 P1: worker-side CoS runtime helpers split out into a sibling
 // submodule. Note this module is `worker::cos`, separate from the
 // `afxdp::cos` directory module imported below as `super::cos`.
@@ -57,11 +63,10 @@ pub(crate) struct BindingWorker {
     pub(crate) pending_tx_prepared: VecDeque<PreparedTxRequest>,
     pub(crate) pending_tx_local: VecDeque<TxRequest>,
     pub(crate) max_pending_tx: usize,
-    pub(crate) cos_fast_interfaces: FastMap<i32, WorkerCoSInterfaceFastPath>,
-    pub(crate) cos_interfaces: FastMap<i32, CoSInterfaceRuntime>,
-    pub(crate) cos_interface_order: Vec<i32>,
-    pub(crate) cos_interface_rr: usize,
-    pub(crate) cos_nonempty_interfaces: usize,
+    /// #959 Phase 3: 5 `cos_*` per-binding CoS scheduling fields
+    /// extracted into `WorkerCos`. Field semantics unchanged;
+    /// access via `binding.cos.cos_X`.
+    pub(crate) cos: WorkerCos,
     pub(crate) pending_fill_frames: VecDeque<u64>,
     /// #959 Phase 2: 11 `scratch_*` reusable buffers extracted into
     /// `WorkerScratch`. Field semantics unchanged; access via
@@ -339,11 +344,13 @@ impl BindingWorker {
             pending_tx_prepared: VecDeque::new(),
             pending_tx_local: VecDeque::new(),
             max_pending_tx,
-            cos_fast_interfaces: FastMap::default(),
-            cos_interfaces: FastMap::default(),
-            cos_interface_order: Vec::new(),
-            cos_interface_rr: 0,
-            cos_nonempty_interfaces: 0,
+            cos: WorkerCos {
+                cos_fast_interfaces: FastMap::default(),
+                cos_interfaces: FastMap::default(),
+                cos_interface_order: Vec::new(),
+                cos_interface_rr: 0,
+                cos_nonempty_interfaces: 0,
+            },
             pending_fill_frames: VecDeque::new(),
             scratch: WorkerScratch {
                 scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
@@ -526,7 +533,7 @@ pub(crate) fn worker_loop(
         cos_shared_queue_vtime_floors.as_ref(),
     );
     for binding in bindings.iter_mut() {
-        binding.cos_fast_interfaces = cos_fast_interfaces.clone();
+        binding.cos.cos_fast_interfaces = cos_fast_interfaces.clone();
     }
     let mut interrupt_poll_fds = if poll_mode == crate::PollMode::Interrupt {
         bindings
@@ -775,7 +782,7 @@ pub(crate) fn worker_loop(
                 cos_shared_queue_vtime_floors.as_ref(),
             );
             for binding in bindings.iter_mut() {
-                binding.cos_fast_interfaces = cos_fast_interfaces.clone();
+                binding.cos.cos_fast_interfaces = cos_fast_interfaces.clone();
             }
         }
         let ha_runtime = ha_state.load();
@@ -1615,7 +1622,7 @@ fn apply_worker_shaped_tx_requests(
     for req in requests {
         let binding_index = bindings
             .first()
-            .and_then(|binding| binding.cos_fast_interfaces.get(&req.egress_ifindex))
+            .and_then(|binding| binding.cos.cos_fast_interfaces.get(&req.egress_ifindex))
             .and_then(|iface_fast| {
                 binding_lookup
                     .first_by_if
