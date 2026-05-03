@@ -16,13 +16,14 @@ use super::*;
 /// Per-binding CoS scheduling state. Owned by the worker that owns
 /// this binding.
 ///
-/// **Intentionally NOT `Default`.** A `WorkerCos::default()` would
-/// silently produce empty `FastMap`s and a zero `cos_interface_rr`,
-/// which is also the legitimate construction state — but going
-/// through `Default` would lose the FastMap's hashing properties
-/// (rebuilding from scratch with default builder). The only legal
-/// construction path is the explicit literal in
-/// `BindingWorker::create`. Same rule as `WorkerScratch`.
+/// **Intentionally NOT `Default`** — for consistency with the
+/// `WorkerScratch` decomposition pattern (#1168), where Default
+/// would have silently regressed Vec capacity. A `WorkerCos::default()`
+/// would technically produce the same state as the explicit literal
+/// in `BindingWorker::create` (FastMaps are equally `default()`'d
+/// there) — but blocking it forces all construction through the
+/// explicit literal so any future field with non-trivial init
+/// requirements can't accidentally bypass it.
 pub(crate) struct WorkerCos {
     pub(crate) cos_fast_interfaces: FastMap<i32, WorkerCoSInterfaceFastPath>,
     pub(crate) cos_interfaces: FastMap<i32, CoSInterfaceRuntime>,
