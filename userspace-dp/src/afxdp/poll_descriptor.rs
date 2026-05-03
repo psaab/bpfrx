@@ -388,7 +388,7 @@ pub(super) fn poll_binding_process_descriptor(
                                                         .dscp_rewrite,
                                                 },
                                             );
-                                            binding.pending_in_place_tx_packets += 1;
+                                            binding.tx_counters.pending_in_place_tx_packets += 1;
                                             telemetry.dbg.forward += 1;
                                             telemetry.dbg.tx += 1;
                                             recycle_now = false;

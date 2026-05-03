@@ -150,7 +150,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
             }
             dbg.enqueue_ok += 1;
             dbg.enqueue_copy += 1;
-            target_binding.pending_copy_tx_packets += 1;
+            target_binding.tx_counters.pending_copy_tx_packets += 1;
             dbg.tx_bytes_total += frame_len as u64;
             if (frame_len as u32) > dbg.tx_max_frame {
                 dbg.tx_max_frame = frame_len as u32;
@@ -277,7 +277,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                 {
                     dbg.enqueue_ok += segments as u64;
                     dbg.enqueue_direct += segments as u64;
-                    target_binding.pending_direct_tx_packets += segments as u64;
+                    target_binding.tx_counters.pending_direct_tx_packets += segments as u64;
                     dbg.tx_bytes_total += bytes;
                     if max_frame > dbg.tx_max_frame {
                         dbg.tx_max_frame = max_frame;
@@ -341,7 +341,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                         bound_pending_tx_local(target_binding);
                         dbg.enqueue_ok += 1;
                         dbg.enqueue_copy += 1;
-                        target_binding.pending_copy_tx_packets += 1;
+                        target_binding.tx_counters.pending_copy_tx_packets += 1;
                         dbg.tx_bytes_total += seg_frame_len as u64;
                         if (seg_frame_len as u32) > dbg.tx_max_frame {
                             dbg.tx_max_frame = seg_frame_len as u32;
@@ -442,7 +442,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                     dscp_rewrite: request.dscp_rewrite,
                                 });
                             bound_pending_tx_prepared(target_binding);
-                            target_binding.pending_in_place_tx_packets += 1;
+                            target_binding.tx_counters.pending_in_place_tx_packets += 1;
                             dbg.enqueue_ok += 1;
                             dbg.enqueue_inplace += 1;
                             dbg.tx_bytes_total += frame_len as u64;
@@ -527,7 +527,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 }
                                 dbg.enqueue_ok += 1;
                                 dbg.enqueue_copy += 1;
-                                target_binding.pending_copy_tx_packets += 1;
+                                target_binding.tx_counters.pending_copy_tx_packets += 1;
                                 dbg.tx_bytes_total += cp1_len as u64;
                                 if (cp1_len as u32) > dbg.tx_max_frame {
                                     dbg.tx_max_frame = cp1_len as u32;
@@ -679,7 +679,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 bound_pending_tx_prepared(target_binding);
                                 dbg.enqueue_ok += 1;
                                 dbg.enqueue_direct += 1;
-                                target_binding.pending_direct_tx_packets += 1;
+                                target_binding.tx_counters.pending_direct_tx_packets += 1;
                                 dbg.tx_bytes_total += written as u64;
                                 if (written as u32) > dbg.tx_max_frame {
                                     dbg.tx_max_frame = written as u32;
@@ -700,13 +700,13 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                     if !direct_built {
                         match direct_tx_fallback_reason {
                             Some(DirectTxFallbackReason::NoFreeTxFrame) => {
-                                target_binding.pending_direct_tx_no_frame_fallback_packets += 1;
+                                target_binding.tx_counters.pending_direct_tx_no_frame_fallback_packets += 1;
                             }
                             Some(DirectTxFallbackReason::BuildReturnedNone) => {
-                                target_binding.pending_direct_tx_build_fallback_packets += 1;
+                                target_binding.tx_counters.pending_direct_tx_build_fallback_packets += 1;
                             }
                             Some(DirectTxFallbackReason::DisallowedByRewriteMode) => {
-                                target_binding.pending_direct_tx_disallowed_fallback_packets += 1;
+                                target_binding.tx_counters.pending_direct_tx_disallowed_fallback_packets += 1;
                             }
                             None => {}
                         }
@@ -786,7 +786,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 }
                                 dbg.enqueue_ok += 1;
                                 dbg.enqueue_copy += 1;
-                                target_binding.pending_copy_tx_packets += 1;
+                                target_binding.tx_counters.pending_copy_tx_packets += 1;
                                 dbg.tx_bytes_total += cp2_len as u64;
                                 if (cp2_len as u32) > dbg.tx_max_frame {
                                     dbg.tx_max_frame = cp2_len as u32;
