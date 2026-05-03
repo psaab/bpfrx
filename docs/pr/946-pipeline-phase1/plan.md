@@ -128,8 +128,7 @@ existing `continue;` in the while-let. Codex round 2 enumerated them:
 | 183  | Screen drop | yes | yes (stage 10) |
 | 221  | IPsec passthrough | yes | yes (stage 11) |
 | 297  | Flow-cache TTL ICMP-TE generated | no (returned via pending_fill_frames) | NO — flow-cache stage deferred |
-| 397  | Flow-cache slow-path fallback (scratch_forwards push) | no (recycled later as part of forward) | NO — flow-cache deferred |
-| 433  | Flow-cache in-place rewrite success | no (frame travels as TX) | NO — flow-cache deferred |
+| 433  | Flow-cache terminal `continue;` (covers both in-place rewrite success and the scratch_forwards fallback inside the same block at line 397) | no (frame travels as TX) | NO — flow-cache deferred |
 | 535  | Session-hit TTL ICMP-TE generated | no (same as 297) | NO — session-hit stage deferred |
 | 604  | Cluster-peer-return fast path | no (frame travels via fabric TX) | NO — cluster-peer stage deferred |
 
@@ -178,8 +177,9 @@ That's ~2,400 LOC of branchy per-packet code in one function.
 - (1) `stage_record_rx_telemetry`
 - (2)+(3)+(4) `stage_parse_and_classify` → `StageOutcome<ParsedFrame>`
    where `ParsedFrame` carries `meta` + `raw_frame: &'a [u8]`.
-- (5) `stage_link_layer_classify` → `LinkLayerOutcome` (5 distinct
-  arms, NOT a generic StageOutcome — see "Open questions" #2).
+- (5) `stage_link_layer_classify` → `StageOutcome<()>` (per Codex
+  round-2 answer to Q2: collapse the four ARP/NDP arms; side
+  effects on `dynamic_neighbors` stay inside the helper).
 - (6) `stage_native_gre_decap` → `(UserspaceDpMeta, Option<Vec<u8>>)`
   *plus* the caller binds the active slice locally (the helper does
   NOT return the slice — that would be self-referential).
@@ -243,9 +243,9 @@ fn stage_parse_and_classify<'a>(
     area: &'a MmapArea,
     validation: ValidationState,
     binding_live: &BindingLiveState,
-    ident: &WorkerIdent,
+    ident: &BindingIdentity,
     forwarding: &ForwardingState,
-    recent_exceptions: &RecentExceptions,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     telemetry: &mut TelemetryContext,
 ) -> StageOutcome<(UserspaceDpMeta, &'a [u8])>;
 
@@ -427,7 +427,7 @@ Phase 1 preserves it.
 
 - **Pure code motion**: each extracted function returns the same
   values the inline code would have produced; control flow is
-  preserved by the explicit StageOutcome / LinkLayerOutcome arms.
+  preserved by the explicit StageOutcome / FabricIngressOutcome arms.
 - **No state shape changes**: BindingWorker, WorkerContext, sessions,
   screen, etc. all retain their current shape and access pattern.
   Stages take `&mut` references where the original code mutated.
@@ -452,11 +452,25 @@ Phase 1 preserves it.
   - **Dynamic-neighbor learning only for non-GRE-owned frames**
     (line 113 guard). v3's `learn_from_live_frame` flag passes
     `owned_packet_frame.is_none()` from the caller.
-  - **`raw_frame` must stay available for deferred TTL/ICMP paths.**
-    The flow-cache TTL path at line 281 and session-hit TTL path
-    use `raw_frame` directly (NOT `packet_frame`). v3's caller
-    binds both: `let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);`
-    — `raw_frame` is preserved for deferred code.
+  - **`raw_frame` must stay available for deferred TTL/ICMP/debug
+    paths.** Beyond the flow-cache TTL path at line 281, deferred
+    code uses `raw_frame` for embedded ICMP handling at
+    [poll_descriptor.rs:865](../../../userspace-dp/src/afxdp/poll_descriptor.rs)
+    and [poll_descriptor.rs:963](../../../userspace-dp/src/afxdp/poll_descriptor.rs),
+    and for debug TCP inspection at
+    [poll_descriptor.rs:1633](../../../userspace-dp/src/afxdp/poll_descriptor.rs).
+    v3's caller binds both: `let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);`
+    — `raw_frame` is preserved as a separate live binding for
+    deferred code that must look at the un-decapped Ethernet frame.
+  - **`metadata_packets` is a batch counter, NOT a live counter.**
+    `telemetry.counters.metadata_packets += 1` fires AFTER
+    successful metadata parse and BEFORE classify, regardless of
+    whether the disposition turns out to be Valid or not. It must
+    NOT fire on parse failure, and the valid-path counters
+    (validated_packets/validated_bytes) are batch counters
+    (`telemetry.counters`), NOT `record_disposition(PacketDisposition::Valid)`
+    live-counter calls. The Valid path's only live-counter side
+    effect is via the deferred stages 12+.
   - **`meta_flags` mutation must precede screen/IPsec/flow-cache.**
     Stage 9 sets `FABRIC_INGRESS_FLAG`. Screen (10), IPsec (11),
     and the deferred flow-cache (12) all read meta after stage 9
@@ -507,7 +521,7 @@ each stage. A separate `PacketBatch` redesign is independent.
   **LOW**. Phase 1 is pure code motion — it cannot push the codebase
   toward a wrong architecture because it doesn't introduce new
   abstractions beyond two enums (StageOutcome<T> generic and
-  LinkLayerOutcome stage-specific). The named functions are just
+  FabricIngressOutcome named struct). The named functions are just
   labels for existing inline code blocks.
 - **Behavioral regression risk**: **LOW**. No state shape or order
   changes. The enum-based outcomes make every early-return arm
@@ -536,7 +550,7 @@ each stage. A separate `PacketBatch` redesign is independent.
 1. Phase 1 extracts 8 stages and leaves stages 12–16 inline. Is this
    the right scope for one PR, or should the extraction split into
    two smaller PRs (e.g., stages 1–6 first, then 7–11)?
-2. `LinkLayerOutcome` has 4 arms (ArpLearnAndRecycle, ArpRecycle,
+2. (Resolved per Codex round-2 Q2.) `LinkLayerOutcome` had 4 arms (ArpLearnAndRecycle, ArpRecycle,
    NdpLearnAndContinue, Continue). The first two collapse to "recycle"
    from the caller's perspective; only the side effects on
    dynamic_neighbors differ. Should the helper consume the side
