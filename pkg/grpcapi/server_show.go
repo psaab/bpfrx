@@ -21,7 +21,6 @@ import (
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -1264,145 +1263,44 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		return s.ShowText(ctx, &pb.ShowTextRequest{Topic: "chassis"})
 
 	case "chassis-forwarding":
-		// #877: Junos-style forwarding-daemon health view.
-		// #881: CPU rows are 5s/1m/5m windows from s.fwdSampler.
-		// #879: cluster mode renders BOTH node0:/node1: blocks. To
-		// prevent infinite recursion, peer calls carry the
-		// `xpf-no-peer:1` gRPC metadata; when present we skip the
-		// peer dial-back and emit a single local block.
-		md, _ := metadata.FromIncomingContext(ctx)
-		isPeerCall := len(md.Get("xpf-no-peer")) > 0
-
-		localBuf := s.buildLocalForwarding()
-
-		if s.cluster == nil || isPeerCall {
-			buf.WriteString(localBuf)
-			break
-		}
-
-		// Cluster mode, original (non-peer) call — compose two blocks.
-		localNodeID := s.cluster.NodeID()
-		fmt.Fprintf(&buf, "node%d:\n%s\n%s",
-			localNodeID, chassisForwardingSeparator, localBuf)
-
-		peerBuf, peerErr := s.dialAndShowForwarding(ctx)
-		// Codex round-1 fix: guard against PeerNodeID() returning 0
-		// before the first heartbeat — would produce two `node0:`
-		// headers. If peer was never seen, label it as unknown.
-		peerLabel := "node?"
-		if s.cluster.PeerAlive() {
-			peerLabel = fmt.Sprintf("node%d", s.cluster.PeerNodeID())
-		}
-		fmt.Fprintf(&buf, "\n%s:\n%s\n", peerLabel, chassisForwardingSeparator)
-		if peerErr != nil {
-			fmt.Fprintf(&buf, "FWDD status:\n  (peer unreachable: %s)\n", peerErr)
-		} else {
-			buf.WriteString(peerBuf)
-		}
+		// #1043 Phase 11: case body extracted to server_show_cluster_text.go
+		s.showChassisForwarding(ctx, &buf)
 
 	case "chassis-cluster", "chassis-cluster-status":
-		if s.cluster != nil {
-			buf.WriteString(s.cluster.FormatStatus())
-		} else {
-			fmt.Fprintln(&buf, "Cluster not configured")
-		}
+		// #1043 Phase 11: case body extracted to server_show_cluster_text.go
+		s.showChassisClusterStatus(&buf)
 
 	case "chassis-cluster-interfaces":
-		if s.cluster == nil {
-			fmt.Fprintln(&buf, "Cluster not configured")
-			break
-		}
-		input := s.buildInterfacesInput()
-		buf.WriteString(s.cluster.FormatInterfaces(input))
+		// #1043 Phase 11: case body extracted to server_show_cluster_text.go
+		s.showChassisClusterInterfaces(&buf)
 
 	case "chassis-cluster-information":
-		if s.cluster != nil {
-			buf.WriteString(s.cluster.FormatInformation())
-		} else {
-			cfg := s.store.ActiveConfig()
-			if cfg == nil || cfg.Chassis.Cluster == nil {
-				fmt.Fprintln(&buf, "Cluster not configured")
-				break
-			}
-			cc := cfg.Chassis.Cluster
-			hbInterval := cc.HeartbeatInterval
-			if hbInterval == 0 {
-				hbInterval = 1000
-			}
-			hbThreshold := cc.HeartbeatThreshold
-			if hbThreshold == 0 {
-				hbThreshold = 3
-			}
-			fmt.Fprintf(&buf, "Cluster ID: %d\n", cc.ClusterID)
-			fmt.Fprintf(&buf, "Node ID: %d\n", cc.NodeID)
-			fmt.Fprintf(&buf, "RETH count: %d\n", cc.RethCount)
-			fmt.Fprintf(&buf, "Heartbeat interval: %d ms\n", hbInterval)
-			fmt.Fprintf(&buf, "Heartbeat threshold: %d\n", hbThreshold)
-			fmt.Fprintf(&buf, "Redundancy groups: %d\n", len(cc.RedundancyGroups))
-		}
+		// #1043 Phase 11: case body extracted to server_show_cluster_text.go
+		s.showChassisClusterInformation(&buf)
 
 	case "chassis-cluster-statistics":
-		if s.cluster == nil {
-			fmt.Fprintln(&buf, "Cluster not configured")
-			break
-		}
-		buf.WriteString(s.cluster.FormatStatistics())
+		// #1043 Phase 11: case body extracted to server_show_cluster_text.go
+		s.showChassisClusterStatistics(&buf)
 
 	case "chassis-cluster-control-plane-statistics":
-		if s.cluster == nil {
-			fmt.Fprintln(&buf, "Cluster not configured")
-			break
-		}
-		buf.WriteString(s.cluster.FormatControlPlaneStatistics())
+		// #1043 Phase 11: case body extracted to server_show_cluster_text.go
+		s.showChassisClusterControlPlaneStatistics(&buf)
 
 	case "chassis-cluster-data-plane-statistics":
-		if s.cluster == nil {
-			fmt.Fprintln(&buf, "Cluster not configured")
-			break
-		}
-		buf.WriteString(s.cluster.FormatDataPlaneStatistics())
-		if status, err := s.userspaceDataplaneStatus(); err == nil {
-			buf.WriteString("\n")
-			buf.WriteString(dpuserspace.FormatStatusSummary(status))
-		}
+		// #1043 Phase 11: case body extracted to server_show_cluster_text.go
+		s.showChassisClusterDataPlaneStatistics(&buf)
 
 	case "chassis-cluster-data-plane-interfaces":
-		if s.cluster == nil {
-			fmt.Fprintln(&buf, "Cluster not configured")
-			break
-		}
-		buf.WriteString(s.cluster.FormatDataPlaneInterfaces())
-		if status, err := s.userspaceDataplaneStatus(); err == nil {
-			buf.WriteString("\n")
-			buf.WriteString(dpuserspace.FormatBindings(status))
-		}
+		// #1043 Phase 11: case body extracted to server_show_cluster_text.go
+		s.showChassisClusterDataPlaneInterfaces(&buf)
 
 	case "chassis-cluster-ip-monitoring-status":
-		if s.cluster == nil {
-			fmt.Fprintln(&buf, "Cluster not configured")
-			break
-		}
-		buf.WriteString(s.cluster.FormatIPMonitoringStatus())
+		// #1043 Phase 11: case body extracted to server_show_cluster_text.go
+		s.showChassisClusterIPMonitoringStatus(&buf)
 
 	case "chassis-cluster-fabric-statistics":
-		if s.dp == nil || !s.dp.IsLoaded() {
-			fmt.Fprintln(&buf, "Dataplane not loaded")
-			break
-		}
-		total, _ := s.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirect)
-		fab0, _ := s.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectFab0)
-		fab1, _ := s.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectFab1)
-		zone, _ := s.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectZone)
-		drops, _ := s.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricFwdDrop)
-		fmt.Fprintln(&buf, "Fabric redirect statistics:")
-		fmt.Fprintf(&buf, "    Total redirects:          %d\n", total)
-		fmt.Fprintf(&buf, "    fab0 redirects:           %d\n", fab0)
-		fmt.Fprintf(&buf, "    fab1 redirects:           %d\n", fab1)
-		fmt.Fprintf(&buf, "    Zone-encoded redirects:   %d\n", zone)
-		fmt.Fprintf(&buf, "    Redirect drops:           %d\n", drops)
-		fmt.Fprintln(&buf)
-		fmt.Fprintln(&buf, "Note: XDP-redirected packets bypass AF_PACKET (tcpdump).")
-		fmt.Fprintln(&buf, "Use these counters or 'monitor interface <fab>' for fabric telemetry.")
+		// #1043 Phase 11: case body extracted to server_show_cluster_text.go
+		s.showChassisClusterFabricStatistics(&buf)
 
 	case "chassis-environment":
 		// #1043 Phase 7: case body extracted to server_show_system.go
