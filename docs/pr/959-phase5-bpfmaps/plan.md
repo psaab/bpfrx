@@ -24,9 +24,11 @@ resolution.
 
 ## Methodology
 
-Same compiler-driven approach as Phases 1-4. 24 callsites across 4
-files (worker/mod.rs, poll_descriptor.rs, session_glue/mod.rs,
-bpf_map.rs).
+Same compiler-driven approach as Phases 1-4. 30 callsites across 4
+files (worker/mod.rs 7, poll_descriptor.rs 13, session_glue/mod.rs 6,
+bpf_map.rs 4). The pre-implementation grep counted 24 because it
+under-counted multi-arg call sites where two FDs appear on the same
+line.
 
 `WorkerBpfMaps` has NO `Default` derive — these are real OS FDs and
 a `c_int = 0` default would alias `stdin`, with potentially

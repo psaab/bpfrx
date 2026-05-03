@@ -12,7 +12,10 @@
 //! `binding.bpf_maps.heartbeat_map_fd` keeps the same grep-friendly
 //! suffix as the original `binding.heartbeat_map_fd`.
 
-use std::ffi::c_int;
+// Use `core::ffi::c_int` to match the rest of the afxdp module which
+// pulls `c_int` via `super::*` (e.g. afxdp/mod.rs, bpf_map.rs). This
+// keeps the FFI integer type source consistent across the crate.
+use core::ffi::c_int;
 
 /// Per-binding BPF map file descriptors. Opened once at binding
 /// construction; constant for the binding's lifetime.
