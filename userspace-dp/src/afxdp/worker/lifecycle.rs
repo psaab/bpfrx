@@ -113,7 +113,7 @@ pub(super) fn poll_binding(
             return did_work;
         }
 
-        let raw_avail = binding.rx.available();
+        let raw_avail = binding.xsk.rx.available();
         let available = raw_avail.min(RX_BATCH_SIZE);
         if raw_avail > 0 && !binding.bind_meta.xsk_rx_confirmed {
             binding.bind_meta.xsk_rx_confirmed = true;
@@ -126,8 +126,8 @@ pub(super) fn poll_binding(
                 }
             }
             // Ring diagnostics are only consumed by debug-log summaries.
-            binding.telemetry.dbg_fill_pending = binding.device.pending();
-            binding.telemetry.dbg_device_avail = binding.device.available();
+            binding.telemetry.dbg_fill_pending = binding.xsk.device.pending();
+            binding.telemetry.dbg_device_avail = binding.xsk.device.available();
         }
         if available == 0 {
             binding.telemetry.dbg_rx_empty += 1;

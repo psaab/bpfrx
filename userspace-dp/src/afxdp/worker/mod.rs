@@ -50,6 +50,14 @@ pub(crate) use bind_meta::WorkerBindMeta;
 mod flow_cache_state;
 pub(crate) use flow_cache_state::WorkerFlowCacheState;
 
+// #959 Phase 11 — XSK kernel-ring handles in
+// worker/xsk_rings.rs. Holds the three socket-ring objects
+// `device`, `rx`, `tx` (was held back as highest-risk because
+// of the `off.rx`/`off.tx` and `telemetry.dbg.rx`/`.tx`
+// snapshot/diagnostic name collisions).
+mod xsk_rings;
+pub(crate) use xsk_rings::WorkerXskRings;
+
 // #957 P1: worker-side CoS runtime helpers split out into a sibling
 // submodule. Note this module is `worker::cos`, separate from the
 // `afxdp::cos` directory module imported below as `super::cos`.
@@ -86,9 +94,10 @@ pub(crate) struct BindingWorker {
     pub(crate) live: Arc<BindingLiveState>,
     #[allow(dead_code)]
     pub(crate) user: User,
-    pub(crate) device: crate::xsk_ffi::DeviceQueue,
-    pub(crate) rx: crate::xsk_ffi::RingRx,
-    pub(crate) tx: crate::xsk_ffi::RingTx,
+    /// #959 Phase 11: 3 XSK kernel-ring handles extracted into
+    /// `WorkerXskRings`. Field semantics unchanged; access via
+    /// `binding.xsk.device`, `binding.xsk.rx`, `binding.xsk.tx`.
+    pub(crate) xsk: WorkerXskRings,
     /// #959 Phase 7 + Phase 10: 8 TX pipeline fields extracted into
     /// `WorkerTxPipeline` (Phase 7 brought 7; Phase 10 added
     /// `outstanding_tx` once the BindingStatus mirror collision was
@@ -331,9 +340,7 @@ impl BindingWorker {
             umem: worker_umem,
             live,
             user,
-            device,
-            rx,
-            tx,
+            xsk: WorkerXskRings { device, rx, tx },
             tx_pipeline: WorkerTxPipeline {
                 free_tx_frames: reserved_tx_frames,
                 pending_tx_prepared: VecDeque::new(),
@@ -545,7 +552,7 @@ pub(crate) fn worker_loop(
         bindings
             .iter()
             .map(|binding| libc::pollfd {
-                fd: binding.device.as_raw_fd(),
+                fd: binding.xsk.device.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             })
@@ -1081,9 +1088,9 @@ pub(crate) fn worker_loop(
                 let mut binding_summary = String::new();
                 for (i, b) in bindings.iter().enumerate() {
                     use std::fmt::Write;
-                    let fill_pending = b.device.pending();
-                    let rx_avail = b.rx.available_relaxed();
-                    let xsk_stats = b.device.statistics_v2().ok();
+                    let fill_pending = b.xsk.device.pending();
+                    let rx_avail = b.xsk.rx.available_relaxed();
+                    let xsk_stats = b.xsk.device.statistics_v2().ok();
                     let inflight_recycles = b.tx_pipeline.in_flight_prepared_recycles.len() as u32;
                     let scratch_recycle_len = b.scratch.scratch_recycle.len() as u32;
                     let ptx_prepared = b.tx_pipeline.pending_tx_prepared.len() as u32;
@@ -1154,7 +1161,7 @@ pub(crate) fn worker_loop(
                     }
                     // Socket error check (SO_ERROR) — detect kernel-side errors
                     {
-                        let fd = b.rx.as_raw_fd();
+                        let fd = b.xsk.rx.as_raw_fd();
                         let mut so_err: c_int = 0;
                         let mut so_err_len: libc::socklen_t = core::mem::size_of::<c_int>() as _;
                         let rc = unsafe {
@@ -1185,7 +1192,7 @@ pub(crate) fn worker_loop(
                         );
                         // Direct mmap diagnosis: read raw ring producer/consumer
                         if let Some((rxp, rxc, frp, frc, txp, txc, crp, crc)) =
-                            diagnose_raw_ring_state(b.rx.as_raw_fd())
+                            diagnose_raw_ring_state(b.xsk.rx.as_raw_fd())
                         {
                             let _ = write!(
                                 binding_summary,
@@ -1350,8 +1357,8 @@ pub(crate) fn worker_loop(
                         // Dump comprehensive per-binding state at stall moment
                         for (si, sb) in bindings.iter().enumerate() {
                             use std::fmt::Write;
-                            let fill_p = sb.device.pending();
-                            let rx_a = sb.rx.available_relaxed();
+                            let fill_p = sb.xsk.device.pending();
+                            let rx_a = sb.xsk.rx.available_relaxed();
                             let ifl = sb.tx_pipeline.in_flight_prepared_recycles.len() as u32;
                             let ptxp = sb.tx_pipeline.pending_tx_prepared.len() as u32;
                             let ptxl = sb.tx_pipeline.pending_tx_local.len() as u32;
@@ -1363,7 +1370,7 @@ pub(crate) fn worker_loop(
                                 + ifl
                                 + sb.scratch.scratch_recycle.len() as u32
                                 + ptxp;
-                            let raw = diagnose_raw_ring_state(sb.rx.as_raw_fd());
+                            let raw = diagnose_raw_ring_state(sb.xsk.rx.as_raw_fd());
                             let mut stall_line = format!(
                                 "DBG STALL_BINDING[{}]: if={} q={} pfill={} fring={} rxring={} free_tx={} otx={} ifl={} ptxp={} ptxl={} total={}/{}",
                                 si,
@@ -1386,7 +1393,7 @@ pub(crate) fn worker_loop(
                                     " RAW:rxP={rxp}/rxC={rxc}/frP={frp}/frC={frc}/txP={txp}/txC={txc}/crP={crp}/crC={crc}"
                                 );
                             }
-                            if let Ok(Some(stats)) = sb.device.statistics_v2().map(Some) {
+                            if let Ok(Some(stats)) = sb.xsk.device.statistics_v2().map(Some) {
                                 let _ = write!(
                                     stall_line,
                                     " xsk:drop={}/rfull={}/fempty={}/tempty={}",
@@ -1495,7 +1502,7 @@ pub(crate) fn worker_loop(
                     // already absolute (kernel-cumulative), so publish with
                     // store() not fetch_add. Sampling failures are silently
                     // ignored — the atomic simply retains its last good value.
-                    if let Ok(stats) = b.device.statistics_v2() {
+                    if let Ok(stats) = b.xsk.device.statistics_v2() {
                         b.live
                             .rx_fill_ring_empty_descs
                             .store(stats.rx_fill_ring_empty_descs, Ordering::Relaxed);
@@ -1527,7 +1534,7 @@ pub(crate) fn worker_loop(
                     let total = b.umem.total_frames();
                     let free_tx = b.tx_pipeline.free_tx_frames.len() as u32;
                     let pending_fill = b.tx_pipeline.pending_fill_frames.len() as u32;
-                    let kernel_fill = b.device.pending();
+                    let kernel_fill = b.xsk.device.pending();
                     let inflight = total
                         .saturating_sub(free_tx)
                         .saturating_sub(pending_fill)

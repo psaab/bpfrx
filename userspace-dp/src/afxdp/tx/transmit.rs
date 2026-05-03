@@ -173,7 +173,7 @@ pub(in crate::afxdp) fn transmit_batch(
         return Err(TxError::Retry("no prepared TX frame available".to_string()));
     }
 
-    let mut writer = binding.tx.transmit(binding.scratch.scratch_local_tx.len() as u32);
+    let mut writer = binding.xsk.tx.transmit(binding.scratch.scratch_local_tx.len() as u32);
     let inserted = writer.insert(
         binding
             .scratch.scratch_local_tx
@@ -411,6 +411,7 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
     }
 
     let mut writer = binding
+        .xsk
         .tx
         .transmit(binding.scratch.scratch_prepared_tx.len() as u32);
     let inserted = writer.insert(binding.scratch.scratch_prepared_tx.iter().map(|req| XdpDesc {
