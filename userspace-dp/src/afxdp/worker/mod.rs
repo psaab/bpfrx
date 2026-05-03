@@ -39,6 +39,11 @@ pub(crate) use timers::WorkerTimers;
 mod tx_pipeline;
 pub(crate) use tx_pipeline::WorkerTxPipeline;
 
+// #959 Phase 8: per-binding registration / identity metadata lives
+// in worker/bind_meta.rs.
+mod bind_meta;
+pub(crate) use bind_meta::WorkerBindMeta;
+
 // #957 P1: worker-side CoS runtime helpers split out into a sibling
 // submodule. Note this module is `worker::cos`, separate from the
 // `afxdp::cos` directory module imported below as `super::cos`.
@@ -114,15 +119,11 @@ pub(crate) struct BindingWorker {
     pub(crate) tx_counters: WorkerTxCounters,
     pub(crate) flow_cache: FlowCache,
     pub(crate) flow_cache_session_touch: u64,
-    /// Timestamp when this binding was created.
-    #[allow(dead_code)] // reserved for heartbeat gating logic
-    pub(crate) bind_time_ns: u64,
-    /// Zero-copy vs copy mode (affects heartbeat gating).
-    #[allow(dead_code)] // reserved for heartbeat gating logic
-    pub(crate) bind_mode: XskBindMode,
-    /// Set true once the XSK RX ring has delivered at least one packet,
-    /// proving the NIC's XSK receive queue is active for this binding.
-    pub(crate) xsk_rx_confirmed: bool,
+    /// #959 Phase 8: 3 binding registration / identity fields
+    /// (bind_time_ns, bind_mode, xsk_rx_confirmed) extracted into
+    /// `WorkerBindMeta`. Field semantics unchanged; access via
+    /// `binding.bind_meta.X`.
+    pub(crate) bind_meta: WorkerBindMeta,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -398,16 +399,18 @@ impl BindingWorker {
             },
             flow_cache: FlowCache::new(),
             flow_cache_session_touch: 0,
-            bind_time_ns: {
-                let mut ts = libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 0,
-                };
-                unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-                ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+            bind_meta: WorkerBindMeta {
+                bind_time_ns: {
+                    let mut ts = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    };
+                    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+                    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+                },
+                bind_mode,
+                xsk_rx_confirmed: false,
             },
-            xsk_rx_confirmed: false,
-            bind_mode,
         };
         update_binding_debug_state(&mut binding);
         Ok(binding)
