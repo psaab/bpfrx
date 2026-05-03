@@ -320,3 +320,128 @@ func (c *CLI) commitCtx() (context.Context, func()) {
 		cancel()
 	}
 }
+
+// #1044c Phase 1: handleConfigShow relocated from cli.go (no behavior change).
+func (c *CLI) handleConfigShow(args []string) error {
+	// Check for pipe commands
+	line := strings.Join(args, " ")
+
+	if strings.Contains(line, "| compare") {
+		// Check for "| compare rollback N"
+		if idx := strings.Index(line, "| compare rollback"); idx >= 0 {
+			rest := strings.TrimSpace(line[idx+len("| compare rollback"):])
+			n, err := strconv.Atoi(rest)
+			if err != nil || n < 1 {
+				return fmt.Errorf("usage: show | compare rollback <N>")
+			}
+			diff, err := c.store.ShowCompareRollback(n)
+			if err != nil {
+				return err
+			}
+			fmt.Print(diff)
+			return nil
+		}
+		fmt.Print(c.store.ShowCompare())
+		return nil
+	}
+
+	// Build path from editPath + args before the pipe (used by all display formats).
+	var displayPath []string
+	{
+		editPath := c.store.GetEditPath()
+		displayPath = append(displayPath, editPath...)
+		for _, a := range args {
+			if a == "|" {
+				break
+			}
+			displayPath = append(displayPath, a)
+		}
+	}
+
+	if strings.Contains(line, "| display json") {
+		if len(displayPath) > 0 {
+			output := c.store.ShowCandidatePathJSON(displayPath)
+			if output == "" {
+				fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
+			} else {
+				fmt.Print(output)
+			}
+		} else {
+			fmt.Print(c.store.ShowCandidateJSON())
+		}
+		return nil
+	}
+
+	if strings.Contains(line, "| display set") {
+		if len(displayPath) > 0 {
+			output := c.store.ShowCandidatePathSet(displayPath)
+			if output == "" {
+				fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
+			} else {
+				fmt.Print(output)
+			}
+		} else {
+			fmt.Print(c.store.ShowCandidateSet())
+		}
+		return nil
+	}
+
+	if strings.Contains(line, "| display xml") {
+		if len(displayPath) > 0 {
+			output := c.store.ShowCandidatePathXML(displayPath)
+			if output == "" {
+				fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
+			} else {
+				fmt.Print(output)
+			}
+		} else {
+			fmt.Print(c.store.ShowCandidateXML())
+		}
+		return nil
+	}
+
+	if strings.Contains(line, "| display inheritance") {
+		if len(displayPath) > 0 {
+			output := c.store.ShowCandidatePathInheritance(displayPath)
+			if output == "" {
+				fmt.Printf("configuration path not found: %s\n", strings.Join(displayPath, " "))
+			} else {
+				fmt.Print(output)
+			}
+		} else {
+			fmt.Print(c.store.ShowCandidateInheritance())
+		}
+		return nil
+	}
+
+	// Unknown pipe command
+	if idx := strings.Index(line, "| "); idx >= 0 {
+		pipeParts := strings.Fields(strings.TrimSpace(line[idx+2:]))
+		if len(pipeParts) >= 2 && pipeParts[0] == "display" {
+			fmt.Printf("syntax error: unknown display option '%s'\n", pipeParts[1])
+		} else if len(pipeParts) > 0 {
+			fmt.Printf("syntax error: unknown pipe command '%s'\n", pipeParts[0])
+		}
+		return nil
+	}
+
+	// Show scoped to path (editPath + args)
+	fullPath := append([]string{}, c.store.GetEditPath()...)
+	for _, a := range args {
+		if a == "|" {
+			break
+		}
+		fullPath = append(fullPath, a)
+	}
+	if len(fullPath) > 0 {
+		output := c.store.ShowCandidatePath(fullPath)
+		if output == "" {
+			fmt.Printf("configuration path not found: %s\n", strings.Join(fullPath, " "))
+		} else {
+			fmt.Print(output)
+		}
+	} else {
+		fmt.Print(c.store.ShowCandidate())
+	}
+	return nil
+}

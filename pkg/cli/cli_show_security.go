@@ -1976,3 +1976,4 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 	fmt.Printf("No matching policy found for %s -> %s (default deny)\n", fromZone, toZone)
 	return nil
 }
+
