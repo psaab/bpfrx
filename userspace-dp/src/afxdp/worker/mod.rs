@@ -119,7 +119,7 @@ pub(crate) struct BindingWorker {
     pub(crate) last_learned_neighbor: Option<LearnedNeighborKey>,
     /// #959 Phase 1: 23 `dbg_*` debug counters extracted into
     /// `WorkerTelemetry` to reduce BindingWorker's mutable surface
-    /// area. Field semantics unchanged; access via `binding.telemetry.telemetry.dbg_X`.
+    /// area. Field semantics unchanged; access via `binding.telemetry.dbg_X`.
     pub(crate) telemetry: WorkerTelemetry,
     pub(crate) pending_direct_tx_packets: u64,
     pub(crate) pending_copy_tx_packets: u64,

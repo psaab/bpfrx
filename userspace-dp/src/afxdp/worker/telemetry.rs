@@ -6,10 +6,10 @@
 //! counters in a coherent group. Phase 2+ may add `#[repr(align(64))]`
 //! once the cache-line layout is profiled.
 
-/// Per-worker debug telemetry counters incremented from the data-
-/// plane hot path. Read sites (formatting, max-window comparison)
-/// are minimal and confined to the per-second debug tick; see
-/// `worker/lifecycle.rs` and `tx/rings.rs`.
+/// Per-worker debug telemetry counters incremented from the
+/// data-plane hot path. Read sites (formatting, max-window
+/// comparison) are minimal and confined to the per-second debug
+/// tick; see `worker/lifecycle.rs` and `tx/rings.rs`.
 ///
 /// Field semantics are documented at each callsite in the worker
 /// implementation; this struct preserves the names verbatim so that

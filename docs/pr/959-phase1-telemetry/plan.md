@@ -26,7 +26,7 @@ fields. The 23 `dbg_*` counters are the cleanest extraction target:
 
 ## Scope
 
-Move these 24 fields out of `BindingWorker` into a new
+Move these 23 fields out of `BindingWorker` into a new
 `WorkerTelemetry` struct, aggregated at one field
 `pub(crate) telemetry: WorkerTelemetry`:
 
