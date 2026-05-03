@@ -204,8 +204,8 @@ pub(super) fn poll_binding(
             &worker_ctx,
             &mut telemetry,
         );
-        let mut pending_forwards = core::mem::take(&mut binding.scratch_forwards);
-        let mut rst_teardowns = core::mem::take(&mut binding.scratch_rst_teardowns);
+        let mut pending_forwards = core::mem::take(&mut binding.scratch.scratch_forwards);
+        let mut rst_teardowns = core::mem::take(&mut binding.scratch.scratch_rst_teardowns);
         for (forward_key, nat) in rst_teardowns.drain(..) {
             // Evict from flow cache so stale entries aren't used after RST.
             // #918: 4-way set-associative cache requires walking the set
@@ -228,14 +228,14 @@ pub(super) fn poll_binding(
                 &mut pending_forwards,
             );
         }
-        binding.scratch_rst_teardowns = rst_teardowns;
+        binding.scratch.scratch_rst_teardowns = rst_teardowns;
         if !pending_forwards.is_empty() {
             // Use raw pointer to avoid Arc::clone (~5% CPU from lock incq).
             // Safety: the Arc<BindingLiveState> outlives this function call;
             // binding is borrowed mutably by enqueue_pending_forwards but
             // ingress_live is only used for read-only error logging inside it.
             let ingress_live: *const BindingLiveState = &*binding.live;
-            let mut scratch_post_recycles = core::mem::take(&mut binding.scratch_post_recycles);
+            let mut scratch_post_recycles = core::mem::take(&mut binding.scratch.scratch_post_recycles);
             enqueue_pending_forwards(
                 left,
                 binding_index,
@@ -257,9 +257,9 @@ pub(super) fn poll_binding(
                 cos_owner_worker_by_queue,
                 cos_owner_live_by_queue,
             );
-            binding.scratch_post_recycles = scratch_post_recycles;
+            binding.scratch.scratch_post_recycles = scratch_post_recycles;
         }
-        binding.scratch_forwards = pending_forwards;
+        binding.scratch.scratch_forwards = pending_forwards;
         // Reserved: cross-binding in-place TX from flow cache fast path.
         // Currently only self-target (hairpin) uses the inline path;
         // cross-binding goes through enqueue_pending_forwards above.
@@ -280,10 +280,10 @@ pub(super) fn poll_binding(
             binding_lookup,
             shared_recycles,
         );
-        if !binding.scratch_recycle.is_empty() {
+        if !binding.scratch.scratch_recycle.is_empty() {
             binding
                 .pending_fill_frames
-                .extend(binding.scratch_recycle.drain(..));
+                .extend(binding.scratch.scratch_recycle.drain(..));
         }
         let _ = drain_pending_fill(binding, now_ns);
         counters.rx_batches += 1;

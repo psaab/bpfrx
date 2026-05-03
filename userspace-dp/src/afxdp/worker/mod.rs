@@ -9,6 +9,11 @@ use lifecycle::poll_binding;
 mod telemetry;
 pub(crate) use telemetry::WorkerTelemetry;
 
+// #959 Phase 2: per-binding reusable scratch buffers live in
+// worker/scratch.rs.
+mod scratch;
+pub(crate) use scratch::WorkerScratch;
+
 // #957 P1: worker-side CoS runtime helpers split out into a sibling
 // submodule. Note this module is `worker::cos`, separate from the
 // `afxdp::cos` directory module imported below as `super::cos`.
@@ -58,15 +63,10 @@ pub(crate) struct BindingWorker {
     pub(crate) cos_interface_rr: usize,
     pub(crate) cos_nonempty_interfaces: usize,
     pub(crate) pending_fill_frames: VecDeque<u64>,
-    pub(crate) scratch_recycle: Vec<u64>,
-    pub(crate) scratch_forwards: Vec<PendingForwardRequest>,
-    pub(crate) scratch_fill: Vec<u64>,
-    pub(crate) scratch_prepared_tx: Vec<PreparedTxRequest>,
-    pub(crate) scratch_local_tx: Vec<(u64, TxRequest)>,
-    pub(crate) scratch_exact_prepared_tx: Vec<ExactPreparedScratchTxRequest>,
-    pub(crate) scratch_exact_local_tx: Vec<ExactLocalScratchTxRequest>,
-    pub(crate) scratch_completed_offsets: Vec<u64>,
-    pub(crate) scratch_post_recycles: Vec<(u32, u64)>,
+    /// #959 Phase 2: 11 `scratch_*` reusable buffers extracted into
+    /// `WorkerScratch`. Field semantics unchanged; access via
+    /// `binding.scratch.scratch.scratch_X`.
+    pub(crate) scratch: WorkerScratch,
     /// #812: per-UMEM-frame submit timestamp sidecar. Indexed by
     /// `offset >> UMEM_FRAME_SHIFT`. Pre-allocated once at binding
     /// construction (length = total UMEM frames) so the hot-path
@@ -99,12 +99,6 @@ pub(crate) struct BindingWorker {
     /// Packets waiting for neighbor resolution. The UMEM frame is held
     /// (not recycled) until the neighbor resolves or the entry times out.
     pub(crate) pending_neigh: VecDeque<PendingNeighPacket>,
-    /// Flow cache fast-path: cross-binding in-place rewrites deferred
-    /// until after the RX batch (borrow checker prevents mutable access
-    /// to two bindings simultaneously inside the RX loop).
-    #[allow(dead_code)] // reserved for cross-binding fast-path
-    pub(crate) scratch_cross_binding_tx: Vec<(usize, PreparedTxRequest)>,
-    pub(crate) scratch_rst_teardowns: Vec<(SessionKey, NatDecision)>,
     pub(crate) in_flight_prepared_recycles: FastMap<u64, PreparedTxRecycle>,
     pub(crate) heartbeat_map_fd: c_int,
     pub(crate) session_map_fd: c_int,
@@ -351,15 +345,19 @@ impl BindingWorker {
             cos_interface_rr: 0,
             cos_nonempty_interfaces: 0,
             pending_fill_frames: VecDeque::new(),
-            scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
-            scratch_forwards: Vec::with_capacity(RX_BATCH_SIZE as usize),
-            scratch_fill: Vec::with_capacity(FILL_BATCH_SIZE),
-            scratch_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
-            scratch_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
-            scratch_exact_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
-            scratch_exact_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
-            scratch_completed_offsets: Vec::with_capacity(ring_entries as usize),
-            scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
+            scratch: WorkerScratch {
+                scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
+                scratch_forwards: Vec::with_capacity(RX_BATCH_SIZE as usize),
+                scratch_fill: Vec::with_capacity(FILL_BATCH_SIZE),
+                scratch_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
+                scratch_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
+                scratch_exact_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
+                scratch_exact_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
+                scratch_completed_offsets: Vec::with_capacity(ring_entries as usize),
+                scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
+                scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
+                scratch_rst_teardowns: Vec::with_capacity(16),
+            },
             // #812: pre-allocate the submit-timestamp sidecar once,
             // sized to the binding's total UMEM frame count so every
             // legal `offset >> UMEM_FRAME_SHIFT` index lands inside
@@ -378,8 +376,6 @@ impl BindingWorker {
             // idle. Start at 0 capacity and let VecDeque grow on push as
             // packets actually queue up.
             pending_neigh: VecDeque::new(),
-            scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
-            scratch_rst_teardowns: Vec::with_capacity(16),
             in_flight_prepared_recycles: FastMap::default(),
             heartbeat_map_fd,
             session_map_fd,
@@ -1076,7 +1072,7 @@ pub(crate) fn worker_loop(
                     let rx_avail = b.rx.available_relaxed();
                     let xsk_stats = b.device.statistics_v2().ok();
                     let inflight_recycles = b.in_flight_prepared_recycles.len() as u32;
-                    let scratch_recycle_len = b.scratch_recycle.len() as u32;
+                    let scratch_recycle_len = b.scratch.scratch_recycle.len() as u32;
                     let ptx_prepared = b.pending_tx_prepared.len() as u32;
                     let ptx_local = b.pending_tx_local.len() as u32;
                     let total_accounted = b.pending_fill_frames.len() as u32
@@ -1352,7 +1348,7 @@ pub(crate) fn worker_loop(
                                 + sb.free_tx_frames.len() as u32
                                 + sb.outstanding_tx
                                 + ifl
-                                + sb.scratch_recycle.len() as u32
+                                + sb.scratch.scratch_recycle.len() as u32
                                 + ptxp;
                             let raw = diagnose_raw_ring_state(sb.rx.as_raw_fd());
                             let mut stall_line = format!(

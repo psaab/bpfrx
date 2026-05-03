@@ -91,8 +91,8 @@ pub(in crate::afxdp) fn transmit_batch(
         return Err(TxError::Retry("no free TX frame available".to_string()));
     }
 
-    binding.scratch_local_tx.clear();
-    while binding.scratch_local_tx.len() < batch_size {
+    binding.scratch.scratch_local_tx.clear();
+    while binding.scratch.scratch_local_tx.len() < batch_size {
         let Some(mut req) = pending.pop_front() else {
             break;
         };
@@ -101,7 +101,7 @@ pub(in crate::afxdp) fn transmit_batch(
         }
         if req.bytes.len() > tx_frame_capacity() {
             // Unwind already-prepared entries before returning.
-            for (off, r) in binding.scratch_local_tx.drain(..) {
+            for (off, r) in binding.scratch.scratch_local_tx.drain(..) {
                 binding.free_tx_frames.push_back(off);
                 pending.push_front(r);
             }
@@ -123,7 +123,7 @@ pub(in crate::afxdp) fn transmit_batch(
         }) else {
             binding.free_tx_frames.push_front(offset);
             // Unwind already-prepared entries before returning.
-            for (off, r) in binding.scratch_local_tx.drain(..) {
+            for (off, r) in binding.scratch.scratch_local_tx.drain(..) {
                 binding.free_tx_frames.push_back(off);
                 pending.push_front(r);
             }
@@ -165,18 +165,18 @@ pub(in crate::afxdp) fn transmit_batch(
                 });
             }
         }
-        binding.scratch_local_tx.push((offset, req));
+        binding.scratch.scratch_local_tx.push((offset, req));
     }
 
-    if binding.scratch_local_tx.is_empty() {
+    if binding.scratch.scratch_local_tx.is_empty() {
         maybe_wake_tx(binding, true, now_ns);
         return Err(TxError::Retry("no prepared TX frame available".to_string()));
     }
 
-    let mut writer = binding.tx.transmit(binding.scratch_local_tx.len() as u32);
+    let mut writer = binding.tx.transmit(binding.scratch.scratch_local_tx.len() as u32);
     let inserted = writer.insert(
         binding
-            .scratch_local_tx
+            .scratch.scratch_local_tx
             .iter()
             .map(|(offset, req)| XdpDesc {
                 addr: *offset,
@@ -200,7 +200,7 @@ pub(in crate::afxdp) fn transmit_batch(
     stamp_submits(
         &mut binding.tx_submit_ns,
         binding
-            .scratch_local_tx
+            .scratch.scratch_local_tx
             .iter()
             .take(inserted as usize)
             .map(|(offset, _)| *offset),
@@ -210,7 +210,7 @@ pub(in crate::afxdp) fn transmit_batch(
     if inserted == 0 {
         binding.telemetry.dbg_tx_ring_full += 1;
         maybe_wake_tx(binding, true, now_ns);
-        while let Some((offset, req)) = binding.scratch_local_tx.pop() {
+        while let Some((offset, req)) = binding.scratch.scratch_local_tx.pop() {
             binding.free_tx_frames.push_front(offset);
             pending.push_front(req);
         }
@@ -222,7 +222,7 @@ pub(in crate::afxdp) fn transmit_batch(
     let mut sent_packets = 0u64;
     let mut sent_bytes = 0u64;
     let mut retry_tail = Vec::new();
-    for (idx, (offset, req)) in binding.scratch_local_tx.drain(..).enumerate() {
+    for (idx, (offset, req)) in binding.scratch.scratch_local_tx.drain(..).enumerate() {
         if idx < inserted as usize {
             sent_packets += 1;
             sent_bytes += req.bytes.len() as u64;
@@ -260,13 +260,13 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
         return Ok((0, 0));
     }
     let batch_size = pending.len().min(TX_BATCH_SIZE);
-    binding.scratch_prepared_tx.clear();
-    while binding.scratch_prepared_tx.len() < batch_size {
+    binding.scratch.scratch_prepared_tx.clear();
+    while binding.scratch.scratch_prepared_tx.len() < batch_size {
         let Some(req) = pending.pop_front() else {
             break;
         };
         if req.len as usize > tx_frame_capacity() {
-            let orphaned: Vec<_> = binding.scratch_prepared_tx.drain(..).collect();
+            let orphaned: Vec<_> = binding.scratch.scratch_prepared_tx.drain(..).collect();
             recycle_prepared_immediately(binding, &req);
             for r in &orphaned {
                 recycle_prepared_immediately(binding, r);
@@ -292,12 +292,12 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
                 tx_frame_capacity()
             )));
         }
-        binding.scratch_prepared_tx.push(req);
+        binding.scratch.scratch_prepared_tx.push(req);
     }
-    if binding.scratch_prepared_tx.is_empty() {
+    if binding.scratch.scratch_prepared_tx.is_empty() {
         return Ok((0, 0));
     }
-    for req in &binding.scratch_prepared_tx {
+    for req in &binding.scratch.scratch_prepared_tx {
         let Some(dscp_rewrite) = req.dscp_rewrite else {
             continue;
         };
@@ -309,7 +309,7 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
         }) else {
             let err_offset = req.offset;
             let err_len = req.len;
-            let orphaned: Vec<_> = binding.scratch_prepared_tx.drain(..).collect();
+            let orphaned: Vec<_> = binding.scratch.scratch_prepared_tx.drain(..).collect();
             for r in &orphaned {
                 recycle_prepared_immediately(binding, r);
             }
@@ -333,7 +333,7 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
         };
         let _ = apply_dscp_rewrite_to_frame(frame, dscp_rewrite);
     }
-    for req in &binding.scratch_prepared_tx {
+    for req in &binding.scratch.scratch_prepared_tx {
         if binding
             .umem
             .area()
@@ -342,7 +342,7 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
         {
             let err_offset = req.offset;
             let err_len = req.len;
-            let orphaned: Vec<_> = binding.scratch_prepared_tx.drain(..).collect();
+            let orphaned: Vec<_> = binding.scratch.scratch_prepared_tx.drain(..).collect();
             for r in &orphaned {
                 recycle_prepared_immediately(binding, r);
             }
@@ -370,7 +370,7 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
 
     // RST detection on prepared TX path: check UMEM frames before submitting to TX ring
     if cfg!(feature = "debug-log") {
-        for req in &binding.scratch_prepared_tx {
+        for req in &binding.scratch.scratch_prepared_tx {
             if let Some(frame_data) = binding
                 .umem
                 .area()
@@ -412,8 +412,8 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
 
     let mut writer = binding
         .tx
-        .transmit(binding.scratch_prepared_tx.len() as u32);
-    let inserted = writer.insert(binding.scratch_prepared_tx.iter().map(|req| XdpDesc {
+        .transmit(binding.scratch.scratch_prepared_tx.len() as u32);
+    let inserted = writer.insert(binding.scratch.scratch_prepared_tx.iter().map(|req| XdpDesc {
         addr: req.offset,
         len: req.len,
         options: 0,
@@ -433,7 +433,7 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
     stamp_submits(
         &mut binding.tx_submit_ns,
         binding
-            .scratch_prepared_tx
+            .scratch.scratch_prepared_tx
             .iter()
             .take(inserted as usize)
             .map(|req| req.offset),
@@ -443,7 +443,7 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
     if inserted == 0 {
         binding.telemetry.dbg_tx_ring_full += 1;
         maybe_wake_tx(binding, true, now_ns);
-        while let Some(req) = binding.scratch_prepared_tx.pop() {
+        while let Some(req) = binding.scratch.scratch_prepared_tx.pop() {
             pending.push_front(req);
         }
         return Err(TxError::Retry("prepared tx ring insert failed".to_string()));
@@ -454,7 +454,7 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
     let mut sent_packets = 0u64;
     let mut sent_bytes = 0u64;
     let mut retry_tail = Vec::new();
-    for (idx, req) in binding.scratch_prepared_tx.drain(..).enumerate() {
+    for (idx, req) in binding.scratch.scratch_prepared_tx.drain(..).enumerate() {
         if idx < inserted as usize {
             remember_prepared_recycle(&mut binding.in_flight_prepared_recycles, &req);
             sent_packets += 1;

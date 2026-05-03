@@ -37,7 +37,7 @@ pub(super) fn service_exact_local_queue_direct(
         let _ = reap_tx_completions(binding, shared_recycles);
     }
     let queue_dscp_rewrite = cos_queue_dscp_rewrite(binding, root_ifindex, queue_idx);
-    binding.scratch_exact_local_tx.clear();
+    binding.scratch.scratch_exact_local_tx.clear();
     let root_budget = binding
         .cos_interfaces
         .get(&root_ifindex)
@@ -55,7 +55,7 @@ pub(super) fn service_exact_local_queue_direct(
         drain_exact_local_fifo_items_to_scratch(
             queue,
             &mut binding.free_tx_frames,
-            &mut binding.scratch_exact_local_tx,
+            &mut binding.scratch.scratch_exact_local_tx,
             binding.umem.area(),
             root_budget,
             secondary_budget,
@@ -70,7 +70,7 @@ pub(super) fn service_exact_local_queue_direct(
         } => {
             release_exact_local_scratch_frames(
                 &mut binding.free_tx_frames,
-                &mut binding.scratch_exact_local_tx,
+                &mut binding.scratch.scratch_exact_local_tx,
             );
             if dropped_bytes > 0 {
                 subtract_direct_cos_queue_bytes(binding, root_ifindex, queue_idx, dropped_bytes);
@@ -89,7 +89,7 @@ pub(super) fn service_exact_local_queue_direct(
             return false;
         }
     }
-    if binding.scratch_exact_local_tx.is_empty() {
+    if binding.scratch.scratch_exact_local_tx.is_empty() {
         maybe_wake_tx(binding, true, now_ns);
         binding
             .live
@@ -99,8 +99,8 @@ pub(super) fn service_exact_local_queue_direct(
 
     let mut writer = binding
         .tx
-        .transmit(binding.scratch_exact_local_tx.len() as u32);
-    let inserted = writer.insert(binding.scratch_exact_local_tx.iter().map(|req| XdpDesc {
+        .transmit(binding.scratch.scratch_exact_local_tx.len() as u32);
+    let inserted = writer.insert(binding.scratch.scratch_exact_local_tx.iter().map(|req| XdpDesc {
         addr: req.offset,
         len: req.len,
         options: 0,
@@ -122,7 +122,7 @@ pub(super) fn service_exact_local_queue_direct(
     stamp_submits(
         &mut binding.tx_submit_ns,
         binding
-            .scratch_exact_local_tx
+            .scratch.scratch_exact_local_tx
             .iter()
             .take(inserted as usize)
             .map(|req| req.offset),
@@ -130,13 +130,13 @@ pub(super) fn service_exact_local_queue_direct(
     );
 
     if inserted == 0 {
-        let dropped = binding.scratch_exact_local_tx.len() as u64;
+        let dropped = binding.scratch.scratch_exact_local_tx.len() as u64;
         binding.telemetry.dbg_tx_ring_full += 1;
         count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
         release_exact_local_scratch_frames(
             &mut binding.free_tx_frames,
-            &mut binding.scratch_exact_local_tx,
+            &mut binding.scratch.scratch_exact_local_tx,
         );
         refresh_cos_interface_activity(binding, root_ifindex);
         binding.live.set_error("tx ring insert failed".to_string());
@@ -151,7 +151,7 @@ pub(super) fn service_exact_local_queue_direct(
             .get_mut(&root_ifindex)
             .and_then(|root| root.queues.get_mut(queue_idx)),
         &mut binding.free_tx_frames,
-        &mut binding.scratch_exact_local_tx,
+        &mut binding.scratch.scratch_exact_local_tx,
         inserted as usize,
     );
     // #940: post-settle V_min publish. FIFO queues currently have
@@ -181,7 +181,7 @@ fn service_exact_local_queue_direct_flow_fair(
         let _ = reap_tx_completions(binding, shared_recycles);
     }
     let queue_dscp_rewrite = cos_queue_dscp_rewrite(binding, root_ifindex, queue_idx);
-    binding.scratch_local_tx.clear();
+    binding.scratch.scratch_local_tx.clear();
     let root_budget = binding
         .cos_interfaces
         .get(&root_ifindex)
@@ -199,7 +199,7 @@ fn service_exact_local_queue_direct_flow_fair(
         drain_exact_local_items_to_scratch_flow_fair(
             queue,
             &mut binding.free_tx_frames,
-            &mut binding.scratch_local_tx,
+            &mut binding.scratch.scratch_local_tx,
             binding.umem.area(),
             root_budget,
             secondary_budget,
@@ -218,7 +218,7 @@ fn service_exact_local_queue_direct_flow_fair(
                     .get_mut(&root_ifindex)
                     .and_then(|root| root.queues.get_mut(queue_idx)),
                 &mut binding.free_tx_frames,
-                &mut binding.scratch_local_tx,
+                &mut binding.scratch.scratch_local_tx,
             );
             if dropped_bytes > 0 {
                 subtract_direct_cos_queue_bytes(binding, root_ifindex, queue_idx, dropped_bytes);
@@ -237,7 +237,7 @@ fn service_exact_local_queue_direct_flow_fair(
             return false;
         }
     }
-    if binding.scratch_local_tx.is_empty() {
+    if binding.scratch.scratch_local_tx.is_empty() {
         maybe_wake_tx(binding, true, now_ns);
         binding
             .live
@@ -245,10 +245,10 @@ fn service_exact_local_queue_direct_flow_fair(
         return false;
     }
 
-    let mut writer = binding.tx.transmit(binding.scratch_local_tx.len() as u32);
+    let mut writer = binding.tx.transmit(binding.scratch.scratch_local_tx.len() as u32);
     let inserted = writer.insert(
         binding
-            .scratch_local_tx
+            .scratch.scratch_local_tx
             .iter()
             .map(|(offset, req)| XdpDesc {
                 addr: *offset,
@@ -267,7 +267,7 @@ fn service_exact_local_queue_direct_flow_fair(
     stamp_submits(
         &mut binding.tx_submit_ns,
         binding
-            .scratch_local_tx
+            .scratch.scratch_local_tx
             .iter()
             .take(inserted as usize)
             .map(|(offset, _)| *offset),
@@ -275,7 +275,7 @@ fn service_exact_local_queue_direct_flow_fair(
     );
 
     if inserted == 0 {
-        let dropped = binding.scratch_local_tx.len() as u64;
+        let dropped = binding.scratch.scratch_local_tx.len() as u64;
         binding.telemetry.dbg_tx_ring_full += 1;
         count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
@@ -285,7 +285,7 @@ fn service_exact_local_queue_direct_flow_fair(
                 .get_mut(&root_ifindex)
                 .and_then(|root| root.queues.get_mut(queue_idx)),
             &mut binding.free_tx_frames,
-            &mut binding.scratch_local_tx,
+            &mut binding.scratch.scratch_local_tx,
         );
         refresh_cos_interface_activity(binding, root_ifindex);
         binding.live.set_error("tx ring insert failed".to_string());
@@ -300,7 +300,7 @@ fn service_exact_local_queue_direct_flow_fair(
             .get_mut(&root_ifindex)
             .and_then(|root| root.queues.get_mut(queue_idx)),
         &mut binding.free_tx_frames,
-        &mut binding.scratch_local_tx,
+        &mut binding.scratch.scratch_local_tx,
         inserted as usize,
     );
     // #940: post-settle V_min publish. Settle has already applied
@@ -342,7 +342,7 @@ pub(super) fn service_exact_prepared_queue_direct(
         );
     }
     let queue_dscp_rewrite = cos_queue_dscp_rewrite(binding, root_ifindex, queue_idx);
-    binding.scratch_exact_prepared_tx.clear();
+    binding.scratch.scratch_exact_prepared_tx.clear();
     let root_budget = binding
         .cos_interfaces
         .get(&root_ifindex)
@@ -359,7 +359,7 @@ pub(super) fn service_exact_prepared_queue_direct(
         };
         drain_exact_prepared_fifo_items_to_scratch(
             queue,
-            &mut binding.scratch_exact_prepared_tx,
+            &mut binding.scratch.scratch_exact_prepared_tx,
             binding.umem.area(),
             &mut binding.free_tx_frames,
             &mut binding.pending_fill_frames,
@@ -375,7 +375,7 @@ pub(super) fn service_exact_prepared_queue_direct(
             error,
             dropped_bytes,
         } => {
-            release_exact_prepared_scratch(&mut binding.scratch_exact_prepared_tx);
+            release_exact_prepared_scratch(&mut binding.scratch.scratch_exact_prepared_tx);
             if dropped_bytes > 0 {
                 subtract_direct_cos_queue_bytes(binding, root_ifindex, queue_idx, dropped_bytes);
             } else {
@@ -393,12 +393,12 @@ pub(super) fn service_exact_prepared_queue_direct(
             return false;
         }
     }
-    if binding.scratch_exact_prepared_tx.is_empty() {
+    if binding.scratch.scratch_exact_prepared_tx.is_empty() {
         return false;
     }
 
     if cfg!(feature = "debug-log") {
-        for req in &binding.scratch_exact_prepared_tx {
+        for req in &binding.scratch.scratch_exact_prepared_tx {
             if let Some(frame_data) = binding
                 .umem
                 .area()
@@ -413,8 +413,8 @@ pub(super) fn service_exact_prepared_queue_direct(
 
     let mut writer = binding
         .tx
-        .transmit(binding.scratch_exact_prepared_tx.len() as u32);
-    let inserted = writer.insert(binding.scratch_exact_prepared_tx.iter().map(|req| XdpDesc {
+        .transmit(binding.scratch.scratch_exact_prepared_tx.len() as u32);
+    let inserted = writer.insert(binding.scratch.scratch_exact_prepared_tx.iter().map(|req| XdpDesc {
         addr: req.offset,
         len: req.len,
         options: 0,
@@ -430,7 +430,7 @@ pub(super) fn service_exact_prepared_queue_direct(
     stamp_submits(
         &mut binding.tx_submit_ns,
         binding
-            .scratch_exact_prepared_tx
+            .scratch.scratch_exact_prepared_tx
             .iter()
             .take(inserted as usize)
             .map(|req| req.offset),
@@ -438,11 +438,11 @@ pub(super) fn service_exact_prepared_queue_direct(
     );
 
     if inserted == 0 {
-        let dropped = binding.scratch_exact_prepared_tx.len() as u64;
+        let dropped = binding.scratch.scratch_exact_prepared_tx.len() as u64;
         binding.telemetry.dbg_tx_ring_full += 1;
         count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
-        release_exact_prepared_scratch(&mut binding.scratch_exact_prepared_tx);
+        release_exact_prepared_scratch(&mut binding.scratch.scratch_exact_prepared_tx);
         refresh_cos_interface_activity(binding, root_ifindex);
         binding
             .live
@@ -457,7 +457,7 @@ pub(super) fn service_exact_prepared_queue_direct(
             .cos_interfaces
             .get_mut(&root_ifindex)
             .and_then(|root| root.queues.get_mut(queue_idx)),
-        &mut binding.scratch_exact_prepared_tx,
+        &mut binding.scratch.scratch_exact_prepared_tx,
         &mut binding.in_flight_prepared_recycles,
         inserted as usize,
     );
@@ -483,7 +483,7 @@ fn service_exact_prepared_queue_direct_flow_fair(
     now_ns: u64,
 ) -> bool {
     let queue_dscp_rewrite = cos_queue_dscp_rewrite(binding, root_ifindex, queue_idx);
-    binding.scratch_prepared_tx.clear();
+    binding.scratch.scratch_prepared_tx.clear();
     let root_budget = binding
         .cos_interfaces
         .get(&root_ifindex)
@@ -500,7 +500,7 @@ fn service_exact_prepared_queue_direct_flow_fair(
         };
         drain_exact_prepared_items_to_scratch_flow_fair(
             queue,
-            &mut binding.scratch_prepared_tx,
+            &mut binding.scratch.scratch_prepared_tx,
             binding.umem.area(),
             &mut binding.free_tx_frames,
             &mut binding.pending_fill_frames,
@@ -521,7 +521,7 @@ fn service_exact_prepared_queue_direct_flow_fair(
                     .cos_interfaces
                     .get_mut(&root_ifindex)
                     .and_then(|root| root.queues.get_mut(queue_idx)),
-                &mut binding.scratch_prepared_tx,
+                &mut binding.scratch.scratch_prepared_tx,
             );
             if dropped_bytes > 0 {
                 subtract_direct_cos_queue_bytes(binding, root_ifindex, queue_idx, dropped_bytes);
@@ -540,12 +540,12 @@ fn service_exact_prepared_queue_direct_flow_fair(
             return false;
         }
     }
-    if binding.scratch_prepared_tx.is_empty() {
+    if binding.scratch.scratch_prepared_tx.is_empty() {
         return false;
     }
 
     if cfg!(feature = "debug-log") {
-        for req in &binding.scratch_prepared_tx {
+        for req in &binding.scratch.scratch_prepared_tx {
             if let Some(frame_data) = binding
                 .umem
                 .area()
@@ -560,8 +560,8 @@ fn service_exact_prepared_queue_direct_flow_fair(
 
     let mut writer = binding
         .tx
-        .transmit(binding.scratch_prepared_tx.len() as u32);
-    let inserted = writer.insert(binding.scratch_prepared_tx.iter().map(|req| XdpDesc {
+        .transmit(binding.scratch.scratch_prepared_tx.len() as u32);
+    let inserted = writer.insert(binding.scratch.scratch_prepared_tx.iter().map(|req| XdpDesc {
         addr: req.offset,
         len: req.len,
         options: 0,
@@ -576,7 +576,7 @@ fn service_exact_prepared_queue_direct_flow_fair(
     stamp_submits(
         &mut binding.tx_submit_ns,
         binding
-            .scratch_prepared_tx
+            .scratch.scratch_prepared_tx
             .iter()
             .take(inserted as usize)
             .map(|req| req.offset),
@@ -584,7 +584,7 @@ fn service_exact_prepared_queue_direct_flow_fair(
     );
 
     if inserted == 0 {
-        let dropped = binding.scratch_prepared_tx.len() as u64;
+        let dropped = binding.scratch.scratch_prepared_tx.len() as u64;
         binding.telemetry.dbg_tx_ring_full += 1;
         count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
@@ -593,7 +593,7 @@ fn service_exact_prepared_queue_direct_flow_fair(
                 .cos_interfaces
                 .get_mut(&root_ifindex)
                 .and_then(|root| root.queues.get_mut(queue_idx)),
-            &mut binding.scratch_prepared_tx,
+            &mut binding.scratch.scratch_prepared_tx,
         );
         refresh_cos_interface_activity(binding, root_ifindex);
         binding
@@ -609,7 +609,7 @@ fn service_exact_prepared_queue_direct_flow_fair(
             .cos_interfaces
             .get_mut(&root_ifindex)
             .and_then(|root| root.queues.get_mut(queue_idx)),
-        &mut binding.scratch_prepared_tx,
+        &mut binding.scratch.scratch_prepared_tx,
         &mut binding.in_flight_prepared_recycles,
         inserted as usize,
     );

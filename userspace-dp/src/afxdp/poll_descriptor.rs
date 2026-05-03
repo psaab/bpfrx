@@ -34,9 +34,9 @@ pub(super) fn poll_binding_process_descriptor(
     telemetry: &mut TelemetryContext,
 ) {
         let mut received = binding.rx.receive(available);
-        binding.scratch_recycle.clear();
-        binding.scratch_forwards.clear();
-        binding.scratch_rst_teardowns.clear();
+        binding.scratch.scratch_recycle.clear();
+        binding.scratch.scratch_forwards.clear();
+        binding.scratch.scratch_rst_teardowns.clear();
         while let Some(desc) = received.read() {
             record_rx_descriptor_telemetry(desc, area, telemetry, worker_ctx);
             let mut recycle_now = true;
@@ -49,7 +49,7 @@ pub(super) fn poll_binding_process_descriptor(
                     let Some(raw_frame) =
                         unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
                     else {
-                        binding.scratch_recycle.push(desc.addr);
+                        binding.scratch.scratch_recycle.push(desc.addr);
                         continue;
                     };
                     // #947: ARP classification + reply parsing extracted to
@@ -72,11 +72,11 @@ pub(super) fn poll_binding_process_descriptor(
                             )
                             .unwrap_or(meta.ingress_ifindex as i32);
                             add_kernel_neighbor(neigh_ifindex, arp.sender_ip, arp.sender_mac);
-                            binding.scratch_recycle.push(desc.addr);
+                            binding.scratch.scratch_recycle.push(desc.addr);
                             continue;
                         }
                         parser::ArpClassification::OtherArp => {
-                            binding.scratch_recycle.push(desc.addr);
+                            binding.scratch.scratch_recycle.push(desc.addr);
                             continue;
                         }
                         parser::ArpClassification::NotArp => {}
@@ -179,7 +179,7 @@ pub(super) fn poll_binding_process_descriptor(
                                     screen.check_packet(zone_name, &screen_pkt, now_secs)
                                 {
                                     binding.live.screen_drops.fetch_add(1, Ordering::Relaxed);
-                                    binding.scratch_recycle.push(desc.addr);
+                                    binding.scratch.scratch_recycle.push(desc.addr);
                                     continue;
                                 }
                             }
@@ -217,7 +217,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 "slow_path",
                                 worker_ctx.forwarding,
                             );
-                            binding.scratch_recycle.push(desc.addr);
+                            binding.scratch.scratch_recycle.push(desc.addr);
                             continue;
                         }
                     }
@@ -290,7 +290,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         now_secs,
                                     );
                                     if let Some(request) = local_icmp_te {
-                                        binding.scratch_forwards.push(request);
+                                        binding.scratch.scratch_forwards.push(request);
                                         // Don't recycle here — enqueue_pending_forwards
                                         // returns the frame via pending_fill_frames
                                         // when processing the prebuilt TE response.
@@ -422,13 +422,13 @@ pub(super) fn poll_binding_process_descriptor(
                                                 .unwrap_or(PendingForwardFrame::Live);
                                             telemetry.dbg.forward += 1;
                                             telemetry.dbg.tx += 1;
-                                            binding.scratch_forwards.push(request);
+                                            binding.scratch.scratch_forwards.push(request);
                                             recycle_now = false;
                                         }
                                     }
                                 }
                                 if recycle_now {
-                                    binding.scratch_recycle.push(desc.addr);
+                                    binding.scratch.scratch_recycle.push(desc.addr);
                                 }
                                 continue;
                             } // else: cached HA-valid — fast path above
@@ -528,7 +528,7 @@ pub(super) fn poll_binding_process_descriptor(
                                     now_secs,
                                 );
                                 if let Some(request) = local_icmp_te {
-                                    binding.scratch_forwards.push(request);
+                                    binding.scratch.scratch_forwards.push(request);
                                     // Don't recycle: the TE response references
                                     // the original frame via desc.addr on the request.
                                     // The continue skips recycle_now handling.
@@ -600,7 +600,7 @@ pub(super) fn poll_binding_process_descriptor(
                                             true,
                                         );
                                     }
-                                    binding.scratch_forwards.push(request);
+                                    binding.scratch.scratch_forwards.push(request);
                                     continue;
                                 }
                             }
@@ -991,7 +991,7 @@ pub(super) fn poll_binding_process_descriptor(
                                                 meta,
                                                 None,
                                             );
-                                            binding.scratch_forwards.push(PendingForwardRequest {
+                                            binding.scratch.scratch_forwards.push(PendingForwardRequest {
                                                 target_ifindex,
                                                 target_binding_index: worker_ctx.binding_lookup.target_index(
                                                     binding_index,
@@ -1177,7 +1177,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         now_secs,
                                     );
                                     if let Some(request) = local_icmp_te {
-                                        binding.scratch_forwards.push(request);
+                                        binding.scratch.scratch_forwards.push(request);
                                         recycle_now = false;
                                     } else {
                                         let mut created = 0u64;
@@ -1786,7 +1786,7 @@ pub(super) fn poll_binding_process_descriptor(
                             && let Some(flow) = flow.as_ref()
                         {
                             binding
-                                .scratch_rst_teardowns
+                                .scratch.scratch_rst_teardowns
                                 .push((flow.forward_key.clone(), decision.nat));
                         }
                         telemetry.counters.forward_candidate_packets += 1;
@@ -1865,7 +1865,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 }
                             }
                             let request_target_binding_index = request.target_binding_index;
-                            binding.scratch_forwards.push(request);
+                            binding.scratch.scratch_forwards.push(request);
                             recycle_now = false;
                             // ── Flow cache population ────────────────────
                             // Cache ForwardCandidate decisions for established
@@ -2203,7 +2203,7 @@ pub(super) fn poll_binding_process_descriptor(
                 );
             }
             if recycle_now {
-                binding.scratch_recycle.push(desc.addr);
+                binding.scratch.scratch_recycle.push(desc.addr);
             }
         }
         received.release();
