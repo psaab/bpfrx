@@ -75,3 +75,79 @@ fn build_cos_interface_runtime_leaves_flow_hash_seed_zero_until_promotion() {
         assert_eq!(queue.flow_hash_seed, 0);
     }
 }
+
+#[test]
+fn build_cos_interface_runtime_zero_shaping_rate_starts_with_full_root_tokens() {
+    // #916: transparent root. When the interface has no shaping-rate
+    // configured, root.tokens MUST start at the burst cap (not 0)
+    // so the very first packet doesn't see an empty root bucket
+    // before the first top-up call.
+    let runtime = build_cos_interface_runtime(
+        &CoSInterfaceConfig {
+            shaping_rate_bytes: 0, // <- transparent root
+            burst_bytes: 256 * 1024,
+            default_queue: 0,
+            dscp_classifier: String::new(),
+            ieee8021_classifier: String::new(),
+            dscp_queue_by_dscp: [u8::MAX; 64],
+            ieee8021_queue_by_pcp: [u8::MAX; 8],
+            queue_by_forwarding_class: FastMap::default(),
+            queues: vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "best-effort".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000,
+                exact: false,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        },
+        1_000_000_000,
+    );
+    assert!(
+        runtime.tokens >= 64 * 1500,
+        "transparent root must start with full bucket (>= COS_MIN_BURST_BYTES), got {}",
+        runtime.tokens,
+    );
+    assert_eq!(runtime.shaping_rate_bytes, 0);
+}
+
+#[test]
+fn build_cos_interface_runtime_zero_queue_rate_starts_with_full_queue_tokens() {
+    // #916: transparent queue. When transmit_rate_bytes == 0
+    // (scheduler had no rate AND parent root has no shaping rate),
+    // queue.tokens MUST start at the buffer cap so the queue
+    // can drain immediately. Otherwise an exact queue with rate=0
+    // starts at 0 and waits forever for a refill that never arrives.
+    let runtime = build_cos_interface_runtime(
+        &CoSInterfaceConfig {
+            shaping_rate_bytes: 0,
+            burst_bytes: 256 * 1024,
+            default_queue: 0,
+            dscp_classifier: String::new(),
+            ieee8021_classifier: String::new(),
+            dscp_queue_by_dscp: [u8::MAX; 64],
+            ieee8021_queue_by_pcp: [u8::MAX; 8],
+            queue_by_forwarding_class: FastMap::default(),
+            queues: vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "best-effort".into(),
+                priority: 5,
+                transmit_rate_bytes: 0, // <- transparent queue
+                exact: false,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        },
+        1_000_000_000,
+    );
+    let queue = &runtime.queues[0];
+    assert!(
+        queue.tokens >= 64 * 1500,
+        "transparent queue must start with full bucket (>= COS_MIN_BURST_BYTES), got {}",
+        queue.tokens,
+    );
+    assert_eq!(queue.transmit_rate_bytes, 0);
+}

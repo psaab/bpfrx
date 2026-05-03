@@ -1176,3 +1176,58 @@ fn restore_cos_prepared_items_marks_queue_runnable_after_retry() {
     assert!(queue.runnable);
     assert!(!queue.parked);
 }
+
+#[test]
+fn estimate_cos_queue_wakeup_tick_root_rate_zero_returns_some() {
+    // #916: transparent root. When `root_rate_bytes == 0` and
+    // queue_rate is non-zero, the root-refill question is
+    // meaningless (transparent semantics: bucket always full).
+    // Pre-fix: cos_refill_ns_until(_, _, 0) → None propagated by
+    // `?` → the caller skips parking AND the queue stays in
+    // limbo. Post-fix: bypass the root-refill check.
+    let wake_tick = estimate_cos_queue_wakeup_tick(
+        0, 0, // root: zero tokens, zero rate (transparent)
+        0, 1_000_000, // queue: zero tokens, 1 Mbps rate
+        1500,
+        0,
+        true,
+    );
+    assert!(
+        wake_tick.is_some(),
+        "transparent root + queue with rate must produce a wake tick (Some)",
+    );
+}
+
+#[test]
+fn estimate_cos_queue_wakeup_tick_both_rates_zero_returns_some() {
+    // #916: transparent root + transparent queue. Both refill
+    // checks must be bypassed; estimator returns the next-tick
+    // wake-tick (1ns past now ≈ next-tick).
+    let wake_tick = estimate_cos_queue_wakeup_tick(
+        0, 0, // root: transparent
+        0, 0, // queue: transparent
+        1500,
+        0,
+        true,
+    );
+    assert!(
+        wake_tick.is_some(),
+        "fully transparent (root + queue both rate=0) must produce a wake tick (Some)",
+    );
+}
+
+#[test]
+fn estimate_cos_queue_wakeup_tick_root_rate_zero_with_require_queue_false() {
+    // #916: surplus path (require_queue_tokens = false). With
+    // transparent root, the root-refill check is bypassed; the
+    // queue-refill check is skipped because require=false. Result
+    // should be Some(_).
+    let wake_tick = estimate_cos_queue_wakeup_tick(
+        0, 0, // root: transparent
+        0, 0, // queue: irrelevant when require=false
+        1500,
+        0,
+        false,
+    );
+    assert!(wake_tick.is_some());
+}

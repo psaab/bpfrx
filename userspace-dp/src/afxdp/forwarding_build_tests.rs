@@ -535,3 +535,162 @@ fn egress_with_unknown_zone_name_collapses_to_zone_id_zero() {
     let eg = state.egress.get(&56).expect("egress");
     assert_eq!(eg.zone_id, 0);
 }
+
+// ---------------------------------------------------------------------
+// #916: zero-shaping-rate (transparent root) tests.
+// ---------------------------------------------------------------------
+
+#[test]
+fn build_cos_state_includes_zero_shaping_rate_interface() {
+    // Pre-#916, an interface with `cos_shaping_rate_bytes_per_sec == 0`
+    // was silently dropped by `build_cos_state`'s upstream skip,
+    // which masked the runtime deadlock by suppressing the entire
+    // CoS runtime. The bug surface for the operator was "CoS
+    // classifier doesn't apply on this interface". The fix permits
+    // the interface through; the runtime handles transparent-root
+    // semantics.
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 42,
+            cos_shaping_rate_bytes_per_sec: 0, // <- the case under test
+            cos_shaping_burst_bytes: 0,
+            cos_scheduler_map: "wan-map".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            }],
+            schedulers: vec![],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    scheduler: String::new(),
+                }],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+    let state = build_cos_state(&snapshot);
+    assert!(
+        state.interfaces.contains_key(&42),
+        "zero-shaping-rate interface must be included in CoSState (transparent root)"
+    );
+    let iface = &state.interfaces[&42];
+    assert_eq!(iface.shaping_rate_bytes, 0);
+    // burst_bytes falls back to default_cos_burst_bytes(0) which floors
+    // at COS_MIN_BURST_BYTES (96 KB).
+    assert!(iface.burst_bytes >= 64 * 1500);
+}
+
+#[test]
+fn build_cos_state_zero_shaping_rate_queue_inherits_transparent() {
+    // When the scheduler has no transmit-rate AND the interface has
+    // no shaping-rate, the queue's effective rate falls through to
+    // 0. Verify the queue config carries `transmit_rate_bytes == 0`
+    // (the runtime build path will pre-fill tokens to the buffer cap
+    // and the queue-service will bypass the cos_refill_ns_until check).
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 42,
+            cos_shaping_rate_bytes_per_sec: 0,
+            cos_scheduler_map: "wan-map".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "iperf-a".into(),
+                queue: 4,
+            }],
+            schedulers: vec![CoSSchedulerSnapshot {
+                name: "no-rate".into(),
+                transmit_rate_bytes: 0, // <- fallback chains to 0
+                transmit_rate_exact: false,
+                priority: "low".into(),
+                buffer_size_bytes: 0,
+            }],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "iperf-a".into(),
+                    scheduler: "no-rate".into(),
+                }],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+    let state = build_cos_state(&snapshot);
+    let iface = state.interfaces.get(&42).expect("transparent iface present");
+    let queue = iface
+        .queues
+        .iter()
+        .find(|q| q.queue_id == 4)
+        .expect("iperf-a queue present");
+    assert_eq!(
+        queue.transmit_rate_bytes, 0,
+        "transparent root + no scheduler rate → transparent queue (rate 0)"
+    );
+}
+
+#[test]
+fn build_cos_state_mixed_zero_and_nonzero_shaping_rate() {
+    // Two interfaces in the same snapshot — one with shaping-rate
+    // configured, one without. Both must produce CoSState entries
+    // with the correct semantics.
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                ifindex: 42,
+                cos_shaping_rate_bytes_per_sec: 25_000_000_000 / 8,
+                cos_scheduler_map: "wan-map".into(),
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                ifindex: 43,
+                cos_shaping_rate_bytes_per_sec: 0,
+                cos_scheduler_map: "wan-map".into(),
+                ..Default::default()
+            },
+        ],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            }],
+            schedulers: vec![],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    scheduler: String::new(),
+                }],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+    let state = build_cos_state(&snapshot);
+    let shaped = state
+        .interfaces
+        .get(&42)
+        .expect("shaped iface in CoSState");
+    let transparent = state
+        .interfaces
+        .get(&43)
+        .expect("transparent iface in CoSState");
+    assert_eq!(shaped.shaping_rate_bytes, 25_000_000_000 / 8);
+    assert_eq!(transparent.shaping_rate_bytes, 0);
+    // Both must have at least one queue.
+    assert!(!shaped.queues.is_empty());
+    assert!(!transparent.queues.is_empty());
+}

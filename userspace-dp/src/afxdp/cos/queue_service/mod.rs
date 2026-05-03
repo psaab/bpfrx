@@ -1055,9 +1055,26 @@ pub(in crate::afxdp) fn estimate_cos_queue_wakeup_tick(
     now_ns: u64,
     require_queue_tokens: bool,
 ) -> Option<u64> {
-    let root_refill_ns = cos_refill_ns_until(root_tokens, need_bytes, root_rate_bytes)?;
+    // #916: transparent root or transparent queue. When the
+    // corresponding rate is 0 the bucket is always-full (see the
+    // top-up fast path in `maybe_top_up_cos_root_lease` /
+    // `maybe_top_up_cos_queue_lease`), so the wakeup-on-refill
+    // question is meaningless. Treat the refill as 0 ns —
+    // immediately runnable. Without these bypasses,
+    // `cos_refill_ns_until(_, _, 0)` would return None and the
+    // caller would skip parking, leaving the queue in a limbo
+    // where it never wakes AND never drains.
+    let root_refill_ns = if root_rate_bytes == 0 {
+        0
+    } else {
+        cos_refill_ns_until(root_tokens, need_bytes, root_rate_bytes)?
+    };
     let queue_refill_ns = if require_queue_tokens {
-        cos_refill_ns_until(queue_tokens, need_bytes, queue_rate_bytes)?
+        if queue_rate_bytes == 0 {
+            0
+        } else {
+            cos_refill_ns_until(queue_tokens, need_bytes, queue_rate_bytes)?
+        }
     } else {
         0
     };

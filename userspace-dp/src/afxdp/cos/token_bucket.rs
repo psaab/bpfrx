@@ -30,6 +30,19 @@ pub(in crate::afxdp) fn maybe_top_up_cos_root_lease(
     shared_root_lease: &SharedCoSRootLease,
     now_ns: u64,
 ) {
+    // #916: transparent root. When the interface has no
+    // `shaping-rate` configured (Junos default = "no shaping at the
+    // interface level"), `shaping_rate_bytes == 0`. Refilling from
+    // a zero-rate shared lease is a no-op (the shared lease never
+    // accrues tokens), which combined with the rate=0 short-circuit
+    // in `cos_refill_ns_until` would leave the queue unable to park
+    // OR drain. Fast-path-fill the bucket to its burst cap and
+    // skip the lease acquire — the per-queue token buckets continue
+    // to gate per-queue rates as configured.
+    if root.shaping_rate_bytes == 0 {
+        root.tokens = root.burst_bytes.max(COS_MIN_BURST_BYTES);
+        return;
+    }
     // Ensure the target is at least tx_frame_capacity() so that a maximum-sized frame
     // can always become eligible.  shared_root_lease already sizes max_total_leased using
     // lease_bytes.max(tx_frame_capacity()), so the shared pool can always satisfy this.
@@ -53,6 +66,19 @@ pub(in crate::afxdp) fn maybe_top_up_cos_queue_lease(
     shared_queue_lease: Option<&Arc<SharedCoSQueueLease>>,
     now_ns: u64,
 ) {
+    // #916: transparent queue. When `transmit_rate_bytes == 0`
+    // (scheduler had no `transmit-rate` configured AND the parent
+    // root has no `shaping-rate`, see the fallback in
+    // `forwarding_build.rs`), the per-queue token bucket cannot
+    // refill from any rate. Mirror the transparent-root fast path:
+    // fill the bucket to its buffer cap and return. Per-queue
+    // exact caps with a non-zero scheduler rate are unaffected
+    // (queue.transmit_rate_bytes > 0 in that case).
+    if queue.transmit_rate_bytes == 0 {
+        queue.tokens = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
+        queue.last_refill_ns = now_ns;
+        return;
+    }
     if queue.exact {
         let Some(shared_queue_lease) = shared_queue_lease else {
             return;
@@ -125,6 +151,24 @@ pub(in crate::afxdp) fn refill_cos_tokens(
     *last_refill_ns = now_ns;
 }
 
+/// Time-until-refill helper. Returns `Some(ns)` for the wait-time
+/// estimate, or `None` when `tokens < need` AND `rate == 0`
+/// (i.e., "the question is unanswerable — there's no rate to
+/// refill at").
+///
+/// **Caller contract for transparent root/queue (#916)**: when
+/// `rate_bytes_per_sec == 0`, the bucket is meant to be
+/// permanently full (transparent semantic; see
+/// `maybe_top_up_cos_root_lease` and `maybe_top_up_cos_queue_lease`
+/// fast paths). Callers MUST NOT propagate the `None` return
+/// through the `?` operator without first short-circuiting the
+/// rate=0 case at the call site (otherwise the queue is never
+/// parked AND never served — see `estimate_cos_queue_wakeup_tick`
+/// for the canonical handling pattern). The helper preserves the
+/// `None` return as a defensive sentinel rather than silently
+/// returning `Some(0)` because a zero return would mask
+/// "tokens=0, rate=0" as runnable, leading to a busy-loop on the
+/// caller side.
 pub(in crate::afxdp) fn cos_refill_ns_until(tokens: u64, need: u64, rate_bytes_per_sec: u64) -> Option<u64> {
     if tokens >= need {
         return Some(0);
