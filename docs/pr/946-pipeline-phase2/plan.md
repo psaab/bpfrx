@@ -1,6 +1,109 @@
 # #946 Phase 2 — Batched per-stage iteration over the RX burst
 
-Status: **DRAFT v1 — pending adversarial plan review (Codex + Gemini)**
+Status: **KILLED v1 — Codex + Gemini both PLAN-KILL on round 1.**
+
+## Why this plan was killed
+
+Both Codex (task-moqfellt-385s0f) and Gemini (task-moqffrq8-0hdpe7)
+independently returned **PLAN-KILL** verdicts on round 1. Both
+reviewers identified the same fundamental defect: the
+"harness-building for Phase 3" justification fails because
+**Phase 3 is not batchable as a per-stage reorder**.
+
+### Phase 3 unbatchability — concrete evidence
+
+Stages 12-16 (the heavy stages where the L1-i benefit would
+actually live) each carry immediate cross-packet state
+dependencies:
+
+- **Flow-cache lookup** (`afxdp/flow_cache.rs:384`,
+  `flow_cache.rs:409`, `flow_cache.rs:436`) mutates LRU
+  counters and can evict entries on each call. Slow-path
+  miss inserts new entries at `poll_descriptor.rs:1787`.
+  Packet N's lookup can evict an entry that packet N+1's
+  lookup would have hit.
+- **Session resolution** — `resolve_flow_session_decision`
+  takes `&mut SessionTable` (`session_glue/mod.rs:954`)
+  and may materialize/promote/install sessions
+  (`session_glue/mod.rs:1015,1056,1084`). Packet N's session
+  install is visible to packet N+1's lookup; reordering
+  breaks the install-before-lookup invariant.
+- **MissingNeighbor side queue** — explicitly order-coupled
+  (`poll_descriptor.rs:1903,1981,2038`): probe, install seed
+  session, publish maps, push to pending_neigh. Reordering
+  these steps even within a single packet is unsafe; across
+  packets it's much worse.
+
+Conclusion: stages 12-16 cannot be transformed from
+per-packet to per-stage iteration without losing semantics.
+Phase 2's "harness for Phase 3" therefore has no successor —
+the harness builds toward a Phase 3 that doesn't exist.
+
+### Phase 2 also has direct defects
+
+Even if Phase 3 were achievable, the Phase 2 plan has its own
+defects identified by Codex:
+
+- **Loop 5 borrow-checker conflict** — the sketch holds
+  `let active = pkt.active_slice()` while calling
+  `stage_classify_fabric_ingress(active, &mut pkt.meta, ...)`.
+  `pkt.meta` is reborrowed mutably while a slice borrowed
+  from `pkt` is still live. Fixable but the v1 sketch is
+  wrong.
+- **Observable reorder of IPsec reinject vs slow-path** —
+  in Phase 1, an earlier packet's stage-12+ slow-path can
+  enqueue to TX before a later packet's stage-11 IPsec
+  reinject. In Phase 2 (per-stage), all stage-11 IPsec
+  reinjections fire before Loop 8 starts. This is a real
+  behavioral change in the wire-side ordering of TX events.
+
+### Why this is the right outcome
+
+The plan v1 explicitly invited PLAN-KILL: *"If Codex / Gemini
+round-1 review concludes the harness-building value is
+insufficient to justify the churn, the right move is to
+**stop and reframe** — don't ship Phase 2 just because it's
+'next.'"* Both reviewers exercised that escape hatch.
+
+This matches the project's documented `feedback_difficult_path_pragmatism`
+rule: "for `Refactor: <Pattern>` issues proposing large
+rearchitectures, stop and report rather than ship a wrong-target
+PR." #946 batched-pipeline batched-iteration falls in this class.
+
+### Recommendation for #946 itself
+
+The full VPP / `rte_graph` rearchitecture proposed by #946 would
+require **rebuilding the dataplane around immutable-state
+snapshots taken at burst boundaries** (so each per-stage iteration
+can read consistent state without write-after-read hazards). That
+is not a Phase-2 increment of the existing pipeline — it's a
+fundamental redesign of session lookup, NAT slot allocation, FIB
+caching, and the MissingNeighbor side queue.
+
+Phase 1 (PR #1179) shipped because pure code motion has no
+architectural premise to fail. The next achievable increment for
+this code area is probably one of:
+
+- **Smaller, targeted hot-path optimizations** within the
+  existing per-packet structure (e.g., #779 `enqueue_pending_forwards`
+  Arc<SessionKey> vs clone, #777 RX hot-path inlining).
+- **Phase 1.5** — extract the stages 12-16 inline blocks into
+  named helpers within the per-packet body (mirrors Phase 1's
+  scope for the slow path; pure code motion).
+
+Phase 2 batched iteration is **not** on that achievable path.
+
+## Codex round-1 verbatim (task-moqfellt-385s0f)
+
+[See task result for full text — key conclusions reproduced above.]
+
+## Gemini round-1 verbatim (task-moqffrq8-0hdpe7)
+
+[See task result for full text — key conclusions reproduced above.]
+
+---
+
+# Original plan v1 follows for the historical record
 
 ## Issue framing
 
