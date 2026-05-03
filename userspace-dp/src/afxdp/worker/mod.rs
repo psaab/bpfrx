@@ -44,6 +44,12 @@ pub(crate) use tx_pipeline::WorkerTxPipeline;
 mod bind_meta;
 pub(crate) use bind_meta::WorkerBindMeta;
 
+// #959 Phase 9: per-binding flow-cache state lives in
+// worker/flow_cache_state.rs (the `flow_cache` name is taken by
+// the `FlowCache` data structure in src/flow_cache.rs).
+mod flow_cache_state;
+pub(crate) use flow_cache_state::WorkerFlowCacheState;
+
 // #957 P1: worker-side CoS runtime helpers split out into a sibling
 // submodule. Note this module is `worker::cos`, separate from the
 // `afxdp::cos` directory module imported below as `super::cos`.
@@ -117,8 +123,10 @@ pub(crate) struct BindingWorker {
     /// into `WorkerTxCounters`. Field semantics unchanged; access
     /// via `binding.tx_counters.pending_X`.
     pub(crate) tx_counters: WorkerTxCounters,
-    pub(crate) flow_cache: FlowCache,
-    pub(crate) flow_cache_session_touch: u64,
+    /// #959 Phase 9: 2 flow-cache state fields extracted into
+    /// `WorkerFlowCacheState`. Field semantics unchanged; access
+    /// via `binding.flow.flow_cache` and `binding.flow.flow_cache_session_touch`.
+    pub(crate) flow: WorkerFlowCacheState,
     /// #959 Phase 8: 3 binding registration / identity fields
     /// (bind_time_ns, bind_mode, xsk_rx_confirmed) extracted into
     /// `WorkerBindMeta`. Field semantics unchanged; access via
@@ -397,8 +405,10 @@ impl BindingWorker {
                 pending_direct_tx_build_fallback_packets: 0,
                 pending_direct_tx_disallowed_fallback_packets: 0,
             },
-            flow_cache: FlowCache::new(),
-            flow_cache_session_touch: 0,
+            flow: WorkerFlowCacheState {
+                flow_cache: FlowCache::new(),
+                flow_cache_session_touch: 0,
+            },
             bind_meta: WorkerBindMeta {
                 bind_time_ns: {
                     let mut ts = libc::timespec {

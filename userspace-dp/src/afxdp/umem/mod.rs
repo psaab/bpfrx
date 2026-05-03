@@ -1038,37 +1038,37 @@ pub(super) fn update_binding_debug_state(binding: &mut BindingWorker) {
             );
         binding.tx_counters.pending_direct_tx_disallowed_fallback_packets = 0;
     }
-    if binding.flow_cache.hits != 0 {
+    if binding.flow.flow_cache.hits != 0 {
         binding
             .live
             .flow_cache_hits
-            .fetch_add(binding.flow_cache.hits, Ordering::Relaxed);
-        binding.flow_cache.hits = 0;
+            .fetch_add(binding.flow.flow_cache.hits, Ordering::Relaxed);
+        binding.flow.flow_cache.hits = 0;
     }
-    if binding.flow_cache.misses != 0 {
+    if binding.flow.flow_cache.misses != 0 {
         binding
             .live
             .flow_cache_misses
-            .fetch_add(binding.flow_cache.misses, Ordering::Relaxed);
-        binding.flow_cache.misses = 0;
+            .fetch_add(binding.flow.flow_cache.misses, Ordering::Relaxed);
+        binding.flow.flow_cache.misses = 0;
     }
-    if binding.flow_cache.evictions != 0 {
+    if binding.flow.flow_cache.evictions != 0 {
         binding
             .live
             .flow_cache_evictions
-            .fetch_add(binding.flow_cache.evictions, Ordering::Relaxed);
-        binding.flow_cache.evictions = 0;
+            .fetch_add(binding.flow.flow_cache.evictions, Ordering::Relaxed);
+        binding.flow.flow_cache.evictions = 0;
     }
     // #918: surface collision-driven evictions distinctly from
     // stale-on-lookup evictions so the post-merge acceptance gate
     // (`collision_evictions / hits < 1 %` under 100E100M load) is
     // observable from the standard binding-counter snapshot.
-    if binding.flow_cache.collision_evictions != 0 {
+    if binding.flow.flow_cache.collision_evictions != 0 {
         binding
             .live
             .flow_cache_collision_evictions
-            .fetch_add(binding.flow_cache.collision_evictions, Ordering::Relaxed);
-        binding.flow_cache.collision_evictions = 0;
+            .fetch_add(binding.flow.flow_cache.collision_evictions, Ordering::Relaxed);
+        binding.flow.flow_cache.collision_evictions = 0;
     }
     // #941 Work item D + #943: flush each queue's per-queue scratch
     // counters (hard-cap overrides AND regular V_min throttles) into
