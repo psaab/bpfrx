@@ -444,7 +444,7 @@ pub(super) fn poll_binding_process_descriptor(
                     let mut decision = if let Some(flow) = flow.as_ref() {
                         if let Some(resolved) = resolve_flow_session_decision(
                             sessions,
-                            binding.session_map_fd,
+                            binding.bpf_maps.session_map_fd,
                             worker_ctx.shared_sessions,
                             worker_ctx.shared_nat_sessions,
                             worker_ctx.shared_forward_wire_sessions,
@@ -594,7 +594,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         meta.tcp_flags,
                                     ) {
                                         let _ = publish_live_session_entry(
-                                            binding.session_map_fd,
+                                            binding.bpf_maps.session_map_fd,
                                             &flow.forward_key,
                                             NatDecision::default(),
                                             true,
@@ -824,7 +824,7 @@ pub(super) fn poll_binding_process_descriptor(
                                             flow.forward_key.src_port,
                                             flow.forward_key.dst_ip,
                                             flow.forward_key.dst_port,
-                                            count_bpf_session_entries(binding.session_map_fd),
+                                            count_bpf_session_entries(binding.bpf_maps.session_map_fd),
                                             sessions.len(),
                                         );
                                         // Dump all local sessions to compare
@@ -895,7 +895,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 };
                                 if install_helper_local_session_on_miss(
                                     sessions,
-                                    binding.session_map_fd,
+                                    binding.bpf_maps.session_map_fd,
                                     worker_ctx.shared_sessions,
                                     worker_ctx.shared_nat_sessions,
                                     worker_ctx.shared_forward_wire_sessions,
@@ -1228,7 +1228,7 @@ pub(super) fn poll_binding_process_descriptor(
                                                 tcp_flags: meta.tcp_flags,
                                             };
                                             let _ = publish_live_session_entry(
-                                                binding.session_map_fd,
+                                                binding.bpf_maps.session_map_fd,
                                                 &flow.forward_key,
                                                 decision.nat,
                                                 false,
@@ -1348,13 +1348,13 @@ pub(super) fn poll_binding_process_descriptor(
                                             )
                                         {
                                             let _ = publish_live_session_key(
-                                                binding.session_map_fd,
+                                                binding.bpf_maps.session_map_fd,
                                                 &reverse_key,
                                             );
                                             // Verify session keys and log creations (debug-only: BPF syscalls)
                                             if cfg!(feature = "debug-log") {
                                                 if verify_session_key_in_bpf(
-                                                    binding.session_map_fd,
+                                                    binding.bpf_maps.session_map_fd,
                                                     &reverse_key,
                                                 ) {
                                                     SESSION_PUBLISH_VERIFY_OK
@@ -1371,11 +1371,11 @@ pub(super) fn poll_binding_process_descriptor(
                                                         reverse_key.src_port,
                                                         reverse_key.dst_ip,
                                                         reverse_key.dst_port,
-                                                        binding.session_map_fd,
+                                                        binding.bpf_maps.session_map_fd,
                                                     );
                                                 }
                                                 if !verify_session_key_in_bpf(
-                                                    binding.session_map_fd,
+                                                    binding.bpf_maps.session_map_fd,
                                                     &flow.forward_key,
                                                 ) {
                                                     debug_log!(
@@ -1412,13 +1412,13 @@ pub(super) fn poll_binding_process_descriptor(
                                                         reverse_key.dst_port,
                                                         decision.nat.rewrite_src,
                                                         decision.nat.rewrite_dst,
-                                                        binding.session_map_fd,
+                                                        binding.bpf_maps.session_map_fd,
                                                         count_bpf_session_entries(
-                                                            binding.session_map_fd
+                                                            binding.bpf_maps.session_map_fd
                                                         ),
                                                     );
                                                     dump_bpf_session_entries(
-                                                        binding.session_map_fd,
+                                                        binding.bpf_maps.session_map_fd,
                                                         20,
                                                     );
                                                 }
@@ -2089,7 +2089,7 @@ pub(super) fn poll_binding_process_descriptor(
                                             &entry,
                                         );
                                         let _ = publish_session_map_entry_for_session(
-                                            binding.session_map_fd,
+                                            binding.bpf_maps.session_map_fd,
                                             &flow.forward_key,
                                             pending_decision,
                                             &entry.metadata,
