@@ -65,7 +65,7 @@ pub(crate) struct BindingWorker {
     pub(crate) pending_fill_frames: VecDeque<u64>,
     /// #959 Phase 2: 11 `scratch_*` reusable buffers extracted into
     /// `WorkerScratch`. Field semantics unchanged; access via
-    /// `binding.scratch.scratch.scratch_X`.
+    /// `binding.scratch.scratch_X`.
     pub(crate) scratch: WorkerScratch,
     /// #812: per-UMEM-frame submit timestamp sidecar. Indexed by
     /// `offset >> UMEM_FRAME_SHIFT`. Pre-allocated once at binding

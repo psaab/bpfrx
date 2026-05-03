@@ -7,10 +7,12 @@
 //! each cycle and pushed-to as the descriptor loop produces work for
 //! the TX submit / fill / recycle / cross-binding handoff stages.
 //!
-//! Pure structural extraction: no semantic change, no allocation
-//! change, no field reordering. Field names preserved so the
+//! Pure structural extraction: capacities and access semantics
+//! unchanged from master pre-Phase-2. Field names preserved so the
 //! `binding.scratch.scratch_X` access pattern keeps the same
 //! grep-friendly suffix as the original `binding.scratch_X`.
+//! (Rust's default `repr(Rust)` does not guarantee layout, so this
+//! says nothing about field ordering or struct size.)
 
 use super::*;
 
@@ -31,8 +33,11 @@ pub(crate) struct WorkerScratch {
     pub(crate) scratch_exact_local_tx: Vec<ExactLocalScratchTxRequest>,
     pub(crate) scratch_completed_offsets: Vec<u64>,
     pub(crate) scratch_post_recycles: Vec<(u32, u64)>,
-    /// Reserved for the cross-binding fast-path (see commentary in
-    /// `BindingWorker`'s original field).
+    /// Flow cache fast-path: cross-binding in-place rewrites
+    /// deferred until after the RX batch (the borrow checker
+    /// prevents mutable access to two bindings simultaneously
+    /// inside the RX loop). Reserved for the cross-binding
+    /// fast-path; not yet wired (hence `#[allow(dead_code)]`).
     #[allow(dead_code)]
     pub(crate) scratch_cross_binding_tx: Vec<(usize, PreparedTxRequest)>,
     pub(crate) scratch_rst_teardowns: Vec<(SessionKey, NatDecision)>,
