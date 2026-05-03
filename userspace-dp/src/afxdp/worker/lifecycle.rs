@@ -151,7 +151,7 @@ pub(super) fn poll_binding(
             update_binding_debug_state(binding);
             return did_work;
         }
-        binding.empty_rx_polls = 0;
+        binding.timers.empty_rx_polls = 0;
         if ident.is_none() {
             ident = Some(binding.identity());
         }

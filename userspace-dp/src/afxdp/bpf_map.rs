@@ -138,7 +138,7 @@ pub(super) fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
     // The fill ring is primed before bind, so the driver's initial NAPI
     // posts WQEs immediately. All queues should be ready to receive.
     // No xsk_rx_confirmed gating needed.
-    let age_ns = now_ns.saturating_sub(binding.last_heartbeat_update_ns);
+    let age_ns = now_ns.saturating_sub(binding.timers.last_heartbeat_update_ns);
     if age_ns < HEARTBEAT_UPDATE_INTERVAL_NS {
         return;
     }
@@ -178,7 +178,7 @@ pub(super) fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
                     }
                 });
             }
-            binding.last_heartbeat_update_ns = now_ns;
+            binding.timers.last_heartbeat_update_ns = now_ns;
         }
         Err(err) => {
             eprintln!(

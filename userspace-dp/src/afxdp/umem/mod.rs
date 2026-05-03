@@ -989,8 +989,8 @@ impl BindingLiveState {
 pub(super) fn update_binding_debug_state(binding: &mut BindingWorker) {
     // Use a simple modular counter to avoid 7 atomic stores on every call.
     // At ~1M calls/sec, checking every 65536 calls ~= every 65ms.
-    binding.debug_state_counter = binding.debug_state_counter.wrapping_add(1);
-    if binding.debug_state_counter & 0xFFFF != 0 {
+    binding.timers.debug_state_counter = binding.timers.debug_state_counter.wrapping_add(1);
+    if binding.timers.debug_state_counter & 0xFFFF != 0 {
         return;
     }
     if binding.tx_counters.pending_direct_tx_packets != 0 {
