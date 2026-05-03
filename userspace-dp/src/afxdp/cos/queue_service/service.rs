@@ -143,7 +143,7 @@ pub(super) fn service_exact_local_queue_direct(
         return false;
     }
     binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
-    binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
+    binding.tx_pipeline.outstanding_tx = binding.tx_pipeline.outstanding_tx.saturating_add(inserted);
 
     let (sent_packets, sent_bytes) = settle_exact_local_fifo_submission(
         binding
@@ -292,7 +292,7 @@ fn service_exact_local_queue_direct_flow_fair(
         return false;
     }
     binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
-    binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
+    binding.tx_pipeline.outstanding_tx = binding.tx_pipeline.outstanding_tx.saturating_add(inserted);
 
     let (sent_packets, sent_bytes) = settle_exact_local_scratch_submission_flow_fair(
         binding
@@ -450,7 +450,7 @@ pub(super) fn service_exact_prepared_queue_direct(
         return false;
     }
     binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
-    binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
+    binding.tx_pipeline.outstanding_tx = binding.tx_pipeline.outstanding_tx.saturating_add(inserted);
 
     let (sent_packets, sent_bytes) = settle_exact_prepared_fifo_submission(
         binding
@@ -602,7 +602,7 @@ fn service_exact_prepared_queue_direct_flow_fair(
         return false;
     }
     binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
-    binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
+    binding.tx_pipeline.outstanding_tx = binding.tx_pipeline.outstanding_tx.saturating_add(inserted);
 
     let (sent_packets, sent_bytes) = settle_exact_prepared_scratch_submission_flow_fair(
         binding

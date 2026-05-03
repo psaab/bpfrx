@@ -552,7 +552,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                     // it falls through to the copy path below.
                     let mut direct_tx_offset = target_binding.tx_pipeline.free_tx_frames.pop_front();
                     if direct_tx_offset.is_none()
-                        && (target_binding.outstanding_tx > 0
+                        && (target_binding.tx_pipeline.outstanding_tx > 0
                             || !target_binding.tx_pipeline.pending_tx_prepared.is_empty()
                             || !target_binding.tx_pipeline.pending_tx_local.is_empty())
                     {
@@ -1282,7 +1282,7 @@ fn segment_forwarded_tcp_frames_into_prepared(
 
     let segment_count = data.len().div_ceil(segment_payload_max);
     if target_binding.tx_pipeline.free_tx_frames.len() < segment_count
-        && (target_binding.outstanding_tx > 0
+        && (target_binding.tx_pipeline.outstanding_tx > 0
             || !target_binding.tx_pipeline.pending_tx_prepared.is_empty()
             || !target_binding.tx_pipeline.pending_tx_local.is_empty())
     {
