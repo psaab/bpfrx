@@ -29,10 +29,10 @@ pub(in crate::afxdp) fn reap_tx_completions(
         return 0;
     }
     let mut reaped = 0u32;
-    binding.scratch_completed_offsets.clear();
+    binding.scratch.scratch_completed_offsets.clear();
     let mut completed = binding.device.complete(available);
     while let Some(offset) = completed.read() {
-        binding.scratch_completed_offsets.push(offset);
+        binding.scratch.scratch_completed_offsets.push(offset);
         reaped += 1;
     }
     completed.release();
@@ -50,12 +50,12 @@ pub(in crate::afxdp) fn reap_tx_completions(
     // pins under `#[cfg(test)]` below.
     record_tx_completions_with_stamp(
         &mut binding.tx_submit_ns,
-        &binding.scratch_completed_offsets,
+        &binding.scratch.scratch_completed_offsets,
         ts_completion,
         &binding.live.owner_profile_owner,
     );
-    for i in 0..binding.scratch_completed_offsets.len() {
-        let offset = binding.scratch_completed_offsets[i];
+    for i in 0..binding.scratch.scratch_completed_offsets.len() {
+        let offset = binding.scratch.scratch_completed_offsets[i];
         recycle_completed_tx_offset(binding, shared_recycles, offset);
     }
     binding.outstanding_tx = binding.outstanding_tx.saturating_sub(reaped);
@@ -73,8 +73,8 @@ pub(in crate::afxdp) fn drain_pending_fill(binding: &mut BindingWorker, now_ns: 
         return false;
     }
     let batch_size = binding.pending_fill_frames.len().min(FILL_BATCH_SIZE);
-    binding.scratch_fill.clear();
-    while binding.scratch_fill.len() < batch_size {
+    binding.scratch.scratch_fill.clear();
+    while binding.scratch.scratch_fill.len() < batch_size {
         let Some(offset) = binding.pending_fill_frames.pop_front() else {
             break;
         };
@@ -89,32 +89,32 @@ pub(in crate::afxdp) fn drain_pending_fill(binding: &mut BindingWorker, now_ns: 
                 frame.copy_from_slice(&0xDEAD_BEEF_DEAD_BEEFu64.to_ne_bytes());
             }
         }
-        binding.scratch_fill.push(offset);
+        binding.scratch.scratch_fill.push(offset);
     }
-    if binding.scratch_fill.is_empty() {
+    if binding.scratch.scratch_fill.is_empty() {
         return false;
     }
     let inserted = {
-        let mut fill = binding.device.fill(binding.scratch_fill.len() as u32);
-        let inserted = fill.insert(binding.scratch_fill.iter().copied());
+        let mut fill = binding.device.fill(binding.scratch.scratch_fill.len() as u32);
+        let inserted = fill.insert(binding.scratch.scratch_fill.iter().copied());
         fill.commit();
         inserted
     };
     if inserted == 0 {
-        binding.telemetry.dbg_fill_failed += binding.scratch_fill.len() as u64;
-        for offset in binding.scratch_fill.drain(..).rev() {
+        binding.telemetry.dbg_fill_failed += binding.scratch.scratch_fill.len() as u64;
+        for offset in binding.scratch.scratch_fill.drain(..).rev() {
             binding.pending_fill_frames.push_front(offset);
         }
         return false;
     }
     binding.telemetry.dbg_fill_submitted += inserted as u64;
-    if inserted < binding.scratch_fill.len() as u32 {
-        binding.telemetry.dbg_fill_failed += (binding.scratch_fill.len() as u32 - inserted) as u64;
-        for offset in binding.scratch_fill.drain(inserted as usize..).rev() {
+    if inserted < binding.scratch.scratch_fill.len() as u32 {
+        binding.telemetry.dbg_fill_failed += (binding.scratch.scratch_fill.len() as u32 - inserted) as u64;
+        for offset in binding.scratch.scratch_fill.drain(inserted as usize..).rev() {
             binding.pending_fill_frames.push_front(offset);
         }
     }
-    binding.scratch_fill.clear();
+    binding.scratch.scratch_fill.clear();
     // Only wake NAPI when the kernel signals it needs fill ring entries,
     // or as a safety net every FILL_WAKE_SAFETY_INTERVAL_NS to prevent
     // lost-wakeup stalls from the race between commit() and needs_wakeup.
