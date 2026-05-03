@@ -217,7 +217,7 @@ pub(in crate::afxdp) fn transmit_batch(
         return Err(TxError::Retry("tx ring insert failed".to_string()));
     }
     binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
-    binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
+    binding.tx_pipeline.outstanding_tx = binding.tx_pipeline.outstanding_tx.saturating_add(inserted);
 
     let mut sent_packets = 0u64;
     let mut sent_bytes = 0u64;
@@ -449,7 +449,7 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
         return Err(TxError::Retry("prepared tx ring insert failed".to_string()));
     }
     binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
-    binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
+    binding.tx_pipeline.outstanding_tx = binding.tx_pipeline.outstanding_tx.saturating_add(inserted);
 
     let mut sent_packets = 0u64;
     let mut sent_bytes = 0u64;

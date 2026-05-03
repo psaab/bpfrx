@@ -109,11 +109,8 @@ pub(crate) struct BindingWorker {
     pub(crate) bpf_maps: WorkerBpfMaps,
     /// #959 Phase 6: 5 timing / wake-pacing fields extracted into
     /// `WorkerTimers`. Field semantics unchanged; access via
-    /// `binding.timers.last_X_ns` etc. `outstanding_tx` stays at
-    /// the BindingWorker level — it's a TX-pipeline counter
-    /// (sequenced for Phase 7), not a timer.
+    /// `binding.timers.last_X_ns` etc.
     pub(crate) timers: WorkerTimers,
-    pub(crate) outstanding_tx: u32,
     pub(crate) last_learned_neighbor: Option<LearnedNeighborKey>,
     /// #959 Phase 1: 23 `dbg_*` debug counters extracted into
     /// `WorkerTelemetry` to reduce BindingWorker's mutable surface
@@ -340,6 +337,7 @@ impl BindingWorker {
                 pending_tx_prepared: VecDeque::new(),
                 pending_tx_local: VecDeque::new(),
                 max_pending_tx,
+                outstanding_tx: 0,
                 pending_fill_frames: VecDeque::new(),
                 in_flight_prepared_recycles: FastMap::default(),
                 // #812: pre-allocate the submit-timestamp sidecar once,
@@ -394,7 +392,6 @@ impl BindingWorker {
                 last_tx_wake_ns: init_now,
                 empty_rx_polls: 0,
             },
-            outstanding_tx: 0,
             last_learned_neighbor: None,
             telemetry: WorkerTelemetry::default(),
             tx_counters: WorkerTxCounters {
@@ -1093,7 +1090,7 @@ pub(crate) fn worker_loop(
                         + fill_pending
                         + rx_avail
                         + b.tx_pipeline.free_tx_frames.len() as u32
-                        + b.outstanding_tx
+                        + b.tx_pipeline.outstanding_tx
                         + inflight_recycles
                         + scratch_recycle_len
                         + ptx_prepared; // prepared TX holds UMEM frames
@@ -1108,7 +1105,7 @@ pub(crate) fn worker_loop(
                         fill_pending,
                         rx_avail,
                         b.tx_pipeline.free_tx_frames.len(),
-                        b.outstanding_tx,
+                        b.tx_pipeline.outstanding_tx,
                         inflight_recycles,
                         scratch_recycle_len,
                         ptx_prepared,
@@ -1360,7 +1357,7 @@ pub(crate) fn worker_loop(
                                 + fill_p
                                 + rx_a
                                 + sb.tx_pipeline.free_tx_frames.len() as u32
-                                + sb.outstanding_tx
+                                + sb.tx_pipeline.outstanding_tx
                                 + ifl
                                 + sb.scratch.scratch_recycle.len() as u32
                                 + ptxp;
@@ -1374,7 +1371,7 @@ pub(crate) fn worker_loop(
                                 fill_p,
                                 rx_a,
                                 sb.tx_pipeline.free_tx_frames.len(),
-                                sb.outstanding_tx,
+                                sb.tx_pipeline.outstanding_tx,
                                 ifl,
                                 ptxp,
                                 ptxl,
@@ -1501,14 +1498,16 @@ pub(crate) fn worker_loop(
                             .rx_fill_ring_empty_descs
                             .store(stats.rx_fill_ring_empty_descs, Ordering::Relaxed);
                     }
-                    // #802: outstanding_tx is a transient gauge on BindingWorker
-                    // (current in-flight TX). Publish to the existing atomic
-                    // mirror on BindingLiveState so the snapshot reader sees
-                    // a recent value. store() because it's a gauge, not a
-                    // counter.
+                    // #802: outstanding_tx is a transient gauge on
+                    // BindingWorker.tx_pipeline (current in-flight TX).
+                    // Publish to the existing atomic mirror on
+                    // BindingLiveState so the snapshot reader sees a
+                    // recent value. store() because it's a gauge, not a
+                    // counter. (#959 Phase 10 moved the field from
+                    // BindingWorker to WorkerTxPipeline.)
                     b.live
                         .debug_outstanding_tx
-                        .store(b.outstanding_tx, Ordering::Relaxed);
+                        .store(b.tx_pipeline.outstanding_tx, Ordering::Relaxed);
                     // #878: publish UMEM in-flight gauge as a single atomic
                     // so the daemon's `show chassis forwarding` Buffer% can
                     // divide by `umem_total_frames` without torn-load risk.

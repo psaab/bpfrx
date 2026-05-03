@@ -21,7 +21,7 @@ pub(in crate::afxdp) fn reap_tx_completions(
     binding: &mut BindingWorker,
     shared_recycles: &mut Vec<(u32, u64)>,
 ) -> u32 {
-    if binding.outstanding_tx == 0 {
+    if binding.tx_pipeline.outstanding_tx == 0 {
         return 0;
     }
     let available = binding.device.available();
@@ -58,7 +58,7 @@ pub(in crate::afxdp) fn reap_tx_completions(
         let offset = binding.scratch.scratch_completed_offsets[i];
         recycle_completed_tx_offset(binding, shared_recycles, offset);
     }
-    binding.outstanding_tx = binding.outstanding_tx.saturating_sub(reaped);
+    binding.tx_pipeline.outstanding_tx = binding.tx_pipeline.outstanding_tx.saturating_sub(reaped);
     binding.telemetry.dbg_completions_reaped += reaped as u64;
     binding
         .live
@@ -282,7 +282,7 @@ pub(in crate::afxdp) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, 
                         binding.slot,
                         binding.ifindex,
                         binding.queue_id,
-                        binding.outstanding_tx,
+                        binding.tx_pipeline.outstanding_tx,
                         binding.tx_pipeline.free_tx_frames.len(),
                     );
                 }
@@ -295,7 +295,7 @@ pub(in crate::afxdp) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, 
                         binding.ifindex,
                         binding.queue_id,
                         errno,
-                        binding.outstanding_tx,
+                        binding.tx_pipeline.outstanding_tx,
                         binding.tx_pipeline.free_tx_frames.len(),
                     );
                 }

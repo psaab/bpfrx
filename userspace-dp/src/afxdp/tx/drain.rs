@@ -71,7 +71,7 @@ pub(in crate::afxdp) fn drain_pending_tx(
     // In copy mode, the kernel needs sendto() to process TX ring entries.
     // If outstanding entries remain after reaping (kernel didn't finish in
     // the previous kick), re-kick now so they don't stall forever.
-    if binding.outstanding_tx > 0
+    if binding.tx_pipeline.outstanding_tx > 0
         && binding.tx_pipeline.pending_tx_prepared.is_empty()
         && binding.tx_pipeline.pending_tx_local.is_empty()
     {
@@ -454,7 +454,7 @@ fn drop_cos_bound_local_leftovers(
 }
 
 fn binding_has_pending_tx_work(binding: &BindingWorker) -> bool {
-    binding.outstanding_tx > 0
+    binding.tx_pipeline.outstanding_tx > 0
         || !binding.tx_pipeline.pending_tx_prepared.is_empty()
         || !binding.tx_pipeline.pending_tx_local.is_empty()
         || !binding.live.pending_tx_empty()
