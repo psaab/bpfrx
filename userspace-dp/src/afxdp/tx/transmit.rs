@@ -136,7 +136,7 @@ pub(in crate::afxdp) fn transmit_batch(
         // RST detection: log when we're about to transmit a TCP RST
         if cfg!(feature = "debug-log") {
             if frame_has_tcp_rst(&req.bytes) {
-                binding.dbg_tx_tcp_rst += 1;
+                binding.telemetry.dbg_tx_tcp_rst += 1;
                 thread_local! {
                     static TX_RST_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
                 }
@@ -208,7 +208,7 @@ pub(in crate::afxdp) fn transmit_batch(
     );
 
     if inserted == 0 {
-        binding.dbg_tx_ring_full += 1;
+        binding.telemetry.dbg_tx_ring_full += 1;
         maybe_wake_tx(binding, true, now_ns);
         while let Some((offset, req)) = binding.scratch_local_tx.pop() {
             binding.free_tx_frames.push_front(offset);
@@ -216,7 +216,7 @@ pub(in crate::afxdp) fn transmit_batch(
         }
         return Err(TxError::Retry("tx ring insert failed".to_string()));
     }
-    binding.dbg_tx_ring_submitted += inserted as u64;
+    binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
     binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
 
     let mut sent_packets = 0u64;
@@ -377,7 +377,7 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
                 .slice(req.offset as usize, req.len as usize)
             {
                 if frame_has_tcp_rst(frame_data) {
-                    binding.dbg_tx_tcp_rst += 1;
+                    binding.telemetry.dbg_tx_tcp_rst += 1;
                     thread_local! {
                         static PREP_TX_RST_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
                     }
@@ -441,14 +441,14 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
     );
 
     if inserted == 0 {
-        binding.dbg_tx_ring_full += 1;
+        binding.telemetry.dbg_tx_ring_full += 1;
         maybe_wake_tx(binding, true, now_ns);
         while let Some(req) = binding.scratch_prepared_tx.pop() {
             pending.push_front(req);
         }
         return Err(TxError::Retry("prepared tx ring insert failed".to_string()));
     }
-    binding.dbg_tx_ring_submitted += inserted as u64;
+    binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
     binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
 
     let mut sent_packets = 0u64;

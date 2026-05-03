@@ -131,7 +131,7 @@ pub(super) fn service_exact_local_queue_direct(
 
     if inserted == 0 {
         let dropped = binding.scratch_exact_local_tx.len() as u64;
-        binding.dbg_tx_ring_full += 1;
+        binding.telemetry.dbg_tx_ring_full += 1;
         count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
         release_exact_local_scratch_frames(
@@ -142,7 +142,7 @@ pub(super) fn service_exact_local_queue_direct(
         binding.live.set_error("tx ring insert failed".to_string());
         return false;
     }
-    binding.dbg_tx_ring_submitted += inserted as u64;
+    binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
     binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
 
     let (sent_packets, sent_bytes) = settle_exact_local_fifo_submission(
@@ -276,7 +276,7 @@ fn service_exact_local_queue_direct_flow_fair(
 
     if inserted == 0 {
         let dropped = binding.scratch_local_tx.len() as u64;
-        binding.dbg_tx_ring_full += 1;
+        binding.telemetry.dbg_tx_ring_full += 1;
         count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
         restore_exact_local_scratch_to_queue_head_flow_fair(
@@ -291,7 +291,7 @@ fn service_exact_local_queue_direct_flow_fair(
         binding.live.set_error("tx ring insert failed".to_string());
         return false;
     }
-    binding.dbg_tx_ring_submitted += inserted as u64;
+    binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
     binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
 
     let (sent_packets, sent_bytes) = settle_exact_local_scratch_submission_flow_fair(
@@ -405,7 +405,7 @@ pub(super) fn service_exact_prepared_queue_direct(
                 .slice(req.offset as usize, req.len as usize)
             {
                 if frame_has_tcp_rst(frame_data) {
-                    binding.dbg_tx_tcp_rst += 1;
+                    binding.telemetry.dbg_tx_tcp_rst += 1;
                 }
             }
         }
@@ -439,7 +439,7 @@ pub(super) fn service_exact_prepared_queue_direct(
 
     if inserted == 0 {
         let dropped = binding.scratch_exact_prepared_tx.len() as u64;
-        binding.dbg_tx_ring_full += 1;
+        binding.telemetry.dbg_tx_ring_full += 1;
         count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
         release_exact_prepared_scratch(&mut binding.scratch_exact_prepared_tx);
@@ -449,7 +449,7 @@ pub(super) fn service_exact_prepared_queue_direct(
             .set_error("prepared tx ring insert failed".to_string());
         return false;
     }
-    binding.dbg_tx_ring_submitted += inserted as u64;
+    binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
     binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
 
     let (sent_packets, sent_bytes) = settle_exact_prepared_fifo_submission(
@@ -552,7 +552,7 @@ fn service_exact_prepared_queue_direct_flow_fair(
                 .slice(req.offset as usize, req.len as usize)
             {
                 if frame_has_tcp_rst(frame_data) {
-                    binding.dbg_tx_tcp_rst += 1;
+                    binding.telemetry.dbg_tx_tcp_rst += 1;
                 }
             }
         }
@@ -585,7 +585,7 @@ fn service_exact_prepared_queue_direct_flow_fair(
 
     if inserted == 0 {
         let dropped = binding.scratch_prepared_tx.len() as u64;
-        binding.dbg_tx_ring_full += 1;
+        binding.telemetry.dbg_tx_ring_full += 1;
         count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
         restore_exact_prepared_scratch_to_queue_head_flow_fair(
@@ -601,7 +601,7 @@ fn service_exact_prepared_queue_direct_flow_fair(
             .set_error("prepared tx ring insert failed".to_string());
         return false;
     }
-    binding.dbg_tx_ring_submitted += inserted as u64;
+    binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
     binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
 
     let (sent_packets, sent_bytes) = settle_exact_prepared_scratch_submission_flow_fair(

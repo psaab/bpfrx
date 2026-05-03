@@ -799,7 +799,7 @@ fn enqueue_cos_item(
     // the bound-pending FIFO evict sites; the two are now tracked on
     // separate counters so operators can disambiguate CoS shaping
     // pressure from bound-pending pressure.
-    binding.dbg_cos_queue_overflow += 1;
+    binding.telemetry.dbg_cos_queue_overflow += 1;
     binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
     binding.live.set_error(format!(
         "class-of-service queue overflow on ifindex {} queue {}",

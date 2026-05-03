@@ -76,7 +76,7 @@ pub(super) fn poll_binding(
     );
     let fill_work = drain_pending_fill(binding, now_ns);
     let mut did_work = tx_work || fill_work;
-    binding.dbg_poll_cycles += 1;
+    binding.telemetry.dbg_poll_cycles += 1;
     let mut counters = BatchCounters::default();
     let mut ident: Option<BindingIdentity> = None;
     for _ in 0..MAX_RX_BATCHES_PER_POLL {
@@ -84,7 +84,7 @@ pub(super) fn poll_binding(
         // fill ring exhaustion. The NIC holds packets until we refill (#201).
         let tx_backlog = binding.pending_tx_local.len() + binding.pending_tx_prepared.len();
         if tx_backlog >= binding.max_pending_tx {
-            binding.dbg_backpressure += 1;
+            binding.telemetry.dbg_backpressure += 1;
             // Try to drain TX first — completions free frames for both TX and fill.
             let _ = drain_pending_tx(
                 binding,
@@ -120,17 +120,17 @@ pub(super) fn poll_binding(
         }
         if cfg!(feature = "debug-log") {
             if raw_avail > 0 {
-                binding.dbg_rx_avail_nonzero += 1;
-                if raw_avail > binding.dbg_rx_avail_max {
-                    binding.dbg_rx_avail_max = raw_avail;
+                binding.telemetry.dbg_rx_avail_nonzero += 1;
+                if raw_avail > binding.telemetry.dbg_rx_avail_max {
+                    binding.telemetry.dbg_rx_avail_max = raw_avail;
                 }
             }
             // Ring diagnostics are only consumed by debug-log summaries.
-            binding.dbg_fill_pending = binding.device.pending();
-            binding.dbg_device_avail = binding.device.available();
+            binding.telemetry.dbg_fill_pending = binding.device.pending();
+            binding.telemetry.dbg_device_avail = binding.device.available();
         }
         if available == 0 {
-            binding.dbg_rx_empty += 1;
+            binding.telemetry.dbg_rx_empty += 1;
             maybe_wake_rx(binding, false, now_ns);
             // Check pending neighbor buffer even when RX is empty.
             // Without this, buffered SYN packets wait until the next

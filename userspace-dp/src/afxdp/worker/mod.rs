@@ -5,6 +5,10 @@ use super::*;
 mod lifecycle;
 use lifecycle::poll_binding;
 
+// #959 Phase 1: per-worker debug counters live in worker/telemetry.rs.
+mod telemetry;
+pub(crate) use telemetry::WorkerTelemetry;
+
 // #957 P1: worker-side CoS runtime helpers split out into a sibling
 // submodule. Note this module is `worker::cos`, separate from the
 // `afxdp::cos` directory module imported below as `super::cos`.
@@ -113,40 +117,10 @@ pub(crate) struct BindingWorker {
     pub(crate) outstanding_tx: u32,
     pub(crate) empty_rx_polls: u32,
     pub(crate) last_learned_neighbor: Option<LearnedNeighborKey>,
-    pub(crate) dbg_fill_submitted: u64,
-    pub(crate) dbg_fill_failed: u64,
-    pub(crate) dbg_poll_cycles: u64,
-    pub(crate) dbg_backpressure: u64,
-    pub(crate) dbg_rx_empty: u64,
-    pub(crate) dbg_rx_wakeups: u64,
-    // TX pipeline debug counters
-    pub(crate) dbg_tx_ring_submitted: u64, // descriptors inserted into TX ring
-    pub(crate) dbg_tx_ring_full: u64,      // times TX ring insert returned 0
-    pub(crate) dbg_completions_reaped: u64, // completion descriptors read
-    pub(crate) dbg_sendto_calls: u64,      // number of sendto/wake calls
-    pub(crate) dbg_sendto_err: u64,        // sendto returned error (non-EAGAIN/ENOBUFS)
-    pub(crate) dbg_sendto_eagain: u64,     // sendto returned EAGAIN/EWOULDBLOCK
-    pub(crate) dbg_sendto_enobufs: u64,    // sendto returned ENOBUFS (kernel TX drop)
-    // #802/#804: per-binding bound-pending FIFO overflow — incremented at
-    // the `bound_pending_tx_local`/`bound_pending_tx_prepared` evict
-    // sites only. Pre-#804 this counter was named `dbg_pending_overflow`
-    // and also doubled as the CoS admission overflow accumulator; the
-    // two semantics are now tracked on separate fields so operators can
-    // tell which path is dropping.
-    pub(crate) dbg_bound_pending_overflow: u64,
-    // #804: per-binding class-of-service queue admission overflow —
-    // incremented in `enqueue_cos_item()` when the CoS admission gate
-    // rejects the item.
-    pub(crate) dbg_cos_queue_overflow: u64,
-    pub(crate) dbg_tx_tcp_rst: u64,        // TCP RST packets transmitted
-    // Ring diagnostics — raw values from xsk_ffi API
-    pub(crate) dbg_rx_avail_nonzero: u64, // times rx.available() > 0
-    pub(crate) dbg_rx_avail_max: u32,     // max rx.available() seen this interval
-    pub(crate) dbg_fill_pending: u32,     // fill ring: userspace produced - kernel consumed
-    pub(crate) dbg_device_avail: u32,     // device queue available (completion ring pending)
-    pub(crate) dbg_rx_wake_sendto_ok: u64, // sendto() returned >= 0 in maybe_wake_rx
-    pub(crate) dbg_rx_wake_sendto_err: u64, // sendto() returned < 0 in maybe_wake_rx
-    pub(crate) dbg_rx_wake_sendto_errno: i32, // last errno from sendto in maybe_wake_rx
+    /// #959 Phase 1: 23 `dbg_*` debug counters extracted into
+    /// `WorkerTelemetry` to reduce BindingWorker's mutable surface
+    /// area. Field semantics unchanged; access via `binding.telemetry.telemetry.dbg_X`.
+    pub(crate) telemetry: WorkerTelemetry,
     pub(crate) pending_direct_tx_packets: u64,
     pub(crate) pending_copy_tx_packets: u64,
     pub(crate) pending_in_place_tx_packets: u64,
@@ -418,29 +392,7 @@ impl BindingWorker {
             outstanding_tx: 0,
             empty_rx_polls: 0,
             last_learned_neighbor: None,
-            dbg_fill_submitted: 0,
-            dbg_fill_failed: 0,
-            dbg_poll_cycles: 0,
-            dbg_backpressure: 0,
-            dbg_rx_empty: 0,
-            dbg_rx_wakeups: 0,
-            dbg_tx_ring_submitted: 0,
-            dbg_tx_ring_full: 0,
-            dbg_completions_reaped: 0,
-            dbg_sendto_calls: 0,
-            dbg_sendto_err: 0,
-            dbg_sendto_eagain: 0,
-            dbg_sendto_enobufs: 0,
-            dbg_bound_pending_overflow: 0,
-            dbg_cos_queue_overflow: 0,
-            dbg_tx_tcp_rst: 0,
-            dbg_rx_avail_nonzero: 0,
-            dbg_rx_avail_max: 0,
-            dbg_fill_pending: 0,
-            dbg_device_avail: 0,
-            dbg_rx_wake_sendto_ok: 0,
-            dbg_rx_wake_sendto_err: 0,
-            dbg_rx_wake_sendto_errno: 0,
+            telemetry: WorkerTelemetry::default(),
             pending_direct_tx_packets: 0,
             pending_copy_tx_packets: 0,
             pending_in_place_tx_packets: 0,
@@ -1153,32 +1105,32 @@ pub(crate) fn worker_loop(
                         ptx_local,
                         total_accounted,
                         expected_total,
-                        b.dbg_fill_submitted,
-                        b.dbg_poll_cycles,
-                        b.dbg_backpressure,
-                        b.dbg_rx_empty,
-                        b.dbg_rx_wakeups,
+                        b.telemetry.dbg_fill_submitted,
+                        b.telemetry.dbg_poll_cycles,
+                        b.telemetry.dbg_backpressure,
+                        b.telemetry.dbg_rx_empty,
+                        b.telemetry.dbg_rx_wakeups,
                     );
                     // TX pipeline debug counters
                     #[cfg(feature = "debug-log")]
                     {
-                        dbg_tx_tcp_rst += b.dbg_tx_tcp_rst;
+                        dbg_tx_tcp_rst += b.telemetry.dbg_tx_tcp_rst;
                     }
                     let _ = write!(
                         binding_summary,
                         " TX:ring_sub={}/ring_full={}/compl={}/sendto={}/err={}/eagain={}/enobufs={}/bp_overflow={}/cos_overflow={}",
-                        b.dbg_tx_ring_submitted,
-                        b.dbg_tx_ring_full,
-                        b.dbg_completions_reaped,
-                        b.dbg_sendto_calls,
-                        b.dbg_sendto_err,
-                        b.dbg_sendto_eagain,
-                        b.dbg_sendto_enobufs,
-                        b.dbg_bound_pending_overflow,
-                        b.dbg_cos_queue_overflow,
+                        b.telemetry.dbg_tx_ring_submitted,
+                        b.telemetry.dbg_tx_ring_full,
+                        b.telemetry.dbg_completions_reaped,
+                        b.telemetry.dbg_sendto_calls,
+                        b.telemetry.dbg_sendto_err,
+                        b.telemetry.dbg_sendto_eagain,
+                        b.telemetry.dbg_sendto_enobufs,
+                        b.telemetry.dbg_bound_pending_overflow,
+                        b.telemetry.dbg_cos_queue_overflow,
                     );
                     #[cfg(feature = "debug-log")]
-                    let _ = write!(binding_summary, "/rst={}", b.dbg_tx_tcp_rst);
+                    let _ = write!(binding_summary, "/rst={}", b.telemetry.dbg_tx_tcp_rst);
                     if let Some(s) = xsk_stats {
                         let _ = write!(
                             binding_summary,
@@ -1214,13 +1166,13 @@ pub(crate) fn worker_loop(
                         let _ = write!(
                             binding_summary,
                             " RING:rx_nz={}/rx_max={}/fill_pend={}/dev_avail={} RX_WAKE:ok={}/err={}/errno={}",
-                            b.dbg_rx_avail_nonzero,
-                            b.dbg_rx_avail_max,
-                            b.dbg_fill_pending,
-                            b.dbg_device_avail,
-                            b.dbg_rx_wake_sendto_ok,
-                            b.dbg_rx_wake_sendto_err,
-                            b.dbg_rx_wake_sendto_errno,
+                            b.telemetry.dbg_rx_avail_nonzero,
+                            b.telemetry.dbg_rx_avail_max,
+                            b.telemetry.dbg_fill_pending,
+                            b.telemetry.dbg_device_avail,
+                            b.telemetry.dbg_rx_wake_sendto_ok,
+                            b.telemetry.dbg_rx_wake_sendto_err,
+                            b.telemetry.dbg_rx_wake_sendto_errno,
                         );
                         // Direct mmap diagnosis: read raw ring producer/consumer
                         if let Some((rxp, rxc, frp, frc, txp, txc, crp, crc)) =
@@ -1503,32 +1455,32 @@ pub(crate) fn worker_loop(
                 for b in bindings.iter_mut() {
                     // #802: publish ring-pressure counters into BindingLiveState
                     // BEFORE resetting the worker-local window. The worker-local
-                    // counters (b.dbg_tx_ring_full, etc.) are accumulated by the
+                    // counters (b.telemetry.dbg_tx_ring_full, etc.) are accumulated by the
                     // hot path and reset each ~1s debug tick; without this
                     // publish they'd never be visible outside the worker thread.
                     // fetch_add is used because the atomic holds the cumulative
                     // total while the local counter holds only the current
                     // window. Relaxed is sufficient — diagnostic counters, no
                     // synchronization contract.
-                    if b.dbg_tx_ring_full != 0 {
+                    if b.telemetry.dbg_tx_ring_full != 0 {
                         b.live
                             .dbg_tx_ring_full
-                            .fetch_add(b.dbg_tx_ring_full, Ordering::Relaxed);
+                            .fetch_add(b.telemetry.dbg_tx_ring_full, Ordering::Relaxed);
                     }
-                    if b.dbg_sendto_enobufs != 0 {
+                    if b.telemetry.dbg_sendto_enobufs != 0 {
                         b.live
                             .dbg_sendto_enobufs
-                            .fetch_add(b.dbg_sendto_enobufs, Ordering::Relaxed);
+                            .fetch_add(b.telemetry.dbg_sendto_enobufs, Ordering::Relaxed);
                     }
-                    if b.dbg_bound_pending_overflow != 0 {
+                    if b.telemetry.dbg_bound_pending_overflow != 0 {
                         b.live
                             .dbg_bound_pending_overflow
-                            .fetch_add(b.dbg_bound_pending_overflow, Ordering::Relaxed);
+                            .fetch_add(b.telemetry.dbg_bound_pending_overflow, Ordering::Relaxed);
                     }
-                    if b.dbg_cos_queue_overflow != 0 {
+                    if b.telemetry.dbg_cos_queue_overflow != 0 {
                         b.live
                             .dbg_cos_queue_overflow
-                            .fetch_add(b.dbg_cos_queue_overflow, Ordering::Relaxed);
+                            .fetch_add(b.telemetry.dbg_cos_queue_overflow, Ordering::Relaxed);
                     }
                     // #802: kernel xdp_statistics.rx_fill_ring_empty_descs is
                     // already absolute (kernel-cumulative), so publish with
@@ -1573,30 +1525,30 @@ pub(crate) fn worker_loop(
                         .umem_inflight_frames
                         .store(inflight, Ordering::Relaxed);
 
-                    b.dbg_fill_submitted = 0;
-                    b.dbg_fill_failed = 0;
-                    b.dbg_poll_cycles = 0;
-                    b.dbg_backpressure = 0;
-                    b.dbg_rx_empty = 0;
-                    b.dbg_rx_wakeups = 0;
-                    b.dbg_tx_ring_submitted = 0;
-                    b.dbg_tx_ring_full = 0;
-                    b.dbg_completions_reaped = 0;
-                    b.dbg_sendto_calls = 0;
-                    b.dbg_sendto_err = 0;
-                    b.dbg_sendto_eagain = 0;
-                    b.dbg_sendto_enobufs = 0;
-                    b.dbg_bound_pending_overflow = 0;
-                    b.dbg_cos_queue_overflow = 0;
+                    b.telemetry.dbg_fill_submitted = 0;
+                    b.telemetry.dbg_fill_failed = 0;
+                    b.telemetry.dbg_poll_cycles = 0;
+                    b.telemetry.dbg_backpressure = 0;
+                    b.telemetry.dbg_rx_empty = 0;
+                    b.telemetry.dbg_rx_wakeups = 0;
+                    b.telemetry.dbg_tx_ring_submitted = 0;
+                    b.telemetry.dbg_tx_ring_full = 0;
+                    b.telemetry.dbg_completions_reaped = 0;
+                    b.telemetry.dbg_sendto_calls = 0;
+                    b.telemetry.dbg_sendto_err = 0;
+                    b.telemetry.dbg_sendto_eagain = 0;
+                    b.telemetry.dbg_sendto_enobufs = 0;
+                    b.telemetry.dbg_bound_pending_overflow = 0;
+                    b.telemetry.dbg_cos_queue_overflow = 0;
                     #[cfg(feature = "debug-log")]
                     {
-                        b.dbg_tx_tcp_rst = 0;
+                        b.telemetry.dbg_tx_tcp_rst = 0;
                     }
-                    b.dbg_rx_avail_nonzero = 0;
-                    b.dbg_rx_avail_max = 0;
-                    b.dbg_rx_wake_sendto_ok = 0;
-                    b.dbg_rx_wake_sendto_err = 0;
-                    b.dbg_rx_wake_sendto_errno = 0;
+                    b.telemetry.dbg_rx_avail_nonzero = 0;
+                    b.telemetry.dbg_rx_avail_max = 0;
+                    b.telemetry.dbg_rx_wake_sendto_ok = 0;
+                    b.telemetry.dbg_rx_wake_sendto_err = 0;
+                    b.telemetry.dbg_rx_wake_sendto_errno = 0;
                 }
             }
         }
