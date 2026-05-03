@@ -59,7 +59,7 @@ pub(in crate::afxdp) fn reap_tx_completions(
         recycle_completed_tx_offset(binding, shared_recycles, offset);
     }
     binding.outstanding_tx = binding.outstanding_tx.saturating_sub(reaped);
-    binding.dbg_completions_reaped += reaped as u64;
+    binding.telemetry.dbg_completions_reaped += reaped as u64;
     binding
         .live
         .tx_completions
@@ -101,15 +101,15 @@ pub(in crate::afxdp) fn drain_pending_fill(binding: &mut BindingWorker, now_ns: 
         inserted
     };
     if inserted == 0 {
-        binding.dbg_fill_failed += binding.scratch_fill.len() as u64;
+        binding.telemetry.dbg_fill_failed += binding.scratch_fill.len() as u64;
         for offset in binding.scratch_fill.drain(..).rev() {
             binding.pending_fill_frames.push_front(offset);
         }
         return false;
     }
-    binding.dbg_fill_submitted += inserted as u64;
+    binding.telemetry.dbg_fill_submitted += inserted as u64;
     if inserted < binding.scratch_fill.len() as u32 {
-        binding.dbg_fill_failed += (binding.scratch_fill.len() as u32 - inserted) as u64;
+        binding.telemetry.dbg_fill_failed += (binding.scratch_fill.len() as u32 - inserted) as u64;
         for offset in binding.scratch_fill.drain(inserted as usize..).rev() {
             binding.pending_fill_frames.push_front(offset);
         }
@@ -157,10 +157,10 @@ pub(in crate::afxdp) fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, 
     };
     let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
     if rc >= 0 {
-        binding.dbg_rx_wake_sendto_ok += 1;
+        binding.telemetry.dbg_rx_wake_sendto_ok += 1;
     } else {
-        binding.dbg_rx_wake_sendto_err += 1;
-        binding.dbg_rx_wake_sendto_errno = unsafe { *libc::__errno_location() };
+        binding.telemetry.dbg_rx_wake_sendto_err += 1;
+        binding.telemetry.dbg_rx_wake_sendto_errno = unsafe { *libc::__errno_location() };
     }
     // Also sendto for TX completions (needed for copy mode and TX kick).
     unsafe {
@@ -173,7 +173,7 @@ pub(in crate::afxdp) fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, 
             0,
         );
     }
-    binding.dbg_rx_wakeups += 1;
+    binding.telemetry.dbg_rx_wakeups += 1;
     binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);
     binding.last_rx_wake_ns = now_ns;
     binding.empty_rx_polls = 0;
@@ -236,7 +236,7 @@ pub(in crate::afxdp) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, 
             )
         };
         let kick_end = monotonic_nanos();
-        binding.dbg_sendto_calls += 1;
+        binding.telemetry.dbg_sendto_calls += 1;
         // #825 plan §3.3 LOW-3 R1 sentinel, code-review R1 HIGH-1 hardening:
         // skip record unless (a) `kick_start != 0` AND (b) `kick_end >=
         // kick_start`. Both guards are required:
@@ -260,7 +260,7 @@ pub(in crate::afxdp) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, 
             let errno = unsafe { *libc::__errno_location() };
             // EAGAIN/EWOULDBLOCK is normal for MSG_DONTWAIT; ENOBUFS means kernel dropped.
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
-                binding.dbg_sendto_eagain += 1;
+                binding.telemetry.dbg_sendto_eagain += 1;
                 // #825 plan §3.3 site 1 / §5: parallel atomic to
                 // `dbg_sendto_eagain` (which is worker-local and
                 // never published). Counts outer `sendto` returns
@@ -275,8 +275,8 @@ pub(in crate::afxdp) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, 
                     .tx_kick_retry_count
                     .fetch_add(1, Ordering::Relaxed);
             } else if errno == libc::ENOBUFS {
-                binding.dbg_sendto_enobufs += 1;
-                if binding.dbg_sendto_enobufs <= 10 {
+                binding.telemetry.dbg_sendto_enobufs += 1;
+                if binding.telemetry.dbg_sendto_enobufs <= 10 {
                     eprintln!(
                         "TX_ENOBUFS: slot={} if={} q={} outstanding_tx={} free_tx={}",
                         binding.slot,
@@ -287,8 +287,8 @@ pub(in crate::afxdp) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, 
                     );
                 }
             } else {
-                binding.dbg_sendto_err += 1;
-                if binding.dbg_sendto_err <= 5 {
+                binding.telemetry.dbg_sendto_err += 1;
+                if binding.telemetry.dbg_sendto_err <= 5 {
                     eprintln!(
                         "DBG SENDTO_ERR: slot={} if={} q={} errno={} outstanding_tx={} free_tx={}",
                         binding.slot,
