@@ -65,9 +65,9 @@ Existing pattern in `pkg/grpcapi/`: sibling files `server_<domain>.go` (e.g., `s
 
 ## Approach
 
-**Phase 1 (this PR): extract the biggest cohesive case-blocks into sibling `server_show_<domain>.go` files.** Each extraction is a pure relocation: case body → private method `(s *Server) showX(...)` in the new file → original case becomes `case "X": return s.showX(ctx, req, params...)`.
+**Phase 1 (this PR): extract just the `firewall` case body** (~130 LOC) into `pkg/grpcapi/server_show_firewall.go` to demonstrate the methodology before the broader phased extraction. Each extraction is a semantic relocation: case body → private method `(s *Server) showX(...)` in the new file → original case becomes `case "X": s.showX(...)`.
 
-Target: get `server_show.go` from 4,072 LOC under the 2,000 threshold, ideally to ~1,800 LOC. That requires extracting ~2,200 LOC across multiple domains.
+Target across the full phase plan: get `server_show.go` from 4,072 LOC under the 2,000 threshold, ideally to ~1,800 LOC. Phase 1 gets 4,072 → 3,945 (the table below shows the full plan; this PR ships only Phase 1's first case body).
 
 ### Domain groups to extract (rev-2 — measured LOC)
 
@@ -77,10 +77,16 @@ domains chosen by combined LOC + cohesion. Naming convention:
 `server_show_forwarding.go`, `server_show_interfaces.go`,
 `server_show_status.go`, `server_show_zones.go`).
 
+**Note**: The Phase 1 PR ships only the `firewall` case body (130 LOC),
+not the full ~465 LOC firewall-family group. The remaining
+firewall-family cases (`policy-options`, `policies-hit-count`,
+`policies-detail`, `screen`) extract in subsequent Phase 1a/1b/...
+PRs if reviewers prefer narrow per-case diffs.
+
 | File | Cases | Measured LOC |
 |------|-------|-------------:|
 | `server_show_chassis.go` | `chassis` (75), `chassis-hardware` (6), `chassis-forwarding` (36), `chassis-cluster` + 8 variants (~108), `chassis-environment` (33), `storage` (26), `commit-history` (17), `alarms` (17), `security-alarms*` (53) | **~371** |
-| `server_show_firewall.go` | `firewall` (130), `policy-options` (56), `policies-hit-count` (57), `policies-detail` (126), `screen` (96) | **~465** |
+| `server_show_firewall.go` | **Phase 1 (this PR)**: `firewall` (130). Future: `policy-options` (56), `policies-hit-count` (57), `policies-detail` (126), `screen` (96) — extract in follow-up PRs. | **~130 (this PR)**, ~465 (full domain) |
 | `server_show_nat.go` | `nat-static` (20), `nat-nptv6` (24), `persistent-nat` (23), `nat-source-rule-detail` (85), `nat-dest-rule-detail` (74), `persistent-nat-detail` (53), `nat64` (16) | **~295** |
 | `server_show_interfaces_extras.go` | `interfaces-extensive` (100), `interfaces-detail` (96), `interfaces-statistics` (25) — note existing `server_show_interfaces.go` already exists for the basic interface RPC; this file is named `_extras` to avoid collision | **~221** |
 | `server_show_dhcp_lldp_snmp.go` | `dhcp-server` (27), `dhcp-server-detail` (79), `dhcp-relay` (21), `lldp` (37), `lldp-neighbors` (18), `snmp` (41), `snmp-v3` (19) | **~242** |
