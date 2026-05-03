@@ -49,7 +49,7 @@ pub(in crate::afxdp) fn reap_tx_completions(
     // exact production algorithm — NOT a test-only fake. See unit
     // pins under `#[cfg(test)]` below.
     record_tx_completions_with_stamp(
-        &mut binding.tx_submit_ns,
+        &mut binding.tx_pipeline.tx_submit_ns,
         &binding.scratch.scratch_completed_offsets,
         ts_completion,
         &binding.live.owner_profile_owner,
@@ -69,13 +69,13 @@ pub(in crate::afxdp) fn reap_tx_completions(
 }
 
 pub(in crate::afxdp) fn drain_pending_fill(binding: &mut BindingWorker, now_ns: u64) -> bool {
-    if binding.pending_fill_frames.is_empty() {
+    if binding.tx_pipeline.pending_fill_frames.is_empty() {
         return false;
     }
-    let batch_size = binding.pending_fill_frames.len().min(FILL_BATCH_SIZE);
+    let batch_size = binding.tx_pipeline.pending_fill_frames.len().min(FILL_BATCH_SIZE);
     binding.scratch.scratch_fill.clear();
     while binding.scratch.scratch_fill.len() < batch_size {
-        let Some(offset) = binding.pending_fill_frames.pop_front() else {
+        let Some(offset) = binding.tx_pipeline.pending_fill_frames.pop_front() else {
             break;
         };
         // Poison the frame before submitting to fill ring — the kernel should
@@ -103,7 +103,7 @@ pub(in crate::afxdp) fn drain_pending_fill(binding: &mut BindingWorker, now_ns: 
     if inserted == 0 {
         binding.telemetry.dbg_fill_failed += binding.scratch.scratch_fill.len() as u64;
         for offset in binding.scratch.scratch_fill.drain(..).rev() {
-            binding.pending_fill_frames.push_front(offset);
+            binding.tx_pipeline.pending_fill_frames.push_front(offset);
         }
         return false;
     }
@@ -111,7 +111,7 @@ pub(in crate::afxdp) fn drain_pending_fill(binding: &mut BindingWorker, now_ns: 
     if inserted < binding.scratch.scratch_fill.len() as u32 {
         binding.telemetry.dbg_fill_failed += (binding.scratch.scratch_fill.len() as u32 - inserted) as u64;
         for offset in binding.scratch.scratch_fill.drain(inserted as usize..).rev() {
-            binding.pending_fill_frames.push_front(offset);
+            binding.tx_pipeline.pending_fill_frames.push_front(offset);
         }
     }
     binding.scratch.scratch_fill.clear();
@@ -196,15 +196,15 @@ fn recycle_completed_tx_offset(
     shared_recycles: &mut Vec<(u32, u64)>,
     offset: u64,
 ) {
-    if let Some(recycle) = binding.in_flight_prepared_recycles.remove(&offset) {
+    if let Some(recycle) = binding.tx_pipeline.in_flight_prepared_recycles.remove(&offset) {
         apply_prepared_recycle(
-            &mut binding.free_tx_frames,
+            &mut binding.tx_pipeline.free_tx_frames,
             shared_recycles,
             recycle,
             offset,
         );
     } else {
-        binding.free_tx_frames.push_back(offset);
+        binding.tx_pipeline.free_tx_frames.push_back(offset);
     }
 }
 
@@ -283,7 +283,7 @@ pub(in crate::afxdp) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, 
                         binding.ifindex,
                         binding.queue_id,
                         binding.outstanding_tx,
-                        binding.free_tx_frames.len(),
+                        binding.tx_pipeline.free_tx_frames.len(),
                     );
                 }
             } else {
@@ -296,7 +296,7 @@ pub(in crate::afxdp) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, 
                         binding.queue_id,
                         errno,
                         binding.outstanding_tx,
-                        binding.free_tx_frames.len(),
+                        binding.tx_pipeline.free_tx_frames.len(),
                     );
                 }
             }

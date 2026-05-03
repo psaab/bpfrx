@@ -53,8 +53,8 @@ pub(in crate::afxdp) fn recycle_prepared_immediately(binding: &mut BindingWorker
     // drop site back to the source worker; deferred until the
     // shared-UMEM prototype is activated.
     recycle_cancelled_prepared_offset(
-        &mut binding.free_tx_frames,
-        &mut binding.pending_fill_frames,
+        &mut binding.tx_pipeline.free_tx_frames,
+        &mut binding.tx_pipeline.pending_fill_frames,
         binding.slot,
         req.recycle,
         req.offset,
@@ -79,12 +79,12 @@ pub(in crate::afxdp) fn transmit_batch(
     if pending.is_empty() {
         return Ok((0, 0));
     }
-    if binding.free_tx_frames.is_empty() {
+    if binding.tx_pipeline.free_tx_frames.is_empty() {
         let _ = reap_tx_completions(binding, shared_recycles);
     }
     let batch_size = pending
         .len()
-        .min(binding.free_tx_frames.len())
+        .min(binding.tx_pipeline.free_tx_frames.len())
         .min(TX_BATCH_SIZE);
     if batch_size == 0 {
         maybe_wake_tx(binding, true, now_ns);
@@ -102,7 +102,7 @@ pub(in crate::afxdp) fn transmit_batch(
         if req.bytes.len() > tx_frame_capacity() {
             // Unwind already-prepared entries before returning.
             for (off, r) in binding.scratch.scratch_local_tx.drain(..) {
-                binding.free_tx_frames.push_back(off);
+                binding.tx_pipeline.free_tx_frames.push_back(off);
                 pending.push_front(r);
             }
             return Err(TxError::Drop(format!(
@@ -111,7 +111,7 @@ pub(in crate::afxdp) fn transmit_batch(
                 tx_frame_capacity()
             )));
         }
-        let Some(offset) = binding.free_tx_frames.pop_front() else {
+        let Some(offset) = binding.tx_pipeline.free_tx_frames.pop_front() else {
             pending.push_front(req);
             break;
         };
@@ -121,10 +121,10 @@ pub(in crate::afxdp) fn transmit_batch(
                 .area()
                 .slice_mut_unchecked(offset as usize, req.bytes.len())
         }) else {
-            binding.free_tx_frames.push_front(offset);
+            binding.tx_pipeline.free_tx_frames.push_front(offset);
             // Unwind already-prepared entries before returning.
             for (off, r) in binding.scratch.scratch_local_tx.drain(..) {
-                binding.free_tx_frames.push_back(off);
+                binding.tx_pipeline.free_tx_frames.push_back(off);
                 pending.push_front(r);
             }
             return Err(TxError::Drop(format!(
@@ -198,7 +198,7 @@ pub(in crate::afxdp) fn transmit_batch(
     // from inflating the observed latency.
     let ts_submit = monotonic_nanos();
     stamp_submits(
-        &mut binding.tx_submit_ns,
+        &mut binding.tx_pipeline.tx_submit_ns,
         binding
             .scratch.scratch_local_tx
             .iter()
@@ -211,7 +211,7 @@ pub(in crate::afxdp) fn transmit_batch(
         binding.telemetry.dbg_tx_ring_full += 1;
         maybe_wake_tx(binding, true, now_ns);
         while let Some((offset, req)) = binding.scratch.scratch_local_tx.pop() {
-            binding.free_tx_frames.push_front(offset);
+            binding.tx_pipeline.free_tx_frames.push_front(offset);
             pending.push_front(req);
         }
         return Err(TxError::Retry("tx ring insert failed".to_string()));
@@ -227,7 +227,7 @@ pub(in crate::afxdp) fn transmit_batch(
             sent_packets += 1;
             sent_bytes += req.bytes.len() as u64;
         } else {
-            binding.free_tx_frames.push_front(offset);
+            binding.tx_pipeline.free_tx_frames.push_front(offset);
             retry_tail.push(req);
         }
     }
@@ -245,9 +245,9 @@ pub(super) fn transmit_prepared_batch(
     binding: &mut BindingWorker,
     now_ns: u64,
 ) -> Result<(u64, u64), TxError> {
-    let mut pending = core::mem::take(&mut binding.pending_tx_prepared);
+    let mut pending = core::mem::take(&mut binding.tx_pipeline.pending_tx_prepared);
     let result = transmit_prepared_queue(binding, &mut pending, now_ns);
-    binding.pending_tx_prepared = pending;
+    binding.tx_pipeline.pending_tx_prepared = pending;
     result
 }
 
@@ -431,7 +431,7 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
     // kernel-visible submit time, not the pre-submit planning window.
     let ts_submit = monotonic_nanos();
     stamp_submits(
-        &mut binding.tx_submit_ns,
+        &mut binding.tx_pipeline.tx_submit_ns,
         binding
             .scratch.scratch_prepared_tx
             .iter()
@@ -456,7 +456,7 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
     let mut retry_tail = Vec::new();
     for (idx, req) in binding.scratch.scratch_prepared_tx.drain(..).enumerate() {
         if idx < inserted as usize {
-            remember_prepared_recycle(&mut binding.in_flight_prepared_recycles, &req);
+            remember_prepared_recycle(&mut binding.tx_pipeline.in_flight_prepared_recycles, &req);
             sent_packets += 1;
             sent_bytes += req.len as u64;
         } else {

@@ -82,8 +82,8 @@ pub(super) fn poll_binding(
     for _ in 0..MAX_RX_BATCHES_PER_POLL {
         // Backpressure: skip RX when TX queues are heavily loaded to prevent
         // fill ring exhaustion. The NIC holds packets until we refill (#201).
-        let tx_backlog = binding.pending_tx_local.len() + binding.pending_tx_prepared.len();
-        if tx_backlog >= binding.max_pending_tx {
+        let tx_backlog = binding.tx_pipeline.pending_tx_local.len() + binding.tx_pipeline.pending_tx_prepared.len();
+        if tx_backlog >= binding.tx_pipeline.max_pending_tx {
             binding.telemetry.dbg_backpressure += 1;
             // Try to drain TX first — completions free frames for both TX and fill.
             let _ = drain_pending_tx(
@@ -282,7 +282,7 @@ pub(super) fn poll_binding(
         );
         if !binding.scratch.scratch_recycle.is_empty() {
             binding
-                .pending_fill_frames
+                .tx_pipeline.pending_fill_frames
                 .extend(binding.scratch.scratch_recycle.drain(..));
         }
         let _ = drain_pending_fill(binding, now_ns);

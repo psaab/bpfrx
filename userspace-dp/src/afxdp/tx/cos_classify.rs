@@ -334,7 +334,7 @@ pub(in crate::afxdp) fn enqueue_local_into_cos(
         .get(&egress_ifindex)
         .is_some_and(|root| cos_queue_accepts_prepared(root, req.cos_queue_id))
     {
-        match prepare_local_request_for_cos(binding.umem.area(), &mut binding.free_tx_frames, req) {
+        match prepare_local_request_for_cos(binding.umem.area(), &mut binding.tx_pipeline.free_tx_frames, req) {
             Ok(prepared_req) => {
                 let item_len = prepared_req.len as u64;
                 match enqueue_cos_item(
@@ -378,8 +378,8 @@ pub(in crate::afxdp) fn enqueue_local_into_cos(
                 if let Some(root) = binding.cos.cos_interfaces.get_mut(&egress_ifindex) {
                     let _ = demote_prepared_cos_queue_to_local(
                         area,
-                        &mut binding.free_tx_frames,
-                        &mut binding.pending_fill_frames,
+                        &mut binding.tx_pipeline.free_tx_frames,
+                        &mut binding.tx_pipeline.pending_fill_frames,
                         slot,
                         root,
                         req.cos_queue_id,
@@ -787,11 +787,11 @@ fn enqueue_cos_item(
     }
     if let Some((recycle, offset)) = recycle {
         match recycle {
-            PreparedTxRecycle::FreeTxFrame => binding.free_tx_frames.push_back(offset),
+            PreparedTxRecycle::FreeTxFrame => binding.tx_pipeline.free_tx_frames.push_back(offset),
             PreparedTxRecycle::FillOnSlot(slot) if slot == binding.slot => {
-                binding.pending_fill_frames.push_back(offset);
+                binding.tx_pipeline.pending_fill_frames.push_back(offset);
             }
-            PreparedTxRecycle::FillOnSlot(_) => binding.free_tx_frames.push_back(offset),
+            PreparedTxRecycle::FillOnSlot(_) => binding.tx_pipeline.free_tx_frames.push_back(offset),
         }
     }
     // #804: CoS admission overflow — NOT bound-pending. Pre-#804 this

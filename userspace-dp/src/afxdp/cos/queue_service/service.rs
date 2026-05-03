@@ -33,7 +33,7 @@ pub(super) fn service_exact_local_queue_direct(
             shared_recycles,
         );
     }
-    if binding.free_tx_frames.is_empty() {
+    if binding.tx_pipeline.free_tx_frames.is_empty() {
         let _ = reap_tx_completions(binding, shared_recycles);
     }
     let queue_dscp_rewrite = cos_queue_dscp_rewrite(binding, root_ifindex, queue_idx);
@@ -54,7 +54,7 @@ pub(super) fn service_exact_local_queue_direct(
         };
         drain_exact_local_fifo_items_to_scratch(
             queue,
-            &mut binding.free_tx_frames,
+            &mut binding.tx_pipeline.free_tx_frames,
             &mut binding.scratch.scratch_exact_local_tx,
             binding.umem.area(),
             root_budget,
@@ -69,7 +69,7 @@ pub(super) fn service_exact_local_queue_direct(
             dropped_bytes,
         } => {
             release_exact_local_scratch_frames(
-                &mut binding.free_tx_frames,
+                &mut binding.tx_pipeline.free_tx_frames,
                 &mut binding.scratch.scratch_exact_local_tx,
             );
             if dropped_bytes > 0 {
@@ -120,7 +120,7 @@ pub(super) fn service_exact_local_queue_direct(
     // `free_tx_frames` and MUST NOT be stamped.
     let ts_submit = monotonic_nanos();
     stamp_submits(
-        &mut binding.tx_submit_ns,
+        &mut binding.tx_pipeline.tx_submit_ns,
         binding
             .scratch.scratch_exact_local_tx
             .iter()
@@ -135,7 +135,7 @@ pub(super) fn service_exact_local_queue_direct(
         count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
         release_exact_local_scratch_frames(
-            &mut binding.free_tx_frames,
+            &mut binding.tx_pipeline.free_tx_frames,
             &mut binding.scratch.scratch_exact_local_tx,
         );
         refresh_cos_interface_activity(binding, root_ifindex);
@@ -150,7 +150,7 @@ pub(super) fn service_exact_local_queue_direct(
             .cos.cos_interfaces
             .get_mut(&root_ifindex)
             .and_then(|root| root.queues.get_mut(queue_idx)),
-        &mut binding.free_tx_frames,
+        &mut binding.tx_pipeline.free_tx_frames,
         &mut binding.scratch.scratch_exact_local_tx,
         inserted as usize,
     );
@@ -177,7 +177,7 @@ fn service_exact_local_queue_direct_flow_fair(
     now_ns: u64,
     shared_recycles: &mut Vec<(u32, u64)>,
 ) -> bool {
-    if binding.free_tx_frames.is_empty() {
+    if binding.tx_pipeline.free_tx_frames.is_empty() {
         let _ = reap_tx_completions(binding, shared_recycles);
     }
     let queue_dscp_rewrite = cos_queue_dscp_rewrite(binding, root_ifindex, queue_idx);
@@ -198,7 +198,7 @@ fn service_exact_local_queue_direct_flow_fair(
         };
         drain_exact_local_items_to_scratch_flow_fair(
             queue,
-            &mut binding.free_tx_frames,
+            &mut binding.tx_pipeline.free_tx_frames,
             &mut binding.scratch.scratch_local_tx,
             binding.umem.area(),
             root_budget,
@@ -217,7 +217,7 @@ fn service_exact_local_queue_direct_flow_fair(
                     .cos.cos_interfaces
                     .get_mut(&root_ifindex)
                     .and_then(|root| root.queues.get_mut(queue_idx)),
-                &mut binding.free_tx_frames,
+                &mut binding.tx_pipeline.free_tx_frames,
                 &mut binding.scratch.scratch_local_tx,
             );
             if dropped_bytes > 0 {
@@ -265,7 +265,7 @@ fn service_exact_local_queue_direct_flow_fair(
     // ring submit from being attributed to submit→completion latency.
     let ts_submit = monotonic_nanos();
     stamp_submits(
-        &mut binding.tx_submit_ns,
+        &mut binding.tx_pipeline.tx_submit_ns,
         binding
             .scratch.scratch_local_tx
             .iter()
@@ -284,7 +284,7 @@ fn service_exact_local_queue_direct_flow_fair(
                 .cos.cos_interfaces
                 .get_mut(&root_ifindex)
                 .and_then(|root| root.queues.get_mut(queue_idx)),
-            &mut binding.free_tx_frames,
+            &mut binding.tx_pipeline.free_tx_frames,
             &mut binding.scratch.scratch_local_tx,
         );
         refresh_cos_interface_activity(binding, root_ifindex);
@@ -299,7 +299,7 @@ fn service_exact_local_queue_direct_flow_fair(
             .cos.cos_interfaces
             .get_mut(&root_ifindex)
             .and_then(|root| root.queues.get_mut(queue_idx)),
-        &mut binding.free_tx_frames,
+        &mut binding.tx_pipeline.free_tx_frames,
         &mut binding.scratch.scratch_local_tx,
         inserted as usize,
     );
@@ -361,8 +361,8 @@ pub(super) fn service_exact_prepared_queue_direct(
             queue,
             &mut binding.scratch.scratch_exact_prepared_tx,
             binding.umem.area(),
-            &mut binding.free_tx_frames,
-            &mut binding.pending_fill_frames,
+            &mut binding.tx_pipeline.free_tx_frames,
+            &mut binding.tx_pipeline.pending_fill_frames,
             binding.slot,
             root_budget,
             secondary_budget,
@@ -428,7 +428,7 @@ pub(super) fn service_exact_prepared_queue_direct(
     // not the moment before a potential preemption window.
     let ts_submit = monotonic_nanos();
     stamp_submits(
-        &mut binding.tx_submit_ns,
+        &mut binding.tx_pipeline.tx_submit_ns,
         binding
             .scratch.scratch_exact_prepared_tx
             .iter()
@@ -458,7 +458,7 @@ pub(super) fn service_exact_prepared_queue_direct(
             .get_mut(&root_ifindex)
             .and_then(|root| root.queues.get_mut(queue_idx)),
         &mut binding.scratch.scratch_exact_prepared_tx,
-        &mut binding.in_flight_prepared_recycles,
+        &mut binding.tx_pipeline.in_flight_prepared_recycles,
         inserted as usize,
     );
     // #940: post-settle V_min publish. FIFO queues have
@@ -502,8 +502,8 @@ fn service_exact_prepared_queue_direct_flow_fair(
             queue,
             &mut binding.scratch.scratch_prepared_tx,
             binding.umem.area(),
-            &mut binding.free_tx_frames,
-            &mut binding.pending_fill_frames,
+            &mut binding.tx_pipeline.free_tx_frames,
+            &mut binding.tx_pipeline.pending_fill_frames,
             binding.slot,
             root_budget,
             secondary_budget,
@@ -574,7 +574,7 @@ fn service_exact_prepared_queue_direct_flow_fair(
     // exact_local variant above for the preemption-window rationale.
     let ts_submit = monotonic_nanos();
     stamp_submits(
-        &mut binding.tx_submit_ns,
+        &mut binding.tx_pipeline.tx_submit_ns,
         binding
             .scratch.scratch_prepared_tx
             .iter()
@@ -610,7 +610,7 @@ fn service_exact_prepared_queue_direct_flow_fair(
             .get_mut(&root_ifindex)
             .and_then(|root| root.queues.get_mut(queue_idx)),
         &mut binding.scratch.scratch_prepared_tx,
-        &mut binding.in_flight_prepared_recycles,
+        &mut binding.tx_pipeline.in_flight_prepared_recycles,
         inserted as usize,
     );
     // #940: post-settle V_min publish. Settle has applied any

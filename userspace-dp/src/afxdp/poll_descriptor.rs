@@ -366,7 +366,7 @@ pub(super) fn poll_binding_process_descriptor(
                                             )
                                         });
                                         if let Some(frame_len) = frame_len {
-                                            binding.pending_tx_prepared.push_back(
+                                            binding.tx_pipeline.pending_tx_prepared.push_back(
                                                 PreparedTxRequest {
                                                     offset: desc.addr,
                                                     len: frame_len,
