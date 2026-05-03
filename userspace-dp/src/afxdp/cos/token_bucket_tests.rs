@@ -272,9 +272,9 @@ fn maybe_top_up_cos_queue_lease_transparent_non_exact_with_nonzero_last_refill()
     // old code fell through to `refill_cos_tokens` which has its
     // own `if rate_bytes_per_sec == 0 { return; }` early-return.
     // Pre-pop last_refill_ns to non-zero so refill_cos_tokens'
-    // first-call init branch (line 111-114) doesn't accidentally
-    // fill tokens — old code would leave tokens at 0 in this
-    // configuration, the fast path fills them.
+    // first-call init branch doesn't accidentally fill tokens —
+    // old code would leave tokens at 0 in this configuration; the
+    // fast path fills them.
     let mut root = test_cos_runtime_with_queues(
         0,
         vec![CoSQueueConfig {
