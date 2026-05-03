@@ -13,8 +13,9 @@
 //! - `pending_tx_local` — local-TX requests awaiting ring submit.
 //! - `max_pending_tx` — TX backpressure threshold (configured once).
 //! - `outstanding_tx` — transient gauge of in-flight TX descriptors
-//!   (incremented at `sendto`/local-TX insert, decremented when the
-//!   completion ring is reaped). Mirrored to
+//!   (incremented when a TX ring descriptor is inserted, decremented
+//!   when the completion ring is reaped — `sendto` is the wake/kick,
+//!   not the increment site). Mirrored to
 //!   `BindingLiveState.debug_outstanding_tx` once per debug tick so
 //!   the snapshot reader sees a recent value (#802).
 //! - `pending_fill_frames` — fill-ring back-pressure queue.
@@ -43,12 +44,15 @@ pub(crate) struct WorkerTxPipeline {
     pub(crate) pending_tx_local: VecDeque<TxRequest>,
     pub(crate) max_pending_tx: usize,
     /// Transient gauge of in-flight TX descriptors — incremented
-    /// when a frame is inserted onto the TX ring (or local-TX queue
-    /// drained into the ring), decremented when the completion ring
-    /// is reaped. Mirrored once per debug tick to
-    /// `BindingLiveState.debug_outstanding_tx` for the snapshot
-    /// reader (#802). NOT a counter — a saturating gauge of
-    /// in-flight work.
+    /// when a TX ring descriptor is inserted (the
+    /// `saturating_add(inserted)` sites in tx/transmit.rs and the
+    /// CoS direct-submit paths in cos/queue_service/service.rs),
+    /// decremented when the completion ring is reaped
+    /// (saturating_sub in tx/rings.rs). `sendto` is the wake/kick
+    /// of the kernel TX path, NOT the increment site. Mirrored once
+    /// per debug tick to `BindingLiveState.debug_outstanding_tx`
+    /// for the snapshot reader (#802). NOT a counter — a
+    /// saturating gauge of in-flight work.
     pub(crate) outstanding_tx: u32,
     pub(crate) pending_fill_frames: VecDeque<u64>,
     pub(crate) in_flight_prepared_recycles: FastMap<u64, PreparedTxRecycle>,

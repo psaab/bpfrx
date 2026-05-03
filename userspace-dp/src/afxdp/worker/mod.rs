@@ -89,9 +89,11 @@ pub(crate) struct BindingWorker {
     pub(crate) device: crate::xsk_ffi::DeviceQueue,
     pub(crate) rx: crate::xsk_ffi::RingRx,
     pub(crate) tx: crate::xsk_ffi::RingTx,
-    /// #959 Phase 7: 7 TX pipeline fields extracted into
-    /// `WorkerTxPipeline`. Field semantics unchanged; access via
-    /// `binding.tx_pipeline.X`.
+    /// #959 Phase 7 + Phase 10: 8 TX pipeline fields extracted into
+    /// `WorkerTxPipeline` (Phase 7 brought 7; Phase 10 added
+    /// `outstanding_tx` once the BindingStatus mirror collision was
+    /// resolved by type-level disambiguation). Field semantics
+    /// unchanged; access via `binding.tx_pipeline.X`.
     pub(crate) tx_pipeline: WorkerTxPipeline,
     /// #959 Phase 3: 5 `cos_*` per-binding CoS scheduling fields
     /// extracted into `WorkerCos`. Field semantics unchanged;
