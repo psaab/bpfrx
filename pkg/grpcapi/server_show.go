@@ -17,7 +17,6 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/feeds"
-	"github.com/psaab/xpf/pkg/frr"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
@@ -1209,67 +1208,27 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		}
 
 	case "route-all":
-		if s.routing == nil {
-			fmt.Fprintln(&buf, "Routing manager not available")
-		} else {
-			var instances []*config.RoutingInstanceConfig
-			if cfg != nil {
-				instances = cfg.RoutingInstances
-			}
-			allTables, err := s.routing.GetAllTableRoutes(instances)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "get routes: %v", err)
-			}
-			buf.WriteString(routing.FormatAllRoutes(allTables))
+		// #1043 Phase 9: case body extracted to server_show_routes_text.go
+		if err := s.showRouteAll(cfg, &buf); err != nil {
+			return nil, err
 		}
 
 	case "route-summary":
-		if s.routing == nil {
-			fmt.Fprintln(&buf, "Routing manager not available")
-		} else {
-			var instances []*config.RoutingInstanceConfig
-			if cfg != nil {
-				instances = cfg.RoutingInstances
-			}
-			allTables, err := s.routing.GetAllTableRoutes(instances)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "get routes: %v", err)
-			}
-			routerID := ""
-			if cfg != nil {
-				if cfg.Protocols.OSPF != nil && cfg.Protocols.OSPF.RouterID != "" {
-					routerID = cfg.Protocols.OSPF.RouterID
-				} else if cfg.Protocols.BGP != nil && cfg.Protocols.BGP.RouterID != "" {
-					routerID = cfg.Protocols.BGP.RouterID
-				}
-			}
-			buf.WriteString(routing.FormatRouteSummary(allTables, routerID))
+		// #1043 Phase 9: case body extracted to server_show_routes_text.go
+		if err := s.showRouteSummary(cfg, &buf); err != nil {
+			return nil, err
 		}
 
 	case "route-terse":
-		if s.routing == nil {
-			fmt.Fprintln(&buf, "Routing manager not available")
-		} else {
-			entries, err := s.routing.GetRoutes()
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "get routes: %v", err)
-			}
-			buf.WriteString(routing.FormatRouteTerse(entries))
+		// #1043 Phase 9: case body extracted to server_show_routes_text.go
+		if err := s.showRouteTerse(&buf); err != nil {
+			return nil, err
 		}
 
 	case "route-detail":
-		if s.frr == nil {
-			fmt.Fprintln(&buf, "FRR manager not available")
-		} else {
-			routes, err := s.frr.GetRouteDetailJSON()
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "get route detail: %v", err)
-			}
-			if len(routes) == 0 {
-				buf.WriteString("No routes\n")
-			} else {
-				buf.WriteString(frr.FormatRouteDetail(routes))
-			}
+		// #1043 Phase 9: case body extracted to server_show_routes_text.go
+		if err := s.showRouteDetail(&buf); err != nil {
+			return nil, err
 		}
 
 	case "interfaces-extensive":
