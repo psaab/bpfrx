@@ -1,6 +1,56 @@
 # #946 Phase 1 — Extract Per-Packet Sub-Stages from `poll_binding_process_descriptor`
 
-Status: **DRAFT v2 — addressing Codex round-1 PLAN-NEEDS-MAJOR**
+Status: **DRAFT v3 — addressing Codex round-2 PLAN-NEEDS-MAJOR**
+
+## v3 changes (Codex round-2 findings)
+
+Codex round 2 accepted the architectural shape but flagged 5
+tactical signature defects that would break behavior preservation
+once implementation began. v3 fixes each.
+
+1. **`stage_parse_and_classify` drops side effects.** Metadata
+   parse failure increments `binding.live.metadata_errors`,
+   `telemetry.dbg.metadata_err`, and calls `record_exception`
+   (poll_descriptor.rs:2192–2204). Non-Valid disposition calls
+   `record_disposition` (line 2181) which updates live counters and
+   `recent_exceptions`. v2's helper only got `telemetry`; v3 takes
+   `&mut binding.live`, `worker_ctx.recent_exceptions`, the ident,
+   and `worker_ctx.forwarding`. Side effects fire inside the helper.
+2. **`stage_parse_flow_and_learn` cannot reproduce the GRE guard.**
+   The current code learns dynamic neighbors only when
+   `owned_packet_frame.is_none()` (poll_descriptor.rs:113). v3's
+   helper takes an explicit `learn_from_live_frame: bool` flag, and
+   the broad `&mut BindingWorker` narrows to
+   `&mut binding.last_learned_neighbor`.
+3. **`stage_screen_check` signature was incomplete.** Needs
+   `packet_frame: &[u8]` (for `extract_screen_info`), `now_secs`
+   (for `screen.check_packet`), and only `&binding.live.screen_drops`
+   for the live drop counter — caller still owns the recycle push.
+4. **Stage inventory still missed 3 continue sites.** v3 explicitly
+   lists all 9 `continue;` sites (53, 76, 80, 183, 221, 297, 433,
+   535, 604) and notes 535 (session-hit TTL ICMP-TE) and 604
+   (cluster-peer-return fast path) belong to the deferred stages
+   13–16. Flow-cache also has a scratch_forwards fallback at line
+   397 — v3 calls this out so the future Phase 1.5 helper covers it.
+5. **Main-loop sketch was not compile-realistic.** Deferred inline
+   code at lines 419, 583, 1814 calls `owned_packet_frame.take()`,
+   so the binding must be `mut`. v3's sketch reflects this and
+   restores `let mut recycle_now = true` before the deferred body.
+
+Open question answers from Codex round 2:
+- **Q1** (split into 2 PRs?): One PR is acceptable after the
+  signature fixes; 8 helpers ≈ 400–1200 LOC, in line with our
+  Phase-N decompositions. Split only if churn grows beyond pure
+  code motion.
+- **Q2** (LinkLayerOutcome arms): collapse to `StageOutcome<()>`;
+  side effects (ARP/NDP neighbor learning) stay inside the helper.
+  v2 was inconsistent — said 5 arms, defined 4. v3 just uses
+  `StageOutcome<()>`.
+- **Q3** (fabric ingress tuple): v3 returns a small named struct
+  `FabricIngressOutcome { ingress_zone_override, packet_fabric_ingress }`.
+- **Q4** (fuse screen+ipsec?): no, keep them separate; different
+  inputs, side effects, ordering matters.
+- **Q5** (hidden invariants): documented at the bottom.
 
 ## v2 changes (Codex round-1 findings)
 
@@ -65,7 +115,30 @@ So scratch_forwards is the slow-path batch boundary; the fast path
 bypasses it. Phase 1 doesn't touch either of these — it adds named
 seams to the per-packet code that runs before both paths.
 
-## Stage inventory (corrected v2)
+## All 9 continue/recycle sites in the loop body (v3)
+
+For Phase 1 to be behavior-preserving we have to account for every
+existing `continue;` in the while-let. Codex round 2 enumerated them:
+
+| Line | Site | Recycles? | Phase 1? |
+|------|------|-----------|----------|
+| 53   | UMEM slice failed | yes | yes (stage 2-4) |
+| 76   | ARP reply | yes | yes (stage 5) |
+| 80   | ARP other | yes | yes (stage 5) |
+| 183  | Screen drop | yes | yes (stage 10) |
+| 221  | IPsec passthrough | yes | yes (stage 11) |
+| 297  | Flow-cache TTL ICMP-TE generated | no (returned via pending_fill_frames) | NO — flow-cache stage deferred |
+| 397  | Flow-cache slow-path fallback (scratch_forwards push) | no (recycled later as part of forward) | NO — flow-cache deferred |
+| 433  | Flow-cache in-place rewrite success | no (frame travels as TX) | NO — flow-cache deferred |
+| 535  | Session-hit TTL ICMP-TE generated | no (same as 297) | NO — session-hit stage deferred |
+| 604  | Cluster-peer-return fast path | no (frame travels via fabric TX) | NO — cluster-peer stage deferred |
+
+Phase 1 covers continues at 53, 76, 80, 183, 221 — every one of these
+is a recycle-and-continue (the simple StageOutcome shape). The 5
+deferred continues all leave the per-packet body via TX-side paths,
+not via recycle, and live in the deferred stages 12–16.
+
+## Stage inventory (corrected v3)
 
 The while-let body executes this sequence per descriptor:
 
@@ -138,128 +211,217 @@ in the main function for now:
   ~1,000+ LOC with deeply intertwined state and no obvious seams.
   **Scope choice**: each gets its own phase.
 
-## Phase 1 stage signatures (concrete)
+## Phase 1 stage signatures (concrete v3)
 
 ```rust
 // Generic outcome for stages with a single non-recycle output.
+// Used everywhere in Phase 1.
 enum StageOutcome<T> {
     RecycleAndContinue,
     Continue(T),
 }
 
-// Stage 2-4 combined: parse metadata, classify, slice the UMEM frame.
+// Small named struct — clearer than the (Option<u16>, bool) tuple
+// used by stage 9. Caller pattern-matches on both fields.
+struct FabricIngressOutcome {
+    ingress_zone_override: Option<u16>,
+    packet_fabric_ingress: bool,
+}
+
+// ── Stage 2-4: parse metadata, classify, slice UMEM ──────────────
+//
+// Side effects handled INSIDE the helper to preserve current
+// behavior:
+//   - Parse failure: telemetry.dbg.metadata_err += 1,
+//     binding.live.metadata_errors.fetch_add, record_exception.
+//   - Non-Valid disposition: record_disposition (live counters +
+//     recent_exceptions).
+// Returns RecycleAndContinue on either failure path; Continue on
+// successful parse + classify + slice.
 fn stage_parse_and_classify<'a>(
     desc: &XdpDesc,
     area: &'a MmapArea,
     validation: ValidationState,
+    binding_live: &BindingLiveState,
+    ident: &WorkerIdent,
+    forwarding: &ForwardingState,
+    recent_exceptions: &RecentExceptions,
     telemetry: &mut TelemetryContext,
 ) -> StageOutcome<(UserspaceDpMeta, &'a [u8])>;
 
-// Stage 5: ARP/NDP. 5 distinct arms, side effects internal.
-enum LinkLayerOutcome {
-    /// ARP reply: dynamic neighbor was learned, recycle the frame.
-    ArpLearnAndRecycle,
-    /// ARP request/other: recycle without learning.
-    ArpRecycle,
-    /// NDP NA: dynamic neighbor was learned, fall through.
-    NdpLearnAndContinue,
-    /// Plain non-link-layer packet: fall through.
-    Continue,
-}
-
+// ── Stage 5: ARP / NDP classification ─────────────────────────────
+//
+// All 4 cases (ARP reply learn-and-recycle, ARP request/other
+// recycle, NDP NA learn-and-fall-through, plain fall-through)
+// collapse to RecycleAndContinue + Continue. Neighbor-learn side
+// effects are kept inside the helper — downstream code does not
+// read the learned neighbor for the same packet.
 fn stage_link_layer_classify(
     raw_frame: &[u8],
     meta: UserspaceDpMeta,
     worker_ctx: &WorkerContext,
-) -> LinkLayerOutcome;
+) -> StageOutcome<()>;
 
-// Stage 6: GRE decap. Returns (new_meta, optional owned decap frame).
-// The caller binds `packet_frame: &[u8]` from owned_packet_frame.as_deref()
-// .unwrap_or(raw_frame). Helper does NOT return the slice — that would
-// be a self-referential return type.
+// ── Stage 6: GRE decap ────────────────────────────────────────────
+//
+// Returns the (possibly-updated) meta + the optional owned decap
+// frame. Caller binds the active slice locally:
+//
+//   let (meta, owned) = stage_native_gre_decap(raw_frame, meta, ...);
+//   let packet_frame = owned.as_deref().unwrap_or(raw_frame);
+//
+// `owned_packet_frame: Option<Vec<u8>>` must be a `mut` binding
+// because deferred stage-12+ code calls `.take()` (lines 419, 583,
+// 1814).
 fn stage_native_gre_decap(
     raw_frame: &[u8],
     meta: UserspaceDpMeta,
     forwarding: &ForwardingState,
 ) -> (UserspaceDpMeta, Option<Vec<u8>>);
 
-// Stage 7+8 combined: parse flow, learn dynamic neighbor as side
-// effect. Combined name flags the side effect (per Codex).
+// ── Stage 7+8: parse flow + learn dynamic neighbor ───────────────
+//
+// `learn_from_live_frame` MUST be true only when the active slice
+// is the un-decapped raw_frame (i.e. owned_packet_frame.is_none() at
+// call site). Mirrors the current GRE guard at line 113.
+//
+// Narrowed binding access — only takes &mut binding.last_learned_neighbor
+// (not the whole BindingWorker).
 fn stage_parse_flow_and_learn(
     area: &MmapArea,
     desc: &XdpDesc,
     packet_frame: &[u8],
     meta: UserspaceDpMeta,
-    binding: &mut BindingWorker,
+    learn_from_live_frame: bool,
+    last_learned_neighbor: &mut Option<LearnedNeighborKey>,
     worker_ctx: &WorkerContext,
 ) -> Option<SessionFlow>;
 
-// Stage 9: fabric ingress. Mutates meta. Returns the bool needed by
-// later stages.
+// ── Stage 9: fabric ingress classification ────────────────────────
+//
+// Mutates meta in place to set FABRIC_INGRESS_FLAG when applicable.
+// Returns a named struct with both outputs.
 fn stage_classify_fabric_ingress(
     packet_frame: &[u8],
     meta: &mut UserspaceDpMeta,
     worker_ctx: &WorkerContext,
-) -> (Option<u16>, bool);  // (ingress_zone_override, packet_fabric_ingress)
+) -> FabricIngressOutcome;
 
-// Stage 10: screen/IDS slow path.
+// ── Stage 10: screen / IDS slow path ──────────────────────────────
+//
+// Adds packet_frame and now_secs (Codex round-2 finding 3). Caller
+// owns the recycle push; helper only increments
+// binding.live.screen_drops on a Drop verdict.
 fn stage_screen_check(
     flow: Option<&SessionFlow>,
+    packet_frame: &[u8],
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
-    binding: &mut BindingWorker,
+    now_secs: u64,
     screen: &mut ScreenState,
+    binding_live: &BindingLiveState,
     worker_ctx: &WorkerContext,
 ) -> StageOutcome<()>;
 
-// Stage 11: IPsec passthrough.
+// ── Stage 11: IPsec passthrough ───────────────────────────────────
 fn stage_ipsec_passthrough_check(
     flow: Option<&SessionFlow>,
     packet_frame: &[u8],
     meta: UserspaceDpMeta,
-    binding: &mut BindingWorker,
+    binding_live: &BindingLiveState,
     worker_ctx: &WorkerContext,
 ) -> StageOutcome<()>;
 ```
 
-The main loop body becomes:
+The main loop body becomes (compile-realistic v3):
 
 ```rust
 while let Some(desc) = received.read() {
     stage_record_rx_telemetry(desc, area, telemetry, worker_ctx);
-    let StageOutcome::Continue((mut meta, raw_frame)) =
-        stage_parse_and_classify(desc, unsafe { &*area }, validation, telemetry)
-    else {
+    let mut recycle_now = true;  // restored — deferred stages 12+
+                                 // toggle this when packet leaves
+                                 // via TX (flow-cache, session-hit
+                                 // TTL, cluster-peer-return).
+    let StageOutcome::Continue((mut meta, raw_frame)) = stage_parse_and_classify(
+        desc,
+        unsafe { &*area },
+        validation,
+        &binding.live,
+        &worker_ctx.ident,
+        worker_ctx.forwarding,
+        worker_ctx.recent_exceptions,
+        telemetry,
+    ) else {
         binding.scratch.scratch_recycle.push(desc.addr);
         continue;
     };
-    match stage_link_layer_classify(raw_frame, meta, worker_ctx) {
-        LinkLayerOutcome::ArpLearnAndRecycle | LinkLayerOutcome::ArpRecycle => {
-            binding.scratch.scratch_recycle.push(desc.addr);
-            continue;
-        }
-        LinkLayerOutcome::NdpLearnAndContinue | LinkLayerOutcome::Continue => {}
+
+    if let StageOutcome::RecycleAndContinue =
+        stage_link_layer_classify(raw_frame, meta, worker_ctx)
+    {
+        binding.scratch.scratch_recycle.push(desc.addr);
+        continue;
     }
-    let (new_meta, owned_packet_frame) = stage_native_gre_decap(
-        raw_frame, meta, worker_ctx.forwarding,
-    );
+
+    let (new_meta, mut owned_packet_frame) =  // mut: deferred .take() at lines 419, 583, 1814
+        stage_native_gre_decap(raw_frame, meta, worker_ctx.forwarding);
     meta = new_meta;
     let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);
-    let flow = stage_parse_flow_and_learn(...);
-    let (ingress_zone_override, packet_fabric_ingress) =
+
+    let flow = stage_parse_flow_and_learn(
+        unsafe { &*area },
+        desc,
+        packet_frame,
+        meta,
+        owned_packet_frame.is_none(),  // GRE guard — preserves line-113 behavior
+        &mut binding.last_learned_neighbor,
+        worker_ctx,
+    );
+
+    let FabricIngressOutcome { ingress_zone_override, packet_fabric_ingress } =
         stage_classify_fabric_ingress(packet_frame, &mut meta, worker_ctx);
-    if let StageOutcome::RecycleAndContinue = stage_screen_check(...) {
+
+    if let StageOutcome::RecycleAndContinue = stage_screen_check(
+        flow.as_ref(),
+        packet_frame,
+        meta,
+        ingress_zone_override,
+        now_secs,
+        screen,
+        &binding.live,
+        worker_ctx,
+    ) {
         binding.scratch.scratch_recycle.push(desc.addr);
         continue;
     }
-    if let StageOutcome::RecycleAndContinue = stage_ipsec_passthrough_check(...) {
+
+    if let StageOutcome::RecycleAndContinue = stage_ipsec_passthrough_check(
+        flow.as_ref(),
+        packet_frame,
+        meta,
+        &binding.live,
+        worker_ctx,
+    ) {
         binding.scratch.scratch_recycle.push(desc.addr);
         continue;
     }
-    // Stages 12-16 stay inline in this PR.
+
+    // ── Deferred stages 12-16 stay inline in this PR ────────────────
+    // Flow-cache fast path, session lookup, slow-path policy/NAT/
+    // forwarding, reverse-NAT/ICMP, MissingNeighbor side queue.
+    // These stages can call owned_packet_frame.take() and may set
+    // recycle_now = false when the packet leaves via TX.
     ...
+
+    if recycle_now {
+        binding.scratch.scratch_recycle.push(desc.addr);
+    }
 }
 ```
+
+Note: the trailing `if recycle_now` is the ORIGINAL behavior at
+[poll_descriptor.rs:2205–2207](../../../userspace-dp/src/afxdp/poll_descriptor.rs).
+Phase 1 preserves it.
 
 ## Why this is safe / shippable
 
@@ -276,17 +438,38 @@ while let Some(desc) = received.read() {
   inlining its callsite is a transformation rustc verifies via type
   checking. The explicit StageOutcome arms make every early-return
   path a compile-time-checked variant.
-- **Hidden ordering invariants** (Codex finding 6) are preserved
-  because the per-packet stage order in the new while-let body is
-  byte-identical to the inline order:
-  - ARP recycles before forwarding (stages 5 → continue).
-  - NDP learns AND falls through (LinkLayerOutcome::NdpLearnAndContinue).
-  - GRE decap precedes flow/screen/fabric (stage 6 before 7).
-  - Fabric flags feed later forwarding (stage 9 mutates meta in
-    place; later stages see the updated flags).
-  - `raw_frame` vs `packet_frame` is preserved by the caller-binds
-    pattern: helper returns `Option<Vec<u8>>`, caller does
-    `let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);`.
+- **Hidden ordering invariants** preserved (per Codex round 2):
+  - **Metadata/disposition side effects fire BEFORE recycle.**
+    `record_disposition` and `record_exception` both update
+    `binding.live.*` and `recent_exceptions` before the recycle
+    push. v3's stage_parse_and_classify keeps this ordering by
+    firing the side effects internally before returning
+    RecycleAndContinue.
+  - **`validated_packets`/`validated_bytes` increment BEFORE
+    raw-frame slice success** (poll_descriptor.rs:47–48 vs 49).
+    v3's stage_parse_and_classify increments these between
+    classify and slice.
+  - **Dynamic-neighbor learning only for non-GRE-owned frames**
+    (line 113 guard). v3's `learn_from_live_frame` flag passes
+    `owned_packet_frame.is_none()` from the caller.
+  - **`raw_frame` must stay available for deferred TTL/ICMP paths.**
+    The flow-cache TTL path at line 281 and session-hit TTL path
+    use `raw_frame` directly (NOT `packet_frame`). v3's caller
+    binds both: `let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);`
+    — `raw_frame` is preserved for deferred code.
+  - **`meta_flags` mutation must precede screen/IPsec/flow-cache.**
+    Stage 9 sets `FABRIC_INGRESS_FLAG`. Screen (10), IPsec (11),
+    and the deferred flow-cache (12) all read meta after stage 9
+    so they see the flag. v3's loop sketch shows the ordering
+    explicitly: stage 9 → 10 → 11 → deferred 12+.
+  - **ARP recycles BEFORE normal forwarding** (stages 5 → continue).
+  - **NDP learns AND falls through** (StageOutcome::Continue
+    after the helper updates dynamic_neighbors internally).
+  - **GRE decap precedes flow/screen/fabric** (stage 6 before 7
+    before 9 before 10).
+  - **`owned_packet_frame` is `mut`** — deferred stage code at
+    lines 419, 583, 1814 calls `.take()`. The new sketch reflects
+    this.
 
 ## Test plan
 
