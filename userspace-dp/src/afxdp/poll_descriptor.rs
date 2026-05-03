@@ -10,7 +10,7 @@ use super::*;
 
 // Per-batch packet processing lifted from `poll_binding` (#678).
 //
-// Runs `binding.rx.receive(available)` + the descriptor while-let +
+// Runs `binding.xsk.rx.receive(available)` + the descriptor while-let +
 // `received.release(); drop(received);` as its own compilation unit so
 // it surfaces under its own symbol in `perf top`. Body is byte-for-byte
 // identical to the previous inner-loop content; only the enclosing
@@ -33,7 +33,7 @@ pub(super) fn poll_binding_process_descriptor(
     worker_ctx: &WorkerContext,
     telemetry: &mut TelemetryContext,
 ) {
-        let mut received = binding.rx.receive(available);
+        let mut received = binding.xsk.rx.receive(available);
         binding.scratch.scratch_recycle.clear();
         binding.scratch.scratch_forwards.clear();
         binding.scratch.scratch_rst_teardowns.clear();

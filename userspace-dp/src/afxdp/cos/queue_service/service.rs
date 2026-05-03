@@ -98,6 +98,7 @@ pub(super) fn service_exact_local_queue_direct(
     }
 
     let mut writer = binding
+        .xsk
         .tx
         .transmit(binding.scratch.scratch_exact_local_tx.len() as u32);
     let inserted = writer.insert(binding.scratch.scratch_exact_local_tx.iter().map(|req| XdpDesc {
@@ -245,7 +246,7 @@ fn service_exact_local_queue_direct_flow_fair(
         return false;
     }
 
-    let mut writer = binding.tx.transmit(binding.scratch.scratch_local_tx.len() as u32);
+    let mut writer = binding.xsk.tx.transmit(binding.scratch.scratch_local_tx.len() as u32);
     let inserted = writer.insert(
         binding
             .scratch.scratch_local_tx
@@ -412,6 +413,7 @@ pub(super) fn service_exact_prepared_queue_direct(
     }
 
     let mut writer = binding
+        .xsk
         .tx
         .transmit(binding.scratch.scratch_exact_prepared_tx.len() as u32);
     let inserted = writer.insert(binding.scratch.scratch_exact_prepared_tx.iter().map(|req| XdpDesc {
@@ -559,6 +561,7 @@ fn service_exact_prepared_queue_direct_flow_fair(
     }
 
     let mut writer = binding
+        .xsk
         .tx
         .transmit(binding.scratch.scratch_prepared_tx.len() as u32);
     let inserted = writer.insert(binding.scratch.scratch_prepared_tx.iter().map(|req| XdpDesc {

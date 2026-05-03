@@ -24,13 +24,13 @@ pub(in crate::afxdp) fn reap_tx_completions(
     if binding.tx_pipeline.outstanding_tx == 0 {
         return 0;
     }
-    let available = binding.device.available();
+    let available = binding.xsk.device.available();
     if available == 0 {
         return 0;
     }
     let mut reaped = 0u32;
     binding.scratch.scratch_completed_offsets.clear();
-    let mut completed = binding.device.complete(available);
+    let mut completed = binding.xsk.device.complete(available);
     while let Some(offset) = completed.read() {
         binding.scratch.scratch_completed_offsets.push(offset);
         reaped += 1;
@@ -95,7 +95,7 @@ pub(in crate::afxdp) fn drain_pending_fill(binding: &mut BindingWorker, now_ns: 
         return false;
     }
     let inserted = {
-        let mut fill = binding.device.fill(binding.scratch.scratch_fill.len() as u32);
+        let mut fill = binding.xsk.device.fill(binding.scratch.scratch_fill.len() as u32);
         let inserted = fill.insert(binding.scratch.scratch_fill.iter().copied());
         fill.commit();
         inserted
@@ -120,7 +120,7 @@ pub(in crate::afxdp) fn drain_pending_fill(binding: &mut BindingWorker, now_ns: 
     // lost-wakeup stalls from the race between commit() and needs_wakeup.
     // Without the needs_wakeup gate, every drain triggers a sendto() syscall
     // (142K/sec at line rate), spending ~20% CPU in syscall entry/exit.
-    if binding.device.needs_wakeup()
+    if binding.xsk.device.needs_wakeup()
         || now_ns.saturating_sub(binding.timers.last_rx_wake_ns) >= FILL_WAKE_SAFETY_INTERVAL_NS
     {
         maybe_wake_rx(binding, true, now_ns);
@@ -148,7 +148,7 @@ pub(in crate::afxdp) fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, 
             return;
         }
     }
-    let fd = binding.device.as_raw_fd();
+    let fd = binding.xsk.device.as_raw_fd();
     // Use poll(POLLIN) for RX wakeup — triggers XDP_WAKEUP_RX.
     let mut pfd = libc::pollfd {
         fd,
@@ -211,12 +211,13 @@ fn recycle_completed_tx_offset(
 pub(in crate::afxdp) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, now_ns: u64) {
     let bind_mode = XskBindMode::from_u8(binding.live.bind_mode.load(Ordering::Relaxed));
     if !bind_mode.is_zerocopy()
-        || binding.tx.needs_wakeup()
+        || binding.xsk.tx.needs_wakeup()
         || force
         || now_ns.saturating_sub(binding.timers.last_tx_wake_ns) >= TX_WAKE_MIN_INTERVAL_NS
     {
-        // Use direct sendto() instead of binding.tx.wake() so we can capture errors.
-        let fd = binding.tx.as_raw_fd();
+        // Use a direct sendto() syscall (not any wrapper) so we can
+        // observe errno and feed the #825 kick-latency telemetry.
+        let fd = binding.xsk.tx.as_raw_fd();
         // #825 plan §3.3 site 1: two fresh `monotonic_nanos()` calls
         // bracket the `sendto` syscall. `now_ns` is caller-cached —
         // stale up to `IDLE_SPIN_ITERS * spin_cost` per #812 §3.1 R1
