@@ -9,6 +9,7 @@ package grpcapi
 import (
 	"encoding/binary"
 	"fmt"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -115,6 +116,12 @@ func (s *Server) showNATSourceRuleDetail(cfg *config.Config, buf *strings.Builde
 			}
 			return true
 		})
+		_ = s.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+			}
+			return true
+		})
 	}
 
 	ruleIdx := 0
@@ -205,6 +212,12 @@ func (s *Server) showNATDestRuleDetail(cfg *config.Config, buf *strings.Builder)
 			}
 			return true
 		})
+		_ = s.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
+				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+			}
+			return true
+		})
 	}
 
 	ruleIdx := 0
@@ -273,15 +286,40 @@ func (s *Server) showPersistentNATDetail(buf *strings.Builder) {
 		buf.WriteString("No persistent NAT bindings\n")
 		return
 	}
+	// natKey uses a unified `netip.Addr` so v4 and v6 NAT IPs share
+	// one map. v4 sessions are stored via `netip.AddrFrom4` and v6
+	// sessions via `netip.AddrFrom16` — matching the producer side
+	// in conntrack/gc.go (Save calls). Persistent-NAT bindings store
+	// `netip.Addr` directly so the lookup matches without
+	// family-specific shimming (was: hardcoded `b.NatIP.As4()` which
+	// panicked on v6 bindings).
 	type natKey struct {
-		ip   uint32
+		addr netip.Addr
 		port uint16
 	}
 	sessionCounts := make(map[natKey]int)
 	if s.dp.IsLoaded() {
 		_ = s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
-				sessionCounts[natKey{val.NATSrcIP, val.NATSrcPort}]++
+				// SessionValue.NATSrcIP is a `uint32` holding the IP's
+				// network-order bytes in native-endian word form (the
+				// BPF `__be32` is serialized as native-endian uint32 by
+				// cilium/ebpf; see CLAUDE.md "Byte Order"). Recover the
+				// original 4 bytes via NativeEndian.PutUint32 to match
+				// conntrack/gc.go:277-279's storage path. Do NOT use
+				// BigEndian here — that would re-swap the bytes.
+				var ip4 [4]byte
+				binary.NativeEndian.PutUint32(ip4[:], val.NATSrcIP)
+				sessionCounts[natKey{netip.AddrFrom4(ip4), val.NATSrcPort}]++
+			}
+			return true
+		})
+		_ = s.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+				// Match conntrack/gc.go:397 — no Unmap, the binding
+				// stores the 16-byte form for v6 NAT.
+				addr := netip.AddrFrom16(val.NATSrcIP)
+				sessionCounts[natKey{addr, val.NATSrcPort}]++
 			}
 			return true
 		})
@@ -296,12 +334,7 @@ func (s *Server) showPersistentNATDetail(buf *strings.Builder) {
 		if remaining < 0 {
 			remaining = 0
 		}
-		natIP := b.NatIP.As4()
-		nk := natKey{
-			ip:   binary.NativeEndian.Uint32(natIP[:]),
-			port: b.NatPort,
-		}
-		sessions := sessionCounts[nk]
+		sessions := sessionCounts[natKey{b.NatIP, b.NatPort}]
 
 		fmt.Fprintf(buf, "Persistent NAT binding:\n")
 		fmt.Fprintf(buf, "  Internal IP:        %s\n", b.SrcIP)
