@@ -58,6 +58,7 @@ pub(super) struct FabricIngressOutcome {
 /// mutability behind `Arc`) and the kernel ARP/NDP table are kept
 /// inside this helper — the caller does not need visibility into
 /// the learned neighbor for the same packet.
+#[inline]
 pub(super) fn stage_link_layer_classify(
     raw_frame: &[u8],
     meta: UserspaceDpMeta,
@@ -114,12 +115,19 @@ pub(super) fn stage_link_layer_classify(
 /// ```
 ///
 /// `owned_packet_frame: Option<Vec<u8>>` MUST be a `mut` binding at
-/// the call site because deferred stage-12+ code calls `.take()` on
-/// it (poll_descriptor.rs lines 419, 583, 1814).
+/// the call site because the deferred stage-12+ code in
+/// `poll_descriptor.rs` calls `.take()` on it (grep
+/// `owned_packet_frame.take(` — the deferred flow-cache,
+/// session-hit reverse-NAT, and missing-neighbor side-queue paths
+/// each move the owned decap frame out before pushing the
+/// resulting forward request). Symbol references rather than line
+/// numbers because the line numbers drift any time a stage above
+/// is touched.
 ///
 /// The helper does NOT return the active slice — that would be a
 /// self-referential return type (the slice would borrow from the
 /// returned `Vec`).
+#[inline]
 pub(super) fn stage_native_gre_decap(
     raw_frame: &[u8],
     meta: UserspaceDpMeta,
@@ -147,6 +155,7 @@ pub(super) fn stage_native_gre_decap(
 ///
 /// Side effects: `worker_ctx.dynamic_neighbors` (interior mut),
 /// `last_learned_neighbor` (caller's &mut), kernel neighbor table.
+#[inline]
 pub(super) fn stage_parse_flow_and_learn(
     area: &MmapArea,
     desc: XdpDesc,
@@ -186,6 +195,7 @@ pub(super) fn stage_parse_flow_and_learn(
 /// `FABRIC_INGRESS_FLAG` is required to skip TTL decrement on
 /// fabric-traversed packets (the sending peer already decremented
 /// TTL when forwarding across the fabric link).
+#[inline]
 pub(super) fn stage_classify_fabric_ingress(
     packet_frame: &[u8],
     meta: &mut UserspaceDpMeta,
@@ -213,6 +223,7 @@ pub(super) fn stage_classify_fabric_ingress(
 /// verdict, increments `binding_live.screen_drops` and returns
 /// `RecycleAndContinue` — the caller still owns the recycle push
 /// (matching the original code's pattern).
+#[inline]
 pub(super) fn stage_screen_check(
     flow: Option<&SessionFlow>,
     packet_frame: &[u8],
@@ -277,6 +288,7 @@ pub(super) fn stage_screen_check(
 /// `RecycleAndContinue` so the caller drops the UMEM frame.
 ///
 /// Non-IPsec packets fall through unchanged.
+#[inline]
 pub(super) fn stage_ipsec_passthrough_check(
     flow: Option<&SessionFlow>,
     packet_frame: &[u8],

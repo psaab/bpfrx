@@ -1,6 +1,31 @@
 # #946 Phase 1 — Extract Per-Packet Sub-Stages from `poll_binding_process_descriptor`
 
-Status: **DRAFT v3 — addressing Codex round-2 PLAN-NEEDS-MAJOR**
+Status: **FINAL v3.2 — shipped as PR #1179, commit ea8fa4e6**
+
+## v3.2 changes vs v3.1 (post-implementation reconciliation)
+
+During implementation we narrowed the scope by one notch from
+what v3.1 specified. The original v3.1 plan listed eight
+extracted stages (1, 2-4, 5, 6, 7+8, 9, 10, 11). The shipped
+PR extracts SEVEN stages: stages 5, 6, 7+8, 9, 10, 11.
+Stages 1 (`stage_record_rx_telemetry`) and 2-4
+(`stage_parse_and_classify`) are kept inline because:
+
+- Stage 1 was already named (`record_rx_descriptor_telemetry` is
+  pre-existing in `poll_descriptor.rs:2258`). Re-extracting it
+  into the new `poll_stages` module would just be relocation.
+- Stage 2-4 (`stage_parse_and_classify`) would have to fire the
+  metadata-error and non-Valid-disposition side effects internally
+  to preserve behavior (a 7-arg signature: `binding_live`, `ident`,
+  `forwarding`, `recent_exceptions` plus the inputs). The original
+  if-let-else structure colocates those side effects at the bottom
+  of the loop body (poll_descriptor.rs:2181–2204). Extracting it
+  would have widened the helper's responsibility for marginal
+  seam value (stages 2-4 are ~15 LOC).
+
+Code-motion delta: 7 stages = ~150 LOC moved, vs the original
+v3.1 estimate of 8 stages = ~200 LOC. Same architectural seams;
+slightly tighter scope.
 
 ## v3 changes (Codex round-2 findings)
 
@@ -172,11 +197,13 @@ That's ~2,400 LOC of branchy per-packet code in one function.
 
 ## Phase 1 scope (explicit)
 
-**In scope** — extract these as named functions:
+**In scope (as shipped in v3.2)** — extract these as named functions:
 
-- (1) `stage_record_rx_telemetry`
-- (2)+(3)+(4) `stage_parse_and_classify` → `StageOutcome<ParsedFrame>`
-   where `ParsedFrame` carries `meta` + `raw_frame: &'a [u8]`.
+- Stage 1 (`record_rx_descriptor_telemetry`) was already extracted
+  pre-#946 (`poll_descriptor.rs:2258`); keeping that name.
+- Stages 2-4 (parse meta, classify, slice raw_frame) **stay inline**
+  in `poll_descriptor.rs` — see v3.2 reconciliation note at the top
+  of this doc.
 - (5) `stage_link_layer_classify` → `StageOutcome<()>` (per Codex
   round-2 answer to Q2: collapse the four ARP/NDP arms; side
   effects on `dynamic_neighbors` stay inside the helper).
@@ -228,26 +255,17 @@ struct FabricIngressOutcome {
     packet_fabric_ingress: bool,
 }
 
-// ── Stage 2-4: parse metadata, classify, slice UMEM ──────────────
+// ── Stages 2-4 NOT EXTRACTED in v3.2 ─────────────────────────────
 //
-// Side effects handled INSIDE the helper to preserve current
-// behavior:
-//   - Parse failure: telemetry.dbg.metadata_err += 1,
-//     binding.live.metadata_errors.fetch_add, record_exception.
-//   - Non-Valid disposition: record_disposition (live counters +
-//     recent_exceptions).
-// Returns RecycleAndContinue on either failure path; Continue on
-// successful parse + classify + slice.
-fn stage_parse_and_classify<'a>(
-    desc: &XdpDesc,
-    area: &'a MmapArea,
-    validation: ValidationState,
-    binding_live: &BindingLiveState,
-    ident: &BindingIdentity,
-    forwarding: &ForwardingState,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
-    telemetry: &mut TelemetryContext,
-) -> StageOutcome<(UserspaceDpMeta, &'a [u8])>;
+// Original v3.1 plan included a `stage_parse_and_classify` helper
+// here. Implementation revealed that preserving the
+// metadata-error and non-Valid-disposition side effects
+// (record_exception, record_disposition, live.metadata_errors)
+// requires a 7-arg signature with helper-internal side effects,
+// while the current if-let-else structure colocates those side
+// effects at the bottom of the loop body
+// (poll_descriptor.rs:2181-2204). Marginal seam value vs widened
+// helper responsibility — left inline. Phase 1.5 / 2 can revisit.
 
 // ── Stage 5: ARP / NDP classification ─────────────────────────────
 //
@@ -333,32 +351,31 @@ fn stage_ipsec_passthrough_check(
 ) -> StageOutcome<()>;
 ```
 
-The main loop body becomes (compile-realistic v3):
+The main loop body becomes (as shipped in v3.2 — stages 1-4 stay
+inline; stages 5-11 dispatch into `poll_stages.rs`):
 
 ```rust
 while let Some(desc) = received.read() {
-    stage_record_rx_telemetry(desc, area, telemetry, worker_ctx);
-    let mut recycle_now = true;  // restored — deferred stages 12+
-                                 // toggle this when packet leaves
-                                 // via TX (flow-cache, session-hit
-                                 // TTL, cluster-peer-return).
-    let StageOutcome::Continue((mut meta, raw_frame)) = stage_parse_and_classify(
-        desc,
-        unsafe { &*area },
-        validation,
-        &binding.live,
-        &worker_ctx.ident,
-        worker_ctx.forwarding,
-        worker_ctx.recent_exceptions,
-        telemetry,
-    ) else {
-        binding.scratch.scratch_recycle.push(desc.addr);
-        continue;
-    };
+    record_rx_descriptor_telemetry(desc, area, telemetry, worker_ctx);
+    let mut recycle_now = true;  // deferred stages 12+ toggle this
+                                 // when packet leaves via TX
+                                 // (flow-cache, session-hit TTL,
+                                 // cluster-peer-return).
+    if let Some(meta) = try_parse_metadata(unsafe { &*area }, desc) {
+        telemetry.counters.metadata_packets += 1;
+        let disposition = classify_metadata(meta, validation);
+        if disposition == PacketDisposition::Valid {
+            telemetry.counters.validated_packets += 1;
+            telemetry.counters.validated_bytes += desc.len as u64;
+            let Some(raw_frame) = unsafe { &*area }.slice(...) else {
+                binding.scratch.scratch_recycle.push(desc.addr);
+                continue;
+            };
 
-    if let StageOutcome::RecycleAndContinue =
-        stage_link_layer_classify(raw_frame, meta, worker_ctx)
-    {
+            // ── Phase 1 stages 5-11 dispatch here ─────────────────
+            if let StageOutcome::RecycleAndContinue =
+                stage_link_layer_classify(raw_frame, meta, worker_ctx)
+            {
         binding.scratch.scratch_recycle.push(desc.addr);
         continue;
     }
@@ -413,6 +430,13 @@ while let Some(desc) = received.read() {
     // recycle_now = false when the packet leaves via TX.
     ...
 
+        } else {
+            record_disposition(...);  // non-Valid disposition
+        }
+    } else {
+        // metadata parse failure — fires record_exception, etc.
+        ...
+    }
     if recycle_now {
         binding.scratch.scratch_recycle.push(desc.addr);
     }

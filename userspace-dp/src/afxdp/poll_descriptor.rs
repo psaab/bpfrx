@@ -17,9 +17,16 @@ use super::poll_stages::{
 //
 // Runs `binding.xsk.rx.receive(available)` + the descriptor while-let +
 // `received.release(); drop(received);` as its own compilation unit so
-// it surfaces under its own symbol in `perf top`. Body is byte-for-byte
-// identical to the previous inner-loop content; only the enclosing
-// function boundary is new.
+// it surfaces under its own symbol in `perf top`.
+//
+// #946 Phase 1 (commit ea8fa4e6) extracted seven per-packet
+// sub-stages out of the while-let body into named helpers in
+// `afxdp/poll_stages.rs`. The helpers are all `#[inline]` so the
+// extracted bodies stay in the caller's CGU and the call/return
+// overhead is amortized to zero — the refactor is pure
+// code-motion at the IR level (modulo what rustc's inliner picks
+// up; the explicit hint matches other hot-path extractions in
+// this repo).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn poll_binding_process_descriptor(
     binding: &mut BindingWorker,
