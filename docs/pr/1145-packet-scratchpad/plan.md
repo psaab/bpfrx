@@ -8,10 +8,23 @@ DRAFT — for Codex + Gemini design review.
 
 REV-2 — addresses Codex round-1 PROCEED-WITH-CHANGES (5 corrections).
 Gemini Pro REJECTed claiming mut+immut aliasing UB; Codex
-investigated and disproved — the mutation paths
-(`apply_rewrite_descriptor`, `rewrite_forwarded_frame_in_place`)
-take the flow-cache fast path which `continue`s at
-poll_descriptor.rs:435 before any redundant slice site runs.
+investigated and disproved.
+
+Aliasing argument (corrected per Codex round-2 finding):
+- The mutating helpers (`apply_rewrite_descriptor`,
+  `rewrite_forwarded_frame_in_place`) at poll_descriptor.rs:351-369
+  produce a short-lived `&mut [u8]` borrow that is consumed inside
+  the helper and dropped before control returns. Once the helper
+  returns, no `&mut [u8]` is alive — `raw_frame: &[u8]` is the only
+  borrow.
+- The flow-cache fast path then `continue`s at line 435; redundant
+  slice sites at 871, 965, 1175, 1643 run only on iterations where
+  the fast-path mutation did NOT happen (or in the non-fast-path
+  branch). Site 280 and 521 run BEFORE the line-351 rewrite, so the
+  mutating borrow doesn't yet exist when those sites read the frame.
+- `raw_frame` and the rewrite's `&mut [u8]` thus never coexist in
+  the same control-flow point; no aliasing.
+
 Per the project's Gemini-low-signal-on-refactor memory rule and
 the verified disproof, proceeding on Codex.
 
