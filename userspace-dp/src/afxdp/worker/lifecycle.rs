@@ -115,8 +115,8 @@ pub(super) fn poll_binding(
 
         let raw_avail = binding.rx.available();
         let available = raw_avail.min(RX_BATCH_SIZE);
-        if raw_avail > 0 && !binding.xsk_rx_confirmed {
-            binding.xsk_rx_confirmed = true;
+        if raw_avail > 0 && !binding.bind_meta.xsk_rx_confirmed {
+            binding.bind_meta.xsk_rx_confirmed = true;
         }
         if cfg!(feature = "debug-log") {
             if raw_avail > 0 {
