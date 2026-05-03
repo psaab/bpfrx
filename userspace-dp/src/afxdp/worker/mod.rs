@@ -34,6 +34,11 @@ pub(crate) use bpf_maps::WorkerBpfMaps;
 mod timers;
 pub(crate) use timers::WorkerTimers;
 
+// #959 Phase 7: per-binding TX pipeline state lives in
+// worker/tx_pipeline.rs.
+mod tx_pipeline;
+pub(crate) use tx_pipeline::WorkerTxPipeline;
+
 // #957 P1: worker-side CoS runtime helpers split out into a sibling
 // submodule. Note this module is `worker::cos`, separate from the
 // `afxdp::cos` directory module imported below as `super::cos`.
@@ -73,52 +78,21 @@ pub(crate) struct BindingWorker {
     pub(crate) device: crate::xsk_ffi::DeviceQueue,
     pub(crate) rx: crate::xsk_ffi::RingRx,
     pub(crate) tx: crate::xsk_ffi::RingTx,
-    pub(crate) free_tx_frames: VecDeque<u64>,
-    pub(crate) pending_tx_prepared: VecDeque<PreparedTxRequest>,
-    pub(crate) pending_tx_local: VecDeque<TxRequest>,
-    pub(crate) max_pending_tx: usize,
+    /// #959 Phase 7: 7 TX pipeline fields extracted into
+    /// `WorkerTxPipeline`. Field semantics unchanged; access via
+    /// `binding.tx_pipeline.X`.
+    pub(crate) tx_pipeline: WorkerTxPipeline,
     /// #959 Phase 3: 5 `cos_*` per-binding CoS scheduling fields
     /// extracted into `WorkerCos`. Field semantics unchanged;
     /// access via `binding.cos.cos_X`.
     pub(crate) cos: WorkerCos,
-    pub(crate) pending_fill_frames: VecDeque<u64>,
     /// #959 Phase 2: 11 `scratch_*` reusable buffers extracted into
     /// `WorkerScratch`. Field semantics unchanged; access via
     /// `binding.scratch.scratch_X`.
     pub(crate) scratch: WorkerScratch,
-    /// #812: per-UMEM-frame submit timestamp sidecar. Indexed by
-    /// `offset >> UMEM_FRAME_SHIFT`. Pre-allocated once at binding
-    /// construction (length = total UMEM frames) so the hot-path
-    /// stamp write is a single store — NO allocation, NO grow.
-    ///
-    /// Single-writer invariant (plan §3.3): submit and completion for
-    /// one frame offset are the same thread (the owner worker that
-    /// owns this binding's `free_tx_frames` via
-    /// `pop_front`/`push_front`), so plain `Vec<u64>` is correct —
-    /// no atomic needed. `WorkerUmem` is `Rc` (not `Arc`) at
-    /// `umem.rs:16-18`, enforcing single-owner semantics even when
-    /// multiple bindings share a UMEM under the mlx5 special case.
-    ///
-    /// Unstamped slots hold `TX_SIDECAR_UNSTAMPED` (`u64::MAX`) — the
-    /// reap path (`reap_tx_completions`) skips the histogram
-    /// increment for these to avoid biasing the tail toward bucket 0
-    /// (plan §5.4). A `monotonic_nanos() == 0` return (VDSO failure,
-    /// plan §3.4a / §6.1 test #5) causes `stamp_submits` to early-
-    /// return without writing the slot (Codex round-1 MED + Rust
-    /// round-1 MED-2) — the slot's pre-existing UNSTAMPED state
-    /// (from the previous reap or from worker construction) is what
-    /// the reap checks.
-    /// Rust round-1 MED-1: `Box<[u64]>` rather than `Vec<u64>` to
-    /// convey single-size intent at the type level. The sidecar is
-    /// pre-allocated to `total_frames` at binding construction and
-    /// NEVER grown. A future refactor that naively added `push` to
-    /// `Vec<u64>` would silently allocate on the hot path; `Box<[u64]>`
-    /// has no `push` method, so the mistake fails to compile.
-    pub(crate) tx_submit_ns: Box<[u64]>,
     /// Packets waiting for neighbor resolution. The UMEM frame is held
     /// (not recycled) until the neighbor resolves or the entry times out.
     pub(crate) pending_neigh: VecDeque<PendingNeighPacket>,
-    pub(crate) in_flight_prepared_recycles: FastMap<u64, PreparedTxRecycle>,
     /// #959 Phase 5: 4 BPF map FDs extracted into `WorkerBpfMaps`.
     /// Field semantics unchanged; access via `binding.bpf_maps.X_fd`.
     pub(crate) bpf_maps: WorkerBpfMaps,
@@ -352,10 +326,25 @@ impl BindingWorker {
             device,
             rx,
             tx,
-            free_tx_frames: reserved_tx_frames,
-            pending_tx_prepared: VecDeque::new(),
-            pending_tx_local: VecDeque::new(),
-            max_pending_tx,
+            tx_pipeline: WorkerTxPipeline {
+                free_tx_frames: reserved_tx_frames,
+                pending_tx_prepared: VecDeque::new(),
+                pending_tx_local: VecDeque::new(),
+                max_pending_tx,
+                pending_fill_frames: VecDeque::new(),
+                in_flight_prepared_recycles: FastMap::default(),
+                // #812: pre-allocate the submit-timestamp sidecar once,
+                // sized to the binding's total UMEM frame count so every
+                // legal `offset >> UMEM_FRAME_SHIFT` index lands inside
+                // the vec. Initial contents are the unstamped sentinel so
+                // any stray pre-existing offset in flight (cross-restart
+                // completion) is skipped by the reap path (plan §5.4).
+                // Allocation happens here — NEVER on the hot path.
+                // Rust round-1 MED-1: Box<[u64]> — allocate-once, never
+                // grow. `vec![...].into_boxed_slice()` produces an
+                // exactly-sized heap allocation with no spare capacity.
+                tx_submit_ns: vec![TX_SIDECAR_UNSTAMPED; total_frames as usize].into_boxed_slice(),
+            },
             cos: WorkerCos {
                 cos_fast_interfaces: FastMap::default(),
                 cos_interfaces: FastMap::default(),
@@ -363,7 +352,6 @@ impl BindingWorker {
                 cos_interface_rr: 0,
                 cos_nonempty_interfaces: 0,
             },
-            pending_fill_frames: VecDeque::new(),
             scratch: WorkerScratch {
                 scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_forwards: Vec::with_capacity(RX_BATCH_SIZE as usize),
@@ -377,17 +365,6 @@ impl BindingWorker {
                 scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_rst_teardowns: Vec::with_capacity(16),
             },
-            // #812: pre-allocate the submit-timestamp sidecar once,
-            // sized to the binding's total UMEM frame count so every
-            // legal `offset >> UMEM_FRAME_SHIFT` index lands inside
-            // the vec. Initial contents are the unstamped sentinel so
-            // any stray pre-existing offset in flight (cross-restart
-            // completion) is skipped by the reap path (plan §5.4).
-            // Allocation happens here — NEVER on the hot path.
-            // Rust round-1 MED-1: Box<[u64]> — allocate-once, never
-            // grow. `vec![...].into_boxed_slice()` produces an
-            // exactly-sized heap allocation with no spare capacity.
-            tx_submit_ns: vec![TX_SIDECAR_UNSTAMPED; total_frames as usize].into_boxed_slice(),
             // GEMINI-NEXT.md Section 3 cold start: lazy allocation. The
             // 4096-cap is enforced at admission (poll_descriptor.rs check
             // against MAX_PENDING_NEIGH), so pre-allocating that capacity
@@ -395,7 +372,6 @@ impl BindingWorker {
             // idle. Start at 0 capacity and let VecDeque grow on push as
             // packets actually queue up.
             pending_neigh: VecDeque::new(),
-            in_flight_prepared_recycles: FastMap::default(),
             bpf_maps: WorkerBpfMaps {
                 heartbeat_map_fd,
                 session_map_fd,
@@ -1096,14 +1072,14 @@ pub(crate) fn worker_loop(
                     let fill_pending = b.device.pending();
                     let rx_avail = b.rx.available_relaxed();
                     let xsk_stats = b.device.statistics_v2().ok();
-                    let inflight_recycles = b.in_flight_prepared_recycles.len() as u32;
+                    let inflight_recycles = b.tx_pipeline.in_flight_prepared_recycles.len() as u32;
                     let scratch_recycle_len = b.scratch.scratch_recycle.len() as u32;
-                    let ptx_prepared = b.pending_tx_prepared.len() as u32;
-                    let ptx_local = b.pending_tx_local.len() as u32;
-                    let total_accounted = b.pending_fill_frames.len() as u32
+                    let ptx_prepared = b.tx_pipeline.pending_tx_prepared.len() as u32;
+                    let ptx_local = b.tx_pipeline.pending_tx_local.len() as u32;
+                    let total_accounted = b.tx_pipeline.pending_fill_frames.len() as u32
                         + fill_pending
                         + rx_avail
-                        + b.free_tx_frames.len() as u32
+                        + b.tx_pipeline.free_tx_frames.len() as u32
                         + b.outstanding_tx
                         + inflight_recycles
                         + scratch_recycle_len
@@ -1115,10 +1091,10 @@ pub(crate) fn worker_loop(
                         i,
                         b.ifindex,
                         b.queue_id,
-                        b.pending_fill_frames.len(),
+                        b.tx_pipeline.pending_fill_frames.len(),
                         fill_pending,
                         rx_avail,
-                        b.free_tx_frames.len(),
+                        b.tx_pipeline.free_tx_frames.len(),
                         b.outstanding_tx,
                         inflight_recycles,
                         scratch_recycle_len,
@@ -1364,13 +1340,13 @@ pub(crate) fn worker_loop(
                             use std::fmt::Write;
                             let fill_p = sb.device.pending();
                             let rx_a = sb.rx.available_relaxed();
-                            let ifl = sb.in_flight_prepared_recycles.len() as u32;
-                            let ptxp = sb.pending_tx_prepared.len() as u32;
-                            let ptxl = sb.pending_tx_local.len() as u32;
-                            let total = sb.pending_fill_frames.len() as u32
+                            let ifl = sb.tx_pipeline.in_flight_prepared_recycles.len() as u32;
+                            let ptxp = sb.tx_pipeline.pending_tx_prepared.len() as u32;
+                            let ptxl = sb.tx_pipeline.pending_tx_local.len() as u32;
+                            let total = sb.tx_pipeline.pending_fill_frames.len() as u32
                                 + fill_p
                                 + rx_a
-                                + sb.free_tx_frames.len() as u32
+                                + sb.tx_pipeline.free_tx_frames.len() as u32
                                 + sb.outstanding_tx
                                 + ifl
                                 + sb.scratch.scratch_recycle.len() as u32
@@ -1381,10 +1357,10 @@ pub(crate) fn worker_loop(
                                 si,
                                 sb.ifindex,
                                 sb.queue_id,
-                                sb.pending_fill_frames.len(),
+                                sb.tx_pipeline.pending_fill_frames.len(),
                                 fill_p,
                                 rx_a,
-                                sb.free_tx_frames.len(),
+                                sb.tx_pipeline.free_tx_frames.len(),
                                 sb.outstanding_tx,
                                 ifl,
                                 ptxp,
@@ -1535,8 +1511,8 @@ pub(crate) fn worker_loop(
                     // reads ~70-80% at idle because AF_XDP keeps the fill
                     // ring pre-populated by design.
                     let total = b.umem.total_frames();
-                    let free_tx = b.free_tx_frames.len() as u32;
-                    let pending_fill = b.pending_fill_frames.len() as u32;
+                    let free_tx = b.tx_pipeline.free_tx_frames.len() as u32;
+                    let pending_fill = b.tx_pipeline.pending_fill_frames.len() as u32;
                     let kernel_fill = b.device.pending();
                     let inflight = total
                         .saturating_sub(free_tx)
@@ -1673,7 +1649,7 @@ fn apply_worker_shaped_tx_requests(
         match enqueue_local_into_cos(binding, forwarding, req, now_ns) {
             Ok(()) => {}
             Err(req) => {
-                binding.pending_tx_local.push_back(req);
+                binding.tx_pipeline.pending_tx_local.push_back(req);
                 bound_pending_tx_local(binding);
             }
         }

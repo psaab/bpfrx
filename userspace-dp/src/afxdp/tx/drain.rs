@@ -10,8 +10,8 @@ pub(in crate::afxdp) fn pending_tx_capacity(ring_entries: u32) -> usize {
 }
 
 pub(in crate::afxdp) fn bound_pending_tx_local(binding: &mut BindingWorker) {
-    while binding.pending_tx_local.len() > binding.max_pending_tx {
-        if binding.pending_tx_local.pop_front().is_some() {
+    while binding.tx_pipeline.pending_tx_local.len() > binding.tx_pipeline.max_pending_tx {
+        if binding.tx_pipeline.pending_tx_local.pop_front().is_some() {
             // #804: bound-pending FIFO overflow — distinct from the CoS
             // queue admission overflow counter. Keep this attribution
             // precise so operators can tell which path is dropping.
@@ -31,9 +31,9 @@ pub(in crate::afxdp) fn bound_pending_tx_local(binding: &mut BindingWorker) {
 }
 
 pub(in crate::afxdp) fn bound_pending_tx_prepared(binding: &mut BindingWorker) {
-    let limit = binding.max_pending_tx;
-    while binding.pending_tx_prepared.len() > limit {
-        if let Some(req) = binding.pending_tx_prepared.pop_front() {
+    let limit = binding.tx_pipeline.max_pending_tx;
+    while binding.tx_pipeline.pending_tx_prepared.len() > limit {
+        if let Some(req) = binding.tx_pipeline.pending_tx_prepared.pop_front() {
             // #804: bound-pending FIFO overflow (prepared side). Same
             // semantic bucket as `bound_pending_tx_local` — internal
             // prepared/local distinction is irrelevant to operators.
@@ -72,8 +72,8 @@ pub(in crate::afxdp) fn drain_pending_tx(
     // If outstanding entries remain after reaping (kernel didn't finish in
     // the previous kick), re-kick now so they don't stall forever.
     if binding.outstanding_tx > 0
-        && binding.pending_tx_prepared.is_empty()
-        && binding.pending_tx_local.is_empty()
+        && binding.tx_pipeline.pending_tx_prepared.is_empty()
+        && binding.tx_pipeline.pending_tx_local.is_empty()
     {
         maybe_wake_tx(binding, false, now_ns);
     }
@@ -189,7 +189,7 @@ pub(in crate::afxdp) fn drain_pending_tx(
     if !forwarding.cos.interfaces.is_empty() {
         drop_cos_bound_prepared_leftovers(binding);
     }
-    while !binding.pending_tx_prepared.is_empty() {
+    while !binding.tx_pipeline.pending_tx_prepared.is_empty() {
         match transmit_prepared_batch(binding, now_ns) {
             Ok((packets, bytes)) => {
                 if packets == 0 {
@@ -228,7 +228,7 @@ pub(in crate::afxdp) fn drain_pending_tx(
             }
         }
     }
-    if binding.pending_tx_local.is_empty() && binding.live.pending_tx_empty() {
+    if binding.tx_pipeline.pending_tx_local.is_empty() && binding.live.pending_tx_empty() {
         update_binding_debug_state(binding);
         return did_work || binding_has_pending_tx_work(binding);
     }
@@ -245,7 +245,7 @@ pub(in crate::afxdp) fn drain_pending_tx(
     let mut retry = VecDeque::new();
     while let Some(req) = pending.pop_front() {
         retry.push_back(req);
-        if retry.len() >= TX_BATCH_SIZE || binding.free_tx_frames.is_empty() || pending.is_empty() {
+        if retry.len() >= TX_BATCH_SIZE || binding.tx_pipeline.free_tx_frames.is_empty() || pending.is_empty() {
             match transmit_batch(binding, &mut retry, now_ns, shared_recycles) {
                 Ok((packets, bytes)) => {
                     if packets > 0 {
@@ -303,7 +303,7 @@ pub(in crate::afxdp) fn drain_pending_tx(
 /// defense rather than only a narrow redirect-to-owner +
 /// local-enqueue failure.
 fn drop_cos_bound_prepared_leftovers(binding: &mut BindingWorker) {
-    if binding.pending_tx_prepared.is_empty() {
+    if binding.tx_pipeline.pending_tx_prepared.is_empty() {
         return;
     }
     // #784 Codex review: the earlier head-peek fast-exit was a
@@ -320,9 +320,9 @@ fn drop_cos_bound_prepared_leftovers(binding: &mut BindingWorker) {
     // per-frame.
     let mut dropped = 0u64;
     let mut dropped_bytes = 0u64;
-    let original_len = binding.pending_tx_prepared.len();
+    let original_len = binding.tx_pipeline.pending_tx_prepared.len();
     for _ in 0..original_len {
-        let Some(req) = binding.pending_tx_prepared.pop_front() else {
+        let Some(req) = binding.tx_pipeline.pending_tx_prepared.pop_front() else {
             break;
         };
         if req.cos_queue_id.is_some() {
@@ -330,7 +330,7 @@ fn drop_cos_bound_prepared_leftovers(binding: &mut BindingWorker) {
             dropped_bytes = dropped_bytes.saturating_add(req.len as u64);
             recycle_prepared_immediately(binding, &req);
         } else {
-            binding.pending_tx_prepared.push_back(req);
+            binding.tx_pipeline.pending_tx_prepared.push_back(req);
         }
     }
     if dropped > 0 {
@@ -455,8 +455,8 @@ fn drop_cos_bound_local_leftovers(
 
 fn binding_has_pending_tx_work(binding: &BindingWorker) -> bool {
     binding.outstanding_tx > 0
-        || !binding.pending_tx_prepared.is_empty()
-        || !binding.pending_tx_local.is_empty()
+        || !binding.tx_pipeline.pending_tx_prepared.is_empty()
+        || !binding.tx_pipeline.pending_tx_local.is_empty()
         || !binding.live.pending_tx_empty()
         || binding.cos.cos_nonempty_interfaces > 0
 }
@@ -525,8 +525,8 @@ fn ingest_cos_pending_tx_with_provenance(
         return;
     }
 
-    if !binding.pending_tx_prepared.is_empty() {
-        let mut pending = core::mem::take(&mut binding.pending_tx_prepared);
+    if !binding.tx_pipeline.pending_tx_prepared.is_empty() {
+        let mut pending = core::mem::take(&mut binding.tx_pipeline.pending_tx_prepared);
         process_pending_queue_in_place(&mut pending, |req| {
             let req = match redirect_prepared_cos_request_to_owner(
                 binding,
@@ -546,10 +546,10 @@ fn ingest_cos_pending_tx_with_provenance(
                 Err(req) => Err(req),
             }
         });
-        binding.pending_tx_prepared = pending;
+        binding.tx_pipeline.pending_tx_prepared = pending;
     }
 
-    let mut pending = core::mem::take(&mut binding.pending_tx_local);
+    let mut pending = core::mem::take(&mut binding.tx_pipeline.pending_tx_local);
     // #709: the split between owner-local and peer-redirected packets.
     // `pending` starts with this worker's own locally-produced requests
     // (this worker drove RX on this binding). `take_pending_tx_into`
@@ -675,7 +675,7 @@ fn ingest_cos_pending_tx_with_provenance(
             Err(req) => Err(req),
         }
     });
-    binding.pending_tx_local = pending;
+    binding.tx_pipeline.pending_tx_local = pending;
     bound_pending_tx_local(binding);
 }
 
@@ -704,14 +704,14 @@ fn take_pending_tx_requests(binding: &mut BindingWorker) -> VecDeque<TxRequest> 
     // target so the owner-worker hot path stays allocation-free. `pop`
     // from the lock-free inbox appends into the same buffer without a
     // queue-to-queue copy.
-    let mut out = core::mem::take(&mut binding.pending_tx_local);
+    let mut out = core::mem::take(&mut binding.tx_pipeline.pending_tx_local);
     binding.live.take_pending_tx_into(&mut out);
     out
 }
 
 fn restore_pending_tx_requests(binding: &mut BindingWorker, mut retry: VecDeque<TxRequest>) {
-    retry.append(&mut binding.pending_tx_local);
-    binding.pending_tx_local = retry;
+    retry.append(&mut binding.tx_pipeline.pending_tx_local);
+    binding.tx_pipeline.pending_tx_local = retry;
     bound_pending_tx_local(binding);
 }
 

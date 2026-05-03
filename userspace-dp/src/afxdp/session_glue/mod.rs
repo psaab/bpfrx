@@ -721,24 +721,24 @@ pub(super) fn cancel_queued_flow_on_binding(
     forward_key: &SessionKey,
     reverse_key: &SessionKey,
 ) {
-    let mut kept_local = VecDeque::with_capacity(binding.pending_tx_local.len());
-    while let Some(req) = binding.pending_tx_local.pop_front() {
+    let mut kept_local = VecDeque::with_capacity(binding.tx_pipeline.pending_tx_local.len());
+    while let Some(req) = binding.tx_pipeline.pending_tx_local.pop_front() {
         if tx_request_matches_flow(&req, forward_key, reverse_key) {
             continue;
         }
         kept_local.push_back(req);
     }
-    binding.pending_tx_local = kept_local;
+    binding.tx_pipeline.pending_tx_local = kept_local;
 
-    let mut kept_prepared = VecDeque::with_capacity(binding.pending_tx_prepared.len());
-    while let Some(req) = binding.pending_tx_prepared.pop_front() {
+    let mut kept_prepared = VecDeque::with_capacity(binding.tx_pipeline.pending_tx_prepared.len());
+    while let Some(req) = binding.tx_pipeline.pending_tx_prepared.pop_front() {
         if prepared_request_matches_flow(&req, forward_key, reverse_key) {
             recycle_cancelled_prepared(binding, &req);
             continue;
         }
         kept_prepared.push_back(req);
     }
-    binding.pending_tx_prepared = kept_prepared;
+    binding.tx_pipeline.pending_tx_prepared = kept_prepared;
 
     // #706: the cross-worker redirect inbox (`binding.live.pending_tx`) is
     // now a lock-free MPSC ring (`MpscInbox`). In-place filtering from an
@@ -763,7 +763,7 @@ pub(super) fn cancel_pending_forwards(
     let mut kept = Vec::with_capacity(pending_forwards.len());
     for req in pending_forwards.drain(..) {
         if pending_forward_matches_flow(&req, forward_key, reverse_key) {
-            binding.pending_fill_frames.push_back(req.desc.addr);
+            binding.tx_pipeline.pending_fill_frames.push_back(req.desc.addr);
             continue;
         }
         kept.push(req);
@@ -773,11 +773,11 @@ pub(super) fn cancel_pending_forwards(
 
 pub(super) fn recycle_cancelled_prepared(binding: &mut BindingWorker, req: &PreparedTxRequest) {
     match req.recycle {
-        PreparedTxRecycle::FreeTxFrame => binding.free_tx_frames.push_back(req.offset),
+        PreparedTxRecycle::FreeTxFrame => binding.tx_pipeline.free_tx_frames.push_back(req.offset),
         PreparedTxRecycle::FillOnSlot(slot) if slot == binding.slot => {
-            binding.pending_fill_frames.push_back(req.offset);
+            binding.tx_pipeline.pending_fill_frames.push_back(req.offset);
         }
-        PreparedTxRecycle::FillOnSlot(_) => binding.free_tx_frames.push_back(req.offset),
+        PreparedTxRecycle::FillOnSlot(_) => binding.tx_pipeline.free_tx_frames.push_back(req.offset),
     }
 }
 

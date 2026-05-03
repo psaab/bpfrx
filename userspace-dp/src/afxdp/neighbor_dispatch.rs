@@ -96,7 +96,7 @@ pub(super) fn retry_pending_neigh(
             .expect("pending_neigh shrank during retry sweep");
         // Timeout: recycle frame and drop.
         if now_ns.saturating_sub(pkt.queued_ns) > PENDING_NEIGH_TIMEOUT_NS {
-            binding.pending_fill_frames.push_back(pkt.addr);
+            binding.tx_pipeline.pending_fill_frames.push_back(pkt.addr);
             continue;
         }
         // Check if neighbor MAC is now available, mirroring the lookup
@@ -165,7 +165,7 @@ pub(super) fn retry_pending_neigh(
             false,
             expected_ports,
         ) else {
-            binding.pending_fill_frames.push_back(pkt.addr);
+            binding.tx_pipeline.pending_fill_frames.push_back(pkt.addr);
             continue;
         };
         let target_ifindex = if decision.resolution.tx_ifindex > 0 {
@@ -179,7 +179,7 @@ pub(super) fn retry_pending_neigh(
             ingress_queue,
             target_ifindex,
         ) else {
-            binding.pending_fill_frames.push_back(pkt.addr);
+            binding.tx_pipeline.pending_fill_frames.push_back(pkt.addr);
             continue;
         };
         let cos = resolve_cos_tx_selection(
@@ -201,14 +201,14 @@ pub(super) fn retry_pending_neigh(
             dscp_rewrite: cos.dscp_rewrite,
         };
         if target_idx == binding_index {
-            binding.pending_tx_prepared.push_back(req);
+            binding.tx_pipeline.pending_tx_prepared.push_back(req);
         } else if let Some(target) =
             binding_by_index_mut(left, binding_index, binding, right, target_idx)
         {
-            target.pending_tx_prepared.push_back(req);
+            target.tx_pipeline.pending_tx_prepared.push_back(req);
             bound_pending_tx_prepared(target);
         } else {
-            binding.pending_fill_frames.push_back(pkt.addr);
+            binding.tx_pipeline.pending_fill_frames.push_back(pkt.addr);
         }
     }
 }

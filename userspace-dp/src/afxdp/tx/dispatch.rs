@@ -36,7 +36,7 @@ fn enqueue_local_request_to_target_or_owner(
         req.egress_ifindex,
         req.cos_queue_id,
     ) {
-        target_binding.pending_tx_local.push_back(req);
+        target_binding.tx_pipeline.pending_tx_local.push_back(req);
         bound_pending_tx_local(target_binding);
         return Ok(());
     }
@@ -50,15 +50,15 @@ fn enqueue_local_request_to_target_or_owner(
             return owner_live.enqueue_tx_owned(req);
         }
     }
-    target_binding.pending_tx_local.push_back(req);
+    target_binding.tx_pipeline.pending_tx_local.push_back(req);
     bound_pending_tx_local(target_binding);
     Ok(())
 }
 
 #[inline]
 fn recycle_ingress_frame(ingress_binding: &mut BindingWorker, source_offset: u64, now_ns: u64) {
-    ingress_binding.pending_fill_frames.push_back(source_offset);
-    if ingress_binding.pending_fill_frames.len() >= FILL_BATCH_SIZE {
+    ingress_binding.tx_pipeline.pending_fill_frames.push_back(source_offset);
+    if ingress_binding.tx_pipeline.pending_fill_frames.len() >= FILL_BATCH_SIZE {
         let _ = drain_pending_fill(ingress_binding, now_ns);
     }
 }
@@ -283,7 +283,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                         dbg.tx_max_frame = max_frame;
                     }
                     copied_source_frame = true;
-                    if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE {
+                    if target_binding.tx_pipeline.pending_tx_prepared.len() >= TX_BATCH_SIZE {
                         let _ = drain_pending_tx_local_owner(
                             target_binding,
                             now_ns,
@@ -328,7 +328,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                             }
                         }
                         let seg_frame_len = frame.len();
-                        target_binding.pending_tx_local.push_back(TxRequest {
+                        target_binding.tx_pipeline.pending_tx_local.push_back(TxRequest {
                             bytes: frame,
                             expected_ports,
                             expected_addr_family: request.meta.addr_family,
@@ -348,7 +348,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                         }
                     }
                     copied_source_frame = true;
-                    if target_binding.pending_tx_local.len() >= TX_BATCH_SIZE {
+                    if target_binding.tx_pipeline.pending_tx_local.len() >= TX_BATCH_SIZE {
                         let _ = drain_pending_tx_local_owner(
                             target_binding,
                             now_ns,
@@ -428,7 +428,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                     ) {
                         Some(frame_len) => {
                             target_binding
-                                .pending_tx_prepared
+                                .tx_pipeline.pending_tx_prepared
                                 .push_back(PreparedTxRequest {
                                     offset: source_offset,
                                     len: frame_len,
@@ -550,11 +550,11 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                     // intermediate Vec allocation and one memcpy.
                     // NAT64 cannot use direct TX (header size changes), so
                     // it falls through to the copy path below.
-                    let mut direct_tx_offset = target_binding.free_tx_frames.pop_front();
+                    let mut direct_tx_offset = target_binding.tx_pipeline.free_tx_frames.pop_front();
                     if direct_tx_offset.is_none()
                         && (target_binding.outstanding_tx > 0
-                            || !target_binding.pending_tx_prepared.is_empty()
-                            || !target_binding.pending_tx_local.is_empty())
+                            || !target_binding.tx_pipeline.pending_tx_prepared.is_empty()
+                            || !target_binding.tx_pipeline.pending_tx_local.is_empty())
                     {
                         let _ = drain_pending_tx_local_owner(
                             target_binding,
@@ -566,20 +566,20 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                             cos_owner_worker_by_queue,
                             cos_owner_live_by_queue,
                         );
-                        direct_tx_offset = target_binding.free_tx_frames.pop_front();
+                        direct_tx_offset = target_binding.tx_pipeline.free_tx_frames.pop_front();
                     }
                     let mut direct_tx_fallback_reason = None;
                     let direct_built = if is_nat64 || uses_native_tunnel {
                         // NAT64 can't use direct TX — return the frame if we popped one.
                         if let Some(off) = direct_tx_offset {
-                            target_binding.free_tx_frames.push_front(off);
+                            target_binding.tx_pipeline.free_tx_frames.push_front(off);
                         }
                         direct_tx_fallback_reason =
                             Some(DirectTxFallbackReason::DisallowedByRewriteMode);
                         false
                     } else if !owner_matches_target {
                         if let Some(off) = direct_tx_offset {
-                            target_binding.free_tx_frames.push_front(off);
+                            target_binding.tx_pipeline.free_tx_frames.push_front(off);
                         }
                         // A prepared/direct frame on a non-owner binding would be
                         // cloned back into a local Vec during CoS owner redirection.
@@ -633,7 +633,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                     expected_ports,
                                     built_ports,
                                 ) {
-                                    target_binding.free_tx_frames.push_front(tx_offset);
+                                    target_binding.tx_pipeline.free_tx_frames.push_front(tx_offset);
                                     record_exception(
                                         recent_exceptions,
                                         ingress_ident,
@@ -647,10 +647,10 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 }
                             }
                             if build_failed {
-                                target_binding.free_tx_frames.push_front(tx_offset);
+                                target_binding.tx_pipeline.free_tx_frames.push_front(tx_offset);
                                 true
                             } else if written > tx_frame_capacity() {
-                                target_binding.free_tx_frames.push_front(tx_offset);
+                                target_binding.tx_pipeline.free_tx_frames.push_front(tx_offset);
                                 record_exception(
                                     recent_exceptions,
                                     ingress_ident,
@@ -663,7 +663,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 true
                             } else {
                                 target_binding
-                                    .pending_tx_prepared
+                                    .tx_pipeline.pending_tx_prepared
                                     .push_back(PreparedTxRequest {
                                         offset: tx_offset,
                                         len: written as u32,
@@ -687,7 +687,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 true
                             }
                         } else {
-                            target_binding.free_tx_frames.push_front(tx_offset);
+                            target_binding.tx_pipeline.free_tx_frames.push_front(tx_offset);
                             direct_tx_fallback_reason =
                                 Some(DirectTxFallbackReason::BuildReturnedNone);
                             false
@@ -800,8 +800,8 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                     }
                 }
             }
-            if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE
-                || target_binding.pending_tx_local.len() >= TX_BATCH_SIZE
+            if target_binding.tx_pipeline.pending_tx_prepared.len() >= TX_BATCH_SIZE
+                || target_binding.tx_pipeline.pending_tx_local.len() >= TX_BATCH_SIZE
             {
                 let _ = drain_pending_tx_local_owner(
                     target_binding,
@@ -850,10 +850,10 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
             recycle_ingress_frame(ingress_binding, source_offset, now_ns);
         }
     }
-    while !ingress_binding.pending_fill_frames.is_empty() {
-        let pending_before = ingress_binding.pending_fill_frames.len();
+    while !ingress_binding.tx_pipeline.pending_fill_frames.is_empty() {
+        let pending_before = ingress_binding.tx_pipeline.pending_fill_frames.len();
         let _ = drain_pending_fill(ingress_binding, now_ns);
-        if ingress_binding.pending_fill_frames.len() >= pending_before {
+        if ingress_binding.tx_pipeline.pending_fill_frames.len() >= pending_before {
             break;
         }
     }
@@ -952,10 +952,10 @@ pub(in crate::afxdp) fn apply_shared_recycles(
             && let Some(binding) =
                 binding_by_index_mut(left, current_index, current, right, target_index)
         {
-            binding.pending_fill_frames.push_back(offset);
+            binding.tx_pipeline.pending_fill_frames.push_back(offset);
             continue;
         }
-        current.pending_fill_frames.push_back(offset);
+        current.tx_pipeline.pending_fill_frames.push_back(offset);
     }
 }
 
@@ -1281,10 +1281,10 @@ fn segment_forwarded_tcp_frames_into_prepared(
     }
 
     let segment_count = data.len().div_ceil(segment_payload_max);
-    if target_binding.free_tx_frames.len() < segment_count
+    if target_binding.tx_pipeline.free_tx_frames.len() < segment_count
         && (target_binding.outstanding_tx > 0
-            || !target_binding.pending_tx_prepared.is_empty()
-            || !target_binding.pending_tx_local.is_empty())
+            || !target_binding.tx_pipeline.pending_tx_prepared.is_empty()
+            || !target_binding.tx_pipeline.pending_tx_local.is_empty())
     {
         let _ = drain_pending_tx_local_owner(
             target_binding,
@@ -1297,7 +1297,7 @@ fn segment_forwarded_tcp_frames_into_prepared(
             cos_owner_live_by_queue,
         );
     }
-    if target_binding.free_tx_frames.len() < segment_count {
+    if target_binding.tx_pipeline.free_tx_frames.len() < segment_count {
         return None;
     }
 
@@ -1342,13 +1342,13 @@ fn segment_forwarded_tcp_frames_into_prepared(
         let frame_len = eth_len + total_ip_len;
         if frame_len > tx_frame_capacity() {
             for req in prepared.drain(..).rev() {
-                target_binding.free_tx_frames.push_front(req.offset);
+                target_binding.tx_pipeline.free_tx_frames.push_front(req.offset);
             }
             return None;
         }
-        let Some(tx_offset) = target_binding.free_tx_frames.pop_front() else {
+        let Some(tx_offset) = target_binding.tx_pipeline.free_tx_frames.pop_front() else {
             for req in prepared.drain(..).rev() {
-                target_binding.free_tx_frames.push_front(req.offset);
+                target_binding.tx_pipeline.free_tx_frames.push_front(req.offset);
             }
             return None;
         };
@@ -1358,9 +1358,9 @@ fn segment_forwarded_tcp_frames_into_prepared(
                 .area()
                 .slice_mut_unchecked(tx_offset as usize, frame_len)
         }) else {
-            target_binding.free_tx_frames.push_front(tx_offset);
+            target_binding.tx_pipeline.free_tx_frames.push_front(tx_offset);
             for req in prepared.drain(..).rev() {
-                target_binding.free_tx_frames.push_front(req.offset);
+                target_binding.tx_pipeline.free_tx_frames.push_front(req.offset);
             }
             return None;
         };
@@ -1452,9 +1452,9 @@ fn segment_forwarded_tcp_frames_into_prepared(
             Some(())
         })();
         if built.is_none() {
-            target_binding.free_tx_frames.push_front(tx_offset);
+            target_binding.tx_pipeline.free_tx_frames.push_front(tx_offset);
             for req in prepared.drain(..).rev() {
-                target_binding.free_tx_frames.push_front(req.offset);
+                target_binding.tx_pipeline.free_tx_frames.push_front(req.offset);
             }
             return None;
         }
@@ -1477,7 +1477,7 @@ fn segment_forwarded_tcp_frames_into_prepared(
     }
 
     for req in prepared {
-        target_binding.pending_tx_prepared.push_back(req);
+        target_binding.tx_pipeline.pending_tx_prepared.push_back(req);
     }
     bound_pending_tx_prepared(target_binding);
     Some((segment_count as u32, total_bytes, max_frame))
