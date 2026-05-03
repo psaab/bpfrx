@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/binary"
 	"fmt"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -1025,16 +1026,37 @@ func (c *CLI) showPersistentNATDetail() error {
 		return nil
 	}
 
-	// Count sessions per NAT IP:port pair
+	// #1152: natKey uses a unified `netip.Addr` so v4 and v6 NAT IPs
+	// share one map. v4 sessions use netip.AddrFrom4 (recovered from
+	// the BPF u32 via NativeEndian — see CLAUDE.md "Byte Order"),
+	// v6 sessions use netip.AddrFrom16. Mirrors the producer side in
+	// conntrack/gc.go (Save calls). The pre-fix code used
+	// `b.NatIP.As4()` which panicked on any v6 binding.
 	type natKey struct {
-		ip   uint32
+		addr netip.Addr
 		port uint16
 	}
 	sessionCounts := make(map[natKey]int)
 	if c.dp.IsLoaded() {
 		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
-				sessionCounts[natKey{val.NATSrcIP, val.NATSrcPort}]++
+				// SessionValue.NATSrcIP is a u32 holding the IP's
+				// network-order bytes in native-endian word form
+				// (CLAUDE.md "Byte Order"). Recover the original
+				// 4 bytes via NativeEndian.PutUint32 to match
+				// conntrack/gc.go:277-279's storage path.
+				var ip4 [4]byte
+				binary.NativeEndian.PutUint32(ip4[:], val.NATSrcIP)
+				sessionCounts[natKey{netip.AddrFrom4(ip4), val.NATSrcPort}]++
+			}
+			return true
+		})
+		_ = c.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+				// Match conntrack/gc.go:397 — no Unmap, the binding
+				// stores the 16-byte form for v6 NAT.
+				addr := netip.AddrFrom16(val.NATSrcIP)
+				sessionCounts[natKey{addr, val.NATSrcPort}]++
 			}
 			return true
 		})
@@ -1050,13 +1072,7 @@ func (c *CLI) showPersistentNATDetail() error {
 			remaining = 0
 		}
 
-		// Match sessions by NAT IP — use NativeEndian for BPF uint32
-		natIP := b.NatIP.As4()
-		nk := natKey{
-			ip:   binary.NativeEndian.Uint32(natIP[:]),
-			port: b.NatPort,
-		}
-		sessions := sessionCounts[nk]
+		sessions := sessionCounts[natKey{b.NatIP, b.NatPort}]
 
 		fmt.Printf("Persistent NAT binding:\n")
 		fmt.Printf("  Internal IP:        %s\n", b.SrcIP)

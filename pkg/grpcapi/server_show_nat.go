@@ -301,10 +301,13 @@ func (s *Server) showPersistentNATDetail(buf *strings.Builder) {
 	if s.dp.IsLoaded() {
 		_ = s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
-				// SessionValue.NATSrcIP is u32 in network byte order
-				// (NativeEndian-of-network-bytes; see CLAUDE.md "Byte
-				// Order"). Convert back to 4 bytes the same way the
-				// pre-fix code did before flattening to uint32.
+				// SessionValue.NATSrcIP is a `uint32` holding the IP's
+				// network-order bytes in native-endian word form (the
+				// BPF `__be32` is serialized as native-endian uint32 by
+				// cilium/ebpf; see CLAUDE.md "Byte Order"). Recover the
+				// original 4 bytes via NativeEndian.PutUint32 to match
+				// conntrack/gc.go:277-279's storage path. Do NOT use
+				// BigEndian here — that would re-swap the bytes.
 				var ip4 [4]byte
 				binary.NativeEndian.PutUint32(ip4[:], val.NATSrcIP)
 				sessionCounts[natKey{netip.AddrFrom4(ip4), val.NATSrcPort}]++
