@@ -276,21 +276,19 @@ pub(super) fn poll_binding_process_descriptor(
                                     // TTL/hop-limit check on flow cache hit path:
                                     // generate ICMP Time Exceeded for packets that
                                     // would expire after decrement.
-                                    let local_icmp_te = unsafe { &*area }
-                                        .slice(desc.addr as usize, desc.len as usize)
-                                        .and_then(|frame| {
-                                            build_local_time_exceeded_request(
-                                                frame,
-                                                desc,
-                                                meta,
-                                                &worker_ctx.ident,
-                                                flow,
-                                                worker_ctx.forwarding,
-                                                worker_ctx.dynamic_neighbors,
-                                                worker_ctx.ha_state,
-                                                now_secs,
-                                            )
-                                        });
+                                    // #1145: reuse the line-50 raw_frame bind
+                                    // instead of re-slicing for the same packet.
+                                    let local_icmp_te = build_local_time_exceeded_request(
+                                        raw_frame,
+                                        desc,
+                                        meta,
+                                        &worker_ctx.ident,
+                                        flow,
+                                        worker_ctx.forwarding,
+                                        worker_ctx.dynamic_neighbors,
+                                        worker_ctx.ha_state,
+                                        now_secs,
+                                    );
                                     if let Some(request) = local_icmp_te {
                                         binding.scratch_forwards.push(request);
                                         // Don't recycle here — enqueue_pending_forwards
@@ -517,21 +515,18 @@ pub(super) fn poll_binding_process_descriptor(
                                 resolved.decision.resolution.disposition,
                                 ForwardingDisposition::ForwardCandidate
                             ) {
-                                let local_icmp_te = unsafe { &*area }
-                                    .slice(desc.addr as usize, desc.len as usize)
-                                    .and_then(|frame| {
-                                        build_local_time_exceeded_request(
-                                            frame,
-                                            desc,
-                                            meta,
-                                            &worker_ctx.ident,
-                                            flow,
-                                            worker_ctx.forwarding,
-                                            worker_ctx.dynamic_neighbors,
-                                            worker_ctx.ha_state,
-                                            now_secs,
-                                        )
-                                    });
+                                // #1145: reuse line-50 raw_frame bind.
+                                let local_icmp_te = build_local_time_exceeded_request(
+                                    raw_frame,
+                                    desc,
+                                    meta,
+                                    &worker_ctx.ident,
+                                    flow,
+                                    worker_ctx.forwarding,
+                                    worker_ctx.dynamic_neighbors,
+                                    worker_ctx.ha_state,
+                                    now_secs,
+                                );
                                 if let Some(request) = local_icmp_te {
                                     binding.scratch_forwards.push(request);
                                     // Don't recycle: the TE response references
@@ -867,9 +862,10 @@ pub(super) fn poll_binding_process_descriptor(
                             let is_embedded_icmp_error = if worker_ctx.forwarding.allow_embedded_icmp
                                 && matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
                             {
-                                unsafe { &*area }
-                                    .slice(desc.addr as usize, desc.len as usize)
-                                    .and_then(|fr| fr.get(meta.l4_offset as usize).copied())
+                                // #1145: reuse line-50 raw_frame bind.
+                                raw_frame
+                                    .get(meta.l4_offset as usize)
+                                    .copied()
                                     .map(|icmp_type| is_icmp_error(meta.protocol, icmp_type))
                                     .unwrap_or(false)
                             } else {
@@ -961,23 +957,20 @@ pub(super) fn poll_binding_process_descriptor(
                                             meta.ingress_ifindex as i32,
                                             &icmp_match,
                                         );
-                                        let frame_data = unsafe { &*area }
-                                            .slice(desc.addr as usize, desc.len as usize);
-                                        let rewritten = frame_data.and_then(|frame| {
-                                            match meta.addr_family as i32 {
-                                                libc::AF_INET => build_nat_reversed_icmp_error_v4(
-                                                    frame,
-                                                    meta,
-                                                    &icmp_match,
-                                                ),
-                                                libc::AF_INET6 => build_nat_reversed_icmp_error_v6(
-                                                    frame,
-                                                    meta,
-                                                    &icmp_match,
-                                                ),
-                                                _ => None,
-                                            }
-                                        });
+                                        // #1145: reuse line-50 raw_frame bind.
+                                        let rewritten = match meta.addr_family as i32 {
+                                            libc::AF_INET => build_nat_reversed_icmp_error_v4(
+                                                raw_frame,
+                                                meta,
+                                                &icmp_match,
+                                            ),
+                                            libc::AF_INET6 => build_nat_reversed_icmp_error_v6(
+                                                raw_frame,
+                                                meta,
+                                                &icmp_match,
+                                            ),
+                                            _ => None,
+                                        };
                                         if let Some(rewritten_frame) = rewritten {
                                             let icmp_decision = SessionDecision {
                                                 resolution: icmp_resolution,
@@ -1171,21 +1164,18 @@ pub(super) fn poll_binding_process_descriptor(
                                         }
                                         None
                                     };
-                                    let local_icmp_te = unsafe { &*area }
-                                        .slice(desc.addr as usize, desc.len as usize)
-                                        .and_then(|frame| {
-                                            build_local_time_exceeded_request(
-                                                frame,
-                                                desc,
-                                                meta,
-                                                &worker_ctx.ident,
-                                                flow,
-                                                worker_ctx.forwarding,
-                                                worker_ctx.dynamic_neighbors,
-                                                worker_ctx.ha_state,
-                                                now_secs,
-                                            )
-                                        });
+                                    // #1145: reuse line-50 raw_frame bind.
+                                    let local_icmp_te = build_local_time_exceeded_request(
+                                        raw_frame,
+                                        desc,
+                                        meta,
+                                        &worker_ctx.ident,
+                                        flow,
+                                        worker_ctx.forwarding,
+                                        worker_ctx.dynamic_neighbors,
+                                        worker_ctx.ha_state,
+                                        now_secs,
+                                    );
                                     if let Some(request) = local_icmp_te {
                                         binding.scratch_forwards.push(request);
                                         recycle_now = false;
@@ -1638,11 +1628,9 @@ pub(super) fn poll_binding_process_descriptor(
                         // TCP flag tracking on forwarded frames
                         if cfg!(feature = "debug-log") {
                             if meta.protocol == 6 {
-                                // Compare meta.tcp_flags from BPF shim with raw frame TCP flags
-                                let frame_data =
-                                    unsafe { &*area }.slice(desc.addr as usize, desc.len as usize);
-                                let raw_tcp_info =
-                                    frame_data.and_then(|data| extract_tcp_flags_and_window(data));
+                                // Compare meta.tcp_flags from BPF shim with raw frame TCP flags.
+                                // #1145: reuse line-50 raw_frame bind instead of re-slicing.
+                                let raw_tcp_info = extract_tcp_flags_and_window(raw_frame);
                                 let raw_flags = raw_tcp_info.map(|(f, _)| f);
                                 let raw_window = raw_tcp_info.map(|(_, w)| w);
                                 // Log first 20 forwarded TCP packets: compare meta vs raw
@@ -1673,20 +1661,19 @@ pub(super) fn poll_binding_process_descriptor(
                                         meta.l4_offset,
                                         flow_str,
                                     );
-                                    // Hex dump bytes around TCP flags position in raw frame
-                                    if let Some(data) = frame_data {
-                                        let l4 = meta.l4_offset as usize;
-                                        if data.len() > l4 + 20 {
-                                            let tcp_hdr: String = data[l4..l4 + 20]
-                                                .iter()
-                                                .map(|b| format!("{:02x}", b))
-                                                .collect::<Vec<_>>()
-                                                .join(" ");
-                                            eprintln!(
-                                                "FWD_TCP_HDR[{}]: offset={} {}",
-                                                telemetry.dbg.forward, l4, tcp_hdr
-                                            );
-                                        }
+                                    // Hex dump bytes around TCP flags position in raw frame.
+                                    // #1145: reuse line-50 raw_frame bind (no Option wrapper).
+                                    let l4 = meta.l4_offset as usize;
+                                    if raw_frame.len() > l4 + 20 {
+                                        let tcp_hdr: String = raw_frame[l4..l4 + 20]
+                                            .iter()
+                                            .map(|b| format!("{:02x}", b))
+                                            .collect::<Vec<_>>()
+                                            .join(" ");
+                                        eprintln!(
+                                            "FWD_TCP_HDR[{}]: offset={} {}",
+                                            telemetry.dbg.forward, l4, tcp_hdr
+                                        );
                                     }
                                 }
                                 if (meta.tcp_flags & 0x04) != 0 {
@@ -1719,23 +1706,22 @@ pub(super) fn poll_binding_process_descriptor(
                                             telemetry.dbg.forward,
                                             flow_str,
                                         );
-                                        // Hex dump TCP header when RST detected
-                                        if let Some(data) = frame_data {
-                                            let l4 = meta.l4_offset as usize;
-                                            if data.len() > l4 + 20 {
-                                                let tcp_hdr: String = data[l4..l4 + 20]
-                                                    .iter()
-                                                    .map(|b| format!("{:02x}", b))
-                                                    .collect::<Vec<_>>()
-                                                    .join(" ");
-                                                eprintln!(
-                                                    "FWD_TCP_RST_HDR[{}]: meta_off={} raw_off={} {}",
-                                                    telemetry.dbg.fwd_tcp_rst,
-                                                    l4,
-                                                    frame_l3_offset(data).unwrap_or(0),
-                                                    tcp_hdr
-                                                );
-                                            }
+                                        // Hex dump TCP header when RST detected.
+                                        // #1145: reuse line-50 raw_frame bind.
+                                        let l4 = meta.l4_offset as usize;
+                                        if raw_frame.len() > l4 + 20 {
+                                            let tcp_hdr: String = raw_frame[l4..l4 + 20]
+                                                .iter()
+                                                .map(|b| format!("{:02x}", b))
+                                                .collect::<Vec<_>>()
+                                                .join(" ");
+                                            eprintln!(
+                                                "FWD_TCP_RST_HDR[{}]: meta_off={} raw_off={} {}",
+                                                telemetry.dbg.fwd_tcp_rst,
+                                                l4,
+                                                frame_l3_offset(raw_frame).unwrap_or(0),
+                                                tcp_hdr
+                                            );
                                         }
                                     }
                                 }
