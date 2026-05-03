@@ -392,6 +392,11 @@ impl BatchCounters {
 mod poll_descriptor;
 use poll_descriptor::poll_binding_process_descriptor;
 
+// #946 Phase 1: per-packet pipeline stages extracted from the
+// while-let body in `poll_binding_process_descriptor`. See
+// `docs/pr/946-pipeline-phase1/plan.md` for the full plan.
+mod poll_stages;
+
 // Issue 67.1: session-delta processing (flush_session_deltas et al.)
 // extracted into afxdp/session_delta.rs.
 mod session_delta;

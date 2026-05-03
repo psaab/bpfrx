@@ -7,6 +7,11 @@
 // that the extracted fn references.
 
 use super::*;
+use super::poll_stages::{
+    stage_classify_fabric_ingress, stage_ipsec_passthrough_check, stage_link_layer_classify,
+    stage_native_gre_decap, stage_parse_flow_and_learn, stage_screen_check, FabricIngressOutcome,
+    StageOutcome,
+};
 
 // Per-batch packet processing lifted from `poll_binding` (#678).
 //
@@ -52,174 +57,76 @@ pub(super) fn poll_binding_process_descriptor(
                         binding.scratch.scratch_recycle.push(desc.addr);
                         continue;
                     };
-                    // #947: ARP classification + reply parsing extracted to
-                    // `parser.rs`. Any ARP frame (request/reply/etc.) is
-                    // recycled — ARP does not transit the firewall. ARP
-                    // replies additionally update the dynamic neighbor cache
-                    // and the kernel's neighbor table.
-                    match parser::classify_arp(raw_frame) {
-                        parser::ArpClassification::Reply(arp) => {
-                            worker_ctx.dynamic_neighbors.insert(
-                                (meta.ingress_ifindex as i32, arp.sender_ip),
-                                NeighborEntry {
-                                    mac: arp.sender_mac,
-                                },
-                            );
-                            let neigh_ifindex = resolve_ingress_logical_ifindex(
-                                worker_ctx.forwarding,
-                                meta.ingress_ifindex as i32,
-                                meta.ingress_vlan_id,
-                            )
-                            .unwrap_or(meta.ingress_ifindex as i32);
-                            add_kernel_neighbor(neigh_ifindex, arp.sender_ip, arp.sender_mac);
-                            binding.scratch.scratch_recycle.push(desc.addr);
-                            continue;
-                        }
-                        parser::ArpClassification::OtherArp => {
-                            binding.scratch.scratch_recycle.push(desc.addr);
-                            continue;
-                        }
-                        parser::ArpClassification::NotArp => {}
-                    }
-                    // #947: NDP Neighbor Advertisement parsing extracted to
-                    // `parser.rs`. NA with a Target Link-Layer Address option
-                    // updates the dynamic neighbor cache and the kernel's
-                    // neighbor table. Unlike ARP, the NA frame falls through
-                    // to normal IPv6 forwarding processing afterward.
-                    if let Some(na) = parser::parse_ndp_neighbor_advert(raw_frame)
-                        && let Some(mac) = na.target_mac
+                    // #946 Phase 1 stage 5: ARP / NDP link-layer
+                    // classification. ARP frames recycle without
+                    // transiting; NDP NA learns and falls through.
+                    if let StageOutcome::RecycleAndContinue =
+                        stage_link_layer_classify(raw_frame, meta, worker_ctx)
                     {
-                        worker_ctx.dynamic_neighbors.insert(
-                            (meta.ingress_ifindex as i32, na.target_ip),
-                            NeighborEntry { mac },
-                        );
-                        let neigh_ifindex = resolve_ingress_logical_ifindex(
-                            worker_ctx.forwarding,
-                            meta.ingress_ifindex as i32,
-                            meta.ingress_vlan_id,
-                        )
-                        .unwrap_or(meta.ingress_ifindex as i32);
-                        add_kernel_neighbor(neigh_ifindex, na.target_ip, mac);
+                        binding.scratch.scratch_recycle.push(desc.addr);
+                        continue;
                     }
-                    let native_gre_packet =
-                        try_native_gre_decap_from_frame(raw_frame, meta, worker_ctx.forwarding);
-                    let mut meta = native_gre_packet
-                        .as_ref()
-                        .map(|packet| packet.meta)
-                        .unwrap_or(meta);
-                    let mut owned_packet_frame = native_gre_packet.map(|packet| packet.frame);
+                    // #946 Phase 1 stage 6: native GRE decap. Caller
+                    // binds the active slice locally; helper does NOT
+                    // return the slice (would be self-referential).
+                    // `owned_packet_frame` MUST be `mut` — deferred
+                    // stage-12+ code at lines below calls `.take()`.
+                    let (mut meta, mut owned_packet_frame) =
+                        stage_native_gre_decap(raw_frame, meta, worker_ctx.forwarding);
                     let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);
-                    let flow = parse_session_flow_from_bytes(packet_frame, meta);
-                    if owned_packet_frame.is_none()
-                        && let Some(flow) = flow.as_ref()
-                    {
-                        learn_dynamic_neighbor_from_packet(
-                            unsafe { &*area },
-                            desc,
-                            meta,
-                            flow.src_ip,
-                            &mut binding.last_learned_neighbor,
-                            worker_ctx.forwarding,
-                            worker_ctx.dynamic_neighbors,
-                        );
-                    }
-                    let ingress_zone_override = parse_zone_encoded_fabric_ingress_from_frame(
+                    // #946 Phase 1 stage 7+8: parse session flow and
+                    // learn the source-side dynamic neighbor.
+                    // `learn_from_live_frame` MUST be
+                    // `owned_packet_frame.is_none()` — preserves the
+                    // GRE guard at the original line 113 (neighbor
+                    // learning uses the live UMEM Ethernet frame so
+                    // the source MAC is the outer host's, not the
+                    // GRE tunnel egress).
+                    let flow = stage_parse_flow_and_learn(
+                        unsafe { &*area },
+                        desc,
                         packet_frame,
                         meta,
-                        worker_ctx.forwarding,
+                        owned_packet_frame.is_none(),
+                        &mut binding.last_learned_neighbor,
+                        worker_ctx,
                     );
-                    let packet_fabric_ingress = ingress_zone_override.is_some()
-                        || ingress_is_fabric_overlay(worker_ctx.forwarding, meta.ingress_ifindex as i32);
-                    // Flag fabric-ingress packets so rewrite functions skip TTL
-                    // decrement. The sending peer already decremented TTL when
-                    // it forwarded the packet across the fabric link.
-                    if packet_fabric_ingress {
-                        meta.meta_flags |= FABRIC_INGRESS_FLAG;
+                    // #946 Phase 1 stage 9: fabric-ingress
+                    // classification. Mutates meta.meta_flags. MUST
+                    // run before screen/IPsec/flow-cache because they
+                    // read meta.meta_flags downstream.
+                    let FabricIngressOutcome {
+                        ingress_zone_override,
+                        packet_fabric_ingress,
+                    } = stage_classify_fabric_ingress(packet_frame, &mut meta, worker_ctx);
+                    // #946 Phase 1 stage 10: screen / IDS slow-path.
+                    // Caller still owns the recycle push (matches
+                    // original code's pattern).
+                    if let StageOutcome::RecycleAndContinue = stage_screen_check(
+                        flow.as_ref(),
+                        packet_frame,
+                        meta,
+                        ingress_zone_override,
+                        now_secs,
+                        screen,
+                        &binding.live,
+                        worker_ctx,
+                    ) {
+                        binding.scratch.scratch_recycle.push(desc.addr);
+                        continue;
                     }
-                    // Screen/IDS check — runs BEFORE session lookup.
-                    // Resolve ingress zone name for screen profile lookup.
-                    // Slow path — only runs when screen profiles configured.
-                    // #919: ingress_zone_override is now Option<u16>; resolve
-                    // ID → name via zone_id_to_name when present.
-                    if screen.has_profiles() {
-                        if let Some(flow) = flow.as_ref() {
-                            let zone_name = ingress_zone_override
-                                .and_then(|id| {
-                                    worker_ctx.forwarding.zone_id_to_name.get(&id).map(|s| s.as_str())
-                                })
-                                .or_else(|| {
-                                    // #921: ifindex → u16 → name via
-                                    // zone_id_to_name. Slow path (only
-                                    // when screen profiles configured).
-                                    worker_ctx.forwarding
-                                        .ifindex_to_zone_id
-                                        .get(&(meta.ingress_ifindex as i32))
-                                        .and_then(|id| worker_ctx.forwarding.zone_id_to_name.get(id))
-                                        .map(|s| s.as_str())
-                                });
-                            if let Some(zone_name) = zone_name {
-                                let l3_off = if meta.ingress_vlan_id > 0 {
-                                    18
-                                } else {
-                                    14 // default Ethernet header
-                                };
-                                let screen_pkt = extract_screen_info(
-                                    packet_frame,
-                                    meta.addr_family,
-                                    meta.protocol,
-                                    meta.tcp_flags,
-                                    meta.pkt_len,
-                                    flow.src_ip,
-                                    flow.dst_ip,
-                                    flow.forward_key.src_port,
-                                    flow.forward_key.dst_port,
-                                    l3_off,
-                                );
-                                if let ScreenVerdict::Drop(_reason) =
-                                    screen.check_packet(zone_name, &screen_pkt, now_secs)
-                                {
-                                    binding.live.screen_drops.fetch_add(1, Ordering::Relaxed);
-                                    binding.scratch.scratch_recycle.push(desc.addr);
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                    // IPsec passthrough: ESP (proto 50) and IKE (UDP 500/4500)
-                    // must be handled by the kernel XFRM subsystem. Send these
-                    // packets to the slow-path TUN device so the kernel can
-                    // encrypt/decrypt via XFRM, then recycle the UMEM frame.
-                    if let Some(flow) = flow.as_ref() {
-                        if is_ipsec_traffic(meta.protocol, flow.forward_key.dst_port) {
-                            let ipsec_decision = SessionDecision {
-                                resolution: ForwardingResolution {
-                                    disposition: ForwardingDisposition::LocalDelivery,
-                                    local_ifindex: 0,
-                                    egress_ifindex: 0,
-                                    tx_ifindex: 0,
-                                    tunnel_endpoint_id: 0,
-                                    next_hop: None,
-                                    neighbor_mac: None,
-                                    src_mac: None,
-                                    tx_vlan_id: 0,
-                                },
-                                nat: NatDecision::default(),
-                            };
-                            maybe_reinject_slow_path_from_frame(
-                                &worker_ctx.ident,
-                                &binding.live,
-                                worker_ctx.slow_path,
-                                worker_ctx.local_tunnel_deliveries,
-                                packet_frame,
-                                meta,
-                                ipsec_decision,
-                                worker_ctx.recent_exceptions,
-                                "slow_path",
-                                worker_ctx.forwarding,
-                            );
-                            binding.scratch.scratch_recycle.push(desc.addr);
-                            continue;
-                        }
+                    // #946 Phase 1 stage 11: IPsec passthrough. ESP
+                    // (proto 50) and IKE (UDP 500/4500) reinject via
+                    // the slow-path TUN; recycle the UMEM frame.
+                    if let StageOutcome::RecycleAndContinue = stage_ipsec_passthrough_check(
+                        flow.as_ref(),
+                        packet_frame,
+                        meta,
+                        &binding.live,
+                        worker_ctx,
+                    ) {
+                        binding.scratch.scratch_recycle.push(desc.addr);
+                        continue;
                     }
                     // ── Flow cache fast path ────────────────────────────
                     // For established TCP (ACK-only) and UDP, check the per-
