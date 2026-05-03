@@ -6,9 +6,13 @@
 - #1044c (cli.go):      this PR. 2,661 → target ~1,696 LOC.
 
 ## Scope
-Move five large handler functions from `pkg/cli/cli.go` into existing
+Move four large handler functions from `pkg/cli/cli.go` into existing
 sibling files in `pkg/cli/`. Pure relocation — same methodology as
 #1043 server_show.go split. No new files; no architectural change.
+
+(Originally drafted as five functions; `handleShowSecurity` was
+removed from scope after measuring `cli_show_security.go` at 1,978
+LOC pre-PR. See the table below.)
 
 ## Mapping
 
