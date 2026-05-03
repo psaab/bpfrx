@@ -143,7 +143,7 @@ pub(super) fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
         return;
     }
     match touch_heartbeat(
-        binding.heartbeat_map_fd,
+        binding.bpf_maps.heartbeat_map_fd,
         binding.slot,
         &binding.live,
         now_ns,
@@ -158,7 +158,7 @@ pub(super) fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
                     debug_log!(
                         "HB_UPDATE slot={} fd={} age={}ms now_ns={} LATE",
                         binding.slot,
-                        binding.heartbeat_map_fd,
+                        binding.bpf_maps.heartbeat_map_fd,
                         age_ms,
                         now_ns,
                     );
@@ -171,7 +171,7 @@ pub(super) fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
                             "HB_UPDATE[{}] slot={} fd={} age={}ms now_ns={} OK",
                             n,
                             binding.slot,
-                            binding.heartbeat_map_fd,
+                            binding.bpf_maps.heartbeat_map_fd,
                             age_ms,
                             now_ns,
                         );
@@ -184,7 +184,7 @@ pub(super) fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
             eprintln!(
                 "HB_UPDATE_ERR slot={} fd={} age={}ms err={}",
                 binding.slot,
-                binding.heartbeat_map_fd,
+                binding.bpf_maps.heartbeat_map_fd,
                 age_ns / 1_000_000,
                 err,
             );

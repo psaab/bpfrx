@@ -25,6 +25,10 @@ pub(crate) use cos_state::WorkerCos;
 mod tx_counters;
 pub(crate) use tx_counters::WorkerTxCounters;
 
+// #959 Phase 5: per-binding BPF map FDs live in worker/bpf_maps.rs.
+mod bpf_maps;
+pub(crate) use bpf_maps::WorkerBpfMaps;
+
 // #957 P1: worker-side CoS runtime helpers split out into a sibling
 // submodule. Note this module is `worker::cos`, separate from the
 // `afxdp::cos` directory module imported below as `super::cos`.
@@ -110,10 +114,9 @@ pub(crate) struct BindingWorker {
     /// (not recycled) until the neighbor resolves or the entry times out.
     pub(crate) pending_neigh: VecDeque<PendingNeighPacket>,
     pub(crate) in_flight_prepared_recycles: FastMap<u64, PreparedTxRecycle>,
-    pub(crate) heartbeat_map_fd: c_int,
-    pub(crate) session_map_fd: c_int,
-    pub(crate) conntrack_v4_fd: c_int,
-    pub(crate) conntrack_v6_fd: c_int,
+    /// #959 Phase 5: 4 BPF map FDs extracted into `WorkerBpfMaps`.
+    /// Field semantics unchanged; access via `binding.bpf_maps.X_fd`.
+    pub(crate) bpf_maps: WorkerBpfMaps,
     pub(crate) last_heartbeat_update_ns: u64,
     pub(crate) debug_state_counter: u32,
     pub(crate) last_rx_wake_ns: u64,
@@ -387,10 +390,12 @@ impl BindingWorker {
             // packets actually queue up.
             pending_neigh: VecDeque::new(),
             in_flight_prepared_recycles: FastMap::default(),
-            heartbeat_map_fd,
-            session_map_fd,
-            conntrack_v4_fd,
-            conntrack_v6_fd,
+            bpf_maps: WorkerBpfMaps {
+                heartbeat_map_fd,
+                session_map_fd,
+                conntrack_v4_fd,
+                conntrack_v6_fd,
+            },
             last_heartbeat_update_ns: init_now,
             debug_state_counter: 0,
             last_rx_wake_ns: init_now,
@@ -651,15 +656,15 @@ pub(crate) fn worker_loop(
     // Cache BPF map FDs — they don't change during the worker's lifetime.
     let session_map_fd = bindings
         .first()
-        .map(|binding| binding.session_map_fd)
+        .map(|binding| binding.bpf_maps.session_map_fd)
         .unwrap_or(-1);
     let conntrack_v4_fd = bindings
         .first()
-        .map(|binding| binding.conntrack_v4_fd)
+        .map(|binding| binding.bpf_maps.conntrack_v4_fd)
         .unwrap_or(-1);
     let conntrack_v6_fd = bindings
         .first()
-        .map(|binding| binding.conntrack_v6_fd)
+        .map(|binding| binding.bpf_maps.conntrack_v6_fd)
         .unwrap_or(-1);
     let mut last_ct_refresh_ns: u64 = 0;
     cos_status.store(Arc::new(build_worker_cos_statuses(
@@ -1029,7 +1034,7 @@ pub(crate) fn worker_loop(
                     flush_session_deltas(
                         &ident,
                         &binding.live,
-                        binding.session_map_fd,
+                        binding.bpf_maps.session_map_fd,
                         conntrack_v4_fd,
                         conntrack_v6_fd,
                         &deltas,
@@ -1055,7 +1060,7 @@ pub(crate) fn worker_loop(
                 flush_session_deltas(
                     &ident,
                     &binding.live,
-                    binding.session_map_fd,
+                    binding.bpf_maps.session_map_fd,
                     conntrack_v4_fd,
                     conntrack_v6_fd,
                     &deltas,
@@ -1271,7 +1276,7 @@ pub(crate) fn worker_loop(
                     SESSION_PUBLISH_VERIFY_OK.swap(0, Ordering::Relaxed),
                     SESSION_PUBLISH_VERIFY_FAIL.swap(0, Ordering::Relaxed),
                     if let Some(b) = bindings.first() {
-                        count_bpf_session_entries(b.session_map_fd)
+                        count_bpf_session_entries(b.bpf_maps.session_map_fd)
                     } else {
                         0
                     },
@@ -1434,7 +1439,7 @@ pub(crate) fn worker_loop(
                         if let Some(b) = bindings.first() {
                             eprintln!(
                                 "DBG STALL_BPF_SESSIONS: entries={}",
-                                count_bpf_session_entries(b.session_map_fd)
+                                count_bpf_session_entries(b.bpf_maps.session_map_fd)
                             );
                         }
                     } else if prev_fwd_total > 0 {

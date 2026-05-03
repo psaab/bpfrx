@@ -668,16 +668,16 @@ pub(super) fn teardown_tcp_rst_flow(
     let reverse_key = reverse_session_key(forward_key, nat);
     sessions.delete(forward_key);
     sessions.delete(&reverse_key);
-    delete_live_session_entry(current.session_map_fd, forward_key, nat, false);
-    delete_live_session_entry(current.session_map_fd, &reverse_key, nat, true);
+    delete_live_session_entry(current.bpf_maps.session_map_fd, forward_key, nat, false);
+    delete_live_session_entry(current.bpf_maps.session_map_fd, &reverse_key, nat, true);
     delete_bpf_conntrack_entry(
-        current.conntrack_v4_fd,
-        current.conntrack_v6_fd,
+        current.bpf_maps.conntrack_v4_fd,
+        current.bpf_maps.conntrack_v6_fd,
         forward_key,
     );
     delete_bpf_conntrack_entry(
-        current.conntrack_v4_fd,
-        current.conntrack_v6_fd,
+        current.bpf_maps.conntrack_v4_fd,
+        current.bpf_maps.conntrack_v6_fd,
         &reverse_key,
     );
     remove_shared_session(
