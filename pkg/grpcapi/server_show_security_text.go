@@ -1,11 +1,11 @@
-// Phase 12 of #1043: extract the residual security/observability
-// ShowText case bodies (`ipsec-statistics`, `tunnels`, `rpm`,
-// `security-log`, `security-alarms`/`security-alarms-detail`) into
-// dedicated methods. Same methodology as Phases 1-11: semantic
-// relocation, no behavior change. Each case body is moved verbatim
-// apart from `&buf` references becoming `buf` (passed-in
-// `*strings.Builder`) and `if … { … } else { … }` flattened into
-// early-return form where it shortens an indent level.
+// Phase 12 of #1043: extract the seven residual ShowText case bodies
+// (`ipsec-statistics`, `tunnels`, `rpm`, `security-log`,
+// `security-alarms`/`security-alarms-detail`, `schedulers`,
+// `applications`) into dedicated methods. Same methodology as Phases
+// 1-11: semantic relocation, no behavior change. Each case body is
+// moved verbatim apart from `&buf` references becoming `buf`
+// (passed-in `*strings.Builder`) and `if … { … } else { … }`
+// flattened into early-return form where it shortens an indent level.
 //
 // `showIPsecStatistics` returns `error` (the original case had a
 // `return nil, status.Errorf` path); the dispatcher rewraps via
