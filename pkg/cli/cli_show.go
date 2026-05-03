@@ -1,8 +1,7 @@
-// #1044c Phase 1: relocate handleShow from cli.go.
-// Pure relocation — same methodology as #1043 server_show.go split.
-// No behavior change.
-
 package cli
+
+// #1044c: relocate handleShow from cli.go. Pure relocation — same
+// methodology as #1043 server_show.go split. No behavior change.
 
 import (
 	"fmt"
