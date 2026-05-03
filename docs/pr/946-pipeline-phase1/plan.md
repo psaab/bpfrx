@@ -466,13 +466,16 @@ Phase 1 preserves it.
   - **Metadata/disposition side effects fire BEFORE recycle.**
     `record_disposition` and `record_exception` both update
     `binding.live.*` and `recent_exceptions` before the recycle
-    push. v3's stage_parse_and_classify keeps this ordering by
-    firing the side effects internally before returning
-    RecycleAndContinue.
+    push. In v3.2 (as shipped) stages 2-4 stay inline so this
+    ordering is preserved naturally by the unchanged
+    if-let-else structure at the bottom of the loop body
+    (poll_descriptor.rs:2181-2204) — record_disposition and
+    record_exception fire there, before the trailing
+    `if recycle_now` block.
   - **`validated_packets`/`validated_bytes` increment BEFORE
     raw-frame slice success** (poll_descriptor.rs:47–48 vs 49).
-    v3's stage_parse_and_classify increments these between
-    classify and slice.
+    Preserved naturally by the inline code path; stages 2-4
+    were not extracted in v3.2.
   - **Dynamic-neighbor learning only for non-GRE-owned frames**
     (line 113 guard). v3's `learn_from_live_frame` flag passes
     `owned_packet_frame.is_none()` from the caller.
