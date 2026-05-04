@@ -1,8 +1,54 @@
 ---
-status: DRAFT v2 — Codex round-1 PLAN-NEEDS-MAJOR + Gemini Pro 3 round-1 PLAN-NEEDS-MINOR addressed
+status: DRAFT v3 — Codex round-2 PLAN-NEEDS-MAJOR addressed by reusing existing screen_drop() helper (no new counter); Gemini Pro 3 round-2 already PLAN-READY
 issue: https://github.com/psaab/xpf/issues/867
 phase: ACK-evasion of SCREEN_IP_SWEEP — post-conntrack accounting
 ---
+
+## Changelog v3
+
+Codex round-2 (`task-mors4osy-ut5dqt`) returned PLAN-NEEDS-MAJOR
+with 2 new MAJORs and 2 minors. Gemini Pro 3 round-2
+(`task-mors54ww-82lk1j`) returned PLAN-READY ✅. Plan v3
+simplifies materially by **dropping the proposed
+`GLOBAL_CTR_SCREEN_IP_SWEEP_ACK`** counter and reusing the
+existing `screen_drop(meta, SCREEN_IP_SWEEP)` helper at
+`bpf/xdp/xdp_screen.c:35-43`. This single change eliminates
+both Codex round-2 MAJORs at once:
+
+- **Codex NEW MAJOR 1** — "ACK drop path bypasses existing
+  screen-drop semantics (policy_id, GLOBAL_CTR_SCREEN_DROPS,
+  per-screen counter, EVENT_TYPE_SCREEN_DROP)". Resolved: the
+  helper now ends with `return screen_drop(meta, SCREEN_IP_SWEEP)`
+  which performs all four side effects. No new ABI surface,
+  no new counter to mirror.
+- **Codex NEW MAJOR 2** — "counter exposure scope incomplete
+  (CLI/GRPC/API hard-coded counter lists not updated)".
+  Resolved: no new counter index → no exposure changes
+  required. The existing `GlobalCtrScreenIPSweep` rendering at
+  `pkg/grpcapi/server_show_status.go:66`, `pkg/cli/cli_show_flow.go:141`,
+  and `pkg/cli/cli_show_flow.go:982` automatically counts BOTH
+  screen-stage drops AND new ACK-evasion drops in the same
+  `ip-sweep` line — exactly what the operator wants ("how many
+  sweep probes were detected, regardless of probe shape").
+- **Codex NEW MINOR 3** — "stale userspace mirror language in
+  §2 and §7 contradicts §4.3". Resolved by rewriting §2 and §7
+  to match v2's §4.3 ("No userspace changes needed").
+- **Codex NIT 4** — "`SCREEN_DROP_RC` symbol doesn't exist".
+  Resolved: helper now returns `XDP_DROP` from
+  `screen_drop()` on threshold trip, `0` otherwise.
+
+Tradeoff lost vs gained:
+- LOST: ability to distinguish "sweep with ACK probes" from
+  "sweep with SYN/UDP probes" via separate counters. Operator
+  diagnostic gets one unified count.
+- GAINED: no ABI surface change; smaller patch; reuses
+  battle-tested screen-drop side-effect ordering; eliminates
+  the maintenance burden of keeping a parallel counter
+  rendered correctly across CLI/GRPC/Prometheus.
+
+Codex's other round-1 findings (false-positive analysis, stack
+budget, NAT64 ordering, IPv6 path coverage, test plan) remain
+addressed as in v2.
 
 ## Changelog v2
 
@@ -123,14 +169,19 @@ This is a **security-correctness** PR, not a perf PR. Win:
 
 Cost (very small):
 
-- ~30 lines of BPF C in `xdp_conntrack.c` (one new accounting
-  block on the session-miss path).
-- ~60 lines of Rust in `userspace-dp/src/screen.rs` to mirror
-  for the userspace dataplane (parity with eBPF).
-- 2-3 new screen tests (Rust + Go where applicable).
-- One new global counter index `GLOBAL_CTR_SCREEN_IP_SWEEP_ACK`
-  for observability of ACK-path drops vs original-path drops.
-- No protocol-wire change (counter index is internal-only).
+- One new bit on `meta->meta_flags` (`META_FLAG_SCREEN_SKIPPED`)
+  set in `bpf/headers/xpf_helpers.h::resolve_ingress_xdp_target`
+  on the explicit ACK-only fast-path return.
+- One new `__noinline` helper (`ip_sweep_track_ack_evasion`) in
+  the BPF datapath, ~30 lines, called from the IPv4 and IPv6
+  conntrack-miss paths in `xdp_conntrack.c`.
+- The helper reuses `screen_drop(meta, SCREEN_IP_SWEEP)` for
+  drop semantics (no new counter index, no new wire surface,
+  no new ABI).
+- New screen tests (BPF eBPF program loader): 11 tests covering
+  positive admission v4+v6, negative no-double-count for each
+  bypass-disabling flag, NAT64 reverse exemption, etc. (See §8.)
+- No userspace dataplane change (out of scope per §4.3).
 - No HA/cluster impact (sweep accounting is per-CPU LRU,
   doesn't sync across nodes today).
 
@@ -192,21 +243,28 @@ No double-count.
 The new conntrack-miss helper (§4.2) gates on this bit. Packets
 without the bit do NOT trigger the helper.
 
-### 4.1 Counter ABI append
+### 4.1 No new counter — reuse `screen_drop()`
 
-Add `GLOBAL_CTR_SCREEN_IP_SWEEP_ACK` at the end of the global
-counter enum in `bpf/headers/xpf_common.h` (current values
-0..40, `MAX = 41` — new value becomes 41, new `MAX = 42`).
-Mirror in `pkg/dataplane/types.go` (`GlobalCtrScreenIPSweepAck`)
-and update `pkg/dataplane/userspace/manager_ha.go::summing` so
-`GlobalCtrScreenDrops` aggregate includes the new counter (per
-Codex round-1 §6 finding).
+Plan v3 drops the proposed `GLOBAL_CTR_SCREEN_IP_SWEEP_ACK`
+counter index. The new helper ends by calling the existing
+`screen_drop(meta, SCREEN_IP_SWEEP)` helper at
+`bpf/xdp/xdp_screen.c:35-43`, which performs:
 
-Operator UX:
-- `cli show security flow statistics` shows the per-counter
-  breakdown including ACK-evasion drops separately.
-- The aggregate `screen drops` line continues to include all
-  paths (including ACK-evasion) for backward compatibility.
+1. `meta->policy_id = SCREEN_IP_SWEEP`
+2. `inc_counter(GLOBAL_CTR_SCREEN_DROPS)`
+3. `inc_screen_counter(SCREEN_IP_SWEEP)` (per-screen counter,
+   today rendered as the `ip-sweep` line in
+   `pkg/grpcapi/server_show_status.go:66`,
+   `pkg/cli/cli_show_flow.go:141`, `pkg/cli/cli_show_flow.go:982`)
+4. `emit_event(meta, EVENT_TYPE_SCREEN_DROP, ACTION_DENY, ...)`
+5. `return XDP_DROP`
+
+Operator UX: the existing `ip-sweep` counter / line in CLI and
+gRPC output now counts BOTH screen-stage detections AND
+ACK-evasion detections via the unified counter. No new
+rendering site, no new wire field, no new metric. (Codex
+round-2 NEW MAJOR 1 + NEW MAJOR 2 both resolved by this
+single decision.)
 
 ### 4.2 Conntrack miss-path helper (Gemini Pro 3 IPv6 fix)
 
@@ -217,23 +275,25 @@ Extract the accounting logic into a `__noinline` helper in
 ```c
 static __noinline int
 ip_sweep_track_ack_evasion(struct pkt_meta *meta, __u64 now_sec);
-/* returns SCREEN_DROP_RC if threshold tripped, 0 otherwise */
+/* returns XDP_DROP on threshold trip, 0 otherwise */
 ```
 
 Helper body:
-1. Fast-bail if `!(meta->meta_flags & META_FLAG_SCREEN_SKIPPED)`.
+1. Fast-bail returning `0` if
+   `!(meta->meta_flags & META_FLAG_SCREEN_SKIPPED)`.
 2. Look up `zone_configs` by `meta->ingress_zone`. (NO
    `iface_zone_map` lookup — `ingress_zone` is already resolved.)
 3. Look up `screen_configs` by `zone_configs.screen_profile_id`.
-4. Bail if `(sc->flags & SCREEN_IP_SWEEP) == 0` or
+4. Bail returning `0` if `(sc->flags & SCREEN_IP_SWEEP) == 0` or
    `sc->ip_sweep_thresh == 0`.
 5. Compute `(src_ip-or-v6-fold, ingress_zone)` key matching the
    existing `xdp_screen.c:943-951` algorithm.
 6. Same window/counter logic as `xdp_screen.c:953-975`. On
-   threshold trip, increment `GLOBAL_CTR_SCREEN_IP_SWEEP_ACK`
-   AND return drop. (Existing screen-stage logic increments
-   `GLOBAL_CTR_SCREEN_IP_SWEEP` instead — the ACK-specific
-   counter is the diagnostic split.)
+   threshold trip, return `screen_drop(meta, SCREEN_IP_SWEEP)`
+   which performs all four screen-drop side effects (policy_id,
+   GLOBAL_CTR_SCREEN_DROPS, per-screen counter, ring-buffer
+   event, XDP_DROP return). The unified counter at the existing
+   rendering sites covers both paths.
 
 Invocation sites — IMPORTANT, BOTH families:
 
@@ -321,7 +381,7 @@ build that the conntrack frame stays ≤512 bytes combined.
 | Class | Verdict | Notes |
 |---|---|---|
 | Behavioral regression | **MED** | New drop path on conntrack-miss. False-positive possible on daemon restart / asymmetric routing — both already-known properties of the existing screen-stage sweep, just now reachable for ACK shape. |
-| Lifetime / borrow-checker | **LOW** | Rust mirror is a few lines, no lifetime gymnastics. |
+| Lifetime / borrow-checker | **LOW** | No Rust changes (userspace-dp out of scope per §4.3). |
 | Performance regression | **LOW** | New code is on the conntrack-miss path which is already the slow path (most packets hit a session and tail-call). Extra cost: one LRU map lookup + at most one update on the miss-path. |
 | Architectural mismatch (#961 / #946-Phase-2 dead-end) | **MED** | Splitting sweep accounting across xdp_screen and xdp_conntrack is layering churn. Reviewers may prefer Option 1 (HLL distinct-dst) which keeps the accounting in xdp_screen. Defer to PLAN-KILL if that's the call. |
 
@@ -338,11 +398,17 @@ build that the conntrack frame stays ≤512 bytes combined.
   Positive admission (drops correctly):
   - `ip_sweep_ack_evasion_detected_v4` — ACK probes from one
     source to N distinct dst v4 addresses; no matching session;
-    drops after threshold.
+    drops after threshold; assert `GlobalCtrScreenDrops` and
+    `GlobalCtrScreenIPSweep` (per-screen counter) both increment.
   - `ip_sweep_ack_evasion_detected_v6` — same shape, IPv6.
   - `ip_sweep_ack_evasion_threshold_unified_with_screen_path` —
     half SYN probes (via screen) + half ACK probes (via new
-    helper); drops on combined count against unified `ip_sweep_track`.
+    helper); drops on combined count against unified `ip_sweep_track`;
+    `GlobalCtrScreenIPSweep` reflects both paths.
+  - `ip_sweep_ack_evasion_emits_screen_drop_event` — verify the
+    drop produces an `EVENT_TYPE_SCREEN_DROP` ring-buffer event
+    (proves the helper invokes `screen_drop()` rather than
+    short-circuiting it).
 
   Negative (no drop, hook not entered):
   - `ip_sweep_ack_no_drop_when_session_matches_v4` — established
