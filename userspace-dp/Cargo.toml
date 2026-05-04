@@ -18,6 +18,7 @@ libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rustc-hash = "2.1"
+slab = "0.4"
 
 [build-dependencies]
 cc = "1.2"
@@ -38,4 +39,13 @@ harness = false
 # 10 ms target, see bench file header).
 [[bench]]
 name = "prefix_set_lookup"
+harness = false
+
+# #964 Step 1: structural microbenchmark for the SessionTable
+# slab + integer-handle refactor. Reimplements the hot-path data
+# shapes in this bin crate (SessionTable is pub(crate); see
+# tx_kick_latency bench for the same pattern) to compare today's
+# FxHashMap-of-keys layout against the slab + Key→u32 layout.
+[[bench]]
+name = "session_table"
 harness = false

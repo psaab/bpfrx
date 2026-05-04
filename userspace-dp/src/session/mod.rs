@@ -125,13 +125,30 @@ struct SessionEntry {
     wheel_tick: u64,
 }
 
+/// #964 Step 1: slab-resident record. Holds the canonical
+/// SessionKey alongside the SessionEntry so any handle resolves to
+/// both. Required because find_forward_nat_match() etc. must return
+/// the canonical key, and lookup_with_origin's wheel push_to_wheel
+/// needs the canonical key after dropping the entry borrow.
+#[derive(Clone, Debug)]
+struct SessionRecord {
+    key: SessionKey,
+    entry: SessionEntry,
+}
 
 pub(crate) struct SessionTable {
-    sessions: FxHashMap<SessionKey, SessionEntry>,
-    nat_reverse_index: FxHashMap<SessionKey, SessionKey>,
-    forward_wire_index: FxHashMap<SessionKey, SessionKey>,
-    reverse_translated_index: FxHashMap<SessionKey, SessionKey>,
-    owner_rg_sessions: FxHashMap<i32, FxHashSet<SessionKey>>,
+    /// #964 Step 1: slab-allocated session storage. Indexed by u32
+    /// handle. Replaces the prior `sessions: FxHashMap<Key, Entry>`.
+    entries: slab::Slab<SessionRecord>,
+    /// #964 Step 1: forward-key → handle. Replaces the
+    /// `sessions` HashMap's key-to-entry mapping.
+    key_to_handle: FxHashMap<SessionKey, u32>,
+    /// #964 Step 1: secondary indices map to u32 handles, not full keys.
+    nat_reverse_index: FxHashMap<SessionKey, u32>,
+    forward_wire_index: FxHashMap<SessionKey, u32>,
+    reverse_translated_index: FxHashMap<SessionKey, u32>,
+    /// #964 Step 1: owner-RG sets keyed by handle (was Key).
+    owner_rg_sessions: FxHashMap<i32, FxHashSet<u32>>,
     deltas: VecDeque<SessionDelta>,
     last_gc_ns: u64,
     max_sessions: usize,
@@ -141,8 +158,13 @@ pub(crate) struct SessionTable {
     create_drops: u64,
     delta_drops: u64,
     delta_drained: u64,
-    /// #965: bucketed timer wheel that mirrors `sessions`. Pop one
+    /// #965: bucketed timer wheel that mirrors `entries`. Pop one
     /// bucket per tick (1 s) instead of scanning the whole HashMap.
+    /// Wheel entries hold `(SessionKey, scheduled_tick)` — NOT the
+    /// slab handle, because wheel lazy-delete needs a stable
+    /// identifier (slab handle reuse after remove+insert would point
+    /// stale wheel entries at the wrong session). See
+    /// docs/pr/964-session-multi-index/plan.md §"Wheel STAYS key-based".
     wheel: SessionWheel,
     /// #965: stats from the most-recent `expire_stale_entries` call.
     /// Reset at the start of each call. Used by unit tests to assert
@@ -155,7 +177,13 @@ pub(crate) struct SessionTable {
 impl SessionTable {
     pub fn new() -> Self {
         Self {
-            sessions: FxHashMap::default(),
+            // Start with an empty slab and let it grow on demand.
+            // `Slab::with_capacity(DEFAULT_MAX_SESSIONS)` would eagerly
+            // allocate a 131072-slot backing Vec per worker (Copilot
+            // review finding) — the prior FxHashMap grew on demand,
+            // so match that to keep baseline RSS unchanged.
+            entries: slab::Slab::new(),
+            key_to_handle: FxHashMap::default(),
             nat_reverse_index: FxHashMap::default(),
             forward_wire_index: FxHashMap::default(),
             reverse_translated_index: FxHashMap::default(),
@@ -209,7 +237,7 @@ impl SessionTable {
     #[inline]
     fn push_to_wheel(&mut self, key: &SessionKey, now_ns: u64) {
         self.wheel_observe(now_ns);
-        let new_tick = match self.sessions.get_mut(key) {
+        let new_tick = match self.entry_by_key_mut(key) {
             Some(entry) => {
                 let nt = target_tick_for(
                     now_ns,
@@ -244,14 +272,73 @@ impl SessionTable {
     }
 
     pub fn len(&self) -> usize {
-        self.sessions.len()
+        // Use key_to_handle (the authoritative primary index) so the
+        // count reflects "installed sessions" even if the slab ever
+        // held an orphan record from a partial cleanup path.
+        self.key_to_handle.len()
+    }
+
+    // ── #964 Step 1 internal helpers ─────────────────────────────
+    //
+    // Centralize key→handle and handle→record resolution so the rest
+    // of the impl uses these short forms instead of repeating
+    // `self.key_to_handle.get(key).and_then(|h| self.entries.get(*h as usize))`
+    // throughout 30+ call sites.
+
+    /// Resolve the slab handle for a forward-key direct lookup.
+    /// Returns None if the key isn't installed.
+    #[inline]
+    fn handle_for_key(&self, key: &SessionKey) -> Option<u32> {
+        self.key_to_handle.get(key).copied()
+    }
+
+    /// Resolve to a slab record from a forward-key. Returns None if
+    /// the key is unknown, the handle is stale, OR the resolved
+    /// record's canonical key doesn't match the lookup key (defense
+    /// vs reused-slot hazard — Copilot review).
+    #[inline]
+    fn record_by_key(&self, key: &SessionKey) -> Option<&SessionRecord> {
+        let handle = self.handle_for_key(key)?;
+        let record = self.entries.get(handle as usize)?;
+        if record.key != *key {
+            return None;
+        }
+        Some(record)
+    }
+
+    /// Mut version of `record_by_key`. Same key-equality validation.
+    #[inline]
+    fn record_by_key_mut(&mut self, key: &SessionKey) -> Option<&mut SessionRecord> {
+        let handle = self.handle_for_key(key)?;
+        let record = self.entries.get_mut(handle as usize)?;
+        if record.key != *key {
+            return None;
+        }
+        Some(record)
+    }
+
+    /// Convenience: borrow the entry only (skipping the canonical
+    /// key field). Used by call sites that don't need the key.
+    #[inline]
+    fn entry_by_key(&self, key: &SessionKey) -> Option<&SessionEntry> {
+        self.record_by_key(key).map(|r| &r.entry)
+    }
+
+    #[inline]
+    fn entry_by_key_mut(&mut self, key: &SessionKey) -> Option<&mut SessionEntry> {
+        self.record_by_key_mut(key).map(|r| &mut r.entry)
+    }
+
+    #[inline]
+    fn contains_key(&self, key: &SessionKey) -> bool {
+        self.key_to_handle.contains_key(key)
     }
 
     /// Update the last-seen timestamp for a session (prevents GC expiry).
     /// Used by the flow cache to amortize session keepalive.
     #[inline]
     pub fn touch(&mut self, key: &SessionKey, now_ns: u64) {
-        if self.sessions.get_mut(key).is_some_and(|e| {
+        if self.entry_by_key_mut(key).is_some_and(|e| {
             e.last_seen_ns = now_ns;
             true
         }) {
@@ -301,7 +388,7 @@ impl SessionTable {
                     .expect("len snapshot bounds the iteration");
                 self.last_pop_stats.scanned += 1;
                 // Case 1: entry already removed elsewhere — drop hint.
-                let Some(entry) = self.sessions.get(&key) else {
+                let Some(entry) = self.entry_by_key(&key) else {
                     self.last_pop_stats.dropped_gone += 1;
                     continue;
                 };
@@ -371,9 +458,8 @@ impl SessionTable {
                     );
                     let new_bucket = bucket_for_tick(new_target_tick);
                     let entry_mut = self
-                        .sessions
-                        .get_mut(&key)
-                        .expect("entry was just read via .get(); no concurrent mutation");
+                        .entry_by_key_mut(&key)
+                        .expect("entry was just read via entry_by_key; no concurrent mutation");
                     entry_mut.wheel_tick = new_target_tick;
                     self.wheel.buckets[new_bucket].push_back(WheelEntry {
                         key,
@@ -410,23 +496,42 @@ impl SessionTable {
         now_ns: u64,
         tcp_flags: u8,
     ) -> Option<(SessionLookup, SessionOrigin)> {
-        let actual_key = if self.sessions.contains_key(key) {
-            key.clone()
-        } else if let Some(alias) = self.reverse_translated_index.get(key) {
-            alias.clone()
-        } else {
-            return None;
+        // #964 Step 1: resolve handle from key. Direct-primary path
+        // looks up via key_to_handle; alias path (NAT-translated
+        // reverse key) goes via reverse_translated_index.
+        let (handle, via_alias) = match self.key_to_handle.get(key) {
+            Some(h) => (*h, false),
+            None => match self.reverse_translated_index.get(key) {
+                Some(h) => (*h, true),
+                None => return None,
+            },
         };
-        // Pre-compute the timeout before borrowing &mut self.sessions
+        // Pre-compute the timeout before borrowing &mut self.entries
         // so the inner block doesn't need to access self.timeouts.
         let timeouts = self.timeouts;
-        // Scope the &mut self.sessions borrow so it ends BEFORE we
+        // Scope the &mut self.entries borrow so it ends BEFORE we
         // touch self.wheel via push_to_wheel. Without this scoping
-        // the closure form `self.sessions.get_mut(...).map(|entry| { ... })`
-        // would hold &mut self via self.sessions and conflict with
-        // a second &mut self via self.wheel.
-        let result = {
-            let entry = self.sessions.get_mut(&actual_key)?;
+        // the &mut record would conflict with the second &mut self
+        // via self.wheel.
+        let (result, actual_key) = {
+            let record = self.entries.get_mut(handle as usize)?;
+            // #964 Step 1: path-specific validation defends against
+            // a stale secondary index pointing at a slab slot that
+            // was reused by a different session (release-mode guard,
+            // not just debug). Direct-primary checks record.key ==
+            // *key; alias path verifies the NAT-translation roundtrip.
+            if !via_alias {
+                if record.key != *key {
+                    return None;
+                }
+            } else {
+                let must_be_reverse = record.entry.metadata.is_reverse;
+                let translated = translated_session_key(&record.key, record.entry.decision.nat);
+                if !must_be_reverse || translated != *key {
+                    return None;
+                }
+            }
+            let entry = &mut record.entry;
             if matches!(key.protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0 {
                 if !entry.closing {
                     debug_log!(
@@ -453,32 +558,35 @@ impl SessionTable {
                 session_timeout_ns(key.protocol, tcp_flags, &timeouts)
             };
             (
-                SessionLookup {
-                    decision: entry.decision,
-                    metadata: entry.metadata.clone(),
-                },
-                entry.origin,
+                (
+                    SessionLookup {
+                        decision: entry.decision,
+                        metadata: entry.metadata.clone(),
+                    },
+                    entry.origin,
+                ),
+                record.key.clone(),
             )
-        }; // <-- &mut self.sessions borrow ends here
-        // Push the canonical key (NOT the alias `key`) into the wheel.
-        // push_to_wheel re-reads the entry to compute the throttled
-        // target_tick, so a second HashMap lookup is needed; that
-        // matches the model in the plan (~100 ns per FxHashMap lookup
-        // on the hot path).
+        }; // <-- &mut self.entries borrow ends here
+        // Push the canonical key (NOT the alias lookup `key`) into
+        // the wheel. push_to_wheel re-reads the record to compute
+        // the throttled target_tick — that matches the model in the
+        // plan (~100 ns per FxHashMap lookup on the slow path).
         self.push_to_wheel(&actual_key, now_ns);
         Some(result)
     }
 
     pub fn find_forward_nat_match(&self, reply_key: &SessionKey) -> Option<ForwardSessionMatch> {
-        let forward_key = self.nat_reverse_index.get(reply_key)?;
-        let entry = self.sessions.get(forward_key)?;
+        let handle = *self.nat_reverse_index.get(reply_key)?;
+        let record = self.entries.get(handle as usize)?;
+        let entry = &record.entry;
         if entry.metadata.is_reverse
-            || !reply_matches_forward_session(forward_key, entry.decision.nat, reply_key)
+            || !reply_matches_forward_session(&record.key, entry.decision.nat, reply_key)
         {
             return None;
         }
         Some(ForwardSessionMatch {
-            key: forward_key.clone(),
+            key: record.key.clone(),
             decision: entry.decision,
             metadata: entry.metadata.clone(),
         })
@@ -493,16 +601,17 @@ impl SessionTable {
         &self,
         wire_key: &SessionKey,
     ) -> Option<(ForwardSessionMatch, SessionOrigin)> {
-        let forward_key = self.forward_wire_index.get(wire_key)?;
-        let entry = self.sessions.get(forward_key)?;
+        let handle = *self.forward_wire_index.get(wire_key)?;
+        let record = self.entries.get(handle as usize)?;
+        let entry = &record.entry;
         if entry.metadata.is_reverse
-            || forward_wire_key(forward_key, entry.decision.nat) != *wire_key
+            || forward_wire_key(&record.key, entry.decision.nat) != *wire_key
         {
             return None;
         }
         Some((
             ForwardSessionMatch {
-                key: forward_key.clone(),
+                key: record.key.clone(),
                 decision: entry.decision,
                 metadata: entry.metadata.clone(),
             },
@@ -541,15 +650,27 @@ impl SessionTable {
         protocol: u8,
         tcp_flags: u8,
     ) -> bool {
-        if self.sessions.len() >= self.max_sessions {
+        if self.len() >= self.max_sessions {
             self.create_drops = self.create_drops.saturating_add(1);
             return false;
         }
-        self.remove_entry(&key);
+        // remove_entry's three debug_assert!s catch invariant
+        // violations in tests:
+        //   - stale-handle guard (entries.get returned None for a
+        //     handle in key_to_handle)
+        //   - PRIMARY-KEY GUARD (record.key != lookup key)
+        //   - no_index_points_at (a secondary index still points
+        //     at the freed handle after cleanup)
+        // The first two guards restore the prior key_to_handle
+        // mapping internally before returning None. In release we
+        // proceed to insert the new record — the guard already
+        // restored the prior mapping; the subsequent
+        // self.key_to_handle.insert(...) overwrites it cleanly.
+        let _previous = self.remove_entry(&key);
         let epoch = self.next_epoch();
-        self.sessions.insert(
-            key.clone(),
-            SessionEntry {
+        let record = SessionRecord {
+            key: key.clone(),
+            entry: SessionEntry {
                 decision,
                 metadata: metadata.clone(),
                 origin,
@@ -559,8 +680,11 @@ impl SessionTable {
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
                 wheel_tick: 0,
             },
-        );
-        self.index_forward_nat_key(&key, decision, &metadata);
+        };
+        let raw = self.entries.insert(record);
+        let handle: u32 = raw.try_into().expect("slab handle exceeds u32");
+        self.key_to_handle.insert(key.clone(), handle);
+        self.index_forward_nat_key(&key, handle, decision, &metadata);
         // #965: schedule the new entry for expiration check.
         self.push_to_wheel(&key, now_ns);
         if !metadata.is_reverse && !origin.is_peer_synced() && !origin.is_transient_local_seed() {
@@ -612,17 +736,21 @@ impl SessionTable {
     ) -> bool {
         // Reject peer data that would clobber a locally-owned session
         // unless explicitly allowed (e.g. during HA activation).
-        if matches!(self.sessions.get(&key), Some(existing) if !existing.origin.is_peer_synced())
+        if matches!(self.entry_by_key(&key), Some(existing) if !existing.origin.is_peer_synced())
             && !allow_replace_local
         {
             return false;
         }
-        self.remove_entry(&key);
+        // Same guard semantics as install_with_protocol_with_origin:
+        // remove_entry has 3 debug_assert!s (stale-handle,
+        // primary-key, no_index_points_at) that catch invariant
+        // violations in tests. The first two restore the prior
+        // key_to_handle mapping internally before returning None.
+        let _previous = self.remove_entry(&key);
         let epoch = self.next_epoch();
-        let index_key = key.clone();
-        self.sessions.insert(
-            key,
-            SessionEntry {
+        let record = SessionRecord {
+            key: key.clone(),
+            entry: SessionEntry {
                 decision,
                 metadata: metadata.clone(),
                 origin,
@@ -632,8 +760,12 @@ impl SessionTable {
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
                 wheel_tick: 0,
             },
-        );
-        self.index_forward_nat_key(&index_key, decision, &metadata);
+        };
+        let raw = self.entries.insert(record);
+        let handle: u32 = raw.try_into().expect("slab handle exceeds u32");
+        let index_key = key.clone();
+        self.key_to_handle.insert(key, handle);
+        self.index_forward_nat_key(&index_key, handle, decision, &metadata);
         // #965: schedule the synced entry for expiration check.
         self.push_to_wheel(&index_key, now_ns);
         true
@@ -715,8 +847,7 @@ impl SessionTable {
         tcp_flags: u8,
     ) -> bool {
         let origin = self
-            .sessions
-            .get(key)
+            .entry_by_key(key)
             .map(|e| e.origin)
             .unwrap_or(SessionOrigin::ForwardFlow);
         self.update_session(
@@ -742,8 +873,7 @@ impl SessionTable {
         tcp_flags: u8,
     ) -> bool {
         let origin = self
-            .sessions
-            .get(key)
+            .entry_by_key(key)
             .map(|e| e.origin)
             .unwrap_or(SessionOrigin::ForwardFlow);
         self.update_session(
@@ -826,19 +956,29 @@ impl SessionTable {
         &self,
         key: &SessionKey,
     ) -> Option<(SessionDecision, SessionMetadata, SessionOrigin)> {
-        self.sessions
-            .get(key)
+        self.entry_by_key(key)
             .map(|entry| (entry.decision, entry.metadata.clone(), entry.origin))
     }
 
     pub fn owner_rg_session_keys(&self, owner_rgs: &[i32]) -> Vec<SessionKey> {
-        owner_rg_session_keys_from_index(&self.owner_rg_sessions, owner_rgs)
+        // #964 Step 1: handles → keys via the slab. Each session is
+        // in at most one owner-RG set, so total iteration is
+        // O(owner-sessions), same complexity as today's key-based
+        // index returned.
+        let mut handles: FxHashSet<u32> = FxHashSet::default();
+        for owner_rg_id in owner_rgs {
+            if let Some(set) = self.owner_rg_sessions.get(owner_rg_id) {
+                handles.extend(set.iter().copied());
+            }
+        }
+        handles
+            .into_iter()
+            .filter_map(|h| self.entries.get(h as usize).map(|r| r.key.clone()))
+            .collect()
     }
 
     pub fn take_synced_local(&mut self, key: &SessionKey) -> Option<SessionLookup> {
-        let Some(entry) = self.sessions.get(key) else {
-            return None;
-        };
+        let entry = self.entry_by_key(key)?;
         if !entry.origin.is_peer_synced()
             || entry.metadata.is_reverse
             || entry.decision.resolution.disposition != ForwardingDisposition::LocalDelivery
@@ -857,7 +997,7 @@ impl SessionTable {
         }
         let mut demoted_keys = Vec::new();
         for key in self.owner_rg_session_keys(&[owner_rg_id]) {
-            let Some(entry) = self.sessions.get_mut(&key) else {
+            let Some(entry) = self.entry_by_key_mut(&key) else {
                 continue;
             };
             if !entry.origin.is_peer_synced() {
@@ -888,8 +1028,13 @@ impl SessionTable {
         &self,
         mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata, SessionOrigin),
     ) {
-        for (key, entry) in &self.sessions {
-            f(key, entry.decision, &entry.metadata, entry.origin);
+        // Walk via key_to_handle (the primary index) so any orphan
+        // slab record without a forward-key mapping is skipped —
+        // matches the plan's "primary index is authoritative" model.
+        for (key, handle) in &self.key_to_handle {
+            if let Some(record) = self.entries.get(*handle as usize) {
+                f(key, record.entry.decision, &record.entry.metadata, record.entry.origin);
+            }
         }
     }
 
@@ -909,9 +1054,12 @@ impl SessionTable {
         now_ns: u64,
         mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata, SessionOrigin, u64),
     ) {
-        for (key, entry) in &self.sessions {
-            let idle_ns = now_ns.saturating_sub(entry.last_seen_ns);
-            f(key, entry.decision, &entry.metadata, entry.origin, idle_ns);
+        for (key, handle) in &self.key_to_handle {
+            if let Some(record) = self.entries.get(*handle as usize) {
+                let entry = &record.entry;
+                let idle_ns = now_ns.saturating_sub(entry.last_seen_ns);
+                f(key, entry.decision, &entry.metadata, entry.origin, idle_ns);
+            }
         }
     }
 
@@ -923,54 +1071,143 @@ impl SessionTable {
         self.deltas.push_back(delta);
     }
 
+    /// #964 Step 1: centralized session removal. Eager-cleanup
+    /// invariant — every handle-valued internal index MUST be
+    /// cleaned BEFORE the slab slot is returned to the free list.
+    /// All session removal goes through this helper.
     fn remove_entry(&mut self, key: &SessionKey) -> Option<SessionEntry> {
-        let entry = self.sessions.remove(key)?;
-        self.remove_forward_nat_index(key, entry.decision, &entry.metadata);
-        remove_owner_rg_index_entry(&mut self.owner_rg_sessions, entry.metadata.owner_rg_id, key);
-        Some(entry)
+        let handle = self.key_to_handle.remove(key)?;
+        // Read the record (still in slab) to learn what to clean.
+        // `.get` not `.remove` — we'll remove from slab last.
+        // Fallible: a stale key_to_handle pointing at a freed slot
+        // returns None and we restore the mapping. Should never
+        // fire under correct cleanup; release-mode safety net
+        // (Copilot review — was `.expect()` which panicked).
+        let Some(record) = self.entries.get(handle as usize) else {
+            debug_assert!(
+                false,
+                "remove_entry: key_to_handle had stale handle {} for {:?}",
+                handle, key
+            );
+            // Restore the primary-index mapping so a failed remove
+            // doesn't mutate len() / leave the table inconsistent
+            // (Codex round-3 finding).
+            self.key_to_handle.insert(key.clone(), handle);
+            return None;
+        };
+        // PRIMARY-KEY GUARD: defend against a stale key_to_handle
+        // pointing at a reused slab slot for a different session.
+        // Should never fire under correct cleanup; release-mode
+        // safety net (returns None instead of corrupting another
+        // session's indices).
+        if record.key != *key {
+            debug_assert!(
+                false,
+                "remove_entry: stale key_to_handle for {:?}",
+                key
+            );
+            self.key_to_handle.insert(key.clone(), handle);
+            return None;
+        }
+        let decision = record.entry.decision;
+        let metadata = record.entry.metadata.clone();
+        // Borrow on `record` ends here; subsequent calls take
+        // &mut self (cleanup helpers) without conflict.
+        let _ = record;
+        // Clean every handle-valued internal index. Each cleanup is
+        // VALUE-GUARDED via guarded_remove — only remove if the
+        // stored handle still equals our handle. Mirrors today's
+        // matches!(... existing == key) pattern.
+        self.remove_forward_nat_index(key, handle, decision, &metadata);
+        remove_owner_rg_index_entry(
+            &mut self.owner_rg_sessions,
+            metadata.owner_rg_id,
+            handle,
+        );
+        // Mandatory debug assertion: NO handle-valued index still
+        // points at the freed handle. Catches eager-cleanup
+        // invariant violations before slab slot reuse.
+        debug_assert!(
+            self.no_index_points_at(handle),
+            "remove_entry leaked handle {} in a secondary index",
+            handle
+        );
+        // Only AFTER all indices are clean, return slot to slab.
+        let record = self.entries.remove(handle as usize);
+        Some(record.entry)
     }
 
+    /// #964 Step 1: re-insert an entry that was just `remove_entry`'d.
+    /// Returns None always — kept return type for API compatibility
+    /// with the prior FxHashMap-based shape.
     fn restore_entry(&mut self, key: SessionKey, entry: SessionEntry) -> Option<SessionEntry> {
-        self.index_forward_nat_key(&key, entry.decision, &entry.metadata);
-        self.sessions.insert(key, entry)
+        let record = SessionRecord {
+            key: key.clone(),
+            entry,
+        };
+        let raw = self.entries.insert(record);
+        let handle: u32 = raw.try_into().expect("slab handle exceeds u32");
+        self.key_to_handle.insert(key.clone(), handle);
+        // Clone metadata + decision out of the slab record for
+        // index_forward_nat_key (which takes &mut self).
+        let (decision, metadata) = {
+            let record = &self.entries[handle as usize];
+            (record.entry.decision, record.entry.metadata.clone())
+        };
+        self.index_forward_nat_key(&key, handle, decision, &metadata);
+        None
     }
 
+    /// #964 Step 1: insert all secondary indices for a freshly-stored
+    /// session. Mirrors today's gates exactly:
+    /// - reverse_translated_index for reverse entries when translated
+    ///   != key.
+    /// - nat_reverse_index for reverse_wire (always) and
+    ///   reverse_canonical (when != key) on forward entries.
+    /// - forward_wire_index ONLY when forward_wire != key
+    ///   (Codex round-4 finding #2 — was unconditional in v4).
+    /// - owner_rg_sessions ONLY when owner_rg_id > 0
+    ///   (Codex round-4 finding #2).
     fn index_forward_nat_key(
         &mut self,
         key: &SessionKey,
+        handle: u32,
         decision: SessionDecision,
         metadata: &SessionMetadata,
     ) {
         if metadata.is_reverse {
             let translated = translated_session_key(key, decision.nat);
             if translated != *key {
-                self.reverse_translated_index
-                    .insert(translated, key.clone());
+                self.reverse_translated_index.insert(translated, handle);
             }
         } else {
             self.nat_reverse_index
-                .insert(reverse_wire_key(key, decision.nat), key.clone());
+                .insert(reverse_wire_key(key, decision.nat), handle);
             let reverse_canonical = reverse_canonical_key(key, decision.nat);
             if reverse_canonical != *key {
-                self.nat_reverse_index
-                    .insert(reverse_canonical, key.clone());
+                self.nat_reverse_index.insert(reverse_canonical, handle);
             }
             let forward_wire = forward_wire_key(key, decision.nat);
             if forward_wire != *key {
-                self.forward_wire_index.insert(forward_wire, key.clone());
+                self.forward_wire_index.insert(forward_wire, handle);
             }
         }
         if metadata.owner_rg_id > 0 {
             self.owner_rg_sessions
                 .entry(metadata.owner_rg_id)
                 .or_default()
-                .insert(key.clone());
+                .insert(handle);
         }
     }
 
+    /// #964 Step 1: value-guarded removal of secondary indices —
+    /// only remove an index entry if its stored handle still equals
+    /// the handle we're removing. Mirrors today's `matches!(... existing == key)`
+    /// shape, just keyed on u32 handle instead of SessionKey.
     fn remove_forward_nat_index(
         &mut self,
         key: &SessionKey,
+        handle: u32,
         decision: SessionDecision,
         metadata: &SessionMetadata,
     ) {
@@ -978,51 +1215,66 @@ impl SessionTable {
             let translated = translated_session_key(key, decision.nat);
             if matches!(
                 self.reverse_translated_index.get(&translated),
-                Some(existing) if existing == key
+                Some(stored) if *stored == handle
             ) {
                 self.reverse_translated_index.remove(&translated);
             }
             return;
         }
         let reverse_wire = reverse_wire_key(key, decision.nat);
-        if matches!(self.nat_reverse_index.get(&reverse_wire), Some(existing) if existing == key) {
+        if matches!(self.nat_reverse_index.get(&reverse_wire), Some(stored) if *stored == handle) {
             self.nat_reverse_index.remove(&reverse_wire);
         }
         let reverse_canonical = reverse_canonical_key(key, decision.nat);
-        if matches!(self.nat_reverse_index.get(&reverse_canonical), Some(existing) if existing == key)
-        {
+        if matches!(
+            self.nat_reverse_index.get(&reverse_canonical),
+            Some(stored) if *stored == handle
+        ) {
             self.nat_reverse_index.remove(&reverse_canonical);
         }
         let forward_wire = forward_wire_key(key, decision.nat);
-        if matches!(self.forward_wire_index.get(&forward_wire), Some(existing) if existing == key) {
+        if matches!(self.forward_wire_index.get(&forward_wire), Some(stored) if *stored == handle) {
             self.forward_wire_index.remove(&forward_wire);
         }
     }
-}
 
-fn owner_rg_session_keys_from_index(
-    index: &FxHashMap<i32, FxHashSet<SessionKey>>,
-    owner_rgs: &[i32],
-) -> Vec<SessionKey> {
-    let mut keys = FxHashSet::default();
-    for owner_rg_id in owner_rgs {
-        if let Some(entries) = index.get(owner_rg_id) {
-            keys.extend(entries.iter().cloned());
-        }
+    /// #964 Step 1 mandatory debug assertion: scan every
+    /// handle-valued internal index for the freed handle. Used by
+    /// `remove_entry` to enforce the eager-cleanup invariant in
+    /// debug builds. O(N) per call — acceptable for tests, no-op in
+    /// release.
+    #[cfg(debug_assertions)]
+    fn no_index_points_at(&self, handle: u32) -> bool {
+        !self.key_to_handle.values().any(|h| *h == handle)
+            && !self.nat_reverse_index.values().any(|h| *h == handle)
+            && !self.forward_wire_index.values().any(|h| *h == handle)
+            && !self
+                .reverse_translated_index
+                .values()
+                .any(|h| *h == handle)
+            && !self
+                .owner_rg_sessions
+                .values()
+                .any(|set| set.contains(&handle))
     }
-    keys.into_iter().collect()
+
+    #[cfg(not(debug_assertions))]
+    #[inline]
+    fn no_index_points_at(&self, _handle: u32) -> bool {
+        true
+    }
 }
 
 fn remove_owner_rg_index_entry(
-    index: &mut FxHashMap<i32, FxHashSet<SessionKey>>,
+    index: &mut FxHashMap<i32, FxHashSet<u32>>,
     owner_rg_id: i32,
-    key: &SessionKey,
+    handle: u32,
 ) {
     if owner_rg_id <= 0 {
         return;
     }
     if let Some(entries) = index.get_mut(&owner_rg_id) {
-        entries.remove(key);
+        entries.remove(&handle);
         if entries.is_empty() {
             index.remove(&owner_rg_id);
         }
