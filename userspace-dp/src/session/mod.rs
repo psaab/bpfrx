@@ -654,13 +654,17 @@ impl SessionTable {
             self.create_drops = self.create_drops.saturating_add(1);
             return false;
         }
-        // remove_entry's primary-key guard or stale-handle guard
-        // CAN return None when the input key existed but the
-        // internal indices were inconsistent. Both guards restore
-        // the prior key_to_handle mapping internally and trip
-        // debug_assert!s (caught in tests). In release we proceed
-        // to insert the new record — the guard already restored
-        // the prior mapping; our subsequent
+        // remove_entry's three debug_assert!s catch invariant
+        // violations in tests:
+        //   - stale-handle guard (entries.get returned None for a
+        //     handle in key_to_handle)
+        //   - PRIMARY-KEY GUARD (record.key != lookup key)
+        //   - no_index_points_at (a secondary index still points
+        //     at the freed handle after cleanup)
+        // The first two guards restore the prior key_to_handle
+        // mapping internally before returning None. In release we
+        // proceed to insert the new record — the guard already
+        // restored the prior mapping; the subsequent
         // self.key_to_handle.insert(...) overwrites it cleanly.
         let _previous = self.remove_entry(&key);
         let epoch = self.next_epoch();
@@ -737,10 +741,11 @@ impl SessionTable {
         {
             return false;
         }
-        // Same guard semantics as install_with_protocol_with_origin
-        // — both stale-handle and primary-key guards in
-        // remove_entry restore the prior mapping internally; the
-        // debug_assert!s catch invariant violations in tests.
+        // Same guard semantics as install_with_protocol_with_origin:
+        // remove_entry has 3 debug_assert!s (stale-handle,
+        // primary-key, no_index_points_at) that catch invariant
+        // violations in tests. The first two restore the prior
+        // key_to_handle mapping internally before returning None.
         let _previous = self.remove_entry(&key);
         let epoch = self.next_epoch();
         let record = SessionRecord {
