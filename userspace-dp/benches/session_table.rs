@@ -109,9 +109,13 @@ impl CurrentTable {
     }
 
     fn install(&mut self, key: BenchKey, entry: BenchEntry, owner_rg: i32, with_alias: bool) {
+        // Mirror production semantics: derive a distinct wire key,
+        // and only insert forward_wire when wire_key != key
+        // (Copilot review — production gates on
+        // `forward_wire != forward_key` in
+        // `index_forward_nat_key`).
         let mut wire_key = key.clone();
         wire_key.src_port = wire_key.src_port.wrapping_add(1);
-        let canon_key = key.clone();
         let translated = if with_alias {
             let mut t = key.clone();
             t.dst_port = t.dst_port.wrapping_add(1);
@@ -120,9 +124,10 @@ impl CurrentTable {
             None
         };
         self.sessions.insert(key.clone(), entry);
-        self.nat_reverse.insert(wire_key, key.clone());
-        self.nat_reverse.insert(canon_key, key.clone());
-        self.forward_wire.insert(key.clone(), key.clone());
+        self.nat_reverse.insert(wire_key.clone(), key.clone());
+        if wire_key != key {
+            self.forward_wire.insert(wire_key, key.clone());
+        }
         if let Some(t) = translated {
             self.reverse_translated.insert(t, key.clone());
         }
@@ -155,8 +160,9 @@ impl CurrentTable {
         let mut wire_key = key.clone();
         wire_key.src_port = wire_key.src_port.wrapping_add(1);
         self.nat_reverse.remove(&wire_key);
-        self.nat_reverse.remove(key);
-        self.forward_wire.remove(key);
+        if wire_key != *key {
+            self.forward_wire.remove(&wire_key);
+        }
         if with_alias {
             let mut t = key.clone();
             t.dst_port = t.dst_port.wrapping_add(1);
@@ -204,9 +210,9 @@ impl SlabTable {
     }
 
     fn install(&mut self, key: BenchKey, entry: BenchEntry, owner_rg: i32, with_alias: bool) {
+        // Mirror production semantics — see CurrentTable::install.
         let mut wire_key = key.clone();
         wire_key.src_port = wire_key.src_port.wrapping_add(1);
-        let canon_key = key.clone();
         let translated = if with_alias {
             let mut t = key.clone();
             t.dst_port = t.dst_port.wrapping_add(1);
@@ -220,9 +226,10 @@ impl SlabTable {
         });
         let handle: u32 = raw.try_into().unwrap();
         self.key_to_handle.insert(key.clone(), handle);
-        self.nat_reverse.insert(wire_key, handle);
-        self.nat_reverse.insert(canon_key, handle);
-        self.forward_wire.insert(key.clone(), handle);
+        self.nat_reverse.insert(wire_key.clone(), handle);
+        if wire_key != key {
+            self.forward_wire.insert(wire_key, handle);
+        }
         if let Some(t) = translated {
             self.reverse_translated.insert(t, handle);
         }
@@ -256,8 +263,9 @@ impl SlabTable {
         let mut wire_key = key.clone();
         wire_key.src_port = wire_key.src_port.wrapping_add(1);
         self.nat_reverse.remove(&wire_key);
-        self.nat_reverse.remove(key);
-        self.forward_wire.remove(key);
+        if wire_key != *key {
+            self.forward_wire.remove(&wire_key);
+        }
         if with_alias {
             let mut t = key.clone();
             t.dst_port = t.dst_port.wrapping_add(1);

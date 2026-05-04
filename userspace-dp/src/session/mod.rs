@@ -272,7 +272,10 @@ impl SessionTable {
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        // Use key_to_handle (the authoritative primary index) so the
+        // count reflects "installed sessions" even if the slab ever
+        // held an orphan record from a partial cleanup path.
+        self.key_to_handle.len()
     }
 
     // ── #964 Step 1 internal helpers ─────────────────────────────
@@ -290,20 +293,28 @@ impl SessionTable {
     }
 
     /// Resolve to a slab record from a forward-key. Returns None if
-    /// the key is unknown OR the handle is stale (defense in depth —
-    /// shouldn't happen post-eager-cleanup but `entries.get` is
-    /// fallible by design).
+    /// the key is unknown, the handle is stale, OR the resolved
+    /// record's canonical key doesn't match the lookup key (defense
+    /// vs reused-slot hazard — Copilot review).
     #[inline]
     fn record_by_key(&self, key: &SessionKey) -> Option<&SessionRecord> {
         let handle = self.handle_for_key(key)?;
-        self.entries.get(handle as usize)
+        let record = self.entries.get(handle as usize)?;
+        if record.key != *key {
+            return None;
+        }
+        Some(record)
     }
 
-    /// Mut version of `record_by_key`.
+    /// Mut version of `record_by_key`. Same key-equality validation.
     #[inline]
     fn record_by_key_mut(&mut self, key: &SessionKey) -> Option<&mut SessionRecord> {
         let handle = self.handle_for_key(key)?;
-        self.entries.get_mut(handle as usize)
+        let record = self.entries.get_mut(handle as usize)?;
+        if record.key != *key {
+            return None;
+        }
+        Some(record)
     }
 
     /// Convenience: borrow the entry only (skipping the canonical
@@ -639,16 +650,17 @@ impl SessionTable {
         protocol: u8,
         tcp_flags: u8,
     ) -> bool {
-        if self.entries.len() >= self.max_sessions {
+        if self.len() >= self.max_sessions {
             self.create_drops = self.create_drops.saturating_add(1);
             return false;
         }
         // remove_entry's primary-key guard CAN return None in the
-        // pathological case where key_to_handle was stale. The guard
-        // re-inserts the original mapping; we proceed to overwrite
-        // it. In debug builds, assert the guard did not fire so that
-        // tests catch invariant violations early. In release, the
-        // overwrite is the safest behavior available.
+        // pathological case where key_to_handle was stale (the
+        // guard restores the mapping internally). The only
+        // assertion is the no_index_points_at debug_assert inside
+        // remove_entry; we proceed to insert the new record either
+        // way (the safest release behavior given the guard already
+        // restored the prior mapping).
         let _previous = self.remove_entry(&key);
         let epoch = self.next_epoch();
         let record = SessionRecord {
@@ -1062,10 +1074,18 @@ impl SessionTable {
         let handle = self.key_to_handle.remove(key)?;
         // Read the record (still in slab) to learn what to clean.
         // `.get` not `.remove` — we'll remove from slab last.
-        let record = self
-            .entries
-            .get(handle as usize)
-            .expect("handle in key_to_handle must be valid");
+        // Fallible: a stale key_to_handle pointing at a freed slot
+        // returns None and we restore the mapping. Should never
+        // fire under correct cleanup; release-mode safety net
+        // (Copilot review — was `.expect()` which panicked).
+        let Some(record) = self.entries.get(handle as usize) else {
+            debug_assert!(
+                false,
+                "remove_entry: key_to_handle had stale handle {} for {:?}",
+                handle, key
+            );
+            return None;
+        };
         // PRIMARY-KEY GUARD: defend against a stale key_to_handle
         // pointing at a reused slab slot for a different session.
         // Should never fire under correct cleanup; release-mode
