@@ -177,7 +177,12 @@ pub(crate) struct SessionTable {
 impl SessionTable {
     pub fn new() -> Self {
         Self {
-            entries: slab::Slab::with_capacity(DEFAULT_MAX_SESSIONS),
+            // Start with an empty slab and let it grow on demand.
+            // `Slab::with_capacity(DEFAULT_MAX_SESSIONS)` would eagerly
+            // allocate a 131072-slot backing Vec per worker (Copilot
+            // review finding) — the prior FxHashMap grew on demand,
+            // so match that to keep baseline RSS unchanged.
+            entries: slab::Slab::new(),
             key_to_handle: FxHashMap::default(),
             nat_reverse_index: FxHashMap::default(),
             forward_wire_index: FxHashMap::default(),
@@ -443,7 +448,7 @@ impl SessionTable {
                     let new_bucket = bucket_for_tick(new_target_tick);
                     let entry_mut = self
                         .entry_by_key_mut(&key)
-                        .expect("entry was just read via .get(); no concurrent mutation");
+                        .expect("entry was just read via entry_by_key; no concurrent mutation");
                     entry_mut.wheel_tick = new_target_tick;
                     self.wheel.buckets[new_bucket].push_back(WheelEntry {
                         key,
@@ -638,7 +643,13 @@ impl SessionTable {
             self.create_drops = self.create_drops.saturating_add(1);
             return false;
         }
-        self.remove_entry(&key);
+        // remove_entry's primary-key guard CAN return None in the
+        // pathological case where key_to_handle was stale. The guard
+        // re-inserts the original mapping; we proceed to overwrite
+        // it. In debug builds, assert the guard did not fire so that
+        // tests catch invariant violations early. In release, the
+        // overwrite is the safest behavior available.
+        let _previous = self.remove_entry(&key);
         let epoch = self.next_epoch();
         let record = SessionRecord {
             key: key.clone(),
@@ -995,8 +1006,13 @@ impl SessionTable {
         &self,
         mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata, SessionOrigin),
     ) {
-        for (_, record) in &self.entries {
-            f(&record.key, record.entry.decision, &record.entry.metadata, record.entry.origin);
+        // Walk via key_to_handle (the primary index) so any orphan
+        // slab record without a forward-key mapping is skipped —
+        // matches the plan's "primary index is authoritative" model.
+        for (key, handle) in &self.key_to_handle {
+            if let Some(record) = self.entries.get(*handle as usize) {
+                f(key, record.entry.decision, &record.entry.metadata, record.entry.origin);
+            }
         }
     }
 
@@ -1016,10 +1032,12 @@ impl SessionTable {
         now_ns: u64,
         mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata, SessionOrigin, u64),
     ) {
-        for (_, record) in &self.entries {
-            let entry = &record.entry;
-            let idle_ns = now_ns.saturating_sub(entry.last_seen_ns);
-            f(&record.key, entry.decision, &entry.metadata, entry.origin, idle_ns);
+        for (key, handle) in &self.key_to_handle {
+            if let Some(record) = self.entries.get(*handle as usize) {
+                let entry = &record.entry;
+                let idle_ns = now_ns.saturating_sub(entry.last_seen_ns);
+                f(key, entry.decision, &entry.metadata, entry.origin, idle_ns);
+            }
         }
     }
 

@@ -12,20 +12,21 @@
 //                4 Key→u32 secondary indices + i32→FxHashSet<u32>
 //                owner-RG.
 //
-// Bench scenarios:
-//   - insert_churn: install + remove cycles. Forwards the
-//     install_with_protocol_with_origin shape.
+// Bench scenarios (this file ships these — `nat_churn` and
+// `gc_drain` proposed in the plan are deferred; the existing
+// `insert_churn` exercises the steady-state install/remove
+// pattern + secondary-index cleanup, which captures the same
+// guarded-remove cost):
+//   - insert_churn: install + remove cycles. Models the
+//     install_with_protocol_with_origin + remove_entry shape,
+//     INCLUDING secondary-index cleanup so the maps stay at
+//     steady-state size across iterations.
 //   - lookup_forward: direct key→entry lookup.
 //   - lookup_reverse_nat: reverse-NAT key → forward entry. The
 //     slab shape goes through one fewer hash lookup.
 //   - lookup_alias: reverse_translated_index → forward record
 //     (the path that caused multiple plan-review failures —
 //     Codex round-4 finding #5).
-//   - nat_churn: install/remove pairs that produce BOTH
-//     reverse_wire AND reverse_canonical keys, exercising the
-//     full guarded-remove path.
-//   - gc_drain: simulate expire_stale_entries shape (drain a
-//     batch of expired keys).
 //   - owner_rg_export: collect Vec<Key> for a given owner-RG.
 //
 // Pass criterion: slab shape must NOT regress on any operation.
@@ -140,6 +141,34 @@ impl CurrentTable {
         let forward_key = self.reverse_translated.get(alias)?;
         self.sessions.get(forward_key)
     }
+
+    /// Full session removal — mirrors SessionTable::remove_entry's
+    /// secondary-index cleanup so churn benches stay at steady
+    /// state instead of growing the maps unbounded (Copilot review).
+    fn remove(&mut self, key: &BenchKey, owner_rg: i32, with_alias: bool) -> bool {
+        if self.sessions.remove(key).is_none() {
+            return false;
+        }
+        let mut wire_key = key.clone();
+        wire_key.src_port = wire_key.src_port.wrapping_add(1);
+        self.nat_reverse.remove(&wire_key);
+        self.nat_reverse.remove(key);
+        self.forward_wire.remove(key);
+        if with_alias {
+            let mut t = key.clone();
+            t.dst_port = t.dst_port.wrapping_add(1);
+            self.reverse_translated.remove(&t);
+        }
+        if owner_rg > 0 {
+            if let Some(set) = self.owner_rg.get_mut(&owner_rg) {
+                set.remove(key);
+                if set.is_empty() {
+                    self.owner_rg.remove(&owner_rg);
+                }
+            }
+        }
+        true
+    }
 }
 
 // ── "slab" shape: Slab<Record> + Key→u32 indices ───────────────────
@@ -212,6 +241,35 @@ impl SlabTable {
     fn lookup_alias(&self, alias: &BenchKey) -> Option<&BenchEntry> {
         let handle = *self.reverse_translated.get(alias)?;
         self.entries.get(handle as usize).map(|r| &r.entry)
+    }
+
+    /// Full session removal — mirrors SessionTable::remove_entry's
+    /// secondary-index cleanup so churn benches stay at steady
+    /// state instead of growing the maps unbounded (Copilot review).
+    fn remove(&mut self, key: &BenchKey, owner_rg: i32, with_alias: bool) -> bool {
+        let Some(handle) = self.key_to_handle.remove(key) else {
+            return false;
+        };
+        let mut wire_key = key.clone();
+        wire_key.src_port = wire_key.src_port.wrapping_add(1);
+        self.nat_reverse.remove(&wire_key);
+        self.nat_reverse.remove(key);
+        self.forward_wire.remove(key);
+        if with_alias {
+            let mut t = key.clone();
+            t.dst_port = t.dst_port.wrapping_add(1);
+            self.reverse_translated.remove(&t);
+        }
+        if owner_rg > 0 {
+            if let Some(set) = self.owner_rg.get_mut(&owner_rg) {
+                set.remove(&handle);
+                if set.is_empty() {
+                    self.owner_rg.remove(&owner_rg);
+                }
+            }
+        }
+        self.entries.remove(handle as usize);
+        true
     }
 }
 
@@ -323,6 +381,10 @@ fn bench_session_table(c: &mut Criterion) {
     });
 
     // Insert-churn: install + remove (steady-state).
+    // Insert-churn: install + FULL remove (secondary-index cleanup
+    // included so the maps stay at steady-state size). Mirrors
+    // SessionTable::install_with_protocol_with_origin +
+    // remove_entry's eager-cleanup pattern (Copilot review).
     g.bench_function("insert_churn/current", |b| {
         let mut t = CurrentTable::new();
         populate_current(&mut t, N / 2, false);
@@ -330,7 +392,7 @@ fn bench_session_table(c: &mut Criterion) {
         b.iter(|| {
             let k = make_key(next);
             t.install(k.clone(), make_entry(), 1, false);
-            t.sessions.remove(&k);
+            t.remove(&k, 1, false);
             next = next.wrapping_add(1);
         });
     });
@@ -341,9 +403,7 @@ fn bench_session_table(c: &mut Criterion) {
         b.iter(|| {
             let k = make_key(next);
             t.install(k.clone(), make_entry(), 1, false);
-            if let Some(handle) = t.key_to_handle.remove(&k) {
-                t.entries.remove(handle as usize);
-            }
+            t.remove(&k, 1, false);
             next = next.wrapping_add(1);
         });
     });

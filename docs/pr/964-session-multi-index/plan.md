@@ -13,8 +13,8 @@ with 5 tactical findings. v5 addresses each:
    `no_index_points_at` extended to also scan `key_to_handle.values()`.
 2. **Insert gates match today exactly**: `forward_wire_index`
    inserts only when `forward_wire != forward_key`
-   (session/mod.rs:951); `owner_rg_sessions` only when
-   `owner_rg_id > 0` (session/mod.rs:963). v4 was unconditional.
+   (`index_forward_nat_key` forward_wire_index gate); `owner_rg_sessions` only when
+   `owner_rg_id > 0` (`index_forward_nat_key` owner_rg_id gate). v4 was unconditional.
 3. **Release-mode alias validation**: `lookup_with_origin`'s
    alias path now checks `metadata.is_reverse &&
    translated_session_key(&record.key, record.entry.decision.nat) == *lookup_key`
@@ -248,14 +248,14 @@ let handle: u32 = raw.try_into().expect("slab handle exceeds u32");
 self.key_to_handle.insert(forward_key.clone(), handle);
 self.nat_reverse_index.insert(reverse_wire, handle);
 self.nat_reverse_index.insert(reverse_canonical, handle);  // both keys today
-// Match today's session/mod.rs:951 gate exactly: only insert
+// Match today's `index_forward_nat_key` forward_wire_index gate gate exactly: only insert
 // the forward-wire index when the wire key differs from the
 // canonical forward key (Codex round-4 finding #2).
 if forward_wire != forward_key {
     self.forward_wire_index.insert(forward_wire, handle);
 }
 // reverse_translated_index inserted only on NAT-translated paths.
-// Match today's session/mod.rs:963 gate: only index by owner-RG
+// Match today's `index_forward_nat_key` owner_rg_id gate gate: only index by owner-RG
 // when owner_rg_id > 0 (Codex round-4 finding #2).
 if metadata.owner_rg_id > 0 {
     self.owner_rg_sessions.entry(metadata.owner_rg_id)
