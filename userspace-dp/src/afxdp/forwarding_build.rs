@@ -657,9 +657,14 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
         // when at least one of these is true:
         //   - `cos_shaping_rate_bytes_per_sec > 0` (interface shaping cap)
         //   - the scheduler-map resolved to ≥ 1 queue
-        //   - the DSCP classifier resolved to ≥ 1 mapping
-        //   - the 802.1p classifier resolved to ≥ 1 mapping
-        //   - the DSCP rewrite-rule resolved to ≥ 1 mapping
+        //   - the DSCP classifier targets ≥ 1 queue_id this interface
+        //     will materialize (real scheduler-map queues, or the
+        //     synthetic default best-effort queue 0)
+        //   - the 802.1p classifier targets ≥ 1 materialized queue_id
+        //     (same materialization rule)
+        //   - the DSCP rewrite-rule targets ≥ 1 materialized
+        //     forwarding-class (real scheduler-map class, or synthetic
+        //     "best-effort" if the rule has a "best-effort" entry)
         //
         // This cleanly handles every config shape that downstream falls
         // back to a synthetic default best-effort queue with no
