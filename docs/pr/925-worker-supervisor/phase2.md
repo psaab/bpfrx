@@ -181,19 +181,35 @@ for _, w := range status.WorkerRuntime {
 
 ### 2. Panic-injection unit tests (Rust)
 
+Reuse the existing `spawn_supervised_worker` (which already
+takes an arbitrary closure and is tested directly at
+`coordinator/tests.rs:848`). No new test helper.
+
 Add to `userspace-dp/src/afxdp/coordinator/tests.rs`:
 
 ```rust
+// Serialize the panic-injection test against any other test
+// that touches the global panic hook. Cargo's default
+// parallel runner makes this otherwise flaky.
 #[test]
+#[serial_test::serial]  // or hand-rolled OnceLock<Mutex<()>> if not in dev-deps
 fn supervisor_catches_worker_panic_and_marks_dead() {
+    // Silence stderr noise during the catch_unwind. Drop guard
+    // restores the prior hook even if the test panics.
+    let prior_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let _restore = scopeguard::guard((), |_| std::panic::set_hook(prior_hook));
+
     let panic_slot = Arc::new(Mutex::new(None::<String>));
     let runtime = Arc::new(WorkerRuntimeAtomics::default());
 
-    spawn_supervised_panicking_test_thread(
+    let handle = spawn_supervised_worker(
+        "worker-test",
         runtime.clone(),
         panic_slot.clone(),
         || panic!("test panic from supervisor_catches_worker_panic_and_marks_dead"),
     );
+    handle.join().expect("thread join");
 
     assert!(runtime.dead.load(Ordering::Relaxed));
     let captured = panic_slot.lock().unwrap().clone();
@@ -202,26 +218,37 @@ fn supervisor_catches_worker_panic_and_marks_dead() {
 }
 
 #[test]
+#[serial_test::serial]
 fn supervisor_clean_exit_does_not_set_dead() {
     let panic_slot = Arc::new(Mutex::new(None::<String>));
     let runtime = Arc::new(WorkerRuntimeAtomics::default());
 
-    spawn_supervised_panicking_test_thread(
+    let handle = spawn_supervised_worker(
+        "worker-test",
         runtime.clone(),
         panic_slot.clone(),
         || { /* clean return */ },
     );
+    handle.join().expect("thread join");
 
     assert!(!runtime.dead.load(Ordering::Relaxed));
     assert!(panic_slot.lock().unwrap().is_none());
 }
 ```
 
-`spawn_supervised_panicking_test_thread` is a small test
-helper added to coordinator/tests.rs that wraps the same
-catch_unwind pattern used in production worker spawns.
-Lifecycle: spawn → run closure → join. The helper joins
-inside itself so the test sees the post-mutation state.
+If `serial_test` isn't already in `userspace-dp`'s dev-deps,
+fall back to a hand-rolled global mutex:
+
+```rust
+static PANIC_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+fn panic_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    PANIC_TEST_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap()
+}
+```
+
+Test entry: `let _g = panic_test_guard();` instead of the
+`#[serial_test::serial]` attribute.
 
 ### 3. No-respawn rationale (in this plan)
 
@@ -253,6 +280,20 @@ The mark-dead-and-stop strategy gives operators:
 This trades **partial outage for the dead worker's bindings**
 against **full daemon restart latency**.
 
+### 3.5. Stale-comment cleanup (mandatory)
+
+Phase-1 comments still promise auto-respawn in Phase 2.
+These now contradict v2's documented no-respawn decision:
+
+- `pkg/dataplane/userspace/protocol.go:539` — update to
+  describe the current behavior (mark-dead until daemon
+  restart) and reference this Phase 2 plan.
+- `userspace-dp/src/afxdp/worker_runtime.rs:71` — same
+  update.
+
+Ship this comment cleanup in the same PR as the metric +
+tests so the codebase stays internally consistent.
+
 ### 4. HA interaction documented
 
 Worker death does NOT trigger chassis-cluster failover.
@@ -260,27 +301,47 @@ Rationale:
 
 - The cluster-level VRRP timer (~60ms failover) is separate
   from worker liveness.
-- A dead worker's bindings stop forwarding, but the surviving
-  workers' bindings (including any RETH-VIP-bearing one) keep
-  serving.
-- Auto-failing-over on partial outage would create a flap loop
-  on any deployment with a single panic-prone worker.
+- `pkg/cluster` has no `WorkerRuntimeStatus.dead` awareness,
+  and userspace takeover readiness checks at
+  `pkg/dataplane/userspace/manager_ha.go:247` check helper /
+  queue / binding readiness — NOT dead workers.
+- Auto-failing-over on partial outage would create a flap
+  loop on any deployment with a single panic-prone worker.
 
-Operators detect the dead worker via Prometheus
-(`xpf_userspace_worker_dead{worker_id="N"} == 1`), then
-choose to restart xpfd (which does its planned-shutdown
-priority-0 VRRP burst → peer takes over fast), avoiding any
-hot failover.
+**Real consequence — black-hole**: if the dead worker owns an
+important binding (e.g., the RETH-VIP-bearing one, or a NAT
+pool's egress queue), that binding is **black-holed** until
+operator restart. Surviving workers' bindings keep forwarding,
+but traffic destined for the dead worker's queues is dropped.
+The chassis-cluster will NOT detect this and will NOT trigger
+failover automatically.
 
-## Public API preservation
+Operators MUST alert on
+`xpf_userspace_worker_dead{worker_id="N"} == 1` to detect.
+Recovery is `systemctl restart xpfd` (which does its
+planned-shutdown priority-0 VRRP burst → peer takes over
+fast), avoiding any hot failover.
 
-No public API changes. Adds:
-- One new Prometheus gauge.
-- Two new private unit tests.
-- Plan documentation.
+## Public API surface
 
-All existing `WorkerRuntimeStatus`, `WorkerRuntimeAtomics`,
-gRPC, and JSON shapes preserved.
+Existing `WorkerRuntimeStatus`, `WorkerRuntimeAtomics`, gRPC,
+and JSON shapes are unchanged.
+
+**Adds one new monitoring API surface**: the
+`xpf_userspace_worker_dead{worker_id}` Prometheus gauge.
+Once shipped this gauge is **stable** — operator alerts /
+Grafana dashboards / SLOs will pin to its name and labels.
+Future changes to either the metric name, label cardinality,
+or value semantics (`1` = caught panic, `0` = running,
+cleared only by daemon restart) constitute a breaking change
+to monitoring infrastructure and require a follow-up
+deprecation cycle.
+
+**Implementation reminder**: the gauge MUST be added to
+`Describe()` at `pkg/api/metrics.go:345` in addition to the
+descriptor field — Prometheus collectors silently drop
+`MustNewConstMetric` calls for descs that aren't
+described.
 
 ## Hidden invariants
 
@@ -331,26 +392,24 @@ gRPC, and JSON shapes preserved.
 - Per-class CoS smoke is NOT required for this observability
   addition.
 
-## Open questions for adversarial review
+## Open questions for round-2 adversarial review
 
-1. **Is documenting "no auto-respawn" sufficient?** The issue
-   says "Automatic respawn implementation OR documented
-   decision NOT to respawn (with rationale)" — this plan
-   chooses the latter. Is the rationale sound?
-2. **Should the gauge be `xpf_userspace_worker_dead` or
-   `xpf_userspace_worker_alive` (inverted)?** Convention in
-   the codebase suggests `dead=1 means panic`; operators may
-   prefer `alive=1 means healthy`. Which is more idiomatic?
-3. **Is `spawn_supervised_panicking_test_thread` the right
-   test surface**, or should the test exercise a smaller
-   `supervise_panic` free-function helper extracted from
-   coordinator/mod.rs?
-4. **HA interaction**: should there be ANY automatic action on
-   worker death (e.g., adjust per-RG weight to deprioritize
-   this node), or is "operator restarts xpfd" the only
-   correct behavior?
-5. **Panic-injection test stability**: catch_unwind has subtle
-   thread-local-state interactions in Rust (`std::panic::set_hook`
-   can be hijacked by other tests). Does the new test risk
-   flaking under concurrent test runs (cargo test runs tests
-   in parallel by default)?
+(v1's 5 questions were resolved in v2: gauge name committed
+to `_dead`; test surface uses existing `spawn_supervised_worker`;
+panic-hook concurrency mitigated via `serial_test` /
+hand-rolled mutex + take_hook/set_hook with Drop guard;
+no-respawn rationale accepted in principle. The HA-action
+question persists.)
+
+1. **HA interaction — should there be ANY automatic action on
+   worker death** (e.g., `pkg/cluster` adjusts per-RG weight
+   to deprioritize this node), or is "operator restarts
+   xpfd" the only correct behavior? v2 picks the latter; the
+   open question is whether a "soft demote weight on dead
+   worker" hook is worth a follow-up issue.
+2. **Long-term respawn roadmap**: v2 commits to no-respawn
+   based on the state-poisoning argument. But Gemini round 1
+   noted this is an availability flaw for HPC. Should we
+   commit to a future "respawn with full state rebuild"
+   issue, or is the answer "any respawn = daemon restart, so
+   automate the daemon restart instead"?
