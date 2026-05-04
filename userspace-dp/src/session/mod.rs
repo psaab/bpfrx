@@ -654,13 +654,14 @@ impl SessionTable {
             self.create_drops = self.create_drops.saturating_add(1);
             return false;
         }
-        // remove_entry's primary-key guard CAN return None in the
-        // pathological case where key_to_handle was stale (the
-        // guard restores the mapping internally). The only
-        // assertion is the no_index_points_at debug_assert inside
-        // remove_entry; we proceed to insert the new record either
-        // way (the safest release behavior given the guard already
-        // restored the prior mapping).
+        // remove_entry's primary-key guard or stale-handle guard
+        // CAN return None when the input key existed but the
+        // internal indices were inconsistent. Both guards restore
+        // the prior key_to_handle mapping internally and trip
+        // debug_assert!s (caught in tests). In release we proceed
+        // to insert the new record — the guard already restored
+        // the prior mapping; our subsequent
+        // self.key_to_handle.insert(...) overwrites it cleanly.
         let _previous = self.remove_entry(&key);
         let epoch = self.next_epoch();
         let record = SessionRecord {
@@ -736,11 +737,10 @@ impl SessionTable {
         {
             return false;
         }
-        // Same guard semantics as install_with_protocol_with_origin:
-        // remove_entry can return None if the primary-key guard
-        // fires (re-inserts the original mapping); we proceed to
-        // overwrite. debug_assert! in remove_entry catches the
-        // pathological case in tests.
+        // Same guard semantics as install_with_protocol_with_origin
+        // — both stale-handle and primary-key guards in
+        // remove_entry restore the prior mapping internally; the
+        // debug_assert!s catch invariant violations in tests.
         let _previous = self.remove_entry(&key);
         let epoch = self.next_epoch();
         let record = SessionRecord {
@@ -1084,6 +1084,10 @@ impl SessionTable {
                 "remove_entry: key_to_handle had stale handle {} for {:?}",
                 handle, key
             );
+            // Restore the primary-index mapping so a failed remove
+            // doesn't mutate len() / leave the table inconsistent
+            // (Codex round-3 finding).
+            self.key_to_handle.insert(key.clone(), handle);
             return None;
         };
         // PRIMARY-KEY GUARD: defend against a stale key_to_handle
