@@ -1,8 +1,68 @@
 # #964 Step 3 — Cache-line pack `SessionEntry`
 
-Status: **DRAFT v2 — addressing Codex round-1 PLAN-NEEDS-MAJOR
-(6 findings); Gemini round-1 was PLAN-READY but missed the
-codebase audit issues Codex caught.**
+Status: **KILLED v2 — Codex round-2 PLAN-KILL + Gemini round-2 PLAN-KILL (both converged)**
+
+## Why this plan was killed
+
+Round 2 saw both reviewers independently return PLAN-KILL after
+v2's honest accounting laid out the real cost/benefit:
+
+- **Codex** (task-moqlf19v-ywqnp5): caught that v2 incompletely
+  removed ifindex-narrowing references (still cited in v2 body
+  at 3 spots), the size target is missed by v2's own estimate
+  (130 vs target ≤128), `Some(0)` port handling "silently drop
+  rewrite in release" recreates the collision, MAC zero
+  sentinel needs an audit of intentional `[0; 6]` uses in
+  tunnel/egress code paths, and event-stream ifindex round-trip
+  isn't value-preserving for full i32 because the wire format
+  already casts to i16. **Verdict**: kill unless there's a
+  committed memory-constrained deployment requirement.
+
+- **Gemini** (task-moqlfgnj-cl5738): flipped from v1 PLAN-READY
+  to PLAN-KILL after the honest accounting. Memory savings
+  7-94 MB are "non-trivial but small compared to typical
+  ~500 MB RSS." CPU cost ~25ns slow-path overhead plausibly
+  erases ~half of Step 1's reverse-NAT win. 30+ callsite churn
+  for marginal gains.
+
+### The methodology working as designed
+
+This is the second PLAN-KILL outcome from the /triple-review
+methodology (after #946 Phase 2 — same framing: a plausible-
+sounding refactor whose honest accounting doesn't justify the
+work). The methodology is doing its job:
+
+1. v1 had inflated memory savings (16 MB claim) and missed
+   sentinel collision audits.
+2. v2 corrected the math (7-94 MB realistic) and added the
+   audits, which surfaced the actual costs.
+3. Both reviewers, given the honest accounting, agreed the
+   gain doesn't justify the work.
+
+Killing at v2 (~6 hours of plan iteration) is much cheaper
+than discovering this after a 1500-LOC PR + 5 rounds of code
+review.
+
+### Recommendation for #964 going forward
+
+#964 has 4 stated goals (slab, integer handles, intrusive
+indices, cache-line packing). Step 1 (slab + integer handles)
+shipped as PR #1182 with 2.2× faster reverse-NAT lookup +
+~40% memory reduction at full table.
+
+- **Step 2** (intrusive `next_node` indices) is the natural
+  remaining increment. Builds on Step 1's slab.
+- **Step 3** (cache-line packing) is hereby PLAN-KILLED with
+  this v2.
+- **Step 4** (was Step 4 in the issue): subsumed into
+  Step 1's cache-locality wins (records already contiguous).
+
+Issue #964 should be closed once Step 2 ships; Step 3 will be
+rejected at the v2 PLAN-KILL.
+
+---
+
+## Original v1 plan body retained for the record
 
 ## v2 changes (Codex round-1 findings)
 
