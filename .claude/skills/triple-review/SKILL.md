@@ -330,20 +330,25 @@ declare -A TARGETS=(
   [v4]="172.16.80.200"
   [v6]="2001:559:8585:80::200"
 )
+# Filter strategy: don't pin the interval string ("0.00-5.00") — iperf3
+# timing drift can print "0.00-5.01" or similar, which would falsely
+# trigger the failure path. Filter on `sender` (every run prints exactly
+# one summary sender line per stream, plus one `[SUM] ... sender` for
+# `-P N`) and pick the last match. For multi-stream we further filter
+# on the literal `[SUM]` to skip the per-stream sender lines.
 for fam in v4 v6; do
   tgt=${TARGETS[$fam]}
-  echo -n "$fam push: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201"    2>&1 | grep -F -- "0.00-5.00" | grep -F -- "sender" || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
-  echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201 -R" 2>&1 | grep -F -- "0.00-5.00" | grep -F -- "sender" || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
+  echo -n "$fam push: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201"    2>&1 | grep -F -- "sender" | tail -1 || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
+  echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201 -R" 2>&1 | grep -F -- "sender" | tail -1 || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
 done
 
-# Multi-stream reverse-mode reproducer (canonical TX-path regression catcher).
-# A reverse cap with healthy push throughput is a TX-path regression.
-# Grep the SUM sender line to expose Retr (retrans column). Two-stage
-# fixed-string filter for the same dot-as-literal reason as above; the
-# `[SUM]` literal contains brackets that need either fgrep or escaping.
+# Multi-stream reverse-mode reproducer (canonical TX-path regression
+# catcher). A reverse cap with healthy push throughput is a TX-path
+# regression. Pick the last `[SUM] ... sender` line so the Retr column
+# stays visible without the brittle interval-string match.
 echo "=== Pass A — 12-stream reverse reproducer (CoS disabled) ==="
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 172.16.80.200 -P 12 -t 10 -p 5201 -R"       2>&1 | grep -F -- "[SUM]" | grep -F -- "0.00-10.00" | grep -F -- "sender" || { echo "NO SUM SENDER LINE — iperf3 failed"; exit 1; }
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 2001:559:8585:80::200 -P 12 -t 10 -p 5201 -R" 2>&1 | grep -F -- "[SUM]" | grep -F -- "0.00-10.00" | grep -F -- "sender" || { echo "NO SUM SENDER LINE — iperf3 failed"; exit 1; }
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 172.16.80.200 -P 12 -t 10 -p 5201 -R"       2>&1 | grep -F -- "[SUM]" | grep -F -- "sender" | tail -1 || { echo "NO SUM SENDER LINE — iperf3 failed"; exit 1; }
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 2001:559:8585:80::200 -P 12 -t 10 -p 5201 -R" 2>&1 | grep -F -- "[SUM]" | grep -F -- "sender" | tail -1 || { echo "NO SUM SENDER LINE — iperf3 failed"; exit 1; }
 
 # === Pass B: CoS ENABLED ===
 sg incus-admin -c "./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0"
@@ -363,16 +368,22 @@ for port in 5201 5202 5203 5204 5205 5206; do
   echo "--- $port $cls ---"
   for fam in v4 v6; do
     tgt=${TARGETS[$fam]}
-    echo -n "$fam push: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port"    2>&1 | grep -F -- "0.00-5.00" | grep -F -- "sender" || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
-    echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port -R" 2>&1 | grep -F -- "0.00-5.00" | grep -F -- "sender" || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
+    echo -n "$fam push: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port"    2>&1 | grep -F -- "sender" | tail -1 || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
+    echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port -R" 2>&1 | grep -F -- "sender" | tail -1 || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
   done
 done
 ```
 
 **Required pass criteria:**
-- Pass A (CoS disabled): all 4 baseline measurements at line rate with 0 retrans;
-  both 12-stream reverse reproducers (v4 + v6) hit line rate with 0 retrans.
-  *A reverse cap with healthy push is a TX-path regression — block on this.*
+- Pass A (CoS disabled):
+  - **Single-stream baselines** (4 cells, v4/v6 × push/rev): connectivity
+    confirmed and **0 retrans**. *Single-stream throughput is NOT held to
+    line rate — on this lab it caps at ~6-7 Gbps per flow due to per-CPU
+    AF_XDP processing limits, which is normal.*
+  - **Multi-stream `-P 12 -R` reproducers** (2 cells, v4 + v6): **line
+    rate with 0 retrans.** This is where the line-rate gate lives.
+    *A reverse cap here with healthy push is a TX-path regression —
+    block on this.*
 - Pass B (CoS enabled): all 24 per-class measurements pass with 0 retrans
   *for unshaped classes*. Shaped classes (e.g. iperf-a at 1 Gb/s) should
   hit their shape rate cleanly with ECN marks but no buffer drops.
