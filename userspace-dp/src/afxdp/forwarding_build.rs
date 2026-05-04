@@ -638,60 +638,49 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
 
     let mut state = CoSState::default();
     for iface in &snapshot.interfaces {
-        // Skip interfaces that do not participate in CoS at all.
+        // Skip interfaces that do not contribute any usable CoS state.
         //
         // f0e364d7 (#916) removed the prior `shaping_rate == 0` skip so
         // that zero-shaping-rate-with-classes interfaces would get a
         // transparent-root CoS runtime instead of being silently dropped.
-        // That side-effect added every forwarding-only interface to
-        // CoSState too — and a CoSState entry triggers the cross-binding
-        // redirect that funnels every TX through the per-interface owner
-        // worker, collapsing 6-worker parallelism to one CPU and capping
-        // reverse throughput at ~2 Gbps instead of ~22 Gbps on the loss
-        // userspace cluster.
+        // That side-effect added every interface that produced no usable
+        // CoS state to `CoSState` too — and any `CoSState` entry triggers
+        // the cross-binding redirect that funnels every TX through the
+        // per-interface owner worker, collapsing 6-worker parallelism
+        // to one CPU and capping reverse throughput at ~2 Gbps instead
+        // of ~22 Gbps on the loss userspace cluster.
         //
-        // An interface participates in CoS when ANY of these is set AND
-        // (for named references) actually resolves to something the
-        // builder can use:
-        //   - `cos_shaping_rate_bytes_per_sec > 0`     — interface shaping cap
-        //   - named scheduler-map present in config    — per-class scheduling
-        //   - named DSCP classifier present in config  — DSCP → fwd-class
-        //   - named 802.1p classifier present in config — 802.1p → fwd-class
-        //   - named DSCP rewrite-rule present in config — egress DSCP rewrite
+        // The fix is to gate on whether the interface PRODUCES anything
+        // useful — not on whether knob *names* are populated. We resolve
+        // the scheduler-map, DSCP classifier, 802.1p classifier, and
+        // DSCP rewrite-rule first, then only insert a `CoSState` entry
+        // when at least one of these is true:
+        //   - `cos_shaping_rate_bytes_per_sec > 0` (interface shaping cap)
+        //   - the scheduler-map resolved to ≥ 1 queue
+        //   - the DSCP classifier resolved to ≥ 1 mapping
+        //   - the 802.1p classifier resolved to ≥ 1 mapping
+        //   - the DSCP rewrite-rule resolved to ≥ 1 mapping
         //
-        // The resolution check is what distinguishes this from a plain
-        // is-non-empty test: a typo'd scheduler-map name ("wan-mapp" vs
-        // "wan-map") would otherwise pass an is-empty gate while resolving
-        // to no usable queues downstream, which would put the interface in
-        // CoSState with only the default best-effort queue — re-triggering
-        // the owner-worker redirect collapse for an interface that has no
-        // effective CoS policy.
+        // This cleanly handles every config shape that downstream falls
+        // back to a synthetic default best-effort queue with no
+        // classification/rewrite/rate cap — including:
+        //   - forwarding-only (no CoS knobs at all)
+        //   - burst-only without rate
+        //     (`pkg/config/compiler_class_of_service.go:285-312` allows
+        //     a committed snapshot of this shape; pre-f0e364d7 also
+        //     skipped it via the rate-zero skip, so admitting it would
+        //     be the divergence)
+        //   - typo'd named references (e.g. `wan-mapp` vs `wan-map`)
+        //     where the named entity does not exist
+        //   - empty named entities (e.g. a scheduler-map declared with
+        //     no entries — `compileClassOfService` keeps these)
+        //   - scheduler-maps / classifiers whose entries all reference
+        //     undefined forwarding-classes (warning-only configs that
+        //     survive validation)
         //
-        // `cos_shaping_burst_bytes` is intentionally NOT a standalone arm.
-        // The Go compiler does allow a committed config to carry
-        // `BurstSizeBytes > 0` independently of `ShapingRateBytes`
-        // (`pkg/config/compiler_class_of_service.go:285-312`). If admitted,
-        // a burst-only config WOULD carry an observable buffer-cap
-        // admission effect (`afxdp/cos/admission.rs` enforces
-        // `buffer_bytes` as a per-queue admission limit). But pre-f0e364d7
-        // also dropped this case (the rate-zero skip caught it), so this
-        // behavior was never observable in production prior to f0e364d7,
-        // and admitting a burst-only interface inevitably installs the
-        // cross-binding owner-worker redirect that the burst-cap
-        // observation alone cannot justify. We choose pre-f0e364d7-baseline
-        // semantics here: burst-only without any other CoS knob is
-        // skipped. f0e364d7's transparent-root runtime fast paths still
-        // apply when at least one resolvable CoS knob is set.
-        let has_cos_config = iface.cos_shaping_rate_bytes_per_sec > 0
-            || (!iface.cos_scheduler_map.is_empty()
-                && scheduler_maps.contains_key(&iface.cos_scheduler_map))
-            || (!iface.cos_dscp_classifier.is_empty()
-                && dscp_classifiers.contains_key(&iface.cos_dscp_classifier))
-            || (!iface.cos_ieee8021_classifier.is_empty()
-                && ieee8021_classifiers.contains_key(&iface.cos_ieee8021_classifier))
-            || (!iface.cos_dscp_rewrite_rule.is_empty()
-                && dscp_rewrite_rules.contains_key(&iface.cos_dscp_rewrite_rule));
-        if iface.ifindex <= 0 || !has_cos_config {
+        // f0e364d7's transparent-root runtime fast paths still apply
+        // whenever at least one resolution produces real CoS state.
+        if iface.ifindex <= 0 {
             continue;
         }
         let burst_bytes = if iface.cos_shaping_burst_bytes > 0 {
@@ -740,6 +729,33 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                 });
             }
         }
+        let scheduler_map_resolved_to_queues = !queues.is_empty();
+        let dscp_classifier_has_mappings = dscp_classifiers
+            .get(&iface.cos_dscp_classifier)
+            .map(|c| !c.queue_by_dscp.is_empty())
+            .unwrap_or(false);
+        let ieee8021_classifier_has_mappings = ieee8021_classifiers
+            .get(&iface.cos_ieee8021_classifier)
+            .map(|c| !c.queue_by_pcp.is_empty())
+            .unwrap_or(false);
+        let dscp_rewrite_has_mappings = dscp_rewrite_rule
+            .map(|r| !r.dscp_by_forwarding_class.is_empty())
+            .unwrap_or(false);
+
+        // Post-build gate. See comment above for rationale.
+        let contributes_usable_cos_state = iface.cos_shaping_rate_bytes_per_sec > 0
+            || scheduler_map_resolved_to_queues
+            || dscp_classifier_has_mappings
+            || ieee8021_classifier_has_mappings
+            || dscp_rewrite_has_mappings;
+        if !contributes_usable_cos_state {
+            continue;
+        }
+        let dscp_queue_by_dscp =
+            build_cos_dscp_queue_table(&iface.cos_dscp_classifier, &dscp_classifiers);
+        let ieee8021_queue_by_pcp =
+            build_cos_ieee8021_queue_table(&iface.cos_ieee8021_classifier, &ieee8021_classifiers);
+
         if queues.is_empty() {
             queues.push(CoSQueueConfig {
                 queue_id: 0,
@@ -774,14 +790,8 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                 default_queue,
                 dscp_classifier: iface.cos_dscp_classifier.clone(),
                 ieee8021_classifier: iface.cos_ieee8021_classifier.clone(),
-                dscp_queue_by_dscp: build_cos_dscp_queue_table(
-                    &iface.cos_dscp_classifier,
-                    &dscp_classifiers,
-                ),
-                ieee8021_queue_by_pcp: build_cos_ieee8021_queue_table(
-                    &iface.cos_ieee8021_classifier,
-                    &ieee8021_classifiers,
-                ),
+                dscp_queue_by_dscp,
+                ieee8021_queue_by_pcp,
                 queue_by_forwarding_class,
                 queues,
             },

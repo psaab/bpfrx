@@ -995,3 +995,95 @@ fn build_cos_state_skips_interface_with_unresolvable_named_references() {
         );
     }
 }
+
+#[test]
+fn build_cos_state_skips_interface_with_resolvable_but_empty_scheduler_map() {
+    // Copilot review on PR #1183 caught this: `compileClassOfService`
+    // keeps a named scheduler-map even when it has zero entries, so
+    // a `contains_key` admission check would let a config like
+    // `set class-of-service interfaces ifd unit X scheduler-map empty-map`
+    // (with `empty-map` declared but no entries) pass the gate, then
+    // collapse downstream to a synthetic best-effort default queue —
+    // re-triggering the owner-worker redirect collapse for an interface
+    // with no effective CoS policy.
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 401,
+            cos_shaping_rate_bytes_per_sec: 0,
+            cos_scheduler_map: "empty-map".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            }],
+            schedulers: vec![],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "empty-map".into(),
+                entries: vec![], // <- the critical case: declared but empty
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+    let state = build_cos_state(&snapshot);
+    assert!(
+        !state.interfaces.contains_key(&401),
+        "interface attached to a resolvable but empty scheduler-map must NOT enter CoSState"
+    );
+}
+
+#[test]
+fn build_cos_state_skips_interface_with_scheduler_map_all_undefined_forwarding_classes() {
+    // The Junos compiler emits a warning for scheduler-map entries that
+    // reference undefined forwarding-classes but does NOT drop the
+    // scheduler-map itself. After resolution, every entry's
+    // `class_to_queue.get` returns None, so `queues` is empty and the
+    // interface would otherwise fall through to the synthetic default
+    // best-effort queue. The post-build gate must reject this case so
+    // we don't reintroduce the owner-worker redirect on an interface
+    // with no effective CoS policy.
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 402,
+            cos_shaping_rate_bytes_per_sec: 0,
+            cos_scheduler_map: "broken-map".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            // forwarding_classes intentionally does NOT include the
+            // class names referenced by `broken-map` below, so every
+            // entry collapses at `class_to_queue.get(&entry.forwarding_class)`.
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            }],
+            schedulers: vec![],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "broken-map".into(),
+                entries: vec![
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "missing-class-a".into(),
+                        scheduler: String::new(),
+                    },
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "missing-class-b".into(),
+                        scheduler: String::new(),
+                    },
+                ],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+    let state = build_cos_state(&snapshot);
+    assert!(
+        !state.interfaces.contains_key(&402),
+        "scheduler-map whose entries all reference undefined forwarding-classes must NOT admit interface"
+    );
+}
