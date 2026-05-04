@@ -1,6 +1,24 @@
 # #964 Step 2 — Intrusive `next_node` indices in `SessionEntry`
 
-Status: **DRAFT v1 — pending adversarial plan review (Codex + Gemini)**
+Status: **KILLED v1 — Codex PLAN-KILL + Gemini PLAN-KILL (both round-1)**
+
+## Why this plan was killed
+
+Both reviewers independently returned PLAN-KILL on round 1 — this is the third PLAN-KILL outcome from the /triple-review methodology (after #946 Phase 2 and #964 Step 3).
+
+- **Codex** (task-moqm45d1-xmpz9y): tightened the memory math — `Option<u32>` is 8 bytes (None tag) on x86_64, so 2 fields × 8 bytes × 131072 sessions = ~2 MB intrusive overhead vs ~1.1 MB FxHashSet storage = **net +950 KB regression** (worse than my v1 estimate of +250 KB). Verdict: "the actual design is memory-worse, operationally riskier, and not attached to a hot path." Also confirmed: no other 1:N indices in SessionTable; cardinality-regime argument correct; #964 may be effectively complete after Step 1.
+
+- **Gemini** (task-moqm4ndy-jl1ctm): "the proposed Step 2 provides a net negative impact across memory, performance (iteration), and code complexity, with only negligible gains on a non-critical path. The architectural pattern chosen is also ill-suited for the problem's characteristics."
+
+### Project-level conclusion (both reviewers agreed)
+
+**#964 is effectively complete after Step 1**. The issue's 4 stated steps:
+- **Step 1** (slab + integer handles) — ✅ shipped (PR #1182).
+- **Step 2** (intrusive next_node) — ❌ KILLED (this plan v1).
+- **Step 3** (cache-line packing) — ❌ KILLED (prior plan v2).
+- **Step 4** ("cache locality" — original issue framing) — subsumed into Step 1's wins.
+
+#964 should be closed; further SessionTable optimization should target a different design that's a better fit for the cardinality regime (few large RG sets, not many small lists).
 
 ## Issue framing
 
