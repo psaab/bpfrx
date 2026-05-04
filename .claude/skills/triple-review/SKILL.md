@@ -255,15 +255,36 @@ export BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env
 ./test/incus/cluster-setup.sh deploy all
 
 # === Pass A: CoS DISABLED (best-effort only) ===
-# Catches regressions in the unshaped fast path. iperf-a default 5201 is best-effort.
+# Catches regressions in the unshaped fast path. iperf-a default 5201
+# falls through to best-effort.
+#
+# Tear down the entire CoS fixture, not just `class-of-service`. The
+# cos-iperf fixture also installs `firewall filter bandwidth-output`
+# and binds it as the output filter on reth0.80 inet/inet6. Deleting
+# only `class-of-service` while those bindings still reference its
+# forwarding classes makes the commit fail validation, leaving the
+# system in a partially-configured state and silently invalidating
+# Pass A. Order matters: detach filters first, then drop the filter,
+# then drop class-of-service. RG-0-primary-only.
 sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- rm -f /tmp/cos-iperf-sets.set"
-sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- bash -c 'cli -c \"configure\" -c \"delete class-of-service\" -c \"commit and-quit\" 2>/dev/null || true'"
+sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- bash -c 'cli <<CLI 2>&1 | tail -5
+configure
+delete interfaces reth0 unit 80 family inet filter
+delete interfaces reth0 unit 80 family inet6 filter
+delete firewall filter bandwidth-output
+delete class-of-service
+commit and-quit
+exit
+CLI
+'"
 
 # Note on grep targets: iperf3 reports the `Retr` (retransmit) column on
-# the **sender** SUM line for both push and reverse runs, so we always
-# grep the sender line — for `-R` runs, the sender is the iperf3 server
-# pushing data and Retr is on its summary. Greppping `receiver` would
-# show throughput but hide retrans, defeating the "0 retrans" gate below.
+# the sender summary line for both push and reverse runs (for multi-
+# stream `-P N` runs that's `[SUM] ... sender`; for single-stream runs
+# it's `[ 5] ... sender`). We always grep the sender line — for `-R`
+# runs the sender is the iperf3 server pushing data and Retr lives on
+# its summary. Grepping `receiver` would show throughput but hide
+# retrans, defeating the "0 retrans" gate below.
 echo "=== Pass A — CoS disabled, v4+v6 × push+reverse ==="
 for af in "v4:172.16.80.200" "v6:2001:559:8585:80::200"; do
   fam=${af%%:*}; tgt=${af#*:}
