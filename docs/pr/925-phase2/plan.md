@@ -1,8 +1,28 @@
 ---
-status: DRAFT v1 — pending adversarial plan review
+status: DRAFT v2 — Codex round-1 PLAN-NEEDS-MINOR addressed; Gemini round-1 redispatch (round-1 failed at 32s with infra error)
 issue: https://github.com/psaab/xpf/issues/925
 phase: Phase 2 — Prometheus gauge + decision-doc closeout
 ---
+
+## Changelog
+- **v2**: Codex round-1 (`task-morpduik-e7wr83`) returned PLAN-NEEDS-MINOR. Addressed:
+  - §8 metric test promoted from "Optional" to MANDATORY (Codex Q-1).
+  - §6 corrected the false "1s snapshot lag" invariant — `xpfCollector.Collect`
+    calls `provider.Status()` per scrape, which synchronously hits the
+    userspace-dp control socket (`pkg/api/metrics.go:394-410, 416-428`,
+    `pkg/dataplane/userspace/manager.go:839-860`). The 1s cadence is the
+    manager's separate `statusLoop` (`process.go:342-360`) and per-worker
+    publishes (`userspace-dp/src/afxdp/worker/mod.rs:687-717`), neither of
+    which the gauge reads from. Cadence-to-alert is `min(scrape_interval,
+    socket_round_trip)`; for typical 15-30s scrapes the 1s publish lag is
+    within noise (Codex Q-5).
+  - §4 / §10 Q3 acknowledged safe alternatives for panic_message (fixed
+    `panic_class` enum, fingerprint hash) but kept the JSON-status-only
+    decision (Codex Q-7).
+  - §4.3 NEW: stale wire-doc comments at `pkg/dataplane/userspace/protocol.go:539-542`
+    and `userspace-dp/src/afxdp/worker_runtime.rs:71-73` say "Phase 2
+    (respawn) will clear on relaunch" — but THIS Phase 2 is closeout, not
+    respawn. Update those comments in the same PR (Codex Q-8).
 
 # #925 Phase 2 — `xpf_userspace_worker_dead{worker_id}` gauge + no-respawn decision
 
@@ -132,6 +152,18 @@ Metric type: `GaugeValue` (binary 0/1, can transition both ways
 in principle — only daemon restart clears it today, but a future
 Phase 3 respawn would also clear it).
 
+### 4.3 Stale-wire-doc cleanup
+
+Both wire-doc strings currently claim "Phase 2 (respawn) will clear
+on relaunch":
+- `pkg/dataplane/userspace/protocol.go:539-542`
+- `userspace-dp/src/afxdp/worker_runtime.rs:71-73`
+
+Update both to reflect actual state: Phase 1 set-only; cleared by
+daemon restart; Phase 2 (this PR) adds Prometheus exposure but does
+NOT add respawn. Hypothetical Phase 3 (deferred indefinitely) would
+clear by replacing `WorkerRuntimeAtomics` on respawn.
+
 ### 4.2 Operations doc
 
 New file: `docs/operations/worker-supervisor.md`. Contents:
@@ -196,12 +228,16 @@ New file: `docs/operations/worker-supervisor.md`. Contents:
 
 ## 6. Hidden invariants the change must preserve
 
-- **xpfCollector caches a `ProcessStatus` snapshot from a 1s
-  cadence.** The Phase 1 atomic flip happens immediately on
-  catch; the snapshot lag means the gauge can be up to ~1s
-  behind reality. Acceptable — the alert `for: 30s` clause
-  absorbs that. Confirm no shorter lag is required by current
-  alerts.
+- **xpfCollector cadence is the Prometheus scrape interval, NOT
+  1 s.** Codex round-1 Q-5 corrected an earlier draft of this
+  plan: `xpfCollector.Collect` calls `provider.Status()` per
+  scrape, which is a synchronous control-socket request (no
+  internal cache). The userspace-dp publishes per-worker fields
+  to its own 1 s `statusLoop`, which the manager serves on
+  request. Total alert-to-page latency is therefore
+  `scrape_interval + worker_publish_lag (≤1 s) + control_rt`,
+  dominated by `scrape_interval` (typically 15-30 s). The
+  `for: 30s` alert clause absorbs all three components.
 - **Worker IDs are stable for the lifetime of the daemon.** The
   `worker_id` label values match the existing 7 metric series,
   so users grouping by `worker_id` get a coherent view.
@@ -222,10 +258,15 @@ New file: `docs/operations/worker-supervisor.md`. Contents:
 
 ## 8. Test plan
 
-- `cargo build` clean (no Rust change, but build sanity).
+- `cargo build` clean (no Rust change beyond the 2 comment
+  updates per §4.3, but build sanity).
 - `cargo test --release`: unchanged from Phase 1 (954+ pass).
-- `go test ./pkg/api/...` for the new Prometheus assertion if
-  added.
+- `go test ./pkg/api/...` MUST include a new test asserting the
+  `xpf_userspace_worker_dead{worker_id=...}` series appears in
+  the `/metrics` output with value `1` when a `ProcessStatus`
+  fixture has `WorkerRuntime[i].Dead = true`, and value `0`
+  otherwise. (Codex round-1 Q-1: the metric is the entire point
+  of the PR; not having a test is unacceptable.)
 - Smoke matrix (per `triple-review` SKILL.md Step 6): full Pass A
   + Pass B 30 measurements (the change is fleet-side metrics; no
   expected throughput delta, but we still smoke to confirm zero
@@ -257,9 +298,23 @@ New file: `docs/operations/worker-supervisor.md`. Contents:
    don't fire on metric absence.)
 3. Should `panic_message` be a separate Prometheus metric (as a
    `_info` gauge with the message in a label)? Or is the JSON
-   status enough? (This plan: JSON status only — Prometheus
-   labels with arbitrary panic strings are a known cardinality
-   trap.)
+   status enough? **This plan: JSON status only.** Codex round-1
+   Q-7 validated that putting raw panic-payload text in a
+   Prometheus label is a cardinality + privacy trap. Codex also
+   noted two safer alternatives that we DEFER (not in scope for
+   Phase 2):
+   - **Fixed `panic_class` enum** — add a small enum (e.g.
+     `OOM`, `AssertTripwire`, `IOError`, `Other`) emitted as a
+     label on `xpf_userspace_worker_dead`. Bounded cardinality,
+     but requires panic-classification logic the supervisor
+     doesn't have today.
+   - **Fingerprint hash** — emit the first N bytes of a SHA-256
+     of `panic_message` as a label. Bounded cardinality, more
+     specific than an enum, but creates per-incident churn and
+     makes alert deduplication harder.
+   Both are real options; both belong in a future Phase 3 if
+   alerting evidence shows the JSON-only diagnosis path is
+   insufficient.
 4. Is the no-respawn decision the right one? Reviewers should
    stress-test the rationale in §4.2 — particularly the
    sticky-failure-trap argument.
