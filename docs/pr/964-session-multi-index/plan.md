@@ -1,7 +1,32 @@
 # #964 SessionTable Multi-Index — Slab + Integer Handles (Step 1)
 
-Status: **DRAFT v4 — clean rewrite addressing Codex round-3
-PLAN-NEEDS-MAJOR + Gemini round-3 PLAN-NEEDS-MINOR**
+Status: **FINAL v5 — Gemini PLAN-READY (round 4); Codex PLAN-NEEDS-MINOR (round 4) addressed below.**
+
+## v5 changes (Codex round-4 tactical fixes)
+
+Round 4 converged: Gemini PLAN-READY, Codex PLAN-NEEDS-MINOR
+with 5 tactical findings. v5 addresses each:
+
+1. **`remove_entry` primary-key guard**: after `key_to_handle.remove(key)`,
+   verify `record.key == *key` BEFORE cleaning. Defends against
+   a stale `key_to_handle` pointing at a reused slot.
+   `no_index_points_at` extended to also scan `key_to_handle.values()`.
+2. **Insert gates match today exactly**: `forward_wire_index`
+   inserts only when `forward_wire != forward_key`
+   (session/mod.rs:951); `owner_rg_sessions` only when
+   `owner_rg_id > 0` (session/mod.rs:963). v4 was unconditional.
+3. **Release-mode alias validation**: `lookup_with_origin`'s
+   alias path now checks `metadata.is_reverse &&
+   translated_session_key(&record.key, record.entry.decision.nat) == *lookup_key`
+   so stale alias returns None, never a wrong reused-slot session.
+4. **Memory math**: numbers are plausible but the breakdown is
+   structural (size_of estimates with tuple padding rules of
+   thumb). Implementation MUST replace the table with measured
+   `std::mem::size_of::<SessionRecord>()` output and rounded
+   bucket counts.
+5. **Bench**: add alias-path lookup (via `reverse_translated_index`)
+   and a churn cycle that creates+destroys NAT sessions to
+   exercise both `reverse_wire` and `reverse_canonical` cleanup.
 
 ## Review history
 
@@ -161,10 +186,25 @@ pub fn lookup_with_origin(&mut self, key: &SessionKey, now_ns: u64)
     // Mutate-then-drop the borrow before push_to_wheel.
     {
         let record = self.entries.get_mut(handle as usize)?;
-        if !via_alias && record.key != *key {
-            // Stale primary index — graceful None. Mirrors
-            // today's sessions.get(key) → None on stale state.
-            return None;
+        if !via_alias {
+            // Direct-primary path: record.key MUST equal lookup key.
+            if record.key != *key {
+                return None;  // stale primary index → graceful None
+            }
+        } else {
+            // Alias path: record.key is the canonical (forward)
+            // key; lookup_key is the translated (reverse) wire
+            // key. Validate that translating record.key under the
+            // record's NAT decision yields lookup_key. This
+            // catches stale reverse_translated_index pointing at
+            // a reused slab slot in release builds (Codex
+            // round-4 finding #3).
+            let must_be_reverse = record.entry.metadata.is_reverse;
+            let translated = translated_session_key(&record.key,
+                record.entry.decision.nat);
+            if !must_be_reverse || translated != *key {
+                return None;  // stale alias → graceful None
+            }
         }
         // (Mutation block: TCP closing, last_seen_ns,
         // expires_after_ns recomputation, etc. — same as today's
@@ -203,11 +243,20 @@ let handle: u32 = raw.try_into().expect("slab handle exceeds u32");
 self.key_to_handle.insert(forward_key.clone(), handle);
 self.nat_reverse_index.insert(reverse_wire, handle);
 self.nat_reverse_index.insert(reverse_canonical, handle);  // both keys today
-self.forward_wire_index.insert(forward_wire, handle);
+// Match today's session/mod.rs:951 gate exactly: only insert
+// the forward-wire index when the wire key differs from the
+// canonical forward key (Codex round-4 finding #2).
+if forward_wire != forward_key {
+    self.forward_wire_index.insert(forward_wire, handle);
+}
 // reverse_translated_index inserted only on NAT-translated paths.
-self.owner_rg_sessions.entry(metadata.owner_rg_id)
-    .or_default()
-    .insert(handle);
+// Match today's session/mod.rs:963 gate: only index by owner-RG
+// when owner_rg_id > 0 (Codex round-4 finding #2).
+if metadata.owner_rg_id > 0 {
+    self.owner_rg_sessions.entry(metadata.owner_rg_id)
+        .or_default()
+        .insert(handle);
+}
 ```
 
 ### Centralized remove with eager cleanup
@@ -231,6 +280,23 @@ fn remove_entry(&mut self, key: &SessionKey) -> Option<SessionEntry> {
     //    .get not .remove — we'll remove from slab last.
     let record = self.entries.get(handle as usize)
         .expect("handle in key_to_handle must be valid");
+    // PRIMARY-KEY GUARD (Codex round-4 finding #1): if
+    // key_to_handle was somehow stale (e.g. concurrent state
+    // corruption — should not happen but defense in depth), the
+    // resolved record might be a different session. Bail without
+    // touching the slab so we don't free another session's slot.
+    if record.key != *key {
+        // Reinsert the (correct) primary mapping we just removed,
+        // since we shouldn't have removed it. This branch should
+        // NEVER fire in correct code; the assertion below is the
+        // primary defense.
+        debug_assert!(false, "remove_entry: stale key_to_handle for {:?}", key);
+        // In release: leak rather than corrupt. We've already
+        // removed from key_to_handle; restore it pointing at the
+        // canonical handle of the SAME key we just looked up.
+        self.key_to_handle.insert(key.clone(), handle);
+        return None;
+    }
     let owner_rg_id = record.entry.metadata.owner_rg_id;
     let reverse_wire = compute_reverse_wire(record);
     let reverse_canonical = compute_reverse_canonical(record);
@@ -276,7 +342,9 @@ fn remove_entry(&mut self, key: &SessionKey) -> Option<SessionEntry> {
 
 #[cfg(debug_assertions)]
 fn no_index_points_at(&self, handle: u32) -> bool {
-    !self.nat_reverse_index.values().any(|h| *h == handle)
+    // Codex round-4 finding #1: also scan key_to_handle.
+    !self.key_to_handle.values().any(|h| *h == handle)
+        && !self.nat_reverse_index.values().any(|h| *h == handle)
         && !self.forward_wire_index.values().any(|h| *h == handle)
         && !self.reverse_translated_index.values().any(|h| *h == handle)
         && !self.owner_rg_sessions.values()
@@ -362,6 +430,15 @@ inflated 55%, but more honest. The dominant win is shrinking
 the secondary indices' value side from 50-byte Keys to 4-byte
 u32s.
 
+**Caveat (Codex round-4 finding #4)**: the table above uses
+size_of estimates with tuple-padding rules of thumb. The
+implementation MUST replace these numbers with measured
+`std::mem::size_of::<SessionRecord>()` and
+`std::mem::size_of::<SessionEntry>()` output, plus rounded
+hashbrown bucket counts (`capacity_to_buckets(N)` from
+hashbrown source). The total ~129 MB → ~78 MB direction is
+believable; the line-item attribution may shift by 5-10%.
+
 ## Public API preservation
 
 All 33 public methods on SessionTable keep their signatures.
@@ -426,7 +503,14 @@ in the public API.
   `userspace-dp/benches/session_table.rs` covering:
   - Insert (install_with_protocol shape) under steady-state
     churn.
-  - Lookup for forward-key, reverse-NAT-key, forward-wire-key.
+  - Lookup for forward-key, reverse-NAT-key, forward-wire-key,
+    AND **alias-path lookup via reverse_translated_index**
+    (Codex round-4 finding #5 — the alias path was the source
+    of multiple prior review failures).
+  - **NAT churn cycle**: install/remove pairs that produce
+    BOTH `reverse_wire` and `reverse_canonical` keys, so the
+    bench exercises the full guarded-remove path (Codex
+    round-4 finding #5).
   - GC (expire_stale_entries shape).
   - owner_rg_session_keys (HA export hot path).
 
