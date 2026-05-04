@@ -1,8 +1,29 @@
 ---
-status: DRAFT v2 — Codex round-1 PLAN-NEEDS-MINOR addressed; Gemini round-1 redispatch (round-1 failed at 32s with infra error)
+status: DRAFT v3 — Codex round-2 PLAN-NEEDS-MINOR (doc-consistency only) addressed; Gemini PLAN-READY
 issue: https://github.com/psaab/xpf/issues/925
 phase: Phase 2 — Prometheus gauge + decision-doc closeout
 ---
+
+## Changelog v3
+- Codex round-2 (`task-morpr2ic-xar6ai`) PLAN-NEEDS-MINOR — three doc-consistency issues, no design changes:
+  - **Q-1 partial**: §8 said the metric test "MUST" exist but §2 still
+    described it as "Optional". Fixed: §2 now matches §8 (mandatory).
+  - **Q-5 partial**: previous §6 wording said "alert-to-page latency
+    is `scrape_interval + worker_publish_lag (≤1 s) + control_rt`"
+    and the v2 changelog said `min(scrape_interval, socket_rt)`.
+    Both wrong — the `dead` bit is read directly by the status
+    handler (`userspace-dp/src/server/handlers.rs:413-415` →
+    `coordinator/status.rs:144-147`), NOT batched via the per-worker
+    counter publish cadence. Corrected to:
+    `latency ≤ scrape_interval + control_socket_rt`, where the worker
+    publish cadence is irrelevant to the `dead` bit.
+  - **NEW-1**: §3 said "no Rust changes required" and §7 risk table
+    said "No Rust change" — but §4.3 adds a Rust source-comment edit.
+    Reworded to "no Rust behavior/API change" so scope text matches
+    the actual implementation footprint.
+- Gemini round-1 (`task-morpts70-37oq7l`) returned PLAN-READY on all 8 questions.
+
+## Changelog v2
 
 ## Changelog
 - **v2**: Codex round-1 (`task-morpduik-e7wr83`) returned PLAN-NEEDS-MINOR. Addressed:
@@ -79,9 +100,12 @@ This is a **doc + 1 Prometheus gauge** PR. Scope:
   one `Describe` send, one emit-loop call).
 - ~50 LOC of documentation in `docs/operations/worker-supervisor.md`
   (no-respawn rationale + HA interaction + how to alert on `dead`).
-- Optional: 1 Go unit test in `pkg/api/metrics_test.go` asserting
-  the metric appears in the `/metrics` endpoint output when a
-  worker has `Dead=true`.
+- **Required**: 1 Go unit test in `pkg/api/metrics_test.go` (or a
+  sibling test file) asserting the metric appears in the `/metrics`
+  endpoint output with value `1` when a `ProcessStatus` fixture has
+  `WorkerRuntime[i].Dead = true`, and `0` otherwise. (Codex round-1
+  Q-1 + round-2 confirmation: the metric is the entire point of the
+  PR; not having a test is unacceptable.)
 
 Win at absolute scale:
 
@@ -100,7 +124,9 @@ Win at absolute scale:
 
 See §1 issue framing — Phase 1 is fully landed in master at
 `753d4e8f` (current HEAD as of this plan). Phase 2 builds
-strictly on top; no Rust changes required.
+strictly on top with no Rust **behavior or API** change. The
+only Rust touchpoint is a stale-comment update in
+`worker_runtime.rs:71-73` (see §4.3) — pure doc, no semantics.
 
 ## 4. Concrete design
 
@@ -229,15 +255,18 @@ New file: `docs/operations/worker-supervisor.md`. Contents:
 ## 6. Hidden invariants the change must preserve
 
 - **xpfCollector cadence is the Prometheus scrape interval, NOT
-  1 s.** Codex round-1 Q-5 corrected an earlier draft of this
-  plan: `xpfCollector.Collect` calls `provider.Status()` per
-  scrape, which is a synchronous control-socket request (no
-  internal cache). The userspace-dp publishes per-worker fields
-  to its own 1 s `statusLoop`, which the manager serves on
-  request. Total alert-to-page latency is therefore
-  `scrape_interval + worker_publish_lag (≤1 s) + control_rt`,
-  dominated by `scrape_interval` (typically 15-30 s). The
-  `for: 30s` alert clause absorbs all three components.
+  1 s.** Codex rounds 1+2 corrected earlier drafts of this plan:
+  `xpfCollector.Collect` calls `provider.Status()` per scrape,
+  which is a synchronous control-socket request with no internal
+  cache. For the `dead` bit specifically, the userspace-dp's
+  status handler reads `runtime_atomics.dead` directly
+  (`userspace-dp/src/server/handlers.rs:413-415` →
+  `coordinator/status.rs:144-147`), NOT batched through the per-
+  worker counter publish cadence. Alert-to-page latency is
+  therefore bounded by `scrape_interval + control_socket_rt`
+  (typically 15-30 s + ~10 ms). The worker publish cadence (1 s
+  in `worker/mod.rs:687-717`) does NOT add to `dead`-bit
+  latency. The `for: 30s` alert clause absorbs both components.
 - **Worker IDs are stable for the lifetime of the daemon.** The
   `worker_id` label values match the existing 7 metric series,
   so users grouping by `worker_id` get a coherent view.
@@ -252,7 +281,7 @@ New file: `docs/operations/worker-supervisor.md`. Contents:
 | Class | Verdict | Notes |
 |---|---|---|
 | Behavioral regression | **LOW** | Pure additive metric + docs. No code path on the dataplane hot path is touched. |
-| Lifetime / borrow-checker | **LOW** | No Rust change. |
+| Lifetime / borrow-checker | **LOW** | No Rust behavior/API change (only the stale-comment refresh in `worker_runtime.rs:71-73`). |
 | Performance regression | **LOW** | One extra `MustNewConstMetric` call per scrape (≤6 workers, scraped at 15s/30s typical). Negligible. |
 | Architectural mismatch (#961 / #946-Phase-2 dead-end) | **LOW** | This is closeout of an already-shipped Phase 1; not a new architecture. |
 
