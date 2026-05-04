@@ -1,8 +1,44 @@
 ---
-status: DRAFT v3 — Codex round-2 PLAN-NEEDS-MAJOR addressed by reusing existing screen_drop() helper (no new counter); Gemini Pro 3 round-2 already PLAN-READY
+status: DRAFT v4 — Codex round-3 PLAN-NEEDS-MAJOR addressed (screen_drop() promotion to header + stale residue cleanup); Gemini Pro 3 round-3 ACP-init failure (will redispatch)
 issue: https://github.com/psaab/xpf/issues/867
 phase: ACK-evasion of SCREEN_IP_SWEEP — post-conntrack accounting
 ---
+
+## Changelog v4
+
+Codex round-3 (`task-morsfhpw-d3ekop`) returned PLAN-NEEDS-MAJOR
+with 1 MAJOR + 3 minors. Plan v4 addresses each:
+
+- **MAJOR (compile-blocker)**: `screen_drop()` at
+  `bpf/xdp/xdp_screen.c:34-42` is `static __always_inline`
+  with file-local linkage. `xdp_conntrack.c` includes only
+  headers, never `xdp_screen.c`, so v3's "call
+  `screen_drop(meta, SCREEN_IP_SWEEP)` from the conntrack
+  helper" would not compile. **Fix**: move `screen_drop()` from
+  `xdp_screen.c` into `bpf/headers/xpf_helpers.h` (already
+  contains the `inc_counter`, `inc_screen_counter`, `emit_event`
+  helpers it depends on). This is a 9-line move; both files
+  continue to use the helper unchanged. Documented in §4.0.
+
+- **MINOR — stale "new counter" residue**: §5 ("Public API
+  preservation") still says "One new BPF global-counter index"
+  and §8 still mentions "Go-side change is the new counter
+  rendering". v3 dropped the new counter entirely. Cleaned up.
+
+- **MINOR — event-test assertions weak**: the test
+  `ip_sweep_ack_evasion_emits_screen_drop_event` only asserts
+  the event is emitted; should also assert `policy_id ==
+  SCREEN_IP_SWEEP` and `action == ACTION_DENY` (the other side
+  effects of `screen_drop()`). Test plan tightened in §8.
+
+- **MINOR — NAT64 indecision in §6**: §4.2 settled on AFTER the
+  NAT64 reverse lookup, but §6 invariant still has v1's
+  "BEFORE … or AFTER … Need to verify" wording. Removed.
+
+Gemini Pro 3 round-3 (`task-morsfw41-pxg0kp`) failed at 32s with
+the recurring ACP-init timeout. Will redispatch. (Per memory
+`feedback_gemini_infra_outage_merge_policy.md`, not yet at
+3-in-a-row across rounds.)
 
 ## Changelog v3
 
@@ -221,7 +257,32 @@ chose to skip screen (signaled by a new meta-flag). Single
 accounting per packet, unified threshold against the existing
 `ip_sweep_track` map.
 
-### 4.0 Bypass marker on `pkt_meta` (Codex round-1 BLOCKER fix)
+### 4.0a Promote `screen_drop()` to `xpf_helpers.h` (Codex round-3 MAJOR fix)
+
+The existing `screen_drop()` helper at `bpf/xdp/xdp_screen.c:34-42`
+is declared `static __always_inline` with file-local linkage:
+
+```c
+static __always_inline int
+screen_drop(struct pkt_meta *meta, __u32 screen_flag)
+{
+    meta->policy_id = screen_flag;
+    inc_counter(GLOBAL_CTR_SCREEN_DROPS);
+    inc_screen_counter(screen_flag);
+    emit_event(meta, EVENT_TYPE_SCREEN_DROP, ACTION_DENY, 0, 0, 0);
+    return XDP_DROP;
+}
+```
+
+`xdp_conntrack.c` includes only headers. To make
+`screen_drop()` callable from the new helper there, move the
+function verbatim from `xdp_screen.c` to `bpf/headers/xpf_helpers.h`
+(which already contains `inc_counter`, `inc_screen_counter`, and
+`emit_event` — the dependencies are satisfied). After the move,
+`xdp_screen.c` keeps using `screen_drop()` exactly as before
+via the header include. Net: 9 lines move; 0 caller changes.
+
+### 4.0b Bypass marker on `pkt_meta` (Codex round-1 BLOCKER fix)
 
 Add `META_FLAG_SCREEN_SKIPPED` to `bpf/headers/xpf_common.h`
 (next free bit on `meta->meta_flags`):
@@ -332,13 +393,20 @@ build that the conntrack frame stays ≤512 bytes combined.
 ## 5. Public API preservation
 
 - No protocol-wire change.
-- No CLI command change. The new counter shows up under
-  existing `show security flow statistics`.
+- No CLI command change. The existing `ip-sweep` line in
+  `show security flow statistics` (rendered from
+  `GlobalCtrScreenIPSweep` at `pkg/grpcapi/server_show_status.go:66`,
+  `pkg/cli/cli_show_flow.go:141` + 982) now counts BOTH
+  screen-stage drops AND new ACK-evasion drops via the unified
+  `screen_drop(meta, SCREEN_IP_SWEEP)` call — no new line, no
+  rendering change.
 - Existing `screen ids-option ... ip-sweep threshold N` config
   continues to work as before; behavior change is that previously-
   bypassed ACK probes now count toward the same threshold.
 - No Rust public API change.
-- One new BPF global-counter index — internal only.
+- No new BPF global-counter index. (v3 simplification: reuse
+  `screen_drop(meta, SCREEN_IP_SWEEP)` via the existing
+  per-screen counter.)
 
 ## 6. Hidden invariants the change must preserve
 
@@ -348,12 +416,14 @@ build that the conntrack frame stays ≤512 bytes combined.
   But SYN-ACK has both SYN and ACK set; the trigger predicate
   requires ACK *without* SYN/FIN/RST/URG, so SYN-ACK is
   excluded. ✓
-- **NAT64 reverse path** runs after the fwd_key+rev_key miss.
-  Make sure the new sweep-accounting hook is positioned BEFORE
-  the NAT64 reverse lookup so NAT64-translated v4 traffic that
-  legitimately matches a v6 session isn't accidentally counted.
-  Or AFTER, so we don't double-count. Need to verify the right
-  order. (See §10/Q3.)
+- **NAT64 reverse path** runs after the fwd_key+rev_key miss
+  (`bpf/xdp/xdp_conntrack.c:785-857`). The new sweep-accounting
+  hook is positioned AFTER NAT64 reverse handling completes
+  (i.e., AFTER `nat64_state` has been consulted and the v4 ACK
+  has been confirmed as NOT belonging to a v6 NAT64 session)
+  and BEFORE `meta->ct_state = SESS_STATE_NEW` is set
+  (`xdp_conntrack.c:891-895`). This ordering is final per Codex
+  + Gemini Pro 3 confirmation in v2.
 - **Daemon restart / session loss (corrected v2)**: normal
   eBPF restarts preserve pinned `sessions` / `sessions_v6` /
   `nat64_state` maps (`pkg/dataplane/loader_ebpf.go:18-36`).
@@ -406,9 +476,15 @@ build that the conntrack frame stays ≤512 bytes combined.
     helper); drops on combined count against unified `ip_sweep_track`;
     `GlobalCtrScreenIPSweep` reflects both paths.
   - `ip_sweep_ack_evasion_emits_screen_drop_event` — verify the
-    drop produces an `EVENT_TYPE_SCREEN_DROP` ring-buffer event
-    (proves the helper invokes `screen_drop()` rather than
-    short-circuiting it).
+    drop produces a ring-buffer event AND that it carries
+    `event_type == EVENT_TYPE_SCREEN_DROP`,
+    `policy_id == SCREEN_IP_SWEEP`,
+    `action == ACTION_DENY`. (Proves the helper invokes
+    `screen_drop()` end-to-end, not just emits an event with the
+    right type.) The aggregate drop counter
+    (`GlobalCtrScreenDrops`) and the per-screen counter
+    (`GlobalCtrScreenIPSweep`) must both increment on the same
+    drop.
 
   Negative (no drop, hook not entered):
   - `ip_sweep_ack_no_drop_when_session_matches_v4` — established
@@ -437,8 +513,10 @@ build that the conntrack frame stays ≤512 bytes combined.
     path looks up `nat64_state`, finds match, tail-calls to
     nat64; the helper position (post-nat64-miss) is NOT reached.
 - `cargo test --release ip_sweep` 5x flake check.
-- `go test ./...` clean (Go-side change is the new counter
-  rendering only).
+- `go test ./...` clean. v4 has no Go-side code change — the
+  unified `GlobalCtrScreenIPSweep` rendering already exists, and
+  the new BPF helper increments the same per-screen counter via
+  the shared `screen_drop()`.
 - Smoke matrix per `triple-review` SKILL.md Step 6: full Pass A
   + Pass B 30 measurements. Expected: zero throughput delta —
   the new accounting block runs only on the conntrack-miss path
@@ -475,11 +553,10 @@ build that the conntrack frame stays ≤512 bytes combined.
    flows look like "ACK with no session" until they retransmit.
    Is the documented mitigation ("set threshold high enough")
    acceptable, or does this need a "warmup" exemption?
-3. **NAT64 ordering**: should the new accounting hook fire BEFORE
-   or AFTER the NAT64 reverse lookup? Mis-ordering either
-   double-counts or misses a real evasion. Proposed: AFTER, so
-   NAT64-translated traffic with a real v6 session is
-   exempted. Confirm.
+3. **NAT64 ordering**: SETTLED in v2. The hook fires AFTER
+   the NAT64 reverse lookup at `xdp_conntrack.c:785-857` and
+   BEFORE `ct_state = NEW` at `xdp_conntrack.c:891-895`. Both
+   reviewers confirmed; question retained for traceability.
 4. **Conntrack semantic overlap**: shouldn't conntrack already
    drop unsolicited ACKs by default (TCP state machine doesn't
    accept ACK-without-prior-SYN)? If yes, then by the time the
