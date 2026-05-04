@@ -219,11 +219,16 @@ pub fn lookup_with_origin(&mut self, key: &SessionKey, now_ns: u64)
 }
 ```
 
-**Validation rule**: only the **direct-primary path** does
-`record.key == lookup_key`. The alias path trusts the alias
-index — if it has been desynced from the slab, the
-remove-time eager cleanup invariant has been violated, which
-the debug assertion (below) catches.
+**Validation rule** (Codex round-4 finding #3 — release-mode
+guard, NOT debug-only): the direct-primary path checks
+`record.key == lookup_key`. The alias path verifies that
+translating the canonical record key under the record's NAT
+decision yields the lookup_key, AND that
+`metadata.is_reverse` is set. Both checks fire in release
+builds. A stale alias index returns `None` instead of a
+wrong reused-slot session. The debug assertion in
+`remove_entry` is an additional defense for tests, not the
+sole release-mode guard.
 
 `find_forward_nat_match` and `find_forward_wire_match_with_origin`
 return owned clones today (session/mod.rs:472-510), so they're
@@ -546,11 +551,9 @@ in the public API.
 1. **Does the v4 design now deliver a measurable benefit?**
    ~40% memory reduction at 131072 sessions; ~50ns per
    cache-miss lookup. Sufficient justification for the churn?
-2. **Is the lookup_with_origin alias-path validation
-   correct?** v4 trusts the `reverse_translated_index` for
-   alias lookups (no `record.key == lookup_key` check); the
-   primary path validates. This relies on the eager-cleanup
-   invariant being sound. Any other defense needed?
+2. **(Resolved in v5)** Alias-path validation now fires in
+   release builds: `metadata.is_reverse &&
+   translated_session_key(record.key, decision.nat) == lookup_key`.
 3. **Are the 4 secondary indices bench-covered for both
    `reverse_wire` and `reverse_canonical`?** Both keys are
    inserted today; `remove_entry` cleans both. The bench
