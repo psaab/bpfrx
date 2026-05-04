@@ -1,8 +1,92 @@
 ---
-status: DRAFT v1 — pending adversarial plan review
+status: DRAFT v2 — Codex round-1 PLAN-NEEDS-MAJOR + Gemini Pro 3 round-1 PLAN-NEEDS-MINOR addressed
 issue: https://github.com/psaab/xpf/issues/867
 phase: ACK-evasion of SCREEN_IP_SWEEP — post-conntrack accounting
 ---
+
+## Changelog v2
+
+Codex round-1 (`task-morrln7c-kd2m3n`) returned PLAN-NEEDS-MAJOR with
+1 BLOCKER + 5 concerns. Gemini Pro 3 round-1 (`task-morrr9ub-vg166z`,
+5m 39s) returned PLAN-NEEDS-MINOR with 4 required adjustments. Plan v2
+addresses every finding:
+
+**Codex BLOCKER (double-counting risk)**: ACK-only shape ≠ "screen
+bypassed". When `SCREEN_TCP_NO_FLAG`, `SCREEN_LAND_ATTACK`, or v4
+`SCREEN_IP_SOURCE_ROUTE` is configured, the fast-path actually
+forces ACK-only TCP THROUGH `xdp_screen` (see
+`bpf/headers/xpf_helpers.h:216-223` — the predicate gates off when
+those flags are set). The proposed conntrack hook would then count
+the same packet TWICE. **Fix**: introduce a new `META_FLAG_SCREEN_SKIPPED`
+bit on `pkt_meta`, set by `resolve_ingress_xdp_target` only when
+it explicitly bypasses screen via the ACK-only fast-path. The new
+conntrack-miss sweep hook gates on this bit. Packets that reach
+screen never have the bit set → handled by existing screen logic.
+Packets that bypassed screen have the bit set → handled by the
+new conntrack hook on session miss. Single accounting per packet,
+unified threshold. (See §4.0.)
+
+**Codex+Gemini agree (stack budget + correct seam)**: drop the
+`iface_zone_map` lookup from the conntrack hook. `meta->ingress_zone`
+is already populated by `resolve_ingress_xdp_target` before the
+fast-path return (`bpf/headers/xpf_helpers.h:189-194`). Use
+`meta->ingress_zone` → `zone_configs` → `screen_configs` instead.
+Extract the entire hook into a `__noinline` helper so it gets its
+own stack frame and the verifier doesn't have to combine its locals
+with `xdp_conntrack_prog`'s already-substantial frame. (See §4.2.)
+
+**Gemini Pro 3 (IPv6 coverage)**: the fast-path bypass applies to
+both IPv4 and IPv6. Helper must be invoked on BOTH the IPv4
+miss-path and the IPv6 miss-path in `xdp_conntrack.c`. Test plan
+adds IPv6 evasion permutations. (See §4.2 + §8.)
+
+**Codex (userspace divergence — out-of-scope clarification)**: the
+Rust `userspace-dp/src/screen.rs` sweep tracker uses unique-dst
+tracking (correct). The BPF-side `ip_sweep_track` uses src+zone
+packet count (the bug under fix). The two paths diverge by design;
+fixing the BPF semantic divergence is out of scope for this PR
+(would require the HLL/CMS work from #867 Option 1). This PR only
+closes the ACK-evasion bypass on the BPF path. Userspace path is
+unaffected — the userspace dataplane doesn't have the same fast-path
+optimization, so ACK probes already go through its sweep tracker.
+(See §9.)
+
+**Codex (§6 false-positive analysis was off)**: the previous draft
+overstated daemon-restart risk. Normal eBPF restarts preserve
+pinned `sessions` / `sessions_v6` / `nat64_state` maps
+(`pkg/dataplane/loader_ebpf.go:18-36`). Real risks: full cleanup,
+incompatible pinned-map ABI changes, mode transitions
+(eBPF↔userspace), HA-sync gaps. **Gemini correction**: even when
+sessions ARE lost, the false-positive surface is BOUNDED. After
+restart, the FIRST ACK of each established flow misses CT, hits
+this hook, increments by 1, then `xdp_policy` creates a `SYN_SENT`
+session for the permitted ACK; subsequent ACKs hit that session
+and bypass the hook entirely. Maximum extra increments per restart
+= N (number of distinct established flows at restart time), not
+unbounded. (See §6.)
+
+**Gemini Pro 3 (§3 confirmation — security gate, not cosmetic)**:
+verified that without the hook, an ACK-only probe that misses CT,
+tail-calls to `xdp_policy`, hits an `ACTION_PERMIT` rule (e.g.
+allow-all subnet) gets a fresh `SYN_SENT` session created and the
+ACK forwarded to the target host. The target replies with RST,
+the attacker maps the network. The sweep hook IS the only
+security gate against this evasion. (See §6 invariant on `ct_state = NEW`.)
+
+**Codex (test coverage)**: previous test plan missed false-positive
+corners. v2 §8 adds: same-packet-no-double-count when
+LAND/NO_FLAG/SOURCE_ROUTE flags configured, NAT64 reverse not
+counted, SYN-ACK/FIN/RST/URG/fragment exclusion, disabled-profile
+exemption, flow-cache hit doesn't enter conntrack, normal CT hit
+doesn't trigger hook, both IPv4 AND IPv6 evasion permutations.
+
+**Codex (counter ABI)**: `GLOBAL_CTR_SCREEN_IP_SWEEP_ACK` will be
+appended at index 41 (current `MAX = 41`, so this becomes 41 and
+new MAX is 42). ABI-safe. The userspace `GlobalCtrScreenDrops`
+aggregate (`pkg/dataplane/userspace/manager_ha.go:524-530`) sums
+from a fixed enum — must be updated to include the new counter
+in its summation. (See §4.4.)
+
 
 # #867 — ACK-based IP_SWEEP detection past the fast-path bypass
 
@@ -80,80 +164,110 @@ PLAN-KILL is on the table if reviewers decide:
 ## 4. Concrete design — chosen architecture: post-conntrack accounting
 
 Approach: keep the screen-stage sweep accounting as-is for all
-non-bypass packets. Add a new accounting block in
-`xdp_conntrack.c` that runs ONLY on the session-miss path AND
-only for the ACK-only TCP shape that the fast-path bypasses
-screen for. Both paths increment the same `ip_sweep_track` map
-so the operator-configured threshold is unified.
+non-bypass packets. Add a new accounting helper that runs ONLY
+on the session-miss path AND only when the fast-path explicitly
+chose to skip screen (signaled by a new meta-flag). Single
+accounting per packet, unified threshold against the existing
+`ip_sweep_track` map.
 
-### 4.1 Trigger condition
+### 4.0 Bypass marker on `pkt_meta` (Codex round-1 BLOCKER fix)
 
-Inside `xdp_conntrack_prog`, after both `fwd_key` and `rev_key`
-return `NULL` (and after the NAT64 reverse check that also
-misses), AND before any session-creation logic:
+Add `META_FLAG_SCREEN_SKIPPED` to `bpf/headers/xpf_common.h`
+(next free bit on `meta->meta_flags`):
 
 ```c
-/* #867: ACK-evasion gate. The resolve_ingress_xdp_target
- * fast-path lets ACK-only TCP skip xdp_screen, so an ACK-based
- * IP sweep would otherwise evade SCREEN_IP_SWEEP. We catch it
- * here, on the conntrack-miss path, where:
- *   - by definition the packet has no matching session, so a
- *     legitimate established ACK is NOT counted (it hits CT)
- *   - the threshold and Junos semantic match the existing
- *     screen-stage sweep (same map, same counter)
- */
-if (meta->protocol == PROTO_TCP &&
-    !meta->is_fragment &&
-    (meta->tcp_flags & 0x10 /* ACK */) &&
-    !(meta->tcp_flags & (0x02|0x01|0x04|0x20))) {
-    struct iface_zone_key zk = {
-        .ifindex = meta->ingress_ifindex,
-        .vlan_id = meta->ingress_vlan_id,
-    };
-    struct iface_zone_value *izv =
-        bpf_map_lookup_elem(&iface_zone_map, &zk);
-    struct screen_config *sc = ...; /* same lookup as screen */
-    if (izv && (izv->screen_flags & SCREEN_IP_SWEEP) &&
-        sc && sc->ip_sweep_thresh > 0) {
-        /* Same counting logic as xdp_screen.c:940-975, but
-         * increments GLOBAL_CTR_SCREEN_IP_SWEEP_ACK on drop
-         * for observability. */
-        ...
-    }
-}
+#define META_FLAG_SCREEN_SKIPPED   (1U << <next_free_bit>)
 ```
 
-### 4.2 New observability counter
+Set it in `bpf/headers/xpf_helpers.h::resolve_ingress_xdp_target`
+ONLY when the function explicitly takes the ACK-only fast-path
+return (the predicate at the current line ~213-223). When any of
+`SCREEN_TCP_NO_FLAG`, `SCREEN_LAND_ATTACK`, or
+`SCREEN_IP_SOURCE_ROUTE` (v4) is configured for the ingress zone,
+the predicate falls through and `XDP_PROG_SCREEN` is returned —
+the bit is NOT set, the packet goes through `xdp_screen` as
+today, and the existing screen-stage sweep accounting handles it.
+No double-count.
 
-Add `GLOBAL_CTR_SCREEN_IP_SWEEP_ACK` to `bpf/headers/xpf_common.h`
-(next free index, currently 17 or 18 — verify). Operators see
-two counters in `cli show security flow statistics`:
-- `Screen ip-sweep drops (SYN/UDP)` → original path
-- `Screen ip-sweep drops (ACK-evasion)` → new path
+The new conntrack-miss helper (§4.2) gates on this bit. Packets
+without the bit do NOT trigger the helper.
 
-The map and threshold are unified; the counters split is purely
-diagnostic — distinguishing "scan with SYN/UDP" from "scan with
-ACK only" tells the operator what the attacker is using.
+### 4.1 Counter ABI append
 
-### 4.3 Userspace dataplane mirror
+Add `GLOBAL_CTR_SCREEN_IP_SWEEP_ACK` at the end of the global
+counter enum in `bpf/headers/xpf_common.h` (current values
+0..40, `MAX = 41` — new value becomes 41, new `MAX = 42`).
+Mirror in `pkg/dataplane/types.go` (`GlobalCtrScreenIPSweepAck`)
+and update `pkg/dataplane/userspace/manager_ha.go::summing` so
+`GlobalCtrScreenDrops` aggregate includes the new counter (per
+Codex round-1 §6 finding).
 
-`userspace-dp/src/screen.rs` mirrors the BPF logic. Add the same
-post-conntrack accounting block in the equivalent Rust path.
-Mirror the new counter constant.
+Operator UX:
+- `cli show security flow statistics` shows the per-counter
+  breakdown including ACK-evasion drops separately.
+- The aggregate `screen drops` line continues to include all
+  paths (including ACK-evasion) for backward compatibility.
 
-### 4.4 BPF verifier budget
+### 4.2 Conntrack miss-path helper (Gemini Pro 3 IPv6 fix)
 
-Adding ~30 lines to `xdp_conntrack_prog` is risky against the
-512-byte combined-frame stack limit (CLAUDE.md "BPF Verifier"
-rules). Mitigations:
+Extract the accounting logic into a `__noinline` helper in
+`bpf/xdp/xdp_conntrack.c` (or a new
+`bpf/headers/xpf_screen_ack.h` if cleaner). Helper signature:
 
-- Reuse the existing `iface_zone_map` lookup if it can be
-  hoisted to before the session lookup (already done?). Verify.
-- Use `__noinline` if necessary to keep the new block in its
-  own frame.
-- The new block is post-CT-miss, which is the slow-er path
-  (most packets hit a session and tail-call away). Even an
-  extra map lookup is acceptable here.
+```c
+static __noinline int
+ip_sweep_track_ack_evasion(struct pkt_meta *meta, __u64 now_sec);
+/* returns SCREEN_DROP_RC if threshold tripped, 0 otherwise */
+```
+
+Helper body:
+1. Fast-bail if `!(meta->meta_flags & META_FLAG_SCREEN_SKIPPED)`.
+2. Look up `zone_configs` by `meta->ingress_zone`. (NO
+   `iface_zone_map` lookup — `ingress_zone` is already resolved.)
+3. Look up `screen_configs` by `zone_configs.screen_profile_id`.
+4. Bail if `(sc->flags & SCREEN_IP_SWEEP) == 0` or
+   `sc->ip_sweep_thresh == 0`.
+5. Compute `(src_ip-or-v6-fold, ingress_zone)` key matching the
+   existing `xdp_screen.c:943-951` algorithm.
+6. Same window/counter logic as `xdp_screen.c:953-975`. On
+   threshold trip, increment `GLOBAL_CTR_SCREEN_IP_SWEEP_ACK`
+   AND return drop. (Existing screen-stage logic increments
+   `GLOBAL_CTR_SCREEN_IP_SWEEP` instead — the ACK-specific
+   counter is the diagnostic split.)
+
+Invocation sites — IMPORTANT, BOTH families:
+
+- **IPv4 miss path**: `bpf/xdp/xdp_conntrack.c` ~line 891-895
+  (after the NAT64 reverse lookup at :785-799 and before
+  `meta->ct_state = SESS_STATE_NEW`).
+- **IPv6 miss path**: equivalent post-NAT64 / pre-ct_state-NEW
+  position in the IPv6 branch.
+
+Both miss paths gate on `(meta->protocol == PROTO_TCP) &&
+!meta->is_fragment && (ACK & !(SYN|FIN|RST|URG))` plus
+`meta->meta_flags & META_FLAG_SCREEN_SKIPPED` before calling
+the helper. (Cheap predicate fail-fast.)
+
+### 4.3 No userspace mirror in this PR
+
+The userspace dataplane (`userspace-dp/src/screen.rs`) already
+implements unique-dst tracking for IP sweep, so it does NOT
+have the BPF-path bug being fixed here. Userspace does not have
+the `resolve_ingress_xdp_target` fast-path optimization (it's a
+BPF-only construct), so ACK probes already go through the
+userspace sweep tracker. No userspace changes needed.
+
+The semantic divergence between BPF (src+zone packet count) and
+userspace (unique-dst tracking) is documented in §9 as
+out-of-scope.
+
+### 4.4 BPF verifier stack budget
+
+Pulling the helper into a `__noinline` frame is the primary
+mitigation. Drop the redundant `iface_zone_map` lookup
+(meta->ingress_zone is already resolved). After implementation,
+verify with `bpftool prog dump xlated` and a `clang --print-stats`
+build that the conntrack frame stays ≤512 bytes combined.
 
 ## 5. Public API preservation
 
@@ -180,19 +294,22 @@ rules). Mitigations:
   legitimately matches a v6 session isn't accidentally counted.
   Or AFTER, so we don't double-count. Need to verify the right
   order. (See §10/Q3.)
-- **Daemon restart / session loss**: a fresh daemon with no
-  sessions will see ACKs from established flows as "no session"
-  for a brief window. With this change, those would count
-  toward `ip_sweep_track`. This is a real false-positive
-  scenario. Mitigation: HA replicates sessions; standalone
-  restart is rare. Operators concerned can set
-  `ip_sweep_thresh` higher than typical post-restart ACK
-  bursts (typical: a few thousand ACKs over 1 sec — set
-  threshold ≥ 10k).
+- **Daemon restart / session loss (corrected v2)**: normal
+  eBPF restarts preserve pinned `sessions` / `sessions_v6` /
+  `nat64_state` maps (`pkg/dataplane/loader_ebpf.go:18-36`).
+  Real risks: full cleanup, incompatible pinned-map ABI changes,
+  eBPF↔userspace mode transitions, HA-sync gaps. **Bounded**
+  even when sessions ARE lost: after restart, the FIRST ACK of
+  each established flow misses CT, takes the ACK-only fast-path
+  bypass, hits this helper, increments by 1, then `xdp_policy`
+  creates a `SYN_SENT` session for the permitted ACK; subsequent
+  ACKs hit that session and bypass the helper entirely. Maximum
+  extra increments per restart = N (number of distinct established
+  flows at restart), not unbounded. (Per Gemini Pro 3 round-1.)
 - **Asymmetric routing**: legitimate ACKs that arrived on the
   wrong interface miss conntrack. With this change, those
-  count. Existing screen-stage sweep already had this same
-  property; behavior unchanged.
+  count. Existing screen-stage sweep had this same property
+  for non-ACK-only packets; the new path extends it to ACK-only.
 - **Per-CPU map ordering**: `ip_sweep_track` is BPF_MAP_TYPE_LRU_HASH,
   not per-CPU. Concurrent updates from multiple CPUs are racy
   on `count++`. Existing screen code uses `bpf_map_update_elem`
@@ -212,16 +329,47 @@ rules). Mitigations:
 
 - `make generate` (regenerate Go BPF bindings).
 - `cargo build --release` clean.
-- `cargo test --release`: 962+ pass, plus 2-3 new tests:
-  - `ip_sweep_ack_evasion_detected` — fixture sends N ACK probes
-    from one source to N distinct destinations with no matching
-    session; assert drop after threshold.
-  - `ip_sweep_ack_evasion_no_drop_when_session_matches` —
-    fixture creates a session, then sends N ACKs that match;
-    assert no drop and counter not incremented.
+- `cargo test --release`: 962+ pass, plus the following new
+  tests covering the false-positive corners flagged by Codex
+  round-1 and the IPv6 path flagged by Gemini Pro 3 round-1.
+  Each test runs against the BPF eBPF program loader (no
+  userspace-dp involvement; userspace doesn't have the bug):
+
+  Positive admission (drops correctly):
+  - `ip_sweep_ack_evasion_detected_v4` — ACK probes from one
+    source to N distinct dst v4 addresses; no matching session;
+    drops after threshold.
+  - `ip_sweep_ack_evasion_detected_v6` — same shape, IPv6.
   - `ip_sweep_ack_evasion_threshold_unified_with_screen_path` —
-    half SYN probes (counted via screen) and half ACK probes
-    (counted via conntrack-miss); assert drop on combined count.
+    half SYN probes (via screen) + half ACK probes (via new
+    helper); drops on combined count against unified `ip_sweep_track`.
+
+  Negative (no drop, hook not entered):
+  - `ip_sweep_ack_no_drop_when_session_matches_v4` — established
+    session, N ACKs all match; assert no drop, counter unchanged.
+  - `ip_sweep_ack_no_drop_when_session_matches_v6` — same, IPv6.
+  - `ip_sweep_ack_no_double_count_when_land_attack_configured` —
+    profile has `SCREEN_LAND_ATTACK | SCREEN_IP_SWEEP`. Send N
+    ACK probes; verify they go through `xdp_screen` (not the
+    fast-path bypass) and count exactly once via the existing
+    screen-stage logic. `META_FLAG_SCREEN_SKIPPED` must NOT be
+    set on these packets.
+  - `ip_sweep_ack_no_double_count_when_tcp_no_flag_configured` —
+    profile has `SCREEN_TCP_NO_FLAG | SCREEN_IP_SWEEP`. Same
+    expectation.
+  - `ip_sweep_ack_no_double_count_when_source_route_configured` —
+    profile has `SCREEN_IP_SOURCE_ROUTE | SCREEN_IP_SWEEP` (v4
+    only — the v6 fast-path doesn't gate on source-route).
+  - `ip_sweep_ack_excludes_syn_ack_fin_rst_urg_fragment` — the
+    helper's predicate must reject any of these flag shapes
+    even with the SCREEN_SKIPPED bit set (defense-in-depth).
+  - `ip_sweep_ack_disabled_when_thresh_zero` — `ip_sweep_thresh = 0`
+    or `SCREEN_IP_SWEEP` not set in `screen_flags`; helper bails
+    after the first config check; counter unchanged.
+  - `ip_sweep_ack_nat64_reverse_not_counted` — IPv4 ACK that
+    is the reverse direction of a v6 NAT64 session; the v4 miss
+    path looks up `nat64_state`, finds match, tail-calls to
+    nat64; the helper position (post-nat64-miss) is NOT reached.
 - `cargo test --release ip_sweep` 5x flake check.
 - `go test ./...` clean (Go-side change is the new counter
   rendering only).
