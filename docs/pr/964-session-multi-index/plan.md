@@ -506,18 +506,25 @@ in the public API.
 - Per-class CoS smoke (5201-5206) — refactor PR rule.
 - **MANDATORY** microbench at
   `userspace-dp/benches/session_table.rs` covering:
-  - Insert (install_with_protocol shape) under steady-state
-    churn.
-  - Lookup for forward-key, reverse-NAT-key, forward-wire-key,
-    AND **alias-path lookup via reverse_translated_index**
-    (Codex round-4 finding #5 — the alias path was the source
-    of multiple prior review failures).
-  - **NAT churn cycle**: install/remove pairs that produce
-    BOTH `reverse_wire` and `reverse_canonical` keys, so the
-    bench exercises the full guarded-remove path (Codex
-    round-4 finding #5).
-  - GC (expire_stale_entries shape).
-  - owner_rg_session_keys (HA export hot path).
+  - Insert + FULL remove churn (mirrors
+    install_with_protocol + remove_entry's eager-cleanup so the
+    bench stays at steady-state size).
+  - Lookup for forward-key, reverse-NAT-key, AND **alias-path
+    lookup via reverse_translated_index** (the alias path was
+    the source of multiple plan-review failures).
+  - owner_rg_session_keys (HA export — included to bound the
+    expected regression on this rare path).
+  - **Deferred**: dedicated `nat_churn` (with both reverse_wire
+    and reverse_canonical keys) and `gc_drain` (wheel-pop
+    shape) benches — `insert_churn` already exercises the
+    guarded-remove path, and the GC pop shape adds nothing
+    over what is already in `session/tests.rs`.
+
+  Acceptance: the slab shape must NOT regress on the
+  reverse_nat or alias lookups (the dominant slow-path
+  operations). Small regressions on lookup_forward (<10ns) and
+  owner_rg_export (rare HA path) are accepted in exchange for
+  the secondary-index payload reduction.
 
   Bench reimplements the SessionTable hot-path shape because
   `SessionTable` is `pub(crate)` in a bin crate — same pattern

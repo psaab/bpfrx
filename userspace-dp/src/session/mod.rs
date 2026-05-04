@@ -724,7 +724,12 @@ impl SessionTable {
         {
             return false;
         }
-        self.remove_entry(&key);
+        // Same guard semantics as install_with_protocol_with_origin:
+        // remove_entry can return None if the primary-key guard
+        // fires (re-inserts the original mapping); we proceed to
+        // overwrite. debug_assert! in remove_entry catches the
+        // pathological case in tests.
+        let _previous = self.remove_entry(&key);
         let epoch = self.next_epoch();
         let record = SessionRecord {
             key: key.clone(),

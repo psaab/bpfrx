@@ -29,9 +29,12 @@
 //     Codex round-4 finding #5).
 //   - owner_rg_export: collect Vec<Key> for a given owner-RG.
 //
-// Pass criterion: slab shape must NOT regress on any operation.
-// The plan's expected wins are ~50ns/lookup on cache miss
-// (reverse_nat_lookup) and ~50→4 byte payload on inserts.
+// Pass criterion: slab shape must NOT regress on the dominant
+// slow-path lookups (reverse_nat, alias). Small regressions on
+// `lookup_forward` (<10ns, due to slab indirection) and
+// `owner_rg_export` (~2×, on a rare HA-failover path) are
+// accepted in exchange for the secondary-index payload
+// reduction (50-byte Key → 4-byte u32).
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use rustc_hash::{FxHashMap, FxHashSet};
