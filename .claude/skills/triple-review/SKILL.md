@@ -321,18 +321,29 @@ CLI
 #      anchoring on the `sender` word avoids that.
 set -o pipefail
 echo "=== Pass A — CoS disabled, v4+v6 × push+reverse ==="
-for af in "v4:172.16.80.200" "v6:2001:559:8585:80::200"; do
-  fam=${af%%:*}; tgt=${af#*:}
-  echo -n "$fam push: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201"    2>&1 | grep "0.00-5.00.*sender" || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
-  echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201 -R" 2>&1 | grep "0.00-5.00.*sender" || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
+# Targets named explicitly to avoid colon-delimited packing (IPv6
+# addresses contain colons, which makes any `${var%%:*}`-style split
+# easy to misread even though bash semantics are correct). Use -F
+# fixed-string grep so the dots in interval/timestamp tokens are
+# matched literally rather than as regex wildcards.
+declare -A TARGETS=(
+  [v4]="172.16.80.200"
+  [v6]="2001:559:8585:80::200"
+)
+for fam in v4 v6; do
+  tgt=${TARGETS[$fam]}
+  echo -n "$fam push: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201"    2>&1 | grep -F -- "0.00-5.00" | grep -F -- "sender" || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
+  echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201 -R" 2>&1 | grep -F -- "0.00-5.00" | grep -F -- "sender" || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
 done
 
 # Multi-stream reverse-mode reproducer (canonical TX-path regression catcher).
 # A reverse cap with healthy push throughput is a TX-path regression.
-# Grep the SUM sender line to expose Retr (retrans column).
+# Grep the SUM sender line to expose Retr (retrans column). Two-stage
+# fixed-string filter for the same dot-as-literal reason as above; the
+# `[SUM]` literal contains brackets that need either fgrep or escaping.
 echo "=== Pass A — 12-stream reverse reproducer (CoS disabled) ==="
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 172.16.80.200 -P 12 -t 10 -p 5201 -R"       2>&1 | grep "^\[SUM\].*0.00-10.00.*sender" || { echo "NO SUM SENDER LINE — iperf3 failed"; exit 1; }
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 2001:559:8585:80::200 -P 12 -t 10 -p 5201 -R" 2>&1 | grep "^\[SUM\].*0.00-10.00.*sender" || { echo "NO SUM SENDER LINE — iperf3 failed"; exit 1; }
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 172.16.80.200 -P 12 -t 10 -p 5201 -R"       2>&1 | grep -F -- "[SUM]" | grep -F -- "0.00-10.00" | grep -F -- "sender" || { echo "NO SUM SENDER LINE — iperf3 failed"; exit 1; }
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 2001:559:8585:80::200 -P 12 -t 10 -p 5201 -R" 2>&1 | grep -F -- "[SUM]" | grep -F -- "0.00-10.00" | grep -F -- "sender" || { echo "NO SUM SENDER LINE — iperf3 failed"; exit 1; }
 
 # === Pass B: CoS ENABLED ===
 sg incus-admin -c "./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0"
@@ -340,13 +351,20 @@ sg incus-admin -c "./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0"
 # Per-class CoS smoke — v4+v6 × push+reverse × 6 ports = 24 measurements
 # Same `sender` grep convention so retrans is visible for every cell.
 echo "=== Pass B — Per-class CoS smoke ==="
-for port_class in "5201:iperf-a" "5202:iperf-b" "5203:iperf-c" "5204:iperf-d" "5205:iperf-e" "5206:iperf-f"; do
-  port=${port_class%%:*}; cls=${port_class#*:}
+# Same fixed-string + named-array shape as Pass A — port-class pairs
+# in a `:`-packed string would be safe, but the iperf-class names use
+# `-` not `:` and TARGETS[] is already in scope, so reuse it.
+declare -A PORT_CLASS=(
+  [5201]="iperf-a" [5202]="iperf-b" [5203]="iperf-c"
+  [5204]="iperf-d" [5205]="iperf-e" [5206]="iperf-f"
+)
+for port in 5201 5202 5203 5204 5205 5206; do
+  cls=${PORT_CLASS[$port]}
   echo "--- $port $cls ---"
-  for af in "v4:172.16.80.200" "v6:2001:559:8585:80::200"; do
-    fam=${af%%:*}; tgt=${af#*:}
-    echo -n "$fam push: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port"    2>&1 | grep "0.00-5.00.*sender" || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
-    echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port -R" 2>&1 | grep "0.00-5.00.*sender" || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
+  for fam in v4 v6; do
+    tgt=${TARGETS[$fam]}
+    echo -n "$fam push: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port"    2>&1 | grep -F -- "0.00-5.00" | grep -F -- "sender" || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
+    echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port -R" 2>&1 | grep -F -- "0.00-5.00" | grep -F -- "sender" || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
   done
 done
 ```
