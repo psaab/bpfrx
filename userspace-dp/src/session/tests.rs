@@ -279,7 +279,7 @@ fn wheel_handles_exact_256s_timeout() {
     ));
     // Verify the entry's wheel_tick is install_tick + 255, NOT
     // install_tick (which would mean "current bucket").
-    let entry = table.sessions.get(&key).expect("entry");
+    let entry = table.entry_by_key(&key).expect("entry");
     let install_tick = install_ns / WHEEL_TICK_NS;
     assert_eq!(
         entry.wheel_tick,
