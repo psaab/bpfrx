@@ -271,7 +271,13 @@ export BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env
 # Apply atomically with `commit check` first so we never end up in a
 # half-broken state. RG-0-primary-only.
 sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- rm -f /tmp/cos-iperf-sets.set"
-sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- bash -c '/usr/local/sbin/cli <<CLI 2>&1 | tail -10
+# Don't pipe `cli` through `tail`/`head` here — that masks the cli exit
+# status (pipeline returns `tail`'s status) and would silently swallow
+# `commit check` / `commit` failures, leaving CoS partially attached
+# while Pass A claims "CoS off". Use `set -o pipefail` if you must
+# pipe; the simpler option below keeps full output visible and exits
+# non-zero if the commit fails.
+sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- bash -c 'set -e; /usr/local/sbin/cli <<CLI
 configure
 delete class-of-service
 delete firewall family inet filter bandwidth-output
@@ -282,15 +288,23 @@ commit check
 commit and-quit
 exit
 CLI
-'"
+'" || { echo "Pass A teardown failed — aborting smoke matrix"; exit 1; }
 
-# Note on grep targets: iperf3 reports the `Retr` (retransmit) column on
-# the sender summary line for both push and reverse runs (for multi-
-# stream `-P N` runs that's `[SUM] ... sender`; for single-stream runs
-# it's `[ 5] ... sender`). We always grep the sender line — for `-R`
-# runs the sender is the iperf3 server pushing data and Retr lives on
-# its summary. Grepping `receiver` would show throughput but hide
-# retrans, defeating the "0 retrans" gate below.
+# Note on grep targets: iperf3 reports the `Retr` (retransmit) column
+# on the sender summary line for both push and reverse runs (for
+# multi-stream `-P N` runs that's `[SUM] ... sender`; for single-stream
+# runs it's `[ 5] ... sender`). We always grep the sender line — for
+# `-R` runs the sender is the iperf3 server pushing data and Retr
+# lives on its summary. Grepping `receiver` would show throughput but
+# hide retrans entirely.
+#
+# These greps are VISIBILITY FILTERS, not programmatic gates: they
+# expose the Retr column to the operator's eye so the "0 retrans"
+# pass criterion (below) can be confirmed by reading the captured
+# output. They do NOT fail on non-zero retrans by themselves. The
+# smoke harness is doc-style — verify by inspection. If you wire a
+# CI runner around this, you must add explicit retrans-zero parsing
+# (e.g. `awk '$13 != "0"'` against the captured Retr column).
 echo "=== Pass A — CoS disabled, v4+v6 × push+reverse ==="
 for af in "v4:172.16.80.200" "v6:2001:559:8585:80::200"; do
   fam=${af%%:*}; tgt=${af#*:}
