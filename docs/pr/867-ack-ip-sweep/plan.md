@@ -1,8 +1,24 @@
 ---
-status: DRAFT v4 — Codex round-3 PLAN-NEEDS-MAJOR addressed (screen_drop() promotion to header + stale residue cleanup); Gemini Pro 3 round-3 ACP-init failure (will redispatch)
+status: PLAN-READY v5 — Codex round-4 trivial NIT addressed (§4.1 citation post-promotion); Gemini Pro 3 round-3 redispatch PLAN-READY ✅
 issue: https://github.com/psaab/xpf/issues/867
 phase: ACK-evasion of SCREEN_IP_SWEEP — post-conntrack accounting
 ---
+
+## Changelog v5
+
+Codex round-4 (`task-morsfhpw-d3ekop` follow-up) returned
+PLAN-NEEDS-MINOR with 1 TRIVIAL nit; Gemini Pro 3 round-3
+redispatch (`task-morsoz49-nubebw`) returned PLAN-READY.
+
+- **TRIVIAL — stale §4.1 citation**: §4.1 still cited the
+  pre-promotion location `bpf/xdp/xdp_screen.c:35-43` for
+  `screen_drop()` after §4.0a moves the helper into
+  `bpf/headers/xpf_helpers.h`. Updated the citation to the
+  promoted header location and added an explicit "must be
+  inserted **after** the existing `emit_event()` definition" note
+  to avoid forward-declaration ambiguity under `-Wall -Werror`.
+
+No other findings. Both reviewers now ready for execution.
 
 ## Changelog v4
 
@@ -308,8 +324,11 @@ without the bit do NOT trigger the helper.
 
 Plan v3 drops the proposed `GLOBAL_CTR_SCREEN_IP_SWEEP_ACK`
 counter index. The new helper ends by calling the existing
-`screen_drop(meta, SCREEN_IP_SWEEP)` helper at
-`bpf/xdp/xdp_screen.c:35-43`, which performs:
+`screen_drop(meta, SCREEN_IP_SWEEP)` helper, which (post §4.0a
+promotion) lives in `bpf/headers/xpf_helpers.h` and must be
+inserted **after** the existing `emit_event()` definition in
+that header to avoid forward-declaration ambiguity under
+`-Wall -Werror`. The helper performs:
 
 1. `meta->policy_id = SCREEN_IP_SWEEP`
 2. `inc_counter(GLOBAL_CTR_SCREEN_DROPS)`
