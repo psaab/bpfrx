@@ -50,16 +50,37 @@ Suggested alert:
 ```
 
 The alert latency is bounded by `scrape_interval +
-control_socket_rt` (typically 15–30 s + ~10 ms). The `for: 30s`
-clause absorbs that.
+successful control-socket round trip`. Scrape interval is
+operator-configured (typically 15–30 s); the control-socket
+round trip is bounded by the dial timeout (`2 s`) and request
+deadline (`3 s`) in `pkg/dataplane/userspace/process.go`, with
+real-world latency well below those bounds. The `for: 30s`
+alert clause absorbs both components comfortably.
 
-### JSON status (deeper diagnosis)
+### CLI / JSON status (deeper diagnosis)
+
+The CoS-aware text formatter renders dead workers inline. The
+canonical operator path is:
 
 ```
-cli show userspace-dp status | jq '.worker_runtime[] | select(.dead)'
+cli show chassis cluster data-plane statistics
 ```
 
-returns the worker entry with both `dead: true` and the
+A dead worker prints as:
+
+```
+  <id>   <tid>      DEAD - panicked: <panic_message>
+```
+
+For machine-readable output (e.g. piping to jq), the same data is
+on the userspace-dp control socket:
+
+```
+incus exec loss:xpf-userspace-fw0 -- bash -lc \
+  "echo status | socat - UNIX-CONNECT:/run/xpf/userspace-dp.sock | jq '.worker_runtime[] | select(.dead)'"
+```
+
+Both paths return the worker entry with `dead: true` and the
 `panic_message` payload that the supervisor captured.
 
 ### Log inspection
