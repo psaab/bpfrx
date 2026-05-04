@@ -808,15 +808,6 @@ fn build_cos_state_admits_each_cos_field_in_isolation() {
             },
         ),
         (
-            202,
-            "burst-bytes only",
-            InterfaceSnapshot {
-                ifindex: 202,
-                cos_shaping_burst_bytes: 256_000,
-                ..Default::default()
-            },
-        ),
-        (
             203,
             "scheduler-map only",
             InterfaceSnapshot {
@@ -865,4 +856,34 @@ fn build_cos_state_admits_each_cos_field_in_isolation() {
             "{label}: interface must be admitted to CoSState (ifindex {ifindex})"
         );
     }
+}
+
+#[test]
+fn build_cos_state_skips_interface_with_burst_only_no_other_cos_knobs() {
+    // Junos grammar parses `burst-size` only as a sub-knob of
+    // `shaping-rate`, so an interface can never carry a burst-bytes
+    // value without also carrying a non-zero shaping-rate. A pathological
+    // snapshot with burst-only must NOT be admitted to CoSState — there
+    // is no real CoS behavior to apply, and admitting would reintroduce
+    // the cross-binding owner-worker redirect that PR #1183 eliminates.
+    // (Copilot review on PR #1183 caught the prior over-broad predicate.)
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 250,
+            cos_shaping_rate_bytes_per_sec: 0,
+            cos_shaping_burst_bytes: 256_000,
+            cos_scheduler_map: String::new(),
+            cos_dscp_classifier: String::new(),
+            cos_ieee8021_classifier: String::new(),
+            cos_dscp_rewrite_rule: String::new(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot::default()),
+        ..Default::default()
+    };
+    let state = build_cos_state(&snapshot);
+    assert!(
+        !state.interfaces.contains_key(&250),
+        "interface with burst-only (no rate, no classes, no rewrite) must NOT be in CoSState"
+    );
 }

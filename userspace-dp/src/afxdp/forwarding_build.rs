@@ -642,11 +642,18 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
         //
         // An interface participates in CoS when ANY of these knobs is set:
         //   - `cos_shaping_rate_bytes_per_sec` (interface shaping cap)
-        //   - `cos_shaping_burst_bytes`        (shaping burst override)
         //   - `cos_scheduler_map`              (per-class scheduling)
         //   - `cos_dscp_classifier`            (DSCP → forwarding-class)
         //   - `cos_ieee8021_classifier`        (802.1p → forwarding-class)
         //   - `cos_dscp_rewrite_rule`          (egress DSCP rewrite)
+        //
+        // `cos_shaping_burst_bytes` is intentionally NOT a standalone arm.
+        // In Junos config grammar, `burst-size` is parsed only as a
+        // sub-knob of `shaping-rate`, so a snapshot can never carry
+        // burst-only without also carrying shaping-rate. Treating
+        // burst-bytes as standalone admission would reintroduce the
+        // owner-worker redirect for any pathological snapshot shape that
+        // happened to set burst alone, with no real CoS behavior to apply.
         //
         // f0e364d7 (#916) removed the prior `shaping_rate == 0` skip so
         // that zero-shaping-rate-with-classes interfaces would get a
@@ -663,7 +670,6 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
         // rate-zero handling) still apply when at least one CoS knob is
         // set; only the no-CoS-at-all case is skipped here.
         let has_cos_config = iface.cos_shaping_rate_bytes_per_sec > 0
-            || iface.cos_shaping_burst_bytes > 0
             || !iface.cos_scheduler_map.is_empty()
             || !iface.cos_dscp_classifier.is_empty()
             || !iface.cos_ieee8021_classifier.is_empty()
