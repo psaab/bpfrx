@@ -1,6 +1,96 @@
 # #925 Phase 2 — Prometheus liveness + panic-injection test + no-respawn rationale
 
-Status: **DRAFT v1 — pending adversarial plan review (Codex + Gemini)**
+Status: **DRAFT v2 — addressing Codex round-1 PLAN-NEEDS-MINOR + Gemini round-1 PLAN-NEEDS-MINOR (concurrency + framing)**
+
+## v2 changes (round-1 reviewer findings)
+
+### 1. Test surface: use existing `spawn_supervised_worker`
+
+Codex caught: `spawn_supervised_worker` already exists in
+`coordinator/mod.rs` and existing tests at
+`coordinator/tests.rs:848` already call it directly with an
+arbitrary closure. v1's proposed
+`spawn_supervised_panicking_test_thread` was unnecessary
+ceremony.
+
+v2 simplifies: test calls `spawn_supervised_worker(..., ||
+panic!("..."))` directly and asserts on the post-join state.
+
+### 2. Drop "No public API changes" claim
+
+Both reviewers caught: a Prometheus metric IS a monitoring
+API. Once shipped, dashboards / alerts / SLOs will pin to
+the gauge name and label cardinality.
+
+v2 explicitly:
+- Documents `xpf_userspace_worker_dead{worker_id}` as
+  stable. Value `1` means caught panic, cleared only by
+  daemon restart.
+- Adds a Go test that asserts the metric registers and emits
+  the expected sample shape (mirrors existing pattern at
+  `pkg/api/metrics_test.go` for other worker gauges).
+- Mentions explicit `Describe()` registration at
+  `pkg/api/metrics.go:345` — easy to forget; the gauge
+  doesn't emit if not Describe'd.
+
+### 3. Update stale "Phase 2 respawn" comments
+
+Codex caught: comments at `pkg/dataplane/userspace/protocol.go:539`
+and `userspace-dp/src/afxdp/worker_runtime.rs:71` still
+promise that Phase 2 will implement respawn. With v2's
+documented decision NOT to respawn, those comments are
+inconsistent with the codebase.
+
+v2 mandates updating both comments to:
+- Describe the current behavior (mark-dead until daemon
+  restart).
+- Reference this Phase 2 plan + the no-respawn rationale.
+
+### 4. HA section: document the real black-hole consequence
+
+Codex caught: `pkg/cluster` has no `WorkerRuntimeStatus.dead`
+awareness, and userspace takeover readiness checks (in
+`pkg/dataplane/userspace/manager_ha.go:247`) check helper /
+queue / binding readiness, NOT dead workers.
+
+v2 adds explicit consequence: **if a dead worker owns an
+important binding (e.g., the RETH-VIP-bearing one), that
+binding is black-holed until operator restart**. The
+chassis-cluster will NOT detect this and trigger failover.
+Operators MUST alert on the gauge to detect.
+
+### 5. Panic-hook concurrency: not a blocker (Codex), critical (Gemini)
+
+Codex: no `std::panic::set_hook` users in the repo; tests
+should not install one and should not need to serialize.
+Gemini: critical concurrency risk in cargo test default
+parallel runner.
+
+v2 takes the conservative path: panic-injection tests do NOT
+install a custom hook, but the test setup uses
+`std::panic::take_hook` + `set_hook(Box::new(|_| {}))` to
+silence stderr noise during the test, then restores the
+prior hook in a Drop guard. Plus the test is wrapped in a
+`#[serial_test::serial]` attribute (using the
+[`serial_test`](https://crates.io/crates/serial_test) crate
+already in dev-dependencies if available, OR a
+hand-rolled global mutex if not).
+
+v2 mandates auditing existing dev-dependencies before
+deciding; if `serial_test` isn't already vendored, fall back
+to the hand-rolled mutex pattern (`OnceLock<Mutex<()>>` with
+the test taking the lock at entry).
+
+### 6. Gauge name: `xpf_userspace_worker_dead` (Codex confirmed)
+
+v1 asked which name. Codex's analysis: no existing alive/dead
+convention in `metrics.go`; existing worker metrics use
+`xpf_userspace_worker_*` with `worker_id`; a bad-state gauge
+is alert-friendly (`alert: workerDead == 1` reads naturally);
+`alive` creates missing-series ambiguity (gauge missing vs
+worker missing vs scrape missing).
+
+v2 commits: `xpf_userspace_worker_dead{worker_id}`.
 
 (Phase 1 — catch + report — shipped in #913. See `plan.md`
 in this directory for that historical record.)
