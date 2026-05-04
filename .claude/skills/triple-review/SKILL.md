@@ -259,20 +259,26 @@ export BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env
 # falls through to best-effort.
 #
 # Tear down the entire CoS fixture, not just `class-of-service`. The
-# cos-iperf fixture also installs `firewall filter bandwidth-output`
-# and binds it as the output filter on reth0.80 inet/inet6. Deleting
-# only `class-of-service` while those bindings still reference its
-# forwarding classes makes the commit fail validation, leaving the
-# system in a partially-configured state and silently invalidating
-# Pass A. Order matters: detach filters first, then drop the filter,
-# then drop class-of-service. RG-0-primary-only.
+# cos-iperf fixture (`test/incus/cos-iperf-config.set`) also installs
+# `firewall family inet/inet6 filter bandwidth-output` and binds it as
+# the unit-80 output filter. Deleting only `class-of-service` while
+# those bindings still reference its forwarding classes makes the
+# commit fail validation, leaving the system in a partially-configured
+# state and silently invalidating Pass A. Use the exact fixture-aligned
+# delete paths (mirrored from the top of `cos-iperf-config.set`):
+#   - `firewall family inet|inet6 filter bandwidth-output`
+#   - `interfaces reth0 unit 80 family inet|inet6 filter output`
+# Apply atomically with `commit check` first so we never end up in a
+# half-broken state. RG-0-primary-only.
 sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- rm -f /tmp/cos-iperf-sets.set"
-sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- bash -c 'cli <<CLI 2>&1 | tail -5
+sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- bash -c '/usr/local/sbin/cli <<CLI 2>&1 | tail -10
 configure
-delete interfaces reth0 unit 80 family inet filter
-delete interfaces reth0 unit 80 family inet6 filter
-delete firewall filter bandwidth-output
 delete class-of-service
+delete firewall family inet filter bandwidth-output
+delete interfaces reth0 unit 80 family inet filter output
+delete firewall family inet6 filter bandwidth-output
+delete interfaces reth0 unit 80 family inet6 filter output
+commit check
 commit and-quit
 exit
 CLI
