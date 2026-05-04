@@ -756,9 +756,14 @@ fn build_cos_state_skips_interface_with_no_cos_config() {
 
 #[test]
 fn build_cos_state_admits_each_cos_field_in_isolation() {
-    // The skip predicate is an OR over six fields. Pin every arm so a
-    // future refactor can't silently drop one — Codex review on
-    // PR #1183 flagged this as coverage debt (Q5).
+    // The skip predicate is an OR over five arms (rate, scheduler-map,
+    // DSCP classifier, 802.1p classifier, DSCP rewrite). Pin every arm so
+    // a future refactor can't silently drop one — Codex review on
+    // PR #1183 flagged this as coverage debt (Q5). The sixth `InterfaceSnapshot`
+    // CoS field, `cos_shaping_burst_bytes`, is intentionally NOT a
+    // standalone arm; see the dedicated burst-only-skip test below and
+    // the gate comment in `forwarding_build.rs::build_cos_state` for
+    // rationale.
     let cos = ClassOfServiceSnapshot {
         forwarding_classes: vec![CoSForwardingClassSnapshot {
             name: "best-effort".into(),

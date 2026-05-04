@@ -648,12 +648,21 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
         //   - `cos_dscp_rewrite_rule`          (egress DSCP rewrite)
         //
         // `cos_shaping_burst_bytes` is intentionally NOT a standalone arm.
-        // In Junos config grammar, `burst-size` is parsed only as a
-        // sub-knob of `shaping-rate`, so a snapshot can never carry
-        // burst-only without also carrying shaping-rate. Treating
-        // burst-bytes as standalone admission would reintroduce the
-        // owner-worker redirect for any pathological snapshot shape that
-        // happened to set burst alone, with no real CoS behavior to apply.
+        // The Go compiler does in fact allow a committed config to carry
+        // burst-only without rate (`pkg/config/compiler_class_of_service.go`
+        // accepts `BurstSizeBytes > 0` independently of `ShapingRateBytes`),
+        // but a burst value without ANY of {rate, scheduler-map, classifier,
+        // rewrite-rule} has no CoS behavior to apply: nothing classifies
+        // packets into queues, nothing schedules between queues, and the
+        // root rate is unlimited. Admitting such an interface to CoSState
+        // therefore produces no shaping, classification, or rewrite — only
+        // the cross-binding owner-worker redirect, i.e. the regression this
+        // gate exists to prevent.
+        //
+        // Pre-f0e364d7 baseline already skipped this case (the old
+        // `shaping_rate == 0` skip caught burst-only too); we restore that
+        // behavior for the no-real-CoS-effect case while preserving
+        // f0e364d7's deadlock fix when at least one CoS knob is set.
         //
         // f0e364d7 (#916) removed the prior `shaping_rate == 0` skip so
         // that zero-shaping-rate-with-classes interfaces would get a
