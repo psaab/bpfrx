@@ -178,10 +178,14 @@ Verdict: PLAN-READY / PLAN-NEEDS-MINOR / PLAN-NEEDS-MAJOR / PLAN-KILL. PLAN-KILL
 ### Gemini prompt template
 
 **Always pass `--model pro-3` (gemini-3-pro-preview).** The companion's
-default is `gemini-2.5-flash`, which has been low-signal on refactor
-plan reviews in this project (see
-`feedback_gemini_low_signal_on_refactor.md`); Pro 3 is the correct
-choice for adversarial plan + code review.
+default is `gemini-2.5-flash`. On the refactor stream this project has
+been driving (#946, #964, #959, #925), Flash repeatedly produced
+verdicts that contradicted itself round-over-round, hallucinated
+files/symbols that did not exist in the diff, or rubber-stamped
+plans that Codex flagged as architecturally wrong. Pro 3 is the
+right tier for adversarial plan + code review here; the Flash latency
+saving is not worth the signal degradation when the methodology
+hinges on whether one reviewer catches what the other misses.
 
 ```bash
 node "/home/ps/.claude/plugins/cache/abiswas97-gemini/gemini/1.0.1/scripts/gemini-companion.mjs" task --background --model pro-3 "$(cat <<'PROMPT'
