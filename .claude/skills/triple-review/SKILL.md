@@ -263,8 +263,11 @@ export BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env
 # `firewall family inet/inet6 filter bandwidth-output` and binds it as
 # the unit-80 output filter. Deleting only `class-of-service` while
 # those bindings still reference its forwarding classes makes the
-# commit fail validation, leaving the system in a partially-configured
-# state and silently invalidating Pass A. Use the exact fixture-aligned
+# commit fail validation. Junos-style candidate config means the live
+# config stays unchanged on commit failure (no half-broken state on
+# the wire) — but the silent failure mode is what hurts: CoS is still
+# enabled, Pass A is invalid, and the smoke matrix reports clean
+# numbers for what's effectively still Pass B. Use the fixture-aligned
 # delete paths (mirrored from the top of `cos-iperf-config.set`):
 #   - `firewall family inet|inet6 filter bandwidth-output`
 #   - `interfaces reth0 unit 80 family inet|inet6 filter output`
@@ -302,22 +305,34 @@ CLI
 # expose the Retr column to the operator's eye so the "0 retrans"
 # pass criterion (below) can be confirmed by reading the captured
 # output. They do NOT fail on non-zero retrans by themselves. The
-# smoke harness is doc-style — verify by inspection. If you wire a
-# CI runner around this, you must add explicit retrans-zero parsing
-# (e.g. `awk '$13 != "0"'` against the captured Retr column).
+# smoke harness is doc-style — verify by inspection.
+#
+# CI integration note: if you wire this into a non-interactive
+# runner, do BOTH of the following so failures surface:
+#   1. `set -o pipefail` so a non-zero exit on either side of the
+#      pipe propagates (the iperf3 binary itself returning non-zero
+#      on connection failure no longer gets masked by `grep`).
+#   2. Add explicit retrans-zero parsing. The `Retr` column on a
+#      sender summary is the token immediately before the trailing
+#      `sender` literal — robust parse:
+#        awk '/sender/ { for (i=1;i<=NF;i++) if ($i=="sender") print $(i-1) }'
+#      Field count varies between `[SUM]` (multi-stream) and `[ N]`
+#      (single-stream) lines so a fixed `$N` index is fragile;
+#      anchoring on the `sender` word avoids that.
+set -o pipefail
 echo "=== Pass A — CoS disabled, v4+v6 × push+reverse ==="
 for af in "v4:172.16.80.200" "v6:2001:559:8585:80::200"; do
   fam=${af%%:*}; tgt=${af#*:}
-  echo -n "$fam push: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201"    2>&1 | grep "0.00-5.00.*sender"
-  echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201 -R" 2>&1 | grep "0.00-5.00.*sender"
+  echo -n "$fam push: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201"    2>&1 | grep "0.00-5.00.*sender" || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
+  echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201 -R" 2>&1 | grep "0.00-5.00.*sender" || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
 done
 
 # Multi-stream reverse-mode reproducer (canonical TX-path regression catcher).
 # A reverse cap with healthy push throughput is a TX-path regression.
 # Grep the SUM sender line to expose Retr (retrans column).
 echo "=== Pass A — 12-stream reverse reproducer (CoS disabled) ==="
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 172.16.80.200 -P 12 -t 10 -p 5201 -R"       2>&1 | grep "^\[SUM\].*0.00-10.00.*sender"
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 2001:559:8585:80::200 -P 12 -t 10 -p 5201 -R" 2>&1 | grep "^\[SUM\].*0.00-10.00.*sender"
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 172.16.80.200 -P 12 -t 10 -p 5201 -R"       2>&1 | grep "^\[SUM\].*0.00-10.00.*sender" || { echo "NO SUM SENDER LINE — iperf3 failed"; exit 1; }
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 2001:559:8585:80::200 -P 12 -t 10 -p 5201 -R" 2>&1 | grep "^\[SUM\].*0.00-10.00.*sender" || { echo "NO SUM SENDER LINE — iperf3 failed"; exit 1; }
 
 # === Pass B: CoS ENABLED ===
 sg incus-admin -c "./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0"
@@ -330,8 +345,8 @@ for port_class in "5201:iperf-a" "5202:iperf-b" "5203:iperf-c" "5204:iperf-d" "5
   echo "--- $port $cls ---"
   for af in "v4:172.16.80.200" "v6:2001:559:8585:80::200"; do
     fam=${af%%:*}; tgt=${af#*:}
-    echo -n "$fam push: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port"    2>&1 | grep "0.00-5.00.*sender"
-    echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port -R" 2>&1 | grep "0.00-5.00.*sender"
+    echo -n "$fam push: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port"    2>&1 | grep "0.00-5.00.*sender" || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
+    echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port -R" 2>&1 | grep "0.00-5.00.*sender" || { echo "NO SENDER LINE — iperf3 failed"; exit 1; }
   done
 done
 ```
