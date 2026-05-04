@@ -1,6 +1,160 @@
 # #964 SessionTable Multi-Index — Slab + Integer Handles (Step 1)
 
-Status: **DRAFT v1 — pending adversarial plan review (Codex + Gemini)**
+Status: **DRAFT v2 — addressing Codex round-1 PLAN-NEEDS-MAJOR**
+
+## v2 changes (Codex round-1 + Gemini round-1)
+
+Codex round 1: **PLAN-NEEDS-MAJOR** (task-moqg4s64-vl1jel).
+Gemini round 1: **PLAN-NEEDS-MINOR** (task-moqg5i8m-74tkzh).
+Codex's longer list subsumed Gemini's, so v2 addresses Codex.
+
+5 blockers from Codex:
+
+### 1. Missing handle→key path (Codex blocker #1)
+
+`find_forward_nat_match()` (session/mod.rs:472),
+`find_forward_wire_match_with_origin()` (session/mod.rs:492),
+and `lookup_with_origin()` (session/mod.rs:407) must return the
+canonical `SessionKey`, not just the entry data.
+`lookup_with_origin` also calls `push_to_wheel(key, ...)` after
+the lookup — the wheel update needs the canonical key.
+
+**v2 decision**: store the canonical key INSIDE the slab entry.
+The slab holds `SessionRecord { key: SessionKey, entry:
+SessionEntry }`. From any handle the canonical key is
+reachable in O(1). This subsumes the owner_rg_sessions
+handle→key issue Gemini also raised — `owner_rg_session_keys()`
+maps `FxHashSet<u32>` → keys via `slab[h].key.clone()` in
+O(owner-sessions), not O(all-sessions).
+
+Memory cost recalculated below.
+
+### 2. Stale-handle invariant misstated (Codex blocker #2)
+
+v1 said "handles are local to a single method call." That's
+wrong — secondary indices DO store handles across calls.
+
+**Real invariant** (v2): handles persist only in eagerly-
+maintained internal indices, and EVERY such index MUST be
+cleaned before its slab slot can be reused. The wheel is the
+ONLY place that holds a `SessionKey` (not handle) across calls
+because wheel entries are lazily deleted via `wheel_tick`
+mismatch.
+
+### 3. Wheel STAYS key-based in Step 1 (Codex blocker #3)
+
+v1 had contradictory wording ("update the wheel to handles" in
+one place, "keep wheel key-based for Step 1" in another). v2 is
+unambiguous: **wheel keys on `SessionKey`, NOT on handle.**
+
+Reason: wheel entries outlive method calls and are lazily
+deleted (a `(SessionKey, scheduled_tick)` entry in a bucket can
+sit there for a long time). If we used handles, slab handle
+reuse (after remove + new install) would point a stale wheel
+entry at a DIFFERENT session. The lazy-delete discriminator
+needs to be a stable identifier, which the SessionKey is.
+
+This means the wheel keeps its ~50 bytes per entry. At 1M
+sessions × 2x amortization (per #965 plan), that's ~100 MB of
+SessionKey storage in the wheel. Not addressed by this Step.
+
+### 4. Use `entries.get(handle)?` not `entries[handle]` (Codex blocker #4)
+
+v1's lookup pattern `let entry = &self.entries[handle as usize];`
+panics if the handle is invalid. The current `sessions.get(...)`
+returns `None` on stale lookups (graceful degradation).
+
+**v2 fix**: use `self.entries.get(handle as usize)?` everywhere
+in lookup paths so stale secondary indices propagate as `None`,
+matching today's behavior.
+
+### 5. owner_rg_sessions handle→key cost (Codex blocker #5 + Gemini Q3)
+
+Resolved by v2 decision in #1: SessionRecord stores the key
+inline. `owner_rg_session_keys()` collects keys via
+`set.iter().map(|h| slab[h].key.clone()).collect()` — O(owner
+sessions), same as today. No O(all-sessions) regression.
+
+## Memory math recalculated (v2 honest)
+
+v1 claimed 33% reduction at 1M sessions but used hand-wavy
+math. Codex blocker #6 also pointed out that
+`DEFAULT_MAX_SESSIONS = 131072` (session/mod.rs:24), so 1M is
+already 8x over the configured cap.
+
+**Use 131072 sessions for the v2 baseline.**
+
+Current state (FxHashMap overhead included; FxHashMap is ~1.5×
+sizeof(K)+sizeof(V)+1 control byte at 75% load):
+
+| Map | Per-entry | × N=131072 | Total |
+|-----|-----------|------------|-------|
+| sessions: Key→Entry | 1.5 × (50+80+1) = 197 | × 131072 | 25.8 MB |
+| nat_reverse: Key→Key | 1.5 × (50+50+1) = 152 | × 131072 | 19.9 MB |
+| forward_wire: Key→Key | 152 | × 131072 | 19.9 MB |
+| reverse_translated: Key→Key | 152 | × 131072 | 19.9 MB |
+| owner_rg: i32→FxHashSet<Key> | ~25 MB across all RGs | | ~25 MB |
+| **Total** | | | **~111 MB** |
+
+After Step 1 (slab with SessionRecord{key,entry}):
+
+| Map | Per-entry | × N=131072 | Total |
+|-----|-----------|------------|-------|
+| slab: SessionRecord{Key,Entry} | 50+80 = 130 (no hash overhead) | × 131072 | 17.0 MB |
+| key_to_handle: Key→u32 | 1.5 × (50+4+1) = 82 | × 131072 | 10.7 MB |
+| nat_reverse: Key→u32 | 82 | × 131072 | 10.7 MB |
+| forward_wire: Key→u32 | 82 | × 131072 | 10.7 MB |
+| reverse_translated: Key→u32 | 82 | × 131072 | 10.7 MB |
+| owner_rg: i32→FxHashSet<u32> | ~5 MB across all RGs | | ~5 MB |
+| **Total** | | | **~65 MB** |
+
+**Realistic saving: ~46 MB / ~41% reduction at 131072 sessions.**
+
+The Step also takes the CRITICAL improvement: `sessions` HashMap
+overhead disappears entirely (the slab is a contiguous Vec, no
+hash bucket overhead). That alone is the bulk of the win.
+
+If session count grows to 1M, the same percentages apply:
+~880 MB → ~510 MB savings. The plan's earlier "33% at 1M"
+claim was directionally correct but underestimated.
+
+## Performance claims (v2 honest)
+
+v1 claimed:
+- 2x lookup speedup on cache miss
+- 5-10x faster secondary inserts
+
+Codex round 1 correctly noted these are overstated:
+- The 2x lookup applies ONLY to specific cache-miss secondary
+  lookups (e.g., `find_forward_nat_match`). The bulk of the
+  slow path is dominated by other work.
+- Secondary insert hash/bucket work remains; only the
+  payload (Key→u32 vs Key→Key) shrinks. The wall-clock saving
+  per insert is in the tens of nanoseconds, not microseconds.
+
+**v2 perf claim**: lookup-path latency for `find_forward_nat_match`
+and `find_forward_wire_match_with_origin` improves by ~50ns per
+call (one fewer FxHashMap lookup). At ~65k flow-cache misses/s
+per worker, that's ~3.25ms/s/worker = ~0.3% CPU saved on the
+slow path. Real but small.
+
+**The dominant value is memory** (~41% reduction at 131072
+sessions, ~880 MB saved at 1M).
+
+## Benchmark requirement (v2 — promoted from optional to required)
+
+A microbenchmark in `userspace-dp/benches/` covering:
+- 100 inserts under steady-state churn (insert + remove cycle)
+- Lookup latency for forward-key, reverse-NAT-key, and
+  forward-wire-key paths
+
+Expected: lookup latency reduction ~30-50ns; insert latency
+roughly unchanged or 5-10ns better.
+
+If the benchmark shows a regression on either dimension, the
+implementation is wrong (or the slab crate has unexpected
+overhead and we should switch to `Vec<Option<SessionRecord>> +
+free list`).
 
 ## Issue framing
 
@@ -93,20 +247,27 @@ it as a known follow-up.
 
 ## Step 1 design
 
-### Add `Slab<SessionEntry>`
+### Add `Slab<SessionRecord>` with key inline
 
-Use the [`slab`](https://crates.io/crates/slab) crate (already
-common in async Rust). It provides:
-- O(1) insert / remove / index by handle.
-- Stable handles (u32 won't be reused while in use).
-- Integer handle reuse on remove (no monotonic growth).
+Use the [`slab`](https://crates.io/crates/slab) crate. Per
+Codex blocker #1, the canonical key is reachable from any
+handle by storing it inline in the slab record:
 
 ```rust
 use slab::Slab;
 
+/// Slab-resident record. Holds the canonical key alongside
+/// the SessionEntry so any handle resolves to both. Required
+/// because find_forward_nat_match() etc. must return the
+/// canonical key (used by callers + push_to_wheel).
+pub(crate) struct SessionRecord {
+    pub(crate) key: SessionKey,
+    pub(crate) entry: SessionEntry,
+}
+
 pub(crate) struct SessionTable {
     /// Slab-allocated session storage. Indexed by u32 handle.
-    entries: Slab<SessionEntry>,
+    entries: Slab<SessionRecord>,
     /// Forward-key → handle. Replaces the `sessions` HashMap's
     /// key-to-entry mapping.
     key_to_handle: FxHashMap<SessionKey, u32>,
@@ -116,9 +277,17 @@ pub(crate) struct SessionTable {
     reverse_translated_index: FxHashMap<SessionKey, u32>,
     /// owner_rg_sessions also goes integer-keyed.
     owner_rg_sessions:        FxHashMap<i32, FxHashSet<u32>>,
-    // ... unchanged: deltas, timeouts, wheel, etc.
+    // ── unchanged: deltas, timeouts, wheel (still key-based per
+    // ── Codex blocker #3), counters, last_pop_stats.
 }
 ```
+
+The wheel REMAINS keyed on `SessionKey`. Per Codex blocker #3,
+wheel entries are lazily deleted via `wheel_tick` mismatch and
+outlive method calls. If we used handles, slab handle reuse
+after remove + new install would point a stale wheel entry at
+a DIFFERENT session. SessionKey is the stable identifier
+needed for lazy delete.
 
 ### Lookup path transformation
 
@@ -128,11 +297,18 @@ let forward_key = self.nat_reverse_index.get(reply_key)?;
 let entry = self.sessions.get(forward_key)?;  // 2nd hash lookup
 ```
 
-Step 1 (Key→u32 → slab):
+Step 1 (Key→u32 → slab, fallible per Codex blocker #4):
 ```rust
 let handle = *self.nat_reverse_index.get(reply_key)?;
-let entry = &self.entries[handle as usize];   // 1 array index
+let record = self.entries.get(handle as usize)?;  // graceful None on stale
+let (forward_key, entry) = (&record.key, &record.entry);
 ```
+
+`entries.get(handle as usize)` returns `Option<&SessionRecord>`
+— if the slab slot was reused (which would only happen via
+correct cleanup ordering, but the defense-in-depth is here), it
+returns the new record's key/entry, not panic. The caller
+checks the returned key against the lookup key when needed.
 
 ### Insert path transformation
 
@@ -146,7 +322,15 @@ self.forward_wire_index.insert(forward_wire, forward_key.clone());
 
 Step 1:
 ```rust
-let handle = self.entries.insert(entry) as u32;
+let raw = self.entries.insert(SessionRecord {
+    key: forward_key.clone(),
+    entry,
+});
+// slab returns usize; convert via fallible u32 cast (Codex
+// suggestion). DEFAULT_MAX_SESSIONS = 131072 fits comfortably
+// in u32 — we'd need a 64-bit slab to overflow, which would be
+// an unrelated capacity bug.
+let handle: u32 = raw.try_into().expect("slab handle exceeds u32");
 self.key_to_handle.insert(forward_key.clone(), handle);
 self.nat_reverse_index.insert(reverse_wire, handle);
 self.forward_wire_index.insert(forward_wire, handle);
@@ -166,18 +350,35 @@ self.nat_reverse_index.remove(&reverse);
 // ... etc
 ```
 
-Step 1:
+Step 1 — **eager-cleanup ordering (Codex blocker #2 invariant)**:
 ```rust
 let handle = self.key_to_handle.remove(key)?;
-let entry = self.entries.remove(handle as usize);
+// Step A: clean up ALL eagerly-maintained handle indices
+// BEFORE returning the slab slot to the free list.
 self.nat_reverse_index.remove(&reverse);
-// ... etc
+self.forward_wire_index.remove(&forward_wire);
+self.reverse_translated_index.remove(&translated);
+remove_owner_rg_index_entry(&mut self.owner_rg_sessions,
+    record.entry.metadata.owner_rg_id, &handle);
+// Step B: only AFTER all handle indices are clean, return the
+// slab slot to the free list. Any future insert that reuses
+// this slot starts with a clean index state.
+let record = self.entries.remove(handle as usize);
+// Step C: wheel cleanup — NOT done eagerly. The wheel uses the
+// (key, scheduled_tick) lazy-delete discriminator. A stale
+// wheel entry whose key now refers to a different session (or
+// no session) is dropped during the next pop because
+// wheel_tick won't match (or sessions.get returns None). This
+// is why the wheel stays key-based.
 ```
 
-Slab handle reuse: when a session is removed, the slab marks
-the slot as free; the next insert reuses that slot. Handle
-values can repeat, but never while a holder of the handle is
-alive (slab guarantees this through the free list).
+**Slab handle reuse contract**: when a session is removed, the
+slab marks the slot as free; the next insert reuses that slot.
+The eager-cleanup invariant guarantees that NO handle index
+contains the freed handle by the time it's reused. The wheel is
+the only structure that may retain a stale (handle-reusable
+slot, but the wheel uses Key) entry — and the lazy-delete
+discriminator handles that.
 
 ### Iterator transformation
 
@@ -258,8 +459,13 @@ get the same data — handles are NOT exposed in the public API.
 - Deploy on loss userspace cluster.
 - v4 + v6 smoke against 172.16.80.200 / 2001:559:8585:80::200.
 - Per-class CoS smoke (5201-5206) — refactor PR rule.
-- **Optional**: micro-benchmark of lookup latency before/after
-  to confirm the 2x speedup claim is real.
+- **MANDATORY** (Codex round-1 requirement): microbenchmark in
+  `userspace-dp/benches/session_table.rs` covering insert and
+  lookup latency for forward-key, reverse-NAT-key, and
+  forward-wire-key paths. If the benchmark shows a regression
+  on either dimension, the implementation is wrong (or the
+  slab crate has unexpected overhead and we should switch to
+  `Vec<Option<SessionRecord>> + free list`).
 
 ## Out of scope (explicitly)
 
@@ -270,34 +476,35 @@ get the same data — handles are NOT exposed in the public API.
 - Changing the public API of SessionTable — none of the 33
   methods change signature.
 
-## Open questions for adversarial review
+## Open questions for round-2 adversarial review
 
-1. **Does Step 1 deliver a measurable benefit, or is the perf
-   gain too small to justify the churn?** The session-table is
-   slow-path; flow-cache misses are <5% of packets. Memory win
-   is real (~33% reduction at 1M sessions). Insert/lookup
-   latency wins are real but on a low-fire path.
-2. **Is the slab crate the right primitive, or should we roll
-   our own (a `Vec<Option<SessionEntry>>` + free list)?** Slab
-   has 4 bytes of overhead per slot for the next-free-link.
-3. **What about the `wheel` left Key-based?** Acceptable for
-   Step 1, or does the inconsistency block the refactor?
-4. **HA delta replay**: when the peer replays a delta and
-   inserts into its own SessionTable, does it allocate a NEW
-   handle for the same forward_key? My read is yes (handles are
-   per-node, not portable). Verify.
-5. **Stale-handle hazard**: any callsite that takes a handle
-   from one method and passes it to another method on the same
-   SessionTable? The internal rule says no, but worth grepping
-   to confirm.
-6. **owner_rg_sessions iteration cost**: today returns
-   `Vec<SessionKey>` — already an alloc. With slab, we need a
-   handle→key reverse mapping. Either:
-   - Use `key_to_handle.iter().filter()` — O(N) over all keys.
-   - Add a parallel `handle_to_key: Slab<SessionKey>` — doubles
-     the slab memory.
-   - Store key inside SessionEntry — adds ~50 bytes per entry.
-   
-   What's the right trade-off?
-7. **Should the slab use `Vec<Option<SessionEntry>>` instead of
-   the slab crate** to avoid a new dependency?
+(v1 had 7. Resolved by v2: Q3 wheel-stays-key-based, Q5 stale-
+handle invariant, Q6 owner_rg via SessionRecord-with-key. Q1-Q2-Q4-Q7
+remain plus one new from Codex.)
+
+1. **Does Step 1 deliver a measurable benefit?** v2's honest
+   numbers: ~41% memory reduction at 131072 sessions (~46 MB);
+   ~50ns per cache-miss lookup (~0.3% CPU saved on slow path);
+   secondary insert payload shrinks Key→u32 (tens of ns). Net:
+   memory win is the dominant value; CPU win is small. Is this
+   sufficient justification for the churn?
+2. **Slab crate vs custom Vec+free-list**: slab is ~600 LOC
+   well-tested. Custom would be ~80 LOC review-able-here. Adds
+   a transitive dep. Which is right?
+3. **HA delta replay**: peer's `upsert_synced_with_origin`
+   allocates a NEW local handle for the synced session.
+   Confirmed in pkg/cluster/ — sync wire format is key/value,
+   no handle assumption. (Verified by Codex round 1.)
+4. **Eager-cleanup invariant verifiability**: every code path
+   that removes from `key_to_handle` must also remove from the
+   3 secondary indices and `owner_rg_sessions` BEFORE returning
+   the slab slot. Currently 8 callsites do session removal
+   (search `entries.remove`, `key_to_handle.remove`, etc.). Is
+   the invariant testable via a debug assertion that the
+   secondary indices have no entries pointing to the freed
+   handle?
+5. **Benchmark precondition**: the mandatory microbench will
+   measure under steady-state churn. Are there stress patterns
+   (high-churn install/remove cycles, or RG demote/promote)
+   that would expose slab fragmentation or free-list latency
+   that the simple bench misses?
