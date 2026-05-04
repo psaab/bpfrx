@@ -1,6 +1,260 @@
 # #964 SessionTable Multi-Index — Slab + Integer Handles (Step 1)
 
-Status: **DRAFT v2 — addressing Codex round-1 PLAN-NEEDS-MAJOR**
+Status: **DRAFT v3 — addressing Codex round-2 PLAN-NEEDS-MAJOR**
+
+## v3 changes (Codex round-2 + Gemini round-2)
+
+Codex round 2: **PLAN-NEEDS-MAJOR** (task-moqglgfa-f7hhhk).
+Gemini round 2: **PLAN-NEEDS-MINOR** (task-moqglxsn-btf5rm).
+
+12 findings from Codex round 2 + 2 from Gemini, all addressed:
+
+### 1. lookup_with_origin's clone-key/drop-borrow sequencing (Codex Q1)
+
+`lookup_with_origin` deliberately scopes the entry borrow before
+calling `push_to_wheel` because holding the borrow across wheel
+mutation doesn't compile (session/mod.rs:423-468). v3 spells
+this out:
+
+```rust
+pub fn lookup_with_origin(&mut self, key: &SessionKey, now_ns: u64) -> Option<SessionLookup> {
+    // Resolve handle from key (with alias chase via reverse_translated_index).
+    let handle = match self.key_to_handle.get(key) {
+        Some(h) => *h,
+        None => *self.reverse_translated_index.get(key)?,
+    };
+    // Defense vs handle-reuse: the resolved record's canonical key
+    // must equal the lookup key (or its alias resolution).
+    let record = self.entries.get(handle as usize)?;
+    if !key_matches_record(key, &record.key) {
+        // Stale secondary index → graceful None (mirrors today's
+        // sessions.get(forward_key) → None behavior).
+        return None;
+    }
+    // Capture the canonical key + lookup result, dropping the borrow.
+    let canonical_key = record.key.clone();
+    let lookup = SessionLookup { decision: record.entry.decision,
+        metadata: record.entry.metadata.clone() };
+    // Drop borrow, then push_to_wheel can take &mut self.
+    drop(record);
+    self.push_to_wheel(&canonical_key, now_ns);
+    Some(lookup)
+}
+```
+
+### 2. entries.get() is NOT stale-safe under handle reuse (Codex Q1)
+
+v2 said "entries.get() returns the new record's key/entry on
+stale handle" — that's true but UNSAFE because the new record
+is a different session. v3 adds explicit key validation
+(`key_matches_record`) in every lookup path that goes through
+a secondary index. The validation defends against:
+
+- A stale secondary index pointing at a freed-then-reused
+  handle.
+- A bug in the eager-cleanup invariant.
+
+```rust
+#[inline]
+fn key_matches_record(lookup_key: &SessionKey, record_key: &SessionKey) -> bool {
+    lookup_key == record_key
+}
+```
+
+### 3. Delete pseudocode order-of-ops bug (Codex Q1)
+
+v2 referenced `record.entry.metadata.owner_rg_id` before
+`record` was created. v3 fixes the order:
+
+```rust
+fn remove_entry(&mut self, key: &SessionKey) -> Option<SessionEntry> {
+    let handle = self.key_to_handle.remove(key)?;
+    // 1. Read the record (still in slab) to learn what to clean.
+    let record = self.entries.get(handle as usize)
+        .expect("handle in key_to_handle must be valid");
+    let owner_rg_id = record.entry.metadata.owner_rg_id;
+    let reverse_wire = compute_reverse_wire(&record);
+    let forward_wire = compute_forward_wire(&record);
+    let translated = compute_translated(&record);
+    // 2. Clean ALL handle-valued indices BEFORE returning the slot.
+    //    Each removal is VALUE-GUARDED — only remove if the stored
+    //    handle still matches our handle (Codex Q2: matches today's
+    //    canonical-key-guarded behavior).
+    if let Some(stored) = self.nat_reverse_index.get(&reverse_wire) {
+        if *stored == handle {
+            self.nat_reverse_index.remove(&reverse_wire);
+        }
+    }
+    if let Some(stored) = self.forward_wire_index.get(&forward_wire) {
+        if *stored == handle {
+            self.forward_wire_index.remove(&forward_wire);
+        }
+    }
+    if let Some(stored) = self.reverse_translated_index.get(&translated) {
+        if *stored == handle {
+            self.reverse_translated_index.remove(&translated);
+        }
+    }
+    if let Some(set) = self.owner_rg_sessions.get_mut(&owner_rg_id) {
+        set.remove(&handle);
+    }
+    // 3. Mandatory debug assertion: NO handle-valued index still
+    //    points at this handle.
+    debug_assert!(self.no_index_points_at(handle),
+        "remove_entry leaked handle {} in a secondary index", handle);
+    // 4. Only AFTER all indices are clean, return slot to slab.
+    let record = self.entries.remove(handle as usize);
+    Some(record.entry)
+}
+```
+
+### 4. Eager-cleanup centralization (Codex Q2)
+
+v2's "every code path / 8 callsites" framing INVITES scattered
+cleanup. v3 enforces: **all session removal goes through a
+single `remove_entry` helper** (matches today's
+session/mod.rs:926-930 shape). External callers (delete,
+expire_stale_entries, demote_owner_rg) call `remove_entry`,
+not the slab directly.
+
+### 5. Value-guarded secondary index removal (Codex Q2)
+
+v2's unconditional `remove(&reverse)` could delete another
+session's index entry on key collision (today's code guards
+against this at session/mod.rs:979-999). v3's remove_entry
+shows the value-guarded form: only remove if stored handle
+matches our handle.
+
+### 6. Mandatory debug assertion (Codex Q2)
+
+v3 makes the "no leaked handle" check mandatory:
+
+```rust
+#[cfg(debug_assertions)]
+fn no_index_points_at(&self, handle: u32) -> bool {
+    !self.nat_reverse_index.values().any(|h| *h == handle)
+        && !self.forward_wire_index.values().any(|h| *h == handle)
+        && !self.reverse_translated_index.values().any(|h| *h == handle)
+        && !self.owner_rg_sessions.values()
+            .any(|set| set.contains(&handle))
+}
+```
+
+In release mode this is a no-op. In debug mode it's O(N) per
+removal — acceptable for tests.
+
+### 7. Memory math recomputed with actual hashbrown semantics (Codex Q3)
+
+v2 used 1.5× as the FxHashMap overhead heuristic. Codex
+correctly noted hashbrown's actual semantics:
+- 7/8 max load (87.5%, NOT 75%)
+- Power-of-two bucket count via `next_power_of_two`
+- At exactly 131072 entries: 131072 buckets only fit 114688 at
+  7/8 load, so the table grows to **262144 buckets**
+- Stores `RawTable<(K, V)>` — tuple padding matters
+
+Recomputed totals at 131072 sessions:
+
+| Map | Tuple padded | × 262144 buckets | + 1 ctrl byte | Total |
+|-----|--------------|------------------|----------------|-------|
+| sessions: Key→Entry | (50+80→136) | 35.6 MB | + 0.25 MB | ~36 MB |
+| 3 × Key→Key | (50+50→104) | × 3 = 81.9 MB | | ~82 MB |
+| owner_rg → FxHashSet<Key>, ~10 RGs × 100K | per-RG ~6.4 MB × 10 | | | ~64 MB |
+| **Current total** | | | | **~182 MB** |
+
+After v3 (slab + SessionRecord + Key→u32 indices):
+
+| Map | Tuple padded | × 262144 buckets | + 1 ctrl byte | Total |
+|-----|--------------|------------------|----------------|-------|
+| entries: Slab<SessionRecord{Key,Entry}> | 50+80+8 (slab tag) | × 131072 slots | | ~18 MB |
+| key_to_handle: Key→u32 | (50+4→56) | 14.7 MB | + 0.25 MB | ~15 MB |
+| 3 × Key→u32 | (50+4→56) | × 3 = 44 MB | | ~44 MB |
+| owner_rg → FxHashSet<u32>, ~10 RGs × 100K | per-RG ~0.5 MB × 10 | | | ~5 MB |
+| **v3 total** | | | | **~82 MB** |
+
+**Realistic saving: ~100 MB / ~55% reduction at 131072 sessions.**
+
+This is a meaningful improvement over v2's 41% claim. The
+biggest wins are owner_rg_sessions (key→u32) and the secondary
+indices (Key→u32 vs Key→Key cuts payload by 46 bytes).
+
+### 8. FxHashMap vs std::HashMap caveat (Codex Q3)
+
+`FxHashMap` is a `std::collections::HashMap` alias from
+rustc-hash; std HashMap uses hashbrown internally (Rust 1.36+).
+The math is identical to direct hashbrown use.
+
+### 9. Benchmark covers production SessionTable structurally (Codex Q4)
+
+`SessionTable` is `pub(crate)` in a bin crate so the bench
+can't import it directly. v3 follows the established pattern
+(tx_kick_latency.rs): the bench **reimplements the SessionTable
+hot-path shape** in `userspace-dp/benches/session_table.rs`.
+This is a "structural microbenchmark" — measures the same
+data-structure shapes (FxHashMap with same key/value sizes,
+Slab with same record size) but is not the production
+SessionTable. Divergence between bench and production is caught
+by unit tests in `session/tests.rs`.
+
+The bench covers:
+- **Insert** (install_with_protocol shape) under steady-state churn
+- **Lookup** for forward-key, reverse-NAT-key, forward-wire-key
+- **GC** (expire_stale_entries shape) — Codex Q4 finding
+- **owner_rg_session_keys** — Codex Q4 finding (HA export hot path)
+
+`drain_deltas` is NOT in the bench (Codex Q4: it just drains a
+VecDeque, not performance-critical for this refactor; Gemini
+suggested it but Codex's analysis is more accurate).
+
+Slab fragmentation stress test (Gemini round-2 finding) is
+left as an open follow-up — the steady-state churn bench
+exercises insert+remove cycles, but a long-duration
+randomized-lifetime stress test would catch fragmentation more
+robustly. Documented but not in v3's mandatory bench scope.
+
+### 10. Wheel contradiction resolved (Codex Q5)
+
+v2 had contradictory wording about the wheel. v3 says
+unambiguously: **wheel keys on `SessionKey`. NEVER on handle.**
+Reason: lazy-delete needs a stable identifier. The single
+extra hash lookup per wheel pop (key_to_handle.get → entries.get
+vs today's sessions.get) is acceptable.
+
+### 11. Stale-handle invariant — pick one (Codex Q6)
+
+v2 had two contradictory framings ("handles persist in
+internal indices, eagerly cleaned" vs "handles are local to
+single method call"). v3 keeps **only the eagerly-cleaned-
+internal-indices framing** and removes the "local to method
+call" wording entirely.
+
+### 12. owner_rg design — pick one (Codex Q6)
+
+v2 mentioned both SessionRecord-with-key AND a reverse
+handle→key map. v3 keeps **only SessionRecord-with-key**.
+
+### 13. Slab dependency (Codex Q6)
+
+v3 adds `slab = "0.4"` to `userspace-dp/Cargo.toml`'s
+dependency list. The crate is widely used (~22M downloads/year)
+and well-tested.
+
+### 14. Iterator uses entries.get() (Codex Q6)
+
+v3's iter_with_origin uses fallible `entries.get()`:
+
+```rust
+pub fn iter_with_origin(&self) -> impl Iterator<Item = (&SessionKey, ...)> {
+    self.key_to_handle.iter().filter_map(|(key, handle)| {
+        let record = self.entries.get(*handle as usize)?;
+        Some((key, &record.entry, ...))
+    })
+}
+```
+
+`filter_map` over the iterator drops any orphan key→handle
+mapping (which shouldn't exist post-cleanup, but defense-in-
+depth).
 
 ## v2 changes (Codex round-1 + Gemini round-1)
 
