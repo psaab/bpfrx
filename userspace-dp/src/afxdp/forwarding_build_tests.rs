@@ -753,3 +753,116 @@ fn build_cos_state_skips_interface_with_no_cos_config() {
         "interface with scheduler-map but no shaping-rate must still appear (transparent root)"
     );
 }
+
+#[test]
+fn build_cos_state_admits_each_cos_field_in_isolation() {
+    // The skip predicate is an OR over six fields. Pin every arm so a
+    // future refactor can't silently drop one — Codex review on
+    // PR #1183 flagged this as coverage debt (Q5).
+    let cos = ClassOfServiceSnapshot {
+        forwarding_classes: vec![CoSForwardingClassSnapshot {
+            name: "best-effort".into(),
+            queue: 0,
+        }],
+        schedulers: vec![],
+        scheduler_maps: vec![CoSSchedulerMapSnapshot {
+            name: "wan-map".into(),
+            entries: vec![CoSSchedulerMapEntrySnapshot {
+                forwarding_class: "best-effort".into(),
+                scheduler: String::new(),
+            }],
+        }],
+        dscp_classifiers: vec![CoSDSCPClassifierSnapshot {
+            name: "dscp-cls".into(),
+            entries: vec![CoSDSCPClassifierEntrySnapshot {
+                forwarding_class: "best-effort".into(),
+                loss_priority: String::new(),
+                dscp_values: vec![0],
+            }],
+        }],
+        ieee8021_classifiers: vec![CoSIEEE8021ClassifierSnapshot {
+            name: "p8021-cls".into(),
+            entries: vec![CoSIEEE8021ClassifierEntrySnapshot {
+                forwarding_class: "best-effort".into(),
+                loss_priority: String::new(),
+                code_points: vec![0],
+            }],
+        }],
+        dscp_rewrite_rules: vec![CoSDSCPRewriteRuleSnapshot {
+            name: "dscp-rw".into(),
+            entries: vec![CoSDSCPRewriteRuleEntrySnapshot {
+                forwarding_class: "best-effort".into(),
+                loss_priority: String::new(),
+                dscp_value: 0,
+            }],
+        }],
+    };
+    let cases: &[(i32, &str, InterfaceSnapshot)] = &[
+        (
+            201,
+            "shaping-rate only",
+            InterfaceSnapshot {
+                ifindex: 201,
+                cos_shaping_rate_bytes_per_sec: 1_000_000,
+                ..Default::default()
+            },
+        ),
+        (
+            202,
+            "burst-bytes only",
+            InterfaceSnapshot {
+                ifindex: 202,
+                cos_shaping_burst_bytes: 256_000,
+                ..Default::default()
+            },
+        ),
+        (
+            203,
+            "scheduler-map only",
+            InterfaceSnapshot {
+                ifindex: 203,
+                cos_scheduler_map: "wan-map".into(),
+                ..Default::default()
+            },
+        ),
+        (
+            204,
+            "DSCP classifier only",
+            InterfaceSnapshot {
+                ifindex: 204,
+                cos_dscp_classifier: "dscp-cls".into(),
+                ..Default::default()
+            },
+        ),
+        (
+            205,
+            "802.1p classifier only",
+            InterfaceSnapshot {
+                ifindex: 205,
+                cos_ieee8021_classifier: "p8021-cls".into(),
+                ..Default::default()
+            },
+        ),
+        (
+            206,
+            "DSCP rewrite-rule only",
+            InterfaceSnapshot {
+                ifindex: 206,
+                cos_dscp_rewrite_rule: "dscp-rw".into(),
+                ..Default::default()
+            },
+        ),
+    ];
+    for (ifindex, label, iface) in cases {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![iface.clone()],
+            class_of_service: Some(cos.clone()),
+            ..Default::default()
+        };
+        let state = build_cos_state(&snapshot);
+        assert!(
+            state.interfaces.contains_key(ifindex),
+            "{label}: interface must be admitted to CoSState (ifindex {ifindex})"
+        );
+    }
+}

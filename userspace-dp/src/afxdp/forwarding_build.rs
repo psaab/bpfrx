@@ -651,6 +651,7 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
         // (transparent-root token top-up / queue-service wakeup) still
         // apply when at least one CoS knob is set.
         let has_cos_config = iface.cos_shaping_rate_bytes_per_sec > 0
+            || iface.cos_shaping_burst_bytes > 0
             || !iface.cos_scheduler_map.is_empty()
             || !iface.cos_dscp_classifier.is_empty()
             || !iface.cos_ieee8021_classifier.is_empty()
