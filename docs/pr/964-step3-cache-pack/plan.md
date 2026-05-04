@@ -1,6 +1,142 @@
 # #964 Step 3 — Cache-line pack `SessionEntry`
 
-Status: **DRAFT v1 — pending adversarial plan review (Codex + Gemini)**
+Status: **DRAFT v2 — addressing Codex round-1 PLAN-NEEDS-MAJOR
+(6 findings); Gemini round-1 was PLAN-READY but missed the
+codebase audit issues Codex caught.**
+
+## v2 changes (Codex round-1 findings)
+
+### 1. ifindex narrowing DROPPED entirely
+
+Codex caught: i16 max is 32767, NOT 65535 (the plan v1 said
+"i16 max ~65535"). Saturating ifindex is silent forwarding
+corruption. xpf already uses i32 ifindexes throughout
+(forwarding.rs:197) and they feed real TX/egress paths.
+
+**v2 keeps `ifindex: i32`** for all 5 ifindex fields
+(local_ifindex, egress_ifindex, tx_ifindex, fib_ifindex,
+*plus session_glue's ingress/egress_ifindex). The 10 bytes
+v1 claimed to save are gone.
+
+Updated SessionEntry size estimate: ~120 → ~130 bytes
+(still 2 cache lines).
+
+### 2. HA wire-format premise corrected
+
+Codex caught: `SessionDelta` is NOT directly serde-serialized.
+The wire path uses two distinct codecs:
+- **JSON status export** (`session_delta.rs:59`) via
+  `SessionDeltaInfo` — already converts ports/MACs/ifindexes
+  to its own representation.
+- **Event stream binary codec** (`event_stream/codec.rs:59`)
+  — has its own sentinel conventions: NAT ports `0`, MACs
+  zero-filled, ifindexes cast to `i16` (codec.rs:89).
+
+This means the HA wire format ALREADY uses the same sentinel
+conventions v1 proposed for the slab! The packed slab type
+just needs to encode/decode unambiguously to/from these
+existing wire formats, not to/from a fictional direct serde
+roundtrip.
+
+v2 mandatory test additions:
+- `unpacked SessionDecision → packed slab → unpacked → SessionDeltaInfo (JSON)` round-trip.
+- `unpacked SessionDecision → packed slab → unpacked → event_stream codec → unpacked` round-trip.
+- HA sync import (`upsert_synced_with_origin`) round-trip.
+
+### 3. Sentinel port=0 collision: ICMP
+
+Codex caught: ports use 0 legitimately for ICMP tuple shape
+(`frame/inspect.rs:225`). `NatDecision` is protocol-agnostic;
+a `Some(0)` rewrite_*_port for an ICMP session would map to
+None under the v1 sentinel scheme.
+
+v2 strategy: **reject `Some(0)` at PackedNatDecision
+construction**, with an explicit `From<NatDecision>` that
+asserts (debug) and treats `Some(0)` as an error case (in
+release: silently drop the rewrite). NAT pool allocator
+already avoids port 0 for TCP/UDP (`nat.rs:200`); ICMP
+sessions don't have rewrite_*_port set.
+
+Document the invariant: "PackedNatDecision MUST NOT carry a
+zero port as Some(0); NAT slot allocators are responsible for
+allocating non-zero ports for TCP/UDP, and ICMP sessions
+leave rewrite_*_port unset."
+
+### 4. MAC zero sentinel: explicit normalization on import
+
+Codex caught: Rust JSON/session-sync parsing accepts
+`"00:00:00:00:00:00"` as `Some([0;6])` (`helpers.rs:234`).
+
+v2 strategy: **normalize all-zero MAC to None at import**.
+Add explicit normalization in `helpers.rs::deserialize_mac`:
+all-zero bytes → `None`, all other patterns → `Some(...)`.
+This silently drops zero-MAC packets from peer imports, but
+that's already a corrupt input — a real MAC is never
+00:00:00:00:00:00.
+
+### 5. Public API materialization for iterators
+
+Codex caught: `iter_with_origin` passes `&SessionMetadata`
+(by reference). v1 plan said "From conversions preserve all
+30+ callsites" but didn't say HOW for ref-passing iterators.
+
+v2 explicit pattern:
+```rust
+pub fn iter_with_origin(&self, mut f: impl FnMut(&SessionKey,
+    SessionDecision, &SessionMetadata, SessionOrigin)) {
+    for (key, handle) in &self.key_to_handle {
+        if let Some(record) = self.entries.get(*handle as usize) {
+            // Materialize a local unpacked metadata for the
+            // callback — its lifetime is bounded by the loop body.
+            let unpacked_metadata: SessionMetadata =
+                record.entry.metadata.clone().into();
+            let unpacked_decision: SessionDecision =
+                record.entry.decision.into();
+            f(key, unpacked_decision, &unpacked_metadata,
+              record.entry.origin.into());
+        }
+    }
+}
+```
+
+This adds a clone+pack-roundtrip per iteration, but iterators
+are slow-path (status export, HA sync, GC).
+
+### 6. RSS model honest re-estimation
+
+Codex caught: 16 MB savings only show up at full table; HA
+shared maps store unpacked `SyncedSessionEntry`, sometimes
+cloned into multiple indices (`shared_ops.rs:621`).
+
+Honest v2 RSS estimate:
+- **Per-worker SessionTable slab**: N workers × 131072 ×
+  120 bytes saved = N × 15.7 MB.
+- **HA shared maps**: unchanged (stay unpacked).
+- **Default deployment**: 6 workers (per `bpfrxd` config) →
+  ~94 MB total savings AT FULL TABLE on a 6-worker deployment.
+
+If sessions don't fill (typical deployment loads <10K
+concurrent sessions per worker), savings scale down
+proportionally: ~10K × 6 workers × 120 bytes = ~7 MB savings.
+
+**Realistic scale of memory win: 7-94 MB depending on load.**
+This is small compared to xpfd's typical RSS (~500 MB) but
+non-trivial on memory-constrained deployments.
+
+### Net effect of v2 changes
+
+The sum of v2's corrections:
+- Drops ifindex narrowing → loses 10 bytes/entry → packed
+  size goes from 120 → 130 bytes.
+- Adds explicit sentinel rejection in From conversions →
+  ~5ns extra pack/unpack cost.
+- Adds 3 mandatory round-trip tests → catches sentinel bugs
+  pre-merge.
+
+If reviewers conclude the realistic 7-94 MB memory win still
+doesn't justify the churn (touching 30+ callsites + 5ns
+extra pack/unpack on top of the original 10-20ns), **v2
+remains a PLAN-KILL candidate.**
 
 ## Issue framing
 
