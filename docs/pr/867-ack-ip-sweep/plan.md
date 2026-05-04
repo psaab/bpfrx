@@ -460,10 +460,17 @@ build that the conntrack frame stays ≤512 bytes combined.
   count. Existing screen-stage sweep had this same property
   for non-ACK-only packets; the new path extends it to ACK-only.
 - **Per-CPU map ordering**: `ip_sweep_track` is BPF_MAP_TYPE_LRU_HASH,
-  not per-CPU. Concurrent updates from multiple CPUs are racy
-  on `count++`. Existing screen code uses `bpf_map_update_elem`
-  with `BPF_ANY` (last-writer-wins on the entire value). Same
-  hazard exists today; the PR does not introduce a new race.
+  not per-CPU. The hot-path uses `bpf_map_lookup_elem` followed
+  by an in-place `sv->count++` on the value pointer — concurrent
+  CPUs racing on this read-modify-write can lose increments
+  (last-writer-wins on the byte word). `bpf_map_update_elem`
+  with `BPF_ANY` is only used on the insert/miss path
+  (first packet from a given source). The hazard is not a
+  whole-value last-writer-wins; it is per-word lost updates on
+  the increment. Same hazard exists today in
+  `xdp_screen.c:945-956`; the PR does not introduce a new race
+  (Copilot code review fix: §6 wording corrected to match the
+  actual update pattern).
 
 ## 7. Risk assessment
 
@@ -560,7 +567,12 @@ build that the conntrack frame stays ≤512 bytes combined.
 - Manual security test on standalone VM: configure
   `screen ids-option scan-screen ip-sweep threshold 5`, send an
   ACK scan (`hping3 -A -p 80 -c 10 <victim-range>`), confirm
-  drop after the 5th probe.
+  drop on the (threshold+1)th probe — i.e., the 6th probe is
+  the first one dropped (`sv->count > sc->ip_sweep_thresh`
+  semantics; the first 5 probes pass and the 6th trips
+  `screen_drop()`). Matches the existing userspace screen-stage
+  test convention. (Copilot code review fix: wording corrected
+  to match implemented threshold semantics.)
 
 ## 9. Out of scope (explicitly)
 

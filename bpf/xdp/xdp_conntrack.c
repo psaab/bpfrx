@@ -770,6 +770,20 @@ ip_sweep_track_ack_evasion(struct pkt_meta *meta)
 	if (!(meta->meta_flags & META_FLAG_SCREEN_SKIPPED))
 		return 0;
 
+	/* Defense-in-depth (Codex round-1 code review NEEDS-MINOR):
+	 * the only setter of META_FLAG_SCREEN_SKIPPED is the ACK-only
+	 * predicate in resolve_ingress_xdp_target(); a future caller
+	 * that sets the bit on a different shape would silently
+	 * misroute non-ACK packets through the sweep counter.  Cheap
+	 * re-check (predictable not-taken on production traffic). */
+	if (meta->protocol != PROTO_TCP || meta->is_fragment)
+		return 0;
+	__u8 tf = meta->tcp_flags;
+	if (!(tf & 0x10 /* ACK */) ||
+	    (tf & (0x02 /* SYN */ | 0x01 /* FIN */ |
+		   0x04 /* RST */ | 0x20 /* URG */)))
+		return 0;
+
 	__u32 zone = meta->ingress_zone;
 	struct zone_config *zc = bpf_map_lookup_elem(&zone_configs, &zone);
 	if (!zc)
