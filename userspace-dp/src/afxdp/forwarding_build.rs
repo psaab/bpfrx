@@ -640,12 +640,22 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
     for iface in &snapshot.interfaces {
         // #916: zero `cos_shaping_rate_bytes_per_sec` is a valid Junos
         // configuration meaning "no interface-level shaping cap"
-        // (transparent root). The runtime build path handles this
-        // case (see `maybe_top_up_cos_root_lease` /
-        // `estimate_cos_queue_wakeup_tick` rate-zero fast paths).
-        // Previously this condition skipped the entire interface,
-        // causing CoS classifier to silently not apply.
-        if iface.ifindex <= 0 {
+        // (transparent root) — but only when the interface actually
+        // participates in CoS (scheduler-map / classifier / rewrite-rule).
+        // Interfaces with no CoS configuration at all (e.g. a plain
+        // forwarding-only LAN egress) must NOT get a CoSState entry,
+        // because that would funnel every TX through the per-interface
+        // owner worker via cross-binding redirect — collapsing 6-worker
+        // parallelism to one CPU and capping reverse throughput at
+        // ~2 Gbps instead of ~22 Gbps. f0e364d7's runtime fast paths
+        // (transparent-root token top-up / queue-service wakeup) still
+        // apply when at least one CoS knob is set.
+        let has_cos_config = iface.cos_shaping_rate_bytes_per_sec > 0
+            || !iface.cos_scheduler_map.is_empty()
+            || !iface.cos_dscp_classifier.is_empty()
+            || !iface.cos_ieee8021_classifier.is_empty()
+            || !iface.cos_dscp_rewrite_rule.is_empty();
+        if iface.ifindex <= 0 || !has_cos_config {
             continue;
         }
         let burst_bytes = if iface.cos_shaping_burst_bytes > 0 {

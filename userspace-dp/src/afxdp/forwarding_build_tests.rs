@@ -694,3 +694,62 @@ fn build_cos_state_mixed_zero_and_nonzero_shaping_rate() {
     assert!(!shaped.queues.is_empty());
     assert!(!transparent.queues.is_empty());
 }
+
+#[test]
+fn build_cos_state_skips_interface_with_no_cos_config() {
+    // An interface that is NOT participating in CoS (no scheduler-map,
+    // no classifier, no rewrite-rule, no shaping-rate) must NOT receive
+    // a CoSState entry — otherwise the per-interface owner-worker
+    // dispatch funnels every TX into one worker, collapsing throughput
+    // (regression hunted in iperf3 -P 12 -R: 22 Gbps → 2 Gbps until
+    // this gate was reinstated).
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            // Forwarding-only LAN egress with no CoS at all.
+            InterfaceSnapshot {
+                ifindex: 100,
+                cos_shaping_rate_bytes_per_sec: 0,
+                cos_shaping_burst_bytes: 0,
+                cos_scheduler_map: String::new(),
+                cos_dscp_classifier: String::new(),
+                cos_ieee8021_classifier: String::new(),
+                cos_dscp_rewrite_rule: String::new(),
+                ..Default::default()
+            },
+            // Sibling that DOES participate in CoS — must still appear.
+            InterfaceSnapshot {
+                ifindex: 101,
+                cos_shaping_rate_bytes_per_sec: 0,
+                cos_scheduler_map: "wan-map".into(),
+                ..Default::default()
+            },
+        ],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            }],
+            schedulers: vec![],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    scheduler: String::new(),
+                }],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+    let state = build_cos_state(&snapshot);
+    assert!(
+        !state.interfaces.contains_key(&100),
+        "interface with no CoS config must NOT be added to CoSState"
+    );
+    assert!(
+        state.interfaces.contains_key(&101),
+        "interface with scheduler-map but no shaping-rate must still appear (transparent root)"
+    );
+}
