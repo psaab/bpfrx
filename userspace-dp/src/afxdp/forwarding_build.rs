@@ -638,18 +638,30 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
 
     let mut state = CoSState::default();
     for iface in &snapshot.interfaces {
-        // #916: zero `cos_shaping_rate_bytes_per_sec` is a valid Junos
-        // configuration meaning "no interface-level shaping cap"
-        // (transparent root) — but only when the interface actually
-        // participates in CoS (scheduler-map / classifier / rewrite-rule).
-        // Interfaces with no CoS configuration at all (e.g. a plain
-        // forwarding-only LAN egress) must NOT get a CoSState entry,
-        // because that would funnel every TX through the per-interface
-        // owner worker via cross-binding redirect — collapsing 6-worker
-        // parallelism to one CPU and capping reverse throughput at
-        // ~2 Gbps instead of ~22 Gbps. f0e364d7's runtime fast paths
-        // (transparent-root token top-up / queue-service wakeup) still
-        // apply when at least one CoS knob is set.
+        // Skip interfaces that do not participate in CoS at all.
+        //
+        // An interface participates in CoS when ANY of these knobs is set:
+        //   - `cos_shaping_rate_bytes_per_sec` (interface shaping cap)
+        //   - `cos_shaping_burst_bytes`        (shaping burst override)
+        //   - `cos_scheduler_map`              (per-class scheduling)
+        //   - `cos_dscp_classifier`            (DSCP → forwarding-class)
+        //   - `cos_ieee8021_classifier`        (802.1p → forwarding-class)
+        //   - `cos_dscp_rewrite_rule`          (egress DSCP rewrite)
+        //
+        // f0e364d7 (#916) removed the prior `shaping_rate == 0` skip so
+        // that zero-shaping-rate-with-classes interfaces would get a
+        // transparent-root CoS runtime instead of being silently dropped.
+        // That side-effect added every forwarding-only interface (no CoS
+        // knobs at all) to CoSState too — and a CoSState entry triggers
+        // the cross-binding redirect that funnels every TX through the
+        // per-interface owner worker, collapsing 6-worker parallelism
+        // to one CPU and capping reverse throughput at ~2 Gbps instead
+        // of ~22 Gbps on this lab.
+        //
+        // The transparent-root runtime fast paths
+        // (`maybe_top_up_cos_root_lease` / `estimate_cos_queue_wakeup_tick`
+        // rate-zero handling) still apply when at least one CoS knob is
+        // set; only the no-CoS-at-all case is skipped here.
         let has_cos_config = iface.cos_shaping_rate_bytes_per_sec > 0
             || iface.cos_shaping_burst_bytes > 0
             || !iface.cos_scheduler_map.is_empty()
