@@ -476,13 +476,30 @@ build that the conntrack frame stays ≤512 bytes combined.
 
 ## 8. Test plan
 
-- `make generate` (regenerate Go BPF bindings).
-- `cargo build --release` clean.
-- `cargo test --release`: 962+ pass, plus the following new
-  tests covering the false-positive corners flagged by Codex
-  round-1 and the IPv6 path flagged by Gemini Pro 3 round-1.
-  Each test runs against the BPF eBPF program loader (no
-  userspace-dp involvement; userspace doesn't have the bug):
+> **Step-5 implementation note (post v5 PLAN-READY):** the test
+> infrastructure originally described below assumed a Go-side
+> `BPF_PROG_TEST_RUN` harness that the project does not in fact
+> have (no `prog.Run()`, `BpfTestRun`, or `ebpf.NewProgram`
+> integration test in `pkg/`). Building that harness is its own
+> tooling investment outside the scope of #867. Per the
+> "stop and revise the plan when implementation reveals a
+> deviation" rule (`.claude/skills/triple-review/SKILL.md`
+> Step 5), §8 is updated to defer the eleven targeted unit
+> tests to a manual on-cluster reproducer (`hping3 -A`) and
+> the existing hostile code-review pipeline (Codex, Gemini
+> Pro 3, Copilot) on the helper logic itself. The compile-time
+> BPF verifier is the strongest static gate available without
+> the missing harness; cargo + Go test suites guarantee no
+> regression in adjacent code; smoke matrix proves no
+> throughput cost. The test catalogue below is retained as the
+> shape a future BPF-prog-test-run harness should target.
+
+- `make generate` (regenerate Go BPF bindings) — **passed clean,
+  BPF verifier accepts the new helper at `__noinline` budget.**
+- `cargo build` clean — **passed.**
+- `cargo test --release`: 962+ pass — **passed.** No new tests
+  added; harness for BPF-program-level tests is not present in
+  the repo. The intended catalogue (retained for traceability):
 
   Positive admission (drops correctly):
   - `ip_sweep_ack_evasion_detected_v4` — ACK probes from one
