@@ -640,49 +640,57 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
     for iface in &snapshot.interfaces {
         // Skip interfaces that do not participate in CoS at all.
         //
-        // An interface participates in CoS when ANY of these knobs is set:
-        //   - `cos_shaping_rate_bytes_per_sec` (interface shaping cap)
-        //   - `cos_scheduler_map`              (per-class scheduling)
-        //   - `cos_dscp_classifier`            (DSCP → forwarding-class)
-        //   - `cos_ieee8021_classifier`        (802.1p → forwarding-class)
-        //   - `cos_dscp_rewrite_rule`          (egress DSCP rewrite)
-        //
-        // `cos_shaping_burst_bytes` is intentionally NOT a standalone arm.
-        // The Go compiler does in fact allow a committed config to carry
-        // burst-only without rate (`pkg/config/compiler_class_of_service.go`
-        // accepts `BurstSizeBytes > 0` independently of `ShapingRateBytes`),
-        // but a burst value without ANY of {rate, scheduler-map, classifier,
-        // rewrite-rule} has no CoS behavior to apply: nothing classifies
-        // packets into queues, nothing schedules between queues, and the
-        // root rate is unlimited. Admitting such an interface to CoSState
-        // therefore produces no shaping, classification, or rewrite — only
-        // the cross-binding owner-worker redirect, i.e. the regression this
-        // gate exists to prevent.
-        //
-        // Pre-f0e364d7 baseline already skipped this case (the old
-        // `shaping_rate == 0` skip caught burst-only too); we restore that
-        // behavior for the no-real-CoS-effect case while preserving
-        // f0e364d7's deadlock fix when at least one CoS knob is set.
-        //
         // f0e364d7 (#916) removed the prior `shaping_rate == 0` skip so
         // that zero-shaping-rate-with-classes interfaces would get a
         // transparent-root CoS runtime instead of being silently dropped.
-        // That side-effect added every forwarding-only interface (no CoS
-        // knobs at all) to CoSState too — and a CoSState entry triggers
-        // the cross-binding redirect that funnels every TX through the
-        // per-interface owner worker, collapsing 6-worker parallelism
-        // to one CPU and capping reverse throughput at ~2 Gbps instead
-        // of ~22 Gbps on this lab.
+        // That side-effect added every forwarding-only interface to
+        // CoSState too — and a CoSState entry triggers the cross-binding
+        // redirect that funnels every TX through the per-interface owner
+        // worker, collapsing 6-worker parallelism to one CPU and capping
+        // reverse throughput at ~2 Gbps instead of ~22 Gbps on the loss
+        // userspace cluster.
         //
-        // The transparent-root runtime fast paths
-        // (`maybe_top_up_cos_root_lease` / `estimate_cos_queue_wakeup_tick`
-        // rate-zero handling) still apply when at least one CoS knob is
-        // set; only the no-CoS-at-all case is skipped here.
+        // An interface participates in CoS when ANY of these is set AND
+        // (for named references) actually resolves to something the
+        // builder can use:
+        //   - `cos_shaping_rate_bytes_per_sec > 0`     — interface shaping cap
+        //   - named scheduler-map present in config    — per-class scheduling
+        //   - named DSCP classifier present in config  — DSCP → fwd-class
+        //   - named 802.1p classifier present in config — 802.1p → fwd-class
+        //   - named DSCP rewrite-rule present in config — egress DSCP rewrite
+        //
+        // The resolution check is what distinguishes this from a plain
+        // is-non-empty test: a typo'd scheduler-map name ("wan-mapp" vs
+        // "wan-map") would otherwise pass an is-empty gate while resolving
+        // to no usable queues downstream, which would put the interface in
+        // CoSState with only the default best-effort queue — re-triggering
+        // the owner-worker redirect collapse for an interface that has no
+        // effective CoS policy.
+        //
+        // `cos_shaping_burst_bytes` is intentionally NOT a standalone arm.
+        // The Go compiler does allow a committed config to carry
+        // `BurstSizeBytes > 0` independently of `ShapingRateBytes`
+        // (`pkg/config/compiler_class_of_service.go:285-312`). If admitted,
+        // a burst-only config WOULD carry an observable buffer-cap
+        // admission effect (`afxdp/cos/admission.rs` enforces
+        // `buffer_bytes` as a per-queue admission limit). But pre-f0e364d7
+        // also dropped this case (the rate-zero skip caught it), so this
+        // behavior was never observable in production prior to f0e364d7,
+        // and admitting a burst-only interface inevitably installs the
+        // cross-binding owner-worker redirect that the burst-cap
+        // observation alone cannot justify. We choose pre-f0e364d7-baseline
+        // semantics here: burst-only without any other CoS knob is
+        // skipped. f0e364d7's transparent-root runtime fast paths still
+        // apply when at least one resolvable CoS knob is set.
         let has_cos_config = iface.cos_shaping_rate_bytes_per_sec > 0
-            || !iface.cos_scheduler_map.is_empty()
-            || !iface.cos_dscp_classifier.is_empty()
-            || !iface.cos_ieee8021_classifier.is_empty()
-            || !iface.cos_dscp_rewrite_rule.is_empty();
+            || (!iface.cos_scheduler_map.is_empty()
+                && scheduler_maps.contains_key(&iface.cos_scheduler_map))
+            || (!iface.cos_dscp_classifier.is_empty()
+                && dscp_classifiers.contains_key(&iface.cos_dscp_classifier))
+            || (!iface.cos_ieee8021_classifier.is_empty()
+                && ieee8021_classifiers.contains_key(&iface.cos_ieee8021_classifier))
+            || (!iface.cos_dscp_rewrite_rule.is_empty()
+                && dscp_rewrite_rules.contains_key(&iface.cos_dscp_rewrite_rule));
         if iface.ifindex <= 0 || !has_cos_config {
             continue;
         }

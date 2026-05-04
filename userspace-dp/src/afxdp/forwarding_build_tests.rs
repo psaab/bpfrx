@@ -865,13 +865,15 @@ fn build_cos_state_admits_each_cos_field_in_isolation() {
 
 #[test]
 fn build_cos_state_skips_interface_with_burst_only_no_other_cos_knobs() {
-    // Junos grammar parses `burst-size` only as a sub-knob of
-    // `shaping-rate`, so an interface can never carry a burst-bytes
-    // value without also carrying a non-zero shaping-rate. A pathological
-    // snapshot with burst-only must NOT be admitted to CoSState — there
-    // is no real CoS behavior to apply, and admitting would reintroduce
-    // the cross-binding owner-worker redirect that PR #1183 eliminates.
-    // (Copilot review on PR #1183 caught the prior over-broad predicate.)
+    // The Go compiler permits a committed config to carry
+    // `BurstSizeBytes > 0` independently of `ShapingRateBytes`
+    // (`pkg/config/compiler_class_of_service.go:285-312`), so this
+    // snapshot shape IS reachable from real config. We deliberately
+    // skip it anyway: pre-f0e364d7 also skipped burst-only (the old
+    // `shaping_rate == 0` skip caught it), and admitting it would
+    // install the cross-binding owner-worker redirect that PR #1183
+    // exists to remove. The buffer-cap admission effect that admission
+    // would unlock has never been observable in production.
     let snapshot = ConfigSnapshot {
         interfaces: vec![InterfaceSnapshot {
             ifindex: 250,
@@ -891,4 +893,105 @@ fn build_cos_state_skips_interface_with_burst_only_no_other_cos_knobs() {
         !state.interfaces.contains_key(&250),
         "interface with burst-only (no rate, no classes, no rewrite) must NOT be in CoSState"
     );
+}
+
+#[test]
+fn build_cos_state_skips_interface_with_unresolvable_named_references() {
+    // A typo'd scheduler-map / classifier / rewrite-rule name is
+    // non-empty but does not resolve to any entry in the CoS config.
+    // Pre-fix, an is-non-empty gate would admit such an interface and
+    // build only a default best-effort queue with rate=0, re-triggering
+    // the owner-worker redirect collapse for an interface with no
+    // effective CoS policy. The predicate must require named references
+    // to actually resolve.
+    let cos = ClassOfServiceSnapshot {
+        forwarding_classes: vec![CoSForwardingClassSnapshot {
+            name: "best-effort".into(),
+            queue: 0,
+        }],
+        schedulers: vec![],
+        scheduler_maps: vec![CoSSchedulerMapSnapshot {
+            name: "wan-map".into(),
+            entries: vec![CoSSchedulerMapEntrySnapshot {
+                forwarding_class: "best-effort".into(),
+                scheduler: String::new(),
+            }],
+        }],
+        dscp_classifiers: vec![CoSDSCPClassifierSnapshot {
+            name: "dscp-cls".into(),
+            entries: vec![CoSDSCPClassifierEntrySnapshot {
+                forwarding_class: "best-effort".into(),
+                loss_priority: String::new(),
+                dscp_values: vec![0],
+            }],
+        }],
+        ieee8021_classifiers: vec![CoSIEEE8021ClassifierSnapshot {
+            name: "p8021-cls".into(),
+            entries: vec![CoSIEEE8021ClassifierEntrySnapshot {
+                forwarding_class: "best-effort".into(),
+                loss_priority: String::new(),
+                code_points: vec![0],
+            }],
+        }],
+        dscp_rewrite_rules: vec![CoSDSCPRewriteRuleSnapshot {
+            name: "dscp-rw".into(),
+            entries: vec![CoSDSCPRewriteRuleEntrySnapshot {
+                forwarding_class: "best-effort".into(),
+                loss_priority: String::new(),
+                dscp_value: 0,
+            }],
+        }],
+    };
+    // Each typo'd reference (one CoS field non-empty but unresolvable)
+    // must NOT admit the interface to CoSState.
+    let cases: &[(i32, &str, InterfaceSnapshot)] = &[
+        (
+            301,
+            "typo'd scheduler-map",
+            InterfaceSnapshot {
+                ifindex: 301,
+                cos_scheduler_map: "wan-mapp".into(),
+                ..Default::default()
+            },
+        ),
+        (
+            302,
+            "typo'd DSCP classifier",
+            InterfaceSnapshot {
+                ifindex: 302,
+                cos_dscp_classifier: "dscp-cls-typo".into(),
+                ..Default::default()
+            },
+        ),
+        (
+            303,
+            "typo'd 802.1p classifier",
+            InterfaceSnapshot {
+                ifindex: 303,
+                cos_ieee8021_classifier: "p8021-cls-typo".into(),
+                ..Default::default()
+            },
+        ),
+        (
+            304,
+            "typo'd DSCP rewrite-rule",
+            InterfaceSnapshot {
+                ifindex: 304,
+                cos_dscp_rewrite_rule: "dscp-rw-typo".into(),
+                ..Default::default()
+            },
+        ),
+    ];
+    for (ifindex, label, iface) in cases {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![iface.clone()],
+            class_of_service: Some(cos.clone()),
+            ..Default::default()
+        };
+        let state = build_cos_state(&snapshot);
+        assert!(
+            !state.interfaces.contains_key(ifindex),
+            "{label}: unresolvable name must NOT admit interface to CoSState (ifindex {ifindex})"
+        );
+    }
 }
