@@ -44,9 +44,9 @@ Suggested alert:
     description: |
       Bindings owned by this worker are no longer forwarding.
       Restart xpfd to recover. Investigation:
-        cli show userspace-dp status
-      and look for `panic_message` on the corresponding worker
-      runtime entry.
+        cli show chassis cluster data-plane statistics
+      and look for the worker line marked
+      `DEAD - panicked: <message>`.
 ```
 
 The alert latency is bounded by `scrape_interval +
@@ -73,12 +73,18 @@ A dead worker prints as:
 ```
 
 For machine-readable output (e.g. piping to jq), the same data is
-on the userspace-dp control socket:
+on the userspace-dp control socket. The control protocol decodes
+the request as a JSON `ControlRequest` (see
+`userspace-dp/src/protocol.rs::ControlRequest`); the field name
+is `type`:
 
 ```
 incus exec loss:xpf-userspace-fw0 -- bash -lc \
-  "echo status | socat - UNIX-CONNECT:/run/xpf/userspace-dp.sock | jq '.worker_runtime[] | select(.dead)'"
+  'echo "{\"type\":\"status\"}" | socat - UNIX-CONNECT:/run/xpf/userspace-dp.sock | jq ".worker_runtime[] | select(.dead)"'
 ```
+
+(See `test/incus/step1-capture.sh` for additional examples of the
+same control-socket request shape.)
 
 Both paths return the worker entry with `dead: true` and the
 `panic_message` payload that the supervisor captured.

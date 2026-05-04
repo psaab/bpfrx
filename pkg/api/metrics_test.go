@@ -134,22 +134,25 @@ func newCollectorWithWorkerDescsOnly() *xpfCollector {
 	}
 }
 
-// collectFromEmitWorkerRuntime drives emitWorkerRuntime into a buffered
-// channel and returns the captured metrics. Buffer is sized for
-// 8 metrics per worker so the producer never blocks.
+// collectFromEmitWorkerRuntime drives emitWorkerRuntime into an
+// unbuffered channel from a goroutine, then drains. Running the
+// producer in a goroutine (rather than synchronously into a fixed-size
+// buffer) means a future engineer adding a 9th per-worker metric
+// can't deadlock this helper — the test would still complete
+// correctly, just with more metrics in the returned slice.
+// (Gemini Pro 3 round-2 review of #1186 caught the previous
+// hardcoded `*8` buffer as a latent deadlock trap.)
 func collectFromEmitWorkerRuntime(
 	t *testing.T,
 	c *xpfCollector,
 	status dpuserspace.ProcessStatus,
 ) []prometheus.Metric {
 	t.Helper()
-	bufCap := len(status.WorkerRuntime) * 8
-	if bufCap < 1 {
-		bufCap = 1
-	}
-	ch := make(chan prometheus.Metric, bufCap)
-	c.emitWorkerRuntime(ch, status)
-	close(ch)
+	ch := make(chan prometheus.Metric)
+	go func() {
+		c.emitWorkerRuntime(ch, status)
+		close(ch)
+	}()
 	var got []prometheus.Metric
 	for m := range ch {
 		got = append(got, m)
