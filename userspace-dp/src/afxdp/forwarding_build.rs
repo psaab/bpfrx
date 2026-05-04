@@ -730,24 +730,62 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
             }
         }
         let scheduler_map_resolved_to_queues = !queues.is_empty();
-        let dscp_classifier_has_mappings = dscp_classifiers
+
+        // Determine the set of (queue_id, forwarding_class) pairs that this
+        // interface will actually materialize at runtime. If the
+        // scheduler-map resolved, those are the configured queues. If not,
+        // the synthetic default best-effort queue (queue_id=0,
+        // class="best-effort") is added later — but ONLY if we admit the
+        // interface, so we model it here for the gate's purposes.
+        let (iface_queue_ids, iface_classes): (Vec<u8>, Vec<&str>) =
+            if scheduler_map_resolved_to_queues {
+                (
+                    queues.iter().map(|q| q.queue_id).collect(),
+                    queues.iter().map(|q| q.forwarding_class.as_str()).collect(),
+                )
+            } else {
+                (vec![0], vec!["best-effort"])
+            };
+
+        // A classifier arm contributes only if it maps at least one
+        // DSCP/802.1p code-point to a queue_id the interface actually
+        // materializes. A classifier mapping to queue 5 on an interface
+        // that only has queue 0 admits the interface for nothing —
+        // packets land in `resolve_cos_queue_idx` and get dropped, the
+        // owner-worker redirect engages, and no observable classification
+        // happens. Same logic for the rewrite-rule: it contributes only
+        // if it has an entry for a forwarding-class the interface
+        // materializes.
+        let dscp_classifier_targets_iface_queue = dscp_classifiers
             .get(&iface.cos_dscp_classifier)
-            .map(|c| !c.queue_by_dscp.is_empty())
+            .map(|c| {
+                c.queue_by_dscp
+                    .values()
+                    .any(|q| iface_queue_ids.contains(q))
+            })
             .unwrap_or(false);
-        let ieee8021_classifier_has_mappings = ieee8021_classifiers
+        let ieee8021_classifier_targets_iface_queue = ieee8021_classifiers
             .get(&iface.cos_ieee8021_classifier)
-            .map(|c| !c.queue_by_pcp.is_empty())
+            .map(|c| {
+                c.queue_by_pcp
+                    .values()
+                    .any(|q| iface_queue_ids.contains(q))
+            })
             .unwrap_or(false);
-        let dscp_rewrite_has_mappings = dscp_rewrite_rule
-            .map(|r| !r.dscp_by_forwarding_class.is_empty())
+        let dscp_rewrite_targets_iface_class = dscp_rewrite_rule
+            .map(|r| {
+                r.dscp_by_forwarding_class
+                    .keys()
+                    .any(|fc| iface_classes.contains(&fc.as_str()))
+            })
             .unwrap_or(false);
 
         // Post-build gate. See comment above for rationale.
         let contributes_usable_cos_state = iface.cos_shaping_rate_bytes_per_sec > 0
             || scheduler_map_resolved_to_queues
-            || dscp_classifier_has_mappings
-            || ieee8021_classifier_has_mappings
-            || dscp_rewrite_has_mappings;
+            || dscp_classifier_targets_iface_queue
+            || ieee8021_classifier_targets_iface_queue
+            || dscp_rewrite_targets_iface_class;
         if !contributes_usable_cos_state {
             continue;
         }

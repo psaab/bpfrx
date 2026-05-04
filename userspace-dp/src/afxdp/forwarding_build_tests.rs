@@ -1087,3 +1087,182 @@ fn build_cos_state_skips_interface_with_scheduler_map_all_undefined_forwarding_c
         "scheduler-map whose entries all reference undefined forwarding-classes must NOT admit interface"
     );
 }
+
+#[test]
+fn build_cos_state_skips_classifier_only_mapping_to_unmaterialized_queue() {
+    // An interface attaches a DSCP classifier whose entries map to
+    // forwarding-class `voice` (queue 5). The interface has NO
+    // scheduler-map, so the only queue it would materialize is the
+    // synthetic default best-effort (queue 0). The classifier maps to
+    // queue 5, which the interface won't have at runtime — packets
+    // matching the classifier would land in `resolve_cos_queue_idx`
+    // and get dropped, while the interface still installs the
+    // owner-worker redirect. Gate must skip such interfaces.
+    // (Copilot review on PR #1183 caught this.)
+    let cos = ClassOfServiceSnapshot {
+        forwarding_classes: vec![
+            CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            },
+            CoSForwardingClassSnapshot {
+                name: "voice".into(),
+                queue: 5,
+            },
+        ],
+        schedulers: vec![],
+        scheduler_maps: vec![],
+        dscp_classifiers: vec![CoSDSCPClassifierSnapshot {
+            name: "voice-cls".into(),
+            entries: vec![CoSDSCPClassifierEntrySnapshot {
+                forwarding_class: "voice".into(), // queue 5
+                loss_priority: String::new(),
+                dscp_values: vec![0x2e],
+            }],
+        }],
+        ieee8021_classifiers: vec![],
+        dscp_rewrite_rules: vec![],
+    };
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 501,
+            cos_dscp_classifier: "voice-cls".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(cos),
+        ..Default::default()
+    };
+    let state = build_cos_state(&snapshot);
+    assert!(
+        !state.interfaces.contains_key(&501),
+        "DSCP classifier mapping to queue the interface won't materialize (no scheduler-map) must NOT admit"
+    );
+}
+
+#[test]
+fn build_cos_state_admits_classifier_mapping_to_materialized_queue() {
+    // The opposite of the previous test: a DSCP classifier mapping to
+    // queue 0 is OK on an interface with no scheduler-map, because the
+    // synthetic default best-effort queue IS queue 0. Packets land
+    // there and the classifier IS observable, so the interface
+    // legitimately needs to be in CoSState.
+    let cos = ClassOfServiceSnapshot {
+        forwarding_classes: vec![CoSForwardingClassSnapshot {
+            name: "best-effort".into(),
+            queue: 0,
+        }],
+        schedulers: vec![],
+        scheduler_maps: vec![],
+        dscp_classifiers: vec![CoSDSCPClassifierSnapshot {
+            name: "be-cls".into(),
+            entries: vec![CoSDSCPClassifierEntrySnapshot {
+                forwarding_class: "best-effort".into(), // queue 0
+                loss_priority: String::new(),
+                dscp_values: vec![0x10],
+            }],
+        }],
+        ieee8021_classifiers: vec![],
+        dscp_rewrite_rules: vec![],
+    };
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 502,
+            cos_dscp_classifier: "be-cls".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(cos),
+        ..Default::default()
+    };
+    let state = build_cos_state(&snapshot);
+    assert!(
+        state.interfaces.contains_key(&502),
+        "DSCP classifier mapping to materialized queue must admit interface"
+    );
+}
+
+#[test]
+fn build_cos_state_skips_rewrite_only_mapping_to_unmaterialized_class() {
+    // A DSCP rewrite-rule whose ONLY entry is for forwarding-class
+    // `voice` is attached to an interface with no scheduler-map. The
+    // interface only has the synthetic default best-effort class —
+    // the `voice` rewrite has no queue to attach to, so no packet can
+    // ever observe it. Gate must skip.
+    let cos = ClassOfServiceSnapshot {
+        forwarding_classes: vec![
+            CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            },
+            CoSForwardingClassSnapshot {
+                name: "voice".into(),
+                queue: 5,
+            },
+        ],
+        schedulers: vec![],
+        scheduler_maps: vec![],
+        dscp_classifiers: vec![],
+        ieee8021_classifiers: vec![],
+        dscp_rewrite_rules: vec![CoSDSCPRewriteRuleSnapshot {
+            name: "voice-rw".into(),
+            entries: vec![CoSDSCPRewriteRuleEntrySnapshot {
+                forwarding_class: "voice".into(),
+                loss_priority: String::new(),
+                dscp_value: 0x2e,
+            }],
+        }],
+    };
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 503,
+            cos_dscp_rewrite_rule: "voice-rw".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(cos),
+        ..Default::default()
+    };
+    let state = build_cos_state(&snapshot);
+    assert!(
+        !state.interfaces.contains_key(&503),
+        "DSCP rewrite-rule for class the interface won't materialize must NOT admit"
+    );
+}
+
+#[test]
+fn build_cos_state_admits_rewrite_only_mapping_to_materialized_class() {
+    // A DSCP rewrite-rule with a `best-effort` entry is observable on
+    // an interface with no scheduler-map, because the synthetic default
+    // best-effort queue IS the materialized class. Packets in that
+    // queue can carry the rewrite — interface should be admitted.
+    let cos = ClassOfServiceSnapshot {
+        forwarding_classes: vec![CoSForwardingClassSnapshot {
+            name: "best-effort".into(),
+            queue: 0,
+        }],
+        schedulers: vec![],
+        scheduler_maps: vec![],
+        dscp_classifiers: vec![],
+        ieee8021_classifiers: vec![],
+        dscp_rewrite_rules: vec![CoSDSCPRewriteRuleSnapshot {
+            name: "be-rw".into(),
+            entries: vec![CoSDSCPRewriteRuleEntrySnapshot {
+                forwarding_class: "best-effort".into(),
+                loss_priority: String::new(),
+                dscp_value: 0,
+            }],
+        }],
+    };
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 504,
+            cos_dscp_rewrite_rule: "be-rw".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(cos),
+        ..Default::default()
+    };
+    let state = build_cos_state(&snapshot);
+    assert!(
+        state.interfaces.contains_key(&504),
+        "DSCP rewrite-rule for the materialized best-effort class must admit"
+    );
+}
