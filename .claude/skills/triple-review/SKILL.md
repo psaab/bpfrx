@@ -54,7 +54,7 @@ increment.
 - **Per-class CoS smoke for refactor PRs.** Hit ports
   5201-5206 (one per configured CoS class). Combined with
   push+reverse, v4+v6, and CoS-disabled/enabled passes, that's
-  4 baseline + 4 multi-stream + 24 per-class = 32 measurements
+  4 baseline + 2 multi-stream + 24 per-class = 30 measurements
   per refactor.
 - **Never dismiss a failing test.** If any reviewer reports a
   test failed, prove it passes locally (named test 5x + full
@@ -259,23 +259,30 @@ export BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env
 sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- rm -f /tmp/cos-iperf-sets.set"
 sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- bash -c 'cli -c \"configure\" -c \"delete class-of-service\" -c \"commit and-quit\" 2>/dev/null || true'"
 
+# Note on grep targets: iperf3 reports the `Retr` (retransmit) column on
+# the **sender** SUM line for both push and reverse runs, so we always
+# grep the sender line — for `-R` runs, the sender is the iperf3 server
+# pushing data and Retr is on its summary. Greppping `receiver` would
+# show throughput but hide retrans, defeating the "0 retrans" gate below.
 echo "=== Pass A — CoS disabled, v4+v6 × push+reverse ==="
 for af in "v4:172.16.80.200" "v6:2001:559:8585:80::200"; do
   fam=${af%%:*}; tgt=${af#*:}
   echo -n "$fam push: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201"    2>&1 | grep "0.00-5.00.*sender"
-  echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201 -R" 2>&1 | grep "0.00-5.00.*receiver"
+  echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201 -R" 2>&1 | grep "0.00-5.00.*sender"
 done
 
 # Multi-stream reverse-mode reproducer (canonical TX-path regression catcher).
 # A reverse cap with healthy push throughput is a TX-path regression.
+# Grep the SUM sender line to expose Retr (retrans column).
 echo "=== Pass A — 12-stream reverse reproducer (CoS disabled) ==="
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 172.16.80.200 -P 12 -t 10 -p 5201 -R" 2>&1 | tail -3
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 2001:559:8585:80::200 -P 12 -t 10 -p 5201 -R" 2>&1 | tail -3
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 172.16.80.200 -P 12 -t 10 -p 5201 -R"       2>&1 | grep "^\[SUM\].*0.00-10.00.*sender"
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 2001:559:8585:80::200 -P 12 -t 10 -p 5201 -R" 2>&1 | grep "^\[SUM\].*0.00-10.00.*sender"
 
 # === Pass B: CoS ENABLED ===
 sg incus-admin -c "./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0"
 
 # Per-class CoS smoke — v4+v6 × push+reverse × 6 ports = 24 measurements
+# Same `sender` grep convention so retrans is visible for every cell.
 echo "=== Pass B — Per-class CoS smoke ==="
 for port_class in "5201:iperf-a" "5202:iperf-b" "5203:iperf-c" "5204:iperf-d" "5205:iperf-e" "5206:iperf-f"; do
   port=${port_class%%:*}; cls=${port_class#*:}
@@ -283,7 +290,7 @@ for port_class in "5201:iperf-a" "5202:iperf-b" "5203:iperf-c" "5204:iperf-d" "5
   for af in "v4:172.16.80.200" "v6:2001:559:8585:80::200"; do
     fam=${af%%:*}; tgt=${af#*:}
     echo -n "$fam push: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port"    2>&1 | grep "0.00-5.00.*sender"
-    echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port -R" 2>&1 | grep "0.00-5.00.*receiver"
+    echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port -R" 2>&1 | grep "0.00-5.00.*sender"
   done
 done
 ```
