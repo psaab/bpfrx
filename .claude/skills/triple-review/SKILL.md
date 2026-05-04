@@ -40,9 +40,22 @@ increment.
 - **Smoke v4 AND v6.** Every test cycle hits both
   172.16.80.200 and 2001:559:8585:80::200. v4-only smoke masks
   dual-stack regressions.
+- **Smoke push AND reverse.** Every iperf3 invocation runs
+  twice: once default (push, client→server) and once with `-R`
+  (reverse, server→client). Push-only smoke once let a TX-path
+  regression cap reverse at ~2 Gbps while push still hit line
+  rate. Multi-stream `-P 12` is the canonical reproducer.
+- **Smoke CoS-disabled AND CoS-enabled.** Run the matrix twice:
+  once with CoS configuration removed (best-effort only — this
+  catches regressions in the unshaped fast path) and once with
+  the per-class CoS config applied. CoS-only smoke masks fast-
+  path regressions; best-effort-only smoke masks classifier and
+  shaper regressions.
 - **Per-class CoS smoke for refactor PRs.** Hit ports
-  5201-5206 (one per configured CoS class). Best-effort-only
-  smoke masks classifier/policer regressions.
+  5201-5206 (one per configured CoS class). Combined with
+  push+reverse, v4+v6, and CoS-disabled/enabled passes, that's
+  4 baseline + 4 multi-stream + 24 per-class = 32 measurements
+  per refactor.
 - **Never dismiss a failing test.** If any reviewer reports a
   test failed, prove it passes locally (named test 5x + full
   suite + Go suite) BEFORE merging. "Sandbox-only flake"
@@ -240,24 +253,48 @@ GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test ./... 2>&1 | grep -v "^ok\|^?" 
 # Deploy
 export BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env
 ./test/incus/cluster-setup.sh deploy all
+
+# === Pass A: CoS DISABLED (best-effort only) ===
+# Catches regressions in the unshaped fast path. iperf-a default 5201 is best-effort.
 sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- rm -f /tmp/cos-iperf-sets.set"
+sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- bash -c 'cli -c \"configure\" -c \"delete class-of-service\" -c \"commit and-quit\" 2>/dev/null || true'"
+
+echo "=== Pass A — CoS disabled, v4+v6 × push+reverse ==="
+for af in "v4:172.16.80.200" "v6:2001:559:8585:80::200"; do
+  fam=${af%%:*}; tgt=${af#*:}
+  echo -n "$fam push: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201"    2>&1 | grep "0.00-5.00.*sender"
+  echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p 5201 -R" 2>&1 | grep "0.00-5.00.*receiver"
+done
+
+# Multi-stream reverse-mode reproducer (canonical TX-path regression catcher).
+# A reverse cap with healthy push throughput is a TX-path regression.
+echo "=== Pass A — 12-stream reverse reproducer (CoS disabled) ==="
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 172.16.80.200 -P 12 -t 10 -p 5201 -R" 2>&1 | tail -3
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 2001:559:8585:80::200 -P 12 -t 10 -p 5201 -R" 2>&1 | tail -3
+
+# === Pass B: CoS ENABLED ===
 sg incus-admin -c "./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0"
 
-# v4 + v6 smoke (best-effort)
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 172.16.80.200 -t 5 -p 5201" | grep "0.00-5.00.*sender"
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 2001:559:8585:80::200 -t 5 -p 5201" | grep "0.00-5.00.*sender"
-
-# Per-class CoS smoke (refactor PR rule)
+# Per-class CoS smoke — v4+v6 × push+reverse × 6 ports = 24 measurements
+echo "=== Pass B — Per-class CoS smoke ==="
 for port_class in "5201:iperf-a" "5202:iperf-b" "5203:iperf-c" "5204:iperf-d" "5205:iperf-e" "5206:iperf-f"; do
-  port=$(echo $port_class | cut -d: -f1)
-  cls=$(echo $port_class | cut -d: -f2)
-  echo "=== $port $cls ==="
-  echo -n "v4: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 172.16.80.200 -t 5 -p $port" 2>&1 | grep "0.00-5.00.*sender"
-  echo -n "v6: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c 2001:559:8585:80::200 -t 5 -p $port" 2>&1 | grep "0.00-5.00.*sender"
+  port=${port_class%%:*}; cls=${port_class#*:}
+  echo "--- $port $cls ---"
+  for af in "v4:172.16.80.200" "v6:2001:559:8585:80::200"; do
+    fam=${af%%:*}; tgt=${af#*:}
+    echo -n "$fam push: "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port"    2>&1 | grep "0.00-5.00.*sender"
+    echo -n "$fam rev:  "; sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -c $tgt -t 5 -p $port -R" 2>&1 | grep "0.00-5.00.*receiver"
+  done
 done
 ```
 
-All 12 measurements must pass with 0 retrans.
+**Required pass criteria:**
+- Pass A (CoS disabled): all 4 baseline measurements at line rate with 0 retrans;
+  both 12-stream reverse reproducers (v4 + v6) hit line rate with 0 retrans.
+  *A reverse cap with healthy push is a TX-path regression — block on this.*
+- Pass B (CoS enabled): all 24 per-class measurements pass with 0 retrans
+  *for unshaped classes*. Shaped classes (e.g. iperf-a at 1 Gb/s) should
+  hit their shape rate cleanly with ECN marks but no buffer drops.
 
 ## Step 7: Open PR
 
@@ -284,9 +321,16 @@ Plan doc: docs/pr/<ISSUE>-<SLUG>/plan.md
 - [x] <named-test> 5/5 flake check
 - [x] Go suite: 30 packages pass
 - [x] Deploy on loss userspace cluster
-- [x] v4 smoke: <Mbps>, <retrans> retrans against 172.16.80.200
-- [x] v6 smoke: <Mbps>, <retrans> retrans against 2001:559:8585:80::200
-- [x] Per-class CoS smoke (5201-5206) v4+v6 — all 0 retrans
+- [x] **Pass A — CoS disabled** (best-effort fast path)
+  - [x] v4 push: <Mbps>, <retrans> retrans against 172.16.80.200
+  - [x] v4 reverse (`-R`): <Mbps>, <retrans> retrans
+  - [x] v6 push: <Mbps>, <retrans> retrans against 2001:559:8585:80::200
+  - [x] v6 reverse (`-R`): <Mbps>, <retrans> retrans
+  - [x] v4 multi-stream reverse: `iperf3 -P 12 -t 10 -R` — line rate, 0 retrans
+  - [x] v6 multi-stream reverse: `iperf3 -P 12 -t 10 -R` — line rate, 0 retrans
+- [x] **Pass B — CoS enabled** (per-class shaper + classifier)
+  - [x] Per-class CoS smoke (5201-5206) v4+v6 push+reverse — all 24 measurements pass
+  - [x] Shaped classes hit configured rate cleanly with ECN marks but no buffer drops
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
