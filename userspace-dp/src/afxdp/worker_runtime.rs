@@ -70,11 +70,11 @@ pub(crate) struct WorkerRuntimeAtomics {
     pub tid: AtomicU64,
     /// #925 Phase 1+2 (catch+report+observe): set to true exactly once
     /// when the supervisor catches a worker_loop panic. Set-only today —
-    /// cleared only by daemon restart. Phase 2 (#1185) added the
+    /// cleared only by daemon restart. Phase 2 added the
     /// `xpf_userspace_worker_dead` Prometheus gauge that reads this flag
-    /// via the JSON status wire. A hypothetical Phase 3 (respawn,
-    /// deferred indefinitely) would clear this by replacing
-    /// WorkerRuntimeAtomics on relaunch.
+    /// via the JSON status wire (xpfCollector → control-socket status).
+    /// A hypothetical Phase 3 (respawn, deferred indefinitely) would
+    /// clear this by replacing WorkerRuntimeAtomics on relaunch.
     /// Adding this flag pushes the struct from 64 B → 128 B due to
     /// `#[repr(align(64))]` rounding; cost is negligible (a few hundred
     /// bytes total across all workers).

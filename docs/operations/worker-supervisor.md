@@ -16,8 +16,10 @@ If a panic escapes the loop body, the supervisor:
 2. Logs the rendered panic payload to journald via `eprintln!`.
 3. Stores the panic message in a `Mutex<Option<String>>` per worker.
 4. Sets the worker's `WorkerRuntimeAtomics.dead` flag to `true`.
-5. Returns `Ok(())` from the supervised closure so the join handle
-   sees a clean exit.
+5. Lets the supervised closure return normally (the closure itself
+   has `()` return type) — because the panic was caught, the
+   worker thread exits cleanly and `JoinHandle::join()` returns
+   `Ok(())` rather than `Err(panic_payload)`.
 
 The other workers and the control plane continue running. The dead
 worker no longer processes packets — bindings/queues owned by it
@@ -80,7 +82,7 @@ is `type`:
 
 ```
 incus exec loss:xpf-userspace-fw0 -- bash -lc \
-  'echo "{\"type\":\"status\"}" | socat - UNIX-CONNECT:/run/xpf/userspace-dp.sock | jq ".worker_runtime[] | select(.dead)"'
+  'echo "{\"type\":\"status\"}" | socat - UNIX-CONNECT:/run/xpf/userspace-dp.sock | jq ".status.worker_runtime[] | select(.dead)"'
 ```
 
 (See `test/incus/step1-capture.sh` for additional examples of the
@@ -91,10 +93,17 @@ Both paths return the worker entry with `dead: true` and the
 
 ### Log inspection
 
-The supervisor prints to stderr, which systemd routes to journald:
+The supervisor prints to stderr, which systemd routes to journald.
+The actual log strings emitted by `spawn_supervised_worker` /
+`spawn_supervised_aux` are:
+
+- `xpf-userspace-dp: worker_loop panicked (worker_id=<N>): <message>`
+- `xpf-userspace-dp: aux thread '<name>' panicked: <message>`
+
+so:
 
 ```
-journalctl -u xpfd -g 'panic|supervisor caught'
+journalctl -u xpfd -g 'panicked'
 ```
 
 ## Why no automatic respawn

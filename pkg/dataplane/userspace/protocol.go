@@ -538,8 +538,8 @@ type WorkerRuntimeStatus struct {
 	IdleLoops   uint64 `json:"idle_loops,omitempty"`
 	// #925 Phase 1+2 (catch+report+observe): Dead == true means the
 	// worker_loop panicked and the supervisor caught it. Set-only
-	// today — cleared only by daemon restart. Phase 2 (this commit)
-	// surfaces this on Prometheus as `xpf_userspace_worker_dead`; a
+	// today — cleared only by daemon restart. Phase 2 surfaces this
+	// on Prometheus as `xpf_userspace_worker_dead` (this PR). A
 	// hypothetical Phase 3 (respawn, deferred indefinitely) would
 	// clear this by replacing WorkerRuntimeAtomics on relaunch.
 	// PanicMessage holds the rendered payload for operator diagnosis.

@@ -1,8 +1,6 @@
 package api
 
 import (
-	"strconv"
-	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -42,10 +40,13 @@ func TestEmitWorkerRuntime_DeadGaugeReflectsDeadFlag(t *testing.T) {
 	}
 
 	// Gather just the dead-gauge entries, keyed by worker_id label.
+	// Filter by descriptor pointer (not Desc().String() which is not a
+	// stable public API and could shift with prometheus/client_golang
+	// updates). Copilot review on PR #1186 caught the previous
+	// substring approach as brittle.
 	deadByWorker := make(map[string]float64)
 	for _, m := range got {
-		desc := m.Desc().String()
-		if !strings.Contains(desc, "xpf_userspace_worker_dead") {
+		if m.Desc() != c.workerDead {
 			continue
 		}
 		var pb dto.Metric
@@ -98,7 +99,7 @@ func TestEmitWorkerRuntime_DeadGaugeZeroForHealthyWorkers(t *testing.T) {
 
 	deads := 0
 	for _, m := range got {
-		if !strings.Contains(m.Desc().String(), "xpf_userspace_worker_dead") {
+		if m.Desc() != c.workerDead {
 			continue
 		}
 		var pb dto.Metric
@@ -157,12 +158,23 @@ func collectFromEmitWorkerRuntime(
 	for m := range ch {
 		got = append(got, m)
 	}
-	// Sanity: every returned descriptor should mention "xpf_userspace_worker_".
+	// Sanity: every returned metric should be one of the worker
+	// descriptors we initialized. Pointer-equality is stable across
+	// prometheus/client_golang versions.
+	expected := map[*prometheus.Desc]struct{}{
+		c.workerWallSecs:      {},
+		c.workerActiveSecs:    {},
+		c.workerIdleSpinSecs:  {},
+		c.workerIdleBlockSecs: {},
+		c.workerThreadCPUSecs: {},
+		c.workerWorkLoops:     {},
+		c.workerIdleLoops:     {},
+		c.workerDead:          {},
+	}
 	for _, m := range got {
-		if !strings.Contains(m.Desc().String(), "xpf_userspace_worker_") {
+		if _, ok := expected[m.Desc()]; !ok {
 			t.Fatalf("unexpected metric leaked from emitWorkerRuntime: %s", m.Desc())
 		}
 	}
-	_ = strconv.Itoa // silence unused-import linter if removed in future edits
 	return got
 }
