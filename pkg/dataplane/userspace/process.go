@@ -258,13 +258,18 @@ func (m *Manager) syncSnapshotLocked() error {
 		return nil
 	}
 	if m.lastStatus.LastSnapshotGeneration >= m.lastSnapshot.Generation {
-		// #1197 v6 (Codex code-review v5): status-loop catch-up
-		// path. The helper acknowledges it already has this
-		// snapshot; mark it published. Same as a successful
-		// apply_snapshot from xpfd's perspective — listener
-		// caches must reflect what userspace-dp has, so rebuild
-		// them here too.
-		m.publishedSnapshot = m.lastStatus.LastSnapshotGeneration
+		// #1197 v7 (Codex code-review v6): status-loop catch-up
+		// path. Helper has the snapshot; mirror the FULL
+		// successful-apply_snapshot bookkeeping, otherwise
+		// downstream paths see stale publishedPlanKey /
+		// lastSnapshotHash and may force unnecessary refreshes
+		// or break the same-plan-during-XSK-startup exception.
+		hash, hashOK := snapshotContentHash(m.lastSnapshot)
+		m.publishedSnapshot = m.lastSnapshot.Generation
+		m.publishedPlanKey = planKey
+		if hashOK {
+			m.lastSnapshotHash = hash
+		}
 		m.rebuildNeighborIndex()
 		m.rebuildMonitoredIfindexes()
 		return nil
