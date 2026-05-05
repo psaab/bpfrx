@@ -1,5 +1,5 @@
 ---
-status: DRAFT v1 — pending adversarial plan review
+status: REVISED v2 — Codex round-1 PLAN-NEEDS-MAJOR corrections applied (close #774/#775, keep #776 as constraint tracker)
 issues: #774, #775, #776, #777, #779, #781
 phase: Triage — close-or-keep decision per issue
 ---
@@ -70,19 +70,25 @@ tractable), MPSC batching (medium), SFQ (irrelevant; queue never
 backs up).
 
 **Reality on master:**
-- 18 Gb/s ceiling has been **beaten**: 23.47 Gb/s per
-  `findings-post-917.md` (2026-04-27), well above the 18 Gb/s
-  ceiling this issue documents.
-- The remaining gap to the 25 Gb/s shaper rate is the 12-13%
-  cross-UMEM memcpy (#776), which is architecturally blocked on
-  this lab per its own scope correction.
+- 18 Gb/s ceiling has been beaten: 23.47 Gb/s per
+  `findings-post-917.md` (2026-04-27).
+- BUT the issue's title target is **25 Gb/s** (the iperf-c shaper
+  rate), not 22 Gb/s (#775's campaign gate). 23.47 still doesn't
+  hit 25.
+- The remaining ~6% gap (23.47 → 25) is the cross-UMEM body
+  memcpy (#776), which is architecturally blocked on this lab
+  per its own scope correction (cross-NIC shared UMEM is blocked,
+  same-device shared-UMEM exists but FQ/CQ ownership bug blocks
+  activation).
 
-**Recommendation:** **Close.** The 18 Gb/s ceiling premise is
-overtaken. The remaining 12-13% memcpy gap is tracked as #776
-which has its own scope correction. Pointing at the wrong number
-in #774 wastes triage cycles on future readers. If a new ceiling
-is measured at some future point, file a fresh issue with the
-new number.
+**Recommendation (revised v2 per Codex round-1):** **Close as
+wontfix-on-current-lab topology.** Frame it as "the 25 Gb/s
+shaper-rate target is unachievable on the loss userspace cluster's
+mlx5 dual-NIC topology — closing the remaining ~6% gap requires
+shared-UMEM activation, which is blocked on this hardware per
+`docs/shared-umem-plan.md`." NOT "ceiling beaten." Preserve the
+25 Gb/s constraint trail by keeping #776 open as the topology
+tracker.
 
 ### #775 — campaign to land consistent 22+ Gbps on iperf3 -P 12 -t 600 -p 5203
 
@@ -120,12 +126,15 @@ The constraint analysis is verified against `docs/shared-umem-plan.md`
 blocked at the mlx5 driver layer (EINVAL on second bind);
 same-device prototype exists but FQ/CQ ownership bug blocks it.
 
-**Recommendation:** **Close as wontfix-on-current-lab.** Follow
-the author's own #776a directive. Note in close comment that #776b
-(hugepage UMEM) and #776c (same-device shared-UMEM activation)
-are the tractable follow-ups but neither is currently filed —
-recommend filing them only when someone's about to take them up.
-Don't pre-file work that won't get touched.
+**Recommendation (revised v2 per Codex round-1):** **Keep open
+as topology-constraint tracker.** Codex round-1 caught the
+inconsistency: if both #774 and #776 close, the cross-NIC
+shared-UMEM constraint trail is lost, and #774's "remaining gap
+tracked as #776" rationale points at a closed issue. Keep #776
+open as the active constraint tracker; it's the canonical place
+to land #776b (hugepage UMEM) or #776c (same-device shared-UMEM
+activation) when someone's ready to take them up. Add a comment
+documenting this role explicitly.
 
 ### #777 — 7.8% CPU in poll_binding_process_descriptor (RX hot path)
 
@@ -152,21 +161,21 @@ a plan against an unscoped target.
 
 **Status:** zero comments. Still 4.20% on current master.
 
-**Reality:** the issue body lists three concrete fix hypotheses:
-1. `flow_key.clone()` per request — measurable at 1.3M pps
-2. Branch-heavy dispatch (segmentation / in-place / copy)
-3. `PreparedTxRequest` field copy
+**Reality:** the issue body lists three concrete fix hypotheses
+(`flow_key.clone()`, branch-heavy dispatch, PreparedTxRequest
+field copy). Per Codex round-1 review, **the `flow_key.clone()`
+hypothesis is stale**: the current common direct path mostly
+moves the key via `take()`; clones remain in request construction,
+segmentation, and prepared-to-local fallback paths. So `Arc<SessionKey>`
+is no longer the obvious lead fix.
 
-Concrete fix hypotheses (1) is the easiest to attack:
-`Arc<SessionKey>` instead of `Option<SessionKey>` clone. One
-refcount bump vs full struct copy.
-
-**Recommendation:** **Keep open.** Single-PR-tractable. Could
-be the next concrete attack target after this triage if user
-wants to start actual perf work. Note: #1016 was filed to decouple
-the mutation in this function from TX dispatch — that's a
-prerequisite for batched-pipeline work but not for the smaller
-flow_key clone fix.
+**Recommendation (revised v2 per Codex round-1):** **Keep open.**
+Next action: fresh `perf annotate` on `enqueue_pending_forwards`
+on current master to find the actual dominant basic blocks — do
+NOT prescribe `Arc<SessionKey>` until annotate confirms it's still
+the right target. Scope the fix off measurement, not the stale
+hypothesis. #1016 (decouple mutation from dispatch) remains a
+prerequisite for any batched-pipeline angle.
 
 ### #781 — 9.67M rx_xsk_buff_alloc_err + 506M tx_xsk_full
 
@@ -185,24 +194,44 @@ errors per unit time may have fallen substantially.
 own note. The retrans-storm symptom (92-170K retrans/30s) has
 fallen to 0-2 retrans/30s per #775's progression table.
 
-**Recommendation:** **Keep open** but explicitly note: requires
-fresh re-measurement before any code work. If fresh ethtool
-counters (rate over a 30-60s window, not cumulative) show
-near-zero `tx_xsk_full` or `rx_xsk_buff_alloc_err`, close as
-mitigated. If they're still substantial, scope a fix.
+Codex round-1 cited fresh evidence from `#778 diagnostic`:
+`rx_xsk_buff_alloc_err=899`, `tx_xsk_full=0`. If those numbers
+are accurate as a 30-60s rate (not cumulative), the structural
+pipeline stall is effectively gone — fresh-measurement-before-
+close is the cautious path, but close-as-mitigated is the likely
+outcome.
 
-## 4. Recommendation summary
+**Recommendation:** **Keep open with explicit fresh-measurement
+gate.** Add a comment requesting a 30-60s window measurement of
+`tx_xsk_full` and `rx_xsk_buff_alloc_err` rates on current master.
+If both are near-zero (Codex's data suggests they are), close as
+mitigated. If still substantial, scope a fix.
+
+## 4. Recommendation summary (revised v2 per Codex round-1)
 
 | # | Recommendation | Justification |
 |---|---|---|
-| #774 | **Close** | 18 Gb/s ceiling beaten (23.47 Gb/s); remaining gap is #776 |
-| #775 | **Close** | Author's own comment says "Closing campaign issue as target met"; never closed |
-| #776 | **Close as wontfix-on-current-lab** | Author's own scope correction recommends close; cross-NIC blocked, follow-ups tracked separately |
-| #777 | **Keep** | Needs perf annotate to scope before plan |
-| #779 | **Keep** | Single-PR-tractable; concrete fix hypotheses |
-| #781 | **Keep** | Largely mitigated by ring/hugepage; needs fresh re-measurement before action |
+| #774 | **Close as wontfix-on-current-lab** | 25 Gb/s target unachievable on dual-NIC mlx5 lab without shared-UMEM unblock; preserved trail in #776 |
+| #775 | **Close** | Author's own comment says "Closing campaign issue as target met"; quote author, don't overclaim 600s campaign |
+| #776 | **Keep open as topology-constraint tracker** | Closing #774 + #776 erases the constraint trail; keep one as active tracker |
+| #777 | **Keep** | Needs fresh perf annotate to scope before plan |
+| #779 | **Keep** | `flow_key.clone()` hypothesis stale; needs fresh annotate before fix prescription |
+| #781 | **Keep with measurement gate** | Codex cites fresh data showing rx_xsk_buff_alloc_err=899, tx_xsk_full=0; likely close-as-mitigated after rate measurement |
 
-**Net effect:** 3 closures, 3 stay open with refined gating notes.
+**Net effect:** 2 closures (#774, #775), 4 stay open with refined
+gating notes. Down from v1's 3 closures — Codex correctly caught
+that closing both #774 AND #776 erases the cross-NIC shared-UMEM
+constraint trail.
+
+**Codex round-1 corrections applied:**
+1. #774 reframed: not "ceiling beaten" but "current-lab target
+   wontfix" (25 ≠ 23.47).
+2. #776 changed from close to keep — preserve the topology-
+   constraint trail.
+3. #779 fix hypothesis flagged as stale — annotate before
+   prescribing.
+4. #781 gets measurement-gate framing with Codex's fresh data
+   noted.
 
 Pattern matches the prior triage outcomes today:
 - SIMD batch: 4 close (4/4 unanimous KILL)
