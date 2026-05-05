@@ -1,11 +1,12 @@
 ---
-status: REVISED v3 — kernel-as-authority redesign per user feedback
+status: REVISED v4 — Codex round-3 PLAN-NEEDS-MAJOR; 4 critical holes plugged
 issue: #1197
 phase: Plan + fix design
 prior:
   - v1 commit 2709752f — fixed second loop only; missed 5 things
   - v2 commit f6e7070a — addressed Codex round-1 5 findings (incremental defense)
-  - v3 (this) — user feedback: redesign to event-driven + proactive-probe
+  - v3 commit 867bd363 — kernel-as-authority redesign per user feedback
+  - v4 (this) — Codex round-3 found 4 substantive holes in v3; replumbed
 ---
 
 ## 1. Issue framing (unchanged)
@@ -118,79 +119,214 @@ already covered by:
 
 The 15s preinstall tick disappears entirely.
 
-### 5.2 Phase 2: listen for changes
+### 5.2 Phase 2: listen for changes — **CORRECTED per Codex round-3**
 
-Add a general neighbor netlink subscriber in `pkg/daemon/`:
+Codex round-3 caught two issues with v3 listener:
+
+1. **Filter scope wrong.** `buildNeighborSnapshots` publishes
+   ALL kernel neighbors on configured forwarding/fabric
+   interfaces (`snapshot.go:1758-1850`). Filter must align with
+   that — not narrowed to next-hops only.
+
+2. **Subscription is lossy.** Multicast can drop; not every NUD
+   transition is notified. Need `NeighSubscribeWithOptions` with
+   `ListExisting: true` (initial dump), error-callback resubscribe,
+   debounce, periodic safety reconciliation.
+
+3. **Event handling can't be MAC-only.** RTM_DELNEIGH must trigger
+   immediate snapshot eviction. State changes to FAILED/INCOMPLETE
+   may also matter. Avoid publish-churn on harmless REACHABLE↔STALE
+   transitions via forwarding-effective diff.
+
+Corrected design:
 
 ```go
-// neighborListener subscribes to RTM_NEWNEIGH/DELNEIGH for all
-// interfaces, filters to neighbors we care about (next-hops in
-// the active config), and triggers snapshot regeneration when a
-// monitored neighbor's MAC changes.
+// neighborListener runs the netlink RTM_NEWNEIGH/DELNEIGH event
+// loop. Triggers snapshot regen when a monitored neighbor's
+// forwarding-effective state changes.
 func (d *Daemon) neighborListener(ctx context.Context) {
-    updates := make(chan netlink.NeighUpdate, 256)
-    done := make(chan struct{})
-    if err := netlink.NeighSubscribe(updates, done); err != nil {
-        slog.Warn("neighbor listener subscribe failed", "err", err)
-        return
-    }
-    defer close(done)
+    var (
+        regenDebounce = make(chan struct{}, 1)
+        debounceMs    = 100 * time.Millisecond
+    )
+    // Debounce coalesces bursts (e.g., GARP storm during failover)
+    go d.regenDebouncer(ctx, regenDebounce, debounceMs)
 
+    // Periodic safety reconciliation: catches lost multicast events
+    safetyTick := time.NewTicker(60 * time.Second)
+    defer safetyTick.Stop()
+
+    for {
+        // Subscribe with initial dump (ListExisting=true); resubscribe
+        // on error.
+        updates := make(chan netlink.NeighUpdate, 1024)
+        done := make(chan struct{})
+        opts := netlink.NeighSubscribeOptions{
+            ListExisting: true,
+            ErrorCallback: func(err error) {
+                slog.Warn("neighbor listener netlink err", "err", err)
+            },
+        }
+        if err := netlink.NeighSubscribeWithOptions(updates, done,
+                                                    opts); err != nil {
+            slog.Warn("neighbor subscribe failed", "err", err)
+            select {
+            case <-ctx.Done():
+                return
+            case <-time.After(2 * time.Second):
+                continue // resubscribe
+            }
+        }
+
+        for {
+            select {
+            case <-ctx.Done():
+                close(done)
+                return
+            case <-safetyTick.C:
+                // Safety net: full reconcile in case events were lost
+                d.triggerRegen(regenDebounce)
+            case u, ok := <-updates:
+                if !ok {
+                    close(done)
+                    break // resubscribe
+                }
+                if !d.isMonitoredNeighbor(u.LinkIndex) {
+                    continue
+                }
+                if d.shouldTriggerRegen(u) {
+                    d.triggerRegen(regenDebounce)
+                }
+            }
+        }
+    }
+}
+
+// isMonitoredNeighbor returns true if linkIndex belongs to a
+// configured forwarding or fabric interface — i.e., aligns with
+// buildNeighborSnapshots' coverage. NOT narrowed to "static next-
+// hops" because the snapshot publishes all of them.
+func (d *Daemon) isMonitoredNeighbor(linkIndex int) bool {
+    // Check against configured interface ifindex set built from
+    // the active config (forwarding interfaces + fabric overlays).
+    cfg := d.store.ActiveConfig()
+    if cfg == nil { return false }
+    return d.linkIndexInActiveConfig(linkIndex)
+}
+
+// shouldTriggerRegen filters out forwarding-irrelevant churn.
+// REACHABLE↔STALE transitions are aging artifacts; ignore.
+// MAC change, RTM_DELNEIGH, FAILED/INCOMPLETE state → trigger.
+func (d *Daemon) shouldTriggerRegen(u netlink.NeighUpdate) bool {
+    switch u.Type {
+    case syscall.RTM_DELNEIGH:
+        // Kernel evicted entry; snapshot must drop it immediately.
+        return true
+    case syscall.RTM_NEWNEIGH:
+        // Look up current snapshot entry for this (ifindex, IP).
+        existing := d.dp.LookupSnapshotNeighbor(u.LinkIndex, u.IP)
+        // No existing snapshot entry: trigger (new entry).
+        if existing == nil {
+            // But only if state is usable (REACHABLE or PERMANENT
+            // or STALE — entries with valid MAC).
+            return u.HardwareAddr != nil && len(u.HardwareAddr) > 0 &&
+                u.State&(netlink.NUD_REACHABLE|netlink.NUD_STALE|
+                         netlink.NUD_PERMANENT) != 0
+        }
+        // Existing snapshot has this entry. Trigger only if MAC
+        // differs, or if kernel transitioned to FAILED/INCOMPLETE
+        // (entry no longer usable).
+        if u.HardwareAddr != nil && len(u.HardwareAddr) > 0 &&
+           !bytes.Equal(existing.MAC, u.HardwareAddr) {
+            return true
+        }
+        if u.State&(netlink.NUD_FAILED|netlink.NUD_INCOMPLETE) != 0 {
+            return true // entry became unusable; snapshot must drop
+        }
+        // REACHABLE↔STALE↔DELAY↔PROBE on same MAC: harmless aging.
+        return false
+    }
+    return false
+}
+
+// regenDebouncer coalesces regen requests so a burst of events
+// (e.g., GARP storm during failover) results in one regen.
+func (d *Daemon) regenDebouncer(ctx context.Context, ch chan struct{},
+                                 delay time.Duration) {
+    var pending bool
+    var timer *time.Timer
     for {
         select {
         case <-ctx.Done():
             return
-        case u, ok := <-updates:
-            if !ok {
-                return
+        case <-ch:
+            if !pending {
+                pending = true
+                timer = time.AfterFunc(delay, func() {
+                    pending = false
+                    if d.dp != nil {
+                        d.dp.RegenerateNeighborSnapshot()
+                    }
+                })
             }
-            d.handleNeighUpdate(u)
+            _ = timer
         }
     }
 }
 
-func (d *Daemon) handleNeighUpdate(u netlink.NeighUpdate) {
-    // Filter: only react to neighbors on configured interfaces
-    // for IPs we monitor (next-hops, address-book, NAT dests).
-    if !d.isMonitoredNeighbor(u.IP, u.LinkIndex) {
-        return
-    }
+func (d *Daemon) triggerRegen(ch chan struct{}) {
+    select { case ch <- struct{}{}: default: }
+}
+```
 
-    // For each event type:
-    switch u.Type {
-    case syscall.RTM_NEWNEIGH:
-        // Kernel learned/updated a MAC. If our snapshot disagrees
-        // (or doesn't have it), regen the snapshot and publish.
-        if d.snapshotDisagreesOrMissing(u.IP, u.LinkIndex,
-                                        u.HardwareAddr) {
-            d.dp.RegenerateNeighborSnapshot()
-        }
-    case syscall.RTM_DELNEIGH:
-        // Kernel evicted entry. Trigger a proactive probe to
-        // re-resolve, then regen snapshot when reply arrives
-        // (which will fire RTM_NEWNEIGH).
-        go d.probeNeighbor(u.IP, u.LinkIndex)
+This requires a new `Manager.LookupSnapshotNeighbor(ifindex, ip)`
+method (cheap O(1) read of in-memory snapshot map).
+
+### 5.3 Phase 3: proactive expiry + reprobe — **CORRECTED per Codex round-3**
+
+Codex round-3 caught: `resolveNeighborsInner` at
+`daemon_neighbor.go:323-334` skips entries already in
+`NUD_REACHABLE|NUD_STALE|NUD_PERMANENT`. Idle STALE entries
+**never get re-probed by this path**. Just calling it on a 15s
+tick does nothing useful for the bug class.
+
+Need a **force-probe** sibling function that **does** re-probe
+STALE entries. Sketch:
+
+```go
+// forceProbeNeighbors sends ARP/NS probes for known neighbor
+// targets WITHOUT skipping STALE entries. Used by the periodic
+// reconcile timer to nudge kernel re-validation. Distinct from
+// resolveNeighborsInner which only fills missing/INCOMPLETE/FAILED
+// entries — that semantics is right for activation priming, but
+// wrong for steady-state staleness reconciliation.
+func (d *Daemon) forceProbeNeighbors(cfg *config.Config) {
+    targets := d.collectMonitoredNeighbors(cfg)  // see 5.2 below
+    for _, t := range targets {
+        // Probe regardless of current NUD state; the kernel will
+        // decide what to do with the response (REACHABLE → confirm;
+        // STALE → DELAY/PROBE → REACHABLE on reply).
+        link, err := netlink.LinkByIndex(t.linkIndex)
+        if err != nil { continue }
+        ifName := link.Attrs().Name
+        go func(ip net.IP, iface string) {
+            if ip.To4() == nil {
+                _ = cluster.SendNDSolicitationFromInterface(iface, ip)
+            }
+            sendICMPProbe(iface, ip)
+        }(t.neighborIP, ifName)
     }
 }
 ```
 
-### 5.3 Phase 3: proactive expiry + reprobe
+This is the periodic cadence (default 15s, tunable) that drives
+proactive reprobing. Replies → kernel ARP update → RTM_NEWNEIGH
+→ our listener → snapshot regen → userspace-dp update.
 
-Add a periodic resolver timer (15s or 30s; tunable) that calls
-`resolveNeighborsInner(cfg, false)` for all known next-hops. The
-existing function:
-- Iterates next-hops, address-book hosts, NAT destinations
-- Sends ARP / IPv6 NS via raw socket (already implemented)
-- Doesn't block on replies (false flag)
-
-The kernel handles the rest. Replies come back via normal NDISC
-processing → kernel updates ARP → RTM_NEWNEIGH fires → our
-listener regenerates snapshot.
-
-This replaces the 15s preinstall tick with a 15s probe tick. The
-probe is proactive (kernel may have valid REACHABLE; probe
-re-confirms) and harmless (kernel won't update ARP unless reply
-differs from existing).
+**Cardinality concern (Codex finding #4):** address-book hosts
+can be much larger than the 5-10 next-hops estimate. Add a
+configurable cap (`neighbor-probe-max-targets`, default 256;
+log target count each tick).
 
 ### 5.4 Phase 4: snapshot regeneration is event-driven
 
@@ -269,12 +405,36 @@ under v1+v2.
 
 ## 9. Phased ship plan
 
-**PR 1 (this):** v3 minimum viable
-- Delete `preinstallSnapshotNeighbors` (and its 15s tick)
-- Add `neighborListener` (RTM_NEWNEIGH → regenerate snapshot)
-- Add `Manager.RegenerateNeighborSnapshot()`
-- Replace 15s preinstall tick with 15s `resolveNeighborsInner`
-  call (existing function; new caller)
+**PR 1 (this):** v4 minimum viable — MUST contain all 3 critical
+elements per Codex round-3 (otherwise need TTL or dynamic-first
+lookup as foundation, both more invasive):
+
+- **Delete** `preinstallSnapshotNeighbors` (and its 15s tick at
+  `daemon_neighbor.go:468`). Stop the bug source.
+- **Add** `neighborListener` with:
+  - `NeighSubscribeWithOptions{ListExisting:true,
+    ErrorCallback:...}` for initial dump + resubscribe loop
+  - **Broad filter** matching `buildNeighborSnapshots` keyspace
+    (any configured forwarding/fabric interface), NOT narrowed to
+    "static next-hops"
+  - **Forwarding-effective diff** in `shouldTriggerRegen` —
+    ignore REACHABLE↔STALE↔DELAY↔PROBE on same MAC; trigger on
+    MAC change, RTM_DELNEIGH, FAILED/INCOMPLETE
+  - 100ms debounce coalescer
+  - 60s safety reconciliation tick
+- **Add** `Manager.RegenerateNeighborSnapshot()` (event-driven
+  regen API)
+- **Add** `Manager.LookupSnapshotNeighbor(ifindex, ip)` (O(1)
+  cheap read for diff)
+- **Add** `forceProbeNeighbors(cfg)` — sibling of
+  `resolveNeighborsInner` that does NOT skip STALE entries.
+  Called periodically (15s, configurable) to drive proactive
+  re-validation of all monitored neighbors.
+- **Tunable cap** `neighbor-probe-max-targets` (default 256) +
+  log target count each tick.
+- **Replace** the 15s preinstall tick with the new force-probe
+  tick (NOT the existing skip-stale `resolveNeighborsInner`,
+  per Codex finding #1).
 
 **PR 2 (follow-up if needed):** TTL-based expiry on snapshot
 entries. If kernel entries age out (RTM_DELNEIGH), our snapshot
@@ -321,35 +481,35 @@ fires only on RG_active transition (not periodic).
 - Failover test: trigger RG1 failover; verify TCP survives;
   verify standby's kernel ARP is fresh (not stale + reverted).
 
-## 11. Open questions for adversarial review v3
+## 11. Open questions for adversarial review v4
 
-1. Is removing `preinstallSnapshotNeighbors` entirely safe? The
-   function's stated purpose is "keep standby warm for failover."
-   The argument is: standby gets warm via activation-time
-   `resolveNeighbors`, and the new periodic probe keeps it warmer
-   over time. Verifies via failover test.
+1. Is `forceProbeNeighbors` (no skip-STALE) at 15s cadence safe
+   in terms of ARP/NS traffic on the wire? Cap protects against
+   pathological large address-books, but normal case may still
+   be 50-100 probes/min on a busy WAN-side interface.
 
-2. Is RTM_NEWNEIGH from `netlink.NeighSubscribe` reliable enough
-   that we can stop pushing snapshot to kernel? The existing
-   subscription in `daemon_ha_fabric.go:809` is already trusted
-   for fabric peer monitoring; expanding the trust is a small
-   step, but worth flagging.
+2. Is the `shouldTriggerRegen` filter sufficient, or are there
+   forwarding-effective state transitions it misses?
+   Specifically: does NUD_NOARP need any handling
+   (loopback/dummy entries)?
 
-3. Is the `isMonitoredNeighbor` filter scope correct? Initial
-   scope: any IP that appears as a static-route next-hop in the
-   active config; any address-book host; any NAT destination;
-   any fabric peer; any VRRP virtual router. Should this be
-   broader (all configured interface peers) or narrower
-   (next-hops only)?
+3. Is the 60s safety reconciliation tick the right cadence, or
+   should it be tighter (10s) to bound staleness if multicast
+   loses many events in a row?
 
-4. Does the periodic `resolveNeighborsInner` probe at 15s tick
-   create unwanted ARP/NS traffic? At 5-10 next-hops × 15s ticks
-   = ~40 NS/ARP per minute. Compare to broadcast ARP cost.
+4. Does the dynamic-neighbor fallback in
+   `userspace-dp/src/afxdp/forwarding/mod.rs:1464` actually
+   contain the kernel-learned data, or is it independent of
+   netlink? If independent, even a perfect Go-side fix won't
+   reach the data plane — Phase 1 needs to verify the
+   `update_neighbors` publish path is end-to-end correct.
 
-5. Should `RegenerateNeighborSnapshot` debounce? RTM_NEWNEIGH
-   may fire in bursts (e.g., during VRRP failover when many
-   peers all GARP at once). A 100ms debounce would coalesce
-   bursts.
+5. Is "delete `preinstallSnapshotNeighbors` entirely" safe in
+   one PR, or should it be progressive (first reduce blast
+   radius, then add listener, then delete)? The argument for
+   one PR: removing the buggy code is the actual fix; the new
+   listener is the replacement. Argument for progressive: less
+   blast radius if the listener has bugs.
 
 ## 12. Verdict request
 
