@@ -435,6 +435,22 @@ pub(in crate::afxdp) fn select_exact_cos_guarantee_queue_with_fast_path(
                 .owner_profile
                 .drain_park_root_tokens
                 .fetch_add(1, Ordering::Relaxed);
+            // #915 (Codex code-review MAJOR): surplus-sharing exact
+            // queues stay runnable on root-token starvation too —
+            // surplus eligibility waits ONLY on root tokens, never
+            // on queue tokens. If we park here with
+            // `require_queue_tokens=true`, a low-rate
+            // surplus-sharing queue with empty queue.tokens would
+            // be put to sleep until BOTH buckets refill, even
+            // though `select_cos_surplus_batch` would have been
+            // happy to send as soon as root tokens recover (it
+            // calls `estimate_cos_queue_wakeup_tick(..., false)`).
+            // Falling through to the surplus selector lets that
+            // selector handle the root-only park with
+            // `require_queue_tokens=false`.
+            if queue.surplus_sharing {
+                continue;
+            }
             if let Some(wake_tick) = estimate_cos_queue_wakeup_tick(
                 root.tokens,
                 root.shaping_rate_bytes,
