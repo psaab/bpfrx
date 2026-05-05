@@ -13,96 +13,14 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-// preinstallSnapshotNeighbors refreshes the kernel ARP/NDP table from two
-// sources: (1) iterates each configured interface's kernel NeighList and
-// re-installs valid entries as NUD_REACHABLE via netlink.NeighSet, and
-// (2) installs snapshot-learned neighbors from the dataplane provider
-// (populated by buildNeighborSnapshots during Compile and synced from the
-// active node). The periodic neighbor-maintenance loop calls this to keep
-// the standby's neighbor table hot so failover does not depend on
-// activation-time priming.
-func (d *Daemon) preinstallSnapshotNeighbors() {
-	// Read neighbors from the snapshot via the dataplane manager.
-	// Fall back to kernel NeighList if the snapshot isn't available.
-	cfg := d.store.ActiveConfig()
-	if cfg == nil {
-		return
-	}
-	var installed int
-	// Iterate ALL interfaces and install any neighbor we know about.
-	for name, ifc := range cfg.Interfaces.Interfaces {
-		if ifc == nil {
-			continue
-		}
-		for _, unit := range ifc.Units {
-			if unit == nil {
-				continue
-			}
-			linuxName := config.LinuxIfName(name)
-			if unit.Number != 0 {
-				linuxName = fmt.Sprintf("%s.%d", linuxName, unit.Number)
-			}
-			link, err := netlink.LinkByName(linuxName)
-			if err != nil || link == nil {
-				continue
-			}
-			for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-				neighs, err := netlink.NeighList(link.Attrs().Index, family)
-				if err != nil {
-					continue
-				}
-				for _, neigh := range neighs {
-					if neigh.HardwareAddr == nil || len(neigh.HardwareAddr) == 0 {
-						continue
-					}
-					if neigh.State == netlink.NUD_FAILED || neigh.State == netlink.NUD_NOARP {
-						continue
-					}
-					entry := netlink.Neigh{
-						LinkIndex:    link.Attrs().Index,
-						Family:       family,
-						State:        netlink.NUD_REACHABLE,
-						IP:           neigh.IP,
-						HardwareAddr: neigh.HardwareAddr,
-					}
-					if err := netlink.NeighSet(&entry); err == nil {
-						installed++
-					}
-				}
-			}
-		}
-	}
-	// Also install static route next-hop neighbors that may not be in the
-	// kernel table yet (expired while another node owned the RG). Use the
-	// config's known gateway addresses with their MACs from the snapshot.
-	if d.dp != nil {
-		type snapshotNeighborProvider interface {
-			SnapshotNeighbors() []struct {
-				Ifindex int
-				IP      net.IP
-				MAC     net.HardwareAddr
-				Family  int
-			}
-		}
-		if provider, ok := d.dp.(snapshotNeighborProvider); ok {
-			for _, sn := range provider.SnapshotNeighbors() {
-				entry := netlink.Neigh{
-					LinkIndex:    sn.Ifindex,
-					Family:       sn.Family,
-					State:        netlink.NUD_REACHABLE,
-					IP:           sn.IP,
-					HardwareAddr: sn.MAC,
-				}
-				if err := netlink.NeighSet(&entry); err == nil {
-					installed++
-				}
-			}
-		}
-	}
-	if installed > 0 {
-		slog.Info("preinstalled kernel neighbor entries from snapshot", "count", installed)
-	}
-}
+// #1197: preinstallSnapshotNeighbors was deleted. It unconditionally
+// pushed the userspace-dp's in-memory neighbor snapshot back into
+// the kernel ARP table every 15s, which would revert kernel-learned
+// fresher MACs to stale snapshot MACs and break forwarding until
+// xpfd restart. The replacement is event-driven: see
+// daemon_neighbor_listener.go for the RTM_NEWNEIGH/DELNEIGH listener
+// (kernel-as-authority) and forceProbeNeighbors for the periodic
+// proactive ARP/NS probe that keeps kernel entries fresh.
 
 // resolveNeighbors proactively triggers ARP/NDP resolution for all known
 // next-hops, gateways, NAT destinations, and address-book host entries.
@@ -449,6 +367,12 @@ func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context) {
 		case <-resolveTicker.C:
 			if cfg := d.store.ActiveConfig(); cfg != nil {
 				d.resolveNeighbors(cfg)
+				// #1197: force-probe ALL monitored neighbors
+				// (including STALE/DELAY/PROBE) so kernel
+				// re-validates entries that resolveNeighbors
+				// would skip. Replies update kernel ARP →
+				// RTM_NEWNEIGH → listener regenerates snapshot.
+				d.forceProbeNeighbors(cfg)
 				d.maintainClusterNeighborReadiness()
 			}
 		}
@@ -465,7 +389,10 @@ func (d *Daemon) maintainClusterNeighborReadiness() {
 	if d.cluster == nil {
 		return
 	}
-	d.preinstallSnapshotNeighbors()
+	// #1197: preinstall removed; the listener (daemon_neighbor_listener.go)
+	// keeps the snapshot in sync with kernel via netlink events,
+	// and the periodic forceProbeNeighbors tick keeps kernel entries
+	// fresh via proactive ARP/NS.
 	if !d.neighborWarmupInFlight.CompareAndSwap(false, true) {
 		return
 	}

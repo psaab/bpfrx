@@ -437,12 +437,16 @@ func (m *Manager) BumpFIBGeneration() uint32 {
 	m.lastSnapshot.Generation = m.generation
 
 	// Check if kernel neighbors changed — if so, push an incremental update.
+	// #1197: use forwarding-effective diff so REACHABLE↔STALE aging churn
+	// doesn't trigger unnecessary publishes; filter publish payload to
+	// publishable-only entries (matches userspace-dp accept rules).
 	newNeighbors := buildNeighborSnapshots(m.lastSnapshot.Config)
-	if !neighborsEqual(m.lastSnapshot.Neighbors, newNeighbors) {
+	if !neighborsEqualForwarding(m.lastSnapshot.Neighbors, newNeighbors) {
+		publishable := filterPublishableNeighbors(newNeighbors)
 		var status ProcessStatus
 		if err := m.requestLocked(ControlRequest{
 			Type:            "update_neighbors",
-			Neighbors:       newNeighbors,
+			Neighbors:       publishable,
 			NeighborReplace: true,
 		}, &status); err != nil {
 			slog.Warn("userspace: failed to publish neighbor update", "err", err)
@@ -464,6 +468,104 @@ func (m *Manager) BumpFIBGeneration() uint32 {
 		slog.Warn("userspace: failed to bump FIB generation", "err", err)
 	}
 	return newGen
+}
+
+// filterPublishableNeighbors returns only the entries
+// userspace-dp will accept (per neighborSnapshotPublishable).
+func filterPublishableNeighbors(neighbors []NeighborSnapshot) []NeighborSnapshot {
+	out := make([]NeighborSnapshot, 0, len(neighbors))
+	for _, n := range neighbors {
+		if neighborSnapshotPublishable(n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// RegenerateNeighborSnapshot rebuilds the in-memory neighbor
+// snapshot from current kernel ARP/NDP state and publishes any
+// forwarding-relevant changes to userspace-dp.
+//
+// #1197: this is the event-driven entry point used by the
+// daemon's RTM_NEWNEIGH/DELNEIGH listener (and the 60s safety
+// reconciliation tick) to keep the userspace-dp neighbor table
+// in sync with the kernel without depending on the buggy
+// preinstall mechanism.
+//
+// Forwarding-effective diff (key, MAC, publishable-bit) decides
+// whether to publish; raw NUD state (REACHABLE↔STALE) is ignored
+// to avoid republish churn.
+func (m *Manager) RegenerateNeighborSnapshot() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
+		return
+	}
+	if m.proc == nil || m.proc.Process == nil {
+		return
+	}
+	newNeighbors := buildNeighborSnapshots(m.lastSnapshot.Config)
+	if neighborsEqualForwarding(m.lastSnapshot.Neighbors, newNeighbors) {
+		return
+	}
+	publishable := filterPublishableNeighbors(newNeighbors)
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{
+		Type:            "update_neighbors",
+		Neighbors:       publishable,
+		NeighborReplace: true,
+	}, &status); err != nil {
+		slog.Warn("userspace: failed to publish neighbor regeneration", "err", err)
+		return
+	}
+	m.lastSnapshot.Neighbors = newNeighbors
+	m.generation++
+	m.lastSnapshot.Generation = m.generation
+}
+
+// LookupSnapshotNeighbor returns the snapshot's current entry for
+// (ifindex, ip), or nil if not present. Used by the daemon's
+// listener to compute forwarding-effective diff per event.
+//
+// O(N) scan over snapshot.Neighbors. N is bounded by the kernel
+// ARP table size on configured interfaces (~hundreds typical).
+// Called per-event in the listener; if hot-path-sensitive in
+// the future, replace with a map index.
+func (m *Manager) LookupSnapshotNeighbor(ifindex int, ip net.IP) *NeighborSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.lastSnapshot == nil {
+		return nil
+	}
+	ipStr := ip.String()
+	for i := range m.lastSnapshot.Neighbors {
+		n := &m.lastSnapshot.Neighbors[i]
+		if n.Ifindex == ifindex && n.IP == ipStr {
+			return n
+		}
+	}
+	return nil
+}
+
+// SnapshotHasIfindex returns true if the current snapshot
+// contains any neighbor entry on the given ifindex. Used by the
+// daemon's listener filter as a fallback for runtime ifindex
+// drift: if a configured interface has been recreated under a
+// new ifindex (or removed), delete events for the old ifindex
+// must still be processed so we drop stale entries from the
+// snapshot.
+func (m *Manager) SnapshotHasIfindex(ifindex int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.lastSnapshot == nil {
+		return false
+	}
+	for _, n := range m.lastSnapshot.Neighbors {
+		if n.Ifindex == ifindex {
+			return true
+		}
+	}
+	return false
 }
 
 func deriveUserspaceConfig(cfg *config.Config) config.UserspaceConfig {
