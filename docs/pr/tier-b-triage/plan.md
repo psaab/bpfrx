@@ -1,5 +1,5 @@
 ---
-status: DRAFT v1 — pending adversarial plan review
+status: REVISED v2 — Codex pushed back on #837 (keep) and #793/#917 framing (slot-floor not CAS-global)
 issues: #786, #793, #794, #837, #917, #936, #937
 phase: Triage — close-or-keep decision per issue
 ---
@@ -59,14 +59,24 @@ this is the architecturally correct answer per cross-worker-flow-
 fairness-research.md".
 
 **Reality:**
-- **Shipped under issue #917** as PR #939 + closeout PRs
-  #950/#952/#953/#1139. The `V_min` `AtomicU64` exists on
-  `SharedCoSQueueLease`; CAS update on dequeue exists; lag-threshold
-  throttle exists with hard-cap escape.
-- #793 and #917 describe the same Phase 4 work; #917 carried it.
+- **Functionally absorbed by #917 — but not as the literal sketch.**
+  The original Phase 4 plan in `docs/pr/785-umbrella/perf-fairness-plan.md:235`
+  proposed a global `AtomicU64 V_min` on `SharedCoSQueueLease` with
+  CAS-update on dequeue and an empirically-tuned lag threshold `T`.
+- What actually shipped (per #917 PR #939 + closeout) is a different
+  design: per-worker padded atomic slots
+  (`shared_cos_lease.rs:49,132`), single-writer Release store per
+  slot, peer min-scan reduction over participating slots
+  (`shared_cos_lease.rs:95`), const-threshold v1 (configurability
+  deferred per `docs/pr/917-mqfq-phase4/plan.md:352`).
+- The slot-floor design is functionally equivalent for the
+  fairness mechanism but architecturally different from the Phase
+  4 sketch.
 
-**Recommendation:** **Close** as duplicate of #917 (which is itself
-a close-as-shipped candidate).
+**Recommendation:** **Close as superseded/absorbed by #917.** Do
+not claim "literal CAS-global V_min implemented." Be explicit that
+the design landed via slot-floor + min-scan, with config tuning
+deferred.
 
 ### #794 — #785 Phase 5 — AFD policer for misbehaving flows (optional)
 
@@ -99,19 +109,25 @@ outage-class regression #841).
   issues from Codex.
 - #841 (Slice B) caused 100% CPU pegging on all 6 workers + 0 Gbps
   forwarding — outage-class regression. Reverted via PR #842.
-- #843 (Slice B post-mortem) documents three failure modes that
-  shipped without detection: gate-fire `continue` without
-  `park_cos_queue`; `wake_tick` scale confusion; cross-binding
-  fence racing.
-- The achievable scope on this seam has repeatedly proven elusive
-  — every plan attempt has either plan-killed or shipped with
-  regressions.
+- **Repo explicitly preserves #837** per
+  `docs/pr/838-afd-lite/findings.md:142`:
+  > "Do not retire #837. It captures the larger redesign that
+  > would be needed for true cross-binding MQFQ; if mouse-latency
+  > data later shows we need it, the design context is preserved."
+- `docs/pr/838-afd-lite/plan.md:617` defers cross-binding shared-
+  exact AFD/MQFQ work back to #837.
 
-**Recommendation:** **Close as wontfix-with-rationale** (like #946
-closure today). Reopen trigger: a concrete burst-snapshot or
-delta-log seam plan + cluster smoke proving correctness, **plus**
-#843's post-mortem prereqs landed (which should be a separate
-issue if anyone takes them up).
+**Recommendation:** **Keep open as parked/gated** — not
+implementation-ready, but preserved as design-context anchor for
+the larger cross-binding redesign. Add a comment that documents
+the gating: "parked pending mouse-latency data, post-mortem
+prerequisites from #843, or a concrete burst-snapshot seam plan."
+
+This is **different from #946's wontfix-closure** because the
+repo's own design docs preserve #837 explicitly; #946 had no
+such preservation. The two issues have superficially similar
+"plan-killed redesign" shapes but #837's design context is
+actively load-bearing for downstream work.
 
 ### #917 — MQFQ Phase 4 missing — cross-worker virtual time synchronization (V_min)
 
@@ -119,18 +135,30 @@ issue if anyone takes them up).
 CAS-update on dequeue, lag-throttle when `vtime > V_min + T`.
 
 **Reality:**
-- **All four bullet points in the issue body are SHIPPED:**
-  - V_min global atomic — `coordinator/cos_state.rs:8` (#917 PR #939).
-  - Workers CAS-update V_min on dequeue — landed PR #939; correctness
-    repaired via PR #950 (#940 work).
-  - Lag throttle with yield/park — landed; hard-cap escape via PR
-    #952 (#941 work item D).
-  - Telemetry — `v_min_throttles` + `v_min_throttle_hard_cap_overrides`
-    counters via PR #1139 (#943).
+- **Functional V_min mechanism shipped, but not as the literal
+  CAS-global atomic the issue body sketched.** What landed (PR #939
+  + closeout #950/#952/#953/#1139) is a **slot-floor design**:
+  - `queue_vtime_floors` map — per-shared-exact-queue
+    (`coordinator/cos_state.rs:13`).
+  - `PaddedVtimeSlot` — per-worker padded atomic slot
+    (`shared_cos_lease.rs:49,132`). Each worker writes its OWN
+    slot (Release store, single-writer).
+  - V_min is computed as min-scan reduction over participating
+    slots, NOT a single CAS-updated global atomic
+    (`shared_cos_lease.rs:95`).
+  - Lag throttle + hard-cap escape exist
+    (`cos/queue_ops/v_min.rs:142`).
+  - Telemetry: `v_min_throttles` + `v_min_throttle_hard_cap_overrides`
+    counters (`protocol.rs:1230,1240`).
+- The slot-floor design is functionally equivalent for the
+  fairness goal but architecturally **different** from the Phase
+  4 sketch. Worth being explicit about this in the closure
+  rationale so future readers don't search for a non-existent
+  CAS-global atomic.
 
-**Recommendation:** **Close as shipped.** The follow-up trio
-#940/#941/#942/#943 closed; this is the umbrella that should close
-last.
+**Recommendation:** **Close as shipped (with corrected rationale).**
+The closeout trio (#940/#941/#942/#943) is already closed. This
+is the umbrella; close it last with the slot-floor description.
 
 ### #936 — Cross-worker MQFQ: shared per-flow vtime across workers (V_min sync alternative)
 
@@ -185,19 +213,29 @@ aggregate-cap problem is real but unfixable by the existing
 mechanisms. Note that #937 is the strictly-better-aggregate
 alternative to #936 — if either ships, the other becomes redundant.
 
-## 4. Recommendation summary
+## 4. Recommendation summary (revised v2 per Codex review)
 
 | # | Recommendation | Justification |
 |---|---|---|
 | #786 | **Close** | Research-tracker complete; actionable scope split out |
-| #793 | **Close** | Duplicate of #917 (which is shipped) |
+| #793 | **Close as superseded by #917** | Functional scope absorbed; literal CAS-global sketch did NOT land — slot-floor design did |
 | #794 | **Close-as-deferred** | Phase 4 shipped without triggering AFD need; reopen on measured starvation |
-| #837 | **Close-as-wontfix** | Multiple plan-fails + outage regression; needs different architecture |
-| #917 | **Close** | All four bullet points shipped via PR #939 + closeout trio |
-| #936 | **Keep** | Awaiting user trade-off decision (43% aggregate hit for CoV → 0) |
+| #837 | **Keep as parked/gated** | Repo explicitly preserves it (`838-afd-lite/findings.md:142`) for cross-binding redesign |
+| #917 | **Close as shipped** | Functional V_min landed via slot-floor design (NOT CAS-global atomic); be explicit in closure |
+| #936 | **Keep** | Awaiting user trade-off decision (~43% aggregate hit for CoV → 0) |
 | #937 | **Keep** | Distinct mechanism from prior attempts; aggregate-cap problem is real |
 
-**Net effect:** 5 closures, 2 stay open with refined gating notes.
+**Net effect:** 4 closures (#786, #793, #794, #917), 3 stay open
+with refined gating notes (#837, #936, #937). Down from v1's
+"5 closures" — Codex correctly rejected closing #837 as wontfix.
+
+**Codex review applied:**
+1. #837 reframed from close-as-wontfix → keep-as-parked (per
+   `838-afd-lite/findings.md:142`).
+2. #917 closure rationale corrected: slot-floor design, not
+   literal CAS-global atomic.
+3. #793 closure framing corrected: superseded/absorbed by #917,
+   not "literal duplicate whose full original tuning scope landed."
 
 ## 5. Out of scope
 
