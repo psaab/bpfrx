@@ -92,6 +92,83 @@ fn build_cos_state_translates_scheduler_map_entries() {
     assert_eq!(iface.queues[1].buffer_bytes, 64_000);
 }
 
+// #915 (Copilot code-review #3): regression test that
+// `build_cos_state` correctly propagates the snapshot
+// `surplus_sharing` flag into the runtime `CoSQueueConfig`.
+// The builders test alone is insufficient because it starts from
+// a hand-built `CoSQueueConfig`, so a regression that stops
+// `build_cos_state` from copying the snapshot field would not
+// show up there. This test starts from a `CoSSchedulerSnapshot`
+// with `surplus_sharing=true` and verifies the field arrives at
+// `CoSQueueConfig.surplus_sharing`.
+#[test]
+fn build_cos_state_propagates_surplus_sharing_from_snapshot() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 42,
+            cos_shaping_rate_bytes_per_sec: 10_000_000,
+            cos_shaping_burst_bytes: 256_000,
+            cos_scheduler_map: "wan-map".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![
+                CoSForwardingClassSnapshot { name: "iperf-a".into(), queue: 4 },
+                CoSForwardingClassSnapshot { name: "iperf-b".into(), queue: 5 },
+            ],
+            schedulers: vec![
+                CoSSchedulerSnapshot {
+                    name: "iperf-a".into(),
+                    transmit_rate_bytes: 1_000_000_000 / 8,
+                    transmit_rate_exact: true,
+                    priority: "low".into(),
+                    buffer_size_bytes: 128 * 1024,
+                    surplus_sharing: true, // opt-in
+                },
+                CoSSchedulerSnapshot {
+                    name: "iperf-b".into(),
+                    transmit_rate_bytes: 10_000_000_000 / 8,
+                    transmit_rate_exact: true,
+                    priority: "low".into(),
+                    buffer_size_bytes: 128 * 1024,
+                    surplus_sharing: false, // explicit hard-cap
+                },
+            ],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "iperf-a".into(),
+                        scheduler: "iperf-a".into(),
+                    },
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "iperf-b".into(),
+                        scheduler: "iperf-b".into(),
+                    },
+                ],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+
+    let state = build_cos_state(&snapshot);
+    let iface = state.interfaces.get(&42).expect("missing CoS interface");
+    let q4 = iface.queues.iter().find(|q| q.queue_id == 4).unwrap();
+    let q5 = iface.queues.iter().find(|q| q.queue_id == 5).unwrap();
+    assert!(q4.surplus_sharing,
+        "snapshot scheduler iperf-a (surplus_sharing=true) must reach \
+         CoSQueueConfig.surplus_sharing on queue 4");
+    assert!(!q5.surplus_sharing,
+        "snapshot scheduler iperf-b (surplus_sharing=false) must reach \
+         CoSQueueConfig.surplus_sharing=false on queue 5");
+    // Sanity: both still exact (so the strip-on-non-exact rule wouldn't have
+    // fired even if it had been at this layer).
+    assert!(q4.exact && q5.exact);
+}
+
 #[test]
 fn build_cos_state_falls_back_to_default_best_effort_queue() {
     let snapshot = ConfigSnapshot {
