@@ -27,12 +27,14 @@ Command (best-effort port 5201, P=128, 15 s push):
 iperf3 -c 172.16.80.200 -P 128 -t 15 -p 5201
 ```
 
-Results (two consecutive runs):
+Results (two consecutive runs on best-effort port 5201, plus one
+run on the iperf-c shaped class port 5203):
 
-| Run | Duration | Bytes | Throughput | Retrans | Direction |
-|-----|---------:|------:|-----------:|--------:|-----------|
-| 1   | 15.02 s  | 41.3 GBytes | **23.6 Gb/s** | 22 564 | push |
-| 2   | 15.01 s  | 41.3 GBytes | **23.7 Gb/s** | 19 842 | push |
+| Run | Port (class) | Duration | Bytes | Throughput | Retrans | Direction |
+|-----|------|---------:|------:|-----------:|--------:|-----------|
+| 1   | 5201 (best-effort) | 15.02 s  | 41.3 GBytes | **23.6 Gb/s** | 22 564 | push |
+| 2   | 5201 (best-effort) | 15.01 s  | 41.3 GBytes | **23.7 Gb/s** | 19 842 | push |
+| 3   | 5203 (iperf-c, 25 Gb/s shape) | 15.01 s | 41.3 GBytes | **23.6 Gb/s** | 23 430 | push |
 
 P=12 reference on the same binary, same target:
 
@@ -43,12 +45,12 @@ P=12 reference on the same binary, same target:
 
 ## Verdict against #944 acceptance criteria
 
-- [x] Reproduce the P=128 ~17 Gb/s observation on the loss cluster
-      (verify it's still a thing post-#917). **Outcome: NOT
-      reproducible.** P=128 = 23.6/23.7 Gb/s, no measurable
-      delta from P=12. The 5 hypotheses listed in the issue
-      (per-worker MQFQ scaling cost, cross-bucket vtime
-      contention, TX-completion saturation, flow cache
+- [x] Attempt reproduction of the P=128 ~17 Gb/s observation
+      on the loss cluster (verify it's still a thing post-#917).
+      **Outcome: NOT reproducible.** P=128 = 23.6/23.7 Gb/s, no
+      measurable delta from P=12. The 5 hypotheses listed in
+      the issue (per-worker MQFQ scaling cost, cross-bucket
+      vtime contention, TX-completion saturation, flow cache
       thrashing, admission overhead) collectively no longer
       bottleneck below the 22 Gb/s gate.
 
