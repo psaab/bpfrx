@@ -1,8 +1,51 @@
 ---
-status: DRAFT v2 — Codex round-1 PLAN-NEEDS-MAJOR addressed (parking, lease, Rust serde, ast.go/ValidateConfig schema, CLI, stale symbol); Gemini Pro 3 round-1 PLAN-NEEDS-MINOR (subset of Codex) addressed
+status: PLAN-READY v3 — Codex round-2 PLAN-NEEDS-MINOR addressed (CLI file path, CoSQueueConfig step, validation-rule citation, end-to-end test tightening); Gemini Pro 3 round-2 PLAN-READY ✅
 issue: https://github.com/psaab/xpf/issues/915
 phase: Add `surplus-sharing` opt-in for exact CoS queues
 ---
+
+## Changelog v3
+
+Codex round-2 (`task-morzhmoo-pobdx3`) returned PLAN-NEEDS-MINOR
+with 4 trivial findings; Gemini Pro 3 round-2 (`task-morzi1xz-rqwsd8`)
+returned PLAN-READY ✅ with no findings.
+
+Codex round-2 v3 fixes:
+
+- **MINOR — §4.7 stale CLI file path**: `pkg/cli/cli_show_cos.go`
+  does not exist; actual path is `pkg/cli/cli_show_services.go`
+  which delegates to `pkg/dataplane/userspace/cosfmt.go`.
+  Updated §4.7 to point only at `cosfmt.go` (no separate CLI
+  mirror needed).
+
+- **MINOR — §4.3 missing intermediate `CoSQueueConfig` step**:
+  v2 went straight from snapshot → `CoSQueueRuntime`. Actual
+  flow is snapshot scheduler → `CoSQueueConfig`
+  (userspace-dp/src/afxdp/types/cos.rs:50) → `build_cos_runtime`
+  (userspace-dp/src/afxdp/cos/builders.rs:90) →
+  `CoSQueueRuntime`. v3 §4.3 names both copy sites explicitly.
+
+- **MINOR — §4.9 contradicts §4.2 on validation location**:
+  v2 §4.9 said `compiler_class_of_service.go` emits the
+  warning; v2 §4.2 correctly puts it in
+  `pkg/config/compiler.go:ValidateConfig` (which runs after
+  typed CoS compilation and has access to
+  `cfg.ClassOfService.Schedulers`). v3 removes §4.9's
+  duplicate; §4.2 is the canonical statement.
+
+- **MINOR — §8 end-to-end test too loose**: Codex flagged
+  that a test which only calls `select_cos_surplus_batch` does
+  not prove the no-park branch was crossed. v3 §8 keeps the
+  isolation tests AND adds an explicit production-order test
+  that drives `drain_shaped_tx` (or sequentially calls
+  `select_exact_cos_guarantee_queue_with_fast_path` then
+  `select_cos_surplus_batch`) so the parking blocker can't
+  reappear outside the surplus selector unit test.
+
+Gemini PASS confirmed all v2 round-2 mechanics: no-park
+branch, phase-gated lease, opt-in default, strict-priority,
+DRR fairness, validation strip semantics, smoke contention
+scenario, no new MAJOR.
 
 ## Changelog v2
 
@@ -179,6 +222,17 @@ the config.
 
 ### 4.3 Rust runtime plumbing
 
+The snapshot → runtime flow has THREE Rust struct layers
+(per Codex round-2 MINOR 2): `CoSSchedulerSnapshot` (wire
+format, src/protocol.rs) → `CoSQueueConfig` (intermediate,
+src/afxdp/types/cos.rs:50) → `CoSQueueRuntime`
+(hot-path, src/afxdp/types/cos.rs:405). `surplus_sharing`
+must be added to all three with explicit copy steps.
+
+- `userspace-dp/src/afxdp/types/cos.rs:CoSQueueConfig`: add
+  `pub(in crate::afxdp) surplus_sharing: bool`. This is the
+  intermediate config built from the snapshot before the
+  runtime is materialized.
 - `userspace-dp/src/afxdp/types/cos.rs:CoSQueueRuntime`: add
   `pub(in crate::afxdp) surplus_sharing: bool`. Doc-comment
   records: "Only meaningful when `exact == true`. When set,
@@ -189,9 +243,15 @@ the config.
   guarantee but can also draw from root surplus tokens once its
   own bucket is empty (#915)."
 - `userspace-dp/src/afxdp/forwarding_build.rs`: populate
-  `surplus_sharing` from
+  `CoSQueueConfig.surplus_sharing` from
   `scheduler.surplus_sharing`, defaulting to `false`. Mirror
   the `exact` field's `.map(...).unwrap_or(false)` shape.
+- `userspace-dp/src/afxdp/cos/builders.rs:build_cos_runtime`:
+  copy `config.surplus_sharing` into
+  `CoSQueueRuntime.surplus_sharing` alongside the existing
+  `config.exact` copy. The builders test
+  (`cos_queue_runtime_propagates_surplus_sharing` in §8)
+  exercises this site.
 
 ### 4.4 Surplus-skip change in `select_cos_surplus_batch`
 
@@ -324,10 +384,12 @@ a `Surplus sharing: yes/no` line for each queue. Operators
 debugging an exact queue that exceeds its configured rate need
 this visibility — without it, the bursting looks like a bug.
 
-The `show class-of-service interface` rendering also lives in
-`pkg/cli/cli_show_cos.go` (and possibly mirrored in DPDK
-manager output if applicable). Mirror the field there. Field
-is rendered only when `Exact == true` to avoid noise on
+`pkg/cli/cli_show_services.go:100` already delegates to
+`cosfmt.go` (per Codex round-2 MINOR 1), so the rendering
+change in `cosfmt.go` is the only CLI write site. No separate
+`pkg/cli/cli_show_cos.go` (that file does not exist).
+
+Field is rendered only when `Exact == true` to avoid noise on
 non-exact queues.
 
 ### 4.8 What NOT to change
@@ -350,12 +412,11 @@ non-exact queues.
 
 ### 4.9 Validation rule
 
-`pkg/config/compiler_class_of_service.go` emits a warning when
-`SurplusSharing == true` and `TransmitRateExact == false`:
-"surplus-sharing is meaningful only on transmit-rate exact
-schedulers; ignored." Doesn't reject. Aligns with #1183 lesson
-(post-build "useful state" gate) — config validation should
-warn-and-strip, not error-and-block.
+(See §4.2 for the canonical statement — warn-and-strip in
+`pkg/config/compiler.go:ValidateConfig`. v3 removes the
+duplicate text that previously incorrectly cited
+`compiler_class_of_service.go` as the validation site, per
+Codex round-2 MINOR 3.)
 
 ## 5. Public API preservation
 
@@ -446,18 +507,24 @@ warn-and-strip, not error-and-block.
     `#[serde(default)]` schema-migration path; addresses
     Codex MAJOR 3 + Gemini #7).
   - `userspace-dp/src/afxdp/cos/queue_service/tests.rs`:
-    `select_cos_surplus_batch_includes_exact_with_surplus_sharing`
-    — exact queue with surplus_sharing=true and
-    `queue.tokens=0` is selected for surplus when root has
-    tokens. This is the END-TO-END test: drives an exact
-    queue through the exact-guarantee no-park branch
-    (§4.5) and into surplus phase via the surplus-skip
-    relaxation (§4.4). Failure here catches the parking
-    blocker Codex MAJOR 1 flagged.
+    `surplus_sharing_exact_reaches_surplus_through_full_drain_pass`
+    — **production-order end-to-end test (Codex round-2 MINOR
+    4)**. Sets up an exact queue with `surplus_sharing=true`,
+    `queue.tokens=0`, root with tokens, no other queues
+    runnable. Calls `drain_shaped_tx` (the actual production
+    entry point). Asserts the batch returned came from the
+    surplus-sharing exact queue with `phase ==
+    CoSServicePhase::Surplus`. This proves the full path:
+    exact-guarantee selector hits the no-park branch
+    (§4.5) → falls through to `build_nonexact_cos_batch` →
+    `select_cos_surplus_batch` (§4.4) picks the queue. A
+    surplus-selector-only test would not catch a parking
+    regression elsewhere on the same drain pass.
   - `userspace-dp/src/afxdp/cos/queue_service/tests.rs`:
     `select_cos_surplus_batch_excludes_exact_without_surplus_sharing`
     — default-false preserves today's hard-cap behavior; the
-    exact queue gets parked, surplus skips it.
+    exact queue gets parked, surplus skips it. Direct unit
+    on the surplus selector for fast regression detection.
   - `userspace-dp/src/afxdp/cos/queue_service/tests.rs`:
     `exact_with_surplus_sharing_not_parked_on_queue_token_starvation`
     — directly tests §4.5: after one exact-guarantee call
