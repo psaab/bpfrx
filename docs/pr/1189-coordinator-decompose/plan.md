@@ -1,5 +1,5 @@
 ---
-status: REVISED v10 — Codex round-9 PLAN-NEEDS-MINOR; corrected Option B test-scope wording — a test-module-local `use` only resolves bare calls; preserving the existing `super::panic_payload_message` test path needs `#[cfg(test)] use supervisor::panic_payload_message;` in `coordinator/mod.rs` (the parent module), not in the test module itself
+status: v10 FINAL — Codex round-10 PLAN-READY. Implementation uses Option A (tests call `super::supervisor::*` directly; cleanest path, no re-export needed). Plan rounds 1-10 progression preserved in git history
 issue: #1189
 phase: First incremental migration of one manager surface
 ---

@@ -45,7 +45,7 @@ pub(super) fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> 
 ///
 /// `AssertUnwindSafe` rationale: aux thread bodies own their state
 /// and `Arc`s; no `&mut` parameters cross the unwind. Shared
-/// `Arc<Mutex<…>>` may become poisoned. Same-file consumers
+/// `Arc<Mutex<…>>` may become poisoned. Consumers in `coordinator/mod.rs`
 /// follow two poison-tolerant patterns: (a) `into_inner` recovery
 /// (e.g. the worker `panic_slot` write at the bottom of
 /// `spawn_supervised_worker`), and (b) `if let Ok(mut guard) =
