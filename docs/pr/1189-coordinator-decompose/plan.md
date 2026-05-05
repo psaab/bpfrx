@@ -1,5 +1,5 @@
 ---
-status: REVISED v8 — Codex round-7 PLAN-NEEDS-MINOR; softened byte-identical claim to acknowledge module-relative path rewrites are required (`super::worker_runtime::WorkerRuntimeAtomics` at mod.rs:1924 → `super::super::worker_runtime::WorkerRuntimeAtomics` or absolute `crate::afxdp::worker_runtime::WorkerRuntimeAtomics` after move into supervisor.rs); added step 8 covering this path rewrite
+status: REVISED v9 — Codex round-8 PLAN-NEEDS-MINOR; corrected Option B to private `use supervisor::{...};` (not `pub(super) use`, which Rust rejects as private-item re-export of `pub(super)` items), and trimmed the production `use` import to only the two spawn helpers actually called from production sites (`panic_payload_message` is test-only)
 issue: #1189
 phase: First incremental migration of one manager surface
 ---
@@ -231,10 +231,14 @@ valid options — pick one in implementation:
   from `super::panic_payload_message` →
   `super::supervisor::panic_payload_message` (similarly for
   the other two helpers). Cleaner; no re-export.
-- **Option B:** add `pub(super) use supervisor::{panic_payload_message,
+- **Option B:** add a private `use supervisor::{panic_payload_message,
   spawn_supervised_worker, spawn_supervised_aux};` in `mod.rs`
-  so the existing five test paths stay unchanged. Smaller diff
-  but adds a coordinator-module re-export.
+  so the existing five test paths stay unchanged. (Rust rejects
+  `pub(super) use` of `pub(super)` items as a private-item
+  re-export, so the `use` MUST be private — module-scope only.
+  An alternative is to widen the helpers to `pub(in crate::afxdp)`
+  and use `pub(super) use`, but the private `use` is the cleaner
+  fix and keeps visibility minimal.)
 
 **Production helper-call sites in `mod.rs` (require path
 update under both Option A and Option B):**
@@ -248,12 +252,19 @@ update under both Option A and Option B):**
 
 These are bare unqualified calls today (the helpers live in the
 same module). After the move they need to resolve into
-`supervisor::*`. The cleanest fix is a `use supervisor::{
-panic_payload_message, spawn_supervised_worker,
-spawn_supervised_aux};` at the top of `mod.rs` so the three
-production sites stay untouched. (This is module-scope `use`,
-not the test-only `pub(super) use` of Option B; both can coexist
-or only the production `use` is needed under Option A.)
+`supervisor::*`. The cleanest fix is a private
+`use supervisor::{spawn_supervised_worker, spawn_supervised_aux};`
+at the top of `mod.rs` so the three production sites stay
+untouched. Note: the production import only needs the two spawn
+helpers — `panic_payload_message` is exclusively used by tests
+(`tests.rs:840`), so importing it in non-test scope would
+trigger an `unused_imports` warning under `#[cfg(not(test))]`
+builds. Under Option A the prod `use` covers production calls
+and tests use the explicit `super::supervisor::*` path. Under
+Option B the same prod `use` covers production calls and a
+separate private `use supervisor::{panic_payload_message,
+spawn_supervised_worker, spawn_supervised_aux};` (or a single
+combined `use supervisor::*;`) in the test module covers tests.
 
 Implementation checklist must touch all five lines (840, 869,
 889, 903, 918) under Option A or none under Option B; do not
