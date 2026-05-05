@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/appid"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcpserver"
@@ -162,72 +162,16 @@ func (c *CLI) showRPMProbeResults() error {
 	return nil
 }
 
-// showApplicationIdentificationStatus surfaces what xpf AppID
-// actually does today vs the Junos vSRX `services
-// application-identification` feature. Honest contract.
-//
-// #653: operators enabling `services application-identification`
-// see the knob accepted at commit time but get a much narrower
-// implementation than vSRX. This output makes the gap explicit
-// at runtime so an operator looking at session output that says
-// "junos-http" understands it came from a port lookup, not L7 DPI.
+// showApplicationIdentificationStatus delegates to the shared
+// renderer in `pkg/appid` so the local CLI and the gRPC
+// text-show surface stay byte-identical (Copilot review #5 on
+// PR #1196). #653.
 func (c *CLI) showApplicationIdentificationStatus() error {
 	cfg := c.store.ActiveConfig()
-	enabled := cfg != nil && cfg.Services.ApplicationIdentification
-
-	fmt.Println("Application identification (AppID) status:")
-	fmt.Printf("  Configured:                  %s\n", yesNoBool(enabled))
-	fmt.Println("  Engine implementation:        port + protocol matching only")
-	fmt.Println("  L7 DPI / signature engine:    not implemented")
-	fmt.Println("  Signature package:            not supported")
-	fmt.Println("  Application System Cache:     not supported")
-	fmt.Println("  Custom L7 signatures:         not supported")
-	fmt.Println("  Auto-update / download:       not supported")
-	fmt.Println()
-	fmt.Println("How sessions get their app name today:")
-	fmt.Println("  1. At session-create time the dataplane looks up")
-	fmt.Println("     (protocol, dst_port[, src_port_range]) in the")
-	fmt.Println("     compiled `applications` catalog and stamps the")
-	fmt.Println("     matching app_id on the session.")
-	fmt.Println("  2. `show security flow session` resolves the app_id")
-	fmt.Println("     back to a name via the same catalog.")
-	fmt.Println("  3. When `services application-identification` is")
-	fmt.Println("     ENABLED and no port match exists, the session")
-	fmt.Println("     name is `UNKNOWN` (honest — no L7 inspection).")
-	fmt.Println("  4. When DISABLED, sessions fall back to a built-in")
-	fmt.Println("     port→name heuristic (junos-http=80, junos-ssh=22,")
-	fmt.Println("     etc.) for common ports.")
-	fmt.Println()
-	if enabled {
-		fmt.Println("Operator note:")
-		fmt.Println("  `services application-identification` is enabled, but")
-		fmt.Println("  this only changes step 3 (UNKNOWN vs port-heuristic).")
-		fmt.Println("  It does NOT enable L7 DPI. Dynamic-application policies")
-		fmt.Println("  (`security policies ... match dynamic-application`),")
-		fmt.Println("  AppTrack, AppFW, AppQoS are NOT implemented.")
-	}
-	fmt.Println()
-	fmt.Println("Catalog statistics:")
-	if cfg == nil {
-		fmt.Println("  (no active configuration)")
-		return nil
-	}
-	fmt.Printf("  Predefined applications:     %d\n", len(config.PredefinedApplications))
-	fmt.Printf("  User-defined applications:   %d\n", len(cfg.Applications.Applications))
-	fmt.Printf("  Application sets:            %d\n", len(cfg.Applications.ApplicationSets))
-	fmt.Println()
-	fmt.Println("See:")
-	fmt.Println("  show configuration applications")
-	fmt.Println("  show security flow session")
-	fmt.Println("  docs/services-application-identification.md")
+	var buf strings.Builder
+	appid.RenderStatus(&buf, cfg)
+	fmt.Print(buf.String())
 	return nil
-}
-
-func yesNoBool(b bool) string {
-	if b {
-		return "yes"
-	}
-	return "no"
 }
 
 func (c *CLI) showSchedulers() error {
