@@ -1,5 +1,5 @@
 ---
-status: REVISED v4 — Codex round-3 PLAN-NEEDS-MINOR; scrubbed remaining v1 residue in sections 3 and 9
+status: v4 FINAL — Codex round-4 PLAN-READY; v3 → v4 scrubbed remaining v1 residue in sections 3 and 9 (no further revisions needed; merged version)
 issue: #1166
 phase: Pure code-motion refactor
 ---
