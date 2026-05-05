@@ -1,5 +1,5 @@
 ---
-status: REVISED v4 — Codex round-3 PLAN-NEEDS-MAJOR; corrected stop_and_clear signature to match actual `Option<&OwnedFd>` types in `BpfMaps`, scrubbed "pure code motion" residue document-wide, corrected test line citations (helper uses are 840/869/889/903/918; 312/322/958/1001 are unaffected direct-field access)
+status: REVISED v5 — Codex round-4 PLAN-NEEDS-MAJOR; scrubbed last `BorrowedFd<'_>` residue at sections 2/6, named actual cleanup site (`stop_inner` at mod.rs:187), added `status.rs:184` and the three production helper-call sites at mod.rs:679/780/830, dropped tests.rs:1001 (was a comment), corrected panic_payload_message location to mod.rs:1849
 issue: #1189
 phase: First incremental migration of one manager surface
 ---
@@ -118,10 +118,10 @@ state, it stays on Coordinator.
 
 ### `coordinator/mod.rs` — items leaving the file
 
-Phase 1 v3 moves four concrete slices out of `mod.rs`:
+Phase 1 v5 moves five concrete slices out of `mod.rs`:
 
 1. **`panic_payload_message(payload: &Box<dyn Any + Send>) -> String`**
-   — pure free function (`mod.rs:~1080`). Becomes a `pub(super)`
+   — pure free function at `mod.rs:1849`. Becomes a `pub(super)`
    free function in a new `coordinator/supervisor.rs` (rationale
    below).
 2. **`spawn_supervised_worker(...)`** — the panic-catch wrapper
@@ -136,18 +136,30 @@ Phase 1 v3 moves four concrete slices out of `mod.rs`:
    live on `WorkerManager`. Lands in `coordinator/supervisor.rs`
    alongside `spawn_supervised_worker` as a `pub(super)` free
    function.
-4. **Worker stop/clear loop** at `mod.rs:202-222` (iterate
+4. **Worker stop/clear loop** at `mod.rs:202-222` (inside
+   `Coordinator::stop_inner` at `mod.rs:187`, called by both
+   `stop` and `stop_with_event_stream`). Iterates
    `self.workers.handles` to send shutdown / await joins / drop
-   `xsk_map`/`heartbeat_map` entries / clear `handles`). Becomes
+   `xsk_map`/`heartbeat_map` entries / clear `handles`. Becomes
    a method `WorkerManager::stop_and_clear(&mut self,
-   xsk_map_fd: BorrowedFd<'_>, heartbeat_map_fd: BorrowedFd<'_>)`.
-   The map fds are passed in because they live on `Coordinator`
-   (or one of its sub-managers), not `WorkerManager`.
+   xsk_map_fd: Option<&OwnedFd>, heartbeat_map_fd: Option<&OwnedFd>)`
+   — see section 4 step 3 for the full signature and body.
+   `OwnedFd` here is the project's local
+   `crate::afxdp::bpf_map::OwnedFd` (with public `.fd: c_int`
+   field), **not** `std::os::fd::OwnedFd`. The map fds live on
+   `Coordinator` via `BpfMaps`, not on `WorkerManager`, hence
+   the explicit parameters.
 5. **Accessor wrappers** for `last_planned_workers` /
    `last_planned_bindings` — trivial `&self` getters added on
-   `WorkerManager`, then `mod.rs` reads `self.workers.last_planned_workers()`
-   instead of `self.workers.last_planned_workers` directly. Pure
-   wrapper change; no behavior change.
+   `WorkerManager`. All read sites get updated:
+   - `mod.rs` (stage label / status surface in `reconcile`)
+   - `coordinator/status.rs:184` (`Coordinator::planned_counts`,
+     which currently reads
+     `self.workers.last_planned_workers` and
+     `self.workers.last_planned_bindings` directly).
+   The fields keep `pub(in crate::afxdp)` visibility because
+   `reconcile` writes them; the accessors just give callers a
+   stable read path. Pure wrapper change; no behavior change.
 
 ### What **stays on `Coordinator`** in Phase 1
 
@@ -182,7 +194,11 @@ Two distinct kinds of test reaches into private worker-related state.
 **Direct field access (unaffected by this PR):**
 
 - `tests.rs:312,322` insert into `coordinator.workers.identities`.
-- `tests.rs:958,1001` insert into / inspect `coordinator.workers.live`.
+- `tests.rs:958` inserts into `coordinator.workers.live`.
+- `tests.rs:1001` is a comment about deliberately *not*
+  inserting into `coordinator.workers.live` for slot 7 — no
+  field access, just documentation; flagging here only because a
+  future grep would surface it.
 
 These rely on the existing `pub(in crate::afxdp)` field
 visibility on `WorkerManager`'s fields and continue to work
@@ -208,6 +224,25 @@ valid options — pick one in implementation:
   spawn_supervised_worker, spawn_supervised_aux};` in `mod.rs`
   so the existing five test paths stay unchanged. Smaller diff
   but adds a coordinator-module re-export.
+
+**Production helper-call sites in `mod.rs` (require path
+update under both Option A and Option B):**
+
+- `mod.rs:679` — `spawn_supervised_worker(...)` from
+  `Coordinator::reconcile` (the worker spawn path).
+- `mod.rs:780` — `spawn_supervised_aux("neigh-monitor", ...)`
+  from the neighbor-monitor setup.
+- `mod.rs:830` — `spawn_supervised_aux(format!(...), ...)`
+  from the local-tunnel source setup.
+
+These are bare unqualified calls today (the helpers live in the
+same module). After the move they need to resolve into
+`supervisor::*`. The cleanest fix is a `use supervisor::{
+panic_payload_message, spawn_supervised_worker,
+spawn_supervised_aux};` at the top of `mod.rs` so the three
+production sites stay untouched. (This is module-scope `use`,
+not the test-only `pub(super) use` of Option B; both can coexist
+or only the production `use` is needed under Option A.)
 
 Implementation checklist must touch all five lines (840, 869,
 889, 903, 918) under Option A or none under Option B; do not
@@ -265,8 +300,9 @@ which are NOT moved in Phase 1 — those tests are unaffected.
    self.live.clear();
    ```
 
-   `Coordinator::shutdown` (or wherever the cleanup lives today)
-   replaces `mod.rs:202-222` with:
+   `Coordinator::stop_inner` at `mod.rs:187` (called by both
+   `stop` and `stop_with_event_stream`) replaces `mod.rs:202-222`
+   with:
 
    ```rust
    self.workers.stop_and_clear(
@@ -310,10 +346,12 @@ verbatim move".
 
 No external (non-`afxdp`) signatures change. Within `afxdp`:
 
-- `Coordinator::shutdown` (or whichever entry owns the
-  stop loop) keeps its signature; its body now calls
-  `self.workers.stop_and_clear(...)` and then
-  `self.worker_panics.clear()`.
+- `Coordinator::stop_inner` (`mod.rs:187`) keeps its signature
+  (`pub(crate) fn stop_inner(&mut self, clear_synced_state: bool)`);
+  its body now calls `self.workers.stop_and_clear(...)` and
+  then `self.worker_panics.clear()` in place of the inline
+  `mod.rs:202-222` block. Both public callers (`stop` and
+  `stop_with_event_stream`) pick up the change transparently.
 - `panic_payload_message`, `spawn_supervised_worker`,
   `spawn_supervised_aux` change resolution path from
   `coordinator::*` to `coordinator::supervisor::*`. With
@@ -328,7 +366,7 @@ No external (non-`afxdp`) signatures change. Within `afxdp`:
 | Class | Level | Why |
 |---|---|---|
 | Behavioral regression | LOW | Supervisor helpers move verbatim; `stop_and_clear` is the same loop with explicit fd params; accessors are trivial getters |
-| Borrow-checker / lifetime | LOW-MED | `stop_and_clear` takes `BorrowedFd<'_>` so it does not double-borrow `self` while mutating `self.workers`. The map fds live on `Coordinator`, not under `self.workers`, so the split-borrow is clean |
+| Borrow-checker / lifetime | LOW-MED | `stop_and_clear` takes `Option<&OwnedFd>` (read-only borrow on `BpfMaps` fields) and `&mut self` for the WorkerManager. The map fds live on `Coordinator` via `self.bpf_maps`, not under `self.workers`, so the split-borrow `self.workers.stop_and_clear(self.bpf_maps.map_fd.as_ref(), self.bpf_maps.heartbeat_map_fd.as_ref())` is clean — disjoint fields |
 | Cross-manager coupling | LOW | Phase 1 explicitly excludes anything that spans multiple managers (reconcile, HA dispatch, refresh_bindings, neighbor/tunnel supervision lifecycle) |
 | Test path breakage | LOW | Predictable: tests need either updated `super::supervisor::*` paths or a re-export in `mod.rs`. Documented above |
 | Performance regression | LOW | `stop_and_clear` runs at shutdown only; accessor wrappers compile to direct field reads |
