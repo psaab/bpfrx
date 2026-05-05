@@ -28,4 +28,44 @@ impl WorkerManager {
             last_planned_bindings: 0,
         }
     }
+
+    pub(super) fn last_planned_workers(&self) -> usize {
+        self.last_planned_workers
+    }
+
+    pub(super) fn last_planned_bindings(&self) -> usize {
+        self.last_planned_bindings
+    }
+
+    /// #1189 Phase 1: stop all workers, drain map slots, and clear
+    /// per-worker state. Called from `Coordinator::stop_inner`.
+    /// Caller passes the BPF map fds because they live on
+    /// `Coordinator::bpf_maps`, not on `WorkerManager`.
+    pub(super) fn stop_and_clear(
+        &mut self,
+        xsk_map_fd: Option<&crate::afxdp::bpf_map::OwnedFd>,
+        heartbeat_map_fd: Option<&crate::afxdp::bpf_map::OwnedFd>,
+    ) {
+        for handle in self.handles.values_mut() {
+            handle.stop.store(true, Ordering::Relaxed);
+        }
+        for (_, handle) in self.handles.iter_mut() {
+            if let Some(join) = handle.join.take() {
+                let _ = join.join();
+            }
+        }
+        if let Some(map_fd) = xsk_map_fd {
+            for slot in self.live.keys().copied().collect::<Vec<_>>() {
+                let _ = delete_xsk_slot(map_fd.fd, slot);
+            }
+        }
+        if let Some(map_fd) = heartbeat_map_fd {
+            for slot in self.live.keys().copied().collect::<Vec<_>>() {
+                let _ = delete_heartbeat_slot(map_fd.fd, slot);
+            }
+        }
+        self.handles.clear();
+        self.identities.clear();
+        self.live.clear();
+    }
 }
