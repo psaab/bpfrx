@@ -1,5 +1,5 @@
 ---
-status: REVISED v3 — Codex round-2 PLAN-NEEDS-MINOR; deleted v1 residue, reframed stop extraction with fd inputs, moved spawn_supervised_aux out of WorkerManager, documented test path updates
+status: REVISED v4 — Codex round-3 PLAN-NEEDS-MAJOR; corrected stop_and_clear signature to match actual `Option<&OwnedFd>` types in `BpfMaps`, scrubbed "pure code motion" residue document-wide, corrected test line citations (helper uses are 840/869/889/903/918; 312/322/958/1001 are unaffected direct-field access)
 issue: #1189
 phase: First incremental migration of one manager surface
 ---
@@ -53,9 +53,16 @@ Coordinator` into `impl WorkerManager`**.
    stream, panic slots, recent status queues).
 2. `WorkerCommand` dispatch is owned by HA paths
    (`ha.rs:40,102,171,310,366`), not just worker supervision.
-3. Tests reach private worker state directly
-   (`coordinator/tests.rs:312,840,958`,
-   `ha_tests.rs:235`).
+3. Tests reach private worker state directly via two paths —
+   field access (`coordinator.workers.identities/live` at
+   `coordinator/tests.rs:312,322,958,1001`) and helper-function
+   calls (`super::panic_payload_message` /
+   `super::spawn_supervised_worker` /
+   `super::spawn_supervised_aux` at
+   `coordinator/tests.rs:840,869,889,903,918`). `ha_tests.rs:235`
+   reaches `super::ha::*` worker-command sites which are NOT
+   moved in Phase 1. See section 3 for the test-surface
+   treatment.
 
 So `reconcile` and HA command dispatch CANNOT migrate cleanly
 in Phase 1. They span too many managers' state.
@@ -90,12 +97,18 @@ Win for Phase 1:
   shutdown / accessor helpers)
 - `worker_manager.rs` grows from 31 LOC stub with `new()` only
   to ~120-200 LOC with the migrated methods
-- Validates the migration shape (delegation pattern + test
-  access via `pub(in crate::afxdp)` field) before larger
-  extractions
-- Each migrated method is **pure code motion** — body verbatim,
-  receiver type changes from `&mut Coordinator` (or `&self`) to
-  `&mut WorkerManager` (or `&self`). No behavior change.
+- Validates the migration shape (small struct + sibling
+  module + `pub(in crate::afxdp)` field for test access) before
+  larger extractions like `reconcile` or HA dispatch
+- This is a **behavior-preserving refactor**, not byte-verbatim
+  motion. Specifically: the supervisor helpers
+  (`panic_payload_message`, `spawn_supervised_worker`,
+  `spawn_supervised_aux`) move byte-identical into
+  `coordinator/supervisor.rs`. The stop loop becomes
+  `WorkerManager::stop_and_clear(...)` with explicit fd inputs;
+  the body is the same logic with `self.workers.` references
+  rewritten to `self.`. Accessors are obviously not byte-
+  identical. No observable behavior change in any case.
 
 **Hard rule (Codex round-1 #4):** WorkerManager methods MUST
 NOT take `&mut Coordinator`. If a method needs Coordinator-only
@@ -164,25 +177,41 @@ From 31 LOC stub (struct + `new()`) to ~60-90 LOC: add
 
 ### Test surface
 
-Existing tests at `coordinator/tests.rs:312,840,958` and
-`ha_tests.rs:235` reach into worker-related items directly:
+Two distinct kinds of test reaches into private worker-related state.
 
-- `tests.rs:312,840,958` reference `super::panic_payload_message`
-  and `super::spawn_supervised_worker` /
-  `super::spawn_supervised_aux` from inside the
-  `coordinator::tests` module.
+**Direct field access (unaffected by this PR):**
 
-After the move, `super::panic_payload_message` etc. resolve into
-`coordinator::supervisor::panic_payload_message`. Two equally
+- `tests.rs:312,322` insert into `coordinator.workers.identities`.
+- `tests.rs:958,1001` insert into / inspect `coordinator.workers.live`.
+
+These rely on the existing `pub(in crate::afxdp)` field
+visibility on `WorkerManager`'s fields and continue to work
+unchanged — the fields keep that visibility because `reconcile`
+in `mod.rs` writes them.
+
+**Helper-function calls (require path update):**
+
+- `tests.rs:840` — `super::panic_payload_message(&payload)`
+- `tests.rs:869` — `super::spawn_supervised_worker(...)`
+- `tests.rs:889,903,918` — `super::spawn_supervised_aux(...)`
+
+After the move, `super::panic_payload_message` etc. no longer
+resolve directly inside `coordinator::tests` (because the
+helpers have moved to `coordinator::supervisor`). Two equally
 valid options — pick one in implementation:
 
-- **Option A (preferred):** update test paths to
-  `super::supervisor::panic_payload_message` etc. Cleaner; no
-  re-export.
+- **Option A (preferred):** update the five call sites above
+  from `super::panic_payload_message` →
+  `super::supervisor::panic_payload_message` (similarly for
+  the other two helpers). Cleaner; no re-export.
 - **Option B:** add `pub(super) use supervisor::{panic_payload_message,
   spawn_supervised_worker, spawn_supervised_aux};` in `mod.rs`
-  so test paths stay unchanged. Smaller diff but adds a
-  coordinator-module re-export.
+  so the existing five test paths stay unchanged. Smaller diff
+  but adds a coordinator-module re-export.
+
+Implementation checklist must touch all five lines (840, 869,
+889, 903, 918) under Option A or none under Option B; do not
+mix the two.
 
 `ha_tests.rs:235` reaches `super::ha::*` worker-command sites
 which are NOT moved in Phase 1 — those tests are unaffected.
@@ -195,20 +224,64 @@ which are NOT moved in Phase 1 — those tests are unaffected.
    functions. Body verbatim (these already take their deps as
    parameters; no receiver change needed).
 2. Add `mod supervisor;` to `coordinator/mod.rs`.
-3. Add method `pub(super) fn stop_and_clear(&mut self,
-   xsk_map_fd: BorrowedFd<'_>, heartbeat_map_fd: BorrowedFd<'_>)`
-   to `WorkerManager`. Body is the existing `mod.rs:202-222`
-   loop with `self.workers.` references rewritten to `self.`.
-   `Coordinator::shutdown` (or wherever the loop lives today)
-   becomes:
+3. Add method on `WorkerManager`:
+
+   ```rust
+   pub(super) fn stop_and_clear(
+       &mut self,
+       xsk_map_fd: Option<&OwnedFd>,
+       heartbeat_map_fd: Option<&OwnedFd>,
+   )
+   ```
+
+   where `OwnedFd` is `crate::afxdp::bpf_map::OwnedFd` (the
+   project's local newtype, **not** `std::os::fd::OwnedFd`; it
+   has a public `.fd: c_int` field). Body is the existing
+   `mod.rs:202-222` block with `self.workers.` references
+   rewritten to `self.`, preserving the `if let Some(map_fd) =
+   ...` conditional cleanup exactly as today:
+
+   ```rust
+   for handle in self.handles.values_mut() {
+       handle.stop.store(true, Ordering::Relaxed);
+   }
+   for (_, handle) in self.handles.iter_mut() {
+       if let Some(join) = handle.join.take() {
+           let _ = join.join();
+       }
+   }
+   if let Some(map_fd) = xsk_map_fd {
+       for slot in self.live.keys().copied().collect::<Vec<_>>() {
+           let _ = delete_xsk_slot(map_fd.fd, slot);
+       }
+   }
+   if let Some(map_fd) = heartbeat_map_fd {
+       for slot in self.live.keys().copied().collect::<Vec<_>>() {
+           let _ = delete_heartbeat_slot(map_fd.fd, slot);
+       }
+   }
+   self.handles.clear();
+   self.identities.clear();
+   self.live.clear();
+   ```
+
+   `Coordinator::shutdown` (or wherever the cleanup lives today)
+   replaces `mod.rs:202-222` with:
 
    ```rust
    self.workers.stop_and_clear(
-       self.xsk_map.as_fd(),
-       self.heartbeat_map.as_fd(),
+       self.bpf_maps.map_fd.as_ref(),
+       self.bpf_maps.heartbeat_map_fd.as_ref(),
    );
    self.worker_panics.clear();   // stays on Coordinator
    ```
+
+   The conditional-cleanup behavior is preserved bit-for-bit:
+   `Option<&OwnedFd>` is `None` exactly when `bpf_maps.*` is
+   `None` today, so the same branches execute in both cases.
+   `worker_panics.clear()` stays on `Coordinator` per Codex
+   round-2 guidance — `worker_panics` is a Coordinator field,
+   not WorkerManager state.
 
 4. Add `last_planned_workers(&self) -> usize` and
    `last_planned_bindings(&self) -> usize` accessors on
@@ -274,7 +347,7 @@ something in `coordinator/tests.rs`).
 **Smoke matrix on loss userspace cluster**:
 - Pass A (CoS off): 6 cells, 0 retrans
 - Pass B (CoS on): 24 cells, 0 retrans
-- Total: 30 cells, 0 retrans (this is pure code motion + delegation)
+- Total: 30 cells, 0 retrans (this is a behavior-preserving refactor — supervisor helpers move byte-identical; stop loop and accessors rewritten in shape but not in behavior)
 
 **Failover smoke**: `make test-failover` if accessible — the
 worker-supervision path is exercised heavily during failover.
