@@ -1,5 +1,5 @@
 ---
-status: REVISED v5 — Codex round-4 PLAN-NEEDS-MAJOR; 5 more holes plugged (atomic-PR constraint added)
+status: REVISED v6 — Codex round-5 PLAN-NEEDS-MINOR; 6 nits fixed; ready to implement
 issue: #1197
 phase: Plan + fix design
 prior:
@@ -7,7 +7,8 @@ prior:
   - v2 commit f6e7070a — addressed Codex round-1 5 findings (incremental defense)
   - v3 commit 867bd363 — kernel-as-authority redesign per user feedback
   - v4 commit 4bcb7947 — Codex round-3 4 substantive holes
-  - v5 (this) — Codex round-4 found 5 more holes; addressing now
+  - v5 commit 0ae008de — Codex round-4 5 more holes
+  - v6 (this) — Codex round-5 PLAN-NEEDS-MINOR; 6 nits applied
 ---
 
 ## 1. Issue framing (unchanged)
@@ -196,9 +197,13 @@ func (d *Daemon) runOneSubscription(
     if err := netlink.NeighSubscribeWithOptions(updates, done,
                                                 opts); err != nil {
         slog.Warn("neighbor subscribe failed", "err", err)
+        // Codex round-5 #5: NeighSubscribeWithOptions can start
+        // its done goroutine before a ListExisting dump fails.
+        // Close done explicitly here to avoid leaking the goroutine.
+        close(done)
         return true // try again after backoff
     }
-    defer close(done) // always close on return; no double-close path
+    defer close(done) // always close on successful subscribe path
 
     for {
         select {
@@ -224,24 +229,29 @@ func (d *Daemon) runOneSubscription(
 // interface enumerated by buildNeighborSnapshots. Codex round-4
 // caught: that snapshot iterates all configured base interfaces
 // AND units (snapshot.go:1768-1787), not an informal "forwarding/
-// fabric" subset. To stay aligned, EXPORT the enumeration as
-// a public helper and reuse it here.
+// fabric" subset. Export the enumeration as a public helper.
 //
-// Plan: refactor buildNeighborSnapshots' interface enumeration
-// into a shared helper:
-//
-//   func MonitoredInterfaceLinkIndexes(cfg *config.Config)
-//                                         map[int]struct{}
-//
-// Both buildNeighborSnapshots and isMonitoredNeighbor call this
-// helper, so the listener's filter is GUARANTEED to match the
-// snapshot's keyspace. Drift is impossible.
+// Codex round-5 #3: pure config-derived filter has runtime
+// ifindex drift hazard. If a link/VLAN disappears, recomputing
+// via current LinkByName excludes the old ifindex, so an
+// RTM_DELNEIGH for the disappeared ifindex gets dropped until
+// the 60s safety regen. Mitigation: also include the union of
+// CURRENT SNAPSHOT KEYS (entries we've already published to
+// userspace-dp). A delete event for any published key MUST be
+// processed even if the link is gone.
 func (d *Daemon) isMonitoredNeighbor(linkIndex int) bool {
     cfg := d.store.ActiveConfig()
     if cfg == nil { return false }
     monitored := userspace.MonitoredInterfaceLinkIndexes(cfg)
-    _, ok := monitored[linkIndex]
-    return ok
+    if _, ok := monitored[linkIndex]; ok {
+        return true
+    }
+    // Snapshot-key fallback: we've already published entries for
+    // this ifindex; we need delete events even if link is gone.
+    if d.dp != nil && d.dp.SnapshotHasIfindex(linkIndex) {
+        return true
+    }
+    return false
 }
 
 // shouldTriggerRegen filters out forwarding-irrelevant churn.
@@ -251,8 +261,13 @@ func (d *Daemon) isMonitoredNeighbor(linkIndex int) bool {
 // to trigger. Same-MAC state churn (REACHABLE↔STALE etc.) is
 // the only ignored case.
 //
-// "Usable" set (must match userspace-dp's neighbor.rs treatment):
-//   NUD_REACHABLE | NUD_STALE | NUD_DELAY | NUD_PROBE | NUD_PERMANENT | NUD_NOARP
+// "Usable" set (must match userspace-dp's neighbor.rs treatment).
+// Codex round-5 #2: explicitly EXCLUDE NUD_NONE (state==0). Rust
+// treats "none" as usable because it's not failed/incomplete, but
+// state-0 entries have no learned MAC and must not be published.
+// This Go set must match neighborSnapshotPublishable's reject set.
+//
+// NUD_REACHABLE | NUD_STALE | NUD_DELAY | NUD_PROBE | NUD_PERMANENT | NUD_NOARP
 const usableNUD = netlink.NUD_REACHABLE | netlink.NUD_STALE |
                   netlink.NUD_DELAY | netlink.NUD_PROBE |
                   netlink.NUD_PERMANENT | netlink.NUD_NOARP
@@ -289,25 +304,45 @@ func (d *Daemon) shouldTriggerRegen(u netlink.NeighUpdate) bool {
 
 // regenDebouncer coalesces regen requests so a burst of events
 // (e.g., GARP storm during failover) results in one regen.
-func (d *Daemon) regenDebouncer(ctx context.Context, ch chan struct{},
+//
+// Codex round-5 #5: previous version had a data race on `pending`
+// because `time.AfterFunc` fires its callback in a separate
+// goroutine. Replaced with a same-goroutine timer-channel pattern.
+func (d *Daemon) regenDebouncer(ctx context.Context,
+                                 ch chan struct{},
                                  delay time.Duration) {
-    var pending bool
     var timer *time.Timer
+    var timerC <-chan time.Time
+
     for {
         select {
         case <-ctx.Done():
+            if timer != nil {
+                timer.Stop()
+            }
             return
         case <-ch:
-            if !pending {
-                pending = true
-                timer = time.AfterFunc(delay, func() {
-                    pending = false
-                    if d.dp != nil {
-                        d.dp.RegenerateNeighborSnapshot()
+            // Request received: arm or reset timer.
+            if timer == nil {
+                timer = time.NewTimer(delay)
+                timerC = timer.C
+            } else {
+                if !timer.Stop() {
+                    // Drain stale fire if any.
+                    select {
+                    case <-timer.C:
+                    default:
                     }
-                })
+                }
+                timer.Reset(delay)
+                timerC = timer.C
             }
-            _ = timer
+        case <-timerC:
+            // Debounce window elapsed; regenerate.
+            if d.dp != nil {
+                d.dp.RegenerateNeighborSnapshot()
+            }
+            timerC = nil // disarm until next request
         }
     }
 }
@@ -337,24 +372,27 @@ to avoid a 256-target ARP storm at startup.
 Defining `collectMonitoredNeighbors` precisely:
 
 ```go
-// collectMonitoredNeighbors returns the union of:
+// collectMonitoredNeighbors returns the deduped union of:
 //   1. Current snapshot keys (every neighbor xpfd has published
-//      to userspace-dp), so we re-validate everything we've told
-//      the data plane is reachable.
-//   2. Configured next-hops, NAT destinations, address-book hosts
-//      (the resolveNeighbors target set), so we keep priming
-//      entries the kernel may have aged out.
-//   3. Fabric peer IPs (from monitorFabricState).
+//      to userspace-dp).
+//   2. Configured next-hops, NAT destinations, address-book hosts.
+//   3. Fabric peer IPs.
 //
-// Returned in PRIORITY ORDER:
-//   tier 1: snapshot keys with kernel state in {STALE, PROBE,
-//           DELAY, FAILED, INCOMPLETE} — these are the ones at
-//           risk of forwarding to dead address
-//   tier 2: configured next-hops + fabric peers (highest-impact
-//           targets that must not go cold)
-//   tier 3: snapshot REACHABLE + remaining configured targets
+// Codex round-5 #4: tiering must be globally state-aware, not
+// per-source. Build the full deduped target set FIRST, then for
+// each target probe current kernel NUD state once via NeighList,
+// then sort:
 //
-// Truncate at the configured cap (default 256). Log skipped count.
+//   tier 1: state ∈ {STALE, PROBE, DELAY, FAILED, INCOMPLETE,
+//                    NONE/missing} — at risk of stale forwarding
+//   tier 2: state == REACHABLE AND target is critical
+//           (next-hop or fabric peer)
+//   tier 3: everything else (REACHABLE non-critical)
+//
+// Within a tier, sort by criticality (next-hops > fabric peers
+// > snapshot keys > address-book).
+//
+// Truncate at the cap (default 256). Log skipped count.
 func (d *Daemon) collectMonitoredNeighbors(
     cfg *config.Config) []probeTarget {
     // Implementation: iterate active snapshot first via
@@ -420,16 +458,46 @@ Add a manager-level **forwarding-effective equality**:
 
 ```go
 // neighborsEqualForwarding compares snapshot entries on what
-// matters for forwarding decisions:
+// matters for forwarding decisions, using ONLY publishable
+// entries (those userspace-dp will accept and use).
+//
+// Codex round-5: empty-MAC INCOMPLETE rows from buildNeighborSnapshots
+// would otherwise affect equality even though userspace-dp drops
+// them at handlers.rs:165. Filter both sides to publishable-only
+// before comparing. This also catches "old usable disappearing
+// to INCOMPLETE" because the publishable key disappears.
+//
+// Publishable predicate (must mirror userspace-dp accept logic):
+//   - Ifindex > 0
+//   - IP parseable
+//   - MAC non-empty
+//   - State NOT in {FAILED, INCOMPLETE, NONE}
+//
+// Compared fields:
 //   - (Ifindex, IP, Family) key
 //   - MAC
-//   - Usable bit (state ∈ {REACHABLE, STALE, DELAY, PROBE,
-//     PERMANENT, NOARP} → usable; FAILED/INCOMPLETE → unusable)
-//
-// Raw state (REACHABLE vs STALE) is NOT compared — both are
-// usable and aging churn shouldn't trigger publish.
+// (Usable-bit is implicitly true; non-publishable rows excluded.)
 func neighborsEqualForwarding(a, b []NeighborSnapshot) bool {
-    // Build map<key, (mac, usable)> for both, compare.
+    // Build map<(ifindex,ip,family), mac> for publishable rows
+    // in each side; compare.
+}
+
+// Publishable predicate: must match userspace-dp's accept rules
+// at handlers.rs:165 / forwarding_build.rs:326. Drift here is a
+// silent forwarding bug — keep this in sync if userspace changes.
+func neighborSnapshotPublishable(n NeighborSnapshot) bool {
+    if n.Ifindex <= 0 || n.IP == "" || n.MAC == "" {
+        return false
+    }
+    // "none" is what neighborStateString emits for raw state 0;
+    // Rust treats "none" as usable, but Go publishing should NOT
+    // emit it because state 0 entries have no learned MAC info.
+    // Codex round-5 finding #2: bridge mismatch.
+    switch n.State {
+    case "failed", "incomplete", "none":
+        return false
+    }
+    return true
 }
 ```
 
@@ -487,38 +555,46 @@ Called from:
   — start `neighborListener` goroutine at daemon init; replace
   preinstall tick with probe tick
 
-## 7. HA / failover considerations
+## 7. HA / failover considerations (revised v6)
 
 **Failover path (RG transition: standby → active):**
-- VRRP MASTER event fires `becomeMaster` (which already calls
-  `resolveNeighbors`)
-- `resolveNeighbors` sends ARP/NS for all next-hops
-- Kernel updates ARP table on replies
-- RTM_NEWNEIGH fires for each → our listener updates snapshot
-- userspace-dp state.neighbors is fresh BEFORE first packet
-  forwarded by new active
+- VRRP MASTER event fires `becomeMaster`. Per Codex round-5 #6
+  fix-up: this PR **changes** the call from `resolveNeighbors`
+  (skip-stale) to `forceProbeNeighbors` (no-skip-stale, with
+  prioritized targets) so a takeover with stale snapshot entries
+  re-validates them immediately rather than leaving them stale.
+- `forceProbeNeighbors` sends ARP/NS for all monitored targets
+  including stale ones, prioritized.
+- Kernel updates ARP table on replies.
+- RTM_NEWNEIGH fires for each MAC change → our listener updates
+  snapshot via debounced regen.
+- userspace-dp `state.neighbors` is fresh BEFORE first packet
+  forwarded by new active.
 
-**No regression risk** — the activation-time priming is preserved
-(it's how the standby gets warm in the first place; it always was
-the actual mechanism, not the periodic preinstall which was just
-masking the bug).
+**No regression risk** — the activation-time priming is
+strengthened (force-probe replaces skip-stale-resolve); the
+periodic preinstall is removed. Both changes converge on
+"snapshot reflects kernel; kernel is authority."
 
 **Standby cold-cache concern:** while standby, no traffic forces
 kernel ARP entries. The kernel may evict over time. When standby
-becomes active, `resolveNeighbors` re-sends probes. First-packet
-delay is bounded by ARP RTT (~ms) — same as today.
+becomes active, `forceProbeNeighbors` re-sends probes for ALL
+monitored targets (including stale + missing). First-packet
+delay is bounded by ARP RTT (~ms) — same as today, plus
+prioritization ensures critical next-hops resolve first.
 
-If we want to keep standby warmer, the periodic probe timer (5.3)
-runs on standby too — sends NS/ARP, kernel resolves, entries stay
-warm. Net effect: standby's kernel ARP is fresher under v3 than
-under v1+v2.
+If we want to keep standby warmer, the periodic force-probe
+(5.3) runs on standby too — sends NS/ARP, kernel resolves,
+entries stay warm. Net effect: standby's kernel ARP and snapshot
+are fresher under v6 than under v1-v2 (where periodic preinstall
+was reverting kernel to stale snapshot every 15s).
 
 ## 8. Risk assessment v3
 
 | Class | Level | Why |
 |---|---|---|
 | Behavioral regression | LOW | Removes a buggy path; activation primer + listener cover the use cases |
-| HA correctness | LOW | Activation-time `resolveNeighbors` already exists and is the actual mechanism; periodic probe optional |
+| HA correctness | LOW | Activation-time `forceProbeNeighbors` (replaces skip-stale `resolveNeighbors` on VRRP MASTER) re-validates stale entries on takeover |
 | Performance regression | NEGLIGIBLE | One netlink subscription; periodic probe sends ~5-10 ARP/NS every 15s; vs current 99-entry NeighSet every 15s |
 | Architectural mismatch | LOW | Aligns with kernel NUD; stops fighting it |
 | Test coverage | MEDIUM | Need unit tests for listener filter + snapshot regen path; existing `resolveNeighbors` tests cover probe |
