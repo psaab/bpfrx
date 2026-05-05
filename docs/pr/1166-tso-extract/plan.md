@@ -1,5 +1,5 @@
 ---
-status: REVISED v2 — Codex round-1 PLAN-NEEDS-MAJOR; layer-violation finding addressed
+status: REVISED v3 — Codex round-2 PLAN-NEEDS-MINOR; cleaned stale v1 visibility/path text and added `use super::*;` implementation note
 issue: #1166
 phase: Pure code-motion refactor
 ---
@@ -101,29 +101,37 @@ Steps:
    `drain_pending_tx_local_owner` (`tx/drain.rs:464`) are already
    reachable from the new sibling file in `tx/` — no further
    visibility changes needed.
+9. **Implementation note:** the new `tx/tcp_segmentation.rs`
+   needs `use super::*;` at the top, matching the import shape
+   used by `tx/dispatch.rs`, `tx/drain.rs`, and the rest of the
+   `tx/` siblings. This brings in `BindingWorker`,
+   `PreparedTxRequest`, `XdpDesc`, fabric/CoS types, and the
+   `bound_pending_tx_prepared` / `drain_pending_tx_local_owner`
+   helpers that the moved function calls.
 
 No behavior change. No new tests needed (function body intact).
 
 ## 5. Public API preservation
 
-Function name unchanged. Visibility widens from
-`fn` → `pub(in crate::afxdp)`. Caller import path changes from
-"local in dispatch.rs" to "from frame::tcp_segmentation". No
-external callers exist.
+Function name unchanged. Visibility widens from `fn` (file-local
+in `tx/dispatch.rs`) to `pub(super)` (callable from sibling
+files inside `tx/`). The single caller in `tx/dispatch.rs:259`
+imports it via `use super::tcp_segmentation::segment_forwarded_tcp_frames_into_prepared;`.
+No external callers exist outside `tx/`.
 
 ## 6. Risk assessment
 
 | Class | Level | Why |
 |---|---|---|
 | Behavioral regression | **VERY LOW** | Pure code motion; function body unchanged |
-| Visibility / namespace | LOW | One-callsite import update |
+| Visibility / namespace | LOW | One-callsite import update; `pub(super)` is the minimum needed |
 | L1-i benefit | UNPROVEN | Not measured; benefit is theoretical until smoke confirms |
-| Cargo build | LOW | Visibility widening can fail if dispatch.rs uses internal-only helpers from inside the moved function |
+| Cargo build | LOW | Internal helpers (`bound_pending_tx_prepared`, `drain_pending_tx_local_owner`) are already `pub(in crate::afxdp)` — reachable from the new sibling file with no further visibility changes |
 
 The only real risk is **#4**: if the moved function calls
-private helpers that live in `tx/dispatch.rs`, those need to be
-exposed too. Let me check the function body for internal calls
-in the implementation phase before claiming this is risk-free.
+file-local (non-`pub`) helpers that live in `tx/dispatch.rs`,
+those would need to be exposed. Verify in the implementation
+phase before claiming this is risk-free.
 
 ## 7. Test plan
 
