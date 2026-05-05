@@ -1,5 +1,5 @@
 ---
-status: DRAFT v1 — pending adversarial plan review (Phase 1 / WorkerManager only)
+status: REVISED v2 — Codex round-1 PLAN-NEEDS-MAJOR; scope narrowed per Codex's findings
 issue: #1189
 phase: First incremental migration of one manager surface
 ---
@@ -32,28 +32,74 @@ coordinator/
 The named manager files exist as types but are mostly empty
 shells; the real logic lives in `mod.rs`'s `Coordinator` impl.
 
-## 2. Honest scope/value framing
+## 2. Honest scope/value framing — v2 (narrowed per Codex round-1)
 
-**This PR ships ONE manager surface only — `WorkerManager`** —
-to validate the migration shape before committing to the full
-4-manager decomposition. Migrating all four at once would be a
-multi-thousand-line PR with high merge-conflict surface.
+**Important correction:** `WorkerManager` already exists as a
+struct (`coordinator/worker_manager.rs:13-19`) with the right
+fields (`live`, `identities`, `handles`, `last_planned_*`).
+`Coordinator` already owns it via `pub(in crate::afxdp) workers:
+WorkerManager` field. This PR is NOT "create WorkerManager" —
+it's **migrate selected worker-related METHODS from `impl
+Coordinator` into `impl WorkerManager`**.
 
-Win:
+**Codex round-1 narrowed the scope.** The original plan said
+"extract worker supervision" but Codex caught:
 
-- `coordinator/mod.rs` shrinks by the worker-supervision LOC
-  (estimated ~300-500 lines)
-- `worker_manager.rs` grows from 31 LOC stub to a real
-  `WorkerManager` with the moved methods
-- Future PRs can do `ConfigManager`, `NeighborManager`,
-  `SessionManager` as independent migrations
-- Each migration is **pure code motion + delegation** — no
-  behavior change
+1. The named `Coordinator::spawn_worker` doesn't exist — worker
+   spawn is embedded in `Coordinator::reconcile`
+   (`mod.rs:322,630`) which passes 12+ deps to `worker_loop`
+   (HA runtime, shared forwarding, fabrics, RG epochs, sessions,
+   neighbors, slow path, local tunnel, CoS shared maps, event
+   stream, panic slots, recent status queues).
+2. `WorkerCommand` dispatch is owned by HA paths
+   (`ha.rs:40,102,171,310,366`), not just worker supervision.
+3. Tests reach private worker state directly
+   (`coordinator/tests.rs:312,840,958`,
+   `ha_tests.rs:235`).
 
-**If reviewers find any cross-manager state coupling that
-prevents clean extraction (e.g., `WorkerManager` methods access
-private fields of `Coordinator` that other managers also need),
-PLAN-NEEDS-MAJOR is the right call.**
+So `reconcile` and HA command dispatch CANNOT migrate cleanly
+in Phase 1. They span too many managers' state.
+
+**Phase 1 v2 — concrete movable slices only:**
+
+- `panic_payload_message` helper (free function or method;
+  pure formatting)
+- `spawn_supervised_worker` / `spawn_supervised_aux` (the panic-
+  catch wrapper; depends only on `WorkerHandle` lifecycle, no
+  cross-manager state)
+- Worker stop/clear loops at `mod.rs:202-222` (iterate
+  `self.workers.handles` to send shutdown / await joins / clear)
+- `last_planned_workers` / `last_planned_bindings` accessor
+  methods (currently inline; pure getter wrappers)
+
+**Stays on `Coordinator` for Phase 1:**
+
+- `reconcile` (multi-manager state)
+- HA command dispatch in `ha.rs` (HA-owned)
+- `refresh_bindings` (CoS / forwarding / worker state span)
+- CoS refresh
+- Neighbor monitor
+- Local tunnel source spawning
+
+**Follow-up phases (not this PR):** larger extractions of
+`reconcile` or HA dispatch require a `WorkerSpawnDeps` /
+context type design — out of scope here.
+
+Win for Phase 1:
+- `coordinator/mod.rs` shrinks by ~50-150 LOC (the panic /
+  shutdown / accessor helpers)
+- `worker_manager.rs` grows from 31 LOC stub with `new()` only
+  to ~120-200 LOC with the migrated methods
+- Validates the migration shape (delegation pattern + test
+  access via `pub(in crate::afxdp)` field) before larger
+  extractions
+- Each migrated method is **pure code motion** — body verbatim,
+  receiver type changes from `&mut Coordinator` (or `&self`) to
+  `&mut WorkerManager` (or `&self`). No behavior change.
+
+**Hard rule (Codex round-1 #4):** WorkerManager methods MUST
+NOT take `&mut Coordinator`. If a method needs Coordinator-only
+state, it stays on Coordinator.
 
 ## 3. Code paths affected
 
