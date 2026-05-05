@@ -36,11 +36,197 @@ func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 	d.resolveNeighborsInner(cfg, true)
 }
 
-func (d *Daemon) resolveNeighborsInner(cfg *config.Config, waitForReplies bool) {
-	type target struct {
-		neighborIP net.IP
-		linkIndex  int
+// neighborProbeTarget is the (IP, linkIndex) pair for a neighbor
+// xpfd wants to probe via ARP/NDP. Used by both resolveNeighborsInner
+// and forceProbeNeighbors (#1197).
+type neighborProbeTarget struct {
+	neighborIP net.IP
+	linkIndex  int
+}
+
+// collectNeighborProbeTargets returns the deduped target list
+// xpfd actively cares about: static-route next-hops, DHCP gateways,
+// backup router, DNAT pool addresses, static NAT translated
+// addresses, address-book host entries (/32 and /128 only).
+//
+// #1197: extracted from resolveNeighborsInner so both that
+// function and forceProbeNeighbors share one source of truth for
+// the configured-target set.
+func (d *Daemon) collectNeighborProbeTargets(cfg *config.Config) []neighborProbeTarget {
+	var targets []neighborProbeTarget
+	seen := make(map[string]bool)
+	if cfg == nil {
+		return nil
 	}
+
+	addByLink := func(ip net.IP, linkIndex int) {
+		key := fmt.Sprintf("%s@%d", ip, linkIndex)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		targets = append(targets, neighborProbeTarget{neighborIP: ip, linkIndex: linkIndex})
+	}
+
+	addByIP := func(ipStr string) {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			return
+		}
+		routes, err := netlink.RouteGet(ip)
+		if err != nil || len(routes) == 0 {
+			return
+		}
+		neighborIP := ip
+		if gw := routes[0].Gw; gw != nil && !gw.IsUnspecified() {
+			neighborIP = gw
+		}
+		addByLink(neighborIP, routes[0].LinkIndex)
+	}
+
+	addByName := func(ipStr, ifName string) {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			return
+		}
+		resolved := resolveJunosIfName(cfg, ifName)
+		link, err := netlink.LinkByName(resolved)
+		if err != nil {
+			return
+		}
+		addByLink(ip, link.Attrs().Index)
+	}
+
+	addByIPOrConfig := func(ipStr string) {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			return
+		}
+		routes, err := netlink.RouteGet(ip)
+		if err == nil && len(routes) > 0 {
+			neighborIP := ip
+			if gw := routes[0].Gw; gw != nil && !gw.IsUnspecified() {
+				neighborIP = gw
+			}
+			addByLink(neighborIP, routes[0].LinkIndex)
+			return
+		}
+		for name, ifc := range cfg.Interfaces.Interfaces {
+			if ifc == nil {
+				continue
+			}
+			for unitNum, unit := range ifc.Units {
+				if unit == nil {
+					continue
+				}
+				for _, addrStr := range unit.Addresses {
+					_, ipNet, err := net.ParseCIDR(addrStr)
+					if err != nil || !ipNet.Contains(ip) {
+						continue
+					}
+					linuxName := resolveJunosIfName(cfg, name)
+					if unit.VlanID > 0 {
+						linuxName = fmt.Sprintf("%s.%d", linuxName, unit.VlanID)
+					} else if unitNum != 0 {
+						linuxName = fmt.Sprintf("%s.%d", linuxName, unitNum)
+					}
+					link, err := netlink.LinkByName(linuxName)
+					if err != nil {
+						continue
+					}
+					addByLink(ip, link.Attrs().Index)
+					return
+				}
+			}
+		}
+	}
+
+	// 1. Static route next-hops
+	allStaticRoutes := append(cfg.RoutingOptions.StaticRoutes, cfg.RoutingOptions.Inet6StaticRoutes...)
+	for _, sr := range allStaticRoutes {
+		if sr.Discard {
+			continue
+		}
+		for _, nh := range sr.NextHops {
+			if nh.Address == "" {
+				continue
+			}
+			if nh.Interface != "" {
+				addByName(nh.Address, nh.Interface)
+			} else {
+				addByIPOrConfig(nh.Address)
+			}
+		}
+	}
+	for _, ri := range cfg.RoutingInstances {
+		for _, sr := range append(ri.StaticRoutes, ri.Inet6StaticRoutes...) {
+			if sr.Discard {
+				continue
+			}
+			for _, nh := range sr.NextHops {
+				if nh.Address == "" {
+					continue
+				}
+				if nh.Interface != "" {
+					addByName(nh.Address, nh.Interface)
+				} else {
+					addByIPOrConfig(nh.Address)
+				}
+			}
+		}
+	}
+
+	// 2. DHCP-learned gateways
+	if d.dhcp != nil {
+		for _, lease := range d.dhcp.Leases() {
+			if lease.Gateway.IsValid() {
+				addByName(lease.Gateway.String(), lease.Interface)
+			}
+		}
+	}
+
+	// 3. Backup router next-hop
+	if cfg.System.BackupRouter != "" {
+		addByIP(cfg.System.BackupRouter)
+	}
+
+	// 4. DNAT pool addresses
+	if cfg.Security.NAT.Destination != nil {
+		for _, pool := range cfg.Security.NAT.Destination.Pools {
+			if pool.Address != "" {
+				addByIP(stripCIDR(pool.Address))
+			}
+		}
+	}
+
+	// 5. Static NAT translated addresses
+	for _, rs := range cfg.Security.NAT.Static {
+		for _, rule := range rs.Rules {
+			if rule.Then != "" {
+				addByIP(stripCIDR(rule.Then))
+			}
+		}
+	}
+
+	// 6. Address-book host entries (/32 and /128 only)
+	if cfg.Security.AddressBook != nil {
+		for _, addr := range cfg.Security.AddressBook.Addresses {
+			ip, ipNet, err := net.ParseCIDR(addr.Value)
+			if err != nil {
+				continue
+			}
+			ones, bits := ipNet.Mask.Size()
+			if ones == bits {
+				addByIP(ip.String())
+			}
+		}
+	}
+
+	return targets
+}
+
+func (d *Daemon) resolveNeighborsInner(cfg *config.Config, waitForReplies bool) {
+	type target = neighborProbeTarget
 	var targets []target
 	seen := make(map[string]bool)
 

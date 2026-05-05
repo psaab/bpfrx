@@ -30,7 +30,9 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"os"
 	"sort"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -53,10 +55,23 @@ const usableNUD = netlink.NUD_REACHABLE | netlink.NUD_STALE |
 	netlink.NUD_DELAY | netlink.NUD_PROBE |
 	netlink.NUD_PERMANENT | netlink.NUD_NOARP
 
-// neighborProbeMaxTargets caps the per-tick force-probe target
-// count. Configurable via env BPFRX_NEIGHBOR_PROBE_MAX_TARGETS;
-// default 256.
-const neighborProbeMaxTargets = 256
+// neighborProbeMaxTargetsDefault caps the per-tick force-probe
+// target count by default. Override via env
+// BPFRX_NEIGHBOR_PROBE_MAX_TARGETS for sites with very large
+// address-books. Read once via getNeighborProbeMaxTargets.
+const neighborProbeMaxTargetsDefault = 256
+
+// getNeighborProbeMaxTargets returns the per-tick probe-target
+// cap, honoring BPFRX_NEIGHBOR_PROBE_MAX_TARGETS env override.
+// Invalid / non-positive values fall back to the default.
+func getNeighborProbeMaxTargets() int {
+	if v := os.Getenv("BPFRX_NEIGHBOR_PROBE_MAX_TARGETS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return neighborProbeMaxTargetsDefault
+}
 
 // neighborSnapshotProvider is the dataplane Manager interface
 // used by the listener to query/regenerate snapshot state.
@@ -64,6 +79,7 @@ type neighborSnapshotProvider interface {
 	RegenerateNeighborSnapshot()
 	LookupSnapshotNeighbor(ifindex int, ip net.IP) *userspace.NeighborSnapshot
 	SnapshotHasIfindex(ifindex int) bool
+	MonitoredIfindexes() map[int]struct{}
 }
 
 // neighborListener runs the netlink RTM_NEWNEIGH/DELNEIGH event
@@ -206,16 +222,23 @@ func (d *Daemon) triggerRegen(ch chan struct{}) {
 // current snapshot already contains entries for that ifindex
 // (snapshot-key fallback for runtime ifindex drift — delete
 // events on disappeared links must still be processed).
+//
+// Codex code-review #2: previously called
+// userspace.MonitoredInterfaceLinkIndexes(cfg) on every event,
+// which makes O(N) netlink LinkByName calls per N configured
+// interfaces. Now reads the cached set from the manager;
+// rebuilt only on snapshot publish.
 func (d *Daemon) isMonitoredNeighbor(linkIndex int) bool {
-	cfg := d.store.ActiveConfig()
-	if cfg != nil {
-		monitored := userspace.MonitoredInterfaceLinkIndexes(cfg)
+	provider := d.neighborProvider()
+	if provider == nil {
+		return false
+	}
+	if monitored := provider.MonitoredIfindexes(); monitored != nil {
 		if _, ok := monitored[linkIndex]; ok {
 			return true
 		}
 	}
-	provider := d.neighborProvider()
-	if provider != nil && provider.SnapshotHasIfindex(linkIndex) {
+	if provider.SnapshotHasIfindex(linkIndex) {
 		return true
 	}
 	return false
@@ -234,7 +257,12 @@ func (d *Daemon) shouldTriggerRegen(u netlink.NeighUpdate) bool {
 	case syscall.RTM_NEWNEIGH:
 		hasMAC := u.HardwareAddr != nil && len(u.HardwareAddr) > 0
 		usable := u.State&usableNUD != 0
-		unusable := u.State&(netlink.NUD_FAILED|netlink.NUD_INCOMPLETE) != 0
+		// Codex code-review #3: NUD_NONE (state==0) for an
+		// EXISTING snapshot entry is also a transition-to-unusable.
+		// Treat as unusable: any state outside usableNUD (including
+		// state==0/NONE/FAILED/INCOMPLETE) means the entry should
+		// drop from snapshot.
+		unusable := !usable
 
 		provider := d.neighborProvider()
 		var existing *userspace.NeighborSnapshot
@@ -253,6 +281,7 @@ func (d *Daemon) shouldTriggerRegen(u netlink.NeighUpdate) bool {
 			}
 		}
 		// Transition to unusable → snapshot must drop entry.
+		// Includes NUD_FAILED, NUD_INCOMPLETE, NUD_NONE (state==0).
 		if unusable {
 			return true
 		}
@@ -320,11 +349,12 @@ func (d *Daemon) forceProbeNeighbors(cfg *config.Config) {
 	if len(targets) == 0 {
 		return
 	}
-	if len(targets) > neighborProbeMaxTargets {
+	cap := getNeighborProbeMaxTargets()
+	if len(targets) > cap {
 		slog.Warn("neighbor probe truncated",
 			"total", len(targets),
-			"cap", neighborProbeMaxTargets)
-		targets = targets[:neighborProbeMaxTargets]
+			"cap", cap)
+		targets = targets[:cap]
 	}
 	slog.Info("force-probe neighbors", "count", len(targets))
 	for _, t := range targets {
@@ -427,13 +457,17 @@ func (d *Daemon) collectMonitoredNeighbors(cfg *config.Config) []probeTarget {
 		}
 	}
 
-	// Source 2: configured next-hops are already covered by the
-	// snapshot keys for any neighbor that has been resolved at
-	// least once (it ends up in kernel ARP → snapshot). The
-	// existing resolveNeighborsInner path handles cold-start
-	// priming on activation. For steady-state staleness
-	// reconciliation we don't need to re-derive next-hops here;
-	// snapshot keys are the operative set.
+	// Source 2: configured next-hops + DHCP gateways + backup
+	// router + DNAT pool addresses + static NAT translated
+	// addresses + address-book host entries.
+	//
+	// Codex code-review #1: previously omitted; cold-start path
+	// (no snapshot yet) had empty target set so force-probe
+	// did nothing. Now uses the shared helper that
+	// resolveNeighborsInner also draws from.
+	for _, t := range d.collectNeighborProbeTargets(cfg) {
+		addTarget(t.neighborIP, t.linkIndex, true)
+	}
 
 	// Source 3: fabric peers (probed via fabric overlay link).
 	d.fabricMu.RLock()

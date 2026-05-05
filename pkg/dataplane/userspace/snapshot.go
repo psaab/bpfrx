@@ -206,9 +206,23 @@ func neighborsEqualForwarding(a, b []NeighborSnapshot) bool {
 
 // neighborSnapshotPublishable returns true if a snapshot entry
 // should be pushed to userspace-dp. Must mirror userspace-dp's
-// accept rules at handlers.rs:165 / forwarding_build.rs:326.
+// accept rules at userspace-dp/src/afxdp/forwarding/mod.rs:45:
 //
-// Drift here is a silent forwarding bug — keep this in sync if
+//   pub(super) fn neighbor_state_usable(state: &str) -> bool {
+//       let normalized = state.to_ascii_lowercase();
+//       !(normalized.contains("failed") || normalized.contains("incomplete"))
+//   }
+//
+// Codex code-review #3: Rust uses SUBSTRING match after
+// lowercasing; previous Go did EXACT match — drift. Fixed to
+// match Rust's substring semantics.
+//
+// "none" is rejected here even though Rust treats it as usable,
+// because state-0 entries have no learned MAC info — Rust would
+// drop them at later parse-MAC anyway, but rejecting here
+// prevents a useless publish round-trip.
+//
+// Drift here is a silent forwarding bug — keep in sync if
 // userspace-dp changes its acceptance criteria.
 func neighborSnapshotPublishable(n NeighborSnapshot) bool {
 	if n.Ifindex <= 0 {
@@ -220,11 +234,11 @@ func neighborSnapshotPublishable(n NeighborSnapshot) bool {
 	if _, err := net.ParseMAC(n.MAC); err != nil {
 		return false
 	}
-	// "none" is what neighborStateString emits for raw state 0;
-	// Rust treats "none" as usable but state-0 entries have no
-	// learned MAC info. Reject in Go publishing.
-	switch n.State {
-	case "failed", "incomplete", "none":
+	lower := strings.ToLower(n.State)
+	if strings.Contains(lower, "failed") || strings.Contains(lower, "incomplete") {
+		return false
+	}
+	if lower == "none" {
 		return false
 	}
 	return true

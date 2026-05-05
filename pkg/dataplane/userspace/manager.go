@@ -74,6 +74,12 @@ type Manager struct {
 	lastRSTAttempt          time.Time
 	lastRSTInstallOK        bool
 	lastSnapshotHash        [32]byte // content hash of last published snapshot (excludes volatile fields)
+	// #1197: O(1) neighbor lookup index for the listener hot path.
+	// Keyed by (ifindex, ip-string). Rebuilt whenever lastSnapshot.Neighbors
+	// is replaced. Read under m.mu (existing snapshot lock).
+	neighborIndex map[neighborIndexKey]*NeighborSnapshot
+	// #1197: ifindex set for listener filter; rebuilt on config commit.
+	monitoredIfindexes map[int]struct{}
 	lastBindingIndices      []uint32
 	neighborsPrewarmed      bool
 	ctrlEnableAt            time.Time
@@ -291,6 +297,8 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		samePlanRefresh = false
 	}
 	m.lastSnapshot = snap
+	m.rebuildNeighborIndex()      // #1197: keep listener O(1) lookup in sync
+	m.rebuildMonitoredIfindexes() // #1197: cache ifindex set for listener filter
 	if pendingXSKStartup {
 		if err := m.syncIngressIfaceMapLocked(snap); err != nil {
 			return result, err
@@ -454,6 +462,7 @@ func (m *Manager) BumpFIBGeneration() uint32 {
 			// Only update cached neighbors after successful publish so
 			// a transient failure doesn't suppress future retries.
 			m.lastSnapshot.Neighbors = newNeighbors
+			m.rebuildNeighborIndex() // #1197
 		}
 	}
 
@@ -470,6 +479,15 @@ func (m *Manager) BumpFIBGeneration() uint32 {
 	return newGen
 }
 
+// neighborIndexKey is the (ifindex, ip-string) key for the
+// O(1) neighbor lookup index used by the daemon's listener hot
+// path. ip-string is used (not net.IP) so map equality is well-
+// defined for both v4 and v6 representations.
+type neighborIndexKey struct {
+	ifindex int
+	ip      string
+}
+
 // filterPublishableNeighbors returns only the entries
 // userspace-dp will accept (per neighborSnapshotPublishable).
 func filterPublishableNeighbors(neighbors []NeighborSnapshot) []NeighborSnapshot {
@@ -480,6 +498,23 @@ func filterPublishableNeighbors(neighbors []NeighborSnapshot) []NeighborSnapshot
 		}
 	}
 	return out
+}
+
+// rebuildNeighborIndex updates m.neighborIndex from the current
+// m.lastSnapshot.Neighbors slice. Caller MUST hold m.mu. Called
+// after every assignment to lastSnapshot.Neighbors.
+func (m *Manager) rebuildNeighborIndex() {
+	if m.lastSnapshot == nil {
+		m.neighborIndex = nil
+		return
+	}
+	idx := make(map[neighborIndexKey]*NeighborSnapshot,
+		len(m.lastSnapshot.Neighbors))
+	for i := range m.lastSnapshot.Neighbors {
+		n := &m.lastSnapshot.Neighbors[i]
+		idx[neighborIndexKey{n.Ifindex, n.IP}] = n
+	}
+	m.neighborIndex = idx
 }
 
 // RegenerateNeighborSnapshot rebuilds the in-memory neighbor
@@ -519,49 +554,85 @@ func (m *Manager) RegenerateNeighborSnapshot() {
 		return
 	}
 	m.lastSnapshot.Neighbors = newNeighbors
+	m.rebuildNeighborIndex() // #1197
 	m.generation++
 	m.lastSnapshot.Generation = m.generation
 }
 
 // LookupSnapshotNeighbor returns the snapshot's current entry for
 // (ifindex, ip), or nil if not present. Used by the daemon's
-// listener to compute forwarding-effective diff per event.
+// listener hot path to compute forwarding-effective diff per
+// event. O(1) via the neighborIndex map.
 //
-// O(N) scan over snapshot.Neighbors. N is bounded by the kernel
-// ARP table size on configured interfaces (~hundreds typical).
-// Called per-event in the listener; if hot-path-sensitive in
-// the future, replace with a map index.
+// Codex code-review #2: previous version did O(N) linear scan
+// inside m.mu.Lock() — pathological under GARP storm. Now uses
+// the neighborIndex rebuilt on every lastSnapshot.Neighbors
+// replacement.
+//
+// Returns a defensive copy (not pointer into the snapshot)
+// because the caller may use the value after releasing m.mu and
+// the index could be rebuilt concurrently from another goroutine.
 func (m *Manager) LookupSnapshotNeighbor(ifindex int, ip net.IP) *NeighborSnapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.lastSnapshot == nil {
+	if m.neighborIndex == nil {
 		return nil
 	}
-	ipStr := ip.String()
-	for i := range m.lastSnapshot.Neighbors {
-		n := &m.lastSnapshot.Neighbors[i]
-		if n.Ifindex == ifindex && n.IP == ipStr {
-			return n
-		}
+	if entry, ok := m.neighborIndex[neighborIndexKey{ifindex, ip.String()}]; ok {
+		// Return a defensive copy so callers don't see mutation
+		// from concurrent rebuildNeighborIndex.
+		copy := *entry
+		return &copy
 	}
 	return nil
+}
+
+// MonitoredIfindexes returns the cached set of link indexes the
+// snapshot covers. O(1) read of the cached map under m.mu.
+//
+// Codex code-review #2: previous listener path called
+// MonitoredInterfaceLinkIndexes(cfg) per event, which makes
+// netlink LinkByName calls per configured interface. Cached
+// here so the listener can do O(1) ifindex membership checks.
+//
+// Returns a defensive copy so callers can iterate without
+// holding the lock.
+func (m *Manager) MonitoredIfindexes() map[int]struct{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.monitoredIfindexes == nil {
+		return nil
+	}
+	out := make(map[int]struct{}, len(m.monitoredIfindexes))
+	for k := range m.monitoredIfindexes {
+		out[k] = struct{}{}
+	}
+	return out
+}
+
+// rebuildMonitoredIfindexes updates m.monitoredIfindexes from
+// the active config. Caller MUST hold m.mu. Called on snapshot
+// publish (config commit time), not per event.
+func (m *Manager) rebuildMonitoredIfindexes() {
+	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
+		m.monitoredIfindexes = nil
+		return
+	}
+	m.monitoredIfindexes = MonitoredInterfaceLinkIndexes(m.lastSnapshot.Config)
 }
 
 // SnapshotHasIfindex returns true if the current snapshot
 // contains any neighbor entry on the given ifindex. Used by the
 // daemon's listener filter as a fallback for runtime ifindex
-// drift: if a configured interface has been recreated under a
-// new ifindex (or removed), delete events for the old ifindex
-// must still be processed so we drop stale entries from the
-// snapshot.
+// drift. O(N) scan over the neighborIndex but the listener
+// already pays O(1) for the LookupSnapshotNeighbor; this fallback
+// only fires when the config-derived monitored set doesn't
+// contain the ifindex (rare, e.g., link disappeared).
 func (m *Manager) SnapshotHasIfindex(ifindex int) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.lastSnapshot == nil {
-		return false
-	}
-	for _, n := range m.lastSnapshot.Neighbors {
-		if n.Ifindex == ifindex {
+	for k := range m.neighborIndex {
+		if k.ifindex == ifindex {
 			return true
 		}
 	}
