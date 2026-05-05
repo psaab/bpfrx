@@ -149,6 +149,11 @@ func snapshotContentHash(snap *ConfigSnapshot) ([32]byte, bool) {
 	tmp.FIBGeneration = 0
 	tmp.GeneratedAt = time.Time{}
 	tmp.Config = nil // exclude raw config from content hash to avoid churn from non-forwarding metadata
+	// #1197 (Copilot review): hash only PUBLISHABLE neighbors so
+	// the dedup compares against what userspace-dp actually sees.
+	// Filtered-out rows (state="none", malformed MAC) never reach
+	// the dataplane, so churn in them must not shift the hash.
+	tmp.Neighbors = filterPublishableNeighbors(snap.Neighbors)
 	data, err := json.Marshal(&tmp)
 	if err != nil {
 		slog.Warn("snapshotContentHash: marshal failed, skipping dedup", "err", err)

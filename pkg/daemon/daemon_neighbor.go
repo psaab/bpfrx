@@ -353,6 +353,12 @@ func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context) {
 	// Immediate first run — don't wait for first tick.
 	if cfg := d.store.ActiveConfig(); cfg != nil {
 		d.resolveNeighbors(cfg)
+		// Copilot review: cold-start pass needs to also force-probe
+		// stale entries. resolveNeighbors skips REACHABLE/STALE/
+		// PERMANENT — without forceProbeNeighbors here, a stale
+		// entry inherited from a previous run wouldn't get
+		// re-validated until the first 15s tick.
+		d.forceProbeNeighbors(cfg)
 		d.maintainClusterNeighborReadiness()
 	}
 	d.cleanFailedNeighbors()

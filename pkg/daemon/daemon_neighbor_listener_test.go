@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/vishvananda/netlink"
 )
 
@@ -68,34 +69,9 @@ func TestUsableNUDMask(t *testing.T) {
 	}
 }
 
-// shouldTriggerRegen tests use a stub provider to avoid wiring
-// a full Daemon. We test the pure decision logic here.
-type stubNeighborProvider struct {
-	existing map[string]string // ip → mac (existing snapshot entries)
-}
-
-func (s *stubNeighborProvider) RegenerateNeighborSnapshot()                       {}
-func (s *stubNeighborProvider) SnapshotHasIfindex(int) bool                       { return true }
-func (s *stubNeighborProvider) LookupSnapshotNeighbor(_ int, ip net.IP) *snapshotEntry {
-	if mac, ok := s.existing[ip.String()]; ok {
-		return &snapshotEntry{IP: ip.String(), MAC: mac}
-	}
-	return nil
-}
-
-// snapshotEntry mirrors userspace.NeighborSnapshot's relevant fields
-// for shouldTriggerRegen testing. We don't import the userspace
-// package here because that would create a cycle in some test setups;
-// the real LookupSnapshotNeighbor returns the userspace type.
-type snapshotEntry struct {
-	IP, MAC string
-}
-
-// Note: full shouldTriggerRegen test would need a Daemon instance
-// with d.dp wired to a stub provider. That's covered indirectly
-// by the integration smoke matrix on the loss userspace cluster.
-// For pure-logic coverage we test probeTier + usableNUD mask
-// (above).
+// (Older stub types removed; superseded by stubProviderForListener
+// below which implements the real neighborSnapshotProvider interface
+// and supports the TestShouldTriggerRegen suite.)
 
 func TestNeighborListenerNUDStateBitmaskCoverage(t *testing.T) {
 	// Sanity: documented learnedMask in the plan must match
@@ -129,6 +105,158 @@ func TestNeighborListenerEventTypes(t *testing.T) {
 	if syscall.RTM_NEWNEIGH == syscall.RTM_DELNEIGH {
 		t.Error("RTM_NEWNEIGH and RTM_DELNEIGH must differ")
 	}
+}
+
+// stubProviderForListener implements neighborSnapshotProvider for
+// shouldTriggerRegen tests. Wraps a small in-memory map.
+type stubProviderForListener struct {
+	regenCount int
+	entries    map[neighborProbeKey]*userspace.NeighborSnapshot
+}
+
+type neighborProbeKey struct {
+	ifindex int
+	ip      string
+}
+
+func (s *stubProviderForListener) RegenerateNeighborSnapshot()  { s.regenCount++ }
+func (s *stubProviderForListener) SnapshotHasIfindex(int) bool  { return true }
+func (s *stubProviderForListener) IsMonitoredIfindex(int) bool  { return true }
+func (s *stubProviderForListener) LookupSnapshotNeighbor(ifindex int, ip net.IP) *userspace.NeighborSnapshot {
+	if s.entries == nil {
+		return nil
+	}
+	return s.entries[neighborProbeKey{ifindex, ip.String()}]
+}
+
+// withStubProvider runs body with a fresh stub provider. Tests
+// invoke shouldTriggerRegenWithProvider directly with the stub
+// rather than going through d.dp (which expects the full
+// dataplane.DataPlane interface).
+func withStubProvider(t *testing.T, fn func(p *stubProviderForListener)) {
+	t.Helper()
+	p := &stubProviderForListener{
+		entries: make(map[neighborProbeKey]*userspace.NeighborSnapshot),
+	}
+	fn(p)
+}
+
+// TestShouldTriggerRegen exercises the full forwarding-effective
+// diff decision tree per Copilot review #4. Covers MAC change,
+// RTM_DELNEIGH, same-MAC same-state churn (ignored), transition
+// to FAILED/INCOMPLETE, NEW publishable entry, NEW unusable entry.
+func TestShouldTriggerRegen(t *testing.T) {
+	mkUpdate := func(ev uint16, ifindex int, ip net.IP, mac net.HardwareAddr, state int) netlink.NeighUpdate {
+		return netlink.NeighUpdate{
+			Type: ev,
+			Neigh: netlink.Neigh{
+				LinkIndex:    ifindex,
+				IP:           ip,
+				HardwareAddr: mac,
+				State:        state,
+			},
+		}
+	}
+	parseMAC := func(s string) net.HardwareAddr {
+		m, _ := net.ParseMAC(s)
+		return m
+	}
+
+	t.Run("RTM_DELNEIGH always triggers", func(t *testing.T) {
+		withStubProvider(t, func(p *stubProviderForListener) {
+			u := mkUpdate(syscall.RTM_DELNEIGH, 5, net.ParseIP("10.0.0.1"), nil, 0)
+			if !shouldTriggerRegenWithProvider(u, p) {
+				t.Error("RTM_DELNEIGH should always trigger")
+			}
+		})
+	})
+
+	t.Run("MAC change triggers", func(t *testing.T) {
+		withStubProvider(t, func(p *stubProviderForListener) {
+			ip := net.ParseIP("10.0.0.1")
+			p.entries[neighborProbeKey{5, "10.0.0.1"}] = &userspace.NeighborSnapshot{
+				Ifindex: 5, IP: "10.0.0.1", MAC: "aa:aa:aa:aa:aa:aa",
+			}
+			u := mkUpdate(syscall.RTM_NEWNEIGH, 5, ip, parseMAC("bb:bb:bb:bb:bb:bb"), netlink.NUD_REACHABLE)
+			if !shouldTriggerRegenWithProvider(u, p) {
+				t.Error("MAC change should trigger")
+			}
+		})
+	})
+
+	t.Run("same-MAC REACHABLE→STALE churn ignored", func(t *testing.T) {
+		withStubProvider(t, func(p *stubProviderForListener) {
+			ip := net.ParseIP("10.0.0.1")
+			mac := parseMAC("aa:aa:aa:aa:aa:aa")
+			p.entries[neighborProbeKey{5, "10.0.0.1"}] = &userspace.NeighborSnapshot{
+				Ifindex: 5, IP: "10.0.0.1", MAC: "aa:aa:aa:aa:aa:aa",
+			}
+			u := mkUpdate(syscall.RTM_NEWNEIGH, 5, ip, mac, netlink.NUD_STALE)
+			if shouldTriggerRegenWithProvider(u, p) {
+				t.Error("same-MAC REACHABLE→STALE should NOT trigger (aging churn)")
+			}
+		})
+	})
+
+	t.Run("transition to FAILED triggers", func(t *testing.T) {
+		withStubProvider(t, func(p *stubProviderForListener) {
+			ip := net.ParseIP("10.0.0.1")
+			mac := parseMAC("aa:aa:aa:aa:aa:aa")
+			p.entries[neighborProbeKey{5, "10.0.0.1"}] = &userspace.NeighborSnapshot{
+				Ifindex: 5, IP: "10.0.0.1", MAC: "aa:aa:aa:aa:aa:aa",
+			}
+			u := mkUpdate(syscall.RTM_NEWNEIGH, 5, ip, mac, netlink.NUD_FAILED)
+			if !shouldTriggerRegenWithProvider(u, p) {
+				t.Error("transition to FAILED should trigger (entry becomes unusable)")
+			}
+		})
+	})
+
+	t.Run("transition to INCOMPLETE triggers", func(t *testing.T) {
+		withStubProvider(t, func(p *stubProviderForListener) {
+			ip := net.ParseIP("10.0.0.1")
+			mac := parseMAC("aa:aa:aa:aa:aa:aa")
+			p.entries[neighborProbeKey{5, "10.0.0.1"}] = &userspace.NeighborSnapshot{
+				Ifindex: 5, IP: "10.0.0.1", MAC: "aa:aa:aa:aa:aa:aa",
+			}
+			u := mkUpdate(syscall.RTM_NEWNEIGH, 5, ip, mac, netlink.NUD_INCOMPLETE)
+			if !shouldTriggerRegenWithProvider(u, p) {
+				t.Error("transition to INCOMPLETE should trigger")
+			}
+		})
+	})
+
+	t.Run("new entry with usable state and MAC triggers", func(t *testing.T) {
+		withStubProvider(t, func(p *stubProviderForListener) {
+			ip := net.ParseIP("10.0.0.99")
+			mac := parseMAC("aa:aa:aa:aa:aa:aa")
+			u := mkUpdate(syscall.RTM_NEWNEIGH, 5, ip, mac, netlink.NUD_REACHABLE)
+			if !shouldTriggerRegenWithProvider(u, p) {
+				t.Error("new publishable entry should trigger")
+			}
+		})
+	})
+
+	t.Run("new entry without MAC does not trigger", func(t *testing.T) {
+		withStubProvider(t, func(p *stubProviderForListener) {
+			ip := net.ParseIP("10.0.0.99")
+			u := mkUpdate(syscall.RTM_NEWNEIGH, 5, ip, nil, netlink.NUD_INCOMPLETE)
+			if shouldTriggerRegenWithProvider(u, p) {
+				t.Error("new INCOMPLETE entry without MAC should NOT trigger")
+			}
+		})
+	})
+
+	t.Run("composite REACHABLE|FAILED for new entry does not trigger", func(t *testing.T) {
+		withStubProvider(t, func(p *stubProviderForListener) {
+			ip := net.ParseIP("10.0.0.99")
+			mac := parseMAC("aa:aa:aa:aa:aa:aa")
+			u := mkUpdate(syscall.RTM_NEWNEIGH, 5, ip, mac, netlink.NUD_REACHABLE|netlink.NUD_FAILED)
+			if shouldTriggerRegenWithProvider(u, p) {
+				t.Error("composite REACHABLE|FAILED should NOT trigger as usable new entry")
+			}
+		})
+	})
 }
 
 // TestCompositeNUDStateUnusable verifies that a state with both

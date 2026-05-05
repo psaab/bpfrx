@@ -598,6 +598,15 @@ func (m *Manager) RegenerateNeighborSnapshot() {
 	m.rebuildNeighborIndex() // #1197 (after publish success)
 	m.generation++
 	m.lastSnapshot.Generation = m.generation
+	// Copilot review: advance publishedSnapshot + refresh
+	// lastSnapshotHash. Otherwise the status loop sees the
+	// bumped generation as unpublished and may force a redundant
+	// apply_snapshot, AND any churn in filtered-out rows could
+	// leak through hash-dedup.
+	m.publishedSnapshot = m.lastSnapshot.Generation
+	if h, ok := snapshotContentHash(m.lastSnapshot); ok {
+		m.lastSnapshotHash = h
+	}
 }
 
 // LookupSnapshotNeighbor returns a copy of the snapshot's

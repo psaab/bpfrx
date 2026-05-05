@@ -246,6 +246,13 @@ func (d *Daemon) isMonitoredNeighbor(linkIndex int) bool {
 // true when the snapshot should be regenerated; false on harmless
 // aging transitions (REACHABLE↔STALE↔DELAY↔PROBE on same MAC).
 func (d *Daemon) shouldTriggerRegen(u netlink.NeighUpdate) bool {
+	return shouldTriggerRegenWithProvider(u, d.neighborProvider())
+}
+
+// shouldTriggerRegenWithProvider is the pure decision logic for
+// the listener event filter. Extracted so tests can inject a
+// stub provider without wiring a full Daemon/dataplane.
+func shouldTriggerRegenWithProvider(u netlink.NeighUpdate, provider neighborSnapshotProvider) bool {
 	switch u.Type {
 	case syscall.RTM_DELNEIGH:
 		// Kernel evicted the entry; snapshot must drop it
@@ -264,7 +271,6 @@ func (d *Daemon) shouldTriggerRegen(u netlink.NeighUpdate) bool {
 		// composite states that include FAILED/INCOMPLETE.
 		unusable := !usable
 
-		provider := d.neighborProvider()
 		var existing *userspace.NeighborSnapshot
 		if provider != nil {
 			existing = provider.LookupSnapshotNeighbor(u.LinkIndex, u.IP)
@@ -393,14 +399,21 @@ func (d *Daemon) collectMonitoredNeighbors(cfg *config.Config) []probeTarget {
 	var targets []probeTarget
 
 	// Helper: NUD state lookup via NeighList per (ifindex, family).
-	stateCache := make(map[int]map[string]uint16) // ifindex → ip → state
+	// Copilot review: previous arithmetic encoding `ifindex*2+family`
+	// collides — netlink.FAMILY_V4=2, FAMILY_V6=10 → (if=1,v6) and
+	// (if=5,v4) both produce 12. Use a struct key instead.
+	type stateCacheKey struct {
+		ifindex int
+		family  int
+	}
+	stateCache := make(map[stateCacheKey]map[string]uint16)
 	getState := func(ifindex int, ip net.IP) uint16 {
 		family := netlink.FAMILY_V4
 		if ip.To4() == nil {
 			family = netlink.FAMILY_V6
 		}
-		cacheKey := ifindex*2 + family
-		if m, ok := stateCache[cacheKey]; ok {
+		k := stateCacheKey{ifindex, family}
+		if m, ok := stateCache[k]; ok {
 			return m[ip.String()]
 		}
 		neighs, err := netlink.NeighList(ifindex, family)
@@ -412,7 +425,7 @@ func (d *Daemon) collectMonitoredNeighbors(cfg *config.Config) []probeTarget {
 				}
 			}
 		}
-		stateCache[cacheKey] = m
+		stateCache[k] = m
 		return m[ip.String()]
 	}
 
