@@ -24,12 +24,15 @@ Close #946 as **wontfix-with-rationale** (not "complete").
    "per-packet, no batch reordering" — Phase 1 is intentionally
    pure code motion, not a behavior change.
 
-3. **The full scope is structurally impossible to ship as proposed.**
-   Phase 2 — swapping to per-stage iteration over the RX burst —
-   was independently PLAN-KILLED on 2026-05-03 by both Codex and
-   Gemini Pro 3 because **stages 12-16 cannot be reordered
-   without rebuilding session/NAT/MissingNeighbor around immutable
-   per-burst snapshots**. Specifically:
+3. **The full scope is not semantics-preserving as an incremental
+   per-stage batching refactor.** Phase 2 — swapping to per-stage
+   iteration over the RX burst — was independently PLAN-KILLED on
+   2026-05-03 by both Codex and Gemini Pro 3 because **stages 12-16
+   cannot be reordered without rebuilding session/NAT/MissingNeighbor
+   around immutable per-burst snapshots or a delta-log redesign**.
+   The full VPP-style rewrite is not impossible in the absolute
+   sense — a snapshot/delta-log redesign could land — but it is
+   not Phase-2-sized incremental work. Specifically the blockers:
    - `flow_cache.rs:384,409,436` — lookup mutates LRU; reordering
      evicts entries packet N+1 would have hit.
    - `session_glue/mod.rs:954` — `resolve_flow_session_decision`
@@ -44,8 +47,12 @@ Close #946 as **wontfix-with-rationale** (not "complete").
    session lookup, NAT slot allocation, FIB caching, and
    MissingNeighbor handling around immutable burst-boundary
    snapshots. That is multi-quarter, has no incremental seam, and
-   has no measured win — frontend/L1-i-bound has never been
-   established as the actual cost source.
+   has no measured win — **no evidence currently shows
+   frontend/L1-i dominance**. Existing perf data on this branch
+   profiles backend / dispatch / memory cost (#776 cross-worker
+   memcpy, #777 RX poll, #779 TX dispatch) — `frontend-retired.l1i_miss`,
+   `L1-icache-load-misses`, and `stalled-cycles-frontend` have not
+   been measured, so the L1-i thrashing premise is unproven.
 
 **What this closure is not:**
 
@@ -59,14 +66,27 @@ Close #946 as **wontfix-with-rationale** (not "complete").
 
 **What would reopen this:**
 
-- A measurement-driven case that frontend/L1-i-bound is the actual
-  cost source (current top hotspots — #776 cross-worker memcpy at
-  13.43%, #777 RX poll at 9.45%, #779 TX dispatch — are backend-
-  bound, memory-bound, and dispatch-coupled, not L1-i-bound).
+- A measurement showing frontend/L1-i dominance — e.g., `perf stat
+  -e frontend-retired.l1i_miss,stalled-cycles-frontend` against
+  the loss userspace cluster under sustained `iperf3 -P 12 -R`
+  load, with frontend stalls a non-trivial share of cycles.
+  Current top hotspots (#776, #777, #779) profile as backend /
+  memory / dispatch cost, not frontend-bound, but this has never
+  been formally measured as L1-i.
 - A concrete plan that solves the immutable-snapshot problem at
   burst boundaries (e.g., lookup-only flow_cache snapshot, deferred
   session install at burst end, MissingNeighbor side queue resolved
-  before stage advance).
+  before stage advance, or a delta-log applied at burst boundary).
+
+**Phase 1.5 dangling scope (resolved here, not blocking closure):**
+
+The Phase 1 doc on `poll_stages.rs` mentions future extraction of
+stages 12-16 as **per-packet helper functions** (pure code motion,
+mirroring Phase 1's scope). That work is not part of #946's L1-i
+batching goal — it's a maintainability cleanup. **Out of scope for
+#946**. If/when someone wants to do it, file a fresh issue scoped
+as "Phase 1.5: extract per-packet stages 12-16 into named helpers"
+— do not reopen #946 for that.
 
 ## 2. What's already documented in the issue
 
