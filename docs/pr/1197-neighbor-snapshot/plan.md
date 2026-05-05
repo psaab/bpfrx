@@ -1,5 +1,5 @@
 ---
-status: REVISED v6 — Codex round-5 PLAN-NEEDS-MINOR; 6 nits fixed; ready to implement
+status: REVISED v7 — Codex round-6 PLAN-NEEDS-MINOR; 3 final text fixes; PROCEEDING to implementation
 issue: #1197
 phase: Plan + fix design
 prior:
@@ -485,8 +485,19 @@ func neighborsEqualForwarding(a, b []NeighborSnapshot) bool {
 // Publishable predicate: must match userspace-dp's accept rules
 // at handlers.rs:165 / forwarding_build.rs:326. Drift here is a
 // silent forwarding bug — keep this in sync if userspace changes.
+//
+// Codex round-6 #2: parse IP and MAC instead of string-emptiness;
+// matches what Rust does on accept (parses both) and rejects
+// malformed strings here rather than letting them through to
+// userspace-dp where they'd be silently dropped.
 func neighborSnapshotPublishable(n NeighborSnapshot) bool {
-    if n.Ifindex <= 0 || n.IP == "" || n.MAC == "" {
+    if n.Ifindex <= 0 {
+        return false
+    }
+    if net.ParseIP(n.IP) == nil {
+        return false
+    }
+    if _, err := net.ParseMAC(n.MAC); err != nil {
         return false
     }
     // "none" is what neighborStateString emits for raw state 0;
@@ -511,6 +522,11 @@ changes publish.
 // RegenerateNeighborSnapshot rebuilds neighbors[] from kernel
 // ARP/NDP via buildNeighborSnapshots, diffs forwarding-effectively,
 // and publishes update_neighbors only on real changes.
+//
+// Codex round-6 #1: filter the publish payload to publishable-only
+// entries. Rust accepts everything-not-failed-as-usable, so an
+// empty-MAC INCOMPLETE row would otherwise reach state.neighbors
+// as a usable-but-broken entry. We MUST drop those at publish time.
 func (m *Manager) RegenerateNeighborSnapshot() {
     m.mu.Lock()
     defer m.mu.Unlock()
@@ -524,7 +540,15 @@ func (m *Manager) RegenerateNeighborSnapshot() {
     }
     m.lastSnapshot.Neighbors = newNeighbors
     m.lastSnapshot.Generation = m.generation
-    m.publishUpdateNeighbors(newNeighbors)
+
+    // Filter to publishable-only before pushing to userspace-dp.
+    publishable := make([]NeighborSnapshot, 0, len(newNeighbors))
+    for _, n := range newNeighbors {
+        if neighborSnapshotPublishable(n) {
+            publishable = append(publishable, n)
+        }
+    }
+    m.publishUpdateNeighbors(publishable)
 }
 ```
 
@@ -540,8 +564,9 @@ Called from:
 ### Deleted
 - `pkg/daemon/daemon_neighbor.go:24-105` — entire
   `preinstallSnapshotNeighbors` function
-- The 15s timer at `daemon_neighbor.go:468` that calls it (or
-  repurposed to call `resolveNeighborsInner` instead)
+- The 15s timer at `daemon_neighbor.go:468` that calls it
+  (replaced by the new force-probe tick added below; NOT
+  repurposed to call skip-stale `resolveNeighborsInner`)
 
 ### Added
 - `pkg/daemon/daemon_neighbor.go` — `neighborListener`,
