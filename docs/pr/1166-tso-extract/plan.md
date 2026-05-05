@@ -1,5 +1,5 @@
 ---
-status: DRAFT v1 — pending adversarial plan review
+status: REVISED v2 — Codex round-1 PLAN-NEEDS-MAJOR; layer-violation finding addressed
 issue: #1166
 phase: Pure code-motion refactor
 ---
@@ -67,22 +67,42 @@ let segmented = segment_forwarded_tcp_frames_into_prepared(...)?;
 Call site stays in `tx/dispatch.rs`; the move adds an import
 from `frame::tcp_segmentation`.
 
-## 4. Concrete design
+## 4. Concrete design — v2 (Codex round-1 layer-violation fix)
 
-1. Cut lines `tx/dispatch.rs:1204-1484` (the whole function).
-2. Paste at the bottom of `frame/tcp_segmentation.rs` (or a
-   sensible location).
-3. Adjust visibility: was `fn` (private to dispatch.rs); needs
-   to become `pub(in crate::afxdp)` so the caller in
-   `tx/dispatch.rs` can still reach it.
-4. Update the `use` block at top of `tx/dispatch.rs` to import
-   the moved function.
-5. Verify no other callers (grep confirms only one).
-6. Tests: existing `frame/tcp_segmentation.rs` already has tests
-   for `segment_forwarded_tcp_frames_from_frame`; the moved
-   wrapper inherits those by-virtue.
+**Target changed.** Codex caught that the function isn't a pure
+frame builder — it mutates `BindingWorker.tx_pipeline`, consumes
+`free_tx_frames`, writes UMEM directly, pushes `PreparedTxRequest`,
+and calls `bound_pending_tx_prepared` + `drain_pending_tx_local_owner`
+(the latter two already live in `tx/drain.rs` as
+`pub(in crate::afxdp)`). Moving it into `frame/tcp_segmentation.rs`
+would make `frame` depend on TX-pipeline / worker / CoS-owner /
+drain state. Layer violation.
 
-No behavior change. No new tests needed (function moves intact).
+**Correct target: `userspace-dp/src/afxdp/tx/tcp_segmentation.rs`**
+(new file, sibling of `tx/dispatch.rs`, same `tx/` module).
+Pure frame-builder logic stays in `frame/tcp_segmentation.rs`.
+Layer boundary preserved: `frame/` builds packets;
+`tx/` owns UMEM/prepared queue/drain side effects.
+
+Steps:
+
+1. Create new file `userspace-dp/src/afxdp/tx/tcp_segmentation.rs`.
+2. Cut lines `tx/dispatch.rs:1204-1484` (the function).
+3. Paste into the new file.
+4. Add `mod tcp_segmentation;` to `tx/mod.rs`.
+5. Visibility: `pub(super) fn segment_forwarded_tcp_frames_into_prepared(...)`
+   so the caller in `tx/dispatch.rs:259` reaches it via the parent
+   `tx/` module — minimum visibility required.
+6. Update `tx/dispatch.rs` `use` block:
+   `use super::tcp_segmentation::segment_forwarded_tcp_frames_into_prepared;`
+7. Verify no other callers (Codex confirmed only one).
+8. The `pub(in crate::afxdp)` helpers
+   `bound_pending_tx_prepared` (`tx/drain.rs:33`) and
+   `drain_pending_tx_local_owner` (`tx/drain.rs:464`) are already
+   reachable from the new sibling file in `tx/` — no further
+   visibility changes needed.
+
+No behavior change. No new tests needed (function body intact).
 
 ## 5. Public API preservation
 
