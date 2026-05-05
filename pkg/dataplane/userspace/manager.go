@@ -462,7 +462,8 @@ func (m *Manager) BumpFIBGeneration() uint32 {
 			// Only update cached neighbors after successful publish so
 			// a transient failure doesn't suppress future retries.
 			m.lastSnapshot.Neighbors = newNeighbors
-			m.rebuildNeighborIndex() // #1197
+			m.rebuildNeighborIndex()      // #1197
+			m.rebuildMonitoredIfindexes() // #1197 v3: catch link recreation
 		}
 	}
 
@@ -503,6 +504,14 @@ func filterPublishableNeighbors(neighbors []NeighborSnapshot) []NeighborSnapshot
 // rebuildNeighborIndex updates m.neighborIndex from the current
 // m.lastSnapshot.Neighbors slice. Caller MUST hold m.mu. Called
 // after every assignment to lastSnapshot.Neighbors.
+//
+// Codex code-review v2 #1: index ONLY publishable entries.
+// Indexing raw entries causes a bug: a raw failed→reachable
+// transition on the same MAC would return existing.MAC == new.MAC
+// from LookupSnapshotNeighbor → shouldTriggerRegen returns false
+// → snapshot stays out of date until 60s safety tick. By indexing
+// only publishable entries, an unpublishable→publishable
+// transition presents as "no existing entry" → trigger fires.
 func (m *Manager) rebuildNeighborIndex() {
 	if m.lastSnapshot == nil {
 		m.neighborIndex = nil
@@ -512,6 +521,9 @@ func (m *Manager) rebuildNeighborIndex() {
 		len(m.lastSnapshot.Neighbors))
 	for i := range m.lastSnapshot.Neighbors {
 		n := &m.lastSnapshot.Neighbors[i]
+		if !neighborSnapshotPublishable(*n) {
+			continue
+		}
 		idx[neighborIndexKey{n.Ifindex, n.IP}] = n
 	}
 	m.neighborIndex = idx
@@ -554,65 +566,69 @@ func (m *Manager) RegenerateNeighborSnapshot() {
 		return
 	}
 	m.lastSnapshot.Neighbors = newNeighbors
-	m.rebuildNeighborIndex() // #1197
+	m.rebuildNeighborIndex()      // #1197
+	m.rebuildMonitoredIfindexes() // #1197 v3: catch link recreation
 	m.generation++
 	m.lastSnapshot.Generation = m.generation
 }
 
-// LookupSnapshotNeighbor returns the snapshot's current entry for
-// (ifindex, ip), or nil if not present. Used by the daemon's
-// listener hot path to compute forwarding-effective diff per
-// event. O(1) via the neighborIndex map.
+// LookupSnapshotNeighbor returns a copy of the snapshot's
+// current entry for (ifindex, ip), or nil if not present. The
+// returned snapshot is a value copy — safe to read after the
+// lock is released, and avoids the (currently no-op) mutation
+// hazard of returning an internal pointer.
 //
-// Codex code-review #2: previous version did O(N) linear scan
-// inside m.mu.Lock() — pathological under GARP storm. Now uses
-// the neighborIndex rebuilt on every lastSnapshot.Neighbors
-// replacement.
+// Codex code-review v2 #4: previous version returned a defensive
+// pointer via heap copy. Caller (shouldTriggerRegen) only reads
+// the MAC immediately while still under m.mu, so a pointer is
+// safe. But the API surface is cleaner as a value (caller can
+// hold it across other lock-acquiring calls without aliasing
+// concerns), so we keep the value-copy semantics — just skip
+// the heap-allocated *NeighborSnapshot wrapping.
 //
-// Returns a defensive copy (not pointer into the snapshot)
-// because the caller may use the value after releasing m.mu and
-// the index could be rebuilt concurrently from another goroutine.
+// Index covers ONLY publishable entries (#1 v2 fix), so a hit
+// here means userspace-dp has been told about this entry.
 func (m *Manager) LookupSnapshotNeighbor(ifindex int, ip net.IP) *NeighborSnapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.neighborIndex == nil {
 		return nil
 	}
-	if entry, ok := m.neighborIndex[neighborIndexKey{ifindex, ip.String()}]; ok {
-		// Return a defensive copy so callers don't see mutation
-		// from concurrent rebuildNeighborIndex.
-		copy := *entry
-		return &copy
+	entry, ok := m.neighborIndex[neighborIndexKey{ifindex, ip.String()}]
+	if !ok {
+		return nil
 	}
-	return nil
+	out := *entry
+	return &out
 }
 
-// MonitoredIfindexes returns the cached set of link indexes the
-// snapshot covers. O(1) read of the cached map under m.mu.
+// IsMonitoredIfindex returns true if the given link index
+// belongs to a configured interface that buildNeighborSnapshots
+// would iterate. O(1) hash-map lookup under m.mu.
 //
-// Codex code-review #2: previous listener path called
-// MonitoredInterfaceLinkIndexes(cfg) per event, which makes
-// netlink LinkByName calls per configured interface. Cached
-// here so the listener can do O(1) ifindex membership checks.
-//
-// Returns a defensive copy so callers can iterate without
-// holding the lock.
-func (m *Manager) MonitoredIfindexes() map[int]struct{} {
+// Codex code-review v2 #2: previous version returned a copy of
+// the whole map, which made the listener hot path O(configured-
+// interfaces) plus heap churn per event. This direct lookup
+// avoids both.
+func (m *Manager) IsMonitoredIfindex(ifindex int) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.monitoredIfindexes == nil {
-		return nil
+		return false
 	}
-	out := make(map[int]struct{}, len(m.monitoredIfindexes))
-	for k := range m.monitoredIfindexes {
-		out[k] = struct{}{}
-	}
-	return out
+	_, ok := m.monitoredIfindexes[ifindex]
+	return ok
 }
 
 // rebuildMonitoredIfindexes updates m.monitoredIfindexes from
-// the active config. Caller MUST hold m.mu. Called on snapshot
-// publish (config commit time), not per event.
+// the active config. Caller MUST hold m.mu.
+//
+// Codex code-review v2 #3: previous version was called only on
+// full snapshot assignment. Neighbor-only updates (BumpFIBGeneration,
+// RegenerateNeighborSnapshot) didn't refresh the cache, so a
+// configured link recreated under a new ifindex could have its
+// events dropped. Now called from every neighbor-related update
+// path that may reflect a new ifindex.
 func (m *Manager) rebuildMonitoredIfindexes() {
 	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
 		m.monitoredIfindexes = nil

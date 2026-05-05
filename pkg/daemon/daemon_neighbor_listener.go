@@ -79,7 +79,7 @@ type neighborSnapshotProvider interface {
 	RegenerateNeighborSnapshot()
 	LookupSnapshotNeighbor(ifindex int, ip net.IP) *userspace.NeighborSnapshot
 	SnapshotHasIfindex(ifindex int) bool
-	MonitoredIfindexes() map[int]struct{}
+	IsMonitoredIfindex(ifindex int) bool
 }
 
 // neighborListener runs the netlink RTM_NEWNEIGH/DELNEIGH event
@@ -233,10 +233,8 @@ func (d *Daemon) isMonitoredNeighbor(linkIndex int) bool {
 	if provider == nil {
 		return false
 	}
-	if monitored := provider.MonitoredIfindexes(); monitored != nil {
-		if _, ok := monitored[linkIndex]; ok {
-			return true
-		}
+	if provider.IsMonitoredIfindex(linkIndex) {
+		return true
 	}
 	if provider.SnapshotHasIfindex(linkIndex) {
 		return true
@@ -256,12 +254,14 @@ func (d *Daemon) shouldTriggerRegen(u netlink.NeighUpdate) bool {
 		return true
 	case syscall.RTM_NEWNEIGH:
 		hasMAC := u.HardwareAddr != nil && len(u.HardwareAddr) > 0
-		usable := u.State&usableNUD != 0
-		// Codex code-review #3: NUD_NONE (state==0) for an
-		// EXISTING snapshot entry is also a transition-to-unusable.
-		// Treat as unusable: any state outside usableNUD (including
-		// state==0/NONE/FAILED/INCOMPLETE) means the entry should
-		// drop from snapshot.
+		// Composite-state safety: a state with both REACHABLE and
+		// FAILED bits set must NOT be classified as usable. Define
+		// usable as: at least one usableNUD bit AND no failed/
+		// incomplete bit.
+		usable := u.State&usableNUD != 0 &&
+			u.State&(netlink.NUD_FAILED|netlink.NUD_INCOMPLETE) == 0
+		// "unusable" covers state==0/NONE/FAILED/INCOMPLETE OR
+		// composite states that include FAILED/INCOMPLETE.
 		unusable := !usable
 
 		provider := d.neighborProvider()
