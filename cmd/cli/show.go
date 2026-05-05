@@ -287,6 +287,9 @@ func (c *ctl) handleShowServices(args []string) error {
 	switch args[0] {
 	case "rpm":
 		return c.showText("rpm")
+	case "application-identification":
+		// #653: surface what xpf AppID actually does today.
+		return c.showText("application-identification")
 	default:
 		return fmt.Errorf("unknown services target: %s", args[0])
 	}

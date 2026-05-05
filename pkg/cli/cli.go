@@ -1946,6 +1946,11 @@ func (c *CLI) handleShowServices(args []string) error {
 			return c.showRPMProbeResults()
 		}
 		return c.showRPMProbeResults()
+	case "application-identification":
+		// #653: surface what xpf AppID actually does today vs the
+		// vSRX application-identification feature. Honest contract,
+		// not the catalog-completeness illusion.
+		return c.showApplicationIdentificationStatus()
 	default:
 		return fmt.Errorf("unknown services target: %s", args[0])
 	}
