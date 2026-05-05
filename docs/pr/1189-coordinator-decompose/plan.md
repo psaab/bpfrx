@@ -1,5 +1,5 @@
 ---
-status: REVISED v9 — Codex round-8 PLAN-NEEDS-MINOR; corrected Option B to private `use supervisor::{...};` (not `pub(super) use`, which Rust rejects as private-item re-export of `pub(super)` items), and trimmed the production `use` import to only the two spawn helpers actually called from production sites (`panic_payload_message` is test-only)
+status: REVISED v10 — Codex round-9 PLAN-NEEDS-MINOR; corrected Option B test-scope wording — a test-module-local `use` only resolves bare calls; preserving the existing `super::panic_payload_message` test path needs `#[cfg(test)] use supervisor::panic_payload_message;` in `coordinator/mod.rs` (the parent module), not in the test module itself
 issue: #1189
 phase: First incremental migration of one manager surface
 ---
@@ -261,10 +261,16 @@ helpers — `panic_payload_message` is exclusively used by tests
 trigger an `unused_imports` warning under `#[cfg(not(test))]`
 builds. Under Option A the prod `use` covers production calls
 and tests use the explicit `super::supervisor::*` path. Under
-Option B the same prod `use` covers production calls and a
-separate private `use supervisor::{panic_payload_message,
-spawn_supervised_worker, spawn_supervised_aux};` (or a single
-combined `use supervisor::*;`) in the test module covers tests.
+Option B the prod `use` covers production calls and a
+`#[cfg(test)] use supervisor::panic_payload_message;` is added
+in `coordinator/mod.rs` (the parent module of `tests`) so that
+the existing `super::panic_payload_message` test path at
+`tests.rs:840` continues to resolve. Note: a test-module-local
+import would *not* satisfy `super::panic_payload_message`
+because `super::` from inside the test module resolves to
+`coordinator::` (where the symbol must live to be reachable via
+that path); the `cfg(test) use` in the parent module gates
+the import to test builds without leaking it into prod.
 
 Implementation checklist must touch all five lines (840, 869,
 889, 903, 918) under Option A or none under Option B; do not
