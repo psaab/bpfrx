@@ -1,7 +1,102 @@
 ---
-status: DRAFT v1 — pending adversarial plan review
+status: PLAN-KILLED — both reviewers concur (Codex PLAN-KILL, Gemini Pro 3 PLAN-KILL); plan v1 retained verbatim below for traceability
 issue: https://github.com/psaab/xpf/issues/761
 phase: Dense-slot indirection for ifindex-keyed hot-path BPF maps
+---
+
+## KILL decision (2026-05-05)
+
+Plan v1 reviewed by Codex (`task-mos41ah2-rf9s8j`) and Gemini
+Pro 3 (`task-mos41n65-19lsvd`). Both verdicts saved verbatim
+in `codex-review.md` + `gemini-review.md`. Converging
+findings:
+
+1. **Fatal slot-instability flaw (Gemini #3)**: the proposed
+   "sorted-by-name" non-recycling slot derivation contradicts
+   itself. If the live interface set is `[eth1, eth2]` (slots
+   0,1) and the operator adds VLAN `eth1.5`, the sorted list
+   becomes `[eth1, eth1.5, eth2]` — `eth2`'s slot shifts from
+   1 → 2, instantly misrouting traffic AND invalidating all
+   existing data-plane state for `eth2` on both HA nodes.
+   Slot IDs must be monotonic and immutable; the plan's
+   derivation isn't.
+
+2. **Cost-benefit wrong (Codex #1, Gemini #1)**: ~0.7-1.0 %
+   plausible CPU savings on a non-bottleneck path while
+   `__memmove_evex_unaligned_erms` (13.43 %, #776) and
+   `poll_binding_process_descriptor` (9.45 %, #777) are an
+   order of magnitude bigger. #781's structural pipeline
+   stall is also much higher upside.
+
+3. **`tx_ports` already DEVMAP, not DEVMAP_HASH (Codex #2)**:
+   the plan assumed DEVMAP_HASH and counted it as one of the
+   "4 hashes per packet". Reality at
+   `bpf/headers/xpf_maps.h:376` shows `BPF_MAP_TYPE_DEVMAP`.
+   #814 also explicitly bans DEVMAP_HASH. So the savings
+   model overcounts.
+
+4. **Plan misses `userspace_bindings` (Codex #3)**: #814
+   explicitly deferred slot indirection for
+   `USERSPACE_BINDINGS` (currently indexed by `ifindex × 16`
+   in `pkg/dataplane/userspace/maps_sync.go:520` +
+   `userspace-xdp/src/lib.rs:392`) to #761 — but the plan
+   doesn't address it. Architectural miss.
+
+5. **u16 keys invalid for ARRAY/DEVMAP (Codex #4)**: BPF
+   array/devmap indexes must be 32-bit. The plan says
+   `slot_id u16` repeatedly. `pkt_meta` can cache u16 but
+   every map lookup needs u32.
+
+6. **Update ordering unsafe (Codex #6)**: writing
+   `ifindex_to_slot` before populating the hot-path maps
+   creates a transient window where new slots resolve to
+   empty arrays/devmap entries → pass/drop/wrong-output
+   behavior. Needs a real two-phase generation protocol.
+
+7. **Memory math wrong (Codex #7)**: `iface_counter_value` is
+   32 bytes (not 16 as the plan said). At MaxSlots=256, CPUs=64
+   the PERCPU_ARRAY is 512 KiB, not 256 KiB. Still acceptable
+   but the plan's numbers are wrong.
+
+8. **MaxSlots=256 too small (Codex #9, Gemini #6)**: codebase
+   has `MAX_LOGICAL_INTERFACES = 512` and userspace ingress
+   includes VLAN children + parents. With non-recycling and
+   high churn (container veth, dynamic tunnels, frequent
+   config reloads), 256 exhausts quickly. Should be ≥ 1024.
+
+9. **Stage 0 gate too loose (Codex #8, Gemini #4)**: 0.5 % is
+   within measurement noise. Codex wants ≥ 1 %; Gemini wants
+   3-5 % for a refactor of this magnitude.
+
+10. **Net savings model unrealistic (Gemini #5)**: replacing
+    5 HASH probes with 1 HASH + 4 ARRAY probes keeps the
+    `bpf_map_lookup_elem` helper-call overhead. At small
+    interface counts the HASH probes are L1d-hot zero-collision.
+    Add `pkt_meta` reads/writes for slot caching + slot_generation
+    branch and the net could be zero or negative.
+
+### Decision
+
+Plan v1 killed. Per the project's KILL discipline:
+
+- Plan doc retained verbatim (this file) so future readers
+  see the rejected v1 and the kill rationale.
+- Both reviewer reports filed in this directory.
+- Issue #761 closed-as-killed with a comment summarizing the
+  findings.
+- If #761 is ever revisited, prerequisites (per Codex
+  recommendation):
+  - Stage-0 measurement showing ≥ 1.0 % NET CPU opportunity
+    (after counting the new ifindex_to_slot probe + slot_generation
+    guard cost).
+  - Include `userspace_bindings` (deferred from #814) in scope.
+  - Use a transaction-safe persistent slot ledger (name → slot
+    with tombstones), NOT sorted-by-name derivation.
+  - Two-phase generation protocol for cross-node update.
+  - u32 keys in BPF map definitions.
+
+(Plan v1 follows verbatim below.)
+
 ---
 
 ## 1. Issue framing
