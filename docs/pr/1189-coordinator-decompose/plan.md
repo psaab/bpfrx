@@ -1,5 +1,5 @@
 ---
-status: REVISED v2 — Codex round-1 PLAN-NEEDS-MAJOR; scope narrowed per Codex's findings
+status: REVISED v3 — Codex round-2 PLAN-NEEDS-MINOR; deleted v1 residue, reframed stop extraction with fd inputs, moved spawn_supervised_aux out of WorkerManager, documented test path updates
 issue: #1189
 phase: First incremental migration of one manager surface
 ---
@@ -103,74 +103,162 @@ state, it stays on Coordinator.
 
 ## 3. Code paths affected
 
-### Coordinator's worker-supervision surface
+### `coordinator/mod.rs` — items leaving the file
 
-Need to identify which methods on `Coordinator` are
-worker-supervision concerns. Candidates (subject to
-implementation-phase audit):
+Phase 1 v3 moves four concrete slices out of `mod.rs`:
 
-- `spawn_worker(...)` and the supervision loop
-- `WorkerCommand` dispatch path
-- Worker liveness tracking
-- Per-worker init / shutdown ordering
+1. **`panic_payload_message(payload: &Box<dyn Any + Send>) -> String`**
+   — pure free function (`mod.rs:~1080`). Becomes a `pub(super)`
+   free function in a new `coordinator/supervisor.rs` (rationale
+   below).
+2. **`spawn_supervised_worker(...)`** — the panic-catch wrapper
+   for the per-worker `worker_loop` thread. Pure code motion to
+   `coordinator/supervisor.rs` as a `pub(super)` free function.
+   It already takes its dependencies as parameters and does not
+   touch `Coordinator` or `WorkerManager` state.
+3. **`spawn_supervised_aux(...)`** — the panic-catch wrapper for
+   *non-worker* aux threads (currently used by the neighbor
+   monitor at `mod.rs:780` and the local-tunnel source at
+   `mod.rs:830`). This is **not** worker-lifecycle and must not
+   live on `WorkerManager`. Lands in `coordinator/supervisor.rs`
+   alongside `spawn_supervised_worker` as a `pub(super)` free
+   function.
+4. **Worker stop/clear loop** at `mod.rs:202-222` (iterate
+   `self.workers.handles` to send shutdown / await joins / drop
+   `xsk_map`/`heartbeat_map` entries / clear `handles`). Becomes
+   a method `WorkerManager::stop_and_clear(&mut self,
+   xsk_map_fd: BorrowedFd<'_>, heartbeat_map_fd: BorrowedFd<'_>)`.
+   The map fds are passed in because they live on `Coordinator`
+   (or one of its sub-managers), not `WorkerManager`.
+5. **Accessor wrappers** for `last_planned_workers` /
+   `last_planned_bindings` — trivial `&self` getters added on
+   `WorkerManager`, then `mod.rs` reads `self.workers.last_planned_workers()`
+   instead of `self.workers.last_planned_workers` directly. Pure
+   wrapper change; no behavior change.
 
-These methods become methods on `WorkerManager`, with
-`Coordinator` owning a `WorkerManager` field and delegating.
+### What **stays on `Coordinator`** in Phase 1
+
+- `Coordinator::reconcile` (multi-manager state).
+- HA `WorkerCommand` dispatch in `ha.rs:40,102,171,310,366` (HA-owned).
+- `refresh_bindings` (CoS / forwarding / worker state span).
+- `worker_panics.clear()` — the panic-tracking map is a
+  `Coordinator` field, not a `WorkerManager` field. Phase 1 keeps
+  the clear in `Coordinator` and only moves the handle-iteration
+  / join / map-cleanup loop into `WorkerManager::stop_and_clear`.
+- Neighbor monitor and local-tunnel source supervision (they
+  call `spawn_supervised_aux` after this PR; `Coordinator` still
+  owns the join handles).
+
+### `coordinator/supervisor.rs` (new file, ~80-120 LOC)
+
+New sibling of `worker_manager.rs` holding the three free
+functions above. Visibility: `pub(super)` so `mod.rs` and
+`worker_manager.rs` can call into it without exposing the
+helpers crate-wide.
 
 ### `worker_manager.rs` grows
 
-Currently 31 LOC of stub. Will absorb the migrated methods.
+From 31 LOC stub (struct + `new()`) to ~60-90 LOC: add
+`stop_and_clear(...)` plus `last_planned_workers()` /
+`last_planned_bindings()` accessors.
 
-### Call sites
+### Test surface
 
-`Coordinator::spawn_worker` callers (etc.) keep their interface
-via delegation: `Coordinator::spawn_worker` → `self.worker_manager.spawn(...)`.
-External callers see no change.
+Existing tests at `coordinator/tests.rs:312,840,958` and
+`ha_tests.rs:235` reach into worker-related items directly:
+
+- `tests.rs:312,840,958` reference `super::panic_payload_message`
+  and `super::spawn_supervised_worker` /
+  `super::spawn_supervised_aux` from inside the
+  `coordinator::tests` module.
+
+After the move, `super::panic_payload_message` etc. resolve into
+`coordinator::supervisor::panic_payload_message`. Two equally
+valid options — pick one in implementation:
+
+- **Option A (preferred):** update test paths to
+  `super::supervisor::panic_payload_message` etc. Cleaner; no
+  re-export.
+- **Option B:** add `pub(super) use supervisor::{panic_payload_message,
+  spawn_supervised_worker, spawn_supervised_aux};` in `mod.rs`
+  so test paths stay unchanged. Smaller diff but adds a
+  coordinator-module re-export.
+
+`ha_tests.rs:235` reaches `super::ha::*` worker-command sites
+which are NOT moved in Phase 1 — those tests are unaffected.
 
 ## 4. Concrete design
 
-1. **Audit `mod.rs` for worker-related methods** — produce a
-   list with line numbers (do this in implementation phase, not
-   plan).
+1. Create `coordinator/supervisor.rs`. Move
+   `panic_payload_message`, `spawn_supervised_worker`, and
+   `spawn_supervised_aux` into it as `pub(super)` free
+   functions. Body verbatim (these already take their deps as
+   parameters; no receiver change needed).
+2. Add `mod supervisor;` to `coordinator/mod.rs`.
+3. Add method `pub(super) fn stop_and_clear(&mut self,
+   xsk_map_fd: BorrowedFd<'_>, heartbeat_map_fd: BorrowedFd<'_>)`
+   to `WorkerManager`. Body is the existing `mod.rs:202-222`
+   loop with `self.workers.` references rewritten to `self.`.
+   `Coordinator::shutdown` (or wherever the loop lives today)
+   becomes:
 
-2. **Lift each method to `WorkerManager`**, preserving behavior.
-   Where a method needs access to fields outside
-   `WorkerManager`'s scope, pass them as `&mut` parameters
-   rather than absorbing the field into `WorkerManager` (avoids
-   ownership refactor cascade).
+   ```rust
+   self.workers.stop_and_clear(
+       self.xsk_map.as_fd(),
+       self.heartbeat_map.as_fd(),
+   );
+   self.worker_panics.clear();   // stays on Coordinator
+   ```
 
-3. **`Coordinator` keeps a thin delegation layer**: each old
-   `Coordinator::method()` becomes
-   `self.worker_manager.method(self.peer_field, ...)`.
+4. Add `last_planned_workers(&self) -> usize` and
+   `last_planned_bindings(&self) -> usize` accessors on
+   `WorkerManager`. Update mod.rs read sites to call the
+   accessors. (Field visibility unchanged: still
+   `pub(in crate::afxdp)` for write access in `reconcile`.)
+5. Update test paths per Option A or Option B above.
+6. Verify nothing else references `Coordinator::panic_payload_message`,
+   `Coordinator::spawn_supervised_worker`, or
+   `Coordinator::spawn_supervised_aux`.
 
-4. **Tests**: existing `coordinator/tests.rs` (1016 LOC) covers
-   the public-API behavior; should pass unchanged. If any test
-   reaches into private worker-state directly, relocate it.
+**Hard rule (Codex round-1 #4):** WorkerManager methods MUST NOT
+take `&mut Coordinator`. `stop_and_clear` complies — it takes
+borrowed fds, not the parent.
 
-5. **No behavior change**: every method's body moves verbatim;
-   only the receiver type changes.
+**Honesty about "pure code motion":** the supervisor functions
+move verbatim. `stop_and_clear` is **not** byte-identical to the
+old loop body — it loses the implicit `self.workers.` qualifier
+on every reference and gains explicit fd parameters at the call
+site. Behaviorally identical, but the body is rewritten, not
+copy-pasted. Accessor wrappers are obviously not byte-identical
+either. Phase 1 is "behavior-preserving refactor", not "byte-
+verbatim move".
 
 ## 5. Public API preservation
 
-`Coordinator::spawn_worker(...)` (etc.) — keep all public
-signatures unchanged. Internal call site changes from `self.x`
-to `self.worker_manager.x`.
+No external (non-`afxdp`) signatures change. Within `afxdp`:
+
+- `Coordinator::shutdown` (or whichever entry owns the
+  stop loop) keeps its signature; its body now calls
+  `self.workers.stop_and_clear(...)` and then
+  `self.worker_panics.clear()`.
+- `panic_payload_message`, `spawn_supervised_worker`,
+  `spawn_supervised_aux` change resolution path from
+  `coordinator::*` to `coordinator::supervisor::*`. With
+  Option B re-exports their old paths still resolve.
+- New: `WorkerManager::stop_and_clear`,
+  `WorkerManager::last_planned_workers`,
+  `WorkerManager::last_planned_bindings` — all `pub(super)` /
+  `pub(in crate::afxdp)`.
 
 ## 6. Risk assessment
 
 | Class | Level | Why |
 |---|---|---|
-| Behavioral regression | LOW | Pure code motion + delegation |
-| Borrow-checker / lifetime | **MEDIUM** | If a method needs `&mut self.coordinator_field` AND `&mut self.worker_manager`, Rust's split-borrow may refuse |
-| Cross-manager coupling | **MEDIUM** | Worker supervision may touch HA state, neighbor state, etc. — split-borrow concerns multiply |
-| Test breakage | LOW | `tests.rs` should pass unchanged; relocate any private-field reaches |
-| Performance regression | LOW | Delegation adds one indirection per call; not on per-packet hot path |
-
-The Rust borrow-checker risk is the dominant one. Mitigation:
-where a method spans multiple managers' state, keep it on
-`Coordinator` with a comment "spans multiple managers' state;
-not migrated to a manager" — leave for future refactor with a
-proper redesign.
+| Behavioral regression | LOW | Supervisor helpers move verbatim; `stop_and_clear` is the same loop with explicit fd params; accessors are trivial getters |
+| Borrow-checker / lifetime | LOW-MED | `stop_and_clear` takes `BorrowedFd<'_>` so it does not double-borrow `self` while mutating `self.workers`. The map fds live on `Coordinator`, not under `self.workers`, so the split-borrow is clean |
+| Cross-manager coupling | LOW | Phase 1 explicitly excludes anything that spans multiple managers (reconcile, HA dispatch, refresh_bindings, neighbor/tunnel supervision lifecycle) |
+| Test path breakage | LOW | Predictable: tests need either updated `super::supervisor::*` paths or a re-export in `mod.rs`. Documented above |
+| Performance regression | LOW | `stop_and_clear` runs at shutdown only; accessor wrappers compile to direct field reads |
 
 ## 7. Test plan
 
