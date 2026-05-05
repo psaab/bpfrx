@@ -304,10 +304,20 @@ func (m *Manager) syncSnapshotLocked() error {
 		m.publishedSnapshot = m.lastSnapshot.Generation
 		return nil
 	}
+	// #1197 v5 (Codex code-review v4 #2): publishable-only filter
+	// for parity with update_neighbors path.
+	publishSnap := *m.lastSnapshot
+	publishSnap.Neighbors = filterPublishableNeighbors(m.lastSnapshot.Neighbors)
 	var status ProcessStatus
-	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: m.lastSnapshot}, &status); err != nil {
+	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: &publishSnap}, &status); err != nil {
 		return fmt.Errorf("publish userspace snapshot: %w", err)
 	}
+	// #1197 v5 (Codex code-review v4 #1): rebuild listener
+	// caches AFTER successful publish on the deferred-publish
+	// path too. Compile() defers when XSK is starting up; this
+	// is where the snapshot actually lands in userspace-dp.
+	m.rebuildNeighborIndex()
+	m.rebuildMonitoredIfindexes()
 	m.publishedSnapshot = m.lastSnapshot.Generation
 	m.publishedPlanKey = planKey
 	if hashOK {

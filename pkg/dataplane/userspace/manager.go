@@ -343,7 +343,14 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		snap.DeferWorkers = true
 	}
 	var status ProcessStatus
-	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: snap}, &status); err != nil {
+	// #1197 v5 (Codex code-review v4 #2): apply_snapshot must
+	// send publishable-only neighbors to match the
+	// update_neighbors path. Otherwise Rust's full-snapshot
+	// build accepts state="none" entries Go's predicate rejects,
+	// and Go can't track removal of those entries via the index.
+	publishSnap := *snap
+	publishSnap.Neighbors = filterPublishableNeighbors(snap.Neighbors)
+	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: &publishSnap}, &status); err != nil {
 		return result, fmt.Errorf("publish userspace snapshot: %w", err)
 	}
 	// #1197 v4: apply_snapshot succeeded — userspace-dp has the
