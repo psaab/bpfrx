@@ -118,6 +118,75 @@ fn exact_with_surplus_sharing_not_parked_on_queue_token_starvation() {
         "drain_park_queue_tokens must still increment for diagnostic parity");
 }
 
+// #915 Codex round-2 MINOR fix: the root-starvation branch in
+// select_exact_cos_guarantee_queue_with_fast_path is also
+// no-park'd for surplus_sharing exact queues (the §4.5 fix
+// addressed only the queue-token branch in plan v3; round-1
+// code review caught that the EARLIER root-token branch had
+// the same problem). Pin that branch directly: when both
+// root.tokens AND queue.tokens are short, a surplus_sharing
+// exact queue still must NOT be parked by the exact-guarantee
+// selector. The drain_park_root_tokens diagnostic counter
+// still increments. The same-pass surplus selector then
+// handles the root-only park with require_queue_tokens=false.
+#[test]
+fn exact_with_surplus_sharing_not_parked_on_root_token_starvation() {
+    let mut root = test_cos_runtime_with_exact(true);
+    root.queues[0].surplus_sharing = true;
+    root.tokens = 0; // root bucket empty (root-token starvation)
+    root.queues[0].last_refill_ns = 1;
+    root.queues[0].tokens = 0; // queue bucket also empty
+    root.queues[0].items.push_back(test_cos_item(1500));
+    root.queues[0].queued_bytes = 1500;
+    root.queues[0].runnable = true;
+    root.queues[0].parked = false;
+    root.nonempty_queues = 1;
+    root.runnable_queues = 1;
+
+    let pre_root_park = root.queues[0]
+        .owner_profile
+        .drain_park_root_tokens
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let pre_queue_park = root.queues[0]
+        .owner_profile
+        .drain_park_queue_tokens
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let selection =
+        select_exact_cos_guarantee_queue_with_fast_path(&mut root, &[], 1);
+    // Selector returns None because root.tokens<head_len; the
+    // root-starvation no-park branch fires first, so the queue
+    // is not parked.
+    assert!(selection.is_none(),
+        "exact-guarantee selector must not select a root-starved queue");
+    assert!(!root.queues[0].parked,
+        "surplus_sharing exact queue must NOT be parked on root-token starvation");
+    assert!(root.queues[0].runnable,
+        "surplus_sharing exact queue must stay runnable");
+    let post_root_park = root.queues[0]
+        .owner_profile
+        .drain_park_root_tokens
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let post_queue_park = root.queues[0]
+        .owner_profile
+        .drain_park_queue_tokens
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(post_root_park, pre_root_park + 1,
+        "drain_park_root_tokens must still increment for diagnostic parity");
+    assert_eq!(post_queue_park, pre_queue_park,
+        "queue-token branch must NOT fire (we exited via root-token branch)");
+
+    // The same-pass surplus selector is the eventual park site
+    // for root-token starvation: it uses require_queue_tokens=false
+    // so the wake_tick is bound only by root refill. Verify it
+    // parks the queue rather than leaving it spinning.
+    let surplus = select_cos_surplus_batch(&mut root, 1);
+    assert!(surplus.is_none(),
+        "surplus selector returns None when root.tokens<head_len");
+    assert!(root.queues[0].parked,
+        "surplus selector must park the queue on root-token starvation");
+}
+
 // #915 §4.5 contrast: a non-surplus-sharing exact queue still
 // parks on queue-token starvation (preserves today's behavior).
 #[test]
