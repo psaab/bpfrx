@@ -56,11 +56,13 @@ impl WorkerManager {
                 let _ = join.join();
             }
         }
-        for (&slot, _) in &self.live {
-            if let Some(fd) = xsk_map_fd {
+        if let Some(fd) = xsk_map_fd {
+            for (&slot, _) in &self.live {
                 let _ = delete_xsk_slot(fd.fd, slot);
             }
-            if let Some(fd) = heartbeat_map_fd {
+        }
+        if let Some(fd) = heartbeat_map_fd {
+            for (&slot, _) in &self.live {
                 let _ = delete_heartbeat_slot(fd.fd, slot);
             }
         }
