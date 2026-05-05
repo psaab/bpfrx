@@ -1,5 +1,6 @@
 use super::*;
 
+#[cold]
 pub(super) fn segment_forwarded_tcp_frames_into_prepared(
     target_binding: &mut BindingWorker,
     frame: &[u8],
