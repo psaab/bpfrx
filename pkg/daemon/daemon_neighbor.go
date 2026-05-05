@@ -351,14 +351,13 @@ func (d *Daemon) cleanFailedNeighbors() int {
 // Fetches fresh active config on each tick so config changes take effect.
 func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context) {
 	// Immediate first run — don't wait for first tick.
+	// resolveNeighbors handles cold-start configured targets;
+	// forceProbeNeighbors handles stale snapshot keys (only
+	// useful once a snapshot exists, which it doesn't yet at
+	// startup). On the first 15s tick once snapshot is warm,
+	// both run with non-overlapping target sets.
 	if cfg := d.store.ActiveConfig(); cfg != nil {
 		d.resolveNeighbors(cfg)
-		// Copilot review: cold-start pass needs to also force-probe
-		// stale entries. resolveNeighbors skips REACHABLE/STALE/
-		// PERMANENT — without forceProbeNeighbors here, a stale
-		// entry inherited from a previous run wouldn't get
-		// re-validated until the first 15s tick.
-		d.forceProbeNeighbors(cfg)
 		d.maintainClusterNeighborReadiness()
 	}
 	d.cleanFailedNeighbors()

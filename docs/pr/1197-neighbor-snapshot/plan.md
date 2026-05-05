@@ -34,8 +34,11 @@ of the principled redesign:
 This is RFC 4861 NUD discipline applied to the snapshot:
 - **Listen** on netlink for kernel ARP/NDP changes (RTM_NEWNEIGH/
   RTM_DELNEIGH).
-- **Don't cache forever** — entries have a TTL; expire when the
-  kernel stops confirming them.
+- **Don't cache forever** — kernel NUD does the aging; xpfd
+  follows. (Note: per-entry TTL inside xpfd is **deferred
+  follow-up**, not shipped in this PR — kernel events plus the
+  60s safety reconciliation tick are sufficient for the
+  bug-class fix.)
 - **Proactively probe** before an entry is too cold via NS/ARP,
   give the kernel a chance to confirm it's still valid.
 - **Trust the kernel** as the source of truth on the current MAC.
@@ -442,8 +445,8 @@ proactive reprobing. Replies → kernel ARP update → RTM_NEWNEIGH
 
 **Cardinality concern (Codex finding #4):** address-book hosts
 can be much larger than the 5-10 next-hops estimate. Add a
-configurable cap (`neighbor-probe-max-targets`, default 256;
-log target count each tick).
+configurable cap via env `BPFRX_NEIGHBOR_PROBE_MAX_TARGETS`
+(default 256; log target count when truncated).
 
 ### 5.4 Phase 4: snapshot regeneration with forwarding-effective diff
 
@@ -652,8 +655,11 @@ contains the complete replacement of the broken mechanism:
   `resolveNeighborsInner` that does NOT skip STALE entries.
   Called periodically (15s, configurable) to drive proactive
   re-validation of all monitored neighbors.
-- **Tunable cap** `neighbor-probe-max-targets` (default 256) +
-  log target count each tick.
+- **Tunable cap** via env `BPFRX_NEIGHBOR_PROBE_MAX_TARGETS`
+  (default 256) + log target count when truncated. (A Junos-
+  config-style knob like `neighbor-probe-max-targets` is a
+  follow-up; env var is sufficient for this PR's operational
+  needs and avoids touching the config schema/parser.)
 - **Replace** the 15s preinstall tick with the new force-probe
   tick (NOT the existing skip-stale `resolveNeighborsInner`,
   per Codex finding #1).

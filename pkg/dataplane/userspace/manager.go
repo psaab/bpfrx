@@ -674,6 +674,27 @@ func (m *Manager) rebuildMonitoredIfindexes() {
 	m.monitoredIfindexes = MonitoredInterfaceLinkIndexes(m.lastSnapshot.Config)
 }
 
+// ForEachSnapshotNeighbor invokes fn for every PUBLISHABLE
+// neighbor entry in the current snapshot (i.e., entries
+// userspace-dp accepted into its forwarding table).
+//
+// #1197 (Copilot review): the existing SnapshotNeighbors() walks
+// raw lastSnapshot.Neighbors which can include filtered-out
+// entries (FAILED/INCOMPLETE/none). For force-probe target
+// collection we want only the entries the dataplane is actually
+// using, so we walk neighborIndex (publishable-only).
+func (m *Manager) ForEachSnapshotNeighbor(fn func(ifindex int, ip net.IP)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k, n := range m.neighborIndex {
+		ip := net.ParseIP(n.IP)
+		if ip == nil {
+			continue
+		}
+		fn(k.ifindex, ip)
+	}
+}
+
 // SnapshotHasIfindex returns true if the current snapshot
 // contains any neighbor entry on the given ifindex. Used by the
 // daemon's listener filter as a fallback for runtime ifindex

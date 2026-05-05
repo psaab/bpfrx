@@ -15,28 +15,29 @@ import (
 
 func TestProbeTierClassification(t *testing.T) {
 	tests := []struct {
-		name     string
-		state    uint16
-		critical bool
-		want     int
+		name        string
+		state       uint16
+		criticality int
+		want        int
 	}{
-		{"NUD_NONE (state==0) is tier 1", 0, false, 1},
-		{"NUD_NONE critical still tier 1", 0, true, 1},
-		{"STALE is tier 1", uint16(netlink.NUD_STALE), false, 1},
-		{"PROBE is tier 1", uint16(netlink.NUD_PROBE), false, 1},
-		{"DELAY is tier 1", uint16(netlink.NUD_DELAY), false, 1},
-		{"FAILED is tier 1", uint16(netlink.NUD_FAILED), false, 1},
-		{"INCOMPLETE is tier 1", uint16(netlink.NUD_INCOMPLETE), false, 1},
-		{"REACHABLE+critical is tier 2", uint16(netlink.NUD_REACHABLE), true, 2},
-		{"REACHABLE non-critical is tier 3", uint16(netlink.NUD_REACHABLE), false, 3},
-		{"PERMANENT non-critical is tier 3", uint16(netlink.NUD_PERMANENT), false, 3},
+		{"NUD_NONE (state==0) is tier 1", 0, criticalityNormal, 1},
+		{"NUD_NONE fabric still tier 1", 0, criticalityFabric, 1},
+		{"STALE is tier 1", uint16(netlink.NUD_STALE), criticalityNormal, 1},
+		{"PROBE is tier 1", uint16(netlink.NUD_PROBE), criticalityNormal, 1},
+		{"DELAY is tier 1", uint16(netlink.NUD_DELAY), criticalityNormal, 1},
+		{"FAILED is tier 1", uint16(netlink.NUD_FAILED), criticalityNormal, 1},
+		{"INCOMPLETE is tier 1", uint16(netlink.NUD_INCOMPLETE), criticalityNormal, 1},
+		{"REACHABLE+fabric is tier 2", uint16(netlink.NUD_REACHABLE), criticalityFabric, 2},
+		{"REACHABLE+next-hop is tier 2", uint16(netlink.NUD_REACHABLE), criticalityNextHop, 2},
+		{"REACHABLE+normal is tier 3", uint16(netlink.NUD_REACHABLE), criticalityNormal, 3},
+		{"PERMANENT+normal is tier 3", uint16(netlink.NUD_PERMANENT), criticalityNormal, 3},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := probeTier(tc.state, tc.critical)
+			got := probeTier(tc.state, tc.criticality)
 			if got != tc.want {
 				t.Errorf("probeTier(%v, %v) = %d, want %d",
-					tc.state, tc.critical, got, tc.want)
+					tc.state, tc.criticality, got, tc.want)
 			}
 		})
 	}

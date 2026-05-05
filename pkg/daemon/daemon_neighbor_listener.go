@@ -310,12 +310,23 @@ func (d *Daemon) neighborProvider() neighborSnapshotProvider {
 	return nil
 }
 
+// criticality levels for force-probe target prioritization.
+// Higher value = probed earlier within a stale-tier bucket.
+// Per Copilot review: a single boolean conflated address-book
+// hosts with real next-hops, so under cap pressure a large
+// address-book could crowd out gateways and fabric peers.
+const (
+	criticalityNormal    = 0 // snapshot-only entries (already-resolved peers)
+	criticalityNextHop   = 1 // configured next-hops, NAT destinations
+	criticalityFabric    = 2 // cluster fabric peers (highest)
+)
+
 // probeTarget is one entry in the force-probe target list.
 type probeTarget struct {
-	ip         net.IP
-	linkIndex  int
-	state      uint16 // current kernel NUD state (bitmask)
-	criticality int   // higher = probe earlier within tier
+	ip          net.IP
+	linkIndex   int
+	state       uint16 // current kernel NUD state (bitmask)
+	criticality int    // see criticality* constants
 }
 
 // probeTier classifies a target's current state for tiered
@@ -323,16 +334,16 @@ type probeTarget struct {
 //
 // Tier 1: states at risk of stale forwarding
 //         (STALE, PROBE, DELAY, FAILED, INCOMPLETE, NONE/missing)
-// Tier 2: REACHABLE + critical (next-hop, fabric peer)
-// Tier 3: everything else (REACHABLE + non-critical)
-func probeTier(state uint16, critical bool) int {
+// Tier 2: REACHABLE on fabric/next-hop targets (criticality > Normal)
+// Tier 3: everything else
+func probeTier(state uint16, criticality int) int {
 	stale := uint16(netlink.NUD_STALE | netlink.NUD_PROBE |
 		netlink.NUD_DELAY | netlink.NUD_FAILED |
 		netlink.NUD_INCOMPLETE)
 	if state == 0 || state&stale != 0 {
 		return 1
 	}
-	if state&netlink.NUD_REACHABLE != 0 && critical {
+	if state&netlink.NUD_REACHABLE != 0 && criticality > criticalityNormal {
 		return 2
 	}
 	return 3
@@ -429,7 +440,7 @@ func (d *Daemon) collectMonitoredNeighbors(cfg *config.Config) []probeTarget {
 		return m[ip.String()]
 	}
 
-	addTarget := func(ip net.IP, linkIndex int, critical bool) {
+	addTarget := func(ip net.IP, linkIndex int, criticality int) {
 		if ip == nil || linkIndex <= 0 {
 			return
 		}
@@ -439,48 +450,45 @@ func (d *Daemon) collectMonitoredNeighbors(cfg *config.Config) []probeTarget {
 		}
 		seen[k] = true
 		st := getState(linkIndex, ip)
-		crit := 0
-		if critical {
-			crit = 1
-		}
 		targets = append(targets, probeTarget{
 			ip:          ip,
 			linkIndex:   linkIndex,
 			state:       st,
-			criticality: crit,
+			criticality: criticality,
 		})
 	}
 
-	// Source 1: snapshot keys
+	// Source 1: snapshot keys (publishable-only).
+	// Copilot review: SnapshotNeighbors walks raw lastSnapshot.Neighbors,
+	// which can include filtered-out entries (FAILED/INCOMPLETE/none/
+	// malformed MAC). Those entries are NOT in userspace-dp's neighbor
+	// table — probing them is fine but they aren't load-bearing for
+	// forwarding-correctness. The neighborIndex reflects publishable-
+	// only entries (we built it that way after publish-success), so
+	// use that as the source for snapshot keys.
 	if provider := d.neighborProvider(); provider != nil {
-		// Reach into the manager to enumerate all snapshot entries.
-		// We use SnapshotNeighbors() (already exists for fabric work).
-		type snapshotEnumerator interface {
-			SnapshotNeighbors() []struct {
-				Ifindex int
-				IP      net.IP
-				MAC     net.HardwareAddr
-				Family  int
-			}
+		type indexEnumerator interface {
+			ForEachSnapshotNeighbor(fn func(ifindex int, ip net.IP))
 		}
-		if e, ok := d.dp.(snapshotEnumerator); ok {
-			for _, sn := range e.SnapshotNeighbors() {
-				addTarget(sn.IP, sn.Ifindex, false)
-			}
+		if e, ok := d.dp.(indexEnumerator); ok {
+			e.ForEachSnapshotNeighbor(func(ifindex int, ip net.IP) {
+				addTarget(ip, ifindex, criticalityNormal)
+			})
 		}
 	}
 
-	// Source 2: configured next-hops + DHCP gateways + backup
-	// router + DNAT pool addresses + static NAT translated
-	// addresses + address-book host entries.
+	// (Source 2 removed per Copilot review.)
+	// Configured next-hops + NAT + address-book targets are
+	// covered by resolveNeighborsInner (which has skip-stale
+	// semantics — appropriate for "fill in missing" rather than
+	// "re-validate stale"). Including them here would duplicate
+	// every probe at all 3 call sites (startup, 15s tick, VRRP
+	// takeover) — exactly when minimizing ARP burst matters most.
 	//
-	// Codex code-review #1: previously omitted; cold-start path
-	// (no snapshot yet) had empty target set so force-probe
-	// did nothing. Now uses the shared helper that
-	// resolveNeighborsInner also draws from.
-	for _, t := range d.collectNeighborProbeTargets(cfg) {
-		addTarget(t.neighborIP, t.linkIndex, true)
-	}
+	// forceProbeNeighbors's job is to RE-VALIDATE entries we've
+	// already seen (snapshot keys) and the cluster fabric peers
+	// that must stay warm. Cold-start "fill missing" is
+	// resolveNeighbors's responsibility.
 
 	// Source 3: fabric peers (probed via fabric overlay link).
 	d.fabricMu.RLock()
@@ -491,19 +499,19 @@ func (d *Daemon) collectMonitoredNeighbors(cfg *config.Config) []probeTarget {
 	d.fabricMu.RUnlock()
 	if fabricPeerIP != nil && fabricOverlay != "" {
 		if link, err := netlink.LinkByName(fabricOverlay); err == nil {
-			addTarget(fabricPeerIP, link.Attrs().Index, true)
+			addTarget(fabricPeerIP, link.Attrs().Index, criticalityFabric)
 		}
 	}
 	if fabricPeerIP1 != nil && fabricOverlay1 != "" {
 		if link, err := netlink.LinkByName(fabricOverlay1); err == nil {
-			addTarget(fabricPeerIP1, link.Attrs().Index, true)
+			addTarget(fabricPeerIP1, link.Attrs().Index, criticalityFabric)
 		}
 	}
 
 	// Sort into tier order. Within tier, higher criticality first.
 	sort.SliceStable(targets, func(i, j int) bool {
-		ti := probeTier(targets[i].state, targets[i].criticality > 0)
-		tj := probeTier(targets[j].state, targets[j].criticality > 0)
+		ti := probeTier(targets[i].state, targets[i].criticality)
+		tj := probeTier(targets[j].state, targets[j].criticality)
 		if ti != tj {
 			return ti < tj
 		}
