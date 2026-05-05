@@ -1,5 +1,5 @@
 ---
-status: REVISED v7 — Codex round-6 PLAN-NEEDS-MINOR; added explicit step 7 covering post-move comment/doc updates (mod.rs:1890 "see ... in this file" reference; docs/operations/worker-supervisor.md:11 path; sharded_neighbor.rs:21 path)
+status: REVISED v8 — Codex round-7 PLAN-NEEDS-MINOR; softened byte-identical claim to acknowledge module-relative path rewrites are required (`super::worker_runtime::WorkerRuntimeAtomics` at mod.rs:1924 → `super::super::worker_runtime::WorkerRuntimeAtomics` or absolute `crate::afxdp::worker_runtime::WorkerRuntimeAtomics` after move into supervisor.rs); added step 8 covering this path rewrite
 issue: #1189
 phase: First incremental migration of one manager surface
 ---
@@ -101,13 +101,18 @@ Win for Phase 1:
 - Validates the migration shape (small struct + sibling
   module + `pub(in crate::afxdp)` field for test access) before
   larger extractions like `reconcile` or HA dispatch
-- This is a **behavior-preserving refactor**, not byte-verbatim
-  motion. Specifically: the supervisor helpers
-  (`panic_payload_message`, `spawn_supervised_worker`,
-  `spawn_supervised_aux`) move byte-identical into
-  `coordinator/supervisor.rs`. The stop loop becomes
+- This is a **behavior-preserving refactor**. The supervisor
+  helpers (`panic_payload_message`, `spawn_supervised_worker`,
+  `spawn_supervised_aux`) move into `coordinator/supervisor.rs`
+  with their bodies essentially intact, but **module-relative
+  paths must be rewritten** because `super::` resolves to a
+  different parent after the move. Concretely, the
+  `Arc<super::worker_runtime::WorkerRuntimeAtomics>` parameter at
+  `mod.rs:1924` becomes `Arc<crate::afxdp::worker_runtime::WorkerRuntimeAtomics>`
+  (or `super::super::worker_runtime::WorkerRuntimeAtomics`) in
+  the new file. See section 4 step 8. The stop loop becomes
   `WorkerManager::stop_and_clear(...)` with explicit fd inputs;
-  the body is the same logic with `self.workers.` references
+  body is the same logic with `self.workers.` references
   rewritten to `self.`. Accessors are obviously not byte-
   identical. No observable behavior change in any case.
 
@@ -356,15 +361,32 @@ which are NOT moved in Phase 1 — those tests are unaffected.
    - `userspace-dp/src/afxdp/sharded_neighbor.rs:21` — currently
      "`spawn_supervised_worker` in `coordinator/mod.rs`"; update
      path to `coordinator/supervisor.rs`.
+8. **Module-relative path rewrites inside the moved helpers** —
+   `spawn_supervised_worker` at `mod.rs:1924` takes
+   `Arc<super::worker_runtime::WorkerRuntimeAtomics>`. From
+   `mod.rs`, `super::` resolves to `coordinator`'s parent
+   (`afxdp`); after the move into `coordinator/supervisor.rs`,
+   `super::` resolves to `coordinator`, which does **not** own
+   `worker_runtime`. The fix in the new file: change to
+   `Arc<crate::afxdp::worker_runtime::WorkerRuntimeAtomics>`
+   (absolute, robust to further refactors) or
+   `Arc<super::super::worker_runtime::WorkerRuntimeAtomics>`
+   (relative, two hops up). Pick the absolute form for clarity.
+   Re-grep the moved helper bodies for any other `super::*`
+   path-bearing references and rewrite the same way; the
+   compiler will catch any miss.
 
 **Hard rule (Codex round-1 #4):** WorkerManager methods MUST NOT
 take `&mut Coordinator`. `stop_and_clear` complies — it takes
 borrowed fds, not the parent.
 
 **Honesty about "pure code motion":** the supervisor functions
-move verbatim. `stop_and_clear` is **not** byte-identical to the
-old loop body — it loses the implicit `self.workers.` qualifier
-on every reference and gains explicit fd parameters at the call
+move with their bodies essentially intact, but module-relative
+paths inside them must be rewritten (see step 8 above —
+`super::worker_runtime` no longer resolves correctly after the
+move). `stop_and_clear` is **not** byte-identical to the old
+loop body — it loses the implicit `self.workers.` qualifier on
+every reference and gains explicit fd parameters at the call
 site. Behaviorally identical, but the body is rewritten, not
 copy-pasted. Accessor wrappers are obviously not byte-identical
 either. Phase 1 is "behavior-preserving refactor", not "byte-
@@ -413,7 +435,7 @@ something in `coordinator/tests.rs`).
 **Smoke matrix on loss userspace cluster**:
 - Pass A (CoS off): 6 cells, 0 retrans
 - Pass B (CoS on): 24 cells, 0 retrans
-- Total: 30 cells, 0 retrans (this is a behavior-preserving refactor — supervisor helpers move byte-identical; stop loop and accessors rewritten in shape but not in behavior)
+- Total: 30 cells, 0 retrans (this is a behavior-preserving refactor — supervisor helper bodies move essentially intact with module-relative path rewrites; stop loop and accessors rewritten in shape but not in behavior)
 
 **Failover smoke**: `make test-failover` if accessible — the
 worker-supervision path is exercised heavily during failover.
