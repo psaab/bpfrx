@@ -1,7 +1,103 @@
 ---
-status: DRAFT v1 — pending adversarial plan review
+status: PLAN-KILLED — both reviewers concur (Gemini Pro 3 PLAN-KILL, Codex PLAN-NEEDS-MAJOR borderline-KILL); plan v1 retained verbatim below for traceability
 issue: https://github.com/psaab/xpf/issues/747
 phase: Glide-style per-flow rate signal for ECN marking on heterogeneous workloads
+---
+
+## KILL decision (2026-05-05)
+
+Plan v1 was reviewed by Codex (`task-mos1mn51-623lbp`) and
+Gemini Pro 3 (`task-mos1n0l1-lux2r2`). Both verdicts are
+recorded verbatim in `docs/pr/747-glide-ecn/codex-review.md` and
+`docs/pr/747-glide-ecn/gemini-review.md`. Summary of converging
+findings:
+
+1. **Math wrong (Codex 1)**: the proposed `2× fair-share`
+   target means saturated elephants on the homogeneous lab
+   workload (which average ~1× fair-share) would NOT trip
+   `rate_above`. The AND-guard would then suppress today's
+   ECN marks, regressing the post-#728 smoke matrix.
+
+2. **Memory math stale (Codex 5)**: the plan assumed
+   `COS_FLOW_FAIR_BUCKETS = 1024`. The repo currently uses
+   **4096** (per
+   `userspace-dp/src/afxdp/types/cos.rs:103`, GEMINI-NEXT.md
+   §2 fairness bump). Two `[u64; 4096]` arrays = **64 KB per
+   queue**, ~9.2 MB total at 6×4×6 scale (not 2.3 MB).
+
+3. **Idle-then-burst fatal flaw (Gemini 3)**: the plan's
+   packet-clocked EWMA inherits stale rates across idle
+   periods. An elephant flow that bursts to 1 Gbps, idles for
+   10 s, then sends one tiny packet would still register
+   ~875 Mbps EWMA. If the bucket happens to be deep (other
+   flows), that single packet triggers BOTH `rate_above` AND
+   `depth_above` — an instant false-positive CE-mark on the
+   *returning mouse*. **The fix actively causes the bug it
+   tries to fix.**
+
+4. **Hot-path cost understated (Codex 2 + Gemini 2)**: the
+   plan says "one DIV per packet". Actually TWO DIVs (target
+   rate computation + inst_rate computation), and the EWMA
+   update fires on shared_exact queues too, where it's never
+   read. ~10-30 ns per packet on x86, on a path that's ~5-8 ns
+   today. +200-400% on this gate.
+
+5. **EWMA update site architecturally wrong (Codex 3)**:
+   `queue_ops/push.rs` is also called by rollback paths
+   (`cos_queue_push_front` for restore-on-tx-failure) and by
+   demotion (`cos_queue_push_back` from
+   `tx/cos_classify.rs:600`). Counting those as "arrivals"
+   corrupts the rate signal. The update belongs in the
+   admission-decision site only.
+
+6. **AND-guard semantics (Gemini 4)**: a brand-new fast-start
+   elephant has rate ramp-up of ~10-20 packets before EWMA
+   crosses target. During the ramp it bloats the queue with
+   no CE-marks → tail drops + bigger queue impact than today.
+
+7. **Stack-overflow risk (Gemini 5)**: 64 KB inline arrays in
+   `CoSQueueRuntime` on the build path can blow the stack if
+   the struct isn't immediately boxed. Rust doesn't guarantee
+   copy elision.
+
+8. **Operator value negative (Gemini 1)**: operators today
+   bypass the heterogeneous-shared-queue scenario via
+   `forwarding-class` segregation. The scenario the fix
+   targets isn't observed in the field; the lab fixture to
+   demonstrate it doesn't exist.
+
+9. **Architectural anti-pattern (Gemini 9)**: per-packet DIV +
+   EWMA on arrival rate is the wrong primitive. The right
+   primitive for per-flow rate tracking is a **token bucket**
+   (addition + `dt × drain_rate`, no DIV, time-clocked decay
+   for idle flows). That's a different fix shape; if operators
+   eventually ask for heterogeneous-mice protection, file a
+   new issue with that architecture.
+
+10. **Glide compat misframed (Gemini 10)**: Glide is a
+    sender-side ACK-clocked algorithm using *delivered* rate
+    (heavily smoothed by the network). The firewall sees
+    *arrival* rate (extremely bursty). Copying the target-rate
+    check from sender-side to firewall-side without the
+    smoothing is structurally flawed.
+
+### Decision
+
+Plan v1 is killed. Per the project's KILL discipline:
+
+- Plan doc retained verbatim (this file) so future readers
+  see the rejected v1 and the kill rationale.
+- Both reviewer reports filed in this directory.
+- Issue #747 closed-as-killed with a comment summarizing the
+  findings.
+- If operators ever hit a real heterogeneous-shared-queue
+  case in the field, the fix shape suggested by Gemini's
+  finding 9 — a per-flow token bucket (no DIV, time-clocked
+  decay) — would be the starting point for a fresh plan, not
+  the EWMA proposed here.
+
+(Plan v1 follows verbatim below.)
+
 ---
 
 ## 1. Issue framing
