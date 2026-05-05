@@ -1,5 +1,5 @@
 ---
-status: REVISED v2 — Codex round-1 PLAN-NEEDS-MAJOR corrections applied (close #774/#775, keep #776 as constraint tracker)
+status: REVISED v3 — Codex round-2 PLAN-NEEDS-MINOR citation/wording tweaks applied; ready to execute
 issues: #774, #775, #776, #777, #779, #781
 phase: Triage — close-or-keep decision per issue
 ---
@@ -28,7 +28,7 @@ gating notes).
 
 ## 2. Recent perf evidence
 
-### Throughput (P=12 -R sustained, master HEAD `b029e91c`)
+### Throughput (P=12 -R sustained, latest measured master `b029e91c`; current master is `dab78ef6` and may have moved)
 
 | Source | iperf-c P=12 | Stddev | Retrans/30s |
 |---|---:|---:|---:|
@@ -41,7 +41,7 @@ gating notes).
 Source: #775 own "Campaign target met" comment (2026-04-19) +
 `docs/pr/917-mqfq-phase4/findings-post-917.md`.
 
-### CPU profile (current master, P=12 -R sustained)
+### CPU profile (latest measured master `b029e91c`, P=12 -R sustained)
 
 | % CPU | Symbol | Tracker |
 |---:|---|---|
@@ -82,13 +82,16 @@ backs up).
   activation).
 
 **Recommendation (revised v2 per Codex round-1):** **Close as
-wontfix-on-current-lab topology.** Frame it as "the 25 Gb/s
-shaper-rate target is unachievable on the loss userspace cluster's
-mlx5 dual-NIC topology — closing the remaining ~6% gap requires
-shared-UMEM activation, which is blocked on this hardware per
-`docs/shared-umem-plan.md`." NOT "ceiling beaten." Preserve the
-25 Gb/s constraint trail by keeping #776 open as the topology
-tracker.
+"umbrella not actionable on this lab".** The 18 Gb/s ceiling
+premise is overtaken (now 23.47), but the 25 Gb/s shaper target
+is not hit, and the remaining gap is the cross-NIC body memcpy
+that #776 already tracks as a topology constraint. Closing #774
+removes the stale ceiling-tracker; keeping #776 open preserves
+the structural-copy / topology trail. Avoid framing as "25 Gb/s
+impossible forever" — `docs/shared-umem-plan.md:237` notes
+cross-NIC memcpy is unavoidable on this hardware **but leaves
+"make the existing memcpy cheaper" as an optimization path**
+(e.g., hugepage UMEM via `/home/ps/.claude/plans/elegant-meandering-lamport.md`).
 
 ### #775 — campaign to land consistent 22+ Gbps on iperf3 -P 12 -t 600 -p 5203
 
@@ -238,10 +241,10 @@ Pattern matches the prior triage outcomes today:
 - Tier D batch: 4 close, 13 stay open with NEEDS-MAJOR
 - #946: 1 close (wontfix-with-rationale)
 - Tier B: 4 close, 3 stay open
-- Tier S: 3 close, 3 stay open
+- Tier S: **2 close, 4 stay open** (after Codex round-1 corrections)
 
-Aggregate today: **16 close, 19 stay open with refined gating** if Tier S
-executes as planned.
+Aggregate today: **15 close, 20 stay open with refined gating**
+if Tier S executes as planned.
 
 ## 5. Out of scope
 
@@ -251,19 +254,16 @@ executes as planned.
   as new issues. The author explicitly recommends NOT pre-filing
   them; only file when someone's about to take them up.
 
-## 6. Open questions for adversarial review
+## 6. Open questions for adversarial review v2
 
-1. Is "close #774" defensible given the issue's title still
-   names a 25 Gb/s target that hasn't been hit (we're at 23.47)?
-   Or is the 23.47 figure good enough that the ceiling-tracking
-   value is gone?
-2. Is "close #776 as wontfix" actually consistent with the author's
-   #776a directive, or should the issue stay open as the
-   "topology-constraint tracker" with the cross-NIC blocker
-   noted in the body?
-3. For #781: is the author's "largely mitigated" assertion strong
-   enough to close, or is the recommended path (keep open + need
-   fresh measurement) appropriately cautious?
+1. Is keeping #776 alone sufficient as the topology-constraint
+   tracker, or should successor issues #776b (hugepage UMEM) /
+   #776c (same-device shared-UMEM activation) be filed
+   simultaneously to make the trail explicit?
+2. For #781: is the measurement-gate framing tight enough, or
+   should the close-as-mitigated already be the recommendation
+   given Codex's cited fresh data (rx_xsk_buff_alloc_err=899,
+   tx_xsk_full=0)?
 
 ## 7. Verdict request
 
