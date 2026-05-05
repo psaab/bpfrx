@@ -1,5 +1,5 @@
 ---
-status: REVISED v3 — Codex round-2 PLAN-NEEDS-MINOR; cleaned stale v1 visibility/path text and added `use super::*;` implementation note
+status: REVISED v4 — Codex round-3 PLAN-NEEDS-MINOR; scrubbed remaining v1 residue in sections 3 and 9
 issue: #1166
 phase: Pure code-motion refactor
 ---
@@ -45,16 +45,26 @@ function's signature suggests it's reasonably self-contained.
 `fn segment_forwarded_tcp_frames_into_prepared(...)` — the
 target. Currently a free function (not a method on a type).
 
-### Sibling already in target file: `frame/tcp_segmentation.rs`
-(338 lines)
+### Existing frame-layer sibling (informational only)
+`userspace-dp/src/afxdp/frame/tcp_segmentation.rs` (338 lines):
 
 ```
 12   fn segment_forwarded_tcp_frames_from_frame(...)  // pure builder
 321  fn segment_forwarded_tcp_frames(...)             // XdpDesc adapter
 ```
 
-`tcp_segmentation.rs` already owns the segmentation logic; the
-dispatch-level wrapper belongs here too.
+The frame-layer file already owns frame-level segmentation. It
+is **not** the destination for the dispatch wrapper — the
+dispatch wrapper mutates `BindingWorker.tx_pipeline`, consumes
+`free_tx_frames`, writes UMEM, and calls drain helpers, all of
+which are tx-layer concerns. See section 4 for the v2/v3 layer
+correction.
+
+### Destination: new file `userspace-dp/src/afxdp/tx/tcp_segmentation.rs`
+
+A new sibling of `tx/dispatch.rs` and `tx/drain.rs` inside the
+`tx/` module. Pure frame-builder logic stays in
+`frame/tcp_segmentation.rs`; the tx-layer wrapper lands here.
 
 ### Caller(s)
 
@@ -65,7 +75,7 @@ let segmented = segment_forwarded_tcp_frames_into_prepared(...)?;
 ```
 
 Call site stays in `tx/dispatch.rs`; the move adds an import
-from `frame::tcp_segmentation`.
+`use super::tcp_segmentation::segment_forwarded_tcp_frames_into_prepared;`.
 
 ## 4. Concrete design — v2 (Codex round-1 layer-violation fix)
 
@@ -169,15 +179,20 @@ segmenter fires; verify same throughput + 0 retrans pre/post.
 
 ## 9. Open questions for adversarial review
 
-1. Are there any private helpers in `tx/dispatch.rs` that the
-   moved function calls internally? If so, those need to be
-   re-exposed via `pub(in crate::afxdp)` too.
-2. Does the existing `tcp_segmentation.rs` already have a test
-   harness that the moved function's tests should follow into?
-3. Is there a name clash with other functions in
-   `tcp_segmentation.rs`? (Unlikely — the names are distinct.)
-4. Is the visibility widening (`fn` → `pub(in crate::afxdp)`)
-   the minimum needed, or should it be wider/narrower?
+1. Are there any file-local (non-`pub`) helpers in
+   `tx/dispatch.rs` that the moved function calls internally? If
+   so, those need to be widened to `pub(super)` so the new
+   sibling file in `tx/` can reach them.
+2. Does the existing frame-layer `tcp_segmentation.rs` already
+   have a test harness whose shape we should mirror in the new
+   `tx/tcp_segmentation.rs`?
+3. Is there a name clash with other functions in the `tx/`
+   module? (Unlikely — function names are distinct.)
+4. Is `pub(super)` the minimum visibility, or should it stay
+   `fn` (file-local) with a `mod tcp_segmentation;` declaration
+   inside `tx/dispatch.rs` instead of `tx/mod.rs`? The latter
+   would keep the function reachable only from the file that
+   declares the submodule, but adds awkward placement.
 
 ## 10. Verdict request
 
