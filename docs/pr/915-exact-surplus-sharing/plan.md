@@ -1,8 +1,68 @@
 ---
-status: DRAFT v1 — pending adversarial plan review
+status: DRAFT v2 — Codex round-1 PLAN-NEEDS-MAJOR addressed (parking, lease, Rust serde, ast.go/ValidateConfig schema, CLI, stale symbol); Gemini Pro 3 round-1 PLAN-NEEDS-MINOR (subset of Codex) addressed
 issue: https://github.com/psaab/xpf/issues/915
 phase: Add `surplus-sharing` opt-in for exact CoS queues
 ---
+
+## Changelog v2
+
+Codex round-1 (`task-morz4uac-7srr47`) returned PLAN-NEEDS-MAJOR
+with 4 blockers; Gemini Pro 3 round-1 (`task-morz59nh-p9hebp`)
+returned PLAN-NEEDS-MINOR with 2 (both subsumed by Codex):
+
+- **MAJOR — park-on-starvation race (Codex 1)**: An exact queue
+  whose `queue.tokens < head_len` is parked (`queue.runnable =
+  false`) by `select_exact_cos_guarantee_queue_with_fast_path`
+  before the surplus phase runs. Once parked, surplus skips it
+  via `!queue.runnable` at queue_service/mod.rs:572. v1's
+  one-line surplus-skip removal would never trigger. **Fix
+  (§4.4)**: in the exact-guarantee selector, when
+  `queue.exact && queue.surplus_sharing && queue.tokens <
+  head_len`, do NOT park — just `continue` so the queue stays
+  runnable and falls through to `select_cos_surplus_batch` on
+  the same drain pass.
+
+- **MAJOR — `shared_queue_lease` consumption on surplus (Codex
+  2)**: Exact queues unconditionally debit `shared_queue_lease`
+  in `apply_cos_send_result` (tx_completion.rs:449-458) and
+  `apply_cos_prepared_result` (tx_completion.rs:515-524), based
+  solely on `queue.exact`. Surplus-sharing bytes would also
+  debit the per-queue lease, violating the "surplus consumes
+  only root tokens" claim. **Fix (§4.5)**: phase-gate the lease
+  consumption — only consume `shared_queue_lease` when `phase ==
+  CoSServicePhase::Guarantee`. Safe today because non-surplus-
+  sharing exact queues never reach Surplus phase, so this
+  changes no current behavior.
+
+- **MAJOR — Rust JSON reader missing serde default (Codex 3 +
+  Gemini #7)**: `userspace-dp/src/protocol.rs:CoSSchedulerSnapshot`
+  needs `#[serde(default)] pub surplus_sharing: bool`. Go
+  `omitempty` covers the writer side; the Rust reader needs
+  `default` so older snapshots (without the field) decode safely.
+  **Fix (§4.2)**: add to the snapshot schema list.
+
+- **MAJOR — Config schema target wrong/incomplete (Codex 4)**:
+  Parser acceptance lives in `pkg/config/ast.go`, not just
+  `pkg/cmdtree/tree.go`. Validation belongs in `ValidateConfig`
+  in `pkg/config/compiler.go`, not only
+  `compiler_class_of_service.go`. **Fix (§4.2)**: add the leaf
+  to `ast.go`'s `class-of-service schedulers <name>` block;
+  put the warn-and-strip rule in `ValidateConfig`.
+
+- **MINOR — CLI exposure (Gemini #8 + Codex non-blocking)**:
+  Add `surplus-sharing` to per-queue CLI output via
+  `pkg/dataplane/userspace/cosfmt.go`. **Fix (§4.6)**.
+
+- **MINOR — stale `select_combined_cos_batch` reference**:
+  That symbol does not exist; the actual entry point is
+  `drain_shaped_tx → service_exact_guarantee_queue_direct_with_info
+  → build_nonexact_cos_batch → select_nonexact_cos_guarantee_batch
+  || select_cos_surplus_batch`. **Fix throughout §4-§6**:
+  reference correct symbols.
+
+Plan v1's other points (opt-in default correct, strict-priority
+preserved, DRR fairness OK, surplus phase already excludes
+`queue.tokens` consumption) all confirmed by both reviewers.
 
 ## 1. Issue framing
 
@@ -89,53 +149,195 @@ the config.
 
 - `pkg/config/types.go:CoSScheduler`: add
   `SurplusSharing bool`.
+- `pkg/config/ast.go`: add `surplus-sharing` as a leaf node in
+  the `class-of-service schedulers <name>` block (per Codex
+  round-1 MAJOR 4 — parser acceptance lives here, not in
+  `cmdtree`). Mirror the existing `exact` leaf's shape on
+  `transmit-rate`.
 - `pkg/config/compiler_class_of_service.go`: extract
-  `surplus-sharing` leaf inside the scheduler block.
+  `surplus-sharing` leaf inside the scheduler block. Sets
+  `sched.SurplusSharing = true` on presence.
+- `pkg/config/compiler.go:ValidateConfig`: per-scheduler post-
+  parse rule (per Codex round-1 MAJOR 4) — when
+  `sched.SurplusSharing && !sched.TransmitRateExact`, append a
+  validation warning `"surplus-sharing on scheduler %q is
+  meaningful only with transmit-rate exact; ignored"` and clear
+  `sched.SurplusSharing` (warn-and-strip per #1183 lesson —
+  effective state never carries the no-op flag).
 - `pkg/dataplane/userspace/protocol.go:CoSSchedulerSnapshot`:
-  add `SurplusSharing bool` json field (`omitempty`).
+  add `SurplusSharing bool` JSON field (`omitempty`).
 - `pkg/dataplane/userspace/snapshot.go`: copy
   `sched.SurplusSharing` into the snapshot per scheduler.
+- `userspace-dp/src/protocol.rs:CoSSchedulerSnapshot`: add
+  `#[serde(rename = "surplus_sharing", default)] pub
+  surplus_sharing: bool` (per Codex round-1 MAJOR 3 + Gemini
+  round-1 #7 — `default` is required so older snapshots without
+  the field decode without panic).
 - `pkg/cmdtree/tree.go`: add the new leaf under
-  `class-of-service schedulers <name>`.
+  `class-of-service schedulers <name>` for tab-completion / `?`
+  help on the CLI.
 
 ### 4.3 Rust runtime plumbing
 
 - `userspace-dp/src/afxdp/types/cos.rs:CoSQueueRuntime`: add
   `pub(in crate::afxdp) surplus_sharing: bool`. Doc-comment
   records: "Only meaningful when `exact == true`. When set,
-  the queue participates in `select_cos_surplus_batch` as if it
-  were non-exact (#915)."
+  the queue (1) is NOT parked on `queue.tokens < head_len` in
+  the exact-guarantee selector, and (2) participates in
+  `select_cos_surplus_batch` as if it were non-exact. The
+  combined effect is that the queue retains its strict-priority
+  guarantee but can also draw from root surplus tokens once its
+  own bucket is empty (#915)."
 - `userspace-dp/src/afxdp/forwarding_build.rs`: populate
   `surplus_sharing` from
   `scheduler.surplus_sharing`, defaulting to `false`. Mirror
   the `exact` field's `.map(...).unwrap_or(false)` shape.
-- `userspace-dp/src/afxdp/cos/queue_service/mod.rs:572`:
-  change the surplus-phase skip from
-  ```rust
-  if cos_queue_is_empty(queue) || !queue.runnable || queue.exact {
-      continue;
-  }
-  ```
-  to
-  ```rust
-  if cos_queue_is_empty(queue) || !queue.runnable {
-      continue;
-  }
-  if queue.exact && !queue.surplus_sharing {
-      continue;
-  }
-  ```
-  Two-stage gate keeps the empty/non-runnable fast skip
-  unchanged and the `exact && !surplus-sharing` skip explicit
-  for grep-ability and review.
 
-### 4.4 What NOT to change
+### 4.4 Surplus-skip change in `select_cos_surplus_batch`
 
-- The exact-guarantee phase
-  (`select_exact_cos_guarantee_queue_with_fast_path`) is
-  unchanged. Exact queues still get strict-priority
-  guarantee-phase service before any surplus runs, so the
-  guarantee floor is preserved.
+`userspace-dp/src/afxdp/cos/queue_service/mod.rs:572` —
+change the surplus-phase skip from
+
+```rust
+if cos_queue_is_empty(queue) || !queue.runnable || queue.exact {
+    continue;
+}
+```
+
+to
+
+```rust
+if cos_queue_is_empty(queue) || !queue.runnable {
+    continue;
+}
+if queue.exact && !queue.surplus_sharing {
+    continue;
+}
+```
+
+Two-stage gate keeps the empty/non-runnable fast skip unchanged
+and the `exact && !surplus-sharing` skip explicit for
+grep-ability.
+
+### 4.5 No-park rule for surplus-sharing exact queues (Codex MAJOR 1)
+
+`userspace-dp/src/afxdp/cos/queue_service/mod.rs:452-473` —
+the `queue.tokens < head_len` branch in
+`select_exact_cos_guarantee_queue_with_fast_path` parks the
+queue so subsequent drain passes wait for refill. For
+surplus-sharing exact queues we want the queue to stay
+runnable so it falls through to surplus phase on the same
+drain pass. Change:
+
+```rust
+if queue.tokens < head_len {
+    queue.owner_profile.drain_park_queue_tokens
+        .fetch_add(1, Ordering::Relaxed);
+    if let Some(wake_tick) = estimate_cos_queue_wakeup_tick(
+        root.tokens, root.shaping_rate_bytes,
+        queue.tokens, queue.transmit_rate_bytes,
+        head_len, now_ns, true,
+    ) {
+        count_park_reason(root, queue_idx,
+            ParkReason::QueueTokenStarvation);
+        park_cos_queue(root, queue_idx, wake_tick);
+    }
+    continue;
+}
+```
+
+to
+
+```rust
+if queue.tokens < head_len {
+    queue.owner_profile.drain_park_queue_tokens
+        .fetch_add(1, Ordering::Relaxed);
+    if queue.surplus_sharing {
+        // #915: do NOT park. Stay runnable so
+        // select_cos_surplus_batch can pick this queue up on
+        // the same drain pass when root tokens exist.
+        continue;
+    }
+    if let Some(wake_tick) = estimate_cos_queue_wakeup_tick(
+        root.tokens, root.shaping_rate_bytes,
+        queue.tokens, queue.transmit_rate_bytes,
+        head_len, now_ns, true,
+    ) {
+        count_park_reason(root, queue_idx,
+            ParkReason::QueueTokenStarvation);
+        park_cos_queue(root, queue_idx, wake_tick);
+    }
+    continue;
+}
+```
+
+Counter increment (`drain_park_queue_tokens`) is retained for
+diagnostic parity — the queue's own bucket DID starve; the
+fact that surplus picks up the slack later is separately
+visible via the queue's `surplus_deficit` accounting.
+
+### 4.6 Phase-gated `shared_queue_lease` consumption (Codex MAJOR 2)
+
+`userspace-dp/src/afxdp/cos/tx_completion.rs:449-458` (in
+`apply_cos_send_result`) and `:515-524` (in
+`apply_cos_prepared_result`) — consume `shared_queue_lease`
+unconditionally when `queue.exact`. Surplus-sharing bytes
+would also debit the per-queue lease, which represents the
+per-queue rate cap; this would cap surplus draws at the
+configured rate and defeat the point.
+
+Fix: gate the lease consumption on phase. Change
+
+```rust
+if let Some(queue_idx) = exact_queue_idx {
+    if let Some(shared_queue_lease) = ... {
+        shared_queue_lease.consume(sent_bytes);
+    }
+}
+```
+
+to
+
+```rust
+if let Some(queue_idx) = exact_queue_idx {
+    if matches!(phase, CoSServicePhase::Guarantee) {
+        if let Some(shared_queue_lease) = ... {
+            shared_queue_lease.consume(sent_bytes);
+        }
+    }
+}
+```
+
+Both apply functions already take `phase: CoSServicePhase` —
+no signature change needed. Behavior parity for non-surplus-
+sharing exact queues: those never reach the Surplus phase
+(blocked by §4.4's surplus-skip), so the gate is a no-op for
+them. Correct: surplus consumes only `root.tokens` +
+`shared_root_lease` + `surplus_deficit`; the per-queue rate
+cap stays a Guarantee-phase concept.
+
+### 4.7 CLI exposure (Gemini MINOR 8)
+
+`pkg/dataplane/userspace/cosfmt.go` — extend the per-queue
+output of `show class-of-service interface <iface>` to print
+a `Surplus sharing: yes/no` line for each queue. Operators
+debugging an exact queue that exceeds its configured rate need
+this visibility — without it, the bursting looks like a bug.
+
+The `show class-of-service interface` rendering also lives in
+`pkg/cli/cli_show_cos.go` (and possibly mirrored in DPDK
+manager output if applicable). Mirror the field there. Field
+is rendered only when `Exact == true` to avoid noise on
+non-exact queues.
+
+### 4.8 What NOT to change
+
+- The order of phases in `drain_shaped_tx` —
+  `service_exact_guarantee_queue_direct_with_info` →
+  `build_nonexact_cos_batch` (which calls
+  `select_nonexact_cos_guarantee_batch` then
+  `select_cos_surplus_batch`) — is unchanged. Strict-priority
+  exact-guarantee still runs first.
 - `cos_surplus_quantum_bytes` is unchanged. The DRR per-queue
   quantum still applies — surplus-sharing exact queues
   participate fairly with non-exact queues at the same priority
@@ -146,7 +348,7 @@ the config.
   from the root shaper, not from its own per-queue bucket
   (which has already been consumed during the guarantee phase).
 
-### 4.5 Validation rule
+### 4.9 Validation rule
 
 `pkg/config/compiler_class_of_service.go` emits a warning when
 `SurplusSharing == true` and `TransmitRateExact == false`:
@@ -170,28 +372,45 @@ warn-and-strip, not error-and-block.
 - **Strict-priority exact guarantee over surplus**: exact queues
   with surplus-sharing must still drain their guarantee budget
   via `select_exact_cos_guarantee_queue_with_fast_path` before
-  hitting the surplus phase. The combined-batch dispatcher at
-  `select_combined_cos_batch:200-212` already enforces this
-  ordering (exact → nonexact-guarantee → surplus). No change
-  to dispatcher.
-- **Per-queue token bucket**: an exact queue's `queue.tokens`
-  cap is enforced ONLY in guarantee phase. Surplus consumes
-  `root.tokens` exclusively. So surplus-sharing does NOT let a
-  1 Gbps queue exceed 1 Gbps overall — it lets it consume root
-  surplus on top of its 1 Gbps guarantee.
+  hitting the surplus phase. The actual entry point is
+  `drain_shaped_tx` (queue_service/mod.rs:128) which calls
+  `service_exact_guarantee_queue_direct_with_info` first; only
+  if that returns `None` does it call `build_nonexact_cos_batch`
+  (which then runs `select_nonexact_cos_guarantee_batch` ||
+  `select_cos_surplus_batch`). The order is preserved.
+- **Per-queue token bucket as guarantee floor**: an exact
+  queue's `queue.tokens` cap is enforced ONLY in Guarantee
+  phase. `apply_cos_send_result` only debits `queue.tokens`
+  when `phase == CoSServicePhase::Guarantee` (verified
+  tx_completion.rs:422-429). After §4.6, `shared_queue_lease`
+  is also Guarantee-phase only. So surplus-sharing does NOT
+  let a 1 Gbps exact queue exceed 1 Gbps via its own token
+  bucket — its surplus-phase bytes draw from `root.tokens` +
+  `shared_root_lease` only.
+- **No-park rule (NEW per §4.5)**: when
+  `queue.exact && queue.surplus_sharing && queue.tokens <
+  head_len`, the exact-guarantee selector must not park the
+  queue. Otherwise `queue.runnable = false` and surplus skips
+  it, defeating the point. The `drain_park_queue_tokens`
+  counter still increments for diagnostic parity (the bucket
+  DID starve), but no `park_cos_queue` call.
 - **DRR fairness**: `surplus_deficit` accumulation is unchanged.
-  An exact-with-surplus-sharing queue will land in the priority
-  RR alongside non-exact queues at the same priority and DRR
+  An exact-with-surplus-sharing queue lands in the priority RR
+  alongside non-exact queues at the same priority and DRR
   fairly via its existing `surplus_weight`.
-- **Park accounting**: `count_park_reason` /
-  `park_cos_queue` paths in surplus already have
-  `RootTokenStarvation` for the non-exact case; exact queues
-  reaching surplus phase share that path uniformly.
+- **Park accounting in surplus**: `count_park_reason(...,
+  RootTokenStarvation)` / `park_cos_queue` paths in surplus
+  already exist (queue_service/mod.rs:589). When a
+  surplus-sharing exact queue runs out of root tokens during
+  surplus phase, it gets parked there — correct.
 - **#1183 useful-state gate**: exact queues with no
   surplus-sharing (the default) keep the same code path they
-  have today. The new branch fires only for opted-in queues.
+  have today (parked on queue-token starvation, skipped in
+  surplus). The new branches fire only for opted-in queues.
   This is the post-build "useful CoS state" pattern — extra
-  state only for queues that need it.
+  state only for queues that need it. Validation
+  (warn-and-strip in `ValidateConfig`) ensures the flag is
+  never set when it's a no-op.
 
 ## 7. Risk assessment
 
@@ -209,21 +428,56 @@ warn-and-strip, not error-and-block.
 - `cargo test --release` 962+ pass, plus new tests:
   - `pkg/config/parser_class_of_service_test.go`:
     `TestSchedulerSurplusSharingHierarchical` /
-    `TestSchedulerSurplusSharingFlatSet` — both parse paths set
-    the bool.
-  - `pkg/config/parser_class_of_service_test.go`:
-    `TestSurplusSharingWithoutExactWarns` — validation warning
-    fires when surplus-sharing is set without `exact`.
+    `TestSchedulerSurplusSharingFlatSet` — both parse paths
+    set `SurplusSharing = true` via the `ast.go` schema.
+  - `pkg/config/compiler_security_test.go` (or
+    `pkg/config/compiler_test.go`):
+    `TestValidateConfigSurplusSharingWithoutExactStripsAndWarns`
+    — `ValidateConfig` strips the no-op flag when set without
+    `exact` and emits the warning verbatim.
+  - `pkg/dataplane/userspace/manager_test.go` (mirroring
+    existing `TestBuildClassOfServiceSnapshotIncludesTransmitRateExact`):
+    `TestBuildClassOfServiceSnapshotIncludesSurplusSharing` —
+    snapshot encoding round-trips the bool.
+  - `userspace-dp/src/protocol_tests.rs` (or wherever the
+    existing serde defaults are tested): a test that decodes
+    a snapshot WITHOUT `surplus_sharing` and confirms
+    `surplus_sharing == false` (covers the
+    `#[serde(default)]` schema-migration path; addresses
+    Codex MAJOR 3 + Gemini #7).
   - `userspace-dp/src/afxdp/cos/queue_service/tests.rs`:
-    `select_cos_surplus_batch_includes_exact_with_surplus_sharing` —
-    exact queue with surplus_sharing=true is selected for
-    surplus.
+    `select_cos_surplus_batch_includes_exact_with_surplus_sharing`
+    — exact queue with surplus_sharing=true and
+    `queue.tokens=0` is selected for surplus when root has
+    tokens. This is the END-TO-END test: drives an exact
+    queue through the exact-guarantee no-park branch
+    (§4.5) and into surplus phase via the surplus-skip
+    relaxation (§4.4). Failure here catches the parking
+    blocker Codex MAJOR 1 flagged.
   - `userspace-dp/src/afxdp/cos/queue_service/tests.rs`:
-    `select_cos_surplus_batch_excludes_exact_without_surplus_sharing` —
-    default-false preserves today's hard-cap behavior.
+    `select_cos_surplus_batch_excludes_exact_without_surplus_sharing`
+    — default-false preserves today's hard-cap behavior; the
+    exact queue gets parked, surplus skips it.
+  - `userspace-dp/src/afxdp/cos/queue_service/tests.rs`:
+    `exact_with_surplus_sharing_not_parked_on_queue_token_starvation`
+    — directly tests §4.5: after one exact-guarantee call
+    that fails the queue-token gate, `queue.runnable` is
+    still `true` (no `park_cos_queue` call). Failure here
+    catches Codex MAJOR 1 in isolation.
+  - `userspace-dp/src/afxdp/cos/tx_completion_tests.rs`:
+    `surplus_phase_does_not_consume_shared_queue_lease` —
+    drives `apply_cos_send_result` with
+    `phase=CoSServicePhase::Surplus` on an exact queue and
+    asserts the per-queue lease counter is unchanged.
+    Failure here catches Codex MAJOR 2.
+  - `userspace-dp/src/afxdp/cos/tx_completion_tests.rs`:
+    `guarantee_phase_still_consumes_shared_queue_lease` —
+    non-regression: the existing Guarantee-phase debit still
+    fires, defending against an over-eager phase gate.
   - `userspace-dp/src/afxdp/cos/queue_service/tests.rs`:
     `exact_surplus_sharing_consumes_root_tokens_only` — verify
-    `queue.tokens` is unchanged after surplus drain.
+    `queue.tokens` and `shared_queue_lease` are unchanged
+    after a Surplus-phase drain.
   - `userspace-dp/src/afxdp/cos/builders_tests.rs`:
     `cos_queue_runtime_propagates_surplus_sharing` — snapshot
     → runtime field copy works.
@@ -258,42 +512,44 @@ warn-and-strip, not error-and-block.
 
 ## 10. Open questions for adversarial review
 
-1. **Scope/value**: is the operator value of opt-in
-   surplus-sharing on exact queues high enough to justify the
-   config-schema + plumbing churn (≈ 30 LOC across 6 files)?
-   If reviewers consider the scenario rare enough that
-   operators should just remove the `exact` qualifier instead,
-   PLAN-KILL is acceptable.
-2. **Default semantics**: the plan picks explicit opt-in.
-   Reviewers may prefer "default-on if `surplus_weight > 0`"
-   (closer to the issue's text). Argument for opt-in:
-   `surplus_weight` is computed for every queue including
-   `exact` ones today, so default-on would silently flip every
-   existing exact queue. Argument against opt-in: more knobs
-   to know about. Settled in §4 but invites pushback.
-3. **Validation rule**: warn-and-strip vs reject when
-   `surplus-sharing` is set without `exact`. Plan picks
-   warn (per #1183 lesson). Reviewers may prefer reject for
-   strictness.
-4. **Token-bucket interaction**: confirm that surplus phase
-   really doesn't touch `queue.tokens` for exact queues (the
-   plan claims this; the code shows `queue.tokens` is read in
-   surplus only for the wakeup-tick estimate, not consumed —
-   verify against `select_cos_surplus_batch:594-611`).
-5. **CLI exposure**: the new flag should appear in
-   `show class-of-service interface` per-queue output so
-   operators can see at a glance which exact queues have it.
-   Plan §4.2 doesn't currently address this — should it?
-6. **Schema migration**: snapshot format gains a new field.
-   Worker fast-path forwarding-build code must handle older
-   snapshots (decode to `false`). Plan §5 claims `omitempty`
-   covers this; verify against `pkg/dataplane/userspace/snapshot.go`
-   reader paths.
-7. **Smoke evidence**: the success criterion (≥ 6 Gbps
+Resolved in v2 (kept for traceability):
+- ~~Token-bucket interaction~~ — confirmed by both Codex and
+  Gemini that surplus phase only touches `surplus_deficit` +
+  `root.tokens`, never `queue.tokens`. The lease question
+  (Codex MAJOR 2) is now phase-gated in §4.6.
+- ~~Default semantics~~ — both reviewers confirmed opt-in
+  default is correct (every queue has `surplus_weight >= 1`
+  today, default-on would flip everything).
+- ~~Strict-priority preservation~~ — confirmed via the
+  `drain_shaped_tx` order; `select_combined_cos_batch` was a
+  stale symbol reference in v1.
+- ~~Schema migration~~ — addressed by `#[serde(default)]` in
+  Rust (§4.2).
+- ~~CLI exposure~~ — added in §4.7.
+
+Open for round 2:
+1. **Scope/value vs PLAN-KILL**: Codex round-1 explicitly
+   ruled out PLAN-KILL ("the knob has real value if the
+   operator wants to keep exact-queue guarantee
+   ordering/direct exact semantics while allowing idle
+   surplus"). Gemini also PASS on operator value. The plan
+   stays unless round 2 raises new concerns.
+2. **Validation rule**: v2 picks reject-via-strip — the
+   warning fires AND the bool is cleared, so the runtime
+   never sees the no-op flag. Reviewers may prefer hard
+   reject (block the commit). Argument for strip: matches
+   #1183 lesson and avoids breaking commits on benign
+   misconfig.
+3. **Smoke evidence**: the success criterion (≥ 6 Gbps
    single-stream on 5201 with surplus-sharing on) assumes
-   no other CoS class is hungry. Reviewers may require a
-   contention scenario that proves the guarantee floor still
-   holds when other classes pressure the root shaper.
-8. **DPDK parity**: not in scope, but should we file a
-   follow-up to keep DPDK ↔ Rust CoS feature symmetry?
-   (See out-of-scope §9.)
+   no other CoS class is hungry. v2 §8 also adds a
+   contention scenario suggestion: configure
+   `surplus-sharing` on iperf-a (1 Gbps shape), run
+   `iperf3 -P 12 -t 30 -p 5201` AND a hungry iperf-b
+   (10 Gbps shape) at the same time, verify iperf-a settles
+   to ≤ 1 Gbps when iperf-b is using its full share. This
+   demonstrates the guarantee floor still holds under
+   contention.
+4. **DPDK parity**: still out of scope per §9. The plan
+   doesn't yet add a follow-up issue. Reviewers may push for
+   that — easy to add if requested.
