@@ -1,5 +1,5 @@
 ---
-status: REVISED v6 — Codex round-5 PLAN-NEEDS-MINOR; aligned section 2 line-56 test-citation with section 3 (1001 is a comment, not field access), added mod.rs:1061 to accessor migration, corrected `OwnedFd.fd` visibility from "public" to `pub(super)`, fixed section 4 step 6 to reference free-function paths (mod.rs:1849/1894/1922) not fictional `Coordinator::*` methods
+status: REVISED v7 — Codex round-6 PLAN-NEEDS-MINOR; added explicit step 7 covering post-move comment/doc updates (mod.rs:1890 "see ... in this file" reference; docs/operations/worker-supervisor.md:11 path; sharded_neighbor.rs:21 path)
 issue: #1189
 phase: First incremental migration of one manager surface
 ---
@@ -338,6 +338,24 @@ which are NOT moved in Phase 1 — those tests are unaffected.
    the move they live in `coordinator::supervisor`; any leftover
    bare call would fail to resolve and be caught by the
    compiler.
+7. **Comment / doc-path cleanup** — the supervisor helper bodies
+   include doc comments that reference the helpers' *current*
+   location. After the move, three known references go stale and
+   must be updated by hand (no `pub(in crate::afxdp)`/
+   compiler signal to flag them):
+   - `coordinator/mod.rs:1890` (inside the moving
+     `spawn_supervised_aux` doc) — "see `recent_exceptions`
+     users in this file" still resolves correctly because
+     `recent_exceptions` is on `Coordinator` (which stays in
+     `mod.rs`); update the wording to "see `recent_exceptions`
+     users in `coordinator/mod.rs`" so it remains accurate after
+     the helper itself moves to `supervisor.rs`.
+   - `docs/operations/worker-supervisor.md:11` — currently
+     "`spawn_supervised_worker` in `userspace-dp/src/afxdp/
+     coordinator/mod.rs`"; update path to `coordinator/supervisor.rs`.
+   - `userspace-dp/src/afxdp/sharded_neighbor.rs:21` — currently
+     "`spawn_supervised_worker` in `coordinator/mod.rs`"; update
+     path to `coordinator/supervisor.rs`.
 
 **Hard rule (Codex round-1 #4):** WorkerManager methods MUST NOT
 take `&mut Coordinator`. `stop_and_clear` complies — it takes
