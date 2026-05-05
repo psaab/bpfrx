@@ -1,5 +1,5 @@
 ---
-status: REVISED v5 — Codex round-4 PLAN-NEEDS-MAJOR; scrubbed last `BorrowedFd<'_>` residue at sections 2/6, named actual cleanup site (`stop_inner` at mod.rs:187), added `status.rs:184` and the three production helper-call sites at mod.rs:679/780/830, dropped tests.rs:1001 (was a comment), corrected panic_payload_message location to mod.rs:1849
+status: REVISED v6 — Codex round-5 PLAN-NEEDS-MINOR; aligned section 2 line-56 test-citation with section 3 (1001 is a comment, not field access), added mod.rs:1061 to accessor migration, corrected `OwnedFd.fd` visibility from "public" to `pub(super)`, fixed section 4 step 6 to reference free-function paths (mod.rs:1849/1894/1922) not fictional `Coordinator::*` methods
 issue: #1189
 phase: First incremental migration of one manager surface
 ---
@@ -55,8 +55,9 @@ Coordinator` into `impl WorkerManager`**.
    (`ha.rs:40,102,171,310,366`), not just worker supervision.
 3. Tests reach private worker state directly via two paths —
    field access (`coordinator.workers.identities/live` at
-   `coordinator/tests.rs:312,322,958,1001`) and helper-function
-   calls (`super::panic_payload_message` /
+   `coordinator/tests.rs:312,322,958`; line 1001 is a *comment*,
+   not field access) and helper-function calls
+   (`super::panic_payload_message` /
    `super::spawn_supervised_worker` /
    `super::spawn_supervised_aux` at
    `coordinator/tests.rs:840,869,889,903,918`). `ha_tests.rs:235`
@@ -145,18 +146,23 @@ Phase 1 v5 moves five concrete slices out of `mod.rs`:
    xsk_map_fd: Option<&OwnedFd>, heartbeat_map_fd: Option<&OwnedFd>)`
    — see section 4 step 3 for the full signature and body.
    `OwnedFd` here is the project's local
-   `crate::afxdp::bpf_map::OwnedFd` (with public `.fd: c_int`
+   `crate::afxdp::bpf_map::OwnedFd` (with `pub(super) fd: c_int`
    field), **not** `std::os::fd::OwnedFd`. The map fds live on
    `Coordinator` via `BpfMaps`, not on `WorkerManager`, hence
    the explicit parameters.
 5. **Accessor wrappers** for `last_planned_workers` /
    `last_planned_bindings` — trivial `&self` getters added on
    `WorkerManager`. All read sites get updated:
-   - `mod.rs` (stage label / status surface in `reconcile`)
+   - `mod.rs:572-573` (stage label inside `reconcile`).
+   - `mod.rs:1061` (`num_workers = self.workers.last_planned_workers.max(1)` —
+     CoS vtime floor sizing).
    - `coordinator/status.rs:184` (`Coordinator::planned_counts`,
      which currently reads
      `self.workers.last_planned_workers` and
      `self.workers.last_planned_bindings` directly).
+   The two write sites at `mod.rs:288-289` (reconcile clear path)
+   and `mod.rs:568-569` (reconcile set path) keep direct field
+   access — accessors are read-only by design.
    The fields keep `pub(in crate::afxdp)` visibility because
    `reconcile` writes them; the accessors just give callers a
    stable read path. Pure wrapper change; no behavior change.
@@ -271,7 +277,7 @@ which are NOT moved in Phase 1 — those tests are unaffected.
 
    where `OwnedFd` is `crate::afxdp::bpf_map::OwnedFd` (the
    project's local newtype, **not** `std::os::fd::OwnedFd`; it
-   has a public `.fd: c_int` field). Body is the existing
+   has a `pub(super) fd: c_int` field). Body is the existing
    `mod.rs:202-222` block with `self.workers.` references
    rewritten to `self.`, preserving the `if let Some(map_fd) =
    ...` conditional cleanup exactly as today:
@@ -325,9 +331,13 @@ which are NOT moved in Phase 1 — those tests are unaffected.
    accessors. (Field visibility unchanged: still
    `pub(in crate::afxdp)` for write access in `reconcile`.)
 5. Update test paths per Option A or Option B above.
-6. Verify nothing else references `Coordinator::panic_payload_message`,
-   `Coordinator::spawn_supervised_worker`, or
-   `Coordinator::spawn_supervised_aux`.
+6. Verify nothing else references the three free functions (at
+   `mod.rs:1849`, `mod.rs:1894`, `mod.rs:1922`) outside the
+   sites listed above. They are free `fn` items in the
+   `coordinator` module, not methods on `Coordinator`. After
+   the move they live in `coordinator::supervisor`; any leftover
+   bare call would fail to resolve and be caught by the
+   compiler.
 
 **Hard rule (Codex round-1 #4):** WorkerManager methods MUST NOT
 take `&mut Coordinator`. `stop_and_clear` complies — it takes
