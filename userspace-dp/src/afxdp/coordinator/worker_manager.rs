@@ -14,8 +14,8 @@ pub(in crate::afxdp) struct WorkerManager {
     pub(in crate::afxdp) live: BTreeMap<u32, Arc<BindingLiveState>>,
     pub(in crate::afxdp) identities: BTreeMap<u32, BindingIdentity>,
     pub(in crate::afxdp) handles: BTreeMap<u32, WorkerHandle>,
-    pub(in crate::afxdp) last_planned_workers: usize,
-    pub(in crate::afxdp) last_planned_bindings: usize,
+    pub(super) last_planned_workers: usize,
+    pub(super) last_planned_bindings: usize,
 }
 
 impl WorkerManager {
@@ -29,10 +29,12 @@ impl WorkerManager {
         }
     }
 
+    #[inline]
     pub(super) fn last_planned_workers(&self) -> usize {
         self.last_planned_workers
     }
 
+    #[inline]
     pub(super) fn last_planned_bindings(&self) -> usize {
         self.last_planned_bindings
     }
@@ -49,19 +51,17 @@ impl WorkerManager {
         for handle in self.handles.values_mut() {
             handle.stop.store(true, Ordering::Relaxed);
         }
-        for (_, handle) in self.handles.iter_mut() {
+        for handle in self.handles.values_mut() {
             if let Some(join) = handle.join.take() {
                 let _ = join.join();
             }
         }
-        if let Some(map_fd) = xsk_map_fd {
-            for slot in self.live.keys().copied().collect::<Vec<_>>() {
-                let _ = delete_xsk_slot(map_fd.fd, slot);
+        for (&slot, _) in &self.live {
+            if let Some(fd) = xsk_map_fd {
+                let _ = delete_xsk_slot(fd.fd, slot);
             }
-        }
-        if let Some(map_fd) = heartbeat_map_fd {
-            for slot in self.live.keys().copied().collect::<Vec<_>>() {
-                let _ = delete_heartbeat_slot(map_fd.fd, slot);
+            if let Some(fd) = heartbeat_map_fd {
+                let _ = delete_heartbeat_slot(fd.fd, slot);
             }
         }
         self.handles.clear();
