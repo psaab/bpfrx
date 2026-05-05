@@ -1,5 +1,5 @@
 ---
-status: REVISED v2 — Codex pushed back on #837 (keep) and #793/#917 framing (slot-floor not CAS-global)
+status: REVISED v3 — Codex round-2 PLAN-NEEDS-MINOR citation tweaks applied; ready to execute
 issues: #786, #793, #794, #837, #917, #936, #937
 phase: Triage — close-or-keep decision per issue
 ---
@@ -64,11 +64,13 @@ fairness-research.md".
   proposed a global `AtomicU64 V_min` on `SharedCoSQueueLease` with
   CAS-update on dequeue and an empirically-tuned lag threshold `T`.
 - What actually shipped (per #917 PR #939 + closeout) is a different
-  design: per-worker padded atomic slots
-  (`shared_cos_lease.rs:49,132`), single-writer Release store per
-  slot, peer min-scan reduction over participating slots
-  (`shared_cos_lease.rs:95`), const-threshold v1 (configurability
-  deferred per `docs/pr/917-mqfq-phase4/plan.md:352`).
+  design: per-worker padded atomic slots (`shared_cos_lease.rs:49,
+  132`), single-writer Release store via `PaddedVtimeSlot::publish`
+  (`shared_cos_lease.rs:95-101`), peer min-scan reduction over
+  participating slots via `participating_v_min_snapshot`
+  (`shared_cos_lease.rs:171-185`, which excludes the caller's own
+  worker slot), const-threshold v1 (configurability deferred per
+  `docs/pr/917-mqfq-phase4/plan.md:352`).
 - The slot-floor design is functionally equivalent for the
   fairness mechanism but architecturally different from the Phase
   4 sketch.
@@ -110,12 +112,13 @@ outage-class regression #841).
 - #841 (Slice B) caused 100% CPU pegging on all 6 workers + 0 Gbps
   forwarding — outage-class regression. Reverted via PR #842.
 - **Repo explicitly preserves #837** per
-  `docs/pr/838-afd-lite/findings.md:142`:
+  `docs/pr/838-afd-lite/findings.md:145`:
   > "Do not retire #837. It captures the larger redesign that
   > would be needed for true cross-binding MQFQ; if mouse-latency
   > data later shows we need it, the design context is preserved."
-- `docs/pr/838-afd-lite/plan.md:617` defers cross-binding shared-
-  exact AFD/MQFQ work back to #837.
+- `docs/pr/838-afd-lite/plan.md:619` ("Cross-binding shared_exact
+  AFD (deferred to #837).") defers cross-binding work back to
+  #837.
 
 **Recommendation:** **Keep open as parked/gated** — not
 implementation-ready, but preserved as design-context anchor for
@@ -142,10 +145,12 @@ CAS-update on dequeue, lag-throttle when `vtime > V_min + T`.
     (`coordinator/cos_state.rs:13`).
   - `PaddedVtimeSlot` — per-worker padded atomic slot
     (`shared_cos_lease.rs:49,132`). Each worker writes its OWN
-    slot (Release store, single-writer).
+    slot via `PaddedVtimeSlot::publish` (`shared_cos_lease.rs:95-101`,
+    Release store, single-writer).
   - V_min is computed as min-scan reduction over participating
-    slots, NOT a single CAS-updated global atomic
-    (`shared_cos_lease.rs:95`).
+    slots via `participating_v_min_snapshot`
+    (`shared_cos_lease.rs:171-185`), NOT a single CAS-updated
+    global atomic. The min-scan excludes the caller's own slot.
   - Lag throttle + hard-cap escape exist
     (`cos/queue_ops/v_min.rs:142`).
   - Telemetry: `v_min_throttles` + `v_min_throttle_hard_cap_overrides`
@@ -177,9 +182,12 @@ workers. It is NOT a work-sharing mechanism."
   decision and it has not been made.
 - #937 (cross-binding redirect) is presented in the same issue as
   the strictly-better aggregate alternative if feasible.
-- Per `feedback_cross_binding_impossible.md`: cross-NIC shared UMEM
-  is blocked on this lab; same-device sharing exists but is gated
-  off due to FQ/CQ ownership bug. So #937 has its own constraints.
+- Per the in-tree design doc `docs/shared-umem-plan.md:58` (viable
+  scope: same-device, mlx5_core only) and `:246` (current HA lab
+  does not have a proof topology, queue-ownership bug blocks the
+  prototype): cross-NIC shared UMEM is blocked on this lab; same-
+  device sharing exists but is gated off. So #937 has its own
+  constraints.
 
 **Recommendation:** **Keep open with explicit gating note.** The
 issue is genuinely awaiting a user decision on the
