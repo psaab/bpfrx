@@ -1,12 +1,13 @@
 ---
-status: REVISED v4 — Codex round-3 PLAN-NEEDS-MAJOR; 4 critical holes plugged
+status: REVISED v5 — Codex round-4 PLAN-NEEDS-MAJOR; 5 more holes plugged (atomic-PR constraint added)
 issue: #1197
 phase: Plan + fix design
 prior:
   - v1 commit 2709752f — fixed second loop only; missed 5 things
   - v2 commit f6e7070a — addressed Codex round-1 5 findings (incremental defense)
   - v3 commit 867bd363 — kernel-as-authority redesign per user feedback
-  - v4 (this) — Codex round-3 found 4 substantive holes in v3; replumbed
+  - v4 commit 4bcb7947 — Codex round-3 4 substantive holes
+  - v5 (this) — Codex round-4 found 5 more holes; addressing now
 ---
 
 ## 1. Issue framing (unchanged)
@@ -157,93 +158,130 @@ func (d *Daemon) neighborListener(ctx context.Context) {
     defer safetyTick.Stop()
 
     for {
-        // Subscribe with initial dump (ListExisting=true); resubscribe
-        // on error.
-        updates := make(chan netlink.NeighUpdate, 1024)
-        done := make(chan struct{})
-        opts := netlink.NeighSubscribeOptions{
-            ListExisting: true,
-            ErrorCallback: func(err error) {
-                slog.Warn("neighbor listener netlink err", "err", err)
-            },
+        if !d.runOneSubscription(ctx, regenDebounce, safetyTick) {
+            return // ctx done
         }
-        if err := netlink.NeighSubscribeWithOptions(updates, done,
-                                                    opts); err != nil {
-            slog.Warn("neighbor subscribe failed", "err", err)
-            select {
-            case <-ctx.Done():
-                return
-            case <-time.After(2 * time.Second):
-                continue // resubscribe
-            }
+        // Subscription closed; resubscribe after backoff.
+        select {
+        case <-ctx.Done():
+            return
+        case <-time.After(2 * time.Second):
         }
+    }
+}
 
-        for {
-            select {
-            case <-ctx.Done():
-                close(done)
-                return
-            case <-safetyTick.C:
-                // Safety net: full reconcile in case events were lost
+// runOneSubscription owns ONE NeighSubscribe lifetime. Returns
+// true to keep retrying (resubscribe), false on ctx done.
+//
+// Codex round-4: the previous v4 sketch had a `break` inside a
+// `select` that exited the select, not the inner loop, so a
+// closed updates channel could spin and double-close `done`.
+// This helper makes the lifetime explicit: subscription opened,
+// loop runs to first error/close, then helper returns and outer
+// loop reopens.
+func (d *Daemon) runOneSubscription(
+    ctx context.Context,
+    regenDebounce chan struct{},
+    safetyTick *time.Ticker) bool {
+
+    updates := make(chan netlink.NeighUpdate, 1024)
+    done := make(chan struct{})
+    opts := netlink.NeighSubscribeOptions{
+        ListExisting:      true,
+        ErrorCallback:     func(err error) {
+            slog.Warn("neighbor listener netlink err", "err", err)
+        },
+        ReceiveBufferSize: 1 << 20, // 1 MB; channel size != socket buf
+    }
+    if err := netlink.NeighSubscribeWithOptions(updates, done,
+                                                opts); err != nil {
+        slog.Warn("neighbor subscribe failed", "err", err)
+        return true // try again after backoff
+    }
+    defer close(done) // always close on return; no double-close path
+
+    for {
+        select {
+        case <-ctx.Done():
+            return false
+        case <-safetyTick.C:
+            d.triggerRegen(regenDebounce)
+        case u, ok := <-updates:
+            if !ok {
+                return true // subscription closed; resubscribe
+            }
+            if !d.isMonitoredNeighbor(u.LinkIndex) {
+                continue
+            }
+            if d.shouldTriggerRegen(u) {
                 d.triggerRegen(regenDebounce)
-            case u, ok := <-updates:
-                if !ok {
-                    close(done)
-                    break // resubscribe
-                }
-                if !d.isMonitoredNeighbor(u.LinkIndex) {
-                    continue
-                }
-                if d.shouldTriggerRegen(u) {
-                    d.triggerRegen(regenDebounce)
-                }
             }
         }
     }
 }
 
-// isMonitoredNeighbor returns true if linkIndex belongs to a
-// configured forwarding or fabric interface — i.e., aligns with
-// buildNeighborSnapshots' coverage. NOT narrowed to "static next-
-// hops" because the snapshot publishes all of them.
+// isMonitoredNeighbor returns true if linkIndex belongs to an
+// interface enumerated by buildNeighborSnapshots. Codex round-4
+// caught: that snapshot iterates all configured base interfaces
+// AND units (snapshot.go:1768-1787), not an informal "forwarding/
+// fabric" subset. To stay aligned, EXPORT the enumeration as
+// a public helper and reuse it here.
+//
+// Plan: refactor buildNeighborSnapshots' interface enumeration
+// into a shared helper:
+//
+//   func MonitoredInterfaceLinkIndexes(cfg *config.Config)
+//                                         map[int]struct{}
+//
+// Both buildNeighborSnapshots and isMonitoredNeighbor call this
+// helper, so the listener's filter is GUARANTEED to match the
+// snapshot's keyspace. Drift is impossible.
 func (d *Daemon) isMonitoredNeighbor(linkIndex int) bool {
-    // Check against configured interface ifindex set built from
-    // the active config (forwarding interfaces + fabric overlays).
     cfg := d.store.ActiveConfig()
     if cfg == nil { return false }
-    return d.linkIndexInActiveConfig(linkIndex)
+    monitored := userspace.MonitoredInterfaceLinkIndexes(cfg)
+    _, ok := monitored[linkIndex]
+    return ok
 }
 
 // shouldTriggerRegen filters out forwarding-irrelevant churn.
-// REACHABLE↔STALE transitions are aging artifacts; ignore.
-// MAC change, RTM_DELNEIGH, FAILED/INCOMPLETE state → trigger.
+// Codex round-4: userspace forwarding (forwarding/mod.rs:45)
+// treats every state EXCEPT failed/incomplete as usable. So
+// new entries in DELAY/PROBE/NOARP with a valid MAC also need
+// to trigger. Same-MAC state churn (REACHABLE↔STALE etc.) is
+// the only ignored case.
+//
+// "Usable" set (must match userspace-dp's neighbor.rs treatment):
+//   NUD_REACHABLE | NUD_STALE | NUD_DELAY | NUD_PROBE | NUD_PERMANENT | NUD_NOARP
+const usableNUD = netlink.NUD_REACHABLE | netlink.NUD_STALE |
+                  netlink.NUD_DELAY | netlink.NUD_PROBE |
+                  netlink.NUD_PERMANENT | netlink.NUD_NOARP
+
 func (d *Daemon) shouldTriggerRegen(u netlink.NeighUpdate) bool {
     switch u.Type {
     case syscall.RTM_DELNEIGH:
         // Kernel evicted entry; snapshot must drop it immediately.
         return true
     case syscall.RTM_NEWNEIGH:
-        // Look up current snapshot entry for this (ifindex, IP).
         existing := d.dp.LookupSnapshotNeighbor(u.LinkIndex, u.IP)
-        // No existing snapshot entry: trigger (new entry).
+        hasMAC := u.HardwareAddr != nil && len(u.HardwareAddr) > 0
+        usable := u.State&usableNUD != 0
+        unusable := u.State&(netlink.NUD_FAILED|netlink.NUD_INCOMPLETE) != 0
+
         if existing == nil {
-            // But only if state is usable (REACHABLE or PERMANENT
-            // or STALE — entries with valid MAC).
-            return u.HardwareAddr != nil && len(u.HardwareAddr) > 0 &&
-                u.State&(netlink.NUD_REACHABLE|netlink.NUD_STALE|
-                         netlink.NUD_PERMANENT) != 0
+            // New usable entry with valid MAC → snapshot must learn it.
+            return hasMAC && usable
         }
-        // Existing snapshot has this entry. Trigger only if MAC
-        // differs, or if kernel transitioned to FAILED/INCOMPLETE
-        // (entry no longer usable).
-        if u.HardwareAddr != nil && len(u.HardwareAddr) > 0 &&
-           !bytes.Equal(existing.MAC, u.HardwareAddr) {
+        // Existing snapshot has this entry.
+        // 1. MAC change → always trigger (the bug-class case).
+        if hasMAC && !bytes.Equal(existing.MAC, u.HardwareAddr) {
             return true
         }
-        if u.State&(netlink.NUD_FAILED|netlink.NUD_INCOMPLETE) != 0 {
-            return true // entry became unusable; snapshot must drop
+        // 2. Transition to unusable → snapshot must drop entry.
+        if unusable {
+            return true
         }
-        // REACHABLE↔STALE↔DELAY↔PROBE on same MAC: harmless aging.
+        // 3. Same MAC, same usable category → harmless aging churn.
         return false
     }
     return false
@@ -282,30 +320,65 @@ func (d *Daemon) triggerRegen(ch chan struct{}) {
 This requires a new `Manager.LookupSnapshotNeighbor(ifindex, ip)`
 method (cheap O(1) read of in-memory snapshot map).
 
-### 5.3 Phase 3: proactive expiry + reprobe — **CORRECTED per Codex round-3**
+### 5.3 Phase 3: proactive expiry + reprobe — **CORRECTED per Codex round-3 + round-4**
 
 Codex round-3 caught: `resolveNeighborsInner` at
 `daemon_neighbor.go:323-334` skips entries already in
 `NUD_REACHABLE|NUD_STALE|NUD_PERMANENT`. Idle STALE entries
-**never get re-probed by this path**. Just calling it on a 15s
-tick does nothing useful for the bug class.
+**never get re-probed by this path**.
 
-Need a **force-probe** sibling function that **does** re-probe
-STALE entries. Sketch:
+Codex round-4 added: `forceProbeNeighbors` is right shape but
+**`collectMonitoredNeighbors` was undefined**, and the force
+path **must also fire on RG takeover** (not only the 15s tick).
+And **target prioritization** is needed: probe
+STALE/PROBE/DELAY first, then on-link/next-hops, then rest —
+to avoid a 256-target ARP storm at startup.
+
+Defining `collectMonitoredNeighbors` precisely:
 
 ```go
-// forceProbeNeighbors sends ARP/NS probes for known neighbor
-// targets WITHOUT skipping STALE entries. Used by the periodic
-// reconcile timer to nudge kernel re-validation. Distinct from
+// collectMonitoredNeighbors returns the union of:
+//   1. Current snapshot keys (every neighbor xpfd has published
+//      to userspace-dp), so we re-validate everything we've told
+//      the data plane is reachable.
+//   2. Configured next-hops, NAT destinations, address-book hosts
+//      (the resolveNeighbors target set), so we keep priming
+//      entries the kernel may have aged out.
+//   3. Fabric peer IPs (from monitorFabricState).
+//
+// Returned in PRIORITY ORDER:
+//   tier 1: snapshot keys with kernel state in {STALE, PROBE,
+//           DELAY, FAILED, INCOMPLETE} — these are the ones at
+//           risk of forwarding to dead address
+//   tier 2: configured next-hops + fabric peers (highest-impact
+//           targets that must not go cold)
+//   tier 3: snapshot REACHABLE + remaining configured targets
+//
+// Truncate at the configured cap (default 256). Log skipped count.
+func (d *Daemon) collectMonitoredNeighbors(
+    cfg *config.Config) []probeTarget {
+    // Implementation: iterate active snapshot first via
+    // dp.SnapshotNeighbors() to learn (ifindex, IP, current
+    // kernel state via NeighList lookup). Then add configured
+    // targets via the existing addByIP/addByName helpers in
+    // resolveNeighborsInner. Sort into tier order, truncate.
+    // ...
+}
+
+// forceProbeNeighbors sends ARP/NS probes for monitored targets
+// REGARDLESS of NUD state (no skip-STALE). Distinct from
 // resolveNeighborsInner which only fills missing/INCOMPLETE/FAILED
 // entries — that semantics is right for activation priming, but
 // wrong for steady-state staleness reconciliation.
 func (d *Daemon) forceProbeNeighbors(cfg *config.Config) {
-    targets := d.collectMonitoredNeighbors(cfg)  // see 5.2 below
+    targets := d.collectMonitoredNeighbors(cfg)
+    cap := d.neighborProbeMaxTargets // default 256
+    if len(targets) > cap {
+        slog.Warn("neighbor probe truncated",
+                  "total", len(targets), "cap", cap)
+        targets = targets[:cap]
+    }
     for _, t := range targets {
-        // Probe regardless of current NUD state; the kernel will
-        // decide what to do with the response (REACHABLE → confirm;
-        // STALE → DELAY/PROBE → REACHABLE on reply).
         link, err := netlink.LinkByIndex(t.linkIndex)
         if err != nil { continue }
         ifName := link.Attrs().Name
@@ -319,6 +392,12 @@ func (d *Daemon) forceProbeNeighbors(cfg *config.Config) {
 }
 ```
 
+**RG takeover must call forceProbeNeighbors too.** Currently
+`daemon_ha_vip.go:174` calls `resolveNeighbors` (skip-stale) on
+VRRP MASTER. Change that call to `forceProbeNeighbors` so a
+takeover with stale snapshot entries gets re-validated, not
+left alone.
+
 This is the periodic cadence (default 15s, tunable) that drives
 proactive reprobing. Replies → kernel ARP update → RTM_NEWNEIGH
 → our listener → snapshot regen → userspace-dp update.
@@ -328,24 +407,65 @@ can be much larger than the 5-10 next-hops estimate. Add a
 configurable cap (`neighbor-probe-max-targets`, default 256;
 log target count each tick).
 
-### 5.4 Phase 4: snapshot regeneration is event-driven
+### 5.4 Phase 4: snapshot regeneration with forwarding-effective diff
 
-`Manager.RegenerateNeighborSnapshot()` (new public method on
-`pkg/dataplane/userspace/manager.go`) becomes the single entry
-point for "kernel changed; tell userspace-dp."
+Codex round-4 caught: v4 plan's `shouldTriggerRegen` filters
+event-loop churn correctly, but **`RegenerateNeighborSnapshot`
+itself uses `neighborsEqual` (snapshot.go:160) which compares
+RAW state**. So the 60s safety tick + `BumpFIBGeneration` can
+still publish on REACHABLE↔STALE churn — the buggy publish
+happens at the manager level, not the listener level.
 
-It's called from:
-- `handleNeighUpdate` (RTM_NEWNEIGH for monitored IP, MAC differs)
-- `BumpFIBGeneration` (already calls `buildNeighborSnapshots`;
-  preserve)
-- `resolveNeighbors` completion (after probe, snapshot may have
-  refreshed)
+Add a manager-level **forwarding-effective equality**:
 
-The function:
-- Calls `buildNeighborSnapshots(cfg)` to rebuild from kernel
-- Diffs against `lastSnapshot.Neighbors`
-- If different: updates `lastSnapshot.Neighbors`, publishes
-  `update_neighbors` to userspace-dp.
+```go
+// neighborsEqualForwarding compares snapshot entries on what
+// matters for forwarding decisions:
+//   - (Ifindex, IP, Family) key
+//   - MAC
+//   - Usable bit (state ∈ {REACHABLE, STALE, DELAY, PROBE,
+//     PERMANENT, NOARP} → usable; FAILED/INCOMPLETE → unusable)
+//
+// Raw state (REACHABLE vs STALE) is NOT compared — both are
+// usable and aging churn shouldn't trigger publish.
+func neighborsEqualForwarding(a, b []NeighborSnapshot) bool {
+    // Build map<key, (mac, usable)> for both, compare.
+}
+```
+
+Use this in `RegenerateNeighborSnapshot` and the
+`BumpFIBGeneration`-driven path so ONLY forwarding-relevant
+changes publish.
+
+`Manager.RegenerateNeighborSnapshot()` becomes:
+
+```go
+// RegenerateNeighborSnapshot rebuilds neighbors[] from kernel
+// ARP/NDP via buildNeighborSnapshots, diffs forwarding-effectively,
+// and publishes update_neighbors only on real changes.
+func (m *Manager) RegenerateNeighborSnapshot() {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
+        return
+    }
+    newNeighbors := buildNeighborSnapshots(m.lastSnapshot.Config)
+    if neighborsEqualForwarding(m.lastSnapshot.Neighbors,
+                                 newNeighbors) {
+        return // no forwarding-relevant change
+    }
+    m.lastSnapshot.Neighbors = newNeighbors
+    m.lastSnapshot.Generation = m.generation
+    m.publishUpdateNeighbors(newNeighbors)
+}
+```
+
+Called from:
+- `neighborListener` debouncer (event-driven primary path)
+- `BumpFIBGeneration` (continues to call this on FIB regen;
+  forwarding-effective diff prevents churn)
+- `forceProbeNeighbors` completion (after probes have had time
+  to land; bound by the 100ms debounce)
 
 ## 6. What gets deleted / changed
 
@@ -405,9 +525,10 @@ under v1+v2.
 
 ## 9. Phased ship plan
 
-**PR 1 (this):** v4 minimum viable — MUST contain all 3 critical
-elements per Codex round-3 (otherwise need TTL or dynamic-first
-lookup as foundation, both more invasive):
+**PR 1 (this):** v5 atomic ship — Codex round-4 explicit:
+*"One PR is fine only if delete + listener + force-probe + regen
+diff ship atomically. Do not ship deletion alone."* So PR1
+contains the complete replacement of the broken mechanism:
 
 - **Delete** `preinstallSnapshotNeighbors` (and its 15s tick at
   `daemon_neighbor.go:468`). Stop the bug source.
