@@ -39,6 +39,7 @@ fn build_cos_state_translates_scheduler_map_entries() {
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
+                    surplus_sharing: false,
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -46,6 +47,7 @@ fn build_cos_state_translates_scheduler_map_entries() {
                     transmit_rate_exact: true,
                     priority: "strict-high".into(),
                     buffer_size_bytes: 64_000,
+                    surplus_sharing: false,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -144,6 +146,7 @@ fn build_cos_state_derives_exact_queue_default_burst_from_queue_rate() {
                 transmit_rate_exact: true,
                 priority: "low".into(),
                 buffer_size_bytes: 0,
+                surplus_sharing: false,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -201,6 +204,7 @@ fn build_cos_state_uses_effective_transmit_rate_for_surplus_weight() {
                 transmit_rate_exact: false,
                 priority: "low".into(),
                 buffer_size_bytes: 0,
+                surplus_sharing: false,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "test-map".into(),
@@ -281,6 +285,7 @@ fn build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids() {
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 0,
+                    surplus_sharing: false,
                 },
                 CoSSchedulerSnapshot {
                     name: "voice".into(),
@@ -288,6 +293,7 @@ fn build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids() {
                     transmit_rate_exact: false,
                     priority: "high".into(),
                     buffer_size_bytes: 0,
+                    surplus_sharing: false,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -613,6 +619,7 @@ fn build_cos_state_zero_shaping_rate_queue_inherits_transparent() {
                 transmit_rate_exact: false,
                 priority: "low".into(),
                 buffer_size_bytes: 0,
+                surplus_sharing: false,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),

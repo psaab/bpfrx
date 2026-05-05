@@ -21,6 +21,7 @@ fn normalize_cos_queue_state_repairs_nonempty_unparked_queue_to_runnable() {
         priority: 5,
         transmit_rate_bytes: 11_000_000_000 / 8,
         exact: true,
+        surplus_sharing: false,
         flow_fair: false,
         shared_exact: false,
         flow_hash_seed: 0,

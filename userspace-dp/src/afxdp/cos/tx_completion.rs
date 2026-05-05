@@ -446,14 +446,26 @@ pub(in crate::afxdp) fn apply_cos_send_result(
     {
         shared_root_lease.consume(sent_bytes);
     }
+    // #915: phase-gate `shared_queue_lease` consumption to the
+    // Guarantee phase only. The per-queue lease represents the
+    // configured rate cap; in Surplus phase a surplus-sharing
+    // exact queue is drawing from root tokens (not its own
+    // bucket), so debiting the per-queue lease here would cap
+    // the surplus draw at the configured rate and defeat #915.
+    // For non-surplus-sharing exact queues this is a no-op
+    // because they never reach Surplus phase (the surplus
+    // selector skips them via `queue.exact && !surplus_sharing`).
     if let Some(queue_idx) = exact_queue_idx {
-        if let Some(shared_queue_lease) = binding
-            .cos.cos_fast_interfaces
-            .get(&root_ifindex)
-            .and_then(|iface_fast| iface_fast.queue_fast_path.get(queue_idx))
-            .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref())
-        {
-            shared_queue_lease.consume(sent_bytes);
+        if matches!(phase, CoSServicePhase::Guarantee) {
+            if let Some(shared_queue_lease) = binding
+                .cos
+                .cos_fast_interfaces
+                .get(&root_ifindex)
+                .and_then(|iface_fast| iface_fast.queue_fast_path.get(queue_idx))
+                .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref())
+            {
+                shared_queue_lease.consume(sent_bytes);
+            }
         }
     }
     refresh_cos_interface_activity(binding, root_ifindex);
@@ -512,14 +524,26 @@ pub(in crate::afxdp) fn apply_cos_prepared_result(
     {
         shared_root_lease.consume(sent_bytes);
     }
+    // #915: phase-gate `shared_queue_lease` consumption to the
+    // Guarantee phase only. The per-queue lease represents the
+    // configured rate cap; in Surplus phase a surplus-sharing
+    // exact queue is drawing from root tokens (not its own
+    // bucket), so debiting the per-queue lease here would cap
+    // the surplus draw at the configured rate and defeat #915.
+    // For non-surplus-sharing exact queues this is a no-op
+    // because they never reach Surplus phase (the surplus
+    // selector skips them via `queue.exact && !surplus_sharing`).
     if let Some(queue_idx) = exact_queue_idx {
-        if let Some(shared_queue_lease) = binding
-            .cos.cos_fast_interfaces
-            .get(&root_ifindex)
-            .and_then(|iface_fast| iface_fast.queue_fast_path.get(queue_idx))
-            .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref())
-        {
-            shared_queue_lease.consume(sent_bytes);
+        if matches!(phase, CoSServicePhase::Guarantee) {
+            if let Some(shared_queue_lease) = binding
+                .cos
+                .cos_fast_interfaces
+                .get(&root_ifindex)
+                .and_then(|iface_fast| iface_fast.queue_fast_path.get(queue_idx))
+                .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref())
+            {
+                shared_queue_lease.consume(sent_bytes);
+            }
         }
     }
     refresh_cos_interface_activity(binding, root_ifindex);
