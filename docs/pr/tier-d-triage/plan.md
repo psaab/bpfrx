@@ -1,7 +1,54 @@
 ---
-status: DRAFT v1 — pending adversarial plan review
+status: TRIAGE COMPLETE 2026-05-05 — 4 closed PLAN-KILL, 13 stay open with refined scope
 issues: #946, #947, #948, #949, #961, #963, #987, #1127, #1144, #1146, #1163, #1164, #1165, #1166, #1187, #1188, #1189
-phase: Triage — codebase-reality check before any implementation
+phase: Closures + comments posted; reviewer reports preserved on this branch
+---
+
+## Triage outcome (2026-05-05)
+
+17 Tier D "Refactor: <Pattern>" issues reviewed by Codex hostile.
+Gemini Pro 3 hit rate-limits across the entire batch (17/17 failures);
+per project policy `feedback_gemini_infra_outage_merge_policy.md` we
+proceeded on Codex alone for triage routing.
+
+**Codex verdicts:**
+
+| # | Verdict | Action |
+|---|---|---|
+| #947 | PLAN-KILL upheld | **Closed** — Strategy parser already shipped via PR #962 (`74d25948`) |
+| #963 | PLAN-NEEDS-MINOR — "the #963 KILL is correct" | **Closed** — Builder/State already shipped via `RewriteDescriptor` |
+| #1127 | PLAN-KILL upheld | **Closed** — actually 15 params (not 31); PacketBatch blocked by #946 Phase 2 constraint |
+| #946 | PLAN-NEEDS-MAJOR | Stays open — Phase 1 done, Phase 2 KILLed, parent issue refined |
+| #948 | PLAN-NEEDS-MAJOR | Stays open — mediator partially shipped (`mpsc_inbox.rs`); refined scope wanted |
+| #949 | PLAN-NEEDS-MAJOR | Stays open — `dynamic_neighbors` sharded but Mutex sites real |
+| #961 | PLAN-NEEDS-MAJOR (rejects KILL) | Stays open — engineering-style.md still tracks #961 |
+| #987 | PLAN-NEEDS-MAJOR (rejects KILL) | Stays open — HAL trait scope needs trimming, not killing |
+| #1144 | PLAN-KILL | **Closed** — deferral breaks SYN/SYN-ACK ordering documented in cold-start-resolution.md |
+| #1146 | PLAN-NEEDS-MAJOR | Stays open — codebase still descriptor-by-descriptor |
+| #1163 | PLAN-NEEDS-MAJOR | Stays open — slow-path call sites real but refactor scope wanted |
+| #1164 | PLAN-NEEDS-MAJOR (rejects KILL) | Stays open — JSON snapshot cost real on bulk sync |
+| #1165 | PLAN-NEEDS-MAJOR | Stays open — release-build cost smaller than issue claims but non-zero |
+| #1166 | PLAN-KILL of triage / "Do not kill #1166" | Stays open — `segment_forwarded_tcp_frames_into_prepared` is 281 lines, not extracted |
+| #1187 | PLAN-NEEDS-MAJOR | Stays open — single-socket caveat valid but cache-line padding wanted |
+| #1188 | PLAN-NEEDS-MAJOR (rejects KILL) | Stays open — atomic loads measurable, not at claimed rate |
+| #1189 | PLAN-NEEDS-MAJOR | Stays open — Coordinator decomposition direction confirmed |
+
+**Result:** 4 closed (PLAN-KILL confirmed), 13 stay open with Codex's
+findings posted as comments and refined scope notes. Substantially
+different from the SIMD batch (4/4 unanimous KILL) — Codex pushed
+back on most of the triage's KILL recommendations, judging the issues
+have enough premise to remain open as long-term design questions.
+
+**Cross-cutting Codex pushback:** the triage was correct that file
+paths cited in many issues are stale and that prescribed patterns
+have partially shipped. But Codex repeatedly rejected the leap from
+"file/symbol stale" to "issue is dead" — the underlying design
+question (per-stage pipeline, RCU snapshot, Coordinator decomposition,
+software TSO) often still has merit even when the specific file
+reference is wrong.
+
+(Plan v1 follows verbatim below.)
+
 ---
 
 ## 1. Why one triage doc for 17 issues
