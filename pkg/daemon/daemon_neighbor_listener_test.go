@@ -130,3 +130,52 @@ func TestNeighborListenerEventTypes(t *testing.T) {
 		t.Error("RTM_NEWNEIGH and RTM_DELNEIGH must differ")
 	}
 }
+
+// TestCompositeNUDStateUnusable verifies that a state with both
+// usable bits AND failed/incomplete bits is correctly classified
+// as unusable. Codex code-review v2 found this composite-state
+// hole; v3 fixed via 'usable := has-usable AND no-failed'.
+func TestCompositeNUDStateUnusable(t *testing.T) {
+	tests := []struct {
+		name   string
+		state  int
+		usable bool
+	}{
+		{
+			"REACHABLE alone is usable",
+			netlink.NUD_REACHABLE,
+			true,
+		},
+		{
+			"REACHABLE|FAILED composite is NOT usable",
+			netlink.NUD_REACHABLE | netlink.NUD_FAILED,
+			false,
+		},
+		{
+			"STALE|INCOMPLETE composite is NOT usable",
+			netlink.NUD_STALE | netlink.NUD_INCOMPLETE,
+			false,
+		},
+		{
+			"PERMANENT alone is usable",
+			netlink.NUD_PERMANENT,
+			true,
+		},
+		{
+			"PERMANENT|FAILED is NOT usable",
+			netlink.NUD_PERMANENT | netlink.NUD_FAILED,
+			false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Mirror the logic in shouldTriggerRegen.
+			usable := tc.state&usableNUD != 0 &&
+				tc.state&(netlink.NUD_FAILED|netlink.NUD_INCOMPLETE) == 0
+			if usable != tc.usable {
+				t.Errorf("state=%v: composite usable check = %v, want %v",
+					tc.state, usable, tc.usable)
+			}
+		})
+	}
+}

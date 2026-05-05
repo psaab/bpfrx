@@ -297,8 +297,11 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		samePlanRefresh = false
 	}
 	m.lastSnapshot = snap
-	m.rebuildNeighborIndex()      // #1197: keep listener O(1) lookup in sync
-	m.rebuildMonitoredIfindexes() // #1197: cache ifindex set for listener filter
+	// #1197 v4 (Codex code-review v3 #1+#2): rebuild listener
+	// caches ONLY after a successful apply_snapshot. Doing it
+	// here (before publish) leaves the listener thinking
+	// userspace-dp has entries it doesn't if apply_snapshot fails.
+	// Moved to the post-success path below (after line 343).
 	if pendingXSKStartup {
 		if err := m.syncIngressIfaceMapLocked(snap); err != nil {
 			return result, err
@@ -343,6 +346,12 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: snap}, &status); err != nil {
 		return result, fmt.Errorf("publish userspace snapshot: %w", err)
 	}
+	// #1197 v4: apply_snapshot succeeded — userspace-dp has the
+	// new neighbors. NOW rebuild listener caches; before this
+	// point the index would shadow events for entries the
+	// dataplane hadn't accepted.
+	m.rebuildNeighborIndex()
+	m.rebuildMonitoredIfindexes()
 	m.publishedSnapshot = snap.Generation
 	m.publishedPlanKey = newPlanKey
 	if h, ok := snapshotContentHash(snap); ok {
@@ -444,6 +453,13 @@ func (m *Manager) BumpFIBGeneration() uint32 {
 	m.generation++
 	m.lastSnapshot.Generation = m.generation
 
+	// #1197 v4 (Codex code-review v3 #1): refresh the monitored
+	// ifindex cache UNCONDITIONALLY — link recreation can happen
+	// without any neighbor diff (operator unplugs cable, kernel
+	// rebinds a VLAN, etc.), and a stale cache silently drops
+	// events on the new ifindex until the next config commit.
+	m.rebuildMonitoredIfindexes()
+
 	// Check if kernel neighbors changed — if so, push an incremental update.
 	// #1197: use forwarding-effective diff so REACHABLE↔STALE aging churn
 	// doesn't trigger unnecessary publishes; filter publish payload to
@@ -462,8 +478,7 @@ func (m *Manager) BumpFIBGeneration() uint32 {
 			// Only update cached neighbors after successful publish so
 			// a transient failure doesn't suppress future retries.
 			m.lastSnapshot.Neighbors = newNeighbors
-			m.rebuildNeighborIndex()      // #1197
-			m.rebuildMonitoredIfindexes() // #1197 v3: catch link recreation
+			m.rebuildNeighborIndex() // #1197
 		}
 	}
 
@@ -551,6 +566,13 @@ func (m *Manager) RegenerateNeighborSnapshot() {
 	if m.proc == nil || m.proc.Process == nil {
 		return
 	}
+	// #1197 v4 (Codex code-review v3 #1): refresh monitored
+	// ifindex cache unconditionally — a regen call may be
+	// triggered by the safety tick precisely because a link
+	// changed, and the listener filter must reflect that even
+	// if neighbor entries didn't diff.
+	m.rebuildMonitoredIfindexes()
+
 	newNeighbors := buildNeighborSnapshots(m.lastSnapshot.Config)
 	if neighborsEqualForwarding(m.lastSnapshot.Neighbors, newNeighbors) {
 		return
@@ -566,8 +588,7 @@ func (m *Manager) RegenerateNeighborSnapshot() {
 		return
 	}
 	m.lastSnapshot.Neighbors = newNeighbors
-	m.rebuildNeighborIndex()      // #1197
-	m.rebuildMonitoredIfindexes() // #1197 v3: catch link recreation
+	m.rebuildNeighborIndex() // #1197 (after publish success)
 	m.generation++
 	m.lastSnapshot.Generation = m.generation
 }
