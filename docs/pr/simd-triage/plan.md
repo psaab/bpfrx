@@ -1,7 +1,70 @@
 ---
-status: DRAFT v1 — pending adversarial plan review (4 SIMD-refactor proposals)
+status: ALL FOUR PLAN-KILLED — Codex + Gemini Pro 3 unanimous on #966, #967, #968, #969 (2026-05-05)
 issues: #966 (SIMD policy classification), #967 (PSHUFB header rewrite), #968 (AES-NI/SHA-Ext crypto), #969 (AVX2 gather FIB)
-phase: Triage all four; identify which (if any) survive adversarial review
+phase: Triage complete; all four closed-as-killed
+---
+
+## KILL outcome (2026-05-05)
+
+8 adversarial reviews dispatched (one Codex + one Gemini Pro 3 per issue);
+all 8 returned PLAN-KILL. Reviewer reports preserved verbatim at:
+- `docs/pr/simd-triage/codex-review-{966,967,968,969}.md`
+- `docs/pr/simd-triage/gemini-review-{966,967,968,969}.md`
+
+Codex session IDs: 019df694-271f-77c3-a680-353ba3b50995 (#966),
+019df694-27e3-7651-b1bd-15086e1cf04e (#967),
+019df694-27c3-7002-bd13-e80517a6e416 (#968),
+019df694-281f-7400-...-... (#969).
+
+### Per-issue summary
+
+**#966 (SIMD policy classification)** — both reviewers confirmed the
+codebase uses O(1) hash-keyed `zone_pair_policies` + bounded array,
+NOT a 10K-rule scalar walk. The fresh perf data shows zero
+contribution from policy lookup symbols. PLAN-KILL.
+
+**#967 (PSHUFB SIMD header rewrite)** — both reviewers confirmed the
+13.43% `__memmove_evex_unaligned_erms` cost IS the cross-UMEM
+frame-body memcpy (build_forwarded_frame_into_from_frame), NOT the
+header rewrite-in-place which is sub-1%. `__memmove_evex_*` is also
+already AVX-512 (EVEX). PSHUFB on 32-byte headers would be a net no-op
+on the smoke matrix. PLAN-KILL.
+
+**#968 (AES-NI / SHA-Ext crypto)** — both reviewers confirmed SYN
+cookies use kernel kfuncs `bpf_tcp_raw_gen_syncookie_ipv4/v6`. xpf
+userspace does NOT generate SYN cookies. RSS hash is NIC-side. There
+is no software-crypto hot path. The 14.8M cookies/sec scenario is
+a non-existent code path. PLAN-KILL.
+
+**#969 (AVX2 gather + DIR-24-8 FIB)** — both reviewers confirmed FIB
+lookup uses kernel kfunc `bpf_fib_lookup` (73 invocations across 4
+BPF programs); the AF_XDP Rust path has a userspace route lookup on
+session miss but it's a sorted Vec scan, not a DIR-24-8 trie. AVX2
+gather is also Spectre-de-optimized on Intel (Skylake-X / Ice Lake /
+Sapphire Rapids). PLAN-KILL.
+
+### Pattern observation
+
+All four issues followed the same "Refactor: <Pattern>" template
+("The 'Amateur' Architecture / Security Engine" → "The CPU Reality"
+→ "The Fix: <SIMD intrinsic>"). Same shape as prior PLAN-KILLs:
+#946 Phase 2, #961, #963, #1144, #747, #761. The triple-review
+methodology consistently catches these speculative architectural
+critiques before any LOC is written.
+
+Cross-cutting failure mode: each proposal targeted a code path that
+doesn't exist in xpf as written. The proposals would all require
+multi-week implementation against fictional bottlenecks at scales
+(100G+, 10K rules, 14.8M cookies/sec) far beyond xpf's actual
+target (22+ Gb/s on 6 workers).
+
+The actual bottlenecks per fresh perf data — cross-worker memcpy
+(#776), RX poll (#777), TX dispatch (#779), structural pipeline
+stall (#781) — are tracked separately and not addressed by any
+of these SIMD proposals.
+
+(Plan v1 follows verbatim below.)
+
 ---
 
 ## 1. Why one triage doc for four issues
