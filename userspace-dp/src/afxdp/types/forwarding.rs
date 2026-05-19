@@ -136,6 +136,7 @@ pub(in crate::afxdp) struct TunnelEndpoint {
     pub(in crate::afxdp) key: u32,
     pub(in crate::afxdp) ttl: u8,
     pub(in crate::afxdp) transport_table: String,
+    pub(in crate::afxdp) wg_public_key: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

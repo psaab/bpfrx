@@ -128,6 +128,21 @@ type InterfaceSnapshot struct {
 	CoSDSCPClassifier         string                     `json:"cos_dscp_classifier,omitempty"`
 	CoSIEEE8021Classifier     string                     `json:"cos_ieee8021_classifier,omitempty"`
 	CoSDSCPRewriteRule        string                     `json:"cos_dscp_rewrite_rule,omitempty"`
+	WireGuard                 *WireGuardInterfaceSnapshot `json:"wireguard,omitempty"`
+}
+
+type WireGuardInterfaceSnapshot struct {
+	PrivateKey string               `json:"private_key,omitempty"`
+	PublicKey  string               `json:"public_key,omitempty"`
+	ListenPort uint16               `json:"listen_port,omitempty"`
+	Peers      []WireGuardPeerSnapshot `json:"peers,omitempty"`
+}
+
+type WireGuardPeerSnapshot struct {
+	PublicKey           string   `json:"public_key,omitempty"`
+	Endpoint            string   `json:"endpoint,omitempty"`
+	AllowedIPs          []string `json:"allowed_ips,omitempty"`
+	PersistentKeepalive uint32   `json:"persistent_keepalive,omitempty"`
 }
 
 type ClassOfServiceSnapshot struct {

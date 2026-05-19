@@ -208,7 +208,8 @@ pub(super) struct WorkerCommandResults {
     /// `apply_worker_commands` cannot vacate directly because it has
     /// no `BindingWorker` access — the outer poll loop in `worker.rs`
     /// dispatches based on this flag.
-    pub vacate_all_shared_exact_slots: bool,
+    pub(super) vacate_all_shared_exact_slots: bool,
+    pub(super) wireguard_update: Option<crate::protocol::WireGuardInterfaceSnapshot>,
 }
 
 fn force_live_redirect_for_worker_synced_entry(
@@ -303,6 +304,7 @@ pub(super) fn apply_worker_commands(
                     exported_sequences: Vec::new(),
                     shaped_tx_requests: Vec::new(),
                     vacate_all_shared_exact_slots: false,
+                    wireguard_update: None,
                 };
             }
             core::mem::take(&mut *pending)
@@ -313,6 +315,7 @@ pub(super) fn apply_worker_commands(
                 exported_sequences: Vec::new(),
                 shaped_tx_requests: Vec::new(),
                 vacate_all_shared_exact_slots: false,
+                wireguard_update: None,
             };
         }
     };
@@ -322,6 +325,7 @@ pub(super) fn apply_worker_commands(
     let mut exported_sequences = Vec::new();
     let mut shaped_tx_requests = Vec::new();
     let mut vacate_all_shared_exact_slots = false;
+    let mut wireguard_update = None;
     for cmd in pending {
         match cmd {
             WorkerCommand::DemoteOwnerRGS { owner_rgs } => {
@@ -602,6 +606,9 @@ pub(super) fn apply_worker_commands(
                 // let `worker.rs:818-822` dispatch).
                 vacate_all_shared_exact_slots = true;
             }
+            WorkerCommand::UpdateWireGuard(snap) => {
+                wireguard_update = Some(snap);
+            }
         }
     }
     WorkerCommandResults {
@@ -609,6 +616,7 @@ pub(super) fn apply_worker_commands(
         exported_sequences,
         shaped_tx_requests,
         vacate_all_shared_exact_slots,
+        wireguard_update,
     }
 }
 

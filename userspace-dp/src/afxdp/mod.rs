@@ -305,6 +305,8 @@ mod coordinator;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+#[path = "wireguard.rs"]
+mod wireguard;
 #[path = "worker/mod.rs"]
 mod worker;
 #[path = "worker_runtime.rs"]

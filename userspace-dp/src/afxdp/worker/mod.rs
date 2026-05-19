@@ -146,6 +146,7 @@ pub(crate) struct BindingWorker {
     /// `WorkerBindMeta`. Field semantics unchanged; access via
     /// `binding.bind_meta.X`.
     pub(crate) bind_meta: WorkerBindMeta,
+    pub(crate) wireguard_engine: super::wireguard::WireGuardEngine,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -437,6 +438,7 @@ impl BindingWorker {
                 bind_mode,
                 xsk_rx_confirmed: false,
             },
+            wireguard_engine: super::wireguard::WireGuardEngine::new(),
         };
         if register_xsk_now {
             register_binding_xsk(&binding, xsk_map_fd)?;
@@ -1393,6 +1395,7 @@ pub(crate) fn worker_loop(
                 exported_sequences: Vec::new(),
                 shaped_tx_requests: Vec::new(),
                 vacate_all_shared_exact_slots: false,
+                wireguard_update: None,
             }
         };
         let WorkerCommandResults {
@@ -1400,7 +1403,13 @@ pub(crate) fn worker_loop(
             exported_sequences,
             shaped_tx_requests,
             vacate_all_shared_exact_slots,
+            wireguard_update,
         } = command_results;
+        if let Some(snap) = wireguard_update {
+            for binding in bindings.iter_mut() {
+                binding.wireguard_engine.apply_snapshot(&snap);
+            }
+        }
         // #941 Work item C: HA-demotion vacate. The
         // VacateAllSharedExactSlots WorkerCommand cannot be processed
         // inside `apply_worker_commands` (no BindingWorker access);

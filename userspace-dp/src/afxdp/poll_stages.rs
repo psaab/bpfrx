@@ -143,6 +143,19 @@ pub(super) fn stage_native_gre_decap(
     (new_meta, owned_packet_frame)
 }
 
+/// Stage 6.5 — WireGuard decapsulation.
+#[inline]
+pub(super) fn stage_wireguard_decap(
+    raw_frame: &[u8],
+    meta: UserspaceDpMeta,
+    wireguard_engine: &super::wireguard::WireGuardEngine,
+) -> (UserspaceDpMeta, Option<Vec<u8>>, bool) {
+    if let Some(decap) = wireguard_engine.try_decap(raw_frame, &meta) {
+        return (decap.meta, Some(decap.frame), decap.is_control);
+    }
+    (meta, None, false)
+}
+
 /// Stage 7+8 — parse session flow and learn the source-side
 /// dynamic neighbor.
 ///

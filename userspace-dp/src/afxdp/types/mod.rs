@@ -129,6 +129,28 @@ pub(super) struct UserspaceDpMeta {
     pub(super) reserved2: u32,
 }
 
+impl UserspaceDpMeta {
+    pub(super) fn src_ip(&self) -> IpAddr {
+        if self.addr_family as i32 == libc::AF_INET {
+            let mut octets = [0u8; 4];
+            octets.copy_from_slice(&self.flow_src_addr[..4]);
+            IpAddr::V4(Ipv4Addr::from(octets))
+        } else {
+            IpAddr::V6(Ipv6Addr::from(self.flow_src_addr))
+        }
+    }
+
+    pub(super) fn dst_ip(&self) -> IpAddr {
+        if self.addr_family as i32 == libc::AF_INET {
+            let mut octets = [0u8; 4];
+            octets.copy_from_slice(&self.flow_dst_addr[..4]);
+            IpAddr::V4(Ipv4Addr::from(octets))
+        } else {
+            IpAddr::V6(Ipv6Addr::from(self.flow_dst_addr))
+        }
+    }
+}
+
 const _: [(); 96] = [(); std::mem::size_of::<UserspaceDpMeta>()];
 const _: [(); 18] = [(); std::mem::offset_of!(UserspaceDpMeta, ingress_pcp)];
 const _: [(); 19] = [(); std::mem::offset_of!(UserspaceDpMeta, ingress_vlan_present)];

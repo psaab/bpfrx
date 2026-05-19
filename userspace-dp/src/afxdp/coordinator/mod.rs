@@ -1001,6 +1001,14 @@ impl Coordinator {
                 }
             }
         }
+
+        if let Some(ref wg) = snapshot.wireguard {
+            for handle in self.workers.handles.values() {
+                if let Ok(mut pending) = handle.commands.lock() {
+                    pending.push_back(WorkerCommand::UpdateWireGuard(wg.clone()));
+                }
+            }
+        }
         self.shared_validation.store(Arc::new(self.validation));
         self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
         self.refresh_cos_owner_worker_map_from_identities();

@@ -538,6 +538,19 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                         // forward it anyway. Mismatch is diagnostic only.
                                     }
                                 }
+                                let mut frame = frame;
+                                if let Some(endpoint) = forwarding.tunnel_endpoints.get(&request.decision.resolution.tunnel_endpoint_id) {
+                                    if endpoint.mode == "wireguard" {
+                                        let mut encap_meta = request.meta;
+                                        encap_meta.l3_offset = 14; 
+                                        if let Some(encap) = target_binding.wireguard_engine.try_encap(&frame, encap_meta.addr_family, encap_meta.ingress_ifindex, 0, endpoint.wg_public_key) {
+                                            frame = encap.frame;
+                                        } else {
+                                            recycle_ingress_frame(ingress_binding, source_offset, now_ns);
+                                            continue;
+                                        }
+                                    }
+                                }
                                 let cp1_len = frame.len();
                                 if cp1_len > tx_frame_capacity() {
                                     record_exception(

@@ -10,7 +10,7 @@ use super::*;
 use super::poll_stages::{
     stage_classify_fabric_ingress, stage_ipsec_passthrough_check, stage_link_layer_classify,
     stage_native_gre_decap, stage_parse_flow_and_learn, stage_screen_check,
-    stage_screen_syn_cookie_ack_on_session_miss, FabricIngressOutcome, StageOutcome,
+    stage_screen_syn_cookie_ack_on_session_miss, stage_wireguard_decap, FabricIngressOutcome, StageOutcome,
 };
 use crate::policy::{evaluate_policy_result_with_len, evaluate_policy_with_len};
 
@@ -373,6 +373,55 @@ pub(super) fn poll_binding_process_descriptor(
                     // stage-12+ code at lines below calls `.take()`.
                     let (mut meta, mut owned_packet_frame) =
                         stage_native_gre_decap(raw_frame, meta, worker_ctx.forwarding);
+                    if owned_packet_frame.is_none() {
+                        let (new_meta, new_owned, is_control) =
+                            stage_wireguard_decap(raw_frame, meta, &binding.wireguard_engine);
+                        if is_control {
+                            if let Some(frame) = new_owned {
+                                let ingress_ifindex = meta.ingress_ifindex as i32;
+                                if let Some(egress) = worker_ctx.forwarding.egress.get(&ingress_ifindex) {
+                                    let target_ifindex = if egress.bind_ifindex > 0 {
+                                        egress.bind_ifindex
+                                    } else {
+                                        ingress_ifindex
+                                    };
+                                    binding.scratch.scratch_forwards.push(PendingForwardRequest {
+                                        target_ifindex,
+                                        target_binding_index: None,
+                                        ingress_queue_id: worker_ctx.ident.queue_id,
+                                        desc,
+                                        frame: PendingForwardFrame::Prebuilt(frame),
+                                        meta: new_meta.into(),
+                                        decision: SessionDecision {
+                                            resolution: ForwardingResolution {
+                                                disposition: ForwardingDisposition::ForwardCandidate,
+                                                local_ifindex: 0,
+                                                egress_ifindex: ingress_ifindex,
+                                                tx_ifindex: target_ifindex,
+                                                tunnel_endpoint_id: 0,
+                                                next_hop: None,
+                                                neighbor_mac: None,
+                                                src_mac: Some(egress.src_mac),
+                                                tx_vlan_id: egress.vlan_id,
+                                            },
+                                            nat: NatDecision::default(),
+                                        },
+                                        apply_nat_on_fabric: false,
+                                        expected_ports: None,
+                                        flow_key: None,
+                                        nat64_reverse: None,
+                                        cos_queue_id: None,
+                                        dscp_rewrite: None,
+                                        cos_tx_selection_resolved: false,
+                                    });
+                                }
+                            }
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
+                        }
+                        meta = new_meta;
+                        owned_packet_frame = new_owned;
+                    }
                     let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);
                     // #946 Phase 1 stage 7+8: parse session flow and
                     // learn the source-side dynamic neighbor.

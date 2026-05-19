@@ -1,5 +1,6 @@
 use super::*;
 use crate::{CoSSchedulerSnapshot, RouteSnapshot};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 pub(super) fn build_screen_profiles(snapshot: &ConfigSnapshot) -> FxHashMap<String, ScreenProfile> {
     let mut profiles = FxHashMap::default();
@@ -154,6 +155,21 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
                 key: endpoint.key,
                 ttl: endpoint.ttl.max(0) as u8,
                 transport_table,
+                wg_public_key: if !endpoint.wg_public_key.is_empty() {
+                    if let Ok(key) = BASE64.decode(&endpoint.wg_public_key) {
+                        if key.len() == 32 {
+                            let mut pub_key = [0u8; 32];
+                            pub_key.copy_from_slice(&key);
+                            Some(pub_key)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                },
             },
         );
         state

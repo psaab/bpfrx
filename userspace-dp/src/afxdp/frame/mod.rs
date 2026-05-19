@@ -209,6 +209,11 @@ pub(super) fn build_forwarded_frame_from_frame(
     )?;
     out.truncate(written);
     if decision.resolution.tunnel_endpoint_id != 0 {
+        if let Some(endpoint) = forwarding.tunnel_endpoints.get(&decision.resolution.tunnel_endpoint_id) {
+            if endpoint.mode == "wireguard" {
+                return Some(out);
+            }
+        }
         return encapsulate_native_gre_frame(&out, meta, decision, forwarding);
     }
     Some(out)
