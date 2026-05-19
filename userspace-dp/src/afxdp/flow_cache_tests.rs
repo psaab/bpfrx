@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::test_zone_ids::*;
+use crate::{FirewallFilterSnapshot, FirewallTermSnapshot, InterfaceSnapshot};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::AtomicU32;
 
@@ -637,6 +638,110 @@ fn make_v4_round_trip_inputs() -> (
         },
     )]);
     (flow, meta, validation, decision, forwarding, ha_state)
+}
+
+#[test]
+fn from_forward_decision_skips_cache_for_dscp_matched_output_filter() {
+    let rg_epochs = default_rg_epochs();
+    let (flow, mut meta, validation, decision, mut forwarding, ha_state) =
+        make_v4_round_trip_inputs();
+    meta.dscp = 0;
+    forwarding.filter_state = crate::filter::parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "wan-drop-ef".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-ef-web".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                dscp_values: vec![46],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &[InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: decision.resolution.egress_ifindex,
+            filter_output_v4: "wan-drop-ef".into(),
+            ..Default::default()
+        }],
+        "",
+        "",
+    );
+
+    let entry = FlowCacheEntry::from_forward_decision(
+        &flow,
+        meta,
+        validation,
+        decision,
+        1,
+        Some(TEST_TRUST_ZONE_ID),
+        Some(7),
+        None,
+        &forwarding,
+        &ha_state,
+        false,
+        &rg_epochs,
+    );
+
+    assert!(
+        entry.is_none(),
+        "DSCP-matched output filters depend on per-packet state outside \
+         the flow-cache key",
+    );
+}
+
+#[test]
+fn from_forward_decision_skips_cache_for_dscp_matched_input_filter() {
+    let rg_epochs = default_rg_epochs();
+    let (flow, mut meta, validation, decision, mut forwarding, ha_state) =
+        make_v4_round_trip_inputs();
+    meta.dscp = 0;
+    forwarding.filter_state = crate::filter::parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "lan-drop-ef".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-ef-web".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                dscp_values: vec![46],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &[InterfaceSnapshot {
+            name: "reth1.0".into(),
+            ifindex: meta.ingress_ifindex as i32,
+            filter_input_v4: "lan-drop-ef".into(),
+            ..Default::default()
+        }],
+        "",
+        "",
+    );
+
+    let entry = FlowCacheEntry::from_forward_decision(
+        &flow,
+        meta,
+        validation,
+        decision,
+        1,
+        Some(TEST_TRUST_ZONE_ID),
+        Some(7),
+        None,
+        &forwarding,
+        &ha_state,
+        false,
+        &rg_epochs,
+    );
+
+    assert!(
+        entry.is_none(),
+        "DSCP-matched input filters depend on per-packet state outside \
+         the flow-cache key",
+    );
 }
 
 /// Build a self-consistent v6-meta + v6-NAT scenario for the
