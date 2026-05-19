@@ -33,6 +33,12 @@ sync.
   non-PBR input/output/lo0 filter logs. Output filter-log identity is
   carried through live TX selection and cached forwarding so flow-cache
   hits emit the same compiled filter/term/action metadata as live paths.
+  Terminal output `discard`/`reject` terms are carried in the TX selection
+  descriptor and drop before enqueue; filter-log deny records must not
+  describe traffic that still forwards. DSCP-matched input/output filters
+  are intentionally not flow-cached because DSCP is packet metadata, not
+  part of the session cache key; session hits re-evaluate DSCP-sensitive
+  input filters per packet.
   Producers must use the event-stream worker handle so rate limiting,
   queue-budget accounting, replay, and daemon callback ACK behavior stay
   centralized in `event_stream/`.

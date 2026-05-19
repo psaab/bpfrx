@@ -948,6 +948,26 @@ impl SessionTable {
         });
     }
 
+    pub fn emit_close_delta_with_origin(
+        &mut self,
+        key: SessionKey,
+        decision: SessionDecision,
+        metadata: SessionMetadata,
+        origin: SessionOrigin,
+    ) {
+        if metadata.is_reverse {
+            return;
+        }
+        self.push_delta(SessionDelta {
+            kind: SessionDeltaKind::Close,
+            key,
+            decision,
+            metadata,
+            origin,
+            fabric_redirect_sync: false,
+        });
+    }
+
     pub fn delete(&mut self, key: &SessionKey) {
         self.remove_entry(key);
     }

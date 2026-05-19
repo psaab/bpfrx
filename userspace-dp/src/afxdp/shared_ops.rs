@@ -352,8 +352,10 @@ impl ResolvedSessionLookup {
 
 #[derive(Clone, Debug)]
 pub(super) struct ResolvedFlowSessionDecision {
+    pub(super) key: SessionKey,
     pub(super) decision: SessionDecision,
     pub(super) metadata: SessionMetadata,
+    pub(super) origin: SessionOrigin,
     pub(super) created: bool,
 }
 

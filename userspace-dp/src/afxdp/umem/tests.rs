@@ -1473,6 +1473,7 @@ fn active_flow_debug_test_entry(
             tx_selection: CachedTxSelectionDescriptor {
                 queue_id: Some(2),
                 dscp_rewrite: Some(46),
+                drop: false,
                 filter_counter: None,
                 three_color_policers: crate::filter::CachedThreeColorPolicers::default(),
                 filter_log: None,

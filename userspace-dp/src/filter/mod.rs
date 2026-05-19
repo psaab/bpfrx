@@ -37,7 +37,10 @@ pub(crate) enum FilterAction {
     Accept,
     /// Silently drop the packet.
     Discard,
-    /// Drop with ICMP unreachable.
+    /// Request reject behavior.
+    ///
+    /// Callers that cannot synthesize the reject packet must fail closed as a
+    /// silent drop and must not log that an ICMP/RST reject was generated.
     Reject,
 }
 
@@ -110,6 +113,8 @@ pub(crate) struct Filter {
     pub(crate) affects_route_lookup: bool,
     pub(crate) has_counter_terms: bool,
     pub(crate) has_log_terms: bool,
+    pub(crate) has_terminal_action_terms: bool,
+    pub(crate) has_dscp_match_terms: bool,
     pub(crate) has_three_color_policer_terms: bool,
 }
 
@@ -263,6 +268,20 @@ impl ThreeColorPolicerRuntime {
             .is_some_and(|state| state.same_runtime_shape(next_shape))
     }
 
+    pub(crate) fn same_runtime_shape_as(&self, other: &Self) -> bool {
+        if self.id != other.id || self.name != other.name {
+            return false;
+        }
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        other
+            .state
+            .lock()
+            .ok()
+            .is_some_and(|other| state.same_runtime_shape(&other))
+    }
+
     pub(crate) fn status(&self) -> crate::protocol::ThreeColorPolicerStatus {
         let (mode, color_blind) = self
             .state
@@ -400,6 +419,8 @@ pub(crate) struct FilterState {
     pub(crate) has_input_three_color_policer_v4: bool,
     /// Per-interface inet input filters that can affect route-table selection.
     pub(crate) iface_filter_v4_affects_route_lookup: rustc_hash::FxHashSet<i32>,
+    /// Per-interface inet input filters with DSCP match terms.
+    pub(crate) iface_filter_v4_has_dscp_match: rustc_hash::FxHashSet<i32>,
     /// Per-interface (ifindex) input filter key for inet6.
     pub(crate) iface_filter_v6: rustc_hash::FxHashMap<i32, String>,
     /// Direct per-interface inet6 filter reference for packet hot-path evaluation.
@@ -412,6 +433,8 @@ pub(crate) struct FilterState {
     pub(crate) has_input_three_color_policer_v6: bool,
     /// Per-interface inet6 input filters that can affect route-table selection.
     pub(crate) iface_filter_v6_affects_route_lookup: rustc_hash::FxHashSet<i32>,
+    /// Per-interface inet6 input filters with DSCP match terms.
+    pub(crate) iface_filter_v6_has_dscp_match: rustc_hash::FxHashSet<i32>,
     /// Per-interface (ifindex) output filter key for inet.
     pub(crate) iface_filter_out_v4: rustc_hash::FxHashMap<i32, String>,
     /// Direct per-interface inet output filter reference for packet hot-path evaluation.
@@ -480,16 +503,18 @@ pub(crate) struct FilterLogMatch {
     pub(crate) action: FilterAction,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct TxSelectionFilterResult<'a> {
+    pub(crate) action: FilterAction,
     pub(crate) forwarding_class: Option<&'a str>,
     pub(crate) dscp_rewrite: Option<u8>,
     pub(crate) policer_drop: bool,
     pub(crate) log_match: Option<FilterLogMatch>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct CachedTxSelectionFilterResult {
+    pub(crate) action: FilterAction,
     pub(crate) forwarding_class: Option<Arc<str>>,
     pub(crate) dscp_rewrite: Option<u8>,
     pub(crate) counter: Option<Arc<FilterTermCounter>>,
@@ -512,6 +537,31 @@ impl Default for FilterResult {
             routing_instance: String::new(),
             forwarding_class: Arc::<str>::from(""),
             log: false,
+            log_match: None,
+        }
+    }
+}
+
+impl Default for TxSelectionFilterResult<'_> {
+    fn default() -> Self {
+        Self {
+            action: FilterAction::Accept,
+            forwarding_class: None,
+            dscp_rewrite: None,
+            policer_drop: false,
+            log_match: None,
+        }
+    }
+}
+
+impl Default for CachedTxSelectionFilterResult {
+    fn default() -> Self {
+        Self {
+            action: FilterAction::Accept,
+            forwarding_class: None,
+            dscp_rewrite: None,
+            counter: None,
+            three_color_policers: CachedThreeColorPolicers::default(),
             log_match: None,
         }
     }

@@ -1728,3 +1728,192 @@ fn dscp_match_in_term() {
     );
     assert_eq!(result.action, FilterAction::Discard);
 }
+
+#[test]
+fn input_dscp_filter_families_changed_detects_same_ifindex_content_change() {
+    let iface = crate::InterfaceSnapshot {
+        name: "reth1.0".into(),
+        ifindex: 10,
+        filter_input_v4: "dscp-filter".into(),
+        ..Default::default()
+    };
+    let old = make_filter_state_with_interfaces(
+        &[FirewallFilterSnapshot {
+            name: "dscp-filter".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "dscp-term".into(),
+                dscp_values: vec![0],
+                action: "accept".into(),
+                ..Default::default()
+            }],
+        }],
+        std::slice::from_ref(&iface),
+    );
+    let new = make_filter_state_with_interfaces(
+        &[FirewallFilterSnapshot {
+            name: "dscp-filter".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "dscp-term".into(),
+                dscp_values: vec![46],
+                action: "discard".into(),
+                log: true,
+                ..Default::default()
+            }],
+        }],
+        &[iface],
+    );
+
+    assert_eq!(
+        input_dscp_filter_families_changed(&old, &new),
+        (true, false)
+    );
+}
+
+#[test]
+fn input_dscp_filter_families_changed_ignores_unchanged_filter() {
+    let iface = crate::InterfaceSnapshot {
+        name: "reth1.0".into(),
+        ifindex: 10,
+        filter_input_v4: "dscp-filter".into(),
+        ..Default::default()
+    };
+    let filter = FirewallFilterSnapshot {
+        name: "dscp-filter".into(),
+        family: "inet".into(),
+        terms: vec![FirewallTermSnapshot {
+            name: "dscp-term".into(),
+            dscp_values: vec![46],
+            action: "discard".into(),
+            log: true,
+            ..Default::default()
+        }],
+    };
+    let old = make_filter_state_with_interfaces(
+        std::slice::from_ref(&filter),
+        std::slice::from_ref(&iface),
+    );
+    let new = make_filter_state_with_interfaces(&[filter], &[iface]);
+
+    assert_eq!(
+        input_dscp_filter_families_changed(&old, &new),
+        (false, false)
+    );
+}
+
+#[test]
+fn input_dscp_filter_families_changed_ignores_positional_filter_id_change() {
+    let iface = crate::InterfaceSnapshot {
+        name: "reth1.0".into(),
+        ifindex: 10,
+        filter_input_v4: "dscp-filter".into(),
+        ..Default::default()
+    };
+    let unrelated = FirewallFilterSnapshot {
+        name: "unrelated".into(),
+        family: "inet".into(),
+        terms: vec![FirewallTermSnapshot {
+            name: "accept".into(),
+            action: "accept".into(),
+            ..Default::default()
+        }],
+    };
+    let dscp_filter = FirewallFilterSnapshot {
+        name: "dscp-filter".into(),
+        family: "inet".into(),
+        terms: vec![FirewallTermSnapshot {
+            name: "dscp-term".into(),
+            dscp_values: vec![46],
+            action: "discard".into(),
+            log: true,
+            ..Default::default()
+        }],
+    };
+    let old = make_filter_state_with_interfaces(
+        &[unrelated.clone(), dscp_filter.clone()],
+        std::slice::from_ref(&iface),
+    );
+    let new = make_filter_state_with_interfaces(&[dscp_filter, unrelated], &[iface]);
+
+    assert_ne!(
+        old.iface_filter_v4_fast.get(&10).unwrap().id,
+        new.iface_filter_v4_fast.get(&10).unwrap().id,
+        "test setup must shift the compiler-positional filter id"
+    );
+    assert_eq!(
+        input_dscp_filter_families_changed(&old, &new),
+        (false, false)
+    );
+}
+
+#[test]
+fn input_dscp_filter_families_changed_detects_three_color_shape_change() {
+    let iface = crate::InterfaceSnapshot {
+        name: "reth1.0".into(),
+        ifindex: 10,
+        filter_input_v4: "dscp-filter".into(),
+        ..Default::default()
+    };
+    let filters = [FirewallFilterSnapshot {
+        name: "dscp-filter".into(),
+        family: "inet".into(),
+        terms: vec![FirewallTermSnapshot {
+            name: "dscp-term".into(),
+            dscp_values: vec![46],
+            action: "accept".into(),
+            policer: "stable-pol".into(),
+            ..Default::default()
+        }],
+    }];
+    let original = [ThreeColorPolicerSnapshot {
+        name: "stable-pol".into(),
+        mode: "single-rate".into(),
+        color_blind: true,
+        committed_rate_bytes_per_sec: 1,
+        committed_burst_bytes: 100,
+        peak_or_excess_burst_bytes: 50,
+        then_action: "discard".into(),
+        ..Default::default()
+    }];
+    let changed = [ThreeColorPolicerSnapshot {
+        committed_burst_bytes: 200,
+        ..original[0].clone()
+    }];
+
+    let old = parse_filter_state_with_three_color(
+        &filters,
+        &[],
+        &original,
+        std::slice::from_ref(&iface),
+        "",
+        "",
+    );
+    let new = parse_filter_state_with_three_color_preserving(
+        &filters,
+        &[],
+        &changed,
+        &[iface],
+        "",
+        "",
+        Some(&old),
+    );
+
+    assert!(
+        !std::sync::Arc::ptr_eq(
+            old.iface_filter_v4_fast.get(&10).unwrap().terms[0]
+                .three_color_policer
+                .as_ref()
+                .unwrap(),
+            new.iface_filter_v4_fast.get(&10).unwrap().terms[0]
+                .three_color_policer
+                .as_ref()
+                .unwrap(),
+        ),
+        "test setup must create a new runtime for the changed policer shape"
+    );
+    assert_eq!(
+        input_dscp_filter_families_changed(&old, &new),
+        (true, false)
+    );
+}

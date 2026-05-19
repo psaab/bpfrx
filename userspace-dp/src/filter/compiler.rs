@@ -105,6 +105,10 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
             affects_route_lookup: terms.iter().any(|term| !term.routing_instance.is_empty()),
             has_counter_terms: terms.iter().any(|term| term.has_count),
             has_log_terms: terms.iter().any(|term| term.log),
+            has_terminal_action_terms: terms
+                .iter()
+                .any(|term| term.action != FilterAction::Accept),
+            has_dscp_match_terms: terms.iter().any(|term| term.dscp_match_enabled),
             has_three_color_policer_terms: terms
                 .iter()
                 .any(|term| term.three_color_policer.is_some()),
@@ -135,6 +139,9 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
                         .iface_filter_v4_affects_route_lookup
                         .insert(iface.ifindex);
                 }
+                if filter.has_dscp_match_terms {
+                    state.iface_filter_v4_has_dscp_match.insert(iface.ifindex);
+                }
                 state
                     .iface_filter_v4_fast
                     .insert(iface.ifindex, filter.clone());
@@ -147,6 +154,7 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
                 if filter.affects_tx_selection
                     || filter.has_counter_terms
                     || filter.has_log_terms
+                    || filter.has_terminal_action_terms
                     || filter.has_three_color_policer_terms
                 {
                     state
@@ -179,6 +187,9 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
                         .iface_filter_v6_affects_route_lookup
                         .insert(iface.ifindex);
                 }
+                if filter.has_dscp_match_terms {
+                    state.iface_filter_v6_has_dscp_match.insert(iface.ifindex);
+                }
                 state
                     .iface_filter_v6_fast
                     .insert(iface.ifindex, filter.clone());
@@ -191,6 +202,7 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
                 if filter.affects_tx_selection
                     || filter.has_counter_terms
                     || filter.has_log_terms
+                    || filter.has_terminal_action_terms
                     || filter.has_three_color_policer_terms
                 {
                     state

@@ -32,6 +32,7 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
         return CachedTxSelectionDescriptor {
             queue_id: iface.map(|iface| iface.default_queue),
             dscp_rewrite: None,
+            drop: false,
             filter_counter: None,
             three_color_policers: crate::filter::CachedThreeColorPolicers::default(),
             filter_log: None,
@@ -77,6 +78,7 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
             filter.affects_tx_selection
                 || filter.has_counter_terms
                 || filter.has_log_terms
+                || filter.has_terminal_action_terms
                 || filter.has_three_color_policer_terms
         })
         .map(|filter| {
@@ -156,6 +158,7 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
     CachedTxSelectionDescriptor {
         queue_id,
         dscp_rewrite: effective_dscp_rewrite,
+        drop: output_result.action != crate::filter::FilterAction::Accept,
         filter_counter,
         three_color_policers,
         filter_log,
@@ -288,6 +291,7 @@ fn resolve_cos_tx_selection_internal(
         filter.affects_tx_selection
             || filter.has_counter_terms
             || filter.has_log_terms
+            || filter.has_terminal_action_terms
             || filter.has_three_color_policer_terms
     }) {
         if let Some(now_ns) = now_ns {
@@ -318,7 +322,8 @@ fn resolve_cos_tx_selection_internal(
         crate::filter::TxSelectionFilterResult::default()
     };
     let mut effective_dscp_rewrite = output_result.dscp_rewrite;
-    let mut policer_drop = output_result.policer_drop;
+    let mut drop =
+        output_result.policer_drop || output_result.action != crate::filter::FilterAction::Accept;
     let mut ingress_forwarding_class = None;
     let filter_log = output_result.log_match;
     if let Some(ingress_filter) = ingress_filter.filter(|filter| {
@@ -349,7 +354,7 @@ fn resolve_cos_tx_selection_internal(
             )
         };
         effective_dscp_rewrite = effective_dscp_rewrite.or(ingress_result.dscp_rewrite);
-        policer_drop |= ingress_result.policer_drop;
+        drop |= ingress_result.policer_drop;
         if !has_output_filter {
             ingress_forwarding_class = ingress_result.forwarding_class;
         }
@@ -358,7 +363,7 @@ fn resolve_cos_tx_selection_internal(
         return CoSTxSelection {
             queue_id: None,
             dscp_rewrite: effective_dscp_rewrite,
-            drop: policer_drop,
+            drop,
             filter_log,
         };
     };
@@ -367,7 +372,7 @@ fn resolve_cos_tx_selection_internal(
             return CoSTxSelection {
                 queue_id: Some(*queue_id),
                 dscp_rewrite: effective_dscp_rewrite,
-                drop: policer_drop,
+                drop,
                 filter_log,
             };
         }
@@ -377,7 +382,7 @@ fn resolve_cos_tx_selection_internal(
             return CoSTxSelection {
                 queue_id: Some(*queue_id),
                 dscp_rewrite: effective_dscp_rewrite,
-                drop: policer_drop,
+                drop,
                 filter_log,
             };
         }
@@ -386,7 +391,7 @@ fn resolve_cos_tx_selection_internal(
         return CoSTxSelection {
             queue_id: Some(queue_id),
             dscp_rewrite: effective_dscp_rewrite,
-            drop: policer_drop,
+            drop,
             filter_log,
         };
     }
@@ -398,14 +403,14 @@ fn resolve_cos_tx_selection_internal(
         return CoSTxSelection {
             queue_id: Some(queue_id),
             dscp_rewrite: effective_dscp_rewrite,
-            drop: policer_drop,
+            drop,
             filter_log,
         };
     }
     CoSTxSelection {
         queue_id: Some(iface.default_queue),
         dscp_rewrite: effective_dscp_rewrite,
-        drop: policer_drop,
+        drop,
         filter_log,
     }
 }

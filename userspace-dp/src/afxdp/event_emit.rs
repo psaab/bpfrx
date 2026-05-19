@@ -1,6 +1,6 @@
 use super::*;
-use crate::event_stream::codec::{DataplaneEventKind, DataplaneEventPayload};
 use crate::event_stream::EventStreamWorkerHandle;
+use crate::event_stream::codec::{DataplaneEventKind, DataplaneEventPayload};
 use crate::filter::FilterAction;
 use crate::policy::PolicyAction;
 use crate::screen::ScreenPacketInfo;
@@ -192,7 +192,10 @@ fn policy_action_to_rt_flow(action: PolicyAction) -> u8 {
     match action {
         PolicyAction::Permit => RT_FLOW_ACTION_PERMIT,
         PolicyAction::Deny => RT_FLOW_ACTION_DENY,
-        PolicyAction::Reject => RT_FLOW_ACTION_REJECT,
+        // Userspace policy reject is currently fail-closed as a terminal
+        // drop. Until policy-deny paths synthesize ICMP/RST rejects, log
+        // deny rather than claiming a reject packet was generated.
+        PolicyAction::Reject => RT_FLOW_ACTION_DENY,
     }
 }
 
@@ -201,7 +204,10 @@ fn filter_action_to_rt_flow(action: FilterAction) -> u8 {
     match action {
         FilterAction::Accept => RT_FLOW_ACTION_PERMIT,
         FilterAction::Discard => RT_FLOW_ACTION_DENY,
-        FilterAction::Reject => RT_FLOW_ACTION_REJECT,
+        // Userspace filter reject is currently fail-closed as a terminal
+        // drop. Until per-path reject packet synthesis is wired, RT_FLOW
+        // must report deny rather than claiming an ICMP/RST reject happened.
+        FilterAction::Reject => RT_FLOW_ACTION_DENY,
     }
 }
 
@@ -326,6 +332,34 @@ mod tests {
     }
 
     #[test]
+    fn policy_deny_event_emit_fails_closed_reject_as_deny() {
+        let (handle, rx) = unlimited_handle();
+        let flow = test_flow();
+
+        emit_policy_deny_event(
+            Some(&handle),
+            &flow,
+            test_meta(),
+            7,
+            9,
+            3,
+            101,
+            PolicyAction::Reject,
+            123,
+        );
+
+        let event = rx
+            .try_recv()
+            .expect("policy event frame")
+            .decode_dataplane_event()
+            .expect("policy event payload");
+        assert_eq!(event.kind, DataplaneEventKind::PolicyDeny);
+        assert_eq!(event.action, RT_FLOW_ACTION_DENY);
+        assert_eq!(event.reason, RT_FLOW_CLOSE_REASON_POLICY);
+        assert_eq!(handle.dataplane_event_stats().policy_deny.sent, 1);
+    }
+
+    #[test]
     fn screen_drop_event_emit_uses_screen_reason_flag() {
         let (handle, rx) = unlimited_handle();
         let pkt = ScreenPacketInfo {
@@ -427,6 +461,37 @@ mod tests {
         assert_eq!(event.reason, FilterLogSource::Input.wire_reason());
         assert_eq!(event.ingress_zone_id, 7);
         assert_eq!(event.egress_zone_id, 0);
+        assert_eq!(handle.dataplane_event_stats().filter_log.sent, 1);
+    }
+
+    #[test]
+    fn filter_log_event_emit_fails_closed_reject_as_deny() {
+        let (handle, rx) = unlimited_handle();
+        let flow = test_flow();
+
+        emit_filter_log_event(
+            Some(&handle),
+            &flow,
+            test_meta(),
+            7,
+            0,
+            23,
+            6,
+            FilterAction::Reject,
+            FilterLogSource::Lo0,
+            789,
+        );
+
+        let event = rx
+            .try_recv()
+            .expect("filter event frame")
+            .decode_dataplane_event()
+            .expect("filter event payload");
+        assert_eq!(event.kind, DataplaneEventKind::FilterLog);
+        assert_eq!(event.action, RT_FLOW_ACTION_DENY);
+        assert_eq!(event.filter_id, 23);
+        assert_eq!(event.term_id, 6);
+        assert_eq!(event.reason, FilterLogSource::Lo0.wire_reason());
         assert_eq!(handle.dataplane_event_stats().filter_log.sent, 1);
     }
 }

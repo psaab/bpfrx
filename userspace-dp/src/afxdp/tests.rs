@@ -257,6 +257,122 @@ fn build_live_forward_request_from_frame_uses_precomputed_hints() {
 }
 
 #[test]
+fn build_live_forward_request_from_frame_drops_logged_output_filter_discard() {
+    let lookup = WorkerBindingLookup::default();
+    let ingress_ident = BindingIdentity {
+        slot: 7,
+        queue_id: 3,
+        worker_id: 0,
+        interface: Arc::<str>::from("ge-0-0-1"),
+        ifindex: 10,
+    };
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 10,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        pkt_len: 60,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 80,
+        },
+        nat: NatDecision::default(),
+    };
+    let flow = SessionFlow {
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 12345,
+            dst_port: 443,
+        },
+    };
+    let forwarding = build_forwarding_state(&ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 12,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-drop".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-drop".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-web".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                action: "discard".into(),
+                log: true,
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    });
+    let (event_handle, event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+
+    let req = build_live_forward_request_from_frame(
+        &lookup,
+        2,
+        &ingress_ident,
+        XdpDesc {
+            addr: 0,
+            len: 0,
+            options: 0,
+        },
+        &[],
+        meta,
+        &decision,
+        &forwarding,
+        Some(&flow),
+        None,
+        false,
+        123,
+        Some(&event_handle),
+        None,
+        None,
+    );
+
+    assert!(req.is_none(), "terminal output filter must not forward");
+    let event = event_rx
+        .try_recv()
+        .expect("output filter-log frame")
+        .decode_dataplane_event()
+        .expect("filter-log payload");
+    assert_eq!(
+        event.kind,
+        crate::event_stream::codec::DataplaneEventKind::FilterLog
+    );
+    assert_eq!(event.action, 0, "discard must encode RT_FLOW deny");
+    assert_eq!(
+        event.reason,
+        FilterLogSource::Output.wire_reason(),
+        "live output filter source must not be mislabeled",
+    );
+}
+
+#[test]
 fn icmp_reverse_key_keeps_identifier_position() {
     let flow = SessionFlow {
         src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
@@ -2539,6 +2655,15 @@ fn build_policy_deny_tcp_syn_frame() -> Vec<u8> {
     frame
 }
 
+fn set_ipv4_dst(frame: &mut [u8], dst: Ipv4Addr) {
+    frame[24] = 0;
+    frame[25] = 0;
+    frame[30..34].copy_from_slice(&dst.octets());
+    let ip_sum = checksum16(&frame[14..34]);
+    frame[24] = (ip_sum >> 8) as u8;
+    frame[25] = ip_sum as u8;
+}
+
 #[test]
 fn poll_descriptor_policy_deny_path_emits_rt_flow_event() {
     let mut snapshot = policy_deny_snapshot();
@@ -3053,6 +3178,618 @@ fn poll_descriptor_input_filter_discard_drops_and_logs() {
     assert_eq!(event.ingress_zone_id, TEST_LAN_ZONE_ID);
     assert!(binding.scratch.scratch_forwards.is_empty());
     assert_eq!(sessions.len(), 0);
+    assert_eq!(event_handle.dataplane_event_stats().filter_log.sent, 1);
+}
+
+#[test]
+fn poll_descriptor_session_hit_rechecks_dscp_input_filter() {
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.default_policy = "permit".to_string();
+    snapshot.policies.clear();
+    snapshot.zones = vec![
+        ZoneSnapshot {
+            name: "lan".to_string(),
+            id: TEST_LAN_ZONE_ID,
+        },
+        ZoneSnapshot {
+            name: "wan".to_string(),
+            id: TEST_WAN_ZONE_ID,
+        },
+    ];
+    snapshot.interfaces[0].filter_input_v4 = "drop-ef-input".to_string();
+    snapshot.filters = vec![FirewallFilterSnapshot {
+        name: "drop-ef-input".to_string(),
+        family: "inet".to_string(),
+        terms: vec![FirewallTermSnapshot {
+            name: "drop-ef-web".to_string(),
+            action: "discard".to_string(),
+            destination_ports: vec!["5201".to_string()],
+            dscp_values: vec![46],
+            log: true,
+            ..Default::default()
+        }],
+    }];
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut frame = build_policy_deny_tcp_syn_frame();
+    frame[47] = 0x10;
+    let meta_len = std::mem::size_of::<UserspaceDpMeta>();
+    let frame_offset = 128;
+    let meta_offset = frame_offset - meta_len;
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: meta_len as u16,
+        ingress_ifindex: 24,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 54,
+        pkt_len: (frame.len() - 14) as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        dscp: 46,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    };
+    let meta_bytes = unsafe {
+        std::slice::from_raw_parts((&meta as *const UserspaceDpMeta).cast::<u8>(), meta_len)
+    };
+    unsafe {
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(meta_offset, meta_len)
+            .expect("meta slice")
+            .copy_from_slice(meta_bytes);
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(frame_offset, frame.len())
+            .expect("frame slice")
+            .copy_from_slice(&frame);
+    }
+    binding.xsk.rx.push_for_test(XdpDesc {
+        addr: frame_offset as u64,
+        len: frame.len() as u32,
+        options: 0,
+    });
+
+    let ident = binding.identity();
+    let binding_lookup = WorkerBindingLookup::from_bindings(std::slice::from_ref(&binding));
+    let mirror_targets = MirrorTargetMap::default();
+    let ha_state = BTreeMap::new();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let last_resolution = Arc::new(Mutex::new(None));
+    let peer_worker_commands = Vec::new();
+    let dnat_fds = DnatTableFds::default();
+    let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+    let (event_handle, event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let worker_ctx = WorkerContext {
+        ident: &ident,
+        binding_lookup: &binding_lookup,
+        mirror_targets: &mirror_targets,
+        forwarding: &forwarding,
+        ha_state: &ha_state,
+        dynamic_neighbors: &dynamic_neighbors,
+        shared_sessions: &shared_sessions,
+        shared_nat_sessions: &shared_nat_sessions,
+        shared_forward_wire_sessions: &shared_forward_wire_sessions,
+        shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        slow_path: None,
+        event_stream: Some(&event_handle),
+        local_tunnel_deliveries: &local_tunnel_deliveries,
+        recent_exceptions: &recent_exceptions,
+        last_resolution: &last_resolution,
+        peer_worker_commands: &peer_worker_commands,
+        dnat_fds: &dnat_fds,
+        rg_epochs: &rg_epochs,
+    };
+    let mut sessions = SessionTable::new();
+    let flow_key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 12345,
+        dst_port: 5201,
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 12,
+            tunnel_endpoint_id: 0,
+            next_hop: None,
+            neighbor_mac: Some([0, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 80,
+        },
+        nat: NatDecision::default(),
+    };
+    let metadata = SessionMetadata {
+        ingress_zone: TEST_LAN_ZONE_ID,
+        egress_zone: TEST_WAN_ZONE_ID,
+        owner_rg_id: 0,
+        fabric_ingress: false,
+        is_reverse: false,
+        nat64_reverse: None,
+    };
+    assert!(sessions.install_with_protocol_with_origin(
+        flow_key.clone(),
+        decision,
+        metadata,
+        SessionOrigin::ForwardFlow,
+        123_000_000_000,
+        PROTO_TCP,
+        0x10,
+    ));
+    assert_eq!(sessions.drain_deltas(16).len(), 1, "initial open delta");
+    let mut screen = ScreenState::new();
+    let mut batch = BatchCounters::default();
+    let mut dbg = DebugPollCounters::default();
+    let mut telemetry = TelemetryContext {
+        dbg: &mut dbg,
+        counters: &mut batch,
+    };
+    let area_ptr = binding.umem.area() as *const MmapArea;
+
+    poll_binding_process_descriptor(
+        &mut binding,
+        0,
+        area_ptr,
+        1,
+        &mut sessions,
+        &mut screen,
+        ValidationState {
+            snapshot_installed: true,
+            config_generation: 7,
+            fib_generation: 9,
+        },
+        123_000_000_000,
+        123,
+        0,
+        0,
+        -1,
+        -1,
+        &worker_ctx,
+        &mut telemetry,
+    );
+
+    let event = event_rx
+        .try_recv()
+        .expect("DSCP input filter-log event from session hit")
+        .decode_dataplane_event()
+        .expect("DSCP input filter-log payload");
+    assert_eq!(event.reason, FilterLogSource::Input.wire_reason());
+    assert_eq!(event.action, 0);
+    assert_eq!(event.ingress_zone_id, TEST_LAN_ZONE_ID);
+    assert!(binding.scratch.scratch_forwards.is_empty());
+    assert_eq!(sessions.len(), 1, "per-packet input drop keeps session");
+    assert_eq!(event_handle.dataplane_event_stats().filter_log.sent, 1);
+}
+
+#[test]
+fn poll_descriptor_lo0_filter_discard_drops_without_reinject() {
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.default_policy = "permit".to_string();
+    snapshot.policies.clear();
+    snapshot.zones = vec![
+        ZoneSnapshot {
+            name: "lan".to_string(),
+            id: TEST_LAN_ZONE_ID,
+        },
+        ZoneSnapshot {
+            name: "wan".to_string(),
+            id: TEST_WAN_ZONE_ID,
+        },
+    ];
+    snapshot.interfaces[0].addresses = vec![InterfaceAddressSnapshot {
+        family: "inet".to_string(),
+        address: "10.0.61.1/24".to_string(),
+        scope: 0,
+    }];
+    snapshot.flow.lo0_filter_input_v4 = "protect-re".to_string();
+    snapshot.filters = vec![FirewallFilterSnapshot {
+        name: "protect-re".to_string(),
+        family: "inet".to_string(),
+        terms: vec![FirewallTermSnapshot {
+            name: "drop-web".to_string(),
+            action: "discard".to_string(),
+            destination_ports: vec!["5201".to_string()],
+            log: true,
+            ..Default::default()
+        }],
+    }];
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut frame = build_policy_deny_tcp_syn_frame();
+    set_ipv4_dst(&mut frame, Ipv4Addr::new(10, 0, 61, 1));
+    let meta_len = std::mem::size_of::<UserspaceDpMeta>();
+    let frame_offset = 128;
+    let meta_offset = frame_offset - meta_len;
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: meta_len as u16,
+        ingress_ifindex: 24,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 54,
+        pkt_len: (frame.len() - 14) as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_SYN,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    };
+    let meta_bytes = unsafe {
+        std::slice::from_raw_parts((&meta as *const UserspaceDpMeta).cast::<u8>(), meta_len)
+    };
+    unsafe {
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(meta_offset, meta_len)
+            .expect("meta slice")
+            .copy_from_slice(meta_bytes);
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(frame_offset, frame.len())
+            .expect("frame slice")
+            .copy_from_slice(&frame);
+    }
+    binding.xsk.rx.push_for_test(XdpDesc {
+        addr: frame_offset as u64,
+        len: frame.len() as u32,
+        options: 0,
+    });
+
+    let ident = binding.identity();
+    let binding_lookup = WorkerBindingLookup::from_bindings(std::slice::from_ref(&binding));
+    let mirror_targets = MirrorTargetMap::default();
+    let ha_state = BTreeMap::new();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let last_resolution = Arc::new(Mutex::new(None));
+    let peer_worker_commands = Vec::new();
+    let dnat_fds = DnatTableFds::default();
+    let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+    let (event_handle, event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let worker_ctx = WorkerContext {
+        ident: &ident,
+        binding_lookup: &binding_lookup,
+        mirror_targets: &mirror_targets,
+        forwarding: &forwarding,
+        ha_state: &ha_state,
+        dynamic_neighbors: &dynamic_neighbors,
+        shared_sessions: &shared_sessions,
+        shared_nat_sessions: &shared_nat_sessions,
+        shared_forward_wire_sessions: &shared_forward_wire_sessions,
+        shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        slow_path: None,
+        event_stream: Some(&event_handle),
+        local_tunnel_deliveries: &local_tunnel_deliveries,
+        recent_exceptions: &recent_exceptions,
+        last_resolution: &last_resolution,
+        peer_worker_commands: &peer_worker_commands,
+        dnat_fds: &dnat_fds,
+        rg_epochs: &rg_epochs,
+    };
+    let mut sessions = SessionTable::new();
+    let mut screen = ScreenState::new();
+    let mut batch = BatchCounters::default();
+    let mut dbg = DebugPollCounters::default();
+    let mut telemetry = TelemetryContext {
+        dbg: &mut dbg,
+        counters: &mut batch,
+    };
+    let area_ptr = binding.umem.area() as *const MmapArea;
+
+    poll_binding_process_descriptor(
+        &mut binding,
+        0,
+        area_ptr,
+        1,
+        &mut sessions,
+        &mut screen,
+        ValidationState {
+            snapshot_installed: true,
+            config_generation: 7,
+            fib_generation: 9,
+        },
+        123_000_000_000,
+        123,
+        0,
+        0,
+        -1,
+        -1,
+        &worker_ctx,
+        &mut telemetry,
+    );
+
+    let event = event_rx
+        .try_recv()
+        .expect("lo0 filter-log event from poll descriptor")
+        .decode_dataplane_event()
+        .expect("lo0 filter-log payload");
+    assert_eq!(
+        event.kind,
+        crate::event_stream::codec::DataplaneEventKind::FilterLog
+    );
+    assert_eq!(event.reason, FilterLogSource::Lo0.wire_reason());
+    assert_eq!(event.action, 0);
+    assert_eq!(event.ingress_zone_id, TEST_LAN_ZONE_ID);
+    assert!(binding.scratch.scratch_forwards.is_empty());
+    assert_eq!(sessions.len(), 0);
+    assert_eq!(binding.live.slow_path_drops.load(Ordering::Relaxed), 0);
+    assert!(recent_exceptions.lock().unwrap().is_empty());
+    assert_eq!(event_handle.dataplane_event_stats().filter_log.sent, 1);
+}
+
+#[test]
+fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.default_policy = "permit".to_string();
+    snapshot.policies.clear();
+    snapshot.zones = vec![
+        ZoneSnapshot {
+            name: "lan".to_string(),
+            id: TEST_LAN_ZONE_ID,
+        },
+        ZoneSnapshot {
+            name: "wan".to_string(),
+            id: TEST_WAN_ZONE_ID,
+        },
+    ];
+    snapshot.interfaces[0].addresses = vec![InterfaceAddressSnapshot {
+        family: "inet".to_string(),
+        address: "10.0.61.1/24".to_string(),
+        scope: 0,
+    }];
+    snapshot.flow.lo0_filter_input_v4 = "protect-re".to_string();
+    snapshot.filters = vec![FirewallFilterSnapshot {
+        name: "protect-re".to_string(),
+        family: "inet".to_string(),
+        terms: vec![FirewallTermSnapshot {
+            name: "drop-web".to_string(),
+            action: "discard".to_string(),
+            destination_ports: vec!["5201".to_string()],
+            log: true,
+            ..Default::default()
+        }],
+    }];
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut frame = build_policy_deny_tcp_syn_frame();
+    set_ipv4_dst(&mut frame, Ipv4Addr::new(10, 0, 61, 1));
+    let meta_len = std::mem::size_of::<UserspaceDpMeta>();
+    let frame_offset = 128;
+    let meta_offset = frame_offset - meta_len;
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: meta_len as u16,
+        ingress_ifindex: 24,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 54,
+        pkt_len: (frame.len() - 14) as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_SYN,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    };
+    let meta_bytes = unsafe {
+        std::slice::from_raw_parts((&meta as *const UserspaceDpMeta).cast::<u8>(), meta_len)
+    };
+    unsafe {
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(meta_offset, meta_len)
+            .expect("meta slice")
+            .copy_from_slice(meta_bytes);
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(frame_offset, frame.len())
+            .expect("frame slice")
+            .copy_from_slice(&frame);
+    }
+    binding.xsk.rx.push_for_test(XdpDesc {
+        addr: frame_offset as u64,
+        len: frame.len() as u32,
+        options: 0,
+    });
+
+    let ident = binding.identity();
+    let binding_lookup = WorkerBindingLookup::from_bindings(std::slice::from_ref(&binding));
+    let mirror_targets = MirrorTargetMap::default();
+    let ha_state = BTreeMap::new();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let last_resolution = Arc::new(Mutex::new(None));
+    let peer_worker_commands = Vec::new();
+    let dnat_fds = DnatTableFds::default();
+    let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+    let (event_handle, event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let worker_ctx = WorkerContext {
+        ident: &ident,
+        binding_lookup: &binding_lookup,
+        mirror_targets: &mirror_targets,
+        forwarding: &forwarding,
+        ha_state: &ha_state,
+        dynamic_neighbors: &dynamic_neighbors,
+        shared_sessions: &shared_sessions,
+        shared_nat_sessions: &shared_nat_sessions,
+        shared_forward_wire_sessions: &shared_forward_wire_sessions,
+        shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        slow_path: None,
+        event_stream: Some(&event_handle),
+        local_tunnel_deliveries: &local_tunnel_deliveries,
+        recent_exceptions: &recent_exceptions,
+        last_resolution: &last_resolution,
+        peer_worker_commands: &peer_worker_commands,
+        dnat_fds: &dnat_fds,
+        rg_epochs: &rg_epochs,
+    };
+    let mut sessions = SessionTable::new();
+    let flow_key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 1)),
+        src_port: 12345,
+        dst_port: 5201,
+    };
+    let local_decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::LocalDelivery,
+            local_ifindex: 24,
+            egress_ifindex: 24,
+            tx_ifindex: 24,
+            tunnel_endpoint_id: 0,
+            next_hop: None,
+            neighbor_mac: None,
+            src_mac: None,
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision::default(),
+    };
+    let local_metadata = SessionMetadata {
+        ingress_zone: TEST_LAN_ZONE_ID,
+        egress_zone: TEST_LAN_ZONE_ID,
+        owner_rg_id: 0,
+        fabric_ingress: false,
+        is_reverse: false,
+        nat64_reverse: None,
+    };
+    assert!(sessions.install_with_protocol_with_origin(
+        flow_key.clone(),
+        local_decision,
+        local_metadata.clone(),
+        SessionOrigin::LocalMiss,
+        123_000_000_000,
+        PROTO_TCP,
+        TCP_FLAG_SYN,
+    ));
+    let shared_entry = SyncedSessionEntry {
+        key: flow_key.clone(),
+        decision: local_decision,
+        metadata: local_metadata,
+        origin: SessionOrigin::LocalMiss,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_SYN,
+    };
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &shared_entry,
+    );
+    assert_eq!(sessions.drain_deltas(16).len(), 1, "initial open delta");
+    let mut screen = ScreenState::new();
+    let mut batch = BatchCounters::default();
+    let mut dbg = DebugPollCounters::default();
+    let mut telemetry = TelemetryContext {
+        dbg: &mut dbg,
+        counters: &mut batch,
+    };
+    let area_ptr = binding.umem.area() as *const MmapArea;
+
+    poll_binding_process_descriptor(
+        &mut binding,
+        0,
+        area_ptr,
+        1,
+        &mut sessions,
+        &mut screen,
+        ValidationState {
+            snapshot_installed: true,
+            config_generation: 7,
+            fib_generation: 9,
+        },
+        123_000_000_000,
+        123,
+        0,
+        0,
+        -1,
+        -1,
+        &worker_ctx,
+        &mut telemetry,
+    );
+
+    let event = event_rx
+        .try_recv()
+        .expect("lo0 filter-log event from cached local session hit")
+        .decode_dataplane_event()
+        .expect("lo0 filter-log payload");
+    assert_eq!(event.reason, FilterLogSource::Lo0.wire_reason());
+    assert_eq!(event.action, 0);
+    assert!(binding.scratch.scratch_forwards.is_empty());
+    assert_eq!(sessions.len(), 0);
+    assert!(shared_sessions.lock().expect("shared sessions").is_empty());
+    assert!(shared_nat_sessions.lock().expect("shared nat").is_empty());
+    assert!(
+        shared_forward_wire_sessions
+            .lock()
+            .expect("shared forward wire")
+            .is_empty()
+    );
+    let deltas = sessions.drain_deltas(16);
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0].kind, SessionDeltaKind::Close);
+    assert_eq!(deltas[0].key, flow_key);
+    assert_eq!(binding.live.slow_path_drops.load(Ordering::Relaxed), 0);
+    assert!(recent_exceptions.lock().unwrap().is_empty());
     assert_eq!(event_handle.dataplane_event_stats().filter_log.sent, 1);
 }
 

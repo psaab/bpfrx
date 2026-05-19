@@ -1371,6 +1371,110 @@ fn resolve_cos_tx_selection_counts_counter_only_output_filter_hits() {
 }
 
 #[test]
+fn resolve_cos_tx_selection_drops_terminal_output_filter_without_log() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-drop".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-drop".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-web".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let selection = resolve_cos_tx_selection(
+        &forwarding,
+        202,
+        UserspaceDpMeta {
+            ingress_ifindex: 5,
+            ingress_vlan_id: 0,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            dscp: 0,
+            pkt_len: 1514,
+            ..Default::default()
+        },
+        Some(&SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 12345,
+            dst_port: 443,
+        }),
+    );
+
+    assert!(selection.drop);
+    assert_eq!(selection.queue_id, None);
+    assert_eq!(selection.filter_log, None);
+}
+
+#[test]
+fn resolve_cos_tx_selection_drops_reject_output_filter_without_log() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-reject".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-reject".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "reject-web".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                action: "reject".into(),
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let selection = resolve_cos_tx_selection(
+        &forwarding,
+        202,
+        UserspaceDpMeta {
+            ingress_ifindex: 5,
+            ingress_vlan_id: 0,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            dscp: 0,
+            pkt_len: 1514,
+            ..Default::default()
+        },
+        Some(&SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 12345,
+            dst_port: 443,
+        }),
+    );
+
+    assert!(selection.drop);
+    assert_eq!(selection.queue_id, None);
+    assert_eq!(selection.filter_log, None);
+}
+
+#[test]
 fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filter_exists() {
     let snapshot = ConfigSnapshot {
         interfaces: vec![
