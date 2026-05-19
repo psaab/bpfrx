@@ -15,6 +15,10 @@ type policySchedulerActiveStateSetter interface {
 	SetPolicySchedulerActiveState(map[string]bool)
 }
 
+type policyScheduleStateUpdater interface {
+	UpdatePolicyScheduleState(*config.Config, map[string]bool)
+}
+
 // reconcilePolicySchedulerLocked runs under applySem. It makes the scheduler
 // lifecycle follow committed config instead of only daemon startup, and returns
 // the active-state map that must be used for the same apply transaction.
@@ -132,7 +136,7 @@ func (d *Daemon) publishPolicyScheduleState(epoch uint64, activeState map[string
 		return
 	}
 	d.seedPolicySchedulerActiveStateLocked(activeState)
-	d.legacyDP().UpdatePolicyScheduleState(cfg, activeState)
+	d.updatePolicyScheduleStateLocked(cfg, activeState)
 }
 
 func (d *Daemon) seedPolicySchedulerActiveStateLocked(activeState map[string]bool) {
@@ -141,5 +145,18 @@ func (d *Daemon) seedPolicySchedulerActiveStateLocked(activeState map[string]boo
 	}
 	if setter, ok := d.dp.(policySchedulerActiveStateSetter); ok {
 		setter.SetPolicySchedulerActiveState(activeState)
+	}
+}
+
+func (d *Daemon) updatePolicyScheduleStateLocked(cfg *config.Config, activeState map[string]bool) {
+	if d.dp == nil {
+		return
+	}
+	if updater, ok := d.dp.(policyScheduleStateUpdater); ok {
+		updater.UpdatePolicyScheduleState(cfg, activeState)
+		return
+	}
+	if lp := d.legacyDP(); lp != nil {
+		lp.UpdatePolicyScheduleState(cfg, activeState)
 	}
 }

@@ -12,6 +12,9 @@ changed.
 - `InterfaceConfig` — `networkd.go`. MAC, addresses, bonding, VLAN
   parent, VRF binding, description.
 - `New()` — `networkd.go`.
+- `NewInDir(dir)` — `networkd.go`. Test/offline renderer constructor that
+  writes xpf-managed files under a caller-provided directory instead of
+  `/etc/systemd/network`.
 - `Apply(...)` — `networkd.go`.
 - `Clear()` — `networkd.go`.
 - `FindExternallyManaged(dir string) map[string]bool` — `networkd.go`. Detects networkd files

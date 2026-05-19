@@ -123,7 +123,7 @@ func TestInjectPacketEmitOnWireFailsClosedBeforeHelperIPCWithoutTupleProtocol(t 
 		t.Fatalf("FindProcess: %v", err)
 	}
 	m := New()
-	m.inner = nil
+	m.bpfShim = nil
 	m.proc = &exec.Cmd{Process: proc}
 	m.cfg.ControlSocket = "/tmp/xpf-test-inject-packet-must-not-dial.sock"
 	m.lastStatus = ProcessStatus{}
@@ -156,7 +156,7 @@ func TestInjectPacketEmitOnWireRejectsLegacyRemoteRequestMetadata(t *testing.T) 
 		t.Fatalf("FindProcess: %v", err)
 	}
 	m := New()
-	m.inner = nil
+	m.bpfShim = nil
 	m.proc = &exec.Cmd{Process: proc}
 	m.cfg.ControlSocket = "/tmp/xpf-test-inject-packet-must-not-dial.sock"
 	m.lastStatus = ProcessStatus{

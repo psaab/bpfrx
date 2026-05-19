@@ -62,23 +62,23 @@ type userspaceLocalAddressEntry struct {
 }
 
 func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg config.UserspaceConfig) error {
-	ctrlMap := m.inner.Map("userspace_ctrl")
+	ctrlMap := m.bpfShim.Map("userspace_ctrl")
 	if ctrlMap == nil {
 		return errors.New("userspace_ctrl map not loaded")
 	}
-	bindingsMap := m.inner.Map("userspace_bindings")
+	bindingsMap := m.bpfShim.Map("userspace_bindings")
 	if bindingsMap == nil {
 		return errors.New("userspace_bindings map not loaded")
 	}
-	heartbeatMap := m.inner.Map("userspace_heartbeat")
+	heartbeatMap := m.bpfShim.Map("userspace_heartbeat")
 	if heartbeatMap == nil {
 		return errors.New("userspace_heartbeat map not loaded")
 	}
-	fallbackMap := m.inner.Map("userspace_fallback_progs")
+	fallbackMap := m.bpfShim.Map("userspace_fallback_progs")
 	if fallbackMap == nil {
 		return errors.New("userspace_fallback_progs map not loaded")
 	}
-	fallbackProg := m.inner.Program("xdp_main_prog")
+	fallbackProg := m.bpfShim.Program("xdp_main_prog")
 	if fallbackProg == nil {
 		return errors.New("xdp_main_prog not loaded")
 	}
@@ -144,7 +144,7 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 // instead of XDP_PASS, which is required for zero-copy AF_XDP (XDP_PASS in
 // zero-copy mode permanently leaks UMEM frames).
 func (m *Manager) setupUserspaceCPUMapLocked() bool {
-	cpuMap := m.inner.Map("userspace_cpumap")
+	cpuMap := m.bpfShim.Map("userspace_cpumap")
 	if cpuMap == nil {
 		slog.Warn("userspace_cpumap not found, zero-copy cpumap redirect disabled")
 		return false
@@ -173,11 +173,11 @@ func (m *Manager) setupUserspaceCPUMapLocked() bool {
 }
 
 func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
-	ctrlMap := m.inner.Map("userspace_ctrl")
+	ctrlMap := m.bpfShim.Map("userspace_ctrl")
 	if ctrlMap == nil {
 		return errors.New("userspace_ctrl map not loaded")
 	}
-	bindingsMap := m.inner.Map("userspace_bindings")
+	bindingsMap := m.bpfShim.Map("userspace_bindings")
 	if bindingsMap == nil {
 		return errors.New("userspace_bindings map not loaded")
 	}
@@ -187,7 +187,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 
 	// Preserve cpumap flag if cpumap is populated.
 	var ctrlFlags uint32
-	if cpuMap := m.inner.Map("userspace_cpumap"); cpuMap != nil {
+	if cpuMap := m.bpfShim.Map("userspace_cpumap"); cpuMap != nil {
 		ctrlFlags |= userspaceCtrlFlagCPUMap
 	}
 	if snapshotHasNativeGRE(m.lastSnapshot) {
@@ -295,7 +295,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			"lastXSKRX", m.lastXSKRX,
 			"neighborsPrewarmed", m.neighborsPrewarmed,
 			"xskLivenessFailed", m.xskLivenessFailed,
-			"xdpEntryProg", m.inner.XDPEntryProg)
+			"xdpEntryProg", m.bpfShim.XDPEntryProg)
 		if m.xskLivenessFailed {
 			// XSK proven broken — ctrl disabled.
 			// In compat mode, the entry program was already swapped to
@@ -306,23 +306,23 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		} else if probeBindingsReady && neighborSyncReady {
 			ctrl.Enabled = 1
 			if m.xskLivenessProven {
-				if m.inner.XDPEntryProg != "xdp_userspace_prog" {
-					if err := m.inner.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+				if m.bpfShim.XDPEntryProg != "xdp_userspace_prog" {
+					if err := m.bpfShim.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
 						slog.Warn("userspace: failed to restore XDP shim after liveness success", "err", err)
 					}
 				}
 			} else if xskReceiveLive {
 				m.xskLivenessProven = true
 				m.xskProbeStart = time.Time{}
-				if m.inner.XDPEntryProg != "xdp_userspace_prog" {
-					if err := m.inner.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+				if m.bpfShim.XDPEntryProg != "xdp_userspace_prog" {
+					if err := m.bpfShim.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
 						slog.Warn("userspace: failed to swap XDP shim after XSK RX became live", "err", err)
 					}
 				}
 				slog.Info("userspace: XSK liveness proven")
 			} else {
-				if m.inner.XDPEntryProg != "xdp_userspace_prog" {
-					if err := m.inner.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+				if m.bpfShim.XDPEntryProg != "xdp_userspace_prog" {
+					if err := m.bpfShim.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
 						slog.Warn("userspace: failed to activate XDP shim for XSK liveness probe", "err", err)
 					}
 				}
@@ -333,8 +333,8 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 					if m.shouldAutoProveIdleStandbyXSKLocked(currentRX, allBindingsBound) {
 						m.xskLivenessProven = true
 						m.xskProbeStart = time.Time{}
-						if m.inner.XDPEntryProg != "xdp_userspace_prog" {
-							if err := m.inner.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+						if m.bpfShim.XDPEntryProg != "xdp_userspace_prog" {
+							if err := m.bpfShim.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
 								slog.Warn("userspace: failed to restore XDP shim after idle standby liveness success", "err", err)
 							}
 						}
@@ -358,7 +358,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 						slog.Error("userspace: XSK liveness probe failed in strict mode — dataplane degraded, no eBPF fallback")
 					} else {
 						slog.Warn("userspace: XSK liveness probe failed, falling back to eBPF pipeline")
-						if err := m.inner.SwapXDPEntryProg("xdp_main_prog"); err != nil {
+						if err := m.bpfShim.SwapXDPEntryProg("xdp_main_prog"); err != nil {
 							slog.Warn("userspace: failed to swap to eBPF pipeline after XSK liveness failure", "err", err)
 						}
 					}
@@ -395,7 +395,7 @@ ctrlReady:
 	// at generation 1 indefinitely; later ctrl re-enables during RG moves
 	// would then retrigger the startup flush and destroy synced sessions.
 	if ctrl.Enabled == 1 && !m.ctrlWasEnabled && !m.initialCtrlCleanupDone {
-		if usMap := m.inner.Map("userspace_sessions"); usMap != nil {
+		if usMap := m.bpfShim.Map("userspace_sessions"); usMap != nil {
 			var key, nextKey []byte
 			key = make([]byte, usMap.KeySize())
 			nextKey = make([]byte, usMap.KeySize())
@@ -434,7 +434,7 @@ ctrlReady:
 		// nanoseconds, so convert to seconds for comparison.
 		cutoffSec := m.ctrlDisabledAt / 1_000_000_000
 		for _, mapName := range []string{"sessions", "sessions_v6"} {
-			if ctMap := m.inner.Map(mapName); ctMap != nil {
+			if ctMap := m.bpfShim.Map(mapName); ctMap != nil {
 				keySize := ctMap.KeySize()
 				valSize := ctMap.ValueSize()
 				var key, nextKey []byte
@@ -635,7 +635,7 @@ var fallbackReasonNames = [16]string{
 // and returns a map of reason name -> cumulative count. Entries with zero
 // count are omitted.
 func (m *Manager) readFallbackStatsLocked() map[string]uint64 {
-	statsMap := m.inner.Map("userspace_fallback_stats")
+	statsMap := m.bpfShim.Map("userspace_fallback_stats")
 	if statsMap == nil {
 		return nil
 	}
@@ -661,18 +661,18 @@ func (m *Manager) readFallbackStatsLocked() map[string]uint64 {
 }
 
 // entryProgramsLocked returns a map of ifindex -> attached XDP program name
-// by inspecting the inner dataplane manager's link state.
+// by inspecting the bpfShim dataplane manager's link state.
 // Note: VLAN sub-interfaces are skipped during SwapXDPEntryProg and may
 // retain the parent's program; they are excluded from this map.
 func (m *Manager) entryProgramsLocked() map[int]string {
-	links := m.inner.XDPLinks()
+	links := m.bpfShim.XDPLinks()
 	if len(links) == 0 {
 		return nil
 	}
-	progName := m.inner.XDPEntryProg
+	progName := m.bpfShim.XDPEntryProg
 	result := make(map[int]string, len(links))
 	for ifindex := range links {
-		if m.inner.VlanSubInterfaces[ifindex] {
+		if m.bpfShim.VlanSubInterfaces[ifindex] {
 			continue // VLAN sub-interfaces use parent's XDP program
 		}
 		result[ifindex] = progName
@@ -684,7 +684,7 @@ func (m *Manager) entryProgramsLocked() map[int]string {
 }
 
 func (m *Manager) syncIngressIfaceMapLocked(snapshot *ConfigSnapshot) error {
-	ifaceMap := m.inner.Map("userspace_ingress_ifaces")
+	ifaceMap := m.bpfShim.Map("userspace_ingress_ifaces")
 	if ifaceMap == nil {
 		return errors.New("userspace_ingress_ifaces map not loaded")
 	}
@@ -715,11 +715,11 @@ func (m *Manager) syncIngressIfaceMapLocked(snapshot *ConfigSnapshot) error {
 }
 
 func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
-	localV4Map := m.inner.Map("userspace_local_v4")
+	localV4Map := m.bpfShim.Map("userspace_local_v4")
 	if localV4Map == nil {
 		return errors.New("userspace_local_v4 map not loaded")
 	}
-	localV6Map := m.inner.Map("userspace_local_v6")
+	localV6Map := m.bpfShim.Map("userspace_local_v6")
 	if localV6Map == nil {
 		return errors.New("userspace_local_v6 map not loaded")
 	}
@@ -793,11 +793,11 @@ func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
 }
 
 func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) error {
-	natV4Map := m.inner.Map("userspace_interface_nat_v4")
+	natV4Map := m.bpfShim.Map("userspace_interface_nat_v4")
 	if natV4Map == nil {
 		return errors.New("userspace_interface_nat_v4 map not loaded")
 	}
-	natV6Map := m.inner.Map("userspace_interface_nat_v6")
+	natV6Map := m.bpfShim.Map("userspace_interface_nat_v6")
 	if natV6Map == nil {
 		return errors.New("userspace_interface_nat_v6 map not loaded")
 	}
@@ -888,7 +888,7 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 // programBootstrapMapsLocked() which zeros the bindings map, and then either:
 //   - applyHelperStatusLocked didn't run (error path)
 //   - another Compile() ran concurrently and re-zeroed the map
-//   - the inner eBPF compile recreated the map from a fresh pin
+//   - the bpfShim eBPF compile recreated the map from a fresh pin
 //
 // When a mismatch is detected, this method rewrites the BPF map entries from
 // the helper's reported state — the same logic as applyHelperStatusLocked but
@@ -908,7 +908,7 @@ func (m *Manager) verifyBindingsMapLocked() bool {
 	if len(bindings) == 0 {
 		return false
 	}
-	bindingsMap := m.inner.Map("userspace_bindings")
+	bindingsMap := m.bpfShim.Map("userspace_bindings")
 	if bindingsMap == nil {
 		return false
 	}

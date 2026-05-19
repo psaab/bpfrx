@@ -57,8 +57,8 @@ func (m *Manager) ReadPolicyCounters(policyID uint32) (dataplane.CounterValue, e
 	// and app-term slot expansion without callers recomputing Rust map slots.
 	var total dataplane.CounterValue
 	var innerErr error
-	if m.inner != nil {
-		total, innerErr = m.inner.ReadPolicyCounters(policyID)
+	if m.bpfShim != nil {
+		total, innerErr = m.bpfShim.ReadPolicyCounters(policyID)
 	}
 
 	m.mu.Lock()
@@ -89,8 +89,8 @@ func (m *Manager) ReadPolicyCounters(policyID uint32) (dataplane.CounterValue, e
 
 func (m *Manager) ClearPolicyCounters() error {
 	var errs []error
-	if m.inner != nil {
-		if err := m.inner.ClearPolicyCounters(); err != nil {
+	if m.bpfShim != nil {
+		if err := m.bpfShim.ClearPolicyCounters(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -105,8 +105,8 @@ func (m *Manager) ClearPolicyCounters() error {
 
 func (m *Manager) ClearAllCounters() error {
 	var errs []error
-	if m.inner != nil {
-		if err := m.inner.ClearAllCounters(); err != nil {
+	if m.bpfShim != nil {
+		if err := m.bpfShim.ClearAllCounters(); err != nil {
 			errs = append(errs, err)
 		}
 	}

@@ -63,7 +63,7 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	m.eventStreamCancel = esCancel
 	// Clear stale XSKMAP entries from previous helper instance.
 	// Old entries point to dead socket fds; new helper will repopulate.
-	if xskMap := m.inner.Map("userspace_xsk_map"); xskMap != nil {
+	if xskMap := m.bpfShim.Map("userspace_xsk_map"); xskMap != nil {
 		for i := uint32(0); i < 4096; i++ {
 			_ = xskMap.Delete(i)
 		}
@@ -907,7 +907,7 @@ func proactiveNeighborResolveAsync(cfg *config.Config) {
 // shim stops redirecting packets to XSK. This MUST be called before the
 // helper exits to prevent packets being sent to dead socket fds.
 func (m *Manager) disableUserspaceCtrlLocked() {
-	ctrlMap := m.inner.Map("userspace_ctrl")
+	ctrlMap := m.bpfShim.Map("userspace_ctrl")
 	if ctrlMap == nil {
 		return
 	}
@@ -925,7 +925,7 @@ func (m *Manager) disableUserspaceCtrlLocked() {
 // reEnableUserspaceCtrlLocked sets ctrl.enabled=1 in the BPF map.
 // Used to rollback a ctrl disable when the subsequent operation fails.
 func (m *Manager) reEnableUserspaceCtrlLocked() {
-	ctrlMap := m.inner.Map("userspace_ctrl")
+	ctrlMap := m.bpfShim.Map("userspace_ctrl")
 	if ctrlMap == nil {
 		return
 	}
@@ -955,8 +955,8 @@ func (m *Manager) DisableAndStopHelper() {
 	m.disableUserspaceCtrlLocked()
 	// Swap to eBPF pipeline so packets go through xdp_main_prog
 	// even if the XDP shim was previously attached.
-	if m.inner.XDPEntryProg != "xdp_main_prog" {
-		_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
+	if m.bpfShim.XDPEntryProg != "xdp_main_prog" {
+		_ = m.bpfShim.SwapXDPEntryProg("xdp_main_prog")
 	}
 }
 
@@ -976,8 +976,8 @@ func (m *Manager) PrepareLinkCycle() {
 		return
 	}
 	m.disableUserspaceCtrlLocked()
-	if m.inner.XDPEntryProg != "xdp_main_prog" {
-		_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
+	if m.bpfShim.XDPEntryProg != "xdp_main_prog" {
+		_ = m.bpfShim.SwapXDPEntryProg("xdp_main_prog")
 	}
 	// Tell the Rust helper to stop all workers. This joins worker
 	// threads so they stop touching UMEM before the NIC unmaps pages
@@ -1002,7 +1002,7 @@ func configEqual(a, b config.UserspaceConfig) bool {
 }
 
 func (m *Manager) StartFIBSync(ctx context.Context) {
-	m.inner.StartFIBSync(ctx)
+	m.bpfShim.StartFIBSync(ctx)
 }
 
 // NotifyLinkCycle tells the userspace helper to rebind all AF_XDP sockets.
@@ -1035,8 +1035,8 @@ func (m *Manager) NotifyLinkCycle() {
 	// Ensure ctrl is disabled (PrepareLinkCycle should have done this,
 	// but guard against callers that skip it).
 	m.disableUserspaceCtrlLocked()
-	if m.inner.XDPEntryProg != "xdp_main_prog" {
-		_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
+	if m.bpfShim.XDPEntryProg != "xdp_main_prog" {
+		_ = m.bpfShim.SwapXDPEntryProg("xdp_main_prog")
 	}
 	// Reset the ctrl enable gate so the fill-ring bootstrap delay
 	// restarts from scratch after rebind.  Without this, ctrl stays

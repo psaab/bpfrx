@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -8,6 +9,7 @@ import (
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpruntime "github.com/psaab/xpf/pkg/dataplane/runtime"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/scheduler"
 )
@@ -30,6 +32,19 @@ func (d *policySchedulerApplyTestDP) Compile(*config.Config) (*dataplane.Compile
 	return &dataplane.CompileResult{}, nil
 }
 
+func (d *policySchedulerApplyTestDP) ApplyConfig(ctx context.Context, cfg *config.Config) (*dataplane.ApplyResult, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	result, err := d.Compile(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return dataplane.ApplyResultFromCompileResult(result), nil
+}
+
 func (d *policySchedulerApplyTestDP) SetDeferWorkers(v bool) {
 	d.deferStates = append(d.deferStates, v)
 }
@@ -49,6 +64,73 @@ type userspacePolicySchedulerApplyTestDP struct {
 	compileCfgSchedule string
 }
 
+type runtimeOnlyApplyTestDP struct {
+	applyCalls  int
+	applyErr    error
+	applyResult *dataplane.ApplyResult
+}
+
+func (d *runtimeOnlyApplyTestDP) Start(context.Context) error { return nil }
+func (d *runtimeOnlyApplyTestDP) Close() error                { return nil }
+func (d *runtimeOnlyApplyTestDP) Teardown() error             { return nil }
+
+func (d *runtimeOnlyApplyTestDP) ApplyConfig(ctx context.Context, _ *config.Config) (*dataplane.ApplyResult, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	d.applyCalls++
+	if d.applyErr != nil {
+		return nil, d.applyErr
+	}
+	if d.applyResult != nil {
+		return d.applyResult.Clone(), nil
+	}
+	return &dataplane.ApplyResult{ZoneIDs: map[string]uint16{}}, nil
+}
+
+func (d *runtimeOnlyApplyTestDP) LastApplyResult() *dataplane.ApplyResult {
+	return &dataplane.ApplyResult{ZoneIDs: map[string]uint16{}}
+}
+
+func (d *runtimeOnlyApplyTestDP) Link() dataplane.LinkController {
+	return noopLinkController{}
+}
+
+func (d *runtimeOnlyApplyTestDP) HA() dataplane.HAController {
+	return dataplane.NewDataPlaneHAController(nil)
+}
+
+func (d *runtimeOnlyApplyTestDP) Sessions() dataplane.SessionStore {
+	return dataplane.SessionStoreOf(nil)
+}
+
+func (d *runtimeOnlyApplyTestDP) Telemetry() dataplane.Telemetry {
+	return dataplane.TelemetryOf(nil)
+}
+
+func (d *runtimeOnlyApplyTestDP) SessionDeltas() dpruntime.SessionDeltaSource {
+	return nil
+}
+
+type noopLinkController struct{}
+
+func (noopLinkController) SetDeferWorkers(bool) {}
+func (noopLinkController) PrepareLinkCycle()    {}
+func (noopLinkController) NotifyLinkCycle()     {}
+
+type runtimeOnlyPolicyUpdaterTestDP struct {
+	runtimeOnlyApplyTestDP
+	updateCalls int
+	stateSeen   map[string]bool
+}
+
+func (d *runtimeOnlyPolicyUpdaterTestDP) UpdatePolicyScheduleState(_ *config.Config, activeState map[string]bool) {
+	d.updateCalls++
+	d.stateSeen = copyPolicySchedulerApplyState(activeState)
+}
+
 func (d *userspacePolicySchedulerApplyTestDP) SetPolicySchedulerActiveState(activeState map[string]bool) {
 	d.seedCalls++
 	d.seedStateSeen = copyPolicySchedulerApplyState(activeState)
@@ -66,6 +148,19 @@ func (d *userspacePolicySchedulerApplyTestDP) Compile(cfg *config.Config) (*data
 		return nil, d.compileErr
 	}
 	return &dataplane.CompileResult{}, nil
+}
+
+func (d *userspacePolicySchedulerApplyTestDP) ApplyConfig(ctx context.Context, cfg *config.Config) (*dataplane.ApplyResult, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	result, err := d.Compile(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return dataplane.ApplyResultFromCompileResult(result), nil
 }
 
 func (d *userspacePolicySchedulerApplyTestDP) Mode() dpuserspace.DataplaneMode {
@@ -163,13 +258,51 @@ func TestApplyConfigPublishesScheduleStateToNonUserspaceDataplane(t *testing.T) 
 	cfg := &config.Config{}
 	activeState := map[string]bool{"workhours": true}
 
-	d.publishInitialPolicySchedulerStateLocked(cfg, activeState, &dataplane.CompileResult{})
+	d.publishInitialPolicySchedulerStateLocked(cfg, activeState, &dataplane.ApplyResult{})
 
 	if dp.updateCalls != 1 {
 		t.Fatalf("UpdatePolicyScheduleState calls = %d, want 1", dp.updateCalls)
 	}
 	if got, ok := dp.updateStateSeen["workhours"]; !ok || !got {
 		t.Fatalf("active state for workhours = %t, present=%t; want active true", got, ok)
+	}
+}
+
+func TestApplyConfigUsesRuntimeConfigSinkWithoutLegacyDataplane(t *testing.T) {
+	dp := &runtimeOnlyApplyTestDP{
+		applyErr: dpuserspace.ErrPolicySchedulerProtocolIncompatible,
+	}
+	if _, ok := any(dp).(dataplane.DataPlane); ok {
+		t.Fatal("test dataplane unexpectedly implements legacy DataPlane")
+	}
+	d := &Daemon{
+		dp:   dp,
+		opts: Options{NoDataplane: true},
+	}
+
+	err := d.applyConfigLocked(&config.Config{})
+	if !errors.Is(err, dpuserspace.ErrPolicySchedulerProtocolIncompatible) {
+		t.Fatalf("applyConfigLocked error = %v, want runtime apply error", err)
+	}
+	if dp.applyCalls != 1 {
+		t.Fatalf("ApplyConfig calls = %d, want 1", dp.applyCalls)
+	}
+}
+
+func TestPolicySchedulerUpdateUsesRuntimeUpdaterWithoutLegacyDataplane(t *testing.T) {
+	dp := &runtimeOnlyPolicyUpdaterTestDP{}
+	if _, ok := any(dp).(dataplane.DataPlane); ok {
+		t.Fatal("test dataplane unexpectedly implements legacy DataPlane")
+	}
+	d := &Daemon{dp: dp}
+
+	d.updatePolicyScheduleStateLocked(&config.Config{}, map[string]bool{"workhours": true})
+
+	if dp.updateCalls != 1 {
+		t.Fatalf("UpdatePolicyScheduleState calls = %d, want 1", dp.updateCalls)
+	}
+	if got, ok := dp.stateSeen["workhours"]; !ok || !got {
+		t.Fatalf("stateSeen[workhours] = %t, present=%t; want true", got, ok)
 	}
 }
 
@@ -207,7 +340,7 @@ func TestPolicySchedulerInitialPublishSkipsUserspaceLegacyMapUpdate(t *testing.T
 	cfg := testPolicySchedulerApplyConfig()
 	activeState := d.policySchedulerActiveStateForApplyLocked(cfg, testPolicySchedulerApplyNow())
 
-	d.publishInitialPolicySchedulerStateLocked(cfg, activeState, &dataplane.CompileResult{})
+	d.publishInitialPolicySchedulerStateLocked(cfg, activeState, &dataplane.ApplyResult{})
 
 	if dp.updateCalls != 0 {
 		t.Fatalf("UpdatePolicyScheduleState calls = %d, want 0 for userspace initial apply", dp.updateCalls)

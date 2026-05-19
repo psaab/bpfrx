@@ -242,16 +242,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		if cfg := d.store.ActiveConfig(); cfg != nil {
 			dpType = cfg.System.DataplaneType
 		}
-		dp, err := dataplane.NewDataPlane(dpType)
+		dp, err := dataplane.NewRuntimeDataPlane(dpType)
 		if err != nil {
 			slog.Error("failed to create dataplane", "type", dpType, "err", err)
 			return fmt.Errorf("create dataplane: %w", err)
 		}
-		var ok bool
-		d.dp, ok = dp.(dataplane.RuntimeDataPlane)
-		if !ok {
-			return fmt.Errorf("dataplane type %q does not implement RuntimeDataPlane", dpType)
-		}
+		d.dp = dp
 		if err := d.dp.Start(ctx); err != nil {
 			slog.Warn("failed to start dataplane, running in config-only mode",
 				"err", err)
@@ -310,7 +306,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 			lp.StartFIBSync(ctx)
 		}
 
-		gc := conntrack.NewGC(d.legacyDP(), 10*time.Second)
+		gc := conntrack.NewGCWithDomains(
+			d.dp.Sessions(),
+			d.dp.Telemetry(),
+			nil,
+			nil,
+			10*time.Second,
+		)
 		d.gc = gc
 
 		// When the userspace dataplane is active, skip BPF session map
@@ -965,11 +967,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// BPF stops forwarding traffic even if subsequent cleanup steps hang.
 	if !hitless && d.dp != nil && cfg.Chassis.Cluster != nil {
 		slog.Info("HA shutdown: clearing rg_active for all RGs")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
 		for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
-			if err := d.dp.HA().SetRGActive(ctx, rg.ID, false); err != nil {
+			err := runHAShutdownUpdate(shutdownCtx, func(ctx context.Context) error {
+				return d.dp.HA().SetRGActive(ctx, rg.ID, false)
+			})
+			if err != nil {
 				slog.Warn("failed to clear rg_active on shutdown", "rg", rg.ID, "err", err)
 			}
-			if err := d.dp.HA().SetHAWatchdog(ctx, rg.ID, 0); err != nil {
+			err = runHAShutdownUpdate(shutdownCtx, func(ctx context.Context) error {
+				return d.dp.HA().SetHAWatchdog(ctx, rg.ID, 0)
+			})
+			if err != nil {
 				slog.Warn("failed to clear ha_watchdog on shutdown", "rg", rg.ID, "err", err)
 			}
 		}
@@ -1224,4 +1234,20 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]
 		addRoutes(vrfName, ri.Inet6StaticRoutes)
 	}
 	return resolved
+}
+
+func runHAShutdownUpdate(ctx context.Context, update func(context.Context) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- update(ctx)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
