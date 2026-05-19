@@ -13,6 +13,9 @@ import (
 	"github.com/psaab/xpf/pkg/cluster"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/routing"
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/base64"
 )
 
 func (c *CLI) handlePing(args []string) error {
@@ -541,6 +544,8 @@ func (c *CLI) handleRequest(args []string) error {
 		return c.handleRequestSecurity(args[1:])
 	case "system":
 		return c.handleRequestSystem(args[1:])
+	case "wireguard":
+		return c.handleRequestWireGuard(args[1:])
 	default:
 		return fmt.Errorf("unknown request target: %s", args[0])
 	}
@@ -1006,5 +1011,52 @@ func (c *CLI) handleRequestSecurity(args []string) error {
 		return err
 	}
 	fmt.Printf("Cleared %d IPsec SA(s)\n", count)
+	return nil
+}
+
+func (c *CLI) handleRequestWireGuard(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("request wireguard:")
+		fmt.Println("  genkey              Generate a new private key")
+		fmt.Println("  pubkey <privkey>    Generate a public key from a private key")
+		return nil
+	}
+
+	switch args[0] {
+	case "genkey":
+		return c.handleWireGuardGenKey()
+	case "pubkey":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: request wireguard pubkey <private-key>")
+		}
+		return c.handleWireGuardPubKey(args[1])
+	default:
+		return fmt.Errorf("unknown wireguard command: %s", args[0])
+	}
+}
+
+func (c *CLI) handleWireGuardGenKey() error {
+	curve := ecdh.X25519()
+	priv, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+	fmt.Println(base64.StdEncoding.EncodeToString(priv.Bytes()))
+	return nil
+}
+
+func (c *CLI) handleWireGuardPubKey(privKeyStr string) error {
+	privKey, err := base64.StdEncoding.DecodeString(privKeyStr)
+	if err != nil || len(privKey) != 32 {
+		return fmt.Errorf("invalid private key (must be 32 bytes base64 encoded)")
+	}
+
+	curve := ecdh.X25519()
+	priv, err := curve.NewPrivateKey(privKey)
+	if err != nil {
+		return err
+	}
+	pub := priv.PublicKey()
+	fmt.Println(base64.StdEncoding.EncodeToString(pub.Bytes()))
 	return nil
 }

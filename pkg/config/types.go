@@ -1781,6 +1781,22 @@ type TunnelConfig struct {
 	Keepalive       int      // keepalive interval in seconds (0 = disabled)
 	KeepaliveRetry  int      // number of missed keepalives before declaring down (0 = default 3)
 	AnchorOnly      bool     // create a dummy anchor instead of a kernel tunnel device
+	WireGuard       *WireGuardConfig
+}
+
+// WireGuardConfig defines WireGuard-specific tunnel parameters.
+type WireGuardConfig struct {
+	PrivateKey string
+	ListenPort int
+	Peers      []*WireGuardPeer
+}
+
+// WireGuardPeer defines a WireGuard peer.
+type WireGuardPeer struct {
+	PublicKey           string
+	Endpoint            string
+	AllowedIPs          []string
+	PersistentKeepalive int
 }
 
 // TunnelNameMap returns a mapping from Junos interface reference (e.g. "gr-0/0/0.0")

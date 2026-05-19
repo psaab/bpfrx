@@ -177,6 +177,9 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 					} else if v := nodeVal(prop); v != "" {
 						tc.RoutingInstance = v
 					}
+				case "wireguard":
+					tc.WireGuard = compileWireGuard(prop)
+					tc.Mode = "wireguard"
 				}
 			}
 			ifc.Tunnel = tc
@@ -509,6 +512,44 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 		ifaces.Interfaces[ifName] = ifc
 	}
 	return nil
+}
+
+func compileWireGuard(node *Node) *WireGuardConfig {
+	wg := &WireGuardConfig{}
+	for _, child := range node.Children {
+		v := nodeVal(child)
+		switch child.Name() {
+		case "private-key":
+			wg.PrivateKey = v
+		case "listen-port":
+			if n, err := strconv.Atoi(v); err == nil {
+				wg.ListenPort = n
+			}
+		case "peer":
+			if len(child.Keys) >= 2 {
+				peer := &WireGuardPeer{PublicKey: child.Keys[1]}
+				for _, p := range child.Children {
+					pv := nodeVal(p)
+					switch p.Name() {
+					case "endpoint":
+						peer.Endpoint = pv
+					case "allowed-ips":
+						for _, ipNode := range p.Children {
+							if ip := nodeVal(ipNode); ip != "" {
+								peer.AllowedIPs = append(peer.AllowedIPs, ip)
+							}
+						}
+					case "persistent-keepalive":
+						if n, err := strconv.Atoi(pv); err == nil {
+							peer.PersistentKeepalive = n
+						}
+					}
+				}
+				wg.Peers = append(wg.Peers, peer)
+			}
+		}
+	}
+	return wg
 }
 
 // parseMSSValue extracts MSS value from either "node { mss VALUE; }" or "node VALUE;" syntax.

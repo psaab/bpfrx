@@ -38,6 +38,7 @@ func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceCo
 	}
 	policyCount := len(cfg.Security.Policies)
 	interfaces := buildInterfaceSnapshots(cfg)
+	wgSnap := buildWireGuardSnapshot(cfg)
 	return &ConfigSnapshot{
 		Version:            ProtocolVersion,
 		Generation:         generation,
@@ -48,6 +49,7 @@ func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceCo
 		Userspace:          ucfg,
 		Zones:              buildZoneSnapshots(cfg),
 		Interfaces:         interfaces,
+		WireGuard:          wgSnap,
 		Fabrics:            buildFabricSnapshots(cfg),
 		TunnelEndpoints:    buildTunnelEndpointSnapshots(cfg, interfaces),
 		Neighbors:          buildNeighborSnapshots(cfg),
@@ -807,6 +809,7 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 			Source:          tunnel.Source,
 			Destination:     tunnel.Destination,
 			Key:             tunnel.Key,
+			WgPublicKey:     wgPublicKey(tunnel),
 			TTL:             tunnel.TTL,
 			TransportTable:  transportTable,
 		})
@@ -2330,4 +2333,40 @@ func neighborStateString(state int) string {
 		return "none"
 	}
 	return strings.Join(parts, "|")
+}
+
+func buildWireGuardSnapshot(cfg *config.Config) *WireGuardInterfaceSnapshot {
+	if cfg == nil {
+		return nil
+	}
+	for _, ifc := range cfg.Interfaces.Interfaces {
+		if ifc.Tunnel != nil && ifc.Tunnel.Mode == "wireguard" && ifc.Tunnel.WireGuard != nil {
+			snap := &WireGuardInterfaceSnapshot{
+				PrivateKey: ifc.Tunnel.WireGuard.PrivateKey,
+				ListenPort: uint16(ifc.Tunnel.WireGuard.ListenPort),
+			}
+			for _, peer := range ifc.Tunnel.WireGuard.Peers {
+				snap.Peers = append(snap.Peers, WireGuardPeerSnapshot{
+					PublicKey:           peer.PublicKey,
+					Endpoint:            peer.Endpoint,
+					AllowedIPs:          peer.AllowedIPs,
+					PersistentKeepalive: uint32(peer.PersistentKeepalive),
+				})
+			}
+			return snap
+		}
+	}
+	return nil
+}
+
+func wgPublicKey(tunnel *config.TunnelConfig) string {
+	if tunnel.Mode != "wireguard" || tunnel.WireGuard == nil {
+		return ""
+	}
+	for _, peer := range tunnel.WireGuard.Peers {
+		if peer.Endpoint == tunnel.Destination {
+			return peer.PublicKey
+		}
+	}
+	return ""
 }

@@ -66,6 +66,7 @@ type ConfigSnapshot struct {
 	ClassOfService     *ClassOfServiceSnapshot      `json:"class_of_service,omitempty"`
 	FlowExport         *FlowExportSnapshot          `json:"flow_export,omitempty"`
 	MirrorConfigs      []MirrorConfigSnapshot       `json:"mirror_configs,omitempty"`
+	WireGuard          *WireGuardInterfaceSnapshot  `json:"wireguard,omitempty"`
 	Config             *config.Config               `json:"config,omitempty"`
 	Userspace          config.UserspaceConfig       `json:"userspace"`
 	DeferWorkers       bool                         `json:"defer_workers,omitempty"`
@@ -247,6 +248,7 @@ type TunnelEndpointSnapshot struct {
 	Source          string `json:"source,omitempty"`
 	Destination     string `json:"destination,omitempty"`
 	Key             uint32 `json:"key,omitempty"`
+	WgPublicKey     string `json:"wg_public_key,omitempty"`
 	TTL             int    `json:"ttl,omitempty"`
 	TransportTable  string `json:"transport_table,omitempty"`
 }
