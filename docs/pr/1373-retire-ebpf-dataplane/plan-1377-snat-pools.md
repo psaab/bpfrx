@@ -197,10 +197,13 @@ per-address atomic counters because it does not create a tracked session.
 The per-pool allocator state is bounded by the smaller of pool port capacity and
 `262144` tracked live flows. This prevents attacker-controlled unbounded growth
 in the packet path. Fresh port claims use a per-address cursor and a recycled
-port stack, and persistent lease expiry uses a replace-in-place ordered expiry
-index bounded by the number of retained leases. Near-full allocation and
-timeout cleanup do not scan the whole port range or lease map on every new
-flow. The allocator reports exhaustion when:
+port stack, and persistent lease expiry uses replace-in-place ordered expiry
+indexes bounded by the number of retained leases. Allocation-time expiry cleanup
+is budgeted, not a full sweep. When a selected pool address is out of fresh or
+recycled ports, the allocator runs bounded cleanup against that address's expiry
+index before reporting exhaustion. Near-full allocation and timeout cleanup do
+not scan the whole port range or lease map on every new flow. The allocator
+reports exhaustion when:
 
 - the selected address-persistent pool address has no free port;
 - a non-address-persistent family has no free port on any family-compatible
@@ -274,6 +277,12 @@ Covered by #1385 and this closeout:
   expiry and rollback release the actual allocated tuple.
 - Cargo: repeated persistent lease refresh/release churn keeps the expiry index
   bounded by retained leases rather than by allocation count.
+- Cargo: allocation-time persistent lease cleanup is budgeted when the pool is
+  not under pressure, so one new flow cannot drain an arbitrary expired run under
+  the allocator mutex.
+- Cargo: address-persistent pressure cleanup reclaims expired leases for the
+  selected pool address even when the global allocation cleanup budget was spent
+  on older expirations from other addresses.
 - Cargo: protocol round-trip covers persistent source-NAT snapshot/status
   fields.
 
