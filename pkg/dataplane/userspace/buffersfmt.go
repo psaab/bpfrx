@@ -80,10 +80,42 @@ type systemBufferRow struct {
 	Used     uint64
 }
 
+// SystemBufferUtilizationRow is a bounded userspace buffer row suitable for
+// non-text renderers such as REST. It intentionally excludes dynamic counters
+// that do not have helper-published capacity denominators.
+type SystemBufferUtilizationRow struct {
+	Name         string
+	Scope        string
+	Capacity     uint64
+	Used         uint64
+	UsagePercent float64
+	Status       string
+}
+
 type systemBufferCounterRow struct {
 	Name  string
 	Scope string
 	Value uint64
+}
+
+// SystemBufferUtilizationRows returns the same bounded helper-status capacity
+// rows used by FormatSystemBuffers. Missing helper capacity fields produce no
+// synthetic fill rows rather than falling back to BPF map statistics.
+func SystemBufferUtilizationRows(status ProcessStatus, detail bool) []SystemBufferUtilizationRow {
+	rows, _, _ := systemBufferRows(status, detail)
+	out := make([]SystemBufferUtilizationRow, 0, len(rows))
+	for _, row := range rows {
+		usage, state := systemBufferUsage(row)
+		out = append(out, SystemBufferUtilizationRow{
+			Name:         row.Name,
+			Scope:        row.Scope,
+			Capacity:     row.Capacity,
+			Used:         row.Used,
+			UsagePercent: usage,
+			Status:       state,
+		})
+	}
+	return out
 }
 
 // FormatSystemBuffers renders userspace dataplane buffer capacity telemetry for
@@ -91,9 +123,53 @@ type systemBufferCounterRow struct {
 // helper status; unbounded helper counters/gauges render in a separate section
 // so missing denominators are not mistaken for real fill percentages.
 func FormatSystemBuffers(status ProcessStatus, detail bool) string {
+	rows, knownUMEM, knownTX := systemBufferRows(status, detail)
 	samples := systemBufferSamples(status)
+	counterRows := systemBufferCounterRows(status, samples, detail)
+
+	var b strings.Builder
+	b.WriteString(systemBufferUtilizationHeading + "\n")
+	if len(rows) == 0 {
+		b.WriteString("  unavailable: helper status does not include bounded AF_XDP capacity gauges\n")
+		b.WriteString("  required status fields: per_binding[].umem_total_frames, per_binding[].umem_inflight_frames, per_binding[].tx_ring_capacity, per_binding[].outstanding_tx\n")
+		b.WriteString("  bindings[] mirrors with the same fields are also accepted\n")
+	} else {
+		if knownUMEM == 0 && knownTX == 0 {
+			b.WriteString("  AF_XDP unavailable: helper status does not include bounded capacity gauges\n")
+		}
+		fmt.Fprintf(&b, "%-24s %-24s %12s %12s %8s %s\n", "Buffer", "Scope", "Capacity", "Used", "Usage%", "Status")
+		b.WriteString(strings.Repeat("-", 92) + "\n")
+		warnings := 0
+		for _, row := range rows {
+			pct, status := systemBufferUsage(row)
+			if status != "OK" {
+				warnings++
+			}
+			fmt.Fprintf(&b, "%-24s %-24s %12d %12d %7.1f%% %s\n",
+				row.Name, row.Scope, row.Capacity, row.Used, pct, status)
+		}
+		if warnings > 0 {
+			fmt.Fprintf(&b, "\n%d userspace buffer row(s) at high utilization\n", warnings)
+		}
+	}
+	if len(counterRows) > 0 {
+		if !strings.HasSuffix(b.String(), "\n\n") {
+			b.WriteString("\n")
+		}
+		b.WriteString(systemBufferCountersHeading + "\n")
+		fmt.Fprintf(&b, "%-32s %-24s %12s\n", "Counter", "Scope", "Value")
+		b.WriteString(strings.Repeat("-", 70) + "\n")
+		for _, row := range counterRows {
+			fmt.Fprintf(&b, "%-32s %-24s %12d\n", row.Name, row.Scope, row.Value)
+		}
+	}
+	return b.String()
+}
+
+func systemBufferRows(status ProcessStatus, detail bool) ([]systemBufferRow, int, int) {
 	var umemCap, umemUsed, txCap, txUsed uint64
 	var knownUMEM, knownTX int
+	samples := systemBufferSamples(status)
 	for _, sample := range samples {
 		if sample.UMEMCap > 0 {
 			knownUMEM++
@@ -146,53 +222,22 @@ func FormatSystemBuffers(status ProcessStatus, detail bool) string {
 			}
 		}
 	}
-	counterRows := systemBufferCounterRows(status, samples, detail)
+	return rows, knownUMEM, knownTX
+}
 
-	var b strings.Builder
-	b.WriteString(systemBufferUtilizationHeading + "\n")
-	if len(rows) == 0 {
-		b.WriteString("  unavailable: helper status does not include bounded AF_XDP capacity gauges\n")
-		b.WriteString("  required status fields: per_binding[].umem_total_frames, per_binding[].umem_inflight_frames, per_binding[].tx_ring_capacity, per_binding[].outstanding_tx\n")
-		b.WriteString("  bindings[] mirrors with the same fields are also accepted\n")
-	} else {
-		if knownUMEM == 0 && knownTX == 0 {
-			b.WriteString("  AF_XDP unavailable: helper status does not include bounded capacity gauges\n")
-		}
-		fmt.Fprintf(&b, "%-24s %-24s %12s %12s %8s %s\n", "Buffer", "Scope", "Capacity", "Used", "Usage%", "Status")
-		b.WriteString(strings.Repeat("-", 92) + "\n")
-		warnings := 0
-		for _, row := range rows {
-			pct := 0.0
-			if row.Capacity > 0 {
-				pct = float64(row.Used) * 100.0 / float64(row.Capacity)
-			}
-			status := "OK"
-			if pct >= 90.0 {
-				status = "CRITICAL"
-				warnings++
-			} else if pct >= 80.0 {
-				status = "WARNING"
-				warnings++
-			}
-			fmt.Fprintf(&b, "%-24s %-24s %12d %12d %7.1f%% %s\n",
-				row.Name, row.Scope, row.Capacity, row.Used, pct, status)
-		}
-		if warnings > 0 {
-			fmt.Fprintf(&b, "\n%d userspace buffer row(s) at high utilization\n", warnings)
-		}
+func systemBufferUsage(row systemBufferRow) (float64, string) {
+	pct := 0.0
+	if row.Capacity > 0 {
+		pct = float64(row.Used) * 100.0 / float64(row.Capacity)
 	}
-	if len(counterRows) > 0 {
-		if !strings.HasSuffix(b.String(), "\n\n") {
-			b.WriteString("\n")
-		}
-		b.WriteString(systemBufferCountersHeading + "\n")
-		fmt.Fprintf(&b, "%-32s %-24s %12s\n", "Counter", "Scope", "Value")
-		b.WriteString(strings.Repeat("-", 70) + "\n")
-		for _, row := range counterRows {
-			fmt.Fprintf(&b, "%-32s %-24s %12d\n", row.Name, row.Scope, row.Value)
-		}
+	switch {
+	case pct >= 90.0:
+		return pct, "CRITICAL"
+	case pct >= 80.0:
+		return pct, "WARNING"
+	default:
+		return pct, "OK"
 	}
-	return b.String()
 }
 
 func systemBufferCoSRows(status ProcessStatus, detail bool) []systemBufferRow {

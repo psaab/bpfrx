@@ -324,10 +324,11 @@ type ZonePairSessionSummary struct {
 	Total    int    `json:"total"`
 }
 
-// BufferInfo holds BPF map utilization information.
+// BufferInfo holds dataplane buffer utilization information.
 type BufferInfo struct {
 	Name         string  `json:"name"`
 	Type         string  `json:"type"`
+	Scope        string  `json:"scope,omitempty"`
 	MaxEntries   int     `json:"max_entries"`
 	UsedCount    int     `json:"used_count"`
 	UsagePercent float64 `json:"usage_percent"`

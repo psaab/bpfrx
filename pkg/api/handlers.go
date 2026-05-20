@@ -16,6 +16,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/logging"
 	"github.com/psaab/xpf/pkg/vrrp"
@@ -2087,6 +2088,32 @@ func (s *Server) configAnnotateHandler(w http.ResponseWriter, r *http.Request) {
 func (s *Server) systemBuffersHandler(w http.ResponseWriter, _ *http.Request) {
 	if s.dp == nil || !s.dp.IsLoaded() {
 		writeOK(w, []BufferInfo{})
+		return
+	}
+
+	if provider, ok := s.dp.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+	}); ok {
+		status, err := provider.Status()
+		if err != nil {
+			msg := fmt.Sprintf("userspace buffer status unavailable: %v", err)
+			writeError(w, http.StatusServiceUnavailable, msg)
+			return
+		}
+		rows := dpuserspace.SystemBufferUtilizationRows(status, false)
+		buffers := make([]BufferInfo, 0, len(rows))
+		for _, row := range rows {
+			buffers = append(buffers, BufferInfo{
+				Name:         row.Name,
+				Type:         "Userspace",
+				Scope:        row.Scope,
+				MaxEntries:   int(row.Capacity),
+				UsedCount:    int(row.Used),
+				UsagePercent: row.UsagePercent,
+				Status:       row.Status,
+			})
+		}
+		writeOK(w, buffers)
 		return
 	}
 
