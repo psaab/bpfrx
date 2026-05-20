@@ -200,6 +200,7 @@ struct PersistentLease {
     expires_at_ns: u64,
     timeout_ns: u64,
     active_flows: u32,
+    completed_flows: u32,
 }
 
 #[derive(Debug, Default)]
@@ -479,6 +480,7 @@ impl PortAllocator {
                         expires_at_ns,
                         timeout_ns: persistent_nat_timeout_ns.max(NS_PER_SEC),
                         active_flows: 1,
+                        completed_flows: 0,
                     },
                 );
             }
@@ -620,6 +622,7 @@ impl PortAllocator {
         if let Some(key) = existing.persistent_key {
             let mut insert_expiry = None;
             if let Some(lease) = live.persistent_by_source.get_mut(&key) {
+                lease.completed_flows = lease.completed_flows.saturating_add(1);
                 lease.active_flows = lease.active_flows.saturating_sub(1);
                 if lease.active_flows == 0 {
                     let expires_at_ns = now_ns.saturating_add(lease.timeout_ns);
@@ -661,7 +664,13 @@ impl PortAllocator {
                 lease.active_flows = lease.active_flows.saturating_sub(1);
                 if lease.active_flows == 0 {
                     if existing.persistent_lease_created {
-                        remove_lease = true;
+                        if lease.completed_flows == 0 {
+                            remove_lease = true;
+                        } else {
+                            let expires_at_ns = now_ns.saturating_add(lease.timeout_ns);
+                            lease.expires_at_ns = expires_at_ns;
+                            insert_expiry = Some((lease.addr_index, expires_at_ns));
+                        }
                     } else if existing.persistent_previous_active_flows == 0 {
                         lease.expires_at_ns = existing.persistent_previous_expires_at_ns;
                         insert_expiry = Some((lease.addr_index, lease.expires_at_ns));
