@@ -20,7 +20,7 @@ serde_json = "1.0"
 rustc-hash = "2.1"
 sha2 = "0.10"
 slab = "0.4"
-boringtun = "0.6"
+boringtun = "0.7.1"
 rayon = "1.10"
 base64 = "0.22"
 

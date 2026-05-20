@@ -137,6 +137,7 @@ pub(in crate::afxdp) struct TunnelEndpoint {
     pub(in crate::afxdp) ttl: u8,
     pub(in crate::afxdp) transport_table: String,
     pub(in crate::afxdp) wg_public_key: Option<[u8; 32]>,
+    pub(in crate::afxdp) wg_listen_port: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -272,6 +273,7 @@ pub(in crate::afxdp) struct BindingIdentity {
 #[derive(Clone, Debug, Default)]
 pub(in crate::afxdp) struct WorkerBindingLookup {
     pub(in crate::afxdp) by_if_queue: FastMap<(i32, u32), usize>,
+    pub(in crate::afxdp) by_if_worker: FastMap<(i32, u32), usize>,
     pub(in crate::afxdp) first_by_if: FastMap<i32, usize>,
     pub(in crate::afxdp) all_by_if: FastMap<i32, Vec<usize>>,
     pub(in crate::afxdp) by_slot: FastMap<u32, usize>,
@@ -284,6 +286,9 @@ impl WorkerBindingLookup {
             lookup
                 .by_if_queue
                 .insert((binding.ifindex, binding.queue_id), index);
+            lookup
+                .by_if_worker
+                .insert((binding.ifindex, binding.worker_id), index);
             lookup.first_by_if.entry(binding.ifindex).or_insert(index);
             lookup
                 .all_by_if
@@ -321,5 +326,9 @@ impl WorkerBindingLookup {
             return None;
         }
         Some(indices[(flow_hash as usize) % indices.len()])
+    }
+
+    pub(in crate::afxdp) fn worker_index(&self, ifindex: i32, worker_id: u32) -> Option<usize> {
+        self.by_if_worker.get(&(ifindex, worker_id)).copied()
     }
 }

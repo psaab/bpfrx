@@ -148,12 +148,23 @@ pub(super) fn stage_native_gre_decap(
 pub(super) fn stage_wireguard_decap(
     raw_frame: &[u8],
     meta: UserspaceDpMeta,
-    wireguard_engine: &super::wireguard::WireGuardEngine,
-) -> (UserspaceDpMeta, Option<Vec<u8>>, bool) {
-    if let Some(decap) = wireguard_engine.try_decap(raw_frame, &meta) {
-        return (decap.meta, Some(decap.frame), decap.is_control);
+    wireguard_engines: &mut rustc_hash::FxHashMap<u16, super::wireguard::WireGuardEngine>,
+    scratch_wg_in: &mut Vec<u8>,
+) -> (UserspaceDpMeta, Option<Vec<u8>>, bool, Option<u32>) {
+    if meta.protocol == 17 {
+        if let Some(engine) = wireguard_engines.get_mut(&meta.flow_dst_port) {
+            match engine.try_decap(raw_frame, &meta, scratch_wg_in) {
+                super::wireguard::WireGuardDecapOutcome::Decapped(decap) => {
+                    return (decap.meta, Some(decap.frame), decap.is_control, None);
+                }
+                super::wireguard::WireGuardDecapOutcome::DispatchToWorker(target_worker) => {
+                    return (meta, None, false, Some(target_worker));
+                }
+                super::wireguard::WireGuardDecapOutcome::None => {}
+            }
+        }
     }
-    (meta, None, false)
+    (meta, None, false, None)
 }
 
 /// Stage 7+8 — parse session flow and learn the source-side

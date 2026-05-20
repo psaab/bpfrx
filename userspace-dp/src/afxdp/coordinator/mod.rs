@@ -527,6 +527,7 @@ impl Coordinator {
             v6: dnat_table_v6_fd.as_ref().map(|f| f.fd),
         };
         let ring_entries = ring_entries.max(64).min(u32::MAX as usize) as u32;
+        let num_workers = bindings.iter().filter(|b| b.registered && b.ifindex > 0).count() as u32;
         let mut workers: BTreeMap<u32, Vec<BindingPlan>> = BTreeMap::new();
         for binding in bindings.iter_mut() {
             if !binding.registered || binding.ifindex <= 0 {
@@ -558,6 +559,7 @@ impl Coordinator {
                     bind_strategy: preferred_bind_strategy(binding),
                     poll_mode: self.poll_mode,
                     shared_umem: SharedUmemBindingPlan::private(),
+                    num_workers,
                 });
         }
         for plans in workers.values_mut() {
@@ -1002,10 +1004,16 @@ impl Coordinator {
             }
         }
 
-        if let Some(ref wg) = snapshot.wireguard {
+        let mut wireguard_updates = rustc_hash::FxHashMap::default();
+        for iface in &snapshot.interfaces {
+            if let Some(ref wg) = iface.wireguard {
+                wireguard_updates.insert(iface.name.clone(), wg.clone());
+            }
+        }
+        if !wireguard_updates.is_empty() {
             for handle in self.workers.handles.values() {
                 if let Ok(mut pending) = handle.commands.lock() {
-                    pending.push_back(WorkerCommand::UpdateWireGuard(wg.clone()));
+                    pending.push_back(WorkerCommand::UpdateWireGuard(wireguard_updates.clone()));
                 }
             }
         }

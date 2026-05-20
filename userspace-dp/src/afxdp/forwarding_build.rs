@@ -170,6 +170,7 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
                 } else {
                     None
                 },
+                wg_listen_port: endpoint.wg_listen_port,
             },
         );
         state

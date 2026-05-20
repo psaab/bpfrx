@@ -534,8 +534,6 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                             None,
                                             forwarding,
                                         );
-                                        // Don't continue — the frame was built successfully,
-                                        // forward it anyway. Mismatch is diagnostic only.
                                     }
                                 }
                                 let mut frame = frame;
@@ -543,8 +541,13 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                     if endpoint.mode == "wireguard" {
                                         let mut encap_meta = request.meta;
                                         encap_meta.l3_offset = 14; 
-                                        if let Some(encap) = target_binding.wireguard_engine.try_encap(&frame, encap_meta.addr_family, encap_meta.ingress_ifindex, 0, endpoint.wg_public_key) {
-                                            frame = encap.frame;
+                                        if let Some(engine) = target_binding.wireguard_engines.get_mut(&endpoint.wg_listen_port) {
+                                            if let Some(encap) = engine.try_encap(&frame, encap_meta.addr_family, encap_meta.ingress_ifindex, 0, endpoint.wg_public_key, Some(endpoint.source), &mut target_binding.scratch.scratch_wg_out) {
+                                                frame = encap.frame;
+                                            } else {
+                                                recycle_ingress_frame(ingress_binding, source_offset, now_ns);
+                                                continue;
+                                            }
                                         } else {
                                             recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                                             continue;
@@ -1295,6 +1298,15 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path_from_frame(
     forwarding: &ForwardingState,
 ) {
     let meta = meta.into();
+    if !matches!(
+        decision.resolution.disposition,
+        ForwardingDisposition::LocalDelivery
+            | ForwardingDisposition::NoRoute
+            | ForwardingDisposition::MissingNeighbor
+            | ForwardingDisposition::NextTableUnsupported
+    ) {
+        return;
+    }
     let Some(packet) = extract_l3_packet_with_nat(frame, meta, decision.nat) else {
         live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
         record_exception(

@@ -1070,6 +1070,13 @@ type SecurityConfig struct {
 	SSHKnownHosts      map[string][]SSHKnownHostKey // host -> keys
 	PolicyStatsEnabled bool                         // policy-stats system-wide enable
 	PreIDDefaultPolicy *PreIDDefaultPolicy          // pre-id-default-policy
+	WireGuard          WireGuardGlobalConfig         // global wireguard settings
+}
+
+// WireGuardGlobalConfig holds global WireGuard identity.
+type WireGuardGlobalConfig struct {
+	PrivateKey string `json:"private_key"`
+	ListenPort int    `json:"listen_port"`
 }
 
 // FlowConfig holds flow/session timeout configuration.

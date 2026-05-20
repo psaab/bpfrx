@@ -662,6 +662,10 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				}},
 			}},
 		}},
+		"wireguard": {children: map[string]*schemaNode{
+			"private-key": {args: 1, children: nil},
+			"listen-port": {args: 1, children: nil},
+		}},
 		"dynamic-address": {children: map[string]*schemaNode{
 			"feed-server": {args: 1, children: map[string]*schemaNode{
 				"url":             {args: 1, children: nil},

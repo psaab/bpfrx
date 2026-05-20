@@ -347,8 +347,6 @@ pub(crate) struct ConfigSnapshot {
     pub screens: Vec<ScreenProfileSnapshot>,
     #[serde(default)]
     pub filters: Vec<FirewallFilterSnapshot>,
-    #[serde(rename = "wireguard", default)]
-    pub wireguard: Option<WireGuardInterfaceSnapshot>,
     #[serde(default)]
     pub policers: Vec<PolicerSnapshot>,
     #[serde(rename = "three_color_policers", default)]
@@ -433,6 +431,8 @@ pub(crate) struct TunnelEndpointSnapshot {
     pub destination: String,
     #[serde(rename = "wg_public_key", default)]
     pub wg_public_key: String,
+    #[serde(rename = "wg_listen_port", default)]
+    pub wg_listen_port: u16,
     #[serde(default)]
     pub key: u32,
     #[serde(default)]

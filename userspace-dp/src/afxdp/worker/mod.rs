@@ -88,6 +88,7 @@ pub(crate) struct BindingWorker {
     pub(crate) slot: u32,
     pub(crate) queue_id: u32,
     pub(crate) worker_id: u32,
+    pub(crate) num_workers: u32,
     pub(crate) interface: Arc<str>,
     pub(crate) ifindex: i32,
     pub(crate) live: Arc<BindingLiveState>,
@@ -146,7 +147,8 @@ pub(crate) struct BindingWorker {
     /// `WorkerBindMeta`. Field semantics unchanged; access via
     /// `binding.bind_meta.X`.
     pub(crate) bind_meta: WorkerBindMeta,
-    pub(crate) wireguard_engine: super::wireguard::WireGuardEngine,
+    pub(crate) name: String,
+    pub(crate) wireguard_engines: rustc_hash::FxHashMap<u16, super::wireguard::WireGuardEngine>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,6 +251,7 @@ impl BindingWorker {
         bind_strategy: AfXdpBindStrategy,
         socket_role: XskSocketRole,
         poll_mode: crate::PollMode,
+        num_workers: u32,
         mut worker_umem: WorkerUmem,
         frame_pool: &mut VecDeque<u64>,
         shared_umem: bool,
@@ -338,6 +341,7 @@ impl BindingWorker {
             slot: binding.slot,
             queue_id: binding.queue_id,
             worker_id: binding.worker_id,
+            num_workers,
             interface: Arc::<str>::from(binding.interface.as_str()),
             ifindex: binding.ifindex,
             umem: worker_umem,
@@ -385,6 +389,8 @@ impl BindingWorker {
                 scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_rst_teardowns: Vec::with_capacity(16),
+                scratch_wg_out: Vec::with_capacity(4096),
+                scratch_wg_in: Vec::with_capacity(4096),
             },
             // GEMINI-NEXT.md Section 3 cold start: lazy allocation. The
             // 4096-cap is enforced at admission (poll_descriptor.rs check
@@ -438,13 +444,23 @@ impl BindingWorker {
                 bind_mode,
                 xsk_rx_confirmed: false,
             },
-            wireguard_engine: super::wireguard::WireGuardEngine::new(),
+            name: binding.interface.to_string(),
+            wireguard_engines: rustc_hash::FxHashMap::default(),
         };
         if register_xsk_now {
             register_binding_xsk(&binding, xsk_map_fd)?;
         }
         update_binding_debug_state(&mut binding);
         Ok(binding)
+    }
+
+    pub(crate) fn apply_wireguard_snapshot(&mut self, snap: crate::protocol::WireGuardInterfaceSnapshot) {
+        let worker_id = self.worker_id;
+        let num_workers = self.num_workers;
+        let engine = self.wireguard_engines.entry(snap.listen_port).or_insert_with(|| {
+            super::wireguard::WireGuardEngine::new(worker_id, num_workers)
+        });
+        engine.apply_snapshot(&snap);
     }
 
     #[cfg(test)]
@@ -520,6 +536,8 @@ impl BindingWorker {
                 scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_rst_teardowns: Vec::with_capacity(16),
+                scratch_wg_out: Vec::with_capacity(4096),
+                scratch_wg_in: Vec::with_capacity(4096),
             },
             pending_neigh: VecDeque::new(),
             bpf_maps: WorkerBpfMaps {
@@ -560,6 +578,9 @@ impl BindingWorker {
                 bind_mode: XskBindMode::Copy,
                 xsk_rx_confirmed: false,
             },
+            name: "test0".to_string(),
+            num_workers: 1,
+            wireguard_engines: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -629,6 +650,8 @@ impl BindingWorker {
                 scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_rst_teardowns: Vec::with_capacity(16),
+                scratch_wg_out: Vec::with_capacity(4096),
+                scratch_wg_in: Vec::with_capacity(4096),
             },
             pending_neigh: VecDeque::new(),
             bpf_maps: WorkerBpfMaps {
@@ -669,6 +692,9 @@ impl BindingWorker {
                 bind_mode: XskBindMode::Copy,
                 xsk_rx_confirmed: false,
             },
+            name: "mirror-test".to_string(),
+            num_workers: 1,
+            wireguard_engines: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -797,6 +823,7 @@ fn create_private_binding_from_plan(
             plan.bind_strategy,
             XskSocketRole::Private,
             plan.poll_mode,
+            plan.num_workers,
             umem,
             &mut free_frames,
             false,
@@ -886,6 +913,7 @@ fn create_shared_binding_group(
             plan.bind_strategy,
             socket_role,
             plan.poll_mode,
+            plan.num_workers,
             umem.clone(),
             &mut free_frames,
             true,
@@ -1395,7 +1423,7 @@ pub(crate) fn worker_loop(
                 exported_sequences: Vec::new(),
                 shaped_tx_requests: Vec::new(),
                 vacate_all_shared_exact_slots: false,
-                wireguard_update: None,
+                wireguard_updates: rustc_hash::FxHashMap::default(),
             }
         };
         let WorkerCommandResults {
@@ -1403,11 +1431,13 @@ pub(crate) fn worker_loop(
             exported_sequences,
             shaped_tx_requests,
             vacate_all_shared_exact_slots,
-            wireguard_update,
+            wireguard_updates,
         } = command_results;
-        if let Some(snap) = wireguard_update {
+        for (ifname, snap) in wireguard_updates {
             for binding in bindings.iter_mut() {
-                binding.wireguard_engine.apply_snapshot(&snap);
+                if binding.name == ifname {
+                    binding.apply_wireguard_snapshot(snap.clone());
+                }
             }
         }
         // #941 Work item C: HA-demotion vacate. The
@@ -2559,6 +2589,7 @@ mod tests {
             bind_strategy: AfXdpBindStrategy::UmemOwnerSocket,
             poll_mode: crate::PollMode::Interrupt,
             shared_umem: shared,
+            num_workers: 1,
         };
 
         let plan = prepare_shared_binding_plan_for_create(&group, plan, XskSocketRole::SharedOwner);

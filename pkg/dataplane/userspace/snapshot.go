@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"crypto/ecdh"
+	"encoding/base64"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -613,6 +615,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			MTU:             mtu,
 			HardwareAddr:    hardwareAddr,
 			Addresses:       addresses,
+			WireGuard:       buildSingleWireGuardSnapshot(iface.Tunnel, cfg.Security.WireGuard),
 		})
 		if len(iface.Units) == 0 {
 			continue
@@ -809,7 +812,8 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 			Source:          tunnel.Source,
 			Destination:     tunnel.Destination,
 			Key:             tunnel.Key,
-			WgPublicKey:     wgPublicKey(tunnel),
+			WgPublicKey:     wgPublicKey(tunnel, cfg.Security.WireGuard),
+			WgListenPort:    wgListenPort(tunnel, cfg.Security.WireGuard),
 			TTL:             tunnel.TTL,
 			TransportTable:  transportTable,
 		})
@@ -2335,38 +2339,107 @@ func neighborStateString(state int) string {
 	return strings.Join(parts, "|")
 }
 
-func buildWireGuardSnapshot(cfg *config.Config) *WireGuardInterfaceSnapshot {
+func buildWireGuardSnapshot(cfg *config.Config) map[string]WireGuardInterfaceSnapshot {
 	if cfg == nil {
 		return nil
 	}
-	for _, ifc := range cfg.Interfaces.Interfaces {
-		if ifc.Tunnel != nil && ifc.Tunnel.Mode == "wireguard" && ifc.Tunnel.WireGuard != nil {
-			snap := &WireGuardInterfaceSnapshot{
-				PrivateKey: ifc.Tunnel.WireGuard.PrivateKey,
-				ListenPort: uint16(ifc.Tunnel.WireGuard.ListenPort),
+	out := make(map[string]WireGuardInterfaceSnapshot)
+	for name, ifc := range cfg.Interfaces.Interfaces {
+		if ifc.Tunnel != nil && ifc.Tunnel.Mode == "wireguard" {
+			privKey := ifc.Tunnel.WireGuard.PrivateKey
+			if privKey == "" {
+				privKey = cfg.Security.WireGuard.PrivateKey
 			}
-			for _, peer := range ifc.Tunnel.WireGuard.Peers {
-				snap.Peers = append(snap.Peers, WireGuardPeerSnapshot{
-					PublicKey:           peer.PublicKey,
-					Endpoint:            peer.Endpoint,
-					AllowedIPs:          peer.AllowedIPs,
-					PersistentKeepalive: uint32(peer.PersistentKeepalive),
-				})
+			listenPort := ifc.Tunnel.WireGuard.ListenPort
+			if listenPort == 0 {
+				listenPort = cfg.Security.WireGuard.ListenPort
 			}
-			return snap
+
+			snap := WireGuardInterfaceSnapshot{
+				PrivateKey: privKey,
+				ListenPort: uint16(listenPort),
+			}
+			if ifc.Tunnel.WireGuard != nil {
+				for _, peer := range ifc.Tunnel.WireGuard.Peers {
+					snap.Peers = append(snap.Peers, WireGuardPeerSnapshot{
+						PublicKey:           peer.PublicKey,
+						Endpoint:            peer.Endpoint,
+						AllowedIPs:          peer.AllowedIPs,
+						PersistentKeepalive: uint32(peer.PersistentKeepalive),
+					})
+				}
+			}
+			out[name] = snap
 		}
 	}
-	return nil
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
-func wgPublicKey(tunnel *config.TunnelConfig) string {
-	if tunnel.Mode != "wireguard" || tunnel.WireGuard == nil {
-		return ""
+func buildSingleWireGuardSnapshot(tunnel *config.TunnelConfig, global config.WireGuardGlobalConfig) *WireGuardInterfaceSnapshot {
+	if tunnel == nil || tunnel.Mode != "wireguard" {
+		return nil
 	}
-	for _, peer := range tunnel.WireGuard.Peers {
-		if peer.Endpoint == tunnel.Destination {
-			return peer.PublicKey
+	privKey := global.PrivateKey
+	listenPort := global.ListenPort
+	if tunnel.WireGuard != nil {
+		if tunnel.WireGuard.PrivateKey != "" {
+			privKey = tunnel.WireGuard.PrivateKey
+		}
+		if tunnel.WireGuard.ListenPort != 0 {
+			listenPort = tunnel.WireGuard.ListenPort
 		}
 	}
-	return ""
+	snap := &WireGuardInterfaceSnapshot{
+		PrivateKey: privKey,
+		ListenPort: uint16(listenPort),
+	}
+	if tunnel.WireGuard != nil {
+		for _, peer := range tunnel.WireGuard.Peers {
+			snap.Peers = append(snap.Peers, WireGuardPeerSnapshot{
+				PublicKey:           peer.PublicKey,
+				Endpoint:            peer.Endpoint,
+				AllowedIPs:          peer.AllowedIPs,
+				PersistentKeepalive: uint32(peer.PersistentKeepalive),
+			})
+		}
+	}
+	return snap
+}
+
+func wgPublicKey(tunnel *config.TunnelConfig, global config.WireGuardGlobalConfig) string {
+	if tunnel.Mode != "wireguard" {
+		return ""
+	}
+	privKeyStr := global.PrivateKey
+	if tunnel.WireGuard != nil && tunnel.WireGuard.PrivateKey != "" {
+		privKeyStr = tunnel.WireGuard.PrivateKey
+	}
+	if privKeyStr == "" {
+		return ""
+	}
+	privKey, err := base64.StdEncoding.DecodeString(privKeyStr)
+	if err != nil || len(privKey) != 32 {
+		return ""
+	}
+	curve := ecdh.X25519()
+	priv, err := curve.NewPrivateKey(privKey)
+	if err != nil {
+		return ""
+	}
+	pub := priv.PublicKey()
+	return base64.StdEncoding.EncodeToString(pub.Bytes())
+}
+
+func wgListenPort(tunnel *config.TunnelConfig, global config.WireGuardGlobalConfig) uint16 {
+	if tunnel.Mode != "wireguard" {
+		return 0
+	}
+	port := global.ListenPort
+	if tunnel.WireGuard != nil && tunnel.WireGuard.ListenPort != 0 {
+		port = tunnel.WireGuard.ListenPort
+	}
+	return uint16(port)
 }

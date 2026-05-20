@@ -46,6 +46,7 @@ pub(in crate::afxdp) struct BindingPlan {
     pub(in crate::afxdp) bind_strategy: AfXdpBindStrategy,
     pub(in crate::afxdp) poll_mode: crate::PollMode,
     pub(in crate::afxdp) shared_umem: SharedUmemBindingPlan,
+    pub(in crate::afxdp) num_workers: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -226,7 +227,7 @@ pub(in crate::afxdp) enum WorkerCommand {
     /// this command sets a flag in `WorkerCommandResults`; the outer
     /// poll loop dispatches via `vacate_all_shared_exact_slots`.
     VacateAllSharedExactSlots,
-    UpdateWireGuard(crate::protocol::WireGuardInterfaceSnapshot),
+    UpdateWireGuard(rustc_hash::FxHashMap<String, crate::protocol::WireGuardInterfaceSnapshot>),
 }
 
 #[derive(Default)]

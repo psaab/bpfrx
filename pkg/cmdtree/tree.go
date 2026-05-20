@@ -889,6 +889,9 @@ var OperationalTree = map[string]*Node{
 					"clear": {Desc: "Clear all IPsec SAs"},
 				}},
 			}},
+			"wireguard": {Desc: "WireGuard operations", Children: map[string]*Node{
+				"generate-private-key": {Desc: "Generate a new WireGuard private key"},
+			}},
 		}},
 		"system": {Desc: "Perform system-level operations", Children: map[string]*Node{
 			"reboot":    {Desc: "Reboot the system"},

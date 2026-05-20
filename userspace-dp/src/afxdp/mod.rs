@@ -95,6 +95,8 @@ mod sharded_neighbor;
 // session_glue is a directory module (afxdp/session_glue/{mod.rs, tests.rs}),
 // so the explicit `#[path]` is unnecessary — auto-resolution finds mod.rs.
 mod session_glue;
+#[path = "prefix_map.rs"]
+mod prefix_map;
 #[path = "cos/mod.rs"]
 mod cos;
 #[path = "shared_ops.rs"]
@@ -156,6 +158,7 @@ pub(crate) use self::rst::remove_kernel_rst_suppression;
 use self::sharded_neighbor::ShardedNeighborMap;
 use self::rst::*;
 use self::session_glue::*;
+pub(crate) use self::prefix_map::PrefixMap;
 use self::shared_ops::*;
 use self::shared_umem::*;
 use self::tunnel::*;

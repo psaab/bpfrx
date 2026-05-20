@@ -80,6 +80,10 @@ func compileSecurity(node *Node, sec *SecurityConfig) error {
 					}
 				}
 			}
+		case "wireguard":
+			if err := compileGlobalWireGuard(child, &sec.WireGuard); err != nil {
+				return fmt.Errorf("wireguard: %w", err)
+			}
 		}
 	}
 	return nil
@@ -747,6 +751,22 @@ func compileALG(node *Node, sec *SecurityConfig) error {
 	if tftpNode := node.FindChild("tftp"); tftpNode != nil {
 		if tftpNode.FindChild("disable") != nil {
 			sec.ALG.TFTPDisable = true
+		}
+	}
+	return nil
+}
+
+func compileGlobalWireGuard(node *Node, config *WireGuardGlobalConfig) error {
+	for _, child := range node.Children {
+		switch child.Name() {
+		case "private-key":
+			config.PrivateKey = nodeVal(child)
+		case "listen-port":
+			v, err := strconv.Atoi(nodeVal(child))
+			if err != nil {
+				return fmt.Errorf("invalid listen-port: %w", err)
+			}
+			config.ListenPort = v
 		}
 	}
 	return nil

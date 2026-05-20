@@ -1994,9 +1994,21 @@ func (c *CLI) handleShowSecurityWireGuard(cfg *config.Config, args []string) err
 }
 
 func (c *CLI) showWireGuardPublicKey(cfg *config.Config, filterIf string) error {
+	if cfg == nil {
+		return fmt.Errorf("no configuration")
+	}
+
 	found := false
-	if cfg == nil || cfg.Interfaces.Interfaces == nil {
-		return fmt.Errorf("no interfaces configured")
+
+	// Show Global Public Key if no specific interface requested
+	if filterIf == "" && cfg.Security.WireGuard.PrivateKey != "" {
+		pubKey, err := derivePublicKey(cfg.Security.WireGuard.PrivateKey)
+		if err == nil {
+			fmt.Printf("Global Public Key: %s\n", pubKey)
+			found = true
+		} else {
+			fmt.Printf("Global Public Key: (failed to derive: %v)\n", err)
+		}
 	}
 
 	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
@@ -2010,39 +2022,36 @@ func (c *CLI) showWireGuardPublicKey(cfg *config.Config, filterIf string) error 
 			continue
 		}
 		ifc := cfg.Interfaces.Interfaces[name]
-		if ifc.Tunnel == nil || ifc.Tunnel.Mode != "wireguard" || ifc.Tunnel.WireGuard == nil {
+		if ifc.Tunnel == nil || ifc.Tunnel.Mode != "wireguard" {
 			continue
 		}
 
-		privKeyStr := ifc.Tunnel.WireGuard.PrivateKey
-		if privKeyStr == "" {
-			fmt.Printf("Interface: %s\n", name)
-			fmt.Printf("  Public key: (private-key not configured)\n")
-			found = true
-			continue
+		privKeyStr := ""
+		if ifc.Tunnel.WireGuard != nil {
+			privKeyStr = ifc.Tunnel.WireGuard.PrivateKey
 		}
 
-		privKey, err := base64.StdEncoding.DecodeString(privKeyStr)
-		if err != nil || len(privKey) != 32 {
-			fmt.Printf("Interface: %s\n", name)
-			fmt.Printf("  Public key: (invalid private-key configured)\n")
-			found = true
+		// Skip if it's using the global key and we already showed it
+		if privKeyStr == "" && filterIf == "" && cfg.Security.WireGuard.PrivateKey != "" {
 			continue
 		}
-
-		curve := ecdh.X25519()
-		priv, err := curve.NewPrivateKey(privKey)
-		if err != nil {
-			fmt.Printf("Interface: %s\n", name)
-			fmt.Printf("  Public key: (failed to derive: %v)\n", err)
-			found = true
-			continue
-		}
-		pub := priv.PublicKey()
-		pubKeyStr := base64.StdEncoding.EncodeToString(pub.Bytes())
 
 		fmt.Printf("Interface: %s\n", name)
-		fmt.Printf("  Public key: %s\n", pubKeyStr)
+		effectivePriv := privKeyStr
+		if effectivePriv == "" {
+			effectivePriv = cfg.Security.WireGuard.PrivateKey
+		}
+
+		if effectivePriv == "" {
+			fmt.Printf("  Public key: (private-key not configured)\n")
+		} else {
+			pubKey, err := derivePublicKey(effectivePriv)
+			if err != nil {
+				fmt.Printf("  Public key: (failed to derive: %v)\n", err)
+			} else {
+				fmt.Printf("  Public key: %s\n", pubKey)
+			}
+		}
 		found = true
 	}
 
@@ -2050,7 +2059,21 @@ func (c *CLI) showWireGuardPublicKey(cfg *config.Config, filterIf string) error 
 		return fmt.Errorf("interface %s not found or not a WireGuard interface", filterIf)
 	}
 	if !found && filterIf == "" {
-		fmt.Println("No WireGuard interfaces configured")
+		fmt.Println("No WireGuard identity or interfaces configured")
 	}
 	return nil
+}
+
+func derivePublicKey(privKeyStr string) (string, error) {
+	privKey, err := base64.StdEncoding.DecodeString(privKeyStr)
+	if err != nil || len(privKey) != 32 {
+		return "", fmt.Errorf("invalid base64 private key")
+	}
+	curve := ecdh.X25519()
+	priv, err := curve.NewPrivateKey(privKey)
+	if err != nil {
+		return "", err
+	}
+	pub := priv.PublicKey()
+	return base64.StdEncoding.EncodeToString(pub.Bytes()), nil
 }

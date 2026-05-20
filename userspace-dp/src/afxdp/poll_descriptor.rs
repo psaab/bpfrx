@@ -374,8 +374,46 @@ pub(super) fn poll_binding_process_descriptor(
                     let (mut meta, mut owned_packet_frame) =
                         stage_native_gre_decap(raw_frame, meta, worker_ctx.forwarding);
                     if owned_packet_frame.is_none() {
-                        let (new_meta, new_owned, is_control) =
-                            stage_wireguard_decap(raw_frame, meta, &binding.wireguard_engine);
+                        let (new_meta, new_owned, is_control, target_worker) =
+                            stage_wireguard_decap(raw_frame, meta, &mut binding.wireguard_engines, &mut binding.scratch.scratch_wg_in);
+                        
+                        if let Some(tw_id) = target_worker {
+                            // Cross-worker dispatch
+                            if let Some(target_binding_index) = worker_ctx.binding_lookup.worker_index(meta.ingress_ifindex as i32, tw_id) {
+                                binding.scratch.scratch_forwards.push(PendingForwardRequest {
+                                    target_ifindex: meta.ingress_ifindex as i32,
+                                    target_binding_index: Some(target_binding_index),
+                                    ingress_queue_id: worker_ctx.ident.queue_id,
+                                    desc,
+                                    frame: PendingForwardFrame::Live,
+                                    meta: meta.into(),
+                                    decision: SessionDecision {
+                                        resolution: ForwardingResolution {
+                                            disposition: ForwardingDisposition::ForwardCandidate,
+                                            local_ifindex: 0,
+                                            egress_ifindex: 0,
+                                            tx_ifindex: 0,
+                                            tunnel_endpoint_id: 0,
+                                            next_hop: None,
+                                            neighbor_mac: None,
+                                            src_mac: None,
+                                            tx_vlan_id: 0,
+                                        },
+                                        nat: NatDecision::default(),
+                                    },
+                                    apply_nat_on_fabric: false,
+                                    expected_ports: None,
+                                    flow_key: None,
+                                    nat64_reverse: None,
+                                    cos_queue_id: None,
+                                    dscp_rewrite: None,
+                                    cos_tx_selection_resolved: false,
+                                });
+                                binding.scratch.scratch_recycle.push(desc.addr);
+                                continue;
+                            }
+                        }
+
                         if is_control {
                             if let Some(frame) = new_owned {
                                 let ingress_ifindex = meta.ingress_ifindex as i32;
@@ -2422,23 +2460,9 @@ pub(super) fn poll_binding_process_descriptor(
                                     ingress_zone_override,
                                     now_ns,
                                 );
-                                // Reinject to slow-path TUN so the kernel
-                                // processes host-bound traffic (NDP, ICMP echo,
-                                // BGP, etc.).  The first packet creates a BPF
-                                // session map entry so subsequent packets bypass
-                                // userspace entirely.
-                                maybe_reinject_slow_path(
-                                    worker_ctx.ident,
-                                    &binding.live,
-                                    worker_ctx.slow_path.as_deref(),
-                                    worker_ctx.local_tunnel_deliveries,
-                                    unsafe { &*area },
-                                    desc,
-                                    meta,
-                                    decision,
-                                    worker_ctx.recent_exceptions,
-                                    worker_ctx.forwarding,
-                                );
+                                // Reinject to slow-path TUN is handled by the
+                                // common maybe_reinject_slow_path_from_frame
+                                // call at the end of the match.
                                 recycle_now = true;
                             }
                             ForwardingDisposition::NoRoute => {

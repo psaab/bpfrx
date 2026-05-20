@@ -700,6 +700,7 @@ mod tests {
                 "cross-nic:w0:lan0,wan0".to_string(),
                 SharedUmemSocketRole::Owner,
             ),
+            num_workers: 1,
         };
         let mut workers = BTreeMap::from([(0, vec![plan])]);
         let snapshot = ConfigSnapshot {

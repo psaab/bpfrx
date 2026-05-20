@@ -544,8 +544,6 @@ func (c *CLI) handleRequest(args []string) error {
 		return c.handleRequestSecurity(args[1:])
 	case "system":
 		return c.handleRequestSystem(args[1:])
-	case "wireguard":
-		return c.handleRequestWireGuard(args[1:])
 	default:
 		return fmt.Errorf("unknown request target: %s", args[0])
 	}
@@ -995,6 +993,9 @@ func (c *CLI) handleRequestSecurity(args []string) error {
 		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["security"].Children))
 		return nil
 	}
+	if args[0] == "wireguard" {
+		return c.handleRequestSecurityWireGuard(args[1:])
+	}
 	if args[0] != "ipsec" {
 		return fmt.Errorf("unknown request security target: %s", args[0])
 	}
@@ -1014,49 +1015,30 @@ func (c *CLI) handleRequestSecurity(args []string) error {
 	return nil
 }
 
-func (c *CLI) handleRequestWireGuard(args []string) error {
+
+func (c *CLI) handleRequestSecurityWireGuard(args []string) error {
 	if len(args) == 0 {
-		fmt.Println("request wireguard:")
-		fmt.Println("  genkey              Generate a new private key")
-		fmt.Println("  pubkey <privkey>    Generate a public key from a private key")
+		fmt.Println("request security wireguard:")
+		fmt.Println("  generate-private-key    Generate a new WireGuard private key")
 		return nil
 	}
 
 	switch args[0] {
-	case "genkey":
-		return c.handleWireGuardGenKey()
-	case "pubkey":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: request wireguard pubkey <private-key>")
+	case "generate-private-key":
+		curve := ecdh.X25519()
+		priv, err := curve.GenerateKey(rand.Reader)
+		if err != nil {
+			return fmt.Errorf("failed to generate key: %w", err)
 		}
-		return c.handleWireGuardPubKey(args[1])
+		privKey := base64.StdEncoding.EncodeToString(priv.Bytes())
+		pub := priv.PublicKey()
+		pubKey := base64.StdEncoding.EncodeToString(pub.Bytes())
+
+		fmt.Printf("Private key: %s\n", privKey)
+		fmt.Printf("Public key:  %s\n", pubKey)
+		fmt.Println("\nKeep the private key secret and configure it on your WireGuard interface.")
+		return nil
 	default:
-		return fmt.Errorf("unknown wireguard command: %s", args[0])
+		return fmt.Errorf("unknown wireguard request: %s", args[0])
 	}
-}
-
-func (c *CLI) handleWireGuardGenKey() error {
-	curve := ecdh.X25519()
-	priv, err := curve.GenerateKey(rand.Reader)
-	if err != nil {
-		return err
-	}
-	fmt.Println(base64.StdEncoding.EncodeToString(priv.Bytes()))
-	return nil
-}
-
-func (c *CLI) handleWireGuardPubKey(privKeyStr string) error {
-	privKey, err := base64.StdEncoding.DecodeString(privKeyStr)
-	if err != nil || len(privKey) != 32 {
-		return fmt.Errorf("invalid private key (must be 32 bytes base64 encoded)")
-	}
-
-	curve := ecdh.X25519()
-	priv, err := curve.NewPrivateKey(privKey)
-	if err != nil {
-		return err
-	}
-	pub := priv.PublicKey()
-	fmt.Println(base64.StdEncoding.EncodeToString(pub.Bytes()))
-	return nil
 }
