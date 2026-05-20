@@ -20,7 +20,7 @@ present until later phase PRs.
 | #1374 | Userspace SYN-cookie validation/admission semantics, root-auth-derived snapshot key publication, bounded SYN-ACK/RST TX replies, counters, and gate removal exist; remaining blocker is live HA/flood validation evidence before BPF source removal | Before Phase 4 |
 | #1375 | Userspace supports the color-blind `then discard` srTCM/trTCM slice, fails closed for unsupported shapes, and preserves token/counter state across compatible in-process snapshot refreshes; remaining work is HA/restart continuity decision, non-drop color actions, and integration/perf evidence | Before Phase 4 |
 | #1376 | Userspace port mirroring has snapshot/wire plumbing plus bounded runtime admission; remaining work is mirror-fidelity and pressure-survival evidence before BPF source removal | Before Phase 4 |
-| #1380 | Userspace `show system buffers` can render helper status; remaining work is Phase 5 cleanup of BPF-map-oriented fallback and optional true-capacity fields | Phase 5 |
+| #1380 | Userspace `show system buffers` renders helper status and keeps dynamic session/flow/neighbor counts out of utilization rows until the helper exports true capacity fields | Phase 5 |
 
 ## Recommended Order
 

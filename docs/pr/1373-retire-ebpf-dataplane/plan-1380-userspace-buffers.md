@@ -14,12 +14,15 @@ session summaries with the same operator utility as the legacy path.
 - #1386 restores the immediate userspace `show system buffers` parity gaps:
   active-session footer, detail/non-detail distinction, and fallback from sparse
   per-binding capacity gauges to binding-level status.
-- Follow-up implementation after #1386 widens the shared formatter to include
+- Follow-up implementation after #1386 widened the shared formatter to include
   all bounded buffer surfaces already present on the helper status wire: AF_XDP
   UMEM/TX rings plus class-of-service queued-byte capacity. It also adds an
   unbounded status-counter section for neighbor entries, active flow-cache
   counts, flow-cache collision evictions, fill/TX ring saturation, pending-TX
   gauges, and worker queue overflow/drop attribution.
+- Current closeout: no additional userspace fill-percentage rows are valid
+  without new helper-published denominators. The remaining useful #1380 work is
+  documentation and issue closure, not hard-coding capacities in Go.
 
 ## Design
 
