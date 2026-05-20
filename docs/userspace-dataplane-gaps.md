@@ -116,8 +116,9 @@ Recommended dependency order:
    artifacts before BPF source removal. Keep #1375 on the Phase 4 list for
    validation and hardening evidence, not as a capability gate. No additional
    #1378 scheduler runtime or evidence work is known from the current audit.
-4. #1380 in Phase 5, after the dataplane boundary is settled but before the
-   remaining operator-facing BPF map surface disappears.
+4. #1380 is closed for the current helper schema. Future true utilization rows
+   for session-table, flow-cache, or neighbor-cache state need new
+   helper-published capacity fields and should be tracked as separate issues.
 
 ## What This Document Does Not Mean
 
@@ -154,17 +155,14 @@ There are two distinct fallback boundaries:
 
 The highest-value remaining work on current `master` is:
 
-1. resolve #1381 so userspace is no longer structurally coupled to the eBPF
-   manager contract
-   current AF_XDP SNAT pool selector, not full persistent-NAT parity. #1378 is
-   closed by the accepted userspace HA scheduler artifact set.
-3. collect #1374 live HA/flood evidence and the remaining #1376 mirror
-   evidence before any BPF source removal, and finish the #1375
-   hardening/evidence checklist. The three-color capability gate is removed
-   only for the current color-blind `then discard` slice with compatible
-   in-process snapshot continuity; color-aware and non-drop treatments stay
-   fail-closed in both Go admission and Rust snapshot parsing.
-4. carry #1380 into Phase 5 only if operators need new helper capacity fields;
-   the current userspace command already avoids BPF-map fallback when helper
-   status is available and does not synthesize percentages for dynamic tables
-5. continue correctness and performance hardening on the active AF_XDP fast path
+1. finish the #1377 disposition around helper-restart persistence, HA lease
+   synchronization, and cross-backend selector parity. The current userspace
+   contract is fail-closed for unusable pools and uses the active AF_XDP
+   selector, not full persistent-NAT parity.
+2. collect any Phase 4 operator evidence still required for admitted userspace
+   features before BPF source removal. The #1378 scheduler runtime is closed by
+   the accepted userspace HA artifact set.
+3. keep #1380 closed for the current command contract. Open a narrower
+   follow-up only if operators need helper-published capacity fields for
+   session-table, flow-cache, or neighbor-cache utilization percentages.
+4. continue correctness and performance hardening on the active AF_XDP fast path
