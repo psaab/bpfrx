@@ -55,7 +55,7 @@ func (m DataplaneMode) String() string {
 
 func init() {
 	dataplane.RegisterRuntimeBackend(dataplane.TypeUserspace, func() dataplane.RuntimeDataPlane {
-		return New()
+		return NewLegacyDataPlaneAdapter(New())
 	})
 }
 

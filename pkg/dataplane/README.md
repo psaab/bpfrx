@@ -13,8 +13,11 @@ exposes session iteration to GC, the CLI, and the metrics surface.
 Pluggable: eBPF/DPDK legacy backends register through `RegisterBackend` for
 the old `DataPlane` surface. Runtime backends register through
 `RegisterRuntimeBackend`; the daemon uses `NewRuntimeDataPlane` so userspace
-AF_XDP starts as `RuntimeDataPlane` directly instead of through a fake
-BPF-shaped compatibility adapter.
+AF_XDP starts through the runtime path. During the #1381 migration, the
+userspace runtime constructor returns `LegacyDataPlaneAdapter`: the userspace
+`Manager` itself still does not implement the BPF-shaped `DataPlane`, but
+daemon status, CLI, and cluster-sync callers that have not moved to domain
+interfaces still receive a temporary compatibility handle.
 
 The userspace backend's status wire format is mirrored here for CLI/API
 consumers. CoS queue status includes queue-scoped drain-phase counters so
@@ -33,7 +36,9 @@ sent while exact queues were still backlogged.
   compile/config entry point; userspace AF_XDP does not need to implement the
   legacy BPF-shaped `Compile` method just to receive committed config.
 - `NewRuntimeDataPlane(dpType)` — `dataplane.go`. Runtime-domain constructor
-  used by `pkg/daemon`; userspace registers only on this path.
+  used by `pkg/daemon`; userspace registers only on this path. The current
+  userspace constructor returns a compatibility adapter around `*userspace.Manager`
+  until the remaining status/session-sync callers stop requiring `DataPlane`.
 - `Manager` — `loader.go`. eBPF implementation.
 - `New() *Manager` — `loader.go`.
 - `Compile(cfg *config.Config) (*CompileResult, error)` — multi-phase
