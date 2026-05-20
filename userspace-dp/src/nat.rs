@@ -196,6 +196,7 @@ struct LiveAllocation {
 #[derive(Clone, Copy, Debug)]
 struct PersistentLease {
     translated: TranslatedTuple,
+    addr_index: usize,
     expires_at_ns: u64,
     timeout_ns: u64,
     active_flows: u32,
@@ -208,6 +209,7 @@ struct PortAllocatorLiveState {
     addr_index_by_translated: FxHashMap<TranslatedTuple, usize>,
     persistent_by_source: FxHashMap<PersistentSourceKey, PersistentLease>,
     lease_expirations: BTreeSet<(u64, PersistentSourceKey)>,
+    lease_expirations_by_addr: Vec<BTreeSet<(u64, PersistentSourceKey)>>,
     next_port_offset_by_addr: Vec<u32>,
     recycled_ports_by_addr: Vec<Vec<u16>>,
     gc_counter: u32,
@@ -216,6 +218,7 @@ struct PortAllocatorLiveState {
 impl PortAllocatorLiveState {
     fn new(addr_count: usize) -> Self {
         Self {
+            lease_expirations_by_addr: vec![BTreeSet::new(); addr_count],
             next_port_offset_by_addr: vec![0; addr_count],
             recycled_ports_by_addr: vec![Vec::new(); addr_count],
             ..Self::default()
@@ -223,8 +226,11 @@ impl PortAllocatorLiveState {
     }
 }
 
-/// Run full lease-expiration GC every N release_flow calls.
+/// Run bounded lease-expiration GC every N release_flow calls.
 const GC_PERIOD: u32 = 10;
+const ALLOCATION_GC_BUDGET: usize = 8;
+const RELEASE_GC_BUDGET: usize = 64;
+const PRESSURE_GC_BUDGET: usize = 64;
 
 #[derive(Debug)]
 struct PortAllocatorShared {
@@ -358,7 +364,7 @@ impl PortAllocator {
         }
 
         let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
-        self.gc_expired_locked(&mut live, now_ns);
+        self.gc_expired_locked(&mut live, now_ns, ALLOCATION_GC_BUDGET);
 
         if let Some(existing) = live.live_by_flow.get(&flow) {
             self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
@@ -391,11 +397,22 @@ impl PortAllocator {
                         lease.expires_at_ns = expires_at_ns;
                         reusable = Some(translated);
                     } else {
-                        expired = Some(lease.translated);
+                        expired = Some((lease.translated, lease.addr_index, lease.expires_at_ns));
                     }
                 }
                 if let Some(expires_at_ns) = remove_expiry {
-                    live.lease_expirations.remove(&(expires_at_ns, key));
+                    if let Some(addr_index) = live
+                        .persistent_by_source
+                        .get(&key)
+                        .map(|lease| lease.addr_index)
+                    {
+                        Self::remove_lease_expiration_locked(
+                            &mut live,
+                            addr_index,
+                            expires_at_ns,
+                            key,
+                        );
+                    }
                 }
                 if let Some(translated) = reusable {
                     live.live_by_flow.insert(
@@ -411,14 +428,11 @@ impl PortAllocator {
                     self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
                     return Ok(translated);
                 }
-                if let Some(translated) = expired {
+                if let Some((translated, addr_index, expires_at_ns)) = expired {
+                    Self::remove_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
                     self.release_translated_locked(&mut live, translated);
                     live.persistent_by_source.remove(&key);
                 }
-            }
-            if live.persistent_by_source.len() >= self.shared.max_tracked_flows {
-                self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
-                return Err(SourceNatFailureReason::AllocatorExhausted);
             }
         }
 
@@ -430,9 +444,28 @@ impl PortAllocator {
             let rel = (start_rel + offset) % family_len;
             let abs = family_offset + rel;
             let translated_ip = family_addresses.ip_at(rel);
-            let Some(translated) =
-                self.claim_free_port_locked(&mut live, abs, translated_ip, flow, persistent_key)
-            else {
+            if persistent_key.is_some()
+                && live.persistent_by_source.len() >= self.shared.max_tracked_flows
+            {
+                self.gc_expired_locked(&mut live, now_ns, PRESSURE_GC_BUDGET);
+                if live.persistent_by_source.len() >= self.shared.max_tracked_flows {
+                    continue;
+                }
+            }
+
+            let mut translated =
+                self.claim_free_port_locked(&mut live, abs, translated_ip, flow, persistent_key);
+            if translated.is_none() {
+                self.gc_expired_for_addr_locked(&mut live, abs, now_ns, PRESSURE_GC_BUDGET);
+                translated = self.claim_free_port_locked(
+                    &mut live,
+                    abs,
+                    translated_ip,
+                    flow,
+                    persistent_key,
+                );
+            }
+            let Some(translated) = translated else {
                 continue;
             };
             if let Some(key) = persistent_key {
@@ -442,6 +475,7 @@ impl PortAllocator {
                     key,
                     PersistentLease {
                         translated,
+                        addr_index: abs,
                         expires_at_ns,
                         timeout_ns: persistent_nat_timeout_ns.max(NS_PER_SEC),
                         active_flows: 1,
@@ -545,6 +579,30 @@ impl PortAllocator {
         true
     }
 
+    fn insert_lease_expiration_locked(
+        live: &mut PortAllocatorLiveState,
+        addr_index: usize,
+        expires_at_ns: u64,
+        key: PersistentSourceKey,
+    ) {
+        live.lease_expirations.insert((expires_at_ns, key));
+        if let Some(by_addr) = live.lease_expirations_by_addr.get_mut(addr_index) {
+            by_addr.insert((expires_at_ns, key));
+        }
+    }
+
+    fn remove_lease_expiration_locked(
+        live: &mut PortAllocatorLiveState,
+        addr_index: usize,
+        expires_at_ns: u64,
+        key: PersistentSourceKey,
+    ) {
+        live.lease_expirations.remove(&(expires_at_ns, key));
+        if let Some(by_addr) = live.lease_expirations_by_addr.get_mut(addr_index) {
+            by_addr.remove(&(expires_at_ns, key));
+        }
+    }
+
     fn release_flow(
         &self,
         flow: SourceNatFlowKey,
@@ -566,18 +624,18 @@ impl PortAllocator {
                 if lease.active_flows == 0 {
                     let expires_at_ns = now_ns.saturating_add(lease.timeout_ns);
                     lease.expires_at_ns = expires_at_ns;
-                    insert_expiry = Some(expires_at_ns);
+                    insert_expiry = Some((lease.addr_index, expires_at_ns));
                 }
             }
-            if let Some(expires_at_ns) = insert_expiry {
-                live.lease_expirations.insert((expires_at_ns, key));
+            if let Some((addr_index, expires_at_ns)) = insert_expiry {
+                Self::insert_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
             }
         } else {
             self.release_translated_locked(&mut live, translated);
         }
         live.gc_counter = live.gc_counter.wrapping_add(1);
         if live.gc_counter % GC_PERIOD == 0 {
-            self.gc_expired_locked(&mut live, now_ns);
+            self.gc_expired_locked(&mut live, now_ns, RELEASE_GC_BUDGET);
         }
         true
     }
@@ -598,9 +656,10 @@ impl PortAllocator {
             } else if let Some(lease) = live.persistent_by_source.get_mut(&key) {
                 lease.active_flows = existing.persistent_previous_active_flows;
                 lease.expires_at_ns = existing.persistent_previous_expires_at_ns;
-                let insert_expiry = (lease.active_flows == 0).then_some(lease.expires_at_ns);
-                if let Some(expires_at_ns) = insert_expiry {
-                    live.lease_expirations.insert((expires_at_ns, key));
+                let insert_expiry =
+                    (lease.active_flows == 0).then_some((lease.addr_index, lease.expires_at_ns));
+                if let Some((addr_index, expires_at_ns)) = insert_expiry {
+                    Self::insert_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
                 }
             }
         } else {
@@ -622,29 +681,86 @@ impl PortAllocator {
         }
     }
 
-    fn gc_expired_locked(&self, live: &mut PortAllocatorLiveState, now_ns: u64) {
-        if now_ns == 0 {
-            return;
+    fn gc_expired_locked(
+        &self,
+        live: &mut PortAllocatorLiveState,
+        now_ns: u64,
+        budget: usize,
+    ) -> usize {
+        if now_ns == 0 || budget == 0 {
+            return 0;
         }
-        while let Some((expires_at_ns, key)) = live.lease_expirations.iter().next().copied() {
+        let mut reclaimed = 0;
+        for _ in 0..budget {
+            let Some((expires_at_ns, key)) = live.lease_expirations.iter().next().copied() else {
+                break;
+            };
             if expires_at_ns > now_ns {
                 break;
             }
             live.lease_expirations.remove(&(expires_at_ns, key));
-            let Some(lease) = live.persistent_by_source.get(&key).copied() else {
-                continue;
-            };
-            if lease.active_flows != 0 || lease.expires_at_ns != expires_at_ns {
-                continue;
-            }
-            let translated = lease.translated;
-            live.persistent_by_source.remove(&key);
-            match live.owner_by_translated.get(&translated) {
-                Some(AllocationOwner::Persistent(owner)) if *owner == key => {
-                    self.release_translated_locked(live, translated);
+            if let Some(lease) = live.persistent_by_source.get(&key).copied() {
+                if let Some(by_addr) = live.lease_expirations_by_addr.get_mut(lease.addr_index) {
+                    by_addr.remove(&(expires_at_ns, key));
                 }
-                _ => {}
             }
+            if self.release_expired_lease_locked(live, key, expires_at_ns) {
+                reclaimed += 1;
+            }
+        }
+        reclaimed
+    }
+
+    fn gc_expired_for_addr_locked(
+        &self,
+        live: &mut PortAllocatorLiveState,
+        addr_index: usize,
+        now_ns: u64,
+        budget: usize,
+    ) -> usize {
+        if now_ns == 0 || budget == 0 || addr_index >= live.lease_expirations_by_addr.len() {
+            return 0;
+        }
+        let mut reclaimed = 0;
+        for _ in 0..budget {
+            let Some((expires_at_ns, key)) = live.lease_expirations_by_addr[addr_index]
+                .iter()
+                .next()
+                .copied()
+            else {
+                break;
+            };
+            if expires_at_ns > now_ns {
+                break;
+            }
+            live.lease_expirations_by_addr[addr_index].remove(&(expires_at_ns, key));
+            live.lease_expirations.remove(&(expires_at_ns, key));
+            if self.release_expired_lease_locked(live, key, expires_at_ns) {
+                reclaimed += 1;
+            }
+        }
+        reclaimed
+    }
+
+    fn release_expired_lease_locked(
+        &self,
+        live: &mut PortAllocatorLiveState,
+        key: PersistentSourceKey,
+        expires_at_ns: u64,
+    ) -> bool {
+        let Some(lease) = live.persistent_by_source.get(&key).copied() else {
+            return false;
+        };
+        if lease.active_flows != 0 || lease.expires_at_ns != expires_at_ns {
+            return false;
+        }
+        let translated = lease.translated;
+        live.persistent_by_source.remove(&key);
+        match live.owner_by_translated.get(&translated) {
+            Some(AllocationOwner::Persistent(owner)) if *owner == key => {
+                self.release_translated_locked(live, translated)
+            }
+            _ => false,
         }
     }
 }

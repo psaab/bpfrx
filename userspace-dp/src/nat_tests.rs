@@ -857,15 +857,35 @@ fn pool_snat_multiple_addresses_round_robin() {
 }
 
 fn persistent_pool_rules(timeout_secs: i64, port_low: u16, port_high: u16) -> Vec<SourceNatRule> {
+    persistent_pool_rules_with_options(
+        timeout_secs,
+        port_low,
+        port_high,
+        vec!["203.0.113.10"],
+        false,
+    )
+}
+
+fn persistent_pool_rules_with_options(
+    timeout_secs: i64,
+    port_low: u16,
+    port_high: u16,
+    pool_addresses: Vec<&str>,
+    address_persistent: bool,
+) -> Vec<SourceNatRule> {
     parse_source_nat_rules(&[SourceNATRuleSnapshot {
         name: "persistent-snat".to_string(),
         from_zone: "lan".to_string(),
         to_zone: "wan".to_string(),
         source_addresses: vec!["0.0.0.0/0".to_string()],
         pool_name: "persistent-pool".to_string(),
-        pool_addresses: vec!["203.0.113.10".to_string()],
+        pool_addresses: pool_addresses
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
         port_low,
         port_high,
+        address_persistent,
         persistent_nat: true,
         persistent_nat_permit_any_remote_host: true,
         persistent_nat_inactivity_timeout: timeout_secs,
@@ -880,11 +900,22 @@ fn tuple_snat_lookup(
     dst_port: u16,
     now_ns: u64,
 ) -> SourceNatLookup {
+    tuple_snat_lookup_from_src(rules, "10.0.1.100", src_port, dst_ip, dst_port, now_ns)
+}
+
+fn tuple_snat_lookup_from_src(
+    rules: &[SourceNatRule],
+    src_ip: &str,
+    src_port: u16,
+    dst_ip: &str,
+    dst_port: u16,
+    now_ns: u64,
+) -> SourceNatLookup {
     match_source_nat_result_for_tuple(
         rules,
         "lan",
         "wan",
-        "10.0.1.100".parse().unwrap(),
+        src_ip.parse().unwrap(),
         dst_ip.parse().unwrap(),
         6,
         src_port,
@@ -903,10 +934,19 @@ fn expect_snat_decision(lookup: SourceNatLookup) -> NatDecision {
 }
 
 fn session_key(src_port: u16, dst_ip: &str, dst_port: u16) -> crate::session::SessionKey {
+    session_key_from_src("10.0.1.100", src_port, dst_ip, dst_port)
+}
+
+fn session_key_from_src(
+    src_ip: &str,
+    src_port: u16,
+    dst_ip: &str,
+    dst_port: u16,
+) -> crate::session::SessionKey {
     crate::session::SessionKey {
         addr_family: libc::AF_INET as u8,
         protocol: 6,
-        src_ip: "10.0.1.100".parse().unwrap(),
+        src_ip: src_ip.parse().unwrap(),
         dst_ip: dst_ip.parse().unwrap(),
         src_port,
         dst_port,
@@ -1229,6 +1269,161 @@ fn pool_snat_persistent_expiry_index_is_bounded_by_leases() {
         .unwrap_or_else(|e| e.into_inner());
     assert_eq!(live.persistent_by_source.len(), 1);
     assert_eq!(live.lease_expirations.len(), 1);
+    assert_eq!(live.lease_expirations_by_addr[0].len(), 1);
+}
+
+#[test]
+fn pool_snat_allocation_gc_is_bounded_when_not_under_pressure() {
+    let rules = persistent_pool_rules(1, 40000, 40099);
+    let expired_lease_count = ALLOCATION_GC_BUDGET + 12;
+    for i in 0..expired_lease_count {
+        let src_port = 10000 + i as u16;
+        let now_ns = 1_000_000_000 + i as u64;
+        let decision =
+            expect_snat_decision(tuple_snat_lookup(&rules, src_port, "8.8.8.8", 53, now_ns));
+        release_source_nat_allocation(
+            &rules,
+            &session_key(src_port, "8.8.8.8", 53),
+            decision,
+            false,
+            now_ns + 1,
+        );
+    }
+
+    let before = source_nat_pool_statuses(&rules);
+    assert_eq!(before[0].persistent_leases, expired_lease_count as u64);
+
+    let decision = expect_snat_decision(tuple_snat_lookup(
+        &rules,
+        20000,
+        "1.1.1.1",
+        53,
+        5_000_000_000,
+    ));
+    assert_eq!(
+        decision.rewrite_src_port,
+        Some(40000 + expired_lease_count as u16)
+    );
+
+    let after = source_nat_pool_statuses(&rules);
+    assert_eq!(
+        after[0].persistent_leases,
+        (expired_lease_count - ALLOCATION_GC_BUDGET + 1) as u64
+    );
+    let live = rules[0]
+        .pool_allocator
+        .shared
+        .live
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(
+        live.lease_expirations.len(),
+        expired_lease_count - ALLOCATION_GC_BUDGET
+    );
+    assert_eq!(
+        live.lease_expirations_by_addr[0].len(),
+        expired_lease_count - ALLOCATION_GC_BUDGET
+    );
+}
+
+#[test]
+fn pool_snat_pressure_gc_reclaims_expired_lease_for_selected_address() {
+    let rules = persistent_pool_rules_with_options(
+        1,
+        40000,
+        40007,
+        vec!["203.0.113.10", "203.0.113.11"],
+        true,
+    );
+    let src_addr_0 = source_for_sticky_pool_index(0, 2);
+    let src_addr_1 = source_for_sticky_pool_index(1, 2);
+
+    for i in 0..ALLOCATION_GC_BUDGET {
+        let src_port = 10000 + i as u16;
+        let now_ns = 1_000_000_000 + i as u64;
+        let decision = expect_snat_decision(tuple_snat_lookup_from_src(
+            &rules,
+            &src_addr_0,
+            src_port,
+            "8.8.8.8",
+            53,
+            now_ns,
+        ));
+        release_source_nat_allocation(
+            &rules,
+            &session_key_from_src(&src_addr_0, src_port, "8.8.8.8", 53),
+            decision,
+            false,
+            now_ns + 1,
+        );
+    }
+    for i in 0..ALLOCATION_GC_BUDGET {
+        let src_port = 11000 + i as u16;
+        let now_ns = 1_100_000_000 + i as u64;
+        let decision = expect_snat_decision(tuple_snat_lookup_from_src(
+            &rules,
+            &src_addr_1,
+            src_port,
+            "8.8.4.4",
+            53,
+            now_ns,
+        ));
+        release_source_nat_allocation(
+            &rules,
+            &session_key_from_src(&src_addr_1, src_port, "8.8.4.4", 53),
+            decision,
+            false,
+            now_ns + 1,
+        );
+    }
+
+    {
+        let live = rules[0]
+            .pool_allocator
+            .shared
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            live.lease_expirations_by_addr[0].len(),
+            ALLOCATION_GC_BUDGET
+        );
+        assert_eq!(
+            live.lease_expirations_by_addr[1].len(),
+            ALLOCATION_GC_BUDGET
+        );
+    }
+
+    let decision = expect_snat_decision(tuple_snat_lookup_from_src(
+        &rules,
+        &src_addr_1,
+        12000,
+        "1.1.1.1",
+        53,
+        5_000_000_000,
+    ));
+
+    assert_eq!(decision.rewrite_src, Some("203.0.113.11".parse().unwrap()));
+    assert!(matches!(decision.rewrite_src_port, Some(40000..=40007)));
+    let live = rules[0]
+        .pool_allocator
+        .shared
+        .live
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(live.lease_expirations_by_addr[0].len(), 0);
+    assert!(live.lease_expirations_by_addr[1].len() < ALLOCATION_GC_BUDGET);
+}
+
+fn source_for_sticky_pool_index(want: usize, pool_len: usize) -> String {
+    for octet in 1..=254 {
+        let candidate = format!("10.0.1.{octet}");
+        let ip = candidate.parse().unwrap();
+        if sticky_pool_index(ip, pool_len) == want {
+            return candidate;
+        }
+    }
+    panic!("no source address found for sticky index {want}");
 }
 
 #[test]
