@@ -618,16 +618,18 @@ impl PortAllocator {
         }
         live.live_by_flow.remove(&flow);
         if let Some(key) = existing.persistent_key {
-            let mut insert_expiry = None;
+            let mut refresh_expiry = None;
             if let Some(lease) = live.persistent_by_source.get_mut(&key) {
                 lease.active_flows = lease.active_flows.saturating_sub(1);
                 if lease.active_flows == 0 {
+                    let old_expires_at_ns = lease.expires_at_ns;
                     let expires_at_ns = now_ns.saturating_add(lease.timeout_ns);
                     lease.expires_at_ns = expires_at_ns;
-                    insert_expiry = Some((lease.addr_index, expires_at_ns));
+                    refresh_expiry = Some((lease.addr_index, old_expires_at_ns, expires_at_ns));
                 }
             }
-            if let Some((addr_index, expires_at_ns)) = insert_expiry {
+            if let Some((addr_index, old_expires_at_ns, expires_at_ns)) = refresh_expiry {
+                Self::remove_lease_expiration_locked(&mut live, addr_index, old_expires_at_ns, key);
                 Self::insert_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
             }
         } else {

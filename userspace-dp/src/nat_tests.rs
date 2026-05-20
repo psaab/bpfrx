@@ -1273,6 +1273,63 @@ fn pool_snat_persistent_expiry_index_is_bounded_by_leases() {
 }
 
 #[test]
+fn pool_snat_persistent_release_replaces_stale_expiry_tuple() {
+    let rules = persistent_pool_rules(300, 40000, 40000);
+    let decision =
+        expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1_000));
+    let stale_expires_at_ns = {
+        let mut live = rules[0]
+            .pool_allocator
+            .shared
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (key, lease) = live
+            .persistent_by_source
+            .iter()
+            .next()
+            .map(|(key, lease)| (*key, *lease))
+            .unwrap();
+        assert_eq!(lease.active_flows, 1);
+        live.lease_expirations.insert((lease.expires_at_ns, key));
+        live.lease_expirations_by_addr[lease.addr_index].insert((lease.expires_at_ns, key));
+        lease.expires_at_ns
+    };
+
+    release_source_nat_allocation(
+        &rules,
+        &session_key(10000, "8.8.8.8", 53),
+        decision,
+        false,
+        2_000,
+    );
+
+    let live = rules[0]
+        .pool_allocator
+        .shared
+        .live
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (key, lease) = live
+        .persistent_by_source
+        .iter()
+        .next()
+        .map(|(key, lease)| (*key, *lease))
+        .unwrap();
+    assert_ne!(lease.expires_at_ns, stale_expires_at_ns);
+    assert_eq!(live.lease_expirations.len(), 1);
+    assert!(live.lease_expirations.contains(&(lease.expires_at_ns, key)));
+    assert!(!live.lease_expirations.contains(&(stale_expires_at_ns, key)));
+    assert_eq!(live.lease_expirations_by_addr[lease.addr_index].len(), 1);
+    assert!(
+        live.lease_expirations_by_addr[lease.addr_index].contains(&(lease.expires_at_ns, key))
+    );
+    assert!(
+        !live.lease_expirations_by_addr[lease.addr_index].contains(&(stale_expires_at_ns, key))
+    );
+}
+
+#[test]
 fn pool_snat_allocation_gc_is_bounded_when_not_under_pressure() {
     let rules = persistent_pool_rules(1, 40000, 40099);
     let expired_lease_count = ALLOCATION_GC_BUDGET + 12;
