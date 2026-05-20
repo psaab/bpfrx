@@ -2660,4 +2660,41 @@ mod tests {
         assert_eq!(telemetry.dbg_tx_completion_ring_available, 0);
         assert_eq!(telemetry.dbg_tx_completion_ring_available_max, 0);
     }
+
+    #[test]
+    fn test_sister_interface_isolation_in_apply_wireguard_snapshot() {
+        use crate::protocol::WireGuardInterfaceSnapshot;
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+        let mut binding = BindingWorker::new_for_mirror_test(0, 0, 1, 0);
+
+        let private_key_wg0 = BASE64.encode(&[1u8; 32]);
+        let private_key_wg1 = BASE64.encode(&[2u8; 32]);
+
+        let snap_wg0 = WireGuardInterfaceSnapshot {
+            private_key: private_key_wg0,
+            public_key: "".to_string(),
+            listen_port: 51820,
+            peers: vec![],
+        };
+
+        let snap_wg1 = WireGuardInterfaceSnapshot {
+            private_key: private_key_wg1,
+            public_key: "".to_string(),
+            listen_port: 51821,
+            peers: vec![],
+        };
+
+        binding.apply_wireguard_snapshot("wg0", snap_wg0);
+        assert!(binding.wireguard_engines.contains_key(&51820));
+        assert_eq!(binding.wireguard_listen_ports_by_ifname.get("wg0"), Some(&51820));
+
+        binding.apply_wireguard_snapshot("wg1", snap_wg1);
+        assert!(binding.wireguard_engines.contains_key(&51820));
+        assert!(binding.wireguard_engines.contains_key(&51821));
+
+        binding.remove_wireguard_snapshot("wg0");
+        assert!(!binding.wireguard_engines.contains_key(&51820));
+        assert!(binding.wireguard_engines.contains_key(&51821));
+    }
 }
