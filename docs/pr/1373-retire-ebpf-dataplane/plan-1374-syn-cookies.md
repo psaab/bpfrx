@@ -35,8 +35,8 @@ SYN cookie behavior in `userspace-dp`.
 - The 2026-05-19 closeout slice adds pure SYN-cookie SYN-ACK and validated ACK
   RST frame builders, wires the screen verdicts into the AF_XDP worker TX path,
   publishes a 16-byte snapshot key derived from cluster-synced root
-  encrypted-password material, and removes the Go userspace capability gate for
-  `syn-cookie`.
+  encrypted-password material, and admits active userspace `syn-cookie` screen
+  profiles only after that HA-safe secret material exists.
 - SYN-cookie replies are admitted only when the binding has enough pending-TX
   and free-frame headroom to preserve a full `TX_BATCH_SIZE` reserve for normal
   forwarding. Budget exhaustion drops the flood reply path and increments
@@ -96,8 +96,10 @@ On returning ACK:
 2. On success, mark the client validated and send RST, matching the current
    eBPF behavior; the client's retransmitted SYN then creates the normal
    policy/NAT/session path.
-3. On failure, drop with no session creation and increment invalid-cookie
-   counters.
+3. On failure during a local active flood window, drop with no session creation
+   and increment invalid-cookie counters. Outside a local active window, invalid
+   ACKs remain `NotApplicable` so standby peers do not start dropping unrelated
+   session-miss ACKs solely because cookie mode is configured.
 
 ## Hot-Path Invariants
 
@@ -127,9 +129,12 @@ On returning ACK:
 - The snapshot key is static for a committed config; epoch calculation happens
   locally from the wall clock and does not require per-epoch control-plane
   publication.
-- Failover during an active flood should continue accepting cookies minted by
-  the former active node for the overlap window; the required cluster smoke
-  must verify this property before BPF source removal.
+- Failover during an active flood continues accepting cookies minted by the
+  former active node for the overlap window even if the new active peer has not
+  observed the local flood threshold. A valid cookie ACK is self-authenticating
+  against the shared key, tuple, zone, MSS index, and current/previous
+  wall-clock epoch; invalid ACKs outside a local active window remain
+  `NotApplicable`.
 - `synproxy_active`, challenge, no-secret, SYN-ACK sent, ACK RST sent, valid,
   invalid, bypass, and budget-drop counters are exposed in userspace status.
 
@@ -138,9 +143,9 @@ On returning ACK:
 - Replay/wrap: the low 5 transmitted epoch bits wrap every 32 epochs. The
   full-epoch MAC rule above is mandatory to prevent old cookies from becoming
   valid again at low-bit wrap.
-- Failover skew: active and backup nodes need bounded monotonic-epoch skew or a
-  shared epoch source; otherwise cookies minted immediately before failover can
-  be rejected by the new active node.
+- Failover skew: active and backup nodes need bounded wall-clock skew;
+  otherwise cookies minted immediately before failover can be rejected by the
+  new active node.
 - Budget starvation: cookie replies are useful only if the bounded reply budget
   cannot drain normal forwarding frames. Drop accounting must distinguish
   invalid-cookie drops from reply-budget drops.
@@ -161,6 +166,8 @@ On returning ACK:
 - Cargo: `screen::syn_cookie_ack_validation_marks_next_syn_bypass_without_session_creation`.
 - Cargo: `screen::syn_cookie_validated_syn_still_runs_later_screen_checks`.
 - Cargo: `screen::syn_cookie_invalid_ack_does_not_validate_client`.
+- Cargo: `screen::syn_cookie_ack_validates_on_peer_without_local_active_window`.
+- Cargo: `screen::syn_cookie_invalid_ack_without_active_window_remains_not_applicable`.
 - Cargo: `screen::syn_cookie_ack_fin_is_invalid_while_cookie_mode_is_active`.
 - Cargo: `screen::syn_cookie_validated_cache_is_bounded`.
 - Cargo: `screen::syn_cookie_validated_cache_index_is_keyed`.

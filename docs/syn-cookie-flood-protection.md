@@ -124,7 +124,10 @@ helper-local fail-closed and backpressure conditions. The validated-client cache
 is local, but the snapshot-published key is derived from cluster-synced root
 encrypted-password material so peers with the same committed config can
 validate cookies minted by the former active node inside the current/previous
-Unix wall-clock epoch overlap. If that secret material is absent, userspace
+Unix wall-clock epoch overlap. A standby peer accepts a valid cookie ACK even
+when it has not locally observed the flood threshold; invalid ACKs outside a
+local active flood window remain ordinary session-miss traffic instead of being
+counted as cookie failures. If that secret material is absent, userspace
 omits the key and fails closed instead of minting predictable cookies; config
 validation also warns and userspace capability admission refuses active
 SYN-cookie screen profiles until the secret exists.

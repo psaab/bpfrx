@@ -1329,6 +1329,67 @@ fn syn_cookie_invalid_ack_does_not_validate_client() {
 }
 
 #[test]
+fn syn_cookie_ack_validates_on_peer_without_local_active_window() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 1;
+    profile.syn_cookie = true;
+
+    let mut peer = make_state("trust", profile);
+    peer.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    peer.set_syn_cookie_full_epoch_for_test(41);
+
+    let syn = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_SYN,
+    );
+    let cookie_isn =
+        syn_cookie_codec().mint_isn(SynCookieTuple::from_packet(&syn), 7, 41, syn.tcp_mss);
+
+    let mut ack = syn.clone();
+    ack.tcp_flags = TCP_ACK;
+    ack.tcp_seq = 2;
+    ack.tcp_ack = cookie_isn.wrapping_add(1);
+
+    assert_eq!(
+        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        SynCookieAckVerdict::Validated,
+        "HA backup must accept a peer-minted cookie without a local flood window"
+    );
+    assert_eq!(peer.syn_cookie_validated_len(), 1);
+}
+
+#[test]
+fn syn_cookie_invalid_ack_without_active_window_remains_not_applicable() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 1;
+    profile.syn_cookie = true;
+
+    let mut peer = make_state("trust", profile);
+    peer.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    peer.set_syn_cookie_full_epoch_for_test(41);
+
+    let mut ack = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_ACK,
+    );
+    ack.tcp_seq = 2;
+    ack.tcp_ack = 0xdead_beefu32;
+
+    assert_eq!(
+        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        SynCookieAckVerdict::NotApplicable,
+        "inactive peers only consume ACKs that validate against the shared key"
+    );
+    assert_eq!(peer.syn_cookie_validated_len(), 0);
+}
+
+#[test]
 fn syn_cookie_ack_fin_is_invalid_while_cookie_mode_is_active() {
     let mut profile = ScreenProfile::default();
     profile.syn_flood_threshold = 1;

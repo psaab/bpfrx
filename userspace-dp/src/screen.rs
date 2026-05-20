@@ -1128,19 +1128,24 @@ impl ScreenState {
         if (flags & TCP_ACK) == 0 || (flags & TCP_SYN) != 0 {
             return SynCookieAckVerdict::NotApplicable;
         }
-        if self
+        let locally_active = self
             .syn_cookie_active_until_secs
             .get(zone)
             .copied()
-            .is_none_or(|until| until <= now_secs)
-        {
-            return SynCookieAckVerdict::NotApplicable;
-        }
+            .is_some_and(|until| until > now_secs);
         if (flags & (TCP_FIN | TCP_RST)) != 0 {
-            return SynCookieAckVerdict::Invalid;
+            return if locally_active {
+                SynCookieAckVerdict::Invalid
+            } else {
+                SynCookieAckVerdict::NotApplicable
+            };
         }
         let Some(codec) = self.syn_cookie_codec else {
-            return SynCookieAckVerdict::Invalid;
+            return if locally_active {
+                SynCookieAckVerdict::Invalid
+            } else {
+                SynCookieAckVerdict::NotApplicable
+            };
         };
         let cookie_isn = pkt.tcp_ack.wrapping_sub(1);
         let current_epoch = self.current_syn_cookie_full_epoch();
@@ -1151,8 +1156,10 @@ impl ScreenState {
         {
             self.syn_cookie_validated.insert(zone_id, tuple, now_secs);
             SynCookieAckVerdict::Validated
-        } else {
+        } else if locally_active {
             SynCookieAckVerdict::Invalid
+        } else {
+            SynCookieAckVerdict::NotApplicable
         }
     }
 
