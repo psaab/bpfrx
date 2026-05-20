@@ -60,6 +60,7 @@ type ConfigSnapshot struct {
 	NAT64              []NAT64RuleSnapshot          `json:"nat64_rules,omitempty"`
 	Nptv6              []Nptv6RuleSnapshot          `json:"nptv6_rules,omitempty"`
 	Screens            []ScreenProfileSnapshot      `json:"screens,omitempty"`
+	SYNCookieMasterKey string                       `json:"syn_cookie_master_key,omitempty"`
 	Filters            []FirewallFilterSnapshot     `json:"filters,omitempty"`
 	Policers           []PolicerSnapshot            `json:"policers,omitempty"`
 	ThreeColorPolicers []ThreeColorPolicerSnapshot  `json:"three_color_policers,omitempty"`
@@ -869,6 +870,9 @@ type BindingStatus struct {
 	ScreenDrops                       uint64 `json:"screen_drops,omitempty"`
 	SYNCookieChallenges               uint64 `json:"syn_cookie_challenges,omitempty"`
 	SYNCookieSecretUnavailable        uint64 `json:"syn_cookie_secret_unavailable,omitempty"`
+	SYNCookieSynAckSent               uint64 `json:"syn_cookie_syn_ack_sent,omitempty"`
+	SYNCookieAckRstSent               uint64 `json:"syn_cookie_ack_rst_sent,omitempty"`
+	SYNCookieReplyBudgetDrops         uint64 `json:"syn_cookie_reply_budget_drops,omitempty"`
 	SYNCookieAckValid                 uint64 `json:"syn_cookie_ack_valid,omitempty"`
 	SYNCookieAckInvalid               uint64 `json:"syn_cookie_ack_invalid,omitempty"`
 	SYNCookieBypass                   uint64 `json:"syn_cookie_bypass,omitempty"`

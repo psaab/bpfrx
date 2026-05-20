@@ -319,6 +319,8 @@ pub(crate) struct ConfigSnapshot {
     pub nptv6_rules: Vec<Nptv6RuleSnapshot>,
     #[serde(default)]
     pub screens: Vec<ScreenProfileSnapshot>,
+    #[serde(rename = "syn_cookie_master_key", default)]
+    pub syn_cookie_master_key: String,
     #[serde(default)]
     pub filters: Vec<FirewallFilterSnapshot>,
     #[serde(default)]
@@ -1585,6 +1587,12 @@ pub(crate) struct BindingStatus {
     pub syn_cookie_challenges: u64,
     #[serde(rename = "syn_cookie_secret_unavailable", default)]
     pub syn_cookie_secret_unavailable: u64,
+    #[serde(rename = "syn_cookie_syn_ack_sent", default)]
+    pub syn_cookie_syn_ack_sent: u64,
+    #[serde(rename = "syn_cookie_ack_rst_sent", default)]
+    pub syn_cookie_ack_rst_sent: u64,
+    #[serde(rename = "syn_cookie_reply_budget_drops", default)]
+    pub syn_cookie_reply_budget_drops: u64,
     #[serde(rename = "syn_cookie_ack_valid", default)]
     pub syn_cookie_ack_valid: u64,
     #[serde(rename = "syn_cookie_ack_invalid", default)]
@@ -2625,9 +2633,12 @@ mod tests {
             queue_id: 2,
             syn_cookie_challenges: 3,
             syn_cookie_secret_unavailable: 5,
-            syn_cookie_ack_valid: 7,
-            syn_cookie_ack_invalid: 11,
-            syn_cookie_bypass: 13,
+            syn_cookie_syn_ack_sent: 7,
+            syn_cookie_ack_rst_sent: 11,
+            syn_cookie_reply_budget_drops: 13,
+            syn_cookie_ack_valid: 17,
+            syn_cookie_ack_invalid: 19,
+            syn_cookie_bypass: 23,
             ..Default::default()
         };
 
@@ -2639,6 +2650,9 @@ mod tests {
         for key in [
             "syn_cookie_challenges",
             "syn_cookie_secret_unavailable",
+            "syn_cookie_syn_ack_sent",
+            "syn_cookie_ack_rst_sent",
+            "syn_cookie_reply_budget_drops",
             "syn_cookie_ack_valid",
             "syn_cookie_ack_invalid",
             "syn_cookie_bypass",
@@ -2655,6 +2669,12 @@ mod tests {
         assert_eq!(
             back.syn_cookie_secret_unavailable,
             status.syn_cookie_secret_unavailable
+        );
+        assert_eq!(back.syn_cookie_syn_ack_sent, status.syn_cookie_syn_ack_sent);
+        assert_eq!(back.syn_cookie_ack_rst_sent, status.syn_cookie_ack_rst_sent);
+        assert_eq!(
+            back.syn_cookie_reply_budget_drops,
+            status.syn_cookie_reply_budget_drops
         );
         assert_eq!(back.syn_cookie_ack_valid, status.syn_cookie_ack_valid);
         assert_eq!(back.syn_cookie_ack_invalid, status.syn_cookie_ack_invalid);

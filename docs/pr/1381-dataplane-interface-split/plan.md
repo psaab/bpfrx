@@ -23,10 +23,11 @@ methods. It mixes:
 
 `pkg/dataplane/userspace/manager.go` used to embed `dataplane.DataPlane` and
 compile by inheriting all eBPF writers. The implementation now registers
-userspace only through `RegisterRuntimeBackend`, so daemon startup constructs
-`*userspace.Manager` directly with `NewRuntimeDataPlane`. The compatibility
-adapter remains available for old `DataPlane` consumers, but it is no longer
-the userspace backend registry entry.
+userspace only through `RegisterRuntimeBackend`. The registry entry currently
+returns `userspace.LegacyDataPlaneAdapter` around a `*userspace.Manager` so
+old status, CLI, and cluster-sync callers still have a non-nil compatibility
+handle while they migrate. The manager itself remains free of the legacy
+`DataPlane` contract.
 
 `pkg/daemon` now stores `dataplane.RuntimeDataPlane` and creates it through
 `NewRuntimeDataPlane`. Runtime work uses config, HA/fabric, session,
@@ -601,10 +602,11 @@ userspace only as a runtime backend, keeps `legacyDP()` as an explicit
 compatibility bridge for old eBPF/DPDK surfaces, and documents the userspace
 XDP shim maps as the remaining intentional eBPF manager owner. Apply-time
 config now goes through `ConfigSink.ApplyConfig`, not
-`legacyDP().Compile`, so a bare userspace `*Manager` can receive commits
-without pretending to implement the legacy BPF writer surface. Runtime policy
-scheduler updates likewise use the runtime updater interface when present and
-fall back to `legacyDP()` only for compatibility backends.
+`legacyDP().Compile`; the runtime backend returns a compatibility adapter only
+so old status/session-sync paths keep working while domain migration
+continues. Runtime policy scheduler updates likewise use the runtime updater
+interface when present and fall back to `legacyDP()` only for compatibility
+backends.
 
 HA fail-closed shutdown now wraps controller calls in one daemon-owned
 deadline. Userspace helper RPCs still retain their internal dial/read

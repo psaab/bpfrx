@@ -61,6 +61,7 @@ func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceCo
 		NAT64:              buildNAT64Snapshots(cfg),
 		Nptv6:              buildNptv6Snapshots(cfg),
 		Screens:            buildScreenSnapshots(cfg),
+		SYNCookieMasterKey: buildSYNCookieMasterKey(cfg),
 		Filters:            buildFirewallFilterSnapshots(cfg),
 		Policers:           buildPolicerSnapshots(cfg),
 		ThreeColorPolicers: buildThreeColorPolicerSnapshots(cfg),
@@ -1664,16 +1665,86 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 	return out
 }
 
+func buildSYNCookieMasterKey(cfg *config.Config) string {
+	if !userspaceSynCookieProtectionActive(cfg) {
+		return ""
+	}
+	secretMaterial := synCookieSecretMaterial(cfg)
+	if secretMaterial == "" {
+		return ""
+	}
+
+	var zones []string
+	for _, zone := range cfg.Security.Zones {
+		if zone == nil || zone.ScreenProfile == "" {
+			continue
+		}
+		profile := cfg.Security.Screen[zone.ScreenProfile]
+		if profile == nil || profile.TCP.SynFlood == nil ||
+			profile.TCP.SynFlood.AttackThreshold <= 0 {
+			continue
+		}
+		zones = append(zones, zone.Name+"\x00"+zone.ScreenProfile)
+	}
+	if len(zones) == 0 {
+		return ""
+	}
+	sort.Strings(zones)
+
+	h := sha256.New()
+	h.Write([]byte("xpf-userspace-syn-cookie-v1\x00"))
+	if cfg.Chassis.Cluster != nil {
+		fmt.Fprintf(h, "cluster-id=%d\x00", cfg.Chassis.Cluster.ClusterID)
+	} else {
+		h.Write([]byte("standalone\x00"))
+	}
+	h.Write([]byte("root-auth-encrypted-password\x00"))
+	h.Write([]byte(secretMaterial))
+	h.Write([]byte{0})
+	for _, zone := range zones {
+		h.Write([]byte(zone))
+		h.Write([]byte{0})
+	}
+	sum := h.Sum(nil)
+	return fmt.Sprintf("%x", sum[:16])
+}
+
+func synCookieSecretMaterial(cfg *config.Config) string {
+	if cfg == nil || cfg.System.RootAuthentication == nil {
+		return ""
+	}
+	// Use already cluster-synced secret material. Do not use
+	// system master-password: it is a PRF selector for configstore
+	// at-rest encryption, not a dataplane secret.
+	return cfg.System.RootAuthentication.EncryptedPassword
+}
+
+func userspaceSynCookieProtectionActive(cfg *config.Config) bool {
+	if cfg == nil || cfg.Security.Flow.SynFloodProtectionMode != "syn-cookie" {
+		return false
+	}
+	for _, zone := range cfg.Security.Zones {
+		if zone == nil || zone.ScreenProfile == "" {
+			continue
+		}
+		profile := cfg.Security.Screen[zone.ScreenProfile]
+		if profile != nil && profile.TCP.SynFlood != nil &&
+			profile.TCP.SynFlood.AttackThreshold > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // userspaceSupportsScreenProfiles returns true if the configured screen
 // profiles only use checks that the userspace dataplane implements.
-// SYN cookies require eBPF-specific facilities and are not supported.
 // Port scan detection, IP sweep detection, and per-IP session limiting
 // are now implemented in the userspace dataplane.
 func userspaceSupportsScreenProfiles(cfg *config.Config) bool {
 	if cfg == nil || len(cfg.Security.Screen) == 0 {
 		return true
 	}
-	if cfg.Security.Flow.SynFloodProtectionMode == "syn-cookie" {
+	if userspaceSynCookieProtectionActive(cfg) && synCookieSecretMaterial(cfg) == "" {
 		return false
 	}
 	return true

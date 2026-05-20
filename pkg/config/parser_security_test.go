@@ -2312,6 +2312,121 @@ func TestZoneSetSyntax(t *testing.T) {
 	}
 }
 
+func TestValidateConfigWarnsSynCookieWithoutRootSecret(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set system dataplane-type userspace",
+		"set security flow syn-flood-protection-mode syn-cookie",
+		"set security zones security-zone trust screen flood",
+		"set security screen ids-option flood tcp syn-flood attack-threshold 100",
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig failed: %v", err)
+	}
+
+	warnings := strings.Join(cfg.Warnings, "\n")
+	if !strings.Contains(warnings, "active userspace-dp SYN-cookie screen profiles require") {
+		t.Fatalf("expected userspace SYN-cookie secret warning, got: %s", warnings)
+	}
+	if !strings.Contains(warnings, "Legacy eBPF SYN-cookie handling uses kernel helpers") {
+		t.Fatalf("expected legacy eBPF scope note, got: %s", warnings)
+	}
+}
+
+func TestValidateConfigDoesNotWarnSynCookieWithRootSecret(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set system dataplane-type userspace",
+		`set system root-authentication encrypted-password "$6$rounds=5000$salt$hash"`,
+		"set security flow syn-flood-protection-mode syn-cookie",
+		"set security zones security-zone trust screen flood",
+		"set security screen ids-option flood tcp syn-flood attack-threshold 100",
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig failed: %v", err)
+	}
+
+	warnings := strings.Join(cfg.Warnings, "\n")
+	if strings.Contains(warnings, "active userspace-dp SYN-cookie screen profiles require") {
+		t.Fatalf("unexpected userspace SYN-cookie secret warning: %s", warnings)
+	}
+}
+
+func TestValidateConfigDoesNotWarnDormantSynCookieWithoutRootSecret(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set system dataplane-type userspace",
+		"set security flow syn-flood-protection-mode syn-cookie",
+		"set security zones security-zone trust screen flood",
+		"set security screen ids-option flood tcp land",
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig failed: %v", err)
+	}
+
+	warnings := strings.Join(cfg.Warnings, "\n")
+	if strings.Contains(warnings, "active userspace-dp SYN-cookie screen profiles require") {
+		t.Fatalf("unexpected dormant userspace SYN-cookie warning: %s", warnings)
+	}
+}
+
+func TestValidateConfigDoesNotWarnDefaultDataplaneSynCookieWithoutRootSecret(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set security flow syn-flood-protection-mode syn-cookie",
+		"set security zones security-zone trust screen flood",
+		"set security screen ids-option flood tcp syn-flood attack-threshold 100",
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig failed: %v", err)
+	}
+
+	warnings := strings.Join(cfg.Warnings, "\n")
+	if strings.Contains(warnings, "active userspace-dp SYN-cookie screen profiles require") {
+		t.Fatalf("unexpected default-dataplane SYN-cookie warning: %s", warnings)
+	}
+}
+
 func TestScreenSetSyntax(t *testing.T) {
 	tree := &ConfigTree{}
 	for _, cmd := range []string{"set security screen ids-option untrust-screen icmp ping-death", "set security screen ids-option untrust-screen tcp land", "set security screen ids-option untrust-screen tcp syn-flood alarm-threshold 1000", "set security screen ids-option untrust-screen tcp syn-flood attack-threshold 500", "set security screen ids-option untrust-screen ip source-route-option"} {

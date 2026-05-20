@@ -15,6 +15,9 @@ const flowWorkerMapAllLimit = -1
 type SYNCookieCounters struct {
 	Challenges        uint64
 	SecretUnavailable uint64
+	SynAckSent        uint64
+	AckRstSent        uint64
+	ReplyBudgetDrops  uint64
 	AckValid          uint64
 	AckInvalid        uint64
 	Bypass            uint64
@@ -24,6 +27,9 @@ type SYNCookieCounters struct {
 func (c SYNCookieCounters) Any() bool {
 	return c.Challenges != 0 ||
 		c.SecretUnavailable != 0 ||
+		c.SynAckSent != 0 ||
+		c.AckRstSent != 0 ||
+		c.ReplyBudgetDrops != 0 ||
 		c.AckValid != 0 ||
 		c.AckInvalid != 0 ||
 		c.Bypass != 0
@@ -35,6 +41,9 @@ func SumSYNCookieCounters(status ProcessStatus) SYNCookieCounters {
 	for _, binding := range status.Bindings {
 		counters.Challenges += binding.SYNCookieChallenges
 		counters.SecretUnavailable += binding.SYNCookieSecretUnavailable
+		counters.SynAckSent += binding.SYNCookieSynAckSent
+		counters.AckRstSent += binding.SYNCookieAckRstSent
+		counters.ReplyBudgetDrops += binding.SYNCookieReplyBudgetDrops
 		counters.AckValid += binding.SYNCookieAckValid
 		counters.AckInvalid += binding.SYNCookieAckInvalid
 		counters.Bypass += binding.SYNCookieBypass
@@ -52,6 +61,9 @@ func FormatSYNCookieCounterRows(counters SYNCookieCounters) string {
 	fmt.Fprintf(&b, "  %-30s %s\n", "Userspace SYN-cookie scope", "all bindings")
 	fmt.Fprintf(&b, "  %-30s %d\n", "SYN-cookie challenges", counters.Challenges)
 	fmt.Fprintf(&b, "  %-30s %d\n", "SYN-cookie secret unavailable", counters.SecretUnavailable)
+	fmt.Fprintf(&b, "  %-30s %d\n", "SYN-cookie SYN-ACK sent", counters.SynAckSent)
+	fmt.Fprintf(&b, "  %-30s %d\n", "SYN-cookie ACK RST sent", counters.AckRstSent)
+	fmt.Fprintf(&b, "  %-30s %d\n", "SYN-cookie budget drops", counters.ReplyBudgetDrops)
 	fmt.Fprintf(&b, "  %-30s %d\n", "SYN-cookie ACK valid", counters.AckValid)
 	fmt.Fprintf(&b, "  %-30s %d\n", "SYN-cookie ACK invalid", counters.AckInvalid)
 	fmt.Fprintf(&b, "  %-30s %d\n", "SYN-cookie bypass", counters.Bypass)
@@ -113,6 +125,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 	var screenDrops uint64
 	var synCookieChallenges uint64
 	var synCookieSecretUnavailable uint64
+	var synCookieSynAckSent uint64
+	var synCookieAckRstSent uint64
+	var synCookieReplyBudgetDrops uint64
 	var synCookieAckValid uint64
 	var synCookieAckInvalid uint64
 	var synCookieBypass uint64
@@ -201,6 +216,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 		screenDrops += binding.ScreenDrops
 		synCookieChallenges += binding.SYNCookieChallenges
 		synCookieSecretUnavailable += binding.SYNCookieSecretUnavailable
+		synCookieSynAckSent += binding.SYNCookieSynAckSent
+		synCookieAckRstSent += binding.SYNCookieAckRstSent
+		synCookieReplyBudgetDrops += binding.SYNCookieReplyBudgetDrops
 		synCookieAckValid += binding.SYNCookieAckValid
 		synCookieAckInvalid += binding.SYNCookieAckInvalid
 		synCookieBypass += binding.SYNCookieBypass
@@ -377,9 +395,14 @@ func FormatStatusSummary(status ProcessStatus) string {
 	}
 	fmt.Fprintf(&b, "  Policy denied packets:     %d\n", policyDeniedPackets)
 	fmt.Fprintf(&b, "  Screen drops:              %d\n", screenDrops)
-	if synCookieChallenges != 0 || synCookieSecretUnavailable != 0 || synCookieAckValid != 0 || synCookieAckInvalid != 0 || synCookieBypass != 0 {
-		fmt.Fprintf(&b, "  SYN-cookie counters:       challenges=%d unavailable=%d ack_valid=%d ack_invalid=%d bypass=%d\n",
-			synCookieChallenges, synCookieSecretUnavailable, synCookieAckValid, synCookieAckInvalid, synCookieBypass)
+	if synCookieChallenges != 0 || synCookieSecretUnavailable != 0 ||
+		synCookieSynAckSent != 0 || synCookieAckRstSent != 0 ||
+		synCookieReplyBudgetDrops != 0 || synCookieAckValid != 0 ||
+		synCookieAckInvalid != 0 || synCookieBypass != 0 {
+		fmt.Fprintf(&b, "  SYN-cookie counters:       challenges=%d unavailable=%d syn_ack_sent=%d ack_rst_sent=%d budget_drops=%d ack_valid=%d ack_invalid=%d bypass=%d\n",
+			synCookieChallenges, synCookieSecretUnavailable, synCookieSynAckSent,
+			synCookieAckRstSent, synCookieReplyBudgetDrops, synCookieAckValid,
+			synCookieAckInvalid, synCookieBypass)
 	}
 	fmt.Fprintf(&b, "  SNAT packets:              %d\n", snatPackets)
 	fmt.Fprintf(&b, "  DNAT packets:              %d\n", dnatPackets)

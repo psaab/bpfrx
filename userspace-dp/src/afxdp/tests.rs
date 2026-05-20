@@ -4290,14 +4290,20 @@ fn syn_cookie_counters_hot_path_accumulate_in_batch() {
     counters.touched = true;
     counters.syn_cookie_challenges = 2;
     counters.syn_cookie_secret_unavailable = 3;
-    counters.syn_cookie_ack_valid = 5;
-    counters.syn_cookie_ack_invalid = 7;
-    counters.syn_cookie_bypass = 11;
+    counters.syn_cookie_syn_ack_sent = 5;
+    counters.syn_cookie_ack_rst_sent = 7;
+    counters.syn_cookie_reply_budget_drops = 11;
+    counters.syn_cookie_ack_valid = 13;
+    counters.syn_cookie_ack_invalid = 17;
+    counters.syn_cookie_bypass = 19;
 
     counters.flush(&live);
 
     assert_eq!(counters.syn_cookie_challenges, 0);
     assert_eq!(counters.syn_cookie_secret_unavailable, 0);
+    assert_eq!(counters.syn_cookie_syn_ack_sent, 0);
+    assert_eq!(counters.syn_cookie_ack_rst_sent, 0);
+    assert_eq!(counters.syn_cookie_reply_budget_drops, 0);
     assert_eq!(counters.syn_cookie_ack_valid, 0);
     assert_eq!(counters.syn_cookie_ack_invalid, 0);
     assert_eq!(counters.syn_cookie_bypass, 0);
@@ -4306,7 +4312,13 @@ fn syn_cookie_counters_hot_path_accumulate_in_batch() {
         live.syn_cookie_secret_unavailable.load(Ordering::Relaxed),
         3
     );
-    assert_eq!(live.syn_cookie_ack_valid.load(Ordering::Relaxed), 5);
-    assert_eq!(live.syn_cookie_ack_invalid.load(Ordering::Relaxed), 7);
-    assert_eq!(live.syn_cookie_bypass.load(Ordering::Relaxed), 11);
+    assert_eq!(live.syn_cookie_syn_ack_sent.load(Ordering::Relaxed), 5);
+    assert_eq!(live.syn_cookie_ack_rst_sent.load(Ordering::Relaxed), 7);
+    assert_eq!(
+        live.syn_cookie_reply_budget_drops.load(Ordering::Relaxed),
+        11
+    );
+    assert_eq!(live.syn_cookie_ack_valid.load(Ordering::Relaxed), 13);
+    assert_eq!(live.syn_cookie_ack_invalid.load(Ordering::Relaxed), 17);
+    assert_eq!(live.syn_cookie_bypass.load(Ordering::Relaxed), 19);
 }

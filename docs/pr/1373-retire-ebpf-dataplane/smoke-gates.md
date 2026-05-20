@@ -114,10 +114,12 @@ ICMP-flood-only. Each subcheck requires the aggregate counter to advance after
 its matching probe. It always redeploys the baseline config on exit so the low
 thresholds do not contaminate reruns or later CoS measurements.
 
-This is not the #1374 SYN-cookie proof. SYN-cookie runtime integration remains
-tracked by #1374; BPF retirement remains blocked until the SYN-cookie issue
-adds its own runtime gate. This section covers the LAND, SYN-flood, and
-ICMP-flood screen plumbing that already exists in userspace.
+This is not the #1374 SYN-cookie proof. SYN-cookie runtime support is now wired
+in userspace, but BPF source removal still needs a dedicated #1374 artifact set
+showing SYN-ACK replies, validated-ACK RST replies, retransmitted-SYN
+admission, random-ACK drops, reply-budget accounting, and HA failover
+acceptance. This section covers the LAND, SYN-flood, and ICMP-flood screen
+plumbing baseline.
 
 ```bash
 set -euo pipefail

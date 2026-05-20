@@ -30,6 +30,9 @@ const (
 	systemBufferLabelTXSubmitErrorDrops     = "TX submit error drops"
 	systemBufferLabelSYNCookieChallenges    = "SYN-cookie challenges"
 	systemBufferLabelSYNCookieSecretUnavail = "SYN-cookie secret unavailable"
+	systemBufferLabelSYNCookieSynAckSent    = "SYN-cookie SYN-ACK sent"
+	systemBufferLabelSYNCookieAckRstSent    = "SYN-cookie ACK RST sent"
+	systemBufferLabelSYNCookieBudgetDrops   = "SYN-cookie budget drops"
 	systemBufferLabelSYNCookieAckValid      = "SYN-cookie ACK valid"
 	systemBufferLabelSYNCookieAckInvalid    = "SYN-cookie ACK invalid"
 	systemBufferLabelSYNCookieBypass        = "SYN-cookie bypass"
@@ -62,6 +65,9 @@ type systemBufferSample struct {
 	TxSubmitErrorDrops          uint64
 	SYNCookieChallenges         uint64
 	SYNCookieSecretUnavailable  uint64
+	SYNCookieSynAckSent         uint64
+	SYNCookieAckRstSent         uint64
+	SYNCookieReplyBudgetDrops   uint64
 	SYNCookieAckValid           uint64
 	SYNCookieAckInvalid         uint64
 	SYNCookieBypass             uint64
@@ -248,6 +254,9 @@ func systemBufferCounterRows(status ProcessStatus, samples []systemBufferSample,
 	var txSubmitErrorDrops uint64
 	var synCookieChallenges uint64
 	var synCookieSecretUnavailable uint64
+	var synCookieSynAckSent uint64
+	var synCookieAckRstSent uint64
+	var synCookieReplyBudgetDrops uint64
 	var synCookieAckValid uint64
 	var synCookieAckInvalid uint64
 	var synCookieBypass uint64
@@ -268,6 +277,9 @@ func systemBufferCounterRows(status ProcessStatus, samples []systemBufferSample,
 		txSubmitErrorDrops += sample.TxSubmitErrorDrops
 		synCookieChallenges += sample.SYNCookieChallenges
 		synCookieSecretUnavailable += sample.SYNCookieSecretUnavailable
+		synCookieSynAckSent += sample.SYNCookieSynAckSent
+		synCookieAckRstSent += sample.SYNCookieAckRstSent
+		synCookieReplyBudgetDrops += sample.SYNCookieReplyBudgetDrops
 		synCookieAckValid += sample.SYNCookieAckValid
 		synCookieAckInvalid += sample.SYNCookieAckInvalid
 		synCookieBypass += sample.SYNCookieBypass
@@ -296,6 +308,9 @@ func systemBufferCounterRows(status ProcessStatus, samples []systemBufferSample,
 	appendCounter(systemBufferLabelTXSubmitErrorDrops, "aggregate", txSubmitErrorDrops)
 	appendCounter(systemBufferLabelSYNCookieChallenges, "aggregate", synCookieChallenges)
 	appendCounter(systemBufferLabelSYNCookieSecretUnavail, "aggregate", synCookieSecretUnavailable)
+	appendCounter(systemBufferLabelSYNCookieSynAckSent, "aggregate", synCookieSynAckSent)
+	appendCounter(systemBufferLabelSYNCookieAckRstSent, "aggregate", synCookieAckRstSent)
+	appendCounter(systemBufferLabelSYNCookieBudgetDrops, "aggregate", synCookieReplyBudgetDrops)
 	appendCounter(systemBufferLabelSYNCookieAckValid, "aggregate", synCookieAckValid)
 	appendCounter(systemBufferLabelSYNCookieAckInvalid, "aggregate", synCookieAckInvalid)
 	appendCounter(systemBufferLabelSYNCookieBypass, "aggregate", synCookieBypass)
@@ -321,6 +336,9 @@ func systemBufferCounterRows(status ProcessStatus, samples []systemBufferSample,
 		appendCounter(systemBufferLabelTXSubmitErrorDrops, scope, sample.TxSubmitErrorDrops)
 		appendCounter(systemBufferLabelSYNCookieChallenges, scope, sample.SYNCookieChallenges)
 		appendCounter(systemBufferLabelSYNCookieSecretUnavail, scope, sample.SYNCookieSecretUnavailable)
+		appendCounter(systemBufferLabelSYNCookieSynAckSent, scope, sample.SYNCookieSynAckSent)
+		appendCounter(systemBufferLabelSYNCookieAckRstSent, scope, sample.SYNCookieAckRstSent)
+		appendCounter(systemBufferLabelSYNCookieBudgetDrops, scope, sample.SYNCookieReplyBudgetDrops)
 		appendCounter(systemBufferLabelSYNCookieAckValid, scope, sample.SYNCookieAckValid)
 		appendCounter(systemBufferLabelSYNCookieAckInvalid, scope, sample.SYNCookieAckInvalid)
 		appendCounter(systemBufferLabelSYNCookieBypass, scope, sample.SYNCookieBypass)
@@ -419,6 +437,9 @@ func systemBufferSamples(status ProcessStatus) []systemBufferSample {
 			TxSubmitErrorDrops:          binding.TxSubmitErrorDrops,
 			SYNCookieChallenges:         binding.SYNCookieChallenges,
 			SYNCookieSecretUnavailable:  binding.SYNCookieSecretUnavailable,
+			SYNCookieSynAckSent:         binding.SYNCookieSynAckSent,
+			SYNCookieAckRstSent:         binding.SYNCookieAckRstSent,
+			SYNCookieReplyBudgetDrops:   binding.SYNCookieReplyBudgetDrops,
 			SYNCookieAckValid:           binding.SYNCookieAckValid,
 			SYNCookieAckInvalid:         binding.SYNCookieAckInvalid,
 			SYNCookieBypass:             binding.SYNCookieBypass,
@@ -491,6 +512,15 @@ func (sample *systemBufferSample) applyBindingStatusFallback(binding BindingStat
 	}
 	if sample.SYNCookieSecretUnavailable == 0 {
 		sample.SYNCookieSecretUnavailable = binding.SYNCookieSecretUnavailable
+	}
+	if sample.SYNCookieSynAckSent == 0 {
+		sample.SYNCookieSynAckSent = binding.SYNCookieSynAckSent
+	}
+	if sample.SYNCookieAckRstSent == 0 {
+		sample.SYNCookieAckRstSent = binding.SYNCookieAckRstSent
+	}
+	if sample.SYNCookieReplyBudgetDrops == 0 {
+		sample.SYNCookieReplyBudgetDrops = binding.SYNCookieReplyBudgetDrops
 	}
 	if sample.SYNCookieAckValid == 0 {
 		sample.SYNCookieAckValid = binding.SYNCookieAckValid

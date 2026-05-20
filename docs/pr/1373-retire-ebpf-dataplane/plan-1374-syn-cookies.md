@@ -16,7 +16,7 @@ SYN cookie behavior in `userspace-dp`.
   profile the actual TX completion cost instead of assuming in-place RX-to-TX
   bounce is required.
 
-## Current Slice Status (2026-05-18)
+## Current Slice Status (2026-05-19)
 
 - #1393 landed the deterministic userspace cookie codec/layout and codec tests.
 - This runtime slice carries `syn_cookie` through Go and Rust screen snapshots,
@@ -26,27 +26,45 @@ SYN cookie behavior in `userspace-dp`.
   session lookup misses.
 - The 2026-05-18 closeout slice makes validated-client cache hits visible as an
   explicit single-use `SynCookieBypass`, pins cache expiration at the one-epoch
-  TTL boundary, pins current/previous cookie-epoch ACK validation, and wires
-  per-binding helper status counters for selected challenges, no-secret
-  fail-closed decisions, valid ACKs, invalid ACKs, and bypasses.
+  TTL boundary, pins cookie-epoch ACK validation, and wires per-binding helper
+  status counters for selected challenges, no-secret fail-closed decisions,
+  valid ACKs, invalid ACKs, and bypasses.
 - Go helper status renders those counters, and the HA/BPF compatibility counter
-  sync mirrors valid ACK, invalid ACK, and bypass deltas. Challenge decisions are
-  deliberately not mapped to the legacy sent counter until bounded SYN-ACK TX
-  exists.
-- The 2026-05-19 construction slice adds pure SYN-cookie SYN-ACK and validated
-  ACK RST frame builders. The builders swap Ethernet/IP/TCP identity, preserve
-  VLAN headers, emit minimal TCP replies, and recompute IPv4/IPv6 checksums
-  from scratch. This intentionally stops before TX-ring integration.
-- The userspace capability gate remains in place until bounded SYN-ACK TX,
-  bounded ACK RST emission, HA-safe secret publication/cache survivability,
-  sent/budget TX counters, and integration/failover validation land.
+  sync initially mirrored valid ACK, invalid ACK, and bypass deltas while the TX
+  reply path was still absent.
+- The 2026-05-19 closeout slice adds pure SYN-cookie SYN-ACK and validated ACK
+  RST frame builders, wires the screen verdicts into the AF_XDP worker TX path,
+  publishes a 16-byte snapshot key derived from cluster-synced root
+  encrypted-password material, and admits active userspace `syn-cookie` screen
+  profiles only after that HA-safe secret material exists.
+- SYN-cookie replies are admitted only when the binding has enough pending-TX
+  and free-frame headroom to preserve a full `TX_BATCH_SIZE` reserve for normal
+  forwarding. Budget exhaustion drops the flood reply path and increments
+  `syn_cookie_reply_budget_drops`; it does not consume forwarding frames.
+- If the committed config lacks cluster-synced secret material, the snapshot
+  omits the key and the helper fails closed through
+  `syn_cookie_secret_unavailable` rather than minting predictable cookies.
+- Binding status, `show system buffers`, `show security screen`, and the
+  userspace status summary expose challenge, secret-unavailable, SYN-ACK sent,
+  ACK RST sent, reply-budget-drop, valid-ACK, invalid-ACK, and bypass counters.
+  Legacy global sync maps userspace SYN-ACK sends to the BPF-compatible
+  `GLOBAL_CTR_SYNCOOKIE_SENT` delta and keeps secret-unavailable/budget drops
+  as userspace-local diagnostics.
+- Remaining #1374 work is evidence, not a known code gate: run the live
+  userspace HA/flood validation before Phase 4 BPF source removal to prove
+  SYN-ACK replies, validated ACK/RST, retransmitted SYN admission, random ACK
+  drops, budget-drop accounting, and failover acceptance within the epoch
+  overlap.
 
 ## Design
 
 Use SipHash, not HMAC-SHA1/SHA256. Linux SYN cookies and the current kernel
 kfunc path use SipHash-class keyed hashing, and the transmitted budget is only
-the 32-bit TCP ISN. Per-zone secrets rotate every 64 seconds using a monotonic
-epoch. Validation accepts the current and previous epochs.
+the 32-bit TCP ISN. Per-zone secrets rotate every 64 seconds using a Unix
+wall-clock epoch. Validation accepts the current, previous, and next epochs.
+The next-epoch candidate is deliberately only a validation-side tolerance for
+HA peers whose clocks straddle a 64-second boundary during failover; minting
+still uses the local current epoch.
 
 Cookie ISN layout:
 
@@ -54,18 +72,18 @@ Cookie ISN layout:
 [5 bits epoch] [3 bits MSS index] [24 bits MAC]
 ```
 
-The transmitted epoch field is only `epoch & 0x1f`. The full monotonic epoch is
-still part of the MAC input and secret derivation. Validation reconstructs
-candidate full epochs from the current and previous full epochs, then accepts
-only candidates whose low 5 bits match the transmitted field and whose MAC
-validates. A cookie minted 32 epochs ago has the same transmitted low bits as
-the current epoch but must reject because the full epoch used for MAC/secret
-derivation is outside the current/previous validation window.
+The transmitted epoch field is only `epoch & 0x1f`. The full wall-clock epoch
+is still part of the MAC input and secret derivation. Validation reconstructs
+candidate full epochs from `current + 1`, current, and previous full epochs,
+then accepts only candidates whose low 5 bits match the transmitted field and
+whose MAC validates. A cookie minted 32 epochs ago has the same transmitted low
+bits as the current epoch but must reject because the full epoch used for
+MAC/secret derivation is outside the three-epoch validation window.
 
 The MAC covers source/destination IPs, ports, MSS index, zone, and the full
-monotonic epoch. The secret is cluster-consistent: either synced as HA state or
-derived from an HA-synced master key plus `(zone_id, full_epoch)`. Local-only
-secrets are rejected because failover would invalidate in-flight cookies.
+wall-clock epoch. The secret is cluster-consistent: derived from an HA-synced
+master key plus `(zone_id, full_epoch)`. Local-only secrets are rejected because
+failover would invalidate in-flight cookies.
 
 On flood threshold:
 
@@ -81,13 +99,20 @@ On returning ACK:
 2. On success, mark the client validated and send RST, matching the current
    eBPF behavior; the client's retransmitted SYN then creates the normal
    policy/NAT/session path.
-3. On failure, drop with no session creation and increment invalid-cookie
-   counters.
+3. On failure during a local active flood window, drop with no session creation
+   and increment invalid-cookie counters. Outside a local active window, invalid
+   ACKs remain `NotApplicable` so standby peers do not start dropping unrelated
+   session-miss ACKs solely because cookie mode is configured. Standby
+   validation is guarded by a cheap transmitted-epoch prefilter and a per-zone
+   per-second validation budget before SipHash runs.
 
 ## Hot-Path Invariants
 
 - No heap allocation while deciding SYN cookie mint or ACK validation.
 - SipHash key lookup is per-zone and read-only on the published snapshot.
+- Inactive peers do not run SipHash for ACKs whose transmitted low epoch bits
+  cannot match `current + 1`, current, or previous full epochs; plausible ACKs
+  are then capped by a fixed per-zone validation budget.
 - Validated-client state is a fixed-size keyed table; attacker-controlled
   tuples do not enter `FxHashMap` or an unbounded queue.
 - Per-zone SYN-cookie active/counter state is config-bound and prepopulated on
@@ -95,28 +120,40 @@ On returning ACK:
 - Cookie reply frame allocation is bounded; normal forwarding frame ownership
   takes priority over diagnostic/flood replies.
 - Random ACKs never install sessions.
+- SYN-cookie replies are host-generated control replies, not forwarded transit
+  packets. They intentionally bypass output filters, CoS classification, DSCP
+  rewrite, and mirroring, matching the legacy eBPF `XDP_TX` contract.
 
 ## State and HA Behavior
 
-- Secrets are consistent across active and backup nodes with current+previous
-  epoch overlap.
-- Epoch uses monotonic time, not wall clock, so NTP rollback does not invalidate
-  cookies.
-- Epoch publication must be generation-atomic with the secret snapshot: workers
-  must not see a new full epoch with an old per-zone secret or the reverse.
+- The daemon publishes a snapshot key only when the committed config contains
+  root encrypted-password material that is shared by the HA peers. Active and
+  backup nodes receiving the same committed config derive the same
+  current/previous/next epoch cookie validation window.
+- Epoch uses Unix wall-clock seconds instead of per-node monotonic uptime so HA
+  peers with synchronized clocks validate cookies minted by the former active
+  node after failover. Large wall-clock skew can still fail closed and is part
+  of the live HA/flood evidence gate.
+- The snapshot key is static for a committed config; epoch calculation happens
+  locally from the wall clock and does not require per-epoch control-plane
+  publication.
 - Failover during an active flood continues accepting cookies minted by the
-  former active node for the overlap window.
-- `synproxy_active`, sent, valid, invalid, bypass, and budget-drop counters are
-  exposed in userspace status.
+  former active node for the overlap window even if the new active peer has not
+  observed the local flood threshold. A valid cookie ACK is self-authenticating
+  against the shared key, tuple, zone, MSS index, and current/previous/next
+  wall-clock epoch; invalid ACKs outside a local active window remain
+  `NotApplicable`.
+- `synproxy_active`, challenge, no-secret, SYN-ACK sent, ACK RST sent, valid,
+  invalid, bypass, and budget-drop counters are exposed in userspace status.
 
 ## Risks
 
 - Replay/wrap: the low 5 transmitted epoch bits wrap every 32 epochs. The
   full-epoch MAC rule above is mandatory to prevent old cookies from becoming
   valid again at low-bit wrap.
-- Failover skew: active and backup nodes need bounded monotonic-epoch skew or a
-  shared epoch source; otherwise cookies minted immediately before failover can
-  be rejected by the new active node.
+- Failover skew: active and backup nodes need bounded wall-clock skew;
+  otherwise cookies minted immediately before failover can be rejected by the
+  new active node.
 - Budget starvation: cookie replies are useful only if the bounded reply budget
   cannot drain normal forwarding frames. Drop accounting must distinguish
   invalid-cookie drops from reply-budget drops.
@@ -137,6 +174,8 @@ On returning ACK:
 - Cargo: `screen::syn_cookie_ack_validation_marks_next_syn_bypass_without_session_creation`.
 - Cargo: `screen::syn_cookie_validated_syn_still_runs_later_screen_checks`.
 - Cargo: `screen::syn_cookie_invalid_ack_does_not_validate_client`.
+- Cargo: `screen::syn_cookie_ack_validates_on_peer_without_local_active_window`.
+- Cargo: `screen::syn_cookie_invalid_ack_without_active_window_remains_not_applicable`.
 - Cargo: `screen::syn_cookie_ack_fin_is_invalid_while_cookie_mode_is_active`.
 - Cargo: `screen::syn_cookie_validated_cache_is_bounded`.
 - Cargo: `screen::syn_cookie_validated_cache_index_is_keyed`.
@@ -147,6 +186,7 @@ On returning ACK:
 - Cargo: `screen::syn_cookie_validated_cache_refresh_extends_ttl`.
 - Cargo: `screen::syn_cookie_ack_validation_accepts_previous_epoch_after_rotation`.
 - Cargo: `afxdp::poll_stages::session_miss_ack_stage_invokes_syn_cookie_runtime_validation`.
+- Cargo: `afxdp::poll_descriptor::syn_cookie_reply_tests::syn_cookie_reply_budget_preserves_tx_batch_reserve`.
 - Cargo: `afxdp::frame::tests::syn_cookie_syn_ack_builder_swaps_tuple_and_preserves_vlan`.
 - Cargo: `afxdp::frame::tests::syn_cookie_ack_rst_builder_uses_received_ack_as_rst_seq`.
 - Cargo: `afxdp::tests::syn_cookie_counters_hot_path_accumulate_in_batch`.
@@ -156,11 +196,10 @@ On returning ACK:
 - Cargo: `protocol::tests::syn_cookie_counters_binding_status_wire_roundtrip`.
 - Go: `TestSumBindingCounters` and `TestFormatStatusSummary` pin helper-side
   aggregation/status rendering for the userspace SYN-cookie counters.
-- Go: while the gate remains, keep the `SynFloodProtectionMode == "syn-cookie"`
-  capability rejection pinned and verify screen snapshots carry `syn_cookie` for
-  the runtime path.
-- Go: remove/update the `SynFloodProtectionMode == "syn-cookie"` capability
-  rejection and the manager test that pins it.
+- Go: `TestUserspaceSupportsScreenProfilesAllowsSynCookie`,
+  `TestDeriveUserspaceCapabilitiesAllowsSynCookieScreen`, and
+  `TestBuildScreenSnapshotsMarksSynCookieMode` pin gate removal, snapshot
+  admission, and deterministic master-key publication.
 - Integration: hping3 SYN flood against the userspace HA cluster with
   `syn-cookie` configured; verify SYN-ACK replies, legitimate retransmitted SYN
   admission after validated ACK/RST, random ACK drops, and failover acceptance

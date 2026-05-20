@@ -14,7 +14,10 @@ The daemon stores dataplane backends behind `dataplane.RuntimeDataPlane` and
 uses the split config, HA/fabric, sessions, telemetry, and link-cycle domains.
 Legacy `dataplane.DataPlane` access is isolated behind `legacyDP()` for
 callers that still need eBPF/DPDK compatibility while their domain adapters
-are completed.
+are completed. Userspace currently reaches those old callers through
+`userspace.LegacyDataPlaneAdapter`; the userspace `Manager` remains a
+runtime-domain type, and the adapter is only the transition boundary for
+status, CLI, and cluster-sync paths that still call `legacyDP()`.
 
 Config apply uses the runtime `ConfigSink.ApplyConfig` path. This is required
 for userspace AF_XDP, which is intentionally not exposed as a legacy

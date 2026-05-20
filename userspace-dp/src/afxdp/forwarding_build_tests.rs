@@ -41,6 +41,33 @@ fn three_color_snapshot(burst: u64) -> ConfigSnapshot {
 }
 
 #[test]
+fn parse_syn_cookie_master_key_accepts_exact_hex_key() {
+    assert_eq!(
+        parse_syn_cookie_master_key("00112233445566778899aabbccddeeff"),
+        Some([
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ])
+    );
+}
+
+#[test]
+fn parse_syn_cookie_master_key_rejects_malformed_keys() {
+    for key in [
+        "",
+        "00112233445566778899aabbccddee",
+        "00112233445566778899aabbccddeeff00",
+        "00112233445566778899aabbccddeefg",
+    ] {
+        assert_eq!(
+            parse_syn_cookie_master_key(key),
+            None,
+            "key {key:?} should fail closed"
+        );
+    }
+}
+
+#[test]
 fn forwarding_state_refresh_preserves_three_color_runtime_state() {
     let policy_counters = PolicyCounterStore::default();
     let snapshot = three_color_snapshot(100);
@@ -836,14 +863,18 @@ fn build_forwarding_state_rejects_reserved_zone_ids() {
     assert_eq!(state.zone_name_to_id.get("ok").copied(), Some(5));
     assert!(state.zone_name_to_id.get("reserved-edge").is_none());
     assert!(state.zone_name_to_id.get("global-sentinel").is_none());
-    assert!(state
-        .zone_id_to_name
-        .get(&crate::policy::ZONE_ID_RESERVED_MIN)
-        .is_none());
-    assert!(state
-        .zone_id_to_name
-        .get(&crate::policy::JUNOS_GLOBAL_ZONE_ID)
-        .is_none());
+    assert!(
+        state
+            .zone_id_to_name
+            .get(&crate::policy::ZONE_ID_RESERVED_MIN)
+            .is_none()
+    );
+    assert!(
+        state
+            .zone_id_to_name
+            .get(&crate::policy::JUNOS_GLOBAL_ZONE_ID)
+            .is_none()
+    );
 }
 
 /// #921: ifindex_to_zone_id is populated at config build time

@@ -43,6 +43,9 @@ var mirror_counter_wire_keys = []string{
 var syn_cookie_counter_wire_keys = []string{
 	"syn_cookie_challenges",
 	"syn_cookie_secret_unavailable",
+	"syn_cookie_syn_ack_sent",
+	"syn_cookie_ack_rst_sent",
+	"syn_cookie_reply_budget_drops",
 	"syn_cookie_ack_valid",
 	"syn_cookie_ack_invalid",
 	"syn_cookie_bypass",
@@ -109,9 +112,12 @@ func TestBindingStatusSYNCookieCountersRoundTrip(t *testing.T) {
 		QueueID:                    2,
 		SYNCookieChallenges:        3,
 		SYNCookieSecretUnavailable: 5,
-		SYNCookieAckValid:          7,
-		SYNCookieAckInvalid:        11,
-		SYNCookieBypass:            13,
+		SYNCookieSynAckSent:        7,
+		SYNCookieAckRstSent:        11,
+		SYNCookieReplyBudgetDrops:  13,
+		SYNCookieAckValid:          17,
+		SYNCookieAckInvalid:        19,
+		SYNCookieBypass:            23,
 	}
 	raw, err := json.Marshal(&in)
 	if err != nil {
@@ -137,6 +143,18 @@ func TestBindingStatusSYNCookieCountersRoundTrip(t *testing.T) {
 	if back.SYNCookieSecretUnavailable != in.SYNCookieSecretUnavailable {
 		t.Fatalf("SYNCookieSecretUnavailable: got %d, want %d",
 			back.SYNCookieSecretUnavailable, in.SYNCookieSecretUnavailable)
+	}
+	if back.SYNCookieSynAckSent != in.SYNCookieSynAckSent {
+		t.Fatalf("SYNCookieSynAckSent: got %d, want %d",
+			back.SYNCookieSynAckSent, in.SYNCookieSynAckSent)
+	}
+	if back.SYNCookieAckRstSent != in.SYNCookieAckRstSent {
+		t.Fatalf("SYNCookieAckRstSent: got %d, want %d",
+			back.SYNCookieAckRstSent, in.SYNCookieAckRstSent)
+	}
+	if back.SYNCookieReplyBudgetDrops != in.SYNCookieReplyBudgetDrops {
+		t.Fatalf("SYNCookieReplyBudgetDrops: got %d, want %d",
+			back.SYNCookieReplyBudgetDrops, in.SYNCookieReplyBudgetDrops)
 	}
 	if back.SYNCookieAckValid != in.SYNCookieAckValid {
 		t.Fatalf("SYNCookieAckValid: got %d, want %d", back.SYNCookieAckValid, in.SYNCookieAckValid)

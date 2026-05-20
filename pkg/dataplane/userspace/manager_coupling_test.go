@@ -75,7 +75,7 @@ func TestUserspaceManagerRuntimeContractDoesNotExposeLegacyDataPlane(t *testing.
 	}
 }
 
-func TestUserspaceBackendRegistryReturnsRuntimeManagerOnly(t *testing.T) {
+func TestUserspaceBackendRegistryReturnsRuntimeAdapterForLegacyCallers(t *testing.T) {
 	t.Parallel()
 
 	if dp, err := dataplane.NewDataPlane(dataplane.TypeUserspace); err == nil {
@@ -86,8 +86,11 @@ func TestUserspaceBackendRegistryReturnsRuntimeManagerOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRuntimeDataPlane(userspace): %v", err)
 	}
-	if _, ok := any(dp).(*Manager); !ok {
-		t.Fatalf("NewRuntimeDataPlane(userspace) = %T, want *Manager", dp)
+	if _, ok := any(dp).(*LegacyDataPlaneAdapter); !ok {
+		t.Fatalf("NewRuntimeDataPlane(userspace) = %T, want *LegacyDataPlaneAdapter", dp)
+	}
+	if _, ok := any(dp).(dataplane.DataPlane); !ok {
+		t.Fatalf("NewRuntimeDataPlane(userspace) = %T, want legacy-compatible adapter", dp)
 	}
 }
 
