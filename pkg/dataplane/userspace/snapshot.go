@@ -1666,7 +1666,7 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 }
 
 func buildSYNCookieMasterKey(cfg *config.Config) string {
-	if cfg == nil || cfg.Security.Flow.SynFloodProtectionMode != "syn-cookie" {
+	if !userspaceSynCookieProtectionActive(cfg) {
 		return ""
 	}
 	secretMaterial := synCookieSecretMaterial(cfg)
@@ -1719,6 +1719,23 @@ func synCookieSecretMaterial(cfg *config.Config) string {
 	return cfg.System.RootAuthentication.EncryptedPassword
 }
 
+func userspaceSynCookieProtectionActive(cfg *config.Config) bool {
+	if cfg == nil || cfg.Security.Flow.SynFloodProtectionMode != "syn-cookie" {
+		return false
+	}
+	for _, zone := range cfg.Security.Zones {
+		if zone == nil || zone.ScreenProfile == "" {
+			continue
+		}
+		profile := cfg.Security.Screen[zone.ScreenProfile]
+		if profile != nil && profile.TCP.SynFlood != nil &&
+			profile.TCP.SynFlood.AttackThreshold > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // userspaceSupportsScreenProfiles returns true if the configured screen
 // profiles only use checks that the userspace dataplane implements.
 // Port scan detection, IP sweep detection, and per-IP session limiting
@@ -1726,6 +1743,9 @@ func synCookieSecretMaterial(cfg *config.Config) string {
 func userspaceSupportsScreenProfiles(cfg *config.Config) bool {
 	if cfg == nil || len(cfg.Security.Screen) == 0 {
 		return true
+	}
+	if userspaceSynCookieProtectionActive(cfg) && synCookieSecretMaterial(cfg) == "" {
+		return false
 	}
 	return true
 }

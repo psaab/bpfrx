@@ -3725,6 +3725,9 @@ func TestDeriveUserspaceCapabilitiesAllowsBasicScreenProfile(t *testing.T) {
 func TestDeriveUserspaceCapabilitiesAllowsSynCookieScreen(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Flow.SynFloodProtectionMode = "syn-cookie"
+	cfg.System.RootAuthentication = &config.RootAuthConfig{
+		EncryptedPassword: "$6$rounds=5000$salt$hash",
+	}
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
 		"trust": {Name: "trust", ScreenProfile: "flood"},
 	}
@@ -3737,6 +3740,29 @@ func TestDeriveUserspaceCapabilitiesAllowsSynCookieScreen(t *testing.T) {
 	caps := deriveUserspaceCapabilities(cfg)
 	if !caps.ForwardingSupported {
 		t.Fatalf("ForwardingSupported = false, reasons: %+v", caps.UnsupportedReasons)
+	}
+}
+
+func TestDeriveUserspaceCapabilitiesRejectsSynCookieWithoutRootSecret(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Flow.SynFloodProtectionMode = "syn-cookie"
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Name: "trust", ScreenProfile: "flood"},
+	}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"flood": {
+			Name: "flood",
+			TCP:  config.TCPScreen{SynFlood: &config.SynFloodConfig{AttackThreshold: 100}},
+		},
+	}
+	caps := deriveUserspaceCapabilities(cfg)
+	if caps.ForwardingSupported {
+		t.Fatal("ForwardingSupported = true, want false without SYN-cookie secret material")
+	}
+	if len(caps.UnsupportedReasons) != 1 ||
+		!strings.Contains(caps.UnsupportedReasons[0], "root-authentication") {
+		t.Fatalf("UnsupportedReasons = %+v, want SYN-cookie root-authentication reason",
+			caps.UnsupportedReasons)
 	}
 }
 

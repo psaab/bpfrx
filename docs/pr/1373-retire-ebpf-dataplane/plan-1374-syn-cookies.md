@@ -60,8 +60,8 @@ SYN cookie behavior in `userspace-dp`.
 
 Use SipHash, not HMAC-SHA1/SHA256. Linux SYN cookies and the current kernel
 kfunc path use SipHash-class keyed hashing, and the transmitted budget is only
-the 32-bit TCP ISN. Per-zone secrets rotate every 64 seconds using a monotonic
-epoch. Validation accepts the current and previous epochs.
+the 32-bit TCP ISN. Per-zone secrets rotate every 64 seconds using a Unix
+wall-clock epoch. Validation accepts the current and previous epochs.
 
 Cookie ISN layout:
 
@@ -69,8 +69,8 @@ Cookie ISN layout:
 [5 bits epoch] [3 bits MSS index] [24 bits MAC]
 ```
 
-The transmitted epoch field is only `epoch & 0x1f`. The full monotonic epoch is
-still part of the MAC input and secret derivation. Validation reconstructs
+The transmitted epoch field is only `epoch & 0x1f`. The full wall-clock epoch
+is still part of the MAC input and secret derivation. Validation reconstructs
 candidate full epochs from the current and previous full epochs, then accepts
 only candidates whose low 5 bits match the transmitted field and whose MAC
 validates. A cookie minted 32 epochs ago has the same transmitted low bits as
@@ -78,9 +78,9 @@ the current epoch but must reject because the full epoch used for MAC/secret
 derivation is outside the current/previous validation window.
 
 The MAC covers source/destination IPs, ports, MSS index, zone, and the full
-monotonic epoch. The secret is cluster-consistent: either synced as HA state or
-derived from an HA-synced master key plus `(zone_id, full_epoch)`. Local-only
-secrets are rejected because failover would invalidate in-flight cookies.
+wall-clock epoch. The secret is cluster-consistent: derived from an HA-synced
+master key plus `(zone_id, full_epoch)`. Local-only secrets are rejected because
+failover would invalidate in-flight cookies.
 
 On flood threshold:
 
@@ -110,6 +110,9 @@ On returning ACK:
 - Cookie reply frame allocation is bounded; normal forwarding frame ownership
   takes priority over diagnostic/flood replies.
 - Random ACKs never install sessions.
+- SYN-cookie replies are host-generated control replies, not forwarded transit
+  packets. They intentionally bypass output filters, CoS classification, DSCP
+  rewrite, and mirroring, matching the legacy eBPF `XDP_TX` contract.
 
 ## State and HA Behavior
 
@@ -117,10 +120,13 @@ On returning ACK:
   root encrypted-password material that is shared by the HA peers. Active and
   backup nodes receiving the same committed config derive the same
   current+previous epoch cookie validation window.
-- Epoch uses monotonic time, not wall clock, so NTP rollback does not invalidate
-  cookies.
-- Epoch publication must be generation-atomic with the secret snapshot: workers
-  must not see a new full epoch with an old per-zone secret or the reverse.
+- Epoch uses Unix wall-clock seconds instead of per-node monotonic uptime so HA
+  peers with synchronized clocks validate cookies minted by the former active
+  node after failover. Large wall-clock skew can still fail closed and is part
+  of the live HA/flood evidence gate.
+- The snapshot key is static for a committed config; epoch calculation happens
+  locally from the wall clock and does not require per-epoch control-plane
+  publication.
 - Failover during an active flood should continue accepting cookies minted by
   the former active node for the overlap window; the required cluster smoke
   must verify this property before BPF source removal.

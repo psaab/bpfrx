@@ -124,8 +124,15 @@ helper-local fail-closed and backpressure conditions. The validated-client cache
 is local, but the snapshot-published key is derived from cluster-synced root
 encrypted-password material so peers with the same committed config can
 validate cookies minted by the former active node inside the current/previous
-epoch overlap. If that secret material is absent, userspace omits the key and
-fails closed instead of minting predictable cookies.
+Unix wall-clock epoch overlap. If that secret material is absent, userspace
+omits the key and fails closed instead of minting predictable cookies; config
+validation also warns and userspace capability admission refuses active
+SYN-cookie screen profiles until the secret exists.
+
+Cookie replies are host-generated flood-control frames. They intentionally
+bypass output filters, CoS classification, DSCP rewrite, and mirroring, matching
+the legacy eBPF `XDP_TX` behavior instead of treating replies as forwarded
+transit packets.
 
 ## Prometheus Metrics
 

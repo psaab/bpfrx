@@ -18,6 +18,7 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::net::IpAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
@@ -118,8 +119,16 @@ impl SynCookieCodec {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn full_epoch_from_monotonic_secs(monotonic_secs: u64) -> u64 {
-        monotonic_secs / Self::EPOCH_SECS
+    pub(crate) fn full_epoch_from_unix_secs(unix_secs: u64) -> u64 {
+        unix_secs / Self::EPOCH_SECS
+    }
+
+    fn current_full_epoch() -> u64 {
+        let unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        Self::full_epoch_from_unix_secs(unix_secs)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -763,6 +772,9 @@ pub(crate) struct ScreenState {
     syn_cookie_active_until_secs: FxHashMap<String, u64>,
     syn_cookie_codec: Option<SynCookieCodec>,
     syn_cookie_validated: SynCookieValidatedCache,
+    syn_cookie_last_full_epoch: u64,
+    #[cfg(test)]
+    syn_cookie_full_epoch_override: Option<u64>,
     // Advanced screen trackers (shared across all zones since they track per-IP)
     session_limits: SessionLimitTracker,
     port_scan: PortScanTracker,
@@ -780,6 +792,9 @@ impl ScreenState {
             syn_cookie_active_until_secs: FxHashMap::default(),
             syn_cookie_codec: None,
             syn_cookie_validated: SynCookieValidatedCache::default(),
+            syn_cookie_last_full_epoch: 0,
+            #[cfg(test)]
+            syn_cookie_full_epoch_override: None,
             session_limits: SessionLimitTracker::default(),
             port_scan: PortScanTracker::default(),
             ip_sweep: IpSweepTracker::default(),
@@ -807,9 +822,10 @@ impl ScreenState {
     }
 
     /// Publish the cluster-wide SYN-cookie master key into this worker's screen
-    /// state. Production snapshots derive this key from committed config so
-    /// peers use the same epoch/MAC material across failover; `None` still
-    /// clears the codec and validated-client cache fail-closed.
+    /// state. Production snapshots derive this key from committed config and
+    /// the cookie epoch is based on Unix wall-clock seconds, so HA peers use
+    /// the same epoch/MAC material across failover when clocks are in sync.
+    /// `None` still clears the codec and validated-client cache fail-closed.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn update_syn_cookie_master_key(&mut self, master_key: Option<[u8; 16]>) {
         if let Some(master_key) = master_key {
@@ -821,6 +837,21 @@ impl ScreenState {
             self.syn_cookie_codec = None;
             self.syn_cookie_validated.clear();
         }
+    }
+
+    fn current_syn_cookie_full_epoch(&mut self) -> u64 {
+        #[cfg(test)]
+        if let Some(epoch) = self.syn_cookie_full_epoch_override {
+            return epoch;
+        }
+        let epoch = SynCookieCodec::current_full_epoch();
+        self.syn_cookie_last_full_epoch = self.syn_cookie_last_full_epoch.max(epoch);
+        self.syn_cookie_last_full_epoch
+    }
+
+    #[cfg(test)]
+    fn set_syn_cookie_full_epoch_for_test(&mut self, full_epoch: u64) {
+        self.syn_cookie_full_epoch_override = Some(full_epoch);
     }
 
     /// Returns true if any zone has a screen profile configured.
@@ -996,8 +1027,7 @@ impl ScreenState {
                             let Some(codec) = self.syn_cookie_codec else {
                                 return ScreenVerdict::Drop("syn-cookie-unavailable");
                             };
-                            let full_epoch =
-                                SynCookieCodec::full_epoch_from_monotonic_secs(now_secs);
+                            let full_epoch = self.current_syn_cookie_full_epoch();
                             let cookie_isn = codec.mint_isn(
                                 SynCookieTuple::from_packet(pkt),
                                 zone_id,
@@ -1113,7 +1143,7 @@ impl ScreenState {
             return SynCookieAckVerdict::Invalid;
         };
         let cookie_isn = pkt.tcp_ack.wrapping_sub(1);
-        let current_epoch = SynCookieCodec::full_epoch_from_monotonic_secs(now_secs);
+        let current_epoch = self.current_syn_cookie_full_epoch();
         let tuple = SynCookieTuple::from_packet(pkt);
         if codec
             .validate_isn(tuple, zone_id, current_epoch, cookie_isn)

@@ -3164,6 +3164,70 @@ mod syn_cookie_reply_tests {
         pipeline
     }
 
+    fn tcp_v4_syn_frame() -> (Vec<u8>, UserspaceDpMeta, SessionFlow) {
+        let src_ip = std::net::Ipv4Addr::new(192, 0, 2, 10);
+        let dst_ip = std::net::Ipv4Addr::new(198, 51, 100, 20);
+        let src_port = 49152u16;
+        let dst_port = 443u16;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+            0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6,
+            0x08, 0x00,
+        ]);
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x2c, 0x12, 0x34,
+            0x40, 0x00, 64, PROTO_TCP, 0x00, 0x00,
+        ]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&src_port.to_be_bytes());
+        frame.extend_from_slice(&dst_port.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x01, // seq
+            0x00, 0x00, 0x00, 0x00, // ack
+            0x60, TCP_FLAG_SYN, 0xfa, 0xf0, // data offset / flags / window
+            0x00, 0x00, 0x00, 0x00, // checksum + urgent
+            0x02, 0x04, 0x05, 0xb4, // MSS 1460
+        ]);
+        let mut src_addr = [0u8; 16];
+        src_addr[..4].copy_from_slice(&src_ip.octets());
+        let mut dst_addr = [0u8; 16];
+        dst_addr[..4].copy_from_slice(&dst_ip.octets());
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex: 5,
+            l3_offset: 14,
+            l4_offset: 34,
+            payload_offset: 58,
+            pkt_len: (frame.len() - 14) as u16,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            tcp_flags: TCP_FLAG_SYN,
+            flow_src_addr: src_addr,
+            flow_dst_addr: dst_addr,
+            flow_src_port: src_port,
+            flow_dst_port: dst_port,
+            ..UserspaceDpMeta::default()
+        };
+        let key = SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: std::net::IpAddr::V4(src_ip),
+            dst_ip: std::net::IpAddr::V4(dst_ip),
+            src_port,
+            dst_port,
+        };
+        let flow = SessionFlow {
+            src_ip: std::net::IpAddr::V4(src_ip),
+            dst_ip: std::net::IpAddr::V4(dst_ip),
+            forward_key: key,
+        };
+        (frame, meta, flow)
+    }
+
     #[test]
     fn syn_cookie_reply_budget_preserves_tx_batch_reserve() {
         let limit = SYN_COOKIE_REPLY_PENDING_RESERVE * 2;
@@ -3188,5 +3252,41 @@ mod syn_cookie_reply_tests {
             SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
             SYN_COOKIE_REPLY_PENDING_RESERVE,
         )));
+    }
+
+    #[test]
+    fn syn_cookie_reply_enqueues_host_generated_frame_without_transit_policy_metadata() {
+        let (frame, meta, flow) = tcp_v4_syn_frame();
+        let mut pipeline = tx_pipeline(
+            SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+            0,
+        );
+        let mut counters = BatchCounters::default();
+
+        assert!(enqueue_syn_cookie_reply(
+            &mut pipeline,
+            5,
+            &frame,
+            meta,
+            Some(&flow),
+            SynCookieReply::SynAck(SynCookieChallenge {
+                cookie_isn: 0xaabb_ccdd,
+                peer_mss: 1460,
+            }),
+            &mut counters,
+        ));
+
+        let req = pipeline
+            .pending_tx_local
+            .pop_front()
+            .expect("SYN-cookie reply request");
+        assert_eq!(req.egress_ifindex, 5);
+        assert_eq!(req.cos_queue_id, None);
+        assert_eq!(req.dscp_rewrite, None);
+        assert!(!req.mirror_clone);
+        assert_eq!(req.flow_key, Some(flow.forward_key));
+        assert_eq!(counters.syn_cookie_syn_ack_sent, 1);
+        assert_eq!(counters.syn_cookie_reply_budget_drops, 0);
     }
 }

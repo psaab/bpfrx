@@ -1181,7 +1181,9 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	// TCP MSS clamping is supported in the userspace dataplane
 	// GRE acceleration (key extraction into session ports) is supported
 	if !userspaceSupportsScreenProfiles(cfg) {
-		addReason("screen features requiring SYN cookies are not implemented in the userspace dataplane")
+		addReason(
+			"userspace SYN-cookie screen profiles require system root-authentication encrypted-password material",
+		)
 	}
 	if !userspaceSupportsThreeColorPolicers(cfg) {
 		addReason("userspace three-color policers require color-blind mode and then discard")

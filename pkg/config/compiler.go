@@ -398,6 +398,16 @@ func ValidateConfig(cfg *Config) []string {
 				"see docs/services-application-identification.md.")
 	}
 
+	if cfg.Security.Flow.SynFloodProtectionMode == "syn-cookie" &&
+		(cfg.System.RootAuthentication == nil ||
+			cfg.System.RootAuthentication.EncryptedPassword == "") {
+		warnings = append(warnings,
+			"security flow syn-flood-protection-mode syn-cookie is "+
+				"configured, but userspace SYN-cookie protection requires "+
+				"system root-authentication encrypted-password material for "+
+				"the cookie key; challenges fail closed until it is set.")
+	}
+
 	// Collect valid zone names
 	zones := make(map[string]bool)
 	for name := range cfg.Security.Zones {
