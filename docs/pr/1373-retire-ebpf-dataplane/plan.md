@@ -17,7 +17,7 @@ present until later phase PRs.
 | #1377 | Userspace-v1 address-persistent SNAT pool selection, fail-closed runtime handling for unusable pool rules, helper-local per-pool `persistent-nat`, live-port exhaustion observability, and allocator counters are implemented; remaining work is HA/restart persistence decisions, integration evidence, and documented mixed-backend rollback behavior | Before Phase 4 |
 | #1378 | Scheduler state, counter survival, strict missing-scheduler behavior, deterministic evidence validation, and live HA artifact capture are complete for userspace; no known #1378 blocker remains | Before Phase 4 |
 | #1379 | Policy-deny, screen-drop, PBR filter logs, non-PBR input/output/lo0 filter logs, cached input-log replay without filter rescans, source-disambiguated FILTER_LOG syslog, and deterministic fanout coverage now emit from userspace; remaining work is live userspace-cluster syslog evidence if Phase 4 requires operator artifacts | Before Phase 4 |
-| #1374 | Userspace SYN-cookie validation/admission semantics and counters exist; remaining blockers are bounded SYN-ACK/RST TX, HA-safe secrets, integration/failover validation, and gate removal | Before Phase 4 |
+| #1374 | Userspace SYN-cookie validation/admission semantics, root-auth-derived snapshot key publication, bounded SYN-ACK/RST TX replies, counters, and gate removal exist; remaining blocker is live HA/flood validation evidence before BPF source removal | Before Phase 4 |
 | #1375 | Userspace supports the color-blind `then discard` srTCM/trTCM slice, fails closed for unsupported shapes, and preserves token/counter state across compatible in-process snapshot refreshes; remaining work is HA/restart continuity decision, non-drop color actions, and integration/perf evidence | Before Phase 4 |
 | #1376 | Userspace port mirroring has snapshot/wire plumbing plus bounded runtime admission; remaining work is mirror-fidelity and pressure-survival evidence before BPF source removal | Before Phase 4 |
 | #1380 | Userspace `show system buffers` can render helper status; remaining work is Phase 5 cleanup of BPF-map-oriented fallback and optional true-capacity fields | Phase 5 |
@@ -28,8 +28,9 @@ present until later phase PRs.
    map-writer methods as the abstract contract.
 2. Land #1377 and #1379 next because these are silent correctness or
    security-visibility gaps; #1378 is now closed by live HA evidence.
-3. Land #1374, #1375, and #1376 before Phase 4 because the current protection is
-   explicit fallback to the legacy eBPF dataplane.
+3. Land #1375 and collect #1374/#1376 live evidence before Phase 4. #1374 is
+   no longer protected by a capability fallback; it still needs the flood/HA
+   artifact set before BPF source removal.
 4. Land #1380 in Phase 5 while replacing BPF-map observability with userspace
    resource reporting.
 

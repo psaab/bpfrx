@@ -257,9 +257,12 @@ func TestFormatSystemBuffersIncludesSYNCookieCounters(t *testing.T) {
 				Interface:                  "ge-0-0-0",
 				SYNCookieChallenges:        3,
 				SYNCookieSecretUnavailable: 5,
-				SYNCookieAckValid:          7,
-				SYNCookieAckInvalid:        11,
-				SYNCookieBypass:            13,
+				SYNCookieSynAckSent:        7,
+				SYNCookieAckRstSent:        11,
+				SYNCookieReplyBudgetDrops:  13,
+				SYNCookieAckValid:          17,
+				SYNCookieAckInvalid:        19,
+				SYNCookieBypass:            23,
 			},
 			{
 				Slot:                       1,
@@ -268,9 +271,12 @@ func TestFormatSystemBuffersIncludesSYNCookieCounters(t *testing.T) {
 				Interface:                  "ge-0-0-1",
 				SYNCookieChallenges:        17,
 				SYNCookieSecretUnavailable: 19,
-				SYNCookieAckValid:          23,
-				SYNCookieAckInvalid:        29,
-				SYNCookieBypass:            31,
+				SYNCookieSynAckSent:        29,
+				SYNCookieAckRstSent:        31,
+				SYNCookieReplyBudgetDrops:  37,
+				SYNCookieAckValid:          41,
+				SYNCookieAckInvalid:        43,
+				SYNCookieBypass:            47,
 			},
 		},
 	}
@@ -280,9 +286,12 @@ func TestFormatSystemBuffersIncludesSYNCookieCounters(t *testing.T) {
 		systemBufferCountersHeading,
 		fmt.Sprintf("%-32s %-24s %12d", systemBufferLabelSYNCookieChallenges, "aggregate", 20),
 		fmt.Sprintf("%-32s %-24s %12d", systemBufferLabelSYNCookieSecretUnavail, "aggregate", 24),
-		fmt.Sprintf("%-32s %-24s %12d", systemBufferLabelSYNCookieAckValid, "aggregate", 30),
-		fmt.Sprintf("%-32s %-24s %12d", systemBufferLabelSYNCookieAckInvalid, "aggregate", 40),
-		fmt.Sprintf("%-32s %-24s %12d", systemBufferLabelSYNCookieBypass, "aggregate", 44),
+		fmt.Sprintf("%-32s %-24s %12d", systemBufferLabelSYNCookieSynAckSent, "aggregate", 36),
+		fmt.Sprintf("%-32s %-24s %12d", systemBufferLabelSYNCookieAckRstSent, "aggregate", 42),
+		fmt.Sprintf("%-32s %-24s %12d", systemBufferLabelSYNCookieBudgetDrops, "aggregate", 50),
+		fmt.Sprintf("%-32s %-24s %12d", systemBufferLabelSYNCookieAckValid, "aggregate", 58),
+		fmt.Sprintf("%-32s %-24s %12d", systemBufferLabelSYNCookieAckInvalid, "aggregate", 62),
+		fmt.Sprintf("%-32s %-24s %12d", systemBufferLabelSYNCookieBypass, "aggregate", 70),
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("FormatSystemBuffers output missing %q:\n%s", want, out)
@@ -291,8 +300,8 @@ func TestFormatSystemBuffersIncludesSYNCookieCounters(t *testing.T) {
 
 	detail := FormatSystemBuffers(status, true)
 	for _, want := range []string{
-		fmt.Sprintf("%-32s %-24s %12d", systemBufferLabelSYNCookieAckValid, "worker 0/queue 0/slot 0/ge-0-0-0", 7),
-		fmt.Sprintf("%-32s %-24s %12d", systemBufferLabelSYNCookieAckValid, "worker 1/queue 0/slot 1/ge-0-0-1", 23),
+		fmt.Sprintf("%-32s %-24s %12d", systemBufferLabelSYNCookieAckValid, "worker 0/queue 0/slot 0/ge-0-0-0", 17),
+		fmt.Sprintf("%-32s %-24s %12d", systemBufferLabelSYNCookieAckValid, "worker 1/queue 0/slot 1/ge-0-0-1", 41),
 	} {
 		if !strings.Contains(detail, want) {
 			t.Fatalf("FormatSystemBuffers detail output missing %q:\n%s", want, detail)

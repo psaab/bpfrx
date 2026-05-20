@@ -16,7 +16,7 @@ SYN cookie behavior in `userspace-dp`.
   profile the actual TX completion cost instead of assuming in-place RX-to-TX
   bounce is required.
 
-## Current Slice Status (2026-05-18)
+## Current Slice Status (2026-05-19)
 
 - #1393 landed the deterministic userspace cookie codec/layout and codec tests.
 - This runtime slice carries `syn_cookie` through Go and Rust screen snapshots,
@@ -30,16 +30,31 @@ SYN cookie behavior in `userspace-dp`.
   per-binding helper status counters for selected challenges, no-secret
   fail-closed decisions, valid ACKs, invalid ACKs, and bypasses.
 - Go helper status renders those counters, and the HA/BPF compatibility counter
-  sync mirrors valid ACK, invalid ACK, and bypass deltas. Challenge decisions are
-  deliberately not mapped to the legacy sent counter until bounded SYN-ACK TX
-  exists.
-- The 2026-05-19 construction slice adds pure SYN-cookie SYN-ACK and validated
-  ACK RST frame builders. The builders swap Ethernet/IP/TCP identity, preserve
-  VLAN headers, emit minimal TCP replies, and recompute IPv4/IPv6 checksums
-  from scratch. This intentionally stops before TX-ring integration.
-- The userspace capability gate remains in place until bounded SYN-ACK TX,
-  bounded ACK RST emission, HA-safe secret publication/cache survivability,
-  sent/budget TX counters, and integration/failover validation land.
+  sync initially mirrored valid ACK, invalid ACK, and bypass deltas while the TX
+  reply path was still absent.
+- The 2026-05-19 closeout slice adds pure SYN-cookie SYN-ACK and validated ACK
+  RST frame builders, wires the screen verdicts into the AF_XDP worker TX path,
+  publishes a 16-byte snapshot key derived from cluster-synced root
+  encrypted-password material, and removes the Go userspace capability gate for
+  `syn-cookie`.
+- SYN-cookie replies are admitted only when the binding has enough pending-TX
+  and free-frame headroom to preserve a full `TX_BATCH_SIZE` reserve for normal
+  forwarding. Budget exhaustion drops the flood reply path and increments
+  `syn_cookie_reply_budget_drops`; it does not consume forwarding frames.
+- If the committed config lacks cluster-synced secret material, the snapshot
+  omits the key and the helper fails closed through
+  `syn_cookie_secret_unavailable` rather than minting predictable cookies.
+- Binding status, `show system buffers`, `show security screen`, and the
+  userspace status summary expose challenge, secret-unavailable, SYN-ACK sent,
+  ACK RST sent, reply-budget-drop, valid-ACK, invalid-ACK, and bypass counters.
+  Legacy global sync maps userspace SYN-ACK sends to the BPF-compatible
+  `GLOBAL_CTR_SYNCOOKIE_SENT` delta and keeps secret-unavailable/budget drops
+  as userspace-local diagnostics.
+- Remaining #1374 work is evidence, not a known code gate: run the live
+  userspace HA/flood validation before Phase 4 BPF source removal to prove
+  SYN-ACK replies, validated ACK/RST, retransmitted SYN admission, random ACK
+  drops, budget-drop accounting, and failover acceptance within the epoch
+  overlap.
 
 ## Design
 
@@ -98,16 +113,19 @@ On returning ACK:
 
 ## State and HA Behavior
 
-- Secrets are consistent across active and backup nodes with current+previous
-  epoch overlap.
+- The daemon publishes a snapshot key only when the committed config contains
+  root encrypted-password material that is shared by the HA peers. Active and
+  backup nodes receiving the same committed config derive the same
+  current+previous epoch cookie validation window.
 - Epoch uses monotonic time, not wall clock, so NTP rollback does not invalidate
   cookies.
 - Epoch publication must be generation-atomic with the secret snapshot: workers
   must not see a new full epoch with an old per-zone secret or the reverse.
-- Failover during an active flood continues accepting cookies minted by the
-  former active node for the overlap window.
-- `synproxy_active`, sent, valid, invalid, bypass, and budget-drop counters are
-  exposed in userspace status.
+- Failover during an active flood should continue accepting cookies minted by
+  the former active node for the overlap window; the required cluster smoke
+  must verify this property before BPF source removal.
+- `synproxy_active`, challenge, no-secret, SYN-ACK sent, ACK RST sent, valid,
+  invalid, bypass, and budget-drop counters are exposed in userspace status.
 
 ## Risks
 
@@ -147,6 +165,7 @@ On returning ACK:
 - Cargo: `screen::syn_cookie_validated_cache_refresh_extends_ttl`.
 - Cargo: `screen::syn_cookie_ack_validation_accepts_previous_epoch_after_rotation`.
 - Cargo: `afxdp::poll_stages::session_miss_ack_stage_invokes_syn_cookie_runtime_validation`.
+- Cargo: `afxdp::poll_descriptor::syn_cookie_reply_tests::syn_cookie_reply_budget_preserves_tx_batch_reserve`.
 - Cargo: `afxdp::frame::tests::syn_cookie_syn_ack_builder_swaps_tuple_and_preserves_vlan`.
 - Cargo: `afxdp::frame::tests::syn_cookie_ack_rst_builder_uses_received_ack_as_rst_seq`.
 - Cargo: `afxdp::tests::syn_cookie_counters_hot_path_accumulate_in_batch`.
@@ -156,11 +175,10 @@ On returning ACK:
 - Cargo: `protocol::tests::syn_cookie_counters_binding_status_wire_roundtrip`.
 - Go: `TestSumBindingCounters` and `TestFormatStatusSummary` pin helper-side
   aggregation/status rendering for the userspace SYN-cookie counters.
-- Go: while the gate remains, keep the `SynFloodProtectionMode == "syn-cookie"`
-  capability rejection pinned and verify screen snapshots carry `syn_cookie` for
-  the runtime path.
-- Go: remove/update the `SynFloodProtectionMode == "syn-cookie"` capability
-  rejection and the manager test that pins it.
+- Go: `TestUserspaceSupportsScreenProfilesAllowsSynCookie`,
+  `TestDeriveUserspaceCapabilitiesAllowsSynCookieScreen`, and
+  `TestBuildScreenSnapshotsMarksSynCookieMode` pin gate removal, snapshot
+  admission, and deterministic master-key publication.
 - Integration: hping3 SYN flood against the userspace HA cluster with
   `syn-cookie` configured; verify SYN-ACK replies, legitimate retransmitted SYN
   admission after validated ACK/RST, random ACK drops, and failover acceptance

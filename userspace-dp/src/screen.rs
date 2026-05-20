@@ -807,9 +807,9 @@ impl ScreenState {
     }
 
     /// Publish the cluster-wide SYN-cookie master key into this worker's screen
-    /// state. Until HA-safe publication is wired, production snapshots leave this
-    /// unset and SYN-cookie mode fails closed instead of minting local-only
-    /// cookies.
+    /// state. Production snapshots derive this key from committed config so
+    /// peers use the same epoch/MAC material across failover; `None` still
+    /// clears the codec and validated-client cache fail-closed.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn update_syn_cookie_master_key(&mut self, master_key: Option<[u8; 16]>) {
         if let Some(master_key) = master_key {

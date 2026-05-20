@@ -1047,6 +1047,7 @@ pub(crate) fn worker_loop(
     let mut sessions = SessionTable::new();
     let mut screen_state = ScreenState::new();
     screen_state.update_profiles(forwarding.screen_profiles.clone());
+    screen_state.update_syn_cookie_master_key(forwarding.syn_cookie_master_key);
     sessions.set_timeouts(forwarding.session_timeouts);
     let mut bindings = Vec::with_capacity(binding_plans.len());
     let (private_plans, shared_groups) = partition_binding_plans(binding_plans);
@@ -1279,6 +1280,7 @@ pub(crate) fn worker_loop(
             // Use NEW values for dependent state updates (forwarding-site
             // ordering — old `forwarding` is stale once rotated).
             screen_state.update_profiles(new_forwarding.screen_profiles.clone());
+            screen_state.update_syn_cookie_master_key(new_forwarding.syn_cookie_master_key);
             sessions.set_timeouts(new_forwarding.session_timeouts);
 
             forwarding = new_forwarding;
@@ -2427,9 +2429,12 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) policy_denied_packets: u64,
     pub(crate) screen_drops: u64,
     /// #1374: SYN-cookie challenge decisions selected by userspace screen
-    /// runtime. Not equivalent to SYN-ACKs sent until bounded TX exists.
+    /// runtime.
     pub(crate) syn_cookie_challenges: u64,
     pub(crate) syn_cookie_secret_unavailable: u64,
+    pub(crate) syn_cookie_syn_ack_sent: u64,
+    pub(crate) syn_cookie_ack_rst_sent: u64,
+    pub(crate) syn_cookie_reply_budget_drops: u64,
     pub(crate) syn_cookie_ack_valid: u64,
     pub(crate) syn_cookie_ack_invalid: u64,
     pub(crate) syn_cookie_bypass: u64,

@@ -449,17 +449,23 @@ func TestStatusIPCRecordsSYNCookieBindingCounters(t *testing.T) {
 						Slot:                       0,
 						SYNCookieChallenges:        3,
 						SYNCookieSecretUnavailable: 5,
-						SYNCookieAckValid:          7,
-						SYNCookieAckInvalid:        11,
-						SYNCookieBypass:            13,
+						SYNCookieSynAckSent:        7,
+						SYNCookieAckRstSent:        11,
+						SYNCookieReplyBudgetDrops:  13,
+						SYNCookieAckValid:          17,
+						SYNCookieAckInvalid:        19,
+						SYNCookieBypass:            23,
 					},
 					{
 						Slot:                       1,
 						SYNCookieChallenges:        17,
 						SYNCookieSecretUnavailable: 19,
-						SYNCookieAckValid:          23,
-						SYNCookieAckInvalid:        29,
-						SYNCookieBypass:            31,
+						SYNCookieSynAckSent:        29,
+						SYNCookieAckRstSent:        31,
+						SYNCookieReplyBudgetDrops:  37,
+						SYNCookieAckValid:          41,
+						SYNCookieAckInvalid:        43,
+						SYNCookieBypass:            47,
 					},
 				},
 			},
@@ -503,9 +509,12 @@ func TestStatusIPCRecordsSYNCookieBindingCounters(t *testing.T) {
 	want := SYNCookieCounters{
 		Challenges:        20,
 		SecretUnavailable: 24,
-		AckValid:          30,
-		AckInvalid:        40,
-		Bypass:            44,
+		SynAckSent:        36,
+		AckRstSent:        42,
+		ReplyBudgetDrops:  50,
+		AckValid:          58,
+		AckInvalid:        62,
+		Bypass:            70,
 	}
 	if got != want {
 		t.Fatalf("SYN-cookie counters after status IPC = %+v, want %+v", got, want)
@@ -3655,7 +3664,7 @@ func TestUserspaceSupportsScreenProfilesBasic(t *testing.T) {
 	}
 }
 
-func TestUserspaceSupportsScreenProfilesRejectsSynCookie(t *testing.T) {
+func TestUserspaceSupportsScreenProfilesAllowsSynCookie(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Flow.SynFloodProtectionMode = "syn-cookie"
 	cfg.Security.Screen = map[string]*config.ScreenProfile{
@@ -3664,8 +3673,8 @@ func TestUserspaceSupportsScreenProfilesRejectsSynCookie(t *testing.T) {
 			TCP:  config.TCPScreen{Land: true},
 		},
 	}
-	if userspaceSupportsScreenProfiles(cfg) {
-		t.Fatal("syn-cookie mode should not be supported")
+	if !userspaceSupportsScreenProfiles(cfg) {
+		t.Fatal("syn-cookie mode should be supported")
 	}
 }
 
@@ -3713,7 +3722,7 @@ func TestDeriveUserspaceCapabilitiesAllowsBasicScreenProfile(t *testing.T) {
 	}
 }
 
-func TestDeriveUserspaceCapabilitiesRejectsSynCookieScreen(t *testing.T) {
+func TestDeriveUserspaceCapabilitiesAllowsSynCookieScreen(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Flow.SynFloodProtectionMode = "syn-cookie"
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
@@ -3726,8 +3735,8 @@ func TestDeriveUserspaceCapabilitiesRejectsSynCookieScreen(t *testing.T) {
 		},
 	}
 	caps := deriveUserspaceCapabilities(cfg)
-	if caps.ForwardingSupported {
-		t.Fatal("ForwardingSupported = true, want false (syn-cookie)")
+	if !caps.ForwardingSupported {
+		t.Fatalf("ForwardingSupported = false, reasons: %+v", caps.UnsupportedReasons)
 	}
 }
 
@@ -3762,6 +3771,9 @@ func TestBuildScreenSnapshotsMatchesZoneToProfile(t *testing.T) {
 func TestBuildScreenSnapshotsMarksSynCookieMode(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Flow.SynFloodProtectionMode = "syn-cookie"
+	cfg.System.RootAuthentication = &config.RootAuthConfig{
+		EncryptedPassword: "$6$rounds=5000$salt$hash",
+	}
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
 		"trust": {Name: "trust", ScreenProfile: "flood"},
 	}
@@ -3778,6 +3790,16 @@ func TestBuildScreenSnapshotsMarksSynCookieMode(t *testing.T) {
 	}
 	if !snaps[0].SYNCookie {
 		t.Fatalf("SYNCookie = false, want true: %+v", snaps[0])
+	}
+	snap := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	if len(snap.SYNCookieMasterKey) != 32 {
+		t.Fatalf("SYNCookieMasterKey len = %d, want 32", len(snap.SYNCookieMasterKey))
+	}
+	cfg.System.RootAuthentication = nil
+	cfg.System.MasterPassword = "juniper-prf1"
+	snap = buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	if snap.SYNCookieMasterKey != "" {
+		t.Fatalf("SYNCookieMasterKey without root secret = %q, want empty", snap.SYNCookieMasterKey)
 	}
 }
 
@@ -4890,6 +4912,7 @@ func TestSumBindingCounters(t *testing.T) {
 				SessionExpires:       5,
 				PolicyDeniedPackets:  3,
 				ScreenDrops:          2,
+				SYNCookieSynAckSent:  7,
 				SYNCookieAckValid:    11,
 				SYNCookieAckInvalid:  13,
 				SYNCookieBypass:      17,
@@ -4904,6 +4927,7 @@ func TestSumBindingCounters(t *testing.T) {
 				SessionExpires:       10,
 				PolicyDeniedPackets:  7,
 				ScreenDrops:          4,
+				SYNCookieSynAckSent:  17,
 				SYNCookieAckValid:    19,
 				SYNCookieAckInvalid:  23,
 				SYNCookieBypass:      29,
@@ -4933,6 +4957,9 @@ func TestSumBindingCounters(t *testing.T) {
 	}
 	if s.screenDrops != 6 {
 		t.Fatalf("screenDrops = %d, want 6", s.screenDrops)
+	}
+	if s.synCookieSent != 24 {
+		t.Fatalf("synCookieSent = %d, want 24", s.synCookieSent)
 	}
 	if s.synCookieValid != 30 {
 		t.Fatalf("synCookieValid = %d, want 30", s.synCookieValid)

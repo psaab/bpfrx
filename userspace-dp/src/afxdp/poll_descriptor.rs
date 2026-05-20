@@ -6,13 +6,23 @@
 // the sibling submodules (parser, rst, sharded_neighbor, etc.)
 // that the extracted fn references.
 
-use super::*;
 use super::poll_stages::{
+    FabricIngressOutcome, ScreenCheckOutcome, StageOutcome, SynCookieAckOutcome,
     stage_classify_fabric_ingress, stage_ipsec_passthrough_check, stage_link_layer_classify,
     stage_native_gre_decap, stage_parse_flow_and_learn, stage_screen_check,
-    stage_screen_syn_cookie_ack_on_session_miss, FabricIngressOutcome, StageOutcome,
+    stage_screen_syn_cookie_ack_on_session_miss,
 };
+use super::worker::WorkerTxPipeline;
+use super::*;
 use crate::policy::{evaluate_policy_result_with_len, evaluate_policy_with_len};
+use crate::screen::SynCookieChallenge;
+
+const SYN_COOKIE_REPLY_PENDING_RESERVE: usize = TX_BATCH_SIZE;
+
+enum SynCookieReply {
+    SynAck(SynCookieChallenge),
+    AckRst,
+}
 
 #[inline]
 fn source_nat_decision_for_flow(
@@ -217,6 +227,68 @@ fn evaluate_dscp_sensitive_input_filter_on_session_hit(
         meta,
         ingress_zone_override,
     ))
+}
+
+#[inline]
+fn syn_cookie_reply_budget_available(tx_pipeline: &WorkerTxPipeline) -> bool {
+    let max_pending = tx_pipeline.max_pending_tx;
+    if max_pending == 0 {
+        return false;
+    }
+    if tx_pipeline.free_tx_frames.len() <= SYN_COOKIE_REPLY_PENDING_RESERVE {
+        return false;
+    }
+    let reserve = SYN_COOKIE_REPLY_PENDING_RESERVE.min(max_pending);
+    let admitted = tx_pipeline
+        .pending_tx_local
+        .len()
+        .saturating_add(tx_pipeline.pending_tx_prepared.len());
+    admitted < max_pending.saturating_sub(reserve)
+}
+
+#[inline]
+fn enqueue_syn_cookie_reply(
+    tx_pipeline: &mut WorkerTxPipeline,
+    ifindex: i32,
+    packet_frame: &[u8],
+    meta: UserspaceDpMeta,
+    flow: Option<&SessionFlow>,
+    reply: SynCookieReply,
+    counters: &mut BatchCounters,
+) -> bool {
+    if !syn_cookie_reply_budget_available(tx_pipeline) {
+        counters.touched = true;
+        counters.syn_cookie_reply_budget_drops += 1;
+        return false;
+    }
+
+    let (bytes, sent_counter): (Option<Vec<u8>>, fn(&mut BatchCounters)) = match reply {
+        SynCookieReply::SynAck(challenge) => (
+            build_syn_cookie_syn_ack_frame(packet_frame, challenge.cookie_isn, challenge.peer_mss),
+            |counters| counters.syn_cookie_syn_ack_sent += 1,
+        ),
+        SynCookieReply::AckRst => (build_syn_cookie_ack_rst_frame(packet_frame), |counters| {
+            counters.syn_cookie_ack_rst_sent += 1
+        }),
+    };
+    let Some(bytes) = bytes else {
+        return false;
+    };
+
+    tx_pipeline.pending_tx_local.push_back(TxRequest {
+        bytes,
+        expected_ports: None,
+        expected_addr_family: meta.addr_family,
+        expected_protocol: meta.protocol,
+        flow_key: flow.map(|flow| flow.forward_key.clone()),
+        egress_ifindex: ifindex,
+        cos_queue_id: None,
+        dscp_rewrite: None,
+        mirror_clone: false,
+    });
+    counters.touched = true;
+    sent_counter(counters);
+    true
 }
 
 #[inline]
@@ -431,7 +503,7 @@ pub(super) fn poll_binding_process_descriptor(
                     // #946 Phase 1 stage 10: screen / IDS slow-path.
                     // Caller still owns the recycle push (matches
                     // original code's pattern).
-                    if let StageOutcome::RecycleAndContinue = stage_screen_check(
+                    match stage_screen_check(
                         flow.as_ref(),
                         packet_frame,
                         meta,
@@ -441,8 +513,24 @@ pub(super) fn poll_binding_process_descriptor(
                         telemetry.counters,
                         worker_ctx,
                     ) {
-                        binding.scratch.scratch_recycle.push(desc.addr);
-                        continue;
+                        StageOutcome::RecycleAndContinue => {
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
+                        }
+                        StageOutcome::Continue(ScreenCheckOutcome::Pass) => {}
+                        StageOutcome::Continue(ScreenCheckOutcome::SynCookieChallenge(challenge)) => {
+                            enqueue_syn_cookie_reply(
+                                &mut binding.tx_pipeline,
+                                binding.ifindex,
+                                packet_frame,
+                                meta,
+                                flow.as_ref(),
+                                SynCookieReply::SynAck(challenge),
+                                telemetry.counters,
+                            );
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
+                        }
                     }
                     // #946 Phase 1 stage 11: IPsec passthrough. ESP
                     // (proto 50) and IKE (UDP 500/4500) reinject via
@@ -949,20 +1037,34 @@ pub(super) fn poll_binding_process_descriptor(
                         } else {
                             telemetry.counters.session_misses += 1;
                             telemetry.dbg.session_miss += 1;
-                            if let StageOutcome::RecycleAndContinue =
-                                stage_screen_syn_cookie_ack_on_session_miss(
-                                    Some(flow),
-                                    packet_frame,
-                                    meta,
-                                    ingress_zone_override,
-                                    now_secs,
-                                    screen,
-                                    telemetry.counters,
-                                    worker_ctx,
-                                )
-                            {
-                                binding.scratch.scratch_recycle.push(desc.addr);
-                                continue;
+                            match stage_screen_syn_cookie_ack_on_session_miss(
+                                Some(flow),
+                                packet_frame,
+                                meta,
+                                ingress_zone_override,
+                                now_secs,
+                                screen,
+                                telemetry.counters,
+                                worker_ctx,
+                            ) {
+                                StageOutcome::RecycleAndContinue => {
+                                    binding.scratch.scratch_recycle.push(desc.addr);
+                                    continue;
+                                }
+                                StageOutcome::Continue(SynCookieAckOutcome::Pass) => {}
+                                StageOutcome::Continue(SynCookieAckOutcome::Validated) => {
+                                    enqueue_syn_cookie_reply(
+                                        &mut binding.tx_pipeline,
+                                        binding.ifindex,
+                                        packet_frame,
+                                        meta,
+                                        Some(flow),
+                                        SynCookieReply::AckRst,
+                                        telemetry.counters,
+                                    );
+                                    binding.scratch.scratch_recycle.push(desc.addr);
+                                    continue;
+                                }
                             }
                             let resolution_target =
                                 parse_packet_destination_from_frame(packet_frame, meta)
@@ -3020,5 +3122,71 @@ fn record_rx_descriptor_telemetry(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod syn_cookie_reply_tests {
+    use super::*;
+
+    fn dummy_tx_request() -> TxRequest {
+        TxRequest {
+            bytes: Vec::new(),
+            expected_ports: None,
+            expected_addr_family: 0,
+            expected_protocol: 0,
+            flow_key: None,
+            egress_ifindex: 0,
+            cos_queue_id: None,
+            dscp_rewrite: None,
+            mirror_clone: false,
+        }
+    }
+
+    fn tx_pipeline(
+        max_pending_tx: usize,
+        free_frames: usize,
+        pending_local: usize,
+    ) -> WorkerTxPipeline {
+        let mut pipeline = WorkerTxPipeline {
+            free_tx_frames: (0..free_frames as u64).collect(),
+            pending_tx_prepared: VecDeque::new(),
+            pending_tx_local: VecDeque::new(),
+            max_pending_tx,
+            outstanding_tx: 0,
+            pending_fill_frames: VecDeque::new(),
+            in_flight_prepared_recycles: FastMap::default(),
+            tx_submit_ns: Vec::new().into_boxed_slice(),
+        };
+        for _ in 0..pending_local {
+            pipeline.pending_tx_local.push_back(dummy_tx_request());
+        }
+        pipeline
+    }
+
+    #[test]
+    fn syn_cookie_reply_budget_preserves_tx_batch_reserve() {
+        let limit = SYN_COOKIE_REPLY_PENDING_RESERVE * 2;
+
+        assert!(!syn_cookie_reply_budget_available(&tx_pipeline(
+            0,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+            0,
+        )));
+        assert!(!syn_cookie_reply_budget_available(&tx_pipeline(
+            limit,
+            SYN_COOKIE_REPLY_PENDING_RESERVE,
+            0,
+        )));
+        assert!(syn_cookie_reply_budget_available(&tx_pipeline(
+            limit,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+            SYN_COOKIE_REPLY_PENDING_RESERVE - 1,
+        )));
+        assert!(!syn_cookie_reply_budget_available(&tx_pipeline(
+            limit,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+            SYN_COOKIE_REPLY_PENDING_RESERVE,
+        )));
     }
 }

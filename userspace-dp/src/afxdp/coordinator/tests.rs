@@ -1221,9 +1221,13 @@ fn refresh_bindings_bridges_v_min_counters_into_binding_status() {
     live.syn_cookie_challenges.store(97, Ordering::Relaxed);
     live.syn_cookie_secret_unavailable
         .store(101, Ordering::Relaxed);
-    live.syn_cookie_ack_valid.store(103, Ordering::Relaxed);
-    live.syn_cookie_ack_invalid.store(107, Ordering::Relaxed);
-    live.syn_cookie_bypass.store(109, Ordering::Relaxed);
+    live.syn_cookie_syn_ack_sent.store(103, Ordering::Relaxed);
+    live.syn_cookie_ack_rst_sent.store(107, Ordering::Relaxed);
+    live.syn_cookie_reply_budget_drops
+        .store(109, Ordering::Relaxed);
+    live.syn_cookie_ack_valid.store(113, Ordering::Relaxed);
+    live.syn_cookie_ack_invalid.store(127, Ordering::Relaxed);
+    live.syn_cookie_bypass.store(131, Ordering::Relaxed);
     coordinator.workers.live.insert(0, live);
 
     let mut bindings = vec![BindingStatus {
@@ -1238,6 +1242,9 @@ fn refresh_bindings_bridges_v_min_counters_into_binding_status() {
         flow_cache_collision_evictions: 0xbad_c0de,
         syn_cookie_challenges: 1,
         syn_cookie_secret_unavailable: 1,
+        syn_cookie_syn_ack_sent: 1,
+        syn_cookie_ack_rst_sent: 1,
+        syn_cookie_reply_budget_drops: 1,
         syn_cookie_ack_valid: 1,
         syn_cookie_ack_invalid: 1,
         syn_cookie_bypass: 1,
@@ -1263,9 +1270,12 @@ fn refresh_bindings_bridges_v_min_counters_into_binding_status() {
     );
     assert_eq!(bindings[0].syn_cookie_challenges, 97);
     assert_eq!(bindings[0].syn_cookie_secret_unavailable, 101);
-    assert_eq!(bindings[0].syn_cookie_ack_valid, 103);
-    assert_eq!(bindings[0].syn_cookie_ack_invalid, 107);
-    assert_eq!(bindings[0].syn_cookie_bypass, 109);
+    assert_eq!(bindings[0].syn_cookie_syn_ack_sent, 103);
+    assert_eq!(bindings[0].syn_cookie_ack_rst_sent, 107);
+    assert_eq!(bindings[0].syn_cookie_reply_budget_drops, 109);
+    assert_eq!(bindings[0].syn_cookie_ack_valid, 113);
+    assert_eq!(bindings[0].syn_cookie_ack_invalid, 127);
+    assert_eq!(bindings[0].syn_cookie_bypass, 131);
 }
 
 #[test]
@@ -1288,9 +1298,12 @@ fn refresh_bindings_zeroes_v_min_counters_when_worker_absent() {
         screen_drops: 777,
         syn_cookie_challenges: 666,
         syn_cookie_secret_unavailable: 555,
-        syn_cookie_ack_valid: 444,
-        syn_cookie_ack_invalid: 333,
-        syn_cookie_bypass: 222,
+        syn_cookie_syn_ack_sent: 444,
+        syn_cookie_ack_rst_sent: 333,
+        syn_cookie_reply_budget_drops: 222,
+        syn_cookie_ack_valid: 111,
+        syn_cookie_ack_invalid: 99,
+        syn_cookie_bypass: 88,
         ..Default::default()
     }];
 
@@ -1301,6 +1314,9 @@ fn refresh_bindings_zeroes_v_min_counters_when_worker_absent() {
     assert_eq!(bindings[0].screen_drops, 0);
     assert_eq!(bindings[0].syn_cookie_challenges, 0);
     assert_eq!(bindings[0].syn_cookie_secret_unavailable, 0);
+    assert_eq!(bindings[0].syn_cookie_syn_ack_sent, 0);
+    assert_eq!(bindings[0].syn_cookie_ack_rst_sent, 0);
+    assert_eq!(bindings[0].syn_cookie_reply_budget_drops, 0);
     assert_eq!(bindings[0].syn_cookie_ack_valid, 0);
     assert_eq!(bindings[0].syn_cookie_ack_invalid, 0);
     assert_eq!(bindings[0].syn_cookie_bypass, 0);
