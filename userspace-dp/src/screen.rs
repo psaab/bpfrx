@@ -51,6 +51,10 @@ const SYN_COOKIE_CACHE_RIGHT_DOMAIN: u64 = u64::from_be_bytes(*b"xpf-scv1");
 const SYN_COOKIE_VALIDATED_CACHE_CAPACITY: usize = 4096;
 const SYN_COOKIE_VALIDATED_CACHE_WAYS: usize = 4;
 const SYN_COOKIE_VALIDATED_CACHE_TTL_SECS: u64 = SynCookieCodec::EPOCH_SECS;
+#[cfg(not(test))]
+const SYN_COOKIE_STANDBY_ACK_VALIDATION_RATE_LIMIT_PER_SEC: u32 = 4096;
+#[cfg(test)]
+const SYN_COOKIE_STANDBY_ACK_VALIDATION_RATE_LIMIT_PER_SEC: u32 = 8;
 const _: [(); SYN_COOKIE_ISN_BITS as usize] = [(); SYN_COOKIE_LAYOUT_BITS as usize];
 
 /// Three-bit MSS table encoded in userspace SYN cookies.
@@ -167,11 +171,15 @@ impl SynCookieCodec {
         current_full_epoch: u64,
         cookie_isn: u32,
     ) -> Option<SynCookieValidation> {
-        let wire_epoch = (cookie_isn >> SYN_COOKIE_EPOCH_SHIFT) & SYN_COOKIE_EPOCH_MASK;
+        let wire_epoch = Self::wire_epoch(cookie_isn);
         let mss_index = ((cookie_isn >> SYN_COOKIE_MSS_SHIFT) & SYN_COOKIE_MSS_MASK) as u8;
         let wire_mac = cookie_isn & SYN_COOKIE_MAC_MASK;
+        let candidates = Self::candidate_validation_epochs(current_full_epoch);
 
-        for candidate_epoch in [current_full_epoch, current_full_epoch.saturating_sub(1)] {
+        for (idx, candidate_epoch) in candidates.iter().copied().enumerate() {
+            if candidates[..idx].contains(&candidate_epoch) {
+                continue;
+            }
             if (candidate_epoch as u32 & SYN_COOKIE_EPOCH_MASK) != wire_epoch {
                 continue;
             }
@@ -185,6 +193,25 @@ impl SynCookieCodec {
         }
 
         None
+    }
+
+    fn candidate_validation_epochs(current_full_epoch: u64) -> [u64; 3] {
+        [
+            current_full_epoch.saturating_add(1),
+            current_full_epoch,
+            current_full_epoch.saturating_sub(1),
+        ]
+    }
+
+    fn wire_epoch(cookie_isn: u32) -> u32 {
+        (cookie_isn >> SYN_COOKIE_EPOCH_SHIFT) & SYN_COOKIE_EPOCH_MASK
+    }
+
+    fn wire_epoch_matches_validation_window(current_full_epoch: u64, cookie_isn: u32) -> bool {
+        let wire_epoch = Self::wire_epoch(cookie_isn);
+        Self::candidate_validation_epochs(current_full_epoch)
+            .iter()
+            .any(|epoch| (*epoch as u32 & SYN_COOKIE_EPOCH_MASK) == wire_epoch)
     }
 
     fn cookie_mac(
@@ -770,6 +797,7 @@ pub(crate) struct ScreenState {
     udp_counters: FxHashMap<String, RateCounter>,
     syn_counters: FxHashMap<String, RateCounter>,
     syn_cookie_active_until_secs: FxHashMap<String, u64>,
+    syn_cookie_standby_ack_counters: FxHashMap<String, RateCounter>,
     syn_cookie_codec: Option<SynCookieCodec>,
     syn_cookie_validated: SynCookieValidatedCache,
     syn_cookie_last_full_epoch: u64,
@@ -790,6 +818,7 @@ impl ScreenState {
             udp_counters: FxHashMap::default(),
             syn_counters: FxHashMap::default(),
             syn_cookie_active_until_secs: FxHashMap::default(),
+            syn_cookie_standby_ack_counters: FxHashMap::default(),
             syn_cookie_codec: None,
             syn_cookie_validated: SynCookieValidatedCache::default(),
             syn_cookie_last_full_epoch: 0,
@@ -810,6 +839,8 @@ impl ScreenState {
         self.syn_counters.retain(|k, _| profiles.contains_key(k));
         self.syn_cookie_active_until_secs
             .retain(|k, _| profiles.contains_key(k));
+        self.syn_cookie_standby_ack_counters
+            .retain(|k, _| profiles.contains_key(k));
         for zone in profiles.keys() {
             self.icmp_counters.entry(zone.clone()).or_default();
             self.udp_counters.entry(zone.clone()).or_default();
@@ -817,6 +848,9 @@ impl ScreenState {
             self.syn_cookie_active_until_secs
                 .entry(zone.clone())
                 .or_insert(0);
+            self.syn_cookie_standby_ack_counters
+                .entry(zone.clone())
+                .or_default();
         }
         self.profiles = profiles;
     }
@@ -852,6 +886,18 @@ impl ScreenState {
     #[cfg(test)]
     fn set_syn_cookie_full_epoch_for_test(&mut self, full_epoch: u64) {
         self.syn_cookie_full_epoch_override = Some(full_epoch);
+    }
+
+    fn standby_syn_cookie_ack_validation_limited(&mut self, zone: &str, now_secs: u64) -> bool {
+        self.syn_cookie_standby_ack_counters
+            .get_mut(zone)
+            .map(|counter| {
+                counter.increment(
+                    now_secs,
+                    SYN_COOKIE_STANDBY_ACK_VALIDATION_RATE_LIMIT_PER_SEC,
+                )
+            })
+            .unwrap_or(true)
     }
 
     /// Returns true if any zone has a screen profile configured.
@@ -1149,6 +1195,14 @@ impl ScreenState {
         };
         let cookie_isn = pkt.tcp_ack.wrapping_sub(1);
         let current_epoch = self.current_syn_cookie_full_epoch();
+        if !locally_active {
+            if !SynCookieCodec::wire_epoch_matches_validation_window(current_epoch, cookie_isn) {
+                return SynCookieAckVerdict::NotApplicable;
+            }
+            if self.standby_syn_cookie_ack_validation_limited(zone, now_secs) {
+                return SynCookieAckVerdict::NotApplicable;
+            }
+        }
         let tuple = SynCookieTuple::from_packet(pkt);
         if codec
             .validate_isn(tuple, zone_id, current_epoch, cookie_isn)
@@ -1171,6 +1225,14 @@ impl ScreenState {
     #[cfg(test)]
     fn syn_cookie_active_zone_count(&self) -> usize {
         self.syn_cookie_active_until_secs.len()
+    }
+
+    #[cfg(test)]
+    fn syn_cookie_standby_ack_count(&self, zone: &str) -> u32 {
+        self.syn_cookie_standby_ack_counters
+            .get(zone)
+            .map(|counter| counter.count)
+            .unwrap_or(0)
     }
 
     /// Notify the screen state that a new session was created. This increments

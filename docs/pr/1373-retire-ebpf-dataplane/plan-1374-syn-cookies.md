@@ -26,9 +26,9 @@ SYN cookie behavior in `userspace-dp`.
   session lookup misses.
 - The 2026-05-18 closeout slice makes validated-client cache hits visible as an
   explicit single-use `SynCookieBypass`, pins cache expiration at the one-epoch
-  TTL boundary, pins current/previous cookie-epoch ACK validation, and wires
-  per-binding helper status counters for selected challenges, no-secret
-  fail-closed decisions, valid ACKs, invalid ACKs, and bypasses.
+  TTL boundary, pins cookie-epoch ACK validation, and wires per-binding helper
+  status counters for selected challenges, no-secret fail-closed decisions,
+  valid ACKs, invalid ACKs, and bypasses.
 - Go helper status renders those counters, and the HA/BPF compatibility counter
   sync initially mirrored valid ACK, invalid ACK, and bypass deltas while the TX
   reply path was still absent.
@@ -61,7 +61,10 @@ SYN cookie behavior in `userspace-dp`.
 Use SipHash, not HMAC-SHA1/SHA256. Linux SYN cookies and the current kernel
 kfunc path use SipHash-class keyed hashing, and the transmitted budget is only
 the 32-bit TCP ISN. Per-zone secrets rotate every 64 seconds using a Unix
-wall-clock epoch. Validation accepts the current and previous epochs.
+wall-clock epoch. Validation accepts the current, previous, and next epochs.
+The next-epoch candidate is deliberately only a validation-side tolerance for
+HA peers whose clocks straddle a 64-second boundary during failover; minting
+still uses the local current epoch.
 
 Cookie ISN layout:
 
@@ -71,11 +74,11 @@ Cookie ISN layout:
 
 The transmitted epoch field is only `epoch & 0x1f`. The full wall-clock epoch
 is still part of the MAC input and secret derivation. Validation reconstructs
-candidate full epochs from the current and previous full epochs, then accepts
-only candidates whose low 5 bits match the transmitted field and whose MAC
-validates. A cookie minted 32 epochs ago has the same transmitted low bits as
-the current epoch but must reject because the full epoch used for MAC/secret
-derivation is outside the current/previous validation window.
+candidate full epochs from `current + 1`, current, and previous full epochs,
+then accepts only candidates whose low 5 bits match the transmitted field and
+whose MAC validates. A cookie minted 32 epochs ago has the same transmitted low
+bits as the current epoch but must reject because the full epoch used for
+MAC/secret derivation is outside the three-epoch validation window.
 
 The MAC covers source/destination IPs, ports, MSS index, zone, and the full
 wall-clock epoch. The secret is cluster-consistent: derived from an HA-synced
@@ -99,12 +102,17 @@ On returning ACK:
 3. On failure during a local active flood window, drop with no session creation
    and increment invalid-cookie counters. Outside a local active window, invalid
    ACKs remain `NotApplicable` so standby peers do not start dropping unrelated
-   session-miss ACKs solely because cookie mode is configured.
+   session-miss ACKs solely because cookie mode is configured. Standby
+   validation is guarded by a cheap transmitted-epoch prefilter and a per-zone
+   per-second validation budget before SipHash runs.
 
 ## Hot-Path Invariants
 
 - No heap allocation while deciding SYN cookie mint or ACK validation.
 - SipHash key lookup is per-zone and read-only on the published snapshot.
+- Inactive peers do not run SipHash for ACKs whose transmitted low epoch bits
+  cannot match `current + 1`, current, or previous full epochs; plausible ACKs
+  are then capped by a fixed per-zone validation budget.
 - Validated-client state is a fixed-size keyed table; attacker-controlled
   tuples do not enter `FxHashMap` or an unbounded queue.
 - Per-zone SYN-cookie active/counter state is config-bound and prepopulated on
@@ -121,7 +129,7 @@ On returning ACK:
 - The daemon publishes a snapshot key only when the committed config contains
   root encrypted-password material that is shared by the HA peers. Active and
   backup nodes receiving the same committed config derive the same
-  current+previous epoch cookie validation window.
+  current/previous/next epoch cookie validation window.
 - Epoch uses Unix wall-clock seconds instead of per-node monotonic uptime so HA
   peers with synchronized clocks validate cookies minted by the former active
   node after failover. Large wall-clock skew can still fail closed and is part
@@ -132,7 +140,7 @@ On returning ACK:
 - Failover during an active flood continues accepting cookies minted by the
   former active node for the overlap window even if the new active peer has not
   observed the local flood threshold. A valid cookie ACK is self-authenticating
-  against the shared key, tuple, zone, MSS index, and current/previous
+  against the shared key, tuple, zone, MSS index, and current/previous/next
   wall-clock epoch; invalid ACKs outside a local active window remain
   `NotApplicable`.
 - `synproxy_active`, challenge, no-secret, SYN-ACK sent, ACK RST sent, valid,
