@@ -674,6 +674,8 @@ impl PortAllocator {
                     } else if existing.persistent_previous_active_flows == 0 {
                         lease.expires_at_ns = existing.persistent_previous_expires_at_ns;
                         insert_expiry = Some((lease.addr_index, lease.expires_at_ns));
+                    } else if lease.completed_flows == 0 {
+                        remove_lease = true;
                     } else {
                         let expires_at_ns = now_ns.saturating_add(lease.timeout_ns);
                         lease.expires_at_ns = expires_at_ns;
