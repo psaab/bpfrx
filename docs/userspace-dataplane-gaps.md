@@ -96,7 +96,7 @@ The current #1373 audit produced these tracked blockers:
 | #1374 | Implement userspace SYN-cookie flood protection or an approved equivalent. #1393, the 2026-05-17 runtime slice, the 2026-05-18 closeout slice, and the 2026-05-19 TX closeout cover deterministic cookie codec/layout, snapshot propagation, root-auth-derived key publication with fail-closed missing-secret behavior, capability admission for active SYN-cookie screen profiles, fail-closed screen challenge selection, bounded SYN-ACK TX, validated-ACK RST emission, session-miss ACK validation, bounded validated-client cache behavior, TTL-bound single-use validated-client expiration, current/previous/next Unix wall-clock cookie-epoch ACK validation with standby prefilter/rate-limiting, explicit validated-client bypass verdicts, userspace helper status counters, and legacy global sync for sent/valid/invalid/bypass counters. Remaining: live HA/flood validation evidence before BPF source removal. | Phase 4 BPF source removal |
 | #1375 | Finish userspace RFC 2697/2698 three-color policer hardening. The current runtime admits the color-blind `then discard` slice, fails closed for unsupported snapshot shapes that bypass Go admission, and preserves token/counter state across compatible in-process snapshot refreshes. Remaining work: sharded/packed state decision, HA/restart continuity decision, full non-drop color action propagation, and integration/failover/performance evidence | Phase 4 BPF source removal |
 | #1376 | Finish userspace port mirroring evidence. Snapshot/wire plumbing, bounded runtime delivery, pending-forward, self-target flow-cache, deferred-neighbor retry, CoS reserve handling, counter attribution, and capability admission now exist. Remaining work is mirror-fidelity evidence and forwarding survival under mirror pressure. | Phase 4 BPF source removal |
-| #1380 | Retire the remaining BPF-map-oriented `show system buffers` operator surface. Userspace now renders the bounded helper status that exists and intentionally keeps session-table / flow-cache / neighbor-cache as counters rather than synthetic utilization rows until the helper exports true capacity fields. | Phase 5 CLI / observability cleanup |
+| #1380 | Closed for the current helper schema: userspace `show system buffers` renders the bounded helper status that exists and intentionally keeps session-table / flow-cache / neighbor-cache as counters rather than synthetic utilization rows until the helper exports true capacity fields. | Phase 5 CLI / observability cleanup |
 
 Recommended dependency order:
 
@@ -116,8 +116,9 @@ Recommended dependency order:
    artifacts before BPF source removal. Keep #1375 on the Phase 4 list for
    validation and hardening evidence, not as a capability gate. No additional
    #1378 scheduler runtime or evidence work is known from the current audit.
-4. #1380 in Phase 5, after the dataplane boundary is settled but before the
-   remaining operator-facing BPF map surface disappears.
+4. #1380 is closed for the current helper schema. Future true utilization rows
+   for session-table, flow-cache, or neighbor-cache state need new
+   helper-published capacity fields and should be tracked as separate issues.
 
 ## What This Document Does Not Mean
 
@@ -154,17 +155,14 @@ There are two distinct fallback boundaries:
 
 The highest-value remaining work on current `master` is:
 
-1. resolve #1381 so userspace is no longer structurally coupled to the eBPF
-   manager contract
-   current AF_XDP SNAT pool selector, not full persistent-NAT parity. #1378 is
-   closed by the accepted userspace HA scheduler artifact set.
-3. collect #1374 live HA/flood evidence and the remaining #1376 mirror
-   evidence before any BPF source removal, and finish the #1375
-   hardening/evidence checklist. The three-color capability gate is removed
-   only for the current color-blind `then discard` slice with compatible
-   in-process snapshot continuity; color-aware and non-drop treatments stay
-   fail-closed in both Go admission and Rust snapshot parsing.
-4. carry #1380 into Phase 5 only if operators need new helper capacity fields;
-   the current userspace command already avoids BPF-map fallback when helper
-   status is available and does not synthesize percentages for dynamic tables
-5. continue correctness and performance hardening on the active AF_XDP fast path
+1. finish the #1377 disposition around helper-restart persistence, HA lease
+   synchronization, and cross-backend selector parity. The current userspace
+   contract is fail-closed for unusable pools and uses the active AF_XDP
+   selector, not full persistent-NAT parity.
+2. collect any Phase 4 operator evidence still required for admitted userspace
+   features before BPF source removal. The #1378 scheduler runtime is closed by
+   the accepted userspace HA artifact set.
+3. keep #1380 closed for the current command contract. Open a narrower
+   follow-up only if operators need helper-published capacity fields for
+   session-table, flow-cache, or neighbor-cache utilization percentages.
+4. continue correctness and performance hardening on the active AF_XDP fast path

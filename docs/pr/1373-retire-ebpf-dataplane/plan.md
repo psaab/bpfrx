@@ -20,7 +20,7 @@ present until later phase PRs.
 | #1374 | Userspace SYN-cookie validation/admission semantics, root-auth-derived snapshot key publication, bounded SYN-ACK/RST TX replies, counters, and gate removal exist; remaining blocker is live HA/flood validation evidence before BPF source removal | Before Phase 4 |
 | #1375 | Userspace supports the color-blind `then discard` srTCM/trTCM slice, fails closed for unsupported shapes, and preserves token/counter state across compatible in-process snapshot refreshes; remaining work is HA/restart continuity decision, non-drop color actions, and integration/perf evidence | Before Phase 4 |
 | #1376 | Userspace port mirroring has snapshot/wire plumbing plus bounded runtime admission; remaining work is mirror-fidelity and pressure-survival evidence before BPF source removal | Before Phase 4 |
-| #1380 | Userspace `show system buffers` can render helper status; remaining work is Phase 5 cleanup of BPF-map-oriented fallback and optional true-capacity fields | Phase 5 |
+| #1380 | Closed for the current helper schema: userspace `show system buffers` renders helper status and keeps dynamic session/flow/neighbor counts out of utilization rows until the helper exports true capacity fields | Phase 5 closeout recorded |
 
 ## Recommended Order
 
@@ -31,8 +31,9 @@ present until later phase PRs.
 3. Land #1375 and collect #1374/#1376 live evidence before Phase 4. #1374 is
    no longer protected by a capability fallback; it still needs the flood/HA
    artifact set before BPF source removal.
-4. Land #1380 in Phase 5 while replacing BPF-map observability with userspace
-   resource reporting.
+4. Treat #1380 as closed for the current helper schema. Future session-table,
+   flow-cache, or neighbor-cache utilization rows require new helper-published
+   denominators and should be tracked as new issues, not as #1380 blockers.
 
 ## Phase Boundaries
 
@@ -43,7 +44,9 @@ present until later phase PRs.
 - Phase 3: build-system and Go dataplane interface removal work, after #1381.
 - Phase 4: BPF source removal, only after #1374-#1379 and any production
   blockers from the audit are closed.
-- Phase 5: CLI and observability cleanup, including #1380.
+- Phase 5: CLI and observability cleanup. The current #1380 helper-status
+  contract is closed; future fill-percentage rows need helper-owned
+  denominators before they can enter the utilization table.
 
 ## Phase 0 Exit Criteria
 
