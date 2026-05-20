@@ -461,8 +461,6 @@ impl BindingWorker {
         ifname: &str,
         snap: crate::protocol::WireGuardInterfaceSnapshot,
     ) {
-        let worker_id = self.worker_id;
-        let num_workers = self.num_workers;
         let old_port = self
             .wireguard_listen_ports_by_ifname
             .insert(ifname.to_string(), snap.listen_port);
@@ -478,7 +476,7 @@ impl BindingWorker {
         let engine = self
             .wireguard_engines
             .entry(snap.listen_port)
-            .or_insert_with(|| super::wireguard::WireGuardEngine::new(worker_id, num_workers));
+            .or_insert_with(super::wireguard::WireGuardEngine::new);
         engine.apply_snapshot(&snap);
     }
 

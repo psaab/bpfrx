@@ -812,7 +812,7 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 			Source:          tunnel.Source,
 			Destination:     tunnel.Destination,
 			Key:             tunnel.Key,
-			WgPublicKey:     wgPublicKey(tunnel, cfg.Security.WireGuard),
+			WgPublicKey:     "",
 			WgListenPort:    wgListenPort(tunnel, cfg.Security.WireGuard),
 			TTL:             tunnel.TTL,
 			TransportTable:  transportTable,
@@ -2440,12 +2440,6 @@ func buildSingleWireGuardSnapshot(tunnel *config.TunnelConfig, global config.Wir
 		}
 	}
 	return snap
-}
-
-func wgPublicKey(tunnel *config.TunnelConfig, global config.WireGuardGlobalConfig) string {
-	_ = tunnel
-	_ = global
-	return ""
 }
 
 func wgListenPort(tunnel *config.TunnelConfig, global config.WireGuardGlobalConfig) uint16 {

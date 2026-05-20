@@ -546,7 +546,15 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                         let mut encap_meta = request.meta;
                                         encap_meta.l3_offset = 14; 
                                         if let Some(engine) = target_binding.wireguard_engines.get_mut(&endpoint.wg_listen_port) {
-                                            if let Some((start_idx, total_len, outer_meta)) = engine.try_encap(&frame, encap_meta.addr_family, encap_meta.ingress_ifindex, 0, None, Some(endpoint.source), &mut target_binding.scratch.scratch_wg_out) {
+                                            if let Some((start_idx, total_len, outer_meta)) = engine.try_encap(
+                                                &frame,
+                                                encap_meta.addr_family,
+                                                encap_meta.ingress_ifindex,
+                                                0,
+                                                None,
+                                                Some(endpoint.source),
+                                                &mut target_binding.scratch.scratch_wg_out,
+                                            ) {
                                                 if owner_matches_target {
                                                     let mut direct_tx_offset = target_binding.tx_pipeline.free_tx_frames.pop_front();
                                                     if direct_tx_offset.is_none()

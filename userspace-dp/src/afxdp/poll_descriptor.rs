@@ -376,6 +376,8 @@ pub(super) fn poll_binding_process_descriptor(
                     let (mut meta, mut owned_packet_frame) =
                         stage_native_gre_decap(raw_frame, meta, worker_ctx.forwarding);
                     if owned_packet_frame.is_none() {
+                        // End the shared borrow before taking a mutable UMEM
+                        // slice for in-place WireGuard decap.
                         let _ = raw_frame;
                         let Some(raw_frame_mut) = (unsafe { (&*area).slice_mut_unchecked(desc.addr as usize, desc.len as usize) }) else {
                             binding.scratch.scratch_recycle.push(desc.addr);

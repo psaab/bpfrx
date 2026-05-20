@@ -2,6 +2,11 @@
 
 ## 2026-05-20
 
+- **Timestamp**: 2026-05-20T20:05:00Z
+  - **Action**: Post-validation review-nit follow-up — removed unused WireGuardEngine constructor args, introduced a shared receiver-index mask constant, documented the UMEM borrow-drop safety point before mutable decap borrow, folded tunnel endpoint `wg_public_key` emission to empty string at snapshot build site (and removed the stub helper), and wrapped long WG `try_encap` call formatting.
+  - **File(s)**: `userspace-dp/src/afxdp/wireguard.rs`, `userspace-dp/src/afxdp/worker/mod.rs`, `userspace-dp/src/afxdp/poll_descriptor.rs`, `userspace-dp/src/afxdp/tx/dispatch.rs`, `pkg/dataplane/userspace/snapshot.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/userspace ./pkg/config ./pkg/api ./pkg/grpcapi`; `cargo test --manifest-path userspace-dp/Cargo.toml --no-run` (expected environment failure: missing libelf/gelf headers/pkg-config in runner); `git diff --check`
+
 - **Timestamp**: 2026-05-20T19:45:00Z
   - **Action**: PR #1433 hostile-review blocker remediation — removed WireGuard cross-worker TX-queue dispatch path, fixed unsafe live/mutable UMEM aliasing in decap stage, hardened snapshot private-key handling (fail-closed on invalid/zero key), stabilized peer receiver-index assignment, switched WG runtime updates to linux-name keyed optional snapshots with stale-engine cleanup on listen-port change/removal, disabled explicit peer key forcing on TX encapsulation, dropped unused rayon dependency, and corrected WireGuard design docs/examples.
   - **File(s)**: `userspace-dp/src/afxdp/poll_descriptor.rs`, `userspace-dp/src/afxdp/tx/dispatch.rs`, `userspace-dp/src/afxdp/wireguard.rs`, `userspace-dp/src/afxdp/coordinator/mod.rs`, `userspace-dp/src/afxdp/worker/mod.rs`, `userspace-dp/src/afxdp/session_glue/mod.rs`, `userspace-dp/src/afxdp/types/runtime.rs`, `pkg/dataplane/userspace/snapshot.go`, `userspace-dp/Cargo.toml`, `userspace-dp/Cargo.lock`, `docs/design/wireguard-support.md`, `docs/design/wireguard-multi-tunnel.md`, `_Log.md`

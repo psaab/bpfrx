@@ -5,6 +5,8 @@ use rustc_hash::FxHashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
+const RECEIVER_INDEX_MASK: u32 = 0x00FF_FFFF;
+
 pub(super) struct WireGuardEngine {
     // Peers indexed by their public key, only peers owned by THIS worker
     peers: FxHashMap<[u8; 32], PeerState>,
@@ -39,7 +41,7 @@ pub(super) enum WireGuardDecapOutcome {
 }
 
 impl WireGuardEngine {
-    pub(super) fn new(_worker_id: u32, _num_workers: u32) -> Self {
+    pub(super) fn new() -> Self {
         Self {
             peers: FxHashMap::default(),
             endpoint_to_peer: FxHashMap::default(),
@@ -50,7 +52,7 @@ impl WireGuardEngine {
     }
 
     fn encode_receiver_index(&self, local_index: u32) -> u32 {
-        local_index & 0x00FF_FFFF
+        local_index & RECEIVER_INDEX_MASK
     }
 
     pub(super) fn try_decap(&mut self, raw_frame_mut: &mut [u8], meta: &UserspaceDpMeta, scratch_wg_in: &mut Vec<u8>) -> WireGuardDecapOutcome {
@@ -130,7 +132,7 @@ impl WireGuardEngine {
              let mut idx_bytes = [0u8; 4];
              idx_bytes.copy_from_slice(&outer_payload[4..8]);
              let receiver_index = u32::from_le_bytes(idx_bytes);
-             let local_index = (receiver_index >> 8) & 0x00FF_FFFF;
+             let local_index = (receiver_index >> 8) & RECEIVER_INDEX_MASK;
              if let Some(key) = self.index_to_peer.get(&local_index) {
                  roamed_key = Some(*key);
                  self.peers.get_mut(key)
@@ -656,12 +658,12 @@ fn parse_inner_protocol_and_offsets(packet: &[u8], _addr_family: u8) -> Option<(
 }
 
 fn stable_local_index(public_key: &[u8; 32], occupied: &FxHashMap<u32, [u8; 32]>) -> u32 {
-    let mut idx = u32::from_le_bytes([public_key[0], public_key[1], public_key[2], 0]) & 0x00FF_FFFF;
+    let mut idx = u32::from_le_bytes([public_key[0], public_key[1], public_key[2], 0]) & RECEIVER_INDEX_MASK;
     if idx == 0 {
         idx = 1;
     }
     while occupied.contains_key(&idx) {
-        idx = (idx + 1) & 0x00FF_FFFF;
+        idx = (idx + 1) & RECEIVER_INDEX_MASK;
         if idx == 0 {
             idx = 1;
         }
@@ -720,21 +722,13 @@ mod tests {
     }
 
     #[test]
-    fn test_wireguard_sharding() {
-        let engine = WireGuardEngine::new(2, 4); // worker_id = 2, num_workers = 4
+    fn test_wireguard_receiver_index_encoding() {
+        let engine = WireGuardEngine::new();
         // encode receiver index
         let supplied_index = engine.encode_receiver_index(123);
         // boringtun shifts it by 8 left and overlays counter
         let receiver_idx = (supplied_index << 8) | 45; // 45 is the cyclic session counter
-        
-        assert_eq!(engine.decode_worker_id(receiver_idx), 2);
-        assert_eq!((receiver_idx >> 8) & 0x0000FFFF, 123);
 
-        // get_target_worker_id sharding consistency
-        let key = [7u8; 32];
-        let target1 = engine.get_target_worker_id(&key);
-        let target2 = engine.get_target_worker_id(&key);
-        assert_eq!(target1, target2);
-        assert!(target1 < 4);
+        assert_eq!((receiver_idx >> 8) & RECEIVER_INDEX_MASK, 123);
     }
 }
