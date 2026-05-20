@@ -107,11 +107,11 @@ func (m *Manager) ExportAllSessionsViaEventStream() error {
 }
 
 func (m *Manager) refreshHAStateFromMapsLocked() error {
-	rgMap := m.inner.Map("rg_active")
+	rgMap := m.bpfShim.Map("rg_active")
 	if rgMap == nil {
 		return errors.New("rg_active map not loaded")
 	}
-	wdMap := m.inner.Map("ha_watchdog")
+	wdMap := m.bpfShim.Map("ha_watchdog")
 	if wdMap == nil {
 		return errors.New("ha_watchdog map not loaded")
 	}
@@ -151,7 +151,7 @@ func (m *Manager) seedHAGroupInventoryLocked(cfg *config.Config) {
 // UpdateRGActive. This avoids the race where re-reading Active from BPF
 // causes the helper to miss demotion deltas.
 func (m *Manager) refreshHAWatchdogOnlyFromMapsLocked() error {
-	wdMap := m.inner.Map("ha_watchdog")
+	wdMap := m.bpfShim.Map("ha_watchdog")
 	if wdMap == nil {
 		return nil
 	}
@@ -383,7 +383,7 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	// Update BPF rg_active UNDER the lock so the periodic poll can't
 	// read the new BPF value and sync to the helper before we do.
 	// This prevents the race where the poll eats the demotion delta.
-	if err := m.inner.UpdateRGActive(rgID, active); err != nil {
+	if err := m.bpfShim.UpdateRGActive(rgID, active); err != nil {
 		return err
 	}
 
@@ -462,7 +462,7 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 }
 
 func (m *Manager) UpdateHAWatchdog(rgID int, timestamp uint64) error {
-	if err := m.inner.UpdateHAWatchdog(rgID, timestamp); err != nil {
+	if err := m.bpfShim.UpdateHAWatchdog(rgID, timestamp); err != nil {
 		return err
 	}
 	m.mu.Lock()
@@ -547,7 +547,7 @@ func (m *Manager) syncBPFCountersLocked(status *ProcessStatus) {
 		if d.delta == 0 {
 			continue
 		}
-		if err := m.inner.IncrementGlobalCounter(d.index, d.delta); err != nil {
+		if err := m.bpfShim.IncrementGlobalCounter(d.index, d.delta); err != nil {
 			slog.Debug("userspace: failed to increment BPF global counter",
 				"index", d.index, "delta", d.delta, "err", err)
 		}
@@ -564,7 +564,7 @@ func safeDelta(cur, prev uint64) uint64 {
 }
 
 func (m *Manager) SetSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) error {
-	if err := m.inner.SetSessionV4(key, val); err != nil {
+	if err := m.bpfShim.SetSessionV4(key, val); err != nil {
 		return err
 	}
 	if !shouldMirrorUserspaceSession(val.IsReverse) {
@@ -600,7 +600,7 @@ func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val datapl
 	installVal.FibDmac = [6]byte{}
 	installVal.FibSmac = [6]byte{}
 	installVal.FibGen = 0
-	if err := m.inner.SetSessionV4(key, installVal); err != nil {
+	if err := m.bpfShim.SetSessionV4(key, installVal); err != nil {
 		return err
 	}
 	// The helper already synthesizes the correct reverse companion from the
@@ -621,7 +621,7 @@ func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val datapl
 }
 
 func (m *Manager) SetSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
-	if err := m.inner.SetSessionV6(key, val); err != nil {
+	if err := m.bpfShim.SetSessionV6(key, val); err != nil {
 		return err
 	}
 	if !shouldMirrorUserspaceSession(val.IsReverse) {
@@ -657,7 +657,7 @@ func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val data
 	installVal.FibDmac = [6]byte{}
 	installVal.FibSmac = [6]byte{}
 	installVal.FibGen = 0
-	if err := m.inner.SetSessionV6(key, installVal); err != nil {
+	if err := m.bpfShim.SetSessionV6(key, installVal); err != nil {
 		return err
 	}
 	if !shouldMirrorUserspaceSession(val.IsReverse) {
@@ -680,9 +680,9 @@ func shouldMirrorUserspaceSession(isReverse uint8) bool {
 func (m *Manager) DeleteSession(key dataplane.SessionKey) error {
 	// Look up the session value BEFORE deleting from the BPF map so we
 	// can retrieve the ReverseKey for the pre-installed companion (#351).
-	val, valErr := m.inner.GetSessionV4(key)
+	val, valErr := m.bpfShim.GetSessionV4(key)
 
-	if err := m.inner.DeleteSession(key); err != nil {
+	if err := m.bpfShim.DeleteSession(key); err != nil {
 		return err
 	}
 	m.mu.Lock()
@@ -698,9 +698,9 @@ func (m *Manager) DeleteSession(key dataplane.SessionKey) error {
 func (m *Manager) DeleteSessionV6(key dataplane.SessionKeyV6) error {
 	// Look up the session value BEFORE deleting from the BPF map so we
 	// can retrieve the ReverseKey for the pre-installed companion (#351).
-	val, valErr := m.inner.GetSessionV6(key)
+	val, valErr := m.bpfShim.GetSessionV6(key)
 
-	if err := m.inner.DeleteSessionV6(key); err != nil {
+	if err := m.bpfShim.DeleteSessionV6(key); err != nil {
 		return err
 	}
 	m.mu.Lock()
@@ -890,7 +890,7 @@ func (m *Manager) zoneNameByID(zoneID uint16) string {
 	if zoneID == 0 {
 		return ""
 	}
-	if cr := m.inner.LastCompileResult(); cr != nil {
+	if cr := m.bpfShim.LastCompileResult(); cr != nil {
 		for name, id := range cr.ZoneIDs {
 			if id == zoneID {
 				return name

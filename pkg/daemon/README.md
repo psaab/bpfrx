@@ -10,11 +10,16 @@ together.
 This is the package `cmd/xpfd` instantiates. It depends on essentially
 every other internal package.
 
-The daemon currently stores dataplane backends behind the transitional
-BPF-shaped `dataplane.DataPlane` interface. #1381 will replace that with
-domain interfaces for config, HA/fabric, sessions, telemetry, and link-cycle
-hooks; the actionable plan is in
-`docs/pr/1381-dataplane-interface-split/plan.md`.
+The daemon stores dataplane backends behind `dataplane.RuntimeDataPlane` and
+uses the split config, HA/fabric, sessions, telemetry, and link-cycle domains.
+Legacy `dataplane.DataPlane` access is isolated behind `legacyDP()` for
+callers that still need eBPF/DPDK compatibility while their domain adapters
+are completed.
+
+Config apply uses the runtime `ConfigSink.ApplyConfig` path. This is required
+for userspace AF_XDP, which is intentionally not exposed as a legacy
+`DataPlane`; apply-time callers must not reintroduce `legacyDP().Compile` as
+the primary compile/apply gate.
 
 ## Entry points
 
@@ -57,3 +62,7 @@ Any interface not declared in the active config is brought down and given
 - FRR reload runs with a 15 s context timeout to keep `systemctl reload
   frr` from hanging. The systemd unit has `TimeoutStopSec=20` as a safety
   net.
+- HA fail-closed shutdown clears `rg_active` and watchdog state through the
+  runtime HA controller under one daemon-owned deadline. Controller
+  implementations may have their own RPC deadlines, but daemon shutdown does
+  not wait past the outer deadline for those calls to return.

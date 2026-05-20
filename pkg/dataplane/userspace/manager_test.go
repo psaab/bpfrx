@@ -115,7 +115,7 @@ func TestReadPolicyCountersPreservesScheduledRuleCountersAcrossDeleteReadd(t *te
 	}
 
 	m := New()
-	m.inner = nil
+	m.bpfShim = nil
 	m.lastStatus = ProcessStatus{
 		PolicyRuleCounters: []PolicyRuleCounterStatus{{
 			RuleID:  stablePolicyRuleID("lan", "wan", "scheduled-allow"),
@@ -193,7 +193,7 @@ security {
 	}
 
 	m := New()
-	m.inner = nil
+	m.bpfShim = nil
 	m.lastSnapshot = &ConfigSnapshot{Config: cfg}
 	m.lastStatus = ProcessStatus{
 		PolicyRuleCounters: []PolicyRuleCounterStatus{{
@@ -214,7 +214,7 @@ security {
 
 func TestClearPolicyCountersZerosCachedHelperCountersWithoutHelper(t *testing.T) {
 	m := New()
-	m.inner = nil
+	m.bpfShim = nil
 	m.lastStatus = ProcessStatus{
 		PolicyRuleCounters: []PolicyRuleCounterStatus{
 			{RuleID: stablePolicyRuleID("lan", "wan", "allow-web"), Packets: 7, Bytes: 700},
@@ -535,28 +535,28 @@ func hostToNetwork16(v uint16) uint16 {
 	return binary.NativeEndian.Uint16(raw[:])
 }
 
-func injectInnerMap(t *testing.T, inner *dataplane.Manager, name string, m *ebpf.Map) {
+func injectShimMap(t *testing.T, bpfShim *dataplane.Manager, name string, m *ebpf.Map) {
 	t.Helper()
-	if inner == nil {
-		t.Fatal("injectInnerMap: inner manager is nil")
+	if bpfShim == nil {
+		t.Fatal("injectShimMap: bpfShim manager is nil")
 	}
-	managerValue := reflect.ValueOf(inner)
+	managerValue := reflect.ValueOf(bpfShim)
 	if managerValue.Kind() != reflect.Ptr || managerValue.IsNil() {
-		t.Fatalf("injectInnerMap: expected non-nil pointer to dataplane.Manager, got %T", inner)
+		t.Fatalf("injectShimMap: expected non-nil pointer to dataplane.Manager, got %T", bpfShim)
 	}
 	managerElem := managerValue.Elem()
 	if !managerElem.IsValid() || managerElem.Kind() != reflect.Struct {
-		t.Fatalf("injectInnerMap: expected dataplane.Manager struct, got kind %s", managerElem.Kind())
+		t.Fatalf("injectShimMap: expected dataplane.Manager struct, got kind %s", managerElem.Kind())
 	}
 	rv := managerElem.FieldByName("maps")
 	if !rv.IsValid() {
-		t.Fatal("injectInnerMap: dataplane.Manager has no field named \"maps\"")
+		t.Fatal("injectShimMap: dataplane.Manager has no field named \"maps\"")
 	}
 	if !rv.CanAddr() {
-		t.Fatal("injectInnerMap: dataplane.Manager.maps is not addressable")
+		t.Fatal("injectShimMap: dataplane.Manager.maps is not addressable")
 	}
 	if rv.Kind() != reflect.Map {
-		t.Fatalf("injectInnerMap: dataplane.Manager.maps has kind %s, want map", rv.Kind())
+		t.Fatalf("injectShimMap: dataplane.Manager.maps has kind %s, want map", rv.Kind())
 	}
 	rm := reflect.NewAt(rv.Type(), unsafe.Pointer(rv.UnsafeAddr())).Elem()
 	if rm.IsNil() {
@@ -565,10 +565,10 @@ func injectInnerMap(t *testing.T, inner *dataplane.Manager, name string, m *ebpf
 	key := reflect.ValueOf(name)
 	value := reflect.ValueOf(m)
 	if !key.Type().AssignableTo(rv.Type().Key()) {
-		t.Fatalf("injectInnerMap: cannot use key type %s for map key type %s", key.Type(), rv.Type().Key())
+		t.Fatalf("injectShimMap: cannot use key type %s for map key type %s", key.Type(), rv.Type().Key())
 	}
 	if !value.Type().AssignableTo(rv.Type().Elem()) {
-		t.Fatalf("injectInnerMap: cannot use value type %s for map element type %s", value.Type(), rv.Type().Elem())
+		t.Fatalf("injectShimMap: cannot use value type %s for map element type %s", value.Type(), rv.Type().Elem())
 	}
 	rm.SetMapIndex(key, value)
 }
@@ -585,7 +585,7 @@ func injectSessionMaps(t *testing.T, m *Manager) {
 		t.Fatalf("new sessions map: %v", err)
 	}
 	t.Cleanup(func() { sessionsMap.Close() })
-	injectInnerMap(t, m.inner, "sessions", sessionsMap)
+	injectShimMap(t, m.bpfShim, "sessions", sessionsMap)
 	sessionsMapV6, err := ebpf.NewMap(&ebpf.MapSpec{
 		Type:       ebpf.Hash,
 		KeySize:    uint32(unsafe.Sizeof(dataplane.SessionKeyV6{})),
@@ -596,7 +596,7 @@ func injectSessionMaps(t *testing.T, m *Manager) {
 		t.Fatalf("new sessions_v6 map: %v", err)
 	}
 	t.Cleanup(func() { sessionsMapV6.Close() })
-	injectInnerMap(t, m.inner, "sessions_v6", sessionsMapV6)
+	injectShimMap(t, m.bpfShim, "sessions_v6", sessionsMapV6)
 }
 
 func injectCtrlAndBindingMaps(t *testing.T, m *Manager) (*ebpf.Map, *ebpf.Map) {
@@ -611,7 +611,7 @@ func injectCtrlAndBindingMaps(t *testing.T, m *Manager) (*ebpf.Map, *ebpf.Map) {
 		t.Fatalf("new userspace_ctrl map: %v", err)
 	}
 	t.Cleanup(func() { ctrlMap.Close() })
-	injectInnerMap(t, m.inner, "userspace_ctrl", ctrlMap)
+	injectShimMap(t, m.bpfShim, "userspace_ctrl", ctrlMap)
 
 	bindingsMap, err := ebpf.NewMap(&ebpf.MapSpec{
 		Type:       ebpf.Hash,
@@ -623,7 +623,7 @@ func injectCtrlAndBindingMaps(t *testing.T, m *Manager) (*ebpf.Map, *ebpf.Map) {
 		t.Fatalf("new userspace_bindings map: %v", err)
 	}
 	t.Cleanup(func() { bindingsMap.Close() })
-	injectInnerMap(t, m.inner, "userspace_bindings", bindingsMap)
+	injectShimMap(t, m.bpfShim, "userspace_bindings", bindingsMap)
 	return ctrlMap, bindingsMap
 }
 
@@ -639,7 +639,7 @@ func injectUserspaceSessionMap(t *testing.T, m *Manager) *ebpf.Map {
 		t.Fatalf("new userspace_sessions map: %v", err)
 	}
 	t.Cleanup(func() { usMap.Close() })
-	injectInnerMap(t, m.inner, "userspace_sessions", usMap)
+	injectShimMap(t, m.bpfShim, "userspace_sessions", usMap)
 	return usMap
 }
 
@@ -757,7 +757,7 @@ func TestSessionSyncTunnelEndpointIDLockedMatchesLogicalTunnelIfindex(t *testing
 
 func TestBuildSessionSyncRequestV4ConvertsPortsToHostOrder(t *testing.T) {
 	m := &Manager{
-		inner: dataplane.New(),
+		bpfShim: dataplane.New(),
 		lastSnapshot: &ConfigSnapshot{
 			Interfaces: []InterfaceSnapshot{{
 				Name:            "reth0.80",
@@ -798,7 +798,7 @@ func TestBuildSessionSyncRequestV4ConvertsPortsToHostOrder(t *testing.T) {
 }
 
 func TestBuildSessionSyncRequestV4PreservesBothNatLegs(t *testing.T) {
-	m := &Manager{inner: dataplane.New()}
+	m := &Manager{bpfShim: dataplane.New()}
 	key := dataplane.SessionKey{
 		SrcIP:    [4]byte{198, 51, 100, 10},
 		DstIP:    [4]byte{172, 16, 80, 8},
@@ -824,7 +824,7 @@ func TestBuildSessionSyncRequestV4PreservesBothNatLegs(t *testing.T) {
 
 func TestBuildSessionSyncRequestV4PreservesTunnelEndpointIdentity(t *testing.T) {
 	m := &Manager{
-		inner: dataplane.New(),
+		bpfShim: dataplane.New(),
 		lastSnapshot: &ConfigSnapshot{
 			Interfaces: []InterfaceSnapshot{{
 				Name:            "gr-0/0/0.0",
@@ -878,7 +878,7 @@ func TestBuildSessionSyncRequestV4PreservesTunnelEndpointIdentity(t *testing.T) 
 
 func TestBuildSessionSyncRequestV6PreservesTunnelEndpointIdentity(t *testing.T) {
 	m := &Manager{
-		inner: dataplane.New(),
+		bpfShim: dataplane.New(),
 		lastSnapshot: &ConfigSnapshot{
 			Interfaces: []InterfaceSnapshot{{
 				Name:            "gr-0/0/0.0",
@@ -926,7 +926,7 @@ func TestBuildSessionSyncRequestV6PreservesTunnelEndpointIdentity(t *testing.T) 
 
 func TestBuildSessionSyncRequestV6ConvertsPortsToHostOrder(t *testing.T) {
 	m := &Manager{
-		inner: dataplane.New(),
+		bpfShim: dataplane.New(),
 		lastSnapshot: &ConfigSnapshot{
 			Interfaces: []InterfaceSnapshot{{
 				Name:            "reth0.80",
@@ -972,7 +972,7 @@ func TestBuildSessionSyncRequestV6ConvertsPortsToHostOrder(t *testing.T) {
 }
 
 func TestBuildSessionSyncRequestV6PreservesBothNatLegs(t *testing.T) {
-	m := &Manager{inner: dataplane.New()}
+	m := &Manager{bpfShim: dataplane.New()}
 	var srcIP, dstIP, natSrc, natDst [16]byte
 	copy(srcIP[:], net.ParseIP("2001:db8::10").To16())
 	copy(dstIP[:], net.ParseIP("2001:db8:80::8").To16())
@@ -1061,7 +1061,7 @@ func TestSetClusterSyncedSessionV4SkipsReverseHelperMirror(t *testing.T) {
 		t.Fatalf("new sessions map: %v", err)
 	}
 	defer sessionsMap.Close()
-	injectInnerMap(t, m.inner, "sessions", sessionsMap)
+	injectShimMap(t, m.bpfShim, "sessions", sessionsMap)
 	sessionsMapV6, err := ebpf.NewMap(&ebpf.MapSpec{
 		Type:       ebpf.Hash,
 		KeySize:    uint32(unsafe.Sizeof(dataplane.SessionKeyV6{})),
@@ -1072,7 +1072,7 @@ func TestSetClusterSyncedSessionV4SkipsReverseHelperMirror(t *testing.T) {
 		t.Fatalf("new sessions_v6 map: %v", err)
 	}
 	defer sessionsMapV6.Close()
-	injectInnerMap(t, m.inner, "sessions_v6", sessionsMapV6)
+	injectShimMap(t, m.bpfShim, "sessions_v6", sessionsMapV6)
 
 	key := dataplane.SessionKey{
 		SrcIP:    [4]byte{172, 16, 80, 200},
@@ -1384,7 +1384,7 @@ func TestApplyHelperStatusInitialCtrlCleanupRunsOnlyOnce(t *testing.T) {
 		t.Skipf("RemoveMemlock: %v", err)
 	}
 	m := New()
-	m.inner.XDPEntryProg = "xdp_userspace_prog"
+	m.bpfShim.XDPEntryProg = "xdp_userspace_prog"
 	injectCtrlAndBindingMaps(t, m)
 	usMap := injectUserspaceSessionMap(t, m)
 	m.neighborsPrewarmed = true
@@ -1491,7 +1491,7 @@ func TestUpdateRGActiveActivationKeepsCtrlEnabledAfterAckedStatus(t *testing.T) 
 	m.proc = &exec.Cmd{Process: &os.Process{Pid: 1}}
 	m.cfg.ControlSocket = controlSock
 	m.clusterHA = true
-	m.inner.XDPEntryProg = "xdp_userspace_prog"
+	m.bpfShim.XDPEntryProg = "xdp_userspace_prog"
 	m.neighborsPrewarmed = true
 	m.xskLivenessProven = true
 	m.ctrlWasEnabled = true
@@ -1512,7 +1512,7 @@ func TestUpdateRGActiveActivationKeepsCtrlEnabledAfterAckedStatus(t *testing.T) 
 		t.Fatalf("new rg_active map: %v", err)
 	}
 	t.Cleanup(func() { rgMap.Close() })
-	injectInnerMap(t, m.inner, "rg_active", rgMap)
+	injectShimMap(t, m.bpfShim, "rg_active", rgMap)
 
 	if err := m.UpdateRGActive(1, true); err != nil {
 		t.Fatalf("UpdateRGActive: %v", err)

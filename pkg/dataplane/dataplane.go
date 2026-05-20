@@ -80,10 +80,16 @@ func UserspaceTracePinPath() string {
 // backendRegistry holds constructors for non-eBPF dataplane backends.
 // Sub-packages register themselves via RegisterBackend in their init().
 var backendRegistry = map[string]func() DataPlane{}
+var runtimeBackendRegistry = map[string]func() RuntimeDataPlane{}
 
 // RegisterBackend registers a dataplane constructor for the given type.
 func RegisterBackend(dpType string, ctor func() DataPlane) {
 	backendRegistry[dpType] = ctor
+}
+
+// RegisterRuntimeBackend registers a runtime-domain dataplane constructor.
+func RegisterRuntimeBackend(dpType string, ctor func() RuntimeDataPlane) {
+	runtimeBackendRegistry[dpType] = ctor
 }
 
 // NewDataPlane creates a DataPlane backend based on the given type string.
@@ -97,6 +103,29 @@ func NewDataPlane(dpType string) (DataPlane, error) {
 			return ctor(), nil
 		}
 		return nil, fmt.Errorf("unknown dataplane type %q (valid: ebpf, dpdk, userspace)", dpType)
+	}
+}
+
+// NewRuntimeDataPlane creates a daemon-facing runtime dataplane backend.
+// Userspace registers here directly so daemon startup does not require a
+// legacy BPF-shaped DataPlane compatibility adapter.
+func NewRuntimeDataPlane(dpType string) (RuntimeDataPlane, error) {
+	switch dpType {
+	case "", TypeEBPF:
+		return New(), nil
+	default:
+		if ctor, ok := runtimeBackendRegistry[dpType]; ok {
+			return ctor(), nil
+		}
+		dp, err := NewDataPlane(dpType)
+		if err != nil {
+			return nil, err
+		}
+		runtimeDP, ok := dp.(RuntimeDataPlane)
+		if !ok {
+			return nil, fmt.Errorf("dataplane type %q does not implement RuntimeDataPlane", dpType)
+		}
+		return runtimeDP, nil
 	}
 }
 
