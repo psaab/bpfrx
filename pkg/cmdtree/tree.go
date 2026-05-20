@@ -458,6 +458,21 @@ var OperationalTree = map[string]*Node{
 				"security-associations": {Desc: "Show IPsec SAs"},
 				"statistics":            {Desc: "Show IPsec statistics"},
 			}},
+			"wireguard": {Desc: "Show WireGuard information", Children: map[string]*Node{
+				"public-key": {Desc: "Show public key for WireGuard interfaces", DynamicFn: func(cfg *config.Config) []string {
+					if cfg == nil {
+						return nil
+					}
+					var names []string
+					for name, ifc := range cfg.Interfaces.Interfaces {
+						if ifc.Tunnel != nil && ifc.Tunnel.Mode == "wireguard" {
+							names = append(names, name)
+						}
+					}
+					sort.Strings(names)
+					return names
+				}},
+			}},
 			"vrrp":           {Desc: "Show VRRP high availability status"},
 			"match-policies": {Desc: "Match 5-tuple against policies"},
 		}},

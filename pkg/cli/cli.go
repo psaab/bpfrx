@@ -18,6 +18,9 @@ import (
 	"syscall"
 	"time"
 
+	"crypto/ecdh"
+	"encoding/base64"
+
 	"github.com/chzyer/readline"
 	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/cluster"
@@ -1039,6 +1042,9 @@ func (c *CLI) handleShowSecurity(args []string) error {
 	case "ipsec":
 		return c.showIPsec(args[1:])
 
+	case "wireguard":
+		return c.handleShowSecurityWireGuard(cfg, args[1:])
+
 	case "ike":
 		return c.showIKE(args[1:])
 
@@ -1966,4 +1972,85 @@ func (c *CLI) handleShowServices(args []string) error {
 	default:
 		return fmt.Errorf("unknown services target: %s", args[0])
 	}
+}
+
+func (c *CLI) handleShowSecurityWireGuard(cfg *config.Config, args []string) error {
+	if len(args) == 0 {
+		fmt.Println("show security wireguard:")
+		fmt.Println("  public-key [interface]    Show public key for WireGuard interfaces")
+		return nil
+	}
+
+	switch args[0] {
+	case "public-key":
+		filterIf := ""
+		if len(args) >= 2 {
+			filterIf = args[1]
+		}
+		return c.showWireGuardPublicKey(cfg, filterIf)
+	default:
+		return fmt.Errorf("unknown wireguard command: %s", args[0])
+	}
+}
+
+func (c *CLI) showWireGuardPublicKey(cfg *config.Config, filterIf string) error {
+	found := false
+	if cfg == nil || cfg.Interfaces.Interfaces == nil {
+		return fmt.Errorf("no interfaces configured")
+	}
+
+	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		ifNames = append(ifNames, name)
+	}
+	sort.Strings(ifNames)
+
+	for _, name := range ifNames {
+		if filterIf != "" && name != filterIf {
+			continue
+		}
+		ifc := cfg.Interfaces.Interfaces[name]
+		if ifc.Tunnel == nil || ifc.Tunnel.Mode != "wireguard" || ifc.Tunnel.WireGuard == nil {
+			continue
+		}
+
+		privKeyStr := ifc.Tunnel.WireGuard.PrivateKey
+		if privKeyStr == "" {
+			fmt.Printf("Interface: %s\n", name)
+			fmt.Printf("  Public key: (private-key not configured)\n")
+			found = true
+			continue
+		}
+
+		privKey, err := base64.StdEncoding.DecodeString(privKeyStr)
+		if err != nil || len(privKey) != 32 {
+			fmt.Printf("Interface: %s\n", name)
+			fmt.Printf("  Public key: (invalid private-key configured)\n")
+			found = true
+			continue
+		}
+
+		curve := ecdh.X25519()
+		priv, err := curve.NewPrivateKey(privKey)
+		if err != nil {
+			fmt.Printf("Interface: %s\n", name)
+			fmt.Printf("  Public key: (failed to derive: %v)\n", err)
+			found = true
+			continue
+		}
+		pub := priv.PublicKey()
+		pubKeyStr := base64.StdEncoding.EncodeToString(pub.Bytes())
+
+		fmt.Printf("Interface: %s\n", name)
+		fmt.Printf("  Public key: %s\n", pubKeyStr)
+		found = true
+	}
+
+	if !found && filterIf != "" {
+		return fmt.Errorf("interface %s not found or not a WireGuard interface", filterIf)
+	}
+	if !found && filterIf == "" {
+		fmt.Println("No WireGuard interfaces configured")
+	}
+	return nil
 }
