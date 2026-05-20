@@ -16,7 +16,7 @@ set security wireguard listen-port 51820
 ### Interface Configuration
 Interfaces inherit the global identity but define their own peers.
 ```bash
-set interfaces wg0 wireguard peer <pubkey> allowed-ips 10.0.1.0/24
+set interfaces wg0 wireguard peer <pubkey> allowed-ips 3fff:1::/48
 ```
 
 Per-interface overrides are still supported if a different identity is required for specific tunnels.

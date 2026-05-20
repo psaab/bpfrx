@@ -25,6 +25,7 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[repr(align(64))]
 struct Slot<T> {
     seq: AtomicUsize,
     val: UnsafeCell<MaybeUninit<T>>,

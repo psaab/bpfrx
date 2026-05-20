@@ -2357,13 +2357,14 @@ func buildWireGuardSnapshot(cfg *config.Config) map[string]WireGuardInterfaceSna
 
 			snap := WireGuardInterfaceSnapshot{
 				PrivateKey: privKey,
+				PublicKey:  deriveWgPublicKey(privKey),
 				ListenPort: uint16(listenPort),
 			}
 			if ifc.Tunnel.WireGuard != nil {
 				for _, peer := range ifc.Tunnel.WireGuard.Peers {
 					snap.Peers = append(snap.Peers, WireGuardPeerSnapshot{
 						PublicKey:           peer.PublicKey,
-						Endpoint:            peer.Endpoint,
+						Endpoint:            formatEndpoint(peer.Endpoint, peer.Port),
 						AllowedIPs:          peer.AllowedIPs,
 						PersistentKeepalive: uint32(peer.PersistentKeepalive),
 					})
@@ -2376,6 +2377,37 @@ func buildWireGuardSnapshot(cfg *config.Config) map[string]WireGuardInterfaceSna
 		return nil
 	}
 	return out
+}
+
+func formatEndpoint(endpoint string, port int) string {
+	if endpoint == "" {
+		return ""
+	}
+	if port == 0 {
+		return endpoint
+	}
+	ip := net.ParseIP(endpoint)
+	if ip != nil && ip.To4() == nil {
+		return fmt.Sprintf("[%s]:%d", endpoint, port)
+	}
+	return fmt.Sprintf("%s:%d", endpoint, port)
+}
+
+func deriveWgPublicKey(privKeyStr string) string {
+	if privKeyStr == "" {
+		return ""
+	}
+	privKey, err := base64.StdEncoding.DecodeString(privKeyStr)
+	if err != nil || len(privKey) != 32 {
+		return ""
+	}
+	curve := ecdh.X25519()
+	priv, err := curve.NewPrivateKey(privKey)
+	if err != nil {
+		return ""
+	}
+	pub := priv.PublicKey()
+	return base64.StdEncoding.EncodeToString(pub.Bytes())
 }
 
 func buildSingleWireGuardSnapshot(tunnel *config.TunnelConfig, global config.WireGuardGlobalConfig) *WireGuardInterfaceSnapshot {
@@ -2394,13 +2426,14 @@ func buildSingleWireGuardSnapshot(tunnel *config.TunnelConfig, global config.Wir
 	}
 	snap := &WireGuardInterfaceSnapshot{
 		PrivateKey: privKey,
+		PublicKey:  deriveWgPublicKey(privKey),
 		ListenPort: uint16(listenPort),
 	}
 	if tunnel.WireGuard != nil {
 		for _, peer := range tunnel.WireGuard.Peers {
 			snap.Peers = append(snap.Peers, WireGuardPeerSnapshot{
 				PublicKey:           peer.PublicKey,
-				Endpoint:            peer.Endpoint,
+				Endpoint:            formatEndpoint(peer.Endpoint, peer.Port),
 				AllowedIPs:          peer.AllowedIPs,
 				PersistentKeepalive: uint32(peer.PersistentKeepalive),
 			})
@@ -2413,24 +2446,10 @@ func wgPublicKey(tunnel *config.TunnelConfig, global config.WireGuardGlobalConfi
 	if tunnel.Mode != "wireguard" {
 		return ""
 	}
-	privKeyStr := global.PrivateKey
-	if tunnel.WireGuard != nil && tunnel.WireGuard.PrivateKey != "" {
-		privKeyStr = tunnel.WireGuard.PrivateKey
+	if tunnel.WireGuard != nil && len(tunnel.WireGuard.Peers) > 0 {
+		return tunnel.WireGuard.Peers[0].PublicKey
 	}
-	if privKeyStr == "" {
-		return ""
-	}
-	privKey, err := base64.StdEncoding.DecodeString(privKeyStr)
-	if err != nil || len(privKey) != 32 {
-		return ""
-	}
-	curve := ecdh.X25519()
-	priv, err := curve.NewPrivateKey(privKey)
-	if err != nil {
-		return ""
-	}
-	pub := priv.PublicKey()
-	return base64.StdEncoding.EncodeToString(pub.Bytes())
+	return ""
 }
 
 func wgListenPort(tunnel *config.TunnelConfig, global config.WireGuardGlobalConfig) uint16 {

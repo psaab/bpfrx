@@ -89,6 +89,7 @@ fn test_pending_forward_request(
         cos_queue_id: None,
         dscp_rewrite: None,
         cos_tx_selection_resolved,
+        target_worker: None,
     }
 }
 
@@ -123,6 +124,7 @@ fn test_live_forward_request_for_frame(
         cos_queue_id: None,
         dscp_rewrite: None,
         cos_tx_selection_resolved: true,
+        target_worker: None,
     }
 }
 

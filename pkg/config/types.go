@@ -1802,6 +1802,7 @@ type WireGuardConfig struct {
 type WireGuardPeer struct {
 	PublicKey           string
 	Endpoint            string
+	Port                int
 	AllowedIPs          []string
 	PersistentKeepalive int
 }

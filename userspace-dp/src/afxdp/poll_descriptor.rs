@@ -342,7 +342,7 @@ pub(super) fn poll_binding_process_descriptor(
         binding.scratch.scratch_recycle.clear();
         binding.scratch.scratch_forwards.clear();
         binding.scratch.scratch_rst_teardowns.clear();
-        while let Some(desc) = received.read() {
+        while let Some(mut desc) = received.read() {
             record_rx_descriptor_telemetry(desc, area, telemetry, worker_ctx);
             let mut recycle_now = true;
             if let Some(meta) = try_parse_metadata(unsafe { &*area }, desc) {
@@ -351,12 +351,14 @@ pub(super) fn poll_binding_process_descriptor(
                 if disposition == PacketDisposition::Valid {
                     telemetry.counters.validated_packets += 1;
                     telemetry.counters.validated_bytes += desc.len as u64;
-                    let Some(raw_frame) =
-                        unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
-                    else {
-                        binding.scratch.scratch_recycle.push(desc.addr);
-                        continue;
-                    };
+                    let mut raw_frame =
+                        match unsafe { &*area }.slice(desc.addr as usize, desc.len as usize) {
+                            Some(slice) => slice,
+                            None => {
+                                binding.scratch.scratch_recycle.push(desc.addr);
+                                continue;
+                            }
+                        };
                     // #946 Phase 1 stage 5: ARP / NDP link-layer
                     // classification. ARP frames recycle without
                     // transiting; NDP NA learns and falls through.
@@ -374,44 +376,58 @@ pub(super) fn poll_binding_process_descriptor(
                     let (mut meta, mut owned_packet_frame) =
                         stage_native_gre_decap(raw_frame, meta, worker_ctx.forwarding);
                     if owned_packet_frame.is_none() {
-                        let (new_meta, new_owned, is_control, target_worker) =
-                            stage_wireguard_decap(raw_frame, meta, &mut binding.wireguard_engines, &mut binding.scratch.scratch_wg_in);
+                        let Some(raw_frame_mut) = (unsafe { (&*area).slice_mut_unchecked(desc.addr as usize, desc.len as usize) }) else {
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
+                        };
+                        let (new_meta, new_owned, is_control, target_worker, decapsulated_len) =
+                            stage_wireguard_decap(raw_frame_mut, meta, &mut binding.wireguard_engines, &mut binding.scratch.scratch_wg_in);
+                        
+                        if let Some(new_len) = decapsulated_len {
+                            if !is_control {
+                                desc.len = new_len as u32;
+                                let Some(new_slice) = (unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)) else {
+                                    binding.scratch.scratch_recycle.push(desc.addr);
+                                    continue;
+                                };
+                                raw_frame = new_slice;
+                            }
+                        }
                         
                         if let Some(tw_id) = target_worker {
                             // Cross-worker dispatch
-                            if let Some(target_binding_index) = worker_ctx.binding_lookup.worker_index(meta.ingress_ifindex as i32, tw_id) {
-                                binding.scratch.scratch_forwards.push(PendingForwardRequest {
-                                    target_ifindex: meta.ingress_ifindex as i32,
-                                    target_binding_index: Some(target_binding_index),
-                                    ingress_queue_id: worker_ctx.ident.queue_id,
-                                    desc,
-                                    frame: PendingForwardFrame::Live,
-                                    meta: meta.into(),
-                                    decision: SessionDecision {
-                                        resolution: ForwardingResolution {
-                                            disposition: ForwardingDisposition::ForwardCandidate,
-                                            local_ifindex: 0,
-                                            egress_ifindex: 0,
-                                            tx_ifindex: 0,
-                                            tunnel_endpoint_id: 0,
-                                            next_hop: None,
-                                            neighbor_mac: None,
-                                            src_mac: None,
-                                            tx_vlan_id: 0,
-                                        },
-                                        nat: NatDecision::default(),
+                            binding.scratch.scratch_forwards.push(PendingForwardRequest {
+                                target_ifindex: meta.ingress_ifindex as i32,
+                                target_binding_index: worker_ctx.binding_lookup.worker_index(meta.ingress_ifindex as i32, tw_id),
+                                ingress_queue_id: worker_ctx.ident.queue_id,
+                                desc,
+                                frame: PendingForwardFrame::Live,
+                                meta: meta.into(),
+                                decision: SessionDecision {
+                                    resolution: ForwardingResolution {
+                                        disposition: ForwardingDisposition::ForwardCandidate,
+                                        local_ifindex: 0,
+                                        egress_ifindex: 0,
+                                        tx_ifindex: 0,
+                                        tunnel_endpoint_id: 0,
+                                        next_hop: None,
+                                        neighbor_mac: None,
+                                        src_mac: None,
+                                        tx_vlan_id: 0,
                                     },
-                                    apply_nat_on_fabric: false,
-                                    expected_ports: None,
-                                    flow_key: None,
-                                    nat64_reverse: None,
-                                    cos_queue_id: None,
-                                    dscp_rewrite: None,
-                                    cos_tx_selection_resolved: false,
-                                });
-                                binding.scratch.scratch_recycle.push(desc.addr);
-                                continue;
-                            }
+                                    nat: NatDecision::default(),
+                                },
+                                apply_nat_on_fabric: false,
+                                expected_ports: None,
+                                flow_key: None,
+                                nat64_reverse: None,
+                                cos_queue_id: None,
+                                dscp_rewrite: None,
+                                cos_tx_selection_resolved: false,
+                                target_worker: Some(tw_id),
+                            });
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
                         }
 
                         if is_control {
@@ -423,6 +439,38 @@ pub(super) fn poll_binding_process_descriptor(
                                     } else {
                                         ingress_ifindex
                                     };
+                                    let next_hop = match new_meta.addr_family as i32 {
+                                        libc::AF_INET => {
+                                            if frame.len() >= new_meta.l3_offset as usize + 20 {
+                                                let mut ip_bytes = [0u8; 4];
+                                                ip_bytes.copy_from_slice(&frame[new_meta.l3_offset as usize + 16..new_meta.l3_offset as usize + 20]);
+                                                Some(IpAddr::V4(Ipv4Addr::from(ip_bytes)))
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        libc::AF_INET6 => {
+                                            if frame.len() >= new_meta.l3_offset as usize + 40 {
+                                                let mut ip_bytes = [0u8; 16];
+                                                ip_bytes.copy_from_slice(&frame[new_meta.l3_offset as usize + 24..new_meta.l3_offset as usize + 40]);
+                                                Some(IpAddr::V6(Ipv6Addr::from(ip_bytes)))
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        _ => None,
+                                    };
+                                    let neighbor_mac = next_hop
+                                        .and_then(|hop| worker_ctx.dynamic_neighbors.get(&(target_ifindex, hop)).map(|entry| entry.mac))
+                                        .or_else(|| {
+                                            if frame.len() >= 6 {
+                                                let mut mac = [0u8; 6];
+                                                mac.copy_from_slice(&frame[0..6]);
+                                                Some(mac)
+                                            } else {
+                                                None
+                                            }
+                                        });
                                     binding.scratch.scratch_forwards.push(PendingForwardRequest {
                                         target_ifindex,
                                         target_binding_index: None,
@@ -437,8 +485,8 @@ pub(super) fn poll_binding_process_descriptor(
                                                 egress_ifindex: ingress_ifindex,
                                                 tx_ifindex: target_ifindex,
                                                 tunnel_endpoint_id: 0,
-                                                next_hop: None,
-                                                neighbor_mac: None,
+                                                next_hop,
+                                                neighbor_mac,
                                                 src_mac: Some(egress.src_mac),
                                                 tx_vlan_id: egress.vlan_id,
                                             },
@@ -451,6 +499,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         cos_queue_id: None,
                                         dscp_rewrite: None,
                                         cos_tx_selection_resolved: false,
+                                        target_worker: None,
                                     });
                                 }
                             }
@@ -1469,6 +1518,7 @@ pub(super) fn poll_binding_process_descriptor(
                                                     cos_queue_id: cos.queue_id,
                                                     dscp_rewrite: cos.dscp_rewrite,
                                                     cos_tx_selection_resolved: true,
+                                                    target_worker: None,
                                                 });
                                                 recycle_now = false;
                                             }

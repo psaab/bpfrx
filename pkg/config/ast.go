@@ -13,7 +13,7 @@ type Node struct {
 	//   "security" -> ["security"]
 	//   "security-zone trust" -> ["security-zone", "trust"]
 	//   "from-zone trust to-zone untrust" -> ["from-zone", "trust", "to-zone", "untrust"]
-	//   "address 10.0.1.0/24" -> ["address", "10.0.1.0/24"]
+	//   "address 3fff:1::/48" -> ["address", "3fff:1::/48"]
 	Keys []string
 
 	// Children are the nodes within this block's braces.
@@ -662,9 +662,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				}},
 			}},
 		}},
-		"wireguard": {children: map[string]*schemaNode{
-			"private-key": {args: 1, children: nil},
-			"listen-port": {args: 1, children: nil},
+		"wireguard": {desc: "Global WireGuard parameters", children: map[string]*schemaNode{
+			"private-key": {desc: "Global WireGuard private key (Base64)", args: 1, placeholder: "<private-key>", children: nil},
+			"listen-port": {desc: "Global WireGuard listen port", args: 1, placeholder: "<port>", children: nil},
 		}},
 		"dynamic-address": {children: map[string]*schemaNode{
 			"feed-server": {args: 1, children: map[string]*schemaNode{
@@ -736,6 +736,16 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"keepalive-retry": {desc: "Keepalive retry count", args: 1, children: nil},
 			"routing-instance": {desc: "Routing instance", children: map[string]*schemaNode{
 				"destination": {desc: "Destination routing instance", args: 1, children: nil},
+			}},
+			"wireguard": {desc: "WireGuard tunnel parameters", children: map[string]*schemaNode{
+				"private-key": {desc: "WireGuard private key (Base64)", args: 1, placeholder: "<private-key>", children: nil},
+				"listen-port": {desc: "WireGuard listen port", args: 1, placeholder: "<port>", children: nil},
+				"peer": {desc: "WireGuard peer public key (Base64)", wildcard: &schemaNode{placeholder: "<public-key>", children: map[string]*schemaNode{
+					"endpoint":             {desc: "WireGuard peer endpoint address or hostname (no brackets required)", args: 1, placeholder: "<address>", children: nil},
+					"port":                 {desc: "WireGuard peer endpoint port", args: 1, placeholder: "<port>", children: nil},
+					"allowed-ips":          {desc: "WireGuard peer allowed IPs", wildcard: &schemaNode{placeholder: "<ip-prefix>", children: nil}},
+					"persistent-keepalive": {desc: "WireGuard peer persistent keepalive interval in seconds", args: 1, placeholder: "<seconds>", children: nil},
+				}}},
 			}},
 		}},
 		"unit": {desc: "Logical unit number", args: 1, valueHint: ValueHintUnitNumber, placeholder: "<unit-number>", children: map[string]*schemaNode{

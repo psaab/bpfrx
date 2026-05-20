@@ -87,6 +87,7 @@ pub(super) fn build_local_time_exceeded_request(
         cos_queue_id: cos.queue_id,
         dscp_rewrite: cos.dscp_rewrite,
         cos_tx_selection_resolved: true,
+        target_worker: None,
     })
 }
 

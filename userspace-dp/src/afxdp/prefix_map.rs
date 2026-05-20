@@ -4,54 +4,28 @@ use ipnet::IpNet;
 /// A Trie-based Longest Prefix Match (LPM) map.
 #[derive(Debug, Clone)]
 pub(crate) struct PrefixMap<V> {
-    v4: PrefixTrie<V>,
-    v6: PrefixTrie<V>,
+    v4: PrefixTrieContiguous<V>,
+    v6: PrefixTrieContiguous<V>,
 }
 
-#[derive(Debug)]
-struct PrefixTrie<V> {
-    root: TrieNode<V>,
+#[derive(Debug, Clone)]
+struct PrefixTrieContiguous<V> {
+    nodes: Vec<TrieNodeContiguous<V>>,
 }
 
-impl<V: Clone> Clone for PrefixTrie<V> {
-    fn clone(&self) -> Self {
-        Self {
-            root: self.root.clone(),
-        }
-    }
-}
-
-impl<V> Default for PrefixTrie<V> {
-    fn default() -> Self {
-        Self {
-            root: TrieNode::default(),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct TrieNode<V> {
+#[derive(Debug, Clone)]
+struct TrieNodeContiguous<V> {
     value: Option<V>,
-    children: [Option<Box<TrieNode<V>>>; 2],
+    children: [Option<u32>; 2],
 }
 
-impl<V: Clone> Clone for TrieNode<V> {
-    fn clone(&self) -> Self {
-        Self {
-            value: self.value.clone(),
-            children: [
-                self.children[0].clone(),
-                self.children[1].clone(),
-            ],
-        }
-    }
-}
-
-impl<V> Default for TrieNode<V> {
+impl<V> Default for PrefixTrieContiguous<V> {
     fn default() -> Self {
         Self {
-            value: None,
-            children: [None, None],
+            nodes: vec![TrieNodeContiguous {
+                value: None,
+                children: [None, None],
+            }],
         }
     }
 }
@@ -59,8 +33,8 @@ impl<V> Default for TrieNode<V> {
 impl<V: Clone> PrefixMap<V> {
     pub(crate) fn new() -> Self {
         Self {
-            v4: PrefixTrie::default(),
-            v6: PrefixTrie::default(),
+            v4: PrefixTrieContiguous::default(),
+            v6: PrefixTrieContiguous::default(),
         }
     }
 
@@ -69,22 +43,50 @@ impl<V: Clone> PrefixMap<V> {
             IpNet::V4(net_v4) => {
                 let bits = u32::from(net_v4.addr());
                 let depth = net_v4.prefix_len() as usize;
-                let mut node = &mut self.v4.root;
+                let mut node_idx = 0usize;
                 for i in 0..depth {
                     let bit = ((bits >> (31 - i)) & 1) as usize;
-                    node = node.children[bit].get_or_insert_with(Box::default);
+                    let next_idx = self.v4.nodes[node_idx].children[bit];
+                    match next_idx {
+                        Some(idx) => {
+                            node_idx = idx as usize;
+                        }
+                        None => {
+                            let new_idx = self.v4.nodes.len();
+                            self.v4.nodes.push(TrieNodeContiguous {
+                                value: None,
+                                children: [None, None],
+                            });
+                            self.v4.nodes[node_idx].children[bit] = Some(new_idx as u32);
+                            node_idx = new_idx;
+                        }
+                    }
                 }
-                node.value = Some(value);
+                self.v4.nodes[node_idx].value = Some(value);
             }
             IpNet::V6(net_v6) => {
                 let bits = u128::from(net_v6.addr());
                 let depth = net_v6.prefix_len() as usize;
-                let mut node = &mut self.v6.root;
+                let mut node_idx = 0usize;
                 for i in 0..depth {
                     let bit = ((bits >> (127 - i)) & 1) as usize;
-                    node = node.children[bit].get_or_insert_with(Box::default);
+                    let next_idx = self.v6.nodes[node_idx].children[bit];
+                    match next_idx {
+                        Some(idx) => {
+                            node_idx = idx as usize;
+                        }
+                        None => {
+                            let new_idx = self.v6.nodes.len();
+                            self.v6.nodes.push(TrieNodeContiguous {
+                                value: None,
+                                children: [None, None],
+                            });
+                            self.v6.nodes[node_idx].children[bit] = Some(new_idx as u32);
+                            node_idx = new_idx;
+                        }
+                    }
                 }
-                node.value = Some(value);
+                self.v6.nodes[node_idx].value = Some(value);
             }
         }
     }
@@ -93,17 +95,17 @@ impl<V: Clone> PrefixMap<V> {
         match ip {
             IpAddr::V4(ip_v4) => {
                 let bits = u32::from(ip_v4);
-                let mut node = &self.v4.root;
-                let mut best_match = node.value.as_ref();
+                let mut node_idx = 0usize;
+                let mut best_match = self.v4.nodes[node_idx].value.as_ref();
                 
                 for i in 0..32 {
                     let bit = ((bits >> (31 - i)) & 1) as usize;
-                    match node.children[bit].as_deref() {
-                        Some(next) => {
-                            if next.value.is_some() {
-                                best_match = next.value.as_ref();
+                    match self.v4.nodes[node_idx].children[bit] {
+                        Some(next_idx) => {
+                            node_idx = next_idx as usize;
+                            if self.v4.nodes[node_idx].value.is_some() {
+                                best_match = self.v4.nodes[node_idx].value.as_ref();
                             }
-                            node = next;
                         }
                         None => break,
                     }
@@ -112,17 +114,17 @@ impl<V: Clone> PrefixMap<V> {
             }
             IpAddr::V6(ip_v6) => {
                 let bits = u128::from(ip_v6);
-                let mut node = &self.v6.root;
-                let mut best_match = node.value.as_ref();
+                let mut node_idx = 0usize;
+                let mut best_match = self.v6.nodes[node_idx].value.as_ref();
                 
                 for i in 0..128 {
                     let bit = ((bits >> (127 - i)) & 1) as usize;
-                    match node.children[bit].as_deref() {
-                        Some(next) => {
-                            if next.value.is_some() {
-                                best_match = next.value.as_ref();
+                    match self.v6.nodes[node_idx].children[bit] {
+                        Some(next_idx) => {
+                            node_idx = next_idx as usize;
+                            if self.v6.nodes[node_idx].value.is_some() {
+                                best_match = self.v6.nodes[node_idx].value.as_ref();
                             }
-                            node = next;
                         }
                         None => break,
                     }

@@ -59,6 +59,7 @@ impl Default for PendingForwardFrame {
     }
 }
 
+#[repr(align(64))]
 pub(in crate::afxdp) struct PendingForwardRequest {
     pub(in crate::afxdp) target_ifindex: i32,
     pub(in crate::afxdp) target_binding_index: Option<usize>,
@@ -74,6 +75,7 @@ pub(in crate::afxdp) struct PendingForwardRequest {
     pub(in crate::afxdp) cos_queue_id: Option<u8>,
     pub(in crate::afxdp) dscp_rewrite: Option<u8>,
     pub(in crate::afxdp) cos_tx_selection_resolved: bool,
+    pub(in crate::afxdp) target_worker: Option<u32>,
 }
 
 pub(in crate::afxdp) struct PreparedTxRequest {

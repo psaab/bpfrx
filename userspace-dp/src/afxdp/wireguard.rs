@@ -31,21 +31,16 @@ struct PeerState {
 }
 
 pub(super) struct WireGuardDecapResult {
-    pub frame: Vec<u8>,
+    pub decapsulated_len: usize,
     pub meta: UserspaceDpMeta,
     pub is_control: bool,
+    pub control_frame: Option<Vec<u8>>,
 }
 
 pub(super) enum WireGuardDecapOutcome {
     Decapped(WireGuardDecapResult),
     DispatchToWorker(u32),
     None,
-}
-
-pub(super) struct WireGuardEncapResult {
-    pub frame: Vec<u8>,
-    pub meta: UserspaceDpMeta,
-    pub is_control: bool,
 }
 
 impl WireGuardEngine {
@@ -79,15 +74,15 @@ impl WireGuardEngine {
     }
 
     fn encode_receiver_index(&self, local_index: u32) -> u32 {
-        (self.worker_id << 24) | (local_index & 0x00FFFFFF)
+        (self.worker_id << 16) | (local_index & 0x0000FFFF)
     }
 
-    pub(super) fn try_decap(&mut self, outer_frame: &[u8], meta: &UserspaceDpMeta, scratch_out: &mut Vec<u8>) -> WireGuardDecapOutcome {
+    pub(super) fn try_decap(&mut self, raw_frame_mut: &mut [u8], meta: &UserspaceDpMeta, scratch_wg_in: &mut Vec<u8>) -> WireGuardDecapOutcome {
         if meta.protocol != 17 || meta.flow_dst_port != self.listen_port {
             return WireGuardDecapOutcome::None;
         }
         
-        let outer_payload = match outer_frame.get(meta.payload_offset as usize..) {
+        let outer_payload = match raw_frame_mut.get(meta.payload_offset as usize..) {
             Some(p) => p,
             None => return WireGuardDecapOutcome::None,
         };
@@ -113,17 +108,6 @@ impl WireGuardEngine {
                 if let Some(peer_key) = self.endpoint_to_peer.get(&(meta.src_ip(), meta.flow_src_port)) {
                     self.get_target_worker_id(peer_key)
                 } else {
-                    // Roaming or new peer. We can't easily find the peer without 
-                    // attempting decryption. For Phase 1, we'll round-robin or 
-                    // just process locally if we can't determine.
-                    // Actually, WireGuard handshake initiation is for the static receiver.
-                    // Any worker could try to decrypt it if they have the static private key.
-                    // But boringtun's Tunn::decapsulate requires a Tunn object which is per-peer.
-                    
-                    // Fallback: search all local peers? No, that's what boringtun does.
-                    // If we shard, only one worker HAS the Tunn object for this peer.
-                    
-                    // For Phase 1, if unknown endpoint, we'll just try local peers.
                     self.worker_id
                 }
             }
@@ -149,90 +133,142 @@ impl WireGuardEngine {
         let endpoint_port = meta.flow_src_port;
 
         // Find peer by endpoint or receiver_index
+        let mut roamed_key = None;
         let peer = if msg_type == 4 || msg_type == 2 || msg_type == 3 {
              let mut idx_bytes = [0u8; 4];
              idx_bytes.copy_from_slice(&outer_payload[4..8]);
              let receiver_index = u32::from_le_bytes(idx_bytes);
-             let local_index = receiver_index & 0x00FFFFFF;
+             let local_index = (receiver_index >> 8) & 0x0000FFFF;
              if let Some(key) = self.index_to_peer.get(&local_index) {
+                 roamed_key = Some(*key);
                  self.peers.get_mut(key)
              } else {
-                 self.endpoint_to_peer.get(&(endpoint_ip, endpoint_port)).and_then(|key| self.peers.get_mut(key))
+                 self.endpoint_to_peer.get(&(endpoint_ip, endpoint_port)).and_then(|key| {
+                     roamed_key = Some(*key);
+                     self.peers.get_mut(key)
+                 })
              }
         } else {
-             self.endpoint_to_peer.get(&(endpoint_ip, endpoint_port)).and_then(|key| self.peers.get_mut(key))
+             self.endpoint_to_peer.get(&(endpoint_ip, endpoint_port)).and_then(|key| {
+                 roamed_key = Some(*key);
+                 self.peers.get_mut(key)
+             })
         };
 
-        let peer = match peer {
-            Some(p) => p,
-            None => return WireGuardDecapOutcome::None,
-        };
-        
-        // Update peer endpoint in case it changed (roaming)
-        peer.endpoint = Some((endpoint_ip, endpoint_port));
-        // Also update local IP from the packet's destination IP
-        peer.local_ip = Some(meta.dst_ip());
-        
-        scratch_out.resize(outer_payload.len(), 0);
-        match peer.tunn.decapsulate(Some(endpoint_ip), outer_payload, scratch_out) {
-            TunnResult::WriteToNetwork(packet) => {
-                let mut src_mac = [0u8; 6];
-                let mut dst_mac = [0u8; 6];
-                if outer_frame.len() >= 12 {
-                    src_mac.copy_from_slice(&outer_frame[0..6]);
-                    dst_mac.copy_from_slice(&outer_frame[6..12]);
+        let (outcome, roamed_update) = {
+            let peer = match peer {
+                Some(p) => p,
+                None => return WireGuardDecapOutcome::None,
+            };
+            
+            scratch_wg_in.resize(outer_payload.len(), 0);
+            let res = peer.tunn.decapsulate(Some(endpoint_ip), outer_payload, scratch_wg_in);
+            
+            // Check if the packet is authentic (WriteToNetwork, WriteToTunnelV4, WriteToTunnelV6)
+            let is_authentic = match &res {
+                TunnResult::WriteToNetwork(_) | TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => true,
+                _ => false,
+            };
+
+            let old_endpoint = peer.endpoint;
+            if is_authentic {
+                // Update peer endpoint in case it changed (roaming)
+                peer.endpoint = Some((endpoint_ip, endpoint_port));
+                // Also update local IP from the packet's destination IP
+                peer.local_ip = Some(meta.dst_ip());
+            }
+
+            let roamed = if is_authentic && old_endpoint != peer.endpoint {
+                Some((old_endpoint, peer.endpoint))
+            } else {
+                None
+            };
+
+            let outcome = match res {
+                TunnResult::WriteToNetwork(packet) => {
+                    let mut src_mac = [0u8; 6];
+                    let mut dst_mac = [0u8; 6];
+                    if raw_frame_mut.len() >= 12 {
+                        src_mac.copy_from_slice(&raw_frame_mut[0..6]);
+                        dst_mac.copy_from_slice(&raw_frame_mut[6..12]);
+                    }
+                    let (frame, outer_meta) = match Self::construct_outer_frame_allocated(
+                        self.listen_port,
+                        packet,
+                        peer,
+                        meta.ingress_ifindex,
+                        meta.rx_queue_index,
+                        src_mac,
+                        dst_mac,
+                    ) {
+                        Some(val) => val,
+                        None => return WireGuardDecapOutcome::None,
+                    };
+                    WireGuardDecapOutcome::Decapped(WireGuardDecapResult {
+                        decapsulated_len: frame.len(),
+                        meta: outer_meta,
+                        is_control: true,
+                        control_frame: Some(frame),
+                    })
                 }
-                let (frame, meta) = match Self::construct_outer_frame(
-                    self.listen_port,
-                    packet,
-                    peer,
-                    meta.ingress_ifindex,
-                    meta.rx_queue_index,
-                    src_mac,
-                    dst_mac,
-                ) {
-                    Some(val) => val,
-                    None => return WireGuardDecapOutcome::None,
-                };
-                WireGuardDecapOutcome::Decapped(WireGuardDecapResult { frame, meta, is_control: true })
+                TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                    let (protocol, l4_offset, _) = match parse_inner_protocol_and_offsets(packet, meta.addr_family) {
+                        Some(val) => val,
+                        None => return WireGuardDecapOutcome::None,
+                    };
+                    let inner_payload_rel = get_inner_payload_offset(packet, l4_offset, protocol);
+                    
+                    let total_len = 14 + packet.len();
+                    if raw_frame_mut.len() < total_len {
+                        return WireGuardDecapOutcome::None;
+                    }
+                    
+                    // Write synthetic Ethernet frame directly back into the UMEM memory in-place!
+                    raw_frame_mut[0..6].copy_from_slice(&[0x02, 0xbf, 0x72, 0x00, 0x00, 0x00]);
+                    raw_frame_mut[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, 0x00, 0x00, 0x00]);
+                    raw_frame_mut[12..14].copy_from_slice(&(if packet[0] >> 4 == 4 { 0x0800u16 } else { 0x86ddu16 }).to_be_bytes());
+                    raw_frame_mut[14..total_len].copy_from_slice(packet);
+                    
+                    let inner_meta = UserspaceDpMeta {
+                        magic: super::USERSPACE_META_MAGIC,
+                        version: super::USERSPACE_META_VERSION,
+                        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+                        ingress_ifindex: meta.ingress_ifindex,
+                        rx_queue_index: meta.rx_queue_index,
+                        l3_offset: 14,
+                        l4_offset: 14 + l4_offset,
+                        payload_offset: 14 + inner_payload_rel,
+                        pkt_len: total_len as u16,
+                        addr_family: if packet[0] >> 4 == 4 { libc::AF_INET as u8 } else { libc::AF_INET6 as u8 },
+                        protocol,
+                        ..UserspaceDpMeta::default()
+                    };
+                    
+                    WireGuardDecapOutcome::Decapped(WireGuardDecapResult {
+                        decapsulated_len: total_len,
+                        meta: inner_meta,
+                        is_control: false,
+                        control_frame: None,
+                    })
+                }
+                _ => WireGuardDecapOutcome::None,
+            };
+
+            (outcome, roamed)
+        };
+
+        if let Some((old_endpoint, new_endpoint)) = roamed_update {
+            if let Some(key) = roamed_key {
+                if let Some((old_ip, old_port)) = old_endpoint {
+                    self.endpoint_to_peer.remove(&(old_ip, old_port));
+                }
+                if let Some((new_ip, new_port)) = new_endpoint {
+                    self.endpoint_to_peer.insert((new_ip, new_port), key);
+                }
             }
-            TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                let (protocol, l4_offset, _) = match parse_inner_protocol_and_offsets(packet, meta.addr_family) {
-                    Some(val) => val,
-                    None => return WireGuardDecapOutcome::None,
-                };
-                let inner_payload_rel = get_inner_payload_offset(packet, l4_offset, protocol);
-                
-                // Construct synthetic Ethernet frame
-                let mut synthetic = vec![0u8; 14 + packet.len()];
-                synthetic[0..6].copy_from_slice(&[0x02, 0xbf, 0x72, 0x00, 0x00, 0x00]);
-                synthetic[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, 0x00, 0x00, 0x00]);
-                synthetic[12..14].copy_from_slice(&(if packet[0] >> 4 == 4 { 0x0800u16 } else { 0x86ddu16 }).to_be_bytes());
-                synthetic[14..].copy_from_slice(packet);
-                
-                let inner_meta = UserspaceDpMeta {
-                    magic: super::USERSPACE_META_MAGIC,
-                    version: super::USERSPACE_META_VERSION,
-                    length: std::mem::size_of::<UserspaceDpMeta>() as u16,
-                    ingress_ifindex: meta.ingress_ifindex,
-                    rx_queue_index: meta.rx_queue_index,
-                    l3_offset: 14,
-                    l4_offset: 14 + l4_offset,
-                    payload_offset: 14 + inner_payload_rel,
-                    pkt_len: (14 + packet.len()) as u16,
-                    addr_family: if packet[0] >> 4 == 4 { libc::AF_INET as u8 } else { libc::AF_INET6 as u8 },
-                    protocol,
-                    ..UserspaceDpMeta::default()
-                };
-                
-                WireGuardDecapOutcome::Decapped(WireGuardDecapResult {
-                    frame: synthetic,
-                    meta: inner_meta,
-                    is_control: false,
-                })
-            }
-            _ => WireGuardDecapOutcome::None,
         }
+
+        outcome
     }
 
     pub(super) fn try_encap(
@@ -244,7 +280,7 @@ impl WireGuardEngine {
         explicit_peer: Option<[u8; 32]>,
         preferred_local_ip: Option<IpAddr>,
         scratch_out: &mut Vec<u8>,
-    ) -> Option<WireGuardEncapResult> {
+    ) -> Option<(usize, usize, UserspaceDpMeta)> {
         let peer_pub_key = if let Some(key) = explicit_peer {
             key
         } else {
@@ -286,29 +322,132 @@ impl WireGuardEngine {
         }
 
         let inner_packet = &inner_frame[14..];
-        scratch_out.resize(inner_packet.len() + 128, 0);
-        match peer.tunn.encapsulate(inner_packet, scratch_out) {
-            TunnResult::WriteToNetwork(packet) => {
-                let (frame, meta) = Self::construct_outer_frame(
-                    self.listen_port,
-                    packet,
-                    peer,
-                    ingress_ifindex,
-                    rx_queue_index,
-                    src_mac,
-                    dst_mac,
-                )?;
-                Some(WireGuardEncapResult {
-                    frame,
-                    meta,
-                    is_control: false,
-                })
+        
+        let (outer_dst_ip, outer_dst_port) = peer.endpoint?;
+        let outer_src_ip = peer.local_ip.unwrap_or_else(|| {
+            if outer_dst_ip.is_ipv4() {
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
             }
-            _ => None,
+        });
+
+        if outer_src_ip.is_unspecified() {
+            return None;
         }
+
+        let header_len = match outer_dst_ip {
+            IpAddr::V4(_) => 42,
+            IpAddr::V6(_) => 62,
+        };
+
+        // Align the packet start to a 32-byte boundary to avoid SIMD unaligned load penalties
+        let base_ptr = scratch_out.as_ptr() as usize;
+        let padding = (32 - (base_ptr % 32)) % 32;
+        let encap_start = padding + header_len;
+
+        scratch_out.resize(encap_start + inner_packet.len() + 128, 0);
+
+        let (payload_slice, encap_ok) = {
+            let out_buf = &mut scratch_out[encap_start..];
+            match peer.tunn.encapsulate(inner_packet, out_buf) {
+                TunnResult::WriteToNetwork(p) => (p as &[u8], true),
+                _ => (&[][..], false),
+            }
+        };
+
+        if !encap_ok {
+            return None;
+        }
+
+        let wg_payload_len = payload_slice.len();
+        let total_len = header_len + wg_payload_len;
+
+        // Construct outer headers in-place directly in scratch_out
+        let packet_start = padding;
+        let ip_start = packet_start + 14;
+        let udp_start = ip_start + (if outer_dst_ip.is_ipv4() { 20 } else { 40 });
+
+        scratch_out[packet_start .. packet_start + 6].copy_from_slice(&dst_mac);
+        scratch_out[packet_start + 6 .. packet_start + 12].copy_from_slice(&src_mac);
+        let eth_proto: u16 = if outer_dst_ip.is_ipv4() { 0x0800 } else { 0x86dd };
+        scratch_out[packet_start + 12 .. packet_start + 14].copy_from_slice(&eth_proto.to_be_bytes());
+
+        let udp_len = 8 + wg_payload_len;
+        let ip_len = match outer_dst_ip {
+            IpAddr::V4(_) => 20 + udp_len,
+            IpAddr::V6(_) => 40 + udp_len,
+        };
+
+        if outer_dst_ip.is_ipv4() {
+            let dst_v4 = match outer_dst_ip { IpAddr::V4(v) => v, _ => unreachable!() };
+            let src_v4 = match outer_src_ip { IpAddr::V4(v) => v, _ => Ipv4Addr::UNSPECIFIED };
+            scratch_out[ip_start] = 0x45;
+            scratch_out[ip_start + 1] = 0; // TOS
+            scratch_out[ip_start + 2 .. ip_start + 4].copy_from_slice(&(ip_len as u16).to_be_bytes());
+            scratch_out[ip_start + 4 .. ip_start + 8].fill(0); // ID, Flags, Fragment offset
+            scratch_out[ip_start + 8] = 64; // TTL
+            scratch_out[ip_start + 9] = 17; // UDP
+            scratch_out[ip_start + 10 .. ip_start + 12].fill(0); // Clear checksum first
+            scratch_out[ip_start + 12 .. ip_start + 16].copy_from_slice(&src_v4.octets());
+            scratch_out[ip_start + 16 .. ip_start + 20].copy_from_slice(&dst_v4.octets());
+            
+            // Set UDP header fields
+            scratch_out[udp_start .. udp_start + 2].copy_from_slice(&self.listen_port.to_be_bytes());
+            scratch_out[udp_start + 2 .. udp_start + 4].copy_from_slice(&outer_dst_port.to_be_bytes());
+            scratch_out[udp_start + 4 .. udp_start + 6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+            scratch_out[udp_start + 6 .. udp_start + 8].fill(0); // Clear checksum first
+            
+            // Compute outer UDP checksum using SIMD helper
+            let udp_csum = super::checksum16_ipv4(src_v4, dst_v4, 17, &scratch_out[udp_start .. udp_start + udp_len]);
+            let udp_csum = if udp_csum == 0 { 0xffff } else { udp_csum };
+            scratch_out[udp_start + 6 .. udp_start + 8].copy_from_slice(&udp_csum.to_be_bytes());
+            
+            // Compute outer IPv4 header checksum using SIMD helper
+            let ip_csum = super::checksum16(&scratch_out[ip_start .. ip_start + 20]);
+            scratch_out[ip_start + 10 .. ip_start + 12].copy_from_slice(&ip_csum.to_be_bytes());
+        } else {
+            let dst_v6 = match outer_dst_ip { IpAddr::V6(v) => v, _ => unreachable!() };
+            let src_v6 = match outer_src_ip { IpAddr::V6(v) => v, _ => Ipv6Addr::UNSPECIFIED };
+            scratch_out[ip_start] = 0x60;
+            scratch_out[ip_start + 1 .. ip_start + 4].fill(0); // Flow label, Traffic class
+            scratch_out[ip_start + 4 .. ip_start + 6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+            scratch_out[ip_start + 6] = 17; // UDP
+            scratch_out[ip_start + 7] = 64; // Hop Limit
+            scratch_out[ip_start + 8 .. ip_start + 24].copy_from_slice(&src_v6.octets());
+            scratch_out[ip_start + 24 .. ip_start + 40].copy_from_slice(&dst_v6.octets());
+            
+            // Set UDP header fields
+            scratch_out[udp_start .. udp_start + 2].copy_from_slice(&self.listen_port.to_be_bytes());
+            scratch_out[udp_start + 2 .. udp_start + 4].copy_from_slice(&outer_dst_port.to_be_bytes());
+            scratch_out[udp_start + 4 .. udp_start + 6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+            scratch_out[udp_start + 6 .. udp_start + 8].fill(0); // Clear checksum first
+            
+            // Compute outer UDP checksum using SIMD helper (mandatory for IPv6)
+            let udp_csum = super::checksum16_ipv6(src_v6, dst_v6, 17, &scratch_out[udp_start .. udp_start + udp_len]);
+            let udp_csum = if udp_csum == 0 { 0xffff } else { udp_csum };
+            scratch_out[udp_start + 6 .. udp_start + 8].copy_from_slice(&udp_csum.to_be_bytes());
+        }
+
+        let meta = UserspaceDpMeta {
+            magic: super::USERSPACE_META_MAGIC,
+            version: super::USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex,
+            rx_queue_index,
+            l3_offset: (ip_start - packet_start) as u16,
+            l4_offset: (udp_start - packet_start) as u16,
+            payload_offset: (udp_start + 8 - packet_start) as u16,
+            pkt_len: total_len as u16,
+            addr_family: if outer_dst_ip.is_ipv4() { libc::AF_INET as u8 } else { libc::AF_INET6 as u8 },
+            protocol: 17, // UDP
+            ..UserspaceDpMeta::default()
+        };
+
+        Some((packet_start, total_len, meta))
     }
 
-    fn construct_outer_frame(
+    fn construct_outer_frame_allocated(
         listen_port: u16,
         wg_payload: &[u8],
         peer: &PeerState,
@@ -412,8 +551,12 @@ impl WireGuardEngine {
         let trimmed_private_key = snap.private_key.trim();
         if let Ok(key) = BASE64.decode(trimmed_private_key) {
             if key.len() == 32 {
-                private_key.copy_from_slice(&key);
-                self.static_private = Some(StaticSecret::from(private_key));
+                if key.iter().all(|&b| b == 0) {
+                    self.static_private = None;
+                } else {
+                    private_key.copy_from_slice(&key);
+                    self.static_private = Some(StaticSecret::from(private_key));
+                }
             }
         }
 
@@ -568,10 +711,13 @@ mod tests {
     #[test]
     fn test_wireguard_sharding() {
         let engine = WireGuardEngine::new(2, 4); // worker_id = 2, num_workers = 4
-        // encode/decode receiver index
-        let receiver_idx = engine.encode_receiver_index(123);
+        // encode receiver index
+        let supplied_index = engine.encode_receiver_index(123);
+        // boringtun shifts it by 8 left and overlays counter
+        let receiver_idx = (supplied_index << 8) | 45; // 45 is the cyclic session counter
+        
         assert_eq!(engine.decode_worker_id(receiver_idx), 2);
-        assert_eq!(receiver_idx & 0x00FFFFFF, 123);
+        assert_eq!((receiver_idx >> 8) & 0x0000FFFF, 123);
 
         // get_target_worker_id sharding consistency
         let key = [7u8; 32];

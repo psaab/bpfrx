@@ -178,7 +178,11 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 						tc.RoutingInstance = v
 					}
 				case "wireguard":
-					tc.WireGuard = compileWireGuard(prop)
+					wg, err := compileWireGuard(prop)
+					if err != nil {
+						return fmt.Errorf("wireguard: %w", err)
+					}
+					tc.WireGuard = wg
 					tc.Mode = "wireguard"
 				}
 			}
@@ -514,12 +518,15 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 	return nil
 }
 
-func compileWireGuard(node *Node) *WireGuardConfig {
+func compileWireGuard(node *Node) (*WireGuardConfig, error) {
 	wg := &WireGuardConfig{}
 	for _, child := range node.Children {
 		v := nodeVal(child)
 		switch child.Name() {
 		case "private-key":
+			if err := validatePrivateKey(v); err != nil {
+				return nil, fmt.Errorf("invalid private-key: %w", err)
+			}
 			wg.PrivateKey = v
 		case "listen-port":
 			if n, err := strconv.Atoi(v); err == nil {
@@ -533,9 +540,17 @@ func compileWireGuard(node *Node) *WireGuardConfig {
 					switch p.Name() {
 					case "endpoint":
 						peer.Endpoint = pv
+					case "port":
+						if n, err := strconv.Atoi(pv); err == nil {
+							peer.Port = n
+						}
 					case "allowed-ips":
 						for _, ipNode := range p.Children {
-							if ip := nodeVal(ipNode); ip != "" {
+							ip := ipNode.Name()
+							if ip == "" {
+								ip = nodeVal(ipNode)
+							}
+							if ip != "" {
 								peer.AllowedIPs = append(peer.AllowedIPs, ip)
 							}
 						}
@@ -549,7 +564,7 @@ func compileWireGuard(node *Node) *WireGuardConfig {
 			}
 		}
 	}
-	return wg
+	return wg, nil
 }
 
 // parseMSSValue extracts MSS value from either "node { mss VALUE; }" or "node VALUE;" syntax.

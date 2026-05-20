@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"strconv"
 )
@@ -756,11 +757,39 @@ func compileALG(node *Node, sec *SecurityConfig) error {
 	return nil
 }
 
+func validatePrivateKey(keyStr string) error {
+	if keyStr == "" {
+		return fmt.Errorf("private key cannot be empty")
+	}
+	dec, err := base64.StdEncoding.DecodeString(keyStr)
+	if err != nil {
+		return fmt.Errorf("invalid base64 encoding: %w", err)
+	}
+	if len(dec) != 32 {
+		return fmt.Errorf("invalid private key length (must be 32 bytes decoded, got %d)", len(dec))
+	}
+	allZeros := true
+	for _, b := range dec {
+		if b != 0 {
+			allZeros = false
+			break
+		}
+	}
+	if allZeros {
+		return fmt.Errorf("private key cannot be all-zero bytes")
+	}
+	return nil
+}
+
 func compileGlobalWireGuard(node *Node, config *WireGuardGlobalConfig) error {
 	for _, child := range node.Children {
 		switch child.Name() {
 		case "private-key":
-			config.PrivateKey = nodeVal(child)
+			v := nodeVal(child)
+			if err := validatePrivateKey(v); err != nil {
+				return fmt.Errorf("invalid private-key: %w", err)
+			}
+			config.PrivateKey = v
 		case "listen-port":
 			v, err := strconv.Atoi(nodeVal(child))
 			if err != nil {

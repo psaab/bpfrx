@@ -103,6 +103,39 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
     for request in pending_forwards.iter_mut() {
         let source_offset = request.desc.addr;
         let ingress_slot = ingress_binding.slot;
+
+        if let Some(tw_id) = request.target_worker {
+            if tw_id != worker_id {
+                if let Some(target_live) = cos_owner_live_by_queue.get(&(request.target_ifindex, tw_id as u8)) {
+                    let bytes = match &mut request.frame {
+                        PendingForwardFrame::Owned(b) => core::mem::take(b),
+                        PendingForwardFrame::Prebuilt(b) => core::mem::take(b),
+                        PendingForwardFrame::Live => {
+                            if let Some(frame) = (unsafe { &*ingress_area }).slice(request.desc.addr as usize, request.desc.len as usize) {
+                                frame.to_vec()
+                            } else {
+                                recycle_ingress_frame(ingress_binding, source_offset, now_ns);
+                                continue;
+                            }
+                        }
+                    };
+                    let tx_req = TxRequest {
+                        bytes,
+                        expected_ports: request.expected_ports,
+                        expected_addr_family: request.meta.addr_family,
+                        expected_protocol: request.meta.protocol,
+                        flow_key: request.flow_key.clone(),
+                        egress_ifindex: request.target_ifindex,
+                        cos_queue_id: request.cos_queue_id,
+                        dscp_rewrite: request.dscp_rewrite,
+                        mirror_clone: false,
+                    };
+                    let _ = target_live.enqueue_tx_owned(tx_req);
+                }
+                recycle_ingress_frame(ingress_binding, source_offset, now_ns);
+                continue;
+            }
+        }
         if pending_forward_needs_cos_tx_selection(
             request,
             tx_selection_enabled_v4,
@@ -542,8 +575,62 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                         let mut encap_meta = request.meta;
                                         encap_meta.l3_offset = 14; 
                                         if let Some(engine) = target_binding.wireguard_engines.get_mut(&endpoint.wg_listen_port) {
-                                            if let Some(encap) = engine.try_encap(&frame, encap_meta.addr_family, encap_meta.ingress_ifindex, 0, endpoint.wg_public_key, Some(endpoint.source), &mut target_binding.scratch.scratch_wg_out) {
-                                                frame = encap.frame;
+                                            if let Some((start_idx, total_len, outer_meta)) = engine.try_encap(&frame, encap_meta.addr_family, encap_meta.ingress_ifindex, 0, endpoint.wg_public_key, Some(endpoint.source), &mut target_binding.scratch.scratch_wg_out) {
+                                                if owner_matches_target {
+                                                    let mut direct_tx_offset = target_binding.tx_pipeline.free_tx_frames.pop_front();
+                                                    if direct_tx_offset.is_none()
+                                                        && (target_binding.tx_pipeline.outstanding_tx > 0
+                                                            || !target_binding.tx_pipeline.pending_tx_prepared.is_empty()
+                                                            || !target_binding.tx_pipeline.pending_tx_local.is_empty())
+                                                    {
+                                                        let _ = drain_pending_tx_local_owner(
+                                                            target_binding,
+                                                            now_ns,
+                                                            post_recycles,
+                                                            forwarding,
+                                                            worker_id,
+                                                            worker_commands_by_id,
+                                                            cos_owner_worker_by_queue,
+                                                            cos_owner_live_by_queue,
+                                                        );
+                                                        direct_tx_offset = target_binding.tx_pipeline.free_tx_frames.pop_front();
+                                                    }
+                                                    if let Some(tx_offset) = direct_tx_offset {
+                                                        let target_area = target_binding.umem.area();
+                                                        let Some(tx_slice) = (unsafe { target_area.slice_mut_unchecked(tx_offset as usize, total_len) }) else {
+                                                            target_binding.tx_pipeline.free_tx_frames.push_front(tx_offset);
+                                                            recycle_ingress_frame(ingress_binding, source_offset, now_ns);
+                                                            continue;
+                                                        };
+                                                        tx_slice.copy_from_slice(&target_binding.scratch.scratch_wg_out[start_idx..start_idx + total_len]);
+                                                        
+                                                        target_binding.tx_pipeline.pending_tx_prepared.push_back(PreparedTxRequest {
+                                                            offset: tx_offset,
+                                                            len: total_len as u32,
+                                                            recycle: PreparedTxRecycle::FreeTxFrame,
+                                                            expected_ports,
+                                                            expected_addr_family: outer_meta.addr_family,
+                                                            expected_protocol: outer_meta.protocol,
+                                                            flow_key: flow_key.take(),
+                                                            egress_ifindex: request.decision.resolution.egress_ifindex,
+                                                            cos_queue_id: request.cos_queue_id,
+                                                            dscp_rewrite: request.dscp_rewrite,
+                                                            mirror_clone: false,
+                                                        });
+                                                        bound_pending_tx_prepared(target_binding, Some(post_recycles));
+                                                        dbg.enqueue_ok += 1;
+                                                        dbg.enqueue_direct += 1;
+                                                        target_binding.tx_counters.pending_direct_tx_packets += 1;
+                                                        dbg.tx_bytes_total += total_len as u64;
+                                                        if (total_len as u32) > dbg.tx_max_frame {
+                                                            dbg.tx_max_frame = total_len as u32;
+                                                        }
+                                                        recycle_ingress_frame(ingress_binding, source_offset, now_ns);
+                                                        continue;
+                                                    }
+                                                }
+                                                // Fallback to allocating a Vec<u8> copy and queuing
+                                                frame = target_binding.scratch.scratch_wg_out[start_idx..start_idx + total_len].to_vec();
                                             } else {
                                                 recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                                                 continue;
