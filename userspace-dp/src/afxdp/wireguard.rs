@@ -62,19 +62,23 @@ impl WireGuardEngine {
         }
     }
 
-    fn acquire_trial_decap_token(&mut self, now_ns: u64) -> bool {
-        let elapsed = now_ns.saturating_sub(self.last_token_refill_ns);
+    fn acquire_trial_decap_token_fields(trial_decap_tokens: &mut u32, last_token_refill_ns: &mut u64, now_ns: u64) -> bool {
+        let elapsed = now_ns.saturating_sub(*last_token_refill_ns);
         if elapsed >= 1_000_000 {
             let tokens_to_add = (elapsed / 1_000_000) as u32;
-            self.trial_decap_tokens = std::cmp::min(32, self.trial_decap_tokens + tokens_to_add);
-            self.last_token_refill_ns = now_ns;
+            *trial_decap_tokens = std::cmp::min(32, *trial_decap_tokens + tokens_to_add);
+            *last_token_refill_ns = now_ns;
         }
-        if self.trial_decap_tokens > 0 {
-            self.trial_decap_tokens -= 1;
+        if *trial_decap_tokens > 0 {
+            *trial_decap_tokens -= 1;
             true
         } else {
             false
         }
+    }
+
+    fn acquire_trial_decap_token(&mut self, now_ns: u64) -> bool {
+        Self::acquire_trial_decap_token_fields(&mut self.trial_decap_tokens, &mut self.last_token_refill_ns, now_ns)
     }
 
     fn encode_receiver_index(&self, local_index: u32) -> u32 {
@@ -99,198 +103,260 @@ impl WireGuardEngine {
         let endpoint_ip = meta.src_ip();
         let endpoint_port = meta.flow_src_port;
 
+        let mut success_outcome = None;
+        let mut roamed_info = None;
         let mut roamed_key = None;
-        let mut cached_result = None;
 
-        let peer = if msg_type == 1 {
+        if msg_type == 1 {
             if outer_payload.len() < 148 {
                 return WireGuardDecapOutcome::None;
             }
-            
+
             let mut tried_key = None;
-            let mut found_peer_key = None;
 
             // 1. Try decapsulation with the mapped peer first
             if let Some(key) = self.endpoint_to_peer.get(&(endpoint_ip, endpoint_port)) {
-                tried_key = Some(*key);
+                let current_key = *key;
+                tried_key = Some(current_key);
                 if let Some(peer_state) = self.peers.get_mut(key) {
                     scratch_wg_in.resize(outer_payload.len(), 0);
                     let res = peer_state.tunn.decapsulate(Some(endpoint_ip), outer_payload, scratch_wg_in);
-                    if matches!(&res, TunnResult::WriteToNetwork(_)) {
-                        found_peer_key = Some(*key);
-                        let res_static: TunnResult<'static> = unsafe { std::mem::transmute(res) };
-                        cached_result = Some(res_static);
+                    
+                    let is_authentic = match &res {
+                        TunnResult::WriteToNetwork(pkt) => pkt.first().copied() != Some(3),
+                        TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => true,
+                        _ => false,
+                    };
+
+                    if is_authentic {
+                        let old_endpoint = peer_state.endpoint;
+                        peer_state.endpoint = Some((endpoint_ip, endpoint_port));
+                        peer_state.local_ip = Some(meta.dst_ip());
+                        
+                        if old_endpoint != peer_state.endpoint {
+                            roamed_info = Some((old_endpoint, peer_state.endpoint));
+                            roamed_key = Some(current_key);
+                        }
+
+                        let outcome = match res {
+                            TunnResult::WriteToNetwork(packet) => {
+                                let mut src_mac = [0u8; 6];
+                                let mut dst_mac = [0u8; 6];
+                                if raw_frame_mut.len() >= 12 {
+                                    src_mac.copy_from_slice(&raw_frame_mut[0..6]);
+                                    dst_mac.copy_from_slice(&raw_frame_mut[6..12]);
+                                }
+                                match Self::construct_outer_frame_allocated(
+                                    self.listen_port,
+                                    packet,
+                                    peer_state,
+                                    meta.ingress_ifindex,
+                                    meta.rx_queue_index,
+                                    src_mac,
+                                    dst_mac,
+                                ) {
+                                    Some((frame, outer_meta)) => {
+                                        WireGuardDecapOutcome::Decapped(WireGuardDecapResult {
+                                            decapsulated_len: frame.len(),
+                                            meta: outer_meta,
+                                            is_control: true,
+                                            control_frame: Some(frame),
+                                        })
+                                    }
+                                    None => WireGuardDecapOutcome::None,
+                                }
+                            }
+                            _ => WireGuardDecapOutcome::None,
+                        };
+                        success_outcome = Some(outcome);
                     }
                 }
             }
 
-            // 2. If decapsulation failed or no mapped peer, try other active peers with rate-limiting
-            if found_peer_key.is_none() {
+            // 2. If decapsulation failed or no mapped peer, try other active peers with per-peer-attempt rate-limiting
+            if success_outcome.is_none() {
                 let now_ns = super::neighbor::monotonic_nanos();
-                if !self.acquire_trial_decap_token(now_ns) {
-                    return WireGuardDecapOutcome::None;
-                }
-
-                scratch_wg_in.resize(outer_payload.len(), 0);
-                // Safety: transmute scratch_wg_in's slice to bypass borrow checker
-                let scratch_slice: &'static mut [u8] = unsafe {
-                    std::mem::transmute(scratch_wg_in.as_mut_slice())
-                };
-
+                
                 for (key, peer_state) in &mut self.peers {
                     if Some(*key) == tried_key {
                         continue;
                     }
-                    let res = peer_state.tunn.decapsulate(Some(endpoint_ip), outer_payload, scratch_slice);
-                    if matches!(&res, TunnResult::WriteToNetwork(_)) {
-                        found_peer_key = Some(*key);
-                        let res_static: TunnResult<'static> = unsafe { std::mem::transmute(res) };
-                        cached_result = Some(res_static);
+                    if !Self::acquire_trial_decap_token_fields(&mut self.trial_decap_tokens, &mut self.last_token_refill_ns, now_ns) {
+                        break;
+                    }
+
+                    scratch_wg_in.resize(outer_payload.len(), 0);
+                    let res = peer_state.tunn.decapsulate(Some(endpoint_ip), outer_payload, scratch_wg_in);
+                    
+                    let is_authentic = match &res {
+                        TunnResult::WriteToNetwork(pkt) => pkt.first().copied() != Some(3),
+                        TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => true,
+                        _ => false,
+                    };
+
+                    if is_authentic {
+                        let old_endpoint = peer_state.endpoint;
+                        peer_state.endpoint = Some((endpoint_ip, endpoint_port));
+                        peer_state.local_ip = Some(meta.dst_ip());
+                        
+                        if old_endpoint != peer_state.endpoint {
+                            roamed_info = Some((old_endpoint, peer_state.endpoint));
+                            roamed_key = Some(*key);
+                        }
+
+                        let outcome = match res {
+                            TunnResult::WriteToNetwork(packet) => {
+                                let mut src_mac = [0u8; 6];
+                                let mut dst_mac = [0u8; 6];
+                                if raw_frame_mut.len() >= 12 {
+                                    src_mac.copy_from_slice(&raw_frame_mut[0..6]);
+                                    dst_mac.copy_from_slice(&raw_frame_mut[6..12]);
+                                }
+                                match Self::construct_outer_frame_allocated(
+                                    self.listen_port,
+                                    packet,
+                                    peer_state,
+                                    meta.ingress_ifindex,
+                                    meta.rx_queue_index,
+                                    src_mac,
+                                    dst_mac,
+                                ) {
+                                    Some((frame, outer_meta)) => {
+                                        WireGuardDecapOutcome::Decapped(WireGuardDecapResult {
+                                            decapsulated_len: frame.len(),
+                                            meta: outer_meta,
+                                            is_control: true,
+                                            control_frame: Some(frame),
+                                        })
+                                    }
+                                    None => WireGuardDecapOutcome::None,
+                                }
+                            }
+                            _ => WireGuardDecapOutcome::None,
+                        };
+                        success_outcome = Some(outcome);
                         break;
                     }
                 }
             }
-
-            if let Some(key) = found_peer_key {
-                roamed_key = Some(key);
-                self.peers.get_mut(&key)
-            } else {
-                None
-            }
-        } else if msg_type == 4 || msg_type == 2 || msg_type == 3 {
-            if outer_payload.len() < 8 {
-                None
-            } else {
-                let mut idx_bytes = [0u8; 4];
-                idx_bytes.copy_from_slice(&outer_payload[4..8]);
-                let receiver_index = u32::from_le_bytes(idx_bytes);
-                let local_index = (receiver_index >> 8) & RECEIVER_INDEX_MASK;
-                if let Some(key) = self.index_to_peer.get(&local_index) {
-                    roamed_key = Some(*key);
-                    self.peers.get_mut(key)
-                } else {
-                    self.endpoint_to_peer.get(&(endpoint_ip, endpoint_port)).and_then(|key| {
-                        roamed_key = Some(*key);
-                        self.peers.get_mut(key)
-                    })
-                }
-            }
         } else {
-            self.endpoint_to_peer.get(&(endpoint_ip, endpoint_port)).and_then(|key| {
-                roamed_key = Some(*key);
-                self.peers.get_mut(key)
-            })
-        };
-
-        let (outcome, roamed_update) = {
-            let peer = match peer {
-                Some(p) => p,
-                None => return WireGuardDecapOutcome::None,
-            };
-            
-            let res = if let Some(cached) = cached_result {
-                // Safety: transmute TunnResult<'static> back to TunnResult<'_>
-                let res_back: TunnResult<'_> = unsafe { std::mem::transmute(cached) };
-                res_back
-            } else {
-                scratch_wg_in.resize(outer_payload.len(), 0);
-                peer.tunn.decapsulate(Some(endpoint_ip), outer_payload, scratch_wg_in)
-            };
-            
-            // Check if the packet is authentic (WriteToNetwork, WriteToTunnelV4, WriteToTunnelV6)
-            let is_authentic = match &res {
-                TunnResult::WriteToNetwork(_) | TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => true,
-                _ => false,
-            };
-
-            let old_endpoint = peer.endpoint;
-            if is_authentic {
-                // Update peer endpoint in case it changed (roaming)
-                peer.endpoint = Some((endpoint_ip, endpoint_port));
-                // Also update local IP from the packet's destination IP
-                peer.local_ip = Some(meta.dst_ip());
+            // For other message types (2, 3, 4)
+            let mut target_peer_key = None;
+            if msg_type == 4 || msg_type == 2 || msg_type == 3 {
+                if outer_payload.len() >= 8 {
+                    let mut idx_bytes = [0u8; 4];
+                    idx_bytes.copy_from_slice(&outer_payload[4..8]);
+                    let receiver_index = u32::from_le_bytes(idx_bytes);
+                    let local_index = (receiver_index >> 8) & RECEIVER_INDEX_MASK;
+                    if let Some(key) = self.index_to_peer.get(&local_index) {
+                        target_peer_key = Some(*key);
+                    }
+                }
+            }
+            if target_peer_key.is_none() {
+                if let Some(key) = self.endpoint_to_peer.get(&(endpoint_ip, endpoint_port)) {
+                    target_peer_key = Some(*key);
+                }
             }
 
-            let roamed = if is_authentic && old_endpoint != peer.endpoint {
-                Some((old_endpoint, peer.endpoint))
-            } else {
-                None
-            };
+            if let Some(key) = target_peer_key {
+                if let Some(peer_state) = self.peers.get_mut(&key) {
+                    scratch_wg_in.resize(outer_payload.len(), 0);
+                    let res = peer_state.tunn.decapsulate(Some(endpoint_ip), outer_payload, scratch_wg_in);
+                    
+                    let is_authentic = match &res {
+                        TunnResult::WriteToNetwork(pkt) => pkt.first().copied() != Some(3),
+                        TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => true,
+                        _ => false,
+                    };
 
-            let outcome = match res {
-                TunnResult::WriteToNetwork(packet) => {
-                    let mut src_mac = [0u8; 6];
-                    let mut dst_mac = [0u8; 6];
-                    if raw_frame_mut.len() >= 12 {
-                        src_mac.copy_from_slice(&raw_frame_mut[0..6]);
-                        dst_mac.copy_from_slice(&raw_frame_mut[6..12]);
+                    if is_authentic {
+                        let old_endpoint = peer_state.endpoint;
+                        peer_state.endpoint = Some((endpoint_ip, endpoint_port));
+                        peer_state.local_ip = Some(meta.dst_ip());
+                        
+                        if old_endpoint != peer_state.endpoint {
+                            roamed_info = Some((old_endpoint, peer_state.endpoint));
+                            roamed_key = Some(key);
+                        }
                     }
-                    let (frame, outer_meta) = match Self::construct_outer_frame_allocated(
-                        self.listen_port,
-                        packet,
-                        peer,
-                        meta.ingress_ifindex,
-                        meta.rx_queue_index,
-                        src_mac,
-                        dst_mac,
-                    ) {
-                        Some(val) => val,
-                        None => return WireGuardDecapOutcome::None,
-                    };
-                    WireGuardDecapOutcome::Decapped(WireGuardDecapResult {
-                        decapsulated_len: frame.len(),
-                        meta: outer_meta,
-                        is_control: true,
-                        control_frame: Some(frame),
-                    })
-                }
-                TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                    let (protocol, l4_offset, _) = match parse_inner_protocol_and_offsets(packet, meta.addr_family) {
-                        Some(val) => val,
-                        None => return WireGuardDecapOutcome::None,
-                    };
-                    let inner_payload_rel = get_inner_payload_offset(packet, l4_offset, protocol);
-                    
-                    let total_len = 14 + packet.len();
-                    if raw_frame_mut.len() < total_len {
-                        return WireGuardDecapOutcome::None;
-                    }
-                    
-                    // Write synthetic Ethernet frame directly back into the UMEM memory in-place!
-                    raw_frame_mut[0..6].copy_from_slice(&[0x02, 0xbf, 0x72, 0x00, 0x00, 0x00]);
-                    raw_frame_mut[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, 0x00, 0x00, 0x00]);
-                    raw_frame_mut[12..14].copy_from_slice(&(if packet[0] >> 4 == 4 { 0x0800u16 } else { 0x86ddu16 }).to_be_bytes());
-                    raw_frame_mut[14..total_len].copy_from_slice(packet);
-                    
-                    let inner_meta = UserspaceDpMeta {
-                        magic: super::USERSPACE_META_MAGIC,
-                        version: super::USERSPACE_META_VERSION,
-                        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
-                        ingress_ifindex: meta.ingress_ifindex,
-                        rx_queue_index: meta.rx_queue_index,
-                        l3_offset: 14,
-                        l4_offset: 14 + l4_offset,
-                        payload_offset: 14 + inner_payload_rel,
-                        pkt_len: total_len as u16,
-                        addr_family: if packet[0] >> 4 == 4 { libc::AF_INET as u8 } else { libc::AF_INET6 as u8 },
-                        protocol,
-                        ..UserspaceDpMeta::default()
-                    };
-                    
-                    WireGuardDecapOutcome::Decapped(WireGuardDecapResult {
-                        decapsulated_len: total_len,
-                        meta: inner_meta,
-                        is_control: false,
-                        control_frame: None,
-                    })
-                }
-                _ => WireGuardDecapOutcome::None,
-            };
 
-            (outcome, roamed)
-        };
+                    let outcome = match res {
+                        TunnResult::WriteToNetwork(packet) => {
+                            let mut src_mac = [0u8; 6];
+                            let mut dst_mac = [0u8; 6];
+                            if raw_frame_mut.len() >= 12 {
+                                src_mac.copy_from_slice(&raw_frame_mut[0..6]);
+                                dst_mac.copy_from_slice(&raw_frame_mut[6..12]);
+                            }
+                            match Self::construct_outer_frame_allocated(
+                                self.listen_port,
+                                packet,
+                                peer_state,
+                                meta.ingress_ifindex,
+                                meta.rx_queue_index,
+                                src_mac,
+                                dst_mac,
+                            ) {
+                                Some((frame, outer_meta)) => {
+                                    WireGuardDecapOutcome::Decapped(WireGuardDecapResult {
+                                        decapsulated_len: frame.len(),
+                                        meta: outer_meta,
+                                        is_control: true,
+                                        control_frame: Some(frame),
+                                    })
+                                }
+                                None => WireGuardDecapOutcome::None,
+                            }
+                        }
+                        TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                            let (protocol, l4_offset, _) = match parse_inner_protocol_and_offsets(packet, meta.addr_family) {
+                                Some(val) => val,
+                                None => return WireGuardDecapOutcome::None,
+                            };
+                            let inner_payload_rel = get_inner_payload_offset(packet, l4_offset, protocol);
+                            
+                            let total_len = 14 + packet.len();
+                            if raw_frame_mut.len() < total_len {
+                                return WireGuardDecapOutcome::None;
+                            }
+                            
+                            raw_frame_mut[0..6].copy_from_slice(&[0x02, 0xbf, 0x72, 0x00, 0x00, 0x00]);
+                            raw_frame_mut[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, 0x00, 0x00, 0x00]);
+                            raw_frame_mut[12..14].copy_from_slice(&(if packet[0] >> 4 == 4 { 0x0800u16 } else { 0x86ddu16 }).to_be_bytes());
+                            raw_frame_mut[14..total_len].copy_from_slice(packet);
+                            
+                            let inner_meta = UserspaceDpMeta {
+                                magic: super::USERSPACE_META_MAGIC,
+                                version: super::USERSPACE_META_VERSION,
+                                length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+                                ingress_ifindex: meta.ingress_ifindex,
+                                rx_queue_index: meta.rx_queue_index,
+                                l3_offset: 14,
+                                l4_offset: 14 + l4_offset,
+                                payload_offset: 14 + inner_payload_rel,
+                                pkt_len: total_len as u16,
+                                addr_family: if packet[0] >> 4 == 4 { libc::AF_INET as u8 } else { libc::AF_INET6 as u8 },
+                                protocol,
+                                ..UserspaceDpMeta::default()
+                            };
+                            
+                            WireGuardDecapOutcome::Decapped(WireGuardDecapResult {
+                                decapsulated_len: total_len,
+                                meta: inner_meta,
+                                is_control: false,
+                                control_frame: None,
+                            })
+                        }
+                        _ => WireGuardDecapOutcome::None,
+                    };
+                    success_outcome = Some(outcome);
+                }
+            }
+        }
 
-        if let Some((old_endpoint, new_endpoint)) = roamed_update {
+        // Apply endpoint/roaming mapping changes if roamed successfully
+        if let Some((old_endpoint, new_endpoint)) = roamed_info {
             if let Some(key) = roamed_key {
                 if let Some((old_ip, old_port)) = old_endpoint {
                     self.endpoint_to_peer.remove(&(old_ip, old_port));
@@ -301,7 +367,7 @@ impl WireGuardEngine {
             }
         }
 
-        outcome
+        success_outcome.unwrap_or(WireGuardDecapOutcome::None)
     }
 
     pub(super) fn try_encap(
@@ -910,5 +976,51 @@ mod tests {
         assert!(!engine.acquire_trial_decap_token(0));
         assert!(engine.acquire_trial_decap_token(1_000_000));
         assert!(!engine.acquire_trial_decap_token(1_000_000));
+    }
+
+    #[test]
+    fn test_trial_decap_rate_limiting_per_peer_attempt() {
+        use crate::protocol::{WireGuardInterfaceSnapshot, WireGuardPeerSnapshot};
+        let mut engine = WireGuardEngine::new();
+        engine.listen_port = 51820;
+
+        let private_key = BASE64.encode(&[1u8; 32]);
+        let mut key_a = [0u8; 32]; key_a[0] = 10;
+        let mut key_b = [0u8; 32]; key_b[0] = 20;
+
+        let pub_a = BASE64.encode(&key_a);
+        let pub_b = BASE64.encode(&key_b);
+
+        let snap = WireGuardInterfaceSnapshot {
+            private_key,
+            public_key: "".to_string(),
+            listen_port: 51820,
+            peers: vec![
+                WireGuardPeerSnapshot { public_key: pub_a, endpoint: "".to_string(), allowed_ips: vec![], persistent_keepalive: 0 },
+                WireGuardPeerSnapshot { public_key: pub_b, endpoint: "".to_string(), allowed_ips: vec![], persistent_keepalive: 0 },
+            ],
+        };
+
+        engine.apply_snapshot(&snap);
+        assert_eq!(engine.peers.len(), 2);
+        assert_eq!(engine.trial_decap_tokens, 32);
+
+        // Construct a dummy handshake initiation (msg_type 1, len 148 bytes)
+        let mut raw_packet = vec![0u8; 148];
+        raw_packet[0] = 1;
+
+        let meta = UserspaceDpMeta {
+            protocol: 17,
+            flow_dst_port: 51820,
+            payload_offset: 0,
+            ..UserspaceDpMeta::default()
+        };
+
+        let mut scratch = vec![];
+        let outcome = engine.try_decap(&mut raw_packet, &meta, &mut scratch);
+        assert!(matches!(outcome, WireGuardDecapOutcome::None));
+
+        // Both peers fail to decapsulate, consuming 2 tokens (1 per peer attempt)
+        assert_eq!(engine.trial_decap_tokens, 30);
     }
 }
