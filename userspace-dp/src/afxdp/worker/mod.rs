@@ -149,6 +149,7 @@ pub(crate) struct BindingWorker {
     pub(crate) bind_meta: WorkerBindMeta,
     pub(crate) name: String,
     pub(crate) wireguard_engines: rustc_hash::FxHashMap<u16, super::wireguard::WireGuardEngine>,
+    pub(crate) wireguard_listen_ports_by_ifname: rustc_hash::FxHashMap<String, u16>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -446,6 +447,7 @@ impl BindingWorker {
             },
             name: binding.interface.to_string(),
             wireguard_engines: rustc_hash::FxHashMap::default(),
+            wireguard_listen_ports_by_ifname: rustc_hash::FxHashMap::default(),
         };
         if register_xsk_now {
             register_binding_xsk(&binding, xsk_map_fd)?;
@@ -454,13 +456,43 @@ impl BindingWorker {
         Ok(binding)
     }
 
-    pub(crate) fn apply_wireguard_snapshot(&mut self, snap: crate::protocol::WireGuardInterfaceSnapshot) {
+    pub(crate) fn apply_wireguard_snapshot(
+        &mut self,
+        ifname: &str,
+        snap: crate::protocol::WireGuardInterfaceSnapshot,
+    ) {
         let worker_id = self.worker_id;
         let num_workers = self.num_workers;
-        let engine = self.wireguard_engines.entry(snap.listen_port).or_insert_with(|| {
-            super::wireguard::WireGuardEngine::new(worker_id, num_workers)
-        });
+        let old_port = self
+            .wireguard_listen_ports_by_ifname
+            .insert(ifname.to_string(), snap.listen_port);
+        if let Some(port) = old_port
+            && port != snap.listen_port
+            && !self
+                .wireguard_listen_ports_by_ifname
+                .values()
+                .any(|current| *current == port)
+        {
+            self.wireguard_engines.remove(&port);
+        }
+        let engine = self
+            .wireguard_engines
+            .entry(snap.listen_port)
+            .or_insert_with(|| super::wireguard::WireGuardEngine::new(worker_id, num_workers));
         engine.apply_snapshot(&snap);
+    }
+
+    pub(crate) fn remove_wireguard_snapshot(&mut self, ifname: &str) {
+        let Some(port) = self.wireguard_listen_ports_by_ifname.remove(ifname) else {
+            return;
+        };
+        if !self
+            .wireguard_listen_ports_by_ifname
+            .values()
+            .any(|current| *current == port)
+        {
+            self.wireguard_engines.remove(&port);
+        }
     }
 
     #[cfg(test)]
@@ -581,6 +613,7 @@ impl BindingWorker {
             name: "test0".to_string(),
             num_workers: 1,
             wireguard_engines: rustc_hash::FxHashMap::default(),
+            wireguard_listen_ports_by_ifname: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -695,6 +728,7 @@ impl BindingWorker {
             name: "mirror-test".to_string(),
             num_workers: 1,
             wireguard_engines: rustc_hash::FxHashMap::default(),
+            wireguard_listen_ports_by_ifname: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -1436,7 +1470,11 @@ pub(crate) fn worker_loop(
         for (ifname, snap) in wireguard_updates {
             for binding in bindings.iter_mut() {
                 if binding.name == ifname {
-                    binding.apply_wireguard_snapshot(snap.clone());
+                    if let Some(snap) = snap.as_ref() {
+                        binding.apply_wireguard_snapshot(&ifname, snap.clone());
+                    } else {
+                        binding.remove_wireguard_snapshot(&ifname);
+                    }
                 }
             }
         }

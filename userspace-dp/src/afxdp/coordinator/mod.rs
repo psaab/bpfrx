@@ -1006,9 +1006,12 @@ impl Coordinator {
 
         let mut wireguard_updates = rustc_hash::FxHashMap::default();
         for iface in &snapshot.interfaces {
-            if let Some(ref wg) = iface.wireguard {
-                wireguard_updates.insert(iface.name.clone(), wg.clone());
-            }
+            let ifname = if iface.linux_name.is_empty() {
+                iface.name.clone()
+            } else {
+                iface.linux_name.clone()
+            };
+            wireguard_updates.insert(ifname, iface.wireguard.clone());
         }
         if !wireguard_updates.is_empty() {
             for handle in self.workers.handles.values() {

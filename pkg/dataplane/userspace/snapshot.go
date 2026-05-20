@@ -1,7 +1,9 @@
 package userspace
 
 import (
+	"crypto/ecdh"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -14,8 +16,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"crypto/ecdh"
-	"encoding/base64"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -2443,12 +2443,8 @@ func buildSingleWireGuardSnapshot(tunnel *config.TunnelConfig, global config.Wir
 }
 
 func wgPublicKey(tunnel *config.TunnelConfig, global config.WireGuardGlobalConfig) string {
-	if tunnel.Mode != "wireguard" {
-		return ""
-	}
-	if tunnel.WireGuard != nil && len(tunnel.WireGuard.Peers) > 0 {
-		return tunnel.WireGuard.Peers[0].PublicKey
-	}
+	_ = tunnel
+	_ = global
 	return ""
 }
 

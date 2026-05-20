@@ -16,11 +16,6 @@ pub(super) struct WireGuardEngine {
     allowed_ip_to_peer: PrefixMap<[u8; 32]>,
     // Local listen port for this interface
     listen_port: u16,
-    // Sharding info
-    worker_id: u32,
-    num_workers: u32,
-    // Local private key (needed for Handshake Initiation decryption)
-    static_private: Option<StaticSecret>,
 }
 
 struct PeerState {
@@ -44,37 +39,18 @@ pub(super) enum WireGuardDecapOutcome {
 }
 
 impl WireGuardEngine {
-    pub(super) fn new(worker_id: u32, num_workers: u32) -> Self {
+    pub(super) fn new(_worker_id: u32, _num_workers: u32) -> Self {
         Self {
             peers: FxHashMap::default(),
             endpoint_to_peer: FxHashMap::default(),
             index_to_peer: FxHashMap::default(),
             allowed_ip_to_peer: PrefixMap::new(),
             listen_port: 0,
-            worker_id,
-            num_workers,
-            static_private: None,
         }
-    }
-
-    fn get_target_worker_id(&self, public_key: &[u8; 32]) -> u32 {
-        if self.num_workers <= 1 {
-            return 0;
-        }
-        let mut hasher = rustc_hash::FxHasher::default();
-        std::hash::Hasher::write(&mut hasher, public_key);
-        (std::hash::Hasher::finish(&hasher) % self.num_workers as u64) as u32
-    }
-
-    fn decode_worker_id(&self, receiver_index: u32) -> u32 {
-        if self.num_workers <= 1 {
-            return 0;
-        }
-        receiver_index >> 24
     }
 
     fn encode_receiver_index(&self, local_index: u32) -> u32 {
-        (self.worker_id << 16) | (local_index & 0x0000FFFF)
+        local_index & 0x00FF_FFFF
     }
 
     pub(super) fn try_decap(&mut self, raw_frame_mut: &mut [u8], meta: &UserspaceDpMeta, scratch_wg_in: &mut Vec<u8>) -> WireGuardDecapOutcome {
@@ -92,41 +68,57 @@ impl WireGuardEngine {
         }
 
         let msg_type = outer_payload[0];
-        let target_worker = match msg_type {
-            1 => {
-                // Handshake Initiation
-                if outer_payload.len() < 148 {
-                    return WireGuardDecapOutcome::None;
+        if msg_type == 1 && outer_payload.len() >= 148 {
+            let endpoint_ip = meta.src_ip();
+            let endpoint_port = meta.flow_src_port;
+            if !self.endpoint_to_peer.contains_key(&(endpoint_ip, endpoint_port)) {
+                let keys: Vec<[u8; 32]> = self.peers.keys().copied().collect();
+                for key in keys {
+                    let peer = match self.peers.get_mut(&key) {
+                        Some(peer) => peer,
+                        None => continue,
+                    };
+                    scratch_wg_in.resize(outer_payload.len(), 0);
+                    let res = peer.tunn.decapsulate(Some(endpoint_ip), outer_payload, scratch_wg_in);
+                    if !matches!(&res, TunnResult::WriteToNetwork(_)) {
+                        continue;
+                    }
+                    let old_endpoint = peer.endpoint;
+                    peer.endpoint = Some((endpoint_ip, endpoint_port));
+                    peer.local_ip = Some(meta.dst_ip());
+                    if let Some((old_ip, old_port)) = old_endpoint {
+                        self.endpoint_to_peer.remove(&(old_ip, old_port));
+                    }
+                    self.endpoint_to_peer.insert((endpoint_ip, endpoint_port), key);
+                    if let TunnResult::WriteToNetwork(packet) = res {
+                        let mut src_mac = [0u8; 6];
+                        let mut dst_mac = [0u8; 6];
+                        if raw_frame_mut.len() >= 12 {
+                            src_mac.copy_from_slice(&raw_frame_mut[0..6]);
+                            dst_mac.copy_from_slice(&raw_frame_mut[6..12]);
+                        }
+                        let (frame, outer_meta) = match Self::construct_outer_frame_allocated(
+                            self.listen_port,
+                            packet,
+                            peer,
+                            meta.ingress_ifindex,
+                            meta.rx_queue_index,
+                            src_mac,
+                            dst_mac,
+                        ) {
+                            Some(val) => val,
+                            None => return WireGuardDecapOutcome::None,
+                        };
+                        return WireGuardDecapOutcome::Decapped(WireGuardDecapResult {
+                            decapsulated_len: frame.len(),
+                            meta: outer_meta,
+                            is_control: true,
+                            control_frame: Some(frame),
+                        });
+                    }
                 }
-                // We need to decrypt to find the static sender (peer public key)
-                let _static_private = match &self.static_private {
-                    Some(k) => k,
-                    None => return WireGuardDecapOutcome::None,
-                };
-                
-                // Use a minimal Tunn-like logic or just dispatch based on endpoint if known
-                if let Some(peer_key) = self.endpoint_to_peer.get(&(meta.src_ip(), meta.flow_src_port)) {
-                    self.get_target_worker_id(peer_key)
-                } else {
-                    self.worker_id
-                }
+                return WireGuardDecapOutcome::None;
             }
-            2 | 3 | 4 => {
-                // Handshake Response (2), Cookie Reply (3), Data (4)
-                // All have receiver_index at offset 4
-                if outer_payload.len() < 8 {
-                    return WireGuardDecapOutcome::None;
-                }
-                let mut idx_bytes = [0u8; 4];
-                idx_bytes.copy_from_slice(&outer_payload[4..8]);
-                let receiver_index = u32::from_le_bytes(idx_bytes);
-                self.decode_worker_id(receiver_index)
-            }
-            _ => return WireGuardDecapOutcome::None,
-        };
-
-        if target_worker != self.worker_id {
-            return WireGuardDecapOutcome::DispatchToWorker(target_worker);
         }
 
         let endpoint_ip = meta.src_ip();
@@ -138,7 +130,7 @@ impl WireGuardEngine {
              let mut idx_bytes = [0u8; 4];
              idx_bytes.copy_from_slice(&outer_payload[4..8]);
              let receiver_index = u32::from_le_bytes(idx_bytes);
-             let local_index = (receiver_index >> 8) & 0x0000FFFF;
+             let local_index = (receiver_index >> 8) & 0x00FF_FFFF;
              if let Some(key) = self.index_to_peer.get(&local_index) {
                  roamed_key = Some(*key);
                  self.peers.get_mut(key)
@@ -309,9 +301,11 @@ impl WireGuardEngine {
 
         let peer = self.peers.get_mut(&peer_pub_key)?;
         
-        // Learn dynamic preferred local IP if not yet set
-        if peer.local_ip.is_none() && preferred_local_ip.is_some() {
-            peer.local_ip = preferred_local_ip;
+        // Learn preferred local IP from control-plane tunnel source.
+        if let Some(local_ip) = preferred_local_ip {
+            if !local_ip.is_unspecified() {
+                peer.local_ip = Some(local_ip);
+            }
         }
 
         let mut src_mac = [0u8; 6];
@@ -549,15 +543,23 @@ impl WireGuardEngine {
 
         let mut private_key = [0u8; 32];
         let trimmed_private_key = snap.private_key.trim();
-        if let Ok(key) = BASE64.decode(trimmed_private_key) {
-            if key.len() == 32 {
-                if key.iter().all(|&b| b == 0) {
-                    self.static_private = None;
-                } else {
-                    private_key.copy_from_slice(&key);
-                    self.static_private = Some(StaticSecret::from(private_key));
-                }
+        let key = match BASE64.decode(trimmed_private_key) {
+            Ok(key) if key.len() == 32 => key,
+            _ => {
+                self.peers.clear();
+                self.allowed_ip_to_peer = PrefixMap::new();
+                self.endpoint_to_peer.clear();
+                self.index_to_peer.clear();
+                return;
             }
+        };
+        private_key.copy_from_slice(&key);
+        if private_key.iter().all(|&b| b == 0) {
+            self.peers.clear();
+            self.allowed_ip_to_peer = PrefixMap::new();
+            self.endpoint_to_peer.clear();
+            self.index_to_peer.clear();
+            return;
         }
 
         let mut current_peers = FxHashMap::default();
@@ -565,7 +567,7 @@ impl WireGuardEngine {
         let mut new_endpoint_to_peer = FxHashMap::default();
         let mut new_index_to_peer = FxHashMap::default();
 
-        for (peer_idx, peer_snap) in snap.peers.iter().enumerate() {
+        for peer_snap in &snap.peers {
             let mut public_key = [0u8; 32];
             let trimmed_peer_key = peer_snap.public_key.trim();
             if let Ok(key) = BASE64.decode(trimmed_peer_key) {
@@ -576,11 +578,6 @@ impl WireGuardEngine {
                 }
             } else {
                 continue; // Skip invalid peer
-            }
-
-            // Sharding check
-            if self.get_target_worker_id(&public_key) != self.worker_id {
-                continue;
             }
 
             let endpoint = if !peer_snap.endpoint.is_empty() {
@@ -599,12 +596,12 @@ impl WireGuardEngine {
                 existing.endpoint = endpoint;
                 existing
             } else {
-                let local_index = peer_idx as u32;
+                let local_index = stable_local_index(&public_key, &new_index_to_peer);
                 let tunn = Tunn::new(
                     StaticSecret::from(private_key),
                     PublicKey::from(public_key),
                     None, // preshared key
-                    Some(peer_snap.persistent_keepalive as u16),
+                    Some(peer_snap.persistent_keepalive.min(u16::MAX as u32) as u16),
                     self.encode_receiver_index(local_index),
                     None, // logger
                 );
@@ -656,6 +653,20 @@ fn parse_inner_protocol_and_offsets(packet: &[u8], _addr_family: u8) -> Option<(
         }
         _ => None,
     }
+}
+
+fn stable_local_index(public_key: &[u8; 32], occupied: &FxHashMap<u32, [u8; 32]>) -> u32 {
+    let mut idx = u32::from_le_bytes([public_key[0], public_key[1], public_key[2], 0]) & 0x00FF_FFFF;
+    if idx == 0 {
+        idx = 1;
+    }
+    while occupied.contains_key(&idx) {
+        idx = (idx + 1) & 0x00FF_FFFF;
+        if idx == 0 {
+            idx = 1;
+        }
+    }
+    idx
 }
 
 fn get_inner_payload_offset(packet: &[u8], l4_offset: u16, protocol: u8) -> u16 {
@@ -727,5 +738,3 @@ mod tests {
         assert!(target1 < 4);
     }
 }
-
-

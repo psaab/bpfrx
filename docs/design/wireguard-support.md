@@ -31,11 +31,11 @@ The Go control plane (`xpfd`) is responsible for:
 3.  **Peer Discovery**: Managing static and dynamic peer endpoints.
 
 ## Implementation Details
-- **Library**: `boringtun` 0.6 (Rust implementation by Cloudflare).
+- **Library**: `boringtun` 0.7.1 (Rust implementation by Cloudflare).
 - **Threading**: Shared-nothing architecture. Each worker has its own engine state. Peer roaming updates are localized to the worker thread that received the traffic (consistent with RSS).
-- **Metadata**: `UserspaceDpMeta` is updated to carry `wg_public_key` to identify the tunnel context across stages.
+- **Metadata**: WireGuard interface and peer state is carried in `WireGuardInterfaceSnapshot`; tunnel endpoint snapshots carry `wg_listen_port`, and peer selection uses allowed-ips LPM at TX time.
 
 ## Performance Considerations
 - **SIMD**: `boringtun` uses SIMD instructions for ChaCha20-Poly1305.
-- **Allocation**: Decapsulation uses pre-allocated scratch buffers per worker to avoid runtime allocations.
+- **Allocation**: Data-packet decapsulation uses pre-allocated scratch buffers per worker; handshake/control packet response frames still use slow-path allocation.
 - **RSS Consistency**: By ensuring the same 5-tuple flows to the same worker, we maintain WireGuard session consistency without global locks.

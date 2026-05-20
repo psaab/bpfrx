@@ -104,38 +104,9 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
         let source_offset = request.desc.addr;
         let ingress_slot = ingress_binding.slot;
 
-        if let Some(tw_id) = request.target_worker {
-            if tw_id != worker_id {
-                if let Some(target_live) = cos_owner_live_by_queue.get(&(request.target_ifindex, tw_id as u8)) {
-                    let bytes = match &mut request.frame {
-                        PendingForwardFrame::Owned(b) => core::mem::take(b),
-                        PendingForwardFrame::Prebuilt(b) => core::mem::take(b),
-                        PendingForwardFrame::Live => {
-                            if let Some(frame) = (unsafe { &*ingress_area }).slice(request.desc.addr as usize, request.desc.len as usize) {
-                                frame.to_vec()
-                            } else {
-                                recycle_ingress_frame(ingress_binding, source_offset, now_ns);
-                                continue;
-                            }
-                        }
-                    };
-                    let tx_req = TxRequest {
-                        bytes,
-                        expected_ports: request.expected_ports,
-                        expected_addr_family: request.meta.addr_family,
-                        expected_protocol: request.meta.protocol,
-                        flow_key: request.flow_key.clone(),
-                        egress_ifindex: request.target_ifindex,
-                        cos_queue_id: request.cos_queue_id,
-                        dscp_rewrite: request.dscp_rewrite,
-                        mirror_clone: false,
-                    };
-                    let _ = target_live.enqueue_tx_owned(tx_req);
-                }
-                recycle_ingress_frame(ingress_binding, source_offset, now_ns);
-                continue;
-            }
-        }
+        let _ = worker_id;
+        let _ = ingress_area;
+        let _ = cos_owner_live_by_queue;
         if pending_forward_needs_cos_tx_selection(
             request,
             tx_selection_enabled_v4,
@@ -575,7 +546,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                         let mut encap_meta = request.meta;
                                         encap_meta.l3_offset = 14; 
                                         if let Some(engine) = target_binding.wireguard_engines.get_mut(&endpoint.wg_listen_port) {
-                                            if let Some((start_idx, total_len, outer_meta)) = engine.try_encap(&frame, encap_meta.addr_family, encap_meta.ingress_ifindex, 0, endpoint.wg_public_key, Some(endpoint.source), &mut target_binding.scratch.scratch_wg_out) {
+                                            if let Some((start_idx, total_len, outer_meta)) = engine.try_encap(&frame, encap_meta.addr_family, encap_meta.ingress_ifindex, 0, None, Some(endpoint.source), &mut target_binding.scratch.scratch_wg_out) {
                                                 if owner_matches_target {
                                                     let mut direct_tx_offset = target_binding.tx_pipeline.free_tx_frames.pop_front();
                                                     if direct_tx_offset.is_none()

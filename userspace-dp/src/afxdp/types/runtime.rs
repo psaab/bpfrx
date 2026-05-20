@@ -227,7 +227,9 @@ pub(in crate::afxdp) enum WorkerCommand {
     /// this command sets a flag in `WorkerCommandResults`; the outer
     /// poll loop dispatches via `vacate_all_shared_exact_slots`.
     VacateAllSharedExactSlots,
-    UpdateWireGuard(rustc_hash::FxHashMap<String, crate::protocol::WireGuardInterfaceSnapshot>),
+    UpdateWireGuard(
+        rustc_hash::FxHashMap<String, Option<crate::protocol::WireGuardInterfaceSnapshot>>,
+    ),
 }
 
 #[derive(Default)]

@@ -209,7 +209,8 @@ pub(super) struct WorkerCommandResults {
     /// no `BindingWorker` access — the outer poll loop in `worker.rs`
     /// dispatches based on this flag.
     pub(super) vacate_all_shared_exact_slots: bool,
-    pub(super) wireguard_updates: rustc_hash::FxHashMap<String, crate::protocol::WireGuardInterfaceSnapshot>,
+    pub(super) wireguard_updates:
+        rustc_hash::FxHashMap<String, Option<crate::protocol::WireGuardInterfaceSnapshot>>,
 }
 
 fn force_live_redirect_for_worker_synced_entry(
