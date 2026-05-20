@@ -1222,4 +1222,254 @@ mod tests {
         assert_eq!(engine.round_robin_offset, 24);
         assert!(engine.trial_decap_tokens <= 31);
     }
+
+    #[test]
+    fn test_cookie_reply_does_not_trigger_endpoint_roaming() {
+        use crate::protocol::{WireGuardInterfaceSnapshot, WireGuardPeerSnapshot};
+        use boringtun::noise::Tunn;
+        use boringtun::x25519::{StaticSecret, PublicKey};
+
+        let mut engine = WireGuardEngine::new();
+        engine.listen_port = 51820;
+
+        let client_private = StaticSecret::from([1u8; 32]);
+        let client_public = PublicKey::from(&client_private);
+
+        let server_private = StaticSecret::from([2u8; 32]);
+        let server_public = PublicKey::from(&server_private);
+
+        let server_private_b64 = BASE64.encode(server_private.to_bytes());
+        let client_public_b64 = BASE64.encode(client_public.as_bytes());
+
+        let snap = WireGuardInterfaceSnapshot {
+            private_key: server_private_b64,
+            public_key: "".to_string(),
+            listen_port: 51820,
+            peers: vec![
+                WireGuardPeerSnapshot {
+                    public_key: client_public_b64,
+                    endpoint: "".to_string(),
+                    allowed_ips: vec![],
+                    persistent_keepalive: 0,
+                }
+            ],
+        };
+        engine.apply_snapshot(&snap);
+
+        let mut client_tunn = Tunn::new(
+            client_private.clone(),
+            server_public.clone(),
+            None,
+            None,
+            1,
+            None,
+        );
+
+        // First, successfully complete a handshake to set the initial endpoint
+        let mut client_out = vec![0u8; 1500];
+        let client_res = client_tunn.encapsulate(&[], &mut client_out);
+        let handshake_init_packet = match client_res {
+            TunnResult::WriteToNetwork(pkt) => pkt,
+            _ => panic!("Expected WriteToNetwork"),
+        };
+
+        let mut raw_frame = vec![0u8; 42 + handshake_init_packet.len()];
+        raw_frame[42..42 + handshake_init_packet.len()].copy_from_slice(handshake_init_packet);
+
+        let initial_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
+        let initial_port = 53421;
+
+        let mut flow_src_addr = [0u8; 16];
+        flow_src_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
+        let mut flow_dst_addr = [0u8; 16];
+        flow_dst_addr[0..4].copy_from_slice(&[192, 168, 1, 1]);
+
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 1,
+            rx_queue_index: 0,
+            protocol: 17,
+            addr_family: libc::AF_INET as u8,
+            flow_dst_port: 51820,
+            flow_src_port: initial_port,
+            l3_offset: 14,
+            l4_offset: 34,
+            payload_offset: 42,
+            pkt_len: raw_frame.len() as u16,
+            flow_src_addr,
+            flow_dst_addr,
+            ..UserspaceDpMeta::default()
+        };
+
+        let mut scratch = vec![0u8; 2048];
+        let outcome = engine.try_decap(&mut raw_frame, &meta, &mut scratch);
+        assert!(matches!(outcome, WireGuardDecapOutcome::Decapped(_)));
+
+        let peer_key: [u8; 32] = client_public.as_bytes().clone();
+        let peer = engine.peers.get(&peer_key).unwrap();
+        assert_eq!(peer.endpoint, Some((initial_ip, initial_port)));
+
+        // Now, we want to trigger a cookie reply.
+        // Let's first spam handshake initiations from the INITIAL port to force the server into under-load state.
+        for _ in 0..100 {
+            let mut c_tunn = Tunn::new(
+                client_private.clone(),
+                server_public.clone(),
+                None,
+                None,
+                1,
+                None,
+            );
+            let mut c_out = vec![0u8; 1500];
+            if let TunnResult::WriteToNetwork(pkt) = c_tunn.encapsulate(&[], &mut c_out) {
+                let mut rf = vec![0u8; 42 + pkt.len()];
+                rf[42..42 + pkt.len()].copy_from_slice(pkt);
+                rf[0..12].copy_from_slice(&[1,2,3,4,5,6, 6,5,4,3,2,1]);
+                let _ = engine.try_decap(&mut rf, &meta, &mut scratch);
+            }
+        }
+
+        // Now that the rate limiter is in the under-load state, send handshake initiations from the new port 53422.
+        // These should trigger a Cookie Reply (type 3) and must NOT cause roaming.
+        let mut cookie_reply_generated = false;
+        let new_port = 53422;
+        let mut meta_new = meta.clone();
+        meta_new.flow_src_port = new_port;
+
+        for _ in 0..10 {
+            let mut c_tunn = Tunn::new(
+                client_private.clone(),
+                server_public.clone(),
+                None,
+                None,
+                1,
+                None,
+            );
+            let mut c_out = vec![0u8; 1500];
+            if let TunnResult::WriteToNetwork(pkt) = c_tunn.encapsulate(&[], &mut c_out) {
+                let mut rf = vec![0u8; 42 + pkt.len()];
+                rf[42..42 + pkt.len()].copy_from_slice(pkt);
+                rf[0..12].copy_from_slice(&[1,2,3,4,5,6, 6,5,4,3,2,1]);
+                let outcome = engine.try_decap(&mut rf, &meta_new, &mut scratch);
+                if let WireGuardDecapOutcome::Decapped(res) = outcome {
+                    let frame = res.control_frame.unwrap();
+                    if frame[42] == 3 { // Type 3 is Cookie Reply!
+                        cookie_reply_generated = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert!(cookie_reply_generated, "Failed to trigger a cookie reply from boringtun rate limiter");
+
+        // Assert that the endpoint did NOT roam to new_port
+        let peer_final = engine.peers.get(&peer_key).unwrap();
+        assert_eq!(peer_final.endpoint, Some((initial_ip, initial_port)));
+    }
+
+    #[test]
+    fn test_trial_decap_40_peers_eventual_handshake_completion() {
+        use crate::protocol::{WireGuardInterfaceSnapshot, WireGuardPeerSnapshot};
+        use boringtun::noise::Tunn;
+        use boringtun::x25519::{StaticSecret, PublicKey};
+
+        let mut engine = WireGuardEngine::new();
+        engine.listen_port = 51820;
+
+        let server_private = StaticSecret::from([9u8; 32]);
+        let server_public = PublicKey::from(&server_private);
+        let server_private_b64 = BASE64.encode(server_private.to_bytes());
+
+        let mut peers = vec![];
+        let mut client_privates = vec![];
+        let mut client_publics = vec![];
+
+        for i in 0..40 {
+            let client_priv = StaticSecret::from([i as u8; 32]);
+            let client_pub = PublicKey::from(&client_priv);
+            let client_pub_b64 = BASE64.encode(client_pub.as_bytes());
+
+            peers.push(WireGuardPeerSnapshot {
+                public_key: client_pub_b64,
+                endpoint: "".to_string(),
+                allowed_ips: vec![],
+                persistent_keepalive: 0,
+            });
+
+            client_privates.push(client_priv);
+            client_publics.push(client_pub);
+        }
+
+        let snap = WireGuardInterfaceSnapshot {
+            private_key: server_private_b64,
+            public_key: "".to_string(),
+            listen_port: 51820,
+            peers,
+        };
+        engine.apply_snapshot(&snap);
+        assert_eq!(engine.peers.len(), 40);
+
+        let peer_39_key: [u8; 32] = client_publics[39].as_bytes().clone();
+
+        // Construct a valid handshake initiation from client 39
+        let mut client_tunn = Tunn::new(
+            client_privates[39].clone(),
+            server_public,
+            None,
+            None,
+            1,
+            None,
+        );
+
+        let mut client_out = vec![0u8; 1500];
+        let client_res = client_tunn.encapsulate(&[], &mut client_out);
+        let handshake_init_packet = match client_res {
+            TunnResult::WriteToNetwork(pkt) => pkt,
+            _ => panic!("Expected WriteToNetwork"),
+        };
+
+        let mut raw_frame = vec![0u8; 42 + handshake_init_packet.len()];
+        raw_frame[42..42 + handshake_init_packet.len()].copy_from_slice(handshake_init_packet);
+
+        let endpoint_port = 53421;
+
+        let mut flow_src_addr = [0u8; 16];
+        flow_src_addr[0..4].copy_from_slice(&[192, 168, 1, 100]);
+        let mut flow_dst_addr = [0u8; 16];
+        flow_dst_addr[0..4].copy_from_slice(&[192, 168, 1, 1]);
+
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 1,
+            rx_queue_index: 0,
+            protocol: 17,
+            addr_family: libc::AF_INET as u8,
+            flow_dst_port: 51820,
+            flow_src_port: endpoint_port,
+            l3_offset: 14,
+            l4_offset: 34,
+            payload_offset: 42,
+            pkt_len: raw_frame.len() as u16,
+            flow_src_addr,
+            flow_dst_addr,
+            ..UserspaceDpMeta::default()
+        };
+
+        let mut roamed = false;
+        let mut scratch = vec![0u8; 2048];
+
+        for _ in 0..10 {
+            engine.trial_decap_tokens = 32;
+
+            let outcome = engine.try_decap(&mut raw_frame, &meta, &mut scratch);
+            if let WireGuardDecapOutcome::Decapped(_) = outcome {
+                let peer = engine.peers.get(&peer_39_key).unwrap();
+                if peer.endpoint.is_some() {
+                    roamed = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(roamed, "Peer 39 failed to roam even after rotating round_robin_offset");
+    }
 }
