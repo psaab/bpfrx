@@ -32,8 +32,8 @@ helper publishes per-binding/ring capacity, available fill frames, completion
 backlog, RX/TX ring occupancy, and drop/error counters. Go formatting keeps a
 stable aggregate view for `show system buffers` and only emits per-binding rows
 for `show system buffers detail`. REST uses the same helper-backed bounded
-rows for JSON so userspace mode never falls back to eBPF map occupancy for
-operator buffer warnings.
+rows and status counters for JSON so userspace mode never falls back to eBPF
+map occupancy for operator buffer warnings.
 
 If mixed-version helpers omit a newer capacity surface, Go must fall back to the
 older binding fields or clearly mark the row unavailable. It must not display

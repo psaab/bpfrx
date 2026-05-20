@@ -32,10 +32,27 @@ func (f *systemBuffersAPIUserspaceDP) GetMapStats() []dataplane.MapStats {
 	}
 }
 
+type systemBuffersAPILegacyDP struct {
+	*dataplane.Manager
+	getMapStatsHit bool
+}
+
+func (f *systemBuffersAPILegacyDP) IsLoaded() bool {
+	return true
+}
+
+func (f *systemBuffersAPILegacyDP) GetMapStats() []dataplane.MapStats {
+	f.getMapStatsHit = true
+	return []dataplane.MapStats{
+		{Name: "session_map", Type: "Hash", MaxEntries: 100, UsedCount: 85},
+	}
+}
+
 func TestSystemBuffersHandlerUsesUserspaceStatusRows(t *testing.T) {
 	dp := &systemBuffersAPIUserspaceDP{
 		Manager: dataplane.New(),
 		status: dpuserspace.ProcessStatus{
+			NeighborEntries: 7,
 			PerBinding: []dpuserspace.BindingCountersSnapshot{
 				{
 					WorkerID:           0,
@@ -45,6 +62,7 @@ func TestSystemBuffersHandlerUsesUserspaceStatusRows(t *testing.T) {
 					UmemInflightFrames: 800,
 					TxRingCapacity:     100,
 					OutstandingTX:      95,
+					ActiveFlowCount:    11,
 				},
 			},
 		},
@@ -72,17 +90,14 @@ func TestSystemBuffersHandlerUsesUserspaceStatusRows(t *testing.T) {
 	if !resp.Success {
 		t.Fatalf("success = false; body: %s", rr.Body.String())
 	}
-	if len(resp.Data) != 2 {
-		t.Fatalf("len(resp.Data) = %d, want 2; data: %+v", len(resp.Data), resp.Data)
+	if len(resp.Data) != 4 {
+		t.Fatalf("len(resp.Data) = %d, want 4; data: %+v", len(resp.Data), resp.Data)
 	}
 
 	rows := make(map[string]BufferInfo, len(resp.Data))
 	for _, row := range resp.Data {
 		rows[row.Name] = row
-		if row.Type != "Userspace" {
-			t.Fatalf("row %q type = %q, want Userspace", row.Name, row.Type)
-		}
-		if row.Scope != "aggregate/1" {
+		if row.Type == "Userspace" && row.Scope != "aggregate/1" {
 			t.Fatalf("row %q scope = %q, want aggregate/1", row.Name, row.Scope)
 		}
 	}
@@ -95,6 +110,16 @@ func TestSystemBuffersHandlerUsesUserspaceStatusRows(t *testing.T) {
 	if tx.MaxEntries != 100 || tx.UsedCount != 95 ||
 		tx.UsagePercent != 95.0 || tx.Status != "CRITICAL" {
 		t.Fatalf("TX row = %+v, want 100/95 95%% CRITICAL", tx)
+	}
+	neighbor := rows["Neighbor cache entries"]
+	if neighbor.Type != "UserspaceCounter" || neighbor.Scope != "dynamic" ||
+		neighbor.Value != 7 || neighbor.UsagePercent != 0 {
+		t.Fatalf("neighbor counter row = %+v, want dynamic counter value 7", neighbor)
+	}
+	flows := rows["Flow cache active flows"]
+	if flows.Type != "UserspaceCounter" || flows.Scope != "active window" ||
+		flows.Value != 11 || flows.UsagePercent != 0 {
+		t.Fatalf("flow-cache counter row = %+v, want active-window counter value 11", flows)
 	}
 }
 
@@ -122,5 +147,57 @@ func TestSystemBuffersHandlerDoesNotFallbackToMapsOnUserspaceStatusError(t *test
 	}
 	if resp.Success {
 		t.Fatalf("success = true, want false; body: %s", rr.Body.String())
+	}
+}
+
+func TestSystemBuffersHandlerRejectsUserspaceStatusWithoutCapacityRows(t *testing.T) {
+	dp := &systemBuffersAPIUserspaceDP{
+		Manager: dataplane.New(),
+		status:  dpuserspace.ProcessStatus{NeighborEntries: 3},
+	}
+	s := &Server{dp: dp}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/system/buffers", nil)
+	s.systemBuffersHandler(rr, req)
+
+	if rr.Code != 503 {
+		t.Fatalf("status = %d, want 503; body: %s", rr.Code, rr.Body.String())
+	}
+	if dp.getMapStatsHit {
+		t.Fatal("systemBuffersHandler used BPF map stats for missing userspace capacity fields")
+	}
+}
+
+func TestSystemBuffersHandlerKeepsLegacyMapStatsFallback(t *testing.T) {
+	dp := &systemBuffersAPILegacyDP{Manager: dataplane.New()}
+	s := &Server{dp: dp}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/system/buffers", nil)
+	s.systemBuffersHandler(rr, req)
+
+	if rr.Code != 200 {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	if !dp.getMapStatsHit {
+		t.Fatal("systemBuffersHandler did not use GetMapStats for legacy dataplane")
+	}
+
+	var resp struct {
+		Success bool         `json:"success"`
+		Data    []BufferInfo `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(resp.Data) != 1 {
+		t.Fatalf("len(resp.Data) = %d, want 1; data: %+v", len(resp.Data), resp.Data)
+	}
+	row := resp.Data[0]
+	if row.Name != "session_map" || row.Type != "Hash" ||
+		row.MaxEntries != 100 || row.UsedCount != 85 ||
+		row.UsagePercent != 85.0 || row.Status != "WARNING" {
+		t.Fatalf("legacy map row = %+v, want session_map 85/100 WARNING", row)
 	}
 }

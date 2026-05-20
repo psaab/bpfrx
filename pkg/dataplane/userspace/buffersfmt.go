@@ -92,6 +92,24 @@ type SystemBufferUtilizationRow struct {
 	Status       string
 }
 
+// SystemBufferCounterRow is an unbounded userspace pressure/status counter.
+// These rows deliberately have no capacity denominator and must not be
+// rendered as fill percentages.
+type SystemBufferCounterRow struct {
+	Name  string
+	Scope string
+	Value uint64
+}
+
+// SystemBufferRows contains all structured userspace buffer/status rows that
+// non-text renderers need to mirror FormatSystemBuffers.
+type SystemBufferRows struct {
+	Utilization       []SystemBufferUtilizationRow
+	Counters          []SystemBufferCounterRow
+	KnownUMEMBindings int
+	KnownTXRings      int
+}
+
 type systemBufferCounterRow struct {
 	Name  string
 	Scope string
@@ -102,7 +120,25 @@ type systemBufferCounterRow struct {
 // rows used by FormatSystemBuffers. Missing helper capacity fields produce no
 // synthetic fill rows rather than falling back to BPF map statistics.
 func SystemBufferUtilizationRows(status ProcessStatus, detail bool) []SystemBufferUtilizationRow {
-	rows, _, _ := systemBufferRows(status, detail)
+	return StructuredSystemBufferRows(status, detail).Utilization
+}
+
+// StructuredSystemBufferRows returns helper-backed userspace buffer rows and
+// unbounded status counters using the same sampling and fallback logic as the
+// CLI/gRPC text formatter.
+func StructuredSystemBufferRows(status ProcessStatus, detail bool) SystemBufferRows {
+	samples := systemBufferSamples(status)
+	rows, knownUMEM, knownTX := systemBufferRows(status, samples, detail)
+	counterRows := systemBufferCounterRows(status, samples, detail)
+	return SystemBufferRows{
+		Utilization:       exportedSystemBufferRows(rows),
+		Counters:          exportedSystemBufferCounterRows(counterRows),
+		KnownUMEMBindings: knownUMEM,
+		KnownTXRings:      knownTX,
+	}
+}
+
+func exportedSystemBufferRows(rows []systemBufferRow) []SystemBufferUtilizationRow {
 	out := make([]SystemBufferUtilizationRow, 0, len(rows))
 	for _, row := range rows {
 		usage, state := systemBufferUsage(row)
@@ -118,13 +154,25 @@ func SystemBufferUtilizationRows(status ProcessStatus, detail bool) []SystemBuff
 	return out
 }
 
+func exportedSystemBufferCounterRows(rows []systemBufferCounterRow) []SystemBufferCounterRow {
+	out := make([]SystemBufferCounterRow, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, SystemBufferCounterRow{
+			Name:  row.Name,
+			Scope: row.Scope,
+			Value: row.Value,
+		})
+	}
+	return out
+}
+
 // FormatSystemBuffers renders userspace dataplane buffer capacity telemetry for
 // `show system buffers`. Capacity rows only use bounded gauges published in
 // helper status; unbounded helper counters/gauges render in a separate section
 // so missing denominators are not mistaken for real fill percentages.
 func FormatSystemBuffers(status ProcessStatus, detail bool) string {
-	rows, knownUMEM, knownTX := systemBufferRows(status, detail)
 	samples := systemBufferSamples(status)
+	rows, knownUMEM, knownTX := systemBufferRows(status, samples, detail)
 	counterRows := systemBufferCounterRows(status, samples, detail)
 
 	var b strings.Builder
@@ -166,10 +214,13 @@ func FormatSystemBuffers(status ProcessStatus, detail bool) string {
 	return b.String()
 }
 
-func systemBufferRows(status ProcessStatus, detail bool) ([]systemBufferRow, int, int) {
+func systemBufferRows(
+	status ProcessStatus,
+	samples []systemBufferSample,
+	detail bool,
+) ([]systemBufferRow, int, int) {
 	var umemCap, umemUsed, txCap, txUsed uint64
 	var knownUMEM, knownTX int
-	samples := systemBufferSamples(status)
 	for _, sample := range samples {
 		if sample.UMEMCap > 0 {
 			knownUMEM++

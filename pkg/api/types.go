@@ -329,8 +329,9 @@ type BufferInfo struct {
 	Name         string  `json:"name"`
 	Type         string  `json:"type"`
 	Scope        string  `json:"scope,omitempty"`
-	MaxEntries   int     `json:"max_entries"`
-	UsedCount    int     `json:"used_count"`
+	MaxEntries   uint64  `json:"max_entries"`
+	UsedCount    uint64  `json:"used_count"`
+	Value        uint64  `json:"value,omitempty"`
 	UsagePercent float64 `json:"usage_percent"`
 	Status       string  `json:"status"`
 }
