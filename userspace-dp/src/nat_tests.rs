@@ -953,6 +953,40 @@ fn session_key_from_src(
     }
 }
 
+fn assert_persistent_expiry_indexes_consistent(rule: &SourceNatRule) {
+    let live = rule
+        .pool_allocator
+        .shared
+        .live
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut expected_global = BTreeSet::new();
+    let mut expected_by_addr = vec![BTreeSet::new(); live.lease_expirations_by_addr.len()];
+
+    for (key, lease) in &live.persistent_by_source {
+        let entry = (lease.expires_at_ns, *key);
+        if lease.active_flows == 0 {
+            assert!(
+                lease.addr_index < expected_by_addr.len(),
+                "persistent lease addr index {} out of range {}",
+                lease.addr_index,
+                expected_by_addr.len()
+            );
+            expected_global.insert(entry);
+            expected_by_addr[lease.addr_index].insert(entry);
+        }
+    }
+
+    assert_eq!(
+        live.lease_expirations, expected_global,
+        "persistent expiry index mismatch"
+    );
+    assert_eq!(
+        live.lease_expirations_by_addr, expected_by_addr,
+        "per-address persistent expiry index mismatch"
+    );
+}
+
 #[test]
 fn pool_snat_persistent_reuses_same_source_tuple() {
     let rules = persistent_pool_rules(300, 40000, 40010);
@@ -967,6 +1001,7 @@ fn pool_snat_persistent_reuses_same_source_tuple() {
     assert_eq!(status[0].reuses_total, 1);
     assert_eq!(status[0].persistent_leases, 1);
     assert_eq!(status[0].live_flows, 2);
+    assert_persistent_expiry_indexes_consistent(&rules[0]);
 }
 
 #[test]
@@ -1012,6 +1047,7 @@ fn pool_snat_persistent_reassigns_after_timeout() {
     ));
     assert_eq!(reassigned.rewrite_src, first.rewrite_src);
     assert_ne!(reassigned.rewrite_src_port, first.rewrite_src_port);
+    assert_persistent_expiry_indexes_consistent(&rules[0]);
 }
 
 #[test]
@@ -1217,6 +1253,7 @@ fn pool_snat_persistent_rollback_removes_fresh_lease() {
     assert_eq!(status[0].live_flows, 0);
     assert_eq!(status[0].used_ports, 0);
     assert_eq!(status[0].persistent_leases, 0);
+    assert_persistent_expiry_indexes_consistent(&rules[0]);
 
     let second = expect_snat_decision(tuple_snat_lookup(&rules, 10001, "1.1.1.1", 53, 3));
     assert_eq!(second.rewrite_src, first.rewrite_src);
@@ -1243,6 +1280,7 @@ fn pool_snat_release_uses_rewritten_dnat_destination_key() {
     assert_eq!(status[0].live_flows, 0);
     assert_eq!(status[0].used_ports, 1);
     assert_eq!(status[0].persistent_leases, 1);
+    assert_persistent_expiry_indexes_consistent(&rules[0]);
 }
 
 #[test]
@@ -1270,6 +1308,43 @@ fn pool_snat_persistent_expiry_index_is_bounded_by_leases() {
     assert_eq!(live.persistent_by_source.len(), 1);
     assert_eq!(live.lease_expirations.len(), 1);
     assert_eq!(live.lease_expirations_by_addr[0].len(), 1);
+    drop(live);
+    assert_persistent_expiry_indexes_consistent(&rules[0]);
+}
+
+#[test]
+#[should_panic(expected = "persistent expiry index mismatch")]
+fn pool_snat_expiry_invariant_rejects_stale_entry() {
+    let rules = persistent_pool_rules(300, 40000, 40000);
+    let decision =
+        expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1_000));
+    release_source_nat_allocation(
+        &rules,
+        &session_key(10000, "8.8.8.8", 53),
+        decision,
+        false,
+        2_000,
+    );
+    {
+        let mut live = rules[0]
+            .pool_allocator
+            .shared
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (key, lease) = live
+            .persistent_by_source
+            .iter()
+            .next()
+            .map(|(key, lease)| (*key, *lease))
+            .unwrap();
+        live.lease_expirations
+            .insert((lease.expires_at_ns + 1, key));
+        live.lease_expirations_by_addr[lease.addr_index]
+            .insert((lease.expires_at_ns + 1, key));
+    }
+
+    assert_persistent_expiry_indexes_consistent(&rules[0]);
 }
 
 #[test]
@@ -1324,6 +1399,8 @@ fn pool_snat_allocation_gc_is_bounded_when_not_under_pressure() {
         live.lease_expirations_by_addr[0].len(),
         expired_lease_count - ALLOCATION_GC_BUDGET
     );
+    drop(live);
+    assert_persistent_expiry_indexes_consistent(&rules[0]);
 }
 
 #[test]
@@ -1393,6 +1470,7 @@ fn pool_snat_pressure_gc_reclaims_expired_lease_for_selected_address() {
             ALLOCATION_GC_BUDGET
         );
     }
+    assert_persistent_expiry_indexes_consistent(&rules[0]);
 
     let decision = expect_snat_decision(tuple_snat_lookup_from_src(
         &rules,
@@ -1413,6 +1491,8 @@ fn pool_snat_pressure_gc_reclaims_expired_lease_for_selected_address() {
         .unwrap_or_else(|e| e.into_inner());
     assert_eq!(live.lease_expirations_by_addr[0].len(), 0);
     assert!(live.lease_expirations_by_addr[1].len() < ALLOCATION_GC_BUDGET);
+    drop(live);
+    assert_persistent_expiry_indexes_consistent(&rules[0]);
 }
 
 fn source_for_sticky_pool_index(want: usize, pool_len: usize) -> String {
