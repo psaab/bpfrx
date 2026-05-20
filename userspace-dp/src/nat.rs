@@ -640,7 +640,12 @@ impl PortAllocator {
         true
     }
 
-    fn rollback_flow(&self, flow: SourceNatFlowKey, translated: TranslatedTuple) -> bool {
+    fn rollback_flow(
+        &self,
+        flow: SourceNatFlowKey,
+        translated: TranslatedTuple,
+        now_ns: u64,
+    ) -> bool {
         let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
         let Some(existing) = live.live_by_flow.get(&flow).copied() else {
             return false;
@@ -650,17 +655,29 @@ impl PortAllocator {
         }
         live.live_by_flow.remove(&flow);
         if let Some(key) = existing.persistent_key {
-            if existing.persistent_lease_created {
+            let mut remove_lease = false;
+            let mut insert_expiry = None;
+            if let Some(lease) = live.persistent_by_source.get_mut(&key) {
+                lease.active_flows = lease.active_flows.saturating_sub(1);
+                if lease.active_flows == 0 {
+                    if existing.persistent_lease_created {
+                        remove_lease = true;
+                    } else if existing.persistent_previous_active_flows == 0 {
+                        lease.expires_at_ns = existing.persistent_previous_expires_at_ns;
+                        insert_expiry = Some((lease.addr_index, lease.expires_at_ns));
+                    } else {
+                        let expires_at_ns = now_ns.saturating_add(lease.timeout_ns);
+                        lease.expires_at_ns = expires_at_ns;
+                        insert_expiry = Some((lease.addr_index, expires_at_ns));
+                    }
+                }
+            }
+            if remove_lease {
                 live.persistent_by_source.remove(&key);
                 self.release_translated_locked(&mut live, translated);
-            } else if let Some(lease) = live.persistent_by_source.get_mut(&key) {
-                lease.active_flows = existing.persistent_previous_active_flows;
-                lease.expires_at_ns = existing.persistent_previous_expires_at_ns;
-                let insert_expiry =
-                    (lease.active_flows == 0).then_some((lease.addr_index, lease.expires_at_ns));
-                if let Some((addr_index, expires_at_ns)) = insert_expiry {
-                    Self::insert_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
-                }
+            }
+            if let Some((addr_index, expires_at_ns)) = insert_expiry {
+                Self::insert_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
             }
         } else {
             self.release_translated_locked(&mut live, translated);
@@ -1036,7 +1053,7 @@ fn release_source_nat_allocation_with_mode(
     key: &crate::session::SessionKey,
     nat: NatDecision,
     is_reverse: bool,
-    _now_ns: u64,
+    now_ns: u64,
     rollback: bool,
 ) {
     if is_reverse {
@@ -1064,9 +1081,9 @@ fn release_source_nat_allocation_with_mode(
             continue;
         }
         let released = if rollback {
-            rule.pool_allocator.rollback_flow(flow, translated)
+            rule.pool_allocator.rollback_flow(flow, translated, now_ns)
         } else {
-            rule.pool_allocator.release_flow(flow, translated, _now_ns)
+            rule.pool_allocator.release_flow(flow, translated, now_ns)
         };
         if released {
             break;
