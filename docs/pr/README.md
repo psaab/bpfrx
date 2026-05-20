@@ -23,6 +23,7 @@ specs (those live at the repo root `docs/` level).
 | `1316-lowrate-cos-buffers/`  | #1312/#1316 low-rate exact CoS buffer sizing measurements    | PR #1316              |
 | `1321-validation-contract/`  | #1321 100E100M and surplus give-back validation contract     | PR branch             |
 | `1373-retire-ebpf-dataplane/` | #1373 userspace parity blocker plans | PR branch |
+| `1435-syncookie-smoke/`      | #1435 userspace SYN-cookie loss-cluster smoke evidence       | PR #1435              |
 | `line-rate-investigation/`   | Parent investigation (#798) plan + phase-B step 0 + gaps doc + 8-matrix findings | #798 open |
 
 ## Conventions
