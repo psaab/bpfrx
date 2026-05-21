@@ -11,6 +11,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
@@ -339,6 +340,67 @@ func TestSamePlanClassifierMapRefreshFailsClosedOnNATSyncFailure(t *testing.T) {
 	}
 	if lookupErr := natV4Map.Lookup(newNAT, &got); !errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
 		t.Fatalf("new NAT address lookup err = %v, want ErrKeyNotExist", lookupErr)
+	}
+}
+
+func TestBlindFailClosedUserspaceCtrlAfterLookupFailure(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+	m := New()
+	ctrlMap, _ := injectCtrlAndBindingMaps(t, m)
+	m.ctrlWasEnabled = true
+
+	zero := uint32(0)
+	if err := ctrlMap.Update(zero, userspaceCtrlValue{
+		Enabled:            1,
+		MetadataVersion:    userspaceMetadataVersion,
+		Workers:            8,
+		QueueCount:         8,
+		HeartbeatTimeoutMS: 30000,
+	}, ebpf.UpdateAny); err != nil {
+		t.Fatalf("seed userspace_ctrl: %v", err)
+	}
+
+	cause := errors.New("classifier sync failed")
+	lookupErr := errors.New("transient ctrl lookup failed")
+	err := m.blindFailClosedUserspaceCtrlLocked(
+		ctrlMap,
+		&ConfigSnapshot{
+			Generation:    99,
+			FIBGeneration: 7,
+			Userspace: config.UserspaceConfig{
+				Workers: 3,
+			},
+		},
+		cause,
+		lookupErr,
+	)
+	if !errors.Is(err, cause) {
+		t.Fatalf("error does not wrap classifier failure: %v", err)
+	}
+	if !errors.Is(err, lookupErr) {
+		t.Fatalf("error does not wrap lookup failure: %v", err)
+	}
+
+	var ctrl userspaceCtrlValue
+	if err := ctrlMap.Lookup(zero, &ctrl); err != nil {
+		t.Fatalf("lookup userspace_ctrl after blind fail-closed: %v", err)
+	}
+	if ctrl.Enabled != 0 {
+		t.Fatalf("userspace_ctrl.Enabled = %d after blind fail-closed, want 0", ctrl.Enabled)
+	}
+	if ctrl.MetadataVersion != userspaceMetadataVersion {
+		t.Fatalf("MetadataVersion = %d, want %d", ctrl.MetadataVersion, userspaceMetadataVersion)
+	}
+	if ctrl.Workers != 3 || ctrl.QueueCount != 3 {
+		t.Fatalf("Workers/QueueCount = %d/%d, want 3/3", ctrl.Workers, ctrl.QueueCount)
+	}
+	if ctrl.ConfigGeneration != 99 || ctrl.FIBGeneration != 7 {
+		t.Fatalf("generations = %d/%d, want 99/7", ctrl.ConfigGeneration, ctrl.FIBGeneration)
+	}
+	if m.ctrlWasEnabled {
+		t.Fatal("ctrlWasEnabled = true after blind fail-closed, want false")
 	}
 }
 

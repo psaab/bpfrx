@@ -193,14 +193,59 @@ func (m *Manager) syncUserspaceClassifierMapsFailClosedLocked(snapshot *ConfigSn
 			if errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
 				return err
 			}
-			return errors.Join(
-				err,
-				fmt.Errorf("lookup userspace_ctrl for classifier-map fail-closed: %w", lookupErr),
-			)
+			return m.blindFailClosedUserspaceCtrlLocked(ctrlMap, snapshot, err, lookupErr)
 		}
 		return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, err)
 	}
 	return nil
+}
+
+func (m *Manager) blindFailClosedUserspaceCtrlLocked(
+	ctrlMap *ebpf.Map,
+	snapshot *ConfigSnapshot,
+	cause error,
+	lookupErr error,
+) error {
+	disabled := userspaceCtrlValue{
+		Enabled:            0,
+		MetadataVersion:    userspaceMetadataVersion,
+		Workers:            1,
+		QueueCount:         1,
+		HeartbeatTimeoutMS: 30000,
+	}
+	if snapshot != nil {
+		workers := maxInt(snapshot.Userspace.Workers, 1)
+		disabled.Workers = uint32(workers)
+		disabled.QueueCount = uint32(workers)
+		disabled.ConfigGeneration = snapshot.Generation
+		disabled.FIBGeneration = snapshot.FIBGeneration
+		if snapshotHasNativeGRE(snapshot) {
+			disabled.Flags |= userspaceCtrlFlagNativeGRE
+		}
+	}
+	if m.configuredMode == ModeUserspaceStrict {
+		disabled.Flags |= userspaceCtrlFlagStrict
+	}
+	if cpuMap := m.bpfShim.Map("userspace_cpumap"); cpuMap != nil {
+		disabled.Flags |= userspaceCtrlFlagCPUMap
+	}
+
+	zero := uint32(0)
+	if err := ctrlMap.Update(zero, disabled, ebpf.UpdateAny); err != nil {
+		return errors.Join(
+			cause,
+			fmt.Errorf("lookup userspace_ctrl for classifier-map fail-closed: %w", lookupErr),
+			fmt.Errorf("blind fail closed userspace_ctrl after lookup failure: %w", err),
+		)
+	}
+	if m.ctrlWasEnabled {
+		m.ctrlDisabledAt = m.bpfKtimeNs()
+	}
+	m.ctrlWasEnabled = false
+	return errors.Join(
+		cause,
+		fmt.Errorf("lookup userspace_ctrl for classifier-map fail-closed: %w", lookupErr),
+	)
 }
 
 func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {

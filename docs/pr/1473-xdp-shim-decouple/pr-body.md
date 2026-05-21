@@ -15,6 +15,8 @@
 - Route same-plan and pending-XSK classifier map refresh failures through the
   same fail-closed control-map path, including ingress, local address, and
   interface-NAT map updates.
+- Defensively blind-disable `userspace_ctrl` if a classifier refresh fails and
+  the current control-map row cannot be read.
 - Route degraded IP local/control delivery through `cpumap_or_pass` when cpumap
   is available; direct `XDP_PASS` remains only for non-IP local L2 frames such
   as ARP/LLDP.
@@ -83,6 +85,7 @@ The Go tests add privileged XDP test-run coverage for:
 - ctrl publication remaining disabled if binding map publication fails
 - fail-closed ctrl disable after a previously-live publication failure
 - fail-closed ctrl disable after a same-plan classifier-map refresh failure
+- blind fail-closed ctrl disable after a transient control-map lookup failure
 - local and interface-NAT address map add-before-remove behavior on refresh
   failure
 - cpumap delivery for degraded IP local/control and ICMPv6 NDP
