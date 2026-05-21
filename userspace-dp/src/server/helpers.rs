@@ -289,6 +289,39 @@ pub(crate) fn should_run_afxdp(status: &ProcessStatus) -> bool {
     status.forwarding_armed && status.capabilities.forwarding_supported
 }
 
+pub(crate) fn same_plan_apply_needs_binding_reconcile(
+    state: &ServerState,
+    previous_defer_workers: bool,
+    next_defer_workers: bool,
+) -> bool {
+    if next_defer_workers || !should_run_afxdp(&state.status) {
+        return false;
+    }
+
+    let runnable_bindings = state
+        .status
+        .bindings
+        .iter()
+        .filter(|binding| binding.registered && binding.ifindex > 0)
+        .count();
+    if runnable_bindings == 0 {
+        return false;
+    }
+    if previous_defer_workers {
+        return true;
+    }
+
+    let (_, planned_bindings) = state.afxdp.planned_counts();
+    let live_bindings = state.afxdp.live_count();
+    (planned_bindings < runnable_bindings || live_bindings < runnable_bindings)
+        && state.status.bindings.iter().any(|binding| {
+            binding.registered
+                && binding.ifindex > 0
+                && binding.last_error.is_empty()
+                && (!binding.bound || !binding.xsk_registered)
+        })
+}
+
 pub(crate) fn set_bindings_forwarding_armed(status: &mut ProcessStatus, armed: bool) {
     for binding in &mut status.bindings {
         binding.armed = armed && binding.registered;

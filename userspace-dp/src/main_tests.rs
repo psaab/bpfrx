@@ -903,6 +903,126 @@ fn binding_counters_snapshot_serializes_with_expected_wire_keys() {
     assert_eq!(round, snap);
 }
 
+fn run_control_request(
+    state: Arc<Mutex<ServerState>>,
+    state_file: &str,
+    request: ControlRequest,
+) -> ControlResponse {
+    let (mut client, server) = std::os::unix::net::UnixStream::pair().expect("control socket pair");
+    let running = Arc::new(AtomicBool::new(true));
+    let state_file = state_file.to_string();
+    let handle = std::thread::spawn(move || handle_stream(server, &state_file, state, running));
+
+    serde_json::to_writer(&mut client, &request).expect("write request");
+    std::io::Write::write_all(&mut client, b"\n").expect("newline");
+
+    let response: ControlResponse =
+        serde_json::from_reader(std::io::BufReader::new(client)).expect("read response");
+    handle
+        .join()
+        .expect("handler thread")
+        .expect("handler result");
+    response
+}
+
+#[test]
+fn apply_snapshot_same_plan_clearing_defer_workers_reconciles_bindings() {
+    let state = Arc::new(Mutex::new(ServerState {
+        status: ProcessStatus {
+            workers: 1,
+            ring_entries: 64,
+            forwarding_armed: true,
+            capabilities: UserspaceCapabilities {
+                forwarding_supported: true,
+                unsupported_reasons: Vec::new(),
+            },
+            ..ProcessStatus::default()
+        },
+        snapshot: None,
+        afxdp: afxdp::Coordinator::new(),
+        state_writer: Arc::new(StateWriter::new()),
+    }));
+    let state_file = format!(
+        "{}/xpf-defer-workers-reconcile-{}.json",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&state_file);
+
+    let deferred_snapshot = ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 1,
+        fib_generation: 1,
+        generated_at: Utc::now(),
+        capabilities: UserspaceCapabilities {
+            forwarding_supported: true,
+            unsupported_reasons: Vec::new(),
+        },
+        userspace: serde_json::json!({
+            "workers": 1,
+            "ring_entries": 64,
+        }),
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0/0/1.0".to_string(),
+            zone: "lan".to_string(),
+            linux_name: "ge-0-0-1".to_string(),
+            ifindex: 11,
+            rx_queues: 1,
+            ..InterfaceSnapshot::default()
+        }],
+        defer_workers: true,
+        ..ConfigSnapshot::default()
+    };
+
+    let response = run_control_request(
+        state.clone(),
+        &state_file,
+        ControlRequest {
+            request_type: "apply_snapshot".to_string(),
+            snapshot: Some(deferred_snapshot.clone()),
+            ..ControlRequest::default()
+        },
+    );
+    assert!(response.ok, "unexpected error: {}", response.error);
+    let status = response.status.expect("status response");
+    assert_eq!(status.debug_reconcile_calls, 0);
+    assert_eq!(status.bindings.len(), 1);
+    assert!(status.bindings[0].registered);
+    assert!(status.bindings[0].last_error.is_empty());
+
+    let mut resumed_snapshot = deferred_snapshot.clone();
+    resumed_snapshot.generation = 2;
+    resumed_snapshot.fib_generation = 2;
+    resumed_snapshot.generated_at = Utc::now();
+    resumed_snapshot.defer_workers = false;
+    assert!(same_binding_plan(&deferred_snapshot, &resumed_snapshot));
+
+    let response = run_control_request(
+        state.clone(),
+        &state_file,
+        ControlRequest {
+            request_type: "apply_snapshot".to_string(),
+            snapshot: Some(resumed_snapshot),
+            ..ControlRequest::default()
+        },
+    );
+    assert!(response.ok, "unexpected error: {}", response.error);
+    let status = response.status.expect("status response");
+    assert_eq!(status.debug_reconcile_calls, 1);
+    assert_eq!(status.debug_reconcile_stage, "missing_xsk_pin");
+    assert!(
+        !state
+            .lock()
+            .expect("state poisoned")
+            .snapshot
+            .as_ref()
+            .expect("snapshot")
+            .defer_workers
+    );
+
+    let _ = std::fs::remove_file(&state_file);
+}
+
 #[test]
 fn apply_snapshot_rejects_unsupported_protocol_version() {
     let (mut client, server) = std::os::unix::net::UnixStream::pair().expect("control socket pair");
