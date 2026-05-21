@@ -1326,6 +1326,7 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path(
             | ForwardingDisposition::NoRoute
             | ForwardingDisposition::MissingNeighbor
             | ForwardingDisposition::NextTableUnsupported
+            | ForwardingDisposition::FabricRedirect
     ) {
         return;
     }
@@ -1375,6 +1376,7 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path_from_frame(
             | ForwardingDisposition::NoRoute
             | ForwardingDisposition::MissingNeighbor
             | ForwardingDisposition::NextTableUnsupported
+            | ForwardingDisposition::FabricRedirect
     ) {
         return;
     }

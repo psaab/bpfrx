@@ -522,3 +522,69 @@ fn shared_exact_queue_lease_uses_interface_default_queue() {
         None,
     ));
 }
+
+#[test]
+fn test_maybe_reinject_slow_path_supports_fabric_redirect() {
+    let binding = BindingWorker::new_for_mirror_test(0, 0, 11, 0);
+    let identity = binding.identity();
+    let live = binding.live;
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let frame = build_ipv4_test_packet(0);
+    let meta = ForwardPacketMeta {
+        ingress_ifindex: 11,
+        l3_offset: 14,
+        l4_offset: 34,
+        pkt_len: frame.len() as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        ..ForwardPacketMeta::default()
+    };
+    let mut decision = test_decision();
+    decision.resolution.disposition = ForwardingDisposition::FabricRedirect;
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let forwarding = test_forwarding_with_egress_mtu(1500);
+
+    maybe_reinject_slow_path_from_frame(
+        &identity,
+        &live,
+        None,
+        &local_tunnel_deliveries,
+        &frame,
+        meta,
+        decision.clone(),
+        &recent_exceptions,
+        "slow_path",
+        &forwarding,
+    );
+
+    // If FabricRedirect is correctly matched, it falls through to slow-path reinjection.
+    // Since slow_path is None, it records a slow_path_unavailable exception and drops.
+    assert_eq!(live.slow_path_drops.load(Ordering::Relaxed), 1);
+    let locked = recent_exceptions.lock().unwrap();
+    assert_eq!(locked.len(), 1);
+    assert_eq!(locked[0].reason, "slow_path_unavailable");
+
+    // Test that an unmatched disposition (e.g. PolicyDenied) returns early without updating drops or exceptions.
+    let mut denied_decision = decision.clone();
+    denied_decision.resolution.disposition = ForwardingDisposition::PolicyDenied;
+    let binding_deny = BindingWorker::new_for_mirror_test(1, 0, 11, 0);
+    let identity_deny = binding_deny.identity();
+    let live_deny = binding_deny.live;
+    let recent_exceptions_deny = Arc::new(Mutex::new(VecDeque::new()));
+
+    maybe_reinject_slow_path_from_frame(
+        &identity_deny,
+        &live_deny,
+        None,
+        &local_tunnel_deliveries,
+        &frame,
+        meta,
+        denied_decision,
+        &recent_exceptions_deny,
+        "slow_path",
+        &forwarding,
+    );
+
+    assert_eq!(live_deny.slow_path_drops.load(Ordering::Relaxed), 0);
+    assert!(recent_exceptions_deny.lock().unwrap().is_empty());
+}
