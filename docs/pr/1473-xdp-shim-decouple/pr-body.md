@@ -29,11 +29,50 @@
     rg 'is_degraded|classify_native|xdp_userspace|parse_l4'
   ```
 
-## Local Smoke Artifact
+## Smoke Artifact
 
-Cluster smoke on `loss:xpf-userspace-fw0/fw1` was not run from this worktree.
-The local artifact for this PR is the rebuilt userspace XDP object plus the Go
-test matrix above. The Go tests add privileged XDP test-run coverage for:
+Cluster smoke was run from this worktree on
+`loss:xpf-userspace-fw0/fw1`.
+
+- Artifact root: `/tmp/pr1481-smoke-20260521-100909`
+- Deployed head: `8dd77a94ddbbf797469ca2a15e8104b213eefaf7`
+- Deploy note: `GOFLAGS=-buildvcs=false` was needed because this `/tmp`
+  worktree sits under a stray `/tmp/.git` that breaks Go VCS stamping. The
+  Makefile still supplied explicit version and commit `-ldflags`.
+- Runtime: `userspace-ha-validation.sh` reported `runtime mode: supported`
+  and armed userspace forwarding on `loss:xpf-userspace-fw0`.
+
+Baseline validation:
+
+| Cell | Avg Gbps | Peak Gbps | Retransmits | Result |
+| --- | ---: | ---: | ---: | --- |
+| IPv4 push | 23.303 | 23.424 | 2 | PASS |
+| IPv6 push | 23.070 | 23.184 | 2 | PASS |
+
+CoS-off v4/v6 push and reverse:
+
+| Cell | Avg Gbps | Peak Gbps | Retransmits | Result |
+| --- | ---: | ---: | ---: | --- |
+| v4 push | 23.392 | 23.476 | 1 | PASS |
+| v4 reverse | 23.069 | 23.189 | 69 | PASS |
+| v6 push | 20.953 | 21.523 | 1 | PASS |
+| v6 reverse | 22.309 | 22.533 | 0 | PASS |
+
+CoS-on bounded smoke after `apply-cos-config.sh --symmetric`, using the
+uncapped class on port `5211`:
+
+| Cell | Avg Gbps | Peak Gbps | Retransmits | Result |
+| --- | ---: | ---: | ---: | --- |
+| v4 push p5211 | 8.470 | 8.822 | 3,658 | PASS |
+| v4 reverse p5211 | 7.973 | 8.349 | 8,979 | PASS |
+| v6 push p5211 | 7.875 | 8.398 | 1,603 | PASS |
+| v6 reverse p5211 | 8.558 | 8.601 | 37,573 | PASS |
+
+The CoS-on run is a bounded dataplane smoke, not the full #1373 12-class
+fairness qualification gate. It proves the shim loads, arms, and carries
+v4/v6 push and reverse traffic with CoS enabled without collapse.
+
+The Go tests add privileged XDP test-run coverage for:
 
 - ctrl-disabled transit drops with `transit_drop`
 - ctrl-disabled local/control delivery
