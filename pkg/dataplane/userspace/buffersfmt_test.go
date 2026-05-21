@@ -300,6 +300,35 @@ func TestFormatSystemBuffersUsesHelperPublishedDynamicCapacities(t *testing.T) {
 	}
 }
 
+func TestFormatSystemBuffersUsesStatusFlowCacheCapacityFallback(t *testing.T) {
+	status := ProcessStatus{
+		FlowCacheCapacity: 20,
+		PerBinding: []BindingCountersSnapshot{
+			{WorkerID: 0, QueueID: 0, ActiveFlowCount: 9},
+			{WorkerID: 1, QueueID: 0, ActiveFlowCount: 3},
+		},
+	}
+
+	out := FormatSystemBuffers(status, false)
+	sections := strings.SplitN(out, systemBufferCountersHeading, 2)
+	utilSection := sections[0]
+	for _, want := range []string{
+		systemBufferLabelFlowCacheActiveFlows,
+		"aggregate",
+		"20",
+		"12",
+		"60.0% OK",
+	} {
+		if !strings.Contains(utilSection, want) {
+			t.Fatalf("FormatSystemBuffers utilization output missing %q:\n%s", want, out)
+		}
+	}
+	if len(sections) == 2 &&
+		strings.Contains(sections[1], systemBufferLabelFlowCacheActiveFlows) {
+		t.Fatalf("bounded flow-cache fallback remained in counters:\n%s", out)
+	}
+}
+
 func TestFormatSystemBuffersIncludesSYNCookieCounters(t *testing.T) {
 	status := ProcessStatus{
 		Bindings: []BindingStatus{

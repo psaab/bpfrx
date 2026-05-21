@@ -33,24 +33,34 @@ func TestEmitWorkerRuntime_DeadGaugeReflectsDeadFlag(t *testing.T) {
 		WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{
 			{
 				WorkerID: 0, CoSQueueLeaseAcquireV8Calls: 7,
-				CoSQueueLeaseAcquireV8GrantedBytes: 4096, Dead: false,
+				CoSQueueLeaseAcquireV8GrantedBytes: 4096,
+				SessionTableEntries:                17,
+				MaxSessions:                        100,
+				Dead:                               false,
 			},
 			{
 				WorkerID: 1, CoSQueueLeaseAcquireV8Calls: 11,
-				CoSQueueLeaseAcquireV8GrantedBytes: 0, Dead: true,
+				CoSQueueLeaseAcquireV8GrantedBytes: 0,
+				SessionTableEntries:                19,
+				MaxSessions:                        100,
+				Dead:                               true,
 			},
 			{
 				WorkerID: 2, CoSQueueLeaseAcquireV8Calls: 13,
-				CoSQueueLeaseAcquireV8GrantedBytes: 8192, Dead: false,
+				CoSQueueLeaseAcquireV8GrantedBytes: 8192,
+				SessionTableEntries:                23,
+				MaxSessions:                        100,
+				Dead:                               false,
 			},
 		},
 	}
 
 	got := collectFromEmitWorkerRuntime(t, c, status)
 
-	// Each worker emits 9 counters + 1 dead gauge + 1 last-60s gauge + 1 window-width gauge = 12 metrics. 3 workers = 36.
-	if len(got) != 3*12 {
-		t.Fatalf("emitWorkerRuntime: want 36 metrics for 3 workers (9 counters + 1 dead gauge + 1 last-60s gauge + 1 window-width gauge), got %d", len(got))
+	// Each worker emits 9 counters + 1 dead gauge + 1 last-60s gauge,
+	// 1 window-width gauge, and 2 session-table gauges = 14 metrics.
+	if len(got) != 3*14 {
+		t.Fatalf("emitWorkerRuntime: want 42 metrics for 3 workers, got %d", len(got))
 	}
 
 	// Gather just the dead-gauge entries, keyed by worker_id label.
@@ -113,6 +123,18 @@ func TestEmitWorkerRuntime_DeadGaugeReflectsDeadFlag(t *testing.T) {
 			t.Errorf("xpf_userspace_worker_cos_queue_lease_acquire_v8_granted_bytes_total{worker_id=%q} = %v, want %v", wid, got, want)
 		}
 	}
+	entriesByWorker := metricValuesByWorker(t, got, c.workerSessionTableEntries, false)
+	for wid, want := range map[string]float64{"0": 17, "1": 19, "2": 23} {
+		if got := entriesByWorker[wid]; got != want {
+			t.Errorf("xpf_userspace_worker_session_table_entries{worker_id=%q} = %v, want %v", wid, got, want)
+		}
+	}
+	capacityByWorker := metricValuesByWorker(t, got, c.workerSessionTableCapacity, false)
+	for wid, want := range map[string]float64{"0": 100, "1": 100, "2": 100} {
+		if got := capacityByWorker[wid]; got != want {
+			t.Errorf("xpf_userspace_worker_session_table_capacity{worker_id=%q} = %v, want %v", wid, got, want)
+		}
+	}
 }
 
 // All-healthy fixture: dead gauge must be 0 for every worker, never absent.
@@ -168,6 +190,8 @@ func newCollectorWithWorkerDescsOnly() *xpfCollector {
 		workerIdleLoops:                          mk("xpf_userspace_worker_idle_loops_total"),
 		workerCoSQueueLeaseAcquireV8Calls:        mk("xpf_userspace_worker_cos_queue_lease_acquire_v8_calls_total"),
 		workerCoSQueueLeaseAcquireV8GrantedBytes: mk("xpf_userspace_worker_cos_queue_lease_acquire_v8_granted_bytes_total"),
+		workerSessionTableEntries:                mk("xpf_userspace_worker_session_table_entries"),
+		workerSessionTableCapacity:               mk("xpf_userspace_worker_session_table_capacity"),
 		workerDead:                               mk("xpf_userspace_worker_dead"),
 	}
 }
@@ -210,6 +234,8 @@ func collectFromEmitWorkerRuntime(
 		c.workerIdleLoops:                          {},
 		c.workerCoSQueueLeaseAcquireV8Calls:        {},
 		c.workerCoSQueueLeaseAcquireV8GrantedBytes: {},
+		c.workerSessionTableEntries:                {},
+		c.workerSessionTableCapacity:               {},
 		c.workerDead:                               {},
 	}
 	for _, m := range got {
@@ -526,6 +552,87 @@ func TestEmitUserspaceSourceNATPoolMetrics(t *testing.T) {
 	assertCounterClose(t, got, c.userspaceSNATPoolAllocationsTotal, labels, 3)
 	assertCounterClose(t, got, c.userspaceSNATPoolReusesTotal, labels, 5)
 	assertCounterClose(t, got, c.userspaceSNATPoolExhaustionsTotal, labels, 7)
+}
+
+func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
+	c := &xpfCollector{
+		userspaceSessionTableEntries: prometheus.NewDesc(
+			"xpf_userspace_session_table_entries",
+			"session entries",
+			nil,
+			nil,
+		),
+		userspaceSessionTableCapacity: prometheus.NewDesc(
+			"xpf_userspace_session_table_capacity",
+			"session capacity",
+			nil,
+			nil,
+		),
+		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
+			"xpf_userspace_flow_cache_active_flows",
+			"flow-cache active flows",
+			nil,
+			nil,
+		),
+		userspaceFlowCacheCapacity: prometheus.NewDesc(
+			"xpf_userspace_flow_cache_capacity",
+			"flow-cache capacity",
+			nil,
+			nil,
+		),
+		bindingFlowCacheCapacity: prometheus.NewDesc(
+			"xpf_userspace_binding_flow_cache_capacity",
+			"binding flow-cache capacity",
+			[]string{"binding_slot", "queue_id", "worker_id", "iface"},
+			nil,
+		),
+	}
+	status := dpuserspace.ProcessStatus{
+		SessionTableEntries: 77,
+		MaxSessions:         100,
+		Bindings: []dpuserspace.BindingStatus{
+			{
+				Slot:              0,
+				QueueID:           1,
+				WorkerID:          2,
+				Interface:         "ge-0-0-1",
+				ActiveFlowCount:   9,
+				FlowCacheCapacity: 10,
+			},
+			{
+				Slot:              1,
+				QueueID:           1,
+				WorkerID:          3,
+				Interface:         "ge-0-0-2",
+				ActiveFlowCount:   3,
+				FlowCacheCapacity: 10,
+			},
+		},
+	}
+
+	ch := make(chan prometheus.Metric)
+	go func() {
+		c.emitUserspaceDynamicBufferMetrics(ch, status)
+		close(ch)
+	}()
+	var got []prometheus.Metric
+	for m := range ch {
+		got = append(got, m)
+	}
+	if len(got) != 6 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 6 metrics, got %d", len(got))
+	}
+
+	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
+	assertGaugeClose(t, got, c.userspaceSessionTableCapacity, nil, 100)
+	assertGaugeClose(t, got, c.userspaceFlowCacheActiveFlows, nil, 12)
+	assertGaugeClose(t, got, c.userspaceFlowCacheCapacity, nil, 20)
+	assertGaugeClose(t, got, c.bindingFlowCacheCapacity, map[string]string{
+		"binding_slot": "0",
+		"queue_id":     "1",
+		"worker_id":    "2",
+		"iface":        "ge-0-0-1",
+	}, 10)
 }
 
 func metricValuesByWorker(

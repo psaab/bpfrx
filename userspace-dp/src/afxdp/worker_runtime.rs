@@ -210,9 +210,11 @@ impl WorkerRuntimeAtomics {
             c.cos_queue_lease_acquire_v8_granted_bytes,
             Ordering::Relaxed,
         );
+        // Publish denominator before numerator so a torn multi-worker read can
+        // under-report briefly, but cannot show entries without capacity.
+        self.max_sessions.store(c.max_sessions, Ordering::Relaxed);
         self.session_table_entries
             .store(c.session_table_entries, Ordering::Relaxed);
-        self.max_sessions.store(c.max_sessions, Ordering::Relaxed);
 
         let base_at = self.window_base_at_ns.load(Ordering::Relaxed);
         if base_at == 0 {

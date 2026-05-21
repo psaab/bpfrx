@@ -12,6 +12,8 @@ import (
 	"testing"
 )
 
+const testFlowCacheCapacity = 4096
+
 // The wire JSON keys the Rust helper emits (serde rename strings
 // verified in userspace-dp/src/protocol.rs). A rename on the Rust
 // side without a matching Go update lands in the field as zero
@@ -901,7 +903,7 @@ func TestBindingFlowCacheCapacityRoundTrip(t *testing.T) {
 		Ifindex:           11,
 		QueueID:           2,
 		ActiveFlowCount:   53,
-		FlowCacheCapacity: 4096,
+		FlowCacheCapacity: testFlowCacheCapacity,
 	}
 	raw, err := json.Marshal(&in)
 	if err != nil {
@@ -928,7 +930,7 @@ func TestBindingFlowCacheCapacityRoundTrip(t *testing.T) {
 		Ifindex:           11,
 		QueueID:           2,
 		ActiveFlowCount:   53,
-		FlowCacheCapacity: 4096,
+		FlowCacheCapacity: testFlowCacheCapacity,
 	}
 	raw, err = json.Marshal(&snap)
 	if err != nil {

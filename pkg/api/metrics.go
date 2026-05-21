@@ -127,6 +127,12 @@ type xpfCollector struct {
 	workerIdleLoops                          *prometheus.Desc
 	workerCoSQueueLeaseAcquireV8Calls        *prometheus.Desc
 	workerCoSQueueLeaseAcquireV8GrantedBytes *prometheus.Desc
+	workerSessionTableEntries                *prometheus.Desc
+	workerSessionTableCapacity               *prometheus.Desc
+	userspaceSessionTableEntries             *prometheus.Desc
+	userspaceSessionTableCapacity            *prometheus.Desc
+	userspaceFlowCacheActiveFlows            *prometheus.Desc
+	userspaceFlowCacheCapacity               *prometheus.Desc
 	// #1379: daemon-side userspace event-stream transport counters.
 	userspaceEventStreamFramesTotal          *prometheus.Desc
 	userspaceEventStreamProducerFramesTotal  *prometheus.Desc
@@ -144,7 +150,8 @@ type xpfCollector struct {
 	// fairness-eval to compute Cstruct + observed_CoV per
 	// docs/fairness-regimes.md). Refreshed at the helper's ~65ms
 	// debug-state tick.
-	bindingActiveFlowCount *prometheus.Desc
+	bindingActiveFlowCount   *prometheus.Desc
+	bindingFlowCacheCapacity *prometheus.Desc
 	// #1241: per-binding AF_XDP TX completion service telemetry.
 	// These signals let fairness measurements distinguish scheduler/RSS
 	// skew from per-queue completion-ring service asymmetry.
@@ -553,6 +560,36 @@ func newCollector(srv *Server) *xpfCollector {
 			"Bytes granted by v8 CoS queue-lease acquire calls for this worker (#1240).",
 			[]string{"worker_id"}, nil,
 		),
+		workerSessionTableEntries: prometheus.NewDesc(
+			"xpf_userspace_worker_session_table_entries",
+			"Live session-table entries published by this userspace worker.",
+			[]string{"worker_id"}, nil,
+		),
+		workerSessionTableCapacity: prometheus.NewDesc(
+			"xpf_userspace_worker_session_table_capacity",
+			"Maximum session-table entries supported by this userspace worker.",
+			[]string{"worker_id"}, nil,
+		),
+		userspaceSessionTableEntries: prometheus.NewDesc(
+			"xpf_userspace_session_table_entries",
+			"Aggregate live userspace session-table entries across workers.",
+			nil, nil,
+		),
+		userspaceSessionTableCapacity: prometheus.NewDesc(
+			"xpf_userspace_session_table_capacity",
+			"Aggregate userspace session-table capacity across workers.",
+			nil, nil,
+		),
+		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
+			"xpf_userspace_flow_cache_active_flows",
+			"Aggregate active userspace flow-cache entries across bindings.",
+			nil, nil,
+		),
+		userspaceFlowCacheCapacity: prometheus.NewDesc(
+			"xpf_userspace_flow_cache_capacity",
+			"Aggregate userspace flow-cache capacity across bindings.",
+			nil, nil,
+		),
 		userspaceEventStreamFramesTotal: prometheus.NewDesc(
 			"xpf_userspace_event_stream_frames_total",
 			"Daemon-side userspace event-stream frames by direction.",
@@ -601,6 +638,11 @@ func newCollector(srv *Server) *xpfCollector {
 				"in the last ~650ms (10 epoch ticks × ~65ms debug-state tick; "+
 				"snapshot refreshed on each tick). Read by the fairness harness to "+
 				"compute the structural CoV ceiling per docs/fairness-regimes.md (#1219).",
+			[]string{"binding_slot", "queue_id", "worker_id", "iface"}, nil,
+		),
+		bindingFlowCacheCapacity: prometheus.NewDesc(
+			"xpf_userspace_binding_flow_cache_capacity",
+			"Flow-cache capacity published by the userspace helper for this binding.",
 			[]string{"binding_slot", "queue_id", "worker_id", "iface"}, nil,
 		),
 		bindingTXCompletions: prometheus.NewDesc(
@@ -817,6 +859,12 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.workerIdleLoops
 	ch <- c.workerCoSQueueLeaseAcquireV8Calls
 	ch <- c.workerCoSQueueLeaseAcquireV8GrantedBytes
+	ch <- c.workerSessionTableEntries
+	ch <- c.workerSessionTableCapacity
+	ch <- c.userspaceSessionTableEntries
+	ch <- c.userspaceSessionTableCapacity
+	ch <- c.userspaceFlowCacheActiveFlows
+	ch <- c.userspaceFlowCacheCapacity
 	ch <- c.userspaceEventStreamFramesTotal
 	ch <- c.userspaceEventStreamProducerFramesTotal
 	ch <- c.userspaceEventStreamDecodeErrorsTotal
@@ -826,6 +874,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceEventStreamUnknownDropsTotal
 	ch <- c.workerDead
 	ch <- c.bindingActiveFlowCount
+	ch <- c.bindingFlowCacheCapacity
 	ch <- c.bindingTXCompletions
 	ch <- c.bindingTXCompletionRingAvailable
 	ch <- c.bindingTXCompletionRingAvailableMax
@@ -892,6 +941,7 @@ func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp da
 	c.emitCoSDrainPhaseTelemetry(ch, status)
 	c.emitCoSEqualFlowEnforcement(ch, status)
 	c.emitWorkerRuntime(ch, status)
+	c.emitUserspaceDynamicBufferMetrics(ch, status)
 	c.emitUserspaceEventStream(ch, status)
 	c.emitBindingActiveFlowCount(ch, status)
 	c.emitBindingTXCompletionTelemetry(ch, status)
@@ -976,6 +1026,54 @@ func (c *xpfCollector) emitUserspaceSourceNATPoolMetrics(ch chan<- prometheus.Me
 			prometheus.CounterValue,
 			float64(pool.ExhaustionTotal),
 			labels...,
+		)
+	}
+}
+
+func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	if status.MaxSessions > 0 {
+		ch <- prometheus.MustNewConstMetric(
+			c.userspaceSessionTableEntries,
+			prometheus.GaugeValue,
+			float64(status.SessionTableEntries),
+		)
+		ch <- prometheus.MustNewConstMetric(
+			c.userspaceSessionTableCapacity,
+			prometheus.GaugeValue,
+			float64(status.MaxSessions),
+		)
+	}
+
+	var activeFlows, flowCapacity uint64
+	for _, b := range status.Bindings {
+		activeFlows += uint64(b.ActiveFlowCount)
+		flowCapacity += uint64(b.FlowCacheCapacity)
+		if b.FlowCacheCapacity == 0 {
+			continue
+		}
+		ch <- prometheus.MustNewConstMetric(
+			c.bindingFlowCacheCapacity,
+			prometheus.GaugeValue,
+			float64(b.FlowCacheCapacity),
+			strconv.FormatUint(uint64(b.Slot), 10),
+			strconv.FormatUint(uint64(b.QueueID), 10),
+			strconv.FormatUint(uint64(b.WorkerID), 10),
+			b.Interface,
+		)
+	}
+	if flowCapacity == 0 {
+		flowCapacity = status.FlowCacheCapacity
+	}
+	if flowCapacity > 0 {
+		ch <- prometheus.MustNewConstMetric(
+			c.userspaceFlowCacheActiveFlows,
+			prometheus.GaugeValue,
+			float64(activeFlows),
+		)
+		ch <- prometheus.MustNewConstMetric(
+			c.userspaceFlowCacheCapacity,
+			prometheus.GaugeValue,
+			float64(flowCapacity),
 		)
 	}
 }
@@ -1324,6 +1422,10 @@ func (c *xpfCollector) emitWorkerRuntime(ch chan<- prometheus.Metric, status dpu
 			prometheus.CounterValue, float64(w.CoSQueueLeaseAcquireV8Calls), label)
 		ch <- prometheus.MustNewConstMetric(c.workerCoSQueueLeaseAcquireV8GrantedBytes,
 			prometheus.CounterValue, float64(w.CoSQueueLeaseAcquireV8GrantedBytes), label)
+		ch <- prometheus.MustNewConstMetric(c.workerSessionTableEntries,
+			prometheus.GaugeValue, float64(w.SessionTableEntries), label)
+		ch <- prometheus.MustNewConstMetric(c.workerSessionTableCapacity,
+			prometheus.GaugeValue, float64(w.MaxSessions), label)
 		var deadValue float64
 		if w.Dead {
 			deadValue = 1
