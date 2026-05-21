@@ -19,20 +19,6 @@ const (
 	retirementBoundaryDocsForCanary = "../../docs/pr/1373-retire-ebpf-dataplane/README.md"
 )
 
-var operatorRuntimeBoundaryRoots = []string{
-	"../../cmd/cli",
-	"../../cmd/xpfd",
-	"../api",
-	"../cli",
-	"../cluster",
-	"../conntrack",
-	"../daemon",
-	"../fwdstatus",
-	"../grpcapi",
-	"../logging",
-	"../monitoriface",
-}
-
 var legacyDataplaneImportAllowlist = map[string]string{
 	"cmd/xpfd/main.go":                         "backend selection, cleanup, and backend registration",
 	"pkg/api/handlers.go":                      "REST handlers still receive the legacy dataplane bridge",
@@ -80,7 +66,7 @@ func TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports(t *testing.T) {
 
 	found := map[string]bool{}
 	var unexpected []string
-	for _, path := range productionGoFilesUnder(t, operatorRuntimeBoundaryRoots) {
+	for _, path := range productionGoFilesUnder(t, operatorRuntimeBoundaryRoots(t)) {
 		for _, imp := range importPaths(t, path) {
 			if imp != rootDataplaneImportForCanary {
 				continue
@@ -104,7 +90,7 @@ func TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports(t *testing.T) {
 		sort.Strings(unexpected)
 		sort.Strings(stale)
 		t.Fatalf(
-			"legacy pkg/dataplane import allowlist drift\nunexpected imports: %v\nstale allowlist entries: %v\nupdate the #1451 runtime-boundary docs with any intentional change",
+			"legacy pkg/dataplane import allowlist drift\nunexpected imports: %v\nstale allowlist entries: %v\nupdate legacyDataplaneImportAllowlist and the #1451 docs table with any intentional change",
 			unexpected,
 			stale,
 		)
@@ -115,7 +101,7 @@ func TestOperatorPackagesDoNotImportBPFArtifactsDirectly(t *testing.T) {
 	t.Parallel()
 
 	var violations []string
-	for _, path := range productionGoFilesUnder(t, operatorRuntimeBoundaryRoots) {
+	for _, path := range productionGoFilesUnder(t, operatorRuntimeBoundaryRoots(t)) {
 		rel := repoRelativePath(t, path)
 		for _, imp := range importPaths(t, path) {
 			if imp == ciliumEBPFImportForCanary || strings.HasPrefix(imp, ciliumEBPFImportForCanary+"/") {
@@ -140,15 +126,11 @@ func TestDaemonRuntimeEntryPointUsesRuntimeDataPlane(t *testing.T) {
 
 	assertDaemonDPFieldIsRuntimeDataPlane(t)
 
-	data, err := os.ReadFile(filepath.Join("..", "daemon", "daemon_run.go"))
-	if err != nil {
-		t.Fatalf("read daemon_run.go: %v", err)
-	}
-	text := string(data)
-	if strings.Contains(text, "dataplane.NewDataPlane(") {
+	daemonRun := filepath.Join("..", "daemon", "daemon_run.go")
+	if hasDaemonRuntimeConstructorCall(t, daemonRun, "NewDataPlane") {
 		t.Fatal("daemon runtime startup must call NewRuntimeDataPlane, not NewDataPlane")
 	}
-	if !strings.Contains(text, "dataplane.NewRuntimeDataPlane(") {
+	if !hasDaemonRuntimeConstructorCall(t, daemonRun, "NewRuntimeDataPlane") {
 		t.Fatal("daemon runtime startup no longer calls dataplane.NewRuntimeDataPlane")
 	}
 }
@@ -172,6 +154,36 @@ func TestRetirementBoundaryDocsMentionLegacyImportAllowlist(t *testing.T) {
 	if len(missing) > 0 {
 		t.Fatalf("retirement docs do not mention allowlisted legacy imports: %v", missing)
 	}
+}
+
+func operatorRuntimeBoundaryRoots(t *testing.T) []string {
+	t.Helper()
+
+	var roots []string
+	for _, pattern := range []string{
+		filepath.Join(repoRootForBoundaryCanary, "cmd", "*"),
+		filepath.Join(repoRootForBoundaryCanary, "pkg", "*"),
+	} {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatalf("glob %s: %v", pattern, err)
+		}
+		for _, path := range matches {
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("stat %s: %v", path, err)
+			}
+			if !info.IsDir() {
+				continue
+			}
+			if repoRelativePath(t, path) == "pkg/dataplane" {
+				continue
+			}
+			roots = append(roots, path)
+		}
+	}
+	sort.Strings(roots)
+	return roots
 }
 
 func productionGoFilesUnder(t *testing.T, roots []string) []string {
@@ -235,6 +247,31 @@ func repoRelativePath(t *testing.T, path string) string {
 		t.Fatalf("rel path for %s: %v", path, err)
 	}
 	return filepath.ToSlash(rel)
+}
+
+func hasDaemonRuntimeConstructorCall(t *testing.T, path, name string) bool {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+
+	want := "dataplane." + name
+	var found bool
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if canaryExprString(call.Fun) == want {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func assertDaemonDPFieldIsRuntimeDataPlane(t *testing.T) {

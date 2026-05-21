@@ -30,8 +30,8 @@ forwarding-source removal gate by itself.
 ## #1451 Runtime Boundary Canaries
 
 `pkg/dataplane/retirement_boundary_canary_test.go` pins the current retirement
-boundary for #1451. It is intentionally narrow and deterministic: it parses
-production Go files in the operator/runtime packages and fails if a new direct
+boundary for #1451. It discovers every top-level `cmd/*` and `pkg/*`
+production Go package except `pkg/dataplane` itself, then fails if a new direct
 `github.com/psaab/xpf/pkg/dataplane` import appears outside the allowlist below,
 or if a listed bridge disappears without shrinking this documentation.
 
@@ -39,7 +39,9 @@ The same canary also keeps operator packages away from direct BPF artifacts:
 they may not import `github.com/cilium/ebpf`, and the DPDK backend import stays
 limited to `cmd/xpfd/main.go` for backend registration. Daemon startup must keep
 owning `dataplane.RuntimeDataPlane` and must call
-`dataplane.NewRuntimeDataPlane`, not `dataplane.NewDataPlane`.
+`dataplane.NewRuntimeDataPlane`, not `dataplane.NewDataPlane`. This is a
+production-code canary; `_test.go` files may still import lower-level helpers
+when they need backend fixtures for regression coverage.
 
 ### Allowlisted Legacy Bridges
 
