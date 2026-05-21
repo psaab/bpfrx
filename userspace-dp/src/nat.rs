@@ -447,6 +447,9 @@ impl PortAllocator {
             if persistent_key.is_some()
                 && live.persistent_by_source.len() >= self.shared.max_tracked_flows
             {
+                // Lease-table pressure is also budgeted. A full persistent
+                // table gets one global PRESSURE_GC_BUDGET pass before this
+                // address attempt is treated as unavailable.
                 self.gc_expired_locked(&mut live, now_ns, PRESSURE_GC_BUDGET);
                 if live.persistent_by_source.len() >= self.shared.max_tracked_flows {
                     continue;
@@ -456,6 +459,11 @@ impl PortAllocator {
             let mut translated =
                 self.claim_free_port_locked(&mut live, abs, translated_ip, flow, persistent_key);
             if translated.is_none() {
+                // Pressure handling is budgeted, not strict O(1). A
+                // non-address-persistent full family can visit each
+                // family-compatible address and run at most
+                // PRESSURE_GC_BUDGET expiry checks for that selected
+                // address before declaring exhaustion.
                 self.gc_expired_for_addr_locked(&mut live, abs, now_ns, PRESSURE_GC_BUDGET);
                 translated = self.claim_free_port_locked(
                     &mut live,
