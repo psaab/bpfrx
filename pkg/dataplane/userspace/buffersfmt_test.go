@@ -127,9 +127,10 @@ func TestFormatSystemBuffersDocumentsMissingStatusFields(t *testing.T) {
 	}, false)
 
 	for _, want := range []string{
-		"unavailable: helper status does not include bounded AF_XDP capacity gauges",
+		"unavailable: helper status does not include bounded userspace capacity gauges",
 		"per_binding[].umem_total_frames",
 		"per_binding[].tx_ring_capacity",
+		"session_table_entries/max_sessions",
 		"bindings[] mirrors",
 	} {
 		if !strings.Contains(out, want) {
@@ -244,6 +245,87 @@ func TestFormatSystemBuffersKeepsDynamicCountsOutOfUtilizationTable(t *testing.T
 	}
 	if strings.Contains(counterSection, "%") {
 		t.Fatalf("status counters rendered a fill percentage without a denominator:\n%s", out)
+	}
+}
+
+func TestFormatSystemBuffersUsesHelperPublishedDynamicCapacities(t *testing.T) {
+	status := ProcessStatus{
+		SessionTableEntries:   90,
+		MaxSessions:           100,
+		NeighborEntries:       42,
+		NeighborCacheCapacity: 50,
+		PerBinding: []BindingCountersSnapshot{
+			{WorkerID: 0, QueueID: 0, ActiveFlowCount: 9, FlowCacheCapacity: 10},
+			{WorkerID: 1, QueueID: 0, ActiveFlowCount: 1, FlowCacheCapacity: 10},
+		},
+	}
+
+	out := FormatSystemBuffers(status, false)
+	sections := strings.SplitN(out, systemBufferCountersHeading, 2)
+	utilSection := sections[0]
+	for _, want := range []string{
+		systemBufferLabelSessionTableEntries,
+		systemBufferLabelNeighborCacheEntries,
+		systemBufferLabelFlowCacheActiveFlows,
+		"90.0% CRITICAL",
+		"84.0% WARNING",
+		"50.0% OK",
+	} {
+		if !strings.Contains(utilSection, want) {
+			t.Fatalf("FormatSystemBuffers utilization output missing %q:\n%s", want, out)
+		}
+	}
+	if len(sections) == 2 {
+		counterSection := sections[1]
+		for _, bounded := range []string{
+			systemBufferLabelSessionTableEntries,
+			systemBufferLabelNeighborCacheEntries,
+			systemBufferLabelFlowCacheActiveFlows,
+		} {
+			if strings.Contains(counterSection, bounded) {
+				t.Fatalf("%s remained in counters after helper capacity was published:\n%s", bounded, out)
+			}
+		}
+	}
+
+	detail := FormatSystemBuffers(status, true)
+	if !strings.Contains(detail, "worker 0/queue 0") ||
+		!strings.Contains(detail, "9") ||
+		!strings.Contains(detail, "90.0% CRITICAL") {
+		t.Fatalf("detail output missing per-binding flow-cache utilization:\n%s", detail)
+	}
+	if detailSections := strings.SplitN(detail, systemBufferCountersHeading, 2); len(detailSections) == 2 &&
+		strings.Contains(detailSections[1], systemBufferLabelFlowCacheActiveFlows) {
+		t.Fatalf("detail output repeated bounded flow-cache count as counter:\n%s", detail)
+	}
+}
+
+func TestFormatSystemBuffersUsesStatusFlowCacheCapacityFallback(t *testing.T) {
+	status := ProcessStatus{
+		FlowCacheCapacity: 20,
+		PerBinding: []BindingCountersSnapshot{
+			{WorkerID: 0, QueueID: 0, ActiveFlowCount: 9},
+			{WorkerID: 1, QueueID: 0, ActiveFlowCount: 3},
+		},
+	}
+
+	out := FormatSystemBuffers(status, false)
+	sections := strings.SplitN(out, systemBufferCountersHeading, 2)
+	utilSection := sections[0]
+	for _, want := range []string{
+		systemBufferLabelFlowCacheActiveFlows,
+		"aggregate",
+		"20",
+		"12",
+		"60.0% OK",
+	} {
+		if !strings.Contains(utilSection, want) {
+			t.Fatalf("FormatSystemBuffers utilization output missing %q:\n%s", want, out)
+		}
+	}
+	if len(sections) == 2 &&
+		strings.Contains(sections[1], systemBufferLabelFlowCacheActiveFlows) {
+		t.Fatalf("bounded flow-cache fallback remained in counters:\n%s", out)
 	}
 }
 

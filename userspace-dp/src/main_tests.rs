@@ -731,6 +731,7 @@ fn binding_counters_snapshot_projects_ring_pressure_fields() {
         // either assignment surfaces here.
         flow_cache_collision_evictions: 53,
         active_flow_count: 71,
+        flow_cache_capacity: 4096,
         v_min_throttle_hard_cap_overrides: 59,
         v_min_throttles: 67,
         ..Default::default()
@@ -758,6 +759,7 @@ fn binding_counters_snapshot_projects_ring_pressure_fields() {
     assert_eq!(snap.flow_cache_collision_evictions, 53);
     // #1219: pin active_flow_count projection through the From impl.
     assert_eq!(snap.active_flow_count, 71);
+    assert_eq!(snap.flow_cache_capacity, 4096);
     assert_eq!(snap.v_min_throttle_hard_cap_overrides, 59);
     assert_eq!(snap.v_min_throttles, 67);
 }
@@ -819,6 +821,7 @@ fn binding_counters_snapshot_serializes_with_expected_wire_keys() {
         // skip_serializing_if and serializes even when 0; the non-zero
         // value here is chosen to make the test intent obvious.
         active_flow_count: 31,
+        flow_cache_capacity: 4096,
         v_min_throttle_hard_cap_overrides: 28,
         v_min_throttles: 29,
     };
@@ -879,6 +882,8 @@ fn binding_counters_snapshot_serializes_with_expected_wire_keys() {
         // always serialized (no skip_serializing_if); the non-zero
         // fixture value makes the assertion intent clear.
         "active_flow_count",
+        // #1453/#1454: Rust-owned flow-cache denominator wire key.
+        "flow_cache_capacity",
         // #941 Work item D / #943: V_min throttle counter wire keys.
         // Absence breaks the binding-counter snapshot consumer that
         // gates fairness diagnostics on these fields.
@@ -1420,6 +1425,7 @@ fn tx_latency_hist_serialization_roundtrip() {
         // #918: per-set LRU collision-eviction counter.
         flow_cache_collision_evictions: 17,
         active_flow_count: 0,
+        flow_cache_capacity: 0,
         v_min_throttle_hard_cap_overrides: 18,
         v_min_throttles: 19,
     };

@@ -58,11 +58,11 @@ debugging entry points, use [`userspace-debug-map.md`](userspace-debug-map.md).
 helper status path when the active dataplane implements
 `Status() (userspace.ProcessStatus, error)`; they do not depend on BPF map
 occupancy for userspace mode. The rendered rows are aggregate AF_XDP UMEM
-frame and TX-ring utilization, with `WARNING` at >=80% and `CRITICAL` at
->=90%, plus the same dynamic userspace status counters. `show system buffers
-detail` adds per-binding rows after the aggregates so a hot binding is visible
-even when total aggregate usage is low. Both userspace buffer commands preserve
-the legacy `Active sessions` footer.
+frame, TX-ring, session-table, and flow-cache utilization, with `WARNING` at
+>=80% and `CRITICAL` at >=90%, plus the same dynamic userspace status
+counters. `show system buffers detail` adds per-binding rows after the
+aggregates so a hot binding is visible even when total aggregate usage is low.
+Both userspace buffer commands preserve the legacy `Active sessions` footer.
 
 The bounded source fields are
 `ProcessStatus.PerBinding[].umem_total_frames`,
@@ -73,12 +73,12 @@ CLI reports the missing status fields rather than showing BPF-map
 metrics for userspace buffers.
 
 CoS queued-byte rows use `ProcessStatus.CoSInterfaces[].Queues[]`
-`buffer_bytes` and `queued_bytes`. Neighbor-cache entries, flow-cache active
-flows, flow-cache collision evictions, and worker queue pressure stay in the
-status-counter section because current helper status does not publish bounded
-session-table, flow-cache, or neighbor-cache capacity denominators. Future fill
-percentage rows for those structures require explicit helper fields; Go must
-not infer them from Rust private constants.
+`buffer_bytes` and `queued_bytes`. Session-table rows use
+`session_table_entries/max_sessions`, and flow-cache rows use helper-published
+`flow_cache_capacity`. Neighbor-cache entries, flow-cache collision evictions,
+and worker queue pressure stay in the status-counter section unless Rust owns
+and publishes a bounded capacity denominator. Go must not infer missing
+denominators from Rust private constants.
 
 ### 1. XDP Shim (`userspace-xdp/src/lib.rs`)
 
@@ -603,8 +603,9 @@ is [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
   broader non-PBR filter-log call sites, and richer identity mapping.
 - `show system buffers` BPF-map display retirement: #1380 is closed for the
   current helper schema. Userspace mode uses helper status, preserves the
-  active-session footer, and reports dynamic session/flow/neighbor values as
-  counters until true capacity fields are added.
+  active-session footer, renders session/flow utilization from Rust-owned
+  helper denominators, and keeps neighbor values as counters until Rust owns a
+  bounded neighbor-cache capacity.
 
 **Handled outside the AF_XDP forwarding fast path:**
 - ARP, NDP, local management traffic, and other kernel-owned packets are passed

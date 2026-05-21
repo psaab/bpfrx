@@ -18,6 +18,8 @@ fn snapshot_roundtrip() {
         idle_loops: 1_234,
         cos_queue_lease_acquire_v8_calls: 55,
         cos_queue_lease_acquire_v8_granted_bytes: 123_456,
+        session_table_entries: 77,
+        max_sessions: 100,
     };
     atomics.publish(&c, 0);
     let s = atomics.snapshot();
@@ -36,6 +38,8 @@ fn snapshot_roundtrip() {
         s.cos_queue_lease_acquire_v8_granted_bytes,
         c.cos_queue_lease_acquire_v8_granted_bytes
     );
+    assert_eq!(s.session_table_entries, c.session_table_entries);
+    assert_eq!(s.max_sessions, c.max_sessions);
 }
 
 #[test]

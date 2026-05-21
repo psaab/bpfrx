@@ -1254,6 +1254,8 @@ pub(crate) fn worker_loop(
                     wr_counters.thread_cpu_ns = sampled_cpu_ns;
                 }
                 refresh_worker_cos_queue_lease_runtime_counters(&mut wr_counters, &bindings);
+                wr_counters.session_table_entries = sessions.len() as u64;
+                wr_counters.max_sessions = sessions.max_sessions() as u64;
                 runtime_atomics.publish(&wr_counters, loop_now_ns);
                 wr_last_publish_ns = loop_now_ns;
             }
@@ -2406,6 +2408,8 @@ pub(crate) struct BindingLiveSnapshot {
     /// #1219: snapshot count of distinct active flows on this binding's
     /// flow_cache (refreshed at the ~65ms debug-state tick).
     pub(crate) active_flow_count: u32,
+    /// Rust-owned per-binding flow-cache capacity.
+    pub(crate) flow_cache_capacity: u32,
     /// #941 Work item D: count of V_min hard-cap activations on this
     /// binding (per `update_binding_debug_state` flush of each queue's
     /// scratch counter). Acceptance gate: under normal load, the

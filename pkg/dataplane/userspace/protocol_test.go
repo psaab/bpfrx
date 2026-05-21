@@ -12,6 +12,8 @@ import (
 	"testing"
 )
 
+const testFlowCacheCapacity = 4096
+
 // The wire JSON keys the Rust helper emits (serde rename strings
 // verified in userspace-dp/src/protocol.rs). A rename on the Rust
 // side without a matching Go update lands in the field as zero
@@ -894,6 +896,61 @@ func TestBindingCountersSnapshotVMinThrottleRoundTrip(t *testing.T) {
 	}
 }
 
+func TestBindingFlowCacheCapacityRoundTrip(t *testing.T) {
+	in := BindingStatus{
+		WorkerID:          3,
+		Slot:              7,
+		Ifindex:           11,
+		QueueID:           2,
+		ActiveFlowCount:   53,
+		FlowCacheCapacity: testFlowCacheCapacity,
+	}
+	raw, err := json.Marshal(&in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	if _, ok := obj["flow_cache_capacity"]; !ok {
+		t.Fatalf("flow_cache_capacity missing from BindingStatus JSON: %s", string(raw))
+	}
+
+	var back BindingStatus
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal BindingStatus: %v", err)
+	}
+	if back.FlowCacheCapacity != in.FlowCacheCapacity {
+		t.Fatalf("FlowCacheCapacity: got %d, want %d", back.FlowCacheCapacity, in.FlowCacheCapacity)
+	}
+
+	snap := BindingCountersSnapshot{
+		WorkerID:          3,
+		Ifindex:           11,
+		QueueID:           2,
+		ActiveFlowCount:   53,
+		FlowCacheCapacity: testFlowCacheCapacity,
+	}
+	raw, err = json.Marshal(&snap)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal snapshot obj: %v", err)
+	}
+	if _, ok := obj["flow_cache_capacity"]; !ok {
+		t.Fatalf("flow_cache_capacity missing from BindingCountersSnapshot JSON: %s", string(raw))
+	}
+	var snapBack BindingCountersSnapshot
+	if err := json.Unmarshal(raw, &snapBack); err != nil {
+		t.Fatalf("unmarshal BindingCountersSnapshot: %v", err)
+	}
+	if !reflect.DeepEqual(snapBack, snap) {
+		t.Fatalf("snapshot round-trip mismatch: got %+v, want %+v", snapBack, snap)
+	}
+}
+
 func TestProcessStatusFlowWorkerMapRoundTrip(t *testing.T) {
 	cosQueueID := uint8(4)
 	in := ProcessStatus{
@@ -977,6 +1034,48 @@ func TestProcessStatusFlowWorkerMapRoundTrip(t *testing.T) {
 	}
 	if !back.CoSActiveFlowCountsTruncated {
 		t.Fatal("CoSActiveFlowCountsTruncated must round-trip true")
+	}
+}
+
+func TestProcessStatusBufferCapacityRoundTrip(t *testing.T) {
+	in := ProcessStatus{
+		SessionTableEntries:   77,
+		MaxSessions:           100,
+		FlowCacheCapacity:     4096,
+		NeighborEntries:       9,
+		NeighborCacheCapacity: 64,
+		WorkerRuntime: []WorkerRuntimeStatus{{
+			WorkerID:            2,
+			SessionTableEntries: 77,
+			MaxSessions:         100,
+		}},
+	}
+	raw, err := json.Marshal(&in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	for _, key := range []string{
+		"session_table_entries",
+		"max_sessions",
+		"flow_cache_capacity",
+		"neighbor_cache_capacity",
+		"worker_runtime",
+	} {
+		if _, ok := obj[key]; !ok {
+			t.Fatalf("wire key %q missing from ProcessStatus JSON: %s", key, string(raw))
+		}
+	}
+
+	var back ProcessStatus
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal ProcessStatus: %v", err)
+	}
+	if !reflect.DeepEqual(back, in) {
+		t.Fatalf("round-trip mismatch: got %+v, want %+v", back, in)
 	}
 }
 

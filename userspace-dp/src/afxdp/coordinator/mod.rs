@@ -1200,6 +1200,7 @@ impl Coordinator {
                 // #1219: bridge active_flow_count from BindingLiveSnapshot
                 // into BindingStatus so it reaches the wire-visible status.
                 binding.active_flow_count = snap.active_flow_count;
+                binding.flow_cache_capacity = snap.flow_cache_capacity;
                 // #941 Work item D / #943: bridge V_min counters from
                 // BindingLiveSnapshot through to BindingStatus so the
                 // wire surface (BindingCountersSnapshot) sees them.
@@ -1375,6 +1376,8 @@ impl Coordinator {
                 binding.flow_cache_misses = 0;
                 binding.flow_cache_evictions = 0;
                 binding.flow_cache_collision_evictions = 0;
+                binding.active_flow_count = 0;
+                binding.flow_cache_capacity = 0;
                 binding.v_min_throttle_hard_cap_overrides = 0;
                 binding.v_min_throttles = 0;
                 binding.session_hits = 0;

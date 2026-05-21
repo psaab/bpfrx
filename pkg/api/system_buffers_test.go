@@ -123,6 +123,57 @@ func TestSystemBuffersHandlerUsesUserspaceStatusRows(t *testing.T) {
 	}
 }
 
+func TestSystemBuffersHandlerUsesHelperCapacityForDynamicRows(t *testing.T) {
+	dp := &systemBuffersAPIUserspaceDP{
+		Manager: dataplane.New(),
+		status: dpuserspace.ProcessStatus{
+			SessionTableEntries:   9,
+			MaxSessions:           10,
+			NeighborEntries:       8,
+			NeighborCacheCapacity: 10,
+			PerBinding: []dpuserspace.BindingCountersSnapshot{
+				{WorkerID: 0, QueueID: 1, ActiveFlowCount: 7, FlowCacheCapacity: 10},
+			},
+		},
+	}
+	s := &Server{dp: dp}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/system/buffers", nil)
+	s.systemBuffersHandler(rr, req)
+
+	if rr.Code != 200 {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		Success bool         `json:"success"`
+		Data    []BufferInfo `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	rows := make(map[string]BufferInfo, len(resp.Data))
+	for _, row := range resp.Data {
+		rows[row.Name] = row
+	}
+	session := rows["Session table entries"]
+	if session.Type != "Userspace" || session.MaxEntries != 10 ||
+		session.UsedCount != 9 || session.Status != "CRITICAL" {
+		t.Fatalf("session capacity row = %+v, want 9/10 CRITICAL", session)
+	}
+	neighbor := rows["Neighbor cache entries"]
+	if neighbor.Type != "Userspace" || neighbor.MaxEntries != 10 ||
+		neighbor.UsedCount != 8 || neighbor.Status != "WARNING" {
+		t.Fatalf("neighbor capacity row = %+v, want 8/10 WARNING", neighbor)
+	}
+	flows := rows["Flow cache active flows"]
+	if flows.Type != "Userspace" || flows.MaxEntries != 10 ||
+		flows.UsedCount != 7 || flows.Status != "OK" {
+		t.Fatalf("flow-cache capacity row = %+v, want 7/10 OK", flows)
+	}
+}
+
 func TestSystemBuffersHandlerDoesNotFallbackToMapsOnUserspaceStatusError(t *testing.T) {
 	dp := &systemBuffersAPIUserspaceDP{
 		Manager:   dataplane.New(),

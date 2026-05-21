@@ -281,6 +281,9 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// Prometheus to compute `{a_i}` for the structural CoV gate
     /// per `docs/fairness-regimes.md`.
     pub(super) active_flow_count: AtomicU32,
+    /// Per-binding flow-cache capacity. The value is Rust-owned and
+    /// published so Go never has to duplicate FLOW_CACHE_SIZE.
+    pub(super) flow_cache_capacity: AtomicU32,
     /// #1249: bounded active flow-cache rows published by the owning
     /// worker on the same debug cadence as `active_flow_count`. Stored
     /// as an owned ArcSwap snapshot so the control thread can aggregate
@@ -602,6 +605,7 @@ impl BindingLiveState {
             flow_cache_evictions: AtomicU64::new(0),
             flow_cache_collision_evictions: AtomicU64::new(0),
             active_flow_count: AtomicU32::new(0),
+            flow_cache_capacity: AtomicU32::new(super::flow_cache::flow_cache_capacity() as u32),
             flow_worker_map: ArcSwap::from_pointee(FlowWorkerMapSnapshot::default()),
             cos_active_flow_counts: ArcSwap::from_pointee(Vec::new()),
             v_min_throttle_hard_cap_overrides: AtomicU64::new(0),
@@ -918,6 +922,7 @@ impl BindingLiveState {
                 .flow_cache_collision_evictions
                 .load(Ordering::Relaxed),
             active_flow_count: self.active_flow_count.load(Ordering::Relaxed),
+            flow_cache_capacity: self.flow_cache_capacity.load(Ordering::Relaxed),
             v_min_throttle_hard_cap_overrides: self
                 .v_min_throttle_hard_cap_overrides
                 .load(Ordering::Relaxed),

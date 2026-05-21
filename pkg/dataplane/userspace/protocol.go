@@ -470,6 +470,10 @@ type ProcessStatus struct {
 	LastSnapshotAt                   time.Time             `json:"last_snapshot_at,omitempty"`
 	InterfaceAddresses               int                   `json:"interface_addresses,omitempty"`
 	NeighborEntries                  int                   `json:"neighbor_entries,omitempty"`
+	SessionTableEntries              uint64                `json:"session_table_entries,omitempty"`
+	MaxSessions                      uint64                `json:"max_sessions,omitempty"`
+	FlowCacheCapacity                uint64                `json:"flow_cache_capacity,omitempty"`
+	NeighborCacheCapacity            uint64                `json:"neighbor_cache_capacity,omitempty"`
 	NeighborGeneration               uint64                `json:"neighbor_generation,omitempty"`
 	RouteEntries                     int                   `json:"route_entries,omitempty"`
 	WorkerHeartbeats                 []time.Time           `json:"worker_heartbeats,omitempty"`
@@ -683,6 +687,8 @@ type WorkerRuntimeStatus struct {
 	// TX throughput to diagnose token-acquisition imbalance.
 	CoSQueueLeaseAcquireV8Calls        uint64 `json:"cos_queue_lease_acquire_v8_calls,omitempty"`
 	CoSQueueLeaseAcquireV8GrantedBytes uint64 `json:"cos_queue_lease_acquire_v8_granted_bytes,omitempty"`
+	SessionTableEntries                uint64 `json:"session_table_entries,omitempty"`
+	MaxSessions                        uint64 `json:"max_sessions,omitempty"`
 	// #925 Phase 1+2 (catch+report+observe): Dead == true means the
 	// worker_loop panicked and the supervisor caught it. Set-only
 	// today — cleared only by daemon restart. Phase 2 surfaces this
@@ -850,6 +856,9 @@ type BindingStatus struct {
 	// Prometheus metric to compute {a_i} for the structural CoV gate
 	// per docs/fairness-regimes.md.
 	ActiveFlowCount uint32 `json:"active_flow_count,omitempty"`
+	// FlowCacheCapacity is Rust-owned and helper-published; Go must not
+	// duplicate the helper's private FLOW_CACHE_SIZE constant.
+	FlowCacheCapacity uint32 `json:"flow_cache_capacity,omitempty"`
 	// #941 Work item D / #943: V_min throttle counters. Hard-cap is
 	// the escape-hatch firing when fairness brake (regular throttle)
 	// has thrown V_MIN_CONSECUTIVE_SKIP_HARD_CAP back-to-back times.
@@ -1057,6 +1066,8 @@ type BindingCountersSnapshot struct {
 	// #1219: distinct active flow count snapshot for fairness harness.
 	// See BindingStatus.ActiveFlowCount.
 	ActiveFlowCount uint32 `json:"active_flow_count,omitempty"`
+	// FlowCacheCapacity mirrors BindingStatus for fast-poll consumers.
+	FlowCacheCapacity uint32 `json:"flow_cache_capacity,omitempty"`
 	// #941 Work item D / #943: V_min throttle counters. The lean
 	// per_binding view is what fast-poll consumers (mouse-latency
 	// orchestrator, MQFQ diagnostics) read; without these here, V_min

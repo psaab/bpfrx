@@ -81,7 +81,7 @@ These are not "missing", but they are not pure userspace forwarding either:
 | IPsec / XFRM handling | Userspace detects and punts to kernel/slow-path as needed |
 | DataPlane control-plane contract | Userspace manager no longer embeds the legacy `dataplane.DataPlane`; a userspace `LegacyDataPlaneAdapter` owns old-interface compatibility while callers migrate. Operator metadata reads in API/gRPC/CLI/daemon now use `LastApplyResult()` instead of `LastCompileResult()`, with a canary preventing those surfaces from regressing to compile-result metadata. GC and HA session sync now use `SessionStore`/`Telemetry`. The manager still holds a named eBPF shim manager for XDP/map bootstrap state, and API/gRPC/CLI session/counter readers plus daemon control paths still need to move fully to domain interfaces; tracked by #1381 |
 | Dataplane event logging | Session open/close/update are emitted by userspace. Policy-deny, screen-drop, logged routing-instance filter hits, non-PBR input filter logs, output filter logs, cached output-filter hits, and lo0 filter logs now enqueue RT_FLOW frames through the non-blocking Rust event-stream producer with existing per-event rate-limit/loss accounting. Go decode/status handling feeds raw userspace RT_FLOW frames through the same `EventReader.ProcessRawEvent` syslog/local-log path as eBPF, with a deterministic UDP syslog fanout harness for policy deny, screen drop, and filter log. Policy-deny events now carry the snapshot's compiled numeric policy ID; filter-log events carry filter/term/action identity from the matched compiled term. Remaining #1379 evidence is live userspace-cluster syslog capture, including deny-storm starvation checks, if Phase 4 requires operator artifacts beyond the deterministic local harness. |
-| `show system buffers` | Userspace helper-status rendering covers AF_XDP UMEM/TX capacity, CoS queued-byte capacity, active-session footer, neighbor/flow-cache counts, and worker queue pressure counters. The Phase 5 denominator decision is explicit: session-table, flow-cache, and neighbor-cache values remain counters, not fill percentages, until the helper publishes bounded capacity fields. A formatter test pins that these dynamic counts cannot move into the utilization table without real denominators. |
+| `show system buffers` | Userspace helper-status rendering covers AF_XDP UMEM/TX capacity, CoS queued-byte capacity, helper-published session-table and flow-cache capacity, active-session footer, neighbor counts, and worker queue pressure counters. The Phase 5 denominator decision is explicit: session-table and flow-cache values become fill percentages only from Rust-owned helper fields; neighbor-cache entries remain counters until Rust owns a bounded neighbor-cache capacity. Formatter tests pin that dynamic counts cannot move into the utilization table without real denominators. |
 
 ## Retirement Blockers From The 2026-05-16 Audit
 
@@ -96,7 +96,7 @@ The current #1373 audit produced these tracked blockers:
 | #1374 | Implement userspace SYN-cookie flood protection or an approved equivalent. #1393, the 2026-05-17 runtime slice, the 2026-05-18 closeout slice, and the 2026-05-19 TX closeout cover deterministic cookie codec/layout, snapshot propagation, root-auth-derived key publication with fail-closed missing-secret behavior, capability admission for active SYN-cookie screen profiles, fail-closed screen challenge selection, bounded SYN-ACK TX, validated-ACK RST emission, session-miss ACK validation, bounded validated-client cache behavior, TTL-bound single-use validated-client expiration, current/previous/next Unix wall-clock cookie-epoch ACK validation with standby prefilter/rate-limiting, explicit validated-client bypass verdicts, userspace helper status counters, and legacy global sync for sent/valid/invalid/bypass counters. Remaining: live HA/flood validation evidence before BPF source removal. | Phase 4 BPF source removal |
 | #1375 | Finish userspace RFC 2697/2698 three-color policer hardening. The current runtime admits the color-blind `then discard` slice, fails closed for unsupported snapshot shapes that bypass Go admission, and preserves token/counter state across compatible in-process snapshot refreshes. Remaining work: sharded/packed state decision, HA/restart continuity decision, full non-drop color action propagation, and integration/failover/performance evidence | Phase 4 BPF source removal |
 | #1376 | Finish userspace port mirroring evidence. Snapshot/wire plumbing, bounded runtime delivery, pending-forward, self-target flow-cache, deferred-neighbor retry, CoS reserve handling, counter attribution, and capability admission now exist. Remaining work is mirror-fidelity evidence and forwarding survival under mirror pressure. | Phase 4 BPF source removal |
-| #1380 | Closed for the current helper schema: userspace `show system buffers` renders the bounded helper status that exists and intentionally keeps session-table / flow-cache / neighbor-cache as counters rather than synthetic utilization rows until the helper exports true capacity fields. | Phase 5 CLI / observability cleanup |
+| #1380 | Userspace `show system buffers` renders bounded helper status, including Rust-owned session-table and flow-cache denominators. Neighbor entries remain counters until Rust owns a bounded neighbor-cache capacity. | Phase 5 CLI / observability cleanup |
 
 Recommended dependency order:
 
@@ -118,8 +118,8 @@ Recommended dependency order:
    validation and hardening evidence, not as a capability gate. No additional
    #1378 scheduler runtime or evidence work is known from the current audit.
 4. #1380 is closed for the current helper schema. Future true utilization rows
-   for session-table, flow-cache, or neighbor-cache state need new
-   helper-published capacity fields and should be tracked as separate issues.
+   for neighbor-cache state need a helper-published bounded capacity and should
+   be tracked as a separate issue.
 
 ## What This Document Does Not Mean
 
@@ -164,6 +164,6 @@ The highest-value remaining work on current `master` is:
    features before BPF source removal. The #1378 scheduler runtime is closed by
    the accepted userspace HA artifact set.
 3. keep #1380 closed for the current command contract. Open a narrower
-   follow-up only if operators need helper-published capacity fields for
-   session-table, flow-cache, or neighbor-cache utilization percentages.
+   follow-up only if operators need a helper-published bounded capacity for
+   neighbor-cache utilization percentages.
 4. continue correctness and performance hardening on the active AF_XDP fast path

@@ -40,6 +40,24 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     state.status.worker_heartbeats = state.afxdp.worker_heartbeats();
     // #869: per-worker busy/idle runtime telemetry.
     state.status.worker_runtime = state.afxdp.worker_runtime_snapshots();
+    state.status.session_table_entries = state
+        .status
+        .worker_runtime
+        .iter()
+        .map(|w| w.session_table_entries as usize)
+        .sum();
+    state.status.max_sessions = state
+        .status
+        .worker_runtime
+        .iter()
+        .map(|w| w.max_sessions as usize)
+        .sum();
+    if state.status.max_sessions == 0 {
+        state.status.max_sessions = state
+            .afxdp
+            .worker_count()
+            .saturating_mul(crate::session::default_max_sessions());
+    }
     state.status.debug_worker_threads = state.afxdp.worker_count();
     state.status.debug_identity_slots = state.afxdp.identity_count();
     state.status.debug_live_slots = state.afxdp.live_count();
@@ -75,6 +93,16 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
         .iter()
         .map(BindingCountersSnapshot::from)
         .collect();
+    state.status.flow_cache_capacity = state
+        .status
+        .per_binding
+        .iter()
+        .map(|b| b.flow_cache_capacity as usize)
+        .sum();
+    // The dynamic neighbor cache is intentionally growable today. Keep
+    // the field explicit and zero so Go renders it as a counter rather
+    // than inventing a utilization denominator.
+    state.status.neighbor_cache_capacity = 0;
     state.status.recent_session_deltas = state.afxdp.recent_session_deltas();
     state.status.recent_exceptions = state.afxdp.recent_exceptions();
     state.status.cos_interfaces = state.afxdp.cos_statuses();
@@ -383,21 +411,27 @@ fn update_snapshot_binding_plan_key(hasher: &mut Sha256, snapshot: &ConfigSnapsh
         .iter()
         .filter(|iface| include_userspace_binding_interface(iface))
     {
-        hash_update(hasher, &format!(
-            "iface={}/{}/{}/{}/{}/{};",
-            iface.name,
-            iface.linux_name,
-            iface.ifindex,
-            iface.parent_ifindex,
-            iface.rx_queues,
-            iface.tunnel
-        ));
+        hash_update(
+            hasher,
+            &format!(
+                "iface={}/{}/{}/{}/{}/{};",
+                iface.name,
+                iface.linux_name,
+                iface.ifindex,
+                iface.parent_ifindex,
+                iface.rx_queues,
+                iface.tunnel
+            ),
+        );
     }
     for fab in &snapshot.fabrics {
-        hash_update(hasher, &format!(
-            "fabric={}/{}/{}/{};",
-            fab.name, fab.parent_linux_name, fab.parent_ifindex, fab.rx_queues
-        ));
+        hash_update(
+            hasher,
+            &format!(
+                "fabric={}/{}/{}/{};",
+                fab.name, fab.parent_linux_name, fab.parent_ifindex, fab.rx_queues
+            ),
+        );
     }
 }
 

@@ -20,6 +20,10 @@ const _: () = assert!(FLOW_CACHE_SETS.is_power_of_two());
 const _: () = assert!(FLOW_CACHE_WAYS == 4);
 const _: () = assert!(FLOW_CACHE_SETS * FLOW_CACHE_WAYS == FLOW_CACHE_SIZE);
 
+pub(super) const fn flow_cache_capacity() -> usize {
+    FLOW_CACHE_SIZE
+}
+
 /// Maximum number of redundancy groups for epoch-based cache invalidation.
 pub(super) const MAX_RG_EPOCHS: usize = 16;
 
@@ -461,12 +465,7 @@ impl FlowCache {
     pub(super) fn active_flow_debug_entries(
         &self,
         limit: usize,
-    ) -> (
-        u32,
-        Vec<FlowCacheDebugEntry>,
-        Vec<CoSActiveFlowCount>,
-        bool,
-    ) {
+    ) -> (u32, Vec<FlowCacheDebugEntry>, Vec<CoSActiveFlowCount>, bool) {
         let limit = limit.min(FLOW_CACHE_SIZE);
         let mut active = 0u32;
         let mut truncated = false;
@@ -508,11 +507,13 @@ impl FlowCache {
         }
         let cos_counts = cos_counts
             .into_iter()
-            .map(|((ifindex, queue_id), active_flow_count)| CoSActiveFlowCount {
-                ifindex,
-                queue_id,
-                active_flow_count,
-            })
+            .map(
+                |((ifindex, queue_id), active_flow_count)| CoSActiveFlowCount {
+                    ifindex,
+                    queue_id,
+                    active_flow_count,
+                },
+            )
             .collect();
         (active, rows, cos_counts, truncated)
     }
@@ -661,9 +662,9 @@ impl FlowCache {
                 // to &FlowCacheEntry in one index, eliminating the
                 // redundant second `self.entries[entry_idx]` access.
                 let now = self.current_epoch;
-                let entry = self.entries[entry_idx]
-                    .as_mut()
-                    .expect("BUG: entry at entry_idx is None after key match — impossible cache state");
+                let entry = self.entries[entry_idx].as_mut().expect(
+                    "BUG: entry at entry_idx is None after key match — impossible cache state",
+                );
                 entry.last_used_epoch = now;
                 entry.observed_bytes = entry.observed_bytes.saturating_add(observed_bytes);
                 return Some(entry);
@@ -685,9 +686,7 @@ impl FlowCache {
         for way in 0..FLOW_CACHE_WAYS {
             let entry_idx = base + way;
             if let Some(existing) = &self.entries[entry_idx] {
-                if existing.key == entry.key
-                    && existing.ingress_ifindex == entry.ingress_ifindex
-                {
+                if existing.key == entry.key && existing.ingress_ifindex == entry.ingress_ifindex {
                     self.entries[entry_idx] = Some(entry);
                     self.promote_lru(set, way as u8);
                     return;

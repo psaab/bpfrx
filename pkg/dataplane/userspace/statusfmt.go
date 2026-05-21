@@ -303,6 +303,17 @@ func FormatStatusSummary(status ProcessStatus) string {
 	}
 	fmt.Fprintf(&b, "  Interface addresses:       %d\n", status.InterfaceAddresses)
 	fmt.Fprintf(&b, "  Neighbor entries:          %d\n", status.NeighborEntries)
+	if status.NeighborCacheCapacity > 0 {
+		fmt.Fprintf(&b, "  Neighbor cache capacity:   %d\n", status.NeighborCacheCapacity)
+	}
+	if status.MaxSessions > 0 {
+		fmt.Fprintf(&b, "  Session table entries:     %d/%d\n", status.SessionTableEntries, status.MaxSessions)
+	} else if status.SessionTableEntries > 0 {
+		fmt.Fprintf(&b, "  Session table entries:     %d\n", status.SessionTableEntries)
+	}
+	if status.FlowCacheCapacity > 0 {
+		fmt.Fprintf(&b, "  Flow cache capacity:       %d\n", status.FlowCacheCapacity)
+	}
 	fmt.Fprintf(&b, "  Neighbor generation:       %d\n", status.NeighborGeneration)
 	fmt.Fprintf(&b, "  Route entries:             %d\n", status.RouteEntries)
 	if len(status.HAGroups) > 0 {
