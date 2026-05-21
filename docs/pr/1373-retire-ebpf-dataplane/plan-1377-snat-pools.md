@@ -32,10 +32,11 @@ runtime lease reuse, and operator-visible allocation failures.
   reuse, and exhaustion counters.
 - The supported persistent-NAT slice is helper-local and non-HA. Rules that
   reference the same concrete pool share one allocator and one lease table, so
-  duplicate rules cannot overbook the same translated tuple. Compatible
-  in-process snapshot refreshes preserve allocator state, but helper restart
-  and pool-shape edits do not. HA configs that use a persistent source-NAT
-  pool are gated because persistent leases are not synchronized.
+  duplicate rules cannot overbook the same translated tuple. Same-binding-plan
+  in-process snapshot refreshes preserve allocator state when the allocator
+  key is unchanged, but helper restart, helper replan, and pool-shape edits do
+  not. HA configs that use a persistent source-NAT pool are gated because
+  persistent leases are not synchronized.
 
 ## Current Fail-Closed Runtime Boundary
 
@@ -177,11 +178,12 @@ contract is helper-local:
 - source-NAT allocations that fail before session install use a rollback path,
   not the inactivity-release path, so a rejected new persistent tuple does not
   pin a lease for the timeout window;
-- compatible in-process snapshot refreshes preserve allocator state when the
-  concrete allocator key is unchanged;
+- same-binding-plan compatible in-process snapshot refreshes preserve
+  allocator state when the concrete allocator key is unchanged;
+- helper restart and binding-plan replan reset allocator live state even when
+  the pool key is unchanged;
 - edits to pool name, IPv4/IPv6 address lists, address order, or port range
   replace allocator state and can reset persistent lease continuity;
-- helper restart loses the persistent lease table; and
 - HA configs using persistent source-NAT pools are gated because leases are not
   synchronized to the peer.
 
@@ -208,8 +210,14 @@ per-address atomic counters because it does not create a tracked session.
 The per-pool allocator state is bounded by the smaller of pool port capacity and
 `262144` tracked live flows. This prevents attacker-controlled unbounded growth
 in the packet path. Fresh port claims use a per-address cursor and a recycled
-port stack, and persistent lease expiry uses replace-in-place ordered expiry
-indexes bounded by the number of retained leases.
+port stack.
+
+Persistent leases are bounded by the same `max_tracked_flows` value:
+`min(pool_port_capacity, 262144)`. Idle persistent leases appear once in the
+global ordered expiry index and once in the selected address's ordered expiry
+index. Active leases remain in the lease table but are absent from expiry
+indexes until their last live flow releases. The per-address expiry index also
+has one empty set header per configured pool address.
 
 The latency contract is budgeted work, not strict constant time:
 
@@ -217,6 +225,9 @@ The latency contract is budgeted work, not strict constant time:
   checks before attempting a claim;
 - every `GC_PERIOD` (`10`) releases run at most `RELEASE_GC_BUDGET` (`64`)
   global expiry checks;
+- if the global persistent lease table is at `max_tracked_flows`, each address
+  attempt can run at most `PRESSURE_GC_BUDGET` (`64`) global expiry checks
+  before trying that address claim;
 - if the selected address has no fresh or recycled port, pressure handling
   runs at most `PRESSURE_GC_BUDGET` (`64`) expiry checks for that address
   before retrying the claim; and
@@ -224,11 +235,12 @@ The latency contract is budgeted work, not strict constant time:
   path for each family-compatible pool address.
 
 Near-full allocation and timeout cleanup do not scan the whole lease map on
-every new flow, but full-pool pressure can still do non-trivial work bounded
-by the number of family-compatible addresses multiplied by the pressure
-budget. Operators should size pool address counts, port ranges, and session
-creation rates with that budgeted worst case in mind. The allocator reports
-exhaustion when:
+every new flow, but full-pool pressure can still do non-trivial work. In a
+non-address-persistent pool, a still-full lease table can consume one global
+pressure-GC budget per family-compatible address attempt, and each selected
+address can consume one per-address pressure-GC budget before retry. Operators
+should size pool address counts, port ranges, and session creation rates with
+that budgeted worst case in mind. The allocator reports exhaustion when:
 
 - the selected address-persistent pool address has no free port;
 - a non-address-persistent family has no free port on any family-compatible

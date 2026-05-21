@@ -447,6 +447,9 @@ impl PortAllocator {
             if persistent_key.is_some()
                 && live.persistent_by_source.len() >= self.shared.max_tracked_flows
             {
+                // Lease-table pressure is also budgeted. A full persistent
+                // table gets one global PRESSURE_GC_BUDGET pass before this
+                // address attempt is treated as unavailable.
                 self.gc_expired_locked(&mut live, now_ns, PRESSURE_GC_BUDGET);
                 if live.persistent_by_source.len() >= self.shared.max_tracked_flows {
                     continue;
