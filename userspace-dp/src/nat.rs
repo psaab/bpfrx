@@ -197,10 +197,11 @@ struct PersistentLease {
     expires_at_ns: u64,
     timeout_ns: u64,
     active_flows: u32,
-    completed_flows: u32,
-    // Baseline for the current active epoch. Rollback needs to distinguish
-    // completions in this reactivation from lifetime persistent-NAT history.
-    activation_completed_flows_baseline: u32,
+    completed_flows: u64,
+    // Rollback needs per-activation completion state, not a comparison
+    // against lifetime completion counters. The latter can saturate over
+    // long-lived persistent leases and make a fresh completion invisible.
+    activation_saw_completion: bool,
     activation_previous_expires_at_ns: u64,
     activation_had_previous_lease: bool,
 }
@@ -389,7 +390,7 @@ impl PortAllocator {
                         let translated = lease.translated;
                         if lease.active_flows == 0 {
                             remove_expiry = Some(lease.expires_at_ns);
-                            lease.activation_completed_flows_baseline = lease.completed_flows;
+                            lease.activation_saw_completion = false;
                             lease.activation_previous_expires_at_ns = lease.expires_at_ns;
                             lease.activation_had_previous_lease = true;
                         }
@@ -479,7 +480,7 @@ impl PortAllocator {
                         timeout_ns: persistent_nat_timeout_ns.max(NS_PER_SEC),
                         active_flows: 1,
                         completed_flows: 0,
-                        activation_completed_flows_baseline: 0,
+                        activation_saw_completion: false,
                         activation_previous_expires_at_ns: 0,
                         activation_had_previous_lease: false,
                     },
@@ -621,6 +622,7 @@ impl PortAllocator {
             let mut insert_expiry = None;
             if let Some(lease) = live.persistent_by_source.get_mut(&key) {
                 lease.completed_flows = lease.completed_flows.saturating_add(1);
+                lease.activation_saw_completion = true;
                 lease.active_flows = lease.active_flows.saturating_sub(1);
                 if lease.active_flows == 0 {
                     let expires_at_ns = now_ns.saturating_add(lease.timeout_ns);
@@ -661,7 +663,7 @@ impl PortAllocator {
             if let Some(lease) = live.persistent_by_source.get_mut(&key) {
                 lease.active_flows = lease.active_flows.saturating_sub(1);
                 if lease.active_flows == 0 {
-                    if lease.completed_flows > lease.activation_completed_flows_baseline {
+                    if lease.activation_saw_completion {
                         let expires_at_ns = now_ns.saturating_add(lease.timeout_ns);
                         lease.expires_at_ns = expires_at_ns;
                         insert_expiry = Some((lease.addr_index, expires_at_ns));

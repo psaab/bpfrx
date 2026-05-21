@@ -1400,6 +1400,73 @@ fn pool_snat_persistent_reactivation_uses_fresh_expiry_after_success() {
 }
 
 #[test]
+fn pool_snat_persistent_reactivation_completion_survives_saturated_counter() {
+    let rules = persistent_pool_rules(300, 40000, 40001);
+    let timeout_ns = 300 * NS_PER_SEC;
+    let original = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1));
+    release_source_nat_allocation(
+        &rules,
+        &session_key(10000, "8.8.8.8", 53),
+        original,
+        false,
+        2,
+    );
+
+    let old_expiry = 2 + timeout_ns;
+    {
+        let mut live = rules[0]
+            .pool_allocator
+            .shared
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let lease = live.persistent_by_source.values_mut().next().unwrap();
+        lease.completed_flows = u64::MAX;
+        assert_eq!(lease.expires_at_ns, old_expiry);
+    }
+
+    let first = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "1.1.1.1", 53, 3));
+    let second = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "9.9.9.9", 53, 4));
+    assert_eq!(second.rewrite_src, first.rewrite_src);
+    assert_eq!(second.rewrite_src_port, first.rewrite_src_port);
+
+    release_source_nat_allocation(
+        &rules,
+        &session_key(10000, "9.9.9.9", 53),
+        second,
+        false,
+        5,
+    );
+    rollback_source_nat_allocation(
+        &rules,
+        &session_key(10000, "1.1.1.1", 53),
+        first,
+        false,
+        6,
+    );
+
+    let fresh_expiry = 6 + timeout_ns;
+    {
+        let live = rules[0]
+            .pool_allocator
+            .shared
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let lease = live.persistent_by_source.values().next().unwrap();
+        assert_eq!(lease.active_flows, 0);
+        assert_eq!(lease.completed_flows, u64::MAX);
+        assert_eq!(lease.expires_at_ns, fresh_expiry);
+        assert!(live
+            .lease_expirations
+            .contains(&(fresh_expiry, lease_key(10000))));
+        assert!(!live
+            .lease_expirations
+            .contains(&(old_expiry, lease_key(10000))));
+    }
+}
+
+#[test]
 fn pool_snat_persistent_reactivation_double_rollback_restores_old_expiry() {
     let rules = persistent_pool_rules(300, 40000, 40001);
     let timeout_ns = 300 * NS_PER_SEC;
