@@ -839,16 +839,34 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 		return errors.New("userspace_interface_nat_v6 map not loaded")
 	}
 
+	desiredV4, desiredV6, rstV4, rstV6 := buildDesiredInterfaceNATAddressSets(snapshot)
+	for key := range desiredV4 {
+		if err := natV4Map.Update(key, uint8(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update userspace_interface_nat_v4 %08x: %w", key, err)
+		}
+	}
+	for key := range desiredV6 {
+		if err := natV6Map.Update(key, uint8(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update userspace_interface_nat_v6 %+v: %w", key, err)
+		}
+	}
+
 	var (
 		natV4Key uint32
 		natV4Val uint8
 	)
 	natV4Iter := natV4Map.Iterate()
-	var natV4Keys []uint32
+	var staleNatV4Keys []uint32
 	for natV4Iter.Next(&natV4Key, &natV4Val) {
-		natV4Keys = append(natV4Keys, natV4Key)
+		if _, keep := desiredV4[natV4Key]; keep {
+			continue
+		}
+		staleNatV4Keys = append(staleNatV4Keys, natV4Key)
 	}
-	for _, key := range natV4Keys {
+	if err := natV4Iter.Err(); err != nil {
+		return fmt.Errorf("iterate userspace_interface_nat_v4: %w", err)
+	}
+	for _, key := range staleNatV4Keys {
 		if err := natV4Map.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("delete userspace_interface_nat_v4 %08x: %w", key, err)
 		}
@@ -859,33 +877,22 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 		natV6Val uint8
 	)
 	natV6Iter := natV6Map.Iterate()
-	var natV6Keys []userspaceLocalV6Key
+	var staleNatV6Keys []userspaceLocalV6Key
 	for natV6Iter.Next(&natV6Key, &natV6Val) {
-		natV6Keys = append(natV6Keys, natV6Key)
+		if _, keep := desiredV6[natV6Key]; keep {
+			continue
+		}
+		staleNatV6Keys = append(staleNatV6Keys, natV6Key)
 	}
-	for _, key := range natV6Keys {
+	if err := natV6Iter.Err(); err != nil {
+		return fmt.Errorf("iterate userspace_interface_nat_v6: %w", err)
+	}
+	for _, key := range staleNatV6Keys {
 		if err := natV6Map.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("delete userspace_interface_nat_v6 %+v: %w", key, err)
 		}
 	}
 
-	var rstV4 []netip.Addr
-	var rstV6 []netip.Addr
-	for _, entry := range buildInterfaceNATAddressEntries(snapshot) {
-		if entry.v4 {
-			if err := natV4Map.Update(entry.v4Key, uint8(1), ebpf.UpdateAny); err != nil {
-				return fmt.Errorf("update userspace_interface_nat_v4 %08x: %w", entry.v4Key, err)
-			}
-			var b [4]byte
-			binary.BigEndian.PutUint32(b[:], entry.v4Key)
-			rstV4 = append(rstV4, netip.AddrFrom4(b))
-			continue
-		}
-		if err := natV6Map.Update(entry.v6Key, uint8(1), ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("update userspace_interface_nat_v6 %+v: %w", entry.v6Key, err)
-		}
-		rstV6 = append(rstV6, netip.AddrFrom16(entry.v6Key.Addr))
-	}
 	slices.SortFunc(rstV4, netip.Addr.Compare)
 	slices.SortFunc(rstV6, netip.Addr.Compare)
 	// Install RST suppression rules. Retry immediately on address changes,
@@ -912,6 +919,25 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 		m.lastRSTv6 = slices.Clone(rstV6)
 	}
 	return nil
+}
+
+func buildDesiredInterfaceNATAddressSets(snapshot *ConfigSnapshot) (map[uint32]struct{}, map[userspaceLocalV6Key]struct{}, []netip.Addr, []netip.Addr) {
+	desiredV4 := make(map[uint32]struct{})
+	desiredV6 := make(map[userspaceLocalV6Key]struct{})
+	rstV4 := make([]netip.Addr, 0)
+	rstV6 := make([]netip.Addr, 0)
+	for _, entry := range buildInterfaceNATAddressEntries(snapshot) {
+		if entry.v4 {
+			desiredV4[entry.v4Key] = struct{}{}
+			var b [4]byte
+			binary.BigEndian.PutUint32(b[:], entry.v4Key)
+			rstV4 = append(rstV4, netip.AddrFrom4(b))
+			continue
+		}
+		desiredV6[entry.v6Key] = struct{}{}
+		rstV6 = append(rstV6, netip.AddrFrom16(entry.v6Key.Addr))
+	}
+	return desiredV4, desiredV6, rstV4, rstV6
 }
 
 // verifyBindingsMapLocked reads the BPF userspace_bindings map and compares

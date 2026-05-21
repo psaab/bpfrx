@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-05-21
+
+- **Timestamp**: 2026-05-21T16:25:00Z
+  - **Action**: PR #1481 comment follow-up — changed `syncInterfaceNATAddressMapsLocked` to publish desired interface-NAT entries before deleting stale keys (matching the local-map add-before-remove contract), and added a regression test that proves a full map cannot transiently clear existing NAT entries.
+  - **File(s)**: `pkg/dataplane/userspace/maps_sync.go`, `pkg/dataplane/userspace/maps_sync_cap_test.go`, `_Log.md`
+
 ## 2026-05-18
 
 - **Timestamp**: 2026-05-18T04:38:00Z
