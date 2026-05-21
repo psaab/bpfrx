@@ -899,6 +899,7 @@ fn pass_local_control(ctrl: &UserspaceCtrl, reason: u32) -> Result<u32, i64> {
     Ok(cpumap_or_pass(ctrl))
 }
 
+#[inline(always)]
 fn is_degraded_local_or_control(
     ctrl: &UserspaceCtrl,
     data: usize,

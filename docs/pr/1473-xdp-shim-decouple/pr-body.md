@@ -15,11 +15,19 @@
 - Route degraded IP local/control delivery through `cpumap_or_pass` when cpumap
   is available; direct `XDP_PASS` remains only for non-IP local L2 frames such
   as ARP/LLDP.
+- Keep degraded local/control classification inline in `xdp_userspace_prog` so
+  the kernel verifier sees the packet-bound proof for nested GRE parsing.
 
 ## Validation
 
 - PASS: `pkg/dataplane/build-userspace-xdp.sh`
 - PASS: `go test ./pkg/dataplane/userspace ./pkg/dataplane`
+- PASS: object-symbol audit shows no standalone
+  `is_degraded_local_or_control` BPF subprogram:
+  ```bash
+  llvm-objdump -t pkg/dataplane/userspace_xdp_bpfel.o |
+    rg 'is_degraded|classify_native|xdp_userspace|parse_l4'
+  ```
 
 ## Local Smoke Artifact
 
