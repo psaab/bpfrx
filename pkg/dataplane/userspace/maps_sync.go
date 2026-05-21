@@ -160,6 +160,23 @@ func (m *Manager) setupUserspaceCPUMapLocked() bool {
 	return true
 }
 
+func (m *Manager) failClosedUserspaceCtrlLocked(ctrlMap *ebpf.Map, ctrl userspaceCtrlValue, cause error) error {
+	if ctrl.Enabled != 1 {
+		return cause
+	}
+	disabled := ctrl
+	disabled.Enabled = 0
+	zero := uint32(0)
+	if err := ctrlMap.Update(zero, disabled, ebpf.UpdateAny); err != nil {
+		return errors.Join(cause, fmt.Errorf("fail closed userspace_ctrl after publication error: %w", err))
+	}
+	if m.ctrlWasEnabled {
+		m.ctrlDisabledAt = m.bpfKtimeNs()
+	}
+	m.ctrlWasEnabled = false
+	return cause
+}
+
 func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 	ctrlMap := m.bpfShim.Map("userspace_ctrl")
 	if ctrlMap == nil {
@@ -511,17 +528,17 @@ ctrlReady:
 		// overflow the flat index; fail with a legible error instead
 		// of relying on the kernel's "argument list too long" E2BIG.
 		if idx >= dataplane.BindingArrayMaxEntries {
-			return fmt.Errorf(
+			return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
 				"update userspace_bindings: idx=%d exceeds cap=%d (ifindex=%d queue=%d; raise MAX_INTERFACES in bpf/headers/xpf_common.h)",
 				idx, dataplane.BindingArrayMaxEntries, binding.Ifindex, binding.QueueID,
-			)
+			))
 		}
 		val := userspaceBindingValue{
 			Slot:  binding.Slot,
 			Flags: flags,
 		}
 		if err := bindingsMap.Update(idx, val, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("update userspace_bindings idx=%d (if=%d q=%d): %w", idx, binding.Ifindex, binding.QueueID, err)
+			return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf("update userspace_bindings idx=%d (if=%d q=%d): %w", idx, binding.Ifindex, binding.QueueID, err))
 		}
 		if _, seen := newBindingIndexSet[idx]; !seen {
 			newBindingIndexSet[idx] = struct{}{}
@@ -542,24 +559,24 @@ ctrlReady:
 			// VLAN-alias children use their own ifindex here, so the
 			// child (not the parent) is the overflow risk.
 			if idx >= dataplane.BindingArrayMaxEntries {
-				return fmt.Errorf(
+				return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
 					"update aliased userspace_bindings: idx=%d exceeds cap=%d (child=%d parent=%d queue=%d; raise MAX_INTERFACES in bpf/headers/xpf_common.h)",
 					idx, dataplane.BindingArrayMaxEntries, childIfindex, parentIfindex, binding.QueueID,
-				)
+				))
 			}
 			val := userspaceBindingValue{
 				Slot:  binding.Slot,
 				Flags: flags,
 			}
 			if err := bindingsMap.Update(idx, val, ebpf.UpdateAny); err != nil {
-				return fmt.Errorf(
+				return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
 					"update aliased userspace_bindings idx=%d (if=%d parent=%d q=%d): %w",
 					idx,
 					childIfindex,
 					parentIfindex,
 					binding.QueueID,
 					err,
-				)
+				))
 			}
 			if _, seen := newBindingIndexSet[idx]; !seen {
 				newBindingIndexSet[idx] = struct{}{}
@@ -578,13 +595,13 @@ ctrlReady:
 		m.lastBindingIndices = newBindingIndices
 	}
 	if err := m.syncIngressIfaceMapLocked(m.lastSnapshot); err != nil {
-		return err
+		return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, err)
 	}
 	if err := m.syncLocalAddressMapsLocked(m.lastSnapshot); err != nil {
-		return err
+		return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, err)
 	}
 	if err := m.syncInterfaceNATAddressMapsLocked(m.lastSnapshot); err != nil {
-		return err
+		return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, err)
 	}
 	// Sync userspace-forwarded packet counters into BPF counter maps so
 	// that ReadGlobalCounter/ReadZoneCounters/etc. return complete values
@@ -593,7 +610,7 @@ ctrlReady:
 
 	if ctrl.Enabled == 1 {
 		if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("enable userspace_ctrl from helper status: %w", err)
+			return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf("enable userspace_ctrl from helper status: %w", err))
 		}
 		m.ctrlWasEnabled = true
 	}
@@ -719,16 +736,34 @@ func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
 		return errors.New("userspace_local_v6 map not loaded")
 	}
 
+	desiredV4, desiredV6 := buildDesiredLocalAddressSets(snapshot)
+	for key := range desiredV4 {
+		if err := localV4Map.Update(key, uint8(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update userspace_local_v4 %08x: %w", key, err)
+		}
+	}
+	for key := range desiredV6 {
+		if err := localV6Map.Update(key, uint8(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update userspace_local_v6 %+v: %w", key, err)
+		}
+	}
+
 	var (
 		localV4Key uint32
 		localV4Val uint8
 	)
 	localV4Iter := localV4Map.Iterate()
-	var localV4Keys []uint32
+	var staleLocalV4Keys []uint32
 	for localV4Iter.Next(&localV4Key, &localV4Val) {
-		localV4Keys = append(localV4Keys, localV4Key)
+		if _, keep := desiredV4[localV4Key]; keep {
+			continue
+		}
+		staleLocalV4Keys = append(staleLocalV4Keys, localV4Key)
 	}
-	for _, key := range localV4Keys {
+	if err := localV4Iter.Err(); err != nil {
+		return fmt.Errorf("iterate userspace_local_v4: %w", err)
+	}
+	for _, key := range staleLocalV4Keys {
 		if err := localV4Map.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("delete userspace_local_v4 %08x: %w", key, err)
 		}
@@ -739,26 +774,33 @@ func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
 		localV6Val uint8
 	)
 	localV6Iter := localV6Map.Iterate()
-	var localV6Keys []userspaceLocalV6Key
+	var staleLocalV6Keys []userspaceLocalV6Key
 	for localV6Iter.Next(&localV6Key, &localV6Val) {
-		localV6Keys = append(localV6Keys, localV6Key)
+		if _, keep := desiredV6[localV6Key]; keep {
+			continue
+		}
+		staleLocalV6Keys = append(staleLocalV6Keys, localV6Key)
 	}
-	for _, key := range localV6Keys {
+	if err := localV6Iter.Err(); err != nil {
+		return fmt.Errorf("iterate userspace_local_v6: %w", err)
+	}
+	for _, key := range staleLocalV6Keys {
 		if err := localV6Map.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("delete userspace_local_v6 %+v: %w", key, err)
 		}
 	}
+	return nil
+}
 
+func buildDesiredLocalAddressSets(snapshot *ConfigSnapshot) (map[uint32]struct{}, map[userspaceLocalV6Key]struct{}) {
+	desiredV4 := make(map[uint32]struct{})
+	desiredV6 := make(map[userspaceLocalV6Key]struct{})
 	for _, entry := range buildLocalAddressEntries(snapshot) {
 		if entry.v4 {
-			if err := localV4Map.Update(entry.v4Key, uint8(1), ebpf.UpdateAny); err != nil {
-				return fmt.Errorf("update userspace_local_v4 %08x: %w", entry.v4Key, err)
-			}
+			desiredV4[entry.v4Key] = struct{}{}
 			continue
 		}
-		if err := localV6Map.Update(entry.v6Key, uint8(1), ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("update userspace_local_v6 %+v: %w", entry.v6Key, err)
-		}
+		desiredV6[entry.v6Key] = struct{}{}
 	}
 	// Also add kernel addresses (VIPs added by VRRP) that aren't in the
 	// config snapshot. Without this, the XDP shim doesn't recognize VIP
@@ -776,15 +818,15 @@ func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
 			}
 			if v4 := ip.To4(); v4 != nil && family == netlink.FAMILY_V4 {
 				key := binary.BigEndian.Uint32(v4)
-				_ = localV4Map.Update(key, uint8(1), ebpf.UpdateAny)
+				desiredV4[key] = struct{}{}
 			} else if v6 := ip.To16(); v6 != nil && family == netlink.FAMILY_V6 {
 				var key [16]byte
 				copy(key[:], v6)
-				_ = localV6Map.Update(userspaceLocalV6Key{Addr: key}, uint8(1), ebpf.UpdateAny)
+				desiredV6[userspaceLocalV6Key{Addr: key}] = struct{}{}
 			}
 		}
 	}
-	return nil
+	return desiredV4, desiredV6
 }
 
 func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) error {

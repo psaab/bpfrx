@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -165,6 +166,105 @@ func TestUserspaceXDPBindingNotReadyDropsTransitButPassesLocalControl(t *testing
 	}
 }
 
+func TestUserspaceXDPIPLocalControlUsesCPUMapWhenAvailable(t *testing.T) {
+	coll := loadUserspaceXDPTestCollection(t)
+	enableUserspaceXDPTestCPUMap(t, coll)
+	local := [4]byte{192, 0, 2, 1}
+	updateUserspaceXDPTestCtrl(t, coll, userspaceCtrlValue{
+		Enabled:            0,
+		MetadataVersion:    userspaceMetadataVersion,
+		Workers:            1,
+		QueueCount:         1,
+		Flags:              userspaceCtrlFlagCPUMap,
+		HeartbeatTimeoutMS: 30000,
+	})
+	updateUserspaceXDPTestLocalV4(t, coll, local)
+
+	ret := runUserspaceXDPTestPacket(t, coll, udpIPv4TestPacket(
+		[4]byte{198, 51, 100, 10},
+		local,
+	))
+	if ret != xdpActionRedirect {
+		t.Fatalf("ctrl-disabled local action with cpumap = %d, want XDP_REDIRECT", ret)
+	}
+	assertUserspaceXDPFallbackStat(t, coll, "ctrl_disabled")
+	assertUserspaceXDPFallbackStat(t, coll, "pass_to_kernel")
+	assertUserspaceXDPFallbackStatAbsent(t, coll, "transit_drop")
+}
+
+func TestUserspaceXDPNDPUsesCPUMapWhenAvailable(t *testing.T) {
+	coll := loadUserspaceXDPTestCollection(t)
+	enableUserspaceXDPTestCPUMap(t, coll)
+	updateUserspaceXDPTestCtrl(t, coll, userspaceCtrlValue{
+		Enabled:            1,
+		MetadataVersion:    userspaceMetadataVersion,
+		Workers:            1,
+		QueueCount:         1,
+		Flags:              userspaceCtrlFlagCPUMap,
+		HeartbeatTimeoutMS: 30000,
+	})
+	updateUserspaceXDPTestIngress(t, coll, 0)
+	updateUserspaceXDPTestBinding(t, coll, 0, userspaceBindingValue{
+		Slot:  0,
+		Flags: userspaceBindingReady,
+	})
+
+	ret := runUserspaceXDPTestPacket(t, coll, icmpv6TestPacket(
+		[16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10},
+		[16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01},
+		136,
+	))
+	if ret != xdpActionRedirect {
+		t.Fatalf("NDP action with cpumap = %d, want XDP_REDIRECT", ret)
+	}
+	assertUserspaceXDPFallbackStat(t, coll, "early_filter")
+	assertUserspaceXDPFallbackStat(t, coll, "pass_to_kernel")
+}
+
+func TestUserspaceXDPDegradedESPToInterfaceNATPassesLocalControl(t *testing.T) {
+	coll := loadUserspaceXDPTestCollection(t)
+	natLocal := [4]byte{192, 0, 2, 254}
+	updateUserspaceXDPTestCtrl(t, coll, userspaceCtrlValue{
+		Enabled:            0,
+		MetadataVersion:    userspaceMetadataVersion,
+		Workers:            1,
+		QueueCount:         1,
+		HeartbeatTimeoutMS: 30000,
+	})
+	updateUserspaceXDPTestInterfaceNATV4(t, coll, natLocal)
+
+	ret := runUserspaceXDPTestPacket(t, coll, espIPv4TestPacket(
+		[4]byte{198, 51, 100, 10},
+		natLocal,
+	))
+	if ret != xdpActionPass {
+		t.Fatalf("ctrl-disabled ESP to interface NAT action = %d, want XDP_PASS", ret)
+	}
+	assertUserspaceXDPFallbackStat(t, coll, "ctrl_disabled")
+	assertUserspaceXDPFallbackStat(t, coll, "pass_to_kernel")
+	assertUserspaceXDPFallbackStatAbsent(t, coll, "transit_drop")
+}
+
+func TestUserspaceXDPDegradedNonIPL2PassesDirect(t *testing.T) {
+	coll := loadUserspaceXDPTestCollection(t)
+	updateUserspaceXDPTestCtrl(t, coll, userspaceCtrlValue{
+		Enabled:            0,
+		MetadataVersion:    userspaceMetadataVersion,
+		Workers:            1,
+		QueueCount:         1,
+		Flags:              userspaceCtrlFlagCPUMap,
+		HeartbeatTimeoutMS: 30000,
+	})
+
+	ret := runUserspaceXDPTestPacket(t, coll, arpTestPacket())
+	if ret != xdpActionPass {
+		t.Fatalf("ctrl-disabled ARP action = %d, want XDP_PASS", ret)
+	}
+	assertUserspaceXDPFallbackStat(t, coll, "ctrl_disabled")
+	assertUserspaceXDPFallbackStat(t, coll, "pass_to_kernel")
+	assertUserspaceXDPFallbackStatAbsent(t, coll, "transit_drop")
+}
+
 func injectUserspaceBootstrapMaps(t *testing.T, m *Manager) {
 	t.Helper()
 	injectShimMapSpec(t, m.bpfShim, "userspace_heartbeat", &ebpf.MapSpec{
@@ -236,8 +336,9 @@ func injectShimProgramName(t *testing.T, bpfShim *dataplane.Manager, name string
 }
 
 const (
-	xdpActionDrop = 1
-	xdpActionPass = 2
+	xdpActionDrop     = 1
+	xdpActionPass     = 2
+	xdpActionRedirect = 4
 )
 
 func loadUserspaceXDPTestCollection(t *testing.T) *ebpf.Collection {
@@ -279,6 +380,30 @@ func updateUserspaceXDPTestIngress(t *testing.T, coll *ebpf.Collection, ifindex 
 func updateUserspaceXDPTestLocalV4(t *testing.T, coll *ebpf.Collection, ip [4]byte) {
 	t.Helper()
 	updateUserspaceXDPTestMap(t, coll, "userspace_local_v4", binary.BigEndian.Uint32(ip[:]), uint8(1))
+}
+
+func updateUserspaceXDPTestInterfaceNATV4(t *testing.T, coll *ebpf.Collection, ip [4]byte) {
+	t.Helper()
+	updateUserspaceXDPTestMap(t, coll, "userspace_interface_nat_v4", binary.BigEndian.Uint32(ip[:]), uint8(1))
+}
+
+func enableUserspaceXDPTestCPUMap(t *testing.T, coll *ebpf.Collection) {
+	t.Helper()
+	m := coll.Maps["userspace_cpumap"]
+	if m == nil {
+		t.Fatal("userspace_cpumap map not loaded")
+	}
+	val := make([]byte, 8)
+	binary.NativeEndian.PutUint32(val[0:4], 2048)
+	cpus := runtime.NumCPU()
+	if cpus > 256 {
+		cpus = 256
+	}
+	for cpu := 0; cpu < cpus; cpu++ {
+		if err := m.Update(uint32(cpu), val, ebpf.UpdateAny); err != nil {
+			t.Skipf("update userspace_cpumap cpu %d: %v", cpu, err)
+		}
+	}
 }
 
 func updateUserspaceXDPTestMap(t *testing.T, coll *ebpf.Collection, name string, key any, value any) {
@@ -345,22 +470,62 @@ func fallbackReasonIndex(t *testing.T, name string) uint32 {
 }
 
 func udpIPv4TestPacket(src [4]byte, dst [4]byte) []byte {
+	return ipv4TestPacket(src, dst, 17, 8)
+}
+
+func espIPv4TestPacket(src [4]byte, dst [4]byte) []byte {
+	return ipv4TestPacket(src, dst, 50, 8)
+}
+
+func ipv4TestPacket(src [4]byte, dst [4]byte, protocol byte, payloadLen int) []byte {
 	packet := make([]byte, 14+20+8)
+	if payloadLen > 8 {
+		packet = make([]byte, 14+20+payloadLen)
+	}
 	copy(packet[0:6], []byte{0x02, 0, 0, 0, 0, 1})
 	copy(packet[6:12], []byte{0x02, 0, 0, 0, 0, 2})
 	binary.BigEndian.PutUint16(packet[12:14], 0x0800)
 
 	ip := packet[14:34]
 	ip[0] = 0x45
-	binary.BigEndian.PutUint16(ip[2:4], uint16(len(ip)+8))
+	binary.BigEndian.PutUint16(ip[2:4], uint16(len(ip)+payloadLen))
 	ip[8] = 64
-	ip[9] = 17
+	ip[9] = protocol
 	copy(ip[12:16], src[:])
 	copy(ip[16:20], dst[:])
 
-	udp := packet[34:]
-	binary.BigEndian.PutUint16(udp[0:2], 12345)
-	binary.BigEndian.PutUint16(udp[2:4], 443)
-	binary.BigEndian.PutUint16(udp[4:6], 8)
+	if protocol == 17 {
+		udp := packet[34:]
+		binary.BigEndian.PutUint16(udp[0:2], 12345)
+		binary.BigEndian.PutUint16(udp[2:4], 443)
+		binary.BigEndian.PutUint16(udp[4:6], uint16(payloadLen))
+	}
+	return packet
+}
+
+func icmpv6TestPacket(src [16]byte, dst [16]byte, icmpType byte) []byte {
+	packet := make([]byte, 14+40+8)
+	copy(packet[0:6], []byte{0x02, 0, 0, 0, 0, 1})
+	copy(packet[6:12], []byte{0x02, 0, 0, 0, 0, 2})
+	binary.BigEndian.PutUint16(packet[12:14], 0x86dd)
+
+	ip := packet[14:54]
+	ip[0] = 0x60
+	binary.BigEndian.PutUint16(ip[4:6], 8)
+	ip[6] = 58
+	ip[7] = 255
+	copy(ip[8:24], src[:])
+	copy(ip[24:40], dst[:])
+
+	icmp := packet[54:]
+	icmp[0] = icmpType
+	return packet
+}
+
+func arpTestPacket() []byte {
+	packet := make([]byte, 14+28)
+	copy(packet[0:6], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+	copy(packet[6:12], []byte{0x02, 0, 0, 0, 0, 2})
+	binary.BigEndian.PutUint16(packet[12:14], 0x0806)
 	return packet
 }

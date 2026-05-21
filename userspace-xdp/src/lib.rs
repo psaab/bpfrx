@@ -348,13 +348,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let parsed = match eth_proto {
         ETH_P_IP => parse_ipv4(data, data_end, vlan_id, vlan_pcp, vlan_present, l3_offset),
         ETH_P_IPV6 => parse_ipv6(data, data_end, vlan_id, vlan_pcp, vlan_present, l3_offset),
-        // Non-IP (ARP, LLDP, etc.): XDP_PASS to kernel stack.
-        // cpumap redirect for ARP breaks kernel neighbor resolution:
-        // the cpumap processing path on the remote CPU doesn't trigger
-        // the L2 ARP state machine, leaving entries in INCOMPLETE state.
-        // XDP_PASS delivers directly to the local kernel stack which
-        // correctly updates the neighbor table.
-        _ => return Ok(xdp_action::XDP_PASS),
+        _ => return Ok(pass_non_ip_l2_direct()),
     };
     let Some(parsed) = parsed else {
         return drop_degraded_transit(ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL);
@@ -486,11 +480,10 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         return pass_local_control(ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
     }
     // ICMPv6 NDP messages (NS/NA/RS/RA/Redirect, types 133-137) are
-    // link-local control plane — always pass directly to kernel so it
-    // can maintain the neighbor table. This is the IPv6 equivalent of
-    // the ARP XDP_PASS path above.
+    // link-local control plane. Prefer cpumap delivery when available,
+    // falling back to XDP_PASS only if cpumap is unavailable.
     if parsed.protocol == PROTO_ICMPV6 && parsed.icmp_type >= 133 && parsed.icmp_type <= 137 {
-        return Ok(xdp_action::XDP_PASS);
+        return pass_local_control(ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
     }
     if !native_gre {
         match live_userspace_session_action(&parsed) {
@@ -875,7 +868,7 @@ fn degraded_ctrl_disabled_action(ctx: &XdpContext, ctrl: &UserspaceCtrl) -> Resu
         ETH_P_IP => parse_ipv4(data, data_end, vlan_id, vlan_pcp, vlan_present, l3_offset),
         ETH_P_IPV6 => parse_ipv6(data, data_end, vlan_id, vlan_pcp, vlan_present, l3_offset),
         _ => {
-            return pass_local_control_direct(ctrl, USERSPACE_FALLBACK_REASON_CTRL_DISABLED);
+            return pass_non_ip_l2_control_direct(USERSPACE_FALLBACK_REASON_CTRL_DISABLED);
         }
     };
     let Some(parsed) = parsed else {
@@ -887,10 +880,17 @@ fn degraded_ctrl_disabled_action(ctx: &XdpContext, ctrl: &UserspaceCtrl) -> Resu
     drop_degraded_transit(ctrl, USERSPACE_FALLBACK_REASON_CTRL_DISABLED)
 }
 
-fn pass_local_control_direct(_ctrl: &UserspaceCtrl, reason: u32) -> Result<u32, i64> {
+fn pass_non_ip_l2_control_direct(reason: u32) -> Result<u32, i64> {
     incr_fallback_stat(reason);
     incr_fallback_stat(USERSPACE_FALLBACK_REASON_PASS_TO_KERNEL);
-    Ok(xdp_action::XDP_PASS)
+    Ok(pass_non_ip_l2_direct())
+}
+
+fn pass_non_ip_l2_direct() -> u32 {
+    // Non-IP local L2 frames such as ARP and LLDP must go directly to the
+    // kernel stack. cpumap redirect breaks ARP neighbor resolution because
+    // the remote-CPU processing path does not drive the local L2 state machine.
+    xdp_action::XDP_PASS
 }
 
 fn pass_local_control(ctrl: &UserspaceCtrl, reason: u32) -> Result<u32, i64> {
@@ -914,9 +914,13 @@ fn is_degraded_local_or_control(
     if is_icmp_to_interface_nat_local(parsed) || is_local_destination(parsed) {
         return true;
     }
+    if parsed.protocol == PROTO_ESP && is_interface_nat_destination(parsed) {
+        return true;
+    }
     parsed.protocol == PROTO_GRE
         && (ctrl.flags & USERSPACE_CTRL_FLAG_NATIVE_GRE) != 0
-        && classify_native_gre_inner(data, data_end, parsed) == USERSPACE_SESSION_ACTION_PASS_TO_KERNEL
+        && classify_native_gre_inner(data, data_end, parsed)
+            == USERSPACE_SESSION_ACTION_PASS_TO_KERNEL
 }
 
 #[inline(always)]

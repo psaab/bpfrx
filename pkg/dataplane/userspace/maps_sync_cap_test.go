@@ -1,11 +1,13 @@
 package userspace
 
 import (
+	"encoding/binary"
 	"errors"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
@@ -69,6 +71,114 @@ func TestApplyHelperStatusRejectsOverCapIfindex(t *testing.T) {
 	}
 	if lookupErr != nil && !errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
 		t.Fatalf("lookup userspace_ctrl after binding publication failure: %v", lookupErr)
+	}
+}
+
+func TestApplyHelperStatusDisablesLiveCtrlOnPublicationFailure(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+	m := New()
+	ctrlMap, _ := injectCtrlAndBindingMaps(t, m)
+	m.neighborsPrewarmed = true
+	m.xskLivenessProven = true
+	m.ctrlWasEnabled = true
+	m.publishedSnapshot = 1
+
+	zero := uint32(0)
+	if err := ctrlMap.Update(zero, userspaceCtrlValue{
+		Enabled:            1,
+		MetadataVersion:    userspaceMetadataVersion,
+		Workers:            1,
+		QueueCount:         1,
+		HeartbeatTimeoutMS: 30000,
+	}, ebpf.UpdateAny); err != nil {
+		t.Fatalf("seed userspace_ctrl: %v", err)
+	}
+
+	overCapIfindex := int(dataplane.MaxInterfaces) + 7
+	status := ProcessStatus{
+		Enabled:                true,
+		Workers:                1,
+		LastSnapshotGeneration: 1,
+		NeighborGeneration:     1,
+		Capabilities: UserspaceCapabilities{
+			ForwardingSupported: true,
+		},
+		Bindings: []BindingStatus{{
+			Slot:       1,
+			QueueID:    0,
+			Ifindex:    overCapIfindex,
+			Registered: true,
+			Armed:      true,
+			Bound:      true,
+		}},
+	}
+
+	err := m.applyHelperStatusLocked(&status)
+	if err == nil {
+		t.Fatal("applyHelperStatusLocked returned nil for over-cap ifindex, want error")
+	}
+	var ctrl userspaceCtrlValue
+	if lookupErr := ctrlMap.Lookup(zero, &ctrl); lookupErr != nil {
+		t.Fatalf("lookup userspace_ctrl after publication failure: %v", lookupErr)
+	}
+	if ctrl.Enabled != 0 {
+		t.Fatalf("userspace_ctrl.Enabled = %d after live publication failure, want 0", ctrl.Enabled)
+	}
+	if m.ctrlWasEnabled {
+		t.Fatal("ctrlWasEnabled = true after fail-closed publication failure, want false")
+	}
+}
+
+func TestSyncLocalAddressMapsAddsBeforeRemovingStale(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+	m := New()
+	localV4Map, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    4,
+		ValueSize:  1,
+		MaxEntries: 1,
+	})
+	if err != nil {
+		t.Fatalf("new userspace_local_v4 map: %v", err)
+	}
+	t.Cleanup(func() { localV4Map.Close() })
+	injectShimMap(t, m.bpfShim, "userspace_local_v4", localV4Map)
+	injectShimMapSpec(t, m.bpfShim, "userspace_local_v6", &ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    uint32(unsafe.Sizeof(userspaceLocalV6Key{})),
+		ValueSize:  1,
+		MaxEntries: 16,
+	})
+
+	oldLocal := binary.BigEndian.Uint32([]byte{192, 0, 2, 1})
+	newLocal := binary.BigEndian.Uint32([]byte{198, 51, 100, 1})
+	if err := localV4Map.Update(oldLocal, uint8(1), ebpf.UpdateAny); err != nil {
+		t.Fatalf("seed userspace_local_v4: %v", err)
+	}
+
+	err = m.syncLocalAddressMapsLocked(&ConfigSnapshot{
+		Interfaces: []InterfaceSnapshot{{
+			Name: "reth0.0",
+			Addresses: []InterfaceAddressSnapshot{{
+				Family:  "inet",
+				Address: "198.51.100.1/24",
+			}},
+		}},
+	})
+	if err == nil {
+		t.Fatal("syncLocalAddressMapsLocked succeeded despite full map, want add-before-remove failure")
+	}
+
+	var got uint8
+	if err := localV4Map.Lookup(oldLocal, &got); err != nil {
+		t.Fatalf("old local address was removed before replacement published: %v", err)
+	}
+	if err := localV4Map.Lookup(newLocal, &got); !errors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Fatalf("new local address lookup err = %v, want ErrKeyNotExist after failed add", err)
 	}
 }
 
