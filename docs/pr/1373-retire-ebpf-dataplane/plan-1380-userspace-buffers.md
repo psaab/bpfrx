@@ -21,9 +21,10 @@ the same operator utility as the legacy path.
   unbounded status-counter section for neighbor entries, active flow-cache
   counts, flow-cache collision evictions, fill/TX ring saturation, pending-TX
   gauges, and worker queue overflow/drop attribution.
-- Current closeout: no additional userspace fill-percentage rows are valid
-  without new helper-published denominators. The remaining useful #1380 work is
-  documentation and issue closure, not hard-coding capacities in Go.
+- #1453/#1454 closeout: the helper protocol now carries the meaningful
+  Rust-owned denominators for dynamic userspace structures that already have
+  real runtime capacity. Go consumes those optional fields and still suppresses
+  utilization rows when a mixed-version helper omits them.
 
 ## Design
 
@@ -39,17 +40,16 @@ If mixed-version helpers omit a newer capacity surface, Go must fall back to the
 older binding fields or clearly mark the row unavailable. It must not display
 zero capacity for a live binding unless the helper explicitly reported zero.
 
-The current helper status does not publish capacity denominators for the
-session table, dynamic neighbor cache, or per-worker flow cache. `show system
-buffers` therefore reports active sessions through the existing footer and
-renders neighbor/flow-cache pressure as counts/counters, not fill percentages.
-This is now the Phase 5 contract, not an undecided gap: adding true fill rows
-for those structures requires new optional helper fields such as
-`session_table_entries/max_sessions`, `flow_cache_capacity`, and
-`neighbor_cache_capacity`; Go must not hard-code Rust private constants to infer
-those denominators. `TestFormatSystemBuffersKeepsDynamicCountsOutOfUtilizationTable`
-pins the contract so dynamic counts cannot drift into the utilization table
-without real denominators.
+Helper status publishes `session_table_entries/max_sessions` and
+per-binding `flow_cache_capacity` from the Rust owners of those structures, with
+aggregate process-level fields for renderers that do not inspect binding
+detail. `show system buffers`, gRPC `ShowText`, and REST JSON render
+session-table and flow-cache fill percentages only from those helper-owned
+denominators. The neighbor cache remains explicit as
+`neighbor_cache_capacity`, but the current sharded map is growable rather than
+bounded, so Rust reports zero and Go renders neighbor entries as a counter
+unless a future helper owns and publishes a true capacity. Go must not hard-code
+Rust private constants to infer missing denominators.
 
 ## Hot-Path Invariants
 
@@ -91,8 +91,12 @@ without real denominators.
   helper status is present.
 - Go: formatter covers CoS queued-byte capacity plus existing helper pressure
   counters without turning unbounded counts into utilization percentages; the
-  dynamic-count regression test must fail if neighbor/flow-cache counters gain
-  a `Usage%` row before helper capacity fields exist.
+  dynamic-count regression test must fail if session/flow/neighbor counters gain
+  a `Usage%` row without helper-published capacity fields.
+- Go: helper-published session-table and flow-cache capacity fields produce
+  warning/critical utilization rows in the shared formatter, CLI, gRPC, and
+  REST paths, while older helpers still render counters or omit rows rather than
+  false zero-capacity percentages.
 - Integration: userspace cluster under forwarding load shows nonzero AF_XDP
   capacities, stable active sessions, and no status command hang.
 

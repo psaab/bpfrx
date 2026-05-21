@@ -278,6 +278,8 @@ impl super::Coordinator {
                     cos_queue_lease_acquire_v8_calls: s.cos_queue_lease_acquire_v8_calls,
                     cos_queue_lease_acquire_v8_granted_bytes: s
                         .cos_queue_lease_acquire_v8_granted_bytes,
+                    session_table_entries: s.session_table_entries,
+                    max_sessions: s.max_sessions,
                     dead,
                     panic_message,
                     thread_cpu_ns_60s: w.thread_cpu_ns,

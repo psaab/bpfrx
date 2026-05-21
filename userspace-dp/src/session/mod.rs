@@ -5,7 +5,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use std::net::IpAddr;
 
-
 // #1047 P2: SessionKey and the key-transform helpers (forward_wire_key,
 // translated_session_key, reverse_canonical_key, reverse_wire_key,
 // reply_matches_forward_session) live in session/key.rs. Re-exporting
@@ -16,8 +15,8 @@ mod entry;
 pub(crate) use entry::*;
 mod wheel;
 use wheel::{
-    bucket_for_tick, target_tick_for, FAR_FUTURE_OFFSET, SessionWheel, WheelEntry, WHEEL_BUCKETS,
-    WHEEL_TICK_NS,
+    FAR_FUTURE_OFFSET, SessionWheel, WHEEL_BUCKETS, WHEEL_TICK_NS, WheelEntry, bucket_for_tick,
+    target_tick_for,
 };
 
 const SESSION_GC_INTERVAL_NS: u64 = 1_000_000_000;
@@ -27,7 +26,6 @@ const TCP_CLOSING_TIMEOUT_NS: u64 = 30_000_000_000;
 const DEFAULT_UDP_SESSION_TIMEOUT_NS: u64 = 60_000_000_000;
 const DEFAULT_ICMP_SESSION_TIMEOUT_NS: u64 = 60_000_000_000;
 const OTHER_SESSION_TIMEOUT_NS: u64 = 30_000_000_000;
-
 
 /// Per-call statistics for `expire_stale_entries` pop work, used by
 /// the timer-wheel unit tests to assert K-bounds and entry
@@ -107,7 +105,6 @@ macro_rules! debug_log {
         eprintln!($($arg)*);
     };
 }
-
 
 #[derive(Clone, Debug)]
 struct SessionEntry {
@@ -278,6 +275,10 @@ impl SessionTable {
         self.key_to_handle.len()
     }
 
+    pub fn max_sessions(&self) -> usize {
+        self.max_sessions
+    }
+
     // ── #964 Step 1 internal helpers ─────────────────────────────
     //
     // Centralize key→handle and handle→record resolution so the rest
@@ -383,7 +384,10 @@ impl SessionTable {
             // visits will be popped within the same call — by design).
             let due_count = self.wheel.buckets[bucket_idx].len();
             for _ in 0..due_count {
-                let WheelEntry { key, scheduled_tick } = self.wheel.buckets[bucket_idx]
+                let WheelEntry {
+                    key,
+                    scheduled_tick,
+                } = self.wheel.buckets[bucket_idx]
                     .pop_front()
                     .expect("len snapshot bounds the iteration");
                 self.last_pop_stats.scanned += 1;
@@ -1053,7 +1057,12 @@ impl SessionTable {
         // matches the plan's "primary index is authoritative" model.
         for (key, handle) in &self.key_to_handle {
             if let Some(record) = self.entries.get(*handle as usize) {
-                f(key, record.entry.decision, &record.entry.metadata, record.entry.origin);
+                f(
+                    key,
+                    record.entry.decision,
+                    &record.entry.metadata,
+                    record.entry.origin,
+                );
             }
         }
     }
@@ -1121,11 +1130,7 @@ impl SessionTable {
         // safety net (returns None instead of corrupting another
         // session's indices).
         if record.key != *key {
-            debug_assert!(
-                false,
-                "remove_entry: stale key_to_handle for {:?}",
-                key
-            );
+            debug_assert!(false, "remove_entry: stale key_to_handle for {:?}", key);
             self.key_to_handle.insert(key.clone(), handle);
             return None;
         }
@@ -1139,11 +1144,7 @@ impl SessionTable {
         // stored handle still equals our handle. Mirrors today's
         // matches!(... existing == key) pattern.
         self.remove_forward_nat_index(key, handle, decision, &metadata);
-        remove_owner_rg_index_entry(
-            &mut self.owner_rg_sessions,
-            metadata.owner_rg_id,
-            handle,
-        );
+        remove_owner_rg_index_entry(&mut self.owner_rg_sessions, metadata.owner_rg_id, handle);
         // Mandatory debug assertion: NO handle-valued index still
         // points at the freed handle. Catches eager-cleanup
         // invariant violations before slab slot reuse.
@@ -1268,10 +1269,7 @@ impl SessionTable {
         !self.key_to_handle.values().any(|h| *h == handle)
             && !self.nat_reverse_index.values().any(|h| *h == handle)
             && !self.forward_wire_index.values().any(|h| *h == handle)
-            && !self
-                .reverse_translated_index
-                .values()
-                .any(|h| *h == handle)
+            && !self.reverse_translated_index.values().any(|h| *h == handle)
             && !self
                 .owner_rg_sessions
                 .values()
@@ -1283,6 +1281,10 @@ impl SessionTable {
     fn no_index_points_at(&self, _handle: u32) -> bool {
         true
     }
+}
+
+pub(crate) const fn default_max_sessions() -> usize {
+    DEFAULT_MAX_SESSIONS
 }
 
 fn remove_owner_rg_index_entry(
@@ -1315,7 +1317,6 @@ fn session_timeout_ns(protocol: u8, tcp_flags: u8, timeouts: &SessionTimeouts) -
         _ => OTHER_SESSION_TIMEOUT_NS,
     }
 }
-
 
 #[cfg(test)]
 #[path = "tests.rs"]

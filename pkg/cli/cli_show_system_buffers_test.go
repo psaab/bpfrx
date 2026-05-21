@@ -30,7 +30,9 @@ func TestShowSystemBuffersUsesSharedUserspaceFormatter(t *testing.T) {
 			v4:      2,
 			v6:      1,
 			status: dpuserspace.ProcessStatus{
-				NeighborEntries: 8,
+				SessionTableEntries: 9,
+				MaxSessions:         10,
+				NeighborEntries:     8,
 				PerBinding: []dpuserspace.BindingCountersSnapshot{
 					{
 						WorkerID:                    1,
@@ -41,6 +43,7 @@ func TestShowSystemBuffersUsesSharedUserspaceFormatter(t *testing.T) {
 						TxRingCapacity:              100,
 						OutstandingTX:               20,
 						ActiveFlowCount:             5,
+						FlowCacheCapacity:           10,
 						FlowCacheCollisionEvictions: 3,
 						DbgTxRingFull:               4,
 					},
@@ -60,9 +63,12 @@ func TestShowSystemBuffersUsesSharedUserspaceFormatter(t *testing.T) {
 		"Userspace Buffer Utilization:",
 		"AF_XDP UMEM frames",
 		"AF_XDP TX ring",
+		"Session table entries",
+		"90.0% CRITICAL",
+		"Flow cache active flows",
+		"50.0% OK",
 		"Userspace Status Counters:",
 		"Neighbor cache entries",
-		"Flow cache active flows",
 		"Flow cache collision evict",
 		"TX ring full events",
 		"Active sessions: 2 IPv4, 1 IPv6, 3 total",

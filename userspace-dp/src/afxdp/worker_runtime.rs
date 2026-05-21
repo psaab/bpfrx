@@ -66,6 +66,8 @@ pub(crate) struct WorkerRuntimeCounters {
     pub idle_loops: u64,
     pub cos_queue_lease_acquire_v8_calls: u64,
     pub cos_queue_lease_acquire_v8_granted_bytes: u64,
+    pub session_table_entries: u64,
+    pub max_sessions: u64,
 }
 
 /// 60 s rolling window. Sized to comfortably cover typical Prometheus
@@ -117,6 +119,8 @@ pub(crate) struct WorkerRuntimeAtomics {
     pub idle_loops: AtomicU64,
     pub cos_queue_lease_acquire_v8_calls: AtomicU64,
     pub cos_queue_lease_acquire_v8_granted_bytes: AtomicU64,
+    pub session_table_entries: AtomicU64,
+    pub max_sessions: AtomicU64,
     /// Snapshot of the corresponding cumulative counter at the start of
     /// the current rolling window, plus the monotonic timestamp the
     /// snapshot was taken at. `publish()` rotates these whenever the
@@ -171,6 +175,8 @@ impl WorkerRuntimeAtomics {
             idle_loops: AtomicU64::new(0),
             cos_queue_lease_acquire_v8_calls: AtomicU64::new(0),
             cos_queue_lease_acquire_v8_granted_bytes: AtomicU64::new(0),
+            session_table_entries: AtomicU64::new(0),
+            max_sessions: AtomicU64::new(0),
             wall_ns_window_base: AtomicU64::new(0),
             active_ns_window_base: AtomicU64::new(0),
             thread_cpu_ns_window_base: AtomicU64::new(0),
@@ -204,6 +210,9 @@ impl WorkerRuntimeAtomics {
             c.cos_queue_lease_acquire_v8_granted_bytes,
             Ordering::Relaxed,
         );
+        self.session_table_entries
+            .store(c.session_table_entries, Ordering::Relaxed);
+        self.max_sessions.store(c.max_sessions, Ordering::Relaxed);
 
         let base_at = self.window_base_at_ns.load(Ordering::Relaxed);
         if base_at == 0 {
@@ -234,7 +243,8 @@ impl WorkerRuntimeAtomics {
             // hole flagged by PR #1311 round-2 review.
             self.window_gen.fetch_add(1, Ordering::AcqRel);
             self.wall_ns_60s.store(new_wall_delta, Ordering::Relaxed);
-            self.active_ns_60s.store(new_active_delta, Ordering::Relaxed);
+            self.active_ns_60s
+                .store(new_active_delta, Ordering::Relaxed);
             self.thread_cpu_ns_60s
                 .store(new_cpu_delta, Ordering::Relaxed);
             self.window_ns.store(new_window, Ordering::Relaxed);
@@ -269,6 +279,8 @@ impl WorkerRuntimeAtomics {
             cos_queue_lease_acquire_v8_granted_bytes: self
                 .cos_queue_lease_acquire_v8_granted_bytes
                 .load(Ordering::Relaxed),
+            session_table_entries: self.session_table_entries.load(Ordering::Relaxed),
+            max_sessions: self.max_sessions.load(Ordering::Relaxed),
         }
     }
 

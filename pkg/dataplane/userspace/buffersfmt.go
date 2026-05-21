@@ -13,6 +13,7 @@ const (
 	systemBufferLabelAFXDPUMEMFrames        = "AF_XDP UMEM frames"
 	systemBufferLabelAFXDPTXRing            = "AF_XDP TX ring"
 	systemBufferLabelCoSQueueBytes          = "CoS queue bytes"
+	systemBufferLabelSessionTableEntries    = "Session table entries"
 	systemBufferLabelNeighborCacheEntries   = "Neighbor cache entries"
 	systemBufferLabelFlowCacheActiveFlows   = "Flow cache active flows"
 	systemBufferLabelFlowCacheEvictions     = "Flow cache collision evict"
@@ -50,6 +51,7 @@ type systemBufferSample struct {
 	TXRingCap                   uint32
 	TXRingUsed                  uint32
 	ActiveFlowCount             uint32
+	FlowCacheCapacity           uint32
 	FlowCacheCollisionEvictions uint64
 	DebugPendingFillFrames      uint32
 	DebugSpareFillFrames        uint32
@@ -178,8 +180,9 @@ func FormatSystemBuffers(status ProcessStatus, detail bool) string {
 	var b strings.Builder
 	b.WriteString(systemBufferUtilizationHeading + "\n")
 	if len(rows) == 0 {
-		b.WriteString("  unavailable: helper status does not include bounded AF_XDP capacity gauges\n")
+		b.WriteString("  unavailable: helper status does not include bounded userspace capacity gauges\n")
 		b.WriteString("  required status fields: per_binding[].umem_total_frames, per_binding[].umem_inflight_frames, per_binding[].tx_ring_capacity, per_binding[].outstanding_tx\n")
+		b.WriteString("  dynamic status fields: session_table_entries/max_sessions, per_binding[].flow_cache_capacity, neighbor_cache_capacity\n")
 		b.WriteString("  bindings[] mirrors with the same fields are also accepted\n")
 	} else {
 		if knownUMEM == 0 && knownTX == 0 {
@@ -252,6 +255,34 @@ func systemBufferRows(
 		})
 	}
 	rows = append(rows, systemBufferCoSRows(status, detail)...)
+	if status.MaxSessions > 0 {
+		rows = append(rows, systemBufferRow{
+			Name:     systemBufferLabelSessionTableEntries,
+			Scope:    "aggregate",
+			Capacity: status.MaxSessions,
+			Used:     status.SessionTableEntries,
+		})
+	}
+	if flowUsed, flowCap, flowKnown := systemBufferFlowCacheAggregate(status, samples); flowCap > 0 {
+		scope := "aggregate"
+		if flowKnown > 0 {
+			scope = fmt.Sprintf("aggregate/%d", flowKnown)
+		}
+		rows = append(rows, systemBufferRow{
+			Name:     systemBufferLabelFlowCacheActiveFlows,
+			Scope:    scope,
+			Capacity: flowCap,
+			Used:     flowUsed,
+		})
+	}
+	if status.NeighborCacheCapacity > 0 {
+		rows = append(rows, systemBufferRow{
+			Name:     systemBufferLabelNeighborCacheEntries,
+			Scope:    "dynamic",
+			Capacity: status.NeighborCacheCapacity,
+			Used:     uint64(status.NeighborEntries),
+		})
+	}
 	if detail {
 		for _, sample := range samples {
 			scope := systemBufferSampleScope(sample)
@@ -271,9 +302,43 @@ func systemBufferRows(
 					Used:     uint64(sample.TXRingUsed),
 				})
 			}
+			if sample.FlowCacheCapacity > 0 {
+				rows = append(rows, systemBufferRow{
+					Name:     systemBufferLabelFlowCacheActiveFlows,
+					Scope:    scope,
+					Capacity: uint64(sample.FlowCacheCapacity),
+					Used:     uint64(sample.ActiveFlowCount),
+				})
+			}
 		}
 	}
 	return rows, knownUMEM, knownTX
+}
+
+func systemBufferFlowCacheAggregate(
+	status ProcessStatus,
+	samples []systemBufferSample,
+) (uint64, uint64, int) {
+	var used, capacity uint64
+	var known int
+	for _, sample := range samples {
+		if sample.FlowCacheCapacity == 0 {
+			continue
+		}
+		known++
+		used += uint64(sample.ActiveFlowCount)
+		capacity += uint64(sample.FlowCacheCapacity)
+	}
+	if capacity > 0 {
+		return used, capacity, known
+	}
+	if status.FlowCacheCapacity == 0 {
+		return 0, 0, 0
+	}
+	for _, sample := range samples {
+		used += uint64(sample.ActiveFlowCount)
+	}
+	return used, status.FlowCacheCapacity, 0
 }
 
 func systemBufferUsage(row systemBufferRow) (float64, string) {
@@ -387,8 +452,15 @@ func systemBufferCounterRows(status ProcessStatus, samples []systemBufferSample,
 			rows = append(rows, systemBufferCounterRow{Name: name, Scope: scope, Value: value})
 		}
 	}
-	appendCounter(systemBufferLabelNeighborCacheEntries, "dynamic", uint64(status.NeighborEntries))
-	appendCounter(systemBufferLabelFlowCacheActiveFlows, "active window", activeFlowCount)
+	if status.MaxSessions == 0 {
+		appendCounter(systemBufferLabelSessionTableEntries, "aggregate", status.SessionTableEntries)
+	}
+	if status.NeighborCacheCapacity == 0 {
+		appendCounter(systemBufferLabelNeighborCacheEntries, "dynamic", uint64(status.NeighborEntries))
+	}
+	if _, flowCap, _ := systemBufferFlowCacheAggregate(status, samples); flowCap == 0 {
+		appendCounter(systemBufferLabelFlowCacheActiveFlows, "active window", activeFlowCount)
+	}
 	appendCounter(systemBufferLabelFlowCacheEvictions, "aggregate", flowCacheCollisionEvictions)
 	appendCounter(systemBufferLabelPendingFillFrames, "aggregate", debugPendingFillFrames)
 	appendCounter(systemBufferLabelSpareFillFrames, "aggregate", debugSpareFillFrames)
@@ -416,7 +488,9 @@ func systemBufferCounterRows(status ProcessStatus, samples []systemBufferSample,
 	}
 	for _, sample := range samples {
 		scope := systemBufferSampleScope(sample)
-		appendCounter(systemBufferLabelFlowCacheActiveFlows, scope, uint64(sample.ActiveFlowCount))
+		if sample.FlowCacheCapacity == 0 {
+			appendCounter(systemBufferLabelFlowCacheActiveFlows, scope, uint64(sample.ActiveFlowCount))
+		}
 		appendCounter(systemBufferLabelFlowCacheEvictions, scope, sample.FlowCacheCollisionEvictions)
 		appendCounter(systemBufferLabelPendingFillFrames, scope, uint64(sample.DebugPendingFillFrames))
 		appendCounter(systemBufferLabelSpareFillFrames, scope, uint64(sample.DebugSpareFillFrames))
@@ -471,6 +545,7 @@ func systemBufferSamples(status ProcessStatus) []systemBufferSample {
 				TXRingCap:                   binding.TxRingCapacity,
 				TXRingUsed:                  binding.OutstandingTX,
 				ActiveFlowCount:             binding.ActiveFlowCount,
+				FlowCacheCapacity:           binding.FlowCacheCapacity,
 				FlowCacheCollisionEvictions: binding.FlowCacheCollisionEvictions,
 				DbgTxRingFull:               binding.DbgTxRingFull,
 				DbgSendtoENOBUFS:            binding.DbgSendtoENOBUFS,
@@ -491,6 +566,9 @@ func systemBufferSamples(status ProcessStatus) []systemBufferSample {
 				if binding.TxRingCapacity == 0 {
 					sample.TXRingCap = full.TxRingCapacity
 					sample.TXRingUsed = full.OutstandingTX
+				}
+				if binding.FlowCacheCapacity == 0 {
+					sample.FlowCacheCapacity = full.FlowCacheCapacity
 				}
 				sample.applyBindingStatusFallback(full)
 			}
@@ -518,6 +596,7 @@ func systemBufferSamples(status ProcessStatus) []systemBufferSample {
 			TXRingCap:                   binding.TxRingCapacity,
 			TXRingUsed:                  binding.OutstandingTX,
 			ActiveFlowCount:             binding.ActiveFlowCount,
+			FlowCacheCapacity:           binding.FlowCacheCapacity,
 			FlowCacheCollisionEvictions: binding.FlowCacheCollisionEvictions,
 			DebugPendingFillFrames:      binding.DebugPendingFillFrames,
 			DebugSpareFillFrames:        binding.DebugSpareFillFrames,
@@ -563,6 +642,9 @@ func systemBufferSamples(status ProcessStatus) []systemBufferSample {
 func (sample *systemBufferSample) applyBindingStatusFallback(binding BindingStatus) {
 	if sample.ActiveFlowCount == 0 {
 		sample.ActiveFlowCount = binding.ActiveFlowCount
+	}
+	if sample.FlowCacheCapacity == 0 {
+		sample.FlowCacheCapacity = binding.FlowCacheCapacity
 	}
 	if sample.FlowCacheCollisionEvictions == 0 {
 		sample.FlowCacheCollisionEvictions = binding.FlowCacheCollisionEvictions

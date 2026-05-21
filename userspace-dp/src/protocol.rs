@@ -779,6 +779,23 @@ pub(crate) struct ProcessStatus {
     pub interface_addresses: usize,
     #[serde(rename = "neighbor_entries", default)]
     pub neighbor_entries: usize,
+    /// Total entries installed in the Rust-owned worker session tables.
+    /// Additive for mixed-version compatibility: older helpers omit it
+    /// and Go treats zero max_sessions as "no denominator available".
+    #[serde(rename = "session_table_entries", default)]
+    pub session_table_entries: usize,
+    /// Aggregate capacity of the Rust-owned worker session tables.
+    #[serde(rename = "max_sessions", default)]
+    pub max_sessions: usize,
+    /// Aggregate per-binding flow-cache capacity across helper-published
+    /// binding status rows. Zero means unavailable, not full.
+    #[serde(rename = "flow_cache_capacity", default)]
+    pub flow_cache_capacity: usize,
+    /// Hard capacity for the dynamic neighbor cache. The current
+    /// sharded map is growable, so zero intentionally suppresses
+    /// utilization rows until Rust owns a real bounded denominator.
+    #[serde(rename = "neighbor_cache_capacity", default)]
+    pub neighbor_cache_capacity: usize,
     #[serde(rename = "neighbor_generation", default)]
     pub neighbor_generation: u64,
     #[serde(rename = "route_entries", default)]
@@ -1374,6 +1391,12 @@ pub struct WorkerRuntimeStatus {
     /// #1240: cumulative bytes granted by v8 queue-lease acquire calls.
     #[serde(rename = "cos_queue_lease_acquire_v8_granted_bytes", default)]
     pub cos_queue_lease_acquire_v8_granted_bytes: u64,
+    /// Current entries in this worker's Rust-owned SessionTable.
+    #[serde(rename = "session_table_entries", default)]
+    pub session_table_entries: u64,
+    /// Capacity of this worker's Rust-owned SessionTable.
+    #[serde(rename = "max_sessions", default)]
+    pub max_sessions: u64,
     /// #925: true if the worker_loop thread panicked and the supervisor
     /// caught it. Set once on first panic; never cleared in Phase 1.
     /// Operators see DEAD in `cli show chassis forwarding` and must
@@ -1546,6 +1569,11 @@ pub(crate) struct BindingStatus {
     /// Prometheus to compute `{a_i}` for the structural CoV gate.
     #[serde(rename = "active_flow_count", default)]
     pub active_flow_count: u32,
+    /// Per-binding capacity of the Rust-owned flow cache. This is the
+    /// denominator for operator buffer rendering when active_flow_count
+    /// is shown as utilization.
+    #[serde(rename = "flow_cache_capacity", default)]
+    pub flow_cache_capacity: u32,
     /// #941 Work item D / #943: count of V_min hard-cap activations
     /// on this binding. Hard-cap is the escape hatch that fires
     /// after V_MIN_CONSECUTIVE_SKIP_HARD_CAP back-to-back throttle
@@ -1987,6 +2015,9 @@ pub(crate) struct BindingCountersSnapshot {
     /// BindingStatus.active_flow_count for full doc.
     #[serde(rename = "active_flow_count", default)]
     pub active_flow_count: u32,
+    /// Per-binding flow-cache capacity. Mirrors BindingStatus.
+    #[serde(rename = "flow_cache_capacity", default)]
+    pub flow_cache_capacity: u32,
     /// #941 Work item D / #943: V_min hard-cap activation count.
     /// Default keeps pre-#943 consumers parseable.
     #[serde(rename = "v_min_throttle_hard_cap_overrides", default)]
@@ -2077,6 +2108,7 @@ impl From<&BindingStatus> for BindingCountersSnapshot {
             flow_cache_collision_evictions: b.flow_cache_collision_evictions,
             // #1219: active flow count snapshot. By-value u32.
             active_flow_count: b.active_flow_count,
+            flow_cache_capacity: b.flow_cache_capacity,
             // #941 Work item D / #943: V_min counters propagate from
             // BindingDebugSnapshot through to the wire-visible
             // BindingCountersSnapshot. By-value u64, no Send concerns.
@@ -2329,6 +2361,40 @@ mod tests {
     }
 
     #[test]
+    fn process_status_buffer_capacity_fields_roundtrip() {
+        let status = ProcessStatus {
+            session_table_entries: 77,
+            max_sessions: 100,
+            flow_cache_capacity: 4096,
+            neighbor_entries: 9,
+            neighbor_cache_capacity: 64,
+            worker_runtime: vec![WorkerRuntimeStatus {
+                worker_id: 2,
+                session_table_entries: 77,
+                max_sessions: 100,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let value: serde_json::Value =
+            serde_json::to_value(&status).expect("serialize ProcessStatus to Value");
+        assert_eq!(value["session_table_entries"], 77);
+        assert_eq!(value["max_sessions"], 100);
+        assert_eq!(value["flow_cache_capacity"], 4096);
+        assert_eq!(value["neighbor_cache_capacity"], 64);
+        assert_eq!(value["worker_runtime"][0]["session_table_entries"], 77);
+        assert_eq!(value["worker_runtime"][0]["max_sessions"], 100);
+
+        let back: ProcessStatus = serde_json::from_value(value).expect("deserialize ProcessStatus");
+        assert_eq!(back.session_table_entries, 77);
+        assert_eq!(back.max_sessions, 100);
+        assert_eq!(back.flow_cache_capacity, 4096);
+        assert_eq!(back.neighbor_cache_capacity, 64);
+        assert_eq!(back.worker_runtime[0].session_table_entries, 77);
+        assert_eq!(back.worker_runtime[0].max_sessions, 100);
+    }
+
+    #[test]
     fn source_nat_persistent_fields_roundtrip() {
         let rule = SourceNATRuleSnapshot {
             name: "snat".into(),
@@ -2563,6 +2629,30 @@ mod tests {
             snap.tx_completion_ring_available_max,
             status.tx_completion_ring_available_max
         );
+    }
+
+    #[test]
+    fn flow_cache_capacity_binding_status_wire_roundtrip_and_projection() {
+        let status = BindingStatus {
+            worker_id: 3,
+            slot: 7,
+            ifindex: 11,
+            queue_id: 2,
+            active_flow_count: 53,
+            flow_cache_capacity: 4096,
+            ..Default::default()
+        };
+
+        let value: serde_json::Value =
+            serde_json::to_value(&status).expect("serialize BindingStatus to Value");
+        assert_eq!(value["flow_cache_capacity"], 4096);
+
+        let back: BindingStatus = serde_json::from_value(value).expect("deserialize BindingStatus");
+        assert_eq!(back.flow_cache_capacity, status.flow_cache_capacity);
+
+        let snap: BindingCountersSnapshot = (&status).into();
+        assert_eq!(snap.active_flow_count, status.active_flow_count);
+        assert_eq!(snap.flow_cache_capacity, status.flow_cache_capacity);
     }
 
     #[test]
