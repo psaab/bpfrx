@@ -2331,6 +2331,67 @@ fn pool_snat_address_persistent_userspace_v1_contract_fixtures() {
 }
 
 #[test]
+fn pool_snat_address_persistent_userspace_v1_selects_pool_addresses() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "userspace-v1-selection".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
+        pool_name: "userspace-v1-pool".to_string(),
+        pool_addresses: vec![
+            "203.0.113.10".to_string(),
+            "203.0.113.11".to_string(),
+            "203.0.113.12".to_string(),
+            "203.0.113.13".to_string(),
+            "2001:db8:ffff::10".to_string(),
+            "2001:db8:ffff::11".to_string(),
+            "2001:db8:ffff::12".to_string(),
+            "2001:db8:ffff::13".to_string(),
+        ],
+        port_low: 40000,
+        port_high: 40010,
+        address_persistent: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+
+    let cases = [
+        ("10.0.1.100", "8.8.8.8", 50000, "203.0.113.13"),
+        ("10.0.1.101", "8.8.4.4", 50001, "203.0.113.10"),
+        (
+            "2001:db8::1",
+            "2001:4860:4860::8888",
+            50002,
+            "2001:db8:ffff::12",
+        ),
+        (
+            "fd00::1234",
+            "2001:4860:4860::8844",
+            50003,
+            "2001:db8:ffff::11",
+        ),
+    ];
+
+    for (src, dst, src_port, want_src) in cases {
+        let decision = expect_snat_decision(match_source_nat_result_for_tuple(
+            &rules,
+            "lan",
+            "wan",
+            src.parse().unwrap(),
+            dst.parse().unwrap(),
+            6,
+            src_port,
+            443,
+            None,
+            None,
+            0,
+        ));
+
+        assert_eq!(decision.rewrite_src, Some(want_src.parse().unwrap()));
+        assert_eq!(decision.rewrite_src_port, Some(40000));
+    }
+}
+
+#[test]
 fn pool_snat_address_persistent_differs_from_legacy_backend_algorithms() {
     let v4: Ipv4Addr = "10.0.1.100".parse().unwrap();
     assert_eq!(sticky_pool_index(IpAddr::V4(v4), 4), 3);
