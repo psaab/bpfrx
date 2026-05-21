@@ -112,6 +112,8 @@ type Manager struct {
 	deferWorkers            bool // skip worker spawn until NotifyLinkCycle
 	xskBoundNotified        bool // OnXSKBound fired at most once
 
+	lookupUserspaceCtrlForFailClosedHook userspaceCtrlLookupHook
+
 	mode               DataplaneMode // current active runtime mode
 	configuredMode     DataplaneMode // user-configured desired mode (from config)
 	lastHASyncTime     time.Time     // throttle HA watchdog sync to avoid control socket contention

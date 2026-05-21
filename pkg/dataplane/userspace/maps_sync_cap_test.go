@@ -347,9 +347,101 @@ func TestBlindFailClosedUserspaceCtrlAfterLookupFailure(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Skipf("RemoveMemlock: %v", err)
 	}
+	for _, tc := range []struct {
+		name       string
+		mode       DataplaneMode
+		wantStrict bool
+	}{
+		{name: "strict", mode: ModeUserspaceStrict, wantStrict: true},
+		{name: "compat", mode: ModeUserspaceCompat, wantStrict: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := New()
+			m.configuredMode = tc.mode
+			ctrlMap, _ := injectCtrlAndBindingMaps(t, m)
+			injectClassifierRefreshMapsWithFullNATV4(t, m)
+			m.ctrlWasEnabled = true
+
+			zero := uint32(0)
+			if err := ctrlMap.Update(zero, userspaceCtrlValue{
+				Enabled:            1,
+				MetadataVersion:    userspaceMetadataVersion,
+				Workers:            8,
+				QueueCount:         8,
+				HeartbeatTimeoutMS: 30000,
+			}, ebpf.UpdateAny); err != nil {
+				t.Fatalf("seed userspace_ctrl: %v", err)
+			}
+
+			lookupErr := errors.New("transient ctrl lookup failed")
+			m.lookupUserspaceCtrlForFailClosedHook = func(_ *ebpf.Map, _ uint32, _ *userspaceCtrlValue) error {
+				return lookupErr
+			}
+
+			err := m.syncUserspaceClassifierMapsFailClosedLocked(classifierRefreshFailureSnapshot())
+			if err == nil {
+				t.Fatal("classifier-map refresh succeeded despite full NAT map, want error")
+			}
+			if !strings.Contains(err.Error(), "userspace_interface_nat_v4") {
+				t.Fatalf("refresh failed before interface-NAT sync: %v", err)
+			}
+			if !errors.Is(err, lookupErr) {
+				t.Fatalf("error does not wrap lookup failure: %v", err)
+			}
+
+			var ctrl userspaceCtrlValue
+			if err := ctrlMap.Lookup(zero, &ctrl); err != nil {
+				t.Fatalf("lookup userspace_ctrl after blind fail-closed: %v", err)
+			}
+			if ctrl.Enabled != 0 {
+				t.Fatalf("userspace_ctrl.Enabled = %d after blind fail-closed, want 0", ctrl.Enabled)
+			}
+			if ctrl.MetadataVersion != userspaceMetadataVersion {
+				t.Fatalf("MetadataVersion = %d, want %d", ctrl.MetadataVersion, userspaceMetadataVersion)
+			}
+			if ctrl.Workers != 3 || ctrl.QueueCount != 3 {
+				t.Fatalf("Workers/QueueCount = %d/%d, want 3/3", ctrl.Workers, ctrl.QueueCount)
+			}
+			if ctrl.ConfigGeneration != 99 || ctrl.FIBGeneration != 7 {
+				t.Fatalf("generations = %d/%d, want 99/7", ctrl.ConfigGeneration, ctrl.FIBGeneration)
+			}
+			gotStrict := ctrl.Flags&userspaceCtrlFlagStrict != 0
+			if gotStrict != tc.wantStrict {
+				t.Fatalf("strict flag present = %t, want %t (flags=%#x)", gotStrict, tc.wantStrict, ctrl.Flags)
+			}
+			if m.ctrlWasEnabled {
+				t.Fatal("ctrlWasEnabled = true after blind fail-closed, want false")
+			}
+		})
+	}
+}
+
+func TestClassifierMapRefreshMissingCtrlRowReturnsClassifierError(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
 	m := New()
-	m.configuredMode = ModeUserspaceStrict
 	ctrlMap, _ := injectCtrlAndBindingMaps(t, m)
+	injectClassifierRefreshMapsWithFullNATV4(t, m)
+
+	err := m.syncUserspaceClassifierMapsFailClosedLocked(classifierRefreshFailureSnapshot())
+	if err == nil {
+		t.Fatal("classifier-map refresh succeeded despite full NAT map, want error")
+	}
+	if !strings.Contains(err.Error(), "userspace_interface_nat_v4") {
+		t.Fatalf("refresh failed before interface-NAT sync: %v", err)
+	}
+	if errors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Fatalf("missing ctrl row leaked ErrKeyNotExist into returned error: %v", err)
+	}
+	var ctrl userspaceCtrlValue
+	if lookupErr := ctrlMap.Lookup(uint32(0), &ctrl); !errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
+		t.Fatalf("userspace_ctrl lookup err = %v, want ErrKeyNotExist", lookupErr)
+	}
+}
+
+func injectClassifierRefreshMapsWithFullNATV4(t *testing.T, m *Manager) {
+	t.Helper()
 	injectShimMapSpec(t, m.bpfShim, "userspace_ingress_ifaces", &ebpf.MapSpec{
 		Type:       ebpf.Hash,
 		KeySize:    4,
@@ -385,32 +477,15 @@ func TestBlindFailClosedUserspaceCtrlAfterLookupFailure(t *testing.T) {
 		ValueSize:  1,
 		MaxEntries: 16,
 	})
-	m.ctrlWasEnabled = true
 
-	zero := uint32(0)
-	if err := ctrlMap.Update(zero, userspaceCtrlValue{
-		Enabled:            1,
-		MetadataVersion:    userspaceMetadataVersion,
-		Workers:            8,
-		QueueCount:         8,
-		HeartbeatTimeoutMS: 30000,
-	}, ebpf.UpdateAny); err != nil {
-		t.Fatalf("seed userspace_ctrl: %v", err)
-	}
-
-	lookupErr := errors.New("transient ctrl lookup failed")
 	oldNAT := binary.BigEndian.Uint32([]byte{203, 0, 113, 1})
 	if err := natV4Map.Update(oldNAT, uint8(1), ebpf.UpdateAny); err != nil {
 		t.Fatalf("seed userspace_interface_nat_v4: %v", err)
 	}
+}
 
-	origLookup := lookupUserspaceCtrlForFailClosed
-	lookupUserspaceCtrlForFailClosed = func(_ *ebpf.Map, _ uint32, _ *userspaceCtrlValue) error {
-		return lookupErr
-	}
-	t.Cleanup(func() { lookupUserspaceCtrlForFailClosed = origLookup })
-
-	err = m.syncUserspaceClassifierMapsFailClosedLocked(&ConfigSnapshot{
+func classifierRefreshFailureSnapshot() *ConfigSnapshot {
+	return &ConfigSnapshot{
 		Generation:    99,
 		FIBGeneration: 7,
 		Userspace: config.UserspaceConfig{
@@ -430,38 +505,6 @@ func TestBlindFailClosedUserspaceCtrlAfterLookupFailure(t *testing.T) {
 			ToZone:        "untrust",
 			InterfaceMode: true,
 		}},
-	})
-	if err == nil {
-		t.Fatal("classifier-map refresh succeeded despite full NAT map, want error")
-	}
-	if !strings.Contains(err.Error(), "userspace_interface_nat_v4") {
-		t.Fatalf("refresh failed before interface-NAT sync: %v", err)
-	}
-	if !errors.Is(err, lookupErr) {
-		t.Fatalf("error does not wrap lookup failure: %v", err)
-	}
-
-	var ctrl userspaceCtrlValue
-	if err := ctrlMap.Lookup(zero, &ctrl); err != nil {
-		t.Fatalf("lookup userspace_ctrl after blind fail-closed: %v", err)
-	}
-	if ctrl.Enabled != 0 {
-		t.Fatalf("userspace_ctrl.Enabled = %d after blind fail-closed, want 0", ctrl.Enabled)
-	}
-	if ctrl.MetadataVersion != userspaceMetadataVersion {
-		t.Fatalf("MetadataVersion = %d, want %d", ctrl.MetadataVersion, userspaceMetadataVersion)
-	}
-	if ctrl.Workers != 3 || ctrl.QueueCount != 3 {
-		t.Fatalf("Workers/QueueCount = %d/%d, want 3/3", ctrl.Workers, ctrl.QueueCount)
-	}
-	if ctrl.ConfigGeneration != 99 || ctrl.FIBGeneration != 7 {
-		t.Fatalf("generations = %d/%d, want 99/7", ctrl.ConfigGeneration, ctrl.FIBGeneration)
-	}
-	if ctrl.Flags&userspaceCtrlFlagStrict == 0 {
-		t.Fatalf("userspace_ctrl.Flags = %#x, want strict flag %#x", ctrl.Flags, userspaceCtrlFlagStrict)
-	}
-	if m.ctrlWasEnabled {
-		t.Fatal("ctrlWasEnabled = true after blind fail-closed, want false")
 	}
 }
 

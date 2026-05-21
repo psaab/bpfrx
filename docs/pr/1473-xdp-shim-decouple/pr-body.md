@@ -86,7 +86,9 @@ The Go tests add privileged XDP test-run coverage for:
 - fail-closed ctrl disable after a previously-live publication failure
 - fail-closed ctrl disable after a same-plan classifier-map refresh failure
 - wrapper-level blind fail-closed ctrl disable after a transient control-map
-  lookup failure
+  lookup failure, including strict and compat mode flag behavior
+- wrapper-level missing-ctrl-row handling, which returns the classifier-refresh
+  error without fabricating a live ctrl row
 - local and interface-NAT address map add-before-remove behavior on refresh
   failure
 - cpumap delivery for degraded IP local/control and ICMPv6 NDP

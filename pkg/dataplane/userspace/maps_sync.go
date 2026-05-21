@@ -181,10 +181,12 @@ func (m *Manager) syncUserspaceClassifierMapsLocked(snapshot *ConfigSnapshot) er
 	return m.syncInterfaceNATAddressMapsLocked(snapshot)
 }
 
-// lookupUserspaceCtrlForFailClosed lets tests force the rare kernel lookup
-// error branch without corrupting the live map handle. Production uses
-// ebpf.Map.Lookup directly through this seam.
-var lookupUserspaceCtrlForFailClosed = func(ctrlMap *ebpf.Map, key uint32, ctrl *userspaceCtrlValue) error {
+type userspaceCtrlLookupHook func(*ebpf.Map, uint32, *userspaceCtrlValue) error
+
+func (m *Manager) lookupUserspaceCtrlForFailClosed(ctrlMap *ebpf.Map, key uint32, ctrl *userspaceCtrlValue) error {
+	if m.lookupUserspaceCtrlForFailClosedHook != nil {
+		return m.lookupUserspaceCtrlForFailClosedHook(ctrlMap, key, ctrl)
+	}
 	return ctrlMap.Lookup(key, ctrl)
 }
 
@@ -196,7 +198,7 @@ func (m *Manager) syncUserspaceClassifierMapsFailClosedLocked(snapshot *ConfigSn
 		}
 		var ctrl userspaceCtrlValue
 		zero := uint32(0)
-		if lookupErr := lookupUserspaceCtrlForFailClosed(ctrlMap, zero, &ctrl); lookupErr != nil {
+		if lookupErr := m.lookupUserspaceCtrlForFailClosed(ctrlMap, zero, &ctrl); lookupErr != nil {
 			if errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
 				return err
 			}
