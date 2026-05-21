@@ -788,7 +788,6 @@ pub(super) fn wireguard_tcp_mss(
     let Some(endpoint) = forwarding
         .tunnel_endpoints
         .get(&decision.resolution.tunnel_endpoint_id)
-        .cloned()
     else {
         return 0;
     };

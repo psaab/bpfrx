@@ -1508,9 +1508,11 @@ pub(crate) fn worker_loop(
             wireguard_updates,
         } = command_results;
         for (ifname, snap) in wireguard_updates {
-            let virtual_ifindex = bindings.iter()
-                .find(|b| b.name == ifname)
-                .map(|b| b.ifindex);
+            let virtual_ifindex = forwarding
+                .ifindex_to_name
+                .iter()
+                .find(|(_, name)| name.as_str() == ifname.as_str())
+                .map(|(ifindex, _)| *ifindex);
 
             for binding in bindings.iter_mut() {
                 if let Some(snap) = snap.as_ref() {

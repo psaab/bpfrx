@@ -544,10 +544,9 @@ impl WireGuardEngine {
             return None;
         }
 
-        let header_len = match outer_dst_ip {
-            IpAddr::V4(_) => 42,
-            IpAddr::V6(_) => 62,
-        };
+        let outer_eth_len = l3_offset;
+        let ip_header_len = if outer_dst_ip.is_ipv4() { 20 } else { 40 };
+        let header_len = outer_eth_len + ip_header_len + 8;
 
         // Resize the scratch buffer FIRST to prevent reallocation invalidating the base pointer
         let max_size = 32 + header_len + inner_packet.len() + 128;
@@ -575,13 +574,20 @@ impl WireGuardEngine {
 
         // Construct outer headers in-place directly in scratch_out
         let packet_start = padding;
-        let ip_start = packet_start + 14;
-        let udp_start = ip_start + (if outer_dst_ip.is_ipv4() { 20 } else { 40 });
+        let ip_start = packet_start + outer_eth_len;
+        let udp_start = ip_start + ip_header_len;
 
         scratch_out[packet_start .. packet_start + 6].copy_from_slice(&dst_mac);
         scratch_out[packet_start + 6 .. packet_start + 12].copy_from_slice(&src_mac);
+        
+        let vlan_len = outer_eth_len - 14;
+        if vlan_len > 0 {
+            scratch_out[packet_start + 12 .. packet_start + 12 + vlan_len]
+                .copy_from_slice(&inner_frame[12 .. 12 + vlan_len]);
+        }
         let eth_proto: u16 = if outer_dst_ip.is_ipv4() { 0x0800 } else { 0x86dd };
-        scratch_out[packet_start + 12 .. packet_start + 14].copy_from_slice(&eth_proto.to_be_bytes());
+        scratch_out[packet_start + outer_eth_len - 2 .. packet_start + outer_eth_len]
+            .copy_from_slice(&eth_proto.to_be_bytes());
 
         let udp_len = 8 + wg_payload_len;
         let ip_len = match outer_dst_ip {
