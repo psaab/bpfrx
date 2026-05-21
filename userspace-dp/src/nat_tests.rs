@@ -937,6 +937,14 @@ fn session_key(src_port: u16, dst_ip: &str, dst_port: u16) -> crate::session::Se
     session_key_from_src("10.0.1.100", src_port, dst_ip, dst_port)
 }
 
+fn lease_key(src_port: u16) -> PersistentSourceKey {
+    PersistentSourceKey {
+        protocol: 6,
+        src_ip: "10.0.1.100".parse().unwrap(),
+        src_port,
+    }
+}
+
 fn session_key_from_src(
     src_ip: &str,
     src_port: u16,
@@ -1314,6 +1322,136 @@ fn pool_snat_persistent_double_rollback_removes_unused_lease() {
         assert!(live.lease_expirations.is_empty());
         assert!(live.lease_expirations_by_addr[0].is_empty());
         assert_eq!(live.recycled_ports_by_addr[0], vec![40000]);
+    }
+}
+
+#[test]
+fn pool_snat_persistent_reactivation_uses_fresh_expiry_after_success() {
+    let rules = persistent_pool_rules(300, 40000, 40001);
+    let timeout_ns = 300 * NS_PER_SEC;
+    let original = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1));
+    release_source_nat_allocation(
+        &rules,
+        &session_key(10000, "8.8.8.8", 53),
+        original,
+        false,
+        2,
+    );
+
+    let old_expiry = 2 + timeout_ns;
+    {
+        let live = rules[0]
+            .pool_allocator
+            .shared
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let lease = live.persistent_by_source.values().next().unwrap();
+        assert_eq!(lease.expires_at_ns, old_expiry);
+        assert!(live
+            .lease_expirations
+            .contains(&(old_expiry, lease_key(10000))));
+    }
+
+    let first = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "1.1.1.1", 53, 3));
+    let second = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "9.9.9.9", 53, 4));
+    assert_eq!(second.rewrite_src, first.rewrite_src);
+    assert_eq!(second.rewrite_src_port, first.rewrite_src_port);
+
+    release_source_nat_allocation(
+        &rules,
+        &session_key(10000, "9.9.9.9", 53),
+        second,
+        false,
+        5,
+    );
+    rollback_source_nat_allocation(
+        &rules,
+        &session_key(10000, "1.1.1.1", 53),
+        first,
+        false,
+        6,
+    );
+
+    let fresh_expiry = 6 + timeout_ns;
+    let status = source_nat_pool_statuses(&rules);
+    assert_eq!(status[0].live_flows, 0);
+    assert_eq!(status[0].used_ports, 1);
+    assert_eq!(status[0].persistent_leases, 1);
+    {
+        let live = rules[0]
+            .pool_allocator
+            .shared
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let lease = live.persistent_by_source.values().next().unwrap();
+        assert_eq!(lease.active_flows, 0);
+        assert_eq!(lease.completed_flows, 2);
+        assert_eq!(lease.expires_at_ns, fresh_expiry);
+        assert_eq!(live.lease_expirations.len(), 1);
+        assert!(live
+            .lease_expirations
+            .contains(&(fresh_expiry, lease_key(10000))));
+        assert!(!live
+            .lease_expirations
+            .contains(&(old_expiry, lease_key(10000))));
+    }
+}
+
+#[test]
+fn pool_snat_persistent_reactivation_double_rollback_restores_old_expiry() {
+    let rules = persistent_pool_rules(300, 40000, 40001);
+    let timeout_ns = 300 * NS_PER_SEC;
+    let original = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1));
+    release_source_nat_allocation(
+        &rules,
+        &session_key(10000, "8.8.8.8", 53),
+        original,
+        false,
+        2,
+    );
+
+    let old_expiry = 2 + timeout_ns;
+    let first = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "1.1.1.1", 53, 3));
+    let second = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "9.9.9.9", 53, 4));
+    assert_eq!(second.rewrite_src, first.rewrite_src);
+    assert_eq!(second.rewrite_src_port, first.rewrite_src_port);
+
+    rollback_source_nat_allocation(
+        &rules,
+        &session_key(10000, "1.1.1.1", 53),
+        first,
+        false,
+        5,
+    );
+    rollback_source_nat_allocation(
+        &rules,
+        &session_key(10000, "9.9.9.9", 53),
+        second,
+        false,
+        6,
+    );
+
+    let status = source_nat_pool_statuses(&rules);
+    assert_eq!(status[0].live_flows, 0);
+    assert_eq!(status[0].used_ports, 1);
+    assert_eq!(status[0].persistent_leases, 1);
+    {
+        let live = rules[0]
+            .pool_allocator
+            .shared
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let lease = live.persistent_by_source.values().next().unwrap();
+        assert_eq!(lease.active_flows, 0);
+        assert_eq!(lease.completed_flows, 1);
+        assert_eq!(lease.expires_at_ns, old_expiry);
+        assert_eq!(live.lease_expirations.len(), 1);
+        assert!(live
+            .lease_expirations
+            .contains(&(old_expiry, lease_key(10000))));
     }
 }
 

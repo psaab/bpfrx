@@ -188,9 +188,6 @@ enum AllocationOwner {
 struct LiveAllocation {
     translated: TranslatedTuple,
     persistent_key: Option<PersistentSourceKey>,
-    persistent_lease_created: bool,
-    persistent_previous_expires_at_ns: u64,
-    persistent_previous_active_flows: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -201,6 +198,11 @@ struct PersistentLease {
     timeout_ns: u64,
     active_flows: u32,
     completed_flows: u32,
+    // Baseline for the current active epoch. Rollback needs to distinguish
+    // completions in this reactivation from lifetime persistent-NAT history.
+    activation_completed_flows_baseline: u32,
+    activation_previous_expires_at_ns: u64,
+    activation_had_previous_lease: bool,
 }
 
 #[derive(Debug, Default)]
@@ -381,16 +383,15 @@ impl PortAllocator {
             if live.persistent_by_source.contains_key(&key) {
                 let mut reusable = None;
                 let mut expired = None;
-                let mut previous_expires_at_ns = 0;
-                let mut previous_active_flows = 0;
                 let mut remove_expiry = None;
                 if let Some(lease) = live.persistent_by_source.get_mut(&key) {
                     if lease.active_flows > 0 || lease.expires_at_ns > now_ns {
                         let translated = lease.translated;
-                        previous_expires_at_ns = lease.expires_at_ns;
-                        previous_active_flows = lease.active_flows;
                         if lease.active_flows == 0 {
                             remove_expiry = Some(lease.expires_at_ns);
+                            lease.activation_completed_flows_baseline = lease.completed_flows;
+                            lease.activation_previous_expires_at_ns = lease.expires_at_ns;
+                            lease.activation_had_previous_lease = true;
                         }
                         lease.active_flows = lease.active_flows.saturating_add(1);
                         let expires_at_ns =
@@ -421,9 +422,6 @@ impl PortAllocator {
                         LiveAllocation {
                             translated,
                             persistent_key: Some(key),
-                            persistent_lease_created: false,
-                            persistent_previous_expires_at_ns: previous_expires_at_ns,
-                            persistent_previous_active_flows: previous_active_flows,
                         },
                     );
                     self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
@@ -481,6 +479,9 @@ impl PortAllocator {
                         timeout_ns: persistent_nat_timeout_ns.max(NS_PER_SEC),
                         active_flows: 1,
                         completed_flows: 0,
+                        activation_completed_flows_baseline: 0,
+                        activation_previous_expires_at_ns: 0,
+                        activation_had_previous_lease: false,
                     },
                 );
             }
@@ -489,9 +490,6 @@ impl PortAllocator {
                 LiveAllocation {
                     translated,
                     persistent_key,
-                    persistent_lease_created: persistent_key.is_some(),
-                    persistent_previous_expires_at_ns: 0,
-                    persistent_previous_active_flows: 0,
                 },
             );
             self.shared
@@ -663,23 +661,15 @@ impl PortAllocator {
             if let Some(lease) = live.persistent_by_source.get_mut(&key) {
                 lease.active_flows = lease.active_flows.saturating_sub(1);
                 if lease.active_flows == 0 {
-                    if existing.persistent_lease_created {
-                        if lease.completed_flows == 0 {
-                            remove_lease = true;
-                        } else {
-                            let expires_at_ns = now_ns.saturating_add(lease.timeout_ns);
-                            lease.expires_at_ns = expires_at_ns;
-                            insert_expiry = Some((lease.addr_index, expires_at_ns));
-                        }
-                    } else if existing.persistent_previous_active_flows == 0 {
-                        lease.expires_at_ns = existing.persistent_previous_expires_at_ns;
-                        insert_expiry = Some((lease.addr_index, lease.expires_at_ns));
-                    } else if lease.completed_flows == 0 {
-                        remove_lease = true;
-                    } else {
+                    if lease.completed_flows > lease.activation_completed_flows_baseline {
                         let expires_at_ns = now_ns.saturating_add(lease.timeout_ns);
                         lease.expires_at_ns = expires_at_ns;
                         insert_expiry = Some((lease.addr_index, expires_at_ns));
+                    } else if lease.activation_had_previous_lease {
+                        lease.expires_at_ns = lease.activation_previous_expires_at_ns;
+                        insert_expiry = Some((lease.addr_index, lease.expires_at_ns));
+                    } else {
+                        remove_lease = true;
                     }
                 }
             }
