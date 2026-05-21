@@ -1072,6 +1072,181 @@ fn apply_snapshot_rejects_unsupported_protocol_version() {
         .expect("handler result");
 }
 
+fn apply_snapshot_for_test(
+    state: Arc<Mutex<ServerState>>,
+    snapshot: ConfigSnapshot,
+) -> ControlResponse {
+    let (mut client, server) = std::os::unix::net::UnixStream::pair().expect("control socket pair");
+    let running = Arc::new(AtomicBool::new(true));
+    let state_file = format!(
+        "{}/xpf-apply-snapshot-test-{}-{}.json",
+        std::env::temp_dir().display(),
+        std::process::id(),
+        snapshot.generation
+    );
+    let handle = {
+        let state = state.clone();
+        let running = running.clone();
+        let state_file = state_file.clone();
+        std::thread::spawn(move || handle_stream(server, &state_file, state, running))
+    };
+
+    let request = ControlRequest {
+        request_type: "apply_snapshot".to_string(),
+        snapshot: Some(snapshot),
+        ..ControlRequest::default()
+    };
+    serde_json::to_writer(&mut client, &request).expect("write request");
+    std::io::Write::write_all(&mut client, b"\n").expect("newline");
+
+    let response: ControlResponse =
+        serde_json::from_reader(std::io::BufReader::new(client)).expect("read response");
+    handle
+        .join()
+        .expect("handler thread")
+        .expect("handler result");
+    let _ = std::fs::remove_file(state_file);
+    response
+}
+
+fn persistent_snat_apply_snapshot(generation: u64) -> ConfigSnapshot {
+    ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generated_at: Utc::now(),
+        generation,
+        capabilities: UserspaceCapabilities {
+            forwarding_supported: true,
+            ..UserspaceCapabilities::default()
+        },
+        source_nat_rules: vec![SourceNATRuleSnapshot {
+            name: "persistent-snat".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            pool_name: "persistent-pool".to_string(),
+            pool_addresses: vec!["203.0.113.10".to_string()],
+            port_low: 40000,
+            port_high: 40001,
+            persistent_nat: true,
+            persistent_nat_permit_any_remote_host: true,
+            persistent_nat_inactivity_timeout: 300,
+            ..SourceNATRuleSnapshot::default()
+        }],
+        ..ConfigSnapshot::default()
+    }
+}
+
+fn apply_path_persistent_snat_key(
+    src_port: u16,
+    dst_ip: std::net::IpAddr,
+    dst_port: u16,
+) -> crate::session::SessionKey {
+    crate::session::SessionKey {
+        addr_family: 2,
+        protocol: 17,
+        src_ip: "192.0.2.10".parse().unwrap(),
+        dst_ip,
+        src_port,
+        dst_port,
+    }
+}
+
+#[test]
+fn apply_snapshot_same_plan_preserves_persistent_snat_lease_state() {
+    let state = Arc::new(Mutex::new(ServerState {
+        status: ProcessStatus {
+            forwarding_armed: true,
+            capabilities: UserspaceCapabilities {
+                forwarding_supported: true,
+                ..UserspaceCapabilities::default()
+            },
+            ..ProcessStatus::default()
+        },
+        snapshot: None,
+        afxdp: afxdp::Coordinator::new(),
+        state_writer: Arc::new(StateWriter::new()),
+    }));
+
+    let initial = apply_snapshot_for_test(state.clone(), persistent_snat_apply_snapshot(1));
+    assert!(initial.ok, "initial apply failed: {}", initial.error);
+
+    let first_dst: std::net::IpAddr = "8.8.8.8".parse().unwrap();
+    let first_nat = {
+        let guard = state.lock().expect("server state");
+        match guard.afxdp.test_match_source_nat_result_for_tuple(
+            "lan",
+            "wan",
+            "192.0.2.10".parse().unwrap(),
+            first_dst,
+            17,
+            12345,
+            53,
+            None,
+            None,
+            1,
+        ) {
+            crate::nat::SourceNatLookup::Matched(decision) => decision,
+            other => panic!("unexpected first SNAT lookup result: {other:?}"),
+        }
+    };
+    {
+        let guard = state.lock().expect("server state");
+        guard.afxdp.test_release_source_nat_allocation(
+            &apply_path_persistent_snat_key(12345, first_dst, 53),
+            first_nat,
+            2,
+        );
+        let status = guard.afxdp.source_nat_pool_statuses();
+        assert_eq!(status[0].live_flows, 0);
+        assert_eq!(status[0].used_ports, 1);
+        assert_eq!(status[0].persistent_leases, 1);
+        assert_eq!(status[0].allocations_total, 1);
+        assert_eq!(status[0].reuses_total, 0);
+    }
+
+    let refresh = apply_snapshot_for_test(state.clone(), persistent_snat_apply_snapshot(2));
+    assert!(refresh.ok, "same-plan apply failed: {}", refresh.error);
+    {
+        let guard = state.lock().expect("server state");
+        let status = guard.afxdp.source_nat_pool_statuses();
+        assert_eq!(status[0].live_flows, 0);
+        assert_eq!(status[0].used_ports, 1);
+        assert_eq!(status[0].persistent_leases, 1);
+        assert_eq!(status[0].allocations_total, 1);
+        assert_eq!(status[0].reuses_total, 0);
+    }
+
+    let second_dst: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+    let reused = {
+        let guard = state.lock().expect("server state");
+        match guard.afxdp.test_match_source_nat_result_for_tuple(
+            "lan",
+            "wan",
+            "192.0.2.10".parse().unwrap(),
+            second_dst,
+            17,
+            12345,
+            443,
+            None,
+            None,
+            3,
+        ) {
+            crate::nat::SourceNatLookup::Matched(decision) => decision,
+            other => panic!("unexpected reused SNAT lookup result: {other:?}"),
+        }
+    };
+    assert_eq!(reused.rewrite_src, first_nat.rewrite_src);
+    assert_eq!(reused.rewrite_src_port, first_nat.rewrite_src_port);
+    {
+        let guard = state.lock().expect("server state");
+        let status = guard.afxdp.source_nat_pool_statuses();
+        assert_eq!(status[0].live_flows, 1);
+        assert_eq!(status[0].used_ports, 1);
+        assert_eq!(status[0].persistent_leases, 1);
+        assert_eq!(status[0].allocations_total, 1);
+        assert_eq!(status[0].reuses_total, 1);
+    }
+}
+
 #[test]
 fn binding_counters_snapshot_tolerates_pre_split_wire() {
     // #804: a helper snapshot that pre-dates the

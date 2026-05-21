@@ -109,6 +109,51 @@ impl super::Coordinator {
         crate::nat::source_nat_pool_statuses(&self.forwarding.source_nat_rules)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_match_source_nat_result_for_tuple(
+        &self,
+        from_zone: &str,
+        to_zone: &str,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        protocol: u8,
+        src_port: u16,
+        dst_port: u16,
+        egress_v4: Option<Ipv4Addr>,
+        egress_v6: Option<Ipv6Addr>,
+        now_ns: u64,
+    ) -> crate::nat::SourceNatLookup {
+        crate::nat::match_source_nat_result_for_tuple(
+            &self.forwarding.source_nat_rules,
+            from_zone,
+            to_zone,
+            src_ip,
+            dst_ip,
+            protocol,
+            src_port,
+            dst_port,
+            egress_v4,
+            egress_v6,
+            now_ns,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_release_source_nat_allocation(
+        &self,
+        key: &crate::session::SessionKey,
+        nat: crate::nat::NatDecision,
+        now_ns: u64,
+    ) {
+        crate::nat::release_source_nat_allocation(
+            &self.forwarding.source_nat_rules,
+            key,
+            nat,
+            false,
+            now_ns,
+        );
+    }
+
     pub fn flow_worker_map(&self) -> (Vec<crate::protocol::FlowWorkerStatus>, bool) {
         const FLOW_WORKER_MAP_MAX_ROWS: usize = 4096;
         let mut out = Vec::new();
