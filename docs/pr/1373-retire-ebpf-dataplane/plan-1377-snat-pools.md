@@ -32,11 +32,12 @@ runtime lease reuse, and operator-visible allocation failures.
   reuse, and exhaustion counters.
 - The supported persistent-NAT slice is helper-local and non-HA. Rules that
   reference the same concrete pool share one allocator and one lease table, so
-  duplicate rules cannot overbook the same translated tuple. Same-binding-plan
-  in-process snapshot refreshes preserve allocator state when the allocator
-  key is unchanged, but helper restart, helper replan, and pool-shape edits do
-  not. HA configs that use a persistent source-NAT pool are gated because
-  persistent leases are not synchronized.
+  duplicate rules cannot overbook the same translated tuple. In-process
+  snapshot refreshes preserve allocator state only when the helper keeps the
+  same binding-plan entries and the allocator key is unchanged. Helper restart,
+  binding-plan changes that force helper replan, and pool-shape edits reset
+  allocator state. HA configs that use a persistent source-NAT pool are gated
+  because persistent leases are not synchronized.
 
 ## Current Fail-Closed Runtime Boundary
 
@@ -178,22 +179,26 @@ contract is helper-local:
 - source-NAT allocations that fail before session install use a rollback path,
   not the inactivity-release path, so a rejected new persistent tuple does not
   pin a lease for the timeout window;
-- same-binding-plan compatible in-process snapshot refreshes preserve
-  allocator state when the concrete allocator key is unchanged;
-- helper restart and binding-plan replan reset allocator live state even when
-  the pool key is unchanged;
+- compatible in-process snapshot refreshes preserve allocator state only when
+  the helper keeps the same binding-plan entries and the concrete allocator key
+  is unchanged;
+- helper restart and binding-plan changes that force helper replan reset
+  allocator live state even when the pool key is unchanged;
 - edits to pool name, IPv4/IPv6 address lists, address order, or port range
   replace allocator state and can reset persistent lease continuity;
 - HA configs using persistent source-NAT pools are gated because leases are not
   synchronized to the peer.
 
-The compatible-refresh boundary is the Rust `SourceNatPoolAllocatorKey` in
-`userspace-dp/src/nat.rs`: pool name, configured IPv4 address list,
-configured IPv6 address list, and low/high port range. Any change to those
-fields is treated as a different allocator shape. The runtime deliberately
-does not try to remap old persistent leases across shape edits because doing
-so would require proving translated tuple ownership across potentially
-different address and port spaces.
+The compatible-refresh boundary has two parts. First, the helper must keep the
+same binding-plan entries; binding-plan changes cause helper replan and rebuild
+forwarding state, so allocator live state is reset. Second, within a preserved
+binding plan, the Rust `SourceNatPoolAllocatorKey` in
+`userspace-dp/src/nat.rs` must be unchanged: pool name, configured IPv4 address
+list, configured IPv6 address list, and low/high port range. Any change to
+those fields is treated as a different allocator shape. The runtime
+deliberately does not try to remap old persistent leases across shape edits
+because doing so would require proving translated tuple ownership across
+potentially different address and port spaces.
 
 `permit any-remote-host` is represented in the snapshot/status contract and is
 accepted by this runtime slice. The allocator reuse key is already independent
@@ -236,11 +241,13 @@ The latency contract is budgeted work, not strict constant time:
 
 Near-full allocation and timeout cleanup do not scan the whole lease map on
 every new flow, but full-pool pressure can still do non-trivial work. In a
-non-address-persistent pool, a still-full lease table can consume one global
-pressure-GC budget per family-compatible address attempt, and each selected
-address can consume one per-address pressure-GC budget before retry. Operators
-should size pool address counts, port ranges, and session creation rates with
-that budgeted worst case in mind. The allocator reports exhaustion when:
+non-address-persistent pool, the still-full lease-table case can consume one
+global pressure-GC budget per family-compatible address attempt before
+continuing to the next address. If a global pressure pass frees capacity, later
+attempts can enter the port-pressure path, where each selected address can
+consume one per-address pressure-GC budget before retry. Operators should size
+pool address counts, port ranges, and session creation rates with those
+budgeted cases in mind. The allocator reports exhaustion when:
 
 - the selected address-persistent pool address has no free port;
 - a non-address-persistent family has no free port on any family-compatible
