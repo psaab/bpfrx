@@ -27,6 +27,7 @@ pub(super) const MAX_RG_EPOCHS: usize = 16;
 pub(super) struct CachedTxSelectionDescriptor {
     pub(super) queue_id: Option<u8>,
     pub(super) dscp_rewrite: Option<u8>,
+    pub(super) drop: bool,
     pub(super) filter_counter: Option<Arc<crate::filter::FilterTermCounter>>,
     pub(super) three_color_policers: crate::filter::CachedThreeColorPolicers,
     pub(super) filter_log: Option<crate::filter::FilterLogMatch>,
@@ -275,6 +276,32 @@ impl FlowCacheEntry {
                  rewrite_src={:?} rewrite_dst={:?}",
                 meta.addr_family, decision.nat.rewrite_src, decision.nat.rewrite_dst,
             );
+            return None;
+        }
+        // The flow-cache key is a 5-tuple and does not include DSCP.
+        // DSCP-sensitive filters must be re-evaluated on every packet,
+        // otherwise a first-packet accept/drop/log/classification
+        // decision could be replayed for later packets in the same flow
+        // with a different DSCP value.
+        let is_v6 = meta.addr_family as i32 == libc::AF_INET6;
+        let ingress_ifindex = resolve_ingress_logical_ifindex(
+            forwarding,
+            meta.ingress_ifindex as i32,
+            meta.ingress_vlan_id,
+        )
+        .unwrap_or(meta.ingress_ifindex as i32);
+        if crate::filter::interface_input_filter_has_dscp_match(
+            &forwarding.filter_state,
+            ingress_ifindex,
+            is_v6,
+        ) {
+            return None;
+        }
+        if crate::filter::interface_output_filter_has_dscp_match(
+            &forwarding.filter_state,
+            decision.resolution.egress_ifindex,
+            is_v6,
+        ) {
             return None;
         }
         // Keep cache invalidation tied to the flow owner RG, not the current

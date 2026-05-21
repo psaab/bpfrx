@@ -115,7 +115,7 @@ func TestReadPolicyCountersPreservesScheduledRuleCountersAcrossDeleteReadd(t *te
 	}
 
 	m := New()
-	m.inner = nil
+	m.bpfShim = nil
 	m.lastStatus = ProcessStatus{
 		PolicyRuleCounters: []PolicyRuleCounterStatus{{
 			RuleID:  stablePolicyRuleID("lan", "wan", "scheduled-allow"),
@@ -193,7 +193,7 @@ security {
 	}
 
 	m := New()
-	m.inner = nil
+	m.bpfShim = nil
 	m.lastSnapshot = &ConfigSnapshot{Config: cfg}
 	m.lastStatus = ProcessStatus{
 		PolicyRuleCounters: []PolicyRuleCounterStatus{{
@@ -214,7 +214,7 @@ security {
 
 func TestClearPolicyCountersZerosCachedHelperCountersWithoutHelper(t *testing.T) {
 	m := New()
-	m.inner = nil
+	m.bpfShim = nil
 	m.lastStatus = ProcessStatus{
 		PolicyRuleCounters: []PolicyRuleCounterStatus{
 			{RuleID: stablePolicyRuleID("lan", "wan", "allow-web"), Packets: 7, Bytes: 700},
@@ -449,17 +449,23 @@ func TestStatusIPCRecordsSYNCookieBindingCounters(t *testing.T) {
 						Slot:                       0,
 						SYNCookieChallenges:        3,
 						SYNCookieSecretUnavailable: 5,
-						SYNCookieAckValid:          7,
-						SYNCookieAckInvalid:        11,
-						SYNCookieBypass:            13,
+						SYNCookieSynAckSent:        7,
+						SYNCookieAckRstSent:        11,
+						SYNCookieReplyBudgetDrops:  13,
+						SYNCookieAckValid:          17,
+						SYNCookieAckInvalid:        19,
+						SYNCookieBypass:            23,
 					},
 					{
 						Slot:                       1,
 						SYNCookieChallenges:        17,
 						SYNCookieSecretUnavailable: 19,
-						SYNCookieAckValid:          23,
-						SYNCookieAckInvalid:        29,
-						SYNCookieBypass:            31,
+						SYNCookieSynAckSent:        29,
+						SYNCookieAckRstSent:        31,
+						SYNCookieReplyBudgetDrops:  37,
+						SYNCookieAckValid:          41,
+						SYNCookieAckInvalid:        43,
+						SYNCookieBypass:            47,
 					},
 				},
 			},
@@ -503,9 +509,12 @@ func TestStatusIPCRecordsSYNCookieBindingCounters(t *testing.T) {
 	want := SYNCookieCounters{
 		Challenges:        20,
 		SecretUnavailable: 24,
-		AckValid:          30,
-		AckInvalid:        40,
-		Bypass:            44,
+		SynAckSent:        36,
+		AckRstSent:        42,
+		ReplyBudgetDrops:  50,
+		AckValid:          58,
+		AckInvalid:        62,
+		Bypass:            70,
 	}
 	if got != want {
 		t.Fatalf("SYN-cookie counters after status IPC = %+v, want %+v", got, want)
@@ -535,28 +544,28 @@ func hostToNetwork16(v uint16) uint16 {
 	return binary.NativeEndian.Uint16(raw[:])
 }
 
-func injectInnerMap(t *testing.T, inner *dataplane.Manager, name string, m *ebpf.Map) {
+func injectShimMap(t *testing.T, bpfShim *dataplane.Manager, name string, m *ebpf.Map) {
 	t.Helper()
-	if inner == nil {
-		t.Fatal("injectInnerMap: inner manager is nil")
+	if bpfShim == nil {
+		t.Fatal("injectShimMap: bpfShim manager is nil")
 	}
-	managerValue := reflect.ValueOf(inner)
+	managerValue := reflect.ValueOf(bpfShim)
 	if managerValue.Kind() != reflect.Ptr || managerValue.IsNil() {
-		t.Fatalf("injectInnerMap: expected non-nil pointer to dataplane.Manager, got %T", inner)
+		t.Fatalf("injectShimMap: expected non-nil pointer to dataplane.Manager, got %T", bpfShim)
 	}
 	managerElem := managerValue.Elem()
 	if !managerElem.IsValid() || managerElem.Kind() != reflect.Struct {
-		t.Fatalf("injectInnerMap: expected dataplane.Manager struct, got kind %s", managerElem.Kind())
+		t.Fatalf("injectShimMap: expected dataplane.Manager struct, got kind %s", managerElem.Kind())
 	}
 	rv := managerElem.FieldByName("maps")
 	if !rv.IsValid() {
-		t.Fatal("injectInnerMap: dataplane.Manager has no field named \"maps\"")
+		t.Fatal("injectShimMap: dataplane.Manager has no field named \"maps\"")
 	}
 	if !rv.CanAddr() {
-		t.Fatal("injectInnerMap: dataplane.Manager.maps is not addressable")
+		t.Fatal("injectShimMap: dataplane.Manager.maps is not addressable")
 	}
 	if rv.Kind() != reflect.Map {
-		t.Fatalf("injectInnerMap: dataplane.Manager.maps has kind %s, want map", rv.Kind())
+		t.Fatalf("injectShimMap: dataplane.Manager.maps has kind %s, want map", rv.Kind())
 	}
 	rm := reflect.NewAt(rv.Type(), unsafe.Pointer(rv.UnsafeAddr())).Elem()
 	if rm.IsNil() {
@@ -565,10 +574,10 @@ func injectInnerMap(t *testing.T, inner *dataplane.Manager, name string, m *ebpf
 	key := reflect.ValueOf(name)
 	value := reflect.ValueOf(m)
 	if !key.Type().AssignableTo(rv.Type().Key()) {
-		t.Fatalf("injectInnerMap: cannot use key type %s for map key type %s", key.Type(), rv.Type().Key())
+		t.Fatalf("injectShimMap: cannot use key type %s for map key type %s", key.Type(), rv.Type().Key())
 	}
 	if !value.Type().AssignableTo(rv.Type().Elem()) {
-		t.Fatalf("injectInnerMap: cannot use value type %s for map element type %s", value.Type(), rv.Type().Elem())
+		t.Fatalf("injectShimMap: cannot use value type %s for map element type %s", value.Type(), rv.Type().Elem())
 	}
 	rm.SetMapIndex(key, value)
 }
@@ -585,7 +594,7 @@ func injectSessionMaps(t *testing.T, m *Manager) {
 		t.Fatalf("new sessions map: %v", err)
 	}
 	t.Cleanup(func() { sessionsMap.Close() })
-	injectInnerMap(t, m.inner, "sessions", sessionsMap)
+	injectShimMap(t, m.bpfShim, "sessions", sessionsMap)
 	sessionsMapV6, err := ebpf.NewMap(&ebpf.MapSpec{
 		Type:       ebpf.Hash,
 		KeySize:    uint32(unsafe.Sizeof(dataplane.SessionKeyV6{})),
@@ -596,7 +605,7 @@ func injectSessionMaps(t *testing.T, m *Manager) {
 		t.Fatalf("new sessions_v6 map: %v", err)
 	}
 	t.Cleanup(func() { sessionsMapV6.Close() })
-	injectInnerMap(t, m.inner, "sessions_v6", sessionsMapV6)
+	injectShimMap(t, m.bpfShim, "sessions_v6", sessionsMapV6)
 }
 
 func injectCtrlAndBindingMaps(t *testing.T, m *Manager) (*ebpf.Map, *ebpf.Map) {
@@ -611,7 +620,7 @@ func injectCtrlAndBindingMaps(t *testing.T, m *Manager) (*ebpf.Map, *ebpf.Map) {
 		t.Fatalf("new userspace_ctrl map: %v", err)
 	}
 	t.Cleanup(func() { ctrlMap.Close() })
-	injectInnerMap(t, m.inner, "userspace_ctrl", ctrlMap)
+	injectShimMap(t, m.bpfShim, "userspace_ctrl", ctrlMap)
 
 	bindingsMap, err := ebpf.NewMap(&ebpf.MapSpec{
 		Type:       ebpf.Hash,
@@ -623,7 +632,7 @@ func injectCtrlAndBindingMaps(t *testing.T, m *Manager) (*ebpf.Map, *ebpf.Map) {
 		t.Fatalf("new userspace_bindings map: %v", err)
 	}
 	t.Cleanup(func() { bindingsMap.Close() })
-	injectInnerMap(t, m.inner, "userspace_bindings", bindingsMap)
+	injectShimMap(t, m.bpfShim, "userspace_bindings", bindingsMap)
 	return ctrlMap, bindingsMap
 }
 
@@ -639,7 +648,7 @@ func injectUserspaceSessionMap(t *testing.T, m *Manager) *ebpf.Map {
 		t.Fatalf("new userspace_sessions map: %v", err)
 	}
 	t.Cleanup(func() { usMap.Close() })
-	injectInnerMap(t, m.inner, "userspace_sessions", usMap)
+	injectShimMap(t, m.bpfShim, "userspace_sessions", usMap)
 	return usMap
 }
 
@@ -757,7 +766,7 @@ func TestSessionSyncTunnelEndpointIDLockedMatchesLogicalTunnelIfindex(t *testing
 
 func TestBuildSessionSyncRequestV4ConvertsPortsToHostOrder(t *testing.T) {
 	m := &Manager{
-		inner: dataplane.New(),
+		bpfShim: dataplane.New(),
 		lastSnapshot: &ConfigSnapshot{
 			Interfaces: []InterfaceSnapshot{{
 				Name:            "reth0.80",
@@ -798,7 +807,7 @@ func TestBuildSessionSyncRequestV4ConvertsPortsToHostOrder(t *testing.T) {
 }
 
 func TestBuildSessionSyncRequestV4PreservesBothNatLegs(t *testing.T) {
-	m := &Manager{inner: dataplane.New()}
+	m := &Manager{bpfShim: dataplane.New()}
 	key := dataplane.SessionKey{
 		SrcIP:    [4]byte{198, 51, 100, 10},
 		DstIP:    [4]byte{172, 16, 80, 8},
@@ -824,7 +833,7 @@ func TestBuildSessionSyncRequestV4PreservesBothNatLegs(t *testing.T) {
 
 func TestBuildSessionSyncRequestV4PreservesTunnelEndpointIdentity(t *testing.T) {
 	m := &Manager{
-		inner: dataplane.New(),
+		bpfShim: dataplane.New(),
 		lastSnapshot: &ConfigSnapshot{
 			Interfaces: []InterfaceSnapshot{{
 				Name:            "gr-0/0/0.0",
@@ -878,7 +887,7 @@ func TestBuildSessionSyncRequestV4PreservesTunnelEndpointIdentity(t *testing.T) 
 
 func TestBuildSessionSyncRequestV6PreservesTunnelEndpointIdentity(t *testing.T) {
 	m := &Manager{
-		inner: dataplane.New(),
+		bpfShim: dataplane.New(),
 		lastSnapshot: &ConfigSnapshot{
 			Interfaces: []InterfaceSnapshot{{
 				Name:            "gr-0/0/0.0",
@@ -926,7 +935,7 @@ func TestBuildSessionSyncRequestV6PreservesTunnelEndpointIdentity(t *testing.T) 
 
 func TestBuildSessionSyncRequestV6ConvertsPortsToHostOrder(t *testing.T) {
 	m := &Manager{
-		inner: dataplane.New(),
+		bpfShim: dataplane.New(),
 		lastSnapshot: &ConfigSnapshot{
 			Interfaces: []InterfaceSnapshot{{
 				Name:            "reth0.80",
@@ -972,7 +981,7 @@ func TestBuildSessionSyncRequestV6ConvertsPortsToHostOrder(t *testing.T) {
 }
 
 func TestBuildSessionSyncRequestV6PreservesBothNatLegs(t *testing.T) {
-	m := &Manager{inner: dataplane.New()}
+	m := &Manager{bpfShim: dataplane.New()}
 	var srcIP, dstIP, natSrc, natDst [16]byte
 	copy(srcIP[:], net.ParseIP("2001:db8::10").To16())
 	copy(dstIP[:], net.ParseIP("2001:db8:80::8").To16())
@@ -1061,7 +1070,7 @@ func TestSetClusterSyncedSessionV4SkipsReverseHelperMirror(t *testing.T) {
 		t.Fatalf("new sessions map: %v", err)
 	}
 	defer sessionsMap.Close()
-	injectInnerMap(t, m.inner, "sessions", sessionsMap)
+	injectShimMap(t, m.bpfShim, "sessions", sessionsMap)
 	sessionsMapV6, err := ebpf.NewMap(&ebpf.MapSpec{
 		Type:       ebpf.Hash,
 		KeySize:    uint32(unsafe.Sizeof(dataplane.SessionKeyV6{})),
@@ -1072,7 +1081,7 @@ func TestSetClusterSyncedSessionV4SkipsReverseHelperMirror(t *testing.T) {
 		t.Fatalf("new sessions_v6 map: %v", err)
 	}
 	defer sessionsMapV6.Close()
-	injectInnerMap(t, m.inner, "sessions_v6", sessionsMapV6)
+	injectShimMap(t, m.bpfShim, "sessions_v6", sessionsMapV6)
 
 	key := dataplane.SessionKey{
 		SrcIP:    [4]byte{172, 16, 80, 200},
@@ -1384,7 +1393,7 @@ func TestApplyHelperStatusInitialCtrlCleanupRunsOnlyOnce(t *testing.T) {
 		t.Skipf("RemoveMemlock: %v", err)
 	}
 	m := New()
-	m.inner.XDPEntryProg = "xdp_userspace_prog"
+	m.bpfShim.XDPEntryProg = "xdp_userspace_prog"
 	injectCtrlAndBindingMaps(t, m)
 	usMap := injectUserspaceSessionMap(t, m)
 	m.neighborsPrewarmed = true
@@ -1491,7 +1500,7 @@ func TestUpdateRGActiveActivationKeepsCtrlEnabledAfterAckedStatus(t *testing.T) 
 	m.proc = &exec.Cmd{Process: &os.Process{Pid: 1}}
 	m.cfg.ControlSocket = controlSock
 	m.clusterHA = true
-	m.inner.XDPEntryProg = "xdp_userspace_prog"
+	m.bpfShim.XDPEntryProg = "xdp_userspace_prog"
 	m.neighborsPrewarmed = true
 	m.xskLivenessProven = true
 	m.ctrlWasEnabled = true
@@ -1512,7 +1521,7 @@ func TestUpdateRGActiveActivationKeepsCtrlEnabledAfterAckedStatus(t *testing.T) 
 		t.Fatalf("new rg_active map: %v", err)
 	}
 	t.Cleanup(func() { rgMap.Close() })
-	injectInnerMap(t, m.inner, "rg_active", rgMap)
+	injectShimMap(t, m.bpfShim, "rg_active", rgMap)
 
 	if err := m.UpdateRGActive(1, true); err != nil {
 		t.Fatalf("UpdateRGActive: %v", err)
@@ -3655,7 +3664,7 @@ func TestUserspaceSupportsScreenProfilesBasic(t *testing.T) {
 	}
 }
 
-func TestUserspaceSupportsScreenProfilesRejectsSynCookie(t *testing.T) {
+func TestUserspaceSupportsScreenProfilesAllowsSynCookie(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Flow.SynFloodProtectionMode = "syn-cookie"
 	cfg.Security.Screen = map[string]*config.ScreenProfile{
@@ -3664,8 +3673,8 @@ func TestUserspaceSupportsScreenProfilesRejectsSynCookie(t *testing.T) {
 			TCP:  config.TCPScreen{Land: true},
 		},
 	}
-	if userspaceSupportsScreenProfiles(cfg) {
-		t.Fatal("syn-cookie mode should not be supported")
+	if !userspaceSupportsScreenProfiles(cfg) {
+		t.Fatal("syn-cookie mode should be supported")
 	}
 }
 
@@ -3713,7 +3722,28 @@ func TestDeriveUserspaceCapabilitiesAllowsBasicScreenProfile(t *testing.T) {
 	}
 }
 
-func TestDeriveUserspaceCapabilitiesRejectsSynCookieScreen(t *testing.T) {
+func TestDeriveUserspaceCapabilitiesAllowsSynCookieScreen(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Flow.SynFloodProtectionMode = "syn-cookie"
+	cfg.System.RootAuthentication = &config.RootAuthConfig{
+		EncryptedPassword: "$6$rounds=5000$salt$hash",
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Name: "trust", ScreenProfile: "flood"},
+	}
+	cfg.Security.Screen = map[string]*config.ScreenProfile{
+		"flood": {
+			Name: "flood",
+			TCP:  config.TCPScreen{SynFlood: &config.SynFloodConfig{AttackThreshold: 100}},
+		},
+	}
+	caps := deriveUserspaceCapabilities(cfg)
+	if !caps.ForwardingSupported {
+		t.Fatalf("ForwardingSupported = false, reasons: %+v", caps.UnsupportedReasons)
+	}
+}
+
+func TestDeriveUserspaceCapabilitiesRejectsSynCookieWithoutRootSecret(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Flow.SynFloodProtectionMode = "syn-cookie"
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
@@ -3727,7 +3757,12 @@ func TestDeriveUserspaceCapabilitiesRejectsSynCookieScreen(t *testing.T) {
 	}
 	caps := deriveUserspaceCapabilities(cfg)
 	if caps.ForwardingSupported {
-		t.Fatal("ForwardingSupported = true, want false (syn-cookie)")
+		t.Fatal("ForwardingSupported = true, want false without SYN-cookie secret material")
+	}
+	if len(caps.UnsupportedReasons) != 1 ||
+		!strings.Contains(caps.UnsupportedReasons[0], "root-authentication") {
+		t.Fatalf("UnsupportedReasons = %+v, want SYN-cookie root-authentication reason",
+			caps.UnsupportedReasons)
 	}
 }
 
@@ -3762,6 +3797,9 @@ func TestBuildScreenSnapshotsMatchesZoneToProfile(t *testing.T) {
 func TestBuildScreenSnapshotsMarksSynCookieMode(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Flow.SynFloodProtectionMode = "syn-cookie"
+	cfg.System.RootAuthentication = &config.RootAuthConfig{
+		EncryptedPassword: "$6$rounds=5000$salt$hash",
+	}
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
 		"trust": {Name: "trust", ScreenProfile: "flood"},
 	}
@@ -3778,6 +3816,16 @@ func TestBuildScreenSnapshotsMarksSynCookieMode(t *testing.T) {
 	}
 	if !snaps[0].SYNCookie {
 		t.Fatalf("SYNCookie = false, want true: %+v", snaps[0])
+	}
+	snap := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	if len(snap.SYNCookieMasterKey) != 32 {
+		t.Fatalf("SYNCookieMasterKey len = %d, want 32", len(snap.SYNCookieMasterKey))
+	}
+	cfg.System.RootAuthentication = nil
+	cfg.System.MasterPassword = "juniper-prf1"
+	snap = buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	if snap.SYNCookieMasterKey != "" {
+		t.Fatalf("SYNCookieMasterKey without root secret = %q, want empty", snap.SYNCookieMasterKey)
 	}
 }
 
@@ -4890,6 +4938,7 @@ func TestSumBindingCounters(t *testing.T) {
 				SessionExpires:       5,
 				PolicyDeniedPackets:  3,
 				ScreenDrops:          2,
+				SYNCookieSynAckSent:  7,
 				SYNCookieAckValid:    11,
 				SYNCookieAckInvalid:  13,
 				SYNCookieBypass:      17,
@@ -4904,6 +4953,7 @@ func TestSumBindingCounters(t *testing.T) {
 				SessionExpires:       10,
 				PolicyDeniedPackets:  7,
 				ScreenDrops:          4,
+				SYNCookieSynAckSent:  17,
 				SYNCookieAckValid:    19,
 				SYNCookieAckInvalid:  23,
 				SYNCookieBypass:      29,
@@ -4933,6 +4983,9 @@ func TestSumBindingCounters(t *testing.T) {
 	}
 	if s.screenDrops != 6 {
 		t.Fatalf("screenDrops = %d, want 6", s.screenDrops)
+	}
+	if s.synCookieSent != 24 {
+		t.Fatalf("synCookieSent = %d, want 24", s.synCookieSent)
 	}
 	if s.synCookieValid != 30 {
 		t.Fatalf("synCookieValid = %d, want 30", s.synCookieValid)

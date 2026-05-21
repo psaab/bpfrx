@@ -1072,13 +1072,36 @@ fn syn_cookie_mss_index_encoding_parity() {
 }
 
 #[test]
-fn syn_cookie_ntp_rollback_monotonic_epoch() {
-    assert_eq!(SynCookieCodec::full_epoch_from_monotonic_secs(0), 0);
-    assert_eq!(SynCookieCodec::full_epoch_from_monotonic_secs(63), 0);
-    assert_eq!(SynCookieCodec::full_epoch_from_monotonic_secs(64), 1);
-    assert_eq!(
-        SynCookieCodec::full_epoch_from_monotonic_secs(64 * 33 + 9),
-        33
+fn syn_cookie_epoch_uses_unix_wall_clock_units() {
+    assert_eq!(SynCookieCodec::full_epoch_from_unix_secs(0), 0);
+    assert_eq!(SynCookieCodec::full_epoch_from_unix_secs(63), 0);
+    assert_eq!(SynCookieCodec::full_epoch_from_unix_secs(64), 1);
+    assert_eq!(SynCookieCodec::full_epoch_from_unix_secs(64 * 33 + 9), 33);
+}
+
+#[test]
+fn syn_cookie_wall_clock_epoch_survives_peer_uptime_skew() {
+    let codec = syn_cookie_codec();
+    let tuple = syn_cookie_tuple();
+    let shared_wall_epoch = SynCookieCodec::full_epoch_from_unix_secs(1_800_000_000);
+    let peer_monotonic_epoch = 0;
+    let cookie = codec.mint_isn(tuple, 7, shared_wall_epoch, 1460);
+
+    assert_ne!(
+        shared_wall_epoch, peer_monotonic_epoch,
+        "test must model peers with unrelated monotonic uptimes"
+    );
+    assert!(
+        codec
+            .validate_isn(tuple, 7, shared_wall_epoch, cookie)
+            .is_some(),
+        "HA peers validate with the shared Unix wall-clock epoch"
+    );
+    assert!(
+        codec
+            .validate_isn(tuple, 7, peer_monotonic_epoch, cookie)
+            .is_none(),
+        "local monotonic uptime would reject the peer-minted cookie"
     );
 }
 
@@ -1099,13 +1122,21 @@ fn syn_cookie_epoch_low_bits_wrap_rejects_32_epoch_old_cookie() {
 }
 
 #[test]
-fn syn_cookie_validation_tries_current_and_previous_full_epoch() {
+fn syn_cookie_validation_tries_next_current_and_previous_full_epoch() {
     let codec = syn_cookie_codec();
     let tuple = syn_cookie_tuple();
+    let next_cookie = codec.mint_isn(tuple, 7, 43, 1460);
     let current_cookie = codec.mint_isn(tuple, 7, 42, 1460);
     let previous_cookie = codec.mint_isn(tuple, 7, 41, 1460);
     let older_cookie = codec.mint_isn(tuple, 7, 40, 1460);
 
+    assert_eq!(
+        codec
+            .validate_isn(tuple, 7, 42, next_cookie)
+            .expect("next epoch")
+            .full_epoch,
+        43
+    );
     assert_eq!(
         codec
             .validate_isn(tuple, 7, 42, current_cookie)
@@ -1130,6 +1161,7 @@ fn syn_cookie_chosen_when_threshold_exceeded() {
     profile.syn_cookie = true;
     let mut state = make_state("trust", profile);
     state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    state.set_syn_cookie_full_epoch_for_test(2);
     let pkt = tcp_pkt(
         IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
         IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
@@ -1146,12 +1178,8 @@ fn syn_cookie_chosen_when_threshold_exceeded() {
         state.check_packet_with_zone_id("trust", 7, &pkt, 128),
         ScreenVerdict::Pass
     );
-    let expected_isn = syn_cookie_codec().mint_isn(
-        SynCookieTuple::from_packet(&pkt),
-        7,
-        SynCookieCodec::full_epoch_from_monotonic_secs(128),
-        pkt.tcp_mss,
-    );
+    let expected_isn =
+        syn_cookie_codec().mint_isn(SynCookieTuple::from_packet(&pkt), 7, 2, pkt.tcp_mss);
     assert_eq!(
         state.check_packet_with_zone_id("trust", 7, &pkt, 128),
         ScreenVerdict::SynCookieChallenge(SynCookieChallenge {
@@ -1192,6 +1220,7 @@ fn syn_cookie_ack_validation_marks_next_syn_bypass_without_session_creation() {
     profile.syn_cookie = true;
     let mut state = make_state("trust", profile);
     state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    state.set_syn_cookie_full_epoch_for_test(1);
     let syn = tcp_pkt(
         IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
         IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
@@ -1278,6 +1307,7 @@ fn syn_cookie_invalid_ack_does_not_validate_client() {
     profile.syn_cookie = true;
     let mut state = make_state("trust", profile);
     state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    state.set_syn_cookie_full_epoch_for_test(1);
     let syn = tcp_pkt(
         IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
         IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
@@ -1304,6 +1334,189 @@ fn syn_cookie_invalid_ack_does_not_validate_client() {
         SynCookieAckVerdict::Invalid
     );
     assert_eq!(state.syn_cookie_validated_len(), 0);
+}
+
+#[test]
+fn syn_cookie_ack_validates_on_peer_without_local_active_window() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 1;
+    profile.syn_cookie = true;
+
+    let mut peer = make_state("trust", profile);
+    peer.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    peer.set_syn_cookie_full_epoch_for_test(41);
+
+    let syn = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_SYN,
+    );
+    let cookie_isn =
+        syn_cookie_codec().mint_isn(SynCookieTuple::from_packet(&syn), 7, 41, syn.tcp_mss);
+
+    let mut ack = syn.clone();
+    ack.tcp_flags = TCP_ACK;
+    ack.tcp_seq = 2;
+    ack.tcp_ack = cookie_isn.wrapping_add(1);
+
+    assert_eq!(
+        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        SynCookieAckVerdict::Validated,
+        "HA backup must accept a peer-minted cookie without a local flood window"
+    );
+    assert_eq!(peer.syn_cookie_validated_len(), 1);
+}
+
+#[test]
+fn syn_cookie_ack_validates_on_peer_one_epoch_behind_active() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 1;
+    profile.syn_cookie = true;
+
+    let mut standby = make_state("trust", profile);
+    standby.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    standby.set_syn_cookie_full_epoch_for_test(40);
+
+    let syn = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_SYN,
+    );
+    let active_cookie =
+        syn_cookie_codec().mint_isn(SynCookieTuple::from_packet(&syn), 7, 41, syn.tcp_mss);
+
+    let mut ack = syn.clone();
+    ack.tcp_flags = TCP_ACK;
+    ack.tcp_seq = 2;
+    ack.tcp_ack = active_cookie.wrapping_add(1);
+
+    assert_eq!(
+        standby.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        SynCookieAckVerdict::Validated,
+        "standby one epoch behind must accept cookies minted by the former active"
+    );
+    assert_eq!(standby.syn_cookie_validated_len(), 1);
+}
+
+#[test]
+fn syn_cookie_invalid_ack_without_active_window_remains_not_applicable() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 1;
+    profile.syn_cookie = true;
+
+    let mut peer = make_state("trust", profile);
+    peer.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    peer.set_syn_cookie_full_epoch_for_test(41);
+
+    let mut ack = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_ACK,
+    );
+    ack.tcp_seq = 2;
+    ack.tcp_ack = 0xdead_beefu32;
+
+    assert_eq!(
+        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        SynCookieAckVerdict::NotApplicable,
+        "inactive peers only consume ACKs that validate against the shared key"
+    );
+    assert_eq!(peer.syn_cookie_validated_len(), 0);
+}
+
+#[test]
+fn syn_cookie_standby_ack_prefilter_skips_implausible_epoch_bits() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 1;
+    profile.syn_cookie = true;
+
+    let mut peer = make_state("trust", profile);
+    peer.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    peer.set_syn_cookie_full_epoch_for_test(40);
+
+    let mut ack = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_ACK,
+    );
+    let implausible_cookie =
+        ((45u32 & SYN_COOKIE_EPOCH_MASK) << SYN_COOKIE_EPOCH_SHIFT) | 0x00ff_eeaa;
+    ack.tcp_ack = implausible_cookie.wrapping_add(1);
+
+    assert_eq!(
+        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
+        SynCookieAckVerdict::NotApplicable,
+        "inactive peers should reject ACKs outside the epoch window before MAC work"
+    );
+    assert_eq!(
+        peer.syn_cookie_standby_ack_count("trust"),
+        0,
+        "wire-epoch prefilter must not spend standby validation budget"
+    );
+}
+
+#[test]
+fn syn_cookie_standby_ack_validation_is_rate_limited() {
+    let mut profile = ScreenProfile::default();
+    profile.syn_flood_threshold = 1;
+    profile.syn_cookie = true;
+
+    let mut peer = make_state("trust", profile);
+    peer.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    peer.set_syn_cookie_full_epoch_for_test(41);
+
+    let syn = tcp_pkt(
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        49152,
+        443,
+        TCP_SYN,
+    );
+    let mut bad_ack = syn.clone();
+    bad_ack.tcp_flags = TCP_ACK;
+    bad_ack.tcp_seq = 2;
+    bad_ack.tcp_ack =
+        (((41u32 & SYN_COOKIE_EPOCH_MASK) << SYN_COOKIE_EPOCH_SHIFT) | 0x1234).wrapping_add(1);
+
+    for _ in 0..SYN_COOKIE_STANDBY_ACK_VALIDATION_RATE_LIMIT_PER_SEC {
+        assert_eq!(
+            peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &bad_ack, 128),
+            SynCookieAckVerdict::NotApplicable
+        );
+    }
+    assert_eq!(
+        peer.syn_cookie_standby_ack_count("trust"),
+        SYN_COOKIE_STANDBY_ACK_VALIDATION_RATE_LIMIT_PER_SEC
+    );
+
+    let valid_cookie =
+        syn_cookie_codec().mint_isn(SynCookieTuple::from_packet(&syn), 7, 41, syn.tcp_mss);
+    let mut valid_ack = syn.clone();
+    valid_ack.tcp_flags = TCP_ACK;
+    valid_ack.tcp_seq = 3;
+    valid_ack.tcp_ack = valid_cookie.wrapping_add(1);
+
+    assert_eq!(
+        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &valid_ack, 128),
+        SynCookieAckVerdict::NotApplicable,
+        "standby validation budget should cap SipHash work for the current second"
+    );
+    assert_eq!(peer.syn_cookie_validated_len(), 0);
+
+    assert_eq!(
+        peer.validate_syn_cookie_ack_on_session_miss("trust", 7, &valid_ack, 129),
+        SynCookieAckVerdict::Validated,
+        "the standby guard is per-second and recovers on the next window"
+    );
+    assert_eq!(peer.syn_cookie_validated_len(), 1);
 }
 
 #[test]
@@ -1515,6 +1728,7 @@ fn syn_cookie_ack_validation_accepts_previous_epoch_after_rotation() {
     profile.syn_cookie = true;
     let mut state = make_state("trust", profile);
     state.update_syn_cookie_master_key(Some(syn_cookie_key()));
+    state.set_syn_cookie_full_epoch_for_test(1);
     let syn = tcp_pkt(
         IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
         IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
@@ -1535,6 +1749,7 @@ fn syn_cookie_ack_validation_accepts_previous_epoch_after_rotation() {
     let mut ack = syn.clone();
     ack.tcp_flags = TCP_ACK;
     ack.tcp_ack = challenge.cookie_isn.wrapping_add(1);
+    state.set_syn_cookie_full_epoch_for_test(2);
     assert_eq!(
         state.validate_syn_cookie_ack_on_session_miss("trust", 7, &ack, 128),
         SynCookieAckVerdict::Validated,

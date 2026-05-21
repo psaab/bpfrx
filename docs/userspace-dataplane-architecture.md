@@ -71,6 +71,14 @@ older helper status snapshots. If neither path publishes capacity, the
 CLI reports the missing status fields rather than showing BPF-map
 metrics for userspace buffers.
 
+CoS queued-byte rows use `ProcessStatus.CoSInterfaces[].Queues[]`
+`buffer_bytes` and `queued_bytes`. Neighbor-cache entries, flow-cache active
+flows, flow-cache collision evictions, and worker queue pressure stay in the
+status-counter section because current helper status does not publish bounded
+session-table, flow-cache, or neighbor-cache capacity denominators. Future fill
+percentage rows for those structures require explicit helper fields; Go must
+not infer them from Rust private constants.
+
 ### 1. XDP Shim (`userspace-xdp/src/lib.rs`)
 
 A minimal BPF program attached at the NIC driver level that decides
@@ -381,10 +389,12 @@ matching, interface-mode SNAT, DNAT, static NAT, NAT64, NPTv6, firewall
 filters, flow export, TCP MSS clamping, configurable timeouts, VLAN handling,
 route/neighbor lookup, and HA/session-delta ingestion.
 
-Remaining explicit gates include SYN-cookie-dependent screen behavior,
-three-color policers, dataplane event parity, and the residual #1377 SNAT pool
-contract for per-pool `persistent-nat`, allocator exhaustion counters, and
-mixed-backend rollback constraints. Port mirroring is no longer a
+Remaining explicit gates include three-color policers, dataplane event parity,
+and the residual #1377 SNAT pool contract for per-pool `persistent-nat`,
+allocator exhaustion counters, and mixed-backend rollback constraints.
+SYN-cookie-dependent screen behavior is admitted in userspace; #1374 still
+needs live HA/flood evidence before BPF source removal. Port mirroring is no
+longer a
 `deriveUserspaceCapabilities()` gate; its remaining #1376 work is operator
 evidence for mirror fidelity and primary-forwarding survival under mirror
 pressure before BPF source removal. HA persistent-SNAT configs remain gated;
@@ -402,8 +412,9 @@ failure. The current slice adds bounded helper-local persistent-NAT lease reuse,
 allocator observability, and live-port exhaustion counters. #1377 still owns
 helper-restart persistence, HA lease synchronization, and the documented
 mixed-backend rollback boundary. #1386 landed
-userspace buffer/status rendering; #1380 still owns
-retirement of the remaining BPF-map-oriented operator surface.
+userspace buffer/status rendering, and #1380 now treats helper-published
+capacity as the boundary for fill percentages instead of synthesizing
+utilization from dynamic counters.
 
 ### 4. HA Cluster Integration
 
@@ -570,8 +581,10 @@ is [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
   allocation/exhaustion counters have landed. #1377 is still required for
   helper-restart persistence, HA lease synchronization, and the mixed-backend
   rollback test boundary.
-- SYN-cookie flood protection closeout: #1374 still owns bounded SYN-ACK/RST
-  TX, HA-safe secrets, integration evidence, and gate removal.
+- SYN-cookie flood protection closeout: bounded SYN-ACK/RST TX,
+  root-auth-derived snapshot key publication, fail-closed missing-secret
+  behavior, status counters, and gate removal are wired. #1374 still owns the
+  live HA/flood artifact set before BPF source removal.
 - RFC 2697/2698 three-color policer closeout: #1375 now preserves
   token/counter state across compatible in-process snapshot refreshes. It still
   owns the sharded/packed state decision, HA/restart continuity decision,
@@ -582,9 +595,10 @@ is [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
   pressure before BPF source removal.
 - Dataplane event closeout: #1379 still owns end-to-end syslog evidence,
   broader non-PBR filter-log call sites, and richer identity mapping.
-- `show system buffers` BPF-map display retirement: #1380. Userspace
-  helper-status rendering landed in #1386, but the legacy operator surface
-  still needs its Phase 5 cleanup.
+- `show system buffers` BPF-map display retirement: #1380 is closed for the
+  current helper schema. Userspace mode uses helper status, preserves the
+  active-session footer, and reports dynamic session/flow/neighbor values as
+  counters until true capacity fields are added.
 
 **Handled outside the AF_XDP forwarding fast path:**
 - ARP, NDP, local management traffic, and other kernel-owned packets are passed

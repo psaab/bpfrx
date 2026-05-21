@@ -398,6 +398,18 @@ func ValidateConfig(cfg *Config) []string {
 				"see docs/services-application-identification.md.")
 	}
 
+	if userspaceSynCookieProtectionActive(cfg) &&
+		(cfg.System.RootAuthentication == nil ||
+			cfg.System.RootAuthentication.EncryptedPassword == "") {
+		warnings = append(warnings,
+			"active userspace-dp SYN-cookie screen profiles require "+
+				"system root-authentication encrypted-password material "+
+				"for the userspace cookie key; the userspace dataplane "+
+				"fails closed until it is set. Legacy eBPF SYN-cookie "+
+				"handling uses kernel helpers and is not affected by "+
+				"this warning.")
+	}
+
 	// Collect valid zone names
 	zones := make(map[string]bool)
 	for name := range cfg.Security.Zones {
@@ -918,6 +930,24 @@ func ValidateConfig(cfg *Config) []string {
 	}
 
 	return warnings
+}
+
+func userspaceSynCookieProtectionActive(cfg *Config) bool {
+	if cfg == nil || cfg.System.DataplaneType != "userspace" ||
+		cfg.Security.Flow.SynFloodProtectionMode != "syn-cookie" {
+		return false
+	}
+	for _, zone := range cfg.Security.Zones {
+		if zone == nil || zone.ScreenProfile == "" {
+			continue
+		}
+		profile := cfg.Security.Screen[zone.ScreenProfile]
+		if profile != nil && profile.TCP.SynFlood != nil &&
+			profile.TCP.SynFlood.AttackThreshold > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // knownManagedProcessNames is the set of Junos process names that bpfrx

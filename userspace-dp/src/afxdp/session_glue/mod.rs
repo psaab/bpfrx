@@ -222,8 +222,102 @@ fn force_live_redirect_for_worker_synced_entry(
     allow_replace_local && uses_kernel_local_session_map_entry(decision, metadata, origin)
 }
 
+pub(super) fn session_key_has_lo0_filter(forwarding: &ForwardingState, key: &SessionKey) -> bool {
+    match key.addr_family {
+        family if family == libc::AF_INET as u8 => {
+            forwarding.filter_state.lo0_filter_v4_fast.is_some()
+        }
+        family if family == libc::AF_INET6 as u8 => {
+            forwarding.filter_state.lo0_filter_v6_fast.is_some()
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn republish_local_delivery_sessions_for_lo0_filter(
+    sessions: &SessionTable,
+    session_map_fd: c_int,
+    forwarding: &ForwardingState,
+) -> usize {
+    let mut republished = 0usize;
+    sessions.iter_with_origin(|key, decision, metadata, _origin| {
+        if metadata.is_reverse
+            || decision.resolution.disposition != ForwardingDisposition::LocalDelivery
+            || !session_key_has_lo0_filter(forwarding, key)
+        {
+            return;
+        }
+        if session_map_fd >= 0 {
+            let _ = publish_live_session_entry(
+                session_map_fd,
+                key,
+                decision.nat,
+                metadata.is_reverse,
+            );
+        }
+        republished += 1;
+    });
+    republished
+}
+
+pub(super) fn purge_sessions_for_input_dscp_filter_revalidation(
+    sessions: &mut SessionTable,
+    session_map_fd: c_int,
+    conntrack_v4_fd: c_int,
+    conntrack_v6_fd: c_int,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
+    peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    forwarding: &ForwardingState,
+    purge_v4: bool,
+    purge_v6: bool,
+    now_ns: u64,
+) -> usize {
+    if !purge_v4 && !purge_v6 {
+        return 0;
+    }
+    let mut stale = Vec::new();
+    sessions.iter_with_origin(|key, decision, metadata, origin| {
+        let family_matches =
+            (purge_v4 && key.addr_family == libc::AF_INET as u8)
+                || (purge_v6 && key.addr_family == libc::AF_INET6 as u8);
+        if family_matches {
+            stale.push((key.clone(), decision, metadata.clone(), origin));
+        }
+    });
+    let purged = stale.len();
+    for (key, decision, metadata, origin) in stale {
+        release_source_nat_allocation(
+            &forwarding.source_nat_rules,
+            &key,
+            decision.nat,
+            metadata.is_reverse,
+            now_ns,
+        );
+        delete_terminal_filtered_session(
+            sessions,
+            session_map_fd,
+            conntrack_v4_fd,
+            conntrack_v6_fd,
+            shared_sessions,
+            shared_nat_sessions,
+            shared_forward_wire_sessions,
+            shared_owner_rg_indexes,
+            peer_worker_commands,
+            &key,
+            decision,
+            &metadata,
+            origin,
+        );
+    }
+    purged
+}
+
 fn publish_worker_session_map_entry(
     session_map_fd: c_int,
+    forwarding: &ForwardingState,
     key: &SessionKey,
     decision: SessionDecision,
     metadata: &SessionMetadata,
@@ -233,7 +327,16 @@ fn publish_worker_session_map_entry(
     if session_map_fd < 0 {
         return;
     }
+    let has_lo0_filter = session_key_has_lo0_filter(forwarding, key);
     let uses_kernel_local = uses_kernel_local_session_map_entry(decision, metadata, origin);
+    if uses_kernel_local && has_lo0_filter {
+        // A PASS_TO_KERNEL session-map entry cannot re-run userspace lo0
+        // filters. Keep the packet visible to the helper while lo0
+        // filtering is configured; the session-hit path enforces the
+        // current lo0 terms before reinjection.
+        let _ = publish_live_session_entry(session_map_fd, key, decision.nat, metadata.is_reverse);
+        return;
+    }
     let _ = if force_live_redirect_for_worker_synced_entry(
         decision,
         metadata,
@@ -253,6 +356,47 @@ fn publish_worker_session_map_entry(
             origin,
         )
     };
+}
+
+pub(super) fn delete_terminal_filtered_session(
+    sessions: &mut SessionTable,
+    session_map_fd: c_int,
+    conntrack_v4_fd: c_int,
+    conntrack_v6_fd: c_int,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
+    peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+    origin: SessionOrigin,
+) {
+    delete_session_map_entry_for_removed_session_with_origin(
+        session_map_fd,
+        key,
+        decision,
+        metadata,
+        origin,
+        conntrack_v4_fd,
+        conntrack_v6_fd,
+    );
+    sessions.delete(key);
+    remove_shared_session(
+        shared_sessions,
+        shared_nat_sessions,
+        shared_forward_wire_sessions,
+        shared_owner_rg_indexes,
+        key,
+    );
+    replicate_session_delete(peer_worker_commands, key);
+    sessions.emit_close_delta_with_origin(
+        key.clone(),
+        decision,
+        metadata.clone(),
+        origin,
+    );
 }
 
 fn export_forward_sessions_for_owner_rgs(sessions: &mut SessionTable, owner_rgs: &[i32]) {
@@ -404,6 +548,7 @@ pub(super) fn apply_worker_commands(
                         };
                         publish_worker_session_map_entry(
                             session_map_fd,
+                            forwarding,
                             &demoted_key,
                             publish_decision,
                             &publish_metadata,
@@ -488,6 +633,7 @@ pub(super) fn apply_worker_commands(
                     ) {
                         publish_worker_session_map_entry(
                             session_map_fd,
+                            forwarding,
                             &key,
                             refreshed_decision,
                             &refreshed_metadata,
@@ -566,6 +712,7 @@ pub(super) fn apply_worker_commands(
                 ) {
                     publish_worker_session_map_entry(
                         session_map_fd,
+                        forwarding,
                         &key,
                         entry.decision,
                         &metadata,
@@ -1132,8 +1279,10 @@ pub(super) fn resolve_flow_session_decision(
             )
         };
         return Some(ResolvedFlowSessionDecision {
+            key: resolved_key.clone(),
             decision,
             metadata,
+            origin: hit_origin,
             created: false,
         });
     }
@@ -1208,8 +1357,10 @@ pub(super) fn resolve_flow_session_decision(
         tcp_flags,
     );
     Some(ResolvedFlowSessionDecision {
+        key: flow.forward_key.clone(),
         decision,
         metadata,
+        origin: SessionOrigin::ReverseFlow,
         created: true,
     })
 }

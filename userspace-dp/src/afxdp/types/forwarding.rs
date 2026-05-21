@@ -46,6 +46,7 @@ pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) nat64: Nat64State,
     pub(in crate::afxdp) nptv6: Nptv6State,
     pub(in crate::afxdp) screen_profiles: FastMap<String, ScreenProfile>,
+    pub(in crate::afxdp) syn_cookie_master_key: Option<[u8; 16]>,
     pub(in crate::afxdp) tunnel_interfaces: FastSet<i32>,
     pub(in crate::afxdp) filter_state: crate::filter::FilterState,
     pub(in crate::afxdp) cos: CoSState,
@@ -320,7 +321,11 @@ impl WorkerBindingLookup {
         self.by_slot.get(&slot).copied()
     }
 
-    pub(in crate::afxdp) fn fabric_target_index(&self, egress_ifindex: i32, flow_hash: u64) -> Option<usize> {
+    pub(in crate::afxdp) fn fabric_target_index(
+        &self,
+        egress_ifindex: i32,
+        flow_hash: u64,
+    ) -> Option<usize> {
         let indices = self.all_by_if.get(&egress_ifindex)?;
         if indices.is_empty() {
             return None;

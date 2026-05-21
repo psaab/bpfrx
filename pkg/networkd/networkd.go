@@ -54,8 +54,17 @@ type Manager struct {
 
 // New creates a new networkd manager.
 func New() *Manager {
+	return NewInDir(DefaultNetworkDir)
+}
+
+// NewInDir creates a networkd manager rooted at networkDir. Production callers
+// use New(); tests and offline renderers use this to avoid touching /etc.
+func NewInDir(networkDir string) *Manager {
+	if networkDir == "" {
+		networkDir = DefaultNetworkDir
+	}
 	return &Manager{
-		networkDir: DefaultNetworkDir,
+		networkDir: networkDir,
 	}
 }
 

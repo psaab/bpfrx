@@ -25,8 +25,17 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   or allocating on the packet path. No-count helper evaluation returns the
   first logged non-PBR input or lo0 match while skipping routing-instance
   terms to avoid double-emitting PBR logs. TX-selection evaluation meters
-  three-color policers and carries output filter-log identity through live
-  forwarding and cached flow-cache hits.
+  three-color policers, carries output filter-log identity through live
+  forwarding and cached flow-cache hits, and preserves terminal
+  `discard`/`reject` actions so output filters cannot log deny while
+  forwarding. Input/output filters with DSCP match terms force the
+  flow-cache insertion path to decline caching because DSCP is not part
+  of the session key. Established session hits still re-evaluate
+  DSCP-sensitive input filters per packet. Forwarding rotations compare
+  DSCP-sensitive input filter content by stable names, terms, and
+  three-color policer runtime shape, not by compiler-positional filter
+  IDs, before deciding whether existing sessions need a conservative
+  packet-family purge.
 - `policer.rs` — token-bucket implementation plus the #1375 RFC
   2697/2698 three-color meter core. Token math is integer-only:
   the legacy token bucket keeps its bits/sec constructor contract, and

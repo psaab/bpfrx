@@ -19,6 +19,9 @@ func init() {
 	dataplane.RegisterBackend(dataplane.TypeDPDK, func() dataplane.DataPlane {
 		return New()
 	})
+	dataplane.RegisterRuntimeBackend(dataplane.TypeDPDK, func() dataplane.RuntimeDataPlane {
+		return New()
+	})
 }
 
 // Manager is the DPDK dataplane backend (stub implementation).

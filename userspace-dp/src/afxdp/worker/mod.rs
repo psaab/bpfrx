@@ -1109,6 +1109,7 @@ pub(crate) fn worker_loop(
     let mut sessions = SessionTable::new();
     let mut screen_state = ScreenState::new();
     screen_state.update_profiles(forwarding.screen_profiles.clone());
+    screen_state.update_syn_cookie_master_key(forwarding.syn_cookie_master_key);
     sessions.set_timeouts(forwarding.session_timeouts);
     let mut bindings = Vec::with_capacity(binding_plans.len());
     let (private_plans, shared_groups) = partition_binding_plans(binding_plans);
@@ -1332,13 +1333,53 @@ pub(crate) fn worker_loop(
             // Compare BEFORE assignment — needs both old and new.
             let cos_changed =
                 cos_runtime_config_changed(forwarding.as_ref(), new_forwarding.as_ref());
+            let (purge_input_dscp_v4, purge_input_dscp_v6) =
+                crate::filter::input_dscp_filter_families_changed(
+                    &forwarding.filter_state,
+                    &new_forwarding.filter_state,
+                );
 
             // Use NEW values for dependent state updates (forwarding-site
             // ordering — old `forwarding` is stale once rotated).
             screen_state.update_profiles(new_forwarding.screen_profiles.clone());
+            screen_state.update_syn_cookie_master_key(new_forwarding.syn_cookie_master_key);
             sessions.set_timeouts(new_forwarding.session_timeouts);
 
             forwarding = new_forwarding;
+            let purged_input_dscp = purge_sessions_for_input_dscp_filter_revalidation(
+                &mut sessions,
+                session_map_fd,
+                conntrack_v4_fd,
+                conntrack_v6_fd,
+                &shared_sessions,
+                &shared_nat_sessions,
+                &shared_forward_wire_sessions,
+                &shared_owner_rg_indexes,
+                &peer_worker_commands,
+                &forwarding,
+                purge_input_dscp_v4,
+                purge_input_dscp_v6,
+                loop_now_ns,
+            );
+            if purged_input_dscp > 0 {
+                debug_log!(
+                    "INPUT_DSCP_FILTER_PURGE: worker={} sessions={}",
+                    worker_id,
+                    purged_input_dscp,
+                );
+            }
+            let republished = republish_local_delivery_sessions_for_lo0_filter(
+                &sessions,
+                session_map_fd,
+                &forwarding,
+            );
+            if republished > 0 {
+                debug_log!(
+                    "LO0_FILTER_REPUBLISH: worker={} local_delivery_sessions={}",
+                    worker_id,
+                    republished,
+                );
+            }
 
             if cos_changed {
                 reset_worker_cos_runtimes(&mut bindings, &mut shared_recycles);
@@ -2463,9 +2504,12 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) policy_denied_packets: u64,
     pub(crate) screen_drops: u64,
     /// #1374: SYN-cookie challenge decisions selected by userspace screen
-    /// runtime. Not equivalent to SYN-ACKs sent until bounded TX exists.
+    /// runtime.
     pub(crate) syn_cookie_challenges: u64,
     pub(crate) syn_cookie_secret_unavailable: u64,
+    pub(crate) syn_cookie_syn_ack_sent: u64,
+    pub(crate) syn_cookie_ack_rst_sent: u64,
+    pub(crate) syn_cookie_reply_budget_drops: u64,
     pub(crate) syn_cookie_ack_valid: u64,
     pub(crate) syn_cookie_ack_invalid: u64,
     pub(crate) syn_cookie_bypass: u64,

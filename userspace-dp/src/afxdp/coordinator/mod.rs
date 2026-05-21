@@ -1236,6 +1236,9 @@ impl Coordinator {
                 binding.screen_drops = snap.screen_drops;
                 binding.syn_cookie_challenges = snap.syn_cookie_challenges;
                 binding.syn_cookie_secret_unavailable = snap.syn_cookie_secret_unavailable;
+                binding.syn_cookie_syn_ack_sent = snap.syn_cookie_syn_ack_sent;
+                binding.syn_cookie_ack_rst_sent = snap.syn_cookie_ack_rst_sent;
+                binding.syn_cookie_reply_budget_drops = snap.syn_cookie_reply_budget_drops;
                 binding.syn_cookie_ack_valid = snap.syn_cookie_ack_valid;
                 binding.syn_cookie_ack_invalid = snap.syn_cookie_ack_invalid;
                 binding.syn_cookie_bypass = snap.syn_cookie_bypass;
@@ -1405,6 +1408,9 @@ impl Coordinator {
                 binding.screen_drops = 0;
                 binding.syn_cookie_challenges = 0;
                 binding.syn_cookie_secret_unavailable = 0;
+                binding.syn_cookie_syn_ack_sent = 0;
+                binding.syn_cookie_ack_rst_sent = 0;
+                binding.syn_cookie_reply_budget_drops = 0;
                 binding.syn_cookie_ack_valid = 0;
                 binding.syn_cookie_ack_invalid = 0;
                 binding.syn_cookie_bypass = 0;

@@ -35,6 +35,19 @@ pub(super) fn build_screen_profiles(snapshot: &ConfigSnapshot) -> FxHashMap<Stri
     profiles
 }
 
+fn parse_syn_cookie_master_key(key: &str) -> Option<[u8; 16]> {
+    if key.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (idx, byte) in out.iter_mut().enumerate() {
+        let start = idx * 2;
+        let part = key.get(start..start + 2)?;
+        *byte = u8::from_str_radix(part, 16).ok()?;
+    }
+    Some(out)
+}
+
 fn build_cos_dscp_queue_table(
     classifier_name: &str,
     classifiers: &FastMap<String, CoSDSCPClassifierConfig>,
@@ -419,6 +432,7 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     state.nat64 = Nat64State::from_snapshots(&snapshot.nat64_rules);
     state.nptv6 = Nptv6State::from_snapshots(&snapshot.nptv6_rules);
     state.screen_profiles = build_screen_profiles(snapshot);
+    state.syn_cookie_master_key = parse_syn_cookie_master_key(&snapshot.syn_cookie_master_key);
     state.tcp_mss_all_tcp = snapshot.flow.tcp_mss_all_tcp;
     state.tcp_mss_ipsec_vpn = snapshot.flow.tcp_mss_ipsec_vpn;
     state.tcp_mss_gre_in = snapshot.flow.tcp_mss_gre_in;

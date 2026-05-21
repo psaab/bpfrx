@@ -84,7 +84,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 | Static NAT (1:1) | Yes | Yes |
 | NAT64 (IPv6↔IPv4) | Yes | Yes |
 | NPTv6 (RFC 6296) | Yes | Yes |
-| Screen/IDS (11 checks) | Yes | Most checks yes; SYN-cookie behavior falls back |
+| Screen/IDS (11 checks) | Yes | Yes; userspace SYN-cookie runtime is wired |
 | Firewall filters + policers | Yes | Filters yes; three-color policers admitted for color-blind `then discard` slice, with remaining #1375 hardening still open |
 | TCP MSS clamping | Yes | Yes |
 | GRE tunnel transit | Yes | Yes (passthrough) |
@@ -92,13 +92,15 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 | VLANs (802.1Q) | Yes | Yes |
 | Flow export (NetFlow v9) | Yes | Yes |
 | HA cluster + session sync | Yes | Integrated, but still under active hardening |
-| SYN cookie flood protection | Yes | No (fallback) |
+| SYN cookie flood protection | Yes | Yes; live HA/flood evidence still required before BPF source removal |
 | Throughput (25G mlx5) | 22+ Gbps | See validation/perf docs for current results |
 
 The userspace dataplane now covers most of the transit feature set in native
-Rust, but it is not "fallback-free". Current explicit gates in code still
-include SYN-cookie-dependent screen behavior. Port mirroring has bounded
-userspace runtime admission, but still needs mirror-fidelity and pressure
+Rust, but it is not "fallback-free". SYN-cookie-dependent screen behavior now
+runs in userspace with bounded SYN-ACK/RST replies and userspace status
+counters; live HA/flood evidence is still required before BPF source removal.
+Port mirroring has bounded userspace runtime admission, but still needs
+mirror-fidelity and pressure
 evidence before BPF source removal. Three-color policers are admitted only for
 the bounded color-blind `then discard` runtime slice while #1375 hardening
 remains. Pool-mode SNAT is admitted, #1385 added userspace-v1

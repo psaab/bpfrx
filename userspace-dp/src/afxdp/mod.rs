@@ -346,6 +346,9 @@ pub(in crate::afxdp) struct BatchCounters {
     screen_drops: u64,
     syn_cookie_challenges: u64,
     syn_cookie_secret_unavailable: u64,
+    syn_cookie_syn_ack_sent: u64,
+    syn_cookie_ack_rst_sent: u64,
+    syn_cookie_reply_budget_drops: u64,
     syn_cookie_ack_valid: u64,
     syn_cookie_ack_invalid: u64,
     syn_cookie_bypass: u64,
@@ -437,6 +440,21 @@ impl BatchCounters {
             live.syn_cookie_secret_unavailable
                 .fetch_add(self.syn_cookie_secret_unavailable, Ordering::Relaxed);
             self.syn_cookie_secret_unavailable = 0;
+        }
+        if self.syn_cookie_syn_ack_sent != 0 {
+            live.syn_cookie_syn_ack_sent
+                .fetch_add(self.syn_cookie_syn_ack_sent, Ordering::Relaxed);
+            self.syn_cookie_syn_ack_sent = 0;
+        }
+        if self.syn_cookie_ack_rst_sent != 0 {
+            live.syn_cookie_ack_rst_sent
+                .fetch_add(self.syn_cookie_ack_rst_sent, Ordering::Relaxed);
+            self.syn_cookie_ack_rst_sent = 0;
+        }
+        if self.syn_cookie_reply_budget_drops != 0 {
+            live.syn_cookie_reply_budget_drops
+                .fetch_add(self.syn_cookie_reply_budget_drops, Ordering::Relaxed);
+            self.syn_cookie_reply_budget_drops = 0;
         }
         if self.syn_cookie_ack_valid != 0 {
             live.syn_cookie_ack_valid

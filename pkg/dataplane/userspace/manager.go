@@ -54,13 +54,13 @@ func (m DataplaneMode) String() string {
 }
 
 func init() {
-	dataplane.RegisterBackend(dataplane.TypeUserspace, func() dataplane.DataPlane {
+	dataplane.RegisterRuntimeBackend(dataplane.TypeUserspace, func() dataplane.RuntimeDataPlane {
 		return NewLegacyDataPlaneAdapter(New())
 	})
 }
 
 type Manager struct {
-	inner *dataplane.Manager
+	bpfShim *dataplane.Manager
 
 	mu                    sync.Mutex
 	sessionMu             sync.Mutex // separate lock for session sync requests (Phase 3)
@@ -152,10 +152,10 @@ func shouldAttemptRSTSuppression(
 }
 
 func New() *Manager {
-	inner := dataplane.New()
-	inner.XDPEntryProg = "xdp_main_prog"
+	bpfShim := dataplane.New()
+	bpfShim.XDPEntryProg = "xdp_main_prog"
 	return &Manager{
-		inner:          inner,
+		bpfShim:        bpfShim,
 		configuredMode: ModeUserspaceCompat,
 		haGroups:       make(map[int]HAGroupStatus),
 	}
@@ -264,17 +264,17 @@ func (o managerHAOps) UpdateHAWatchdog(rgID int, timestamp uint64) error {
 }
 
 func (o managerHAOps) UpdateFabricFwd(info dataplane.FabricFwdInfo) error {
-	if o.manager == nil || o.manager.inner == nil {
+	if o.manager == nil || o.manager.bpfShim == nil {
 		return errors.New("nil userspace dataplane")
 	}
-	return o.manager.inner.UpdateFabricFwd(info)
+	return o.manager.bpfShim.UpdateFabricFwd(info)
 }
 
 func (o managerHAOps) UpdateFabricFwd1(info dataplane.FabricFwdInfo) error {
-	if o.manager == nil || o.manager.inner == nil {
+	if o.manager == nil || o.manager.bpfShim == nil {
 		return errors.New("nil userspace dataplane")
 	}
-	return o.manager.inner.UpdateFabricFwd1(info)
+	return o.manager.bpfShim.UpdateFabricFwd1(info)
 }
 
 func (o managerHAOps) SyncFabricState() {
@@ -442,21 +442,21 @@ func (m *Manager) SessionSyncSweepProfile() (bool, time.Duration, time.Duration)
 }
 
 func (m *Manager) Load() error {
-	return m.inner.Load()
+	return m.bpfShim.Load()
 }
 
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.stopLocked()
-	return m.inner.Close()
+	return m.bpfShim.Close()
 }
 
 func (m *Manager) Teardown() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.stopLocked()
-	return m.inner.Teardown()
+	return m.bpfShim.Teardown()
 }
 
 // SetDeferWorkers tells the manager to skip worker startup during the next
@@ -470,7 +470,7 @@ func (m *Manager) SetDeferWorkers(v bool) {
 }
 
 func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) {
-	// Delete XDP link pins BEFORE inner.Compile() so AttachXDP does
+	// Delete XDP link pins BEFORE bpfShim.Compile() so AttachXDP does
 	// a fresh attach. This is critical for zero-copy: fresh attach
 	// triggers mlx5 to initialize XSK buffer pool from fill ring.
 	// Pinned link reuse (l.Update) only swaps the program without
@@ -492,13 +492,13 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	// XSK socket creation is deferred by the arm delay (45s) to avoid
 	// segfaults from __xsk_setup_xdp_prog during link cycles.
 	if m.xskLivenessFailed {
-		m.inner.XDPEntryProg = "xdp_main_prog"
+		m.bpfShim.XDPEntryProg = "xdp_main_prog"
 	} else if caps.ForwardingSupported {
-		m.inner.XDPEntryProg = "xdp_userspace_prog"
+		m.bpfShim.XDPEntryProg = "xdp_userspace_prog"
 	} else {
-		m.inner.XDPEntryProg = "xdp_main_prog"
+		m.bpfShim.XDPEntryProg = "xdp_main_prog"
 	}
-	result, err := m.inner.Compile(cfg)
+	result, err := m.bpfShim.Compile(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -703,26 +703,26 @@ func (m *Manager) syncInterfaceAttachments(result *dataplane.CompileResult, snap
 	for _, ifindex := range buildUserspaceIngressIfindexes(snapshot) {
 		allowed[int(ifindex)] = true
 	}
-	for ifindex := range m.inner.XDPLinks() {
+	for ifindex := range m.bpfShim.XDPLinks() {
 		if allowed[ifindex] {
 			continue
 		}
-		if err := m.inner.DetachXDP(ifindex); err != nil {
+		if err := m.bpfShim.DetachXDP(ifindex); err != nil {
 			slog.Warn("userspace: detach XDP from non-data interface failed", "ifindex", ifindex, "err", err)
 		}
 	}
-	for ifindex := range m.inner.TCLinks() {
+	for ifindex := range m.bpfShim.TCLinks() {
 		if allowed[ifindex] {
 			continue
 		}
-		if err := m.inner.DetachTC(ifindex); err != nil {
+		if err := m.bpfShim.DetachTC(ifindex); err != nil {
 			slog.Warn("userspace: detach TC from non-data interface failed", "ifindex", ifindex, "err", err)
 		}
 	}
 }
 
 func (m *Manager) readFIBGeneration() uint32 {
-	fibGenMap := m.inner.Map("fib_gen_map")
+	fibGenMap := m.bpfShim.Map("fib_gen_map")
 	if fibGenMap == nil {
 		return 0
 	}
@@ -864,7 +864,7 @@ func (m *Manager) bumpGeneration() uint64 {
 // This avoids the full buildSnapshot() + apply_snapshot round-trip that was the
 // primary source of control socket contention during route convergence.
 func (m *Manager) BumpFIBGeneration() uint32 {
-	newGen := m.inner.BumpFIBGeneration()
+	newGen := m.bpfShim.BumpFIBGeneration()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1181,7 +1181,9 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	// TCP MSS clamping is supported in the userspace dataplane
 	// GRE acceleration (key extraction into session ports) is supported
 	if !userspaceSupportsScreenProfiles(cfg) {
-		addReason("screen features requiring SYN cookies are not implemented in the userspace dataplane")
+		addReason(
+			"userspace SYN-cookie screen profiles require system root-authentication encrypted-password material",
+		)
 	}
 	if !userspaceSupportsThreeColorPolicers(cfg) {
 		addReason("userspace three-color policers require color-blind mode and then discard")

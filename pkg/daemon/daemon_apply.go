@@ -397,7 +397,7 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 
 	// 1.9. Pre-check: will RETH MAC programming require a link cycle?
 	// If yes, tell the userspace DP to skip initial worker startup during
-	// Compile(). Workers will be started by NotifyLinkCycle() after MAC
+	// ApplyConfig(). Workers will be started by NotifyLinkCycle() after MAC
 	// programming is done. This avoids the double-bind that causes EBUSY
 	// on mlx5 zero-copy queues.
 	rethMACPending := false
@@ -422,19 +422,16 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 			}
 		}
 		if rethMACPending {
-			type deferSetter interface{ SetDeferWorkers(bool) }
-			if ds, ok := d.dp.(deferSetter); ok {
-				ds.SetDeferWorkers(true)
-				deferWorkersActive = true
-				clearDeferWorkers = func() {
-					ds.SetDeferWorkers(false)
-				}
-				defer func() {
-					if deferWorkersActive {
-						clearDeferWorkers()
-					}
-				}()
+			d.setDataplaneDeferWorkers(true)
+			deferWorkersActive = true
+			clearDeferWorkers = func() {
+				d.setDataplaneDeferWorkers(false)
 			}
+			defer func() {
+				if deferWorkersActive {
+					clearDeferWorkers()
+				}
+			}()
 		}
 	}
 
@@ -442,11 +439,11 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	policySchedulerActiveState := d.policySchedulerActiveStateForApplyLocked(cfg, policySchedulerApplyTime)
 	d.seedPolicySchedulerActiveStateLocked(policySchedulerActiveState)
 
-	// 2. Compile eBPF dataplane
-	var compileResult *dataplane.CompileResult
+	// 2. Apply dataplane config through the runtime config sink.
+	var applyResult *dataplane.ApplyResult
 	if d.dp != nil {
 		var err error
-		if compileResult, err = d.dp.Compile(cfg); err != nil {
+		if applyResult, err = d.dp.ApplyConfig(context.Background(), cfg); err != nil {
 			d.recordCompileFailure(err)
 			if compileErrorMustAbortApply(err) {
 				return err
@@ -456,9 +453,9 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		}
 	}
 	policySchedulerActiveState = d.reconcilePolicySchedulerLockedAt(cfg, policySchedulerApplyTime)
-	d.publishInitialPolicySchedulerStateLocked(cfg, policySchedulerActiveState, compileResult)
+	d.publishInitialPolicySchedulerStateLocked(cfg, policySchedulerActiveState, applyResult)
 
-	// Clear defer flag after Compile so subsequent recompiles (where MAC
+	// Clear defer flag after ApplyConfig so subsequent applies (where MAC
 	// is already set) don't skip workers.
 	if deferWorkersActive {
 		clearDeferWorkers()
@@ -485,13 +482,13 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	}
 
 	// 2.2. Build zone→RG map for per-RG session sync.
-	if d.sessionSync != nil && compileResult != nil {
-		d.sessionSync.SetZoneRGMap(buildZoneRGMap(cfg, compileResult.ZoneIDs))
+	if d.sessionSync != nil && applyResult != nil {
+		d.sessionSync.SetZoneRGMap(buildZoneRGMap(cfg, applyResult.ZoneIDs))
 	}
 
 	// 2.5. Write systemd-networkd config for managed interfaces
-	if d.networkd != nil && compileResult != nil && len(compileResult.ManagedInterfaces) > 0 {
-		if err := d.networkd.Apply(compileResult.ManagedInterfaces); err != nil {
+	if d.networkd != nil && applyResult != nil && len(applyResult.ManagedInterfaces) > 0 {
+		if err := d.networkd.Apply(applyResult.ManagedInterfaces); err != nil {
 			slog.Warn("failed to apply networkd config", "err", err)
 		}
 	}
@@ -552,11 +549,8 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 				// been accessing UMEM during the DOWN/UP). The rebind
 				// in NotifyLinkCycle will restart them.
 				if d.dp != nil {
-					type linkCyclePreparer interface{ PrepareLinkCycle() }
-					if preparer, ok := d.dp.(linkCyclePreparer); ok {
-						slog.Info("userspace: stopping workers after RETH MAC link cycle")
-						preparer.PrepareLinkCycle()
-					}
+					slog.Info("userspace: stopping workers after RETH MAC link cycle")
+					d.dp.Link().PrepareLinkCycle()
 				}
 			}
 			needLinkCycleRecovery = needLinkCycleRecovery || linkCycled
@@ -655,16 +649,16 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	if d.dp != nil && needLinkCycleRecovery {
 		// Actual link DOWN/UP occurred — old XSK sockets are dead.
 		// Rebind to create fresh sockets on the reinitialized queues.
-		d.dp.NotifyLinkCycle()
+		d.dp.Link().NotifyLinkCycle()
 		if d.ra != nil {
 			d.ra.ResendBurst()
 		}
 	} else if d.dp != nil && rethMACPending && !needLinkCycleRecovery {
 		// MAC set live (no link cycle) but workers were deferred.
-		// Trigger a re-Compile to start workers with the now-correct MAC.
+		// Trigger a re-apply to start workers with the now-correct MAC.
 		// This is cheaper than NotifyLinkCycle (no stop_workers/rebind).
-		if _, err := d.dp.Compile(cfg); err != nil {
-			slog.Warn("failed to re-compile after deferred MAC", "err", err)
+		if _, err := d.dp.ApplyConfig(context.Background(), cfg); err != nil {
+			slog.Warn("failed to re-apply after deferred MAC", "err", err)
 		}
 	}
 
@@ -1046,12 +1040,24 @@ func compileErrorMustAbortApply(err error) bool {
 	return errors.Is(err, dpuserspace.ErrPolicySchedulerProtocolIncompatible)
 }
 
-func (d *Daemon) publishInitialPolicySchedulerStateLocked(cfg *config.Config, activeState map[string]bool, compileResult *dataplane.CompileResult) {
-	if d.dp == nil || activeState == nil || compileResult == nil {
+func (d *Daemon) setDataplaneDeferWorkers(deferWorkers bool) {
+	if d.dp == nil {
+		return
+	}
+	type deferSetter interface{ SetDeferWorkers(bool) }
+	if setter, ok := d.dp.(deferSetter); ok {
+		setter.SetDeferWorkers(deferWorkers)
+		return
+	}
+	d.dp.Link().SetDeferWorkers(deferWorkers)
+}
+
+func (d *Daemon) publishInitialPolicySchedulerStateLocked(cfg *config.Config, activeState map[string]bool, applyResult *dataplane.ApplyResult) {
+	if d.dp == nil || activeState == nil || applyResult == nil {
 		return
 	}
 	if _, isUserspace := d.dp.(userspaceRuntimeModeReporter); isUserspace {
 		return
 	}
-	d.dp.UpdatePolicyScheduleState(cfg, activeState)
+	d.updatePolicyScheduleStateLocked(cfg, activeState)
 }

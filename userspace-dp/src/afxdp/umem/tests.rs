@@ -421,9 +421,13 @@ fn binding_live_snapshot_propagates_710_drop_counters() {
     live.syn_cookie_challenges.store(17, Ordering::Relaxed);
     live.syn_cookie_secret_unavailable
         .store(19, Ordering::Relaxed);
-    live.syn_cookie_ack_valid.store(23, Ordering::Relaxed);
-    live.syn_cookie_ack_invalid.store(29, Ordering::Relaxed);
-    live.syn_cookie_bypass.store(31, Ordering::Relaxed);
+    live.syn_cookie_syn_ack_sent.store(23, Ordering::Relaxed);
+    live.syn_cookie_ack_rst_sent.store(29, Ordering::Relaxed);
+    live.syn_cookie_reply_budget_drops
+        .store(31, Ordering::Relaxed);
+    live.syn_cookie_ack_valid.store(37, Ordering::Relaxed);
+    live.syn_cookie_ack_invalid.store(41, Ordering::Relaxed);
+    live.syn_cookie_bypass.store(43, Ordering::Relaxed);
     live.no_owner_binding_drops.store(11, Ordering::Relaxed);
 
     let snap = live.snapshot();
@@ -433,9 +437,12 @@ fn binding_live_snapshot_propagates_710_drop_counters() {
     assert_eq!(snap.tx_shared_recycle_unknown_slot_drops, 13);
     assert_eq!(snap.syn_cookie_challenges, 17);
     assert_eq!(snap.syn_cookie_secret_unavailable, 19);
-    assert_eq!(snap.syn_cookie_ack_valid, 23);
-    assert_eq!(snap.syn_cookie_ack_invalid, 29);
-    assert_eq!(snap.syn_cookie_bypass, 31);
+    assert_eq!(snap.syn_cookie_syn_ack_sent, 23);
+    assert_eq!(snap.syn_cookie_ack_rst_sent, 29);
+    assert_eq!(snap.syn_cookie_reply_budget_drops, 31);
+    assert_eq!(snap.syn_cookie_ack_valid, 37);
+    assert_eq!(snap.syn_cookie_ack_invalid, 41);
+    assert_eq!(snap.syn_cookie_bypass, 43);
     // `no_owner_binding_drops` has no per-binding protocol surface;
     // it is read directly from the atomic by
     // `Coordinator::cos_no_owner_binding_drops_total()`.
@@ -1473,6 +1480,7 @@ fn active_flow_debug_test_entry(
             tx_selection: CachedTxSelectionDescriptor {
                 queue_id: Some(2),
                 dscp_rewrite: Some(46),
+                drop: false,
                 filter_counter: None,
                 three_color_policers: crate::filter::CachedThreeColorPolicers::default(),
                 filter_log: None,

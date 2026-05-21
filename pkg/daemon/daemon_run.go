@@ -242,23 +242,25 @@ func (d *Daemon) Run(ctx context.Context) error {
 		if cfg := d.store.ActiveConfig(); cfg != nil {
 			dpType = cfg.System.DataplaneType
 		}
-		dp, err := dataplane.NewDataPlane(dpType)
+		dp, err := dataplane.NewRuntimeDataPlane(dpType)
 		if err != nil {
 			slog.Error("failed to create dataplane", "type", dpType, "err", err)
 			return fmt.Errorf("create dataplane: %w", err)
 		}
 		d.dp = dp
-		if err := d.dp.Load(); err != nil {
-			slog.Warn("failed to load dataplane programs, running in config-only mode",
+		if err := d.dp.Start(ctx); err != nil {
+			slog.Warn("failed to start dataplane, running in config-only mode",
 				"err", err)
 			d.dp = nil
 		} else {
-			d.dp.SeedNATPortCounters()
-			nodeID := 0
-			if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
-				nodeID = cfg.Chassis.Cluster.NodeID
+			if lp := d.legacyDP(); lp != nil {
+				lp.SeedNATPortCounters()
+				nodeID := 0
+				if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
+					nodeID = cfg.Chassis.Cluster.NodeID
+				}
+				lp.SeedSessionIDCounter(nodeID)
 			}
-			d.dp.SeedSessionIDCounter(nodeID)
 		}
 		// Apply current config — needed even in config-only mode so that
 		// VRFs, interfaces, and routing are configured before cluster comms.
@@ -300,9 +302,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	var er *logging.EventReader
 	if d.dp != nil {
 		// Start FIB sync (DPDK: background route populator; eBPF: no-op)
-		d.dp.StartFIBSync(ctx)
+		if lp := d.legacyDP(); lp != nil {
+			lp.StartFIBSync(ctx)
+		}
 
-		gc := conntrack.NewGC(d.dp, 10*time.Second)
+		gc := conntrack.NewGCWithDomains(
+			d.dp.Sessions(),
+			d.dp.Telemetry(),
+			nil,
+			nil,
+			10*time.Second,
+		)
 		d.gc = gc
 
 		// When the userspace dataplane is active, skip BPF session map
@@ -345,7 +355,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			gc.Run(ctx)
 		}()
 
-		evSrc, evErr := d.dp.NewEventSource()
+		evSrc, evErr := d.dp.Telemetry().NewEventSource()
 		if evErr != nil {
 			slog.Warn("failed to create event source", "err", evErr)
 		}
@@ -382,7 +392,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 						key.SrcPort = binary.BigEndian.Uint16(raw[40:42])
 						key.DstPort = binary.BigEndian.Uint16(raw[42:44])
 						key.Protocol = proto
-						if val, err := d.dp.GetSessionV6(key); err == nil && val.IsReverse == 0 {
+						if val, err := d.dp.Sessions().GetV6(key); err == nil && val.IsReverse == 0 {
 							if d.sessionSync.ShouldSyncZone(val.IngressZone) {
 								d.sessionSync.QueueSessionV6(key, val)
 							}
@@ -394,7 +404,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 						key.SrcPort = binary.BigEndian.Uint16(raw[40:42])
 						key.DstPort = binary.BigEndian.Uint16(raw[42:44])
 						key.Protocol = proto
-						if val, err := d.dp.GetSessionV4(key); err == nil && val.IsReverse == 0 {
+						if val, err := d.dp.Sessions().GetV4(key); err == nil && val.IsReverse == 0 {
 							if d.sessionSync.ShouldSyncZone(val.IngressZone) {
 								d.sessionSync.QueueSessionV4(key, val)
 							}
@@ -643,7 +653,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		apiCfg := api.Config{
 			Addr:     d.opts.APIAddr,
 			Store:    d.store,
-			DP:       d.dp,
+			DP:       d.legacyDP(),
 			EventBuf: eventBuf,
 			GC:       d.gc,
 			Routing:  d.routing,
@@ -722,14 +732,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// `show chassis forwarding`).  Shared between the gRPC server
 	// and the local CLI; both paths call Snapshot() at query time.
 	// Started here so the ring is populated before the first CLI.
-	fwdSampler := fwdstatus.NewSampler(d.dp, fwdstatus.OSProcReader{})
+	fwdSampler := fwdstatus.NewSampler(d.legacyDP(), fwdstatus.OSProcReader{})
 	fwdSampler.Start(ctx)
 
 	// Start gRPC API server.
 	{
 		grpcSrv := grpcapi.NewServer(d.opts.GRPCAddr, grpcapi.Config{
 			Store:      d.store,
-			DP:         d.dp,
+			DP:         d.legacyDP(),
 			EventBuf:   eventBuf,
 			GC:         d.gc,
 			Routing:    d.routing,
@@ -815,7 +825,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start interactive CLI or block in daemon mode
 	var runErr error
 	if isInteractive() {
-		shell := cli.New(d.store, d.dp, eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp, d.dhcpRelay, d.cluster)
+		shell := cli.New(d.store, d.legacyDP(), eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp, d.dhcpRelay, d.cluster)
 		shell.SetVersion(d.opts.Version)
 		shell.SetForwardingSampler(fwdSampler)
 		// #797 H2 / #846: route in-process CLI commits through the
@@ -957,11 +967,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// BPF stops forwarding traffic even if subsequent cleanup steps hang.
 	if !hitless && d.dp != nil && cfg.Chassis.Cluster != nil {
 		slog.Info("HA shutdown: clearing rg_active for all RGs")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
 		for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
-			if err := d.dp.UpdateRGActive(rg.ID, false); err != nil {
+			err := runHAShutdownUpdate(shutdownCtx, func(ctx context.Context) error {
+				return d.dp.HA().SetRGActive(ctx, rg.ID, false)
+			})
+			if err != nil {
 				slog.Warn("failed to clear rg_active on shutdown", "rg", rg.ID, "err", err)
 			}
-			if err := d.dp.UpdateHAWatchdog(rg.ID, 0); err != nil {
+			err = runHAShutdownUpdate(shutdownCtx, func(ctx context.Context) error {
+				return d.dp.HA().SetHAWatchdog(ctx, rg.ID, 0)
+			})
+			if err != nil {
 				slog.Warn("failed to clear ha_watchdog on shutdown", "rg", rg.ID, "err", err)
 			}
 		}
@@ -1001,7 +1019,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	if d.dp != nil {
-		logFinalStats(d.dp)
+		if lp := d.legacyDP(); lp != nil {
+			logFinalStats(lp)
+		}
 		if hitless {
 			// Hitless: close Go handles only — BPF programs keep running.
 			slog.Info("hitless shutdown: preserving BPF state")
@@ -1214,4 +1234,20 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]
 		addRoutes(vrfName, ri.Inet6StaticRoutes)
 	}
 	return resolved
+}
+
+func runHAShutdownUpdate(ctx context.Context, update func(context.Context) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- update(ctx)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

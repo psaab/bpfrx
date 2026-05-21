@@ -6,8 +6,12 @@
 // session_glue/mod.rs.
 
 use super::*;
+use crate::filter::Filter;
 use crate::test_zone_ids::*;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
+
+const TCP_FLAG_ACK: u8 = 0x10;
 
 fn active_ha_runtime(now_secs: u64) -> HAGroupRuntime {
     HAGroupRuntime {
@@ -57,6 +61,22 @@ fn test_decision() -> SessionDecision {
     }
 }
 
+fn empty_filter(name: &str, family: &str) -> Arc<Filter> {
+    Arc::new(Filter {
+        id: 1,
+        name: name.to_string(),
+        family: family.to_string(),
+        terms: Vec::new(),
+        affects_tx_selection: false,
+        affects_route_lookup: false,
+        has_counter_terms: false,
+        has_log_terms: false,
+        has_terminal_action_terms: false,
+        has_dscp_match_terms: false,
+        has_three_color_policer_terms: false,
+    })
+}
+
 fn test_forwarding_state() -> ForwardingState {
     let mut forwarding = ForwardingState::default();
     forwarding.connected_v4.push(ConnectedRouteV4 {
@@ -97,6 +117,135 @@ fn test_forwarding_state() -> ForwardingState {
         },
     );
     forwarding
+}
+
+#[test]
+fn session_key_has_lo0_filter_matches_packet_family() {
+    let mut forwarding = ForwardingState::default();
+    let v4_key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 1)),
+        src_port: 12345,
+        dst_port: 5201,
+    };
+    let v6_key = SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+        dst_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+        src_port: 12345,
+        dst_port: 5201,
+    };
+
+    assert!(!session_key_has_lo0_filter(&forwarding, &v4_key));
+    forwarding.filter_state.lo0_filter_v4_fast = Some(empty_filter("lo0-v4", "inet"));
+    assert!(session_key_has_lo0_filter(&forwarding, &v4_key));
+    assert!(!session_key_has_lo0_filter(&forwarding, &v6_key));
+
+    forwarding.filter_state.lo0_filter_v6_fast = Some(empty_filter("lo0-v6", "inet6"));
+    assert!(session_key_has_lo0_filter(&forwarding, &v6_key));
+}
+
+#[test]
+fn republish_local_delivery_sessions_for_lo0_filter_selects_existing_hits() {
+    let mut forwarding = ForwardingState::default();
+    forwarding.filter_state.lo0_filter_v4_fast = Some(empty_filter("lo0-v4", "inet"));
+    let key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 1)),
+        src_port: 12345,
+        dst_port: 5201,
+    };
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol_with_origin(
+        key,
+        test_local_delivery_decision(),
+        test_metadata(),
+        SessionOrigin::SyncImport,
+        1,
+        PROTO_TCP,
+        TCP_FLAG_SYN,
+    ));
+
+    assert_eq!(
+        republish_local_delivery_sessions_for_lo0_filter(&sessions, -1, &forwarding),
+        1
+    );
+
+    forwarding.filter_state.lo0_filter_v4_fast = None;
+    assert_eq!(
+        republish_local_delivery_sessions_for_lo0_filter(&sessions, -1, &forwarding),
+        0
+    );
+}
+
+#[test]
+fn purge_sessions_for_input_dscp_filter_revalidation_removes_family() {
+    let forwarding = ForwardingState::default();
+    let mut sessions = SessionTable::new();
+    let v4_key = test_key();
+    let v6_key = SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+        dst_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+        src_port: 12345,
+        dst_port: 5201,
+    };
+    assert!(sessions.install_with_protocol_with_origin(
+        v4_key.clone(),
+        test_decision(),
+        test_metadata(),
+        SessionOrigin::ForwardFlow,
+        1,
+        PROTO_TCP,
+        TCP_FLAG_ACK,
+    ));
+    assert!(sessions.install_with_protocol_with_origin(
+        v6_key.clone(),
+        test_decision(),
+        test_metadata(),
+        SessionOrigin::ForwardFlow,
+        1,
+        PROTO_TCP,
+        TCP_FLAG_ACK,
+    ));
+    let _ = sessions.drain_deltas(16);
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
+
+    assert_eq!(
+        purge_sessions_for_input_dscp_filter_revalidation(
+            &mut sessions,
+            -1,
+            -1,
+            -1,
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &peer_worker_commands,
+            &forwarding,
+            true,
+            false,
+            2,
+        ),
+        1
+    );
+
+    assert!(sessions.entry_with_origin(&v4_key).is_none());
+    assert!(sessions.entry_with_origin(&v6_key).is_some());
+    let deltas = sessions.drain_deltas(16);
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0].kind, SessionDeltaKind::Close);
+    assert_eq!(deltas[0].key, v4_key);
 }
 
 fn test_local_delivery_decision() -> SessionDecision {

@@ -20,7 +20,7 @@ func TestUserspaceManagerDoesNotEmbedLegacyDataPlane(t *testing.T) {
 	}
 
 	var hasEmbeddedDataPlane bool
-	var hasInnerDataplaneManager bool
+	var hasExplicitBPFShim bool
 	ast.Inspect(file, func(n ast.Node) bool {
 		typeSpec, ok := n.(*ast.TypeSpec)
 		if !ok || typeSpec.Name.Name != "Manager" {
@@ -38,8 +38,8 @@ func TestUserspaceManagerDoesNotEmbedLegacyDataPlane(t *testing.T) {
 				}
 			case "*dataplane.Manager":
 				for _, name := range field.Names {
-					if name.Name == "inner" {
-						hasInnerDataplaneManager = true
+					if name.Name == "bpfShim" {
+						hasExplicitBPFShim = true
 					}
 				}
 			}
@@ -50,8 +50,8 @@ func TestUserspaceManagerDoesNotEmbedLegacyDataPlane(t *testing.T) {
 	if hasEmbeddedDataPlane {
 		t.Fatal("userspace Manager must not embed dataplane.DataPlane; use LegacyDataPlaneAdapter for old callers")
 	}
-	if !hasInnerDataplaneManager {
-		t.Fatal("userspace Manager no longer has inner *dataplane.Manager; update #1381 docs and remove this remaining-debt canary")
+	if !hasExplicitBPFShim {
+		t.Fatal("userspace Manager must keep an explicit bpfShim field for userspace XDP maps")
 	}
 }
 
@@ -75,18 +75,22 @@ func TestUserspaceManagerRuntimeContractDoesNotExposeLegacyDataPlane(t *testing.
 	}
 }
 
-func TestUserspaceBackendRegistryReturnsLegacyAdapter(t *testing.T) {
+func TestUserspaceBackendRegistryReturnsRuntimeAdapterForLegacyCallers(t *testing.T) {
 	t.Parallel()
 
-	dp, err := dataplane.NewDataPlane(dataplane.TypeUserspace)
+	if dp, err := dataplane.NewDataPlane(dataplane.TypeUserspace); err == nil {
+		t.Fatalf("NewDataPlane(userspace) = %T, want legacy registry miss", dp)
+	}
+
+	dp, err := dataplane.NewRuntimeDataPlane(dataplane.TypeUserspace)
 	if err != nil {
-		t.Fatalf("NewDataPlane(userspace): %v", err)
+		t.Fatalf("NewRuntimeDataPlane(userspace): %v", err)
 	}
 	if _, ok := any(dp).(*LegacyDataPlaneAdapter); !ok {
-		t.Fatalf("NewDataPlane(userspace) = %T, want *LegacyDataPlaneAdapter", dp)
+		t.Fatalf("NewRuntimeDataPlane(userspace) = %T, want *LegacyDataPlaneAdapter", dp)
 	}
-	if _, ok := any(dp).(*Manager); ok {
-		t.Fatal("NewDataPlane(userspace) returned *Manager directly")
+	if _, ok := any(dp).(dataplane.DataPlane); !ok {
+		t.Fatalf("NewRuntimeDataPlane(userspace) = %T, want legacy-compatible adapter", dp)
 	}
 }
 

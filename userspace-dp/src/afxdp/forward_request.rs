@@ -122,7 +122,7 @@ pub(super) fn build_live_forward_request_from_frame(
         .map(|selection| CoSTxSelection {
             queue_id: selection.queue_id,
             dscp_rewrite: selection.dscp_rewrite,
-            drop: false,
+            drop: selection.drop,
             filter_log: selection.filter_log,
         })
         .unwrap_or_else(|| {

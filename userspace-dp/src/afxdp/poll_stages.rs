@@ -23,7 +23,7 @@
 //! the 9-continue table, and the hidden-invariants list.
 
 use super::*;
-use crate::screen::SynCookieAckVerdict;
+use crate::screen::{SynCookieAckVerdict, SynCookieChallenge};
 
 /// Generic outcome for a per-packet stage. The `RecycleAndContinue`
 /// arm signals that the caller should push `desc.addr` to
@@ -32,6 +32,16 @@ use crate::screen::SynCookieAckVerdict;
 pub(super) enum StageOutcome<T> {
     RecycleAndContinue,
     Continue(T),
+}
+
+pub(super) enum ScreenCheckOutcome {
+    Pass,
+    SynCookieChallenge(SynCookieChallenge),
+}
+
+pub(super) enum SynCookieAckOutcome {
+    Pass,
+    Validated,
 }
 
 /// Output of `stage_classify_fabric_ingress`. The stage *also*
@@ -260,12 +270,12 @@ pub(super) fn stage_screen_check(
     screen: &mut ScreenState,
     counters: &mut BatchCounters,
     worker_ctx: &WorkerContext,
-) -> StageOutcome<()> {
+) -> StageOutcome<ScreenCheckOutcome> {
     if !screen.has_profiles() {
-        return StageOutcome::Continue(());
+        return StageOutcome::Continue(ScreenCheckOutcome::Pass);
     }
     let Some(flow) = flow else {
-        return StageOutcome::Continue(());
+        return StageOutcome::Continue(ScreenCheckOutcome::Pass);
     };
     let zone_id = ingress_zone_override
         .filter(|id| worker_ctx.forwarding.zone_id_to_name.contains_key(id))
@@ -277,7 +287,7 @@ pub(super) fn stage_screen_check(
                 .copied()
         });
     let Some(zone_id) = zone_id else {
-        return StageOutcome::Continue(());
+        return StageOutcome::Continue(ScreenCheckOutcome::Pass);
     };
     let Some(zone_name) = worker_ctx
         .forwarding
@@ -285,7 +295,7 @@ pub(super) fn stage_screen_check(
         .get(&zone_id)
         .map(|s| s.as_str())
     else {
-        return StageOutcome::Continue(());
+        return StageOutcome::Continue(ScreenCheckOutcome::Pass);
     };
     let l3_off = if meta.ingress_vlan_id > 0 { 18 } else { 14 };
     let screen_pkt = extract_screen_info(
@@ -301,11 +311,11 @@ pub(super) fn stage_screen_check(
         l3_off,
     );
     match screen.check_packet_with_zone_id(zone_name, zone_id, &screen_pkt, now_secs) {
-        ScreenVerdict::Pass => StageOutcome::Continue(()),
+        ScreenVerdict::Pass => StageOutcome::Continue(ScreenCheckOutcome::Pass),
         ScreenVerdict::SynCookieBypass => {
             counters.touched = true;
             counters.syn_cookie_bypass += 1;
-            StageOutcome::Continue(())
+            StageOutcome::Continue(ScreenCheckOutcome::Pass)
         }
         ScreenVerdict::Drop(reason) => {
             emit_screen_drop_event(
@@ -323,7 +333,7 @@ pub(super) fn stage_screen_check(
             }
             StageOutcome::RecycleAndContinue
         }
-        ScreenVerdict::SynCookieChallenge(_) => {
+        ScreenVerdict::SynCookieChallenge(challenge) => {
             emit_screen_drop_event(
                 worker_ctx.event_stream,
                 &screen_pkt,
@@ -335,7 +345,7 @@ pub(super) fn stage_screen_check(
             counters.touched = true;
             counters.screen_drops += 1;
             counters.syn_cookie_challenges += 1;
-            StageOutcome::RecycleAndContinue
+            StageOutcome::Continue(ScreenCheckOutcome::SynCookieChallenge(challenge))
         }
     }
 }
@@ -344,13 +354,13 @@ pub(super) fn stage_screen_check(
 ///
 /// This runs after normal session lookup has failed, so established ACK traffic
 /// keeps its normal fast/session path. A valid cookie ACK is consumed without
-/// creating a session; the validated-client cache lets the client's next SYN
-/// traverse the ordinary policy/NAT/session path. Invalid cookie ACKs are
-/// dropped while cookie mode is active. Poll-stage coverage intentionally pins
-/// only the operational drop/bypass behavior here; the lower screen runtime
-/// owns cache mechanics. `screen_tests.rs` covers bounded 4-way replacement,
-/// explicit cache expiration, and current/previous secret-epoch validation;
-/// HA-safe secret/cache survivability remains an explicit #1374 follow-up.
+/// creating a session; the caller turns the `Validated` outcome into a bounded
+/// RST reply and the validated-client cache lets the client's next SYN traverse
+/// the ordinary policy/NAT/session path. Invalid cookie ACKs are dropped while
+/// cookie mode is active. Poll-stage coverage intentionally pins only the
+/// operational drop/bypass behavior here; the lower screen runtime owns cache
+/// mechanics. `screen_tests.rs` covers bounded 4-way replacement, explicit
+/// cache expiration, and current/previous secret-epoch validation.
 #[inline]
 pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
     flow: Option<&SessionFlow>,
@@ -361,12 +371,12 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
     screen: &mut ScreenState,
     counters: &mut BatchCounters,
     worker_ctx: &WorkerContext,
-) -> StageOutcome<()> {
+) -> StageOutcome<SynCookieAckOutcome> {
     if !screen.has_profiles() {
-        return StageOutcome::Continue(());
+        return StageOutcome::Continue(SynCookieAckOutcome::Pass);
     }
     let Some(flow) = flow else {
-        return StageOutcome::Continue(());
+        return StageOutcome::Continue(SynCookieAckOutcome::Pass);
     };
     let zone_id = ingress_zone_override
         .filter(|id| worker_ctx.forwarding.zone_id_to_name.contains_key(id))
@@ -378,7 +388,7 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
                 .copied()
         });
     let Some(zone_id) = zone_id else {
-        return StageOutcome::Continue(());
+        return StageOutcome::Continue(SynCookieAckOutcome::Pass);
     };
     let Some(zone_name) = worker_ctx
         .forwarding
@@ -386,7 +396,7 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
         .get(&zone_id)
         .map(|s| s.as_str())
     else {
-        return StageOutcome::Continue(());
+        return StageOutcome::Continue(SynCookieAckOutcome::Pass);
     };
     let l3_off = if meta.ingress_vlan_id > 0 { 18 } else { 14 };
     let screen_pkt = extract_screen_info(
@@ -403,11 +413,11 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
     );
     match screen.validate_syn_cookie_ack_on_session_miss(zone_name, zone_id, &screen_pkt, now_secs)
     {
-        SynCookieAckVerdict::NotApplicable => StageOutcome::Continue(()),
+        SynCookieAckVerdict::NotApplicable => StageOutcome::Continue(SynCookieAckOutcome::Pass),
         SynCookieAckVerdict::Validated => {
             counters.touched = true;
             counters.syn_cookie_ack_valid += 1;
-            StageOutcome::RecycleAndContinue
+            StageOutcome::Continue(SynCookieAckOutcome::Validated)
         }
         SynCookieAckVerdict::Invalid => {
             emit_screen_drop_event(
@@ -720,7 +730,7 @@ mod tests {
                 &mut counters,
                 &worker_ctx,
             ),
-            StageOutcome::RecycleAndContinue
+            StageOutcome::Continue(SynCookieAckOutcome::Validated)
         ));
         assert!(
             counters.touched,

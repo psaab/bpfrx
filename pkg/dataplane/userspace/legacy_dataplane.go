@@ -33,8 +33,8 @@ func NewLegacyDataPlaneAdapter(manager *Manager) *LegacyDataPlaneAdapter {
 	adapter := &LegacyDataPlaneAdapter{
 		manager: manager,
 	}
-	if manager.inner != nil {
-		adapter.DataPlane = manager.inner
+	if manager.bpfShim != nil {
+		adapter.DataPlane = manager.bpfShim
 	}
 	return adapter
 }
@@ -211,7 +211,7 @@ func (a *LegacyDataPlaneAdapter) UpdateFabricFwd(info dataplane.FabricFwdInfo) e
 	if err != nil {
 		return err
 	}
-	return m.inner.UpdateFabricFwd(info)
+	return m.bpfShim.UpdateFabricFwd(info)
 }
 
 func (a *LegacyDataPlaneAdapter) UpdateFabricFwd1(info dataplane.FabricFwdInfo) error {
@@ -219,7 +219,7 @@ func (a *LegacyDataPlaneAdapter) UpdateFabricFwd1(info dataplane.FabricFwdInfo) 
 	if err != nil {
 		return err
 	}
-	return m.inner.UpdateFabricFwd1(info)
+	return m.bpfShim.UpdateFabricFwd1(info)
 }
 
 func (a *LegacyDataPlaneAdapter) SetSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) error {

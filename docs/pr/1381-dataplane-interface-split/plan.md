@@ -1,11 +1,13 @@
 # #1381 dataplane interface split plan
 
-Status: design/scaffold PR for #1381, prerequisite to #1373 Phase 4.
+Status: implementation closeout for #1381's daemon-facing runtime split,
+prerequisite to #1373 Phase 4.
 
-This PR does not remove the eBPF dataplane. It makes the split actionable by
-pinning the target interfaces, the daemon migration order, and the state
-ownership decisions that must hold before the BPF-shaped `dataplane.DataPlane`
-surface can disappear.
+This PR does not remove the eBPF dataplane or the userspace XDP shim maps.
+It makes the split operational by moving daemon startup and runtime control
+onto `RuntimeDataPlane` plus domain interfaces. The old BPF-shaped
+`dataplane.DataPlane` remains as a legacy compatibility surface for eBPF/DPDK
+and isolated adapters, not as the daemon root contract.
 
 ## Current coupling
 
@@ -20,19 +22,18 @@ methods. It mixes:
 - HA, fabric, scheduler, link-cycle, and event APIs.
 
 `pkg/dataplane/userspace/manager.go` used to embed `dataplane.DataPlane` and
-compile by inheriting all eBPF writers. The current migration slice has moved
-that legacy interface satisfaction into `userspace.LegacyDataPlaneAdapter` so
-`*userspace.Manager` implements the small `RuntimeDataPlane` contract instead
-of the BPF-shaped root interface. The manager still keeps
-`inner *dataplane.Manager` for XDP shim maps, BPF conntrack mirrors, DNAT bridge
-maps, FIB generation, RG state, and helper control. Removing that named shim
-dependency remains a later #1381 phase.
+compile by inheriting all eBPF writers. The implementation now registers
+userspace only through `RegisterRuntimeBackend`. The registry entry currently
+returns `userspace.LegacyDataPlaneAdapter` around a `*userspace.Manager` so
+old status, CLI, and cluster-sync callers still have a non-nil compatibility
+handle while they migrate. The manager itself remains free of the legacy
+`DataPlane` contract.
 
-`pkg/daemon` stores one `dataplane.DataPlane` and calls both generic runtime
-methods and BPF-shaped methods from the same field. The real daemon surface is
-smaller than the current interface: lifecycle/config, HA/fabric, session
-lookup/iteration, events, scheduler state, link-cycle hooks, and a few
-userspace-only optional interfaces.
+`pkg/daemon` now stores `dataplane.RuntimeDataPlane` and creates it through
+`NewRuntimeDataPlane`. Runtime work uses config, HA/fabric, session,
+telemetry, scheduler, and link-cycle domains. Remaining `legacyDP()` calls are
+explicit compatibility bridges for old eBPF/DPDK surfaces rather than the
+daemon's root dataplane contract.
 
 ## Current caller inventory
 
@@ -359,11 +360,10 @@ The daemon should migrate in this order:
 7. Replace `NewEventSource` and counter reads with `d.dp.Telemetry()`.
 8. Replace userspace type assertions in fabric/IPVLAN/link-cycle handling with
    `d.dp.Link()` and a narrow userspace binding-ready callback interface.
-9. Delete the remaining userspace `inner *dataplane.Manager` dependency once
-   the XDP shim/session/NAT pins have backend owners. The
-   `dataplane.DataPlane` embedding has already been removed; the current
-   canary now fails if it returns and records the named inner manager as the
-   remaining debt.
+9. Keep the userspace XDP shim dependency explicit as `bpfShim`, not as
+   inherited `dataplane.DataPlane` behavior. The shim owns AF_XDP control,
+   redirect, heartbeat, local-delivery, and mirror pins that intentionally
+   remain below the userspace helper boundary.
 
 ## BPF pin ownership
 
@@ -402,9 +402,8 @@ Phase 0: scaffold and canaries.
 
 - Land this plan.
 - Keep current behavior unchanged.
-- Add AST canary documenting the current userspace embedding and `inner`
-  dependency so future work cannot claim the split is done without updating
-  the test.
+- Add AST canary proving the userspace manager does not embed
+  `dataplane.DataPlane` and that the XDP shim is an explicit field.
 
 Phase 1: interfaces and adapters.
 
@@ -437,11 +436,11 @@ Phase 3: session, NAT, and telemetry ownership.
 
 Phase 4: remove eBPF inheritance.
 
-- Delete `inner *dataplane.Manager` from userspace `Manager`.
 - Keep the inverted scaffold canary strict: userspace Manager must not embed
-  `dataplane.DataPlane`, must not name `*dataplane.Manager`, and must not
-  import `github.com/cilium/ebpf` outside the XDP shim owner package.
-- Remove daemon access to old BPF-shaped interface.
+  `dataplane.DataPlane`; the only allowed eBPF manager reference is the
+  explicitly named userspace XDP shim owner.
+- Remove daemon dependence on the old BPF-shaped interface as its root
+  dataplane contract.
 
 Phase 5: eBPF source retirement gate for #1373.
 
@@ -490,8 +489,8 @@ Required during the split:
 - `go test ./pkg/dataplane/... ./pkg/dataplane/userspace/... ./pkg/daemon/...`
 - `go build ./...`
 - AST canary: userspace `Manager` must not embed `dataplane.DataPlane`; the
-  remaining named `inner *dataplane.Manager` dependency is recorded as debt and
-  must fail once Phase 4 removes it.
+  explicit `bpfShim` field documents the userspace XDP shim owner and prevents
+  accidental reintroduction of root-interface inheritance.
 - Interface method-count canary: the exported root `DataPlane` interface has
   at most 15 methods after Phase 1.
 - Import canary: the abstract dataplane/runtime package must not import
@@ -538,7 +537,8 @@ Operational canaries:
 - Removing eBPF programs or generated BPF Go files.
 - Replacing AF_XDP/XDP shim attachment.
 - Implementing #1374 through #1380 feature parity.
-- Making userspace manager independent of `*dataplane.Manager` in this patch.
+- Removing the userspace XDP shim maps/programs that still intentionally use
+  `*dataplane.Manager` as their owner.
 
 ## Phase 1 acceptance gate
 
@@ -597,11 +597,18 @@ interface in place and adds the new contract beside it:
   `DataPlane` for compatibility, but immediately adapt it with
   `SessionStoreOf`/`TelemetryOf`.
 
-Remaining Phase 1 work is still explicit: daemon/API/gRPC/CLI operator metadata
-callers now read `LastApplyResult()` and a canary prevents those packages from
-regressing to `LastCompileResult()`. GC and HA session sync have moved to the
-runtime session/telemetry domains. Remaining work is API/gRPC/CLI session and
-counter readers, daemon control paths, userspace-specific diagnostic/control
-extensions, and the final userspace `inner *dataplane.Manager` shim removal.
-The legacy `DataPlane` method-count canary can only flip after those callers no
-longer need the BPF-shaped surface.
+The closeout slice moves daemon startup to `NewRuntimeDataPlane`, registers
+userspace only as a runtime backend, keeps `legacyDP()` as an explicit
+compatibility bridge for old eBPF/DPDK surfaces, and documents the userspace
+XDP shim maps as the remaining intentional eBPF manager owner. Apply-time
+config now goes through `ConfigSink.ApplyConfig`, not
+`legacyDP().Compile`; the runtime backend returns a compatibility adapter only
+so old status/session-sync paths keep working while domain migration
+continues. Runtime policy scheduler updates likewise use the runtime updater
+interface when present and fall back to `legacyDP()` only for compatibility
+backends.
+
+HA fail-closed shutdown now wraps controller calls in one daemon-owned
+deadline. Userspace helper RPCs still retain their internal dial/read
+deadlines, but daemon shutdown proceeds when the outer deadline expires rather
+than waiting for those nested RPC timers to finish.

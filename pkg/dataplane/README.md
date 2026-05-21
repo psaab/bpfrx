@@ -3,20 +3,21 @@
 > Deprecation notice (#1373): the legacy eBPF backend in this package is being
 > retired in favor of the Rust AF_XDP userspace dataplane. Phase 1 updates
 > active docs and migration targeting only; no BPF source, loader code, or
-> bindings are removed in this phase. The DataPlane interface cleanup is tracked
-> by #1381.
+> bindings are removed in this phase.
 
 Abstract dataplane interface plus the legacy eBPF backend. Compiles the typed
 config from `pkg/config` into BPF-map entries (zones, policies, NAT,
 filters, applications), attaches the 14 BPF programs (9 XDP + 5 TC), and
 exposes session iteration to GC, the CLI, and the metrics surface.
 
-Pluggable: alternative backends (DPDK in `pkg/dataplane/dpdk`, userspace
-AF_XDP in `pkg/dataplane/userspace`) register via `RegisterBackend`. The
-userspace AF_XDP backend is the primary #1373 target, but the current
-`DataPlane` interface is still BPF-shaped and is scheduled to split under
-#1381; see `docs/pr/1381-dataplane-interface-split/plan.md` before adding new
-methods to it.
+Pluggable: eBPF/DPDK legacy backends register through `RegisterBackend` for
+the old `DataPlane` surface. Runtime backends register through
+`RegisterRuntimeBackend`; the daemon uses `NewRuntimeDataPlane` so userspace
+AF_XDP starts through the runtime path. During the #1381 migration, the
+userspace runtime constructor returns `LegacyDataPlaneAdapter`: the userspace
+`Manager` itself still does not implement the BPF-shaped `DataPlane`, but
+daemon status, CLI, and cluster-sync callers that have not moved to domain
+interfaces still receive a temporary compatibility handle.
 
 The userspace backend's status wire format is mirrored here for CLI/API
 consumers. CoS queue status includes queue-scoped drain-phase counters so
@@ -25,14 +26,19 @@ sent while exact queues were still backlogged.
 
 ## Entry points
 
-- `DataPlane` — `dataplane.go`. Transitional abstract interface; #1381 will
-  replace it with a small root interface plus config, HA, session, telemetry,
-  and link-control domains.
+- `DataPlane` — `dataplane.go`. Legacy BPF-shaped interface kept for the
+  eBPF/DPDK compiler and compatibility adapters. New daemon-facing code should
+  not add methods here.
 - `RuntimeDataPlane`, `ConfigSink`, `SessionStore`, `Telemetry`,
   `HAController`, and `LinkController` — `apply.go` and `session_store.go`.
-  These are the #1381 split-domain interfaces. New daemon/runtime code should
-  depend on these domains rather than adding methods to the BPF-shaped
-  `DataPlane` root.
+  These are the split-domain interfaces used by daemon startup and runtime
+  subsystems. `ConfigSink.ApplyConfig` is the daemon's apply-time
+  compile/config entry point; userspace AF_XDP does not need to implement the
+  legacy BPF-shaped `Compile` method just to receive committed config.
+- `NewRuntimeDataPlane(dpType)` — `dataplane.go`. Runtime-domain constructor
+  used by `pkg/daemon`; userspace registers only on this path. The current
+  userspace constructor returns a compatibility adapter around `*userspace.Manager`
+  until the remaining status/session-sync callers stop requiring `DataPlane`.
 - `Manager` — `loader.go`. eBPF implementation.
 - `New() *Manager` — `loader.go`.
 - `Compile(cfg *config.Config) (*CompileResult, error)` — multi-phase

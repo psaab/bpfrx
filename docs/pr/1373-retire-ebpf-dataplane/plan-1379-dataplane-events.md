@@ -47,18 +47,47 @@ Current implementation status after the 2026-05-19 closeout slice:
   and lo0/local-delivery filter logs. Non-PBR input filter-log matching runs
   only on the slow path after a flow-cache miss. Non-PBR input filter
   `discard`/`reject` actions are terminal before route lookup and policy
-  evaluation; logged terminal actions emit `source=input` with deny/reject RT_FLOW
-  action. If the first permitted packet installs a flow-cache entry, the matched
-  input log term and ingress-zone ID are stored in that entry and cached hits
-  re-emit `source=input` without rescanning filter terms.
-- Policy deny records carry the userspace snapshot's numeric policy ID. Filter
-  log records carry the compiled filter ID, term ID, action, and source
-  (`pbr`, `input`, `output`, `cached-output`, or `lo0`). These IDs are
-  deterministic inside the compiled snapshot and intentionally avoid invented
-  names or unstable runtime-only identifiers.
+  evaluation; logged terminal actions emit `source=input` with deny RT_FLOW
+  action because this userspace path fails closed without synthesizing an
+  ICMP/RST reject packet yet. If the first permitted packet installs a
+  flow-cache entry,
+  the matched input log term and ingress-zone ID are stored in that entry and
+  cached hits re-emit `source=input` without rescanning filter terms.
+- Input/output filters with DSCP match terms are deliberately not
+  flow-cached because DSCP is per-packet metadata outside the session cache
+  key. Established session hits re-evaluate DSCP-sensitive input filters, and
+  forwarding rotations that add, remove, or change DSCP-sensitive input
+  filters purge existing sessions for that packet family so traffic returns
+  to the miss path. The rotation comparison ignores compiler-positional
+  filter IDs and includes three-color policer runtime shape so unrelated
+  filter reordering does not over-purge while policer-shape changes still
+  force revalidation.
+- Output filter `discard`/`reject` terms are terminal in the TX-selection
+  path. The helper carries the matched action alongside forwarding-class,
+  DSCP, policer, counter, and filter-log metadata, so a live or cached
+  output-filter deny record cannot describe a packet that still enqueues for
+  TX. Output `reject` also fails closed as a silent drop until per-path
+  ICMP/RST synthesis exists.
+- Policy deny records carry the userspace snapshot's numeric policy ID. Policy
+  `reject` is logged as deny until the userspace PolicyDenied path synthesizes
+  ICMP/RST reject packets. Filter log records carry the compiled filter ID,
+  term ID, action, and source (`pbr`, `input`, `output`, `cached-output`, or
+  `lo0`). These IDs are deterministic inside the compiled snapshot and
+  intentionally avoid invented names or unstable runtime-only identifiers.
 - The `lo0` source label means a userspace local-delivery packet matched the
-  configured lo0 log term. It does not claim that kernel/nft lo0 ingress
-  enforcement moved into the AF_XDP helper.
+  configured lo0 log term. Userspace local-delivery `discard`/`reject` actions
+  are terminal and prevent slow-path reinjection; `reject` is logged as deny
+  until reject packet generation exists on this path. Local-delivery session
+  hits also re-run lo0 enforcement, and HA-published local-delivery BPF map
+  entries use the userspace-visible redirect path while a lo0 filter is
+  configured so cached `PASS_TO_KERNEL` state cannot bypass the filter. This
+  does not claim that kernel/nft lo0 ingress enforcement moved into the AF_XDP
+  helper. If a lo0 filter is removed, already-demoted local-delivery sessions
+  can stay on the userspace-visible helper path until they age out; that is a
+  bounded performance cost, not a forwarding bypass. NAT64 local-delivery
+  traffic is evaluated using the pre-translation packet family, so operators
+  that use NAT64 and want uniform local-delivery filtering must configure both
+  inet and inet6 lo0 filters.
 - The event-stream wire format is a helper/daemon lockstep contract. For
   `MSG_FILTER_LOG`, the RT_FLOW reason byte carries the source label above;
   close events continue to interpret the same byte as a close reason. This is
