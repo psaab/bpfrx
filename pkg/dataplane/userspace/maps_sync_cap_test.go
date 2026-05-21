@@ -239,6 +239,62 @@ func TestSyncInterfaceNATAddressMapsAddsBeforeRemovingStale(t *testing.T) {
 	}
 }
 
+func TestSyncInterfaceNATAddressMapsReplacesStaleWhenCapacityAllows(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+	m := New()
+	natV4Map, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    4,
+		ValueSize:  1,
+		MaxEntries: 2,
+	})
+	if err != nil {
+		t.Fatalf("new userspace_interface_nat_v4 map: %v", err)
+	}
+	t.Cleanup(func() { natV4Map.Close() })
+	injectShimMap(t, m.bpfShim, "userspace_interface_nat_v4", natV4Map)
+	injectShimMapSpec(t, m.bpfShim, "userspace_interface_nat_v6", &ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    uint32(unsafe.Sizeof(userspaceLocalV6Key{})),
+		ValueSize:  1,
+		MaxEntries: 16,
+	})
+
+	oldNAT := binary.BigEndian.Uint32([]byte{203, 0, 113, 1})
+	newNAT := binary.BigEndian.Uint32([]byte{198, 51, 100, 1})
+	if err := natV4Map.Update(oldNAT, uint8(1), ebpf.UpdateAny); err != nil {
+		t.Fatalf("seed userspace_interface_nat_v4: %v", err)
+	}
+
+	if err := m.syncInterfaceNATAddressMapsLocked(&ConfigSnapshot{
+		Interfaces: []InterfaceSnapshot{{
+			Name: "reth1.0",
+			Zone: "untrust",
+			Addresses: []InterfaceAddressSnapshot{{
+				Family:  "inet",
+				Address: "198.51.100.1/24",
+			}},
+		}},
+		SourceNAT: []SourceNATRuleSnapshot{{
+			Name:          "snat-out",
+			ToZone:        "untrust",
+			InterfaceMode: true,
+		}},
+	}); err != nil {
+		t.Fatalf("syncInterfaceNATAddressMapsLocked: %v", err)
+	}
+
+	var got uint8
+	if err := natV4Map.Lookup(newNAT, &got); err != nil {
+		t.Fatalf("new NAT address missing after successful replacement: %v", err)
+	}
+	if err := natV4Map.Lookup(oldNAT, &got); !errors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Fatalf("old NAT address lookup err = %v, want ErrKeyNotExist after stale cleanup", err)
+	}
+}
+
 // TestApplyHelperStatusAcceptsIfindexWithinCap exercises the happy path
 // to confirm the new cap guard does not spuriously reject valid
 // ifindexes. Any small ifindex (< MaxInterfaces) must still succeed.

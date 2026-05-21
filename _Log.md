@@ -3,8 +3,9 @@
 ## 2026-05-21
 
 - **Timestamp**: 2026-05-21T16:25:00Z
-  - **Action**: PR #1481 comment follow-up — changed `syncInterfaceNATAddressMapsLocked` to publish desired interface-NAT entries before deleting stale keys (matching the local-map add-before-remove contract), and added a regression test that proves a full map cannot transiently clear existing NAT entries.
+  - **Action**: PR #1481 comment follow-up — changed `syncInterfaceNATAddressMapsLocked` to publish desired interface-NAT entries before deleting stale keys (matching the local-map add-before-remove contract), pre-sized NAT RST publish slices from desired-entry count, and added regression tests for both full-map publication failure retention and successful stale-key replacement.
   - **File(s)**: `pkg/dataplane/userspace/maps_sync.go`, `pkg/dataplane/userspace/maps_sync_cap_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/userspace ./pkg/dataplane`; `git diff --check`
 
 ## 2026-05-18
 

@@ -922,11 +922,19 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 }
 
 func buildDesiredInterfaceNATAddressSets(snapshot *ConfigSnapshot) (map[uint32]struct{}, map[userspaceLocalV6Key]struct{}, []netip.Addr, []netip.Addr) {
+	entries := buildInterfaceNATAddressEntries(snapshot)
+	v4Count := 0
+	for _, entry := range entries {
+		if entry.v4 {
+			v4Count++
+		}
+	}
+	v6Count := len(entries) - v4Count
 	desiredV4 := make(map[uint32]struct{})
 	desiredV6 := make(map[userspaceLocalV6Key]struct{})
-	rstV4 := make([]netip.Addr, 0)
-	rstV6 := make([]netip.Addr, 0)
-	for _, entry := range buildInterfaceNATAddressEntries(snapshot) {
+	rstV4 := make([]netip.Addr, 0, v4Count)
+	rstV6 := make([]netip.Addr, 0, v6Count)
+	for _, entry := range entries {
 		if entry.v4 {
 			desiredV4[entry.v4Key] = struct{}{}
 			var b [4]byte
