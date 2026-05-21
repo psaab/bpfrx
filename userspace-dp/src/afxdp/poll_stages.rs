@@ -596,6 +596,7 @@ mod tests {
                 burst: 0,
             },
         );
+        let cos_owner_live_by_queue = std::collections::BTreeMap::new();
         let worker_ctx = WorkerContext {
             ident: &ident,
             binding_lookup: &binding_lookup,
@@ -615,6 +616,7 @@ mod tests {
             peer_worker_commands: &peer_worker_commands,
             dnat_fds: &dnat_fds,
             rg_epochs: &rg_epochs,
+            cos_owner_live_by_queue: &cos_owner_live_by_queue,
         };
 
         let client = Ipv4Addr::new(192, 0, 2, 10);

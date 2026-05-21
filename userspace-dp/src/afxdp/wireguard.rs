@@ -27,6 +27,8 @@ pub(super) struct WireGuardEngine {
     last_token_refill_ns: u64,
     // Offset for fair round-robin trial decapsulation across peers to prevent starvation
     round_robin_offset: usize,
+    worker_id: u32,
+    num_workers: u32,
 }
 
 struct PeerState {
@@ -50,7 +52,7 @@ pub(super) enum WireGuardDecapOutcome {
 }
 
 impl WireGuardEngine {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(worker_id: u32, num_workers: u32) -> Self {
         Self {
             peers: FxHashMap::default(),
             endpoint_to_peer: FxHashMap::default(),
@@ -62,7 +64,25 @@ impl WireGuardEngine {
             trial_decap_tokens: 32,
             last_token_refill_ns: 0,
             round_robin_offset: 0,
+            worker_id,
+            num_workers,
         }
+    }
+
+    fn get_target_worker_id(&self, public_key: &[u8; 32]) -> u32 {
+        if self.num_workers <= 1 { return 0; }
+        let mut hasher = rustc_hash::FxHasher::default();
+        std::hash::Hasher::write(&mut hasher, public_key);
+        (std::hash::Hasher::finish(&hasher) % self.num_workers as u64) as u32
+    }
+
+    fn decode_worker_id(&self, receiver_index: u32) -> u32 {
+        if self.num_workers <= 1 { return 0; }
+        receiver_index >> 24
+    }
+
+    fn encode_receiver_index(&self, local_index: u32) -> u32 {
+        (self.worker_id << 16) | (local_index & 0x0000FFFF)
     }
 
     fn acquire_trial_decap_token_fields(trial_decap_tokens: &mut u32, last_token_refill_ns: &mut u64, now_ns: u64) -> bool {
@@ -84,10 +104,6 @@ impl WireGuardEngine {
         Self::acquire_trial_decap_token_fields(&mut self.trial_decap_tokens, &mut self.last_token_refill_ns, now_ns)
     }
 
-    fn encode_receiver_index(&self, local_index: u32) -> u32 {
-        local_index & RECEIVER_INDEX_MASK
-    }
-
     pub(super) fn try_decap(&mut self, raw_frame_mut: &mut [u8], meta: &UserspaceDpMeta, scratch_wg_in: &mut Vec<u8>) -> WireGuardDecapOutcome {
         if meta.protocol != 17 || meta.flow_dst_port != self.listen_port {
             return WireGuardDecapOutcome::None;
@@ -105,6 +121,32 @@ impl WireGuardEngine {
         let msg_type = outer_payload[0];
         let endpoint_ip = meta.src_ip();
         let endpoint_port = meta.flow_src_port;
+
+        let target_worker = match msg_type {
+            1 => {
+                if outer_payload.len() < 148 {
+                    return WireGuardDecapOutcome::None;
+                }
+                if let Some(peer_key) = self.endpoint_to_peer.get(&(endpoint_ip, endpoint_port)) {
+                    self.get_target_worker_id(peer_key)
+                } else {
+                    self.worker_id
+                }
+            }
+            2 | 3 | 4 => {
+                if outer_payload.len() < 8 {
+                    return WireGuardDecapOutcome::None;
+                }
+                let mut idx_bytes = [0u8; 4];
+                idx_bytes.copy_from_slice(&outer_payload[4..8]);
+                let receiver_index = u32::from_le_bytes(idx_bytes);
+                self.decode_worker_id(receiver_index)
+            }
+            _ => return WireGuardDecapOutcome::None,
+        };
+        if target_worker != self.worker_id {
+            return WireGuardDecapOutcome::DispatchToWorker(target_worker);
+        }
 
         let mut success_outcome = None;
         let mut roamed_info = None;
@@ -805,6 +847,20 @@ impl WireGuardEngine {
                 None
             };
 
+            if self.get_target_worker_id(&public_key) != self.worker_id {
+                // Not owned by this worker, but we still populate the lookup maps for routing:
+                if let Some((ip, port)) = endpoint {
+                    new_endpoint_to_peer.insert((ip, port), public_key);
+                }
+                for allowed_ip in &peer_snap.allowed_ips {
+                    let trimmed_ip = allowed_ip.trim();
+                    if let Ok(net) = trimmed_ip.parse::<ipnet::IpNet>() {
+                        new_allowed_ip_to_peer.insert(net, public_key);
+                    }
+                }
+                continue;
+            }
+
             // Reuse existing PeerState if we have it, to preserve the Tunn session
             let peer_state = if let Some(mut existing) = self.peers.remove(&public_key) {
                 existing.endpoint = endpoint;
@@ -820,7 +876,7 @@ impl WireGuardEngine {
                 }
                 existing
             } else {
-                let local_index = stable_local_index(&public_key, &new_index_to_peer, &self.peers);
+                let local_index = stable_local_index(self.worker_id, &public_key, &new_index_to_peer, &self.peers);
                 let tunn = Tunn::new(
                     StaticSecret::from(private_key),
                     PublicKey::from(public_key),
@@ -838,7 +894,8 @@ impl WireGuardEngine {
                 }
             };
 
-            new_index_to_peer.insert(peer_state.local_index, public_key);
+            let encoded_local_index = self.encode_receiver_index(peer_state.local_index);
+            new_index_to_peer.insert(encoded_local_index, public_key);
             current_peers.insert(public_key, peer_state);
 
             if let Some((ip, port)) = endpoint {
@@ -880,21 +937,23 @@ fn parse_inner_protocol_and_offsets(packet: &[u8], _addr_family: u8) -> Option<(
 }
 
 fn stable_local_index(
+    worker_id: u32,
     public_key: &[u8; 32],
     occupied: &FxHashMap<u32, [u8; 32]>,
     remaining_peers: &FxHashMap<[u8; 32], PeerState>,
 ) -> u32 {
-    let mut idx = u32::from_le_bytes([public_key[0], public_key[1], public_key[2], 0]) & RECEIVER_INDEX_MASK;
+    let mut idx = u32::from_le_bytes([public_key[0], public_key[1], public_key[2], 0]) & 0x0000_FFFF;
     if idx == 0 {
         idx = 1;
     }
     loop {
-        let in_occupied = occupied.contains_key(&idx);
+        let encoded = (worker_id << 16) | idx;
+        let in_occupied = occupied.contains_key(&encoded);
         let in_remaining = remaining_peers.values().any(|p| p.local_index == idx);
         if !in_occupied && !in_remaining {
             break;
         }
-        idx = (idx + 1) & RECEIVER_INDEX_MASK;
+        idx = (idx + 1) & 0x0000_FFFF;
         if idx == 0 {
             idx = 1;
         }
@@ -954,7 +1013,7 @@ mod tests {
 
     #[test]
     fn test_wireguard_receiver_index_encoding() {
-        let engine = WireGuardEngine::new();
+        let engine = WireGuardEngine::new(0, 1);
         // encode receiver index
         let supplied_index = engine.encode_receiver_index(123);
         // boringtun shifts it by 8 left and overlays counter
@@ -966,7 +1025,7 @@ mod tests {
     #[test]
     fn test_peer_reorder_and_index_collision_avoidance() {
         use crate::protocol::{WireGuardInterfaceSnapshot, WireGuardPeerSnapshot};
-        let mut engine = WireGuardEngine::new();
+        let mut engine = WireGuardEngine::new(0, 1);
 
         let private_key = BASE64.encode(&[1u8; 32]);
         let mut key_a = [0u8; 32]; key_a[0] = 10;
@@ -1015,7 +1074,7 @@ mod tests {
     #[test]
     fn test_private_key_rotation_rebuilds_tunn() {
         use crate::protocol::{WireGuardInterfaceSnapshot, WireGuardPeerSnapshot};
-        let mut engine = WireGuardEngine::new();
+        let mut engine = WireGuardEngine::new(0, 1);
 
         let key1 = [1u8; 32];
         let key2 = [2u8; 32];
@@ -1049,7 +1108,7 @@ mod tests {
 
     #[test]
     fn test_try_decap_packet_bounds_check_panic_prevention() {
-        let mut engine = WireGuardEngine::new();
+        let mut engine = WireGuardEngine::new(0, 1);
         engine.listen_port = 51820;
 
         let meta = UserspaceDpMeta {
@@ -1067,7 +1126,7 @@ mod tests {
 
     #[test]
     fn test_trial_decap_rate_limiting() {
-        let mut engine = WireGuardEngine::new();
+        let mut engine = WireGuardEngine::new(0, 1);
         assert_eq!(engine.trial_decap_tokens, 32);
 
         for _ in 0..32 {
@@ -1084,7 +1143,7 @@ mod tests {
         use boringtun::noise::Tunn;
         use boringtun::x25519::{StaticSecret, PublicKey};
 
-        let mut engine = WireGuardEngine::new();
+        let mut engine = WireGuardEngine::new(0, 1);
         engine.listen_port = 51820;
 
         let client_private = StaticSecret::from([1u8; 32]);
@@ -1176,7 +1235,7 @@ mod tests {
     #[test]
     fn test_trial_decap_32_peer_starvation_and_round_robin() {
         use crate::protocol::{WireGuardInterfaceSnapshot, WireGuardPeerSnapshot};
-        let mut engine = WireGuardEngine::new();
+        let mut engine = WireGuardEngine::new(0, 1);
         engine.listen_port = 51820;
 
         let private_key = BASE64.encode(&[1u8; 32]);
@@ -1234,7 +1293,7 @@ mod tests {
         use boringtun::noise::Tunn;
         use boringtun::x25519::{StaticSecret, PublicKey};
 
-        let mut engine = WireGuardEngine::new();
+        let mut engine = WireGuardEngine::new(0, 1);
         engine.listen_port = 51820;
 
         let client_private = StaticSecret::from([1u8; 32]);
@@ -1383,7 +1442,7 @@ mod tests {
         use boringtun::noise::Tunn;
         use boringtun::x25519::{StaticSecret, PublicKey};
 
-        let mut engine = WireGuardEngine::new();
+        let mut engine = WireGuardEngine::new(0, 1);
         engine.listen_port = 51820;
 
         let server_private = StaticSecret::from([9u8; 32]);

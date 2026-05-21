@@ -329,6 +329,7 @@ pub(in crate::afxdp) struct WorkerContext<'a> {
     pub(in crate::afxdp) peer_worker_commands: &'a [Arc<Mutex<VecDeque<WorkerCommand>>>],
     pub(in crate::afxdp) dnat_fds: &'a DnatTableFds,
     pub(in crate::afxdp) rg_epochs: &'a [AtomicU32; MAX_RG_EPOCHS],
+    pub(in crate::afxdp) cos_owner_live_by_queue: &'a BTreeMap<(i32, u8), Arc<BindingLiveState>>,
 }
 
 /// #945: mutable telemetry context for `poll_binding_process_descriptor`.

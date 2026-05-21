@@ -236,6 +236,12 @@ pub(super) struct SharedUmemLiveStatus {
     disabled_reason: String,
 }
 
+#[derive(Clone, Debug)]
+pub(in crate::afxdp) struct DecapRequest {
+    pub(in crate::afxdp) packet: Vec<u8>,
+    pub(in crate::afxdp) meta: UserspaceDpMeta,
+}
+
 /// Raw ring state: (rxP, rxC, frP, frC, txP, txC, crP, crC)
 pub(in crate::afxdp) struct BindingLiveState {
     pub(super) bound: AtomicBool,
@@ -538,6 +544,7 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// serialised every producer against every other producer and
     /// against the owner's drain.
     pub(super) pending_tx: MpscInbox<TxRequest>,
+    pub(super) pending_decap: MpscInbox<DecapRequest>,
     pub(super) pending_session_deltas: Mutex<VecDeque<SessionDeltaInfo>>,
 }
 
@@ -703,6 +710,7 @@ impl BindingLiveState {
             pending_tx_admitted: AtomicUsize::new(0),
             last_error: Mutex::new(String::new()),
             pending_tx: MpscInbox::new(PENDING_TX_INBOX_HARD_CAP),
+            pending_decap: MpscInbox::new(PENDING_TX_INBOX_HARD_CAP),
             pending_session_deltas: Mutex::new(VecDeque::new()),
         }
     }
@@ -1310,6 +1318,15 @@ impl BindingLiveState {
         while let Some(req) = unsafe { self.pending_tx.pop() } {
             self.release_pending_tx_admission();
             out.push_back(req);
+        }
+    }
+
+    pub(super) fn take_pending_decap_into(&self, out: &mut Vec<DecapRequest>) {
+        if self.pending_decap.is_empty() {
+            return;
+        }
+        while let Some(req) = unsafe { self.pending_decap.pop() } {
+            out.push(req);
         }
     }
 

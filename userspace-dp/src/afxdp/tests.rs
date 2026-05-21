@@ -2760,6 +2760,7 @@ fn poll_descriptor_policy_deny_path_emits_rt_flow_event() {
             burst: 0,
         },
     );
+    let cos_owner_live_by_queue = BTreeMap::new();
     let worker_ctx = WorkerContext {
         ident: &ident,
         binding_lookup: &binding_lookup,
@@ -2779,6 +2780,7 @@ fn poll_descriptor_policy_deny_path_emits_rt_flow_event() {
         peer_worker_commands: &peer_worker_commands,
         dnat_fds: &dnat_fds,
         rg_epochs: &rg_epochs,
+        cos_owner_live_by_queue: &cos_owner_live_by_queue,
     };
     let mut sessions = SessionTable::new();
     let mut screen = ScreenState::new();
@@ -2945,6 +2947,7 @@ fn poll_descriptor_input_filter_log_path_emits_rt_flow_event() {
             burst: 0,
         },
     );
+    let cos_owner_live_by_queue = BTreeMap::new();
     let worker_ctx = WorkerContext {
         ident: &ident,
         binding_lookup: &binding_lookup,
@@ -2964,6 +2967,7 @@ fn poll_descriptor_input_filter_log_path_emits_rt_flow_event() {
         peer_worker_commands: &peer_worker_commands,
         dnat_fds: &dnat_fds,
         rg_epochs: &rg_epochs,
+        cos_owner_live_by_queue: &cos_owner_live_by_queue,
     };
     let mut sessions = SessionTable::new();
     let mut screen = ScreenState::new();
@@ -3112,6 +3116,7 @@ fn poll_descriptor_input_filter_discard_drops_and_logs() {
             burst: 0,
         },
     );
+    let cos_owner_live_by_queue = BTreeMap::new();
     let worker_ctx = WorkerContext {
         ident: &ident,
         binding_lookup: &binding_lookup,
@@ -3131,6 +3136,7 @@ fn poll_descriptor_input_filter_discard_drops_and_logs() {
         peer_worker_commands: &peer_worker_commands,
         dnat_fds: &dnat_fds,
         rg_epochs: &rg_epochs,
+        cos_owner_live_by_queue: &cos_owner_live_by_queue,
     };
     let mut sessions = SessionTable::new();
     let mut screen = ScreenState::new();
@@ -3280,6 +3286,7 @@ fn poll_descriptor_session_hit_rechecks_dscp_input_filter() {
             burst: 0,
         },
     );
+    let cos_owner_live_by_queue = BTreeMap::new();
     let worker_ctx = WorkerContext {
         ident: &ident,
         binding_lookup: &binding_lookup,
@@ -3299,6 +3306,7 @@ fn poll_descriptor_session_hit_rechecks_dscp_input_filter() {
         peer_worker_commands: &peer_worker_commands,
         dnat_fds: &dnat_fds,
         rg_epochs: &rg_epochs,
+        cos_owner_live_by_queue: &cos_owner_live_by_queue,
     };
     let mut sessions = SessionTable::new();
     let flow_key = SessionKey {
@@ -3487,6 +3495,7 @@ fn poll_descriptor_lo0_filter_discard_drops_without_reinject() {
             burst: 0,
         },
     );
+    let cos_owner_live_by_queue = BTreeMap::new();
     let worker_ctx = WorkerContext {
         ident: &ident,
         binding_lookup: &binding_lookup,
@@ -3506,6 +3515,7 @@ fn poll_descriptor_lo0_filter_discard_drops_without_reinject() {
         peer_worker_commands: &peer_worker_commands,
         dnat_fds: &dnat_fds,
         rg_epochs: &rg_epochs,
+        cos_owner_live_by_queue: &cos_owner_live_by_queue,
     };
     let mut sessions = SessionTable::new();
     let mut screen = ScreenState::new();
@@ -3660,6 +3670,7 @@ fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
             burst: 0,
         },
     );
+    let cos_owner_live_by_queue = BTreeMap::new();
     let worker_ctx = WorkerContext {
         ident: &ident,
         binding_lookup: &binding_lookup,
@@ -3679,6 +3690,7 @@ fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
         peer_worker_commands: &peer_worker_commands,
         dnat_fds: &dnat_fds,
         rg_epochs: &rg_epochs,
+        cos_owner_live_by_queue: &cos_owner_live_by_queue,
     };
     let mut sessions = SessionTable::new();
     let flow_key = SessionKey {

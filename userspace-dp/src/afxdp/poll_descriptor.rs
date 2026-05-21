@@ -476,6 +476,7 @@ pub(super) fn poll_binding_process_descriptor(
                     // stage-12+ code at lines below calls `.take()`.
                     let (mut meta, mut owned_packet_frame) =
                         stage_native_gre_decap(raw_frame, meta, worker_ctx.forwarding);
+                    let mut was_wireguard_decap = false;
                     if owned_packet_frame.is_none() {
                         // End the shared borrow before taking a mutable UMEM
                         // slice for in-place WireGuard decap.
@@ -488,6 +489,7 @@ pub(super) fn poll_binding_process_descriptor(
                             stage_wireguard_decap(raw_frame_mut, meta, &mut binding.wireguard_engines, &mut binding.scratch.scratch_wg_in);
                         
                         if let Some(new_len) = decapsulated_len {
+                            was_wireguard_decap = true;
                             if !is_control {
                                 desc.len = new_len as u32;
                                 let Some(new_slice) = (unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)) else {
@@ -498,9 +500,19 @@ pub(super) fn poll_binding_process_descriptor(
                             }
                         }
                         
-                        let _ = target_worker;
+                        if let Some(tw_id) = target_worker {
+                            if let Some(target_live) = worker_ctx.cos_owner_live_by_queue.get(&(meta.ingress_ifindex as i32, tw_id as u8)) {
+                                let _ = target_live.pending_decap.push(DecapRequest {
+                                    packet: raw_frame_mut.to_vec(),
+                                    meta,
+                                });
+                            }
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
+                        }
 
                         if is_control {
+                            let mut forwarded = false;
                             if let Some(frame) = new_owned {
                                 let ingress_ifindex = meta.ingress_ifindex as i32;
                                 if let Some(egress) = worker_ctx.forwarding.egress.get(&ingress_ifindex) {
@@ -571,7 +583,11 @@ pub(super) fn poll_binding_process_descriptor(
                                         cos_tx_selection_resolved: false,
                                         target_worker: None,
                                     });
+                                    forwarded = true;
                                 }
+                            }
+                            if !forwarded {
+                                binding.scratch.scratch_recycle.push(desc.addr);
                             }
                             continue;
                         }
@@ -592,12 +608,13 @@ pub(super) fn poll_binding_process_descriptor(
                     // learning uses the live UMEM Ethernet frame so
                     // the source MAC is the outer host's, not the
                     // GRE tunnel egress).
+                    let learn_from_live_frame = owned_packet_frame.is_none() && !was_wireguard_decap;
                     let flow = stage_parse_flow_and_learn(
                         unsafe { &*area },
                         desc,
                         packet_frame,
                         meta,
-                        owned_packet_frame.is_none(),
+                        learn_from_live_frame,
                         &mut binding.last_learned_neighbor,
                         worker_ctx,
                     );

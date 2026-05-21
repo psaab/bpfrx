@@ -187,6 +187,7 @@ pub(super) fn poll_binding(
             peer_worker_commands,
             dnat_fds,
             rg_epochs,
+            cos_owner_live_by_queue,
         };
         let mut telemetry = TelemetryContext {
             dbg,
@@ -209,6 +210,144 @@ pub(super) fn poll_binding(
             &worker_ctx,
             &mut telemetry,
         );
+        {
+            let mut pending_decap = Vec::new();
+            binding.live.take_pending_decap_into(&mut pending_decap);
+            for req in pending_decap {
+                if let Some(engine) = binding.wireguard_engines.get_mut(&req.meta.flow_dst_port) {
+                    let mut raw_packet = req.packet;
+                    match engine.try_decap(&mut raw_packet, &req.meta, &mut binding.scratch.scratch_wg_in) {
+                        crate::afxdp::wireguard::WireGuardDecapOutcome::Decapped(decap) => {
+                            let ingress_ifindex = req.meta.ingress_ifindex as i32;
+                            if decap.is_control {
+                                if let Some(frame) = decap.control_frame {
+                                    if let Some(egress) = forwarding.egress.get(&ingress_ifindex) {
+                                        let target_ifindex = if egress.bind_ifindex > 0 { egress.bind_ifindex } else { ingress_ifindex };
+                                        let next_hop = match decap.meta.addr_family as i32 {
+                                            libc::AF_INET => {
+                                                if frame.len() >= decap.meta.l3_offset as usize + 20 {
+                                                    let mut ip_bytes = [0u8; 4];
+                                                    ip_bytes.copy_from_slice(&frame[decap.meta.l3_offset as usize + 16..decap.meta.l3_offset as usize + 20]);
+                                                    Some(IpAddr::V4(Ipv4Addr::from(ip_bytes)))
+                                                } else { None }
+                                            }
+                                            libc::AF_INET6 => {
+                                                if frame.len() >= decap.meta.l3_offset as usize + 40 {
+                                                    let mut ip_bytes = [0u8; 16];
+                                                    ip_bytes.copy_from_slice(&frame[decap.meta.l3_offset as usize + 24..decap.meta.l3_offset as usize + 40]);
+                                                    Some(IpAddr::V6(Ipv6Addr::from(ip_bytes)))
+                                                } else { None }
+                                            }
+                                            _ => None,
+                                        };
+                                        let neighbor_mac = next_hop
+                                            .and_then(|hop| dynamic_neighbors.get(&(target_ifindex, hop)).map(|entry| entry.mac))
+                                            .or_else(|| {
+                                                if frame.len() >= 6 {
+                                                    let mut mac = [0u8; 6];
+                                                    mac.copy_from_slice(&frame[0..6]);
+                                                    Some(mac)
+                                                } else { None }
+                                            });
+                                        binding.scratch.scratch_forwards.push(PendingForwardRequest {
+                                            target_ifindex,
+                                            target_binding_index: None,
+                                            ingress_queue_id: binding.live.socket_queue_id.load(std::sync::atomic::Ordering::Relaxed),
+                                            desc: XdpDesc { addr: u64::MAX, len: 0, options: 0 },
+                                            frame: PendingForwardFrame::Prebuilt(frame),
+                                            meta: decap.meta.into(),
+                                            decision: SessionDecision {
+                                                resolution: ForwardingResolution {
+                                                    disposition: ForwardingDisposition::ForwardCandidate,
+                                                    local_ifindex: 0,
+                                                    egress_ifindex: ingress_ifindex,
+                                                    tx_ifindex: target_ifindex,
+                                                    tunnel_endpoint_id: 0,
+                                                    next_hop,
+                                                    neighbor_mac,
+                                                    src_mac: Some(egress.src_mac),
+                                                    tx_vlan_id: egress.vlan_id,
+                                                },
+                                                nat: NatDecision::default(),
+                                            },
+                                            apply_nat_on_fabric: false,
+                                            expected_ports: None,
+                                            flow_key: None,
+                                            nat64_reverse: None,
+                                            cos_queue_id: None,
+                                            dscp_rewrite: None,
+                                            cos_tx_selection_resolved: false,
+                                            target_worker: None,
+                                        });
+                                    }
+                                }
+                            } else {
+                                let frame = &raw_packet[0..decap.decapsulated_len];
+                                let l3 = decap.meta.l3_offset as usize;
+                                let dst = match decap.meta.addr_family as i32 {
+                                    libc::AF_INET => {
+                                        if l3 + 20 <= frame.len() {
+                                            Some(IpAddr::V4(Ipv4Addr::new(frame[l3 + 16], frame[l3 + 17], frame[l3 + 18], frame[l3 + 19])))
+                                        } else { None }
+                                    }
+                                    libc::AF_INET6 => {
+                                        if l3 + 40 <= frame.len() {
+                                            let mut ip_bytes = [0u8; 16];
+                                            ip_bytes.copy_from_slice(&frame[l3 + 24..l3 + 40]);
+                                            Some(IpAddr::V6(Ipv6Addr::from(ip_bytes)))
+                                        } else { None }
+                                    }
+                                    _ => None,
+                                };
+                                let resolution = if let Some(dst_ip) = dst {
+                                    lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, dst_ip)
+                                } else {
+                                    ForwardingResolution {
+                                        disposition: ForwardingDisposition::NoRoute,
+                                        local_ifindex: 0,
+                                        egress_ifindex: 0,
+                                        tx_ifindex: 0,
+                                        tunnel_endpoint_id: 0,
+                                        next_hop: None,
+                                        neighbor_mac: None,
+                                        src_mac: None,
+                                        tx_vlan_id: 0,
+                                    }
+                                };
+                                if matches!(resolution.disposition, ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect) {
+                                    let target_ifindex = if resolution.tx_ifindex > 0 {
+                                        resolution.tx_ifindex
+                                    } else {
+                                        resolve_tx_binding_ifindex(forwarding, resolution.egress_ifindex)
+                                    };
+                                    binding.scratch.scratch_forwards.push(PendingForwardRequest {
+                                        target_ifindex,
+                                        target_binding_index: None,
+                                        ingress_queue_id: binding.live.socket_queue_id.load(std::sync::atomic::Ordering::Relaxed),
+                                        desc: XdpDesc { addr: u64::MAX, len: 0, options: 0 },
+                                        frame: PendingForwardFrame::Owned(frame.to_vec()),
+                                        meta: decap.meta.into(),
+                                        decision: SessionDecision {
+                                            resolution,
+                                            nat: NatDecision::default(),
+                                        },
+                                        apply_nat_on_fabric: false,
+                                        expected_ports: None,
+                                        flow_key: None,
+                                        nat64_reverse: None,
+                                        cos_queue_id: None,
+                                        dscp_rewrite: None,
+                                        cos_tx_selection_resolved: false,
+                                        target_worker: None,
+                                    });
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         let mut pending_forwards = core::mem::take(&mut binding.scratch.scratch_forwards);
         let mut rst_teardowns = core::mem::take(&mut binding.scratch.scratch_rst_teardowns);
         for (forward_key, nat) in rst_teardowns.drain(..) {

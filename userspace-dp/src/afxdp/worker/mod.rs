@@ -473,10 +473,12 @@ impl BindingWorker {
         {
             self.wireguard_engines.remove(&port);
         }
+        let worker_id = self.worker_id;
+        let num_workers = self.num_workers;
         let engine = self
             .wireguard_engines
             .entry(snap.listen_port)
-            .or_insert_with(super::wireguard::WireGuardEngine::new);
+            .or_insert_with(|| super::wireguard::WireGuardEngine::new(worker_id, num_workers));
         engine.apply_snapshot(&snap);
     }
 
