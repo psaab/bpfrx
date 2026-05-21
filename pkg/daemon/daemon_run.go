@@ -732,7 +732,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// `show chassis forwarding`).  Shared between the gRPC server
 	// and the local CLI; both paths call Snapshot() at query time.
 	// Started here so the ring is populated before the first CLI.
-	fwdSampler := fwdstatus.NewSampler(d.legacyDP(), fwdstatus.OSProcReader{})
+	fwdSampler := fwdstatus.NewSampler(d.forwardingStatusDataplane(), fwdstatus.OSProcReader{})
 	fwdSampler.Start(ctx)
 
 	// Start gRPC API server.

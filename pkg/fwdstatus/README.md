@@ -19,10 +19,10 @@ fixed-width table.
 
 ## Dependencies
 
-`pkg/dataplane` and `pkg/dataplane/userspace` (used by `Sampler` and
-`builder.go` for live BPF map / userspace-helper stats). The package
-deliberately avoids importing `pkg/cli` or `pkg/grpcapi` to prevent
-circular imports — those are the consumers, not dependencies.
+`pkg/dataplane/userspace` for userspace-helper status. Callers adapt
+their runtime dataplane map telemetry into the package-local
+`MapStats` shape; `pkg/fwdstatus` deliberately avoids importing the
+root `pkg/dataplane` package, `pkg/cli`, or `pkg/grpcapi`.
 
 ## Gotchas
 
