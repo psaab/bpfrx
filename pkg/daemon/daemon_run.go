@@ -21,7 +21,6 @@ import (
 	"github.com/psaab/xpf/pkg/cli"
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
-	"github.com/psaab/xpf/pkg/conntrack"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcprelay"
@@ -307,13 +306,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			lp.StartFIBSync(ctx)
 		}
 
-		gc := conntrack.NewGCWithDomains(
-			d.dp.Sessions(),
-			d.dp.Telemetry(),
-			nil,
-			nil,
-			10*time.Second,
-		)
+		gc := d.newConntrackGC(10 * time.Second)
 		d.gc = gc
 
 		// When the userspace dataplane is active, skip BPF session map

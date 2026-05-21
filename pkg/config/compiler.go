@@ -928,7 +928,7 @@ func ValidateConfig(cfg *Config) []string {
 			len(cos.DSCPClassifiers) > 0 ||
 			len(cos.IEEE8021Classifiers) > 0 ||
 			len(cos.DSCPRewriteRules) > 0
-		if hasCoSRuntimeConfig && effectiveDataplaneType(cfg.System.DataplaneType) != "userspace" {
+		if hasCoSRuntimeConfig && effectiveDataplaneType(cfg.System.DataplaneType) != dataplaneTypeUserspace {
 			warnings = append(warnings, "class-of-service shaping, classifier attachment, and dscp rewrite-rule attachment are only implemented in the userspace dataplane; configuration is accepted but will not take effect on this dataplane")
 		}
 	}
@@ -936,15 +936,30 @@ func ValidateConfig(cfg *Config) []string {
 	return warnings
 }
 
+const (
+	dataplaneTypeEBPF      = "ebpf"
+	dataplaneTypeDPDK      = "dpdk"
+	dataplaneTypeUserspace = "userspace"
+)
+
 func effectiveDataplaneType(dpType string) string {
 	if dpType == "" {
-		return "userspace"
+		return dataplaneTypeUserspace
 	}
 	return dpType
 }
 
+func validDataplaneType(dpType string) bool {
+	switch dpType {
+	case dataplaneTypeEBPF, dataplaneTypeDPDK, dataplaneTypeUserspace:
+		return true
+	default:
+		return false
+	}
+}
+
 func userspaceSynCookieProtectionActive(cfg *Config) bool {
-	if cfg == nil || effectiveDataplaneType(cfg.System.DataplaneType) != "userspace" ||
+	if cfg == nil || effectiveDataplaneType(cfg.System.DataplaneType) != dataplaneTypeUserspace ||
 		cfg.Security.Flow.SynFloodProtectionMode != "syn-cookie" {
 		return false
 	}

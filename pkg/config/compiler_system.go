@@ -11,7 +11,7 @@ import (
 const sharedUMEMPhase0ArtifactMaxBytes = 16 << 20
 
 func compileSystem(node *Node, sys *SystemConfig) error {
-	dpType, err := resolveSystemDataplaneType(node)
+	dpType, err := compileSystemDataplaneType(node)
 	if err != nil {
 		return err
 	}
@@ -24,8 +24,8 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 				sys.HostName = child.Keys[1]
 			}
 		case "dataplane-type":
-			// Resolved before the main pass so a dataplane block uses the
-			// same validated type regardless of sibling order.
+			// Already resolved before child compilation so system dataplane
+			// dispatch is independent of statement ordering.
 		case "domain-name":
 			if len(child.Keys) >= 2 {
 				sys.DomainName = child.Keys[1]
@@ -225,21 +225,24 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 				sys.InternetOptions.NoIPv6RejectZeroHopLimit = true
 			}
 		case "dataplane":
-			switch sys.DataplaneType {
-			case "userspace":
+			switch effectiveDataplaneType(sys.DataplaneType) {
+			case dataplaneTypeUserspace:
 				if sys.UserspaceDataplane == nil {
 					sys.UserspaceDataplane = &UserspaceConfig{}
 				}
 				if err := compileUserspaceDataplane(child, sys.UserspaceDataplane); err != nil {
 					return err
 				}
-			default:
+			case dataplaneTypeDPDK:
 				if sys.DPDKDataplane == nil {
 					sys.DPDKDataplane = &DPDKConfig{}
 				}
 				if err := compileDPDKDataplane(child, sys.DPDKDataplane); err != nil {
 					return err
 				}
+			case dataplaneTypeEBPF:
+				// The legacy eBPF dataplane has no system dataplane
+				// sub-stanza. Do not route it through DPDK.
 			}
 		case "syslog":
 			sys.Syslog = &SystemSyslogConfig{}
@@ -367,28 +370,21 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 	return nil
 }
 
-func resolveSystemDataplaneType(node *Node) (string, error) {
+func compileSystemDataplaneType(node *Node) (string, error) {
 	var dpType string
 	for _, child := range node.Children {
 		if child.Name() != "dataplane-type" || len(child.Keys) < 2 {
 			continue
 		}
-		value := child.Keys[1]
-		if err := validateSystemDataplaneType(value); err != nil {
-			return "", err
+		next := child.Keys[1]
+		if !validDataplaneType(next) {
+			return "", fmt.Errorf(
+				"unknown dataplane-type %q; dataplane-type %q is invalid; valid values are ebpf, dpdk, userspace",
+				next, next)
 		}
-		dpType = value
+		dpType = next
 	}
 	return dpType, nil
-}
-
-func validateSystemDataplaneType(dpType string) error {
-	switch dpType {
-	case "", "ebpf", "dpdk", "userspace":
-		return nil
-	default:
-		return fmt.Errorf("dataplane-type %q is invalid; valid values are ebpf, dpdk, userspace", dpType)
-	}
 }
 
 func hasDNSProxyChild(node *Node) bool {
