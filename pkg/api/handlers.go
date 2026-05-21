@@ -1030,13 +1030,19 @@ func matchSingleApp(appName, proto string, dstPort int, cfg *config.Config) bool
 	if app.DestinationPort != "" && dstPort > 0 {
 		if strings.Contains(app.DestinationPort, "-") {
 			parts := strings.SplitN(app.DestinationPort, "-", 2)
-			lo, _ := strconv.Atoi(parts[0])
-			hi, _ := strconv.Atoi(parts[1])
+			lo, err1 := strconv.Atoi(parts[0])
+			hi, err2 := strconv.Atoi(parts[1])
+			if err1 != nil || err2 != nil {
+				return false
+			}
 			if dstPort < lo || dstPort > hi {
 				return false
 			}
 		} else {
-			p, _ := strconv.Atoi(app.DestinationPort)
+			p, err := strconv.Atoi(app.DestinationPort)
+			if err != nil {
+				return false
+			}
 			if p != dstPort {
 				return false
 			}

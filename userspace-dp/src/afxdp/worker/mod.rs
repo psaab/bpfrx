@@ -460,6 +460,7 @@ impl BindingWorker {
         &mut self,
         ifname: &str,
         snap: crate::protocol::WireGuardInterfaceSnapshot,
+        virtual_ifindex: Option<i32>,
     ) {
         let old_port = self
             .wireguard_listen_ports_by_ifname
@@ -477,7 +478,7 @@ impl BindingWorker {
             .wireguard_engines
             .entry(snap.listen_port)
             .or_insert_with(super::wireguard::WireGuardEngine::new);
-        engine.apply_snapshot(&snap);
+        engine.apply_snapshot(&snap, virtual_ifindex.map(|idx| idx as u32));
     }
 
     pub(crate) fn remove_wireguard_snapshot(&mut self, ifname: &str) {
@@ -1507,13 +1508,15 @@ pub(crate) fn worker_loop(
             wireguard_updates,
         } = command_results;
         for (ifname, snap) in wireguard_updates {
+            let virtual_ifindex = bindings.iter()
+                .find(|b| b.name == ifname)
+                .map(|b| b.ifindex);
+
             for binding in bindings.iter_mut() {
-                if binding.name == ifname {
-                    if let Some(snap) = snap.as_ref() {
-                        binding.apply_wireguard_snapshot(&ifname, snap.clone());
-                    } else {
-                        binding.remove_wireguard_snapshot(&ifname);
-                    }
+                if let Some(snap) = snap.as_ref() {
+                    binding.apply_wireguard_snapshot(&ifname, snap.clone(), virtual_ifindex);
+                } else {
+                    binding.remove_wireguard_snapshot(&ifname);
                 }
             }
         }
@@ -2729,11 +2732,11 @@ mod tests {
             peers: vec![],
         };
 
-        binding.apply_wireguard_snapshot("wg0", snap_wg0);
+        binding.apply_wireguard_snapshot("wg0", snap_wg0, None);
         assert!(binding.wireguard_engines.contains_key(&51820));
         assert_eq!(binding.wireguard_listen_ports_by_ifname.get("wg0"), Some(&51820));
 
-        binding.apply_wireguard_snapshot("wg1", snap_wg1);
+        binding.apply_wireguard_snapshot("wg1", snap_wg1, None);
         assert!(binding.wireguard_engines.contains_key(&51820));
         assert!(binding.wireguard_engines.contains_key(&51821));
 

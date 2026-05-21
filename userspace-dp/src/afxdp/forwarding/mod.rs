@@ -774,6 +774,63 @@ pub(super) fn native_gre_tcp_mss(
     u16::try_from(max_mss).unwrap_or_default()
 }
 
+pub(super) fn wireguard_tcp_mss(
+    forwarding: &ForwardingState,
+    decision: &SessionDecision,
+    addr_family: u8,
+) -> u16 {
+    if decision.resolution.tunnel_endpoint_id == 0 {
+        return 0;
+    }
+    if forwarding.tcp_mss_all_tcp > 0 {
+        return forwarding.tcp_mss_all_tcp;
+    }
+    let Some(endpoint) = forwarding
+        .tunnel_endpoints
+        .get(&decision.resolution.tunnel_endpoint_id)
+        .cloned()
+    else {
+        return 0;
+    };
+    let transport_ifindex = resolve_ingress_logical_ifindex(
+        forwarding,
+        decision.resolution.tx_ifindex,
+        decision.resolution.tx_vlan_id,
+    )
+    .unwrap_or(decision.resolution.tx_ifindex);
+    let transport_mtu = forwarding
+        .egress
+        .get(&transport_ifindex)
+        .or_else(|| forwarding.egress.get(&decision.resolution.egress_ifindex))
+        .or_else(|| forwarding.egress.get(&endpoint.logical_ifindex))
+        .map(|egress| egress.mtu)
+        .unwrap_or_default();
+    if transport_mtu == 0 {
+        return 0;
+    }
+    let outer_ip_header_len = match endpoint.outer_family {
+        libc::AF_INET => 20usize,
+        libc::AF_INET6 => 40usize,
+        _ => return 0,
+    };
+    let wg_overhead = outer_ip_header_len + 8usize + 32usize;
+    let Some(inner_mtu) = transport_mtu.checked_sub(wg_overhead) else {
+        return 0;
+    };
+    if inner_mtu == 0 {
+        return 0;
+    }
+    let ip_header_len = match addr_family as i32 {
+        libc::AF_INET => 20usize,
+        libc::AF_INET6 => 40usize,
+        _ => return 0,
+    };
+    let Some(max_mss) = inner_mtu.checked_sub(ip_header_len + 20) else {
+        return 0;
+    };
+    u16::try_from(max_mss).unwrap_or_default()
+}
+
 // #989: clamp_tcp_mss / clamp_tcp_mss_frame relocated to `frame/tcp.rs`.
 
 #[allow(dead_code)]

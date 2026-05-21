@@ -285,13 +285,17 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 					profile.ICMP.PingDeath = true
 				case "flood":
 					if len(opt.Keys) >= 3 {
-						if v, err := strconv.Atoi(opt.Keys[2]); err == nil {
-							profile.ICMP.FloodThreshold = v
+						v, err := strconv.Atoi(opt.Keys[2])
+						if err != nil {
+							return fmt.Errorf("invalid icmp flood threshold %q: %w", opt.Keys[2], err)
 						}
+						profile.ICMP.FloodThreshold = v
 					} else if v := nodeVal(opt); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							profile.ICMP.FloodThreshold = n
+						n, err := strconv.Atoi(v)
+						if err != nil {
+							return fmt.Errorf("invalid icmp flood threshold %q: %w", v, err)
 						}
+						profile.ICMP.FloodThreshold = n
 					}
 				}
 			}
@@ -312,9 +316,11 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 							if val == "" && len(swOpt.Keys) >= 2 {
 								val = swOpt.Keys[1]
 							}
-							if n, err := strconv.Atoi(val); err == nil {
-								profile.IP.IPSweepThreshold = n
+							n, err := strconv.Atoi(val)
+							if err != nil {
+								return fmt.Errorf("invalid ip-sweep threshold %q: %w", val, err)
 							}
+							profile.IP.IPSweepThreshold = n
 						}
 					}
 				}
@@ -345,7 +351,10 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 							val = sfOpt.Keys[1]
 						}
 						if val != "" {
-							n, _ := strconv.Atoi(val)
+							n, err := strconv.Atoi(val)
+							if err != nil {
+								return fmt.Errorf("invalid syn-flood %s %q: %w", sfOpt.Name(), val, err)
+							}
 							switch sfOpt.Name() {
 							case "alarm-threshold":
 								sf.AlarmThreshold = n
@@ -368,9 +377,11 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 							if val == "" && len(psOpt.Keys) >= 2 {
 								val = psOpt.Keys[1]
 							}
-							if n, err := strconv.Atoi(val); err == nil {
-								profile.TCP.PortScanThreshold = n
+							n, err := strconv.Atoi(val)
+							if err != nil {
+								return fmt.Errorf("invalid port-scan threshold %q: %w", val, err)
 							}
+							profile.TCP.PortScanThreshold = n
 						}
 					}
 				}
@@ -383,13 +394,17 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 				switch opt.Name() {
 				case "flood":
 					if len(opt.Keys) >= 3 {
-						if v, err := strconv.Atoi(opt.Keys[2]); err == nil {
-							profile.UDP.FloodThreshold = v
+						v, err := strconv.Atoi(opt.Keys[2])
+						if err != nil {
+							return fmt.Errorf("invalid udp flood threshold %q: %w", opt.Keys[2], err)
 						}
+						profile.UDP.FloodThreshold = v
 					} else if v := nodeVal(opt); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							profile.UDP.FloodThreshold = n
+						n, err := strconv.Atoi(v)
+						if err != nil {
+							return fmt.Errorf("invalid udp flood threshold %q: %w", v, err)
 						}
+						profile.UDP.FloodThreshold = n
 					}
 				}
 			}
@@ -403,7 +418,10 @@ func compileScreen(node *Node, sec *SecurityConfig) error {
 					val = opt.Keys[1]
 				}
 				if val != "" {
-					n, _ := strconv.Atoi(val)
+					n, err := strconv.Atoi(val)
+					if err != nil {
+						return fmt.Errorf("invalid limit-session %s %q: %w", opt.Name(), val, err)
+					}
 					switch opt.Name() {
 					case "source-ip-based":
 						profile.LimitSession.SourceIPBased = n

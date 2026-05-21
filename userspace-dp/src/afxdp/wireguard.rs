@@ -27,6 +27,8 @@ pub(super) struct WireGuardEngine {
     last_token_refill_ns: u64,
     // Offset for fair round-robin trial decapsulation across peers to prevent starvation
     round_robin_offset: usize,
+    // Virtual interface's ifindex for ingress remapping
+    virtual_ifindex: Option<u32>,
 }
 
 struct PeerState {
@@ -62,6 +64,7 @@ impl WireGuardEngine {
             trial_decap_tokens: 32,
             last_token_refill_ns: 0,
             round_robin_offset: 0,
+            virtual_ifindex: None,
         }
     }
 
@@ -433,7 +436,7 @@ impl WireGuardEngine {
                                 magic: super::USERSPACE_META_MAGIC,
                                 version: super::USERSPACE_META_VERSION,
                                 length: std::mem::size_of::<UserspaceDpMeta>() as u16,
-                                ingress_ifindex: meta.ingress_ifindex,
+                                ingress_ifindex: self.virtual_ifindex.unwrap_or(meta.ingress_ifindex),
                                 rx_queue_index: meta.rx_queue_index,
                                 l3_offset: 14,
                                 l4_offset: 14 + l4_offset,
@@ -483,11 +486,12 @@ impl WireGuardEngine {
         preferred_local_ip: Option<IpAddr>,
         scratch_out: &mut Vec<u8>,
     ) -> Option<(usize, usize, UserspaceDpMeta)> {
+        let l3_offset = frame_l3_offset(inner_frame).unwrap_or(14);
         let peer_pub_key = if let Some(key) = explicit_peer {
             key
         } else {
             // Need to parse inner IP to find peer
-            let inner_packet = &inner_frame[14..]; // Assume Ethernet
+            let inner_packet = &inner_frame[l3_offset..];
             if addr_family as i32 == libc::AF_INET {
                 if inner_packet.len() < 20 {
                     return None;
@@ -525,7 +529,7 @@ impl WireGuardEngine {
             dst_mac.copy_from_slice(&inner_frame[0..6]);
         }
 
-        let inner_packet = &inner_frame[14..];
+        let inner_packet = &inner_frame[l3_offset..];
         
         let (outer_dst_ip, outer_dst_port) = peer.endpoint?;
         let outer_src_ip = peer.local_ip.unwrap_or_else(|| {
@@ -545,12 +549,14 @@ impl WireGuardEngine {
             IpAddr::V6(_) => 62,
         };
 
+        // Resize the scratch buffer FIRST to prevent reallocation invalidating the base pointer
+        let max_size = 32 + header_len + inner_packet.len() + 128;
+        scratch_out.resize(max_size, 0);
+
         // Align the packet start to a 32-byte boundary to avoid SIMD unaligned load penalties
         let base_ptr = scratch_out.as_ptr() as usize;
         let padding = (32 - (base_ptr % 32)) % 32;
         let encap_start = padding + header_len;
-
-        scratch_out.resize(encap_start + inner_packet.len() + 128, 0);
 
         let (payload_slice, encap_ok) = {
             let out_buf = &mut scratch_out[encap_start..];
@@ -745,8 +751,9 @@ impl WireGuardEngine {
         Some((out, meta))
     }
 
-    pub(super) fn apply_snapshot(&mut self, snap: &crate::protocol::WireGuardInterfaceSnapshot) {
+    pub(super) fn apply_snapshot(&mut self, snap: &crate::protocol::WireGuardInterfaceSnapshot, virtual_ifindex: Option<u32>) {
         self.listen_port = snap.listen_port;
+        self.virtual_ifindex = virtual_ifindex;
 
         let mut private_key = [0u8; 32];
         let trimmed_private_key = snap.private_key.trim();
@@ -987,7 +994,7 @@ mod tests {
             ],
         };
 
-        engine.apply_snapshot(&snap1);
+        engine.apply_snapshot(&snap1, None);
         assert_eq!(engine.peers.len(), 2);
         let idx_a = engine.peers.get(&key_a).unwrap().local_index;
         let idx_b = engine.peers.get(&key_b).unwrap().local_index;
@@ -1003,7 +1010,7 @@ mod tests {
             ],
         };
 
-        engine.apply_snapshot(&snap2);
+        engine.apply_snapshot(&snap2, None);
         assert_eq!(engine.peers.len(), 2);
         let new_idx_b = engine.peers.get(&key_b).unwrap().local_index;
         let idx_c = engine.peers.get(&key_c).unwrap().local_index;
@@ -1032,7 +1039,7 @@ mod tests {
             peers: vec![WireGuardPeerSnapshot { public_key: pub_peer.clone(), endpoint: "".to_string(), allowed_ips: vec![], persistent_keepalive: 0 }],
         };
 
-        engine.apply_snapshot(&snap1);
+        engine.apply_snapshot(&snap1, None);
         let idx_before = engine.peers.get(&peer_key).unwrap().local_index;
 
         let snap2 = WireGuardInterfaceSnapshot {
@@ -1042,7 +1049,7 @@ mod tests {
             peers: vec![WireGuardPeerSnapshot { public_key: pub_peer.clone(), endpoint: "".to_string(), allowed_ips: vec![], persistent_keepalive: 0 }],
         };
 
-        engine.apply_snapshot(&snap2);
+        engine.apply_snapshot(&snap2, None);
         let peer_after = engine.peers.get(&peer_key).unwrap();
         assert_eq!(peer_after.local_index, idx_before);
     }
@@ -1109,7 +1116,7 @@ mod tests {
                 }
             ],
         };
-        engine.apply_snapshot(&snap);
+        engine.apply_snapshot(&snap, None);
         assert_eq!(engine.peers.len(), 1);
 
         let peer_key: [u8; 32] = client_public.as_bytes().clone();
@@ -1199,7 +1206,7 @@ mod tests {
             listen_port: 51820,
             peers,
         };
-        engine.apply_snapshot(&snap);
+        engine.apply_snapshot(&snap, None);
         assert_eq!(engine.peers.len(), 40);
         assert_eq!(engine.round_robin_offset, 0);
 
@@ -1259,7 +1266,7 @@ mod tests {
                 }
             ],
         };
-        engine.apply_snapshot(&snap);
+        engine.apply_snapshot(&snap, None);
 
         let mut client_tunn = Tunn::new(
             client_private.clone(),
@@ -1416,7 +1423,7 @@ mod tests {
             listen_port: 51820,
             peers,
         };
-        engine.apply_snapshot(&snap);
+        engine.apply_snapshot(&snap, None);
         assert_eq!(engine.peers.len(), 40);
 
         let peer_39_key: [u8; 32] = client_publics[39].as_bytes().clone();
