@@ -43,16 +43,24 @@ func (a forwardingStatusDaemonDataPlane) GetMapStats() []fwdstatus.MapStats {
 
 type forwardingStatusDaemonUserspaceDataPlane struct {
 	forwardingStatusDaemonDataPlane
-	statusProvider interface {
-		Status() (dpuserspace.ProcessStatus, error)
-	}
 }
 
 func (a forwardingStatusDaemonUserspaceDataPlane) Status() (dpuserspace.ProcessStatus, error) {
-	if a.statusProvider == nil {
+	if a.daemon == nil {
 		return dpuserspace.ProcessStatus{}, errors.New("userspace status unavailable")
 	}
-	return a.statusProvider.Status()
+	return a.daemon.userspaceDataplaneStatus()
+}
+
+func (d *Daemon) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
+	dp := d.legacyDP()
+	provider, ok := dp.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+	})
+	if !ok {
+		return dpuserspace.ProcessStatus{}, errors.New("userspace status unavailable")
+	}
+	return provider.Status()
 }
 
 func (d *Daemon) forwardingStatusDataplane() fwdstatus.DataPlaneAccessor {
@@ -64,13 +72,10 @@ func (d *Daemon) forwardingStatusDataplane() fwdstatus.DataPlaneAccessor {
 		return nil
 	}
 	base := forwardingStatusDaemonDataPlane{daemon: d}
-	if statusProvider, ok := dp.(interface {
+	if _, ok := dp.(interface {
 		Status() (dpuserspace.ProcessStatus, error)
 	}); ok {
-		return forwardingStatusDaemonUserspaceDataPlane{
-			forwardingStatusDaemonDataPlane: base,
-			statusProvider:                  statusProvider,
-		}
+		return forwardingStatusDaemonUserspaceDataPlane{forwardingStatusDaemonDataPlane: base}
 	}
 	return base
 }

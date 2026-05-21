@@ -118,3 +118,68 @@ func TestForwardingStatusDataplaneUsesUserspaceStatusAdapter(t *testing.T) {
 		t.Fatalf("Status() = %#v, want injected userspace status", got)
 	}
 }
+
+func TestForwardingStatusDataplaneUsesCurrentDataplaneAfterSwap(t *testing.T) {
+	first := &forwardingStatusDaemonUserspaceTestDP{
+		forwardingStatusDaemonTestDP: &forwardingStatusDaemonTestDP{
+			loaded: true,
+			mapStats: []dataplane.MapStats{{
+				Type:       "Hash",
+				MaxEntries: 16,
+				UsedCount:  4,
+			}},
+		},
+		status: dpuserspace.ProcessStatus{
+			WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{{
+				ThreadCPUNS: 111,
+				WallNS:      222,
+			}},
+		},
+	}
+	second := &forwardingStatusDaemonUserspaceTestDP{
+		forwardingStatusDaemonTestDP: &forwardingStatusDaemonTestDP{
+			loaded: true,
+			mapStats: []dataplane.MapStats{{
+				Type:       "LPMTrie",
+				MaxEntries: 32,
+				UsedCount:  8,
+			}},
+		},
+		status: dpuserspace.ProcessStatus{
+			WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{{
+				ThreadCPUNS: 333,
+				WallNS:      444,
+			}},
+		},
+	}
+	d := &Daemon{dp: first}
+
+	accessor := d.forwardingStatusDataplane()
+	statusAccessor, ok := accessor.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+	})
+	if !ok {
+		t.Fatalf("forwardingStatusDataplane() = %T, want userspace Status adapter", accessor)
+	}
+
+	d.dp = second
+
+	if got, want := accessor.GetMapStats(), []fwdstatus.MapStats{
+		{Type: "LPMTrie", MaxEntries: 32, UsedCount: 8},
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("GetMapStats() after dp swap = %#v, want %#v", got, want)
+	}
+	got, err := statusAccessor.Status()
+	if err != nil {
+		t.Fatalf("Status() after dp swap error = %v", err)
+	}
+	if first.statusCalls != 0 {
+		t.Fatalf("first Status() calls = %d, want 0", first.statusCalls)
+	}
+	if second.statusCalls != 1 {
+		t.Fatalf("second Status() calls = %d, want 1", second.statusCalls)
+	}
+	if len(got.WorkerRuntime) != 1 || got.WorkerRuntime[0].ThreadCPUNS != 333 {
+		t.Fatalf("Status() after dp swap = %#v, want second dataplane status", got)
+	}
+}
