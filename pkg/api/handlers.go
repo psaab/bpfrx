@@ -16,6 +16,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/logging"
 	"github.com/psaab/xpf/pkg/vrrp"
@@ -2090,6 +2091,46 @@ func (s *Server) systemBuffersHandler(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 
+	if provider, ok := s.dp.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+	}); ok {
+		status, err := provider.Status()
+		if err != nil {
+			msg := fmt.Sprintf("userspace buffer status unavailable: %v", err)
+			writeError(w, http.StatusServiceUnavailable, msg)
+			return
+		}
+		rows := dpuserspace.StructuredSystemBufferRows(status, false)
+		if len(rows.Utilization) == 0 {
+			msg := "userspace buffer status missing bounded capacity fields"
+			writeError(w, http.StatusServiceUnavailable, msg)
+			return
+		}
+		buffers := make([]BufferInfo, 0, len(rows.Utilization)+len(rows.Counters))
+		for _, row := range rows.Utilization {
+			buffers = append(buffers, BufferInfo{
+				Name:         row.Name,
+				Type:         "Userspace",
+				Scope:        row.Scope,
+				MaxEntries:   row.Capacity,
+				UsedCount:    row.Used,
+				UsagePercent: row.UsagePercent,
+				Status:       row.Status,
+			})
+		}
+		for _, row := range rows.Counters {
+			buffers = append(buffers, BufferInfo{
+				Name:   row.Name,
+				Type:   "UserspaceCounter",
+				Scope:  row.Scope,
+				Value:  row.Value,
+				Status: "OK",
+			})
+		}
+		writeOK(w, buffers)
+		return
+	}
+
 	stats := s.dp.GetMapStats()
 	buffers := make([]BufferInfo, 0, len(stats))
 	for _, st := range stats {
@@ -2106,8 +2147,8 @@ func (s *Server) systemBuffersHandler(w http.ResponseWriter, _ *http.Request) {
 		buffers = append(buffers, BufferInfo{
 			Name:         st.Name,
 			Type:         st.Type,
-			MaxEntries:   int(st.MaxEntries),
-			UsedCount:    int(st.UsedCount),
+			MaxEntries:   uint64(st.MaxEntries),
+			UsedCount:    uint64(st.UsedCount),
 			UsagePercent: usage,
 			Status:       status,
 		})

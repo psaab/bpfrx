@@ -3,9 +3,10 @@
 ## Goal
 
 Keep operational buffer/status visibility intact after the eBPF dataplane is
-retired. `show system buffers`, gRPC `ShowText`, and related status/metrics
-must expose userspace AF_XDP ring capacity, fill/comp pressure, and active
-session summaries with the same operator utility as the legacy path.
+retired. `show system buffers`, gRPC `ShowText`, REST
+`/api/v1/system/buffers`, and related status/metrics must expose userspace
+AF_XDP ring capacity, fill/comp pressure, and active session summaries with
+the same operator utility as the legacy path.
 
 ## Dependencies
 
@@ -30,7 +31,9 @@ Treat buffer visibility as runtime telemetry, not config state. The userspace
 helper publishes per-binding/ring capacity, available fill frames, completion
 backlog, RX/TX ring occupancy, and drop/error counters. Go formatting keeps a
 stable aggregate view for `show system buffers` and only emits per-binding rows
-for `show system buffers detail`.
+for `show system buffers detail`. REST uses the same helper-backed bounded
+rows and status counters for JSON so userspace mode never falls back to eBPF
+map occupancy for operator buffer warnings.
 
 If mixed-version helpers omit a newer capacity surface, Go must fall back to the
 older binding fields or clearly mark the row unavailable. It must not display
@@ -83,8 +86,9 @@ without real denominators.
   them, and both preserve the active-session footer.
 - Go: mixed-version status with sparse per-binding capacity falls back to
   binding-level capacity instead of rendering false zeroes.
-- Go: gRPC `ShowText` and local CLI use the same userspace buffer fixture and
-  produce equivalent text.
+- Go: gRPC `ShowText`, local CLI, and REST `/api/v1/system/buffers` use the
+  same userspace buffer fixture and do not fall back to BPF map statistics when
+  helper status is present.
 - Go: formatter covers CoS queued-byte capacity plus existing helper pressure
   counters without turning unbounded counts into utilization percentages; the
   dynamic-count regression test must fail if neighbor/flow-cache counters gain
