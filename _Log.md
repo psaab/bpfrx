@@ -2,6 +2,21 @@
 
 ## 2026-05-21
 
+- **Timestamp**: 2026-05-21T07:16:00Z
+  - **Action**: Minor cleanup after validation feedback — changed WireGuard decap tuple binding to discard the unused target-worker slot directly (`_`) to avoid dead local binding noise.
+  - **File(s)**: `userspace-dp/src/afxdp/poll_descriptor.rs`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/userspace`; `git diff --check`
+
+- **Timestamp**: 2026-05-21T07:12:00Z
+  - **Action**: Post-validation follow-up — removed no-op `target_worker` suppression in WireGuard decap integration and restored `u64::MAX` sentinel guard in ingress-frame recycle helper.
+  - **File(s)**: `userspace-dp/src/afxdp/poll_descriptor.rs`, `userspace-dp/src/afxdp/tx/dispatch.rs`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/userspace`; `git diff --check`
+
+- **Timestamp**: 2026-05-21T07:05:00Z
+  - **Action**: PR #1433 round-11 follow-up — removed the cross-worker WireGuard decap dispatch reintroduction by restoring the prior single-worker decap pipeline path, while retaining targeted fixes for control-frame recycle leak handling, WireGuard decap neighbor-learn suppression, and fallback TxRequest outer metadata propagation.
+  - **File(s)**: `userspace-dp/src/afxdp/poll_descriptor.rs`, `userspace-dp/src/afxdp/tx/dispatch.rs`, `userspace-dp/src/afxdp/poll_stages.rs`, `userspace-dp/src/afxdp/tests.rs`, `userspace-dp/src/afxdp/types/runtime.rs`, `userspace-dp/src/afxdp/umem/mod.rs`, `userspace-dp/src/afxdp/wireguard.rs`, `userspace-dp/src/afxdp/worker/lifecycle.rs`, `userspace-dp/src/afxdp/worker/mod.rs`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/userspace`; `cargo test --manifest-path userspace-dp/Cargo.toml -q wireguard` (expected environment failure: missing libelf/gelf headers/pkg-config in runner); `cargo fmt --manifest-path userspace-dp/Cargo.toml --check` (pre-existing unrelated formatting differences in benchmark files); `git diff --check`
+
 - **Timestamp**: 2026-05-21T03:40:00Z
   - **Action**: PR #1433 follow-up review fixes — guarded WireGuard snapshot generation when per-interface `tunnel wireguard` block is omitted (fallback to global key/port), and removed duplicate RX UMEM recycle in WireGuard control-frame enqueue path.
   - **File(s)**: `pkg/dataplane/userspace/snapshot.go`, `userspace-dp/src/afxdp/poll_descriptor.rs`, `_Log.md`

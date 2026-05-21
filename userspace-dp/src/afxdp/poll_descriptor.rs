@@ -485,7 +485,7 @@ pub(super) fn poll_binding_process_descriptor(
                             binding.scratch.scratch_recycle.push(desc.addr);
                             continue;
                         };
-                        let (new_meta, new_owned, is_control, target_worker, decapsulated_len) =
+                        let (new_meta, new_owned, is_control, _, decapsulated_len) =
                             stage_wireguard_decap(raw_frame_mut, meta, &mut binding.wireguard_engines, &mut binding.scratch.scratch_wg_in);
                         
                         if let Some(new_len) = decapsulated_len {
@@ -500,17 +500,6 @@ pub(super) fn poll_binding_process_descriptor(
                             }
                         }
                         
-                        if let Some(tw_id) = target_worker {
-                            if let Some(target_live) = worker_ctx.cos_owner_live_by_queue.get(&(meta.ingress_ifindex as i32, tw_id as u8)) {
-                                let _ = target_live.pending_decap.push(DecapRequest {
-                                    packet: raw_frame_mut.to_vec(),
-                                    meta,
-                                });
-                            }
-                            binding.scratch.scratch_recycle.push(desc.addr);
-                            continue;
-                        }
-
                         if is_control {
                             let mut forwarded = false;
                             if let Some(frame) = new_owned {
