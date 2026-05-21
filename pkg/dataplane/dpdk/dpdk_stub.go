@@ -61,6 +61,9 @@ func (m *Manager) AddTxPort(ifindex int) error {
 // --- Compilation ---
 
 func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) {
+	if !m.loaded {
+		return nil, errDPDKBuildTagRequired
+	}
 	result, err := dataplane.CompileConfig(m, cfg, m.lastCompile != nil)
 	if err != nil {
 		return nil, err

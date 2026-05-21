@@ -41,4 +41,12 @@ func TestDPDKStubRequiresDPDKBuildTag(t *testing.T) {
 	if err := m.Start(context.Background()); !errors.Is(err, errDPDKBuildTagRequired) {
 		t.Fatalf("Start() error = %v, want %v", err, errDPDKBuildTagRequired)
 	}
+
+	if _, err := m.Compile(nil); !errors.Is(err, errDPDKBuildTagRequired) {
+		t.Fatalf("Compile() error = %v, want %v", err, errDPDKBuildTagRequired)
+	}
+
+	if _, err := m.ApplyConfig(context.Background(), nil); !errors.Is(err, errDPDKBuildTagRequired) {
+		t.Fatalf("ApplyConfig() error = %v, want %v", err, errDPDKBuildTagRequired)
+	}
 }

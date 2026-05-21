@@ -65,6 +65,10 @@ var dpdkEBPFImportAllowlist = map[string]string{
 	"pkg/dataplane/dpdk/manager.go": "legacy DataPlane Map method returns *ebpf.Map until DPDK migrates off root DataPlane",
 }
 
+var dpdkBackendImportAllowlist = map[string]string{
+	"cmd/xpfd/main.go": "backend registration and cleanup entry point",
+}
+
 func TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports(t *testing.T) {
 	t.Parallel()
 
@@ -134,7 +138,10 @@ func TestDPDKBackendImportStaysBackendLocal(t *testing.T) {
 		filepath.Join(repoRootForBoundaryCanary, "pkg"),
 	}) {
 		rel := repoRelativePath(t, path)
-		if rel == "cmd/xpfd/main.go" || strings.HasPrefix(rel, "pkg/dataplane/dpdk/") {
+		if strings.HasPrefix(rel, "pkg/dataplane/dpdk/") {
+			continue
+		}
+		if _, ok := dpdkBackendImportAllowlist[rel]; ok {
 			continue
 		}
 		for _, imp := range importPaths(t, path) {
