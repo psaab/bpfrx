@@ -3,7 +3,9 @@
 > #1373 note: this is the primary packet-processing path for new dataplane
 > development and routine validation. References to the legacy BPF pipeline
 > below describe explicit fallback/regression boundaries, not the preferred
-> implementation target.
+> implementation target. The retained userspace shim no longer tail-calls into
+> `xdp_main_prog` for degraded helper/XSK states; compat mode uses explicit
+> kernel pass-through and strict mode drops.
 
 ## 1. Architecture Overview
 
@@ -23,7 +25,9 @@ The shim checks several conditions before redirecting a packet to userspace:
    marked `USERSPACE_BINDING_READY`.
 4. The binding's heartbeat (written every 250ms by the worker) must not be
    stale (default 5s timeout).
-5. ICMP/ICMPv6 falls back to the legacy BPF pipeline via `userspace_fallback_progs` tail call.
+5. ICMP/ICMPv6 is handled by the userspace dataplane or passed to the kernel
+   for local/control-plane delivery; the shim no longer tail-calls through
+   `userspace_fallback_progs`.
 6. Local-destination traffic (matching `userspace_local_v4`/`userspace_local_v6`) passes to kernel.
 7. Non-SYN TCP without a live entry in `userspace_sessions` BPF map is dropped
    (not fallen back -- legacy BPF would generate RSTs that kill the real connection).

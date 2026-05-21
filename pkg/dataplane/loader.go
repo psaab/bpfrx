@@ -242,9 +242,9 @@ func (m *Manager) seedInterfaceCounter(ifindex int) {
 	_ = ic.Update(uint32(ifindex), zero, ebpf.UpdateNoExist)
 }
 
-// SwapXDPEntryProg atomically replaces the XDP entry program on all
-// attached interfaces. Used to switch between the userspace XDP shim
-// and xdp_main_prog based on HA forwarding state.
+// SwapXDPEntryProg atomically replaces the XDP entry program on all attached
+// interfaces. Userspace mode keeps the userspace XDP shim attached for normal
+// operation and degraded compat/strict handling.
 func (m *Manager) SwapXDPEntryProg(name string) error {
 	prog, ok := m.programs[name]
 	if !ok {

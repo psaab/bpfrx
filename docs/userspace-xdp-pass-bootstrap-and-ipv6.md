@@ -14,17 +14,25 @@ After daemon restart on the userspace HA cluster (`loss:xpf-userspace-fw0/fw1`),
 
 ## Root Causes
 
-### 1. XDP Shim `fallback_to_main()` Tail-Call Silent Failure
+### 1. Historical XDP Shim Tail-Call Silent Failure
 
-The Rust eBPF XDP shim (`userspace-xdp/src/lib.rs`) uses `USERSPACE_FALLBACK_PROGS.tail_call()` to jump back to `xdp_main_prog` when the userspace dataplane can't handle a packet. **This tail call always silently fails** in aya-ebpf, despite the prog array being correctly populated (verified via `bpftool map dump`).
+At the time of this investigation, the Rust eBPF XDP shim
+(`userspace-xdp/src/lib.rs`) used `USERSPACE_FALLBACK_PROGS.tail_call()` to
+jump back to `xdp_main_prog` when the userspace dataplane could not handle a
+packet. **This tail call always silently failed** in aya-ebpf, despite the prog
+array being correctly populated (verified via `bpftool map dump`).
+
+Issue #1473 removed this runtime dependency: the retained userspace shim now
+uses explicit kernel pass-through for compat degraded paths and fail-closed
+drop behavior for strict degraded paths.
 
 When the tail call failed, the function fell through to `return Ok(xdp_action::XDP_DROP)`, silently dropping all fallback packets. This affected three code paths:
 
 | Path | Trigger | Old Behavior | New Behavior |
 |------|---------|-------------|-------------|
-| `fallback_to_main()` | Heartbeat missing/stale, early filter | `XDP_DROP` | `XDP_PASS` |
+| Historical tail-call fallback | Heartbeat missing/stale, early filter | `XDP_DROP` | `XDP_PASS` |
 | Binding not ready | VLAN sub-interface without XSK binding | `XDP_DROP` | `XDP_PASS` |
-| Heartbeat stale | Timeout exceeded | `XDP_DROP` | `XDP_PASS` (via `fallback_to_main`) |
+| Heartbeat stale | Timeout exceeded | `XDP_DROP` | `XDP_PASS` |
 
 **Impact:** Every packet that should have fallen back to the eBPF pipeline was silently dropped. During startup bootstrap, this meant zero forwarding.
 
@@ -120,7 +128,10 @@ incus exec loss:cluster-userspace-host -- iperf3 -c 2001:559:8585:80::200 -P 8 -
 
 ## Remaining Known Issues
 
-1. **aya-ebpf tail-call bug:** `USERSPACE_FALLBACK_PROGS.tail_call()` always fails silently despite correct map setup. The `XDP_PASS` workaround bypasses the eBPF firewall during bootstrap. Fixing the tail call would allow full pipeline processing during bootstrap.
+1. **Retired tail-call dependency:** #1473 removed
+   `USERSPACE_FALLBACK_PROGS.tail_call()` from the userspace shim. Compat
+   degraded paths now use explicit kernel pass-through; strict degraded paths
+   fail closed.
 
 2. **XSK RQ bootstrap timing:** Quiet queues (no background traffic) may never bootstrap and remain on `XDP_PASS` indefinitely. Under load (iperf3), all queues bootstrap within milliseconds. For ping-only traffic, some queues may stay on kernel forwarding.
 

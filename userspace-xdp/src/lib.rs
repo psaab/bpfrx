@@ -5,7 +5,7 @@ use aya_ebpf::{
     bindings::{xdp_action, xdp_md},
     helpers::r#gen::{bpf_get_smp_processor_id, bpf_ktime_get_ns, bpf_xdp_adjust_meta},
     macros::{map, xdp},
-    maps::{Array, CpuMap, HashMap, ProgramArray, XskMap},
+    maps::{Array, CpuMap, HashMap, XskMap},
     programs::XdpContext,
 };
 use core::mem;
@@ -13,7 +13,6 @@ use core::mem;
 const USERSPACE_META_MAGIC: u32 = 0x4250_5553;
 const USERSPACE_META_VERSION: u16 = 4;
 const USERSPACE_BINDING_READY: u32 = 1;
-const USERSPACE_FALLBACK_MAIN: u32 = 0;
 const USERSPACE_DEFAULT_HEARTBEAT_TIMEOUT_MS: u32 = 5000;
 const ETH_P_8021Q: u16 = 0x8100;
 const ETH_P_8021AD: u16 = 0x88a8;
@@ -315,9 +314,6 @@ static USERSPACE_SESSIONS: HashMap<UserspaceSessionKey, u8> = HashMap::with_max_
 const USERSPACE_SESSION_ACTION_REDIRECT: u8 = 1;
 const USERSPACE_SESSION_ACTION_PASS_TO_KERNEL: u8 = 2;
 
-#[map(name = "userspace_fallback_progs")]
-static USERSPACE_FALLBACK_PROGS: ProgramArray = ProgramArray::with_max_entries(1, 0);
-
 #[map(name = "userspace_fallback_stats")]
 static USERSPACE_FALLBACK_STATS: Array<u64> =
     Array::with_max_entries(USERSPACE_FALLBACK_REASON_MAX, 0);
@@ -342,9 +338,9 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         // In strict mode, drop transit even when ctrl is disabled (fail-closed).
         // This prevents XSK liveness failure from silently routing through eBPF.
         if is_strict_mode(ctrl) {
-            return strict_drop_or_fallback(ctx, ctrl, USERSPACE_FALLBACK_REASON_CTRL_DISABLED);
+            return strict_drop_or_compat_pass(ctrl, USERSPACE_FALLBACK_REASON_CTRL_DISABLED);
         }
-        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_CTRL_DISABLED);
+        return compat_pass_to_kernel(USERSPACE_FALLBACK_REASON_CTRL_DISABLED);
     }
 
     let data = ctx.data();
@@ -365,13 +361,11 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         _ => return Ok(xdp_action::XDP_PASS),
     };
     let Some(parsed) = parsed else {
-        return strict_drop_or_fallback(ctx, ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL);
+        return strict_drop_or_compat_pass(ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL);
     };
 
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
-    if unsafe { USERSPACE_INGRESS_IFACES.get(&ingress_ifindex) }
-        .map_or(true, |v| *v == 0)
-    {
+    if unsafe { USERSPACE_INGRESS_IFACES.get(&ingress_ifindex) }.map_or(true, |v| *v == 0) {
         return Ok(cpumap_or_pass(ctrl));
     }
     let native_gre =
@@ -450,11 +444,11 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING,
             &parsed,
         );
-        // Fall back to eBPF pipeline instead of dropping. This lets
-        // the kernel forward the packet AND generates a hardware RX
-        // event that bootstraps the XSK fill ring for this queue.
-        // In strict mode, drop instead of escaping to eBPF/kernel.
-        return strict_drop_or_fallback(ctx, ctrl, USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING);
+        // Compat mode passes to the kernel instead of dropping. This lets
+        // the kernel forward the packet AND generates a hardware RX event
+        // that bootstraps the XSK fill ring for this queue. Strict mode
+        // drops instead of escaping to kernel forwarding.
+        return strict_drop_or_compat_pass(ctrl, USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING);
     };
     let timeout_ms = if ctrl.heartbeat_timeout_ms == 0 {
         USERSPACE_DEFAULT_HEARTBEAT_TIMEOUT_MS
@@ -474,18 +468,16 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE,
             &parsed,
         );
-        // Fall back to eBPF pipeline instead of dropping — same rationale
-        // as heartbeat-missing: let kernel forward + bootstrap fill ring.
-        // In strict mode, drop instead of escaping to eBPF/kernel.
-        return strict_drop_or_fallback(ctx, ctrl, USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE);
+        // Compat mode passes to the kernel instead of dropping; same
+        // rationale as heartbeat-missing: let kernel forward and bootstrap
+        // the fill ring. Strict mode drops instead of escaping to kernel
+        // forwarding.
+        return strict_drop_or_compat_pass(ctrl, USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE);
     }
 
     let packet_len = data_end.saturating_sub(data);
     // ESP still relies on the kernel XFRM path. Use cpumap_or_pass
-    // instead of fallback_to_main — the tail-call can fail silently
-    // during early boot when the prog-array isn't populated, which
-    // would drop ESP/IKE packets. cpumap_or_pass delivers to the
-    // kernel stack reliably.
+    // directly. cpumap_or_pass delivers to the kernel stack reliably.
     if parsed.protocol == PROTO_ESP {
         return Ok(cpumap_or_pass(ctrl));
     }
@@ -504,7 +496,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             USERSPACE_FALLBACK_REASON_EARLY_FILTER,
             &parsed,
         );
-        return strict_drop_or_fallback(ctx, ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
+        return strict_drop_or_compat_pass(ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
     }
     // ICMPv6 NDP messages (NS/NA/RS/RA/Redirect, types 133-137) are
     // link-local control plane — always pass directly to kernel so it
@@ -602,12 +594,12 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
     let adjust_rc = unsafe { bpf_xdp_adjust_meta(ctx.ctx as *mut xdp_md, -meta_len) };
     if adjust_rc != 0 {
-        return strict_drop_or_fallback(ctx, ctrl, USERSPACE_FALLBACK_REASON_ADJUST_META);
+        return strict_drop_or_compat_pass(ctrl, USERSPACE_FALLBACK_REASON_ADJUST_META);
     }
 
     let meta_ptr = ctx.metadata() as *mut UserspaceDpMeta;
     if (meta_ptr as usize).saturating_add(mem::size_of::<UserspaceDpMeta>()) > ctx.metadata_end() {
-        return strict_drop_or_fallback(ctx, ctrl, USERSPACE_FALLBACK_REASON_META_BOUNDS);
+        return strict_drop_or_compat_pass(ctrl, USERSPACE_FALLBACK_REASON_META_BOUNDS);
     }
 
     unsafe {
@@ -670,7 +662,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                 incr_fallback_stat(USERSPACE_FALLBACK_REASON_REDIRECT_ERR);
                 return Ok(xdp_action::XDP_DROP);
             }
-            strict_drop_or_fallback(ctx, ctrl, USERSPACE_FALLBACK_REASON_REDIRECT_ERR)
+            strict_drop_or_compat_pass(ctrl, USERSPACE_FALLBACK_REASON_REDIRECT_ERR)
         }
     }
 }
@@ -885,19 +877,17 @@ fn classify_native_gre_inner_ipv6(data: usize, data_end: usize, l3_offset: usize
     0
 }
 
-fn fallback_to_main(ctx: &XdpContext, ctrl: &UserspaceCtrl, reason: u32) -> Result<u32, i64> {
+fn compat_pass_to_kernel(reason: u32) -> Result<u32, i64> {
     incr_fallback_stat(reason);
-    // Try tail-call to the main eBPF pipeline for full firewall processing.
-    unsafe {
-        let _ = USERSPACE_FALLBACK_PROGS.tail_call(ctx, USERSPACE_FALLBACK_MAIN);
-    }
-    // Tail call failed (known aya-ebpf issue). Use XDP_PASS to deliver to
-    // the kernel stack for forwarding. Although cpumap is generally preferred
-    // in zero-copy mode, cpumap adds ~40% overhead for bulk transit traffic
-    // (cross-CPU re-queue + full stack processing). XDP_PASS stays on the
-    // same CPU and lets the kernel forward directly. The UMEM frame is
-    // safely handled: mlx5 copies the data to an SKB on XDP_PASS and
-    // recycles the zero-copy buffer.
+    // Compat mode no longer tail-calls into xdp_main_prog. Degraded
+    // userspace-shim paths pass to the kernel explicitly; strict mode
+    // uses strict_drop_or_compat_pass() to fail closed instead.
+    //
+    // Although cpumap is generally preferred in zero-copy mode, cpumap
+    // adds significant overhead for bulk transit traffic (cross-CPU
+    // re-queue + full stack processing). XDP_PASS stays on the same CPU
+    // and lets the kernel forward directly. The UMEM frame is safely
+    // handled by mlx5 via SKB copy on XDP_PASS before recycling.
     Ok(xdp_action::XDP_PASS)
 }
 
@@ -907,16 +897,16 @@ fn is_strict_mode(ctrl: &UserspaceCtrl) -> bool {
 }
 
 /// In strict mode, drop transit packets that would otherwise escape to the
-/// eBPF pipeline or kernel forwarding path. Increments both the original
-/// reason counter and the STRICT_DROP counter for observability.
-/// In compat (non-strict) mode, falls back to the main eBPF pipeline.
-fn strict_drop_or_fallback(ctx: &XdpContext, ctrl: &UserspaceCtrl, reason: u32) -> Result<u32, i64> {
+/// kernel forwarding path. Increments both the original reason counter and
+/// the STRICT_DROP counter for observability. In compat mode, pass directly
+/// to the kernel without requiring xdp_main_prog.
+fn strict_drop_or_compat_pass(ctrl: &UserspaceCtrl, reason: u32) -> Result<u32, i64> {
     if is_strict_mode(ctrl) {
         incr_fallback_stat(reason);
         incr_fallback_stat(USERSPACE_FALLBACK_REASON_STRICT_DROP);
         Ok(xdp_action::XDP_DROP)
     } else {
-        fallback_to_main(ctx, ctrl, reason)
+        compat_pass_to_kernel(reason)
     }
 }
 
@@ -971,9 +961,7 @@ fn record_trace(
     // Keep the key in u32 for the BPF map, but avoid overlapping the two port
     // fields directly. Mix each component into a separate avalanche step so
     // distinct (src_port, dst_port) pairs do not alias trivially.
-    let trace_key = ingress_ifindex
-        .wrapping_mul(0x9e37_79b1)
-        .rotate_left(5)
+    let trace_key = ingress_ifindex.wrapping_mul(0x9e37_79b1).rotate_left(5)
         ^ ((((parsed.protocol as u32) << 16) | (parsed.flow_src_port as u32))
             .wrapping_mul(0x85eb_ca6b))
         ^ ((parsed.flow_dst_port as u32).wrapping_mul(0xc2b2_ae35));
@@ -1219,9 +1207,7 @@ fn is_icmp_to_interface_nat_local(pkt: &ParsedPacket) -> bool {
             unsafe { USERSPACE_INTERFACE_NAT_V4.get(&pkt.dst_v4) }.is_some()
         }
         AF_INET6 => {
-            if pkt.protocol != PROTO_ICMPV6
-                || (pkt.icmp_type != 128 && pkt.icmp_type != 129)
-            {
+            if pkt.protocol != PROTO_ICMPV6 || (pkt.icmp_type != 128 && pkt.icmp_type != 129) {
                 return false;
             }
             unsafe { USERSPACE_INTERFACE_NAT_V6.get(&UserspaceLocalV6Key { addr: pkt.dst_addr }) }
@@ -1240,10 +1226,7 @@ fn is_interface_nat_destination(pkt: &ParsedPacket) -> bool {
     {
         return false;
     }
-    if pkt.protocol == PROTO_ICMPV6
-        && pkt.icmp_type >= 1
-        && pkt.icmp_type <= 4
-    {
+    if pkt.protocol == PROTO_ICMPV6 && pkt.icmp_type >= 1 && pkt.icmp_type <= 4 {
         return false;
     }
     match pkt.addr_family {

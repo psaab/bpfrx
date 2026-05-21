@@ -37,10 +37,12 @@ const persistentSourceNATHAUnsupportedReason = "userspace persistent-nat source 
 type DataplaneMode int
 
 const (
-	ModeEBPFOnly        DataplaneMode = iota // Pure eBPF pipeline, no userspace
-	ModeUserspaceCompat                      // Userspace preferred, eBPF/kernel fallback allowed
+	ModeEBPFOnly        DataplaneMode = iota // Fallback-only, no userspace forwarding
+	ModeUserspaceCompat                      // Userspace preferred, kernel pass-through fallback allowed
 	ModeUserspaceStrict                      // Strict userspace only, no transit fallback
 )
+
+const userspaceXDPEntryProg = "xdp_userspace_prog"
 
 func (m DataplaneMode) String() string {
 	switch m {
@@ -155,7 +157,7 @@ func shouldAttemptRSTSuppression(
 
 func New() *Manager {
 	bpfShim := dataplane.New()
-	bpfShim.XDPEntryProg = "xdp_main_prog"
+	bpfShim.XDPEntryProg = userspaceXDPEntryProg
 	return &Manager{
 		bpfShim:        bpfShim,
 		configuredMode: ModeUserspaceCompat,
@@ -488,18 +490,12 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	}
 	caps := deriveUserspaceCapabilities(cfg)
 	_ = caps // used below for helper config
-	// Use the shim when forwarding is supported. The shim redirects to
-	// XSK when ctrl=1; when ctrl=0 it falls through to XDP_PASS which
-	// delivers to the kernel at the same throughput as xdp_main_prog.
-	// XSK socket creation is deferred by the arm delay (45s) to avoid
-	// segfaults from __xsk_setup_xdp_prog during link cycles.
-	if m.xskLivenessFailed {
-		m.bpfShim.XDPEntryProg = "xdp_main_prog"
-	} else if caps.ForwardingSupported {
-		m.bpfShim.XDPEntryProg = "xdp_userspace_prog"
-	} else {
-		m.bpfShim.XDPEntryProg = "xdp_main_prog"
-	}
+	// Userspace mode always attaches the retained XDP shim. The shim
+	// redirects to XSK when ctrl=1; when ctrl=0 compat mode passes to the
+	// kernel and strict mode drops. Do not swap to xdp_main_prog for
+	// unsupported capabilities or failed XSK liveness: the userspace runtime
+	// must not require the legacy main XDP pipeline.
+	m.bpfShim.XDPEntryProg = userspaceXDPEntryProg
 	result, err := m.bpfShim.Compile(cfg)
 	if err != nil {
 		return nil, err

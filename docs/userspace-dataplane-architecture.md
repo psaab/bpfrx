@@ -94,13 +94,14 @@ Packet arrives at NIC
   ├─ Non-IP (ARP, etc.) ──────────────────► cpumap → kernel stack
   ├─ Multicast / broadcast ────────────────► cpumap → kernel stack
   ├─ Local destination ────────────────────► cpumap → kernel stack
-  ├─ GRE / ESP / explicit fallback cases ──► tail-call → legacy XDP pipeline
+  ├─ GRE / ESP / degraded compat cases ────► kernel pass-through
+  ├─ Strict degraded cases ────────────────► XDP_DROP
   │
   ├─ Has active session in BPF map? ───YES─► XDP_REDIRECT → XSK socket
   │
   ├─ Session miss but still transit traffic ─► XDP_REDIRECT → XSK socket
   │
-  └─ Binding/heartbeat failure on DP-managed interface ─► DROP or explicit fallback
+  └─ Binding/heartbeat failure on DP-managed interface ─► compat pass or strict drop
 ```
 
 **Key design decisions:**
@@ -117,8 +118,9 @@ Packet arrives at NIC
 
 - **Fail closed on dead bindings**: if a binding is missing, not ready, or
   its heartbeat is stale on a userspace-managed interface, the shim drops
-  rather than blindly passing packets into the kernel path and creating
-  spurious RST/black-hole behavior.
+  in strict mode. Compat mode uses explicit kernel pass-through for degraded
+  helper/XSK states and does not require the legacy `xdp_main_prog` fallback
+  path.
 
 - **Heartbeat watchdog**: Each worker writes a timestamp to a BPF array
   map every 250ms. The shim checks freshness (5s timeout) and refuses

@@ -30,11 +30,12 @@ and close blockers tracked in
 
 A Rust-based forwarding engine receives packets via AF_XDP sockets and
 processes them in userspace. A Rust XDP shim stamps metadata, redirects transit
-traffic into AF_XDP, and still hands kernel-owned or unsupported traffic back
-to the kernel or legacy BPF path when needed.
+traffic into AF_XDP, and still hands kernel-owned or degraded compat-mode
+traffic back to the kernel when needed. Strict userspace mode fails closed
+instead of using a transit fallback.
 
 ```
-NIC → XDP shim (live-session + new-flow redirect, kernel pass-through, explicit fallback)
+NIC → XDP shim (live-session + new-flow redirect, kernel pass-through, strict drop)
     → AF_XDP socket
     → Rust worker thread (session → policy → NAT → FIB → TX)
     → AF_XDP TX ring → NIC
@@ -45,6 +46,9 @@ NIC → XDP shim (live-session + new-flow redirect, kernel pass-through, explici
 - **Kernel pass-through**: cpumap-assisted delivery keeps local/kernel-owned traffic out of the AF_XDP fast path
 - **Fail-closed admission**: unsupported userspace configs should be gated or
   fail closed rather than silently falling back to legacy eBPF
+- **Compat degraded mode**: when helper/XSK forwarding is unavailable, the shim
+  keeps `xdp_main_prog` out of the userspace runtime path; compat mode uses
+  kernel pass-through and strict mode drops
 - **Best for**: new dataplane development, primary validation, and high-throughput transit forwarding on supported configs
 - **See**: [`docs/userspace-dataplane-architecture.md`](docs/userspace-dataplane-architecture.md) for the current architecture and [`docs/userspace-debug-map.md`](docs/userspace-debug-map.md) for the active debugging map
 

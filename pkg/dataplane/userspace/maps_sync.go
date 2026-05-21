@@ -74,14 +74,6 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	if heartbeatMap == nil {
 		return errors.New("userspace_heartbeat map not loaded")
 	}
-	fallbackMap := m.bpfShim.Map("userspace_fallback_progs")
-	if fallbackMap == nil {
-		return errors.New("userspace_fallback_progs map not loaded")
-	}
-	fallbackProg := m.bpfShim.Program("xdp_main_prog")
-	if fallbackProg == nil {
-		return errors.New("xdp_main_prog not loaded")
-	}
 
 	// Populate userspace_cpumap so the XDP shim can use cpumap redirect
 	// instead of XDP_PASS (required for zero-copy AF_XDP).
@@ -107,10 +99,6 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	}
 	if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update userspace_ctrl: %w", err)
-	}
-	fallbackFD := uint32(fallbackProg.FD())
-	if err := fallbackMap.Update(zero, fallbackFD, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("update userspace_fallback_progs: %w", err)
 	}
 
 	// Bindings map is now an Array — zero previously-set indices.
@@ -215,9 +203,9 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// Delay ctrl enable until AFTER VIPs are configured in HA mode.
 		// The VRRP election + VIP add takes ~10-14s after restart.
 		// If we enable ctrl before VIPs, the XSK path gets packets but
-		// can't SNAT (no source address) → all transit dropped.  The
-		// eBPF pipeline (XDP_PASS fallback) handles traffic correctly
-		// during this window since the kernel has the same FIB state.
+		// can't SNAT (no source address) -> all transit dropped.  Compat
+		// shim pass-through handles traffic during this window since the
+		// kernel has the same FIB state.
 		//
 		// Also delay by 3s for fill ring bootstrap: mlx5 zero-copy
 		// needs NAPI to post fill ring WQEs, and NAPI only runs on
@@ -278,8 +266,8 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// XSK receive liveness: once bindings and neighbor state are ready,
 		// arm ctrl and explicitly probe the userspace shim. A working XSK
 		// path must show RX progress while ctrl=1 and the shim is active.
-		// Otherwise swap back to the eBPF pipeline instead of assuming
-		// the userspace AF_XDP path is healthy.
+		// Otherwise keep ctrl disabled and rely on the shim's compat
+		// pass-through or strict fail-closed behavior.
 		var currentRX uint64
 		for _, b := range status.Bindings {
 			currentRX += b.RXPackets
@@ -297,32 +285,30 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			"xskLivenessFailed", m.xskLivenessFailed,
 			"xdpEntryProg", m.bpfShim.XDPEntryProg)
 		if m.xskLivenessFailed {
-			// XSK proven broken — ctrl disabled.
-			// In compat mode, the entry program was already swapped to
-			// xdp_main_prog (eBPF pipeline). In strict mode the shim
-			// stays attached so packets drop rather than silently
-			// falling through to eBPF.
+			// XSK proven broken: ctrl stays disabled. Compat mode uses
+			// the shim's explicit kernel pass-through path; strict mode
+			// keeps the same shim attached and fails closed.
 			ctrl.Enabled = 0
 		} else if probeBindingsReady && neighborSyncReady {
 			ctrl.Enabled = 1
 			if m.xskLivenessProven {
-				if m.bpfShim.XDPEntryProg != "xdp_userspace_prog" {
-					if err := m.bpfShim.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+				if m.bpfShim.XDPEntryProg != userspaceXDPEntryProg {
+					if err := m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg); err != nil {
 						slog.Warn("userspace: failed to restore XDP shim after liveness success", "err", err)
 					}
 				}
 			} else if xskReceiveLive {
 				m.xskLivenessProven = true
 				m.xskProbeStart = time.Time{}
-				if m.bpfShim.XDPEntryProg != "xdp_userspace_prog" {
-					if err := m.bpfShim.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+				if m.bpfShim.XDPEntryProg != userspaceXDPEntryProg {
+					if err := m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg); err != nil {
 						slog.Warn("userspace: failed to swap XDP shim after XSK RX became live", "err", err)
 					}
 				}
 				slog.Info("userspace: XSK liveness proven")
 			} else {
-				if m.bpfShim.XDPEntryProg != "xdp_userspace_prog" {
-					if err := m.bpfShim.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+				if m.bpfShim.XDPEntryProg != userspaceXDPEntryProg {
+					if err := m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg); err != nil {
 						slog.Warn("userspace: failed to activate XDP shim for XSK liveness probe", "err", err)
 					}
 				}
@@ -333,8 +319,8 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 					if m.shouldAutoProveIdleStandbyXSKLocked(currentRX, allBindingsBound) {
 						m.xskLivenessProven = true
 						m.xskProbeStart = time.Time{}
-						if m.bpfShim.XDPEntryProg != "xdp_userspace_prog" {
-							if err := m.bpfShim.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+						if m.bpfShim.XDPEntryProg != userspaceXDPEntryProg {
+							if err := m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg); err != nil {
 								slog.Warn("userspace: failed to restore XDP shim after idle standby liveness success", "err", err)
 							}
 						}
@@ -349,17 +335,17 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 					m.xskProbeStart = time.Time{}
 					ctrl.Enabled = 0
 					if m.configuredMode == ModeUserspaceStrict {
-						// Strict mode: do NOT swap to xdp_main_prog.
-						// Keep the shim attached with ctrl=0 so packets
-						// hit the shim's ctrl-disabled fallback path and
-						// get counted, but never silently enter the eBPF
-						// pipeline. Log at error level — this is a
-						// degraded state that needs operator attention.
-						slog.Error("userspace: XSK liveness probe failed in strict mode — dataplane degraded, no eBPF fallback")
+						// Strict mode: keep the shim attached with ctrl=0
+						// so packets hit the fail-closed ctrl-disabled path.
+						// Log at error level because this degraded state
+						// needs operator attention.
+						slog.Error("userspace: XSK liveness probe failed in strict mode; dataplane degraded fail-closed")
 					} else {
-						slog.Warn("userspace: XSK liveness probe failed, falling back to eBPF pipeline")
-						if err := m.bpfShim.SwapXDPEntryProg("xdp_main_prog"); err != nil {
-							slog.Warn("userspace: failed to swap to eBPF pipeline after XSK liveness failure", "err", err)
+						slog.Warn("userspace: XSK liveness probe failed; keeping shim disabled for compat kernel pass-through")
+						if m.bpfShim.XDPEntryProg != userspaceXDPEntryProg {
+							if err := m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg); err != nil {
+								slog.Warn("userspace: failed to restore XDP shim after XSK liveness failure", "err", err)
+							}
 						}
 					}
 				}
@@ -367,7 +353,8 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt.Add(60*time.Second)) {
 			// Hard timeout fallback: allow ctrl even if readiness has not been
 			// fully proven yet. The XSK liveness probe still decides whether
-			// the userspace shim stays active or we fall back to xdp_main.
+			// the userspace shim starts redirecting or stays in compat
+			// kernel pass-through / strict fail-closed mode.
 			ctrl.Enabled = 1
 		} else {
 			ctrl.Enabled = 0
@@ -375,20 +362,19 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 	}
 ctrlReady:
 	// Flush stale BPF session entries when ctrl transitions from
-	// disabled to enabled. During ctrl-disabled, the eBPF pipeline
-	// creates PASS_TO_KERNEL entries in the userspace session map.
-	// These poison the XDP shim after ctrl enables — it sees the stale
-	// entry and bypasses XSK, routing packets to the eBPF pipeline
-	// instead of the userspace helper.
+	// disabled to enabled. Older legacy-fallback windows could create
+	// PASS_TO_KERNEL entries in the userspace session map. These poison
+	// the XDP shim after ctrl enables: it sees the stale entry and
+	// bypasses XSK instead of redirecting to the userspace helper.
 	//
-	// Also flush BPF conntrack sessions created by the eBPF pipeline
-	// during the ctrl-disabled window. These sessions interfere with
-	// the userspace pipeline via TC egress: when the Rust helper sends
-	// packets via XSK TX, TC egress finds the stale BPF conntrack
-	// entries and may apply conflicting NAT or update session state
-	// incorrectly. The userspace helper's own session table (Rust
-	// SessionTable + shared_sessions) holds the authoritative synced
-	// sessions — BPF conntrack must be empty when ctrl re-enables.
+	// Also flush BPF conntrack sessions left by earlier legacy-fallback
+	// windows. These sessions interfere with the userspace pipeline via
+	// TC egress: when the Rust helper sends packets via XSK TX, TC egress
+	// finds the stale BPF conntrack entries and may apply conflicting NAT
+	// or update session state incorrectly. The userspace helper's own
+	// session table (Rust SessionTable + shared_sessions) holds the
+	// authoritative synced sessions, so BPF conntrack must be empty when
+	// ctrl re-enables.
 	// Only flush stale BPF sessions on the very first ctrl enable after
 	// daemon startup. Snapshot generation is not a reliable proxy for
 	// "startup" on long-lived HA nodes because a steady appliance can stay
@@ -413,19 +399,18 @@ ctrlReady:
 					"deleted", deleted)
 			}
 		}
-		// Flush BPF conntrack sessions created by the eBPF pipeline
-		// during the ctrl-disabled transition window. Only delete
+		// Flush BPF conntrack sessions left by an earlier fallback
+		// transition window. Only delete
 		// sessions whose Created timestamp is AFTER ctrlDisabledAt —
 		// synced sessions from the cluster peer have earlier timestamps
 		// and must survive for HA failover continuity.
 		//
-		// Why this is needed (issue #334): when ctrl=0 (startup, XSK
-		// liveness probe, link cycle), the eBPF pipeline creates
-		// conntrack entries in the BPF sessions map. When ctrl
-		// re-enables, TC egress finds these stale BPF entries and
-		// may apply conflicting NAT or update session state
-		// incorrectly — the userspace helper's own session table
-		// (Rust SessionTable + shared_sessions) is authoritative.
+		// Why this is needed (issue #334): a previous legacy fallback
+		// can leave conntrack entries in the BPF sessions map. When
+		// ctrl re-enables, TC egress finds these stale BPF entries and
+		// may apply conflicting NAT or update session state incorrectly;
+		// the userspace helper's own session table (Rust SessionTable +
+		// shared_sessions) is authoritative.
 		//
 		// session_value layout: State[1]+Flags[1]+TCPState[1]+
 		// IsReverse[1]+AppTimeout[4]+SessionID[8]+Created[8].

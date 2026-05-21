@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"runtime"
 	"unsafe"
 
@@ -203,8 +202,8 @@ func (m *Manager) loadAllObjects() error {
 		},
 	}
 
-	// Load the Rust userspace XDP entry program. It owns only the AF_XDP
-	// control maps and a fallback prog-array that jumps into xdp_main.
+	// Load the Rust userspace XDP entry program. It owns the AF_XDP
+	// control maps and explicit compat/strict degraded-mode handling.
 	userspaceSpec, err := loadRustUserspaceXDP()
 	if err != nil {
 		return fmt.Errorf("load Rust xdp_userspace spec: %w", err)
@@ -239,7 +238,6 @@ func (m *Manager) loadAllObjects() error {
 		"userspace_xsk_map",
 		"userspace_local_v4",
 		"userspace_local_v6",
-		"userspace_fallback_progs",
 		"userspace_interface_nat_v4",
 		"userspace_interface_nat_v6",
 		"userspace_sessions",
@@ -287,10 +285,6 @@ func (m *Manager) loadAllObjects() error {
 	if !ok {
 		return fmt.Errorf("Rust userspace_local_v6 map not found")
 	}
-	userspaceFallback, ok := userspaceCollection.Maps["userspace_fallback_progs"]
-	if !ok {
-		return fmt.Errorf("Rust userspace_fallback_progs map not found")
-	}
 	for _, pin := range []struct {
 		name string
 		m    *ebpf.Map
@@ -303,7 +297,6 @@ func (m *Manager) loadAllObjects() error {
 		{name: "userspace_xsk_map", m: userspaceXSK, path: UserspaceXSKMapPinPath()},
 		{name: "userspace_local_v4", m: userspaceLocalV4, path: UserspaceLocalV4PinPath()},
 		{name: "userspace_local_v6", m: userspaceLocalV6, path: UserspaceLocalV6PinPath()},
-		{name: "userspace_fallback_progs", m: userspaceFallback, path: filepath.Join(bpfPinPath, "userspace_fallback_progs")},
 	} {
 		if err := ensureUserspaceMapPinned(pin.name, pin.m, pin.path); err != nil {
 			return err
