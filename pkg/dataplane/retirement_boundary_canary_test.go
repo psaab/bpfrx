@@ -1,0 +1,289 @@
+package dataplane
+
+import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+)
+
+const (
+	repoRootForBoundaryCanary       = "../.."
+	rootDataplaneImportForCanary    = "github.com/psaab/xpf/pkg/dataplane"
+	ciliumEBPFImportForCanary       = "github.com/cilium/ebpf"
+	dpdkBackendImportForCanary      = "github.com/psaab/xpf/pkg/dataplane/dpdk"
+	retirementBoundaryDocsForCanary = "../../docs/pr/1373-retire-ebpf-dataplane/README.md"
+)
+
+var operatorRuntimeBoundaryRoots = []string{
+	"../../cmd/cli",
+	"../../cmd/xpfd",
+	"../api",
+	"../cli",
+	"../cluster",
+	"../conntrack",
+	"../daemon",
+	"../fwdstatus",
+	"../grpcapi",
+	"../logging",
+	"../monitoriface",
+}
+
+var legacyDataplaneImportAllowlist = map[string]string{
+	"cmd/xpfd/main.go":                         "backend selection, cleanup, and backend registration",
+	"pkg/api/handlers.go":                      "REST handlers still receive the legacy dataplane bridge",
+	"pkg/api/handlers_sessions.go":             "REST session reads still use legacy session types",
+	"pkg/api/metrics.go":                       "Prometheus telemetry still reads legacy counters and metadata",
+	"pkg/api/server.go":                        "REST server constructor still stores the legacy bridge",
+	"pkg/cli/cli.go":                           "embedded CLI constructor still stores the legacy bridge",
+	"pkg/cli/cli_clear.go":                     "clear commands still delete legacy session entries",
+	"pkg/cli/cli_show_cluster.go":              "cluster display still reads legacy dataplane state",
+	"pkg/cli/cli_show_flow.go":                 "flow display still uses legacy session keys and values",
+	"pkg/cli/cli_show_nat.go":                  "NAT display still uses legacy NAT/session metadata",
+	"pkg/cli/cli_show_security.go":             "security display still uses legacy counters and filter types",
+	"pkg/cluster/sync.go":                      "session sync still installs sessions through the legacy bridge",
+	"pkg/cluster/sync_bulk.go":                 "bulk sync still serializes legacy session entries",
+	"pkg/cluster/sync_conn.go":                 "sync connection code still references legacy session types",
+	"pkg/cluster/sync_protocol.go":             "wire protocol still carries legacy session records",
+	"pkg/conntrack/gc.go":                      "GC compatibility constructor still adapts legacy sessions",
+	"pkg/daemon/daemon.go":                     "daemon owns RuntimeDataPlane and exposes legacyDP for unmigrated callers",
+	"pkg/daemon/daemon_apply.go":               "apply path still adapts legacy compile/apply metadata",
+	"pkg/daemon/daemon_flow.go":                "flow logging still formats legacy dataplane counters",
+	"pkg/daemon/daemon_ha.go":                  "HA state updates still call legacy bridge methods",
+	"pkg/daemon/daemon_ha_fabric.go":           "fabric HA updates still call legacy bridge methods",
+	"pkg/daemon/daemon_ha_userspace.go":        "userspace HA control still crosses the legacy bridge",
+	"pkg/daemon/daemon_run.go":                 "runtime wiring still passes legacyDP to unmigrated services",
+	"pkg/fwdstatus/builder.go":                 "forwarding status still reads legacy map stats",
+	"pkg/grpcapi/apply_result.go":              "gRPC apply metadata still adapts legacy apply results",
+	"pkg/grpcapi/server.go":                    "gRPC server constructor still stores the legacy bridge",
+	"pkg/grpcapi/server_helpers.go":            "gRPC helpers still format legacy dataplane types",
+	"pkg/grpcapi/server_nat.go":                "gRPC NAT output still reads legacy NAT/session metadata",
+	"pkg/grpcapi/server_sessions.go":           "gRPC session RPCs still use legacy session types",
+	"pkg/grpcapi/server_show.go":               "gRPC show dispatcher still reaches legacy dataplane state",
+	"pkg/grpcapi/server_show_cluster_text.go":  "cluster text output still reads legacy dataplane state",
+	"pkg/grpcapi/server_show_flow.go":          "flow text output still uses legacy session keys and values",
+	"pkg/grpcapi/server_show_nat.go":           "NAT text output still uses legacy NAT/session metadata",
+	"pkg/grpcapi/server_show_policies_text.go": "policy text output still uses legacy counters",
+	"pkg/grpcapi/server_show_security_text.go": "security text output still uses legacy counters and filter types",
+	"pkg/grpcapi/server_show_status.go":        "status output still reads legacy dataplane state",
+	"pkg/grpcapi/server_show_zones.go":         "zone output still uses legacy dataplane types",
+	"pkg/logging/ringbuf.go":                   "event reader still consumes the legacy EventSource",
+	"pkg/monitoriface/monitor.go":              "interface monitor still reads legacy interface counters",
+}
+
+func TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports(t *testing.T) {
+	t.Parallel()
+
+	found := map[string]bool{}
+	var unexpected []string
+	for _, path := range productionGoFilesUnder(t, operatorRuntimeBoundaryRoots) {
+		for _, imp := range importPaths(t, path) {
+			if imp != rootDataplaneImportForCanary {
+				continue
+			}
+			rel := repoRelativePath(t, path)
+			found[rel] = true
+			if _, ok := legacyDataplaneImportAllowlist[rel]; !ok {
+				unexpected = append(unexpected, rel)
+			}
+		}
+	}
+
+	var stale []string
+	for rel := range legacyDataplaneImportAllowlist {
+		if !found[rel] {
+			stale = append(stale, rel)
+		}
+	}
+
+	if len(unexpected) > 0 || len(stale) > 0 {
+		sort.Strings(unexpected)
+		sort.Strings(stale)
+		t.Fatalf(
+			"legacy pkg/dataplane import allowlist drift\nunexpected imports: %v\nstale allowlist entries: %v\nupdate the #1451 runtime-boundary docs with any intentional change",
+			unexpected,
+			stale,
+		)
+	}
+}
+
+func TestOperatorPackagesDoNotImportBPFArtifactsDirectly(t *testing.T) {
+	t.Parallel()
+
+	var violations []string
+	for _, path := range productionGoFilesUnder(t, operatorRuntimeBoundaryRoots) {
+		rel := repoRelativePath(t, path)
+		for _, imp := range importPaths(t, path) {
+			if imp == ciliumEBPFImportForCanary || strings.HasPrefix(imp, ciliumEBPFImportForCanary+"/") {
+				violations = append(violations, rel+" imports "+imp)
+			}
+			if imp == dpdkBackendImportForCanary || strings.HasPrefix(imp, dpdkBackendImportForCanary+"/") {
+				if rel != "cmd/xpfd/main.go" {
+					violations = append(violations, rel+" imports "+imp)
+				}
+			}
+		}
+	}
+
+	if len(violations) > 0 {
+		sort.Strings(violations)
+		t.Fatalf("operator packages must stay behind RuntimeDataPlane/BPF artifact boundaries: %v", violations)
+	}
+}
+
+func TestDaemonRuntimeEntryPointUsesRuntimeDataPlane(t *testing.T) {
+	t.Parallel()
+
+	assertDaemonDPFieldIsRuntimeDataPlane(t)
+
+	data, err := os.ReadFile(filepath.Join("..", "daemon", "daemon_run.go"))
+	if err != nil {
+		t.Fatalf("read daemon_run.go: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, "dataplane.NewDataPlane(") {
+		t.Fatal("daemon runtime startup must call NewRuntimeDataPlane, not NewDataPlane")
+	}
+	if !strings.Contains(text, "dataplane.NewRuntimeDataPlane(") {
+		t.Fatal("daemon runtime startup no longer calls dataplane.NewRuntimeDataPlane")
+	}
+}
+
+func TestRetirementBoundaryDocsMentionLegacyImportAllowlist(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(retirementBoundaryDocsForCanary)
+	if err != nil {
+		t.Fatalf("read retirement boundary docs: %v", err)
+	}
+	text := string(data)
+
+	var missing []string
+	for rel := range legacyDataplaneImportAllowlist {
+		if !strings.Contains(text, rel) {
+			missing = append(missing, rel)
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Fatalf("retirement docs do not mention allowlisted legacy imports: %v", missing)
+	}
+}
+
+func productionGoFilesUnder(t *testing.T, roots []string) []string {
+	t.Helper()
+
+	var files []string
+	for _, root := range roots {
+		err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				if d.Name() == "testdata" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			files = append(files, path)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk %s: %v", root, err)
+		}
+	}
+	sort.Strings(files)
+	return files
+}
+
+func importPaths(t *testing.T, path string) []string {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+	if err != nil {
+		t.Fatalf("parse imports for %s: %v", path, err)
+	}
+
+	imports := make([]string, 0, len(file.Imports))
+	for _, imp := range file.Imports {
+		imports = append(imports, strings.Trim(imp.Path.Value, `"`))
+	}
+	return imports
+}
+
+func repoRelativePath(t *testing.T, path string) string {
+	t.Helper()
+
+	root, err := filepath.Abs(repoRootForBoundaryCanary)
+	if err != nil {
+		t.Fatalf("abs repo root: %v", err)
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatalf("abs path for %s: %v", path, err)
+	}
+	rel, err := filepath.Rel(root, absPath)
+	if err != nil {
+		t.Fatalf("rel path for %s: %v", path, err)
+	}
+	return filepath.ToSlash(rel)
+}
+
+func assertDaemonDPFieldIsRuntimeDataPlane(t *testing.T) {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, filepath.Join("..", "daemon", "daemon.go"), nil, 0)
+	if err != nil {
+		t.Fatalf("parse daemon.go: %v", err)
+	}
+
+	var found bool
+	ast.Inspect(file, func(n ast.Node) bool {
+		typeSpec, ok := n.(*ast.TypeSpec)
+		if !ok || typeSpec.Name.Name != "Daemon" {
+			return true
+		}
+		st, ok := typeSpec.Type.(*ast.StructType)
+		if !ok {
+			t.Fatalf("Daemon is %T, want struct", typeSpec.Type)
+		}
+		for _, field := range st.Fields.List {
+			for _, name := range field.Names {
+				if name.Name != "dp" {
+					continue
+				}
+				found = true
+				if got := canaryExprString(field.Type); got != "dataplane.RuntimeDataPlane" {
+					t.Fatalf("Daemon.dp = %s, want dataplane.RuntimeDataPlane", got)
+				}
+			}
+		}
+		return false
+	})
+
+	if !found {
+		t.Fatal("Daemon.dp field not found")
+	}
+}
+
+func canaryExprString(expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e.Name
+	case *ast.SelectorExpr:
+		return canaryExprString(e.X) + "." + e.Sel.Name
+	case *ast.StarExpr:
+		return "*" + canaryExprString(e.X)
+	default:
+		return ""
+	}
+}
