@@ -108,6 +108,12 @@ algorithm version and would require explicit migration tests.
 
 ## Cross-Backend Compatibility Boundary
 
+#1450 is closed by choosing a backend-specific selector contract, not by
+standardizing the retained backends in this slice. Operators should treat
+AF_XDP userspace `address-persistent` pool selection as deterministic only
+while new allocations stay on the AF_XDP userspace backend and the pool shape
+is unchanged.
+
 The retained backends do not share an address-persistent selector today:
 
 - legacy eBPF IPv4 uses the packet-order `src_ip` word modulo the IPv4 pool
@@ -132,6 +138,11 @@ Phase 4 eBPF source removal must not use a mixed-backend rollback test that
 expects newly allocated userspace flows to match legacy eBPF/DPDK
 address-persistent pool choices unless a later PR standardizes a shared
 algorithm for all retained backends.
+
+Operationally, backend rollback is expected to preserve already-synced active
+sessions by carrying their translated tuple in session state. It is allowed to
+remap later new flows from the same client source IP to a different pool
+address after the backend changes.
 
 ## Persistent NAT Boundary
 
@@ -300,7 +311,8 @@ Covered by #1385 and this closeout:
   ranges, wrong-family-only pools, or allocation failures fail closed at all
   four `poll_descriptor.rs` source-NAT call sites instead of becoming an
   untranslated forward.
-- Cargo: userspace-v1 fixtures pin IPv4/IPv6 sticky hash outputs.
+- Cargo: userspace-v1 fixtures pin IPv4/IPv6 sticky hash outputs and selected
+  pool addresses through the source-NAT rule path.
 - Cargo: one source keeps one pool address across repeated allocations.
 - Cargo: many sources spread across the pool and do not collapse to a single
   address.
