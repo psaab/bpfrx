@@ -573,7 +573,6 @@ pub(super) fn poll_binding_process_descriptor(
                                     });
                                 }
                             }
-                            binding.scratch.scratch_recycle.push(desc.addr);
                             continue;
                         }
                         meta = new_meta;

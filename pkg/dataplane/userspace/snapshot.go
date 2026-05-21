@@ -2417,11 +2417,15 @@ func buildWireGuardSnapshot(cfg *config.Config) map[string]WireGuardInterfaceSna
 	out := make(map[string]WireGuardInterfaceSnapshot)
 	for name, ifc := range cfg.Interfaces.Interfaces {
 		if ifc.Tunnel != nil && ifc.Tunnel.Mode == "wireguard" {
-			privKey := ifc.Tunnel.WireGuard.PrivateKey
+			privKey := ""
+			listenPort := 0
+			if ifc.Tunnel.WireGuard != nil {
+				privKey = ifc.Tunnel.WireGuard.PrivateKey
+				listenPort = ifc.Tunnel.WireGuard.ListenPort
+			}
 			if privKey == "" {
 				privKey = cfg.Security.WireGuard.PrivateKey
 			}
-			listenPort := ifc.Tunnel.WireGuard.ListenPort
 			if listenPort == 0 {
 				listenPort = cfg.Security.WireGuard.ListenPort
 			}

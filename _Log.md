@@ -1,5 +1,12 @@
 # Action Log
 
+## 2026-05-21
+
+- **Timestamp**: 2026-05-21T03:40:00Z
+  - **Action**: PR #1433 follow-up review fixes — guarded WireGuard snapshot generation when per-interface `tunnel wireguard` block is omitted (fallback to global key/port), and removed duplicate RX UMEM recycle in WireGuard control-frame enqueue path.
+  - **File(s)**: `pkg/dataplane/userspace/snapshot.go`, `userspace-dp/src/afxdp/poll_descriptor.rs`, `_Log.md`
+  - **Validation**: `gofmt -w pkg/dataplane/userspace/snapshot.go`; `go test ./pkg/dataplane/userspace`; `cargo test --manifest-path userspace-dp/Cargo.toml -q wireguard` (expected environment failure: missing libelf/gelf headers/pkg-config in runner); `git diff --check`
+
 ## 2026-05-20
 
 - **Timestamp**: 2026-05-20T20:05:00Z
