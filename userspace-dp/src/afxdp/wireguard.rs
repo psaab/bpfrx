@@ -153,7 +153,9 @@ impl WireGuardEngine {
                             match Self::construct_outer_frame_allocated(
                                 self.listen_port,
                                 packet,
-                                peer_state,
+                                meta.dst_ip(),
+                                endpoint_ip,
+                                endpoint_port,
                                 meta.ingress_ifindex,
                                 meta.rx_queue_index,
                                 src_mac,
@@ -233,7 +235,9 @@ impl WireGuardEngine {
                                     match Self::construct_outer_frame_allocated(
                                         self.listen_port,
                                         packet,
-                                        peer_state,
+                                        meta.dst_ip(),
+                                        endpoint_ip,
+                                        endpoint_port,
                                         meta.ingress_ifindex,
                                         meta.rx_queue_index,
                                         src_mac,
@@ -301,7 +305,9 @@ impl WireGuardEngine {
                                         match Self::construct_outer_frame_allocated(
                                             self.listen_port,
                                             packet,
-                                            peer_state,
+                                            meta.dst_ip(),
+                                            endpoint_ip,
+                                            endpoint_port,
                                             meta.ingress_ifindex,
                                             meta.rx_queue_index,
                                             src_mac,
@@ -387,7 +393,9 @@ impl WireGuardEngine {
                             match Self::construct_outer_frame_allocated(
                                 self.listen_port,
                                 packet,
-                                peer_state,
+                                meta.dst_ip(),
+                                endpoint_ip,
+                                endpoint_port,
                                 meta.ingress_ifindex,
                                 meta.rx_queue_index,
                                 src_mac,
@@ -646,21 +654,18 @@ impl WireGuardEngine {
     fn construct_outer_frame_allocated(
         listen_port: u16,
         wg_payload: &[u8],
-        peer: &PeerState,
+        outer_src_ip: IpAddr,
+        outer_dst_ip: IpAddr,
+        outer_dst_port: u16,
         ingress_ifindex: u32,
         rx_queue_index: u32,
         src_mac: [u8; 6],
         dst_mac: [u8; 6],
     ) -> Option<(Vec<u8>, UserspaceDpMeta)> {
-        let (outer_dst_ip, outer_dst_port) = peer.endpoint?;
-        let outer_src_ip = peer.local_ip.unwrap_or_else(|| {
-            if outer_dst_ip.is_ipv4() {
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-            } else {
-                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
-            }
-        });
-        
+        if outer_src_ip.is_ipv4() != outer_dst_ip.is_ipv4() {
+            return None;
+        }
+
         let udp_len = 8 + wg_payload.len();
         let ip_len = match outer_dst_ip {
             IpAddr::V4(_) => 20 + udp_len,
@@ -1352,7 +1357,12 @@ mod tests {
                 let outcome = engine.try_decap(&mut rf, &meta_new, &mut scratch);
                 if let WireGuardDecapOutcome::Decapped(res) = outcome {
                     let frame = res.control_frame.unwrap();
-                    if frame[42] == 3 { // Type 3 is Cookie Reply!
+                    if frame[42] == 3 {
+                        // Type 3 is Cookie Reply.
+                        assert_eq!(u16::from_be_bytes([frame[34], frame[35]]), 51820);
+                        assert_eq!(u16::from_be_bytes([frame[36], frame[37]]), new_port);
+                        assert_eq!(&frame[26..30], &[192, 168, 1, 1]);
+                        assert_eq!(&frame[30..34], &[192, 168, 1, 100]);
                         cookie_reply_generated = true;
                         break;
                     }
