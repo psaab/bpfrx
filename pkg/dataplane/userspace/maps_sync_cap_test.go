@@ -348,7 +348,43 @@ func TestBlindFailClosedUserspaceCtrlAfterLookupFailure(t *testing.T) {
 		t.Skipf("RemoveMemlock: %v", err)
 	}
 	m := New()
+	m.configuredMode = ModeUserspaceStrict
 	ctrlMap, _ := injectCtrlAndBindingMaps(t, m)
+	injectShimMapSpec(t, m.bpfShim, "userspace_ingress_ifaces", &ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    4,
+		ValueSize:  1,
+		MaxEntries: 16,
+	})
+	injectShimMapSpec(t, m.bpfShim, "userspace_local_v4", &ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    4,
+		ValueSize:  1,
+		MaxEntries: 1024,
+	})
+	injectShimMapSpec(t, m.bpfShim, "userspace_local_v6", &ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    uint32(unsafe.Sizeof(userspaceLocalV6Key{})),
+		ValueSize:  1,
+		MaxEntries: 1024,
+	})
+	natV4Map, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    4,
+		ValueSize:  1,
+		MaxEntries: 1,
+	})
+	if err != nil {
+		t.Fatalf("new userspace_interface_nat_v4 map: %v", err)
+	}
+	t.Cleanup(func() { natV4Map.Close() })
+	injectShimMap(t, m.bpfShim, "userspace_interface_nat_v4", natV4Map)
+	injectShimMapSpec(t, m.bpfShim, "userspace_interface_nat_v6", &ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    uint32(unsafe.Sizeof(userspaceLocalV6Key{})),
+		ValueSize:  1,
+		MaxEntries: 16,
+	})
 	m.ctrlWasEnabled = true
 
 	zero := uint32(0)
@@ -362,22 +398,44 @@ func TestBlindFailClosedUserspaceCtrlAfterLookupFailure(t *testing.T) {
 		t.Fatalf("seed userspace_ctrl: %v", err)
 	}
 
-	cause := errors.New("classifier sync failed")
 	lookupErr := errors.New("transient ctrl lookup failed")
-	err := m.blindFailClosedUserspaceCtrlLocked(
-		ctrlMap,
-		&ConfigSnapshot{
-			Generation:    99,
-			FIBGeneration: 7,
-			Userspace: config.UserspaceConfig{
-				Workers: 3,
-			},
+	oldNAT := binary.BigEndian.Uint32([]byte{203, 0, 113, 1})
+	if err := natV4Map.Update(oldNAT, uint8(1), ebpf.UpdateAny); err != nil {
+		t.Fatalf("seed userspace_interface_nat_v4: %v", err)
+	}
+
+	origLookup := lookupUserspaceCtrlForFailClosed
+	lookupUserspaceCtrlForFailClosed = func(_ *ebpf.Map, _ uint32, _ *userspaceCtrlValue) error {
+		return lookupErr
+	}
+	t.Cleanup(func() { lookupUserspaceCtrlForFailClosed = origLookup })
+
+	err = m.syncUserspaceClassifierMapsFailClosedLocked(&ConfigSnapshot{
+		Generation:    99,
+		FIBGeneration: 7,
+		Userspace: config.UserspaceConfig{
+			Workers: 3,
 		},
-		cause,
-		lookupErr,
-	)
-	if !errors.Is(err, cause) {
-		t.Fatalf("error does not wrap classifier failure: %v", err)
+		Interfaces: []InterfaceSnapshot{{
+			Name:    "reth1.0",
+			Zone:    "untrust",
+			Ifindex: 5,
+			Addresses: []InterfaceAddressSnapshot{{
+				Family:  "inet",
+				Address: "198.51.100.1/24",
+			}},
+		}},
+		SourceNAT: []SourceNATRuleSnapshot{{
+			Name:          "snat-out",
+			ToZone:        "untrust",
+			InterfaceMode: true,
+		}},
+	})
+	if err == nil {
+		t.Fatal("classifier-map refresh succeeded despite full NAT map, want error")
+	}
+	if !strings.Contains(err.Error(), "userspace_interface_nat_v4") {
+		t.Fatalf("refresh failed before interface-NAT sync: %v", err)
 	}
 	if !errors.Is(err, lookupErr) {
 		t.Fatalf("error does not wrap lookup failure: %v", err)
@@ -398,6 +456,9 @@ func TestBlindFailClosedUserspaceCtrlAfterLookupFailure(t *testing.T) {
 	}
 	if ctrl.ConfigGeneration != 99 || ctrl.FIBGeneration != 7 {
 		t.Fatalf("generations = %d/%d, want 99/7", ctrl.ConfigGeneration, ctrl.FIBGeneration)
+	}
+	if ctrl.Flags&userspaceCtrlFlagStrict == 0 {
+		t.Fatalf("userspace_ctrl.Flags = %#x, want strict flag %#x", ctrl.Flags, userspaceCtrlFlagStrict)
 	}
 	if m.ctrlWasEnabled {
 		t.Fatal("ctrlWasEnabled = true after blind fail-closed, want false")
