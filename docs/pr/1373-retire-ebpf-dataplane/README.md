@@ -27,6 +27,91 @@ and BPF build rules can be removed. #1380 is a Phase 5 CLI/observability cleanup
 item, now closed for the current helper schema; it does not block the Phase 4
 forwarding-source removal gate by itself.
 
+## #1451 Runtime Boundary Canaries
+
+`pkg/dataplane/retirement_boundary_canary_test.go` pins the current retirement
+boundary for #1451. It discovers every top-level `cmd/*` and `pkg/*`
+production Go package except `pkg/dataplane` itself, then fails if a new direct
+`github.com/psaab/xpf/pkg/dataplane` import appears outside the allowlist below,
+or if a listed bridge disappears without shrinking this documentation.
+
+The same canary also keeps operator packages away from direct BPF artifacts:
+they may not import `github.com/cilium/ebpf`, and the DPDK backend import stays
+limited to `cmd/xpfd/main.go` for backend registration. Daemon startup must keep
+owning `dataplane.RuntimeDataPlane` and must call
+`dataplane.NewRuntimeDataPlane`, not `dataplane.NewDataPlane`. This is a
+production-code canary; `_test.go` files may still import lower-level helpers
+when they need backend fixtures for regression coverage.
+
+### Allowlisted Legacy Bridges
+
+These files are the current production direct-import allowlist for root
+`pkg/dataplane`. New migration PRs should remove entries from this table as
+surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
+`Telemetry`, or package-local accessor interfaces. Adding a new entry means
+#1451 is moving backward and requires an explicit design reason.
+
+| File | Current blocker |
+|---|---|
+| `cmd/xpfd/main.go` | Backend selection, cleanup, and backend registration still cross the root package. |
+| `pkg/api/handlers.go` | REST handlers still receive the legacy dataplane bridge. |
+| `pkg/api/handlers_sessions.go` | REST session reads still use legacy session types. |
+| `pkg/api/metrics.go` | Prometheus telemetry still reads legacy counters and metadata. |
+| `pkg/api/server.go` | REST server construction still stores the legacy bridge. |
+| `pkg/cli/cli.go` | Embedded CLI construction still stores the legacy bridge. |
+| `pkg/cli/cli_clear.go` | Clear commands still delete legacy session entries. |
+| `pkg/cli/cli_show_cluster.go` | Cluster display still reads legacy dataplane state. |
+| `pkg/cli/cli_show_flow.go` | Flow display still uses legacy session keys and values. |
+| `pkg/cli/cli_show_nat.go` | NAT display still uses legacy NAT/session metadata. |
+| `pkg/cli/cli_show_security.go` | Security display still uses legacy counters and filter types. |
+| `pkg/cluster/sync.go` | Session sync still installs sessions through the legacy bridge. |
+| `pkg/cluster/sync_bulk.go` | Bulk sync still serializes legacy session entries. |
+| `pkg/cluster/sync_conn.go` | Sync connection code still references legacy session types. |
+| `pkg/cluster/sync_protocol.go` | Wire protocol still carries legacy session records. |
+| `pkg/conntrack/gc.go` | GC compatibility construction still adapts legacy sessions. |
+| `pkg/daemon/daemon.go` | Daemon owns `RuntimeDataPlane` and exposes `legacyDP()` for unmigrated callers. |
+| `pkg/daemon/daemon_apply.go` | Apply path still adapts legacy compile/apply metadata. |
+| `pkg/daemon/daemon_flow.go` | Flow logging still formats legacy dataplane counters. |
+| `pkg/daemon/daemon_ha.go` | HA state updates still call legacy bridge methods. |
+| `pkg/daemon/daemon_ha_fabric.go` | Fabric HA updates still call legacy bridge methods. |
+| `pkg/daemon/daemon_ha_userspace.go` | Userspace HA control still crosses the legacy bridge. |
+| `pkg/daemon/daemon_run.go` | Runtime wiring still passes `legacyDP()` to unmigrated services. |
+| `pkg/fwdstatus/builder.go` | Forwarding status still reads legacy map stats. |
+| `pkg/grpcapi/apply_result.go` | gRPC apply metadata still adapts legacy apply results. |
+| `pkg/grpcapi/server.go` | gRPC server construction still stores the legacy bridge. |
+| `pkg/grpcapi/server_helpers.go` | gRPC helpers still format legacy dataplane types. |
+| `pkg/grpcapi/server_nat.go` | gRPC NAT output still reads legacy NAT/session metadata. |
+| `pkg/grpcapi/server_sessions.go` | gRPC session RPCs still use legacy session types. |
+| `pkg/grpcapi/server_show.go` | gRPC show dispatcher still reaches legacy dataplane state. |
+| `pkg/grpcapi/server_show_cluster_text.go` | Cluster text output still reads legacy dataplane state. |
+| `pkg/grpcapi/server_show_flow.go` | Flow text output still uses legacy session keys and values. |
+| `pkg/grpcapi/server_show_nat.go` | NAT text output still uses legacy NAT/session metadata. |
+| `pkg/grpcapi/server_show_policies_text.go` | Policy text output still uses legacy counters. |
+| `pkg/grpcapi/server_show_security_text.go` | Security text output still uses legacy counters and filter types. |
+| `pkg/grpcapi/server_show_status.go` | Status output still reads legacy dataplane state. |
+| `pkg/grpcapi/server_show_zones.go` | Zone output still uses legacy dataplane types. |
+| `pkg/logging/ringbuf.go` | Event reader still consumes the legacy `EventSource`. |
+| `pkg/monitoriface/monitor.go` | Interface monitor still reads legacy interface counters. |
+
+### Safe-Delete Blockers
+
+- `pkg/dataplane.DataPlane` is still load-bearing for API, gRPC, CLI, status,
+  monitor, logging, cluster session sync, conntrack GC, daemon HA, daemon flow,
+  and daemon apply bridges listed above.
+- `pkg/dataplane/userspace.LegacyDataPlaneAdapter` is still required because
+  userspace runtime construction returns a legacy-compatible adapter while
+  unmigrated operator services consume old session, telemetry, and control
+  methods. The userspace `Manager` itself must not implement `DataPlane`.
+- DPDK still implements both `DataPlane` and `RuntimeDataPlane`; the only
+  direct DPDK backend import outside `pkg/dataplane` should remain the blank
+  registration import in `cmd/xpfd/main.go`.
+- BPF source and build artifacts are not safe to delete in #1451 canary work:
+  `bpf/`, `pkg/dataplane/loader_ebpf.go`,
+  `pkg/dataplane/*_bpfel.go`, `pkg/dataplane/*_bpfel.o`,
+  `pkg/dataplane/userspace_xdp_bpfel.o`,
+  `pkg/dataplane/build-userspace-xdp.sh`, and the `Makefile generate` path
+  remain tied to the eBPF backend and userspace XDP shim.
+
 ## Phase 1/2 Smoke Gates
 
 Use [smoke-gates.md](smoke-gates.md) for the repeatable Phase 1/2 operator
