@@ -76,7 +76,6 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/daemon/daemon_ha_fabric.go` | Fabric HA updates still call legacy bridge methods. |
 | `pkg/daemon/daemon_ha_userspace.go` | Userspace HA control still crosses the legacy bridge. |
 | `pkg/daemon/daemon_run.go` | Runtime wiring still passes `legacyDP()` to unmigrated services. |
-| `pkg/fwdstatus/builder.go` | Forwarding status still reads legacy map stats. |
 | `pkg/grpcapi/apply_result.go` | gRPC apply metadata still adapts legacy apply results. |
 | `pkg/grpcapi/server.go` | gRPC server construction still stores the legacy bridge. |
 | `pkg/grpcapi/server_helpers.go` | gRPC helpers still format legacy dataplane types. |

@@ -43,7 +43,6 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"pkg/daemon/daemon_ha_fabric.go":           "fabric HA updates still call legacy bridge methods",
 	"pkg/daemon/daemon_ha_userspace.go":        "userspace HA control still crosses the legacy bridge",
 	"pkg/daemon/daemon_run.go":                 "runtime wiring still passes legacyDP to unmigrated services",
-	"pkg/fwdstatus/builder.go":                 "forwarding status still reads legacy map stats",
 	"pkg/grpcapi/apply_result.go":              "gRPC apply metadata still adapts legacy apply results",
 	"pkg/grpcapi/server.go":                    "gRPC server constructor still stores the legacy bridge",
 	"pkg/grpcapi/server_helpers.go":            "gRPC helpers still format legacy dataplane types",
