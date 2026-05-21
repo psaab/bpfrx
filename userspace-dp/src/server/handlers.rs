@@ -70,8 +70,11 @@ pub(crate) fn handle_stream(
                         guard.status.last_snapshot_at = Some(snapshot.generated_at);
                         guard.status.capabilities = snapshot.capabilities.clone();
                         let existing_bindings = guard.status.bindings.clone();
-                        let previous_snapshot = guard.snapshot.as_ref();
-                        let same_plan = previous_snapshot.is_some_and(|prev| {
+                        let previous_defer_workers = guard
+                            .snapshot
+                            .as_ref()
+                            .is_some_and(|prev| prev.defer_workers);
+                        let same_plan = guard.snapshot.as_ref().is_some_and(|prev| {
                             let prev_key = snapshot_binding_plan_key(prev);
                             let next_key = snapshot_binding_plan_key(&snapshot);
                             let same = prev_key == next_key;
@@ -84,8 +87,21 @@ pub(crate) fn handle_stream(
                             same
                         });
                         if same_plan {
-                            guard.afxdp.refresh_runtime_snapshot(&snapshot);
-                            guard.snapshot = Some(snapshot);
+                            let needs_reconcile = same_plan_apply_needs_binding_reconcile(
+                                &guard,
+                                previous_defer_workers,
+                                snapshot.defer_workers,
+                            );
+                            if needs_reconcile {
+                                eprintln!(
+                                    "CTRL_REQ: same-plan apply_snapshot reconciling deferred bindings"
+                                );
+                                guard.snapshot = Some(snapshot);
+                                reconcile_status_bindings(&mut guard);
+                            } else {
+                                guard.afxdp.refresh_runtime_snapshot(&snapshot);
+                                guard.snapshot = Some(snapshot);
+                            }
                             refresh_status(&mut guard);
                             persist_state = true;
                         } else {
