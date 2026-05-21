@@ -25,7 +25,7 @@ func TestApplyHelperStatusRejectsOverCapIfindex(t *testing.T) {
 		t.Skipf("RemoveMemlock: %v", err)
 	}
 	m := New()
-	m.bpfShim.XDPEntryProg = "xdp_userspace_prog"
+	m.bpfShim.XDPEntryProg = userspaceXDPEntryProg
 	ctrlMap, _ := injectCtrlAndBindingMaps(t, m)
 	injectUserspaceSessionMap(t, m)
 	m.neighborsPrewarmed = true
@@ -529,7 +529,7 @@ func TestApplyHelperStatusAcceptsIfindexWithinCap(t *testing.T) {
 		t.Skipf("RemoveMemlock: %v", err)
 	}
 	m := New()
-	m.bpfShim.XDPEntryProg = "xdp_userspace_prog"
+	m.bpfShim.XDPEntryProg = userspaceXDPEntryProg
 	injectCtrlAndBindingMaps(t, m)
 	injectUserspaceSessionMap(t, m)
 	m.neighborsPrewarmed = true
@@ -567,7 +567,7 @@ func TestVerifyBindingsWatchdogSkipsOverCapIfindex(t *testing.T) {
 		t.Skipf("RemoveMemlock: %v", err)
 	}
 	m := New()
-	m.bpfShim.XDPEntryProg = "xdp_userspace_prog"
+	m.bpfShim.XDPEntryProg = userspaceXDPEntryProg
 	injectCtrlAndBindingMaps(t, m)
 	m.ctrlWasEnabled = true
 	// verifyBindingsMapLocked early-returns on m.proc == nil or

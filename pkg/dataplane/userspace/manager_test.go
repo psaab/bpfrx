@@ -1417,7 +1417,7 @@ func TestApplyHelperStatusInitialCtrlCleanupRunsOnlyOnce(t *testing.T) {
 		t.Skipf("RemoveMemlock: %v", err)
 	}
 	m := New()
-	m.bpfShim.XDPEntryProg = "xdp_userspace_prog"
+	m.bpfShim.XDPEntryProg = userspaceXDPEntryProg
 	injectCtrlAndBindingMaps(t, m)
 	usMap := injectUserspaceSessionMap(t, m)
 	m.neighborsPrewarmed = true
@@ -1524,7 +1524,7 @@ func TestUpdateRGActiveActivationKeepsCtrlEnabledAfterAckedStatus(t *testing.T) 
 	m.proc = &exec.Cmd{Process: &os.Process{Pid: 1}}
 	m.cfg.ControlSocket = controlSock
 	m.clusterHA = true
-	m.bpfShim.XDPEntryProg = "xdp_userspace_prog"
+	m.bpfShim.XDPEntryProg = userspaceXDPEntryProg
 	m.neighborsPrewarmed = true
 	m.xskLivenessProven = true
 	m.ctrlWasEnabled = true
