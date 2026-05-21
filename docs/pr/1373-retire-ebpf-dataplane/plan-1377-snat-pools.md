@@ -36,8 +36,9 @@ runtime lease reuse, and operator-visible allocation failures.
   snapshot refreshes preserve allocator state only when the helper keeps the
   same binding-plan entries and the allocator key is unchanged. Helper restart,
   binding-plan changes that force helper replan, and pool-shape edits reset
-  allocator state. HA configs that use a persistent source-NAT pool are gated
-  because persistent leases are not synchronized.
+  allocator state. #1449 closes the HA question by treating persistent source
+  NAT in HA as an admission boundary: userspace forwarding is blocked with an
+  explicit unsupported reason because persistent leases are not synchronized.
 
 ## Current Fail-Closed Runtime Boundary
 
@@ -197,8 +198,36 @@ contract is helper-local:
   allocator live state even when the pool key is unchanged;
 - edits to pool name, IPv4/IPv6 address lists, address order, or port range
   replace allocator state and can reset persistent lease continuity;
-- HA configs using persistent source-NAT pools are gated because leases are not
-  synchronized to the peer.
+- HA configs using persistent source-NAT pools are gated before userspace
+  forwarding is admitted because leases are not synchronized to the peer.
+
+## HA Failover Boundary (#1449)
+
+Persistent-NAT leases are allocator runtime state, not HA session state. Full
+HA lease synchronization would need a peer wire format, ownership rules,
+conflict handling for live translated tuples, rollback semantics, and stale
+entry cleanup. This slice deliberately does not add partial replay because a
+standby importing stale helper-local leases could claim a tuple that is still
+owned by a live synced session or by a different allocator shape.
+
+The production contract is therefore an audited gate:
+
+- if chassis cluster is configured and any source-NAT rule references a pool
+  with `persistent-nat`, `deriveUserspaceCapabilities()` marks userspace
+  forwarding unsupported;
+- `TakeoverReady()` propagates the same unsupported reason, so planned
+  userspace failover does not treat the helper as ready for that config;
+- `show ... userspace` status renders `Forwarding blocked by:
+  userspace persistent-nat source pool leases are not HA-synchronized`;
+- non-HA persistent pools still expose live-flow, used-port,
+  persistent-lease, allocation, reuse, and exhaustion counters, so allocator
+  exhaustion remains distinguishable from the HA gate.
+
+There is no "lease reset after failover" behavior in the admitted userspace HA
+contract because the config is not admitted to userspace forwarding in the
+first place. A future PR that removes this gate must implement full lease sync
+or replay with tuple-conflict and stale-entry tests before claiming HA
+persistent-NAT support.
 
 The compatible-refresh boundary has two parts. First, the helper must keep the
 same binding-plan entries; binding-plan changes cause helper replan and rebuild
@@ -299,8 +328,10 @@ Covered by #1385 and this closeout:
   `address_persistent`, and per-pool `persistent-nat` fields.
 - Go: protocol round-trip covers source-NAT persistent fields and source-NAT
   pool status rows.
-- Go: userspace admission gates HA configs that use persistent source-NAT
-  pools because leases are not synchronized.
+- Go: userspace admission and takeover readiness gate HA configs that use
+  persistent source-NAT pools because leases are not synchronized.
+- Go: userspace status summary renders the persistent source-NAT HA unsupported
+  reason as a forwarding-blocked status line.
 - Go: snapshot builder preserves missing pool, empty pool, invalid port range,
   and nil pool entries as unusable pool-mode rules with
   `pool_unusable_reason`.
@@ -348,7 +379,8 @@ Still outside the current supported contract:
   across failover, while new-flow mixed-backend rollback tests accept the
   documented selector boundary.
 - Helper-restart persistence for the persistent-NAT lease table.
-- HA synchronization for persistent-NAT leases.
+- HA synchronization for persistent-NAT leases. The current #1449 contract is
+  the explicit HA capability gate above, not partial lease replay.
 - A shared selector algorithm across eBPF, DPDK, and userspace for new-flow
   cross-backend parity.
 

@@ -1,6 +1,6 @@
 # HA Failover Status
 
-Date: 2026-04-03 (updated)
+Date: 2026-05-21 (updated)
 
 This is the single authoritative document for userspace dataplane HA failover.
 It replaces the fragmented state across a dozen prior docs. Read this first;
@@ -46,6 +46,9 @@ yet. Here is what is true today:
 - Planned failover decoupled from bulk sync (PR #407) — barrier ack
   proves peer is current, no bulk-sync gate
 - Transfer readiness surfaced separately from takeover readiness (PR #402)
+- HA configs that use per-pool source NAT `persistent-nat` are not admitted to
+  userspace forwarding because persistent-NAT leases are helper-local allocator
+  state and are not HA-synchronized (#1449)
 
 ## What Works
 
@@ -66,6 +69,32 @@ The key fixes that made this work:
 | PRs #395-397 | Explicit RG transfer protocol (request/ack/commit) |
 | PRs #404-406 | Owner RG indexes — O(1) demotion/activation |
 | PR #407 | Priority barrier channel + decouple failover from bulk sync |
+
+## Persistent SNAT Lease Boundary
+
+Synced sessions carry the translated tuple needed for active-flow return
+traffic after failover. Per-pool `persistent-nat` leases are different: they
+are helper-local allocator state used only for future source-side allocations
+after the last live flow releases. The userspace helper does not synchronize or
+replay those leases to the peer.
+
+#1449 is closed as an admission boundary rather than partial lease replay. If
+a chassis cluster config has any source-NAT rule that references a pool with
+`persistent-nat`, userspace forwarding is marked unsupported with:
+
+```
+userspace persistent-nat source pool leases are not HA-synchronized
+```
+
+That reason is visible in helper status as `Forwarding blocked by: ...` and is
+also propagated through takeover readiness. Operators should treat it as an
+expected capability gate, not allocator exhaustion. Non-HA persistent pools
+still report live-flow, used-port, persistent-lease, allocation, reuse, and
+exhaustion counters.
+
+A future change that admits HA persistent-NAT must add full lease sync or
+replay, including tuple-conflict handling for live synced sessions and stale
+lease cleanup.
 
 ## What Was Fixed Recently
 
