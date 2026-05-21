@@ -545,13 +545,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 			}
 			return result, err
 		}
-		if err := m.syncIngressIfaceMapLocked(snap); err != nil {
-			return result, err
-		}
-		if err := m.syncLocalAddressMapsLocked(snap); err != nil {
-			return result, err
-		}
-		if err := m.syncInterfaceNATAddressMapsLocked(snap); err != nil {
+		if err := m.syncUserspaceClassifierMapsFailClosedLocked(snap); err != nil {
 			return result, err
 		}
 		m.lastSnapshot = snap
@@ -566,13 +560,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		return result, nil
 	}
 	if samePlanRefresh {
-		if err := m.syncIngressIfaceMapLocked(snap); err != nil {
-			return result, err
-		}
-		if err := m.syncLocalAddressMapsLocked(snap); err != nil {
-			return result, err
-		}
-		if err := m.syncInterfaceNATAddressMapsLocked(snap); err != nil {
+		if err := m.syncUserspaceClassifierMapsFailClosedLocked(snap); err != nil {
 			return result, err
 		}
 	} else {

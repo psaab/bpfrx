@@ -118,13 +118,7 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 			_ = heartbeatMap.Update(slot, zeroHB, ebpf.UpdateAny)
 		}
 	}
-	if err := m.syncIngressIfaceMapLocked(snapshot); err != nil {
-		return err
-	}
-	if err := m.syncLocalAddressMapsLocked(snapshot); err != nil {
-		return err
-	}
-	return m.syncInterfaceNATAddressMapsLocked(snapshot)
+	return m.syncUserspaceClassifierMapsLocked(snapshot)
 }
 
 // setupUserspaceCPUMapLocked populates the userspace_cpumap BPF map with one
@@ -175,6 +169,38 @@ func (m *Manager) failClosedUserspaceCtrlLocked(ctrlMap *ebpf.Map, ctrl userspac
 	}
 	m.ctrlWasEnabled = false
 	return cause
+}
+
+func (m *Manager) syncUserspaceClassifierMapsLocked(snapshot *ConfigSnapshot) error {
+	if err := m.syncIngressIfaceMapLocked(snapshot); err != nil {
+		return err
+	}
+	if err := m.syncLocalAddressMapsLocked(snapshot); err != nil {
+		return err
+	}
+	return m.syncInterfaceNATAddressMapsLocked(snapshot)
+}
+
+func (m *Manager) syncUserspaceClassifierMapsFailClosedLocked(snapshot *ConfigSnapshot) error {
+	if err := m.syncUserspaceClassifierMapsLocked(snapshot); err != nil {
+		ctrlMap := m.bpfShim.Map("userspace_ctrl")
+		if ctrlMap == nil {
+			return err
+		}
+		var ctrl userspaceCtrlValue
+		zero := uint32(0)
+		if lookupErr := ctrlMap.Lookup(zero, &ctrl); lookupErr != nil {
+			if errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
+				return err
+			}
+			return errors.Join(
+				err,
+				fmt.Errorf("lookup userspace_ctrl for classifier-map fail-closed: %w", lookupErr),
+			)
+		}
+		return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, err)
+	}
+	return nil
 }
 
 func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {

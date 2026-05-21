@@ -12,6 +12,9 @@
   by adding desired keys before deleting stale keys.
 - Force `userspace_ctrl.enabled=0` on enabled-path publication failures so stale
   bindings or metadata cannot stay live after a partial update.
+- Route same-plan and pending-XSK classifier map refresh failures through the
+  same fail-closed control-map path, including ingress, local address, and
+  interface-NAT map updates.
 - Route degraded IP local/control delivery through `cpumap_or_pass` when cpumap
   is available; direct `XDP_PASS` remains only for non-IP local L2 frames such
   as ARP/LLDP.
@@ -79,6 +82,7 @@ The Go tests add privileged XDP test-run coverage for:
 - binding-not-ready transit drop versus local/control delivery
 - ctrl publication remaining disabled if binding map publication fails
 - fail-closed ctrl disable after a previously-live publication failure
+- fail-closed ctrl disable after a same-plan classifier-map refresh failure
 - local and interface-NAT address map add-before-remove behavior on refresh
   failure
 - cpumap delivery for degraded IP local/control and ICMPv6 NDP

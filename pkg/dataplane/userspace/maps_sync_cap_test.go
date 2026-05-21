@@ -239,6 +239,109 @@ func TestSyncInterfaceNATAddressMapsAddsBeforeRemovingStale(t *testing.T) {
 	}
 }
 
+func TestSamePlanClassifierMapRefreshFailsClosedOnNATSyncFailure(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+	m := New()
+	ctrlMap, _ := injectCtrlAndBindingMaps(t, m)
+	injectShimMapSpec(t, m.bpfShim, "userspace_ingress_ifaces", &ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    4,
+		ValueSize:  1,
+		MaxEntries: 16,
+	})
+	injectShimMapSpec(t, m.bpfShim, "userspace_local_v4", &ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    4,
+		ValueSize:  1,
+		MaxEntries: 1024,
+	})
+	injectShimMapSpec(t, m.bpfShim, "userspace_local_v6", &ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    uint32(unsafe.Sizeof(userspaceLocalV6Key{})),
+		ValueSize:  1,
+		MaxEntries: 1024,
+	})
+	natV4Map, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    4,
+		ValueSize:  1,
+		MaxEntries: 1,
+	})
+	if err != nil {
+		t.Fatalf("new userspace_interface_nat_v4 map: %v", err)
+	}
+	t.Cleanup(func() { natV4Map.Close() })
+	injectShimMap(t, m.bpfShim, "userspace_interface_nat_v4", natV4Map)
+	injectShimMapSpec(t, m.bpfShim, "userspace_interface_nat_v6", &ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    uint32(unsafe.Sizeof(userspaceLocalV6Key{})),
+		ValueSize:  1,
+		MaxEntries: 16,
+	})
+
+	zero := uint32(0)
+	if err := ctrlMap.Update(zero, userspaceCtrlValue{
+		Enabled:            1,
+		MetadataVersion:    userspaceMetadataVersion,
+		Workers:            1,
+		QueueCount:         1,
+		HeartbeatTimeoutMS: 30000,
+	}, ebpf.UpdateAny); err != nil {
+		t.Fatalf("seed userspace_ctrl: %v", err)
+	}
+	m.ctrlWasEnabled = true
+
+	oldNAT := binary.BigEndian.Uint32([]byte{203, 0, 113, 1})
+	newNAT := binary.BigEndian.Uint32([]byte{198, 51, 100, 1})
+	if err := natV4Map.Update(oldNAT, uint8(1), ebpf.UpdateAny); err != nil {
+		t.Fatalf("seed userspace_interface_nat_v4: %v", err)
+	}
+
+	err = m.syncUserspaceClassifierMapsFailClosedLocked(&ConfigSnapshot{
+		Interfaces: []InterfaceSnapshot{{
+			Name:    "reth1.0",
+			Zone:    "untrust",
+			Ifindex: 5,
+			Addresses: []InterfaceAddressSnapshot{{
+				Family:  "inet",
+				Address: "198.51.100.1/24",
+			}},
+		}},
+		SourceNAT: []SourceNATRuleSnapshot{{
+			Name:          "snat-out",
+			ToZone:        "untrust",
+			InterfaceMode: true,
+		}},
+	})
+	if err == nil {
+		t.Fatal("classifier-map refresh succeeded despite full NAT map, want error")
+	}
+	if !strings.Contains(err.Error(), "userspace_interface_nat_v4") {
+		t.Fatalf("refresh failed before interface-NAT sync: %v", err)
+	}
+
+	var ctrl userspaceCtrlValue
+	if lookupErr := ctrlMap.Lookup(zero, &ctrl); lookupErr != nil {
+		t.Fatalf("lookup userspace_ctrl after refresh failure: %v", lookupErr)
+	}
+	if ctrl.Enabled != 0 {
+		t.Fatalf("userspace_ctrl.Enabled = %d after refresh failure, want 0", ctrl.Enabled)
+	}
+	if m.ctrlWasEnabled {
+		t.Fatal("ctrlWasEnabled = true after refresh failure, want false")
+	}
+
+	var got uint8
+	if lookupErr := natV4Map.Lookup(oldNAT, &got); lookupErr != nil {
+		t.Fatalf("old NAT address missing after failed refresh: %v", lookupErr)
+	}
+	if lookupErr := natV4Map.Lookup(newNAT, &got); !errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
+		t.Fatalf("new NAT address lookup err = %v, want ErrKeyNotExist", lookupErr)
+	}
+}
+
 func TestSyncInterfaceNATAddressMapsReplacesStaleWhenCapacityAllows(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Skipf("RemoveMemlock: %v", err)
