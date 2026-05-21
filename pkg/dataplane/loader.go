@@ -244,7 +244,7 @@ func (m *Manager) seedInterfaceCounter(ifindex int) {
 
 // SwapXDPEntryProg atomically replaces the XDP entry program on all attached
 // interfaces. Userspace mode keeps the userspace XDP shim attached for normal
-// operation and degraded compat/strict handling.
+// operation and degraded local/control handling.
 func (m *Manager) SwapXDPEntryProg(name string) error {
 	prog, ok := m.programs[name]
 	if !ok {

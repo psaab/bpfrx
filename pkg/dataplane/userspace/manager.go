@@ -38,7 +38,7 @@ type DataplaneMode int
 
 const (
 	ModeEBPFOnly        DataplaneMode = iota // Fallback-only, no userspace forwarding
-	ModeUserspaceCompat                      // Userspace preferred, kernel pass-through fallback allowed
+	ModeUserspaceCompat                      // Userspace preferred, degraded transit fails closed
 	ModeUserspaceStrict                      // Strict userspace only, no transit fallback
 )
 
@@ -491,10 +491,10 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	caps := deriveUserspaceCapabilities(cfg)
 	_ = caps // used below for helper config
 	// Userspace mode always attaches the retained XDP shim. The shim
-	// redirects to XSK when ctrl=1; when ctrl=0 compat mode passes to the
-	// kernel and strict mode drops. Do not swap to xdp_main_prog for
-	// unsupported capabilities or failed XSK liveness: the userspace runtime
-	// must not require the legacy main XDP pipeline.
+	// redirects to XSK when ctrl=1; when ctrl=0 it only passes proven
+	// local/control traffic to the kernel and drops transit. Do not swap to
+	// xdp_main_prog for unsupported capabilities or failed XSK liveness: the
+	// userspace runtime must not require the legacy main XDP pipeline.
 	m.bpfShim.XDPEntryProg = userspaceXDPEntryProg
 	result, err := m.bpfShim.Compile(cfg)
 	if err != nil {

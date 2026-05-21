@@ -4,8 +4,8 @@
 > development and routine validation. References to the legacy BPF pipeline
 > below describe explicit fallback/regression boundaries, not the preferred
 > implementation target. The retained userspace shim no longer tail-calls into
-> `xdp_main_prog` for degraded helper/XSK states; compat mode uses explicit
-> kernel pass-through and strict mode drops.
+> `xdp_main_prog` for degraded helper/XSK states. In degraded states it passes
+> only proven local/control traffic to the kernel and drops non-local transit.
 
 ## 1. Architecture Overview
 
@@ -31,6 +31,10 @@ The shim checks several conditions before redirecting a packet to userspace:
 6. Local-destination traffic (matching `userspace_local_v4`/`userspace_local_v6`) passes to kernel.
 7. Non-SYN TCP without a live entry in `userspace_sessions` BPF map is dropped
    (not fallen back -- legacy BPF would generate RSTs that kill the real connection).
+8. When helper/XSK state is degraded (`ctrl.enabled=0`, missing/not-ready
+   binding, stale heartbeat, redirect failure), only the local/control cases
+   above may reach the kernel. Transit drops and increments
+   `transit_drop` in `userspace_fallback_stats`.
 
 Packets that pass all checks get a `UserspaceDpMeta` header prepended via
 `bpf_xdp_adjust_meta` and are redirected to the AF_XDP socket with

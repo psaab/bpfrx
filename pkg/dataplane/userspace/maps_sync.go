@@ -76,7 +76,7 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	}
 
 	// Populate userspace_cpumap so the XDP shim can use cpumap redirect
-	// instead of XDP_PASS (required for zero-copy AF_XDP).
+	// for IP packets that must reach the kernel on zero-copy AF_XDP paths.
 	cpumapReady := m.setupUserspaceCPUMapLocked()
 
 	zero := uint32(0)
@@ -129,8 +129,8 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 
 // setupUserspaceCPUMapLocked populates the userspace_cpumap BPF map with one
 // entry per online CPU. This enables the XDP shim to use cpumap redirect
-// instead of XDP_PASS, which is required for zero-copy AF_XDP (XDP_PASS in
-// zero-copy mode permanently leaks UMEM frames).
+// instead of relying on driver-specific XDP_PASS recycling behavior for IP
+// packets delivered to the kernel from zero-copy AF_XDP paths.
 func (m *Manager) setupUserspaceCPUMapLocked() bool {
 	cpuMap := m.bpfShim.Map("userspace_cpumap")
 	if cpuMap == nil {
@@ -203,9 +203,9 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// Delay ctrl enable until AFTER VIPs are configured in HA mode.
 		// The VRRP election + VIP add takes ~10-14s after restart.
 		// If we enable ctrl before VIPs, the XSK path gets packets but
-		// can't SNAT (no source address) -> all transit dropped.  Compat
-		// shim pass-through handles traffic during this window since the
-		// kernel has the same FIB state.
+		// can't SNAT (no source address) -> all transit dropped. While
+		// ctrl is disabled, only proven local/control traffic reaches the
+		// kernel; transit remains fail-closed.
 		//
 		// Also delay by 3s for fill ring bootstrap: mlx5 zero-copy
 		// needs NAPI to post fill ring WQEs, and NAPI only runs on
@@ -266,8 +266,8 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// XSK receive liveness: once bindings and neighbor state are ready,
 		// arm ctrl and explicitly probe the userspace shim. A working XSK
 		// path must show RX progress while ctrl=1 and the shim is active.
-		// Otherwise keep ctrl disabled and rely on the shim's compat
-		// pass-through or strict fail-closed behavior.
+		// Otherwise keep ctrl disabled: local/control packets may still
+		// reach the kernel, but transit fails closed in both modes.
 		var currentRX uint64
 		for _, b := range status.Bindings {
 			currentRX += b.RXPackets
@@ -285,9 +285,8 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			"xskLivenessFailed", m.xskLivenessFailed,
 			"xdpEntryProg", m.bpfShim.XDPEntryProg)
 		if m.xskLivenessFailed {
-			// XSK proven broken: ctrl stays disabled. Compat mode uses
-			// the shim's explicit kernel pass-through path; strict mode
-			// keeps the same shim attached and fails closed.
+			// XSK proven broken: ctrl stays disabled. The shim only passes
+			// proven local/control packets and drops transit.
 			ctrl.Enabled = 0
 		} else if probeBindingsReady && neighborSyncReady {
 			ctrl.Enabled = 1
@@ -341,7 +340,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 						// needs operator attention.
 						slog.Error("userspace: XSK liveness probe failed in strict mode; dataplane degraded fail-closed")
 					} else {
-						slog.Warn("userspace: XSK liveness probe failed; keeping shim disabled for compat kernel pass-through")
+						slog.Warn("userspace: XSK liveness probe failed; keeping shim disabled with transit fail-closed")
 						if m.bpfShim.XDPEntryProg != userspaceXDPEntryProg {
 							if err := m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg); err != nil {
 								slog.Warn("userspace: failed to restore XDP shim after XSK liveness failure", "err", err)
@@ -353,8 +352,8 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt.Add(60*time.Second)) {
 			// Hard timeout fallback: allow ctrl even if readiness has not been
 			// fully proven yet. The XSK liveness probe still decides whether
-			// the userspace shim starts redirecting or stays in compat
-			// kernel pass-through / strict fail-closed mode.
+			// the userspace shim starts redirecting or stays fail-closed
+			// for transit.
 			ctrl.Enabled = 1
 		} else {
 			ctrl.Enabled = 0
@@ -457,20 +456,16 @@ ctrlReady:
 		}
 		m.initialCtrlCleanupDone = true
 	}
-	if ctrl.Enabled == 0 && m.ctrlWasEnabled {
-		m.ctrlDisabledAt = m.bpfKtimeNs()
-	}
-	m.ctrlWasEnabled = ctrl.Enabled == 1
 
 	// Compute active runtime mode from ctrl state and liveness.
 	switch {
 	case ctrl.Enabled == 0 || m.xskLivenessFailed:
-		// In strict mode, a degraded userspace path still implies the strict
-		// shim is attached and fail-closed, not eBPF-only forwarding.
+		// Degraded userspace mode keeps the shim attached. Compat still only
+		// permits local/control kernel delivery; it is not eBPF-only transit.
 		if m.configuredMode == ModeUserspaceStrict {
 			m.mode = ModeUserspaceStrict
 		} else {
-			m.mode = ModeEBPFOnly
+			m.mode = ModeUserspaceCompat
 		}
 	case m.xskLivenessProven && m.configuredMode == ModeUserspaceStrict:
 		m.mode = ModeUserspaceStrict
@@ -480,13 +475,20 @@ ctrlReady:
 		// ctrl enabled but liveness not yet proven — still probing.
 		m.mode = ModeUserspaceCompat
 	}
-	// Set strict flag in ctrl so the XDP shim knows not to fall back.
+	// Set strict flag in ctrl so the XDP shim reports strict degraded drops
+	// separately while keeping transit fail-closed in both modes.
 	if m.configuredMode == ModeUserspaceStrict {
 		ctrl.Flags |= userspaceCtrlFlagStrict
 	}
 
-	if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("update userspace_ctrl from helper status: %w", err)
+	if ctrl.Enabled == 0 {
+		if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("disable userspace_ctrl from helper status: %w", err)
+		}
+		if m.ctrlWasEnabled {
+			m.ctrlDisabledAt = m.bpfKtimeNs()
+		}
+		m.ctrlWasEnabled = false
 	}
 
 	for _, binding := range status.Bindings {
@@ -589,6 +591,13 @@ ctrlReady:
 	// even for packets that bypassed the BPF pipeline (#332).
 	m.syncBPFCountersLocked(status)
 
+	if ctrl.Enabled == 1 {
+		if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("enable userspace_ctrl from helper status: %w", err)
+		}
+		m.ctrlWasEnabled = true
+	}
+
 	m.recordHelperStatusLocked(status)
 	return nil
 }
@@ -614,6 +623,7 @@ var fallbackReasonNames = [16]string{
 	12: "no_session",
 	13: "strict_drop",
 	14: "pass_to_kernel",
+	15: "transit_drop",
 }
 
 // readFallbackStatsLocked reads the userspace_fallback_stats BPF array map

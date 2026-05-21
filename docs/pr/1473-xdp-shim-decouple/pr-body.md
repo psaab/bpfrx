@@ -2,15 +2,32 @@
 
 - Remove the userspace XDP shim tail-call dependency on `xdp_main_prog`.
 - Keep `xdp_userspace_prog` as the userspace-mode XDP entry program.
-- Make degraded userspace runtime behavior explicit: compat mode uses kernel
-  pass-through from the shim, while strict mode fails closed.
+- Make degraded userspace runtime behavior explicit: compat and strict modes
+  pass only proven local/control traffic and fail closed for non-local transit.
 - Stop requiring `userspace_fallback_progs` / `xdp_main_prog` during userspace
   bootstrap and lifecycle paths.
+- Publish `userspace_ctrl.enabled=1` only after the userspace binding and
+  local/control maps have been refreshed.
 
 ## Validation
 
 - PASS: `pkg/dataplane/build-userspace-xdp.sh`
-- PASS: `go test ./pkg/dataplane ./pkg/dataplane/userspace`
+- PASS: `go test ./pkg/dataplane/userspace ./pkg/dataplane`
+
+## Local Smoke Artifact
+
+Cluster smoke on `loss:xpf-userspace-fw0/fw1` was not run from this worktree.
+The local artifact for this PR is the rebuilt userspace XDP object plus the Go
+test matrix above. The Go tests add privileged XDP test-run coverage for:
+
+- ctrl-disabled transit drops with `transit_drop`
+- ctrl-disabled local/control delivery
+- binding-not-ready transit drop versus local/control delivery
+- ctrl publication remaining disabled if binding map publication fails
+
+In unprivileged local environments, the XDP test-run cases skip at the BPF
+memlock/capability gate; the manager ordering regression still compiles with
+the package test run.
 
 Refs #1473.
 

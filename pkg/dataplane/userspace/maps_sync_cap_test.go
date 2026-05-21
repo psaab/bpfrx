@@ -1,11 +1,13 @@
 package userspace
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/psaab/xpf/pkg/dataplane"
 )
@@ -21,7 +23,7 @@ func TestApplyHelperStatusRejectsOverCapIfindex(t *testing.T) {
 	}
 	m := New()
 	m.bpfShim.XDPEntryProg = "xdp_userspace_prog"
-	injectCtrlAndBindingMaps(t, m)
+	ctrlMap, _ := injectCtrlAndBindingMaps(t, m)
 	injectUserspaceSessionMap(t, m)
 	m.neighborsPrewarmed = true
 	m.xskLivenessProven = true
@@ -59,6 +61,14 @@ func TestApplyHelperStatusRejectsOverCapIfindex(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "MAX_INTERFACES") {
 		t.Fatalf("error missing remediation pointer: %v", err)
+	}
+	var ctrl userspaceCtrlValue
+	lookupErr := ctrlMap.Lookup(uint32(0), &ctrl)
+	if lookupErr == nil && ctrl.Enabled != 0 {
+		t.Fatalf("userspace_ctrl.Enabled = %d after binding publication failure, want not enabled", ctrl.Enabled)
+	}
+	if lookupErr != nil && !errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
+		t.Fatalf("lookup userspace_ctrl after binding publication failure: %v", lookupErr)
 	}
 }
 

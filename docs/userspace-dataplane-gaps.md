@@ -83,7 +83,7 @@ These are not "missing", but they are not pure userspace forwarding either:
 |------|------------------|
 | SYN cookie flood protection | Userspace now publishes a snapshot key when cluster-synced root encrypted-password material exists, mints/validates cookies against the Unix wall-clock epoch, sends bounded SYN-ACK and validated-ACK RST replies through the AF_XDP TX path, and reports challenge/no-secret/SYN-ACK/ACK-RST/budget/valid/invalid/bypass counters. Active SYN-cookie screen profiles require that secret material at userspace capability admission; missing secret material also fails closed at runtime. Remaining #1374 work is live HA/flood evidence before BPF source removal. |
 | Kernel-owned traffic (ARP, local delivery, management, some non-IP) | cpumap or kernel pass-through from XDP |
-| GRE / ESP / explicit early filters | Kernel pass-through in compat mode or fail-closed drop in strict mode; the retained userspace shim no longer tail-calls into `xdp_main_prog` |
+| GRE / ESP / explicit early filters | Live kernel-owned/tunnel-control cases use cpumap or pass-through; degraded helper/XSK states pass only proven local/control traffic and drop non-local transit |
 | IPsec / XFRM handling | Userspace detects and punts to kernel/slow-path as needed |
 | DataPlane control-plane contract | Userspace manager no longer embeds the legacy `dataplane.DataPlane`; a userspace `LegacyDataPlaneAdapter` owns old-interface compatibility while callers migrate. Operator metadata reads in API/gRPC/CLI/daemon now use `LastApplyResult()` instead of `LastCompileResult()`, with a canary preventing those surfaces from regressing to compile-result metadata. GC and HA session sync now use `SessionStore`/`Telemetry`. The manager still holds a named eBPF shim manager for XDP/map bootstrap state, and API/gRPC/CLI session/counter readers plus daemon control paths still need to move fully to domain interfaces; tracked by #1381 |
 | DPDK backend | Separately supported backend outside userspace source-removal scope. Its current root `DataPlane` dependency is pinned as a backend-local #1475 exception until DPDK migrates to runtime/domain interfaces or gets a separate retirement decision. |
@@ -160,9 +160,9 @@ There are two distinct fallback boundaries:
    - Even when `xdp_userspace_prog` is active, the XDP shim can still:
      - redirect to AF_XDP
      - send kernel-owned traffic to cpumap / kernel
-     - use explicit kernel pass-through for compat degraded paths
-     - fail closed for strict degraded paths
-     - drop on dead/missing userspace bindings to fail closed
+     - pass proven local/control traffic while helper/XSK is degraded
+     - drop degraded non-local transit in both compat and strict modes
+     - count those drops as `transit_drop` in `userspace_fallback_stats`
 
 ## Priority Work
 

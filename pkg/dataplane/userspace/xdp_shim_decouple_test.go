@@ -1,7 +1,10 @@
 package userspace
 
 import (
+	"encoding/binary"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -61,6 +64,104 @@ func TestXSKLivenessFailureRestoresUserspaceShimEntry(t *testing.T) {
 	}
 	if got := m.bpfShim.XDPEntryProg; got != userspaceXDPEntryProg {
 		t.Fatalf("XDPEntryProg = %q, want %q", got, userspaceXDPEntryProg)
+	}
+}
+
+func TestUserspaceXDPDegradedCtrlDisabledDropsTransit(t *testing.T) {
+	coll := loadUserspaceXDPTestCollection(t)
+	updateUserspaceXDPTestCtrl(t, coll, userspaceCtrlValue{
+		Enabled:            0,
+		MetadataVersion:    userspaceMetadataVersion,
+		Workers:            1,
+		QueueCount:         1,
+		HeartbeatTimeoutMS: 30000,
+	})
+
+	ret := runUserspaceXDPTestPacket(t, coll, udpIPv4TestPacket(
+		[4]byte{198, 51, 100, 10},
+		[4]byte{203, 0, 113, 20},
+	))
+	if ret != xdpActionDrop {
+		t.Fatalf("ctrl-disabled transit action = %d, want XDP_DROP", ret)
+	}
+	assertUserspaceXDPFallbackStat(t, coll, "ctrl_disabled")
+	assertUserspaceXDPFallbackStat(t, coll, "transit_drop")
+}
+
+func TestUserspaceXDPDegradedCtrlDisabledPassesLocalControl(t *testing.T) {
+	coll := loadUserspaceXDPTestCollection(t)
+	local := [4]byte{192, 0, 2, 1}
+	updateUserspaceXDPTestCtrl(t, coll, userspaceCtrlValue{
+		Enabled:            0,
+		MetadataVersion:    userspaceMetadataVersion,
+		Workers:            1,
+		QueueCount:         1,
+		HeartbeatTimeoutMS: 30000,
+	})
+	updateUserspaceXDPTestLocalV4(t, coll, local)
+
+	ret := runUserspaceXDPTestPacket(t, coll, udpIPv4TestPacket(
+		[4]byte{198, 51, 100, 10},
+		local,
+	))
+	if ret != xdpActionPass {
+		t.Fatalf("ctrl-disabled local action = %d, want XDP_PASS", ret)
+	}
+	assertUserspaceXDPFallbackStat(t, coll, "ctrl_disabled")
+	assertUserspaceXDPFallbackStat(t, coll, "pass_to_kernel")
+	assertUserspaceXDPFallbackStatAbsent(t, coll, "transit_drop")
+}
+
+func TestUserspaceXDPBindingNotReadyDropsTransitButPassesLocalControl(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		dst      [4]byte
+		local    bool
+		want     uint32
+		statName string
+	}{
+		{
+			name:     "transit",
+			dst:      [4]byte{203, 0, 113, 20},
+			want:     xdpActionDrop,
+			statName: "transit_drop",
+		},
+		{
+			name:     "local",
+			dst:      [4]byte{192, 0, 2, 1},
+			local:    true,
+			want:     xdpActionPass,
+			statName: "pass_to_kernel",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coll := loadUserspaceXDPTestCollection(t)
+			updateUserspaceXDPTestCtrl(t, coll, userspaceCtrlValue{
+				Enabled:            1,
+				MetadataVersion:    userspaceMetadataVersion,
+				Workers:            1,
+				QueueCount:         1,
+				HeartbeatTimeoutMS: 30000,
+			})
+			updateUserspaceXDPTestIngress(t, coll, 0)
+			updateUserspaceXDPTestBinding(t, coll, 0, userspaceBindingValue{
+				Slot:  0,
+				Flags: 2, // non-zero but not userspaceBindingReady
+			})
+			if tc.local {
+				updateUserspaceXDPTestLocalV4(t, coll, tc.dst)
+			}
+
+			ret := runUserspaceXDPTestPacket(t, coll, udpIPv4TestPacket(
+				[4]byte{198, 51, 100, 10},
+				tc.dst,
+			))
+			if ret != tc.want {
+				t.Fatalf("binding-not-ready %s action = %d, want %d", tc.name, ret, tc.want)
+			}
+			assertUserspaceXDPFallbackStat(t, coll, "binding_not_ready")
+			assertUserspaceXDPFallbackStat(t, coll, tc.statName)
+		})
 	}
 }
 
@@ -132,4 +233,134 @@ func injectShimProgramName(t *testing.T, bpfShim *dataplane.Manager, name string
 	// SwapXDPEntryProg only needs the name to exist when no links are
 	// attached, so a nil *ebpf.Program is sufficient for this unit test.
 	rm.SetMapIndex(reflect.ValueOf(name), reflect.Zero(rv.Type().Elem()))
+}
+
+const (
+	xdpActionDrop = 1
+	xdpActionPass = 2
+)
+
+func loadUserspaceXDPTestCollection(t *testing.T) *ebpf.Collection {
+	t.Helper()
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+	spec, err := ebpf.LoadCollectionSpec(filepath.Join("..", "userspace_xdp_bpfel.o"))
+	if err != nil {
+		t.Fatalf("load userspace_xdp_bpfel.o spec: %v", err)
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") ||
+			strings.Contains(err.Error(), "permission denied") {
+			t.Skipf("load userspace XDP collection: %v", err)
+		}
+		t.Fatalf("load userspace XDP collection: %v", err)
+	}
+	t.Cleanup(func() { coll.Close() })
+	return coll
+}
+
+func updateUserspaceXDPTestCtrl(t *testing.T, coll *ebpf.Collection, ctrl userspaceCtrlValue) {
+	t.Helper()
+	updateUserspaceXDPTestMap(t, coll, "userspace_ctrl", uint32(0), ctrl)
+}
+
+func updateUserspaceXDPTestBinding(t *testing.T, coll *ebpf.Collection, idx uint32, binding userspaceBindingValue) {
+	t.Helper()
+	updateUserspaceXDPTestMap(t, coll, "userspace_bindings", idx, binding)
+}
+
+func updateUserspaceXDPTestIngress(t *testing.T, coll *ebpf.Collection, ifindex uint32) {
+	t.Helper()
+	updateUserspaceXDPTestMap(t, coll, "userspace_ingress_ifaces", ifindex, uint8(1))
+}
+
+func updateUserspaceXDPTestLocalV4(t *testing.T, coll *ebpf.Collection, ip [4]byte) {
+	t.Helper()
+	updateUserspaceXDPTestMap(t, coll, "userspace_local_v4", binary.BigEndian.Uint32(ip[:]), uint8(1))
+}
+
+func updateUserspaceXDPTestMap(t *testing.T, coll *ebpf.Collection, name string, key any, value any) {
+	t.Helper()
+	m := coll.Maps[name]
+	if m == nil {
+		t.Fatalf("%s map not loaded", name)
+	}
+	if err := m.Update(key, value, ebpf.UpdateAny); err != nil {
+		t.Fatalf("update %s: %v", name, err)
+	}
+}
+
+func runUserspaceXDPTestPacket(t *testing.T, coll *ebpf.Collection, packet []byte) uint32 {
+	t.Helper()
+	prog := coll.Programs[userspaceXDPEntryProg]
+	if prog == nil {
+		t.Fatalf("%s program not loaded", userspaceXDPEntryProg)
+	}
+	ret, _, err := prog.Test(packet)
+	if err != nil {
+		t.Fatalf("run %s: %v", userspaceXDPEntryProg, err)
+	}
+	return ret
+}
+
+func assertUserspaceXDPFallbackStat(t *testing.T, coll *ebpf.Collection, name string) {
+	t.Helper()
+	if got := userspaceXDPFallbackStat(t, coll, name); got == 0 {
+		t.Fatalf("fallback stat %q = 0, want incremented", name)
+	}
+}
+
+func assertUserspaceXDPFallbackStatAbsent(t *testing.T, coll *ebpf.Collection, name string) {
+	t.Helper()
+	if got := userspaceXDPFallbackStat(t, coll, name); got != 0 {
+		t.Fatalf("fallback stat %q = %d, want 0", name, got)
+	}
+}
+
+func userspaceXDPFallbackStat(t *testing.T, coll *ebpf.Collection, name string) uint64 {
+	t.Helper()
+	stats := coll.Maps["userspace_fallback_stats"]
+	if stats == nil {
+		t.Fatal("userspace_fallback_stats map not loaded")
+	}
+	idx := fallbackReasonIndex(t, name)
+	var got uint64
+	if err := stats.Lookup(idx, &got); err != nil {
+		t.Fatalf("lookup userspace_fallback_stats[%d] (%s): %v", idx, name, err)
+	}
+	return got
+}
+
+func fallbackReasonIndex(t *testing.T, name string) uint32 {
+	t.Helper()
+	for idx, candidate := range fallbackReasonNames {
+		if candidate == name {
+			return uint32(idx)
+		}
+	}
+	t.Fatalf("fallback reason %q not found", name)
+	return 0
+}
+
+func udpIPv4TestPacket(src [4]byte, dst [4]byte) []byte {
+	packet := make([]byte, 14+20+8)
+	copy(packet[0:6], []byte{0x02, 0, 0, 0, 0, 1})
+	copy(packet[6:12], []byte{0x02, 0, 0, 0, 0, 2})
+	binary.BigEndian.PutUint16(packet[12:14], 0x0800)
+
+	ip := packet[14:34]
+	ip[0] = 0x45
+	binary.BigEndian.PutUint16(ip[2:4], uint16(len(ip)+8))
+	ip[8] = 64
+	ip[9] = 17
+	copy(ip[12:16], src[:])
+	copy(ip[16:20], dst[:])
+
+	udp := packet[34:]
+	binary.BigEndian.PutUint16(udp[0:2], 12345)
+	binary.BigEndian.PutUint16(udp[2:4], 443)
+	binary.BigEndian.PutUint16(udp[4:6], 8)
+	return packet
 }

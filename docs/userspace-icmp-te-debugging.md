@@ -96,8 +96,8 @@ plus cross-worker shared session lookup issue).
 4. **Tail-call issue discovered**: the removed `fallback_to_main()` path used
    `USERSPACE_FALLBACK_PROGS.tail_call()` and could fail silently in the
    aya-ebpf framework, causing XDP_DROP instead of eBPF pipeline processing.
-   The current shim bypasses that path entirely and uses explicit compat
-   kernel pass-through or strict fail-closed behavior.
+   The current shim bypasses that path entirely. Degraded helper/XSK states
+   pass only proven local/control traffic and drop non-local transit.
 
 ## TC Conntrack Fix
 

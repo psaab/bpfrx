@@ -91,17 +91,18 @@ kernel BPF pipeline.
 ```
 Packet arrives at NIC
   │
-  ├─ Non-IP (ARP, etc.) ──────────────────► cpumap → kernel stack
+  ├─ Non-IP (ARP, etc.) ──────────────────► kernel stack
   ├─ Multicast / broadcast ────────────────► cpumap → kernel stack
   ├─ Local destination ────────────────────► cpumap → kernel stack
-  ├─ GRE / ESP / degraded compat cases ────► kernel pass-through
-  ├─ Strict degraded cases ────────────────► XDP_DROP
+  ├─ GRE / ESP live exceptions ────────────► cpumap → kernel stack
+  ├─ Degraded local/control cases ─────────► kernel stack
+  ├─ Degraded transit cases ───────────────► XDP_DROP
   │
   ├─ Has active session in BPF map? ───YES─► XDP_REDIRECT → XSK socket
   │
   ├─ Session miss but still transit traffic ─► XDP_REDIRECT → XSK socket
   │
-  └─ Binding/heartbeat failure on DP-managed interface ─► compat pass or strict drop
+  └─ Binding/heartbeat failure on DP-managed interface ─► local/control pass or transit drop
 ```
 
 **Key design decisions:**
@@ -110,16 +111,17 @@ Packet arrives at NIC
   local/interface-NAT checks, but transit session misses are still redirected
   so the Rust dataplane can perform first-packet policy/NAT/FIB evaluation.
 
-- **cpumap for kernel pass-through**: In AF_XDP zero-copy mode, XDP_PASS
-  permanently consumes UMEM frames (the kernel holds them in SKBs). The
-  shim uses `bpf_redirect_map` to a cpumap instead, which immediately
-  frees the XSK frame while still delivering the packet to the kernel
-  networking stack.
+- **cpumap for kernel delivery**: For IP packets that must reach the kernel,
+  the shim uses `bpf_redirect_map` to a cpumap when available so zero-copy
+  XSK frames are released before stack delivery. Direct `XDP_PASS` is reserved
+  for cases such as ARP/NDP where cpumap delivery does not update the kernel
+  neighbor state correctly.
 
 - **Fail closed on dead bindings**: if a binding is missing, not ready, or
-  its heartbeat is stale on a userspace-managed interface, the shim drops
-  in strict mode. Compat mode uses explicit kernel pass-through for degraded
-  helper/XSK states and does not require the legacy `xdp_main_prog` fallback
+  its heartbeat is stale on a userspace-managed interface, the shim passes
+  only proven local/control traffic to the kernel. Non-local transit drops in
+  compat and strict modes and increments the `transit_drop` fallback counter.
+  The userspace runtime does not require the legacy `xdp_main_prog` fallback
   path.
 
 - **Heartbeat watchdog**: Each worker writes a timestamp to a BPF array

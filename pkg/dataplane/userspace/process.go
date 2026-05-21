@@ -96,10 +96,11 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	m.cfg = cfg
 	m.proc = cmd
 	// Bootstrap XSK fill ring on all queues: send broadcast pings
-	// 3 seconds after helper start. During this window, ctrl is disabled
-	// so the XDP shim uses its compat pass-through behavior. The broadcast
-	// pings generate hardware RX events on multiple queues, triggering NAPI
-	// which consumes fill ring entries and posts WQEs for zero-copy.
+	// 3 seconds after helper start. During this window, ctrl is disabled;
+	// the shim only passes proven local/control traffic and drops transit.
+	// The broadcast pings generate hardware RX events on multiple queues,
+	// triggering NAPI which consumes fill ring entries and posts WQEs for
+	// zero-copy.
 	go func() {
 		time.Sleep(3 * time.Second)
 		m.mu.Lock()
@@ -521,7 +522,7 @@ func (m *Manager) stopLocked() {
 	// Disable userspace forwarding BEFORE stopping the helper. Without this,
 	// the XDP shim continues redirecting to XSK after the helper exits,
 	// sending packets to dead socket fds. Setting ctrl.enabled=0 makes the
-	// shim use compat kernel pass-through or strict fail-closed behavior.
+	// shim pass only proven local/control traffic and drop transit.
 	m.disableUserspaceCtrlLocked()
 	_ = m.requestLocked(ControlRequest{Type: "shutdown"}, nil)
 	done := make(chan struct{})
@@ -570,8 +571,8 @@ func (m *Manager) stopLocked() {
 // events. Without at least one packet per queue, the fill ring stays
 // unconsumed and XDP_REDIRECT silently drops packets.
 //
-// The probes are sent while ctrl is disabled, so the XDP shim uses compat
-// pass-through and the kernel handles them normally.
+// The probes are sent while ctrl is disabled, so only the local/control
+// boundary reaches the kernel; transit remains fail-closed.
 func (m *Manager) bootstrapNAPIQueuesLocked() {
 	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
 		return
@@ -957,7 +958,7 @@ func (m *Manager) DisableAndStopHelper() {
 // PrepareLinkCycle must be called BEFORE any link DOWN/UP cycle (e.g. RETH
 // MAC programming). It:
 //  1. Disables ctrl so the XDP shim stops redirecting to XSK
-//  2. Leaves the userspace shim attached for compat pass-through or strict drop
+//  2. Leaves the userspace shim attached with transit fail-closed
 //  3. Sends "stop_workers" to the Rust helper, which joins all worker
 //     threads — no thread touches UMEM after this returns
 //
