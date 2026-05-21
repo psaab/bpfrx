@@ -519,6 +519,36 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                             )
                         } {
                             Some(frame) => {
+                                let mut frame = frame;
+                                let mut outer_meta_opt = None;
+                                if let Some(endpoint) = forwarding.tunnel_endpoints.get(&request.decision.resolution.tunnel_endpoint_id) {
+                                    if endpoint.mode == "wireguard" {
+                                        let mut encap_meta = request.meta;
+                                        encap_meta.l3_offset = 14;
+                                        if let Some(engine) = target_binding.wireguard_engines.get_mut(&endpoint.wg_listen_port) {
+                                            if let Some((start_idx, total_len, outer_meta)) = engine.try_encap(
+                                                &frame,
+                                                encap_meta.addr_family,
+                                                encap_meta.ingress_ifindex,
+                                                0,
+                                                None,
+                                                Some(endpoint.source),
+                                                &mut target_binding.scratch.scratch_wg_out,
+                                            ) {
+                                                frame = target_binding.scratch.scratch_wg_out[start_idx..start_idx + total_len].to_vec();
+                                                outer_meta_opt = Some(outer_meta);
+                                            } else {
+                                                build_failed = true;
+                                                fallback_to_slow_path = true;
+                                                continue;
+                                            }
+                                        } else {
+                                            build_failed = true;
+                                            fallback_to_slow_path = true;
+                                            continue;
+                                        }
+                                    }
+                                }
                                 if cfg!(feature = "debug-log") {
                                     if let Some(reason) = forward_tuple_mismatch_reason(
                                         live_frame_ports_from_meta_bytes(
@@ -921,8 +951,8 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 let req = TxRequest {
                                     bytes: frame,
                                     expected_ports,
-                                    expected_addr_family: request.meta.addr_family,
-                                    expected_protocol: request.meta.protocol,
+                                    expected_addr_family: outer_meta_opt.map(|m| m.addr_family).unwrap_or(request.meta.addr_family),
+                                    expected_protocol: outer_meta_opt.map(|m| m.protocol).unwrap_or(request.meta.protocol),
                                     flow_key: flow_key.take(),
                                     egress_ifindex: request.decision.resolution.egress_ifindex,
                                     cos_queue_id: request.cos_queue_id,

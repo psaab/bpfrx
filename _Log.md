@@ -2,6 +2,11 @@
 
 ## 2026-05-21
 
+- **Timestamp**: 2026-05-21T17:45:00Z
+  - **Action**: PR #1433 r13 follow-up — restored WireGuard encapsulation + outer metadata propagation in the reachable native-tunnel copy fallback path in `tx/dispatch.rs` (the branch entered when `uses_native_tunnel` disables in-place/direct rewrite).
+  - **File(s)**: `userspace-dp/src/afxdp/tx/dispatch.rs`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/userspace`; `cargo test --manifest-path userspace-dp/Cargo.toml -q dispatch_tests` (expected environment failure: missing libelf/gelf headers/pkg-config in runner); `git diff --check`
+
 - **Timestamp**: 2026-05-21T07:16:00Z
   - **Action**: Minor cleanup after validation feedback — changed WireGuard decap tuple binding to discard the unused target-worker slot directly (`_`) to avoid dead local binding noise.
   - **File(s)**: `userspace-dp/src/afxdp/poll_descriptor.rs`, `_Log.md`
