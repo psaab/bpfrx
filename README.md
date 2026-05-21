@@ -3,10 +3,10 @@
 Stateful firewall with native Junos configuration syntax.
 
 > Deprecation notice (#1373): the Rust AF_XDP userspace dataplane is now the
-> primary/default target for dataplane development and validation. The legacy
-> eBPF dataplane remains in-tree for compatibility, rollback, and regression
-> coverage during the staged retirement. Phase 1 updates active documentation;
-> later phases own source, loader, build, and CLI removals.
+> primary/default target for dataplane development, validation, and omitted
+> runtime configuration. The legacy eBPF dataplane remains in-tree for
+> explicit compatibility and regression coverage during the staged retirement.
+> Later phases own source, loader, build, and CLI removals.
 
 xpf is a high-performance stateful firewall that replicates Juniper vSRX
 capabilities. It uses the familiar Junos hierarchical configuration syntax and
@@ -18,11 +18,12 @@ xpf provides dataplane backends selectable via configuration. Both share the
 same Go control plane (config, HA, routing, CLI, APIs); only the packet
 forwarding path differs.
 
-The userspace AF_XDP backend is the primary retirement target. It is still
-selected explicitly with `system dataplane-type userspace`; if that knob is
-omitted, the current code falls back to the legacy eBPF backend until a later
-cutover phase changes runtime defaults. New dataplane feature work should use
-the userspace path and close blockers tracked in
+The userspace AF_XDP backend is the default runtime target. Operators may still
+set `system dataplane-type userspace` explicitly, but omitting that knob also
+selects the userspace runtime path. The legacy eBPF backend remains available
+only through an explicit `system dataplane-type ebpf` selection until the later
+source-removal phase. New dataplane feature work should use the userspace path
+and close blockers tracked in
 [`docs/userspace-dataplane-gaps.md`](docs/userspace-dataplane-gaps.md).
 
 ### Userspace Dataplane (primary target)
@@ -42,15 +43,15 @@ NIC → XDP shim (live-session + new-flow redirect, kernel pass-through, explici
 - **Per-worker architecture**: one worker per queue shard, with session/NAT/policy/FIB handled in Rust
 - **AF_XDP fast path**: current code supports both copy and zero-copy modes depending on driver/path behavior
 - **Kernel pass-through**: cpumap-assisted delivery keeps local/kernel-owned traffic out of the AF_XDP fast path
-- **Automatic fallback**: unsupported configs and explicit error paths still fall back to the legacy eBPF dataplane
+- **Fail-closed admission**: unsupported userspace configs should be gated or
+  fail closed rather than silently falling back to legacy eBPF
 - **Best for**: new dataplane development, primary validation, and high-throughput transit forwarding on supported configs
 - **See**: [`docs/userspace-dataplane-architecture.md`](docs/userspace-dataplane-architecture.md) for the current architecture and [`docs/userspace-debug-map.md`](docs/userspace-debug-map.md) for the active debugging map
 
-**To select the userspace dataplane:**
+**To tune the userspace dataplane:**
 
 ```junos
 system {
-    dataplane-type userspace;
     dataplane {
         binary /usr/local/sbin/xpf-userspace-dp;
         workers 6;
@@ -151,7 +152,7 @@ admission boundary is documented in
 - **IPsec SA sync**: shared IKE/ESP state across cluster nodes
 - **Dual fabric links**: independent fab0/fab1 for redundancy (no bonding)
 - **Fabric cross-chassis forwarding**: `try_fabric_redirect()` redirects to peer when FIB fails for synced sessions
-- **Dataplane watchdogs**: legacy BPF pins and userspace heartbeat checks fail closed on daemon/helper failure
+- **Dataplane watchdogs**: userspace heartbeat checks fail closed on daemon/helper failure; legacy BPF pins remain for explicitly selected eBPF compatibility
 - **Readiness gate**: per-RG readiness (interfaces + VRRP) + hold timer gates election
 - **Planned shutdown**: near-instant takeover (priority-0 burst), failback ~130ms
 - **ISSU**: in-service software upgrade with rolling deploy

@@ -1,10 +1,10 @@
 # Testing & Performance Guide
 
 > Deprecation notice (#1373): routine dataplane validation now targets the
-> userspace AF_XDP cluster by default. The legacy eBPF dataplane remains
-> available for compatibility, rollback, and explicit regression coverage during
-> the staged retirement. Phase 1 updates active documentation; later phases own
-> source, loader, build, and CLI removals.
+> userspace AF_XDP cluster by default, and omitted runtime configuration now
+> selects userspace. The legacy eBPF dataplane remains available for explicit
+> compatibility and regression coverage during the staged retirement. Later
+> phases own source, loader, build, and CLI removals.
 
 This page still contains legacy eBPF standalone/HA procedures and historical
 performance notes. Treat them as regression context unless a workstream

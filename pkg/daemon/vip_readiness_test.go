@@ -317,7 +317,7 @@ func TestTakeoverReadinessForRG_NoRethIgnoresClusterSyncReady(t *testing.T) {
 func TestUserspaceRGConfigured(t *testing.T) {
 	cfg := &config.Config{
 		System: config.SystemConfig{
-			DataplaneType: dataplane.TypeUserspace,
+			DataplaneType: "",
 		},
 		Interfaces: config.InterfacesConfig{
 			Interfaces: map[string]*config.InterfaceConfig{
@@ -347,5 +347,10 @@ func TestUserspaceRGConfigured(t *testing.T) {
 	}
 	if userspaceRGConfigured(nil, 1) {
 		t.Fatal("expected nil config not configured")
+	}
+
+	cfg.System.DataplaneType = dataplane.TypeEBPF
+	if userspaceRGConfigured(cfg, 1) {
+		t.Fatal("expected explicit legacy eBPF config not configured for userspace RG")
 	}
 }

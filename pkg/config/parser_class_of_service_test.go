@@ -960,8 +960,8 @@ func TestValidateClassOfServiceWarnings(t *testing.T) {
 	if !strings.Contains(warnings, "dscp rewrite-rule loss-priority is accepted for compatibility but not yet enforced") {
 		t.Fatalf("expected rewrite-rule loss-priority warning, got: %s", warnings)
 	}
-	if !strings.Contains(warnings, "class-of-service shaping, classifier attachment, and dscp rewrite-rule attachment are only implemented in the userspace dataplane") {
-		t.Fatalf("expected dataplane warning, got: %s", warnings)
+	if strings.Contains(warnings, "class-of-service shaping, classifier attachment, and dscp rewrite-rule attachment are only implemented in the userspace dataplane") {
+		t.Fatalf("unexpected dataplane warning for default userspace path: %s", warnings)
 	}
 }
 

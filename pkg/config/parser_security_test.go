@@ -2400,7 +2400,7 @@ func TestValidateConfigDoesNotWarnDormantSynCookieWithoutRootSecret(t *testing.T
 	}
 }
 
-func TestValidateConfigDoesNotWarnDefaultDataplaneSynCookieWithoutRootSecret(t *testing.T) {
+func TestValidateConfigWarnsDefaultUserspaceSynCookieWithoutRootSecret(t *testing.T) {
 	tree := &ConfigTree{}
 	setCommands := []string{
 		"set security flow syn-flood-protection-mode syn-cookie",
@@ -2422,8 +2422,8 @@ func TestValidateConfigDoesNotWarnDefaultDataplaneSynCookieWithoutRootSecret(t *
 	}
 
 	warnings := strings.Join(cfg.Warnings, "\n")
-	if strings.Contains(warnings, "active userspace-dp SYN-cookie screen profiles require") {
-		t.Fatalf("unexpected default-dataplane SYN-cookie warning: %s", warnings)
+	if !strings.Contains(warnings, "active userspace-dp SYN-cookie screen profiles require") {
+		t.Fatalf("expected default-userspace SYN-cookie warning, got: %s", warnings)
 	}
 }
 

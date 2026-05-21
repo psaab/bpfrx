@@ -1,10 +1,10 @@
 # xpf - Junos-Style Firewall With AF_XDP Userspace Dataplane
 
 > Deprecation notice (#1373): the Rust AF_XDP userspace dataplane is now the
-> primary/default target for dataplane development and validation. The legacy
-> eBPF dataplane remains in-tree for compatibility, rollback, and regression
-> coverage during the staged retirement. Phase 1 updates active documentation;
-> later phases own source, loader, build, and CLI removals.
+> primary/default target for dataplane development, validation, and omitted
+> runtime configuration. The legacy eBPF dataplane remains in-tree for explicit
+> compatibility and regression coverage during the staged retirement. Later
+> phases own source, loader, build, and CLI removals.
 
 ## Working Style
 - Think before acting. Read existing files before writing code.

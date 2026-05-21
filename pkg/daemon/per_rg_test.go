@@ -107,26 +107,26 @@ func TestRethMasterState_MultiRG(t *testing.T) {
 	}
 }
 
-func TestStrictVIPOwnershipByDefault_DefaultsToStrictInVRRPMode(t *testing.T) {
+func TestStrictVIPOwnershipByDefault_DefaultUserspaceKeepsVRRPLoose(t *testing.T) {
 	cc := &config.ClusterConfig{
 		RedundancyGroups: []*config.RedundancyGroup{{ID: 1}},
 	}
 	cfg := &config.Config{}
 
-	if !strictVIPOwnershipByDefault(cc, cfg) {
-		t.Fatal("expected strict VIP ownership to default on in VRRP mode")
+	if strictVIPOwnershipByDefault(cc, cfg) {
+		t.Fatal("expected strict VIP ownership off for default userspace dataplane")
 	}
 }
 
-func TestStrictVIPOwnershipByDefault_DisabledInUserspaceVRRPMode(t *testing.T) {
+func TestStrictVIPOwnershipByDefault_EnabledInLegacyEBPFVRRPMode(t *testing.T) {
 	cc := &config.ClusterConfig{
 		RedundancyGroups: []*config.RedundancyGroup{{ID: 1}},
 	}
 	cfg := &config.Config{}
-	cfg.System.DataplaneType = dataplane.TypeUserspace
+	cfg.System.DataplaneType = dataplane.TypeEBPF
 
-	if strictVIPOwnershipByDefault(cc, cfg) {
-		t.Fatal("expected strict VIP ownership to stay off in userspace VRRP mode")
+	if !strictVIPOwnershipByDefault(cc, cfg) {
+		t.Fatal("expected strict VIP ownership on for explicit legacy eBPF VRRP mode")
 	}
 }
 

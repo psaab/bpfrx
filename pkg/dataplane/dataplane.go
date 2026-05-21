@@ -16,10 +16,20 @@ var _ RuntimeDataPlane = (*Manager)(nil)
 
 // Dataplane type constants used in system { dataplane-type <type>; }.
 const (
-	TypeEBPF      = "ebpf" // default
+	TypeEBPF      = "ebpf"
 	TypeDPDK      = "dpdk"
 	TypeUserspace = "userspace"
 )
+
+// EffectiveType resolves the operator-facing dataplane type.  The empty
+// config value now means the userspace runtime path; callers must not treat an
+// omitted value as legacy eBPF fallback.
+func EffectiveType(dpType string) string {
+	if dpType == "" {
+		return TypeUserspace
+	}
+	return dpType
+}
 
 func UserspaceCtrlPinPath() string {
 	return filepath.Join(bpfPinPath, "userspace_ctrl")
@@ -92,11 +102,18 @@ func RegisterRuntimeBackend(dpType string, ctor func() RuntimeDataPlane) {
 	runtimeBackendRegistry[dpType] = ctor
 }
 
-// NewDataPlane creates a DataPlane backend based on the given type string.
-// An empty string defaults to eBPF.
+// NewDataPlane creates a legacy DataPlane backend based on the given type
+// string.  It intentionally does not accept the empty default: daemon startup
+// must use NewRuntimeDataPlane so omitted config resolves to userspace instead
+// of silently falling back to legacy eBPF.
 func NewDataPlane(dpType string) (DataPlane, error) {
 	switch dpType {
-	case "", TypeEBPF:
+	case "":
+		return nil, fmt.Errorf(
+			"empty dataplane type defaults to %q; use NewRuntimeDataPlane for default selection",
+			TypeUserspace,
+		)
+	case TypeEBPF:
 		return New(), nil
 	default:
 		if ctor, ok := backendRegistry[dpType]; ok {
@@ -110,12 +127,16 @@ func NewDataPlane(dpType string) (DataPlane, error) {
 // Userspace registers here directly so daemon startup does not require a
 // legacy BPF-shaped DataPlane compatibility adapter.
 func NewRuntimeDataPlane(dpType string) (RuntimeDataPlane, error) {
+	dpType = EffectiveType(dpType)
 	switch dpType {
-	case "", TypeEBPF:
+	case TypeEBPF:
 		return New(), nil
 	default:
 		if ctor, ok := runtimeBackendRegistry[dpType]; ok {
 			return ctor(), nil
+		}
+		if dpType == TypeUserspace {
+			return nil, fmt.Errorf("dataplane type %q runtime backend is not registered", dpType)
 		}
 		dp, err := NewDataPlane(dpType)
 		if err != nil {

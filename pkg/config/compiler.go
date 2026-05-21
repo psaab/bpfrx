@@ -924,7 +924,11 @@ func ValidateConfig(cfg *Config) []string {
 				}
 			}
 		}
-		if (len(cos.Interfaces) > 0 || len(cos.DSCPClassifiers) > 0 || len(cos.IEEE8021Classifiers) > 0 || len(cos.DSCPRewriteRules) > 0) && cfg.System.DataplaneType != "userspace" {
+		hasCoSRuntimeConfig := len(cos.Interfaces) > 0 ||
+			len(cos.DSCPClassifiers) > 0 ||
+			len(cos.IEEE8021Classifiers) > 0 ||
+			len(cos.DSCPRewriteRules) > 0
+		if hasCoSRuntimeConfig && effectiveDataplaneType(cfg.System.DataplaneType) != "userspace" {
 			warnings = append(warnings, "class-of-service shaping, classifier attachment, and dscp rewrite-rule attachment are only implemented in the userspace dataplane; configuration is accepted but will not take effect on this dataplane")
 		}
 	}
@@ -932,8 +936,15 @@ func ValidateConfig(cfg *Config) []string {
 	return warnings
 }
 
+func effectiveDataplaneType(dpType string) string {
+	if dpType == "" {
+		return "userspace"
+	}
+	return dpType
+}
+
 func userspaceSynCookieProtectionActive(cfg *Config) bool {
-	if cfg == nil || cfg.System.DataplaneType != "userspace" ||
+	if cfg == nil || effectiveDataplaneType(cfg.System.DataplaneType) != "userspace" ||
 		cfg.Security.Flow.SynFloodProtectionMode != "syn-cookie" {
 		return false
 	}

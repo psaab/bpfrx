@@ -433,7 +433,7 @@ type SystemConfig struct {
 	BackupRouterDst          string   // backup router destination prefix
 	Lo0FilterInputV4         string   // lo0 unit 0 family inet filter input (host-bound filtering)
 	Lo0FilterInputV6         string   // lo0 unit 0 family inet6 filter input (host-bound filtering)
-	DataplaneType            string   // "ebpf" (default), "dpdk", or "userspace"
+	DataplaneType            string   // empty defaults to "userspace"; explicit "ebpf" is legacy
 	DPDKDataplane            *DPDKConfig
 	UserspaceDataplane       *UserspaceConfig
 	InternetOptions          *InternetOptionsConfig
