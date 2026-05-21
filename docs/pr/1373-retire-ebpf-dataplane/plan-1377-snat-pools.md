@@ -35,10 +35,12 @@ runtime lease reuse, and operator-visible allocation failures.
   duplicate rules cannot overbook the same translated tuple. In-process
   snapshot refreshes preserve allocator state only when the helper keeps the
   same binding-plan entries and the allocator key is unchanged. Helper restart,
-  binding-plan changes that force helper replan, and pool-shape edits reset
-  allocator state. #1449 closes the HA question by treating persistent source
-  NAT in HA as an admission boundary: userspace forwarding is blocked with an
-  explicit unsupported reason because persistent leases are not synchronized.
+  binding-plan changes that force helper replan, and pool-shape edits are
+  explicit reset boundaries: live tuple ownership, persistent leases, and
+  allocator counters are not replayed. #1449 closes the HA question by treating
+  persistent source NAT in HA as an admission boundary: userspace forwarding is
+  blocked with an explicit unsupported reason because persistent leases are not
+  synchronized.
 
 ## Current Fail-Closed Runtime Boundary
 
@@ -194,8 +196,12 @@ contract is helper-local:
 - compatible in-process snapshot refreshes preserve allocator state only when
   the helper keeps the same binding-plan entries and the concrete allocator key
   is unchanged;
-- helper restart and binding-plan changes that force helper replan reset
-  allocator live state even when the pool key is unchanged;
+- helper restart, helper cold start, and binding-plan changes that force helper
+  replan reset allocator live state even when the pool key is unchanged;
+- reset boundaries do not replay live tuple ownership, persistent leases, or
+  allocator counters. New flows allocate from fresh helper-local state; they may
+  happen to receive the same translated tuple, but that is a fresh allocation,
+  not lease continuity;
 - edits to pool name, IPv4/IPv6 address lists, address order, or port range
   replace allocator state and can reset persistent lease continuity;
 - HA configs using persistent source-NAT pools are gated before userspace
@@ -228,6 +234,13 @@ contract because the config is not admitted to userspace forwarding in the
 first place. A future PR that removes this gate must implement full lease sync
 or replay with tuple-conflict and stale-entry tests before claiming HA
 persistent-NAT support.
+
+Operators can audit the boundary through existing status and Prometheus
+counters. `Source NAT pools` status rows and the
+`xpf_userspace_source_nat_pool_*` metrics report helper-local `live_flows`,
+`used_ports`, `persistent_leases`, `allocations_total`, `reuses_total`, and
+`exhaustions_total`; after helper restart or replan these values start again
+from the new helper runtime state.
 
 The compatible-refresh boundary has two parts. First, the helper must keep the
 same binding-plan entries; binding-plan changes cause helper replan and rebuild
@@ -370,6 +383,11 @@ Covered by #1385 and this closeout:
 - Cargo: address-persistent pressure cleanup reclaims expired leases for the
   selected pool address even when the global allocation cleanup budget was spent
   on older expirations from other addresses.
+- Cargo: compatible in-process snapshot refresh preserves persistent leases,
+  tuple ownership, and allocator counters for an unchanged source-NAT pool key.
+- Cargo: helper cold start with the same snapshot resets persistent leases,
+  tuple ownership, and allocator counters; the next same-source flow is counted
+  as a new allocation rather than a lease reuse.
 - Cargo: protocol round-trip covers persistent source-NAT snapshot/status
   fields.
 
@@ -378,7 +396,7 @@ Still outside the current supported contract:
 - Integration: active userspace SNAT pool sessions preserve return traffic
   across failover, while new-flow mixed-backend rollback tests accept the
   documented selector boundary.
-- Helper-restart persistence for the persistent-NAT lease table.
+- Helper-restart lease replay beyond the documented reset boundary.
 - HA synchronization for persistent-NAT leases. The current #1449 contract is
   the explicit HA capability gate above, not partial lease replay.
 - A shared selector algorithm across eBPF, DPDK, and userspace for new-flow

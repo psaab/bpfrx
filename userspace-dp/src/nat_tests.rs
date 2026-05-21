@@ -873,7 +873,23 @@ fn persistent_pool_rules_with_options(
     pool_addresses: Vec<&str>,
     address_persistent: bool,
 ) -> Vec<SourceNatRule> {
-    parse_source_nat_rules(&[SourceNATRuleSnapshot {
+    parse_source_nat_rules(&[persistent_pool_snapshot(
+        timeout_secs,
+        port_low,
+        port_high,
+        pool_addresses,
+        address_persistent,
+    )])
+}
+
+fn persistent_pool_snapshot(
+    timeout_secs: i64,
+    port_low: u16,
+    port_high: u16,
+    pool_addresses: Vec<&str>,
+    address_persistent: bool,
+) -> SourceNATRuleSnapshot {
+    SourceNATRuleSnapshot {
         name: "persistent-snat".to_string(),
         from_zone: "lan".to_string(),
         to_zone: "wan".to_string(),
@@ -890,7 +906,7 @@ fn persistent_pool_rules_with_options(
         persistent_nat_permit_any_remote_host: true,
         persistent_nat_inactivity_timeout: timeout_secs,
         ..SourceNATRuleSnapshot::default()
-    }])
+    }
 }
 
 fn tuple_snat_lookup(
@@ -1079,6 +1095,79 @@ fn pool_snat_persistent_reassigns_after_timeout() {
     assert_eq!(reassigned.rewrite_src, first.rewrite_src);
     assert_ne!(reassigned.rewrite_src_port, first.rewrite_src_port);
     assert_persistent_expiry_indexes_consistent(&rules[0]);
+}
+
+#[test]
+fn pool_snat_persistent_compatible_refresh_preserves_lease_state() {
+    let snapshot = persistent_pool_snapshot(300, 40000, 40001, vec!["203.0.113.10"], false);
+    let rules = parse_source_nat_rules(&[snapshot.clone()]);
+    let first = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
+    release_source_nat_allocation(&rules, &session_key(12345, "8.8.8.8", 53), first, false, 2);
+
+    let before = source_nat_pool_statuses(&rules);
+    assert_eq!(before[0].live_flows, 0);
+    assert_eq!(before[0].used_ports, 1);
+    assert_eq!(before[0].persistent_leases, 1);
+    assert_eq!(before[0].allocations_total, 1);
+    assert_eq!(before[0].reuses_total, 0);
+
+    let refreshed = parse_source_nat_rules_with_previous(&[snapshot], Some(&rules));
+    let after_refresh = source_nat_pool_statuses(&refreshed);
+    assert_eq!(after_refresh[0].live_flows, 0);
+    assert_eq!(after_refresh[0].used_ports, 1);
+    assert_eq!(after_refresh[0].persistent_leases, 1);
+    assert_eq!(after_refresh[0].allocations_total, 1);
+    assert_eq!(after_refresh[0].reuses_total, 0);
+
+    let reused = expect_snat_decision(tuple_snat_lookup(&refreshed, 12345, "1.1.1.1", 443, 3));
+    assert_eq!(reused.rewrite_src, first.rewrite_src);
+    assert_eq!(reused.rewrite_src_port, first.rewrite_src_port);
+
+    let after_reuse = source_nat_pool_statuses(&refreshed);
+    assert_eq!(after_reuse[0].live_flows, 1);
+    assert_eq!(after_reuse[0].used_ports, 1);
+    assert_eq!(after_reuse[0].persistent_leases, 1);
+    assert_eq!(after_reuse[0].allocations_total, 1);
+    assert_eq!(after_reuse[0].reuses_total, 1);
+    assert_persistent_expiry_indexes_consistent(&refreshed[0]);
+}
+
+#[test]
+fn pool_snat_persistent_helper_restart_resets_lease_state() {
+    let snapshot = persistent_pool_snapshot(300, 40000, 40001, vec!["203.0.113.10"], false);
+    let rules = parse_source_nat_rules(&[snapshot.clone()]);
+    let first = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
+    release_source_nat_allocation(&rules, &session_key(12345, "8.8.8.8", 53), first, false, 2);
+
+    let before = source_nat_pool_statuses(&rules);
+    assert_eq!(before[0].live_flows, 0);
+    assert_eq!(before[0].used_ports, 1);
+    assert_eq!(before[0].persistent_leases, 1);
+    assert_eq!(before[0].allocations_total, 1);
+
+    // A helper restart has no previous in-process allocator to reuse. The
+    // lease table and allocator counters reset even when the snapshot is
+    // byte-identical.
+    let restarted = parse_source_nat_rules(&[snapshot]);
+    let reset = source_nat_pool_statuses(&restarted);
+    assert_eq!(reset[0].live_flows, 0);
+    assert_eq!(reset[0].used_ports, 0);
+    assert_eq!(reset[0].persistent_leases, 0);
+    assert_eq!(reset[0].allocations_total, 0);
+    assert_eq!(reset[0].reuses_total, 0);
+    assert_eq!(reset[0].exhaustion_total, 0);
+
+    let fresh = expect_snat_decision(tuple_snat_lookup(&restarted, 12345, "1.1.1.1", 443, 3));
+    assert_eq!(fresh.rewrite_src, Some("203.0.113.10".parse().unwrap()));
+    assert!(fresh.rewrite_src_port.is_some());
+
+    let after_fresh = source_nat_pool_statuses(&restarted);
+    assert_eq!(after_fresh[0].live_flows, 1);
+    assert_eq!(after_fresh[0].used_ports, 1);
+    assert_eq!(after_fresh[0].persistent_leases, 1);
+    assert_eq!(after_fresh[0].allocations_total, 1);
+    assert_eq!(after_fresh[0].reuses_total, 0);
+    assert_persistent_expiry_indexes_consistent(&restarted[0]);
 }
 
 #[test]

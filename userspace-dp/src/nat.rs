@@ -916,6 +916,11 @@ pub(crate) fn parse_source_nat_rules_with_previous(
     snaps: &[SourceNATRuleSnapshot],
     previous: Option<&[SourceNatRule]>,
 ) -> Vec<SourceNatRule> {
+    // Persistent SNAT allocator state is helper-local runtime state. A
+    // compatible in-process refresh may reuse the previous allocator below,
+    // but a helper cold start passes `None` here and intentionally resets live
+    // tuple ownership, persistent leases, and allocator counters instead of
+    // replaying unproven translated tuple ownership.
     let mut out = Vec::with_capacity(snaps.len());
     let mut previous_allocators = FxHashMap::<SourceNatPoolAllocatorKey, PortAllocator>::default();
     if let Some(prev_rules) = previous {
