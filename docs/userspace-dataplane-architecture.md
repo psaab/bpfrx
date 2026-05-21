@@ -315,8 +315,9 @@ the NAT module applies it:
   Per-pool `persistent-nat` lease reuse is helper-local userspace runtime
   state keyed by source tuple `(protocol, source IP, source port)` to
   translated tuple. Compatible in-process snapshot refreshes preserve it;
-  helper restart does not. HA configs using persistent source-NAT pools are
-  gated because persistent leases are not synchronized.
+  helper restart does not. #1449 closes HA behavior as an explicit userspace
+  capability gate: HA configs using persistent source-NAT pools are not
+  admitted because persistent leases are not synchronized.
 - **Checksum update:** Incremental RFC 1624 checksum adjustment for
   IP header + TCP/UDP pseudo-header. Avoids full recomputation.
 
@@ -391,15 +392,17 @@ filters, flow export, TCP MSS clamping, configurable timeouts, VLAN handling,
 route/neighbor lookup, and HA/session-delta ingestion.
 
 Remaining explicit gates include three-color policers, dataplane event parity,
-and the residual #1377 SNAT pool contract for per-pool `persistent-nat`,
-allocator exhaustion counters, and mixed-backend rollback constraints.
+and the residual #1377 SNAT pool contract for helper-restart persistence and
+mixed-backend rollback constraints.
 SYN-cookie-dependent screen behavior is admitted in userspace; #1374 still
 needs live HA/flood evidence before BPF source removal. Port mirroring is no
 longer a
 `deriveUserspaceCapabilities()` gate; its remaining #1376 work is operator
 evidence for mirror fidelity and primary-forwarding survival under mirror
-pressure before BPF source removal. HA persistent-SNAT configs remain gated;
-non-HA per-pool persistent-NAT lease reuse is helper-local userspace state.
+pressure before BPF source removal. HA persistent-SNAT configs remain gated
+with the status reason `userspace persistent-nat source pool leases are not
+HA-synchronized`; non-HA per-pool persistent-NAT lease reuse is helper-local
+userspace state.
 
 Policy scheduler state is no longer a propagation gap: #1396 carries scheduler
 state into the userspace snapshot and Rust policy evaluator, and the 2026-05-19
@@ -410,9 +413,10 @@ commit behavior, and integration/failover evidence with
 fails closed at the `poll_descriptor.rs` source-NAT call sites for missing
 pools, empty pools, invalid pool inputs, wrong-family-only pools, or allocator
 failure. The current slice adds bounded helper-local persistent-NAT lease reuse,
-allocator observability, and live-port exhaustion counters. #1377 still owns
-helper-restart persistence, HA lease synchronization, and the documented
-mixed-backend rollback boundary. #1386 landed
+allocator observability, and live-port exhaustion counters. #1449 records HA
+persistent-lease behavior as a capability gate rather than lease replay; #1377
+still owns helper-restart persistence and the documented mixed-backend rollback
+boundary. #1386 landed
 userspace buffer/status rendering, and #1380 now treats helper-published
 capacity as the boundary for fill percentages instead of synthesizing
 utilization from dynamic counters.
@@ -579,9 +583,10 @@ is [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
   fail-closed runtime handling for missing pools, empty pools, invalid pool
   inputs, wrong-family-only pools, and allocator failures have landed.
   Helper-local non-HA per-pool `persistent-nat` lease reuse and pool
-  allocation/exhaustion counters have landed. #1377 is still required for
-  helper-restart persistence, HA lease synchronization, and the mixed-backend
-  rollback test boundary.
+  allocation/exhaustion counters have landed. #1449 closes HA behavior as an
+  explicit userspace capability gate because persistent leases are not
+  synchronized. #1377 is still required for helper-restart persistence and the
+  mixed-backend rollback test boundary.
 - SYN-cookie flood protection closeout: bounded SYN-ACK/RST TX,
   root-auth-derived snapshot key publication, fail-closed missing-secret
   behavior, status counters, and gate removal are wired. #1374 still owns the

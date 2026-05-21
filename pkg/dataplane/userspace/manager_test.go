@@ -1248,6 +1248,30 @@ func TestTakeoverReadyReportsSessionMirrorFailure(t *testing.T) {
 	}
 }
 
+func TestTakeoverReadyReportsPersistentSourceNATHABoundary(t *testing.T) {
+	m := &Manager{
+		proc: &exec.Cmd{Process: &os.Process{Pid: 1}},
+		lastStatus: ProcessStatus{
+			Enabled:         true,
+			ForwardingArmed: true,
+			Capabilities: UserspaceCapabilities{
+				ForwardingSupported: false,
+				UnsupportedReasons:  []string{persistentSourceNATHAUnsupportedReason},
+			},
+		},
+		mode:              ModeUserspaceCompat,
+		xskLivenessProven: true,
+	}
+
+	ready, reasons := m.TakeoverReady()
+	if ready {
+		t.Fatal("TakeoverReady() = true, want false")
+	}
+	if !slices.Contains(reasons, persistentSourceNATHAUnsupportedReason) {
+		t.Fatalf("TakeoverReady() reasons = %v, missing persistent source NAT HA boundary", reasons)
+	}
+}
+
 func testStandbyNeighborPrewarmManager() *Manager {
 	return &Manager{
 		proc:      &exec.Cmd{Process: &os.Process{Pid: 1}},
@@ -2724,7 +2748,7 @@ func TestDeriveUserspaceCapabilitiesRejectsHAPersistentSourceNAT(t *testing.T) {
 	if caps.ForwardingSupported {
 		t.Fatal("ForwardingSupported = true, want false for HA persistent source NAT")
 	}
-	if !slices.Contains(caps.UnsupportedReasons, "userspace persistent-nat source pool leases are not HA-synchronized") {
+	if !slices.Contains(caps.UnsupportedReasons, persistentSourceNATHAUnsupportedReason) {
 		t.Fatalf("unsupported reasons = %+v, missing persistent-nat HA reason", caps.UnsupportedReasons)
 	}
 }

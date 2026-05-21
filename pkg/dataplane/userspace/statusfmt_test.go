@@ -130,6 +130,25 @@ func TestFormatStatusSummary(t *testing.T) {
 	}
 }
 
+func TestFormatStatusSummaryShowsPersistentSourceNATHABoundary(t *testing.T) {
+	status := ProcessStatus{
+		Capabilities: UserspaceCapabilities{
+			ForwardingSupported: false,
+			UnsupportedReasons:  []string{persistentSourceNATHAUnsupportedReason},
+		},
+	}
+
+	out := FormatStatusSummary(status)
+	for _, want := range []string{
+		"Forwarding supported:      false",
+		"Forwarding blocked by:     " + persistentSourceNATHAUnsupportedReason,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("summary missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestFormatSYNCookieCounterRows(t *testing.T) {
 	status := ProcessStatus{
 		Bindings: []BindingStatus{

@@ -31,6 +31,8 @@ var _ dataplane.RuntimeDataPlane = (*Manager)(nil)
 var ErrPolicySchedulerProtocolIncompatible = errors.New("userspace policy scheduler snapshot protocol incompatible")
 var ErrPersistentSourceNATProtocolIncompatible = errors.New("userspace persistent source NAT snapshot protocol incompatible")
 
+const persistentSourceNATHAUnsupportedReason = "userspace persistent-nat source pool leases are not HA-synchronized"
+
 // DataplaneMode describes which packet-processing pipeline is active.
 type DataplaneMode int
 
@@ -1189,7 +1191,7 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 		addReason("userspace three-color policers require color-blind mode and then discard")
 	}
 	if cfg.Chassis.Cluster != nil && userspaceConfigUsesPersistentSourceNAT(cfg) {
-		addReason("userspace persistent-nat source pool leases are not HA-synchronized")
+		addReason(persistentSourceNATHAUnsupportedReason)
 	}
 	// Firewall filters and legacy policers are supported in the userspace
 	// dataplane. Three-color policers are supported for the color-blind
