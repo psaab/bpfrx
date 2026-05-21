@@ -2688,6 +2688,25 @@ func TestDPDKConfig(t *testing.T) {
 	}
 }
 
+func TestDataplaneTypeValidationRejectsUnknownBackend(t *testing.T) {
+	tree := &ConfigTree{}
+	path, err := ParseSetCommand("set system dataplane-type vpp")
+	if err != nil {
+		t.Fatalf("ParseSetCommand: %v", err)
+	}
+	if err := tree.SetPath(path); err != nil {
+		t.Fatalf("SetPath: %v", err)
+	}
+
+	_, err = CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig succeeded for an unknown dataplane type")
+	}
+	if !strings.Contains(err.Error(), `dataplane-type "vpp" is invalid`) {
+		t.Fatalf("CompileConfig error = %v", err)
+	}
+}
+
 func TestUserspaceDataplaneConfig(t *testing.T) {
 	lines := []string{"set system dataplane-type userspace", "set system dataplane binary /usr/local/bin/xpf-userspace-dp", "set system dataplane control-socket /run/xpf/userspace-dp.sock", "set system dataplane state-file /run/xpf/userspace-dp.json", "set system dataplane workers 4", "set system dataplane ring-entries 2048"}
 	tree := &ConfigTree{}

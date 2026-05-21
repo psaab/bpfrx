@@ -18,6 +18,13 @@ below are closed, the legacy eBPF dataplane remains present as the
 compatibility and rollback path for configurations the AF_XDP userspace
 dataplane cannot yet own.
 
+DPDK is not part of the userspace retirement path. It remains a separately
+supported DPDK-build backend, but #1475 confines its root `DataPlane`
+dependency to `pkg/dataplane/dpdk` and the `cmd/xpfd/main.go` registration
+import until that backend gets its own migration off the legacy interface.
+Non-`-tags dpdk` binaries reject DPDK startup explicitly instead of admitting a
+no-op stub dataplane.
+
 ## Implemented In The Current Runtime
 
 These capabilities exist in the current Rust userspace dataplane code path:
@@ -80,6 +87,7 @@ These are not "missing", but they are not pure userspace forwarding either:
 | GRE / ESP / explicit early filters | Tail-call back into the legacy XDP pipeline |
 | IPsec / XFRM handling | Userspace detects and punts to kernel/slow-path as needed |
 | DataPlane control-plane contract | Userspace manager no longer embeds the legacy `dataplane.DataPlane`; a userspace `LegacyDataPlaneAdapter` owns old-interface compatibility while callers migrate. Operator metadata reads in API/gRPC/CLI/daemon now use `LastApplyResult()` instead of `LastCompileResult()`, with a canary preventing those surfaces from regressing to compile-result metadata. GC and HA session sync now use `SessionStore`/`Telemetry`. The manager still holds a named eBPF shim manager for XDP/map bootstrap state, and API/gRPC/CLI session/counter readers plus daemon control paths still need to move fully to domain interfaces; tracked by #1381 |
+| DPDK backend | Separately supported backend outside userspace source-removal scope. Its current root `DataPlane` dependency is pinned as a backend-local #1475 exception until DPDK migrates to runtime/domain interfaces or gets a separate retirement decision. |
 | Dataplane event logging | Session open/close/update are emitted by userspace. Policy-deny, screen-drop, logged routing-instance filter hits, non-PBR input filter logs, output filter logs, cached output-filter hits, and lo0 filter logs now enqueue RT_FLOW frames through the non-blocking Rust event-stream producer with existing per-event rate-limit/loss accounting. Go decode/status handling feeds raw userspace RT_FLOW frames through the same `EventReader.ProcessRawEvent` syslog/local-log path as eBPF, with a deterministic UDP syslog fanout harness for policy deny, screen drop, and filter log. Policy-deny events now carry the snapshot's compiled numeric policy ID; filter-log events carry filter/term/action identity from the matched compiled term. Remaining #1379 evidence is live userspace-cluster syslog capture, including deny-storm starvation checks, if Phase 4 requires operator artifacts beyond the deterministic local harness. |
 | `show system buffers` | Userspace helper-status rendering covers AF_XDP UMEM/TX capacity, CoS queued-byte capacity, helper-published session-table and flow-cache capacity, active-session footer, neighbor counts, and worker queue pressure counters. The Phase 5 denominator decision is explicit: session-table and flow-cache values become fill percentages only from Rust-owned helper fields; neighbor-cache entries remain counters until Rust owns a bounded neighbor-cache capacity. Formatter tests pin that dynamic counts cannot move into the utilization table without real denominators. |
 

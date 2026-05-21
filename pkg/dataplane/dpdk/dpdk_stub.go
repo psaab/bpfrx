@@ -4,6 +4,7 @@ package dpdk
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -13,12 +14,12 @@ import (
 
 type platformState struct{}
 
+var errDPDKBuildTagRequired = errors.New("DPDK dataplane requires a binary built with -tags dpdk and libdpdk support")
+
 // --- Lifecycle ---
 
 func (m *Manager) Load() error {
-	slog.Info("DPDK dataplane loaded (stub)")
-	m.loaded = true
-	return nil
+	return errDPDKBuildTagRequired
 }
 
 func (m *Manager) Close() error {

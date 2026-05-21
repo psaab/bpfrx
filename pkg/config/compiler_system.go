@@ -17,6 +17,9 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 			break
 		}
 	}
+	if err := validateSystemDataplaneType(sys.DataplaneType); err != nil {
+		return err
+	}
 	for _, child := range node.Children {
 		switch child.Name() {
 		case "host-name":
@@ -366,6 +369,15 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 	}
 
 	return nil
+}
+
+func validateSystemDataplaneType(dpType string) error {
+	switch dpType {
+	case "", "ebpf", "dpdk", "userspace":
+		return nil
+	default:
+		return fmt.Errorf("dataplane-type %q is invalid; valid values are ebpf, dpdk, userspace", dpType)
+	}
 }
 
 func hasDNSProxyChild(node *Node) bool {
