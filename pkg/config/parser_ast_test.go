@@ -2707,6 +2707,55 @@ func TestDataplaneTypeValidationRejectsUnknownBackend(t *testing.T) {
 	}
 }
 
+func TestDataplaneTypeValidationRejectsHierarchicalDuplicateUnknownBackend(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name: "valid then unknown",
+			input: `system {
+    dataplane-type ebpf;
+    dataplane-type vpp;
+    host-name fw1;
+}`,
+		},
+		{
+			name: "unknown then valid",
+			input: `system {
+    dataplane-type vpp;
+    dataplane-type ebpf;
+    host-name fw1;
+}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parser := NewParser(tt.input)
+			tree, errs := parser.Parse()
+			if len(errs) > 0 {
+				t.Fatalf("parse errors: %v", errs)
+			}
+			system := tree.FindChild("system")
+			if system == nil {
+				t.Fatal("missing system node")
+			}
+			if got := len(system.FindChildren("dataplane-type")); got != 2 {
+				t.Fatalf("dataplane-type sibling count = %d, want 2", got)
+			}
+
+			_, err := CompileConfig(tree)
+			if err == nil {
+				t.Fatal("CompileConfig succeeded for duplicate hierarchical unknown dataplane type")
+			}
+			if !strings.Contains(err.Error(), `dataplane-type "vpp" is invalid`) {
+				t.Fatalf("CompileConfig error = %v", err)
+			}
+		})
+	}
+}
+
 func TestUserspaceDataplaneConfig(t *testing.T) {
 	lines := []string{"set system dataplane-type userspace", "set system dataplane binary /usr/local/bin/xpf-userspace-dp", "set system dataplane control-socket /run/xpf/userspace-dp.sock", "set system dataplane state-file /run/xpf/userspace-dp.json", "set system dataplane workers 4", "set system dataplane ring-entries 2048"}
 	tree := &ConfigTree{}
