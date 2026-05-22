@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/psaab/xpf/pkg/dataplane"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
@@ -62,9 +61,7 @@ func (s *Server) GetNATDestination(_ context.Context, _ *pb.GetNATDestinationReq
 	}
 
 	// Count active DNAT sessions and per-rule-set breakdown
-	if s.dp != nil && s.dp.IsLoaded() {
-		type rsKey struct{ from, to string }
-		rsSessions := make(map[rsKey]int32)
+	if s.dataplaneLoaded() {
 		var zoneByID map[uint16]string
 		if cr := s.applyResult(); cr != nil {
 			zoneByID = make(map[uint16]string, len(cr.ZoneIDs))
@@ -72,29 +69,11 @@ func (s *Server) GetNATDestination(_ context.Context, _ *pb.GetNATDestinationReq
 				zoneByID[id] = name
 			}
 		}
-		totalDNAT := int32(0)
-		_ = s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
-			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
-				totalDNAT++
-				if zoneByID != nil {
-					rsSessions[rsKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
-				}
-			}
-			return true
-		})
-		_ = s.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
-			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
-				totalDNAT++
-				if zoneByID != nil {
-					rsSessions[rsKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
-				}
-			}
-			return true
-		})
-		resp.TotalActiveTranslations = totalDNAT
+		counts := s.countDNATSessions(zoneByID)
+		resp.TotalActiveTranslations = counts.total
 		for _, rs := range cfg.Security.NAT.Destination.RuleSets {
-			key := rsKey{rs.FromZone, rs.ToZone}
-			if cnt, ok := rsSessions[key]; ok {
+			key := natRuleSetKey{rs.FromZone, rs.ToZone}
+			if cnt, ok := counts.ruleSetSessions[key]; ok {
 				resp.RuleSetSessions = append(resp.RuleSetSessions, &pb.NATRuleSetSessions{
 					FromZone: rs.FromZone,
 					ToZone:   rs.ToZone,
@@ -114,10 +93,8 @@ func (s *Server) GetNATPoolStats(_ context.Context, _ *pb.GetNATPoolStatsRequest
 	}
 
 	resp := &pb.GetNATPoolStatsResponse{}
-	var cr *dataplane.ApplyResult
-	if s.dp != nil && s.dp.IsLoaded() {
-		cr = s.applyResult()
-	}
+	cr := s.loadedApplyResult()
+	telemetry := s.telemetry()
 
 	// Named pools
 	for name, pool := range cfg.Security.NAT.SourcePools {
@@ -133,7 +110,7 @@ func (s *Server) GetNATPoolStats(_ context.Context, _ *pb.GetNATPoolStatsRequest
 
 		if cr != nil {
 			if id, ok := cr.PoolIDs[name]; ok {
-				cnt, err := s.dp.ReadNATPortCounter(uint32(id))
+				cnt, err := telemetry.NATPortCounter(uint32(id))
 				if err == nil {
 					used = int32(cnt)
 				}
@@ -160,10 +137,8 @@ func (s *Server) GetNATPoolStats(_ context.Context, _ *pb.GetNATPoolStatsRequest
 	}
 
 	// Count active SNAT sessions and per-rule-set breakdown
-	totalSNAT := int32(0)
-	type rsKey struct{ from, to string }
-	rsSessions := make(map[rsKey]int32)
-	if s.dp != nil && s.dp.IsLoaded() {
+	var counts natSessionCounts
+	if s.dataplaneLoaded() {
 		var zoneByID map[uint16]string
 		if cr != nil {
 			zoneByID = make(map[uint16]string, len(cr.ZoneIDs))
@@ -171,26 +146,9 @@ func (s *Server) GetNATPoolStats(_ context.Context, _ *pb.GetNATPoolStatsRequest
 				zoneByID[id] = name
 			}
 		}
-		_ = s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
-			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
-				totalSNAT++
-				if zoneByID != nil {
-					rsSessions[rsKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
-				}
-			}
-			return true
-		})
-		_ = s.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
-			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
-				totalSNAT++
-				if zoneByID != nil {
-					rsSessions[rsKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
-				}
-			}
-			return true
-		})
+		counts = s.countSNATSessions(zoneByID)
 	}
-	resp.TotalActiveTranslations = totalSNAT
+	resp.TotalActiveTranslations = counts.total
 
 	// Interface-mode pools
 	for _, rs := range cfg.Security.NAT.Source {
@@ -199,7 +157,7 @@ func (s *Server) GetNATPoolStats(_ context.Context, _ *pb.GetNATPoolStatsRequest
 				resp.Pools = append(resp.Pools, &pb.NATPoolStats{
 					Name:        fmt.Sprintf("%s->%s", rs.FromZone, rs.ToZone),
 					Address:     "interface",
-					UsedPorts:   totalSNAT,
+					UsedPorts:   counts.total,
 					IsInterface: true,
 				})
 			}
@@ -208,8 +166,8 @@ func (s *Server) GetNATPoolStats(_ context.Context, _ *pb.GetNATPoolStatsRequest
 
 	// Per-rule-set session counts
 	for _, rs := range cfg.Security.NAT.Source {
-		key := rsKey{rs.FromZone, rs.ToZone}
-		if cnt, ok := rsSessions[key]; ok {
+		key := natRuleSetKey{rs.FromZone, rs.ToZone}
+		if cnt, ok := counts.ruleSetSessions[key]; ok {
 			resp.RuleSetSessions = append(resp.RuleSetSessions, &pb.NATRuleSetSessions{
 				FromZone: rs.FromZone,
 				ToZone:   rs.ToZone,
@@ -228,17 +186,15 @@ func (s *Server) GetNATRuleStats(_ context.Context, req *pb.GetNATRuleStatsReque
 	}
 
 	resp := &pb.GetNATRuleStatsResponse{}
-	var cr *dataplane.ApplyResult
-	if s.dp != nil && s.dp.IsLoaded() {
-		cr = s.applyResult()
-	}
+	cr := s.loadedApplyResult()
+	telemetry := s.telemetry()
 
 	// Helper to read NAT rule counters
 	readCounter := func(rsName, ruleName string) (uint64, uint64) {
 		if cr != nil {
 			ruleKey := rsName + "/" + ruleName
 			if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
-				cnt, err := s.dp.ReadNATRuleCounter(uint32(cid))
+				cnt, err := telemetry.NATRuleCounter(uint32(cid))
 				if err == nil {
 					return cnt.Packets, cnt.Bytes
 				}

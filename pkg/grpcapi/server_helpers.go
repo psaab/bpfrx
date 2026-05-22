@@ -98,6 +98,76 @@ func uint32ToIP(v uint32) net.IP {
 	return ip
 }
 
+func (s *Server) dataplaneLoaded() bool {
+	return s != nil && s.dp != nil && s.dp.IsLoaded()
+}
+
+func (s *Server) loadedApplyResult() *dataplane.ApplyResult {
+	if !s.dataplaneLoaded() {
+		return nil
+	}
+	return s.applyResult()
+}
+
+func (s *Server) sessionStore() dataplane.SessionStore {
+	if s == nil {
+		return dataplane.SessionStoreOf(nil)
+	}
+	return dataplane.SessionStoreOf(s.dp)
+}
+
+func (s *Server) telemetry() dataplane.Telemetry {
+	if s == nil {
+		return dataplane.TelemetryOf(nil)
+	}
+	return dataplane.TelemetryOf(s.dp)
+}
+
+type natRuleSetKey struct{ from, to string }
+
+type natSessionCounts struct {
+	total           int32
+	ruleSetSessions map[natRuleSetKey]int32
+}
+
+func (s *Server) countSNATSessions(zoneByID map[uint16]string) natSessionCounts {
+	return s.countNATSessions(dataplane.SessFlagSNAT, zoneByID)
+}
+
+func (s *Server) countDNATSessions(zoneByID map[uint16]string) natSessionCounts {
+	return s.countNATSessions(dataplane.SessFlagDNAT, zoneByID)
+}
+
+func (s *Server) countNATSessions(flag uint8, zoneByID map[uint16]string) natSessionCounts {
+	counts := natSessionCounts{
+		ruleSetSessions: make(map[natRuleSetKey]int32),
+	}
+	if !s.dataplaneLoaded() {
+		return counts
+	}
+
+	add := func(isReverse uint8, flags uint8, ingressZone, egressZone uint16) {
+		if isReverse != 0 || flags&flag == 0 {
+			return
+		}
+		counts.total++
+		if zoneByID != nil {
+			counts.ruleSetSessions[natRuleSetKey{zoneByID[ingressZone], zoneByID[egressZone]}]++
+		}
+	}
+
+	sessions := s.sessionStore()
+	_ = sessions.ForEachV4(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+		add(val.IsReverse, val.Flags, val.IngressZone, val.EgressZone)
+		return true
+	})
+	_ = sessions.ForEachV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		add(val.IsReverse, val.Flags, val.IngressZone, val.EgressZone)
+		return true
+	})
+	return counts
+}
+
 type builtinApp struct {
 	proto uint8
 	port  uint16
