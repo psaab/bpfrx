@@ -39,7 +39,7 @@ func (s *Server) showVersion(buf *strings.Builder) {
 	if ver == "" {
 		ver = "dev"
 	}
-	fmt.Fprintf(buf, "xpf eBPF firewall %s\n", ver)
+	fmt.Fprintf(buf, "xpf stateful firewall %s\n", ver)
 	var uts unix.Utsname
 	if err := unix.Uname(&uts); err == nil {
 		sysname := strings.TrimRight(string(uts.Sysname[:]), "\x00")

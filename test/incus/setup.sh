@@ -2,7 +2,7 @@
 # xpf Incus test environment management
 #
 # Creates an isolated VM or privileged container with multiple network
-# interfaces for testing the xpf eBPF firewall.
+# interfaces for testing the xpf userspace dataplane firewall.
 #
 # Usage:
 #   ./test/incus/setup.sh init        # Install incus, create networks + profiles
