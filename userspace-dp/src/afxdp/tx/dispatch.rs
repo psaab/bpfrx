@@ -824,12 +824,12 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 // the inner frame.
                                 if is_wireguard {
                                     if let Some(endpoint) = forwarding.tunnel_endpoints.get(&request.decision.resolution.tunnel_endpoint_id) {
-                                        if let Some((wg_frame, wg_meta)) = target_binding.wireguard.try_encap(
+                                        if let Some((wg_frame, _wg_meta)) = target_binding.wireguard.try_encap(
                                             &frame,
                                             request.meta.addr_family,
                                             request.meta.ingress_ifindex,
                                             request.decision.resolution.tx_vlan_id,
-                                            None,
+                                            Some(endpoint.source),
                                             request.meta.dscp,
                                             endpoint.wg_listen_port,
                                         ) {

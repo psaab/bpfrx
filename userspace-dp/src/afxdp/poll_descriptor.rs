@@ -512,7 +512,7 @@ pub(super) fn poll_binding_process_descriptor(
                                             target_binding_index: None,
                                             ingress_queue_id: binding.queue_id,
                                             desc,
-                                            frame: PendingForwardFrame::Owned(frame),
+                                            frame: PendingForwardFrame::Prebuilt(frame),
                                             meta: new_meta.into(),
                                             decision,
                                             apply_nat_on_fabric: false,
