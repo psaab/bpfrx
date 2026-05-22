@@ -94,7 +94,6 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/api/server.go` | REST server construction still stores the legacy bridge. |
 | `pkg/cli/cli.go` | Embedded CLI construction still stores the legacy bridge. |
 | `pkg/cli/cli_clear.go` | Clear commands still delete legacy session entries. |
-| `pkg/cli/cli_show_cluster.go` | Cluster display still reads legacy dataplane state. |
 | `pkg/cli/cli_show_flow.go` | Flow display still uses legacy session keys and values. |
 | `pkg/cli/cli_show_nat.go` | NAT display still uses legacy NAT/session metadata. |
 | `pkg/cli/cli_show_security.go` | Security display still uses legacy counters and filter types. |
