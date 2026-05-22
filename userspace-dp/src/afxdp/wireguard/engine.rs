@@ -365,20 +365,40 @@ impl WireGuardEngine {
                 let mut flow_src_addr = [0u8; 16];
                 let mut flow_dst_addr = [0u8; 16];
 
+                // AllowedIPs inbound enforcement (WireGuard cryptokey routing):
+                // The inner source IP must fall within the allowed-IPs set
+                // configured for this peer.  Drop packets whose source is not
+                // covered — prevents an authenticated peer from injecting traffic
+                // with an arbitrary source into the trusted zone.
+                let inner_src_ip: IpAddr;
                 if inner_family == libc::AF_INET as u8 {
+                    if inner_packet.len() < 20 {
+                        return None;
+                    }
                     let src = Ipv4Addr::new(
                         inner_packet[12], inner_packet[13], inner_packet[14], inner_packet[15],
                     );
                     let dst = Ipv4Addr::new(
                         inner_packet[16], inner_packet[17], inner_packet[18], inner_packet[19],
                     );
+                    inner_src_ip = IpAddr::V4(src);
                     flow_src_addr[..4].copy_from_slice(&src.octets());
                     flow_dst_addr[..4].copy_from_slice(&dst.octets());
-                } else if inner_packet.len() >= 40 {
+                } else {
+                    if inner_packet.len() < 40 {
+                        return None;
+                    }
                     let src = Ipv6Addr::from(<[u8; 16]>::try_from(&inner_packet[8..24]).ok()?);
                     let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&inner_packet[24..40]).ok()?);
+                    inner_src_ip = IpAddr::V6(src);
                     flow_src_addr.copy_from_slice(&src.octets());
                     flow_dst_addr.copy_from_slice(&dst.octets());
+                }
+
+                if !self.allowed_ip_to_peer
+                    .longest_match(inner_src_ip)
+                    .is_some_and(|k| k == peer_key) {
+                    return None;
                 }
 
                 let inner_meta = UserspaceDpMeta {
@@ -488,7 +508,7 @@ impl WireGuardEngine {
                     eth_type,
                 )?;
 
-                let inner_dscp = meta_dscp >> 2;
+                let inner_dscp = meta_dscp & 0x3f;
                 let mut outer_meta = packet::build_outer_headers(
                     header_area,
                     outer_ip_start,

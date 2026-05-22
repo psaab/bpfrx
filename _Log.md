@@ -949,3 +949,7 @@
 - **Timestamp**: 2026-05-17T21:29:00Z
   - **Action**: Updated #1376 plan test/runtime notes to match implemented mirror tests and cross-worker limit semantics.
   - **File(s)**: docs/pr/1373-retire-ebpf-dataplane/plan-1376-port-mirroring.md
+
+- **Timestamp**: 2026-05-22T14:35:44Z
+  - **Action**: WireGuard review (comment_id 4519636478): fixed DSCP pre-shift bug (meta_dscp >> 2 → meta_dscp & 0x3f in try_encap), added AllowedIPs inbound enforcement on decap (inner source IP checked against peer's allowed-IPs set before emitting InnerData), replaced assert_eq!(num_workers, 1) hard panic in coordinator with eprintln! + graceful skip.
+  - **File(s)**: userspace-dp/src/afxdp/wireguard/engine.rs, userspace-dp/src/afxdp/coordinator/mod.rs

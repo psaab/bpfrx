@@ -828,13 +828,13 @@ impl Coordinator {
             })
             .collect();
         if !wg_snapshots.is_empty() {
-            assert_eq!(
-                self.workers.handles.len(),
-                1,
-                "WireGuard requires exactly 1 worker thread (found {})",
-                self.workers.handles.len()
-            );
-            if let Some(handle) = self.workers.handles.values().next() {
+            if self.workers.handles.len() != 1 {
+                eprintln!(
+                    "xpf-coordinator: WireGuard requires exactly 1 worker thread \
+                     (found {}); skipping WireGuard snapshot dispatch",
+                    self.workers.handles.len()
+                );
+            } else if let Some(handle) = self.workers.handles.values().next() {
                 let mut q = handle.commands.lock().unwrap();
                 q.push_back(WorkerCommand::ApplyWireguard(wg_snapshots));
             }
