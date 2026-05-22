@@ -31,9 +31,9 @@ Look at:
 - [lib.rs#L526](/home/ps/git/codex-xpf/userspace-xdp/src/lib.rs#L526)
 
 Questions:
-- Did Go choose `xdp_userspace_prog` or `xdp_main_prog`?
-- Is the capability gate forcing legacy fallback?
-- Is the XDP shim redirecting, cpumap-passing, tail-calling, or dropping?
+- Is Go keeping `xdp_userspace_prog` attached?
+- Is the capability gate disarming helper forwarding?
+- Is the XDP shim redirecting, cpumap/kernel-passing, or dropping?
 
 ### Helper is up but bindings never become live
 

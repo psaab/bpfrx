@@ -167,15 +167,15 @@ Reason:
 - the handoff ABI and AF_XDP queue model are owned by the Rust userspace dataplane
 - keeping the userspace entry path in the same language makes metadata evolution,
   queue handoff, and future userspace-owned parsing easier to reason about
-- the existing C/libbpf/bpf2go pipeline is still useful for the main firewall path
-  and as the guarded fallback while the Rust dataplane matures
+- the existing C/libbpf/bpf2go pipeline remains useful for the legacy backend,
+  shared maps, and regression coverage while the Rust dataplane matures
 
 So the current plan is:
 
 - keep the main firewall XDP/TC pipeline in the existing C/libbpf/bpf2go toolchain
 - move the userspace-specific XDP entry and the separate dataplane process to Rust
-- use a narrow fallback boundary from the Rust XDP entry into `xdp_main` until
-  the Rust dataplane owns live forwarding end-to-end
+- keep the userspace runtime independent from `xdp_main`; degraded helper/XSK
+  states pass only proven local/control traffic and drop non-local transit
 
 ### Support Envelope
 
@@ -829,10 +829,12 @@ Current `xdp_userspace` behavior:
 - parse
 - metadata stamp
 - gated XSK redirect if a binding is marked ready
-- safe fallback tail call into `xdp_main` otherwise
+- local/control kernel delivery for proven host/control-plane packets
+- degraded non-local transit drop when helper/XSK state is not safe
 
 That means the userspace-specific XDP boundary is now Rust-owned, while the
-existing C pipeline remains the fallback and the non-userspace dataplane.
+existing C pipeline remains the legacy non-userspace dataplane and a source of
+shared maps until the loader/map split is complete.
 
 The remaining missing part is broader feature coverage and parity, not the handoff itself.
 
@@ -913,7 +915,7 @@ Implemented today:
 - HA-aware userspace forwarding resolution that blocks egress on inactive or stale owner RGs
 - flow knob snapshots for `allow-dns-reply` and `allow-embedded-icmp`
 - `allow-dns-reply` sessionless admit through policy on the Rust fast path for unsolicited UDP replies from port 53 (post-#850: policy runs, session install is skipped only when no NAT is required)
-- `allow-embedded-icmp` treated as supported because local-destination ICMP error traffic stays on the legacy fallback path
+- `allow-embedded-icmp` treated as supported because local-destination ICMP error traffic stays on the local/control kernel-delivery path
 - interface-mode source NAT rule snapshots from the Go control plane
 - per-session NAT decisions and reply-direction key installation
 - source and destination IP rewrite on the Rust fast path for interface-mode source NAT

@@ -96,10 +96,11 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	m.cfg = cfg
 	m.proc = cmd
 	// Bootstrap XSK fill ring on all queues: send broadcast pings
-	// 3 seconds after helper start. During this window, ctrl is disabled
-	// so the XDP shim falls back to eBPF. The broadcast pings generate
-	// hardware RX events on multiple queues, triggering NAPI which
-	// consumes fill ring entries and posts WQEs for zero-copy.
+	// 3 seconds after helper start. During this window, ctrl is disabled;
+	// the shim only passes proven local/control traffic and drops transit.
+	// The broadcast pings generate hardware RX events on multiple queues,
+	// triggering NAPI which consumes fill ring entries and posts WQEs for
+	// zero-copy.
 	go func() {
 		time.Sleep(3 * time.Second)
 		m.mu.Lock()
@@ -518,10 +519,10 @@ func (m *Manager) stopLocked() {
 		m.sessionMirrorErr = ""
 		return
 	}
-	// Disable userspace forwarding BEFORE stopping the helper.
-	// Without this, the XDP shim continues redirecting to XSK after
-	// the helper exits, sending packets to dead socket fds. Setting
-	// ctrl.enabled=0 makes the shim fall back to the eBPF pipeline.
+	// Disable userspace forwarding BEFORE stopping the helper. Without this,
+	// the XDP shim continues redirecting to XSK after the helper exits,
+	// sending packets to dead socket fds. Setting ctrl.enabled=0 makes the
+	// shim pass only proven local/control traffic and drop transit.
 	m.disableUserspaceCtrlLocked()
 	_ = m.requestLocked(ControlRequest{Type: "shutdown"}, nil)
 	done := make(chan struct{})
@@ -570,8 +571,8 @@ func (m *Manager) stopLocked() {
 // events. Without at least one packet per queue, the fill ring stays
 // unconsumed and XDP_REDIRECT silently drops packets.
 //
-// The probes are sent while ctrl is disabled, so the XDP shim falls
-// back to the eBPF pipeline which handles them normally (XDP_PASS).
+// The probes are sent while ctrl is disabled, so only the local/control
+// boundary reaches the kernel; transit remains fail-closed.
 func (m *Manager) bootstrapNAPIQueuesLocked() {
 	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
 		return
@@ -939,11 +940,10 @@ func (m *Manager) reEnableUserspaceCtrlLocked() {
 	slog.Info("userspace: re-enabled ctrl (rollback)")
 }
 
-// DisableAndStopHelper disables ctrl and swaps to the eBPF pipeline entry
-// program. This prevents the XDP shim from redirecting new packets to XSK.
-// Must be called BEFORE any operation that invalidates UMEM (e.g. link
-// DOWN on mlx5 zero-copy). Worker threads keep running but see no new
-// packets since ctrl=0 stops XSK redirects.
+// DisableAndStopHelper disables ctrl. This prevents the XDP shim from
+// redirecting new packets to XSK. Must be called BEFORE any operation that
+// invalidates UMEM (e.g. link DOWN on mlx5 zero-copy). Worker threads keep
+// running but see no new packets since ctrl=0 stops XSK redirects.
 //
 // Deprecated: use PrepareLinkCycle which also stops the Rust workers.
 func (m *Manager) DisableAndStopHelper() {
@@ -953,17 +953,12 @@ func (m *Manager) DisableAndStopHelper() {
 		return
 	}
 	m.disableUserspaceCtrlLocked()
-	// Swap to eBPF pipeline so packets go through xdp_main_prog
-	// even if the XDP shim was previously attached.
-	if m.bpfShim.XDPEntryProg != "xdp_main_prog" {
-		_ = m.bpfShim.SwapXDPEntryProg("xdp_main_prog")
-	}
 }
 
 // PrepareLinkCycle must be called BEFORE any link DOWN/UP cycle (e.g. RETH
 // MAC programming). It:
 //  1. Disables ctrl so the XDP shim stops redirecting to XSK
-//  2. Swaps to xdp_main_prog (eBPF pipeline)
+//  2. Leaves the userspace shim attached with transit fail-closed
 //  3. Sends "stop_workers" to the Rust helper, which joins all worker
 //     threads — no thread touches UMEM after this returns
 //
@@ -976,9 +971,6 @@ func (m *Manager) PrepareLinkCycle() {
 		return
 	}
 	m.disableUserspaceCtrlLocked()
-	if m.bpfShim.XDPEntryProg != "xdp_main_prog" {
-		_ = m.bpfShim.SwapXDPEntryProg("xdp_main_prog")
-	}
 	// Tell the Rust helper to stop all workers. This joins worker
 	// threads so they stop touching UMEM before the NIC unmaps pages
 	// during link DOWN.
@@ -1035,9 +1027,6 @@ func (m *Manager) NotifyLinkCycle() {
 	// Ensure ctrl is disabled (PrepareLinkCycle should have done this,
 	// but guard against callers that skip it).
 	m.disableUserspaceCtrlLocked()
-	if m.bpfShim.XDPEntryProg != "xdp_main_prog" {
-		_ = m.bpfShim.SwapXDPEntryProg("xdp_main_prog")
-	}
 	// Reset the ctrl enable gate so the fill-ring bootstrap delay
 	// restarts from scratch after rebind.  Without this, ctrl stays
 	// enabled while the new bindings aren't ready — packets redirected

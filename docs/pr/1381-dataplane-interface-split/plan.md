@@ -386,8 +386,8 @@ owners before the eBPF dataplane source is removed.
 | `/sys/fs/bpf/xpf/dnat_table_v6` | Same as `dnat_table` for IPv6. | Rust NAT/session state. Remove pin before Phase 4. |
 | `/sys/fs/bpf/xpf/userspace_trace` | Shim/helper trace diagnostics. | Minimal userspace XDP shim until replaced by userspace event/trace channel. |
 | `/sys/fs/bpf/xpf/userspace_cpumap` | Go programs cpumap redirect for the shim. | Minimal userspace XDP shim only if cpumap redirect remains enabled. Derived from worker config. |
-| `/sys/fs/bpf/xpf/userspace_fallback_progs` | Go wires fallback program tail calls for compat mode. | Remove before Phase 4; there is no eBPF fallback dataplane after #1373. |
-| `/sys/fs/bpf/xpf/userspace_fallback_stats` | Go reads fallback stats from shim. | Remove before Phase 4 or replace with userspace telemetry counters. |
+| `/sys/fs/bpf/xpf/userspace_fallback_progs` | Removed from the userspace shim in the #1473 decoupling slice; compat mode now uses explicit kernel pass-through instead of a prog-array tail call. | Keep absent; do not reintroduce the legacy `xdp_main_prog` fallback dependency. |
+| `/sys/fs/bpf/xpf/userspace_fallback_stats` | Go reads degraded-path stats from the retained shim. | Rename or replace with userspace telemetry counters before final Phase 4 source removal. |
 | `/sys/fs/bpf/xpf/userspace_interface_nat_v4` | Go publishes interface SNAT helper state. | Rust NAT config from snapshot. Remove pin before Phase 4. |
 | `/sys/fs/bpf/xpf/userspace_interface_nat_v6` | Same as v4. | Rust NAT config from snapshot. Remove pin before Phase 4. |
 | `/sys/fs/bpf/xpf/links/xdp_*`, `/sys/fs/bpf/xpf/links/tc_*` | eBPF manager pins attach links; userspace removes XDP link pins before recompile. | eBPF backend private. Userspace shim owns only its own XDP attachment lifecycle; no TC link ownership. |

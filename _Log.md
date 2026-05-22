@@ -1,5 +1,17 @@
 # Action Log
 
+## 2026-05-21
+
+- **Timestamp**: 2026-05-21T23:30:00Z
+  - **Action**: PR #1481 review follow-up — replaced 5 hard-coded `"xdp_userspace_prog"` literal strings with the `userspaceXDPEntryProg` constant in test files to avoid drift if the entry program name changes.
+  - **File(s)**: `pkg/dataplane/userspace/maps_sync_cap_test.go`, `pkg/dataplane/userspace/manager_test.go`, `_Log.md`
+  - **Validation**: `GOFLAGS=-buildvcs=false go test -count=1 ./pkg/dataplane/userspace ./pkg/dataplane`; `git diff --check`
+
+- **Timestamp**: 2026-05-21T16:25:00Z
+  - **Action**: PR #1481 comment follow-up — changed `syncInterfaceNATAddressMapsLocked` to publish desired interface-NAT entries before deleting stale keys (matching the local-map add-before-remove contract), pre-sized NAT RST publish slices from desired-entry count, and added regression tests for both full-map publication failure retention and successful stale-key replacement.
+  - **File(s)**: `pkg/dataplane/userspace/maps_sync.go`, `pkg/dataplane/userspace/maps_sync_cap_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/userspace ./pkg/dataplane`; `git diff --check`
+
 ## 2026-05-18
 
 - **Timestamp**: 2026-05-18T04:38:00Z

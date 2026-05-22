@@ -67,7 +67,11 @@ Evidence:
 
 ## Current State (c5cb982)
 
-The XDP shim now starts with `xdp_main_prog` and swaps to `xdp_userspace_prog` when `forwarding_armed` transitions to true. When armed and primary, ICMP TE from intermediate routers reaches the userspace DP but the session-miss debug log (`/tmp/icmp_te_debug.log`) is NEVER created. This means either:
+Historical note: this section predates #1473. The userspace runtime now keeps
+`xdp_userspace_prog` attached and no longer swaps degraded helper/XSK states
+back to `xdp_main_prog`. At the time of this capture, ICMP TE from intermediate
+routers reached the userspace DP when armed and primary, but the session-miss
+debug log (`/tmp/icmp_te_debug.log`) was never created. This meant either:
 
 1. The ICMP TE packets hit an existing session (session hit path, bypass session-miss entirely)
 2. The ICMP TE packets take a different code path before reaching the session-miss block
@@ -75,7 +79,11 @@ The XDP shim now starts with `xdp_main_prog` and swaps to `xdp_userspace_prog` w
 
 Next debugging step: add debug logging to the session HIT path to see if ICMP TE matches an established session. Also verify `/tmp/` is writable from the Rust worker threads.
 
-Key finding: when forwarding is NOT armed (HA secondary), `xdp_main_prog` runs and the eBPF embedded ICMP handler works correctly. When forwarding IS armed, the userspace shim redirects ICMP TE to userspace where the NAT reversal doesn't work (per-worker session isolation + cross-worker shared session lookup issue).
+At the time of this capture, the key finding was that forwarding-disabled HA
+secondaries ran `xdp_main_prog` and the eBPF embedded ICMP handler worked
+correctly. When forwarding was armed, the userspace shim redirected ICMP TE to
+userspace where the NAT reversal did not work (per-worker session isolation
+plus cross-worker shared session lookup issue).
 
 ## XDP Shim Fixes Applied
 
@@ -85,7 +93,11 @@ Key finding: when forwarding is NOT armed (HA secondary), `xdp_main_prog` runs a
 
 3. **Removed mid-stream TCP fallback** (gate-fixes merge): All TCP goes to userspace, not just SYN.
 
-4. **Tail-call issue discovered**: `fallback_to_main()` uses `USERSPACE_FALLBACK_PROGS.tail_call()` which silently fails in the aya-ebpf framework, causing XDP_DROP instead of eBPF pipeline processing. GRE/ESP now bypass this entirely with XDP_PASS.
+4. **Tail-call issue discovered**: the removed `fallback_to_main()` path used
+   `USERSPACE_FALLBACK_PROGS.tail_call()` and could fail silently in the
+   aya-ebpf framework, causing XDP_DROP instead of eBPF pipeline processing.
+   The current shim bypasses that path entirely. Degraded helper/XSK states
+   pass only proven local/control traffic and drop non-local transit.
 
 ## TC Conntrack Fix
 

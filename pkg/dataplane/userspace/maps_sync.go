@@ -74,17 +74,9 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	if heartbeatMap == nil {
 		return errors.New("userspace_heartbeat map not loaded")
 	}
-	fallbackMap := m.bpfShim.Map("userspace_fallback_progs")
-	if fallbackMap == nil {
-		return errors.New("userspace_fallback_progs map not loaded")
-	}
-	fallbackProg := m.bpfShim.Program("xdp_main_prog")
-	if fallbackProg == nil {
-		return errors.New("xdp_main_prog not loaded")
-	}
 
 	// Populate userspace_cpumap so the XDP shim can use cpumap redirect
-	// instead of XDP_PASS (required for zero-copy AF_XDP).
+	// for IP packets that must reach the kernel on zero-copy AF_XDP paths.
 	cpumapReady := m.setupUserspaceCPUMapLocked()
 
 	zero := uint32(0)
@@ -108,10 +100,6 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update userspace_ctrl: %w", err)
 	}
-	fallbackFD := uint32(fallbackProg.FD())
-	if err := fallbackMap.Update(zero, fallbackFD, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("update userspace_fallback_progs: %w", err)
-	}
 
 	// Bindings map is now an Array — zero previously-set indices.
 	{
@@ -130,19 +118,13 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 			_ = heartbeatMap.Update(slot, zeroHB, ebpf.UpdateAny)
 		}
 	}
-	if err := m.syncIngressIfaceMapLocked(snapshot); err != nil {
-		return err
-	}
-	if err := m.syncLocalAddressMapsLocked(snapshot); err != nil {
-		return err
-	}
-	return m.syncInterfaceNATAddressMapsLocked(snapshot)
+	return m.syncUserspaceClassifierMapsLocked(snapshot)
 }
 
 // setupUserspaceCPUMapLocked populates the userspace_cpumap BPF map with one
 // entry per online CPU. This enables the XDP shim to use cpumap redirect
-// instead of XDP_PASS, which is required for zero-copy AF_XDP (XDP_PASS in
-// zero-copy mode permanently leaks UMEM frames).
+// instead of relying on driver-specific XDP_PASS recycling behavior for IP
+// packets delivered to the kernel from zero-copy AF_XDP paths.
 func (m *Manager) setupUserspaceCPUMapLocked() bool {
 	cpuMap := m.bpfShim.Map("userspace_cpumap")
 	if cpuMap == nil {
@@ -170,6 +152,109 @@ func (m *Manager) setupUserspaceCPUMapLocked() bool {
 
 	slog.Info("userspace cpumap enabled for zero-copy AF_XDP", "cpus", numCPUs)
 	return true
+}
+
+func (m *Manager) failClosedUserspaceCtrlLocked(ctrlMap *ebpf.Map, ctrl userspaceCtrlValue, cause error) error {
+	if ctrl.Enabled != 1 {
+		return cause
+	}
+	disabled := ctrl
+	disabled.Enabled = 0
+	zero := uint32(0)
+	if err := ctrlMap.Update(zero, disabled, ebpf.UpdateAny); err != nil {
+		return errors.Join(cause, fmt.Errorf("fail closed userspace_ctrl after publication error: %w", err))
+	}
+	if m.ctrlWasEnabled {
+		m.ctrlDisabledAt = m.bpfKtimeNs()
+	}
+	m.ctrlWasEnabled = false
+	return cause
+}
+
+func (m *Manager) syncUserspaceClassifierMapsLocked(snapshot *ConfigSnapshot) error {
+	if err := m.syncIngressIfaceMapLocked(snapshot); err != nil {
+		return err
+	}
+	if err := m.syncLocalAddressMapsLocked(snapshot); err != nil {
+		return err
+	}
+	return m.syncInterfaceNATAddressMapsLocked(snapshot)
+}
+
+type userspaceCtrlLookupHook func(*ebpf.Map, uint32, *userspaceCtrlValue) error
+
+func (m *Manager) lookupUserspaceCtrlForFailClosed(ctrlMap *ebpf.Map, key uint32, ctrl *userspaceCtrlValue) error {
+	if m.lookupUserspaceCtrlForFailClosedHook != nil {
+		return m.lookupUserspaceCtrlForFailClosedHook(ctrlMap, key, ctrl)
+	}
+	return ctrlMap.Lookup(key, ctrl)
+}
+
+func (m *Manager) syncUserspaceClassifierMapsFailClosedLocked(snapshot *ConfigSnapshot) error {
+	if err := m.syncUserspaceClassifierMapsLocked(snapshot); err != nil {
+		ctrlMap := m.bpfShim.Map("userspace_ctrl")
+		if ctrlMap == nil {
+			return err
+		}
+		var ctrl userspaceCtrlValue
+		zero := uint32(0)
+		if lookupErr := m.lookupUserspaceCtrlForFailClosed(ctrlMap, zero, &ctrl); lookupErr != nil {
+			if errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
+				return err
+			}
+			return m.blindFailClosedUserspaceCtrlLocked(ctrlMap, snapshot, err, lookupErr)
+		}
+		return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, err)
+	}
+	return nil
+}
+
+func (m *Manager) blindFailClosedUserspaceCtrlLocked(
+	ctrlMap *ebpf.Map,
+	snapshot *ConfigSnapshot,
+	cause error,
+	lookupErr error,
+) error {
+	disabled := userspaceCtrlValue{
+		Enabled:            0,
+		MetadataVersion:    userspaceMetadataVersion,
+		Workers:            1,
+		QueueCount:         1,
+		HeartbeatTimeoutMS: 30000,
+	}
+	if snapshot != nil {
+		workers := maxInt(snapshot.Userspace.Workers, 1)
+		disabled.Workers = uint32(workers)
+		disabled.QueueCount = uint32(workers)
+		disabled.ConfigGeneration = snapshot.Generation
+		disabled.FIBGeneration = snapshot.FIBGeneration
+		if snapshotHasNativeGRE(snapshot) {
+			disabled.Flags |= userspaceCtrlFlagNativeGRE
+		}
+	}
+	if m.configuredMode == ModeUserspaceStrict {
+		disabled.Flags |= userspaceCtrlFlagStrict
+	}
+	if cpuMap := m.bpfShim.Map("userspace_cpumap"); cpuMap != nil {
+		disabled.Flags |= userspaceCtrlFlagCPUMap
+	}
+
+	zero := uint32(0)
+	if err := ctrlMap.Update(zero, disabled, ebpf.UpdateAny); err != nil {
+		return errors.Join(
+			cause,
+			fmt.Errorf("lookup userspace_ctrl for classifier-map fail-closed: %w", lookupErr),
+			fmt.Errorf("blind fail closed userspace_ctrl after lookup failure: %w", err),
+		)
+	}
+	if m.ctrlWasEnabled {
+		m.ctrlDisabledAt = m.bpfKtimeNs()
+	}
+	m.ctrlWasEnabled = false
+	return errors.Join(
+		cause,
+		fmt.Errorf("lookup userspace_ctrl for classifier-map fail-closed: %w", lookupErr),
+	)
 }
 
 func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
@@ -215,9 +300,9 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// Delay ctrl enable until AFTER VIPs are configured in HA mode.
 		// The VRRP election + VIP add takes ~10-14s after restart.
 		// If we enable ctrl before VIPs, the XSK path gets packets but
-		// can't SNAT (no source address) → all transit dropped.  The
-		// eBPF pipeline (XDP_PASS fallback) handles traffic correctly
-		// during this window since the kernel has the same FIB state.
+		// can't SNAT (no source address) -> all transit dropped. While
+		// ctrl is disabled, only proven local/control traffic reaches the
+		// kernel; transit remains fail-closed.
 		//
 		// Also delay by 3s for fill ring bootstrap: mlx5 zero-copy
 		// needs NAPI to post fill ring WQEs, and NAPI only runs on
@@ -278,8 +363,8 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// XSK receive liveness: once bindings and neighbor state are ready,
 		// arm ctrl and explicitly probe the userspace shim. A working XSK
 		// path must show RX progress while ctrl=1 and the shim is active.
-		// Otherwise swap back to the eBPF pipeline instead of assuming
-		// the userspace AF_XDP path is healthy.
+		// Otherwise keep ctrl disabled: local/control packets may still
+		// reach the kernel, but transit fails closed in both modes.
 		var currentRX uint64
 		for _, b := range status.Bindings {
 			currentRX += b.RXPackets
@@ -297,32 +382,29 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			"xskLivenessFailed", m.xskLivenessFailed,
 			"xdpEntryProg", m.bpfShim.XDPEntryProg)
 		if m.xskLivenessFailed {
-			// XSK proven broken — ctrl disabled.
-			// In compat mode, the entry program was already swapped to
-			// xdp_main_prog (eBPF pipeline). In strict mode the shim
-			// stays attached so packets drop rather than silently
-			// falling through to eBPF.
+			// XSK proven broken: ctrl stays disabled. The shim only passes
+			// proven local/control packets and drops transit.
 			ctrl.Enabled = 0
 		} else if probeBindingsReady && neighborSyncReady {
 			ctrl.Enabled = 1
 			if m.xskLivenessProven {
-				if m.bpfShim.XDPEntryProg != "xdp_userspace_prog" {
-					if err := m.bpfShim.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+				if m.bpfShim.XDPEntryProg != userspaceXDPEntryProg {
+					if err := m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg); err != nil {
 						slog.Warn("userspace: failed to restore XDP shim after liveness success", "err", err)
 					}
 				}
 			} else if xskReceiveLive {
 				m.xskLivenessProven = true
 				m.xskProbeStart = time.Time{}
-				if m.bpfShim.XDPEntryProg != "xdp_userspace_prog" {
-					if err := m.bpfShim.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+				if m.bpfShim.XDPEntryProg != userspaceXDPEntryProg {
+					if err := m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg); err != nil {
 						slog.Warn("userspace: failed to swap XDP shim after XSK RX became live", "err", err)
 					}
 				}
 				slog.Info("userspace: XSK liveness proven")
 			} else {
-				if m.bpfShim.XDPEntryProg != "xdp_userspace_prog" {
-					if err := m.bpfShim.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+				if m.bpfShim.XDPEntryProg != userspaceXDPEntryProg {
+					if err := m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg); err != nil {
 						slog.Warn("userspace: failed to activate XDP shim for XSK liveness probe", "err", err)
 					}
 				}
@@ -333,8 +415,8 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 					if m.shouldAutoProveIdleStandbyXSKLocked(currentRX, allBindingsBound) {
 						m.xskLivenessProven = true
 						m.xskProbeStart = time.Time{}
-						if m.bpfShim.XDPEntryProg != "xdp_userspace_prog" {
-							if err := m.bpfShim.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+						if m.bpfShim.XDPEntryProg != userspaceXDPEntryProg {
+							if err := m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg); err != nil {
 								slog.Warn("userspace: failed to restore XDP shim after idle standby liveness success", "err", err)
 							}
 						}
@@ -349,17 +431,17 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 					m.xskProbeStart = time.Time{}
 					ctrl.Enabled = 0
 					if m.configuredMode == ModeUserspaceStrict {
-						// Strict mode: do NOT swap to xdp_main_prog.
-						// Keep the shim attached with ctrl=0 so packets
-						// hit the shim's ctrl-disabled fallback path and
-						// get counted, but never silently enter the eBPF
-						// pipeline. Log at error level — this is a
-						// degraded state that needs operator attention.
-						slog.Error("userspace: XSK liveness probe failed in strict mode — dataplane degraded, no eBPF fallback")
+						// Strict mode: keep the shim attached with ctrl=0
+						// so packets hit the fail-closed ctrl-disabled path.
+						// Log at error level because this degraded state
+						// needs operator attention.
+						slog.Error("userspace: XSK liveness probe failed in strict mode; dataplane degraded fail-closed")
 					} else {
-						slog.Warn("userspace: XSK liveness probe failed, falling back to eBPF pipeline")
-						if err := m.bpfShim.SwapXDPEntryProg("xdp_main_prog"); err != nil {
-							slog.Warn("userspace: failed to swap to eBPF pipeline after XSK liveness failure", "err", err)
+						slog.Warn("userspace: XSK liveness probe failed; keeping shim disabled with transit fail-closed")
+						if m.bpfShim.XDPEntryProg != userspaceXDPEntryProg {
+							if err := m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg); err != nil {
+								slog.Warn("userspace: failed to restore XDP shim after XSK liveness failure", "err", err)
+							}
 						}
 					}
 				}
@@ -367,7 +449,8 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt.Add(60*time.Second)) {
 			// Hard timeout fallback: allow ctrl even if readiness has not been
 			// fully proven yet. The XSK liveness probe still decides whether
-			// the userspace shim stays active or we fall back to xdp_main.
+			// the userspace shim starts redirecting or stays fail-closed
+			// for transit.
 			ctrl.Enabled = 1
 		} else {
 			ctrl.Enabled = 0
@@ -375,20 +458,19 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 	}
 ctrlReady:
 	// Flush stale BPF session entries when ctrl transitions from
-	// disabled to enabled. During ctrl-disabled, the eBPF pipeline
-	// creates PASS_TO_KERNEL entries in the userspace session map.
-	// These poison the XDP shim after ctrl enables — it sees the stale
-	// entry and bypasses XSK, routing packets to the eBPF pipeline
-	// instead of the userspace helper.
+	// disabled to enabled. Older legacy-fallback windows could create
+	// PASS_TO_KERNEL entries in the userspace session map. These poison
+	// the XDP shim after ctrl enables: it sees the stale entry and
+	// bypasses XSK instead of redirecting to the userspace helper.
 	//
-	// Also flush BPF conntrack sessions created by the eBPF pipeline
-	// during the ctrl-disabled window. These sessions interfere with
-	// the userspace pipeline via TC egress: when the Rust helper sends
-	// packets via XSK TX, TC egress finds the stale BPF conntrack
-	// entries and may apply conflicting NAT or update session state
-	// incorrectly. The userspace helper's own session table (Rust
-	// SessionTable + shared_sessions) holds the authoritative synced
-	// sessions — BPF conntrack must be empty when ctrl re-enables.
+	// Also flush BPF conntrack sessions left by earlier legacy-fallback
+	// windows. These sessions interfere with the userspace pipeline via
+	// TC egress: when the Rust helper sends packets via XSK TX, TC egress
+	// finds the stale BPF conntrack entries and may apply conflicting NAT
+	// or update session state incorrectly. The userspace helper's own
+	// session table (Rust SessionTable + shared_sessions) holds the
+	// authoritative synced sessions, so BPF conntrack must be empty when
+	// ctrl re-enables.
 	// Only flush stale BPF sessions on the very first ctrl enable after
 	// daemon startup. Snapshot generation is not a reliable proxy for
 	// "startup" on long-lived HA nodes because a steady appliance can stay
@@ -413,19 +495,18 @@ ctrlReady:
 					"deleted", deleted)
 			}
 		}
-		// Flush BPF conntrack sessions created by the eBPF pipeline
-		// during the ctrl-disabled transition window. Only delete
+		// Flush BPF conntrack sessions left by an earlier fallback
+		// transition window. Only delete
 		// sessions whose Created timestamp is AFTER ctrlDisabledAt —
 		// synced sessions from the cluster peer have earlier timestamps
 		// and must survive for HA failover continuity.
 		//
-		// Why this is needed (issue #334): when ctrl=0 (startup, XSK
-		// liveness probe, link cycle), the eBPF pipeline creates
-		// conntrack entries in the BPF sessions map. When ctrl
-		// re-enables, TC egress finds these stale BPF entries and
-		// may apply conflicting NAT or update session state
-		// incorrectly — the userspace helper's own session table
-		// (Rust SessionTable + shared_sessions) is authoritative.
+		// Why this is needed (issue #334): a previous legacy fallback
+		// can leave conntrack entries in the BPF sessions map. When
+		// ctrl re-enables, TC egress finds these stale BPF entries and
+		// may apply conflicting NAT or update session state incorrectly;
+		// the userspace helper's own session table (Rust SessionTable +
+		// shared_sessions) is authoritative.
 		//
 		// session_value layout: State[1]+Flags[1]+TCPState[1]+
 		// IsReverse[1]+AppTimeout[4]+SessionID[8]+Created[8].
@@ -472,20 +553,16 @@ ctrlReady:
 		}
 		m.initialCtrlCleanupDone = true
 	}
-	if ctrl.Enabled == 0 && m.ctrlWasEnabled {
-		m.ctrlDisabledAt = m.bpfKtimeNs()
-	}
-	m.ctrlWasEnabled = ctrl.Enabled == 1
 
 	// Compute active runtime mode from ctrl state and liveness.
 	switch {
 	case ctrl.Enabled == 0 || m.xskLivenessFailed:
-		// In strict mode, a degraded userspace path still implies the strict
-		// shim is attached and fail-closed, not eBPF-only forwarding.
+		// Degraded userspace mode keeps the shim attached. Compat still only
+		// permits local/control kernel delivery; it is not eBPF-only transit.
 		if m.configuredMode == ModeUserspaceStrict {
 			m.mode = ModeUserspaceStrict
 		} else {
-			m.mode = ModeEBPFOnly
+			m.mode = ModeUserspaceCompat
 		}
 	case m.xskLivenessProven && m.configuredMode == ModeUserspaceStrict:
 		m.mode = ModeUserspaceStrict
@@ -495,13 +572,20 @@ ctrlReady:
 		// ctrl enabled but liveness not yet proven — still probing.
 		m.mode = ModeUserspaceCompat
 	}
-	// Set strict flag in ctrl so the XDP shim knows not to fall back.
+	// Set strict flag in ctrl so the XDP shim reports strict degraded drops
+	// separately while keeping transit fail-closed in both modes.
 	if m.configuredMode == ModeUserspaceStrict {
 		ctrl.Flags |= userspaceCtrlFlagStrict
 	}
 
-	if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("update userspace_ctrl from helper status: %w", err)
+	if ctrl.Enabled == 0 {
+		if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("disable userspace_ctrl from helper status: %w", err)
+		}
+		if m.ctrlWasEnabled {
+			m.ctrlDisabledAt = m.bpfKtimeNs()
+		}
+		m.ctrlWasEnabled = false
 	}
 
 	for _, binding := range status.Bindings {
@@ -524,17 +608,17 @@ ctrlReady:
 		// overflow the flat index; fail with a legible error instead
 		// of relying on the kernel's "argument list too long" E2BIG.
 		if idx >= dataplane.BindingArrayMaxEntries {
-			return fmt.Errorf(
+			return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
 				"update userspace_bindings: idx=%d exceeds cap=%d (ifindex=%d queue=%d; raise MAX_INTERFACES in bpf/headers/xpf_common.h)",
 				idx, dataplane.BindingArrayMaxEntries, binding.Ifindex, binding.QueueID,
-			)
+			))
 		}
 		val := userspaceBindingValue{
 			Slot:  binding.Slot,
 			Flags: flags,
 		}
 		if err := bindingsMap.Update(idx, val, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("update userspace_bindings idx=%d (if=%d q=%d): %w", idx, binding.Ifindex, binding.QueueID, err)
+			return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf("update userspace_bindings idx=%d (if=%d q=%d): %w", idx, binding.Ifindex, binding.QueueID, err))
 		}
 		if _, seen := newBindingIndexSet[idx]; !seen {
 			newBindingIndexSet[idx] = struct{}{}
@@ -555,24 +639,24 @@ ctrlReady:
 			// VLAN-alias children use their own ifindex here, so the
 			// child (not the parent) is the overflow risk.
 			if idx >= dataplane.BindingArrayMaxEntries {
-				return fmt.Errorf(
+				return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
 					"update aliased userspace_bindings: idx=%d exceeds cap=%d (child=%d parent=%d queue=%d; raise MAX_INTERFACES in bpf/headers/xpf_common.h)",
 					idx, dataplane.BindingArrayMaxEntries, childIfindex, parentIfindex, binding.QueueID,
-				)
+				))
 			}
 			val := userspaceBindingValue{
 				Slot:  binding.Slot,
 				Flags: flags,
 			}
 			if err := bindingsMap.Update(idx, val, ebpf.UpdateAny); err != nil {
-				return fmt.Errorf(
+				return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
 					"update aliased userspace_bindings idx=%d (if=%d parent=%d q=%d): %w",
 					idx,
 					childIfindex,
 					parentIfindex,
 					binding.QueueID,
 					err,
-				)
+				))
 			}
 			if _, seen := newBindingIndexSet[idx]; !seen {
 				newBindingIndexSet[idx] = struct{}{}
@@ -591,18 +675,25 @@ ctrlReady:
 		m.lastBindingIndices = newBindingIndices
 	}
 	if err := m.syncIngressIfaceMapLocked(m.lastSnapshot); err != nil {
-		return err
+		return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, err)
 	}
 	if err := m.syncLocalAddressMapsLocked(m.lastSnapshot); err != nil {
-		return err
+		return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, err)
 	}
 	if err := m.syncInterfaceNATAddressMapsLocked(m.lastSnapshot); err != nil {
-		return err
+		return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, err)
 	}
 	// Sync userspace-forwarded packet counters into BPF counter maps so
 	// that ReadGlobalCounter/ReadZoneCounters/etc. return complete values
 	// even for packets that bypassed the BPF pipeline (#332).
 	m.syncBPFCountersLocked(status)
+
+	if ctrl.Enabled == 1 {
+		if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
+			return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf("enable userspace_ctrl from helper status: %w", err))
+		}
+		m.ctrlWasEnabled = true
+	}
 
 	m.recordHelperStatusLocked(status)
 	return nil
@@ -629,6 +720,7 @@ var fallbackReasonNames = [16]string{
 	12: "no_session",
 	13: "strict_drop",
 	14: "pass_to_kernel",
+	15: "transit_drop",
 }
 
 // readFallbackStatsLocked reads the userspace_fallback_stats BPF array map
@@ -724,16 +816,34 @@ func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
 		return errors.New("userspace_local_v6 map not loaded")
 	}
 
+	desiredV4, desiredV6 := buildDesiredLocalAddressSets(snapshot)
+	for key := range desiredV4 {
+		if err := localV4Map.Update(key, uint8(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update userspace_local_v4 %08x: %w", key, err)
+		}
+	}
+	for key := range desiredV6 {
+		if err := localV6Map.Update(key, uint8(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update userspace_local_v6 %+v: %w", key, err)
+		}
+	}
+
 	var (
 		localV4Key uint32
 		localV4Val uint8
 	)
 	localV4Iter := localV4Map.Iterate()
-	var localV4Keys []uint32
+	var staleLocalV4Keys []uint32
 	for localV4Iter.Next(&localV4Key, &localV4Val) {
-		localV4Keys = append(localV4Keys, localV4Key)
+		if _, keep := desiredV4[localV4Key]; keep {
+			continue
+		}
+		staleLocalV4Keys = append(staleLocalV4Keys, localV4Key)
 	}
-	for _, key := range localV4Keys {
+	if err := localV4Iter.Err(); err != nil {
+		return fmt.Errorf("iterate userspace_local_v4: %w", err)
+	}
+	for _, key := range staleLocalV4Keys {
 		if err := localV4Map.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("delete userspace_local_v4 %08x: %w", key, err)
 		}
@@ -744,26 +854,33 @@ func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
 		localV6Val uint8
 	)
 	localV6Iter := localV6Map.Iterate()
-	var localV6Keys []userspaceLocalV6Key
+	var staleLocalV6Keys []userspaceLocalV6Key
 	for localV6Iter.Next(&localV6Key, &localV6Val) {
-		localV6Keys = append(localV6Keys, localV6Key)
+		if _, keep := desiredV6[localV6Key]; keep {
+			continue
+		}
+		staleLocalV6Keys = append(staleLocalV6Keys, localV6Key)
 	}
-	for _, key := range localV6Keys {
+	if err := localV6Iter.Err(); err != nil {
+		return fmt.Errorf("iterate userspace_local_v6: %w", err)
+	}
+	for _, key := range staleLocalV6Keys {
 		if err := localV6Map.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("delete userspace_local_v6 %+v: %w", key, err)
 		}
 	}
+	return nil
+}
 
+func buildDesiredLocalAddressSets(snapshot *ConfigSnapshot) (map[uint32]struct{}, map[userspaceLocalV6Key]struct{}) {
+	desiredV4 := make(map[uint32]struct{})
+	desiredV6 := make(map[userspaceLocalV6Key]struct{})
 	for _, entry := range buildLocalAddressEntries(snapshot) {
 		if entry.v4 {
-			if err := localV4Map.Update(entry.v4Key, uint8(1), ebpf.UpdateAny); err != nil {
-				return fmt.Errorf("update userspace_local_v4 %08x: %w", entry.v4Key, err)
-			}
+			desiredV4[entry.v4Key] = struct{}{}
 			continue
 		}
-		if err := localV6Map.Update(entry.v6Key, uint8(1), ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("update userspace_local_v6 %+v: %w", entry.v6Key, err)
-		}
+		desiredV6[entry.v6Key] = struct{}{}
 	}
 	// Also add kernel addresses (VIPs added by VRRP) that aren't in the
 	// config snapshot. Without this, the XDP shim doesn't recognize VIP
@@ -781,15 +898,15 @@ func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
 			}
 			if v4 := ip.To4(); v4 != nil && family == netlink.FAMILY_V4 {
 				key := binary.BigEndian.Uint32(v4)
-				_ = localV4Map.Update(key, uint8(1), ebpf.UpdateAny)
+				desiredV4[key] = struct{}{}
 			} else if v6 := ip.To16(); v6 != nil && family == netlink.FAMILY_V6 {
 				var key [16]byte
 				copy(key[:], v6)
-				_ = localV6Map.Update(userspaceLocalV6Key{Addr: key}, uint8(1), ebpf.UpdateAny)
+				desiredV6[userspaceLocalV6Key{Addr: key}] = struct{}{}
 			}
 		}
 	}
-	return nil
+	return desiredV4, desiredV6
 }
 
 func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) error {
@@ -802,16 +919,34 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 		return errors.New("userspace_interface_nat_v6 map not loaded")
 	}
 
+	desiredV4, desiredV6, rstV4, rstV6 := buildDesiredInterfaceNATAddressSets(snapshot)
+	for key := range desiredV4 {
+		if err := natV4Map.Update(key, uint8(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update userspace_interface_nat_v4 %08x: %w", key, err)
+		}
+	}
+	for key := range desiredV6 {
+		if err := natV6Map.Update(key, uint8(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update userspace_interface_nat_v6 %+v: %w", key, err)
+		}
+	}
+
 	var (
 		natV4Key uint32
 		natV4Val uint8
 	)
 	natV4Iter := natV4Map.Iterate()
-	var natV4Keys []uint32
+	var staleNatV4Keys []uint32
 	for natV4Iter.Next(&natV4Key, &natV4Val) {
-		natV4Keys = append(natV4Keys, natV4Key)
+		if _, keep := desiredV4[natV4Key]; keep {
+			continue
+		}
+		staleNatV4Keys = append(staleNatV4Keys, natV4Key)
 	}
-	for _, key := range natV4Keys {
+	if err := natV4Iter.Err(); err != nil {
+		return fmt.Errorf("iterate userspace_interface_nat_v4: %w", err)
+	}
+	for _, key := range staleNatV4Keys {
 		if err := natV4Map.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("delete userspace_interface_nat_v4 %08x: %w", key, err)
 		}
@@ -822,33 +957,22 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 		natV6Val uint8
 	)
 	natV6Iter := natV6Map.Iterate()
-	var natV6Keys []userspaceLocalV6Key
+	var staleNatV6Keys []userspaceLocalV6Key
 	for natV6Iter.Next(&natV6Key, &natV6Val) {
-		natV6Keys = append(natV6Keys, natV6Key)
+		if _, keep := desiredV6[natV6Key]; keep {
+			continue
+		}
+		staleNatV6Keys = append(staleNatV6Keys, natV6Key)
 	}
-	for _, key := range natV6Keys {
+	if err := natV6Iter.Err(); err != nil {
+		return fmt.Errorf("iterate userspace_interface_nat_v6: %w", err)
+	}
+	for _, key := range staleNatV6Keys {
 		if err := natV6Map.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("delete userspace_interface_nat_v6 %+v: %w", key, err)
 		}
 	}
 
-	var rstV4 []netip.Addr
-	var rstV6 []netip.Addr
-	for _, entry := range buildInterfaceNATAddressEntries(snapshot) {
-		if entry.v4 {
-			if err := natV4Map.Update(entry.v4Key, uint8(1), ebpf.UpdateAny); err != nil {
-				return fmt.Errorf("update userspace_interface_nat_v4 %08x: %w", entry.v4Key, err)
-			}
-			var b [4]byte
-			binary.BigEndian.PutUint32(b[:], entry.v4Key)
-			rstV4 = append(rstV4, netip.AddrFrom4(b))
-			continue
-		}
-		if err := natV6Map.Update(entry.v6Key, uint8(1), ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("update userspace_interface_nat_v6 %+v: %w", entry.v6Key, err)
-		}
-		rstV6 = append(rstV6, netip.AddrFrom16(entry.v6Key.Addr))
-	}
 	slices.SortFunc(rstV4, netip.Addr.Compare)
 	slices.SortFunc(rstV6, netip.Addr.Compare)
 	// Install RST suppression rules. Retry immediately on address changes,
@@ -875,6 +999,33 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 		m.lastRSTv6 = slices.Clone(rstV6)
 	}
 	return nil
+}
+
+func buildDesiredInterfaceNATAddressSets(snapshot *ConfigSnapshot) (map[uint32]struct{}, map[userspaceLocalV6Key]struct{}, []netip.Addr, []netip.Addr) {
+	entries := buildInterfaceNATAddressEntries(snapshot)
+	v4Count := 0
+	for _, entry := range entries {
+		if entry.v4 {
+			v4Count++
+		}
+	}
+	v6Count := len(entries) - v4Count
+	desiredV4 := make(map[uint32]struct{})
+	desiredV6 := make(map[userspaceLocalV6Key]struct{})
+	rstV4 := make([]netip.Addr, 0, v4Count)
+	rstV6 := make([]netip.Addr, 0, v6Count)
+	for _, entry := range entries {
+		if entry.v4 {
+			desiredV4[entry.v4Key] = struct{}{}
+			var b [4]byte
+			binary.BigEndian.PutUint32(b[:], entry.v4Key)
+			rstV4 = append(rstV4, netip.AddrFrom4(b))
+			continue
+		}
+		desiredV6[entry.v6Key] = struct{}{}
+		rstV6 = append(rstV6, netip.AddrFrom16(entry.v6Key.Addr))
+	}
+	return desiredV4, desiredV6, rstV4, rstV6
 }
 
 // verifyBindingsMapLocked reads the BPF userspace_bindings map and compares

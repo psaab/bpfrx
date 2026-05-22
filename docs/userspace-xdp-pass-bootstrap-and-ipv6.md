@@ -14,17 +14,26 @@ After daemon restart on the userspace HA cluster (`loss:xpf-userspace-fw0/fw1`),
 
 ## Root Causes
 
-### 1. XDP Shim `fallback_to_main()` Tail-Call Silent Failure
+### 1. Historical XDP Shim Tail-Call Silent Failure
 
-The Rust eBPF XDP shim (`userspace-xdp/src/lib.rs`) uses `USERSPACE_FALLBACK_PROGS.tail_call()` to jump back to `xdp_main_prog` when the userspace dataplane can't handle a packet. **This tail call always silently fails** in aya-ebpf, despite the prog array being correctly populated (verified via `bpftool map dump`).
+At the time of this investigation, the Rust eBPF XDP shim
+(`userspace-xdp/src/lib.rs`) used `USERSPACE_FALLBACK_PROGS.tail_call()` to
+jump back to `xdp_main_prog` when the userspace dataplane could not handle a
+packet. **This tail call always silently failed** in aya-ebpf, despite the prog
+array being correctly populated (verified via `bpftool map dump`).
+
+Issue #1473 removed this runtime dependency: the retained userspace shim now
+passes only proven local/control traffic to the kernel when helper/XSK state is
+degraded. Non-local transit drops in both compat and strict modes and is counted
+as `transit_drop` in `userspace_fallback_stats`.
 
 When the tail call failed, the function fell through to `return Ok(xdp_action::XDP_DROP)`, silently dropping all fallback packets. This affected three code paths:
 
 | Path | Trigger | Old Behavior | New Behavior |
 |------|---------|-------------|-------------|
-| `fallback_to_main()` | Heartbeat missing/stale, early filter | `XDP_DROP` | `XDP_PASS` |
-| Binding not ready | VLAN sub-interface without XSK binding | `XDP_DROP` | `XDP_PASS` |
-| Heartbeat stale | Timeout exceeded | `XDP_DROP` | `XDP_PASS` (via `fallback_to_main`) |
+| Historical tail-call fallback | Heartbeat missing/stale, early filter | `XDP_DROP` | Local/control pass; transit `XDP_DROP` |
+| Binding not ready | VLAN sub-interface without XSK binding | `XDP_DROP` | Local/control pass; transit `XDP_DROP` |
+| Heartbeat stale | Timeout exceeded | `XDP_DROP` | Local/control pass; transit `XDP_DROP` |
 
 **Impact:** Every packet that should have fallen back to the eBPF pipeline was silently dropped. During startup bootstrap, this meant zero forwarding.
 
@@ -55,7 +64,7 @@ When the XDP shim redirects packets to XSK, the kernel never sees them. The help
 
 This caused two problems:
 - **Kernel-originated traffic** (ping from fw0 itself) couldn't resolve neighbors
-- **XDP_PASS fallback** during bootstrap sent packets to the kernel, which couldn't forward because it had no ARP/NDP entries
+- **Local/control kernel delivery** during bootstrap sent host-owned packets to the kernel, which couldn't answer correctly because it had no ARP/NDP entries
 
 **Fix:** After learning a neighbor from an ARP reply or NDP NA, the helper now calls `add_kernel_neighbor()` which sends a raw netlink `RTM_NEWNEIGH` message to add the entry to the kernel's neighbor table. For VLAN interfaces, `resolve_ingress_logical_ifindex()` resolves the correct sub-interface ifindex from the VLAN tag.
 
@@ -65,7 +74,7 @@ After fresh XSK binding in zero-copy mode (mlx5), the NIC's XSK Receive Queue (R
 
 If heartbeat was written immediately, the XDP shim redirected to XSKMAP. On queues where the XSK RQ hadn't been bootstrapped, the redirect either failed silently or succeeded but the NIC couldn't deliver packets (no WQEs).
 
-**Fix:** `xsk_rx_confirmed` flag in `BindingWorker`. Heartbeat is only written after the XSK RX ring has delivered at least one packet, proving the NIC's XSK RQ is active. Until then, the XDP shim sees no heartbeat → `XDP_PASS` → kernel forwards (slower but works). Background traffic (VRRP advertisements, ARP, heartbeats) naturally bootstraps each queue's NAPI over time.
+**Fix:** `xsk_rx_confirmed` flag in `BindingWorker`. Heartbeat is only written after the XSK RX ring has delivered at least one packet, proving the NIC's XSK RQ is active. Until then, the XDP shim sees no heartbeat: proven local/control traffic may reach the kernel, while non-local transit drops and retries rather than bypassing policy/NAT/conntrack. Background traffic (VRRP advertisements, ARP, heartbeats) naturally bootstraps each queue's NAPI over time.
 
 ### 6. Session Sync Readiness Timeout Too Long
 
@@ -90,7 +99,7 @@ With both nodes running the new code, fw1 takes over in ~2.25s and forwards traf
 
 | File | Changes |
 |------|---------|
-| `userspace-xdp/src/lib.rs` | `XDP_PASS` fallback in 3 paths, updated comments |
+| `userspace-xdp/src/lib.rs` | Local/control kernel delivery and degraded transit drop paths |
 | `userspace-dp/src/afxdp.rs` | `xsk_rx_confirmed`, `add_kernel_neighbor()` via netlink, ARP/NDP reinject, grace period tuning |
 | `pkg/dataplane/compiler.go` | Skip XDP on VLAN sub-interfaces with userspace shim, `VlanSubInterfaces` tracking |
 | `pkg/dataplane/loader.go` | `VlanSubInterfaces` field, skip in `SwapXDPEntryProg()` |
@@ -120,8 +129,11 @@ incus exec loss:cluster-userspace-host -- iperf3 -c 2001:559:8585:80::200 -P 8 -
 
 ## Remaining Known Issues
 
-1. **aya-ebpf tail-call bug:** `USERSPACE_FALLBACK_PROGS.tail_call()` always fails silently despite correct map setup. The `XDP_PASS` workaround bypasses the eBPF firewall during bootstrap. Fixing the tail call would allow full pipeline processing during bootstrap.
+1. **Retired tail-call dependency:** #1473 removed
+   `USERSPACE_FALLBACK_PROGS.tail_call()` from the userspace shim. Compat
+   and strict degraded paths now pass only proven local/control traffic and
+   fail closed for non-local transit.
 
-2. **XSK RQ bootstrap timing:** Quiet queues (no background traffic) may never bootstrap and remain on `XDP_PASS` indefinitely. Under load (iperf3), all queues bootstrap within milliseconds. For ping-only traffic, some queues may stay on kernel forwarding.
+2. **XSK RQ bootstrap timing:** Quiet queues (no background traffic) may never bootstrap until a hardware RX event reaches that queue. Under load (iperf3), all queues bootstrap within milliseconds. During the unproven window, transit is dropped instead of forwarded through the kernel.
 
 3. **VLAN sub-interface XDP:** Skipping XDP on VLAN sub-interfaces means the eBPF pipeline doesn't run on demuxed VLAN traffic when the userspace shim is NOT active (e.g., during initial compile before shim swap). The parent's XDP handles the raw VLAN-tagged packet, which is sufficient for the userspace path.
