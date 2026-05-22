@@ -744,7 +744,7 @@ func (c *CLI) showVersion() error {
 	if ver == "" {
 		ver = "dev"
 	}
-	fmt.Printf("xpf eBPF firewall %s\n", ver)
+	fmt.Printf("xpf stateful firewall %s\n", ver)
 	var uts unix.Utsname
 	if err := unix.Uname(&uts); err == nil {
 		sysname := strings.TrimRight(string(uts.Sysname[:]), "\x00")

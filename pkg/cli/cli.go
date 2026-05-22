@@ -626,7 +626,7 @@ func (c *CLI) Run() error {
 		fmt.Fprintf(os.Stderr, "\ncommit confirmed timed out, configuration has been rolled back\n")
 	})
 
-	fmt.Println("xpf firewall - Junos-style eBPF firewall")
+	fmt.Println("xpf stateful firewall - Junos-style CLI")
 	fmt.Println("Type '?' for help")
 	fmt.Println()
 

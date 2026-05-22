@@ -415,7 +415,7 @@ func (a *Agent) isValidCommunity(community string) bool {
 func (a *Agent) getOIDValue(oid []int) ([]byte, byte) {
 	// System MIB group
 	if oidEqual(oid, oidSysDescr) {
-		desc := "xpf eBPF firewall"
+		desc := "xpf stateful firewall"
 		if a.cfg != nil && a.cfg.Description != "" {
 			desc = a.cfg.Description
 		}

@@ -1,5 +1,5 @@
 [Unit]
-Description=xpf eBPF Firewall Daemon
+Description=xpf Stateful Firewall Daemon
 After=network-online.target frr.service
 Wants=network-online.target
 

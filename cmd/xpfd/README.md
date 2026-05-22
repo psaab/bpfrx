@@ -1,8 +1,8 @@
 # cmd/xpfd
 
-The xpfd daemon — the firewall control plane. Loads eBPF (or spawns the
-Rust AF_XDP helper), applies compiled config to every subsystem,
-handles signals, and exposes gRPC + HTTP REST + an interactive CLI.
+The xpfd daemon — the firewall control plane. Starts the configured
+dataplane, applies compiled config to every subsystem, handles signals,
+and exposes gRPC + HTTP REST + an interactive CLI.
 
 ## Entry
 
@@ -13,8 +13,8 @@ manager from `pkg/*` and runs them under an errgroup.
 ## Flags
 
 - `-config` — config file path. Default `/etc/xpf/xpf.conf`.
-- `-no-dataplane` — config-only mode (parse + validate without loading
-  BPF). Useful for offline checks.
+- `-no-dataplane` — config-only mode (parse + validate without starting
+  the dataplane). Useful for offline checks.
 - `-api-addr` — HTTP REST listener. Default `127.0.0.1:8080`.
 - `-grpc-addr` — gRPC listener. Default `127.0.0.1:50051`.
 - `-debug` — verbose logging.
