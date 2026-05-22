@@ -926,7 +926,7 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 // CoS owner profile + worker runtime collectors.  Both features need
 // the same ProcessStatus; calling Status() twice per scrape is
 // wasteful on the userspace-dp control socket.
-func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
 	provider, ok := dp.(interface {
 		Status() (dpuserspace.ProcessStatus, error)
 	})
@@ -1644,7 +1644,7 @@ func bucketUpperBoundNs(i int) uint64 {
 	return uint64(1) << uint(i+10)
 }
 
-func (c *xpfCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+func (c *xpfCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
 	readCounter := func(idx uint32) float64 {
 		v, _ := dp.ReadGlobalCounter(idx)
 		return float64(v)
@@ -1692,7 +1692,7 @@ func (c *xpfCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp dat
 		readCounter(dataplane.GlobalCtrFlowCacheInvalidate), "invalidate")
 }
 
-func (c *xpfCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+func (c *xpfCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -1718,7 +1718,7 @@ func (c *xpfCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, dp 
 	}
 }
 
-func (c *xpfCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+func (c *xpfCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -1748,7 +1748,7 @@ func (c *xpfCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp datap
 	}
 }
 
-func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -1789,7 +1789,7 @@ func policyCounterID(policySetID uint32, ruleIndex int) uint32 {
 	return policySetID*dataplane.MaxRulesPerPolicy + uint32(ruleIndex)
 }
 
-func (c *xpfCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+func (c *xpfCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -1843,7 +1843,7 @@ func (c *xpfCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp dat
 	emitFilters("inet6", cfg.Firewall.FiltersInet6)
 }
 
-func (c *xpfCollector) collectSessionGauges(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+func (c *xpfCollector) collectSessionGauges(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
 	if c.srv.gc == nil {
 		return
 	}
@@ -1887,7 +1887,7 @@ func (c *xpfCollector) collectSessionGauges(ch chan<- prometheus.Metric, dp data
 	ch <- prometheus.MustNewConstMetric(c.sessionsDNAT, prometheus.GaugeValue, float64(dnat))
 }
 
-func (c *xpfCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+func (c *xpfCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
