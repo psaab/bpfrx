@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/psaab/xpf/pkg/cmdtree"
-	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -166,22 +165,18 @@ func (c *CLI) showChassisClusterStatistics() error {
 }
 
 func (c *CLI) showChassisClusterFabricStatistics() error {
-	if c.dp == nil || !c.dp.IsLoaded() {
+	counters, ok := c.readFabricRedirectCounters()
+	if !ok {
 		fmt.Println("Dataplane not loaded")
 		return nil
 	}
-	total, _ := c.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirect)
-	fab0, _ := c.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectFab0)
-	fab1, _ := c.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectFab1)
-	zone, _ := c.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectZone)
-	drops, _ := c.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricFwdDrop)
 
 	fmt.Println("Fabric redirect statistics:")
-	fmt.Printf("    Total redirects:          %d\n", total)
-	fmt.Printf("    fab0 redirects:           %d\n", fab0)
-	fmt.Printf("    fab1 redirects:           %d\n", fab1)
-	fmt.Printf("    Zone-encoded redirects:   %d\n", zone)
-	fmt.Printf("    Redirect drops:           %d\n", drops)
+	fmt.Printf("    Total redirects:          %d\n", counters.total)
+	fmt.Printf("    fab0 redirects:           %d\n", counters.fab0)
+	fmt.Printf("    fab1 redirects:           %d\n", counters.fab1)
+	fmt.Printf("    Zone-encoded redirects:   %d\n", counters.zone)
+	fmt.Printf("    Redirect drops:           %d\n", counters.drops)
 	fmt.Println()
 	fmt.Println("Note: XDP-redirected packets bypass AF_PACKET (tcpdump).")
 	fmt.Println("Use these counters or 'monitor interface <fab>' for fabric telemetry.")

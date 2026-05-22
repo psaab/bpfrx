@@ -28,7 +28,6 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"pkg/api/metrics.go":                       "Prometheus telemetry still reads legacy counters and metadata",
 	"pkg/cli/cli.go":                           "embedded CLI constructor still stores the legacy bridge",
 	"pkg/cli/cli_clear.go":                     "clear commands still delete legacy session entries",
-	"pkg/cli/cli_show_cluster.go":              "cluster display still reads legacy dataplane state",
 	"pkg/cli/cli_show_flow.go":                 "flow display still uses legacy session keys and values",
 	"pkg/cli/cli_show_nat.go":                  "NAT display still uses legacy NAT/session metadata",
 	"pkg/cli/cli_show_security.go":             "security display still uses legacy counters and filter types",

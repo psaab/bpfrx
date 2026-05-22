@@ -139,6 +139,36 @@ func (c *CLI) applyResult() *dataplane.ApplyResult {
 	return dataplane.LastApplyResultOf(c.dp)
 }
 
+func (c *CLI) dataplaneLoaded() bool {
+	return c != nil && c.dp != nil && c.dp.IsLoaded()
+}
+
+type fabricRedirectCounters struct {
+	total uint64
+	fab0  uint64
+	fab1  uint64
+	zone  uint64
+	drops uint64
+}
+
+func (c *CLI) readFabricRedirectCounters() (fabricRedirectCounters, bool) {
+	if !c.dataplaneLoaded() {
+		return fabricRedirectCounters{}, false
+	}
+	telemetry := dataplane.TelemetryOf(c.dp)
+	read := func(index uint32) uint64 {
+		v, _ := telemetry.GlobalCounter(index)
+		return v
+	}
+	return fabricRedirectCounters{
+		total: read(dataplane.GlobalCtrFabricRedirect),
+		fab0:  read(dataplane.GlobalCtrFabricRedirectFab0),
+		fab1:  read(dataplane.GlobalCtrFabricRedirectFab1),
+		zone:  read(dataplane.GlobalCtrFabricRedirectZone),
+		drops: read(dataplane.GlobalCtrFabricFwdDrop),
+	}, true
+}
+
 // SetForwardingSampler wires the pkg/fwdstatus Sampler into the CLI
 // so `show chassis forwarding` can read 5s/1m/5m CPU windows.
 // Pass nil to disable windowed CPU display (Build falls back to
