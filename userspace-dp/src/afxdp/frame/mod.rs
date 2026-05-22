@@ -210,7 +210,7 @@ pub(super) fn build_forwarded_frame_from_frame(
     out.truncate(written);
     if decision.resolution.tunnel_endpoint_id != 0 {
         if let Some(endpoint) = forwarding.tunnel_endpoints.get(&decision.resolution.tunnel_endpoint_id) {
-            if endpoint.mode == "wireguard" {
+            if endpoint.is_wireguard() {
                 return Some(out);
             }
         }
@@ -288,7 +288,7 @@ pub(super) fn build_forwarded_frame_into_from_frame(
         let is_wg = forwarding
             .tunnel_endpoints
             .get(&decision.resolution.tunnel_endpoint_id)
-            .map(|endpoint| endpoint.mode.eq_ignore_ascii_case("wireguard") || endpoint.wg_listen_port > 0)
+            .map(|endpoint| endpoint.is_wireguard())
             .unwrap_or(false);
         if is_wg {
             wireguard_tcp_mss(forwarding, decision, meta.addr_family)

@@ -141,6 +141,13 @@ pub(in crate::afxdp) struct TunnelEndpoint {
     pub(in crate::afxdp) wg_listen_port: u16,
 }
 
+impl TunnelEndpoint {
+    #[inline(always)]
+    pub(in crate::afxdp) fn is_wireguard(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("wireguard") || self.wg_listen_port > 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::afxdp) struct FabricLink {
     pub(in crate::afxdp) parent_ifindex: i32,

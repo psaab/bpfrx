@@ -158,11 +158,15 @@ pub(super) fn stage_native_gre_decap(
 pub(super) fn stage_wireguard_decap(
     raw_frame_mut: &mut [u8],
     meta: UserspaceDpMeta,
-    wireguard_engines: &mut rustc_hash::FxHashMap<u16, super::wireguard::WireGuardEngine>,
+    wireguard_engines: &mut rustc_hash::FxHashMap<(u16, i32), super::wireguard::WireGuardEngine>,
     scratch_wg_in: &mut Vec<u8>,
 ) -> (UserspaceDpMeta, Option<Vec<u8>>, bool, Option<u32>, Option<usize>) {
     if meta.protocol == 17 {
-        if let Some(engine) = wireguard_engines.get_mut(&meta.flow_dst_port) {
+        if let Some(engine) = wireguard_engines
+            .iter_mut()
+            .find(|((port, _), _)| *port == meta.flow_dst_port)
+            .map(|(_, engine)| engine)
+        {
             match engine.try_decap(raw_frame_mut, &meta, scratch_wg_in) {
                 super::wireguard::WireGuardDecapOutcome::Decapped(decap) => {
                     return (decap.meta, decap.control_frame, decap.is_control, None, Some(decap.decapsulated_len));

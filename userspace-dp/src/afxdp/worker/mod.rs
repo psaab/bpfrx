@@ -148,8 +148,8 @@ pub(crate) struct BindingWorker {
     /// `binding.bind_meta.X`.
     pub(crate) bind_meta: WorkerBindMeta,
     pub(crate) name: String,
-    pub(crate) wireguard_engines: rustc_hash::FxHashMap<u16, super::wireguard::WireGuardEngine>,
-    pub(crate) wireguard_listen_ports_by_ifname: rustc_hash::FxHashMap<String, u16>,
+    pub(crate) wireguard_engines: rustc_hash::FxHashMap<(u16, i32), super::wireguard::WireGuardEngine>,
+    pub(crate) wireguard_listen_ports_by_ifname: rustc_hash::FxHashMap<String, (u16, i32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -462,35 +462,36 @@ impl BindingWorker {
         snap: crate::protocol::WireGuardInterfaceSnapshot,
         virtual_ifindex: Option<i32>,
     ) {
-        let old_port = self
+        let v_ifindex = virtual_ifindex.unwrap_or(0);
+        let old_entry = self
             .wireguard_listen_ports_by_ifname
-            .insert(ifname.to_string(), snap.listen_port);
-        if let Some(port) = old_port
-            && port != snap.listen_port
+            .insert(ifname.to_string(), (snap.listen_port, v_ifindex));
+        if let Some((old_port, old_ifindex)) = old_entry
+            && (old_port != snap.listen_port || old_ifindex != v_ifindex)
             && !self
                 .wireguard_listen_ports_by_ifname
                 .values()
-                .any(|current| *current == port)
+                .any(|(current_port, current_ifindex)| *current_port == old_port && *current_ifindex == old_ifindex)
         {
-            self.wireguard_engines.remove(&port);
+            self.wireguard_engines.remove(&(old_port, old_ifindex));
         }
         let engine = self
             .wireguard_engines
-            .entry(snap.listen_port)
+            .entry((snap.listen_port, v_ifindex))
             .or_insert_with(super::wireguard::WireGuardEngine::new);
         engine.apply_snapshot(&snap, virtual_ifindex.map(|idx| idx as u32));
     }
 
     pub(crate) fn remove_wireguard_snapshot(&mut self, ifname: &str) {
-        let Some(port) = self.wireguard_listen_ports_by_ifname.remove(ifname) else {
+        let Some((port, v_ifindex)) = self.wireguard_listen_ports_by_ifname.remove(ifname) else {
             return;
         };
         if !self
             .wireguard_listen_ports_by_ifname
             .values()
-            .any(|current| *current == port)
+            .any(|(current_port, current_ifindex)| *current_port == port && *current_ifindex == v_ifindex)
         {
-            self.wireguard_engines.remove(&port);
+            self.wireguard_engines.remove(&(port, v_ifindex));
         }
     }
 
@@ -2735,15 +2736,38 @@ mod tests {
         };
 
         binding.apply_wireguard_snapshot("wg0", snap_wg0, None);
-        assert!(binding.wireguard_engines.contains_key(&51820));
-        assert_eq!(binding.wireguard_listen_ports_by_ifname.get("wg0"), Some(&51820));
+        assert!(binding.wireguard_engines.contains_key(&(51820, 0)));
+        assert_eq!(binding.wireguard_listen_ports_by_ifname.get("wg0"), Some(&(51820, 0)));
 
         binding.apply_wireguard_snapshot("wg1", snap_wg1, None);
-        assert!(binding.wireguard_engines.contains_key(&51820));
-        assert!(binding.wireguard_engines.contains_key(&51821));
+        assert!(binding.wireguard_engines.contains_key(&(51820, 0)));
+        assert!(binding.wireguard_engines.contains_key(&(51821, 0)));
 
         binding.remove_wireguard_snapshot("wg0");
-        assert!(!binding.wireguard_engines.contains_key(&51820));
-        assert!(binding.wireguard_engines.contains_key(&51821));
+        assert!(!binding.wireguard_engines.contains_key(&(51820, 0)));
+        assert!(binding.wireguard_engines.contains_key(&(51821, 0)));
+
+        // Test port aliasing: two interfaces sharing a port but having different virtual_ifindex values
+        let snap_wg2 = WireGuardInterfaceSnapshot {
+            private_key: BASE64.encode(&[3u8; 32]),
+            public_key: "".to_string(),
+            listen_port: 51822,
+            peers: vec![],
+        };
+        let snap_wg3 = WireGuardInterfaceSnapshot {
+            private_key: BASE64.encode(&[4u8; 32]),
+            public_key: "".to_string(),
+            listen_port: 51822, // identical port
+            peers: vec![],
+        };
+        binding.apply_wireguard_snapshot("wg2", snap_wg2, Some(22));
+        binding.apply_wireguard_snapshot("wg3", snap_wg3, Some(23));
+
+        assert!(binding.wireguard_engines.contains_key(&(51822, 22)));
+        assert!(binding.wireguard_engines.contains_key(&(51822, 23)));
+
+        binding.remove_wireguard_snapshot("wg2");
+        assert!(!binding.wireguard_engines.contains_key(&(51822, 22)));
+        assert!(binding.wireguard_engines.contains_key(&(51822, 23))); // wg3 remains unaffected!
     }
 }

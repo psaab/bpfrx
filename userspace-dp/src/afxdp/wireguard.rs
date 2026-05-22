@@ -484,6 +484,7 @@ impl WireGuardEngine {
         rx_queue_index: u32,
         explicit_peer: Option<[u8; 32]>,
         preferred_local_ip: Option<IpAddr>,
+        tx_vlan_id: Option<u16>,
         scratch_out: &mut Vec<u8>,
     ) -> Option<(usize, usize, UserspaceDpMeta)> {
         let l3_offset = frame_l3_offset(inner_frame).unwrap_or(14);
@@ -544,7 +545,8 @@ impl WireGuardEngine {
             return None;
         }
 
-        let outer_eth_len = l3_offset;
+        let vlan_id = tx_vlan_id.unwrap_or(0);
+        let outer_eth_len = if vlan_id > 0 { 18 } else { 14 };
         let ip_header_len = if outer_dst_ip.is_ipv4() { 20 } else { 40 };
         let header_len = outer_eth_len + ip_header_len + 8;
 
@@ -577,17 +579,14 @@ impl WireGuardEngine {
         let ip_start = packet_start + outer_eth_len;
         let udp_start = ip_start + ip_header_len;
 
-        scratch_out[packet_start .. packet_start + 6].copy_from_slice(&dst_mac);
-        scratch_out[packet_start + 6 .. packet_start + 12].copy_from_slice(&src_mac);
-        
-        let vlan_len = outer_eth_len - 14;
-        if vlan_len > 0 {
-            scratch_out[packet_start + 12 .. packet_start + 12 + vlan_len]
-                .copy_from_slice(&inner_frame[12 .. 12 + vlan_len]);
-        }
         let eth_proto: u16 = if outer_dst_ip.is_ipv4() { 0x0800 } else { 0x86dd };
-        scratch_out[packet_start + outer_eth_len - 2 .. packet_start + outer_eth_len]
-            .copy_from_slice(&eth_proto.to_be_bytes());
+        super::frame::write_eth_header_slice(
+            &mut scratch_out[packet_start .. packet_start + outer_eth_len],
+            dst_mac,
+            src_mac,
+            vlan_id,
+            eth_proto,
+        )?;
 
         let udp_len = 8 + wg_payload_len;
         let ip_len = match outer_dst_ip {
@@ -1494,5 +1493,62 @@ mod tests {
         }
 
         assert!(roamed, "Peer 39 failed to roam even after rotating round_robin_offset");
+    }
+
+    #[test]
+    fn test_try_encap_with_vlan() {
+        use crate::protocol::{WireGuardInterfaceSnapshot, WireGuardPeerSnapshot};
+        let mut engine = WireGuardEngine::new();
+
+        let private_key = BASE64.encode(&[1u8; 32]);
+        let mut peer_key = [0u8; 32]; peer_key[0] = 99;
+        let pub_peer = BASE64.encode(&peer_key);
+
+        let snap = WireGuardInterfaceSnapshot {
+            private_key,
+            public_key: "".to_string(),
+            listen_port: 51820,
+            peers: vec![WireGuardPeerSnapshot {
+                public_key: pub_peer,
+                endpoint: "1.2.3.4:51820".to_string(),
+                allowed_ips: vec![],
+                persistent_keepalive: 0,
+            }],
+        };
+        engine.apply_snapshot(&snap, None);
+
+        // Form an inner packet with MAC headers
+        let mut inner_frame = vec![0u8; 64];
+        inner_frame[0..6].copy_from_slice(&[10, 11, 12, 13, 14, 15]); // dst MAC
+        inner_frame[6..12].copy_from_slice(&[1, 2, 3, 4, 5, 6]); // src MAC
+        inner_frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes()); // IPv4
+
+        let mut scratch_out = Vec::new();
+
+        // Pass Some(80) as tx_vlan_id
+        let res = engine.try_encap(
+            &inner_frame,
+            libc::AF_INET as u8,
+            1,
+            0,
+            Some(peer_key),
+            Some("1.2.3.5".parse().unwrap()),
+            Some(80),
+            &mut scratch_out,
+        );
+
+        assert!(res.is_some(), "try_encap failed");
+        let (start_idx, total_len, meta) = res.unwrap();
+
+        let encapped = &scratch_out[start_idx..start_idx + total_len];
+        assert_eq!(meta.l3_offset, 18);
+        assert_eq!(meta.l4_offset, 38);
+
+        // Verify VLAN tagged Ethernet header
+        assert_eq!(&encapped[0..6], &[10, 11, 12, 13, 14, 15]);
+        assert_eq!(&encapped[6..12], &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(&encapped[12..14], &0x8100u16.to_be_bytes()); // TPID
+        assert_eq!(&encapped[14..16], &80u16.to_be_bytes()); // VLAN ID
+        assert_eq!(&encapped[16..18], &0x0800u16.to_be_bytes()); // EtherType
     }
 }

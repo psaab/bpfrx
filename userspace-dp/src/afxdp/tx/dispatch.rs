@@ -826,10 +826,10 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 let mut frame = frame;
                                 let mut outer_meta_opt = None;
                                 if let Some(endpoint) = forwarding.tunnel_endpoints.get(&request.decision.resolution.tunnel_endpoint_id) {
-                                    if endpoint.mode == "wireguard" {
+                                    if endpoint.is_wireguard() {
                                         let mut encap_meta = request.meta;
                                         encap_meta.l3_offset = 14; 
-                                        if let Some(engine) = target_binding.wireguard_engines.get_mut(&endpoint.wg_listen_port) {
+                                        if let Some(engine) = target_binding.wireguard_engines.get_mut(&(endpoint.wg_listen_port, endpoint.logical_ifindex)) {
                                             if let Some((start_idx, total_len, outer_meta)) = engine.try_encap(
                                                 &frame,
                                                 encap_meta.addr_family,
@@ -837,6 +837,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                                 0,
                                                 None,
                                                 Some(endpoint.source),
+                                                Some(request.decision.resolution.tx_vlan_id),
                                                 &mut target_binding.scratch.scratch_wg_out,
                                             ) {
                                                 frame = target_binding.scratch.scratch_wg_out[start_idx..start_idx + total_len].to_vec();
