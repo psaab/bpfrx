@@ -83,14 +83,21 @@ impl WireguardBindingState {
         before: &FxHashMap<String, u16>,
         after: &[(String, u16)],
     ) {
+        let after_names: std::collections::BTreeSet<&str> =
+            after.iter().map(|(n, _)| n.as_str()).collect();
         let after_ports: std::collections::BTreeSet<u16> =
             after.iter().map(|(_, p)| *p).collect();
         let mut engines = self.engines.lock().unwrap();
-        for (_ifname, port) in before {
-            if !after_ports.contains(port) {
-                engines.remove(port);
+        self.interfaces.retain(|name, port| {
+            if after_names.contains(name.as_str()) {
+                true
+            } else {
+                if !after_ports.contains(port) {
+                    engines.remove(port);
+                }
+                false
             }
-        }
+        });
     }
 
     /// Attempt WireGuard decapsulation for a packet on this binding.

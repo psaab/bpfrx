@@ -269,9 +269,16 @@ impl WireGuardEngine {
         endpoint_port: u16,
         scratch: &mut Vec<u8>,
     ) -> Option<TunnPhase2> {
+        // boringtun internally shifts the receiver index left by 8
+        // (id << 8 in Tunn::new), then uses the low 8 bits as a
+        // cyclic session counter.  The wire-format receiver index
+        // therefore has the peer identifier in bits 31..8 and the
+        // session counter in bits 7..0.  Shift right by 8 to recover
+        // the peer identifier for our index_to_peer lookup.
+        let lookup_key = receiver_idx >> 8;
         let pk = self
             .index_to_peer
-            .get(&receiver_idx)
+            .get(&lookup_key)
             .copied()
             .or_else(|| {
                 let ek = (peer_ip, endpoint_port);
@@ -525,7 +532,6 @@ impl WireGuardEngine {
                     eth_type,
                 )?;
 
-                let inner_dscp = meta_dscp & 0x3f;
                 let mut outer_meta = packet::build_outer_headers(
                     header_area,
                     outer_ip_start,
@@ -534,7 +540,7 @@ impl WireGuardEngine {
                     self.listen_port,
                     outer_dst_port,
                     total_payload_len,
-                    inner_dscp,
+                    meta_dscp,   // full TOS/TC byte (DSCP + ECN) from caller
                     wg_payload,
                 )?;
 
@@ -594,13 +600,24 @@ impl WireGuardEngine {
             self.static_private = private_key;
         }
 
+        // Key removal (transition from Some to None): clear all peer
+        // state.  Existing Tunn objects were created with the old
+        // static_secret and cannot be reused without a valid key.
+        if self.static_private.is_none() {
+            self.peers.clear();
+            self.endpoint_to_peer.clear();
+            self.index_to_peer.clear();
+            self.allowed_ip_to_peer = PrefixMap::new();
+            return;
+        }
+
         // When the private key changes, all existing Tunn objects must be
         // recreated — each Tunn embeds the static_secret at construction
         // time and does not update it on key rotation. Retaining stale
         // Tunn objects means old sessions remain valid, which violates
         // the WireGuard key-compromise property (old key material should
         // be unusable after rotation).
-        let force_tunn_rebuild = key_changed && self.static_private.is_some();
+        let force_tunn_rebuild = key_changed;
 
         let mut new_peers: FxHashMap<[u8; 32], PeerState> = FxHashMap::default();
         let mut new_endpoint_to_peer: FxHashMap<(IpAddr, u16), [u8; 32]> = FxHashMap::default();

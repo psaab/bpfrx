@@ -13,7 +13,7 @@ pub(crate) fn build_outer_headers(
     src_port: u16,
     dst_port: u16,
     payload_len: usize,
-    inner_dscp: u8,
+    inner_tos_tc: u8,
     payload: &[u8],
 ) -> Option<UserspaceDpMeta> {
     match (src_ip, dst_ip) {
@@ -25,7 +25,7 @@ pub(crate) fn build_outer_headers(
             let total_len_u16 = u16::try_from(20 + 8 + payload_len).ok()?;
             let ip_hdr = out.get_mut(ip_start..ip_start + 20)?;
             ip_hdr[0] = 0x45;
-            ip_hdr[1] = (inner_dscp << 2) | (ip_hdr[1] & 0x03);
+            ip_hdr[1] = inner_tos_tc;
             ip_hdr[2..4].copy_from_slice(&total_len_u16.to_be_bytes());
             ip_hdr[4..8].copy_from_slice(&[0, 0, 0x40, 0]);
             ip_hdr[8] = 64;
@@ -66,11 +66,12 @@ pub(crate) fn build_outer_headers(
             }
             let payload_len_u16 = u16::try_from(8 + payload_len).ok()?;
             let ip_hdr = out.get_mut(ip_start..ip_start + 40)?;
-            // IPv6 traffic class = DSCP (6 bits) << 2 | ECN (2 bits).
-            // inner_dscp is the raw 6-bit DSCP value from meta_dscp & 0x3f.
-            let tc = (inner_dscp << 2) | (ip_hdr[1] & 0x03);
-            ip_hdr[0] = 0x60 | ((tc >> 4) & 0x0f);
-            ip_hdr[1] = ((tc & 0x0f) << 4) | (ip_hdr[1] & 0x0f);
+            // inner_tos_tc is the full 8-bit TOS (IPv4) / Traffic Class
+            // (IPv6) byte from the inner packet: DSCP (6 bits) in the
+            // top-6, ECN (2 bits) in the bottom-2.  Copy it into the
+            // outer IPv6 header, splitting across the TC nibbles.
+            ip_hdr[0] = 0x60 | ((inner_tos_tc >> 4) & 0x0f);
+            ip_hdr[1] = ((inner_tos_tc & 0x0f) << 4) | (ip_hdr[1] & 0x0f);
             ip_hdr[2..4].copy_from_slice(&[0, 0]);
             ip_hdr[4..6].copy_from_slice(&payload_len_u16.to_be_bytes());
             ip_hdr[6] = PROTO_UDP;

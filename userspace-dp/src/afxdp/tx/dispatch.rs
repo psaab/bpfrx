@@ -549,6 +549,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                         None,
                                         forwarding,
                                     );
+                                    recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                                     continue;
                                 }
                                 let req = TxRequest {
@@ -878,6 +879,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                         None,
                                         forwarding,
                                     );
+                                    recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                                     continue;
                                 }
                                 let req = TxRequest {
