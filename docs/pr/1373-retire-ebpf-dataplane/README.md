@@ -132,8 +132,7 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/daemon/daemon_run.go` | Runtime wiring still passes `legacyDP()` to unmigrated services. |
 | `pkg/grpcapi/apply_result.go` | gRPC apply metadata still adapts legacy apply results. |
 | `pkg/grpcapi/server.go` | gRPC server construction still stores the legacy bridge. |
-| `pkg/grpcapi/server_helpers.go` | gRPC helpers still format legacy dataplane types. |
-| `pkg/grpcapi/server_nat.go` | gRPC NAT output still reads legacy NAT/session metadata. |
+| `pkg/grpcapi/server_helpers.go` | gRPC helpers still format legacy dataplane types and bridge runtime accessors. |
 | `pkg/grpcapi/server_sessions.go` | gRPC session RPCs still use legacy session types. |
 | `pkg/grpcapi/server_show.go` | gRPC show dispatcher still reaches legacy dataplane state. |
 | `pkg/grpcapi/server_show_cluster_text.go` | Cluster text output still reads legacy dataplane state. |

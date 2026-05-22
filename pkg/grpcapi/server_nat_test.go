@@ -25,8 +25,54 @@ func (d *natApplyResultGRPCDP) LastApplyResult() *dataplane.ApplyResult {
 	return d.result.Clone()
 }
 
+func (d *natApplyResultGRPCDP) Telemetry() dataplane.Telemetry {
+	return dataplane.NewDataPlaneTelemetry(d)
+}
+
 func (d *natApplyResultGRPCDP) ReadNATRuleCounter(counterID uint32) (dataplane.CounterValue, error) {
 	return dataplane.CounterValue{Packets: uint64(counterID), Bytes: uint64(counterID) * 100}, nil
+}
+
+type natSessionProviderGRPCDP struct {
+	*dataplane.Manager
+	result *dataplane.ApplyResult
+	store  dataplane.SessionStore
+}
+
+func (d *natSessionProviderGRPCDP) IsLoaded() bool {
+	return true
+}
+
+func (d *natSessionProviderGRPCDP) LastApplyResult() *dataplane.ApplyResult {
+	return d.result.Clone()
+}
+
+func (d *natSessionProviderGRPCDP) Sessions() dataplane.SessionStore {
+	return d.store
+}
+
+type natSessionGRPCStore struct {
+	dataplane.SessionStore
+	v4 []dataplane.SessionValue
+	v6 []dataplane.SessionValueV6
+}
+
+func (s *natSessionGRPCStore) ForEachV4(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	for _, val := range s.v4 {
+		if !fn(dataplane.SessionKey{}, val) {
+			return nil
+		}
+	}
+	return nil
+}
+
+func (s *natSessionGRPCStore) ForEachV6(fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	for _, val := range s.v6 {
+		if !fn(dataplane.SessionKeyV6{}, val) {
+			return nil
+		}
+	}
+	return nil
 }
 
 func newNATStatsGRPCStore(t *testing.T) *configstore.Store {
@@ -78,5 +124,55 @@ func TestGetNATRuleStatsReadsApplyResultOnce(t *testing.T) {
 	}
 	if hits["r1"] != 21 || hits["r2"] != 22 {
 		t.Fatalf("hit packets = %+v, want r1=21 r2=22", hits)
+	}
+}
+
+func TestGetNATPoolStatsUsesSessionStoreProvider(t *testing.T) {
+	dp := &natSessionProviderGRPCDP{
+		Manager: dataplane.New(),
+		result: &dataplane.ApplyResult{
+			ZoneIDs: map[string]uint16{
+				"trust":   1,
+				"untrust": 2,
+			},
+		},
+		store: &natSessionGRPCStore{
+			v4: []dataplane.SessionValue{
+				{Flags: dataplane.SessFlagSNAT, IngressZone: 1, EgressZone: 2},
+				{Flags: dataplane.SessFlagSNAT, IsReverse: 1, IngressZone: 1, EgressZone: 2},
+				{Flags: dataplane.SessFlagDNAT, IngressZone: 1, EgressZone: 2},
+			},
+			v6: []dataplane.SessionValueV6{
+				{Flags: dataplane.SessFlagSNAT, IngressZone: 1, EgressZone: 2},
+			},
+		},
+	}
+	s := &Server{store: newNATStatsGRPCStore(t), dp: dp}
+
+	resp, err := s.GetNATPoolStats(context.Background(), &pb.GetNATPoolStatsRequest{})
+	if err != nil {
+		t.Fatalf("GetNATPoolStats() error = %v", err)
+	}
+	if resp.TotalActiveTranslations != 2 {
+		t.Fatalf("TotalActiveTranslations = %d, want 2", resp.TotalActiveTranslations)
+	}
+	if len(resp.RuleSetSessions) != 1 {
+		t.Fatalf("len(RuleSetSessions) = %d, want 1", len(resp.RuleSetSessions))
+	}
+	got := resp.RuleSetSessions[0]
+	if got.FromZone != "trust" || got.ToZone != "untrust" || got.Sessions != 2 {
+		t.Fatalf("RuleSetSessions[0] = %+v, want trust->untrust sessions=2", got)
+	}
+	interfacePools := 0
+	for _, pool := range resp.Pools {
+		if pool.IsInterface && pool.UsedPorts != 2 {
+			t.Fatalf("interface pool %q UsedPorts = %d, want 2", pool.Name, pool.UsedPorts)
+		}
+		if pool.IsInterface {
+			interfacePools++
+		}
+	}
+	if interfacePools != 2 {
+		t.Fatalf("interface pool count = %d, want 2", interfacePools)
 	}
 }
