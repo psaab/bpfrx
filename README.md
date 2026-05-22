@@ -92,7 +92,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 | NAT64 (IPv6↔IPv4) | Yes | Yes |
 | NPTv6 (RFC 6296) | Yes | Yes |
 | Screen/IDS (11 checks) | Yes | Yes; userspace SYN-cookie runtime is wired |
-| Firewall filters + policers | Yes | Filters yes; three-color policers admitted for color-blind `then discard` slice, with remaining #1375 hardening still open |
+| Firewall filters + policers | Yes | Filters yes; three-color policers admitted for the reviewed color-blind `then discard` slice; broader color-aware and non-drop action work is production hardening, not an active #1375 feature-gap blocker |
 | TCP MSS clamping | Yes | Yes |
 | GRE tunnel transit | Yes | Yes (passthrough) |
 | IPsec / XFRM | Yes | Yes (passthrough) |
@@ -108,9 +108,11 @@ runs in userspace with bounded SYN-ACK/RST replies and userspace status
 counters; live HA/flood evidence is still required before BPF source removal.
 Port mirroring has bounded userspace runtime admission, but still needs
 mirror-fidelity and pressure
-evidence before BPF source removal. Three-color policers are admitted only for
-the bounded color-blind `then discard` runtime slice while #1375 hardening
-remains. Pool-mode SNAT is admitted, #1385 added userspace-v1
+evidence before BPF source removal. Three-color policers are admitted for the
+bounded color-blind `then discard` runtime slice; remaining color-aware,
+non-drop action, and HA/restart continuity decisions are production follow-up
+work rather than active #1375 feature-gap blockers. Pool-mode SNAT is admitted,
+#1385 added userspace-v1
 `address-persistent` selection, and the runtime now fails closed for unusable
 or exhausted source-NAT pool rules before forwarding. Non-HA per-pool
 `persistent-nat` lease reuse is helper-local userspace state; it does not

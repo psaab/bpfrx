@@ -1,15 +1,20 @@
 package dataplane
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/cilium/ebpf"
 )
 
 const (
@@ -19,6 +24,7 @@ const (
 	dpdkBackendImportForCanary      = "github.com/psaab/xpf/pkg/dataplane/dpdk"
 	makefileForCanary               = "../../Makefile"
 	retirementBoundaryDocsForCanary = "../../docs/pr/1373-retire-ebpf-dataplane/README.md"
+	userspaceXDPEntryProgForCanary  = "xdp_userspace_prog"
 )
 
 var legacyDataplaneImportAllowlist = map[string]string{
@@ -65,6 +71,32 @@ var dpdkEBPFImportAllowlist = map[string]string{
 var dpdkBackendImportAllowlist = map[string]string{
 	"cmd/xpfd/main.go": "backend registration and cleanup entry point",
 }
+
+var userspaceShimAllowedMapTypes = map[string]ebpf.MapType{
+	"dnat_table":                 ebpf.Hash,
+	"userspace_bindings":         ebpf.Array,
+	"userspace_cpumap":           ebpf.CPUMap,
+	"userspace_ctrl":             ebpf.Array,
+	"userspace_fallback_stats":   ebpf.Array,
+	"userspace_heartbeat":        ebpf.Array,
+	"userspace_ingress_ifaces":   ebpf.Hash,
+	"userspace_interface_nat_v4": ebpf.Hash,
+	"userspace_interface_nat_v6": ebpf.Hash,
+	"userspace_local_v4":         ebpf.Hash,
+	"userspace_local_v6":         ebpf.Hash,
+	"userspace_sessions":         ebpf.Hash,
+	"userspace_trace":            ebpf.Hash,
+	"userspace_xsk_map":          ebpf.XSKMap,
+}
+
+var userspaceShimAllowedProgramTypes = map[string]ebpf.ProgramType{
+	userspaceXDPEntryProgForCanary: ebpf.XDP,
+}
+
+var (
+	rustMapAnnotationRE = regexp.MustCompile(`#\[\s*map\s*\(\s*name\s*=\s*"([^"]+)"\s*\)\s*\]`)
+	rustXDPFunctionRE   = regexp.MustCompile(`#\[\s*xdp\s*\]\s*(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)`)
+)
 
 func TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports(t *testing.T) {
 	t.Parallel()
@@ -318,6 +350,232 @@ func TestUserspaceShimSharedMapsAreExplicitCompatibilitySet(t *testing.T) {
 	}
 }
 
+func TestUserspaceXDPShimSourceMatchesRetainedObjectAllowlist(t *testing.T) {
+	t.Parallel()
+
+	foundMaps := map[string]string{}
+	foundPrograms := map[string]string{}
+	var forbidden []string
+
+	for _, path := range rustSourceFilesUnder(t, filepath.Join(repoRootForBoundaryCanary, "userspace-xdp", "src")) {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read userspace XDP shim source %s: %v", path, err)
+		}
+		text := string(data)
+		rel := repoRelativePath(t, path)
+		for _, token := range []string{
+			"ProgramArray",
+			".tail_call(",
+			"bpf_tail_call",
+		} {
+			if strings.Contains(text, token) {
+				forbidden = append(forbidden, fmt.Sprintf("%s contains %q", rel, token))
+			}
+		}
+		for _, match := range rustMapAnnotationRE.FindAllStringSubmatchIndex(text, -1) {
+			name := text[match[2]:match[3]]
+			foundMaps[name] = fmt.Sprintf("%s at %s:%d", name, rel, lineForOffset(text, match[0]))
+		}
+		for _, match := range rustXDPFunctionRE.FindAllStringSubmatchIndex(text, -1) {
+			name := text[match[2]:match[3]]
+			foundPrograms[name] = fmt.Sprintf("%s at %s:%d", name, rel, lineForOffset(text, match[0]))
+		}
+	}
+
+	unexpectedMaps, missingMaps := compareStringSetToAllowed(foundMaps, keysOfMapTypeAllowlist(userspaceShimAllowedMapTypes))
+	unexpectedPrograms, missingPrograms := compareStringSetToAllowed(foundPrograms, keysOfProgramTypeAllowlist(userspaceShimAllowedProgramTypes))
+	if len(forbidden) > 0 || len(unexpectedMaps) > 0 || len(missingMaps) > 0 ||
+		len(unexpectedPrograms) > 0 || len(missingPrograms) > 0 {
+		sort.Strings(forbidden)
+		sort.Strings(unexpectedMaps)
+		sort.Strings(missingMaps)
+		sort.Strings(unexpectedPrograms)
+		sort.Strings(missingPrograms)
+		t.Fatalf(
+			"userspace XDP shim source allowlist drift\nforbidden tail-call tokens: %v\nunexpected maps: %v\nmissing maps: %v\nunexpected programs: %v\nmissing programs: %v",
+			forbidden,
+			unexpectedMaps,
+			missingMaps,
+			unexpectedPrograms,
+			missingPrograms,
+		)
+	}
+}
+
+func TestUserspaceXDPShimObjectMatchesRetainedCollectionAllowlist(t *testing.T) {
+	t.Parallel()
+
+	spec, err := loadRustUserspaceXDP()
+	if err != nil {
+		t.Fatalf("load userspace XDP shim object: %v", err)
+	}
+
+	foundMaps := map[string]string{}
+	var wrongMaps []string
+	for name, mapSpec := range spec.Maps {
+		foundMaps[name] = name
+		if want, ok := userspaceShimAllowedMapTypes[name]; ok && mapSpec.Type != want {
+			wrongMaps = append(wrongMaps, fmt.Sprintf("%s type %s, want %s", name, mapSpec.Type, want))
+		}
+	}
+	foundPrograms := map[string]string{}
+	var wrongPrograms []string
+	for name, programSpec := range spec.Programs {
+		foundPrograms[name] = name
+		if want, ok := userspaceShimAllowedProgramTypes[name]; ok && programSpec.Type != want {
+			wrongPrograms = append(wrongPrograms, fmt.Sprintf("%s type %s, want %s", name, programSpec.Type, want))
+		}
+	}
+
+	unexpectedMaps, missingMaps := compareStringSetToAllowed(foundMaps, keysOfMapTypeAllowlist(userspaceShimAllowedMapTypes))
+	unexpectedPrograms, missingPrograms := compareStringSetToAllowed(foundPrograms, keysOfProgramTypeAllowlist(userspaceShimAllowedProgramTypes))
+	if len(wrongMaps) > 0 || len(unexpectedMaps) > 0 || len(missingMaps) > 0 ||
+		len(wrongPrograms) > 0 || len(unexpectedPrograms) > 0 || len(missingPrograms) > 0 {
+		sort.Strings(wrongMaps)
+		sort.Strings(unexpectedMaps)
+		sort.Strings(missingMaps)
+		sort.Strings(wrongPrograms)
+		sort.Strings(unexpectedPrograms)
+		sort.Strings(missingPrograms)
+		t.Fatalf(
+			"userspace XDP shim object allowlist drift\nwrong map types: %v\nunexpected maps: %v\nmissing maps: %v\nwrong program types: %v\nunexpected programs: %v\nmissing programs: %v",
+			wrongMaps,
+			unexpectedMaps,
+			missingMaps,
+			wrongPrograms,
+			unexpectedPrograms,
+			missingPrograms,
+		)
+	}
+}
+
+func TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram(t *testing.T) {
+	t.Parallel()
+
+	var violations []string
+	for _, path := range productionGoFilesUnder(t, []string{
+		filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace"),
+	}) {
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.AssignStmt:
+				for i, lhs := range node.Lhs {
+					if !isXDPEntryProgField(lhs) {
+						continue
+					}
+					var rhs ast.Expr
+					if len(node.Rhs) == len(node.Lhs) {
+						rhs = node.Rhs[i]
+					}
+					if !isUserspaceXDPEntryProgExpr(rhs) {
+						pos := fset.Position(lhs.Pos())
+						violations = append(violations, fmt.Sprintf(
+							"%s:%d assigns XDPEntryProg from %q",
+							repoRelativePath(t, path),
+							pos.Line,
+							canaryExprString(rhs),
+						))
+					}
+				}
+			case *ast.CompositeLit:
+				for _, elt := range node.Elts {
+					kv, ok := elt.(*ast.KeyValueExpr)
+					if !ok || !isXDPEntryProgField(kv.Key) {
+						continue
+					}
+					if !isUserspaceXDPEntryProgExpr(kv.Value) {
+						pos := fset.Position(kv.Pos())
+						violations = append(violations, fmt.Sprintf(
+							"%s:%d initializes XDPEntryProg from %q",
+							repoRelativePath(t, path),
+							pos.Line,
+							canaryExprString(kv.Value),
+						))
+					}
+				}
+			case *ast.CallExpr:
+				sel, ok := node.Fun.(*ast.SelectorExpr)
+				if !ok || sel.Sel.Name != "SwapXDPEntryProg" {
+					return true
+				}
+				if len(node.Args) != 1 || !isUserspaceXDPEntryProgExpr(node.Args[0]) {
+					var got string
+					if len(node.Args) == 1 {
+						got = canaryExprString(node.Args[0])
+					}
+					pos := fset.Position(node.Pos())
+					violations = append(violations, fmt.Sprintf(
+						"%s:%d calls SwapXDPEntryProg with %q",
+						repoRelativePath(t, path),
+						pos.Line,
+						got,
+					))
+				}
+			}
+			return true
+		})
+	}
+	if len(violations) > 0 {
+		sort.Strings(violations)
+		t.Fatalf("userspace manager production code must only select userspaceXDPEntryProg: %v", violations)
+	}
+}
+
+func TestUserspaceXDPEntryProgramConstantNamesRetainedShim(t *testing.T) {
+	t.Parallel()
+
+	var found []string
+	var violations []string
+	for _, path := range productionGoFilesUnder(t, []string{
+		filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace"),
+	}) {
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			valueSpec, ok := n.(*ast.ValueSpec)
+			if !ok {
+				return true
+			}
+			for i, name := range valueSpec.Names {
+				if name.Name != "userspaceXDPEntryProg" {
+					continue
+				}
+				pos := fset.Position(name.Pos())
+				location := fmt.Sprintf("%s:%d", repoRelativePath(t, path), pos.Line)
+				found = append(found, location)
+				if len(valueSpec.Values) != len(valueSpec.Names) {
+					violations = append(violations, location+" uses implicit or tuple value")
+					continue
+				}
+				lit, ok := valueSpec.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING || lit.Value != strconv.Quote(userspaceXDPEntryProgForCanary) {
+					violations = append(violations, fmt.Sprintf(
+						"%s sets userspaceXDPEntryProg to %q, want %q",
+						location,
+						canaryExprString(valueSpec.Values[i]),
+						userspaceXDPEntryProgForCanary,
+					))
+				}
+			}
+			return true
+		})
+	}
+	if len(found) != 1 || len(violations) > 0 {
+		sort.Strings(found)
+		sort.Strings(violations)
+		t.Fatalf("userspaceXDPEntryProg constant drift\nfound: %v\nviolations: %v", found, violations)
+	}
+}
+
 func TestDaemonRuntimeEntryPointUsesRuntimeDataPlane(t *testing.T) {
 	t.Parallel()
 
@@ -447,6 +705,84 @@ func TestRetirementBoundaryDocsMentionLegacyImportAllowlist(t *testing.T) {
 	if len(missing) > 0 {
 		t.Fatalf("retirement docs do not mention allowlisted legacy imports: %v", missing)
 	}
+}
+
+func rustSourceFilesUnder(t *testing.T, root string) []string {
+	t.Helper()
+
+	var files []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(path, ".rs") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk Rust source under %s: %v", root, err)
+	}
+	sort.Strings(files)
+	return files
+}
+
+func compareStringSetToAllowed(found map[string]string, allowed map[string]bool) ([]string, []string) {
+	var unexpected []string
+	for name, location := range found {
+		if !allowed[name] {
+			unexpected = append(unexpected, location)
+		}
+	}
+	var missing []string
+	for name := range allowed {
+		if _, ok := found[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	return unexpected, missing
+}
+
+func keysOfMapTypeAllowlist(values map[string]ebpf.MapType) map[string]bool {
+	keys := make(map[string]bool, len(values))
+	for name := range values {
+		keys[name] = true
+	}
+	return keys
+}
+
+func keysOfProgramTypeAllowlist(values map[string]ebpf.ProgramType) map[string]bool {
+	keys := make(map[string]bool, len(values))
+	for name := range values {
+		keys[name] = true
+	}
+	return keys
+}
+
+func lineForOffset(text string, offset int) int {
+	if offset > len(text) {
+		offset = len(text)
+	}
+	return strings.Count(text[:offset], "\n") + 1
+}
+
+func isXDPEntryProgField(expr ast.Expr) bool {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e.Name == "XDPEntryProg"
+	case *ast.SelectorExpr:
+		return e.Sel.Name == "XDPEntryProg"
+	default:
+		return false
+	}
+}
+
+func isUserspaceXDPEntryProgExpr(expr ast.Expr) bool {
+	ident, ok := expr.(*ast.Ident)
+	return ok && ident.Name == "userspaceXDPEntryProg"
 }
 
 func operatorRuntimeBoundaryRoots(t *testing.T) []string {
@@ -673,6 +1009,8 @@ func canaryExprString(expr ast.Expr) string {
 		return canaryExprString(e.X) + "." + e.Sel.Name
 	case *ast.StarExpr:
 		return "*" + canaryExprString(e.X)
+	case *ast.BasicLit:
+		return e.Value
 	default:
 		return ""
 	}

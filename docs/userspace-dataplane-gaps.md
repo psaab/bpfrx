@@ -109,7 +109,7 @@ The current tracked removal work is:
 | Issue | Removal-phase role |
 |-------|--------------------|
 | #1451 | Migrate remaining API, gRPC, CLI, status, metrics, session, GC, cluster, daemon-control, and userspace shim callers away from the legacy eBPF-shaped `dataplane.DataPlane` surface before deleting source/generated artifacts. |
-| #1473 | Split the retained userspace XDP shim from legacy `xdp_main_prog` fallback so the shim can remain while legacy XDP/TC programs are removed. |
+| #1473 / #1493 | Runtime fallback and shim-only generation are split from legacy `xdp_main_prog`; the remaining blocker is the userspace load graph still going through the legacy manager until #1451/#1476 split shared map bootstrap from legacy object loading. |
 | #1476 | Remove legacy BPF source, generated artifacts, and build hooks after the migration blockers close, while preserving the retained AF_XDP userspace shim path. |
 | #1477 | Publish final userspace-only validation artifacts for the exact source-removal candidate, including cluster, screen/flood, CoS, HA, and fallback-proof evidence. |
 
@@ -121,8 +121,9 @@ Recommended dependency order:
 
 1. #1451 first, because it defines the runtime and operator interface boundary
    that every source-removal slice depends on.
-2. #1473 next, because the retained userspace XDP shim must be explicit before
-   legacy source is deleted.
+2. Finish the #1493 loader side after the runtime fallback/generation split:
+   userspace must be able to load the retained shim and required shared maps
+   without loading legacy XDP/TC programs.
 3. #1476 after #1451 and #1473 close, as the auditable source/generated-artifact
    removal PR.
 4. #1477 on the exact #1476 candidate, so the final validation artifacts match
