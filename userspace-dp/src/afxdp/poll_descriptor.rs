@@ -525,7 +525,9 @@ pub(super) fn poll_binding_process_descriptor(
                                         };
                                         binding.scratch.scratch_forwards.push(request);
                                     }
-                                    binding.scratch.scratch_recycle.push(desc.addr);
+                                    // Prebuilt handler in enqueue_pending_forwards recycles
+                                    // desc.addr via recycle_ingress_frame; do NOT add to
+                                    // scratch_recycle here (double-recycle UAF otherwise).
                                     continue;
                                 }
                                 desc.len = new_len as u32;

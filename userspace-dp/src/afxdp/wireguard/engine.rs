@@ -178,15 +178,32 @@ impl WireGuardEngine {
                 }
             }
             2 | 3 | 4 => {
-                if outer_payload.len() < 8 {
-                    return WireGuardDecapOutcome::None;
-                }
-                let receiver_idx = u32::from_be_bytes([
-                    outer_payload[4],
-                    outer_payload[5],
-                    outer_payload[6],
-                    outer_payload[7],
-                ]);
+                // WireGuard wire format uses little-endian u32 fields.
+                // For msg types 3 (cookie reply) and 4 (transport data),
+                // the receiver index is at bytes 4..8. For type 2
+                // (handshake response), bytes 4..8 are the SENDER index
+                // and the receiver index is at bytes 8..12.
+                let receiver_idx = if msg_type == 2 {
+                    if outer_payload.len() < 12 {
+                        return WireGuardDecapOutcome::None;
+                    }
+                    u32::from_le_bytes([
+                        outer_payload[8],
+                        outer_payload[9],
+                        outer_payload[10],
+                        outer_payload[11],
+                    ])
+                } else {
+                    if outer_payload.len() < 8 {
+                        return WireGuardDecapOutcome::None;
+                    }
+                    u32::from_le_bytes([
+                        outer_payload[4],
+                        outer_payload[5],
+                        outer_payload[6],
+                        outer_payload[7],
+                    ])
+                };
                 let phase2 = self.handle_other_message(meta, outer_payload, msg_type, receiver_idx, peer_ip, local_ip, endpoint_port, scratch);
                 match phase2 {
                     Some(p2) => complete_tunn_phase2(frame, p2, scratch),
@@ -577,6 +594,14 @@ impl WireGuardEngine {
             self.static_private = private_key;
         }
 
+        // When the private key changes, all existing Tunn objects must be
+        // recreated — each Tunn embeds the static_secret at construction
+        // time and does not update it on key rotation. Retaining stale
+        // Tunn objects means old sessions remain valid, which violates
+        // the WireGuard key-compromise property (old key material should
+        // be unusable after rotation).
+        let force_tunn_rebuild = key_changed && self.static_private.is_some();
+
         let mut new_peers: FxHashMap<[u8; 32], PeerState> = FxHashMap::default();
         let mut new_endpoint_to_peer: FxHashMap<(IpAddr, u16), [u8; 32]> = FxHashMap::default();
         let mut new_index_to_peer: FxHashMap<u32, [u8; 32]> = FxHashMap::default();
@@ -598,11 +623,26 @@ impl WireGuardEngine {
             let endpoint = packet::parse_endpoint(&peer_snap.endpoint);
 
             let peer_state = if let Some(existing) = self.peers.remove(&pub_key_bytes) {
-                PeerState {
-                    tunn: existing.tunn,
-                    endpoint: endpoint.or(existing.endpoint),
-                    local_ip: existing.local_ip,
-                    receiver_index: existing.receiver_index,
+                if force_tunn_rebuild {
+                    let Some(ref static_private) = self.static_private else {
+                        continue;
+                    };
+                    let static_secret = StaticSecret::from(**static_private);
+                    let public_key = PublicKey::from(pub_key_bytes);
+                    let Ok(tunn) = Tunn::new(static_secret, public_key, None, None, existing.receiver_index, None) else { continue; };
+                    PeerState {
+                        tunn,
+                        endpoint: endpoint.or(existing.endpoint),
+                        local_ip: existing.local_ip,
+                        receiver_index: existing.receiver_index,
+                    }
+                } else {
+                    PeerState {
+                        tunn: existing.tunn,
+                        endpoint: endpoint.or(existing.endpoint),
+                        local_ip: existing.local_ip,
+                        receiver_index: existing.receiver_index,
+                    }
                 }
             } else {
                 let Some(ref static_private) = self.static_private else {

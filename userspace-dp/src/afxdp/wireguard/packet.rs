@@ -66,8 +66,11 @@ pub(crate) fn build_outer_headers(
             }
             let payload_len_u16 = u16::try_from(8 + payload_len).ok()?;
             let ip_hdr = out.get_mut(ip_start..ip_start + 40)?;
-            ip_hdr[0] = 0x60 | ((inner_dscp >> 4) & 0x0f);
-            ip_hdr[1] = ((inner_dscp & 0x0f) << 4) | (ip_hdr[1] & 0x0f);
+            // IPv6 traffic class = DSCP (6 bits) << 2 | ECN (2 bits).
+            // inner_dscp is the raw 6-bit DSCP value from meta_dscp & 0x3f.
+            let tc = (inner_dscp << 2) | (ip_hdr[1] & 0x03);
+            ip_hdr[0] = 0x60 | ((tc >> 4) & 0x0f);
+            ip_hdr[1] = ((tc & 0x0f) << 4) | (ip_hdr[1] & 0x0f);
             ip_hdr[2..4].copy_from_slice(&[0, 0]);
             ip_hdr[4..6].copy_from_slice(&payload_len_u16.to_be_bytes());
             ip_hdr[6] = PROTO_UDP;

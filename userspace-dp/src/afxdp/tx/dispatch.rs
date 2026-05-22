@@ -834,7 +834,11 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                             endpoint.wg_listen_port,
                                         ) {
                                             frame = wg_frame;
+                                        } else {
+                                            continue;
                                         }
+                                    } else {
+                                        continue;
                                     }
                                 }
                                 if cfg!(feature = "debug-log") {
