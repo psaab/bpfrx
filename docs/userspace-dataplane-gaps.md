@@ -5,7 +5,7 @@ AF_XDP userspace dataplane. It is not a full bug tracker and it is not a
 historical branch plan. For active debugging entry points, use
 [`userspace-debug-map.md`](userspace-debug-map.md).
 
-Last updated: 2026-05-21
+Last updated: 2026-05-22
 
 ## Deprecation Context
 
@@ -37,14 +37,14 @@ These capabilities exist in the current Rust userspace dataplane code path:
 | Policy schedulers | Implemented; live HA evidence captured | Scheduled-policy `scheduler_name` and `inactive` bits are published in userspace snapshots, old helper protocol mismatches disarm forwarding, missing policy-scheduler references are commit errors, and Rust hit counters survive active/inactive snapshot rebuilds by stable rule ID. The 2026-05-19 #1378 live artifact set is accepted by `test/incus/policy_scheduler_validate.py` for `lan->wan/scheduled-allow`. |
 | Application matching | Implemented | Protocol + port terms, including expanded multi-term apps |
 | Source NAT (interface mode) | Implemented | IPv4 and IPv6 egress interface rewrite |
-| Source NAT (pool mode) | Implemented with scoped caveats | IPv4/IPv6 pool address and port allocation. Global `source address-persistent` uses the documented userspace-v1 SHA-256 source-IP hash and is stable only within the AF_XDP backend, pool family, pool order, and pool size. Legacy eBPF and current DPDK use C-word IPv4 modulo / IPv6 lane-XOR selection, so new-flow pool address parity is not promised across backend transitions. Pool-mode rules with missing pools, empty pools, invalid port ranges, malformed addresses, no address for the packet family, or exhausted live translated tuples fail closed at the `poll_descriptor.rs` source-NAT call sites before session creation or forwarding, with recent-exception reasons such as `source_nat_pool_missing`, `source_nat_pool_empty`, `source_nat_pool_invalid_port_range`, and `source_nat_pool_exhausted`. Per-pool `persistent-nat` now has snapshot fields and runtime lease reuse keyed by source tuple `(protocol, source IP, source port)` to translated tuple. The lease table is bounded in helper memory, survives compatible in-process snapshot refreshes, and expires after the configured inactivity timeout once no live flow uses the lease. It does not consult Go `PersistentNATTable` and does not survive helper restart. #1449 closes HA behavior as an explicit userspace capability gate: HA configs that reference persistent source-NAT pools are not admitted because leases are not synchronized, and status reports `userspace persistent-nat source pool leases are not HA-synchronized`. Userspace status, CLI summary, and Prometheus expose live-flow, used-port, persistent-lease, allocation, reuse, and exhaustion counters for admitted non-HA pools. |
+| Source NAT (pool mode) | Implemented with scoped caveats | IPv4/IPv6 pool address and port allocation. Global `source address-persistent` uses the documented userspace-v1 SHA-256 source-IP hash and is stable only within the AF_XDP backend, pool family, pool order, and pool size. Legacy eBPF and current DPDK use C-word IPv4 modulo / IPv6 lane-XOR selection, so new-flow pool address parity is not promised across retained backend transitions. Pool-mode rules with missing pools, empty pools, invalid port ranges, malformed addresses, no address for the packet family, or exhausted live translated tuples fail closed at the `poll_descriptor.rs` source-NAT call sites before session creation or forwarding, with recent-exception reasons such as `source_nat_pool_missing`, `source_nat_pool_empty`, `source_nat_pool_invalid_port_range`, and `source_nat_pool_exhausted`. Per-pool `persistent-nat` now has snapshot fields and runtime lease reuse keyed by source tuple `(protocol, source IP, source port)` to translated tuple. The lease table is bounded in helper memory, survives compatible in-process snapshot refreshes, and expires after the configured inactivity timeout once no live flow uses the lease. It does not consult Go `PersistentNATTable` and does not survive helper restart. The closed #1449 contract gates HA behavior explicitly: HA configs that reference persistent source-NAT pools are not admitted because leases are not synchronized, and status reports `userspace persistent-nat source pool leases are not HA-synchronized`. Userspace status, CLI summary, and Prometheus expose live-flow, used-port, persistent-lease, allocation, reuse, and exhaustion counters for admitted non-HA pools. |
 | Destination NAT | Implemented | Pre-expanded tuple snapshots from Go |
 | Static NAT | Implemented | Bidirectional 1:1 translation |
 | NAT64 | Implemented | Forward and reverse translation with reverse-session state |
 | NPTv6 | Implemented | Stateless prefix translation |
 | Firewall filters | Implemented | Filter snapshots and evaluation in Rust |
 | Flow export | Implemented | Userspace flow export snapshot and runtime |
-| Three-color policers | Implemented with caveats | srTCM/trTCM runtime, forwarding-path and flow-cache-hit metering, red drops for `then discard`, status/CLI/Prometheus counters, and compatible in-process snapshot continuity. Unsupported color-aware, non-`discard`, and malformed snapshots now fail closed in Rust if they bypass Go admission. Sharded state, HA/restart continuity decision, full non-drop action propagation, and integration evidence remain #1375 follow-up work. |
+| Three-color policers | Implemented with caveats | srTCM/trTCM runtime, forwarding-path and flow-cache-hit metering, red drops for `then discard`, status/CLI/Prometheus counters, and compatible in-process snapshot continuity. Unsupported color-aware, non-`discard`, and malformed snapshots now fail closed in Rust if they bypass Go admission. Sharded state, HA/restart continuity decision, full non-drop action propagation, and integration evidence remain production hardening work, not active feature-gap blockers. |
 | TCP MSS clamping | Implemented | Flow snapshot fields are delivered and used in Rust |
 | Embedded ICMP NAT reversal | Implemented | Includes reverse-session repair paths |
 | Configurable session timeouts | Implemented | Snapshot-driven timeouts in `session.rs` |
@@ -60,22 +60,22 @@ features that still need operator evidence before BPF source removal. The
 explicit gates live in
 [`pkg/dataplane/userspace/manager.go`](../pkg/dataplane/userspace/manager.go).
 
-| Feature/config shape | Userspace status | Retirement blocker |
+| Feature/config shape | Userspace status | Tracker / disposition |
 |----------------------|-------------|--------------------|
 | Unsupported policy shapes | Gated | Address/application expansion must succeed for userspace |
-| Screen behavior requiring SYN cookies | Supported; live HA/flood evidence pending before BPF source removal | #1374 |
-| HA with per-pool source NAT `persistent-nat` | Gated | #1449 closed as an explicit userspace capability gate because helper-memory persistent-NAT leases are not HA-synchronized |
-| Port mirroring | Supported; evidence pending | #1376 still needs mirror-fidelity and pressure evidence before BPF source removal |
+| Screen behavior requiring SYN cookies | Supported; final source-removal evidence, if required, belongs with #1477 | Closed feature-gap; #1477 final validation |
+| HA with per-pool source NAT `persistent-nat` | Gated | Closed/documented contract: helper-memory persistent-NAT leases are not HA-synchronized, so HA configs that reference persistent source-NAT pools are not admitted |
+| Port mirroring | Supported; final source-removal evidence, if required, belongs with #1477 | Closed feature-gap; #1477 final validation |
 
 Port mirroring now has snapshot/wire plumbing plus a bounded runtime slice
 that samples and queues discardable full-L2 mirror clones with drop counters.
 Runtime coverage includes the pending-forward path, self-target flow-cache
 mirror surface, deferred neighbor-resolution retry path, CoS-bound reserve
 handling, and mirror-specific counter attribution. The
-`deriveUserspaceCapabilities()` gate has been removed; #1376 remains open for
-integration evidence that tcpdump on the mirror output sees full-frame clones
-at the expected sample rate and that primary forwarding survives mirror
-pressure.
+`deriveUserspaceCapabilities()` gate has been removed; #1376 is closed for the
+feature-gap audit. If source removal needs final mirror-fidelity and
+pressure-survival artifacts, they belong with the #1477 validation set for the
+exact removal candidate.
 
 ## Features That Still Use A Mixed Boundary
 
@@ -83,52 +83,50 @@ These are not "missing", but they are not pure userspace forwarding either:
 
 | Area | Current boundary |
 |------|------------------|
-| SYN cookie flood protection | Userspace now publishes a snapshot key when cluster-synced root encrypted-password material exists, mints/validates cookies against the Unix wall-clock epoch, sends bounded SYN-ACK and validated-ACK RST replies through the AF_XDP TX path, and reports challenge/no-secret/SYN-ACK/ACK-RST/budget/valid/invalid/bypass counters. Active SYN-cookie screen profiles require that secret material at userspace capability admission; missing secret material also fails closed at runtime. Remaining #1374 work is live HA/flood evidence before BPF source removal. |
+| SYN cookie flood protection | Userspace now publishes a snapshot key when cluster-synced root encrypted-password material exists, mints/validates cookies against the Unix wall-clock epoch, sends bounded SYN-ACK and validated-ACK RST replies through the AF_XDP TX path, and reports challenge/no-secret/SYN-ACK/ACK-RST/budget/valid/invalid/bypass counters. Active SYN-cookie screen profiles require that secret material at userspace capability admission; missing secret material also fails closed at runtime. #1374 is closed for the feature-gap audit; any final live HA/flood proof belongs with #1477. |
 | Kernel-owned traffic (ARP, local delivery, management, some non-IP) | cpumap or kernel pass-through from XDP |
 | GRE / ESP / explicit early filters | Live kernel-owned/tunnel-control cases use cpumap or pass-through; degraded helper/XSK states pass only proven local/control traffic and drop non-local transit |
 | IPsec / XFRM handling | Userspace detects and punts to kernel/slow-path as needed |
-| DataPlane control-plane contract | Userspace manager no longer embeds the legacy `dataplane.DataPlane`; a userspace `LegacyDataPlaneAdapter` owns old-interface compatibility while callers migrate. Operator metadata reads in API/gRPC/CLI/daemon now use `LastApplyResult()` instead of `LastCompileResult()`, with a canary preventing those surfaces from regressing to compile-result metadata. GC and HA session sync now use `SessionStore`/`Telemetry`. The manager still holds a named eBPF shim manager for XDP/map bootstrap state, and API/gRPC/CLI session/counter readers plus daemon control paths still need to move fully to domain interfaces; tracked by #1381 |
+| DataPlane control-plane contract | Userspace manager no longer embeds the legacy `dataplane.DataPlane`; a userspace `LegacyDataPlaneAdapter` owns old-interface compatibility while callers migrate. Operator metadata reads in API/gRPC/CLI/daemon now use `LastApplyResult()` instead of `LastCompileResult()`, with a canary preventing those surfaces from regressing to compile-result metadata. GC and HA session sync now use `SessionStore`/`Telemetry`. The manager still holds a named eBPF shim manager for XDP/map bootstrap state, and API/gRPC/CLI session/counter readers plus daemon control paths still need to move fully to domain interfaces; tracked by the #1451 removal-phase migration |
 | DPDK backend | Separately supported backend outside userspace source-removal scope. Its current root `DataPlane` dependency is pinned as a backend-local #1475 exception until DPDK migrates to runtime/domain interfaces or gets a separate retirement decision. |
-| Dataplane event logging | Session open/close/update are emitted by userspace. Policy-deny, screen-drop, logged routing-instance filter hits, non-PBR input filter logs, output filter logs, cached output-filter hits, and lo0 filter logs now enqueue RT_FLOW frames through the non-blocking Rust event-stream producer with existing per-event rate-limit/loss accounting. Go decode/status handling feeds raw userspace RT_FLOW frames through the same `EventReader.ProcessRawEvent` syslog/local-log path as eBPF, with a deterministic UDP syslog fanout harness for policy deny, screen drop, and filter log. Policy-deny events now carry the snapshot's compiled numeric policy ID; filter-log events carry filter/term/action identity from the matched compiled term. Remaining #1379 evidence is live userspace-cluster syslog capture, including deny-storm starvation checks, if Phase 4 requires operator artifacts beyond the deterministic local harness. |
+| Dataplane event logging | Session open/close/update are emitted by userspace. Policy-deny, screen-drop, logged routing-instance filter hits, non-PBR input filter logs, output filter logs, cached output-filter hits, and lo0 filter logs now enqueue RT_FLOW frames through the non-blocking Rust event-stream producer with existing per-event rate-limit/loss accounting. Go decode/status handling feeds raw userspace RT_FLOW frames through the same `EventReader.ProcessRawEvent` syslog/local-log path as eBPF, with a deterministic UDP syslog fanout harness for policy deny, screen drop, and filter log. Policy-deny events now carry the snapshot's compiled numeric policy ID; filter-log events carry filter/term/action identity from the matched compiled term. #1379 is closed for the feature-gap audit; any final live cluster syslog proof belongs with #1477 if the source-removal candidate requires it. |
 | `show system buffers` | Userspace helper-status rendering covers AF_XDP UMEM/TX capacity, CoS queued-byte capacity, helper-published session-table and flow-cache capacity, active-session footer, neighbor counts, and worker queue pressure counters. The Phase 5 denominator decision is explicit: session-table and flow-cache values become fill percentages only from Rust-owned helper fields; neighbor-cache entries remain counters until Rust owns a bounded neighbor-cache capacity. Formatter tests pin that dynamic counts cannot move into the utilization table without real denominators. |
 
-## Retirement Blockers From The 2026-05-16 Audit
+## Current Retirement Work After Feature-Gap Closeout
 
-The current #1373 audit produced these tracked blockers:
+The original #1374-#1381 feature-gap audit is closed. The remaining #1373 work
+is no longer "implement missing userspace feature parity"; it is the removal
+phase that migrates or deletes the legacy eBPF runtime surfaces safely.
 
-| Issue | Blocker | Required before |
-|-------|---------|-----------------|
-| #1381 | Split or replace the BPF-shaped `dataplane.DataPlane` interface so userspace no longer embeds the eBPF manager for map-writer methods. Current progress: userspace no longer embeds the legacy interface, neutral `RuntimeDataPlane` domains exist, operator metadata reads use `ApplyResult`, and GC plus HA session sync use `SessionStore`/`Telemetry` for session/counter work; remaining work is API/gRPC/CLI session/counter readers, daemon control paths, userspace-specific diagnostics/control adapters, and the final userspace shim removal. | Phase 3 build-system / Go removal |
-| #1377 | Preserve userspace-v1 address-persistent SNAT pool selection with an explicit backend compatibility boundary, and own non-HA userspace source-NAT pool allocation at runtime. The current runtime fails closed for source-NAT pool rules with missing pools, empty pools, invalid pool inputs, wrong-family-only pools, or live allocator exhaustion at the `poll_descriptor.rs` source-NAT call sites. It provides bounded helper-local persistent-NAT lease reuse and live allocator counters, but does not provide helper-restart persistence or cross-backend new-flow parity. HA-synchronized persistent leases are intentionally not implemented; #1449 closes that behavior as the capability gate above. | Phase 4 BPF source removal |
-| #1378 | Closed for the policy-scheduler retirement contract after #1396 userspace propagation: hit-counter survival across scheduler snapshot rebuilds and strict missing-scheduler commit behavior landed in the 2026-05-17 closeout slice, the 2026-05-18 closeout slice added the deterministic evidence checker and non-eBPF apply-path pin, and the 2026-05-19 live HA artifact set passed `test/incus/policy_scheduler_validate.py`. | Phase 4 BPF source removal |
-| #1379 | Complete dataplane event closeout: policy-deny, screen-drop, logged PBR filter hits, non-PBR input/output/lo0 filter logs, cached output-filter logs, policy numeric IDs, and filter/term identities now emit from userspace through the RT_FLOW stream. Deterministic Go syslog fanout coverage exists for policy deny, screen drop, and filter log. Remaining blocker is live userspace-cluster syslog evidence, including deny-storm starvation checks, if #1373 Phase 4 requires external artifacts. | Phase 4 BPF source removal |
-| #1374 | Implement userspace SYN-cookie flood protection or an approved equivalent. #1393, the 2026-05-17 runtime slice, the 2026-05-18 closeout slice, and the 2026-05-19 TX closeout cover deterministic cookie codec/layout, snapshot propagation, root-auth-derived key publication with fail-closed missing-secret behavior, capability admission for active SYN-cookie screen profiles, fail-closed screen challenge selection, bounded SYN-ACK TX, validated-ACK RST emission, session-miss ACK validation, bounded validated-client cache behavior, TTL-bound single-use validated-client expiration, current/previous/next Unix wall-clock cookie-epoch ACK validation with standby prefilter/rate-limiting, explicit validated-client bypass verdicts, userspace helper status counters, and legacy global sync for sent/valid/invalid/bypass counters. Remaining: live HA/flood validation evidence before BPF source removal. | Phase 4 BPF source removal |
-| #1375 | Finish userspace RFC 2697/2698 three-color policer hardening. The current runtime admits the color-blind `then discard` slice, fails closed for unsupported snapshot shapes that bypass Go admission, and preserves token/counter state across compatible in-process snapshot refreshes. Remaining work: sharded/packed state decision, HA/restart continuity decision, full non-drop color action propagation, and integration/failover/performance evidence | Phase 4 BPF source removal |
-| #1376 | Finish userspace port mirroring evidence. Snapshot/wire plumbing, bounded runtime delivery, pending-forward, self-target flow-cache, deferred-neighbor retry, CoS reserve handling, counter attribution, and capability admission now exist. Remaining work is mirror-fidelity evidence and forwarding survival under mirror pressure. | Phase 4 BPF source removal |
-| #1380 | Userspace `show system buffers` renders bounded helper status, including Rust-owned session-table and flow-cache denominators. Neighbor entries remain counters until Rust owns a bounded neighbor-cache capacity. | Phase 5 CLI / observability cleanup |
+#1377 is also closed for source-NAT pool retirement. Its SNAT follow-ups
+#1448, #1449, and #1450 are closed as documented contracts: helper restart
+resets helper-local persistent-NAT leases, HA configurations with persistent
+source-NAT pools are gated because leases are not synchronized, and new-flow
+pool-address parity is not promised across retained backend changes.
+
+The current tracked removal work is:
+
+| Issue | Removal-phase role |
+|-------|--------------------|
+| #1451 | Migrate remaining API, gRPC, CLI, status, metrics, session, GC, cluster, daemon-control, and userspace shim callers away from the legacy eBPF-shaped `dataplane.DataPlane` surface before deleting source/generated artifacts. |
+| #1473 | Split the retained userspace XDP shim from legacy `xdp_main_prog` fallback so the shim can remain while legacy XDP/TC programs are removed. |
+| #1476 | Remove legacy BPF source, generated artifacts, and build hooks after the migration blockers close, while preserving the retained AF_XDP userspace shim path. |
+| #1477 | Publish final userspace-only validation artifacts for the exact source-removal candidate, including cluster, screen/flood, CoS, HA, and fallback-proof evidence. |
+
+#1474 is closed: omitted `system dataplane-type` selects userspace, and
+explicit `system dataplane-type ebpf` emits an operator-visible compile warning
+while legacy source removal is staged.
 
 Recommended dependency order:
 
-1. #1381 first, because it defines the control-plane interface boundary that
-   every later removal phase depends on.
-2. #1377 and #1379 next, because they are silent correctness or
-   security-visibility regressions in configurations that may otherwise appear
-   admitted. #1377 now has fail-closed pool runtime handling for unusable
-   pool snapshots, the userspace-v1 selector and mixed-backend transition
-   boundary are explicit, and the non-HA helper-local persistent-NAT allocator
-   slice is implemented with live counters. Remaining #1377 caveats are
-   helper-restart persistence and any future decision to standardize new-flow
-   selector parity across retained backends. #1449 closes HA persistent-lease
-   behavior as an explicit userspace capability gate, not as lease replay.
-   #1378 is closed after the accepted 2026-05-19 live HA artifact set.
-3. #1374 and #1376 evidence before Phase 4, because SYN-cookie and mirroring
-   are now admitted userspace runtime features that still need live operator
-   artifacts before BPF source removal. Keep #1375 on the Phase 4 list for
-   validation and hardening evidence, not as a capability gate. No additional
-   #1378 scheduler runtime or evidence work is known from the current audit.
-4. #1380 is closed for the current helper schema. Future true utilization rows
-   for neighbor-cache state need a helper-published bounded capacity and should
-   be tracked as a separate issue.
+1. #1451 first, because it defines the runtime and operator interface boundary
+   that every source-removal slice depends on.
+2. #1473 next, because the retained userspace XDP shim must be explicit before
+   legacy source is deleted.
+3. #1476 after #1451 and #1473 close, as the auditable source/generated-artifact
+   removal PR.
+4. #1477 on the exact #1476 candidate, so the final validation artifacts match
+   the code that removes the legacy eBPF path.
 
 ## What This Document Does Not Mean
 
@@ -171,14 +169,14 @@ There are two distinct fallback boundaries:
 
 The highest-value remaining work on current `master` is:
 
-1. finish the #1377 disposition around helper-restart persistence, HA lease
-   synchronization, and cross-backend selector parity. The current userspace
-   contract is fail-closed for unusable pools and uses the active AF_XDP
-   selector, not full persistent-NAT parity.
-2. collect any Phase 4 operator evidence still required for admitted userspace
-   features before BPF source removal. The #1378 scheduler runtime is closed by
-   the accepted userspace HA artifact set.
-3. keep #1380 closed for the current command contract. Open a narrower
-   follow-up only if operators need a helper-published bounded capacity for
-   neighbor-cache utilization percentages.
+1. complete #1451's runtime-surface migration so source removal no longer
+   depends on legacy `dataplane.DataPlane` callers.
+2. complete #1473's userspace XDP shim split.
+3. land #1476 only after those blockers close, then attach the #1477
+   userspace-only validation artifact set to the exact source-removal
+   candidate.
 4. continue correctness and performance hardening on the active AF_XDP fast path
+
+Keep #1377, #1448, #1449, and #1450 closed. SNAT helper-restart reset
+behavior, HA persistent-lease gating, and cross-backend selector divergence
+remain documented userspace contract limits, not active #1373/#1451 blockers.
