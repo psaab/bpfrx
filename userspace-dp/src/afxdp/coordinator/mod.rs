@@ -831,7 +831,8 @@ impl Coordinator {
             if self.workers.handles.len() != 1 {
                 eprintln!(
                     "xpf-coordinator: WireGuard requires exactly 1 worker thread \
-                     (found {}); skipping WireGuard snapshot dispatch",
+                     (found {}); WireGuard tunnels will not function until the \
+                     interface config is reduced to a single RX queue",
                     self.workers.handles.len()
                 );
             } else if let Some(handle) = self.workers.handles.values().next() {
