@@ -77,6 +77,28 @@ builds remain blocked on migrating away from root `DataPlane`; userspace-only
 production source removal must not depend on solving that DPDK migration in the
 same PR.
 
+## #1473 Userspace XDP Shim Build Split
+
+The retained Rust userspace XDP shim is still required for the AF_XDP userspace
+runtime, but its generation path is now explicit and separate from the legacy
+XDP/TC dataplane bpf2go batch:
+
+- `make generate-userspace-xdp` rebuilds only
+  `pkg/dataplane/userspace_xdp_bpfel.o` through the
+  `pkg/dataplane/build-userspace-xdp.sh` go:generate directive.
+- `make build-userspace-xdp` is an alias for the shim-only generation target.
+- `make generate` remains the full compatibility target: legacy XDP/TC bpf2go
+  artifacts plus the retained userspace shim.
+- `make generate-legacy-bpf` regenerates legacy XDP/TC bpf2go artifacts while
+  skipping the retained shim.
+
+The userspace shim target must not depend on legacy `xdp_main` or TC program
+generation. `pkg/dataplane/retirement_boundary_canary_test.go` reads the
+Makefile and fails if `generate-userspace-xdp` gains legacy bpf2go tokens,
+recursive Make dependencies, or the broad `./pkg/dataplane/...` generate path.
+This keeps the retained shim visible without implying that deleting legacy
+dataplane program generation is blocked by the shim itself.
+
 ### Allowlisted Legacy Bridges
 
 These files are the current production direct-import allowlist for root
@@ -143,12 +165,16 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
   only direct DPDK backend import outside the package being the blank
   registration import in `cmd/xpfd/main.go`. Non-`-tags dpdk` binaries fail
   DPDK startup explicitly rather than running a no-op stub.
-- BPF source and build artifacts are not safe to delete in #1451 canary work:
-  `bpf/`, `pkg/dataplane/loader_ebpf.go`,
-  `pkg/dataplane/*_bpfel.go`, `pkg/dataplane/*_bpfel.o`,
-  `pkg/dataplane/userspace_xdp_bpfel.o`,
-  `pkg/dataplane/build-userspace-xdp.sh`, and the `Makefile generate` path
-  remain tied to the eBPF backend and userspace XDP shim.
+- Legacy BPF source and generated artifacts are not safe to delete in #1451
+  canary work: `bpf/`, `pkg/dataplane/loader_ebpf.go`,
+  `pkg/dataplane/*_bpfel.go`, `pkg/dataplane/*_bpfel.o`, and the legacy side
+  of the `Makefile generate` path remain tied to the eBPF backend until the
+  loader/map-bootstrap split is finished.
+- Retained userspace XDP shim artifacts are tracked separately:
+  `pkg/dataplane/userspace_xdp_bpfel.o` and
+  `pkg/dataplane/build-userspace-xdp.sh` remain required for userspace runtime
+  startup, but `make generate-userspace-xdp` rebuilds them without legacy
+  `xdp_main` or TC dataplane program generation.
 
 ## Phase 1/2 Smoke Gates
 

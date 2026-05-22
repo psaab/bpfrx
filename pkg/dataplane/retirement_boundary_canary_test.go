@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -16,6 +17,7 @@ const (
 	rootDataplaneImportForCanary    = "github.com/psaab/xpf/pkg/dataplane"
 	ciliumEBPFImportForCanary       = "github.com/cilium/ebpf"
 	dpdkBackendImportForCanary      = "github.com/psaab/xpf/pkg/dataplane/dpdk"
+	makefileForCanary               = "../../Makefile"
 	retirementBoundaryDocsForCanary = "../../docs/pr/1373-retire-ebpf-dataplane/README.md"
 )
 
@@ -194,6 +196,62 @@ func TestDPDKEBPFArtifactImportsStayAtLegacyAdapter(t *testing.T) {
 	}
 }
 
+func TestUserspaceXDPGenerateTargetStaysDecoupledFromLegacyBPF(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(makefileForCanary)
+	if err != nil {
+		t.Fatalf("read Makefile: %v", err)
+	}
+	prereqs, recipe := makeTargetDefinition(t, string(data), "generate-userspace-xdp")
+	if strings.TrimSpace(prereqs) != "" {
+		t.Fatalf("generate-userspace-xdp must not depend on other Make targets, got prerequisites %q", prereqs)
+	}
+	if len(recipe) == 0 {
+		t.Fatal("generate-userspace-xdp has no recipe")
+	}
+	body := strings.Join(recipe, "\n")
+	for _, token := range []string{"generate", "-run", "build-userspace-xdp"} {
+		if !strings.Contains(body, token) {
+			t.Fatalf("generate-userspace-xdp recipe %q missing required token %q", body, token)
+		}
+	}
+	for _, token := range []string{
+		"bpf2go",
+		"xdp_main",
+		"tc_main",
+		"bpf/xdp",
+		"bpf/tc",
+		"./pkg/dataplane/...",
+		"generate-legacy-bpf",
+		"$(MAKE)",
+	} {
+		if strings.Contains(body, token) {
+			t.Fatalf("generate-userspace-xdp must not invoke legacy dataplane generation; recipe %q contains %q", body, token)
+		}
+	}
+}
+
+func TestUserspaceXDPGoGenerateRunSelectsOnlyShim(t *testing.T) {
+	t.Parallel()
+
+	cmd := exec.Command("go", "generate", "-n", "-run", "^//go:generate bash build-userspace-xdp\\.sh$", "./pkg/dataplane")
+	cmd.Dir = repoRootForBoundaryCanary
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go generate dry-run failed: %v\n%s", err, out)
+	}
+	var lines []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			lines = append(lines, trimmed)
+		}
+	}
+	if len(lines) != 1 || lines[0] != "bash build-userspace-xdp.sh" {
+		t.Fatalf("go generate shim dry-run selected %v, want only build-userspace-xdp.sh", lines)
+	}
+}
+
 func TestDaemonRuntimeEntryPointUsesRuntimeDataPlane(t *testing.T) {
 	t.Parallel()
 
@@ -286,6 +344,66 @@ func operatorRuntimeBoundaryRoots(t *testing.T) []string {
 	}
 	sort.Strings(roots)
 	return roots
+}
+
+func makeTargetDefinition(t *testing.T, makefile, target string) (string, []string) {
+	t.Helper()
+
+	lines := strings.Split(makefile, "\n")
+	for i, line := range lines {
+		targets, prereqs, ok := parseMakeTargetLine(line)
+		if !ok {
+			continue
+		}
+		found := false
+		for _, name := range targets {
+			if name == target {
+				found = true
+				break
+			}
+		}
+		if !found {
+			continue
+		}
+
+		var recipe []string
+		for _, next := range lines[i+1:] {
+			trimmed := strings.TrimSpace(next)
+			switch {
+			case strings.HasPrefix(next, "\t"):
+				recipe = append(recipe, strings.TrimSpace(next))
+			case trimmed == "" || strings.HasPrefix(trimmed, "#"):
+				if len(recipe) == 0 {
+					continue
+				}
+				return prereqs, recipe
+			default:
+				return prereqs, recipe
+			}
+		}
+		return prereqs, recipe
+	}
+	t.Fatalf("Makefile target %q not found", target)
+	return "", nil
+}
+
+func parseMakeTargetLine(line string) ([]string, string, bool) {
+	if strings.HasPrefix(line, "\t") {
+		return nil, "", false
+	}
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+		return nil, "", false
+	}
+	idx := strings.Index(trimmed, ":")
+	if idx < 0 {
+		return nil, "", false
+	}
+	targets := strings.Fields(strings.TrimSpace(trimmed[:idx]))
+	if len(targets) == 0 || targets[0] == ".PHONY" {
+		return nil, "", false
+	}
+	return targets, strings.TrimSpace(trimmed[idx+1:]), true
 }
 
 func productionGoFilesUnder(t *testing.T, roots []string) []string {
