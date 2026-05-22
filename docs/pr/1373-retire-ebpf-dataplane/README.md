@@ -1,31 +1,43 @@
 # #1373 Retire eBPF Dataplane Blocker Plans
 
-Status: design-plan bundle for #1373 blockers. These docs convert the
-reviewed issue contracts into implementation plans for the code PRs that must
-land before their listed #1373 retirement phase.
+Status: closeout and removal-plan bundle for #1373. The original #1374-#1381
+feature-gap plans are kept here as design history and documented runtime
+contracts, but those feature-gap blockers are closed. Current removal work is
+tracked by #1451 and the removal-phase child issues below.
 
-## Blocker Index
+## Feature Gap Closeout Index
 
-| Issue | Plan | Required before | Code PR still needed |
+| Issue | Plan | Retirement state | Notes |
 |---|---|---|---|
-| #1374 SYN cookie flood protection | [plan-1374-syn-cookies.md](plan-1374-syn-cookies.md) | #1373 Phase 4 | Runtime challenge/ACK/cache/counters, root-auth-derived snapshot key, bounded SYN-ACK/RST TX, status counters, and gate removal landed; live HA/flood evidence still needed before BPF source removal |
-| #1375 three-color policers | [plan-1375-three-color-policers.md](plan-1375-three-color-policers.md) | #1373 Phase 4 | Color-blind `then discard` runtime plus compatible snapshot continuity landed; sharded/packed state decision, HA/restart continuity decision, non-drop color actions, and integration/perf evidence still needed |
-| #1376 port mirroring | [plan-1376-port-mirroring.md](plan-1376-port-mirroring.md) | #1373 Phase 4 | Snapshot/wire plus bounded runtime admission landed; mirror-fidelity and pressure-survival evidence still needed |
-| #1377 persistent SNAT pool address selection | [plan-1377-snat-pools.md](plan-1377-snat-pools.md) | #1373 Phase 4 | Userspace-v1 selector, unusable-pool fail-closed runtime, helper-local persistent-NAT lease reuse, per-pool allocator sharing, and allocator counters landed; #1449 closes HA lease behavior as an explicit userspace capability gate; helper-restart persistence, integration evidence, and cross-backend new-flow parity remain outside the current contract |
-| #1378 policy schedulers | [plan-1378-policy-schedulers.md](plan-1378-policy-schedulers.md) | #1373 Phase 4 | Closed by live HA artifact capture accepted by `policy_scheduler_validate.py`; no known #1378 runtime or evidence gap remains |
-| #1379 dataplane events | [plan-1379-dataplane-events.md](plan-1379-dataplane-events.md) | #1373 Phase 4 | Policy-deny, screen-drop, PBR filter logs, non-PBR input/output/lo0 filter logs, cached input-log replay without filter rescans, source-disambiguated FILTER_LOG syslog, and deterministic fanout coverage landed; live cluster evidence remains if Phase 4 requires operator artifacts |
-| #1380 userspace buffer/status parity | [plan-1380-userspace-buffers.md](plan-1380-userspace-buffers.md) | #1373 Phase 5 | Helper-status rendering is active; Rust-owned session-table and flow-cache denominators are helper-published, while neighbor entries remain counters until Rust owns a bounded neighbor-cache capacity |
+| #1374 SYN cookie flood protection | [plan-1374-syn-cookies.md](plan-1374-syn-cookies.md) | Closed | Runtime challenge/ACK/cache/counters, root-auth-derived snapshot key, bounded SYN-ACK/RST TX, status counters, and gate removal landed; final source-removal evidence rolls into #1477 if required. |
+| #1375 three-color policers | [plan-1375-three-color-policers.md](plan-1375-three-color-policers.md) | Closed | Color-blind `then discard` runtime plus compatible snapshot continuity landed; future hardening is production follow-up work, not an active feature-gap blocker. |
+| #1376 port mirroring | [plan-1376-port-mirroring.md](plan-1376-port-mirroring.md) | Closed | Snapshot/wire plus bounded runtime admission landed; final mirror-fidelity evidence rolls into #1477 if required. |
+| #1377 persistent SNAT pool address selection | [plan-1377-snat-pools.md](plan-1377-snat-pools.md) | Closed | Userspace-v1 selector, unusable-pool fail-closed runtime, helper-local persistent-NAT lease reuse, per-pool allocator sharing, and allocator counters landed. #1448, #1449, and #1450 are closed documented contracts for helper restart reset, HA admission gating, and backend-specific selector behavior. |
+| #1378 policy schedulers | [plan-1378-policy-schedulers.md](plan-1378-policy-schedulers.md) | Closed | Closed by live HA artifact capture accepted by `policy_scheduler_validate.py`; no known #1378 runtime or evidence gap remains. |
+| #1379 dataplane events | [plan-1379-dataplane-events.md](plan-1379-dataplane-events.md) | Closed | Policy-deny, screen-drop, PBR filter logs, non-PBR input/output/lo0 filter logs, cached input-log replay without filter rescans, source-disambiguated FILTER_LOG syslog, and deterministic fanout coverage landed. |
+| #1380 userspace buffer/status parity | [plan-1380-userspace-buffers.md](plan-1380-userspace-buffers.md) | Closed | Helper-status rendering is active; Rust-owned session-table and flow-cache denominators are helper-published, while neighbor entries remain counters until Rust owns a bounded neighbor-cache capacity. |
+| #1381 DataPlane split | [plan.md](plan.md) | Closed | The blocking userspace-apply/interface split closed; the broader source-removal migration continues under #1451. |
 
-## Shared Dependency
+## Current Removal Work
 
-#1381 is the common plumbing dependency for the blocker set. The userspace
-manager no longer embeds the old `DataPlane` interface directly for the first
-operator metadata surfaces, and a userspace legacy adapter owns the compatibility
-boundary. Remaining Phase 3 work is to move session, telemetry, GC, and control
-callers off the old BPF-shaped surface before generated bindings, loader code,
-and BPF build rules can be removed. #1380 is a Phase 5 CLI/observability cleanup
-item, now closed for the current helper schema; it does not block the Phase 4
-forwarding-source removal gate by itself.
+| Issue | Scope |
+|---|---|
+| #1451 | Migrate remaining legacy eBPF-shaped runtime and operator surfaces before source/generated artifact deletion. |
+| #1473 | Split the retained userspace XDP shim from legacy `xdp_main_prog` fallback. |
+| #1476 | Remove legacy BPF source, generated artifacts, and build hooks after the blockers close. |
+| #1477 | Publish final userspace-only validation artifacts for the exact source-removal candidate. |
+
+#1474 is closed: omitted `system dataplane-type` selects userspace, while
+explicit `system dataplane-type ebpf` remains temporary warned compatibility
+until legacy source removal.
+
+## Removal-Phase Dependency
+
+#1451 is the current common migration umbrella. The userspace manager no longer
+embeds the old `DataPlane` interface directly, and a userspace legacy adapter
+owns the compatibility boundary while unmigrated callers move to domain
+interfaces. #1380 is a Phase 5 CLI/observability cleanup item, now closed for
+the current helper schema; it does not block the source-removal gate by itself.
 
 ## #1451 Runtime Boundary Canaries
 

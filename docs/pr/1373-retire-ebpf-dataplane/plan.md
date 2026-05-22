@@ -2,38 +2,53 @@
 
 Phase 0 is a documentation and audit PR for #1373. It announces that new
 dataplane development targets `userspace-dp`, refreshes the userspace gap audit,
-and records the blockers that must close before later retirement phases remove
-legacy eBPF code.
+and records the feature-gap blockers that have since closed before later
+retirement phases remove legacy eBPF code.
 
 No BPF source is removed in Phase 0. The `bpf/` tree, bpf2go-generated Go
 bindings, eBPF loader, legacy test targets, and BPF-backed CLI surfaces remain
 present until later phase PRs.
 
-## Blockers
+## Feature Gap Closeout
 
-| Issue | Summary | Phase dependency |
-|-------|---------|------------------|
-| #1381 | Runtime interface split is underway; userspace no longer embeds the old interface directly for the first operator metadata surfaces, but session/telemetry/GC/control callers still need to leave the BPF-shaped contract | Must land first; blocks Phase 3 |
-| #1377 | Userspace-v1 address-persistent SNAT pool selection, fail-closed runtime handling for unusable pool rules, helper-local per-pool `persistent-nat`, live-port exhaustion observability, and allocator counters are implemented; #1449 closes HA persistent-lease behavior as an explicit userspace capability gate; remaining work is helper-restart persistence, integration evidence, and documented mixed-backend rollback behavior | Before Phase 4 |
-| #1378 | Scheduler state, counter survival, strict missing-scheduler behavior, deterministic evidence validation, and live HA artifact capture are complete for userspace; no known #1378 blocker remains | Before Phase 4 |
-| #1379 | Policy-deny, screen-drop, PBR filter logs, non-PBR input/output/lo0 filter logs, cached input-log replay without filter rescans, source-disambiguated FILTER_LOG syslog, and deterministic fanout coverage now emit from userspace; remaining work is live userspace-cluster syslog evidence if Phase 4 requires operator artifacts | Before Phase 4 |
-| #1374 | Userspace SYN-cookie validation/admission semantics, root-auth-derived snapshot key publication, bounded SYN-ACK/RST TX replies, counters, and gate removal exist; remaining blocker is live HA/flood validation evidence before BPF source removal | Before Phase 4 |
-| #1375 | Userspace supports the color-blind `then discard` srTCM/trTCM slice, fails closed for unsupported shapes, and preserves token/counter state across compatible in-process snapshot refreshes; remaining work is HA/restart continuity decision, non-drop color actions, and integration/perf evidence | Before Phase 4 |
-| #1376 | Userspace port mirroring has snapshot/wire plumbing plus bounded runtime admission; remaining work is mirror-fidelity and pressure-survival evidence before BPF source removal | Before Phase 4 |
-| #1380 | Userspace `show system buffers` renders helper status; Rust-owned session and flow-cache denominators are helper-published, and neighbor entries remain counters until Rust owns a bounded neighbor-cache capacity | Phase 5 closeout recorded |
+The original #1374-#1381 Phase 0 blocker set is closed. This tracker keeps the
+closeout state visible because the detailed plan files still define important
+runtime contracts, but those issues are no longer the active source-removal
+backlog.
+
+| Issue | Disposition |
+|-------|-------------|
+| #1374 | SYN-cookie runtime support is implemented; final source-removal evidence belongs with #1477 if required. |
+| #1375 | The admitted userspace three-color policer slice is implemented; future hardening is production follow-up work. |
+| #1376 | Userspace port mirroring runtime support is implemented; final mirror evidence belongs with #1477 if required. |
+| #1377 | Userspace-v1 address-persistent SNAT selection, fail-closed pool runtime, helper-local per-pool `persistent-nat`, live-port exhaustion observability, and allocator counters are implemented. #1448, #1449, and #1450 are closed as documented helper-restart, HA-gate, and cross-backend selector contracts, not active #1373/#1451 blockers. |
+| #1378 | Scheduler state, counter survival, strict missing-scheduler behavior, deterministic evidence validation, and live HA artifact capture are complete for userspace. |
+| #1379 | Policy-deny, screen-drop, filter-log, source-disambiguated FILTER_LOG syslog, and deterministic fanout coverage now emit from userspace. |
+| #1380 | Userspace `show system buffers` renders helper status; Rust-owned session and flow-cache denominators are helper-published, and neighbor entries remain counters until Rust owns a bounded neighbor-cache capacity. |
+| #1381 | The blocking interface split is closed; remaining runtime/operator surface migration is tracked by #1451. |
+
+## Current Removal Trackers
+
+| Issue | Scope |
+|-------|-------|
+| #1451 | Move remaining runtime and operator callers off the legacy eBPF-shaped dataplane surfaces before source/generated artifact deletion. |
+| #1473 | Split the retained userspace XDP shim from legacy `xdp_main_prog` fallback. |
+| #1476 | Remove legacy BPF source, generated artifacts, and build hooks after migration blockers close. |
+| #1477 | Publish final userspace-only validation artifacts for the exact source-removal candidate. |
+
+#1474 is closed: omitted `system dataplane-type` selects userspace, while
+explicit `system dataplane-type ebpf` remains temporary warned compatibility
+until legacy source removal.
 
 ## Recommended Order
 
-1. Land #1381 first so the daemon and dataplane interface stop assuming BPF
-   map-writer methods as the abstract contract.
-2. Land #1377 and #1379 next because these are silent correctness or
-   security-visibility gaps; #1378 is now closed by live HA evidence.
-3. Land #1375 and collect #1374/#1376 live evidence before Phase 4. #1374 is
-   no longer protected by a capability fallback; it still needs the flood/HA
-   artifact set before BPF source removal.
-4. Treat #1380 as closed for the current helper schema. Neighbor-cache
-   utilization rows still require a new helper-published bounded capacity and
-   should be tracked as new issues, not as #1380 blockers.
+1. Land #1451 first so remaining runtime and operator surfaces no longer depend
+   on the legacy eBPF-shaped `dataplane.DataPlane` contract.
+2. Land #1473 before source deletion so the retained userspace shim is
+   explicit and separate from legacy `xdp_main_prog` fallback.
+3. Land #1476 as the source/generated-artifact removal PR after those blockers
+   close.
+4. Attach #1477 validation artifacts to the exact #1476 candidate.
 
 ## Phase Boundaries
 
@@ -41,9 +56,9 @@ present until later phase PRs.
 - Phase 1: broad documentation migration. Historical PR-plan docs are preserved
   as history; add banners only where needed instead of rewriting old plans.
 - Phase 2: test environment consolidation.
-- Phase 3: build-system and Go dataplane interface removal work, after #1381.
-- Phase 4: BPF source removal, only after #1374-#1379 and any production
-  blockers from the audit are closed.
+- Phase 3: runtime and operator surface migration under #1451.
+- Phase 4: BPF source removal under #1476, only after #1451, #1473, and
+  the required #1477 validation artifacts are ready.
 - Phase 5: CLI and observability cleanup. The current #1380 helper-status
   contract is closed; future neighbor-cache fill-percentage rows need
   helper-owned denominators before they can enter the utilization table.
@@ -61,7 +76,7 @@ Phase 0 is complete only when:
   preserving stale "not implemented" claims for features already implemented in
   Rust;
 - rollback remains documented as the legacy eBPF dataplane staying present and
-  selectable until later phases; and
+  explicitly selectable until later phases; and
 - no BPF source, generated bindings, loader code, legacy tests, or CLI surfaces
   are removed by the Phase 0 PR.
 
@@ -71,8 +86,9 @@ The Phase 0 rollback path is deliberately simple because this PR is docs/audit
 only:
 
 1. keep the legacy eBPF backend in the tree and in build/test targets;
-2. remove or avoid `system dataplane-type userspace` on affected deployments, or
-   set `system dataplane-type ebpf` where an explicit backend is required;
+2. set `system dataplane-type ebpf` where an explicit legacy backend is
+   required, acknowledging the compile warning emitted for that temporary
+   compatibility selection;
 3. restart/re-apply `xpfd` so the manager selects the eBPF backend and legacy
    XDP/TC programs; and
 4. do not remove existing BPF pins or source until the later retirement phases
