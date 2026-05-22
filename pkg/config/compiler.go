@@ -377,10 +377,19 @@ func validateClassOfServiceStrict(cos *ClassOfServiceConfig) error {
 	return nil
 }
 
-// ValidateConfig performs cross-reference validation on a compiled config.
-// Returns a list of warnings (non-fatal) for references that don't resolve.
+// ValidateConfig performs non-fatal validation on a compiled config.
+// Returns warnings for unresolved references and operator-visible
+// compatibility/deprecation conditions.
 func ValidateConfig(cfg *Config) []string {
 	var warnings []string
+
+	if cfg.System.DataplaneType == dataplaneTypeEBPF {
+		warnings = append(warnings,
+			"system dataplane-type ebpf selects the deprecated legacy eBPF "+
+				"dataplane explicitly; this is temporary compatibility "+
+				"while legacy source removal is staged. Omitting "+
+				"system dataplane-type selects the userspace dataplane.")
+	}
 
 	// #653: when `services application-identification` is enabled,
 	// emit a one-line warning at commit time so operators see what

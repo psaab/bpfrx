@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/config"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -155,7 +156,8 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 	if s.commitFn == nil {
 		return nil, status.Errorf(codes.Internal, "commit handler not wired")
 	}
-	if _, err := s.commitFn(ctx, req.Comment); err != nil {
+	compiled, err := s.commitFn(ctx, req.Comment)
+	if err != nil {
 		switch {
 		case errors.Is(err, context.Canceled):
 			return nil, status.Errorf(codes.Canceled, "commit busy: %v", err)
@@ -165,21 +167,23 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 		}
 	}
-	return &pb.CommitResponse{Summary: summary}, nil
+	return &pb.CommitResponse{Summary: summary, Warnings: configWarnings(compiled)}, nil
 }
 
 func (s *Server) CommitCheck(_ context.Context, _ *pb.CommitCheckRequest) (*pb.CommitCheckResponse, error) {
-	if _, err := s.store.CommitCheck(); err != nil {
+	compiled, err := s.store.CommitCheck()
+	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	return &pb.CommitCheckResponse{}, nil
+	return &pb.CommitCheckResponse{Warnings: configWarnings(compiled)}, nil
 }
 
 func (s *Server) CommitConfirmed(ctx context.Context, req *pb.CommitConfirmedRequest) (*pb.CommitConfirmedResponse, error) {
 	if s.commitConfirmedFn == nil {
 		return nil, status.Errorf(codes.Internal, "commit-confirmed handler not wired")
 	}
-	if _, err := s.commitConfirmedFn(ctx, int(req.Minutes)); err != nil {
+	compiled, err := s.commitConfirmedFn(ctx, int(req.Minutes))
+	if err != nil {
 		switch {
 		case errors.Is(err, context.Canceled):
 			return nil, status.Errorf(codes.Canceled, "commit busy: %v", err)
@@ -189,7 +193,7 @@ func (s *Server) CommitConfirmed(ctx context.Context, req *pb.CommitConfirmedReq
 			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 		}
 	}
-	return &pb.CommitConfirmedResponse{}, nil
+	return &pb.CommitConfirmedResponse{Warnings: configWarnings(compiled)}, nil
 }
 
 func (s *Server) ConfirmCommit(_ context.Context, _ *pb.ConfirmCommitRequest) (*pb.ConfirmCommitResponse, error) {
@@ -204,6 +208,13 @@ func (s *Server) Rollback(_ context.Context, req *pb.RollbackRequest) (*pb.Rollb
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	return &pb.RollbackResponse{}, nil
+}
+
+func configWarnings(cfg *config.Config) []string {
+	if cfg == nil || len(cfg.Warnings) == 0 {
+		return nil
+	}
+	return append([]string(nil), cfg.Warnings...)
 }
 
 func (s *Server) ShowConfig(_ context.Context, req *pb.ShowConfigRequest) (*pb.ShowConfigResponse, error) {

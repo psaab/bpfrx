@@ -57,6 +57,19 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, Response{Success: false, Error: msg})
 }
 
+type configCommitResponse struct {
+	Status   string   `json:"status"`
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+func commitResponseFromConfig(cfg *config.Config) configCommitResponse {
+	resp := configCommitResponse{Status: "ok"}
+	if cfg != nil && len(cfg.Warnings) > 0 {
+		resp.Warnings = append([]string(nil), cfg.Warnings...)
+	}
+	return resp
+}
+
 // healthHandler surfaces dataplane compile health (#758) alongside the
 // simple "ok" probe. When the dataplane compile has failed and has
 // never succeeded since startup, return 503 with a structured "status:
@@ -1554,7 +1567,8 @@ func (s *Server) configCommitHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "commit handler not wired")
 		return
 	}
-	if _, err := s.commitFn(r.Context(), ""); err != nil {
+	compiled, err := s.commitFn(r.Context(), "")
+	if err != nil {
 		switch {
 		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 			writeError(w, http.StatusServiceUnavailable, "commit busy: "+err.Error())
@@ -1563,15 +1577,16 @@ func (s *Server) configCommitHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeOK(w, map[string]string{"status": "ok"})
+	writeOK(w, commitResponseFromConfig(compiled))
 }
 
 func (s *Server) configCommitCheckHandler(w http.ResponseWriter, _ *http.Request) {
-	if _, err := s.store.CommitCheck(); err != nil {
+	compiled, err := s.store.CommitCheck()
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeOK(w, map[string]string{"status": "ok"})
+	writeOK(w, commitResponseFromConfig(compiled))
 }
 
 func (s *Server) configRollbackHandler(w http.ResponseWriter, r *http.Request) {
@@ -1716,7 +1731,8 @@ func (s *Server) configCommitConfirmedHandler(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusInternalServerError, "commit-confirmed handler not wired")
 		return
 	}
-	if _, err := s.commitConfirmedFn(r.Context(), req.Minutes); err != nil {
+	compiled, err := s.commitConfirmedFn(r.Context(), req.Minutes)
+	if err != nil {
 		switch {
 		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 			writeError(w, http.StatusServiceUnavailable, "commit busy: "+err.Error())
@@ -1725,7 +1741,7 @@ func (s *Server) configCommitConfirmedHandler(w http.ResponseWriter, r *http.Req
 		}
 		return
 	}
-	writeOK(w, map[string]string{"status": "ok"})
+	writeOK(w, commitResponseFromConfig(compiled))
 }
 
 func (s *Server) configConfirmHandler(w http.ResponseWriter, _ *http.Request) {
