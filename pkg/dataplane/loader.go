@@ -16,8 +16,11 @@ import (
 
 const linkPinPath = "/sys/fs/bpf/xpf/links"
 
-// go:generate directives -- run "make generate" with clang + libbpf-dev installed.
-// These produce the *_bpfel.go files with embedded ELF objects.
+// go:generate directives.
+// Run "make generate" with clang + libbpf-dev installed for the full legacy
+// XDP/TC bpf2go batch plus the retained Rust userspace XDP shim object.
+// Run "make generate-userspace-xdp" to rebuild only the retained shim without
+// invoking legacy xdp_main/tc bpf2go generation.
 //
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 xpfXdpMain ../../bpf/xdp/xdp_main.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 //go:generate bash build-userspace-xdp.sh

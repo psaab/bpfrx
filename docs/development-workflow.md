@@ -10,6 +10,24 @@ How non-trivial changes land in this repo. Roles and agent-boundary
 rules are in `AGENTS.md`; read that first. This doc is the process
 layer on top of those roles.
 
+## Dataplane generation split
+
+The retained userspace XDP shim is a separate build artifact from the legacy
+XDP/TC dataplane programs:
+
+- `make generate-userspace-xdp` rebuilds only
+  `pkg/dataplane/userspace_xdp_bpfel.o` through
+  `go generate -run '^//go:generate bash build-userspace-xdp\.sh$' ./pkg/dataplane`.
+- `make build-userspace-xdp` is an alias for the shim-only generation target.
+- `make generate` remains the full compatibility path and still regenerates
+  the legacy bpf2go XDP/TC artifacts as well as the retained shim.
+- `make generate-legacy-bpf` runs the legacy XDP/TC bpf2go directives while
+  leaving the retained shim object untouched.
+
+Do not treat the retained shim as evidence that legacy `xdp_main` or TC
+dataplane program generation is required. The shim-only target is the #1473
+canary for that boundary.
+
 The workflow has two distinct review cycles — one on the plan, one
 on the code — each with the same rule: **land when both reviewers
 agree, not before**.

@@ -13,13 +13,26 @@ LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime
 # eBPF compilation flags
 BPF_CFLAGS := -O2 -g -Wall -Werror -target bpf
 
-.PHONY: all generate build build-ctl build-userspace-dp proto install clean test test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity build-dpdk-worker build-dpdk clean-dpdk
+.PHONY: all generate generate-legacy-bpf generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp proto install clean test test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity build-dpdk-worker build-dpdk clean-dpdk
 
 all: generate build build-ctl
 
-# Generate Go bindings from eBPF C programs via bpf2go
+# Generate all dataplane artifacts: legacy XDP/TC bpf2go outputs plus the
+# retained Rust userspace XDP shim object.
 generate:
 	$(GO) generate ./pkg/dataplane/...
+
+# Generate only legacy XDP/TC eBPF dataplane bindings, leaving the retained
+# Rust userspace XDP shim object untouched.
+generate-legacy-bpf:
+	$(GO) generate -skip '^//go:generate bash build-userspace-xdp\.sh$$' ./pkg/dataplane/...
+
+# Generate only the retained Rust userspace XDP shim object. This target is the
+# #1473 source-removal canary: it must not invoke legacy xdp_main/tc bpf2go.
+generate-userspace-xdp:
+	$(GO) generate -run '^//go:generate bash build-userspace-xdp\.sh$$' ./pkg/dataplane
+
+build-userspace-xdp: generate-userspace-xdp
 
 # Build the daemon binary
 build:
