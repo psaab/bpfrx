@@ -4,6 +4,13 @@ Note: This is an architecture/planning document. For the current project-level
 decision and recommendation between DPDK and VPP, see
 `docs/dataplane-decision-dpdk-vs-vpp.md`.
 
+Current #1475 policy: DPDK remains a separately supported backend for binaries
+built with `-tags dpdk`, but it is outside the #1373 eBPF source-removal path
+until it migrates off the root `dataplane.DataPlane` interface. The legacy
+bridge is confined to `pkg/dataplane/dpdk`, with only the blank registration
+import in `cmd/xpfd/main.go` outside that package. Non-DPDK builds reject DPDK
+startup explicitly instead of running a no-op stub.
+
 ## Overview
 
 Add a DPDK-based dataplane as an alternative to the current XDP/TC eBPF pipeline. The existing `pkg/dataplane.Manager` API is already well-abstracted — the daemon, CLI, gRPC, config system, and all subsystems interact through this interface, not through BPF-specific code. A DPDK implementation would swap the packet processing engine while keeping everything else unchanged.

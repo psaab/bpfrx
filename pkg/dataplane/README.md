@@ -19,6 +19,14 @@ userspace runtime constructor returns `LegacyDataPlaneAdapter`: the userspace
 daemon status, CLI, and cluster-sync callers that have not moved to domain
 interfaces still receive a temporary compatibility handle.
 
+#1475 policy: DPDK is retained as a separately supported DPDK-build backend,
+but it is outside the eBPF source-removal path until it migrates off the root
+`DataPlane` interface. Its legacy bridge must stay inside
+`pkg/dataplane/dpdk`; the only production import outside that package is the
+blank registration import in `cmd/xpfd/main.go`. Non-`-tags dpdk` binaries keep
+the package compiling but fail DPDK startup explicitly instead of running a
+no-op stub.
+
 The userspace backend's status wire format is mirrored here for CLI/API
 consumers. CoS queue status includes queue-scoped drain-phase counters so
 operators can separate guarantee bytes, surplus bytes, and non-exact bytes
@@ -29,6 +37,9 @@ sent while exact queues were still backlogged.
 - `DataPlane` — `dataplane.go`. Legacy BPF-shaped interface kept for the
   eBPF/DPDK compiler and compatibility adapters. New daemon-facing code should
   not add methods here.
+- `pkg/dataplane/dpdk.Manager` — DPDK implementation. It currently satisfies
+  both `DataPlane` and `RuntimeDataPlane`; that is the #1475 backend-local
+  exception and not a template for new runtime code.
 - `RuntimeDataPlane`, `ConfigSink`, `SessionStore`, `Telemetry`,
   `HAController`, and `LinkController` — `apply.go` and `session_store.go`.
   These are the split-domain interfaces used by daemon startup and runtime

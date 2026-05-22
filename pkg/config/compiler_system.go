@@ -11,12 +11,12 @@ import (
 const sharedUMEMPhase0ArtifactMaxBytes = 16 << 20
 
 func compileSystem(node *Node, sys *SystemConfig) error {
-	for _, child := range node.Children {
-		if child.Name() == "dataplane-type" && len(child.Keys) >= 2 {
-			sys.DataplaneType = child.Keys[1]
-			break
-		}
+	dpType, err := resolveSystemDataplaneType(node)
+	if err != nil {
+		return err
 	}
+	sys.DataplaneType = dpType
+
 	for _, child := range node.Children {
 		switch child.Name() {
 		case "host-name":
@@ -24,9 +24,8 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 				sys.HostName = child.Keys[1]
 			}
 		case "dataplane-type":
-			if len(child.Keys) >= 2 {
-				sys.DataplaneType = child.Keys[1]
-			}
+			// Resolved before the main pass so a dataplane block uses the
+			// same validated type regardless of sibling order.
 		case "domain-name":
 			if len(child.Keys) >= 2 {
 				sys.DomainName = child.Keys[1]
@@ -366,6 +365,30 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 	}
 
 	return nil
+}
+
+func resolveSystemDataplaneType(node *Node) (string, error) {
+	var dpType string
+	for _, child := range node.Children {
+		if child.Name() != "dataplane-type" || len(child.Keys) < 2 {
+			continue
+		}
+		value := child.Keys[1]
+		if err := validateSystemDataplaneType(value); err != nil {
+			return "", err
+		}
+		dpType = value
+	}
+	return dpType, nil
+}
+
+func validateSystemDataplaneType(dpType string) error {
+	switch dpType {
+	case "", "ebpf", "dpdk", "userspace":
+		return nil
+	default:
+		return fmt.Errorf("dataplane-type %q is invalid; valid values are ebpf, dpdk, userspace", dpType)
+	}
 }
 
 func hasDNSProxyChild(node *Node) bool {

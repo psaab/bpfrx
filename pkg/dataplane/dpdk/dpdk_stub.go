@@ -4,6 +4,7 @@ package dpdk
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -13,12 +14,12 @@ import (
 
 type platformState struct{}
 
+var errDPDKBuildTagRequired = errors.New("DPDK dataplane requires a binary built with -tags dpdk and libdpdk support")
+
 // --- Lifecycle ---
 
 func (m *Manager) Load() error {
-	slog.Info("DPDK dataplane loaded (stub)")
-	m.loaded = true
-	return nil
+	return errDPDKBuildTagRequired
 }
 
 func (m *Manager) Close() error {
@@ -60,6 +61,9 @@ func (m *Manager) AddTxPort(ifindex int) error {
 // --- Compilation ---
 
 func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) {
+	if !m.loaded {
+		return nil, errDPDKBuildTagRequired
+	}
 	result, err := dataplane.CompileConfig(m, cfg, m.lastCompile != nil)
 	if err != nil {
 		return nil, err

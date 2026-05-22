@@ -43,6 +43,40 @@ owning `dataplane.RuntimeDataPlane` and must call
 production-code canary; `_test.go` files may still import lower-level helpers
 when they need backend fixtures for regression coverage.
 
+## #1475 DPDK Backend Policy
+
+DPDK remains a separately supported backend for DPDK-specific binaries, but it
+is explicitly outside the eBPF source-removal path until it migrates off the
+root `DataPlane` interface. The current DPDK implementation still satisfies
+both `dataplane.DataPlane` and `dataplane.RuntimeDataPlane`; that is a
+backend-local compatibility exception, not a reason for userspace retirement
+work to grow new dependencies on the legacy BPF-shaped surface.
+
+The allowed production boundary is narrow:
+
+- `pkg/dataplane/dpdk` may import root `pkg/dataplane` types and helpers while
+  it owns the DPDK compatibility bridge.
+- `cmd/xpfd/main.go` may keep the blank DPDK import for backend registration.
+- No other production `cmd/*` or `pkg/*` package may import
+  `pkg/dataplane/dpdk`.
+- The only allowed DPDK import of `github.com/cilium/ebpf` is the existing
+  `pkg/dataplane/dpdk/manager.go` adapter for the legacy `Map(string)
+  *ebpf.Map` method. Adding more eBPF artifact imports to DPDK requires an
+  explicit backend-policy update.
+
+The default non-DPDK build keeps the package present so registration and tests
+compile, but `system dataplane-type dpdk` does not silently start a stub
+dataplane: `pkg/dataplane/dpdk` returns a clear startup error unless the daemon
+binary was built with `-tags dpdk` and libdpdk support. Config validation still
+accepts `dpdk` as a valid backend name and rejects unknown backend names before
+daemon startup.
+
+The #1475 canaries in `pkg/dataplane/retirement_boundary_canary_test.go` enforce
+the import boundary above and require this policy text to stay present. DPDK
+builds remain blocked on migrating away from root `DataPlane`; userspace-only
+production source removal must not depend on solving that DPDK migration in the
+same PR.
+
 ### Allowlisted Legacy Bridges
 
 These files are the current production direct-import allowlist for root
@@ -101,9 +135,11 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
   userspace runtime construction returns a legacy-compatible adapter while
   unmigrated operator services consume old session, telemetry, and control
   methods. The userspace `Manager` itself must not implement `DataPlane`.
-- DPDK still implements both `DataPlane` and `RuntimeDataPlane`; the only
-  direct DPDK backend import outside `pkg/dataplane` should remain the blank
-  registration import in `cmd/xpfd/main.go`.
+- DPDK still implements both `DataPlane` and `RuntimeDataPlane`. That
+  compatibility is intentionally confined to `pkg/dataplane/dpdk`, with the
+  only direct DPDK backend import outside the package being the blank
+  registration import in `cmd/xpfd/main.go`. Non-`-tags dpdk` binaries fail
+  DPDK startup explicitly rather than running a no-op stub.
 - BPF source and build artifacts are not safe to delete in #1451 canary work:
   `bpf/`, `pkg/dataplane/loader_ebpf.go`,
   `pkg/dataplane/*_bpfel.go`, `pkg/dataplane/*_bpfel.o`,

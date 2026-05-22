@@ -60,6 +60,14 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"pkg/monitoriface/monitor.go":              "interface monitor still reads legacy interface counters",
 }
 
+var dpdkEBPFImportAllowlist = map[string]string{
+	"pkg/dataplane/dpdk/manager.go": "legacy DataPlane Map method returns *ebpf.Map until DPDK migrates off root DataPlane",
+}
+
+var dpdkBackendImportAllowlist = map[string]string{
+	"cmd/xpfd/main.go": "backend registration and cleanup entry point",
+}
+
 func TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports(t *testing.T) {
 	t.Parallel()
 
@@ -120,6 +128,72 @@ func TestOperatorPackagesDoNotImportBPFArtifactsDirectly(t *testing.T) {
 	}
 }
 
+func TestDPDKBackendImportStaysBackendLocal(t *testing.T) {
+	t.Parallel()
+
+	var violations []string
+	for _, path := range productionGoFilesUnder(t, []string{
+		filepath.Join(repoRootForBoundaryCanary, "cmd"),
+		filepath.Join(repoRootForBoundaryCanary, "pkg"),
+	}) {
+		rel := repoRelativePath(t, path)
+		if strings.HasPrefix(rel, "pkg/dataplane/dpdk/") {
+			continue
+		}
+		if _, ok := dpdkBackendImportAllowlist[rel]; ok {
+			continue
+		}
+		for _, imp := range importPaths(t, path) {
+			if imp == dpdkBackendImportForCanary || strings.HasPrefix(imp, dpdkBackendImportForCanary+"/") {
+				violations = append(violations, rel+" imports "+imp)
+			}
+		}
+	}
+
+	if len(violations) > 0 {
+		sort.Strings(violations)
+		t.Fatalf("DPDK backend imports must stay limited to pkg/dataplane/dpdk and cmd/xpfd registration: %v", violations)
+	}
+}
+
+func TestDPDKEBPFArtifactImportsStayAtLegacyAdapter(t *testing.T) {
+	t.Parallel()
+
+	found := map[string]bool{}
+	var unexpected []string
+	for _, path := range productionGoFilesUnder(t, []string{
+		filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "dpdk"),
+	}) {
+		rel := repoRelativePath(t, path)
+		for _, imp := range importPaths(t, path) {
+			if imp != ciliumEBPFImportForCanary && !strings.HasPrefix(imp, ciliumEBPFImportForCanary+"/") {
+				continue
+			}
+			found[rel] = true
+			if _, ok := dpdkEBPFImportAllowlist[rel]; !ok {
+				unexpected = append(unexpected, rel+" imports "+imp)
+			}
+		}
+	}
+
+	var stale []string
+	for rel := range dpdkEBPFImportAllowlist {
+		if !found[rel] {
+			stale = append(stale, rel)
+		}
+	}
+
+	if len(unexpected) > 0 || len(stale) > 0 {
+		sort.Strings(unexpected)
+		sort.Strings(stale)
+		t.Fatalf(
+			"DPDK eBPF artifact import policy drift\nunexpected imports: %v\nstale allowlist entries: %v",
+			unexpected,
+			stale,
+		)
+	}
+}
+
 func TestDaemonRuntimeEntryPointUsesRuntimeDataPlane(t *testing.T) {
 	t.Parallel()
 
@@ -131,6 +205,35 @@ func TestDaemonRuntimeEntryPointUsesRuntimeDataPlane(t *testing.T) {
 	}
 	if !hasDaemonRuntimeConstructorCall(t, daemonRun, "NewRuntimeDataPlane") {
 		t.Fatal("daemon runtime startup no longer calls dataplane.NewRuntimeDataPlane")
+	}
+}
+
+func TestRetirementBoundaryDocsMentionDPDKPolicy(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(retirementBoundaryDocsForCanary)
+	if err != nil {
+		t.Fatalf("read retirement boundary docs: %v", err)
+	}
+	text := string(data)
+
+	want := []string{
+		"## #1475 DPDK Backend Policy",
+		"DPDK remains a separately supported backend",
+		"outside the eBPF source-removal path",
+		"`pkg/dataplane/dpdk`",
+		"`cmd/xpfd/main.go`",
+		"`-tags dpdk`",
+		"root `DataPlane`",
+	}
+	var missing []string
+	for _, token := range want {
+		if !strings.Contains(text, token) {
+			missing = append(missing, token)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("retirement docs do not mention DPDK policy tokens: %v", missing)
 	}
 }
 

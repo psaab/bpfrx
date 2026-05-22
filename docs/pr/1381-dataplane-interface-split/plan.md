@@ -582,6 +582,10 @@ interface in place and adds the new contract beside it:
   session surfaces; userspace keeps backend-specific link and HA controllers so
   link-cycle prepare/defer/rebind semantics and fabric-state helper sync stay
   intact.
+- #1475 pins DPDK as a separately supported DPDK-build backend outside the
+  userspace eBPF source-removal path. Its current root `DataPlane` dependency
+  is confined to `pkg/dataplane/dpdk` plus the `cmd/xpfd/main.go` registration
+  import until DPDK gets its own migration off the legacy interface.
 - Cluster stale-bulk reconciliation now routes through
   `dataplane.SessionStore.ReconcileClusterBulk`, whose companion-delete path
   owns forward, reverse, and DNAT/DNATv6 cleanup. A canary fails if
