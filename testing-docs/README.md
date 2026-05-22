@@ -24,6 +24,12 @@ AF_XDP dataplane plus legacy eBPF regression coverage.
 | [performance.md](performance.md) | Throughput, latency, perf profiling | `scripts/userspace-perf-compare.sh` |
 | [regression-checklist.md](regression-checklist.md) | Pre-commit validation checklist | Manual |
 
+## Historical References
+
+| Document | Status |
+|----------|--------|
+| [ha-failover-validation.md](ha-failover-validation.md) | Historical March 2026 HA investigation notes only. Current userspace HA validation must use `failover-testing.md`, `userspace-fabric-failover.md`, `scripts/userspace-ha-validation.sh`, and `scripts/userspace-ha-failover-validation.sh`; legacy `xdp_main_prog` fallback is not a userspace pass condition. |
+
 ## Quick Reference
 
 ```bash

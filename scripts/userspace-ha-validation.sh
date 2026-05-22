@@ -25,6 +25,7 @@ MTR_V6_TARGET="${MTR_V6_TARGET:-2607:f8b0:4005:814::200e}"
 MTR_REPORT_CYCLES="${MTR_REPORT_CYCLES:-1}"
 WAN_TEST_IFACE="${WAN_TEST_IFACE:-}"
 IPERF_METRICS="${PROJECT_ROOT}/scripts/iperf-json-metrics.py"
+ALLOW_LEGACY_EBPF_HA_VALIDATION="${ALLOW_LEGACY_EBPF_HA_VALIDATION:-0}"
 WITH_PERF=0
 DEPLOY=0
 
@@ -126,14 +127,29 @@ enabled_userspace_vm() {
 }
 
 active_owner_vm() {
-	local vm stats
+	local active=()
+	local vm stats query_failed=0
 	for vm in "$FW0" "$FW1"; do
-		stats="$(run_vm "$vm" 'cli -c "show chassis cluster data-plane statistics"' 2>/dev/null || true)"
+		if ! stats="$(run_vm "$vm" 'cli -c "show chassis cluster data-plane statistics"' 2>/dev/null)"; then
+			printf 'failed to query data-plane statistics from %s\n' "$vm" >&2
+			query_failed=1
+			continue
+		fi
 		if grep -Eq 'HA groups:[[:space:]].*rg[1-9][0-9]* active=true' <<<"$stats"; then
-			printf '%s\n' "$vm"
-			return 0
+			active+=("$vm")
 		fi
 	done
+	if (( query_failed != 0 )); then
+		return 2
+	fi
+	if (( ${#active[@]} == 1 )); then
+		printf '%s\n' "${active[0]}"
+		return 0
+	fi
+	if (( ${#active[@]} > 1 )); then
+		printf 'split-brain active owners: %s\n' "${active[*]}" >&2
+		return 2
+	fi
 	return 1
 }
 
@@ -155,10 +171,8 @@ rg_primary_node() {
 }
 
 ensure_preferred_active_node() {
-	local preferred_vm="$FW0"
 	local preferred_name="node0"
 	if [[ "$PREFERRED_ACTIVE_NODE" == "1" ]]; then
-		preferred_vm="$FW1"
 		preferred_name="node1"
 	fi
 	info "pinning userspace validation to ${preferred_name} for RGs:${PREFERRED_ACTIVE_RGS}"
@@ -189,11 +203,17 @@ ensure_preferred_active_node() {
 wait_for_active_supported_runtime() {
 	local tries=30
 	while (( tries > 0 )); do
-		local owner
-		owner="$(active_owner_vm || true)"
-		if [[ -n "$owner" ]] && enabled_userspace_vm "$owner" >/dev/null 2>&1; then
-			printf '%s\n' "$owner"
-			return 0
+		local owner owner_status
+		if owner="$(active_owner_vm)"; then
+			if enabled_userspace_vm "$owner" >/dev/null 2>&1; then
+				printf '%s\n' "$owner"
+				return 0
+			fi
+		else
+			owner_status=$?
+			if (( owner_status == 2 )); then
+				return 2
+			fi
 		fi
 		sleep 1
 		tries=$((tries - 1))
@@ -202,21 +222,34 @@ wait_for_active_supported_runtime() {
 }
 
 arm_supported_runtime() {
-	local owner
-	owner="$(active_owner_vm || true)"
-	if [[ -z "$owner" ]]; then
-		owner="$FW0"
-	fi
+	local owner owner_status runtime_status
 	info "waiting for userspace forwarding to auto-arm on the active node"
 	if ACTIVE_FW="$(wait_for_active_supported_runtime)"; then
 		info "active userspace firewall: ${ACTIVE_FW}"
 		return 0
+	else
+		runtime_status=$?
+		if (( runtime_status == 2 )); then
+			die "supported userspace runtime requires an unambiguous active firewall owner"
+		fi
+	fi
+	if ! owner="$(active_owner_vm)"; then
+		owner_status=$?
+		if (( owner_status == 2 )); then
+			die "cannot force userspace arm with an ambiguous active firewall owner"
+		fi
+		die "cannot force userspace arm before an active firewall owner is reported"
 	fi
 	info "auto-arm did not settle, forcing forwarding arm on ${owner}"
 	run_vm "$owner" 'cli -c "request chassis cluster data-plane userspace forwarding arm" >/tmp/userspace-arm.out'
 	if ACTIVE_FW="$(wait_for_active_supported_runtime)"; then
 		info "active userspace firewall: ${ACTIVE_FW}"
 		return 0
+	else
+		runtime_status=$?
+		if (( runtime_status == 2 )); then
+			die "supported userspace runtime became ambiguous after forced arm"
+		fi
 	fi
 	run_vm "$owner" 'cli -c "show chassis cluster data-plane statistics" >&2 || true'
 	die "userspace forwarding did not become enabled on the active node"
@@ -357,7 +390,16 @@ info "detecting userspace runtime mode"
 MODE="$(runtime_mode)" || die "userspace runtime mode did not settle in time"
 info "runtime mode: ${MODE}"
 if [[ "${MODE}" == "legacy" ]]; then
-	info "validating legacy fallback state"
+	if [[ "${ALLOW_LEGACY_EBPF_HA_VALIDATION}" == "1" ]]; then
+		info "legacy eBPF fallback accepted by ALLOW_LEGACY_EBPF_HA_VALIDATION=1"
+		ACTIVE_FW="$(active_owner_vm)" ||
+			die "legacy fallback override requires an unambiguous active firewall owner"
+		info "active legacy fallback firewall: ${ACTIVE_FW}"
+	else
+		die "legacy eBPF fallback detected; userspace HA validation requires" \
+			"xdp_userspace_prog; set ALLOW_LEGACY_EBPF_HA_VALIDATION=1" \
+			"only for legacy regression runs"
+	fi
 else
 	info "supported userspace runtime detected"
 	ensure_preferred_active_node

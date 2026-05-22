@@ -1,16 +1,52 @@
-# HA Failover Validation -- Loss Userspace Cluster
+# Historical HA Failover Validation -- Loss Userspace Cluster
 
 Date: 2026-03-24
 
-This document records the bugs found, fixes applied, and test procedures
-used to validate HA failover on the isolated userspace AF_XDP cluster
-running mlx5 ConnectX SR-IOV VFs. It is self-contained: another engineer
-can reproduce every result using only the commands and environment
-described here.
+Status: historical archive. Do not use this file as the active userspace HA
+runbook.
+
+This document records the bugs found, fixes applied, and test procedures used
+for the March 2026 HA investigation on the isolated userspace AF_XDP cluster
+running mlx5 ConnectX SR-IOV VFs. It preserves useful history, but the legacy
+eBPF dataplane fallback described here is not an accepted userspace validation
+result.
+
+For current userspace HA validation, use:
+
+- [failover-testing.md](failover-testing.md)
+- [userspace-fabric-failover.md](userspace-fabric-failover.md)
+- `scripts/userspace-ha-validation.sh`
+- `scripts/userspace-ha-failover-validation.sh`
+
+Current userspace validation must stay on the userspace dataplane. An
+attachment or auto-swap to the legacy `xdp_main_prog` path is historical
+fallback behavior only; treat it as a userspace validation failure unless the
+test is explicitly scoped as a legacy eBPF regression.
+
+## Current Userspace HA Gate
+
+The active pass criteria are maintained in
+[failover-testing.md](failover-testing.md) and
+[userspace-fabric-failover.md](userspace-fabric-failover.md). In summary, a
+current userspace HA run must show:
+
+- `scripts/userspace-ha-validation.sh` passes steady-state reachability and
+  throughput checks before failover testing starts.
+- `scripts/userspace-ha-failover-validation.sh` passes RG move and failback
+  under established load.
+- The active and standby userspace helpers remain armed: userspace forwarding
+  is supported, active RGs are enabled, forwarding is armed where expected, and
+  ready bindings stay non-zero.
+- The XDP userspace shim/helper path remains attached on userspace data
+  interfaces; the legacy `xdp_main_prog` fallback is not counted as success.
+- Failover artifacts show external IPv4 and IPv6 reachability, no
+  zero-throughput collapse, positive old-owner fabric TX deltas when stale-MAC
+  traffic is expected, flat standby WAN TX deltas during fabric redirect, and
+  bounded session/neighbor/route/policy deltas.
 
 ---
 
-## 1. Summary of Fixes Applied
+## 1. Historical Summary of Fixes Applied
 
 Ten commits, listed in dependency order. Each commit addresses a distinct
 failure mode discovered during HA failover testing on the loss cluster.
@@ -22,7 +58,7 @@ failure mode discovered during HA failover testing on the loss cluster.
 | `00dc648d` | NAPI bootstrap with varying probes (multi-queue coverage) | `manager.go` |
 | `8d4bb7ce` | Standalone AF_XDP XSK rebind test proving two bugs | `test/xsk-repro/` |
 | `b95a8dd8` | Avoid link DOWN/UP on RETH MAC change | `linksetup.go`, `garp.go` |
-| `e83d4d3a` | XSK liveness gate + auto-swap to eBPF pipeline | `manager.go` |
+| `e83d4d3a` | Historical XSK liveness gate + legacy eBPF fallback | `manager.go` |
 | `2e237a7e` | Suppress stable link-local EADDRNOTAVAIL log spam | `reconcile.go` |
 | `375be885` | Replace xdpilone with libxdp C bridge | `csrc/xsk_bridge.c`, `xsk_ffi.rs`, `bind.rs`, `Cargo.toml`, `build.rs` |
 | `807ae01a` | eBPF fabric redirect re-FIB for split-RG failover | `bpf/xdp/xdp_zone.c` |
@@ -88,19 +124,21 @@ occurs and AF_XDP sockets are preserved. Falls back to DOWN/UP only if
 the live change fails. When no link cycle occurs, VIP reconcile, AF_XDP
 rebind, and RA re-burst are all skipped (not needed).
 
-### 1.6 `e83d4d3a` -- XSK liveness gate + auto-swap to eBPF pipeline
+### 1.6 `e83d4d3a` -- Historical XSK liveness gate + legacy fallback
 
-Two changes:
+This was a historical defense-in-depth change from the March 2026 debugging
+window, not a current userspace HA success condition. Two changes were made:
 
 1. `ctrl.enabled` is only set to 1 if at least one binding has
    `rx_packets > 0`. Prevents routing transit traffic into a black hole
    when XSK cannot deliver packets.
 
 2. After 30 seconds of XSK bindings being ready but `rx_packets == 0`,
-   the manager calls `SwapXDPEntryProg("xdp_main_prog")` to replace the
-   XDP shim with the direct eBPF pipeline. This restores full 15+ Gbps
-   forwarding with zone/policy/SNAT instead of the broken XDP_PASS
-   fallback (~129 Mbps, no SNAT).
+   the manager called `SwapXDPEntryProg("xdp_main_prog")` as a legacy fallback
+   to replace the XDP shim with the direct legacy eBPF pipeline. That
+   historical fallback restored forwarding during this investigation, but an
+   active userspace validation run must treat this attachment as failure unless
+   it is deliberately testing legacy eBPF regression coverage.
 
 ### 1.7 `2e237a7e` -- Suppress stable link-local log spam
 
@@ -132,19 +170,18 @@ a session exists, attempt a re-FIB in the main routing table
 normally. If it also fails (true dual-inactive), drop with
 `GLOBAL_CTR_FABRIC_FWD_DROP`.
 
-### 1.10 `4ddf371f` -- Persist XSK liveness failure across config reconciles
+### 1.10 `4ddf371f` -- Persist historical XSK liveness failure across config reconciles
 
-The XSK liveness swap to `xdp_main_prog` was being overridden by config
-reconciles which re-set `XDPEntryProg` to `xdp_userspace_prog`. Added
-`xskLivenessFailed` flag that persists and prevents `Compile` from
-switching back to the broken XDP shim. Also added `delta-rx` check:
-the liveness gate now compares current `rx_packets` against a snapshot
-taken at gate start, so transient initial packets do not mask a
-subsequent stall.
+The historical XSK liveness swap to `xdp_main_prog` was being overridden by
+config reconciles which re-set `XDPEntryProg` to `xdp_userspace_prog`. Added
+`xskLivenessFailed` flag that persists and prevents `Compile` from switching
+back to the broken XDP shim. Also added `delta-rx` check: the liveness gate now
+compares current `rx_packets` against a snapshot taken at gate start, so
+transient initial packets do not mask a subsequent stall.
 
 ---
 
-## 2. Test Environment
+## 2. Historical Test Environment
 
 ### 2.1 Cluster Topology
 
@@ -212,7 +249,7 @@ subsequent stall.
 
 ---
 
-## 3. Bugs Found and Proven
+## 3. Historical Bugs Found and Proven
 
 ### 3.1 Router Flag Bug (RFC 4861 section 7.2.5)
 
@@ -294,11 +331,13 @@ rx_xsk_packets: 0              # never delivered
 rx_xsk_congst_umr: 3           # UMR issue
 ```
 
-**Workaround.** Two-layer defense:
+**Historical workaround.** Two-layer defense:
 1. `b95a8dd8`: Avoid link DOWN/UP entirely during RETH MAC change
    (live MAC change with `IFF_LIVE_ADDR_CHANGE`).
-2. `e83d4d3a` + `4ddf371f`: XSK liveness gate detects rx=0 and
-   auto-swaps to `xdp_main_prog` (eBPF pipeline) as fallback.
+2. `e83d4d3a` + `4ddf371f`: XSK liveness gate detects rx=0 and performs a
+   historical auto-swap to `xdp_main_prog` (legacy eBPF pipeline) as fallback.
+   Current userspace HA validation must not count that legacy fallback as a
+   pass.
 
 ### 3.4 eBPF Fabric Redirect Drops on Split-RG
 
@@ -328,11 +367,12 @@ handled it without SNAT.
 the XDP shim context. The tail-call instruction is emitted but the
 program array lookup fails silently.
 
-**Workaround.** The XSK liveness gate (`e83d4d3a` + `4ddf371f`) detects
-that XSK is broken and replaces `xdp_userspace_prog` with
-`xdp_main_prog` directly. This eliminates the shim entirely -- traffic
-goes through the full eBPF pipeline (zone, conntrack, policy, NAT,
-forward) at 15+ Gbps.
+**Historical workaround.** The XSK liveness gate (`e83d4d3a` + `4ddf371f`)
+detects that XSK is broken and uses the legacy `xdp_main_prog` fallback. This
+eliminates the shim entirely and sends traffic through the full legacy eBPF
+pipeline (zone, conntrack, policy, NAT, forward) at 15+ Gbps. That behavior is
+kept here as history; current userspace HA validation must fail on this legacy
+fallback unless the run is explicitly a legacy eBPF regression.
 
 ### 3.6 Ctrl Enable Never Fires (Rebind Timeout Reset)
 
@@ -376,7 +416,7 @@ entries on the ctrl 0-to-1 transition.
 
 ---
 
-## 4. Test Results
+## 4. Historical Test Results
 
 ### 4.1 Baseline Throughput (All RGs on Same Node)
 
@@ -430,172 +470,90 @@ failed over to node1 during an active iperf3 session.
 
 ---
 
-## 5. Test Procedures
+## 5. Current Validation Entry Points
 
-### 5.1 Deploy
+This section replaces the old active-looking procedure that waited for an XSK
+liveness failure and then verified the legacy eBPF program. That procedure was
+valid only for the historical investigation above.
+
+For current userspace HA validation, run the maintained docs and scripts:
+
+- [failover-testing.md](failover-testing.md) for the end-to-end failover
+  runbook and pass criteria.
+- [userspace-fabric-failover.md](userspace-fabric-failover.md) for
+  stale-owner fabric-path interpretation and artifact review.
+- `scripts/userspace-ha-validation.sh` before failover, to prove steady-state
+  userspace forwarding.
+- `scripts/userspace-ha-failover-validation.sh` for RG move and failback under
+  load.
+
+### 5.1 Deploy And Preflight
 
 ```bash
 BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env \
   ./test/incus/cluster-setup.sh deploy all
 ```
 
-Wait for the XSK liveness check to complete and the eBPF pipeline swap
-to occur. This takes 15-45 seconds after deploy depending on the NAPI
-prewarm timing.
+After deploy, do not wait for a legacy fallback swap. Preflight the live
+userspace dataplane:
 
 ```bash
-# Wait for swap (conservative)
-sleep 70
+BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env \
+RUNS=3 DURATION=5 PARALLEL=4 \
+PREFERRED_ACTIVE_NODE=0 \
+PREFERRED_ACTIVE_RGS="1 2" \
+scripts/userspace-ha-validation.sh
 ```
 
-### 5.2 Verify XDP Program
+### 5.2 Verify Userspace Attachment
 
-After the liveness gate fires, each node should be running
-`xdp_main_prog` (not `xdp_userspace_prog`) on data interfaces.
+On userspace data interfaces, the userspace XDP shim/helper path must remain
+attached and the helper must be ready. A legacy `xdp_main_prog` attachment on a
+userspace data interface is a failure for active userspace validation unless
+the run is explicitly a legacy eBPF regression.
 
 ```bash
-# Node 0 -- check WAN interface
+# Node 0 -- example WAN interface
 sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- \
   ip link show ge-0-0-2 | grep prog"
-# Expected: prog/xdp id <N> ...
 
-# Node 1 -- check LAN interface
+# Node 1 -- example LAN interface
 sg incus-admin -c "incus exec loss:xpf-userspace-fw1 -- \
   ip link show ge-7-0-1 | grep prog"
-# Expected: prog/xdp id <N> ...
 ```
 
-Verify the program is the eBPF pipeline, not the XDP shim:
+Use CLI state, the script artifacts, and `monitor interface <fabric-parent>` to
+confirm:
+
+- userspace forwarding is supported
+- active RGs are enabled
+- forwarding is armed where expected
+- ready bindings are non-zero
+- old-owner stale-MAC traffic redirects across fabric instead of egressing the
+  standby WAN
+
+### 5.3 Hardened RG Move Under Load
+
+Run the hardened failover validator:
 
 ```bash
-sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- \
-  bpftool prog show | grep -A1 'xdp_main_prog'"
+BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env \
+IPERF_TARGET=172.16.80.200 \
+TOTAL_CYCLES=3 CYCLE_INTERVAL=10 \
+scripts/userspace-ha-failover-validation.sh --duration 90 --parallel 4
 ```
 
-### 5.3 Basic Connectivity
+Pass/fail comes from the current script and the current runbooks, not from the
+historical manual thresholds in this file. The run must preserve IPv4 and IPv6
+reachability, avoid zero-throughput collapse, keep failover deltas within
+threshold, prove expected fabric TX on the old owner, and keep standby WAN TX
+flat during stale-owner fabric redirect checks.
 
-```bash
-# IPv4
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- \
-  ping -c 5 -W 2 172.16.80.200"
-
-# IPv6
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- \
-  ping6 -c 5 -W 2 2001:559:8585:80::200"
-```
-
-Both must succeed (allow 1 cold-start loss on IPv4).
-
-### 5.4 Throughput Baseline
-
-```bash
-# IPv4
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- \
-  iperf3 -c 172.16.80.200 -t 10 -P 4"
-
-# IPv6
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- \
-  iperf3 -c 2001:559:8585:80::200 -t 10 -P 4"
-```
-
-Expected: 20+ Gbps for both protocols when all RGs are on the same
-node. If throughput is significantly lower, check which XDP program is
-attached (section 5.2) and the ctrl map state (section 7.2).
-
-### 5.5 Failover Test (THE CRITICAL TEST)
-
-This is the primary acceptance gate. It tests that existing TCP sessions
-survive a per-RG failover and that new connections work immediately
-after.
-
-```bash
-# Step 1: Move all RGs to node 0
-for rg in 0 1 2; do
-  sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- \
-    /usr/local/sbin/cli -c \
-    'request chassis cluster failover redundancy-group $rg node 0'"
-  sleep 1
-done
-sleep 5
-
-# Step 2: Verify cluster state
-sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- \
-  /usr/local/sbin/cli -c 'show chassis cluster status'"
-# All three RGs should show node0 as primary
-
-# Step 3: Start iperf3 in background (25-second run)
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- \
-  bash -c 'iperf3 -c 2001:559:8585:80::200 -t 25 -P 4 2>&1'" &
-PID=$!
-
-# Step 4: Wait for baseline to establish
-sleep 8
-
-# Step 5: Failover RG2 (LAN) to node 1
-sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- \
-  /usr/local/sbin/cli -c \
-  'request chassis cluster failover redundancy-group 2 node 1'"
-
-# Step 6: Wait for iperf3 to finish
-wait $PID
-
-# Step 7: Test new connections after split-RG
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- \
-  ping -c 5 -W 2 172.16.80.200"
-
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- \
-  ping6 -c 5 -W 2 2001:559:8585:80::200"
-```
-
-**Pass criteria:**
-
-| Criterion | Threshold |
-|-----------|-----------|
-| iperf3 drops to 0 Gbps | NEVER (hard fail) |
-| Transition dip duration | < 3 seconds |
-| Recovery throughput (fabric path) | > 8 Gbps |
-| New IPv4 connections (ping) | >= 4/5 |
-| New IPv6 connections (ping) | >= 4/5 |
-| IPv6 default route on host after failover | Present |
-
-### 5.6 Failover Test -- IPv4 Variant
-
-Same procedure as 5.5 but using IPv4 iperf3:
-
-```bash
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- \
-  bash -c 'iperf3 -c 172.16.80.200 -t 25 -P 4 2>&1'" &
-```
-
-Pass criteria are the same.
-
-### 5.7 Full Reset and Re-Verify
-
-After failover testing, reset all RGs to node 0 and verify clean
-recovery:
-
-```bash
-for rg in 0 1 2; do
-  sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- \
-    /usr/local/sbin/cli -c \
-    'request chassis cluster failover redundancy-group $rg node 0'"
-  sleep 1
-done
-sleep 5
-
-# Full connectivity check
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- \
-  ping -c 5 -W 2 172.16.80.200"
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- \
-  ping6 -c 5 -W 2 2001:559:8585:80::200"
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- \
-  iperf3 -c 172.16.80.200 -t 5 -P 4"
-```
-
-### 5.8 Standalone XSK Rebind Test
+### 5.4 Standalone XSK Rebind Test
 
 This is the standalone test used to bisect AF_XDP bugs independently
-of xpfd. Run directly on one of the firewall VMs.
+of xpfd. It is useful for driver/library regression investigation, not as the
+active HA acceptance gate. Run directly on one of the firewall VMs.
 
 ```bash
 # SSH into a firewall node
@@ -626,14 +584,18 @@ is suspected to fix or break XSK behavior:
 
 ---
 
-## 6. Known Limitations
+## 6. Historical Limitations
 
-### 6.1 XSK Liveness Swap Window
+These limitations describe the March 2026 investigation. They are not current
+userspace HA pass criteria.
 
-After deploy, the daemon takes 15-45 seconds to detect that XSK is
-broken and swap to `xdp_main_prog`. During this window, traffic goes
-through kernel fallback (`XDP_PASS`) at reduced throughput and without
-SNAT. The window consists of:
+### 6.1 Historical XSK Liveness Swap Window
+
+During the historical fallback design, the daemon took 15-45 seconds to detect
+that XSK was broken and swap to legacy `xdp_main_prog`. During this window,
+traffic went through kernel fallback (`XDP_PASS`) at reduced throughput and
+without SNAT. This legacy fallback is no longer an accepted result for active
+userspace HA validation. The historical window consisted of:
 
 1. Binding setup + NAPI prewarm: ~5-10s
 2. Liveness check period: up to 30s (configurable)
@@ -641,11 +603,11 @@ SNAT. The window consists of:
 
 ### 6.2 mlx5 Zero-Copy After Link DOWN/UP
 
-This is an upstream kernel/driver bug. The workaround (live MAC change
-via `IFF_LIVE_ADDR_CHANGE`) avoids triggering it during normal
-operation. If a future event forces a link cycle (e.g., driver reload,
-PCI reset), the XSK liveness gate will detect it and auto-swap to the
-eBPF pipeline.
+This is an upstream kernel/driver bug. The workaround (live MAC change via
+`IFF_LIVE_ADDR_CHANGE`) avoids triggering it during normal operation. If a
+future event forces a link cycle (e.g., driver reload, PCI reset), active
+userspace validation should catch the resulting helper/binding failure. Do not
+treat a legacy eBPF fallback as userspace success.
 
 ### 6.3 libxdp Dynamic Linking
 
@@ -663,10 +625,10 @@ to the fabric architecture, not a bug.
 
 ### 6.5 aya-ebpf Tail-Call Bug
 
-The XDP shim's `fallback_to_main()` tail-call silently fails in
-aya-ebpf. This is worked around by the XSK liveness gate (which
-replaces the shim entirely), but the root cause in aya-ebpf has not
-been fixed upstream.
+The XDP shim's `fallback_to_main()` tail-call silently failed in aya-ebpf
+during this investigation. The historical workaround replaced the shim
+entirely, but that is legacy fallback behavior and not a current userspace HA
+success condition.
 
 ---
 
@@ -674,16 +636,16 @@ been fixed upstream.
 
 ### 7.1 XDP Program Attached
 
-Check which XDP program is attached to each data interface:
+Check which XDP program is attached to each data interface. For active
+userspace HA validation, the userspace shim/helper path is expected. A legacy
+`xdp_main_prog` attachment is historical fallback or legacy-regression evidence,
+not userspace success.
 
 ```bash
 # On firewall VM
 ip link show ge-0-0-2 | grep prog
 # or
 bpftool net list
-
-# Expected after liveness swap:
-#   xdp_main_prog (not xdp_userspace_prog)
 ```
 
 List all loaded XDP programs:
@@ -848,7 +810,7 @@ When a kernel update claims to fix mlx5 XSK zero-copy reinit:
 
 ---
 
-## 9. Commit Dependency Graph
+## 9. Historical Commit Dependency Graph
 
 The fixes have the following logical dependencies (commits higher in
 the graph must be applied before commits lower):
@@ -883,20 +845,29 @@ e83d4d3a  (XSK liveness gate -- defense-in-depth for 3.2+3.3+3.5)
 
 ---
 
-## 10. Validation Checklist
+## 10. Current Userspace Validation Checklist
 
-Use this checklist after each deploy to confirm all fixes are working:
+Use the maintained checklist in [failover-testing.md](failover-testing.md) and
+[userspace-fabric-failover.md](userspace-fabric-failover.md) for active runs.
+The short checklist below exists only to prevent the historical fallback in
+this archive from being mistaken for current success:
 
-- [ ] `xdp_main_prog` attached on both nodes (not `xdp_userspace_prog`)
-- [ ] `ctrl.enabled` map shows 0 (ctrl disabled is expected after liveness swap)
-- [ ] IPv4 ping to `172.16.80.200`: >= 4/5
-- [ ] IPv6 ping to `2001:559:8585:80::200`: 5/5
-- [ ] IPv6 default route present on `cluster-userspace-host`
-- [ ] IPv4 iperf3 baseline: > 15 Gbps
-- [ ] IPv6 iperf3 baseline: > 15 Gbps
-- [ ] Failover test: zero seconds at 0 Gbps
-- [ ] Failover test: transition dip < 3 seconds
-- [ ] Post-failover new IPv4 connections: >= 4/5
-- [ ] Post-failover new IPv6 connections: >= 4/5
-- [ ] No `EADDRNOTAVAIL` WARN spam in journal
-- [ ] `show chassis cluster status` shows expected RG ownership
+- [ ] `scripts/userspace-ha-validation.sh` passes before failover testing.
+- [ ] `scripts/userspace-ha-failover-validation.sh` passes RG move and
+      failback under load.
+- [ ] The userspace shim/helper path remains attached on userspace data
+      interfaces; legacy `xdp_main_prog` attachment is historical fallback or
+      legacy eBPF regression evidence only.
+- [ ] Active RGs show userspace forwarding enabled and ready bindings
+      non-zero.
+- [ ] Standby helpers stay armed where stale-owner fabric redirect is expected.
+- [ ] IPv4 and IPv6 external reachability pass before, during, and after
+      failover phases.
+- [ ] Throughput has no zero-collapse interval.
+- [ ] Old-owner fabric TX deltas are positive when stale-MAC traffic should
+      cross fabric.
+- [ ] Standby WAN TX deltas stay flat during stale-owner fabric redirect.
+- [ ] Session, neighbor, route, and policy deltas stay within the current
+      validator thresholds.
+- [ ] `show chassis cluster status` shows expected RG ownership after each
+      phase.
