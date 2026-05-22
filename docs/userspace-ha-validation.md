@@ -123,7 +123,8 @@ The validator does this in order:
 
 1. uses the tracked env/config in the repo, not `/tmp`
 2. waits for CLI availability on both firewalls
-3. checks whether the runtime settled into supported userspace forwarding or legacy fallback
+3. fails unless the runtime settled into supported userspace forwarding; legacy
+   eBPF fallback requires explicit `ALLOW_LEGACY_EBPF_HA_VALIDATION=1`
 4. pins the validation RGs to the preferred node, retrying transient failover
    precondition failures while userspace XSK liveness propagates into RG
    readiness
@@ -148,12 +149,14 @@ The validator does this in order:
 16. retries one marginal near-threshold miss once
 17. optionally records `perf` data on the active firewall
 
-The dedicated RG failover validator now adds two stricter HA gates:
+The dedicated RG failover validator now adds stricter HA gates:
 
 1. a steady-state pre-failover observation window after session sync completes
 2. `0.00 bits/sec` enforcement during that window for both:
    - aggregate `[SUM]` output
    - individual `iperf3` streams
+3. standby userspace readiness checks after each RG move
+4. flat standby WAN TX deltas during stale-owner fabric redirect checks
 
 For standard HA failover stress on `loss`, use:
 
@@ -194,10 +197,11 @@ That is the target, not a guarantee of the current tree state.
 Current `master` reality:
 
 - the isolated HA lab is used for both active userspace-forwarding work and
-  safe fallback verification, depending on the active config and runtime gate
-- the validator must therefore first determine whether the node settled into:
-  - active userspace forwarding, or
-  - legacy eBPF fallback
+  explicit legacy regression coverage, depending on the active config and
+  runtime gate
+- the userspace validator fails by default if the node settled into legacy eBPF
+  fallback; set `ALLOW_LEGACY_EBPF_HA_VALIDATION=1` only for a deliberately
+  scoped legacy regression run
 - the tree is still under active forwarding-correctness and performance work on
   the AF_XDP fast path
 - it is normal for the validator to fail while a phase is in progress

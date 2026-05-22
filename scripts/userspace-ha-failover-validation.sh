@@ -24,8 +24,6 @@ if [[ -z "${IPERF_DURATION:-}" ]]; then
 	else
 		IPERF_DURATION=60
 	fi
-else
-	IPERF_DURATION="${IPERF_DURATION}"
 fi
 IPERF_STREAMS="${IPERF_STREAMS:-4}"
 MIN_SESSIONS="${MIN_SESSIONS:-4}"
@@ -54,6 +52,8 @@ MAX_TRANSITION_DIRECT_TX_NOFRAME_DELTA="${MAX_TRANSITION_DIRECT_TX_NOFRAME_DELTA
 TRANSITION_PATH_TRIGGER_PKTS="${TRANSITION_PATH_TRIGGER_PKTS:-1000}"
 MIN_TRANSITION_FABRIC_RX_DELTA="${MIN_TRANSITION_FABRIC_RX_DELTA:-32}"
 MIN_TRANSITION_WAN_TX_DELTA="${MIN_TRANSITION_WAN_TX_DELTA:-32}"
+MAX_STANDBY_WAN_TX_DELTA="${MAX_STANDBY_WAN_TX_DELTA:-0}"
+STANDBY_WAN_IFACE_REGEX="${STANDBY_WAN_IFACE_REGEX:-ge-[0-9]+-0-2}"
 RESTORE_SOURCE_NODE="${RESTORE_SOURCE_NODE:-1}"
 ALLOW_STALE_SESSIONS="${ALLOW_STALE_SESSIONS:-0}"
 IPERF_COMPLETION_GRACE_SEC="${IPERF_COMPLETION_GRACE_SEC:-2}"
@@ -213,15 +213,33 @@ enabled_userspace_rg_vm() {
 
 wait_for_userspace_rg_owner() {
 	local rg="$1"
+	local expected_vm="${2:-}"
 	local tries=45
 	while (( tries > 0 )); do
-		local owner_vm
+		local active=()
+		local owner_vm stats query_failed=0
 		for owner_vm in "$FW0" "$FW1"; do
-			if enabled_userspace_rg_vm "$owner_vm" "$rg" >/dev/null 2>&1; then
-				printf '%s\n' "$owner_vm"
-				return 0
+			if ! stats="$(run_vm "$owner_vm" 'cli -c "show chassis cluster data-plane statistics"' 2>/dev/null)"; then
+				query_failed=1
+				continue
+			fi
+			if grep -Eq 'Enabled:[[:space:]]+true' <<<"$stats" &&
+				grep -Eq 'Forwarding supported:[[:space:]]+true' <<<"$stats" &&
+				grep -Eq "rg${rg} active=true" <<<"$stats" &&
+				grep -Eq 'Ready bindings:[[:space:]]+[1-9][0-9]*/[0-9]+' <<<"$stats"; then
+				active+=("$owner_vm")
 			fi
 		done
+		if (( ${#active[@]} > 1 )); then
+			printf 'split-brain userspace RG%s owners: %s\n' "$rg" "${active[*]}" >&2
+			return 2
+		fi
+		if (( query_failed == 0 && ${#active[@]} == 1 )); then
+			if [[ -z "$expected_vm" || "${active[0]}" == "$expected_vm" ]]; then
+				printf '%s\n' "${active[0]}"
+				return 0
+			fi
+		fi
 		sleep 1
 		tries=$((tries - 1))
 	done
@@ -230,17 +248,28 @@ wait_for_userspace_rg_owner() {
 
 arm_userspace_runtime() {
 	local owner_vm
+	local settle_status
 	owner_vm="$(vm_for_node "$SOURCE_NODE")"
 	info "waiting for userspace forwarding on RG${RG}"
 	if ACTIVE_FW="$(wait_for_userspace_rg_owner "$RG")"; then
 		info "active RG${RG} userspace firewall: ${ACTIVE_FW}"
 		return 0
+	else
+		settle_status=$?
+		if (( settle_status == 2 )); then
+			die "userspace forwarding for RG${RG} is split-brain; refusing to arm"
+		fi
 	fi
 	info "forcing userspace arm on ${owner_vm}"
 	run_vm "$owner_vm" 'cli -c "request chassis cluster data-plane userspace forwarding arm" >/tmp/userspace-arm.out'
 	if ACTIVE_FW="$(wait_for_userspace_rg_owner "$RG")"; then
 		info "active RG${RG} userspace firewall: ${ACTIVE_FW}"
 		return 0
+	else
+		settle_status=$?
+		if (( settle_status == 2 )); then
+			die "userspace forwarding for RG${RG} is split-brain after arm request"
+		fi
 	fi
 	die "userspace forwarding did not become active for RG${RG}"
 }
@@ -316,9 +345,8 @@ import sys
 path = pathlib.Path(sys.argv[1])
 label = sys.argv[2]
 if not path.exists():
-    print(f"WARN: status_summary_value: '{path}' missing", file=sys.stderr)
-    print("__ERR__")
-    raise SystemExit(0)
+    print(f"status summary snapshot missing: {path}", file=sys.stderr)
+    raise SystemExit(2)
 
 pattern = f"  {label}:"
 for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -328,13 +356,35 @@ for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
     if match:
         print(match.group(1))
     else:
-        print(f"WARN: status_summary_value: unparseable value for '{label}' in '{path}'", file=sys.stderr)
-        print("__ERR__")
+        print(f"unparseable status summary value for {label!r} in {path}", file=sys.stderr)
+        raise SystemExit(2)
     break
 else:
-    print(f"WARN: status_summary_value: label '{label}' not found in '{path}'", file=sys.stderr)
-    print("__ERR__")
+    print(f"status summary label {label!r} not found in {path}", file=sys.stderr)
+    raise SystemExit(2)
 PY
+}
+
+status_summary_delta() {
+	local post_path="$1"
+	local pre_path="$2"
+	local label="$3"
+	local context="$4"
+	local pre post delta
+
+	if ! pre="$(status_summary_value "$pre_path" "$label")"; then
+		fail "${context}: unable to read pre ${label}"
+		return 1
+	fi
+	if ! post="$(status_summary_value "$post_path" "$label")"; then
+		fail "${context}: unable to read post ${label}"
+		return 1
+	fi
+	if ! delta="$(nondecreasing_counter_delta "$pre" "$post")"; then
+		fail "${context}: ${label} counter decreased from ${pre} to ${post}"
+		return 1
+	fi
+	printf '%s\n' "$delta"
 }
 
 sync_stats_value() {
@@ -404,8 +454,12 @@ wait_for_session_sync_idle() {
 		local source_sent target_recv target_pending target_drained
 		source_sent="$(sync_stats_value "$source_path" "Session create" sent)"
 		target_recv="$(sync_stats_value "$target_path" "Session create" received)"
-		target_pending="$(status_summary_value "$target_path" "Session delta pending")"
-		target_drained="$(status_summary_value "$target_path" "Session delta drained")"
+		if ! target_pending="$(status_summary_value "$target_path" "Session delta pending")"; then
+			target_pending="__ERR__"
+		fi
+		if ! target_drained="$(status_summary_value "$target_path" "Session delta drained")"; then
+			target_drained="__ERR__"
+		fi
 		if [[ "$source_sent" != "__ERR__" && "$target_recv" != "__ERR__" && "$target_pending" != "__ERR__" && "$target_drained" != "__ERR__" && "$source_sent" == "$target_recv" && "$target_pending" == "0" ]]; then
 			stable=$((stable + 1))
 			if (( stable >= stable_needed )); then
@@ -497,12 +551,15 @@ iface_regex = re.compile(sys.argv[2])
 direction = sys.argv[3]
 idx = 10 if direction == "rx" else 11
 if not path.exists():
-    print("0")
-    raise SystemExit(0)
+    print(f"missing interface snapshot: {path}", file=sys.stderr)
+    raise SystemExit(2)
 
 in_bindings = False
 skip_header = False
 total = 0
+matched = False
+bindings_rows = 0
+malformed_rows = 0
 for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
     stripped = raw_line.strip()
     if stripped == "Userspace bindings:":
@@ -518,16 +575,62 @@ for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         continue
     parts = stripped.split()
     if len(parts) < 20:
+        malformed_rows += 1
         continue
+    bindings_rows += 1
     iface = parts[19]
     if not iface_regex.fullmatch(iface):
         continue
+    matched = True
     try:
         total += int(parts[idx])
     except ValueError:
-        pass
+        print(f"invalid {direction} counter for {iface} in {path}", file=sys.stderr)
+        raise SystemExit(2)
+
+if not in_bindings:
+    print(f"userspace bindings section not found in {path}", file=sys.stderr)
+    raise SystemExit(2)
+elif not matched:
+    if bindings_rows == 0:
+        if malformed_rows > 0:
+            print(
+                f"userspace bindings rows malformed in {path} "
+                f"({malformed_rows} short rows)",
+                file=sys.stderr,
+            )
+        else:
+            print(f"userspace bindings section empty in {path}", file=sys.stderr)
+    else:
+        detail = ""
+        if malformed_rows > 0:
+            detail = f" ({malformed_rows} malformed rows ignored)"
+        print(
+            f"no interfaces matching /{iface_regex.pattern}/ in {path}{detail}",
+            file=sys.stderr,
+        )
+    raise SystemExit(2)
 
 print(total)
+PY
+}
+
+nondecreasing_counter_delta() {
+	local baseline="$1"
+	local post="$2"
+	python3 - "$baseline" "$post" <<'PY'
+import sys
+
+try:
+    baseline = int(sys.argv[1])
+    post = int(sys.argv[2])
+except ValueError:
+    print(f"invalid counter values: {sys.argv[1]!r} {sys.argv[2]!r}", file=sys.stderr)
+    raise SystemExit(2)
+if post < baseline:
+    print(f"{baseline} {post}", file=sys.stderr)
+    raise SystemExit(2)
+print(post - baseline)
 PY
 }
 
@@ -559,8 +662,9 @@ validate_phase_fabric_path() {
 	local to_vm="$5"
 	local to_name="$6"
 	local from_pre from_post to_pre to_post
-	local from_if_pre from_if_post
+	local from_if_baseline from_if_post
 	local from_fabric_pre from_fabric_post from_fabric_delta
+	local from_wan_tx_base from_wan_tx_post from_wan_tx_delta
 	local from_session_delta to_session_delta session_delta
 	local from_neighbor_delta to_neighbor_delta neighbor_delta
 	local from_route_delta to_route_delta route_delta
@@ -571,14 +675,37 @@ validate_phase_fabric_path() {
 	from_post="$(cycle_stats_path "$cycle" "${phase}-post" "$from_vm")"
 	to_pre="$(cycle_stats_path "$cycle" "${phase}-pre" "$to_vm")"
 	to_post="$(cycle_stats_path "$cycle" "${phase}-post" "$to_vm")"
-	from_if_pre="$(cycle_interfaces_path "$cycle" "${phase}-pre" "$from_vm")"
+	from_if_baseline="$(cycle_interfaces_path "$cycle" "$phase" "$from_vm")"
 	from_if_post="$(cycle_interfaces_path "$cycle" "${phase}-post" "$from_vm")"
 
-	from_fabric_pre="$(status_fabric_tx_packets "$from_if_pre")"
+	from_fabric_pre="$(status_fabric_tx_packets "$from_if_baseline")"
 	from_fabric_post="$(status_fabric_tx_packets "$from_if_post")"
 	from_fabric_delta=$(( from_fabric_post - from_fabric_pre ))
-	from_session_delta=$(( $(status_summary_value "$from_post" "Session misses") - $(status_summary_value "$from_pre" "Session misses") ))
-	to_session_delta=$(( $(status_summary_value "$to_post" "Session misses") - $(status_summary_value "$to_pre" "Session misses") ))
+	if ! from_wan_tx_base="$(interface_packets_value "$from_if_baseline" "$STANDBY_WAN_IFACE_REGEX" tx)"; then
+		fail "cycle ${cycle} ${phase}: unable to read standby ${from_name} WAN TX post-failover baseline counters"
+		return
+	fi
+	if ! from_wan_tx_post="$(interface_packets_value "$from_if_post" "$STANDBY_WAN_IFACE_REGEX" tx)"; then
+		fail "cycle ${cycle} ${phase}: unable to read standby ${from_name} WAN TX post-validation counters"
+		return
+	fi
+	if ! from_wan_tx_delta="$(nondecreasing_counter_delta "$from_wan_tx_base" "$from_wan_tx_post")"; then
+		fail "cycle ${cycle} ${phase}: standby ${from_name} WAN TX counter decreased" \
+			"from ${from_wan_tx_base} to ${from_wan_tx_post}; failing closed"
+		return
+	fi
+	from_session_delta="$(
+		status_summary_delta "$from_post" "$from_pre" "Session misses" \
+			"cycle ${cycle} ${phase}: ${from_name}"
+	)" || {
+		return
+	}
+	to_session_delta="$(
+		status_summary_delta "$to_post" "$to_pre" "Session misses" \
+			"cycle ${cycle} ${phase}: ${to_name}"
+	)" || {
+		return
+	}
 	session_delta=$(( from_session_delta + to_session_delta ))
 	if (( session_delta <= MAX_FAILOVER_SESSION_MISS_DELTA )); then
 		pass "cycle ${cycle} ${phase}: session miss delta ${session_delta} (source=${from_session_delta} target=${to_session_delta})"
@@ -586,8 +713,18 @@ validate_phase_fabric_path() {
 		fail "cycle ${cycle} ${phase}: session miss delta ${session_delta} (source=${from_session_delta} target=${to_session_delta}) exceeds ${MAX_FAILOVER_SESSION_MISS_DELTA}"
 	fi
 
-	from_neighbor_delta=$(( $(status_summary_value "$from_post" "Neighbor misses") - $(status_summary_value "$from_pre" "Neighbor misses") ))
-	to_neighbor_delta=$(( $(status_summary_value "$to_post" "Neighbor misses") - $(status_summary_value "$to_pre" "Neighbor misses") ))
+	from_neighbor_delta="$(
+		status_summary_delta "$from_post" "$from_pre" "Neighbor misses" \
+			"cycle ${cycle} ${phase}: ${from_name}"
+	)" || {
+		return
+	}
+	to_neighbor_delta="$(
+		status_summary_delta "$to_post" "$to_pre" "Neighbor misses" \
+			"cycle ${cycle} ${phase}: ${to_name}"
+	)" || {
+		return
+	}
 	neighbor_delta=$(( from_neighbor_delta + to_neighbor_delta ))
 	if (( neighbor_delta <= MAX_FAILOVER_NEIGHBOR_MISS_DELTA )); then
 		pass "cycle ${cycle} ${phase}: neighbor miss delta ${neighbor_delta} (source=${from_neighbor_delta} target=${to_neighbor_delta})"
@@ -595,8 +732,18 @@ validate_phase_fabric_path() {
 		fail "cycle ${cycle} ${phase}: neighbor miss delta ${neighbor_delta} (source=${from_neighbor_delta} target=${to_neighbor_delta}) exceeds ${MAX_FAILOVER_NEIGHBOR_MISS_DELTA}"
 	fi
 
-	from_route_delta=$(( $(status_summary_value "$from_post" "Route misses") - $(status_summary_value "$from_pre" "Route misses") ))
-	to_route_delta=$(( $(status_summary_value "$to_post" "Route misses") - $(status_summary_value "$to_pre" "Route misses") ))
+	from_route_delta="$(
+		status_summary_delta "$from_post" "$from_pre" "Route misses" \
+			"cycle ${cycle} ${phase}: ${from_name}"
+	)" || {
+		return
+	}
+	to_route_delta="$(
+		status_summary_delta "$to_post" "$to_pre" "Route misses" \
+			"cycle ${cycle} ${phase}: ${to_name}"
+	)" || {
+		return
+	}
 	route_delta=$(( from_route_delta + to_route_delta ))
 	if (( route_delta <= MAX_FAILOVER_ROUTE_MISS_DELTA )); then
 		pass "cycle ${cycle} ${phase}: route miss delta ${route_delta} (source=${from_route_delta} target=${to_route_delta})"
@@ -604,8 +751,18 @@ validate_phase_fabric_path() {
 		fail "cycle ${cycle} ${phase}: route miss delta ${route_delta} (source=${from_route_delta} target=${to_route_delta}) exceeds ${MAX_FAILOVER_ROUTE_MISS_DELTA}"
 	fi
 
-	from_policy_delta=$(( $(status_summary_value "$from_post" "Policy denied packets") - $(status_summary_value "$from_pre" "Policy denied packets") ))
-	to_policy_delta=$(( $(status_summary_value "$to_post" "Policy denied packets") - $(status_summary_value "$to_pre" "Policy denied packets") ))
+	from_policy_delta="$(
+		status_summary_delta "$from_post" "$from_pre" "Policy denied packets" \
+			"cycle ${cycle} ${phase}: ${from_name}"
+	)" || {
+		return
+	}
+	to_policy_delta="$(
+		status_summary_delta "$to_post" "$to_pre" "Policy denied packets" \
+			"cycle ${cycle} ${phase}: ${to_name}"
+	)" || {
+		return
+	}
 	policy_delta=$(( from_policy_delta + to_policy_delta ))
 	if (( policy_delta <= MAX_FAILOVER_POLICY_DENIED_DELTA )); then
 		pass "cycle ${cycle} ${phase}: policy denied delta ${policy_delta} (source=${from_policy_delta} target=${to_policy_delta})"
@@ -633,22 +790,41 @@ validate_phase_fabric_path() {
 			fail "cycle ${cycle} ${phase}: standby ${from_name} lost userspace readiness"
 		fi
 	fi
+
+	if (( from_wan_tx_delta <= MAX_STANDBY_WAN_TX_DELTA )); then
+		pass "cycle ${cycle} ${phase}: standby ${from_name} WAN TX delta ${from_wan_tx_delta}"
+	else
+		fail "cycle ${cycle} ${phase}: standby ${from_name} WAN TX delta" \
+			"${from_wan_tx_delta} exceeds ${MAX_STANDBY_WAN_TX_DELTA}"
+	fi
 }
 
 capture_transition_window() {
 	local cycle="$1"
 	local phase="$2"
 	local seconds="$3"
-	local sample
+	local sample stats_path interfaces_path
 	for (( sample = 1; sample <= seconds; sample++ )); do
 		if ! cycle_sleep 1 0; then
 			fail "cycle ${cycle} ${phase}: iperf3 exited during transition sample ${sample}/${seconds}"
 			break
 		fi
-		run_vm "$FW0" 'cli -c "show chassis cluster data-plane statistics"' >"$(transition_stats_path "$cycle" "$phase" "$sample" "$FW0")" 2>&1 || true
-		run_vm "$FW1" 'cli -c "show chassis cluster data-plane statistics"' >"$(transition_stats_path "$cycle" "$phase" "$sample" "$FW1")" 2>&1 || true
-		run_vm "$FW0" 'cli -c "show chassis cluster data-plane interfaces"' >"$(transition_interfaces_path "$cycle" "$phase" "$sample" "$FW0")" 2>&1 || true
-		run_vm "$FW1" 'cli -c "show chassis cluster data-plane interfaces"' >"$(transition_interfaces_path "$cycle" "$phase" "$sample" "$FW1")" 2>&1 || true
+		stats_path="$(transition_stats_path "$cycle" "$phase" "$sample" "$FW0")"
+		if ! run_vm "$FW0" 'cli -c "show chassis cluster data-plane statistics"' >"$stats_path" 2>&1; then
+			fail "cycle ${cycle} ${phase}: failed to capture ${FW0} transition statistics sample ${sample}"
+		fi
+		stats_path="$(transition_stats_path "$cycle" "$phase" "$sample" "$FW1")"
+		if ! run_vm "$FW1" 'cli -c "show chassis cluster data-plane statistics"' >"$stats_path" 2>&1; then
+			fail "cycle ${cycle} ${phase}: failed to capture ${FW1} transition statistics sample ${sample}"
+		fi
+		interfaces_path="$(transition_interfaces_path "$cycle" "$phase" "$sample" "$FW0")"
+		if ! run_vm "$FW0" 'cli -c "show chassis cluster data-plane interfaces"' >"$interfaces_path" 2>&1; then
+			fail "cycle ${cycle} ${phase}: failed to capture ${FW0} transition interface sample ${sample}"
+		fi
+		interfaces_path="$(transition_interfaces_path "$cycle" "$phase" "$sample" "$FW1")"
+		if ! run_vm "$FW1" 'cli -c "show chassis cluster data-plane interfaces"' >"$interfaces_path" 2>&1; then
+			fail "cycle ${cycle} ${phase}: failed to capture ${FW1} transition interface sample ${sample}"
+		fi
 	done
 }
 
@@ -673,16 +849,22 @@ suffix = sys.argv[5]
 iface_regex = re.compile(sys.argv[6])
 direction = sys.argv[7]
 agg = sys.argv[8]
+if direction not in {"rx", "tx"}:
+    print(f"invalid packet direction: {direction}", file=sys.stderr)
+    raise SystemExit(2)
 idx = 10 if direction == "rx" else 11
 values = []
 
 for sample in range(1, seconds + 1):
     path = artifact_dir / f"cycle{cycle}-{phase}-watch{sample:02d}-{suffix}-dp-interfaces.txt"
     if not path.exists():
-        continue
+        print(f"missing transition interface snapshot: {path}", file=sys.stderr)
+        raise SystemExit(2)
     total = 0
     in_bindings = False
     skip_header = False
+    matched = False
+    bindings_rows = 0
     for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         stripped = raw_line.strip()
         if stripped == "Userspace bindings:":
@@ -696,20 +878,33 @@ for sample in range(1, seconds + 1):
         if skip_header:
             skip_header = False
             continue
+        bindings_rows += 1
         parts = stripped.split()
         if len(parts) < 20:
             continue
         iface = parts[19]
         if not iface_regex.fullmatch(iface):
             continue
+        matched = True
         try:
             total += int(parts[idx])
-        except ValueError:
-            pass
+        except (IndexError, ValueError):
+            print(f"invalid {direction} counter for {iface} in {path}", file=sys.stderr)
+            raise SystemExit(2)
+    if not in_bindings:
+        print(f"userspace bindings section not found in {path}", file=sys.stderr)
+        raise SystemExit(2)
+    if not matched:
+        if bindings_rows == 0:
+            print(f"userspace bindings section empty in {path}", file=sys.stderr)
+        else:
+            print(f"no interfaces matching /{iface_regex.pattern}/ in {path}", file=sys.stderr)
+        raise SystemExit(2)
     values.append(total)
 
 if not values:
-    print("0")
+    print("no transition interface samples collected", file=sys.stderr)
+    raise SystemExit(2)
 elif agg == "max":
     print(max(values))
 else:
@@ -741,17 +936,24 @@ values = []
 for sample in range(1, seconds + 1):
     path = artifact_dir / f"cycle{cycle}-{phase}-watch{sample:02d}-{suffix}-dp-stats.txt"
     if not path.exists():
-        continue
+        print(f"missing transition statistics snapshot: {path}", file=sys.stderr)
+        raise SystemExit(2)
+    found = False
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         if not line.startswith(pattern):
             continue
         match = re.search(r"(-?\d+)", line.split(":", 1)[1])
         if match:
             values.append(int(match.group(1)))
+            found = True
         break
+    if not found:
+        print(f"label {label!r} not found in {path}", file=sys.stderr)
+        raise SystemExit(2)
 
 if not values:
-    print("0")
+    print("no transition statistics samples collected", file=sys.stderr)
+    raise SystemExit(2)
 elif agg == "max":
     print(max(values))
 else:
@@ -770,10 +972,12 @@ validate_transition_window() {
 	local from_pre to_pre
 	local from_if_pre to_if_pre
 	local to_kernel_rx_dropped_max from_no_frame_max
+	local to_kernel_rx_dropped_pre from_no_frame_pre
 	local to_kernel_rx_dropped_delta from_no_frame_delta
 	local from_pending_local_max to_pending_local_max
 	local from_outstanding_max to_outstanding_max
 	local from_lan_rx_max from_fabric_tx_max to_fabric_rx_max to_wan_tx_max
+	local from_lan_rx_pre from_fabric_tx_pre to_fabric_rx_pre to_wan_tx_pre
 	local from_lan_rx_delta from_fabric_tx_delta to_fabric_rx_delta to_wan_tx_delta
 
 	from_pre="$(cycle_stats_path "$cycle" "${phase}-pre" "$from_vm")"
@@ -781,31 +985,111 @@ validate_transition_window() {
 	from_if_pre="$(cycle_interfaces_path "$cycle" "${phase}-pre" "$from_vm")"
 	to_if_pre="$(cycle_interfaces_path "$cycle" "${phase}-pre" "$to_vm")"
 
-	to_kernel_rx_dropped_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$to_vm" "Kernel RX dropped" max)"
-	from_no_frame_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$from_vm" "Direct TX no-frame fb" max)"
-	from_pending_local_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$from_vm" "Pending TX local" max)"
-	to_pending_local_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$to_vm" "Pending TX local" max)"
-	from_outstanding_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$from_vm" "Outstanding TX" max)"
-	to_outstanding_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$to_vm" "Outstanding TX" max)"
-	from_lan_rx_max="$(sample_window_interface_packets "$cycle" "$phase" "$seconds" "$from_vm" 'ge-[0-9]+-0-1' rx max)"
-	from_fabric_tx_max="$(sample_window_interface_packets "$cycle" "$phase" "$seconds" "$from_vm" 'ge-[0-9]+-0-0' tx max)"
-	to_fabric_rx_max="$(sample_window_interface_packets "$cycle" "$phase" "$seconds" "$to_vm" 'ge-[0-9]+-0-0' rx max)"
-	to_wan_tx_max="$(sample_window_interface_packets "$cycle" "$phase" "$seconds" "$to_vm" 'ge-[0-9]+-0-2' tx max)"
+	to_kernel_rx_dropped_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$to_vm" "Kernel RX dropped" max)" || {
+		fail "cycle ${cycle} ${phase}: unable to read ${to_name} transition kernel RX drop samples"
+		return
+	}
+	from_no_frame_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$from_vm" "Direct TX no-frame fb" max)" || {
+		fail "cycle ${cycle} ${phase}: unable to read ${from_name} transition direct no-frame samples"
+		return
+	}
+	from_pending_local_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$from_vm" "Pending TX local" max)" || {
+		fail "cycle ${cycle} ${phase}: unable to read ${from_name} pending-local transition samples"
+		return
+	}
+	to_pending_local_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$to_vm" "Pending TX local" max)" || {
+		fail "cycle ${cycle} ${phase}: unable to read ${to_name} pending-local transition samples"
+		return
+	}
+	from_outstanding_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$from_vm" "Outstanding TX" max)" || {
+		fail "cycle ${cycle} ${phase}: unable to read ${from_name} outstanding-TX transition samples"
+		return
+	}
+	to_outstanding_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$to_vm" "Outstanding TX" max)" || {
+		fail "cycle ${cycle} ${phase}: unable to read ${to_name} outstanding-TX transition samples"
+		return
+	}
+	from_lan_rx_max="$(
+		sample_window_interface_packets "$cycle" "$phase" "$seconds" "$from_vm" \
+			'ge-[0-9]+-0-1' rx max
+	)" || {
+		fail "cycle ${cycle} ${phase}: unable to read ${from_name} LAN RX transition samples"
+		return
+	}
+	from_fabric_tx_max="$(
+		sample_window_interface_packets "$cycle" "$phase" "$seconds" "$from_vm" \
+			'ge-[0-9]+-0-0' tx max
+	)" || {
+		fail "cycle ${cycle} ${phase}: unable to read ${from_name} fabric TX transition samples"
+		return
+	}
+	to_fabric_rx_max="$(sample_window_interface_packets "$cycle" "$phase" "$seconds" "$to_vm" 'ge-[0-9]+-0-0' rx max)" || {
+		fail "cycle ${cycle} ${phase}: unable to read ${to_name} fabric RX transition samples"
+		return
+	}
+	to_wan_tx_max="$(sample_window_interface_packets "$cycle" "$phase" "$seconds" "$to_vm" 'ge-[0-9]+-0-2' tx max)" || {
+		fail "cycle ${cycle} ${phase}: unable to read ${to_name} WAN TX transition samples"
+		return
+	}
 
-	# Clamp deltas at 0: counter resets (helper restart/rebind) can produce
-	# negative values that silently pass the threshold checks.
-	to_kernel_rx_dropped_delta=$(( to_kernel_rx_dropped_max - $(status_summary_value "$to_pre" "Kernel RX dropped") ))
-	(( to_kernel_rx_dropped_delta < 0 )) && to_kernel_rx_dropped_delta=0
-	from_no_frame_delta=$(( from_no_frame_max - $(status_summary_value "$from_pre" "Direct TX no-frame fb") ))
-	(( from_no_frame_delta < 0 )) && from_no_frame_delta=0
-	from_lan_rx_delta=$(( from_lan_rx_max - $(interface_packets_value "$from_if_pre" 'ge-[0-9]+-0-1' rx) ))
-	(( from_lan_rx_delta < 0 )) && from_lan_rx_delta=0
-	from_fabric_tx_delta=$(( from_fabric_tx_max - $(interface_packets_value "$from_if_pre" 'ge-[0-9]+-0-0' tx) ))
-	(( from_fabric_tx_delta < 0 )) && from_fabric_tx_delta=0
-	to_fabric_rx_delta=$(( to_fabric_rx_max - $(interface_packets_value "$to_if_pre" 'ge-[0-9]+-0-0' rx) ))
-	(( to_fabric_rx_delta < 0 )) && to_fabric_rx_delta=0
-	to_wan_tx_delta=$(( to_wan_tx_max - $(interface_packets_value "$to_if_pre" 'ge-[0-9]+-0-2' tx) ))
-	(( to_wan_tx_delta < 0 )) && to_wan_tx_delta=0
+	to_kernel_rx_dropped_pre="$(status_summary_value "$to_pre" "Kernel RX dropped")" || {
+		fail "cycle ${cycle} ${phase}: unable to read ${to_name} pre-transition kernel RX drop baseline"
+		return
+	}
+	from_no_frame_pre="$(status_summary_value "$from_pre" "Direct TX no-frame fb")" || {
+		fail "cycle ${cycle} ${phase}: unable to read ${from_name} pre-transition direct no-frame baseline"
+		return
+	}
+	from_lan_rx_pre="$(interface_packets_value "$from_if_pre" 'ge-[0-9]+-0-1' rx)" || {
+		fail "cycle ${cycle} ${phase}: unable to read ${from_name} pre-transition LAN RX baseline"
+		return
+	}
+	from_fabric_tx_pre="$(interface_packets_value "$from_if_pre" 'ge-[0-9]+-0-0' tx)" || {
+		fail "cycle ${cycle} ${phase}: unable to read ${from_name} pre-transition fabric TX baseline"
+		return
+	}
+	to_fabric_rx_pre="$(interface_packets_value "$to_if_pre" 'ge-[0-9]+-0-0' rx)" || {
+		fail "cycle ${cycle} ${phase}: unable to read ${to_name} pre-transition fabric RX baseline"
+		return
+	}
+	to_wan_tx_pre="$(interface_packets_value "$to_if_pre" 'ge-[0-9]+-0-2' tx)" || {
+		fail "cycle ${cycle} ${phase}: unable to read ${to_name} pre-transition WAN TX baseline"
+		return
+	}
+
+	to_kernel_rx_dropped_delta="$(
+		nondecreasing_counter_delta "$to_kernel_rx_dropped_pre" \
+			"$to_kernel_rx_dropped_max"
+	)" || {
+		fail "cycle ${cycle} ${phase}: ${to_name} transition kernel RX dropped counter decreased" \
+			"from ${to_kernel_rx_dropped_pre} to ${to_kernel_rx_dropped_max}; failing closed"
+		return
+	}
+	from_no_frame_delta="$(nondecreasing_counter_delta "$from_no_frame_pre" "$from_no_frame_max")" || {
+		fail "cycle ${cycle} ${phase}: ${from_name} transition direct no-frame counter decreased" \
+			"from ${from_no_frame_pre} to ${from_no_frame_max}; failing closed"
+		return
+	}
+	from_lan_rx_delta="$(nondecreasing_counter_delta "$from_lan_rx_pre" "$from_lan_rx_max")" || {
+		fail "cycle ${cycle} ${phase}: ${from_name} transition LAN RX counter decreased" \
+			"from ${from_lan_rx_pre} to ${from_lan_rx_max}; failing closed"
+		return
+	}
+	from_fabric_tx_delta="$(nondecreasing_counter_delta "$from_fabric_tx_pre" "$from_fabric_tx_max")" || {
+		fail "cycle ${cycle} ${phase}: ${from_name} transition fabric TX counter decreased" \
+			"from ${from_fabric_tx_pre} to ${from_fabric_tx_max}; failing closed"
+		return
+	}
+	to_fabric_rx_delta="$(nondecreasing_counter_delta "$to_fabric_rx_pre" "$to_fabric_rx_max")" || {
+		fail "cycle ${cycle} ${phase}: ${to_name} transition fabric RX counter decreased" \
+			"from ${to_fabric_rx_pre} to ${to_fabric_rx_max}; failing closed"
+		return
+	}
+	to_wan_tx_delta="$(nondecreasing_counter_delta "$to_wan_tx_pre" "$to_wan_tx_max")" || {
+		fail "cycle ${cycle} ${phase}: ${to_name} transition WAN TX counter decreased" \
+			"from ${to_wan_tx_pre} to ${to_wan_tx_max}; failing closed"
+		return
+	}
 
 	if (( to_kernel_rx_dropped_delta <= MAX_TRANSITION_KERNEL_RX_DROPPED_DELTA )); then
 		pass "cycle ${cycle} ${phase}: ${to_name} transition kernel RX dropped delta ${to_kernel_rx_dropped_delta}"
@@ -1273,7 +1557,9 @@ run_failover_phase() {
 	run_vm "$from_vm" "cli -c \"request chassis cluster failover redundancy-group ${RG} node ${to_node}\" >/tmp/userspace-rg${RG}-${phase}-cycle${cycle}.out"
 	wait_for_rg_owner "$RG" "$to_node" "$FAILOVER_WAIT" || die "RG${RG} did not move to ${to_name} during cycle ${cycle} ${phase}"
 	pass "cycle ${cycle} ${phase}: RG${RG} moved to ${to_name}"
-	ACTIVE_FW="$(wait_for_userspace_rg_owner "$RG")" || die "userspace forwarding did not settle on ${to_name} during cycle ${cycle} ${phase}"
+	ACTIVE_FW="$(wait_for_userspace_rg_owner "$RG" "$to_vm")" ||
+		die "userspace forwarding did not settle on ${to_name}" \
+			"during cycle ${cycle} ${phase}"
 	pass "cycle ${cycle} ${phase}: userspace forwarding active on ${ACTIVE_FW}"
 	capture_cycle_state "$cycle" "$phase"
 	validate_target_connectivity "cycle ${cycle} ${phase}"

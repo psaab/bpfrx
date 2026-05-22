@@ -1,5 +1,103 @@
 # Action Log
 
+## 2026-05-22
+
+- **Timestamp**: 2026-05-22T20:20:00Z
+  - **Action**: PR #1491 r6 review closeout — removed the remaining
+    supported-runtime `FW0` arm fallback, made supported-runtime owner
+    waits fail closed on ambiguous ownership, and converted status summary
+    counter reads from `__ERR__` sentinel math to explicit fail-closed
+    delta helpers.
+  - **File(s)**: `scripts/userspace-ha-validation.sh`,
+    `scripts/userspace-ha-failover-validation.sh`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-ha-failover-validation.sh`; `shellcheck
+    scripts/userspace-ha-validation.sh
+    scripts/userspace-ha-failover-validation.sh`; `git diff --check`
+
+- **Timestamp**: 2026-05-22T20:02:00Z
+  - **Action**: PR #1491 copilot follow-up — clarified unmatched-interface
+    parser failures to include the count of malformed binding rows that were
+    ignored, so diagnostics no longer imply a pure regex mismatch when row
+    shape is also broken.
+  - **File(s)**: `scripts/userspace-ha-failover-validation.sh`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-failover-validation.sh`;
+    `git diff --check`
+
+- **Timestamp**: 2026-05-22T19:55:00Z
+  - **Action**: PR #1491 copilot follow-up — tightened userspace binding
+    parser diagnostics so malformed short rows are tracked separately from
+    valid rows, avoiding misleading "no interface match" errors when the
+    binding table format is broken.
+  - **File(s)**: `scripts/userspace-ha-failover-validation.sh`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-failover-validation.sh`;
+    `git diff --check`
+
+- **Timestamp**: 2026-05-22T18:45:00Z
+  - **Action**: PR #1491 r4 closeout — made userspace RG owner
+    selection reject split-brain, require the post-failover owner to match
+    the requested target VM, keep owner selection ambiguous while either
+    peer cannot be queried, and make the startup arm path refuse split-brain
+    states. Removed the remaining transition-window sample `|| true`
+    masking and negative-delta clamps.
+  - **File(s)**: `scripts/userspace-ha-validation.sh`,
+    `scripts/userspace-ha-failover-validation.sh`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-ha-failover-validation.sh`; `git diff --check`
+
+- **Timestamp**: 2026-05-22T16:20:00Z
+  - **Action**: PR #1491 review cleanup — made the explicit legacy-HA
+    validation override require an unambiguous active firewall owner instead
+    of falling back to `FW0` when owner detection fails.
+  - **File(s)**: `scripts/userspace-ha-validation.sh`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-ha-failover-validation.sh`; `git diff --check`
+
+- **Timestamp**: 2026-05-22T16:00:00Z
+  - **Action**: PR #1491 review cleanup — normalized userspace bindings
+    parse error text casing to match the CLI section header terminology.
+  - **File(s)**: `scripts/userspace-ha-failover-validation.sh`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-ha-failover-validation.sh`; `git diff --check`
+
+- **Timestamp**: 2026-05-22T15:55:00Z
+  - **Action**: PR #1491 review closeout — renamed standby WAN baseline
+    snapshot variable for clarity, tightened userspace-binding parser
+    diagnostics for empty vs unmatched rows, and moved WAN counter delta
+    monotonicity checks to Python integer math to avoid shell
+    signed-arithmetic edge cases.
+  - **File(s)**: `scripts/userspace-ha-failover-validation.sh`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-ha-failover-validation.sh`; `git diff --check`
+
+- **Timestamp**: 2026-05-22T15:45:00Z
+  - **Action**: PR #1491 review polish — added explicit
+    empty-userspace-bindings detection in standby WAN counter parsing and
+    simplified standby WAN snapshot-stage failure messages to high-level
+    baseline/post-validation diagnostics.
+  - **File(s)**: `scripts/userspace-ha-failover-validation.sh`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-ha-failover-validation.sh`; `git diff --check`
+
+- **Timestamp**: 2026-05-22T15:35:00Z
+  - **Action**: PR #1491 review polish — clarified standby WAN TX snapshot
+    failure messages for post-failover baseline vs post-validation captures
+    and tightened userspace-binding parse failure checks to fail once with
+    explicit context.
+  - **File(s)**: `scripts/userspace-ha-failover-validation.sh`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-ha-failover-validation.sh`; `git diff --check`
+
+- **Timestamp**: 2026-05-22T15:10:10Z
+  - **Action**: PR #1491 follow-up — fixed standby WAN TX failover
+    gating by measuring from post-failover baseline snapshots, failing closed
+    when userspace binding counters are unavailable, and treating standby WAN
+    TX counter resets as validation failures instead of clamping negative
+    deltas to zero.
+  - **File(s)**: `scripts/userspace-ha-failover-validation.sh`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-ha-failover-validation.sh`; `git diff --check`
+
 ## 2026-05-21
 
 - **Timestamp**: 2026-05-21T23:30:00Z
