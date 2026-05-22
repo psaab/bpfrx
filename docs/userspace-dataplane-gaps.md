@@ -15,7 +15,9 @@ AF_XDP userspace dataplane is now the effective runtime default when
 dataplane development and routine validation. No BPF source, bpf2go bindings,
 loader code, test targets, or CLI surfaces are removed in this phase. The
 legacy eBPF dataplane remains present only for explicit compatibility and
-regression use while the source-removal blockers close.
+regression use while the source-removal blockers close. Explicit
+`system dataplane-type ebpf` is accepted only with a compile warning; it is not
+the omitted/default dataplane path.
 
 DPDK is not part of the userspace retirement path. It remains a separately
 supported DPDK-build backend, but #1475 confines its root `DataPlane`
@@ -35,7 +37,7 @@ These capabilities exist in the current Rust userspace dataplane code path:
 | Policy schedulers | Implemented; live HA evidence captured | Scheduled-policy `scheduler_name` and `inactive` bits are published in userspace snapshots, old helper protocol mismatches disarm forwarding, missing policy-scheduler references are commit errors, and Rust hit counters survive active/inactive snapshot rebuilds by stable rule ID. The 2026-05-19 #1378 live artifact set is accepted by `test/incus/policy_scheduler_validate.py` for `lan->wan/scheduled-allow`. |
 | Application matching | Implemented | Protocol + port terms, including expanded multi-term apps |
 | Source NAT (interface mode) | Implemented | IPv4 and IPv6 egress interface rewrite |
-| Source NAT (pool mode) | Implemented with scoped caveats | IPv4/IPv6 pool address and port allocation. Global `source address-persistent` uses the documented userspace-v1 SHA-256 source-IP hash and is stable only within the AF_XDP backend, pool family, pool order, and pool size. Legacy eBPF and current DPDK use C-word IPv4 modulo / IPv6 lane-XOR selection, so new-flow pool address parity is not promised across backend rollback. Pool-mode rules with missing pools, empty pools, invalid port ranges, malformed addresses, no address for the packet family, or exhausted live translated tuples fail closed at the `poll_descriptor.rs` source-NAT call sites before session creation or forwarding, with recent-exception reasons such as `source_nat_pool_missing`, `source_nat_pool_empty`, `source_nat_pool_invalid_port_range`, and `source_nat_pool_exhausted`. Per-pool `persistent-nat` now has snapshot fields and runtime lease reuse keyed by source tuple `(protocol, source IP, source port)` to translated tuple. The lease table is bounded in helper memory, survives compatible in-process snapshot refreshes, and expires after the configured inactivity timeout once no live flow uses the lease. It does not consult Go `PersistentNATTable` and does not survive helper restart. #1449 closes HA behavior as an explicit userspace capability gate: HA configs that reference persistent source-NAT pools are not admitted because leases are not synchronized, and status reports `userspace persistent-nat source pool leases are not HA-synchronized`. Userspace status, CLI summary, and Prometheus expose live-flow, used-port, persistent-lease, allocation, reuse, and exhaustion counters for admitted non-HA pools. |
+| Source NAT (pool mode) | Implemented with scoped caveats | IPv4/IPv6 pool address and port allocation. Global `source address-persistent` uses the documented userspace-v1 SHA-256 source-IP hash and is stable only within the AF_XDP backend, pool family, pool order, and pool size. Legacy eBPF and current DPDK use C-word IPv4 modulo / IPv6 lane-XOR selection, so new-flow pool address parity is not promised across backend transitions. Pool-mode rules with missing pools, empty pools, invalid port ranges, malformed addresses, no address for the packet family, or exhausted live translated tuples fail closed at the `poll_descriptor.rs` source-NAT call sites before session creation or forwarding, with recent-exception reasons such as `source_nat_pool_missing`, `source_nat_pool_empty`, `source_nat_pool_invalid_port_range`, and `source_nat_pool_exhausted`. Per-pool `persistent-nat` now has snapshot fields and runtime lease reuse keyed by source tuple `(protocol, source IP, source port)` to translated tuple. The lease table is bounded in helper memory, survives compatible in-process snapshot refreshes, and expires after the configured inactivity timeout once no live flow uses the lease. It does not consult Go `PersistentNATTable` and does not survive helper restart. #1449 closes HA behavior as an explicit userspace capability gate: HA configs that reference persistent source-NAT pools are not admitted because leases are not synchronized, and status reports `userspace persistent-nat source pool leases are not HA-synchronized`. Userspace status, CLI summary, and Prometheus expose live-flow, used-port, persistent-lease, allocation, reuse, and exhaustion counters for admitted non-HA pools. |
 | Destination NAT | Implemented | Pre-expanded tuple snapshots from Go |
 | Static NAT | Implemented | Bidirectional 1:1 translation |
 | NAT64 | Implemented | Forward and reverse translation with reverse-session state |
@@ -112,7 +114,7 @@ Recommended dependency order:
 2. #1377 and #1379 next, because they are silent correctness or
    security-visibility regressions in configurations that may otherwise appear
    admitted. #1377 now has fail-closed pool runtime handling for unusable
-   pool snapshots, the userspace-v1 selector and mixed-backend rollback
+   pool snapshots, the userspace-v1 selector and mixed-backend transition
    boundary are explicit, and the non-HA helper-local persistent-NAT allocator
    slice is implemented with live counters. Remaining #1377 caveats are
    helper-restart persistence and any future decision to standardize new-flow
@@ -151,7 +153,8 @@ There are two distinct fallback boundaries:
 1. **Compile-time / reconcile-time gate**
    - The Go manager chooses the userspace runtime path by default. Explicit
      legacy eBPF selection can still use `xdp_main_prog` while #1373 source
-     removal is staged.
+     removal is staged, but config compile emits a deprecation warning for
+     that explicit selection.
    - The Go manager keeps `xdp_userspace_prog` as the userspace-mode
      XDP entry. Capability gates disarm helper forwarding rather than
      swapping userspace runtime traffic into `xdp_main_prog`.

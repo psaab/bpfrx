@@ -152,7 +152,8 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
   and daemon apply bridges listed above.
 - Omitted `system dataplane-type` now resolves to the userspace runtime path.
   Explicit `system dataplane-type ebpf` remains available only as a temporary
-  compatibility setting until source removal.
+  compatibility setting until source removal, and config compile emits a
+  deprecation warning when it is selected.
 - `pkg/dataplane/userspace.LegacyDataPlaneAdapter` is still required because
   userspace runtime construction returns a legacy-compatible adapter while
   unmigrated operator services consume old session, telemetry, and control

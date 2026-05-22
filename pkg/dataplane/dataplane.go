@@ -21,9 +21,8 @@ const (
 	TypeUserspace = "userspace"
 )
 
-// EffectiveType resolves the operator-facing dataplane type.  The empty
-// config value now means the userspace runtime path; callers must not treat an
-// omitted value as legacy eBPF fallback.
+// EffectiveType resolves the operator-facing dataplane type. The empty config
+// value means the userspace runtime path.
 func EffectiveType(dpType string) string {
 	if dpType == "" {
 		return TypeUserspace

@@ -5,8 +5,9 @@ Stateful firewall with native Junos configuration syntax.
 > Deprecation notice (#1373): the Rust AF_XDP userspace dataplane is now the
 > primary/default target for dataplane development, validation, and omitted
 > runtime configuration. The legacy eBPF dataplane remains in-tree for
-> explicit compatibility and regression coverage during the staged retirement.
-> Later phases own source, loader, build, and CLI removals.
+> explicit compatibility and regression coverage during the staged retirement;
+> explicit `system dataplane-type ebpf` now emits a compile warning. Later
+> phases own source, loader, build, and CLI removals.
 
 xpf is a high-performance stateful firewall that replicates Juniper vSRX
 capabilities. It uses the familiar Junos hierarchical configuration syntax and
@@ -21,9 +22,9 @@ forwarding path differs.
 The userspace AF_XDP backend is the default runtime target. Operators may still
 set `system dataplane-type userspace` explicitly, but omitting that knob also
 selects the userspace runtime path. The legacy eBPF backend remains available
-only through an explicit `system dataplane-type ebpf` selection until the later
-source-removal phase. New dataplane feature work should use the userspace path
-and close blockers tracked in
+only through an explicit, warned `system dataplane-type ebpf` selection until
+the later source-removal phase. New dataplane feature work should use the
+userspace path and close blockers tracked in
 [`docs/userspace-dataplane-gaps.md`](docs/userspace-dataplane-gaps.md).
 
 ### Userspace Dataplane (primary target)
@@ -74,7 +75,7 @@ XDP Ingress: main -> screen -> zone -> conntrack -> policy -> nat -> nat64 -> fo
 TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 ```
 
-- **Legacy coverage**: compatibility, rollback, and targeted regression tests
+- **Legacy coverage**: explicit compatibility and targeted regression tests
 - **Historical performance**: 25+ Gbps on native XDP (mlx5, i40e, ice)
 - **Best for**: reproducing legacy behavior while #1373 retirement blockers are being closed
 

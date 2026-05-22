@@ -719,7 +719,8 @@ func (x *CommitRequest) GetComment() string {
 
 type CommitResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Summary       string                 `protobuf:"bytes,1,opt,name=summary,proto3" json:"summary,omitempty"` // human-readable diff summary (e.g. "3 statement(s) changed (2 added, 1 removed)")
+	Summary       string                 `protobuf:"bytes,1,opt,name=summary,proto3" json:"summary,omitempty"`   // human-readable diff summary (e.g. "3 statement(s) changed (2 added, 1 removed)")
+	Warnings      []string               `protobuf:"bytes,2,rep,name=warnings,proto3" json:"warnings,omitempty"` // non-fatal validation warnings surfaced at commit time
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -761,6 +762,13 @@ func (x *CommitResponse) GetSummary() string {
 	return ""
 }
 
+func (x *CommitResponse) GetWarnings() []string {
+	if x != nil {
+		return x.Warnings
+	}
+	return nil
+}
+
 type CommitCheckRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -799,6 +807,7 @@ func (*CommitCheckRequest) Descriptor() ([]byte, []int) {
 
 type CommitCheckResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	Warnings      []string               `protobuf:"bytes,1,rep,name=warnings,proto3" json:"warnings,omitempty"` // non-fatal validation warnings surfaced by commit check
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -831,6 +840,13 @@ func (x *CommitCheckResponse) ProtoReflect() protoreflect.Message {
 // Deprecated: Use CommitCheckResponse.ProtoReflect.Descriptor instead.
 func (*CommitCheckResponse) Descriptor() ([]byte, []int) {
 	return file_xpf_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *CommitCheckResponse) GetWarnings() []string {
+	if x != nil {
+		return x.Warnings
+	}
+	return nil
 }
 
 type CommitConfirmedRequest struct {
@@ -879,6 +895,7 @@ func (x *CommitConfirmedRequest) GetMinutes() int32 {
 
 type CommitConfirmedResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	Warnings      []string               `protobuf:"bytes,1,rep,name=warnings,proto3" json:"warnings,omitempty"` // non-fatal validation warnings surfaced at commit-confirmed time
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -911,6 +928,13 @@ func (x *CommitConfirmedResponse) ProtoReflect() protoreflect.Message {
 // Deprecated: Use CommitConfirmedResponse.ProtoReflect.Descriptor instead.
 func (*CommitConfirmedResponse) Descriptor() ([]byte, []int) {
 	return file_xpf_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *CommitConfirmedResponse) GetWarnings() []string {
+	if x != nil {
+		return x.Warnings
+	}
+	return nil
 }
 
 type ConfirmCommitRequest struct {
@@ -6922,14 +6946,17 @@ const file_xpf_proto_rawDesc = "" +
 	"\acontent\x18\x02 \x01(\tR\acontent\"\x0e\n" +
 	"\fLoadResponse\")\n" +
 	"\rCommitRequest\x12\x18\n" +
-	"\acomment\x18\x01 \x01(\tR\acomment\"*\n" +
+	"\acomment\x18\x01 \x01(\tR\acomment\"F\n" +
 	"\x0eCommitResponse\x12\x18\n" +
-	"\asummary\x18\x01 \x01(\tR\asummary\"\x14\n" +
-	"\x12CommitCheckRequest\"\x15\n" +
-	"\x13CommitCheckResponse\"2\n" +
+	"\asummary\x18\x01 \x01(\tR\asummary\x12\x1a\n" +
+	"\bwarnings\x18\x02 \x03(\tR\bwarnings\"\x14\n" +
+	"\x12CommitCheckRequest\"1\n" +
+	"\x13CommitCheckResponse\x12\x1a\n" +
+	"\bwarnings\x18\x01 \x03(\tR\bwarnings\"2\n" +
 	"\x16CommitConfirmedRequest\x12\x18\n" +
-	"\aminutes\x18\x01 \x01(\x05R\aminutes\"\x19\n" +
-	"\x17CommitConfirmedResponse\"\x16\n" +
+	"\aminutes\x18\x01 \x01(\x05R\aminutes\"5\n" +
+	"\x17CommitConfirmedResponse\x12\x1a\n" +
+	"\bwarnings\x18\x01 \x03(\tR\bwarnings\"\x16\n" +
 	"\x14ConfirmCommitRequest\"\x17\n" +
 	"\x15ConfirmCommitResponse\"\x1f\n" +
 	"\x0fRollbackRequest\x12\f\n" +

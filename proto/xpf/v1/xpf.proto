@@ -109,13 +109,18 @@ message CommitRequest {
 }
 message CommitResponse {
   string summary = 1; // human-readable diff summary (e.g. "3 statement(s) changed (2 added, 1 removed)")
+  repeated string warnings = 2; // non-fatal validation warnings surfaced at commit time
 }
 
 message CommitCheckRequest {}
-message CommitCheckResponse {}
+message CommitCheckResponse {
+  repeated string warnings = 1; // non-fatal validation warnings surfaced by commit check
+}
 
 message CommitConfirmedRequest { int32 minutes = 1; }
-message CommitConfirmedResponse {}
+message CommitConfirmedResponse {
+  repeated string warnings = 1; // non-fatal validation warnings surfaced at commit-confirmed time
+}
 
 message ConfirmCommitRequest {}
 message ConfirmCommitResponse {}

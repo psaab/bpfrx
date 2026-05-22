@@ -1388,6 +1388,63 @@ func TestDataplaneWorkersOmittedTypeUsesUserspaceDefault(t *testing.T) {
 	if cfg.System.UserspaceDataplane.Workers != 8 {
 		t.Fatalf("Workers = %d, want 8", cfg.System.UserspaceDataplane.Workers)
 	}
+	warnings := strings.Join(cfg.Warnings, "\n")
+	if strings.Contains(warnings, "system dataplane-type ebpf selects") {
+		t.Fatalf("unexpected eBPF deprecation warning for omitted dataplane-type: %s", warnings)
+	}
+}
+
+func TestDataplaneTypeExplicitEBPFWarnsDeprecatedCompatibility(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, cmd := range []string{
+		"set system dataplane-type ebpf",
+	} {
+		fields := strings.Fields(cmd)
+		if err := tree.SetPath(fields[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	if cfg.System.DataplaneType != "ebpf" {
+		t.Fatalf("DataplaneType = %q, want ebpf", cfg.System.DataplaneType)
+	}
+	warnings := strings.Join(cfg.Warnings, "\n")
+	if !strings.Contains(warnings, "system dataplane-type ebpf selects the deprecated legacy eBPF dataplane explicitly") {
+		t.Fatalf("missing explicit eBPF deprecation warning, got: %s", warnings)
+	}
+	if !strings.Contains(warnings, "Omitting system dataplane-type selects the userspace dataplane") {
+		t.Fatalf("missing userspace default note in explicit eBPF warning, got: %s", warnings)
+	}
+}
+
+func TestDataplaneTypeNonLegacyValuesDoNotWarnDeprecatedCompatibility(t *testing.T) {
+	for _, dataplaneType := range []string{"userspace", "dpdk"} {
+		t.Run(dataplaneType, func(t *testing.T) {
+			tree := &ConfigTree{}
+			cmd := "set system dataplane-type " + dataplaneType
+			fields := strings.Fields(cmd)
+			if err := tree.SetPath(fields[1:]); err != nil {
+				t.Fatalf("SetPath(%q): %v", cmd, err)
+			}
+
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("CompileConfig: %v", err)
+			}
+			if cfg.System.DataplaneType != dataplaneType {
+				t.Fatalf("DataplaneType = %q, want %q",
+					cfg.System.DataplaneType, dataplaneType)
+			}
+			warnings := strings.Join(cfg.Warnings, "\n")
+			if strings.Contains(warnings, "deprecated legacy eBPF") {
+				t.Fatalf("unexpected eBPF deprecation warning: %s", warnings)
+			}
+		})
+	}
 }
 
 func TestDataplaneTypeValidationRejectsUnknownDuplicateValues(t *testing.T) {

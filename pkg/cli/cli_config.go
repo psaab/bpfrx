@@ -175,10 +175,11 @@ func (c *CLI) handleLoad(args []string) error {
 
 func (c *CLI) handleCommit(args []string) error {
 	if len(args) > 0 && args[0] == "check" {
-		_, err := c.store.CommitCheck()
+		compiled, err := c.store.CommitCheck()
 		if err != nil {
 			return fmt.Errorf("commit check failed: %w", err)
 		}
+		printConfigWarnings(compiled.Warnings)
 		fmt.Println("configuration check succeeds")
 		return nil
 	}
@@ -200,6 +201,7 @@ func (c *CLI) handleCommit(args []string) error {
 		c.reloadSyslog(compiled)
 		c.refreshPrompt()
 
+		printConfigWarnings(compiled.Warnings)
 		if diffSummary != "" {
 			fmt.Printf("commit complete: %s\n", diffSummary)
 		} else {
@@ -224,6 +226,7 @@ func (c *CLI) handleCommit(args []string) error {
 		c.reloadSyslog(compiled)
 		c.refreshPrompt()
 
+		printConfigWarnings(compiled.Warnings)
 		fmt.Printf("commit confirmed will be automatically rolled back in %d minutes unless confirmed\n", minutes)
 		return nil
 	}
@@ -249,12 +252,19 @@ func (c *CLI) handleCommit(args []string) error {
 	c.reloadSyslog(compiled)
 	c.refreshPrompt()
 
+	printConfigWarnings(compiled.Warnings)
 	if diffSummary != "" {
 		fmt.Printf("commit complete: %s\n", diffSummary)
 	} else {
 		fmt.Println("commit complete")
 	}
 	return nil
+}
+
+func printConfigWarnings(warnings []string) {
+	for _, warning := range warnings {
+		fmt.Printf("warning: %s\n", warning)
+	}
 }
 
 // runCommit dispatches to the daemon's atomic commit+apply when
