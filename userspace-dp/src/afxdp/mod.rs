@@ -72,6 +72,7 @@ mod frame;
 mod mpsc_inbox;
 #[path = "gre.rs"]
 mod gre;
+mod wireguard;
 #[path = "ha.rs"]
 mod ha;
 #[path = "icmp.rs"]

@@ -103,32 +103,47 @@ type ZoneSnapshot struct {
 }
 
 type InterfaceSnapshot struct {
-	Name                      string                     `json:"name"`
-	Zone                      string                     `json:"zone,omitempty"`
-	LinuxName                 string                     `json:"linux_name,omitempty"`
-	ParentLinuxName           string                     `json:"parent_linux_name,omitempty"`
-	Ifindex                   int                        `json:"ifindex,omitempty"`
-	ParentIfindex             int                        `json:"parent_ifindex,omitempty"`
-	LogicalOnly               bool                       `json:"logical_only,omitempty"`
-	RXQueues                  int                        `json:"rx_queues,omitempty"`
-	VLANID                    int                        `json:"vlan_id,omitempty"`
-	LocalFabric               string                     `json:"local_fabric_member,omitempty"`
-	RedundancyGroup           int                        `json:"redundancy_group,omitempty"`
-	UnitCount                 int                        `json:"unit_count"`
-	Tunnel                    bool                       `json:"tunnel"`
-	MTU                       int                        `json:"mtu,omitempty"`
-	HardwareAddr              string                     `json:"hardware_addr,omitempty"`
-	Addresses                 []InterfaceAddressSnapshot `json:"addresses,omitempty"`
-	FilterInputV4             string                     `json:"filter_input_v4,omitempty"`
-	FilterOutputV4            string                     `json:"filter_output_v4,omitempty"`
-	FilterInputV6             string                     `json:"filter_input_v6,omitempty"`
-	FilterOutputV6            string                     `json:"filter_output_v6,omitempty"`
-	CoSShapingRateBytesPerSec uint64                     `json:"cos_shaping_rate_bytes_per_sec,omitempty"`
-	CoSBurstSize              uint64                     `json:"cos_shaping_burst_bytes,omitempty"`
-	CoSSchedulerMap           string                     `json:"cos_scheduler_map,omitempty"`
-	CoSDSCPClassifier         string                     `json:"cos_dscp_classifier,omitempty"`
-	CoSIEEE8021Classifier     string                     `json:"cos_ieee8021_classifier,omitempty"`
-	CoSDSCPRewriteRule        string                     `json:"cos_dscp_rewrite_rule,omitempty"`
+	Name                      string                        `json:"name"`
+	Zone                      string                        `json:"zone,omitempty"`
+	LinuxName                 string                        `json:"linux_name,omitempty"`
+	ParentLinuxName           string                        `json:"parent_linux_name,omitempty"`
+	Ifindex                   int                           `json:"ifindex,omitempty"`
+	ParentIfindex             int                           `json:"parent_ifindex,omitempty"`
+	LogicalOnly               bool                          `json:"logical_only,omitempty"`
+	RXQueues                  int                           `json:"rx_queues,omitempty"`
+	VLANID                    int                           `json:"vlan_id,omitempty"`
+	LocalFabric               string                        `json:"local_fabric_member,omitempty"`
+	RedundancyGroup           int                           `json:"redundancy_group,omitempty"`
+	UnitCount                 int                           `json:"unit_count"`
+	Tunnel                    bool                          `json:"tunnel"`
+	MTU                       int                           `json:"mtu,omitempty"`
+	HardwareAddr              string                        `json:"hardware_addr,omitempty"`
+	Addresses                 []InterfaceAddressSnapshot    `json:"addresses,omitempty"`
+	FilterInputV4             string                        `json:"filter_input_v4,omitempty"`
+	FilterOutputV4            string                        `json:"filter_output_v4,omitempty"`
+	FilterInputV6             string                        `json:"filter_input_v6,omitempty"`
+	FilterOutputV6            string                        `json:"filter_output_v6,omitempty"`
+	CoSShapingRateBytesPerSec uint64                        `json:"cos_shaping_rate_bytes_per_sec,omitempty"`
+	CoSBurstSize              uint64                        `json:"cos_shaping_burst_bytes,omitempty"`
+	CoSSchedulerMap           string                        `json:"cos_scheduler_map,omitempty"`
+	CoSDSCPClassifier         string                        `json:"cos_dscp_classifier,omitempty"`
+	CoSIEEE8021Classifier     string                        `json:"cos_ieee8021_classifier,omitempty"`
+	CoSDSCPRewriteRule        string                        `json:"cos_dscp_rewrite_rule,omitempty"`
+	Wireguard                 *WireGuardInterfaceSnapshot   `json:"wireguard,omitempty"`
+}
+
+type WireGuardInterfaceSnapshot struct {
+	PrivateKey string                  `json:"private_key"`
+	PublicKey  string                  `json:"public_key"`
+	ListenPort uint16                  `json:"listen_port"`
+	Peers      []WireGuardPeerSnapshot `json:"peers"`
+}
+
+type WireGuardPeerSnapshot struct {
+	PublicKey           string   `json:"public_key"`
+	Endpoint            string   `json:"endpoint"`
+	AllowedIPs          []string `json:"allowed_ips"`
+	PersistentKeepalive uint32   `json:"persistent_keepalive"`
 }
 
 type ClassOfServiceSnapshot struct {
@@ -235,6 +250,8 @@ type TunnelEndpointSnapshot struct {
 	Key             uint32 `json:"key,omitempty"`
 	TTL             int    `json:"ttl,omitempty"`
 	TransportTable  string `json:"transport_table,omitempty"`
+	WgPublicKey     string `json:"wg_public_key,omitempty"`
+	WgListenPort    uint16 `json:"wg_listen_port,omitempty"`
 }
 
 type SourceNATRuleSnapshot struct {

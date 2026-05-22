@@ -146,6 +146,10 @@ pub(crate) struct BindingWorker {
     /// `WorkerBindMeta`. Field semantics unchanged; access via
     /// `binding.bind_meta.X`.
     pub(crate) bind_meta: WorkerBindMeta,
+    /// Per-binding WireGuard state (engines are shared via Arc<Mutex<>>).
+    pub(super) wireguard: super::wireguard::WireguardBindingState,
+    /// Previous WG interface snapshot (for reconciliation on re-apply).
+    pub(super) wireguard_prev_ifaces: Option<rustc_hash::FxHashMap<String, u16>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -384,6 +388,8 @@ impl BindingWorker {
                 scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_rst_teardowns: Vec::with_capacity(16),
+                scratch_wg_out: Vec::with_capacity(4096),
+                scratch_wg_in: Vec::with_capacity(4096),
             },
             // GEMINI-NEXT.md Section 3 cold start: lazy allocation. The
             // 4096-cap is enforced at admission (poll_descriptor.rs check
@@ -437,6 +443,8 @@ impl BindingWorker {
                 bind_mode,
                 xsk_rx_confirmed: false,
             },
+            wireguard: super::wireguard::WireguardBindingState::new(),
+            wireguard_prev_ifaces: None,
         };
         if register_xsk_now {
             register_binding_xsk(&binding, xsk_map_fd)?;
@@ -518,6 +526,8 @@ impl BindingWorker {
                 scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_rst_teardowns: Vec::with_capacity(16),
+                scratch_wg_out: Vec::with_capacity(4096),
+                scratch_wg_in: Vec::with_capacity(4096),
             },
             pending_neigh: VecDeque::new(),
             bpf_maps: WorkerBpfMaps {
@@ -558,6 +568,8 @@ impl BindingWorker {
                 bind_mode: XskBindMode::Copy,
                 xsk_rx_confirmed: false,
             },
+            wireguard: super::wireguard::WireguardBindingState::new(),
+            wireguard_prev_ifaces: None,
         }
     }
 
@@ -627,6 +639,8 @@ impl BindingWorker {
                 scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_rst_teardowns: Vec::with_capacity(16),
+                scratch_wg_out: Vec::with_capacity(4096),
+                scratch_wg_in: Vec::with_capacity(4096),
             },
             pending_neigh: VecDeque::new(),
             bpf_maps: WorkerBpfMaps {
@@ -667,6 +681,8 @@ impl BindingWorker {
                 bind_mode: XskBindMode::Copy,
                 xsk_rx_confirmed: false,
             },
+            wireguard: super::wireguard::WireguardBindingState::new(),
+            wireguard_prev_ifaces: None,
         }
     }
 
@@ -679,6 +695,7 @@ impl BindingWorker {
             ifindex: self.ifindex,
         }
     }
+
 }
 
 fn register_binding_xsk(
@@ -1068,6 +1085,15 @@ pub(crate) fn worker_loop(
         }
     }
     bindings.sort_by_key(|binding| (binding.queue_id, binding.ifindex, binding.slot));
+    // Share WireGuard engine state across all bindings on this worker.
+    // The first binding owns the original engines; subsequent bindings
+    // get an Arc clone so the replay window and nonce counter are
+    // consistent across all ingress NICs.
+    if let Some((first, rest)) = bindings.split_first_mut() {
+        for binding in rest.iter_mut() {
+            binding.wireguard = first.wireguard.new_sharing();
+        }
+    }
     let binding_lookup = WorkerBindingLookup::from_bindings(&bindings);
     let cos_owner_live_by_tx_ifindex = build_worker_cos_owner_live_by_tx_ifindex(
         bindings
@@ -1436,6 +1462,7 @@ pub(crate) fn worker_loop(
                 exported_sequences: Vec::new(),
                 shaped_tx_requests: Vec::new(),
                 vacate_all_shared_exact_slots: false,
+                pending_wireguard_snapshots: Vec::new(),
             }
         };
         let WorkerCommandResults {
@@ -1443,6 +1470,7 @@ pub(crate) fn worker_loop(
             exported_sequences,
             shaped_tx_requests,
             vacate_all_shared_exact_slots,
+            pending_wireguard_snapshots,
         } = command_results;
         // #941 Work item C: HA-demotion vacate. The
         // VacateAllSharedExactSlots WorkerCommand cannot be processed
@@ -1453,6 +1481,49 @@ pub(crate) fn worker_loop(
         if vacate_all_shared_exact_slots {
             for binding in bindings.iter_mut() {
                 vacate_all_shared_exact_slots_for_binding(binding);
+            }
+        }
+        if !pending_wireguard_snapshots.is_empty() {
+            let wg_snapshots: Vec<(String, u16)> = pending_wireguard_snapshots
+                .iter()
+                .map(|(n, s)| (n.clone(), s.listen_port))
+                .collect();
+            for (ifname, wg_iface) in &pending_wireguard_snapshots {
+                let wg_peers: Vec<super::wireguard::WireGuardPeerSnapshot> = wg_iface
+                    .peers
+                    .iter()
+                    .map(|p| super::wireguard::WireGuardPeerSnapshot {
+                        public_key: p.public_key.clone(),
+                        endpoint: p.endpoint.clone(),
+                        allowed_ips: p.allowed_ips.clone(),
+                        persistent_keepalive: p.persistent_keepalive,
+                    })
+                    .collect();
+                let virtual_ifindex = forwarding
+                    .ifindex_to_name
+                    .iter()
+                    .find(|(_, name)| name.as_str() == ifname.as_str())
+                    .map(|(ifindex, _)| *ifindex as u32);
+                for binding in bindings.iter_mut() {
+                    binding.wireguard.apply_snapshot(
+                        ifname,
+                        &wg_iface.private_key,
+                        &wg_iface.public_key,
+                        wg_iface.listen_port,
+                        &wg_peers,
+                        virtual_ifindex,
+                    );
+                }
+            }
+            // Reconcile: remove engines for interfaces that were in the
+            // previous snapshot but are absent from the current one.
+            for binding in bindings.iter_mut() {
+                if let Some(old_ifaces) = binding.wireguard_prev_ifaces.take() {
+                    binding.wireguard.reconcile_snapshots(&old_ifaces, &wg_snapshots);
+                }
+                binding.wireguard_prev_ifaces = Some(
+                    wg_snapshots.iter().cloned().collect(),
+                );
             }
         }
         if !shaped_tx_requests.is_empty() {

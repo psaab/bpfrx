@@ -87,6 +87,8 @@ pub(crate) struct InterfaceSnapshot {
     pub cos_ieee8021_classifier: String,
     #[serde(rename = "cos_dscp_rewrite_rule", default)]
     pub cos_dscp_rewrite_rule: String,
+    #[serde(rename = "wireguard", default)]
+    pub wireguard: Option<WireGuardInterfaceSnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -411,6 +413,34 @@ pub(crate) struct TunnelEndpointSnapshot {
     pub ttl: i32,
     #[serde(rename = "transport_table", default)]
     pub transport_table: String,
+    #[serde(rename = "wg_public_key", default)]
+    pub wg_public_key: String,
+    #[serde(rename = "wg_listen_port", default)]
+    pub wg_listen_port: u16,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct WireGuardInterfaceSnapshot {
+    #[serde(rename = "private_key", default)]
+    pub private_key: String,
+    #[serde(rename = "public_key", default)]
+    pub public_key: String,
+    #[serde(rename = "listen_port", default)]
+    pub listen_port: u16,
+    #[serde(default)]
+    pub peers: Vec<WireGuardPeerSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct WireGuardPeerSnapshot {
+    #[serde(rename = "public_key", default)]
+    pub public_key: String,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(rename = "allowed_ips", default)]
+    pub allowed_ips: Vec<String>,
+    #[serde(rename = "persistent_keepalive", default)]
+    pub persistent_keepalive: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

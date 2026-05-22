@@ -209,6 +209,11 @@ pub(super) struct WorkerCommandResults {
     /// no `BindingWorker` access — the outer poll loop in `worker.rs`
     /// dispatches based on this flag.
     pub vacate_all_shared_exact_slots: bool,
+    /// WireGuard interface snapshots pending application to bindings.
+    /// Populated when a `WorkerCommand::ApplyWireguard` is processed.
+    /// The outer poll loop applies them (needs `&mut BindingWorker`).
+    pub pending_wireguard_snapshots:
+        Vec<(String, crate::protocol::WireGuardInterfaceSnapshot)>,
 }
 
 fn force_live_redirect_for_worker_synced_entry(
@@ -447,6 +452,7 @@ pub(super) fn apply_worker_commands(
                     exported_sequences: Vec::new(),
                     shaped_tx_requests: Vec::new(),
                     vacate_all_shared_exact_slots: false,
+                    pending_wireguard_snapshots: Vec::new(),
                 };
             }
             core::mem::take(&mut *pending)
@@ -457,6 +463,7 @@ pub(super) fn apply_worker_commands(
                 exported_sequences: Vec::new(),
                 shaped_tx_requests: Vec::new(),
                 vacate_all_shared_exact_slots: false,
+                pending_wireguard_snapshots: Vec::new(),
             };
         }
     };
@@ -466,6 +473,7 @@ pub(super) fn apply_worker_commands(
     let mut exported_sequences = Vec::new();
     let mut shaped_tx_requests = Vec::new();
     let mut vacate_all_shared_exact_slots = false;
+    let mut pending_wireguard_snapshots = Vec::new();
     for cmd in pending {
         match cmd {
             WorkerCommand::DemoteOwnerRGS { owner_rgs } => {
@@ -749,6 +757,9 @@ pub(super) fn apply_worker_commands(
                 // let `worker.rs:818-822` dispatch).
                 vacate_all_shared_exact_slots = true;
             }
+            WorkerCommand::ApplyWireguard(snapshots) => {
+                pending_wireguard_snapshots = snapshots;
+            }
         }
     }
     WorkerCommandResults {
@@ -756,6 +767,7 @@ pub(super) fn apply_worker_commands(
         exported_sequences,
         shaped_tx_requests,
         vacate_all_shared_exact_slots,
+        pending_wireguard_snapshots,
     }
 }
 

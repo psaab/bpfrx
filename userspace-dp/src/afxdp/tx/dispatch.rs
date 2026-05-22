@@ -774,6 +774,16 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                             }
                             None => {}
                         }
+                        // For WireGuard tunnel endpoints, build the frame
+                        // without GRE encapsulation, then apply WG encap.
+                        let is_wireguard = if request.decision.resolution.tunnel_endpoint_id != 0 {
+                            forwarding
+                                .tunnel_endpoints
+                                .get(&request.decision.resolution.tunnel_endpoint_id)
+                                .is_some_and(|ep| ep.is_wireguard())
+                        } else {
+                            false
+                        };
                         match if is_nat64 {
                             build_nat64_forwarded_frame(
                                 source_frame,
@@ -781,6 +791,23 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 &request.decision,
                                 request.nat64_reverse.as_ref(),
                             )
+                        } else if is_wireguard {
+                            // Use the inner-frame builder (no GRE encap).
+                            let mut inner = vec![0u8; source_frame.len().saturating_add(4)];
+                            let written = match build_forwarded_frame_into_from_frame(
+                                &mut inner,
+                                source_frame,
+                                request.meta,
+                                &request.decision,
+                                forwarding,
+                                request.apply_nat_on_fabric,
+                                expected_ports,
+                            ) {
+                                Some(w) => w,
+                                None => continue,
+                            };
+                            inner.truncate(written);
+                            Some(inner)
                         } else {
                             build_forwarded_frame_from_frame(
                                 source_frame,
@@ -791,7 +818,25 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 expected_ports,
                             )
                         } {
-                            Some(frame) => {
+                            Some(mut frame) => {
+                                // WireGuard encapsulation: if the tunnel
+                                // endpoint is a WG tunnel, re-encapsulate
+                                // the inner frame.
+                                if is_wireguard {
+                                    if let Some(endpoint) = forwarding.tunnel_endpoints.get(&request.decision.resolution.tunnel_endpoint_id) {
+                                        if let Some((wg_frame, wg_meta)) = target_binding.wireguard.try_encap(
+                                            &frame,
+                                            request.meta.addr_family,
+                                            request.meta.ingress_ifindex,
+                                            request.decision.resolution.tx_vlan_id,
+                                            None,
+                                            request.meta.dscp,
+                                            endpoint.wg_listen_port,
+                                        ) {
+                                            frame = wg_frame;
+                                        }
+                                    }
+                                }
                                 if cfg!(feature = "debug-log") {
                                     if let Some(reason) = forward_tuple_mismatch_reason(
                                         live_frame_ports_from_meta_bytes(

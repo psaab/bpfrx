@@ -153,6 +153,36 @@ pub(super) fn stage_native_gre_decap(
     (new_meta, owned_packet_frame)
 }
 
+/// Stage 6.5 — WireGuard decapsulation.
+///
+/// Runs in-place on the UMEM frame buffer. Returns a 4-tuple:
+/// `(new_meta, owned_frame, is_control, new_len)`.
+/// - When `is_control` is true, `owned_frame` contains the control
+///   response to forward.
+/// - When `is_control` is false and `new_len` is Some, the packet was
+///   decapped in-place in the UMEM buffer; the caller must re-bind the
+///   active slice with the new length.
+/// - When the tuple is `(meta, None, false, None)`, the packet was not
+///   a WireGuard packet and should continue through the pipeline.
+#[inline]
+pub(super) fn stage_wireguard_decap<'a>(
+    raw_frame_mut: &'a mut [u8],
+    meta: UserspaceDpMeta,
+    wg: &mut super::wireguard::WireguardBindingState,
+) -> (UserspaceDpMeta, Option<Vec<u8>>, bool, Option<usize>) {
+    use super::wireguard::WireGuardDecapOutcome;
+    match wg.try_decap(raw_frame_mut, &meta) {
+        WireGuardDecapOutcome::Decapped(result) => {
+            if result.is_control {
+                (result.meta, result.control_frame, true, Some(result.decap_len))
+            } else {
+                (result.meta, None, false, Some(result.decap_len))
+            }
+        }
+        WireGuardDecapOutcome::None => (meta, None, false, None),
+    }
+}
+
 /// Stage 7+8 — parse session flow and learn the source-side
 /// dynamic neighbor.
 ///

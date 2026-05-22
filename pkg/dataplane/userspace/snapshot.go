@@ -596,7 +596,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 		if rg <= 0 {
 			rg = rethRG[name]
 		}
-		out = append(out, InterfaceSnapshot{
+		ifaceSnap := InterfaceSnapshot{
 			Name:            name,
 			Zone:            zoneByInterface[name],
 			LinuxName:       linuxName,
@@ -612,7 +612,25 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			MTU:             mtu,
 			HardwareAddr:    hardwareAddr,
 			Addresses:       addresses,
-		})
+		}
+		if iface.Wireguard != nil {
+			wg := iface.Wireguard
+			wgSnap := WireGuardInterfaceSnapshot{
+				PrivateKey: wg.PrivateKey,
+				PublicKey:  wg.PublicKey,
+				ListenPort: wg.ListenPort,
+			}
+			for _, p := range wg.Peers {
+				wgSnap.Peers = append(wgSnap.Peers, WireGuardPeerSnapshot{
+					PublicKey:           p.PublicKey,
+					Endpoint:            p.Endpoint,
+					AllowedIPs:          p.AllowedIPs,
+					PersistentKeepalive: p.PersistentKeepalive,
+				})
+			}
+			ifaceSnap.Wireguard = &wgSnap
+		}
+		out = append(out, ifaceSnap)
 		if len(iface.Units) == 0 {
 			continue
 		}
@@ -810,6 +828,8 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 			Key:             tunnel.Key,
 			TTL:             tunnel.TTL,
 			TransportTable:  transportTable,
+			WgPublicKey:     tunnel.WgPublicKey,
+			WgListenPort:    tunnel.WgListenPort,
 		})
 		nextID++
 	}

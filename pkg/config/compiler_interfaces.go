@@ -146,19 +146,29 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 					if len(prop.Keys) >= 2 {
 						tc.Mode = prop.Keys[1]
 					}
-				case "key":
-					if len(prop.Keys) >= 2 {
-						if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-							tc.Key = uint32(v)
-						}
+			case "key":
+				if len(prop.Keys) >= 2 {
+					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
+						tc.Key = uint32(v)
 					}
-				case "ttl":
-					if len(prop.Keys) >= 2 {
-						if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-							tc.TTL = v
-						}
+				}
+			case "ttl":
+				if len(prop.Keys) >= 2 {
+					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
+						tc.TTL = v
 					}
-				case "keepalive":
+				}
+			case "wg-public-key":
+				if len(prop.Keys) >= 2 {
+					tc.WgPublicKey = prop.Keys[1]
+				}
+			case "wg-listen-port":
+				if len(prop.Keys) >= 2 {
+					if v, err := strconv.Atoi(prop.Keys[1]); err == nil && v >= 0 && v <= 65535 {
+						tc.WgListenPort = uint16(v)
+					}
+				}
+			case "keepalive":
 					if v := nodeVal(prop); v != "" {
 						if n, err := strconv.Atoi(v); err == nil {
 							tc.Keepalive = n
@@ -504,6 +514,48 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 				// Interface-level tunnel: all unit addresses go to shared tunnel
 				ifc.Tunnel.Addresses = append(ifc.Tunnel.Addresses, unit.Addresses...)
 			}
+		}
+
+		// Parse WireGuard configuration
+		if wgNode := child.FindChild("wireguard"); wgNode != nil {
+			wgc := &WireGuardConfig{}
+			for _, prop := range wgNode.Children {
+				switch prop.Name() {
+				case "private-key":
+					wgc.PrivateKey = nodeVal(prop)
+				case "public-key":
+					wgc.PublicKey = nodeVal(prop)
+				case "listen-port":
+					if v := nodeVal(prop); v != "" {
+						if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 65535 {
+							wgc.ListenPort = uint16(n)
+						}
+					}
+				case "peer":
+					pc := WireGuardPeerConfig{}
+					for _, peerProp := range prop.Children {
+						switch peerProp.Name() {
+						case "public-key":
+							pc.PublicKey = nodeVal(peerProp)
+						case "endpoint":
+							pc.Endpoint = nodeVal(peerProp)
+						case "allowed-ips":
+							raw := nodeVal(peerProp)
+							if raw != "" {
+								pc.AllowedIPs = strings.Fields(raw)
+							}
+						case "persistent-keepalive":
+							if v := nodeVal(peerProp); v != "" {
+								if n, err := strconv.Atoi(v); err == nil {
+									pc.PersistentKeepalive = uint32(n)
+								}
+							}
+						}
+					}
+					wgc.Peers = append(wgc.Peers, pc)
+				}
+			}
+			ifc.Wireguard = wgc
 		}
 
 		ifaces.Interfaces[ifName] = ifc

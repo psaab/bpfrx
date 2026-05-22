@@ -10,7 +10,7 @@ use super::poll_stages::{
     FabricIngressOutcome, ScreenCheckOutcome, StageOutcome, SynCookieAckOutcome,
     stage_classify_fabric_ingress, stage_ipsec_passthrough_check, stage_link_layer_classify,
     stage_native_gre_decap, stage_parse_flow_and_learn, stage_screen_check,
-    stage_screen_syn_cookie_ack_on_session_miss,
+    stage_screen_syn_cookie_ack_on_session_miss, stage_wireguard_decap,
 };
 use super::worker::WorkerTxPipeline;
 use super::*;
@@ -443,7 +443,7 @@ pub(super) fn poll_binding_process_descriptor(
         binding.scratch.scratch_recycle.clear();
         binding.scratch.scratch_forwards.clear();
         binding.scratch.scratch_rst_teardowns.clear();
-        while let Some(desc) = received.read() {
+        while let Some(mut desc) = received.read() {
             record_rx_descriptor_telemetry(desc, area, telemetry, worker_ctx);
             let mut recycle_now = true;
             if let Some(meta) = try_parse_metadata(unsafe { &*area }, desc) {
@@ -452,7 +452,7 @@ pub(super) fn poll_binding_process_descriptor(
                 if disposition == PacketDisposition::Valid {
                     telemetry.counters.validated_packets += 1;
                     telemetry.counters.validated_bytes += desc.len as u64;
-                    let Some(raw_frame) =
+                    let Some(mut raw_frame) =
                         unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
                     else {
                         binding.scratch.scratch_recycle.push(desc.addr);
@@ -474,6 +474,75 @@ pub(super) fn poll_binding_process_descriptor(
                     // stage-12+ code at lines below calls `.take()`.
                     let (mut meta, mut owned_packet_frame) =
                         stage_native_gre_decap(raw_frame, meta, worker_ctx.forwarding);
+                    // Stage 6.5: WireGuard decap — only when GRE
+                    // didn't consume the packet.  Uses
+                    // slice_mut_unchecked (established codebase
+                    // pattern for cross-borrow UMEM access) to get
+                    // a mutable frame for in-place WG decap.
+                    if owned_packet_frame.is_none() {
+                        let target_area = unsafe { &*area };
+                        if let Some(raw_frame_mut) = unsafe {
+                            target_area.slice_mut_unchecked(desc.addr as usize, desc.len as usize)
+                        } {
+                            let (new_meta, new_owned, is_control, new_len_opt) =
+                                stage_wireguard_decap(
+                                    raw_frame_mut,
+                                    meta,
+                                    &mut binding.wireguard,
+                                );
+                            if let Some(new_len) = new_len_opt {
+                                if is_control {
+                                    if let Some(frame) = new_owned {
+                                        let decision = SessionDecision {
+                                            resolution: ForwardingResolution {
+                                                disposition: ForwardingDisposition::ForwardCandidate,
+                                                local_ifindex: 0,
+                                                egress_ifindex: binding.ifindex,
+                                                tx_ifindex: binding.ifindex,
+                                                tunnel_endpoint_id: 0,
+                                                next_hop: None,
+                                                neighbor_mac: None,
+                                                src_mac: None,
+                                                tx_vlan_id: 0,
+                                            },
+                                            nat: NatDecision::default(),
+                                        };
+                                        let request = PendingForwardRequest {
+                                            target_ifindex: binding.ifindex,
+                                            target_binding_index: None,
+                                            ingress_queue_id: binding.queue_id,
+                                            desc,
+                                            frame: PendingForwardFrame::Owned(frame),
+                                            meta: new_meta.into(),
+                                            decision,
+                                            apply_nat_on_fabric: false,
+                                            expected_ports: None,
+                                            flow_key: None,
+                                            nat64_reverse: None,
+                                            cos_queue_id: None,
+                                            dscp_rewrite: None,
+                                            cos_tx_selection_resolved: false,
+                                        };
+                                        binding.scratch.scratch_forwards.push(request);
+                                    }
+                                    binding.scratch.scratch_recycle.push(desc.addr);
+                                    continue;
+                                }
+                                desc.len = new_len as u32;
+                                meta = new_meta;
+                                // Re-slice raw_frame to the new (inner packet)
+                                // length so downstream stages (parse flow,
+                                // screen, etc.) read the correct bounds.
+                                raw_frame = unsafe {
+                                    &*area
+                                }
+                                .slice(desc.addr as usize, desc.len as usize)
+                                .unwrap_or(raw_frame);
+                            } else {
+                                meta = new_meta;
+                            }
+                        }
+                    }
                     let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);
                     // #946 Phase 1 stage 7+8: parse session flow and
                     // learn the source-side dynamic neighbor.

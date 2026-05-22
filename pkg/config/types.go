@@ -1449,7 +1449,8 @@ type InterfaceConfig struct {
 	BondMode            string                  // bond mode: "active-backup" for fabric, "802.3ad" for ae
 	AggregatedEtherOpts *AggregatedEtherOptions // ae interface options (LACP, etc.)
 	Units               map[int]*InterfaceUnit
-	Tunnel              *TunnelConfig // non-nil for tunnel interfaces (gre0, etc.)
+	Tunnel              *TunnelConfig    // non-nil for tunnel interfaces (gre0, etc.)
+	Wireguard           *WireGuardConfig // non-nil for WireGuard interfaces
 }
 
 // AggregatedEtherOptions defines LAG/ae interface parameters.
@@ -1781,6 +1782,24 @@ type TunnelConfig struct {
 	Keepalive       int      // keepalive interval in seconds (0 = disabled)
 	KeepaliveRetry  int      // number of missed keepalives before declaring down (0 = default 3)
 	AnchorOnly      bool     // create a dummy anchor instead of a kernel tunnel device
+	WgPublicKey     string   // WireGuard public key for tunnel binding
+	WgListenPort    uint16   // WireGuard listen port for tunnel binding
+}
+
+// WireGuardConfig defines configuration for a WireGuard interface.
+type WireGuardConfig struct {
+	PrivateKey string
+	PublicKey  string
+	ListenPort uint16
+	Peers      []WireGuardPeerConfig
+}
+
+// WireGuardPeerConfig defines a single peer within a WireGuard interface.
+type WireGuardPeerConfig struct {
+	PublicKey           string
+	Endpoint            string
+	AllowedIPs          []string
+	PersistentKeepalive uint32
 }
 
 // TunnelNameMap returns a mapping from Junos interface reference (e.g. "gr-0/0/0.0")

@@ -815,6 +815,30 @@ impl Coordinator {
             .ok();
             self.neighbors.monitor_stop = Some(stop);
         }
+        // Extract WireGuard interface snapshots and dispatch to the
+        // single worker (WG requires num_workers == 1).
+        let wg_snapshots: Vec<(String, crate::protocol::WireGuardInterfaceSnapshot)> = snapshot
+            .interfaces
+            .iter()
+            .filter_map(|iface| {
+                iface
+                    .wireguard
+                    .as_ref()
+                    .map(|wg| (iface.name.clone(), wg.clone()))
+            })
+            .collect();
+        if !wg_snapshots.is_empty() {
+            assert_eq!(
+                self.workers.handles.len(),
+                1,
+                "WireGuard requires exactly 1 worker thread (found {})",
+                self.workers.handles.len()
+            );
+            if let Some(handle) = self.workers.handles.values().next() {
+                let mut q = handle.commands.lock().unwrap();
+                q.push_back(WorkerCommand::ApplyWireguard(wg_snapshots));
+            }
+        }
         self.spawn_local_tunnel_sources();
         self.refresh_bindings(bindings);
     }

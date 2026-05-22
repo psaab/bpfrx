@@ -167,6 +167,25 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
                 key: endpoint.key,
                 ttl: endpoint.ttl.max(0) as u8,
                 transport_table,
+                wg_public_key: if endpoint.wg_public_key.is_empty() {
+                    None
+                } else {
+                    base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        &endpoint.wg_public_key,
+                    )
+                    .ok()
+                    .and_then(|bytes| {
+                        if bytes.len() == 32 {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(&bytes);
+                            Some(arr)
+                        } else {
+                            None
+                        }
+                    })
+                },
+                wg_listen_port: endpoint.wg_listen_port,
             },
         );
         state
