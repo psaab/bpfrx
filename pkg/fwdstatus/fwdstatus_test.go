@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
@@ -16,14 +15,14 @@ import (
 
 func TestFormat_LabelsAndOrderEBPF(t *testing.T) {
 	fs := &ForwardingStatus{
-		State: StateOnline,
-		DaemonCPUWindows: [numCPUWindows]float64{4, 3, 2},
+		State:                StateOnline,
+		DaemonCPUWindows:     [numCPUWindows]float64{4, 3, 2},
 		DaemonCPUWindowValid: [numCPUWindows]bool{true, true, true},
-		WorkerCPUMode:  CPUModeEBPFNoWorkers,
-		HeapPercent:    72.0,
-		BufferPercent:  83.0,
-		BufferKnown:    true,
-		Uptime:         474635 * time.Second,
+		WorkerCPUMode:        CPUModeEBPFNoWorkers,
+		HeapPercent:          72.0,
+		BufferPercent:        83.0,
+		BufferKnown:          true,
+		Uptime:               474635 * time.Second,
 	}
 	out := Format(fs)
 	wantLabelsInOrder := []string{
@@ -59,12 +58,12 @@ func TestFormat_LabelsAndOrderEBPF(t *testing.T) {
 
 func TestFormat_BufferUnknownUserspace(t *testing.T) {
 	fs := &ForwardingStatus{
-		State:              StateOnline,
-		WorkerCPUMode:      CPUModeWorkers,
-		WorkerCPUWindows:   [numCPUWindows]float64{45, 40, 35},
+		State:                StateOnline,
+		WorkerCPUMode:        CPUModeWorkers,
+		WorkerCPUWindows:     [numCPUWindows]float64{45, 40, 35},
 		WorkerCPUWindowValid: [numCPUWindows]bool{true, true, true},
-		BufferKnown:        false,
-		BufferFollowupRef:  878,
+		BufferKnown:          false,
+		BufferFollowupRef:    878,
 	}
 	out := Format(fs)
 	if !strings.Contains(out, "unknown (see #878)") {
@@ -161,11 +160,11 @@ func TestFormat_HeapAndBufferClampButCPUDoesNot(t *testing.T) {
 // make Build treat it as userspace-dp (adds the Status method).
 type fakeDP struct {
 	loaded   bool
-	mapStats []dataplane.MapStats
+	mapStats []MapStats
 }
 
-func (f *fakeDP) IsLoaded() bool                   { return f.loaded }
-func (f *fakeDP) GetMapStats() []dataplane.MapStats { return f.mapStats }
+func (f *fakeDP) IsLoaded() bool          { return f.loaded }
+func (f *fakeDP) GetMapStats() []MapStats { return f.mapStats }
 
 type fakeUserspaceDP struct {
 	fakeDP
@@ -179,16 +178,16 @@ func (f *fakeUserspaceDP) Status() (userspace.ProcessStatus, error) {
 
 // fakeProcReader injects canned /proc contents.
 type fakeProcReader struct {
-	selfStat    ProcSelfStat
-	selfStatErr error
-	selfStatm   ProcSelfStatm
+	selfStat     ProcSelfStat
+	selfStatErr  error
+	selfStatm    ProcSelfStatm
 	selfStatmErr error
-	stat        ProcStat
-	statErr     error
-	memInfo     ProcMemInfo
-	memInfoErr  error
-	cgroupMax   uint64
-	cgroupErr   error
+	stat         ProcStat
+	statErr      error
+	memInfo      ProcMemInfo
+	memInfoErr   error
+	cgroupMax    uint64
+	cgroupErr    error
 }
 
 func (f *fakeProcReader) ReadSelfStat() (ProcSelfStat, error) {
@@ -224,8 +223,8 @@ func freshProcReader() *fakeProcReader {
 }
 
 func TestBuild_Online_eBPF(t *testing.T) {
-	dp := &fakeDP{loaded: true, mapStats: []dataplane.MapStats{
-		{Name: "sessions", MaxEntries: 100, UsedCount: 30},
+	dp := &fakeDP{loaded: true, mapStats: []MapStats{
+		{MaxEntries: 100, UsedCount: 30},
 	}}
 	fs, err := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
 	if err != nil {

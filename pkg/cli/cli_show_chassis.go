@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/fwdstatus"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"google.golang.org/grpc/metadata"
@@ -56,7 +57,7 @@ func (c *CLI) buildLocalForwarding() (string, error) {
 		snap = c.fwdSampler.Snapshot()
 	}
 	fs, err := fwdstatus.Build(
-		c.dp,
+		c.forwardingStatusDataplane(),
 		fwdstatus.OSProcReader{},
 		c.startTime,
 		snap,
@@ -65,6 +66,51 @@ func (c *CLI) buildLocalForwarding() (string, error) {
 		return "", fmt.Errorf("build forwarding status: %w", err)
 	}
 	return fwdstatus.Format(fs), nil
+}
+
+type forwardingStatusCLIDataPlane struct {
+	cli *CLI
+}
+
+func (a forwardingStatusCLIDataPlane) IsLoaded() bool {
+	return a.cli != nil && a.cli.dp != nil && a.cli.dp.IsLoaded()
+}
+
+func (a forwardingStatusCLIDataPlane) GetMapStats() []fwdstatus.MapStats {
+	if a.cli == nil || a.cli.dp == nil {
+		return nil
+	}
+	stats := a.cli.dp.GetMapStats()
+	out := make([]fwdstatus.MapStats, 0, len(stats))
+	for _, ms := range stats {
+		out = append(out, fwdstatus.MapStats{
+			Type:       ms.Type,
+			MaxEntries: ms.MaxEntries,
+			UsedCount:  ms.UsedCount,
+		})
+	}
+	return out
+}
+
+type forwardingStatusCLIUserspaceDataPlane struct {
+	forwardingStatusCLIDataPlane
+}
+
+func (a forwardingStatusCLIUserspaceDataPlane) Status() (dpuserspace.ProcessStatus, error) {
+	return a.cli.userspaceDataplaneStatus()
+}
+
+func (c *CLI) forwardingStatusDataplane() fwdstatus.DataPlaneAccessor {
+	if c == nil || c.dp == nil {
+		return nil
+	}
+	base := forwardingStatusCLIDataPlane{cli: c}
+	if _, ok := c.dp.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+	}); ok {
+		return forwardingStatusCLIUserspaceDataPlane{forwardingStatusCLIDataPlane: base}
+	}
+	return base
 }
 
 // dialAndShowForwarding queries the cluster peer for its single-node

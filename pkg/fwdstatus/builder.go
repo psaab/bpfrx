@@ -3,7 +3,6 @@ package fwdstatus
 import (
 	"time"
 
-	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
@@ -26,13 +25,19 @@ const followupUMEMBuffer = 878
 // want to suppress the reference.
 func UMEMBufferFollowup() int { return followupUMEMBuffer }
 
-// DataPlaneAccessor is the small surface Build needs from the
-// dataplane.  Both `dataplane.DataPlane` and mocks in tests satisfy
-// it.  Package keeps the interface narrow so tests don't have to
-// stub dozens of unrelated methods.
+// MapStats is the package-local BPF map utilization shape Build needs.
+type MapStats struct {
+	Type       string
+	MaxEntries uint32
+	UsedCount  uint32
+}
+
+// DataPlaneAccessor is the small surface Build needs from the dataplane.
+// Callers adapt broader runtime or legacy dataplane implementations to this
+// shape so this package does not depend on root dataplane telemetry types.
 type DataPlaneAccessor interface {
 	IsLoaded() bool
-	GetMapStats() []dataplane.MapStats
+	GetMapStats() []MapStats
 }
 
 // Build gathers all fields of a ForwardingStatus.  Nil `dp` is
