@@ -92,6 +92,14 @@ func TestUserspaceBackendRegistryReturnsRuntimeAdapterForLegacyCallers(t *testin
 	if _, ok := any(dp).(dataplane.DataPlane); !ok {
 		t.Fatalf("NewRuntimeDataPlane(userspace) = %T, want legacy-compatible adapter", dp)
 	}
+
+	defaultDP, err := dataplane.NewRuntimeDataPlane("")
+	if err != nil {
+		t.Fatalf("NewRuntimeDataPlane(default): %v", err)
+	}
+	if _, ok := any(defaultDP).(*LegacyDataPlaneAdapter); !ok {
+		t.Fatalf("NewRuntimeDataPlane(default) = %T, want *LegacyDataPlaneAdapter", defaultDP)
+	}
 }
 
 func exprString(expr ast.Expr) string {

@@ -391,13 +391,14 @@ system {
 //   - hierarchical nested: archive-sites { "<url>" { password "..."; } }
 //   - hierarchical leaf:   archive-sites { "<url>" password "..."; }
 //   - flat-set:            set system archival ... archive-sites "<url>" password "..."
+//
 // The existing ValidateConfig test pre-populates the slice; this test
 // exercises the compile-time extraction so regressions in how Junos
 // shapes enter ArchiveSitesWithPassword are caught at the parser level.
 func TestArchiveSitesPasswordParsed(t *testing.T) {
 	type want struct {
-		urls        []string
-		withPasswd  []string
+		urls       []string
+		withPasswd []string
 	}
 
 	cases := []struct {
@@ -1358,4 +1359,93 @@ func TestDataplaneWorkersCanonicalPathParses(t *testing.T) {
 	if cfg.System.UserspaceDataplane.Workers != 7 {
 		t.Errorf("Workers: got %d, want 7", cfg.System.UserspaceDataplane.Workers)
 	}
+}
+
+func TestDataplaneWorkersOmittedTypeUsesUserspaceDefault(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, cmd := range []string{
+		"set system dataplane workers 8",
+	} {
+		fields := strings.Fields(cmd)
+		if err := tree.SetPath(fields[1:]); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	if cfg.System.DataplaneType != "" {
+		t.Fatalf("DataplaneType = %q, want omitted empty value", cfg.System.DataplaneType)
+	}
+	if cfg.System.DPDKDataplane != nil {
+		t.Fatalf("DPDKDataplane = %+v, want nil for omitted dataplane-type", cfg.System.DPDKDataplane)
+	}
+	if cfg.System.UserspaceDataplane == nil {
+		t.Fatal("expected UserspaceDataplane to be populated")
+	}
+	if cfg.System.UserspaceDataplane.Workers != 8 {
+		t.Fatalf("Workers = %d, want 8", cfg.System.UserspaceDataplane.Workers)
+	}
+}
+
+func TestDataplaneTypeValidationRejectsUnknownDuplicateValues(t *testing.T) {
+	t.Run("unknown", func(t *testing.T) {
+		tree := &ConfigTree{}
+		for _, cmd := range []string{
+			"set system dataplane-type mystery",
+			"set system dataplane workers 8",
+		} {
+			fields := strings.Fields(cmd)
+			if err := tree.SetPath(fields[1:]); err != nil {
+				t.Fatalf("SetPath(%q): %v", cmd, err)
+			}
+		}
+
+		_, err := CompileConfig(tree)
+		if err == nil || !strings.Contains(err.Error(), `unknown dataplane-type "mystery"`) {
+			t.Fatalf("CompileConfig error = %v, want unknown dataplane-type rejection", err)
+		}
+	})
+
+	t.Run("valid then unknown", func(t *testing.T) {
+		parser := NewParser(`
+system {
+    dataplane-type userspace;
+    dataplane-type mystery;
+    dataplane {
+        workers 8;
+    }
+}`)
+		tree, parseErrs := parser.Parse()
+		if len(parseErrs) > 0 {
+			t.Fatalf("Parse errors: %v", parseErrs)
+		}
+
+		_, err := CompileConfig(tree)
+		if err == nil || !strings.Contains(err.Error(), `unknown dataplane-type "mystery"`) {
+			t.Fatalf("CompileConfig error = %v, want unknown dataplane-type rejection", err)
+		}
+	})
+
+	t.Run("unknown then valid", func(t *testing.T) {
+		parser := NewParser(`
+system {
+    dataplane-type mystery;
+    dataplane-type userspace;
+    dataplane {
+        workers 8;
+    }
+}`)
+		tree, parseErrs := parser.Parse()
+		if len(parseErrs) > 0 {
+			t.Fatalf("Parse errors: %v", parseErrs)
+		}
+
+		_, err := CompileConfig(tree)
+		if err == nil || !strings.Contains(err.Error(), `unknown dataplane-type "mystery"`) {
+			t.Fatalf("CompileConfig error = %v, want unknown dataplane-type rejection", err)
+		}
+	})
 }

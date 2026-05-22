@@ -1010,7 +1010,8 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 			coalesceExplicit  bool
 			claimHostTunables bool
 		)
-		if cfg.System.DataplaneType == "userspace" && cfg.System.UserspaceDataplane != nil {
+		if dataplane.EffectiveType(cfg.System.DataplaneType) == dataplane.TypeUserspace &&
+			cfg.System.UserspaceDataplane != nil {
 			userspaceDP = true
 			workers = cfg.System.UserspaceDataplane.Workers
 			if cfg.System.UserspaceDataplane.RSSIndirectionDisabled {

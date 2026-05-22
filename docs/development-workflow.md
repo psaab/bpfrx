@@ -1,10 +1,10 @@
 # Development workflow — plan, review, code, review, merge
 
 > Deprecation notice (#1373): new dataplane work and routine forwarding
-> validation target the Rust AF_XDP userspace dataplane by default. The legacy
-> eBPF dataplane remains in-tree for compatibility, rollback, and explicit
-> regression coverage during the staged retirement. Phase 1 updates active
-> documentation; later phases own source, loader, build, and CLI removals.
+> validation target the Rust AF_XDP userspace dataplane by default. Omitted
+> runtime configuration now selects userspace. The legacy eBPF dataplane
+> remains in-tree for explicit compatibility and regression coverage during the
+> staged retirement. Later phases own source, loader, build, and CLI removals.
 
 How non-trivial changes land in this repo. Roles and agent-boundary
 rules are in `AGENTS.md`; read that first. This doc is the process

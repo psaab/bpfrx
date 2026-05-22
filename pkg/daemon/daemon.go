@@ -43,7 +43,7 @@ import (
 // Options configures the daemon.
 type Options struct {
 	ConfigFile  string
-	NoDataplane bool   // set to true to run without eBPF (config-only mode)
+	NoDataplane bool   // set to true to run without a dataplane (config-only mode)
 	APIAddr     string // HTTP API listen address (empty = disabled)
 	GRPCAddr    string // gRPC API listen address (empty = disabled)
 	Version     string // software version string
@@ -59,7 +59,7 @@ const nodeIDFile = "/etc/xpf/node-id"
 type Daemon struct {
 	opts                       Options
 	store                      *configstore.Store
-	dp  dataplane.RuntimeDataPlane
+	dp                         dataplane.RuntimeDataPlane
 	networkd                   *networkd.Manager
 	routing                    *routing.Manager
 	frr                        *frr.Manager

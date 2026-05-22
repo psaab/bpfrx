@@ -21,7 +21,6 @@ import (
 	"github.com/psaab/xpf/pkg/cli"
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
-	"github.com/psaab/xpf/pkg/conntrack"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcprelay"
@@ -46,7 +45,7 @@ func collectAppliedTunnels(cfg *config.Config) []*config.TunnelConfig {
 	if cfg == nil {
 		return nil
 	}
-	anchorOnly := cfg.System.DataplaneType == dataplane.TypeUserspace
+	anchorOnly := dataplane.EffectiveType(cfg.System.DataplaneType) == dataplane.TypeUserspace
 	var tunnels []*config.TunnelConfig
 	for _, ifc := range cfg.Interfaces.Interfaces {
 		if ifc == nil {
@@ -131,7 +130,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// reshape mlx5 RSS indirection before any AF_XDP bind. Zero
 			// when userspace dataplane is not in use — applyRSSIndirection
 			// treats that as a no-op.
-			if cfg.System.DataplaneType == "userspace" && cfg.System.UserspaceDataplane != nil {
+			if dataplane.EffectiveType(cfg.System.DataplaneType) == dataplane.TypeUserspace &&
+				cfg.System.UserspaceDataplane != nil {
 				userspaceDP = true
 				userspaceWorkers = cfg.System.UserspaceDataplane.Workers
 				if cfg.System.UserspaceDataplane.RSSIndirectionDisabled {
@@ -306,13 +306,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			lp.StartFIBSync(ctx)
 		}
 
-		gc := conntrack.NewGCWithDomains(
-			d.dp.Sessions(),
-			d.dp.Telemetry(),
-			nil,
-			nil,
-			10*time.Second,
-		)
+		gc := d.newConntrackGC(10 * time.Second)
 		d.gc = gc
 
 		// When the userspace dataplane is active, skip BPF session map

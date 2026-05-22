@@ -65,7 +65,10 @@ func strictVIPOwnershipByDefault(cc *config.ClusterConfig, cfg *config.Config) b
 	// already being forwarding-ready before VIP/MAC ownership moves. Waiting
 	// for the VRRP MASTER event to derive rg_active leaves a cutover window
 	// where reply packets can hit the promoted node before userspace is active.
-	return cfg == nil || cfg.System.DataplaneType != dataplane.TypeUserspace
+	if cfg == nil {
+		return false
+	}
+	return dataplane.EffectiveType(cfg.System.DataplaneType) != dataplane.TypeUserspace
 }
 
 func (d *Daemon) setLocalFailoverCommitReady(rgID int, ready bool) {

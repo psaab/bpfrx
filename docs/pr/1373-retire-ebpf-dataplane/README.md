@@ -131,6 +131,9 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 - `pkg/dataplane.DataPlane` is still load-bearing for API, gRPC, CLI, status,
   monitor, logging, cluster session sync, conntrack GC, daemon HA, daemon flow,
   and daemon apply bridges listed above.
+- Omitted `system dataplane-type` now resolves to the userspace runtime path.
+  Explicit `system dataplane-type ebpf` remains available only as a temporary
+  compatibility setting until source removal.
 - `pkg/dataplane/userspace.LegacyDataPlaneAdapter` is still required because
   userspace runtime construction returns a legacy-compatible adapter while
   unmigrated operator services consume old session, telemetry, and control

@@ -9,14 +9,13 @@ Last updated: 2026-05-21
 
 ## Deprecation Context
 
-Issue #1373 retires the legacy eBPF dataplane in staged phases. As of Phase 1,
-the Rust AF_XDP userspace dataplane is the primary/default target for
-dataplane development and routine validation. Phase 1 is still documentation
-and migration-targeting work only: no BPF source, bpf2go bindings, loader code,
-test targets, or CLI surfaces are removed in this phase. Until the blockers
-below are closed, the legacy eBPF dataplane remains present as the
-compatibility and rollback path for configurations the AF_XDP userspace
-dataplane cannot yet own.
+Issue #1373 retires the legacy eBPF dataplane in staged phases. The Rust
+AF_XDP userspace dataplane is now the effective runtime default when
+`system dataplane-type` is omitted, and it remains the primary target for
+dataplane development and routine validation. No BPF source, bpf2go bindings,
+loader code, test targets, or CLI surfaces are removed in this phase. The
+legacy eBPF dataplane remains present only for explicit compatibility and
+regression use while the source-removal blockers close.
 
 DPDK is not part of the userspace retirement path. It remains a separately
 supported DPDK-build backend, but #1475 confines its root `DataPlane`
@@ -150,14 +149,16 @@ Those are separate questions. Use:
 There are two distinct fallback boundaries:
 
 1. **Compile-time / reconcile-time gate**
-   - The Go manager chooses `xdp_userspace_prog` or `xdp_main_prog`
-     depending on `deriveUserspaceCapabilities()`.
+   - The Go manager chooses the userspace runtime path by default. Explicit
+     legacy eBPF selection can still use `xdp_main_prog` while #1373 source
+     removal is staged.
 
 2. **Runtime XDP decision**
    - Even when `xdp_userspace_prog` is active, the XDP shim can still:
      - redirect to AF_XDP
      - send kernel-owned traffic to cpumap / kernel
-     - tail-call back into the legacy XDP pipeline for explicit fallback reasons
+     - tail-call back into the legacy XDP pipeline only for remaining explicit
+       compatibility fallback paths tracked by #1473
      - drop on dead/missing userspace bindings to fail closed
 
 ## Priority Work

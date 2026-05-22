@@ -1018,7 +1018,7 @@ func (d *Daemon) userspaceDataplaneActive() bool {
 }
 
 func userspaceRGConfigured(cfg *config.Config, rgID int) bool {
-	if cfg == nil || cfg.System.DataplaneType != dataplane.TypeUserspace || rgID <= 0 {
+	if cfg == nil || dataplane.EffectiveType(cfg.System.DataplaneType) != dataplane.TypeUserspace || rgID <= 0 {
 		return false
 	}
 	for _, ifc := range cfg.Interfaces.Interfaces {

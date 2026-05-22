@@ -1,7 +1,6 @@
 // xpfd is the xpf firewall daemon.
 //
-// It provides a Junos-style CLI for configuring an eBPF-based firewall
-// that replicates Juniper vSRX capabilities.
+// It provides a Junos-style CLI for configuring the xpf firewall.
 package main
 
 import (
@@ -54,7 +53,7 @@ func main() {
 	}
 
 	configFile := flag.String("config", "/etc/xpf/xpf.conf", "configuration file path")
-	noDataplane := flag.Bool("no-dataplane", false, "run without eBPF (config-only mode)")
+	noDataplane := flag.Bool("no-dataplane", false, "run without a dataplane (config-only mode)")
 	apiAddr := flag.String("api-addr", "127.0.0.1:8080", "HTTP API listen address (empty to disable)")
 	grpcAddr := flag.String("grpc-addr", "127.0.0.1:50051", "gRPC API listen address")
 	debug := flag.Bool("debug", false, "enable debug logging")
