@@ -21,10 +21,9 @@ const (
 
 var legacyDataplaneImportAllowlist = map[string]string{
 	"cmd/xpfd/main.go":                         "backend selection, cleanup, and backend registration",
-	"pkg/api/handlers.go":                      "REST handlers still receive the legacy dataplane bridge",
+	"pkg/api/handlers.go":                      "REST handlers still reference legacy dataplane counters and types",
 	"pkg/api/handlers_sessions.go":             "REST session reads still use legacy session types",
 	"pkg/api/metrics.go":                       "Prometheus telemetry still reads legacy counters and metadata",
-	"pkg/api/server.go":                        "REST server constructor still stores the legacy bridge",
 	"pkg/cli/cli.go":                           "embedded CLI constructor still stores the legacy bridge",
 	"pkg/cli/cli_clear.go":                     "clear commands still delete legacy session entries",
 	"pkg/cli/cli_show_cluster.go":              "cluster display still reads legacy dataplane state",

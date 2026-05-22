@@ -21,7 +21,6 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/conntrack"
-	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/ipsec"
@@ -47,7 +46,7 @@ type Config struct {
 	TLS       bool   // enable HTTPS with auto-generated certificate
 	Auth      *AuthConfig // nil = no authentication
 	Store     *configstore.Store
-	DP        dataplane.DataPlane
+	DP        apiRuntimeDataPlane
 	EventBuf  *logging.EventBuffer
 	GC        *conntrack.GC
 	Routing   *routing.Manager
@@ -75,7 +74,7 @@ type Server struct {
 	httpServer  *http.Server
 	httpsServer *http.Server
 	store       *configstore.Store
-	dp          dataplane.DataPlane
+	dp          apiRuntimeDataPlane
 	eventBuf    *logging.EventBuffer
 	gc          *conntrack.GC
 	routing     *routing.Manager

@@ -88,10 +88,9 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | File | Current blocker |
 |---|---|
 | `cmd/xpfd/main.go` | Backend selection, cleanup, and backend registration still cross the root package. |
-| `pkg/api/handlers.go` | REST handlers still receive the legacy dataplane bridge. |
+| `pkg/api/handlers.go` | REST handlers still reference legacy dataplane counters and types. |
 | `pkg/api/handlers_sessions.go` | REST session reads still use legacy session types. |
 | `pkg/api/metrics.go` | Prometheus telemetry still reads legacy counters and metadata. |
-| `pkg/api/server.go` | REST server construction still stores the legacy bridge. |
 | `pkg/cli/cli.go` | Embedded CLI construction still stores the legacy bridge. |
 | `pkg/cli/cli_clear.go` | Clear commands still delete legacy session entries. |
 | `pkg/cli/cli_show_cluster.go` | Cluster display still reads legacy dataplane state. |

@@ -22,6 +22,27 @@ import (
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
+// apiRuntimeDataPlane is the API server's legacy-compatible runtime surface.
+// It intentionally stays narrower than dataplane.DataPlane while REST handlers
+// still migrate one domain at a time.
+type apiRuntimeDataPlane interface {
+	IsLoaded() bool
+	IterateSessions(func(dataplane.SessionKey, dataplane.SessionValue) bool) error
+	IterateSessionsV6(func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
+	ClearAllSessions() (int, int, error)
+
+	ReadGlobalCounter(uint32) (uint64, error)
+	ReadInterfaceCounters(int) (dataplane.InterfaceCounterValue, error)
+	ReadZoneCounters(uint16, int) (dataplane.CounterValue, error)
+	ReadPolicyCounters(uint32) (dataplane.CounterValue, error)
+	ReadFilterConfig(uint32) (dataplane.FilterConfig, error)
+	ReadFilterCounters(uint32) (dataplane.CounterValue, error)
+	ReadNATRuleCounter(uint32) (dataplane.CounterValue, error)
+	ReadNATPortCounter(uint32) (uint64, error)
+	ClearAllCounters() error
+	GetMapStats() []dataplane.MapStats
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
