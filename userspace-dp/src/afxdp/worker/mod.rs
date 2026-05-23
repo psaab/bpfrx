@@ -1483,11 +1483,11 @@ pub(crate) fn worker_loop(
                 vacate_all_shared_exact_slots_for_binding(binding);
             }
         }
+        let wg_snapshots: Vec<(String, u16)> = pending_wireguard_snapshots
+            .iter()
+            .map(|(n, s)| (n.clone(), s.listen_port))
+            .collect();
         if !pending_wireguard_snapshots.is_empty() {
-            let wg_snapshots: Vec<(String, u16)> = pending_wireguard_snapshots
-                .iter()
-                .map(|(n, s)| (n.clone(), s.listen_port))
-                .collect();
             for (ifname, wg_iface) in &pending_wireguard_snapshots {
                 let wg_peers: Vec<super::wireguard::WireGuardPeerSnapshot> = wg_iface
                     .peers
@@ -1515,16 +1515,17 @@ pub(crate) fn worker_loop(
                     );
                 }
             }
-            // Reconcile: remove engines for interfaces that were in the
-            // previous snapshot but are absent from the current one.
-            for binding in bindings.iter_mut() {
-                if let Some(old_ifaces) = binding.wireguard_prev_ifaces.take() {
-                    binding.wireguard.reconcile_snapshots(&old_ifaces, &wg_snapshots);
-                }
-                binding.wireguard_prev_ifaces = Some(
-                    wg_snapshots.iter().cloned().collect(),
-                );
+        }
+        // Always reconcile: remove engines for interfaces that were in
+        // the previous snapshot but are absent from the current one,
+        // even when the current snapshot is empty (all WG removed).
+        for binding in bindings.iter_mut() {
+            if let Some(old_ifaces) = binding.wireguard_prev_ifaces.take() {
+                binding.wireguard.reconcile_snapshots(&old_ifaces, &wg_snapshots);
             }
+            binding.wireguard_prev_ifaces = Some(
+                wg_snapshots.iter().cloned().collect(),
+            );
         }
         if !shaped_tx_requests.is_empty() {
             apply_worker_shaped_tx_requests(

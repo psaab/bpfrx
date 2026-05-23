@@ -25,7 +25,7 @@ pub(crate) fn build_outer_headers(
             let total_len_u16 = u16::try_from(20 + 8 + payload_len).ok()?;
             let ip_hdr = out.get_mut(ip_start..ip_start + 20)?;
             ip_hdr[0] = 0x45;
-            ip_hdr[1] = inner_tos_tc;
+            ip_hdr[1] = inner_tos_tc << 2;
             ip_hdr[2..4].copy_from_slice(&total_len_u16.to_be_bytes());
             ip_hdr[4..8].copy_from_slice(&[0, 0, 0x40, 0]);
             ip_hdr[8] = 64;
@@ -66,12 +66,14 @@ pub(crate) fn build_outer_headers(
             }
             let payload_len_u16 = u16::try_from(8 + payload_len).ok()?;
             let ip_hdr = out.get_mut(ip_start..ip_start + 40)?;
-            // inner_tos_tc is the full 8-bit TOS (IPv4) / Traffic Class
-            // (IPv6) byte from the inner packet: DSCP (6 bits) in the
-            // top-6, ECN (2 bits) in the bottom-2.  Copy it into the
-            // outer IPv6 header, splitting across the TC nibbles.
-            ip_hdr[0] = 0x60 | ((inner_tos_tc >> 4) & 0x0f);
-            ip_hdr[1] = ((inner_tos_tc & 0x0f) << 4) | (ip_hdr[1] & 0x0f);
+            // inner_tos_tc is the 6-bit DSCP value (right-justified,
+            // per meta.dscp in xpf_helpers.h).  Shift left by 2 to
+            // restore the full TOS/TC byte (ECN bits = 00), then
+            // split across the IPv6 TC nibbles.  Set flow-label to
+            // zero (bytes 1-3) rather than preserving garbage.
+            let tc_byte = inner_tos_tc << 2;
+            ip_hdr[0] = 0x60 | ((tc_byte >> 4) & 0x0f);
+            ip_hdr[1] = (tc_byte & 0x0f) << 4;
             ip_hdr[2..4].copy_from_slice(&[0, 0]);
             ip_hdr[4..6].copy_from_slice(&payload_len_u16.to_be_bytes());
             ip_hdr[6] = PROTO_UDP;
@@ -237,7 +239,9 @@ pub(crate) fn parse_inner_protocol_and_offsets(packet: &[u8], addr_family: u8) -
                             if offset + 3 > packet.len() {
                                 return None;
                             }
-                            (packet[offset + 1] as usize + 1) * 4
+                            // RFC 4302 §2: Hdr Ext Len is count of 32-bit
+                            // words minus 2.  Total = (payload_len + 2) * 4.
+                            (packet[offset + 1] as usize + 2) * 4
                         }
                         135 => {
                             if offset + 1 > packet.len() {
@@ -301,60 +305,6 @@ pub(crate) fn packet_tcp_flags(packet: &[u8], _addr_family: u8, protocol: u8, re
     }
     let l4 = rel_l4 as usize;
     packet.get(l4 + 13).copied().unwrap_or_default()
-}
-
-/// Compute the effective TCP MSS for WireGuard tunnels given the
-/// forwarding state and session decision.
-#[allow(dead_code)]
-pub(crate) fn wireguard_tcp_mss(
-    forwarding: &crate::afxdp::types::ForwardingState,
-    decision: &crate::session::SessionDecision,
-    addr_family: u8,
-) -> u16 {
-    if decision.resolution.tunnel_endpoint_id == 0 {
-        return 0;
-}
-    if forwarding.tcp_mss_all_tcp > 0 {
-        return forwarding.tcp_mss_all_tcp;
-    }
-    let Some(endpoint) = forwarding
-        .tunnel_endpoints
-        .get(&decision.resolution.tunnel_endpoint_id)
-    else {
-        return 0;
-    };
-    if !endpoint.is_wireguard() {
-        return 0;
-    }
-    let outer_ip_len = match addr_family as i32 {
-        libc::AF_INET => 20usize,
-        libc::AF_INET6 => 40usize,
-        _ => return 0,
-    };
-    let wg_overhead = outer_ip_len + 8 + 32;
-    let transport_ifindex = forwarding
-        .ingress_logical_ifindex
-        .get(&(decision.resolution.tx_ifindex, decision.resolution.tx_vlan_id))
-        .copied()
-        .unwrap_or(decision.resolution.tx_ifindex);
-    let transport_mtu = forwarding
-        .egress
-        .get(&transport_ifindex)
-        .or_else(|| forwarding.egress.get(&decision.resolution.egress_ifindex))
-        .map(|egress| egress.mtu)
-        .unwrap_or_default();
-    if transport_mtu == 0 {
-        return 0;
-    }
-    let inner_ip_len = match addr_family as i32 {
-        libc::AF_INET => 20usize,
-        libc::AF_INET6 => 40usize,
-        _ => return 0,
-    };
-    transport_mtu
-        .checked_sub(wg_overhead + inner_ip_len + 20)
-        .and_then(|mss| u16::try_from(mss).ok())
-        .unwrap_or_default()
 }
 
 pub(crate) fn parse_endpoint(s: &str) -> Option<(IpAddr, u16)> {

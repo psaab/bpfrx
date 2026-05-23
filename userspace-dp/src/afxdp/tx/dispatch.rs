@@ -805,7 +805,10 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 expected_ports,
                             ) {
                                 Some(w) => w,
-                                None => continue,
+                                None => {
+                                    recycle_ingress_frame(ingress_binding, source_offset, now_ns);
+                                    continue;
+                                }
                             };
                             inner.truncate(written);
                             Some(inner)
@@ -836,9 +839,11 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                         ) {
                                             frame = wg_frame;
                                         } else {
+                                            recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                                             continue;
                                         }
                                     } else {
+                                        recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                                         continue;
                                     }
                                 }

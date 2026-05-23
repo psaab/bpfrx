@@ -774,6 +774,69 @@ pub(super) fn native_gre_tcp_mss(
     u16::try_from(max_mss).unwrap_or_default()
 }
 
+/// Compute the effective TCP MSS for any tunnel type (GRE or WireGuard).
+///
+/// Dispatches to the GRE or WireGuard calculator based on the endpoint
+/// mode.  Returns 0 when no tunnel is in play or no MSS clamp is needed.
+pub(super) fn tunnel_tcp_mss(
+    forwarding: &ForwardingState,
+    decision: &SessionDecision,
+    addr_family: u8,
+) -> u16 {
+    // Try GRE first — when the endpoint is GRE this returns the GRE MSS;
+    // when it is WG the check inside native_gre_tcp_mss fails because
+    // neither tcp_mss_gre_out nor native_gre_inner_mtu match WG, so it
+    // returns 0 and we fall through to the WireGuard calculator.
+    let mss = native_gre_tcp_mss(forwarding, decision, addr_family);
+    if mss > 0 {
+        return mss;
+    }
+    if decision.resolution.tunnel_endpoint_id == 0 {
+        return 0;
+    }
+    let Some(endpoint) = forwarding
+        .tunnel_endpoints
+        .get(&decision.resolution.tunnel_endpoint_id)
+    else {
+        return 0;
+    };
+    if !endpoint.is_wireguard() {
+        return 0;
+    }
+    if forwarding.tcp_mss_all_tcp > 0 {
+        return forwarding.tcp_mss_all_tcp;
+    }
+    let outer_ip_len = match addr_family as i32 {
+        libc::AF_INET => 20usize,
+        libc::AF_INET6 => 40usize,
+        _ => return 0,
+    };
+    let wg_overhead = outer_ip_len + 8 + 32; // outer UDP + WG header
+    let transport_ifindex = forwarding
+        .ingress_logical_ifindex
+        .get(&(decision.resolution.tx_ifindex, decision.resolution.tx_vlan_id))
+        .copied()
+        .unwrap_or(decision.resolution.tx_ifindex);
+    let transport_mtu = forwarding
+        .egress
+        .get(&transport_ifindex)
+        .or_else(|| forwarding.egress.get(&decision.resolution.egress_ifindex))
+        .map(|egress| egress.mtu)
+        .unwrap_or_default();
+    if transport_mtu == 0 {
+        return 0;
+    }
+    let inner_ip_len = match addr_family as i32 {
+        libc::AF_INET => 20usize,
+        libc::AF_INET6 => 40usize,
+        _ => return 0,
+    };
+    transport_mtu
+        .checked_sub(wg_overhead + inner_ip_len + 20)
+        .and_then(|mss| u16::try_from(mss).ok())
+        .unwrap_or_default()
+}
+
 // #989: clamp_tcp_mss / clamp_tcp_mss_frame relocated to `frame/tcp.rs`.
 
 #[allow(dead_code)]

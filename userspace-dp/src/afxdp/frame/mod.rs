@@ -279,7 +279,7 @@ pub(super) fn build_forwarded_frame_into_from_frame(
     }
     let out = &mut out[..frame_len];
     let force_tunnel_l4_recompute = decision.resolution.tunnel_endpoint_id != 0;
-    let tunnel_tcp_mss = native_gre_tcp_mss(forwarding, decision, meta.addr_family);
+    let tunnel_tcp_mss = tunnel_tcp_mss(forwarding, decision, meta.addr_family);
     let ip_start = eth_len;
     match meta.addr_family as i32 {
         libc::AF_INET => {

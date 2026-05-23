@@ -827,18 +827,18 @@ impl Coordinator {
                     .map(|wg| (iface.name.clone(), wg.clone()))
             })
             .collect();
-        if !wg_snapshots.is_empty() {
-            if self.workers.handles.len() != 1 {
+        if self.workers.handles.len() != 1 {
+            if !wg_snapshots.is_empty() {
                 eprintln!(
                     "xpf-coordinator: WireGuard requires exactly 1 worker thread \
                      (found {}); WireGuard tunnels will not function until the \
                      interface config is reduced to a single RX queue",
                     self.workers.handles.len()
                 );
-            } else if let Some(handle) = self.workers.handles.values().next() {
-                let mut q = handle.commands.lock().unwrap();
-                q.push_back(WorkerCommand::ApplyWireguard(wg_snapshots));
             }
+        } else if let Some(handle) = self.workers.handles.values().next() {
+            let mut q = handle.commands.lock().unwrap();
+            q.push_back(WorkerCommand::ApplyWireguard(wg_snapshots));
         }
         self.spawn_local_tunnel_sources();
         self.refresh_bindings(bindings);
