@@ -369,7 +369,7 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 		// can create a kernel-level conflict on the parent (EEXIST).
 		// Also skip with the userspace XDP shim — XDP_PASS on generic mode
 		// doesn't properly deliver NDP to kernel on VLAN devices.
-		isUserspaceShim := m.XDPEntryProg == "xdp_userspace_prog"
+		isUserspaceShim := m.UsingUserspaceXDPShimEntryProgram()
 		for _, ifidx := range result.pendingXDP {
 			forceGeneric := failedNativeXDP[ifidx] || result.tunnelIfindexes[ifidx] || result.genericXDPIfindexes[ifidx]
 			if !forceGeneric {
@@ -394,7 +394,7 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 		}
 	}
 
-	// Record VLAN sub-interfaces so SwapXDPEntryProg can skip them.
+	// Record VLAN sub-interfaces so userspace-shim swaps can skip them.
 	// The shim on VLAN sub-interfaces breaks NDP because generic XDP
 	// + XDP_PASS doesn't deliver properly to kernel NDP on VLAN devices.
 	for ifidx := range result.genericXDPIfindexes {

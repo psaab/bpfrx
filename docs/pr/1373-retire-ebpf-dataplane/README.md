@@ -123,10 +123,12 @@ generation. `pkg/dataplane/retirement_boundary_canary_test.go` reads the
 Makefile and fails if `generate-userspace-xdp` gains legacy bpf2go tokens,
 recursive Make dependencies, or the broad `./pkg/dataplane/...` generate path.
 The same canary allowlists the retained Rust shim's source-level and built-object
-maps/programs, rejects tail-call plumbing in that shim, and requires production
-userspace manager writes to `XDPEntryProg` or calls to `SwapXDPEntryProg` to use
-`userspaceXDPEntryProg`. This keeps the retained shim visible without implying
-that degraded userspace mode can bypass back into the legacy pipeline.
+maps/programs, rejects tail-call plumbing in that shim, and requires the retained
+Go shim manager to keep its entry-program state unexported so JSON/reflection
+cannot select the legacy XDP entry point. Production userspace code may only use
+the narrow userspace-shim selection/swap methods. This keeps the retained shim
+visible without implying that degraded userspace mode can bypass back into the
+legacy pipeline.
 
 The remaining #1473/#1451 blocker is #1493's loader/bootstrap shape, not runtime
 fallback semantics. `pkg/dataplane/userspace.Manager` still creates a named

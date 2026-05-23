@@ -33,8 +33,11 @@ func TestXSKLivenessFailureRestoresUserspaceShimEntry(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Skipf("RemoveMemlock: %v", err)
 	}
-	m := New()
-	m.bpfShim.XDPEntryProg = "xdp_main_prog"
+	m := &Manager{
+		bpfShim:        dataplane.New(),
+		configuredMode: ModeUserspaceCompat,
+		haGroups:       make(map[int]HAGroupStatus),
+	}
 	injectShimProgramName(t, m.bpfShim, userspaceXDPEntryProg)
 	injectCtrlAndBindingMaps(t, m)
 	m.neighborsPrewarmed = true
@@ -63,8 +66,8 @@ func TestXSKLivenessFailureRestoresUserspaceShimEntry(t *testing.T) {
 	if !m.xskLivenessFailed {
 		t.Fatal("xskLivenessFailed = false, want true after expired liveness probe")
 	}
-	if got := m.bpfShim.XDPEntryProg; got != userspaceXDPEntryProg {
-		t.Fatalf("XDPEntryProg = %q, want %q", got, userspaceXDPEntryProg)
+	if got := m.bpfShim.XDPEntryProgram(); got != userspaceXDPEntryProg {
+		t.Fatalf("XDPEntryProgram() = %q, want %q", got, userspaceXDPEntryProg)
 	}
 }
 
@@ -330,7 +333,7 @@ func injectShimProgramName(t *testing.T, bpfShim *dataplane.Manager, name string
 	if rm.IsNil() {
 		rm.Set(reflect.MakeMap(rv.Type()))
 	}
-	// SwapXDPEntryProg only needs the name to exist when no links are
+	// SwapToUserspaceXDPShimEntryProgram only needs the name to exist when no links are
 	// attached, so a nil *ebpf.Program is sufficient for this unit test.
 	rm.SetMapIndex(reflect.ValueOf(name), reflect.Zero(rv.Type().Elem()))
 }

@@ -134,7 +134,7 @@ window, not a current userspace HA success condition. Two changes were made:
    when XSK cannot deliver packets.
 
 2. After 30 seconds of XSK bindings being ready but `rx_packets == 0`,
-   the manager called `SwapXDPEntryProg("xdp_main_prog")` as a legacy fallback
+   the manager historically selected `xdp_main_prog` as a legacy fallback
    to replace the XDP shim with the direct legacy eBPF pipeline. That
    historical fallback restored forwarding during this investigation, but an
    active userspace validation run must treat this attachment as failure unless
@@ -173,7 +173,7 @@ normally. If it also fails (true dual-inactive), drop with
 ### 1.10 `4ddf371f` -- Persist historical XSK liveness failure across config reconciles
 
 The historical XSK liveness swap to `xdp_main_prog` was being overridden by
-config reconciles which re-set `XDPEntryProg` to `xdp_userspace_prog`. Added
+config reconciles which re-selected `xdp_userspace_prog`. Added
 `xskLivenessFailed` flag that persists and prevents `Compile` from switching
 back to the broken XDP shim. Also added `delta-rx` check: the liveness gate now
 compares current `rx_packets` against a snapshot taken at gate start, so

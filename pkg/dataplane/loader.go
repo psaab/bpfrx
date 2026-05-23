@@ -19,6 +19,11 @@ import (
 const linkPinPath = "/sys/fs/bpf/xpf/links"
 const userspaceShimEntryProg = "xdp_userspace_prog"
 
+const (
+	defaultXDPEntryProg       = "xdp_main_prog"
+	userspaceShimXDPEntryProg = "xdp_userspace_prog"
+)
+
 // go:generate directives.
 // Run "make generate" with clang + libbpf-dev installed for the full legacy
 // XDP/TC bpf2go batch plus the retained Rust userspace XDP shim object.
@@ -54,7 +59,7 @@ type Manager struct {
 	lastApply               *ApplyResult
 	PersistentNAT           *PersistentNATTable
 	EnableCPUMap            bool // Enable cpumap multi-CPU distribution (adds startup overhead)
-	XDPEntryProg            string
+	xdpEntryProg            string
 	VlanSubInterfaces       map[int]bool      // VLAN sub-interface ifindexes (skip XDP swap for these)
 	mu                      sync.Mutex        // protects userspaceCounterOffsets
 	userspaceCounterOffsets map[uint32]uint64 // userspace counter deltas merged in ReadGlobalCounter
@@ -79,10 +84,31 @@ func New() *Manager {
 		xdpLinks:          make(map[int]link.Link),
 		tcLinks:           make(map[int]link.Link),
 		PersistentNAT:     NewPersistentNATTable(),
-		XDPEntryProg:      "xdp_main_prog",
+		xdpEntryProg:      defaultXDPEntryProg,
 		VlanSubInterfaces: make(map[int]bool),
 		xdpFlagClaims:     make(map[IfaceZoneKey]map[int]bool),
 	}
+}
+
+// XDPEntryProgram returns the entry program selected for future XDP
+// attachments and currently swapped links.
+func (m *Manager) XDPEntryProgram() string {
+	if m.xdpEntryProg == "" {
+		return defaultXDPEntryProg
+	}
+	return m.xdpEntryProg
+}
+
+// SelectUserspaceXDPShimEntryProgram selects the retained userspace shim for
+// future XDP attachments without touching already attached links.
+func (m *Manager) SelectUserspaceXDPShimEntryProgram() {
+	m.xdpEntryProg = userspaceShimXDPEntryProg
+}
+
+// UsingUserspaceXDPShimEntryProgram reports whether the retained userspace
+// shim is selected for XDP attachments and swapped links.
+func (m *Manager) UsingUserspaceXDPShimEntryProgram() bool {
+	return m.XDPEntryProgram() == userspaceShimXDPEntryProg
 }
 
 // Load loads all eBPF programs and maps. Returns an error if eBPF
@@ -440,10 +466,7 @@ func (m *Manager) AttachXDP(ifindex int, forceGeneric bool) error {
 		return fmt.Errorf("eBPF programs not loaded")
 	}
 
-	entryProg := m.XDPEntryProg
-	if entryProg == "" {
-		entryProg = "xdp_main_prog"
-	}
+	entryProg := m.XDPEntryProgram()
 	prog, ok := m.programs[entryProg]
 	if !ok {
 		return fmt.Errorf("%s not found", entryProg)
@@ -549,15 +572,20 @@ func (m *Manager) seedInterfaceCounter(ifindex int) {
 	_ = ic.Update(uint32(ifindex), zero, ebpf.UpdateNoExist)
 }
 
-// SwapXDPEntryProg atomically replaces the XDP entry program on all attached
-// interfaces. Userspace mode keeps the userspace XDP shim attached for normal
-// operation and degraded local/control handling.
-func (m *Manager) SwapXDPEntryProg(name string) error {
+// SwapToUserspaceXDPShimEntryProgram atomically replaces the XDP entry
+// program on all attached interfaces with the retained userspace XDP shim.
+// Userspace mode keeps this shim attached for normal operation and degraded
+// local/control handling.
+func (m *Manager) SwapToUserspaceXDPShimEntryProgram() error {
+	return m.swapXDPEntryProg(userspaceShimXDPEntryProg)
+}
+
+func (m *Manager) swapXDPEntryProg(name string) error {
 	prog, ok := m.programs[name]
 	if !ok {
 		return fmt.Errorf("XDP program %q not found", name)
 	}
-	if m.XDPEntryProg == name {
+	if m.XDPEntryProgram() == name {
 		return nil // already using this program
 	}
 	var errs []error
@@ -576,7 +604,7 @@ func (m *Manager) SwapXDPEntryProg(name string) error {
 	if len(errs) > 0 {
 		return errs[0]
 	}
-	m.XDPEntryProg = name
+	m.xdpEntryProg = name
 	slog.Info("swapped XDP entry program", "program", name, "interfaces", len(m.xdpLinks))
 	return nil
 }

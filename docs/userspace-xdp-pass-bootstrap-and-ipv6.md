@@ -45,7 +45,7 @@ The compiler attaches XDP programs to VLAN sub-interfaces (`ge-0-0-2.50`, `ge-0-
 
 Evidence: `ping6` to the LAN interface (non-VLAN `ge-0-0-1`) worked perfectly. `ping6` to any VLAN interface was 100% loss. Removing generic XDP from the VLAN sub-interface immediately fixed NDP.
 
-**Fix:** Skip XDP attachment on VLAN sub-interfaces when the userspace shim is active (`pkg/dataplane/compiler.go`). The parent's native XDP handles all VLAN-tagged traffic. New `VlanSubInterfaces` map in `loader.go` tracks which ifindexes to skip during `SwapXDPEntryProg()`.
+**Fix:** Skip XDP attachment on VLAN sub-interfaces when the userspace shim is active (`pkg/dataplane/compiler.go`). The parent's native XDP handles all VLAN-tagged traffic. New `VlanSubInterfaces` map in `loader.go` tracks which ifindexes to skip during userspace-shim swaps.
 
 ### 3. VIPs Missing from `userspace_local_v6` BPF Map
 
@@ -102,7 +102,7 @@ With both nodes running the new code, fw1 takes over in ~2.25s and forwards traf
 | `userspace-xdp/src/lib.rs` | Local/control kernel delivery and degraded transit drop paths |
 | `userspace-dp/src/afxdp.rs` | `xsk_rx_confirmed`, `add_kernel_neighbor()` via netlink, ARP/NDP reinject, grace period tuning |
 | `pkg/dataplane/compiler.go` | Skip XDP on VLAN sub-interfaces with userspace shim, `VlanSubInterfaces` tracking |
-| `pkg/dataplane/loader.go` | `VlanSubInterfaces` field, skip in `SwapXDPEntryProg()` |
+| `pkg/dataplane/loader.go` | `VlanSubInterfaces` field, skip during userspace-shim swaps |
 | `pkg/dataplane/userspace/manager.go` | Kernel address enumeration for local map, ctrl delay 3s |
 | `pkg/daemon/daemon.go` | Session sync timeout 5s |
 | `pkg/dataplane/userspace_xdp_bpfel.o` | Rebuilt XDP shim object |

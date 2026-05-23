@@ -159,7 +159,7 @@ func shouldAttemptRSTSuppression(
 
 func New() *Manager {
 	bpfShim := dataplane.New()
-	bpfShim.XDPEntryProg = userspaceXDPEntryProg
+	bpfShim.SelectUserspaceXDPShimEntryProgram()
 	return &Manager{
 		bpfShim:        bpfShim,
 		configuredMode: ModeUserspaceCompat,
@@ -497,7 +497,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	// local/control traffic to the kernel and drops transit. Do not swap to
 	// xdp_main_prog for unsupported capabilities or failed XSK liveness: the
 	// userspace runtime must not require the legacy main XDP pipeline.
-	m.bpfShim.XDPEntryProg = userspaceXDPEntryProg
+	m.bpfShim.SelectUserspaceXDPShimEntryProgram()
 	result, err := m.bpfShim.CompileUserspaceShim(cfg)
 	if err != nil {
 		return nil, err

@@ -39,6 +39,24 @@
 
 ## 2026-05-23
 
+- **Timestamp**: 2026-05-23T17:01:19Z
+  - **Action**: PR #1494 round-9 follow-up — encapsulated the retained shim
+    entry-program state by unexporting `XDPEntryProg`, removed the arbitrary
+    `SwapXDPEntryProg(name)` production surface, and added narrow userspace-shim
+    selection/swap methods plus a JSON-mutability canary. Updated userspace
+    call sites and docs to describe the structural boundary instead of relying
+    on decoder-shape blocklists.
+  - **File(s)**: `pkg/dataplane/loader.go`,
+    `pkg/dataplane/retirement_boundary_canary_test.go`,
+    `pkg/dataplane/userspace/manager.go`,
+    `pkg/dataplane/userspace/maps_sync.go`,
+    `docs/pr/1373-retire-ebpf-dataplane/README.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane -run
+    'TestBPFShimEntryProgramStateIsNotJSONMutable|TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram|TestUserspaceEntryProgramCanaryRejectsBypassFixtures|TestUserspaceEntryProgramCanaryAllowsCrossFileConstantFixture|TestUserspaceXDPEntryProgramConstantNamesRetainedShim'
+    -count=1 -v`; `go test ./pkg/dataplane ./pkg/dataplane/userspace
+    -count=1`; `go test ./pkg/dataplane/... -count=1`; `go test ./...
+    -count=1`; `git diff --check`
+
 - **Timestamp**: 2026-05-23T15:58:00Z
   - **Action**: PR #1494 round-8 follow-up — hardened JSON decoder canary
     laundering checks for stored decoder receivers, function-variable

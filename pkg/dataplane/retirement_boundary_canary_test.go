@@ -1,6 +1,7 @@
 package dataplane
 
 import (
+	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -476,6 +478,59 @@ func TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram(t *testing.T) {
 	}
 }
 
+func TestBPFShimEntryProgramStateIsNotJSONMutable(t *testing.T) {
+	t.Parallel()
+
+	if userspaceShimXDPEntryProg != userspaceXDPEntryProgForCanary {
+		t.Fatalf(
+			"userspace shim entry-program constant = %q, want %q",
+			userspaceShimXDPEntryProg,
+			userspaceXDPEntryProgForCanary,
+		)
+	}
+
+	managerType := reflect.TypeOf(Manager{})
+	if _, ok := managerType.FieldByName("XDPEntryProg"); ok {
+		t.Fatal("dataplane.Manager must not export XDPEntryProg")
+	}
+	field, ok := managerType.FieldByName("xdpEntryProg")
+	if !ok {
+		t.Fatal("dataplane.Manager lost xdpEntryProg state field")
+	}
+	if field.PkgPath == "" {
+		t.Fatal("dataplane.Manager.xdpEntryProg must stay unexported")
+	}
+
+	managerPtrType := reflect.TypeOf((*Manager)(nil))
+	if _, ok := managerPtrType.MethodByName("SwapXDPEntryProg"); ok {
+		t.Fatal("dataplane.Manager must not expose arbitrary SwapXDPEntryProg")
+	}
+	if _, ok := managerPtrType.MethodByName("SwapToUserspaceXDPShimEntryProgram"); !ok {
+		t.Fatal("dataplane.Manager lost narrow userspace shim swap method")
+	}
+
+	data, err := json.Marshal(&Manager{xdpEntryProg: "xdp_bypassed"})
+	if err != nil {
+		t.Fatalf("marshal Manager: %v", err)
+	}
+	if strings.Contains(string(data), "xdp_bypassed") ||
+		strings.Contains(string(data), "XDPEntryProg") ||
+		strings.Contains(string(data), "xdpEntryProg") {
+		t.Fatalf("xdpEntryProg leaked into JSON: %s", data)
+	}
+
+	var decoded Manager
+	if err := json.Unmarshal(
+		[]byte(`{"XDPEntryProg":"xdp_bypassed","xdpEntryProg":"xdp_bypassed"}`),
+		&decoded,
+	); err != nil {
+		t.Fatalf("unmarshal Manager: %v", err)
+	}
+	if got := decoded.XDPEntryProgram(); got == "xdp_bypassed" {
+		t.Fatalf("JSON mutated xdpEntryProg to %q", got)
+	}
+}
+
 func TestUserspaceManagerDoesNotImportReflectOrUnsafe(t *testing.T) {
 	t.Parallel()
 
@@ -519,18 +574,17 @@ package userspace
 
 const userspaceXDPEntryProg = "xdp_userspace_prog"
 
-type shim struct { XDPEntryProg string }
-func (s *shim) SwapXDPEntryProg(name string) error { return nil }
+type shim struct{}
+func (s *shim) SelectUserspaceXDPShimEntryProgram() {}
+func (s *shim) SwapToUserspaceXDPShimEntryProgram() error { return nil }
 type manager struct { bpfShim *shim }
 `,
 		"use.go": `
 package userspace
 
 func valid(m *manager) {
-	m.bpfShim.XDPEntryProg = userspaceXDPEntryProg
-	_ = m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg)
-	_ = (m.bpfShim.SwapXDPEntryProg)(userspaceXDPEntryProg)
-	_ = ((*shim).SwapXDPEntryProg)(m.bpfShim, userspaceXDPEntryProg)
+	m.bpfShim.SelectUserspaceXDPShimEntryProgram()
+	_ = m.bpfShim.SwapToUserspaceXDPShimEntryProgram()
 }
 `,
 	})
@@ -1030,15 +1084,13 @@ func userspaceXDPEntryProgramViolations(t *testing.T, roots []string) []string {
 					if len(node.Rhs) == len(node.Lhs) {
 						rhs = node.Rhs[i]
 					}
-					if !isUserspaceXDPEntryProgExpr(rhs) {
-						pos := fset.Position(lhs.Pos())
-						violations = append(violations, fmt.Sprintf(
-							"%s:%d assigns XDPEntryProg from %q",
-							rel,
-							pos.Line,
-							canaryExprString(rhs),
-						))
-					}
+					pos := fset.Position(lhs.Pos())
+					violations = append(violations, fmt.Sprintf(
+						"%s:%d assigns XDPEntryProg from %q",
+						rel,
+						pos.Line,
+						canaryExprString(rhs),
+					))
 				}
 			case *ast.CompositeLit:
 				for _, elt := range node.Elts {
@@ -1046,15 +1098,13 @@ func userspaceXDPEntryProgramViolations(t *testing.T, roots []string) []string {
 					if !ok || !isXDPEntryProgField(kv.Key) {
 						continue
 					}
-					if !isUserspaceXDPEntryProgExpr(kv.Value) {
-						pos := fset.Position(kv.Pos())
-						violations = append(violations, fmt.Sprintf(
-							"%s:%d initializes XDPEntryProg from %q",
-							rel,
-							pos.Line,
-							canaryExprString(kv.Value),
-						))
-					}
+					pos := fset.Position(kv.Pos())
+					violations = append(violations, fmt.Sprintf(
+						"%s:%d initializes XDPEntryProg from %q",
+						rel,
+						pos.Line,
+						canaryExprString(kv.Value),
+					))
 				}
 			case *ast.CallExpr:
 				if isJSONDecoderIntoBPFShim(node, jsonImports, jsonDotImport) {
@@ -1743,13 +1793,8 @@ func containsBPFShimFromIdent(ident *ast.Ident, seen map[*ast.Object]bool) bool 
 func swapXDPEntryProgSelectorViolation(sel *ast.SelectorExpr, parents map[ast.Node]ast.Node, fset *token.FileSet, rel string) string {
 	if call, methodExpr, ok := enclosingDirectSwapXDPEntryProgCall(sel, parents); ok {
 		argIndex := 0
-		wantArgs := 1
 		if methodExpr {
 			argIndex = 1
-			wantArgs = 2
-		}
-		if len(call.Args) == wantArgs && isUserspaceXDPEntryProgExpr(call.Args[argIndex]) {
-			return ""
 		}
 		var got string
 		if len(call.Args) > argIndex {
