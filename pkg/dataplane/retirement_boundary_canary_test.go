@@ -94,7 +94,7 @@ var userspaceShimAllowedProgramTypes = map[string]ebpf.ProgramType{
 }
 
 var (
-	rustMapAnnotationRE = regexp.MustCompile(`#\[\s*map\s*\(\s*name\s*=\s*"([^"]+)"\s*\)\s*\]`)
+	rustMapAnnotationRE = regexp.MustCompile(`#\[\s*map\s*\([^)]*\bname\s*=\s*"([^"]+)"[^)]*\)\s*\]`)
 	rustXDPFunctionRE   = regexp.MustCompile(`#\[\s*xdp\s*\]\s*(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)`)
 )
 
@@ -467,9 +467,201 @@ func TestUserspaceXDPShimObjectMatchesRetainedCollectionAllowlist(t *testing.T) 
 func TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram(t *testing.T) {
 	t.Parallel()
 
-	fset, files := productionGoPackageFilesUnder(t, []string{
+	violations := userspaceXDPEntryProgramViolations(t, []string{
 		filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace"),
 	})
+	if len(violations) > 0 {
+		sort.Strings(violations)
+		t.Fatalf("userspace manager production code must only select userspaceXDPEntryProg: %v", violations)
+	}
+}
+
+func TestUserspaceXDPEntryProgramConstantNamesRetainedShim(t *testing.T) {
+	t.Parallel()
+
+	found, violations := userspaceXDPEntryProgramConstantDrift(t, []string{
+		filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace"),
+	})
+	if len(found) != 1 || len(violations) > 0 {
+		sort.Strings(found)
+		sort.Strings(violations)
+		t.Fatalf("userspaceXDPEntryProg constant drift\nfound: %v\nviolations: %v", found, violations)
+	}
+}
+
+func TestUserspaceEntryProgramCanaryAllowsCrossFileConstantFixture(t *testing.T) {
+	t.Parallel()
+
+	root := writeUserspaceEntryProgramFixture(t, map[string]string{
+		"const.go": `
+package userspace
+
+const userspaceXDPEntryProg = "xdp_userspace_prog"
+
+type shim struct { XDPEntryProg string }
+func (s *shim) SwapXDPEntryProg(name string) error { return nil }
+type manager struct { bpfShim *shim }
+`,
+		"use.go": `
+package userspace
+
+func valid(m *manager) {
+	m.bpfShim.XDPEntryProg = userspaceXDPEntryProg
+	_ = m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg)
+}
+`,
+	})
+
+	if got := userspaceXDPEntryProgramViolations(t, []string{root}); len(got) > 0 {
+		t.Fatalf("valid cross-file constant fixture produced violations: %v", got)
+	}
+	found, drift := userspaceXDPEntryProgramConstantDrift(t, []string{root})
+	if len(found) != 1 || len(drift) > 0 {
+		t.Fatalf("valid cross-file constant drift\nfound: %v\nviolations: %v", found, drift)
+	}
+}
+
+func TestUserspaceEntryProgramCanaryRejectsBypassFixtures(t *testing.T) {
+	t.Parallel()
+
+	root := writeUserspaceEntryProgramFixture(t, map[string]string{
+		"base.go": `
+package userspace
+
+const userspaceXDPEntryProg = "xdp_userspace_prog"
+
+type shim struct { XDPEntryProg string }
+func (s *shim) SwapXDPEntryProg(name string) error { return nil }
+type manager struct { bpfShim *shim }
+func consume(v interface{}) {}
+`,
+		"bypass.go": `
+package userspace
+
+func literalAssign(m *manager) {
+	m.bpfShim.XDPEntryProg = "xdp_main_prog"
+}
+
+func shadowedConstName(m *manager) {
+	userspaceXDPEntryProg := "xdp_main_prog"
+	m.bpfShim.XDPEntryProg = userspaceXDPEntryProg
+}
+
+func pointerAlias(m *manager) {
+	p := &m.bpfShim.XDPEntryProg
+	_ = p
+}
+
+func methodValueCapture(m *manager) {
+	swap := m.bpfShim.SwapXDPEntryProg
+	_ = swap
+}
+
+func methodValuePass(m *manager) {
+	consume(m.bpfShim.SwapXDPEntryProg)
+}
+
+func methodValueReturn(m *manager) func(string) error {
+	return m.bpfShim.SwapXDPEntryProg
+}
+
+func directBadCall(m *manager) {
+	_ = m.bpfShim.SwapXDPEntryProg("xdp_main_prog")
+}
+
+func reflectionName() {
+	_ = "XDPEntryProg"
+}
+`,
+	})
+
+	violations := userspaceXDPEntryProgramViolations(t, []string{root})
+	assertCanaryViolationsContain(t, violations, []string{
+		"assigns XDPEntryProg from",
+		"xdp_main_prog",
+		"assigns XDPEntryProg from \"userspaceXDPEntryProg\"",
+		"takes XDPEntryProg address",
+		"captures SwapXDPEntryProg method value",
+		"passes SwapXDPEntryProg method value",
+		"returns SwapXDPEntryProg method value",
+		"calls SwapXDPEntryProg with",
+		"uses XDPEntryProg string literal",
+	})
+}
+
+func TestDaemonRuntimeEntryPointUsesRuntimeDataPlane(t *testing.T) {
+	t.Parallel()
+
+	assertDaemonDPFieldIsRuntimeDataPlane(t)
+
+	daemonRun := filepath.Join("..", "daemon", "daemon_run.go")
+	if hasDaemonRuntimeConstructorCall(t, daemonRun, "NewDataPlane") {
+		t.Fatal("daemon runtime startup must call NewRuntimeDataPlane, not NewDataPlane")
+	}
+	if !hasDaemonRuntimeConstructorCall(t, daemonRun, "NewRuntimeDataPlane") {
+		t.Fatal("daemon runtime startup no longer calls dataplane.NewRuntimeDataPlane")
+	}
+}
+
+func TestRetirementBoundaryDocsMentionDPDKPolicy(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(retirementBoundaryDocsForCanary)
+	if err != nil {
+		t.Fatalf("read retirement boundary docs: %v", err)
+	}
+	text := string(data)
+
+	want := []string{
+		"## #1475 DPDK Backend Policy",
+		"DPDK remains a separately supported backend",
+		"outside the eBPF source-removal path",
+		"`pkg/dataplane/dpdk`",
+		"`cmd/xpfd/main.go`",
+		"`-tags dpdk`",
+		"root `DataPlane`",
+	}
+	var missing []string
+	for _, token := range want {
+		if !strings.Contains(text, token) {
+			missing = append(missing, token)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("retirement docs do not mention DPDK policy tokens: %v", missing)
+	}
+}
+
+func TestRetirementBoundaryDocsMentionLegacyImportAllowlist(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(retirementBoundaryDocsForCanary)
+	if err != nil {
+		t.Fatalf("read retirement boundary docs: %v", err)
+	}
+	text := string(data)
+
+	var missing []string
+	for rel := range legacyDataplaneImportAllowlist {
+		if !strings.Contains(text, rel) {
+			missing = append(missing, rel)
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Fatalf("retirement docs do not mention allowlisted legacy imports: %v", missing)
+	}
+}
+
+type canaryParsedGoFile struct {
+	path string
+	file *ast.File
+}
+
+func userspaceXDPEntryProgramViolations(t *testing.T, roots []string) []string {
+	t.Helper()
+
+	fset, files := productionGoPackageFilesUnder(t, roots)
 	var violations []string
 	for _, parsed := range files {
 		rel := repoRelativePath(t, parsed.path)
@@ -579,22 +771,31 @@ func TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram(t *testing.T) {
 						pos.Line,
 					))
 				}
+			case *ast.BasicLit:
+				if node.Kind != token.STRING {
+					return true
+				}
+				value, err := strconv.Unquote(node.Value)
+				if err == nil && value == "XDPEntryProg" {
+					pos := fset.Position(node.Pos())
+					violations = append(violations, fmt.Sprintf(
+						"%s:%d uses XDPEntryProg string literal",
+						rel,
+						pos.Line,
+					))
+				}
 			}
 			return true
 		})
 	}
-	if len(violations) > 0 {
-		sort.Strings(violations)
-		t.Fatalf("userspace manager production code must only select userspaceXDPEntryProg: %v", violations)
-	}
+	sort.Strings(violations)
+	return violations
 }
 
-func TestUserspaceXDPEntryProgramConstantNamesRetainedShim(t *testing.T) {
-	t.Parallel()
+func userspaceXDPEntryProgramConstantDrift(t *testing.T, roots []string) ([]string, []string) {
+	t.Helper()
 
-	fset, files := productionGoPackageFilesUnder(t, []string{
-		filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace"),
-	})
+	fset, files := productionGoPackageFilesUnder(t, roots)
 	var found []string
 	var violations []string
 	for _, parsed := range files {
@@ -627,25 +828,9 @@ func TestUserspaceXDPEntryProgramConstantNamesRetainedShim(t *testing.T) {
 			return true
 		})
 	}
-	if len(found) != 1 || len(violations) > 0 {
-		sort.Strings(found)
-		sort.Strings(violations)
-		t.Fatalf("userspaceXDPEntryProg constant drift\nfound: %v\nviolations: %v", found, violations)
-	}
-}
-
-func TestDaemonRuntimeEntryPointUsesRuntimeDataPlane(t *testing.T) {
-	t.Parallel()
-
-	assertDaemonDPFieldIsRuntimeDataPlane(t)
-
-	daemonRun := filepath.Join("..", "daemon", "daemon_run.go")
-	if hasDaemonRuntimeConstructorCall(t, daemonRun, "NewDataPlane") {
-		t.Fatal("daemon runtime startup must call NewRuntimeDataPlane, not NewDataPlane")
-	}
-	if !hasDaemonRuntimeConstructorCall(t, daemonRun, "NewRuntimeDataPlane") {
-		t.Fatal("daemon runtime startup no longer calls dataplane.NewRuntimeDataPlane")
-	}
+	sort.Strings(found)
+	sort.Strings(violations)
+	return found, violations
 }
 
 func compilerDataplaneCalls(t *testing.T) map[string]bool {
@@ -715,61 +900,6 @@ func receiverTypeName(expr ast.Expr) string {
 	}
 }
 
-func TestRetirementBoundaryDocsMentionDPDKPolicy(t *testing.T) {
-	t.Parallel()
-
-	data, err := os.ReadFile(retirementBoundaryDocsForCanary)
-	if err != nil {
-		t.Fatalf("read retirement boundary docs: %v", err)
-	}
-	text := string(data)
-
-	want := []string{
-		"## #1475 DPDK Backend Policy",
-		"DPDK remains a separately supported backend",
-		"outside the eBPF source-removal path",
-		"`pkg/dataplane/dpdk`",
-		"`cmd/xpfd/main.go`",
-		"`-tags dpdk`",
-		"root `DataPlane`",
-	}
-	var missing []string
-	for _, token := range want {
-		if !strings.Contains(text, token) {
-			missing = append(missing, token)
-		}
-	}
-	if len(missing) > 0 {
-		t.Fatalf("retirement docs do not mention DPDK policy tokens: %v", missing)
-	}
-}
-
-func TestRetirementBoundaryDocsMentionLegacyImportAllowlist(t *testing.T) {
-	t.Parallel()
-
-	data, err := os.ReadFile(retirementBoundaryDocsForCanary)
-	if err != nil {
-		t.Fatalf("read retirement boundary docs: %v", err)
-	}
-	text := string(data)
-
-	var missing []string
-	for rel := range legacyDataplaneImportAllowlist {
-		if !strings.Contains(text, rel) {
-			missing = append(missing, rel)
-		}
-	}
-	sort.Strings(missing)
-	if len(missing) > 0 {
-		t.Fatalf("retirement docs do not mention allowlisted legacy imports: %v", missing)
-	}
-}
-
-type canaryParsedGoFile struct {
-	path string
-	file *ast.File
-}
-
 func productionGoPackageFilesUnder(t *testing.T, roots []string) (*token.FileSet, []canaryParsedGoFile) {
 	t.Helper()
 
@@ -784,12 +914,67 @@ func productionGoPackageFilesUnder(t *testing.T, roots []string) (*token.FileSet
 		packageFiles[path] = file
 		files = append(files, canaryParsedGoFile{path: path, file: file})
 	}
-	// NewPackage resolves same-package identifiers across files. It also reports
-	// unrelated predeclared/imported identifiers because this canary does not
-	// provide a full importer or universe scope, so the error is intentionally
-	// ignored after the resolver has linked package-level objects.
-	_, _ = ast.NewPackage(fset, packageFiles, nil, nil)
+	resolveUserspaceXDPEntryProgramIdents(packageFiles)
 	return fset, files
+}
+
+func resolveUserspaceXDPEntryProgramIdents(files map[string]*ast.File) {
+	var packageConst *ast.Object
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			genDecl, ok := decl.(*ast.GenDecl)
+			if !ok || genDecl.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range genDecl.Specs {
+				valueSpec, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for _, name := range valueSpec.Names {
+					if name.Name == "userspaceXDPEntryProg" && name.Obj != nil && name.Obj.Kind == ast.Con {
+						packageConst = name.Obj
+					}
+				}
+			}
+		}
+	}
+	if packageConst == nil {
+		return
+	}
+	for _, file := range files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			ident, ok := n.(*ast.Ident)
+			if ok && ident.Name == "userspaceXDPEntryProg" && ident.Obj == nil {
+				ident.Obj = packageConst
+			}
+			return true
+		})
+	}
+}
+
+func writeUserspaceEntryProgramFixture(t *testing.T, files map[string]string) string {
+	t.Helper()
+
+	root := t.TempDir()
+	for name, body := range files {
+		path := filepath.Join(root, name)
+		if err := os.WriteFile(path, []byte(strings.TrimSpace(body)+"\n"), 0o644); err != nil {
+			t.Fatalf("write fixture %s: %v", path, err)
+		}
+	}
+	return root
+}
+
+func assertCanaryViolationsContain(t *testing.T, violations []string, want []string) {
+	t.Helper()
+
+	joined := strings.Join(violations, "\n")
+	for _, needle := range want {
+		if !strings.Contains(joined, needle) {
+			t.Fatalf("violations missing %q\nall violations:\n%s", needle, joined)
+		}
+	}
 }
 
 func rustSourceFilesUnder(t *testing.T, root string) []string {
