@@ -306,6 +306,20 @@
     `git diff --check`
 ## 2026-05-23
 
+- **Timestamp**: 2026-05-23T07:07:56Z
+  - **Action**: PR #1499 @copilot review round-3 follow-up — corrected
+    WireGuard `REJECT_AFTER_MESSAGES` to the WG spec value, changed
+    TX counter reservation to atomic `fetch_update` so rejection does
+    not advance/wrap counters, restored demux-before-rotate install
+    ordering to eliminate the new-session decap gap, and clarified
+    replay precheck concurrency semantics.
+  - **File(s)**: `userspace-dp/src/afxdp/wg/session.rs`,
+    `userspace-dp/src/afxdp/wg/engine.rs`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/userspace/...`;
+    `cargo test --release afxdp::wg::`
+    (fails in this runner as expected: missing `libelf`/`gelf` headers
+    for `libbpf-sys` build); `git diff --check`
+
 - **Timestamp**: 2026-05-23T06:32:50Z
   - **Action**: PR #1499 @copilot review follow-up — fixed WireGuard
     engine conformance and robustness issues by switching to IKpsk2

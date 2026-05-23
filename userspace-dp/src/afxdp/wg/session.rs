@@ -25,7 +25,20 @@ pub(crate) const REPLAY_WINDOW: u64 = 64;
 ///
 /// Per the protocol, a session must stop encrypting after this many
 /// transport messages and rekey.
-pub(crate) const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1u64 << 13) - 1;
+pub(crate) const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1u64 << 13);
+
+#[inline]
+fn reserve_next_counter(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            if current >= REJECT_AFTER_MESSAGES {
+                None
+            } else {
+                Some(current + 1)
+            }
+        })
+        .ok()
+}
 
 /// A live, post-handshake WG transport session.
 ///
@@ -42,9 +55,7 @@ pub(crate) struct WgSession {
     /// Receiver index that *we* put in the WG data header when
     /// sending to the peer. Peer-chosen at handshake time.
     pub(crate) peer_index: u32,
-    /// Monotonic outbound counter. We are the only writer (the
-    /// worker that owns this session for egress), so a single
-    /// fetch_add is sufficient.
+    /// Monotonic outbound counter.
     pub(crate) tx_counter: AtomicU64,
     /// Replay tracker for inbound packets.
     pub(crate) replay: Mutex<ReplayState>,
@@ -85,11 +96,7 @@ impl WgSession {
     /// Atomically reserve the next outbound counter value.
     #[inline]
     pub(crate) fn next_tx_counter(&self) -> Option<u64> {
-        let counter = self.tx_counter.fetch_add(1, Ordering::Relaxed);
-        if counter > REJECT_AFTER_MESSAGES {
-            return None;
-        }
-        Some(counter)
+        reserve_next_counter(&self.tx_counter)
     }
 }
 
@@ -117,8 +124,11 @@ pub(crate) struct ReplayState {
 impl ReplayState {
     /// Cheap pre-crypto reject for trivially stale counters.
     ///
-    /// This never rejects in-window candidates, so it is safe to run
-    /// before AEAD without creating false drops.
+    /// This never rejects in-window candidates for the current replay
+    /// state snapshot, so it is safe to run before AEAD without
+    /// creating false drops. Under concurrent decap another packet may
+    /// advance `highest` between this check and post-decrypt update,
+    /// so this is a best-effort CPU guard rather than a hard guarantee.
     #[inline]
     pub(crate) fn definitely_out_of_window(&self, c: u64) -> bool {
         self.started && c.saturating_add(REPLAY_WINDOW) <= self.highest
@@ -260,5 +270,22 @@ mod session_tests {
         assert_eq!(r.check_and_update(1000), ReplayDecision::Accept);
         assert!(!r.definitely_out_of_window(937));
         assert!(r.definitely_out_of_window(936));
+    }
+
+    #[test]
+    fn reject_after_messages_constant_matches_wireguard_spec() {
+        assert_eq!(REJECT_AFTER_MESSAGES, 0xffff_ffff_ffff_dfff);
+    }
+
+    #[test]
+    fn tx_counter_stops_at_reject_after_messages_without_advancing() {
+        let counter = AtomicU64::new(REJECT_AFTER_MESSAGES - 1);
+        assert_eq!(
+            reserve_next_counter(&counter),
+            Some(REJECT_AFTER_MESSAGES - 1)
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), REJECT_AFTER_MESSAGES);
+        assert_eq!(reserve_next_counter(&counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), REJECT_AFTER_MESSAGES);
     }
 }

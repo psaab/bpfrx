@@ -210,14 +210,20 @@ impl WgEngine {
         let Some(peer) = self.peer_arc(pubkey) else {
             return;
         };
-        // Rotate first so concurrent encap picks up the newest
-        // session as soon as possible. Keep only current+previous in
-        // the demux map by deleting the session that falls off.
-        let dropped_previous = peer.rotate_session(session.clone());
-        let mut by_index = self.sessions_by_local_index.write().unwrap();
-        by_index.insert(session.local_index, session);
+        // Register for inbound demux before rotation so decap can
+        // resolve the new local index immediately. Keep only
+        // current+previous in the demux map by deleting the session
+        // that falls off.
+        {
+            let mut by_index = self.sessions_by_local_index.write().unwrap();
+            by_index.insert(session.local_index, session.clone());
+        }
+        let dropped_previous = peer.rotate_session(session);
         if let Some(old) = dropped_previous {
-            by_index.remove(&old.local_index);
+            self.sessions_by_local_index
+                .write()
+                .unwrap()
+                .remove(&old.local_index);
         }
     }
 
@@ -476,7 +482,7 @@ mod engine_internal_tests {
             peer_pub,
         ));
         session.tx_counter.store(
-            super::super::session::REJECT_AFTER_MESSAGES + 1,
+            super::super::session::REJECT_AFTER_MESSAGES,
             Ordering::Relaxed,
         );
         engine.install_session(&peer_pub, session);
