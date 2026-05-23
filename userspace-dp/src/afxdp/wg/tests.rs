@@ -146,11 +146,11 @@ fn handshake_completes_and_roundtrip_encap_decap() {
     let mut plain = [0u8; 2048];
     let dec = resp_engine.try_decap(&wire[..enc.len], &mut plain).unwrap();
     assert_eq!(dec.peer_pubkey, init_pub);
-    // Decrypted plaintext is the padded form. The first `inner.len()`
-    // bytes must equal the original inner packet; trailing bytes are
-    // zero padding.
-    assert_eq!(&plain[..inner.len()], &inner[..]);
-    assert!(plain[inner.len()..dec.len].iter().all(|&b| b == 0));
+    // `dec.len` is the un-padded inner-IP packet length read from
+    // the IPv4 `total_length` field. It must equal the original
+    // sent inner packet length, not the padded plaintext length.
+    assert_eq!(dec.len, inner.len());
+    assert_eq!(&plain[..dec.len], &inner[..]);
 }
 
 #[test]
@@ -381,11 +381,13 @@ fn outer_ipv4_tos_propagates_dscp() {
 
 #[test]
 fn mss_clamp_matches_byte_breakdown() {
-    // Sanity: 1500-byte outer MTU, v4-in-v4, MSS = 1400. See
-    // mss.rs for the byte-by-byte derivation. Repeated here in
-    // the integration tests because review-time errors on MSS
-    // math are the kind of bug that ships and silently fragments.
-    assert_eq!(wg_tcp_mss(libc::AF_INET, libc::AF_INET, 1500), 1400);
+    // Sanity: 1500-byte outer MTU, v4-in-v4, MSS = 1385. The 1385
+    // (vs the pre-padding-fix 1400) leaves room for the worst-case
+    // 15 bytes of WG §5.4.6 padding the encap side may add. See
+    // mss.rs for the byte-by-byte derivation. Repeated here in the
+    // integration tests because review-time errors on MSS math
+    // ship and silently fragment.
+    assert_eq!(wg_tcp_mss(libc::AF_INET, libc::AF_INET, 1500), 1385);
 }
 
 #[test]
@@ -444,11 +446,17 @@ fn transport_plaintext_is_padded_to_16_byte_multiple() {
             ciphertext_len, expected_padded,
             "padding mismatch at inner_len={inner_len}: got {ciphertext_len}, want {expected_padded}",
         );
-        // Roundtrip: decap and verify the original prefix survives.
+        // Roundtrip: decap returns the un-padded inner-IP length.
+        // The first `inner_len` bytes of `plain` must equal the
+        // original inner packet; `dec.len` must equal `inner_len`,
+        // NOT `expected_padded`.
         let mut plain = [0u8; 4096];
         let dec = resp_engine.try_decap(&wire[..enc.len], &mut plain).unwrap();
         assert_eq!(&plain[..inner_len], &inner[..]);
-        assert_eq!(dec.len, expected_padded);
+        assert_eq!(
+            dec.len, inner_len,
+            "DecapOutcome.len must be the inner-IP packet length, not the padded plaintext length",
+        );
     }
 }
 
@@ -471,6 +479,181 @@ fn decap_rejects_counter_at_reject_after_messages() {
     let mut plain = [0u8; 128];
     let err = resp_engine.try_decap(&wire[..32], &mut plain).unwrap_err();
     assert_eq!(err, DecapError::CounterRejectAfterMessages);
+}
+
+/// Cross-peer overlapping AllowedIPs MUST honor WG §5.4.6 global
+/// LPM cryptokey routing. If peer A owns `10.0.0.0/8` and peer B
+/// owns `10.1.1.0/24`, a packet authenticated by A with inner src
+/// `10.1.1.5` must be rejected — the global LPM resolves that
+/// address to B, not A. An earlier r4 revision used a per-peer
+/// "any prefix covers" check that wrongly accepted A's spoofed
+/// source; this regression test fails under that semantic.
+#[test]
+fn decap_lpm_rejects_spoofed_source_inside_more_specific_peer_prefix() {
+    let (init_priv, init_pub) = keypair();
+    let (peer_a_priv, peer_a_pub) = keypair();
+    let (peer_b_priv, peer_b_pub) = keypair();
+
+    // Initiator engine owns AllowedIPs for both peers: A=/8 (less
+    // specific) and B=/24 (more specific, inside A's prefix).
+    let init_engine = WgEngine::new(WgEngineConfig {
+        local_private_key: init_priv,
+        listen_port: 51820,
+        peers: vec![
+            WgPeerConfig {
+                pubkey: peer_a_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["10.0.0.0/8".parse().unwrap()],
+            },
+            WgPeerConfig {
+                pubkey: peer_b_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["10.1.1.0/24".parse().unwrap()],
+            },
+        ],
+    });
+    // Responder engines mirror that view from each peer's side.
+    let resp_a = WgEngine::new(WgEngineConfig {
+        local_private_key: peer_a_priv,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: init_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["10.0.0.0/8".parse().unwrap()],
+        }],
+    });
+    let _resp_b = WgEngine::new(WgEngineConfig {
+        local_private_key: peer_b_priv,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: init_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["10.1.1.0/24".parse().unwrap()],
+        }],
+    });
+
+    // We want to demonstrate: a packet that AUTHENTICATES under
+    // peer A's session (because A's session was used to encrypt)
+    // but whose inner src lies inside peer B's /24 must be
+    // rejected by the DECAP-side AllowedIPs gate. Drive the
+    // handshake init↔A, install sessions, and have A encrypt a
+    // packet with src `10.1.1.5`. The init engine must then
+    // verify on receive that the inner src doesn't belong to A.
+    let mut init_hs = init_engine.build_initiator_handshake(&peer_a_pub).unwrap();
+    let mut resp_hs = resp_a.build_responder_handshake().unwrap();
+    let mut buf = [0u8; 1024];
+    let mut sink = [0u8; 1024];
+    let n1 = init_hs.write_message(&[], &mut buf).unwrap();
+    resp_hs.read_message(&buf[..n1], &mut sink).unwrap();
+    let n2 = resp_hs.write_message(&[], &mut buf).unwrap();
+    init_hs.read_message(&buf[..n2], &mut sink).unwrap();
+    let init_xport = init_hs.into_stateless_transport_mode().unwrap();
+    let resp_xport = resp_hs.into_stateless_transport_mode().unwrap();
+    let init_idx = 0x1111_aaaa;
+    let resp_idx = 0x2222_aaaa;
+    init_engine
+        .install_session(
+            &peer_a_pub,
+            Arc::new(WgSession::new(init_xport, init_idx, resp_idx, peer_a_pub)),
+        )
+        .unwrap();
+    resp_a
+        .install_session(
+            &init_pub,
+            Arc::new(WgSession::new(resp_xport, resp_idx, init_idx, init_pub)),
+        )
+        .unwrap();
+
+    // A sends a packet with src 10.1.1.5 (inside B's /24, NOT
+    // authoritative for A under global LPM) to init_engine.
+    let inner = ipv4_packet(Ipv4Addr::new(10, 1, 1, 5), Ipv4Addr::new(10, 0, 0, 9));
+    let mut wire = [0u8; 2048];
+    let enc = resp_a.try_encap(&init_pub, &inner, &mut wire).unwrap();
+    let mut plain = [0u8; 2048];
+    let err = init_engine
+        .try_decap(&wire[..enc.len], &mut plain)
+        .unwrap_err();
+    assert_eq!(
+        err,
+        DecapError::AllowedIpsViolation,
+        "global LPM resolves 10.1.1.5 to peer B; A's /8 must NOT authorize that source"
+    );
+}
+
+/// On every post-AEAD error arm, `out[..n]` must be wiped before
+/// returning so the contract "on Err the caller MUST NOT inspect
+/// `out`" is structurally enforced. Earlier r4 revisions covered
+/// only 3 of 5 error arms; Codex r4 finding 3 / Gemini r4 finding F.
+#[test]
+fn decap_zeros_plaintext_on_allowed_ips_violation() {
+    // Set the AllowedIPs trie so the responder's view of the
+    // initiator covers `10.0.0.0/24` only. The initiator then
+    // sends with inner src `10.0.99.99` — authenticates, fails
+    // AllowedIPs gate, must return AllowedIpsViolation AND wipe.
+    let (init_engine, resp_engine, _init_pub, resp_pub) = established_pair(
+        vec!["10.0.1.0/24".parse().unwrap()],
+        vec!["10.0.0.0/24".parse().unwrap()],
+    );
+    let inner = ipv4_packet(Ipv4Addr::new(10, 0, 99, 99), Ipv4Addr::new(10, 0, 1, 5));
+    let mut wire = [0u8; 2048];
+    let enc = init_engine.try_encap(&resp_pub, &inner, &mut wire).unwrap();
+    let mut plain = [0u8; 2048];
+    // Pre-fill `plain` with a recognizable pattern; the wipe must
+    // overwrite any decrypted bytes back to zero by the time we
+    // observe `plain` after the error return.
+    plain.fill(0xa5);
+    let err = resp_engine
+        .try_decap(&wire[..enc.len], &mut plain)
+        .unwrap_err();
+    assert_eq!(err, DecapError::AllowedIpsViolation);
+    // The plaintext-bearing region — the first `padded_inner_len`
+    // bytes that snow decrypted into `out` — must be all zeros.
+    // Bytes past that region were never touched by the engine and
+    // still hold the 0xa5 pre-fill. snow writes
+    // `(inner.len() + 15) & !15` bytes (the padded plaintext).
+    let padded_inner_len = (inner.len() + 15) & !15;
+    assert!(
+        plain[..padded_inner_len].iter().all(|&b| b == 0),
+        "AllowedIpsViolation must zero out[..n] ({} bytes); first {} bytes are {:?}",
+        padded_inner_len,
+        padded_inner_len,
+        &plain[..padded_inner_len],
+    );
+}
+
+#[test]
+fn decap_zeros_plaintext_on_malformed_inner() {
+    // Force a `MalformedInner` arm: encap a payload whose first
+    // byte has IP version != 4/6 so `inner_src_ip` returns None.
+    // The packet authenticates (it's just bytes to the AEAD) but
+    // the post-decrypt parse fails, and the engine must wipe.
+    let (init_engine, resp_engine, _init_pub, resp_pub) = established_pair(
+        vec!["10.0.1.0/24".parse().unwrap()],
+        vec!["10.0.0.0/24".parse().unwrap()],
+    );
+    // 32-byte payload, first nibble = 0 (no valid IP version).
+    let mut inner = vec![0u8; 32];
+    inner[0] = 0x05;
+    let mut wire = [0u8; 2048];
+    let enc = init_engine.try_encap(&resp_pub, &inner, &mut wire).unwrap();
+    let mut plain = [0u8; 2048];
+    plain.fill(0xa5);
+    let err = resp_engine
+        .try_decap(&wire[..enc.len], &mut plain)
+        .unwrap_err();
+    assert_eq!(err, DecapError::MalformedInner);
+    let padded_inner_len = (inner.len() + 15) & !15;
+    assert!(
+        plain[..padded_inner_len].iter().all(|&b| b == 0),
+        "MalformedInner must zero out[..n] ({} bytes); first {} bytes are {:?}",
+        padded_inner_len,
+        padded_inner_len,
+        &plain[..padded_inner_len],
+    );
 }
 
 #[test]

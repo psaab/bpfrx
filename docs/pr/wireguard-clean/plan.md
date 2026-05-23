@@ -200,10 +200,18 @@ WG-specific overhead, per draft-ietf-wireguard / the WG whitepaper:
   (receiver index) + 8 (counter) + 16 (Poly1305 tag) = **60 bytes**.
 - IPv6 outer: 40 (outer IP) + 8 (UDP) + 4 + 4 + 8 + 16 = **80 bytes**.
 
+WG §5.4.6 also requires the inner-IP plaintext to be zero-padded
+to a 16-byte multiple before AEAD. That adds **0..15** bytes per
+data record on top of the fixed transport overhead. `wg_tcp_mss`
+therefore subtracts an additional 15 bytes (worst-case padding)
+so that a sender advertising the clamp can never produce an outer
+frame larger than the MTU, regardless of how the inner segment's
+total length lands modulo 16. See `mss.rs` for the byte table.
+
 Note: the task brief gave 68/88 by counting "WG type 4 hdr (16)"
 which already includes type+reserved+receiver+counter. The numbers
 agree once you don't double-count. I'm using the byte-exact
-breakdown: **60 / 80**.
+breakdown: **60 / 80** plus the **15** padding allowance.
 
 The MSS gate in `forwarding/mod.rs:751` (`native_gre_tcp_mss`) is
 extended with a sibling `wg_tcp_mss` and the call site

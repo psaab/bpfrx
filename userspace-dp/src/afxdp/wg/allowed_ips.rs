@@ -22,7 +22,6 @@
 //! storms that bit #923's prefix-set code at large fanout. The
 //! scan is also branch-predictable and cache-friendly.
 
-use rustc_hash::FxHashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// A single AllowedIPs entry: `(prefix, prefix_len, peer_index)`.
@@ -46,15 +45,16 @@ pub(crate) struct AllowedIps {
     /// Sorted by `prefix_len` descending so the first match wins.
     /// IPv4 and IPv6 entries are interleaved — `lookup` dispatches
     /// on the query family.
+    ///
+    /// `matches_for_peer` is implemented as a global LPM lookup
+    /// followed by a peer-identity compare, because WG cryptokey
+    /// routing requires the global LPM semantic (see the
+    /// `matches_for_peer` doc for details). An earlier revision
+    /// kept a per-peer auxiliary index for O(per-peer) scanning;
+    /// that micro-optimization was incorrect by construction
+    /// against overlapping cross-peer prefixes and has been
+    /// removed.
     entries: Vec<Entry>,
-    /// Auxiliary index: `peer_index → indices into `entries` belonging
-    /// to that peer`. Lets `matches_for_peer` skip over entries owned
-    /// by other peers without scanning the whole table — important
-    /// when many peers share an engine (the original linear scan was
-    /// O(N) per decap and showed up in profiles at 50+-peer configs).
-    /// Rebuilt on every `insert` / `remove_peer` call; the LPM
-    /// reconcile path is slow-path so the rebuild cost is irrelevant.
-    by_peer: FxHashMap<u32, Vec<usize>>,
 }
 
 impl AllowedIps {
@@ -86,24 +86,12 @@ impl AllowedIps {
         });
         self.entries.push(entry);
         self.entries.sort_by(|a, b| b.prefix_len.cmp(&a.prefix_len));
-        self.rebuild_by_peer();
     }
 
     /// Remove every entry for a peer. Used when the peer is dropped
     /// from the config snapshot.
     pub(crate) fn remove_peer(&mut self, peer_index: u32) {
         self.entries.retain(|e| e.peer_index != peer_index);
-        self.rebuild_by_peer();
-    }
-
-    /// Rebuild the `by_peer` auxiliary index from `entries`. O(N)
-    /// over the entry count; only called from the slow-path
-    /// reconcile.
-    fn rebuild_by_peer(&mut self) {
-        self.by_peer.clear();
-        for (idx, entry) in self.entries.iter().enumerate() {
-            self.by_peer.entry(entry.peer_index).or_default().push(idx);
-        }
     }
 
     /// Longest-prefix-match lookup. Returns the peer_index of the
@@ -141,44 +129,25 @@ impl AllowedIps {
         None
     }
 
-    /// Verify that `addr` is covered by *some* prefix belonging to
-    /// `peer_index`. This is the gate used on decap: after we know
-    /// which peer decrypted the packet, we check the inner src IP
-    /// against that peer's AllowedIPs.
+    /// Cryptokey-routing gate used on decap: after we know which
+    /// peer decrypted the packet, verify that a global LPM lookup of
+    /// the inner src IP across the entire AllowedIPs trie resolves
+    /// to that same peer.
     ///
-    /// Returns true on a match. Returns false if no entry for
-    /// `peer_index` covers `addr` — in which case the packet must
-    /// be dropped.
+    /// WG spec §5.4.6 requires the global LPM semantic, NOT a
+    /// per-peer "is the address covered by any of this peer's
+    /// prefixes" check. The distinction matters when AllowedIPs
+    /// overlap across peers: e.g. peer A owns `10.0.0.0/8` and peer
+    /// B owns `10.1.1.0/24`. A packet authenticated by A with inner
+    /// src `10.1.1.5` must be dropped, because the global LPM
+    /// resolves `10.1.1.5` to B's more-specific /24 — even though
+    /// A's /8 also covers it. The per-peer-only check (which an
+    /// earlier r4 revision implemented) silently violated this and
+    /// allowed A to spoof source addresses inside B's prefix.
+    ///
+    /// Returns true iff `lookup(addr) == Some(peer_index)`.
     pub(crate) fn matches_for_peer(&self, addr: IpAddr, peer_index: u32) -> bool {
-        let Some(indices) = self.by_peer.get(&peer_index) else {
-            return false;
-        };
-        match addr {
-            IpAddr::V4(ip) => {
-                let bytes = ip.octets();
-                for &i in indices {
-                    let entry = &self.entries[i];
-                    if let PrefixBits::V4(prefix) = entry.prefix
-                        && prefix_matches(&bytes, &prefix, entry.prefix_len)
-                    {
-                        return true;
-                    }
-                }
-                false
-            }
-            IpAddr::V6(ip) => {
-                let bytes = ip.octets();
-                for &i in indices {
-                    let entry = &self.entries[i];
-                    if let PrefixBits::V6(prefix) = entry.prefix
-                        && prefix_matches(&bytes, &prefix, entry.prefix_len)
-                    {
-                        return true;
-                    }
-                }
-                false
-            }
-        }
+        self.lookup(addr) == Some(peer_index)
     }
 }
 
@@ -246,15 +215,23 @@ mod allowed_ips_tests {
         assert!(!t.matches_for_peer(ip("10.1.0.5"), 1));
     }
 
+    /// Cryptokey routing: when peer A owns a less-specific prefix
+    /// and peer B owns a more-specific one within it, an inner-src
+    /// inside B's prefix that arrives over A's session MUST be
+    /// rejected — the global LPM resolves to B, so A is not the
+    /// authoritative owner. This is the WG §5.4.6 semantic.
     #[test]
-    fn duplicate_insert_replaces() {
+    fn matches_for_peer_overlapping_lpm_picks_most_specific() {
         let mut t = AllowedIps::new();
-        t.insert(net("10.0.0.0/8"), 1);
-        t.insert(net("10.0.0.0/8"), 2);
-        // Same prefix, different peers can coexist so decap can
-        // validate by explicit peer identity.
-        assert!(t.matches_for_peer(ip("10.1.1.1"), 1));
-        assert!(t.matches_for_peer(ip("10.1.1.1"), 2));
+        t.insert(net("10.0.0.0/8"), 1); // peer A owns 10/8
+        t.insert(net("10.1.1.0/24"), 2); // peer B owns 10.1.1/24
+        // 10.1.1.5 globally resolves to peer B; only B may
+        // authoritatively use that source.
+        assert!(!t.matches_for_peer(ip("10.1.1.5"), 1));
+        assert!(t.matches_for_peer(ip("10.1.1.5"), 2));
+        // 10.2.0.5 globally resolves to peer A; only A may use it.
+        assert!(t.matches_for_peer(ip("10.2.0.5"), 1));
+        assert!(!t.matches_for_peer(ip("10.2.0.5"), 2));
     }
 
     #[test]
@@ -265,13 +242,24 @@ mod allowed_ips_tests {
         assert_eq!(t.lookup(ip("10.1.1.1")), Some(1));
     }
 
+    /// Cross-peer identical prefixes are a misconfiguration in WG
+    /// cryptokey routing: only one peer can own a given address.
+    /// The data structure tolerates the insert but global LPM picks
+    /// a single winner (insertion-order tie-breaking via the stable
+    /// sort), and `matches_for_peer` reflects that — the loser
+    /// cannot authoritatively use any address inside the prefix.
+    /// This test pins the behavior so a future change can't
+    /// accidentally return true for both peers.
     #[test]
-    fn matches_for_peer_with_overlapping_prefixes() {
+    fn duplicate_cross_peer_prefix_only_one_peer_wins() {
         let mut t = AllowedIps::new();
-        t.insert(net("10.0.0.0/24"), 1);
-        t.insert(net("10.0.0.0/24"), 2);
-        assert!(t.matches_for_peer(ip("10.0.0.5"), 1));
-        assert!(t.matches_for_peer(ip("10.0.0.5"), 2));
+        t.insert(net("10.0.0.0/8"), 1);
+        t.insert(net("10.0.0.0/8"), 2);
+        let winner = t.lookup(ip("10.1.1.1")).unwrap();
+        assert!(winner == 1 || winner == 2);
+        assert!(t.matches_for_peer(ip("10.1.1.1"), winner));
+        let loser = if winner == 1 { 2 } else { 1 };
+        assert!(!t.matches_for_peer(ip("10.1.1.1"), loser));
     }
 
     #[test]

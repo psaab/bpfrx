@@ -29,7 +29,7 @@ snow = "0.10"
 # pin the version we use directly for the engine's static-key state
 # so the WG private key is wiped on engine drop. Cost: zero — just a
 # Drop impl on a 32-byte field.
-zeroize = { version = "1.8", features = ["derive"] }
+zeroize = "1.8"
 
 [build-dependencies]
 cc = "1.2"
