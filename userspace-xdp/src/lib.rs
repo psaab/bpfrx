@@ -2,7 +2,7 @@
 #![no_main]
 
 use aya_ebpf::{
-    bindings::{xdp_action, xdp_md},
+    bindings::{BPF_F_NO_PREALLOC, xdp_action, xdp_md},
     helpers::r#gen::{bpf_get_smp_processor_id, bpf_ktime_get_ns, bpf_xdp_adjust_meta},
     macros::{map, xdp},
     maps::{Array, CpuMap, HashMap, XskMap},
@@ -69,6 +69,7 @@ const MAX_INTERFACES: u32 = match u32::from_str_radix(env!("MAX_INTERFACES"), 10
     Err(_) => panic!("MAX_INTERFACES env var must be a u32 decimal literal"),
 };
 const BINDING_ARRAY_MAX_ENTRIES: u32 = MAX_INTERFACES * BINDING_QUEUES_PER_IFACE;
+const USERSPACE_SHIM_MAX_DNAT_ENTRIES: u32 = 10_000_000;
 const USERSPACE_TRACE_STAGE_RECEIVED: u32 = 1;
 const USERSPACE_TRACE_STAGE_BINDING_MISSING: u32 = 2;
 const USERSPACE_TRACE_STAGE_BINDING_NOT_READY: u32 = 3;
@@ -307,7 +308,8 @@ static USERSPACE_INTERFACE_NAT_V6: HashMap<UserspaceLocalV6Key, u8> =
 // loader (pkg/dataplane/loader.go) must ensure the userspace XDP
 // collection shares the same pinned dnat_table map fd.
 #[map(name = "dnat_table")]
-static DNAT_TABLE: HashMap<DnatKeyV4, DnatValueV4> = HashMap::with_max_entries(262144, 0);
+static DNAT_TABLE: HashMap<DnatKeyV4, DnatValueV4> =
+    HashMap::with_max_entries(USERSPACE_SHIM_MAX_DNAT_ENTRIES, BPF_F_NO_PREALLOC);
 
 #[map(name = "userspace_sessions")]
 static USERSPACE_SESSIONS: HashMap<UserspaceSessionKey, u8> = HashMap::with_max_entries(262144, 0);

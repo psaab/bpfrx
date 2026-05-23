@@ -108,6 +108,9 @@ func (m *Manager) Load() error {
 func (m *Manager) LoadUserspaceShim() error {
 	slog.Info("loading userspace XDP shim")
 	m.XDPEntryProg = userspaceShimEntryProg
+	if err := cleanupUserspaceShimLegacyTCLinks(); err != nil {
+		return err
+	}
 	if err := m.loadUserspaceShimObjects(); err != nil {
 		return err
 	}
@@ -122,6 +125,9 @@ func (m *Manager) LoadUserspaceShim() error {
 // startup independent from xdp_main and TC program objects.
 func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, error) {
 	if err := m.preflightCheckIfindexCaps(); err != nil {
+		return nil, err
+	}
+	if err := cleanupUserspaceShimLegacyTCLinks(); err != nil {
 		return nil, err
 	}
 
@@ -187,6 +193,71 @@ func (m *Manager) attachUserspaceShimXDP(result *CompileResult) error {
 		}
 	}
 	return nil
+}
+
+type pinnedTCLink interface {
+	Unpin() error
+	Close() error
+}
+
+func cleanupUserspaceShimLegacyTCLinks() error {
+	return cleanupUserspaceShimLegacyTCLinksIn(linkPinPath, func(path string) (pinnedTCLink, error) {
+		return link.LoadPinnedLink(path, nil)
+	})
+}
+
+func cleanupUserspaceShimLegacyTCLinksIn(
+	linkDir string,
+	load func(string) (pinnedTCLink, error),
+) error {
+	entries, err := os.ReadDir(linkDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read userspace shim link pins: %w", err)
+	}
+	for _, entry := range entries {
+		if !isLegacyTCPinName(entry.Name()) {
+			continue
+		}
+		pinFile := filepath.Join(linkDir, entry.Name())
+		pinned, err := load(pinFile)
+		if err != nil {
+			if rmErr := os.Remove(pinFile); rmErr != nil && !os.IsNotExist(rmErr) {
+				return fmt.Errorf("remove unreadable legacy TC pin %s: load: %v; remove: %w", pinFile, err, rmErr)
+			}
+			slog.Warn("removed unreadable legacy TC link pin", "pin", pinFile, "err", err)
+			continue
+		}
+		var errs []error
+		if err := pinned.Unpin(); err != nil {
+			errs = append(errs, fmt.Errorf("unpin %s: %w", pinFile, err))
+		}
+		if err := pinned.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close %s: %w", pinFile, err))
+		}
+		if len(errs) > 0 {
+			return errors.Join(errs...)
+		}
+		slog.Info("detached stale legacy TC link before userspace shim attach", "pin", pinFile)
+	}
+	return nil
+}
+
+func isLegacyTCPinName(name string) bool {
+	if !strings.HasPrefix(name, "tc_") {
+		return false
+	}
+	if len(name) == len("tc_") {
+		return false
+	}
+	for _, r := range name[len("tc_"):] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 type userspaceShimCompileDataplane struct {

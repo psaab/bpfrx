@@ -586,10 +586,15 @@ func validateUserspaceShimSpec(userspaceSpec *ebpf.CollectionSpec) error {
 	}
 	if ms, ok := userspaceSpec.Maps["dnat_table"]; !ok {
 		return fmt.Errorf("Rust xdp_userspace spec missing map dnat_table")
-	} else if ms.MaxEntries != userspaceShimMaxDnatEntries {
+	} else if ms.MaxEntries != userspaceShimMaxSessions {
 		return fmt.Errorf(
 			"dnat_table max_entries drift: embedded=%d, expected=%d (userspace shim compatibility map). Re-run `make generate-userspace-xdp`.",
-			ms.MaxEntries, userspaceShimMaxDnatEntries,
+			ms.MaxEntries, userspaceShimMaxSessions,
+		)
+	} else if ms.Flags&unix.BPF_F_NO_PREALLOC == 0 {
+		return fmt.Errorf(
+			"dnat_table flags drift: embedded=%d, expected BPF_F_NO_PREALLOC (userspace shim compatibility map). Re-run `make generate-userspace-xdp`.",
+			ms.Flags,
 		)
 	}
 	return nil
@@ -690,7 +695,7 @@ func userspaceShimSharedMapSpecs() []*ebpf.MapSpec {
 	return []*ebpf.MapSpec{
 		hashMapSpec("sessions", sizeOf[SessionKey](), sizeOf[SessionValue](), userspaceShimMaxSessions, unix.BPF_F_NO_PREALLOC),
 		hashMapSpec("sessions_v6", sizeOf[SessionKeyV6](), sizeOf[SessionValueV6](), userspaceShimMaxSessions, unix.BPF_F_NO_PREALLOC),
-		hashMapSpec("dnat_table", sizeOf[DNATKey](), sizeOf[DNATValue](), userspaceShimMaxDnatEntries, unix.BPF_F_NO_PREALLOC),
+		hashMapSpec("dnat_table", sizeOf[DNATKey](), sizeOf[DNATValue](), userspaceShimMaxSessions, unix.BPF_F_NO_PREALLOC),
 		hashMapSpec("dnat_table_v6", sizeOf[DNATKeyV6](), sizeOf[DNATValueV6](), userspaceShimMaxSessions, unix.BPF_F_NO_PREALLOC),
 		arrayMapSpec("fib_gen_map", sizeOf[uint32](), 1),
 		arrayMapSpec("fabric_fwd", sizeOf[FabricFwdInfo](), 2),
@@ -709,10 +714,9 @@ func userspaceShimSharedMapSpecs() []*ebpf.MapSpec {
 }
 
 const (
-	userspaceShimMaxSessions    uint32 = 10000000
-	userspaceShimMaxPolicies    uint32 = 4096
-	userspaceShimMaxDnatEntries uint32 = 262144
-	userspaceShimMaxNATPools    uint32 = 32
+	userspaceShimMaxSessions uint32 = 10000000
+	userspaceShimMaxPolicies uint32 = 4096
+	userspaceShimMaxNATPools uint32 = 32
 )
 
 func hashMapSpec(name string, keySize, valueSize, maxEntries, flags uint32) *ebpf.MapSpec {

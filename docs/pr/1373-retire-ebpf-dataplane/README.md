@@ -123,6 +123,13 @@ userspace runtime and old operational bridges: `userspace_*`, `dnat_table`,
 `xdp_main_prog`, legacy XDP tail-call programs, TC programs, `xdp_progs`, or
 `tc_progs`.
 
+The shim keeps `dnat_table` and `dnat_table_v6` at the legacy 10M-entry,
+`BPF_F_NO_PREALLOC` contract so a legacy-to-shim restart can reuse existing
+pins instead of silently wiping active SNAT-return state. During userspace shim
+compile, any pinned legacy `tc_*` links are detached and unpinned before the
+retained XDP shim is attached; TC programs are not part of the userspace
+runtime and must not survive as stale egress hooks from a previous legacy boot.
+
 The remaining compatibility bridge is config compilation metadata and Linux
 interface setup: userspace still runs the shared config compiler, but through a
 shim compile adapter that no-ops legacy dataplane map writes and attaches only
