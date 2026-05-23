@@ -566,6 +566,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 if enqueue_local_request_to_target_or_owner(target_binding, req)
                                     .is_err()
                                 {
+                                    recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                                     build_failed = true;
                                     fallback_to_slow_path = true;
                                     continue;
@@ -901,6 +902,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 if enqueue_local_request_to_target_or_owner(target_binding, req)
                                     .is_err()
                                 {
+                                    recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                                     build_failed = true;
                                     fallback_to_slow_path = true;
                                     continue;

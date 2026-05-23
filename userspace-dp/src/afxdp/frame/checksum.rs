@@ -140,8 +140,7 @@ pub(in crate::afxdp) fn checksum16_finish(mut sum: u32) -> u16 {
     while (sum >> 16) != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
-    let csum = !(sum as u16);
-    if csum == 0 { 0xffff } else { csum }
+    !(sum as u16)
 }
 
 pub(in crate::afxdp) fn checksum16_adjust(checksum: u16, old_words: &[u16], new_words: &[u16]) -> u16 {

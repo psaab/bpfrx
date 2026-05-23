@@ -49,7 +49,11 @@ pub(crate) fn build_outer_headers(
             csum = checksum16_add_bytes(csum, &udp_len.to_be_bytes());
             csum = checksum16_add_bytes(csum, udp);
             csum = checksum16_add_bytes(csum, payload);
-            let udp_csum = checksum16_finish(csum);
+            let udp_csum = {
+                let c = checksum16_finish(csum);
+                // RFC 768: transmitted checksum 0 means "no checksum"; use 0xFFFF.
+                if c == 0 { 0xffff } else { c }
+            };
             udp[6..8].copy_from_slice(&udp_csum.to_be_bytes());
 
             let mut meta = meta_for_outer(ip_start as u16, udp_start as u16, libc::AF_INET as u8, PROTO_UDP);
@@ -94,7 +98,12 @@ pub(crate) fn build_outer_headers(
             csum = checksum16_add_bytes(csum, &[0, 0, 0, PROTO_UDP]);
             csum = checksum16_add_bytes(csum, udp);
             csum = checksum16_add_bytes(csum, payload);
-            let udp_csum = checksum16_finish(csum);
+            let udp_csum = {
+                let c = checksum16_finish(csum);
+                // RFC 768: transmitted checksum 0 means "no checksum"; use 0xFFFF.
+                // IPv6 UDP checksum is mandatory and zero is invalid (RFC 2460 §8.1).
+                if c == 0 { 0xffff } else { c }
+            };
             udp[6..8].copy_from_slice(&udp_csum.to_be_bytes());
 
             let mut meta = meta_for_outer(ip_start as u16, udp_start as u16, libc::AF_INET6 as u8, PROTO_UDP);

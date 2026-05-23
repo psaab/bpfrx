@@ -953,3 +953,7 @@
 - **Timestamp**: 2026-05-22T14:35:44Z
   - **Action**: WireGuard review (comment_id 4519636478): fixed DSCP pre-shift bug (meta_dscp >> 2 → meta_dscp & 0x3f in try_encap), added AllowedIPs inbound enforcement on decap (inner source IP checked against peer's allowed-IPs set before emitting InnerData), replaced assert_eq!(num_workers, 1) hard panic in coordinator with eprintln! + graceful skip.
   - **File(s)**: userspace-dp/src/afxdp/wireguard/engine.rs, userspace-dp/src/afxdp/coordinator/mod.rs
+
+- **Timestamp**: 2026-05-23T03:51:33Z
+  - **Action**: WireGuard r8 review (comment_id 4524076005): fixed three blockers: (1) reverted `checksum16_finish` 0→0xFFFF mis-scoping (r8 regression — generic finisher must not force 0xFFFF; applied only at WG UDP call sites); (2) added `recycle_ingress_frame` before `continue` at cp1 enqueue-fail path; (3) added `recycle_ingress_frame` before `continue` at cp2/WG enqueue-fail path.
+  - **File(s)**: userspace-dp/src/afxdp/frame/checksum.rs, userspace-dp/src/afxdp/wireguard/packet.rs, userspace-dp/src/afxdp/tx/dispatch.rs
