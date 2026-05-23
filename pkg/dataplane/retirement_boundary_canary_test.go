@@ -772,7 +772,52 @@ func jsonBypass(m *manager) {
 	_ = json.Unmarshal([]byte(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `), m.bpfShim)
 }
 `,
-			want: []string{"json.Unmarshal into bpfShim"},
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "json_dot_import_unmarshal_bpf_shim",
+			body: `
+package userspace
+
+import . "encoding/json"
+
+func jsonDotImportBypass(m *manager) {
+	_ = Unmarshal([]byte(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `), m.bpfShim)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "json_new_decoder_decode_bpf_shim",
+			body: `
+package userspace
+
+import (
+	"encoding/json"
+	"strings"
+)
+
+func jsonDecoderBypass(m *manager) {
+	_ = json.NewDecoder(strings.NewReader(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `)).Decode(m.bpfShim)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "json_dot_import_new_decoder_decode_bpf_shim",
+			body: `
+package userspace
+
+import (
+	. "encoding/json"
+	"strings"
+)
+
+func jsonDotDecoderBypass(m *manager) {
+	_ = NewDecoder(strings.NewReader(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `)).Decode(m.bpfShim)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
 		},
 		{
 			name: "reflection_field_name",
@@ -876,7 +921,12 @@ func userspaceXDPEntryProgramViolations(t *testing.T, roots []string) []string {
 	for _, parsed := range files {
 		rel := repoRelativePath(t, parsed.path)
 		parents := astParentMap(parsed.file)
-		jsonImports := importNamesForPath(parsed.file, "encoding/json")
+		jsonImports, jsonDotImport := importNamesForPath(parsed.file, "encoding/json")
+		jsonV2Imports, jsonV2DotImport := importNamesForPath(parsed.file, "encoding/json/v2")
+		for name := range jsonV2Imports {
+			jsonImports[name] = true
+		}
+		jsonDotImport = jsonDotImport || jsonV2DotImport
 		ast.Inspect(parsed.file, func(n ast.Node) bool {
 			switch node := n.(type) {
 			case *ast.AssignStmt:
@@ -915,10 +965,10 @@ func userspaceXDPEntryProgramViolations(t *testing.T, roots []string) []string {
 					}
 				}
 			case *ast.CallExpr:
-				if isJSONUnmarshalIntoBPFShim(node, jsonImports) {
+				if isJSONDecoderIntoBPFShim(node, jsonImports, jsonDotImport) {
 					pos := fset.Position(node.Pos())
 					violations = append(violations, fmt.Sprintf(
-						"%s:%d json.Unmarshal into bpfShim can mutate XDPEntryProg",
+						"%s:%d encoding/json decode into bpfShim can mutate XDPEntryProg",
 						rel,
 						pos.Line,
 					))
@@ -1105,14 +1155,18 @@ func astParentMap(root ast.Node) map[ast.Node]ast.Node {
 	return parents
 }
 
-func importNamesForPath(file *ast.File, importPath string) map[string]bool {
+func importNamesForPath(file *ast.File, importPath string) (map[string]bool, bool) {
 	names := map[string]bool{}
+	dotImport := false
 	for _, imp := range file.Imports {
 		path, err := strconv.Unquote(imp.Path.Value)
 		if err != nil || path != importPath {
 			continue
 		}
 		if imp.Name != nil {
+			if imp.Name.Name == "." {
+				dotImport = true
+			}
 			if imp.Name.Name != "_" && imp.Name.Name != "." {
 				names[imp.Name.Name] = true
 			}
@@ -1120,7 +1174,7 @@ func importNamesForPath(file *ast.File, importPath string) map[string]bool {
 		}
 		names[defaultImportName(importPath)] = true
 	}
-	return names
+	return names, dotImport
 }
 
 func defaultImportName(importPath string) string {
@@ -1281,19 +1335,55 @@ func containsXDPEntryProgField(expr ast.Expr) bool {
 	return containsExpr(expr, isXDPEntryProgField)
 }
 
-func isJSONUnmarshalIntoBPFShim(call *ast.CallExpr, jsonImports map[string]bool) bool {
-	if len(jsonImports) == 0 || len(call.Args) < 2 {
+func isJSONDecoderIntoBPFShim(call *ast.CallExpr, jsonImports map[string]bool, jsonDotImport bool) bool {
+	if (len(jsonImports) == 0 && !jsonDotImport) || len(call.Args) == 0 {
 		return false
 	}
-	sel, ok := unparenExpr(call.Fun).(*ast.SelectorExpr)
-	if !ok || sel.Sel.Name != "Unmarshal" {
+
+	switch fun := unparenExpr(call.Fun).(type) {
+	case *ast.SelectorExpr:
+		switch fun.Sel.Name {
+		case "Unmarshal":
+			if len(call.Args) < 2 {
+				return false
+			}
+			pkg, ok := unparenExpr(fun.X).(*ast.Ident)
+			if !ok || !jsonImports[pkg.Name] {
+				return false
+			}
+			return containsBPFShimSelector(call.Args[1])
+		case "Decode":
+			if len(call.Args) != 1 {
+				return false
+			}
+			if !isJSONNewDecoderCall(fun.X, jsonImports, jsonDotImport) {
+				return false
+			}
+			return containsBPFShimSelector(call.Args[0])
+		}
+	case *ast.Ident:
+		if !jsonDotImport || fun.Name != "Unmarshal" || len(call.Args) < 2 {
+			return false
+		}
+		return containsBPFShimSelector(call.Args[1])
+	}
+	return false
+}
+
+func isJSONNewDecoderCall(expr ast.Expr, jsonImports map[string]bool, jsonDotImport bool) bool {
+	call, ok := unparenExpr(expr).(*ast.CallExpr)
+	if !ok {
 		return false
 	}
-	pkg, ok := unparenExpr(sel.X).(*ast.Ident)
-	if !ok || !jsonImports[pkg.Name] {
+	switch fun := unparenExpr(call.Fun).(type) {
+	case *ast.SelectorExpr:
+		pkg, ok := unparenExpr(fun.X).(*ast.Ident)
+		return ok && fun.Sel.Name == "NewDecoder" && jsonImports[pkg.Name]
+	case *ast.Ident:
+		return jsonDotImport && fun.Name == "NewDecoder"
+	default:
 		return false
 	}
-	return containsBPFShimSelector(call.Args[1])
 }
 
 func containsBPFShimSelector(expr ast.Expr) bool {

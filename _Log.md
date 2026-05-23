@@ -47,6 +47,17 @@
   - **Validation**: `go build ./pkg/dataplane/...`;
     `go test ./pkg/dataplane/... -count=1`
 
+- **Timestamp**: 2026-05-23T06:12:00Z
+  - **Action**: PR #1494 r7 copilot re-review follow-up — hardened the
+    retirement-boundary canary to catch `encoding/json` decode mutations via
+    dot-import `Unmarshal` and `NewDecoder(...).Decode` paths, including
+    `encoding/json/v2`, and added fixture coverage for each bypass shape.
+  - **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane -run
+    'TestUserspaceEntryProgramCanaryRejectsBypassFixtures|TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram'
+    -count=1`; `go test ./pkg/dataplane ./pkg/dataplane/userspace -count=1`;
+    `git diff --check`
+
 - **Timestamp**: 2026-05-23T04:58:00Z
   - **Action**: PR #1494 copilot round-5 follow-up — hardened the canary
     walker to treat wrapped SwapXDPEntryProg callees as direct calls and added
