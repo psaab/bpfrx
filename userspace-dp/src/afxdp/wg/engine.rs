@@ -213,9 +213,11 @@ pub(crate) struct WgEngine {
     /// Combined peer-routing table behind a single ArcSwap. See
     /// `PeerTable` doc for the atomicity rationale.
     table: ArcSwap<PeerTable>,
-    /// Mutex held by reconcile_peers so concurrent reconciles
-    /// serialize. Hot path does NOT take this lock — readers only
-    /// touch `table` via `.load()`. Reconcile is slow path.
+    /// Slow-path serialization lock for peer-table mutation.
+    /// `reconcile_peers` and `install_session` both take it to
+    /// prevent stale-Arc install races across peer removal. Hot path
+    /// does NOT take this lock — readers only touch `table` via
+    /// `.load()`.
     reconcile_lock: std::sync::Mutex<()>,
     /// Demux map: receiver_index → session. Receiver indices are
     /// chosen locally at handshake time so they uniquely identify
@@ -362,6 +364,16 @@ impl WgEngine {
         pubkey: &[u8; 32],
         session: Arc<WgSession>,
     ) -> Result<(), InstallSessionError> {
+        // Serialize session installs with reconcile to avoid the
+        // stale-Arc orphaning race:
+        //   1) install loads `peer` from old snapshot
+        //   2) reconcile removes that peer and publishes new snapshot
+        //   3) install inserts demux entry against orphan peer Arc
+        // Without serialization, that orphan demux entry can survive
+        // future reconciles because the peer pubkey no longer exists
+        // in published tables. This is slow path, so mutex cost is
+        // acceptable and keeps install/reconcile linearizable.
+        let _reconcile_guard = self.reconcile_lock.lock().unwrap();
         let Some(peer) = self.peer_arc(pubkey) else {
             return Err(InstallSessionError::UnknownPeer);
         };

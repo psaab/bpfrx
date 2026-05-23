@@ -306,6 +306,17 @@
     `git diff --check`
 ## 2026-05-23
 
+- **Timestamp**: 2026-05-23T21:25:00Z
+  - **Action**: PR #1499 @copilot round-6 follow-up — serialized
+    WireGuard `install_session` with `reconcile_peers` using the
+    existing slow-path reconcile mutex to eliminate stale-Arc
+    orphaning when a peer is removed concurrently with session install.
+  - **File(s)**: `userspace-dp/src/afxdp/wg/engine.rs`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/userspace/...`;
+    `cargo test --release afxdp::wg::`
+    (fails in this runner as expected: missing `libelf`/`gelf` headers
+    for `libbpf-sys` build); `git diff --check`
+
 - **Timestamp**: 2026-05-23T07:07:56Z
   - **Action**: PR #1499 @copilot review round-3 follow-up — corrected
     WireGuard `REJECT_AFTER_MESSAGES` to the WG spec value, changed
