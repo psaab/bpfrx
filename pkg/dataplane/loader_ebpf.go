@@ -220,7 +220,7 @@ func (m *Manager) loadAllObjects() error {
 		return fmt.Errorf("Rust xdp_userspace spec missing map userspace_bindings")
 	} else if ms.MaxEntries != BindingArrayMaxEntries {
 		return fmt.Errorf(
-			"userspace_bindings max_entries drift: embedded=%d, expected=%d (MaxInterfaces=%d * BindingQueuesPerIface=%d in bpf/headers/xpf_common.h). Re-run `make generate`.",
+			"userspace_bindings max_entries drift: embedded=%d, expected=%d (MaxInterfaces=%d * BindingQueuesPerIface=%d in bpf/headers/xpf_common.h). Re-run `make generate-userspace-xdp`.",
 			ms.MaxEntries, BindingArrayMaxEntries, MaxInterfaces, BindingQueuesPerIface,
 		)
 	}
@@ -228,7 +228,7 @@ func (m *Manager) loadAllObjects() error {
 		return fmt.Errorf("Rust xdp_userspace spec missing map userspace_ingress_ifaces")
 	} else if ms.MaxEntries != MaxInterfaces {
 		return fmt.Errorf(
-			"userspace_ingress_ifaces max_entries drift: embedded=%d, expected=%d (MaxInterfaces in bpf/headers/xpf_common.h). Re-run `make generate`.",
+			"userspace_ingress_ifaces max_entries drift: embedded=%d, expected=%d (MaxInterfaces in bpf/headers/xpf_common.h). Re-run `make generate-userspace-xdp`.",
 			ms.MaxEntries, MaxInterfaces,
 		)
 	}
@@ -560,7 +560,7 @@ func validateUserspaceShimSpec(userspaceSpec *ebpf.CollectionSpec) error {
 		return fmt.Errorf("Rust xdp_userspace spec missing map userspace_bindings")
 	} else if ms.MaxEntries != BindingArrayMaxEntries {
 		return fmt.Errorf(
-			"userspace_bindings max_entries drift: embedded=%d, expected=%d (MaxInterfaces=%d * BindingQueuesPerIface=%d in bpf/headers/xpf_common.h). Re-run `make generate`.",
+			"userspace_bindings max_entries drift: embedded=%d, expected=%d (MaxInterfaces=%d * BindingQueuesPerIface=%d in bpf/headers/xpf_common.h). Re-run `make generate-userspace-xdp`.",
 			ms.MaxEntries, BindingArrayMaxEntries, MaxInterfaces, BindingQueuesPerIface,
 		)
 	}
@@ -568,7 +568,7 @@ func validateUserspaceShimSpec(userspaceSpec *ebpf.CollectionSpec) error {
 		return fmt.Errorf("Rust xdp_userspace spec missing map userspace_ingress_ifaces")
 	} else if ms.MaxEntries != MaxInterfaces {
 		return fmt.Errorf(
-			"userspace_ingress_ifaces max_entries drift: embedded=%d, expected=%d (MaxInterfaces in bpf/headers/xpf_common.h). Re-run `make generate`.",
+			"userspace_ingress_ifaces max_entries drift: embedded=%d, expected=%d (MaxInterfaces in bpf/headers/xpf_common.h). Re-run `make generate-userspace-xdp`.",
 			ms.MaxEntries, MaxInterfaces,
 		)
 	}

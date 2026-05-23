@@ -80,6 +80,51 @@ func TestEmbeddedUserspaceShimDNATMapMatchesSharedPinnedMap(t *testing.T) {
 	}
 }
 
+func TestValidateUserspaceShimSpecDriftMentionsUserspaceXDPGenerate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		spec *ebpf.CollectionSpec
+	}{
+		{
+			name: "bindings",
+			spec: &ebpf.CollectionSpec{
+				Maps: map[string]*ebpf.MapSpec{
+					"userspace_bindings": {MaxEntries: BindingArrayMaxEntries - 1},
+				},
+			},
+		},
+		{
+			name: "ingress-ifaces",
+			spec: &ebpf.CollectionSpec{
+				Maps: map[string]*ebpf.MapSpec{
+					"userspace_bindings":       {MaxEntries: BindingArrayMaxEntries},
+					"userspace_ingress_ifaces": {MaxEntries: MaxInterfaces - 1},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := validateUserspaceShimSpec(tt.spec)
+			if err == nil {
+				t.Fatal("validateUserspaceShimSpec succeeded, want drift error")
+			}
+			if !strings.Contains(err.Error(), "Re-run `make generate-userspace-xdp`.") {
+				t.Fatalf("err = %v, want userspace XDP regeneration target", err)
+			}
+			if strings.Contains(err.Error(), "Re-run `make generate`.") {
+				t.Fatalf("err = %v, should not point at legacy bpf2go generation", err)
+			}
+		})
+	}
+}
+
 func TestLoadOrCreatePinnedShimMapRefusesIncompatiblePinnedMap(t *testing.T) {
 	t.Parallel()
 
