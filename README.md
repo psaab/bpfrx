@@ -322,14 +322,15 @@ To deploy to a single node: `make cluster-deploy NODE=0` or `make cluster-deploy
 
 | Path | Description |
 |------|-------------|
-| `bpf/headers/*.h` | Shared C structs (common, maps, helpers, conntrack, nat) |
-| `bpf/xdp/*.c` | Legacy XDP ingress programs (includes cpumap entry) |
-| `bpf/tc/*.c` | Legacy TC egress programs |
+| `bpf/headers/*.h` | Shared constants and C structs retained until userspace/DPDK replacements exist |
+| `bpf/xdp/*.c` | Legacy XDP ingress programs pending #1476 source removal |
+| `bpf/tc/*.c` | Legacy TC egress programs pending #1476 source removal |
 | `pkg/config/` | Junos parser, AST, typed config, compiler |
 | `pkg/cmdtree/` | Single source of truth for all CLI command trees |
 | `pkg/configstore/` | Candidate/active/commit/rollback, atomic DB persistence |
-| `pkg/dataplane/` | Legacy eBPF loader, map management, bpf2go bindings, shared dataplane interface |
+| `pkg/dataplane/` | Runtime contracts, retained userspace shim embed, and temporary legacy eBPF compatibility |
 | `pkg/dataplane/userspace/` | Go manager for the Rust userspace dataplane |
+| `userspace-xdp/` | Retained Rust XDP shim that redirects packets into the AF_XDP userspace runtime |
 | `pkg/daemon/` | Daemon lifecycle, reconciliation, interface management |
 | `pkg/cluster/` | Chassis cluster HA (state machine, session sync, config sync) |
 | `pkg/vrrp/` | Native VRRPv3 state machine (30ms RETH advertisements) |
@@ -355,7 +356,6 @@ To deploy to a single node: `make cluster-deploy NODE=0` or `make cluster-deploy
 | `proto/xpf/v1/` | Protobuf service definition |
 | `cmd/xpfd/` | Daemon main binary |
 | `cmd/cli/` | Remote CLI client binary |
-| `userspace-xdp/` | XDP shim for AF_XDP packet steering (Rust/eBPF) |
 | `userspace-dp/` | Rust AF_XDP userspace dataplane binary |
 | `docs/` | Protocol docs, test plans, feature gaps |
 | `test/incus/` | Test environment scripts and configs |
