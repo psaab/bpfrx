@@ -476,7 +476,7 @@ func TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram(t *testing.T) {
 	}
 }
 
-func TestUserspaceManagerAvoidsReflectionAndUnsafeMutationEscapes(t *testing.T) {
+func TestUserspaceManagerDoesNotImportReflectOrUnsafe(t *testing.T) {
 	t.Parallel()
 
 	var violations []string
@@ -530,6 +530,7 @@ func valid(m *manager) {
 	m.bpfShim.XDPEntryProg = userspaceXDPEntryProg
 	_ = m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg)
 	_ = (m.bpfShim.SwapXDPEntryProg)(userspaceXDPEntryProg)
+	_ = ((*shim).SwapXDPEntryProg)(m.bpfShim, userspaceXDPEntryProg)
 }
 `,
 	})
@@ -662,7 +663,18 @@ func methodExprBadCall(m *manager) {
 	_ = ((*shim).SwapXDPEntryProg)(m.bpfShim, "xdp_main_prog")
 }
 `,
-			want: []string{"calls through SwapXDPEntryProg method value"},
+			want: []string{"calls SwapXDPEntryProg with", "xdp_main_prog"},
+		},
+		{
+			name: "raw_string_bad_call",
+			body: `
+package userspace
+
+func rawStringBadCall(m *manager) {
+	_ = m.bpfShim.SwapXDPEntryProg(` + "`xdp_main_prog`" + `)
+}
+`,
+			want: []string{"calls SwapXDPEntryProg with", "xdp_main_prog"},
 		},
 		{
 			name: "slice_index_bad_call",
@@ -697,6 +709,70 @@ func wrappedMethodValueCallee(m *manager) {
 }
 `,
 			want: []string{"calls through SwapXDPEntryProg method value"},
+		},
+		{
+			name: "send_stmt_method_value",
+			body: `
+package userspace
+
+func sendStmtBypass(m *manager) {
+	ch := make(chan func(string) error, 1)
+	ch <- m.bpfShim.SwapXDPEntryProg
+}
+`,
+			want: []string{"sends SwapXDPEntryProg method value"},
+		},
+		{
+			name: "range_stmt_method_value",
+			body: `
+package userspace
+
+func rangeStmtBypass(m *manager) {
+	for _, fn := range []func(string) error{m.bpfShim.SwapXDPEntryProg} {
+		_ = fn(userspaceXDPEntryProg)
+	}
+}
+`,
+			want: []string{"ranges over SwapXDPEntryProg method value"},
+		},
+		{
+			name: "map_key_method_value",
+			body: `
+package userspace
+
+func mapKeyBypass(m *manager) {
+	mapOfFuncs := make(map[any]bool)
+	mapOfFuncs[m.bpfShim.SwapXDPEntryProg] = true
+}
+`,
+			want: []string{"uses SwapXDPEntryProg method value"},
+		},
+		{
+			name: "switch_tag_method_value",
+			body: `
+package userspace
+
+func switchTagBypass(m *manager) {
+	switch m.bpfShim.SwapXDPEntryProg {
+	case nil:
+	default:
+	}
+}
+`,
+			want: []string{"switches on SwapXDPEntryProg method value"},
+		},
+		{
+			name: "json_unmarshal_bpf_shim",
+			body: `
+package userspace
+
+import "encoding/json"
+
+func jsonBypass(m *manager) {
+	_ = json.Unmarshal([]byte(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `), m.bpfShim)
+}
+`,
+			want: []string{"json.Unmarshal into bpfShim"},
 		},
 		{
 			name: "reflection_field_name",
@@ -799,19 +875,11 @@ func userspaceXDPEntryProgramViolations(t *testing.T, roots []string) []string {
 	var violations []string
 	for _, parsed := range files {
 		rel := repoRelativePath(t, parsed.path)
+		parents := astParentMap(parsed.file)
+		jsonImports := importNamesForPath(parsed.file, "encoding/json")
 		ast.Inspect(parsed.file, func(n ast.Node) bool {
 			switch node := n.(type) {
 			case *ast.AssignStmt:
-				for _, rhs := range node.Rhs {
-					if containsSwapXDPEntryProgMethodValue(rhs) {
-						pos := fset.Position(rhs.Pos())
-						violations = append(violations, fmt.Sprintf(
-							"%s:%d captures SwapXDPEntryProg method value",
-							rel,
-							pos.Line,
-						))
-					}
-				}
 				for i, lhs := range node.Lhs {
 					if !isXDPEntryProgField(lhs) {
 						continue
@@ -846,62 +914,14 @@ func userspaceXDPEntryProgramViolations(t *testing.T, roots []string) []string {
 						))
 					}
 				}
-			case *ast.ValueSpec:
-				for _, value := range node.Values {
-					if containsSwapXDPEntryProgMethodValue(value) {
-						pos := fset.Position(value.Pos())
-						violations = append(violations, fmt.Sprintf(
-							"%s:%d stores SwapXDPEntryProg method value",
-							rel,
-							pos.Line,
-						))
-					}
-				}
 			case *ast.CallExpr:
-				if isDirectSwapXDPEntryProgCall(node.Fun) {
-					if len(node.Args) != 1 || !isUserspaceXDPEntryProgExpr(node.Args[0]) {
-						var got string
-						if len(node.Args) == 1 {
-							got = canaryExprString(node.Args[0])
-						}
-						pos := fset.Position(node.Pos())
-						violations = append(violations, fmt.Sprintf(
-							"%s:%d calls SwapXDPEntryProg with %q",
-							rel,
-							pos.Line,
-							got,
-						))
-					}
-					return true
-				}
-				if containsSwapXDPEntryProgMethodValue(node.Fun) {
-					pos := fset.Position(node.Fun.Pos())
+				if isJSONUnmarshalIntoBPFShim(node, jsonImports) {
+					pos := fset.Position(node.Pos())
 					violations = append(violations, fmt.Sprintf(
-						"%s:%d calls through SwapXDPEntryProg method value",
+						"%s:%d json.Unmarshal into bpfShim can mutate XDPEntryProg",
 						rel,
 						pos.Line,
 					))
-				}
-				for _, arg := range node.Args {
-					if containsSwapXDPEntryProgMethodValue(arg) {
-						pos := fset.Position(arg.Pos())
-						violations = append(violations, fmt.Sprintf(
-							"%s:%d passes SwapXDPEntryProg method value",
-							rel,
-							pos.Line,
-						))
-					}
-				}
-			case *ast.ReturnStmt:
-				for _, result := range node.Results {
-					if containsSwapXDPEntryProgMethodValue(result) {
-						pos := fset.Position(result.Pos())
-						violations = append(violations, fmt.Sprintf(
-							"%s:%d returns SwapXDPEntryProg method value",
-							rel,
-							pos.Line,
-						))
-					}
 				}
 			case *ast.UnaryExpr:
 				if node.Op == token.AND && containsXDPEntryProgField(node.X) {
@@ -924,6 +944,13 @@ func userspaceXDPEntryProgramViolations(t *testing.T, roots []string) []string {
 						rel,
 						pos.Line,
 					))
+				}
+			case *ast.SelectorExpr:
+				if node.Sel.Name != "SwapXDPEntryProg" {
+					return true
+				}
+				if violation := swapXDPEntryProgSelectorViolation(node, parents, fset, rel); violation != "" {
+					violations = append(violations, violation)
 				}
 			}
 			return true
@@ -1057,6 +1084,50 @@ func productionGoPackageFilesUnder(t *testing.T, roots []string) (*token.FileSet
 	}
 	resolveUserspaceXDPEntryProgramIdents(packageFiles)
 	return fset, files
+}
+
+func astParentMap(root ast.Node) map[ast.Node]ast.Node {
+	parents := map[ast.Node]ast.Node{}
+	var stack []ast.Node
+	ast.Inspect(root, func(n ast.Node) bool {
+		if n == nil {
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+			return false
+		}
+		if len(stack) > 0 {
+			parents[n] = stack[len(stack)-1]
+		}
+		stack = append(stack, n)
+		return true
+	})
+	return parents
+}
+
+func importNamesForPath(file *ast.File, importPath string) map[string]bool {
+	names := map[string]bool{}
+	for _, imp := range file.Imports {
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil || path != importPath {
+			continue
+		}
+		if imp.Name != nil {
+			if imp.Name.Name != "_" && imp.Name.Name != "." {
+				names[imp.Name.Name] = true
+			}
+			continue
+		}
+		names[defaultImportName(importPath)] = true
+	}
+	return names
+}
+
+func defaultImportName(importPath string) string {
+	if idx := strings.LastIndex(importPath, "/"); idx >= 0 {
+		return importPath[idx+1:]
+	}
+	return importPath
 }
 
 func resolveUserspaceXDPEntryProgramIdents(files map[string]*ast.File) {
@@ -1210,47 +1281,132 @@ func containsXDPEntryProgField(expr ast.Expr) bool {
 	return containsExpr(expr, isXDPEntryProgField)
 }
 
-func containsSwapXDPEntryProgMethodValue(expr ast.Expr) bool {
-	if expr == nil {
+func isJSONUnmarshalIntoBPFShim(call *ast.CallExpr, jsonImports map[string]bool) bool {
+	if len(jsonImports) == 0 || len(call.Args) < 2 {
 		return false
 	}
-	var found bool
-	ast.Inspect(expr, func(n ast.Node) bool {
-		if found {
-			return false
-		}
-		switch node := n.(type) {
-		case *ast.CallExpr:
-			if isDirectSwapXDPEntryProgCall(node.Fun) {
-				for _, arg := range node.Args {
-					if containsSwapXDPEntryProgMethodValue(arg) {
-						found = true
-						return false
-					}
-				}
-				return false
-			}
-		case *ast.SelectorExpr:
-			if node.Sel.Name == "SwapXDPEntryProg" {
-				found = true
-				return false
-			}
-		}
-		return true
-	})
-	return found
+	sel, ok := unparenExpr(call.Fun).(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "Unmarshal" {
+		return false
+	}
+	pkg, ok := unparenExpr(sel.X).(*ast.Ident)
+	if !ok || !jsonImports[pkg.Name] {
+		return false
+	}
+	return containsBPFShimSelector(call.Args[1])
 }
 
-func isDirectSwapXDPEntryProgCall(expr ast.Expr) bool {
-	sel, ok := unparenExpr(expr).(*ast.SelectorExpr)
-	if !ok || sel.Sel.Name != "SwapXDPEntryProg" {
-		return false
+func containsBPFShimSelector(expr ast.Expr) bool {
+	return containsExpr(expr, func(e ast.Expr) bool {
+		sel, ok := e.(*ast.SelectorExpr)
+		return ok && sel.Sel.Name == "bpfShim"
+	})
+}
+
+func swapXDPEntryProgSelectorViolation(sel *ast.SelectorExpr, parents map[ast.Node]ast.Node, fset *token.FileSet, rel string) string {
+	if call, methodExpr, ok := enclosingDirectSwapXDPEntryProgCall(sel, parents); ok {
+		argIndex := 0
+		wantArgs := 1
+		if methodExpr {
+			argIndex = 1
+			wantArgs = 2
+		}
+		if len(call.Args) == wantArgs && isUserspaceXDPEntryProgExpr(call.Args[argIndex]) {
+			return ""
+		}
+		var got string
+		if len(call.Args) > argIndex {
+			got = canaryExprString(call.Args[argIndex])
+		}
+		pos := fset.Position(call.Pos())
+		return fmt.Sprintf("%s:%d calls SwapXDPEntryProg with %q", rel, pos.Line, got)
 	}
-	switch unparenExpr(sel.X).(type) {
-	case *ast.StarExpr:
-		return false
+
+	pos := fset.Position(sel.Pos())
+	return fmt.Sprintf("%s:%d %s", rel, pos.Line, swapXDPEntryProgMethodValueContext(sel, parents))
+}
+
+func enclosingDirectSwapXDPEntryProgCall(sel *ast.SelectorExpr, parents map[ast.Node]ast.Node) (*ast.CallExpr, bool, bool) {
+	var expr ast.Node = sel
+	for {
+		parent := parents[expr]
+		if paren, ok := parent.(*ast.ParenExpr); ok && paren.X == expr {
+			expr = paren
+			continue
+		}
+		call, ok := parent.(*ast.CallExpr)
+		if !ok || call.Fun != expr {
+			return nil, false, false
+		}
+		return call, isSwapXDPEntryProgMethodExpression(sel), true
 	}
-	return true
+}
+
+func isSwapXDPEntryProgMethodExpression(sel *ast.SelectorExpr) bool {
+	_, ok := unparenExpr(sel.X).(*ast.StarExpr)
+	return ok
+}
+
+func swapXDPEntryProgMethodValueContext(sel *ast.SelectorExpr, parents map[ast.Node]ast.Node) string {
+	if selectorInsideCallFun(sel, parents) {
+		return "calls through SwapXDPEntryProg method value"
+	}
+
+	for child := ast.Node(sel); child != nil; {
+		parent := parents[child]
+		switch node := parent.(type) {
+		case *ast.AssignStmt:
+			if exprListContainsNode(node.Rhs, child) {
+				return "captures SwapXDPEntryProg method value"
+			}
+		case *ast.ValueSpec:
+			if exprListContainsNode(node.Values, child) {
+				return "stores SwapXDPEntryProg method value"
+			}
+		case *ast.ReturnStmt:
+			if exprListContainsNode(node.Results, child) {
+				return "returns SwapXDPEntryProg method value"
+			}
+		case *ast.CallExpr:
+			if exprListContainsNode(node.Args, child) {
+				return "passes SwapXDPEntryProg method value"
+			}
+		case *ast.SendStmt:
+			if node.Value == child {
+				return "sends SwapXDPEntryProg method value"
+			}
+		case *ast.RangeStmt:
+			if node.X == child {
+				return "ranges over SwapXDPEntryProg method value"
+			}
+		case *ast.SwitchStmt:
+			if node.Tag == child {
+				return "switches on SwapXDPEntryProg method value"
+			}
+		}
+		child = parent
+	}
+	return "uses SwapXDPEntryProg method value"
+}
+
+func selectorInsideCallFun(sel *ast.SelectorExpr, parents map[ast.Node]ast.Node) bool {
+	for child := ast.Node(sel); child != nil; {
+		parent := parents[child]
+		if call, ok := parent.(*ast.CallExpr); ok && call.Fun == child {
+			return true
+		}
+		child = parent
+	}
+	return false
+}
+
+func exprListContainsNode(exprs []ast.Expr, node ast.Node) bool {
+	for _, expr := range exprs {
+		if expr == node {
+			return true
+		}
+	}
+	return false
 }
 
 func unparenExpr(expr ast.Expr) ast.Expr {
