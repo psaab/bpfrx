@@ -89,14 +89,16 @@ impl WireguardBindingState {
         self.interfaces.retain(|name, _port| {
             after_names.contains(name.as_str())
         });
-        // Clean up stale engines: handle both interface removal and
-        // port migration (same name, different listen port).
+        // Clean up stale engines: handle interface removal, port
+        // migration, and port swap (two interfaces exchanging ports).
         for (name, old_port) in before.iter() {
             if !self.interfaces.contains_key(name.as_str()) {
                 if !self.interfaces.values().any(|p| *p == *old_port) {
                     engines.remove(old_port);
                 }
-            } else if self.interfaces.get(name.as_str()) != Some(old_port) {
+            } else if self.interfaces.get(name.as_str()) != Some(old_port)
+                && !self.interfaces.values().any(|p| *p == *old_port)
+            {
                 engines.remove(old_port);
             }
         }

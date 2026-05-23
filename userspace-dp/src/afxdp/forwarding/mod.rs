@@ -783,26 +783,33 @@ pub(super) fn tunnel_tcp_mss(
     decision: &SessionDecision,
     addr_family: u8,
 ) -> u16 {
-    // Try GRE first — when the endpoint is GRE this returns the GRE MSS;
-    // when it is WG the check inside native_gre_tcp_mss fails because
-    // neither tcp_mss_gre_out nor native_gre_inner_mtu match WG, so it
-    // returns 0 and we fall through to the WireGuard calculator.
-    let mss = native_gre_tcp_mss(forwarding, decision, addr_family);
-    if mss > 0 {
-        return mss;
-    }
     if decision.resolution.tunnel_endpoint_id == 0 {
         return 0;
     }
+    // Check the endpoint type: GRE uses native_gre_tcp_mss, WireGuard
+    // uses the WG-specific calculator below.  The global tcp_mss_gre_out
+    // must NOT be applied to WG tunnels.
     let Some(endpoint) = forwarding
         .tunnel_endpoints
         .get(&decision.resolution.tunnel_endpoint_id)
     else {
         return 0;
     };
-    if !endpoint.is_wireguard() {
-        return 0;
+    if endpoint.is_wireguard() {
+        // WireGuard tunnel — compute MSS from transport MTU with
+        // WG overhead (outer IP + UDP + WG header).
+        return wireguard_tcp_mss_inner(forwarding, decision, addr_family);
     }
+    // GRE tunnel — delegate to the GRE MSS calculator.
+    native_gre_tcp_mss(forwarding, decision, addr_family)
+}
+
+/// Compute TCP MSS for a WireGuard tunnel.
+fn wireguard_tcp_mss_inner(
+    forwarding: &ForwardingState,
+    decision: &SessionDecision,
+    addr_family: u8,
+) -> u16 {
     if forwarding.tcp_mss_all_tcp > 0 {
         return forwarding.tcp_mss_all_tcp;
     }

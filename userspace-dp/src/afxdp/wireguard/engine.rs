@@ -540,7 +540,7 @@ impl WireGuardEngine {
                     self.listen_port,
                     outer_dst_port,
                     total_payload_len,
-                    meta_dscp,   // full TOS/TC byte (DSCP + ECN) from caller
+                    meta_dscp,   // 6-bit DSCP, right-justified (meta.dscp per xpf_helpers.h)
                     wg_payload,
                 )?;
 
