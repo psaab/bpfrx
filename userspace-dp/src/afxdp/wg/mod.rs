@@ -18,6 +18,13 @@
 //! global type web. The integration PR will add a thin adapter
 //! layer that bridges the engine API to the dispatch/poll types.
 
+// TODO(#1499 r4 / integration PR): tighten this to per-item
+// `#[allow(dead_code)]` once tx/dispatch.rs and poll_descriptor.rs
+// consume the engine API. The module-wide allow exists because the
+// engine surface is intentionally complete-but-unused in this PR;
+// the integration PR will exercise most of it and the remaining
+// dead symbols (e.g. cookie-message helpers) can be allow-listed
+// individually.
 #![allow(dead_code)] // Most of this module is not yet wired into the hot path.
 
 pub(crate) mod allowed_ips;
@@ -35,7 +42,8 @@ pub(crate) mod session;
 mod tests;
 
 pub(crate) use engine::{
-    DecapError, DecapOutcome, EncapError, EncapOutcome, WgEngine, WgEngineConfig, WgPeerConfig,
+    DecapError, DecapOutcome, EncapError, EncapOutcome, InstallSessionError, WgEngine,
+    WgEngineConfig, WgPeerConfig,
 };
 pub(crate) use scratch::WgWorkerScratch;
 

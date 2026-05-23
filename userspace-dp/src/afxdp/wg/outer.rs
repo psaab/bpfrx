@@ -52,8 +52,21 @@ pub(crate) fn write_outer_eth(
 /// The IPv4 checksum is computed over the IPv4 header only;
 /// per RFC 768 the UDP checksum on IPv4 is optional. We set it to
 /// zero (skip) for now — UDP checksum offload semantics differ
-/// across NICs and we want a known-baseline behavior. A future
-/// PR can wire it through if needed.
+/// across NICs and we want a known-baseline behavior.
+///
+/// TODO(#1499 r4 / udp-checksum): kernel WG and wireguard-go emit a
+/// non-zero UDP checksum on IPv4. Some commercial firewalls and
+/// midboxes silently drop UDPv4 with cs=0. The integration PR
+/// should:
+///   - Either compute the UDP checksum here (pseudo-header + UDP
+///     header + payload — ones-complement sum, like the IP checksum
+///     above), or
+///   - Delegate to a NIC TX checksum-offload flag in the AF_XDP
+///     descriptor and surface the option through `outer_l2_len` /
+///     metadata.
+/// This is the only outer-header gap that affects wire interop with
+/// commercial midboxes; tracked separately from the engine-correctness
+/// fixes in this PR.
 pub(crate) fn write_outer_ipv4_udp(
     out: &mut [u8],
     src: Ipv4Addr,

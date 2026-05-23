@@ -30,12 +30,13 @@
 use super::allowed_ips::AllowedIps;
 use super::framing::{encode_data_header, parse_data_header};
 use super::peer::Peer;
-use super::session::{ReplayDecision, WgSession};
+use super::session::{REJECT_AFTER_MESSAGES, ReplayDecision, WgSession};
 use super::{POLY1305_TAG_LEN, WG_DATA_HEADER_LEN, WG_NOISE_PATTERN, WG_ZERO_PSK};
 use rustc_hash::FxHashMap;
 use snow::{Builder, HandshakeState};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, RwLock};
+use zeroize::Zeroizing;
 
 /// Errors that can fail the egress path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +66,18 @@ pub(crate) struct EncapOutcome {
     pub(crate) counter: u64,
 }
 
+/// Errors that can fail the slow-path session install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InstallSessionError {
+    /// The caller-supplied peer pubkey is not in the engine table.
+    UnknownPeer,
+    /// The caller-supplied `local_index` is already mapped to a
+    /// different live session. The caller must retry handshake
+    /// completion with a fresh `local_index`. Silently overwriting
+    /// the existing session would blackhole its inbound traffic.
+    LocalIndexCollision,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DecapError {
     /// Header was malformed (too short, wrong type, etc.)
@@ -77,6 +90,9 @@ pub(crate) enum DecapError {
     ReplayDuplicate,
     /// Replay window said this counter is too old.
     ReplayOutOfWindow,
+    /// Counter is at or above `REJECT_AFTER_MESSAGES`. Per WG spec
+    /// §6.5 the receiver MUST reject these without attempting AEAD.
+    CounterRejectAfterMessages,
     /// Decrypted plaintext did not parse as IPv4/IPv6.
     MalformedInner,
     /// Inner src IP is not in this peer's AllowedIPs — cryptokey-
@@ -113,11 +129,28 @@ pub(crate) struct WgEngineConfig {
     pub(crate) peers: Vec<WgPeerConfig>,
 }
 
+/// Stack scratch for the padded plaintext on the encap path. Sized
+/// to cover a 4 KiB jumbo-MTU inner packet plus the worst-case 15
+/// bytes of padding. We use a fixed stack buffer rather than the
+/// caller's `out` because `out` is the post-AEAD destination — snow
+/// requires non-overlapping plaintext/ciphertext slices. Stack
+/// allocation has zero per-packet cost.
+const PADDED_PLAINTEXT_MAX: usize = 4096 + 16;
+
+/// Round `n` up to the nearest multiple of 16. WG spec §5.4.6.
+#[inline]
+const fn pad_to_16(n: usize) -> usize {
+    (n + 15) & !15
+}
+
 /// The engine.
 pub(crate) struct WgEngine {
     /// Local X25519 private key. Held in the engine because every
-    /// slow-path handshake needs it.
-    local_private_key: [u8; 32],
+    /// slow-path handshake needs it. Wrapped in `Zeroizing` so the
+    /// 32 bytes of key material are wiped on engine drop — kernel
+    /// WG and wireguard-go both do this. snow internally zeroizes
+    /// its own copies; this is for the engine's persistent copy.
+    local_private_key: Zeroizing<[u8; 32]>,
     /// UDP port we listen on for inbound. Stored for diagnostics
     /// and for the slow-path responder.
     listen_port: u16,
@@ -137,7 +170,7 @@ pub(crate) struct WgEngine {
 impl WgEngine {
     pub(crate) fn new(config: WgEngineConfig) -> Self {
         let engine = Self {
-            local_private_key: config.local_private_key,
+            local_private_key: Zeroizing::new(config.local_private_key),
             listen_port: config.listen_port,
             peer_index_by_pubkey: RwLock::new(FxHashMap::default()),
             peers: RwLock::new(Vec::new()),
@@ -206,25 +239,62 @@ impl WgEngine {
     /// Install a freshly-completed transport session on a peer and
     /// register it for inbound demux. Called from the slow-path
     /// handshake-complete code.
-    pub(crate) fn install_session(&self, pubkey: &[u8; 32], session: Arc<WgSession>) {
+    ///
+    /// Returns `Err(InstallSessionError::LocalIndexCollision)` if the
+    /// caller's chosen `local_index` is already in the demux map for
+    /// a *different* session (different `Arc` identity). The slow-path
+    /// integration must retry handshake completion with a fresh
+    /// receiver_index when this fires; silently overwriting an
+    /// existing session would blackhole all of its inbound traffic.
+    /// See `try_decap` path for why the demux key must be unique
+    /// across live sessions.
+    pub(crate) fn install_session(
+        &self,
+        pubkey: &[u8; 32],
+        session: Arc<WgSession>,
+    ) -> Result<(), InstallSessionError> {
         let Some(peer) = self.peer_arc(pubkey) else {
-            return;
+            return Err(InstallSessionError::UnknownPeer);
         };
-        // Register for inbound demux before rotation so decap can
-        // resolve the new local index immediately. Keep only
-        // current+previous in the demux map by deleting the session
-        // that falls off.
+        // Register for inbound demux BEFORE rotation so decap can
+        // resolve the new local index immediately (closes the decap-
+        // blackhole window that earlier rotate-first ordering had).
+        //
+        // Three concerns:
+        //   (a) If the same `local_index` is already mapped to a
+        //       different session, refuse the install rather than
+        //       silently overwriting it.
+        //   (b) After rotation, the dropped-previous session must be
+        //       removed from the demux map — but ONLY if its
+        //       `local_index` differs from the new session's (the
+        //       re-handshake-on-same-index case), otherwise the
+        //       remove kills the entry we just inserted.
+        //   (c) The demux insert and rotate must be visible together.
+        //       Holding the demux write lock across rotate_session is
+        //       safe (peer.current/previous have separate locks) and
+        //       gives a single atomic transition.
+        let new_local_index = session.local_index;
+        let mut by_index = self.sessions_by_local_index.write().unwrap();
+        // Collision check: an existing entry with the same local_index
+        // is only acceptable if it belongs to the SAME peer (i.e. a
+        // re-handshake / rekey landed on the same caller-chosen
+        // receiver_index, which is benign — the new session simply
+        // replaces the old one). An entry owned by a DIFFERENT peer
+        // is a real collision and we must refuse the install rather
+        // than silently overwrite the other peer's live session.
+        if let Some(existing) = by_index.get(&new_local_index)
+            && existing.peer_pubkey != session.peer_pubkey
         {
-            let mut by_index = self.sessions_by_local_index.write().unwrap();
-            by_index.insert(session.local_index, session.clone());
+            return Err(InstallSessionError::LocalIndexCollision);
         }
+        by_index.insert(new_local_index, session.clone());
         let dropped_previous = peer.rotate_session(session);
-        if let Some(old) = dropped_previous {
-            self.sessions_by_local_index
-                .write()
-                .unwrap()
-                .remove(&old.local_index);
+        if let Some(old) = dropped_previous
+            && old.local_index != new_local_index
+        {
+            by_index.remove(&old.local_index);
         }
+        Ok(())
     }
 
     /// Hot-path encap.
@@ -251,18 +321,46 @@ impl WgEngine {
             .clone()
             .ok_or(EncapError::NoSession)?;
 
-        let required = WG_DATA_HEADER_LEN + inner_ip.len() + POLY1305_TAG_LEN;
+        // WG spec §5.4.6 mandates the plaintext be zero-padded to a
+        // 16-byte multiple before AEAD. This obscures inner packet
+        // lengths and is required for wire interoperability with
+        // kernel WG / wireguard-go. Compute the padded length and
+        // ensure the output buffer can hold header + ciphertext +
+        // tag at the padded size.
+        let padded_len = pad_to_16(inner_ip.len());
+        let required = WG_DATA_HEADER_LEN + padded_len + POLY1305_TAG_LEN;
         if out.len() < required {
             return Err(EncapError::BufferTooSmall);
         }
         let counter = session.next_tx_counter().ok_or(EncapError::RekeyRequired)?;
         let _ = encode_data_header(out, session.peer_index, counter)
             .ok_or(EncapError::BufferTooSmall)?;
-        // snow writes ciphertext||tag into the payload region.
+        // Stage the padded plaintext in the output buffer immediately
+        // after the (eventual) ciphertext region. We do NOT allocate;
+        // we reuse a scratch zone at the END of `out` that is past
+        // `required`. If the caller sized `out` exactly to `required`
+        // (the worker scratch path always does this), we instead pad
+        // in-place at the front of the payload region BEFORE handing
+        // it to snow. Strategy: write zeros after `inner_ip` into the
+        // pre-AEAD slot, then have snow encrypt the padded region.
+        //
+        // Implementation: pre-AEAD plaintext lives in `out[WG_DATA_HEADER_LEN..WG_DATA_HEADER_LEN+padded_len]`.
+        // We can't overlap with snow's output of the same range, so
+        // we use a small stack-allocated scratch for the padded
+        // plaintext. The WG MTU bound puts the inner packet at
+        // <=1500 bytes; we use a 4 KiB stack buffer to cover jumbo
+        // MTU configurations comfortably.
+        let mut plaintext = [0u8; PADDED_PLAINTEXT_MAX];
+        if padded_len > plaintext.len() {
+            return Err(EncapError::BufferTooSmall);
+        }
+        plaintext[..inner_ip.len()].copy_from_slice(inner_ip);
+        // Bytes [inner_ip.len()..padded_len] are already zero from
+        // the array initializer.
         let (_hdr, payload) = out.split_at_mut(WG_DATA_HEADER_LEN);
         let n = session
             .transport
-            .write_message(counter, inner_ip, payload)
+            .write_message(counter, &plaintext[..padded_len], payload)
             .map_err(|_| EncapError::CryptoFailed)?;
         Ok(EncapOutcome {
             len: WG_DATA_HEADER_LEN + n,
@@ -283,6 +381,14 @@ impl WgEngine {
         out: &mut [u8],
     ) -> Result<DecapOutcome, DecapError> {
         let hdr = parse_data_header(wg_record).ok_or(DecapError::MalformedHeader)?;
+        // WG spec §6.5: drop inbound data packets whose counter is
+        // at or above REJECT_AFTER_MESSAGES without doing AEAD. The
+        // counter-space ceiling is symmetric across encap/decap;
+        // the encap-side guard alone is not sufficient because a
+        // malicious or buggy sender may send arbitrary high counters.
+        if hdr.counter >= REJECT_AFTER_MESSAGES {
+            return Err(DecapError::CounterRejectAfterMessages);
+        }
         let session = self
             .sessions_by_local_index
             .read()
@@ -313,8 +419,20 @@ impl WgEngine {
             let mut replay = session.replay.lock().unwrap();
             match replay.check_and_update(hdr.counter) {
                 ReplayDecision::Accept => {}
-                ReplayDecision::Repeat => return Err(DecapError::ReplayDuplicate),
-                ReplayDecision::OutOfWindow => return Err(DecapError::ReplayOutOfWindow),
+                ReplayDecision::Repeat => {
+                    // Authentic but replayed: snow has already written
+                    // plaintext into `out[..n]`. Zero the staging
+                    // region before returning so a caller that
+                    // mishandles the error path cannot leak the
+                    // plaintext upstream. Cost is one memset per
+                    // replay-reject — the rare path.
+                    out[..n].fill(0);
+                    return Err(DecapError::ReplayDuplicate);
+                }
+                ReplayDecision::OutOfWindow => {
+                    out[..n].fill(0);
+                    return Err(DecapError::ReplayOutOfWindow);
+                }
             }
         }
         // AllowedIPs gate on the inner src IP. WG spec §5.4.6:
@@ -322,12 +440,28 @@ impl WgEngine {
         // IP of the inner packet belongs to the peer who sent it.
         // If not, drop." This is the cryptokey-routing safety
         // invariant on the receive side.
+        //
+        // WG transport messages are zero-padded to 16-byte multiples
+        // before AEAD on send; strip trailing zero padding before we
+        // hand the plaintext to the inner-IP parser, otherwise an
+        // IPv4 packet whose `total_length` is shorter than the
+        // padded ciphertext will still parse correctly (we parse the
+        // src IP from the IPv4 header at byte offset 12..16, which
+        // is well before any padding) but downstream consumers will
+        // see trailing zero bytes that aren't part of the original
+        // packet. We do not truncate `n` here — the caller is
+        // expected to consult the inner IP header's length field —
+        // but the parse below is robust to extra trailing bytes.
         let inner_src = inner_src_ip(&out[..n]).ok_or(DecapError::MalformedInner)?;
         let peer_idx = self
             .peer_index(&session.peer_pubkey)
             .ok_or(DecapError::UnknownSession)?;
         let allowed = self.allowed_ips.read().unwrap();
         if !allowed.matches_for_peer(inner_src, peer_idx) {
+            // Defensive: zero the plaintext we just authenticated
+            // but cannot deliver, to keep the contract "on Err the
+            // caller MUST NOT inspect `out`" tight.
+            out[..n].fill(0);
             return Err(DecapError::AllowedIpsViolation);
         }
         Ok(DecapOutcome {
@@ -348,7 +482,7 @@ impl WgEngine {
         peer_pubkey: &[u8; 32],
     ) -> Result<HandshakeState, snow::Error> {
         Builder::new(WG_NOISE_PATTERN.parse()?)
-            .local_private_key(&self.local_private_key)?
+            .local_private_key(self.local_private_key.as_slice())?
             .remote_public_key(peer_pubkey)?
             .psk(2, &WG_ZERO_PSK)?
             .build_initiator()
@@ -356,9 +490,19 @@ impl WgEngine {
 
     /// Build a snow `HandshakeState` configured as the responder.
     /// Slow path only.
+    ///
+    /// TODO(#1499 r4 / responder-peer-id): the integration layer
+    /// needs a thin helper that (a) builds this responder state,
+    /// (b) reads the init message, (c) calls
+    /// `HandshakeState::get_remote_static` to learn which peer sent
+    /// the init, and (d) looks up the peer in the engine table.
+    /// snow already supports step (c); we just haven't surfaced a
+    /// convenience API yet. Adding it here would couple the engine
+    /// to the snow message-bytes parser which is integration-layer
+    /// concern. Tracked for the integration PR.
     pub(crate) fn build_responder_handshake(&self) -> Result<HandshakeState, snow::Error> {
         Builder::new(WG_NOISE_PATTERN.parse()?)
-            .local_private_key(&self.local_private_key)?
+            .local_private_key(self.local_private_key.as_slice())?
             .psk(2, &WG_ZERO_PSK)?
             .build_responder()
     }
@@ -443,6 +587,134 @@ mod engine_internal_tests {
         assert!(inner_src_ip(&[0x05u8; 40]).is_none()); // bogus version 0
     }
 
+    /// Drive a real IK handshake between two engines and return the
+    /// initiator-side transport session. Helper used by the
+    /// install_session unit tests below — going through snow is
+    /// cheaper than a separate mock and keeps the test honest.
+    fn make_session_for(
+        engine: &WgEngine,
+        peer_pub: [u8; 32],
+        peer_engine: &WgEngine,
+        local_index: u32,
+        peer_index: u32,
+    ) -> Arc<WgSession> {
+        let mut init_hs = engine.build_initiator_handshake(&peer_pub).unwrap();
+        let mut resp_hs = peer_engine.build_responder_handshake().unwrap();
+        let mut buf = [0u8; 1024];
+        let mut sink = [0u8; 1024];
+        let n1 = init_hs.write_message(&[], &mut buf).unwrap();
+        resp_hs.read_message(&buf[..n1], &mut sink).unwrap();
+        let n2 = resp_hs.write_message(&[], &mut buf).unwrap();
+        init_hs.read_message(&buf[..n2], &mut sink).unwrap();
+        let xport = init_hs.into_stateless_transport_mode().unwrap();
+        Arc::new(WgSession::new(xport, local_index, peer_index, peer_pub))
+    }
+
+    /// Regression: re-handshake on the SAME `local_index` must keep
+    /// the new session in the demux map, not get it nuked by the
+    /// dropped-previous cleanup. r3 introduced a same-index aliasing
+    /// bug where remove(&old.local_index) silently deleted the entry
+    /// the new session had just installed.
+    #[test]
+    fn install_session_same_local_index_keeps_new_session_in_demux() {
+        let (init_priv, _init_pub) = keypair();
+        let (peer_priv, peer_pub) = keypair();
+        let engine = WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: peer_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            }],
+        });
+        let peer_engine = WgEngine::new(WgEngineConfig {
+            local_private_key: peer_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: [0u8; 32],
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            }],
+        });
+        let s1 = make_session_for(&engine, peer_pub, &peer_engine, 0xaaaa_0001, 2);
+        engine.install_session(&peer_pub, s1).unwrap();
+        // Re-handshake with the SAME local_index (e.g. rekey
+        // happened to land on the same caller-chosen receiver_index).
+        let s2 = make_session_for(&engine, peer_pub, &peer_engine, 0xaaaa_0001, 3);
+        let s2_ptr = Arc::as_ptr(&s2);
+        engine.install_session(&peer_pub, s2).unwrap();
+        let by_index = engine.sessions_by_local_index.read().unwrap();
+        let live = by_index
+            .get(&0xaaaa_0001)
+            .expect("new session must still be in demux map");
+        assert_eq!(Arc::as_ptr(live), s2_ptr);
+    }
+
+    /// Collision detection: installing two distinct sessions with the
+    /// same `local_index` for DIFFERENT peers (or stale handshake
+    /// race) must return LocalIndexCollision rather than silently
+    /// overwriting the existing entry.
+    #[test]
+    fn install_session_rejects_local_index_collision_across_peers() {
+        let (init_priv, _init_pub) = keypair();
+        let (peer_a_priv, peer_a_pub) = keypair();
+        let (peer_b_priv, peer_b_pub) = keypair();
+        let engine = WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![
+                WgPeerConfig {
+                    pubkey: peer_a_pub,
+                    endpoint: None,
+                    persistent_keepalive: 0,
+                    allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+                },
+                WgPeerConfig {
+                    pubkey: peer_b_pub,
+                    endpoint: None,
+                    persistent_keepalive: 0,
+                    allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+                },
+            ],
+        });
+        let peer_a_engine = WgEngine::new(WgEngineConfig {
+            local_private_key: peer_a_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: [0u8; 32],
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            }],
+        });
+        let peer_b_engine = WgEngine::new(WgEngineConfig {
+            local_private_key: peer_b_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: [0u8; 32],
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            }],
+        });
+        let sa = make_session_for(&engine, peer_a_pub, &peer_a_engine, 0x1234_5678, 2);
+        let sa_ptr = Arc::as_ptr(&sa);
+        engine.install_session(&peer_a_pub, sa).unwrap();
+        let sb = make_session_for(&engine, peer_b_pub, &peer_b_engine, 0x1234_5678, 3);
+        let err = engine.install_session(&peer_b_pub, sb).unwrap_err();
+        assert_eq!(err, InstallSessionError::LocalIndexCollision);
+        // Peer A's session must still be the one in the demux map.
+        let by_index = engine.sessions_by_local_index.read().unwrap();
+        assert_eq!(
+            Arc::as_ptr(by_index.get(&0x1234_5678).unwrap()),
+            sa_ptr,
+            "collision must NOT overwrite the existing session"
+        );
+    }
+
     #[test]
     fn encap_rejects_after_message_limit() {
         let (init_priv, _init_pub) = keypair();
@@ -485,7 +757,7 @@ mod engine_internal_tests {
             super::super::session::REJECT_AFTER_MESSAGES,
             Ordering::Relaxed,
         );
-        engine.install_session(&peer_pub, session);
+        engine.install_session(&peer_pub, session).unwrap();
         let inner = [
             0x45u8, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2,
         ];

@@ -22,6 +22,7 @@
 //! storms that bit #923's prefix-set code at large fanout. The
 //! scan is also branch-predictable and cache-friendly.
 
+use rustc_hash::FxHashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// A single AllowedIPs entry: `(prefix, prefix_len, peer_index)`.
@@ -46,6 +47,14 @@ pub(crate) struct AllowedIps {
     /// IPv4 and IPv6 entries are interleaved — `lookup` dispatches
     /// on the query family.
     entries: Vec<Entry>,
+    /// Auxiliary index: `peer_index → indices into `entries` belonging
+    /// to that peer`. Lets `matches_for_peer` skip over entries owned
+    /// by other peers without scanning the whole table — important
+    /// when many peers share an engine (the original linear scan was
+    /// O(N) per decap and showed up in profiles at 50+-peer configs).
+    /// Rebuilt on every `insert` / `remove_peer` call; the LPM
+    /// reconcile path is slow-path so the rebuild cost is irrelevant.
+    by_peer: FxHashMap<u32, Vec<usize>>,
 }
 
 impl AllowedIps {
@@ -77,12 +86,24 @@ impl AllowedIps {
         });
         self.entries.push(entry);
         self.entries.sort_by(|a, b| b.prefix_len.cmp(&a.prefix_len));
+        self.rebuild_by_peer();
     }
 
     /// Remove every entry for a peer. Used when the peer is dropped
     /// from the config snapshot.
     pub(crate) fn remove_peer(&mut self, peer_index: u32) {
         self.entries.retain(|e| e.peer_index != peer_index);
+        self.rebuild_by_peer();
+    }
+
+    /// Rebuild the `by_peer` auxiliary index from `entries`. O(N)
+    /// over the entry count; only called from the slow-path
+    /// reconcile.
+    fn rebuild_by_peer(&mut self) {
+        self.by_peer.clear();
+        for (idx, entry) in self.entries.iter().enumerate() {
+            self.by_peer.entry(entry.peer_index).or_default().push(idx);
+        }
     }
 
     /// Longest-prefix-match lookup. Returns the peer_index of the
@@ -129,13 +150,14 @@ impl AllowedIps {
     /// `peer_index` covers `addr` — in which case the packet must
     /// be dropped.
     pub(crate) fn matches_for_peer(&self, addr: IpAddr, peer_index: u32) -> bool {
+        let Some(indices) = self.by_peer.get(&peer_index) else {
+            return false;
+        };
         match addr {
             IpAddr::V4(ip) => {
                 let bytes = ip.octets();
-                for entry in &self.entries {
-                    if entry.peer_index != peer_index {
-                        continue;
-                    }
+                for &i in indices {
+                    let entry = &self.entries[i];
                     if let PrefixBits::V4(prefix) = entry.prefix
                         && prefix_matches(&bytes, &prefix, entry.prefix_len)
                     {
@@ -146,10 +168,8 @@ impl AllowedIps {
             }
             IpAddr::V6(ip) => {
                 let bytes = ip.octets();
-                for entry in &self.entries {
-                    if entry.peer_index != peer_index {
-                        continue;
-                    }
+                for &i in indices {
+                    let entry = &self.entries[i];
                     if let PrefixBits::V6(prefix) = entry.prefix
                         && prefix_matches(&bytes, &prefix, entry.prefix_len)
                     {

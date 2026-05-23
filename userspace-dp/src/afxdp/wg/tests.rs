@@ -101,8 +101,12 @@ fn established_pair(
         init_local_index,
         init_pub,
     ));
-    init_engine.install_session(&resp_pub, init_session);
-    resp_engine.install_session(&init_pub, resp_session);
+    init_engine
+        .install_session(&resp_pub, init_session)
+        .unwrap();
+    resp_engine
+        .install_session(&init_pub, resp_session)
+        .unwrap();
 
     (init_engine, resp_engine, init_pub, resp_pub)
 }
@@ -131,13 +135,22 @@ fn handshake_completes_and_roundtrip_encap_decap() {
     let mut wire = [0u8; 2048];
     let enc = init_engine.try_encap(&resp_pub, &inner, &mut wire).unwrap();
 
-    // Wire image should be: header (16) + ciphertext (inner.len()) + tag (16).
-    assert_eq!(enc.len, 16 + inner.len() + 16);
+    // Wire image: header (16) + padded_plaintext (16-byte multiple
+    // >= inner.len()) + tag (16). WG spec §5.4.6 mandates the
+    // plaintext be zero-padded to a 16-byte multiple before AEAD.
+    let padded = (inner.len() + 15) & !15;
+    assert_eq!(enc.len, 16 + padded + 16);
+    assert!(padded >= inner.len());
+    assert_eq!(padded % 16, 0);
 
     let mut plain = [0u8; 2048];
     let dec = resp_engine.try_decap(&wire[..enc.len], &mut plain).unwrap();
     assert_eq!(dec.peer_pubkey, init_pub);
-    assert_eq!(&plain[..dec.len], &inner[..]);
+    // Decrypted plaintext is the padded form. The first `inner.len()`
+    // bytes must equal the original inner packet; trailing bytes are
+    // zero padding.
+    assert_eq!(&plain[..inner.len()], &inner[..]);
+    assert!(plain[inner.len()..dec.len].iter().all(|&b| b == 0));
 }
 
 #[test]
@@ -254,14 +267,18 @@ fn cryptokey_routing_overlapping_allowed_ips() {
     let resp_xport = resp_hs.into_stateless_transport_mode().unwrap();
     let init_idx = 0x1111_2222;
     let resp_idx = 0x3333_4444;
-    init_engine.install_session(
-        &peer_a_pub,
-        Arc::new(WgSession::new(init_xport, init_idx, resp_idx, peer_a_pub)),
-    );
-    resp_a.install_session(
-        &init_pub,
-        Arc::new(WgSession::new(resp_xport, resp_idx, init_idx, init_pub)),
-    );
+    init_engine
+        .install_session(
+            &peer_a_pub,
+            Arc::new(WgSession::new(init_xport, init_idx, resp_idx, peer_a_pub)),
+        )
+        .unwrap();
+    resp_a
+        .install_session(
+            &init_pub,
+            Arc::new(WgSession::new(resp_xport, resp_idx, init_idx, init_pub)),
+        )
+        .unwrap();
 
     // Drive IK init↔B.
     let mut init_hs = init_engine.build_initiator_handshake(&peer_b_pub).unwrap();
@@ -274,14 +291,18 @@ fn cryptokey_routing_overlapping_allowed_ips() {
     let resp_xport = resp_hs.into_stateless_transport_mode().unwrap();
     let init_idx = 0x5555_6666;
     let resp_idx = 0x7777_8888;
-    init_engine.install_session(
-        &peer_b_pub,
-        Arc::new(WgSession::new(init_xport, init_idx, resp_idx, peer_b_pub)),
-    );
-    resp_b.install_session(
-        &init_pub,
-        Arc::new(WgSession::new(resp_xport, resp_idx, init_idx, init_pub)),
-    );
+    init_engine
+        .install_session(
+            &peer_b_pub,
+            Arc::new(WgSession::new(init_xport, init_idx, resp_idx, peer_b_pub)),
+        )
+        .unwrap();
+    resp_b
+        .install_session(
+            &init_pub,
+            Arc::new(WgSession::new(resp_xport, resp_idx, init_idx, init_pub)),
+        )
+        .unwrap();
 
     let inner = ipv4_packet(Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 9));
     let mut wire = [0u8; 2048];
@@ -381,8 +402,75 @@ fn worker_scratch_no_realloc_under_repeated_encap() {
         let _ = init_engine.try_encap(&resp_pub, &inner, &mut buf).unwrap();
     }
     // No reallocation across 256 encaps. If a future change adds
-    // a per-packet vec![], this test will catch it.
+    // a per-packet `vec![]` on the scratch buffer, this test will
+    // catch it.
+    //
+    // TODO(#1499 r4 / hot-path-discipline): this test only proves
+    // the scratch `Vec` doesn't grow. It does NOT prove that
+    // `try_encap` itself avoids internal allocation (e.g. an
+    // accidental `Vec::with_capacity` inside snow or the engine).
+    // The proper instrumentation is `assert_no_alloc` or a custom
+    // `GlobalAlloc` that panics on alloc during the hot section.
+    // Adding it now would change crate-level test infra; deferred
+    // to a follow-up PR that introduces the harness once the
+    // integration PR has the full hot path under test.
     assert_eq!(scratch.encap_out.borrow().as_ptr(), initial_ptr);
+}
+
+#[test]
+fn transport_plaintext_is_padded_to_16_byte_multiple() {
+    // WG spec §5.4.6 — every plaintext input to the data-AEAD must
+    // be zero-padded to a multiple of 16 before encryption. Test
+    // several inner-packet lengths to cover both the "exact
+    // multiple" and "needs padding" arms.
+    let (init_engine, resp_engine, _init_pub, resp_pub) = established_pair(
+        vec!["10.0.1.0/24".parse().unwrap()],
+        vec!["10.0.0.0/24".parse().unwrap()],
+    );
+    for inner_len in [20usize, 32, 33, 47, 48, 49, 1500] {
+        let mut inner = vec![0u8; inner_len];
+        inner[0] = 0x45; // IPv4
+        inner[2..4].copy_from_slice(&(inner_len as u16).to_be_bytes());
+        inner[9] = 17; // UDP
+        inner[12..16].copy_from_slice(&[10, 0, 0, 5]);
+        inner[16..20].copy_from_slice(&[10, 0, 1, 5]);
+        let mut wire = [0u8; 4096];
+        let enc = init_engine
+            .try_encap(&resp_pub, &inner, &mut wire)
+            .unwrap_or_else(|e| panic!("inner_len={inner_len}: {e:?}"));
+        let expected_padded = (inner_len + 15) & !15;
+        let ciphertext_len = enc.len - 16 /* hdr */ - 16 /* tag */;
+        assert_eq!(
+            ciphertext_len, expected_padded,
+            "padding mismatch at inner_len={inner_len}: got {ciphertext_len}, want {expected_padded}",
+        );
+        // Roundtrip: decap and verify the original prefix survives.
+        let mut plain = [0u8; 4096];
+        let dec = resp_engine.try_decap(&wire[..enc.len], &mut plain).unwrap();
+        assert_eq!(&plain[..inner_len], &inner[..]);
+        assert_eq!(dec.len, expected_padded);
+    }
+}
+
+#[test]
+fn decap_rejects_counter_at_reject_after_messages() {
+    // WG spec §6.5 — receiver MUST refuse data messages whose
+    // counter is at or above REJECT_AFTER_MESSAGES, without
+    // attempting AEAD. Symmetric to the encap-side guard.
+    use super::framing::encode_data_header;
+    use super::session::REJECT_AFTER_MESSAGES;
+    let (_init_engine, resp_engine, _init_pub, _resp_pub) = established_pair(
+        vec!["10.0.1.0/24".parse().unwrap()],
+        vec!["10.0.0.0/24".parse().unwrap()],
+    );
+    // Hand-craft a record with a counter at the spec limit. We
+    // don't need real ciphertext — the counter check fires before
+    // the demux lookup or AEAD attempt.
+    let mut wire = [0u8; 64];
+    encode_data_header(&mut wire, /*receiver_idx*/ 0xdead_beef, REJECT_AFTER_MESSAGES).unwrap();
+    let mut plain = [0u8; 128];
+    let err = resp_engine.try_decap(&wire[..32], &mut plain).unwrap_err();
+    assert_eq!(err, DecapError::CounterRejectAfterMessages);
 }
 
 #[test]
