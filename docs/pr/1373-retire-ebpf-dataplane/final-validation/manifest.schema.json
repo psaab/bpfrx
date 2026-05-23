@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/psaab/xpf/docs/pr/1373-retire-ebpf-dataplane/final-validation/manifest.schema.json",
+  "title": "#1477 Final Userspace-Only Validation Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "issues",
+    "candidate_commit",
+    "cluster",
+    "binaries",
+    "commands"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "integer"
+      },
+      "allOf": [
+        {
+          "contains": {
+            "const": 1373
+          }
+        },
+        {
+          "contains": {
+            "const": 1477
+          }
+        }
+      ],
+      "minItems": 2,
+      "uniqueItems": true
+    },
+    "candidate_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "candidate_branch": {
+      "type": "string",
+      "minLength": 1
+    },
+    "artifact_created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "cluster": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "env_file",
+        "config_files"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "env_file": {
+          "const": "test/incus/loss-userspace-cluster.env"
+        },
+        "config_files": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "contains": {
+            "const": "docs/ha-cluster-userspace.conf"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      }
+    },
+    "binaries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "host",
+          "path",
+          "sha256"
+        ],
+        "properties": {
+          "host": {
+            "type": "string",
+            "minLength": 1
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "commands": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "gate",
+          "command",
+          "exit_status"
+        ],
+        "properties": {
+          "gate": {
+            "type": "string",
+            "enum": [
+              "cos-off",
+              "screen-flood",
+              "syn-cookie",
+              "cos-on-5200-5211-push",
+              "cos-on-5200-5211-reverse",
+              "echo-6200-6211",
+              "userspace-phase-cycle",
+              "userspace-ha-failover",
+              "ha-test-failover",
+              "ha-test-ha-crash",
+              "ha-test-restart-connectivity",
+              "fallback-exclusion"
+            ]
+          },
+          "command": {
+            "type": "string",
+            "minLength": 1
+          },
+          "exit_status": {
+            "type": "integer"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "finished_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "artifacts": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": "string"
+    }
+  }
+}

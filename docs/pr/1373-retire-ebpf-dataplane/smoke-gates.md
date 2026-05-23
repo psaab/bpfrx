@@ -110,16 +110,17 @@ This gate proves the userspace cluster still exercises screen paths before BPF
 retirement work proceeds. The userspace status path currently publishes an
 aggregate `screen_drops` counter, so this gate isolates each configured check
 instead of summing unrelated statistics: LAND-only, then SYN-flood-only, then
-ICMP-flood-only. Each subcheck requires the aggregate counter to advance after
-its matching probe. It always redeploys the baseline config on exit so the low
-thresholds do not contaminate reruns or later CoS measurements.
+ICMP-flood-only, then UDP-flood-only. Each subcheck requires the aggregate
+counter to advance after its matching probe. It always redeploys the baseline
+config on exit so the low thresholds do not contaminate reruns or later CoS
+measurements.
 
 This is not the #1374 SYN-cookie proof. SYN-cookie runtime support is now wired
 in userspace, but BPF source removal still needs a dedicated #1374 artifact set
 showing SYN-ACK replies, validated-ACK RST replies, retransmitted-SYN
 admission, random-ACK drops, reply-budget accounting, and HA failover
-acceptance. This section covers the LAND, SYN-flood, and ICMP-flood screen
-plumbing baseline.
+acceptance. This section covers the LAND, SYN-flood, ICMP-flood, and UDP-flood
+screen plumbing baseline.
 
 ```bash
 set -euo pipefail
@@ -234,6 +235,13 @@ for i in $(seq 1 80); do ping -c 1 -W 1 172.16.50.1 >/dev/null 2>&1 || true; don
 icmp_after=$(capture_screen_total icmp-after)
 assert_advanced ICMP-flood "$icmp_before" "$icmp_after"
 
+apply_screen_profile udp pr1373-udp 'set security screen ids-option pr1373-udp udp flood threshold 1'
+udp_before=$(capture_screen_total udp-before)
+run_loss_host 'set -euo pipefail
+for i in $(seq 1 80); do printf pr1373-udp > /dev/udp/172.16.50.1/65000 || true; done'
+udp_after=$(capture_screen_total udp-after)
+assert_advanced UDP-flood "$udp_before" "$udp_after"
+
 BPFRX_CLUSTER_ENV="$BPFRX_CLUSTER_ENV" ./test/incus/cluster-setup.sh deploy all
 SCREEN_RESTORE_NEEDED=0
 trap - EXIT
@@ -294,22 +302,27 @@ two sweep commands. Do not use that shortened run as the Phase 1/2 gate.
 ## Gate 4: CoS-On TCP Echo 6200-6211
 
 This checks that the TCP echo service for each CoS class accepts a connection
-through the userspace dataplane and returns the payload.
+through the userspace dataplane, returns the payload, and records one
+connect-plus-echo latency sample per port.
 
 ```bash
 set -euo pipefail
 mkdir -p "$ARTIFACT_ROOT/echo-6200-6211"
 SUMMARY_TSV="$ARTIFACT_ROOT/echo-6200-6211/summary.tsv"
-: >"$SUMMARY_TSV"
+LATENCY_TSV="$ARTIFACT_ROOT/echo-6200-6211/latency-summary.tsv"
+printf 'port\tverdict\tlatency_ns\n' >"$SUMMARY_TSV"
+cp "$SUMMARY_TSV" "$LATENCY_TSV"
 failed=0
 for port in $(seq 6200 6211); do
   payload="pr1373-${port}"
-  if run_loss_host "timeout 4 bash -lc 'payload=${payload}; exec 3<>/dev/tcp/172.16.80.200/${port}; printf %s \"\$payload\" >&3; IFS= read -r -N \${#payload} reply <&3; [[ \"\$reply\" == \"\$payload\" ]]'" \
+  if run_loss_host "timeout 4 bash -lc 'payload=${payload}; start=\$(date +%s%N); exec 3<>/dev/tcp/172.16.80.200/${port}; printf %s \"\$payload\" >&3; IFS= read -r -N \${#payload} reply <&3; end=\$(date +%s%N); [[ \"\$reply\" == \"\$payload\" ]]; printf \"latency_ns=%s\n\" \"\$((end - start))\"'" \
     >"$ARTIFACT_ROOT/echo-6200-6211/${port}.stdout" \
     2>"$ARTIFACT_ROOT/echo-6200-6211/${port}.stderr"; then
-    printf '%s\tPASS\n' "$port" | tee -a "$SUMMARY_TSV"
+    latency_ns="$(sed -n 's/^latency_ns=//p' "$ARTIFACT_ROOT/echo-6200-6211/${port}.stdout" | tail -n1)"
+    : "${latency_ns:=unknown}"
+    printf '%s\tPASS\t%s\n' "$port" "$latency_ns" | tee -a "$SUMMARY_TSV" >>"$LATENCY_TSV"
   else
-    printf '%s\tFAIL\n' "$port" | tee -a "$SUMMARY_TSV"
+    printf '%s\tFAIL\t-\n' "$port" | tee -a "$SUMMARY_TSV" >>"$LATENCY_TSV"
     failed=1
   fi
 done
@@ -381,3 +394,24 @@ BPFRX_CLUSTER_ENV="$BPFRX_CLUSTER_ENV" make test-restart-connectivity \
 
 Record the final `git rev-parse HEAD`, `$ARTIFACT_ROOT`, and the exit status
 of every command in the validation report.
+
+## Gate 8: Final #1477 Artifact Packaging
+
+For the final source-removal candidate, copy or run the gates into the schema
+defined by
+[final-validation/README.md](final-validation/README.md). This packaging gate
+does not validate live result quality; it blocks incomplete or stale evidence
+sets before review.
+
+```bash
+set -euo pipefail
+CANDIDATE_COMMIT="$(git rev-parse HEAD)"
+python3 test/incus/retire_ebpf_artifact_schema.py \
+  "$ARTIFACT_ROOT" \
+  --candidate-commit "$CANDIDATE_COMMIT"
+```
+
+The checker intentionally requires a full 40-character SHA in the manifest,
+matching `metadata/git-rev-parse-head.txt` and the artifact root name. If the
+source-removal branch is rebased or amended, rebuild the artifact directory
+instead of reusing the old one.

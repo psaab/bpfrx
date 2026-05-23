@@ -245,6 +245,14 @@ checklist: CoS-off IPv4/IPv6 push and reverse, screen/flood baseline,
 CoS-on 5200..5211 class sweeps, 6200..6211 TCP echo probes, and the
 existing HA Makefile gates.
 
+## #1477 Final Artifact Contract
+
+Use [final-validation/README.md](final-validation/README.md) for the final
+source-removal candidate artifact layout. The structural checker at
+`test/incus/retire_ebpf_artifact_schema.py` verifies that the evidence bundle is
+complete, consistently named, and tied to the exact 40-character candidate SHA;
+it does not replace live-result review.
+
 ## Shared Non-Goals
 
 - Do not remove `bpf/` in these blocker implementation PRs; that remains #1373
