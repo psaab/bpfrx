@@ -125,10 +125,16 @@ userspace runtime and old operational bridges: `userspace_*`, `dnat_table`,
 
 The shim keeps `dnat_table` and `dnat_table_v6` at the legacy 10M-entry,
 `BPF_F_NO_PREALLOC` contract so a legacy-to-shim restart can reuse existing
-pins instead of silently wiping active SNAT-return state. During userspace shim
-compile, any pinned legacy `tc_*` links are detached and unpinned before the
-retained XDP shim is attached; TC programs are not part of the userspace
-runtime and must not survive as stale egress hooks from a previous legacy boot.
+pins instead of silently wiping active SNAT-return state. If any required
+compatibility map is incompatible, the shim loader fails closed and tells the
+operator to run an explicit cleanup; it never retries by deleting a map pin or
+the whole BPF pin tree. During userspace shim compile, any pinned legacy `tc_*`
+links are detached and unpinned before the retained XDP shim is attached; TC
+programs are not part of the userspace runtime and must not survive as stale
+egress hooks from a previous legacy boot. Legacy-only map pins (`xdp_progs`,
+`tc_progs`, and `policer_states`) are removed during userspace shim startup,
+while compatibility stateful maps such as `sessions`, `sessions_v6`,
+`dnat_table`, and `dnat_table_v6` are preserved.
 
 The remaining compatibility bridge is config compilation metadata and Linux
 interface setup: userspace still runs the shared config compiler, but through a

@@ -481,19 +481,7 @@ func (m *Manager) loadUserspaceShimObjects() error {
 	}
 
 	if err := m.loadUserspaceShimObjectsOnce(); err != nil {
-		if !errors.Is(err, ebpf.ErrMapIncompatible) {
-			return err
-		}
-		slog.Warn("userspace shim pinned maps incompatible, creating fresh", "err", err)
-		if rmErr := os.RemoveAll(bpfPinPath); rmErr != nil {
-			return fmt.Errorf("remove incompatible userspace shim pins: %w", rmErr)
-		}
-		if err := os.MkdirAll(bpfPinPath, 0700); err != nil {
-			return fmt.Errorf("recreate pin path: %w", err)
-		}
-		if retryErr := m.loadUserspaceShimObjectsOnce(); retryErr != nil {
-			return fmt.Errorf("load userspace shim after fresh pins: %w", retryErr)
-		}
+		return err
 	}
 	return nil
 }
@@ -657,24 +645,29 @@ func loadUserspaceShimSharedMaps() (map[string]*ebpf.Map, error) {
 }
 
 func loadOrCreatePinnedShimMap(spec *ebpf.MapSpec) (*ebpf.Map, error) {
+	return loadOrCreatePinnedShimMapWith(spec, bpfPinPath, ebpf.NewMapWithOptions)
+}
+
+type userspaceShimMapLoader func(*ebpf.MapSpec, ebpf.MapOptions) (*ebpf.Map, error)
+
+func loadOrCreatePinnedShimMapWith(
+	spec *ebpf.MapSpec,
+	pinPath string,
+	load userspaceShimMapLoader,
+) (*ebpf.Map, error) {
 	spec = spec.Copy()
 	spec.Pinning = ebpf.PinByName
-	m, err := ebpf.NewMapWithOptions(spec, ebpf.MapOptions{PinPath: bpfPinPath})
+	m, err := load(spec, ebpf.MapOptions{PinPath: pinPath})
 	if err == nil {
 		return m, nil
 	}
 	if !errors.Is(err, ebpf.ErrMapIncompatible) {
 		return nil, fmt.Errorf("load userspace shim shared map %s: %w", spec.Name, err)
 	}
-	pinPath := filepath.Join(bpfPinPath, spec.Name)
-	if rmErr := os.Remove(pinPath); rmErr != nil && !os.IsNotExist(rmErr) {
-		return nil, fmt.Errorf("remove incompatible userspace shim map %s: %w", pinPath, rmErr)
-	}
-	m, retryErr := ebpf.NewMapWithOptions(spec, ebpf.MapOptions{PinPath: bpfPinPath})
-	if retryErr != nil {
-		return nil, fmt.Errorf("load fresh userspace shim shared map %s: %w", spec.Name, retryErr)
-	}
-	return m, nil
+	return nil, fmt.Errorf(
+		"refusing to reset incompatible userspace shim map %s at %s: %w",
+		spec.Name, filepath.Join(pinPath, spec.Name), err,
+	)
 }
 
 func closeUniqueMaps(maps map[string]*ebpf.Map) {

@@ -111,6 +111,9 @@ func (m *Manager) LoadUserspaceShim() error {
 	if err := cleanupUserspaceShimLegacyTCLinks(); err != nil {
 		return err
 	}
+	if err := cleanupUserspaceShimLegacyOnlyMapPins(); err != nil {
+		return err
+	}
 	if err := m.loadUserspaceShimObjects(); err != nil {
 		return err
 	}
@@ -128,6 +131,9 @@ func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, erro
 		return nil, err
 	}
 	if err := cleanupUserspaceShimLegacyTCLinks(); err != nil {
+		return nil, err
+	}
+	if err := cleanupUserspaceShimLegacyOnlyMapPins(); err != nil {
 		return nil, err
 	}
 
@@ -201,6 +207,33 @@ type pinnedTCLink interface {
 	Close() error
 }
 
+var userspaceShimLegacyOnlyMapPins = []string{
+	"xdp_progs",
+	"tc_progs",
+	"policer_states",
+}
+
+func cleanupUserspaceShimLegacyOnlyMapPins() error {
+	return cleanupUserspaceShimLegacyOnlyMapPinsIn(bpfPinPath, userspaceShimLegacyOnlyMapPins)
+}
+
+func cleanupUserspaceShimLegacyOnlyMapPinsIn(pinDir string, names []string) error {
+	var cleanupErrs []error
+	for _, name := range names {
+		pinFile := filepath.Join(pinDir, name)
+		if err := os.Remove(pinFile); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			cleanupErrs = append(cleanupErrs,
+				fmt.Errorf("remove legacy-only userspace shim map pin %s: %w", pinFile, err))
+			continue
+		}
+		slog.Info("removed legacy-only BPF map pin before userspace shim attach", "pin", pinFile)
+	}
+	return errors.Join(cleanupErrs...)
+}
+
 func cleanupUserspaceShimLegacyTCLinks() error {
 	return cleanupUserspaceShimLegacyTCLinksIn(linkPinPath, func(path string) (pinnedTCLink, error) {
 		return link.LoadPinnedLink(path, nil)
@@ -218,6 +251,7 @@ func cleanupUserspaceShimLegacyTCLinksIn(
 		}
 		return fmt.Errorf("read userspace shim link pins: %w", err)
 	}
+	var cleanupErrs []error
 	for _, entry := range entries {
 		if !isLegacyTCPinName(entry.Name()) {
 			continue
@@ -226,24 +260,27 @@ func cleanupUserspaceShimLegacyTCLinksIn(
 		pinned, err := load(pinFile)
 		if err != nil {
 			if rmErr := os.Remove(pinFile); rmErr != nil && !os.IsNotExist(rmErr) {
-				return fmt.Errorf("remove unreadable legacy TC pin %s: load: %v; remove: %w", pinFile, err, rmErr)
+				cleanupErrs = append(cleanupErrs,
+					fmt.Errorf("remove unreadable legacy TC pin %s: load: %v; remove: %w", pinFile, err, rmErr))
+				continue
 			}
 			slog.Warn("removed unreadable legacy TC link pin", "pin", pinFile, "err", err)
 			continue
 		}
-		var errs []error
+		pinErrs := 0
 		if err := pinned.Unpin(); err != nil {
-			errs = append(errs, fmt.Errorf("unpin %s: %w", pinFile, err))
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("unpin %s: %w", pinFile, err))
+			pinErrs++
 		}
 		if err := pinned.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("close %s: %w", pinFile, err))
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("close %s: %w", pinFile, err))
+			pinErrs++
 		}
-		if len(errs) > 0 {
-			return errors.Join(errs...)
+		if pinErrs == 0 {
+			slog.Info("detached stale legacy TC link before userspace shim attach", "pin", pinFile)
 		}
-		slog.Info("detached stale legacy TC link before userspace shim attach", "pin", pinFile)
 	}
-	return nil
+	return errors.Join(cleanupErrs...)
 }
 
 func isLegacyTCPinName(name string) bool {
