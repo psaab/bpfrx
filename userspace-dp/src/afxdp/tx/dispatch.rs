@@ -843,10 +843,46 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                                 frame = target_binding.scratch.scratch_wg_out[start_idx..start_idx + total_len].to_vec();
                                                 outer_meta_opt = Some(outer_meta);
                                             } else {
+                                                // WG encap failed (peer/handshake
+                                                // missing, oversize, etc.). Record
+                                                // a WG-specific exception before
+                                                // recycling so the drop is not
+                                                // silent. Slow-path reinjection
+                                                // cannot recover a WG failure
+                                                // (the kernel has no boringtun
+                                                // state for this tunnel), so
+                                                // recycle locally.
+                                                record_exception(
+                                                    recent_exceptions,
+                                                    ingress_ident,
+                                                    "wireguard_encap_failed",
+                                                    frame.len() as u32,
+                                                    Some(request.meta.into()),
+                                                    None,
+                                                    forwarding,
+                                                );
                                                 recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                                                 continue;
                                             }
                                         } else {
+                                            // No engine for this
+                                            // (listen_port, logical_ifindex)
+                                            // composite key — the WG tunnel
+                                            // snapshot has not landed on this
+                                            // binding yet, or the endpoint
+                                            // references an unknown
+                                            // interface. Record an exception
+                                            // before recycling so the drop is
+                                            // observable.
+                                            record_exception(
+                                                recent_exceptions,
+                                                ingress_ident,
+                                                "wireguard_endpoint_missing",
+                                                frame.len() as u32,
+                                                Some(request.meta.into()),
+                                                None,
+                                                forwarding,
+                                            );
                                             recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                                             continue;
                                         }
