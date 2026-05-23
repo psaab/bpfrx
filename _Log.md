@@ -39,6 +39,18 @@
 
 ## 2026-05-23
 
+- **Timestamp**: 2026-05-23T15:58:00Z
+  - **Action**: PR #1494 round-8 follow-up — hardened JSON decoder canary
+    laundering checks for stored decoder receivers, function-variable
+    `Unmarshal` callees, tuple-return spread into `Unmarshal`, and default
+    import-name resolution for versioned import paths (e.g. `encoding/json/v2`);
+    added dedicated fixtures for each bypass shape.
+  - **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane -run
+    'TestUserspaceEntryProgramCanaryRejectsBypassFixtures|TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram|TestUserspaceEntryProgramCanaryAllowsCrossFileConstantFixture'
+    -count=1 -v`; `go test ./pkg/dataplane ./pkg/dataplane/userspace -count=1`;
+    `git diff --check`
+
 - **Timestamp**: 2026-05-23T09:52:00Z
   - **Action**: PR #1494 r7 copilot re-review follow-up — hardened
     `encoding/json` canary detection to catch decode targets laundered through

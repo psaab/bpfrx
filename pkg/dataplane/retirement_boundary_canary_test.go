@@ -851,6 +851,67 @@ func jsonDecodeAliasBypass(m *manager) {
 			want: []string{"encoding/json decode into bpfShim"},
 		},
 		{
+			name: "json_stored_decoder_decode_bpf_shim",
+			body: `
+package userspace
+
+import (
+	"encoding/json"
+	"strings"
+)
+
+func jsonStoredDecoderBypass(m *manager) {
+	dec := json.NewDecoder(strings.NewReader(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `))
+	_ = dec.Decode(m.bpfShim)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "json_func_var_unmarshal_bpf_shim",
+			body: `
+package userspace
+
+import "encoding/json"
+
+func jsonFuncVarBypass(m *manager) {
+	decode := json.Unmarshal
+	_ = decode([]byte(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `), m.bpfShim)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "json_tuple_spread_bpf_shim",
+			body: `
+package userspace
+
+import "encoding/json"
+
+func tupleDecodeArgs(m *manager) ([]byte, *bpfShim) {
+	return []byte(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `), m.bpfShim
+}
+
+func jsonTupleSpreadBypass(m *manager) {
+	_ = json.Unmarshal(tupleDecodeArgs(m))
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "json_v2_unmarshal_bpf_shim",
+			body: `
+package userspace
+
+import "encoding/json/v2"
+
+func jsonV2Bypass(m *manager) {
+	_ = json.Unmarshal([]byte(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `), m.bpfShim)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
 			name: "reflection_field_name",
 			body: `
 package userspace
@@ -1209,6 +1270,26 @@ func importNamesForPath(file *ast.File, importPath string) (map[string]bool, boo
 }
 
 func defaultImportName(importPath string) string {
+	last := importPath
+	if idx := strings.LastIndex(last, "/"); idx >= 0 {
+		last = last[idx+1:]
+	}
+	if strings.HasPrefix(last, "v") && len(last) > 1 {
+		allDigits := true
+		for _, r := range last[1:] {
+			if r < '0' || r > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			trimmed := strings.TrimSuffix(importPath, "/"+last)
+			if idx := strings.LastIndex(trimmed, "/"); idx >= 0 {
+				return trimmed[idx+1:]
+			}
+			return trimmed
+		}
+	}
 	if idx := strings.LastIndex(importPath, "/"); idx >= 0 {
 		return importPath[idx+1:]
 	}
@@ -1371,39 +1452,92 @@ func isJSONDecoderIntoBPFShim(call *ast.CallExpr, jsonImports map[string]bool, j
 		return false
 	}
 
-	switch fun := unparenExpr(call.Fun).(type) {
-	case *ast.SelectorExpr:
-		switch fun.Sel.Name {
-		case "Unmarshal":
-			if len(call.Args) < 2 {
-				return false
-			}
-			pkg, ok := unparenExpr(fun.X).(*ast.Ident)
-			if !ok || !jsonImports[pkg.Name] {
-				return false
-			}
+	if isJSONUnmarshalCallee(call.Fun, jsonImports, jsonDotImport) {
+		switch len(call.Args) {
+		case 0:
+			return false
+		case 1:
+			return callReturnsBPFShimTuple(call.Args[0], map[*ast.Object]bool{})
+		default:
 			return containsBPFShimReference(call.Args[1])
-		case "Decode":
-			if len(call.Args) != 1 {
-				return false
-			}
-			if !isJSONNewDecoderCall(fun.X, jsonImports, jsonDotImport) {
-				return false
-			}
-			return containsBPFShimReference(call.Args[0])
 		}
-	case *ast.Ident:
-		if !jsonDotImport || fun.Name != "Unmarshal" || len(call.Args) < 2 {
+	}
+
+	if len(call.Args) != 1 {
+		return false
+	}
+	if sel, ok := unparenExpr(call.Fun).(*ast.SelectorExpr); ok && sel.Sel.Name == "Decode" {
+		if !isJSONNewDecoderReceiver(sel.X, jsonImports, jsonDotImport, map[*ast.Object]bool{}) {
 			return false
 		}
-		return containsBPFShimReference(call.Args[1])
+		return containsBPFShimReference(call.Args[0])
 	}
 	return false
 }
 
-func isJSONNewDecoderCall(expr ast.Expr, jsonImports map[string]bool, jsonDotImport bool) bool {
-	call, ok := unparenExpr(expr).(*ast.CallExpr)
-	if !ok {
+func isJSONUnmarshalCallee(expr ast.Expr, jsonImports map[string]bool, jsonDotImport bool) bool {
+	switch fun := unparenExpr(expr).(type) {
+	case *ast.SelectorExpr:
+		pkg, ok := unparenExpr(fun.X).(*ast.Ident)
+		return ok && fun.Sel.Name == "Unmarshal" && jsonImports[pkg.Name]
+	case *ast.Ident:
+		if jsonDotImport && fun.Name == "Unmarshal" {
+			return true
+		}
+		return identResolvesToJSONUnmarshal(fun, jsonImports, jsonDotImport, map[*ast.Object]bool{})
+	default:
+		return false
+	}
+}
+
+func identResolvesToJSONUnmarshal(ident *ast.Ident, jsonImports map[string]bool, jsonDotImport bool, seen map[*ast.Object]bool) bool {
+	if ident == nil || ident.Obj == nil {
+		return false
+	}
+	obj := ident.Obj
+	if seen[obj] {
+		return false
+	}
+	seen[obj] = true
+	defer delete(seen, obj)
+
+	switch decl := obj.Decl.(type) {
+	case *ast.AssignStmt:
+		if len(decl.Rhs) != len(decl.Lhs) {
+			return false
+		}
+		for i, lhs := range decl.Lhs {
+			lhsIdent, ok := lhs.(*ast.Ident)
+			if ok && lhsIdent.Obj == obj {
+				return isJSONUnmarshalCallee(decl.Rhs[i], jsonImports, jsonDotImport)
+			}
+		}
+	case *ast.ValueSpec:
+		if len(decl.Values) != len(decl.Names) {
+			return false
+		}
+		for i, name := range decl.Names {
+			if name.Obj == obj {
+				return isJSONUnmarshalCallee(decl.Values[i], jsonImports, jsonDotImport)
+			}
+		}
+	}
+	return false
+}
+
+func isJSONNewDecoderReceiver(expr ast.Expr, jsonImports map[string]bool, jsonDotImport bool, seen map[*ast.Object]bool) bool {
+	switch e := unparenExpr(expr).(type) {
+	case *ast.CallExpr:
+		return isJSONNewDecoderCall(e, jsonImports, jsonDotImport)
+	case *ast.Ident:
+		return identResolvesToJSONNewDecoder(e, jsonImports, jsonDotImport, seen)
+	default:
+		return false
+	}
+}
+
+func isJSONNewDecoderCall(call *ast.CallExpr, jsonImports map[string]bool, jsonDotImport bool) bool {
+	if call == nil {
 		return false
 	}
 	switch fun := unparenExpr(call.Fun).(type) {
@@ -1415,6 +1549,115 @@ func isJSONNewDecoderCall(expr ast.Expr, jsonImports map[string]bool, jsonDotImp
 	default:
 		return false
 	}
+}
+
+func identResolvesToJSONNewDecoder(ident *ast.Ident, jsonImports map[string]bool, jsonDotImport bool, seen map[*ast.Object]bool) bool {
+	if ident == nil || ident.Obj == nil {
+		return false
+	}
+	obj := ident.Obj
+	if seen[obj] {
+		return false
+	}
+	seen[obj] = true
+	defer delete(seen, obj)
+
+	switch decl := obj.Decl.(type) {
+	case *ast.AssignStmt:
+		if len(decl.Rhs) != len(decl.Lhs) {
+			return false
+		}
+		for i, lhs := range decl.Lhs {
+			lhsIdent, ok := lhs.(*ast.Ident)
+			if ok && lhsIdent.Obj == obj {
+				return isJSONNewDecoderReceiver(decl.Rhs[i], jsonImports, jsonDotImport, seen)
+			}
+		}
+	case *ast.ValueSpec:
+		if len(decl.Values) != len(decl.Names) {
+			return false
+		}
+		for i, name := range decl.Names {
+			if name.Obj == obj {
+				return isJSONNewDecoderReceiver(decl.Values[i], jsonImports, jsonDotImport, seen)
+			}
+		}
+	}
+	return false
+}
+
+func callReturnsBPFShimTuple(expr ast.Expr, seen map[*ast.Object]bool) bool {
+	call, ok := unparenExpr(expr).(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+
+	switch fun := unparenExpr(call.Fun).(type) {
+	case *ast.FuncLit:
+		return blockReturnsBPFShimTuple(fun.Body, seen)
+	case *ast.Ident:
+		return identReturnsBPFShimTuple(fun, seen)
+	default:
+		return false
+	}
+}
+
+func identReturnsBPFShimTuple(ident *ast.Ident, seen map[*ast.Object]bool) bool {
+	if ident == nil || ident.Obj == nil {
+		return false
+	}
+	obj := ident.Obj
+	if seen[obj] {
+		return false
+	}
+	seen[obj] = true
+	defer delete(seen, obj)
+
+	switch decl := obj.Decl.(type) {
+	case *ast.FuncDecl:
+		return blockReturnsBPFShimTuple(decl.Body, seen)
+	case *ast.AssignStmt:
+		if len(decl.Rhs) != len(decl.Lhs) {
+			return false
+		}
+		for i, lhs := range decl.Lhs {
+			lhsIdent, ok := lhs.(*ast.Ident)
+			if ok && lhsIdent.Obj == obj {
+				return callReturnsBPFShimTuple(decl.Rhs[i], seen)
+			}
+		}
+	case *ast.ValueSpec:
+		if len(decl.Values) != len(decl.Names) {
+			return false
+		}
+		for i, name := range decl.Names {
+			if name.Obj == obj {
+				return callReturnsBPFShimTuple(decl.Values[i], seen)
+			}
+		}
+	}
+	return false
+}
+
+func blockReturnsBPFShimTuple(block *ast.BlockStmt, seen map[*ast.Object]bool) bool {
+	if block == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(block, func(n ast.Node) bool {
+		ret, ok := n.(*ast.ReturnStmt)
+		if !ok {
+			return true
+		}
+		for _, result := range ret.Results {
+			if containsBPFShimReferenceExpr(result, seen) {
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	return found
 }
 
 func containsBPFShimSelector(expr ast.Expr) bool {
