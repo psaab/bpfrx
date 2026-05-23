@@ -24,6 +24,12 @@ The removal path must land in this order:
 
 ## Delete Manifest
 
+### Legacy BPF Root Docs
+
+Delete the root legacy BPF tree README with the source tree it describes:
+
+- `bpf/README.md`
+
 ### Legacy XDP Source
 
 Delete these legacy ingress dataplane programs after the dependency order above
@@ -156,6 +162,9 @@ The headers are not all dead with the XDP/TC source. The current tree still
 uses or cites them for `MAX_INTERFACES`, Go constants, userspace shim build
 inputs, userspace-dp struct parity tests, and DPDK shared-memory parity. A
 future PR may move these definitions, but that is a separate reviewed boundary.
+`xpf_helpers.h` and `xpf_trace.h` have weaker current non-legacy consumers than
+the struct/constant headers; keep them conservatively until the deletion PR can
+prove they are orphaned after the legacy source is removed.
 
 ## Proof Required Before Deletion
 

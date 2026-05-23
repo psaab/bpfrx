@@ -356,7 +356,6 @@ To deploy to a single node: `make cluster-deploy NODE=0` or `make cluster-deploy
 | `proto/xpf/v1/` | Protobuf service definition |
 | `cmd/xpfd/` | Daemon main binary |
 | `cmd/cli/` | Remote CLI client binary |
-| `userspace-xdp/` | XDP shim for AF_XDP packet steering (Rust/eBPF) |
 | `userspace-dp/` | Rust AF_XDP userspace dataplane binary |
 | `docs/` | Protocol docs, test plans, feature gaps |
 | `test/incus/` | Test environment scripts and configs |

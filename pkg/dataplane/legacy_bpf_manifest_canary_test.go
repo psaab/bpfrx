@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -22,10 +23,20 @@ var retainedUserspaceShimManifestPaths = []string{
 	"test/xsk-repro/",
 }
 
+var legacyBPFManifestCodeSpanRE = regexp.MustCompile("`([^`]+)`")
+
 func TestLegacyBPFRemovalManifestCoversTrackedGeneratedArtifacts(t *testing.T) {
 	t.Parallel()
 
 	manifest := readLegacyBPFManifest(t)
+	deletePaths := markdownPathSetForLegacyBPFManifest(
+		t,
+		markdownSectionForLegacyBPFManifest(t, manifest, "## Delete Manifest"),
+	)
+	retainPaths := markdownPathSetForLegacyBPFManifest(
+		t,
+		markdownSectionForLegacyBPFManifest(t, manifest, "## Retain Manifest"),
+	)
 	generated := gitTrackedFilesForLegacyBPFManifest(t,
 		"pkg/dataplane/*_bpfel.go",
 		"pkg/dataplane/*_bpfel.o",
@@ -34,17 +45,88 @@ func TestLegacyBPFRemovalManifestCoversTrackedGeneratedArtifacts(t *testing.T) {
 	)
 
 	var missing []string
+	var wronglyRetained []string
 	for _, rel := range generated {
 		if isRetainedUserspaceShimManifestPath(rel) {
 			continue
 		}
-		if !strings.Contains(manifest, "`"+rel+"`") {
+		if !deletePaths[rel] {
 			missing = append(missing, rel)
+		}
+		if retainPaths[rel] {
+			wronglyRetained = append(wronglyRetained, rel)
+		}
+	}
+	if len(missing) > 0 || len(wronglyRetained) > 0 {
+		sort.Strings(missing)
+		sort.Strings(wronglyRetained)
+		t.Fatalf(
+			"legacy generated artifact manifest drift\nmissing from delete section: %v\nwrongly retained: %v",
+			missing,
+			wronglyRetained,
+		)
+	}
+}
+
+func TestLegacyBPFRemovalManifestCoversTrackedBPFSourceTree(t *testing.T) {
+	t.Parallel()
+
+	manifest := readLegacyBPFManifest(t)
+	deletePaths := markdownPathSetForLegacyBPFManifest(
+		t,
+		markdownSectionForLegacyBPFManifest(t, manifest, "## Delete Manifest"),
+	)
+	retainPaths := markdownPathSetForLegacyBPFManifest(
+		t,
+		markdownSectionForLegacyBPFManifest(t, manifest, "## Retain Manifest"),
+	)
+	tracked := gitTrackedFilesForLegacyBPFManifest(t, "bpf/**")
+
+	var missing []string
+	var doubleListed []string
+	for _, rel := range tracked {
+		inDelete := deletePaths[rel]
+		inRetain := retainPaths[rel]
+		switch {
+		case !inDelete && !inRetain:
+			missing = append(missing, rel)
+		case inDelete && inRetain:
+			doubleListed = append(doubleListed, rel)
+		}
+	}
+	if len(missing) > 0 || len(doubleListed) > 0 {
+		sort.Strings(missing)
+		sort.Strings(doubleListed)
+		t.Fatalf(
+			"tracked bpf/ source tree manifest drift\nmissing entries: %v\ndouble-listed entries: %v",
+			missing,
+			doubleListed,
+		)
+	}
+}
+
+func TestLegacyBPFRemovalManifestEntriesResolveToTrackedFiles(t *testing.T) {
+	t.Parallel()
+
+	manifest := readLegacyBPFManifest(t)
+	tracked := stringSet(gitTrackedFilesForLegacyBPFManifest(t))
+
+	sections := map[string]string{
+		"delete": markdownSectionForLegacyBPFManifest(t, manifest, "## Delete Manifest"),
+		"retain": markdownSectionForLegacyBPFManifest(t, manifest, "## Retain Manifest"),
+	}
+
+	var missing []string
+	for name, section := range sections {
+		for rel := range markdownPathSetForLegacyBPFManifest(t, section) {
+			if !manifestPathExistsInTrackedFiles(rel, tracked) {
+				missing = append(missing, name+":"+rel)
+			}
 		}
 	}
 	if len(missing) > 0 {
 		sort.Strings(missing)
-		t.Fatalf("legacy generated artifacts missing from #1476 manifest: %v", missing)
+		t.Fatalf("#1476 manifest references paths not tracked at HEAD: %v", missing)
 	}
 }
 
@@ -82,11 +164,11 @@ func TestLegacyBPFRemovalManifestDocumentsDependencyOrder(t *testing.T) {
 	manifest := readLegacyBPFManifest(t)
 	section := markdownSectionForLegacyBPFManifest(t, manifest, "## Dependency Order")
 	wantOrder := []string{
-		"#1494 canary",
-		"#1493 loader split",
-		"#1451 surface shrink",
-		"#1476 deletion",
-		"#1477 final evidence",
+		"#1494",
+		"#1493",
+		"#1451",
+		"#1476",
+		"#1477",
 	}
 
 	last := -1
@@ -115,6 +197,7 @@ func readLegacyBPFManifest(t *testing.T) string {
 func gitTrackedFilesForLegacyBPFManifest(t *testing.T, patterns ...string) []string {
 	t.Helper()
 
+	requireGitForLegacyBPFManifest(t)
 	args := append([]string{"ls-files", "--"}, patterns...)
 	cmd := exec.Command("git", args...)
 	cmd.Dir = legacyBPFManifestRepoRoot
@@ -133,6 +216,70 @@ func gitTrackedFilesForLegacyBPFManifest(t *testing.T, patterns ...string) []str
 	}
 	sort.Strings(files)
 	return files
+}
+
+func requireGitForLegacyBPFManifest(t *testing.T) {
+	t.Helper()
+
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not available; skipping #1476 manifest canary: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(legacyBPFManifestRepoRoot, ".git")); err != nil {
+		t.Skipf("not a git checkout; skipping #1476 manifest canary: %v", err)
+	}
+}
+
+func markdownPathSetForLegacyBPFManifest(t *testing.T, section string) map[string]bool {
+	t.Helper()
+
+	paths := map[string]bool{}
+	for _, match := range legacyBPFManifestCodeSpanRE.FindAllStringSubmatch(section, -1) {
+		value := strings.TrimSpace(match[1])
+		if legacyBPFManifestPathCandidate(value) {
+			paths[value] = true
+		}
+	}
+	return paths
+}
+
+func legacyBPFManifestPathCandidate(value string) bool {
+	if value == "" || strings.ContainsAny(value, "* ") {
+		return false
+	}
+	switch {
+	case value == "Makefile":
+		return true
+	case strings.HasPrefix(value, "bpf/"):
+		return true
+	case strings.HasPrefix(value, "pkg/dataplane/"):
+		return true
+	case strings.HasPrefix(value, "userspace-xdp/"):
+		return true
+	case strings.HasPrefix(value, "test/xsk-repro/"):
+		return true
+	default:
+		return false
+	}
+}
+
+func stringSet(values []string) map[string]bool {
+	set := make(map[string]bool, len(values))
+	for _, value := range values {
+		set[value] = true
+	}
+	return set
+}
+
+func manifestPathExistsInTrackedFiles(rel string, tracked map[string]bool) bool {
+	if strings.HasSuffix(rel, "/") {
+		for path := range tracked {
+			if strings.HasPrefix(path, rel) {
+				return true
+			}
+		}
+		return false
+	}
+	return tracked[rel]
 }
 
 func isRetainedUserspaceShimManifestPath(rel string) bool {
