@@ -1,5 +1,15 @@
 # Action Log
 
+## 2026-05-23
+
+- **Timestamp**: 2026-05-23T09:31:43Z
+  - **Action**: PR #1493 r2 copilot follow-up — restored `"impact"` slog key
+    on native-XDP fallback warning in `attachUserspaceShimXDP` so operator
+    log output matches legacy compiler guidance (higher CPU, ~6 Gbps cap).
+  - **File(s)**: `pkg/dataplane/loader.go`, `_Log.md`
+  - **Validation**: `go build ./pkg/dataplane/...`;
+    `go test ./pkg/dataplane/... -count=1`
+
 ## 2026-05-22
 
 - **Timestamp**: 2026-05-22T20:20:00Z

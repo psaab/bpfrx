@@ -165,8 +165,9 @@ func (m *Manager) attachUserspaceShimXDP(result *CompileResult) error {
 			if strings.Contains(err.Error(), "already attached") {
 				continue
 			}
-			slog.Warn("native XDP unavailable for userspace shim; falling back to generic",
-				"ifindex", ifidx, "err", err)
+			slog.Warn("native XDP unavailable for userspace shim; falling back to generic (skb-mode)",
+				"ifindex", ifidx, "err", err,
+				"impact", "higher CPU, ~6 Gbps cap; fix driver/firmware to restore driver-mode XDP")
 			m.DetachXDP(ifidx)
 			failedNativeXDP[ifidx] = true
 		}
