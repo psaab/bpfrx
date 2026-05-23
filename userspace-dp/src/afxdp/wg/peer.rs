@@ -50,12 +50,12 @@ impl Peer {
 
     /// Replace `current` with `new`, moving the old current to
     /// `previous`. Called from the slow-path handshake-complete code.
-    pub(crate) fn rotate_session(&self, new: Arc<WgSession>) {
+    pub(crate) fn rotate_session(&self, new: Arc<WgSession>) -> Option<Arc<WgSession>> {
         let old_current = {
             let mut cur = self.current.write().unwrap();
             cur.replace(new)
         };
         let mut prev = self.previous.write().unwrap();
-        *prev = old_current;
+        std::mem::replace(&mut *prev, old_current)
     }
 }

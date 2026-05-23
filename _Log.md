@@ -304,6 +304,28 @@
   - **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`, `_Log.md`
   - **Validation**: `go test ./pkg/dataplane ./pkg/dataplane/userspace`;
     `git diff --check`
+## 2026-05-23
+
+- **Timestamp**: 2026-05-23T06:32:50Z
+  - **Action**: PR #1499 @copilot review follow-up — fixed WireGuard
+    engine conformance and robustness issues by switching to IKpsk2
+    with zero-PSK mixing, enforcing reject-after-messages on encap,
+    preserving overlapping AllowedIPs per-peer validation, pruning
+    stale demux sessions across rekeys, tightening the overlapping
+    cryptokey-routing test to exercise both live peers, and removing
+    the unused `rand` dependency.
+  - **File(s)**: `userspace-dp/src/afxdp/wg/mod.rs`,
+    `userspace-dp/src/afxdp/wg/engine.rs`,
+    `userspace-dp/src/afxdp/wg/session.rs`,
+    `userspace-dp/src/afxdp/wg/allowed_ips.rs`,
+    `userspace-dp/src/afxdp/wg/peer.rs`,
+    `userspace-dp/src/afxdp/wg/framing.rs`,
+    `userspace-dp/src/afxdp/wg/tests.rs`,
+    `userspace-dp/Cargo.toml`, `userspace-dp/Cargo.lock`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/userspace/...`;
+    `cargo test --release afxdp::wg::`
+    (fails in this runner as expected: missing `libelf`/`gelf` headers
+    for `libbpf-sys` build); `git diff --check`
 
 ## 2026-05-22
 

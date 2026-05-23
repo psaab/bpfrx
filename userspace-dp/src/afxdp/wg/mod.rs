@@ -35,15 +35,23 @@ pub(crate) mod session;
 mod tests;
 
 pub(crate) use engine::{
-    EncapError, EncapOutcome, DecapError, DecapOutcome, WgEngine, WgEngineConfig, WgPeerConfig,
+    DecapError, DecapOutcome, EncapError, EncapOutcome, WgEngine, WgEngineConfig, WgPeerConfig,
 };
 pub(crate) use scratch::WgWorkerScratch;
 
 /// X25519 public/private key length (bytes).
 pub(crate) const WG_KEY_LEN: usize = 32;
 
-/// Noise IK pattern with WG primitives.
-pub(crate) const WG_NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
+/// Noise IKpsk2 pattern with WG primitives.
+///
+/// WireGuard always uses IKpsk2. When no explicit PSK is configured,
+/// the protocol still mixes an all-zero 32-byte PSK in the `psk2`
+/// step.
+pub(crate) const WG_NOISE_PATTERN: &str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
+
+/// All-zero PSK used for the standard "no explicit PSK configured"
+/// WG handshake behavior.
+pub(crate) const WG_ZERO_PSK: [u8; WG_KEY_LEN] = [0u8; WG_KEY_LEN];
 
 /// WireGuard packet type codes (over UDP outer).
 pub(crate) const WG_TYPE_INITIATION: u8 = 1;

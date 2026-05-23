@@ -22,13 +22,9 @@ sha2 = "0.10"
 slab = "0.4"
 # WireGuard clean-room termination (docs/pr/wireguard-clean/plan.md):
 # snow provides Noise IK with explicit state machine and no hidden
-# output queues. default-resolver pulls in pure-Rust crypto
-# (chacha20poly1305, curve25519-dalek current, blake2) — no ring.
+# output queues. The transitive crypto set includes
+# chacha20poly1305/curve25519-dalek/blake2 and ring.
 snow = "0.10"
-# Used by the slow-path ephemeral pre-generation thread to source
-# X25519 private bytes once at handshake-init time. Never called
-# from the worker hot path.
-rand = "0.8"
 
 [build-dependencies]
 cc = "1.2"

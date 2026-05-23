@@ -21,6 +21,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// single u64 bitmap; if we widen to 128 in the future we can swap
 /// the type without touching the API.
 pub(crate) const REPLAY_WINDOW: u64 = 64;
+/// WireGuard reject-after-messages limit.
+///
+/// Per the protocol, a session must stop encrypting after this many
+/// transport messages and rekey.
+pub(crate) const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1u64 << 13) - 1;
 
 /// A live, post-handshake WG transport session.
 ///
@@ -79,8 +84,12 @@ impl WgSession {
 
     /// Atomically reserve the next outbound counter value.
     #[inline]
-    pub(crate) fn next_tx_counter(&self) -> u64 {
-        self.tx_counter.fetch_add(1, Ordering::Relaxed)
+    pub(crate) fn next_tx_counter(&self) -> Option<u64> {
+        let counter = self.tx_counter.fetch_add(1, Ordering::Relaxed);
+        if counter > REJECT_AFTER_MESSAGES {
+            return None;
+        }
+        Some(counter)
     }
 }
 
@@ -106,6 +115,15 @@ pub(crate) struct ReplayState {
 }
 
 impl ReplayState {
+    /// Cheap pre-crypto reject for trivially stale counters.
+    ///
+    /// This never rejects in-window candidates, so it is safe to run
+    /// before AEAD without creating false drops.
+    #[inline]
+    pub(crate) fn definitely_out_of_window(&self, c: u64) -> bool {
+        self.started && c.saturating_add(REPLAY_WINDOW) <= self.highest
+    }
+
     /// Check-and-update for inbound counter `c`. Returns
     /// `ReplayDecision::Accept` if the counter is fresh (and the
     /// window is updated atomically with the accept), or one of
@@ -234,5 +252,13 @@ mod session_tests {
         // One more step pushes 0 out: highest = 64, age = 64 = REPLAY_WINDOW.
         assert_eq!(r.check_and_update(64), ReplayDecision::Accept);
         assert_eq!(r.check_and_update(0), ReplayDecision::OutOfWindow);
+    }
+
+    #[test]
+    fn precheck_out_of_window_matches_window_width() {
+        let mut r = ReplayState::default();
+        assert_eq!(r.check_and_update(1000), ReplayDecision::Accept);
+        assert!(!r.definitely_out_of_window(937));
+        assert!(r.definitely_out_of_window(936));
     }
 }

@@ -188,7 +188,9 @@ fn encap_unknown_peer_returns_error_not_random_session() {
     let bogus = [0xcd; 32];
     let inner = ipv4_packet(Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 1, 5));
     let mut wire = [0u8; 2048];
-    let err = init_engine.try_encap(&bogus, &inner, &mut wire).unwrap_err();
+    let err = init_engine
+        .try_encap(&bogus, &inner, &mut wire)
+        .unwrap_err();
     assert_eq!(err, EncapError::UnknownPeer);
 }
 
@@ -197,7 +199,6 @@ fn cryptokey_routing_overlapping_allowed_ips() {
     let (init_priv, init_pub) = keypair();
     let (peer_a_priv, peer_a_pub) = keypair();
     let (peer_b_priv, peer_b_pub) = keypair();
-    let _ = peer_a_priv;
 
     let init_engine = WgEngine::new(WgEngineConfig {
         local_private_key: init_priv,
@@ -217,7 +218,17 @@ fn cryptokey_routing_overlapping_allowed_ips() {
             },
         ],
     });
-    // Stand up a real engine for peer B only and handshake into it.
+    // Stand up real engines for both peers.
+    let resp_a = WgEngine::new(WgEngineConfig {
+        local_private_key: peer_a_priv,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: init_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+        }],
+    });
     let resp_b = WgEngine::new(WgEngineConfig {
         local_private_key: peer_b_priv,
         listen_port: 51820,
@@ -229,9 +240,9 @@ fn cryptokey_routing_overlapping_allowed_ips() {
         }],
     });
 
-    // Drive IK init→B, B→init.
-    let mut init_hs = init_engine.build_initiator_handshake(&peer_b_pub).unwrap();
-    let mut resp_hs = resp_b.build_responder_handshake().unwrap();
+    // Drive IK init↔A.
+    let mut init_hs = init_engine.build_initiator_handshake(&peer_a_pub).unwrap();
+    let mut resp_hs = resp_a.build_responder_handshake().unwrap();
     let mut buf = [0u8; 1024];
     let mut sink = [0u8; 1024];
     let n1 = init_hs.write_message(&[], &mut buf).unwrap();
@@ -244,6 +255,26 @@ fn cryptokey_routing_overlapping_allowed_ips() {
     let init_idx = 0x1111_2222;
     let resp_idx = 0x3333_4444;
     init_engine.install_session(
+        &peer_a_pub,
+        Arc::new(WgSession::new(init_xport, init_idx, resp_idx, peer_a_pub)),
+    );
+    resp_a.install_session(
+        &init_pub,
+        Arc::new(WgSession::new(resp_xport, resp_idx, init_idx, init_pub)),
+    );
+
+    // Drive IK init↔B.
+    let mut init_hs = init_engine.build_initiator_handshake(&peer_b_pub).unwrap();
+    let mut resp_hs = resp_b.build_responder_handshake().unwrap();
+    let n1 = init_hs.write_message(&[], &mut buf).unwrap();
+    resp_hs.read_message(&buf[..n1], &mut sink).unwrap();
+    let n2 = resp_hs.write_message(&[], &mut buf).unwrap();
+    init_hs.read_message(&buf[..n2], &mut sink).unwrap();
+    let init_xport = init_hs.into_stateless_transport_mode().unwrap();
+    let resp_xport = resp_hs.into_stateless_transport_mode().unwrap();
+    let init_idx = 0x5555_6666;
+    let resp_idx = 0x7777_8888;
+    init_engine.install_session(
         &peer_b_pub,
         Arc::new(WgSession::new(init_xport, init_idx, resp_idx, peer_b_pub)),
     );
@@ -255,15 +286,20 @@ fn cryptokey_routing_overlapping_allowed_ips() {
     let inner = ipv4_packet(Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 9));
     let mut wire = [0u8; 2048];
 
-    // Asking for A: A has no session installed. Must error, not
-    // silently fall back to B's session (which the LPM would
-    // happily resolve to).
-    let err = init_engine.try_encap(&peer_a_pub, &inner, &mut wire).unwrap_err();
-    assert_eq!(err, EncapError::NoSession);
-
-    // Asking for B: works, and the wire image decrypts at B's engine.
-    let enc = init_engine.try_encap(&peer_b_pub, &inner, &mut wire).unwrap();
+    // Asking for A must use A's session, not silently route to B.
+    let enc = init_engine
+        .try_encap(&peer_a_pub, &inner, &mut wire)
+        .unwrap();
     let mut plain = [0u8; 2048];
+    let dec = resp_a.try_decap(&wire[..enc.len], &mut plain).unwrap();
+    assert_eq!(dec.peer_pubkey, init_pub);
+    let err = resp_b.try_decap(&wire[..enc.len], &mut plain).unwrap_err();
+    assert_eq!(err, DecapError::UnknownSession);
+
+    // Asking for B still works and decrypts only at B.
+    let enc = init_engine
+        .try_encap(&peer_b_pub, &inner, &mut wire)
+        .unwrap();
     let dec = resp_b.try_decap(&wire[..enc.len], &mut plain).unwrap();
     assert_eq!(dec.peer_pubkey, init_pub);
 }

@@ -31,7 +31,7 @@ use super::allowed_ips::AllowedIps;
 use super::framing::{encode_data_header, parse_data_header};
 use super::peer::Peer;
 use super::session::{ReplayDecision, WgSession};
-use super::{POLY1305_TAG_LEN, WG_DATA_HEADER_LEN, WG_NOISE_PATTERN};
+use super::{POLY1305_TAG_LEN, WG_DATA_HEADER_LEN, WG_NOISE_PATTERN, WG_ZERO_PSK};
 use rustc_hash::FxHashMap;
 use snow::{Builder, HandshakeState};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -50,6 +50,8 @@ pub(crate) enum EncapError {
     /// snow rejected the encryption — most likely nonce exhaustion
     /// (counter approaching 2^64). Caller MUST drop and re-key.
     CryptoFailed,
+    /// Session exceeded WG's reject-after-messages bound.
+    RekeyRequired,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -205,17 +207,17 @@ impl WgEngine {
     /// register it for inbound demux. Called from the slow-path
     /// handshake-complete code.
     pub(crate) fn install_session(&self, pubkey: &[u8; 32], session: Arc<WgSession>) {
-        // Register for inbound demux first — the worker may start
-        // receiving traffic immediately on this new session.
-        self.sessions_by_local_index
-            .write()
-            .unwrap()
-            .insert(session.local_index, session.clone());
-        // Then rotate it onto the peer. The previous session (if
-        // any) lives on as `peer.previous` for in-flight tail
-        // decrypts.
-        if let Some(peer) = self.peer_arc(pubkey) {
-            peer.rotate_session(session);
+        let Some(peer) = self.peer_arc(pubkey) else {
+            return;
+        };
+        // Rotate first so concurrent encap picks up the newest
+        // session as soon as possible. Keep only current+previous in
+        // the demux map by deleting the session that falls off.
+        let dropped_previous = peer.rotate_session(session.clone());
+        let mut by_index = self.sessions_by_local_index.write().unwrap();
+        by_index.insert(session.local_index, session);
+        if let Some(old) = dropped_previous {
+            by_index.remove(&old.local_index);
         }
     }
 
@@ -247,7 +249,7 @@ impl WgEngine {
         if out.len() < required {
             return Err(EncapError::BufferTooSmall);
         }
-        let counter = session.next_tx_counter();
+        let counter = session.next_tx_counter().ok_or(EncapError::RekeyRequired)?;
         let _ = encode_data_header(out, session.peer_index, counter)
             .ok_or(EncapError::BufferTooSmall)?;
         // snow writes ciphertext||tag into the payload region.
@@ -285,6 +287,12 @@ impl WgEngine {
         let plaintext_len_max = hdr.ciphertext.len().saturating_sub(POLY1305_TAG_LEN);
         if out.len() < plaintext_len_max {
             return Err(DecapError::BufferTooSmall);
+        }
+        {
+            let replay = session.replay.lock().unwrap();
+            if replay.definitely_out_of_window(hdr.counter) {
+                return Err(DecapError::ReplayOutOfWindow);
+            }
         }
         let n = session
             .transport
@@ -336,6 +344,7 @@ impl WgEngine {
         Builder::new(WG_NOISE_PATTERN.parse()?)
             .local_private_key(&self.local_private_key)?
             .remote_public_key(peer_pubkey)?
+            .psk(2, &WG_ZERO_PSK)?
             .build_initiator()
     }
 
@@ -344,6 +353,7 @@ impl WgEngine {
     pub(crate) fn build_responder_handshake(&self) -> Result<HandshakeState, snow::Error> {
         Builder::new(WG_NOISE_PATTERN.parse()?)
             .local_private_key(&self.local_private_key)?
+            .psk(2, &WG_ZERO_PSK)?
             .build_responder()
     }
 }
@@ -358,7 +368,9 @@ fn inner_src_ip(pkt: &[u8]) -> Option<IpAddr> {
             if pkt.len() < 20 {
                 return None;
             }
-            Some(IpAddr::V4(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15])))
+            Some(IpAddr::V4(Ipv4Addr::new(
+                pkt[12], pkt[13], pkt[14], pkt[15],
+            )))
         }
         6 => {
             if pkt.len() < 40 {
@@ -375,6 +387,19 @@ fn inner_src_ip(pkt: &[u8]) -> Option<IpAddr> {
 #[cfg(test)]
 mod engine_internal_tests {
     use super::*;
+    use std::str::FromStr;
+    use std::sync::atomic::Ordering;
+
+    fn keypair() -> ([u8; 32], [u8; 32]) {
+        let kp = Builder::new(WG_NOISE_PATTERN.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let mut priv_k = [0u8; 32];
+        let mut pub_k = [0u8; 32];
+        priv_k.copy_from_slice(&kp.private);
+        pub_k.copy_from_slice(&kp.public);
+        (priv_k, pub_k)
+    }
 
     #[test]
     fn inner_src_ip_v4() {
@@ -410,5 +435,56 @@ mod engine_internal_tests {
     #[test]
     fn inner_src_ip_rejects_unknown_version() {
         assert!(inner_src_ip(&[0x05u8; 40]).is_none()); // bogus version 0
+    }
+
+    #[test]
+    fn encap_rejects_after_message_limit() {
+        let (init_priv, _init_pub) = keypair();
+        let (peer_priv, peer_pub) = keypair();
+        let engine = WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: peer_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            }],
+        });
+        let resp = WgEngine::new(WgEngineConfig {
+            local_private_key: peer_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: [0u8; 32],
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            }],
+        });
+        let mut init_hs = engine.build_initiator_handshake(&peer_pub).unwrap();
+        let mut resp_hs = resp.build_responder_handshake().unwrap();
+        let mut buf = [0u8; 1024];
+        let mut sink = [0u8; 1024];
+        let n1 = init_hs.write_message(&[], &mut buf).unwrap();
+        resp_hs.read_message(&buf[..n1], &mut sink).unwrap();
+        let n2 = resp_hs.write_message(&[], &mut buf).unwrap();
+        init_hs.read_message(&buf[..n2], &mut sink).unwrap();
+        let session = Arc::new(WgSession::new(
+            init_hs.into_stateless_transport_mode().unwrap(),
+            1,
+            2,
+            peer_pub,
+        ));
+        session.tx_counter.store(
+            super::super::session::REJECT_AFTER_MESSAGES + 1,
+            Ordering::Relaxed,
+        );
+        engine.install_session(&peer_pub, session);
+        let inner = [
+            0x45u8, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2,
+        ];
+        let mut out = [0u8; 128];
+        let err = engine.try_encap(&peer_pub, &inner, &mut out).unwrap_err();
+        assert_eq!(err, EncapError::RekeyRequired);
     }
 }

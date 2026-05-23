@@ -67,9 +67,14 @@ impl AllowedIps {
                 peer_index,
             },
         };
-        // Replace exact-prefix duplicates; this keeps reconciliation
-        // idempotent across config refreshes.
-        self.entries.retain(|e| !(e.prefix == entry.prefix && e.prefix_len == entry.prefix_len));
+        // Replace exact duplicates for the same peer; this keeps
+        // reconciliation idempotent across config refreshes while
+        // still allowing overlapping prefixes across different peers.
+        self.entries.retain(|e| {
+            !(e.prefix == entry.prefix
+                && e.prefix_len == entry.prefix_len
+                && e.peer_index == entry.peer_index)
+        });
         self.entries.push(entry);
         self.entries.sort_by(|a, b| b.prefix_len.cmp(&a.prefix_len));
     }
@@ -124,9 +129,35 @@ impl AllowedIps {
     /// `peer_index` covers `addr` — in which case the packet must
     /// be dropped.
     pub(crate) fn matches_for_peer(&self, addr: IpAddr, peer_index: u32) -> bool {
-        match self.lookup(addr) {
-            Some(idx) => idx == peer_index,
-            None => false,
+        match addr {
+            IpAddr::V4(ip) => {
+                let bytes = ip.octets();
+                for entry in &self.entries {
+                    if entry.peer_index != peer_index {
+                        continue;
+                    }
+                    if let PrefixBits::V4(prefix) = entry.prefix
+                        && prefix_matches(&bytes, &prefix, entry.prefix_len)
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+            IpAddr::V6(ip) => {
+                let bytes = ip.octets();
+                for entry in &self.entries {
+                    if entry.peer_index != peer_index {
+                        continue;
+                    }
+                    if let PrefixBits::V6(prefix) = entry.prefix
+                        && prefix_matches(&bytes, &prefix, entry.prefix_len)
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
         }
     }
 }
@@ -200,8 +231,27 @@ mod allowed_ips_tests {
         let mut t = AllowedIps::new();
         t.insert(net("10.0.0.0/8"), 1);
         t.insert(net("10.0.0.0/8"), 2);
-        // Same prefix, different peer — the latter wins.
-        assert_eq!(t.lookup(ip("10.1.1.1")), Some(2));
+        // Same prefix, different peers can coexist so decap can
+        // validate by explicit peer identity.
+        assert!(t.matches_for_peer(ip("10.1.1.1"), 1));
+        assert!(t.matches_for_peer(ip("10.1.1.1"), 2));
+    }
+
+    #[test]
+    fn duplicate_insert_same_peer_is_idempotent() {
+        let mut t = AllowedIps::new();
+        t.insert(net("10.0.0.0/8"), 1);
+        t.insert(net("10.0.0.0/8"), 1);
+        assert_eq!(t.lookup(ip("10.1.1.1")), Some(1));
+    }
+
+    #[test]
+    fn matches_for_peer_with_overlapping_prefixes() {
+        let mut t = AllowedIps::new();
+        t.insert(net("10.0.0.0/24"), 1);
+        t.insert(net("10.0.0.0/24"), 2);
+        assert!(t.matches_for_peer(ip("10.0.0.5"), 1));
+        assert!(t.matches_for_peer(ip("10.0.0.5"), 2));
     }
 
     #[test]
