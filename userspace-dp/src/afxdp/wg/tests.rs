@@ -656,6 +656,136 @@ fn decap_zeros_plaintext_on_malformed_inner() {
     );
 }
 
+/// r5 regression: the encap path stages plaintext through a
+/// stack `MaybeUninit<[u8; PADDED_PLAINTEXT_MAX]>` and writes it
+/// via raw pointer (not via a `&mut [u8; N]` reference) to keep
+/// the un-padded bytes truly uninitialized without crossing the
+/// reference-validity invariant. This test bombards the path with
+/// a range of inner-IP sizes (covering 0-byte padding, full-15-byte
+/// padding, and the PADDED_PLAINTEXT_MAX upper bound) and verifies
+/// every roundtrip succeeds with the correct un-padded length —
+/// any UB in the raw-pointer write or any miscounted padding
+/// boundary would either corrupt the AEAD (decap returns
+/// CryptoFailed) or produce a wrong `dec.len`.
+#[test]
+fn encap_decap_varied_inner_sizes_roundtrip() {
+    let (init_engine, resp_engine, init_pub, resp_pub) = established_pair(
+        vec!["10.0.1.0/24".parse().unwrap()],
+        vec!["10.0.0.0/24".parse().unwrap()],
+    );
+    // Sizes chosen to span:
+    //   - 20: minimum IPv4 header, padding = 12
+    //   - 32: padding boundary, padding = 0
+    //   - 33: padding = 15 (worst case)
+    //   - 1280, 1500: typical MTU sizes
+    //   - 4080: the PADDED_PLAINTEXT_MAX inner-payload cap (padded
+    //     to 4080 + 0 = 4080, exercises the upper boundary of the
+    //     raw-pointer write region)
+    for size in [20usize, 32, 33, 64, 100, 256, 1280, 1500, 4080] {
+        let mut inner = vec![0u8; size];
+        // IPv4 header: version 4, IHL 5, total_length = size.
+        inner[0] = 0x45;
+        let len_be = (size as u16).to_be_bytes();
+        inner[2] = len_be[0];
+        inner[3] = len_be[1];
+        // src 10.0.0.5 → must match the responder's allowed_ips for the initiator.
+        inner[12..16].copy_from_slice(&[10, 0, 0, 5]);
+        // dst 10.0.1.5
+        inner[16..20].copy_from_slice(&[10, 0, 1, 5]);
+        // Fill the rest with a non-zero marker so any uninitialized-
+        // memory leak would visibly perturb the decapped output.
+        for (i, b) in inner.iter_mut().enumerate().skip(20) {
+            *b = ((i * 31) & 0xff) as u8;
+        }
+
+        // Pre-fill the output buffer with a non-zero marker — if the
+        // raw-pointer write accidentally left a "hole" in the padded
+        // plaintext, the AEAD would authenticate the marker bytes
+        // and decap would either fail or return mismatched plaintext.
+        let mut wire = [0xa5u8; 6000];
+        let enc = init_engine
+            .try_encap(&resp_pub, &inner, &mut wire)
+            .unwrap_or_else(|e| panic!("encap failed at size={}: {:?}", size, e));
+        let padded = (size + 15) & !15;
+        assert_eq!(enc.len, 16 + padded + 16, "wire len off at size={}", size);
+
+        let mut plain = [0u8; 6000];
+        let dec = resp_engine
+            .try_decap(&wire[..enc.len], &mut plain)
+            .unwrap_or_else(|e| panic!("decap failed at size={}: {:?}", size, e));
+        assert_eq!(dec.peer_pubkey, init_pub, "wrong peer at size={}", size);
+        assert_eq!(dec.len, size, "wrong un-padded len at size={}", size);
+        assert_eq!(
+            &plain[..dec.len],
+            &inner[..],
+            "plaintext mismatch at size={}",
+            size
+        );
+        // Bytes beyond the un-padded inner-IP length up to the
+        // padded length must be zero — WG §5.4.6. The decap already
+        // verifies this; we assert it explicitly here to anchor the
+        // padding contract under the raw-pointer write path.
+        for j in dec.len..padded {
+            assert_eq!(
+                plain[j], 0,
+                "padding byte at plain[{}] should be 0, was 0x{:02x} (size={})",
+                j, plain[j], size
+            );
+        }
+    }
+}
+
+/// r5 regression: encap with an inner_ip whose padded length lands
+/// exactly at PADDED_PLAINTEXT_MAX = 4096 must succeed; one byte
+/// over must fail with `BufferTooSmall`. The boundary fixes the
+/// raw-pointer write to the exact `[0..padded_len)` range — an
+/// off-by-one would either write past the staging buffer (UB) or
+/// fail to write enough padding bytes (mismatched AEAD tag).
+#[test]
+fn encap_padded_plaintext_max_boundary() {
+    let (init_engine, resp_engine, init_pub, resp_pub) = established_pair(
+        vec!["10.0.1.0/24".parse().unwrap()],
+        vec!["10.0.0.0/24".parse().unwrap()],
+    );
+
+    let make = |size: usize| -> Vec<u8> {
+        let mut inner = vec![0u8; size];
+        inner[0] = 0x45;
+        let len_be = (size as u16).to_be_bytes();
+        inner[2] = len_be[0];
+        inner[3] = len_be[1];
+        inner[12..16].copy_from_slice(&[10, 0, 0, 5]);
+        inner[16..20].copy_from_slice(&[10, 0, 1, 5]);
+        for (i, b) in inner.iter_mut().enumerate().skip(20) {
+            *b = ((i * 17) & 0xff) as u8;
+        }
+        inner
+    };
+
+    // 4096 → padded to 4096 = PADDED_PLAINTEXT_MAX → fits at the
+    // exact boundary. The raw-pointer write fills bytes
+    // `[0..4096)` of the staging store, which is the maximum
+    // legal range.
+    let inner = make(4096);
+    let mut wire = [0u8; 8000];
+    let enc = init_engine
+        .try_encap(&resp_pub, &inner, &mut wire)
+        .expect("4096 must encap (at PADDED_PLAINTEXT_MAX boundary)");
+    assert_eq!(enc.len, 16 + 4096 + 16);
+    let mut plain = [0u8; 8000];
+    let dec = resp_engine.try_decap(&wire[..enc.len], &mut plain).unwrap();
+    assert_eq!(dec.len, 4096);
+    assert_eq!(dec.peer_pubkey, init_pub);
+
+    // 4097 → padded to 4112 > PADDED_PLAINTEXT_MAX; the engine
+    // refuses with BufferTooSmall, preventing any write past the
+    // staging buffer.
+    let inner = make(4097);
+    let mut wire = [0u8; 8000];
+    let err = init_engine.try_encap(&resp_pub, &inner, &mut wire).unwrap_err();
+    assert_eq!(err, EncapError::BufferTooSmall);
+}
+
 #[test]
 fn allowed_ips_unit_check() {
     // Direct AllowedIps test — extra coverage on top of the

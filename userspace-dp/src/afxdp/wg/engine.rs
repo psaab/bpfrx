@@ -32,6 +32,7 @@ use super::framing::{encode_data_header, parse_data_header};
 use super::peer::Peer;
 use super::session::{REJECT_AFTER_MESSAGES, ReplayDecision, WgSession};
 use super::{POLY1305_TAG_LEN, WG_DATA_HEADER_LEN, WG_NOISE_PATTERN, WG_ZERO_PSK};
+use arc_swap::ArcSwap;
 use rustc_hash::FxHashMap;
 use snow::{Builder, HandshakeState};
 use std::mem::MaybeUninit;
@@ -166,6 +167,38 @@ const fn pad_to_16(n: usize) -> usize {
     (n + 15) & !15
 }
 
+/// Atomically-swappable triple of peer-routing tables. The three
+/// fields are reconciled together (a new config snapshot rebuilds
+/// all three) and a hot-path reader must observe them as a unit, or
+/// else it can pair a `peer_index` from the old map with a `peers`
+/// entry from the new vec and route to the wrong peer. Holding three
+/// independent RwLocks does NOT give that property: a reader can
+/// release the index lock, the reconciler can swap, and then the
+/// reader can acquire the peers lock on the new state. Bundling all
+/// three behind a single `ArcSwap<PeerTable>` gives the reader an
+/// atomic snapshot — every load returns an `Arc<PeerTable>` that is
+/// internally consistent for its lifetime, and the writer publishes
+/// the next snapshot in one release-store.
+pub(crate) struct PeerTable {
+    /// peer slab — one entry per configured peer. Indexed by the
+    /// `peer_index` referenced from `allowed_ips`.
+    pub(crate) peers: Vec<Arc<Peer>>,
+    /// peer_pubkey → index in `peers`.
+    pub(crate) peer_index_by_pubkey: FxHashMap<[u8; 32], u32>,
+    /// AllowedIPs LPM. Only consulted on the decap path.
+    pub(crate) allowed_ips: AllowedIps,
+}
+
+impl PeerTable {
+    fn empty() -> Self {
+        Self {
+            peers: Vec::new(),
+            peer_index_by_pubkey: FxHashMap::default(),
+            allowed_ips: AllowedIps::new(),
+        }
+    }
+}
+
 /// The engine.
 pub(crate) struct WgEngine {
     /// Local X25519 private key. Held in the engine because every
@@ -177,16 +210,19 @@ pub(crate) struct WgEngine {
     /// UDP port we listen on for inbound. Stored for diagnostics
     /// and for the slow-path responder.
     listen_port: u16,
-    /// peer_pubkey → index in `peers`.
-    peer_index_by_pubkey: RwLock<FxHashMap<[u8; 32], u32>>,
-    /// peer slab — one entry per configured peer. Indexed by the
-    /// `peer_index` referenced from `allowed_ips`.
-    peers: RwLock<Vec<Arc<Peer>>>,
-    /// AllowedIPs LPM. Only consulted on the decap path.
-    allowed_ips: RwLock<AllowedIps>,
+    /// Combined peer-routing table behind a single ArcSwap. See
+    /// `PeerTable` doc for the atomicity rationale.
+    table: ArcSwap<PeerTable>,
+    /// Mutex held by reconcile_peers so concurrent reconciles
+    /// serialize. Hot path does NOT take this lock — readers only
+    /// touch `table` via `.load()`. Reconcile is slow path.
+    reconcile_lock: std::sync::Mutex<()>,
     /// Demux map: receiver_index → session. Receiver indices are
     /// chosen locally at handshake time so they uniquely identify
-    /// a session for as long as it lives.
+    /// a session for as long as it lives. Kept out of `PeerTable`
+    /// because session install / rotation is independent of peer
+    /// reconcile; only peer REMOVAL touches both (we drain a
+    /// dropped peer's sessions out of this map during reconcile).
     sessions_by_local_index: RwLock<FxHashMap<u32, Arc<WgSession>>>,
 }
 
@@ -195,9 +231,8 @@ impl WgEngine {
         let engine = Self {
             local_private_key: Zeroizing::new(config.local_private_key),
             listen_port: config.listen_port,
-            peer_index_by_pubkey: RwLock::new(FxHashMap::default()),
-            peers: RwLock::new(Vec::new()),
-            allowed_ips: RwLock::new(AllowedIps::new()),
+            table: ArcSwap::from_pointee(PeerTable::empty()),
+            reconcile_lock: std::sync::Mutex::new(()),
             sessions_by_local_index: RwLock::new(FxHashMap::default()),
         };
         engine.reconcile_peers(&config.peers);
@@ -210,21 +245,36 @@ impl WgEngine {
 
     /// Reconcile the engine's peer table against a new config
     /// snapshot. Slow path only.
+    ///
+    /// Atomicity contract:
+    ///   1. Build a fresh `PeerTable` off-line (no readers see partial
+    ///      state).
+    ///   2. Identify peers present in the old table but absent in the
+    ///      new one. Drain their `(current, previous)` session
+    ///      `local_index` entries from `sessions_by_local_index`
+    ///      before publishing the new table — otherwise an inbound
+    ///      packet targeting a removed peer's session would decrypt
+    ///      successfully (the session Arc is still in the demux map),
+    ///      then fail the AllowedIPs gate because the peer is no
+    ///      longer in the index, and the demux entry would leak
+    ///      forever.
+    ///   3. `ArcSwap::store` publishes the new `PeerTable` in one
+    ///      release-store. Subsequent `.load()` calls observe either
+    ///      the entire old table or the entire new one — never a mix.
     pub(crate) fn reconcile_peers(&self, configs: &[WgPeerConfig]) {
-        let mut peers = self.peers.write().unwrap();
-        let mut index_by_pubkey = self.peer_index_by_pubkey.write().unwrap();
-        let mut allowed = self.allowed_ips.write().unwrap();
-        // Build a fresh AllowedIPs from scratch. Old peer Arcs are
-        // preserved where pubkeys overlap, which preserves the
-        // post-handshake session state across config refreshes.
+        // Serialize concurrent reconciles. The lock does NOT gate the
+        // hot path (readers take only the ArcSwap load).
+        let _guard = self.reconcile_lock.lock().unwrap();
+        let old = self.table.load_full();
         let mut new_peers: Vec<Arc<Peer>> = Vec::with_capacity(configs.len());
         let mut new_index: FxHashMap<[u8; 32], u32> = FxHashMap::default();
         let mut new_allowed = AllowedIps::new();
         for (i, cfg) in configs.iter().enumerate() {
             let idx = i as u32;
-            let existing = index_by_pubkey
+            let existing = old
+                .peer_index_by_pubkey
                 .get(&cfg.pubkey)
-                .and_then(|old_idx| peers.get(*old_idx as usize).cloned());
+                .and_then(|old_idx| old.peers.get(*old_idx as usize).cloned());
             let peer = match existing {
                 Some(p) => p,
                 None => Arc::new(Peer::new(
@@ -239,24 +289,58 @@ impl WgEngine {
                 new_allowed.insert(*cidr, idx);
             }
         }
-        *peers = new_peers;
-        *index_by_pubkey = new_index;
-        *allowed = new_allowed;
+        // Drain demux entries for peers that exist in `old` but not
+        // in `new`. Walk old peers and check absence from new_index.
+        // We collect `local_index` values under read locks on the
+        // peer's `current`/`previous`, then drop those locks before
+        // taking the demux write lock — this keeps the demux write
+        // hold short and avoids any lock-order coupling with peer
+        // session rotation.
+        let mut dropped_indices: Vec<u32> = Vec::new();
+        for (pubkey, old_idx) in old.peer_index_by_pubkey.iter() {
+            if new_index.contains_key(pubkey) {
+                continue;
+            }
+            let Some(peer) = old.peers.get(*old_idx as usize) else {
+                continue;
+            };
+            if let Some(cur) = peer.current.read().unwrap().as_ref() {
+                dropped_indices.push(cur.local_index);
+            }
+            if let Some(prev) = peer.previous.read().unwrap().as_ref() {
+                dropped_indices.push(prev.local_index);
+            }
+        }
+        if !dropped_indices.is_empty() {
+            let mut by_index = self.sessions_by_local_index.write().unwrap();
+            for li in &dropped_indices {
+                by_index.remove(li);
+            }
+        }
+        // Publish the new table. Atomic release-store; any reader
+        // doing `.load()` after this point sees the new table whole.
+        self.table.store(Arc::new(PeerTable {
+            peers: new_peers,
+            peer_index_by_pubkey: new_index,
+            allowed_ips: new_allowed,
+        }));
+    }
+
+    /// Take an atomic snapshot of the peer-routing table. Hot path.
+    /// The returned `Arc<PeerTable>` is internally consistent for as
+    /// long as the caller holds it.
+    fn load_table(&self) -> Arc<PeerTable> {
+        self.table.load_full()
     }
 
     fn peer_arc(&self, pubkey: &[u8; 32]) -> Option<Arc<Peer>> {
-        let idx_map = self.peer_index_by_pubkey.read().unwrap();
-        let idx = *idx_map.get(pubkey)?;
-        let peers = self.peers.read().unwrap();
-        peers.get(idx as usize).cloned()
+        let table = self.load_table();
+        let idx = *table.peer_index_by_pubkey.get(pubkey)?;
+        table.peers.get(idx as usize).cloned()
     }
 
     fn peer_index(&self, pubkey: &[u8; 32]) -> Option<u32> {
-        self.peer_index_by_pubkey
-            .read()
-            .unwrap()
-            .get(pubkey)
-            .copied()
+        self.load_table().peer_index_by_pubkey.get(pubkey).copied()
     }
 
     /// Install a freshly-completed transport session on a peer and
@@ -368,27 +452,65 @@ impl WgEngine {
         if padded_len > PADDED_PLAINTEXT_MAX {
             return Err(EncapError::BufferTooSmall);
         }
+        // Stage the padded plaintext on the stack. We use
+        // `MaybeUninit` to skip the 4096-byte zero-init that a
+        // `[0u8; PADDED_PLAINTEXT_MAX]` literal would force on every
+        // call. snow's `write_message` requires non-overlapping
+        // plaintext and ciphertext slices, so we cannot stage the
+        // plaintext inside `out`.
+        //
+        // Soundness: we NEVER materialize a `&mut [u8; N]` (or
+        // `&mut [u8]`) over the uninitialized backing store —
+        // creating a Rust reference to uninitialized memory is UB
+        // even if the bytes are never read, because references carry
+        // a validity invariant over their entire pointee. We only
+        // write through the raw `*mut u8` returned by
+        // `MaybeUninit::as_mut_ptr`, initializing exactly
+        // `[0..padded_len]`. Once that range is initialized via raw
+        // pointer writes, we hand snow a `&[u8]` (read-only slice)
+        // limited to that initialized range — at which point the
+        // reference covers fully-initialized memory and is sound.
         let mut plaintext_uninit: MaybeUninit<[u8; PADDED_PLAINTEXT_MAX]> = MaybeUninit::uninit();
-        // SAFETY: we cast the `MaybeUninit<[u8; N]>` to `&mut [u8; N]`
-        // before writing every byte we intend to read. The bytes
-        // outside `[0..padded_len]` are never read (snow only
-        // touches `[..padded_len]`), so leaving them uninitialized
-        // is sound. We initialize:
-        //   - `[0..inner_ip.len()]` with the caller's payload
-        //   - `[inner_ip.len()..padded_len]` with zeros (WG spec
-        //     §5.4.6 requires the padding be zero bytes)
-        let plaintext_ref: &mut [u8; PADDED_PLAINTEXT_MAX] =
-            unsafe { &mut *plaintext_uninit.as_mut_ptr() };
-        plaintext_ref[..inner_ip.len()].copy_from_slice(inner_ip);
-        // Trailing padding: at most 15 bytes. WG spec §5.4.6 requires
-        // the padding be zero.
-        for b in &mut plaintext_ref[inner_ip.len()..padded_len] {
-            *b = 0;
+        let plaintext_ptr = plaintext_uninit.as_mut_ptr() as *mut u8;
+        // SAFETY:
+        //   - `plaintext_ptr` is the start of a writable, properly
+        //     aligned `[u8; PADDED_PLAINTEXT_MAX]` backing store on
+        //     the current stack frame; it is unique (no aliasing
+        //     reference exists — we never created one).
+        //   - `inner_ip.len() <= padded_len <= PADDED_PLAINTEXT_MAX`,
+        //     so `[0..inner_ip.len())` and
+        //     `[inner_ip.len()..padded_len)` are non-overlapping
+        //     in-bounds ranges of that store.
+        //   - `inner_ip` is `&[u8]`, distinct from our local
+        //     `plaintext_uninit`, so the copy source/dest do not
+        //     alias.
+        //   - After both calls, bytes `[0..padded_len)` are fully
+        //     initialized: the payload from `inner_ip`, then
+        //     `(padded_len - inner_ip.len()) <= 15` zero bytes (WG
+        //     spec §5.4.6 padding).
+        //   - Bytes `[padded_len..PADDED_PLAINTEXT_MAX)` remain
+        //     uninitialized but are never read: we only borrow the
+        //     initialized prefix below, and `plaintext_uninit` is
+        //     dropped at end of scope without any further access.
+        unsafe {
+            std::ptr::copy_nonoverlapping(inner_ip.as_ptr(), plaintext_ptr, inner_ip.len());
+            std::ptr::write_bytes(
+                plaintext_ptr.add(inner_ip.len()),
+                0u8,
+                padded_len - inner_ip.len(),
+            );
         }
-        // SAFETY: `[0..padded_len]` is fully initialized (payload +
-        // zero padding above); we hand snow a slice limited to that
-        // range, which is the only memory it reads.
-        let plaintext = &plaintext_ref[..padded_len];
+        // SAFETY: `plaintext_ptr` is valid for `padded_len` bytes
+        // (proved above) and those bytes are now initialized
+        // (`copy_nonoverlapping` + `write_bytes`). Building a `&[u8]`
+        // (immutable) over an initialized range is the standard
+        // MaybeUninit "assume_init_ref-equivalent" pattern; we use
+        // `from_raw_parts` here rather than `MaybeUninit::slice_assume_init_ref`
+        // because the latter wants a `&[MaybeUninit<u8>]` source
+        // slice which itself crosses the same validity boundary we
+        // are avoiding. The returned slice is read-only and lives
+        // only until snow consumes it on this line.
+        let plaintext: &[u8] = unsafe { std::slice::from_raw_parts(plaintext_ptr, padded_len) };
         let (_hdr, payload) = out.split_at_mut(WG_DATA_HEADER_LEN);
         let n = session
             .transport
@@ -489,11 +611,18 @@ impl WgEngine {
         // sees only the un-padded inner-IP packet.
         let outcome = (|| -> Result<(IpAddr, u32, usize), DecapError> {
             let inner_src = inner_src_ip(&out[..n]).ok_or(DecapError::MalformedInner)?;
-            let peer_idx = self
-                .peer_index(&session.peer_pubkey)
+            // Single atomic snapshot for both peer-index lookup and
+            // AllowedIPs gate. Taking these from separate ArcSwap
+            // loads would re-introduce the reconcile race window
+            // — between the two loads, a config refresh could swap
+            // the peer table and we'd pair a peer_idx from the old
+            // snapshot with allowed_ips from the new one.
+            let table = self.load_table();
+            let peer_idx = *table
+                .peer_index_by_pubkey
+                .get(&session.peer_pubkey)
                 .ok_or(DecapError::UnknownSession)?;
-            let allowed = self.allowed_ips.read().unwrap();
-            if !allowed.matches_for_peer(inner_src, peer_idx) {
+            if !table.allowed_ips.matches_for_peer(inner_src, peer_idx) {
                 return Err(DecapError::AllowedIpsViolation);
             }
             let inner_len = inner_ip_len_after_decap(&out[..n])
@@ -949,5 +1078,238 @@ mod engine_internal_tests {
         let mut out = [0u8; 128];
         let err = engine.try_encap(&peer_pub, &inner, &mut out).unwrap_err();
         assert_eq!(err, EncapError::RekeyRequired);
+    }
+
+    /// r5 regression: when `reconcile_peers` drops a peer whose
+    /// pubkey is absent in the new config, the peer's
+    /// `(current, previous)` session entries MUST be drained from
+    /// `sessions_by_local_index`. Codex r5 finding: without the
+    /// drain, every config refresh that removes a peer leaks that
+    /// peer's session Arcs in the demux map forever (until engine
+    /// drop). The Arcs also keep `WgSession` (transport key
+    /// material) alive past peer removal, which violates the
+    /// expectation that removing a peer immediately revokes its
+    /// session material from the live state.
+    #[test]
+    fn reconcile_peers_drains_dropped_peer_sessions_from_demux() {
+        let (init_priv, _init_pub) = keypair();
+        let (peer_priv, peer_pub) = keypair();
+        let engine = WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: peer_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            }],
+        });
+        let peer_engine = WgEngine::new(WgEngineConfig {
+            local_private_key: peer_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: [0u8; 32],
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            }],
+        });
+        // Install two sessions on the peer (current + previous).
+        let s1 = make_session_for(&engine, peer_pub, &peer_engine, 0xaaaa_0001, 2);
+        engine.install_session(&peer_pub, s1).unwrap();
+        let s2 = make_session_for(&engine, peer_pub, &peer_engine, 0xaaaa_0002, 3);
+        engine.install_session(&peer_pub, s2).unwrap();
+        // Both indices must be in the demux pre-reconcile.
+        {
+            let by_index = engine.sessions_by_local_index.read().unwrap();
+            assert!(by_index.contains_key(&0xaaaa_0001));
+            assert!(by_index.contains_key(&0xaaaa_0002));
+        }
+        // Reconcile with the peer removed.
+        engine.reconcile_peers(&[]);
+        // Both demux entries must now be gone — the leak is fixed.
+        let by_index = engine.sessions_by_local_index.read().unwrap();
+        assert!(
+            !by_index.contains_key(&0xaaaa_0001),
+            "dropped peer's `previous` session must be drained from demux"
+        );
+        assert!(
+            !by_index.contains_key(&0xaaaa_0002),
+            "dropped peer's `current` session must be drained from demux"
+        );
+        assert!(
+            by_index.is_empty(),
+            "no stray demux entries should remain after peer removal"
+        );
+    }
+
+    /// r5 regression: peer removal must NOT touch unrelated peers'
+    /// sessions. A reconcile that drops peer A while keeping peer B
+    /// must drain A's demux entries and leave B's intact.
+    #[test]
+    fn reconcile_peers_leaves_kept_peer_sessions_intact() {
+        let (init_priv, _init_pub) = keypair();
+        let (peer_a_priv, peer_a_pub) = keypair();
+        let (peer_b_priv, peer_b_pub) = keypair();
+        let engine = WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![
+                WgPeerConfig {
+                    pubkey: peer_a_pub,
+                    endpoint: None,
+                    persistent_keepalive: 0,
+                    allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+                },
+                WgPeerConfig {
+                    pubkey: peer_b_pub,
+                    endpoint: None,
+                    persistent_keepalive: 0,
+                    allowed_ips: vec![ipnet::IpNet::from_str("10.0.1.0/24").unwrap()],
+                },
+            ],
+        });
+        let peer_a_engine = WgEngine::new(WgEngineConfig {
+            local_private_key: peer_a_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: [0u8; 32],
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            }],
+        });
+        let peer_b_engine = WgEngine::new(WgEngineConfig {
+            local_private_key: peer_b_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: [0u8; 32],
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.1.0/24").unwrap()],
+            }],
+        });
+        let s_a = make_session_for(&engine, peer_a_pub, &peer_a_engine, 0xaaaa_0001, 2);
+        engine.install_session(&peer_a_pub, s_a).unwrap();
+        let s_b = make_session_for(&engine, peer_b_pub, &peer_b_engine, 0xbbbb_0001, 4);
+        engine.install_session(&peer_b_pub, s_b).unwrap();
+        // Reconcile dropping only peer A.
+        engine.reconcile_peers(&[WgPeerConfig {
+            pubkey: peer_b_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec![ipnet::IpNet::from_str("10.0.1.0/24").unwrap()],
+        }]);
+        let by_index = engine.sessions_by_local_index.read().unwrap();
+        assert!(
+            !by_index.contains_key(&0xaaaa_0001),
+            "peer A's session must be drained"
+        );
+        assert!(
+            by_index.contains_key(&0xbbbb_0001),
+            "peer B's session must remain — unrelated peer reconcile must not touch it"
+        );
+    }
+
+    /// r5 regression: hot-path readers must observe a torn-free
+    /// snapshot across `reconcile_peers`. A concurrent
+    /// reconcile/hot-read interleaving where the reader sees
+    /// `peer_index_by_pubkey` from the new snapshot but `peers`
+    /// from the old (or vice versa) would route to the wrong peer.
+    /// We hammer reconcile in one thread and assert internal
+    /// consistency from another.
+    ///
+    /// Invariant verified: every snapshot returned by `load_table()`
+    /// is internally consistent — for every (pubkey, idx) entry in
+    /// `peer_index_by_pubkey`, `peers[idx].pubkey == pubkey`. The
+    /// invariant would fail under torn snapshots if reconcile
+    /// published the index map and peer vec via separate stores.
+    #[test]
+    fn reconcile_peers_snapshot_is_atomic_under_concurrent_load() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+        use std::thread;
+        let (init_priv, _init_pub) = keypair();
+        let (peer_a_priv, peer_a_pub) = keypair();
+        let (peer_b_priv, peer_b_pub) = keypair();
+        let (_peer_c_priv, peer_c_pub) = keypair();
+        let _ = (peer_a_priv, peer_b_priv);
+        let engine = Arc::new(WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: peer_a_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            }],
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let config_alt = vec![
+            WgPeerConfig {
+                pubkey: peer_b_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.1.0/24").unwrap()],
+            },
+            WgPeerConfig {
+                pubkey: peer_c_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.2.0/24").unwrap()],
+            },
+        ];
+        let config_orig = vec![WgPeerConfig {
+            pubkey: peer_a_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+        }];
+        let writer = {
+            let engine = engine.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                for i in 0..2000 {
+                    if i % 2 == 0 {
+                        engine.reconcile_peers(&config_alt);
+                    } else {
+                        engine.reconcile_peers(&config_orig);
+                    }
+                }
+                stop.store(true, AOrd::Relaxed);
+            })
+        };
+        let reader = {
+            let engine = engine.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let mut observed = 0u64;
+                while !stop.load(AOrd::Relaxed) {
+                    let snapshot = engine.load_table();
+                    // The invariant: every (pubkey, idx) pair in
+                    // the index map must map to a peer in `peers`
+                    // whose pubkey matches. A torn snapshot would
+                    // pair an old-config pubkey with a new-config
+                    // peer slot (or vice versa) — different pubkey.
+                    for (pubkey, idx) in snapshot.peer_index_by_pubkey.iter() {
+                        let peer = snapshot
+                            .peers
+                            .get(*idx as usize)
+                            .expect("idx must be in bounds within a snapshot");
+                        assert_eq!(
+                            &peer.pubkey, pubkey,
+                            "torn snapshot: index map and peer vec disagree"
+                        );
+                    }
+                    observed += 1;
+                }
+                observed
+            })
+        };
+        writer.join().unwrap();
+        let n = reader.join().unwrap();
+        // Sanity: the reader must have done at least one full pass.
+        // (On a heavily loaded CI box this could be 1; we don't
+        // tighten it.)
+        assert!(n >= 1, "reader thread observed no snapshots");
     }
 }
