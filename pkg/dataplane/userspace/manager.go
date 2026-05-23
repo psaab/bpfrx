@@ -448,7 +448,7 @@ func (m *Manager) SessionSyncSweepProfile() (bool, time.Duration, time.Duration)
 }
 
 func (m *Manager) Load() error {
-	return m.bpfShim.Load()
+	return m.bpfShim.LoadUserspaceShim()
 }
 
 func (m *Manager) Close() error {
@@ -476,7 +476,7 @@ func (m *Manager) SetDeferWorkers(v bool) {
 }
 
 func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) {
-	// Delete XDP link pins BEFORE bpfShim.Compile() so AttachXDP does
+	// Delete XDP link pins BEFORE CompileUserspaceShim() so AttachXDP does
 	// a fresh attach. This is critical for zero-copy: fresh attach
 	// triggers mlx5 to initialize XSK buffer pool from fill ring.
 	// Pinned link reuse (l.Update) only swaps the program without
@@ -498,7 +498,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	// xdp_main_prog for unsupported capabilities or failed XSK liveness: the
 	// userspace runtime must not require the legacy main XDP pipeline.
 	m.bpfShim.XDPEntryProg = userspaceXDPEntryProg
-	result, err := m.bpfShim.Compile(cfg)
+	result, err := m.bpfShim.CompileUserspaceShim(cfg)
 	if err != nil {
 		return nil, err
 	}

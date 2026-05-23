@@ -6,15 +6,18 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/vishvananda/netlink"
 )
 
 const linkPinPath = "/sys/fs/bpf/xpf/links"
+const userspaceShimEntryProg = "xdp_userspace_prog"
 
 // go:generate directives.
 // Run "make generate" with clang + libbpf-dev installed for the full legacy
@@ -97,6 +100,198 @@ func (m *Manager) Load() error {
 	slog.Info("eBPF programs loaded successfully")
 	return nil
 }
+
+// LoadUserspaceShim loads only the retained AF_XDP userspace XDP shim and the
+// explicit shared maps that the userspace runtime still exchanges with Go.
+// It intentionally bypasses loadAllObjects, xdp_main, XDP tail-call objects,
+// and TC objects.
+func (m *Manager) LoadUserspaceShim() error {
+	slog.Info("loading userspace XDP shim")
+	m.XDPEntryProg = userspaceShimEntryProg
+	if err := m.loadUserspaceShimObjects(); err != nil {
+		return err
+	}
+	m.loaded = true
+	slog.Info("userspace XDP shim loaded successfully")
+	return nil
+}
+
+// CompileUserspaceShim runs the shared config compiler for its Linux interface
+// setup and metadata, but suppresses writes to legacy eBPF dataplane maps and
+// attaches only the retained userspace XDP shim. This keeps normal AF_XDP
+// startup independent from xdp_main and TC program objects.
+func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, error) {
+	if err := m.preflightCheckIfindexCaps(); err != nil {
+		return nil, err
+	}
+
+	m.XDPEntryProg = userspaceShimEntryProg
+	compilerDP := userspaceShimCompileDataplane{Manager: m}
+	result, err := CompileConfig(compilerDP, cfg, m.lastCompile != nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.attachUserspaceShimXDP(result); err != nil {
+		return nil, err
+	}
+
+	for ifidx := range result.genericXDPIfindexes {
+		if !result.tunnelIfindexes[ifidx] {
+			m.VlanSubInterfaces[ifidx] = true
+		}
+	}
+	m.lastCompile = result
+	m.recordApplyResult(ApplyResultFromCompileResult(result))
+	return result, nil
+}
+
+func (m *Manager) attachUserspaceShimXDP(result *CompileResult) error {
+	if result == nil || len(result.pendingXDP) == 0 {
+		return nil
+	}
+
+	failedNativeXDP := make(map[int]bool)
+	for _, ifidx := range result.pendingXDP {
+		if result.tunnelIfindexes[ifidx] || result.genericXDPIfindexes[ifidx] {
+			continue
+		}
+		if err := m.AttachXDP(ifidx, false); err != nil {
+			if strings.Contains(err.Error(), "already attached") {
+				continue
+			}
+			slog.Warn("native XDP unavailable for userspace shim; falling back to generic",
+				"ifindex", ifidx, "err", err)
+			m.DetachXDP(ifidx)
+			failedNativeXDP[ifidx] = true
+		}
+	}
+	if len(failedNativeXDP) > 0 {
+		failed := make([]int, 0, len(failedNativeXDP))
+		for ifidx := range failedNativeXDP {
+			failed = append(failed, ifidx)
+		}
+		m.clearNativeXDPFlagsForIfindexes(failed)
+	}
+	for _, ifidx := range result.pendingXDP {
+		forceGeneric := failedNativeXDP[ifidx] || result.tunnelIfindexes[ifidx] || result.genericXDPIfindexes[ifidx]
+		if !forceGeneric {
+			continue
+		}
+		if result.genericXDPIfindexes[ifidx] && !result.tunnelIfindexes[ifidx] {
+			continue
+		}
+		if err := m.AttachXDP(ifidx, true); err != nil {
+			if !strings.Contains(err.Error(), "already attached") {
+				return fmt.Errorf("attach userspace XDP shim generic to ifindex %d: %w", ifidx, err)
+			}
+		}
+	}
+	return nil
+}
+
+type userspaceShimCompileDataplane struct {
+	*Manager
+}
+
+func (d userspaceShimCompileDataplane) AddTxPort(int) error { return nil }
+
+func (d userspaceShimCompileDataplane) SetZone(int, uint16, uint16, uint32, uint8, uint8, uint32) error {
+	return nil
+}
+
+func (d userspaceShimCompileDataplane) SetVlanIfaceInfo(int, int, uint16) error { return nil }
+func (d userspaceShimCompileDataplane) SetZoneConfig(uint16, ZoneConfig) error  { return nil }
+func (d userspaceShimCompileDataplane) ClearAddressBookV4() error               { return nil }
+func (d userspaceShimCompileDataplane) ClearAddressBookV6() error               { return nil }
+func (d userspaceShimCompileDataplane) ClearAddressMembership() error           { return nil }
+func (d userspaceShimCompileDataplane) SetAddressBookEntry(string, uint32) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) SetAddressMembership(uint32, uint32) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) ClearApplications() error { return nil }
+func (d userspaceShimCompileDataplane) ClearAppRanges() error    { return nil }
+func (d userspaceShimCompileDataplane) SetAppRange(uint32, AppRangeEntry) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) SetApplication(uint8, uint16, uint32, uint32, uint8, uint16, uint16) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) ClearZonePairPolicies() error { return nil }
+func (d userspaceShimCompileDataplane) SetZonePairPolicy(uint16, uint16, PolicySet) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) SetPolicyRule(uint32, uint32, PolicyRule) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) SetDefaultPolicy(uint8) error { return nil }
+func (d userspaceShimCompileDataplane) SetSNATRule(uint16, uint16, uint16, SNATValue) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) SetSNATRuleV6(uint16, uint16, uint16, SNATValueV6) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) SetSNATEgressIP(SNATEgressKey, SNATEgressValue) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) SetNATPoolConfig(uint32, NATPoolConfig) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) SetNATPoolIPV4(uint32, uint32, uint32) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) SetNATPoolIPV6(uint32, uint32, [16]byte) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) SetDNATEntry(DNATKey, DNATValue) error       { return nil }
+func (d userspaceShimCompileDataplane) SetDNATEntryV6(DNATKeyV6, DNATValueV6) error { return nil }
+func (d userspaceShimCompileDataplane) SetStaticNATEntryV4(uint32, uint8, uint32) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) SetStaticNATEntryV6([16]byte, uint8, [16]byte) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) SetNPTv6Rule(NPTv6Key, NPTv6Value) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) SetNAT64Config(uint32, NAT64Config) error { return nil }
+func (d userspaceShimCompileDataplane) SetNAT64Count(uint32) error               { return nil }
+func (d userspaceShimCompileDataplane) SetScreenConfig(uint32, ScreenConfig) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) SetFlowTimeout(uint32, uint32) error    { return nil }
+func (d userspaceShimCompileDataplane) SetFlowConfig(FlowConfigValue) error    { return nil }
+func (d userspaceShimCompileDataplane) SetMirrorConfig(int, int, uint32) error { return nil }
+func (d userspaceShimCompileDataplane) ClearMirrorConfigs() error              { return nil }
+func (d userspaceShimCompileDataplane) SetPolicerConfig(uint32, PolicerConfig) error {
+	return nil
+}
+func (d userspaceShimCompileDataplane) SetIfaceFilter(IfaceFilterKey, uint32) error { return nil }
+func (d userspaceShimCompileDataplane) SetFilterConfig(uint32, FilterConfig) error  { return nil }
+func (d userspaceShimCompileDataplane) SetFilterRule(uint32, FilterRule) error      { return nil }
+func (d userspaceShimCompileDataplane) ClearSNATEgressIPs() error                   { return nil }
+func (d userspaceShimCompileDataplane) DeleteStaleIfaceZone(map[IfaceZoneKey]bool)  {}
+func (d userspaceShimCompileDataplane) DeleteStaleVlanIface(map[uint32]bool)        {}
+func (d userspaceShimCompileDataplane) DeleteStaleZonePairPolicies(map[ZonePairKey]bool) {
+}
+func (d userspaceShimCompileDataplane) DeleteStaleApplications(map[AppKey]bool) {}
+func (d userspaceShimCompileDataplane) DeleteStaleSNATRules(map[SNATKey]bool)   {}
+func (d userspaceShimCompileDataplane) DeleteStaleSNATRulesV6(map[SNATKey]bool) {}
+func (d userspaceShimCompileDataplane) DeleteStaleDNATStatic(map[DNATKey]bool)  {}
+func (d userspaceShimCompileDataplane) DeleteStaleDNATStaticV6(map[DNATKeyV6]bool) {
+}
+func (d userspaceShimCompileDataplane) DeleteStaleStaticNAT(map[StaticNATKeyV4]bool, map[StaticNATKeyV6]bool) {
+}
+func (d userspaceShimCompileDataplane) DeleteStaleNPTv6(map[NPTv6Key]bool) {}
+func (d userspaceShimCompileDataplane) DeleteStaleNAT64(uint32, map[NAT64PrefixKey]bool) {
+}
+func (d userspaceShimCompileDataplane) ZeroStaleScreenConfigs(uint32) {}
+func (d userspaceShimCompileDataplane) ZeroStaleNATPoolConfigs(uint32) {
+}
+func (d userspaceShimCompileDataplane) DeleteStaleIfaceFilter(map[IfaceFilterKey]bool) {
+}
+func (d userspaceShimCompileDataplane) ZeroStaleFilterConfigs(uint32) {}
 
 // IsLoaded returns true if eBPF programs are loaded.
 func (m *Manager) IsLoaded() bool {

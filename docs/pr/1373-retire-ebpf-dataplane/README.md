@@ -111,6 +111,24 @@ recursive Make dependencies, or the broad `./pkg/dataplane/...` generate path.
 This keeps the retained shim visible without implying that deleting legacy
 dataplane program generation is blocked by the shim itself.
 
+## #1493 Userspace Shim Loader Split
+
+Normal AF_XDP userspace startup now enters `LoadUserspaceShim()` and
+`CompileUserspaceShim()` instead of the legacy `Manager.Load()` /
+`loadAllObjects()` path. The shim loader loads only the retained Rust
+`xdp_userspace_prog` object plus explicit pinned compatibility maps used by the
+userspace runtime and old operational bridges: `userspace_*`, `dnat_table`,
+`dnat_table_v6`, `sessions`, `sessions_v6`, FIB/HA/fabric maps,
+`session_id_gen`, and telemetry counter maps. It does not load
+`xdp_main_prog`, legacy XDP tail-call programs, TC programs, `xdp_progs`, or
+`tc_progs`.
+
+The remaining compatibility bridge is config compilation metadata and Linux
+interface setup: userspace still runs the shared config compiler, but through a
+shim compile adapter that no-ops legacy dataplane map writes and attaches only
+the userspace XDP shim. Legacy direct callers outside the runtime adapter remain
+tracked under #1451.
+
 ### Allowlisted Legacy Bridges
 
 These files are the current production direct-import allowlist for root
@@ -176,10 +194,10 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
   registration import in `cmd/xpfd/main.go`. Non-`-tags dpdk` binaries fail
   DPDK startup explicitly rather than running a no-op stub.
 - Legacy BPF source and generated artifacts are not safe to delete in #1451
-  canary work: `bpf/`, `pkg/dataplane/loader_ebpf.go`,
-  `pkg/dataplane/*_bpfel.go`, `pkg/dataplane/*_bpfel.o`, and the legacy side
-  of the `Makefile generate` path remain tied to the eBPF backend until the
-  loader/map-bootstrap split is finished.
+  canary work: `bpf/`, `pkg/dataplane/*_bpfel.go`,
+  `pkg/dataplane/*_bpfel.o`, and the legacy side of the `Makefile generate`
+  path remain tied to the explicit eBPF backend until #1476 removes that
+  backend source. They are no longer required by normal userspace startup.
 - Retained userspace XDP shim artifacts are tracked separately:
   `pkg/dataplane/userspace_xdp_bpfel.o` and
   `pkg/dataplane/build-userspace-xdp.sh` remain required for userspace runtime
