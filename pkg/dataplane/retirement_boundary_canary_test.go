@@ -569,6 +569,22 @@ func directBadCall(m *manager) {
 	_ = m.bpfShim.SwapXDPEntryProg("xdp_main_prog")
 }
 
+func parenBadCall(m *manager) {
+	_ = (m.bpfShim.SwapXDPEntryProg)("xdp_main_prog")
+}
+
+func methodExprBadCall(m *manager) {
+	_ = ((*shim).SwapXDPEntryProg)(m.bpfShim, "xdp_main_prog")
+}
+
+func sliceIndexBadCall(m *manager) {
+	_ = ([]func(string) error{m.bpfShim.SwapXDPEntryProg})[0]("xdp_main_prog")
+}
+
+func doubleParenBadCall(m *manager) {
+	_ = ((m.bpfShim.SwapXDPEntryProg))("xdp_main_prog")
+}
+
 func reflectionName() {
 	_ = "XDPEntryProg"
 }
@@ -587,6 +603,9 @@ func reflectionName() {
 		"calls SwapXDPEntryProg with",
 		"uses XDPEntryProg string literal",
 	})
+	if got := countViolationsContaining(violations, "calls SwapXDPEntryProg with"); got < 5 {
+		t.Fatalf("expected at least 5 SwapXDPEntryProg call violations, got %d: %v", got, violations)
+	}
 }
 
 func TestDaemonRuntimeEntryPointUsesRuntimeDataPlane(t *testing.T) {
@@ -724,8 +743,7 @@ func userspaceXDPEntryProgramViolations(t *testing.T, roots []string) []string {
 					}
 				}
 			case *ast.CallExpr:
-				sel, ok := node.Fun.(*ast.SelectorExpr)
-				if ok && sel.Sel.Name == "SwapXDPEntryProg" {
+				if invokesSwapXDPEntryProg(node.Fun) {
 					if len(node.Args) != 1 || !isUserspaceXDPEntryProgExpr(node.Args[0]) {
 						var got string
 						if len(node.Args) == 1 {
@@ -1073,7 +1091,7 @@ func containsSwapXDPEntryProgMethodValue(expr ast.Expr) bool {
 		}
 		switch node := n.(type) {
 		case *ast.CallExpr:
-			if sel, ok := node.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "SwapXDPEntryProg" {
+			if invokesSwapXDPEntryProg(node.Fun) {
 				for _, arg := range node.Args {
 					if containsSwapXDPEntryProgMethodValue(arg) {
 						found = true
@@ -1091,6 +1109,13 @@ func containsSwapXDPEntryProgMethodValue(expr ast.Expr) bool {
 		return true
 	})
 	return found
+}
+
+func invokesSwapXDPEntryProg(expr ast.Expr) bool {
+	return containsExpr(expr, func(e ast.Expr) bool {
+		sel, ok := e.(*ast.SelectorExpr)
+		return ok && sel.Sel.Name == "SwapXDPEntryProg"
+	})
 }
 
 func containsExpr(expr ast.Expr, match func(ast.Expr) bool) bool {
@@ -1113,6 +1138,16 @@ func containsExpr(expr ast.Expr, match func(ast.Expr) bool) bool {
 		return true
 	})
 	return found
+}
+
+func countViolationsContaining(violations []string, needle string) int {
+	count := 0
+	for _, violation := range violations {
+		if strings.Contains(violation, needle) {
+			count++
+		}
+	}
+	return count
 }
 
 func operatorRuntimeBoundaryRoots(t *testing.T) []string {

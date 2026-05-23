@@ -47,6 +47,14 @@
   - **Validation**: `go build ./pkg/dataplane/...`;
     `go test ./pkg/dataplane/... -count=1`
 
+- **Timestamp**: 2026-05-23T04:58:00Z
+  - **Action**: PR #1494 copilot round-5 follow-up — hardened the canary
+    walker to treat wrapped SwapXDPEntryProg callees as direct calls and added
+    bypass fixtures for parenthesized/method-expression/slice-indexed calls.
+  - **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane ./pkg/dataplane/userspace`;
+    `git diff --check`
+
 - **Timestamp**: 2026-05-23T03:45:00Z
   - **Action**: PR #1494 copilot re-review hardening — made the userspace
     entry-program canary reject shadowed local identifiers so only the package
