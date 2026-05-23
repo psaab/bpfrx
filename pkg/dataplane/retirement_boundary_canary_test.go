@@ -820,6 +820,37 @@ func jsonDotDecoderBypass(m *manager) {
 			want: []string{"encoding/json decode into bpfShim"},
 		},
 		{
+			name: "json_unmarshal_alias_bpf_shim",
+			body: `
+package userspace
+
+import "encoding/json"
+
+func jsonUnmarshalAliasBypass(m *manager) {
+	alias := m.bpfShim
+	_ = json.Unmarshal([]byte(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `), alias)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "json_new_decoder_alias_bpf_shim",
+			body: `
+package userspace
+
+import (
+	"encoding/json"
+	"strings"
+)
+
+func jsonDecodeAliasBypass(m *manager) {
+	alias := m.bpfShim
+	_ = json.NewDecoder(strings.NewReader(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `)).Decode(alias)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
 			name: "reflection_field_name",
 			body: `
 package userspace
@@ -1351,7 +1382,7 @@ func isJSONDecoderIntoBPFShim(call *ast.CallExpr, jsonImports map[string]bool, j
 			if !ok || !jsonImports[pkg.Name] {
 				return false
 			}
-			return containsBPFShimSelector(call.Args[1])
+			return containsBPFShimReference(call.Args[1])
 		case "Decode":
 			if len(call.Args) != 1 {
 				return false
@@ -1359,13 +1390,13 @@ func isJSONDecoderIntoBPFShim(call *ast.CallExpr, jsonImports map[string]bool, j
 			if !isJSONNewDecoderCall(fun.X, jsonImports, jsonDotImport) {
 				return false
 			}
-			return containsBPFShimSelector(call.Args[0])
+			return containsBPFShimReference(call.Args[0])
 		}
 	case *ast.Ident:
 		if !jsonDotImport || fun.Name != "Unmarshal" || len(call.Args) < 2 {
 			return false
 		}
-		return containsBPFShimSelector(call.Args[1])
+		return containsBPFShimReference(call.Args[1])
 	}
 	return false
 }
@@ -1391,6 +1422,79 @@ func containsBPFShimSelector(expr ast.Expr) bool {
 		sel, ok := e.(*ast.SelectorExpr)
 		return ok && sel.Sel.Name == "bpfShim"
 	})
+}
+
+func containsBPFShimReference(expr ast.Expr) bool {
+	return containsBPFShimReferenceExpr(expr, map[*ast.Object]bool{})
+}
+
+func containsBPFShimReferenceExpr(expr ast.Expr, seen map[*ast.Object]bool) bool {
+	if expr == nil {
+		return false
+	}
+	if containsBPFShimSelector(expr) {
+		return true
+	}
+
+	switch e := unparenExpr(expr).(type) {
+	case *ast.Ident:
+		return containsBPFShimFromIdent(e, seen)
+	case *ast.SelectorExpr:
+		return containsBPFShimReferenceExpr(e.X, seen)
+	case *ast.StarExpr:
+		return containsBPFShimReferenceExpr(e.X, seen)
+	case *ast.UnaryExpr:
+		return containsBPFShimReferenceExpr(e.X, seen)
+	case *ast.IndexExpr:
+		return containsBPFShimReferenceExpr(e.X, seen) || containsBPFShimReferenceExpr(e.Index, seen)
+	case *ast.IndexListExpr:
+		if containsBPFShimReferenceExpr(e.X, seen) {
+			return true
+		}
+		for _, idx := range e.Indices {
+			if containsBPFShimReferenceExpr(idx, seen) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func containsBPFShimFromIdent(ident *ast.Ident, seen map[*ast.Object]bool) bool {
+	if ident == nil || ident.Obj == nil {
+		return false
+	}
+	obj := ident.Obj
+	if seen[obj] {
+		return false
+	}
+	seen[obj] = true
+	defer delete(seen, obj)
+
+	switch decl := obj.Decl.(type) {
+	case *ast.AssignStmt:
+		if len(decl.Rhs) != len(decl.Lhs) {
+			return false
+		}
+		for i, lhs := range decl.Lhs {
+			lhsIdent, ok := lhs.(*ast.Ident)
+			if ok && lhsIdent.Obj == obj {
+				return containsBPFShimReferenceExpr(decl.Rhs[i], seen)
+			}
+		}
+	case *ast.ValueSpec:
+		if len(decl.Values) != len(decl.Names) {
+			return false
+		}
+		for i, name := range decl.Names {
+			if name.Obj == obj {
+				return containsBPFShimReferenceExpr(decl.Values[i], seen)
+			}
+		}
+	}
+
+	return false
 }
 
 func swapXDPEntryProgSelectorViolation(sel *ast.SelectorExpr, parents map[ast.Node]ast.Node, fset *token.FileSet, rel string) string {

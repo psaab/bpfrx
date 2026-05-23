@@ -39,6 +39,17 @@
 
 ## 2026-05-23
 
+- **Timestamp**: 2026-05-23T09:52:00Z
+  - **Action**: PR #1494 r7 copilot re-review follow-up — hardened
+    `encoding/json` canary detection to catch decode targets laundered through
+    local aliases of `bpfShim`, and added fixture coverage for unmarshal/decode
+    alias bypass shapes.
+  - **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane -run
+    'TestUserspaceEntryProgramCanaryRejectsBypassFixtures|TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram|TestUserspaceEntryProgramCanaryAllowsCrossFileConstantFixture'
+    -count=1 -v`; `go test ./pkg/dataplane ./pkg/dataplane/userspace -count=1`;
+    `git diff --check`
+
 - **Timestamp**: 2026-05-23T09:31:43Z
   - **Action**: PR #1493 r2 copilot follow-up — restored `"impact"` slog key
     on native-XDP fallback warning in `attachUserspaceShimXDP` so operator
