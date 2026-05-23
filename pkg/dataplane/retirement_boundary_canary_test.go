@@ -782,7 +782,13 @@ func isXDPEntryProgField(expr ast.Expr) bool {
 
 func isUserspaceXDPEntryProgExpr(expr ast.Expr) bool {
 	ident, ok := expr.(*ast.Ident)
-	return ok && ident.Name == "userspaceXDPEntryProg"
+	if !ok || ident.Name != "userspaceXDPEntryProg" {
+		return false
+	}
+	if ident.Obj == nil {
+		return true
+	}
+	return ident.Obj.Kind == ast.Con
 }
 
 func operatorRuntimeBoundaryRoots(t *testing.T) []string {

@@ -47,6 +47,14 @@
   - **Validation**: `go build ./pkg/dataplane/...`;
     `go test ./pkg/dataplane/... -count=1`
 
+- **Timestamp**: 2026-05-23T03:45:00Z
+  - **Action**: PR #1494 copilot re-review hardening — made the userspace
+    entry-program canary reject shadowed local identifiers so only the package
+    constant `userspaceXDPEntryProg` can satisfy XDP entry assignments/calls.
+  - **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane ./pkg/dataplane/userspace`;
+    `git diff --check`
+
 ## 2026-05-22
 
 - **Timestamp**: 2026-05-22T20:20:00Z
