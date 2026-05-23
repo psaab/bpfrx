@@ -959,3 +959,8 @@
 - **Timestamp**: 2026-05-17T21:29:00Z
   - **Action**: Updated #1376 plan test/runtime notes to match implemented mirror tests and cross-worker limit semantics.
   - **File(s)**: docs/pr/1373-retire-ebpf-dataplane/plan-1376-port-mirroring.md
+
+- **Timestamp**: 2026-05-23T16:16:59Z
+  - **Action**: PR #1498 userspace shim loader r4/r5 closeout: make pinned compatibility-map drift fail closed instead of deleting individual pins or the whole BPF pin tree; cleanup only legacy-only map pins (`xdp_progs`, `tc_progs`, `policer_states`); keep stateful compatibility pins (`sessions`, `sessions_v6`, `dnat_table`, `dnat_table_v6`) preserved; make stale `tc_*` cleanup exhaustively try every pin before returning joined cleanup errors; correct userspace shim drift remediation text to `make generate-userspace-xdp`.
+  - **File(s)**: `pkg/dataplane/loader.go`, `pkg/dataplane/loader_ebpf.go`, `pkg/dataplane/userspace_shim_loader_test.go`, `docs/pr/1373-retire-ebpf-dataplane/README.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane -run 'TestUserspaceShim|TestCleanupUserspaceShim|TestLoadOrCreatePinnedShimMap|TestEmbeddedUserspaceShim' -count=1 -v`; `go test ./pkg/dataplane -run 'TestValidateUserspaceShimSpecDriftMentionsUserspaceXDPGenerate' -count=1 -v`; `go test ./pkg/dataplane/... -count=1`; `go test ./...`; `git diff --check`; `GOFLAGS=-buildvcs=false ./scripts/userspace-phase-cycle.sh --env test/incus/loss-userspace-cluster.env` passed on `0254013c` with userspace auto-armed on `loss:xpf-userspace-fw0`, IPv4 runs 21.141/23.328/23.226 Gbps and IPv6 runs 21.137/23.079/23.073 Gbps. The later `542656ec` and this log/doc follow-up only change error text, tests, and documentation.
