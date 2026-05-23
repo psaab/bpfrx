@@ -33,6 +33,8 @@ backlog.
 |-------|-------|
 | #1451 | Move remaining runtime and operator callers off the legacy eBPF-shaped dataplane surfaces before source/generated artifact deletion. |
 | #1473 | Split the retained userspace XDP shim from legacy `xdp_main_prog` fallback. |
+| #1493 | Split userspace shim loader/bootstrap from the legacy `loadAllObjects()` path. |
+| #1494 | Pin the retained userspace shim boundary with canaries before source deletion. |
 | #1476 | Remove legacy BPF source, generated artifacts, and build hooks after migration blockers close. |
 | #1477 | Publish final userspace-only validation artifacts for the exact source-removal candidate. |
 
@@ -42,13 +44,16 @@ until legacy source removal.
 
 ## Recommended Order
 
-1. Land #1451 first so remaining runtime and operator surfaces no longer depend
+1. Land #1494 canary first so the retained userspace XDP shim boundary is
+   guarded before source-removal work starts.
+2. Land #1493 loader split so userspace startup no longer depends on the
+   legacy `loadAllObjects()` path.
+3. Finish #1451 surface shrink so runtime and operator callers no longer depend
    on the legacy eBPF-shaped `dataplane.DataPlane` contract.
-2. Land #1473 before source deletion so the retained userspace shim is
-   explicit and separate from legacy `xdp_main_prog` fallback.
-3. Land #1476 as the source/generated-artifact removal PR after those blockers
-   close.
-4. Attach #1477 validation artifacts to the exact #1476 candidate.
+4. Land #1476 as the source/generated-artifact removal PR, using
+   [source-removal-manifest-1476.md](source-removal-manifest-1476.md) as the
+   deletion boundary.
+5. Attach #1477 final evidence artifacts to the exact #1476 candidate.
 
 ## Phase Boundaries
 
@@ -57,8 +62,9 @@ until legacy source removal.
   as history; add banners only where needed instead of rewriting old plans.
 - Phase 2: test environment consolidation.
 - Phase 3: runtime and operator surface migration under #1451.
-- Phase 4: BPF source removal under #1476, only after #1451, #1473, and
-  the required #1477 validation artifacts are ready.
+- Phase 4: BPF source removal under #1476, only after #1494, #1493, and
+  #1451 have landed and the #1477 validation plan is ready for the exact
+  deletion candidate.
 - Phase 5: CLI and observability cleanup. The current #1380 helper-status
   contract is closed; future neighbor-cache fill-percentage rows need
   helper-owned denominators before they can enter the utilization table.

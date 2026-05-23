@@ -24,6 +24,8 @@ tracked by #1451 and the removal-phase child issues below.
 |---|---|
 | #1451 | Migrate remaining legacy eBPF-shaped runtime and operator surfaces before source/generated artifact deletion. |
 | #1473 | Split the retained userspace XDP shim from legacy `xdp_main_prog` fallback. |
+| #1493 | Split userspace shim loader/bootstrap from the legacy `loadAllObjects()` path. |
+| #1494 | Pin the retained userspace shim boundary with source/object/manager canaries before source deletion. |
 | #1476 | Remove legacy BPF source, generated artifacts, and build hooks after the blockers close. |
 | #1477 | Publish final userspace-only validation artifacts for the exact source-removal candidate. |
 
@@ -33,7 +35,19 @@ until legacy source removal.
 
 ## Removal-Phase Dependency
 
-#1451 is the current common migration umbrella. The userspace manager no longer
+The source-removal order is now explicit:
+
+1. #1494 canary: merge the retained userspace XDP shim boundary canaries.
+2. #1493 loader split: remove userspace startup's dependency on the legacy
+   `loadAllObjects()` graph.
+3. #1451 surface shrink: finish moving runtime/operator callers off the legacy
+   eBPF-shaped `dataplane.DataPlane` bridge.
+4. #1476 deletion: remove legacy source, generated artifacts, and stale build
+   hooks using [source-removal-manifest-1476.md](source-removal-manifest-1476.md).
+5. #1477 final evidence: publish validation artifacts for the exact deletion
+   candidate.
+
+#1451 remains the common migration umbrella. The userspace manager no longer
 embeds the old `DataPlane` interface directly, and a userspace legacy adapter
 owns the compatibility boundary while unmigrated callers move to domain
 interfaces. #1380 is a Phase 5 CLI/observability cleanup item, now closed for
