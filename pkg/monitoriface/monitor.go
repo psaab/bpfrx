@@ -10,15 +10,31 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
-	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/vishvananda/netlink"
 )
 
-type CounterReader interface {
-	IsLoaded() bool
-	ReadInterfaceCounters(ifindex int) (dataplane.InterfaceCounterValue, error)
+// InterfaceCounters is the monitor-interface package's local counter shape.
+// Callers adapt broader dataplane implementations to this struct so this
+// package stays independent of root dataplane telemetry types.
+type InterfaceCounters struct {
+	RxPackets uint64
+	RxBytes   uint64
+	TxPackets uint64
+	TxBytes   uint64
 }
+
+// RuntimeDataPlane is the small dataplane surface ReadSnapshot needs.
+// It is intentionally narrower than the legacy root dataplane.DataPlane
+// interface.
+type RuntimeDataPlane interface {
+	IsLoaded() bool
+	ReadInterfaceCounters(ifindex int) (InterfaceCounters, error)
+}
+
+// CounterReader is kept as the older name for callers and docs that describe
+// the monitor package's interface-counter dependency.
+type CounterReader = RuntimeDataPlane
 
 type StatusReader func() (dpuserspace.ProcessStatus, error)
 

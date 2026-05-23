@@ -56,7 +56,6 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"pkg/grpcapi/server_show_status.go":        "status output still reads legacy dataplane state",
 	"pkg/grpcapi/server_show_zones.go":         "zone output still uses legacy dataplane types",
 	"pkg/logging/ringbuf.go":                   "event reader still consumes the legacy EventSource",
-	"pkg/monitoriface/monitor.go":              "interface monitor still reads legacy interface counters",
 }
 
 var dpdkEBPFImportAllowlist = map[string]string{

@@ -28,6 +28,39 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+var _ monitoriface.RuntimeDataPlane = monitorInterfaceServerDataPlane{}
+
+type monitorInterfaceServerDataPlane struct {
+	server *Server
+}
+
+func (a monitorInterfaceServerDataPlane) IsLoaded() bool {
+	return a.server != nil && a.server.dp != nil && a.server.dp.IsLoaded()
+}
+
+func (a monitorInterfaceServerDataPlane) ReadInterfaceCounters(ifindex int) (monitoriface.InterfaceCounters, error) {
+	if a.server == nil || a.server.dp == nil {
+		return monitoriface.InterfaceCounters{}, fmt.Errorf("dataplane unavailable")
+	}
+	ctrs, err := a.server.dp.ReadInterfaceCounters(ifindex)
+	if err != nil {
+		return monitoriface.InterfaceCounters{}, err
+	}
+	return monitoriface.InterfaceCounters{
+		RxPackets: ctrs.RxPackets,
+		RxBytes:   ctrs.RxBytes,
+		TxPackets: ctrs.TxPackets,
+		TxBytes:   ctrs.TxBytes,
+	}, nil
+}
+
+func (s *Server) monitorInterfaceDataplane() monitoriface.RuntimeDataPlane {
+	if s == nil || s.dp == nil {
+		return nil
+	}
+	return monitorInterfaceServerDataPlane{server: s}
+}
+
 // --- Diagnostic RPCs ---
 
 func (s *Server) Ping(req *pb.PingRequest, stream grpc.ServerStreamingServer[pb.PingResponse]) error {
@@ -377,7 +410,7 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 	prevAll := make(map[string]*monitoriface.Snapshot)
 
 	readSnap := func(name string) *monitoriface.Snapshot {
-		snap, err := monitoriface.ReadSnapshot(s.dp, s.userspaceDataplaneStatus, name)
+		snap, err := monitoriface.ReadSnapshot(s.monitorInterfaceDataplane(), s.userspaceDataplaneStatus, name)
 		if err != nil {
 			return nil
 		}
