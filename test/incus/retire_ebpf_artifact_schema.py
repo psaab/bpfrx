@@ -53,6 +53,29 @@ REQUIRED_COMMAND_GATES = {
     "fallback-exclusion",
 }
 
+MANIFEST_FIELDS = {
+    "schema_version",
+    "issues",
+    "candidate_commit",
+    "candidate_branch",
+    "artifact_created_at",
+    "cluster",
+    "binaries",
+    "commands",
+    "notes",
+}
+
+CLUSTER_FIELDS = {"name", "env_file", "config_files"}
+BINARY_FIELDS = {"host", "path", "sha256", "version"}
+COMMAND_FIELDS = {
+    "gate",
+    "command",
+    "exit_status",
+    "started_at",
+    "finished_at",
+    "artifacts",
+}
+
 SUMMARY_HEADINGS = (
     "Candidate",
     "Cluster And Binaries",
@@ -128,12 +151,24 @@ class ArtifactChecker:
             self.error("manifest.json must contain a JSON object")
             return {}
 
+        self.validate_known_fields("manifest.json", manifest, MANIFEST_FIELDS)
+
         if manifest.get("schema_version") != 1:
             self.error("manifest.json schema_version must be 1")
 
         issues = manifest.get("issues")
-        if not isinstance(issues, list) or not {1373, 1477}.issubset(set(issues)):
+        if not isinstance(issues, list):
             self.error("manifest.json issues must include 1373 and 1477")
+        else:
+            bad_issue_types = [
+                issue
+                for issue in issues
+                if isinstance(issue, bool) or not isinstance(issue, int)
+            ]
+            if bad_issue_types:
+                self.error("manifest.json issues must be integer issue numbers")
+            elif not {1373, 1477}.issubset(set(issues)):
+                self.error("manifest.json issues must include 1373 and 1477")
 
         raw_commit = manifest.get("candidate_commit")
         if not isinstance(raw_commit, str) or not FULL_SHA_RE.match(raw_commit):
@@ -156,6 +191,7 @@ class ArtifactChecker:
         if not isinstance(cluster, dict):
             self.error("manifest.json cluster must be an object")
         else:
+            self.validate_known_fields("manifest.json cluster", cluster, CLUSTER_FIELDS)
             if cluster.get("env_file") != "test/incus/loss-userspace-cluster.env":
                 self.error(
                     "manifest.json cluster.env_file must be "
@@ -169,6 +205,8 @@ class ArtifactChecker:
                     "manifest.json cluster.config_files must include "
                     "docs/ha-cluster-userspace.conf"
                 )
+            elif any(not isinstance(item, str) for item in config_files):
+                self.error("manifest.json cluster.config_files entries must be strings")
 
         binaries = manifest.get("binaries")
         if not isinstance(binaries, list) or not binaries:
@@ -178,6 +216,9 @@ class ArtifactChecker:
                 if not isinstance(binary, dict):
                     self.error(f"manifest.json binaries[{idx}] must be an object")
                     continue
+                self.validate_known_fields(
+                    f"manifest.json binaries[{idx}]", binary, BINARY_FIELDS
+                )
                 for field in ("host", "path"):
                     if not isinstance(binary.get(field), str) or not binary[field]:
                         self.error(f"manifest.json binaries[{idx}].{field} is required")
@@ -196,12 +237,21 @@ class ArtifactChecker:
                 if not isinstance(command, dict):
                     self.error(f"manifest.json commands[{idx}] must be an object")
                     continue
+                self.validate_known_fields(
+                    f"manifest.json commands[{idx}]", command, COMMAND_FIELDS
+                )
                 gate = command.get("gate")
                 if isinstance(gate, str):
-                    gates.add(gate)
+                    if gate in REQUIRED_COMMAND_GATES:
+                        gates.add(gate)
+                    else:
+                        self.error(f"manifest.json commands[{idx}].gate is unknown: {gate}")
                 else:
                     self.error(f"manifest.json commands[{idx}].gate is required")
-                if not isinstance(command.get("exit_status"), int):
+                if not isinstance(command.get("command"), str) or not command["command"]:
+                    self.error(f"manifest.json commands[{idx}].command is required")
+                exit_status = command.get("exit_status")
+                if isinstance(exit_status, bool) or not isinstance(exit_status, int):
                     self.error(
                         f"manifest.json commands[{idx}].exit_status must be recorded as an integer"
                     )
@@ -210,6 +260,13 @@ class ArtifactChecker:
                 self.error("manifest.json commands missing gates: " + ", ".join(missing))
 
         return manifest
+
+    def validate_known_fields(
+        self, context: str, value: dict[str, Any], allowed: set[str]
+    ) -> None:
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            self.error(f"{context} has unknown fields: {', '.join(unknown)}")
 
     def validate_metadata(self) -> None:
         self.require_file("metadata/git-rev-parse-head.txt")

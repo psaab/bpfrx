@@ -315,7 +315,7 @@ cp "$SUMMARY_TSV" "$LATENCY_TSV"
 failed=0
 for port in $(seq 6200 6211); do
   payload="pr1373-${port}"
-  if run_loss_host "timeout 4 bash -lc 'payload=${payload}; start=\$(date +%s%N); exec 3<>/dev/tcp/172.16.80.200/${port}; printf %s \"\$payload\" >&3; IFS= read -r -N \${#payload} reply <&3; end=\$(date +%s%N); [[ \"\$reply\" == \"\$payload\" ]]; printf \"latency_ns=%s\n\" \"\$((end - start))\"'" \
+  if run_loss_host "timeout 4 bash -lc 'payload=${payload}; start=\$(date +%s%N); exec 3<>/dev/tcp/172.16.80.200/${port}; printf %s \"\$payload\" >&3; IFS= read -r -N \${#payload} reply <&3; end=\$(date +%s%N); [[ \"\$reply\" == \"\$payload\" ]] && printf \"latency_ns=%s\n\" \"\$((end - start))\"'" \
     >"$ARTIFACT_ROOT/echo-6200-6211/${port}.stdout" \
     2>"$ARTIFACT_ROOT/echo-6200-6211/${port}.stderr"; then
     latency_ns="$(sed -n 's/^latency_ns=//p' "$ARTIFACT_ROOT/echo-6200-6211/${port}.stdout" | tail -n1)"

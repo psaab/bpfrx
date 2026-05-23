@@ -264,5 +264,58 @@ class RetireEbpfArtifactSchemaTests(unittest.TestCase):
             with self.assertRaisesRegex(schema.ValidationFailure, "## HA Gates"):
                 schema.validate_artifact_root(root, candidate_commit=COMMIT)
 
+    def test_rejects_non_integer_issue_value_without_crashing(self) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            manifest = make_manifest()
+            manifest["issues"] = [1373, {"bad": 1}, 1477]
+            write_json(root, "manifest.json", manifest)
+            with self.assertRaisesRegex(
+                schema.ValidationFailure, "issues must be integer"
+            ):
+                schema.validate_artifact_root(root, candidate_commit=COMMIT)
+
+    def test_rejects_boolean_exit_status(self) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            manifest = make_manifest()
+            commands = manifest["commands"]
+            assert isinstance(commands, list)
+            commands[0]["exit_status"] = True
+            write_json(root, "manifest.json", manifest)
+            with self.assertRaisesRegex(schema.ValidationFailure, "exit_status"):
+                schema.validate_artifact_root(root, candidate_commit=COMMIT)
+
+    def test_rejects_unknown_command_gate(self) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            manifest = make_manifest()
+            commands = manifest["commands"]
+            assert isinstance(commands, list)
+            commands.append(command("unknown-gate"))
+            write_json(root, "manifest.json", manifest)
+            with self.assertRaisesRegex(schema.ValidationFailure, "unknown-gate"):
+                schema.validate_artifact_root(root, candidate_commit=COMMIT)
+
+    def test_rejects_additional_manifest_fields(self) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            manifest = make_manifest()
+            manifest["extra"] = "not in schema"
+            write_json(root, "manifest.json", manifest)
+            with self.assertRaisesRegex(schema.ValidationFailure, "unknown fields"):
+                schema.validate_artifact_root(root, candidate_commit=COMMIT)
+
+    def test_rejects_additional_command_fields(self) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            manifest = make_manifest()
+            commands = manifest["commands"]
+            assert isinstance(commands, list)
+            commands[0]["unexpected"] = "not in schema"
+            write_json(root, "manifest.json", manifest)
+            with self.assertRaisesRegex(schema.ValidationFailure, "unknown fields"):
+                schema.validate_artifact_root(root, candidate_commit=COMMIT)
+
 if __name__ == "__main__":
     unittest.main()

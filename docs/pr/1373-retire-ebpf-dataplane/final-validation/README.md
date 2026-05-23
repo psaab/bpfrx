@@ -95,15 +95,16 @@ syn-cookie/
   final-cluster-status.txt
 cos-on-5200-5211-push/
 cos-on-5200-5211-reverse/
-  summary.tsv
-  summary.md
-  dataplane/status-before.json
-  dataplane/status-after.json
-  dataplane/counter-delta.json
-  dataplane/journal-since.txt
-  dataplane-summary.tsv
-  equal-flow-summary.tsv
-  q0-best-effort-root/... q11-iperf-uncapped-root/...
+  Each directory contains:
+    summary.tsv
+    summary.md
+    dataplane/status-before.json
+    dataplane/status-after.json
+    dataplane/counter-delta.json
+    dataplane/journal-since.txt
+    dataplane-summary.tsv
+    equal-flow-summary.tsv
+    q0-best-effort-root/... q11-iperf-uncapped-root/...
 echo-6200-6211/
   summary.tsv
   latency-summary.tsv
