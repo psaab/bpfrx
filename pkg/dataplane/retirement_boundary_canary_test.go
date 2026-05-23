@@ -476,6 +476,27 @@ func TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram(t *testing.T) {
 	}
 }
 
+func TestUserspaceManagerAvoidsReflectionAndUnsafeMutationEscapes(t *testing.T) {
+	t.Parallel()
+
+	var violations []string
+	for _, path := range productionGoFilesUnder(t, []string{
+		filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace"),
+	}) {
+		rel := repoRelativePath(t, path)
+		for _, imp := range importPaths(t, path) {
+			switch imp {
+			case "reflect", "unsafe":
+				violations = append(violations, rel+" imports "+imp)
+			}
+		}
+	}
+	if len(violations) > 0 {
+		sort.Strings(violations)
+		t.Fatalf("userspace production code must not use reflection/unsafe to bypass entry-program canaries: %v", violations)
+	}
+}
+
 func TestUserspaceXDPEntryProgramConstantNamesRetainedShim(t *testing.T) {
 	t.Parallel()
 
@@ -508,6 +529,7 @@ package userspace
 func valid(m *manager) {
 	m.bpfShim.XDPEntryProg = userspaceXDPEntryProg
 	_ = m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg)
+	_ = (m.bpfShim.SwapXDPEntryProg)(userspaceXDPEntryProg)
 }
 `,
 	})
@@ -524,8 +546,7 @@ func valid(m *manager) {
 func TestUserspaceEntryProgramCanaryRejectsBypassFixtures(t *testing.T) {
 	t.Parallel()
 
-	root := writeUserspaceEntryProgramFixture(t, map[string]string{
-		"base.go": `
+	base := `
 package userspace
 
 const userspaceXDPEntryProg = "xdp_userspace_prog"
@@ -534,77 +555,171 @@ type shim struct { XDPEntryProg string }
 func (s *shim) SwapXDPEntryProg(name string) error { return nil }
 type manager struct { bpfShim *shim }
 func consume(v interface{}) {}
-`,
-		"bypass.go": `
+`
+
+	cases := []struct {
+		name string
+		body string
+		want []string
+	}{
+		{
+			name: "literal_assignment",
+			body: `
 package userspace
 
 func literalAssign(m *manager) {
 	m.bpfShim.XDPEntryProg = "xdp_main_prog"
 }
+`,
+			want: []string{"assigns XDPEntryProg from", "xdp_main_prog"},
+		},
+		{
+			name: "shadowed_constant_name",
+			body: `
+package userspace
 
 func shadowedConstName(m *manager) {
 	userspaceXDPEntryProg := "xdp_main_prog"
 	m.bpfShim.XDPEntryProg = userspaceXDPEntryProg
 }
+`,
+			want: []string{"assigns XDPEntryProg from \"userspaceXDPEntryProg\""},
+		},
+		{
+			name: "pointer_alias",
+			body: `
+package userspace
 
 func pointerAlias(m *manager) {
 	p := &m.bpfShim.XDPEntryProg
 	_ = p
 }
+`,
+			want: []string{"takes XDPEntryProg address"},
+		},
+		{
+			name: "method_value_capture",
+			body: `
+package userspace
 
 func methodValueCapture(m *manager) {
 	swap := m.bpfShim.SwapXDPEntryProg
 	_ = swap
 }
+`,
+			want: []string{"captures SwapXDPEntryProg method value"},
+		},
+		{
+			name: "method_value_pass",
+			body: `
+package userspace
 
 func methodValuePass(m *manager) {
 	consume(m.bpfShim.SwapXDPEntryProg)
 }
+`,
+			want: []string{"passes SwapXDPEntryProg method value"},
+		},
+		{
+			name: "method_value_return",
+			body: `
+package userspace
 
 func methodValueReturn(m *manager) func(string) error {
 	return m.bpfShim.SwapXDPEntryProg
 }
+`,
+			want: []string{"returns SwapXDPEntryProg method value"},
+		},
+		{
+			name: "direct_bad_call",
+			body: `
+package userspace
 
 func directBadCall(m *manager) {
 	_ = m.bpfShim.SwapXDPEntryProg("xdp_main_prog")
 }
+`,
+			want: []string{"calls SwapXDPEntryProg with", "xdp_main_prog"},
+		},
+		{
+			name: "parenthesized_bad_call",
+			body: `
+package userspace
 
 func parenBadCall(m *manager) {
 	_ = (m.bpfShim.SwapXDPEntryProg)("xdp_main_prog")
 }
+`,
+			want: []string{"calls SwapXDPEntryProg with", "xdp_main_prog"},
+		},
+		{
+			name: "method_expression_bad_call",
+			body: `
+package userspace
 
 func methodExprBadCall(m *manager) {
 	_ = ((*shim).SwapXDPEntryProg)(m.bpfShim, "xdp_main_prog")
 }
+`,
+			want: []string{"calls through SwapXDPEntryProg method value"},
+		},
+		{
+			name: "slice_index_bad_call",
+			body: `
+package userspace
 
 func sliceIndexBadCall(m *manager) {
 	_ = ([]func(string) error{m.bpfShim.SwapXDPEntryProg})[0]("xdp_main_prog")
 }
+`,
+			want: []string{"calls through SwapXDPEntryProg method value"},
+		},
+		{
+			name: "double_parenthesized_bad_call",
+			body: `
+package userspace
 
 func doubleParenBadCall(m *manager) {
 	_ = ((m.bpfShim.SwapXDPEntryProg))("xdp_main_prog")
 }
+`,
+			want: []string{"calls SwapXDPEntryProg with", "xdp_main_prog"},
+		},
+		{
+			name: "wrapped_method_value_callee",
+			body: `
+package userspace
+
+func wrap(fn func(string) error) func(string) error { return fn }
+func wrappedMethodValueCallee(m *manager) {
+	_ = wrap(m.bpfShim.SwapXDPEntryProg)(userspaceXDPEntryProg)
+}
+`,
+			want: []string{"calls through SwapXDPEntryProg method value"},
+		},
+		{
+			name: "reflection_field_name",
+			body: `
+package userspace
 
 func reflectionName() {
 	_ = "XDPEntryProg"
 }
 `,
-	})
+			want: []string{"uses XDPEntryProg string literal"},
+		},
+	}
 
-	violations := userspaceXDPEntryProgramViolations(t, []string{root})
-	assertCanaryViolationsContain(t, violations, []string{
-		"assigns XDPEntryProg from",
-		"xdp_main_prog",
-		"assigns XDPEntryProg from \"userspaceXDPEntryProg\"",
-		"takes XDPEntryProg address",
-		"captures SwapXDPEntryProg method value",
-		"passes SwapXDPEntryProg method value",
-		"returns SwapXDPEntryProg method value",
-		"calls SwapXDPEntryProg with",
-		"uses XDPEntryProg string literal",
-	})
-	if got := countViolationsContaining(violations, "calls SwapXDPEntryProg with"); got < 5 {
-		t.Fatalf("expected at least 5 SwapXDPEntryProg call violations, got %d: %v", got, violations)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := writeUserspaceEntryProgramFixture(t, map[string]string{
+				"base.go":   base,
+				"bypass.go": tc.body,
+			})
+			violations := userspaceXDPEntryProgramViolations(t, []string{root})
+			assertCanaryViolationContains(t, violations, tc.want...)
+		})
 	}
 }
 
@@ -743,7 +858,7 @@ func userspaceXDPEntryProgramViolations(t *testing.T, roots []string) []string {
 					}
 				}
 			case *ast.CallExpr:
-				if invokesSwapXDPEntryProg(node.Fun) {
+				if isDirectSwapXDPEntryProgCall(node.Fun) {
 					if len(node.Args) != 1 || !isUserspaceXDPEntryProgExpr(node.Args[0]) {
 						var got string
 						if len(node.Args) == 1 {
@@ -758,6 +873,14 @@ func userspaceXDPEntryProgramViolations(t *testing.T, roots []string) []string {
 						))
 					}
 					return true
+				}
+				if containsSwapXDPEntryProgMethodValue(node.Fun) {
+					pos := fset.Position(node.Fun.Pos())
+					violations = append(violations, fmt.Sprintf(
+						"%s:%d calls through SwapXDPEntryProg method value",
+						rel,
+						pos.Line,
+					))
 				}
 				for _, arg := range node.Args {
 					if containsSwapXDPEntryProgMethodValue(arg) {
@@ -984,15 +1107,22 @@ func writeUserspaceEntryProgramFixture(t *testing.T, files map[string]string) st
 	return root
 }
 
-func assertCanaryViolationsContain(t *testing.T, violations []string, want []string) {
+func assertCanaryViolationContains(t *testing.T, violations []string, needles ...string) {
 	t.Helper()
 
-	joined := strings.Join(violations, "\n")
-	for _, needle := range want {
-		if !strings.Contains(joined, needle) {
-			t.Fatalf("violations missing %q\nall violations:\n%s", needle, joined)
+	for _, violation := range violations {
+		matches := true
+		for _, needle := range needles {
+			if !strings.Contains(violation, needle) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return
 		}
 	}
+	t.Fatalf("no violation contains all of %q\nall violations:\n%s", needles, strings.Join(violations, "\n"))
 }
 
 func rustSourceFilesUnder(t *testing.T, root string) []string {
@@ -1091,7 +1221,7 @@ func containsSwapXDPEntryProgMethodValue(expr ast.Expr) bool {
 		}
 		switch node := n.(type) {
 		case *ast.CallExpr:
-			if invokesSwapXDPEntryProg(node.Fun) {
+			if isDirectSwapXDPEntryProgCall(node.Fun) {
 				for _, arg := range node.Args {
 					if containsSwapXDPEntryProgMethodValue(arg) {
 						found = true
@@ -1111,11 +1241,26 @@ func containsSwapXDPEntryProgMethodValue(expr ast.Expr) bool {
 	return found
 }
 
-func invokesSwapXDPEntryProg(expr ast.Expr) bool {
-	return containsExpr(expr, func(e ast.Expr) bool {
-		sel, ok := e.(*ast.SelectorExpr)
-		return ok && sel.Sel.Name == "SwapXDPEntryProg"
-	})
+func isDirectSwapXDPEntryProgCall(expr ast.Expr) bool {
+	sel, ok := unparenExpr(expr).(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "SwapXDPEntryProg" {
+		return false
+	}
+	switch unparenExpr(sel.X).(type) {
+	case *ast.StarExpr:
+		return false
+	}
+	return true
+}
+
+func unparenExpr(expr ast.Expr) ast.Expr {
+	for {
+		paren, ok := expr.(*ast.ParenExpr)
+		if !ok {
+			return expr
+		}
+		expr = paren.X
+	}
 }
 
 func containsExpr(expr ast.Expr, match func(ast.Expr) bool) bool {
@@ -1138,16 +1283,6 @@ func containsExpr(expr ast.Expr, match func(ast.Expr) bool) bool {
 		return true
 	})
 	return found
-}
-
-func countViolationsContaining(violations []string, needle string) int {
-	count := 0
-	for _, violation := range violations {
-		if strings.Contains(violation, needle) {
-			count++
-		}
-	}
-	return count
 }
 
 func operatorRuntimeBoundaryRoots(t *testing.T) []string {
