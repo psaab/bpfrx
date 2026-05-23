@@ -411,6 +411,33 @@ pub(crate) struct TunnelEndpointSnapshot {
     pub ttl: i32,
     #[serde(rename = "transport_table", default)]
     pub transport_table: String,
+    // WireGuard fields. All `#[serde(default)]` so this stays
+    // wire-compatible with old daemons that don't populate them.
+    // See docs/pr/wireguard-clean/plan.md for the design.
+    #[serde(rename = "wg_listen_port", default)]
+    pub wg_listen_port: u16,
+    /// Local static private key for the WG interface, hex-encoded
+    /// (64 chars for 32 bytes). Empty when `mode != "wireguard"`.
+    /// CONTROL-PLANE-INTERNAL only — never logged.
+    #[serde(rename = "wg_local_privkey_hex", default)]
+    pub wg_local_privkey_hex: String,
+    /// Peer's static public key, hex-encoded. The WG engine uses
+    /// this as the encap key — not AllowedIPs LPM. See plan §
+    /// "Engine keying" for why this matters.
+    #[serde(rename = "wg_peer_pubkey_hex", default)]
+    pub wg_peer_pubkey_hex: String,
+    /// Peer AllowedIPs, as CIDR strings. Only consulted on the
+    /// decap path (inner src-IP gate); never used to choose a peer
+    /// on egress.
+    #[serde(rename = "wg_allowed_ips", default)]
+    pub wg_allowed_ips: Vec<String>,
+    /// Optional peer endpoint (`IP:port`) for initiator-role
+    /// handshakes. Empty for responder-only.
+    #[serde(rename = "wg_endpoint", default)]
+    pub wg_endpoint: String,
+    /// Optional persistent keepalive in seconds. 0 = off.
+    #[serde(rename = "wg_keepalive_secs", default)]
+    pub wg_keepalive_secs: u16,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

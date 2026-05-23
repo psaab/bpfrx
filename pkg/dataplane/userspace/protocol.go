@@ -236,6 +236,33 @@ type TunnelEndpointSnapshot struct {
 	Key             uint32 `json:"key,omitempty"`
 	TTL             int    `json:"ttl,omitempty"`
 	TransportTable  string `json:"transport_table,omitempty"`
+
+	// WireGuard clean-room termination (see docs/pr/wireguard-clean/plan.md).
+	// All fields are wire-compatible additions: a daemon built before the
+	// plan landed will simply omit them, and the Rust side defaults each
+	// field via #[serde(default)]. The control plane only populates them
+	// when Mode == "wireguard".
+	//
+	// WgListenPort is the local UDP port we listen on for inbound WG
+	// transport. Demuxed against (listen_port, receiver_index) by the
+	// engine.
+	WgListenPort uint16 `json:"wg_listen_port,omitempty"`
+	// WgLocalPrivkeyHex is the local static X25519 private key as
+	// hex (64 chars). Control-plane-internal; never logged.
+	WgLocalPrivkeyHex string `json:"wg_local_privkey_hex,omitempty"`
+	// WgPeerPubkeyHex is the peer's static X25519 public key as
+	// hex. The engine uses THIS, not AllowedIPs LPM, to choose the
+	// encryption peer on egress — see plan §"Engine keying".
+	WgPeerPubkeyHex string `json:"wg_peer_pubkey_hex,omitempty"`
+	// WgAllowedIPs is the peer's AllowedIPs as CIDR strings. Only
+	// consulted on the decap path (inner src-IP gate).
+	WgAllowedIPs []string `json:"wg_allowed_ips,omitempty"`
+	// WgEndpoint is the optional peer endpoint (IP:port). Empty
+	// for responder-only.
+	WgEndpoint string `json:"wg_endpoint,omitempty"`
+	// WgKeepaliveSecs is the optional persistent-keepalive
+	// interval. 0 means disabled.
+	WgKeepaliveSecs uint16 `json:"wg_keepalive_secs,omitempty"`
 }
 
 type SourceNATRuleSnapshot struct {

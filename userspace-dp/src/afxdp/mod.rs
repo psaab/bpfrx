@@ -112,6 +112,11 @@ mod tx;
 mod types;
 #[path = "umem/mod.rs"]
 mod umem;
+// Clean-room WireGuard tunnel termination — see
+// docs/pr/wireguard-clean/plan.md. Engine + tests only in this PR;
+// hot-path activation lands in a follow-up.
+#[path = "wg/mod.rs"]
+mod wg;
 
 #[cfg(test)]
 use self::bind::bind_flag_candidates_for_driver;
