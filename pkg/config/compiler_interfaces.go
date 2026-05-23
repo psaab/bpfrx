@@ -146,29 +146,29 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 					if len(prop.Keys) >= 2 {
 						tc.Mode = prop.Keys[1]
 					}
-			case "key":
-				if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						tc.Key = uint32(v)
+				case "key":
+					if len(prop.Keys) >= 2 {
+						if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
+							tc.Key = uint32(v)
+						}
 					}
-				}
-			case "ttl":
-				if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						tc.TTL = v
+				case "ttl":
+					if len(prop.Keys) >= 2 {
+						if v, err := strconv.Atoi(prop.Keys[1]); err == nil {
+							tc.TTL = v
+						}
 					}
-				}
-			case "wg-public-key":
-				if len(prop.Keys) >= 2 {
-					tc.WgPublicKey = prop.Keys[1]
-				}
-			case "wg-listen-port":
-				if len(prop.Keys) >= 2 {
-					if v, err := strconv.Atoi(prop.Keys[1]); err == nil && v >= 0 && v <= 65535 {
-						tc.WgListenPort = uint16(v)
+				case "wg-public-key":
+					if len(prop.Keys) >= 2 {
+						tc.WgPublicKey = prop.Keys[1]
 					}
-				}
-			case "keepalive":
+				case "wg-listen-port":
+					if len(prop.Keys) >= 2 {
+						if v, err := strconv.Atoi(prop.Keys[1]); err == nil && v >= 0 && v <= 65535 {
+							tc.WgListenPort = uint16(v)
+						}
+					}
+				case "keepalive":
 					if v := nodeVal(prop); v != "" {
 						if n, err := strconv.Atoi(v); err == nil {
 							tc.Keepalive = n
@@ -546,7 +546,7 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 							}
 						case "persistent-keepalive":
 							if v := nodeVal(peerProp); v != "" {
-								if n, err := strconv.Atoi(v); err == nil {
+								if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 									pc.PersistentKeepalive = uint32(n)
 								}
 							}

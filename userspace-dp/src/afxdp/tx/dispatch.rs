@@ -566,17 +566,16 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 if enqueue_local_request_to_target_or_owner(target_binding, req)
                                     .is_err()
                                 {
-                                    recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                                     build_failed = true;
                                     fallback_to_slow_path = true;
-                                    continue;
-                                }
-                                dbg.enqueue_ok += 1;
-                                dbg.enqueue_copy += 1;
-                                target_binding.tx_counters.pending_copy_tx_packets += 1;
-                                dbg.tx_bytes_total += cp1_len as u64;
-                                if (cp1_len as u32) > dbg.tx_max_frame {
-                                    dbg.tx_max_frame = cp1_len as u32;
+                                } else {
+                                    dbg.enqueue_ok += 1;
+                                    dbg.enqueue_copy += 1;
+                                    target_binding.tx_counters.pending_copy_tx_packets += 1;
+                                    dbg.tx_bytes_total += cp1_len as u64;
+                                    if (cp1_len as u32) > dbg.tx_max_frame {
+                                        dbg.tx_max_frame = cp1_len as u32;
+                                    }
                                 }
                             }
                             None => {
@@ -796,7 +795,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                         } else if is_wireguard {
                             // Use the inner-frame builder (no GRE encap).
                             let mut inner = vec![0u8; source_frame.len().saturating_add(4)];
-                            let written = match build_forwarded_frame_into_from_frame(
+                            if let Some(written) = build_forwarded_frame_into_from_frame(
                                 &mut inner,
                                 source_frame,
                                 request.meta,
@@ -805,14 +804,11 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 request.apply_nat_on_fabric,
                                 expected_ports,
                             ) {
-                                Some(w) => w,
-                                None => {
-                                    recycle_ingress_frame(ingress_binding, source_offset, now_ns);
-                                    continue;
-                                }
-                            };
-                            inner.truncate(written);
-                            Some(inner)
+                                inner.truncate(written);
+                                Some(inner)
+                            } else {
+                                None
+                            }
                         } else {
                             build_forwarded_frame_from_frame(
                                 source_frame,
@@ -828,27 +824,32 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 // endpoint is a WG tunnel, re-encapsulate
                                 // the inner frame.
                                 if is_wireguard {
-                                    if let Some(endpoint) = forwarding.tunnel_endpoints.get(&request.decision.resolution.tunnel_endpoint_id) {
-                                        if let Some((wg_frame, _wg_meta)) = target_binding.wireguard.try_encap(
-                                            &frame,
-                                            request.meta.addr_family,
-                                            request.meta.ingress_ifindex,
-                                            request.decision.resolution.tx_vlan_id,
-                                            Some(endpoint.source),
-                                            request.meta.dscp,
-                                            endpoint.wg_listen_port,
-                                        ) {
+                                    if let Some(endpoint) = forwarding
+                                        .tunnel_endpoints
+                                        .get(&request.decision.resolution.tunnel_endpoint_id)
+                                    {
+                                        if let Some((wg_frame, _wg_meta)) =
+                                            target_binding.wireguard.try_encap(
+                                                &frame,
+                                                request.meta.addr_family,
+                                                request.meta.ingress_ifindex,
+                                                request.decision.resolution.tx_vlan_id,
+                                                Some(endpoint.source),
+                                                request.meta.dscp,
+                                                endpoint.wg_listen_port,
+                                            )
+                                        {
                                             frame = wg_frame;
                                         } else {
-                                            recycle_ingress_frame(ingress_binding, source_offset, now_ns);
-                                            continue;
+                                            build_failed = true;
+                                            fallback_to_slow_path = true;
                                         }
                                     } else {
-                                        recycle_ingress_frame(ingress_binding, source_offset, now_ns);
-                                        continue;
+                                        build_failed = true;
+                                        fallback_to_slow_path = true;
                                     }
                                 }
-                                if cfg!(feature = "debug-log") {
+                                if !build_failed && cfg!(feature = "debug-log") {
                                     if let Some(reason) = forward_tuple_mismatch_reason(
                                         live_frame_ports_from_meta_bytes(
                                             source_frame,
@@ -874,45 +875,50 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                         // forward it anyway. Mismatch is diagnostic only.
                                     }
                                 }
-                                let cp2_len = frame.len();
-                                if cp2_len > tx_frame_capacity() {
-                                    record_exception(
-                                        recent_exceptions,
-                                        ingress_ident,
-                                        "oversized_forward_frame",
-                                        cp2_len as u32,
-                                        Some(request.meta.into()),
-                                        None,
-                                        forwarding,
-                                    );
-                                    recycle_ingress_frame(ingress_binding, source_offset, now_ns);
-                                    continue;
-                                }
-                                let req = TxRequest {
-                                    bytes: frame,
-                                    expected_ports,
-                                    expected_addr_family: request.meta.addr_family,
-                                    expected_protocol: request.meta.protocol,
-                                    flow_key: flow_key.take(),
-                                    egress_ifindex: request.decision.resolution.egress_ifindex,
-                                    cos_queue_id: request.cos_queue_id,
-                                    dscp_rewrite: request.dscp_rewrite,
-                                    mirror_clone: false,
-                                };
-                                if enqueue_local_request_to_target_or_owner(target_binding, req)
-                                    .is_err()
-                                {
-                                    recycle_ingress_frame(ingress_binding, source_offset, now_ns);
-                                    build_failed = true;
-                                    fallback_to_slow_path = true;
-                                    continue;
-                                }
-                                dbg.enqueue_ok += 1;
-                                dbg.enqueue_copy += 1;
-                                target_binding.tx_counters.pending_copy_tx_packets += 1;
-                                dbg.tx_bytes_total += cp2_len as u64;
-                                if (cp2_len as u32) > dbg.tx_max_frame {
-                                    dbg.tx_max_frame = cp2_len as u32;
+                                if !build_failed {
+                                    let cp2_len = frame.len();
+                                    if cp2_len > tx_frame_capacity() {
+                                        record_exception(
+                                            recent_exceptions,
+                                            ingress_ident,
+                                            "oversized_forward_frame",
+                                            cp2_len as u32,
+                                            Some(request.meta.into()),
+                                            None,
+                                            forwarding,
+                                        );
+                                        recycle_ingress_frame(
+                                            ingress_binding,
+                                            source_offset,
+                                            now_ns,
+                                        );
+                                        continue;
+                                    }
+                                    let req = TxRequest {
+                                        bytes: frame,
+                                        expected_ports,
+                                        expected_addr_family: request.meta.addr_family,
+                                        expected_protocol: request.meta.protocol,
+                                        flow_key: flow_key.take(),
+                                        egress_ifindex: request.decision.resolution.egress_ifindex,
+                                        cos_queue_id: request.cos_queue_id,
+                                        dscp_rewrite: request.dscp_rewrite,
+                                        mirror_clone: false,
+                                    };
+                                    if enqueue_local_request_to_target_or_owner(target_binding, req)
+                                        .is_err()
+                                    {
+                                        build_failed = true;
+                                        fallback_to_slow_path = true;
+                                    } else {
+                                        dbg.enqueue_ok += 1;
+                                        dbg.enqueue_copy += 1;
+                                        target_binding.tx_counters.pending_copy_tx_packets += 1;
+                                        dbg.tx_bytes_total += cp2_len as u64;
+                                        if (cp2_len as u32) > dbg.tx_max_frame {
+                                            dbg.tx_max_frame = cp2_len as u32;
+                                        }
+                                    }
                                 }
                             }
                             None => {
@@ -1513,16 +1519,52 @@ fn forwarded_tcp_may_need_segmentation(
     forwarding: &ForwardingState,
 ) -> bool {
     let meta = meta.into();
-    if meta.protocol != PROTO_TCP || decision.resolution.tunnel_endpoint_id != 0 {
+    if meta.protocol != PROTO_TCP {
         return false;
     }
-    let mtu = forwarding
-        .egress
-        .get(&decision.resolution.egress_ifindex)
-        .or_else(|| forwarding.egress.get(&decision.resolution.tx_ifindex))
-        .map(|egress| egress.mtu)
-        .unwrap_or_default()
-        .max(1280);
+    let mtu = if decision.resolution.tunnel_endpoint_id != 0 {
+        let Some(endpoint) = forwarding
+            .tunnel_endpoints
+            .get(&decision.resolution.tunnel_endpoint_id)
+        else {
+            return false;
+        };
+        if !endpoint.is_wireguard() {
+            return false;
+        }
+        let outer_ip_len = match endpoint.outer_family {
+            libc::AF_INET => 20usize,
+            libc::AF_INET6 => 40usize,
+            _ => return false,
+        };
+        let transport_ifindex = forwarding
+            .ingress_logical_ifindex
+            .get(&(
+                decision.resolution.tx_ifindex,
+                decision.resolution.tx_vlan_id,
+            ))
+            .copied()
+            .unwrap_or(decision.resolution.tx_ifindex);
+        let transport_mtu = forwarding
+            .egress
+            .get(&transport_ifindex)
+            .or_else(|| forwarding.egress.get(&decision.resolution.egress_ifindex))
+            .map(|egress| egress.mtu)
+            .unwrap_or_default();
+        if transport_mtu == 0 {
+            return false;
+        }
+        let wg_overhead = outer_ip_len + 8 + 32;
+        transport_mtu.saturating_sub(wg_overhead).max(1280)
+    } else {
+        forwarding
+            .egress
+            .get(&decision.resolution.egress_ifindex)
+            .or_else(|| forwarding.egress.get(&decision.resolution.tx_ifindex))
+            .map(|egress| egress.mtu)
+            .unwrap_or_default()
+            .max(1280)
+    };
     // Prefer the actual Ethernet header in the frame. Metadata can lag
     // behind VLAN normalization; a VLAN frame with 18 bytes of L2 and a
     // 1500-byte L3 payload is 1518 bytes total, and treating stale

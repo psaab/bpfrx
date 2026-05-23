@@ -8,6 +8,7 @@ use crate::afxdp::tx::test_support::{build_ipv4_test_packet, test_session_key};
 use crate::test_zone_ids::*;
 use arc_swap::ArcSwap;
 use std::collections::{BTreeMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
@@ -44,6 +45,12 @@ fn test_decision() -> SessionDecision {
         },
         nat: NatDecision::default(),
     }
+}
+
+fn test_wireguard_decision(tunnel_endpoint_id: u16) -> SessionDecision {
+    let mut decision = test_decision();
+    decision.resolution.tunnel_endpoint_id = tunnel_endpoint_id;
+    decision
 }
 
 fn test_forwarding_decision_to_bound_ifindex(tx_ifindex: i32) -> SessionDecision {
@@ -89,6 +96,23 @@ fn test_pending_forward_request(
         cos_queue_id: None,
         dscp_rewrite: None,
         cos_tx_selection_resolved,
+    }
+}
+
+fn test_wireguard_tunnel_endpoint(id: u16, outer_family: i32) -> TunnelEndpoint {
+    TunnelEndpoint {
+        id,
+        logical_ifindex: 11,
+        redundancy_group: 0,
+        mode: "wireguard".to_string(),
+        outer_family,
+        source: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        destination: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)),
+        key: 0,
+        ttl: 0,
+        transport_table: String::new(),
+        wg_public_key: None,
+        wg_listen_port: 51820,
     }
 }
 
@@ -291,6 +315,27 @@ fn forwarded_tcp_may_need_segmentation_flags_oversized_frame() {
         &frame,
         meta,
         &test_decision(),
+        &forwarding,
+    ));
+}
+
+#[test]
+fn forwarded_tcp_may_need_segmentation_flags_wireguard_overhead() {
+    let mut forwarding = test_forwarding_with_egress_mtu(1500);
+    forwarding
+        .tunnel_endpoints
+        .insert(7, test_wireguard_tunnel_endpoint(7, libc::AF_INET));
+    let meta = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        l3_offset: 14,
+        ..UserspaceDpMeta::default()
+    };
+    let frame = vec![0u8; 14 + 1450];
+    assert!(forwarded_tcp_may_need_segmentation(
+        &frame,
+        meta,
+        &test_wireguard_decision(7),
         &forwarding,
     ));
 }

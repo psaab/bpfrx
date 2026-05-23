@@ -1,5 +1,27 @@
 # Action Log
 
+## 2026-05-23
+
+- **Timestamp**: 2026-05-23T06:15:00Z
+  - **Action**: PR #1492 hostile-review follow-up — fixed WireGuard MSS
+    outer-family calculation, removed enqueue-failure silent-drop paths so
+    failures re-enter the existing slow-path handler, restored WG copy-path
+    build failure handling, enabled WG tunnel TCP segmentation detection,
+    tightened IPv6 fragment extension parsing, removed unused WG scratch
+    buffers, and hardened userspace snapshot parsing for nil peers/allowed-ips
+    plus negative persistent-keepalive input.
+  - **File(s)**: `userspace-dp/src/afxdp/forwarding/mod.rs`,
+    `userspace-dp/src/afxdp/tx/dispatch.rs`,
+    `userspace-dp/src/afxdp/tx/dispatch_tests.rs`,
+    `userspace-dp/src/afxdp/wireguard/packet.rs`,
+    `userspace-dp/src/afxdp/worker/scratch.rs`,
+    `userspace-dp/src/afxdp/worker/mod.rs`,
+    `pkg/dataplane/userspace/protocol.go`,
+    `pkg/config/compiler_interfaces.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/config ./pkg/dataplane/userspace`;
+    `go build ./...`; `cargo build --manifest-path userspace-dp/Cargo.toml`
+    (fails in this runner: missing libelf/gelf headers for libbpf-sys)
+
 ## 2026-05-22
 
 - **Timestamp**: 2026-05-22T20:20:00Z

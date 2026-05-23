@@ -813,7 +813,13 @@ fn wireguard_tcp_mss_inner(
     if forwarding.tcp_mss_all_tcp > 0 {
         return forwarding.tcp_mss_all_tcp;
     }
-    let outer_ip_len = match addr_family as i32 {
+    let Some(endpoint) = forwarding
+        .tunnel_endpoints
+        .get(&decision.resolution.tunnel_endpoint_id)
+    else {
+        return 0;
+    };
+    let outer_ip_len = match endpoint.outer_family {
         libc::AF_INET => 20usize,
         libc::AF_INET6 => 40usize,
         _ => return 0,
@@ -821,7 +827,10 @@ fn wireguard_tcp_mss_inner(
     let wg_overhead = outer_ip_len + 8 + 32; // outer UDP + WG header
     let transport_ifindex = forwarding
         .ingress_logical_ifindex
-        .get(&(decision.resolution.tx_ifindex, decision.resolution.tx_vlan_id))
+        .get(&(
+            decision.resolution.tx_ifindex,
+            decision.resolution.tx_vlan_id,
+        ))
         .copied()
         .unwrap_or(decision.resolution.tx_ifindex);
     let transport_mtu = forwarding

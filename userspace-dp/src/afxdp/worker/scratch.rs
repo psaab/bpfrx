@@ -48,6 +48,4 @@ pub(crate) struct WorkerScratch {
     #[allow(dead_code)]
     pub(crate) scratch_cross_binding_tx: Vec<(usize, PreparedTxRequest)>,
     pub(crate) scratch_rst_teardowns: Vec<(SessionKey, NatDecision)>,
-    pub(crate) scratch_wg_out: Vec<u8>,
-    pub(crate) scratch_wg_in: Vec<u8>,
 }

@@ -238,12 +238,13 @@ pub(crate) fn parse_inner_protocol_and_offsets(packet: &[u8], addr_family: u8) -
                             }
                             (packet[offset + 1] as usize + 1) * 8
                         }
-                        43 | 44 => {
+                        43 => {
                             if offset + 1 > packet.len() {
                                 return None;
                             }
                             (packet[offset + 1] as usize) * 8 + 8
                         }
+                        44 => 8,
                         51 => {
                             if offset + 3 > packet.len() {
                                 return None;
