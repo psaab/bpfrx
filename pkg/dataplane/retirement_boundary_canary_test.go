@@ -161,6 +161,7 @@ func TestOperatorPackagesDoNotImportBPFArtifactsDirectly(t *testing.T) {
 func TestDPDKBackendImportStaysBackendLocal(t *testing.T) {
 	t.Parallel()
 
+	found := map[string]bool{}
 	var violations []string
 	for _, path := range productionGoFilesUnder(t, []string{
 		filepath.Join(repoRootForBoundaryCanary, "cmd"),
@@ -170,19 +171,32 @@ func TestDPDKBackendImportStaysBackendLocal(t *testing.T) {
 		if strings.HasPrefix(rel, "pkg/dataplane/dpdk/") {
 			continue
 		}
-		if _, ok := dpdkBackendImportAllowlist[rel]; ok {
-			continue
-		}
 		for _, imp := range importPaths(t, path) {
 			if imp == dpdkBackendImportForCanary || strings.HasPrefix(imp, dpdkBackendImportForCanary+"/") {
-				violations = append(violations, rel+" imports "+imp)
+				if _, ok := dpdkBackendImportAllowlist[rel]; ok {
+					found[rel] = true
+				} else {
+					violations = append(violations, rel+" imports "+imp)
+				}
 			}
 		}
 	}
 
-	if len(violations) > 0 {
+	var stale []string
+	for rel := range dpdkBackendImportAllowlist {
+		if !found[rel] {
+			stale = append(stale, rel)
+		}
+	}
+
+	if len(violations) > 0 || len(stale) > 0 {
 		sort.Strings(violations)
-		t.Fatalf("DPDK backend imports must stay limited to pkg/dataplane/dpdk and cmd/xpfd registration: %v", violations)
+		sort.Strings(stale)
+		t.Fatalf(
+			"DPDK backend import allowlist drift\nunexpected imports: %v\nstale allowlist entries: %v",
+			violations,
+			stale,
+		)
 	}
 }
 
@@ -453,18 +467,25 @@ func TestUserspaceXDPShimObjectMatchesRetainedCollectionAllowlist(t *testing.T) 
 func TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram(t *testing.T) {
 	t.Parallel()
 
-	var violations []string
-	for _, path := range productionGoFilesUnder(t, []string{
+	fset, files := productionGoPackageFilesUnder(t, []string{
 		filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace"),
-	}) {
-		fset := token.NewFileSet()
-		file, err := parser.ParseFile(fset, path, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", path, err)
-		}
-		ast.Inspect(file, func(n ast.Node) bool {
+	})
+	var violations []string
+	for _, parsed := range files {
+		rel := repoRelativePath(t, parsed.path)
+		ast.Inspect(parsed.file, func(n ast.Node) bool {
 			switch node := n.(type) {
 			case *ast.AssignStmt:
+				for _, rhs := range node.Rhs {
+					if containsSwapXDPEntryProgMethodValue(rhs) {
+						pos := fset.Position(rhs.Pos())
+						violations = append(violations, fmt.Sprintf(
+							"%s:%d captures SwapXDPEntryProg method value",
+							rel,
+							pos.Line,
+						))
+					}
+				}
 				for i, lhs := range node.Lhs {
 					if !isXDPEntryProgField(lhs) {
 						continue
@@ -477,7 +498,7 @@ func TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram(t *testing.T) {
 						pos := fset.Position(lhs.Pos())
 						violations = append(violations, fmt.Sprintf(
 							"%s:%d assigns XDPEntryProg from %q",
-							repoRelativePath(t, path),
+							rel,
 							pos.Line,
 							canaryExprString(rhs),
 						))
@@ -493,28 +514,69 @@ func TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram(t *testing.T) {
 						pos := fset.Position(kv.Pos())
 						violations = append(violations, fmt.Sprintf(
 							"%s:%d initializes XDPEntryProg from %q",
-							repoRelativePath(t, path),
+							rel,
 							pos.Line,
 							canaryExprString(kv.Value),
 						))
 					}
 				}
+			case *ast.ValueSpec:
+				for _, value := range node.Values {
+					if containsSwapXDPEntryProgMethodValue(value) {
+						pos := fset.Position(value.Pos())
+						violations = append(violations, fmt.Sprintf(
+							"%s:%d stores SwapXDPEntryProg method value",
+							rel,
+							pos.Line,
+						))
+					}
+				}
 			case *ast.CallExpr:
 				sel, ok := node.Fun.(*ast.SelectorExpr)
-				if !ok || sel.Sel.Name != "SwapXDPEntryProg" {
+				if ok && sel.Sel.Name == "SwapXDPEntryProg" {
+					if len(node.Args) != 1 || !isUserspaceXDPEntryProgExpr(node.Args[0]) {
+						var got string
+						if len(node.Args) == 1 {
+							got = canaryExprString(node.Args[0])
+						}
+						pos := fset.Position(node.Pos())
+						violations = append(violations, fmt.Sprintf(
+							"%s:%d calls SwapXDPEntryProg with %q",
+							rel,
+							pos.Line,
+							got,
+						))
+					}
 					return true
 				}
-				if len(node.Args) != 1 || !isUserspaceXDPEntryProgExpr(node.Args[0]) {
-					var got string
-					if len(node.Args) == 1 {
-						got = canaryExprString(node.Args[0])
+				for _, arg := range node.Args {
+					if containsSwapXDPEntryProgMethodValue(arg) {
+						pos := fset.Position(arg.Pos())
+						violations = append(violations, fmt.Sprintf(
+							"%s:%d passes SwapXDPEntryProg method value",
+							rel,
+							pos.Line,
+						))
 					}
+				}
+			case *ast.ReturnStmt:
+				for _, result := range node.Results {
+					if containsSwapXDPEntryProgMethodValue(result) {
+						pos := fset.Position(result.Pos())
+						violations = append(violations, fmt.Sprintf(
+							"%s:%d returns SwapXDPEntryProg method value",
+							rel,
+							pos.Line,
+						))
+					}
+				}
+			case *ast.UnaryExpr:
+				if node.Op == token.AND && containsXDPEntryProgField(node.X) {
 					pos := fset.Position(node.Pos())
 					violations = append(violations, fmt.Sprintf(
-						"%s:%d calls SwapXDPEntryProg with %q",
-						repoRelativePath(t, path),
+						"%s:%d takes XDPEntryProg address",
+						rel,
 						pos.Line,
-						got,
 					))
 				}
 			}
@@ -530,17 +592,13 @@ func TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram(t *testing.T) {
 func TestUserspaceXDPEntryProgramConstantNamesRetainedShim(t *testing.T) {
 	t.Parallel()
 
+	fset, files := productionGoPackageFilesUnder(t, []string{
+		filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace"),
+	})
 	var found []string
 	var violations []string
-	for _, path := range productionGoFilesUnder(t, []string{
-		filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace"),
-	}) {
-		fset := token.NewFileSet()
-		file, err := parser.ParseFile(fset, path, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", path, err)
-		}
-		ast.Inspect(file, func(n ast.Node) bool {
+	for _, parsed := range files {
+		ast.Inspect(parsed.file, func(n ast.Node) bool {
 			valueSpec, ok := n.(*ast.ValueSpec)
 			if !ok {
 				return true
@@ -550,7 +608,7 @@ func TestUserspaceXDPEntryProgramConstantNamesRetainedShim(t *testing.T) {
 					continue
 				}
 				pos := fset.Position(name.Pos())
-				location := fmt.Sprintf("%s:%d", repoRelativePath(t, path), pos.Line)
+				location := fmt.Sprintf("%s:%d", repoRelativePath(t, parsed.path), pos.Line)
 				found = append(found, location)
 				if len(valueSpec.Values) != len(valueSpec.Names) {
 					violations = append(violations, location+" uses implicit or tuple value")
@@ -707,6 +765,33 @@ func TestRetirementBoundaryDocsMentionLegacyImportAllowlist(t *testing.T) {
 	}
 }
 
+type canaryParsedGoFile struct {
+	path string
+	file *ast.File
+}
+
+func productionGoPackageFilesUnder(t *testing.T, roots []string) (*token.FileSet, []canaryParsedGoFile) {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	packageFiles := map[string]*ast.File{}
+	var files []canaryParsedGoFile
+	for _, path := range productionGoFilesUnder(t, roots) {
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		packageFiles[path] = file
+		files = append(files, canaryParsedGoFile{path: path, file: file})
+	}
+	// NewPackage resolves same-package identifiers across files. It also reports
+	// unrelated predeclared/imported identifiers because this canary does not
+	// provide a full importer or universe scope, so the error is intentionally
+	// ignored after the resolver has linked package-level objects.
+	_, _ = ast.NewPackage(fset, packageFiles, nil, nil)
+	return fset, files
+}
+
 func rustSourceFilesUnder(t *testing.T, root string) []string {
 	t.Helper()
 
@@ -785,10 +870,64 @@ func isUserspaceXDPEntryProgExpr(expr ast.Expr) bool {
 	if !ok || ident.Name != "userspaceXDPEntryProg" {
 		return false
 	}
-	if ident.Obj == nil {
-		return true
+	return ident.Obj != nil && ident.Obj.Kind == ast.Con
+}
+
+func containsXDPEntryProgField(expr ast.Expr) bool {
+	return containsExpr(expr, isXDPEntryProgField)
+}
+
+func containsSwapXDPEntryProgMethodValue(expr ast.Expr) bool {
+	if expr == nil {
+		return false
 	}
-	return ident.Obj.Kind == ast.Con
+	var found bool
+	ast.Inspect(expr, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		switch node := n.(type) {
+		case *ast.CallExpr:
+			if sel, ok := node.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "SwapXDPEntryProg" {
+				for _, arg := range node.Args {
+					if containsSwapXDPEntryProgMethodValue(arg) {
+						found = true
+						return false
+					}
+				}
+				return false
+			}
+		case *ast.SelectorExpr:
+			if node.Sel.Name == "SwapXDPEntryProg" {
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
+func containsExpr(expr ast.Expr, match func(ast.Expr) bool) bool {
+	if expr == nil {
+		return false
+	}
+	var found bool
+	ast.Inspect(expr, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		expr, ok := n.(ast.Expr)
+		if !ok {
+			return true
+		}
+		if match(expr) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func operatorRuntimeBoundaryRoots(t *testing.T) []string {
