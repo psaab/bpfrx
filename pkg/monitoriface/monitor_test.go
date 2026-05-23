@@ -2,12 +2,32 @@ package monitoriface
 
 import (
 	"bytes"
+	"net"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
+
+var _ RuntimeDataPlane = (*fakeRuntimeDataPlane)(nil)
+
+type fakeRuntimeDataPlane struct {
+	loaded       bool
+	counters     InterfaceCounters
+	gotIfindex   int
+	readCounters bool
+}
+
+func (f *fakeRuntimeDataPlane) IsLoaded() bool {
+	return f.loaded
+}
+
+func (f *fakeRuntimeDataPlane) ReadInterfaceCounters(ifindex int) (InterfaceCounters, error) {
+	f.gotIfindex = ifindex
+	f.readCounters = true
+	return f.counters, nil
+}
 
 func TestParseSummaryMode(t *testing.T) {
 	cases := map[string]SummaryMode{
@@ -30,6 +50,38 @@ func TestParseSummaryMode(t *testing.T) {
 	}
 	if _, ok := ParseSummaryMode("bogus"); ok {
 		t.Fatal("ParseSummaryMode accepted invalid mode")
+	}
+}
+
+func TestReadSnapshotUsesRuntimeDataPlaneCounters(t *testing.T) {
+	iface, err := net.InterfaceByName("lo")
+	if err != nil {
+		t.Skipf("loopback interface unavailable: %v", err)
+	}
+	dp := &fakeRuntimeDataPlane{
+		loaded: true,
+		counters: InterfaceCounters{
+			RxPackets: 11,
+			RxBytes:   22,
+			TxPackets: 33,
+			TxBytes:   44,
+		},
+	}
+
+	snap, err := ReadSnapshot(dp, nil, "lo")
+	if err != nil {
+		t.Fatalf("ReadSnapshot: %v", err)
+	}
+
+	if !dp.readCounters {
+		t.Fatal("ReadSnapshot did not read counters from RuntimeDataPlane")
+	}
+	if dp.gotIfindex != iface.Index {
+		t.Fatalf("ReadInterfaceCounters ifindex = %d, want %d", dp.gotIfindex, iface.Index)
+	}
+	if snap.RxPkts != 11 || snap.RxBytes != 22 || snap.TxPkts != 33 || snap.TxBytes != 44 {
+		t.Fatalf("ReadSnapshot counters = rxPkts=%d rxBytes=%d txPkts=%d txBytes=%d, want 11/22/33/44",
+			snap.RxPkts, snap.RxBytes, snap.TxPkts, snap.TxBytes)
 	}
 }
 

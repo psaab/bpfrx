@@ -10,8 +10,9 @@ packets, bytes, delta, rate.
 - `Snapshot` — `monitor.go`. Kernel counters (Rx/TxBytes, errors,
   collisions, etc.).
 - `UserspaceSnapshot` — `monitor.go`. Per-binding XSK stats.
-- `CounterReader` interface — `monitor.go`. Abstracts BPF map access
-  so tests can inject a fake.
+- `RuntimeDataPlane` / `CounterReader` interface — `monitor.go`.
+  Abstracts monitor-interface counter reads so callers adapt broader
+  dataplanes at their package boundary and tests can inject a fake.
 - `ReadSnapshot(counterReader CounterReader, statusReader StatusReader, kernelName string) (Snapshot, error)` — `monitor.go`.
 - `RenderSingleInterface(w io.Writer, hostname, displayName, kernelName string, snap, prev, baseline *Snapshot, startTime time.Time)` — `monitor.go`.
 - `RenderTrafficSummary(w io.Writer, hostname string, names []string, kernelNames map[string]string, snaps, prevSnaps map[string]*Snapshot, mode SummaryMode, startTime time.Time)` — `monitor.go`.
@@ -22,7 +23,7 @@ packets, bytes, delta, rate.
 
 ## Dependencies
 
-`pkg/config`, `pkg/dataplane`, `pkg/dataplane/userspace`.
+`pkg/config`, `pkg/dataplane/userspace`.
 
 ## Gotchas
 

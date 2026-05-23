@@ -7,9 +7,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/logging"
+	"github.com/psaab/xpf/pkg/monitoriface"
 )
+
+type monitorInterfaceCLITestDP struct {
+	dataplane.DataPlane
+
+	loaded     bool
+	counters   dataplane.InterfaceCounterValue
+	gotIfindex int
+}
+
+func (f *monitorInterfaceCLITestDP) IsLoaded() bool {
+	return f.loaded
+}
+
+func (f *monitorInterfaceCLITestDP) ReadInterfaceCounters(ifindex int) (dataplane.InterfaceCounterValue, error) {
+	f.gotIfindex = ifindex
+	return f.counters, nil
+}
 
 func TestMonitorFlowFilter_MatchesAll(t *testing.T) {
 	f := &monitorFlowFilter{Name: "empty"}
@@ -20,6 +39,41 @@ func TestMonitorFlowFilter_MatchesAll(t *testing.T) {
 	}
 	if !f.matches(rec) {
 		t.Fatal("empty filter should match everything")
+	}
+}
+
+func TestMonitorInterfaceDataplaneProjectsCounters(t *testing.T) {
+	dp := &monitorInterfaceCLITestDP{
+		loaded: true,
+		counters: dataplane.InterfaceCounterValue{
+			RxPackets: 10,
+			RxBytes:   20,
+			TxPackets: 30,
+			TxBytes:   40,
+		},
+	}
+	cli := &CLI{dp: dp}
+
+	accessor := cli.monitorInterfaceDataplane()
+	if accessor == nil {
+		t.Fatal("monitorInterfaceDataplane() returned nil")
+	}
+	if _, ok := accessor.(monitoriface.RuntimeDataPlane); !ok {
+		t.Fatalf("monitorInterfaceDataplane() = %T, want monitoriface.RuntimeDataPlane", accessor)
+	}
+	if !accessor.IsLoaded() {
+		t.Fatal("IsLoaded() = false, want true")
+	}
+
+	got, err := accessor.ReadInterfaceCounters(42)
+	if err != nil {
+		t.Fatalf("ReadInterfaceCounters() error = %v", err)
+	}
+	if dp.gotIfindex != 42 {
+		t.Fatalf("ReadInterfaceCounters ifindex = %d, want 42", dp.gotIfindex)
+	}
+	if got != (monitoriface.InterfaceCounters{RxPackets: 10, RxBytes: 20, TxPackets: 30, TxBytes: 40}) {
+		t.Fatalf("ReadInterfaceCounters() = %+v, want projected monitor counters", got)
 	}
 }
 

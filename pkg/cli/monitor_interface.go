@@ -16,6 +16,32 @@ import (
 type ifaceSnapshot = monitoriface.Snapshot
 type userspaceIfaceSnapshot = monitoriface.UserspaceSnapshot
 
+var _ monitoriface.RuntimeDataPlane = monitorInterfaceRuntimeDataPlane{}
+
+type monitorInterfaceRuntimeDataPlane struct {
+	cli *CLI
+}
+
+func (a monitorInterfaceRuntimeDataPlane) IsLoaded() bool {
+	return a.cli != nil && a.cli.dp != nil && a.cli.dp.IsLoaded()
+}
+
+func (a monitorInterfaceRuntimeDataPlane) ReadInterfaceCounters(ifindex int) (monitoriface.InterfaceCounters, error) {
+	if a.cli == nil || a.cli.dp == nil {
+		return monitoriface.InterfaceCounters{}, fmt.Errorf("dataplane unavailable")
+	}
+	ctrs, err := a.cli.dp.ReadInterfaceCounters(ifindex)
+	if err != nil {
+		return monitoriface.InterfaceCounters{}, err
+	}
+	return monitoriface.InterfaceCounters{
+		RxPackets: ctrs.RxPackets,
+		RxBytes:   ctrs.RxBytes,
+		TxPackets: ctrs.TxPackets,
+		TxBytes:   ctrs.TxBytes,
+	}, nil
+}
+
 // setRawMode puts the terminal into raw mode for single-character reads.
 func setRawMode(fd int) (*unix.Termios, error) {
 	old, err := unix.IoctlGetTermios(fd, unix.TCGETS)
@@ -141,7 +167,14 @@ func (c *CLI) resolveToKernel(cfgName string) string {
 }
 
 func (c *CLI) readMonitorSnapshot(kernelName string) (monitoriface.Snapshot, error) {
-	return monitoriface.ReadSnapshot(c.dp, c.userspaceDataplaneStatus, kernelName)
+	return monitoriface.ReadSnapshot(c.monitorInterfaceDataplane(), c.userspaceDataplaneStatus, kernelName)
+}
+
+func (c *CLI) monitorInterfaceDataplane() monitoriface.RuntimeDataPlane {
+	if c == nil || c.dp == nil {
+		return nil
+	}
+	return monitorInterfaceRuntimeDataPlane{cli: c}
 }
 
 // monitorInterfaceSingle shows full-screen stats for a single interface.
