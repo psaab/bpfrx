@@ -1,0 +1,291 @@
+# WireGuard clean-room dataplane termination — plan
+
+Status: WIP. Tracks #1492's architectural failures and rebuilds from
+origin/master without reusing code from #1492 (`cleanroom/wireguard`)
+or #1433 (`feature/wireguard-support`).
+
+## Why a clean room
+
+The 33+ CRIT findings against PR #1492 collapse into a small set of
+root causes that are architectural, not local:
+
+1. **Hidden state machine in boringtun.** boringtun's `Tunn` queues
+   handshake material internally and surfaces it via successive
+   `update_timers` / `decapsulate` calls. The #1492 author filtered
+   "non-data" outputs out of the encapsulate path and never drained
+   the queues, so handshakes silently stalled.
+2. **Cryptokey-routing security flaw.** The forwarding decision tells
+   the dataplane "send to tunnel-endpoint K via peer pubkey P". #1492
+   ignored P and re-derived the peer via AllowedIPs longest-prefix
+   match. With overlapping AllowedIPs across peers, this routes
+   plaintext to the wrong peer's session keys — a textbook WG
+   cryptokey-routing misuse.
+3. **Stale crypto via boringtun 0.6.0.** Pulls a vulnerable `ring`
+   (RUSTSEC-2025-0010) and `curve25519-dalek` (RUSTSEC-2024-0344).
+4. **Aliasing UB in the poll path.** Held `&mut [u8]` over the same
+   UMEM region as a live `&[u8]`.
+5. **`getrandom` on the hot path.** Per-handshake ephemerals
+   generated under the worker's poll loop.
+6. **`vec![]` per packet** in encap/decap.
+7. **Hardcoded L2 dst/src MACs** in the outer encap.
+8. **GRE-overhead MSS clamp reused for WG.** Off by 48–68 bytes.
+9. **DSCP wiring confused 6-bit vs 8-bit TOS placement.**
+10. **VLAN-unsafe encap** — outer L2 emitted without the binding's
+    `tx_vlan_id` even when set.
+11. **Bare `continue;` in drop paths** leaked ingress UMEM frames.
+12. **Silent drops on enqueue-fail** with no exception counter bump.
+13. **Replay-window wipes on control-plane restart.**
+14. **No cookie/rate-limit reply path** when the engine is under load.
+
+Items 1–6 are foundational. They have to be designed out before any
+wiring touches the dispatch / poll fast path. Items 7–14 are
+integration-level and tracked as IN/OUT scope below.
+
+## Architecture
+
+### Crypto: snow, not boringtun
+
+Use [`snow`](https://crates.io/crates/snow) for Noise IK
+(`Noise_IK_25519_ChaChaPoly_BLAKE2s`). snow has:
+
+- Explicit state machine — no hidden output queues.
+- Caller-driven I/O: `read_message` / `write_message` return exactly
+  the bytes they produce. There is nothing to "drain".
+- Audited core (snow has been independently audited and is widely
+  used).
+- No `ring` dependency on the default feature set — uses pure-Rust
+  `chacha20-poly1305`, `curve25519-dalek` (a current, non-vulnerable
+  version), and `blake2`.
+
+WireGuard's transport-data record format (4-byte type, 4-byte
+receiver index, 8-byte counter, encrypted payload || 16-byte Poly1305
+tag) is implemented directly on top of snow's transport session — it
+maps 1:1 to snow's `into_transport_mode()` `StatelessTransportState`.
+We do not depend on snow doing any WG framing for us.
+
+### Engine keying
+
+The forwarding decision is the **sole** source of truth for which
+peer to encrypt to on egress. The engine exposes:
+
+```rust
+pub fn try_encap(
+    &self,
+    virtual_ifindex: i32,   // logical WG interface
+    peer_pubkey: &[u8; 32], // explicit; from the forwarding decision
+    inner: &[u8],           // inner IP packet
+    out: &mut Vec<u8>,      // pre-allocated worker scratch
+) -> Result<EncapOutcome, EncapError>;
+```
+
+The control plane delivers `peer_pubkey` via a new field on
+`TunnelEndpointSnapshot` (`wg_peer_pubkey`). AllowedIPs is **only**
+consulted on the decap path to gate inbound plaintext — "is this src
+IP in AllowedIPs for the session's peer?" — never to choose a peer
+on egress.
+
+On ingress the engine demuxes by `(listen_port, receiver_index)`
+extracted from the WG transport header. The receiver index is
+chosen by the local side at handshake time, so it identifies the
+session unambiguously without depending on a tuple-match.
+
+### Pump pattern
+
+snow has no hidden output queue. The pattern is strictly:
+
+```
+loop {
+    // Hot path: try transport-mode read/write. If the session is
+    // not yet in transport mode, fall to the slow path.
+}
+```
+
+Handshake transitions happen entirely on the slow path:
+
+- Initiator: build `MessageInitiation` (snow `write_message(b"", out)`),
+  send on the outer UDP socket, wait for `MessageResponse`, finalize
+  with `into_stateless_transport_mode`.
+- Responder: receive `MessageInitiation`, `read_message`, produce
+  `MessageResponse` via `write_message(b"", out)`, finalize.
+
+There is no third state. Every transition has exactly one input
+message and at most one output message. Nothing to "drain".
+
+### Hot-path layout
+
+- Worker holds a `WgWorkerScratch` with `encap_buf: Vec<u8>` sized
+  to `MAX_FRAME` at startup. Never reallocated.
+- Engine internals (peer table, session table) live in an
+  `Arc<WgEngine>` and use `arc-swap` for reconfiguration — the worker
+  reads a snapshot per poll, never under a lock on the hot path.
+- Replay windows are per-session, accessed via `&AtomicU64`
+  bitmap + counter pair (sliding window of 64). Encap is lock-free
+  (single producer per session — the owning worker). Decap acquires
+  an inexpensive per-session `parking_lot::Mutex` only on the
+  duplicate/out-of-window arms.
+- Ephemerals: a slow-path producer thread pre-generates 64
+  ephemeral keypairs into a bounded SPSC ring. Slow-path handshake
+  drains; hot path never calls `getrandom`.
+
+### Replay window
+
+Single-counter sliding bitmap, 64 bits, RFC 6479 algorithm. Stored
+in the session struct as `(highest: AtomicU64, bitmap: AtomicU64)`.
+Encap increments `highest` (we are the only writer). Decap CAS-loops
+or locks briefly on the dup/oow path.
+
+### Replay-state across restart
+
+Out of scope for this PR. Documented: when the userspace helper
+restarts, in-flight sessions are torn down by the engine init path,
+and the responder will renegotiate within `REKEY_TIMEOUT`. A future
+PR will persist (counter, bitmap) per session in the slow-path
+control socket so we survive restart without rekey.
+
+## Integration
+
+Two call sites. Both are **clearly marked WIP** in this PR and
+**do not** activate in production paths.
+
+### Encap call site: tx/dispatch.rs
+
+The tunnel-endpoint branch at `dispatch.rs:430` (`uses_native_tunnel
+= tunnel_endpoint_id != 0`) is the only egress encap point. Today it
+unconditionally calls `encapsulate_native_gre_frame`. The change is
+small and local:
+
+```rust
+let endpoint = forwarding.tunnel_endpoints.get(&id)?;
+let bytes = match endpoint.mode.as_str() {
+    "wireguard" => wg_engine.try_encap(...)?,
+    _ => encapsulate_native_gre_frame(...)?,
+};
+```
+
+This PR does NOT make that call. It lands the engine + tests + the
+protocol extension and stops there. Wiring is the next PR — gated
+behind a thorough triple-review of the engine as-is.
+
+### Decap call site: poll_descriptor.rs
+
+WG ingress is `UDP/<listen_port>` on any RG-aware ifindex. The
+decap point sits in the ingress packet classifier (poll_descriptor)
+where we already strip outer L2/L3/L4 to expose payload. The same
+"wire it up later" comment applies — engine builds and tests in this
+PR; activation lands separately.
+
+### Protocol extension
+
+Add to `TunnelEndpointSnapshot` (both `userspace-dp/src/protocol.rs`
+and `pkg/dataplane/userspace/protocol.go`):
+
+- `wg_listen_port: u16` — UDP port for inbound demux.
+- `wg_local_privkey: [u8; 32]` (hex on the wire) — our static key.
+- `wg_peer_pubkey: [u8; 32]` (hex on the wire) — peer's static key.
+- `wg_allowed_ips: Vec<String>` — allowed-IPs CIDRs.
+- `wg_endpoint: String` — optional peer endpoint for initiator role.
+- `wg_keepalive_secs: u16` — optional persistent keepalive.
+
+These mirror in `TunnelEndpoint` in `types/forwarding.rs`.
+
+We do NOT (yet) extend the Go control plane to populate these from
+Junos config. That's a follow-up PR. For now the fields exist on
+the wire and are populated only by tests.
+
+## MSS clamp
+
+WG-specific overhead, per draft-ietf-wireguard / the WG whitepaper:
+
+- IPv4 outer: 20 (outer IP) + 8 (UDP) + 4 (type+reserved) + 4
+  (receiver index) + 8 (counter) + 16 (Poly1305 tag) = **60 bytes**.
+- IPv6 outer: 40 (outer IP) + 8 (UDP) + 4 + 4 + 8 + 16 = **80 bytes**.
+
+Note: the task brief gave 68/88 by counting "WG type 4 hdr (16)"
+which already includes type+reserved+receiver+counter. The numbers
+agree once you don't double-count. I'm using the byte-exact
+breakdown: **60 / 80**.
+
+The MSS gate in `forwarding/mod.rs:751` (`native_gre_tcp_mss`) is
+extended with a sibling `wg_tcp_mss` and the call site
+(`dispatch.rs:1458`) branches on `endpoint.mode`. WG endpoints
+read `wg_tcp_mss`; everything else keeps GRE semantics. No GRE
+clamp is reused.
+
+## DSCP and ECN
+
+`meta.dscp` is 6-bit right-justified. Outer TOS byte:
+
+```rust
+let outer_tos = (meta.dscp & 0x3F) << 2; // ECN bits 0 (cleared)
+```
+
+ECN propagation per RFC 6040 is a follow-up. For this PR we clear
+the ECN bits and document it as a known gap with a tracking issue.
+
+## VLAN safety
+
+`try_encap` takes `tx_vlan_id: u16` and emits 802.1Q outer L2 when
+`tx_vlan_id != 0`, mirroring `encapsulate_native_gre_frame`. The
+neighbor MAC is supplied by the caller (resolved by the existing
+FIB/neighbor pipeline before the encap call). Engine does NOT do
+its own neighbor lookup.
+
+## Recycle discipline
+
+Every drop path in the eventual integration must recycle the
+ingress UMEM frame. This PR does not touch dispatch/poll, so there
+is no recycle code here. The integration PR will follow the
+existing pattern of `recycle_ingress_frame(...)` before every
+`continue;` — encap is just one more arm of the existing match.
+
+## What's IN this PR
+
+- `userspace-dp/src/afxdp/wg/` new module:
+  - `mod.rs` — public API + `WgEngine`
+  - `engine.rs` — engine state, peer table, session table
+  - `peer.rs` — peer state + AllowedIPs
+  - `session.rs` — transport session + replay window
+  - `allowed_ips.rs` — LPM trie (in-tree, no extra deps)
+  - `framing.rs` — WG transport-data record encode/decode
+  - `mss.rs` — WG MSS arithmetic
+  - `dscp.rs` — DSCP→TOS shifting
+  - `outer.rs` — outer IPv4/UDP/L2 (+VLAN) header builder
+  - `scratch.rs` — preallocated worker scratch type
+  - `tests.rs` — unit tests
+- `userspace-dp/Cargo.toml` — adds `snow` and supporting crates.
+- `userspace-dp/src/protocol.rs` — adds WG fields to
+  `TunnelEndpointSnapshot`. Backward-compatible (all new fields are
+  `#[serde(default)]`).
+- `userspace-dp/src/afxdp/types/forwarding.rs` — adds WG fields to
+  `TunnelEndpoint`.
+- `userspace-dp/src/afxdp/forwarding_build.rs` — propagates WG fields
+  from snapshot to runtime.
+- `pkg/dataplane/userspace/protocol.go` — Go-side mirror.
+- Unit tests: handshake roundtrip, encap matches snow output,
+  decap recovers plaintext, replay window in-order / repeat /
+  out-of-window / gap-fill, AllowedIPs LPM, MSS clamp math, VLAN
+  outer L2, DSCP propagation, peer-pubkey gate (cryptokey routing).
+- `userspace-dp/src/afxdp/mod.rs` — `mod wg;` declaration.
+
+## What's OUT (tracked as follow-ups)
+
+- Activation in `tx/dispatch.rs` and `poll_descriptor.rs`. Engine
+  exists and is tested but is not on the hot path yet.
+- Go control-plane mapping from Junos `set security ipsec ...` /
+  `set interfaces st0...` to WG snapshot fields.
+- HA / RG-aware session migration on failover.
+- FIB/neighbor lookup hint for outer next-hop MAC (caller-supplied
+  in this PR).
+- RFC 7901-style cookie / rate-limit DoS reply path.
+- IPv6 outer encap (engine supports v4 outer only in this PR;
+  framing is family-agnostic but `outer.rs` builds v4 headers only).
+- Persistent replay window across control-plane restart.
+- RFC 6040 ECN propagation (cleared today).
+- Cluster smoke matrix.
+
+## Validation in this PR
+
+- `cargo build --release` clean.
+- `cargo test --release` for new tests clean.
+- `go test ./pkg/...` clean (protocol.go round-trip).
+- No changes to existing tests; no changes to existing hot paths.
