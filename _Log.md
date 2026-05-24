@@ -2,6 +2,78 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T18:47:00Z
+  - **Action**: PR #1508 copilot follow-up — moved `IPERF_TIMEOUT` defaulting
+    after argument parsing and env-file sourcing so the default tracks the
+    effective `DURATION`, added dry-run coverage for CLI duration/default
+    timeout interaction, ignored Python bytecode caches, and cleaned up the
+    PR log entries that were duplicated or appended outside their date
+    section.
+  - **File(s)**: `scripts/userspace-ha-validation.sh`,
+    `scripts/userspace_ha_validation_matrix_test.py`, `.gitignore`,
+    `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-phase-cycle.sh`; `shellcheck
+    scripts/userspace-ha-validation.sh scripts/userspace-phase-cycle.sh`;
+    `python3 -m unittest scripts.userspace_ha_validation_matrix_test`;
+    `git diff --check`
+
+- **Timestamp**: 2026-05-24T18:40:00Z
+  - **Action**: PR #1508 adversarial follow-up — validated and escaped the
+    remaining iperf runtime knobs before composing remote `bash -lc` commands,
+    and added dry-run regressions so `DURATION`, `PARALLEL`, and
+    `IPERF_TIMEOUT` cannot carry shell syntax into the HA smoke matrix.
+  - **File(s)**: `scripts/userspace-ha-validation.sh`,
+    `scripts/userspace_ha_validation_matrix_test.py`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-phase-cycle.sh`; `shellcheck
+    scripts/userspace-ha-validation.sh scripts/userspace-phase-cycle.sh`;
+    `python3 -m unittest scripts.userspace_ha_validation_matrix_test`;
+    `git diff --check`
+
+- **Timestamp**: 2026-05-24T18:24:00Z
+  - **Action**: PR #1508 copilot follow-up — hardened `run_iperf_json`
+    remote command construction by shell-escaping the target and temporary
+    output paths so env-driven target overrides cannot inject shell syntax
+    into host-side iperf execution.
+  - **File(s)**: `scripts/userspace-ha-validation.sh`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-phase-cycle.sh`; `shellcheck
+    scripts/userspace-ha-validation.sh scripts/userspace-phase-cycle.sh`;
+    `python3 -m unittest scripts.userspace_ha_validation_matrix_test`;
+    `git diff --check`
+
+- **Timestamp**: 2026-05-24T18:21:49Z
+  - **Action**: PR #1508 review follow-up: made iperf JSON metrics prefer
+    receiver-side end summaries so reverse cells gate on received throughput,
+    kept `run_iperf_json` from silently defaulting an explicit empty port to
+    5201, documented all script-local port defaults, and expanded dry-run
+    coverage for empty/range/metacharacter port overrides plus command token
+    escaping.
+  - **File(s)**: `scripts/iperf-json-metrics.py`,
+    `scripts/userspace-ha-validation.sh`,
+    `scripts/userspace_ha_validation_matrix_test.py`,
+    `docs/pr/1373-retire-ebpf-dataplane/smoke-gates.md`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-phase-cycle.sh`; `shellcheck
+    scripts/userspace-ha-validation.sh scripts/userspace-phase-cycle.sh`;
+    `python3 -m unittest scripts.userspace_ha_validation_matrix_test`;
+    `git diff --check`
+
+- **Timestamp**: 2026-05-24T18:01:21Z
+  - **Action**: PR #1508 review follow-up — added script-local
+    documentation for the four smoke-matrix iperf port overrides, hardened
+    remote iperf port argument construction, and expanded invalid-port
+    dry-run coverage across all four override variables plus boundary
+    values.
+  - **File(s)**: `scripts/userspace-ha-validation.sh`,
+    `scripts/userspace_ha_validation_matrix_test.py`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-phase-cycle.sh`; `shellcheck
+    scripts/userspace-ha-validation.sh scripts/userspace-phase-cycle.sh`;
+    `python3 -m unittest scripts.userspace_ha_validation_matrix_test`;
+    `git diff --check`
+
 - **Timestamp**: 2026-05-24T16:56:30Z
   - **Action**: PR #1506 review follow-up — normalized RFC3339 leap-second
     validation through UTC before accepting `:60` offset forms, and reported
@@ -13,6 +85,20 @@
     retire_ebpf_artifact_schema_test.py`; `python3 -m py_compile
     test/incus/retire_ebpf_artifact_schema.py
     test/incus/retire_ebpf_artifact_schema_test.py`; `git diff --check`
+
+- **Timestamp**: 2026-05-24T16:56:31Z
+  - **Action**: PR #1508 review follow-up — validated smoke-matrix iperf
+    port overrides, documented the override contract, and hoisted the
+    CoS-off matrix precheck before full-matrix perf capture so profiling
+    cannot run against an already-shaped cluster.
+  - **File(s)**: `scripts/userspace-ha-validation.sh`,
+    `scripts/userspace_ha_validation_matrix_test.py`,
+    `docs/pr/1373-retire-ebpf-dataplane/smoke-gates.md`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-phase-cycle.sh`; `shellcheck
+    scripts/userspace-ha-validation.sh scripts/userspace-phase-cycle.sh`;
+    `python3 -m unittest scripts.userspace_ha_validation_matrix_test`;
+    `git diff --check`
 
 - **Timestamp**: 2026-05-24T15:14:30Z
   - **Action**: PR #1494 round-11 follow-up — collapsed the retained
@@ -30,6 +116,22 @@
     `go test ./pkg/dataplane ./pkg/dataplane/userspace`;
     `git diff --check`
 
+- **Timestamp**: 2026-05-24T06:08:39Z
+  - **Action**: PR #1508 review follow-up — made HA smoke-matrix iperf
+    ports explicit so CoS-on cells use port 5211's uncapped-root class
+    instead of iperf3's default 5201 / 100 Mbps class, and moved full-matrix
+    perf capture ahead of CoS fixture application so flamegraphs stay on a
+    clean CoS-off baseline.
+  - **File(s)**: `scripts/userspace-ha-validation.sh`,
+    `scripts/userspace_ha_validation_matrix_test.py`,
+    `docs/pr/1373-retire-ebpf-dataplane/README.md`,
+    `docs/pr/1373-retire-ebpf-dataplane/smoke-gates.md`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-phase-cycle.sh`; `shellcheck
+    scripts/userspace-ha-validation.sh scripts/userspace-phase-cycle.sh`;
+    `python3 -m unittest scripts.userspace_ha_validation_matrix_test`;
+    `git diff --check`
+
 - **Timestamp**: 2026-05-24T06:06:58Z
   - **Action**: PR #1505 review follow-up — changed the SYN-cookie
     `docs/feature-gaps.md` row to point at final #1477 source-removal
@@ -39,6 +141,24 @@
   - **Validation**: `rg -n "#1375|#1378|SYN-cookie|source-removal"
     docs/feature-gaps.md docs/pr/1373-retire-ebpf-dataplane/README.md
     docs/pr/1373-retire-ebpf-dataplane/plan.md`; `git diff --check`
+
+- **Timestamp**: 2026-05-24T04:51:19Z
+  - **Action**: Issue #1500 userspace HA smoke matrix: added an explicit
+    `--smoke-matrix` mode that runs IPv4 push, IPv4 reverse, IPv6 push, and
+    IPv6 reverse first with CoS off, then repeats those four cells after
+    applying the existing symmetric CoS fixture; kept the fast current-CoS
+    IPv4/IPv6 push readiness mode distinct; made `userspace-phase-cycle.sh`
+    invoke the full matrix by default for standard smoke evidence.
+  - **File(s)**: `scripts/userspace-ha-validation.sh`,
+    `scripts/userspace-phase-cycle.sh`,
+    `scripts/userspace_ha_validation_matrix_test.py`,
+    `docs/pr/1373-retire-ebpf-dataplane/README.md`,
+    `docs/pr/1373-retire-ebpf-dataplane/smoke-gates.md`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-phase-cycle.sh`; `shellcheck
+    scripts/userspace-ha-validation.sh scripts/userspace-phase-cycle.sh`;
+    `python3 -m unittest scripts.userspace_ha_validation_matrix_test`;
+    `git diff --check`
 
 - **Timestamp**: 2026-05-24T04:08:49Z
   - **Action**: PR #1497 round-3 follow-up — fixed the checker/schema

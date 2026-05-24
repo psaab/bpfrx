@@ -32,9 +32,14 @@ Fresh deploys start CoS-off because `docs/ha-cluster-userspace.conf` has no
 CoS fixture. If this is not a fresh deploy, redeploy before the CoS-off gate
 or intentionally clear/reload the userspace cluster config first.
 
+The direct HA validator's default `--fast` mode is only a current-CoS
+IPv4/IPv6 push readiness check. Use `--smoke-matrix` or the phase-cycle gate
+below for standard smoke evidence that covers push, reverse, CoS-off, and
+CoS-on cells.
+
 ```bash
 BPFRX_CLUSTER_ENV="$BPFRX_CLUSTER_ENV" ./test/incus/cluster-setup.sh deploy all
-./scripts/userspace-ha-validation.sh --env "$BPFRX_CLUSTER_ENV"
+./scripts/userspace-ha-validation.sh --env "$BPFRX_CLUSTER_ENV" --fast
 ```
 
 ## Gate 1: CoS-Off IPv4/IPv6 Push And Reverse
@@ -42,6 +47,9 @@ BPFRX_CLUSTER_ENV="$BPFRX_CLUSTER_ENV" ./test/incus/cluster-setup.sh deploy all
 This gate runs normal client push plus `iperf3 -R` for IPv4 and IPv6 from
 `loss:cluster-userspace-host`. It stores raw iperf JSON and parsed collapse
 metrics under `$ARTIFACT_ROOT/cos-off`.
+`scripts/iperf-json-metrics.py` uses the receiver-side iperf end summary when
+that field is present, so reverse-mode checks gate on received throughput rather
+than the client-side sent counter.
 
 ```bash
 set -euo pipefail
@@ -332,11 +340,36 @@ test "$failed" -eq 0
 ## Gate 5: Deploy And Steady-State Userspace Readiness
 
 This gate exercises the canonical deploy/readiness, router-advertisement,
-ping, iperf, and collapse-detection validation suite. The validator may pin RG
-ownership before the steady-state checks, but it is not the low-latency
-failover/failback flow-survival proof. Treat any validator failure, collapse
-detection, or unexplained retransmit warning as a stop-the-line artifact to
-triage before BPF retirement proceeds.
+ping, iperf, and collapse-detection validation suite. `userspace-phase-cycle.sh`
+pushes the branch, deploys the cluster, and invokes
+`userspace-ha-validation.sh --smoke-matrix`: IPv4 push, IPv4 reverse, IPv6
+push, and IPv6 reverse while CoS is off, then the same four cells after applying
+the existing symmetric CoS fixture with
+`test/incus/apply-cos-config.sh --symmetric`. CoS-off cells use explicit
+iperf3 port 5201 to preserve the historical readiness path; CoS-on cells use
+explicit port 5211 so the matrix hits the uncapped-root class instead of
+iperf3's default 5201 / 100 Mbps class. The matrix summary names each
+`cos-off-*` and `cos-on-*` cell, including the iperf3 port, and
+only prints `smoke matrix complete: 8/8 cells passed` after every required cell
+has passed. Reverse cells use the receiver-side iperf summary for throughput
+thresholds.
+
+The validator may pin RG ownership before the steady-state checks, but it is
+not the low-latency failover/failback flow-survival proof. Treat any validator
+failure, missing matrix cell, collapse detection, or unexplained retransmit
+warning as a stop-the-line artifact to triage before BPF retirement proceeds.
+The matrix applies the symmetric CoS fixture for the CoS-on half and leaves it
+applied; redeploy before collecting fresh CoS-off-only evidence.
+
+The iperf port selection is intentionally explicit and can be overridden only
+with numeric TCP ports in the `1..65535` range:
+
+| Variable | Default | Scope |
+|---|---:|---|
+| `FAST_IPERF_PORT` | `5201` | Fast/readiness mode current-CoS cells |
+| `MATRIX_COS_OFF_IPERF_PORT` | `5201` | Full-matrix CoS-off cells |
+| `MATRIX_COS_ON_IPERF_PORT` | `5211` | Full-matrix CoS-on cells |
+| `PERF_IPERF_PORT` | `5201` | `--perf` baseline capture |
 
 ```bash
 set -euo pipefail
@@ -344,8 +377,14 @@ BPFRX_CLUSTER_ENV="$BPFRX_CLUSTER_ENV" ./scripts/userspace-phase-cycle.sh \
   2>&1 | tee "$ARTIFACT_ROOT/userspace-phase-cycle.log"
 ```
 
+For a quick readiness-only cycle that preserves the old IPv4/IPv6 push scope
+and does not apply CoS, pass `--fast`. Do not use that shortened run as the
+standard Phase 1/2 smoke gate.
+
 When performance evidence is needed, run the stricter profiling variant as a
-separate artifact set:
+separate artifact set. With the full matrix, the validator captures perf
+before applying the CoS fixture so profiles describe the clean userspace
+dataplane baseline rather than CoS-on shaping overhead:
 
 ```bash
 set -euo pipefail

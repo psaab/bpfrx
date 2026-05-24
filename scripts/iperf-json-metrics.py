@@ -54,6 +54,14 @@ def collect_intervals(payload):
     return intervals, end
 
 
+def end_throughput_summary(end):
+    for name in ("sum_received", "sum", "sum_sent"):
+        candidate = end.get(name) or {}
+        if isinstance(candidate, dict) and candidate.get("bits_per_second") is not None:
+            return candidate
+    return {}
+
+
 def summarize(path, args):
     summary = {
         "path": str(path),
@@ -104,9 +112,10 @@ def summarize(path, args):
         test_start = start.get("test_start", {}) or {}
     summary["protocol"] = str(test_start.get("protocol") or "").upper()
     sum_sent = end.get("sum_sent") or end.get("sum") or {}
-    summary["avg_gbps"] = float(sum_sent.get("bits_per_second") or 0.0) / 1e9
-    summary["retransmits"] = int(sum_sent.get("retransmits") or 0)
     sum_received = end.get("sum_received") or {}
+    throughput_summary = end_throughput_summary(end)
+    summary["avg_gbps"] = float(throughput_summary.get("bits_per_second") or 0.0) / 1e9
+    summary["retransmits"] = int(sum_sent.get("retransmits") or 0)
     # Use `is not None` instead of `or` chaining — 0.0 is a valid value
     # that `or` would treat as falsy, falling through to the wrong source.
     def _first_defined(*sources):
@@ -148,7 +157,10 @@ def summarize(path, args):
         if duration >= args.min_full_interval_sec:
             full_intervals.append(bps / 1e9)
     if end:
-        observed_end = max(observed_end, float((sum_sent.get("end") or 0.0)))
+        observed_end = max(
+            observed_end,
+            float((throughput_summary.get("end") or sum_sent.get("end") or 0.0)),
+        )
     summary["observed_end_sec"] = observed_end
     summary["stream_zero_intervals_total"] = stream_zero_total
     summary["zero_streams_total"] = len(zero_stream_ids)

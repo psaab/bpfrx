@@ -4,6 +4,8 @@
 /cli
 *.test
 *.out
+__pycache__/
+*.pyc
 
 /userspace-dp/target/
 

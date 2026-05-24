@@ -6,10 +6,13 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${BPFRX_CLUSTER_ENV:-${PROJECT_ROOT}/test/incus/loss-userspace-cluster.env}"
 BRANCH="$(git -C "${PROJECT_ROOT}" rev-parse --abbrev-ref HEAD)"
 WITH_PERF=0
+SMOKE_MODE="${SMOKE_MODE:-matrix}"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--perf) WITH_PERF=1 ;;
+	--smoke-matrix | --full-matrix) SMOKE_MODE="matrix" ;;
+	--fast) SMOKE_MODE="fast" ;;
 	--env) ENV_FILE="$2"; shift ;;
 	*)
 		echo "unknown arg: $1" >&2
@@ -24,8 +27,18 @@ cd "${PROJECT_ROOT}"
 git push origin "${BRANCH}"
 BPFRX_CLUSTER_ENV="${ENV_FILE}" ./test/incus/cluster-setup.sh deploy all
 
+validation_args=(--env "${ENV_FILE}")
+case "$SMOKE_MODE" in
+	matrix | full | full-matrix | smoke-matrix) validation_args+=(--smoke-matrix) ;;
+	fast | legacy) validation_args+=(--fast) ;;
+	*)
+		echo "unknown SMOKE_MODE: ${SMOKE_MODE}" >&2
+		exit 2
+		;;
+esac
+
 if [[ ${WITH_PERF} -eq 1 ]]; then
-	./scripts/userspace-ha-validation.sh --env "${ENV_FILE}" --perf
+	./scripts/userspace-ha-validation.sh "${validation_args[@]}" --perf
 else
-	./scripts/userspace-ha-validation.sh --env "${ENV_FILE}"
+	./scripts/userspace-ha-validation.sh "${validation_args[@]}"
 fi
