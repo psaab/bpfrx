@@ -2,6 +2,21 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T23:00:00Z
+  - **Action**: PR #1499 r-final-5 fix pass start — exhaustive mechanical
+    plan.md sweep against actual source. Step 1 fixed: WG data-record
+    header described as 20 bytes in plan.md:74-78 (handshake scope) and
+    plan.md:282-286 (MSS section). Actual is 16 bytes: 1B type + 3B
+    reserved + 4B receiver_index + 8B counter, as defined by
+    `WG_DATA_HEADER_LEN = 1 + 3 + 4 + 8` in
+    `userspace-dp/src/afxdp/wg/mod.rs:91` and the byte-exact layout in
+    `userspace-dp/src/afxdp/wg/framing.rs:32-46`. Rewrote the on-wire
+    framing description with explicit byte offsets and a per-row table;
+    updated the handshake-scope bullet to match; fixed the IPv4/IPv6
+    outer overhead breakdown to call out the `WG_DATA_HEADER_LEN` /
+    `POLY1305_TAG_LEN` constants directly.
+  - **File(s)**: docs/pr/wireguard-clean/plan.md
+
 - **Timestamp**: 2026-05-24T22:00:00Z
   - **Action**: PR #1499 r-final-4 fix — closed Codex MAJOR (5 plan.md
     drifts) and Copilot 2 inline findings on the r-final-3 commit

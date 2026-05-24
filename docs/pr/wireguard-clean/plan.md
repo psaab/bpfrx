@@ -71,11 +71,28 @@ to interoperate with kernel WireGuard / wireguard-go. snow has:
   by snow's choice of vetted crypto crates, not by avoiding `ring`
   outright.
 
-WireGuard's transport-data record format (4-byte type, 4-byte
-receiver index, 8-byte counter, encrypted payload || 16-byte Poly1305
-tag) is implemented directly on top of snow's transport session — it
-maps 1:1 to snow's `into_transport_mode()` `StatelessTransportState`.
-We do not depend on snow doing any WG framing for us.
+WireGuard's transport-data record format is a 16-byte header followed
+by ciphertext || 16-byte Poly1305 tag. The header layout, byte-exact,
+matches the engine constants in `userspace-dp/src/afxdp/wg/mod.rs:86-91`
+and `userspace-dp/src/afxdp/wg/framing.rs:32-46`:
+
+| offset | bytes | field          |
+|-------:|------:|----------------|
+|      0 |     1 | type = 4       |
+|      1 |     3 | reserved (zero on send; accepted as zero on recv for interop) |
+|      4 |     4 | receiver_index (little-endian u32) |
+|      8 |     8 | counter (little-endian u64) |
+|     16 |     N | encrypted payload \|\| 16-byte Poly1305 tag |
+
+Total fixed transport overhead is therefore **`WG_DATA_HEADER_LEN`
+(16) + `POLY1305_TAG_LEN` (16) = 32 bytes** per data record. (Earlier
+drafts described the header as "4-byte type + 4-byte reserved + 4-byte
+receiver_index + 8-byte counter" = 20 bytes; that mis-stated the
+type+reserved layout — `type` is a single byte, `reserved` is 3 bytes,
+together a single 4-byte word.) The header is implemented directly on
+top of snow's transport session and maps 1:1 to snow's
+`into_transport_mode()` `StatelessTransportState`. We do not depend
+on snow doing any WG framing for us.
 
 ### Engine keying
 
@@ -280,9 +297,11 @@ the wire and are populated only by tests.
 
 WG-specific overhead, per draft-ietf-wireguard / the WG whitepaper:
 
-- IPv4 outer: 20 (outer IP) + 8 (UDP) + 4 (type+reserved) + 4
-  (receiver index) + 8 (counter) + 16 (Poly1305 tag) = **60 bytes**.
-- IPv6 outer: 40 (outer IP) + 8 (UDP) + 4 + 4 + 8 + 16 = **80 bytes**.
+- IPv4 outer: 20 (outer IP) + 8 (UDP) + 16 (WG data header:
+  `WG_DATA_HEADER_LEN`) + 16 (Poly1305 tag: `POLY1305_TAG_LEN`) =
+  **60 bytes** (matches `WG_OVERHEAD_V4` in `mod.rs:95`).
+- IPv6 outer: 40 (outer IP) + 8 (UDP) + 16 + 16 = **80 bytes**
+  (matches `WG_OVERHEAD_V6` in `mod.rs:98`).
 
 WG §5.4.6 also requires the inner-IP plaintext to be zero-padded
 to a 16-byte multiple before AEAD. That adds **0..15** bytes per
@@ -293,9 +312,10 @@ frame larger than the MTU, regardless of how the inner segment's
 total length lands modulo 16. See `mss.rs` for the byte table.
 
 Note: the task brief gave 68/88 by counting "WG type 4 hdr (16)"
-which already includes type+reserved+receiver+counter. The numbers
-agree once you don't double-count. I'm using the byte-exact
-breakdown: **60 / 80** plus the **15** padding allowance.
+which already includes the 1-byte type + 3-byte reserved + 4-byte
+receiver_index + 8-byte counter that make up `WG_DATA_HEADER_LEN`.
+The numbers agree once you don't double-count. I'm using the
+byte-exact breakdown: **60 / 80** plus the **15** padding allowance.
 
 This engine PR ships `wg_tcp_mss` as a standalone helper in
 `afxdp/wg/mss.rs` (signature
@@ -403,8 +423,11 @@ Noise IK sub-message). The engine only:
   bytes via `read_message` / `write_message`, with the WG prologue
   mixed into the transcript hash.
 - Builds and consumes the WG transport-data record on the wire (see
-  `framing.rs`): 4-byte type + 4-byte reserved + 4-byte
-  receiver_index + 8-byte counter + ciphertext || Poly1305 tag.
+  `framing.rs:32-46` and `mod.rs:86-91`): 1-byte type=4 + 3-byte
+  reserved + 4-byte little-endian `receiver_index` + 8-byte
+  little-endian `counter` + ciphertext || 16-byte Poly1305 tag.
+  Fixed header = `WG_DATA_HEADER_LEN` (16); fixed AEAD tag =
+  `POLY1305_TAG_LEN` (16); 32 bytes of transport overhead total.
 
 The integration PR will add a layer that wraps the engine's Noise
 sub-message bytes inside the WG handshake outer framing (with MAC1
