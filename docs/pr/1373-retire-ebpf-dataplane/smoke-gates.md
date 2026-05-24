@@ -342,8 +342,11 @@ pushes the branch, deploys the cluster, and invokes
 `userspace-ha-validation.sh --smoke-matrix`: IPv4 push, IPv4 reverse, IPv6
 push, and IPv6 reverse while CoS is off, then the same four cells after applying
 the existing symmetric CoS fixture with
-`test/incus/apply-cos-config.sh --symmetric`. The matrix summary names each
-`cos-off-*` and `cos-on-*` cell and
+`test/incus/apply-cos-config.sh --symmetric`. CoS-off cells use explicit
+iperf3 port 5201 to preserve the historical readiness path; CoS-on cells use
+explicit port 5211 so the matrix hits the uncapped-root class instead of
+iperf3's default 5201 / 100 Mbps class. The matrix summary names each
+`cos-off-*` and `cos-on-*` cell, including the iperf3 port, and
 only prints `smoke matrix complete: 8/8 cells passed` after every required cell
 has passed.
 
@@ -365,7 +368,9 @@ and does not apply CoS, pass `--fast`. Do not use that shortened run as the
 standard Phase 1/2 smoke gate.
 
 When performance evidence is needed, run the stricter profiling variant as a
-separate artifact set:
+separate artifact set. With the full matrix, the validator captures perf
+before applying the CoS fixture so profiles describe the clean userspace
+dataplane baseline rather than CoS-on shaping overhead:
 
 ```bash
 set -euo pipefail

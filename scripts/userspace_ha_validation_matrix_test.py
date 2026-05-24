@@ -70,22 +70,26 @@ class UserspaceHASmokeMatrixTests(unittest.TestCase):
             plan,
             [
                 "matrix plan: cos-off-ipv4-push cos=off family=ipv4 direction=push "
-                "target=172.16.80.200 min_gbps=1.0",
+                "target=172.16.80.200 port=5201 min_gbps=1.0",
                 "matrix plan: cos-off-ipv4-reverse cos=off family=ipv4 direction=reverse "
-                "target=172.16.80.200 min_gbps=1.0",
+                "target=172.16.80.200 port=5201 min_gbps=1.0",
                 "matrix plan: cos-off-ipv6-push cos=off family=ipv6 direction=push "
-                "target=2001:559:8585:80::200 min_gbps=1.0",
+                "target=2001:559:8585:80::200 port=5201 min_gbps=1.0",
                 "matrix plan: cos-off-ipv6-reverse cos=off family=ipv6 direction=reverse "
-                "target=2001:559:8585:80::200 min_gbps=1.0",
+                "target=2001:559:8585:80::200 port=5201 min_gbps=1.0",
                 "matrix plan: cos-on-ipv4-push cos=on family=ipv4 direction=push "
-                "target=172.16.80.200 min_gbps=1.0",
+                "target=172.16.80.200 port=5211 min_gbps=1.0",
                 "matrix plan: cos-on-ipv4-reverse cos=on family=ipv4 direction=reverse "
-                "target=172.16.80.200 min_gbps=1.0",
+                "target=172.16.80.200 port=5211 min_gbps=1.0",
                 "matrix plan: cos-on-ipv6-push cos=on family=ipv6 direction=push "
-                "target=2001:559:8585:80::200 min_gbps=1.0",
+                "target=2001:559:8585:80::200 port=5211 min_gbps=1.0",
                 "matrix plan: cos-on-ipv6-reverse cos=on family=ipv6 direction=reverse "
-                "target=2001:559:8585:80::200 min_gbps=1.0",
+                "target=2001:559:8585:80::200 port=5211 min_gbps=1.0",
             ],
+        )
+        self.assertIn(
+            "cos-on-ipv4-push run 1: dry-run direction=push port=5211",
+            result.stdout,
         )
         self.assertIn("smoke matrix complete: 8/8 cells passed", result.stdout)
 
@@ -96,9 +100,9 @@ class UserspaceHASmokeMatrixTests(unittest.TestCase):
             plan,
             [
                 "matrix plan: fast-current-cos-ipv4-push cos=current-cos family=ipv4 "
-                "direction=push target=172.16.80.200 min_gbps=1.0",
+                "direction=push target=172.16.80.200 port=5201 min_gbps=1.0",
                 "matrix plan: fast-current-cos-ipv6-push cos=current-cos family=ipv6 "
-                "direction=push target=2001:559:8585:80::200 min_gbps=1.0",
+                "direction=push target=2001:559:8585:80::200 port=5201 min_gbps=1.0",
             ],
         )
         self.assertIn(
@@ -120,6 +124,17 @@ class UserspaceHASmokeMatrixTests(unittest.TestCase):
         self.assertNotIn("smoke matrix complete:", result.stdout)
         self.assertIn("smoke cell pass: cos-on-ipv6-push", result.stdout)
         self.assertNotIn("smoke cell pass: cos-on-ipv6-reverse", result.stdout)
+
+    def test_matrix_perf_runs_before_cos_on_state(self) -> None:
+        result = self.run_validator("--smoke-matrix", "--perf")
+        self.assertIn(
+            "perf order: before smoke matrix to keep CoS-off baseline clean",
+            result.stdout,
+        )
+        self.assertLess(
+            result.stdout.index("perf order: before smoke matrix"),
+            result.stdout.index("smoke cell start: cos-on-ipv4-push"),
+        )
 
 
 if __name__ == "__main__":

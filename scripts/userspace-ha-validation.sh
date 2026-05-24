@@ -20,6 +20,10 @@ PREFERRED_ACTIVE_RGS="${PREFERRED_ACTIVE_RGS:-1 2}"
 IPERF_TIMEOUT="${IPERF_TIMEOUT:-$((DURATION + 15))}"
 V4_TEST_TARGET="${V4_TEST_TARGET:-172.16.80.200}"
 V6_TEST_TARGET="${V6_TEST_TARGET:-2001:559:8585:80::200}"
+FAST_IPERF_PORT="${FAST_IPERF_PORT:-5201}"
+MATRIX_COS_OFF_IPERF_PORT="${MATRIX_COS_OFF_IPERF_PORT:-5201}"
+MATRIX_COS_ON_IPERF_PORT="${MATRIX_COS_ON_IPERF_PORT:-5211}"
+PERF_IPERF_PORT="${PERF_IPERF_PORT:-5201}"
 MTR_V4_TARGET="${MTR_V4_TARGET:-1.1.1.1}"
 MTR_V6_TARGET="${MTR_V6_TARGET:-2607:f8b0:4005:814::200e}"
 MTR_REPORT_CYCLES="${MTR_REPORT_CYCLES:-1}"
@@ -393,7 +397,7 @@ validate_traceroute_visibility() {
 }
 
 run_iperf_json() {
-	local family="$1" target="$2" outfile="$3" direction="${4:-push}"
+	local family="$1" target="$2" outfile="$3" direction="${4:-push}" port="${5:-5201}"
 	local cmd tmpfile timeout_sec reverse_arg=""
 	tmpfile="${outfile}.tmp"
 	timeout_sec="${IPERF_TIMEOUT}s"
@@ -403,9 +407,9 @@ run_iperf_json() {
 	*) die "unknown iperf direction: ${direction}" ;;
 	esac
 	if [[ "$family" == "6" ]]; then
-		cmd="rm -f ${outfile} ${outfile}.err ${tmpfile}; if timeout -k 2 ${timeout_sec} iperf3 -6 -J -c ${target} -P ${PARALLEL} -t ${DURATION}${reverse_arg} > ${tmpfile} 2>${outfile}.err; then mv ${tmpfile} ${outfile}; else rc=\$?; rm -f ${tmpfile} ${outfile}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile}.err; else echo \"iperf3 exited with status \$rc\" >> ${outfile}.err; fi; fi"
+		cmd="rm -f ${outfile} ${outfile}.err ${tmpfile}; if timeout -k 2 ${timeout_sec} iperf3 -6 -J -c ${target} -p ${port} -P ${PARALLEL} -t ${DURATION}${reverse_arg} > ${tmpfile} 2>${outfile}.err; then mv ${tmpfile} ${outfile}; else rc=\$?; rm -f ${tmpfile} ${outfile}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile}.err; else echo \"iperf3 exited with status \$rc\" >> ${outfile}.err; fi; fi"
 	else
-		cmd="rm -f ${outfile} ${outfile}.err ${tmpfile}; if timeout -k 2 ${timeout_sec} iperf3 -J -c ${target} -P ${PARALLEL} -t ${DURATION}${reverse_arg} > ${tmpfile} 2>${outfile}.err; then mv ${tmpfile} ${outfile}; else rc=\$?; rm -f ${tmpfile} ${outfile}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile}.err; else echo \"iperf3 exited with status \$rc\" >> ${outfile}.err; fi; fi"
+		cmd="rm -f ${outfile} ${outfile}.err ${tmpfile}; if timeout -k 2 ${timeout_sec} iperf3 -J -c ${target} -p ${port} -P ${PARALLEL} -t ${DURATION}${reverse_arg} > ${tmpfile} 2>${outfile}.err; then mv ${tmpfile} ${outfile}; else rc=\$?; rm -f ${tmpfile} ${outfile}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile}.err; else echo \"iperf3 exited with status \$rc\" >> ${outfile}.err; fi; fi"
 	fi
 	run_host "$cmd"
 }
@@ -504,12 +508,17 @@ PY
 
 matrix_cell_specs() {
 	local mode="$1"
-	local cos_state family direction target min_gbps family_arg
+	local cos_state family direction target min_gbps family_arg port
 	case "$mode" in
 	matrix)
 		for cos_state in cos-off cos-on; do
 			for family in ipv4 ipv6; do
 				for direction in push reverse; do
+					if [[ "$cos_state" == "cos-on" ]]; then
+						port="$MATRIX_COS_ON_IPERF_PORT"
+					else
+						port="$MATRIX_COS_OFF_IPERF_PORT"
+					fi
 					if [[ "$family" == "ipv4" ]]; then
 						target="$V4_TEST_TARGET"
 						min_gbps="$MIN_GBPS_V4"
@@ -519,8 +528,8 @@ matrix_cell_specs() {
 						min_gbps="$MIN_GBPS_V6"
 						family_arg="6"
 					fi
-					printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-						"$cos_state" "$family" "$direction" "$family_arg" "$target" "$min_gbps"
+					printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+						"$cos_state" "$family" "$direction" "$family_arg" "$target" "$min_gbps" "$port"
 				done
 			done
 		done
@@ -536,8 +545,8 @@ matrix_cell_specs() {
 				min_gbps="$MIN_GBPS_V6"
 				family_arg="6"
 			fi
-			printf 'current-cos\t%s\tpush\t%s\t%s\t%s\n' \
-				"$family" "$family_arg" "$target" "$min_gbps"
+			printf 'current-cos\t%s\tpush\t%s\t%s\t%s\t%s\n' \
+				"$family" "$family_arg" "$target" "$min_gbps" "$FAST_IPERF_PORT"
 		done
 		;;
 	*) die "unknown smoke mode: ${mode}" ;;
@@ -587,25 +596,26 @@ apply_symmetric_cos_config() {
 }
 
 print_smoke_matrix_plan() {
-	local cos_state family direction family_arg target min_gbps label cos_label
-	while IFS=$'\t' read -r cos_state family direction family_arg target min_gbps; do
+	local cos_state family direction family_arg target min_gbps port label cos_label
+	while IFS=$'\t' read -r cos_state family direction family_arg target min_gbps port; do
 		label="$(cell_label "$cos_state" "$family" "$direction")"
 		cos_label="${cos_state#cos-}"
-		printf 'matrix plan: %s cos=%s family=%s direction=%s target=%s min_gbps=%s\n' \
-			"$label" "$cos_label" "$family" "$direction" "$target" "$min_gbps"
+		printf 'matrix plan: %s cos=%s family=%s direction=%s target=%s port=%s min_gbps=%s\n' \
+			"$label" "$cos_label" "$family" "$direction" "$target" "$port" "$min_gbps"
 	done < <(matrix_cell_specs "$SMOKE_MODE")
 }
 
 warm_up_cell() {
-	local label="$1" target="$2" family="$3" direction="$4"
+	local label="$1" target="$2" family="$3" direction="$4" port="$5"
 	local json="/tmp/${label}-warmup.json"
 	local metrics
 	if (( DRY_RUN_MATRIX == 1 )); then
-		printf '%s warmup: dry-run direction=%s\n' "$label" "$direction" | tee -a "$summary_file"
+		printf '%s warmup: dry-run direction=%s port=%s\n' "$label" "$direction" "$port" |
+			tee -a "$summary_file"
 		return 0
 	fi
-	info "warming up ${label} ${direction} path"
-	run_iperf_json "$family" "$target" "$json" "$direction"
+	info "warming up ${label} ${direction} path on iperf port ${port}"
+	run_iperf_json "$family" "$target" "$json" "$direction" "$port"
 	metrics="$(iperf_metrics "$json")"
 	if [[ "$metrics" == ERROR:* ]]; then
 		die "${label} warm-up iperf failed: ${metrics#ERROR:}"
@@ -613,22 +623,22 @@ warm_up_cell() {
 }
 
 validate_cell() {
-	local label="$1" target="$2" family="$3" direction="$4" min_gbps="$5"
+	local label="$1" target="$2" family="$3" direction="$4" min_gbps="$5" port="$6"
 	local i json gbps metrics metrics_line
 	for i in $(seq 1 "$RUNS"); do
 		if (( DRY_RUN_MATRIX == 1 )); then
 			if [[ "$DRY_RUN_FAIL_CELL" == "$label" ]]; then
 				die "dry-run injected failure for ${label}"
 			fi
-			printf '%s run %s: dry-run direction=%s min=%s Gbps\n' \
-				"$label" "$i" "$direction" "$min_gbps" | tee -a "$summary_file"
+			printf '%s run %s: dry-run direction=%s port=%s min=%s Gbps\n' \
+				"$label" "$i" "$direction" "$port" "$min_gbps" | tee -a "$summary_file"
 			continue
 		fi
 		local attempt=1
 		while true; do
 			json="/tmp/${label}-${i}.json"
-			info "running ${label} ${direction} iperf iteration ${i}/${RUNS}"
-			run_iperf_json "$family" "$target" "$json" "$direction"
+			info "running ${label} ${direction} iperf port ${port} iteration ${i}/${RUNS}"
+			run_iperf_json "$family" "$target" "$json" "$direction" "$port"
 			metrics="$(iperf_metrics "$json")"
 			if [[ "$metrics" == ERROR:* ]]; then
 				die "${label} iperf failed: ${metrics#ERROR:}"
@@ -669,7 +679,7 @@ PY
 
 run_performance_profile() {
 	local mode="$1"
-	local cos_state family direction family_arg target min_gbps label current_cos_state=""
+	local cos_state family direction family_arg target min_gbps port label current_cos_state=""
 	local expected=0 completed=0
 	local complete_label="smoke matrix complete"
 
@@ -682,7 +692,7 @@ run_performance_profile() {
 		ensure_cos_off_for_matrix
 	fi
 
-	while IFS=$'\t' read -r cos_state family direction family_arg target min_gbps; do
+	while IFS=$'\t' read -r cos_state family direction family_arg target min_gbps port; do
 		if [[ "$cos_state" == "cos-on" && "$current_cos_state" != "cos-on" ]]; then
 			apply_symmetric_cos_config
 			current_cos_state="cos-on"
@@ -692,8 +702,8 @@ run_performance_profile() {
 		label="$(cell_label "$cos_state" "$family" "$direction")"
 		expected=$((expected + 1))
 		printf 'smoke cell start: %s\n' "$label" | tee -a "$summary_file"
-		warm_up_cell "$label" "$target" "$family_arg" "$direction"
-		validate_cell "$label" "$target" "$family_arg" "$direction" "$min_gbps"
+		warm_up_cell "$label" "$target" "$family_arg" "$direction" "$port"
+		validate_cell "$label" "$target" "$family_arg" "$direction" "$min_gbps" "$port"
 		completed=$((completed + 1))
 		printf 'smoke cell pass: %s\n' "$label" | tee -a "$summary_file"
 	done < <(matrix_cell_specs "$mode")
@@ -713,7 +723,7 @@ run_perf_pair() {
 	sg incus-admin -c "incus exec ${ACTIVE_FW} -- bash -lc $(printf %q "rm -f ${perf_data} ${perf_report}; perf record -a -g -F 997 -o ${perf_data} -- sleep $((DURATION + 2))")" &
 	perf_pid=$!
 	sleep 1
-	run_iperf_json "$family" "$target" "$iperf_json" "$direction"
+	run_iperf_json "$family" "$target" "$iperf_json" "$direction" "$PERF_IPERF_PORT"
 	wait "$perf_pid" || perf_status=$?
 	if (( perf_status != 0 )); then
 		die "perf record for ${label} exited with status ${perf_status}"
@@ -730,6 +740,10 @@ trap cleanup EXIT
 if (( DRY_RUN_MATRIX == 1 )); then
 	info "dry-running userspace HA validation smoke matrix"
 	print_smoke_matrix_plan
+	if (( WITH_PERF == 1 )) && [[ "$SMOKE_MODE" == "matrix" ]]; then
+		printf 'perf order: before smoke matrix to keep CoS-off baseline clean\n' |
+			tee -a "$summary_file"
+	fi
 	run_performance_profile "$SMOKE_MODE"
 	info "dry-run validation summary"
 	cat "$summary_file"
@@ -776,9 +790,15 @@ run_host "ping -6 -c 2 -W 1 ${V6_TEST_TARGET} >/tmp/userspace-ping-v6.out"
 
 validate_traceroute_visibility
 
+if [[ $WITH_PERF -eq 1 && "$SMOKE_MODE" == "matrix" ]]; then
+	info "capturing perf baseline before smoke matrix applies CoS"
+	run_perf_pair perf-userspace-ipv4 "${V4_TEST_TARGET}" 4
+	run_perf_pair perf-userspace-ipv6 "${V6_TEST_TARGET}" 6
+fi
+
 run_performance_profile "$SMOKE_MODE"
 
-if [[ $WITH_PERF -eq 1 ]]; then
+if [[ $WITH_PERF -eq 1 && "$SMOKE_MODE" != "matrix" ]]; then
 	run_perf_pair perf-userspace-ipv4 "${V4_TEST_TARGET}" 4
 	run_perf_pair perf-userspace-ipv6 "${V6_TEST_TARGET}" 6
 fi

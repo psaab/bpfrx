@@ -30,6 +30,22 @@
     `go test ./pkg/dataplane ./pkg/dataplane/userspace`;
     `git diff --check`
 
+- **Timestamp**: 2026-05-24T06:08:39Z
+  - **Action**: PR #1508 review follow-up — made HA smoke-matrix iperf
+    ports explicit so CoS-on cells use port 5211's uncapped-root class
+    instead of iperf3's default 5201 / 100 Mbps class, and moved full-matrix
+    perf capture ahead of CoS fixture application so flamegraphs stay on a
+    clean CoS-off baseline.
+  - **File(s)**: `scripts/userspace-ha-validation.sh`,
+    `scripts/userspace_ha_validation_matrix_test.py`,
+    `docs/pr/1373-retire-ebpf-dataplane/README.md`,
+    `docs/pr/1373-retire-ebpf-dataplane/smoke-gates.md`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-phase-cycle.sh`; `shellcheck
+    scripts/userspace-ha-validation.sh scripts/userspace-phase-cycle.sh`;
+    `python3 -m unittest scripts.userspace_ha_validation_matrix_test`;
+    `git diff --check`
+
 - **Timestamp**: 2026-05-24T06:06:58Z
   - **Action**: PR #1505 review follow-up — changed the SYN-cookie
     `docs/feature-gaps.md` row to point at final #1477 source-removal
@@ -39,6 +55,7 @@
   - **Validation**: `rg -n "#1375|#1378|SYN-cookie|source-removal"
     docs/feature-gaps.md docs/pr/1373-retire-ebpf-dataplane/README.md
     docs/pr/1373-retire-ebpf-dataplane/plan.md`; `git diff --check`
+
 
 - **Timestamp**: 2026-05-24T04:08:49Z
   - **Action**: PR #1497 round-3 follow-up — fixed the checker/schema
