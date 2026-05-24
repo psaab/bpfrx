@@ -11,16 +11,128 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
-
-	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 // EventCallback is called for each processed event record.
 type EventCallback func(rec EventRecord, raw []byte)
 
-// EventReader reads events from a dataplane EventSource.
+// EventSource reads raw RT_FLOW event records from a runtime source.
+type EventSource interface {
+	ReadEvent() ([]byte, error)
+	Close() error
+}
+
+// rawEvent mirrors the fixed 136-byte RT_FLOW event wire shape produced by the
+// runtime event sources. The decoder below still reads by offset so that port
+// byte order stays explicit.
+type rawEvent struct {
+	Timestamp      uint64
+	SrcIP          [16]byte
+	DstIP          [16]byte
+	SrcPort        uint16
+	DstPort        uint16
+	PolicyID       uint32
+	IngressZone    uint16
+	EgressZone     uint16
+	EventType      uint8
+	Protocol       uint8
+	Action         uint8
+	AddrFamily     uint8
+	SessionPackets uint64
+	SessionBytes   uint64
+	NATSrcIP       [16]byte
+	NATDstIP       [16]byte
+	NATSrcPort     uint16
+	NATDstPort     uint16
+	Created        uint32
+	RevPackets     uint64
+	RevBytes       uint64
+	IngressIfindex uint32
+	AppID          uint16
+	CloseReason    uint8
+	PadEvent       uint8
+}
+
+const (
+	rawEventWireSize   = 136
+	rawEventStructSize = int(unsafe.Sizeof(rawEvent{}))
+)
+
+var _ [rawEventWireSize]struct{} = [rawEventStructSize]struct{}{}
+
+const (
+	closeReasonNone    = 0
+	closeReasonTimeout = 1
+	closeReasonTCPFIN  = 2
+	closeReasonTCPRST  = 3
+	closeReasonAgeOut  = 4
+	closeReasonPolicy  = 5
+)
+
+const (
+	actionDeny   = 0
+	actionPermit = 1
+	actionReject = 2
+)
+
+const (
+	eventTypeSessionOpen  = 1
+	eventTypeSessionClose = 2
+	eventTypePolicyDeny   = 3
+	eventTypeScreenDrop   = 4
+	eventTypeFilterLog    = 6
+)
+
+const (
+	addrFamilyInet  = 2
+	addrFamilyInet6 = 10
+)
+
+const protoICMPv6 = 58
+
+const (
+	screenSynFlood        = 1 << 0
+	screenICMPFlood       = 1 << 1
+	screenUDPFlood        = 1 << 2
+	screenPortScan        = 1 << 3
+	screenIPSweep         = 1 << 4
+	screenLandAttack      = 1 << 5
+	screenPingOfDeath     = 1 << 6
+	screenTearDrop        = 1 << 7
+	screenTCPSynFin       = 1 << 8
+	screenTCPNoFlag       = 1 << 9
+	screenTCPFinNoAck     = 1 << 10
+	screenWinNuke         = 1 << 11
+	screenIPSourceRoute   = 1 << 12
+	screenSynFrag         = 1 << 13
+	screenSynCookie       = 1 << 14
+	screenSessionLimitSrc = 1 << 15
+	screenSessionLimitDst = 1 << 16
+)
+
+var screenFlagNames = map[uint32]string{
+	screenSynFlood:        "SYN flood",
+	screenICMPFlood:       "ICMP flood",
+	screenUDPFlood:        "UDP flood",
+	screenPortScan:        "port scan",
+	screenIPSweep:         "IP sweep",
+	screenLandAttack:      "LAND attack",
+	screenPingOfDeath:     "ping of death",
+	screenTearDrop:        "tear drop",
+	screenTCPSynFin:       "TCP SYN+FIN",
+	screenTCPNoFlag:       "TCP no-flag",
+	screenTCPFinNoAck:     "TCP FIN-no-ACK",
+	screenWinNuke:         "WinNuke",
+	screenIPSourceRoute:   "IP source-route",
+	screenSynFrag:         "SYN fragment",
+	screenSynCookie:       "SYN cookie",
+	screenSessionLimitSrc: "session limit (source)",
+	screenSessionLimitDst: "session limit (destination)",
+}
+
+// EventReader reads events from an EventSource.
 type EventReader struct {
-	source        dataplane.EventSource
+	source        EventSource
 	buffer        *EventBuffer
 	syslogMu      sync.RWMutex
 	syslogClients []*SyslogClient
@@ -40,7 +152,7 @@ type EventReader struct {
 }
 
 // NewEventReader creates a new event reader for the given event source.
-func NewEventReader(source dataplane.EventSource, buffer *EventBuffer) *EventReader {
+func NewEventReader(source EventSource, buffer *EventBuffer) *EventReader {
 	return &EventReader{
 		source: source,
 		buffer: buffer,
@@ -217,7 +329,7 @@ func (er *EventReader) Run(ctx context.Context) {
 			}
 		}
 
-		if len(data) < int(unsafe.Sizeof(dataplane.Event{})) {
+		if len(data) < rawEventWireSize {
 			continue
 		}
 
@@ -225,12 +337,12 @@ func (er *EventReader) Run(ctx context.Context) {
 	}
 }
 
-// ProcessRawEvent feeds an RT_FLOW-format dataplane.Event record through the
+// ProcessRawEvent feeds an RT_FLOW-format event record through the
 // same enrichment, buffering, callback, and syslog/local-log fanout path used
 // by the eBPF ring-buffer reader. Userspace transports should call this rather
 // than adding decoded records directly to EventBuffer.
 func (er *EventReader) ProcessRawEvent(data []byte) bool {
-	if len(data) < int(unsafe.Sizeof(dataplane.Event{})) {
+	if len(data) < rawEventWireSize {
 		return false
 	}
 	er.logEvent(data)
@@ -238,7 +350,7 @@ func (er *EventReader) ProcessRawEvent(data []byte) bool {
 }
 
 func (er *EventReader) logEvent(data []byte) {
-	var evt dataplane.Event
+	var evt rawEvent
 	evt.Timestamp = binary.LittleEndian.Uint64(data[0:8])
 	copy(evt.SrcIP[:], data[8:24])
 	copy(evt.DstIP[:], data[24:40])
@@ -262,7 +374,7 @@ func (er *EventReader) logEvent(data []byte) {
 	}
 
 	var srcStr, dstStr, natSrcStr, natDstStr string
-	if evt.AddrFamily == dataplane.AFInet6 {
+	if evt.AddrFamily == addrFamilyInet6 {
 		srcIP := net.IP(evt.SrcIP[:])
 		dstIP := net.IP(evt.DstIP[:])
 		srcStr = fmt.Sprintf("[%s]:%d", srcIP, evt.SrcPort)
@@ -303,7 +415,7 @@ func (er *EventReader) logEvent(data []byte) {
 		OutZoneName: er.resolveZoneName(evt.EgressZone),
 	}
 
-	if evt.EventType == dataplane.EventTypeSessionClose {
+	if evt.EventType == eventTypeSessionClose {
 		rec.SessionPkts = binary.LittleEndian.Uint64(data[56:64])
 		rec.SessionBytes = binary.LittleEndian.Uint64(data[64:72])
 		// Compute elapsed time from session creation
@@ -314,23 +426,23 @@ func (er *EventReader) logEvent(data []byte) {
 			}
 		}
 	}
-	if evt.EventType == dataplane.EventTypeScreenDrop {
+	if evt.EventType == eventTypeScreenDrop {
 		rec.ScreenCheck = screenFlagName(evt.PolicyID)
 	}
-	if evt.EventType != dataplane.EventTypeSessionClose && len(data) >= 136 {
+	if evt.EventType != eventTypeSessionClose && len(data) >= rawEventWireSize {
 		rec.RuleID = binary.LittleEndian.Uint32(data[56:60])
 		rec.TermID = binary.LittleEndian.Uint32(data[60:64])
 		rec.OwnerRGID = int16(binary.LittleEndian.Uint16(data[64:66]))
-		if evt.EventType == dataplane.EventTypeFilterLog && data[134] != 0 {
+		if evt.EventType == eventTypeFilterLog && data[134] != 0 {
 			rec.Reason = filterLogSourceName(data[134])
-		} else if data[134] != dataplane.CloseReasonNone {
+		} else if data[134] != closeReasonNone {
 			rec.Reason = closeReasonName(data[134])
 		}
 	}
 
 	// Parse extended fields (offset 112+)
 	var closeReasonCode uint8
-	if len(data) >= 136 {
+	if len(data) >= rawEventWireSize {
 		rec.RevSessionPkts = binary.LittleEndian.Uint64(data[112:120])
 		rec.RevSessionBytes = binary.LittleEndian.Uint64(data[120:128])
 		ifindex := binary.LittleEndian.Uint32(data[128:132])
@@ -343,7 +455,7 @@ func (er *EventReader) logEvent(data []byte) {
 	}
 
 	// Resolve policy name (skip for screen drops which repurpose policy_id)
-	if evt.EventType != dataplane.EventTypeScreenDrop {
+	if evt.EventType != eventTypeScreenDrop {
 		rec.PolicyName = er.resolvePolicyName(evt.PolicyID)
 	}
 
@@ -372,7 +484,7 @@ func (er *EventReader) logEvent(data []byte) {
 	if outZone == "" {
 		outZone = fmt.Sprintf("%d", evt.EgressZone)
 	}
-	if evt.EventType == dataplane.EventTypeSessionClose {
+	if evt.EventType == eventTypeSessionClose {
 		slog.Info("firewall event",
 			"type", eventName,
 			"src", srcStr,
@@ -384,7 +496,7 @@ func (er *EventReader) logEvent(data []byte) {
 			"egress_zone", outZone,
 			"session_packets", rec.SessionPkts,
 			"session_bytes", rec.SessionBytes)
-	} else if evt.EventType == dataplane.EventTypeScreenDrop {
+	} else if evt.EventType == eventTypeScreenDrop {
 		slog.Info("firewall event",
 			"type", eventName,
 			"screen_check", rec.ScreenCheck,
@@ -480,16 +592,16 @@ func (er *EventReader) logEvent(data []byte) {
 	}
 }
 
-// DecodeRawEventRecord decodes the fixed dataplane.Event RT_FLOW wire shape
+// DecodeRawEventRecord decodes the fixed RT_FLOW event wire shape
 // used by the eBPF ring buffer and by the userspace event-stream adapter.
 // It is decode-only; transports that need EventBuffer, callback, local-log,
 // and syslog fanout must call EventReader.ProcessRawEvent instead.
 func DecodeRawEventRecord(data []byte) (EventRecord, bool) {
-	if len(data) < int(unsafe.Sizeof(dataplane.Event{})) {
+	if len(data) < rawEventWireSize {
 		return EventRecord{}, false
 	}
 
-	var evt dataplane.Event
+	var evt rawEvent
 	evt.Timestamp = binary.LittleEndian.Uint64(data[0:8])
 	copy(evt.SrcIP[:], data[8:24])
 	copy(evt.DstIP[:], data[24:40])
@@ -517,7 +629,7 @@ func DecodeRawEventRecord(data []byte) (EventRecord, bool) {
 
 	var srcStr, dstStr, natSrcStr, natDstStr string
 	switch evt.AddrFamily {
-	case dataplane.AFInet6:
+	case addrFamilyInet6:
 		srcIP := net.IP(evt.SrcIP[:])
 		dstIP := net.IP(evt.DstIP[:])
 		srcStr = fmt.Sprintf("[%s]:%d", srcIP, evt.SrcPort)
@@ -526,7 +638,7 @@ func DecodeRawEventRecord(data []byte) (EventRecord, bool) {
 		natDstIP := net.IP(evt.NATDstIP[:])
 		natSrcStr = fmt.Sprintf("[%s]:%d", natSrcIP, evt.NATSrcPort)
 		natDstStr = fmt.Sprintf("[%s]:%d", natDstIP, evt.NATDstPort)
-	case dataplane.AFInet:
+	case addrFamilyInet:
 		srcIP := net.IP(evt.SrcIP[:4])
 		dstIP := net.IP(evt.DstIP[:4])
 		srcStr = fmt.Sprintf("%s:%d", srcIP, evt.SrcPort)
@@ -557,22 +669,22 @@ func DecodeRawEventRecord(data []byte) (EventRecord, bool) {
 		RevSessionBytes: evt.RevBytes,
 		CloseReason:     closeReasonName(evt.CloseReason),
 	}
-	if evt.EventType != dataplane.EventTypeSessionClose {
+	if evt.EventType != eventTypeSessionClose {
 		rec.SessionPkts = 0
 		rec.SessionBytes = 0
 		rec.RuleID = binary.LittleEndian.Uint32(data[56:60])
 		rec.TermID = binary.LittleEndian.Uint32(data[60:64])
 		rec.OwnerRGID = int16(binary.LittleEndian.Uint16(data[64:66]))
-		if evt.EventType == dataplane.EventTypeFilterLog && evt.CloseReason != 0 {
+		if evt.EventType == eventTypeFilterLog && evt.CloseReason != 0 {
 			rec.Reason = filterLogSourceName(evt.CloseReason)
-		} else if evt.CloseReason != dataplane.CloseReasonNone {
+		} else if evt.CloseReason != closeReasonNone {
 			rec.Reason = closeReasonName(evt.CloseReason)
 		}
 	}
 	if evt.Timestamp > 0 && evt.Timestamp <= uint64(1<<63-1) {
 		rec.Time = time.Unix(0, int64(evt.Timestamp))
 	}
-	if evt.EventType == dataplane.EventTypeScreenDrop {
+	if evt.EventType == eventTypeScreenDrop {
 		rec.ScreenCheck = screenFlagName(evt.PolicyID)
 	}
 	return rec, true
@@ -581,13 +693,13 @@ func DecodeRawEventRecord(data []byte) (EventRecord, bool) {
 // eventCategory maps event types to category bitmask values.
 func eventCategory(eventType uint8) uint8 {
 	switch eventType {
-	case dataplane.EventTypeSessionOpen, dataplane.EventTypeSessionClose:
+	case eventTypeSessionOpen, eventTypeSessionClose:
 		return CategorySession
-	case dataplane.EventTypePolicyDeny:
+	case eventTypePolicyDeny:
 		return CategoryPolicy
-	case dataplane.EventTypeScreenDrop:
+	case eventTypeScreenDrop:
 		return CategoryScreen
-	case dataplane.EventTypeFilterLog:
+	case eventTypeFilterLog:
 		return CategoryFirewall
 	default:
 		return CategoryAll // unknown events pass all category filters
@@ -597,11 +709,11 @@ func eventCategory(eventType uint8) uint8 {
 // eventSeverity maps event types to syslog severity levels.
 func eventSeverity(eventType uint8) int {
 	switch eventType {
-	case dataplane.EventTypeScreenDrop:
+	case eventTypeScreenDrop:
 		return SyslogError
-	case dataplane.EventTypePolicyDeny:
+	case eventTypePolicyDeny:
 		return SyslogWarning
-	case dataplane.EventTypeFilterLog:
+	case eventTypeFilterLog:
 		return SyslogInfo
 	default:
 		return SyslogInfo
@@ -760,15 +872,15 @@ func splitAddrPort(addr string) (string, string) {
 
 func eventTypeName(t uint8) string {
 	switch t {
-	case dataplane.EventTypeSessionOpen:
+	case eventTypeSessionOpen:
 		return "SESSION_OPEN"
-	case dataplane.EventTypeSessionClose:
+	case eventTypeSessionClose:
 		return "SESSION_CLOSE"
-	case dataplane.EventTypePolicyDeny:
+	case eventTypePolicyDeny:
 		return "POLICY_DENY"
-	case dataplane.EventTypeScreenDrop:
+	case eventTypeScreenDrop:
 		return "SCREEN_DROP"
-	case dataplane.EventTypeFilterLog:
+	case eventTypeFilterLog:
 		return "FILTER_LOG"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", t)
@@ -794,11 +906,11 @@ func filterLogSourceName(reason uint8) string {
 
 func actionName(a uint8) string {
 	switch a {
-	case dataplane.ActionPermit:
+	case actionPermit:
 		return "permit"
-	case dataplane.ActionDeny:
+	case actionDeny:
 		return "deny"
-	case dataplane.ActionReject:
+	case actionReject:
 		return "reject"
 	default:
 		return fmt.Sprintf("unknown(%d)", a)
@@ -813,7 +925,7 @@ func protoName(p uint8) string {
 		return "UDP"
 	case 1:
 		return "ICMP"
-	case dataplane.ProtoICMPv6:
+	case protoICMPv6:
 		return "ICMPv6"
 	default:
 		return fmt.Sprintf("%d", p)
@@ -821,7 +933,7 @@ func protoName(p uint8) string {
 }
 
 func screenFlagName(flag uint32) string {
-	if name, ok := dataplane.ScreenFlagNames[flag]; ok {
+	if name, ok := screenFlagNames[flag]; ok {
 		return name
 	}
 	return fmt.Sprintf("screen(0x%x)", flag)
@@ -869,7 +981,7 @@ const (
 //	  [142]     CloseReason code
 //	Variable section (uint8 length + UTF-8 bytes each):
 //	  InZoneName, OutZoneName, PolicyName, AppName, IngressIface
-func formatBinaryRecord(evt *dataplane.Event, rec *EventRecord, severity int, closeReason uint8) []byte {
+func formatBinaryRecord(evt *rawEvent, rec *EventRecord, severity int, closeReason uint8) []byte {
 	inZone := truncStr(rec.InZoneName, 255)
 	outZone := truncStr(rec.OutZoneName, 255)
 	policyName := truncStr(rec.PolicyName, 255)
@@ -951,15 +1063,15 @@ func putLenStr(buf []byte, off int, s string) int {
 
 func closeReasonName(reason uint8) string {
 	switch reason {
-	case dataplane.CloseReasonTimeout:
+	case closeReasonTimeout:
 		return "idle Timeout"
-	case dataplane.CloseReasonTCPFIN:
+	case closeReasonTCPFIN:
 		return "TCP FIN"
-	case dataplane.CloseReasonTCPRST:
+	case closeReasonTCPRST:
 		return "TCP RST"
-	case dataplane.CloseReasonAgeOut:
+	case closeReasonAgeOut:
 		return "aged out"
-	case dataplane.CloseReasonPolicy:
+	case closeReasonPolicy:
 		return "Rejected by policy"
 	default:
 		return "N/A"

@@ -2,6 +2,38 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T20:58:00Z
+  - **Action**: PR #1451 review follow-up — extended the RT_FLOW
+    wire-offset canary across the full raw event layout and tightened
+    short-record boundary tests with nil, empty, short, and exact-size cases.
+  - **File(s)**: `pkg/logging/binary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/logging ./pkg/dataplane -count=1`;
+    `go test ./pkg/logging -run
+    'TestRawEventFieldOffsetsMatchWireFormat|TestDecodeRawEventRecordRejectsShortRecord|TestProcessRawEventRejectsShortRecord'
+    -count=1`; `git diff --check`
+
+- **Timestamp**: 2026-05-24T20:47:00Z
+  - **Action**: PR #1451 review follow-up — added direct RT_FLOW wire-offset
+    assertions and explicit short-record rejection tests for the logging event
+    decoder/reader without widening the production boundary again.
+  - **File(s)**: `pkg/logging/binary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/logging ./pkg/dataplane -count=1`;
+    `git diff --check`
+
+- **Timestamp**: 2026-05-24T19:26:45Z
+  - **Action**: #1451 logging boundary shrink — moved the logging event
+    reader to a package-local `EventSource` interface and RT_FLOW event wire
+    contract so `pkg/logging/ringbuf.go` no longer imports root
+    `pkg/dataplane`, then removed the stale #1451 allowlist/documentation
+    entry.
+  - **File(s)**: `pkg/logging/ringbuf.go`,
+    `pkg/logging/binary_test.go`,
+    `pkg/dataplane/retirement_boundary_canary_test.go`,
+    `docs/pr/1373-retire-ebpf-dataplane/README.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/logging ./pkg/dataplane -count=1`;
+    `go test ./pkg/daemon ./pkg/dataplane/userspace -count=1`;
+    `git diff --check`
+
 - **Timestamp**: 2026-05-24T18:47:00Z
   - **Action**: PR #1508 copilot follow-up — moved `IPERF_TIMEOUT` defaulting
     after argument parsing and env-file sourcing so the default tracks the

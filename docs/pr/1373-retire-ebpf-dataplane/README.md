@@ -214,14 +214,13 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/grpcapi/server_show_security_text.go` | Security text output still uses legacy counters and filter types. |
 | `pkg/grpcapi/server_show_status.go` | Status output still reads legacy dataplane state. |
 | `pkg/grpcapi/server_show_zones.go` | Zone output still uses legacy dataplane types. |
-| `pkg/logging/ringbuf.go` | Event reader still consumes the legacy `EventSource`. |
 
 ### Safe-Delete Blockers
 
 - `pkg/dataplane.DataPlane` is still load-bearing for API, gRPC, CLI, status,
-  logging, cluster session sync, daemon HA, daemon flow, and daemon apply
-  bridges listed above. Conntrack GC now enters through `SessionStore` and
-  `Telemetry` runtime-domain providers. `pkg/monitoriface` now uses a
+  cluster session sync, daemon HA, daemon flow, and daemon apply bridges listed
+  above. Conntrack GC now enters through `SessionStore` and `Telemetry`
+  runtime-domain providers. `pkg/monitoriface` now uses a
   package-local `RuntimeDataPlane`/`CounterReader` shape; CLI and gRPC adapt
   their wider dataplane fields before entering the monitor-interface package.
 - Omitted `system dataplane-type` now resolves to the userspace runtime path.
