@@ -5,18 +5,20 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 func TestFormatBinaryRecord_Basic(t *testing.T) {
-	evt := &dataplane.Event{
-		EventType:   dataplane.EventTypeSessionOpen,
+	evt := &rawEvent{
+		EventType:   eventTypeSessionOpen,
 		Protocol:    6, // TCP
-		Action:      dataplane.ActionPermit,
-		AddrFamily:  dataplane.AFInet,
+		Action:      actionPermit,
+		AddrFamily:  addrFamilyInet,
 		SrcPort:     12345,
 		DstPort:     443,
 		PolicyID:    42,
@@ -54,17 +56,17 @@ func TestFormatBinaryRecord_Basic(t *testing.T) {
 	}
 
 	// Verify event fields
-	if buf[5] != dataplane.EventTypeSessionOpen {
-		t.Errorf("event type = %d, want %d", buf[5], dataplane.EventTypeSessionOpen)
+	if buf[5] != eventTypeSessionOpen {
+		t.Errorf("event type = %d, want %d", buf[5], eventTypeSessionOpen)
 	}
 	if buf[6] != 6 {
 		t.Errorf("protocol = %d, want 6", buf[6])
 	}
-	if buf[7] != dataplane.ActionPermit {
-		t.Errorf("action = %d, want %d", buf[7], dataplane.ActionPermit)
+	if buf[7] != actionPermit {
+		t.Errorf("action = %d, want %d", buf[7], actionPermit)
 	}
-	if buf[8] != dataplane.AFInet {
-		t.Errorf("addr family = %d, want %d", buf[8], dataplane.AFInet)
+	if buf[8] != addrFamilyInet {
+		t.Errorf("addr family = %d, want %d", buf[8], addrFamilyInet)
 	}
 	if buf[9] != uint8(SyslogInfo) {
 		t.Errorf("severity = %d, want %d", buf[9], SyslogInfo)
@@ -132,12 +134,155 @@ func TestFormatBinaryRecord_Basic(t *testing.T) {
 	}
 }
 
+func TestRawEventWireContractSize(t *testing.T) {
+	if rawEventWireSize != 136 {
+		t.Fatalf("rawEventWireSize = %d, want 136", rawEventWireSize)
+	}
+	if rawEventStructSize != rawEventWireSize {
+		t.Fatalf("rawEventStructSize = %d, want wire size %d",
+			rawEventStructSize, rawEventWireSize)
+	}
+}
+
+func TestRawEventContractMatchesDataplaneEvent(t *testing.T) {
+	if rawEventWireSize != int(unsafe.Sizeof(dataplane.Event{})) {
+		t.Fatalf("rawEventWireSize = %d, dataplane.Event size = %d",
+			rawEventWireSize, unsafe.Sizeof(dataplane.Event{}))
+	}
+	if eventTypeSessionOpen != dataplane.EventTypeSessionOpen {
+		t.Fatalf("eventTypeSessionOpen = %d, want %d",
+			eventTypeSessionOpen, dataplane.EventTypeSessionOpen)
+	}
+	if eventTypeSessionClose != dataplane.EventTypeSessionClose {
+		t.Fatalf("eventTypeSessionClose = %d, want %d",
+			eventTypeSessionClose, dataplane.EventTypeSessionClose)
+	}
+	if eventTypePolicyDeny != dataplane.EventTypePolicyDeny {
+		t.Fatalf("eventTypePolicyDeny = %d, want %d",
+			eventTypePolicyDeny, dataplane.EventTypePolicyDeny)
+	}
+	if eventTypeScreenDrop != dataplane.EventTypeScreenDrop {
+		t.Fatalf("eventTypeScreenDrop = %d, want %d",
+			eventTypeScreenDrop, dataplane.EventTypeScreenDrop)
+	}
+	if eventTypeFilterLog != dataplane.EventTypeFilterLog {
+		t.Fatalf("eventTypeFilterLog = %d, want %d",
+			eventTypeFilterLog, dataplane.EventTypeFilterLog)
+	}
+	if actionDeny != dataplane.ActionDeny ||
+		actionPermit != dataplane.ActionPermit ||
+		actionReject != dataplane.ActionReject {
+		t.Fatalf("action constants drifted: logging=(%d,%d,%d) dataplane=(%d,%d,%d)",
+			actionDeny, actionPermit, actionReject,
+			dataplane.ActionDeny, dataplane.ActionPermit, dataplane.ActionReject)
+	}
+	if addrFamilyInet != dataplane.AFInet || addrFamilyInet6 != dataplane.AFInet6 {
+		t.Fatalf("address family constants drifted: logging=(%d,%d) dataplane=(%d,%d)",
+			addrFamilyInet, addrFamilyInet6, dataplane.AFInet, dataplane.AFInet6)
+	}
+	if closeReasonNone != dataplane.CloseReasonNone ||
+		closeReasonTimeout != dataplane.CloseReasonTimeout ||
+		closeReasonTCPFIN != dataplane.CloseReasonTCPFIN ||
+		closeReasonTCPRST != dataplane.CloseReasonTCPRST ||
+		closeReasonAgeOut != dataplane.CloseReasonAgeOut ||
+		closeReasonPolicy != dataplane.CloseReasonPolicy {
+		t.Fatalf("close reason constants drifted")
+	}
+	if len(screenFlagNames) != len(dataplane.ScreenFlagNames) {
+		t.Fatalf("screen flag count = %d, want %d",
+			len(screenFlagNames), len(dataplane.ScreenFlagNames))
+	}
+	for flag, name := range dataplane.ScreenFlagNames {
+		if screenFlagNames[flag] != name {
+			t.Fatalf("screen flag %d = %q, want %q",
+				flag, screenFlagNames[flag], name)
+		}
+	}
+}
+
+func TestRawEventContractMatchesBPFHeader(t *testing.T) {
+	fields := eventStructFieldsFromXPFCommon(t)
+	want := []string{
+		"__u64 timestamp",
+		"__u8 src_ip[16]",
+		"__u8 dst_ip[16]",
+		"__be16 src_port",
+		"__be16 dst_port",
+		"__u32 policy_id",
+		"__u16 ingress_zone",
+		"__u16 egress_zone",
+		"__u8 event_type",
+		"__u8 protocol",
+		"__u8 action",
+		"__u8 addr_family",
+		"__u64 session_packets",
+		"__u64 session_bytes",
+		"__u8 nat_src_ip[16]",
+		"__u8 nat_dst_ip[16]",
+		"__be16 nat_src_port",
+		"__be16 nat_dst_port",
+		"__u32 created",
+		"__u64 rev_packets",
+		"__u64 rev_bytes",
+		"__u32 ingress_ifindex",
+		"__u16 app_id",
+		"__u8 close_reason",
+		"__u8 pad_event",
+	}
+	if len(fields) != len(want) {
+		t.Fatalf("struct event field count = %d, want %d\nfields: %v",
+			len(fields), len(want), fields)
+	}
+	for i := range want {
+		if fields[i] != want[i] {
+			t.Fatalf("struct event field %d = %q, want %q\nfields: %v",
+				i, fields[i], want[i], fields)
+		}
+	}
+}
+
+func eventStructFieldsFromXPFCommon(t *testing.T) []string {
+	t.Helper()
+	path := filepath.Join("..", "..", "bpf", "headers", "xpf_common.h")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	text := string(data)
+	start := strings.Index(text, "struct event {")
+	if start < 0 {
+		t.Fatalf("%s missing struct event", path)
+	}
+	bodyStart := start + len("struct event {")
+	end := strings.Index(text[bodyStart:], "\n};")
+	if end < 0 {
+		t.Fatalf("%s struct event missing terminator", path)
+	}
+	body := text[bodyStart : bodyStart+end]
+	var fields []string
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "/*") || strings.HasPrefix(line, "*") {
+			continue
+		}
+		if idx := strings.Index(line, "/*"); idx >= 0 {
+			line = strings.TrimSpace(line[:idx])
+		}
+		line = strings.TrimSuffix(line, ";")
+		line = strings.Join(strings.Fields(line), " ")
+		if line != "" {
+			fields = append(fields, line)
+		}
+	}
+	return fields
+}
+
 func TestFormatBinaryRecord_SessionClose(t *testing.T) {
-	evt := &dataplane.Event{
-		EventType:   dataplane.EventTypeSessionClose,
+	evt := &rawEvent{
+		EventType:   eventTypeSessionClose,
 		Protocol:    6,
-		Action:      dataplane.ActionPermit,
-		AddrFamily:  dataplane.AFInet,
+		Action:      actionPermit,
+		AddrFamily:  addrFamilyInet,
 		SrcPort:     54321,
 		DstPort:     80,
 		PolicyID:    10,
@@ -162,7 +307,7 @@ func TestFormatBinaryRecord_SessionClose(t *testing.T) {
 		IngressIface:    "trust0",
 	}
 
-	buf := formatBinaryRecord(evt, rec, SyslogInfo, dataplane.CloseReasonTCPFIN)
+	buf := formatBinaryRecord(evt, rec, SyslogInfo, closeReasonTCPFIN)
 
 	// Verify session stats
 	pkts := binary.LittleEndian.Uint64(buf[98:106])
@@ -189,8 +334,8 @@ func TestFormatBinaryRecord_SessionClose(t *testing.T) {
 	}
 
 	// Verify close reason
-	if buf[142] != dataplane.CloseReasonTCPFIN {
-		t.Errorf("close reason = %d, want %d", buf[142], dataplane.CloseReasonTCPFIN)
+	if buf[142] != closeReasonTCPFIN {
+		t.Errorf("close reason = %d, want %d", buf[142], closeReasonTCPFIN)
 	}
 
 	// Verify ingress iface in variable section
@@ -206,11 +351,11 @@ func TestFormatBinaryRecord_SessionClose(t *testing.T) {
 }
 
 func TestFormatBinaryRecord_IPv6(t *testing.T) {
-	evt := &dataplane.Event{
-		EventType:   dataplane.EventTypeSessionOpen,
+	evt := &rawEvent{
+		EventType:   eventTypeSessionOpen,
 		Protocol:    6,
-		Action:      dataplane.ActionPermit,
-		AddrFamily:  dataplane.AFInet6,
+		Action:      actionPermit,
+		AddrFamily:  addrFamilyInet6,
 		SrcPort:     8080,
 		DstPort:     443,
 		IngressZone: 1,
@@ -231,8 +376,8 @@ func TestFormatBinaryRecord_IPv6(t *testing.T) {
 	buf := formatBinaryRecord(evt, rec, SyslogInfo, 0)
 
 	// Verify IPv6 addresses
-	if buf[8] != dataplane.AFInet6 {
-		t.Errorf("addr family = %d, want %d", buf[8], dataplane.AFInet6)
+	if buf[8] != addrFamilyInet6 {
+		t.Errorf("addr family = %d, want %d", buf[8], addrFamilyInet6)
 	}
 	gotSrc := net.IP(buf[18:34])
 	if !gotSrc.Equal(srcV6) {
@@ -245,10 +390,10 @@ func TestFormatBinaryRecord_IPv6(t *testing.T) {
 }
 
 func TestFormatBinaryRecord_EmptyStrings(t *testing.T) {
-	evt := &dataplane.Event{
-		EventType: dataplane.EventTypePolicyDeny,
+	evt := &rawEvent{
+		EventType: eventTypePolicyDeny,
 		Protocol:  17,
-		Action:    dataplane.ActionDeny,
+		Action:    actionDeny,
 	}
 	rec := &EventRecord{
 		Time:      time.Now(),
@@ -273,19 +418,19 @@ func TestFormatBinaryRecord_EmptyStrings(t *testing.T) {
 
 func TestFormatBinaryRecord_SelfFraming(t *testing.T) {
 	// Verify the record length field matches actual data — needed for TCP stream parsing
-	evt := &dataplane.Event{
-		EventType:   dataplane.EventTypeSessionOpen,
+	evt := &rawEvent{
+		EventType:   eventTypeSessionOpen,
 		Protocol:    6,
 		IngressZone: 1,
 	}
 	rec := &EventRecord{
-		Time:        time.Now(),
-		InZoneName:  "very-long-zone-name-for-testing",
-		OutZoneName: "another-zone",
-		PolicyName:  "my-policy",
-		AppName:     "custom-app",
+		Time:         time.Now(),
+		InZoneName:   "very-long-zone-name-for-testing",
+		OutZoneName:  "another-zone",
+		PolicyName:   "my-policy",
+		AppName:      "custom-app",
 		IngressIface: "ge-0/0/0",
-		SessionID:   99,
+		SessionID:    99,
 	}
 
 	buf := formatBinaryRecord(evt, rec, SyslogInfo, 0)
@@ -340,8 +485,8 @@ func TestSyslogSendBinary_UDP(t *testing.T) {
 	defer client.Close()
 
 	// Create a minimal binary record
-	evt := &dataplane.Event{
-		EventType: dataplane.EventTypeSessionOpen,
+	evt := &rawEvent{
+		EventType: eventTypeSessionOpen,
 		Protocol:  6,
 	}
 	rec := &EventRecord{
@@ -400,8 +545,8 @@ func TestSyslogSendBinary_TCP(t *testing.T) {
 	}
 	defer client.Close()
 
-	evt := &dataplane.Event{
-		EventType: dataplane.EventTypeSessionOpen,
+	evt := &rawEvent{
+		EventType: eventTypeSessionOpen,
 		Protocol:  17,
 	}
 	rec := &EventRecord{
@@ -439,10 +584,10 @@ func TestLocalLogWriterSendBinary(t *testing.T) {
 	}
 	defer lw.Close()
 
-	evt := &dataplane.Event{
-		EventType:   dataplane.EventTypeSessionClose,
+	evt := &rawEvent{
+		EventType:   eventTypeSessionClose,
 		Protocol:    6,
-		Action:      dataplane.ActionPermit,
+		Action:      actionPermit,
 		IngressZone: 1,
 		EgressZone:  2,
 	}
@@ -456,7 +601,7 @@ func TestLocalLogWriterSendBinary(t *testing.T) {
 		SessionID:    10,
 	}
 
-	binData := formatBinaryRecord(evt, rec, SyslogInfo, dataplane.CloseReasonTimeout)
+	binData := formatBinaryRecord(evt, rec, SyslogInfo, closeReasonTimeout)
 
 	if err := lw.SendBinary(binData); err != nil {
 		t.Fatal(err)
@@ -496,7 +641,7 @@ func TestLocalLogWriterSendBinary_Rotation(t *testing.T) {
 	}
 	defer lw.Close()
 
-	evt := &dataplane.Event{EventType: dataplane.EventTypeSessionOpen}
+	evt := &rawEvent{EventType: eventTypeSessionOpen}
 	rec := &EventRecord{Time: time.Now(), SessionID: 1}
 	binData := formatBinaryRecord(evt, rec, SyslogInfo, 0)
 

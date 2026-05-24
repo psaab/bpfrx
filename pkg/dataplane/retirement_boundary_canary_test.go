@@ -63,7 +63,6 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"pkg/grpcapi/server_show_security_text.go": "security text output still uses legacy counters and filter types",
 	"pkg/grpcapi/server_show_status.go":        "status output still reads legacy dataplane state",
 	"pkg/grpcapi/server_show_zones.go":         "zone output still uses legacy dataplane types",
-	"pkg/logging/ringbuf.go":                   "event reader still consumes the legacy EventSource",
 }
 
 var dpdkEBPFImportAllowlist = map[string]string{

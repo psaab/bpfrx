@@ -2,6 +2,20 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T19:26:45Z
+  - **Action**: #1451 logging boundary shrink — moved the logging event
+    reader to a package-local `EventSource` interface and RT_FLOW event wire
+    contract so `pkg/logging/ringbuf.go` no longer imports root
+    `pkg/dataplane`, then removed the stale #1451 allowlist/documentation
+    entry.
+  - **File(s)**: `pkg/logging/ringbuf.go`,
+    `pkg/logging/binary_test.go`,
+    `pkg/dataplane/retirement_boundary_canary_test.go`,
+    `docs/pr/1373-retire-ebpf-dataplane/README.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/logging ./pkg/dataplane -count=1`;
+    `go test ./pkg/daemon ./pkg/dataplane/userspace -count=1`;
+    `git diff --check`
+
 - **Timestamp**: 2026-05-24T18:47:00Z
   - **Action**: PR #1508 copilot follow-up — moved `IPERF_TIMEOUT` defaulting
     after argument parsing and env-file sourcing so the default tracks the
