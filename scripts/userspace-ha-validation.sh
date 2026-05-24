@@ -20,6 +20,14 @@ PREFERRED_ACTIVE_RGS="${PREFERRED_ACTIVE_RGS:-1 2}"
 IPERF_TIMEOUT="${IPERF_TIMEOUT:-$((DURATION + 15))}"
 V4_TEST_TARGET="${V4_TEST_TARGET:-172.16.80.200}"
 V6_TEST_TARGET="${V6_TEST_TARGET:-2001:559:8585:80::200}"
+# Iperf port selection for the smoke harness:
+# - FAST_IPERF_PORT: current-CoS fast/readiness cells.
+# - MATRIX_COS_OFF_IPERF_PORT: full-matrix CoS-off cells.
+# - MATRIX_COS_ON_IPERF_PORT: full-matrix CoS-on cells; default 5211
+#   matches the uncapped class in test/incus/cos-iperf-symmetric.set.
+# - PERF_IPERF_PORT: perf profiling traffic; captured pre-matrix in matrix mode.
+# Keep these defaults in sync with docs/pr/1373-retire-ebpf-dataplane/smoke-gates.md.
+# All four values are validated as TCP ports before any remote iperf command runs.
 FAST_IPERF_PORT="${FAST_IPERF_PORT:-5201}"
 MATRIX_COS_OFF_IPERF_PORT="${MATRIX_COS_OFF_IPERF_PORT:-5201}"
 MATRIX_COS_ON_IPERF_PORT="${MATRIX_COS_ON_IPERF_PORT:-5211}"
@@ -414,18 +422,20 @@ validate_traceroute_visibility() {
 
 run_iperf_json() {
 	local family="$1" target="$2" outfile="$3" direction="${4:-push}" port="${5:-5201}"
-	local cmd tmpfile timeout_sec reverse_arg=""
+	local cmd tmpfile timeout_sec reverse_arg="" port_arg
 	tmpfile="${outfile}.tmp"
 	timeout_sec="${IPERF_TIMEOUT}s"
+	validate_port run_iperf_json_port "$port"
+	printf -v port_arg '%q' "$port"
 	case "$direction" in
 	push) reverse_arg="" ;;
 	reverse) reverse_arg=" -R" ;;
 	*) die "unknown iperf direction: ${direction}" ;;
 	esac
 	if [[ "$family" == "6" ]]; then
-		cmd="rm -f ${outfile} ${outfile}.err ${tmpfile}; if timeout -k 2 ${timeout_sec} iperf3 -6 -J -c ${target} -p ${port} -P ${PARALLEL} -t ${DURATION}${reverse_arg} > ${tmpfile} 2>${outfile}.err; then mv ${tmpfile} ${outfile}; else rc=\$?; rm -f ${tmpfile} ${outfile}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile}.err; else echo \"iperf3 exited with status \$rc\" >> ${outfile}.err; fi; fi"
+		cmd="rm -f ${outfile} ${outfile}.err ${tmpfile}; if timeout -k 2 ${timeout_sec} iperf3 -6 -J -c ${target} -p ${port_arg} -P ${PARALLEL} -t ${DURATION}${reverse_arg} > ${tmpfile} 2>${outfile}.err; then mv ${tmpfile} ${outfile}; else rc=\$?; rm -f ${tmpfile} ${outfile}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile}.err; else echo \"iperf3 exited with status \$rc\" >> ${outfile}.err; fi; fi"
 	else
-		cmd="rm -f ${outfile} ${outfile}.err ${tmpfile}; if timeout -k 2 ${timeout_sec} iperf3 -J -c ${target} -p ${port} -P ${PARALLEL} -t ${DURATION}${reverse_arg} > ${tmpfile} 2>${outfile}.err; then mv ${tmpfile} ${outfile}; else rc=\$?; rm -f ${tmpfile} ${outfile}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile}.err; else echo \"iperf3 exited with status \$rc\" >> ${outfile}.err; fi; fi"
+		cmd="rm -f ${outfile} ${outfile}.err ${tmpfile}; if timeout -k 2 ${timeout_sec} iperf3 -J -c ${target} -p ${port_arg} -P ${PARALLEL} -t ${DURATION}${reverse_arg} > ${tmpfile} 2>${outfile}.err; then mv ${tmpfile} ${outfile}; else rc=\$?; rm -f ${tmpfile} ${outfile}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile}.err; else echo \"iperf3 exited with status \$rc\" >> ${outfile}.err; fi; fi"
 	fi
 	run_host "$cmd"
 }

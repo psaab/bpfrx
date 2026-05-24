@@ -161,17 +161,27 @@ class UserspaceHASmokeMatrixTests(unittest.TestCase):
             result.stdout,
         )
 
-    def test_rejects_invalid_iperf_port_override(self) -> None:
-        result = self.run_validator(
-            "--smoke-matrix",
-            check=False,
-            extra_env={"MATRIX_COS_ON_IPERF_PORT": "5211;echo bad"},
+    def test_rejects_invalid_iperf_port_overrides(self) -> None:
+        port_vars = (
+            "FAST_IPERF_PORT",
+            "MATRIX_COS_OFF_IPERF_PORT",
+            "MATRIX_COS_ON_IPERF_PORT",
+            "PERF_IPERF_PORT",
         )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(
-            "MATRIX_COS_ON_IPERF_PORT must be a numeric port",
-            result.stderr,
-        )
+        bad_values = ("0", "65536", "5211;echo bad")
+        for var_name in port_vars:
+            for bad_value in bad_values:
+                with self.subTest(var_name=var_name, bad_value=bad_value):
+                    result = self.run_validator(
+                        "--smoke-matrix",
+                        check=False,
+                        extra_env={var_name: bad_value},
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        f"{var_name} must be a numeric port",
+                        result.stderr,
+                    )
 
 
 if __name__ == "__main__":

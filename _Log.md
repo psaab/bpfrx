@@ -2,6 +2,20 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T18:01:21Z
+  - **Action**: PR #1508 review follow-up — added script-local
+    documentation for the four smoke-matrix iperf port overrides, hardened
+    remote iperf port argument construction, and expanded invalid-port
+    dry-run coverage across all four override variables plus boundary
+    values.
+  - **File(s)**: `scripts/userspace-ha-validation.sh`,
+    `scripts/userspace_ha_validation_matrix_test.py`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-phase-cycle.sh`; `shellcheck
+    scripts/userspace-ha-validation.sh scripts/userspace-phase-cycle.sh`;
+    `python3 -m unittest scripts.userspace_ha_validation_matrix_test`;
+    `git diff --check`
+
 - **Timestamp**: 2026-05-24T16:56:30Z
   - **Action**: PR #1506 review follow-up — normalized RFC3339 leap-second
     validation through UTC before accepting `:60` offset forms, and reported
