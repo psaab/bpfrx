@@ -47,6 +47,9 @@ BPFRX_CLUSTER_ENV="$BPFRX_CLUSTER_ENV" ./test/incus/cluster-setup.sh deploy all
 This gate runs normal client push plus `iperf3 -R` for IPv4 and IPv6 from
 `loss:cluster-userspace-host`. It stores raw iperf JSON and parsed collapse
 metrics under `$ARTIFACT_ROOT/cos-off`.
+`scripts/iperf-json-metrics.py` uses the receiver-side iperf end summary when
+that field is present, so reverse-mode checks gate on received throughput rather
+than the client-side sent counter.
 
 ```bash
 set -euo pipefail
@@ -348,7 +351,8 @@ explicit port 5211 so the matrix hits the uncapped-root class instead of
 iperf3's default 5201 / 100 Mbps class. The matrix summary names each
 `cos-off-*` and `cos-on-*` cell, including the iperf3 port, and
 only prints `smoke matrix complete: 8/8 cells passed` after every required cell
-has passed.
+has passed. Reverse cells use the receiver-side iperf summary for throughput
+thresholds.
 
 The validator may pin RG ownership before the steady-state checks, but it is
 not the low-latency failover/failback flow-survival proof. Treat any validator

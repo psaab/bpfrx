@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -13,6 +14,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VALIDATOR = PROJECT_ROOT / "scripts" / "userspace-ha-validation.sh"
+IPERF_METRICS = PROJECT_ROOT / "scripts" / "iperf-json-metrics.py"
 
 
 class UserspaceHASmokeMatrixTests(unittest.TestCase):
@@ -62,6 +64,25 @@ class UserspaceHASmokeMatrixTests(unittest.TestCase):
                 f"{result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
             )
         return result
+
+    def run_iperf_metrics(self, payload: dict) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = Path(tmp) / "iperf.json"
+            json_path.write_text(json.dumps(payload), encoding="utf-8")
+            result = subprocess.run(
+                ["python3", str(IPERF_METRICS), str(json_path)],
+                cwd=PROJECT_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        if result.returncode != 0:
+            self.fail(
+                "iperf metrics exited "
+                f"{result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+        return json.loads(result.stdout)
 
     def test_full_matrix_lists_all_cos_direction_cells(self) -> None:
         result = self.run_validator("--smoke-matrix")
@@ -142,6 +163,25 @@ class UserspaceHASmokeMatrixTests(unittest.TestCase):
         # Once from the live dry-run stream and once from the final summary.
         self.assertEqual(result.stdout.count("cos-off precheck: dry-run"), 2)
 
+    def test_duration_cli_updates_default_iperf_timeout(self) -> None:
+        result = self.run_validator("--smoke-matrix", "--duration", "17")
+        self.assertIn(
+            "iperf runtime: runs=1 duration=17 parallel=1 timeout=32",
+            result.stdout,
+        )
+
+    def test_explicit_iperf_timeout_overrides_duration_default(self) -> None:
+        result = self.run_validator(
+            "--smoke-matrix",
+            "--duration",
+            "17",
+            extra_env={"IPERF_TIMEOUT": "99"},
+        )
+        self.assertIn(
+            "iperf runtime: runs=1 duration=17 parallel=1 timeout=99",
+            result.stdout,
+        )
+
     def test_matrix_port_overrides_are_reflected_in_plan(self) -> None:
         result = self.run_validator(
             "--smoke-matrix",
@@ -168,7 +208,7 @@ class UserspaceHASmokeMatrixTests(unittest.TestCase):
             "MATRIX_COS_ON_IPERF_PORT",
             "PERF_IPERF_PORT",
         )
-        bad_values = ("0", "65536", "5211;echo bad")
+        bad_values = ("", "0", "65536", "5211;echo bad")
         for var_name in port_vars:
             for bad_value in bad_values:
                 with self.subTest(var_name=var_name, bad_value=bad_value):
@@ -182,6 +222,62 @@ class UserspaceHASmokeMatrixTests(unittest.TestCase):
                         f"{var_name} must be a numeric port",
                         result.stderr,
                     )
+
+    def test_rejects_invalid_iperf_runtime_overrides(self) -> None:
+        bad_cases = (
+            ("DURATION", ""),
+            ("DURATION", "5;echo bad"),
+            ("PARALLEL", "0"),
+            ("PARALLEL", "6;echo bad"),
+            ("IPERF_TIMEOUT", "0"),
+            ("IPERF_TIMEOUT", "20;echo bad"),
+        )
+        for var_name, bad_value in bad_cases:
+            with self.subTest(var_name=var_name, bad_value=bad_value):
+                result = self.run_validator(
+                    "--smoke-matrix",
+                    check=False,
+                    extra_env={var_name: bad_value},
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    f"{var_name} must be a positive integer",
+                    result.stderr,
+                )
+
+    def test_run_iperf_json_requires_explicit_escaped_port(self) -> None:
+        script = VALIDATOR.read_text(encoding="utf-8")
+        self.assertNotIn('port="${5:-5201}"', script)
+        self.assertIn("run_iperf_json requires an explicit iperf port", script)
+        self.assertIn("printf -v port_arg '%q' \"$port\"", script)
+        self.assertIn("printf -v target_arg '%q' \"$target\"", script)
+        self.assertIn("printf -v outfile_arg '%q' \"$outfile\"", script)
+        self.assertIn("printf -v outfile_err_arg '%q' \"${outfile}.err\"", script)
+        self.assertIn("printf -v tmpfile_arg '%q' \"$tmpfile\"", script)
+        self.assertIn("printf -v timeout_sec_arg '%q' \"$timeout_sec\"", script)
+        self.assertIn("printf -v parallel_arg '%q' \"$PARALLEL\"", script)
+        self.assertIn("printf -v duration_arg '%q' \"$DURATION\"", script)
+
+    def test_iperf_metrics_prefers_receiver_summary(self) -> None:
+        metrics = self.run_iperf_metrics(
+            {
+                "start": {"test_start": {"protocol": "TCP"}},
+                "end": {
+                    "sum_sent": {
+                        "bits_per_second": 1_000_000,
+                        "retransmits": 7,
+                        "end": 1.0,
+                    },
+                    "sum_received": {
+                        "bits_per_second": 22_000_000_000,
+                        "end": 5.0,
+                    },
+                },
+            }
+        )
+        self.assertEqual(metrics["avg_gbps"], 22.0)
+        self.assertEqual(metrics["retransmits"], 7)
+        self.assertEqual(metrics["observed_end_sec"], 5.0)
 
 
 if __name__ == "__main__":

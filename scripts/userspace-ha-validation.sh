@@ -4,9 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${BPFRX_CLUSTER_ENV:-${PROJECT_ROOT}/test/incus/loss-userspace-cluster.env}"
-RUNS="${RUNS:-3}"
-DURATION="${DURATION:-5}"
-PARALLEL="${PARALLEL:-6}"
+RUNS="${RUNS-3}"
+DURATION="${DURATION-5}"
+PARALLEL="${PARALLEL-6}"
 MIN_GBPS_V4="${MIN_GBPS_V4:-18.0}"
 MIN_GBPS_V6="${MIN_GBPS_V6:-18.0}"
 MARGINAL_GBPS_EPSILON="${MARGINAL_GBPS_EPSILON:-0.25}"
@@ -17,21 +17,21 @@ IPERF_STALL_GBPS="${IPERF_STALL_GBPS:-0.25}"
 IPERF_TAIL_WINDOW="${IPERF_TAIL_WINDOW:-2}"
 PREFERRED_ACTIVE_NODE="${PREFERRED_ACTIVE_NODE:-0}"
 PREFERRED_ACTIVE_RGS="${PREFERRED_ACTIVE_RGS:-1 2}"
-IPERF_TIMEOUT="${IPERF_TIMEOUT:-$((DURATION + 15))}"
 V4_TEST_TARGET="${V4_TEST_TARGET:-172.16.80.200}"
 V6_TEST_TARGET="${V6_TEST_TARGET:-2001:559:8585:80::200}"
 # Iperf port selection for the smoke harness:
-# - FAST_IPERF_PORT: current-CoS fast/readiness cells.
-# - MATRIX_COS_OFF_IPERF_PORT: full-matrix CoS-off cells.
+# - FAST_IPERF_PORT: current-CoS fast/readiness cells, default 5201.
+# - MATRIX_COS_OFF_IPERF_PORT: full-matrix CoS-off cells, default 5201.
 # - MATRIX_COS_ON_IPERF_PORT: full-matrix CoS-on cells; default 5211
 #   matches the uncapped class in test/incus/cos-iperf-symmetric.set.
-# - PERF_IPERF_PORT: perf profiling traffic; captured pre-matrix in matrix mode.
+# - PERF_IPERF_PORT: perf profiling traffic; captured pre-matrix in matrix
+#   mode, default 5201.
 # Keep these defaults in sync with docs/pr/1373-retire-ebpf-dataplane/smoke-gates.md.
 # All four values are validated as TCP ports before any remote iperf command runs.
-FAST_IPERF_PORT="${FAST_IPERF_PORT:-5201}"
-MATRIX_COS_OFF_IPERF_PORT="${MATRIX_COS_OFF_IPERF_PORT:-5201}"
-MATRIX_COS_ON_IPERF_PORT="${MATRIX_COS_ON_IPERF_PORT:-5211}"
-PERF_IPERF_PORT="${PERF_IPERF_PORT:-5201}"
+FAST_IPERF_PORT="${FAST_IPERF_PORT-5201}"
+MATRIX_COS_OFF_IPERF_PORT="${MATRIX_COS_OFF_IPERF_PORT-5201}"
+MATRIX_COS_ON_IPERF_PORT="${MATRIX_COS_ON_IPERF_PORT-5211}"
+PERF_IPERF_PORT="${PERF_IPERF_PORT-5201}"
 MTR_V4_TARGET="${MTR_V4_TARGET:-1.1.1.1}"
 MTR_V6_TARGET="${MTR_V6_TARGET:-2607:f8b0:4005:814::200e}"
 MTR_REPORT_CYCLES="${MTR_REPORT_CYCLES:-1}"
@@ -85,11 +85,32 @@ validate_port() {
 	fi
 }
 
+validate_positive_int() {
+	local name="$1" value="$2"
+	if ! [[ "$value" =~ ^[0-9]+$ ]] ||
+		((${#value} > 9)) ||
+		((10#$value < 1)); then
+		die "${name} must be a positive integer, got: ${value}"
+	fi
+}
+
 validate_iperf_ports() {
 	validate_port FAST_IPERF_PORT "$FAST_IPERF_PORT"
 	validate_port MATRIX_COS_OFF_IPERF_PORT "$MATRIX_COS_OFF_IPERF_PORT"
 	validate_port MATRIX_COS_ON_IPERF_PORT "$MATRIX_COS_ON_IPERF_PORT"
 	validate_port PERF_IPERF_PORT "$PERF_IPERF_PORT"
+}
+
+validate_iperf_runtime_knobs() {
+	validate_positive_int RUNS "$RUNS"
+	validate_positive_int DURATION "$DURATION"
+	validate_positive_int PARALLEL "$PARALLEL"
+	validate_positive_int IPERF_TIMEOUT "$IPERF_TIMEOUT"
+}
+
+default_iperf_timeout() {
+	validate_positive_int DURATION "$DURATION"
+	IPERF_TIMEOUT="${IPERF_TIMEOUT-$((10#$DURATION + 15))}"
 }
 
 normalize_smoke_mode() {
@@ -421,25 +442,34 @@ validate_traceroute_visibility() {
 }
 
 run_iperf_json() {
-	local family="$1" target="$2" outfile="$3" direction="${4:-push}" port="${5:-5201}"
-	local cmd tmpfile timeout_sec reverse_arg="" port_arg target_arg outfile_arg outfile_err_arg tmpfile_arg
+	if (( $# < 5 )); then
+		die "run_iperf_json requires an explicit iperf port"
+	fi
+	local family="$1" target="$2" outfile="$3" direction="${4:-push}" port="$5"
+	local cmd tmpfile timeout_sec reverse_arg=""
+	local port_arg target_arg outfile_arg outfile_err_arg tmpfile_arg
+	local timeout_sec_arg parallel_arg duration_arg
 	tmpfile="${outfile}.tmp"
 	timeout_sec="${IPERF_TIMEOUT}s"
+	validate_iperf_runtime_knobs
 	validate_port run_iperf_json_port "$port"
 	printf -v port_arg '%q' "$port"
 	printf -v target_arg '%q' "$target"
 	printf -v outfile_arg '%q' "$outfile"
 	printf -v outfile_err_arg '%q' "${outfile}.err"
 	printf -v tmpfile_arg '%q' "$tmpfile"
+	printf -v timeout_sec_arg '%q' "$timeout_sec"
+	printf -v parallel_arg '%q' "$PARALLEL"
+	printf -v duration_arg '%q' "$DURATION"
 	case "$direction" in
 	push) reverse_arg="" ;;
 	reverse) reverse_arg=" -R" ;;
 	*) die "unknown iperf direction: ${direction}" ;;
 	esac
 	if [[ "$family" == "6" ]]; then
-		cmd="rm -f ${outfile_arg} ${outfile_err_arg} ${tmpfile_arg}; if timeout -k 2 ${timeout_sec} iperf3 -6 -J -c ${target_arg} -p ${port_arg} -P ${PARALLEL} -t ${DURATION}${reverse_arg} > ${tmpfile_arg} 2>${outfile_err_arg}; then mv ${tmpfile_arg} ${outfile_arg}; else rc=\$?; rm -f ${tmpfile_arg} ${outfile_arg}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile_err_arg}; else echo \"iperf3 exited with status \$rc\" >> ${outfile_err_arg}; fi; fi"
+		cmd="rm -f ${outfile_arg} ${outfile_err_arg} ${tmpfile_arg}; if timeout -k 2 ${timeout_sec_arg} iperf3 -6 -J -c ${target_arg} -p ${port_arg} -P ${parallel_arg} -t ${duration_arg}${reverse_arg} > ${tmpfile_arg} 2>${outfile_err_arg}; then mv ${tmpfile_arg} ${outfile_arg}; else rc=\$?; rm -f ${tmpfile_arg} ${outfile_arg}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile_err_arg}; else echo \"iperf3 exited with status \$rc\" >> ${outfile_err_arg}; fi; fi"
 	else
-		cmd="rm -f ${outfile_arg} ${outfile_err_arg} ${tmpfile_arg}; if timeout -k 2 ${timeout_sec} iperf3 -J -c ${target_arg} -p ${port_arg} -P ${PARALLEL} -t ${DURATION}${reverse_arg} > ${tmpfile_arg} 2>${outfile_err_arg}; then mv ${tmpfile_arg} ${outfile_arg}; else rc=\$?; rm -f ${tmpfile_arg} ${outfile_arg}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile_err_arg}; else echo \"iperf3 exited with status \$rc\" >> ${outfile_err_arg}; fi; fi"
+		cmd="rm -f ${outfile_arg} ${outfile_err_arg} ${tmpfile_arg}; if timeout -k 2 ${timeout_sec_arg} iperf3 -J -c ${target_arg} -p ${port_arg} -P ${parallel_arg} -t ${duration_arg}${reverse_arg} > ${tmpfile_arg} 2>${outfile_err_arg}; then mv ${tmpfile_arg} ${outfile_arg}; else rc=\$?; rm -f ${tmpfile_arg} ${outfile_arg}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile_err_arg}; else echo \"iperf3 exited with status \$rc\" >> ${outfile_err_arg}; fi; fi"
 	fi
 	run_host "$cmd"
 }
@@ -768,6 +798,8 @@ run_perf_pair() {
 
 normalize_smoke_mode
 validate_iperf_ports
+default_iperf_timeout
+validate_iperf_runtime_knobs
 
 summary_file="$(mktemp)"
 COS_OFF_MATRIX_PRECHECKED=0
@@ -777,6 +809,9 @@ trap cleanup EXIT
 if (( DRY_RUN_MATRIX == 1 )); then
 	info "dry-running userspace HA validation smoke matrix"
 	print_smoke_matrix_plan
+	printf 'iperf runtime: runs=%s duration=%s parallel=%s timeout=%s\n' \
+		"$RUNS" "$DURATION" "$PARALLEL" "$IPERF_TIMEOUT" |
+		tee -a "$summary_file"
 	if (( WITH_PERF == 1 )) && [[ "$SMOKE_MODE" == "matrix" ]]; then
 		ensure_cos_off_for_matrix
 		printf 'perf order: before smoke matrix to keep CoS-off baseline clean\n' |
