@@ -156,24 +156,24 @@ message and at most one output message. Nothing to "drain".
 ### Hot-path layout
 
 - Worker holds a `WgWorkerScratch` with `encap_out: RefCell<Vec<u8>>`
-  and `decap_out: RefCell<Vec<u8>>` (see `scratch.rs:17-21`), each
+  and `decap_out: RefCell<Vec<u8>>` (see `scratch.rs:18-25`), each
   sized to the worker's `max_frame` at startup
-  (`WgWorkerScratch::new(max_frame)` in `scratch.rs:25-30`; the
+  (`WgWorkerScratch::new(max_frame)` in `scratch.rs:27-33`; the
   integration PR will pass `UMEM_FRAME_SIZE` from
   `afxdp/mod.rs:175`, currently 4096). Separate per-direction buffers
   with `RefCell` interior mutability — never reallocated; the cells
   are entered exclusively per packet because each worker is
   single-threaded inside its poll loop.
 - Engine peer routing (peers vec + pubkey→index map + AllowedIPs)
-  lives in a single `ArcSwap<PeerTable>` (`engine.rs:258`) so the
+  lives in a single `ArcSwap<PeerTable>` (`engine.rs:262`) so the
   hot path observes the three sub-fields as one atomic snapshot
   (`peer_arc` does an `ArcSwap::load` only — no lock). Per-peer
   session state (`peer.current` / `peer.previous`) is
   `RwLock<Option<Arc<WgSession>>>` and ingress demux
   (`sessions_by_local_index`) is `RwLock<FxHashMap<u32, Arc<WgSession>>>`,
   so encap takes one `RwLock::read` on `peer.current`
-  (`engine.rs:506-510`) and decap takes one `RwLock::read` on
-  `sessions_by_local_index` (`engine.rs:643-649`). Both are
+  (`engine.rs:510-514`) and decap takes one `RwLock::read` on
+  `sessions_by_local_index` (`engine.rs:647-653`). Both are
   uncontended in steady state (single-writer at slow-path session
   install / rotate), but they ARE RwLock reads, not lock-free. The
   earlier draft of this bullet claimed "never under a lock on the
@@ -195,9 +195,9 @@ message and at most one output message. Nothing to "drain".
   cross-worker traffic. The earlier draft of this bullet described
   the lock as `parking_lot::Mutex` taken "only on the
   duplicate/out-of-window arms"; that did not match the
-  implementation (`session.rs:72` — `std::sync::Mutex<ReplayState>`,
-  `engine.rs:671-676` — unconditional pre-AEAD precheck-lock; and
-  `engine.rs:695` onward — post-AEAD update-lock that calls
+  implementation (`session.rs:77` — `std::sync::Mutex<ReplayState>`,
+  `engine.rs:675-680` — unconditional pre-AEAD precheck-lock; and
+  `engine.rs:699-718` — post-AEAD update-lock that calls
   `replay.check_and_update`).
 - Ephemerals: handshakes are slow-path only — snow's `Builder`
   generates the ephemeral keypair inside `build_initiator_handshake`

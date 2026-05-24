@@ -2,6 +2,34 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T23:30:00Z
+  - **Action**: PR #1499 r-final-5 step 4 — final mechanical sweep
+    pass. After the previous step's edits shifted lines in
+    engine.rs (+4 from the jumbo-MTU comment expansion), scratch.rs
+    (+2 from the doc-comment rewrite), and session.rs (+5 from the
+    local_index doc-comment rewrite), the plan's own line citations
+    that I had just "fixed" were already stale. Cross-grepped every
+    remaining plan.md file:line citation:
+    - `scratch.rs:17-21` → `scratch.rs:18-25` (struct field
+      definitions shifted by +1..+4 lines)
+    - `scratch.rs:25-30` → `scratch.rs:27-33` (constructor)
+    - `engine.rs:258` → `engine.rs:262` (`table: ArcSwap<PeerTable>`)
+    - `engine.rs:506-510` → `engine.rs:510-514` (`peer.current.read()`)
+    - `engine.rs:643-649` → `engine.rs:647-653`
+      (`sessions_by_local_index.read()` in try_decap)
+    - `engine.rs:671-676` → `engine.rs:675-680` (pre-AEAD replay
+      precheck-lock block)
+    - `engine.rs:695` → `engine.rs:699-718` (post-AEAD replay
+      update-lock block — now cites the actual block range)
+    - `session.rs:72` → `session.rs:77`
+      (`replay: Mutex<ReplayState>`)
+    All other citations (afxdp/mod.rs:175, mod.rs:86-91/95/98,
+    framing.rs:32-46, outer.rs:23-45, protocol.rs:417-450,
+    types/forwarding.rs:129-140, forwarding/mod.rs:751,
+    tx/dispatch.rs:430/785-792/1458-1459, frame/mod.rs:212,
+    frame/tcp_segmentation.rs:309, tunnel.rs:189) re-verified.
+  - **File(s)**: docs/pr/wireguard-clean/plan.md
+
 - **Timestamp**: 2026-05-24T23:15:00Z
   - **Action**: PR #1499 r-final-5 fix step 3 — line-citation offsets
     + stale field-name drift + scratch.rs MAX_FRAME doc-comment.
