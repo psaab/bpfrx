@@ -132,8 +132,45 @@ class UserspaceHASmokeMatrixTests(unittest.TestCase):
             result.stdout,
         )
         self.assertLess(
+            result.stdout.index("cos-off precheck: dry-run"),
+            result.stdout.index("perf order: before smoke matrix"),
+        )
+        self.assertLess(
             result.stdout.index("perf order: before smoke matrix"),
             result.stdout.index("smoke cell start: cos-on-ipv4-push"),
+        )
+        # Once from the live dry-run stream and once from the final summary.
+        self.assertEqual(result.stdout.count("cos-off precheck: dry-run"), 2)
+
+    def test_matrix_port_overrides_are_reflected_in_plan(self) -> None:
+        result = self.run_validator(
+            "--smoke-matrix",
+            extra_env={
+                "MATRIX_COS_OFF_IPERF_PORT": "5202",
+                "MATRIX_COS_ON_IPERF_PORT": "5210",
+            },
+        )
+        self.assertIn(
+            "matrix plan: cos-off-ipv4-push cos=off family=ipv4 direction=push "
+            "target=172.16.80.200 port=5202 min_gbps=1.0",
+            result.stdout,
+        )
+        self.assertIn(
+            "matrix plan: cos-on-ipv4-push cos=on family=ipv4 direction=push "
+            "target=172.16.80.200 port=5210 min_gbps=1.0",
+            result.stdout,
+        )
+
+    def test_rejects_invalid_iperf_port_override(self) -> None:
+        result = self.run_validator(
+            "--smoke-matrix",
+            check=False,
+            extra_env={"MATRIX_COS_ON_IPERF_PORT": "5211;echo bad"},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "MATRIX_COS_ON_IPERF_PORT must be a numeric port",
+            result.stderr,
         )
 
 

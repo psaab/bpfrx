@@ -357,6 +357,16 @@ warning as a stop-the-line artifact to triage before BPF retirement proceeds.
 The matrix applies the symmetric CoS fixture for the CoS-on half and leaves it
 applied; redeploy before collecting fresh CoS-off-only evidence.
 
+The iperf port selection is intentionally explicit and can be overridden only
+with numeric TCP ports in the `1..65535` range:
+
+| Variable | Default | Scope |
+|---|---:|---|
+| `FAST_IPERF_PORT` | `5201` | Fast/readiness mode current-CoS cells |
+| `MATRIX_COS_OFF_IPERF_PORT` | `5201` | Full-matrix CoS-off cells |
+| `MATRIX_COS_ON_IPERF_PORT` | `5211` | Full-matrix CoS-on cells |
+| `PERF_IPERF_PORT` | `5201` | `--perf` baseline capture |
+
 ```bash
 set -euo pipefail
 BPFRX_CLUSTER_ENV="$BPFRX_CLUSTER_ENV" ./scripts/userspace-phase-cycle.sh \

@@ -14,6 +14,20 @@
     test/incus/retire_ebpf_artifact_schema.py
     test/incus/retire_ebpf_artifact_schema_test.py`; `git diff --check`
 
+- **Timestamp**: 2026-05-24T16:56:30Z
+  - **Action**: PR #1508 review follow-up — validated smoke-matrix iperf
+    port overrides, documented the override contract, and hoisted the
+    CoS-off matrix precheck before full-matrix perf capture so profiling
+    cannot run against an already-shaped cluster.
+  - **File(s)**: `scripts/userspace-ha-validation.sh`,
+    `scripts/userspace_ha_validation_matrix_test.py`,
+    `docs/pr/1373-retire-ebpf-dataplane/smoke-gates.md`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-phase-cycle.sh`; `shellcheck
+    scripts/userspace-ha-validation.sh scripts/userspace-phase-cycle.sh`;
+    `python3 -m unittest scripts.userspace_ha_validation_matrix_test`;
+    `git diff --check`
+
 - **Timestamp**: 2026-05-24T15:14:30Z
   - **Action**: PR #1494 round-11 follow-up — collapsed the retained
     userspace XDP shim entry-program name onto one dataplane constant and

@@ -68,6 +68,22 @@ ACTIVE_FW="${FW0}"
 info() { printf '==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+validate_port() {
+	local name="$1" value="$2"
+	if ! [[ "$value" =~ ^[0-9]+$ ]] ||
+		((${#value} > 5)) ||
+		((10#$value < 1 || 10#$value > 65535)); then
+		die "${name} must be a numeric port (1-65535), got: ${value}"
+	fi
+}
+
+validate_iperf_ports() {
+	validate_port FAST_IPERF_PORT "$FAST_IPERF_PORT"
+	validate_port MATRIX_COS_OFF_IPERF_PORT "$MATRIX_COS_OFF_IPERF_PORT"
+	validate_port MATRIX_COS_ON_IPERF_PORT "$MATRIX_COS_ON_IPERF_PORT"
+	validate_port PERF_IPERF_PORT "$PERF_IPERF_PORT"
+}
+
 normalize_smoke_mode() {
 	case "$SMOKE_MODE" in
 	matrix | full | full-matrix | smoke-matrix) SMOKE_MODE="matrix" ;;
@@ -571,8 +587,12 @@ cos_config_active() {
 }
 
 ensure_cos_off_for_matrix() {
+	if (( COS_OFF_MATRIX_PRECHECKED == 1 )); then
+		return 0
+	fi
 	if (( DRY_RUN_MATRIX == 1 )); then
 		printf 'cos-off precheck: dry-run\n' | tee -a "$summary_file"
+		COS_OFF_MATRIX_PRECHECKED=1
 		return 0
 	fi
 	info "verifying CoS-off baseline before smoke matrix"
@@ -581,6 +601,7 @@ ensure_cos_off_for_matrix() {
 			"the userspace cluster or pass --deploy before collecting matrix evidence"
 	fi
 	printf 'cos-off precheck: ok\n' | tee -a "$summary_file"
+	COS_OFF_MATRIX_PRECHECKED=1
 }
 
 apply_symmetric_cos_config() {
@@ -732,8 +753,10 @@ run_perf_pair() {
 }
 
 normalize_smoke_mode
+validate_iperf_ports
 
 summary_file="$(mktemp)"
+COS_OFF_MATRIX_PRECHECKED=0
 cleanup() { rm -f "$summary_file"; }
 trap cleanup EXIT
 
@@ -741,6 +764,7 @@ if (( DRY_RUN_MATRIX == 1 )); then
 	info "dry-running userspace HA validation smoke matrix"
 	print_smoke_matrix_plan
 	if (( WITH_PERF == 1 )) && [[ "$SMOKE_MODE" == "matrix" ]]; then
+		ensure_cos_off_for_matrix
 		printf 'perf order: before smoke matrix to keep CoS-off baseline clean\n' |
 			tee -a "$summary_file"
 	fi
@@ -791,6 +815,7 @@ run_host "ping -6 -c 2 -W 1 ${V6_TEST_TARGET} >/tmp/userspace-ping-v6.out"
 validate_traceroute_visibility
 
 if [[ $WITH_PERF -eq 1 && "$SMOKE_MODE" == "matrix" ]]; then
+	ensure_cos_off_for_matrix
 	info "capturing perf baseline before smoke matrix applies CoS"
 	run_perf_pair perf-userspace-ipv4 "${V4_TEST_TARGET}" 4
 	run_perf_pair perf-userspace-ipv6 "${V6_TEST_TARGET}" 6
