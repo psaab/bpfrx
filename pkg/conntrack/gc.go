@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"log/slog"
+	"reflect"
 	"sync"
 	"time"
 
@@ -37,6 +38,13 @@ type sessionCountPublisher interface {
 
 type persistentNATProvider interface {
 	GetPersistentNAT() *dataplane.PersistentNATTable
+}
+
+// RuntimeDomainProvider exposes the runtime-domain surfaces GC needs at
+// construction time without requiring the legacy BPF-shaped DataPlane.
+type RuntimeDomainProvider interface {
+	dataplane.SessionStoreProvider
+	dataplane.TelemetryProvider
 }
 
 // GC performs periodic garbage collection on the session table.
@@ -92,20 +100,51 @@ type GC struct {
 	SkipSweep func() bool
 }
 
-// NewGC creates a new session garbage collector.
-func NewGC(dp dataplane.DataPlane, interval time.Duration) *GC {
+// NewGC creates a new session garbage collector from runtime-domain providers.
+func NewGC(provider RuntimeDomainProvider, interval time.Duration) *GC {
+	if runtimeDomainProviderIsNil(provider) {
+		return NewGCWithDomains(
+			dataplane.SessionStoreOf(nil),
+			dataplane.TelemetryOf(nil),
+			nil,
+			nil,
+			interval,
+		)
+	}
+
+	var sessionCount sessionCountPublisher
+	var persistent persistentNATProvider
+	if p, ok := provider.(sessionCountPublisher); ok {
+		sessionCount = p
+	}
+	if p, ok := provider.(persistentNATProvider); ok {
+		persistent = p
+	}
 	return NewGCWithDomains(
-		dataplane.SessionStoreOf(dp),
-		dataplane.TelemetryOf(dp),
-		dp,
-		dp,
+		dataplane.SessionStoreOf(provider),
+		dataplane.TelemetryOf(provider),
+		sessionCount,
+		persistent,
 		interval,
 	)
 }
 
+func runtimeDomainProviderIsNil(provider RuntimeDomainProvider) bool {
+	if provider == nil {
+		return true
+	}
+	value := reflect.ValueOf(provider)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
 // NewGCWithDomains creates a garbage collector from the runtime-domain
-// interfaces used by #1381. The legacy NewGC constructor adapts existing
-// dataplanes into these surfaces so callers can migrate independently.
+// interfaces used by #1381. NewGC adapts runtime providers into these surfaces
+// so callers can migrate independently.
 func NewGCWithDomains(
 	sessions dataplane.SessionStore,
 	telemetry dataplane.Telemetry,

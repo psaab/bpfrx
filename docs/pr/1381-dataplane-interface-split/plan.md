@@ -590,12 +590,12 @@ interface in place and adds the new contract beside it:
   `dataplane.SessionStore.ReconcileClusterBulk`, whose companion-delete path
   owns forward, reverse, and DNAT/DNATv6 cleanup. A canary fails if
   `pkg/cluster/sync.go` reintroduces local `DeleteDNATEntry*` cleanup.
-- GC now routes through `SessionStore` and `Telemetry`. The legacy
-  `NewGC(dataplane.DataPlane, ...)` constructor is only an adapter boundary;
-  the sweep body uses session-domain iteration, domain-owned
-  known-value batched companion deletes, and telemetry global counters. A
-  domain-only unit test pins that GC can expire sessions without a
-  `DataPlane`.
+- GC now routes through `SessionStore` and `Telemetry`. `NewGC` accepts a
+  `RuntimeDomainProvider` with `Sessions()` and `Telemetry()` instead of the
+  legacy `DataPlane`; the sweep body uses session-domain iteration,
+  domain-owned known-value batched companion deletes, and telemetry global
+  counters. A canary pins that GC construction does not regain a `DataPlane`
+  parameter.
 - Session sync now routes receive, sweep, bulk export, and stale-reconcile
   through `SessionStore`/`Telemetry`. The legacy constructors still accept a
   `DataPlane` for compatibility, but immediately adapt it with

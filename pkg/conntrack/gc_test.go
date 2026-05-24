@@ -12,16 +12,138 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// mockGCDP is a minimal mock dataplane for GC testing.
-// Embeds DataPlane interface to satisfy the full contract; only the methods
-// used by sweep() are implemented — others will panic if called.
+// mockGCDP is a minimal runtime-domain provider for GC testing.
 type mockGCDP struct {
-	dataplane.DataPlane // embedded interface satisfies all methods
-	mu                  sync.Mutex
-	v4sessions          map[dataplane.SessionKey]dataplane.SessionValue
-	v6sessions          map[dataplane.SessionKeyV6]dataplane.SessionValueV6
-	deleted             []dataplane.SessionKey
-	deletedV6           []dataplane.SessionKeyV6
+	mu         sync.Mutex
+	v4sessions map[dataplane.SessionKey]dataplane.SessionValue
+	v6sessions map[dataplane.SessionKeyV6]dataplane.SessionValueV6
+	deleted    []dataplane.SessionKey
+	deletedV6  []dataplane.SessionKeyV6
+}
+
+type mockGCTelemetry struct {
+	dataplane.Telemetry
+}
+
+func (mockGCTelemetry) GlobalCounter(uint32) (uint64, error) {
+	return 1, nil
+}
+
+type nilRuntimeProvider struct{}
+
+func (*nilRuntimeProvider) Sessions() dataplane.SessionStore {
+	panic("typed nil provider should not be adapted")
+}
+
+func (*nilRuntimeProvider) Telemetry() dataplane.Telemetry {
+	panic("typed nil provider should not be adapted")
+}
+
+func (m *mockGCDP) Sessions() dataplane.SessionStore {
+	return m
+}
+
+func (m *mockGCDP) Telemetry() dataplane.Telemetry {
+	return mockGCTelemetry{}
+}
+
+func (m *mockGCDP) ForEachV4(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	return m.IterateSessions(fn)
+}
+
+func (m *mockGCDP) ForEachV6(fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	return m.IterateSessionsV6(fn)
+}
+
+func (m *mockGCDP) GetV4(key dataplane.SessionKey) (dataplane.SessionValue, error) {
+	return m.GetSessionV4(key)
+}
+
+func (m *mockGCDP) GetV6(key dataplane.SessionKeyV6) (dataplane.SessionValueV6, error) {
+	return m.GetSessionV6(key)
+}
+
+func (m *mockGCDP) PutClusterSyncedV4(dataplane.SessionKey, dataplane.SessionValue) error {
+	return nil
+}
+
+func (m *mockGCDP) PutClusterSyncedV6(dataplane.SessionKeyV6, dataplane.SessionValueV6) error {
+	return nil
+}
+
+func (m *mockGCDP) DeleteV4(key dataplane.SessionKey) error {
+	return m.DeleteSession(key)
+}
+
+func (m *mockGCDP) DeleteV6(key dataplane.SessionKeyV6) error {
+	return m.DeleteSessionV6(key)
+}
+
+func (m *mockGCDP) DeleteKnownV4(key dataplane.SessionKey, val dataplane.SessionValue, reason dataplane.DeleteReason) error {
+	_, err := m.DeleteBatchKnownV4([]dataplane.SessionEntryV4{{Key: key, Value: val}}, reason)
+	return err
+}
+
+func (m *mockGCDP) DeleteKnownV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, reason dataplane.DeleteReason) error {
+	_, err := m.DeleteBatchKnownV6([]dataplane.SessionEntryV6{{Key: key, Value: val}}, reason)
+	return err
+}
+
+func (m *mockGCDP) DeleteBatchKnownV4(entries []dataplane.SessionEntryV4, _ dataplane.DeleteReason) (int, error) {
+	for _, entry := range entries {
+		if entry.Value.ReverseKey.Protocol != 0 {
+			m.DeleteSession(entry.Value.ReverseKey)
+		}
+		m.DeleteSession(entry.Key)
+	}
+	return len(entries), nil
+}
+
+func (m *mockGCDP) DeleteBatchKnownV6(entries []dataplane.SessionEntryV6, _ dataplane.DeleteReason) (int, error) {
+	for _, entry := range entries {
+		if entry.Value.ReverseKey.Protocol != 0 {
+			m.DeleteSessionV6(entry.Value.ReverseKey)
+		}
+		m.DeleteSessionV6(entry.Key)
+	}
+	return len(entries), nil
+}
+
+func (m *mockGCDP) DeleteWithCompanionsV4(key dataplane.SessionKey, reason dataplane.DeleteReason) error {
+	val, err := m.GetSessionV4(key)
+	if err != nil {
+		return err
+	}
+	return m.DeleteKnownV4(key, val, reason)
+}
+
+func (m *mockGCDP) DeleteWithCompanionsV6(key dataplane.SessionKeyV6, reason dataplane.DeleteReason) error {
+	val, err := m.GetSessionV6(key)
+	if err != nil {
+		return err
+	}
+	return m.DeleteKnownV6(key, val, reason)
+}
+
+func (m *mockGCDP) ReconcileClusterBulk(dataplane.ClusterBulkReconcileInput) (dataplane.ClusterBulkReconcileResult, error) {
+	return dataplane.ClusterBulkReconcileResult{}, nil
+}
+
+func (m *mockGCDP) SessionDeltas() dpruntime.SessionDeltaSource {
+	return nil
+}
+
+func (m *mockGCDP) Count() (int, int) {
+	return len(m.v4sessions), len(m.v6sessions)
+}
+
+func (m *mockGCDP) Clear() (int, int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v4, v6 := len(m.v4sessions), len(m.v6sessions)
+	m.v4sessions = map[dataplane.SessionKey]dataplane.SessionValue{}
+	m.v6sessions = map[dataplane.SessionKeyV6]dataplane.SessionValueV6{}
+	return v4, v6, nil
 }
 
 func (m *mockGCDP) IterateSessions(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
@@ -116,7 +238,7 @@ func (m *mockGCDP) UpdateSessionCountDst(_ dataplane.SessionCountKey, _ uint32) 
 }
 func (m *mockGCDP) ClearSessionCounts() error { return nil }
 
-func TestNewGCAdaptsLegacyDataplaneToRuntimeDomains(t *testing.T) {
+func TestNewGCAdaptsRuntimeProviderToDomains(t *testing.T) {
 	dp := &mockGCDP{
 		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{},
 		v6sessions: map[dataplane.SessionKeyV6]dataplane.SessionValueV6{},
@@ -141,6 +263,41 @@ func TestNewGCAdaptsLegacyDataplaneToRuntimeDomains(t *testing.T) {
 	}
 	if gc.lastV6Count != -1 {
 		t.Fatalf("lastV6Count = %d, want -1", gc.lastV6Count)
+	}
+}
+
+func TestNewGCNilProviderKeepsAdapterBehavior(t *testing.T) {
+	gc := NewGC(nil, 10*time.Second)
+
+	if gc.sessions == nil {
+		t.Fatal("NewGC nil provider did not install nil session adapter")
+	}
+	if gc.telemetry == nil {
+		t.Fatal("NewGC nil provider did not install nil telemetry adapter")
+	}
+	if gc.sessionCount != nil {
+		t.Fatal("NewGC nil provider retained session-count publisher")
+	}
+	if gc.persistent != nil {
+		t.Fatal("NewGC nil provider retained persistent NAT provider")
+	}
+}
+
+func TestNewGCTypedNilProviderKeepsAdapterBehavior(t *testing.T) {
+	var provider *nilRuntimeProvider
+	gc := NewGC(provider, 10*time.Second)
+
+	if gc.sessions == nil {
+		t.Fatal("NewGC typed nil provider did not install nil session adapter")
+	}
+	if gc.telemetry == nil {
+		t.Fatal("NewGC typed nil provider did not install nil telemetry adapter")
+	}
+	if gc.sessionCount != nil {
+		t.Fatal("NewGC typed nil provider retained session-count publisher")
+	}
+	if gc.persistent != nil {
+		t.Fatal("NewGC typed nil provider retained persistent NAT provider")
 	}
 }
 
