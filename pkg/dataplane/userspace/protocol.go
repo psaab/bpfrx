@@ -1,6 +1,7 @@
 package userspace
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -508,11 +509,54 @@ type ProcessStatus struct {
 	SourceNATPools               []SourceNATPoolStatus             `json:"source_nat_pools,omitempty"`
 	LastResolution               *PacketResolution                 `json:"last_resolution,omitempty"`
 	SlowPath                     SlowPathStatus                    `json:"slow_path,omitempty"`
-	LastCacheFlushAt             uint64                            `json:"last_cache_flush_at,omitempty"` // monotonic secs (#312)
-	DataplaneMode                string                            `json:"dataplane_mode,omitempty"`      // Current active mode: "ebpf_only", "userspace_compat", "userspace_strict"
-	ConfiguredMode               string                            `json:"configured_mode,omitempty"`     // Desired mode from config
-	EntryPrograms                map[int]string                    `json:"entry_programs,omitempty"`      // ifindex -> attached XDP program name
-	FallbackCounters             map[string]uint64                 `json:"fallback_counters,omitempty"`   // reason_name -> count
+	LastCacheFlushAt             uint64                            `json:"last_cache_flush_at,omitempty"`    // monotonic secs (#312)
+	DataplaneMode                string                            `json:"dataplane_mode,omitempty"`         // Current active mode: "ebpf_only", "userspace_compat", "userspace_strict"
+	ConfiguredMode               string                            `json:"configured_mode,omitempty"`        // Desired mode from config
+	EntryPrograms                map[int]string                    `json:"entry_programs,omitempty"`         // ifindex -> attached XDP program name
+	DegradedPathCounters         map[string]uint64                 `json:"degraded_path_counters,omitempty"` // reason_name -> count
+}
+
+// MarshalJSON intentionally uses a value receiver so both ProcessStatus values
+// and *ProcessStatus pointers emit the temporary legacy alias during the
+// rolling-upgrade window.
+func (s ProcessStatus) MarshalJSON() ([]byte, error) {
+	type processStatusAlias ProcessStatus
+	aux := struct {
+		*processStatusAlias
+		LegacyFallbackCounters map[string]uint64 `json:"fallback_counters,omitempty"`
+	}{
+		processStatusAlias: (*processStatusAlias)(&s),
+	}
+	if len(s.DegradedPathCounters) > 0 {
+		// encoding/json never mutates input maps, so sharing the map keeps the
+		// legacy alias byte-for-byte consistent with the primary field.
+		aux.LegacyFallbackCounters = s.DegradedPathCounters
+	}
+	return json.Marshal(aux)
+}
+
+func (s *ProcessStatus) UnmarshalJSON(data []byte) error {
+	type processStatusAlias ProcessStatus
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	var aux processStatusAlias
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*s = ProcessStatus(aux)
+	if _, ok := raw["degraded_path_counters"]; ok {
+		return nil
+	}
+	if legacyRaw, ok := raw["fallback_counters"]; ok {
+		var legacy map[string]uint64
+		if err := json.Unmarshal(legacyRaw, &legacy); err != nil {
+			return err
+		}
+		s.DegradedPathCounters = legacy
+	}
+	return nil
 }
 
 type SourceNATPoolStatus struct {

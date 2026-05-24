@@ -1019,25 +1019,31 @@ pub(super) static SESSION_CREATIONS_LOGGED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "debug-log")]
 static ICMPV6_EMBED_LOGGED: AtomicU32 = AtomicU32::new(0);
 
-pub(super) const FALLBACK_STATS_PIN_PATH: &str = "/sys/fs/bpf/xpf/userspace_fallback_stats";
-pub(super) const FALLBACK_REASON_NAMES: &[&str] = &[
-    "ctrl_disabled",     // 0
-    "parse_fail",        // 1
-    "binding_missing",   // 2
-    "binding_not_ready", // 3
-    "hb_missing",        // 4
-    "hb_stale",          // 5
-    "icmp",              // 6
-    "early_filter",      // 7
-    "adjust_meta",       // 8
-    "meta_bounds",       // 9
-    "redirect_err",      // 10
-    "iface_nat_no_sess", // 11
-    "no_session",        // 12
+// The pinned map path keeps the historical "fallback" spelling for
+// mixed-version shim compatibility. Operator-facing names use
+// degraded-path terminology.
+pub(super) const DEGRADED_PATH_STATS_PIN_PATH: &str = "/sys/fs/bpf/xpf/userspace_fallback_stats";
+pub(super) const DEGRADED_PATH_REASON_NAMES: &[&str] = &[
+    "ctrl_disabled",            // 0
+    "parse_fail",               // 1
+    "binding_missing",          // 2
+    "binding_not_ready",        // 3
+    "heartbeat_missing",        // 4
+    "heartbeat_stale",          // 5
+    "icmp",                     // 6
+    "early_filter",             // 7
+    "adjust_meta",              // 8
+    "meta_bounds",              // 9
+    "redirect_err",             // 10
+    "interface_nat_no_session", // 11
+    "no_session",               // 12
+    "strict_drop",              // 13
+    "pass_to_kernel",           // 14
+    "transit_drop",             // 15
 ];
 
-pub(super) fn read_fallback_stats() -> Option<Vec<(String, u64)>> {
-    let fd = OwnedFd::open_bpf_map(FALLBACK_STATS_PIN_PATH).ok()?;
+pub(super) fn read_degraded_path_stats() -> Option<Vec<(String, u64)>> {
+    let fd = OwnedFd::open_bpf_map(DEGRADED_PATH_STATS_PIN_PATH).ok()?;
     let mut result = Vec::new();
     for idx in 0u32..16 {
         let mut value = 0u64;
@@ -1049,7 +1055,7 @@ pub(super) fn read_fallback_stats() -> Option<Vec<(String, u64)>> {
             )
         };
         if rc == 0 && value > 0 {
-            let name = FALLBACK_REASON_NAMES
+            let name = DEGRADED_PATH_REASON_NAMES
                 .get(idx as usize)
                 .copied()
                 .unwrap_or("unknown");
@@ -1183,4 +1189,3 @@ pub(super) fn delete_session_map_entry_for_removed_session_with_origin(
 #[cfg(test)]
 #[path = "bpf_map_tests.rs"]
 mod tests;
-

@@ -801,7 +801,7 @@ func (m *Manager) recordHelperStatusLocked(status *ProcessStatus) {
 	status.DataplaneMode = m.mode.String()
 	status.ConfiguredMode = m.configuredMode.String()
 	status.EntryPrograms = m.entryProgramsLocked()
-	status.FallbackCounters = m.readFallbackStatsLocked()
+	status.DegradedPathCounters = m.readDegradedPathStatsLocked()
 	if m.eventStream != nil {
 		es := m.eventStream.Status()
 		status.EventStream = &es

@@ -156,6 +156,25 @@ func TestFormatStatusSummaryShowsPersistentSourceNATHABoundary(t *testing.T) {
 	}
 }
 
+func TestFormatStatusSummaryShowsDegradedPathCounters(t *testing.T) {
+	status := ProcessStatus{
+		DegradedPathCounters: map[string]uint64{
+			"transit_drop":  5,
+			"ctrl_disabled": 1,
+			"redirect_err":  3,
+		},
+	}
+
+	out := FormatStatusSummary(status)
+	want := "Degraded path counters:    ctrl_disabled=1 redirect_err=3 transit_drop=5"
+	if !strings.Contains(out, want) {
+		t.Fatalf("summary missing degraded path counters %q:\n%s", want, out)
+	}
+	if strings.Contains(out, "fallback_counters") {
+		t.Fatalf("summary exposed legacy fallback_counters field:\n%s", out)
+	}
+}
+
 func TestFormatSYNCookieCounterRows(t *testing.T) {
 	status := ProcessStatus{
 		Bindings: []BindingStatus{

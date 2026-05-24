@@ -15,6 +15,42 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
+func TestDegradedPathReasonNamesCoverRetainedShimActions(t *testing.T) {
+	found := map[string]bool{}
+	for _, name := range degradedPathReasonNames {
+		found[name] = true
+	}
+
+	for _, name := range []string{
+		"ctrl_disabled",
+		"pass_to_kernel",
+		"transit_drop",
+		"strict_drop",
+		"redirect_err",
+		"binding_missing",
+		"binding_not_ready",
+		"heartbeat_missing",
+		"heartbeat_stale",
+		"adjust_meta",
+		"meta_bounds",
+	} {
+		if !found[name] {
+			t.Fatalf("degraded path reason %q missing from %v", name, degradedPathReasonNames)
+		}
+	}
+	if got, want := len(degradedPathReasonNames), 16; got != want {
+		t.Fatalf("degradedPathReasonNames length = %d, want %d", got, want)
+	}
+	if got := userspaceShimDegradedStatsMapName; got != "userspace_fallback_stats" {
+		t.Fatalf("userspaceShimDegradedStatsMapName = %q, want pinned compatibility map name", got)
+	}
+	for idx, name := range degradedPathReasonNames {
+		if name == "" {
+			t.Fatalf("degradedPathReasonNames[%d] is empty", idx)
+		}
+	}
+}
+
 // TestApplyHelperStatusRejectsOverCapIfindex verifies that a binding
 // whose ifindex overflows the userspace_bindings Array cap is caught
 // at the call site with a legible error rather than bubbling up the

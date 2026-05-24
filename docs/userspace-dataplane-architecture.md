@@ -120,9 +120,11 @@ Packet arrives at NIC
 - **Fail closed on dead bindings**: if a binding is missing, not ready, or
   its heartbeat is stale on a userspace-managed interface, the shim passes
   only proven local/control traffic to the kernel. Non-local transit drops in
-  compat and strict modes and increments the `transit_drop` fallback counter.
-  The userspace runtime does not require the legacy `xdp_main_prog` fallback
-  path.
+  compat and strict modes and increments the `transit_drop` degraded-path
+  counter. Go exposes the per-reason map as `degraded_path_counters`; the
+  pinned BPF map keeps the internal compatibility name
+  `userspace_fallback_stats` until the mixed-version boundary is retired. The
+  userspace runtime does not require the legacy `xdp_main_prog` fallback path.
 
 - **Heartbeat watchdog**: Each worker writes a timestamp to a BPF array
   map every 250ms. The shim checks freshness (5s timeout) and refuses
