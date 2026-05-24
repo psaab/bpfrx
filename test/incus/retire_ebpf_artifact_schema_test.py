@@ -511,6 +511,32 @@ class RetireEbpfArtifactSchemaTests(unittest.TestCase):
             summary = schema.validate_artifact_root(root, candidate_commit=COMMIT)
             self.assertEqual(summary["verdict"], "STRUCTURE_OK")
 
+    def test_accepts_rfc3339_leap_second_with_offset(self) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            manifest = make_manifest()
+            commands = manifest["commands"]
+            assert isinstance(commands, list)
+            commands[0]["started_at"] = "2026-12-31T15:59:60-08:00"
+            commands[0]["finished_at"] = "2027-01-01T08:59:60+09:00"
+            write_json(root, "manifest.json", manifest)
+            summary = schema.validate_artifact_root(root, candidate_commit=COMMIT)
+            self.assertEqual(summary["verdict"], "STRUCTURE_OK")
+
+    def test_rejects_local_leap_shape_that_is_not_utc_leap_second(self) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            manifest = make_manifest()
+            commands = manifest["commands"]
+            assert isinstance(commands, list)
+            commands[0]["started_at"] = "2026-12-31T23:59:60-08:00"
+            write_json(root, "manifest.json", manifest)
+            with self.assertRaisesRegex(
+                schema.ValidationFailure,
+                "commands\\[0\\].started_at must be an RFC3339 date-time string",
+            ):
+                schema.validate_artifact_root(root, candidate_commit=COMMIT)
+
     def test_rejects_non_leap_shaped_sixty_second_timestamps(self) -> None:
         def set_command_started_at(manifest: dict[str, object], value: str) -> None:
             commands = manifest["commands"]
@@ -577,6 +603,21 @@ class RetireEbpfArtifactSchemaTests(unittest.TestCase):
             path.write_bytes(b"\xff\xfe{")
             with self.assertRaisesRegex(schema.ValidationFailure, "invalid UTF-8 JSON"):
                 schema.validate_artifact_root(root, candidate_commit=COMMIT)
+
+    def test_rejects_decimal_parse_error_without_traceback(self) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            text = make_manifest_json()
+            needle = '"schema_version":1'
+            self.assertIn(needle, text)
+            write_text(
+                root,
+                "manifest.json",
+                text.replace(needle, '"schema_version":1e999999999999999999999'),
+            )
+            with self.assertRaisesRegex(schema.ValidationFailure, "invalid JSON"):
+                schema.validate_artifact_root(root, candidate_commit=COMMIT)
+
 
 if __name__ == "__main__":
     unittest.main()

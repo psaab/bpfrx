@@ -12,8 +12,8 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime
-from decimal import Decimal
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -373,8 +373,16 @@ class ArtifactChecker:
             return None
         if isinstance(value, int):
             return value
-        if isinstance(value, Decimal) and value == value.to_integral_value():
-            return int(value)
+        if isinstance(value, Decimal):
+            try:
+                integral = value.to_integral_value()
+            except InvalidOperation:
+                return None
+            if value == integral:
+                try:
+                    return int(value)
+                except (InvalidOperation, OverflowError, ValueError):
+                    return None
         return None
 
     def validate_unique_list(self, context: str, value: list[Any]) -> None:
@@ -398,9 +406,6 @@ class ArtifactChecker:
         if second > 60:
             self.error(f"{context} must be an RFC3339 date-time string")
             return
-        if second == 60 and not self.is_practical_leap_second(match):
-            self.error(f"{context} must be an RFC3339 date-time string")
-            return
         normalized = value
         normalized = normalized[:10] + "T" + normalized[11:]
         if normalized.endswith(("Z", "z")):
@@ -415,14 +420,20 @@ class ArtifactChecker:
             return
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             self.error(f"{context} must include a timezone offset")
+            return
+        if second == 60 and not self.is_practical_leap_second(parsed):
+            self.error(f"{context} must be an RFC3339 date-time string")
 
-    def is_practical_leap_second(self, match: re.Match[str]) -> bool:
-        month = match.group("month")
-        day = match.group("day")
+    def is_practical_leap_second(self, parsed: datetime) -> bool:
+        utc = parsed.astimezone(timezone.utc)
         return (
-            match.group("hour") == "23"
-            and match.group("minute") == "59"
-            and ((month == "06" and day == "30") or (month == "12" and day == "31"))
+            utc.hour == 23
+            and utc.minute == 59
+            and utc.second == 59
+            and (
+                (utc.month == 6 and utc.day == 30)
+                or (utc.month == 12 and utc.day == 31)
+            )
         )
 
     def validate_metadata(self) -> None:
@@ -594,6 +605,9 @@ class ArtifactChecker:
             self.error(f"invalid UTF-8 JSON artifact {rel}: {exc}")
             return None
         except json.JSONDecodeError as exc:
+            self.error(f"invalid JSON artifact {rel}: {exc}")
+            return None
+        except (InvalidOperation, ValueError) as exc:
             self.error(f"invalid JSON artifact {rel}: {exc}")
             return None
 

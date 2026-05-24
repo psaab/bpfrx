@@ -2,6 +2,18 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T16:56:30Z
+  - **Action**: PR #1506 review follow-up — normalized RFC3339 leap-second
+    validation through UTC before accepting `:60` offset forms, and reported
+    hostile Decimal/oversized-number JSON parse failures as structured
+    validation errors instead of tracebacks.
+  - **File(s)**: `test/incus/retire_ebpf_artifact_schema.py`,
+    `test/incus/retire_ebpf_artifact_schema_test.py`, `_Log.md`
+  - **Validation**: `python3 -m unittest discover -s test/incus -p
+    retire_ebpf_artifact_schema_test.py`; `python3 -m py_compile
+    test/incus/retire_ebpf_artifact_schema.py
+    test/incus/retire_ebpf_artifact_schema_test.py`; `git diff --check`
+
 - **Timestamp**: 2026-05-24T15:14:30Z
   - **Action**: PR #1494 round-11 follow-up — collapsed the retained
     userspace XDP shim entry-program name onto one dataplane constant and
