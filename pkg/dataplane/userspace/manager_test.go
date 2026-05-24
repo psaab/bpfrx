@@ -24,6 +24,7 @@ import (
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 func TestShouldAttemptRSTSuppression(t *testing.T) {
@@ -591,7 +592,7 @@ func injectSessionMaps(t *testing.T, m *Manager) {
 		MaxEntries: 1024,
 	})
 	if err != nil {
-		t.Fatalf("new sessions map: %v", err)
+		skipIfBPFMapUnavailable(t, "new sessions map", err)
 	}
 	t.Cleanup(func() { sessionsMap.Close() })
 	injectShimMap(t, m.bpfShim, "sessions", sessionsMap)
@@ -602,7 +603,7 @@ func injectSessionMaps(t *testing.T, m *Manager) {
 		MaxEntries: 1024,
 	})
 	if err != nil {
-		t.Fatalf("new sessions_v6 map: %v", err)
+		skipIfBPFMapUnavailable(t, "new sessions_v6 map", err)
 	}
 	t.Cleanup(func() { sessionsMapV6.Close() })
 	injectShimMap(t, m.bpfShim, "sessions_v6", sessionsMapV6)
@@ -617,7 +618,7 @@ func injectCtrlAndBindingMaps(t *testing.T, m *Manager) (*ebpf.Map, *ebpf.Map) {
 		MaxEntries: 16,
 	})
 	if err != nil {
-		t.Fatalf("new userspace_ctrl map: %v", err)
+		skipIfBPFMapUnavailable(t, "new userspace_ctrl map", err)
 	}
 	t.Cleanup(func() { ctrlMap.Close() })
 	injectShimMap(t, m.bpfShim, "userspace_ctrl", ctrlMap)
@@ -629,7 +630,7 @@ func injectCtrlAndBindingMaps(t *testing.T, m *Manager) (*ebpf.Map, *ebpf.Map) {
 		MaxEntries: 256,
 	})
 	if err != nil {
-		t.Fatalf("new userspace_bindings map: %v", err)
+		skipIfBPFMapUnavailable(t, "new userspace_bindings map", err)
 	}
 	t.Cleanup(func() { bindingsMap.Close() })
 	injectShimMap(t, m.bpfShim, "userspace_bindings", bindingsMap)
@@ -645,11 +646,24 @@ func injectUserspaceSessionMap(t *testing.T, m *Manager) *ebpf.Map {
 		MaxEntries: 256,
 	})
 	if err != nil {
-		t.Fatalf("new userspace_sessions map: %v", err)
+		skipIfBPFMapUnavailable(t, "new userspace_sessions map", err)
 	}
 	t.Cleanup(func() { usMap.Close() })
 	injectShimMap(t, m.bpfShim, "userspace_sessions", usMap)
 	return usMap
+}
+
+func skipIfBPFMapUnavailable(t *testing.T, context string, err error) {
+	t.Helper()
+	msg := strings.ToLower(err.Error())
+	if errors.Is(err, unix.EPERM) ||
+		errors.Is(err, unix.EACCES) ||
+		strings.Contains(msg, "operation not permitted") ||
+		strings.Contains(msg, "permission denied") ||
+		strings.Contains(msg, "memlock") {
+		t.Skipf("%s requires BPF map privileges: %v", context, err)
+	}
+	t.Fatalf("%s: %v", context, err)
 }
 
 func TestFindUserspaceEgressInterfaceSnapshotPrefersVLANUnit(t *testing.T) {

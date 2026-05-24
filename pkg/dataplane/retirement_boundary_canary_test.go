@@ -527,6 +527,400 @@ func TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram(t *testing.T) {
 	}
 }
 
+func TestUserspaceLinkCycleDoesNotReenterLegacyLoader(t *testing.T) {
+	t.Parallel()
+
+	violations, missing := linkCycleLegacyLoaderTargetViolations(t, productionLinkCycleLegacyLoaderTargets())
+	if len(missing) > 0 {
+		t.Fatalf("userspace link-cycle methods not found: %v", missing)
+	}
+	if len(violations) > 0 {
+		t.Fatalf("userspace link-cycle code must not reference legacy loader or xdp_main_prog controls: %v", violations)
+	}
+}
+
+type linkCycleLegacyLoaderTarget struct {
+	path     string
+	receiver string
+	methods  map[string]bool
+}
+
+func productionLinkCycleLegacyLoaderTargets() []linkCycleLegacyLoaderTarget {
+	return []linkCycleLegacyLoaderTarget{
+		{
+			path:     filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace", "process.go"),
+			receiver: "Manager",
+			methods: map[string]bool{
+				"PrepareLinkCycle": false,
+				"NotifyLinkCycle":  false,
+			},
+		},
+		{
+			path:     filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace", "manager.go"),
+			receiver: "userspaceLinkController",
+			methods: map[string]bool{
+				"PrepareLinkCycle": false,
+				"NotifyLinkCycle":  false,
+			},
+		},
+		{
+			path:     filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace", "legacy_dataplane.go"),
+			receiver: "LegacyDataPlaneAdapter",
+			methods: map[string]bool{
+				"PrepareLinkCycle": false,
+				"NotifyLinkCycle":  false,
+			},
+		},
+	}
+}
+
+func linkCycleLegacyLoaderTargetViolations(
+	t *testing.T,
+	targets []linkCycleLegacyLoaderTarget,
+) ([]string, []string) {
+	t.Helper()
+
+	var violations []string
+	var missing []string
+	for _, target := range targets {
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, target.path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", target.path, err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Recv == nil || receiverTypeName(fn.Recv.List[0].Type) != target.receiver {
+				continue
+			}
+			if _, ok := target.methods[fn.Name.Name]; !ok {
+				continue
+			}
+			target.methods[fn.Name.Name] = true
+			violations = append(violations, linkCycleLegacyLoaderFunctionViolations(
+				t,
+				fset,
+				target.path,
+				target.receiver,
+				fn,
+			)...)
+		}
+		for method, found := range target.methods {
+			if !found {
+				missing = append(missing, repoRelativePath(t, target.path)+":"+method)
+			}
+		}
+	}
+
+	if len(missing) > 0 {
+		sort.Strings(missing)
+	}
+	sort.Strings(violations)
+	return violations, missing
+}
+
+func linkCycleLegacyLoaderFunctionViolations(
+	t *testing.T,
+	fset *token.FileSet,
+	path string,
+	receiver string,
+	fn *ast.FuncDecl,
+) []string {
+	t.Helper()
+
+	aliases := linkCycleLegacyLoaderRootAliases(receiver, receiverValueName(fn.Recv.List[0]))
+	var violations []string
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.AssignStmt:
+			for i, rhs := range node.Rhs {
+				if i < len(node.Lhs) {
+					linkCycleRecordLegacyLoaderAlias(node.Lhs[i], rhs, aliases)
+				}
+			}
+		case *ast.ValueSpec:
+			for i, rhs := range node.Values {
+				if i < len(node.Names) {
+					linkCycleRecordLegacyLoaderAlias(node.Names[i], rhs, aliases)
+				}
+			}
+		case *ast.SelectorExpr:
+			if !linkCycleLegacyLoaderSelector(node, aliases) {
+				return true
+			}
+			pos := fset.Position(node.Pos())
+			violations = append(violations, fmt.Sprintf(
+				"%s:%d %s references %s.%s during userspace link-cycle handling",
+				repoRelativePath(t, path),
+				pos.Line,
+				fn.Name.Name,
+				linkCycleSelectorReceiverString(node.X),
+				node.Sel.Name,
+			))
+		}
+		return true
+	})
+	return violations
+}
+
+func receiverValueName(recv *ast.Field) string {
+	if recv != nil && len(recv.Names) > 0 {
+		return recv.Names[0].Name
+	}
+	return ""
+}
+
+func linkCycleLegacyLoaderRootAliases(receiver, name string) map[string]bool {
+	aliases := map[string]bool{}
+	if name == "" {
+		return aliases
+	}
+	switch receiver {
+	case "Manager":
+		aliases[name] = true
+		aliases[name+".bpfShim"] = true
+	case "userspaceLinkController":
+		aliases[name+".manager"] = true
+		aliases[name+".manager.bpfShim"] = true
+	case "LegacyDataPlaneAdapter":
+		aliases[name] = true
+		aliases[name+".DataPlane"] = true
+	}
+	return aliases
+}
+
+func linkCycleRecordLegacyLoaderAlias(lhs ast.Expr, rhs ast.Expr, aliases map[string]bool) {
+	id, ok := lhs.(*ast.Ident)
+	if !ok || id.Name == "_" {
+		return
+	}
+	if linkCycleLegacyLoaderExpr(rhs, aliases) {
+		aliases[id.Name] = true
+		aliases[id.Name+".bpfShim"] = true
+		aliases[id.Name+".DataPlane"] = true
+	}
+}
+
+func linkCycleLegacyLoaderSelector(sel *ast.SelectorExpr, aliases map[string]bool) bool {
+	if !linkCycleLegacyLoaderMethod(sel.Sel.Name) {
+		return false
+	}
+	return linkCycleLegacyLoaderExpr(sel.X, aliases) || linkCycleLegacyManagerTypeExpr(sel.X)
+}
+
+func linkCycleLegacyLoaderMethod(name string) bool {
+	switch name {
+	case "Load", "Compile",
+		"LoadUserspaceShim", "CompileUserspaceShim",
+		"AttachXDP", "SelectUserspaceXDPShimEntryProgram",
+		"SwapToUserspaceXDPShimEntryProgram", "SwapXDPEntryProg":
+		return true
+	default:
+		return false
+	}
+}
+
+func linkCycleLegacyLoaderExpr(expr ast.Expr, aliases map[string]bool) bool {
+	expr = unparenCanaryExpr(expr)
+	if aliases[canaryExprString(expr)] {
+		return true
+	}
+	switch e := expr.(type) {
+	case *ast.SelectorExpr:
+		switch e.Sel.Name {
+		case "bpfShim", "DataPlane":
+			return linkCycleLegacyLoaderExpr(e.X, aliases)
+		default:
+			return false
+		}
+	case *ast.TypeAssertExpr:
+		return linkCycleLegacyLoaderExpr(e.X, aliases) && linkCycleLegacyManagerTypeExpr(e.Type)
+	case *ast.CallExpr:
+		sel, ok := unparenCanaryExpr(e.Fun).(*ast.SelectorExpr)
+		return ok && sel.Sel.Name == "managerOrErr" && linkCycleLegacyLoaderExpr(sel.X, aliases)
+	default:
+		return false
+	}
+}
+
+func linkCycleLegacyManagerTypeExpr(expr ast.Expr) bool {
+	expr = unparenCanaryExpr(expr)
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e.Name == "Manager"
+	case *ast.SelectorExpr:
+		return canaryExprString(e) == "dataplane.Manager"
+	case *ast.StarExpr:
+		return linkCycleLegacyManagerTypeExpr(e.X)
+	default:
+		return false
+	}
+}
+
+func linkCycleSelectorReceiverString(expr ast.Expr) string {
+	if got := canaryExprString(unparenCanaryExpr(expr)); got != "" {
+		return got
+	}
+	return fmt.Sprintf("%T", expr)
+}
+
+func unparenCanaryExpr(expr ast.Expr) ast.Expr {
+	for {
+		paren, ok := expr.(*ast.ParenExpr)
+		if !ok {
+			return expr
+		}
+		expr = paren.X
+	}
+}
+
+func TestLinkCycleLegacyLoaderSelectorCatchesLegacyReceivers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		expr string
+		want bool
+	}{
+		{expr: "m.Load", want: true},
+		{expr: "c.manager.CompileUserspaceShim", want: true},
+		{expr: "a.Load", want: true},
+		{expr: "m.bpfShim.LoadUserspaceShim", want: true},
+		{expr: "c.manager.bpfShim.SelectUserspaceXDPShimEntryProgram", want: true},
+		{expr: "a.DataPlane.Load", want: true},
+		{expr: "mgr.Load", want: true},
+		{expr: "shim.AttachXDP", want: true},
+		{expr: "(*Manager).Load", want: true},
+		{expr: "atomic.Load", want: false},
+		{expr: "m.rgTransitionInFlight.Load", want: false},
+		{expr: "m.somethingNew.Load", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.expr, func(t *testing.T) {
+			expr, err := parser.ParseExpr(tt.expr)
+			if err != nil {
+				t.Fatalf("parse %s: %v", tt.expr, err)
+			}
+			sel, ok := expr.(*ast.SelectorExpr)
+			if !ok {
+				t.Fatalf("%s parsed as %T, want *ast.SelectorExpr", tt.expr, expr)
+			}
+			aliases := map[string]bool{
+				"m":                 true,
+				"m.bpfShim":         true,
+				"c.manager":         true,
+				"c.manager.bpfShim": true,
+				"a":                 true,
+				"a.DataPlane":       true,
+				"mgr":               true,
+				"mgr.bpfShim":       true,
+				"shim":              true,
+				"dp":                true,
+				"dp.DataPlane":      true,
+			}
+			if got := linkCycleLegacyLoaderSelector(sel, aliases); got != tt.want {
+				t.Fatalf("linkCycleLegacyLoaderSelector(%s) = %v, want %v", tt.expr, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUserspaceLinkCycleCanaryRejectsLegacyLoaderFixtures(t *testing.T) {
+	t.Parallel()
+
+	root := writeUserspaceEntryProgramFixture(t, map[string]string{
+		"link_cycle.go": `
+package userspace
+
+import "github.com/psaab/xpf/pkg/dataplane"
+
+type Manager struct {
+	bpfShim shim
+	rgTransitionInFlight counter
+	somethingNew counter
+}
+type shim struct{}
+type counter struct{}
+
+func (m *Manager) PrepareLinkCycle() {
+	m.somethingNew.Load()
+}
+
+func (m *Manager) NotifyLinkCycle() {
+	mgr := m
+	mgr.Load()
+	m.bpfShim.LoadUserspaceShim()
+	(*Manager).Load(m)
+}
+
+type userspaceLinkController struct {
+	manager *Manager
+}
+
+func (c userspaceLinkController) PrepareLinkCycle() {
+	mgr := c.manager
+	mgr.Compile()
+	shim := c.manager.bpfShim
+	shim.CompileUserspaceShim(nil)
+}
+
+func (c userspaceLinkController) NotifyLinkCycle() {}
+
+type LegacyDataPlaneAdapter struct {
+	DataPlane any
+}
+
+func (a *LegacyDataPlaneAdapter) PrepareLinkCycle() {
+	dp := a.DataPlane
+	dp.Compile(nil)
+	a.DataPlane.(*dataplane.Manager).Load()
+}
+
+func (a *LegacyDataPlaneAdapter) NotifyLinkCycle() {
+	a.DataPlane.Load()
+}
+`,
+	})
+	path := filepath.Join(root, "link_cycle.go")
+	targets := []linkCycleLegacyLoaderTarget{
+		{
+			path:     path,
+			receiver: "Manager",
+			methods: map[string]bool{
+				"PrepareLinkCycle": false,
+				"NotifyLinkCycle":  false,
+			},
+		},
+		{
+			path:     path,
+			receiver: "userspaceLinkController",
+			methods: map[string]bool{
+				"PrepareLinkCycle": false,
+				"NotifyLinkCycle":  false,
+			},
+		},
+		{
+			path:     path,
+			receiver: "LegacyDataPlaneAdapter",
+			methods: map[string]bool{
+				"PrepareLinkCycle": false,
+				"NotifyLinkCycle":  false,
+			},
+		},
+	}
+	violations, missing := linkCycleLegacyLoaderTargetViolations(t, targets)
+	if len(missing) > 0 {
+		t.Fatalf("fixture link-cycle methods not found: %v", missing)
+	}
+	assertCanaryViolationContains(t, violations, "NotifyLinkCycle", "mgr.Load")
+	assertCanaryViolationContains(t, violations, "NotifyLinkCycle", "m.bpfShim.LoadUserspaceShim")
+	assertCanaryViolationContains(t, violations, "NotifyLinkCycle", "*Manager.Load")
+	assertCanaryViolationContains(t, violations, "PrepareLinkCycle", "mgr.Compile")
+	assertCanaryViolationContains(t, violations, "PrepareLinkCycle", "shim.CompileUserspaceShim")
+	assertCanaryViolationContains(t, violations, "PrepareLinkCycle", "dp.Compile")
+	assertCanaryViolationContains(t, violations, "PrepareLinkCycle", "*ast.TypeAssertExpr.Load")
+	assertCanaryViolationContains(t, violations, "NotifyLinkCycle", "a.DataPlane.Load")
+}
+
 func TestBPFShimEntryProgramStateIsNotJSONMutable(t *testing.T) {
 	t.Parallel()
 

@@ -997,6 +997,8 @@ func (m *Manager) StartFIBSync(ctx context.Context) {
 	m.bpfShim.StartFIBSync(ctx)
 }
 
+var linkCycleRebindSleep = time.Sleep
+
 // NotifyLinkCycle tells the userspace helper to rebind all AF_XDP sockets.
 // In mlx5 (and other drivers), a link DOWN/UP cycle destroys the kernel-side
 // XSK receive queue.  The sockets remain open but no longer receive packets.
@@ -1004,10 +1006,10 @@ func (m *Manager) StartFIBSync(ctx context.Context) {
 //
 // PrepareLinkCycle should have been called BEFORE the link cycle to stop
 // workers (so they don't access UMEM during link DOWN). This method
-// waits 200ms for NIC reinitialization then sends "rebind" to recreate
+// waits 1s for NIC reinitialization then sends "rebind" to recreate
 // workers with fresh AF_XDP sockets.
 //
-// The 200ms delay lets the mlx5 NIC fully reinitialize its UMR (User
+// The 1s delay lets the mlx5 NIC fully reinitialize its UMR (User
 // Memory Region) subsystem after link reactivation. Without this, the
 // NIC's UMR WQE queue overflows when all XSK sockets are recreated
 // simultaneously (rx_xsk_congst_umr), causing UMEM pages to not be mapped
@@ -1017,7 +1019,7 @@ func (m *Manager) NotifyLinkCycle() {
 	// sockets. mlx5 releases zero-copy queue resources asynchronously after
 	// socket close — binding a new socket to the same queue before teardown
 	// completes returns EBUSY. 1s gives the driver ample time.
-	time.Sleep(1 * time.Second)
+	linkCycleRebindSleep(1 * time.Second)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
