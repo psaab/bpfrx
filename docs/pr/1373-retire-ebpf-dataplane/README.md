@@ -252,8 +252,10 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 
 Use [smoke-gates.md](smoke-gates.md) for the repeatable Phase 1/2 operator
 checklist: CoS-off IPv4/IPv6 push and reverse, screen/flood baseline,
-CoS-on 5200..5211 class sweeps, 6200..6211 TCP echo probes, and the
-existing HA Makefile gates.
+CoS-on 5200..5211 class sweeps, 6200..6211 TCP echo probes, the standard
+`userspace-phase-cycle.sh` eight-cell HA smoke matrix, and the existing HA
+Makefile gates. The direct HA validator keeps a `--fast` IPv4/IPv6 push-only
+readiness mode, but standard smoke evidence must use the full matrix.
 
 ## #1477 Final Artifact Contract
 

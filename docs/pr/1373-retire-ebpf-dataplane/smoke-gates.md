@@ -32,9 +32,14 @@ Fresh deploys start CoS-off because `docs/ha-cluster-userspace.conf` has no
 CoS fixture. If this is not a fresh deploy, redeploy before the CoS-off gate
 or intentionally clear/reload the userspace cluster config first.
 
+The direct HA validator's default `--fast` mode is only a current-CoS
+IPv4/IPv6 push readiness check. Use `--smoke-matrix` or the phase-cycle gate
+below for standard smoke evidence that covers push, reverse, CoS-off, and
+CoS-on cells.
+
 ```bash
 BPFRX_CLUSTER_ENV="$BPFRX_CLUSTER_ENV" ./test/incus/cluster-setup.sh deploy all
-./scripts/userspace-ha-validation.sh --env "$BPFRX_CLUSTER_ENV"
+./scripts/userspace-ha-validation.sh --env "$BPFRX_CLUSTER_ENV" --fast
 ```
 
 ## Gate 1: CoS-Off IPv4/IPv6 Push And Reverse
@@ -332,17 +337,32 @@ test "$failed" -eq 0
 ## Gate 5: Deploy And Steady-State Userspace Readiness
 
 This gate exercises the canonical deploy/readiness, router-advertisement,
-ping, iperf, and collapse-detection validation suite. The validator may pin RG
-ownership before the steady-state checks, but it is not the low-latency
-failover/failback flow-survival proof. Treat any validator failure, collapse
-detection, or unexplained retransmit warning as a stop-the-line artifact to
-triage before BPF retirement proceeds.
+ping, iperf, and collapse-detection validation suite. `userspace-phase-cycle.sh`
+pushes the branch, deploys the cluster, and invokes
+`userspace-ha-validation.sh --smoke-matrix`: IPv4 push, IPv4 reverse, IPv6
+push, and IPv6 reverse while CoS is off, then the same four cells after applying
+the existing symmetric CoS fixture with
+`test/incus/apply-cos-config.sh --symmetric`. The matrix summary names each
+`cos-off-*` and `cos-on-*` cell and
+only prints `smoke matrix complete: 8/8 cells passed` after every required cell
+has passed.
+
+The validator may pin RG ownership before the steady-state checks, but it is
+not the low-latency failover/failback flow-survival proof. Treat any validator
+failure, missing matrix cell, collapse detection, or unexplained retransmit
+warning as a stop-the-line artifact to triage before BPF retirement proceeds.
+The matrix applies the symmetric CoS fixture for the CoS-on half and leaves it
+applied; redeploy before collecting fresh CoS-off-only evidence.
 
 ```bash
 set -euo pipefail
 BPFRX_CLUSTER_ENV="$BPFRX_CLUSTER_ENV" ./scripts/userspace-phase-cycle.sh \
   2>&1 | tee "$ARTIFACT_ROOT/userspace-phase-cycle.log"
 ```
+
+For a quick readiness-only cycle that preserves the old IPv4/IPv6 push scope
+and does not apply CoS, pass `--fast`. Do not use that shortened run as the
+standard Phase 1/2 smoke gate.
 
 When performance evidence is needed, run the stricter profiling variant as a
 separate artifact set:

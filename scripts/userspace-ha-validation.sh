@@ -26,13 +26,20 @@ MTR_REPORT_CYCLES="${MTR_REPORT_CYCLES:-1}"
 WAN_TEST_IFACE="${WAN_TEST_IFACE:-}"
 IPERF_METRICS="${PROJECT_ROOT}/scripts/iperf-json-metrics.py"
 ALLOW_LEGACY_EBPF_HA_VALIDATION="${ALLOW_LEGACY_EBPF_HA_VALIDATION:-0}"
+SMOKE_MODE="${SMOKE_MODE:-fast}"
 WITH_PERF=0
 DEPLOY=0
+DRY_RUN_MATRIX=0
+DRY_RUN_FAIL_CELL="${DRY_RUN_FAIL_CELL:-}"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--perf) WITH_PERF=1 ;;
 	--deploy) DEPLOY=1 ;;
+	--smoke-matrix | --full-matrix) SMOKE_MODE="matrix" ;;
+	--fast) SMOKE_MODE="fast" ;;
+	--dry-run-matrix) DRY_RUN_MATRIX=1 ;;
+	--dry-run-fail-cell) DRY_RUN_FAIL_CELL="$2"; shift ;;
 	--env) ENV_FILE="$2"; shift ;;
 	--runs) RUNS="$2"; shift ;;
 	--duration) DURATION="$2"; shift ;;
@@ -56,6 +63,14 @@ ACTIVE_FW="${FW0}"
 
 info() { printf '==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+normalize_smoke_mode() {
+	case "$SMOKE_MODE" in
+	matrix | full | full-matrix | smoke-matrix) SMOKE_MODE="matrix" ;;
+	fast | legacy) SMOKE_MODE="fast" ;;
+	*) die "unknown SMOKE_MODE: ${SMOKE_MODE}" ;;
+	esac
+}
 
 run_host() {
 	sg incus-admin -c "incus exec ${HOST} -- bash -lc $(printf %q "$1")"
@@ -377,59 +392,20 @@ validate_traceroute_visibility() {
 	validate_mtr_report "ipv6" "${mtr_v6}" 1
 }
 
-if [[ $DEPLOY -eq 1 ]]; then
-	info "deploying isolated userspace cluster from ${ENV_FILE}"
-	BPFRX_CLUSTER_ENV="$ENV_FILE" "${PROJECT_ROOT}/test/incus/cluster-setup.sh" deploy all
-fi
-
-info "waiting for xpfd gRPC/CLI readiness"
-wait_for_vm_cli "$FW0" || die "fw0 xpfd did not become reachable in time"
-wait_for_vm_cli "$FW1" || die "fw1 xpfd did not become reachable in time"
-
-info "detecting userspace runtime mode"
-MODE="$(runtime_mode)" || die "userspace runtime mode did not settle in time"
-info "runtime mode: ${MODE}"
-if [[ "${MODE}" == "legacy" ]]; then
-	if [[ "${ALLOW_LEGACY_EBPF_HA_VALIDATION}" == "1" ]]; then
-		info "legacy eBPF fallback accepted by ALLOW_LEGACY_EBPF_HA_VALIDATION=1"
-		ACTIVE_FW="$(active_owner_vm)" ||
-			die "legacy fallback override requires an unambiguous active firewall owner"
-		info "active legacy fallback firewall: ${ACTIVE_FW}"
-	else
-		die "legacy eBPF fallback detected; userspace HA validation requires" \
-			"xdp_userspace_prog; set ALLOW_LEGACY_EBPF_HA_VALIDATION=1" \
-			"only for legacy regression runs"
-	fi
-else
-	info "supported userspace runtime detected"
-	ensure_preferred_active_node
-	arm_supported_runtime
-fi
-
-info "ensuring IPv6 default route via router advertisement"
-wait_for_ipv6_default_route || die "cluster userspace host still has no IPv6 default route after repeated RA solicitation"
-
-ensure_dualstack_wan_neighbors "$ACTIVE_FW"
-
-info "basic reachability checks"
-run_host "ping -c 2 -W 1 ${V4_TEST_TARGET} >/tmp/userspace-ping-v4.out"
-run_host "ping -6 -c 2 -W 1 ${V6_TEST_TARGET} >/tmp/userspace-ping-v6.out"
-
-summary_file="$(mktemp)"
-cleanup() { rm -f "$summary_file"; }
-trap cleanup EXIT
-
-validate_traceroute_visibility
-
 run_iperf_json() {
-	local family="$1" target="$2" outfile="$3"
-	local cmd tmpfile timeout_sec
+	local family="$1" target="$2" outfile="$3" direction="${4:-push}"
+	local cmd tmpfile timeout_sec reverse_arg=""
 	tmpfile="${outfile}.tmp"
 	timeout_sec="${IPERF_TIMEOUT}s"
+	case "$direction" in
+	push) reverse_arg="" ;;
+	reverse) reverse_arg=" -R" ;;
+	*) die "unknown iperf direction: ${direction}" ;;
+	esac
 	if [[ "$family" == "6" ]]; then
-		cmd="rm -f ${outfile} ${outfile}.err ${tmpfile}; if timeout -k 2 ${timeout_sec} iperf3 -6 -J -c ${target} -P ${PARALLEL} -t ${DURATION} > ${tmpfile} 2>${outfile}.err; then mv ${tmpfile} ${outfile}; else rc=\$?; rm -f ${tmpfile} ${outfile}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile}.err; else echo \"iperf3 exited with status \$rc\" >> ${outfile}.err; fi; fi"
+		cmd="rm -f ${outfile} ${outfile}.err ${tmpfile}; if timeout -k 2 ${timeout_sec} iperf3 -6 -J -c ${target} -P ${PARALLEL} -t ${DURATION}${reverse_arg} > ${tmpfile} 2>${outfile}.err; then mv ${tmpfile} ${outfile}; else rc=\$?; rm -f ${tmpfile} ${outfile}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile}.err; else echo \"iperf3 exited with status \$rc\" >> ${outfile}.err; fi; fi"
 	else
-		cmd="rm -f ${outfile} ${outfile}.err ${tmpfile}; if timeout -k 2 ${timeout_sec} iperf3 -J -c ${target} -P ${PARALLEL} -t ${DURATION} > ${tmpfile} 2>${outfile}.err; then mv ${tmpfile} ${outfile}; else rc=\$?; rm -f ${tmpfile} ${outfile}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile}.err; else echo \"iperf3 exited with status \$rc\" >> ${outfile}.err; fi; fi"
+		cmd="rm -f ${outfile} ${outfile}.err ${tmpfile}; if timeout -k 2 ${timeout_sec} iperf3 -J -c ${target} -P ${PARALLEL} -t ${DURATION}${reverse_arg} > ${tmpfile} 2>${outfile}.err; then mv ${tmpfile} ${outfile}; else rc=\$?; rm -f ${tmpfile} ${outfile}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile}.err; else echo \"iperf3 exited with status \$rc\" >> ${outfile}.err; fi; fi"
 	fi
 	run_host "$cmd"
 }
@@ -526,22 +502,133 @@ if actual < minimum:
 PY
 }
 
-warm_up_family() {
-	local label="$1" target="$2" family="$3"
-	local json="/tmp/${label}-warmup.json"
-	info "warming up ${label} path"
-	run_iperf_json "$family" "$target" "$json"
+matrix_cell_specs() {
+	local mode="$1"
+	local cos_state family direction target min_gbps family_arg
+	case "$mode" in
+	matrix)
+		for cos_state in cos-off cos-on; do
+			for family in ipv4 ipv6; do
+				for direction in push reverse; do
+					if [[ "$family" == "ipv4" ]]; then
+						target="$V4_TEST_TARGET"
+						min_gbps="$MIN_GBPS_V4"
+						family_arg="4"
+					else
+						target="$V6_TEST_TARGET"
+						min_gbps="$MIN_GBPS_V6"
+						family_arg="6"
+					fi
+					printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+						"$cos_state" "$family" "$direction" "$family_arg" "$target" "$min_gbps"
+				done
+			done
+		done
+		;;
+	fast)
+		for family in ipv4 ipv6; do
+			if [[ "$family" == "ipv4" ]]; then
+				target="$V4_TEST_TARGET"
+				min_gbps="$MIN_GBPS_V4"
+				family_arg="4"
+			else
+				target="$V6_TEST_TARGET"
+				min_gbps="$MIN_GBPS_V6"
+				family_arg="6"
+			fi
+			printf 'current-cos\t%s\tpush\t%s\t%s\t%s\n' \
+				"$family" "$family_arg" "$target" "$min_gbps"
+		done
+		;;
+	*) die "unknown smoke mode: ${mode}" ;;
+	esac
 }
 
-validate_family() {
-	local label="$1" target="$2" family="$3" min_gbps="$4"
+cell_label() {
+	local cos_state="$1" family="$2" direction="$3"
+	if [[ "$cos_state" == "current-cos" ]]; then
+		printf 'fast-current-cos-%s-%s\n' "$family" "$direction"
+	else
+		printf '%s-%s-%s\n' "$cos_state" "$family" "$direction"
+	fi
+}
+
+cos_config_active() {
+	local output
+	if ! output="$(run_fw0 'cli -c "show class-of-service interface"')"; then
+		die "failed to query class-of-service interface state before smoke matrix"
+	fi
+	grep -iqE 'shaper|scheduler|traffic-control-profile|output.*traffic' <<<"$output"
+}
+
+ensure_cos_off_for_matrix() {
+	if (( DRY_RUN_MATRIX == 1 )); then
+		printf 'cos-off precheck: dry-run\n' | tee -a "$summary_file"
+		return 0
+	fi
+	info "verifying CoS-off baseline before smoke matrix"
+	if cos_config_active; then
+		die "smoke matrix CoS-off cells require no active CoS fixture; redeploy" \
+			"the userspace cluster or pass --deploy before collecting matrix evidence"
+	fi
+	printf 'cos-off precheck: ok\n' | tee -a "$summary_file"
+}
+
+apply_symmetric_cos_config() {
+	local cmd
+	if (( DRY_RUN_MATRIX == 1 )); then
+		printf 'cos-on apply: dry-run symmetric fixture on %s\n' "$FW0" | tee -a "$summary_file"
+		return 0
+	fi
+	info "applying symmetric CoS fixture before CoS-on smoke cells"
+	printf -v cmd '%q ' "${PROJECT_ROOT}/test/incus/apply-cos-config.sh" --symmetric "$FW0"
+	sg incus-admin -c "$cmd"
+	printf 'cos-on apply: symmetric fixture on %s\n' "$FW0" | tee -a "$summary_file"
+}
+
+print_smoke_matrix_plan() {
+	local cos_state family direction family_arg target min_gbps label cos_label
+	while IFS=$'\t' read -r cos_state family direction family_arg target min_gbps; do
+		label="$(cell_label "$cos_state" "$family" "$direction")"
+		cos_label="${cos_state#cos-}"
+		printf 'matrix plan: %s cos=%s family=%s direction=%s target=%s min_gbps=%s\n' \
+			"$label" "$cos_label" "$family" "$direction" "$target" "$min_gbps"
+	done < <(matrix_cell_specs "$SMOKE_MODE")
+}
+
+warm_up_cell() {
+	local label="$1" target="$2" family="$3" direction="$4"
+	local json="/tmp/${label}-warmup.json"
+	local metrics
+	if (( DRY_RUN_MATRIX == 1 )); then
+		printf '%s warmup: dry-run direction=%s\n' "$label" "$direction" | tee -a "$summary_file"
+		return 0
+	fi
+	info "warming up ${label} ${direction} path"
+	run_iperf_json "$family" "$target" "$json" "$direction"
+	metrics="$(iperf_metrics "$json")"
+	if [[ "$metrics" == ERROR:* ]]; then
+		die "${label} warm-up iperf failed: ${metrics#ERROR:}"
+	fi
+}
+
+validate_cell() {
+	local label="$1" target="$2" family="$3" direction="$4" min_gbps="$5"
 	local i json gbps metrics metrics_line
 	for i in $(seq 1 "$RUNS"); do
+		if (( DRY_RUN_MATRIX == 1 )); then
+			if [[ "$DRY_RUN_FAIL_CELL" == "$label" ]]; then
+				die "dry-run injected failure for ${label}"
+			fi
+			printf '%s run %s: dry-run direction=%s min=%s Gbps\n' \
+				"$label" "$i" "$direction" "$min_gbps" | tee -a "$summary_file"
+			continue
+		fi
 		local attempt=1
 		while true; do
 			json="/tmp/${label}-${i}.json"
-			info "running ${label} iperf iteration ${i}/${RUNS}"
-			run_iperf_json "$family" "$target" "$json"
+			info "running ${label} ${direction} iperf iteration ${i}/${RUNS}"
+			run_iperf_json "$family" "$target" "$json" "$direction"
 			metrics="$(iperf_metrics "$json")"
 			if [[ "$metrics" == ERROR:* ]]; then
 				die "${label} iperf failed: ${metrics#ERROR:}"
@@ -580,27 +667,116 @@ PY
 	done
 }
 
+run_performance_profile() {
+	local mode="$1"
+	local cos_state family direction family_arg target min_gbps label current_cos_state=""
+	local expected=0 completed=0
+	local complete_label="smoke matrix complete"
+
+	printf 'smoke mode: %s\n' "$mode" | tee -a "$summary_file"
+	if [[ "$mode" == "fast" ]]; then
+		printf 'smoke matrix: fast mode runs current-CoS IPv4/IPv6 push only\n' |
+			tee -a "$summary_file"
+		complete_label="smoke fast complete"
+	else
+		ensure_cos_off_for_matrix
+	fi
+
+	while IFS=$'\t' read -r cos_state family direction family_arg target min_gbps; do
+		if [[ "$cos_state" == "cos-on" && "$current_cos_state" != "cos-on" ]]; then
+			apply_symmetric_cos_config
+			current_cos_state="cos-on"
+		elif [[ "$cos_state" == "cos-off" && "$current_cos_state" != "cos-off" ]]; then
+			current_cos_state="cos-off"
+		fi
+		label="$(cell_label "$cos_state" "$family" "$direction")"
+		expected=$((expected + 1))
+		printf 'smoke cell start: %s\n' "$label" | tee -a "$summary_file"
+		warm_up_cell "$label" "$target" "$family_arg" "$direction"
+		validate_cell "$label" "$target" "$family_arg" "$direction" "$min_gbps"
+		completed=$((completed + 1))
+		printf 'smoke cell pass: %s\n' "$label" | tee -a "$summary_file"
+	done < <(matrix_cell_specs "$mode")
+
+	printf '%s: %s/%s cells passed\n' "$complete_label" "$completed" "$expected" |
+		tee -a "$summary_file"
+}
+
 run_perf_pair() {
-	local label="$1" target="$2" family="$3"
+	local label="$1" target="$2" family="$3" direction="${4:-push}"
 	local perf_data="/tmp/${label}.data"
 	local perf_report="/tmp/${label}.report"
 	local iperf_json="/tmp/${label}.json"
-	local perf_pid
+	local perf_pid perf_status=0
 
 	info "profiling ${label}"
 	sg incus-admin -c "incus exec ${ACTIVE_FW} -- bash -lc $(printf %q "rm -f ${perf_data} ${perf_report}; perf record -a -g -F 997 -o ${perf_data} -- sleep $((DURATION + 2))")" &
 	perf_pid=$!
 	sleep 1
-	run_iperf_json "$family" "$target" "$iperf_json"
-	wait "$perf_pid" || true
+	run_iperf_json "$family" "$target" "$iperf_json" "$direction"
+	wait "$perf_pid" || perf_status=$?
+	if (( perf_status != 0 )); then
+		die "perf record for ${label} exited with status ${perf_status}"
+	fi
 	run_active_fw "perf report --stdio -i ${perf_data} --sort symbol | sed -n '1,80p' > ${perf_report}"
 }
 
-warm_up_family ipv4 "${V4_TEST_TARGET}" 4
-warm_up_family ipv6 "${V6_TEST_TARGET}" 6
+normalize_smoke_mode
 
-validate_family ipv4 "${V4_TEST_TARGET}" 4 "$MIN_GBPS_V4"
-validate_family ipv6 "${V6_TEST_TARGET}" 6 "$MIN_GBPS_V6"
+summary_file="$(mktemp)"
+cleanup() { rm -f "$summary_file"; }
+trap cleanup EXIT
+
+if (( DRY_RUN_MATRIX == 1 )); then
+	info "dry-running userspace HA validation smoke matrix"
+	print_smoke_matrix_plan
+	run_performance_profile "$SMOKE_MODE"
+	info "dry-run validation summary"
+	cat "$summary_file"
+	exit 0
+fi
+
+if [[ $DEPLOY -eq 1 ]]; then
+	info "deploying isolated userspace cluster from ${ENV_FILE}"
+	BPFRX_CLUSTER_ENV="$ENV_FILE" "${PROJECT_ROOT}/test/incus/cluster-setup.sh" deploy all
+fi
+
+info "waiting for xpfd gRPC/CLI readiness"
+wait_for_vm_cli "$FW0" || die "fw0 xpfd did not become reachable in time"
+wait_for_vm_cli "$FW1" || die "fw1 xpfd did not become reachable in time"
+
+info "detecting userspace runtime mode"
+MODE="$(runtime_mode)" || die "userspace runtime mode did not settle in time"
+info "runtime mode: ${MODE}"
+if [[ "${MODE}" == "legacy" ]]; then
+	if [[ "${ALLOW_LEGACY_EBPF_HA_VALIDATION}" == "1" ]]; then
+		info "legacy eBPF fallback accepted by ALLOW_LEGACY_EBPF_HA_VALIDATION=1"
+		ACTIVE_FW="$(active_owner_vm)" ||
+			die "legacy fallback override requires an unambiguous active firewall owner"
+		info "active legacy fallback firewall: ${ACTIVE_FW}"
+	else
+		die "legacy eBPF fallback detected; userspace HA validation requires" \
+			"xdp_userspace_prog; set ALLOW_LEGACY_EBPF_HA_VALIDATION=1" \
+			"only for legacy regression runs"
+	fi
+else
+	info "supported userspace runtime detected"
+	ensure_preferred_active_node
+	arm_supported_runtime
+fi
+
+info "ensuring IPv6 default route via router advertisement"
+wait_for_ipv6_default_route || die "cluster userspace host still has no IPv6 default route after repeated RA solicitation"
+
+ensure_dualstack_wan_neighbors "$ACTIVE_FW"
+
+info "basic reachability checks"
+run_host "ping -c 2 -W 1 ${V4_TEST_TARGET} >/tmp/userspace-ping-v4.out"
+run_host "ping -6 -c 2 -W 1 ${V6_TEST_TARGET} >/tmp/userspace-ping-v6.out"
+
+validate_traceroute_visibility
+
+run_performance_profile "$SMOKE_MODE"
 
 if [[ $WITH_PERF -eq 1 ]]; then
 	run_perf_pair perf-userspace-ipv4 "${V4_TEST_TARGET}" 4

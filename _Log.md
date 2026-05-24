@@ -1161,3 +1161,21 @@
     retire_ebpf_artifact_schema_test.py`; `python3 -m py_compile
     test/incus/retire_ebpf_artifact_schema.py
     test/incus/retire_ebpf_artifact_schema_test.py`; `git diff --check`
+
+- **Timestamp**: 2026-05-23T21:51:19-07:00
+  - **Action**: Issue #1500 userspace HA smoke matrix: added an explicit
+    `--smoke-matrix` mode that runs IPv4 push, IPv4 reverse, IPv6 push, and
+    IPv6 reverse first with CoS off, then repeats those four cells after
+    applying the existing symmetric CoS fixture; kept the fast current-CoS
+    IPv4/IPv6 push readiness mode distinct; made `userspace-phase-cycle.sh`
+    invoke the full matrix by default for standard smoke evidence.
+  - **File(s)**: `scripts/userspace-ha-validation.sh`,
+    `scripts/userspace-phase-cycle.sh`,
+    `scripts/userspace_ha_validation_matrix_test.py`,
+    `docs/pr/1373-retire-ebpf-dataplane/README.md`,
+    `docs/pr/1373-retire-ebpf-dataplane/smoke-gates.md`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-phase-cycle.sh`; `shellcheck
+    scripts/userspace-ha-validation.sh scripts/userspace-phase-cycle.sh`;
+    `python3 -m unittest scripts.userspace_ha_validation_matrix_test`;
+    `git diff --check`
