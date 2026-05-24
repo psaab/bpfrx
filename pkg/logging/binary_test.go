@@ -248,6 +248,18 @@ func TestRawEventFieldOffsetsMatchWireFormat(t *testing.T) {
 		got  uintptr
 		want uintptr
 	}{
+		{name: "Timestamp", got: unsafe.Offsetof(evt.Timestamp), want: 0},
+		{name: "SrcIP", got: unsafe.Offsetof(evt.SrcIP), want: 8},
+		{name: "DstIP", got: unsafe.Offsetof(evt.DstIP), want: 24},
+		{name: "SrcPort", got: unsafe.Offsetof(evt.SrcPort), want: 40},
+		{name: "DstPort", got: unsafe.Offsetof(evt.DstPort), want: 42},
+		{name: "PolicyID", got: unsafe.Offsetof(evt.PolicyID), want: 44},
+		{name: "IngressZone", got: unsafe.Offsetof(evt.IngressZone), want: 48},
+		{name: "EgressZone", got: unsafe.Offsetof(evt.EgressZone), want: 50},
+		{name: "EventType", got: unsafe.Offsetof(evt.EventType), want: 52},
+		{name: "Protocol", got: unsafe.Offsetof(evt.Protocol), want: 53},
+		{name: "Action", got: unsafe.Offsetof(evt.Action), want: 54},
+		{name: "AddrFamily", got: unsafe.Offsetof(evt.AddrFamily), want: 55},
 		{name: "SessionPackets", got: unsafe.Offsetof(evt.SessionPackets), want: 56},
 		{name: "SessionBytes", got: unsafe.Offsetof(evt.SessionBytes), want: 64},
 		{name: "NATSrcIP", got: unsafe.Offsetof(evt.NATSrcIP), want: 72},
@@ -305,20 +317,65 @@ func eventStructFieldsFromXPFCommon(t *testing.T) []string {
 	return fields
 }
 
+func minimallyValidRawEventData() []byte {
+	data := make([]byte, rawEventWireSize)
+	data[40] = 0x30 // src port 12345
+	data[41] = 0x39
+	data[42] = 0x01 // dst port 443
+	data[43] = 0xbb
+	data[52] = eventTypeSessionOpen
+	data[53] = 6
+	data[54] = actionPermit
+	data[55] = addrFamilyInet
+	copy(data[8:12], net.ParseIP("10.0.1.1").To4())
+	copy(data[24:28], net.ParseIP("10.0.2.1").To4())
+	return data
+}
+
 func TestDecodeRawEventRecordRejectsShortRecord(t *testing.T) {
-	if _, ok := DecodeRawEventRecord(make([]byte, rawEventWireSize-1)); ok {
-		t.Fatal("DecodeRawEventRecord accepted a short record")
+	tests := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{name: "nil", data: nil, want: false},
+		{name: "empty", data: []byte{}, want: false},
+		{name: "short", data: make([]byte, rawEventWireSize-1), want: false},
+		{name: "exact", data: minimallyValidRawEventData(), want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ok := DecodeRawEventRecord(tt.data)
+			if ok != tt.want {
+				t.Fatalf("DecodeRawEventRecord(%s) ok = %v, want %v", tt.name, ok, tt.want)
+			}
+		})
 	}
 }
 
 func TestProcessRawEventRejectsShortRecord(t *testing.T) {
-	buffer := NewEventBuffer(4)
-	reader := NewEventReader(nil, buffer)
-	if reader.ProcessRawEvent(make([]byte, rawEventWireSize-1)) {
-		t.Fatal("ProcessRawEvent accepted a short record")
+	tests := []struct {
+		name      string
+		data      []byte
+		wantOK    bool
+		wantCount int
+	}{
+		{name: "nil", data: nil, wantOK: false, wantCount: 0},
+		{name: "empty", data: []byte{}, wantOK: false, wantCount: 0},
+		{name: "short", data: make([]byte, rawEventWireSize-1), wantOK: false, wantCount: 0},
+		{name: "exact", data: minimallyValidRawEventData(), wantOK: true, wantCount: 1},
 	}
-	if got := buffer.Latest(1); got != nil {
-		t.Fatalf("buffer = %+v, want empty", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buffer := NewEventBuffer(4)
+			reader := NewEventReader(nil, buffer)
+			if ok := reader.ProcessRawEvent(tt.data); ok != tt.wantOK {
+				t.Fatalf("ProcessRawEvent(%s) ok = %v, want %v", tt.name, ok, tt.wantOK)
+			}
+			if got := len(buffer.Latest(4)); got != tt.wantCount {
+				t.Fatalf("buffer count = %d, want %d", got, tt.wantCount)
+			}
+		})
 	}
 }
 

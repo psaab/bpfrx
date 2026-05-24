@@ -2,6 +2,16 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T20:58:00Z
+  - **Action**: PR #1451 review follow-up — extended the RT_FLOW
+    wire-offset canary across the full raw event layout and tightened
+    short-record boundary tests with nil, empty, short, and exact-size cases.
+  - **File(s)**: `pkg/logging/binary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/logging ./pkg/dataplane -count=1`;
+    `go test ./pkg/logging -run
+    'TestRawEventFieldOffsetsMatchWireFormat|TestDecodeRawEventRecordRejectsShortRecord|TestProcessRawEventRejectsShortRecord'
+    -count=1`; `git diff --check`
+
 - **Timestamp**: 2026-05-24T20:47:00Z
   - **Action**: PR #1451 review follow-up — added direct RT_FLOW wire-offset
     assertions and explicit short-record rejection tests for the logging event
