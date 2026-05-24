@@ -91,7 +91,7 @@ func New() *Manager {
 }
 
 // XDPEntryProgram returns the entry program selected for future XDP
-// attachments and currently swapped links.
+// attachments and non-VLAN-subinterface link swaps.
 func (m *Manager) XDPEntryProgram() string {
 	if m.xdpEntryProg == "" {
 		return defaultXDPEntryProg
@@ -133,7 +133,7 @@ func (m *Manager) Load() error {
 // and TC objects.
 func (m *Manager) LoadUserspaceShim() error {
 	slog.Info("loading userspace XDP shim")
-	m.XDPEntryProg = userspaceShimEntryProg
+	m.SelectUserspaceXDPShimEntryProgram()
 	if err := cleanupUserspaceShimLegacyTCLinks(); err != nil {
 		return err
 	}
@@ -163,7 +163,7 @@ func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, erro
 		return nil, err
 	}
 
-	m.XDPEntryProg = userspaceShimEntryProg
+	m.SelectUserspaceXDPShimEntryProgram()
 	compilerDP := userspaceShimCompileDataplane{Manager: m}
 	result, err := CompileConfig(compilerDP, cfg, m.lastCompile != nil)
 	if err != nil {

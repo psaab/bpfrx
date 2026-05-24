@@ -400,7 +400,7 @@ The original #1374-#1381 userspace feature-gap blockers are closed. Remaining
 eBPF retirement work is source-removal plumbing rather than feature admission:
 #1451 is migrating the remaining operator/runtime surfaces off the legacy
 `dataplane.DataPlane` bridge, #1473 keeps the retained XDP shim separate from
-legacy fallback behavior, #1493 owns the remaining userspace-only loader split,
+legacy fallback behavior, #1493 documents the userspace-only loader split,
 #1476 owns the final source/generated-artifact deletion, and #1477 owns live
 evidence for the exact deletion candidate.
 SYN-cookie, port-mirroring, dataplane-event, and CoS/fairness live artifacts

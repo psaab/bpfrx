@@ -130,13 +130,9 @@ the narrow userspace-shim selection/swap methods. This keeps the retained shim
 visible without implying that degraded userspace mode can bypass back into the
 legacy pipeline.
 
-The remaining #1473/#1451 blocker is #1493's loader/bootstrap shape, not runtime
-fallback semantics. `pkg/dataplane/userspace.Manager` still creates a named
-legacy shim manager for shared maps and XDP attachment plumbing, and that
-manager still loads the full legacy object set before the retained shim. The
-final source-removal path needs a userspace-only loader/bootstrap boundary that
-loads the retained shim plus required shared maps without loading legacy XDP/TC
-programs.
+The #1493 loader/bootstrap split keeps normal userspace startup on the
+userspace-only shim loader below. Source removal still waits for #1451's
+remaining operator/runtime surface migration and #1476's deletion candidate.
 
 ## #1493 Userspace Shim Loader Split
 
