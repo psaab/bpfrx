@@ -191,6 +191,15 @@ class RetireEbpfArtifactSchemaTests(unittest.TestCase):
         build_complete_artifact(root)
         return tmp, root
 
+    def assert_manifest_mutation_rejected(self, mutate, pattern: str) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            manifest = make_manifest()
+            mutate(manifest)
+            write_json(root, "manifest.json", manifest)
+            with self.assertRaisesRegex(schema.ValidationFailure, pattern):
+                schema.validate_artifact_root(root, candidate_commit=COMMIT)
+
     def test_complete_candidate_schema_passes(self) -> None:
         tmp, root = self.with_fixture()
         with tmp:
@@ -305,6 +314,114 @@ class RetireEbpfArtifactSchemaTests(unittest.TestCase):
             write_json(root, "manifest.json", manifest)
             with self.assertRaisesRegex(schema.ValidationFailure, "unknown fields"):
                 schema.validate_artifact_root(root, candidate_commit=COMMIT)
+
+    def test_rejects_schema_required_and_uniqueness_drifts(self) -> None:
+        def duplicate_artifacts(manifest: dict[str, object]) -> None:
+            commands = manifest["commands"]
+            assert isinstance(commands, list)
+            commands[0]["artifacts"] = ["summary.md", "summary.md"]
+
+        cases = (
+            (
+                "missing_top_level_required",
+                lambda manifest: manifest.pop("schema_version"),
+                "missing required fields: schema_version",
+            ),
+            (
+                "missing_cluster_name",
+                lambda manifest: manifest["cluster"].pop("name"),
+                "cluster missing required fields: name",
+            ),
+            (
+                "duplicate_issues",
+                lambda manifest: manifest.__setitem__(
+                    "issues", [1373, 1373, 1477, 1477]
+                ),
+                "issues must not contain duplicates",
+            ),
+            (
+                "duplicate_config_files",
+                lambda manifest: manifest["cluster"].__setitem__(
+                    "config_files",
+                    [
+                        "docs/ha-cluster-userspace.conf",
+                        "docs/ha-cluster-userspace.conf",
+                    ],
+                ),
+                "cluster.config_files must not contain duplicates",
+            ),
+            (
+                "duplicate_command_artifacts",
+                duplicate_artifacts,
+                "commands\\[0\\].artifacts must not contain duplicates",
+            ),
+        )
+
+        for name, mutate, pattern in cases:
+            with self.subTest(name=name):
+                self.assert_manifest_mutation_rejected(mutate, pattern)
+
+    def test_rejects_schema_minlength_and_datetime_drifts(self) -> None:
+        def empty_config_file(manifest: dict[str, object]) -> None:
+            cluster = manifest["cluster"]
+            assert isinstance(cluster, dict)
+            cluster["config_files"] = ["docs/ha-cluster-userspace.conf", ""]
+
+        def bad_command_timestamp(manifest: dict[str, object]) -> None:
+            commands = manifest["commands"]
+            assert isinstance(commands, list)
+            commands[0]["started_at"] = "not-a-date"
+
+        cases = (
+            (
+                "empty_cluster_name",
+                lambda manifest: manifest["cluster"].__setitem__("name", ""),
+                "cluster.name must be a non-empty string",
+            ),
+            (
+                "empty_candidate_branch",
+                lambda manifest: manifest.__setitem__("candidate_branch", ""),
+                "candidate_branch must be a non-empty string",
+            ),
+            (
+                "empty_config_file",
+                empty_config_file,
+                "cluster.config_files entries must be non-empty strings",
+            ),
+            (
+                "bad_artifact_created_at",
+                lambda manifest: manifest.__setitem__(
+                    "artifact_created_at", "not-a-date"
+                ),
+                "artifact_created_at must be an RFC3339 date-time string",
+            ),
+            (
+                "artifact_created_at_without_timezone",
+                lambda manifest: manifest.__setitem__(
+                    "artifact_created_at", "2026-05-24T03:00:00"
+                ),
+                "artifact_created_at must be an RFC3339 date-time string",
+            ),
+            (
+                "bad_command_timestamp",
+                bad_command_timestamp,
+                "commands\\[0\\].started_at must be an RFC3339 date-time string",
+            ),
+        )
+
+        for name, mutate, pattern in cases:
+            with self.subTest(name=name):
+                self.assert_manifest_mutation_rejected(mutate, pattern)
+
+    def test_rejects_empty_command_artifact_path(self) -> None:
+        def mutate(manifest: dict[str, object]) -> None:
+            commands = manifest["commands"]
+            assert isinstance(commands, list)
+            commands[0]["artifacts"] = ["summary.md", ""]
+
+        self.assert_manifest_mutation_rejected(
+            mutate, "commands\\[0\\].artifacts entries must be non-empty strings"
+        )
 
     def test_rejects_additional_command_fields(self) -> None:
         tmp, root = self.with_fixture()

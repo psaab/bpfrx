@@ -1,5 +1,24 @@
 # Action Log
 
+## 2026-05-24
+
+- **Timestamp**: 2026-05-24T03:46:48Z
+  - **Action**: PR #1497 round-2 follow-up — aligned the Python #1477
+    artifact checker with the manifest schema's required-field, uniqueness,
+    non-empty string, command artifact, and RFC3339 date-time constraints.
+    Added hostile regression tests for the schema/checker drift cases raised
+    in PR review.
+  - **File(s)**: `test/incus/retire_ebpf_artifact_schema.py`,
+    `test/incus/retire_ebpf_artifact_schema_test.py`, `_Log.md`
+  - **Validation**: `python3 -m unittest discover -s test/incus -p
+    retire_ebpf_artifact_schema_test.py`;
+    `python3 test/incus/retire_ebpf_artifact_schema_test.py`;
+    `python3 -m py_compile test/incus/retire_ebpf_artifact_schema.py
+    test/incus/retire_ebpf_artifact_schema_test.py`;
+    `python3 -m json.tool
+    docs/pr/1373-retire-ebpf-dataplane/final-validation/manifest.schema.json
+    >/dev/null`; `git diff --check`
+
 ## 2026-05-23
 
 - **Timestamp**: 2026-05-23T09:31:43Z

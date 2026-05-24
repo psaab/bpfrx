@@ -12,12 +12,16 @@ import argparse
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+DATE_TIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
 
 COS_OFF_CASES = ("v4-push", "v4-reverse", "v6-push", "v6-reverse")
 SCREEN_PROBES = ("land", "syn", "icmp", "udp")
@@ -65,8 +69,19 @@ MANIFEST_FIELDS = {
     "notes",
 }
 
+REQUIRED_MANIFEST_FIELDS = {
+    "schema_version",
+    "issues",
+    "candidate_commit",
+    "cluster",
+    "binaries",
+    "commands",
+}
+
 CLUSTER_FIELDS = {"name", "env_file", "config_files"}
+REQUIRED_CLUSTER_FIELDS = {"name", "env_file", "config_files"}
 BINARY_FIELDS = {"host", "path", "sha256", "version"}
+REQUIRED_BINARY_FIELDS = {"host", "path", "sha256"}
 COMMAND_FIELDS = {
     "gate",
     "command",
@@ -75,6 +90,7 @@ COMMAND_FIELDS = {
     "finished_at",
     "artifacts",
 }
+REQUIRED_COMMAND_FIELDS = {"gate", "command", "exit_status"}
 
 SUMMARY_HEADINGS = (
     "Candidate",
@@ -152,6 +168,9 @@ class ArtifactChecker:
             return {}
 
         self.validate_known_fields("manifest.json", manifest, MANIFEST_FIELDS)
+        self.validate_required_fields(
+            "manifest.json", manifest, REQUIRED_MANIFEST_FIELDS
+        )
 
         if manifest.get("schema_version") != 1:
             self.error("manifest.json schema_version must be 1")
@@ -167,6 +186,8 @@ class ArtifactChecker:
             ]
             if bad_issue_types:
                 self.error("manifest.json issues must be integer issue numbers")
+            elif len(set(issues)) != len(issues):
+                self.error("manifest.json issues must not contain duplicates")
             elif not {1373, 1477}.issubset(set(issues)):
                 self.error("manifest.json issues must include 1373 and 1477")
 
@@ -187,11 +208,28 @@ class ArtifactChecker:
                     f"candidate_commit ({short})"
                 )
 
+        if "candidate_branch" in manifest:
+            self.validate_non_empty_string(
+                "manifest.json candidate_branch", manifest.get("candidate_branch")
+            )
+        if "artifact_created_at" in manifest:
+            self.validate_date_time_string(
+                "manifest.json artifact_created_at", manifest.get("artifact_created_at")
+            )
+        if "notes" in manifest and not isinstance(manifest.get("notes"), str):
+            self.error("manifest.json notes must be a string")
+
         cluster = manifest.get("cluster")
         if not isinstance(cluster, dict):
             self.error("manifest.json cluster must be an object")
         else:
             self.validate_known_fields("manifest.json cluster", cluster, CLUSTER_FIELDS)
+            self.validate_required_fields(
+                "manifest.json cluster", cluster, REQUIRED_CLUSTER_FIELDS
+            )
+            self.validate_non_empty_string(
+                "manifest.json cluster.name", cluster.get("name")
+            )
             if cluster.get("env_file") != "test/incus/loss-userspace-cluster.env":
                 self.error(
                     "manifest.json cluster.env_file must be "
@@ -205,8 +243,18 @@ class ArtifactChecker:
                     "manifest.json cluster.config_files must include "
                     "docs/ha-cluster-userspace.conf"
                 )
-            elif any(not isinstance(item, str) for item in config_files):
-                self.error("manifest.json cluster.config_files entries must be strings")
+            elif len(config_files) == 0:
+                self.error("manifest.json cluster.config_files must not be empty")
+            else:
+                self.validate_unique_list(
+                    "manifest.json cluster.config_files", config_files
+                )
+                for item in config_files:
+                    if not isinstance(item, str) or not item:
+                        self.error(
+                            "manifest.json cluster.config_files entries must be non-empty strings"
+                        )
+                        break
 
         binaries = manifest.get("binaries")
         if not isinstance(binaries, list) or not binaries:
@@ -219,18 +267,26 @@ class ArtifactChecker:
                 self.validate_known_fields(
                     f"manifest.json binaries[{idx}]", binary, BINARY_FIELDS
                 )
+                self.validate_required_fields(
+                    f"manifest.json binaries[{idx}]",
+                    binary,
+                    REQUIRED_BINARY_FIELDS,
+                )
                 for field in ("host", "path"):
-                    if not isinstance(binary.get(field), str) or not binary[field]:
-                        self.error(f"manifest.json binaries[{idx}].{field} is required")
+                    self.validate_non_empty_string(
+                        f"manifest.json binaries[{idx}].{field}", binary.get(field)
+                    )
                 digest = binary.get("sha256")
                 if not isinstance(digest, str) or not SHA256_RE.match(digest):
                     self.error(
                         f"manifest.json binaries[{idx}].sha256 must be a 64-character hex digest"
                     )
+                if "version" in binary and not isinstance(binary.get("version"), str):
+                    self.error(f"manifest.json binaries[{idx}].version must be a string")
 
         commands = manifest.get("commands")
-        if not isinstance(commands, list):
-            self.error("manifest.json commands must be a list")
+        if not isinstance(commands, list) or not commands:
+            self.error("manifest.json commands must be a non-empty list")
         else:
             gates: set[str] = set()
             for idx, command in enumerate(commands):
@@ -240,8 +296,13 @@ class ArtifactChecker:
                 self.validate_known_fields(
                     f"manifest.json commands[{idx}]", command, COMMAND_FIELDS
                 )
+                self.validate_required_fields(
+                    f"manifest.json commands[{idx}]",
+                    command,
+                    REQUIRED_COMMAND_FIELDS,
+                )
                 gate = command.get("gate")
-                if isinstance(gate, str):
+                if isinstance(gate, str) and gate:
                     if gate in REQUIRED_COMMAND_GATES:
                         gates.add(gate)
                     else:
@@ -255,6 +316,28 @@ class ArtifactChecker:
                     self.error(
                         f"manifest.json commands[{idx}].exit_status must be recorded as an integer"
                     )
+                for field in ("started_at", "finished_at"):
+                    if field in command:
+                        self.validate_date_time_string(
+                            f"manifest.json commands[{idx}].{field}",
+                            command.get(field),
+                        )
+                if "artifacts" in command:
+                    artifacts = command.get("artifacts")
+                    if not isinstance(artifacts, list):
+                        self.error(
+                            f"manifest.json commands[{idx}].artifacts must be a list"
+                        )
+                    else:
+                        self.validate_unique_list(
+                            f"manifest.json commands[{idx}].artifacts", artifacts
+                        )
+                        for artifact in artifacts:
+                            if not isinstance(artifact, str) or not artifact:
+                                self.error(
+                                    f"manifest.json commands[{idx}].artifacts entries must be non-empty strings"
+                                )
+                                break
             missing = sorted(REQUIRED_COMMAND_GATES - gates)
             if missing:
                 self.error("manifest.json commands missing gates: " + ", ".join(missing))
@@ -267,6 +350,42 @@ class ArtifactChecker:
         unknown = sorted(set(value) - allowed)
         if unknown:
             self.error(f"{context} has unknown fields: {', '.join(unknown)}")
+
+    def validate_required_fields(
+        self, context: str, value: dict[str, Any], required: set[str]
+    ) -> None:
+        missing = sorted(required - set(value))
+        if missing:
+            self.error(f"{context} missing required fields: {', '.join(missing)}")
+
+    def validate_non_empty_string(self, context: str, value: Any) -> None:
+        if not isinstance(value, str) or not value:
+            self.error(f"{context} must be a non-empty string")
+
+    def validate_unique_list(self, context: str, value: list[Any]) -> None:
+        try:
+            unique_count = len(set(value))
+        except TypeError:
+            self.error(f"{context} entries must be scalar values")
+            return
+        if unique_count != len(value):
+            self.error(f"{context} must not contain duplicates")
+
+    def validate_date_time_string(self, context: str, value: Any) -> None:
+        if not isinstance(value, str) or not value:
+            self.error(f"{context} must be a date-time string")
+            return
+        if not DATE_TIME_RE.match(value):
+            self.error(f"{context} must be an RFC3339 date-time string")
+            return
+        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            self.error(f"{context} must be an RFC3339 date-time string")
+            return
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            self.error(f"{context} must include a timezone offset")
 
     def validate_metadata(self) -> None:
         self.require_file("metadata/git-rev-parse-head.txt")
