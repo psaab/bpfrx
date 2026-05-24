@@ -241,6 +241,34 @@ func TestRawEventContractMatchesBPFHeader(t *testing.T) {
 	}
 }
 
+func TestRawEventFieldOffsetsMatchWireFormat(t *testing.T) {
+	var evt rawEvent
+	tests := []struct {
+		name string
+		got  uintptr
+		want uintptr
+	}{
+		{name: "SessionPackets", got: unsafe.Offsetof(evt.SessionPackets), want: 56},
+		{name: "SessionBytes", got: unsafe.Offsetof(evt.SessionBytes), want: 64},
+		{name: "NATSrcIP", got: unsafe.Offsetof(evt.NATSrcIP), want: 72},
+		{name: "NATDstIP", got: unsafe.Offsetof(evt.NATDstIP), want: 88},
+		{name: "NATSrcPort", got: unsafe.Offsetof(evt.NATSrcPort), want: 104},
+		{name: "NATDstPort", got: unsafe.Offsetof(evt.NATDstPort), want: 106},
+		{name: "Created", got: unsafe.Offsetof(evt.Created), want: 108},
+		{name: "RevPackets", got: unsafe.Offsetof(evt.RevPackets), want: 112},
+		{name: "RevBytes", got: unsafe.Offsetof(evt.RevBytes), want: 120},
+		{name: "IngressIfindex", got: unsafe.Offsetof(evt.IngressIfindex), want: 128},
+		{name: "AppID", got: unsafe.Offsetof(evt.AppID), want: 132},
+		{name: "CloseReason", got: unsafe.Offsetof(evt.CloseReason), want: 134},
+		{name: "PadEvent", got: unsafe.Offsetof(evt.PadEvent), want: 135},
+	}
+	for _, tt := range tests {
+		if tt.got != tt.want {
+			t.Fatalf("%s offset = %d, want %d", tt.name, tt.got, tt.want)
+		}
+	}
+}
+
 func eventStructFieldsFromXPFCommon(t *testing.T) []string {
 	t.Helper()
 	path := filepath.Join("..", "..", "bpf", "headers", "xpf_common.h")
@@ -275,6 +303,23 @@ func eventStructFieldsFromXPFCommon(t *testing.T) []string {
 		}
 	}
 	return fields
+}
+
+func TestDecodeRawEventRecordRejectsShortRecord(t *testing.T) {
+	if _, ok := DecodeRawEventRecord(make([]byte, rawEventWireSize-1)); ok {
+		t.Fatal("DecodeRawEventRecord accepted a short record")
+	}
+}
+
+func TestProcessRawEventRejectsShortRecord(t *testing.T) {
+	buffer := NewEventBuffer(4)
+	reader := NewEventReader(nil, buffer)
+	if reader.ProcessRawEvent(make([]byte, rawEventWireSize-1)) {
+		t.Fatal("ProcessRawEvent accepted a short record")
+	}
+	if got := buffer.Latest(1); got != nil {
+		t.Fatalf("buffer = %+v, want empty", got)
+	}
 }
 
 func TestFormatBinaryRecord_SessionClose(t *testing.T) {

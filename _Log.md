@@ -2,6 +2,14 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T20:47:00Z
+  - **Action**: PR #1451 review follow-up — added direct RT_FLOW wire-offset
+    assertions and explicit short-record rejection tests for the logging event
+    decoder/reader without widening the production boundary again.
+  - **File(s)**: `pkg/logging/binary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/logging ./pkg/dataplane -count=1`;
+    `git diff --check`
+
 - **Timestamp**: 2026-05-24T19:26:45Z
   - **Action**: #1451 logging boundary shrink — moved the logging event
     reader to a package-local `EventSource` interface and RT_FLOW event wire
