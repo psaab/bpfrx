@@ -422,20 +422,24 @@ validate_traceroute_visibility() {
 
 run_iperf_json() {
 	local family="$1" target="$2" outfile="$3" direction="${4:-push}" port="${5:-5201}"
-	local cmd tmpfile timeout_sec reverse_arg="" port_arg
+	local cmd tmpfile timeout_sec reverse_arg="" port_arg target_arg outfile_arg outfile_err_arg tmpfile_arg
 	tmpfile="${outfile}.tmp"
 	timeout_sec="${IPERF_TIMEOUT}s"
 	validate_port run_iperf_json_port "$port"
 	printf -v port_arg '%q' "$port"
+	printf -v target_arg '%q' "$target"
+	printf -v outfile_arg '%q' "$outfile"
+	printf -v outfile_err_arg '%q' "${outfile}.err"
+	printf -v tmpfile_arg '%q' "$tmpfile"
 	case "$direction" in
 	push) reverse_arg="" ;;
 	reverse) reverse_arg=" -R" ;;
 	*) die "unknown iperf direction: ${direction}" ;;
 	esac
 	if [[ "$family" == "6" ]]; then
-		cmd="rm -f ${outfile} ${outfile}.err ${tmpfile}; if timeout -k 2 ${timeout_sec} iperf3 -6 -J -c ${target} -p ${port_arg} -P ${PARALLEL} -t ${DURATION}${reverse_arg} > ${tmpfile} 2>${outfile}.err; then mv ${tmpfile} ${outfile}; else rc=\$?; rm -f ${tmpfile} ${outfile}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile}.err; else echo \"iperf3 exited with status \$rc\" >> ${outfile}.err; fi; fi"
+		cmd="rm -f ${outfile_arg} ${outfile_err_arg} ${tmpfile_arg}; if timeout -k 2 ${timeout_sec} iperf3 -6 -J -c ${target_arg} -p ${port_arg} -P ${PARALLEL} -t ${DURATION}${reverse_arg} > ${tmpfile_arg} 2>${outfile_err_arg}; then mv ${tmpfile_arg} ${outfile_arg}; else rc=\$?; rm -f ${tmpfile_arg} ${outfile_arg}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile_err_arg}; else echo \"iperf3 exited with status \$rc\" >> ${outfile_err_arg}; fi; fi"
 	else
-		cmd="rm -f ${outfile} ${outfile}.err ${tmpfile}; if timeout -k 2 ${timeout_sec} iperf3 -J -c ${target} -p ${port_arg} -P ${PARALLEL} -t ${DURATION}${reverse_arg} > ${tmpfile} 2>${outfile}.err; then mv ${tmpfile} ${outfile}; else rc=\$?; rm -f ${tmpfile} ${outfile}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile}.err; else echo \"iperf3 exited with status \$rc\" >> ${outfile}.err; fi; fi"
+		cmd="rm -f ${outfile_arg} ${outfile_err_arg} ${tmpfile_arg}; if timeout -k 2 ${timeout_sec} iperf3 -J -c ${target_arg} -p ${port_arg} -P ${PARALLEL} -t ${DURATION}${reverse_arg} > ${tmpfile_arg} 2>${outfile_err_arg}; then mv ${tmpfile_arg} ${outfile_arg}; else rc=\$?; rm -f ${tmpfile_arg} ${outfile_arg}; if [[ \$rc -eq 124 || \$rc -eq 137 ]]; then echo \"iperf3 timed out after ${timeout_sec}\" >> ${outfile_err_arg}; else echo \"iperf3 exited with status \$rc\" >> ${outfile_err_arg}; fi; fi"
 	fi
 	run_host "$cmd"
 }

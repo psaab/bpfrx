@@ -2,6 +2,18 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T18:24:00Z
+  - **Action**: PR #1508 copilot follow-up — hardened `run_iperf_json`
+    remote command construction by shell-escaping the target and temporary
+    output paths so env-driven target overrides cannot inject shell syntax
+    into host-side iperf execution.
+  - **File(s)**: `scripts/userspace-ha-validation.sh`, `_Log.md`
+  - **Validation**: `bash -n scripts/userspace-ha-validation.sh
+    scripts/userspace-phase-cycle.sh`; `shellcheck
+    scripts/userspace-ha-validation.sh scripts/userspace-phase-cycle.sh`;
+    `python3 -m unittest scripts.userspace_ha_validation_matrix_test`;
+    `git diff --check`
+
 - **Timestamp**: 2026-05-24T18:01:21Z
   - **Action**: PR #1508 review follow-up — added script-local
     documentation for the four smoke-matrix iperf port overrides, hardened
