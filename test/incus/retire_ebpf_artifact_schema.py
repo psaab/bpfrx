@@ -20,7 +20,9 @@ from typing import Any
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 DATE_TIME_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+    r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})"
+    r"[Tt](?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
+    r"(?P<fraction>\.\d+)?(?P<zone>[Zz]|[+-]\d{2}:\d{2})$"
 )
 
 COS_OFF_CASES = ("v4-push", "v4-reverse", "v6-push", "v6-reverse")
@@ -172,23 +174,20 @@ class ArtifactChecker:
             "manifest.json", manifest, REQUIRED_MANIFEST_FIELDS
         )
 
-        if manifest.get("schema_version") != 1:
+        schema_version = manifest.get("schema_version")
+        if isinstance(schema_version, bool) or schema_version != 1:
             self.error("manifest.json schema_version must be 1")
 
         issues = manifest.get("issues")
         if not isinstance(issues, list):
             self.error("manifest.json issues must include 1373 and 1477")
         else:
-            bad_issue_types = [
-                issue
-                for issue in issues
-                if isinstance(issue, bool) or not isinstance(issue, int)
-            ]
-            if bad_issue_types:
+            issue_numbers = [self.issue_number(issue) for issue in issues]
+            if any(issue is None for issue in issue_numbers):
                 self.error("manifest.json issues must be integer issue numbers")
-            elif len(set(issues)) != len(issues):
+            elif len(set(issue_numbers)) != len(issue_numbers):
                 self.error("manifest.json issues must not contain duplicates")
-            elif not {1373, 1477}.issubset(set(issues)):
+            elif not {1373, 1477}.issubset(set(issue_numbers)):
                 self.error("manifest.json issues must include 1373 and 1477")
 
         raw_commit = manifest.get("candidate_commit")
@@ -236,13 +235,8 @@ class ArtifactChecker:
                     "test/incus/loss-userspace-cluster.env"
                 )
             config_files = cluster.get("config_files")
-            if not isinstance(config_files, list) or (
-                "docs/ha-cluster-userspace.conf" not in config_files
-            ):
-                self.error(
-                    "manifest.json cluster.config_files must include "
-                    "docs/ha-cluster-userspace.conf"
-                )
+            if not isinstance(config_files, list):
+                self.error("manifest.json cluster.config_files must be a list")
             elif len(config_files) == 0:
                 self.error("manifest.json cluster.config_files must not be empty")
             else:
@@ -255,6 +249,11 @@ class ArtifactChecker:
                             "manifest.json cluster.config_files entries must be non-empty strings"
                         )
                         break
+                if "docs/ha-cluster-userspace.conf" not in config_files:
+                    self.error(
+                        "manifest.json cluster.config_files must include "
+                        "docs/ha-cluster-userspace.conf"
+                    )
 
         binaries = manifest.get("binaries")
         if not isinstance(binaries, list) or not binaries:
@@ -362,6 +361,15 @@ class ArtifactChecker:
         if not isinstance(value, str) or not value:
             self.error(f"{context} must be a non-empty string")
 
+    def issue_number(self, value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return None
+
     def validate_unique_list(self, context: str, value: list[Any]) -> None:
         try:
             unique_count = len(set(value))
@@ -375,10 +383,21 @@ class ArtifactChecker:
         if not isinstance(value, str) or not value:
             self.error(f"{context} must be a date-time string")
             return
-        if not DATE_TIME_RE.match(value):
+        match = DATE_TIME_RE.match(value)
+        if not match:
             self.error(f"{context} must be an RFC3339 date-time string")
             return
-        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        second = int(match.group("second"))
+        if second > 60:
+            self.error(f"{context} must be an RFC3339 date-time string")
+            return
+        normalized = value
+        normalized = normalized[:10] + "T" + normalized[11:]
+        if normalized.endswith(("Z", "z")):
+            normalized = normalized[:-1] + "+00:00"
+        if second == 60:
+            start, end = match.span("second")
+            normalized = normalized[:start] + "59" + normalized[end:]
         try:
             parsed = datetime.fromisoformat(normalized)
         except ValueError:
@@ -515,6 +534,10 @@ class ArtifactChecker:
         )
 
     def validate_fallback_exclusion(self) -> None:
+        json_artifacts = {
+            "fallback-exclusion/fw0-userspace-dp.json",
+            "fallback-exclusion/fw1-userspace-dp.json",
+        }
         for rel in (
             "fallback-exclusion/fw0-ip-link.txt",
             "fallback-exclusion/fw1-ip-link.txt",
@@ -524,7 +547,10 @@ class ArtifactChecker:
             "fallback-exclusion/fw1-userspace-dp.json",
             "fallback-exclusion/legacy-map-counter-audit.txt",
         ):
-            self.require_file(rel)
+            if rel in json_artifacts:
+                self.require_json(rel)
+            else:
+                self.require_file(rel)
 
     def require_file(self, rel: str, *, non_empty: bool = True) -> Path:
         self.checked += 1
@@ -545,6 +571,9 @@ class ArtifactChecker:
             return None
         try:
             return json.loads(path.read_text(encoding="utf-8"))
+        except UnicodeDecodeError as exc:
+            self.error(f"invalid UTF-8 JSON artifact {rel}: {exc}")
+            return None
         except json.JSONDecodeError as exc:
             self.error(f"invalid JSON artifact {rel}: {exc}")
             return None

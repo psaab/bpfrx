@@ -295,6 +295,27 @@ class RetireEbpfArtifactSchemaTests(unittest.TestCase):
             with self.assertRaisesRegex(schema.ValidationFailure, "exit_status"):
                 schema.validate_artifact_root(root, candidate_commit=COMMIT)
 
+    def test_rejects_boolean_schema_version(self) -> None:
+        self.assert_manifest_mutation_rejected(
+            lambda manifest: manifest.__setitem__("schema_version", True),
+            "schema_version must be 1",
+        )
+
+    def test_accepts_json_integer_float_issue_numbers(self) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            manifest = make_manifest()
+            manifest["issues"] = [1373.0, 1477.0]
+            write_json(root, "manifest.json", manifest)
+            summary = schema.validate_artifact_root(root, candidate_commit=COMMIT)
+            self.assertEqual(summary["verdict"], "STRUCTURE_OK")
+
+    def test_rejects_boolean_issue_number(self) -> None:
+        self.assert_manifest_mutation_rejected(
+            lambda manifest: manifest.__setitem__("issues", [True, 1373, 1477]),
+            "issues must be integer issue numbers",
+        )
+
     def test_rejects_unknown_command_gate(self) -> None:
         tmp, root = self.with_fixture()
         with tmp:
@@ -354,6 +375,13 @@ class RetireEbpfArtifactSchemaTests(unittest.TestCase):
                 "duplicate_command_artifacts",
                 duplicate_artifacts,
                 "commands\\[0\\].artifacts must not contain duplicates",
+            ),
+            (
+                "empty_config_files",
+                lambda manifest: manifest["cluster"].__setitem__(
+                    "config_files", []
+                ),
+                "cluster.config_files must not be empty",
             ),
         )
 
@@ -423,6 +451,18 @@ class RetireEbpfArtifactSchemaTests(unittest.TestCase):
             mutate, "commands\\[0\\].artifacts entries must be non-empty strings"
         )
 
+    def test_accepts_rfc3339_lowercase_tz_and_leap_second(self) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            manifest = make_manifest()
+            manifest["artifact_created_at"] = "2026-05-24t03:00:00z"
+            commands = manifest["commands"]
+            assert isinstance(commands, list)
+            commands[0]["started_at"] = "2026-06-30T23:59:60Z"
+            write_json(root, "manifest.json", manifest)
+            summary = schema.validate_artifact_root(root, candidate_commit=COMMIT)
+            self.assertEqual(summary["verdict"], "STRUCTURE_OK")
+
     def test_rejects_additional_command_fields(self) -> None:
         tmp, root = self.with_fixture()
         with tmp:
@@ -432,6 +472,21 @@ class RetireEbpfArtifactSchemaTests(unittest.TestCase):
             commands[0]["unexpected"] = "not in schema"
             write_json(root, "manifest.json", manifest)
             with self.assertRaisesRegex(schema.ValidationFailure, "unknown fields"):
+                schema.validate_artifact_root(root, candidate_commit=COMMIT)
+
+    def test_rejects_invalid_fallback_json_artifact(self) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            write_text(root, "fallback-exclusion/fw0-userspace-dp.json", "{bad")
+            with self.assertRaisesRegex(schema.ValidationFailure, "invalid JSON"):
+                schema.validate_artifact_root(root, candidate_commit=COMMIT)
+
+    def test_rejects_non_utf8_json_artifact_without_traceback(self) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            path = root / "fallback-exclusion/fw1-userspace-dp.json"
+            path.write_bytes(b"\xff\xfe{")
+            with self.assertRaisesRegex(schema.ValidationFailure, "invalid UTF-8 JSON"):
                 schema.validate_artifact_root(root, candidate_commit=COMMIT)
 
 if __name__ == "__main__":

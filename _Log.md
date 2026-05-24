@@ -2,6 +2,24 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T04:08:49Z
+  - **Action**: PR #1497 round-3 follow-up — fixed the checker/schema
+    parity nits from review: boolean `schema_version` rejection, JSON
+    integer float issue acceptance, RFC3339 lowercase/leap-second
+    acceptance, reachable empty `config_files` validation, parsed fallback
+    JSON artifacts, and Unicode decode failures reported as validation
+    errors instead of tracebacks.
+  - **File(s)**: `test/incus/retire_ebpf_artifact_schema.py`,
+    `test/incus/retire_ebpf_artifact_schema_test.py`, `_Log.md`
+  - **Validation**: `python3 -m unittest discover -s test/incus -p
+    retire_ebpf_artifact_schema_test.py`;
+    `python3 test/incus/retire_ebpf_artifact_schema_test.py`;
+    `python3 -m py_compile test/incus/retire_ebpf_artifact_schema.py
+    test/incus/retire_ebpf_artifact_schema_test.py`;
+    `python3 -m json.tool
+    docs/pr/1373-retire-ebpf-dataplane/final-validation/manifest.schema.json
+    >/dev/null`; `git diff --check`
+
 - **Timestamp**: 2026-05-24T03:46:48Z
   - **Action**: PR #1497 round-2 follow-up — aligned the Python #1477
     artifact checker with the manifest schema's required-field, uniqueness,
