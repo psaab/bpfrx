@@ -1,6 +1,6 @@
 # xpf vs Juniper vSRX Feature Gap Analysis
 
-Last updated: 2026-05-17
+Last updated: 2026-05-24
 
 > #1373 dataplane note: the Rust AF_XDP userspace dataplane is the
 > primary/default target for new dataplane work. Rows that mention only eBPF or
@@ -56,7 +56,7 @@ xpf has zone-based policies with source/dest address, application match, permit/
 | **Source Identity Match** | `security policies ... match source-identity ...` | Match on authenticated user identity (AD user/group) in policy | Medium | Missing (requires user-id) |
 | **Application Services in Policy** | `security policies ... then permit application-services` | Attach UTM, IDP, SSL-proxy, AppFW, ICAP redirect, SecIntel to policy action | High | Missing |
 | **Policy Rematch** | `security policies policy-rematch` | Re-evaluate existing sessions when policy changes | Medium | Missing |
-| **Policy Scheduling (time ranges)** | `schedulers scheduler ...` | Time-based policy activation/deactivation with start/stop dates | Low | Userspace propagation landed in #1396. #1378 remains open for the remaining retirement contract: hit-counter survival across scheduler snapshot rebuilds, strict missing-scheduler commit behavior, and integration/failover validation. |
+| **Policy Scheduling (time ranges)** | `schedulers scheduler ...` | Time-based policy activation/deactivation with start/stop dates | Low | Userspace propagation landed in #1396. #1378 is closed: scheduler state, hit-counter survival, strict missing-scheduler behavior, deterministic evidence validation, and live HA artifact capture are complete for userspace. |
 | **Reject Action with Profile** | `security policies ... then reject profile ...` | Custom ICMP/TCP-RST reject messages, redirect URLs for blocked content | Low | Missing |
 
 ---
@@ -193,7 +193,7 @@ xpf has TCP session timeouts (established, initial, closing, time-wait), UDP/ICM
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **SYN Flood Protection Mode** | `security flow syn-flood-protection-mode syn-cookie` | Global SYN flood protection mode: syn-cookie (stateless) or syn-proxy (stateful). Different from per-screen syn-flood thresholds. | Medium | Legacy eBPF done (`8cbf31a`) with BPF helpers, validated_clients LRU, and 4 counters. Userspace SYN-cookie runtime is wired for #1374 with bounded SYN-ACK/RST replies and status counters; live HA/flood evidence remains before BPF source removal. `syn-proxy` mode is not implemented. |
+| **SYN Flood Protection Mode** | `security flow syn-flood-protection-mode syn-cookie` | Global SYN flood protection mode: syn-cookie (stateless) or syn-proxy (stateful). Different from per-screen syn-flood thresholds. | Medium | Legacy eBPF done (`8cbf31a`) with BPF helpers, validated_clients LRU, and 4 counters. Userspace SYN-cookie runtime is wired for #1374 with bounded SYN-ACK/RST replies and status counters; final #1477 source-removal evidence still needs to include the SYN-cookie HA/flood artifacts for the exact deletion candidate. `syn-proxy` mode is not implemented. |
 | **TCP Strict SYN Check** | `security flow tcp-session strict-syn-check` | Require SYN as first packet for TCP session creation (drop mid-stream pickup) | Medium | **Done** (`2114333`) — default behavior (SYN required), configurable via no-syn-check / no-syn-check-in-tunnel. |
 | **TCP No-SYN-Check** | `security flow tcp-session no-syn-check` | Allow mid-stream TCP session pickup (useful after failover or asymmetric routing) | Medium | **Done** (`2114333`) — BPF flow_config tcp_flags bit, creates ESTABLISHED state for non-SYN first packet. eBPF + DPDK. |
 | **TCP No-SYN-Check in Tunnel** | `security flow tcp-session no-syn-check-in-tunnel` | Allow mid-stream pickup specifically for tunneled traffic (IPsec, GRE) | Low | **Done** (`2114333`) — per-interface IFACE_FLAG_TUNNEL in iface_zone_value, propagated via META_FLAG_TUNNEL in xdp_zone. |
@@ -318,8 +318,8 @@ xpf has firewall filters with source/dest addresses, prefix-lists (with except),
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color, three-color policers. | High | Partial for #1373: legacy eBPF/DPDK token-bucket policer support exists; userspace supports the admitted filter path and the color-blind `then discard` three-color slice. #1375 still tracks unsupported color-aware/non-drop behavior and evidence. |
-| **Three-Color Policer** | `firewall three-color-policer ...` | RFC 2697/2698 metering with green/yellow/red marking based on CIR/CBS/EBS or CIR/PIR | Medium | Legacy eBPF/DPDK done; userspace AF_XDP supports color-blind `then discard` with compatible snapshot continuity. #1375 remains a retirement blocker for color-aware/non-drop action parity and integration/failover/perf evidence. |
+| **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color, three-color policers. | High | Partial for #1373: legacy eBPF/DPDK token-bucket policer support exists; userspace supports the admitted filter path and the color-blind `then discard` three-color slice. #1375 is closed; unsupported color-aware/non-drop behavior and broader Junos parity remain production/future parity work, not active #1373 source-removal blockers. |
+| **Three-Color Policer** | `firewall three-color-policer ...` | RFC 2697/2698 metering with green/yellow/red marking based on CIR/CBS/EBS or CIR/PIR | Medium | Legacy eBPF/DPDK done; userspace AF_XDP supports color-blind `then discard` with compatible snapshot continuity. #1375 is closed; remaining color-aware/non-drop action parity plus integration, failover, and performance hardening are production/future parity work, not active #1373 source-removal blockers. |
 | **Interface Policer** | `firewall policer ... logical-interface-policer` | Aggregate rate limiting across all protocol families on a logical interface | Low | Missing |
 | **Flexible Match Conditions** | `firewall filter ... term ... from flexible-match-range ...` | Match on arbitrary byte offsets within packet header for custom protocol matching | Low | Missing |
 | **Firewall Filter on lo0** | `interfaces lo0 unit 0 family inet filter input ...` | Host-bound traffic filtering — config parsed, compiled to filter IDs, evaluated natively in xdp_forward for host-bound packets, plus kernel nftables fallback | Medium | Done |
@@ -434,7 +434,7 @@ Features most commonly used in production vSRX deployments:
 
 1. ~~**Proxy ARP/NDP for NAT**~~ - **Done** (proxy ARP with GARP; proxy NDP still missing)
 2. ~~**Session Limiting (source/dest-ip)**~~ - **Done** on the legacy BPF path (GC sweep + BPF LRU maps + xdp_screen enforcement); userspace admission is tracked in `userspace-dataplane-gaps.md`.
-3. ~~**Firewall Filter Policers**~~ - **Legacy done** (token bucket: single-rate, two-rate RFC 2698, single-rate-3c RFC 2697; eBPF + DPDK). Userspace supports the color-blind `then discard` three-color slice; #1375 tracks the remaining parity/evidence work.
+3. ~~**Firewall Filter Policers**~~ - **Legacy done** (token bucket: single-rate, two-rate RFC 2698, single-rate-3c RFC 2697; eBPF + DPDK). Userspace supports the color-blind `then discard` three-color slice; #1375 is closed. Remaining color-aware/non-drop and broader Junos parity work is production/future parity, not active #1373 source-removal work.
 4. ~~**BFD**~~ - **Done** (OSPF/IS-IS/BGP BFD via FRR profiles)
 5. **NETCONF/YANG** - Industry-standard management, enables automation tooling
 6. **Unified Policies / AppID** - Foundation of modern NGFW (long-term, high complexity)
@@ -489,12 +489,9 @@ table, so this list count can be higher than the category-level Parse-Only total
 
 ## Runtime Follow-Up Features Summary
 
-These features have a runtime slice, but still have open retirement-contract
-work tracked by the linked issue.
-
-| # | Config Path | Type | Notes |
-|---|------------|------|-------|
-| 1 | `security policies ... schedulers ...` | SchedulerConfig | Runtime userspace propagation landed in #1396. This is no longer parse-only; #1378 remains listed here only for follow-up contract work around counters, strict validation, and integration evidence. |
+No feature rows currently carry open #1373 runtime follow-up work. Closed
+contracts such as #1378 remain documented in their feature rows as closeout
+evidence, not as active eBPF source-removal blockers.
 
 ---
 
@@ -509,11 +506,13 @@ work tracked by the linked issue.
 - xdp_screen enforces limits on TCP SYN
 - Config: `set security screen ids-option <name> limit-session source-ip-based <N>` / `destination-ip-based <N>`
 
-### Firewall Filter Policers (Tier 1) -- LEGACY DONE
+### Firewall Filter Policers (Tier 1) -- PARTIAL; #1375 CLOSED
 - Token bucket policer with single-rate two-color, two-rate three-color (RFC 2698), and single-rate three-color (RFC 2697) modes
 - eBPF and DPDK parity; userspace supports the color-blind `then discard`
-  three-color slice while #1375 tracks color-aware/non-drop parity and
-  evidence
+  three-color slice
+- #1375 is closed. Remaining color-aware/non-drop behavior and broader Junos
+  parity are production/future parity work, not active #1373 source-removal
+  blockers.
 
 ### BFD (Tier 1) -- DONE
 - OSPF BFD with interval/multiplier via FRR profiles
