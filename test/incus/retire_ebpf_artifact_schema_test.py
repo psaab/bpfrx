@@ -65,6 +65,10 @@ def make_manifest(commit: str = COMMIT) -> dict[str, object]:
     }
 
 
+def make_manifest_json() -> str:
+    return json.dumps(make_manifest(), separators=(",", ":")) + "\n"
+
+
 def make_summary(commit: str = COMMIT) -> str:
     lines = ["# #1477 Source-Removal Validation Summary", "", commit, ""]
     for heading in schema.SUMMARY_HEADINGS:
@@ -310,11 +314,54 @@ class RetireEbpfArtifactSchemaTests(unittest.TestCase):
             summary = schema.validate_artifact_root(root, candidate_commit=COMMIT)
             self.assertEqual(summary["verdict"], "STRUCTURE_OK")
 
+    def test_accepts_json_integer_float_exit_status(self) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            manifest = make_manifest()
+            commands = manifest["commands"]
+            assert isinstance(commands, list)
+            commands[0]["exit_status"] = 0.0
+            write_json(root, "manifest.json", manifest)
+            summary = schema.validate_artifact_root(root, candidate_commit=COMMIT)
+            self.assertEqual(summary["verdict"], "STRUCTURE_OK")
+
     def test_rejects_boolean_issue_number(self) -> None:
         self.assert_manifest_mutation_rejected(
             lambda manifest: manifest.__setitem__("issues", [True, 1373, 1477]),
             "issues must be integer issue numbers",
         )
+
+    def test_rejects_lossy_decimal_issue_number(self) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            text = make_manifest_json()
+            needle = '"issues":[1373,1477]'
+            self.assertIn(needle, text)
+            write_text(
+                root,
+                "manifest.json",
+                text.replace(needle, '"issues":[1373.0000000000000001,1477]'),
+            )
+            with self.assertRaisesRegex(
+                schema.ValidationFailure, "issues must be integer issue numbers"
+            ):
+                schema.validate_artifact_root(root, candidate_commit=COMMIT)
+
+    def test_rejects_lossy_decimal_exit_status(self) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            text = make_manifest_json()
+            needle = '"exit_status":0'
+            self.assertIn(needle, text)
+            write_text(
+                root,
+                "manifest.json",
+                text.replace(needle, '"exit_status":0.0000000000000001', 1),
+            )
+            with self.assertRaisesRegex(
+                schema.ValidationFailure, "commands\\[0\\].exit_status"
+            ):
+                schema.validate_artifact_root(root, candidate_commit=COMMIT)
 
     def test_rejects_unknown_command_gate(self) -> None:
         tmp, root = self.with_fixture()
@@ -459,9 +506,51 @@ class RetireEbpfArtifactSchemaTests(unittest.TestCase):
             commands = manifest["commands"]
             assert isinstance(commands, list)
             commands[0]["started_at"] = "2026-06-30T23:59:60Z"
+            commands[0]["finished_at"] = "2026-12-31T23:59:60+00:00"
             write_json(root, "manifest.json", manifest)
             summary = schema.validate_artifact_root(root, candidate_commit=COMMIT)
             self.assertEqual(summary["verdict"], "STRUCTURE_OK")
+
+    def test_rejects_non_leap_shaped_sixty_second_timestamps(self) -> None:
+        def set_command_started_at(manifest: dict[str, object], value: str) -> None:
+            commands = manifest["commands"]
+            assert isinstance(commands, list)
+            commands[0]["started_at"] = value
+
+        cases = (
+            (
+                "top_level_wrong_month",
+                lambda manifest: manifest.__setitem__(
+                    "artifact_created_at", "2026-05-31T23:59:60Z"
+                ),
+                "artifact_created_at must be an RFC3339 date-time string",
+            ),
+            (
+                "top_level_wrong_day",
+                lambda manifest: manifest.__setitem__(
+                    "artifact_created_at", "2026-06-29T23:59:60Z"
+                ),
+                "artifact_created_at must be an RFC3339 date-time string",
+            ),
+            (
+                "command_wrong_hour",
+                lambda manifest: set_command_started_at(
+                    manifest, "2026-06-30T22:59:60Z"
+                ),
+                "commands\\[0\\].started_at must be an RFC3339 date-time string",
+            ),
+            (
+                "command_wrong_minute",
+                lambda manifest: set_command_started_at(
+                    manifest, "2026-12-31T23:58:60Z"
+                ),
+                "commands\\[0\\].started_at must be an RFC3339 date-time string",
+            ),
+        )
+
+        for name, mutate, pattern in cases:
+            with self.subTest(name=name):
+                self.assert_manifest_mutation_rejected(mutate, pattern)
 
     def test_rejects_additional_command_fields(self) -> None:
         tmp, root = self.with_fixture()

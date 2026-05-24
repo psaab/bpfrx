@@ -1120,3 +1120,19 @@
   - **Validation**: `rg -n "#1375|#1378|retirement blocker|retirement-contract"
     docs/feature-gaps.md docs/pr/1373-retire-ebpf-dataplane/README.md
     docs/pr/1373-retire-ebpf-dataplane/plan.md`; `git diff --check`
+
+- **Timestamp**: 2026-05-23T21:46:59-07:00
+  - **Action**: #1502 artifact-schema checker follow-up: parse JSON floats as
+    `Decimal`, normalize JSON integer-like values for manifest issues,
+    schema version, and command exit status, reject lossy non-integer decimal
+    numbers, and restrict accepted RFC3339 leap seconds to 23:59:60 on June 30
+    or December 31.
+  - **File(s)**: `test/incus/retire_ebpf_artifact_schema.py`,
+    `test/incus/retire_ebpf_artifact_schema_test.py`, `_Log.md`
+  - **Validation**: `python3 -m unittest discover -s test/incus -p
+    retire_ebpf_artifact_schema_test.py`; `python3
+    test/incus/retire_ebpf_artifact_schema_test.py`; `python3 -m py_compile
+    test/incus/retire_ebpf_artifact_schema.py
+    test/incus/retire_ebpf_artifact_schema_test.py`; `python3 -m json.tool
+    docs/pr/1373-retire-ebpf-dataplane/final-validation/manifest.schema.json
+    >/dev/null`; `git diff --check`

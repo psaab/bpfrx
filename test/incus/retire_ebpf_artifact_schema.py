@@ -13,6 +13,7 @@ import json
 import re
 import sys
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -174,21 +175,25 @@ class ArtifactChecker:
             "manifest.json", manifest, REQUIRED_MANIFEST_FIELDS
         )
 
-        schema_version = manifest.get("schema_version")
-        if isinstance(schema_version, bool) or schema_version != 1:
+        schema_version = self.json_integer_value(manifest.get("schema_version"))
+        if schema_version != 1:
             self.error("manifest.json schema_version must be 1")
+        else:
+            manifest["schema_version"] = schema_version
 
         issues = manifest.get("issues")
         if not isinstance(issues, list):
             self.error("manifest.json issues must include 1373 and 1477")
         else:
-            issue_numbers = [self.issue_number(issue) for issue in issues]
+            issue_numbers = [self.json_integer_value(issue) for issue in issues]
             if any(issue is None for issue in issue_numbers):
                 self.error("manifest.json issues must be integer issue numbers")
             elif len(set(issue_numbers)) != len(issue_numbers):
                 self.error("manifest.json issues must not contain duplicates")
             elif not {1373, 1477}.issubset(set(issue_numbers)):
                 self.error("manifest.json issues must include 1373 and 1477")
+            else:
+                manifest["issues"] = issue_numbers
 
         raw_commit = manifest.get("candidate_commit")
         if not isinstance(raw_commit, str) or not FULL_SHA_RE.match(raw_commit):
@@ -310,11 +315,13 @@ class ArtifactChecker:
                     self.error(f"manifest.json commands[{idx}].gate is required")
                 if not isinstance(command.get("command"), str) or not command["command"]:
                     self.error(f"manifest.json commands[{idx}].command is required")
-                exit_status = command.get("exit_status")
-                if isinstance(exit_status, bool) or not isinstance(exit_status, int):
+                exit_status = self.json_integer_value(command.get("exit_status"))
+                if exit_status is None:
                     self.error(
                         f"manifest.json commands[{idx}].exit_status must be recorded as an integer"
                     )
+                else:
+                    command["exit_status"] = exit_status
                 for field in ("started_at", "finished_at"):
                     if field in command:
                         self.validate_date_time_string(
@@ -361,12 +368,12 @@ class ArtifactChecker:
         if not isinstance(value, str) or not value:
             self.error(f"{context} must be a non-empty string")
 
-    def issue_number(self, value: Any) -> int | None:
+    def json_integer_value(self, value: Any) -> int | None:
         if isinstance(value, bool):
             return None
         if isinstance(value, int):
             return value
-        if isinstance(value, float) and value.is_integer():
+        if isinstance(value, Decimal) and value == value.to_integral_value():
             return int(value)
         return None
 
@@ -391,6 +398,9 @@ class ArtifactChecker:
         if second > 60:
             self.error(f"{context} must be an RFC3339 date-time string")
             return
+        if second == 60 and not self.is_practical_leap_second(match):
+            self.error(f"{context} must be an RFC3339 date-time string")
+            return
         normalized = value
         normalized = normalized[:10] + "T" + normalized[11:]
         if normalized.endswith(("Z", "z")):
@@ -405,6 +415,15 @@ class ArtifactChecker:
             return
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             self.error(f"{context} must include a timezone offset")
+
+    def is_practical_leap_second(self, match: re.Match[str]) -> bool:
+        month = match.group("month")
+        day = match.group("day")
+        return (
+            match.group("hour") == "23"
+            and match.group("minute") == "59"
+            and ((month == "06" and day == "30") or (month == "12" and day == "31"))
+        )
 
     def validate_metadata(self) -> None:
         self.require_file("metadata/git-rev-parse-head.txt")
@@ -570,7 +589,7 @@ class ArtifactChecker:
         if not path.exists() or not path.is_file():
             return None
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
         except UnicodeDecodeError as exc:
             self.error(f"invalid UTF-8 JSON artifact {rel}: {exc}")
             return None
