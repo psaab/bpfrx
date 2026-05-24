@@ -25,7 +25,9 @@ array being correctly populated (verified via `bpftool map dump`).
 Issue #1473 removed this runtime dependency: the retained userspace shim now
 passes only proven local/control traffic to the kernel when helper/XSK state is
 degraded. Non-local transit drops in both compat and strict modes and is counted
-as `transit_drop` in `userspace_fallback_stats`.
+as `transit_drop` in `degraded_path_counters`. The pinned BPF map still uses the
+internal compatibility name `userspace_fallback_stats` during mixed-version
+upgrades.
 
 When the tail call failed, the function fell through to `return Ok(xdp_action::XDP_DROP)`, silently dropping all fallback packets. This affected three code paths:
 

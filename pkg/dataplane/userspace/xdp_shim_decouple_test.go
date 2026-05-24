@@ -88,8 +88,8 @@ func TestUserspaceXDPDegradedCtrlDisabledDropsTransit(t *testing.T) {
 	if ret != xdpActionDrop {
 		t.Fatalf("ctrl-disabled transit action = %d, want XDP_DROP", ret)
 	}
-	assertUserspaceXDPFallbackStat(t, coll, "ctrl_disabled")
-	assertUserspaceXDPFallbackStat(t, coll, "transit_drop")
+	assertUserspaceXDPDegradedPathStat(t, coll, "ctrl_disabled")
+	assertUserspaceXDPDegradedPathStat(t, coll, "transit_drop")
 }
 
 func TestUserspaceXDPDegradedCtrlDisabledPassesLocalControl(t *testing.T) {
@@ -111,9 +111,9 @@ func TestUserspaceXDPDegradedCtrlDisabledPassesLocalControl(t *testing.T) {
 	if ret != xdpActionPass {
 		t.Fatalf("ctrl-disabled local action = %d, want XDP_PASS", ret)
 	}
-	assertUserspaceXDPFallbackStat(t, coll, "ctrl_disabled")
-	assertUserspaceXDPFallbackStat(t, coll, "pass_to_kernel")
-	assertUserspaceXDPFallbackStatAbsent(t, coll, "transit_drop")
+	assertUserspaceXDPDegradedPathStat(t, coll, "ctrl_disabled")
+	assertUserspaceXDPDegradedPathStat(t, coll, "pass_to_kernel")
+	assertUserspaceXDPDegradedPathStatAbsent(t, coll, "transit_drop")
 }
 
 func TestUserspaceXDPBindingNotReadyDropsTransitButPassesLocalControl(t *testing.T) {
@@ -163,8 +163,8 @@ func TestUserspaceXDPBindingNotReadyDropsTransitButPassesLocalControl(t *testing
 			if ret != tc.want {
 				t.Fatalf("binding-not-ready %s action = %d, want %d", tc.name, ret, tc.want)
 			}
-			assertUserspaceXDPFallbackStat(t, coll, "binding_not_ready")
-			assertUserspaceXDPFallbackStat(t, coll, tc.statName)
+			assertUserspaceXDPDegradedPathStat(t, coll, "binding_not_ready")
+			assertUserspaceXDPDegradedPathStat(t, coll, tc.statName)
 		})
 	}
 }
@@ -190,9 +190,9 @@ func TestUserspaceXDPIPLocalControlUsesCPUMapWhenAvailable(t *testing.T) {
 	if ret != xdpActionRedirect {
 		t.Fatalf("ctrl-disabled local action with cpumap = %d, want XDP_REDIRECT", ret)
 	}
-	assertUserspaceXDPFallbackStat(t, coll, "ctrl_disabled")
-	assertUserspaceXDPFallbackStat(t, coll, "pass_to_kernel")
-	assertUserspaceXDPFallbackStatAbsent(t, coll, "transit_drop")
+	assertUserspaceXDPDegradedPathStat(t, coll, "ctrl_disabled")
+	assertUserspaceXDPDegradedPathStat(t, coll, "pass_to_kernel")
+	assertUserspaceXDPDegradedPathStatAbsent(t, coll, "transit_drop")
 }
 
 func TestUserspaceXDPNDPUsesCPUMapWhenAvailable(t *testing.T) {
@@ -220,8 +220,8 @@ func TestUserspaceXDPNDPUsesCPUMapWhenAvailable(t *testing.T) {
 	if ret != xdpActionRedirect {
 		t.Fatalf("NDP action with cpumap = %d, want XDP_REDIRECT", ret)
 	}
-	assertUserspaceXDPFallbackStat(t, coll, "early_filter")
-	assertUserspaceXDPFallbackStat(t, coll, "pass_to_kernel")
+	assertUserspaceXDPDegradedPathStat(t, coll, "early_filter")
+	assertUserspaceXDPDegradedPathStat(t, coll, "pass_to_kernel")
 }
 
 func TestUserspaceXDPDegradedESPToInterfaceNATPassesLocalControl(t *testing.T) {
@@ -243,9 +243,9 @@ func TestUserspaceXDPDegradedESPToInterfaceNATPassesLocalControl(t *testing.T) {
 	if ret != xdpActionPass {
 		t.Fatalf("ctrl-disabled ESP to interface NAT action = %d, want XDP_PASS", ret)
 	}
-	assertUserspaceXDPFallbackStat(t, coll, "ctrl_disabled")
-	assertUserspaceXDPFallbackStat(t, coll, "pass_to_kernel")
-	assertUserspaceXDPFallbackStatAbsent(t, coll, "transit_drop")
+	assertUserspaceXDPDegradedPathStat(t, coll, "ctrl_disabled")
+	assertUserspaceXDPDegradedPathStat(t, coll, "pass_to_kernel")
+	assertUserspaceXDPDegradedPathStatAbsent(t, coll, "transit_drop")
 }
 
 func TestUserspaceXDPDegradedNonIPL2PassesDirect(t *testing.T) {
@@ -263,9 +263,9 @@ func TestUserspaceXDPDegradedNonIPL2PassesDirect(t *testing.T) {
 	if ret != xdpActionPass {
 		t.Fatalf("ctrl-disabled ARP action = %d, want XDP_PASS", ret)
 	}
-	assertUserspaceXDPFallbackStat(t, coll, "ctrl_disabled")
-	assertUserspaceXDPFallbackStat(t, coll, "pass_to_kernel")
-	assertUserspaceXDPFallbackStatAbsent(t, coll, "transit_drop")
+	assertUserspaceXDPDegradedPathStat(t, coll, "ctrl_disabled")
+	assertUserspaceXDPDegradedPathStat(t, coll, "pass_to_kernel")
+	assertUserspaceXDPDegradedPathStatAbsent(t, coll, "transit_drop")
 }
 
 func injectUserspaceBootstrapMaps(t *testing.T, m *Manager) {
@@ -433,42 +433,42 @@ func runUserspaceXDPTestPacket(t *testing.T, coll *ebpf.Collection, packet []byt
 	return ret
 }
 
-func assertUserspaceXDPFallbackStat(t *testing.T, coll *ebpf.Collection, name string) {
+func assertUserspaceXDPDegradedPathStat(t *testing.T, coll *ebpf.Collection, name string) {
 	t.Helper()
-	if got := userspaceXDPFallbackStat(t, coll, name); got == 0 {
-		t.Fatalf("fallback stat %q = 0, want incremented", name)
+	if got := userspaceXDPDegradedPathStat(t, coll, name); got == 0 {
+		t.Fatalf("degraded path stat %q = 0, want incremented", name)
 	}
 }
 
-func assertUserspaceXDPFallbackStatAbsent(t *testing.T, coll *ebpf.Collection, name string) {
+func assertUserspaceXDPDegradedPathStatAbsent(t *testing.T, coll *ebpf.Collection, name string) {
 	t.Helper()
-	if got := userspaceXDPFallbackStat(t, coll, name); got != 0 {
-		t.Fatalf("fallback stat %q = %d, want 0", name, got)
+	if got := userspaceXDPDegradedPathStat(t, coll, name); got != 0 {
+		t.Fatalf("degraded path stat %q = %d, want 0", name, got)
 	}
 }
 
-func userspaceXDPFallbackStat(t *testing.T, coll *ebpf.Collection, name string) uint64 {
+func userspaceXDPDegradedPathStat(t *testing.T, coll *ebpf.Collection, name string) uint64 {
 	t.Helper()
 	stats := coll.Maps["userspace_fallback_stats"]
 	if stats == nil {
-		t.Fatal("userspace_fallback_stats map not loaded")
+		t.Fatal("userspace_fallback_stats compatibility map not loaded")
 	}
-	idx := fallbackReasonIndex(t, name)
+	idx := degradedPathReasonIndex(t, name)
 	var got uint64
 	if err := stats.Lookup(idx, &got); err != nil {
-		t.Fatalf("lookup userspace_fallback_stats[%d] (%s): %v", idx, name, err)
+		t.Fatalf("lookup userspace_fallback_stats compatibility map[%d] (%s): %v", idx, name, err)
 	}
 	return got
 }
 
-func fallbackReasonIndex(t *testing.T, name string) uint32 {
+func degradedPathReasonIndex(t *testing.T, name string) uint32 {
 	t.Helper()
-	for idx, candidate := range fallbackReasonNames {
+	for idx, candidate := range degradedPathReasonNames {
 		if candidate == name {
 			return uint32(idx)
 		}
 	}
-	t.Fatalf("fallback reason %q not found", name)
+	t.Fatalf("degraded path reason %q not found", name)
 	return 0
 }
 

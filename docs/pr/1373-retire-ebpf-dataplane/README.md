@@ -130,6 +130,14 @@ the narrow userspace-shim selection/swap methods. This keeps the retained shim
 visible without implying that degraded userspace mode can bypass back into the
 legacy pipeline.
 
+#1509 renames the retained-shim degraded action counters on the Go/status and
+operator documentation surface to `degraded_path_counters`. The pinned BPF map
+name `userspace_fallback_stats` remains an internal mixed-version compatibility
+exception until the final retained-shim ABI boundary is removed. New daemons
+also emit `fallback_counters` as a legacy JSON alias for one compatibility
+window so old status readers do not silently zero these counters during rolling
+upgrades; new code should read `degraded_path_counters`.
+
 The #1493 loader/bootstrap split keeps normal userspace startup on the
 userspace-only shim loader below. Source removal still waits for #1451's
 remaining operator/runtime surface migration and #1476's deletion candidate.

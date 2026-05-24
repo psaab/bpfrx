@@ -83,6 +83,17 @@ fn kernel_local_session_map_entry_rejects_non_kernel_local_cases() {
 }
 
 #[test]
+fn degraded_path_reason_names_cover_retained_shim_actions() {
+    assert_eq!(DEGRADED_PATH_REASON_NAMES.len(), 16);
+    assert_eq!(DEGRADED_PATH_REASON_NAMES[4], "heartbeat_missing");
+    assert_eq!(DEGRADED_PATH_REASON_NAMES[5], "heartbeat_stale");
+    assert_eq!(DEGRADED_PATH_REASON_NAMES[11], "interface_nat_no_session");
+    assert_eq!(DEGRADED_PATH_REASON_NAMES[13], "strict_drop");
+    assert_eq!(DEGRADED_PATH_REASON_NAMES[14], "pass_to_kernel");
+    assert_eq!(DEGRADED_PATH_REASON_NAMES[15], "transit_drop");
+}
+
+#[test]
 fn bpf_conntrack_struct_sizes_match_c() {
     // Must match C struct sizes from xpf_conntrack.h exactly.
     assert_eq!(core::mem::size_of::<BpfSessionKeyV4>(), 16);

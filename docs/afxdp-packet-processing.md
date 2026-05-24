@@ -34,7 +34,7 @@ The shim checks several conditions before redirecting a packet to userspace:
 8. When helper/XSK state is degraded (`ctrl.enabled=0`, missing/not-ready
    binding, stale heartbeat, redirect failure), only the local/control cases
    above may reach the kernel. Transit drops and increments
-   `transit_drop` in `userspace_fallback_stats`.
+   `transit_drop` in `degraded_path_counters`.
 
 Packets that pass all checks get a `UserspaceDpMeta` header prepended via
 `bpf_xdp_adjust_meta` and are redirected to the AF_XDP socket with
@@ -213,9 +213,11 @@ The remaining work is now cleaner:
 | Without `debug-log` | Zero-overhead production build. `debug_log!()` compiles to nothing. |
 | With `debug-log` | Per-packet TCP flag parsing, RST detection, hex dumps, checksum verification, session dumps, stall detection, ring diagnostics. |
 
-**XDP fallback stats**: The shim maintains per-reason counters in
-`userspace_fallback_stats` (array map with `USERSPACE_FALLBACK_REASON_MAX`
-entries).  The worker reads and logs these as `DBG w{}: XDP_FALLBACK: ...`.
+**XDP degraded path counters**: The shim maintains per-reason counters for
+retained-shim degraded actions. Go exposes them in status JSON as
+`degraded_path_counters`. The pinned BPF map remains
+`userspace_fallback_stats` as an internal mixed-version compatibility
+exception.
 
 **Binding debug state**: Each `BindingWorker` tracks live ring state
 (`debug_pending_fill_frames`, `debug_free_tx_frames`,

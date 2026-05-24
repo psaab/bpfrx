@@ -37,6 +37,9 @@ const NEXTHDR_FRAGMENT: u8 = 44;
 const NEXTHDR_AUTH: u8 = 51;
 const NEXTHDR_DEST: u8 = 60;
 const NEXTHDR_NONE: u8 = 59;
+// The BPF-side symbol names retain FALLBACK for index/map compatibility. The
+// Go/operator surface exposes these retained-shim actions as degraded-path
+// counters.
 const USERSPACE_FALLBACK_REASON_CTRL_DISABLED: u32 = 0;
 const USERSPACE_FALLBACK_REASON_PARSE_FAIL: u32 = 1;
 const USERSPACE_FALLBACK_REASON_BINDING_MISSING: u32 = 2;
@@ -317,6 +320,8 @@ static USERSPACE_SESSIONS: HashMap<UserspaceSessionKey, u8> = HashMap::with_max_
 const USERSPACE_SESSION_ACTION_REDIRECT: u8 = 1;
 const USERSPACE_SESSION_ACTION_PASS_TO_KERNEL: u8 = 2;
 
+// Pinned-map compatibility exception: Go still reads this map name during
+// mixed-version upgrades, but status/docs expose it as degraded_path_counters.
 #[map(name = "userspace_fallback_stats")]
 static USERSPACE_FALLBACK_STATS: Array<u64> =
     Array::with_max_entries(USERSPACE_FALLBACK_REASON_MAX, 0);

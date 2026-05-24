@@ -465,6 +465,56 @@ func TestUserspaceXDPShimObjectMatchesRetainedCollectionAllowlist(t *testing.T) 
 	}
 }
 
+func TestUserspaceDegradedPathCounterStatusStructAvoidsFallbackField(t *testing.T) {
+	t.Parallel()
+
+	tags := processStatusJSONTags(t)
+	if !tags["degraded_path_counters"] {
+		t.Fatal("ProcessStatus JSON tags missing degraded_path_counters")
+	}
+	if tags["fallback_counters"] {
+		t.Fatal("ProcessStatus must not expose fallback_counters as a primary status field")
+	}
+}
+
+func TestActiveDocsDescribeRetainedShimCountersAsDegradedPath(t *testing.T) {
+	t.Parallel()
+
+	docs := []string{
+		filepath.Join(repoRootForBoundaryCanary, "docs", "afxdp-packet-processing.md"),
+		filepath.Join(repoRootForBoundaryCanary, "docs", "userspace-xdp-pass-bootstrap-and-ipv6.md"),
+		filepath.Join(repoRootForBoundaryCanary, "docs", "userspace-dataplane-architecture.md"),
+		filepath.Join(repoRootForBoundaryCanary, "docs", "userspace-dataplane-gaps.md"),
+		filepath.Join(repoRootForBoundaryCanary, "docs", "xpf-userspace-fw-deploy-verification.md"),
+		retirementBoundaryDocsForCanary,
+	}
+	for _, path := range docs {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		lines := strings.Split(string(data), "\n")
+		for idx, line := range lines {
+			lower := strings.ToLower(line)
+			switch {
+			case strings.Contains(line, "fallback_counters") &&
+				!lineWindowContains(lines, idx, "compatibility"):
+				t.Fatalf("%s:%d exposes legacy fallback_counters JSON name", repoRelativePath(t, path), idx+1)
+			case strings.Contains(lower, "xdp fallback stats"),
+				strings.Contains(lower, "fallback counters"),
+				strings.Contains(lower, "fallback reason"),
+				strings.Contains(lower, "went via fallback"):
+				t.Fatalf("%s:%d describes retained-shim counters with fallback wording: %s",
+					repoRelativePath(t, path), idx+1, strings.TrimSpace(line))
+			case strings.Contains(line, "userspace_fallback_stats") &&
+				!lineWindowContains(lines, idx, "compatibility"):
+				t.Fatalf("%s:%d mentions userspace_fallback_stats without compatibility context: %s",
+					repoRelativePath(t, path), idx+1, strings.TrimSpace(line))
+			}
+		}
+	}
+}
+
 func TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram(t *testing.T) {
 	t.Parallel()
 
@@ -1509,6 +1559,70 @@ func lineForOffset(text string, offset int) int {
 		offset = len(text)
 	}
 	return strings.Count(text[:offset], "\n") + 1
+}
+
+func lineWindowContains(lines []string, idx int, needle string) bool {
+	start := idx - 2
+	if start < 0 {
+		start = 0
+	}
+	end := idx + 2
+	if end >= len(lines) {
+		end = len(lines) - 1
+	}
+	needle = strings.ToLower(needle)
+	for i := start; i <= end; i++ {
+		if strings.Contains(strings.ToLower(lines[i]), needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func processStatusJSONTags(t *testing.T) map[string]bool {
+	t.Helper()
+
+	path := filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace", "protocol.go")
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			typeSpec, ok := spec.(*ast.TypeSpec)
+			if !ok || typeSpec.Name.Name != "ProcessStatus" {
+				continue
+			}
+			st, ok := typeSpec.Type.(*ast.StructType)
+			if !ok {
+				t.Fatalf("ProcessStatus in %s is not a struct", path)
+			}
+			tags := map[string]bool{}
+			for _, field := range st.Fields.List {
+				if field.Tag == nil {
+					continue
+				}
+				rawTag, err := strconv.Unquote(field.Tag.Value)
+				if err != nil {
+					t.Fatalf("unquote ProcessStatus tag %s: %v", field.Tag.Value, err)
+				}
+				jsonTag := reflect.StructTag(rawTag).Get("json")
+				name, _, _ := strings.Cut(jsonTag, ",")
+				if name != "" && name != "-" {
+					tags[name] = true
+				}
+			}
+			return tags
+		}
+	}
+	t.Fatalf("ProcessStatus not found in %s", path)
+	return nil
 }
 
 func isXDPEntryProgField(expr ast.Expr) bool {

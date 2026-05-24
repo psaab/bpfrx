@@ -1929,14 +1929,14 @@ pub(crate) fn worker_loop(
                     binding_summary,
                 );
                 // Non-debug builds: no per-second stats dump (use debug-log feature for verbose output).
-                // Print XDP shim fallback stats — tells us WHY packets stop
-                // being redirected to XSK.
+                // Print retained-shim degraded-path stats — tells us WHY
+                // packets stop being redirected to XSK.
                 if cfg!(feature = "debug-log") {
-                    if let Some(stats) = read_fallback_stats() {
+                    if let Some(stats) = read_degraded_path_stats() {
                         if !stats.is_empty() {
                             let s: Vec<String> =
                                 stats.iter().map(|(n, v)| format!("{n}={v}")).collect();
-                            eprintln!("DBG w{}: XDP_FALLBACK: {}", worker_id, s.join(" "));
+                            eprintln!("DBG w{}: XDP_DEGRADED: {}", worker_id, s.join(" "));
                         }
                     }
                 }
@@ -2073,12 +2073,12 @@ pub(crate) fn worker_loop(
                         if !sess_dump.is_empty() {
                             eprintln!("DBG STALL_SESSIONS:{sess_dump}");
                         }
-                        // Dump fallback stats at stall time
-                        if let Some(stats) = read_fallback_stats() {
+                        // Dump degraded-path stats at stall time.
+                        if let Some(stats) = read_degraded_path_stats() {
                             if !stats.is_empty() {
                                 let s: Vec<String> =
                                     stats.iter().map(|(n, v)| format!("{n}={v}")).collect();
-                                eprintln!("DBG STALL_FALLBACK: {}", s.join(" "));
+                                eprintln!("DBG STALL_DEGRADED: {}", s.join(" "));
                             }
                         }
                         // Also dump BPF session count

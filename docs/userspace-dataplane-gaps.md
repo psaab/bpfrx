@@ -163,7 +163,9 @@ There are two distinct fallback boundaries:
      - send kernel-owned traffic to cpumap / kernel
      - pass proven local/control traffic while helper/XSK is degraded
      - drop degraded non-local transit in both compat and strict modes
-     - count those drops as `transit_drop` in `userspace_fallback_stats`
+     - count those drops as `transit_drop` in `degraded_path_counters`; the
+       pinned BPF map keeps the internal compatibility name
+       `userspace_fallback_stats` until the mixed-version boundary is retired
 
 ## Priority Work
 

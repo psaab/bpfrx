@@ -747,21 +747,21 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
-# Section 14: BPF Fallback Stats
+# Section 14: Retained-shim Degraded Path Stats
 # ═══════════════════════════════════════════════════════════════════════
-hdr "BPF Fallback Stats"
+hdr "Retained-shim Degraded Path Stats"
 
 # Check if bpftool is available on the instance
 if incus exec "${REMOTE}:${INSTANCE}" -- which bpftool >/dev/null 2>&1; then
     # Try to dump the userspace_fallback_stats map
     FALLBACK_OUT=$(incus exec "${REMOTE}:${INSTANCE}" -- bpftool map dump pinned /sys/fs/bpf/xpf/userspace_fallback_stats 2>/dev/null || echo "")
     if [ -n "$FALLBACK_OUT" ] && [ "$FALLBACK_OUT" != "" ]; then
-        note "BPF fallback stats map:"
+        note "Retained-shim degraded-path stats map:"
         echo "$FALLBACK_OUT" | head -30 | while IFS= read -r line; do
             note "  ${line}"
         done
     else
-        note "Fallback stats map not available or empty."
+        note "Degraded-path stats map not available or empty."
     fi
 
     # Check userspace_ctrl map for enabled/disabled state

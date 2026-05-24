@@ -85,6 +85,19 @@ func localHAForwardingRole(status ProcessStatus) string {
 	return "standby"
 }
 
+func formatStatusCounterMap(counters map[string]uint64) string {
+	keys := make([]string, 0, len(counters))
+	for name := range counters {
+		keys = append(keys, name)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, name := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", name, counters[name]))
+	}
+	return strings.Join(parts, " ")
+}
+
 func FormatStatusSummary(status ProcessStatus) string {
 	var b strings.Builder
 	now := time.Now()
@@ -337,6 +350,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 			parts = append(parts, part)
 		}
 		fmt.Fprintf(&b, "  Fabric links:              %s\n", strings.Join(parts, "; "))
+	}
+	if len(status.DegradedPathCounters) > 0 {
+		fmt.Fprintf(&b, "  Degraded path counters:    %s\n", formatStatusCounterMap(status.DegradedPathCounters))
 	}
 	if status.LastResolution != nil {
 		fmt.Fprintf(&b, "  Last resolution:           %s", status.LastResolution.Disposition)

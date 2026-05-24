@@ -513,6 +513,60 @@ func TestProcessStatusThreeColorPolicerCountersRoundTrip(t *testing.T) {
 	}
 }
 
+func TestProcessStatusDegradedPathCountersJSON(t *testing.T) {
+	in := ProcessStatus{
+		DegradedPathCounters: map[string]uint64{
+			"ctrl_disabled":  1,
+			"pass_to_kernel": 2,
+			"redirect_err":   3,
+			"strict_drop":    4,
+			"transit_drop":   5,
+		},
+	}
+
+	raw, err := json.Marshal(&in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	if _, ok := obj["degraded_path_counters"]; !ok {
+		t.Fatalf("degraded_path_counters missing from ProcessStatus JSON: %s", string(raw))
+	}
+	if _, ok := obj["fallback_counters"]; !ok {
+		t.Fatalf("legacy fallback_counters alias missing from ProcessStatus JSON: %s", string(raw))
+	}
+
+	var back ProcessStatus
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal ProcessStatus: %v", err)
+	}
+	if !reflect.DeepEqual(back.DegradedPathCounters, in.DegradedPathCounters) {
+		t.Fatalf("DegradedPathCounters = %+v, want %+v",
+			back.DegradedPathCounters, in.DegradedPathCounters)
+	}
+
+	var legacy ProcessStatus
+	if err := json.Unmarshal([]byte(`{"fallback_counters":{"transit_drop":9}}`), &legacy); err != nil {
+		t.Fatalf("unmarshal legacy ProcessStatus: %v", err)
+	}
+	if got := legacy.DegradedPathCounters["transit_drop"]; got != 9 {
+		t.Fatalf("legacy fallback_counters decode transit_drop = %d, want 9", got)
+	}
+
+	var both ProcessStatus
+	if err := json.Unmarshal([]byte(
+		`{"degraded_path_counters":{},"fallback_counters":{"transit_drop":9}}`,
+	), &both); err != nil {
+		t.Fatalf("unmarshal mixed ProcessStatus: %v", err)
+	}
+	if got := both.DegradedPathCounters["transit_drop"]; got != 0 {
+		t.Fatalf("new empty degraded_path_counters should not be overridden, got transit_drop=%d", got)
+	}
+}
+
 func TestProcessStatusInjectPacketTupleVersionRoundTrip(t *testing.T) {
 	in := ProcessStatus{
 		InjectPacketTupleProtocolVersion: InjectPacketTupleProtocolVersion,

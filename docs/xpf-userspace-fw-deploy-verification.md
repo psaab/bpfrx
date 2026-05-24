@@ -177,9 +177,10 @@ again after a 30 s run. Compute deltas.
   aggressively that TCP can't progress.
 - `peer_pps` / `owner_pps` both zero while traffic was flowing —
   the queue isn't actually being serviced by the userspace-dp worker;
-  the packets went via fallback. Check `userspace_fallback_stats`
-  (`bpftool map dump pinned /sys/fs/bpf/xpf/userspace_fallback_stats`)
-  for which fallback reason fired.
+  check `degraded_path_counters` in userspace status for retained-shim
+  degraded actions. If direct BPF inspection is required, the internal
+  mixed-version compatibility map is still pinned at
+  `/sys/fs/bpf/xpf/userspace_fallback_stats`.
 
 ## Pass criteria (summary)
 

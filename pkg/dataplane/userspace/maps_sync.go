@@ -702,9 +702,11 @@ ctrlReady:
 // userspaceCounterSnapshot holds cumulative counter totals from the helper,
 // used to compute deltas between status polls.
 
-// fallbackReasonNames maps BPF array index to a human-readable name.
+const userspaceShimDegradedStatsMapName = "userspace_fallback_stats"
+
+// degradedPathReasonNames maps BPF array index to a human-readable name.
 // Must stay in sync with USERSPACE_FALLBACK_REASON_* in userspace-xdp/src/lib.rs.
-var fallbackReasonNames = [16]string{
+var degradedPathReasonNames = [16]string{
 	0:  "ctrl_disabled",
 	1:  "parse_fail",
 	2:  "binding_missing",
@@ -723,16 +725,20 @@ var fallbackReasonNames = [16]string{
 	15: "transit_drop",
 }
 
-// readFallbackStatsLocked reads the userspace_fallback_stats BPF array map
-// and returns a map of reason name -> cumulative count. Entries with zero
-// count are omitted.
-func (m *Manager) readFallbackStatsLocked() map[string]uint64 {
-	statsMap := m.bpfShim.Map("userspace_fallback_stats")
+// readDegradedPathStatsLocked reads retained-shim degraded-path counters and
+// returns a map of reason name -> cumulative count. Entries with zero count are
+// omitted.
+//
+// The pinned BPF map name remains userspace_fallback_stats as an internal
+// mixed-version compatibility exception. Operator-facing Go status, JSON, and
+// docs must use degraded-path terminology instead.
+func (m *Manager) readDegradedPathStatsLocked() map[string]uint64 {
+	statsMap := m.bpfShim.Map(userspaceShimDegradedStatsMapName)
 	if statsMap == nil {
 		return nil
 	}
 	result := make(map[string]uint64)
-	for i := uint32(0); i < uint32(len(fallbackReasonNames)); i++ {
+	for i := uint32(0); i < uint32(len(degradedPathReasonNames)); i++ {
 		var val uint64
 		if err := statsMap.Lookup(i, &val); err != nil {
 			continue
@@ -740,7 +746,7 @@ func (m *Manager) readFallbackStatsLocked() map[string]uint64 {
 		if val == 0 {
 			continue
 		}
-		name := fallbackReasonNames[i]
+		name := degradedPathReasonNames[i]
 		if name == "" {
 			name = fmt.Sprintf("reason_%d", i)
 		}
