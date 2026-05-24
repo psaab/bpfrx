@@ -248,7 +248,7 @@ type TunnelEndpointSnapshot struct {
 	// layer's UDP-socket dispatch (one layer above the engine); the
 	// engine itself demuxes by `receiver_index` alone via the
 	// `sessions_by_local_index` map (see userspace-dp
-	// afxdp/wg/engine.rs:264). The receiver index is chosen by the
+	// afxdp/wg/engine.rs:271). The receiver index is chosen by the
 	// local side at handshake time, so it identifies the session
 	// unambiguously without a (port, index) tuple match.
 	WgListenPort uint16 `json:"wg_listen_port,omitempty"`

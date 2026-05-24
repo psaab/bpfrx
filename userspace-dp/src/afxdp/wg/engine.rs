@@ -191,7 +191,11 @@ pub(crate) struct WgEngineConfig {
 /// pad bytes, which must be zero by spec).
 ///
 /// Note on jumbo MTU: the value is 4080 + 16 = 4096. The bound is
-/// enforced at `engine.rs:539` as `padded_len > PADDED_PLAINTEXT_MAX`
+/// enforced inside `try_encap` (search for the
+/// `if padded_len > PADDED_PLAINTEXT_MAX` guard, which is hoisted
+/// above the `next_tx_counter()` consume so a failed staging guard
+/// cannot leave the session's counter advanced) as
+/// `padded_len > PADDED_PLAINTEXT_MAX`
 /// where `padded_len = pad_to_16(inner_ip.len())` — i.e. the post-
 /// WG-§5.4.6-padding length. The accepted range is therefore
 /// `inner_ip.len() ∈ [0, 4096]` (any inner whose 16-byte-padded

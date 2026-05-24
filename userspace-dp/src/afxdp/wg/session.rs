@@ -61,7 +61,12 @@ pub(crate) struct WgSession {
     pub(crate) transport: StatelessTransportState,
     /// Receiver index that the *peer* will put in the WG data
     /// header when sending to us. Locally chosen at handshake time.
-    /// Used for inbound demux: `(listen_port, local_index) → WgSession`.
+    /// Used for inbound demux: the engine's
+    /// `sessions_by_local_index: RwLock<FxHashMap<u32, Arc<WgSession>>>`
+    /// is keyed by `local_index` alone, not by `(listen_port,
+    /// local_index)`. Listen-port selection happens one layer up in
+    /// the integration PR's UDP-socket dispatch, before the record
+    /// reaches the engine.
     pub(crate) local_index: u32,
     /// Receiver index that *we* put in the WG data header when
     /// sending to the peer. Peer-chosen at handshake time.

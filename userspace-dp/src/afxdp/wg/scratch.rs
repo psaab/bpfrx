@@ -2,9 +2,12 @@
 //!
 //! No `vec![]` in encap/decap. The buffers are sized once at
 //! worker init and reused for every packet. Capacity is taken
-//! from the worker's max-frame size — currently `MAX_FRAME = 2048`
-//! across the dataplane; the WG module is told the size explicitly
-//! so it does not have to import the rest of `afxdp/`.
+//! from the worker's max-frame size — the UMEM frame is
+//! `UMEM_FRAME_SIZE` (4096) in `afxdp/mod.rs:175`; the WG module
+//! takes the size as an explicit `max_frame: usize` parameter so it
+//! does not have to import the rest of `afxdp/`. The integration PR
+//! will wire `WgWorkerScratch::new(UMEM_FRAME_SIZE as usize)` (or a
+//! smaller worker-specific cap) from the dispatch side.
 
 use std::cell::RefCell;
 

@@ -118,7 +118,8 @@ The engine takes `&mut [u8]` precisely so the hot path never has the
 opportunity to realloc.
 
 The control plane delivers `peer_pubkey` via a new field on
-`TunnelEndpointSnapshot` (`wg_peer_pubkey`). AllowedIPs is **only**
+`TunnelEndpointSnapshot` (`wg_peer_pubkey_hex`; see
+`userspace-dp/src/protocol.rs:437-438`). AllowedIPs is **only**
 consulted on the decap path to gate inbound plaintext — "is this src
 IP in AllowedIPs for the session's peer?" — never to choose a peer
 on egress.
@@ -156,7 +157,10 @@ message and at most one output message. Nothing to "drain".
 
 - Worker holds a `WgWorkerScratch` with `encap_out: RefCell<Vec<u8>>`
   and `decap_out: RefCell<Vec<u8>>` (see `scratch.rs:17-21`), each
-  sized to `MAX_FRAME` at startup. Separate per-direction buffers
+  sized to the worker's `max_frame` at startup
+  (`WgWorkerScratch::new(max_frame)` in `scratch.rs:25-30`; the
+  integration PR will pass `UMEM_FRAME_SIZE` from
+  `afxdp/mod.rs:175`, currently 4096). Separate per-direction buffers
   with `RefCell` interior mutability — never reallocated; the cells
   are entered exclusively per packet because each worker is
   single-threaded inside its poll loop.
@@ -168,8 +172,8 @@ message and at most one output message. Nothing to "drain".
   `RwLock<Option<Arc<WgSession>>>` and ingress demux
   (`sessions_by_local_index`) is `RwLock<FxHashMap<u32, Arc<WgSession>>>`,
   so encap takes one `RwLock::read` on `peer.current`
-  (`engine.rs:499-503`) and decap takes one `RwLock::read` on
-  `sessions_by_local_index` (`engine.rs:636-642`). Both are
+  (`engine.rs:506-510`) and decap takes one `RwLock::read` on
+  `sessions_by_local_index` (`engine.rs:643-649`). Both are
   uncontended in steady state (single-writer at slow-path session
   install / rotate), but they ARE RwLock reads, not lock-free. The
   earlier draft of this bullet claimed "never under a lock on the

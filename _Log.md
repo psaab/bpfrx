@@ -2,6 +2,39 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T23:15:00Z
+  - **Action**: PR #1499 r-final-5 fix step 3 — line-citation offsets
+    + stale field-name drift + scratch.rs MAX_FRAME doc-comment.
+    Updated plan.md:104 to spell out `wg_peer_pubkey_hex` (was the
+    pre-r4 stale `wg_peer_pubkey`) and added a `protocol.rs:437-438`
+    pointer. Updated plan.md hot-path lock-read citations from
+    `engine.rs:499-503` → `engine.rs:506-510` (encap-side
+    `peer.current.read()`) and `engine.rs:636-642` →
+    `engine.rs:643-649` (decap-side `sessions_by_local_index.read()`),
+    matching the actual line numbers after the truncated-record DoS
+    guard landed at engine.rs:664-666. Updated protocol.go:250 to
+    cite `engine.rs:271` instead of `engine.rs:264` for
+    `sessions_by_local_index`. Updated engine.rs:194 jumbo-MTU
+    comment to drop the fragile `engine.rs:539` line citation and
+    point at the `if padded_len > PADDED_PLAINTEXT_MAX` guard by
+    pattern instead (actual line 546). Rewrote session.rs:62-69
+    `local_index` doc comment so it no longer says inbound demux is
+    `(listen_port, local_index)` — the engine map is keyed by
+    `local_index` alone. Rewrote allowed_ips.rs:11-19 to spell out
+    `wg_peer_pubkey_hex` (was `wg_peer_pubkey`) and to drop the
+    false claim that the field lives on the runtime `TunnelEndpoint`
+    — the snapshot has it; the runtime type extension is integration-
+    PR scope. Rewrote scratch.rs:3-10 to drop the false
+    `MAX_FRAME = 2048` constant (no such constant exists — the
+    UMEM constant is `UMEM_FRAME_SIZE = 4096` in `afxdp/mod.rs:175`)
+    and to make the parameter-passed `max_frame` explicit.
+  - **File(s)**: docs/pr/wireguard-clean/plan.md,
+    userspace-dp/src/afxdp/wg/engine.rs,
+    userspace-dp/src/afxdp/wg/session.rs,
+    userspace-dp/src/afxdp/wg/allowed_ips.rs,
+    userspace-dp/src/afxdp/wg/scratch.rs,
+    pkg/dataplane/userspace/protocol.go
+
 - **Timestamp**: 2026-05-24T23:05:00Z
   - **Action**: PR #1499 r-final-5 fix step 2 — integration-PR pointer
     rewritten. plan.md "Encap call site" claimed dispatch.rs:430 was

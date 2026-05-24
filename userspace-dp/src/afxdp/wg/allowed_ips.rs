@@ -10,11 +10,15 @@
 //!
 //! In **xpf** we deliberately use it only for the second purpose.
 //! The forwarding decision tells dispatch.rs which peer to encrypt
-//! to (via the `wg_peer_pubkey` field on `TunnelEndpoint`), so the
-//! outbound LPM is never consulted. This eliminates the
-//! cryptokey-routing flaw that PR #1492 r11 was tripped up by:
-//! overlapping AllowedIPs across peers can never route plaintext
-//! to the wrong session.
+//! to (via the `wg_peer_pubkey_hex` field on
+//! `TunnelEndpointSnapshot` — see
+//! `userspace-dp/src/protocol.rs:437-438`; the runtime
+//! `TunnelEndpoint` in `afxdp/types/forwarding.rs:129-140` is NOT
+//! yet extended with WG fields, the integration PR will mirror them
+//! across), so the outbound LPM is never consulted. This eliminates
+//! the cryptokey-routing flaw that PR #1492 r11 was tripped up by:
+//! overlapping AllowedIPs across peers can never route plaintext to
+//! the wrong session.
 //!
 //! Implementation: a flat sorted-by-prefix-length-descending list.
 //! AllowedIPs is reconciled at config-commit time, not on the hot
