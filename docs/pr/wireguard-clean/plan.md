@@ -263,11 +263,22 @@ existing pattern of `recycle_ingress_frame(...)` before every
 - `userspace-dp/Cargo.toml` — adds `snow` and supporting crates.
 - `userspace-dp/src/protocol.rs` — adds WG fields to
   `TunnelEndpointSnapshot`. Backward-compatible (all new fields are
-  `#[serde(default)]`).
-- `userspace-dp/src/afxdp/types/forwarding.rs` — adds WG fields to
-  `TunnelEndpoint`.
-- `userspace-dp/src/afxdp/forwarding_build.rs` — propagates WG fields
-  from snapshot to runtime.
+  `#[serde(default)]`). The `wg_local_privkey_hex` field is
+  `#[serde(skip_serializing)]` so it never lands in the persisted
+  state file; a manual `Debug` impl on the snapshot redacts the
+  private key.
+- (Deferred to integration PR) `userspace-dp/src/afxdp/types/forwarding.rs`
+  — extend the runtime `TunnelEndpoint` with WG fields. This PR
+  intentionally lands the wire surface (`TunnelEndpointSnapshot`)
+  without the runtime mirror; the integration PR will wire the
+  reconcile path from snapshot into the runtime `TunnelEndpoint` and
+  the WG hot path at the same time so the runtime type stays out of
+  the dataplane until it is actually consumed. Codex final pre-merge
+  finding 4 flagged the earlier plan text that claimed both landed
+  here.
+- (Deferred to integration PR) `userspace-dp/src/afxdp/forwarding_build.rs`
+  — propagation from snapshot to the runtime `TunnelEndpoint`. Lands
+  alongside the runtime type extension above, in the integration PR.
 - `pkg/dataplane/userspace/protocol.go` — Go-side mirror.
 - Unit tests: handshake roundtrip, encap matches snow output,
   decap recovers plaintext, replay window in-order / repeat /

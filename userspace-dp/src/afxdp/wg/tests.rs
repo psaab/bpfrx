@@ -786,6 +786,400 @@ fn encap_padded_plaintext_max_boundary() {
     assert_eq!(err, EncapError::BufferTooSmall);
 }
 
+/// r-final-fix regression for Codex final pre-merge finding 1:
+/// `build_initiator_handshake` and `build_responder_handshake` MUST
+/// call `.prologue(WG_PROTOCOL_ID_BYTES)` so the initial Noise hash
+/// matches kernel WireGuard and wireguard-go. We can't reach inside
+/// snow's `HandshakeState` to read the hash directly, but we CAN
+/// prove the prologue is actually consumed by showing that two
+/// engines that disagree on the prologue fail to authenticate each
+/// other while two engines that agree complete the handshake.
+///
+/// The control engine in this test bypasses `WgEngine::build_*` and
+/// constructs the `Builder` directly with an empty prologue. If our
+/// production builders silently dropped the prologue, the control
+/// peer would still authenticate them; with the prologue actually
+/// mixed into the hash, the control peer's `read_message` rejects
+/// the production initiator with a snow error.
+#[test]
+fn handshake_prologue_is_required_for_authentication() {
+    use super::{WG_NOISE_PATTERN, WG_PROTOCOL_ID_BYTES, WG_ZERO_PSK};
+    use snow::Builder;
+
+    let (init_priv, init_pub) = keypair();
+    let (resp_priv, resp_pub) = keypair();
+
+    // Production initiator: prologue set via our `build_initiator_handshake`.
+    let init_engine = WgEngine::new(WgEngineConfig {
+        local_private_key: init_priv,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: resp_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+        }],
+    });
+    let mut init_hs = init_engine.build_initiator_handshake(&resp_pub).unwrap();
+
+    // Bad responder: prologue OMITTED. If our engine doesn't actually
+    // mix the prologue into the hash, this responder would still
+    // authenticate the init message; with the prologue properly
+    // mixed in, snow rejects.
+    let mut bad_resp_hs = Builder::new(WG_NOISE_PATTERN.parse().unwrap())
+        .local_private_key(&resp_priv)
+        .unwrap()
+        .psk(2, &WG_ZERO_PSK)
+        .unwrap()
+        .build_responder()
+        .unwrap();
+
+    let mut buf = [0u8; 1024];
+    let mut sink = [0u8; 1024];
+    let n1 = init_hs.write_message(&[], &mut buf).unwrap();
+    let res = bad_resp_hs.read_message(&buf[..n1], &mut sink);
+    assert!(
+        res.is_err(),
+        "responder without prologue must reject an initiator that mixed the WG prologue \
+         (otherwise the prologue is silently dropped and the engine is not WireGuard-compat)"
+    );
+
+    // Sanity: a responder built via `build_responder_handshake`
+    // (which sets the prologue) does authenticate the same init
+    // message. This shows the rejection above is the prologue
+    // difference, not some unrelated handshake mismatch.
+    let good_resp_engine = WgEngine::new(WgEngineConfig {
+        local_private_key: resp_priv,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: init_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+        }],
+    });
+    let mut init_hs2 = init_engine.build_initiator_handshake(&resp_pub).unwrap();
+    let mut good_resp_hs = good_resp_engine.build_responder_handshake().unwrap();
+    let n1 = init_hs2.write_message(&[], &mut buf).unwrap();
+    good_resp_hs
+        .read_message(&buf[..n1], &mut sink)
+        .expect("matched-prologue responder must authenticate the initiator");
+
+    // Verify the prologue bytes are exactly the WireGuard protocol
+    // identifier — 34 bytes, no trailing NUL. The kernel WG source
+    // (`drivers/net/wireguard/noise.c`) uses the same byte string.
+    assert_eq!(WG_PROTOCOL_ID_BYTES.len(), 34);
+    assert_eq!(WG_PROTOCOL_ID_BYTES, b"WireGuard v1 zx2c4 Jason@zx2c4.com");
+}
+
+/// r-final-fix regression for Codex final pre-merge finding 2:
+/// responder key-confirmation. A responder-role session MUST NOT be
+/// usable for `try_encap` until it has authenticated at least one
+/// inbound transport packet (the initiator's first data record).
+/// Initiator-role sessions are confirmed at install. After the
+/// responder authenticates the initiator's first packet, the
+/// responder's session flips to confirmed and egress is allowed.
+#[test]
+fn responder_session_blocks_encap_until_initiator_data_authenticated() {
+    use super::session::SessionRole;
+
+    let (init_priv, init_pub) = keypair();
+    let (resp_priv, resp_pub) = keypair();
+
+    let init_engine = WgEngine::new(WgEngineConfig {
+        local_private_key: init_priv,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: resp_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+        }],
+    });
+    let resp_engine = WgEngine::new(WgEngineConfig {
+        local_private_key: resp_priv,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: init_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+        }],
+    });
+
+    // Drive the IK handshake.
+    let mut init_hs = init_engine.build_initiator_handshake(&resp_pub).unwrap();
+    let mut resp_hs = resp_engine.build_responder_handshake().unwrap();
+    let mut buf = [0u8; 1024];
+    let mut sink = [0u8; 1024];
+    let n1 = init_hs.write_message(&[], &mut buf).unwrap();
+    resp_hs.read_message(&buf[..n1], &mut sink).unwrap();
+    let n2 = resp_hs.write_message(&[], &mut buf).unwrap();
+    init_hs.read_message(&buf[..n2], &mut sink).unwrap();
+
+    let init_xport = init_hs.into_stateless_transport_mode().unwrap();
+    let resp_xport = resp_hs.into_stateless_transport_mode().unwrap();
+    let init_local = 0xc0de_0001;
+    let resp_local = 0xc0de_0002;
+
+    // Install the initiator session as Initiator-role → confirmed.
+    init_engine
+        .install_session(
+            &resp_pub,
+            Arc::new(WgSession::new_with_role(
+                init_xport,
+                init_local,
+                resp_local,
+                resp_pub,
+                SessionRole::Initiator,
+            )),
+        )
+        .unwrap();
+    // Install the responder session as Responder-role → unconfirmed.
+    let resp_session = Arc::new(WgSession::new_with_role(
+        resp_xport,
+        resp_local,
+        init_local,
+        init_pub,
+        SessionRole::Responder,
+    ));
+    assert!(
+        !resp_session.is_confirmed(),
+        "responder session must start unconfirmed"
+    );
+    resp_engine
+        .install_session(&init_pub, resp_session.clone())
+        .unwrap();
+
+    // The responder MUST refuse to encap before the initiator's
+    // first data record arrives — this is the WG anti-reflection
+    // invariant. The caller sees `NoSession` and falls through to
+    // its slow path.
+    let inner = ipv4_packet(Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 9));
+    let mut wire_pre = [0u8; 2048];
+    let err = resp_engine
+        .try_encap(&init_pub, &inner, &mut wire_pre)
+        .unwrap_err();
+    assert_eq!(
+        err,
+        EncapError::NoSession,
+        "responder MUST NOT encap before authenticating initiator's first data record"
+    );
+
+    // Initiator sends the first transport packet. Responder
+    // authenticates it — that flips `confirmed = true`.
+    let mut wire_first = [0u8; 2048];
+    let enc = init_engine
+        .try_encap(&resp_pub, &inner, &mut wire_first)
+        .unwrap();
+    let mut plain = [0u8; 2048];
+    let dec = resp_engine
+        .try_decap(&wire_first[..enc.len], &mut plain)
+        .unwrap();
+    assert_eq!(dec.peer_pubkey, init_pub);
+    assert!(
+        resp_session.is_confirmed(),
+        "successful AEAD authentication of inbound data must flip the responder \
+         session's confirmation flag (WG key-confirmation invariant)"
+    );
+
+    // Responder can now encap to the initiator.
+    let inner_reply = ipv4_packet(Ipv4Addr::new(10, 0, 0, 9), Ipv4Addr::new(10, 0, 0, 5));
+    let mut wire_post = [0u8; 2048];
+    let enc_post = resp_engine
+        .try_encap(&init_pub, &inner_reply, &mut wire_post)
+        .expect("responder must be able to encap after confirmation flips");
+    assert!(enc_post.len > 0);
+}
+
+/// r-final-fix regression for Codex final pre-merge finding 3:
+/// `reconcile_peers` must update mutable per-peer config fields
+/// (endpoint, persistent_keepalive) in place on an existing peer
+/// Arc rather than silently keeping stale values. Pre-fix: the Peer
+/// struct held immutable `endpoint` / `persistent_keepalive`, so a
+/// config commit that changed those values for an existing pubkey
+/// was lost.
+#[test]
+fn reconcile_peers_updates_endpoint_and_keepalive_for_existing_peer() {
+    use std::net::SocketAddr;
+    let (init_priv, _init_pub) = keypair();
+    let (_peer_priv, peer_pub) = keypair();
+    let engine = WgEngine::new(WgEngineConfig {
+        local_private_key: init_priv,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: peer_pub,
+            endpoint: Some(SocketAddr::from(([192, 0, 2, 1], 51820))),
+            persistent_keepalive: 25,
+            allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+        }],
+    });
+
+    // Sanity: initial fields applied.
+    {
+        let table = engine.table_for_test();
+        let idx = *table.peer_index_by_pubkey.get(&peer_pub).unwrap();
+        let peer = table.peers[idx as usize].clone();
+        assert_eq!(peer.endpoint(), Some(SocketAddr::from(([192, 0, 2, 1], 51820))));
+        assert_eq!(peer.persistent_keepalive(), 25);
+    }
+
+    // Commit a new config that changes the endpoint AND keepalive
+    // for the SAME pubkey. The engine reuses the existing peer Arc
+    // (same pubkey) but must apply the field updates in place.
+    engine.reconcile_peers(&[WgPeerConfig {
+        pubkey: peer_pub,
+        endpoint: Some(SocketAddr::from(([198, 51, 100, 7], 51900))),
+        persistent_keepalive: 60,
+        allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+    }]);
+
+    let table = engine.table_for_test();
+    let idx = *table.peer_index_by_pubkey.get(&peer_pub).unwrap();
+    let peer = table.peers[idx as usize].clone();
+    assert_eq!(
+        peer.endpoint(),
+        Some(SocketAddr::from(([198, 51, 100, 7], 51900))),
+        "reconcile must apply endpoint update to the reused peer Arc"
+    );
+    assert_eq!(
+        peer.persistent_keepalive(),
+        60,
+        "reconcile must apply persistent_keepalive update to the reused peer Arc"
+    );
+
+    // Clearing the endpoint (responder-only) must also propagate.
+    engine.reconcile_peers(&[WgPeerConfig {
+        pubkey: peer_pub,
+        endpoint: None,
+        persistent_keepalive: 0,
+        allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+    }]);
+    let table = engine.table_for_test();
+    let idx = *table.peer_index_by_pubkey.get(&peer_pub).unwrap();
+    let peer = table.peers[idx as usize].clone();
+    assert_eq!(peer.endpoint(), None);
+    assert_eq!(peer.persistent_keepalive(), 0);
+}
+
+/// r-final-fix regression for Copilot inline finding on
+/// `inner_ip_len_after_decap`: an IPv4 inner packet with a bogus
+/// IHL (< 5) or a `total_length` shorter than the header length
+/// MUST be rejected as `MalformedInner`. Pre-fix the engine
+/// returned `Some(claimed)` for any `total_length <= pkt.len()`,
+/// so a downstream parser could see `DecapOutcome.len < 20` and
+/// mis-parse the bytes as a real IPv4 header.
+#[test]
+fn decap_rejects_inner_ipv4_with_invalid_ihl_or_total_length() {
+    let (init_engine, resp_engine, _init_pub, resp_pub) = established_pair(
+        vec!["10.0.1.0/24".parse().unwrap()],
+        vec!["10.0.0.0/24".parse().unwrap()],
+    );
+
+    // Case 1: IHL = 4 (impossible — < 5 means no room for the fixed
+    // header). The first byte's low nibble holds IHL. version=4,
+    // IHL=4 → byte 0 = 0x44.
+    {
+        let mut inner = vec![0u8; 32];
+        inner[0] = 0x44; // version=4, IHL=4 (invalid)
+        inner[2..4].copy_from_slice(&32u16.to_be_bytes());
+        // Need a valid src for AllowedIPs gate to PASS so the
+        // failure attributes to inner_ip_len_after_decap, not the
+        // AllowedIPs gate. inner_src_ip reads bytes 12..16
+        // unconditionally.
+        inner[12..16].copy_from_slice(&[10, 0, 0, 5]);
+        inner[16..20].copy_from_slice(&[10, 0, 1, 5]);
+        let mut wire = [0u8; 2048];
+        let enc = init_engine.try_encap(&resp_pub, &inner, &mut wire).unwrap();
+        let mut plain = [0u8; 2048];
+        let err = resp_engine
+            .try_decap(&wire[..enc.len], &mut plain)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DecapError::MalformedInner,
+            "IHL < 5 must be rejected as MalformedInner"
+        );
+    }
+
+    // Case 2: IHL = 5, total_length = 10 (claims fewer bytes than
+    // the fixed header). Must reject.
+    {
+        let mut inner = vec![0u8; 32];
+        inner[0] = 0x45; // version=4, IHL=5
+        inner[2..4].copy_from_slice(&10u16.to_be_bytes());
+        inner[12..16].copy_from_slice(&[10, 0, 0, 5]);
+        inner[16..20].copy_from_slice(&[10, 0, 1, 5]);
+        let mut wire = [0u8; 2048];
+        let enc = init_engine.try_encap(&resp_pub, &inner, &mut wire).unwrap();
+        let mut plain = [0u8; 2048];
+        let err = resp_engine
+            .try_decap(&wire[..enc.len], &mut plain)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DecapError::MalformedInner,
+            "total_length < ihl*4 must be rejected as MalformedInner"
+        );
+    }
+}
+
+/// r-final-fix regression for Copilot inline finding on
+/// `TunnelEndpointSnapshot::wg_local_privkey_hex`: the private key
+/// field MUST NOT be serialized into the on-disk state file, and a
+/// `Debug` impl MUST redact it so accidental log calls cannot leak
+/// key material.
+#[test]
+fn tunnel_endpoint_snapshot_private_key_is_skipped_and_redacted() {
+    use crate::protocol::TunnelEndpointSnapshot;
+
+    let snap = TunnelEndpointSnapshot {
+        wg_local_privkey_hex: "deadbeef".repeat(8), // 64 hex chars = "private key"
+        wg_peer_pubkey_hex: "abc123".to_string(),
+        wg_listen_port: 51820,
+        ..Default::default()
+    };
+
+    // Serialization must NOT include the private key — this is the
+    // surface that ends up in the state file on disk.
+    let json = serde_json::to_string(&snap).expect("snapshot must serialize");
+    assert!(
+        !json.contains(&snap.wg_local_privkey_hex),
+        "wg_local_privkey_hex must NOT appear in serialized output (state file would leak); \
+         got: {json}"
+    );
+
+    // Debug must redact — accidental {:?} log lines can't leak.
+    let debug_str = format!("{snap:?}");
+    assert!(
+        !debug_str.contains(&snap.wg_local_privkey_hex),
+        "Debug for TunnelEndpointSnapshot must NOT include the raw private key bytes; \
+         got: {debug_str}"
+    );
+    assert!(
+        debug_str.contains("<redacted>"),
+        "Debug for TunnelEndpointSnapshot must show <redacted> placeholder; got: {debug_str}"
+    );
+
+    // Empty-key case: must show <unset> placeholder.
+    let empty = TunnelEndpointSnapshot::default();
+    let debug_str = format!("{empty:?}");
+    assert!(
+        debug_str.contains("<unset>"),
+        "empty privkey must Debug as <unset>; got: {debug_str}"
+    );
+
+    // Deserialization still accepts the field — the control plane
+    // delivers the key on the control socket.
+    let wire = serde_json::json!({
+        "wg_local_privkey_hex": "0123456789abcdef".repeat(4),
+        "wg_listen_port": 51820,
+    });
+    let snap: TunnelEndpointSnapshot = serde_json::from_value(wire).unwrap();
+    assert_eq!(snap.wg_local_privkey_hex.len(), 64);
+    assert_eq!(snap.wg_listen_port, 51820);
+}
+
 #[test]
 fn allowed_ips_unit_check() {
     // Direct AllowedIps test — extra coverage on top of the

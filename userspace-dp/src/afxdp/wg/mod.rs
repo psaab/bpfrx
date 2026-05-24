@@ -61,6 +61,19 @@ pub(crate) const WG_NOISE_PATTERN: &str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s
 /// WG handshake behavior.
 pub(crate) const WG_ZERO_PSK: [u8; WG_KEY_LEN] = [0u8; WG_KEY_LEN];
 
+/// WireGuard protocol identifier mixed into the Noise prologue so the
+/// initial transcript hash matches the kernel WireGuard / wireguard-go
+/// implementations on the wire. See the WireGuard protocol page
+/// (https://www.wireguard.com/protocol/) and the kernel source at
+/// `drivers/net/wireguard/noise.c` (search for "WireGuard v1 zx2c4").
+///
+/// The bytes are the ASCII string "WireGuard v1 zx2c4 Jason@zx2c4.com"
+/// (34 bytes, no trailing NUL — the kernel passes the same string
+/// through `BLAKE2s` without terminator). Without this prologue the
+/// Noise hash diverges from byte one and this engine is not
+/// interoperable with any real WG peer.
+pub(crate) const WG_PROTOCOL_ID_BYTES: &[u8] = b"WireGuard v1 zx2c4 Jason@zx2c4.com";
+
 /// WireGuard packet type codes (over UDP outer).
 pub(crate) const WG_TYPE_INITIATION: u8 = 1;
 pub(crate) const WG_TYPE_RESPONSE: u8 = 2;

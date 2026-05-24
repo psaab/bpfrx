@@ -15,7 +15,7 @@
 
 use snow::StatelessTransportState;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Width of the replay window in packets. 64 is a tight fit for a
 /// single u64 bitmap; if we widen to 128 in the future we can swap
@@ -38,6 +38,17 @@ fn reserve_next_counter(counter: &AtomicU64) -> Option<u64> {
             }
         })
         .ok()
+}
+
+/// Which side of the handshake produced this session. Determines the
+/// initial value of `confirmed` (initiator-side sessions are confirmed
+/// at install because the initiator is the side that sends first;
+/// responder-side sessions start unconfirmed and must observe a valid
+/// inbound data record before egress is allowed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionRole {
+    Initiator,
+    Responder,
 }
 
 /// A live, post-handshake WG transport session.
@@ -63,6 +74,18 @@ pub(crate) struct WgSession {
     /// Stored so the engine can route demuxed packets back through
     /// the peer's AllowedIPs gate.
     pub(crate) peer_pubkey: [u8; 32],
+    /// WireGuard key-confirmation flag. WG spec: the responder MUST
+    /// NOT send encrypted transport data on a fresh session until it
+    /// has authenticated the initiator's first transport packet. This
+    /// is the anti-reflection / key-confirmation invariant that
+    /// prevents the responder from acting as a one-shot amplifier
+    /// against a forged handshake response. Initiator-role sessions
+    /// are installed with `confirmed = true` (the initiator is the
+    /// side that sends first by definition). Responder-role sessions
+    /// are installed with `confirmed = false`; egress through such a
+    /// session is treated as no-usable-session until a successful
+    /// inbound `read_message` flips the flag.
+    pub(crate) confirmed: AtomicBool,
 }
 
 impl std::fmt::Debug for WgSession {
@@ -77,12 +100,40 @@ impl std::fmt::Debug for WgSession {
 }
 
 impl WgSession {
+    /// Create a session in initiator role — confirmed at install
+    /// (the initiator is the side that sends first per the WG spec).
+    /// Existing callers used `WgSession::new`; that constructor maps
+    /// to this initiator behavior to preserve backward compatibility
+    /// for the in-tree tests that drive both sides through the
+    /// engine's slow path. Callers that handle a responder session
+    /// (after reading the initiator's first handshake message) MUST
+    /// use `new_with_role(SessionRole::Responder, ...)`.
     pub(crate) fn new(
         transport: StatelessTransportState,
         local_index: u32,
         peer_index: u32,
         peer_pubkey: [u8; 32],
     ) -> Self {
+        Self::new_with_role(
+            transport,
+            local_index,
+            peer_index,
+            peer_pubkey,
+            SessionRole::Initiator,
+        )
+    }
+
+    /// Create a session and record its role for key-confirmation
+    /// gating. See the `confirmed` field doc on `WgSession` for the
+    /// initiator-vs-responder contract.
+    pub(crate) fn new_with_role(
+        transport: StatelessTransportState,
+        local_index: u32,
+        peer_index: u32,
+        peer_pubkey: [u8; 32],
+        role: SessionRole,
+    ) -> Self {
+        let confirmed = matches!(role, SessionRole::Initiator);
         Self {
             transport,
             local_index,
@@ -90,6 +141,7 @@ impl WgSession {
             tx_counter: AtomicU64::new(0),
             replay: Mutex::new(ReplayState::default()),
             peer_pubkey,
+            confirmed: AtomicBool::new(confirmed),
         }
     }
 
@@ -97,6 +149,23 @@ impl WgSession {
     #[inline]
     pub(crate) fn next_tx_counter(&self) -> Option<u64> {
         reserve_next_counter(&self.tx_counter)
+    }
+
+    /// Returns true once the session has authenticated at least one
+    /// inbound transport packet. Initiator-role sessions return true
+    /// from install onward.
+    #[inline]
+    pub(crate) fn is_confirmed(&self) -> bool {
+        self.confirmed.load(Ordering::Acquire)
+    }
+
+    /// Mark the session as confirmed. Called from `try_decap` after a
+    /// successful AEAD authentication of an inbound transport record.
+    /// `Release` pairs with the `Acquire` load in `is_confirmed` so
+    /// any subsequent egress reader sees a `true` flag.
+    #[inline]
+    pub(crate) fn mark_confirmed(&self) {
+        self.confirmed.store(true, Ordering::Release);
     }
 }
 

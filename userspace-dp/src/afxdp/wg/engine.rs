@@ -31,7 +31,9 @@ use super::allowed_ips::AllowedIps;
 use super::framing::{encode_data_header, parse_data_header};
 use super::peer::Peer;
 use super::session::{REJECT_AFTER_MESSAGES, ReplayDecision, WgSession};
-use super::{POLY1305_TAG_LEN, WG_DATA_HEADER_LEN, WG_NOISE_PATTERN, WG_ZERO_PSK};
+use super::{
+    POLY1305_TAG_LEN, WG_DATA_HEADER_LEN, WG_NOISE_PATTERN, WG_PROTOCOL_ID_BYTES, WG_ZERO_PSK,
+};
 use arc_swap::ArcSwap;
 use rustc_hash::FxHashMap;
 use snow::{Builder, HandshakeState};
@@ -278,7 +280,18 @@ impl WgEngine {
                 .get(&cfg.pubkey)
                 .and_then(|old_idx| old.peers.get(*old_idx as usize).cloned());
             let peer = match existing {
-                Some(p) => p,
+                Some(p) => {
+                    // Apply mutable-field updates in place. The peer
+                    // Arc is reused so the (current, previous) session
+                    // pair survives the commit. Without this in-place
+                    // update, config changes to endpoint or persistent-
+                    // keepalive on an existing pubkey would be silently
+                    // ignored until the integration layer dropped and
+                    // recreated the peer (which it does not). Codex
+                    // final pre-merge finding 3.
+                    p.update_config(cfg.endpoint, cfg.persistent_keepalive);
+                    p
+                }
                 None => Arc::new(Peer::new(
                     cfg.pubkey,
                     cfg.endpoint,
@@ -345,6 +358,15 @@ impl WgEngine {
     /// long as the caller holds it.
     fn load_table(&self) -> Arc<PeerTable> {
         self.table.load_full()
+    }
+
+    /// Test-only accessor: same as `load_table`, exposed at module
+    /// visibility so tests can reach `peer.endpoint()` /
+    /// `peer.persistent_keepalive()` for the reconcile-updates-
+    /// existing-peer regression. Not used on the hot path.
+    #[cfg(test)]
+    pub(crate) fn table_for_test(&self) -> Arc<PeerTable> {
+        self.load_table()
     }
 
     fn peer_arc(&self, pubkey: &[u8; 32]) -> Option<Arc<Peer>> {
@@ -446,6 +468,19 @@ impl WgEngine {
             .unwrap()
             .clone()
             .ok_or(EncapError::NoSession)?;
+        // WG key-confirmation: the responder MUST NOT send transport
+        // data on a fresh session until it has authenticated the
+        // initiator's first data packet. Treat an unconfirmed session
+        // as `NoSession` so the caller falls through to its slow path
+        // (typically: queue the packet, wait for the initiator to
+        // send first). Initiator-role sessions are installed
+        // pre-confirmed, so this gate only fires on the responder
+        // side and only until the first valid inbound record. See
+        // `WgSession::confirmed` doc for the rationale and Codex
+        // final pre-merge finding 2 for the missed invariant.
+        if !session.is_confirmed() {
+            return Err(EncapError::NoSession);
+        }
 
         // WG spec §5.4.6 mandates the plaintext be zero-padded to a
         // 16-byte multiple before AEAD. This obscures inner packet
@@ -585,6 +620,15 @@ impl WgEngine {
             .transport
             .read_message(hdr.counter, hdr.ciphertext, out)
             .map_err(|_| DecapError::CryptoFailed)?;
+        // WG key-confirmation: a successful AEAD authenticate is
+        // proof that the peer has the session keys, so a responder-
+        // role session can now be used for egress. Initiator-role
+        // sessions install pre-confirmed; this is a no-op for them.
+        // Set the flag BEFORE the replay/LPM gates so a packet that
+        // authenticates but fails AllowedIPs still flips the
+        // confirmation — the authentication is what the WG spec
+        // ties confirmation to, not downstream policy gates.
+        session.mark_confirmed();
         // Check the replay window AFTER successful decrypt — per
         // RFC 6479 / the WG paper, we mustn't update the window
         // for packets that fail authentication, or an attacker
@@ -679,7 +723,16 @@ impl WgEngine {
         &self,
         peer_pubkey: &[u8; 32],
     ) -> Result<HandshakeState, snow::Error> {
+        // `.prologue(WG_PROTOCOL_ID_BYTES)` is mandatory for wire
+        // interoperability with kernel WireGuard and wireguard-go. The
+        // WG protocol mixes the ASCII identifier
+        // "WireGuard v1 zx2c4 Jason@zx2c4.com" into the initial Noise
+        // hash. Omitting the prologue produces a "WireGuard-shaped"
+        // transcript that no real peer will authenticate. Codex final
+        // pre-merge review caught this after nine prior review rounds
+        // missed it; see WG_PROTOCOL_ID_BYTES doc in mod.rs.
         Builder::new(WG_NOISE_PATTERN.parse()?)
+            .prologue(WG_PROTOCOL_ID_BYTES)?
             .local_private_key(self.local_private_key.as_slice())?
             .remote_public_key(peer_pubkey)?
             .psk(2, &WG_ZERO_PSK)?
@@ -699,7 +752,11 @@ impl WgEngine {
     /// to the snow message-bytes parser which is integration-layer
     /// concern. Tracked for the integration PR.
     pub(crate) fn build_responder_handshake(&self) -> Result<HandshakeState, snow::Error> {
+        // See `build_initiator_handshake` for the prologue rationale.
+        // Both sides must mix the same identifier into the Noise
+        // initial hash or the transcripts diverge from byte one.
         Builder::new(WG_NOISE_PATTERN.parse()?)
+            .prologue(WG_PROTOCOL_ID_BYTES)?
             .local_private_key(self.local_private_key.as_slice())?
             .psk(2, &WG_ZERO_PSK)?
             .build_responder()
@@ -727,7 +784,27 @@ fn inner_ip_len_after_decap(pkt: &[u8]) -> Option<usize> {
             if pkt.len() < 20 {
                 return None;
             }
-            u16::from_be_bytes([pkt[2], pkt[3]]) as usize
+            // RFC 791: IHL is the IP header length in 32-bit words.
+            // Valid values are 5..=15 (20..=60 bytes of header). An
+            // IHL < 5 means there isn't even room for the fixed IPv4
+            // header. Copilot inline review: an AEAD-authenticated
+            // payload with a bogus IHL would otherwise let
+            // `total_length` claim a value < ihl*4 and `DecapOutcome
+            // .len` could be < 20 — a downstream parser that
+            // assumes "len >= 20 ⇒ valid IPv4 header" would
+            // mis-interpret the bytes. Reject these here so the
+            // post-decap consumer never sees a structurally bogus
+            // inner header.
+            let ihl = (pkt[0] & 0x0f) as usize;
+            if ihl < 5 {
+                return None;
+            }
+            let header_len = ihl * 4;
+            let total_length = u16::from_be_bytes([pkt[2], pkt[3]]) as usize;
+            if total_length < header_len {
+                return None;
+            }
+            total_length
         }
         6 => {
             if pkt.len() < 40 {

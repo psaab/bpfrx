@@ -381,7 +381,7 @@ pub(crate) struct FabricSnapshot {
     pub peer_mac: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub(crate) struct TunnelEndpointSnapshot {
     #[serde(default)]
     pub id: u16,
@@ -418,8 +418,18 @@ pub(crate) struct TunnelEndpointSnapshot {
     pub wg_listen_port: u16,
     /// Local static private key for the WG interface, hex-encoded
     /// (64 chars for 32 bytes). Empty when `mode != "wireguard"`.
-    /// CONTROL-PLANE-INTERNAL only — never logged.
-    #[serde(rename = "wg_local_privkey_hex", default)]
+    ///
+    /// This field is intentionally `skip_serializing` so it CANNOT
+    /// be written back out via any `serde_json` round-trip. The
+    /// userspace dataplane persists a JSON snapshot of `ServerState`
+    /// to disk via `server::helpers::write_state`, which used to
+    /// include this private key in plaintext (Copilot inline review
+    /// caught this on the final pre-merge round). Deserialization
+    /// still works — the control plane delivers the key on the
+    /// control socket via the `default` path. The custom Debug impl
+    /// on `TunnelEndpointSnapshot` redacts this field to keep any
+    /// future accidental `{:?}` log line from leaking key material.
+    #[serde(rename = "wg_local_privkey_hex", default, skip_serializing)]
     pub wg_local_privkey_hex: String,
     /// Peer's static public key, hex-encoded. The WG engine uses
     /// this as the encap key — not AllowedIPs LPM. See plan §
@@ -438,6 +448,41 @@ pub(crate) struct TunnelEndpointSnapshot {
     /// Optional persistent keepalive in seconds. 0 = off.
     #[serde(rename = "wg_keepalive_secs", default)]
     pub wg_keepalive_secs: u16,
+}
+
+impl std::fmt::Debug for TunnelEndpointSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Manually redact `wg_local_privkey_hex`. Use a placeholder
+        // that records only whether a key was set so debug logs
+        // remain useful for triage without leaking key material.
+        let privkey_state = if self.wg_local_privkey_hex.is_empty() {
+            "<unset>"
+        } else {
+            "<redacted>"
+        };
+        f.debug_struct("TunnelEndpointSnapshot")
+            .field("id", &self.id)
+            .field("interface", &self.interface)
+            .field("linux_name", &self.linux_name)
+            .field("ifindex", &self.ifindex)
+            .field("zone", &self.zone)
+            .field("redundancy_group", &self.redundancy_group)
+            .field("mtu", &self.mtu)
+            .field("mode", &self.mode)
+            .field("outer_family", &self.outer_family)
+            .field("source", &self.source)
+            .field("destination", &self.destination)
+            .field("key", &self.key)
+            .field("ttl", &self.ttl)
+            .field("transport_table", &self.transport_table)
+            .field("wg_listen_port", &self.wg_listen_port)
+            .field("wg_local_privkey_hex", &privkey_state)
+            .field("wg_peer_pubkey_hex", &self.wg_peer_pubkey_hex)
+            .field("wg_allowed_ips", &self.wg_allowed_ips)
+            .field("wg_endpoint", &self.wg_endpoint)
+            .field("wg_keepalive_secs", &self.wg_keepalive_secs)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

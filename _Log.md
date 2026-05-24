@@ -132,6 +132,49 @@
     `python3 -m unittest scripts.userspace_ha_validation_matrix_test`;
     `git diff --check`
 
+- **Timestamp**: 2026-05-24T19:30:00Z
+  - **Action**: PR #1499 r-final-fix — close the four findings Codex
+    final pre-merge review surfaced after nine prior review rounds
+    missed them, plus two Copilot inline findings that surfaced on
+    the same pass. (1) Set the WireGuard protocol prologue
+    "WireGuard v1 zx2c4 Jason@zx2c4.com" on both initiator and
+    responder Noise builders so the initial transcript hash matches
+    kernel WireGuard / wireguard-go; the engine was previously
+    "WireGuard-shaped" but not interoperable. (2) Added responder
+    key-confirmation gating: WgSession carries a SessionRole +
+    confirmed AtomicBool; responder sessions block try_encap until
+    a successful inbound try_decap flips the flag, restoring the WG
+    anti-reflection invariant. (3) Made Peer.endpoint and
+    persistent_keepalive interior-mutable (RwLock + AtomicU16) so
+    reconcile_peers updates an existing peer's config in place
+    instead of silently keeping stale values. (4) Clarified the
+    plan doc to scope the runtime TunnelEndpoint propagation
+    (forwarding.rs + forwarding_build.rs) into the integration PR;
+    only the wire surface TunnelEndpointSnapshot ships here.
+    (5) Strengthened inner_ip_len_after_decap to validate IPv4
+    IHL>=5 and total_length>=ihl*4 — Copilot inline finding.
+    (6) Made TunnelEndpointSnapshot.wg_local_privkey_hex
+    skip_serializing and gave the snapshot a manual Debug impl
+    that redacts the field; write_state used to leak the WG
+    private key into the on-disk state JSON — Copilot inline
+    finding. Added five regression tests covering the prologue
+    (counter-example proof), responder confirmation gating,
+    in-place peer reconcile, malformed IPv4 rejection, and the
+    privkey serialization/Debug contract.
+  - **File(s)**: `userspace-dp/src/afxdp/wg/mod.rs`,
+    `userspace-dp/src/afxdp/wg/engine.rs`,
+    `userspace-dp/src/afxdp/wg/session.rs`,
+    `userspace-dp/src/afxdp/wg/peer.rs`,
+    `userspace-dp/src/afxdp/wg/tests.rs`,
+    `userspace-dp/src/protocol.rs`,
+    `docs/pr/wireguard-clean/plan.md`, `_Log.md`
+  - **Validation**: `cargo build --release`: clean (114 pre-existing
+    warnings); `cargo test --release --bin xpf-userspace-dp
+    afxdp::wg`: 76/76 pass (was 71; +5 new regressions);
+    `cargo test --release --bin xpf-userspace-dp`: 1413/1413 pass
+    (was 1408; the same +5 new tests); each new test passes 5/5
+    runs in isolation.
+
 - **Timestamp**: 2026-05-24T15:14:30Z
   - **Action**: PR #1494 round-11 follow-up — collapsed the retained
     userspace XDP shim entry-program name onto one dataplane constant and
