@@ -1099,3 +1099,14 @@
     'TestValidateUserspaceShimSpecDriftMentionsUserspaceXDPGenerate|TestUserspaceShim|TestCleanupUserspaceShim|TestLoadOrCreatePinnedShimMap|TestEmbeddedUserspaceShim'
     -count=1`; `go test ./pkg/dataplane/... -count=1`; `go test ./...
     -count=1`; `git diff --check`
+
+- **Timestamp**: 2026-05-24T04:47:07Z
+  - **Action**: #1503 documentation reconciliation: refreshed
+    `docs/feature-gaps.md` so closed #1378 policy-scheduler work is no longer
+    presented as open retirement follow-up, and closed #1375 policer work is
+    documented as future parity/hardening rather than an active #1373
+    source-removal blocker.
+  - **File(s)**: `docs/feature-gaps.md`, `_Log.md`
+  - **Validation**: `rg -n "#1375|#1378|retirement blocker|retirement-contract"
+    docs/feature-gaps.md docs/pr/1373-retire-ebpf-dataplane/README.md
+    docs/pr/1373-retire-ebpf-dataplane/plan.md`; `git diff --check`
