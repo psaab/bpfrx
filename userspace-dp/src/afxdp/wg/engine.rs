@@ -15,17 +15,42 @@
 //!     `(receiver_index)`, finds the session, decrypts, then checks
 //!     the decrypted inner src IP against the owning peer's
 //!     AllowedIPs.
-//!   - `complete_handshake_initiator` / `complete_handshake_responder`
-//!     — slow path. Drive a snow `HandshakeState` to completion and
-//!     install the resulting `StatelessTransportState` on the peer.
+//!   - `build_initiator_handshake` / `build_responder_handshake` —
+//!     slow path. Construct a snow `HandshakeState` configured with
+//!     the WG protocol prologue and (for the initiator) the peer's
+//!     remote static key. The caller pumps the handshake by feeding
+//!     wire bytes through `read_message` / `write_message`, converts
+//!     to a `StatelessTransportState` via `into_stateless_transport_mode`,
+//!     and installs the resulting session via `install_session`.
+//!
+//! Out of scope for this engine (integration PR owns these):
+//!   - Building / parsing the on-wire WG handshake framing
+//!     (MessageInitiation/MessageResponse: MAC1 over a hash of the
+//!     responder's public key, MAC2 cookie reply when under load,
+//!     TAI64N timestamp inside the IK payload). This engine only
+//!     builds and consumes the snow sub-message bytes — the integration
+//!     PR will wrap them in the WG type-1/type-2 outer framing.
+//!   - Data-record on-wire framing extras beyond `framing.rs`
+//!     (cookie messages, keepalives that double as data records).
+//!   - Outer-UDP IO and routing.
 //!
 //! Hot path discipline:
 //!   - No allocations. snow's `write_message` / `read_message` take
 //!     pre-sized slices.
 //!   - No locks held across crypto operations on the encrypt path
 //!     (we clone the `Arc<WgSession>` and release the peer lock).
-//!   - Decrypt path takes a per-session replay-window lock only on
-//!     the cold (Repeat / OutOfWindow) arms.
+//!   - Decrypt path takes the per-session replay-window mutex twice:
+//!     once for the pre-AEAD `definitely_out_of_window` precheck, and
+//!     once for the post-AEAD `check_and_update`. The precheck is
+//!     held to avoid paying for a snow decrypt on counters that are
+//!     already provably stale — a hostile or replayed flood would
+//!     otherwise burn the AEAD cost per packet. Contention is bounded
+//!     because each session is demuxed onto a single worker, so the
+//!     mutex is effectively a per-session-per-worker SPSC lock with
+//!     no cross-worker traffic. (An earlier draft of this comment
+//!     claimed the precheck-lock was taken "only on cold arms"; that
+//!     was wrong — `try_decap` unconditionally locks the replay
+//!     mutex before snow.read_message.)
 
 use super::allowed_ips::AllowedIps;
 use super::framing::{encode_data_header, parse_data_header};

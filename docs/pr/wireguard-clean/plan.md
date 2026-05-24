@@ -45,17 +45,31 @@ integration-level and tracked as IN/OUT scope below.
 
 ### Crypto: snow, not boringtun
 
-Use [`snow`](https://crates.io/crates/snow) for Noise IK
-(`Noise_IK_25519_ChaChaPoly_BLAKE2s`). snow has:
+Use [`snow`](https://crates.io/crates/snow) for Noise IK with PSK2
+(`Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` — see `WG_NOISE_PATTERN` in
+`userspace-dp/src/afxdp/wg/mod.rs`). The PSK2 step matches WireGuard's
+on-wire framing: WG always feeds an all-zero 32-byte PSK in the PSK2
+position when no explicit pre-shared key is configured. The earlier
+draft of this section listed `Noise_IK_25519_ChaChaPoly_BLAKE2s` (no
+PSK2); that did not match the implementation and would have failed
+to interoperate with kernel WireGuard / wireguard-go. snow has:
 
 - Explicit state machine — no hidden output queues.
 - Caller-driven I/O: `read_message` / `write_message` return exactly
   the bytes they produce. There is nothing to "drain".
 - Audited core (snow has been independently audited and is widely
   used).
-- No `ring` dependency on the default feature set — uses pure-Rust
-  `chacha20-poly1305`, `curve25519-dalek` (a current, non-vulnerable
-  version), and `blake2`.
+- `ring 0.17.x` is pulled in transitively via snow's resolver. (The
+  earlier draft of this section claimed "no `ring` dependency on the
+  default feature set"; that was wrong — `Cargo.lock` shows `ring
+  0.17.14` reachable through snow.) `ring 0.17.x` is not the
+  RUSTSEC-2025-0010 version that boringtun 0.6.0 dragged in via
+  pre-0.17 ring; the current `ring 0.17.x` line is clean of open
+  RustSec advisories as of 2026-05-24. The dalek crates also resolve
+  to a non-RUSTSEC-2024-0344-vulnerable version. The vulnerability
+  story from PR #1492 (root cause 3 above) is therefore addressed
+  by snow's choice of vetted crypto crates, not by avoiding `ring`
+  outright.
 
 WireGuard's transport-data record format (4-byte type, 4-byte
 receiver index, 8-byte counter, encrypted payload || 16-byte Poly1305
@@ -69,14 +83,22 @@ The forwarding decision is the **sole** source of truth for which
 peer to encrypt to on egress. The engine exposes:
 
 ```rust
-pub fn try_encap(
+// Engine-level API as actually shipped in this PR.
+pub(crate) fn try_encap(
     &self,
-    virtual_ifindex: i32,   // logical WG interface
     peer_pubkey: &[u8; 32], // explicit; from the forwarding decision
-    inner: &[u8],           // inner IP packet
-    out: &mut Vec<u8>,      // pre-allocated worker scratch
+    inner_ip: &[u8],        // inner IP packet
+    out: &mut [u8],         // caller's pre-sized scratch (NOT Vec — no realloc allowed)
 ) -> Result<EncapOutcome, EncapError>;
 ```
+
+The integration PR will thread `virtual_ifindex` through a wrapper at
+the dispatch call site — the engine itself does not need it because
+peer selection is by `peer_pubkey` alone. The earlier draft of this
+section included `virtual_ifindex` and used `&mut Vec<u8>`; that
+was the original integration-layer sketch, not the engine's contract.
+The engine takes `&mut [u8]` precisely so the hot path never has the
+opportunity to realloc.
 
 The control plane delivers `peer_pubkey` via a new field on
 `TunnelEndpointSnapshot` (`wg_peer_pubkey`). AllowedIPs is **only**
@@ -286,10 +308,37 @@ existing pattern of `recycle_ingress_frame(...)` before every
   outer L2, DSCP propagation, peer-pubkey gate (cryptokey routing).
 - `userspace-dp/src/afxdp/mod.rs` — `mod wg;` declaration.
 
+### On-wire handshake framing scope (explicit boundary)
+
+This engine does NOT build or parse the WireGuard handshake message
+on-wire framing (type-1 MessageInitiation, type-2 MessageResponse,
+type-3 CookieReply, MAC1/MAC2 fields, the TAI64N timestamp slot, the
+encrypted-static and encrypted-identity blocks that surround the
+Noise IK sub-message). The engine only:
+
+- Builds and consumes the snow `HandshakeState` Noise sub-message
+  bytes via `read_message` / `write_message`, with the WG prologue
+  mixed into the transcript hash.
+- Builds and consumes the WG transport-data record on the wire (see
+  `framing.rs`): 4-byte type + 4-byte reserved + 4-byte
+  receiver_index + 8-byte counter + ciphertext || Poly1305 tag.
+
+The integration PR will add a layer that wraps the engine's Noise
+sub-message bytes inside the WG handshake outer framing (with MAC1
+over a hash of the responder's static pubkey, MAC2 cookie-reply
+under load, and TAI64N replay protection inside the identity
+payload). A reader of this engine alone should not conclude the
+handshake on-wire framing is "almost done" — `framing.rs` covers the
+data record only.
+
 ## What's OUT (tracked as follow-ups)
 
 - Activation in `tx/dispatch.rs` and `poll_descriptor.rs`. Engine
   exists and is tested but is not on the hot path yet.
+- WG handshake outer-framing layer (MessageInitiation/MessageResponse
+  outer bytes around the Noise sub-message, MAC1/MAC2, TAI64N).
+  Engine ships the Noise sub-message bytes only; the integration
+  PR will wrap them.
 - Go control-plane mapping from Junos `set security ipsec ...` /
   `set interfaces st0...` to WG snapshot fields.
 - HA / RG-aware session migration on failover.
