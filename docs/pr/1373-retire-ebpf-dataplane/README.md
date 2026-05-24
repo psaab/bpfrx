@@ -125,6 +125,43 @@ recursive Make dependencies, or the broad `./pkg/dataplane/...` generate path.
 This keeps the retained shim visible without implying that deleting legacy
 dataplane program generation is blocked by the shim itself.
 
+## #1493 Userspace Shim Loader Split
+
+Normal AF_XDP userspace startup now enters `LoadUserspaceShim()` and
+`CompileUserspaceShim()` instead of the legacy `Manager.Load()` /
+`loadAllObjects()` path. The shim loader loads only the retained Rust
+`xdp_userspace_prog` object plus explicit pinned compatibility maps used by the
+userspace runtime and old operational bridges: `userspace_*`, `dnat_table`,
+`dnat_table_v6`, `sessions`, `sessions_v6`, FIB/HA/fabric maps,
+`session_id_gen`, and telemetry counter maps. It does not load
+`xdp_main_prog`, legacy XDP tail-call programs, TC programs, `xdp_progs`, or
+`tc_progs`.
+
+The shim keeps `dnat_table` and `dnat_table_v6` at the legacy 10M-entry,
+`BPF_F_NO_PREALLOC` contract so a legacy-to-shim restart can reuse existing
+pins instead of silently wiping active SNAT-return state. If any required
+compatibility map is incompatible, the shim loader fails closed with the
+offending pin path and does not mutate pinned state; the operator must run an
+explicit teardown or migration outside normal startup. The operator runbook is
+[`docs/operations/userspace-shim-pin-recovery.md`](../../operations/userspace-shim-pin-recovery.md):
+drain traffic, stop `xpfd`, inspect the pinned map, remove only the
+incompatible pin path named in the error, restart `xpfd`, and verify the map was
+recreated. Removing a stateful compatibility pin resets that map's dataplane
+state, so the loader never retries by deleting a map pin or the whole BPF pin
+tree. During userspace shim compile, any pinned legacy `tc_*` links are detached
+and unpinned before the retained XDP shim is attached; TC programs are not part
+of the userspace runtime and must not survive as stale egress hooks from a
+previous legacy boot. Legacy-only map pins (`xdp_progs`, `tc_progs`, and
+`policer_states`) are removed during userspace shim startup, while compatibility
+stateful maps such as `sessions`, `sessions_v6`, `dnat_table`, and
+`dnat_table_v6` are preserved.
+
+The remaining compatibility bridge is config compilation metadata and Linux
+interface setup: userspace still runs the shared config compiler, but through a
+shim compile adapter that no-ops legacy dataplane map writes and attaches only
+the userspace XDP shim. Legacy direct callers outside the runtime adapter remain
+tracked under #1451.
+
 ### Allowlisted Legacy Bridges
 
 These files are the current production direct-import allowlist for root
@@ -191,10 +228,10 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
   registration import in `cmd/xpfd/main.go`. Non-`-tags dpdk` binaries fail
   DPDK startup explicitly rather than running a no-op stub.
 - Legacy BPF source and generated artifacts are not safe to delete in #1451
-  canary work: `bpf/`, `pkg/dataplane/loader_ebpf.go`,
-  `pkg/dataplane/*_bpfel.go`, `pkg/dataplane/*_bpfel.o`, and the legacy side
-  of the `Makefile generate` path remain tied to the eBPF backend until the
-  loader/map-bootstrap split is finished.
+  canary work: `bpf/`, `pkg/dataplane/*_bpfel.go`,
+  `pkg/dataplane/*_bpfel.o`, and the legacy side of the `Makefile generate`
+  path remain tied to the explicit eBPF backend until #1476 removes that
+  backend source. They are no longer required by normal userspace startup.
 - Retained userspace XDP shim artifacts are tracked separately:
   `pkg/dataplane/userspace_xdp_bpfel.o` and
   `pkg/dataplane/build-userspace-xdp.sh` remain required for userspace runtime

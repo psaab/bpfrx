@@ -46,6 +46,14 @@ func (a *LegacyDataPlaneAdapter) managerOrErr() (*Manager, error) {
 	return a.manager, nil
 }
 
+func (a *LegacyDataPlaneAdapter) IsLoaded() bool {
+	m, err := a.managerOrErr()
+	if err != nil || m.bpfShim == nil {
+		return false
+	}
+	return m.bpfShim.IsLoaded()
+}
+
 func (a *LegacyDataPlaneAdapter) Start(ctx context.Context) error {
 	m, err := a.managerOrErr()
 	if err != nil {

@@ -248,6 +248,76 @@ func TestUserspaceXDPGoGenerateRunSelectsOnlyShim(t *testing.T) {
 	}
 }
 
+func TestUserspaceShimCompileAdapterCoversCompilerDataplaneCalls(t *testing.T) {
+	t.Parallel()
+
+	compilerCalls := compilerDataplaneCalls(t)
+	adapterMethods := receiverMethods(t, "loader.go", "userspaceShimCompileDataplane")
+	allowedRealMethods := map[string]bool{
+		"BumpFIBGeneration": true, // uses the shim-owned fib_gen_map
+		"GetPersistentNAT":  true, // in-memory compatibility table
+		"IsLoaded":          true, // lifecycle state only
+	}
+
+	var missing []string
+	for name := range compilerCalls {
+		if allowedRealMethods[name] || adapterMethods[name] {
+			continue
+		}
+		missing = append(missing, name)
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Fatalf("userspaceShimCompileDataplane must explicitly no-op or allow compiler DataPlane calls: %v", missing)
+	}
+}
+
+func TestUserspaceShimSharedMapsAreExplicitCompatibilitySet(t *testing.T) {
+	t.Parallel()
+
+	specs := userspaceShimSharedMapSpecs()
+	names := make(map[string]bool, len(specs))
+	for _, spec := range specs {
+		names[spec.Name] = true
+	}
+	for _, name := range []string{
+		"sessions",
+		"sessions_v6",
+		"dnat_table",
+		"dnat_table_v6",
+		"fib_gen_map",
+		"fabric_fwd",
+		"rg_active",
+		"ha_watchdog",
+		"session_id_gen",
+		"global_counters",
+		"flood_counters",
+		"policy_counters",
+		"zone_counters",
+		"filter_counters",
+		"interface_counters",
+		"nat_port_counters",
+		"nat_rule_counters",
+	} {
+		if !names[name] {
+			t.Fatalf("userspace shim shared map %q missing from explicit compatibility set", name)
+		}
+	}
+	for _, forbidden := range []string{
+		"xdp_progs",
+		"tc_progs",
+		"iface_zone_map",
+		"zone_configs",
+		"policy_rules",
+		"tx_ports",
+		"redirect_capable",
+	} {
+		if names[forbidden] {
+			t.Fatalf("userspace shim shared maps must not retain legacy pipeline map %q", forbidden)
+		}
+	}
+}
+
 func TestDaemonRuntimeEntryPointUsesRuntimeDataPlane(t *testing.T) {
 	t.Parallel()
 
@@ -259,6 +329,73 @@ func TestDaemonRuntimeEntryPointUsesRuntimeDataPlane(t *testing.T) {
 	}
 	if !hasDaemonRuntimeConstructorCall(t, daemonRun, "NewRuntimeDataPlane") {
 		t.Fatal("daemon runtime startup no longer calls dataplane.NewRuntimeDataPlane")
+	}
+}
+
+func compilerDataplaneCalls(t *testing.T) map[string]bool {
+	t.Helper()
+	files, err := filepath.Glob("compiler*.go")
+	if err != nil {
+		t.Fatalf("glob compiler files: %v", err)
+	}
+	out := make(map[string]bool)
+	for _, path := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			ident, ok := sel.X.(*ast.Ident)
+			if !ok || ident.Name != "dp" {
+				return true
+			}
+			out[sel.Sel.Name] = true
+			return true
+		})
+	}
+	return out
+}
+
+func receiverMethods(t *testing.T, path, receiverName string) map[string]bool {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	out := make(map[string]bool)
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv == nil || len(fn.Recv.List) != 1 {
+			continue
+		}
+		if receiverTypeName(fn.Recv.List[0].Type) == receiverName {
+			out[fn.Name.Name] = true
+		}
+	}
+	return out
+}
+
+func receiverTypeName(expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e.Name
+	case *ast.StarExpr:
+		return receiverTypeName(e.X)
+	default:
+		return ""
 	}
 }
 
