@@ -14,7 +14,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const bpfPinPath = "/sys/fs/bpf/xpf"
+const (
+	bpfPinPath                         = "/sys/fs/bpf/xpf"
+	userspaceShimGenerateRemediation   = "Re-run `make generate-userspace-xdp`."
+	userspaceBindingsMapName           = "userspace_bindings"
+	userspaceIngressIfacesMapName      = "userspace_ingress_ifaces"
+	userspaceShimCompatibilityDNATName = "dnat_table"
+)
 
 // pinnedMaps lists maps that survive daemon restarts via BPF filesystem pins.
 // Config-derived maps are repopulated from config on every Compile().
@@ -216,21 +222,15 @@ func (m *Manager) loadAllObjects() error {
 	// constants.go. A stale .o slipping through make generate would
 	// otherwise silently overflow at the first high-ifindex
 	// bindingsMap.Update, exactly the recurrence this PR fixes.
-	if ms, ok := userspaceSpec.Maps["userspace_bindings"]; !ok {
+	if ms, ok := userspaceSpec.Maps[userspaceBindingsMapName]; !ok {
 		return fmt.Errorf("Rust xdp_userspace spec missing map userspace_bindings")
 	} else if ms.MaxEntries != BindingArrayMaxEntries {
-		return fmt.Errorf(
-			"userspace_bindings max_entries drift: embedded=%d, expected=%d (MaxInterfaces=%d * BindingQueuesPerIface=%d in bpf/headers/xpf_common.h). Re-run `make generate-userspace-xdp`.",
-			ms.MaxEntries, BindingArrayMaxEntries, MaxInterfaces, BindingQueuesPerIface,
-		)
+		return userspaceBindingsMaxEntriesDriftError(ms.MaxEntries)
 	}
-	if ms, ok := userspaceSpec.Maps["userspace_ingress_ifaces"]; !ok {
+	if ms, ok := userspaceSpec.Maps[userspaceIngressIfacesMapName]; !ok {
 		return fmt.Errorf("Rust xdp_userspace spec missing map userspace_ingress_ifaces")
 	} else if ms.MaxEntries != MaxInterfaces {
-		return fmt.Errorf(
-			"userspace_ingress_ifaces max_entries drift: embedded=%d, expected=%d (MaxInterfaces in bpf/headers/xpf_common.h). Re-run `make generate-userspace-xdp`.",
-			ms.MaxEntries, MaxInterfaces,
-		)
+		return userspaceIngressIfacesMaxEntriesDriftError(ms.MaxEntries)
 	}
 	for _, name := range []string{
 		"userspace_ctrl",
@@ -556,36 +556,44 @@ func (m *Manager) loadUserspaceShimObjectsOnce() (err error) {
 }
 
 func validateUserspaceShimSpec(userspaceSpec *ebpf.CollectionSpec) error {
-	if ms, ok := userspaceSpec.Maps["userspace_bindings"]; !ok {
+	if ms, ok := userspaceSpec.Maps[userspaceBindingsMapName]; !ok {
 		return fmt.Errorf("Rust xdp_userspace spec missing map userspace_bindings")
 	} else if ms.MaxEntries != BindingArrayMaxEntries {
-		return fmt.Errorf(
-			"userspace_bindings max_entries drift: embedded=%d, expected=%d (MaxInterfaces=%d * BindingQueuesPerIface=%d in bpf/headers/xpf_common.h). Re-run `make generate-userspace-xdp`.",
-			ms.MaxEntries, BindingArrayMaxEntries, MaxInterfaces, BindingQueuesPerIface,
-		)
+		return userspaceBindingsMaxEntriesDriftError(ms.MaxEntries)
 	}
-	if ms, ok := userspaceSpec.Maps["userspace_ingress_ifaces"]; !ok {
+	if ms, ok := userspaceSpec.Maps[userspaceIngressIfacesMapName]; !ok {
 		return fmt.Errorf("Rust xdp_userspace spec missing map userspace_ingress_ifaces")
 	} else if ms.MaxEntries != MaxInterfaces {
-		return fmt.Errorf(
-			"userspace_ingress_ifaces max_entries drift: embedded=%d, expected=%d (MaxInterfaces in bpf/headers/xpf_common.h). Re-run `make generate-userspace-xdp`.",
-			ms.MaxEntries, MaxInterfaces,
-		)
+		return userspaceIngressIfacesMaxEntriesDriftError(ms.MaxEntries)
 	}
-	if ms, ok := userspaceSpec.Maps["dnat_table"]; !ok {
+	if ms, ok := userspaceSpec.Maps[userspaceShimCompatibilityDNATName]; !ok {
 		return fmt.Errorf("Rust xdp_userspace spec missing map dnat_table")
 	} else if ms.MaxEntries != userspaceShimMaxSessions {
 		return fmt.Errorf(
-			"dnat_table max_entries drift: embedded=%d, expected=%d (userspace shim compatibility map). Re-run `make generate-userspace-xdp`.",
-			ms.MaxEntries, userspaceShimMaxSessions,
+			"dnat_table max_entries drift: embedded=%d, expected=%d (userspace shim compatibility map). %s",
+			ms.MaxEntries, userspaceShimMaxSessions, userspaceShimGenerateRemediation,
 		)
 	} else if ms.Flags&unix.BPF_F_NO_PREALLOC == 0 {
 		return fmt.Errorf(
-			"dnat_table flags drift: embedded=%d, expected BPF_F_NO_PREALLOC (userspace shim compatibility map). Re-run `make generate-userspace-xdp`.",
-			ms.Flags,
+			"dnat_table flags drift: embedded=%d, expected BPF_F_NO_PREALLOC (userspace shim compatibility map). %s",
+			ms.Flags, userspaceShimGenerateRemediation,
 		)
 	}
 	return nil
+}
+
+func userspaceBindingsMaxEntriesDriftError(got uint32) error {
+	return fmt.Errorf(
+		"userspace_bindings max_entries drift: embedded=%d, expected=%d (MaxInterfaces=%d * BindingQueuesPerIface=%d in bpf/headers/xpf_common.h). %s",
+		got, BindingArrayMaxEntries, MaxInterfaces, BindingQueuesPerIface, userspaceShimGenerateRemediation,
+	)
+}
+
+func userspaceIngressIfacesMaxEntriesDriftError(got uint32) error {
+	return fmt.Errorf(
+		"userspace_ingress_ifaces max_entries drift: embedded=%d, expected=%d (MaxInterfaces in bpf/headers/xpf_common.h). %s",
+		got, MaxInterfaces, userspaceShimGenerateRemediation,
+	)
 }
 
 func userspacePinnedShimMaps() []string {
