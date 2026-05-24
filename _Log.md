@@ -2,6 +2,61 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T22:00:00Z
+  - **Action**: PR #1499 r-final-4 fix — closed Codex MAJOR (5 plan.md
+    drifts) and Copilot 2 inline findings on the r-final-3 commit
+    `d379c9d9`, plus a mechanical doc-sync sweep that tightened several
+    file:line citations. (1) plan.md hot-path layout `WgWorkerScratch`
+    bullet rewritten to describe `encap_out`/`decap_out:
+    RefCell<Vec<u8>>` (was `encap_buf: Vec<u8>`) per `scratch.rs:17-21`.
+    (2) plan.md hot-path "never under a lock on the hot path" claim
+    rewritten: engine peer routing is `ArcSwap<PeerTable>` (lock-free
+    load), but per-peer `current`/`previous` are `RwLock<Option<Arc<
+    WgSession>>>` and `sessions_by_local_index` is `RwLock<FxHashMap>`,
+    so encap takes `peer.current.read()` at `engine.rs:499-503` and
+    decap takes `sessions_by_local_index.read()` at `engine.rs:636-642`.
+    (3) plan.md protocol-extension field block: renamed `wg_local_privkey:
+    [u8; 32]` / `wg_peer_pubkey: [u8; 32]` to `wg_local_privkey_hex:
+    String` / `wg_peer_pubkey_hex: String` per `protocol.rs:417-450`
+    and deleted the false claim that the snapshot mirrors into the
+    runtime `TunnelEndpoint` in this PR — runtime mirror is integration-
+    PR scope (`afxdp/types/forwarding.rs:129-140` confirms no WG fields).
+    (4) plan.md MSS section: corrected the claim that `wg_tcp_mss` is
+    wired as a sibling of `native_gre_tcp_mss` and that `dispatch.rs:1458`
+    branches on `endpoint.mode`. Actual `dispatch.rs:1458-1459` short-
+    circuits TCP segmentation for ANY `tunnel_endpoint_id != 0`;
+    `wg_tcp_mss` exists only as a standalone helper in `afxdp/wg/mss.rs`.
+    Dispatch-side wiring is integration-PR scope. (5) plan.md VLAN-safety
+    section: reordered `write_outer_eth` arg list from `(out, src_mac,
+    dst_mac, vlan_id, ethertype)` to `(out, dst_mac, src_mac, vlan_id,
+    ethertype)` per `outer.rs:23-45`. (6) Copilot finding 1 (Go-side
+    comment): updated `pkg/dataplane/userspace/protocol.go` `WgListenPort`
+    comment that claimed WG demux is `(listen_port, receiver_index)` —
+    the engine demuxes by `receiver_index` alone, listen-port selection
+    is integration-layer UDP dispatch. (7) Copilot finding 2 (boundary
+    comment): tightened the `PADDED_PLAINTEXT_MAX` doc in `engine.rs:198`
+    to describe the actual `padded_len <= PADDED_PLAINTEXT_MAX` boundary
+    — accepted range is `inner_ip.len() ∈ [0, 4096]`, not "> 4080
+    rejected". A 4081..=4096-byte inner is ACCEPTED because
+    `pad_to_16(4096) == 4096 == PADDED_PLAINTEXT_MAX`. Mechanical-sweep
+    extras: (a) `allowed_ips.rs` "LPM trie" label corrected to flat
+    sorted-by-prefix-length-descending `Vec<Entry>` (LPM lookup, not LPM
+    trie). (b) `engine.rs:251` citation for `ArcSwap<PeerTable>` updated
+    to `engine.rs:258`. (c) Replay-lock citations updated from
+    `engine.rs:664`/`engine.rs:688` to `engine.rs:671-676` (pre-AEAD
+    precheck) and `engine.rs:695` onward (post-AEAD update). (d)
+    `protocol.rs:432-450` widened to `protocol.rs:417-450`. Verified by
+    `cargo build --release` (clean), 5×`cargo test ... afxdp::wg` runs
+    (78 pass each), and `go test ./pkg/dataplane/...` (all 4 packages
+    pass). One initial test flake on
+    `install_session_serializes_with_reconcile_removal` did not
+    reproduce on any of 5 follow-up runs — same class as the documented
+    pre-existing `reconcile_peers_snapshot_is_atomic_under_concurrent_load`
+    flake from `a5664f85`, not introduced by this fix.
+    - **File(s)**: `docs/pr/wireguard-clean/plan.md`,
+      `pkg/dataplane/userspace/protocol.go`,
+      `userspace-dp/src/afxdp/wg/engine.rs`, `_Log.md`.
+
 - **Timestamp**: 2026-05-24T20:58:00Z
   - **Action**: PR #1451 review follow-up — extended the RT_FLOW
     wire-offset canary across the full raw event layout and tightened

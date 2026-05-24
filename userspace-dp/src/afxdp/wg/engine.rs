@@ -190,9 +190,16 @@ pub(crate) struct WgEngineConfig {
 /// (LLVM cannot elide the zero-init because snow reads the trailing
 /// pad bytes, which must be zero by spec).
 ///
-/// Note on jumbo MTU: the value is 4080 + 16 padding = 4096. Inner
-/// packets larger than 4080 bytes will return `EncapError::BufferTooSmall`.
-/// Jumbo MTU configurations (>4080 inner) are not currently
+/// Note on jumbo MTU: the value is 4080 + 16 = 4096. The bound is
+/// enforced at `engine.rs:539` as `padded_len > PADDED_PLAINTEXT_MAX`
+/// where `padded_len = pad_to_16(inner_ip.len())` — i.e. the post-
+/// WG-§5.4.6-padding length. The accepted range is therefore
+/// `inner_ip.len() ∈ [0, 4096]` (any inner whose 16-byte-padded
+/// length is ≤ 4096): a 4080-byte inner pads to 4080 (already a
+/// multiple of 16, accepted), a 4081..=4096-byte inner pads to 4096
+/// (accepted, since `pad_to_16(4096) == 4096`), and a 4097-byte inner
+/// pads to 4112 and is rejected with `EncapError::BufferTooSmall`.
+/// Jumbo MTU configurations (>4096 inner) are not currently
 /// supported by this engine; raising the bound is a one-line change
 /// when the integration layer needs it.
 const PADDED_PLAINTEXT_MAX: usize = 4080 + 16;

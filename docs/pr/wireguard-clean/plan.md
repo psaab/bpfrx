@@ -137,11 +137,28 @@ message and at most one output message. Nothing to "drain".
 
 ### Hot-path layout
 
-- Worker holds a `WgWorkerScratch` with `encap_buf: Vec<u8>` sized
-  to `MAX_FRAME` at startup. Never reallocated.
-- Engine internals (peer table, session table) live in an
-  `Arc<WgEngine>` and use `arc-swap` for reconfiguration — the worker
-  reads a snapshot per poll, never under a lock on the hot path.
+- Worker holds a `WgWorkerScratch` with `encap_out: RefCell<Vec<u8>>`
+  and `decap_out: RefCell<Vec<u8>>` (see `scratch.rs:17-21`), each
+  sized to `MAX_FRAME` at startup. Separate per-direction buffers
+  with `RefCell` interior mutability — never reallocated; the cells
+  are entered exclusively per packet because each worker is
+  single-threaded inside its poll loop.
+- Engine peer routing (peers vec + pubkey→index map + AllowedIPs)
+  lives in a single `ArcSwap<PeerTable>` (`engine.rs:258`) so the
+  hot path observes the three sub-fields as one atomic snapshot
+  (`peer_arc` does an `ArcSwap::load` only — no lock). Per-peer
+  session state (`peer.current` / `peer.previous`) is
+  `RwLock<Option<Arc<WgSession>>>` and ingress demux
+  (`sessions_by_local_index`) is `RwLock<FxHashMap<u32, Arc<WgSession>>>`,
+  so encap takes one `RwLock::read` on `peer.current`
+  (`engine.rs:499-503`) and decap takes one `RwLock::read` on
+  `sessions_by_local_index` (`engine.rs:636-642`). Both are
+  uncontended in steady state (single-writer at slow-path session
+  install / rotate), but they ARE RwLock reads, not lock-free. The
+  earlier draft of this bullet claimed "never under a lock on the
+  hot path"; that overstated the invariant — the lock-free property
+  applies to the peer-table snapshot via `ArcSwap`, not to the
+  per-session current/previous slots or the inbound demux map.
 - Replay windows are per-session, tracked by a `ReplayState`
   (single counter + 64-bit sliding bitmap, RFC 6479) guarded by a
   `std::sync::Mutex` on the session. Encap is lock-free on the
@@ -158,8 +175,9 @@ message and at most one output message. Nothing to "drain".
   the lock as `parking_lot::Mutex` taken "only on the
   duplicate/out-of-window arms"; that did not match the
   implementation (`session.rs:72` — `std::sync::Mutex<ReplayState>`,
-  `engine.rs:664`/`engine.rs:688` — unconditional precheck-lock
-  followed by post-AEAD update-lock).
+  `engine.rs:671-676` — unconditional pre-AEAD precheck-lock; and
+  `engine.rs:695` onward — post-AEAD update-lock that calls
+  `replay.check_and_update`).
 - Ephemerals: handshakes are slow-path only — snow's `Builder`
   generates the ephemeral keypair inside `build_initiator_handshake`
   / `build_responder_handshake`, which the engine deliberately
@@ -233,13 +251,26 @@ Add to `TunnelEndpointSnapshot` (both `userspace-dp/src/protocol.rs`
 and `pkg/dataplane/userspace/protocol.go`):
 
 - `wg_listen_port: u16` — UDP port for inbound demux.
-- `wg_local_privkey: [u8; 32]` (hex on the wire) — our static key.
-- `wg_peer_pubkey: [u8; 32]` (hex on the wire) — peer's static key.
+- `wg_local_privkey_hex: String` — our static X25519 private key as
+  hex (64 chars). `#[serde(skip_serializing)]` so it never lands in
+  the persisted state file; the custom `Debug` impl on
+  `TunnelEndpointSnapshot` redacts it.
+- `wg_peer_pubkey_hex: String` — peer's static X25519 public key as
+  hex. The engine uses THIS as the encap key, not AllowedIPs LPM.
 - `wg_allowed_ips: Vec<String>` — allowed-IPs CIDRs.
 - `wg_endpoint: String` — optional peer endpoint for initiator role.
 - `wg_keepalive_secs: u16` — optional persistent keepalive.
 
-These mirror in `TunnelEndpoint` in `types/forwarding.rs`.
+Field names match the as-shipped types in `protocol.rs:417-450`
+(`wg_local_privkey_hex` / `wg_peer_pubkey_hex` — hex strings, not
+`[u8; 32]`). The runtime `TunnelEndpoint` in
+`afxdp/types/forwarding.rs:129-140` is NOT extended in this PR;
+the integration PR will mirror the snapshot fields onto the
+runtime type alongside the dispatch/poll wiring (see the "What's
+IN this PR" deferred-to-integration bullet for the explicit
+boundary). The earlier draft claimed the snapshot mirrored into
+`TunnelEndpoint` in this PR; that was the original integration
+sketch, not the engine PR's contract.
 
 We do NOT (yet) extend the Go control plane to populate these from
 Junos config. That's a follow-up PR. For now the fields exist on
@@ -266,11 +297,18 @@ which already includes type+reserved+receiver+counter. The numbers
 agree once you don't double-count. I'm using the byte-exact
 breakdown: **60 / 80** plus the **15** padding allowance.
 
-The MSS gate in `forwarding/mod.rs:751` (`native_gre_tcp_mss`) is
-extended with a sibling `wg_tcp_mss` and the call site
-(`dispatch.rs:1458`) branches on `endpoint.mode`. WG endpoints
-read `wg_tcp_mss`; everything else keeps GRE semantics. No GRE
-clamp is reused.
+This engine PR ships `wg_tcp_mss` as a standalone helper in
+`afxdp/wg/mss.rs` (signature
+`fn wg_tcp_mss(outer_family: i32, inner_family: i32, mtu: usize) -> u16`)
+alongside the existing `native_gre_tcp_mss` in
+`afxdp/forwarding/mod.rs:751`. The dispatch-side wiring — branching
+`forwarded_tcp_may_need_segmentation` at
+`afxdp/tx/dispatch.rs:1458` on `endpoint.mode` so WG endpoints
+read `wg_tcp_mss` while GRE endpoints keep `native_gre_tcp_mss`
+— is deferred to the integration PR (the current call site at
+`dispatch.rs:1458-1459` short-circuits TCP segmentation for ANY
+`tunnel_endpoint_id != 0`, so no MSS path is hit yet). No GRE
+clamp is reused; the byte table lives in `mss.rs`.
 
 ## DSCP and ECN
 
@@ -286,7 +324,9 @@ the ECN bits and document it as a known gap with a tracking issue.
 ## VLAN safety
 
 VLAN-aware outer L2 is built by `outer.rs::write_outer_eth(out,
-src_mac, dst_mac, vlan_id, ethertype)`: an 18-byte 802.1Q tagged
+dst_mac, src_mac, vlan_id, ethertype)` (see `outer.rs:23-45` — the
+destination MAC is the second argument, source MAC the third,
+matching the on-wire Ethernet header order): an 18-byte 802.1Q tagged
 header when `vlan_id != 0`, otherwise the 14-byte untagged
 Ethernet header. `outer_l2_len(vlan_id)` returns the matching
 length so the caller can size its scratch correctly. `try_encap`
@@ -313,7 +353,12 @@ existing pattern of `recycle_ingress_frame(...)` before every
   - `engine.rs` — engine state, peer table, session table
   - `peer.rs` — peer state + AllowedIPs
   - `session.rs` — transport session + replay window
-  - `allowed_ips.rs` — LPM trie (in-tree, no extra deps)
+  - `allowed_ips.rs` — AllowedIPs lookup as a flat sorted-by-
+    prefix-length-descending `Vec<Entry>` (in-tree, no extra deps).
+    Linear-scan LPM; reconciled at config-commit time, not on the
+    hot path, so the linear scan is fine and cache-friendly. The
+    earlier draft labelled this an "LPM trie"; the implementation is
+    a sorted Vec.
   - `framing.rs` — WG transport-data record encode/decode
   - `mss.rs` — WG MSS arithmetic
   - `dscp.rs` — DSCP→TOS shifting

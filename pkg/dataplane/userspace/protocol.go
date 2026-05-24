@@ -244,8 +244,13 @@ type TunnelEndpointSnapshot struct {
 	// when Mode == "wireguard".
 	//
 	// WgListenPort is the local UDP port we listen on for inbound WG
-	// transport. Demuxed against (listen_port, receiver_index) by the
-	// engine.
+	// transport. Listen-port selection happens at the integration
+	// layer's UDP-socket dispatch (one layer above the engine); the
+	// engine itself demuxes by `receiver_index` alone via the
+	// `sessions_by_local_index` map (see userspace-dp
+	// afxdp/wg/engine.rs:264). The receiver index is chosen by the
+	// local side at handshake time, so it identifies the session
+	// unambiguously without a (port, index) tuple match.
 	WgListenPort uint16 `json:"wg_listen_port,omitempty"`
 	// WgLocalPrivkeyHex is the local static X25519 private key as
 	// hex (64 chars). Control-plane-internal; never logged.
