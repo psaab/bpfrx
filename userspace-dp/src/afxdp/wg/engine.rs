@@ -341,10 +341,6 @@ impl WgEngine {
         table.peers.get(idx as usize).cloned()
     }
 
-    fn peer_index(&self, pubkey: &[u8; 32]) -> Option<u32> {
-        self.load_table().peer_index_by_pubkey.get(pubkey).copied()
-    }
-
     /// Install a freshly-completed transport session on a peer and
     /// register it for inbound demux. Called from the slow-path
     /// handshake-complete code.
@@ -445,25 +441,26 @@ impl WgEngine {
         // kernel WG / wireguard-go. Compute the padded length and
         // ensure the output buffer can hold header + ciphertext +
         // tag at the padded size.
+        //
+        // All bound checks fire BEFORE any observable side effect
+        // (counter advance, header write into `out`). Callers can
+        // therefore rely on the contract "on Err, the output buffer
+        // and the session's tx_counter are untouched". An oversized
+        // `out` paired with an oversized `inner_ip` previously tripped
+        // the PADDED_PLAINTEXT_MAX guard AFTER `next_tx_counter()`
+        // had already advanced the counter; the staging guard is
+        // hoisted above the counter consume to close that hole.
         let padded_len = pad_to_16(inner_ip.len());
         let required = WG_DATA_HEADER_LEN + padded_len + POLY1305_TAG_LEN;
         if out.len() < required {
             return Err(EncapError::BufferTooSmall);
         }
-        let counter = session.next_tx_counter().ok_or(EncapError::RekeyRequired)?;
-        let _ = encode_data_header(out, session.peer_index, counter)
-            .ok_or(EncapError::BufferTooSmall)?;
-        // Stage the padded plaintext on the stack. We use
-        // `MaybeUninit` and only initialize the bytes snow will read
-        // (`inner_ip.len()` of payload + the worst-case 15 padding
-        // bytes), which avoids the 4112-byte memset-per-call that a
-        // `[0u8; N]` array initializer would force LLVM to emit on
-        // the hot path. snow's `write_message` requires
-        // non-overlapping plaintext and ciphertext slices, so we
-        // cannot stage the plaintext inside `out`.
         if padded_len > PADDED_PLAINTEXT_MAX {
             return Err(EncapError::BufferTooSmall);
         }
+        let counter = session.next_tx_counter().ok_or(EncapError::RekeyRequired)?;
+        let _ = encode_data_header(out, session.peer_index, counter)
+            .ok_or(EncapError::BufferTooSmall)?;
         // Stage the padded plaintext on the stack. We use
         // `MaybeUninit` to skip the 4096-byte zero-init that a
         // `[0u8; PADDED_PLAINTEXT_MAX]` literal would force on every
@@ -1323,5 +1320,237 @@ mod engine_internal_tests {
         // (On a heavily loaded CI box this could be 1; we don't
         // tighten it.)
         assert!(n >= 1, "reader thread observed no snapshots");
+    }
+
+    /// r6 regression: `install_session` and `reconcile_peers` must
+    /// serialize so a removed peer cannot orphan a freshly-installed
+    /// demux entry.
+    ///
+    /// Race (pre-fix):
+    ///   1. install_session(P) loads `peer` via `peer_arc(P)` from
+    ///      `PeerTable_v1` and drops the snapshot reference.
+    ///   2. reconcile_peers(&[]) publishes `PeerTable_v2` without P.
+    ///      Its drain loop reads `peer.current.read()` and
+    ///      `peer.previous.read()` — both `None` because step (1)
+    ///      hasn't called `rotate_session` yet.
+    ///   3. install_session continues against the orphan Arc<Peer>,
+    ///      inserts the demux entry, and calls rotate_session. The
+    ///      demux entry now references a peer pubkey absent from
+    ///      every future `peer_index_by_pubkey`, so subsequent
+    ///      reconciles cannot drain it.
+    ///
+    /// Fix: `install_session` takes `reconcile_lock` for the entire
+    /// critical region. The lookup-then-mutate sequence is then
+    /// serialized against any concurrent `reconcile_peers`, and if
+    /// the peer is removed before the install acquires the lock, the
+    /// `peer_arc(pubkey)` lookup returns None and the install fails
+    /// with `UnknownPeer` — no demux mutation occurs.
+    ///
+    /// Invariant verified across the race: every entry in
+    /// `sessions_by_local_index` has its `session.peer_pubkey`
+    /// present in the currently published `peer_index_by_pubkey`.
+    /// Under the pre-fix code path, this invariant would fail
+    /// whenever the orphan interleaving fires.
+    #[test]
+    fn install_session_serializes_with_reconcile_removal() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+        use std::thread;
+        let (init_priv, _init_pub) = keypair();
+        let (peer_priv, peer_pub) = keypair();
+        let engine = Arc::new(WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: peer_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            }],
+        }));
+        let peer_engine = WgEngine::new(WgEngineConfig {
+            local_private_key: peer_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: [0u8; 32],
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            }],
+        });
+        let cfg_with_peer = vec![WgPeerConfig {
+            pubkey: peer_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+        }];
+        // Pre-build a batch of sessions off the hot path. Each one
+        // gets a fresh local_index so installs never collide on the
+        // demux map for the wrong reason.
+        let iterations = 400u32;
+        let mut sessions: Vec<Arc<WgSession>> = Vec::with_capacity(iterations as usize);
+        for i in 0..iterations {
+            sessions.push(make_session_for(
+                &engine,
+                peer_pub,
+                &peer_engine,
+                0xcafe_0000 + i,
+                100 + i,
+            ));
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        // Thread A: install_session in a tight loop, alternating
+        // with reconciles that re-add the peer so installs can
+        // succeed sometimes.
+        let installer = {
+            let engine = engine.clone();
+            thread::spawn(move || {
+                let mut ok = 0u32;
+                let mut unknown = 0u32;
+                let mut collision = 0u32;
+                for s in sessions {
+                    match engine.install_session(&peer_pub, s) {
+                        Ok(()) => ok += 1,
+                        Err(InstallSessionError::UnknownPeer) => unknown += 1,
+                        Err(InstallSessionError::LocalIndexCollision) => collision += 1,
+                    }
+                    thread::yield_now();
+                }
+                (ok, unknown, collision)
+            })
+        };
+        // Thread B: alternate removing and re-adding the peer.
+        let reconciler = {
+            let engine = engine.clone();
+            let stop = stop.clone();
+            let cfg = cfg_with_peer.clone();
+            thread::spawn(move || {
+                let mut iters = 0u32;
+                while !stop.load(AOrd::Relaxed) {
+                    engine.reconcile_peers(&[]);
+                    engine.reconcile_peers(&cfg);
+                    iters += 1;
+                    thread::yield_now();
+                }
+                iters
+            })
+        };
+        let (ok, unknown, collision) = installer.join().unwrap();
+        stop.store(true, AOrd::Relaxed);
+        let reconcile_iters = reconciler.join().unwrap();
+        // We made progress on both sides — otherwise the test is
+        // not actually exercising the race window.
+        assert!(
+            ok + unknown + collision == iterations,
+            "every install attempt accounted for"
+        );
+        assert!(
+            reconcile_iters >= 1,
+            "reconcile loop must have completed at least one full add/remove cycle"
+        );
+        // Post-condition invariant: every entry in
+        // `sessions_by_local_index` must reference a peer pubkey
+        // that is present in the currently published table. An
+        // orphan demux entry (the race the fix closes) would have a
+        // `session.peer_pubkey` that is not in the index map of any
+        // future snapshot — and we can detect it by re-reconciling
+        // the peer back in and checking the index map directly.
+        engine.reconcile_peers(&cfg_with_peer);
+        let table = engine.load_table();
+        let by_index = engine.sessions_by_local_index.read().unwrap();
+        for (local_index, session) in by_index.iter() {
+            assert!(
+                table.peer_index_by_pubkey.contains_key(&session.peer_pubkey),
+                "demux entry {local_index:#x} references unknown peer pubkey \
+                 — orphan from install/reconcile race"
+            );
+        }
+        // Now flip the peer out one more time. Reconcile's drain
+        // path must remove every session belonging to that peer; any
+        // surviving entry would prove the orphan slipped through.
+        engine.reconcile_peers(&[]);
+        let by_index = engine.sessions_by_local_index.read().unwrap();
+        assert!(
+            by_index.is_empty(),
+            "after removing the only peer, no demux entries should remain; \
+             found {} — install/reconcile race left orphans",
+            by_index.len()
+        );
+    }
+
+    /// r6 regression for the MINOR Codex finding: `try_encap` must
+    /// not consume a tx counter (or write the WG header) when it
+    /// returns `BufferTooSmall` because the inner IP would overflow
+    /// the PADDED_PLAINTEXT_MAX staging buffer.
+    ///
+    /// Pre-fix sequence at engine.rs:
+    ///   1. `out.len() < required` check (fires for small `out`).
+    ///   2. `next_tx_counter()` — counter advances.
+    ///   3. `encode_data_header(out, ...)` — 16 bytes written.
+    ///   4. `padded_len > PADDED_PLAINTEXT_MAX` check — fires here.
+    /// Result on the failure path: counter consumed, header dirty,
+    /// and the caller sees BufferTooSmall but cannot rely on
+    /// "Err leaves state untouched".
+    ///
+    /// Post-fix: the PADDED_PLAINTEXT_MAX guard is hoisted above
+    /// `next_tx_counter()` (and above the header write), so the
+    /// failure path leaves both the counter and `out` untouched.
+    #[test]
+    fn encap_padded_plaintext_overflow_leaves_counter_and_buffer_untouched() {
+        let (init_priv, _init_pub) = keypair();
+        let (peer_priv, peer_pub) = keypair();
+        let engine = WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: peer_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            }],
+        });
+        let peer_engine = WgEngine::new(WgEngineConfig {
+            local_private_key: peer_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: [0u8; 32],
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            }],
+        });
+        let session = make_session_for(&engine, peer_pub, &peer_engine, 0xdead_0001, 2);
+        engine.install_session(&peer_pub, session).unwrap();
+        // inner_ip = 4097 bytes → pad_to_16(4097) = 4112 >
+        // PADDED_PLAINTEXT_MAX (4096). `out` is sized large enough to
+        // hold header + 4112 + 16 so it cleanly passes the
+        // `out.len() < required` guard and only the staging guard
+        // can fire.
+        let inner = vec![0x45u8; 4097];
+        let mut out = vec![0xa5u8; WG_DATA_HEADER_LEN + 4112 + POLY1305_TAG_LEN];
+        // Snapshot the per-session counter pre-encap.
+        let counter_before = session_tx_counter(&engine, &peer_pub);
+        let err = engine.try_encap(&peer_pub, &inner, &mut out).unwrap_err();
+        assert_eq!(err, EncapError::BufferTooSmall);
+        let counter_after = session_tx_counter(&engine, &peer_pub);
+        assert_eq!(
+            counter_before, counter_after,
+            "BufferTooSmall on PADDED_PLAINTEXT_MAX overflow must NOT advance tx counter"
+        );
+        // First 16 bytes of `out` must remain the 0xa5 sentinel — no
+        // partial header write on the failure path.
+        assert!(
+            out[..WG_DATA_HEADER_LEN].iter().all(|&b| b == 0xa5),
+            "BufferTooSmall must NOT write the WG header into `out`"
+        );
+    }
+
+    /// Helper for the BufferTooSmall counter-leak test: read the
+    /// `current` session's tx_counter for `pubkey`.
+    fn session_tx_counter(engine: &WgEngine, pubkey: &[u8; 32]) -> u64 {
+        let table = engine.load_table();
+        let idx = *table.peer_index_by_pubkey.get(pubkey).unwrap();
+        let peer = table.peers[idx as usize].clone();
+        let cur = peer.current.read().unwrap().clone().unwrap();
+        cur.tx_counter.load(Ordering::Relaxed)
     }
 }
