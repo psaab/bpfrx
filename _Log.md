@@ -2,6 +2,22 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T15:14:30Z
+  - **Action**: PR #1494 round-11 follow-up — collapsed the retained
+    userspace XDP shim entry-program name onto one dataplane constant and
+    routed both full-loader and shim-loader registrations through it. This
+    removes the duplicate `xdp_userspace_prog` constants that reviewers
+    flagged as a drift risk.
+  - **File(s)**: `pkg/dataplane/loader.go`,
+    `pkg/dataplane/loader_ebpf.go`,
+    `pkg/dataplane/retirement_boundary_canary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane -run
+    'TestBPFShimEntryProgramStateIsNotJSONMutable|TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram|TestUserspaceXDPEntryProgramConstantNamesRetainedShim'`;
+    `go test ./pkg/dataplane/userspace -run
+    'TestUserspaceShimLoaderDoesNotReferenceLegacyObjects|TestUserspaceStartupUsesShimLoaderBoundary'`;
+    `go test ./pkg/dataplane ./pkg/dataplane/userspace`;
+    `git diff --check`
+
 - **Timestamp**: 2026-05-24T04:08:49Z
   - **Action**: PR #1497 round-3 follow-up — fixed the checker/schema
     parity nits from review: boolean `schema_version` rejection, JSON

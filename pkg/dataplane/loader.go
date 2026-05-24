@@ -16,12 +16,10 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-const linkPinPath = "/sys/fs/bpf/xpf/links"
-const userspaceShimEntryProg = "xdp_userspace_prog"
-
 const (
-	defaultXDPEntryProg       = "xdp_main_prog"
-	userspaceShimXDPEntryProg = "xdp_userspace_prog"
+	linkPinPath            = "/sys/fs/bpf/xpf/links"
+	defaultXDPEntryProg    = "xdp_main_prog"
+	userspaceShimEntryProg = "xdp_userspace_prog"
 )
 
 // go:generate directives.
@@ -102,13 +100,13 @@ func (m *Manager) XDPEntryProgram() string {
 // SelectUserspaceXDPShimEntryProgram selects the retained userspace shim for
 // future XDP attachments without touching already attached links.
 func (m *Manager) SelectUserspaceXDPShimEntryProgram() {
-	m.xdpEntryProg = userspaceShimXDPEntryProg
+	m.xdpEntryProg = userspaceShimEntryProg
 }
 
 // UsingUserspaceXDPShimEntryProgram reports whether the retained userspace
 // shim is selected for XDP attachments and swapped links.
 func (m *Manager) UsingUserspaceXDPShimEntryProgram() bool {
-	return m.XDPEntryProgram() == userspaceShimXDPEntryProg
+	return m.XDPEntryProgram() == userspaceShimEntryProg
 }
 
 // Load loads all eBPF programs and maps. Returns an error if eBPF
@@ -577,7 +575,7 @@ func (m *Manager) seedInterfaceCounter(ifindex int) {
 // Userspace mode keeps this shim attached for normal operation and degraded
 // local/control handling.
 func (m *Manager) SwapToUserspaceXDPShimEntryProgram() error {
-	return m.swapXDPEntryProg(userspaceShimXDPEntryProg)
+	return m.swapXDPEntryProg(userspaceShimEntryProg)
 }
 
 func (m *Manager) swapXDPEntryProg(name string) error {

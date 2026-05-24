@@ -481,10 +481,10 @@ func TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram(t *testing.T) {
 func TestBPFShimEntryProgramStateIsNotJSONMutable(t *testing.T) {
 	t.Parallel()
 
-	if userspaceShimXDPEntryProg != userspaceXDPEntryProgForCanary {
+	if userspaceShimEntryProg != userspaceXDPEntryProgForCanary {
 		t.Fatalf(
 			"userspace shim entry-program constant = %q, want %q",
-			userspaceShimXDPEntryProg,
+			userspaceShimEntryProg,
 			userspaceXDPEntryProgForCanary,
 		)
 	}
