@@ -89,18 +89,34 @@ fn established_pair(
     // chose.
     let init_local_index = 0xaaaa_0001;
     let resp_local_index = 0xbbbb_0001;
-    let init_session = Arc::new(WgSession::new(
+    // Initiator session is created with Initiator-role (confirmed at
+    // install per WG spec — the initiator is the side that sends
+    // first). Responder session is created with Responder-role to be
+    // faithful to the wire contract; we then pre-confirm it so existing
+    // round-trip tests that encap from the responder side continue
+    // to function. The key-confirmation invariant itself is exercised
+    // by `responder_session_blocks_encap_until_initiator_data_authenticated`
+    // and `established_pair_responder_confirmation_flips_via_decap_path`
+    // — see Copilot inline finding on the prior round of this PR.
+    let init_session = Arc::new(WgSession::new_with_role(
         init_xport,
         init_local_index,
         resp_local_index,
         resp_pub,
+        super::session::SessionRole::Initiator,
     ));
-    let resp_session = Arc::new(WgSession::new(
+    let resp_session = Arc::new(WgSession::new_with_role(
         resp_xport,
         resp_local_index,
         init_local_index,
         init_pub,
+        super::session::SessionRole::Responder,
     ));
+    // Pre-confirm the responder so callers that don't want to drive
+    // the gate (the bulk of the tests in this file) can encap from
+    // either side immediately. The gate tests do NOT call this
+    // helper and manage confirmation explicitly.
+    resp_session.mark_confirmed();
     init_engine
         .install_session(&resp_pub, init_session)
         .unwrap();
@@ -1264,4 +1280,100 @@ fn try_decap_rejects_sub_poly1305_tag_records_without_panicking() {
         "a ciphertext.len() == POLY1305_TAG_LEN record is NOT short — must \
          reach snow and reject as CryptoFailed (or similar) instead"
     );
+}
+
+/// Builds an `established_pair` where the responder session starts
+/// unconfirmed (responder-role) and is confirmed by the engine's
+/// own `try_decap` rather than by a manual `mark_confirmed` test
+/// helper. This is what a real responder integration path will do
+/// — the first authenticated inbound data record flips the gate.
+///
+/// Addresses the Copilot inline finding on `established_pair`: the
+/// bulk of the file's round-trip tests use the helper which
+/// pre-confirms the responder, so the key-confirmation gate is not
+/// exercised by them. This test exercises it end-to-end without
+/// touching `mark_confirmed`.
+#[test]
+fn established_pair_responder_confirmation_flips_via_decap_path() {
+    use super::session::SessionRole;
+
+    let (init_priv, init_pub) = keypair();
+    let (resp_priv, resp_pub) = keypair();
+
+    let init_engine = WgEngine::new(WgEngineConfig {
+        local_private_key: init_priv,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: resp_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+        }],
+    });
+    let resp_engine = WgEngine::new(WgEngineConfig {
+        local_private_key: resp_priv,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: init_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+        }],
+    });
+
+    let mut init_hs = init_engine.build_initiator_handshake(&resp_pub).unwrap();
+    let mut resp_hs = resp_engine.build_responder_handshake().unwrap();
+    let mut buf = [0u8; 1024];
+    let mut sink = [0u8; 1024];
+    let n1 = init_hs.write_message(&[], &mut buf).unwrap();
+    resp_hs.read_message(&buf[..n1], &mut sink).unwrap();
+    let n2 = resp_hs.write_message(&[], &mut buf).unwrap();
+    init_hs.read_message(&buf[..n2], &mut sink).unwrap();
+
+    let init_xport = init_hs.into_stateless_transport_mode().unwrap();
+    let resp_xport = resp_hs.into_stateless_transport_mode().unwrap();
+    let init_local = 0xc0de_4001;
+    let resp_local = 0xc0de_4002;
+
+    init_engine
+        .install_session(
+            &resp_pub,
+            Arc::new(WgSession::new_with_role(
+                init_xport,
+                init_local,
+                resp_local,
+                resp_pub,
+                SessionRole::Initiator,
+            )),
+        )
+        .unwrap();
+    let resp_session = Arc::new(WgSession::new_with_role(
+        resp_xport,
+        resp_local,
+        init_local,
+        init_pub,
+        SessionRole::Responder,
+    ));
+    resp_engine
+        .install_session(&init_pub, resp_session.clone())
+        .unwrap();
+    assert!(!resp_session.is_confirmed());
+
+    // Initiator sends; engine `try_decap` MUST flip confirmation.
+    let inner = ipv4_packet(Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 9));
+    let mut wire = [0u8; 2048];
+    let enc = init_engine.try_encap(&resp_pub, &inner, &mut wire).unwrap();
+    let mut plain = [0u8; 2048];
+    resp_engine.try_decap(&wire[..enc.len], &mut plain).unwrap();
+    assert!(
+        resp_session.is_confirmed(),
+        "successful AEAD via try_decap must flip confirmation without any test-only mark_confirmed call"
+    );
+
+    // Responder can now encap; the gate is open.
+    let reply = ipv4_packet(Ipv4Addr::new(10, 0, 0, 9), Ipv4Addr::new(10, 0, 0, 5));
+    let mut wire2 = [0u8; 2048];
+    resp_engine
+        .try_encap(&init_pub, &reply, &mut wire2)
+        .expect("post-confirmation encap must succeed");
 }
