@@ -516,6 +516,9 @@ type ProcessStatus struct {
 	DegradedPathCounters         map[string]uint64                 `json:"degraded_path_counters,omitempty"` // reason_name -> count
 }
 
+// MarshalJSON intentionally uses a value receiver so both ProcessStatus values
+// and *ProcessStatus pointers emit the temporary legacy alias during the
+// rolling-upgrade window.
 func (s ProcessStatus) MarshalJSON() ([]byte, error) {
 	type processStatusAlias ProcessStatus
 	aux := struct {
@@ -525,6 +528,8 @@ func (s ProcessStatus) MarshalJSON() ([]byte, error) {
 		processStatusAlias: (*processStatusAlias)(&s),
 	}
 	if len(s.DegradedPathCounters) > 0 {
+		// encoding/json never mutates input maps, so sharing the map keeps the
+		// legacy alias byte-for-byte consistent with the primary field.
 		aux.LegacyFallbackCounters = s.DegradedPathCounters
 	}
 	return json.Marshal(aux)

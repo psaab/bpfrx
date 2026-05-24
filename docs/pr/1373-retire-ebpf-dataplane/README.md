@@ -136,7 +136,10 @@ name `userspace_fallback_stats` remains an internal mixed-version compatibility
 exception until the final retained-shim ABI boundary is removed. New daemons
 also emit `fallback_counters` as a legacy JSON alias for one compatibility
 window so old status readers do not silently zero these counters during rolling
-upgrades; new code should read `degraded_path_counters`.
+upgrades; new code should read `degraded_path_counters`. The dual-emit window
+is intentionally short and the legacy alias should be removed with the next
+userspace helper status protocol bump after the retained-shim ABI boundary is
+retired.
 
 The #1493 loader/bootstrap split keeps normal userspace startup on the
 userspace-only shim loader below. Source removal still waits for #1451's

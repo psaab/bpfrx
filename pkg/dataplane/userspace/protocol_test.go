@@ -538,6 +538,14 @@ func TestProcessStatusDegradedPathCountersJSON(t *testing.T) {
 	if _, ok := obj["fallback_counters"]; !ok {
 		t.Fatalf("legacy fallback_counters alias missing from ProcessStatus JSON: %s", string(raw))
 	}
+	var legacyAlias map[string]uint64
+	if err := json.Unmarshal(obj["fallback_counters"], &legacyAlias); err != nil {
+		t.Fatalf("unmarshal legacy fallback_counters alias: %v", err)
+	}
+	if !reflect.DeepEqual(legacyAlias, in.DegradedPathCounters) {
+		t.Fatalf("fallback_counters alias = %+v, want %+v",
+			legacyAlias, in.DegradedPathCounters)
+	}
 
 	var back ProcessStatus
 	if err := json.Unmarshal(raw, &back); err != nil {
