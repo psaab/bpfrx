@@ -132,6 +132,63 @@
     `python3 -m unittest scripts.userspace_ha_validation_matrix_test`;
     `git diff --check`
 
+- **Timestamp**: 2026-05-24T18:00:00Z
+  - **Action**: PR #1499 r-final-2 fix — address every actionable
+    finding from the round-final triple-review on `62d2353c`. (1)
+    Truncated-record remote DoS in `try_decap`: a 16..31-byte UDP
+    datagram with a valid `receiver_index` could panic the AF_XDP
+    worker because `parse_data_header` accepted any record >= 16
+    bytes, leaving a sub-Poly1305-tag ciphertext that snow 0.10's
+    ChaCha decrypt cannot handle safely (`ciphertext.len() - TAGLEN`
+    underflow). Added `DecapError::ShortRecord`, a one-line guard
+    before `read_message`, and a regression test that walks
+    `ciphertext.len()` ∈ {0,1,8,14,15} plus a boundary check at
+    `ciphertext.len() == POLY1305_TAG_LEN` to assert the cutoff is
+    strict `<`. (2) Copilot inline #5: replay-lock comment claimed
+    decap "only takes the replay-window lock on cold arms"; the
+    precheck unconditionally locks. Updated the module docstring to
+    describe the actual two-lock pattern and explain why the
+    precheck is held (skip snow AEAD on already-stale counters,
+    bounded contention because each session is demuxed onto a
+    single worker). (3) Copilot inline #6: `established_pair`
+    installed the responder via `WgSession::new` (Initiator-role,
+    pre-confirmed); not faithful to the responder-role gate this PR
+    shipped. Converted `established_pair` to build the responder
+    session as `SessionRole::Responder` then explicitly
+    `mark_confirmed()` so existing round-trip tests still pass, and
+    added a new test
+    `established_pair_responder_confirmation_flips_via_decap_path`
+    that exercises the full handshake → install (unconfirmed) →
+    decap-flips-confirmation flow without any `mark_confirmed` test
+    helper. (4) Copilot inline #1..#4: plan.md doc drift — updated
+    to say `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` (PSK2 step
+    matters for WG wire framing), to acknowledge that `ring 0.17.x`
+    is pulled in transitively through snow's resolver (and is
+    clean of open RustSec advisories, not the
+    RUSTSEC-2025-0010 0.16.x version that boringtun dragged in),
+    to update the `try_encap` signature snippet to match the
+    `&mut [u8]` engine API, and to clarify that
+    `complete_handshake_*` is `build_initiator_handshake` /
+    `build_responder_handshake` + `install_session`. (5) Codex
+    scope item: the engine ships Noise sub-message bytes only; the
+    WG handshake outer framing (MessageInitiation/MessageResponse
+    + MAC1/MAC2 + TAI64N) is the integration PR's scope. Made the
+    boundary explicit in both the engine module docstring and a
+    new "On-wire handshake framing scope" section in plan.md plus
+    a new bullet in "What's OUT". The pre-existing
+    `snat_contract_documents_current_fail_closed_runtime`
+    integration-test failure on `userspace-dp/tests/snat_contract_doc_guard.rs`
+    is from `docs/userspace-dataplane-gaps.md` lacking the literal
+    string `fail-closed`; verified the test fails on origin/master
+    `0b837165` (the PR base) just as it does on the PR head, with
+    identical doc and test bytes — entirely unrelated to wg work
+    and out of scope for this PR. New tests: 78/78 wg tests pass
+    (was 76 — added 2 regression tests). All cargo --bin tests
+    pass; 5/5 flake check clean on both new tests. Go suite clean.
+  - **File(s)**: `userspace-dp/src/afxdp/wg/engine.rs`,
+    `userspace-dp/src/afxdp/wg/tests.rs`,
+    `docs/pr/wireguard-clean/plan.md`, `_Log.md`
+
 - **Timestamp**: 2026-05-24T19:30:00Z
   - **Action**: PR #1499 r-final-fix — close the four findings Codex
     final pre-merge review surfaced after nine prior review rounds
