@@ -1364,3 +1364,7 @@
 - **Timestamp**: 2026-05-23T21:30:00Z
   - **Action**: Hoisted PADDED_PLAINTEXT_MAX guard above next_tx_counter + header write so encap-overflow returns BufferTooSmall without observable side effects; removed dead fn peer_index; pruned r5 leftover duplicate comment block in try_encap; added install_session_serializes_with_reconcile_removal and encap_padded_plaintext_overflow_leaves_counter_and_buffer_untouched regression tests.
   - **File(s)**: userspace-dp/src/afxdp/wg/engine.rs
+
+- **Timestamp**: 2026-05-24T04:00:00Z
+  - **Action**: r8: strengthened install_session_serializes_with_reconcile_removal with an `ok > 0` gate so the race test cannot pass tautologically when the reconciler always wins (Codex r7 finding); added debug_assert! on duplicate peer pubkey in reconcile_peers so engine-side surface flags Go-control-plane validation gaps (r6 Claude nit 4 / Codex r7).
+  - **File(s)**: userspace-dp/src/afxdp/wg/engine.rs

@@ -286,7 +286,19 @@ impl WgEngine {
                 )),
             };
             new_peers.push(peer);
-            new_index.insert(cfg.pubkey, idx);
+            // r7 Codex/Claude nit: duplicate pubkeys in `configs`
+            // leave an orphan `Peer` in `new_peers` (unreachable via
+            // pubkey lookup) and make `new_allowed` carry entries
+            // indexed at the earlier duplicate's slot. The Go control
+            // plane is supposed to reject duplicate pubkeys at config
+            // validation; this `debug_assert` keeps the engine-side
+            // invariant visible during development without panicking
+            // production builds if the validation layer is bypassed.
+            let prior = new_index.insert(cfg.pubkey, idx);
+            debug_assert!(
+                prior.is_none(),
+                "duplicate peer pubkey in reconcile_peers configs (prior idx={prior:?}, new idx={idx})"
+            );
             for cidr in &cfg.allowed_ips {
                 new_allowed.insert(*cidr, idx);
             }
@@ -1446,6 +1458,24 @@ mod engine_internal_tests {
         assert!(
             reconcile_iters >= 1,
             "reconcile loop must have completed at least one full add/remove cycle"
+        );
+        // r7 Codex hostile finding: a tautological pass shape exists
+        // if the reconciler always wins the lock — every install
+        // returns UnknownPeer, demux stays empty, and the post-loop
+        // invariants are trivially satisfied even with the lock
+        // removed. Require at least one Ok install so the lock-
+        // protected path (peer_arc-then-rotate_session under the
+        // same guard) is actually exercised. With 400 iterations and
+        // reconcile alternating add/remove on a separate thread, the
+        // installer typically lands 50-300 Ok results in practice;
+        // requiring just `ok > 0` is conservative against schedule
+        // skew while keeping the gate non-vacuous.
+        assert!(
+            ok > 0,
+            "race regression must exercise at least one successful install \
+             (ok={ok}, unknown={unknown}, collision={collision}); without an \
+             Ok the lock-protected demux insert path is not on the test \
+             trajectory and the gate is tautological"
         );
         // Post-condition invariant: every entry in
         // `sessions_by_local_index` must reference a peer pubkey
