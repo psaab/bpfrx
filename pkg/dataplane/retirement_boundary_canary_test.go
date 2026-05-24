@@ -73,6 +73,29 @@ var dpdkBackendImportAllowlist = map[string]string{
 	"cmd/xpfd/main.go": "backend registration and cleanup entry point",
 }
 
+var retainedShimBoundaryBuildTagAllowlist = map[string][]string{
+	// Generated legacy bpf2go artifacts keep bpf2go's architecture constraint
+	// until #1476 removes the legacy source/generated artifact set.
+	"pkg/dataplane/xpftcconntrack_x86_bpfel.go":    {"//go:build 386 || amd64"},
+	"pkg/dataplane/xpftcforward_x86_bpfel.go":      {"//go:build 386 || amd64"},
+	"pkg/dataplane/xpftcmain_x86_bpfel.go":         {"//go:build 386 || amd64"},
+	"pkg/dataplane/xpftcnat_x86_bpfel.go":          {"//go:build 386 || amd64"},
+	"pkg/dataplane/xpftcscreenegress_x86_bpfel.go": {"//go:build 386 || amd64"},
+	"pkg/dataplane/xpfxdpconntrack_x86_bpfel.go":   {"//go:build 386 || amd64"},
+	"pkg/dataplane/xpfxdpcpumap_x86_bpfel.go":      {"//go:build 386 || amd64"},
+	"pkg/dataplane/xpfxdpforward_x86_bpfel.go":     {"//go:build 386 || amd64"},
+	"pkg/dataplane/xpfxdpmain_x86_bpfel.go":        {"//go:build 386 || amd64"},
+	"pkg/dataplane/xpfxdpnat64_x86_bpfel.go":       {"//go:build 386 || amd64"},
+	"pkg/dataplane/xpfxdpnat_x86_bpfel.go":         {"//go:build 386 || amd64"},
+	"pkg/dataplane/xpfxdppolicy_x86_bpfel.go":      {"//go:build 386 || amd64"},
+	"pkg/dataplane/xpfxdpscreen_x86_bpfel.go":      {"//go:build 386 || amd64"},
+	"pkg/dataplane/xpfxdpzone_x86_bpfel.go":        {"//go:build 386 || amd64"},
+
+	// Ignored fallback stub for trees without generated legacy artifacts; it is
+	// deliberately not part of any normal build.
+	"pkg/dataplane/loader_stub.go": {"//go:build ignore"},
+}
+
 var userspaceShimAllowedMapTypes = map[string]ebpf.MapType{
 	"dnat_table":                 ebpf.Hash,
 	"userspace_bindings":         ebpf.Array,
@@ -601,6 +624,16 @@ func TestUserspaceManagerDoesNotImportReflectOrUnsafe(t *testing.T) {
 	}
 }
 
+func TestRetainedUserspaceShimBoundaryCanaryRejectsExoticEscapes(t *testing.T) {
+	t.Parallel()
+
+	violations := retainedUserspaceShimBoundaryViolations(t, retainedUserspaceShimBoundaryPackageRoots(), true)
+	if len(violations) > 0 {
+		sort.Strings(violations)
+		t.Fatalf("retained userspace shim boundary has exotic escape paths: %v", violations)
+	}
+}
+
 func TestUserspaceXDPEntryProgramConstantNamesRetainedShim(t *testing.T) {
 	t.Parallel()
 
@@ -611,6 +644,160 @@ func TestUserspaceXDPEntryProgramConstantNamesRetainedShim(t *testing.T) {
 		sort.Strings(found)
 		sort.Strings(violations)
 		t.Fatalf("userspaceXDPEntryProg constant drift\nfound: %v\nviolations: %v", found, violations)
+	}
+}
+
+func TestRetainedUserspaceShimBoundaryCanaryRejectsExoticEscapeFixtures(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		files map[string]string
+		want  []string
+	}{
+		{
+			name: "positional_dataplane_manager_literal",
+			files: map[string]string{
+				"manager.go": `
+package dataplane
+
+type Manager struct {
+	loaded bool
+	programs map[string]any
+	xdpEntryProg string
+}
+
+func hostile() *Manager {
+	return &Manager{false, nil, "xdp_main_prog"}
+}
+`,
+			},
+			want: []string{"positional dataplane.Manager literal", "xdpEntryProg", "xdp_main_prog"},
+		},
+		{
+			name: "positional_dataplane_manager_alias_literal",
+			files: map[string]string{
+				"manager.go": `
+package dataplane
+
+type Manager struct {
+	loaded bool
+	programs map[string]any
+	xdpEntryProg string
+}
+
+type managerAlias = Manager
+
+func hostileAlias() managerAlias {
+	return managerAlias{false, nil, "xdp_main_prog"}
+}
+`,
+			},
+			want: []string{"positional dataplane.Manager literal", "xdpEntryProg", "xdp_main_prog"},
+		},
+		{
+			name: "positional_dataplane_manager_defined_type_literal",
+			files: map[string]string{
+				"manager.go": `
+package dataplane
+
+type Manager struct {
+	loaded bool
+	programs map[string]any
+	xdpEntryProg string
+}
+
+type managerCopy Manager
+
+func hostileDefinedType() Manager {
+	return Manager(managerCopy{false, nil, "xdp_main_prog"})
+}
+`,
+			},
+			want: []string{"positional dataplane.Manager literal", "xdpEntryProg", "xdp_main_prog"},
+		},
+		{
+			name: "cgo_import",
+			files: map[string]string{
+				"cgo.go": `
+package userspace
+
+import "C"
+`,
+			},
+			want: []string{`imports "C"`},
+		},
+		{
+			name: "go_linkname",
+			files: map[string]string{
+				"linkname.go": `
+package userspace
+
+//go:linkname hostile github.com/psaab/xpf/pkg/dataplane.(*Manager).xdpEntryProg
+func hostile()
+`,
+			},
+			want: []string{"uses //go:linkname"},
+		},
+		{
+			name: "assembly_file",
+			files: map[string]string{
+				"escape.s": `
+TEXT ·hostile(SB),$0-0
+	RET
+`,
+			},
+			want: []string{"has assembly file"},
+		},
+		{
+			name: "precompiled_object_file",
+			files: map[string]string{
+				"escape.syso": "opaque object bytes",
+			},
+			want: []string{"has precompiled object file"},
+		},
+		{
+			name: "go_cgo_compiler_directive",
+			files: map[string]string{
+				"directive.go": `
+package userspace
+
+//go:cgo_import_dynamic libc_malloc malloc "libc.so"
+func hostile()
+`,
+			},
+			want: []string{"uses //go:cgo_ compiler directive"},
+		},
+		{
+			name: "go_build_tagged_file",
+			files: map[string]string{
+				"hidden.go": `
+//go:build linux
+
+package userspace
+`,
+			},
+			want: []string{"has unallowlisted build constraint", "//go:build linux"},
+		},
+		{
+			name: "legacy_build_tagged_file",
+			files: map[string]string{
+				"hidden_legacy.go": `
+// +build legacy
+
+package userspace
+`,
+			},
+			want: []string{"has unallowlisted build constraint", "// +build legacy"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := writeBoundaryFixture(t, tc.files)
+			violations := retainedUserspaceShimBoundaryViolations(t, []string{root}, false)
+			assertCanaryViolationContains(t, violations, tc.want...)
+		})
 	}
 }
 
@@ -1082,6 +1269,54 @@ func TestRetirementBoundaryDocsMentionDPDKPolicy(t *testing.T) {
 	}
 }
 
+func TestRetirementBoundaryDocsMentionShimEscapeAssumptions(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(retirementBoundaryDocsForCanary)
+	if err != nil {
+		t.Fatalf("read retirement boundary docs: %v", err)
+	}
+	text := string(data)
+
+	want := []string{
+		"## #1504 Userspace Shim Boundary Escape Assumptions",
+		"does not recurse",
+		"positional `dataplane.Manager`",
+		"`import \"C\"`",
+		"`//go:linkname`",
+		"`//go:cgo_*`",
+		"`.s` / `.S`",
+		"`.syso`",
+		"`*_bpfel.go`",
+		"`//go:build 386 || amd64`",
+		"`pkg/dataplane/loader_stub.go`",
+		"`//go:build ignore`",
+	}
+	for _, root := range retainedUserspaceShimBoundaryPackageRoots() {
+		want = append(want, "`"+repoRelativePath(t, root)+"`")
+	}
+	var allowlistPaths []string
+	for rel := range retainedShimBoundaryBuildTagAllowlist {
+		allowlistPaths = append(allowlistPaths, rel)
+	}
+	sort.Strings(allowlistPaths)
+	for _, rel := range allowlistPaths {
+		want = append(want, "`"+rel+"`")
+		for _, constraint := range retainedShimBoundaryBuildTagAllowlist[rel] {
+			want = append(want, "`"+constraint+"`")
+		}
+	}
+	var missing []string
+	for _, token := range want {
+		if !strings.Contains(text, token) {
+			missing = append(missing, token)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("retirement docs do not mention shim escape assumptions: %v", missing)
+	}
+}
+
 func TestRetirementBoundaryDocsMentionLegacyImportAllowlist(t *testing.T) {
 	t.Parallel()
 
@@ -1106,6 +1341,307 @@ func TestRetirementBoundaryDocsMentionLegacyImportAllowlist(t *testing.T) {
 type canaryParsedGoFile struct {
 	path string
 	file *ast.File
+}
+
+func retainedUserspaceShimBoundaryPackageRoots() []string {
+	return []string{
+		filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane"),
+		filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace"),
+	}
+}
+
+func retainedUserspaceShimBoundaryViolations(t *testing.T, roots []string, checkAllowlists bool) []string {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	var parsedFiles []canaryParsedGoFile
+	var violations []string
+	foundBuildTagAllowlist := map[string]bool{}
+
+	for _, path := range retainedUserspaceShimBoundaryFilesUnder(t, roots) {
+		rel := repoRelativePath(t, path)
+		if isGoAssemblyFile(path) {
+			violations = append(violations, rel+" has assembly file")
+			continue
+		}
+		if isGoObjectFile(path) {
+			violations = append(violations, rel+" has precompiled object file")
+			continue
+		}
+		if !strings.HasSuffix(path, ".go") {
+			continue
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		text := string(data)
+		buildConstraints := buildConstraintLines(text)
+		if len(buildConstraints) > 0 {
+			if _, ok := retainedShimBoundaryBuildTagAllowlist[rel]; ok {
+				foundBuildTagAllowlist[rel] = true
+			}
+			if !buildConstraintLinesAllowed(rel, buildConstraints) {
+				violations = append(violations, fmt.Sprintf(
+					"%s has unallowlisted build constraint %q",
+					rel,
+					strings.Join(buildConstraints, "; "),
+				))
+			}
+		}
+		for _, line := range goCompilerDirectiveLines(text) {
+			violations = append(violations, fmt.Sprintf("%s uses %s compiler directive %q", rel, goCompilerDirectiveKind(line), line))
+		}
+
+		file, err := parser.ParseFile(fset, path, data, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		parsedFiles = append(parsedFiles, canaryParsedGoFile{path: path, file: file})
+		for _, imp := range file.Imports {
+			if importPathLiteral(imp) == "C" {
+				pos := fset.Position(imp.Pos())
+				violations = append(violations, fmt.Sprintf("%s:%d imports \"C\"", rel, pos.Line))
+			}
+		}
+	}
+
+	violations = append(violations, positionalDataplaneManagerLiteralViolations(t, fset, parsedFiles)...)
+
+	if checkAllowlists {
+		for rel := range retainedShimBoundaryBuildTagAllowlist {
+			if !foundBuildTagAllowlist[rel] {
+				violations = append(violations, rel+" stale retained shim boundary build-tag allowlist entry")
+			}
+		}
+	}
+
+	sort.Strings(violations)
+	return violations
+}
+
+func retainedUserspaceShimBoundaryFilesUnder(t *testing.T, roots []string) []string {
+	t.Helper()
+
+	var files []string
+	for _, root := range roots {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			t.Fatalf("read boundary dir %s: %v", root, err)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if strings.HasSuffix(name, "_test.go") {
+				continue
+			}
+			if strings.HasSuffix(name, ".go") || isGoAssemblyFile(name) || isGoObjectFile(name) {
+				files = append(files, filepath.Join(root, name))
+			}
+		}
+	}
+	sort.Strings(files)
+	return files
+}
+
+func isGoAssemblyFile(path string) bool {
+	return strings.HasSuffix(path, ".s") || strings.HasSuffix(path, ".S")
+}
+
+func isGoObjectFile(path string) bool {
+	return strings.HasSuffix(path, ".syso")
+}
+
+func buildConstraintLines(text string) []string {
+	var lines []string
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "//go:build") || strings.HasPrefix(trimmed, "// +build") {
+			lines = append(lines, trimmed)
+		}
+	}
+	return lines
+}
+
+func buildConstraintLinesAllowed(rel string, got []string) bool {
+	allowed, ok := retainedShimBoundaryBuildTagAllowlist[rel]
+	if !ok || len(allowed) != len(got) {
+		return false
+	}
+	for i := range allowed {
+		if allowed[i] != got[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func goCompilerDirectiveLines(text string) []string {
+	var lines []string
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "//go:linkname") || strings.HasPrefix(trimmed, "//go:cgo_") {
+			lines = append(lines, trimmed)
+		}
+	}
+	return lines
+}
+
+func goCompilerDirectiveKind(line string) string {
+	switch {
+	case strings.HasPrefix(line, "//go:linkname"):
+		return "//go:linkname"
+	case strings.HasPrefix(line, "//go:cgo_"):
+		return "//go:cgo_"
+	default:
+		return "//go:"
+	}
+}
+
+func importPathLiteral(imp *ast.ImportSpec) string {
+	if imp == nil || imp.Path == nil {
+		return ""
+	}
+	path, err := strconv.Unquote(imp.Path.Value)
+	if err != nil {
+		return ""
+	}
+	return path
+}
+
+func positionalDataplaneManagerLiteralViolations(t *testing.T, fset *token.FileSet, files []canaryParsedGoFile) []string {
+	t.Helper()
+
+	xdpEntryProgIndex := dataplaneManagerFieldIndex(files, "xdpEntryProg")
+	if xdpEntryProgIndex < 0 {
+		return nil
+	}
+	managerTypeNames := packageLocalDataplaneManagerTypeNames(files)
+
+	var violations []string
+	for _, parsed := range files {
+		if parsed.file.Name == nil || parsed.file.Name.Name != "dataplane" {
+			continue
+		}
+		rel := repoRelativePath(t, parsed.path)
+		ast.Inspect(parsed.file, func(n ast.Node) bool {
+			lit, ok := n.(*ast.CompositeLit)
+			if !ok || !isPackageLocalDataplaneManagerLiteralType(lit.Type, managerTypeNames) {
+				return true
+			}
+			if len(lit.Elts) <= xdpEntryProgIndex || allCompositeLiteralElementsKeyed(lit) {
+				return true
+			}
+
+			pos := fset.Position(lit.Pos())
+			violations = append(violations, fmt.Sprintf(
+				"%s:%d uses positional dataplane.Manager literal that can set xdpEntryProg from %q",
+				rel,
+				pos.Line,
+				canaryExprString(lit.Elts[xdpEntryProgIndex]),
+			))
+			return true
+		})
+	}
+	return violations
+}
+
+func dataplaneManagerFieldIndex(files []canaryParsedGoFile, fieldName string) int {
+	for _, parsed := range files {
+		if parsed.file.Name == nil || parsed.file.Name.Name != "dataplane" {
+			continue
+		}
+		for _, decl := range parsed.file.Decls {
+			genDecl, ok := decl.(*ast.GenDecl)
+			if !ok || genDecl.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range genDecl.Specs {
+				typeSpec, ok := spec.(*ast.TypeSpec)
+				if !ok || typeSpec.Name.Name != "Manager" {
+					continue
+				}
+				st, ok := typeSpec.Type.(*ast.StructType)
+				if !ok || st.Fields == nil {
+					continue
+				}
+				index := 0
+				for _, field := range st.Fields.List {
+					names := field.Names
+					if len(names) == 0 {
+						if fieldName == canaryExprString(field.Type) {
+							return index
+						}
+						index++
+						continue
+					}
+					for _, name := range names {
+						if name.Name == fieldName {
+							return index
+						}
+						index++
+					}
+				}
+			}
+		}
+	}
+	return -1
+}
+
+func packageLocalDataplaneManagerTypeNames(files []canaryParsedGoFile) map[string]bool {
+	names := map[string]bool{"Manager": true}
+	for changed := true; changed; {
+		changed = false
+		for _, parsed := range files {
+			if parsed.file.Name == nil || parsed.file.Name.Name != "dataplane" {
+				continue
+			}
+			for _, decl := range parsed.file.Decls {
+				genDecl, ok := decl.(*ast.GenDecl)
+				if !ok || genDecl.Tok != token.TYPE {
+					continue
+				}
+				for _, spec := range genDecl.Specs {
+					typeSpec, ok := spec.(*ast.TypeSpec)
+					if !ok || names[typeSpec.Name.Name] {
+						continue
+					}
+					if names[typeIdentName(typeSpec.Type)] {
+						names[typeSpec.Name.Name] = true
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	return names
+}
+
+func typeIdentName(expr ast.Expr) string {
+	ident, ok := unparenExpr(expr).(*ast.Ident)
+	if !ok {
+		return ""
+	}
+	return ident.Name
+}
+
+func isPackageLocalDataplaneManagerLiteralType(expr ast.Expr, managerTypeNames map[string]bool) bool {
+	return managerTypeNames[typeIdentName(expr)]
+}
+
+func allCompositeLiteralElementsKeyed(lit *ast.CompositeLit) bool {
+	if lit == nil {
+		return false
+	}
+	for _, elt := range lit.Elts {
+		if _, ok := elt.(*ast.KeyValueExpr); !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func userspaceXDPEntryProgramViolations(t *testing.T, roots []string) []string {
@@ -1469,6 +2005,12 @@ func resolveUserspaceXDPEntryProgramIdents(files map[string]*ast.File) {
 }
 
 func writeUserspaceEntryProgramFixture(t *testing.T, files map[string]string) string {
+	t.Helper()
+
+	return writeBoundaryFixture(t, files)
+}
+
+func writeBoundaryFixture(t *testing.T, files map[string]string) string {
 	t.Helper()
 
 	root := t.TempDir()

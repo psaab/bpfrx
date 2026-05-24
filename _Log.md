@@ -32,6 +32,22 @@
     `docs/pr/1373-retire-ebpf-dataplane/README.md`, `_Log.md`
   - **Validation**: `go test ./pkg/logging ./pkg/dataplane -count=1`;
     `go test ./pkg/daemon ./pkg/dataplane/userspace -count=1`;
+
+- **Timestamp**: 2026-05-24T19:29:17Z
+  - **Action**: Issue #1504 implementation — hardened the retained
+    userspace shim boundary canary against positional package-local
+    `dataplane.Manager` literals, production CGo imports, `go:linkname`,
+    `go:cgo_*` compiler directives, direct assembly and `.syso` object
+    files, and unallowlisted build tags while keeping DPDK CGo outside the
+    scanner. Documented the exact #1504 boundary
+    assumptions and allowlisted only generated legacy bpf2go architecture
+    tags plus the ignored loader stub.
+  - **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`,
+    `docs/pr/1373-retire-ebpf-dataplane/README.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane -run
+    'TestRetainedUserspaceShimBoundaryCanary|TestRetirementBoundaryDocsMentionShimEscapeAssumptions'
+    -count=1`; `go test ./pkg/dataplane -run
+    'Retirement|Canary|Userspace.*Entry|BPFShim' -count=1`;
     `git diff --check`
 
 - **Timestamp**: 2026-05-24T18:47:00Z
