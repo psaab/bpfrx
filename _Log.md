@@ -2,6 +2,18 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T16:56:30Z
+  - **Action**: PR #1506 review follow-up — normalized RFC3339 leap-second
+    validation through UTC before accepting `:60` offset forms, and reported
+    hostile Decimal/oversized-number JSON parse failures as structured
+    validation errors instead of tracebacks.
+  - **File(s)**: `test/incus/retire_ebpf_artifact_schema.py`,
+    `test/incus/retire_ebpf_artifact_schema_test.py`, `_Log.md`
+  - **Validation**: `python3 -m unittest discover -s test/incus -p
+    retire_ebpf_artifact_schema_test.py`; `python3 -m py_compile
+    test/incus/retire_ebpf_artifact_schema.py
+    test/incus/retire_ebpf_artifact_schema_test.py`; `git diff --check`
+
 - **Timestamp**: 2026-05-24T15:14:30Z
   - **Action**: PR #1494 round-11 follow-up — collapsed the retained
     userspace XDP shim entry-program name onto one dataplane constant and
@@ -1120,3 +1132,32 @@
   - **Validation**: `rg -n "#1375|#1378|retirement blocker|retirement-contract"
     docs/feature-gaps.md docs/pr/1373-retire-ebpf-dataplane/README.md
     docs/pr/1373-retire-ebpf-dataplane/plan.md`; `git diff --check`
+
+- **Timestamp**: 2026-05-23T21:46:59-07:00
+  - **Action**: #1502 artifact-schema checker follow-up: parse JSON floats as
+    `Decimal`, normalize JSON integer-like values for manifest issues,
+    schema version, and command exit status, reject lossy non-integer decimal
+    numbers, and restrict accepted RFC3339 leap seconds to 23:59:60 on June 30
+    or December 31.
+  - **File(s)**: `test/incus/retire_ebpf_artifact_schema.py`,
+    `test/incus/retire_ebpf_artifact_schema_test.py`, `_Log.md`
+  - **Validation**: `python3 -m unittest discover -s test/incus -p
+    retire_ebpf_artifact_schema_test.py`; `python3
+    test/incus/retire_ebpf_artifact_schema_test.py`; `python3 -m py_compile
+    test/incus/retire_ebpf_artifact_schema.py
+    test/incus/retire_ebpf_artifact_schema_test.py`; `python3 -m json.tool
+    docs/pr/1373-retire-ebpf-dataplane/final-validation/manifest.schema.json
+    >/dev/null`; `git diff --check`
+
+- **Timestamp**: 2026-05-24T11:01:44-07:00
+  - **Action**: PR #1506 review follow-up: reject Python JSON parser
+    extensions (`NaN`, `Infinity`, and `-Infinity`) through the existing
+    invalid-JSON validation path, and cap Decimal integer materialization so
+    hostile exponent-form manifest integers cannot force huge `int`
+    allocation.
+  - **File(s)**: `test/incus/retire_ebpf_artifact_schema.py`,
+    `test/incus/retire_ebpf_artifact_schema_test.py`, `_Log.md`
+  - **Validation**: `python3 -m unittest discover -s test/incus -p
+    retire_ebpf_artifact_schema_test.py`; `python3 -m py_compile
+    test/incus/retire_ebpf_artifact_schema.py
+    test/incus/retire_ebpf_artifact_schema_test.py`; `git diff --check`

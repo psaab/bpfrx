@@ -12,7 +12,8 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,8 @@ DATE_TIME_RE = re.compile(
     r"[Tt](?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
     r"(?P<fraction>\.\d+)?(?P<zone>[Zz]|[+-]\d{2}:\d{2})$"
 )
+# Manifest integer fields are small; cap Decimal-to-int conversion defensively.
+MAX_JSON_INTEGER_DIGITS = 128
 
 COS_OFF_CASES = ("v4-push", "v4-reverse", "v6-push", "v6-reverse")
 SCREEN_PROBES = ("land", "syn", "icmp", "udp")
@@ -128,6 +131,10 @@ def _display(path: Path) -> str:
     return path.as_posix()
 
 
+def _reject_json_constant(token: str) -> None:
+    raise ValueError(f"non-RFC 8259 JSON constant: {token}")
+
+
 class ArtifactChecker:
     def __init__(self, root: Path, *, candidate_commit: str | None = None) -> None:
         self.root = root
@@ -174,21 +181,25 @@ class ArtifactChecker:
             "manifest.json", manifest, REQUIRED_MANIFEST_FIELDS
         )
 
-        schema_version = manifest.get("schema_version")
-        if isinstance(schema_version, bool) or schema_version != 1:
+        schema_version = self.json_integer_value(manifest.get("schema_version"))
+        if schema_version != 1:
             self.error("manifest.json schema_version must be 1")
+        else:
+            manifest["schema_version"] = schema_version
 
         issues = manifest.get("issues")
         if not isinstance(issues, list):
             self.error("manifest.json issues must include 1373 and 1477")
         else:
-            issue_numbers = [self.issue_number(issue) for issue in issues]
+            issue_numbers = [self.json_integer_value(issue) for issue in issues]
             if any(issue is None for issue in issue_numbers):
                 self.error("manifest.json issues must be integer issue numbers")
             elif len(set(issue_numbers)) != len(issue_numbers):
                 self.error("manifest.json issues must not contain duplicates")
             elif not {1373, 1477}.issubset(set(issue_numbers)):
                 self.error("manifest.json issues must include 1373 and 1477")
+            else:
+                manifest["issues"] = issue_numbers
 
         raw_commit = manifest.get("candidate_commit")
         if not isinstance(raw_commit, str) or not FULL_SHA_RE.match(raw_commit):
@@ -310,11 +321,13 @@ class ArtifactChecker:
                     self.error(f"manifest.json commands[{idx}].gate is required")
                 if not isinstance(command.get("command"), str) or not command["command"]:
                     self.error(f"manifest.json commands[{idx}].command is required")
-                exit_status = command.get("exit_status")
-                if isinstance(exit_status, bool) or not isinstance(exit_status, int):
+                exit_status = self.json_integer_value(command.get("exit_status"))
+                if exit_status is None:
                     self.error(
                         f"manifest.json commands[{idx}].exit_status must be recorded as an integer"
                     )
+                else:
+                    command["exit_status"] = exit_status
                 for field in ("started_at", "finished_at"):
                     if field in command:
                         self.validate_date_time_string(
@@ -361,13 +374,25 @@ class ArtifactChecker:
         if not isinstance(value, str) or not value:
             self.error(f"{context} must be a non-empty string")
 
-    def issue_number(self, value: Any) -> int | None:
+    def json_integer_value(self, value: Any) -> int | None:
         if isinstance(value, bool):
             return None
         if isinstance(value, int):
             return value
-        if isinstance(value, float) and value.is_integer():
-            return int(value)
+        if isinstance(value, Decimal):
+            if not value.is_finite():
+                return None
+            if not value.is_zero() and value.adjusted() + 1 > MAX_JSON_INTEGER_DIGITS:
+                return None
+            try:
+                integral = value.to_integral_value()
+            except InvalidOperation:
+                return None
+            if value == integral:
+                try:
+                    return int(value)
+                except (InvalidOperation, OverflowError, ValueError):
+                    return None
         return None
 
     def validate_unique_list(self, context: str, value: list[Any]) -> None:
@@ -405,6 +430,21 @@ class ArtifactChecker:
             return
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             self.error(f"{context} must include a timezone offset")
+            return
+        if second == 60 and not self.is_practical_leap_second(parsed):
+            self.error(f"{context} must be an RFC3339 date-time string")
+
+    def is_practical_leap_second(self, parsed: datetime) -> bool:
+        utc = parsed.astimezone(timezone.utc)
+        return (
+            utc.hour == 23
+            and utc.minute == 59
+            and utc.second == 59
+            and (
+                (utc.month == 6 and utc.day == 30)
+                or (utc.month == 12 and utc.day == 31)
+            )
+        )
 
     def validate_metadata(self) -> None:
         self.require_file("metadata/git-rev-parse-head.txt")
@@ -570,11 +610,18 @@ class ArtifactChecker:
         if not path.exists() or not path.is_file():
             return None
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(
+                path.read_text(encoding="utf-8"),
+                parse_float=Decimal,
+                parse_constant=_reject_json_constant,
+            )
         except UnicodeDecodeError as exc:
             self.error(f"invalid UTF-8 JSON artifact {rel}: {exc}")
             return None
         except json.JSONDecodeError as exc:
+            self.error(f"invalid JSON artifact {rel}: {exc}")
+            return None
+        except (InvalidOperation, ValueError) as exc:
             self.error(f"invalid JSON artifact {rel}: {exc}")
             return None
 
