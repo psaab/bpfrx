@@ -2,6 +2,22 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T23:05:00Z
+  - **Action**: PR #1499 r-final-5 fix step 2 — integration-PR pointer
+    rewritten. plan.md "Encap call site" claimed dispatch.rs:430 was
+    the egress encap point that unconditionally called
+    `encapsulate_native_gre_frame`. Actual: dispatch.rs:430 only
+    computes the `uses_native_tunnel = tunnel_endpoint_id != 0` gate;
+    the real `encapsulate_native_gre_frame` calls live in
+    `frame/mod.rs:212` (copy path, invoked from dispatch at
+    `tx/dispatch.rs:785-792`), `frame/tcp_segmentation.rs:309`
+    (TCP segmentation), and `tunnel.rs:189` (local origination).
+    Rewrote the section to enumerate all three sites and clarified
+    that dispatch.rs:430 *computes the gate*, it does not itself
+    encap. Also updated the "What's OUT" bullet that referenced
+    `tx/dispatch.rs` activation to enumerate the same three sites.
+  - **File(s)**: docs/pr/wireguard-clean/plan.md
+
 - **Timestamp**: 2026-05-24T23:00:00Z
   - **Action**: PR #1499 r-final-5 fix pass start — exhaustive mechanical
     plan.md sweep against actual source. Step 1 fixed: WG data-record

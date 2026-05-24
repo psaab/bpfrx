@@ -235,12 +235,25 @@ control socket so we survive restart without rekey.
 Two call sites. Both are **clearly marked WIP** in this PR and
 **do not** activate in production paths.
 
-### Encap call site: tx/dispatch.rs
+### Encap call sites (integration PR boundary)
 
-The tunnel-endpoint branch at `dispatch.rs:430` (`uses_native_tunnel
-= tunnel_endpoint_id != 0`) is the only egress encap point. Today it
-unconditionally calls `encapsulate_native_gre_frame`. The change is
-small and local:
+The egress encap path is gated on `tunnel_endpoint_id != 0` at
+`tx/dispatch.rs:430` (the `uses_native_tunnel` boolean — note this
+line *computes* the gate; it does not itself call the encap builder).
+The actual `encapsulate_native_gre_frame` call sites the integration
+PR has to teach about WireGuard are:
+
+- `userspace-dp/src/afxdp/frame/mod.rs:212` — `build_forwarded_frame_from_frame`
+  branches on `decision.resolution.tunnel_endpoint_id != 0` and
+  unconditionally calls `encapsulate_native_gre_frame`. This is the
+  primary copy-path encap builder invoked by dispatch at
+  `tx/dispatch.rs:785-792`.
+- `userspace-dp/src/afxdp/frame/tcp_segmentation.rs:309` — TCP-
+  segmentation path that emits one GRE-encapped frame per segment.
+- `userspace-dp/src/afxdp/tunnel.rs:189` — local-tunnel-origination
+  path (packets sourced by the firewall itself, not just transit).
+
+The shape of the integration change is the same at each site:
 
 ```rust
 let endpoint = forwarding.tunnel_endpoints.get(&id)?;
@@ -250,9 +263,10 @@ let bytes = match endpoint.mode.as_str() {
 };
 ```
 
-This PR does NOT make that call. It lands the engine + tests + the
-protocol extension and stops there. Wiring is the next PR — gated
-behind a thorough triple-review of the engine as-is.
+This PR does NOT make those calls. It lands the engine + tests + the
+protocol extension and stops there. Wiring all three sites is the
+integration PR — gated behind a thorough triple-review of the engine
+as-is.
 
 ### Decap call site: poll_descriptor.rs
 
@@ -439,8 +453,13 @@ data record only.
 
 ## What's OUT (tracked as follow-ups)
 
-- Activation in `tx/dispatch.rs` and `poll_descriptor.rs`. Engine
-  exists and is tested but is not on the hot path yet.
+- Activation in the egress encap call sites
+  (`afxdp/frame/mod.rs:212`, `afxdp/frame/tcp_segmentation.rs:309`,
+  `afxdp/tunnel.rs:189`, gated by the
+  `tunnel_endpoint_id != 0` branch computed at
+  `afxdp/tx/dispatch.rs:430`) and in the ingress decap classifier
+  in `poll_descriptor.rs`. Engine exists and is tested but is not on
+  the hot path yet.
 - WG handshake outer-framing layer (MessageInitiation/MessageResponse
   outer bytes around the Noise sub-message, MAC1/MAC2, TAI64N).
   Engine ships the Noise sub-message bytes only; the integration
