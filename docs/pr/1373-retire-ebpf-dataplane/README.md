@@ -106,8 +106,8 @@ same PR.
 ## #1473 Userspace XDP Shim Build Split
 
 The retained Rust userspace XDP shim is still required for the AF_XDP userspace
-runtime, but its generation path is now explicit and separate from the legacy
-XDP/TC dataplane bpf2go batch:
+runtime. Its runtime fallback behavior and generation path are now explicit and
+separate from the legacy XDP/TC dataplane:
 
 - `make generate-userspace-xdp` rebuilds only
   `pkg/dataplane/userspace_xdp_bpfel.o` through the
@@ -122,8 +122,17 @@ The userspace shim target must not depend on legacy `xdp_main` or TC program
 generation. `pkg/dataplane/retirement_boundary_canary_test.go` reads the
 Makefile and fails if `generate-userspace-xdp` gains legacy bpf2go tokens,
 recursive Make dependencies, or the broad `./pkg/dataplane/...` generate path.
-This keeps the retained shim visible without implying that deleting legacy
-dataplane program generation is blocked by the shim itself.
+The same canary allowlists the retained Rust shim's source-level and built-object
+maps/programs, rejects tail-call plumbing in that shim, and requires the retained
+Go shim manager to keep its entry-program state unexported so JSON/reflection
+cannot select the legacy XDP entry point. Production userspace code may only use
+the narrow userspace-shim selection/swap methods. This keeps the retained shim
+visible without implying that degraded userspace mode can bypass back into the
+legacy pipeline.
+
+The #1493 loader/bootstrap split keeps normal userspace startup on the
+userspace-only shim loader below. Source removal still waits for #1451's
+remaining operator/runtime surface migration and #1476's deletion candidate.
 
 ## #1493 Userspace Shim Loader Split
 

@@ -1,15 +1,22 @@
 package dataplane
 
 import (
+	"encoding/json"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/cilium/ebpf"
 )
 
 const (
@@ -19,6 +26,7 @@ const (
 	dpdkBackendImportForCanary      = "github.com/psaab/xpf/pkg/dataplane/dpdk"
 	makefileForCanary               = "../../Makefile"
 	retirementBoundaryDocsForCanary = "../../docs/pr/1373-retire-ebpf-dataplane/README.md"
+	userspaceXDPEntryProgForCanary  = "xdp_userspace_prog"
 )
 
 var legacyDataplaneImportAllowlist = map[string]string{
@@ -65,6 +73,32 @@ var dpdkEBPFImportAllowlist = map[string]string{
 var dpdkBackendImportAllowlist = map[string]string{
 	"cmd/xpfd/main.go": "backend registration and cleanup entry point",
 }
+
+var userspaceShimAllowedMapTypes = map[string]ebpf.MapType{
+	"dnat_table":                 ebpf.Hash,
+	"userspace_bindings":         ebpf.Array,
+	"userspace_cpumap":           ebpf.CPUMap,
+	"userspace_ctrl":             ebpf.Array,
+	"userspace_fallback_stats":   ebpf.Array,
+	"userspace_heartbeat":        ebpf.Array,
+	"userspace_ingress_ifaces":   ebpf.Hash,
+	"userspace_interface_nat_v4": ebpf.Hash,
+	"userspace_interface_nat_v6": ebpf.Hash,
+	"userspace_local_v4":         ebpf.Hash,
+	"userspace_local_v6":         ebpf.Hash,
+	"userspace_sessions":         ebpf.Hash,
+	"userspace_trace":            ebpf.Hash,
+	"userspace_xsk_map":          ebpf.XSKMap,
+}
+
+var userspaceShimAllowedProgramTypes = map[string]ebpf.ProgramType{
+	userspaceXDPEntryProgForCanary: ebpf.XDP,
+}
+
+var (
+	rustMapAnnotationRE = regexp.MustCompile(`#\[\s*map\s*\([^)]*\bname\s*=\s*"([^"]+)"[^)]*\)\s*\]`)
+	rustXDPFunctionRE   = regexp.MustCompile(`#\[\s*xdp\s*\]\s*(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)`)
+)
 
 func TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports(t *testing.T) {
 	t.Parallel()
@@ -129,6 +163,7 @@ func TestOperatorPackagesDoNotImportBPFArtifactsDirectly(t *testing.T) {
 func TestDPDKBackendImportStaysBackendLocal(t *testing.T) {
 	t.Parallel()
 
+	found := map[string]bool{}
 	var violations []string
 	for _, path := range productionGoFilesUnder(t, []string{
 		filepath.Join(repoRootForBoundaryCanary, "cmd"),
@@ -138,19 +173,32 @@ func TestDPDKBackendImportStaysBackendLocal(t *testing.T) {
 		if strings.HasPrefix(rel, "pkg/dataplane/dpdk/") {
 			continue
 		}
-		if _, ok := dpdkBackendImportAllowlist[rel]; ok {
-			continue
-		}
 		for _, imp := range importPaths(t, path) {
 			if imp == dpdkBackendImportForCanary || strings.HasPrefix(imp, dpdkBackendImportForCanary+"/") {
-				violations = append(violations, rel+" imports "+imp)
+				if _, ok := dpdkBackendImportAllowlist[rel]; ok {
+					found[rel] = true
+				} else {
+					violations = append(violations, rel+" imports "+imp)
+				}
 			}
 		}
 	}
 
-	if len(violations) > 0 {
+	var stale []string
+	for rel := range dpdkBackendImportAllowlist {
+		if !found[rel] {
+			stale = append(stale, rel)
+		}
+	}
+
+	if len(violations) > 0 || len(stale) > 0 {
 		sort.Strings(violations)
-		t.Fatalf("DPDK backend imports must stay limited to pkg/dataplane/dpdk and cmd/xpfd registration: %v", violations)
+		sort.Strings(stale)
+		t.Fatalf(
+			"DPDK backend import allowlist drift\nunexpected imports: %v\nstale allowlist entries: %v",
+			violations,
+			stale,
+		)
 	}
 }
 
@@ -318,6 +366,630 @@ func TestUserspaceShimSharedMapsAreExplicitCompatibilitySet(t *testing.T) {
 	}
 }
 
+func TestUserspaceXDPShimSourceMatchesRetainedObjectAllowlist(t *testing.T) {
+	t.Parallel()
+
+	foundMaps := map[string]string{}
+	foundPrograms := map[string]string{}
+	var forbidden []string
+
+	for _, path := range rustSourceFilesUnder(t, filepath.Join(repoRootForBoundaryCanary, "userspace-xdp", "src")) {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read userspace XDP shim source %s: %v", path, err)
+		}
+		text := string(data)
+		rel := repoRelativePath(t, path)
+		for _, token := range []string{
+			"ProgramArray",
+			".tail_call(",
+			"bpf_tail_call",
+		} {
+			if strings.Contains(text, token) {
+				forbidden = append(forbidden, fmt.Sprintf("%s contains %q", rel, token))
+			}
+		}
+		for _, match := range rustMapAnnotationRE.FindAllStringSubmatchIndex(text, -1) {
+			name := text[match[2]:match[3]]
+			foundMaps[name] = fmt.Sprintf("%s at %s:%d", name, rel, lineForOffset(text, match[0]))
+		}
+		for _, match := range rustXDPFunctionRE.FindAllStringSubmatchIndex(text, -1) {
+			name := text[match[2]:match[3]]
+			foundPrograms[name] = fmt.Sprintf("%s at %s:%d", name, rel, lineForOffset(text, match[0]))
+		}
+	}
+
+	unexpectedMaps, missingMaps := compareStringSetToAllowed(foundMaps, keysOfMapTypeAllowlist(userspaceShimAllowedMapTypes))
+	unexpectedPrograms, missingPrograms := compareStringSetToAllowed(foundPrograms, keysOfProgramTypeAllowlist(userspaceShimAllowedProgramTypes))
+	if len(forbidden) > 0 || len(unexpectedMaps) > 0 || len(missingMaps) > 0 ||
+		len(unexpectedPrograms) > 0 || len(missingPrograms) > 0 {
+		sort.Strings(forbidden)
+		sort.Strings(unexpectedMaps)
+		sort.Strings(missingMaps)
+		sort.Strings(unexpectedPrograms)
+		sort.Strings(missingPrograms)
+		t.Fatalf(
+			"userspace XDP shim source allowlist drift\nforbidden tail-call tokens: %v\nunexpected maps: %v\nmissing maps: %v\nunexpected programs: %v\nmissing programs: %v",
+			forbidden,
+			unexpectedMaps,
+			missingMaps,
+			unexpectedPrograms,
+			missingPrograms,
+		)
+	}
+}
+
+func TestUserspaceXDPShimObjectMatchesRetainedCollectionAllowlist(t *testing.T) {
+	t.Parallel()
+
+	spec, err := loadRustUserspaceXDP()
+	if err != nil {
+		t.Fatalf("load userspace XDP shim object: %v", err)
+	}
+
+	foundMaps := map[string]string{}
+	var wrongMaps []string
+	for name, mapSpec := range spec.Maps {
+		foundMaps[name] = name
+		if want, ok := userspaceShimAllowedMapTypes[name]; ok && mapSpec.Type != want {
+			wrongMaps = append(wrongMaps, fmt.Sprintf("%s type %s, want %s", name, mapSpec.Type, want))
+		}
+	}
+	foundPrograms := map[string]string{}
+	var wrongPrograms []string
+	for name, programSpec := range spec.Programs {
+		foundPrograms[name] = name
+		if want, ok := userspaceShimAllowedProgramTypes[name]; ok && programSpec.Type != want {
+			wrongPrograms = append(wrongPrograms, fmt.Sprintf("%s type %s, want %s", name, programSpec.Type, want))
+		}
+	}
+
+	unexpectedMaps, missingMaps := compareStringSetToAllowed(foundMaps, keysOfMapTypeAllowlist(userspaceShimAllowedMapTypes))
+	unexpectedPrograms, missingPrograms := compareStringSetToAllowed(foundPrograms, keysOfProgramTypeAllowlist(userspaceShimAllowedProgramTypes))
+	if len(wrongMaps) > 0 || len(unexpectedMaps) > 0 || len(missingMaps) > 0 ||
+		len(wrongPrograms) > 0 || len(unexpectedPrograms) > 0 || len(missingPrograms) > 0 {
+		sort.Strings(wrongMaps)
+		sort.Strings(unexpectedMaps)
+		sort.Strings(missingMaps)
+		sort.Strings(wrongPrograms)
+		sort.Strings(unexpectedPrograms)
+		sort.Strings(missingPrograms)
+		t.Fatalf(
+			"userspace XDP shim object allowlist drift\nwrong map types: %v\nunexpected maps: %v\nmissing maps: %v\nwrong program types: %v\nunexpected programs: %v\nmissing programs: %v",
+			wrongMaps,
+			unexpectedMaps,
+			missingMaps,
+			wrongPrograms,
+			unexpectedPrograms,
+			missingPrograms,
+		)
+	}
+}
+
+func TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram(t *testing.T) {
+	t.Parallel()
+
+	violations := userspaceXDPEntryProgramViolations(t, []string{
+		filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace"),
+	})
+	if len(violations) > 0 {
+		sort.Strings(violations)
+		t.Fatalf("userspace manager production code must only select userspaceXDPEntryProg: %v", violations)
+	}
+}
+
+func TestBPFShimEntryProgramStateIsNotJSONMutable(t *testing.T) {
+	t.Parallel()
+
+	if userspaceShimEntryProg != userspaceXDPEntryProgForCanary {
+		t.Fatalf(
+			"userspace shim entry-program constant = %q, want %q",
+			userspaceShimEntryProg,
+			userspaceXDPEntryProgForCanary,
+		)
+	}
+
+	managerType := reflect.TypeOf(Manager{})
+	if _, ok := managerType.FieldByName("XDPEntryProg"); ok {
+		t.Fatal("dataplane.Manager must not export XDPEntryProg")
+	}
+	field, ok := managerType.FieldByName("xdpEntryProg")
+	if !ok {
+		t.Fatal("dataplane.Manager lost xdpEntryProg state field")
+	}
+	if field.PkgPath == "" {
+		t.Fatal("dataplane.Manager.xdpEntryProg must stay unexported")
+	}
+
+	managerPtrType := reflect.TypeOf((*Manager)(nil))
+	if _, ok := managerPtrType.MethodByName("SwapXDPEntryProg"); ok {
+		t.Fatal("dataplane.Manager must not expose arbitrary SwapXDPEntryProg")
+	}
+	if _, ok := managerPtrType.MethodByName("SwapToUserspaceXDPShimEntryProgram"); !ok {
+		t.Fatal("dataplane.Manager lost narrow userspace shim swap method")
+	}
+
+	data, err := json.Marshal(&Manager{xdpEntryProg: "xdp_bypassed"})
+	if err != nil {
+		t.Fatalf("marshal Manager: %v", err)
+	}
+	if strings.Contains(string(data), "xdp_bypassed") ||
+		strings.Contains(string(data), "XDPEntryProg") ||
+		strings.Contains(string(data), "xdpEntryProg") {
+		t.Fatalf("xdpEntryProg leaked into JSON: %s", data)
+	}
+
+	var decoded Manager
+	if err := json.Unmarshal(
+		[]byte(`{"XDPEntryProg":"xdp_bypassed","xdpEntryProg":"xdp_bypassed"}`),
+		&decoded,
+	); err != nil {
+		t.Fatalf("unmarshal Manager: %v", err)
+	}
+	if got := decoded.XDPEntryProgram(); got == "xdp_bypassed" {
+		t.Fatalf("JSON mutated xdpEntryProg to %q", got)
+	}
+}
+
+func TestUserspaceManagerDoesNotImportReflectOrUnsafe(t *testing.T) {
+	t.Parallel()
+
+	var violations []string
+	for _, path := range productionGoFilesUnder(t, []string{
+		filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace"),
+	}) {
+		rel := repoRelativePath(t, path)
+		for _, imp := range importPaths(t, path) {
+			switch imp {
+			case "reflect", "unsafe":
+				violations = append(violations, rel+" imports "+imp)
+			}
+		}
+	}
+	if len(violations) > 0 {
+		sort.Strings(violations)
+		t.Fatalf("userspace production code must not use reflection/unsafe to bypass entry-program canaries: %v", violations)
+	}
+}
+
+func TestUserspaceXDPEntryProgramConstantNamesRetainedShim(t *testing.T) {
+	t.Parallel()
+
+	found, violations := userspaceXDPEntryProgramConstantDrift(t, []string{
+		filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace"),
+	})
+	if len(found) != 1 || len(violations) > 0 {
+		sort.Strings(found)
+		sort.Strings(violations)
+		t.Fatalf("userspaceXDPEntryProg constant drift\nfound: %v\nviolations: %v", found, violations)
+	}
+}
+
+func TestUserspaceEntryProgramCanaryAllowsCrossFileConstantFixture(t *testing.T) {
+	t.Parallel()
+
+	root := writeUserspaceEntryProgramFixture(t, map[string]string{
+		"const.go": `
+package userspace
+
+const userspaceXDPEntryProg = "xdp_userspace_prog"
+
+type shim struct{}
+func (s *shim) SelectUserspaceXDPShimEntryProgram() {}
+func (s *shim) SwapToUserspaceXDPShimEntryProgram() error { return nil }
+type manager struct { bpfShim *shim }
+`,
+		"use.go": `
+package userspace
+
+func valid(m *manager) {
+	m.bpfShim.SelectUserspaceXDPShimEntryProgram()
+	_ = m.bpfShim.SwapToUserspaceXDPShimEntryProgram()
+}
+`,
+	})
+
+	if got := userspaceXDPEntryProgramViolations(t, []string{root}); len(got) > 0 {
+		t.Fatalf("valid cross-file constant fixture produced violations: %v", got)
+	}
+	found, drift := userspaceXDPEntryProgramConstantDrift(t, []string{root})
+	if len(found) != 1 || len(drift) > 0 {
+		t.Fatalf("valid cross-file constant drift\nfound: %v\nviolations: %v", found, drift)
+	}
+}
+
+func TestUserspaceEntryProgramCanaryRejectsBypassFixtures(t *testing.T) {
+	t.Parallel()
+
+	base := `
+package userspace
+
+const userspaceXDPEntryProg = "xdp_userspace_prog"
+
+type shim struct { XDPEntryProg string }
+func (s *shim) SwapXDPEntryProg(name string) error { return nil }
+type manager struct { bpfShim *shim }
+func consume(v interface{}) {}
+`
+
+	cases := []struct {
+		name string
+		body string
+		want []string
+	}{
+		{
+			name: "literal_assignment",
+			body: `
+package userspace
+
+func literalAssign(m *manager) {
+	m.bpfShim.XDPEntryProg = "xdp_main_prog"
+}
+`,
+			want: []string{"assigns XDPEntryProg from", "xdp_main_prog"},
+		},
+		{
+			name: "shadowed_constant_name",
+			body: `
+package userspace
+
+func shadowedConstName(m *manager) {
+	userspaceXDPEntryProg := "xdp_main_prog"
+	m.bpfShim.XDPEntryProg = userspaceXDPEntryProg
+}
+`,
+			want: []string{"assigns XDPEntryProg from \"userspaceXDPEntryProg\""},
+		},
+		{
+			name: "pointer_alias",
+			body: `
+package userspace
+
+func pointerAlias(m *manager) {
+	p := &m.bpfShim.XDPEntryProg
+	_ = p
+}
+`,
+			want: []string{"takes XDPEntryProg address"},
+		},
+		{
+			name: "method_value_capture",
+			body: `
+package userspace
+
+func methodValueCapture(m *manager) {
+	swap := m.bpfShim.SwapXDPEntryProg
+	_ = swap
+}
+`,
+			want: []string{"captures SwapXDPEntryProg method value"},
+		},
+		{
+			name: "method_value_pass",
+			body: `
+package userspace
+
+func methodValuePass(m *manager) {
+	consume(m.bpfShim.SwapXDPEntryProg)
+}
+`,
+			want: []string{"passes SwapXDPEntryProg method value"},
+		},
+		{
+			name: "method_value_return",
+			body: `
+package userspace
+
+func methodValueReturn(m *manager) func(string) error {
+	return m.bpfShim.SwapXDPEntryProg
+}
+`,
+			want: []string{"returns SwapXDPEntryProg method value"},
+		},
+		{
+			name: "direct_bad_call",
+			body: `
+package userspace
+
+func directBadCall(m *manager) {
+	_ = m.bpfShim.SwapXDPEntryProg("xdp_main_prog")
+}
+`,
+			want: []string{"calls SwapXDPEntryProg with", "xdp_main_prog"},
+		},
+		{
+			name: "parenthesized_bad_call",
+			body: `
+package userspace
+
+func parenBadCall(m *manager) {
+	_ = (m.bpfShim.SwapXDPEntryProg)("xdp_main_prog")
+}
+`,
+			want: []string{"calls SwapXDPEntryProg with", "xdp_main_prog"},
+		},
+		{
+			name: "method_expression_bad_call",
+			body: `
+package userspace
+
+func methodExprBadCall(m *manager) {
+	_ = ((*shim).SwapXDPEntryProg)(m.bpfShim, "xdp_main_prog")
+}
+`,
+			want: []string{"calls SwapXDPEntryProg with", "xdp_main_prog"},
+		},
+		{
+			name: "raw_string_bad_call",
+			body: `
+package userspace
+
+func rawStringBadCall(m *manager) {
+	_ = m.bpfShim.SwapXDPEntryProg(` + "`xdp_main_prog`" + `)
+}
+`,
+			want: []string{"calls SwapXDPEntryProg with", "xdp_main_prog"},
+		},
+		{
+			name: "slice_index_bad_call",
+			body: `
+package userspace
+
+func sliceIndexBadCall(m *manager) {
+	_ = ([]func(string) error{m.bpfShim.SwapXDPEntryProg})[0]("xdp_main_prog")
+}
+`,
+			want: []string{"calls through SwapXDPEntryProg method value"},
+		},
+		{
+			name: "double_parenthesized_bad_call",
+			body: `
+package userspace
+
+func doubleParenBadCall(m *manager) {
+	_ = ((m.bpfShim.SwapXDPEntryProg))("xdp_main_prog")
+}
+`,
+			want: []string{"calls SwapXDPEntryProg with", "xdp_main_prog"},
+		},
+		{
+			name: "wrapped_method_value_callee",
+			body: `
+package userspace
+
+func wrap(fn func(string) error) func(string) error { return fn }
+func wrappedMethodValueCallee(m *manager) {
+	_ = wrap(m.bpfShim.SwapXDPEntryProg)(userspaceXDPEntryProg)
+}
+`,
+			want: []string{"calls through SwapXDPEntryProg method value"},
+		},
+		{
+			name: "send_stmt_method_value",
+			body: `
+package userspace
+
+func sendStmtBypass(m *manager) {
+	ch := make(chan func(string) error, 1)
+	ch <- m.bpfShim.SwapXDPEntryProg
+}
+`,
+			want: []string{"sends SwapXDPEntryProg method value"},
+		},
+		{
+			name: "range_stmt_method_value",
+			body: `
+package userspace
+
+func rangeStmtBypass(m *manager) {
+	for _, fn := range []func(string) error{m.bpfShim.SwapXDPEntryProg} {
+		_ = fn(userspaceXDPEntryProg)
+	}
+}
+`,
+			want: []string{"ranges over SwapXDPEntryProg method value"},
+		},
+		{
+			name: "map_key_method_value",
+			body: `
+package userspace
+
+func mapKeyBypass(m *manager) {
+	mapOfFuncs := make(map[any]bool)
+	mapOfFuncs[m.bpfShim.SwapXDPEntryProg] = true
+}
+`,
+			want: []string{"uses SwapXDPEntryProg method value"},
+		},
+		{
+			name: "switch_tag_method_value",
+			body: `
+package userspace
+
+func switchTagBypass(m *manager) {
+	switch m.bpfShim.SwapXDPEntryProg {
+	case nil:
+	default:
+	}
+}
+`,
+			want: []string{"switches on SwapXDPEntryProg method value"},
+		},
+		{
+			name: "json_unmarshal_bpf_shim",
+			body: `
+package userspace
+
+import "encoding/json"
+
+func jsonBypass(m *manager) {
+	_ = json.Unmarshal([]byte(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `), m.bpfShim)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "json_dot_import_unmarshal_bpf_shim",
+			body: `
+package userspace
+
+import . "encoding/json"
+
+func jsonDotImportBypass(m *manager) {
+	_ = Unmarshal([]byte(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `), m.bpfShim)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "json_new_decoder_decode_bpf_shim",
+			body: `
+package userspace
+
+import (
+	"encoding/json"
+	"strings"
+)
+
+func jsonDecoderBypass(m *manager) {
+	_ = json.NewDecoder(strings.NewReader(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `)).Decode(m.bpfShim)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "json_dot_import_new_decoder_decode_bpf_shim",
+			body: `
+package userspace
+
+import (
+	. "encoding/json"
+	"strings"
+)
+
+func jsonDotDecoderBypass(m *manager) {
+	_ = NewDecoder(strings.NewReader(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `)).Decode(m.bpfShim)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "json_unmarshal_alias_bpf_shim",
+			body: `
+package userspace
+
+import "encoding/json"
+
+func jsonUnmarshalAliasBypass(m *manager) {
+	alias := m.bpfShim
+	_ = json.Unmarshal([]byte(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `), alias)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "json_new_decoder_alias_bpf_shim",
+			body: `
+package userspace
+
+import (
+	"encoding/json"
+	"strings"
+)
+
+func jsonDecodeAliasBypass(m *manager) {
+	alias := m.bpfShim
+	_ = json.NewDecoder(strings.NewReader(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `)).Decode(alias)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "json_stored_decoder_decode_bpf_shim",
+			body: `
+package userspace
+
+import (
+	"encoding/json"
+	"strings"
+)
+
+func jsonStoredDecoderBypass(m *manager) {
+	dec := json.NewDecoder(strings.NewReader(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `))
+	_ = dec.Decode(m.bpfShim)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "json_func_var_unmarshal_bpf_shim",
+			body: `
+package userspace
+
+import "encoding/json"
+
+func jsonFuncVarBypass(m *manager) {
+	decode := json.Unmarshal
+	_ = decode([]byte(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `), m.bpfShim)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "json_tuple_spread_bpf_shim",
+			body: `
+package userspace
+
+import "encoding/json"
+
+func tupleDecodeArgs(m *manager) ([]byte, *bpfShim) {
+	return []byte(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `), m.bpfShim
+}
+
+func jsonTupleSpreadBypass(m *manager) {
+	_ = json.Unmarshal(tupleDecodeArgs(m))
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "json_v2_unmarshal_bpf_shim",
+			body: `
+package userspace
+
+import "encoding/json/v2"
+
+func jsonV2Bypass(m *manager) {
+	_ = json.Unmarshal([]byte(` + "`{\"XDPEntryProg\":\"xdp_bypassed\"}`" + `), m.bpfShim)
+}
+`,
+			want: []string{"encoding/json decode into bpfShim"},
+		},
+		{
+			name: "reflection_field_name",
+			body: `
+package userspace
+
+func reflectionName() {
+	_ = "XDPEntryProg"
+}
+`,
+			want: []string{"uses XDPEntryProg string literal"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := writeUserspaceEntryProgramFixture(t, map[string]string{
+				"base.go":   base,
+				"bypass.go": tc.body,
+			})
+			violations := userspaceXDPEntryProgramViolations(t, []string{root})
+			assertCanaryViolationContains(t, violations, tc.want...)
+		})
+	}
+}
+
 func TestDaemonRuntimeEntryPointUsesRuntimeDataPlane(t *testing.T) {
 	t.Parallel()
 
@@ -330,6 +1002,195 @@ func TestDaemonRuntimeEntryPointUsesRuntimeDataPlane(t *testing.T) {
 	if !hasDaemonRuntimeConstructorCall(t, daemonRun, "NewRuntimeDataPlane") {
 		t.Fatal("daemon runtime startup no longer calls dataplane.NewRuntimeDataPlane")
 	}
+}
+
+func TestRetirementBoundaryDocsMentionDPDKPolicy(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(retirementBoundaryDocsForCanary)
+	if err != nil {
+		t.Fatalf("read retirement boundary docs: %v", err)
+	}
+	text := string(data)
+
+	want := []string{
+		"## #1475 DPDK Backend Policy",
+		"DPDK remains a separately supported backend",
+		"outside the eBPF source-removal path",
+		"`pkg/dataplane/dpdk`",
+		"`cmd/xpfd/main.go`",
+		"`-tags dpdk`",
+		"root `DataPlane`",
+	}
+	var missing []string
+	for _, token := range want {
+		if !strings.Contains(text, token) {
+			missing = append(missing, token)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("retirement docs do not mention DPDK policy tokens: %v", missing)
+	}
+}
+
+func TestRetirementBoundaryDocsMentionLegacyImportAllowlist(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(retirementBoundaryDocsForCanary)
+	if err != nil {
+		t.Fatalf("read retirement boundary docs: %v", err)
+	}
+	text := string(data)
+
+	var missing []string
+	for rel := range legacyDataplaneImportAllowlist {
+		if !strings.Contains(text, rel) {
+			missing = append(missing, rel)
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Fatalf("retirement docs do not mention allowlisted legacy imports: %v", missing)
+	}
+}
+
+type canaryParsedGoFile struct {
+	path string
+	file *ast.File
+}
+
+func userspaceXDPEntryProgramViolations(t *testing.T, roots []string) []string {
+	t.Helper()
+
+	fset, files := productionGoPackageFilesUnder(t, roots)
+	var violations []string
+	for _, parsed := range files {
+		rel := repoRelativePath(t, parsed.path)
+		parents := astParentMap(parsed.file)
+		jsonImports, jsonDotImport := importNamesForPath(parsed.file, "encoding/json")
+		jsonV2Imports, jsonV2DotImport := importNamesForPath(parsed.file, "encoding/json/v2")
+		for name := range jsonV2Imports {
+			jsonImports[name] = true
+		}
+		jsonDotImport = jsonDotImport || jsonV2DotImport
+		ast.Inspect(parsed.file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.AssignStmt:
+				for i, lhs := range node.Lhs {
+					if !isXDPEntryProgField(lhs) {
+						continue
+					}
+					var rhs ast.Expr
+					if len(node.Rhs) == len(node.Lhs) {
+						rhs = node.Rhs[i]
+					}
+					pos := fset.Position(lhs.Pos())
+					violations = append(violations, fmt.Sprintf(
+						"%s:%d assigns XDPEntryProg from %q",
+						rel,
+						pos.Line,
+						canaryExprString(rhs),
+					))
+				}
+			case *ast.CompositeLit:
+				for _, elt := range node.Elts {
+					kv, ok := elt.(*ast.KeyValueExpr)
+					if !ok || !isXDPEntryProgField(kv.Key) {
+						continue
+					}
+					pos := fset.Position(kv.Pos())
+					violations = append(violations, fmt.Sprintf(
+						"%s:%d initializes XDPEntryProg from %q",
+						rel,
+						pos.Line,
+						canaryExprString(kv.Value),
+					))
+				}
+			case *ast.CallExpr:
+				if isJSONDecoderIntoBPFShim(node, jsonImports, jsonDotImport) {
+					pos := fset.Position(node.Pos())
+					violations = append(violations, fmt.Sprintf(
+						"%s:%d encoding/json decode into bpfShim can mutate XDPEntryProg",
+						rel,
+						pos.Line,
+					))
+				}
+			case *ast.UnaryExpr:
+				if node.Op == token.AND && containsXDPEntryProgField(node.X) {
+					pos := fset.Position(node.Pos())
+					violations = append(violations, fmt.Sprintf(
+						"%s:%d takes XDPEntryProg address",
+						rel,
+						pos.Line,
+					))
+				}
+			case *ast.BasicLit:
+				if node.Kind != token.STRING {
+					return true
+				}
+				value, err := strconv.Unquote(node.Value)
+				if err == nil && value == "XDPEntryProg" {
+					pos := fset.Position(node.Pos())
+					violations = append(violations, fmt.Sprintf(
+						"%s:%d uses XDPEntryProg string literal",
+						rel,
+						pos.Line,
+					))
+				}
+			case *ast.SelectorExpr:
+				if node.Sel.Name != "SwapXDPEntryProg" {
+					return true
+				}
+				if violation := swapXDPEntryProgSelectorViolation(node, parents, fset, rel); violation != "" {
+					violations = append(violations, violation)
+				}
+			}
+			return true
+		})
+	}
+	sort.Strings(violations)
+	return violations
+}
+
+func userspaceXDPEntryProgramConstantDrift(t *testing.T, roots []string) ([]string, []string) {
+	t.Helper()
+
+	fset, files := productionGoPackageFilesUnder(t, roots)
+	var found []string
+	var violations []string
+	for _, parsed := range files {
+		ast.Inspect(parsed.file, func(n ast.Node) bool {
+			valueSpec, ok := n.(*ast.ValueSpec)
+			if !ok {
+				return true
+			}
+			for i, name := range valueSpec.Names {
+				if name.Name != "userspaceXDPEntryProg" {
+					continue
+				}
+				pos := fset.Position(name.Pos())
+				location := fmt.Sprintf("%s:%d", repoRelativePath(t, parsed.path), pos.Line)
+				found = append(found, location)
+				if len(valueSpec.Values) != len(valueSpec.Names) {
+					violations = append(violations, location+" uses implicit or tuple value")
+					continue
+				}
+				lit, ok := valueSpec.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING || lit.Value != strconv.Quote(userspaceXDPEntryProgForCanary) {
+					violations = append(violations, fmt.Sprintf(
+						"%s sets userspaceXDPEntryProg to %q, want %q",
+						location,
+						canaryExprString(valueSpec.Values[i]),
+						userspaceXDPEntryProgForCanary,
+					))
+				}
+			}
+			return true
+		})
+	}
+	sort.Strings(found)
+	sort.Strings(violations)
+	return found, violations
 }
 
 func compilerDataplaneCalls(t *testing.T) map[string]bool {
@@ -399,54 +1260,667 @@ func receiverTypeName(expr ast.Expr) string {
 	}
 }
 
-func TestRetirementBoundaryDocsMentionDPDKPolicy(t *testing.T) {
-	t.Parallel()
+func productionGoPackageFilesUnder(t *testing.T, roots []string) (*token.FileSet, []canaryParsedGoFile) {
+	t.Helper()
 
-	data, err := os.ReadFile(retirementBoundaryDocsForCanary)
-	if err != nil {
-		t.Fatalf("read retirement boundary docs: %v", err)
+	fset := token.NewFileSet()
+	packageFiles := map[string]*ast.File{}
+	var files []canaryParsedGoFile
+	for _, path := range productionGoFilesUnder(t, roots) {
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		packageFiles[path] = file
+		files = append(files, canaryParsedGoFile{path: path, file: file})
 	}
-	text := string(data)
+	resolveUserspaceXDPEntryProgramIdents(packageFiles)
+	return fset, files
+}
 
-	want := []string{
-		"## #1475 DPDK Backend Policy",
-		"DPDK remains a separately supported backend",
-		"outside the eBPF source-removal path",
-		"`pkg/dataplane/dpdk`",
-		"`cmd/xpfd/main.go`",
-		"`-tags dpdk`",
-		"root `DataPlane`",
+func astParentMap(root ast.Node) map[ast.Node]ast.Node {
+	parents := map[ast.Node]ast.Node{}
+	var stack []ast.Node
+	ast.Inspect(root, func(n ast.Node) bool {
+		if n == nil {
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+			return false
+		}
+		if len(stack) > 0 {
+			parents[n] = stack[len(stack)-1]
+		}
+		stack = append(stack, n)
+		return true
+	})
+	return parents
+}
+
+func importNamesForPath(file *ast.File, importPath string) (map[string]bool, bool) {
+	names := map[string]bool{}
+	dotImport := false
+	for _, imp := range file.Imports {
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil || path != importPath {
+			continue
+		}
+		if imp.Name != nil {
+			if imp.Name.Name == "." {
+				dotImport = true
+			}
+			if imp.Name.Name != "_" && imp.Name.Name != "." {
+				names[imp.Name.Name] = true
+			}
+			continue
+		}
+		names[defaultImportName(importPath)] = true
 	}
-	var missing []string
-	for _, token := range want {
-		if !strings.Contains(text, token) {
-			missing = append(missing, token)
+	return names, dotImport
+}
+
+func defaultImportName(importPath string) string {
+	last := importPath
+	if idx := strings.LastIndex(last, "/"); idx >= 0 {
+		last = last[idx+1:]
+	}
+	if strings.HasPrefix(last, "v") && len(last) > 1 {
+		allDigits := true
+		for _, r := range last[1:] {
+			if r < '0' || r > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			trimmed := strings.TrimSuffix(importPath, "/"+last)
+			if idx := strings.LastIndex(trimmed, "/"); idx >= 0 {
+				return trimmed[idx+1:]
+			}
+			return trimmed
 		}
 	}
-	if len(missing) > 0 {
-		t.Fatalf("retirement docs do not mention DPDK policy tokens: %v", missing)
+	if idx := strings.LastIndex(importPath, "/"); idx >= 0 {
+		return importPath[idx+1:]
+	}
+	return importPath
+}
+
+func resolveUserspaceXDPEntryProgramIdents(files map[string]*ast.File) {
+	var packageConst *ast.Object
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			genDecl, ok := decl.(*ast.GenDecl)
+			if !ok || genDecl.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range genDecl.Specs {
+				valueSpec, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for _, name := range valueSpec.Names {
+					if name.Name == "userspaceXDPEntryProg" && name.Obj != nil && name.Obj.Kind == ast.Con {
+						packageConst = name.Obj
+					}
+				}
+			}
+		}
+	}
+	if packageConst == nil {
+		return
+	}
+	for _, file := range files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			ident, ok := n.(*ast.Ident)
+			if ok && ident.Name == "userspaceXDPEntryProg" && ident.Obj == nil {
+				ident.Obj = packageConst
+			}
+			return true
+		})
 	}
 }
 
-func TestRetirementBoundaryDocsMentionLegacyImportAllowlist(t *testing.T) {
-	t.Parallel()
+func writeUserspaceEntryProgramFixture(t *testing.T, files map[string]string) string {
+	t.Helper()
 
-	data, err := os.ReadFile(retirementBoundaryDocsForCanary)
-	if err != nil {
-		t.Fatalf("read retirement boundary docs: %v", err)
-	}
-	text := string(data)
-
-	var missing []string
-	for rel := range legacyDataplaneImportAllowlist {
-		if !strings.Contains(text, rel) {
-			missing = append(missing, rel)
+	root := t.TempDir()
+	for name, body := range files {
+		path := filepath.Join(root, name)
+		if err := os.WriteFile(path, []byte(strings.TrimSpace(body)+"\n"), 0o644); err != nil {
+			t.Fatalf("write fixture %s: %v", path, err)
 		}
 	}
-	sort.Strings(missing)
-	if len(missing) > 0 {
-		t.Fatalf("retirement docs do not mention allowlisted legacy imports: %v", missing)
+	return root
+}
+
+func assertCanaryViolationContains(t *testing.T, violations []string, needles ...string) {
+	t.Helper()
+
+	for _, violation := range violations {
+		matches := true
+		for _, needle := range needles {
+			if !strings.Contains(violation, needle) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return
+		}
 	}
+	t.Fatalf("no violation contains all of %q\nall violations:\n%s", needles, strings.Join(violations, "\n"))
+}
+
+func rustSourceFilesUnder(t *testing.T, root string) []string {
+	t.Helper()
+
+	var files []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(path, ".rs") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk Rust source under %s: %v", root, err)
+	}
+	sort.Strings(files)
+	return files
+}
+
+func compareStringSetToAllowed(found map[string]string, allowed map[string]bool) ([]string, []string) {
+	var unexpected []string
+	for name, location := range found {
+		if !allowed[name] {
+			unexpected = append(unexpected, location)
+		}
+	}
+	var missing []string
+	for name := range allowed {
+		if _, ok := found[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	return unexpected, missing
+}
+
+func keysOfMapTypeAllowlist(values map[string]ebpf.MapType) map[string]bool {
+	keys := make(map[string]bool, len(values))
+	for name := range values {
+		keys[name] = true
+	}
+	return keys
+}
+
+func keysOfProgramTypeAllowlist(values map[string]ebpf.ProgramType) map[string]bool {
+	keys := make(map[string]bool, len(values))
+	for name := range values {
+		keys[name] = true
+	}
+	return keys
+}
+
+func lineForOffset(text string, offset int) int {
+	if offset > len(text) {
+		offset = len(text)
+	}
+	return strings.Count(text[:offset], "\n") + 1
+}
+
+func isXDPEntryProgField(expr ast.Expr) bool {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e.Name == "XDPEntryProg"
+	case *ast.SelectorExpr:
+		return e.Sel.Name == "XDPEntryProg"
+	default:
+		return false
+	}
+}
+
+func isUserspaceXDPEntryProgExpr(expr ast.Expr) bool {
+	ident, ok := expr.(*ast.Ident)
+	if !ok || ident.Name != "userspaceXDPEntryProg" {
+		return false
+	}
+	return ident.Obj != nil && ident.Obj.Kind == ast.Con
+}
+
+func containsXDPEntryProgField(expr ast.Expr) bool {
+	return containsExpr(expr, isXDPEntryProgField)
+}
+
+func isJSONDecoderIntoBPFShim(call *ast.CallExpr, jsonImports map[string]bool, jsonDotImport bool) bool {
+	if (len(jsonImports) == 0 && !jsonDotImport) || len(call.Args) == 0 {
+		return false
+	}
+
+	if isJSONUnmarshalCallee(call.Fun, jsonImports, jsonDotImport) {
+		switch len(call.Args) {
+		case 0:
+			return false
+		case 1:
+			return callReturnsBPFShimTuple(call.Args[0], map[*ast.Object]bool{})
+		default:
+			return containsBPFShimReference(call.Args[1])
+		}
+	}
+
+	if len(call.Args) != 1 {
+		return false
+	}
+	if sel, ok := unparenExpr(call.Fun).(*ast.SelectorExpr); ok && sel.Sel.Name == "Decode" {
+		if !isJSONNewDecoderReceiver(sel.X, jsonImports, jsonDotImport, map[*ast.Object]bool{}) {
+			return false
+		}
+		return containsBPFShimReference(call.Args[0])
+	}
+	return false
+}
+
+func isJSONUnmarshalCallee(expr ast.Expr, jsonImports map[string]bool, jsonDotImport bool) bool {
+	switch fun := unparenExpr(expr).(type) {
+	case *ast.SelectorExpr:
+		pkg, ok := unparenExpr(fun.X).(*ast.Ident)
+		return ok && fun.Sel.Name == "Unmarshal" && jsonImports[pkg.Name]
+	case *ast.Ident:
+		if jsonDotImport && fun.Name == "Unmarshal" {
+			return true
+		}
+		return identResolvesToJSONUnmarshal(fun, jsonImports, jsonDotImport, map[*ast.Object]bool{})
+	default:
+		return false
+	}
+}
+
+func identResolvesToJSONUnmarshal(ident *ast.Ident, jsonImports map[string]bool, jsonDotImport bool, seen map[*ast.Object]bool) bool {
+	if ident == nil || ident.Obj == nil {
+		return false
+	}
+	obj := ident.Obj
+	if seen[obj] {
+		return false
+	}
+	seen[obj] = true
+	defer delete(seen, obj)
+
+	switch decl := obj.Decl.(type) {
+	case *ast.AssignStmt:
+		if len(decl.Rhs) != len(decl.Lhs) {
+			return false
+		}
+		for i, lhs := range decl.Lhs {
+			lhsIdent, ok := lhs.(*ast.Ident)
+			if ok && lhsIdent.Obj == obj {
+				return isJSONUnmarshalCallee(decl.Rhs[i], jsonImports, jsonDotImport)
+			}
+		}
+	case *ast.ValueSpec:
+		if len(decl.Values) != len(decl.Names) {
+			return false
+		}
+		for i, name := range decl.Names {
+			if name.Obj == obj {
+				return isJSONUnmarshalCallee(decl.Values[i], jsonImports, jsonDotImport)
+			}
+		}
+	}
+	return false
+}
+
+func isJSONNewDecoderReceiver(expr ast.Expr, jsonImports map[string]bool, jsonDotImport bool, seen map[*ast.Object]bool) bool {
+	switch e := unparenExpr(expr).(type) {
+	case *ast.CallExpr:
+		return isJSONNewDecoderCall(e, jsonImports, jsonDotImport)
+	case *ast.Ident:
+		return identResolvesToJSONNewDecoder(e, jsonImports, jsonDotImport, seen)
+	default:
+		return false
+	}
+}
+
+func isJSONNewDecoderCall(call *ast.CallExpr, jsonImports map[string]bool, jsonDotImport bool) bool {
+	if call == nil {
+		return false
+	}
+	switch fun := unparenExpr(call.Fun).(type) {
+	case *ast.SelectorExpr:
+		pkg, ok := unparenExpr(fun.X).(*ast.Ident)
+		return ok && fun.Sel.Name == "NewDecoder" && jsonImports[pkg.Name]
+	case *ast.Ident:
+		return jsonDotImport && fun.Name == "NewDecoder"
+	default:
+		return false
+	}
+}
+
+func identResolvesToJSONNewDecoder(ident *ast.Ident, jsonImports map[string]bool, jsonDotImport bool, seen map[*ast.Object]bool) bool {
+	if ident == nil || ident.Obj == nil {
+		return false
+	}
+	obj := ident.Obj
+	if seen[obj] {
+		return false
+	}
+	seen[obj] = true
+	defer delete(seen, obj)
+
+	switch decl := obj.Decl.(type) {
+	case *ast.AssignStmt:
+		if len(decl.Rhs) != len(decl.Lhs) {
+			return false
+		}
+		for i, lhs := range decl.Lhs {
+			lhsIdent, ok := lhs.(*ast.Ident)
+			if ok && lhsIdent.Obj == obj {
+				return isJSONNewDecoderReceiver(decl.Rhs[i], jsonImports, jsonDotImport, seen)
+			}
+		}
+	case *ast.ValueSpec:
+		if len(decl.Values) != len(decl.Names) {
+			return false
+		}
+		for i, name := range decl.Names {
+			if name.Obj == obj {
+				return isJSONNewDecoderReceiver(decl.Values[i], jsonImports, jsonDotImport, seen)
+			}
+		}
+	}
+	return false
+}
+
+func callReturnsBPFShimTuple(expr ast.Expr, seen map[*ast.Object]bool) bool {
+	call, ok := unparenExpr(expr).(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+
+	switch fun := unparenExpr(call.Fun).(type) {
+	case *ast.FuncLit:
+		return blockReturnsBPFShimTuple(fun.Body, seen)
+	case *ast.Ident:
+		return identReturnsBPFShimTuple(fun, seen)
+	default:
+		return false
+	}
+}
+
+func identReturnsBPFShimTuple(ident *ast.Ident, seen map[*ast.Object]bool) bool {
+	if ident == nil || ident.Obj == nil {
+		return false
+	}
+	obj := ident.Obj
+	if seen[obj] {
+		return false
+	}
+	seen[obj] = true
+	defer delete(seen, obj)
+
+	switch decl := obj.Decl.(type) {
+	case *ast.FuncDecl:
+		return blockReturnsBPFShimTuple(decl.Body, seen)
+	case *ast.AssignStmt:
+		if len(decl.Rhs) != len(decl.Lhs) {
+			return false
+		}
+		for i, lhs := range decl.Lhs {
+			lhsIdent, ok := lhs.(*ast.Ident)
+			if ok && lhsIdent.Obj == obj {
+				return callReturnsBPFShimTuple(decl.Rhs[i], seen)
+			}
+		}
+	case *ast.ValueSpec:
+		if len(decl.Values) != len(decl.Names) {
+			return false
+		}
+		for i, name := range decl.Names {
+			if name.Obj == obj {
+				return callReturnsBPFShimTuple(decl.Values[i], seen)
+			}
+		}
+	}
+	return false
+}
+
+func blockReturnsBPFShimTuple(block *ast.BlockStmt, seen map[*ast.Object]bool) bool {
+	if block == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(block, func(n ast.Node) bool {
+		ret, ok := n.(*ast.ReturnStmt)
+		if !ok {
+			return true
+		}
+		for _, result := range ret.Results {
+			if containsBPFShimReferenceExpr(result, seen) {
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
+func containsBPFShimSelector(expr ast.Expr) bool {
+	return containsExpr(expr, func(e ast.Expr) bool {
+		sel, ok := e.(*ast.SelectorExpr)
+		return ok && sel.Sel.Name == "bpfShim"
+	})
+}
+
+func containsBPFShimReference(expr ast.Expr) bool {
+	return containsBPFShimReferenceExpr(expr, map[*ast.Object]bool{})
+}
+
+func containsBPFShimReferenceExpr(expr ast.Expr, seen map[*ast.Object]bool) bool {
+	if expr == nil {
+		return false
+	}
+	if containsBPFShimSelector(expr) {
+		return true
+	}
+
+	switch e := unparenExpr(expr).(type) {
+	case *ast.Ident:
+		return containsBPFShimFromIdent(e, seen)
+	case *ast.SelectorExpr:
+		return containsBPFShimReferenceExpr(e.X, seen)
+	case *ast.StarExpr:
+		return containsBPFShimReferenceExpr(e.X, seen)
+	case *ast.UnaryExpr:
+		return containsBPFShimReferenceExpr(e.X, seen)
+	case *ast.IndexExpr:
+		return containsBPFShimReferenceExpr(e.X, seen) || containsBPFShimReferenceExpr(e.Index, seen)
+	case *ast.IndexListExpr:
+		if containsBPFShimReferenceExpr(e.X, seen) {
+			return true
+		}
+		for _, idx := range e.Indices {
+			if containsBPFShimReferenceExpr(idx, seen) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func containsBPFShimFromIdent(ident *ast.Ident, seen map[*ast.Object]bool) bool {
+	if ident == nil || ident.Obj == nil {
+		return false
+	}
+	obj := ident.Obj
+	if seen[obj] {
+		return false
+	}
+	seen[obj] = true
+	defer delete(seen, obj)
+
+	switch decl := obj.Decl.(type) {
+	case *ast.AssignStmt:
+		if len(decl.Rhs) != len(decl.Lhs) {
+			return false
+		}
+		for i, lhs := range decl.Lhs {
+			lhsIdent, ok := lhs.(*ast.Ident)
+			if ok && lhsIdent.Obj == obj {
+				return containsBPFShimReferenceExpr(decl.Rhs[i], seen)
+			}
+		}
+	case *ast.ValueSpec:
+		if len(decl.Values) != len(decl.Names) {
+			return false
+		}
+		for i, name := range decl.Names {
+			if name.Obj == obj {
+				return containsBPFShimReferenceExpr(decl.Values[i], seen)
+			}
+		}
+	}
+
+	return false
+}
+
+func swapXDPEntryProgSelectorViolation(sel *ast.SelectorExpr, parents map[ast.Node]ast.Node, fset *token.FileSet, rel string) string {
+	if call, methodExpr, ok := enclosingDirectSwapXDPEntryProgCall(sel, parents); ok {
+		argIndex := 0
+		if methodExpr {
+			argIndex = 1
+		}
+		var got string
+		if len(call.Args) > argIndex {
+			got = canaryExprString(call.Args[argIndex])
+		}
+		pos := fset.Position(call.Pos())
+		return fmt.Sprintf("%s:%d calls SwapXDPEntryProg with %q", rel, pos.Line, got)
+	}
+
+	pos := fset.Position(sel.Pos())
+	return fmt.Sprintf("%s:%d %s", rel, pos.Line, swapXDPEntryProgMethodValueContext(sel, parents))
+}
+
+func enclosingDirectSwapXDPEntryProgCall(sel *ast.SelectorExpr, parents map[ast.Node]ast.Node) (*ast.CallExpr, bool, bool) {
+	var expr ast.Node = sel
+	for {
+		parent := parents[expr]
+		if paren, ok := parent.(*ast.ParenExpr); ok && paren.X == expr {
+			expr = paren
+			continue
+		}
+		call, ok := parent.(*ast.CallExpr)
+		if !ok || call.Fun != expr {
+			return nil, false, false
+		}
+		return call, isSwapXDPEntryProgMethodExpression(sel), true
+	}
+}
+
+func isSwapXDPEntryProgMethodExpression(sel *ast.SelectorExpr) bool {
+	_, ok := unparenExpr(sel.X).(*ast.StarExpr)
+	return ok
+}
+
+func swapXDPEntryProgMethodValueContext(sel *ast.SelectorExpr, parents map[ast.Node]ast.Node) string {
+	if selectorInsideCallFun(sel, parents) {
+		return "calls through SwapXDPEntryProg method value"
+	}
+
+	for child := ast.Node(sel); child != nil; {
+		parent := parents[child]
+		switch node := parent.(type) {
+		case *ast.AssignStmt:
+			if exprListContainsNode(node.Rhs, child) {
+				return "captures SwapXDPEntryProg method value"
+			}
+		case *ast.ValueSpec:
+			if exprListContainsNode(node.Values, child) {
+				return "stores SwapXDPEntryProg method value"
+			}
+		case *ast.ReturnStmt:
+			if exprListContainsNode(node.Results, child) {
+				return "returns SwapXDPEntryProg method value"
+			}
+		case *ast.CallExpr:
+			if exprListContainsNode(node.Args, child) {
+				return "passes SwapXDPEntryProg method value"
+			}
+		case *ast.SendStmt:
+			if node.Value == child {
+				return "sends SwapXDPEntryProg method value"
+			}
+		case *ast.RangeStmt:
+			if node.X == child {
+				return "ranges over SwapXDPEntryProg method value"
+			}
+		case *ast.SwitchStmt:
+			if node.Tag == child {
+				return "switches on SwapXDPEntryProg method value"
+			}
+		}
+		child = parent
+	}
+	return "uses SwapXDPEntryProg method value"
+}
+
+func selectorInsideCallFun(sel *ast.SelectorExpr, parents map[ast.Node]ast.Node) bool {
+	for child := ast.Node(sel); child != nil; {
+		parent := parents[child]
+		if call, ok := parent.(*ast.CallExpr); ok && call.Fun == child {
+			return true
+		}
+		child = parent
+	}
+	return false
+}
+
+func exprListContainsNode(exprs []ast.Expr, node ast.Node) bool {
+	for _, expr := range exprs {
+		if expr == node {
+			return true
+		}
+	}
+	return false
+}
+
+func unparenExpr(expr ast.Expr) ast.Expr {
+	for {
+		paren, ok := expr.(*ast.ParenExpr)
+		if !ok {
+			return expr
+		}
+		expr = paren.X
+	}
+}
+
+func containsExpr(expr ast.Expr, match func(ast.Expr) bool) bool {
+	if expr == nil {
+		return false
+	}
+	var found bool
+	ast.Inspect(expr, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		expr, ok := n.(ast.Expr)
+		if !ok {
+			return true
+		}
+		if match(expr) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func operatorRuntimeBoundaryRoots(t *testing.T) []string {
@@ -673,6 +2147,8 @@ func canaryExprString(expr ast.Expr) string {
 		return canaryExprString(e.X) + "." + e.Sel.Name
 	case *ast.StarExpr:
 		return "*" + canaryExprString(e.X)
+	case *ast.BasicLit:
+		return e.Value
 	default:
 		return ""
 	}

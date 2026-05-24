@@ -150,7 +150,7 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["snat_egress_ips"] = mainObjs.SnatEgressIps
 
 	// Store main program.
-	m.programs["xdp_main_prog"] = mainObjs.XdpMainProg
+	m.programs[defaultXDPEntryProg] = mainObjs.XdpMainProg
 
 	// Build map replacements so tail call programs share the same maps.
 	replaceOpts := &ebpf.CollectionOptions{
@@ -255,9 +255,9 @@ func (m *Manager) loadAllObjects() error {
 	if err != nil {
 		return fmt.Errorf("load Rust xdp_userspace collection: %w", err)
 	}
-	userspaceProg, ok := userspaceCollection.Programs["xdp_userspace_prog"]
+	userspaceProg, ok := userspaceCollection.Programs[userspaceShimEntryProg]
 	if !ok {
-		return fmt.Errorf("Rust xdp_userspace_prog not found")
+		return fmt.Errorf("Rust %s not found", userspaceShimEntryProg)
 	}
 	userspaceCtrl, ok := userspaceCollection.Maps["userspace_ctrl"]
 	if !ok {
@@ -304,7 +304,7 @@ func (m *Manager) loadAllObjects() error {
 			return err
 		}
 	}
-	m.programs["xdp_userspace_prog"] = userspaceProg
+	m.programs[userspaceShimEntryProg] = userspaceProg
 	// Register all userspace maps from the Rust XDP collection.
 	for name, umap := range userspaceCollection.Maps {
 		m.maps[name] = umap

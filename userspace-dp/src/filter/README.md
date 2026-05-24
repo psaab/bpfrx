@@ -109,5 +109,5 @@ Remaining limitations:
   fail-closed until downstream loss-priority behavior is wired. Color-aware
   mode also stays fail-closed until inherited packet color is carried through
   trusted metadata.
-- Traffic-level integration, failover, and performance evidence still need to
-  be collected before treating #1375 as fully retired.
+- Traffic-level integration, failover, and performance evidence remain
+  production-hardening follow-ups for #1375, not active feature-gap blockers.

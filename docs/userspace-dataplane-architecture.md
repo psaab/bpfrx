@@ -384,9 +384,10 @@ ConfigSnapshot {
 
 #### Capability Check
 
-The manager evaluates the active config to determine if the userspace
-dataplane can handle it. Unsupported features cause automatic fallback
-to the legacy kernel BPF pipeline:
+The manager evaluates the active config to determine whether the userspace
+dataplane can handle it. Unsupported userspace features fail closed or disarm
+helper forwarding; userspace runtime traffic must not silently fall back into
+the legacy kernel BPF pipeline.
 
 The current supported/gated split is maintained in
 [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md). In broad terms,
@@ -395,18 +396,15 @@ matching, interface-mode SNAT, DNAT, static NAT, NAT64, NPTv6, firewall
 filters, flow export, TCP MSS clamping, configurable timeouts, VLAN handling,
 route/neighbor lookup, and HA/session-delta ingestion.
 
-Remaining explicit gates include three-color policers, dataplane event parity,
-and the residual #1377 SNAT pool contract for helper-restart persistence and
-mixed-backend rollback constraints.
-SYN-cookie-dependent screen behavior is admitted in userspace; #1374 still
-needs live HA/flood evidence before BPF source removal. Port mirroring is no
-longer a
-`deriveUserspaceCapabilities()` gate; its remaining #1376 work is operator
-evidence for mirror fidelity and primary-forwarding survival under mirror
-pressure before BPF source removal. HA persistent-SNAT configs remain gated
-with the status reason `userspace persistent-nat source pool leases are not
-HA-synchronized`; non-HA per-pool persistent-NAT lease reuse is helper-local
-userspace state.
+The original #1374-#1381 userspace feature-gap blockers are closed. Remaining
+eBPF retirement work is source-removal plumbing rather than feature admission:
+#1451 is migrating the remaining operator/runtime surfaces off the legacy
+`dataplane.DataPlane` bridge, #1473 keeps the retained XDP shim separate from
+legacy fallback behavior, #1493 documents the userspace-only loader split,
+#1476 owns the final source/generated-artifact deletion, and #1477 owns live
+evidence for the exact deletion candidate.
+SYN-cookie, port-mirroring, dataplane-event, and CoS/fairness live artifacts
+belong in #1477 if the final source-removal candidate requires them.
 
 Policy scheduler state is no longer a propagation gap: #1396 carries scheduler
 state into the userspace snapshot and Rust policy evaluator, and the 2026-05-19
@@ -582,29 +580,30 @@ system {
 This section is a high-level architecture note. The authoritative current gate
 is [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
 
-**Still explicitly gated or incomplete for eBPF retirement:**
+**Still explicitly tracked for eBPF retirement:**
 - Source NAT pool mode: userspace-v1 deterministic pool selection and
   fail-closed runtime handling for missing pools, empty pools, invalid pool
   inputs, wrong-family-only pools, and allocator failures have landed.
   Helper-local non-HA per-pool `persistent-nat` lease reuse and pool
   allocation/exhaustion counters have landed. #1449 closes HA behavior as an
   explicit userspace capability gate because persistent leases are not
-  synchronized. #1377 is still required for helper-restart persistence and the
-  mixed-backend rollback test boundary.
+  synchronized. Helper-restart reset and mixed-backend selector parity are
+  documented contracts, not active #1377 blockers.
 - SYN-cookie flood protection closeout: bounded SYN-ACK/RST TX,
   root-auth-derived snapshot key publication, fail-closed missing-secret
-  behavior, status counters, and gate removal are wired. #1374 still owns the
-  live HA/flood artifact set before BPF source removal.
+  behavior, status counters, and gate removal are wired. Any final live
+  HA/flood artifact belongs with #1477 on the source-removal candidate.
 - RFC 2697/2698 three-color policer closeout: #1375 now preserves
-  token/counter state across compatible in-process snapshot refreshes. It still
-  owns the sharded/packed state decision, HA/restart continuity decision,
-  non-drop color actions, and integration/perf evidence beyond the admitted
-  color-blind `then discard` slice.
+  token/counter state across compatible in-process snapshot refreshes and
+  admits the reviewed color-blind `then discard` runtime slice. Sharded/packed
+  state, HA/restart continuity, non-drop color actions, and broader perf
+  evidence are production follow-ups, not active feature-gap blockers.
 - Port mirroring closeout: #1376 now has bounded userspace runtime admission,
-  but still owns mirror-fidelity evidence and forwarding survival under mirror
-  pressure before BPF source removal.
-- Dataplane event closeout: #1379 still owns end-to-end syslog evidence,
-  broader non-PBR filter-log call sites, and richer identity mapping.
+  with final mirror-fidelity or pressure-survival artifacts belonging in #1477
+  if the source-removal candidate needs them.
+- Dataplane event closeout: #1379 is closed for policy-deny, screen-drop, and
+  filter-log emission. Final live syslog proof, if required, belongs with
+  #1477.
 - `show system buffers` BPF-map display retirement: #1380 is closed for the
   current helper schema. Userspace mode uses helper status, preserves the
   active-session footer, renders session/flow utilization from Rust-owned

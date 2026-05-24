@@ -380,7 +380,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			"lastXSKRX", m.lastXSKRX,
 			"neighborsPrewarmed", m.neighborsPrewarmed,
 			"xskLivenessFailed", m.xskLivenessFailed,
-			"xdpEntryProg", m.bpfShim.XDPEntryProg)
+			"xdpEntryProg", m.bpfShim.XDPEntryProgram())
 		if m.xskLivenessFailed {
 			// XSK proven broken: ctrl stays disabled. The shim only passes
 			// proven local/control packets and drops transit.
@@ -388,23 +388,23 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		} else if probeBindingsReady && neighborSyncReady {
 			ctrl.Enabled = 1
 			if m.xskLivenessProven {
-				if m.bpfShim.XDPEntryProg != userspaceXDPEntryProg {
-					if err := m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg); err != nil {
+				if !m.bpfShim.UsingUserspaceXDPShimEntryProgram() {
+					if err := m.bpfShim.SwapToUserspaceXDPShimEntryProgram(); err != nil {
 						slog.Warn("userspace: failed to restore XDP shim after liveness success", "err", err)
 					}
 				}
 			} else if xskReceiveLive {
 				m.xskLivenessProven = true
 				m.xskProbeStart = time.Time{}
-				if m.bpfShim.XDPEntryProg != userspaceXDPEntryProg {
-					if err := m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg); err != nil {
+				if !m.bpfShim.UsingUserspaceXDPShimEntryProgram() {
+					if err := m.bpfShim.SwapToUserspaceXDPShimEntryProgram(); err != nil {
 						slog.Warn("userspace: failed to swap XDP shim after XSK RX became live", "err", err)
 					}
 				}
 				slog.Info("userspace: XSK liveness proven")
 			} else {
-				if m.bpfShim.XDPEntryProg != userspaceXDPEntryProg {
-					if err := m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg); err != nil {
+				if !m.bpfShim.UsingUserspaceXDPShimEntryProgram() {
+					if err := m.bpfShim.SwapToUserspaceXDPShimEntryProgram(); err != nil {
 						slog.Warn("userspace: failed to activate XDP shim for XSK liveness probe", "err", err)
 					}
 				}
@@ -415,8 +415,8 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 					if m.shouldAutoProveIdleStandbyXSKLocked(currentRX, allBindingsBound) {
 						m.xskLivenessProven = true
 						m.xskProbeStart = time.Time{}
-						if m.bpfShim.XDPEntryProg != userspaceXDPEntryProg {
-							if err := m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg); err != nil {
+						if !m.bpfShim.UsingUserspaceXDPShimEntryProgram() {
+							if err := m.bpfShim.SwapToUserspaceXDPShimEntryProgram(); err != nil {
 								slog.Warn("userspace: failed to restore XDP shim after idle standby liveness success", "err", err)
 							}
 						}
@@ -438,8 +438,8 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 						slog.Error("userspace: XSK liveness probe failed in strict mode; dataplane degraded fail-closed")
 					} else {
 						slog.Warn("userspace: XSK liveness probe failed; keeping shim disabled with transit fail-closed")
-						if m.bpfShim.XDPEntryProg != userspaceXDPEntryProg {
-							if err := m.bpfShim.SwapXDPEntryProg(userspaceXDPEntryProg); err != nil {
+						if !m.bpfShim.UsingUserspaceXDPShimEntryProgram() {
+							if err := m.bpfShim.SwapToUserspaceXDPShimEntryProgram(); err != nil {
 								slog.Warn("userspace: failed to restore XDP shim after XSK liveness failure", "err", err)
 							}
 						}
@@ -754,14 +754,14 @@ func (m *Manager) readFallbackStatsLocked() map[string]uint64 {
 
 // entryProgramsLocked returns a map of ifindex -> attached XDP program name
 // by inspecting the bpfShim dataplane manager's link state.
-// Note: VLAN sub-interfaces are skipped during SwapXDPEntryProg and may
+// Note: VLAN sub-interfaces are skipped during userspace-shim swaps and may
 // retain the parent's program; they are excluded from this map.
 func (m *Manager) entryProgramsLocked() map[int]string {
 	links := m.bpfShim.XDPLinks()
 	if len(links) == 0 {
 		return nil
 	}
-	progName := m.bpfShim.XDPEntryProg
+	progName := m.bpfShim.XDPEntryProgram()
 	result := make(map[int]string, len(links))
 	for ifindex := range links {
 		if m.bpfShim.VlanSubInterfaces[ifindex] {

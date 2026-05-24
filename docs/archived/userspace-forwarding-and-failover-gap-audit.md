@@ -72,7 +72,7 @@ The userspace manager still chooses between `xdp_userspace_prog` and
 `xdp_main_prog`:
 
 - `pkg/dataplane/userspace/manager.go:Compile()`
-- `pkg/dataplane/loader.go:SwapXDPEntryProg()`
+- `pkg/dataplane/loader.go` userspace-shim swap path
 
 Current behavior:
 

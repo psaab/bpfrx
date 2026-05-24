@@ -2,6 +2,22 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T15:14:30Z
+  - **Action**: PR #1494 round-11 follow-up — collapsed the retained
+    userspace XDP shim entry-program name onto one dataplane constant and
+    routed both full-loader and shim-loader registrations through it. This
+    removes the duplicate `xdp_userspace_prog` constants that reviewers
+    flagged as a drift risk.
+  - **File(s)**: `pkg/dataplane/loader.go`,
+    `pkg/dataplane/loader_ebpf.go`,
+    `pkg/dataplane/retirement_boundary_canary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane -run
+    'TestBPFShimEntryProgramStateIsNotJSONMutable|TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram|TestUserspaceXDPEntryProgramConstantNamesRetainedShim'`;
+    `go test ./pkg/dataplane/userspace -run
+    'TestUserspaceShimLoaderDoesNotReferenceLegacyObjects|TestUserspaceStartupUsesShimLoaderBoundary'`;
+    `go test ./pkg/dataplane ./pkg/dataplane/userspace`;
+    `git diff --check`
+
 - **Timestamp**: 2026-05-24T04:08:49Z
   - **Action**: PR #1497 round-3 follow-up — fixed the checker/schema
     parity nits from review: boolean `schema_version` rejection, JSON
@@ -39,6 +55,47 @@
 
 ## 2026-05-23
 
+- **Timestamp**: 2026-05-23T17:01:19Z
+  - **Action**: PR #1494 round-9 follow-up — encapsulated the retained shim
+    entry-program state by unexporting `XDPEntryProg`, removed the arbitrary
+    `SwapXDPEntryProg(name)` production surface, and added narrow userspace-shim
+    selection/swap methods plus a JSON-mutability canary. Updated userspace
+    call sites and docs to describe the structural boundary instead of relying
+    on decoder-shape blocklists.
+  - **File(s)**: `pkg/dataplane/loader.go`,
+    `pkg/dataplane/retirement_boundary_canary_test.go`,
+    `pkg/dataplane/userspace/manager.go`,
+    `pkg/dataplane/userspace/maps_sync.go`,
+    `docs/pr/1373-retire-ebpf-dataplane/README.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane -run
+    'TestBPFShimEntryProgramStateIsNotJSONMutable|TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram|TestUserspaceEntryProgramCanaryRejectsBypassFixtures|TestUserspaceEntryProgramCanaryAllowsCrossFileConstantFixture|TestUserspaceXDPEntryProgramConstantNamesRetainedShim'
+    -count=1 -v`; `go test ./pkg/dataplane ./pkg/dataplane/userspace
+    -count=1`; `go test ./pkg/dataplane/... -count=1`; `go test ./...
+    -count=1`; `git diff --check`
+
+- **Timestamp**: 2026-05-23T15:58:00Z
+  - **Action**: PR #1494 round-8 follow-up — hardened JSON decoder canary
+    laundering checks for stored decoder receivers, function-variable
+    `Unmarshal` callees, tuple-return spread into `Unmarshal`, and default
+    import-name resolution for versioned import paths (e.g. `encoding/json/v2`);
+    added dedicated fixtures for each bypass shape.
+  - **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane -run
+    'TestUserspaceEntryProgramCanaryRejectsBypassFixtures|TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram|TestUserspaceEntryProgramCanaryAllowsCrossFileConstantFixture'
+    -count=1 -v`; `go test ./pkg/dataplane ./pkg/dataplane/userspace -count=1`;
+    `git diff --check`
+
+- **Timestamp**: 2026-05-23T09:52:00Z
+  - **Action**: PR #1494 r7 copilot re-review follow-up — hardened
+    `encoding/json` canary detection to catch decode targets laundered through
+    local aliases of `bpfShim`, and added fixture coverage for unmarshal/decode
+    alias bypass shapes.
+  - **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane -run
+    'TestUserspaceEntryProgramCanaryRejectsBypassFixtures|TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram|TestUserspaceEntryProgramCanaryAllowsCrossFileConstantFixture'
+    -count=1 -v`; `go test ./pkg/dataplane ./pkg/dataplane/userspace -count=1`;
+    `git diff --check`
+
 - **Timestamp**: 2026-05-23T09:31:43Z
   - **Action**: PR #1493 r2 copilot follow-up — restored `"impact"` slog key
     on native-XDP fallback warning in `attachUserspaceShimXDP` so operator
@@ -46,6 +103,33 @@
   - **File(s)**: `pkg/dataplane/loader.go`, `_Log.md`
   - **Validation**: `go build ./pkg/dataplane/...`;
     `go test ./pkg/dataplane/... -count=1`
+
+- **Timestamp**: 2026-05-23T06:12:00Z
+  - **Action**: PR #1494 r7 copilot re-review follow-up — hardened the
+    retirement-boundary canary to catch `encoding/json` decode mutations via
+    dot-import `Unmarshal` and `NewDecoder(...).Decode` paths, including
+    `encoding/json/v2`, and added fixture coverage for each bypass shape.
+  - **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane -run
+    'TestUserspaceEntryProgramCanaryRejectsBypassFixtures|TestUserspaceManagerSelectsOnlyUserspaceXDPEntryProgram'
+    -count=1`; `go test ./pkg/dataplane ./pkg/dataplane/userspace -count=1`;
+    `git diff --check`
+
+- **Timestamp**: 2026-05-23T04:58:00Z
+  - **Action**: PR #1494 copilot round-5 follow-up — hardened the canary
+    walker to treat wrapped SwapXDPEntryProg callees as direct calls and added
+    bypass fixtures for parenthesized/method-expression/slice-indexed calls.
+  - **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane ./pkg/dataplane/userspace`;
+    `git diff --check`
+
+- **Timestamp**: 2026-05-23T03:45:00Z
+  - **Action**: PR #1494 copilot re-review hardening — made the userspace
+    entry-program canary reject shadowed local identifiers so only the package
+    constant `userspaceXDPEntryProg` can satisfy XDP entry assignments/calls.
+  - **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane ./pkg/dataplane/userspace`;
+    `git diff --check`
 
 ## 2026-05-22
 
