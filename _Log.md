@@ -1148,3 +1148,16 @@
     test/incus/retire_ebpf_artifact_schema_test.py`; `python3 -m json.tool
     docs/pr/1373-retire-ebpf-dataplane/final-validation/manifest.schema.json
     >/dev/null`; `git diff --check`
+
+- **Timestamp**: 2026-05-24T11:01:44-07:00
+  - **Action**: PR #1506 review follow-up: reject Python JSON parser
+    extensions (`NaN`, `Infinity`, and `-Infinity`) through the existing
+    invalid-JSON validation path, and cap Decimal integer materialization so
+    hostile exponent-form manifest integers cannot force huge `int`
+    allocation.
+  - **File(s)**: `test/incus/retire_ebpf_artifact_schema.py`,
+    `test/incus/retire_ebpf_artifact_schema_test.py`, `_Log.md`
+  - **Validation**: `python3 -m unittest discover -s test/incus -p
+    retire_ebpf_artifact_schema_test.py`; `python3 -m py_compile
+    test/incus/retire_ebpf_artifact_schema.py
+    test/incus/retire_ebpf_artifact_schema_test.py`; `git diff --check`

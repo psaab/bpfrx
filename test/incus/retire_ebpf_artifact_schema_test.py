@@ -596,6 +596,23 @@ class RetireEbpfArtifactSchemaTests(unittest.TestCase):
             with self.assertRaisesRegex(schema.ValidationFailure, "invalid JSON"):
                 schema.validate_artifact_root(root, candidate_commit=COMMIT)
 
+    def test_rejects_non_rfc_json_constants_without_traceback(self) -> None:
+        for token in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(token=token):
+                tmp, root = self.with_fixture()
+                with tmp:
+                    write_text(
+                        root,
+                        "fallback-exclusion/fw0-userspace-dp.json",
+                        f'{{"value": {token}}}\n',
+                    )
+                    with self.assertRaisesRegex(
+                        schema.ValidationFailure,
+                        "invalid JSON artifact fallback-exclusion/fw0-userspace-dp.json: "
+                        f"non-RFC 8259 JSON constant: {token}",
+                    ):
+                        schema.validate_artifact_root(root, candidate_commit=COMMIT)
+
     def test_rejects_non_utf8_json_artifact_without_traceback(self) -> None:
         tmp, root = self.with_fixture()
         with tmp:
@@ -616,6 +633,22 @@ class RetireEbpfArtifactSchemaTests(unittest.TestCase):
                 text.replace(needle, '"schema_version":1e999999999999999999999'),
             )
             with self.assertRaisesRegex(schema.ValidationFailure, "invalid JSON"):
+                schema.validate_artifact_root(root, candidate_commit=COMMIT)
+
+    def test_rejects_huge_decimal_integer_without_materializing(self) -> None:
+        tmp, root = self.with_fixture()
+        with tmp:
+            text = make_manifest_json()
+            needle = '"exit_status":0'
+            self.assertIn(needle, text)
+            write_text(
+                root,
+                "manifest.json",
+                text.replace(needle, '"exit_status":1e999999999999999999', 1),
+            )
+            with self.assertRaisesRegex(
+                schema.ValidationFailure, "commands\\[0\\].exit_status"
+            ):
                 schema.validate_artifact_root(root, candidate_commit=COMMIT)
 
 

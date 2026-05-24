@@ -25,6 +25,8 @@ DATE_TIME_RE = re.compile(
     r"[Tt](?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
     r"(?P<fraction>\.\d+)?(?P<zone>[Zz]|[+-]\d{2}:\d{2})$"
 )
+# Manifest integer fields are small; cap Decimal-to-int conversion defensively.
+MAX_JSON_INTEGER_DIGITS = 128
 
 COS_OFF_CASES = ("v4-push", "v4-reverse", "v6-push", "v6-reverse")
 SCREEN_PROBES = ("land", "syn", "icmp", "udp")
@@ -127,6 +129,10 @@ class ValidationFailure(Exception):
 
 def _display(path: Path) -> str:
     return path.as_posix()
+
+
+def _reject_json_constant(token: str) -> None:
+    raise ValueError(f"non-RFC 8259 JSON constant: {token}")
 
 
 class ArtifactChecker:
@@ -374,6 +380,10 @@ class ArtifactChecker:
         if isinstance(value, int):
             return value
         if isinstance(value, Decimal):
+            if not value.is_finite():
+                return None
+            if not value.is_zero() and value.adjusted() + 1 > MAX_JSON_INTEGER_DIGITS:
+                return None
             try:
                 integral = value.to_integral_value()
             except InvalidOperation:
@@ -600,7 +610,11 @@ class ArtifactChecker:
         if not path.exists() or not path.is_file():
             return None
         try:
-            return json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
+            return json.loads(
+                path.read_text(encoding="utf-8"),
+                parse_float=Decimal,
+                parse_constant=_reject_json_constant,
+            )
         except UnicodeDecodeError as exc:
             self.error(f"invalid UTF-8 JSON artifact {rel}: {exc}")
             return None
