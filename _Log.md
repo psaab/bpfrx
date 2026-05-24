@@ -18,6 +18,16 @@
     `go test ./pkg/dataplane ./pkg/dataplane/userspace`;
     `git diff --check`
 
+- **Timestamp**: 2026-05-24T06:06:58Z
+  - **Action**: PR #1505 review follow-up — changed the SYN-cookie
+    `docs/feature-gaps.md` row to point at final #1477 source-removal
+    evidence for the exact deletion candidate instead of saying the
+    feature itself still has pre-removal live evidence outstanding.
+  - **File(s)**: `docs/feature-gaps.md`, `_Log.md`
+  - **Validation**: `rg -n "#1375|#1378|SYN-cookie|source-removal"
+    docs/feature-gaps.md docs/pr/1373-retire-ebpf-dataplane/README.md
+    docs/pr/1373-retire-ebpf-dataplane/plan.md`; `git diff --check`
+
 - **Timestamp**: 2026-05-24T04:08:49Z
   - **Action**: PR #1497 round-3 follow-up — fixed the checker/schema
     parity nits from review: boolean `schema_version` rejection, JSON
