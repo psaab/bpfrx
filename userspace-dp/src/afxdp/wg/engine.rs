@@ -107,6 +107,15 @@ pub(crate) enum DecapError {
     AllowedIpsViolation,
     /// Output buffer too small for plaintext.
     BufferTooSmall,
+    /// Record's ciphertext field is shorter than the Poly1305 tag
+    /// length. Snow's AEAD decrypt has no short-tag guard internally;
+    /// passing a sub-tag ciphertext underflows `ciphertext.len() -
+    /// TAGLEN` and panics on the subsequent slice op (release build)
+    /// or directly via `usize` underflow assert (debug). Reject the
+    /// record before invoking snow so a hostile peer cannot crash the
+    /// AF_XDP worker by sending 16..31-byte UDP datagrams with a
+    /// valid `receiver_index`.
+    ShortRecord,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -606,7 +615,24 @@ impl WgEngine {
             .get(&hdr.receiver_index)
             .cloned()
             .ok_or(DecapError::UnknownSession)?;
-        let plaintext_len_max = hdr.ciphertext.len().saturating_sub(POLY1305_TAG_LEN);
+        // Truncated-record DoS guard. `parse_data_header` only checks
+        // that the buffer has at least WG_DATA_HEADER_LEN (16) bytes;
+        // it does not enforce that the trailing ciphertext field is
+        // at least one Poly1305 tag wide. Snow 0.10's ChaCha-Poly1305
+        // decrypt computes `ciphertext.len() - TAGLEN` with no short-
+        // tag guard — for `ciphertext.len() < POLY1305_TAG_LEN` this
+        // wraps to a huge usize and panics on the subsequent slice op
+        // (or underflows directly in debug builds). A hostile peer
+        // with a known live `receiver_index` could crash the AF_XDP
+        // worker by sending 16..31-byte UDP datagrams; remote
+        // dataplane DoS. Reject sub-tag records here, before any of
+        // the replay-window / snow code runs. Caught by Codex on the
+        // r-final-2 review (the truncated-record class was missed by
+        // all 9 prior review rounds).
+        if hdr.ciphertext.len() < POLY1305_TAG_LEN {
+            return Err(DecapError::ShortRecord);
+        }
+        let plaintext_len_max = hdr.ciphertext.len() - POLY1305_TAG_LEN;
         if out.len() < plaintext_len_max {
             return Err(DecapError::BufferTooSmall);
         }

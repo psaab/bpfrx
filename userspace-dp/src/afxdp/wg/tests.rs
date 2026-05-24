@@ -1191,3 +1191,77 @@ fn allowed_ips_unit_check() {
     assert_eq!(t.lookup(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))), Some(0));
     assert_eq!(t.lookup(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 200))), Some(1));
 }
+
+/// Regression test for the truncated-record remote DoS that Codex
+/// caught on the r-final-2 review (all 9 prior review rounds missed
+/// it). A hostile peer that observes a valid `receiver_index` for a
+/// live session can send 16..31-byte UDP datagrams; `parse_data_header`
+/// accepts any record ≥ 16 bytes, leaving a sub-Poly1305-tag
+/// ciphertext that snow 0.10's ChaCha-Poly1305 decrypt cannot handle
+/// safely (the internal `ciphertext.len() - TAGLEN` either underflows
+/// to a debug-assert or wraps to a huge usize that panics on the
+/// subsequent slice op). The fix: reject sub-tag records with
+/// `DecapError::ShortRecord` before invoking snow.
+///
+/// This test installs a live session, then walks `ciphertext.len()`
+/// across {0, 1, 8, 14, 15} and asserts the engine returns the new
+/// error variant rather than panicking. The assertion is on the
+/// returned error — if the bug regressed, the test would panic
+/// instead of failing with a wrong-error.
+#[test]
+fn try_decap_rejects_sub_poly1305_tag_records_without_panicking() {
+    use super::framing::encode_data_header;
+
+    let (init_engine, resp_engine, _init_pub, resp_pub) = established_pair(
+        vec!["10.0.1.0/24".parse().unwrap()],
+        vec!["10.0.0.0/24".parse().unwrap()],
+    );
+
+    // Encrypt one real packet through the engine to learn what
+    // `receiver_index` the responder demuxes on. We extract that
+    // index from the encrypted record so the hostile-attacker probe
+    // uses a live session's index.
+    let inner = ipv4_packet(Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 1, 5));
+    let mut wire = [0u8; 2048];
+    let enc = init_engine
+        .try_encap(&resp_pub, &inner, &mut wire)
+        .expect("baseline encap should succeed");
+    let receiver_index = enc.receiver_index;
+
+    // Walk ciphertext lengths from 0 through 15 (i.e. record lengths
+    // 16..31). Every one of these must return ShortRecord, NOT panic.
+    for ct_len in [0usize, 1, 8, 14, 15] {
+        let mut probe = vec![0u8; super::WG_DATA_HEADER_LEN + ct_len];
+        encode_data_header(&mut probe, receiver_index, 0xdead_beef).unwrap();
+        // The header counter we used (0xdeadbeef) is well below
+        // REJECT_AFTER_MESSAGES — so the rejection MUST come from the
+        // short-record guard, not from the counter-ceiling guard or
+        // from a panic inside snow.
+        let mut plain = [0u8; 2048];
+        let err = resp_engine.try_decap(&probe, &mut plain).unwrap_err();
+        assert_eq!(
+            err,
+            DecapError::ShortRecord,
+            "record with ciphertext.len()={ct_len} must reject as ShortRecord; \
+             got {err:?}. If this test panics instead of asserting, the \
+             truncated-record DoS has regressed and snow is being handed \
+             a sub-tag ciphertext."
+        );
+    }
+
+    // Boundary case: ciphertext.len() == POLY1305_TAG_LEN (16) is no
+    // longer ShortRecord — it's an empty-payload record. Snow will
+    // reject it for failing the AEAD tag (we haven't crafted a real
+    // tag), which surfaces as CryptoFailed. Important contract: the
+    // short-record guard's cutoff is `< POLY1305_TAG_LEN`, not `<=`.
+    let mut sixteen_byte_ct = vec![0u8; super::WG_DATA_HEADER_LEN + super::POLY1305_TAG_LEN];
+    encode_data_header(&mut sixteen_byte_ct, receiver_index, 0xdead_beef).unwrap();
+    let mut plain = [0u8; 2048];
+    let err = resp_engine.try_decap(&sixteen_byte_ct, &mut plain).unwrap_err();
+    assert_ne!(
+        err,
+        DecapError::ShortRecord,
+        "a ciphertext.len() == POLY1305_TAG_LEN record is NOT short — must \
+         reach snow and reject as CryptoFailed (or similar) instead"
+    );
+}
