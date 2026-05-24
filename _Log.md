@@ -2,6 +2,36 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-25T00:30:00Z
+  - **Action**: PR #1499 r-final-6 fix — rebased onto current
+    `origin/master` after PR #1511 merged. Resolved chronological
+    `_Log.md` conflicts across two rebased PR commits (`d379c9d9`
+    r-final-3 and `95fc992f` r-final-4) by interleaving the new
+    `pkg/logging/binary_test.go` PR #1451 review-follow-up entries
+    from master with the existing PR #1499 entries. All other
+    commits replayed cleanly with no code conflicts. Mechanical
+    plan.md citation sweep on the rebased tree produced two residual
+    minor citation drifts (the same two Copilot flagged as non-
+    blocking on `183bc394`): (1)
+    `pkg/dataplane/userspace/protocol.go:250` cited
+    `afxdp/wg/engine.rs:271` for the `sessions_by_local_index`
+    field — actual field declaration is at line 275 (line 271 is
+    inside the `/// ` doc block that introduces it). Corrected
+    citation to `engine.rs:275`. (2) `docs/pr/wireguard-clean/plan.md`
+    cited `mod.rs:86-91` for "the engine constants" describing both
+    `WG_DATA_HEADER_LEN` and `POLY1305_TAG_LEN`; the cited range
+    only covers the data-header constant. `POLY1305_TAG_LEN` is at
+    line 84. Widened both citations (lines 76 and 444) to
+    `mod.rs:84-91` so the range covers both constants the
+    surrounding prose names. No code changes.
+  - **File(s)**: `pkg/dataplane/userspace/protocol.go`,
+    `docs/pr/wireguard-clean/plan.md`, `_Log.md`
+  - **Validation**: rebase clean after manual `_Log.md` resolution
+    on commits `d379c9d9` + `95fc992f`; `cargo build --release`
+    clean (114 warnings, all pre-existing); `cargo test --release
+    --bin xpf-userspace-dp afxdp::wg` — 78/78 pass; `go test
+    ./pkg/dataplane/...` — 4/4 packages pass.
+
 - **Timestamp**: 2026-05-24T23:30:00Z
   - **Action**: PR #1499 r-final-5 step 4 — final mechanical sweep
     pass. After the previous step's edits shifted lines in

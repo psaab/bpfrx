@@ -73,7 +73,7 @@ to interoperate with kernel WireGuard / wireguard-go. snow has:
 
 WireGuard's transport-data record format is a 16-byte header followed
 by ciphertext || 16-byte Poly1305 tag. The header layout, byte-exact,
-matches the engine constants in `userspace-dp/src/afxdp/wg/mod.rs:86-91`
+matches the engine constants in `userspace-dp/src/afxdp/wg/mod.rs:84-91`
 and `userspace-dp/src/afxdp/wg/framing.rs:32-46`:
 
 | offset | bytes | field          |
@@ -441,7 +441,7 @@ Noise IK sub-message). The engine only:
   bytes via `read_message` / `write_message`, with the WG prologue
   mixed into the transcript hash.
 - Builds and consumes the WG transport-data record on the wire (see
-  `framing.rs:32-46` and `mod.rs:86-91`): 1-byte type=4 + 3-byte
+  `framing.rs:32-46` and `mod.rs:84-91`): 1-byte type=4 + 3-byte
   reserved + 4-byte little-endian `receiver_index` + 8-byte
   little-endian `counter` + ciphertext || 16-byte Poly1305 tag.
   Fixed header = `WG_DATA_HEADER_LEN` (16); fixed AEAD tag =
