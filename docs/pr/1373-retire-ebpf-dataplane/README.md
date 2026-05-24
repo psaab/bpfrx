@@ -194,7 +194,7 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/cluster/sync_bulk.go` | Bulk sync still serializes legacy session entries. |
 | `pkg/cluster/sync_conn.go` | Sync connection code still references legacy session types. |
 | `pkg/cluster/sync_protocol.go` | Wire protocol still carries legacy session records. |
-| `pkg/conntrack/gc.go` | GC compatibility construction still adapts legacy sessions. |
+| `pkg/conntrack/gc.go` | GC still uses root package session-domain types until those move out of `pkg/dataplane`; constructors no longer accept `DataPlane`. |
 | `pkg/daemon/daemon.go` | Daemon owns `RuntimeDataPlane` and exposes `legacyDP()` for unmigrated callers. |
 | `pkg/daemon/daemon_apply.go` | Apply path still adapts legacy compile/apply metadata. |
 | `pkg/daemon/daemon_flow.go` | Flow logging still formats legacy dataplane counters. |
@@ -219,8 +219,9 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 ### Safe-Delete Blockers
 
 - `pkg/dataplane.DataPlane` is still load-bearing for API, gRPC, CLI, status,
-  logging, cluster session sync, conntrack GC, daemon HA, daemon flow, and
-  daemon apply bridges listed above. `pkg/monitoriface` now uses a
+  logging, cluster session sync, daemon HA, daemon flow, and daemon apply
+  bridges listed above. Conntrack GC now enters through `SessionStore` and
+  `Telemetry` runtime-domain providers. `pkg/monitoriface` now uses a
   package-local `RuntimeDataPlane`/`CounterReader` shape; CLI and gRPC adapt
   their wider dataplane fields before entering the monitor-interface package.
 - Omitted `system dataplane-type` now resolves to the userspace runtime path.

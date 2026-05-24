@@ -10,9 +10,10 @@ owns the empty-table change counters.
 ## Entry points
 
 - `GC` — `gc.go`.
-- `NewGC(dp dataplane.DataPlane, interval time.Duration) *GC` — `gc.go`.
-  Compatibility adapter for legacy callers; internally converts the dataplane
-  to `SessionStore`/`Telemetry` domains.
+- `NewGC(provider RuntimeDomainProvider, interval time.Duration) *GC` —
+  `gc.go`. Convenience adapter for callers that expose `Sessions()` and
+  `Telemetry()` runtime domains without accepting the legacy root
+  `dataplane.DataPlane` surface.
 - `NewGCWithDomains(sessions, telemetry, sessionCount, persistent, interval)`
   — `gc.go`. Preferred constructor for callers that already own the split
   runtime interfaces.
@@ -33,9 +34,10 @@ owns the empty-table change counters.
 
 ## Dependencies
 
-`dataplane` runtime-domain interfaces. The compatibility constructor still
-accepts the transitional `dataplane.DataPlane` root interface, but the sweep
-body must not reach through raw BPF session/counter methods directly.
+`dataplane` runtime-domain interfaces and session value types. Constructors no
+longer accept the transitional `dataplane.DataPlane` root interface; callers
+that still own a legacy bridge must adapt it before entering this package. The
+sweep body must not reach through raw BPF session/counter methods directly.
 
 ## Gotchas
 

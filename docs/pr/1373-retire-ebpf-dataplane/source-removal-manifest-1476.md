@@ -176,8 +176,9 @@ show all of the following:
   `loadXpfXdpMain()`, any legacy XDP/TC tail-call loader, or the legacy
   `xdp_main_prog`/`tc_main_prog` program-map bootstrap.
 - #1451 has shrunk the root `dataplane.DataPlane` compatibility surface so API,
-  gRPC, CLI, status, monitor, logging, cluster sync, conntrack GC, and daemon
-  runtime paths do not require the legacy eBPF manager.
+  gRPC, CLI, status, monitor, logging, cluster sync, and daemon runtime paths
+  do not require the legacy eBPF manager. Conntrack GC already enters through
+  runtime-domain session and telemetry providers.
 - DPDK remains confined to its documented backend policy or has its own explicit
   migration result; userspace-only source removal must not delete DPDK-required
   shared definitions by accident.
