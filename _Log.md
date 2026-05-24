@@ -20,6 +20,40 @@
   - **Validation**: `go test ./pkg/logging ./pkg/dataplane -count=1`;
     `git diff --check`
 
+- **Timestamp**: 2026-05-24T20:30:00Z
+  - **Action**: PR #1499 r-final-3 fix — rebased onto current
+    `origin/master` (resolved `_Log.md` conflicts chronologically across
+    four rebased PR commits) and closed the Codex MINOR finding from the
+    r-final-2 synthesis plus three residual plan.md drifts Codex did not
+    catch but a wider sweep surfaced. (1) `docs/pr/wireguard-clean/plan.md`
+    Performance Architecture (hot-path layout) replay-locking bullet:
+    rewrote to describe the as-shipped `std::sync::Mutex<ReplayState>` and
+    the unconditional pre-AEAD precheck-lock + post-AEAD update-lock
+    pattern at `engine.rs:664`/`engine.rs:688`. The earlier "AtomicU64
+    bitmap + counter", "parking_lot::Mutex", and "only on the
+    duplicate/out-of-window arms" wording is now flagged as the stale
+    pre-implementation sketch. (2) `Replay window` subsection: same
+    correction — replaced the `(highest: AtomicU64, bitmap: AtomicU64)`
+    description with `std::sync::Mutex<ReplayState>` and made the two
+    decap locks explicit. (3) `Engine keying` ingress demux: was
+    `(listen_port, receiver_index)`, actual implementation is
+    `sessions_by_local_index` keyed by `receiver_index` alone — fixed.
+    (4) `Hot-path layout` ephemerals bullet: claimed a slow-path SPSC
+    pre-generation ring exists; no such ring is implemented in this PR
+    (snow generates ephemerals inside `build_*_handshake` on the control
+    thread). Reworded to describe the actual control-thread-only ephemeral
+    generation and the unimplemented SPSC ring as a future-revisit. (5)
+    `VLAN safety` section: claimed `try_encap` takes `tx_vlan_id` and
+    emits 802.1Q outer L2; actual `try_encap` signature is `(peer_pubkey,
+    inner_ip, out)` and outer L2 (with VLAN) is built by
+    `outer.rs::write_outer_eth`. Rewrote to match the as-shipped split.
+  - **File(s)**: `docs/pr/wireguard-clean/plan.md`, `_Log.md`
+  - **Validation**: rebase clean after manual `_Log.md` merges (15/15
+    commits replayed); `cargo build --release` clean; `cargo test
+    --release --bin xpf-userspace-dp afxdp::wg` — 78/78 pass (same as
+    pre-rebase; doc-only changes for this commit on top of the rebased
+    crypto changes); `git diff --check` clean.
+
 - **Timestamp**: 2026-05-24T19:26:45Z
   - **Action**: #1451 logging boundary shrink — moved the logging event
     reader to a package-local `EventSource` interface and RT_FLOW event wire

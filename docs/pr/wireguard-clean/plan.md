@@ -106,10 +106,12 @@ consulted on the decap path to gate inbound plaintext — "is this src
 IP in AllowedIPs for the session's peer?" — never to choose a peer
 on egress.
 
-On ingress the engine demuxes by `(listen_port, receiver_index)`
-extracted from the WG transport header. The receiver index is
-chosen by the local side at handshake time, so it identifies the
-session unambiguously without depending on a tuple-match.
+On ingress the engine demuxes by `receiver_index` alone, extracted
+from the WG transport header (`sessions_by_local_index` in
+`engine.rs`). The receiver index is chosen by the local side at
+handshake time, so it identifies the session unambiguously without
+depending on a tuple-match — listen-port selection happens one
+layer up in the integration PR's UDP-socket dispatch.
 
 ### Pump pattern
 
@@ -140,21 +142,50 @@ message and at most one output message. Nothing to "drain".
 - Engine internals (peer table, session table) live in an
   `Arc<WgEngine>` and use `arc-swap` for reconfiguration — the worker
   reads a snapshot per poll, never under a lock on the hot path.
-- Replay windows are per-session, accessed via `&AtomicU64`
-  bitmap + counter pair (sliding window of 64). Encap is lock-free
-  (single producer per session — the owning worker). Decap acquires
-  an inexpensive per-session `parking_lot::Mutex` only on the
-  duplicate/out-of-window arms.
-- Ephemerals: a slow-path producer thread pre-generates 64
-  ephemeral keypairs into a bounded SPSC ring. Slow-path handshake
-  drains; hot path never calls `getrandom`.
+- Replay windows are per-session, tracked by a `ReplayState`
+  (single counter + 64-bit sliding bitmap, RFC 6479) guarded by a
+  `std::sync::Mutex` on the session. Encap is lock-free on the
+  replay path — the owning worker is the only producer and bumps a
+  separate `AtomicU64` tx counter. Decap takes the per-session
+  replay mutex twice per packet: a pre-AEAD precheck
+  (`definitely_out_of_window`) so a hostile flood cannot burn the
+  snow ChaCha20-Poly1305 cost on counters that are already
+  provably stale, and a post-AEAD `check_and_update` to commit the
+  authenticated counter into the window. Contention is bounded
+  because each session is demuxed onto a single worker — the mutex
+  is effectively a per-session-per-worker SPSC lock with no
+  cross-worker traffic. The earlier draft of this bullet described
+  the lock as `parking_lot::Mutex` taken "only on the
+  duplicate/out-of-window arms"; that did not match the
+  implementation (`session.rs:72` — `std::sync::Mutex<ReplayState>`,
+  `engine.rs:664`/`engine.rs:688` — unconditional precheck-lock
+  followed by post-AEAD update-lock).
+- Ephemerals: handshakes are slow-path only — snow's `Builder`
+  generates the ephemeral keypair inside `build_initiator_handshake`
+  / `build_responder_handshake`, which the engine deliberately
+  reserves for the control thread. The hot encap/decap paths never
+  build a `HandshakeState` and never call `getrandom`. The
+  originally-planned SPSC pre-generation ring is not implemented in
+  this PR (and not needed while handshakes stay off the worker poll
+  loop); revisit if a future profile shows handshake-driven
+  getrandom contention on slow path.
 
 ### Replay window
 
 Single-counter sliding bitmap, 64 bits, RFC 6479 algorithm. Stored
-in the session struct as `(highest: AtomicU64, bitmap: AtomicU64)`.
-Encap increments `highest` (we are the only writer). Decap CAS-loops
-or locks briefly on the dup/oow path.
+on the session as `replay: std::sync::Mutex<ReplayState>`, where
+`ReplayState` carries the highest accepted counter and a 64-bit
+bitmap (see `session.rs`). Encap bumps a separate `AtomicU64`
+`tx_counter` field — the encap path never touches the replay
+mutex. Decap takes the mutex twice per packet: an unconditional
+pre-AEAD `definitely_out_of_window` precheck to skip snow's AEAD
+for provably stale counters, and a post-AEAD `check_and_update`
+that commits an authenticated counter into the window or returns
+`ReplayDuplicate` / `ReplayOutOfWindow`. The earlier draft of
+this section described the storage as
+`(highest: AtomicU64, bitmap: AtomicU64)` with a CAS loop /
+brief lock; the implementation is the mutex-guarded `ReplayState`
+described above.
 
 ### Replay-state across restart
 
@@ -254,8 +285,15 @@ the ECN bits and document it as a known gap with a tracking issue.
 
 ## VLAN safety
 
-`try_encap` takes `tx_vlan_id: u16` and emits 802.1Q outer L2 when
-`tx_vlan_id != 0`, mirroring `encapsulate_native_gre_frame`. The
+VLAN-aware outer L2 is built by `outer.rs::write_outer_eth(out,
+src_mac, dst_mac, vlan_id, ethertype)`: an 18-byte 802.1Q tagged
+header when `vlan_id != 0`, otherwise the 14-byte untagged
+Ethernet header. `outer_l2_len(vlan_id)` returns the matching
+length so the caller can size its scratch correctly. `try_encap`
+itself takes only `(peer_pubkey, inner_ip, out)` and writes the
+WG transport record (header + ciphertext + Poly1305 tag) into
+`out[0..]` — outer L2 / L3 / L4 are entirely the integration
+caller's responsibility and use `outer.rs` to stay VLAN-safe. The
 neighbor MAC is supplied by the caller (resolved by the existing
 FIB/neighbor pipeline before the encap call). Engine does NOT do
 its own neighbor lookup.
