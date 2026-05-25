@@ -2,7 +2,62 @@
 
 ## Status
 
-DRAFT v2 — addressing round-1 plan-review findings
+DRAFT v3 — addressing round-2 Codex plan-review findings.
+
+## Round-2 verdicts
+
+- Codex (`task-mpkr1t72-5jl8po`): PLAN-NEEDS-MAJOR
+  - Finding 1: `Store.Commit()` wraps the compile error as
+    `"commit check failed: %w"` (store.go:681) while
+    `Store.CommitCheck()` returns the raw error (store.go:663).
+    gRPC/REST forward `Commit`'s wrapped text. The v2 plan
+    asserts byte-exact equality on the unwrapped compile error,
+    which is correct for `CompileConfig` directly but cannot be
+    asserted byte-exact via `Store.Commit`.
+  - Finding 2: the v2 plan's "recovery flow" said the operator
+    can `delete system dataplane-type` from a candidate that
+    inherits the previously-active stanzas. Counter-evidence:
+    `Store.Load()` returns at store.go:97-99 before assigning
+    `s.active = tree` if compile fails; subsequent
+    `EnterConfigure()` clones an empty `s.active`. The
+    candidate WILL be empty, not pre-populated. The operator's
+    recovery flow has to start from the on-disk file or from
+    `load merge ...` of a corrected text config.
+  - Finding 3: parent task ("Continue DPDK retirement Chain A")
+    said the migration message should point at the docs from
+    sibling #1531. Counter to that, the #1526 issue body pins
+    the verbatim text `(see #1525)`. v3 honors the verbatim
+    text (issue body is authoritative) and notes that #1531's
+    retirement banner is what operators see when they follow
+    the issue link from the error message.
+- Antigravity (`adversarial-review-mpkqxuth-epwnj3`): PLAN-READY
+  on v2.
+
+## v3 changes vs v2
+
+1. Tests use **substring match** on the retirement phrase rather
+   than byte-exact, so the same assertion fires across
+   `CompileConfig`, `Store.CommitCheck`, and `Store.Commit`
+   (which prepends `commit check failed: `). The substring is
+   the full verbatim acceptance text minus the leading/trailing
+   whitespace.
+2. v3 plan adds a sibling test that calls `Store.Commit()` on a
+   candidate carrying `dataplane-type dpdk` and asserts the
+   error contains the retirement substring AND begins with
+   `commit check failed: `. This locks in the wrapped surface
+   so gRPC/REST contract drift is caught.
+3. Replace the "operator deletes dpdk from candidate" sentence
+   with the accurate recovery flow: candidate is empty after
+   the failed `Store.Load()`, so the operator must either
+   `load merge replace ...` the corrected file or
+   `set system dataplane-type userspace` from scratch and
+   commit. Manual sanity test step is updated to verify this.
+4. Manual sanity test explicitly confirms the candidate is
+   empty after the failed Load by running
+   `cli -c "show configuration"` and seeing `{}` rather than
+   the previous active config.
+
+## Round-1 verdicts
 
 ## Round-1 verdicts
 

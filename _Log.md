@@ -2,6 +2,22 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-25T05:30:00Z
+  - **Action**: PR #1526 implementation — added
+    `validateDataplaneTypeStrict` to pkg/config/compiler.go (slotted
+    BEFORE existing CoS/policer/scheduler strict validators); split
+    `TestDPDKConfig` into parse-clean / compile-rejects sibling
+    pair; dropped `dpdk` from the
+    `TestDataplaneTypeNonLegacyValuesDoNotWarnDeprecatedCompatibility`
+    loop; added Store-boundary tests covering both raw
+    `CommitCheck` error and `commit check failed:`-wrapped
+    `Commit` error.
+  - **File(s)**: `pkg/config/compiler.go`,
+    `pkg/config/parser_ast_test.go`,
+    `pkg/config/parser_system_test.go`,
+    `pkg/configstore/store_test.go`,
+    `docs/pr/1526-dpdk-reject/plan.md`
+
 - **Timestamp**: 2026-05-24T00:05:00Z
   - **Action**: PR #1526 plan v1 drafted. Reject `system
     dataplane-type dpdk` at commit-time via new strict

@@ -1450,3 +1450,67 @@ func TestRenameNotInConfigMode(t *testing.T) {
 		t.Errorf("expected config mode error, got: %v", err)
 	}
 }
+
+// #1526 — the DPDK retirement reject must fire at the Store boundary
+// for both CommitCheck (raw error) and Commit (wrapped error). The
+// gRPC and REST surfaces both forward Commit's wrapped text, so we
+// lock in the wrapping contract here: any future change that drops
+// the "commit check failed: " prefix from Commit or changes the
+// underlying retirement substring breaks this test.
+const dpdkRetirementSubstr = "the DPDK dataplane backend has been retired; use 'set system dataplane-type userspace' (see #1525)"
+
+func TestCommit_RejectsDPDKDataplaneType(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if err := s.SetFromInput("system dataplane-type dpdk"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+
+	// CommitCheck returns the raw compile-error text.
+	_, ccErr := s.CommitCheck()
+	if ccErr == nil {
+		t.Fatal("CommitCheck succeeded for dataplane-type dpdk; expected retirement reject")
+	}
+	if !strings.Contains(ccErr.Error(), dpdkRetirementSubstr) {
+		t.Fatalf("CommitCheck error = %q, want substring %q", ccErr.Error(), dpdkRetirementSubstr)
+	}
+	// CommitCheck should NOT prepend "commit check failed: " — the
+	// wrapping happens in Commit, not CommitCheck.
+	if strings.HasPrefix(ccErr.Error(), "commit check failed:") {
+		t.Fatalf("CommitCheck unexpectedly wrapped its error with 'commit check failed:' prefix: %q", ccErr.Error())
+	}
+
+	// Commit wraps the same compile error as "commit check failed: ...".
+	_, cmErr := s.Commit()
+	if cmErr == nil {
+		t.Fatal("Commit succeeded for dataplane-type dpdk; expected retirement reject")
+	}
+	if !strings.Contains(cmErr.Error(), dpdkRetirementSubstr) {
+		t.Fatalf("Commit error = %q, want substring %q", cmErr.Error(), dpdkRetirementSubstr)
+	}
+	// Lock the wrap surface so gRPC / REST contract drift is caught.
+	if !strings.HasPrefix(cmErr.Error(), "commit check failed:") {
+		t.Fatalf("Commit error missing 'commit check failed:' wrap prefix: %q", cmErr.Error())
+	}
+}
+
+// TestCommit_AcceptsUserspaceDataplaneType is the negative control:
+// the migration target (`set system dataplane-type userspace`) must
+// commit cleanly without warnings about DPDK retirement.
+func TestCommit_AcceptsUserspaceDataplaneType(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if err := s.SetFromInput("system dataplane-type userspace"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if _, err := s.CommitCheck(); err != nil {
+		t.Fatalf("CommitCheck for userspace dataplane-type: %v", err)
+	}
+	if _, err := s.Commit(); err != nil {
+		t.Fatalf("Commit for userspace dataplane-type: %v", err)
+	}
+}
