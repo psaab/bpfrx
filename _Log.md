@@ -288,6 +288,34 @@
     Rebased onto current master (which now has #1536).
   - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
     `_Log.md`
+- **Timestamp**: 2026-05-25T17:15:00Z
+  - **Action**: #1521 r6 review fix — AGY r6 NEEDS-MINOR identified
+    one more bypass: block-local const declaration with the same
+    name as a package-level const causes the flat package-wide
+    consts symbol table to be silently overwritten by the local
+    value, so a package-level chain that compiles to
+    "userspace_fallback_stats" can be evaluated by the canary as
+    something innocuous if shadowed at the function entry point.
+    AGY authored the fix directly in the worktree:
+    - collectFileConstsInto now collects ONLY top-level const
+      declarations (no DeclStmt walk).
+    - scopeWalker (implements ast.Visitor) + walkWithScope manage
+      a scope stack: blocks (BlockStmt, FuncDecl, FuncLit) push a
+      new scope; block-local const decls bind in the current
+      scope; lookups walk inner-to-outer. The package-wide table
+      is never mutated by block-local decls.
+    - All three passes route through walkWithScope so they see the
+      same correct lexical scoping as the compiler.
+    New agy_r6_block_shadow_chain_bypass fixture proves the fix
+    (chain1 shadowed locally, package-level chain3 must still fold
+    to "userspace_fallback_stats" and "userspace_fallback").
+    Copilot r4 on 0692093a: 9/9 files reviewed, 0 new comments —
+    clean.
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: 6 canary tests + 19 negative-fixture sub-cases
+    pass; go test ./... all 30 packages green.
+
 - **Timestamp**: 2026-05-25T17:00:00Z
   - **Action**: #1521 r5 review fixes — AGY r5 raised NEEDS-MINOR
     with 4 issues; all addressed. (a) Inverted const dependency

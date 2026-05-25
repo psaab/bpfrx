@@ -32,4 +32,7 @@ Plan is PLAN-READY v2 after both r1 verdicts addressed.
 | 5 | Antigravity | adversarial-review-mpldughx-s5jbfs | NEEDS-MINOR (depth-3 chain, typed conversion, typo-padded new map, generated-file filter) — all 4 addressed |
 | 5 | Copilot | PR review on 5b41f9d7 | 3 wording-only comments — all addressed in r5 commit |
 | 5 | Claude SMR | self-review post-r5-fixes | MERGE-READY |
+| 6 | Antigravity | adversarial-review-mple4zlr-vda9fo | NEEDS-MINOR (block-local const shadowing bypasses package-level chain) — AGY-authored fix applied directly: scopeWalker isolates top-level vs block-local consts; agy_r6_block_shadow_chain_bypass fixture proves the kill |
+| 6 | Copilot | PR review on 0692093a | "Copilot reviewed 9 out of 9 changed files in this pull request and generated no new comments." — clean |
+| 6 | Claude SMR | self-review post-AGY-authored fix | MERGE-READY |
 

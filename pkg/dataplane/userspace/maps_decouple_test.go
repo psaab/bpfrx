@@ -250,12 +250,9 @@ func findForbiddenAliasesInFiles(fset *token.FileSet, files []*ast.File, fileNam
 	if len(files) != len(fileNames) {
 		return nil, fmt.Errorf("file/name length mismatch")
 	}
-	// Build package-wide const symbol table. Top-level first, then
-	// local block consts. Run until the table size stabilizes so
-	// dependency chains of arbitrary depth converge (AGY r5 §I.a:
-	// chain3=chain2+"_x"; chain2=chain1+"_y"; chain1="..." needs
-	// 3 passes; a fixed 2-pass loop leaves chain3 unresolved). The
-	// upper bound (32) is a safety net against pathological input.
+	// Build package-wide const symbol table. Top-level first.
+	// Run until the table size stabilizes so dependency chains of
+	// arbitrary depth converge (AGY r5 §I.a).
 	consts := map[string]string{}
 	for pass := 0; pass < 32; pass++ {
 		prev := len(consts)
@@ -279,14 +276,13 @@ func findForbiddenAliasesInFiles(fset *token.FileSet, files []*ast.File, fileNam
 			hitSet[s] = struct{}{}
 		}
 
-		// Pass 1: BinaryExpr concat fold (file-wide, but consts
-		// resolved against package-wide table).
-		ast.Inspect(file, func(n ast.Node) bool {
+		// Pass 1: BinaryExpr concat fold with scope walker.
+		walkWithScope(file, consts, func(n ast.Node, scope map[string]string) bool {
 			bin, ok := n.(*ast.BinaryExpr)
 			if !ok || bin.Op != token.ADD {
 				return true
 			}
-			folded, fok := evalStringExpr(bin, consts)
+			folded, fok := evalStringExpr(bin, scope)
 			if !fok {
 				return true
 			}
@@ -303,9 +299,8 @@ func findForbiddenAliasesInFiles(fset *token.FileSet, files []*ast.File, fileNam
 			return true
 		})
 
-		// Pass 2: CallExpr arg ident-resolution (package-wide
-		// table).
-		ast.Inspect(file, func(n ast.Node) bool {
+		// Pass 2: CallExpr arg ident-resolution with scope walker.
+		walkWithScope(file, consts, func(n ast.Node, scope map[string]string) bool {
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
 				return true
@@ -314,7 +309,7 @@ func findForbiddenAliasesInFiles(fset *token.FileSet, files []*ast.File, fileNam
 				if _, isLit := arg.(*ast.BasicLit); isLit {
 					continue
 				}
-				s, ok := evalStringExpr(arg, consts)
+				s, ok := evalStringExpr(arg, scope)
 				if !ok {
 					continue
 				}
@@ -330,8 +325,8 @@ func findForbiddenAliasesInFiles(fset *token.FileSet, files []*ast.File, fileNam
 			return true
 		})
 
-		// Pass 3: direct BasicLit (with trim-padded check).
-		ast.Inspect(file, func(n ast.Node) bool {
+		// Pass 3: direct BasicLit (with trim-padded check) with scope walker.
+		walkWithScope(file, consts, func(n ast.Node, scope map[string]string) bool {
 			lit, ok := n.(*ast.BasicLit)
 			if !ok || lit.Kind != token.STRING {
 				return true
@@ -371,10 +366,8 @@ func findForbiddenAliasesInFiles(fset *token.FileSet, files []*ast.File, fileNam
 }
 
 // collectFileConstsInto records every const-declared string value
-// in file into out. Walks both top-level GenDecls and any GenDecls
-// nested inside function bodies (*ast.DeclStmt). Skips non-string
-// constants and constants that fail to fold (left unresolved for
-// the second pass to converge).
+// in file into out. Walks only top-level GenDecls (package scope).
+// Skips local block consts to avoid scope shadowing bugs (AGY r6).
 func collectFileConstsInto(file *ast.File, out map[string]string) {
 	addSpec := func(vs *ast.ValueSpec) {
 		for i, name := range vs.Names {
@@ -397,25 +390,126 @@ func collectFileConstsInto(file *ast.File, out map[string]string) {
 			}
 		}
 	}
-	// Block-local consts: walk every function body and look for
-	// DeclStmt nodes carrying const decls. AGY r4 §II.1.
-	ast.Inspect(file, func(n ast.Node) bool {
-		ds, ok := n.(*ast.DeclStmt)
-		if !ok {
-			return true
-		}
-		gd, ok := ds.Decl.(*ast.GenDecl)
-		if !ok || gd.Tok != token.CONST {
-			return true
-		}
-		for _, spec := range gd.Specs {
-			if vs, ok := spec.(*ast.ValueSpec); ok {
-				addSpec(vs)
-			}
-		}
-		return true
-	})
 }
+
+func cloneMap(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func collectLocalConstsForBlock(block ast.Node, parent map[string]string) map[string]string {
+	local := cloneMap(parent)
+	for pass := 0; pass < 8; pass++ {
+		prev := len(local)
+		ast.Inspect(block, func(n ast.Node) bool {
+			if n == nil {
+				return true
+			}
+			switch n.(type) {
+			case *ast.FuncDecl, *ast.FuncLit:
+				return false
+			}
+			ds, ok := n.(*ast.DeclStmt)
+			if !ok {
+				return true
+			}
+			gd, ok := ds.Decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.CONST {
+				return true
+			}
+			for _, spec := range gd.Specs {
+				if vs, ok := spec.(*ast.ValueSpec); ok {
+					for i, name := range vs.Names {
+						if i < len(vs.Values) {
+							if v, ok := evalStringExpr(vs.Values[i], local); ok {
+								local[name.Name] = v
+							}
+						}
+					}
+				}
+			}
+			return true
+		})
+		if len(local) == prev {
+			break
+		}
+	}
+	return local
+}
+
+type scopeWalker struct {
+	consts []map[string]string
+	f      func(ast.Node, map[string]string) bool
+}
+
+func (w *scopeWalker) Visit(node ast.Node) ast.Visitor {
+	if node == nil {
+		return nil
+	}
+
+	var hasNewScope bool
+	currentScope := w.consts[len(w.consts)-1]
+
+	switch n := node.(type) {
+	case *ast.FuncDecl:
+		if n.Body != nil {
+			currentScope = collectLocalConstsForBlock(n.Body, currentScope)
+			w.consts = append(w.consts, currentScope)
+			hasNewScope = true
+		}
+	case *ast.FuncLit:
+		if n.Body != nil {
+			currentScope = collectLocalConstsForBlock(n.Body, currentScope)
+			w.consts = append(w.consts, currentScope)
+			hasNewScope = true
+		}
+	case *ast.BlockStmt:
+		currentScope = collectLocalConstsForBlock(n, currentScope)
+		w.consts = append(w.consts, currentScope)
+		hasNewScope = true
+	}
+
+	keepDescending := w.f(node, currentScope)
+
+	if !keepDescending {
+		if hasNewScope {
+			w.consts = w.consts[:len(w.consts)-1]
+		}
+		return nil
+	}
+
+	return &postVisitor{
+		walker:      w,
+		hasNewScope: hasNewScope,
+	}
+}
+
+type postVisitor struct {
+	walker      *scopeWalker
+	hasNewScope bool
+}
+
+func (pv *postVisitor) Visit(node ast.Node) ast.Visitor {
+	if node == nil {
+		if pv.hasNewScope {
+			pv.walker.consts = pv.walker.consts[:len(pv.walker.consts)-1]
+		}
+		return nil
+	}
+	return pv.walker.Visit(node)
+}
+
+func walkWithScope(node ast.Node, initialScope map[string]string, f func(ast.Node, map[string]string) bool) {
+	walker := &scopeWalker{
+		consts: []map[string]string{initialScope},
+		f:      f,
+	}
+	ast.Walk(walker, node)
+}
+
 
 func findForbiddenMapNameAliases(src string) ([]string, error) {
 	fset := token.NewFileSet()
@@ -456,15 +550,15 @@ func findForbiddenMapNameAliases(src string) ([]string, error) {
 	}
 
 	// Pass 1: walk every CallExpr / *ast.Ident / BinaryExpr that
-	// evaluates to a static string starting with "userspace_".
+	// evaluates to a static string starting with "userspace_" using scope walker.
 	// This catches concat folds (AGY r2 §D) and const-ident
 	// resolution (AGY r3 §ii).
-	ast.Inspect(file, func(n ast.Node) bool {
+	walkWithScope(file, consts, func(n ast.Node, scope map[string]string) bool {
 		bin, ok := n.(*ast.BinaryExpr)
 		if !ok || bin.Op != token.ADD {
 			return true
 		}
-		folded, fok := evalStringExpr(bin, consts)
+		folded, fok := evalStringExpr(bin, scope)
 		if !fok {
 			return true
 		}
@@ -477,11 +571,8 @@ func findForbiddenMapNameAliases(src string) ([]string, error) {
 
 	// Pass 2: walk every CallExpr argument — when the argument
 	// resolves (via const-ident, concat, paren) to a static
-	// "userspace_*" string, report it. Catches the AGY r3 §ii
-	// const-ident bypass even when the const value is built from
-	// other const idents. Also applies the trim-padded check
-	// so AGY r3 §iii padded-const-ident bypasses are caught.
-	ast.Inspect(file, func(n ast.Node) bool {
+	// "userspace_*" string, report it using scope walker.
+	walkWithScope(file, consts, func(n ast.Node, scope map[string]string) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
@@ -491,7 +582,7 @@ func findForbiddenMapNameAliases(src string) ([]string, error) {
 				// Basic literals are covered by Pass 3.
 				continue
 			}
-			s, ok := evalStringExpr(arg, consts)
+			s, ok := evalStringExpr(arg, scope)
 			if !ok {
 				continue
 			}
@@ -511,8 +602,8 @@ func findForbiddenMapNameAliases(src string) ([]string, error) {
 	})
 
 	// Pass 3: basic-literal walk for direct literals (including
-	// trim-padded bypasses, AGY r2 §A and AGY r3 §iii).
-	ast.Inspect(file, func(n ast.Node) bool {
+	// trim-padded bypasses, AGY r2 §A and AGY r3 §iii) using scope walker.
+	walkWithScope(file, consts, func(n ast.Node, scope map[string]string) bool {
 		lit, ok := n.(*ast.BasicLit)
 		if !ok || lit.Kind != token.STRING {
 			return true
@@ -941,6 +1032,25 @@ func (M) Map(string) any { return nil }
 			// value isn't in the exact-registry list yet — the prefix
 			// match alone is enough.
 			want: []string{"userspace_new_interface_map "},
+		},
+		{
+			name: "agy_r6_block_shadow_chain_bypass",
+			src: `package x
+const chain3 = chain2 + "_stats"
+const chain2 = chain1 + "_fallback"
+const chain1 = "userspace"
+func F(m M) {
+	const chain1 = "innocuous"
+	_ = m.Map(chain3)
+}
+type M struct{}
+func (M) Map(string) any { return nil }
+`,
+			// AGY r6: block-local shadow chain bypass. A block-local constant shadows
+			// a package-level constant, which would corrupt a flat symbol table.
+			// The scope-aware walker ensures the package-level chain3 still resolves
+			// to "userspace_fallback_stats" and is successfully caught.
+			want: []string{"userspace_fallback_stats", "userspace_fallback"},
 		},
 	}
 
