@@ -20,11 +20,17 @@ Per-round reviewer task / job IDs for the triple-review skill.
 
 ## Code review (post-PR)
 
-### Round 1
+### Round 1 (PR #1550, HEAD e0a694ca)
 
-- Codex task ID: _pending_
-- Antigravity job ID: _pending_
-- Copilot review: _pending_
+- Codex task ID: _bg task bq4nf4oer (codex exec)_ — output empty (Codex CLI errored); re-dispatched as bqz009mtr (also empty); will re-dispatch round-2 on new HEAD
+- Antigravity job ID: `adversarial-review-mplc57vw-e6chtv` — VERDICT MERGE-READY (8 findings clean, 1 minor coverage gap)
+- Copilot review: COMMENTED — 2 inline wording nits (Boot() doc + buildRuntimeDataPlane doc); both addressed in round-2 commit
+
+### Round 2 (after wording + coverage gap fixes)
+
+- Codex task ID: _pending re-dispatch after force-push_
+- Antigravity job ID: _pending re-dispatch after force-push_
+- Copilot review: triggered via `@copilot review` PR comment
 
 ## Notes
 

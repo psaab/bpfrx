@@ -76,9 +76,15 @@ func init() {
 //
 // Daemon startup prefers Boot() over dataplane.NewRuntimeDataPlane(
 // TypeUserspace) for the default and explicit userspace selections.
-// The legacy registry path is retained for the explicit
-// "dataplane-type ebpf" rollback only, because that branch deliberately
-// resolves through dataplane.New() and the legacy program loader.
+// The runtime backend registry entry for TypeUserspace (see init()
+// above) is retained as a compatibility / test seam — it remains
+// reachable via dataplane.NewRuntimeDataPlane(TypeUserspace) but is
+// no longer the canonical daemon boot path.
+//
+// The explicit "dataplane-type ebpf" rollback does NOT use the
+// userspace registry entry at all; it goes through the
+// dataplane.NewRuntimeDataPlane → TypeEBPF switch which constructs
+// a bare *dataplane.Manager (legacy) via the legacy program loader.
 //
 // The returned value still implements dataplane.DataPlane via the
 // adapter, so unmigrated callers (pkg/cli, pkg/api, pkg/conntrack,

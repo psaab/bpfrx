@@ -44,10 +44,17 @@ import (
 
 // buildRuntimeDataPlane selects the userspace-native Boot() path for the
 // default and explicit userspace selections, and falls through to
-// dataplane.NewRuntimeDataPlane only for the explicit legacy eBPF rollback
-// (and the retired-DPDK error case). Keeping the legacy branch routed
-// through the dataplane factory preserves the ErrDPDKBackendRetired sentinel
-// handling unchanged AND preserves the existing AST canary in
+// dataplane.NewRuntimeDataPlane for every other type. The two
+// operator-facing cases on the fall-through branch today are the
+// explicit legacy eBPF rollback ("dataplane-type ebpf") and the
+// retired-DPDK sentinel ("dataplane-type dpdk" → ErrDPDKBackendRetired).
+// Unknown/custom types and any future registry-backed types also flow
+// through the same default branch and surface the legacy factory's
+// error (including "unknown dataplane type") verbatim.
+//
+// Keeping the legacy branch routed through the dataplane factory
+// preserves the ErrDPDKBackendRetired sentinel handling unchanged AND
+// preserves the existing AST canary in
 // pkg/dataplane/retirement_boundary_canary_test.go
 // (TestDaemonRuntimeEntryPointUsesRuntimeDataPlane) that requires
 // daemon_run.go to reference dataplane.NewRuntimeDataPlane.

@@ -79,6 +79,27 @@ func TestBuildRuntimeDataPlaneDPDKReturnsRetired(t *testing.T) {
 	}
 }
 
+// TestBuildRuntimeDataPlaneUnknownTypePropagatesError asserts that the
+// helper does not silently swallow an unknown dataplane type (e.g., an
+// operator typo). The error must be surfaced from the legacy factory so
+// daemon startup logs it via the existing slog.Error("failed to create
+// dataplane", ...) branch. Also asserts the unknown-type error is NOT
+// the DPDK retirement sentinel (sentinel reserved for "dpdk" only).
+func TestBuildRuntimeDataPlaneUnknownTypePropagatesError(t *testing.T) {
+	t.Parallel()
+
+	dp, err := buildRuntimeDataPlane("totally-unknown-type")
+	if err == nil {
+		t.Fatalf("buildRuntimeDataPlane(unknown) = %T, nil; want error", dp)
+	}
+	if dp != nil {
+		t.Fatalf("buildRuntimeDataPlane(unknown) returned non-nil dp = %T", dp)
+	}
+	if errors.Is(err, dataplane.ErrDPDKBackendRetired) {
+		t.Fatalf("buildRuntimeDataPlane(unknown) returned ErrDPDKBackendRetired; sentinel must be reserved for dpdk")
+	}
+}
+
 // TestBuildRuntimeDataPlaneMatchesBootShape sanity-checks that the
 // userspace branch returns the same concrete type as userspace.Boot()
 // directly. Guards against a future refactor that silently re-introduces

@@ -2,14 +2,34 @@
 
 ## 2026-05-25
 
-- **Timestamp**: 2026-05-25T15:25:00Z
-  - **Action**: PR #1520 follow-up doc fix after Copilot review request.
-    Updated `pkg/dataplane/README.md` and `pkg/daemon/README.md` so the
-    documented boot path matches the landed code: daemon startup now picks
-    `userspace.Boot()` directly for default / explicit userspace and keeps
-    `dataplane.NewRuntimeDataPlane()` only for the explicit legacy eBPF
-    rollback and the retired-DPDK sentinel path.
-  - **File(s)**: `pkg/dataplane/README.md`, `pkg/daemon/README.md`, `_Log.md`
+- **Timestamp**: 2026-05-25T23:30:00Z
+  - **Action**: PR #1550 round-1 doc + wording follow-ups merged.
+    Copilot agent pushed be8a7b6d updating
+    `pkg/dataplane/README.md` and `pkg/daemon/README.md` to align
+    doc text with the landed code (boot path via
+    `userspace.Boot()`; legacy factory only for ebpf rollback +
+    DPDK sentinel). Rebased local round-1 review fixes on top.
+  - **File(s)**: `pkg/dataplane/README.md`, `pkg/daemon/README.md`
+
+- **Timestamp**: 2026-05-25T23:00:00Z
+  - **Action**: PR #1550 round-1 code review feedback addressed.
+    Copilot inline nits: (1) Boot() doc misdescribed the userspace
+    registry path as "rollback" — clarified that the userspace
+    registry entry is the compatibility/test seam and the ebpf
+    rollback goes through the legacy factory's TypeEBPF switch,
+    not the userspace registry; (2) buildRuntimeDataPlane doc said
+    the default branch is "only" for ebpf/dpdk — rewrote to
+    acknowledge unknown/custom types also flow through and surface
+    the legacy factory's error verbatim. AGY minor coverage gap:
+    added TestBuildRuntimeDataPlaneUnknownTypePropagatesError to
+    lock in the unknown-type error propagation and to assert
+    ErrDPDKBackendRetired stays reserved for "dpdk". AGY code
+    review verdict: MERGE-READY (8 findings clean).
+  - **File(s)**:
+    `pkg/dataplane/userspace/manager.go`,
+    `pkg/daemon/daemon_run.go`,
+    `pkg/daemon/dataplane_boot_test.go`,
+    `docs/pr/1520-userspace-boot-extraction/reviewer-ids.md`
 
 - **Timestamp**: 2026-05-25T22:30:00Z
   - **Action**: #1520 plan v4 + implementation. v2 added Claude SMR
