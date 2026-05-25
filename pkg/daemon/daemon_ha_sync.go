@@ -681,8 +681,9 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 					)
 					return
 				}
-				slog.Warn("cluster: fence received from peer, disabling all RGs")
 				if cfg.Chassis.Cluster != nil {
+					slog.Warn("cluster: fence: disabling all RGs",
+						"rg_count", len(cfg.Chassis.Cluster.RedundancyGroups))
 					for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
 						if err := d.dp.HA().SetRGActive(commsCtx, rg.ID, false); err != nil {
 							slog.Warn("cluster: fence: failed to disable rg_active",

@@ -157,7 +157,13 @@ func NewDataPlane(dpType string) (DataPlane, error) {
 		if ctor, ok := backendRegistry[dpType]; ok {
 			return ctor(), nil
 		}
-		return nil, fmt.Errorf("unknown dataplane type %q (valid built-in legacy type: ebpf)", dpType)
+		// Legacy NewDataPlane only accepts TypeEBPF directly; TypeUserspace
+		// has no legacy DataPlane shape and must go through
+		// NewRuntimeDataPlane.  TypeDPDK is caught above as
+		// ErrDPDKBackendRetired.  Operators selecting userspace at the
+		// config layer never reach this branch because daemon startup
+		// uses NewRuntimeDataPlane.
+		return nil, fmt.Errorf("unknown dataplane type %q (valid via NewDataPlane: ebpf; use NewRuntimeDataPlane for userspace)", dpType)
 	}
 }
 

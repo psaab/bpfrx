@@ -37,9 +37,28 @@ registration + cleanup), `ee83e972` (allowlist comment refresh), `8c475d4a`
 (StartFIBSync stale ref fix), plus my `fe82ac74` (structured slog kv on
 nil-dp fence warning, addresses Codex NIT).
 
-- Codex re-re-review: `task-mpksgyz9-45ib7t` — DISPATCHED
-- Antigravity re-re-review: `adversarial-review-mpksh5km-1mf7rz` — DISPATCHED
-- Copilot re-trigger: issue-comment 4531892202
+- Codex re-re-review: `task-mpksgyz9-45ib7t` — MERGE-READY with NIT
+  (stale FIB sync comment at `daemon_run.go:326`; fixed in `9b4e9e24`)
+- Antigravity re-re-review: `adversarial-review-mpksh5km-1mf7rz` — MERGE-READY
+- Copilot re-trigger: issue-comment 4531892202 → Copilot fresh review on `d5fa4838`
+  returned 3 inline findings (compiler_system error string, fence log ordering,
+  plan v3/v4 inconsistency); all 3 fixed in `9aa96c3e` + `dd959112`.
+
+## Parallel session reviews captured
+
+- Codex `task-mpksf0nq-eeuxc3` (other agent, on `ee83e972`): MERGE-NEEDS-MINOR.
+  Findings: (1) error string vs validator (fixed in `9aa96c3e`), (2) plan
+  sequencing inconsistency (fixed in `dd959112`), (3) plan whitespace NIT
+  (acknowledged out-of-scope).
+
+## Code review — commit dd959112 (final convergence)
+
+Final round addresses all 3 remaining Copilot inline findings on the prior
+SHA plus the Codex `task-mpksf0nq-eeuxc3` minor findings.
+
+- Codex final re-review: `task-mpksus16-sel08z` — DISPATCHED
+- Antigravity final re-review: `adversarial-review-mpksuwyo-tlgd91` — DISPATCHED
+- Copilot final re-trigger: issue-comment 4531937401
 
 Verification scope (see prompt for full list): (a) blank-import removal completeness,
 (b) NewRuntimeDataPlane reject placement vs EffectiveType, (c) errors.Is wrapping
