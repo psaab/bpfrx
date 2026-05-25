@@ -288,6 +288,26 @@
     Rebased onto current master (which now has #1536).
   - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
     `_Log.md`
+- **Timestamp**: 2026-05-25T15:50:00Z
+  - **Action**: #1521 r2 code-review fixes — Codex LOW-2 (%
+    exemption allows format-template bypass) + AGY r2 §A (trim-
+    padded literal) + AGY r2 §D (split-string concat fold) all
+    closed. Refactored canary into `findForbiddenMapNameAliases`
+    helper that (a) drops `%` from prose exemption, (b) folds
+    `*ast.BinaryExpr` Op=ADD with recursive string-concat operands
+    and flags folded `userspace_*` results, (c) flags any literal
+    whose TRIMMED value (strip whitespace + `%`) exactly matches a
+    registered map name. New `TestAliasCanaryCatchesBypassPatterns`
+    with 10 sub-cases (incl. AGY r2 (A) and (D) exact bypasses)
+    proves the inspector catches every documented bypass.
+    Production canary now delegates to the same helper.
+    Codex LOW-1 (parity bytes.Contains) again REJECTED with same
+    rationale as r1 LOW-2.
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: 4 canary tests + 10 alias-bypass sub-cases all
+    pass; go test ./... all 30 packages green.
+
 - **Timestamp**: 2026-05-25T15:30:00Z
   - **Action**: #1521 r1 code-review fixes — Codex MED-1 + AGY §1
     (alias bypass) closed by new `TestNoMapNameLiteralAliasesOutside

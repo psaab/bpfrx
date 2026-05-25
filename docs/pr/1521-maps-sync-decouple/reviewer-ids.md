@@ -19,4 +19,7 @@ Plan is PLAN-READY v2 after both r1 verdicts addressed.
 | 1 | Codex | workflow 20260525-145416-0c2271 (impl r1) | MED×1 LOW×2; 2 ACCEPT 1 REJECT → r2 |
 | 1 | Antigravity | adversarial-review-mplcamu9-gxguu8 | CODE-NEEDS-MAJOR (alias canary + parity-skip sentinel) → r2 |
 | 1 | Claude SMR | self-review post-r1-fixes | MERGE-READY pending r2 confirm |
+| 2 | Codex | workflow 20260525-145416-0c2271 (impl r2) | LOW×2; 1 ACCEPT 1 REJECT → r3 |
+| 2 | Antigravity | adversarial-review-mplcnpph-45ufpf | CODE-NEEDS-MAJOR (concat fold + trim-bypass) → r3 |
+| 2 | Claude SMR | self-review post-r2-fixes | MERGE-READY pending r3 confirm |
 
