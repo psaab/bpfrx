@@ -426,13 +426,21 @@ Total: 30 measurements per the skill's discipline. Required:
    plan: check after `EffectiveType` so the empty-default path is
    unaffected.
 
-5. **Does this PR need to land before or after #1526?** RESOLVED:
-   #1526 must land first. Codex plan review (task-mpkqsgf5-j2yag1)
-   correctly showed that today's behavior is `slog.Warn` + config-
-   only fallback, while this PR makes the same config fatal at
-   daemon startup. Without Chain A landing first, an existing
-   `system dataplane-type dpdk` config would kill the daemon on
-   next restart.
+5. **Does this PR need to land before or after #1526?** RESOLVED in
+   v4: #1526 is STRONGLY PREFERRED but NOT required.  v2 of this
+   plan required #1526 first because today's daemon falls through
+   to config-only mode on a stub `Start()` failure while this PR
+   originally made the same config fatal at daemon startup.  v3
+   added an `errors.Is(ErrDPDKBackendRetired)` soft-fallback to
+   `pkg/daemon/daemon_run.go:247` so the daemon now treats the
+   sentinel exactly like a `Start()` failure: structured
+   `slog.Warn` plus config-only fallback.  An operator with a
+   stale `system dataplane-type dpdk` config no longer hits an
+   `os.Exit(1)` loop on restart — the daemon stays up and is
+   reachable from the CLI / gRPC to edit the config in place.
+   With #1526 also landed, the runtime path is unreachable for
+   legitimate configs (commit-time rejection).  Without #1526 the
+   soft-fallback covers the gap.
 
 6. **The `-tags dpdk` build path: leave it as zombie code or
    actively break it?** Removing the `init()` means `-tags dpdk`
