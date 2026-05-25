@@ -1,5 +1,25 @@
 # Action Log
 
+## 2026-05-25 — #1476 Phase A v4 plan after r3 reviews
+
+- **Timestamp**: 2026-05-25T (Phase A v4 after r3 reviewer findings)
+  - **Action**: Round-3 reviews returned: AGY r3 PLAN-READY with
+    one cosmetic nit (risk-table count "4" → "5"); Codex r3
+    PLAN-NEEDS-MAJOR with 6 findings, all stale-text drift from
+    v1 prose that v2/v3 header rewrites didn't reach (no new
+    operational issues). v4 fixes: §1 #2 stale Manager.Load()
+    "either deleted or stubbed" → "is kept as retirement stub";
+    §5 invariant 8 stale "boundary tests pass unchanged" →
+    rewritten to acknowledge §4.3's shim_loader_boundary path fix;
+    §8 Q2 stale "all four tests construct Manager" → corrected;
+    §4.3 doc-sweep adds rows for constants.go:14, docs/testing.md:281,
+    docs/next-features/ipv6-session-fast-path.md:16,38; closing
+    footer "End of plan v1" → "End of plan v4"; risk-table
+    "4 retirement-manifest canaries" → "5"; "all four" literals
+    in v3 change-log header rewritten without losing meaning.
+  - **File(s)**: `docs/pr/1476-mechanical-bpf-removal/plan.md` v4,
+    `docs/pr/1476-mechanical-bpf-removal/reviewer-ids.md`, `_Log.md`
+
 ## 2026-05-25 — #1476 Phase A v3 plan after r2 reviews
 
 - **Timestamp**: 2026-05-25T (Phase A v3 after r2 reviewer findings)

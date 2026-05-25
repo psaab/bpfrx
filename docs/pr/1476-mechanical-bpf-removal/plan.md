@@ -1,16 +1,40 @@
 # #1476 — eBPF Retirement: Mechanical Source Removal
 
-**Status:** DRAFT v3 — addresses Codex r2 PLAN-NEEDS-MAJOR (5
-findings) and AGY r2 PLAN-NEEDS-MINOR (1 finding). v2 closed all r1
-findings cleanly but left stale v1 prose in §5/§8 contradicting the
-v2 action tables, and missed 4 retained-helper symbols (AGY r2) and
-two NEW issues: the `shim_loader_boundary_test.go:45` hardcoded
-`loader_ebpf.go` path, and non-daemon `dataplane-type ebpf` warning
-tests in `pkg/api/`, `pkg/cli/`, `pkg/grpcapi/`, `pkg/config/` that
-break under strict commit reject. The #1373 umbrella's
-mechanical-deletion phase. Blocked-on-merge by #1516 (grpcapi
-migration) and #1521 (userspace maps_sync decouple), both sub-issues
-of #1451. #1473, #1493, #1494, #1518, #1522 already merged.
+**Status:** DRAFT v4 — addresses Codex r3 PLAN-NEEDS-MAJOR (6
+findings, all stale-text drift / doc-sweep gaps; no new operational
+issues). AGY r3 returned PLAN-READY with one cosmetic nit (line 721
+"4" → "5") already absorbed before this v4 draft. The #1373
+umbrella's mechanical-deletion phase. Blocked-on-merge by #1516
+(grpcapi migration) and #1521 (userspace maps_sync decouple), both
+sub-issues of #1451. #1473, #1493, #1494, #1518, #1522 already
+merged.
+
+## v4 changes from v3
+
+- **§1 issue-framing #2 prose (Codex r3 F1)**: stale text "must
+  either be deleted (preferred) or stubbed" contradicted §4.1/§5's
+  retention decision. v4 rewrites to "is kept with body rewritten
+  to `return ErrEBPFBackendRetired`".
+- **§5 invariant 8 (Codex r3 F2)**: stale text "boundary tests pass
+  unchanged" contradicted §4.3's NEW edit row for
+  `shim_loader_boundary_test.go:45`. v4 rewrites to acknowledge the
+  hardcoded-path fix and grep-token re-evaluation.
+- **§8 Q2 prose (Codex r3 F3)**: stale text said all four daemon
+  tests construct a Manager and may call `.Load()`. v4 corrects
+  per §4.3 action table.
+- **§4.3 doc-sweep extended (Codex r3 F5)**: added rows for
+  `pkg/dataplane/constants.go:14` (loader_ebpf.go reference in doc
+  comment), `docs/testing.md:281` (`loadAllObjects()` reference),
+  `docs/next-features/ipv6-session-fast-path.md:16,38`
+  (`bpf/xdp/xdp_zone.c` references). v3 missed these in the doc
+  sweep.
+- **Closing footer (Codex r3 NIT F6)**: "End of plan v1" footer
+  corrected to "End of plan v3 (r3 fixes applied)" — though v4
+  rewrites it to match.
+- **Risk-table test-breakage count (AGY r3 cosmetic nit)**: line
+  721 "4 retirement-manifest canaries" → "5".
+- **"All four" stale literals in the v3 changes header**: rewritten
+  to remove the literal "all four" without losing meaning.
 
 This plan is staged while the in-flight blockers close so review can
 happen in parallel with #1451 completion. Phase B (implementation)
@@ -43,14 +67,15 @@ rebases onto master once `gh issue view 1451 --json state` returns
   successful commit with a deprecation warning. Strict reject
   breaks them; v3 rewrites each to match #1526's DPDK reject
   pattern.
-- **§8 Q7 prose updated (Codex r2 F6)**: stale text saying "all four
-  must rewrite" now matches §4.3 action table (only
-  `dataplane_boot_test` rewrites; the other three stay).
+- **§8 Q7 prose updated (Codex r2 F6)**: stale text saying every
+  one of the four TypeEBPF tests must rewrite now matches §4.3
+  action table (only `dataplane_boot_test` rewrites; the other
+  three stay).
 - **§8 Q8 prose updated (Codex r2 F4)**: stale text listed
   `nat_port_counters` among legacy drop pins. v3 corrects to
   retained-shim shared state per §5.
-- **"All four" manifest-test references corrected to five (Codex r2
-  F6 NIT)**: lines 171, 327, 852.
+- **Stale "four manifest tests" → "five" sweep (Codex r2 F6
+  NIT)**: lines 171, 327, 852 corrected.
 
 ## v2 changes from v1
 
@@ -199,12 +224,17 @@ longer touches. The risk surfaces are:
    interface stay**; only the bpf2go-backed `loadAllObjects()`
    bootstrap graph goes.
 2. `Manager.Load()` currently calls `loadAllObjects()`. After this PR
-   it must either be deleted (preferred) or stubbed to return an
-   error directing the operator to use `LoadUserspaceShim()`. The
-   `TypeEBPF` enum value still exists in `pkg/dataplane/dataplane.go`
-   and is still selectable via `system dataplane-type ebpf` at the
-   config layer. After deletion, `TypeEBPF` is functionally a
-   retirement-error token like `TypeDPDK` became in #1525/#1528.
+   it is **kept** with its body rewritten to `return
+   ErrEBPFBackendRetired` — see §4.1 Option A and §5 public-API
+   table. Deletion is not safe because the `DataPlane` interface
+   assertion at `pkg/dataplane/dataplane.go:29` and
+   `Manager.Start()` at `pkg/dataplane/apply.go:208` both depend
+   on the method existing. The `TypeEBPF` enum value still exists
+   in `pkg/dataplane/dataplane.go` and is still selectable via
+   `system dataplane-type ebpf` at the config layer (parse path);
+   the commit-time strict validator rejects with the retirement
+   message, so `TypeEBPF` is functionally a retirement-error token
+   like `TypeDPDK` became in #1525/#1528.
 3. The retirement-boundary canary (`legacy_bpf_manifest_canary_test.go`,
    `retirement_boundary_canary_test.go`) is pre-loaded with the exact
    deletion manifest at
@@ -376,6 +406,9 @@ Option B, plan revises before any code moves.
 | `docs/development-workflow.md` line 24 | Remove the "`make generate-legacy-bpf` runs the legacy XDP/TC bpf2go directives" line. |
 | `docs/refactoring-audit.md` lines 20, 83 | Remove references to `bpf/xdp/*.c`, `bpf/tc/*.c` as live source paths. Trim or move to historical section. |
 | `docs/userspace-master-merge-20260310.md` lines 40-46 | Historical doc; convert to past-tense or move to `docs/archived/`. |
+| `pkg/dataplane/constants.go:14` | **(v3 — Codex r3 F5 NEW)** Doc comment "MaxEntries assertion in loader_ebpf.go catches drift" references the deleted file. Update to point at the new `loader_userspace_shim.go` (where `validateUserspaceShimSpec` and `userspaceBindingsMaxEntriesDriftError` live post-move). |
+| `docs/testing.md:281` | **(v3 — Codex r3 F5 NEW)** Step describing restart-time map preservation refers to `loadAllObjects()`. Update to reference `loadUserspaceShimObjects()` or remove the legacy-only step (depends on whether the runbook is still relevant post-retirement). |
+| `docs/next-features/ipv6-session-fast-path.md` lines 16, 38 | **(v3 — Codex r3 F5 NEW)** Active next-feature doc still cites `bpf/xdp/xdp_zone.c` as a live source path. Rewrite to reference the userspace-dp equivalent or mark explicitly as "legacy reference (deleted in #1476)". |
 | `docs/userspace-native-gre-plan.md` line 116, `docs/userspace-icmp-te-debugging.md` line 104 | Rewrite to reference userspace-dp/userspace-xdp source paths or mark as historical context. |
 | `docs/active-active-new-connections.md` lines 481-482, `docs/fabric-cross-chassis-fwd.md` lines 46, 82 | Historical narrative of legacy XDP design. Re-frame as "legacy XDP design (deleted in #1476)" or move to archived. |
 | `docs/services-application-identification.md` line 51, `docs/userspace-performance-plan.md` line 258 | Rewrite to reference userspace-dp equivalents or mark historical. |
@@ -701,10 +734,20 @@ remains the userspace entry point.
      pre-upgrade run. Verify this cleanup remains correct after
      the v2 narrowing.
 
-8. **#1494 boundary canaries.** `pkg/dataplane/userspace/`
-   shim_loader_boundary tests verify the shim does not regrow
-   legacy fallbacks. These pass unchanged because the legacy code
-   they pinned is gone, leaving the boundary trivially correct.
+8. **#1494 boundary canaries (v3 corrected per Codex r2 F3 NEW
+   + r3 F2).** `pkg/dataplane/userspace/` shim_loader_boundary
+   tests verify the shim does not regrow legacy fallbacks. They
+   pass at the **semantic** level after deletion because the legacy
+   code they pinned is gone, leaving the boundary trivially
+   correct. However, `shim_loader_boundary_test.go:45`
+   hard-codes the filesystem path
+   `filepath.Join("..", "loader_ebpf.go")`, which becomes a
+   nonexistent file after this PR's deletion. The deletion must
+   update the path argument to the new
+   `loader_userspace_shim.go` per §4.3's explicit edit row. The
+   adjacent grep-on-source assertions inside the test (e.g.
+   "legacy fallback" tokens) need to be re-evaluated against the
+   moved function body.
 
 9. **xpfd binary size.** Expected ~3-5 MB reduction (depending on
    strip level) because 14 embedded `.o` byte arrays disappear from
@@ -718,7 +761,7 @@ remains the userspace entry point.
 | Behavioral regression | LOW | All retained paths bit-identical; deleted code has zero production callers after #1451 closes |
 | Loader refactor (split) | MED | `loadUserspaceShimObjects` move must be byte-for-byte equivalent. Easy to verify with `gofmt` and side-by-side diff |
 | Build-system breakage | MED | `Makefile generate-legacy-bpf` deletion must be atomic with `.PHONY:` line edit. Mismatched edits produce a make warning. Verify `make generate && make build` clean |
-| Test breakage | MED | 4 retirement-manifest canaries + retirement-boundary canary + every test that touches deleted bpf2go types. Audit list in §4.3 |
+| Test breakage | MED | 5 retirement-manifest canaries + retirement-boundary canary + every test that touches deleted bpf2go types + the 4 non-daemon ebpf-warning tests rewritten under §4.3. Audit list in §4.3 |
 | Canary surgery | MED | `retainedShimBoundaryBuildTagAllowlist` has 14 keys; missing one fails the canary |
 | Architectural mismatch | LOW | Mechanical deletion only; no architectural premise to fail |
 | Stored-config rolling upgrade | LOW under Option A; MED under Option B | See §4.6 |
@@ -760,16 +803,21 @@ demand a major revision.
    reasoning. PLAN-KILL if a reviewer can show Option A leaves a
    boot blackout.
 
-2. **`Manager.Load()` deletion safety.** Currently `Manager.Load()`
-   is the entry point for the legacy `dataplane-type ebpf` mode
-   (and is consumed in tests via `dataplane.TypeEBPF`). After this
-   PR, `NewDataPlane(TypeEBPF)` returns `ErrEBPFBackendRetired`
-   directly, so `Manager.Load()` becomes unreachable from production.
-   But test files (`tunnel_anchor_test.go`, `vip_readiness_test.go`,
-   `per_rg_test.go`, `dataplane_boot_test.go`) construct a Manager
-   directly and may call `.Load()`. Plan migrates those tests to
-   `LoadUserspaceShim()` OR rewrites them to use a different setup
-   path. Reviewer to verify the test-side migration is exhaustive.
+2. **`Manager.Load()` retention safety (v3 corrected per Codex r3
+   F3).** v1 wrongly proposed deletion; v2/v3 retain
+   `Manager.Load()` as a retirement-stub returning
+   `ErrEBPFBackendRetired`. After this PR,
+   `NewDataPlane(TypeEBPF)` returns the same sentinel directly,
+   so `Manager.Load()` becomes unreachable from production
+   factories. The four test files
+   (`tunnel_anchor_test.go:55`, `vip_readiness_test.go:352`,
+   `per_rg_test.go:121`, `dataplane_boot_test.go:48-61`) do NOT
+   call `Manager.Load()` directly — they set
+   `cfg.System.DataplaneType = dataplane.TypeEBPF` for
+   struct-logic branches. Only `dataplane_boot_test.go` calls the
+   factory `buildRuntimeDataPlane(TypeEBPF)` and asserts
+   `*dataplane.Manager`; v3 rewrites just that test per §4.3 to
+   assert `ErrEBPFBackendRetired`. The other three stay unchanged.
 
 3. **`loadUserspaceShimObjects` extraction correctness.** The
    plan splits `loader_ebpf.go` into "retained shim load" + "legacy
@@ -920,4 +968,4 @@ otherwise). The `## Retain Manifest` section is unchanged.
 
 ---
 
-**End of plan v1.** Awaiting Codex + AGY plan-review verdicts.
+**End of plan v4.** Awaiting Codex + AGY r4 plan-review verdicts.

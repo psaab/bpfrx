@@ -12,6 +12,8 @@ rounds. Append a row per dispatch.
 | r1b | Codex (gpt-5.5) | bash:ba71kfn0k (local) | PLAN-NEEDS-MAJOR | 6 findings (1,2,3,4,5,8): Manager.Load() interface break, make clean nukes shim, retained-helper under-list, nat_port_counters misclass, loader_stub canary gaps, TypeEBPF test migration |
 | r2 | AGY (adversarial) | adversarial-review-mpleu3yh-ppf34j | PLAN-NEEDS-MINOR | 4 missing retained helpers: userspaceBindingsMaxEntriesDriftError, userspaceIngressIfacesMaxEntriesDriftError, userspaceShimMaxSessions, userspaceShimMaxNATPools |
 | r2 | Codex (gpt-5.5) | bash:b6lqkxdnp (local) | PLAN-NEEDS-MAJOR | 5 findings: stale §5 Manager.Load() row; F3 still under-listed (overlap with AGY r2); shim_loader_boundary_test path hardcode (NEW); F4 stale drop-pin text; non-daemon ebpf-warning tests will fail (NEW) |
+| r3 | AGY (adversarial) | adversarial-review-mplfqxg2-tsn5wi | PLAN-READY | 1 cosmetic nit: risk-table line 721 "4" → "5" (absorbed into v4) |
+| r3 | Codex (gpt-5.5) | local pid 1246138 | PLAN-NEEDS-MAJOR | 6 findings, all stale-text drift / doc-sweep gaps; no new operational issues. Fixed in v4. |
 
 ## Code review (Phase B only)
 
