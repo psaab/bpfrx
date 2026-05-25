@@ -1808,3 +1808,18 @@
   - **File(s)**: `userspace-dp/src/afxdp/wg/framing.rs`, `_Log.md`
   - **Validation**: cargo build --release; cargo test --release --bin
     xpf-userspace-dp afxdp::wg.
+
+- **Timestamp**: 2026-05-25T05:58Z
+- **Action**: PR #1536 — add ErrDPDKDataplaneRetired sentinel + errors.Is test (AGY round-N feedback)
+- **File(s)**: pkg/config/compiler.go, pkg/config/parser_ast_test.go
+- **Why**: Antigravity adversarial-review-mpksjr0e-f3mjrn flagged the lack of a
+  structured sentinel error as an API design gap. External consumers (gRPC
+  orchestration, REST wrappers, CLI tooling) cannot programmatically match
+  the DPDK retirement reject without substring-searching the error text.
+  Adding `var ErrDPDKDataplaneRetired = errors.New(...)` and returning it
+  from validateDataplaneTypeStrict preserves the verbatim message contract
+  (existing tests still pass via strings.Contains) and adds programmatic
+  matching via errors.Is. Mirrors the runtime-side
+  dataplane.ErrDPDKBackendRetired sentinel introduced by #1527 / PR #1535.
+- **Validation**: TestDPDKConfigCompileRejects extended with errors.Is
+  assertion; full pkg/config + pkg/configstore suites green.

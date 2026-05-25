@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -2691,6 +2692,14 @@ func TestDPDKConfigCompileRejects(t *testing.T) {
 	// file at package scope.
 	if !strings.Contains(err.Error(), dpdkRetirementSubstr) {
 		t.Fatalf("CompileConfig error = %q, want substring %q", err.Error(), dpdkRetirementSubstr)
+	}
+	// Structured-error contract: external API consumers must be able
+	// to match the DPDK retirement reject with errors.Is rather than
+	// substring-searching the error text. The verbatim text is still
+	// part of the contract (see dpdkRetirementSubstr above), but the
+	// sentinel is the programmatic handle.
+	if !errors.Is(err, ErrDPDKDataplaneRetired) {
+		t.Fatalf("CompileConfig error = %v, want errors.Is(err, ErrDPDKDataplaneRetired)", err)
 	}
 }
 

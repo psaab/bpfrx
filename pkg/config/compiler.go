@@ -1,11 +1,27 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
 )
+
+// ErrDPDKDataplaneRetired is the sentinel error returned at commit
+// time when a configuration sets `system dataplane-type dpdk`. External
+// API consumers (gRPC orchestration, REST wrappers, CLI tooling) can
+// match this with errors.Is rather than substring-searching the wrapped
+// error text. The wrapped form is preserved verbatim so the operator-
+// facing migration message remains stable; see #1525.
+//
+// Mirrors the runtime-side dataplane.ErrDPDKBackendRetired sentinel
+// introduced by #1527 so the config-time and runtime layers both expose
+// structured rejections.
+var ErrDPDKDataplaneRetired = errors.New(
+	"the DPDK dataplane backend has been retired; " +
+		"use 'set system dataplane-type userspace' " +
+		"(see #1525)")
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
 // It clones the tree before expansion so the original tree is not mutated.
@@ -305,10 +321,7 @@ func validateDataplaneTypeStrict(cfg *Config) error {
 		return nil
 	}
 	if cfg.System.DataplaneType == dataplaneTypeDPDK {
-		return fmt.Errorf(
-			"the DPDK dataplane backend has been retired; " +
-				"use 'set system dataplane-type userspace' " +
-				"(see #1525)")
+		return ErrDPDKDataplaneRetired
 	}
 	return nil
 }
