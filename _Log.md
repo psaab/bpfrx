@@ -1,5 +1,20 @@
 # Action Log
 
+## 2026-05-25 — #1529 Antigravity code-review finding follow-up
+
+- **Timestamp**: 2026-05-25T06:30:00Z
+  - **Action**: Antigravity code review MERGE-READY with one new
+    finding: `pkg/dataplane/README.md` and `pkg/daemon/README.md`
+    were missed by the original docs/ + root grep. The issue body
+    for #1529 explicitly names `pkg/dataplane/README.md` as part
+    of the retirement boundary, so this was a scope-coverage miss.
+    Edited `pkg/dataplane/README.md` and `pkg/daemon/README.md` to
+    reframe DPDK references past-tense; pointed at the canary-
+    pinned `#1475 DPDK Backend Policy` section as the historical
+    anchor.
+  - **File(s)**: `pkg/dataplane/README.md`, `pkg/daemon/README.md`,
+    `_Log.md`
+
 ## 2026-05-25 — #1529 implementation
 
 - **Timestamp**: 2026-05-25T06:00:00Z

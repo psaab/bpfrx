@@ -13,8 +13,8 @@ every other internal package.
 The daemon stores dataplane backends behind `dataplane.RuntimeDataPlane` and
 uses the split config, HA/fabric, sessions, telemetry, and link-cycle domains.
 Legacy `dataplane.DataPlane` access is isolated behind `legacyDP()` for
-callers that still need eBPF/DPDK compatibility while their domain adapters
-are completed. Userspace currently reaches those old callers through
+callers that still need legacy eBPF compatibility while their domain adapters
+are completed (DPDK retired #1525). Userspace currently reaches those old callers through
 `userspace.LegacyDataPlaneAdapter`; the userspace `Manager` remains a
 runtime-domain type, and the adapter is only the transition boundary for
 status, CLI, and cluster-sync paths that still call `legacyDP()`.
