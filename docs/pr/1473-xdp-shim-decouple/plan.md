@@ -41,8 +41,11 @@ Proof on master at `da103d81`:
   - `rg -n "userspace_fallback_progs|fallback_to_main"
     --type rust --type go --type c` returns no runtime hits; only
     historical / archived docs reference the old name.
-  - `rg -n "xdp_main_prog" pkg/dataplane/userspace/` shows a single
-    explanatory comment at `manager.go:498`, no live call.
+  - `rg -n "xdp_main_prog" pkg/dataplane/userspace/` reports two
+    hits, both intentional: `manager.go:498` is the contract comment
+    forbidding the swap; `shim_loader_boundary_test.go:69` is a
+    forbidden-token literal that the test searches for in production
+    source. Neither is a live call.
 
 ### AC2 — Compat/strict behavior explicitly defined and tested
 
@@ -120,8 +123,16 @@ Proof on master:
   - Selects only the Rust shim build script; does not invoke any
     legacy `bpf2go` directive.
 - The Rust shim build script (`pkg/dataplane/build-userspace-xdp.sh`)
-  invokes only `cargo` against `userspace-xdp/`; no `clang`, `bpf2go`,
-  or legacy header invocation.
+  invokes only `cargo` against `userspace-xdp/`; no `clang` and no
+  `bpf2go` invocation. The script does still parse `MAX_INTERFACES`
+  from `bpf/headers/xpf_common.h` (`build-userspace-xdp.sh:24`) so
+  the shim's `BINDING_ARRAY_MAX_ENTRIES` and `userspace_ingress_ifaces`
+  capacity stay locked to the same constant as the legacy `tx_ports`
+  map width (the drift mode #814 closed). This is a retained
+  read-only header dependency, not a bpf2go / legacy XDP build
+  invocation. The header itself either moves into a userspace-owned
+  source of truth or stays as a small retained shared constants
+  header when #1476 deletes the rest of the legacy source tree.
 - Canaries pin the contract:
   - `TestUserspaceXDPGenerateTargetStaysDecoupledFromLegacyBPF`
     (`pkg/dataplane/retirement_boundary_canary_test.go:265`) parses
@@ -193,8 +204,11 @@ repo. Only `docs/archived/`, `docs/issues/`, and historical
 1. Add `docs/pr/1473-xdp-shim-decouple/plan.md` (this file) so the
    #1473 evidence trail lives next to its sibling plans.
 2. Update `docs/pr/1373-retire-ebpf-dataplane/README.md` to mark
-   `#1473` as Closed in the Current Removal Work table, with the
-   evidence trail pointing at the canaries and tests cited above.
+   `#1473` as Closeout-pending in the Current Removal Work table,
+   pointing at the per-AC evidence trail. The PR does not flip the
+   GitHub issue state itself; #1473 is closed by the project owner
+   once this evidence PR merges. The Closed transition is reserved
+   for the merge-time README update bundled with the close.
 3. Run the targeted regression set
    (`pkg/dataplane` + `pkg/dataplane/userspace` userspace and
    canary tests) and append the result to `_Log.md`.
