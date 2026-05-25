@@ -2449,3 +2449,25 @@
   handler path are `request chassis cluster data-plane userspace` via
   cli_request.go:handleRequestChassisClusterDataPlane. Updated plan snippet
   in lockstep so docs match implementation. No code change.
+- **Timestamp**: 2026-05-25T07:30Z
+- **Action**: #1522 plan v2 — pruned bpf/xdp/, bpf/tc/, bpf/headers/ README banner edits per AGY PLAN-NEEDS-MINOR (adversarial-review-mpkub795-6e2gou)
+- **File(s)**: docs/pr/1522-readme-doc-drift/plan.md, docs/pr/1522-readme-doc-drift/reviewer-ids.md
+- **Why**: AGY adversarial-review-mpkub795-6e2gou returned PLAN-NEEDS-MINOR
+  on plan v1 with one specific scope-reduction request: prune the three
+  bpf/*/README.md banner edits because #1476 will mechanically delete the
+  entire bpf/ tree — editing those READMEs is pure churn that #1476 will
+  reverse. v2 edit list reduced from 5 files to 2 (dpdk_worker/README.md +
+  pkg/logging/README.md). Re-dispatching Codex + AGY plan review on v2.
+
+- **Timestamp**: 2026-05-25T08:10Z
+- **Action**: #1522 plan v3 — pruned dpdk_worker/README.md after rebase onto current master (d237cceb) exposed #1528 will delete the entire dpdk_worker/ tree
+- **File(s)**: docs/pr/1522-readme-doc-drift/plan.md, docs/pr/1522-readme-doc-drift/reviewer-ids.md, pkg/logging/README.md
+- **Why**: Same scope-reduction principle AGY applied to bpf/*/README.md in
+  v2. #1528 is OPEN and its issue body explicitly lists
+  dpdk_worker/README.md in the deletion set; master CLAUDE.md states
+  "DPDK dataplane retired in #1525. ... removed in #1527/#1528". v3 is a
+  strict subset of v2 (AGY adversarial-review-mplbvcsb-kxkn6q
+  PLAN-READY) so no re-dispatch needed. Scope is now 1 file:
+  pkg/logging/README.md line 46 one-token reframe ("...as eBPF
+  ring-buffer events" -> "...as the legacy eBPF ring-buffer events do").
+- **Validation**: Defensive go test ./pkg/dataplane/... -run RetirementBoundary pending after commit.
