@@ -29,3 +29,20 @@ so a fresh session can `result <id>` without re-dispatching.
 - Copilot: `@copilot review` posted to PR #1554; awaiting.
 - Claude SMR review: posted as PR comment 4535284297, verdict MERGE-READY.
 - Dispatched: 2026-05-25T15:25Z (approx).
+- **r1 verdicts** (head `bace61ac`):
+  - AGY adversarial-review-mplcffbz-bwa6fo: **MERGE-NEEDS-MINOR** (cursor fallback regression + missing tests).
+  - Codex task-mplcj462-u4wie3: **MERGE-NEEDS-MINOR** (same cursor finding + same test gap).
+  - Copilot: COMMENTED with 3 inline comments (grammar nit, README.md request, _Log.md duplicate header).
+  - Claude SMR: MERGE-READY (acknowledged the test-coverage minor but ruled it acceptable).
+
+## Code review round 2 (head `d74e2805` — r1 follow-up)
+
+- Codex task: `task-mplcuy5p-63l4qu` — **MERGE-READY**, no findings. Verified sentinel identity flow, production-delegation path, fallback semantics, compile-time guard, and r1 test coverage.
+- AGY job: `adversarial-review-mplcugio-dm2nh7` — **MERGE-READY**, all 5 hostile checks PASS.
+- Copilot review #2 (2026-05-25T15:24Z) — COMMENTED with no new findings (all 3 r1 inline comments addressed; reviewed 13/13 files).
+- Claude SMR — MERGE-READY across all three lenses (verified inline above).
+- Dispatched: 2026-05-25T16:00Z (approx).
+
+## Final state
+
+All four reviewers converged MERGE-READY on head `d74e2805`. PR-body checklist still has the AWAITING-SMOKE box unchecked; explicit `<!-- AWAITING-SMOKE -->` marker posted as PR comment 4535361953 for the serialized smoke-runner singleton per `feedback_smoke_serialized_single_agent`. Auto-merge fires on smoke-pass per `feedback_auto_merge_on_clean_triple`.
