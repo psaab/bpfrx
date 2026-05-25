@@ -14,6 +14,21 @@ import (
 var _ dataplane.DataPlane = (*LegacyDataPlaneAdapter)(nil)
 var _ dataplane.RuntimeDataPlane = (*LegacyDataPlaneAdapter)(nil)
 
+// #1516 sub-#1451 S1 — guard against signature drift on the
+// LegacyDataPlaneAdapter cursor-pagination delegation methods. The
+// gRPC server's session-pagination handler (server_sessions.go)
+// performs a runtime type assertion against an unexported
+// `sessionCursorIterator` interface declared in pkg/grpcapi. If
+// either of the signatures below drifts away from that interface,
+// the assertion would silently fail at runtime and the handler
+// would fall through to the full-table scan path under userspace —
+// exactly the silent-degradation hazard #1516 closed. This compile-
+// time assertion catches the drift at build time instead.
+var _ interface {
+	IterateSessionsFrom(cursor *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error
+	IterateSessionsV6From(cursor *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
+} = (*LegacyDataPlaneAdapter)(nil)
+
 // LegacyDataPlaneAdapter is the compatibility boundary for callers that still
 // depend on the old BPF-shaped dataplane.DataPlane interface.
 //
