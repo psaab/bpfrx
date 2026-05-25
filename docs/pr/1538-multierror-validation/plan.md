@@ -10,18 +10,18 @@ AGY round-3 PLAN-NEEDS-MINOR (1 finding):
   rejects explicit `dpdk`, and unset == userspace via
   `effectiveDataplaneType` in `pkg/config/compiler.go`
   (pinned by `TestDataplaneTypeOmittedCompilesCleanly` at
-  `pkg/config/parser_ast_test.go:2983`). Line stays as
+  `pkg/config/parser_ast_test.go`). Line stays as
   self-documenting future-proofing.
 - Fix test-count to three throughout (was "two" at v3
   plan.md:69 and :86).
 - Replace bad three-color-policer syntax
   `action loss-priority high then discard` with schema-clean
   `then discard` — the `action` form parses via the
-  schema-less fallback at `pkg/config/ast_edit.go:151-152` but
-  is silently ignored by `compiler_firewall.go:144-155` which
+  schema-less fallback in `pkg/config/ast_edit.go` but
+  is silently ignored by `compiler_firewall.go` which
   only traverses the `then` child.
 - Rewrite the gRPC test plan to match the existing direct-handler
-  test style at `pkg/grpcapi/server_config_test.go:15-25`
+  test style at `pkg/grpcapi/server_config_test.go`
   (no bufconn — the existing tests construct `*Server`
   directly with a temp-dir Store and call handlers). Use
   `store.LoadSet(...)` per existing pattern, not nonexistent
@@ -54,9 +54,9 @@ The strict-validator block in `pkg/config/compiler.go::compileExpanded`
 currently short-circuits on the first failure across three independent
 validator families:
 
-- `validateClassOfServiceStrict`   (compiler.go:244)
-- `validateThreeColorPolicersStrict` (compiler.go:247)
-- `validatePolicySchedulerReferencesStrict` (compiler.go:250)
+- `validateClassOfServiceStrict`   (compiler.go)
+- `validateThreeColorPolicersStrict` (compiler.go)
+- `validatePolicySchedulerReferencesStrict` (compiler.go)
 
 In an upgrade scenario where a legacy candidate carries multiple
 dormant structural errors (e.g., a malformed CoS scheduler-map
@@ -98,10 +98,10 @@ Absolute scale of the win:
 
 **Honest caveat on "one error per family."** Each existing
 strict validator still fail-fasts INTERNALLY (e.g.,
-`validateThreeColorPolicersStrict` in `pkg/config/compiler.go`
-returns on the first bad policer; `validateClassOfServiceStrict`
-at `:363+` returns on the first bad scheduler; same for
-`validatePolicySchedulerReferencesStrict`). This PR does NOT
+`validateThreeColorPolicersStrict` returns on the first bad
+policer; `validateClassOfServiceStrict` returns on the first
+bad scheduler; same for `validatePolicySchedulerReferencesStrict`
+— all in `pkg/config/compiler.go`). This PR does NOT
 expand intra-validator accumulation. The operator gets at most
 ONE error from each family in a single response — a maximum of
 three findings, not "every dormant error." Future work could
@@ -120,19 +120,19 @@ upgrade-friction win, PLAN-KILL.
 ## DPDK precheck contract — preserved verbatim
 
 PR #1536 (merged as commit cdad3c31 / merge 4508d714) installed
-`validateDataplaneTypeStrict` at `pkg/config/compiler.go:241`
+`validateDataplaneTypeStrict` at `pkg/config/compiler.go`
 BEFORE the other strict validators with explicit UX intent
-(`compiler.go:234-243`): the operator must see the migration
+(`compiler.go`): the operator must see the migration
 message FIRST when a candidate has both a retired dataplane-type
 AND any unrelated structural error.
 
 The brittle-by-design test `TestDataplaneTypeDPDKRejectedAtCommitFiresFirst`
-at `pkg/config/parser_ast_test.go:2855` asserts BOTH:
+at `pkg/config/parser_ast_test.go` asserts BOTH:
 
 1. The DPDK retirement substring is present in the error
-   (`parser_ast_test.go:2909`).
+   (`parser_ast_test.go`).
 2. The string "three-color-policer" does NOT leak through
-   (`parser_ast_test.go:2913`).
+   (`parser_ast_test.go`).
 
 #1538 must NOT break either assertion. The clean answer is to
 KEEP `validateDataplaneTypeStrict` as a separate fail-fast
@@ -239,7 +239,7 @@ similar.
    a `joinError` with `Unwrap() []error`, traversed by
    `errors.Is` since Go 1.20.
 3. **Wrap chain.** `fmt.Errorf("commit check failed: %w", join)`
-   at `pkg/configstore/store.go:681` wraps the join into a
+   at `pkg/configstore/store.go` wraps the join into a
    single `%w` chain; `errors.Is/As` traverse through that
    wrap AND the underlying join.
 4. **Substring contracts.** `strings.Contains(join.Error(), substr)`
@@ -259,7 +259,7 @@ similar.
      reads `cos.Schedulers` and `cos.SchedulerMaps` only. Nil-safe
      on `cos == nil`, each `sched == nil`, each `schedMap == nil`,
      missing scheduler reference.
-   - `validateThreeColorPolicersStrict` (`compiler.go:262+`) —
+   - `validateThreeColorPolicersStrict` (`compiler.go`) —
      reads `cfg.Firewall.ThreeColorPolicers` map only. Nil-safe
      on each `pol == nil`.
    - `validatePolicySchedulerReferencesStrict` (`compiler.go`) —
@@ -268,7 +268,7 @@ similar.
      `zpp == nil`, `pol == nil || pol.SchedulerName == ""`.
 
    `compileExpanded` only reaches the strict block after all
-   compile_* phases succeed (`compiler.go:82-153`), so the
+   compile_* phases succeed (`compiler.go`), so the
    typed sub-structs are independently populated regardless of
    whether any one validator returns an error. Cross-contamination
    is impossible: validators are pure functions over the typed
@@ -309,7 +309,7 @@ similar.
 **Fixture choice — parser-reachable strict-validator errors.**
 
 The CoS "both buffer-size bytes AND percent set" condition is
-NOT parser-reachable: `pkg/config/compiler_class_of_service.go:239`
+NOT parser-reachable: `pkg/config/compiler_class_of_service.go`
 clears the alternate field, and the validator at
 the comment in `pkg/config/compiler.go` notes the state "can only arise in
 constructed or externally-assembled configs." For tests that
@@ -375,26 +375,31 @@ For the byte-identity test we call the helper directly (no parser).
      not in play; defense-in-depth).
 
 2. **`TestCompileSingleStrictErrorJoinPath`** —
-   `pkg/config/compiler_test.go`. Call the new
-   accumulator helper (`accumulateStrictValidators` or
-   inline-equivalent depending on implementation choice) with a
-   hand-built `*Config` that triggers only ONE family. Assert
-   `err.Error()` is byte-identical to the single underlying
-   validator return. The hand-built path is fine here because
-   the goal is to pin `errors.Join`'s single-element semantics
-   (Go std lib documents byte-identity at
-   `/usr/lib/go-1.24/src/errors/join.go:47-48`, confirmed by
-   Codex round-2). This protects against any future
-   helper-wrapper drift; the bare-`*Config` route makes the
-   test independent of parser/compiler shape changes.
+   `pkg/config/compiler_test.go`. Drives through the production
+   path `ParseSetCommand` → `tree.SetPath` → `CompileConfig`
+   with a fixture that triggers ONLY the CoS family (no policer
+   lines), so the accumulator slice ends up length-1. Asserts
+   `err.Error()` is byte-identical to a direct
+   `validateClassOfServiceStrict` call on an equivalent stub
+   `*ClassOfServiceConfig` (the direct call is the reference
+   value; the test only USES it for comparison, not as the
+   production path). Plus zero-`\n`-separator and an incidental
+   `errors.Is(err, ErrDPDKDataplaneRetired) == false`
+   wrap-chain traversal assertion. Pins `errors.Join`'s
+   single-element semantics (Go std lib documents
+   byte-identity in the std `errors.Join` source). Exercising
+   the production `CompileConfig` path catches any future
+   regression that wraps or reformats the single-error result
+   inside `compileExpanded` (per Codex code-review round-1
+   finding on the original test design).
 
 3. **`TestCompileCheckMultiErrorRendersThroughGRPC`** —
    `pkg/grpcapi/server_config_test.go`. Construct a `*Server`
    directly with a temp-dir-backed `configstore.Store` per the
-   existing pattern at
-   `pkg/grpcapi/server_config_test.go:15-25` (no bufconn — the
-   existing tests call handlers directly). Seed the candidate
-   via `store.EnterConfigure()` + repeated `store.LoadSet(...)`
+   existing pattern in that file (no bufconn — the existing
+   tests construct handlers directly with a `*Server` value
+   plus a `*configstore.Store`). Seed the candidate via
+   `store.EnterConfigure()` + repeated `store.LoadSet(...)`
    with the same fixture lines as test 1 (CoS
    `equal-flow-enforcement` + policer `single-rate color-blind`
    + `then discard`). Call `s.CommitCheck(...)`; assert the
@@ -404,9 +409,10 @@ For the byte-identity test we call the helper directly (no parser).
    `\n`.
 
    Rationale (Codex r2 agreed): the rendering layer being
-   tested is `pkg/grpcapi/server_config.go:176`, not
+   tested is `pkg/grpcapi/server_config.go`, not
    configstore. Configstore only emits raw/wrapped errors via
-   `pkg/configstore/store.go:661`/`:681`. Testing at the gRPC
+   `pkg/configstore/store.go` (`Commit` wraps the compile
+   error). Testing at the gRPC
    boundary captures the actual operator-facing surface, and
    doing it via direct-handler call (not bufconn) matches the
    existing test style.
@@ -414,14 +420,14 @@ For the byte-identity test we call the helper directly (no parser).
 ### Existing test gates (must not regress)
 
 - `TestDataplaneTypeDPDKRejectedAtCommitFiresFirst`
-  (`pkg/config/parser_ast_test.go:2855`) — DPDK contract.
+  (`pkg/config/parser_ast_test.go`) — DPDK contract.
 - `TestDPDKConfigCompileRejects`
   (`pkg/config/parser_ast_test.go`) — DPDK substring + sentinel.
 - `TestCompileClassOfServiceBothBufferFieldsRejected`
   (`pkg/config/parser_class_of_service_test.go`) — direct
   validator call, unaffected.
 - `TestCommit_RejectsDPDKDataplaneType`
-  (`pkg/configstore/store_test.go:1460`) — wrapped DPDK
+  (`pkg/configstore/store_test.go`) — wrapped DPDK
   substring through Commit, unaffected.
 - All other commit/commit-check substring tests in
   `pkg/configstore/store_test.go`.

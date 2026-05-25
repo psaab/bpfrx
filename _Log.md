@@ -110,6 +110,31 @@
   - **File(s)**:
     `docs/pr/1520-userspace-boot-extraction/plan.md`,
     `docs/pr/1520-userspace-boot-extraction/reviewer-ids.md`
+- **Timestamp**: 2026-05-25T09:15:00Z
+  - **Action**: #1538 code-review round-2 doc cleanup —
+    Codex code review round 2 verdict was NEEDS-MINOR with
+    two doc-only findings (AGY round-2 was MERGE-READY,
+    Copilot pending):
+    1. plan.md still described the OLD
+       TestCompileSingleStrictErrorJoinPath design (hand-built
+       *Config / direct helper). Rewrote the description to
+       match the actual implementation (ParseSetCommand →
+       SetPath → CompileConfig path with single-CoS-only
+       fixture, byte-identity vs direct validator call as
+       reference, defense-in-depth zero-newline + wrap-chain
+       traversal assertions).
+    2. Many `file:line` citations remained in plan.md after
+       the first cleanup pass (compiler.go:244/247/250,
+       :363+, :241, :234-243, :262+, :82-153, store.go:681,
+       ast_edit.go:151-152, etc). Stripped all of them via
+       sed to use durable symbol references instead.
+    Also fixed a couple of leftover sed artifacts manually
+    (`/`:681`` artifact at line 414; the `at :363+`
+    construction at line 103).
+    Re-ran ./pkg/config/ + ./pkg/grpcapi/ tests: clean.
+  - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
+    `_Log.md`
+
 - **Timestamp**: 2026-05-25T09:00:00Z
   - **Action**: #1538 code-review round-1 follow-up — addresses
     Codex code-review NEEDS-MINOR (3 findings; AGY MERGE-READY,
