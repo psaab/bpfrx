@@ -2,6 +2,15 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T00:00:00Z
+  - **Action**: PR #1531 plan v1 drafted. Retire DPDK
+    recommendations in `docs/dataplane-decision-dpdk-vs-vpp.md`
+    and `docs/dpdk-dataplane.md`; rewrite both as short
+    retirement notices pointing at #1525.
+  - **File(s)**: `docs/pr/1531-dpdk-docs-retire/plan.md`
+
+## 2026-05-24 (prior)
+
 - **Timestamp**: 2026-05-25T00:45:00Z
   - **Action**: PR #1512 review follow-up — tightened the positional
     `dataplane.Manager` literal canary on two axes. (a) Recurse into nested
