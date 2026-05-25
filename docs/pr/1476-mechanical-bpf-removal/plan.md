@@ -1,14 +1,95 @@
 # #1476 — eBPF Retirement: Mechanical Source Removal
 
-**Status:** DRAFT v1 — to be plan-reviewed by Codex + Antigravity. The
-#1373 umbrella's mechanical-deletion phase. Blocked-on-merge by #1516
-(grpcapi migration) and #1521 (userspace maps_sync decouple), both
-sub-issues of #1451. #1473, #1493, #1494, #1518, #1522 already merged.
+**Status:** DRAFT v2 — addresses Codex r1b PLAN-NEEDS-MAJOR (6 findings)
+and AGY r1 PLAN-NEEDS-MINOR (2 findings). The #1373 umbrella's
+mechanical-deletion phase. Blocked-on-merge by #1516 (grpcapi
+migration) and #1521 (userspace maps_sync decouple), both sub-issues
+of #1451. #1473, #1493, #1494, #1518, #1522 already merged.
 
 This plan is staged while the in-flight blockers close so review can
 happen in parallel with #1451 completion. Phase B (implementation)
 rebases onto master once `gh issue view 1451 --json state` returns
 `CLOSED`.
+
+## v2 changes from v1
+
+- **§4.1 Option A clarified — `Manager.Load()` kept as retirement
+  stub**: Both reviewers caught that the `DataPlane` interface at
+  `pkg/dataplane/dataplane.go:209` requires `Load()` AND
+  `Manager.Start()` at `pkg/dataplane/apply.go:208` calls
+  `m.Load()`. The compile-time interface assertion at
+  `pkg/dataplane/dataplane.go:29` (`var _ DataPlane =
+  (*Manager)(nil)`) would break under v1's outright deletion. Plan
+  v2 keeps `Manager.Load()` as a method that returns
+  `ErrEBPFBackendRetired` directly (Option C-shape, with Option A
+  retirement-error semantics). The interface stays bit-identical;
+  `Manager.Start()` keeps calling `m.Load()` and propagates the
+  retirement sentinel up to `daemon_run.go:247`-style soft-fallback
+  consumers.
+- **§4.3 Makefile clean narrowed**: Both reviewers flagged
+  `Makefile:66-67` `rm -f pkg/dataplane/*_bpfel.go
+  pkg/dataplane/*_bpfeb.go` + `*_bpfel.o`/`*_bpfeb.o` would delete
+  the retained `pkg/dataplane/userspace_xdp_bpfel.o` (embedded by
+  `userspace_xdp_rust.go:11`). v2 narrows globs to
+  `pkg/dataplane/xpf*_bpfel.{go,o}` so the retained shim object is
+  never matched.
+- **§4.3 `dataplane_boot_test.go` rewrite required**: AGY r1 +
+  Codex F8 both caught that
+  `TestBuildRuntimeDataPlaneEBPFRoutesToLegacyManager` at
+  `pkg/daemon/dataplane_boot_test.go:48-61` (added in #1520)
+  explicitly asserts `*dataplane.Manager` is returned for
+  `TypeEBPF`. Under Option A it must be rewritten to assert
+  `ErrEBPFBackendRetired`, mirroring
+  `TestBuildRuntimeDataPlaneDPDKReturnsRetired` at the same file.
+- **§4.3 other `TypeEBPF` tests classified per reviewer**: AGY r1
+  empirically verified `vip_readiness_test.go:352`,
+  `per_rg_test.go:126`, `tunnel_anchor_test.go:57` are Go-level
+  struct-logic tests that only need `cfg.System.DataplaneType !=
+  TypeUserspace` to exercise their branch — they keep `TypeEBPF`
+  as a token (still exported under Option A). Codex F8 was more
+  cautious; v2 takes AGY's empirical reading after re-reading each
+  test's assertion block (none boot a Manager or call
+  `NewRuntimeDataPlane`). If implementation reveals an unexpected
+  failure, plan v3 will rewrite per-test.
+- **§4.8 retained shim helpers fully enumerated**: Codex F3 caught
+  v1 under-listed retained dependencies. AGY r1 provided the
+  verified full enumeration. v2 incorporates AGY's list:
+  `validateUserspaceShimSpec`, `userspacePinnedShimMaps`,
+  `userspaceRequiredShimPins`, `userspaceShimSharedMapSpecs`,
+  `loadUserspaceShimSharedMaps`, `closeUniqueMaps`,
+  `loadOrCreatePinnedShimMap`, `loadOrCreatePinnedShimMapWith`,
+  `userspaceShimMapLoader`, `hashMapSpec`, `perCPUHashMapSpec`,
+  `arrayMapSpec`, `perCPUArrayMapSpec`, `sizeOf`,
+  `ensureUserspaceMapPinned`. None pull legacy `xpfXdp*`/`xpfTc*`
+  types — clean extraction verified.
+- **§5 invariant 7 — `pinnedMaps` corrected**: Codex F4 + AGY r1
+  both caught `nat_port_counters` is NOT legacy-only. It is created
+  by `userspaceShimSharedMapSpecs()` at `loader_ebpf.go:712`,
+  consumed by `Manager.ReadNATPortCounter()` at `maps.go:1569` and
+  `SeedNATPortCounters()` at `maps.go:1589`, AND pinned by the
+  boundary canary at
+  `pkg/dataplane/retirement_boundary_canary_test.go:383`. v2 keeps
+  `nat_port_counters` in the retained pin set. Stale legacy pins
+  are `xdp_progs`, `tc_progs`, `policer_states` only.
+- **§4.4 canary surgery extended to `loader_stub.go` + docs
+  tokens**: Codex F5 caught that `loader_stub.go` appears in
+  `retainedShimBoundaryBuildTagAllowlist` at
+  `retirement_boundary_canary_test.go:106` AND in the docs-pinned
+  tokens at `retirement_boundary_canary_test.go:1823`. v2 deletes
+  the allowlist entry AND the docs-pinned token in lockstep with
+  the file deletion.
+- **§4.4 manifest test count corrected**: Codex F6 noted there are
+  five `TestLegacyBPFRemovalManifest*` tests, not four (lines 28,
+  71, 108, 133, 161 of `legacy_bpf_manifest_canary_test.go`). v2
+  corrects the count and walks all five.
+- **§4.6 `rewriteRetiredDataplaneType` clarified as net-new
+  helper**: Codex F9 noted current master `Store.Load()` has no
+  rewrite hook before `compileTree` (`pkg/configstore/store.go:83`).
+  v2 adds the helper as net-new code in this PR, not as an
+  extension of a #1528 deliverable. If #1528 lands first with its
+  own helper, this PR extends it to handle `ebpf` too; otherwise
+  this PR adds the helper fresh and a future cleanup PR consolidates
+  the dpdk + ebpf rewrite logic.
 
 ---
 
@@ -131,17 +212,24 @@ The deletion has to choose between three approaches for the lingering
   system dataplane-type userspace' (see #1373)"`.
 - `NewDataPlane(TypeEBPF)` and `NewRuntimeDataPlane(TypeEBPF)` return
   a new sentinel `ErrEBPFBackendRetired`.
-- Delete `Manager.Load()` — its only purpose was to call
-  `loadAllObjects()`. The userspace path uses `LoadUserspaceShim()`
-  already.
+- **Keep `Manager.Load()` as a retirement stub** that returns
+  `ErrEBPFBackendRetired` directly. v1 incorrectly proposed deleting
+  it; the `DataPlane` interface at `pkg/dataplane/dataplane.go:209`
+  requires `Load()` (compile-time asserted at line 29 via
+  `var _ DataPlane = (*Manager)(nil)`), and `Manager.Start()` at
+  `pkg/dataplane/apply.go:208` calls `m.Load()`. Both stay. The
+  userspace path continues to use `LoadUserspaceShim()` (separate
+  method, no contract impact). Operational result: any caller that
+  reaches `Manager.Load()` after this PR gets the retirement
+  sentinel, identical to the factory rejection.
 - Add a `daemon_run.go` soft-fallback branch that catches
   `ErrEBPFBackendRetired` (parallel to the existing
-  `ErrDPDKBackendRetired` branch).
+  `ErrDPDKBackendRetired` branch at `pkg/daemon/daemon_run.go:247`).
 - Add a stored-config rewrite at `Store.Load()` for `dataplane-type
   ebpf` → empty (defaults to userspace) — same pattern as #1528's
-  §4.6 fix for the inherited bootstrap-loop bug. This is required
-  because the strict validator runs inside `compileTree` on Load,
-  swallowing the error and stranding the daemon with empty config.
+  §4.6 fix for the inherited bootstrap-loop bug. v2 ships this as
+  net-new code in this PR (see §4.6); does not assume #1528 has
+  shipped the helper.
 
 **Option B — Hard removal of `TypeEBPF`.**
 
@@ -226,7 +314,7 @@ Option B, plan revises before any code moves.
 
 | Path | Edit |
 |---|---|
-| `pkg/dataplane/loader.go` | Delete the 14 legacy `//go:generate go run github.com/cilium/ebpf/cmd/bpf2go ...` directives (lines 31, 33-45). KEEP the `//go:generate bash build-userspace-xdp.sh` directive (line 32). Delete `Manager.Load()` (lines 112-126) under Option A, OR rewrite it to return `ErrEBPFBackendRetired` under Option C. Adjust file header comment to reflect retained shim path only. |
+| `pkg/dataplane/loader.go` | Delete the 14 legacy `//go:generate go run github.com/cilium/ebpf/cmd/bpf2go ...` directives (lines 31, 33-45). KEEP the `//go:generate bash build-userspace-xdp.sh` directive (line 32). **Keep `Manager.Load()` (lines 112-126) and rewrite its body to `return ErrEBPFBackendRetired`** — both the `DataPlane` interface assertion at `dataplane.go:29` and `Manager.Start()` at `apply.go:208` depend on the method existing. Adjust file header comment to reflect retained shim path only. |
 | `pkg/dataplane/dataplane.go` | Add `ErrEBPFBackendRetired` sentinel mirroring `ErrDPDKBackendRetired`. In `NewDataPlane` (line ~152), change the `case TypeEBPF: return New(), nil` arm to `case TypeEBPF: return nil, ErrEBPFBackendRetired`. Same in `NewRuntimeDataPlane` (line ~176). Keep `TypeEBPF` const. |
 | `pkg/config/compiler.go` | Add `validateDataplaneTypeStrictEBPF` mirroring `validateDataplaneTypeStrict` (DPDK), wired into the existing strict-validator stack at line ~241. Add `ErrEBPFDataplaneRetired` sentinel. Keep `dataplaneTypeEBPF` const and `validDataplaneType` arm. Verbatim retirement message: `"the legacy eBPF dataplane backend has been retired; use 'set system dataplane-type userspace' (see #1373)"`. |
 | `pkg/config/compiler.go:437` | The `if cfg.System.DataplaneType == dataplaneTypeEBPF { ... }` block. Audit what it does (BPF-specific compile step?) and either delete it (if it produces BPF-only output) or guard with retirement reject. **Plan reviewers asked to validate.** |
@@ -234,12 +322,14 @@ Option B, plan revises before any code moves.
 | `pkg/configstore/store.go` | Add `rewriteRetiredDataplaneType` invocation at `Load()` before `compileTree` for `dataplane-type ebpf` (mirror #1528's §4.6 fix; the helper from #1528 will already handle `dpdk` — extend it or add a parallel helper for `ebpf`). |
 | `pkg/configstore/dataplane_retire.go` (or extend if it exists from #1528) | Helper that walks the persisted AST tree and rewrites both `dataplane-type dpdk` and `dataplane-type ebpf` to empty, with `slog.Warn` for each rewrite. |
 | `pkg/daemon/daemon_run.go:247` | Extend the existing `errors.Is(err, dataplane.ErrDPDKBackendRetired)` soft-fallback to also catch `ErrEBPFBackendRetired`. |
-| `Makefile` | Delete `generate-legacy-bpf` target (lines 27-29). Remove `generate-legacy-bpf` from `.PHONY:` (line 16). Update the header comment for `generate:` target (lines 20-23) so it no longer references "legacy XDP/TC bpf2go outputs". Verify `clean:` does not erase retained shim artifacts. |
-| `pkg/dataplane/retirement_boundary_canary_test.go` | Delete the `retainedShimBoundaryBuildTagAllowlist` entries for the 14 deleted bpf2go `_x86_bpfel.go` paths (lines pinning `//go:build 386 \|\| amd64`). The map entries become stale on deletion. Other entries (for `userspace_xdp_rust.go`, etc.) stay. Update or delete `userspaceXDPEntryProgForCanary = "xdp_userspace_prog"` references if they only test the deleted entry-program path; check carefully. |
+| `Makefile` | Delete `generate-legacy-bpf` target (lines 27-29). Remove `generate-legacy-bpf` from `.PHONY:` (line 16). Update the header comment for `generate:` target (lines 20-23) so it no longer references "legacy XDP/TC bpf2go outputs". **Narrow the `clean:` recipe globs (lines 66-67)** from `pkg/dataplane/*_bpfel.{go,o}` + `pkg/dataplane/*_bpfeb.{go,o}` to `pkg/dataplane/xpf*_bpfel.{go,o}` + `pkg/dataplane/xpf*_bpfeb.{go,o}` so `make clean` cannot delete the retained `pkg/dataplane/userspace_xdp_bpfel.o` (embedded by `userspace_xdp_rust.go:11`). The narrowed glob is harmless after deletion (no `xpf*_bpfel.*` files remain) but stays in tree as a defence-in-depth pattern. |
+| `pkg/dataplane/retirement_boundary_canary_test.go` | Delete the `retainedShimBoundaryBuildTagAllowlist` entries for the 14 deleted bpf2go `_x86_bpfel.go` paths (lines pinning `//go:build 386 \|\| amd64`). **Also delete the `pkg/dataplane/loader_stub.go` entry at line 106** — the file is removed by this PR (Codex F5). **Also delete the docs-pinned token block at line 1823** that hard-requires `loader_stub.go` and the legacy build-tag text (Codex F5). Other entries (for `userspace_xdp_rust.go`, etc.) stay. Update or delete `userspaceXDPEntryProgForCanary = "xdp_userspace_prog"` references if they only test the deleted entry-program path; check carefully. |
 | `pkg/dataplane/legacy_bpf_manifest_canary_test.go` | This canary is the deletion-readiness gate. It must continue to pass AFTER deletion. Verify all 4 `TestLegacyBPFRemovalManifest*` tests pass on a post-delete tree by running them locally before commit. May need adjustments if a manifest entry no longer matches a tracked file (e.g. if a retained header gets moved). |
 | `pkg/dataplane/userspace_shim_loader_test.go` | Audit. If it tests a code path that uses deleted legacy types, simplify. |
 | `pkg/dataplane/watchdog_test.go` | Audit. The watchdog test was historically wired into the legacy BPF map; verify it still passes with userspace-only paths or rewrite. |
 | `pkg/dataplane/apply_test.go`, `compiler_test.go`, `constants_test.go`, `default_test.go`, `nptv6_test.go`, `persistent_nat_test.go`, `session_store_test.go` | Audit each. Tests exercising legacy BPF maps directly need rewriting. Tests on shared structs (constants, NAT, session domain) stay. |
+| `pkg/daemon/dataplane_boot_test.go` | **Rewrite `TestBuildRuntimeDataPlaneEBPFRoutesToLegacyManager` (lines 48-61)** to `TestBuildRuntimeDataPlaneEBPFReturnsRetired` asserting `errors.Is(err, dataplane.ErrEBPFBackendRetired)` and `dp == nil`. Pattern identical to `TestBuildRuntimeDataPlaneDPDKReturnsRetired` at lines 67-80. AGY r1 + Codex F8 both required this. |
+| `pkg/daemon/tunnel_anchor_test.go`, `pkg/daemon/vip_readiness_test.go`, `pkg/daemon/per_rg_test.go` | AGY r1 empirically verified: each only sets `cfg.System.DataplaneType = dataplane.TypeEBPF` as a non-userspace token for Go-level struct-logic branches; none call `NewRuntimeDataPlane` or boot a `Manager`. Under Option A, `TypeEBPF` stays exported, so these tests still compile and execute the same branch. **Plan: leave them unchanged.** If implementation reveals any test now hits a retirement-rejected path, plan v3 rewrites it to a parameterized non-userspace token (e.g. a fixed test-only sentinel). |
 | `docs/development-workflow.md` line 24 | Remove the "`make generate-legacy-bpf` runs the legacy XDP/TC bpf2go directives" line. |
 | `docs/refactoring-audit.md` lines 20, 83 | Remove references to `bpf/xdp/*.c`, `bpf/tc/*.c` as live source paths. Trim or move to historical section. |
 | `docs/userspace-master-merge-20260310.md` lines 40-46 | Historical doc; convert to past-tense or move to `docs/archived/`. |
@@ -256,7 +346,9 @@ Option B, plan revises before any code moves.
 
 The two canary files in `pkg/dataplane/` are the deletion gate:
 
-1. **`legacy_bpf_manifest_canary_test.go`** — four tests:
+1. **`legacy_bpf_manifest_canary_test.go`** — five tests (Codex F6
+   corrected v1's count of four; tests live at lines 28, 71, 108,
+   133, 161 of the file):
    - `TestLegacyBPFRemovalManifestCoversTrackedGeneratedArtifacts`:
      verifies every tracked `pkg/dataplane/*_bpfel.{go,o}` is either
      in the manifest's `## Delete Manifest` section OR listed as a
@@ -291,14 +383,18 @@ The two canary files in `pkg/dataplane/` are the deletion gate:
      remaining `pkg/dataplane` Manager/types after this PR (their
      migration is #1451's job, complete via #1516+#1521 before Phase B
      starts).
-   - `retainedShimBoundaryBuildTagAllowlist` (lines ~74-100): 14
+   - `retainedShimBoundaryBuildTagAllowlist` (lines ~74-106): 14
      entries for `pkg/dataplane/xpf{Xdp,Tc}*_x86_bpfel.go` build-tag
-     allowance. ALL 14 entries delete in lockstep with the deleted
-     `.go` files.
+     allowance PLUS one entry for `pkg/dataplane/loader_stub.go` at
+     line 106. ALL 14 bpf2go entries AND the `loader_stub.go` entry
+     delete in lockstep with the deleted files (Codex F5).
+   - Docs-pinned token block at line 1823 referencing
+     `loader_stub.go` and the legacy `//go:build ignore` text:
+     **delete** in lockstep with `loader_stub.go` removal (Codex F5).
    - `userspaceXDPEntryProgForCanary = "xdp_userspace_prog"` — verify
      this constant is still meaningful after deletion. The entry
      program name refers to the retained Rust shim, not legacy XDP
-     entry — confirm at impl time.
+     entry — confirm at impl time by reading the Rust shim source.
 
 ### 4.5 Test plan
 
@@ -437,18 +533,43 @@ that are part of the RETAINED shim path. These functions must be
 moved to a kept file (e.g., `pkg/dataplane/loader_userspace_shim.go`
 or appended to `loader.go`) before `loader_ebpf.go` is deleted.
 
-Audit of `loader_ebpf.go` content to be retained:
+**Full retained-graph enumeration (AGY r1 verified, Codex F3
+required the explicit list):**
 
-- `loadUserspaceShimObjects(...)` (line 478)
-- `loadUserspaceShimObjectsOnce(...)` (line 489) — including the
-  Rust shim spec load, the drift-guard for `MAX_INTERFACES`, the
-  userspace_bindings cap check, and the userspace_xsk_map / xsk
-  socket setup
-- `userspaceShimMapLoader` type and helpers (line 659+)
-- `pinnedMaps` map (line ~30) — narrowed to userspace-only entries
-  (drop `xdp_progs`, `tc_progs`, `nat_port_counters` if they only
-  serve legacy)
-- `bpfPinPath` constant and shim-relevant constants
+- `loadUserspaceShimObjects(...)` (loader_ebpf.go:478)
+- `loadUserspaceShimObjectsOnce(...)` (loader_ebpf.go:489) —
+  including the Rust shim spec load, the drift-guard for
+  `MAX_INTERFACES`, the `userspace_bindings` cap check, and the
+  `userspace_xsk_map` / xsk socket setup
+- `validateUserspaceShimSpec(...)` (loader_ebpf.go:558)
+- `userspacePinnedShimMaps()` (loader_ebpf.go:599)
+- `userspaceRequiredShimPins()` (loader_ebpf.go:618)
+- `loadUserspaceShimSharedMaps(...)` (loader_ebpf.go:642)
+- `loadOrCreatePinnedShimMap(...)` (loader_ebpf.go:655)
+- `loadOrCreatePinnedShimMapWith(...)` (loader_ebpf.go:661)
+- `userspaceShimMapLoader` type (loader_ebpf.go:659)
+- `closeUniqueMaps(...)` (loader_ebpf.go:681)
+- `userspaceShimSharedMapSpecs()` (loader_ebpf.go:695)
+- `hashMapSpec(...)` (loader_ebpf.go:723)
+- `perCPUHashMapSpec(...)` (loader_ebpf.go:734)
+- `arrayMapSpec(...)` (loader_ebpf.go:745)
+- `perCPUArrayMapSpec(...)` (loader_ebpf.go:755)
+- `sizeOf[T any]()` (loader_ebpf.go:765)
+- `ensureUserspaceMapPinned(...)` (loader_ebpf.go:770)
+- `pinnedMaps` map (loader_ebpf.go:~30) — narrowed to retained
+  entries only. See §5 invariant 7 — `nat_port_counters` IS
+  retained shim state; only `xdp_progs`, `tc_progs`, and
+  `policer_states` drop.
+- `bpfPinPath` constant and the shim-relevant constants from
+  loader_ebpf.go:18-22 (`userspaceShimGenerateRemediation`,
+  `userspaceBindingsMapName`, `userspaceIngressIfacesMapName`,
+  `userspaceShimCompatibilityDNATName`)
+
+**Verified clean**: none of the retained helpers transitively
+references any `xpfXdp*` or `xpfTc*` type. The legacy graph
+(`loadAllObjects` at loader_ebpf.go:72, `loadCPUMapPrograms` at
+loader_ebpf.go:793, and the per-stage program loaders) is
+self-contained and disposable.
 
 Audit of `loader_ebpf.go` content to be DELETED:
 
@@ -457,9 +578,16 @@ Audit of `loader_ebpf.go` content to be DELETED:
 - All references to `xpf{Xdp,Tc}*Objects` types
 
 This split is mechanical — copy the retained functions into a new
-file, delete `loader_ebpf.go`, then verify `go build ./...`. The new
-file gets a header comment explaining its purpose ("retained Rust
-AF_XDP shim loader; legacy bpf2go graph removed in #1476").
+file (suggested: `pkg/dataplane/loader_userspace_shim.go`), delete
+`loader_ebpf.go`, then verify `go build ./...`. The new file gets a
+header comment explaining its purpose ("retained Rust AF_XDP shim
+loader; legacy bpf2go graph removed in #1476").
+
+**Manager.Load() retention (v2)**: `Manager.Load()` itself stays in
+`pkg/dataplane/loader.go` with its body rewritten to
+`return ErrEBPFBackendRetired`. The interface contract requires the
+method exists; the body is a sentinel return. `Manager.LoadUserspaceShim()`
+remains the userspace entry point.
 
 ## 5. Hidden invariants the change must preserve
 
@@ -495,13 +623,25 @@ AF_XDP shim loader; legacy bpf2go graph removed in #1476").
    (DPDK) must both fire before any compile step touches
    dataplane-specific fields. Order verified in `compileExpanded`.
 
-7. **Map-pinning expectations.** `pinnedMaps` map currently
-   includes `xdp_progs`, `tc_progs` (legacy PROG_ARRAY pins),
-   `policer_states` (legacy per-CPU pin). After deletion, these
-   pins no longer exist as kernel objects since no legacy program
-   loads them. `Manager.LoadUserspaceShim()` already has cleanup
-   logic (`cleanupUserspaceShimLegacyOnlyMapPins`) that removes the
-   pins on startup — verify this cleanup remains correct.
+7. **Map-pinning expectations (v2 corrected).** Codex F4 + AGY r1
+   both caught v1's misclassification of `nat_port_counters`. The
+   retained `pinnedMaps` set after this PR is:
+   - **Retained as userspace-shared**: `sessions`, `sessions_v6`,
+     `dnat_table`, `dnat_table_v6`, `nat64_state`,
+     `nat_port_counters`. The last is created by
+     `userspaceShimSharedMapSpecs()` at `loader_ebpf.go:712`,
+     consumed by `Manager.ReadNATPortCounter()` at `maps.go:1569`
+     and `SeedNATPortCounters()` at `maps.go:1589`, and pinned by
+     the boundary canary at
+     `pkg/dataplane/retirement_boundary_canary_test.go:383`.
+   - **Drop as legacy-only**: `xdp_progs`, `tc_progs`,
+     `policer_states`. After deletion, these kernel pins no longer
+     exist because no legacy program loads them.
+     `Manager.LoadUserspaceShim()` already has cleanup logic
+     (`cleanupUserspaceShimLegacyOnlyMapPins` at `loader.go:240`)
+     that removes the pins on startup if they survive from a
+     pre-upgrade run. Verify this cleanup remains correct after
+     the v2 narrowing.
 
 8. **#1494 boundary canaries.** `pkg/dataplane/userspace/`
    shim_loader_boundary tests verify the shim does not regrow
@@ -655,15 +795,16 @@ demand a major revision.
     "loud-log-defer" stance as #1528. Reviewer asked to confirm
     this is acceptable for a one-release-cycle migration.
 
-12. **`Makefile clean` target safety.** The plan says "verify
-    `clean:` does not erase retained shim artifacts". `make clean`
-    currently runs `clean-dpdk` (per #1528 deletion) and may
-    `rm -f pkg/dataplane/*_bpfel.{go,o}`. After this PR, the only
-    matching file is `pkg/dataplane/userspace_xdp_bpfel.o`, which
-    MUST NOT be deleted by `make clean`. Reviewer to inspect the
-    actual `clean:` recipe and confirm the glob excludes the
-    retained shim object. PLAN-KILL if `make clean` deletes the
-    retained shim.
+12. **`Makefile clean` target safety (v2 resolved).** Codex F2 +
+    AGY CRITICAL both flagged that `Makefile:66-67` greedy globs
+    `rm -f pkg/dataplane/*_bpfel.{go,o}` + `*_bpfeb.{go,o}` would
+    delete the retained `pkg/dataplane/userspace_xdp_bpfel.o`. v2
+    narrows the globs to `pkg/dataplane/xpf*_bpfel.{go,o}` +
+    `pkg/dataplane/xpf*_bpfeb.{go,o}` (§4.3) so the
+    `userspace_xdp_bpfel.o` (which does not start with `xpf`) is
+    protected by name. The narrowed pattern is harmless post-
+    deletion (no `xpf*_bpfel.*` tracked files remain) but stays as
+    defence-in-depth against a future re-introduction.
 
 ## 9. Reviewer dispatch contract
 

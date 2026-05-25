@@ -1,5 +1,24 @@
 # Action Log
 
+## 2026-05-25 — #1476 Phase A v2 plan after r1 reviews
+
+- **Timestamp**: 2026-05-25T (Phase A v2 after r1 reviewer findings)
+  - **Action**: Round-1 reviews returned: Codex r1b
+    PLAN-NEEDS-MAJOR (6 findings: Manager.Load() interface break,
+    make clean nukes shim, retained-helper under-listing,
+    nat_port_counters misclass, loader_stub canary gaps, TypeEBPF
+    test migration); AGY r1 PLAN-NEEDS-MINOR (Makefile clean +
+    dataplane_boot_test rewrite). v2 plan incorporates all findings:
+    keeps Manager.Load() as ErrEBPFBackendRetired stub (not deleted);
+    narrows Makefile clean globs to xpf*_bpfel.{go,o}; rewrites
+    TestBuildRuntimeDataPlaneEBPFRoutesToLegacyManager to assert
+    retirement-sentinel; enumerates full retained shim helper list;
+    keeps nat_port_counters in pinnedMaps; deletes loader_stub
+    allowlist entry + docs-pinned token; corrects manifest test
+    count to 5.
+  - **File(s)**: `docs/pr/1476-mechanical-bpf-removal/plan.md` v2,
+    `docs/pr/1476-mechanical-bpf-removal/reviewer-ids.md`, `_Log.md`
+
 ## 2026-05-25 — #1476 Phase A v1 plan drafted
 
 - **Timestamp**: 2026-05-25T (Phase A v1 draft)
