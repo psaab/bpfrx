@@ -1,5 +1,83 @@
 # Action Log
 
+## 2026-05-25
+
+- **Timestamp**: 2026-05-25T05:55:00Z
+  - **Action**: PR #1536 round-3 cleanup — address Codex MAJOR
+    (load merge syntax in plan recovery) + 3 Copilot nits:
+    1. plan.md operational-note recovery flow used invalid
+       `load merge replace /etc/xpf/xpf.conf` — the supported
+       forms are `load merge <file>` or `load override <file>`
+       (`cmd/cli/main.go` parses mode then args[1] as file).
+       Replaced with `load override /etc/xpf/xpf.conf` which is
+       the appropriate one-shot replacement form.
+    2. compiler_system.go unknown-dataplane-type error wording
+       said "valid values are userspace" — misleading when
+       ebpf is still accepted (deprecated) and dpdk still
+       parses (rejected at commit). Updated to "valid values
+       are userspace or ebpf (deprecated); dpdk parses for
+       legacy-config compatibility but is rejected at commit
+       per #1525".
+    3. parser_ast_test.go TestDPDKConfigCompileRejects had a
+       local `wantSubstr` duplicating `dpdkRetirementSubstr`
+       const declared lower in the same file. Reuses the const
+       to prevent drift.
+    4. _Log.md had a duplicate `## 2026-05-25` header inserted
+       around line 1783 by an earlier auto-bot commit. Folded
+       its content into this top-of-file entry and removed the
+       stray header to keep one bucket per date.
+  - **File(s)**: `docs/pr/1526-dpdk-reject/plan.md`,
+    `pkg/config/compiler_system.go`,
+    `pkg/config/parser_ast_test.go`, `_Log.md`
+
+- **Timestamp**: 2026-05-25T05:30:00Z
+  - **Action**: PR #1526 implementation v3 — added
+    `validateDataplaneTypeStrict` in pkg/config/compiler.go (slotted
+    BEFORE existing CoS / policer / scheduler strict validators per
+    Codex round-1 ordering finding). Verbatim retirement message
+    per issue body: `the DPDK dataplane backend has been retired;
+    use 'set system dataplane-type userspace' (see #1525)`. Tests
+    use substring match so the same assertion fires across
+    CompileConfig (raw), Store.CommitCheck (raw), and Store.Commit
+    (`commit check failed:`-wrapped) — addresses Codex round-2
+    MAJOR finding 1.
+
+    Test surface:
+    - parser_ast_test.go: split TestDPDKConfig into
+      TestDPDKConfigParsesCleanly (parse must survive — AST shape
+      assertion) and TestDPDKConfigCompileRejects (commit reject).
+    - parser_ast_test.go: 5 new dedicated tests —
+      TestDataplaneTypeDPDKRejectedAtCommit (flat-set form),
+      TestDataplaneTypeDPDKRejectedAtCommitHierarchical (block
+      form), TestDataplaneTypeDPDKRejectedAtCommitFiresBeforeCoS
+      (validator ordering lock-in),
+      TestDataplaneTypeDPDKRejectedAtCommitViaApplyGroups
+      (apply-groups expansion path), plus negative-control pair
+      TestDataplaneTypeUserspaceCompilesCleanly and
+      TestDataplaneTypeOmittedCompilesCleanly.
+    - parser_system_test.go: dropped `dpdk` from the
+      TestDataplaneTypeNonLegacyValuesDoNotWarnDeprecatedCompatibility
+      loop (now hard-errors at compile).
+    - configstore/store_test.go: 2 new tests —
+      TestCommit_RejectsDPDKDataplaneType locks in BOTH the raw
+      CommitCheck error AND the `commit check failed:`-wrapped
+      Commit error, plus TestCommit_AcceptsUserspaceDataplaneType
+      negative control.
+
+    Plan v3 updated to (a) switch tests from byte-exact to
+    substring-match for cross-surface compatibility, (b) correct
+    the daemon-startup recovery flow text (candidate is empty
+    after failed Load, not pre-populated), (c) honor the issue
+    body's verbatim `(see #1525)` (does not point at #1531 docs).
+
+    Test gates: go build ./... clean. go test ./... clean across
+    33 packages. 5x flake check on new tests passes. cargo check
+    on userspace-dp/ clean (no Rust touched).
+  - **File(s)**: `pkg/config/compiler.go`,
+    `pkg/config/parser_ast_test.go`,
+    `pkg/config/parser_system_test.go`,
+    `pkg/configstore/store_test.go`,
+    `docs/pr/1526-dpdk-reject/plan.md`
 ## 2026-05-25 — #1529 Codex code-review finding follow-up
 
 - **Timestamp**: 2026-05-25T06:50:00Z
@@ -424,6 +502,8 @@
     clean (114 warnings, all pre-existing); `cargo test --release
     --bin xpf-userspace-dp afxdp::wg` — 78/78 pass; `go test
     ./pkg/dataplane/...` — 4/4 packages pass.
+
+## 2026-05-24
 
 - **Timestamp**: 2026-05-24T23:30:00Z
   - **Action**: PR #1499 r-final-5 step 4 — final mechanical sweep
@@ -2108,6 +2188,20 @@
   - **Validation**: cargo build --release; cargo test --release --bin
     xpf-userspace-dp afxdp::wg.
 
+- **Timestamp**: 2026-05-25T05:58Z
+- **Action**: PR #1536 — add ErrDPDKDataplaneRetired sentinel + errors.Is test (AGY round-N feedback)
+- **File(s)**: pkg/config/compiler.go, pkg/config/parser_ast_test.go
+- **Why**: Antigravity adversarial-review-mpksjr0e-f3mjrn flagged the lack of a
+  structured sentinel error as an API design gap. External consumers (gRPC
+  orchestration, REST wrappers, CLI tooling) cannot programmatically match
+  the DPDK retirement reject without substring-searching the error text.
+  Adding `var ErrDPDKDataplaneRetired = errors.New(...)` and returning it
+  from validateDataplaneTypeStrict preserves the verbatim message contract
+  (existing tests still pass via strings.Contains) and adds programmatic
+  matching via errors.Is. Mirrors the runtime-side
+  dataplane.ErrDPDKBackendRetired sentinel introduced by #1527 / PR #1535.
+- **Validation**: TestDPDKConfigCompileRejects extended with errors.Is
+  assertion; full pkg/config + pkg/configstore suites green.
 - **Timestamp**: 2026-05-25T05:41:23Z
   - **Action**: Review fix (#1529) — inline DPDK annotation pass on
     `docs/feature-gaps.md`. The initial sweep used a blanket header
