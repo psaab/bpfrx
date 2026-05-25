@@ -111,6 +111,19 @@ plan-review (no PR yet) and code-review (PR #1556) phases.
   - Verdict: NEEDS-MINOR (round 6 AGY verdict missing —
     addressed in this commit)
 
-### Round 8 (after this commit)
+### Round 8 (HEAD a4151a6b — final lock)
 
-- Pending re-verification after this commit lands.
+- Codex: `task-mpldog0j-876c1w`
+  - Verdict: MERGE-READY
+- Antigravity: r5 MERGE-READY still applies (no code change)
+- Copilot: r5 PASS still applies (no code change)
+
+## Final consensus
+
+All four reviewers MERGE-READY at HEAD a4151a6b:
+  - Codex: MERGE-READY (r8)
+  - Antigravity: MERGE-READY (r5)
+  - Copilot: PASS (r5, no inline comments)
+  - Claude SMR: PASS
+
+Posting AWAITING-SMOKE per standing rule.

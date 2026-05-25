@@ -288,7 +288,6 @@
     Rebased onto current master (which now has #1536).
   - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
     `_Log.md`
- 9a0e7012 (config: plan #1538 — accumulate strict validation errors via errors.Join)
 
 - **Timestamp**: 2026-05-25T05:55:00Z
   - **Action**: PR #1536 round-3 cleanup — address Codex MAJOR
@@ -2822,9 +2821,9 @@
   README. Smoke + test-failover pending (HA-sensitive scope per CLAUDE.md).
 
 - **Timestamp**: 2026-05-25T15:31Z
-- **Action**: PR #1538 Copilot code-review round-2 — fix `want` variable
-  shadowing in TestCompileSingleStrictErrorJoinPath and add
-  TestCompileAllThreeStrictValidatorsAccumulated to close the
-  third-family (validatePolicySchedulerReferencesStrict) coverage gap
-  flagged in round-1 review.
-- **File(s)**: pkg/config/compiler_test.go
+  - **Action**: PR #1538 Copilot code-review round-2 — fix `want`
+    variable shadowing in TestCompileSingleStrictErrorJoinPath and
+    add TestCompileAllThreeStrictValidatorsAccumulated to close the
+    third-family (validatePolicySchedulerReferencesStrict) coverage
+    gap flagged in round-1 review.
+  - **File(s)**: `pkg/config/compiler_test.go`
