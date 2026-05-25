@@ -86,6 +86,17 @@ func TestNoLiteralMapNamesOutsideRegistry(t *testing.T) {
 				}
 				s, err := strconv.Unquote(lit.Value)
 				if err != nil {
+					// A malformed string literal in production
+					// code is a hard failure: the file cannot
+					// have parsed cleanly if this path is hit, so
+					// record the error explicitly instead of
+					// silently swallowing it. Copilot r1 flagged
+					// the previous "return true" as a silent
+					// bypass risk.
+					pos := fset.Position(lit.Pos())
+					violations = append(violations, fmt.Sprintf(
+						"%s:%d: malformed string literal %s in .Map() call: %v",
+						pos.Filename, pos.Line, lit.Value, err))
 					return true
 				}
 				if !strings.HasPrefix(s, "userspace_") {

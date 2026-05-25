@@ -2,9 +2,11 @@
 //
 // These constants enumerate every BPF map name consumed by the
 // userspace control plane (maps_sync.go, process.go, manager_ha.go)
-// so map-name drift inside this Go package is a compile-time
-// failure via the regression canary in maps_decouple_test.go
+// so map-name drift inside this Go package becomes a CI / test-time
+// failure via the regression canaries in maps_decouple_test.go
 // rather than a runtime "map not loaded" error at helper bringup.
+// (Copilot r1: prior wording overstated this as "compile-time"; the
+// enforcement is via go test, not the compiler.)
 //
 // Scope of guarantee:
 //
