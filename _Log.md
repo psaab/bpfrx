@@ -2,6 +2,31 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T22:30:00Z
+  - **Action**: #1520 plan v4 + implementation. v2 added Claude SMR
+    refinements (no-arg Boot, behavioral canaries). v3 addressed
+    Codex round-2 PLAN-NEEDS-MAJOR (9 findings: structural value
+    statement, default-route invariant, dropped text-shape canary,
+    behavioral helper tests, BootOptions dropped, rollback/test-seam
+    wording). v4 addressed AGY round-2 CRITICAL: existing AST canary
+    `TestDaemonRuntimeEntryPointUsesRuntimeDataPlane` requires
+    `daemon_run.go` to literally reference
+    `dataplane.NewRuntimeDataPlane(...)`; pinned the helper inside
+    `daemon_run.go` and kept the non-userspace branch routed through
+    that factory call to preserve the canary. Codex round-3
+    PLAN-NEEDS-MINOR confirmed two stale strings ("BootOptions{}"
+    in §8.5 and "rollback" in §4.3 heading) — both fixed in v4.
+    Implementation: added `userspace.Boot()` + helper
+    `buildRuntimeDataPlane` in daemon_run.go + two canary test
+    files. Full Go suite green; 5x flake stable.
+  - **File(s)**:
+    `docs/pr/1520-userspace-boot-extraction/plan.md`,
+    `docs/pr/1520-userspace-boot-extraction/reviewer-ids.md`,
+    `pkg/dataplane/userspace/manager.go`,
+    `pkg/daemon/daemon_run.go`,
+    `pkg/dataplane/userspace/userspace_boot_canary_test.go`,
+    `pkg/daemon/dataplane_boot_test.go`
+
 - **Timestamp**: 2026-05-25T20:00:00Z
   - **Action**: #1520 plan v1 DRAFT — extract userspace boot path
     from legacy `dataplane.New()` (sub-#1451 S5). Adds

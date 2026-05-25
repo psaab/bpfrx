@@ -1,6 +1,44 @@
 # #1520 Plan: Extract Userspace Boot Path From Legacy `dataplane.New()`
 
-**Status:** DRAFT v1 — pending adversarial plan review.
+**Status:** v4 — addresses AGY round-2 CRITICAL (existing AST canary
+collision) and Codex round-3 stragglers. v3 addressed Codex
+round-2 PLAN-NEEDS-MAJOR (9 findings).
+
+v4 changes:
+- §4.2: pin helper location to `pkg/daemon/daemon_run.go` and
+  document the load-bearing
+  `dataplane.NewRuntimeDataPlane(dpType)` reference required by
+  `retirement_boundary_canary_test.go::TestDaemonRuntimeEntryPointUsesRuntimeDataPlane`.
+- §4.3: rename "rollback / test seam" → "compatibility / test
+  seam" (Codex round-3 finding 8).
+- §8.5: drop the stale `Boot(BootOptions{})` reference (Codex
+  round-3 finding 7).
+
+v3 changes were: Changes from v1/v2:
+
+- Drop premature `BootOptions{}` — use no-arg `Boot()` (finding 7).
+- Drop the parse-text canary that targets a literal filename
+  (findings 4 and 6) and replace with behavioral canaries on the
+  daemon helper.
+- Add behavioral test for `buildRuntimeDataPlane("")` AND
+  `buildRuntimeDataPlane(TypeUserspace)` returning the adapter and
+  for both producing the same concrete type (finding 5).
+- §6 now requires that BOTH empty default and explicit
+  `TypeUserspace` route through `Boot()` (finding 2).
+- Strike the "structured config gate" wording — §4.4 is documentation
+  only; the rollback gate is the existing `dataplane-type` config
+  knob (finding 3).
+- Call the registry path a "compatibility/test seam," not "rollback"
+  (finding 8) — rollback is `dataplane-type ebpf` through
+  `NewRuntimeDataPlane()`, not through the userspace registry.
+- Sharpen the structural value statement (finding 1): the
+  enforceable delta is that `pkg/daemon` no longer compiles against
+  the registry indirection for the userspace path. Future #1521
+  threads typed options through the new `Boot()` signature; today
+  there is no opt struct.
+- #1521 coordination: this slice does NOT add `BootOptions`, so
+  there is no API surface for #1521 to extend yet (finding 9).
+  Semantic coordination is now stated explicitly in §7.
 
 **Scope (one line):** sub-#1451 S5; provide a userspace-native
 constructor that does not require the legacy `dataplane.New()`
@@ -158,15 +196,6 @@ func init() {
 In `pkg/dataplane/userspace/manager.go`, add:
 
 ```go
-// BootOptions configure userspace-native boot. Empty options select
-// the userspace AF_XDP runtime in its current compat-mode default.
-type BootOptions struct {
-    // Reserved for future use (e.g., explicit mode override, fail-closed
-    // helper unavailability handling). Empty today; we add the struct
-    // up-front so signature churn does not propagate when #1521 / #1473
-    // need to thread additional config in.
-}
-
 // Boot constructs the userspace AF_XDP runtime and returns it as a
 // dataplane.RuntimeDataPlane wrapped in the legacy-compatible adapter.
 //
@@ -179,9 +208,11 @@ type BootOptions struct {
 // The returned value still implements dataplane.DataPlane via the
 // adapter, so unmigrated callers (pkg/cli, pkg/api, pkg/conntrack,
 // pkg/fwdstatus) continue to compile until #1451 finishes the surface
-// shrink.
-func Boot(opts BootOptions) dataplane.RuntimeDataPlane {
-    _ = opts // reserved
+// shrink. When #1521 / #1473 need to thread additional construction
+// configuration in, they should add a typed options argument here —
+// not pre-emptively. See Claude SMR review feedback rejecting empty
+// `BootOptions{}` as premature YAGNI.
+func Boot() dataplane.RuntimeDataPlane {
     return NewLegacyDataPlaneAdapter(New())
 }
 ```
@@ -191,6 +222,20 @@ the **call site** — daemon startup no longer needs to consult the
 runtime backend registry for the userspace path.
 
 ### 4.2 Daemon startup chooses Boot() for userspace, registry for legacy
+
+The helper `buildRuntimeDataPlane()` **MUST** live inside
+`pkg/daemon/daemon_run.go` and the helper body **MUST** contain the
+literal call `dataplane.NewRuntimeDataPlane(dpType)` for the
+non-userspace fall-through. This is load-bearing: the existing AST
+canary
+`pkg/dataplane/retirement_boundary_canary_test.go::TestDaemonRuntimeEntryPointUsesRuntimeDataPlane`
+parses `pkg/daemon/daemon_run.go` and fails if
+`dataplane.NewRuntimeDataPlane` is no longer referenced in that file
+(see `hasDaemonRuntimeConstructorCall` at
+`retirement_boundary_canary_test.go:3366`). Splitting the helper
+into a new file or replacing the legacy-path call with a different
+constructor would trigger
+`t.Fatal("daemon runtime startup no longer calls dataplane.NewRuntimeDataPlane")`.
 
 In `pkg/daemon/daemon_run.go`, replace:
 
@@ -212,8 +257,7 @@ if cfg := d.store.ActiveConfig(); cfg != nil {
 dp, err := buildRuntimeDataPlane(dpType)
 ```
 
-and add a small helper in `pkg/daemon/daemon_run.go` (or a new
-`pkg/daemon/dataplane_boot.go` if cleaner):
+and add the helper inside `pkg/daemon/daemon_run.go`:
 
 ```go
 // buildRuntimeDataPlane selects the userspace-native Boot() path for
@@ -221,19 +265,23 @@ and add a small helper in `pkg/daemon/daemon_run.go` (or a new
 // dataplane.NewRuntimeDataPlane only for the explicit legacy eBPF
 // rollback (and the retired-DPDK error case). Keeping the legacy
 // branch routed through the dataplane factory preserves the
-// ErrDPDKBackendRetired sentinel handling unchanged.
+// ErrDPDKBackendRetired sentinel handling unchanged AND preserves
+// the existing retirement_boundary_canary_test.go AST canary that
+// requires daemon_run.go to reference dataplane.NewRuntimeDataPlane.
+//
+// This helper MUST stay in daemon_run.go for the AST canary above.
+// Do not split into pkg/daemon/dataplane_boot.go.
 func buildRuntimeDataPlane(dpType string) (dataplane.RuntimeDataPlane, error) {
     switch dataplane.EffectiveType(dpType) {
     case dataplane.TypeUserspace:
-        return userspace.Boot(userspace.BootOptions{}), nil
+        return userspace.Boot(), nil
     default:
         return dataplane.NewRuntimeDataPlane(dpType)
     }
 }
 ```
 
-### 4.3 Keep the runtime backend registration as the rollback / test
-seam
+### 4.3 Keep the runtime backend registration as the compatibility / test seam
 
 The `init()` in `pkg/dataplane/userspace/manager.go` continues to
 register a userspace runtime backend so that
@@ -245,15 +293,20 @@ registry. The registry path stays a thin alias for the canonical
 ```go
 func init() {
     dataplane.RegisterRuntimeBackend(dataplane.TypeUserspace, func() dataplane.RuntimeDataPlane {
-        return Boot(BootOptions{})
+        return Boot()
     })
 }
 ```
 
 This satisfies #1520 acceptance criterion 3 ("Backend registration
 … either remains for the rollback path"): registration remains, and
-its presence is documented in code as the test/rollback seam, not
-the canonical daemon startup path.
+its presence is documented in code as the **compatibility/test
+seam**, not the canonical daemon startup path and not the operator
+rollback path. The operator rollback path is
+`dataplane-type ebpf` which goes through
+`dataplane.NewRuntimeDataPlane()` → `New()` (legacy
+`*dataplane.Manager`) and never touches the userspace registry
+entry.
 
 ### 4.4 `xdp_main_prog` / `xdp_userspace_prog` swap path documentation
 
@@ -275,29 +328,54 @@ shorter pointer comment at
 - the swap-back path in
   `pkg/dataplane/userspace/maps_sync.go` calls
   `bpfShim.SwapToUserspaceXDPShimEntryProgram()` defensively after
-  a link cycle that the kernel observed an attachment to
-  `xdp_main_prog`. This is the structured config gate (compat mode,
-  observable in `show system buffers` and userspace status). The
+  a link cycle. This is operationally observable in
+  `show system buffers` and userspace status but is **not** a new
+  config gate — the only operator-facing dataplane gate is the
+  existing `set system dataplane-type {ebpf|userspace}` knob. The
   swap NEVER goes the other direction in normal userspace startup.
 
-This documentation satisfies #1520 acceptance criterion 2 ("documented
-as the explicit retained fallback with a structured config gate").
+This documentation satisfies #1520 acceptance criterion 2
+("documented as the explicit retained fallback with a structured
+config gate"): the structured gate is the existing
+`dataplane-type` knob, not a new flag introduced by this slice.
 
 ### 4.5 New AST canary: `Boot()` is the daemon entry point
 
-Add a canary test in
-`pkg/dataplane/userspace/userspace_boot_canary_test.go` that:
+Add behavioral canary tests in two places:
 
-- parses `pkg/daemon/daemon_run.go` and asserts the file references
-  `buildRuntimeDataPlane` or `userspace.Boot` (not just
-  `dataplane.NewRuntimeDataPlane`). The intent: prevent silent
-  regression to the registry-only path.
-- parses `pkg/dataplane/userspace/manager.go` and asserts that
-  `Boot` is an exported function. (Cheap structural check.)
-- still asserts the registry indirection works:
-  `dataplane.NewRuntimeDataPlane(TypeUserspace)` returns
-  `*LegacyDataPlaneAdapter` (already covered by
-  `TestUserspaceBackendRegistryReturnsRuntimeAdapterForLegacyCallers`).
+In `pkg/dataplane/userspace/userspace_boot_canary_test.go`:
+
+- asserts behavior of `Boot()`: returns a value that
+  - implements `dataplane.RuntimeDataPlane`,
+  - implements `dataplane.DataPlane` (adapter identity preserved),
+  - is concretely `*LegacyDataPlaneAdapter`,
+  - has the same concrete type as
+    `dataplane.NewRuntimeDataPlane(dataplane.TypeUserspace)`.
+- the existing registry canary
+  `TestUserspaceBackendRegistryReturnsRuntimeAdapterForLegacyCallers`
+  is kept and continues to assert
+  `dataplane.NewRuntimeDataPlane(TypeUserspace)` returns the same
+  shape.
+
+In `pkg/daemon/dataplane_boot_test.go` (new test file in the
+daemon package so the helper is directly exercised):
+
+- `TestBuildRuntimeDataPlaneDefaultUsesUserspaceBoot` asserts that
+  `buildRuntimeDataPlane("")` returns the userspace adapter (same
+  concrete type as `userspace.Boot()`).
+- `TestBuildRuntimeDataPlaneUserspaceUsesUserspaceBoot` asserts the
+  same for `buildRuntimeDataPlane(dataplane.TypeUserspace)`.
+- `TestBuildRuntimeDataPlaneEBPFRoutesToLegacyManager` asserts
+  `buildRuntimeDataPlane(dataplane.TypeEBPF)` returns the legacy
+  `*dataplane.Manager` shape (NOT `*LegacyDataPlaneAdapter`).
+- `TestBuildRuntimeDataPlaneDPDKReturnsRetired` asserts
+  `buildRuntimeDataPlane(dataplane.TypeDPDK)` propagates
+  `ErrDPDKBackendRetired` unchanged.
+
+No file is parsed for a literal text reference — the canary that
+v2 proposed against `pkg/daemon/daemon_run.go` is dropped per
+Codex round-2 finding 4/6 (brittle text-shape check that breaks
+under a future file rename without any behavioral regression).
 
 ## 5. Public API preservation
 
@@ -314,6 +392,13 @@ Add a canary test in
 - The runtime backend registry still has a userspace entry.
 
 ## 6. Hidden invariants the change must preserve
+
+0. **Default routing.** Both `dpType == ""` and
+   `dpType == TypeUserspace` MUST route through `userspace.Boot()`,
+   not through `dataplane.NewRuntimeDataPlane()`. The daemon
+   helper resolves the empty default itself via
+   `dataplane.EffectiveType()` and dispatches accordingly. This
+   is the load-bearing structural delta of #1520.
 
 1. **Side-effect ordering on startup.** `userspace.New()` calls
    `bpfShim.SelectUserspaceXDPShimEntryProgram()` BEFORE returning.
@@ -367,7 +452,7 @@ Add a canary test in
 | Lifetime / borrow-checker risk | N/A | Go; no borrow checker concerns. |
 | Performance regression risk | NONE | Boot() runs once at daemon startup. No hot-path change. |
 | Architectural mismatch risk | MEDIUM | The AST canary forbids removing the `bpfShim` field. If reviewers want the slice to also peel `bpfShim` off into a smaller type, they should PLAN-KILL this slice and open a new issue that updates the canary. This slice deliberately does NOT touch the Manager shape. |
-| Sibling-PR collision risk | LOW | Touches `pkg/dataplane/userspace/manager.go` and `pkg/daemon/daemon_run.go`. #1521 (maps_sync) touches `pkg/dataplane/userspace/maps_sync.go`. No file overlap. |
+| Sibling-PR collision risk | LOW | Touches `pkg/dataplane/userspace/manager.go` (init + new Boot), `pkg/daemon/daemon_run.go` (one call-site change + new helper inline), and adds `pkg/dataplane/userspace/userspace_boot_canary_test.go` + `pkg/daemon/dataplane_boot_test.go`. #1521 touches `pkg/dataplane/userspace/maps_sync.go`. No file overlap. Semantic coordination: #1521 does NOT consume any new exported type from this slice. This slice does NOT add a `BootOptions` API for #1521 to extend. Future #1521 / #1473 may add a typed options argument to `Boot()` at that time. |
 
 ## 8. Test plan
 
@@ -382,12 +467,13 @@ Add a canary test in
    and
    `TestUserspaceBackendRegistryReturnsRuntimeAdapterForLegacyCallers`
    must continue to pass.
-4. **New canary.** `TestDaemonRunBuildsUserspaceViaBoot` and
-   `TestUserspaceBootIsExportedConstructor` pass.
+4. **New canary.** Behavioral tests in
+   `pkg/daemon/dataplane_boot_test.go` pass (default, userspace,
+   ebpf, dpdk routes — see §4.5).
 5. **Boot() return-shape canary.** `TestUserspaceBootReturnsAdapter`
-   asserts `Boot(BootOptions{})` returns
-   `*LegacyDataPlaneAdapter` and that the adapter still implements
-   both `dataplane.DataPlane` and `dataplane.RuntimeDataPlane`.
+   asserts `Boot()` returns `*LegacyDataPlaneAdapter` and that the
+   adapter still implements both `dataplane.DataPlane` and
+   `dataplane.RuntimeDataPlane`.
 6. **Rollback path canary.** `TestBuildRuntimeDataPlaneRoutesEBPFThroughLegacyFactory`
    asserts the daemon helper still routes `dataplane-type ebpf`
    through the legacy factory and returns the legacy
@@ -456,17 +542,15 @@ attempted in this PR:
    which returns the sentinel unchanged. Reviewers should verify
    this is preserved end-to-end.
 
-4. **Is the new AST canary brittle?** Parsing `daemon_run.go` for
-   a literal `buildRuntimeDataPlane`/`userspace.Boot` reference
-   will fail if a later refactor moves the call into a different
-   file (e.g., `dataplane_boot.go`). The canary should be
-   directory-scoped or interface-shaped. PLAN-NEEDS-MINOR if so.
+4. **Is the new AST canary brittle?** RESOLVED in v3: the
+   text-shape canary on `daemon_run.go` is dropped. The new tests
+   are behavioral — they call `buildRuntimeDataPlane()` directly
+   and assert returned types — and are stable across file
+   renames.
 
-5. **Is the BootOptions struct premature future-proofing?** It's
-   empty today. The alternative is a no-arg `Boot()` until #1521
-   needs an option. The plan chose the struct up-front to avoid
-   churn when #1521 lands. PLAN-NEEDS-MINOR if reviewers prefer
-   `Boot()` with no args.
+5. **Is the BootOptions struct premature future-proofing?**
+   RESOLVED in v3: `Boot()` takes no arguments. Future slices that
+   need to thread options can add them at that point.
 
 6. **#1521 collision.** #1521 is decoupling `maps_sync.go` from
    hard-coded BPF map name string literals. #1520 does not touch

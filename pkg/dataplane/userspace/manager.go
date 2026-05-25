@@ -58,9 +58,36 @@ func (m DataplaneMode) String() string {
 }
 
 func init() {
+	// RegisterRuntimeBackend retains the userspace runtime as a
+	// compatibility / test seam for callers that go through the legacy
+	// dataplane.NewRuntimeDataPlane(...) factory (and for the existing
+	// canaries that exercise the registry round-trip). Daemon startup
+	// prefers userspace.Boot() directly via the pkg/daemon helper, so
+	// this registry entry is no longer the canonical boot path.
+	// Removing it is out of scope for #1520; #1474 already permits its
+	// presence as the test / compatibility seam.
 	dataplane.RegisterRuntimeBackend(dataplane.TypeUserspace, func() dataplane.RuntimeDataPlane {
-		return NewLegacyDataPlaneAdapter(New())
+		return Boot()
 	})
+}
+
+// Boot constructs the userspace AF_XDP runtime and returns it as a
+// dataplane.RuntimeDataPlane wrapped in the legacy-compatible adapter.
+//
+// Daemon startup prefers Boot() over dataplane.NewRuntimeDataPlane(
+// TypeUserspace) for the default and explicit userspace selections.
+// The legacy registry path is retained for the explicit
+// "dataplane-type ebpf" rollback only, because that branch deliberately
+// resolves through dataplane.New() and the legacy program loader.
+//
+// The returned value still implements dataplane.DataPlane via the
+// adapter, so unmigrated callers (pkg/cli, pkg/api, pkg/conntrack,
+// pkg/fwdstatus) continue to compile until #1451 finishes the surface
+// shrink. When #1521 / #1473 need to thread additional construction
+// configuration in, they should add a typed options argument here.
+// No empty options struct is added pre-emptively (YAGNI).
+func Boot() dataplane.RuntimeDataPlane {
+	return NewLegacyDataPlaneAdapter(New())
 }
 
 type Manager struct {

@@ -42,6 +42,32 @@ import (
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
+// buildRuntimeDataPlane selects the userspace-native Boot() path for the
+// default and explicit userspace selections, and falls through to
+// dataplane.NewRuntimeDataPlane only for the explicit legacy eBPF rollback
+// (and the retired-DPDK error case). Keeping the legacy branch routed
+// through the dataplane factory preserves the ErrDPDKBackendRetired sentinel
+// handling unchanged AND preserves the existing AST canary in
+// pkg/dataplane/retirement_boundary_canary_test.go
+// (TestDaemonRuntimeEntryPointUsesRuntimeDataPlane) that requires
+// daemon_run.go to reference dataplane.NewRuntimeDataPlane.
+//
+// This helper MUST stay in daemon_run.go for the canary above. Do not
+// split into a separate file in pkg/daemon/ without updating the canary.
+//
+// #1520 (sub-#1451 S5): userspace daemon construction no longer detours
+// through the runtime backend registry. The registry entry is retained
+// as a compatibility / test seam (see pkg/dataplane/userspace/manager.go
+// init()).
+func buildRuntimeDataPlane(dpType string) (dataplane.RuntimeDataPlane, error) {
+	switch dataplane.EffectiveType(dpType) {
+	case dataplane.TypeUserspace:
+		return dpuserspace.Boot(), nil
+	default:
+		return dataplane.NewRuntimeDataPlane(dpType)
+	}
+}
+
 func collectAppliedTunnels(cfg *config.Config) []*config.TunnelConfig {
 	if cfg == nil {
 		return nil
@@ -243,7 +269,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		if cfg := d.store.ActiveConfig(); cfg != nil {
 			dpType = cfg.System.DataplaneType
 		}
-		dp, err := dataplane.NewRuntimeDataPlane(dpType)
+		dp, err := buildRuntimeDataPlane(dpType)
 		if errors.Is(err, dataplane.ErrDPDKBackendRetired) {
 			// #1527 Phase 2 of the DPDK retirement (umbrella
 			// #1525): the runtime DPDK backend is gone, but a
