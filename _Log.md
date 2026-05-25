@@ -288,6 +288,28 @@
     Rebased onto current master (which now has #1536).
   - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
     `_Log.md`
+- **Timestamp**: 2026-05-25T16:35:00Z
+  - **Action**: #1521 r4 review fixes — Copilot wording nits +
+    Codex LOW-1 parseMapsGoRegistry hard-fail + AGY r4 §II.1
+    local-block consts + AGY r4 §II.2 cross-file concat. Refactored
+    canary into package-wide AST inspector `findForbiddenAliasesIn
+    Files` that builds a single symbol table spanning every
+    production file's top-level AND block-local const decls
+    (DeclStmt walk). `parseMapsGoRegistry` now hard-fails on
+    non-BasicLit mapName* constants. New
+    TestParseMapsGoRegistryRejectsDriftShapes (3 sub-cases) +
+    TestCrossFileConcatBypassIsCaught + agy_r4_ii_local_block_
+    const_concat fixture. AGY r4 §II.3 (byte-slice synthesis) +
+    §II.4 (struct-tag reflection) documented as out-of-scope
+    deliberate-attacker bypasses in maps.go header.
+    Codex r4 MED-1 (parity AST roster) REJECTED third time same
+    rationale.
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    pkg/dataplane/userspace/maps.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: 5 canary tests + 18 negative-fixture sub-cases
+    all pass; go test ./... all 30 packages green.
+
 - **Timestamp**: 2026-05-25T16:15:00Z
   - **Action**: #1521 r3 code-review fixes — AGY r3 found four
     more bypass classes; all addressed: (i) deeply nested concat

@@ -25,6 +25,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -139,39 +140,40 @@ func TestNoLiteralMapNamesOutsideRegistry(t *testing.T) {
 func TestNoMapNameLiteralAliasesOutsideRegistry(t *testing.T) {
 	t.Parallel()
 
-	var violations []string
-	files, err := filepath.Glob("*.go")
+	// Package-level AST parse: build a single symbol table across
+	// every production .go file (excluding maps.go and _test.go)
+	// so cross-file constant concatenation cannot bypass the
+	// canary. AGY r4 §II.2 closed.
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseDir(fset, ".", nil, parser.ParseComments)
 	if err != nil {
-		t.Fatalf("glob: %v", err)
+		t.Fatalf("parse pkg/dataplane/userspace: %v", err)
 	}
-	for _, path := range files {
-		base := filepath.Base(path)
-		if base == "maps.go" {
-			continue
+	var files []*ast.File
+	var fileNames []string
+	for _, pkg := range parsed {
+		// Preserve a deterministic file order so violations
+		// reports are stable across runs.
+		paths := make([]string, 0, len(pkg.Files))
+		for p := range pkg.Files {
+			paths = append(paths, p)
 		}
-		if strings.HasSuffix(base, "_test.go") {
-			// Test files may construct map-name literals in
-			// helpers (e.g. injectShimMap) without functional
-			// risk on the production path.
-			continue
-		}
-		body, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("read %s: %v", path, err)
-		}
-		hits, err := findForbiddenMapNameAliases(string(body))
-		if err != nil {
-			t.Fatalf("parse %s: %v", path, err)
-		}
-		for _, h := range hits {
-			violations = append(violations, fmt.Sprintf(
-				"%s: forbidden map-name literal %q outside maps.go — "+
-					"reference a registry constant from maps.go instead",
-				path, h))
+		sort.Strings(paths)
+		for _, p := range paths {
+			base := filepath.Base(p)
+			if base == "maps.go" || strings.HasSuffix(base, "_test.go") {
+				continue
+			}
+			files = append(files, pkg.Files[p])
+			fileNames = append(fileNames, p)
 		}
 	}
-	if len(violations) > 0 {
-		t.Fatalf("AST alias canary violations:\n  %s", strings.Join(violations, "\n  "))
+	hits, err := findForbiddenAliasesInFiles(fset, files, fileNames)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if len(hits) > 0 {
+		t.Fatalf("AST alias canary violations:\n  %s", strings.Join(hits, "\n  "))
 	}
 }
 
@@ -211,6 +213,185 @@ func isKnownNonMapUserspaceLiteral(s string) bool {
 // The basic-literal walk is kept as the primary path (covers the
 // vast majority of cases), and the two structural walkers above
 // catch the residual bypass classes.
+// findForbiddenAliasesInFiles is the package-aware multi-file
+// inspector. It builds a single symbol table that spans:
+//
+//   - top-level consts in every file
+//   - local consts declared inside function bodies via *ast.DeclStmt
+//
+// then runs Pass 1/2/3 over every file using the unified table.
+// This closes AGY r4 §II.1 (local block constants) and §II.2
+// (cross-file concat) which the single-file helper could not see.
+//
+// Returns a slice of "path: hit" violation strings; one entry per
+// (file, distinct forbidden literal). Order is deterministic over
+// file iteration order — caller passes filenames in a stable order.
+func findForbiddenAliasesInFiles(fset *token.FileSet, files []*ast.File, fileNames []string) ([]string, error) {
+	if len(files) != len(fileNames) {
+		return nil, fmt.Errorf("file/name length mismatch")
+	}
+	// Build package-wide const symbol table. Top-level first, then
+	// local block consts. Forward references between top-level
+	// consts in Go require the referenced const to be declared
+	// earlier in the same file or in another file in the package —
+	// we run two passes to converge cross-file references.
+	consts := map[string]string{}
+	for pass := 0; pass < 2; pass++ {
+		for _, file := range files {
+			collectFileConstsInto(file, consts)
+		}
+	}
+
+	var hits []string
+	for i, file := range files {
+		path := fileNames[i]
+		concatOperand := map[ast.Node]bool{}
+		hitSet := map[string]struct{}{}
+		report := func(s string) {
+			if isKnownNonMapUserspaceLiteral(s) {
+				return
+			}
+			hitSet[s] = struct{}{}
+		}
+
+		// Pass 1: BinaryExpr concat fold (file-wide, but consts
+		// resolved against package-wide table).
+		ast.Inspect(file, func(n ast.Node) bool {
+			bin, ok := n.(*ast.BinaryExpr)
+			if !ok || bin.Op != token.ADD {
+				return true
+			}
+			folded, fok := evalStringExpr(bin, consts)
+			if !fok {
+				return true
+			}
+			if isMapNameSuspect(folded) {
+				report(folded)
+				markBasicLitOperands(bin, concatOperand)
+				return true
+			}
+			trimmed := trimPaddingForBypass(folded)
+			if trimmed != folded && isExactRegistryMapName(trimmed) {
+				report(trimmed)
+				markBasicLitOperands(bin, concatOperand)
+			}
+			return true
+		})
+
+		// Pass 2: CallExpr arg ident-resolution (package-wide
+		// table).
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			for _, arg := range call.Args {
+				if _, isLit := arg.(*ast.BasicLit); isLit {
+					continue
+				}
+				s, ok := evalStringExpr(arg, consts)
+				if !ok {
+					continue
+				}
+				if isMapNameSuspect(s) {
+					report(s)
+					continue
+				}
+				trimmed := trimPaddingForBypass(s)
+				if trimmed != s && isExactRegistryMapName(trimmed) {
+					report(trimmed)
+				}
+			}
+			return true
+		})
+
+		// Pass 3: direct BasicLit (with trim-padded check).
+		ast.Inspect(file, func(n ast.Node) bool {
+			lit, ok := n.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			if concatOperand[lit] {
+				return true
+			}
+			s, err := strconv.Unquote(lit.Value)
+			if err != nil {
+				return true
+			}
+			if strings.HasPrefix(s, "userspace_") && !containsUnicodeSpace(s) {
+				report(s)
+				return true
+			}
+			trimmed := trimPaddingForBypass(s)
+			if trimmed != s && isExactRegistryMapName(trimmed) {
+				report(s)
+			}
+			return true
+		})
+
+		// Stable sort of this file's hits.
+		keys := make([]string, 0, len(hitSet))
+		for s := range hitSet {
+			keys = append(keys, s)
+		}
+		sort.Strings(keys)
+		for _, h := range keys {
+			hits = append(hits, fmt.Sprintf(
+				"%s: forbidden map-name literal %q outside maps.go — "+
+					"reference a registry constant from maps.go instead",
+				path, h))
+		}
+	}
+	return hits, nil
+}
+
+// collectFileConstsInto records every const-declared string value
+// in file into out. Walks both top-level GenDecls and any GenDecls
+// nested inside function bodies (*ast.DeclStmt). Skips non-string
+// constants and constants that fail to fold (left unresolved for
+// the second pass to converge).
+func collectFileConstsInto(file *ast.File, out map[string]string) {
+	addSpec := func(vs *ast.ValueSpec) {
+		for i, name := range vs.Names {
+			if i >= len(vs.Values) {
+				continue
+			}
+			if v, ok := evalStringExpr(vs.Values[i], out); ok {
+				out[name.Name] = v
+			}
+		}
+	}
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			if vs, ok := spec.(*ast.ValueSpec); ok {
+				addSpec(vs)
+			}
+		}
+	}
+	// Block-local consts: walk every function body and look for
+	// DeclStmt nodes carrying const decls. AGY r4 §II.1.
+	ast.Inspect(file, func(n ast.Node) bool {
+		ds, ok := n.(*ast.DeclStmt)
+		if !ok {
+			return true
+		}
+		gd, ok := ds.Decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
+			return true
+		}
+		for _, spec := range gd.Specs {
+			if vs, ok := spec.(*ast.ValueSpec); ok {
+				addSpec(vs)
+			}
+		}
+		return true
+	})
+}
+
 func findForbiddenMapNameAliases(src string) ([]string, error) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "fixture.go", src, parser.ParseComments)
@@ -218,33 +399,12 @@ func findForbiddenMapNameAliases(src string) ([]string, error) {
 		return nil, err
 	}
 
-	// Build a const-identifier symbol table by walking every
-	// top-level const decl. Values that are themselves foldable
-	// string expressions get a fully-resolved string. Identifiers
-	// in initializers are resolved against the partial table
-	// (Go forbids forward references between top-level consts so
-	// the source order is a topological order; walking decls in
-	// file order is sufficient).
+	// Single-file const symbol table — covers both top-level and
+	// block-local const declarations (AGY r4 §II.1). Run twice to
+	// converge any single-file forward references.
 	consts := map[string]string{}
-	for _, decl := range file.Decls {
-		gd, ok := decl.(*ast.GenDecl)
-		if !ok || gd.Tok != token.CONST {
-			continue
-		}
-		for _, spec := range gd.Specs {
-			vs, ok := spec.(*ast.ValueSpec)
-			if !ok {
-				continue
-			}
-			for i, name := range vs.Names {
-				if i >= len(vs.Values) {
-					continue
-				}
-				if v, ok := evalStringExpr(vs.Values[i], consts); ok {
-					consts[name.Name] = v
-				}
-			}
-		}
+	for pass := 0; pass < 2; pass++ {
+		collectFileConstsInto(file, consts)
 	}
 
 	// Track which AST nodes have already been reported as part of
@@ -632,6 +792,25 @@ func (M) Map(string) any { return nil }
 			// stripped; trimmed value equals "userspace_ctrl".
 			want: []string{"userspace_ctrl ", "userspace_ctrl"},
 		},
+		{
+			name: "agy_r4_ii_local_block_const_concat",
+			src: `package x
+func F(m M) {
+	const pfx = "user"
+	const sfx = "space_ctrl"
+	const bypass = pfx + sfx
+	m.Map(bypass)
+}
+type M struct{}
+func (M) Map(string) any { return nil }
+`,
+			// AGY r4 II.1: local block consts. collectFileConstsInto
+			// now walks DeclStmt inside function bodies, so the
+			// local consts resolve and bypass = pfx + sfx folds to
+			// "userspace_ctrl". Pass 1 (BinaryExpr fold) and Pass 2
+			// (call-arg ident-resolve) both report; dedup keeps one.
+			want: []string{"userspace_ctrl"},
+		},
 	}
 
 	for _, tc := range cases {
@@ -723,8 +902,14 @@ type registryEntry struct {
 }
 
 // parseMapsGoRegistry parses maps.go and returns every top-level
-// `const mapName... = "..."` declaration. Skips comments, blank
-// identifiers, and non-string values.
+// `const mapName... = "..."` declaration.
+//
+// Any mapName* constant whose initializer is not a basic string
+// literal — or whose literal fails strconv.Unquote — is a HARD
+// FAILURE. Silent-skip would let a future refactor (e.g. building a
+// constant from concatenation or from an external identifier) slip
+// past the parity check; the test must complain immediately so the
+// reviewer is forced to update the canary. (Codex r4 LOW-1.)
 func parseMapsGoRegistry(path string) ([]registryEntry, error) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
@@ -743,23 +928,151 @@ func parseMapsGoRegistry(path string) ([]registryEntry, error) {
 				continue
 			}
 			for i, name := range vs.Names {
-				if i >= len(vs.Values) {
-					continue
-				}
 				if !strings.HasPrefix(name.Name, "mapName") {
 					continue
 				}
+				if i >= len(vs.Values) {
+					return nil, fmt.Errorf(
+						"%s: mapName-prefixed const %q has no initializer "+
+							"(iota or grouped declaration unsupported)",
+						path, name.Name)
+				}
 				lit, ok := vs.Values[i].(*ast.BasicLit)
-				if !ok || lit.Kind != token.STRING {
-					continue
+				if !ok {
+					return nil, fmt.Errorf(
+						"%s: mapName-prefixed const %q initializer is %T, "+
+							"want *ast.BasicLit (parity canary needs a direct string literal)",
+						path, name.Name, vs.Values[i])
+				}
+				if lit.Kind != token.STRING {
+					return nil, fmt.Errorf(
+						"%s: mapName-prefixed const %q is a %s literal, want STRING",
+						path, name.Name, lit.Kind)
 				}
 				v, err := strconv.Unquote(lit.Value)
 				if err != nil {
-					continue
+					return nil, fmt.Errorf(
+						"%s: mapName-prefixed const %q malformed literal %s: %w",
+						path, name.Name, lit.Value, err)
 				}
 				out = append(out, registryEntry{name: name.Name, value: v})
 			}
 		}
 	}
 	return out, nil
+}
+
+// TestParseMapsGoRegistryRejectsDriftShapes ensures the parity-
+// canary helper hard-fails (returns an error) for any `mapName*`
+// constant declared in a form it cannot statically reason about,
+// instead of silently skipping it and weakening parity coverage.
+// Closes Codex r4 LOW-1.
+func TestParseMapsGoRegistryRejectsDriftShapes(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cases := []struct {
+		name        string
+		src         string
+		wantErrSubs string
+	}{
+		{
+			name: "non_basiclit_initializer",
+			src: `package x
+const helper = "userspace_ctrl"
+const mapNameUserspaceCtrl = helper // ident, not BasicLit
+`,
+			wantErrSubs: "initializer is *ast.Ident",
+		},
+		{
+			name: "concat_initializer",
+			src: `package x
+const mapNameUserspaceCtrl = "userspace_" + "ctrl" // BinaryExpr
+`,
+			wantErrSubs: "initializer is *ast.BinaryExpr",
+		},
+		{
+			name: "non_string_kind",
+			src: `package x
+const mapNameUserspaceCtrl = 42 // int literal
+`,
+			wantErrSubs: "INT literal, want STRING",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(dir, tc.name+".go")
+			if err := os.WriteFile(path, []byte(tc.src), 0o644); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+			_, err := parseMapsGoRegistry(path)
+			if err == nil {
+				t.Fatalf("expected parseMapsGoRegistry to fail, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubs) {
+				t.Fatalf("error %q does not contain %q", err.Error(), tc.wantErrSubs)
+			}
+		})
+	}
+}
+
+// TestCrossFileConcatBypassIsCaught proves the multi-file
+// inspector resolves package-wide const concatenation that the
+// single-file helper cannot see. Closes AGY r4 §II.2.
+func TestCrossFileConcatBypassIsCaught(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	// File A: declare two innocuous-looking parts.
+	if err := os.WriteFile(filepath.Join(dir, "parts.go"), []byte(`package x
+const part1 = "user"
+const part2 = "space_ctrl"
+`), 0o644); err != nil {
+		t.Fatalf("write parts.go: %v", err)
+	}
+	// File B: combine them, lookup via Map().
+	if err := os.WriteFile(filepath.Join(dir, "use.go"), []byte(`package x
+const MyMap = part1 + part2
+type M struct{}
+func (M) Map(string) any { return nil }
+func F(m M) { _ = m.Map(MyMap) }
+`), 0o644); err != nil {
+		t.Fatalf("write use.go: %v", err)
+	}
+
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseDir(fset, dir, nil, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parse fixture dir: %v", err)
+	}
+	var files []*ast.File
+	var names []string
+	for _, pkg := range parsed {
+		paths := make([]string, 0, len(pkg.Files))
+		for p := range pkg.Files {
+			paths = append(paths, p)
+		}
+		sort.Strings(paths)
+		for _, p := range paths {
+			files = append(files, pkg.Files[p])
+			names = append(names, p)
+		}
+	}
+	hits, err := findForbiddenAliasesInFiles(fset, files, names)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	// At least one hit should reference "userspace_ctrl" — the
+	// folded cross-file value.
+	found := false
+	for _, h := range hits {
+		if strings.Contains(h, `"userspace_ctrl"`) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected hit referencing %q, got: %v", "userspace_ctrl", hits)
+	}
 }

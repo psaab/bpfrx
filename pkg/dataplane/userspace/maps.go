@@ -11,7 +11,10 @@
 // Scope of guarantee:
 //
 //   - Catches new literal reintroductions inside
-//     pkg/dataplane/userspace/ via the AST canary.
+//     pkg/dataplane/userspace/ via the AST canary, including
+//     const-ident aliases (local block or top-level, package-wide),
+//     concatenation folds, parenthesized selectors, method aliases,
+//     raw string literals, and Unicode-whitespace-padded forms.
 //   - Does NOT prevent drift against the Rust helper's BPF object
 //     names (those live in the BPF C source) or against the legacy
 //     loader's literals in pkg/dataplane/loader_ebpf.go (the loader
@@ -19,6 +22,12 @@
 //   - The dup-loader parity canary in maps_decouple_test.go pins
 //     the two sides together during the #1476 window so a rename in
 //     either side is caught at test time, not at bringup time.
+//   - Out-of-scope bypasses (deliberate-attacker, not accidental
+//     drift): constructing a map name via byte-slice
+//     (`string([]byte{'u','s',...})`) or via struct-tag reflection
+//     redirection — these require intent to bypass the canary and
+//     are not patterns that arise from refactor accident. AGY r4
+//     §II.3 / §II.4 documented these as acceptable residual.
 //
 // Issue: #1521 (sub-#1451 S6, blocks #1476).
 package userspace

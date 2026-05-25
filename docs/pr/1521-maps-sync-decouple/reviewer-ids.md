@@ -25,4 +25,8 @@ Plan is PLAN-READY v2 after both r1 verdicts addressed.
 | 3 | Codex | workflow 20260525-145416-0c2271 (impl r3) | HIGH×2 MED×1 — REJECT all (review-basis error: Codex inspected wrong checkout) |
 | 3 | Antigravity | adversarial-review-mplczt4g-jjot6z | CODE-NEEDS-MAJOR (const-ident bypass + non-standard whitespace + seen orphan + parity hardcode) → r4 |
 | 3 | Claude SMR | self-review post-r3-fixes | MERGE-READY pending r4 confirm |
+| 4 | Codex | workflow 20260525-145416-0c2271 (impl r4) | MED×1 LOW×1 → 1 REJECT 1 ACCEPT (parseMapsGoRegistry hard-fail) |
+| 4 | Antigravity | adversarial-review-mpldeqzb-442pr1 | NEEDS-MINOR (cross-file concat + local-block consts addressed; byte-slice + struct-tag tagged as out-of-scope) → r5 |
+| 4 | Copilot | PR review on cfae89555 | 4 inline comments — 2 already-fixed in r3 commit + 2 wording nits addressed in 5b41f9d7 |
+| 4 | Claude SMR | self-review post-r4-fixes | MERGE-READY pending r5 confirm |
 
