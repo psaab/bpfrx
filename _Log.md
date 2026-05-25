@@ -2827,3 +2827,11 @@
     third-family (validatePolicySchedulerReferencesStrict) coverage
     gap flagged in round-1 review.
   - **File(s)**: `pkg/config/compiler_test.go`
+- **Timestamp**: 2026-05-24T00:00Z
+- **Action**: Draft #1521 plan v1 — decouple userspace maps_sync from legacy BPF map name literals (sub-#1451 S6)
+- **File(s)**: docs/pr/1521-maps-sync-decouple/plan.md, docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+- **Why**: `pkg/dataplane/userspace/maps_sync.go` hardcodes eleven BPF map
+  names by string literal that need to migrate to a package-private
+  registry so #1476 can retire legacy pinning without grep-and-pray. Plan
+  preserves PR #1514's documented `userspace_fallback_stats` mixed-version
+  compatibility exception verbatim. Pending Codex + AGY plan review.
