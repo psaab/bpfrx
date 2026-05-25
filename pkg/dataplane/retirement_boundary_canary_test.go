@@ -66,7 +66,14 @@ var legacyDataplaneImportAllowlist = map[string]string{
 }
 
 var dpdkEBPFImportAllowlist = map[string]string{
-	"pkg/dataplane/dpdk/manager.go": "legacy DataPlane Map method returns *ebpf.Map until DPDK migrates off root DataPlane",
+	// After #1527 (Phase 2) the DPDK package is no longer linked
+	// into the default xpfd binary and has no production callers
+	// outside test code.  Phase 3 (#1528) deletes the package
+	// entirely.  The retained allowlist entry covers the in-tree
+	// retired stub's legacy DataPlane Map(string) *ebpf.Map
+	// signature so the package still compiles cleanly until Phase
+	// 3 removes it.
+	"pkg/dataplane/dpdk/manager.go": "retired in-tree DPDK stub keeps legacy DataPlane Map() *ebpf.Map signature until Phase 3 (#1528) deletes the package",
 }
 
 // dpdkBackendImportAllowlist is intentionally empty after Phase 2
