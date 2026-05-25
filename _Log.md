@@ -1808,3 +1808,18 @@
   - **File(s)**: `userspace-dp/src/afxdp/wg/framing.rs`, `_Log.md`
   - **Validation**: cargo build --release; cargo test --release --bin
     xpf-userspace-dp afxdp::wg.
+
+- **Timestamp**: 2026-05-25T05:41:23Z
+  - **Action**: Review fix (#1529) — inline DPDK annotation pass on
+    `docs/feature-gaps.md`. The initial sweep used a blanket header
+    note to cover all table rows, but several "Done" status cells still
+    contained present-tense DPDK language that implies the backend is
+    an active target. Fixed inline: line 169 (Twice NAT — "across eBPF,
+    DPDK, and userspace"), line 173 (Port Randomization — "XDP and DPDK
+    SNAT allocators"), lines 203/205 (TCP No-SYN-Check / TCP RST —
+    "eBPF + DPDK"), line 315 (Dual Fabric — "DPDK still lacks...parity"),
+    line 326 (Policer), line 327 (Three-Color Policer), line 407 (system
+    caps listing "DPDK config"), line 442 (policer tier list), line 516
+    (policer section). No source code changed; pure doc fixes.
+  - **File(s)**: `docs/feature-gaps.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/... -run 'TestRetirementBoundary|TestLegacyBPF' -count=1`
