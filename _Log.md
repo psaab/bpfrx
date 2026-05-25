@@ -2228,3 +2228,70 @@
   slog.Warn wording to "the DPDK dataplane backend has been retired".
 - **Validation**: pkg/dataplane test suite green; no other in-tree strings
   pinned the old wording.
+
+- **Timestamp**: 2026-05-24 (1517 plan draft)
+- **Action**: Wrote plan v1 (DRAFT) for #1517 — migrate pkg/cli off legacy
+  dataplane.DataPlane (sub-#1451 S2). Mirrors apiRuntimeDataPlane pattern.
+- **File(s)**: docs/pr/1517-cli-migration/plan.md
+- **Why**: Triple-review methodology — plan first, code never first. Dispatch
+  Codex + Antigravity adversarial plan review before any code touches.
+
+- **Timestamp**: 2026-05-24 (1517 plan v2 PLAN-READY)
+- **Action**: Folded Codex PLAN-NEEDS-MINOR findings into plan v2. AGY
+  PLAN-READY against v1 stands. Both reviewers now agree — proceeding to
+  implementation.
+- **File(s)**: docs/pr/1517-cli-migration/plan.md, reviewer-ids.md
+- **Why**: Codex r1 (task-mpkukwfs-gl3fv4) identified Q1 over-engineering
+  (LastApplyResultOf is already `any`-typed at apply.go:54, so neither
+  Option B shadow field nor Option C interface widening is needed) and a
+  scope-doc citation hygiene issue. AGY r1 (adversarial-review-mpkuldhp-mnlp6x)
+  was PLAN-READY across all seven hostile checks.
+
+- **Timestamp**: 2026-05-25 (1517 implementation)
+- **Action**: Implemented #1517 — added pkg/cli/runtime.go with cliRuntime
+  interface (25 methods), cliUserspaceStatusProvider, and
+  cliUserspaceControlProvider. Changed cli.dp from dataplane.DataPlane to
+  cliRuntime; cli.New parameter type updated. Five inline interface{}
+  provider probes consolidated into named interfaces.
+- **File(s)**: pkg/cli/runtime.go (new), pkg/cli/cli.go,
+  pkg/cli/cli_helpers.go, pkg/cli/cli_show_chassis.go,
+  pkg/cli/cli_show_system.go, pkg/dataplane/retirement_boundary_canary_test.go
+  (add runtime.go to legacy allowlist), docs/pr/1373-retire-ebpf-dataplane/README.md
+  (add runtime.go row to migration table).
+- **Validation**: cargo+go build clean; ./pkg/cli/... 5/5 flake pass;
+  full Go suite green. Deployed to loss userspace cluster:
+  Pass A 6/6 baseline cells 0 retrans, multi-stream -P 12 -R hit
+  22.6/20.3 Gbps with 0 retrans. Pass B all 24 cells passed; shaped
+  classes hit configured rates cleanly. Interactive CLI smoke
+  (show security flow session brief, show security flow statistics,
+  clear security flow session all, show system buffers,
+  show chassis forwarding, request chassis cluster data-plane
+  userspace) all work — the named provider-probe interfaces resolve
+  correctly against the userspace LegacyDataPlaneAdapter.
+
+- **Timestamp**: 2026-05-25 (1517 code-review r1 minor folds)
+- **Action**: Folded Copilot inline finding on cliUserspaceControlProvider
+  doc comment — said "request security flow" but correct CLI path is
+  "request chassis cluster data-plane userspace" handled by
+  handleRequestChassisClusterDataPlane in cli_request.go. Recorded
+  reviewer-ids for code-review round 1.
+- **File(s)**: pkg/cli/runtime.go, docs/pr/1517-cli-migration/reviewer-ids.md
+
+- **Timestamp**: 2026-05-25 (1517 code review final verdicts)
+- **Action**: All three reviewers MERGE-READY. Recording verdicts;
+  not merging (per project policy).
+- **File(s)**: docs/pr/1517-cli-migration/reviewer-ids.md
+- **Validation**: Codex r3 task-mpkvl9cn-3we3in MERGE-READY (after two
+  sandbox-FS-blocked retries); AGY adversarial-review-mpkvctz4-xk8x46
+  MERGE-READY (exhaustive 10-check report with byte-for-byte evidence);
+  Copilot COMMENTED with 1 minor inline finding, addressed in 91e1da9f.
+
+- **Timestamp**: 2026-05-25T07:30Z
+- **Action**: PR #1549 — fix stale plan.md snippet per Copilot d9545813 review
+- **File(s)**: docs/pr/1517-cli-migration/plan.md
+- **Why**: Copilot review on d9545813 left 1 inline comment that the plan.md
+  snippet for cliUserspaceControlProvider still references `request security
+  flow ...` while the actual source comment (fixed in 91e1da9f) and the actual
+  handler path are `request chassis cluster data-plane userspace` via
+  cli_request.go:handleRequestChassisClusterDataPlane. Updated plan snippet
+  in lockstep so docs match implementation. No code change.

@@ -164,29 +164,15 @@ func (c *CLI) buildInterfacesInput() cluster.InterfacesInput {
 }
 
 func (c *CLI) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
-	provider, ok := c.dp.(interface {
-		Status() (dpuserspace.ProcessStatus, error)
-	})
+	provider, ok := c.dp.(cliUserspaceStatusProvider)
 	if !ok {
 		return dpuserspace.ProcessStatus{}, fmt.Errorf("userspace status unavailable")
 	}
 	return provider.Status()
 }
 
-func (c *CLI) userspaceDataplaneControl() (interface {
-	Status() (dpuserspace.ProcessStatus, error)
-	SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
-	SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
-	SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
-	InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
-}, error) {
-	provider, ok := c.dp.(interface {
-		Status() (dpuserspace.ProcessStatus, error)
-		SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
-		SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
-		SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
-		InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
-	})
+func (c *CLI) userspaceDataplaneControl() (cliUserspaceControlProvider, error) {
+	provider, ok := c.dp.(cliUserspaceControlProvider)
 	if !ok {
 		return nil, fmt.Errorf("userspace dataplane control unavailable")
 	}

@@ -47,7 +47,7 @@ import (
 type CLI struct {
 	rl              *readline.Instance
 	store           *configstore.Store
-	dp              dataplane.DataPlane
+	dp              cliRuntime
 	eventBuf        *logging.EventBuffer
 	eventReader     *logging.EventReader
 	routing         *routing.Manager
@@ -105,7 +105,7 @@ type CLI struct {
 }
 
 // New creates a new CLI.
-func New(store *configstore.Store, dp dataplane.DataPlane, eventBuf *logging.EventBuffer, eventReader *logging.EventReader, rm *routing.Manager, fm *frr.Manager, im *ipsec.Manager, dm *dhcp.Manager, dr *dhcprelay.Manager, cm *cluster.Manager) *CLI {
+func New(store *configstore.Store, dp cliRuntime, eventBuf *logging.EventBuffer, eventReader *logging.EventReader, rm *routing.Manager, fm *frr.Manager, im *ipsec.Manager, dm *dhcp.Manager, dr *dhcprelay.Manager, cm *cluster.Manager) *CLI {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "xpf"
