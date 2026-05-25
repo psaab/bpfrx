@@ -2,7 +2,19 @@
 
 ## Status
 
-DRAFT v1 — pending adversarial plan review.
+v2 — PLAN-READY after Antigravity PLAN-READY
+(adversarial-review-mpkqkzkm-qfa19j) and Codex PLAN-NEEDS-MINOR
+(task-mpkqsgf5-j2yag1). v2 incorporates the three MUST-FIX items:
+
+1. Require Chain A (#1526) to land BEFORE this PR (sequencing
+   constraint, was previously "either order works").
+2. Drop Change 5 (docs edit) entirely. The required canary tokens
+   are already present in `docs/pr/1373-retire-ebpf-dataplane/README.md`
+   and Chain C (#1529) owns the docs sweep.
+3. Acknowledge that `ErrDPDKBackendRetired` cannot be re-used by
+   `pkg/config` for Chain A because `pkg/dataplane` already imports
+   `pkg/config` (import cycle).  The sentinel is for runtime factory
+   callers only.
 
 ## Issue framing
 
@@ -21,10 +33,29 @@ production binary references it, so its deletion is a pure no-link
 file removal.
 
 The user-facing commit-time rejection for `system dataplane-type
-dpdk` is sibling Chain A (#1526). This PR assumes Phase 1 either
-lands first or is independent enough that the runtime "DPDK backend
-retired" error here covers the post-#1527, pre-#1526 window if Chain
-A is still in flight.
+dpdk` is sibling Chain A (#1526). **This PR REQUIRES #1526 to land
+first.** Today's behavior on a running daemon that loads a config
+with `system dataplane-type dpdk` is:
+
+- `dataplane.NewRuntimeDataPlane("dpdk")` succeeds (stub registers
+  the backend, `pkg/daemon/daemon_run.go:245`).
+- `d.dp.Start(ctx)` returns `errDPDKBuildTagRequired`, daemon logs
+  `slog.Warn("failed to start dataplane, running in config-only
+  mode")` and continues running (`daemon_run.go:251-254`).
+
+After this PR's changes:
+
+- `dataplane.NewRuntimeDataPlane("dpdk")` returns
+  `ErrDPDKBackendRetired`.
+- `daemon_run.go:248` returns `fmt.Errorf("create dataplane: %w",
+  err)`, daemon exits with `os.Exit(1)`.
+
+Without #1526 landing first, an operator who already committed
+`set system dataplane-type dpdk` on the running config would see
+their daemon refuse to start after the next restart. With #1526
+landed first, the config never accepts `dpdk` at commit time, so
+this PR's runtime path is only reachable via a malformed config
+file written by hand (which is acceptable as a fatal error).
 
 ## Honest scope/value framing
 
@@ -59,11 +90,14 @@ perf claim — the value is discipline gate, not throughput.)
 ## What's already shipped / partially batched
 
 - The `errDPDKBuildTagRequired` startup error
-  (`pkg/dataplane/dpdk/dpdk_stub.go:17`) already prevents a non-
-  `-tags dpdk` build from running DPDK at runtime. With this PR's
-  changes, that error path is unreachable from the boot path (no
-  registration) but stays in place as defense-in-depth for the
-  `-tags dpdk` build path.
+  (`pkg/dataplane/dpdk/dpdk_stub.go:17`) is gated behind
+  `//go:build !dpdk` and only exists in non-`-tags dpdk` builds.
+  After this PR's changes, the boot path no longer registers the
+  DPDK backend at all (registration removed in both stub and
+  `-tags dpdk` builds, since `manager.go` has no build tag). The
+  package-local test `TestDPDKStubRequiresDPDKBuildTag` still
+  exercises this sentinel directly (no factory path needed), so
+  it stays in place until Phase 3 deletes the package.
 - The retirement-boundary canary
   (`pkg/dataplane/retirement_boundary_canary_test.go`) already
   enforces the *narrow* policy that only `cmd/xpfd/main.go` may
@@ -167,25 +201,23 @@ collapses to a non-issue because the map is empty.
 (line 137-159) currently allows `cmd/xpfd/main.go` to import DPDK.
 That exemption is removed (the import is gone).
 
-### Change 5 — Update Phase-1373 README DPDK policy section
+### Change 5 — REMOVED (Chain C scope)
 
-The retirement-boundary docs at
-`docs/pr/1373-retire-ebpf-dataplane/README.md` contain a `#1475
-DPDK Backend Policy` section whose tokens are pinned by
-`TestRetirementBoundaryDocsMentionDPDKPolicy`. Update the prose so
-the canary still passes while reflecting Phase 2 reality:
+The original plan v1 proposed editing
+`docs/pr/1373-retire-ebpf-dataplane/README.md`'s `#1475 DPDK
+Backend Policy` section. Codex round-1 plan review correctly
+flagged that this is Chain C (#1529) scope.
 
-- "DPDK remains a separately supported backend" → "DPDK backend
-  registration has been retired (#1527 / #1525); the package is
-  unreferenced and Phase 3 (#1528) will delete it."
-- Drop the "blank DPDK import in `cmd/xpfd/main.go`" sentence.
-- Keep the `-tags dpdk` token and `root DataPlane` mention (still
-  enforced by the canary).
-
-Update the canary's required tokens to match. The required token
-list at lines 832-839 of the canary test is hand-curated; this PR
-trims it to the tokens that still describe accurate post-#1527
-policy.
+The required canary tokens at
+`pkg/dataplane/retirement_boundary_canary_test.go:1780-1788`
+(`## #1475 DPDK Backend Policy`, `DPDK remains a separately
+supported backend`, `outside the eBPF source-removal path`,
+`` `pkg/dataplane/dpdk` ``, `` `cmd/xpfd/main.go` ``, `` `-tags
+dpdk` ``, `` root `DataPlane` ``) are all still present in the
+README untouched (verified by grep). The docs-token canary stays
+green without any edit in this PR. Chain C will update the prose
+to reflect the post-Phase-2 reality once Phase 3 (#1528) has
+deleted the package.
 
 ### Change 6 — Adjust the DPDK package-local test
 
@@ -208,10 +240,14 @@ registry.
   error return shape changes for the DPDK case.
 - `pkg/dataplane.NewRuntimeDataPlane(string)` signature — unchanged;
   same.
-- `pkg/dataplane.TypeDPDK` constant — preserved (so #1526's
-  commit-time rejection path can reference it if it wants a typed
-  sentinel; otherwise the constant's only consumer is the
-  retirement error path here).
+- `pkg/dataplane.TypeDPDK` constant — preserved. (Chain A
+  (#1526) cannot import `dataplane.ErrDPDKBackendRetired` from
+  `pkg/config/compiler.go` without creating an import cycle —
+  `pkg/dataplane/dataplane.go:9` already imports `pkg/config`.
+  Chain A will keep its own string literal or local sentinel.
+  The `TypeDPDK` constant is still useful as a typed token for
+  the retirement-error code path in `NewDataPlane` /
+  `NewRuntimeDataPlane`.)
 - `pkg/dataplane/dpdk.Manager` type — unchanged; still compiles.
 - `pkg/dataplane/dpdk.New()` constructor — unchanged; still
   callable but no longer registered.
@@ -267,7 +303,7 @@ registry.
 | Architectural mismatch | LOW | Same shape as #1473 retirement Phase 1 — shrink canary allowlist, remove registration, leave package compilable for later deletion. |
 | Canary drift | MED | The canary tests are fiddly. The `stale allowlist entry` branch of `TestDPDKBackendImportStaysBackendLocal` triggers if the map empties without the test logic understanding that empty-is-OK. The plan accounts for that by reading the test code, not just the allowlist. |
 | Docs-token canary drift | MED | `TestRetirementBoundaryDocsMentionDPDKPolicy` pins 7 token strings. The plan touches that prose and must keep the canary-required tokens present (or update the canary token list in lockstep). |
-| #1526 ordering | LOW-MED | If #1526 (commit-time rejection) lands after this PR, there is a window where the daemon accepts `system dataplane-type dpdk` at commit but rejects it at runtime via `ErrDPDKBackendRetired`. The error message is the same as Chain A's, so operator UX is acceptable. If #1526 lands first, this PR has no effect on the commit path. |
+| #1526 ordering | HIGH if #1527 lands first | Today's daemon currently runs in config-only mode on `set system dataplane-type dpdk` (slog.Warn). After this PR, the same config kills the daemon at startup. **Therefore #1526 must land first** so the config never reaches the runtime in the first place. The sequencing is a HARD prerequisite, not a soft recommendation. |
 
 ## Test plan
 
@@ -353,11 +389,13 @@ Total: 30 measurements per the skill's discipline. Required:
    plan: check after `EffectiveType` so the empty-default path is
    unaffected.
 
-5. **Does this PR need to land before or after #1526?** Plan says
-   "either order works." But if #1526 lands first and then this PR
-   lands, is there a window where the commit-time rejection passes
-   but a stale-import canary fires because Chain A added a typed
-   reference? Reviewer should verify the dependency graph.
+5. **Does this PR need to land before or after #1526?** RESOLVED:
+   #1526 must land first. Codex plan review (task-mpkqsgf5-j2yag1)
+   correctly showed that today's behavior is `slog.Warn` + config-
+   only fallback, while this PR makes the same config fatal at
+   daemon startup. Without Chain A landing first, an existing
+   `system dataplane-type dpdk` config would kill the daemon on
+   next restart.
 
 6. **The `-tags dpdk` build path: leave it as zombie code or
    actively break it?** Removing the `init()` means `-tags dpdk`

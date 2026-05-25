@@ -13,6 +13,23 @@
     Chain A (#1526) and Chain C (#1528/#1529) lanes clean.
   - **File(s)**: `docs/pr/1527-dpdk-boot-decouple/plan.md`
 
+- **Timestamp**: 2026-05-24T18:30:00Z
+  - **Action**: #1527 plan v2 — incorporated Codex hostile plan
+    review (task-mpkqsgf5-j2yag1, PLAN-NEEDS-MINOR). Three MUST-FIX
+    items applied: (1) require Chain A #1526 to land BEFORE this PR
+    (was "either order works" — Codex showed today's UX is
+    config-only fallback with slog.Warn but this PR makes the same
+    config fatal at startup); (2) dropped Change 5 docs edit — the
+    required canary tokens are already present in
+    docs/pr/1373-retire-ebpf-dataplane/README.md, so docs prose is
+    Chain C #1529 scope only; (3) acknowledged that
+    ErrDPDKBackendRetired cannot be used by pkg/config (Chain A)
+    due to dataplane->config import cycle. Also corrected
+    errDPDKBuildTagRequired claim (it's !dpdk-gated, not a
+    defense-in-depth for -tags dpdk). Antigravity PLAN-READY
+    (adversarial-review-mpkqkzkm-qfa19j) verdict preserved.
+  - **File(s)**: `docs/pr/1527-dpdk-boot-decouple/plan.md`
+
 - **Timestamp**: 2026-05-25T00:45:00Z
   - **Action**: PR #1512 review follow-up — tightened the positional
     `dataplane.Manager` literal canary on two axes. (a) Recurse into nested
