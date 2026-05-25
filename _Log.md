@@ -2,6 +2,36 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T05:00:00Z
+  - **Action**: #1501 A2 — replaced the stale TODO + contradictory
+    doc comment on `write_outer_ipv4_udp` with an honest
+    RFC-grounded comment explaining that the engine intentionally
+    emits outer IPv4 UDP cs=0 (legal per RFC 768) and that this
+    DIFFERS from kernel WireGuard / wireguard-go which compute
+    the outer UDP checksum. Added two byte-level regression
+    assertions on `out[26..28] == [0, 0]` (one new dedicated
+    `udp_checksum_is_zero_on_ipv4_outer` test + a strengthened
+    `ipv4_checksum_is_correct`) with 0xff sentinel pre-fill so
+    the assertion proves the function wrote zero rather than
+    leaving the buffer zero-initialized. Triple-review:
+    Antigravity (round-1 PLAN-NEEDS-MINOR for sentinel pre-fill;
+    round-2 PLAN-READY) and Codex (round-1 PLAN-NEEDS-MAJOR for
+    factually-wrong "matches kernel WG" claim; round-2
+    PLAN-READY) both agreed before code touched.
+  - **File(s)**: `userspace-dp/src/afxdp/wg/outer.rs`,
+    `docs/pr/1501-a2-outer-udp-cs/plan.md`, `_Log.md`
+  - **Validation**: cargo build --release clean; cargo test
+    --release for `afxdp::wg::outer` 6/6 pass (5x flake-checked);
+    full cargo suite 1417 passed modulo two pre-existing flaky
+    tests on origin/master da103d81 baseline
+    (`snat_contract_documents_current_fail_closed_runtime`
+    fails consistently on master too;
+    `reconcile_peers_snapshot_is_atomic_under_concurrent_load`
+    is a 1-in-5 load flake on master too); `go test ./...`
+    clean; smoke on loss userspace cluster Pass A (CoS off)
+    0-retrans single-stream + 23 Gb/s 12-stream `-R`, and
+    Pass B (CoS on) 24-cell per-class shaper smoke 5201-5206 ×
+    v4+v6 × push+rev with shape rates hit cleanly.
 - **Timestamp**: 2026-05-25T05:30:00Z
   - **Action**: Addressed Copilot's 4 nits on PR #1534 (DPDK
     operator docs retirement, #1531). Harmonized retirement banners
