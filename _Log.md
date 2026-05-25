@@ -758,6 +758,24 @@
     PLAN-KILL grounds.
   - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
     `_Log.md`
+- **Timestamp**: 2026-05-25T15:25:00Z
+  - **Action**: #1539 implementation — Option A + Option B per
+    plan v3. Option A: `cfg.System.DPDKDataplane = nil` clear at
+    end of `compileExpanded` after `validateDataplaneTypeStrict`
+    succeeds and before `return cfg, nil`. Option B: new
+    pkg/config/dpdk_subtree_leakage_canary_test.go (~600 LOC
+    including ~200 LOC walker + fixtures + 9 tests). Canary uses
+    parent-stack maintained via ast.Inspect nil-callback
+    semantics, walks parent chain to enclosing FuncDecl (AGY
+    round-2 MEDIUM nested-conditional fix), recognizes IfStmt
+    `==` gates and switch single-entry case-clause gates (AGY
+    round-2 HIGH multi-case fix), and rejects negation idiom
+    (Codex round-2 contradictory-paragraph fix). LHS-of-assign-
+    to-nil is recognized so Option A's clear is not flagged.
+    Real-repo scan returns zero findings; 5x flake-clean on
+    named tests; `go test ./...` passes across all 30 packages.
+  - **File(s)**: pkg/config/compiler.go,
+    pkg/config/dpdk_subtree_leakage_canary_test.go, _Log.md
 - **Timestamp**: 2026-05-25T14:50:00Z
   - **Action**: #1539 plan v3 — applied round-2 plan review
     feedback. Codex round-2 PLAN-MINOR (session

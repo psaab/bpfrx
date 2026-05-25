@@ -278,6 +278,23 @@ func compileExpanded(tree *ConfigTree) (*Config, error) {
 		}
 	}
 
+	// #1539: structural invariant against AST leakage / shadow
+	// execution of retired DPDK sub-tree fields.
+	// validateDataplaneTypeStrict above has already rejected every
+	// committed config that selects the retired DPDK backend; on the
+	// success path the only way cfg.System.DPDKDataplane could still
+	// be non-nil is if a future compiler entry path forgets to call
+	// the strict validator. Force the field to nil here so that any
+	// future helper / reader of the form
+	//   if cfg.System.DPDKDataplane != nil { /* DPDK-only logic */ }
+	// is statically dead on every committed config without requiring
+	// the caller to also gate on effectiveDataplaneType. This is dead
+	// code after #1528 (Phase 3) deletes the field entirely; remove
+	// this line in #1528.
+	if cfg != nil {
+		cfg.System.DPDKDataplane = nil
+	}
+
 	return cfg, nil
 }
 
