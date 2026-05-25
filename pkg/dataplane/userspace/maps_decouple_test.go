@@ -400,44 +400,52 @@ func cloneMap(m map[string]string) map[string]string {
 	return out
 }
 
-func collectLocalConstsForBlock(block ast.Node, parent map[string]string) map[string]string {
+func collectConstsFromStmtList(stmts []ast.Stmt, parent map[string]string) map[string]string {
 	local := cloneMap(parent)
+	addSpec := func(vs *ast.ValueSpec) {
+		for i, name := range vs.Names {
+			if i >= len(vs.Values) {
+				continue
+			}
+			if v, ok := evalStringExpr(vs.Values[i], local); ok {
+				local[name.Name] = v
+			}
+		}
+	}
 	for pass := 0; pass < 8; pass++ {
 		prev := len(local)
-		ast.Inspect(block, func(n ast.Node) bool {
-			if n == nil {
-				return true
-			}
-			switch n.(type) {
-			case *ast.FuncDecl, *ast.FuncLit:
-				return false
-			}
-			ds, ok := n.(*ast.DeclStmt)
+		for _, stmt := range stmts {
+			ds, ok := stmt.(*ast.DeclStmt)
 			if !ok {
-				return true
+				continue
 			}
 			gd, ok := ds.Decl.(*ast.GenDecl)
 			if !ok || gd.Tok != token.CONST {
-				return true
+				continue
 			}
 			for _, spec := range gd.Specs {
 				if vs, ok := spec.(*ast.ValueSpec); ok {
-					for i, name := range vs.Names {
-						if i < len(vs.Values) {
-							if v, ok := evalStringExpr(vs.Values[i], local); ok {
-								local[name.Name] = v
-							}
-						}
-					}
+					addSpec(vs)
 				}
 			}
-			return true
-		})
+		}
 		if len(local) == prev {
 			break
 		}
 	}
 	return local
+}
+
+func collectLocalConstsForBlock(block ast.Node, parent map[string]string) map[string]string {
+	switch n := block.(type) {
+	case *ast.BlockStmt:
+		return collectConstsFromStmtList(n.List, parent)
+	case *ast.CaseClause:
+		return collectConstsFromStmtList(n.Body, parent)
+	case *ast.CommClause:
+		return collectConstsFromStmtList(n.Body, parent)
+	}
+	return parent
 }
 
 type scopeWalker struct {
@@ -454,19 +462,7 @@ func (w *scopeWalker) Visit(node ast.Node) ast.Visitor {
 	currentScope := w.consts[len(w.consts)-1]
 
 	switch n := node.(type) {
-	case *ast.FuncDecl:
-		if n.Body != nil {
-			currentScope = collectLocalConstsForBlock(n.Body, currentScope)
-			w.consts = append(w.consts, currentScope)
-			hasNewScope = true
-		}
-	case *ast.FuncLit:
-		if n.Body != nil {
-			currentScope = collectLocalConstsForBlock(n.Body, currentScope)
-			w.consts = append(w.consts, currentScope)
-			hasNewScope = true
-		}
-	case *ast.BlockStmt:
+	case *ast.BlockStmt, *ast.CaseClause, *ast.CommClause:
 		currentScope = collectLocalConstsForBlock(n, currentScope)
 		w.consts = append(w.consts, currentScope)
 		hasNewScope = true
@@ -1050,6 +1046,25 @@ func (M) Map(string) any { return nil }
 			// a package-level constant, which would corrupt a flat symbol table.
 			// The scope-aware walker ensures the package-level chain3 still resolves
 			// to "userspace_fallback_stats" and is successfully caught.
+			want: []string{"userspace_fallback_stats", "userspace_fallback"},
+		},
+		{
+			name: "agy_r7_switch_case_shadow_bypass",
+			src: `package x
+func F(x int, m M) {
+	const chain3 = chain2 + "_stats"
+	const chain2 = chain1 + "_fallback"
+	const chain1 = "userspace"
+	switch x {
+	case 1:
+		const chain1 = "innocuous"
+	case 2:
+		_ = m.Map(chain3)
+	}
+}
+type M struct{}
+func (M) Map(string) any { return nil }
+`,
 			want: []string{"userspace_fallback_stats", "userspace_fallback"},
 		},
 	}

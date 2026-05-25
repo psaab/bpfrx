@@ -35,4 +35,7 @@ Plan is PLAN-READY v2 after both r1 verdicts addressed.
 | 6 | Antigravity | adversarial-review-mple4zlr-vda9fo | NEEDS-MINOR (block-local const shadowing bypasses package-level chain) — AGY-authored fix applied directly: scopeWalker isolates top-level vs block-local consts; agy_r6_block_shadow_chain_bypass fixture proves the kill |
 | 6 | Copilot | PR review on 0692093a | "Copilot reviewed 9 out of 9 changed files in this pull request and generated no new comments." — clean |
 | 6 | Claude SMR | self-review post-AGY-authored fix | MERGE-READY |
+| 7 | Antigravity | adversarial-review-mplebv9s-a166sj | CONCRETE KILL (switch/case implicit-block shadow) — AGY-authored fix: collectConstsFromStmtList strict stmt-list iteration + scopeWalker push for CaseClause/CommClause; agy_r7_switch_case_shadow_bypass fixture proves the kill |
+| 7 | Copilot | pending PR review on 2769fa1f | _waiting on push_ |
+| 7 | Claude SMR | post-r7 self-review | MERGE-READY |
 

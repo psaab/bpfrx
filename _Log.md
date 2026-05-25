@@ -288,6 +288,29 @@
     Rebased onto current master (which now has #1536).
   - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
     `_Log.md`
+- **Timestamp**: 2026-05-25T17:30:00Z
+  - **Action**: #1521 r7 review fix — AGY r7 CONCRETE KILL: switch
+    or select case body acts as an implicit Go scope but is
+    represented as *ast.CaseClause / *ast.CommClause, not
+    *ast.BlockStmt. The r6 scopeWalker only pushed scopes for
+    BlockStmt/FuncDecl/FuncLit; case-body consts therefore leaked
+    into the enclosing scope and could shadow package-level consts
+    (e.g. `case 1: const chain1 = "innocuous"` overwrites the
+    package-level chain1). Additionally, the local-const collector
+    used ast.Inspect over the whole block, which recursively
+    descended into nested case bodies and pulled their consts into
+    the outer scope.
+    AGY r7 authored the fix: collectLocalConstsForBlock now
+    dispatches on node type and routes to a strict stmt-list
+    iterator collectConstsFromStmtList (no ast.Inspect, no nested
+    descent). scopeWalker pushes new scopes for BlockStmt,
+    CaseClause, and CommClause. New agy_r7_switch_case_shadow_
+    bypass fixture asserts the kill.
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: 6 canary tests + 20 negative-fixture sub-cases
+    pass; go test ./... all 30 packages green.
+
 - **Timestamp**: 2026-05-25T17:15:00Z
   - **Action**: #1521 r6 review fix — AGY r6 NEEDS-MINOR identified
     one more bypass: block-local const declaration with the same
