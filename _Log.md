@@ -2,6 +2,27 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T06:50:00Z
+  - **Action**: #1527 reviewer re-dispatch on 878bcbdd after my
+    earlier v3 NPE-fix commit landed. Codex hostile re-review
+    (task-mpks5yrq-4h7ia5) and Antigravity adversarial re-review
+    (adversarial-review-mpks62um-g47sg4) dispatched with explicit
+    context that the OnFenceReceived NPE is now guarded at
+    daemon_ha_sync.go:676-679, and that stale docs prose is
+    intentionally deferred to Chain C #1529 — the canary test still
+    passes because every pinned token still exists in the README.
+    Copilot re-triggered via @copilot review (issue-comment
+    4531855093). Ran the full smoke matrix on the loss userspace
+    cluster after make cluster-deploy: Pass A (CoS-off) v4 push 8.81
+    Gb/s / v6 push 8.75 Gb/s / v4 reverse 8.65 Gb/s / v6 reverse 8.87
+    Gb/s / -P 12 -R v4 23.0 Gb/s / v6 22.6 Gb/s, all zero-retrans;
+    Pass B (CoS-on) 24-cell per-class matrix all shaped correctly on
+    push (100m→83/82 Mb/s, 1g→844/832 Mb/s, ..., 12g→6.54/6.37 Gb/s)
+    and reverse unshaped 7.4-8.2 Gb/s. Reviewer-ids recorded in
+    docs/pr/1527-dpdk-boot-decouple/reviewer-ids.md. Smoke posted as
+    PR comment 4531859958.
+  - **File(s)**: `docs/pr/1527-dpdk-boot-decouple/reviewer-ids.md`
+
 - **Timestamp**: 2026-05-25T06:40:00Z
   - **Action**: #1527 v4 — Codex hostile code review v3
     (task-mpkrwbtk-pd6nnw MERGE-NEEDS-MAJOR) and Antigravity
