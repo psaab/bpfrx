@@ -160,8 +160,9 @@ dependency is either moved to a userspace-owned schema or explicitly retired:
 
 The headers are not all dead with the XDP/TC source. The current tree still
 uses or cites them for `MAX_INTERFACES`, Go constants, userspace shim build
-inputs, userspace-dp struct parity tests, and DPDK shared-memory parity. A
-future PR may move these definitions, but that is a separate reviewed boundary.
+inputs, and userspace-dp struct parity tests (~~DPDK shared-memory parity~~ —
+DPDK retired #1525). A future PR may move these definitions, but that is a
+separate reviewed boundary.
 `xpf_helpers.h` and `xpf_trace.h` have weaker current non-legacy consumers than
 the struct/constant headers; keep them conservatively until the deletion PR can
 prove they are orphaned after the legacy source is removed.
@@ -179,9 +180,9 @@ show all of the following:
   gRPC, CLI, status, monitor, logging, cluster sync, and daemon runtime paths
   do not require the legacy eBPF manager. Conntrack GC already enters through
   runtime-domain session and telemetry providers.
-- DPDK remains confined to its documented backend policy or has its own explicit
-  migration result; userspace-only source removal must not delete DPDK-required
-  shared definitions by accident.
+- DPDK retired in #1525 and removed in #1527/#1528; userspace-only source
+  removal coordinates with the DPDK retirement sequence so neither PR
+  deletes shared definitions still required by the other in-flight chain.
 - `go test ./pkg/dataplane -run 'Test.*Manifest|Test.*Boundary|Test.*UserspaceXDP' -count=1`
   passes with this manifest and the then-current canaries.
 - `go generate -n -run '^//go:generate bash build-userspace-xdp\.sh$' ./pkg/dataplane`
@@ -203,8 +204,9 @@ Reviewers of the deletion PR should explicitly check these failure modes:
   untracked `_bpfel`/`_bpfeb` leftovers are hiding outside Git;
 - stale `go:generate`, `make generate`, `make clean`, README, and development
   workflow references are removed or rewritten;
-- DPDK policy remains explicit and no DPDK-only shared struct dependency is
-  lost as collateral damage;
+- DPDK retirement (#1525, #1527, #1528) and userspace source removal do not
+  collide on shared struct dependencies — explicit coordination between the
+  two retirement chains;
 - `bpf/headers/*.h` consumers have either been moved to a userspace-owned
   source of truth or are still retained intentionally; and
 - historical docs remain historical, while active docs no longer describe the

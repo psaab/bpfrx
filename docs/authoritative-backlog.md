@@ -74,7 +74,7 @@ From `docs/next-features` and HA proposal docs:
 ### 3) Additional open items from bug/test planning docs
 
 - `docs/bugs.md`: `RETH .link file overwritten with virtual MAC on DHCP recompile` is still marked `FIXING`
-- `docs/active-active-new-connections.md`: DPDK zone-encoded path still documented with TODO placeholder
+- ~~`docs/active-active-new-connections.md`: DPDK zone-encoded path still documented with TODO placeholder~~ (DPDK retired #1525)
 - `docs/test_env.md`:
   - Verify PBR overrides VRF routing (TODO)
   - Multi-ISP VRF test (TODO)
@@ -105,7 +105,7 @@ These are documented as implemented in `docs/phases.md` and should not remain in
 - System NTP threshold action runtime wiring (`accept`/`reject`) via chrony
 - Application identification runtime wiring:
   - compiles the broader application catalog when enabled
-  - stores real session `app_id` across eBPF and DPDK dataplanes
+  - stores real session `app_id` across eBPF and userspace dataplanes (DPDK retired #1525)
   - uses session `app_id` for CLI/gRPC session display and filtering
 - Pre-ID default policy logging for unknown-app sessions
 - `system master-password` at-rest encryption for active/candidate/rollback config trees using the configured PRF + node-local master key
@@ -116,7 +116,7 @@ These are documented as implemented in `docs/phases.md` and should not remain in
   - `external-interface` to runtime `local-address` resolution
   - Junos `$9$` PSK decoding
 - Twice NAT parity:
-  - static DNAT now keys on ingress zone with wildcard fallback for SNAT return-path entries across eBPF, DPDK, and userspace
+  - static DNAT now keys on ingress zone with wildcard fallback for SNAT return-path entries across eBPF and userspace (DPDK retired #1525)
   - userspace post-DNAT SNAT matching evaluates destination filters against the translated destination
   - session/gRPC visibility preserves both NAT legs for combined NAT flows
 - Sync known-issues pair below are marked fixed in `docs/bugs.md`:

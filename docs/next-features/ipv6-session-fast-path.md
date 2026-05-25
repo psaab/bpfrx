@@ -27,7 +27,7 @@ semantics in unsafe ways.
 
 ## Non-goals
 
-1. No DPDK parity in phase 1.
+1. ~~No DPDK parity in phase 1.~~ — moot: DPDK retired in #1525.
 2. No new behavior for control packets (`SYN`, `FIN`, `RST`).
 3. No caching for NAT64, ALG, or predicted sessions.
 
@@ -142,7 +142,7 @@ reuse. Adding the cache there avoids duplicating another lookup path in
 
 1. Direct-mapped cache means collision eviction under many concurrent IPv6 flows.
 2. Batched `last_seen` updates slightly relax session freshness granularity.
-3. XDP-only for now; DPDK remains on the old path.
+3. XDP-only for now (~~DPDK remains on the old path~~ — DPDK retired #1525).
 
 ## Acceptance Criteria
 

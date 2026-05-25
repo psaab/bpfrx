@@ -1,5 +1,15 @@
 # #1373 Retire eBPF Dataplane Blocker Plans
 
+> [!IMPORTANT]
+> DPDK dataplane retired in #1525. The `## #1475 DPDK Backend Policy`
+> and `## #1504 Userspace Shim Boundary Escape Assumptions` sections
+> below are preserved verbatim only because the retirement-boundary
+> canaries (`TestRetirementBoundaryDocsMentionDPDKPolicy` and
+> `TestRetirementBoundaryDocsMentionShimEscapeAssumptions` in
+> `pkg/dataplane/retirement_boundary_canary_test.go`) pin their
+> text strings. The full rewrite of those sections lands together
+> with the canary update in #1527/#1528.
+
 Status: closeout and removal-plan bundle for #1373. The original #1374-#1381
 feature-gap plans are kept here as design history and documented runtime
 contracts, but those feature-gap blockers are closed. Current removal work is
@@ -23,7 +33,7 @@ tracked by #1451 and the removal-phase child issues below.
 | Issue | Scope |
 |---|---|
 | #1451 | Migrate remaining legacy eBPF-shaped runtime and operator surfaces before source/generated artifact deletion. |
-| #1473 | Split the retained userspace XDP shim from legacy `xdp_main_prog` fallback. |
+| #1473 | Split the retained userspace XDP shim from legacy `xdp_main_prog` fallback. Closeout pending: implementation, link-cycle regressions, counter rename, and source/object/manager canaries already landed via #1493, #1498, #1512, #1513, #1514. See [plan-1473](../1473-xdp-shim-decouple/plan.md) for the per-AC evidence trail. |
 | #1493 | Split userspace shim loader/bootstrap from the legacy `loadAllObjects()` path. |
 | #1494 | Pin the retained userspace shim boundary with source/object/manager canaries before source deletion. |
 | #1476 | Remove legacy BPF source, generated artifacts, and build hooks after the blockers close. |
@@ -62,8 +72,10 @@ production Go package except `pkg/dataplane` itself, then fails if a new direct
 or if a listed bridge disappears without shrinking this documentation.
 
 The same canary also keeps operator packages away from direct BPF artifacts:
-they may not import `github.com/cilium/ebpf`, and the DPDK backend import stays
-limited to `cmd/xpfd/main.go` for backend registration. Daemon startup must keep
+they may not import `github.com/cilium/ebpf`. The DPDK backend import was
+historically allowed only at `cmd/xpfd/main.go` for backend registration; that
+backend is retired in #1525 and #1527 removes the registration import. Daemon
+startup must keep
 owning `dataplane.RuntimeDataPlane` and must call
 `dataplane.NewRuntimeDataPlane`, not `dataplane.NewDataPlane`. This is a
 production-code canary; `_test.go` files may still import lower-level helpers
@@ -289,11 +301,12 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
   userspace runtime construction returns a legacy-compatible adapter while
   unmigrated operator services consume old session, telemetry, and control
   methods. The userspace `Manager` itself must not implement `DataPlane`.
-- DPDK still implements both `DataPlane` and `RuntimeDataPlane`. That
-  compatibility is intentionally confined to `pkg/dataplane/dpdk`, with the
-  only direct DPDK backend import outside the package being the blank
-  registration import in `cmd/xpfd/main.go`. Non-`-tags dpdk` binaries fail
-  DPDK startup explicitly rather than running a no-op stub.
+- DPDK was retired in #1525. The pre-retirement contract — that DPDK
+  implemented both `DataPlane` and `RuntimeDataPlane` and that the blank
+  registration import lived at `cmd/xpfd/main.go` — is preserved in the
+  canary-pinned `#1475 DPDK Backend Policy` section in this file as a
+  historical anchor; #1527 removes the registration import and #1528
+  deletes the backend package.
 - Legacy BPF source and generated artifacts are not safe to delete in #1451
   canary work: `bpf/`, `pkg/dataplane/*_bpfel.go`,
   `pkg/dataplane/*_bpfel.o`, and the legacy side of the `Makefile generate`

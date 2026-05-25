@@ -8,7 +8,7 @@ Status: Implemented
 
 ## Current State
 - Parsed into `SecurityConfig.PreIDDefaultPolicy`: `pkg/config/compiler.go`
-- Wired into flow config/runtime flags: `pkg/dataplane/compiler.go`, `bpf/xdp/xdp_policy.c`, `dpdk_worker/policy.c`
+- Wired into flow config/runtime flags: `pkg/dataplane/compiler.go`, `bpf/xdp/xdp_policy.c` (~~`dpdk_worker/policy.c`~~ — DPDK retired #1525)
 - Session init/close logging is now applied to unknown-app sessions when AppID is enabled
 
 ## Problem

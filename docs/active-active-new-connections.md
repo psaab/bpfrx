@@ -483,8 +483,8 @@ cluster-lan-host (10.0.60.102) → ping 172.16.100.200
 | `pkg/daemon/daemon.go` | `injectBlackholeRoutes()` / `removeBlackholeRoutes()` on VRRP transitions, `fib_ifindex` population in `populateFabricFwd()` |
 | `pkg/dataplane/types.go` | `FabricFwdInfo.FIBIfindex` field |
 | `pkg/frr/frr.go` | Cluster mode blackhole default route (`ip route 0.0.0.0/0 Null0 250`) |
-| `dpdk_worker/shared_mem.h` | `FABRIC_ZONE_MAC_MAGIC` constant (DPDK parity) |
-| `dpdk_worker/zone.c` | Zone-encoded MAC detection placeholder (TODO: full DPDK implementation) |
+| ~~`dpdk_worker/shared_mem.h`~~ | ~~`FABRIC_ZONE_MAC_MAGIC` constant (DPDK parity)~~ — DPDK retired #1525 |
+| ~~`dpdk_worker/zone.c`~~ | ~~Zone-encoded MAC detection placeholder~~ — DPDK retired #1525 (no further parity work) |
 | `test/incus/test-active-active.sh` | Phase 3b (TCP handshake via `/dev/tcp`) + Phase 3c (ICMP ping) during split |
 
 ## Key Design Decisions
@@ -867,10 +867,10 @@ if (sess->state != SESS_STATE_CLOSED)
 Same `last_seen` guard. TC doesn't do TCP state tracking or CLOSED drops, but
 the guard prevents egress retransmits from resetting the GC timer.
 
-**DPDK conntrack** (`dpdk_worker/conntrack.c`):
-
-Same pattern at all 4 hit paths (v4 forward, v4 reverse, v6 forward, v6
-reverse): suppress RST→CLOSED for ESTABLISHED + guard `last_seen`.
+**DPDK conntrack** (retired #1525): the same pattern applied at all 4 hit
+paths in the historical `dpdk_worker/conntrack.c` (v4 forward, v4 reverse,
+v6 forward, v6 reverse): suppress RST→CLOSED for ESTABLISHED + guard
+`last_seen`. The DPDK backend is removed in #1527/#1528.
 
 ### Design Rationale
 
