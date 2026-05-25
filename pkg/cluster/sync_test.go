@@ -716,7 +716,7 @@ func TestHandleMessageDeleteV6RemovesCompanions(t *testing.T) {
 // After #1518 (sub-#1451 S3) the cluster constructors take
 // clusterRuntime (Sessions()/Telemetry()) instead of dataplane.DataPlane.
 // mockSweepDP satisfies clusterRuntime by adapting itself via
-// dataplane.NewDataPlaneSessionStore / NewDataPlaneTelemetry — the
+// dataplane.NewDataPlaneSessionStore / dataplane.NewDataPlaneTelemetry — the
 // exact same adapter the legacy SetDataPlane path used. This keeps the
 // production wiring under test and exercises the same SessionStoreOf /
 // TelemetryOf adapter the deprecated alias still uses, so the existing

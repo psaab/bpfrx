@@ -351,7 +351,8 @@ const deleteJournalDefaultCap = 10000
 // that contract. Callers that hold only a value typed as dataplane.DataPlane
 // (the legacy bridge does NOT expose Sessions()/Telemetry() directly) can
 // either: (a) wrap it in a small local type that adds Sessions() and
-// Telemetry() returning dataplane.SessionStoreOf(dp) / TelemetryOf(dp) and
+// Telemetry() returning dataplane.SessionStoreOf(dp) /
+// dataplane.TelemetryOf(dp) and
 // pass that wrapper here — Go structural typing accepts any value with the
 // right method set even though clusterRuntime is package-private — or (b)
 // pass nil and use the deprecated SetDataPlane alias, which performs the

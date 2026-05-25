@@ -2,6 +2,15 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T15:45:00Z
+  - **Action**: Addressed PR #1551 Copilot round-3 doc-comment nits by
+    fully qualifying dataplane helper names in cluster session-sync
+    comments (`dataplane.TelemetryOf`, `dataplane.NewDataPlaneTelemetry`).
+  - **File(s)**:
+    `pkg/cluster/sync.go`,
+    `pkg/cluster/sync_test.go`,
+    `_Log.md`
+
 - **Timestamp**: 2026-05-26T01:00:00Z
   - **Action**: Round-3 reviewer verdicts complete on PR #1550 HEAD
     444a1959. Codex MERGE-READY (no findings). AGY MERGE-READY
