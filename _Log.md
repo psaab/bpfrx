@@ -2,19 +2,23 @@
 
 ## 2026-05-25
 
-- **Timestamp**: 2026-05-25T15:20:00Z
-  - **Action**: PR #1550 round-2 Copilot wording drift follow-up.
-    Updated the `userspace.Boot()` doc/canary comments to name the
-    actual remaining legacy `dataplane.DataPlane` consumers
-    (`daemon.legacyDP()` handoffs into CLI, gRPC, and cluster
-    session-sync) instead of stale pkg/api/pkg/conntrack/pkg/fwdstatus
-    examples. Also fixed `pkg/dataplane/README.md` so the
-    `NewRuntimeDataPlane` fall-through text matches the code's
-    non-userspace branch, including unknown/custom type error
-    propagation.
-  - **File(s)**: `pkg/dataplane/userspace/manager.go`,
+- **Timestamp**: 2026-05-26T00:30:00Z
+  - **Action**: PR #1550 round-2 reviews landed. Codex MERGE-READY
+    (no findings; all wording fixes confirmed). AGY MERGE-READY
+    (8/8 invariants verified). Copilot round-2 surfaced 3 doc-only
+    nits: stale legacy-caller list (pkg/api/pkg/conntrack/
+    pkg/fwdstatus → actual: pkg/cli, pkg/grpcapi, pkg/cluster via
+    daemon.legacyDP()), in both Boot() docstring and
+    userspace_boot_canary_test.go; plus README "only ebpf/dpdk"
+    wording missing unknown-type pass-through. Copilot agent
+    pushed fffe3e41 ("docs: fix PR #1550 wording drift") with the
+    same fixes; rebased local 3ea74518 on top — same content, took
+    Copilot agent's version verbatim during rebase since the two
+    wordings are equivalent.
+  - **File(s)**:
+    `pkg/dataplane/userspace/manager.go`,
     `pkg/dataplane/userspace/userspace_boot_canary_test.go`,
-    `pkg/dataplane/README.md`, `_Log.md`
+    `pkg/dataplane/README.md`
 
 - **Timestamp**: 2026-05-25T23:30:00Z
   - **Action**: PR #1550 round-1 doc + wording follow-ups merged.

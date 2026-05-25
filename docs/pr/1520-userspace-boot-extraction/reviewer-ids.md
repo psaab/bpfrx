@@ -26,10 +26,16 @@ Per-round reviewer task / job IDs for the triple-review skill.
 - Antigravity job ID: `adversarial-review-mplc57vw-e6chtv` — VERDICT MERGE-READY (8 findings clean, 1 minor coverage gap)
 - Copilot review: COMMENTED — 2 inline wording nits (Boot() doc + buildRuntimeDataPlane doc); both addressed in round-2 commit
 
-### Round 2 (after wording + coverage gap fixes)
+### Round 2 (after wording + coverage gap fixes, HEAD 9c532b05)
 
-- Codex task ID: _pending re-dispatch after force-push_
-- Antigravity job ID: _pending re-dispatch after force-push_
+- Codex task ID: _bg task bodqke6ph (codex exec)_ — VERDICT MERGE-READY (no findings; all wording fixes confirmed; 3 quoted-line evidence items; all targeted tests pass)
+- Antigravity job ID: `adversarial-review-mplcf05h-abqou8` — VERDICT MERGE-READY (8/8 invariants verified; clean rebase assessment)
+- Copilot review: COMMENTED — 3 doc nits (stale legacy-caller list in Boot() doc + canary test docstring; README "only" wording); all addressed in round-3 commit
+
+### Round 3 (after Copilot round-2 doc nits)
+
+- Codex task ID: _pending re-dispatch_
+- Antigravity job ID: _pending re-dispatch_
 - Copilot review: triggered via `@copilot review` PR comment
 
 ## Notes
