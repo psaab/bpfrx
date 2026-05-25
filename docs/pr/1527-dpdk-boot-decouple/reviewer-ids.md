@@ -66,3 +66,13 @@ chain, (d) empty allowlist canary behavior, (e) docs-token canary integrity,
 (f) build + tests without -tags dpdk, (g) daemon_run.go soft-fallback correctness
 (d.dp = nil safety, branch ordering), (h) scope-creep into #1528, (i) restart-race
 adversarial probe.
+
+## Cross-PR alignment round on SHA `51948aae`
+
+Aligns ErrDPDKBackendRetired wording with PR #1536's ErrDPDKDataplaneRetired
+("DPDK ..." → "the DPDK ...") per AGY adversarial-review-mpksyrj1-f1mid9
+finding against #1536.
+
+Codex: `task-mpktkfxm-vqe9xe`
+AGY: `adversarial-review-mpktkg6j-mlah42`
+Copilot: re-triggered in PR comment
