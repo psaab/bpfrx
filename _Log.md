@@ -584,8 +584,6 @@
   - **File(s)**: `docs/pr/1516-grpcapi-migration/plan.md`,
     `_Log.md`.
 
-## 2026-05-25
-
 - **Timestamp**: 2026-05-25T05:55:00Z
   - **Action**: PR #1536 round-3 cleanup — address Codex MAJOR
     (load merge syntax in plan recovery) + 3 Copilot nits:

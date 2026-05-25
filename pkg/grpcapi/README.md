@@ -26,6 +26,25 @@ bridge in `pkg/api`.
 `dhcpserver`, `feeds`, `frr`, `ipsec`, `logging`, `fwdstatus`, `ra`,
 `routing`, `rpm`, `vrrp`, plus most of the rest of `pkg/`.
 
+The dataplane dependency is intentionally narrow: `Config.DP` and
+`Server.dp` are typed against the unexported `grpcRuntime`
+interface declared in `runtime.go`, **not** the full
+`dataplane.DataPlane`. `grpcRuntime` lists exactly the methods the
+gRPC handlers invoke via `s.dp.*` (counters, session-read,
+session-clear, map-stats, persistent-NAT) and is a strict subset
+of `dataplane.DataPlane`, so any concrete dataplane that satisfies
+the legacy interface also satisfies `grpcRuntime`. The userspace-
+specific provider capabilities (`Status`, `SetForwardingArmed`,
+`SetQueueState`, `SetBindingState`, `InjectPacket`) live on named
+provider interfaces (`userspaceStatusProvider`,
+`userspaceControlProvider`) in the same file; the gRPC server
+probes them via type assertion on `s.dp`. Cursor-based session
+pagination uses the `sessionCursorIterator` probe, also in
+`runtime.go`. This is the boundary that the #1373 eBPF retirement
+narrows; see `docs/pr/1373-retire-ebpf-dataplane/README.md` and
+`docs/pr/1516-grpcapi-migration/plan.md` for the migration
+contract.
+
 ## Gotchas
 
 - Configure mode is **exclusive on the secondary node** in cluster mode.

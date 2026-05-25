@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
@@ -112,6 +114,16 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 	v6Exhausted := true // set to false when we start v6
 
 	// Phase 1: iterate v4 sessions from cursor.
+	//
+	// The adapter's cursor delegation can return
+	// dpuserspace.ErrCursorIterationUnsupported when the embedded
+	// dataplane is nil or does not implement cursor iteration
+	// (test/edge configurations only — production
+	// LegacyDataPlaneAdapter wraps a *dataplane.Manager which does
+	// implement it). Detecting that sentinel and falling back to
+	// the legacy offset/limit pagination preserves the master/
+	// pre-#1516 user-visible behavior in those edge cases instead
+	// of surfacing a codes.Internal to the client.
 	if startV4 {
 		if err := iterDP.IterateSessionsFrom(cursorV4, func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 			if len(all) >= pageSize {
@@ -136,6 +148,9 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 			lastV4Key = key
 			return true
 		}); err != nil {
+			if errors.Is(err, dpuserspace.ErrCursorIterationUnsupported) {
+				return s.getSessionsLegacy(ctx, req)
+			}
 			return nil, status.Errorf(codes.Internal, "v4 session iteration: %v", err)
 		}
 		if len(all) >= pageSize {
@@ -179,6 +194,9 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 			lastV6Key = key
 			return true
 		}); err != nil {
+			if errors.Is(err, dpuserspace.ErrCursorIterationUnsupported) {
+				return s.getSessionsLegacy(ctx, req)
+			}
 			return nil, status.Errorf(codes.Internal, "v6 session iteration: %v", err)
 		}
 		if len(all) >= pageSize {

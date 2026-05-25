@@ -474,27 +474,45 @@ func (a *LegacyDataPlaneAdapter) TakeoverReady() (bool, []string) {
 	return m.TakeoverReady()
 }
 
+// ErrCursorIterationUnsupported is returned by
+// LegacyDataPlaneAdapter.IterateSessionsFrom and
+// IterateSessionsV6From when the underlying wrapped dataplane does
+// not expose cursor-based iteration. Callers that probe for cursor
+// support via type assertion (e.g. gRPC pagination) MUST detect
+// this error and fall back to non-cursor iteration so the user-
+// visible behavior matches the master/pre-#1516 path on
+// dataplanes that lack cursor support.
+//
+// In production the wrapped dataplane is a *dataplane.Manager (set
+// by NewLegacyDataPlaneAdapter from manager.bpfShim) which does
+// implement cursor iteration, so the production code path never
+// returns this sentinel. The sentinel guards test/edge
+// configurations where the adapter is constructed with a nil
+// manager or with an embedded DataPlane that does not implement
+// cursor iteration.
+var ErrCursorIterationUnsupported = errors.New("underlying dataplane does not support cursor iteration")
+
 func (a *LegacyDataPlaneAdapter) IterateSessionsFrom(cursor *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
 	if a == nil || a.DataPlane == nil {
-		return errors.New("nil dataplane")
+		return ErrCursorIterationUnsupported
 	}
 	if iter, ok := a.DataPlane.(interface {
 		IterateSessionsFrom(*dataplane.SessionKey, func(dataplane.SessionKey, dataplane.SessionValue) bool) error
 	}); ok {
 		return iter.IterateSessionsFrom(cursor, fn)
 	}
-	return errors.New("underlying dataplane does not support IterateSessionsFrom")
+	return ErrCursorIterationUnsupported
 }
 
 func (a *LegacyDataPlaneAdapter) IterateSessionsV6From(cursor *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
 	if a == nil || a.DataPlane == nil {
-		return errors.New("nil dataplane")
+		return ErrCursorIterationUnsupported
 	}
 	if iter, ok := a.DataPlane.(interface {
 		IterateSessionsV6From(*dataplane.SessionKeyV6, func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
 	}); ok {
 		return iter.IterateSessionsV6From(cursor, fn)
 	}
-	return errors.New("underlying dataplane does not support IterateSessionsV6From")
+	return ErrCursorIterationUnsupported
 }
 

@@ -6,9 +6,9 @@ import (
 )
 
 // grpcRuntime is the gRPC server's domain-specific dataplane
-// surface. Listed exactly to the methods the gRPC handlers
-// consume on master. Narrower than dataplane.DataPlane;
-// intentionally not exported.
+// surface. Lists exactly the methods the gRPC handlers consume on
+// master. Narrower than dataplane.DataPlane; intentionally not
+// exported.
 type grpcRuntime interface {
 	// Liveness probe — guards every counter / iter call site.
 	IsLoaded() bool
