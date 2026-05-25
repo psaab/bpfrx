@@ -15,14 +15,12 @@ var _ dataplane.DataPlane = (*Manager)(nil)
 var _ dataplane.ConfigSink = (*Manager)(nil)
 var _ dataplane.RuntimeDataPlane = (*Manager)(nil)
 
-func init() {
-	dataplane.RegisterBackend(dataplane.TypeDPDK, func() dataplane.DataPlane {
-		return New()
-	})
-	dataplane.RegisterRuntimeBackend(dataplane.TypeDPDK, func() dataplane.RuntimeDataPlane {
-		return New()
-	})
-}
+// NOTE: backend registration via dataplane.RegisterBackend /
+// dataplane.RegisterRuntimeBackend was removed in #1527 (Phase 2 of
+// the DPDK retirement, umbrella #1525).  After this change the
+// package remains compilable but no production code path constructs
+// a Manager through the dataplane registry.  Phase 3 (#1528) will
+// delete the package outright.
 
 // Manager is the DPDK dataplane backend (stub implementation).
 type Manager struct {

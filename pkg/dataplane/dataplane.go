@@ -2,11 +2,28 @@ package dataplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 
 	"github.com/cilium/ebpf"
 	"github.com/psaab/xpf/pkg/config"
+)
+
+// ErrDPDKBackendRetired is returned from NewDataPlane and
+// NewRuntimeDataPlane when caller code still asks for the DPDK
+// backend after Phase 2 of the DPDK retirement (#1527, umbrella
+// #1525).  Operators must migrate to "set system dataplane-type
+// userspace" (or omit the directive entirely for the default).
+//
+// Chain A (#1526) handles user-facing rejection at commit time;
+// this sentinel covers the runtime factory path for callers that
+// still pass TypeDPDK through, including the package-local test
+// in pkg/dataplane/dpdk that guards against silent registry
+// resurrection.
+var ErrDPDKBackendRetired = errors.New(
+	"DPDK dataplane backend has been retired; use " +
+		"'set system dataplane-type userspace' (see #1525)",
 )
 
 // Compile-time assertion that Manager implements DataPlane.
@@ -15,6 +32,12 @@ var _ ConfigSink = (*Manager)(nil)
 var _ RuntimeDataPlane = (*Manager)(nil)
 
 // Dataplane type constants used in system { dataplane-type <type>; }.
+//
+// TypeDPDK is preserved as a typed token for the retirement-error
+// code path in NewDataPlane / NewRuntimeDataPlane after Phase 2 of
+// #1525.  No production code path may construct a DPDK backend
+// through the registry — see ErrDPDKBackendRetired and the
+// retirement-boundary canary in retirement_boundary_canary_test.go.
 const (
 	TypeEBPF      = "ebpf"
 	TypeDPDK      = "dpdk"
@@ -114,11 +137,13 @@ func NewDataPlane(dpType string) (DataPlane, error) {
 		)
 	case TypeEBPF:
 		return New(), nil
+	case TypeDPDK:
+		return nil, ErrDPDKBackendRetired
 	default:
 		if ctor, ok := backendRegistry[dpType]; ok {
 			return ctor(), nil
 		}
-		return nil, fmt.Errorf("unknown dataplane type %q (valid: ebpf, dpdk, userspace)", dpType)
+		return nil, fmt.Errorf("unknown dataplane type %q (valid: ebpf, userspace)", dpType)
 	}
 }
 
@@ -130,6 +155,13 @@ func NewRuntimeDataPlane(dpType string) (RuntimeDataPlane, error) {
 	switch dpType {
 	case TypeEBPF:
 		return New(), nil
+	case TypeDPDK:
+		// EffectiveType only rewrites empty -> userspace, never
+		// -> dpdk, so this branch cannot intercept legitimate
+		// empty-default callers.  Any TypeDPDK that reaches here
+		// is an explicit "set system dataplane-type dpdk" that
+		// must be rejected after Phase 2 of #1525.
+		return nil, ErrDPDKBackendRetired
 	default:
 		if ctor, ok := runtimeBackendRegistry[dpType]; ok {
 			return ctor(), nil

@@ -30,7 +30,7 @@ const (
 )
 
 var legacyDataplaneImportAllowlist = map[string]string{
-	"cmd/xpfd/main.go":                         "backend selection, cleanup, and backend registration",
+	"cmd/xpfd/main.go":                         "cleanup entry point (backend registration removed in #1527)",
 	"pkg/api/handlers.go":                      "REST handlers still reference legacy dataplane counters and types",
 	"pkg/api/handlers_sessions.go":             "REST session reads still use legacy session types",
 	"pkg/api/metrics.go":                       "Prometheus telemetry still reads legacy counters and metadata",
@@ -69,9 +69,12 @@ var dpdkEBPFImportAllowlist = map[string]string{
 	"pkg/dataplane/dpdk/manager.go": "legacy DataPlane Map method returns *ebpf.Map until DPDK migrates off root DataPlane",
 }
 
-var dpdkBackendImportAllowlist = map[string]string{
-	"cmd/xpfd/main.go": "backend registration and cleanup entry point",
-}
+// dpdkBackendImportAllowlist is intentionally empty after Phase 2
+// of the DPDK retirement (#1527, umbrella #1525).  The DPDK package
+// remains in-tree but no production package outside
+// pkg/dataplane/dpdk/ may import it.  Phase 3 (#1528) removes the
+// package entirely.
+var dpdkBackendImportAllowlist = map[string]string{}
 
 var retainedShimBoundaryBuildTagAllowlist = map[string][]string{
 	// Generated legacy bpf2go artifacts keep bpf2go's architecture constraint
@@ -169,9 +172,11 @@ func TestOperatorPackagesDoNotImportBPFArtifactsDirectly(t *testing.T) {
 				violations = append(violations, rel+" imports "+imp)
 			}
 			if imp == dpdkBackendImportForCanary || strings.HasPrefix(imp, dpdkBackendImportForCanary+"/") {
-				if rel != "cmd/xpfd/main.go" {
-					violations = append(violations, rel+" imports "+imp)
-				}
+				// After Phase 2 of #1525 (boot-path decouple,
+				// #1527) no operator-runtime production file may
+				// import pkg/dataplane/dpdk.  The previous
+				// cmd/xpfd/main.go exemption is removed.
+				violations = append(violations, rel+" imports "+imp)
 			}
 		}
 	}

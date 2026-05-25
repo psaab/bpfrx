@@ -30,6 +30,38 @@
     (adversarial-review-mpkqkzkm-qfa19j) verdict preserved.
   - **File(s)**: `docs/pr/1527-dpdk-boot-decouple/plan.md`
 
+- **Timestamp**: 2026-05-24T19:00:00Z
+  - **Action**: #1527 implementation. Removed the
+    `_ "github.com/psaab/xpf/pkg/dataplane/dpdk"` blank import
+    from cmd/xpfd/main.go. Deleted the init() block in
+    pkg/dataplane/dpdk/manager.go that registered the backend with
+    both dataplane.RegisterBackend and
+    dataplane.RegisterRuntimeBackend; replaced it with a comment
+    pointing at #1527/#1525/#1528. Added exported sentinel
+    `dataplane.ErrDPDKBackendRetired` in pkg/dataplane/dataplane.go
+    plus TypeDPDK reject arms in NewDataPlane (errors before the
+    registry fallback) and NewRuntimeDataPlane (errors after
+    EffectiveType normalization so the empty-default path stays
+    on userspace). Removed "dpdk" from the NewDataPlane
+    unknown-type error message. Shrunk dpdkBackendImportAllowlist
+    to an empty map and removed the cmd/xpfd/main.go DPDK
+    exemption from
+    TestOperatorPackagesDoNotImportBPFArtifactsDirectly. Rewrote
+    dpdk_stub_test.go's TestDPDKConstructorsRemainRegistered as
+    TestDPDKConstructorsReturnRetirementError, asserting
+    errors.Is(err, ErrDPDKBackendRetired) for both factories;
+    TestDPDKStubRequiresDPDKBuildTag retained unchanged. Per Codex
+    round-1 MUST-FIX (3): docs/pr/1373-retire-ebpf-dataplane/README.md
+    NOT touched — Chain C (#1529) scope, and the docs-token canary
+    stays green untouched. Updated legacyDataplaneImportAllowlist
+    description for cmd/xpfd/main.go to reflect post-#1527 reality
+    (cleanup only, no registration).
+  - **File(s)**: `cmd/xpfd/main.go`,
+    `pkg/dataplane/dpdk/manager.go`,
+    `pkg/dataplane/dataplane.go`,
+    `pkg/dataplane/retirement_boundary_canary_test.go`,
+    `pkg/dataplane/dpdk/dpdk_stub_test.go`
+
 - **Timestamp**: 2026-05-25T00:45:00Z
   - **Action**: PR #1512 review follow-up — tightened the positional
     `dataplane.Manager` literal canary on two axes. (a) Recurse into nested
