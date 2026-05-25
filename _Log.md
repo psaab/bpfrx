@@ -2470,4 +2470,23 @@
   PLAN-READY) so no re-dispatch needed. Scope is now 1 file:
   pkg/logging/README.md line 46 one-token reframe ("...as eBPF
   ring-buffer events" -> "...as the legacy eBPF ring-buffer events do").
-- **Validation**: Defensive go test ./pkg/dataplane/... -run RetirementBoundary pending after commit.
+- **Validation**: `go test ./pkg/dataplane/... -run
+  RetirementBoundary -count=1` passes locally; canary tests do not
+  pin any string in `pkg/logging/README.md` or the rewritten
+  sentence. `git diff --stat origin/master..HEAD` confirms only
+  `*.md` files touched, so smoke is skipped per the pure-docs
+  skill rule.
+
+- **Timestamp**: 2026-05-25T08:25Z
+- **Action**: #1522 PR #1555 round-2 — fold Copilot 3 minor inline nits
+- **File(s)**: docs/pr/1522-readme-doc-drift/plan.md,
+  docs/pr/1522-readme-doc-drift/reviewer-ids.md, _Log.md
+- **Why**: Copilot inline review on PR #1555 HEAD cb4c2345 left
+  three minor nits: (1) plan.md L89 referenced master tip
+  `c5c52a14` but the doc header references `d237cceb` — clarify;
+  (2) reviewer-ids.md L15 said "codex" lowercased — capitalize to
+  "Codex" to match other occurrences; (3) _Log.md said
+  "pending after commit" which reads as TODO — record actual
+  validation outcome. All three are purely cosmetic; no diff to
+  pkg/logging/README.md.
+- **Validation**: cosmetic-only; no test/build rerun needed.

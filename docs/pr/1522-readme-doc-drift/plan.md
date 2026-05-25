@@ -86,7 +86,10 @@ Three doc-sweep PRs landed on master immediately before this sub-issue:
 - **#1525 / PR #1538 (merged)** — `_Log.md` entries and assorted
   inline-DPDK annotations.
 
-**Survey result on master (commit c5c52a14)** — running
+**Survey result on master (commit `c5c52a14`, the master tip at the
+time of the v1 survey; current master tip after rebase is `d237cceb`
+which adds #1517/#1532/#1536/#1537/#1549 — none of those touch the
+pkg/logging/README.md drift this PR addresses)** — running
 `grep -niE 'eBPF|XDP|TC egress|tail.call|primary|cilium/ebpf|bpf2go|legacy'`
 across all 54 in-tree package-level READMEs:
 
