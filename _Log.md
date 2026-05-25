@@ -3161,3 +3161,18 @@
   green. Smoke matrix delegated to serialized smoke-runner singleton
   per feedback_smoke_serialized_single_agent rule (AWAITING-SMOKE
   marker posted on PR).
+
+- **Timestamp**: 2026-05-25T16:05Z
+- **Action**: #1554 r3 Copilot finding fold — cross-package compile-time
+  interface-satisfaction guard. The userspace-side compile-time check
+  is method-shape-only (inline anonymous interface) and can't catch
+  drift if the unexported pkg/grpcapi interfaces (grpcRuntime,
+  sessionCursorIterator, userspaceStatusProvider,
+  userspaceControlProvider) acquire a new method. Adding the asymmetric
+  guard in pkg/grpcapi/runtime_canary_test.go: `var _ grpcRuntime =
+  (*dpuserspace.LegacyDataPlaneAdapter)(nil)` plus the same for each
+  named provider interface. _test.go scope keeps the assertions out
+  of the production binary.
+- **File(s)**: pkg/grpcapi/runtime_canary_test.go (new), _Log.md
+- **Validation**: go test ./pkg/grpcapi/... -count=1 green; full Go
+  suite green.
