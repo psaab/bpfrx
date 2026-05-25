@@ -2,6 +2,34 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T05:55:00Z
+  - **Action**: PR #1536 round-3 cleanup — address Codex MAJOR
+    (load merge syntax in plan recovery) + 3 Copilot nits:
+    1. plan.md operational-note recovery flow used invalid
+       `load merge replace /etc/xpf/xpf.conf` — the supported
+       forms are `load merge <file>` or `load override <file>`
+       (`cmd/cli/main.go` parses mode then args[1] as file).
+       Replaced with `load override /etc/xpf/xpf.conf` which is
+       the appropriate one-shot replacement form.
+    2. compiler_system.go unknown-dataplane-type error wording
+       said "valid values are userspace" — misleading when
+       ebpf is still accepted (deprecated) and dpdk still
+       parses (rejected at commit). Updated to "valid values
+       are userspace or ebpf (deprecated); dpdk parses for
+       legacy-config compatibility but is rejected at commit
+       per #1525".
+    3. parser_ast_test.go TestDPDKConfigCompileRejects had a
+       local `wantSubstr` duplicating `dpdkRetirementSubstr`
+       const declared lower in the same file. Reuses the const
+       to prevent drift.
+    4. _Log.md had a duplicate `## 2026-05-25` header inserted
+       around line 1783 by an earlier auto-bot commit. Folded
+       its content into this top-of-file entry and removed the
+       stray header to keep one bucket per date.
+  - **File(s)**: `docs/pr/1526-dpdk-reject/plan.md`,
+    `pkg/config/compiler_system.go`,
+    `pkg/config/parser_ast_test.go`, `_Log.md`
+
 - **Timestamp**: 2026-05-25T05:30:00Z
   - **Action**: PR #1526 implementation v3 — added
     `validateDataplaneTypeStrict` in pkg/config/compiler.go (slotted
@@ -1780,8 +1808,3 @@
   - **File(s)**: `userspace-dp/src/afxdp/wg/framing.rs`, `_Log.md`
   - **Validation**: cargo build --release; cargo test --release --bin
     xpf-userspace-dp afxdp::wg.
-## 2026-05-25
-
-- **Timestamp**: 2026-05-25T05:40:00Z
-- **Action**: Fix two review findings on #1526: unknown-type error msg still listed dpdk as valid; t.Fatalf arg order inverted in CoS-ordering test
-- **File(s)**: pkg/config/compiler_system.go, pkg/config/parser_ast_test.go

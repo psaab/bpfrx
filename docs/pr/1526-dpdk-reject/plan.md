@@ -364,10 +364,15 @@ example:
 ssh fw-node
 cli
 configure
-load merge replace /etc/xpf/xpf.conf      # or any sanitized copy
-delete system dataplane-type              # now operates on the loaded tree
+load override /etc/xpf/xpf.conf      # or any sanitized copy
+delete system dataplane-type         # now operates on the loaded tree
 commit
 ```
+
+`load override` is the appropriate form here because it replaces
+the candidate wholesale rather than layering on top. The
+supported forms (per `cmd/cli/main.go`) are `load merge <file>`
+and `load override <file>`.
 
 (or simpler: edit the on-disk file to set `dataplane-type
 userspace` or remove the line, then restart the daemon and let

@@ -2685,9 +2685,12 @@ func TestDPDKConfigCompileRejects(t *testing.T) {
 	if err == nil {
 		t.Fatal("CompileConfig succeeded for dataplane-type dpdk; expected retirement rejection")
 	}
-	wantSubstr := "the DPDK dataplane backend has been retired; use 'set system dataplane-type userspace' (see #1525)"
-	if !strings.Contains(err.Error(), wantSubstr) {
-		t.Fatalf("CompileConfig error = %q, want substring %q", err.Error(), wantSubstr)
+	// Reuse the package-local const (declared further down in this
+	// file) so the verbatim retirement text lives in exactly one
+	// place. Go allows referencing consts declared later in the
+	// file at package scope.
+	if !strings.Contains(err.Error(), dpdkRetirementSubstr) {
+		t.Fatalf("CompileConfig error = %q, want substring %q", err.Error(), dpdkRetirementSubstr)
 	}
 }
 
