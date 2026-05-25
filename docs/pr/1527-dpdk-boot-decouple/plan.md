@@ -68,29 +68,44 @@ production binary references it, so its deletion is a pure no-link
 file removal.
 
 The user-facing commit-time rejection for `system dataplane-type
-dpdk` is sibling Chain A (#1526). **This PR REQUIRES #1526 to land
-first.** Today's behavior on a running daemon that loads a config
-with `system dataplane-type dpdk` is:
+dpdk` is sibling Chain A (#1526). **Sequencing v4 (final): Chain A
+is STRONGLY PREFERRED but no longer required to land first.** v2
+of this plan required Chain A first; v3 added the
+`errors.Is(ErrDPDKBackendRetired)` soft-fallback at
+`pkg/daemon/daemon_run.go:247` so an operator with a persisted
+`set system dataplane-type dpdk` config sees a structured
+`slog.Warn` plus config-only fallback rather than `os.Exit(1)` on
+restart.
 
-- `dataplane.NewRuntimeDataPlane("dpdk")` succeeds (stub registers
-  the backend, `pkg/daemon/daemon_run.go:245`).
-- `d.dp.Start(ctx)` returns `errDPDKBuildTagRequired`, daemon logs
-  `slog.Warn("failed to start dataplane, running in config-only
-  mode")` and continues running (`daemon_run.go:251-254`).
+Today's behavior on a running daemon that loads a config with
+`system dataplane-type dpdk`:
 
-After this PR's changes:
+- Before this PR: `dataplane.NewRuntimeDataPlane("dpdk")` succeeds
+  (the DPDK stub self-registered via the now-removed `init()`
+  block), `d.dp.Start(ctx)` returns `errDPDKBuildTagRequired`,
+  daemon logs `slog.Warn("failed to start dataplane, running in
+  config-only mode")` and continues running.
+- After this PR: `dataplane.NewRuntimeDataPlane("dpdk")` returns
+  `ErrDPDKBackendRetired`. `pkg/daemon/daemon_run.go:247` detects
+  the sentinel via `errors.Is`, emits a structured `slog.Warn`
+  with remediation guidance (`use 'set system dataplane-type
+  userspace'`), sets `d.dp = nil`, and the daemon continues
+  running in config-only mode. Operator UX is the same as a
+  generic `Start()` failure.
 
-- `dataplane.NewRuntimeDataPlane("dpdk")` returns
-  `ErrDPDKBackendRetired`.
-- `daemon_run.go:248` returns `fmt.Errorf("create dataplane: %w",
-  err)`, daemon exits with `os.Exit(1)`.
+With Chain A landed first, the config never accepts `dpdk` at
+commit time and this PR's runtime sentinel becomes defense-in-
+depth for malformed-by-hand configs only. Without Chain A landed
+first, an operator's existing `set system dataplane-type dpdk`
+keeps the daemon reachable from the CLI / gRPC to fix the config
+in place.
 
-Without #1526 landing first, an operator who already committed
-`set system dataplane-type dpdk` on the running config would see
-their daemon refuse to start after the next restart. With #1526
-landed first, the config never accepts `dpdk` at commit time, so
-this PR's runtime path is only reachable via a malformed config
-file written by hand (which is acceptable as a fatal error).
+The compiler-side error string at
+`pkg/config/compiler_system.go:391` still lists `dpdk` as a known
+value (annotated `(retired in #1527)`) because `validDataplaneType`
+at `pkg/config/compiler.go:961` still accepts the token. That
+accept-and-defer is intentional: Chain A owns the commit-time
+rejection lockstep with the validator.
 
 ## Honest scope/value framing
 
