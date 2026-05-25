@@ -3,13 +3,26 @@
 ## 2026-05-25
 
 - **Timestamp**: 2026-05-25T07:05:00Z
-  - **Action**: #1527 follow-up re-review fix — corrected
-    `NewDataPlane` unknown-type guidance in `pkg/dataplane/dataplane.go`
-    to stop advertising `userspace` as a valid legacy `DataPlane` type.
-    `userspace` is runtime-only through `NewRuntimeDataPlane`, so the old
-    message was misleading during operator/debug triage.
-    Baseline + post-change dataplane tests run clean.
-  - **File(s)**: `pkg/dataplane/dataplane.go`, `_Log.md`
+  - **Action**: #1527 round-7 Copilot follow-up. Copilot review on
+    9b4e9e24 (COMMENTED, 5 inline comments) flagged two new
+    consistency nits on top of the 3 already-resolved ones:
+    (1) `pkg/dataplane/dataplane.go:160` — `NewDataPlane`'s
+    unknown-type error listed "userspace" as valid even though
+    legacy `NewDataPlane(TypeUserspace)` falls through to the
+    registry lookup and errors out; the message is now
+    `"unknown dataplane type %q (valid via NewDataPlane: ebpf; use NewRuntimeDataPlane for userspace)"`
+    with a clarifying comment;
+    (2) `pkg/daemon/daemon_ha_sync.go:684` — the "disabling all
+    RGs" log fired even when `cfg.Chassis.Cluster == nil`, which is
+    misleading. Moved it inside the cluster-cfg-non-nil branch with
+    an `rg_count` slog kv field. The neutral "fence received from
+    peer" log at line 667 stays as the unconditional entry point.
+    Both fixes are comment-only consistency nits, no behavior
+    change.
+  - **File(s)**: `pkg/dataplane/dataplane.go`,
+    `pkg/daemon/daemon_ha_sync.go`, `_Log.md`
+  - **Validation**: `go build ./...` clean; `go test
+    ./pkg/dataplane/... ./pkg/daemon/... -count=1` clean.
 
 - **Timestamp**: 2026-05-25T05:55:15Z
   - **Action**: #1527 final Copilot re-review follow-up — resolved three
