@@ -109,18 +109,32 @@ func UserspaceTracePinPath() string {
 	return filepath.Join(bpfPinPath, "userspace_trace")
 }
 
-// backendRegistry holds constructors for non-eBPF dataplane backends.
-// Sub-packages register themselves via RegisterBackend in their init().
+// backendRegistry holds constructors for non-eBPF, non-DPDK dataplane
+// backends.  After the Phase 2 DPDK retirement (#1527, umbrella #1525)
+// userspace is the sole remaining registrant and it uses
+// RegisterRuntimeBackend, not RegisterBackend.  RegisterBackend remains
+// for forward-compatibility with hypothetical future backends.
 var backendRegistry = map[string]func() DataPlane{}
 var runtimeBackendRegistry = map[string]func() RuntimeDataPlane{}
 
 // RegisterBackend registers a dataplane constructor for the given type.
+// Panics if dpType is TypeDPDK: the DPDK backend was retired in Phase 2
+// of #1525 (#1527).  NewDataPlane intercepts TypeDPDK before consulting
+// the registry, so any registered DPDK constructor would be silently
+// unreachable; the panic makes the programming error immediately visible.
 func RegisterBackend(dpType string, ctor func() DataPlane) {
+	if dpType == TypeDPDK {
+		panic("TypeDPDK backend registration rejected: DPDK retired in #1527 (umbrella #1525)")
+	}
 	backendRegistry[dpType] = ctor
 }
 
 // RegisterRuntimeBackend registers a runtime-domain dataplane constructor.
+// Panics if dpType is TypeDPDK for the same reason as RegisterBackend.
 func RegisterRuntimeBackend(dpType string, ctor func() RuntimeDataPlane) {
+	if dpType == TypeDPDK {
+		panic("TypeDPDK runtime backend registration rejected: DPDK retired in #1527 (umbrella #1525)")
+	}
 	runtimeBackendRegistry[dpType] = ctor
 }
 
@@ -182,8 +196,8 @@ func NewRuntimeDataPlane(dpType string) (RuntimeDataPlane, error) {
 }
 
 // DataPlane defines the abstract interface for a packet-processing dataplane.
-// The eBPF Manager is the primary implementation; a DPDK implementation can
-// be added as an alternative backend.
+// The eBPF Manager is the legacy implementation; the userspace AF_XDP
+// backend is the primary/default target after Phase 2 of the DPDK retirement.
 type DataPlane interface {
 	// Lifecycle
 	Load() error
@@ -335,16 +349,16 @@ type DataPlane interface {
 
 	// FIB
 	BumpFIBGeneration() uint32
-	StartFIBSync(ctx context.Context) // DPDK: background route sync; eBPF: no-op
+	StartFIBSync(ctx context.Context) // DPDK: background route sync; eBPF/userspace: no-op
 
 	// NotifyLinkCycle signals that data-plane interfaces were taken DOWN/UP
 	// (e.g. during RETH MAC programming).  The userspace dataplane uses this
 	// to rebind AF_XDP sockets whose kernel-side RQ was destroyed by the
-	// link cycle.  No-op for the eBPF-only and DPDK dataplanes.
+	// link cycle.  No-op for the eBPF-only dataplane.
 	NotifyLinkCycle()
 
 	// SyncFabricState pushes updated fabric MACs to the userspace helper.
-	// No-op for eBPF-only and DPDK dataplanes.
+	// No-op for the eBPF-only dataplane.
 	SyncFabricState()
 
 	// Map statistics
@@ -378,12 +392,13 @@ type DataPlane interface {
 	// Event source for reading pipeline events (session open/close, deny, etc.)
 	NewEventSource() (EventSource, error)
 
-	// Raw map access (eBPF-specific; DPDK implementations may return nil)
+	// Raw map access (eBPF-specific; non-eBPF implementations return nil)
 	Map(name string) *ebpf.Map
 }
 
 // EventSource reads raw event records from the dataplane.
-// The eBPF implementation wraps a ring buffer reader; DPDK uses rte_ring.
+// The eBPF implementation wraps a ring buffer reader; the userspace
+// AF_XDP implementation uses the control-socket event stream.
 type EventSource interface {
 	// ReadEvent blocks until an event is available and returns raw bytes.
 	// Returns an error on close or failure.

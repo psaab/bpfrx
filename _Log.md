@@ -45,6 +45,24 @@
     `go test ./pkg/dataplane/... ./pkg/daemon/...` clean.
   - **File(s)**: `pkg/daemon/daemon_run.go`
 
+- **Timestamp**: 2026-05-25T06:30:00Z
+  - **Action**: #1527 second Copilot review pass — addressed MUST FIX
+    and SHOULD FIX items from prior adversarial review: (1) Added
+    TypeDPDK panic guard to RegisterBackend and RegisterRuntimeBackend
+    so silent re-registration is immediately visible rather than
+    permanently silently unreachable. (2) Added
+    TestRegisterDPDKBackendPanics to dpdk_stub_test.go to pin the
+    panic behavior. (3) Cleaned stale DPDK references from DataPlane
+    interface docstrings (lines 185-186, 338, 341-343, 347, 381-382,
+    386). (4) Fixed compiler_system.go error string to say "valid:
+    ebpf, userspace" instead of "valid: ebpf, dpdk, userspace".
+    Build clean, go test ./pkg/dataplane/... ./pkg/daemon/...
+    ./pkg/config/... clean.
+  - **File(s)**: `pkg/dataplane/dataplane.go`,
+    `pkg/dataplane/dpdk/dpdk_stub_test.go`,
+    `pkg/config/compiler_system.go`, `_Log.md`
+
+
 ## 2026-05-24
 
 - **Timestamp**: 2026-05-24T12:00:00Z
