@@ -25,4 +25,26 @@
 ## Round 4 (plan v4 @ commit 9a0e7012)
 
 - Codex: `task-mplcd8yt-ne3g43`
+  - Verdict: PLAN-READY
 - Antigravity: `adversarial-review-mplcdckp-lp3qxi`
+  - Verdict: PLAN-READY
+
+## Code review (HEAD 15c217f0 — PR #1556)
+
+- Codex: `task-mplcmpc3-iq7iho`
+  - Verdict: NEEDS-MINOR
+    1. `TestCompileSingleStrictErrorJoinPath` should exercise
+       production path (not inline-duplicate the accumulator).
+    2. Stale `file:line` citations after rebase
+       (`compiler.go:371-374`, `:277-278`, `:1005`).
+    3. `reviewer-ids.md` round-4 missing PLAN-READY verdicts.
+- Antigravity: `adversarial-review-mplcmu4f-k9ph8t`
+  - Verdict: MERGE-READY
+- Copilot: review at PR #1556 comment
+  - Verdict: PASS (state COMMENTED, zero inline comments)
+- Claude SMR: self-review of diff; matches plan v4 exactly.
+  Verdict: PASS
+
+## Code review round 2 (after Codex r1 NEEDS-MINOR fixes)
+
+- Pending dispatch after this commit.

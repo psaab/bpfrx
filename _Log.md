@@ -110,6 +110,33 @@
   - **File(s)**:
     `docs/pr/1520-userspace-boot-extraction/plan.md`,
     `docs/pr/1520-userspace-boot-extraction/reviewer-ids.md`
+- **Timestamp**: 2026-05-25T09:00:00Z
+  - **Action**: #1538 code-review round-1 follow-up — addresses
+    Codex code-review NEEDS-MINOR (3 findings; AGY MERGE-READY,
+    Copilot PASS, Claude SMR PASS):
+    1. Rewrote `TestCompileSingleStrictErrorJoinPath` to drive
+       through `CompileConfig` rather than inline-duplicating
+       the accumulator pattern. New fixture uses ONLY the CoS
+       `equal-flow-enforcement` set line (no policer), so the
+       accumulator slice ends up length-1 and the test now
+       genuinely exercises the production path. Asserts
+       byte-identity vs a direct validator call on an
+       equivalent stub `*ClassOfServiceConfig`, zero '\n'
+       separators on the single-error path, and incidental
+       wrap-chain traversal (`errors.Is(err,
+       ErrDPDKDataplaneRetired) == false`).
+    2. Dropped stale `file:line` citations from compiler_test.go
+       and plan.md; switched to symbol references that survive
+       rebase drift.
+    3. Updated reviewer-ids.md with round-4 PLAN-READY
+       verdicts and recorded the code-review verdicts.
+    Re-ran the three new tests + the DPDK no-leak test
+    locally; all clean.
+  - **File(s)**: `pkg/config/compiler_test.go`,
+    `docs/pr/1538-multierror-validation/plan.md`,
+    `docs/pr/1538-multierror-validation/reviewer-ids.md`,
+    `_Log.md`
+
 - **Timestamp**: 2026-05-25T08:45:00Z
   - **Action**: #1538 implementation (plan v4 PLAN-READY 4/4).
     Plan-review summary: r1 Codex PLAN-NEEDS-MAJOR / AGY

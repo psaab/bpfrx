@@ -8,7 +8,7 @@ AGY round-3 PLAN-NEEDS-MINOR (1 finding):
   `set system dataplane-type userspace`; it's harmless
   explicitness because `validateDataplaneTypeStrict` only
   rejects explicit `dpdk`, and unset == userspace via
-  `effectiveDataplaneType` at `pkg/config/compiler.go:1005`
+  `effectiveDataplaneType` in `pkg/config/compiler.go`
   (pinned by `TestDataplaneTypeOmittedCompilesCleanly` at
   `pkg/config/parser_ast_test.go:2983`). Line stays as
   self-documenting future-proofing.
@@ -98,7 +98,7 @@ Absolute scale of the win:
 
 **Honest caveat on "one error per family."** Each existing
 strict validator still fail-fasts INTERNALLY (e.g.,
-`validateThreeColorPolicersStrict` at `pkg/config/compiler.go:262-303`
+`validateThreeColorPolicersStrict` in `pkg/config/compiler.go`
 returns on the first bad policer; `validateClassOfServiceStrict`
 at `:363+` returns on the first bad scheduler; same for
 `validatePolicySchedulerReferencesStrict`). This PR does NOT
@@ -255,14 +255,14 @@ similar.
    `TestDataplaneTypeDPDKRejectedAtCommitFiresFirst`.
 
 2. **Validator independence within the accumulator.**
-   - `validateClassOfServiceStrict` (`compiler.go:363+`) —
+   - `validateClassOfServiceStrict` (`compiler.go`) —
      reads `cos.Schedulers` and `cos.SchedulerMaps` only. Nil-safe
      on `cos == nil`, each `sched == nil`, each `schedMap == nil`,
      missing scheduler reference.
    - `validateThreeColorPolicersStrict` (`compiler.go:262+`) —
      reads `cfg.Firewall.ThreeColorPolicers` map only. Nil-safe
      on each `pol == nil`.
-   - `validatePolicySchedulerReferencesStrict` (`compiler.go:329+`) —
+   - `validatePolicySchedulerReferencesStrict` (`compiler.go`) —
      reads `cfg.Schedulers` and `cfg.Security.Policies` /
      `cfg.Security.GlobalPolicies` only. Nil-safe on `cfg == nil`,
      `zpp == nil`, `pol == nil || pol.SchedulerName == ""`.
@@ -311,7 +311,7 @@ similar.
 The CoS "both buffer-size bytes AND percent set" condition is
 NOT parser-reachable: `pkg/config/compiler_class_of_service.go:239`
 clears the alternate field, and the validator at
-`pkg/config/compiler.go:386` notes the state "can only arise in
+the comment in `pkg/config/compiler.go` notes the state "can only arise in
 constructed or externally-assembled configs." For tests that
 drive through `CompileConfig` we use parser-reachable conditions:
 
@@ -319,12 +319,12 @@ drive through `CompileConfig` we use parser-reachable conditions:
   `set class-of-service schedulers <name> equal-flow-enforcement`
   WITHOUT a `transmit-rate exact` setter — triggers
   `class-of-service scheduler %q equal-flow-enforcement requires
-  positive transmit-rate exact` at `pkg/config/compiler.go:371-374`.
+  positive transmit-rate exact` in `validateClassOfServiceStrict`.
 - **Policer family error (parser-reachable):**
   `set firewall three-color-policer <name> single-rate color-blind`
   WITHOUT a `committed-information-rate` setter — triggers
   `firewall three-color-policer %q requires positive
-  committed-information-rate` at `pkg/config/compiler.go:277-278`.
+  committed-information-rate` in `validateThreeColorPolicersStrict`.
 
 For the byte-identity test we call the helper directly (no parser).
 
@@ -346,21 +346,21 @@ For the byte-identity test we call the helper directly (no parser).
 
    The `set system dataplane-type userspace` line is harmless
    explicitness (unset == userspace via `effectiveDataplaneType`
-   at `pkg/config/compiler.go:1005`, so the precheck at
-   `:319` returns nil either way — see
-   `TestDataplaneTypeOmittedCompilesCleanly` at
-   `pkg/config/parser_ast_test.go:2983`). Keeping the line in
-   the fixture makes the test self-documenting and guards
-   against any future change to the default-dataplane behavior.
+   in `pkg/config/compiler.go`, so `validateDataplaneTypeStrict`
+   returns nil either way — see
+   `TestDataplaneTypeOmittedCompilesCleanly` in
+   `pkg/config/parser_ast_test.go`). Keeping the line in the
+   fixture makes the test self-documenting and guards against
+   any future change to the default-dataplane behavior.
 
    The `then discard` line uses the schema-supported action
-   syntax for three-color-policer per
-   `pkg/config/ast.go:1237`; an earlier draft used the
+   syntax for three-color-policer per the `three-color-policer`
+   entry in `pkg/config/ast.go`; an earlier draft used the
    schema-less `action loss-priority high then discard` which
-   parses (via the fallback path at `ast_edit.go:151-152`) but
-   is silently ignored by `compiler_firewall.go:144-155` since
-   the compiler only traverses the `then` child. Schema-clean
-   syntax keeps the test honest.
+   parses (via the fallback path in `ast_edit.go`) but is
+   silently ignored by the three-color-policer compile block in
+   `compiler_firewall.go` because the compiler only traverses
+   the `then` child. Schema-clean syntax keeps the test honest.
 
    Assertions:
    - `err != nil`.
