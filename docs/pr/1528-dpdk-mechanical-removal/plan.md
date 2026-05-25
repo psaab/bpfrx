@@ -1,6 +1,50 @@
 # #1528 — DPDK Retirement Phase 3: Mechanical Source Removal
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + Antigravity)
+**Status:** DRAFT v2 — addresses AGY round-1 PLAN-NEEDS-MAJOR finding
+on stored-config rolling-upgrade bootstrap-loop bug
+
+## v2 changes from v1
+
+- **§4.6 NEW**: Stored-config rolling-upgrade fix. AGY round-1 (job
+  `adversarial-review-mplctf86-k90pc7`) verified that under Option A as
+  drafted in v1, `validateDataplaneTypeStrict` runs unconditionally inside
+  `compileExpanded` (`pkg/config/compiler.go:241`), which is called from
+  `Store.compileTree` (`pkg/configstore/store.go:152`) on the `Load()`
+  path (`pkg/configstore/store.go:96`). The error bubbles up as
+  `compile config: ErrDPDKDataplaneRetired`, gets swallowed by
+  `daemon_run.go:87` (`slog.Warn("failed to load config from db",
+  ...)`), and `ActiveConfig()` returns nil. Daemon then bootstraps from
+  the text config file or starts with empty config — the
+  `errors.Is(err, ErrDPDKBackendRetired)` soft-fallback at
+  `daemon_run.go:247` is **never reached** because `dpType` resolves to
+  empty (→ userspace). Net: a node booting with `system dataplane-type
+  dpdk` persisted from before #1526 comes up with no interfaces, no
+  VRFs, no routing — operational blackout.
+  This is an **inherited bug from Phase 1 (#1526)**, not introduced by
+  this PR. But Phase 3 owns DPDK retirement completeness and must close
+  it. v2 plan adds a load-time validation bypass.
+- **§4.4 socket-mem decision**: AGY round-1 confirmed userspace path
+  ignores unmapped schema children (`pkg/config/compiler_system.go:461`
+  has no default case; `pkg/config/ast_edit.go:151` parses unmapped
+  tokens as flat leaves). Recommendation flipped from "delete the
+  schema node" to "rewrite description to indicate retirement"
+  (AGY-preferred option (b)) so old configs with `socket-mem` continue
+  to parse cleanly.
+- **§9 out-of-scope**: Updated #1539/#1553 coordination note —
+  PR #1553 is open with the leakage canary; AGY claimed we'd need to
+  delete `pkg/config/dpdk_subtree_leakage_canary_test.go` in this PR,
+  but that file is in PR #1553 NOT master. Once #1528 lands first, PR
+  #1553 rebases out (the field it polices is gone). If #1553 lands
+  first, this PR rebases.
+- Codex round-1 (task-mplct48n-8mmrjq) and round-2 retry
+  (task-mplcwinw-aayd43) both ENV-BLOCKED with sandbox failures
+  (`Failed to create unified exec process: Unable to spawn
+  codex-linux-sandbox`). No Codex plan verdict; AGY-only verdict on v1.
+  v2 will be re-submitted to Codex for round-2.
+
+---
+
+
 
 ## 1. Issue framing
 
@@ -139,7 +183,7 @@ moves.
 | `Makefile` | Remove `build-dpdk-worker`, `build-dpdk`, `clean-dpdk` from `.PHONY:` (line 16); remove `clean: clean-dpdk` (line 64); remove the `# --- DPDK targets ---` section (lines 239-251) including all three target recipes |
 | `pkg/config/compiler_system.go` | Delete `case dataplaneTypeDPDK:` branch in the `dataplane` switch (lines 236-243). Delete the `compileDPDKDataplane()` function (lines 402-463). Phase 1 reject means the `dpdk` arm is unreachable but kept in `validDataplaneType()`; we delete the *compile-side* DPDK code because nothing reads `DPDKConfig` after this PR |
 | `pkg/config/types.go` | Delete `DPDKConfig`, `DPDKAdaptiveConfig`, `DPDKPort` types and the `DPDKDataplane *DPDKConfig` field on `SystemConfig` |
-| `pkg/config/ast.go` | Line 1389: the `"socket-mem"` schema node is ONLY consumed by `compileDPDKDataplane()` (verified by `grep -rn "SocketMem\|socket-mem" --include='*.go'`). Since `compileDPDKDataplane()` is deleted, the schema node is dead syntax. Two options: (a) delete the `"socket-mem"` schema-node entirely (cleanest), (b) keep it but rewrite the description as "Legacy DPDK socket memory (retired, ignored)". RECOMMENDED: (a) — the parse path retains acceptance via the parent `dataplane` block which the userspace path uses, but `socket-mem` itself is DPDK-only and useless now |
+| `pkg/config/ast.go` | Line 1389: the `"socket-mem"` schema node is ONLY consumed by `compileDPDKDataplane()` (verified by `grep -rn "SocketMem\|socket-mem" --include='*.go'`). Since `compileDPDKDataplane()` is deleted, the schema node is dead syntax. **v2 decision (AGY r1)**: keep the schema node but rewrite description to `"Legacy DPDK socket memory (retired, ignored)"`. The userspace `compileUserspaceDataplane` ignores unmapped children with no default case (`compiler_system.go:461`), and `ast_edit.go:151` parses unmapped tokens as flat leaves, so an old config with `set system dataplane socket-mem "1024,1024"` parses cleanly with the value silently dropped. Preserving the schema-node description keeps `?`-help honest about its retirement status |
 | `pkg/config/parser_ast_test.go` | Delete `TestDPDKConfigParsesCleanly` (2622-2666) and the supporting `dpdkRetirementSubstr` constant ONLY IF Option B chosen. Under Option A, `TestDPDKConfigParsesCleanly` is REWRITTEN: the flat-set parse must still succeed (because validator catches the reject at commit), but the assertion checking `DPDKDataplane` field population is dropped. `TestDPDKConfigCompileRejects` is kept verbatim |
 | `pkg/config/parser_system_test.go:1380-1395` | Remove the `cfg.System.DPDKDataplane != nil` assertion in `TestDataplaneTypeOmittedSelectsUserspaceDataplaneDefault` — the field no longer exists, so the check is unreachable |
 | `pkg/configstore/store_test.go:1462` (`TestCommit_RejectsDPDKDataplaneType`) | **KEPT VERBATIM** — Phase 1 reject contract for the `CommitCheck`/`Commit` wrap surface (gRPC/REST). Reads `system dataplane-type dpdk`, asserts the verbatim retirement substring, and locks the `"commit check failed: "` prefix on the wrapped Commit error. Option A preserves this test unchanged |
@@ -147,6 +191,7 @@ moves.
 | `docs/pr/1373-retire-ebpf-dataplane/README.md` | The `## #1475 DPDK Backend Policy` section is now stale (the package is gone). Rewrite as `## #1475 DPDK Backend Retired (#1525)` with a 2-3 line note pointing at #1525 |
 | `docs/dpdk-dataplane.md`, `docs/dataplane-decision-dpdk-vs-vpp.md` | Already largely swept in Phase 4 (#1529). Recheck and delete if stale, or trim to a 1-paragraph retirement note. **Pre-check `docs/dpdk-dataplane.md` exists** — issue body asks for short retirement notes; Phase 4 may have already deleted these |
 | `pkg/dataplane/README.md` | Drop the #1475 DPDK Backend Policy section |
+| `scripts/refactoring-audit.sh` (lines 61, 72) | Remove `dpdk_worker` from the `find userspace-dp/src userspace-xdp/src dpdk_worker -name '*.rs'` and `find pkg cmd dpdk_worker -name '*.go'` invocations. The script silently no-ops on a missing directory (`2>/dev/null` swallows the warning) but the path is dead and should be removed for clarity |
 
 ### 4.4 Canary test surgery (highest-risk edit)
 
@@ -197,6 +242,94 @@ node boots with `system dataplane-type dpdk` persisted in
 Without this branch the daemon fatal-exits, leaving no path to fix the
 config from CLI.
 
+### 4.6 Stored-config-tolerant load path (v2 addition — fixes inherited Phase 1 bug)
+
+**AGY round-1 verified a critical bootstrap bug inherited from Phase 1
+(#1526)**: the daemon_run.go:247 soft-fallback at the factory call is
+**unreachable** for the stored-config case because the error is thrown
+EARLIER, inside `Store.Load()`. Path:
+
+1. `pkg/configstore/store.go:96`: `compiled, err := s.compileTree(tree)`
+2. `pkg/configstore/store.go:152`: `compileTree` → `config.CompileConfig(tree)`
+3. `pkg/config/compiler.go:241`: `validateDataplaneTypeStrict(cfg)` fires
+   on the persisted `dataplane-type dpdk`, returns
+   `ErrDPDKDataplaneRetired`
+4. `Store.Load()` returns `fmt.Errorf("compile config: %w", err)`
+5. `pkg/daemon/daemon_run.go:87`: `slog.Warn("failed to load config
+   from db", "err", err)` — error swallowed
+6. `pkg/daemon/daemon_run.go:91-95`: `ActiveConfig()` is nil →
+   `bootstrapFromFile()` runs OR daemon starts with empty config
+7. By the time `daemon_run.go:243` resolves `dpType`, the active config
+   is either the bootstrap text file (no DPDK) or empty (defaults to
+   userspace). The `errors.Is(err, ErrDPDKBackendRetired)` branch at
+   line 247 is unreachable for the stored-config path
+8. Result: node boots with empty/default config — no interfaces, no
+   VRFs, no routing — operational blackout
+
+**Fix**: Add a load-mode bypass to `compileTree` so persisted-config
+load tolerates the retired backend. Two acceptable shapes:
+
+**Option A2-fix-Rewrite (PREFERRED)**: at `Store.Load()`, before
+`compileTree`, walk the active tree and if `DataplaneType == "dpdk"`
+is persisted, rewrite it to empty (defaults to userspace) AND log a
+loud warning. Operator then sees the daemon boot with userspace and
+the warning in journald. The candidate config inherits the rewrite
+and a subsequent commit persists the cleanup.
+
+```go
+// pkg/configstore/store.go in Load():
+if tree != nil {
+    if rewrote := rewriteRetiredDataplaneType(tree); rewrote {
+        slog.Warn("persisted active-config selects retired DPDK dataplane; rewriting to userspace default",
+            "remediation", "review and `commit` after daemon comes up",
+        )
+    }
+}
+compiled, err := s.compileTree(tree)
+```
+
+`rewriteRetiredDataplaneType(*config.ConfigTree) bool` is a small
+helper in `pkg/configstore/` that uses the public AST API
+(`tree.FindPath`, `tree.DeletePath` or equivalent — to be confirmed
+during impl) to find and remove the `system { dataplane-type dpdk; }`
+leaf.
+
+**Option A2-fix-Bypass (alternative)**: add an `isLoad bool` parameter
+to `Store.compileTree` and a matching `loadMode bool` parameter to
+`CompileConfig` / `compileExpanded`. In load mode, `compileExpanded`
+skips the strict-validator stack (or skips only the
+DPDK-retirement validator) but still runs the schema/type validators.
+The error never fires; load succeeds; the operator can fix the
+config from CLI.
+
+**Recommendation: Option A2-fix-Rewrite.** Rewriting at Load is
+operator-friendly: the daemon boots green, the log message points at
+the remediation, and the candidate config inherits the rewrite so a
+straight `commit` clears it. The Bypass option leaves the persisted
+config un-rewritten and silently lets the strict validator fail at
+the next CLI `commit`, which is more confusing than helpful.
+
+The fix scope is small (~30 LOC + tests):
+- `pkg/configstore/store.go`: `Load()` calls
+  `rewriteRetiredDataplaneType(tree)` before `compileTree`
+- `pkg/configstore/dataplane_retire.go` (new): helper +
+  `slog.Warn` call
+- `pkg/configstore/store_test.go`: new test
+  `TestLoad_RewritesPersistedDPDKDataplaneType` confirms the rewrite
+  happens, `ActiveConfig()` is non-nil, `DataplaneType == ""`, and
+  the warning fires
+- `pkg/daemon/daemon_run.go:247` soft-fallback: kept (defense-in-depth
+  for the `NewRuntimeDataPlane(TypeDPDK)` path that callers other than
+  the stored-config flow could still hit, e.g. config sync, REST/gRPC
+  candidate apply that races the rewrite)
+
+This makes Phase 3 the right place to close the inherited bug because:
+- The bug is invisible until the DPDK-retirement migration sees real
+  rolling-upgrade traffic
+- Phase 3 owns "DPDK is retired cleanly" — leaving the boot blackout
+  open is operationally unacceptable
+- The fix is small, additive, and orthogonal to the deletion work
+
 ## 5. Public API preservation
 
 Option A path:
@@ -222,9 +355,12 @@ Option A path:
 
 1. **Stored-config rolling upgrade.** A node booting with
    `system dataplane-type dpdk` persisted in `active-config.json` must
-   still come up (in config-only mode) so the operator can fix the
-   config from CLI. The soft-fallback in `daemon_run.go:247` preserves
-   this under Option A.
+   still come up so the operator can fix the config from CLI. **v2**:
+   the daemon_run.go:247 soft-fallback alone is INSUFFICIENT (verified
+   by AGY r1 — the error fires in `Store.Load` before the factory is
+   called). §4.6 adds the stored-config-tolerant Load path: rewrite
+   persisted `dataplane-type dpdk` to empty (userspace default) with a
+   loud warning. daemon_run.go:247 stays as defense-in-depth.
 2. **`load merge` / `load override` of pre-retirement configs.** The
    parser must still accept `system dataplane-type dpdk` as a syntactically
    valid leaf (commit rejects it). `validDataplaneType()` returning
@@ -271,9 +407,12 @@ GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go build ./... 2>&1 | tail -5
 # 2. Full Go suite
 GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test ./... 2>&1 | grep -v "^ok\|^?" | tail
 
-# 3. 5x flake on the retirement-reject test
+# 3. 5x flake on the retirement-reject test + new load-tolerance test
 for i in 1 2 3 4 5; do
   GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test -run TestDataplaneTypeDPDKRejectedAtCommit ./pkg/config/ 2>&1 | grep -E "PASS|FAIL|ok " | tail -1
+done
+for i in 1 2 3 4 5; do
+  GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test -run TestLoad_RewritesPersistedDPDKDataplaneType ./pkg/configstore/ 2>&1 | grep -E "PASS|FAIL|ok " | tail -1
 done
 
 # 4. Retirement-boundary canary tests
@@ -314,10 +453,13 @@ smoke-runner via `<!-- AWAITING-SMOKE -->` marker per
 5. **Sibling #1476 eBPF mechanical removal.** Independent. Whichever
    lands first rebases the canary; this PR touches only DPDK-scoped
    surfaces.
-6. **#1539 AST leakage guard.** If #1539 is still open after #1528
-   merges, its plan target (a runtime check for DPDKConfig AST
-   leakage) becomes compile-time-tautological. Coordinated handoff,
-   not in this PR's scope.
+6. **#1539 AST leakage guard.** Currently in flight as PR #1553. Its
+   author explicitly states: "After #1528 lands, both Option A's nil
+   clear and the entire canary file become dead code and are removed
+   mechanically with the schema deletion." This PR coordinates by
+   leaving #1553 alone — the leakage canary will rebase out the
+   `DPDKDataplane` field reference (or close as PLAN-KILL) once this PR
+   merges. Not in this PR's scope.
 7. **DPDK protobuf surfaces.** None exist (umbrella confirmed).
 
 ## 10. Open questions for adversarial plan review
@@ -414,6 +556,48 @@ plan.
     would conflict with the deletion? Coordinator note in §9 covers
     this; reviewer to spot-check `gh pr list` for active touch on
     `pkg/dataplane/dpdk/` or `dpdk_worker/`.
+
+11. **(v2) Stored-config rewrite at Load.** Plan §4.6 proposes
+    `rewriteRetiredDataplaneType(tree)` called from `Store.Load()`
+    BEFORE `compileTree`. The helper walks the AST and removes
+    `system { dataplane-type dpdk; }`. Concerns:
+    - Is `ConfigTree.FindPath`/`DeletePath` the right public API, or
+      do we need a new helper? (Answer: TBD at impl time — depends on
+      current AST mutation surface.)
+    - Should the warning fire ONCE at Load or persist as an active-
+      config warning surfaced via `show system commit-warnings`?
+      Plan goes with Load-time `slog.Warn` only.
+    - Does the rewrite interact badly with HA config sync? After
+      rewrite, the daemon's `active-config.json` differs from the
+      peer's `active-config.json`. On reconnect, primary's
+      `OnPeerConnected` push will REINSTATE the DPDK config if the
+      primary still has it. **Edge case**: both nodes boot with DPDK
+      persisted, both rewrite locally, sync converges to userspace.
+      But if only ONE node has the rewrite (e.g. one upgraded, one
+      not), the un-upgraded primary will re-push DPDK to the
+      upgraded secondary, which re-rewrites on each push. Plan: log
+      every rewrite at WARN so the loop is visible to ops; deeper
+      handling deferred. Reviewer: is this acceptable, or does the
+      HA sync interaction need explicit handling in this PR?
+    - Alternative: do the rewrite in `compileExpanded` itself
+      (mutate the typed config after validateDataplaneTypeStrict
+      would have fired, replace with empty) gated on a `loadMode`
+      flag. Cleaner from a layering perspective but adds the
+      load-mode parameter through more functions. Plan: keep the
+      rewrite at `Store.Load` for minimal blast radius.
+
+12. **(v2) Should Phase 3 fix the inherited Phase 1 bug at all?**
+    AGY r1 flagged the bootstrap-loop bug as PLAN-NEEDS-MAJOR. An
+    alternative is to file a new follow-up issue and leave Phase 3
+    scoped to mechanical deletion. Arguments for fixing here: (a) the
+    bug is invisible until DPDK retirement rolling-upgrade traffic
+    hits, which is exactly the window Phase 3 owns; (b) the fix is
+    small; (c) leaving it open means the next operator who hits a
+    persisted-dpdk node has no recourse. Arguments against: (a) it
+    enlarges scope from "deletion-only" to "deletion + behavior
+    change"; (b) the behavior change could itself have edge cases
+    (the HA-sync interaction in Q11). Plan goes with "fix here";
+    reviewer to weigh in.
 
 ## 11. Reviewer dispatch contract
 

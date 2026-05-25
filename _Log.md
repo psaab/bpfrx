@@ -3582,3 +3582,20 @@
   for operator-friendly migration message + stored-config rolling-upgrade
   safety via daemon_run.go:247 soft-fallback. 10 hostile questions
   surfaced for adversarial plan review. Pending Codex + Antigravity.
+
+- **Timestamp**: 2026-05-25T09:15Z
+- **Action**: #1528 plan v2 — addresses AGY r1 PLAN-NEEDS-MAJOR
+- **File(s)**: docs/pr/1528-dpdk-mechanical-removal/plan.md
+- **Why**: AGY round-1 verified that `validateDataplaneTypeStrict` fires inside
+  `Store.Load()` BEFORE the daemon_run.go:247 soft-fallback gets a chance to
+  catch `ErrDPDKBackendRetired`. The error is swallowed at daemon_run.go:87 as
+  "failed to load config from db"; ActiveConfig() returns nil; dpType resolves
+  to "" → userspace; the sentinel-Is check never fires. Node boots with empty
+  config = operational blackout. This is an inherited bug from Phase 1 (#1526)
+  that Phase 3 should fix. v2 adds §4.6 stored-config-tolerant Load path:
+  rewrite persisted `dataplane-type dpdk` to empty at Load with loud warning.
+  Also flipped socket-mem schema-node decision per AGY: keep with retirement-
+  marker description rather than delete (userspace path ignores unmapped
+  schema children gracefully). Added Q11 + Q12 for the v2 fix path and the
+  HA-sync edge case. Codex r1+r2 ENV-BLOCKED sandbox failure; AGY-only verdict
+  on v1.
