@@ -20,11 +20,12 @@
     been superseded by #1525.
   - **File(s)**: `docs/dataplane-decision-dpdk-vs-vpp.md`,
     `docs/dpdk-dataplane.md`, `_Log.md`
-  - **Validation**: pure-docs + log scope — `git diff --stat
-    origin/master..HEAD` touches only `docs/` paths and the root
-    `_Log.md` action log. No source files, build inputs, or test
-    fixtures modified, so smoke is intentionally skipped per
-    pure-docs PR discipline.
+  - **Validation**: docs + log + userspace-dp README scope —
+    `git diff --stat origin/master..HEAD` touches `docs/` paths,
+    the root `_Log.md` action log, and `userspace-dp/README.md`
+    (the README wording fix is the only file outside `docs/`).
+    No `.go` / `.rs` / `.c` source, no build inputs, no test
+    fixtures modified.
 
 - **Timestamp**: 2026-05-24T06:35:00Z
   - **Action**: PR #1531 implementation v2 — applied retirement
