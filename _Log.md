@@ -2,6 +2,18 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T20:00:00Z
+  - **Action**: #1520 plan v1 DRAFT — extract userspace boot path
+    from legacy `dataplane.New()` (sub-#1451 S5). Adds
+    `userspace.Boot()` constructor + daemon `buildRuntimeDataPlane`
+    wrapper that fences the legacy registry off to the
+    `dataplane-type ebpf` rollback. Plan explicitly out-of-scopes
+    the `bpfShim` field rename (forbidden by existing AST canary)
+    and the `maps_sync.go` map-name decoupling (#1521 sibling work).
+  - **File(s)**:
+    `docs/pr/1520-userspace-boot-extraction/plan.md`,
+    `docs/pr/1520-userspace-boot-extraction/reviewer-ids.md`
+
 - **Timestamp**: 2026-05-25T05:55:00Z
   - **Action**: PR #1536 round-3 cleanup — address Codex MAJOR
     (load merge syntax in plan recovery) + 3 Copilot nits:
