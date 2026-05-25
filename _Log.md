@@ -288,6 +288,25 @@
     Rebased onto current master (which now has #1536).
   - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
     `_Log.md`
+- **Timestamp**: 2026-05-25T15:10:00Z
+  - **Action**: #1521 — decouple userspace maps_sync from legacy
+    BPF map names (sub-#1451 S6). New file
+    `pkg/dataplane/userspace/maps.go` holds 11 + 1 map-name
+    constants. 16 .Map() call sites in maps_sync.go + 3 in
+    process.go rewritten to use constants. Cap test updated to
+    new symbol name. Two new canaries in maps_decouple_test.go:
+    AST-semantic (no Map("userspace_*") outside maps.go) +
+    legacy-loader parity (self-retiring under #1476).
+  - **File(s)**: pkg/dataplane/userspace/maps.go (new),
+    pkg/dataplane/userspace/maps_decouple_test.go (new),
+    pkg/dataplane/userspace/maps_sync.go,
+    pkg/dataplane/userspace/process.go,
+    pkg/dataplane/userspace/maps_sync_cap_test.go,
+    docs/pr/1521-maps-sync-decouple/plan.md (v1→v2 after
+    Codex+AGY r1), docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: go build ./... clean; go test
+    ./pkg/dataplane/userspace/... ok; canaries 5/5 pass;
+    go test ./... — all 30 packages green.
 
 - **Timestamp**: 2026-05-25T05:55:00Z
   - **Action**: PR #1536 round-3 cleanup — address Codex MAJOR

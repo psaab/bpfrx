@@ -2,7 +2,16 @@
 
 ## Status
 
-DRAFT v1 — pending adversarial plan review (Codex + Antigravity).
+PLAN-READY v2 — Codex r1 + Antigravity r1 both addressed.
+Codex r1: 5 ACCEPT (HIGH-1 call-site recount, HIGH-2 AST canary,
+MEDIUM-1 reframe boundary, MEDIUM-2 loader parity, MEDIUM-3 hard-fail
+on read err) + 1 DEFER (LOW-1 shared mapnames package).
+AGY r1: PLAN-NEEDS-MAJOR with two actionable items — AST canary
+(same as Codex HIGH-2, addressed Step 3) + factual correction on
+"public-API constant" wording (now corrected to "package-private"
+in Step 2). AGY confirmed: package-private choice correct, no
+collision with #1520, rename drift detected via cap test + injected-
+literal unit tests. Ready to implement.
 
 ## Issue framing
 
@@ -86,7 +95,13 @@ works; this is hygiene for the staged retirement.
 ### Step 1: new file `pkg/dataplane/userspace/maps.go`
 
 A tiny registry file (estimated ~80 LOC) that holds the eleven map
-names as unexported package-level constants:
+names as unexported package-level constants. The registry is a
+**Go-side single source of truth for the userspace package** — it
+turns *new* literal reintroductions inside `pkg/dataplane/userspace/`
+into a CI failure via the Step 3 AST canary. It does **not** prevent
+drift against the Rust helper's BPF object names or the legacy
+loader's literals (those remain runtime failure modes); the Step 3b
+parity canary closes the loader-side gap during the #1476 window.
 
 ```go
 // Package userspace map-name registry.
@@ -138,14 +153,23 @@ package-private to enforce the boundary the issue is creating.
 
 ### Step 2: rewrite consumers
 
-**`pkg/dataplane/userspace/maps_sync.go`** — 13 references rewritten
-from `m.bpfShim.Map("userspace_<name>")` to
-`m.bpfShim.Map(mapName...)`. The existing public-API constant
-`userspaceShimDegradedStatsMapName` (line 705) is removed; its
-single call site at line 736 switches to
-`mapNameUserspaceShimDegradedStats`. All `errors.New(...)` /
-`fmt.Errorf(...)` messages keep their existing literal strings
-(operator-facing log content does not change).
+**`pkg/dataplane/userspace/maps_sync.go`** — **16** `bpfShim.Map("userspace_<name>")`
+call sites (lines 65, 69, 73, 129, 195, 238, 261, 265, 275, 480, 785,
+816, 820, 919, 923, 1068) rewritten to `m.bpfShim.Map(mapName...)`.
+The existing unexported (package-private) constant
+`userspaceShimDegradedStatsMapName` at `maps_sync.go:705` is renamed
+to `mapNameUserspaceShimDegradedStats` and moved into the new
+`maps.go` registry; its call site at line 736 follows the rename.
+(AGY r1 noted v1 wording incorrectly called it "public-API" — it is
+package-private; the value is what's pinned for mixed-version
+compatibility, not the symbol name.)
+
+The `errors.New(...)` / `fmt.Errorf(...)` messages around these call
+sites keep their existing literal-prose strings (e.g.
+`"userspace_ctrl map not loaded"`, `"update userspace_local_v4 %08x:
+%w"`) because they are operator-facing log content that ops greps
+against journald output. The AST-semantic canary (Step 3, revised)
+distinguishes lookup keys from log prose explicitly.
 
 **`pkg/dataplane/userspace/process.go`** — 3 references at lines
 66, 911, 929 rewritten the same way (`userspace_xsk_map`,
@@ -158,54 +182,136 @@ to the constant by name so future readers find the registry, but
 the literal string in the comment is also left as a backup
 breadcrumb.
 
-### Step 3: regression canary
+### Step 3: regression canary — AST-semantic
 
 New unit test in `pkg/dataplane/userspace/maps_decouple_test.go`
-that walks the package source tree and asserts no `.go` file other
-than `maps.go` contains a literal `"userspace_..."` map name from
-the registry. Implementation sketch:
+that walks the package source tree using `go/parser` + `go/ast` and
+fails if any `.go` file other than `maps.go` contains a `Map(<basic
+string literal>)` call where the string starts with `"userspace_"`.
+This is AST-semantic — it only inspects actual call expressions, so
+operator-facing log prose like `"update userspace_local_v4 %08x:
+%w"` is not flagged. It also catches any *new* literal a future PR
+introduces, even if it's a map name not currently in the registry.
+
+Implementation sketch (full implementation in PR):
 
 ```go
-func TestNoStringLiteralMapNamesOutsideRegistry(t *testing.T) {
-    forbidden := []string{
-        "userspace_ctrl", "userspace_bindings", "userspace_heartbeat",
-        "userspace_xsk_map", "userspace_cpumap", "userspace_sessions",
-        "userspace_ingress_ifaces",
-        "userspace_local_v4", "userspace_local_v6",
-        "userspace_interface_nat_v4", "userspace_interface_nat_v6",
-        "userspace_fallback_stats",
+func TestNoLiteralMapNamesOutsideRegistry(t *testing.T) {
+    fset := token.NewFileSet()
+    pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
+        // Walk all .go files including tests; tests may legitimately
+        // reference the names by literal for assertion clarity, but
+        // they must NOT invoke .Map(<literal>) in non-test code.
+        return true
+    }, parser.ParseComments)
+    if err != nil {
+        t.Fatalf("parse dir: %v", err)
     }
-    files, _ := filepath.Glob("*.go")
-    for _, f := range files {
-        if f == "maps.go" {
-            continue // registry owns the literals
-        }
-        if strings.HasSuffix(f, "_test.go") {
-            continue // tests may reference for assertion clarity
-        }
-        body, _ := os.ReadFile(f)
-        for _, name := range forbidden {
-            // Match `"<name>"` exactly to avoid catching the same
-            // substring inside log-message prose like "update
-            // userspace_local_v4 %08x: %w" which is a legitimate
-            // operator-facing string and not a Map() lookup key.
-            quoted := `"` + name + `"`
-            if bytes.Contains(body, []byte(quoted)) {
-                t.Errorf("%s: forbidden literal map name %q outside registry", f, quoted)
+    var violations []string
+    for _, pkg := range pkgs {
+        for path, file := range pkg.Files {
+            if filepath.Base(path) == "maps.go" {
+                continue // registry owns the literals
             }
+            isTest := strings.HasSuffix(path, "_test.go")
+            ast.Inspect(file, func(n ast.Node) bool {
+                call, ok := n.(*ast.CallExpr)
+                if !ok {
+                    return true
+                }
+                sel, ok := call.Fun.(*ast.SelectorExpr)
+                if !ok || sel.Sel.Name != "Map" {
+                    return true
+                }
+                if len(call.Args) != 1 {
+                    return true
+                }
+                lit, ok := call.Args[0].(*ast.BasicLit)
+                if !ok || lit.Kind != token.STRING {
+                    return true
+                }
+                // Strip the surrounding quotes.
+                s, err := strconv.Unquote(lit.Value)
+                if err != nil || !strings.HasPrefix(s, "userspace_") {
+                    return true
+                }
+                pos := fset.Position(lit.Pos())
+                if isTest {
+                    // _test.go files are allowed to reference the literal
+                    // in assertion helpers (e.g. cap test); skip.
+                    return true
+                }
+                violations = append(violations,
+                    fmt.Sprintf("%s:%d: forbidden literal map name %q in .Map() call outside registry",
+                        pos.Filename, pos.Line, s))
+                return true
+            })
+        }
+    }
+    if len(violations) > 0 {
+        t.Fatalf("AST canary violations:\n  %s", strings.Join(violations, "\n  "))
+    }
+}
+```
+
+Notes:
+- AST-semantic, so it precisely catches `Map(<literal>)` and ignores
+  string literals in `errors.New`, `fmt.Errorf`, comments, or other
+  log-prose contexts. This responds directly to Codex r1 HIGH-2.
+- Catches reintroductions via raw string literals (`` `userspace_x` ``)
+  because `strconv.Unquote` handles both quoted forms.
+- Catches names not yet in the registry too — any new `Map("userspace_*")`
+  literal fails CI, forcing the author to add a registry entry first.
+- Test files are skipped on the `.Map()` rule but the cap test
+  (`maps_sync_cap_test.go`) is unaffected because its assertion is
+  a literal-equality compare, not a `.Map()` call.
+- File discovery uses `parser.ParseDir(".")`, which fails hard on
+  read/parse errors (vs the v1 sketch's silent error swallowing —
+  Codex r1 MEDIUM-3).
+
+### Step 3b: duplicated-name parity canary (Codex r1 MEDIUM-2)
+
+A second unit test in the same file pins the eleven (+1 retained)
+constants against the literal strings the legacy loader at
+`pkg/dataplane/loader_ebpf.go` currently uses. The test reads the
+loader file from a known relative path (`../loader_ebpf.go`) and
+parses it for `Pin: "userspace_..."` / `bpfMap{Name: "userspace_..."}`
+constructs; for each registry constant the test asserts that the
+literal string appears at least once in the loader source. This is a
+short-lived consistency canary that goes away with #1476 (loader
+deletion) but in the meantime prevents one side renaming a map and
+silently breaking bringup.
+
+Implementation sketch:
+
+```go
+func TestRegistryParityWithLegacyLoader(t *testing.T) {
+    loaderPath := "../loader_ebpf.go"
+    body, err := os.ReadFile(loaderPath)
+    if err != nil {
+        // Loader deleted by #1476 — parity check no longer needed.
+        t.Skipf("loader_ebpf.go absent (#1476 retired the loader?): %v", err)
+        return
+    }
+    for _, name := range []string{
+        mapNameUserspaceCtrl, mapNameUserspaceBindings,
+        mapNameUserspaceHeartbeat, mapNameUserspaceXSK,
+        mapNameUserspaceCPUMap, mapNameUserspaceSessions,
+        mapNameUserspaceIngressIfaces, mapNameUserspaceLocalV4,
+        mapNameUserspaceLocalV6, mapNameUserspaceInterfaceNATv4,
+        mapNameUserspaceInterfaceNATv6, mapNameUserspaceShimDegradedStats,
+    } {
+        if !bytes.Contains(body, []byte(`"`+name+`"`)) {
+            t.Errorf("registry constant %q not found in legacy loader %s — "+
+                "parity broken (either rename both sides or update this canary)",
+                name, loaderPath)
         }
     }
 }
 ```
 
-The canary deliberately uses **quoted-string matching** to spare
-the operator-facing log prose (`"update userspace_local_v4
-%08x"`). Those format strings remain literal because they describe
-operations not lookups and are useful to grep against journald
-output. The canary catches the actual `Map(...)` keys.
-
-Tests are excluded because `maps_sync_cap_test.go` and any future
-asserter may want to reference the literal value for clarity.
+The test `Skip`s if `loader_ebpf.go` is deleted (i.e. #1476 lands),
+so it self-retires cleanly.
 
 ### Step 4: cap-test pointer update
 

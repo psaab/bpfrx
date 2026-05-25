@@ -63,7 +63,7 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	m.eventStreamCancel = esCancel
 	// Clear stale XSKMAP entries from previous helper instance.
 	// Old entries point to dead socket fds; new helper will repopulate.
-	if xskMap := m.bpfShim.Map("userspace_xsk_map"); xskMap != nil {
+	if xskMap := m.bpfShim.Map(mapNameUserspaceXSK); xskMap != nil {
 		for i := uint32(0); i < 4096; i++ {
 			_ = xskMap.Delete(i)
 		}
@@ -908,7 +908,7 @@ func proactiveNeighborResolveAsync(cfg *config.Config) {
 // shim stops redirecting packets to XSK. This MUST be called before the
 // helper exits to prevent packets being sent to dead socket fds.
 func (m *Manager) disableUserspaceCtrlLocked() {
-	ctrlMap := m.bpfShim.Map("userspace_ctrl")
+	ctrlMap := m.bpfShim.Map(mapNameUserspaceCtrl)
 	if ctrlMap == nil {
 		return
 	}
@@ -926,7 +926,7 @@ func (m *Manager) disableUserspaceCtrlLocked() {
 // reEnableUserspaceCtrlLocked sets ctrl.enabled=1 in the BPF map.
 // Used to rollback a ctrl disable when the subsequent operation fails.
 func (m *Manager) reEnableUserspaceCtrlLocked() {
-	ctrlMap := m.bpfShim.Map("userspace_ctrl")
+	ctrlMap := m.bpfShim.Map(mapNameUserspaceCtrl)
 	if ctrlMap == nil {
 		return
 	}
