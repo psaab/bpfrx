@@ -2,10 +2,9 @@
 
 ## Status
 
-v2 — PLAN-READY after Antigravity PLAN-READY
-(adversarial-review-mpkqkzkm-qfa19j) and Codex PLAN-NEEDS-MINOR
-(task-mpkqsgf5-j2yag1). v2 incorporates the three MUST-FIX items:
+v3 — IMPLEMENTATION COMPLETE.
 
+v1 → v2 (Codex plan review task-mpkqsgf5-j2yag1, PLAN-NEEDS-MINOR):
 1. Require Chain A (#1526) to land BEFORE this PR (sequencing
    constraint, was previously "either order works").
 2. Drop Change 5 (docs edit) entirely. The required canary tokens
@@ -15,6 +14,23 @@ v2 — PLAN-READY after Antigravity PLAN-READY
    `pkg/config` for Chain A because `pkg/dataplane` already imports
    `pkg/config` (import cycle).  The sentinel is for runtime factory
    callers only.
+
+v2 → v3 (Copilot inline review on PR #1535):
+4. Soften the runtime-fatal behavior.  v2's `NewRuntimeDataPlane`
+   returning `ErrDPDKBackendRetired` would `os.Exit(1)` the daemon
+   on the next restart for any node that still had a persisted
+   `system dataplane-type dpdk` from before Chain A landed.  v3
+   adds an `errors.Is` branch in `pkg/daemon/daemon_run.go` that
+   treats this sentinel the same as a `Start()` failure: `slog.Warn`
+   plus config-only fallback.  Sequencing dependency on #1526 is
+   downgraded from HARD to STRONGLY PREFERRED.
+5. Clean up stale plan v1 prose still referencing docs edits and
+   token-list trims (Codex code review task-mpkrohgl-dow3kd).
+
+Earlier verdicts preserved:
+- Antigravity plan review: adversarial-review-mpkqkzkm-qfa19j → PLAN-READY.
+- Codex plan review: task-mpkqsgf5-j2yag1 → PLAN-NEEDS-MINOR (resolved in v2).
+- Codex code review v2: task-mpkrohgl-dow3kd → MERGE-NEEDS-MINOR (resolved in v3).
 
 ## Issue framing
 
@@ -302,8 +318,8 @@ registry.
 | Performance regression | NONE | Pure link-time change. No hot-path code touched. |
 | Architectural mismatch | LOW | Same shape as #1473 retirement Phase 1 — shrink canary allowlist, remove registration, leave package compilable for later deletion. |
 | Canary drift | MED | The canary tests are fiddly. The `stale allowlist entry` branch of `TestDPDKBackendImportStaysBackendLocal` triggers if the map empties without the test logic understanding that empty-is-OK. The plan accounts for that by reading the test code, not just the allowlist. |
-| Docs-token canary drift | MED | `TestRetirementBoundaryDocsMentionDPDKPolicy` pins 7 token strings. The plan touches that prose and must keep the canary-required tokens present (or update the canary token list in lockstep). |
-| #1526 ordering | HIGH if #1527 lands first | Today's daemon currently runs in config-only mode on `set system dataplane-type dpdk` (slog.Warn). After this PR, the same config kills the daemon at startup. **Therefore #1526 must land first** so the config never reaches the runtime in the first place. The sequencing is a HARD prerequisite, not a soft recommendation. |
+| Docs-token canary drift | NONE | `TestRetirementBoundaryDocsMentionDPDKPolicy` pins 7 token strings. This PR does NOT touch the docs prose at all — every required token already appears in `docs/pr/1373-retire-ebpf-dataplane/README.md` untouched. Chain C (#1529) will update the prose after Phase 3 deletion. |
+| #1526 ordering | LOW (mitigated in v3) | Plan v2 required #1526 first because today's daemon falls through to config-only on stub Start() failure but this PR made the same config fatal at constructor time. **v3 mitigates this in `pkg/daemon/daemon_run.go`**: `NewRuntimeDataPlane(...)` returning `ErrDPDKBackendRetired` is detected via `errors.Is` and treated the same as a `Start()` failure — `slog.Warn` plus config-only fallback. Operators with a persisted `system dataplane-type dpdk` get a clear remediation log and a running daemon rather than an `os.Exit(1)` loop. The sequencing dependency on Chain A is no longer hard; #1526 still strongly preferred because it gives the same operator UX at commit time instead of startup time. |
 
 ## Test plan
 
@@ -337,7 +353,9 @@ Total: 30 measurements per the skill's discipline. Required:
 - `go test -run 'TestOperatorPackagesDoNotImportBPFArtifactsDirectly' ./pkg/dataplane/`
   — passes (no DPDK production imports left).
 - `go test -run 'TestRetirementBoundaryDocsMentionDPDKPolicy' ./pkg/dataplane/`
-  — passes after docs edits + token-list trim.
+  — passes untouched (the required tokens already appear in
+  `docs/pr/1373-retire-ebpf-dataplane/README.md`; Chain C #1529
+  owns the docs prose sweep).
 
 ## Out of scope (explicitly)
 

@@ -1,5 +1,25 @@
 # Action Log
 
+## 2026-05-25
+
+- **Timestamp**: 2026-05-25T06:00:00Z
+  - **Action**: #1527 Copilot review response — Copilot flagged on
+    `47a4278c` that returning `ErrDPDKBackendRetired` at construction
+    time in `NewRuntimeDataPlane` is now fatal in
+    `pkg/daemon/daemon_run.go` (the "create dataplane" error path
+    exits the daemon), whereas a `Start()` failure falls back to
+    config-only mode with a warning. Nodes that still have a
+    persisted `set system dataplane-type dpdk` would be bricked on
+    restart even before Chain A (#1526) blocks the commit. Addressed
+    by special-casing `errors.Is(err, ErrDPDKBackendRetired)` in
+    `daemon_run.go`: log a structured warning with remediation
+    guidance, set `d.dp = nil`, and fall through to config-only mode
+    (same posture as a `Start()` failure). The hard fatal branch is
+    preserved for genuinely unknown dataplane types. No new imports
+    needed (`errors` already imported). Build clean,
+    `go test ./pkg/dataplane/... ./pkg/daemon/...` clean.
+  - **File(s)**: `pkg/daemon/daemon_run.go`
+
 ## 2026-05-24
 
 - **Timestamp**: 2026-05-24T12:00:00Z
