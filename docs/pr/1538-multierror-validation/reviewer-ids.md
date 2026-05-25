@@ -1,4 +1,8 @@
-# Reviewer Job IDs — #1538 multierror validation
+# Reviewer Job IDs — issue #1538 / PR #1556 (multierror validation)
+
+This worktree is named after the issue (#1538). The pull request
+opened from this branch is #1556. Reviewer IDs below cover both
+plan-review (no PR yet) and code-review (PR #1556) phases.
 
 ## Round 1 (plan v1 @ commit 6f8864a2)
 
