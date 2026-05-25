@@ -99,5 +99,18 @@ plan-review (no PR yet) and code-review (PR #1556) phases.
 
 - Codex: `task-mpldivmf-wqx812`
   - Verdict: NEEDS-MINOR (reviewer-ids.md r5 entry said
-    "pending"; addressed in this commit)
+    "pending"; addressed in 68c2327c)
 - Antigravity: `adversarial-review-mpldix4e-vyjru7`
+  - Verdict: MERGE-READY
+- Copilot: review at PR #1556
+  - Verdict: PASS (no new comments)
+
+### Round 7 (HEAD 68c2327c — reviewer-ids fix)
+
+- Codex: `task-mpldlvnx-dfu9bd`
+  - Verdict: NEEDS-MINOR (round 6 AGY verdict missing —
+    addressed in this commit)
+
+### Round 8 (after this commit)
+
+- Pending re-verification after this commit lands.
