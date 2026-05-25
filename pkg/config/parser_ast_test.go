@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -2618,7 +2619,16 @@ func TestDomainNameAndSearch(t *testing.T) {
 	}
 }
 
-func TestDPDKConfig(t *testing.T) {
+// TestDPDKConfigParsesCleanly documents that the flat-set syntax for
+// the retired DPDK dataplane stanza still parses (so `load merge`
+// of a pre-retirement config does not syntax-error). The companion
+// TestDPDKConfigCompileRejects exercises the commit-time reject.
+//
+// Pre-#1526 this test ALSO asserted CompileConfig succeeded with
+// populated DPDKDataplane fields. After #1526 commit-time reject,
+// CompileConfig fails by design, so we split the parse coverage
+// from the (rejected) compile-time semantics.
+func TestDPDKConfigParsesCleanly(t *testing.T) {
 	lines := []string{"set system dataplane-type dpdk", "set system dataplane cores 2-5", "set system dataplane memory 2048", "set system dataplane socket-mem \"1024,1024\"", "set system dataplane rx-mode adaptive", "set system dataplane rx-mode idle-threshold 256", "set system dataplane rx-mode resume-threshold 32", "set system dataplane rx-mode sleep-timeout 100", "set system dataplane ports 0000:03:00.0 interface wan0", "set system dataplane ports 0000:03:00.0 rx-mode polling", "set system dataplane ports 0000:03:00.0 cores 2-3", "set system dataplane ports 0000:06:00.0 interface trust0"}
 	tree := &ConfigTree{}
 	for _, line := range lines {
@@ -2630,61 +2640,66 @@ func TestDPDKConfig(t *testing.T) {
 			t.Fatalf("SetPath(%v): %v", path, err)
 		}
 	}
-	cfg, err := CompileConfig(tree)
-	if err != nil {
-		t.Fatal(err)
+	// Tree should hold the DPDK syntax verbatim — parse must not
+	// reject it (the rejection is at commit/compile time, not parse).
+	// Flat-set form represents `set system dataplane-type dpdk` as
+	// Node{Keys:[dataplane-type, dpdk], IsLeaf:true} under system.
+	sys := tree.FindChild("system")
+	if sys == nil {
+		t.Fatal("system node missing after parse")
 	}
-	if cfg.System.DataplaneType != "dpdk" {
-		t.Errorf("DataplaneType = %q, want dpdk", cfg.System.DataplaneType)
+	dpType := sys.FindChild("dataplane-type")
+	if dpType == nil {
+		t.Fatal("dataplane-type node missing under system after parse")
 	}
-	dp := cfg.System.DPDKDataplane
-	if dp == nil {
-		t.Fatal("DPDKDataplane is nil")
+	// Either flat-set leaf (Keys = [dataplane-type, dpdk]) or
+	// hierarchical (Keys = [dataplane-type], Children = [Node{dpdk}]).
+	parsedValue := ""
+	if dpType.IsLeaf && len(dpType.Keys) >= 2 {
+		parsedValue = dpType.Keys[1]
+	} else if len(dpType.Children) > 0 {
+		parsedValue = dpType.Children[0].Name()
 	}
-	if dp.Cores != "2-5" {
-		t.Errorf("Cores = %q, want 2-5", dp.Cores)
+	if parsedValue != "dpdk" {
+		t.Fatalf("dataplane-type dpdk did not survive parse: %+v", dpType)
 	}
-	if dp.Memory != 2048 {
-		t.Errorf("Memory = %d, want 2048", dp.Memory)
+	// Compile is expected to fail; covered by TestDPDKConfigCompileRejects.
+}
+
+// TestDPDKConfigCompileRejects reuses the comprehensive DPDK schema
+// fixture from TestDPDKConfigParsesCleanly and asserts the new
+// commit-time reject (#1526) fires with the verbatim retirement
+// substring.
+func TestDPDKConfigCompileRejects(t *testing.T) {
+	lines := []string{"set system dataplane-type dpdk", "set system dataplane cores 2-5", "set system dataplane memory 2048", "set system dataplane socket-mem \"1024,1024\"", "set system dataplane rx-mode adaptive", "set system dataplane rx-mode idle-threshold 256", "set system dataplane rx-mode resume-threshold 32", "set system dataplane rx-mode sleep-timeout 100", "set system dataplane ports 0000:03:00.0 interface wan0", "set system dataplane ports 0000:03:00.0 rx-mode polling", "set system dataplane ports 0000:03:00.0 cores 2-3", "set system dataplane ports 0000:06:00.0 interface trust0"}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
 	}
-	if dp.SocketMem != "1024,1024" {
-		t.Errorf("SocketMem = %q, want 1024,1024", dp.SocketMem)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig succeeded for dataplane-type dpdk; expected retirement rejection")
 	}
-	if dp.RXMode != "adaptive" {
-		t.Errorf("RXMode = %q, want adaptive", dp.RXMode)
+	// Reuse the package-local const (declared further down in this
+	// file) so the verbatim retirement text lives in exactly one
+	// place. Go allows referencing consts declared later in the
+	// file at package scope.
+	if !strings.Contains(err.Error(), dpdkRetirementSubstr) {
+		t.Fatalf("CompileConfig error = %q, want substring %q", err.Error(), dpdkRetirementSubstr)
 	}
-	if dp.AdaptiveConfig == nil {
-		t.Fatal("AdaptiveConfig is nil")
-	}
-	if dp.AdaptiveConfig.IdleThreshold != 256 {
-		t.Errorf("IdleThreshold = %d, want 256", dp.AdaptiveConfig.IdleThreshold)
-	}
-	if dp.AdaptiveConfig.ResumeThreshold != 32 {
-		t.Errorf("ResumeThreshold = %d, want 32", dp.AdaptiveConfig.ResumeThreshold)
-	}
-	if dp.AdaptiveConfig.SleepTimeout != 100 {
-		t.Errorf("SleepTimeout = %d, want 100", dp.AdaptiveConfig.SleepTimeout)
-	}
-	if len(dp.Ports) != 2 {
-		t.Fatalf("Ports len = %d, want 2", len(dp.Ports))
-	}
-	if dp.Ports[0].PCIAddress != "0000:03:00.0" {
-		t.Errorf("Port[0].PCIAddress = %q, want 0000:03:00.0", dp.Ports[0].PCIAddress)
-	}
-	if dp.Ports[0].Interface != "wan0" {
-		t.Errorf("Port[0].Interface = %q, want wan0", dp.Ports[0].Interface)
-	}
-	if dp.Ports[0].RXMode != "polling" {
-		t.Errorf("Port[0].RXMode = %q, want polling", dp.Ports[0].RXMode)
-	}
-	if dp.Ports[0].Cores != "2-3" {
-		t.Errorf("Port[0].Cores = %q, want 2-3", dp.Ports[0].Cores)
-	}
-	if dp.Ports[1].PCIAddress != "0000:06:00.0" {
-		t.Errorf("Port[1].PCIAddress = %q, want 0000:06:00.0", dp.Ports[1].PCIAddress)
-	}
-	if dp.Ports[1].Interface != "trust0" {
-		t.Errorf("Port[1].Interface = %q, want trust0", dp.Ports[1].Interface)
+	// Structured-error contract: external API consumers must be able
+	// to match the DPDK retirement reject with errors.Is rather than
+	// substring-searching the error text. The verbatim text is still
+	// part of the contract (see dpdkRetirementSubstr above), but the
+	// sentinel is the programmatic handle.
+	if !errors.Is(err, ErrDPDKDataplaneRetired) {
+		t.Fatalf("CompileConfig error = %v, want errors.Is(err, ErrDPDKDataplaneRetired)", err)
 	}
 }
 
@@ -2753,6 +2768,236 @@ func TestDataplaneTypeValidationRejectsHierarchicalDuplicateUnknownBackend(t *te
 				t.Fatalf("CompileConfig error = %v", err)
 			}
 		})
+	}
+}
+
+// dpdkRetirementSubstr is the verbatim message #1526 contracts at
+// commit time. Substring match (rather than byte-exact) is used
+// so the same assertion fires whether the error is observed via
+// CompileConfig directly, Store.CommitCheck (raw), or Store.Commit
+// (prepended with "commit check failed: ").
+const dpdkRetirementSubstr = "the DPDK dataplane backend has been retired; use 'set system dataplane-type userspace' (see #1525)"
+
+// TestDataplaneTypeDPDKRejectedAtCommit — flat-set form. Mirrors the
+// way operators most often type the migration in candidate config.
+// Asserts the exact (substring) retirement message lands.
+func TestDataplaneTypeDPDKRejectedAtCommit(t *testing.T) {
+	lines := []string{
+		"set system dataplane-type dpdk",
+		"set system dataplane cores 2-5",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig succeeded for dataplane-type dpdk (flat-set form)")
+	}
+	if !strings.Contains(err.Error(), dpdkRetirementSubstr) {
+		t.Fatalf("CompileConfig error = %q, want substring %q", err.Error(), dpdkRetirementSubstr)
+	}
+}
+
+// TestDataplaneTypeDPDKRejectedAtCommitHierarchical — same assertion
+// via the `system { dataplane-type dpdk; }` AST shape to confirm
+// the reject is shape-independent.
+func TestDataplaneTypeDPDKRejectedAtCommitHierarchical(t *testing.T) {
+	parser := NewParser(`system {
+    dataplane-type dpdk;
+    dataplane {
+        cores 2-5;
+    }
+}`)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig succeeded for hierarchical dataplane-type dpdk")
+	}
+	if !strings.Contains(err.Error(), dpdkRetirementSubstr) {
+		t.Fatalf("CompileConfig error = %q, want substring %q", err.Error(), dpdkRetirementSubstr)
+	}
+}
+
+// TestDataplaneTypeDPDKRejectedAtCommitFiresFirst — locks in the
+// validator ordering decision (DPDK reject is the FIRST strict
+// validator in compileExpanded). Without this ordering, an
+// operator fixing a retirement-blocked config also has to chase
+// unrelated structural errors before they see the migration
+// message; the documented migration is the FIRST thing to do.
+//
+// Negative-control approach: build a candidate that would
+// independently fail one of the OTHER strict validators after
+// validateDataplaneTypeStrict in compileExpanded. We use the
+// three-color-policer single-rate + two-rate conflict because
+// it is the simplest validator-failing fixture
+// (validateThreeColorPolicersStrict). We verify that:
+//   1. The DPDK retirement message wins (the policer error does
+//      NOT surface).
+//   2. The policer fixture in isolation DOES fail with its own
+//      strict-validator error (proves the negative control is
+//      live — otherwise removing the dpdk line would surface
+//      neither error and the test would silently pass).
+//
+// Brittle by design: if a future refactor moves
+// validateDataplaneTypeStrict after validateThreeColorPolicers-
+// Strict, the first assertion fails and forces an explicit
+// re-justification.
+func TestDataplaneTypeDPDKRejectedAtCommitFiresFirst(t *testing.T) {
+	// First: prove the negative-control fixture actually triggers
+	// the secondary strict validator on its own.
+	policerOnly := NewParser(`firewall {
+    three-color-policer bad-pol {
+        single-rate {
+            color-blind;
+        }
+        two-rate {
+            color-aware;
+        }
+        action {
+            loss-priority high then discard;
+        }
+    }
+}`)
+	tree1, errs := policerOnly.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("policer-only parse errors: %v", errs)
+	}
+	_, polErr := CompileConfig(tree1)
+	if polErr == nil {
+		t.Fatal("negative control failed: bad three-color-policer fixture should fail validateThreeColorPolicersStrict on its own — test cannot prove ordering")
+	}
+	if !strings.Contains(polErr.Error(), "three-color-policer") {
+		t.Fatalf("negative control surfaced unexpected error %q (want three-color-policer); fixture may need updating", polErr.Error())
+	}
+
+	// Now combine the dpdk type and the bad policer. The DPDK
+	// retirement reject must fire first.
+	parser := NewParser(`system {
+    dataplane-type dpdk;
+}
+firewall {
+    three-color-policer bad-pol {
+        single-rate {
+            color-blind;
+        }
+        two-rate {
+            color-aware;
+        }
+        action {
+            loss-priority high then discard;
+        }
+    }
+}`)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig succeeded for dpdk + malformed policer candidate")
+	}
+	if !strings.Contains(err.Error(), dpdkRetirementSubstr) {
+		t.Fatalf("CompileConfig error = %q, want DPDK retirement substring (policer error should not win): %q", err.Error(), dpdkRetirementSubstr)
+	}
+	// Also confirm the policer error did NOT leak through.
+	if strings.Contains(err.Error(), "three-color-policer") {
+		t.Fatalf("policer error leaked through DPDK retirement reject: %q", err.Error())
+	}
+}
+
+// TestDataplaneTypeDPDKRejectedAtCommitViaApplyGroups — verifies
+// the reject fires AFTER apply-groups / ${node} expansion. A group-
+// injected `dataplane-type dpdk` is caught by the strict validator
+// because the validator runs inside compileExpanded, not against
+// the raw tree (Codex round-1 finding).
+func TestDataplaneTypeDPDKRejectedAtCommitViaApplyGroups(t *testing.T) {
+	parser := NewParser(`groups {
+    legacy {
+        system {
+            dataplane-type dpdk;
+        }
+    }
+}
+system {
+    apply-groups legacy;
+    host-name fw1;
+}`)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	_, err := CompileConfigForNode(tree, 0)
+	if err == nil {
+		t.Fatal("CompileConfigForNode succeeded for apply-groups-injected dpdk")
+	}
+	if !strings.Contains(err.Error(), dpdkRetirementSubstr) {
+		t.Fatalf("CompileConfigForNode error = %q, want substring %q", err.Error(), dpdkRetirementSubstr)
+	}
+}
+
+// TestDataplaneTypeUserspaceCompilesCleanly is the negative-control
+// test: the still-supported `dataplane-type userspace` must
+// continue to compile without warnings or errors after #1526. If
+// validateDataplaneTypeStrict ever broadens to reject non-DPDK
+// types, this test fails immediately.
+func TestDataplaneTypeUserspaceCompilesCleanly(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, line := range []string{
+		"set system dataplane-type userspace",
+		"set system dataplane workers 4",
+	} {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig for userspace: %v", err)
+	}
+	if cfg.System.DataplaneType != "userspace" {
+		t.Fatalf("DataplaneType = %q, want userspace", cfg.System.DataplaneType)
+	}
+	// No mention of the DPDK retirement substring anywhere on
+	// the success path.
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, dpdkRetirementSubstr) {
+			t.Fatalf("DPDK retirement substring leaked into warnings on userspace path: %v", cfg.Warnings)
+		}
+	}
+}
+
+// TestDataplaneTypeOmittedCompilesCleanly — the "no system
+// dataplane-type" form (operator deletes the line entirely) is also
+// a valid migration target since `effectiveDataplaneType("")`
+// resolves to userspace.
+func TestDataplaneTypeOmittedCompilesCleanly(t *testing.T) {
+	parser := NewParser(`system {
+    host-name fw1;
+}`)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig with omitted dataplane-type: %v", err)
+	}
+	if cfg.System.DataplaneType != "" {
+		t.Fatalf("DataplaneType = %q, want empty string", cfg.System.DataplaneType)
 	}
 }
 

@@ -1,5 +1,236 @@
 # Action Log
 
+## 2026-05-25
+
+- **Timestamp**: 2026-05-25T05:55:00Z
+  - **Action**: PR #1536 round-3 cleanup — address Codex MAJOR
+    (load merge syntax in plan recovery) + 3 Copilot nits:
+    1. plan.md operational-note recovery flow used invalid
+       `load merge replace /etc/xpf/xpf.conf` — the supported
+       forms are `load merge <file>` or `load override <file>`
+       (`cmd/cli/main.go` parses mode then args[1] as file).
+       Replaced with `load override /etc/xpf/xpf.conf` which is
+       the appropriate one-shot replacement form.
+    2. compiler_system.go unknown-dataplane-type error wording
+       said "valid values are userspace" — misleading when
+       ebpf is still accepted (deprecated) and dpdk still
+       parses (rejected at commit). Updated to "valid values
+       are userspace or ebpf (deprecated); dpdk parses for
+       legacy-config compatibility but is rejected at commit
+       per #1525".
+    3. parser_ast_test.go TestDPDKConfigCompileRejects had a
+       local `wantSubstr` duplicating `dpdkRetirementSubstr`
+       const declared lower in the same file. Reuses the const
+       to prevent drift.
+    4. _Log.md had a duplicate `## 2026-05-25` header inserted
+       around line 1783 by an earlier auto-bot commit. Folded
+       its content into this top-of-file entry and removed the
+       stray header to keep one bucket per date.
+  - **File(s)**: `docs/pr/1526-dpdk-reject/plan.md`,
+    `pkg/config/compiler_system.go`,
+    `pkg/config/parser_ast_test.go`, `_Log.md`
+
+- **Timestamp**: 2026-05-25T05:30:00Z
+  - **Action**: PR #1526 implementation v3 — added
+    `validateDataplaneTypeStrict` in pkg/config/compiler.go (slotted
+    BEFORE existing CoS / policer / scheduler strict validators per
+    Codex round-1 ordering finding). Verbatim retirement message
+    per issue body: `the DPDK dataplane backend has been retired;
+    use 'set system dataplane-type userspace' (see #1525)`. Tests
+    use substring match so the same assertion fires across
+    CompileConfig (raw), Store.CommitCheck (raw), and Store.Commit
+    (`commit check failed:`-wrapped) — addresses Codex round-2
+    MAJOR finding 1.
+
+    Test surface:
+    - parser_ast_test.go: split TestDPDKConfig into
+      TestDPDKConfigParsesCleanly (parse must survive — AST shape
+      assertion) and TestDPDKConfigCompileRejects (commit reject).
+    - parser_ast_test.go: 5 new dedicated tests —
+      TestDataplaneTypeDPDKRejectedAtCommit (flat-set form),
+      TestDataplaneTypeDPDKRejectedAtCommitHierarchical (block
+      form), TestDataplaneTypeDPDKRejectedAtCommitFiresBeforeCoS
+      (validator ordering lock-in),
+      TestDataplaneTypeDPDKRejectedAtCommitViaApplyGroups
+      (apply-groups expansion path), plus negative-control pair
+      TestDataplaneTypeUserspaceCompilesCleanly and
+      TestDataplaneTypeOmittedCompilesCleanly.
+    - parser_system_test.go: dropped `dpdk` from the
+      TestDataplaneTypeNonLegacyValuesDoNotWarnDeprecatedCompatibility
+      loop (now hard-errors at compile).
+    - configstore/store_test.go: 2 new tests —
+      TestCommit_RejectsDPDKDataplaneType locks in BOTH the raw
+      CommitCheck error AND the `commit check failed:`-wrapped
+      Commit error, plus TestCommit_AcceptsUserspaceDataplaneType
+      negative control.
+
+    Plan v3 updated to (a) switch tests from byte-exact to
+    substring-match for cross-surface compatibility, (b) correct
+    the daemon-startup recovery flow text (candidate is empty
+    after failed Load, not pre-populated), (c) honor the issue
+    body's verbatim `(see #1525)` (does not point at #1531 docs).
+
+    Test gates: go build ./... clean. go test ./... clean across
+    33 packages. 5x flake check on new tests passes. cargo check
+    on userspace-dp/ clean (no Rust touched).
+  - **File(s)**: `pkg/config/compiler.go`,
+    `pkg/config/parser_ast_test.go`,
+    `pkg/config/parser_system_test.go`,
+    `pkg/configstore/store_test.go`,
+    `docs/pr/1526-dpdk-reject/plan.md`
+## 2026-05-25 — #1529 Codex code-review finding follow-up
+
+- **Timestamp**: 2026-05-25T06:50:00Z
+  - **Action**: Codex code review NEEDS-MINOR with three findings,
+    all addressed:
+    (1) _Log.md said 25 files but commit had 26; corrected.
+    (2) `docs/pr/1373-retire-ebpf-dataplane/README.md` safe-delete
+        bullet said "#1475 section below" but #1475 is above the
+        safe-delete blockers list; corrected to "section in this
+        file".
+    (3) Tense mismatch in `docs/userspace-dataplane-gaps.md` and
+        `docs/userspace-dataplane-architecture.md`: changed
+        "legacy eBPF used" back to "legacy eBPF uses" since
+        legacy eBPF is still present during the staged retirement.
+  - **File(s)**: `docs/pr/1373-retire-ebpf-dataplane/README.md`,
+    `docs/userspace-dataplane-gaps.md`,
+    `docs/userspace-dataplane-architecture.md`, `_Log.md`
+
+## 2026-05-25 — #1529 Antigravity code-review finding follow-up
+
+- **Timestamp**: 2026-05-25T06:30:00Z
+  - **Action**: Antigravity code review MERGE-READY with one new
+    finding: `pkg/dataplane/README.md` and `pkg/daemon/README.md`
+    were missed by the original docs/ + root grep. The issue body
+    for #1529 explicitly names `pkg/dataplane/README.md` as part
+    of the retirement boundary, so this was a scope-coverage miss.
+    Edited `pkg/dataplane/README.md` and `pkg/daemon/README.md` to
+    reframe DPDK references past-tense; pointed at the canary-
+    pinned `#1475 DPDK Backend Policy` section as the historical
+    anchor.
+  - **File(s)**: `pkg/dataplane/README.md`, `pkg/daemon/README.md`,
+    `_Log.md`
+
+## 2026-05-25 — #1529 implementation
+
+- **Timestamp**: 2026-05-25T06:00:00Z
+  - **Action**: Implemented the v3 plan. 26 files touched, all `*.md`.
+    Pure-text gate passes; no source files touched. Chain A boundary
+    confirmed (no overlap with `docs/dataplane-decision-dpdk-vs-vpp.md`
+    or `docs/dpdk-dataplane.md`). All three retirement-boundary doc
+    canaries pass: `TestRetirementBoundaryDocsMentionDPDKPolicy`,
+    `TestRetirementBoundaryDocsMentionShimEscapeAssumptions`,
+    `TestRetirementBoundaryDocsMentionLegacyImportAllowlist`. Full
+    `pkg/dataplane/...` Go test suite passes. Cargo sanity build
+    passes.
+  - **File(s)**: README.md, CLAUDE.md, docs/pr/1373-retire-ebpf-dataplane/{README.md,source-removal-manifest-1476.md},
+    docs/{active-active-new-connections.md, authoritative-backlog.md,
+    bugs.md, deterministic-nat-cgnat.md, fabric-bridge-tuning.md,
+    feature-gaps.md, memory.md, perf-ranked-backlog.md, phases.md,
+    refactoring-audit.md, userspace-dataplane-architecture.md,
+    userspace-dataplane-gaps.md, userspace-fabric-redirect-fix.md,
+    vpp-dataplane-assessment.md, xdp-io-uring-userspace-dataplane.md},
+    docs/next-features/{application-identification.md,
+    ha-session-ownership-and-fabric-failover.md,
+    ipv6-session-fast-path.md, pre-id-default-policy.md,
+    twice-nat.md, vsrx-fabric-fab0-fab1-syntax-compat.md}, _Log.md.
+
+## 2026-05-25 — #1529 plan v3 (Antigravity r2 build-breaker fix)
+
+- **Timestamp**: 2026-05-25T05:30:00Z
+  - **Action**: v3 plan addresses Antigravity r2 PLAN-NEEDS-MINOR.
+    The §1504 paragraph in `docs/pr/1373-retire-ebpf-dataplane/README.md`
+    is ALSO canary-pinned by
+    `TestRetirementBoundaryDocsMentionShimEscapeAssumptions`
+    (pinned string "does not recurse"). v2's proposed rewrite
+    would have broken the build. v3 defers §1504 rewrite to
+    #1527/#1528 along with §1475. Only lines 65 and 292 (not
+    canary-pinned) are edited in-place; line 65 split into two
+    sentences to fix grammar, line 292 explicitly includes the
+    `- ` bullet marker.
+  - **File(s)**: `docs/pr/1529-dpdk-docs-sweep/plan.md`, `_Log.md`
+
+## 2026-05-24 — #1529 plan v2 (Codex r1 fixes)
+
+- **Timestamp**: 2026-05-25T05:00:00Z
+  - **Action**: v2 plan addresses Codex r1 PLAN-NEEDS-MAJOR six
+    findings: non-canary-pinned DPDK text now has explicit
+    rewrites; acceptance-criterion 4 deferral now documented as
+    staged exception; EDIT row ambiguity eliminated;
+    docs/refactoring-audit.md annotate (not drop);
+    historical-classification wording clarified; git diff gate
+    uses --name-only.
+  - **File(s)**: `docs/pr/1529-dpdk-docs-sweep/plan.md`
+
+## 2026-05-24 — #1529 plan v1 drafted
+
+- **Timestamp**: 2026-05-24T17:00:00Z
+  - **Action**: Drafted plan v1 for #1529 (DPDK retirement Phase 4 —
+    broad docs sweep). Per-file disposition table covers ~42 files
+    with DPDK references. Major scope adjustment: the
+    `#1475 DPDK Backend Policy` section in
+    `docs/pr/1373-retire-ebpf-dataplane/README.md` is canary-pinned
+    by `TestRetirementBoundaryDocsMentionDPDKPolicy` and the rewrite
+    is deferred to #1527/#1528. This PR adds a leading retirement
+    note above it instead.
+  - **File(s)**: `docs/pr/1529-dpdk-docs-sweep/plan.md`, `_Log.md`
+## 2026-05-25
+
+- **Timestamp**: 2026-05-25T05:00:00Z
+  - **Action**: #1501 A2 — replaced the stale TODO + contradictory
+    doc comment on `write_outer_ipv4_udp` with an honest
+    RFC-grounded comment explaining that the engine intentionally
+    emits outer IPv4 UDP cs=0 (legal per RFC 768) and that this
+    DIFFERS from kernel WireGuard / wireguard-go which compute
+    the outer UDP checksum. Added two byte-level regression
+    assertions on `out[26..28] == [0, 0]` (one new dedicated
+    `udp_checksum_is_zero_on_ipv4_outer` test + a strengthened
+    `ipv4_checksum_is_correct`) with 0xff sentinel pre-fill so
+    the assertion proves the function wrote zero rather than
+    leaving the buffer zero-initialized. Triple-review:
+    Antigravity (round-1 PLAN-NEEDS-MINOR for sentinel pre-fill;
+    round-2 PLAN-READY) and Codex (round-1 PLAN-NEEDS-MAJOR for
+    factually-wrong "matches kernel WG" claim; round-2
+    PLAN-READY) both agreed before code touched.
+  - **File(s)**: `userspace-dp/src/afxdp/wg/outer.rs`,
+    `docs/pr/1501-a2-outer-udp-cs/plan.md`, `_Log.md`
+  - **Validation**: cargo build --release clean; cargo test
+    --release for `afxdp::wg::outer` 6/6 pass (5x flake-checked);
+    full cargo suite 1417 passed modulo two pre-existing flaky
+    tests on origin/master da103d81 baseline
+    (`snat_contract_documents_current_fail_closed_runtime`
+    fails consistently on master too;
+    `reconcile_peers_snapshot_is_atomic_under_concurrent_load`
+    is a 1-in-5 load flake on master too); `go test ./...`
+    clean; smoke on loss userspace cluster Pass A (CoS off)
+    0-retrans single-stream + 23 Gb/s 12-stream `-R`, and
+    Pass B (CoS on) 24-cell per-class shaper smoke 5201-5206 ×
+    v4+v6 × push+rev with shape rates hit cleanly.
+- **Timestamp**: 2026-05-25T05:30:00Z
+  - **Action**: Addressed Copilot's 4 nits on PR #1534 (DPDK
+    operator docs retirement, #1531). Harmonized retirement banners
+    in `docs/dataplane-decision-dpdk-vs-vpp.md` and
+    `docs/dpdk-dataplane.md` from "is being retired" to "is retired"
+    so banners and Current State sections agree. Converted bare
+    code span around `docs/vpp-dataplane-assessment.md` to a
+    proper markdown link in the Related Documents section.
+    Tightened the "underlay-NIC XSK" wording in the encrypted
+    tunnel revisit trigger to "userspace-dp's AF_XDP socket on
+    the physical NIC cannot see inner payloads of kernel-managed
+    tunnels", which avoids conflating the NIC XDP hook with the
+    AF_XDP socket. Folded the awkward "The previous header read:"
+    preamble in `docs/dpdk-dataplane.md` into a single narrative
+    paragraph describing the prior #1475 policy and noting it has
+    been superseded by #1525.
+  - **File(s)**: `docs/dataplane-decision-dpdk-vs-vpp.md`,
+    `docs/dpdk-dataplane.md`, `_Log.md`
+  - **Validation**: docs + log + userspace-dp README scope —
+    `git diff --stat origin/master..HEAD` touches `docs/` paths,
+    the root `_Log.md` action log, and `userspace-dp/README.md`
+    (the README wording fix is the only file outside `docs/`).
+    No `.go` / `.rs` / `.c` source, no build inputs, no test
+    fixtures modified.
+
 ## 2026-05-24
 
 - **Timestamp**: 2026-05-25T01:30:00Z
@@ -17,6 +248,230 @@
   - **Validation**: `go test ./pkg/conntrack/ -count=1 -race` green;
     `go vet ./pkg/conntrack/...` clean; negative-case hand-flip
     confirms canary fires.
+- **Timestamp**: 2026-05-24T06:35:00Z
+  - **Action**: PR #1531 implementation v2 — applied retirement
+    banner + Current State + reframed VPP revisit trigger +
+    [Retired] Historical block to both
+    `docs/dataplane-decision-dpdk-vs-vpp.md` and
+    `docs/dpdk-dataplane.md`; updated
+    `docs/vpp-dataplane-assessment.md` inbound-pointer header to
+    note DPDK / decision doc retirement and explicitly preserve
+    "still useful" architectural threads (encrypted-tunnel
+    reasoning + native Go VRRP decision). Then addressed Codex
+    plan-review v2 findings: (a) sharpened the VPP revisit
+    trigger in the decision doc to specify "physical NIC XDP /
+    AF_XDP hook sees only outer encrypted packets when kernel
+    WireGuard/XFRM performs crypto" plus post-crypto interface
+    hook options; (b) updated `userspace-dp/README.md` "still
+    selected ... until later cutover" wording to reflect that
+    `EffectiveType` now defaults to userspace today.
+    Historical sections kept verbatim under bold-block retired
+    banners with all original H2 headings demoted to H3 inside
+    the retired wrapper.
+  - **File(s)**: `docs/dataplane-decision-dpdk-vs-vpp.md`,
+    `docs/dpdk-dataplane.md`,
+    `docs/vpp-dataplane-assessment.md`,
+    `userspace-dp/README.md`
+
+- **Timestamp**: 2026-05-24T00:00:00Z
+  - **Action**: PR #1531 plan v1 drafted. Retire DPDK
+    recommendations in `docs/dataplane-decision-dpdk-vs-vpp.md`
+    and `docs/dpdk-dataplane.md`; rewrite both as short
+    retirement notices pointing at #1525.
+  - **File(s)**: `docs/pr/1531-dpdk-docs-retire/plan.md`
+
+## 2026-05-25 (earlier — prior PR follow-ups)
+- **Timestamp**: 2026-05-25T07:05:00Z
+  - **Action**: #1527 round-7 Copilot follow-up. Copilot review on
+    9b4e9e24 (COMMENTED, 5 inline comments) flagged two new
+    consistency nits on top of the 3 already-resolved ones:
+    (1) `pkg/dataplane/dataplane.go:160` — `NewDataPlane`'s
+    unknown-type error listed "userspace" as valid even though
+    legacy `NewDataPlane(TypeUserspace)` falls through to the
+    registry lookup and errors out; the message is now
+    `"unknown dataplane type %q (valid via NewDataPlane: ebpf; use NewRuntimeDataPlane for userspace)"`
+    with a clarifying comment;
+    (2) `pkg/daemon/daemon_ha_sync.go:684` — the "disabling all
+    RGs" log fired even when `cfg.Chassis.Cluster == nil`, which is
+    misleading. Moved it inside the cluster-cfg-non-nil branch with
+    an `rg_count` slog kv field. The neutral "fence received from
+    peer" log at line 667 stays as the unconditional entry point.
+    Both fixes are comment-only consistency nits, no behavior
+    change.
+  - **File(s)**: `pkg/dataplane/dataplane.go`,
+    `pkg/daemon/daemon_ha_sync.go`, `_Log.md`
+  - **Validation**: `go build ./...` clean; `go test
+    ./pkg/dataplane/... ./pkg/daemon/... -count=1` clean.
+
+- **Timestamp**: 2026-05-25T05:55:15Z
+  - **Action**: #1527 final Copilot re-review follow-up — resolved three
+    remaining consistency nits from the latest Copilot inline pass:
+    (1) `compiler_system.go` invalid dataplane-type guidance now
+    matches current parser acceptance (`ebpf, dpdk, userspace`);
+    (2) peer-fence logging in `daemon_ha_sync.go` now logs a neutral
+    receive message before the nil-dataplane guard and emits
+    "disabling all RGs" only when deactivation will actually run;
+    (3) plan status header in
+    `docs/pr/1527-dpdk-boot-decouple/plan.md` corrected from v3 to v4.
+    Ran focused package tests for dataplane/config/daemon.
+  - **File(s)**: `pkg/config/compiler_system.go`,
+    `pkg/daemon/daemon_ha_sync.go`,
+    `docs/pr/1527-dpdk-boot-decouple/plan.md`, `_Log.md`
+
+- **Timestamp**: 2026-05-25T06:50:00Z
+  - **Action**: #1527 reviewer re-dispatch on 878bcbdd after my
+    earlier v3 NPE-fix commit landed. Codex hostile re-review
+    (task-mpks5yrq-4h7ia5) and Antigravity adversarial re-review
+    (adversarial-review-mpks62um-g47sg4) dispatched with explicit
+    context that the OnFenceReceived NPE is now guarded at
+    daemon_ha_sync.go:676-679, and that stale docs prose is
+    intentionally deferred to Chain C #1529 — the canary test still
+    passes because every pinned token still exists in the README.
+    Copilot re-triggered via @copilot review (issue-comment
+    4531855093). Ran the full smoke matrix on the loss userspace
+    cluster after make cluster-deploy: Pass A (CoS-off) v4 push 8.81
+    Gb/s / v6 push 8.75 Gb/s / v4 reverse 8.65 Gb/s / v6 reverse 8.87
+    Gb/s / -P 12 -R v4 23.0 Gb/s / v6 22.6 Gb/s, all zero-retrans;
+    Pass B (CoS-on) 24-cell per-class matrix all shaped correctly on
+    push (100m→83/82 Mb/s, 1g→844/832 Mb/s, ..., 12g→6.54/6.37 Gb/s)
+    and reverse unshaped 7.4-8.2 Gb/s. Reviewer-ids recorded in
+    docs/pr/1527-dpdk-boot-decouple/reviewer-ids.md. Smoke posted as
+    PR comment 4531859958.
+  - **File(s)**: `docs/pr/1527-dpdk-boot-decouple/reviewer-ids.md`
+
+- **Timestamp**: 2026-05-25T06:40:00Z
+  - **Action**: #1527 v4 — Codex hostile code review v3
+    (task-mpkrwbtk-pd6nnw MERGE-NEEDS-MAJOR) and Antigravity
+    adversarial review v3 (adversarial-review-mpkrwmkk-2k24v4
+    MAJOR) both independently caught a nil-pointer crash exposed
+    by the v3 soft-fallback: `pkg/daemon/daemon_ha_sync.go:670`
+    `OnFenceReceived` callback unconditionally called
+    `d.dp.HA().SetRGActive(...)`. With `d.dp = nil` after the
+    `ErrDPDKBackendRetired` soft-fallback, the next peer-fence
+    message would panic the daemon. Pre-existing latent bug
+    (also reachable via Start() failure) but newly exposed by
+    v3's more-reachable nil-dp path. Added a `d.dp == nil`
+    early-return with structured log explaining the
+    config-only-mode rationale. Codex v3 also flagged that
+    `docs/pr/1373-retire-ebpf-dataplane/README.md` lines 64 and
+    85 contain factually stale claims about `cmd/xpfd/main.go`
+    keeping the DPDK blank import. The pinned canary tokens
+    still pass literally, but the prose now describes a
+    pre-#1527 reality. Intentionally left untouched per the
+    Chain C (#1529) scope boundary; flagged in plan v4 + PR
+    description as a Chain C TODO. Build clean, full Go test
+    suite clean.
+  - **File(s)**: `pkg/daemon/daemon_ha_sync.go`,
+    `docs/pr/1527-dpdk-boot-decouple/plan.md`
+
+- **Timestamp**: 2026-05-25T06:00:00Z
+  - **Action**: #1527 Copilot review response — Copilot flagged on
+    `47a4278c` that returning `ErrDPDKBackendRetired` at construction
+    time in `NewRuntimeDataPlane` is now fatal in
+    `pkg/daemon/daemon_run.go` (the "create dataplane" error path
+    exits the daemon), whereas a `Start()` failure falls back to
+    config-only mode with a warning. Nodes that still have a
+    persisted `set system dataplane-type dpdk` would be bricked on
+    restart even before Chain A (#1526) blocks the commit. Addressed
+    by special-casing `errors.Is(err, ErrDPDKBackendRetired)` in
+    `daemon_run.go`: log a structured warning with remediation
+    guidance, set `d.dp = nil`, and fall through to config-only mode
+    (same posture as a `Start()` failure). The hard fatal branch is
+    preserved for genuinely unknown dataplane types. No new imports
+    needed (`errors` already imported). Build clean,
+    `go test ./pkg/dataplane/... ./pkg/daemon/...` clean.
+  - **File(s)**: `pkg/daemon/daemon_run.go`
+
+- **Timestamp**: 2026-05-25T06:30:00Z
+  - **Action**: #1527 second Copilot review pass — addressed MUST FIX
+    and SHOULD FIX items from prior adversarial review: (1) Added
+    TypeDPDK panic guard to RegisterBackend and RegisterRuntimeBackend
+    so silent re-registration is immediately visible rather than
+    permanently silently unreachable. (2) Added
+    TestRegisterDPDKBackendPanics to dpdk_stub_test.go to pin the
+    panic behavior. (3) Cleaned stale DPDK references from DataPlane
+    interface docstrings (lines 185-186, 338, 341-343, 347, 381-382,
+    386). (4) Fixed compiler_system.go error string to say "valid:
+    ebpf, userspace" instead of "valid: ebpf, dpdk, userspace".
+    Build clean, go test ./pkg/dataplane/... ./pkg/daemon/...
+    ./pkg/config/... clean.
+  - **File(s)**: `pkg/dataplane/dataplane.go`,
+    `pkg/dataplane/dpdk/dpdk_stub_test.go`,
+    `pkg/config/compiler_system.go`, `_Log.md`
+
+
+## 2026-05-24
+
+- **Timestamp**: 2026-05-24T12:00:00Z
+  - **Action**: #1527 DPDK retirement Phase 2 (boot-path decouple) —
+    drafted plan v1 covering blank-import removal, init()
+    registration deletion, retirement-error returns from
+    NewDataPlane / NewRuntimeDataPlane factories, canary allowlist
+    shrink, Phase-1373 README DPDK-policy prose update, and
+    package-local test rewrite. Plan includes 8 open questions for
+    adversarial review and explicit out-of-scope list to keep
+    Chain A (#1526) and Chain C (#1528/#1529) lanes clean.
+  - **File(s)**: `docs/pr/1527-dpdk-boot-decouple/plan.md`
+
+- **Timestamp**: 2026-05-24T18:30:00Z
+  - **Action**: #1527 plan v2 — incorporated Codex hostile plan
+    review (task-mpkqsgf5-j2yag1, PLAN-NEEDS-MINOR). Three MUST-FIX
+    items applied: (1) require Chain A #1526 to land BEFORE this PR
+    (was "either order works" — Codex showed today's UX is
+    config-only fallback with slog.Warn but this PR makes the same
+    config fatal at startup); (2) dropped Change 5 docs edit — the
+    required canary tokens are already present in
+    docs/pr/1373-retire-ebpf-dataplane/README.md, so docs prose is
+    Chain C #1529 scope only; (3) acknowledged that
+    ErrDPDKBackendRetired cannot be used by pkg/config (Chain A)
+    due to dataplane->config import cycle. Also corrected
+    errDPDKBuildTagRequired claim (it's !dpdk-gated, not a
+    defense-in-depth for -tags dpdk). Antigravity PLAN-READY
+    (adversarial-review-mpkqkzkm-qfa19j) verdict preserved.
+  - **File(s)**: `docs/pr/1527-dpdk-boot-decouple/plan.md`
+
+- **Timestamp**: 2026-05-24T19:00:00Z
+  - **Action**: #1527 implementation. Removed the
+    `_ "github.com/psaab/xpf/pkg/dataplane/dpdk"` blank import
+    from cmd/xpfd/main.go. Deleted the init() block in
+    pkg/dataplane/dpdk/manager.go that registered the backend with
+    both dataplane.RegisterBackend and
+    dataplane.RegisterRuntimeBackend; replaced it with a comment
+    pointing at #1527/#1525/#1528. Added exported sentinel
+    `dataplane.ErrDPDKBackendRetired` in pkg/dataplane/dataplane.go
+    plus TypeDPDK reject arms in NewDataPlane (errors before the
+    registry fallback) and NewRuntimeDataPlane (errors after
+    EffectiveType normalization so the empty-default path stays
+    on userspace). Removed "dpdk" from the NewDataPlane
+    unknown-type error message. Shrunk dpdkBackendImportAllowlist
+    to an empty map and removed the cmd/xpfd/main.go DPDK
+    exemption from
+    TestOperatorPackagesDoNotImportBPFArtifactsDirectly. Rewrote
+    dpdk_stub_test.go's TestDPDKConstructorsRemainRegistered as
+    TestDPDKConstructorsReturnRetirementError, asserting
+    errors.Is(err, ErrDPDKBackendRetired) for both factories;
+    TestDPDKStubRequiresDPDKBuildTag retained unchanged. Per Codex
+    round-1 MUST-FIX (3): docs/pr/1373-retire-ebpf-dataplane/README.md
+    NOT touched — Chain C (#1529) scope, and the docs-token canary
+    stays green untouched. Updated legacyDataplaneImportAllowlist
+    description for cmd/xpfd/main.go to reflect post-#1527 reality
+    (cleanup only, no registration).
+  - **File(s)**: `cmd/xpfd/main.go`,
+    `pkg/dataplane/dpdk/manager.go`,
+    `pkg/dataplane/dataplane.go`,
+    `pkg/dataplane/retirement_boundary_canary_test.go`,
+    `pkg/dataplane/dpdk/dpdk_stub_test.go`
+- **Timestamp**: 2026-05-24T18:00:00Z
+  - **Action**: #1473 closeout plan. Added per-AC evidence document
+    citing the prior PRs that landed the runtime decouple (#1493,
+    #1498), the boundary canary (#1512), the link-cycle regressions
+    (#1513), and the counter rename (#1514). Marked #1473 as
+    closeout-pending in the #1373 README. No runtime code change
+    required; AC1-AC5 already proven on master at da103d81.
+  - **File(s)**: `docs/pr/1473-xdp-shim-decouple/plan.md`,
+    `docs/pr/1373-retire-ebpf-dataplane/README.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane ./pkg/dataplane/userspace`
+    targeted runs for the AC-pinned canary/regression test set.
 
 - **Timestamp**: 2026-05-25T00:45:00Z
   - **Action**: PR #1512 review follow-up — tightened the positional
@@ -62,6 +517,8 @@
     clean (114 warnings, all pre-existing); `cargo test --release
     --bin xpf-userspace-dp afxdp::wg` — 78/78 pass; `go test
     ./pkg/dataplane/...` — 4/4 packages pass.
+
+## 2026-05-24
 
 - **Timestamp**: 2026-05-24T23:30:00Z
   - **Action**: PR #1499 r-final-5 step 4 — final mechanical sweep
@@ -1783,3 +2240,43 @@
   the prior matcher missed. Added two case arms to isLegacyDataPlaneType to
   recursively unwrap each.
 - **Validation**: canary still passes on current pkg/conntrack/ production tree.
+- **Timestamp**: 2026-05-25T05:58Z
+- **Action**: PR #1536 — add ErrDPDKDataplaneRetired sentinel + errors.Is test (AGY round-N feedback)
+- **File(s)**: pkg/config/compiler.go, pkg/config/parser_ast_test.go
+- **Why**: Antigravity adversarial-review-mpksjr0e-f3mjrn flagged the lack of a
+  structured sentinel error as an API design gap. External consumers (gRPC
+  orchestration, REST wrappers, CLI tooling) cannot programmatically match
+  the DPDK retirement reject without substring-searching the error text.
+  Adding `var ErrDPDKDataplaneRetired = errors.New(...)` and returning it
+  from validateDataplaneTypeStrict preserves the verbatim message contract
+  (existing tests still pass via strings.Contains) and adds programmatic
+  matching via errors.Is. Mirrors the runtime-side
+  dataplane.ErrDPDKBackendRetired sentinel introduced by #1527 / PR #1535.
+- **Validation**: TestDPDKConfigCompileRejects extended with errors.Is
+  assertion; full pkg/config + pkg/configstore suites green.
+- **Timestamp**: 2026-05-25T05:41:23Z
+  - **Action**: Review fix (#1529) — inline DPDK annotation pass on
+    `docs/feature-gaps.md`. The initial sweep used a blanket header
+    note to cover all table rows, but several "Done" status cells still
+    contained present-tense DPDK language that implies the backend is
+    an active target. Fixed inline: line 169 (Twice NAT — "across eBPF,
+    DPDK, and userspace"), line 173 (Port Randomization — "XDP and DPDK
+    SNAT allocators"), lines 203/205 (TCP No-SYN-Check / TCP RST —
+    "eBPF + DPDK"), line 315 (Dual Fabric — "DPDK still lacks...parity"),
+    line 326 (Policer), line 327 (Three-Color Policer), line 407 (system
+    caps listing "DPDK config"), line 442 (policer tier list), line 516
+    (policer section). No source code changed; pure doc fixes.
+  - **File(s)**: `docs/feature-gaps.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/... -run 'TestRetirementBoundary|TestLegacyBPF' -count=1`
+- **Timestamp**: 2026-05-25T06:20Z
+- **Action**: Harmonize ErrDPDKBackendRetired + slog.Warn wording with config sentinel (AGY #1536 review finding)
+- **File(s)**: pkg/dataplane/dataplane.go, pkg/daemon/daemon_run.go
+- **Why**: Antigravity adversarial-review-mpksyrj1-f1mid9 (against #1536) noted a
+  cross-PR consistency gap: the config-time sentinel ErrDPDKDataplaneRetired
+  starts with "the DPDK..." while the runtime-time ErrDPDKBackendRetired (this
+  PR) starts with "DPDK..." (no leading article). errors.Is matching is
+  unaffected but log monitoring tools using exact string matches across both
+  layers would mismatch. Aligned both the sentinel and the daemon_run.go
+  slog.Warn wording to "the DPDK dataplane backend has been retired".
+- **Validation**: pkg/dataplane test suite green; no other in-tree strings
+  pinned the old wording.

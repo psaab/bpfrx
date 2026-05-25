@@ -23,7 +23,7 @@ The open Twice NAT parity work is:
 
 - no explicit end-to-end validation that one flow can hit DNAT and SNAT together on supported dataplanes
 - no HA/failover validation proving both NAT legs survive session sync and failover
-- no support matrix spelling out whether eBPF, userspace AF_XDP, and DPDK all have the same combined-NAT behavior
+- no support matrix spelling out whether eBPF and userspace AF_XDP have the same combined-NAT behavior (DPDK retired #1525)
 - feature-gap docs still describe Twice NAT as if the combined path were mostly hypothetical
 
 ## Proposed implementation scope
@@ -57,7 +57,7 @@ Add failover coverage proving that:
 ### 4. Audit dataplane parity
 Make the support statement explicit:
 
-- if eBPF, userspace AF_XDP, and DPDK all support Twice NAT, document that and test each path
+- if eBPF and userspace AF_XDP support Twice NAT, document that and test each path (DPDK retired #1525)
 - if support is intentionally narrower, say so directly and scope the feature-gap row to the supported dataplanes
 
 ### 5. Update public gap tracking

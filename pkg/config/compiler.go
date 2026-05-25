@@ -1,11 +1,27 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
 )
+
+// ErrDPDKDataplaneRetired is the sentinel error returned at commit
+// time when a configuration sets `system dataplane-type dpdk`. External
+// API consumers (gRPC orchestration, REST wrappers, CLI tooling) can
+// match this with errors.Is rather than substring-searching the wrapped
+// error text. The wrapped form is preserved verbatim so the operator-
+// facing migration message remains stable; see #1525.
+//
+// Mirrors the runtime-side dataplane.ErrDPDKBackendRetired sentinel
+// introduced by #1527 so the config-time and runtime layers both expose
+// structured rejections.
+var ErrDPDKDataplaneRetired = errors.New(
+	"the DPDK dataplane backend has been retired; " +
+		"use 'set system dataplane-type userspace' " +
+		"(see #1525)")
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
 // It clones the tree before expansion so the original tree is not mutated.
@@ -215,6 +231,16 @@ func compileExpanded(tree *ConfigTree) (*Config, error) {
 		}
 	}
 
+	// #1526 — reject retired dataplane backends at commit time.
+	// Placed BEFORE the other strict validators so that an operator
+	// editing a candidate that has BOTH a retired dataplane-type and
+	// an unrelated structural error (CoS, policers, scheduler-map)
+	// sees the migration message first. The retirement is the
+	// documented migration path; the other errors only become
+	// actionable after migration.
+	if err := validateDataplaneTypeStrict(cfg); err != nil {
+		return nil, err
+	}
 	if err := validateClassOfServiceStrict(cfg.ClassOfService); err != nil {
 		return nil, err
 	}
@@ -271,6 +297,31 @@ func validateThreeColorPolicersStrict(policers map[string]*ThreeColorPolicerConf
 				return fmt.Errorf("firewall three-color-policer %q peak-burst-size must be >= committed-burst-size", displayName)
 			}
 		}
+	}
+	return nil
+}
+
+// validateDataplaneTypeStrict rejects retired dataplane backends at
+// commit time. The parse path accepts `dataplane-type dpdk` as a
+// legal known value (see compileSystemDataplaneType +
+// validDataplaneType) so that `load merge` / `load override` of a
+// pre-retirement config does not syntax-error; this strict validator
+// is what tells the operator to migrate.
+//
+// Acceptance criterion in #1526 pins the verbatim message:
+//
+//	"the DPDK dataplane backend has been retired; use 'set system dataplane-type userspace' (see #1525)"
+//
+// Tests substring-match the phrase so the same assertion holds
+// whether the error is observed via `CompileConfig` directly,
+// via `Store.CommitCheck()` (which returns the raw error), or via
+// `Store.Commit()` (which wraps it as "commit check failed: ...").
+func validateDataplaneTypeStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	if cfg.System.DataplaneType == dataplaneTypeDPDK {
+		return ErrDPDKDataplaneRetired
 	}
 	return nil
 }

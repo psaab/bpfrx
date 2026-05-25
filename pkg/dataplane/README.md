@@ -10,8 +10,9 @@ config from `pkg/config` into BPF-map entries (zones, policies, NAT,
 filters, applications), attaches the 14 BPF programs (9 XDP + 5 TC), and
 exposes session iteration to GC, the CLI, and the metrics surface.
 
-Pluggable: eBPF/DPDK legacy backends register through `RegisterBackend` for
-the old `DataPlane` surface. Runtime backends register through
+Pluggable: the legacy eBPF backend registers through `RegisterBackend` for
+the old `DataPlane` surface (DPDK retired #1525; removed in #1527/#1528).
+Runtime backends register through
 `RegisterRuntimeBackend`; the daemon uses `NewRuntimeDataPlane` so userspace
 AF_XDP starts through the runtime path. During the #1381 migration, the
 userspace runtime constructor returns `LegacyDataPlaneAdapter`: the userspace
@@ -19,13 +20,13 @@ userspace runtime constructor returns `LegacyDataPlaneAdapter`: the userspace
 daemon status, CLI, and cluster-sync callers that have not moved to domain
 interfaces still receive a temporary compatibility handle.
 
-#1475 policy: DPDK is retained as a separately supported DPDK-build backend,
-but it is outside the eBPF source-removal path until it migrates off the root
-`DataPlane` interface. Its legacy bridge must stay inside
-`pkg/dataplane/dpdk`; the only production import outside that package is the
-blank registration import in `cmd/xpfd/main.go`. Non-`-tags dpdk` binaries keep
-the package compiling but fail DPDK startup explicitly instead of running a
-no-op stub.
+DPDK retirement (#1525): the historical #1475 policy that retained DPDK as
+a separately supported DPDK-build backend applied pre-retirement; the
+`pkg/dataplane/dpdk` bridge, the `cmd/xpfd/main.go` blank registration
+import, and the canary allowlist entries are removed in #1527/#1528. Until
+those PRs land, the canary-pinned `#1475 DPDK Backend Policy` section in
+[`docs/pr/1373-retire-ebpf-dataplane/README.md`](../../docs/pr/1373-retire-ebpf-dataplane/README.md)
+preserves the pre-retirement contract verbatim as a historical anchor.
 
 The userspace backend's status wire format is mirrored here for CLI/API
 consumers. CoS queue status includes queue-scoped drain-phase counters so
@@ -35,11 +36,10 @@ sent while exact queues were still backlogged.
 ## Entry points
 
 - `DataPlane` — `dataplane.go`. Legacy BPF-shaped interface kept for the
-  eBPF/DPDK compiler and compatibility adapters. New daemon-facing code should
-  not add methods here.
-- `pkg/dataplane/dpdk.Manager` — DPDK implementation. It currently satisfies
-  both `DataPlane` and `RuntimeDataPlane`; that is the #1475 backend-local
-  exception and not a template for new runtime code.
+  legacy eBPF compiler and compatibility adapters (DPDK retired #1525). New
+  daemon-facing code should not add methods here.
+- ~~`pkg/dataplane/dpdk.Manager` — DPDK implementation.~~ Retired in #1525;
+  the `pkg/dataplane/dpdk` package is deleted in #1528.
 - `RuntimeDataPlane`, `ConfigSink`, `SessionStore`, `Telemetry`,
   `HAController`, and `LinkController` — `apply.go` and `session_store.go`.
   These are the split-domain interfaces used by daemon startup and runtime

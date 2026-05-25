@@ -23,9 +23,9 @@ The current xpf HA architecture is still single-fabric in core transport/data-pl
   - `pkg/cli/cli.go` and `pkg/grpcapi/server.go` populate a single fabric field.
 - eBPF fabric forwarding state is single-entry:
   - `bpf/headers/xpf_maps.h` `fabric_fwd` map has `max_entries = 1`.
-- DPDK parity is single-fabric:
-  - `dpdk_worker/shared_mem.h` has one `fabric_port_id`.
-  - `pkg/dataplane/dpdk/dpdk_cgo.go` updates a single `fabric_port_id`.
+- ~~DPDK parity is single-fabric:~~ (DPDK retired #1525)
+  - ~~`dpdk_worker/shared_mem.h` has one `fabric_port_id`.~~
+  - ~~`pkg/dataplane/dpdk/dpdk_cgo.go` updates a single `fabric_port_id`.~~
 - Bond behavior is inconsistent:
   - networkd generation uses `active-backup` in `pkg/dataplane/compiler.go`.
   - netlink runtime bond creation uses `802.3ad` in `pkg/routing/routing.go`.
@@ -51,7 +51,7 @@ The current xpf HA architecture is still single-fabric in core transport/data-pl
 - Replace single `fabric_fwd` state with multi-link state:
   - eBPF map keyed per fabric link (or keyed by ifindex),
   - anti-loop validation accepts known fabric ingress set, not one ifindex.
-- DPDK shared memory should hold multiple fabric ports (array/bitmap), not one `fabric_port_id`.
+- ~~DPDK shared memory should hold multiple fabric ports (array/bitmap), not one `fabric_port_id`.~~ (DPDK retired #1525)
 
 ### 4) CLI/Operational Parity
 
@@ -77,4 +77,4 @@ The current xpf HA architecture is still single-fabric in core transport/data-pl
 - A `vsrx.conf`-style HA config with both `fab0` and `fab1` parses and compiles without custom-only transport fields.
 - Session/config sync survives loss of one fabric link with no cluster split.
 - `show chassis cluster interfaces` shows both fabric links and correct link status.
-- eBPF and DPDK both validate/redirect using either fabric link.
+- eBPF validates/redirects using either fabric link (DPDK retired #1525).

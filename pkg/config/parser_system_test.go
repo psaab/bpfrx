@@ -1422,7 +1422,12 @@ func TestDataplaneTypeExplicitEBPFWarnsDeprecatedCompatibility(t *testing.T) {
 }
 
 func TestDataplaneTypeNonLegacyValuesDoNotWarnDeprecatedCompatibility(t *testing.T) {
-	for _, dataplaneType := range []string{"userspace", "dpdk"} {
+	// `dpdk` was previously included in this loop; it now hard-errors
+	// at compile time via the #1526 retirement reject, so it cannot
+	// reach the deprecated-eBPF warning surface. The DPDK rejection
+	// is covered by TestDPDKConfigCompileRejects and by the dedicated
+	// retirement tests in parser_ast_test.go.
+	for _, dataplaneType := range []string{"userspace"} {
 		t.Run(dataplaneType, func(t *testing.T) {
 			tree := &ConfigTree{}
 			cmd := "set system dataplane-type " + dataplaneType

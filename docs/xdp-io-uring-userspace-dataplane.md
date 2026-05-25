@@ -2,6 +2,11 @@
 
 Date: 2026-03-06
 
+> [!IMPORTANT]
+> DPDK dataplane retired in #1525. References below comparing xpf
+> against "the DPDK backend" describe the pre-retirement state. The
+> userspace AF_XDP dataplane is the production target.
+
 Note: This is an architecture exploration document. It is intentionally grounded in
 xpf's current XDP/TC, HA, and `pkg/dataplane.DataPlane` model.
 
@@ -1054,7 +1059,7 @@ If this path is pursued, the working plan should be:
 1. Do we want AF_XDP only for native-XDP-capable NICs, with eBPF/TC retained elsewhere?
 2. Do we want a kernel slow path via TUN/TAP, or strict fail-closed on unresolved neighbors/local exceptions?
 3. Should session sync read worker-local delta rings directly, or aggregate through a single native dataplane manager thread?
-4. If this path is pursued, is it still worth carrying both this and the DPDK backend long-term?
+4. ~~If this path is pursued, is it still worth carrying both this and the DPDK backend long-term?~~ — resolved: DPDK retired in #1525, only userspace AF_XDP carries forward.
 
 ## Bottom Line
 

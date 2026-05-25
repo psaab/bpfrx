@@ -324,7 +324,7 @@ To deploy to a single node: `make cluster-deploy NODE=0` or `make cluster-deploy
 
 | Path | Description |
 |------|-------------|
-| `bpf/headers/*.h` | Shared constants and C structs retained until userspace/DPDK replacements exist |
+| `bpf/headers/*.h` | Shared constants and C structs retained until userspace replacements exist (DPDK retired #1525) |
 | `bpf/xdp/*.c` | Legacy XDP ingress programs pending #1476 source removal |
 | `bpf/tc/*.c` | Legacy TC egress programs pending #1476 source removal |
 | `pkg/config/` | Junos parser, AST, typed config, compiler |
