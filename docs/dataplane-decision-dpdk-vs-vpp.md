@@ -1,10 +1,73 @@
 # Dataplane Decision: DPDK vs VPP
 
+> **Status: Retired.** The DPDK dataplane is being retired under
+> umbrella issue #1525. The userspace AF_XDP dataplane
+> (`userspace-dp/`) is the primary/default backend. Migrate with
+> `set system dataplane-type userspace`, or simply omit
+> `system dataplane-type` (userspace is the default). See
+> [`userspace-dp/README.md`](../userspace-dp/README.md) for the
+> active design.
+
+## Current State (2026-05)
+
+- DPDK is retired under #1525. There is no in-tree dataplane
+  competition between DPDK and VPP today; the userspace AF_XDP
+  dataplane (`userspace-dp/`) is the primary/default backend, and
+  the legacy eBPF dataplane is being retired in parallel under
+  #1373.
+- The DPDK source under `dpdk_worker/` and `pkg/dataplane/dpdk/`
+  remains in-tree until Phase 3 of #1525 deletes it. Commit-time
+  rejection of `set system dataplane-type dpdk` lands in Phase 1
+  (#1526). Builds with `-tags dpdk` are not supported for
+  production.
+- VPP was never implemented in xpf. There is no current plan to
+  add a VPP backend. If one becomes interesting in the future, a
+  fresh decision document will be filed at that time; the section
+  below captures the trigger we would use to make that call.
+
+## Revisit Trigger for VPP
+
+Re-open VPP assessment if all are true:
+
+- Encrypted tunnel (IPsec / WireGuard) throughput becomes a
+  primary product driver. The physical NIC XDP / AF_XDP hook
+  sees only the outer encrypted packets when kernel
+  WireGuard/XFRM performs crypto, so the underlay-NIC XSK cannot
+  inspect inner payloads of kernel-managed IPsec or WireGuard
+  tunnels directly. xpf can still hook decrypted traffic via TC
+  BPF on the post-crypto interface (e.g. `wgN` or an XFRM
+  interface), or via XDP on a veth on the decrypted side, but
+  both add per-packet cost relative to VPP's userspace-crypto
+  pipeline. VPP terminates crypto in userspace and avoids the
+  underlay/inner-packet split entirely.
+- Throughput goals materially exceed what the userspace AF_XDP
+  backend can deliver on target hardware.
+- Team is willing to own VPP integration and long-term plugin /
+  API maintenance.
+
+## Related (Active) Documents
+
+- Active userspace dataplane design:
+  [`userspace-dp/README.md`](../userspace-dp/README.md).
+- Retirement umbrella: #1525.
+- VPP architectural reference (kept as historical analysis, not
+  current direction): `docs/vpp-dataplane-assessment.md`.
+
+---
+
+## [Retired] Historical Decision
+
+> **Retired** — preserved for reference only. The text below was
+> the active decision as of 2026-03-02 when DPDK was a live
+> in-tree backend candidate. It does NOT reflect current
+> direction. The DPDK dataplane is retired under #1525; see the
+> banner at the top of this file for the active path.
+
 Date: 2026-03-02
-Status: Active
+Status: Active (at the time)
 Scope: xpf dataplane strategy
 
-## Decision Summary
+### Decision Summary
 
 For this project today, **DPDK is the better next dataplane path than VPP**.
 
@@ -16,12 +79,12 @@ Why:
 When VPP could become better:
 - If product direction prioritizes very high-end encrypted throughput (especially IPsec/WireGuard) at 40/100G scale over short-term delivery and architectural continuity.
 
-## Current Repo Reality
+### Current Repo Reality
 
-### eBPF/XDP-TC path (primary)
+#### eBPF/XDP-TC path (primary)
 - Production path with broad feature coverage and HA behavior implemented around existing xpf design.
 
-### DPDK path (secondary backend, in-tree)
+#### DPDK path (secondary backend, in-tree)
 - Implemented worker pipeline in C (`parse -> filter -> screen -> zone -> conntrack -> policy -> nat -> nat64 -> forward`).
 - Go backend exists and is wired through `dataplane.DataPlane`.
 - DPDK worker builds cleanly with current tree.
@@ -35,11 +98,11 @@ Known DPDK gaps visible in code:
 - `pkg/dataplane/dpdk/fib.go`
   - ifindex -> DPDK `port_id` mapping still TODO
 
-### VPP path
+#### VPP path
 - No in-tree VPP dataplane implementation exists.
 - Existing assessment doc is extensive, but implementation would still start from zero in this repo.
 
-## What Matters Most for xpf
+### What Matters Most for xpf
 
 1. Preserve Junos-like behavior:
 - Zone-pair policy semantics, NAT behavior, screens, session model, CLI/runtime parity.
@@ -55,9 +118,9 @@ Known DPDK gaps visible in code:
 
 DPDK aligns better with these constraints than VPP right now.
 
-## Option Comparison
+### Option Comparison
 
-### Option A: Continue DPDK backend evolution (recommended)
+#### Option A: Continue DPDK backend evolution (recommended)
 
 Pros:
 - Reuses existing xpf pipeline model and compiler outputs.
@@ -73,7 +136,7 @@ Cons:
 Effort profile:
 - Incremental and bounded; most work is finishing known TODOs and behavior parity.
 
-### Option B: Build VPP backend now (not recommended now)
+#### Option B: Build VPP backend now (not recommended now)
 
 Pros:
 - Strong high-end packet processing and mature routing dataplane framework.
@@ -88,22 +151,22 @@ Cons:
 Effort profile:
 - Multi-phase rewrite/integration project with significant validation burden.
 
-## Recommendation
+### Recommendation
 
-### Primary recommendation
+#### Primary recommendation
 - **Invest in completing and hardening the DPDK backend first.**
 
-### Explicit non-recommendation (for now)
+#### Explicit non-recommendation (for now)
 - Do **not** start a full VPP dataplane migration now.
 
-### Revisit trigger for VPP
+#### Revisit trigger for VPP
 Re-open VPP if all are true:
 - DPDK backend is functionally complete/parity-acceptable.
 - Throughput goals materially exceed what eBPF+DPDK path can deliver on target hardware.
 - Encrypted tunnel throughput becomes a primary product driver.
 - Team is willing to own VPP integration and long-term plugin/API maintenance.
 
-## Execution Plan (DPDK-first)
+### Execution Plan (DPDK-first)
 
 1. Close known DPDK functional gaps:
 - Implement app range support
@@ -121,9 +184,11 @@ Re-open VPP if all are true:
 4. Only after 1-3:
 - Decide whether VPP is still needed for next performance envelope.
 
-## Related Docs
+### Related Docs (as written 2026-03-02; some are now retired)
 
-- DPDK architecture plan: `docs/dpdk-dataplane.md`
-- VPP assessment: `docs/vpp-dataplane-assessment.md`
-- Performance context: `docs/optimizations.md`
-- HA behavior context: `docs/active-active-new-connections.md`
+- DPDK architecture plan: `docs/dpdk-dataplane.md` (now retired —
+  see retirement banner at top of that file).
+- VPP assessment: `docs/vpp-dataplane-assessment.md` (kept as
+  historical analysis; not current direction).
+- Performance context: `docs/optimizations.md`.
+- HA behavior context: `docs/active-active-new-connections.md`.

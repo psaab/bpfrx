@@ -1,21 +1,64 @@
 # DPDK Dataplane for xpf — Architecture Plan
 
-Note: This is an architecture/planning document. For the current project-level
-decision and recommendation between DPDK and VPP, see
-`docs/dataplane-decision-dpdk-vs-vpp.md`.
+> **Status: Retired.** This document was an architecture plan for
+> a DPDK-based xpf dataplane. The DPDK dataplane is being retired
+> under umbrella issue #1525. The userspace AF_XDP dataplane
+> (`userspace-dp/`) is the primary/default backend. Migrate with
+> `set system dataplane-type userspace`, or simply omit
+> `system dataplane-type` (userspace is the default). See
+> [`userspace-dp/README.md`](../userspace-dp/README.md) for the
+> active design.
 
-Current #1475 policy: DPDK remains a separately supported backend for binaries
-built with `-tags dpdk`, but it is outside the #1373 eBPF source-removal path
-until it migrates off the root `dataplane.DataPlane` interface. The legacy
-bridge is confined to `pkg/dataplane/dpdk`, with only the blank registration
-import in `cmd/xpfd/main.go` outside that package. Non-DPDK builds reject DPDK
-startup explicitly instead of running a no-op stub.
+## Current State (2026-05)
 
-## Overview
+- DPDK is retired under #1525. The userspace AF_XDP dataplane
+  (`userspace-dp/`) is the primary/default backend, and the legacy
+  eBPF dataplane is being retired in parallel under #1373.
+- The DPDK source under `dpdk_worker/` and `pkg/dataplane/dpdk/`
+  remains in-tree until Phase 3 of #1525 deletes it. Builds with
+  `-tags dpdk` are not supported for production.
+- Commit-time rejection of `set system dataplane-type dpdk` lands
+  in Phase 1 (#1526). Operators should migrate with
+  `set system dataplane-type userspace`, or simply omit
+  `system dataplane-type` entirely (userspace is the default).
+- For the project-level retirement context, see
+  [`docs/dataplane-decision-dpdk-vs-vpp.md`](dataplane-decision-dpdk-vs-vpp.md)
+  (also carrying a retirement banner).
+
+The architecture material below is preserved verbatim for
+reference only — it describes a code path that is being removed
+and does not reflect current direction.
+
+---
+
+## [Retired] Historical Design Details
+
+> **Retired** — preserved for reference only. The text below was
+> the active architecture plan when DPDK was a live in-tree
+> backend candidate. It does NOT reflect current direction. The
+> DPDK dataplane is retired under #1525; see the banner at the
+> top of this file for the active path.
+
+The previous header read:
+
+> Note: This is an architecture/planning document. For the current
+> project-level decision and recommendation between DPDK and VPP,
+> see `docs/dataplane-decision-dpdk-vs-vpp.md`.
+>
+> Current #1475 policy: DPDK remains a separately supported
+> backend for binaries built with `-tags dpdk`, but it is outside
+> the #1373 eBPF source-removal path until it migrates off the
+> root `dataplane.DataPlane` interface. The legacy bridge is
+> confined to `pkg/dataplane/dpdk`, with only the blank
+> registration import in `cmd/xpfd/main.go` outside that package.
+> Non-DPDK builds reject DPDK startup explicitly instead of
+> running a no-op stub.
+
+### Overview
 
 Add a DPDK-based dataplane as an alternative to the current XDP/TC eBPF pipeline. The existing `pkg/dataplane.Manager` API is already well-abstracted — the daemon, CLI, gRPC, config system, and all subsystems interact through this interface, not through BPF-specific code. A DPDK implementation would swap the packet processing engine while keeping everything else unchanged.
 
-## Why DPDK?
+### Why DPDK?
 
 | | XDP/TC (current) | DPDK (proposed) |
 |---|---|---|
@@ -30,9 +73,9 @@ Add a DPDK-based dataplane as an alternative to the current XDP/TC eBPF pipeline
 
 **Target use case:** High-throughput deployments (40G/100G NICs) where dedicating CPU cores to packet processing is acceptable. An interrupt-driven mode is also available for power-sensitive deployments.
 
-## Architecture
+### Architecture
 
-### Current Architecture (XDP/TC)
+#### Current Architecture (XDP/TC)
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -67,7 +110,7 @@ Add a DPDK-based dataplane as an alternative to the current XDP/TC eBPF pipeline
     └─────────────────────────────────┘
 ```
 
-### Proposed Architecture (DPDK)
+#### Proposed Architecture (DPDK)
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -106,9 +149,9 @@ Add a DPDK-based dataplane as an alternative to the current XDP/TC eBPF pipeline
                               └───────────┘
 ```
 
-## Implementation Plan
+### Implementation Plan
 
-### Phase 1: Define Manager Interface (Go)
+#### Phase 1: Define Manager Interface (Go)
 
 Extract an interface from the current concrete `Manager` struct. All existing callers already use it as a concrete type, so this is a refactoring step.
 
@@ -167,7 +210,7 @@ type DataPlane interface {
 
 **Estimated effort:** 1-2 days. Mechanical refactoring, no behavior change.
 
-### Phase 2: DPDK Worker Process (C)
+#### Phase 2: DPDK Worker Process (C)
 
 Write the DPDK packet processing pipeline in C (or Rust). This replicates the 14 BPF programs as userspace functions.
 
@@ -267,7 +310,7 @@ drop:
 
 **Estimated effort:** 3-4 weeks. This is the bulk of the work — replicating all packet processing logic.
 
-### Phase 3: Go ↔ DPDK Communication
+#### Phase 3: Go ↔ DPDK Communication
 
 The Go control plane needs to update DPDK data structures (zones, policies, sessions) and read counters/sessions back.
 
@@ -343,7 +386,7 @@ func (m *DPDKManager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routing
 
 **Estimated effort:** 2-3 weeks. CGo wrappers for all map operations + shared memory setup.
 
-### Phase 4: Go DPDKManager Implementation
+#### Phase 4: Go DPDKManager Implementation
 
 Implement the `DataPlane` interface for DPDK.
 
@@ -401,7 +444,7 @@ func (m *DPDKManager) AttachXDP(ifindex int, forceGeneric bool) error {
 
 **Estimated effort:** 2 weeks. Most logic from compiler.go can be shared; only the "write to map" calls change.
 
-### Phase 5: Build System & Configuration
+#### Phase 5: Build System & Configuration
 
 ```go
 // cmd/xpfd/main.go
@@ -455,9 +498,9 @@ build-ebpf:
 
 **Estimated effort:** 1 week.
 
-## Data Structure Replication Details
+### Data Structure Replication Details
 
-### Session Table
+#### Session Table
 
 BPF: `HASH` with `SessionKey` → `SessionValue` (40 + 120 bytes)
 
@@ -476,7 +519,7 @@ struct rte_hash_parameters session_params = {
 
 **Lock-free update:** DPDK `rte_hash` supports RCU-based lock-free readers with `RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF`. Worker threads read without locks; Go control plane writes with RCU protection.
 
-### LPM Trie (Address Book)
+#### LPM Trie (Address Book)
 
 BPF: `LPM_TRIE` with `(prefixLen, IP)` → `addressID`
 
@@ -490,7 +533,7 @@ struct rte_lpm_config lpm_cfg = {
 struct rte_lpm *addr_book_v4 = rte_lpm_create("addr_v4", SOCKET_ID_ANY, &lpm_cfg);
 ```
 
-### Counters
+#### Counters
 
 BPF: `PERCPU_ARRAY` — kernel maintains per-CPU copies
 
@@ -510,16 +553,16 @@ void aggregate_counters(uint32_t policy_id, uint64_t *packets, uint64_t *bytes) 
 }
 ```
 
-## Challenges & Mitigations
+### Challenges & Mitigations
 
-### 1. NIC Ownership
+#### 1. NIC Ownership
 **Problem:** DPDK takes exclusive ownership of NIC ports via VFIO/UIO. The kernel loses visibility.
 **Mitigation:**
 - Management interface (mgmt0) stays in kernel (not bound to DPDK)
 - KNI (Kernel NIC Interface) or virtio-user for control plane traffic
 - Or use bifurcated driver (mlx5) that shares NIC between kernel and DPDK
 
-### 2. Kernel Routing Integration
+#### 2. Kernel Routing Integration
 **Problem:** FRR manages routes via kernel; DPDK bypasses kernel networking.
 **Mitigation:**
 - Read FIB from FRR JSON API (already done for `show route detail`)
@@ -527,7 +570,7 @@ void aggregate_counters(uint32_t policy_id, uint64_t *packets, uint64_t *bytes) 
 - Or use `rte_fib` for longest-prefix-match forwarding
 - FRR route changes → notification → update DPDK FIB
 
-### 3. ARP/ND Resolution
+#### 3. ARP/ND Resolution
 **Problem:** Kernel ARP won't work for DPDK-owned interfaces.
 **Mitigation:**
 - Implement ARP responder in DPDK worker (answer ARP requests)
@@ -535,20 +578,20 @@ void aggregate_counters(uint32_t policy_id, uint64_t *packets, uint64_t *bytes) 
 - Go control plane can populate static entries
 - Or use KNI to punt ARP to kernel
 
-### 4. Host-Inbound Services (SSH, DHCP, DNS)
+#### 4. Host-Inbound Services (SSH, DHCP, DNS)
 **Problem:** Traffic destined to the firewall itself needs to reach kernel stack.
 **Mitigation:**
 - KNI interface: DPDK → kernel for host-inbound
 - Or virtio-user pair: DPDK writes to virtio-user → kernel picks up
 - Filter in DPDK: if dest_ip == self → punt to kernel via KNI
 
-### 5. VLAN Handling
+#### 5. VLAN Handling
 **Problem:** DPDK doesn't use kernel VLAN sub-interfaces.
 **Mitigation:**
 - Handle VLAN tag/untag in DPDK pipeline (already done in BPF)
 - Map VLAN IDs to logical interfaces in userspace
 
-### 6. Hitless Restart
+#### 6. Hitless Restart
 **Problem:** DPDK process restart loses all NIC state.
 **Mitigation:**
 - Use hugepage-backed shared memory (survives process restart)
@@ -557,7 +600,7 @@ void aggregate_counters(uint32_t policy_id, uint64_t *packets, uint64_t *bytes) 
 - Brief packet loss during worker restart (unavoidable)
 - Or use hot-standby: start new worker before killing old one
 
-### 7. CGo Overhead
+#### 7. CGo Overhead
 **Problem:** CGo calls have ~100ns overhead per call.
 **Mitigation:**
 - Batch operations: write many map entries in single CGo call
@@ -565,11 +608,11 @@ void aggregate_counters(uint32_t policy_id, uint64_t *packets, uint64_t *bytes) 
 - Session iteration: C-side filtering, return matching subset
 - Config compilation: batch all writes, single CGo "apply" call
 
-## Power Management: Interrupt-Driven Mode
+### Power Management: Interrupt-Driven Mode
 
 Pure poll-mode DPDK burns 100% CPU on dedicated cores even with zero traffic. This is unacceptable for branch/edge deployments, VMs, or any environment where power efficiency matters. xpf supports three RX modes that trade latency for power.
 
-### Three RX Modes
+#### Three RX Modes
 
 ```
 system {
@@ -587,7 +630,7 @@ system {
 | **interrupt** | ~0% per core | Scales with load | 5-50µs (interrupt coalescing) | Edge, branch, VM |
 | **adaptive** | ~0% idle → 100% busy | 100% at threshold | 0-50µs (dynamic) | General purpose |
 
-### Interrupt-Driven Mode (`rx-mode interrupt`)
+#### Interrupt-Driven Mode (`rx-mode interrupt`)
 
 Uses DPDK's `rte_eth_dev_rx_intr_*` API to sleep on an epoll fd until the NIC signals new packets.
 
@@ -639,7 +682,7 @@ ethtool -C enp3s0 rx-usecs 50 rx-frames 64
 -a 0000:03:00.0,rx_intr_thresh=64
 ```
 
-### Adaptive Mode (`rx-mode adaptive`)
+#### Adaptive Mode (`rx-mode adaptive`)
 
 Dynamically switches between poll and interrupt based on traffic load. This gives poll-mode performance under load and interrupt-mode efficiency at idle.
 
@@ -708,7 +751,7 @@ system {
 }
 ```
 
-### Power States and CPU Frequency
+#### Power States and CPU Frequency
 
 In interrupt mode, the core genuinely sleeps (enters C-state). Combined with CPU frequency scaling:
 
@@ -738,7 +781,7 @@ DPDK's `rte_power` library integrates with Linux cpufreq governors (intel_pstate
 - Frequency drops to minimum P-state
 - Wake-up latency: 10-100µs depending on C-state depth
 
-### Hybrid Multi-Core: Mixed Modes
+#### Hybrid Multi-Core: Mixed Modes
 
 For deployments with asymmetric traffic (e.g., WAN at 10G, LAN at 1G), different cores can run different modes:
 
@@ -762,7 +805,7 @@ system {
 }
 ```
 
-### Power Monitoring
+#### Power Monitoring
 
 Expose power state in operational commands:
 
@@ -777,7 +820,7 @@ show system dataplane power
   Estimated power savings vs pure poll: ~45%
 ```
 
-### Implementation in Worker
+#### Implementation in Worker
 
 The RX mode is selected at startup and can be changed at runtime via shared memory flag:
 
@@ -809,7 +852,7 @@ lcore_main(void *arg)
 }
 ```
 
-### Comparison with XDP
+#### Comparison with XDP
 
 | | XDP (current) | DPDK Poll | DPDK Interrupt | DPDK Adaptive |
 |---|---|---|---|---|
@@ -822,7 +865,7 @@ lcore_main(void *arg)
 
 The interrupt and adaptive modes make DPDK viable for the same environments where XDP currently runs — without the 100% CPU penalty. Adaptive mode is the recommended default for most deployments.
 
-## Estimated Timeline
+### Estimated Timeline
 
 | Phase | Description | Effort | Dependencies |
 |-------|-------------|--------|-------------|
@@ -834,7 +877,7 @@ The interrupt and adaptive modes make DPDK viable for the same environments wher
 | 6 | Testing + optimization | 2-3 weeks | All phases |
 | **Total** | | **10-14 weeks** | |
 
-## Incremental Approach
+### Incremental Approach
 
 Rather than implementing everything at once, the DPDK backend could be brought up incrementally:
 
@@ -847,7 +890,7 @@ Rather than implementing everything at once, the DPDK backend could be brought u
 
 Each milestone can be tested independently against the eBPF baseline.
 
-## File Structure
+### File Structure
 
 ```
 pkg/dataplane/
@@ -885,7 +928,7 @@ dpdk_worker/
 └── meson.build          # DPDK build file
 ```
 
-## Decision Points
+### Decision Points
 
 1. **Language for worker:** C (native DPDK) vs Rust (safety + performance) vs Go with DPDK bindings (simplicity but GC pauses)
    - **Recommendation:** C for worker, Go for control plane. Matches DPDK ecosystem.

@@ -2,6 +2,31 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T06:35:00Z
+  - **Action**: PR #1531 implementation v2 — applied retirement
+    banner + Current State + reframed VPP revisit trigger +
+    [Retired] Historical block to both
+    `docs/dataplane-decision-dpdk-vs-vpp.md` and
+    `docs/dpdk-dataplane.md`; updated
+    `docs/vpp-dataplane-assessment.md` inbound-pointer header to
+    note DPDK / decision doc retirement and explicitly preserve
+    "still useful" architectural threads (encrypted-tunnel
+    reasoning + native Go VRRP decision). Then addressed Codex
+    plan-review v2 findings: (a) sharpened the VPP revisit
+    trigger in the decision doc to specify "physical NIC XDP /
+    AF_XDP hook sees only outer encrypted packets when kernel
+    WireGuard/XFRM performs crypto" plus post-crypto interface
+    hook options; (b) updated `userspace-dp/README.md` "still
+    selected ... until later cutover" wording to reflect that
+    `EffectiveType` now defaults to userspace today.
+    Historical sections kept verbatim under bold-block retired
+    banners with all original H2 headings demoted to H3 inside
+    the retired wrapper.
+  - **File(s)**: `docs/dataplane-decision-dpdk-vs-vpp.md`,
+    `docs/dpdk-dataplane.md`,
+    `docs/vpp-dataplane-assessment.md`,
+    `userspace-dp/README.md`
+
 - **Timestamp**: 2026-05-24T00:00:00Z
   - **Action**: PR #1531 plan v1 drafted. Retire DPDK
     recommendations in `docs/dataplane-decision-dpdk-vs-vpp.md`
