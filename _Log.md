@@ -2,6 +2,67 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T19:30:00Z
+  - **Action**: #1521 Copilot r-rebase (4357897741 on 5bc310fc)
+    fixes — 1 correctness finding + 1 doc nit. Correctness
+    (pos 487): scopeWalker bound DeclStmt(CONST) names into the
+    current scope BEFORE descending into the const declaration's
+    initializer AST. For a shadowing `const outer = outer +
+    "_shadow"`, this meant Pass 1's later BinaryExpr fold would
+    evaluate the RHS `outer` AFTER the inner binding was
+    installed, so Pass 1 reported a double-shadowed
+    "userspace_outer_shadow_shadow" instead of the compile-time
+    "userspace_outer_shadow". FIX: introduced
+    `evalGenDeclConsts(gd, scope) map[string]string` which
+    evaluates each spec against the pre-binding scope using a
+    rolling fold (so later specs in the same GenDecl can still
+    reference earlier specs in the same GenDecl, which IS Go-
+    legal). scopeWalker.Visit on DeclStmt(CONST) stores the
+    pending bindings on the postVisitor; postVisitor.Visit(nil)
+    applies them when the DeclStmt is exited (BEFORE popping any
+    new scope frame, so siblings later in the same block see
+    them). Doc nit (pos 729): trimPaddingForBypass comment said
+    "any `%` format-verb characters" but `strings.Trim(s, "%")`
+    only strips leading/trailing — comment updated to
+    "LEADING/TRAILING `%` characters" with rationale: internal
+    `%` must be preserved so legitimate format strings like
+    `"update userspace_local_v4 %08x: %w"` don't trim down to a
+    registered map name. New fixture
+    copilot_rebase_shadow_initializer_refs_outer locks the kill.
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md, _Log.md
+  - **Validation**: 6 canary tests + 25 alias-bypass sub-cases
+    pass under `-count=2`; full `go test ./...` all 33 packages
+    green.
+
+- **Timestamp**: 2026-05-25T18:50:00Z
+  - **Action**: #1521 post-rebase + AGY r-rebase inherited-initializer
+    fix. Rebased branch onto master b7466f5d (8 sibling PRs merged
+    since the previous round; _Log.md conflicts resolved by concat).
+    AGY post-rebase review
+    (adversarial-review-mplf2r55-xnr229) flagged a compiling bypass
+    via Go spec §Constant declarations inherited initializers:
+    `const ( A = "userspace_ctrl"; B )` binds B to the same value
+    as A, but the AST sees `vs.Values` empty for B. The previous
+    binder skipped such specs, leaving B unbound and silently
+    allowing m.Map(B) to bypass the canary. FIX: retired
+    `bindConstSpec` and replaced with `bindGenDeclConsts(gd, scope)`
+    which walks the entire GenDecl tracking lastValues across
+    specs. Same lastValues pattern mirrored in
+    `collectFileConstsInto` for top-level const blocks. Two new
+    fixtures lock the kill: agy_rebase_inherited_initializer_bypass
+    (package-scope) and agy_rebase_inherited_initializer_local_block
+    (exercises scopeWalker via DeclStmt). Codex post-rebase
+    plan-r1 (workflow 20260525-162502-88b826): 6 findings — 1 FIX
+    (sentinel-gated skip already closed), 1 DEFER (relative path),
+    4 REJECT (recurring parity-AST and scoping rationales). Codex
+    impl-r1: 3 findings, all REJECT (recurring).
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md, _Log.md
+  - **Validation**: 6 canary tests + 24 alias-bypass sub-cases
+    pass; full `go test ./...` all 33 packages green on the
+    rebased branch.
+
 - **Timestamp**: 2026-05-25T15:45:00Z
   - **Action**: Addressed PR #1551 Copilot round-3 doc-comment nits by
     fully qualifying dataplane helper names in cluster session-sync
@@ -288,6 +349,227 @@
     Rebased onto current master (which now has #1536).
   - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
     `_Log.md`
+- **Timestamp**: 2026-05-25T18:30:00Z
+  - **Action**: #1521 Copilot r5 fixes + pre-rebase. Copilot r5
+    (review id 4357796234 on 5becd4fa) flagged 3 inline findings:
+    two doc-vs-impl drift comments (lines 240, 518) and one
+    correctness concern (line 436): `collectConstsFromStmtList`
+    pre-collected ALL block-local consts up-front, which violates
+    Go's "scope begins at end of ConstSpec" rule. Constructed
+    worked examples that prove the bug: a later-declared
+    block-local const shadowing an outer const used EARLIER in the
+    same block could cause both false-negatives (canary reads the
+    shadow value, misses the real outer-scope violation) and
+    false-positives (canary reads a later "userspace_*" shadow at
+    an earlier call site that semantically used an innocuous
+    outer). Fix: replaced pre-collect + collectLocalConstsForBlock
+    + collectConstsFromStmtList with a single bindConstSpec helper
+    that scopeWalker.Visit invokes WHEN a DeclStmt(CONST) is
+    visited — binding goes into the current top-of-stack scope
+    only at that moment, preserving statement order. BlockStmt /
+    CaseClause / CommClause still push an empty cloned-parent
+    scope on entry, popped on exit. Two new fixtures
+    copilot_r5_statement_order_false_positive (outer="innocuous_outer",
+    later shadow "userspace_evil" → only shadow is flagged) and
+    copilot_r5_statement_order_false_negative (outer="userspace_real",
+    later shadow "innocuous" → outer call site is flagged) lock
+    the correct semantics in place. Doc comments at lines 240 and
+    518 updated to match the new implementation.
+    Also retired the now-redundant agy_r7 fixture's invalid local
+    inverted chain (Go doesn't actually compile local
+    forward-referenced consts) and replaced with valid Go where
+    chain is at package scope and only chain1 is shadowed in
+    `case 1` — the canary must still resolve chain3 via package
+    scope to "userspace_fallback_stats".
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: 6 canary tests + 22 negative-fixture sub-cases
+    (2 new copilot_r5 cases) pass under `-count=2`; full
+    `go test ./...` green on this branch (pre-rebase).
+
+- **Timestamp**: 2026-05-25T17:30:00Z
+  - **Action**: #1521 r7 review fix — AGY r7 CONCRETE KILL: switch
+    or select case body acts as an implicit Go scope but is
+    represented as *ast.CaseClause / *ast.CommClause, not
+    *ast.BlockStmt. The r6 scopeWalker only pushed scopes for
+    BlockStmt/FuncDecl/FuncLit; case-body consts therefore leaked
+    into the enclosing scope and could shadow package-level consts
+    (e.g. `case 1: const chain1 = "innocuous"` overwrites the
+    package-level chain1). Additionally, the local-const collector
+    used ast.Inspect over the whole block, which recursively
+    descended into nested case bodies and pulled their consts into
+    the outer scope.
+    AGY r7 authored the fix: collectLocalConstsForBlock now
+    dispatches on node type and routes to a strict stmt-list
+    iterator collectConstsFromStmtList (no ast.Inspect, no nested
+    descent). scopeWalker pushes new scopes for BlockStmt,
+    CaseClause, and CommClause. New agy_r7_switch_case_shadow_
+    bypass fixture asserts the kill.
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: 6 canary tests + 20 negative-fixture sub-cases
+    pass; go test ./... all 30 packages green.
+
+- **Timestamp**: 2026-05-25T17:15:00Z
+  - **Action**: #1521 r6 review fix — AGY r6 NEEDS-MINOR identified
+    one more bypass: block-local const declaration with the same
+    name as a package-level const causes the flat package-wide
+    consts symbol table to be silently overwritten by the local
+    value, so a package-level chain that compiles to
+    "userspace_fallback_stats" can be evaluated by the canary as
+    something innocuous if shadowed at the function entry point.
+    AGY authored the fix directly in the worktree:
+    - collectFileConstsInto now collects ONLY top-level const
+      declarations (no DeclStmt walk).
+    - scopeWalker (implements ast.Visitor) + walkWithScope manage
+      a scope stack: blocks (BlockStmt, FuncDecl, FuncLit) push a
+      new scope; block-local const decls bind in the current
+      scope; lookups walk inner-to-outer. The package-wide table
+      is never mutated by block-local decls.
+    - All three passes route through walkWithScope so they see the
+      same correct lexical scoping as the compiler.
+    New agy_r6_block_shadow_chain_bypass fixture proves the fix
+    (chain1 shadowed locally, package-level chain3 must still fold
+    to "userspace_fallback_stats" and "userspace_fallback").
+    Copilot r4 on 0692093a: 9/9 files reviewed, 0 new comments —
+    clean.
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: 6 canary tests + 19 negative-fixture sub-cases
+    pass; go test ./... all 30 packages green.
+
+- **Timestamp**: 2026-05-25T17:00:00Z
+  - **Action**: #1521 r5 review fixes — AGY r5 raised NEEDS-MINOR
+    with 4 issues; all addressed. (a) Inverted const dependency
+    chain depth > 2: replaced fixed 2-pass loop with convergence
+    until stable (cap 32 passes for safety). (d.1) Typed-conversion
+    concat (`type T string; const x = T("user") + T("space_ctrl")`):
+    evalStringExpr now unwraps single-arg *ast.CallExpr so type
+    conversions fold via the BasicLit operand. (d.2) Typo-padded
+    NEW map name: isMapNameSuspect now trims FIRST and checks
+    prefix on trimmed value — catches new userspace_* names even
+    when not yet registered. (b) Generated file filter:
+    astFileIsGenerated helper detects `// Code generated ... DO NOT
+    EDIT.` marker per Go convention; multi-file inspector skips
+    generated files.
+    Plus Copilot r3 wording nits: maps.go now points readers at
+    userspace-xdp/src/lib.rs as Rust map-name source; parity-canary
+    doc updated to describe sentinel-gated retirement; alias-canary
+    doc updated to describe current trim-first rules (no `%`
+    exemption).
+    3 new fixtures: agy_r5_ia_inverted_chain_depth3,
+    agy_r5_id1_typed_concat_conversion,
+    agy_r5_id2_typo_padded_new_name.
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    pkg/dataplane/userspace/maps.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: 6 canary tests + 18 negative-fixture sub-cases
+    all pass; go test ./... all 30 packages green.
+
+- **Timestamp**: 2026-05-25T16:35:00Z
+  - **Action**: #1521 r4 review fixes — Copilot wording nits +
+    Codex LOW-1 parseMapsGoRegistry hard-fail + AGY r4 §II.1
+    local-block consts + AGY r4 §II.2 cross-file concat. Refactored
+    canary into package-wide AST inspector `findForbiddenAliasesIn
+    Files` that builds a single symbol table spanning every
+    production file's top-level AND block-local const decls
+    (DeclStmt walk). `parseMapsGoRegistry` now hard-fails on
+    non-BasicLit mapName* constants. New
+    TestParseMapsGoRegistryRejectsDriftShapes (3 sub-cases) +
+    TestCrossFileConcatBypassIsCaught + agy_r4_ii_local_block_
+    const_concat fixture. AGY r4 §II.3 (byte-slice synthesis) +
+    §II.4 (struct-tag reflection) documented as out-of-scope
+    deliberate-attacker bypasses in maps.go header.
+    Codex r4 MED-1 (parity AST roster) REJECTED third time same
+    rationale.
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    pkg/dataplane/userspace/maps.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: 5 canary tests + 18 negative-fixture sub-cases
+    all pass; go test ./... all 30 packages green.
+
+- **Timestamp**: 2026-05-25T16:15:00Z
+  - **Action**: #1521 r3 code-review fixes — AGY r3 found four
+    more bypass classes; all addressed: (i) deeply nested concat
+    confirmed SECURE — no change needed. (ii) Const-ident bypass
+    (`const pfx="user"; const sfx="space_ctrl"; const bypass=pfx+sfx`)
+    closed by adding a top-level const symbol table and recursive
+    `evalStringExpr` that resolves `*ast.Ident` against it; new
+    Pass 2 walks every CallExpr argument and reports ident-
+    resolved "userspace_*" values. (iii) Non-standard whitespace
+    padding (`"userspace_ctrl\n\t"`, NBSP) closed by switching
+    whitespace detection to `unicode.IsSpace`; trimPaddingForBypass
+    strips Unicode-defined whitespace. (iv) Removed orphan `seen`
+    map. (v) Parity canary now AST-parses maps.go via new
+    `parseMapsGoRegistry()` helper — no hardcoded list. Hits are
+    dedup'd via map[string]struct{}. 4 new negative-fixture sub-
+    cases (agy_r3_ii_const_ident_concat, agy_r3_ii_call_arg_via_
+    ident, agy_r3_iii_newline_padding, agy_r3_iii_nbsp_padding)
+    prove the kills.
+    Codex r3 review rejected as basis-error (codex ran against
+    pr-1494-head not the worktree HEAD); no substantive findings.
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: 4 canary tests + 14 alias-bypass sub-cases all
+    pass; go test ./... all 30 packages green.
+
+- **Timestamp**: 2026-05-25T15:50:00Z
+  - **Action**: #1521 r2 code-review fixes — Codex LOW-2 (%
+    exemption allows format-template bypass) + AGY r2 §A (trim-
+    padded literal) + AGY r2 §D (split-string concat fold) all
+    closed. Refactored canary into `findForbiddenMapNameAliases`
+    helper that (a) drops `%` from prose exemption, (b) folds
+    `*ast.BinaryExpr` Op=ADD with recursive string-concat operands
+    and flags folded `userspace_*` results, (c) flags any literal
+    whose TRIMMED value (strip whitespace + `%`) exactly matches a
+    registered map name. New `TestAliasCanaryCatchesBypassPatterns`
+    with 10 sub-cases (incl. AGY r2 (A) and (D) exact bypasses)
+    proves the inspector catches every documented bypass.
+    Production canary now delegates to the same helper.
+    Codex LOW-1 (parity bytes.Contains) again REJECTED with same
+    rationale as r1 LOW-2.
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: 4 canary tests + 10 alias-bypass sub-cases all
+    pass; go test ./... all 30 packages green.
+
+- **Timestamp**: 2026-05-25T15:30:00Z
+  - **Action**: #1521 r1 code-review fixes — Codex MED-1 + AGY §1
+    (alias bypass) closed by new `TestNoMapNameLiteralAliasesOutside
+    Registry` that walks every BasicLit (not just .Map args) so
+    const-aliases, parenthesized selectors and method aliases are
+    all caught; non-map operator tokens in an explicit allow-list.
+    AGY §2 closed by replacing parity-canary `t.Skip` on missing
+    loader with a `BPFRX_LEGACY_LOADER_RETIRED=1` envvar sentinel.
+    AGY §3 / Codex LOW-1 closed by updating manager_ha.go:215
+    comment to reference `mapNameUserspaceCtrl`. Codex LOW-2
+    rejected (parity AST-pattern adds fragility vs loader refactor;
+    bytes.Contains is the minimum signal we actually want).
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    pkg/dataplane/userspace/manager_ha.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: 3 canaries × -count=5 all green; go test ./...
+    all 30 packages green.
+
+- **Timestamp**: 2026-05-25T15:10:00Z
+  - **Action**: #1521 — decouple userspace maps_sync from legacy
+    BPF map names (sub-#1451 S6). New file
+    `pkg/dataplane/userspace/maps.go` holds 11 + 1 map-name
+    constants. 16 .Map() call sites in maps_sync.go + 3 in
+    process.go rewritten to use constants. Cap test updated to
+    new symbol name. Two new canaries in maps_decouple_test.go:
+    AST-semantic (no Map("userspace_*") outside maps.go) +
+    legacy-loader parity (self-retiring under #1476).
+  - **File(s)**: pkg/dataplane/userspace/maps.go (new),
+    pkg/dataplane/userspace/maps_decouple_test.go (new),
+    pkg/dataplane/userspace/maps_sync.go,
+    pkg/dataplane/userspace/process.go,
+    pkg/dataplane/userspace/maps_sync_cap_test.go,
+    docs/pr/1521-maps-sync-decouple/plan.md (v1→v2 after
+    Codex+AGY r1), docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: go build ./... clean; go test
+    ./pkg/dataplane/userspace/... ok; canaries 5/5 pass;
+    go test ./... — all 30 packages green.
 
 - **Timestamp**: 2026-05-25T05:55:00Z
   - **Action**: PR #1536 round-3 cleanup — address Codex MAJOR
@@ -2827,3 +3109,11 @@
     third-family (validatePolicySchedulerReferencesStrict) coverage
     gap flagged in round-1 review.
   - **File(s)**: `pkg/config/compiler_test.go`
+- **Timestamp**: 2026-05-24T00:00Z
+- **Action**: Draft #1521 plan v1 — decouple userspace maps_sync from legacy BPF map name literals (sub-#1451 S6)
+- **File(s)**: docs/pr/1521-maps-sync-decouple/plan.md, docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+- **Why**: `pkg/dataplane/userspace/maps_sync.go` hardcodes eleven BPF map
+  names by string literal that need to migrate to a package-private
+  registry so #1476 can retire legacy pinning without grep-and-pray. Plan
+  preserves PR #1514's documented `userspace_fallback_stats` mixed-version
+  compatibility exception verbatim. Pending Codex + AGY plan review.

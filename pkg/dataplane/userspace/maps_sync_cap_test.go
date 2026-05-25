@@ -41,8 +41,8 @@ func TestDegradedPathReasonNamesCoverRetainedShimActions(t *testing.T) {
 	if got, want := len(degradedPathReasonNames), 16; got != want {
 		t.Fatalf("degradedPathReasonNames length = %d, want %d", got, want)
 	}
-	if got := userspaceShimDegradedStatsMapName; got != "userspace_fallback_stats" {
-		t.Fatalf("userspaceShimDegradedStatsMapName = %q, want pinned compatibility map name", got)
+	if got := mapNameUserspaceShimDegradedStats; got != "userspace_fallback_stats" {
+		t.Fatalf("mapNameUserspaceShimDegradedStats = %q, want pinned compatibility map name", got)
 	}
 	for idx, name := range degradedPathReasonNames {
 		if name == "" {

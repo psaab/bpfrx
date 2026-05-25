@@ -212,8 +212,9 @@ func (m *Manager) desiredForwardingArmedLocked() bool {
 		return false
 	}
 	// Keep bindings armed as soon as the helper is allowed to forward.
-	// Startup settle and XSK bring-up are now controlled by userspace_ctrl
-	// and the liveness probe in applyHelperStatusLocked(). Disarming the
+	// Startup settle and XSK bring-up are now controlled by the
+	// userspace_ctrl map (see mapNameUserspaceCtrl in maps.go) and
+	// the liveness probe in applyHelperStatusLocked(). Disarming the
 	// helper here races against the initial armed=true request and tears
 	// down AF_XDP before the probe can ever observe RX progress.
 	if !m.clusterHA {

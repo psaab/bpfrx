@@ -62,15 +62,15 @@ type userspaceLocalAddressEntry struct {
 }
 
 func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg config.UserspaceConfig) error {
-	ctrlMap := m.bpfShim.Map("userspace_ctrl")
+	ctrlMap := m.bpfShim.Map(mapNameUserspaceCtrl)
 	if ctrlMap == nil {
 		return errors.New("userspace_ctrl map not loaded")
 	}
-	bindingsMap := m.bpfShim.Map("userspace_bindings")
+	bindingsMap := m.bpfShim.Map(mapNameUserspaceBindings)
 	if bindingsMap == nil {
 		return errors.New("userspace_bindings map not loaded")
 	}
-	heartbeatMap := m.bpfShim.Map("userspace_heartbeat")
+	heartbeatMap := m.bpfShim.Map(mapNameUserspaceHeartbeat)
 	if heartbeatMap == nil {
 		return errors.New("userspace_heartbeat map not loaded")
 	}
@@ -126,7 +126,7 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 // instead of relying on driver-specific XDP_PASS recycling behavior for IP
 // packets delivered to the kernel from zero-copy AF_XDP paths.
 func (m *Manager) setupUserspaceCPUMapLocked() bool {
-	cpuMap := m.bpfShim.Map("userspace_cpumap")
+	cpuMap := m.bpfShim.Map(mapNameUserspaceCPUMap)
 	if cpuMap == nil {
 		slog.Warn("userspace_cpumap not found, zero-copy cpumap redirect disabled")
 		return false
@@ -192,7 +192,7 @@ func (m *Manager) lookupUserspaceCtrlForFailClosed(ctrlMap *ebpf.Map, key uint32
 
 func (m *Manager) syncUserspaceClassifierMapsFailClosedLocked(snapshot *ConfigSnapshot) error {
 	if err := m.syncUserspaceClassifierMapsLocked(snapshot); err != nil {
-		ctrlMap := m.bpfShim.Map("userspace_ctrl")
+		ctrlMap := m.bpfShim.Map(mapNameUserspaceCtrl)
 		if ctrlMap == nil {
 			return err
 		}
@@ -235,7 +235,7 @@ func (m *Manager) blindFailClosedUserspaceCtrlLocked(
 	if m.configuredMode == ModeUserspaceStrict {
 		disabled.Flags |= userspaceCtrlFlagStrict
 	}
-	if cpuMap := m.bpfShim.Map("userspace_cpumap"); cpuMap != nil {
+	if cpuMap := m.bpfShim.Map(mapNameUserspaceCPUMap); cpuMap != nil {
 		disabled.Flags |= userspaceCtrlFlagCPUMap
 	}
 
@@ -258,11 +258,11 @@ func (m *Manager) blindFailClosedUserspaceCtrlLocked(
 }
 
 func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
-	ctrlMap := m.bpfShim.Map("userspace_ctrl")
+	ctrlMap := m.bpfShim.Map(mapNameUserspaceCtrl)
 	if ctrlMap == nil {
 		return errors.New("userspace_ctrl map not loaded")
 	}
-	bindingsMap := m.bpfShim.Map("userspace_bindings")
+	bindingsMap := m.bpfShim.Map(mapNameUserspaceBindings)
 	if bindingsMap == nil {
 		return errors.New("userspace_bindings map not loaded")
 	}
@@ -272,7 +272,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 
 	// Preserve cpumap flag if cpumap is populated.
 	var ctrlFlags uint32
-	if cpuMap := m.bpfShim.Map("userspace_cpumap"); cpuMap != nil {
+	if cpuMap := m.bpfShim.Map(mapNameUserspaceCPUMap); cpuMap != nil {
 		ctrlFlags |= userspaceCtrlFlagCPUMap
 	}
 	if snapshotHasNativeGRE(m.lastSnapshot) {
@@ -477,7 +477,7 @@ ctrlReady:
 	// at generation 1 indefinitely; later ctrl re-enables during RG moves
 	// would then retrigger the startup flush and destroy synced sessions.
 	if ctrl.Enabled == 1 && !m.ctrlWasEnabled && !m.initialCtrlCleanupDone {
-		if usMap := m.bpfShim.Map("userspace_sessions"); usMap != nil {
+		if usMap := m.bpfShim.Map(mapNameUserspaceSessions); usMap != nil {
 			var key, nextKey []byte
 			key = make([]byte, usMap.KeySize())
 			nextKey = make([]byte, usMap.KeySize())
@@ -702,8 +702,6 @@ ctrlReady:
 // userspaceCounterSnapshot holds cumulative counter totals from the helper,
 // used to compute deltas between status polls.
 
-const userspaceShimDegradedStatsMapName = "userspace_fallback_stats"
-
 // degradedPathReasonNames maps BPF array index to a human-readable name.
 // Must stay in sync with USERSPACE_FALLBACK_REASON_* in userspace-xdp/src/lib.rs.
 var degradedPathReasonNames = [16]string{
@@ -733,7 +731,7 @@ var degradedPathReasonNames = [16]string{
 // mixed-version compatibility exception. Operator-facing Go status, JSON, and
 // docs must use degraded-path terminology instead.
 func (m *Manager) readDegradedPathStatsLocked() map[string]uint64 {
-	statsMap := m.bpfShim.Map(userspaceShimDegradedStatsMapName)
+	statsMap := m.bpfShim.Map(mapNameUserspaceShimDegradedStats)
 	if statsMap == nil {
 		return nil
 	}
@@ -782,7 +780,7 @@ func (m *Manager) entryProgramsLocked() map[int]string {
 }
 
 func (m *Manager) syncIngressIfaceMapLocked(snapshot *ConfigSnapshot) error {
-	ifaceMap := m.bpfShim.Map("userspace_ingress_ifaces")
+	ifaceMap := m.bpfShim.Map(mapNameUserspaceIngressIfaces)
 	if ifaceMap == nil {
 		return errors.New("userspace_ingress_ifaces map not loaded")
 	}
@@ -813,11 +811,11 @@ func (m *Manager) syncIngressIfaceMapLocked(snapshot *ConfigSnapshot) error {
 }
 
 func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
-	localV4Map := m.bpfShim.Map("userspace_local_v4")
+	localV4Map := m.bpfShim.Map(mapNameUserspaceLocalV4)
 	if localV4Map == nil {
 		return errors.New("userspace_local_v4 map not loaded")
 	}
-	localV6Map := m.bpfShim.Map("userspace_local_v6")
+	localV6Map := m.bpfShim.Map(mapNameUserspaceLocalV6)
 	if localV6Map == nil {
 		return errors.New("userspace_local_v6 map not loaded")
 	}
@@ -916,11 +914,11 @@ func buildDesiredLocalAddressSets(snapshot *ConfigSnapshot) (map[uint32]struct{}
 }
 
 func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) error {
-	natV4Map := m.bpfShim.Map("userspace_interface_nat_v4")
+	natV4Map := m.bpfShim.Map(mapNameUserspaceInterfaceNATv4)
 	if natV4Map == nil {
 		return errors.New("userspace_interface_nat_v4 map not loaded")
 	}
-	natV6Map := m.bpfShim.Map("userspace_interface_nat_v6")
+	natV6Map := m.bpfShim.Map(mapNameUserspaceInterfaceNATv6)
 	if natV6Map == nil {
 		return errors.New("userspace_interface_nat_v6 map not loaded")
 	}
@@ -1065,7 +1063,7 @@ func (m *Manager) verifyBindingsMapLocked() bool {
 	if len(bindings) == 0 {
 		return false
 	}
-	bindingsMap := m.bpfShim.Map("userspace_bindings")
+	bindingsMap := m.bpfShim.Map(mapNameUserspaceBindings)
 	if bindingsMap == nil {
 		return false
 	}
