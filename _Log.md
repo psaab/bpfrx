@@ -1,5 +1,29 @@
 # Action Log
 
+## 2026-05-25 — #1476 Phase A v1 plan drafted
+
+- **Timestamp**: 2026-05-25T (Phase A v1 draft)
+  - **Action**: Created worktree `refactor/1476-mechanical-bpf-removal`
+    off origin/master. Drafted plan v1 for #1476 (eBPF retirement
+    Phase: mechanical source removal of legacy `bpf/xdp/*.c`,
+    `bpf/tc/*.c`, 14 bpf2go generated pairs, `loader_ebpf.go`, and
+    legacy Makefile hooks). Plan mirrors the DPDK retirement Phase 3
+    (#1528) template: keeps `TypeEBPF` as a retirement-error token,
+    adds `validateDataplaneTypeStrictEBPF` commit-time validator with
+    verbatim retirement message, extends the
+    `rewriteRetiredDataplaneType` Load-time rewrite to handle the
+    EBPF persistent-config case, deletes the bpf2go graph in lockstep
+    with the legacy build hooks. Retained: `bpf/headers/*.h`,
+    `userspace-xdp/`, `pkg/dataplane/userspace_xdp_bpfel.o`,
+    `pkg/dataplane/userspace_xdp_rust.go`,
+    `pkg/dataplane/build-userspace-xdp.sh`. Manifest discipline
+    enforced by the 4 `TestLegacyBPFRemovalManifest*` canaries
+    already in tree from #1494.
+    Blocked on #1451 (sub-issues #1516, #1521 still OPEN); Phase B
+    rebases onto master once #1451 closes.
+  - **File(s)**: `docs/pr/1476-mechanical-bpf-removal/plan.md`,
+    `docs/pr/1476-mechanical-bpf-removal/reviewer-ids.md`, `_Log.md`
+
 ## 2026-05-26
 
 - **Timestamp**: 2026-05-26T02:50:00Z
