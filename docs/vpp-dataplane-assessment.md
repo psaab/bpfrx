@@ -1,15 +1,18 @@
 # VPP Dataplane Assessment for xpf
 
-> [!IMPORTANT]
-> DPDK dataplane retired in #1525; VPP is not under consideration.
-> This assessment is preserved as historical comparative analysis.
-> Userspace AF_XDP is the production dataplane. The companion
-> decision doc (`docs/dataplane-decision-dpdk-vs-vpp.md`) is being
-> rewritten as a retirement notice in #1531.
-
-Note: This is a deep VPP-focused assessment. For the current project-level
-decision and recommendation between DPDK and VPP, see
-`docs/dataplane-decision-dpdk-vs-vpp.md`.
+> Note: this VPP assessment was written when DPDK was a live
+> in-tree backend candidate. Both DPDK and the historical
+> dataplane-decision document are now retired (DPDK retirement:
+> #1525; userspace AF_XDP is the current/default backend in
+> `userspace-dp/`). The architectural reasoning here — especially
+> around encrypted-tunnel acceleration and the userspace-crypto
+> tradeoff — remains a useful reference, as do specific
+> assessments such as the native Go VRRP decision. Other
+> recommendations should not be read as current direction; see
+> [`docs/dataplane-decision-dpdk-vs-vpp.md`](dataplane-decision-dpdk-vs-vpp.md)
+> for the retirement banner and active direction, and
+> [`userspace-dp/README.md`](../userspace-dp/README.md) for the
+> active design.
 
 *Date: 2026-02-19*
 
