@@ -2,16 +2,49 @@
 
 ## 2026-05-24
 
-- **Timestamp**: 2026-05-25T05:30:00Z
-  - **Action**: PR #1526 implementation — added
-    `validateDataplaneTypeStrict` to pkg/config/compiler.go (slotted
-    BEFORE existing CoS/policer/scheduler strict validators); split
-    `TestDPDKConfig` into parse-clean / compile-rejects sibling
-    pair; dropped `dpdk` from the
-    `TestDataplaneTypeNonLegacyValuesDoNotWarnDeprecatedCompatibility`
-    loop; added Store-boundary tests covering both raw
-    `CommitCheck` error and `commit check failed:`-wrapped
-    `Commit` error.
+- **Timestamp**: 2026-05-24T07:00:00Z
+  - **Action**: PR #1526 implementation v3 — added
+    `validateDataplaneTypeStrict` in pkg/config/compiler.go (slotted
+    BEFORE existing CoS / policer / scheduler strict validators per
+    Codex round-1 ordering finding). Verbatim retirement message
+    per issue body: `the DPDK dataplane backend has been retired;
+    use 'set system dataplane-type userspace' (see #1525)`. Tests
+    use substring match so the same assertion fires across
+    CompileConfig (raw), Store.CommitCheck (raw), and Store.Commit
+    (`commit check failed:`-wrapped) — addresses Codex round-2
+    MAJOR finding 1.
+
+    Test surface:
+    - parser_ast_test.go: split TestDPDKConfig into
+      TestDPDKConfigParsesCleanly (parse must survive — AST shape
+      assertion) and TestDPDKConfigCompileRejects (commit reject).
+    - parser_ast_test.go: 5 new dedicated tests —
+      TestDataplaneTypeDPDKRejectedAtCommit (flat-set form),
+      TestDataplaneTypeDPDKRejectedAtCommitHierarchical (block
+      form), TestDataplaneTypeDPDKRejectedAtCommitFiresBeforeCoS
+      (validator ordering lock-in),
+      TestDataplaneTypeDPDKRejectedAtCommitViaApplyGroups
+      (apply-groups expansion path), plus negative-control pair
+      TestDataplaneTypeUserspaceCompilesCleanly and
+      TestDataplaneTypeOmittedCompilesCleanly.
+    - parser_system_test.go: dropped `dpdk` from the
+      TestDataplaneTypeNonLegacyValuesDoNotWarnDeprecatedCompatibility
+      loop (now hard-errors at compile).
+    - configstore/store_test.go: 2 new tests —
+      TestCommit_RejectsDPDKDataplaneType locks in BOTH the raw
+      CommitCheck error AND the `commit check failed:`-wrapped
+      Commit error, plus TestCommit_AcceptsUserspaceDataplaneType
+      negative control.
+
+    Plan v3 updated to (a) switch tests from byte-exact to
+    substring-match for cross-surface compatibility, (b) correct
+    the daemon-startup recovery flow text (candidate is empty
+    after failed Load, not pre-populated), (c) honor the issue
+    body's verbatim `(see #1525)` (does not point at #1531 docs).
+
+    Test gates: go build ./... clean. go test ./... clean across
+    33 packages. 5x flake check on new tests passes. cargo check
+    on userspace-dp/ clean (no Rust touched).
   - **File(s)**: `pkg/config/compiler.go`,
     `pkg/config/parser_ast_test.go`,
     `pkg/config/parser_system_test.go`,
