@@ -312,7 +312,7 @@ func injectShimMapSpec(t *testing.T, bpfShim *dataplane.Manager, name string, sp
 	t.Helper()
 	m, err := ebpf.NewMap(spec)
 	if err != nil {
-		t.Fatalf("new %s map: %v", name, err)
+		skipIfBPFMapUnavailable(t, "new "+name+" map", err)
 	}
 	t.Cleanup(func() { m.Close() })
 	injectShimMap(t, bpfShim, name, m)
