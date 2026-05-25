@@ -2851,7 +2851,7 @@ class-of-service {
 		t.Fatal("CompileConfig succeeded for dpdk + malformed CoS candidate")
 	}
 	if !strings.Contains(err.Error(), dpdkRetirementSubstr) {
-		t.Fatalf("CompileConfig error = %q, want DPDK retirement substring (CoS error should not win), got: %q", dpdkRetirementSubstr, err.Error())
+		t.Fatalf("CompileConfig error = %q, want DPDK retirement substring (CoS error should not win): %q", err.Error(), dpdkRetirementSubstr)
 	}
 }
 

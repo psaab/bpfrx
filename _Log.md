@@ -1780,3 +1780,8 @@
   - **File(s)**: `userspace-dp/src/afxdp/wg/framing.rs`, `_Log.md`
   - **Validation**: cargo build --release; cargo test --release --bin
     xpf-userspace-dp afxdp::wg.
+## 2026-05-25
+
+- **Timestamp**: 2026-05-25T05:40:00Z
+- **Action**: Fix two review findings on #1526: unknown-type error msg still listed dpdk as valid; t.Fatalf arg order inverted in CoS-ordering test
+- **File(s)**: pkg/config/compiler_system.go, pkg/config/parser_ast_test.go
