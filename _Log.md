@@ -110,6 +110,67 @@
   - **File(s)**:
     `docs/pr/1520-userspace-boot-extraction/plan.md`,
     `docs/pr/1520-userspace-boot-extraction/reviewer-ids.md`
+- **Timestamp**: 2026-05-25T08:45:00Z
+  - **Action**: #1538 implementation (plan v4 PLAN-READY 4/4).
+    Plan-review summary: r1 Codex PLAN-NEEDS-MAJOR / AGY
+    PLAN-READY; r2 Codex PLAN-NEEDS-MINOR / AGY PLAN-READY;
+    r3 Codex PLAN-NEEDS-MINOR / AGY PLAN-NEEDS-MINOR; r4
+    Codex PLAN-READY / AGY PLAN-READY. v4 is the final plan.
+
+    Code change: `compileExpanded` in
+    `pkg/config/compiler.go:244-272` now accumulates the three
+    independent strict-validator family errors
+    (`validateClassOfServiceStrict`,
+    `validateThreeColorPolicersStrict`,
+    `validatePolicySchedulerReferencesStrict`) into a single
+    `errors.Join` return so `commit check` surfaces ONE error
+    per family in a single response. The
+    `validateDataplaneTypeStrict` precheck (added by #1536)
+    stays fail-fast and runs FIRST so the brittle-by-design
+    `TestDataplaneTypeDPDKRejectedAtCommitFiresFirst` no-leak
+    contract (parser_ast_test.go:2909+2913) keeps passing
+    byte-identically.
+
+    Tests added (3):
+    - `pkg/config/compiler_test.go::TestCompileMultipleStrictErrorsAccumulated`
+      — parser-driven via `CompileConfig` + `ParseSetCommand` /
+      `tree.SetPath` loop. Fixture: `equal-flow-enforcement`
+      on a scheduler without `transmit-rate exact` (parser-
+      reachable CoS error) + `single-rate color-blind` on a
+      three-color-policer without `committed-information-rate`
+      (parser-reachable policer error). Asserts both error
+      substrings present in the joined Error(), exactly one
+      '\n' separator, and `errors.Is(err,
+      ErrDPDKDataplaneRetired) == false` (defense-in-depth).
+    - `pkg/config/compiler_test.go::TestCompileSingleStrictErrorJoinPath`
+      — direct accumulator-pattern call with a hand-built
+      *Config that triggers only the CoS family. Pins
+      `errors.Join`'s single-element byte-identity semantics
+      (Go std lib pin at /usr/lib/go-1.24/src/errors/join.go:47-48
+      per Codex round-2 verification).
+    - `pkg/grpcapi/server_config_test.go::TestCompileCheckMultiErrorRendersThroughGRPC`
+      — exercises the actual operator-facing gRPC rendering
+      via `status.Errorf(codes.InvalidArgument, "%v", err)`
+      at `server_config.go:176`. Direct-handler style
+      (no bufconn) per existing pattern at lines 15-25.
+      Asserts `codes.InvalidArgument` + both substrings +
+      one '\n' separator on the rendered status.Message().
+
+    Local validation: `go build ./...` clean, `go test
+    ./...` clean (30 packages), 5× flake loop on the three
+    new tests + the DPDK no-leak test all clean.
+
+    Also tidied two cosmetic stale-wording items Codex r4
+    called out as non-blocking: "Land plan v2" → "Land plan
+    ... v4 is the final" and "Open questions ... (round 2)"
+    → "(historical)".
+  - **File(s)**: `pkg/config/compiler.go`,
+    `pkg/config/compiler_test.go` (new),
+    `pkg/grpcapi/server_config_test.go`,
+    `docs/pr/1538-multierror-validation/plan.md`,
+    `docs/pr/1538-multierror-validation/reviewer-ids.md` (new),
+    `_Log.md`
+
 - **Timestamp**: 2026-05-25T08:30:00Z
   - **Action**: #1538 plan v4 — addresses Codex round-3
     PLAN-NEEDS-MINOR (3 findings) + AGY round-3

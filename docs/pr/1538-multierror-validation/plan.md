@@ -471,7 +471,8 @@ repeat), not a regression.
 
 ## Implementation order
 
-1. Land plan v2; iterate to PLAN-READY across Codex + AGY.
+1. Land plan; iterate to PLAN-READY across Codex + AGY (took 4
+   rounds; plan v4 is the final).
 2. Edit `compileExpanded` per the design above (keep DPDK
    precheck; accumulate the remaining 3).
 3. Add the three new tests.
@@ -484,7 +485,7 @@ repeat), not a regression.
    + AGY + Copilot). Auto-merge when 4-of-4 agree.
 10. Report PR URL + verdicts.
 
-## Open questions for adversarial reviewers (round 2)
+## Open questions for adversarial reviewers (historical)
 
 1. **Test placement for the gRPC rendering test.** Is
    `pkg/grpcapi/server_config_test.go` the right home, or
