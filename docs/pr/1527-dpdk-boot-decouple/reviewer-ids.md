@@ -25,9 +25,21 @@ Resolves Codex+Antigravity MAJOR (NPE on fence callback) via nil guard in
 `pkg/daemon/daemon_ha_sync.go:676-679`. Docs prose update deferred to Chain C
 (#1529) — canary `TestRetirementBoundaryDocsMentionDPDKPolicy` still PASS.
 
-- Codex re-review: `task-mpks5yrq-4h7ia5` — DISPATCHED
-- Antigravity re-review: `adversarial-review-mpks62um-g47sg4` — DISPATCHED
+- Codex re-review: `task-mpks5yrq-4h7ia5` — MERGE-READY (1 NIT: structure the
+  nil-dp fence slog.Warn with kv fields; fixed in fe82ac74)
+- Antigravity re-review: `adversarial-review-mpks62um-g47sg4` — MERGE-READY
 - Copilot re-trigger: issue-comment 4531855093
+
+## Code review — commit fe82ac74 (force-push 2026-05-25)
+
+Includes the second-agent commits `e7f199f1` (panic guards on TypeDPDK
+registration + cleanup), `ee83e972` (allowlist comment refresh), `8c475d4a`
+(StartFIBSync stale ref fix), plus my `fe82ac74` (structured slog kv on
+nil-dp fence warning, addresses Codex NIT).
+
+- Codex re-re-review: `task-mpksgyz9-45ib7t` — DISPATCHED
+- Antigravity re-re-review: `adversarial-review-mpksh5km-1mf7rz` — DISPATCHED
+- Copilot re-trigger: issue-comment 4531892202
 
 Verification scope (see prompt for full list): (a) blank-import removal completeness,
 (b) NewRuntimeDataPlane reject placement vs EffectiveType, (c) errors.Is wrapping
