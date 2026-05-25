@@ -49,9 +49,12 @@ DRAFT v3 — addressing round-2 Codex plan-review findings.
 3. Replace the "operator deletes dpdk from candidate" sentence
    with the accurate recovery flow: candidate is empty after
    the failed `Store.Load()`, so the operator must either
-   `load merge replace ...` the corrected file or
-   `set system dataplane-type userspace` from scratch and
-   commit. Manual sanity test step is updated to verify this.
+   `load override <file>` (or `load merge <file>`) of a
+   corrected config or `set system dataplane-type userspace`
+   from scratch and commit. The supported `load` modes per
+   `cmd/cli/main.go` are `merge` and `override` — there is no
+   `load merge replace` form. Manual sanity test step is
+   updated to verify this.
 4. Manual sanity test explicitly confirms the candidate is
    empty after the failed Load by running
    `cli -c "show configuration"` and seeing `{}` rather than
