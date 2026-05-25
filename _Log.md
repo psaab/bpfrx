@@ -1,5 +1,21 @@
 # Action Log
 
+## 2026-05-25 — #1476 Phase A v3 plan after r2 reviews
+
+- **Timestamp**: 2026-05-25T (Phase A v3 after r2 reviewer findings)
+  - **Action**: Round-2 reviews returned: Codex r2 PLAN-NEEDS-MAJOR
+    (5 findings, mostly stale-text drift between v2 header changes
+    and unchanged v1 prose, plus 2 NEW: shim_loader_boundary_test
+    hardcoded path + non-daemon ebpf-warning tests); AGY r2
+    PLAN-NEEDS-MINOR (4 missing retained helpers — overlapped with
+    Codex F3). v3 fixes: §5 Manager.Load() table row, §4.8 adds 5
+    additional retained symbols (drift errors + size constants),
+    §4.3 adds shim_loader_boundary_test.go path-fix row and 4
+    non-daemon ebpf-warning test rewrite rows, §8 prose updates,
+    "four manifest tests" → "five" sweep.
+  - **File(s)**: `docs/pr/1476-mechanical-bpf-removal/plan.md` v3,
+    `docs/pr/1476-mechanical-bpf-removal/reviewer-ids.md`, `_Log.md`
+
 ## 2026-05-25 — #1476 Phase A v2 plan after r1 reviews
 
 - **Timestamp**: 2026-05-25T (Phase A v2 after r1 reviewer findings)
