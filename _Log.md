@@ -231,6 +231,120 @@
     No `.go` / `.rs` / `.c` source, no build inputs, no test
     fixtures modified.
 
+- **Timestamp**: 2026-05-25T09:45:00Z
+  - **Action**: PR #1532 — address Copilot review on 510fe7dd
+    (7 nits). Copilot caught a contradiction between the godoc /
+    plan / log claims (generics + type aliases "deferred") and the
+    actual catch-all sweep behaviour (those ARE caught when the
+    selector is spelled literally). True deferred bypasses are
+    only those where the selector vanishes from the AST: transitive
+    alias use, import renames, dot imports, external-package
+    wrappers. Updated godoc on the test func, on
+    findLegacyDataPlaneOffenders, on isLegacyDataPlaneType, and on
+    the *ast.ArrayType slice branch comment. Also added a
+    receiverTypeName helper so funcDeclName includes the receiver
+    on methods ("(*S).Foo parameter is dataplane.DataPlane")
+    addressing Copilot's ambiguity concern, with a new
+    method-receiver-named-in-offender test subcase to lock the
+    behaviour. plan.md got the same scope-clarification + the
+    stale "~80 LOC" claim updated to ~615 LOC.
+  - **File(s)**:
+    `pkg/conntrack/legacy_dataplane_canary_test.go`,
+    `docs/pr/1515-conntrack-gc-canary/plan.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/conntrack -count=1 -race` green
+    (34 subcases now); new method-receiver test fixture asserts
+    "(*S).Foo parameter is dataplane.DataPlane" produced.
+
+- **Timestamp**: 2026-05-25T09:15:00Z
+  - **Action**: PR #1532 round-N — close all AGY-flagged bypass
+    vectors via two-pass walker. AGY KILL verdict on 78b8a38a
+    identified 5 trivial-bypass categories not in the documented
+    deferred list: package-level var, local var, closure param,
+    composite literal, type definition. Codex high finding also
+    flagged `[N]T` fixed array as undocumented. Fix:
+    (a) refactored the AST walker into a shared
+    `findLegacyDataPlaneOffenders(file, name)` helper invoked by
+    both the main canary AND the synthetic tests — addresses Codex
+    "tautological test" finding.
+    (b) added `*ast.ArrayType` arm (Len != nil for fixed arrays) to
+    `isLegacyDataPlaneType` — catches `[N]dataplane.DataPlane`.
+    (c) added pass-2 catch-all selector sweep that walks every
+    `*ast.SelectorExpr` and flags any `dataplane.DataPlane` not
+    already attributed by the structural pass. Closes
+    package-level var, local var, closure, composite literal, type
+    def, AND the previously #1548-deferred compound shapes (`[]T`,
+    `map[K]T`, `chan T`, `func(T)`). Tracked via token.Pos in a
+    structuralHits set so the sweep doesn't double-report.
+    (d) updated godoc scope block to reflect the two-pass design.
+    Remaining #1548-deferred bypasses all share one property: the
+    `dataplane.DataPlane` selector disappears from the AST —
+    transitive alias use (`var x DPAlias` after the alias decl),
+    import renames (`dp.DataPlane`), dot imports (bare `DataPlane`
+    ident), and external-package wrapper types. Generic
+    constraints/instantiations are NOT deferred — the sweep
+    catches them because they still spell the selector literally.
+
+    New tests (33 total subcases): `TestLegacyDataPlaneTypeMatcher`
+    9 cases including new fixed-array + slice-deferred;
+    `TestProductionWalkerCatchesCanaryShapes` 12 structural-pass
+    fixtures parsed via `parser.ParseFile`;
+    `TestProductionWalkerIgnoresUnrelatedTypes` confirms
+    dataplane.SessionStore/Telemetry/Sessions/context.Context don't
+    trip the sweep; new
+    `TestProductionWalkerCatchAllSweepClosesAGYBypasses` 9 cases
+    proving every AGY-flagged bypass + compound type IS now caught.
+
+  - **File(s)**:
+    `pkg/conntrack/legacy_dataplane_canary_test.go`,
+    `docs/pr/1515-conntrack-gc-canary/plan.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/conntrack -count=1 -race` green
+    (33 new subcases pass);
+    `grep -rn 'dataplane\.DataPlane' pkg/conntrack/*.go` finds
+    only the canary test file itself, confirming production tree
+    still clean.
+
+- **Timestamp**: 2026-05-25T08:30:00Z
+  - **Action**: PR #1532 round — address Copilot review on 77baa235.
+    Copilot flagged that `method.Type` is `*ast.FuncType` and that
+    `isLegacyDataPlaneType(method.Type)` could never detect interface
+    method param/result. The existing code at lines 102-132 already
+    type-switches on `*ast.FuncType` and extracts `mt.Params` and
+    `mt.Results` correctly — Copilot misread the implementation. To
+    refute the finding with code-level evidence, added
+    `TestLegacyDataPlaneTypeMatcher` and
+    `TestInterfaceMethodCanaryScansFuncTypeParamsAndResults`
+    subtests that build synthetic ASTs and confirm the walker fires
+    on (a) direct param, (b) pointer param, (c) variadic, (d)
+    paren-wrapped, (e) result; and that it ignores a clean
+    interface. Also addressed Copilot's plan-vs-implementation
+    wording mismatches in
+    `docs/pr/1515-conntrack-gc-canary/plan.md` (scope is all
+    FuncDecls not exported-only; matcher is
+    `isLegacyDataPlaneType()` not `exprString()`).
+  - **File(s)**:
+    `pkg/conntrack/legacy_dataplane_canary_test.go`,
+    `docs/pr/1515-conntrack-gc-canary/plan.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/conntrack -run
+    TestConntrackHasNoLegacyDataPlaneDependency -count=1 -race`
+    green; new subtests assert the interface-method scan against
+    synthetic AST fixtures.
+
+- **Timestamp**: 2026-05-25T01:30:00Z
+  - **Action**: #1515 (#1451 S8) — add regression canary that fences
+    `pkg/conntrack` production code against future re-introduction of
+    `dataplane.DataPlane` as a parameter, result, struct field, or
+    interface method. Mirrors the AST canary pattern from
+    `pkg/dataplane/userspace/manager_coupling_test.go`. Confirmed
+    canary fires by hand-flipping a dummy `func _canaryNegativeTest(dp
+    dataplane.DataPlane) {}` into the package (revert verified clean).
+    No production code change; the conntrack GC is already migrated
+    to `RuntimeDomainProvider`.
+  - **File(s)**: `pkg/conntrack/legacy_dataplane_canary_test.go`
+    (new), `docs/pr/1515-conntrack-gc-canary/plan.md` (new), `_Log.md`
+  - **Validation**: `go test ./pkg/conntrack/ -count=1 -race` green;
+    `go vet ./pkg/conntrack/...` clean; negative-case hand-flip
+    confirms canary fires.
+
 ## 2026-05-24
 
 - **Timestamp**: 2026-05-24T06:35:00Z
@@ -2188,9 +2302,49 @@
   - **Validation**: cargo build --release; cargo test --release --bin
     xpf-userspace-dp afxdp::wg.
 
+- **Timestamp**: 2026-05-25T06:35Z
+  - **Action**: PR #1532 — document known canary bypass vectors per AGY
+    review; file #1548 hardening follow-up.
+  - **File(s)**: `pkg/conntrack/legacy_dataplane_canary_test.go`
+  - **Why**: AGY adversarial review
+    (`adversarial-review-mpktubut-ogkp1e`) flagged five categories of
+    bypass the current AST walker doesn't catch (compound types,
+    generics, type aliases, import renames, anonymous-struct context).
+    The canary as shipped catches the most common naive-reintroduction
+    mode (direct param/result/field/embed/interface-method of
+    dataplane.DataPlane), which is the realistic regression risk.
+    Hardening for the bypasses is tracked in #1548 (substantial work
+    needing go/types-level import resolution). Comment block updated to
+    make the scope explicit so a future reader doesn't mistake this for
+    an exhaustive fence.
+  - **Validation**:
+    `TestConntrackHasNoLegacyDataPlaneDependency` still passes on the
+    current `pkg/conntrack/` production tree.
+
+- **Timestamp**: 2026-05-25T06:47Z
+  - **Action**: PR #1532 follow-up — fix interface method signature
+    traversal in the conntrack legacy dataplane canary and normalize
+    malformed `_Log.md` list formatting flagged by review.
+  - **File(s)**: `pkg/conntrack/legacy_dataplane_canary_test.go`,
+    `_Log.md`
+  - **Validation**: `go test ./pkg/conntrack/ -count=1 -race`; `go vet
+    ./pkg/conntrack/...`.
+
+- **Timestamp**: 2026-05-25T07:55Z
+  - **Action**: PR #1532 — close Codex MINOR (ellipsis + paren bypasses)
+  - **File(s)**: pkg/conntrack/legacy_dataplane_canary_test.go
+  - **Why**: Codex task-mpktubkn-r9llzq flagged `...dataplane.DataPlane`
+    (variadic params, *ast.Ellipsis) and `(dataplane.DataPlane)`
+    (paren-wrapped, *ast.ParenExpr) as bypass vectors. Both are common Go
+    AST disguises that the prior matcher missed. Added two case arms to
+    isLegacyDataPlaneType to recursively unwrap each.
+  - **Validation**: canary still passes on current pkg/conntrack/
+    production tree.
+
 - **Timestamp**: 2026-05-25T05:58Z
-- **Action**: PR #1536 — add ErrDPDKDataplaneRetired sentinel + errors.Is test (AGY round-N feedback)
-- **File(s)**: pkg/config/compiler.go, pkg/config/parser_ast_test.go
+  - **Action**: PR #1536 — add ErrDPDKDataplaneRetired sentinel +
+    errors.Is test (AGY round-N feedback)
+  - **File(s)**: pkg/config/compiler.go, pkg/config/parser_ast_test.go
 - **Why**: Antigravity adversarial-review-mpksjr0e-f3mjrn flagged the lack of a
   structured sentinel error as an API design gap. External consumers (gRPC
   orchestration, REST wrappers, CLI tooling) cannot programmatically match
