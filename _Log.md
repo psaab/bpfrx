@@ -2228,3 +2228,10 @@
   slog.Warn wording to "the DPDK dataplane backend has been retired".
 - **Validation**: pkg/dataplane test suite green; no other in-tree strings
   pinned the old wording.
+
+- **Timestamp**: 2026-05-24 (1517 plan draft)
+- **Action**: Wrote plan v1 (DRAFT) for #1517 — migrate pkg/cli off legacy
+  dataplane.DataPlane (sub-#1451 S2). Mirrors apiRuntimeDataPlane pattern.
+- **File(s)**: docs/pr/1517-cli-migration/plan.md
+- **Why**: Triple-review methodology — plan first, code never first. Dispatch
+  Codex + Antigravity adversarial plan review before any code touches.
