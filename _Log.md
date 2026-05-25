@@ -288,6 +288,24 @@
     Rebased onto current master (which now has #1536).
   - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
     `_Log.md`
+- **Timestamp**: 2026-05-25T15:30:00Z
+  - **Action**: #1521 r1 code-review fixes — Codex MED-1 + AGY §1
+    (alias bypass) closed by new `TestNoMapNameLiteralAliasesOutside
+    Registry` that walks every BasicLit (not just .Map args) so
+    const-aliases, parenthesized selectors and method aliases are
+    all caught; non-map operator tokens in an explicit allow-list.
+    AGY §2 closed by replacing parity-canary `t.Skip` on missing
+    loader with a `BPFRX_LEGACY_LOADER_RETIRED=1` envvar sentinel.
+    AGY §3 / Codex LOW-1 closed by updating manager_ha.go:215
+    comment to reference `mapNameUserspaceCtrl`. Codex LOW-2
+    rejected (parity AST-pattern adds fragility vs loader refactor;
+    bytes.Contains is the minimum signal we actually want).
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    pkg/dataplane/userspace/manager_ha.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: 3 canaries × -count=5 all green; go test ./...
+    all 30 packages green.
+
 - **Timestamp**: 2026-05-25T15:10:00Z
   - **Action**: #1521 — decouple userspace maps_sync from legacy
     BPF map names (sub-#1451 S6). New file

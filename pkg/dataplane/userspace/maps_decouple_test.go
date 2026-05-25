@@ -104,6 +104,103 @@ func TestNoLiteralMapNamesOutsideRegistry(t *testing.T) {
 	}
 }
 
+// TestNoMapNameLiteralAliasesOutsideRegistry closes the
+// const-alias / parenthesized-selector / method-alias bypasses
+// that the .Map()-only canary above does not catch:
+//
+//	const stale = "userspace_ctrl"
+//	m.bpfShim.Map(stale)            // const alias
+//	(m.bpfShim.Map)("userspace_ctrl") // parenthesized selector
+//	f := m.bpfShim.Map; f("userspace_ctrl") // method alias
+//
+// All three patterns hide the literal from the .Map(literal)
+// inspector. This canary walks every *ast.BasicLit in the package
+// (excluding maps.go and _test.go files) and fails on any string
+// literal whose entire trimmed value starts with "userspace_" and
+// does NOT look like an operator-facing format string. The
+// "format-looking" exclusion is conservative: literals containing
+// whitespace or a `%` verb are treated as log/error prose and
+// permitted.
+//
+// Rationale: closes Codex code-review r1 MEDIUM-1 and AGY r1 §1
+// (const alias / paren selector / method alias).
+func TestNoMapNameLiteralAliasesOutsideRegistry(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", nil, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parse pkg/dataplane/userspace: %v", err)
+	}
+
+	var violations []string
+	for _, pkg := range pkgs {
+		for path, file := range pkg.Files {
+			base := filepath.Base(path)
+			if base == "maps.go" {
+				continue
+			}
+			if strings.HasSuffix(base, "_test.go") {
+				// Test files may construct map-name literals in
+				// helpers (e.g. injectShimMap) without functional
+				// risk on the production path.
+				continue
+			}
+			ast.Inspect(file, func(n ast.Node) bool {
+				lit, ok := n.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					return true
+				}
+				s, err := strconv.Unquote(lit.Value)
+				if err != nil || !strings.HasPrefix(s, "userspace_") {
+					return true
+				}
+				// Operator-facing format strings legitimately
+				// contain the map name as a substring (e.g.
+				// `"update userspace_local_v4 %08x: %w"` or
+				// `"userspace_ctrl map not loaded"`). Heuristic:
+				// any whitespace or `%` verb signals format
+				// prose, not a declaration alias.
+				if strings.ContainsAny(s, " \t%") {
+					return true
+				}
+				// Known non-map "userspace_*" identifiers used as
+				// operator-facing tokens (mode names, entry-program
+				// names, etc.). These predate this canary and are
+				// not BPF map names. Extend this list deliberately
+				// only when a new such identifier is introduced.
+				if isKnownNonMapUserspaceLiteral(s) {
+					return true
+				}
+				pos := fset.Position(lit.Pos())
+				violations = append(violations, fmt.Sprintf(
+					"%s:%d: forbidden map-name literal %q outside maps.go — "+
+						"reference a registry constant from maps.go instead",
+					pos.Filename, pos.Line, s))
+				return true
+			})
+		}
+	}
+	if len(violations) > 0 {
+		t.Fatalf("AST alias canary violations:\n  %s", strings.Join(violations, "\n  "))
+	}
+}
+
+// isKnownNonMapUserspaceLiteral lists "userspace_*" identifiers in
+// the package that are NOT BPF map names but operator-facing tokens
+// returned from String() helpers or used as JSON field values. They
+// pre-date the registry and are intentionally not subject to the
+// canary. Extending this list is a conscious decision the reviewer
+// should challenge.
+func isKnownNonMapUserspaceLiteral(s string) bool {
+	switch s {
+	case "userspace_compat", // DataplaneMode.String()
+		"userspace_strict": // DataplaneMode.String()
+		return true
+	}
+	return false
+}
+
 // TestRegistryParityWithLegacyLoader asserts that every userspace
 // map-name constant matches a literal string still present in the
 // legacy loader at pkg/dataplane/loader_ebpf.go. The two sides
@@ -111,19 +208,26 @@ func TestNoLiteralMapNamesOutsideRegistry(t *testing.T) {
 // canary keeps them in lockstep so a rename in either file is caught
 // at test time, not at helper bringup.
 //
-// The test Skips when the loader is absent (i.e. #1476 has deleted
-// it), so it self-retires cleanly.
+// The test self-retires (t.Skip) only when the explicit retirement
+// sentinel BPFRX_LEGACY_LOADER_RETIRED=1 is set. Without the
+// sentinel, a missing loader_ebpf.go is a hard failure — this is
+// deliberate per AGY r1 §2: a sibling PR that *moves* the loader
+// (e.g. to pkg/dataplane/ebpf/loader.go) must explicitly accept
+// retirement before this canary stands down. Otherwise drift
+// protection silently disappears.
 func TestRegistryParityWithLegacyLoader(t *testing.T) {
 	t.Parallel()
 
 	loaderPath := filepath.Join("..", "loader_ebpf.go")
 	body, err := os.ReadFile(loaderPath)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			t.Skipf("legacy loader absent (#1476 retirement?): %v", err)
+		if errors.Is(err, fs.ErrNotExist) && os.Getenv("BPFRX_LEGACY_LOADER_RETIRED") == "1" {
+			t.Skipf("legacy loader absent and BPFRX_LEGACY_LOADER_RETIRED=1 — #1476 retired: %v", err)
 			return
 		}
-		t.Fatalf("read legacy loader %s: %v", loaderPath, err)
+		t.Fatalf("read legacy loader %s: %v "+
+			"(if #1476 has retired the loader, set BPFRX_LEGACY_LOADER_RETIRED=1 "+
+			"or delete this canary)", loaderPath, err)
 	}
 
 	for _, tc := range []struct {
