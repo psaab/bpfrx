@@ -8,7 +8,7 @@
     in `docs/dataplane-decision-dpdk-vs-vpp.md` and
     `docs/dpdk-dataplane.md` from "is being retired" to "is retired"
     so banners and Current State sections agree. Converted bare
-    code span ``` `docs/vpp-dataplane-assessment.md` ``` to a
+    code span around `docs/vpp-dataplane-assessment.md` to a
     proper markdown link in the Related Documents section.
     Tightened the "underlay-NIC XSK" wording in the encrypted
     tunnel revisit trigger to "userspace-dp's AF_XDP socket on
