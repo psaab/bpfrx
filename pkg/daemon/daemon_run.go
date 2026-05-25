@@ -323,7 +323,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start background services if dataplane is loaded
 	var er *logging.EventReader
 	if d.dp != nil {
-		// Start FIB sync (DPDK: background route populator; eBPF: no-op)
+		// Start FIB sync (userspace: background route populator; eBPF: no-op).
+		// The DPDK reference was retired in #1527 (Phase 2).
 		if lp := d.legacyDP(); lp != nil {
 			lp.StartFIBSync(ctx)
 		}
