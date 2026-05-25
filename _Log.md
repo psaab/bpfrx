@@ -2285,3 +2285,13 @@
   sandbox-FS-blocked retries); AGY adversarial-review-mpkvctz4-xk8x46
   MERGE-READY (exhaustive 10-check report with byte-for-byte evidence);
   Copilot COMMENTED with 1 minor inline finding, addressed in 91e1da9f.
+
+- **Timestamp**: 2026-05-25T07:30Z
+- **Action**: PR #1549 — fix stale plan.md snippet per Copilot d9545813 review
+- **File(s)**: docs/pr/1517-cli-migration/plan.md
+- **Why**: Copilot review on d9545813 left 1 inline comment that the plan.md
+  snippet for cliUserspaceControlProvider still references `request security
+  flow ...` while the actual source comment (fixed in 91e1da9f) and the actual
+  handler path are `request chassis cluster data-plane userspace` via
+  cli_request.go:handleRequestChassisClusterDataPlane. Updated plan snippet
+  in lockstep so docs match implementation. No code change.
