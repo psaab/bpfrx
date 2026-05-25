@@ -140,21 +140,15 @@ const dpdkSubtreeLeakageCanaryDPDKConstName = "dataplaneTypeDPDK"
 // the canary accepts in place of the typed constant.
 const dpdkSubtreeLeakageCanaryDPDKLiteral = `"dpdk"`
 
-// dpdkSubtreeLeakageCanaryRepoRoot is the path the canary walks
-// when invoked against the real production tree. The test
-// package compiles from `pkg/config/`, so the repo root is two
-// directories up.
-const dpdkSubtreeLeakageCanaryRepoRoot = ".."
-
 // dpdkSubtreeLeakageCanaryProductionScanRoot is the production
 // source root the canary scans for the
 // `TestDPDKSubtreeLeakageCanary_RealRepoIsClean` test. v3 scope
-// is just `pkg/config/` per the round-2 plan (Codex round-1 F1).
-// Future canary iterations may expand to scan other packages
-// that grow `DPDKDataplane` readers.
-var dpdkSubtreeLeakageCanaryProductionScanRoot = filepath.Join(
-	dpdkSubtreeLeakageCanaryRepoRoot, "config",
-)
+// is just `pkg/config/` per the round-2 plan (Codex round-1 F1):
+// future canary iterations may expand to scan other packages
+// that grow `DPDKDataplane` readers. The Go test binary runs
+// with the package source as its working directory, so the
+// production scan root is just ".".
+const dpdkSubtreeLeakageCanaryProductionScanRoot = "."
 
 // dpdkSubtreeLeakageFinding records a single ungated read or
 // pass-through. The test prints findings in stable file:line
@@ -188,10 +182,18 @@ func scanForDPDKSubtreeLeakage(t *testing.T, root string) []dpdkSubtreeLeakageFi
 		if strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
-		// Strip the leading "../" pair when the caller passes
-		// `dpdkSubtreeLeakageCanaryProductionScanRoot` so the
-		// allowlist key is package-relative.
-		relKey := filepath.ToSlash(path)
+		// Allowlist keys are paths relative to the walk root,
+		// in forward-slash form so the canary's contract does
+		// not silently break on a future Windows port. Use
+		// `filepath.Rel` rather than the raw walked path so an
+		// allowlist key like `"compiler_system.go"` matches
+		// regardless of whether `root` is "." (production scan)
+		// or a `t.TempDir()` (fixture scan).
+		relKey, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			relKey = path
+		}
+		relKey = filepath.ToSlash(relKey)
 		if _, allowed := dpdkSubtreeLeakageCanaryFileAllowlist[relKey]; allowed {
 			return nil
 		}
@@ -309,6 +311,12 @@ func scanFileForDPDKSubtreeLeakage(t *testing.T, path string) []dpdkSubtreeLeaka
 			// CallExpr we will also visit the CallExpr branch
 			// below. We still want to fire on a bare read like
 			// `_ = sys.DPDKDataplane.Cores`.
+			//
+			// A nil enclosing FuncDecl means the selector lives in
+			// package scope (var/const initializer). That site
+			// runs unconditionally at init time and cannot be
+			// gated by `if effectiveDataplaneType ...`, so it is
+			// always an ungated read.
 			fn := enclosingFuncDecl(node)
 			if fn == nil {
 				pos := fset.Position(node.Pos())
@@ -345,6 +353,10 @@ func scanFileForDPDKSubtreeLeakage(t *testing.T, path string) []dpdkSubtreeLeaka
 			if passthroughArg == nil {
 				return true
 			}
+			// As with the SelectorExpr branch, a CallExpr in
+			// package scope (e.g. a var initializer that calls a
+			// helper with `cfg.System.DPDKDataplane`) cannot be
+			// gated and must fire.
 			fn := enclosingFuncDecl(node)
 			if fn == nil {
 				pos := fset.Position(passthroughArg.Pos())
@@ -626,7 +638,8 @@ func TestDPDKSubtreeLeakageCanary_NegativeRejectsMultiVariableBypass(t *testing.
 
 // TestDPDKSubtreeLeakageCanary_NegativeRejectsPackageScopeInitializer
 // asserts the canary fires on package-scope reads and helper pass-throughs.
-// Package scope has no enclosing FuncDecl, so there is no valid gate context.
+// Package scope has no enclosing FuncDecl, so there is no valid gate context
+// (Copilot finding on PR #1553).
 func TestDPDKSubtreeLeakageCanary_NegativeRejectsPackageScopeInitializer(t *testing.T) {
 	root := writeLeakageCanaryFixture(t, map[string]string{
 		"a.go": negativePackageScopeInitializerFixture,

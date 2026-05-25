@@ -56,8 +56,6 @@
 
 ## Plan v1 (commit cf9c1518)
 
-## Plan v1 (commit cf9c1518)
-
 - Codex round-1: task-mpku5dam-crjpoi — PLAN-NEEDS-MAJOR
   - 1. Canary excludes pkg/config/ but a future strict validator
     lands in pkg/config/ — primary regression class.

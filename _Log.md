@@ -764,13 +764,32 @@
     `DPDKDataplane` selector or helper pass-through at package
     scope is reported immediately instead of being skipped when
     no enclosing `FuncDecl` exists. Added
+- **Timestamp**: 2026-05-25T16:00:00Z
+  - **Action**: #1539 Copilot findings on PR #1553 — 5 valid
+    findings on HEAD 12237f12 addressed across two commits
+    (Copilot SWE bot fixed findings 1/5 + I rebased on top
+    with findings 2/3/4). (1+5) package-scope init bypass:
+    SelectorExpr and CallExpr branches treated `fn == nil`
+    as silent skip — `var leaked = cfg.System.DPDKDataplane`
+    at file scope escaped the canary; both fixed by treating
+    nil enclosing FuncDecl as an automatic finding with
+    distinct `package-scope read/passthrough of ...` why
+    text. New
     `TestDPDKSubtreeLeakageCanary_NegativeRejectsPackageScopeInitializer`
-    with a fixture covering both a package-scope read and a
-    package-scope helper pass-through. Updated the canary's file
-    contract comments to document that package scope is always
-    ungated.
+    exercises both kinds.
+    (2) RepoRoot inconsistency: `dpdkSubtreeLeakageCanaryRepoRoot
+    = ".."` then joined with "config" was confusing; replaced
+    with `dpdkSubtreeLeakageCanaryProductionScanRoot = "."`.
+    (3) Allowlist key drift: comment said "strip leading ../"
+    but code didn't. Replaced with proper `filepath.Rel(root,
+    path)` normalization so future allowlist keys are
+    package-relative regardless of walk root.
+    (4) Duplicate "Plan v1" header in reviewer-ids.md removed.
+    All 11 canary tests pass; 5x flake-clean; full pkg/config
+    suite green.
   - **File(s)**: pkg/config/dpdk_subtree_leakage_canary_test.go,
     _Log.md
+    docs/pr/1539-ast-leakage-guard/reviewer-ids.md, _Log.md
 - **Timestamp**: 2026-05-25T15:50:00Z
   - **Action**: #1539 code-review on PR #1553 + lint fix
     (commit 6a7d0649). Codex MERGE-READY directly on 8c5a4ced
