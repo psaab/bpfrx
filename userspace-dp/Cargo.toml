@@ -20,6 +20,16 @@ serde_json = "1.0"
 rustc-hash = "2.1"
 sha2 = "0.10"
 slab = "0.4"
+# WireGuard clean-room termination (docs/pr/wireguard-clean/plan.md):
+# snow provides Noise IK with explicit state machine and no hidden
+# output queues. The transitive crypto set includes
+# chacha20poly1305/curve25519-dalek/blake2 and ring.
+snow = "0.10"
+# zeroize is already pulled transitively by curve25519-dalek/snow; we
+# pin the version we use directly for the engine's static-key state
+# so the WG private key is wiped on engine drop. Cost: zero — just a
+# Drop impl on a 32-byte field.
+zeroize = "1.8"
 
 [build-dependencies]
 cc = "1.2"

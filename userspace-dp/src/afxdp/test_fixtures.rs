@@ -149,6 +149,7 @@ pub(super) fn native_gre_snapshot(include_neighbor: bool) -> ConfigSnapshot {
             key: 0,
             ttl: 64,
             transport_table: "inet6.0".to_string(),
+            ..Default::default()
         }],
         routes: vec![
             RouteSnapshot {
