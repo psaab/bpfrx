@@ -110,6 +110,72 @@
   - **File(s)**:
     `docs/pr/1520-userspace-boot-extraction/plan.md`,
     `docs/pr/1520-userspace-boot-extraction/reviewer-ids.md`
+- **Timestamp**: 2026-05-25T08:30:00Z
+  - **Action**: #1538 plan v4 — addresses Codex round-3
+    PLAN-NEEDS-MINOR (3 findings) + AGY round-3
+    PLAN-NEEDS-MINOR (1 finding). Changes:
+    (1) drop "REQUIRED" rationale for `set system
+        dataplane-type userspace` (no-op — unset == userspace
+        per `effectiveDataplaneType` and validateDataplaneTypeStrict
+        only rejects explicit `dpdk`); line stays as
+        self-documenting future-proof;
+    (2) fix test-count "two" → "three" throughout the plan;
+    (3) replace bad-syntax three-color-policer line
+        `action loss-priority high then discard` (parses via
+        schema-less fallback, silently ignored by compiler)
+        with schema-clean `then discard`;
+    (4) rewrite gRPC test plan to match existing
+        direct-handler style at server_config_test.go:15-25
+        (no bufconn; use `store.LoadSet` per existing
+        pattern, not nonexistent `LoadCandidate`/`Edit`).
+    Sanity-checked the fixture locally with a throw-away
+    test: under current fail-fast, only CoS error surfaces;
+    under accumulator both surface separated by one '\n'.
+  - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
+    `_Log.md`
+
+- **Timestamp**: 2026-05-25T08:15:00Z
+  - **Action**: #1538 plan v3 — addresses Codex round-2
+    PLAN-NEEDS-MINOR on plan v2. AGY round-2 was PLAN-READY.
+    Minor fix: v2's CoS fixture used "both buffer-size bytes
+    AND percent set" which is NOT parser-reachable
+    (`pkg/config/compiler_class_of_service.go:239` clears the
+    alternate field; validator at `pkg/config/compiler.go:386`
+    documents the state arises only from constructed configs).
+    v3 switches the parser-driven tests to use
+    `equal-flow-enforcement` without `transmit-rate exact` as
+    the parser-reachable CoS error and `single-rate
+    color-blind` without `committed-information-rate` as the
+    parser-reachable policer error. Also clarifies that there
+    are THREE new tests (not two) and splits fixture-build
+    technique per-test (parser for tests 1+3, direct-helper
+    for the byte-identity test 2).
+  - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
+    `_Log.md`
+
+- **Timestamp**: 2026-05-25T08:00:00Z
+  - **Action**: #1538 plan v2 — addresses Codex round-1
+    PLAN-NEEDS-MAJOR (4 findings) on plan v1. Changes:
+    (a) keep `validateDataplaneTypeStrict` as a separate
+    fail-fast precheck BEFORE the accumulator — preserves
+    #1536's DPDK-first / no-leak contract pinned by
+    `TestDataplaneTypeDPDKRejectedAtCommitFiresFirst`
+    (`pkg/config/parser_ast_test.go:2855,:2909,:2913`);
+    (b) drop the "matches Junos commit check" overclaim and
+    frame the change as an xpf UX choice grounded in
+    upgrade-friction reduction; (c) tighten wording from
+    "all structural errors" to "one error per validator
+    family" since each strict family still fail-fasts
+    internally; (d) add a third test
+    `TestCompileCheckMultiErrorRendersThroughGRPC` covering
+    the multi-line rendering through `pkg/grpcapi`.
+    AGY round-1 verdict was PLAN-READY; v2 preserves the
+    audit it confirmed (validator independence, substring
+    + sentinel preservation, wrap-chain mechanics).
+    Rebased onto current master (which now has #1536).
+  - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
+    `_Log.md`
+ 9a0e7012 (config: plan #1538 — accumulate strict validation errors via errors.Join)
 
 - **Timestamp**: 2026-05-25T05:55:00Z
   - **Action**: PR #1536 round-3 cleanup — address Codex MAJOR
@@ -283,7 +349,21 @@
     is deferred to #1527/#1528. This PR adds a leading retirement
     note above it instead.
   - **File(s)**: `docs/pr/1529-dpdk-docs-sweep/plan.md`, `_Log.md`
-## 2026-05-25
+
+- **Timestamp**: 2026-05-25T07:30:00Z
+  - **Action**: #1538 plan v1 (DRAFT) — accumulate strict validation
+    errors via `errors.Join` in `compileExpanded` so `commit check`
+    surfaces every dormant structural finding in one pass instead
+    of forcing whack-a-mole CLI round-trips. Plan composes with the
+    in-flight #1536 (validateDataplaneTypeStrict) under either merge
+    order. Walks Junos UX (Junos itself accumulates), validator
+    independence (each strict validator reads its own typed sub-
+    struct, all nil-safe), substring/sentinel contract preservation
+    (`strings.Contains` + `errors.Is` traverse `errors.Join`), and
+    risk table. Calls out 7 hostile reviewer questions including
+    PLAN-KILL grounds.
+  - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
+    `_Log.md`
 
 - **Timestamp**: 2026-05-25T05:00:00Z
   - **Action**: #1501 A2 — replaced the stale TODO + contradictory
