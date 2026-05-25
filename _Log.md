@@ -3599,3 +3599,26 @@
   schema children gracefully). Added Q11 + Q12 for the v2 fix path and the
   HA-sync edge case. Codex r1+r2 ENV-BLOCKED sandbox failure; AGY-only verdict
   on v1.
+
+- **Timestamp**: 2026-05-25T09:50Z
+- **Action**: #1528 plan v3 — addresses Codex r3 PLAN-NEEDS-MAJOR
+- **File(s)**: docs/pr/1528-dpdk-mechanical-removal/plan.md, reviewer-ids.md
+- **Why**: Codex r3 (task-mpld4f7u-l7ixka) flagged 4 substantive findings on
+  v2's load-rewrite approach: (1) the rewrite walks the raw tree and would
+  MISS apply-groups + ${node} injected dpdk because group expansion happens
+  inside CompileConfig/CompileConfigForNode BEFORE compileExpanded;
+  (2) Q11 HA-sync claim was wrong — SyncApply does NOT use Store.Load() so
+  inbound DPDK sync is rejected with a compile error (verified at
+  daemon_ha_sync.go:566 → store.go:191); (3) ConfigTree.FindPath doesn't
+  exist publicly (only FindChild + DeletePath); (4) rewrite leaves orphan
+  DPDK sub-stanza (cores, memory, rx-mode, ports) which userspace compile
+  silently drops. v3 PIVOT to load-mode bypass: add compileOpts{loadMode}
+  on private compileExpanded plus CompileConfigForLoad + CompileConfigForNodeAndLoad
+  exported helpers called by Store.compileTreeForLoad. Bypass operates AFTER
+  group expansion (handles apply-groups), no AST mutation (no orphan concern),
+  and preserves DataplaneType=="dpdk" through to NewRuntimeDataPlane which
+  triggers the existing daemon_run.go:247 ErrDPDKBackendRetired soft-fallback.
+  Also acknowledged the runtime/import_canary_test.go:47 dpdk forbidden-import
+  entry as a KEEP (defense-in-depth). AGY r2 (adversarial-review-mpld4tso-19877w)
+  returned PLAN-READY on v2 but missed findings 1, 3, 4; v3 takes Codex's
+  strictly-superior feedback.

@@ -1,7 +1,115 @@
 # #1528 — DPDK Retirement Phase 3: Mechanical Source Removal
 
-**Status:** DRAFT v2 — addresses AGY round-1 PLAN-NEEDS-MAJOR finding
-on stored-config rolling-upgrade bootstrap-loop bug
+**Status:** DRAFT v3 — addresses Codex r3 PLAN-NEEDS-MAJOR (4 findings)
+on v2's load-time rewrite approach + missed orphan sub-stanza
+
+## v3 changes from v2
+
+Codex r3 (task-mpld4f7u-l7ixka) returned PLAN-NEEDS-MAJOR with 4 substantive
+findings, all verified against actual source:
+
+1. **§4.6 load-rewrite misses apply-groups + ${node} expansion.** Verified
+   at `pkg/config/compiler.go:28-37` (CompileConfig) and `compiler.go:62-72`
+   (CompileConfigForNode): both call `tree.ExpandGroups()` BEFORE
+   `compileExpanded`, and `compileExpanded` runs
+   `validateDataplaneTypeStrict` at line 241 on the EXPANDED tree.
+   `parser_ast_test.go:2918 TestDataplaneTypeDPDKRejectedAtCommitViaApplyGroups`
+   already pins this: a `groups { legacy { system { dataplane-type dpdk; }}}`
+   block + `apply-groups legacy` is rejected by the strict validator
+   because the validator sees the post-expansion tree. v2's
+   `rewriteRetiredDataplaneType(tree)` walks the RAW unexpanded tree and
+   removes `system { dataplane-type dpdk; }` only — it would MISS the
+   apply-groups injected case. Rolling-upgrade bootstrap-loop bug remains.
+
+2. **v2 Q11 HA-sync claim was wrong.** Verified at
+   `pkg/daemon/daemon_ha_sync.go:566 → 322 → 347 → daemon_apply.go:124 →
+   store.go:191 SyncApply → store.go:205 compileTree`. Inbound config sync
+   does NOT go through Store.Load() — it parses + calls compileTree
+   directly. An upgraded secondary that receives an un-upgraded primary's
+   DPDK config sync REJECTS the inbound payload with a compile error
+   (validateDataplaneTypeStrict). AGY r2 confirmed this is the correct
+   behavior — no flap loop, just clean rejection.
+
+3. **§4.6 `ConfigTree.FindPath` doesn't exist publicly.** Verified
+   `pkg/config/ast.go` + `ast_edit.go`: only `FindChild`, `FindChildren`,
+   `DeletePath`, `SetPath` exist. v2's helper signature was imprecise.
+
+4. **Rewrite leaves orphan DPDK sub-stanza children.** Verified by reading
+   `pkg/config/compiler_system.go:228` switch under `case "dataplane"` —
+   when `effectiveDataplaneType(sys.DataplaneType) == dataplaneTypeUserspace`,
+   control routes to `compileUserspaceDataplane`, which (line 461 onward)
+   has no default case and silently ignores unrecognized children. So
+   `cores`, `memory`, `socket-mem`, `rx-mode`, `ports` (all DPDK-only)
+   would parse as leaves and drop silently. Functionally harmless but
+   operationally confusing.
+
+**v3 PIVOT: switch to load-mode bypass (Codex Option (a)).** Instead of
+rewriting the raw stored tree at Load, add a `loadMode bool` parameter
+to `Store.compileTree` (default false; true only on the `Store.Load()`
+call site) that skips `validateDataplaneTypeStrict` inside
+`compileExpanded`. Implementation shape:
+
+```go
+// pkg/config/compiler.go
+type compileOpts struct { loadMode bool }
+func CompileConfig(tree *ConfigTree) (*Config, error)          { return compileWithOpts(tree, compileOpts{}) }
+func CompileConfigForLoad(tree *ConfigTree) (*Config, error)   { return compileWithOpts(tree, compileOpts{loadMode: true}) }
+func CompileConfigForNode(tree *ConfigTree, nodeID int) (*Config, error) { ... compileExpanded(tree, compileOpts{}) }
+func CompileConfigForNodeAndLoad(tree *ConfigTree, nodeID int) (*Config, error) { ... compileExpanded(tree, compileOpts{loadMode: true}) }
+
+// inside compileExpanded:
+if !opts.loadMode {
+    if err := validateDataplaneTypeStrict(cfg); err != nil { return nil, err }
+}
+// other strict validators still run regardless — only the DPDK
+// retirement reject is bypassed
+```
+
+`Store.Load()` calls `compileTreeForLoad`, which dispatches to
+`CompileConfigForLoad` (standalone) or `CompileConfigForNodeAndLoad`
+(cluster). Every other compile path (`CommitCheck`, `Commit`,
+`SyncApply`, `Validate`, etc.) keeps the strict validator.
+
+Net effect:
+
+- Load succeeds. `cfg.System.DataplaneType == "dpdk"` is preserved.
+  No AST mutation. No orphan sub-stanza concern.
+- `daemon_run.go:244` reads `dpType = "dpdk"`.
+- `dataplane.NewRuntimeDataPlane("dpdk")` hits `case TypeDPDK: return
+  nil, ErrDPDKBackendRetired`.
+- `daemon_run.go:247` soft-fallback FIRES (now reachable for the
+  load-bypass case) → daemon runs in config-only mode. Operator sees
+  warning, fixes config from CLI.
+- Apply-groups + ${node} cases handled identically because the bypass
+  operates inside `compileExpanded` after group expansion.
+- SyncApply continues to call compileTree WITHOUT load-mode, so an
+  un-upgraded primary's DPDK config sync is rejected with a compile
+  error (matches finding 2 — correct behavior, no flap).
+- Operator-driven CLI `commit` keeps the Phase 1 reject message.
+
+Cost: one boolean parameter on a single private function
+(`compileExpanded`) plus two new exported helpers
+(`CompileConfigForLoad`, `CompileConfigForNodeAndLoad`). No AST
+mutation helper. No orphan sub-stanza concern.
+
+Other v3 follow-ons:
+
+- §4.4 socket-mem decision (keep with retirement-marker description)
+  is preserved from v2 — it remains the right call regardless of
+  load-mode-vs-rewrite, because the schema-node description is the
+  operator-facing `?`-help text.
+- §6 Hidden invariant #1 (stored-config rolling upgrade) updated to
+  cite the load-bypass path.
+- §9 out-of-scope unchanged (#1539 / #1553 coordination still applies).
+- §10 Q11 reworked to record verified SyncApply behavior.
+- §10 Q13 NEW: load-mode signature blast radius — is the four-function
+  shape acceptable, or should we collapse to a single
+  `Compile(tree, opts)` API?
+- AGY r2 (adversarial-review-mpld4tso-19877w) returned PLAN-READY on v2
+  but missed findings 1, 3, 4. v3 takes Codex's strictly-superior
+  feedback and folds it cleanly.
+
+## v2 changes from v1
 
 ## v2 changes from v1
 
@@ -192,6 +300,7 @@ moves.
 | `docs/dpdk-dataplane.md`, `docs/dataplane-decision-dpdk-vs-vpp.md` | Already largely swept in Phase 4 (#1529). Recheck and delete if stale, or trim to a 1-paragraph retirement note. **Pre-check `docs/dpdk-dataplane.md` exists** — issue body asks for short retirement notes; Phase 4 may have already deleted these |
 | `pkg/dataplane/README.md` | Drop the #1475 DPDK Backend Policy section |
 | `scripts/refactoring-audit.sh` (lines 61, 72) | Remove `dpdk_worker` from the `find userspace-dp/src userspace-xdp/src dpdk_worker -name '*.rs'` and `find pkg cmd dpdk_worker -name '*.go'` invocations. The script silently no-ops on a missing directory (`2>/dev/null` swallows the warning) but the path is dead and should be removed for clarity |
+| `pkg/dataplane/runtime/import_canary_test.go:47` | **KEPT** — this canary lists `pkg/dataplane/dpdk` as a forbidden import for `pkg/dataplane/runtime`. After this PR the package doesn't exist, but keeping the forbidden-import entry is defense-in-depth against a future revival. The entry costs ~1 line and the canary still runs cleanly because the runtime package itself has no DPDK imports. Codex r3 informational note: post-PR `_test.go` grep for `dpdk\|DPDK` will hit this file plus the Phase 1 reject tests plus the migrated factory/panic invariants — that's the expected bounded set |
 
 ### 4.4 Canary test surgery (highest-risk edit)
 
@@ -242,93 +351,166 @@ node boots with `system dataplane-type dpdk` persisted in
 Without this branch the daemon fatal-exits, leaving no path to fix the
 config from CLI.
 
-### 4.6 Stored-config-tolerant load path (v2 addition — fixes inherited Phase 1 bug)
+### 4.6 Stored-config-tolerant load path (v3: load-mode bypass)
 
-**AGY round-1 verified a critical bootstrap bug inherited from Phase 1
-(#1526)**: the daemon_run.go:247 soft-fallback at the factory call is
-**unreachable** for the stored-config case because the error is thrown
-EARLIER, inside `Store.Load()`. Path:
+**The inherited Phase 1 (#1526) bug**: under v1/v2 Option A as drafted,
+`validateDataplaneTypeStrict` fires inside `Store.Load()` ON THE
+EXPANDED tree (post-apply-groups). The error swallowed at
+`daemon_run.go:87`; `ActiveConfig()` is nil; daemon boots empty.
+`errors.Is(err, ErrDPDKBackendRetired)` at `daemon_run.go:247` is
+unreachable for the stored-config path. Node loses interfaces, VRFs,
+routing.
 
-1. `pkg/configstore/store.go:96`: `compiled, err := s.compileTree(tree)`
+Trace:
+
+1. `pkg/configstore/store.go:96`: `s.compileTree(tree)`
 2. `pkg/configstore/store.go:152`: `compileTree` → `config.CompileConfig(tree)`
-3. `pkg/config/compiler.go:241`: `validateDataplaneTypeStrict(cfg)` fires
-   on the persisted `dataplane-type dpdk`, returns
-   `ErrDPDKDataplaneRetired`
-4. `Store.Load()` returns `fmt.Errorf("compile config: %w", err)`
-5. `pkg/daemon/daemon_run.go:87`: `slog.Warn("failed to load config
-   from db", "err", err)` — error swallowed
-6. `pkg/daemon/daemon_run.go:91-95`: `ActiveConfig()` is nil →
-   `bootstrapFromFile()` runs OR daemon starts with empty config
-7. By the time `daemon_run.go:243` resolves `dpType`, the active config
-   is either the bootstrap text file (no DPDK) or empty (defaults to
-   userspace). The `errors.Is(err, ErrDPDKBackendRetired)` branch at
-   line 247 is unreachable for the stored-config path
-8. Result: node boots with empty/default config — no interfaces, no
-   VRFs, no routing — operational blackout
+   or `config.CompileConfigForNode(tree, nodeID)`
+3. `pkg/config/compiler.go:28` (CompileConfig) / `:62`
+   (CompileConfigForNode): `tree.ExpandGroups()` runs FIRST
+4. `pkg/config/compiler.go:50` / `:73`: `compileExpanded(tree)` runs
+5. `pkg/config/compiler.go:241`: `validateDataplaneTypeStrict(cfg)`
+   fires on the expanded tree → `ErrDPDKDataplaneRetired`
+6. Error wrapped as `"compile config: ..."`, swallowed at
+   `daemon_run.go:87`
 
-**Fix**: Add a load-mode bypass to `compileTree` so persisted-config
-load tolerates the retired backend. Two acceptable shapes:
-
-**Option A2-fix-Rewrite (PREFERRED)**: at `Store.Load()`, before
-`compileTree`, walk the active tree and if `DataplaneType == "dpdk"`
-is persisted, rewrite it to empty (defaults to userspace) AND log a
-loud warning. Operator then sees the daemon boot with userspace and
-the warning in journald. The candidate config inherits the rewrite
-and a subsequent commit persists the cleanup.
+**v3 fix: load-mode bypass.** Add a `loadMode bool` parameter on the
+private `compileExpanded` plus two new public entry points that set
+it. `Store.Load()` calls the load-mode entry point; every other
+compile path (commit, sync-apply, validate) keeps the strict validator.
 
 ```go
-// pkg/configstore/store.go in Load():
-if tree != nil {
-    if rewrote := rewriteRetiredDataplaneType(tree); rewrote {
-        slog.Warn("persisted active-config selects retired DPDK dataplane; rewriting to userspace default",
-            "remediation", "review and `commit` after daemon comes up",
-        )
+// pkg/config/compiler.go
+
+// CompileConfigForLoad is like CompileConfig but skips the
+// retirement-reject validators. It is used ONLY by Store.Load() to
+// tolerate pre-#1526 configs whose persisted active config still
+// selects a retired dataplane. The daemon then picks up the retired
+// DataplaneType, NewRuntimeDataPlane returns ErrDPDKBackendRetired,
+// and the soft-fallback at daemon_run.go:247 catches the sentinel.
+func CompileConfigForLoad(tree *ConfigTree) (*Config, error) {
+    return compileWithOpts(tree, "", compileOpts{loadMode: true})
+}
+
+// CompileConfigForNodeAndLoad is the cluster-mode counterpart.
+func CompileConfigForNodeAndLoad(tree *ConfigTree, nodeID int) (*Config, error) {
+    return compileWithOpts(tree, fmt.Sprintf("node%d", nodeID), compileOpts{loadMode: true})
+}
+
+// compileWithOpts is the internal shared helper used by all four
+// public entry points (Compile, CompileForLoad, CompileForNode,
+// CompileForNodeAndLoad).  CompileConfig and CompileConfigForNode
+// delegate to this with opts.loadMode == false; the *ForLoad
+// variants set loadMode == true.
+
+type compileOpts struct {
+    loadMode bool // skip retirement-reject validators (Store.Load only)
+}
+
+// inside compileExpanded:
+if !opts.loadMode {
+    if err := validateDataplaneTypeStrict(cfg); err != nil {
+        return nil, err
     }
 }
-compiled, err := s.compileTree(tree)
+// All other strict validators run regardless — only the DPDK
+// retirement reject is bypassed. Type-coercion / structural
+// validators still apply.
 ```
 
-`rewriteRetiredDataplaneType(*config.ConfigTree) bool` is a small
-helper in `pkg/configstore/` that uses the public AST API
-(`tree.FindPath`, `tree.DeletePath` or equivalent — to be confirmed
-during impl) to find and remove the `system { dataplane-type dpdk; }`
-leaf.
+`Store.Load()` calls a new private `compileTreeForLoad` (mirrors
+`compileTree` but dispatches to the load-mode entry points):
 
-**Option A2-fix-Bypass (alternative)**: add an `isLoad bool` parameter
-to `Store.compileTree` and a matching `loadMode bool` parameter to
-`CompileConfig` / `compileExpanded`. In load mode, `compileExpanded`
-skips the strict-validator stack (or skips only the
-DPDK-retirement validator) but still runs the schema/type validators.
-The error never fires; load succeeds; the operator can fix the
-config from CLI.
+```go
+// pkg/configstore/store.go
 
-**Recommendation: Option A2-fix-Rewrite.** Rewriting at Load is
-operator-friendly: the daemon boots green, the log message points at
-the remediation, and the candidate config inherits the rewrite so a
-straight `commit` clears it. The Bypass option leaves the persisted
-config un-rewritten and silently lets the strict validator fail at
-the next CLI `commit`, which is more confusing than helpful.
+func (s *Store) compileTreeForLoad(tree *config.ConfigTree) (*config.Config, error) {
+    if err := s.schemaValidateExpandedTree(tree); err != nil {
+        return nil, err
+    }
+    if s.nodeID >= 0 {
+        return config.CompileConfigForNodeAndLoad(tree, s.nodeID)
+    }
+    return config.CompileConfigForLoad(tree)
+}
 
-The fix scope is small (~30 LOC + tests):
-- `pkg/configstore/store.go`: `Load()` calls
-  `rewriteRetiredDataplaneType(tree)` before `compileTree`
-- `pkg/configstore/dataplane_retire.go` (new): helper +
-  `slog.Warn` call
+// Load() callsite:
+compiled, err := s.compileTreeForLoad(tree)
+if err != nil {
+    return fmt.Errorf("compile config: %w", err)
+}
+
+// After compileTreeForLoad succeeds with DataplaneType == "dpdk", log loudly
+// once so the operator sees the retirement-active path is hot.
+if compiled != nil && compiled.System.DataplaneType == "dpdk" {
+    slog.Warn(
+        "persisted active-config selects retired DPDK dataplane; daemon will run in config-only mode until config is updated",
+        "remediation", "set system dataplane-type userspace; commit",
+    )
+}
+```
+
+Net effect:
+
+- `Store.Load()` succeeds. `cfg.System.DataplaneType == "dpdk"` is
+  preserved (no AST mutation).
+- `daemon_run.go:244`: `dpType = "dpdk"`.
+- `dataplane.NewRuntimeDataPlane("dpdk")` hits `case TypeDPDK: return
+  nil, ErrDPDKBackendRetired`.
+- `daemon_run.go:247` soft-fallback FIRES (now reachable) → daemon
+  runs in config-only mode.
+- Apply-groups + ${node} cases are handled identically because the
+  bypass runs INSIDE `compileExpanded` after expansion.
+- `SyncApply` continues using `compileTree` (non-load mode), so
+  inbound DPDK config sync from an un-upgraded primary is rejected
+  with a clean compile-error (Codex finding 2 — correct behavior, no
+  flap).
+- `CommitCheck` / `Commit` keep the Phase 1 reject message verbatim;
+  existing `TestDataplaneTypeDPDKRejected*` tests continue to pass.
+
+Implementation scope (~70 LOC + tests):
+
+- `pkg/config/compiler.go`: add `compileOpts` struct + private
+  `compileWithOpts` helper; refactor `CompileConfig`,
+  `CompileConfigForNode` to delegate; add `CompileConfigForLoad` and
+  `CompileConfigForNodeAndLoad` public entry points. `compileExpanded`
+  takes the opts and gates `validateDataplaneTypeStrict`.
+- `pkg/configstore/store.go`: add `compileTreeForLoad`; `Load()`
+  switches to it; emit the `slog.Warn` when DataplaneType=="dpdk".
 - `pkg/configstore/store_test.go`: new test
-  `TestLoad_RewritesPersistedDPDKDataplaneType` confirms the rewrite
-  happens, `ActiveConfig()` is non-nil, `DataplaneType == ""`, and
-  the warning fires
-- `pkg/daemon/daemon_run.go:247` soft-fallback: kept (defense-in-depth
-  for the `NewRuntimeDataPlane(TypeDPDK)` path that callers other than
-  the stored-config flow could still hit, e.g. config sync, REST/gRPC
-  candidate apply that races the rewrite)
+  `TestLoad_PersistedDPDKDataplaneTypeBootsConfigOnly` — write
+  `system dataplane-type dpdk` to disk via `db.WriteActive`, call
+  `Store.Load()`, assert `ActiveConfig() != nil` AND
+  `ActiveConfig().System.DataplaneType == "dpdk"`. New test
+  `TestCompileConfigForLoad_BypassesDPDKReject` — direct test on the
+  compiler entry point.
+- `pkg/config/compiler_test.go` (existing file): pin that
+  `CompileConfig("dataplane-type dpdk")` still fails (commit semantics
+  unchanged); the load-mode entry point variant succeeds.
+- `pkg/daemon/daemon_run.go:247`: kept verbatim (defense-in-depth).
 
 This makes Phase 3 the right place to close the inherited bug because:
 - The bug is invisible until the DPDK-retirement migration sees real
   rolling-upgrade traffic
 - Phase 3 owns "DPDK is retired cleanly" — leaving the boot blackout
   open is operationally unacceptable
-- The fix is small, additive, and orthogonal to the deletion work
+- The fix is small, additive, orthogonal to the deletion work, and
+  has zero blast radius on commit/sync/validate semantics
+
+**Why bypass over rewrite (Codex r3 finding 1):**
+
+| Concern | Rewrite (v2) | Bypass (v3) |
+|---|---|---|
+| Apply-groups injected dpdk | MISSED (walks raw tree) | HANDLED (runs after expansion) |
+| AST mutation safety | Custom helper using DeletePath | None — no AST mutation |
+| Orphan DPDK sub-stanza (`cores`, `memory`, ...) | Orphans persist; userspace path silently drops them | Orphans persist; userspace path silently drops them (same behavior — neither shape can solve this without a separate sub-tree scrub, which is out of scope) |
+| Config-only-mode reachability | After rewrite, DataplaneType=="" → userspace; daemon comes up fully | DataplaneType=="dpdk" preserved; daemon runs in config-only mode (correct semantic: the operator IS asking for DPDK, which IS retired) |
+| Operator confusion | Daemon comes up "running" but actually rewrote their config | Daemon comes up "config-only" with a loud warning — matches the actual situation |
+| Signature blast radius | One new helper in pkg/configstore | One new opts struct + two new exported compile entry points in pkg/config |
+
+Bypass is operationally more honest: the daemon does NOT pretend the
+operator's `dataplane-type dpdk` request succeeded. It boots config-only
+and forces the operator to make an explicit migration commit.
 
 ## 5. Public API preservation
 
@@ -355,12 +537,15 @@ Option A path:
 
 1. **Stored-config rolling upgrade.** A node booting with
    `system dataplane-type dpdk` persisted in `active-config.json` must
-   still come up so the operator can fix the config from CLI. **v2**:
-   the daemon_run.go:247 soft-fallback alone is INSUFFICIENT (verified
-   by AGY r1 — the error fires in `Store.Load` before the factory is
-   called). §4.6 adds the stored-config-tolerant Load path: rewrite
-   persisted `dataplane-type dpdk` to empty (userspace default) with a
-   loud warning. daemon_run.go:247 stays as defense-in-depth.
+   still come up so the operator can fix the config from CLI. **v3**:
+   §4.6 adds a load-mode bypass on `validateDataplaneTypeStrict` so
+   `Store.Load()` succeeds with `DataplaneType=="dpdk"` preserved.
+   `NewRuntimeDataPlane("dpdk")` returns `ErrDPDKBackendRetired`,
+   which the now-reachable `daemon_run.go:247` soft-fallback catches.
+   Daemon runs in config-only mode; operator fixes the config from
+   CLI. Apply-groups + ${node}-injected cases handled identically
+   because the bypass runs AFTER group expansion. SyncApply path is
+   unchanged (still rejects inbound DPDK sync at compile time).
 2. **`load merge` / `load override` of pre-retirement configs.** The
    parser must still accept `system dataplane-type dpdk` as a syntactically
    valid leaf (commit rejects it). `validDataplaneType()` returning
@@ -407,12 +592,18 @@ GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go build ./... 2>&1 | tail -5
 # 2. Full Go suite
 GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test ./... 2>&1 | grep -v "^ok\|^?" | tail
 
-# 3. 5x flake on the retirement-reject test + new load-tolerance test
+# 3. 5x flake on the retirement-reject tests + new load-bypass tests
 for i in 1 2 3 4 5; do
   GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test -run TestDataplaneTypeDPDKRejectedAtCommit ./pkg/config/ 2>&1 | grep -E "PASS|FAIL|ok " | tail -1
 done
 for i in 1 2 3 4 5; do
-  GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test -run TestLoad_RewritesPersistedDPDKDataplaneType ./pkg/configstore/ 2>&1 | grep -E "PASS|FAIL|ok " | tail -1
+  GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test -run TestDataplaneTypeDPDKRejectedAtCommitViaApplyGroups ./pkg/config/ 2>&1 | grep -E "PASS|FAIL|ok " | tail -1
+done
+for i in 1 2 3 4 5; do
+  GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test -run TestCompileConfigForLoad_BypassesDPDKReject ./pkg/config/ 2>&1 | grep -E "PASS|FAIL|ok " | tail -1
+done
+for i in 1 2 3 4 5; do
+  GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test -run TestLoad_PersistedDPDKDataplaneTypeBootsConfigOnly ./pkg/configstore/ 2>&1 | grep -E "PASS|FAIL|ok " | tail -1
 done
 
 # 4. Retirement-boundary canary tests
@@ -557,47 +748,39 @@ plan.
     this; reviewer to spot-check `gh pr list` for active touch on
     `pkg/dataplane/dpdk/` or `dpdk_worker/`.
 
-11. **(v2) Stored-config rewrite at Load.** Plan §4.6 proposes
-    `rewriteRetiredDataplaneType(tree)` called from `Store.Load()`
-    BEFORE `compileTree`. The helper walks the AST and removes
-    `system { dataplane-type dpdk; }`. Concerns:
-    - Is `ConfigTree.FindPath`/`DeletePath` the right public API, or
-      do we need a new helper? (Answer: TBD at impl time — depends on
-      current AST mutation surface.)
-    - Should the warning fire ONCE at Load or persist as an active-
-      config warning surfaced via `show system commit-warnings`?
-      Plan goes with Load-time `slog.Warn` only.
-    - Does the rewrite interact badly with HA config sync? After
-      rewrite, the daemon's `active-config.json` differs from the
-      peer's `active-config.json`. On reconnect, primary's
-      `OnPeerConnected` push will REINSTATE the DPDK config if the
-      primary still has it. **Edge case**: both nodes boot with DPDK
-      persisted, both rewrite locally, sync converges to userspace.
-      But if only ONE node has the rewrite (e.g. one upgraded, one
-      not), the un-upgraded primary will re-push DPDK to the
-      upgraded secondary, which re-rewrites on each push. Plan: log
-      every rewrite at WARN so the loop is visible to ops; deeper
-      handling deferred. Reviewer: is this acceptable, or does the
-      HA sync interaction need explicit handling in this PR?
-    - Alternative: do the rewrite in `compileExpanded` itself
-      (mutate the typed config after validateDataplaneTypeStrict
-      would have fired, replace with empty) gated on a `loadMode`
-      flag. Cleaner from a layering perspective but adds the
-      load-mode parameter through more functions. Plan: keep the
-      rewrite at `Store.Load` for minimal blast radius.
+11. **(v3) HA config-sync behavior under load-mode bypass.** Verified
+    in Codex r3 + AGY r2: inbound config sync goes
+    `daemon_ha_sync.go:566 → 322 → 347 → daemon_apply.go:124 →
+    store.go:191 SyncApply → store.go:205 compileTree` (NOT through
+    Load()). SyncApply uses the standard `compileTree` (no load-mode
+    bypass), so an un-upgraded primary's DPDK config sync is
+    REJECTED with a clean compile error at the upgraded secondary.
+    Behavior is correct (no flap loop, no silent acceptance of DPDK
+    config). Plan keeps this — reviewer to confirm.
 
-12. **(v2) Should Phase 3 fix the inherited Phase 1 bug at all?**
-    AGY r1 flagged the bootstrap-loop bug as PLAN-NEEDS-MAJOR. An
-    alternative is to file a new follow-up issue and leave Phase 3
-    scoped to mechanical deletion. Arguments for fixing here: (a) the
-    bug is invisible until DPDK retirement rolling-upgrade traffic
-    hits, which is exactly the window Phase 3 owns; (b) the fix is
-    small; (c) leaving it open means the next operator who hits a
-    persisted-dpdk node has no recourse. Arguments against: (a) it
-    enlarges scope from "deletion-only" to "deletion + behavior
-    change"; (b) the behavior change could itself have edge cases
-    (the HA-sync interaction in Q11). Plan goes with "fix here";
-    reviewer to weigh in.
+12. **(v3) Phase 3 scope: fix Phase 1 inherited bug here?** AGY r1
+    + Codex r3 both verified the bootstrap-loop bug. Phase 3 owns
+    "DPDK retired cleanly" → the fix lives here. Reviewer can
+    challenge if "deletion-only" scope is preferable.
+
+13. **(v3) Load-mode signature: four-function shape vs single
+    options-API.** Plan §4.6 adds:
+    - `CompileConfig(tree)` — unchanged (commit semantics)
+    - `CompileConfigForNode(tree, nodeID)` — unchanged
+    - `CompileConfigForLoad(tree)` — NEW
+    - `CompileConfigForNodeAndLoad(tree, nodeID)` — NEW
+    Plus a private `compileWithOpts(tree, nodeVar, compileOpts{...})`
+    helper. Alternative shape: collapse to
+    `CompileConfig(tree, ...Option)` with `WithLoadMode()` and
+    `WithNodeID(int)` variadic options. Pro of variadic: cleaner
+    when more compile flags arrive. Con: it's a public API break
+    requiring callsite updates across 5+ files. Plan picks the
+    four-function shape because (a) `CompileConfig` /
+    `CompileConfigForNode` callsites in the codebase are stable and
+    breaking them is unnecessary churn, (b) the
+    "load-mode-or-not" distinction is genuinely orthogonal to
+    nodeID, (c) we are not anticipating more compile flags in the
+    near term. Reviewer to confirm.
 
 ## 11. Reviewer dispatch contract
 
