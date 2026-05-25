@@ -20,7 +20,18 @@
     PLAN-READY) both agreed before code touched.
   - **File(s)**: `userspace-dp/src/afxdp/wg/outer.rs`,
     `docs/pr/1501-a2-outer-udp-cs/plan.md`, `_Log.md`
-  - **Validation**: cargo build clean; cargo test pending.
+  - **Validation**: cargo build --release clean; cargo test
+    --release for `afxdp::wg::outer` 6/6 pass (5x flake-checked);
+    full cargo suite 1417 passed modulo two pre-existing flaky
+    tests on origin/master da103d81 baseline
+    (`snat_contract_documents_current_fail_closed_runtime`
+    fails consistently on master too;
+    `reconcile_peers_snapshot_is_atomic_under_concurrent_load`
+    is a 1-in-5 load flake on master too); `go test ./...`
+    clean; smoke on loss userspace cluster Pass A (CoS off)
+    0-retrans single-stream + 23 Gb/s 12-stream `-R`, and
+    Pass B (CoS on) 24-cell per-class shaper smoke 5201-5206 ×
+    v4+v6 × push+rev with shape rates hit cleanly.
 
 ## 2026-05-24
 
