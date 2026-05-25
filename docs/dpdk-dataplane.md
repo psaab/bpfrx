@@ -26,9 +26,14 @@
   [`docs/dataplane-decision-dpdk-vs-vpp.md`](dataplane-decision-dpdk-vs-vpp.md)
   (also carrying a retirement banner).
 
-The architecture material below is preserved verbatim for
-reference only — it describes a code path that is being removed
-and does not reflect current direction.
+The architecture material below is preserved for reference only
+— it describes a code path that is being removed and does not
+reflect current direction. The wrapper banner, the
+"`[Retired] Historical Design Details`" heading, and minor
+heading demotions inside the section have been added; the
+substantive technical content (overview, architecture diagrams,
+implementation phases, RX-mode tables, file structure, decision
+points) is unchanged from the original.
 
 ---
 
