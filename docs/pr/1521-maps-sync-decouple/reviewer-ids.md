@@ -36,6 +36,6 @@ Plan is PLAN-READY v2 after both r1 verdicts addressed.
 | 6 | Copilot | PR review on 0692093a | "Copilot reviewed 9 out of 9 changed files in this pull request and generated no new comments." — clean |
 | 6 | Claude SMR | self-review post-AGY-authored fix | MERGE-READY |
 | 7 | Antigravity | adversarial-review-mplebv9s-a166sj | CONCRETE KILL (switch/case implicit-block shadow) — AGY-authored fix: collectConstsFromStmtList strict stmt-list iteration + scopeWalker push for CaseClause/CommClause; agy_r7_switch_case_shadow_bypass fixture proves the kill |
-| 7 | Copilot | pending PR review on 2769fa1f | _waiting on push_ |
+| 7 | Copilot | review id 4357796234 on 5becd4fa | 3 inline (2 doc-only + 1 correctness): pre-collect violated Go statement-order semantics (later-declared block-local const could shadow outer for earlier uses → both FN and FP). FIX: statement-order binding in scopeWalker.Visit replaces pre-collect; doc comments at maps_decouple_test.go:240,518 updated; 2 new fixtures copilot_r5_statement_order_false_positive + copilot_r5_statement_order_false_negative prove the kill |
 | 7 | Claude SMR | post-r7 self-review | MERGE-READY |
 

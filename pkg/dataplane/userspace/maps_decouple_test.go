@@ -234,14 +234,18 @@ func isKnownNonMapUserspaceLiteral(s string) bool {
 // vast majority of cases), and the two structural walkers above
 // catch the residual bypass classes.
 // findForbiddenAliasesInFiles is the package-aware multi-file
-// inspector. It builds a single symbol table that spans:
+// inspector. It builds a package-wide symbol table of top-level
+// consts only; block-local consts (inside function bodies, switch
+// case clauses, etc.) are bound dynamically by scopeWalker at the
+// moment the corresponding *ast.DeclStmt is visited, so
+// statement-order semantics are preserved (Copilot r5 r5:436).
 //
-//   - top-level consts in every file
-//   - local consts declared inside function bodies via *ast.DeclStmt
-//
-// then runs Pass 1/2/3 over every file using the unified table.
-// This closes AGY r4 §II.1 (local block constants) and §II.2
-// (cross-file concat) which the single-file helper could not see.
+// Pass 1/2/3 over every file run through walkWithScope which
+// presents the visitor with the correct effective scope at each
+// AST node. This closes AGY r4 §II.1 (local block constants) and
+// §II.2 (cross-file concat) which the single-file helper could
+// not see, AGY r6 (package-level vs block-local shadow), and
+// AGY r7 (switch/case implicit-block shadow).
 //
 // Returns a slice of "path: hit" violation strings; one entry per
 // (file, distinct forbidden literal). Order is deterministic over
@@ -400,52 +404,31 @@ func cloneMap(m map[string]string) map[string]string {
 	return out
 }
 
-func collectConstsFromStmtList(stmts []ast.Stmt, parent map[string]string) map[string]string {
-	local := cloneMap(parent)
-	addSpec := func(vs *ast.ValueSpec) {
-		for i, name := range vs.Names {
-			if i >= len(vs.Values) {
-				continue
-			}
-			if v, ok := evalStringExpr(vs.Values[i], local); ok {
-				local[name.Name] = v
-			}
+// bindConstSpec evaluates a *ast.ValueSpec from a CONST GenDecl and
+// installs its name→value bindings into scope. Used at the moment
+// the corresponding DeclStmt is visited so that statement-order
+// semantics are preserved: only consts declared earlier in the
+// block are visible to expressions later in the block (per Go spec
+// §Declarations and scope).
+//
+// Closes Copilot r5 finding at maps_decouple_test.go:436 — the
+// previous pre-collect helper installed all of a block's consts
+// up-front, which violated the "scope begins at end of ConstSpec"
+// rule and could both miss real violations (when a later inner
+// const shadowed an outer const used earlier in the block, the
+// canary read the shadow value instead of the outer one) and emit
+// false positives (when a later inner const happened to begin with
+// "userspace_" but the earlier-in-block expression was actually
+// using an innocuous outer const).
+func bindConstSpec(vs *ast.ValueSpec, scope map[string]string) {
+	for i, name := range vs.Names {
+		if i >= len(vs.Values) {
+			continue
+		}
+		if v, ok := evalStringExpr(vs.Values[i], scope); ok {
+			scope[name.Name] = v
 		}
 	}
-	for pass := 0; pass < 8; pass++ {
-		prev := len(local)
-		for _, stmt := range stmts {
-			ds, ok := stmt.(*ast.DeclStmt)
-			if !ok {
-				continue
-			}
-			gd, ok := ds.Decl.(*ast.GenDecl)
-			if !ok || gd.Tok != token.CONST {
-				continue
-			}
-			for _, spec := range gd.Specs {
-				if vs, ok := spec.(*ast.ValueSpec); ok {
-					addSpec(vs)
-				}
-			}
-		}
-		if len(local) == prev {
-			break
-		}
-	}
-	return local
-}
-
-func collectLocalConstsForBlock(block ast.Node, parent map[string]string) map[string]string {
-	switch n := block.(type) {
-	case *ast.BlockStmt:
-		return collectConstsFromStmtList(n.List, parent)
-	case *ast.CaseClause:
-		return collectConstsFromStmtList(n.Body, parent)
-	case *ast.CommClause:
-		return collectConstsFromStmtList(n.Body, parent)
-	}
-	return parent
 }
 
 type scopeWalker struct {
@@ -461,11 +444,32 @@ func (w *scopeWalker) Visit(node ast.Node) ast.Visitor {
 	var hasNewScope bool
 	currentScope := w.consts[len(w.consts)-1]
 
-	switch n := node.(type) {
+	switch node.(type) {
 	case *ast.BlockStmt, *ast.CaseClause, *ast.CommClause:
-		currentScope = collectLocalConstsForBlock(n, currentScope)
+		// Push an EMPTY local frame on top of the current scope
+		// stack. Block-local const decls bind into this frame as
+		// they are visited in syntactic order — preserving Go's
+		// "scope begins at end of ConstSpec" rule. Lookups walk
+		// inner→outer so the package-wide table at index 0 is
+		// still the default.
+		currentScope = cloneMap(currentScope)
 		w.consts = append(w.consts, currentScope)
 		hasNewScope = true
+	}
+
+	// Statement-order binding: when a DeclStmt(CONST) is visited,
+	// install its bindings into the current top-of-stack scope
+	// BEFORE descending so subsequent visitor calls see them, but
+	// earlier visitor calls in the same block do NOT.
+	if ds, ok := node.(*ast.DeclStmt); ok {
+		if gd, ok := ds.Decl.(*ast.GenDecl); ok && gd.Tok == token.CONST {
+			top := w.consts[len(w.consts)-1]
+			for _, spec := range gd.Specs {
+				if vs, ok := spec.(*ast.ValueSpec); ok {
+					bindConstSpec(vs, top)
+				}
+			}
+		}
 	}
 
 	keepDescending := w.f(node, currentScope)
@@ -514,10 +518,12 @@ func findForbiddenMapNameAliases(src string) ([]string, error) {
 		return nil, err
 	}
 
-	// Single-file const symbol table — covers both top-level and
-	// block-local const declarations (AGY r4 §II.1). Run until the
-	// table stabilizes (AGY r5 §I.a) so deep dependency chains
-	// converge.
+	// Single-file const symbol table — top-level consts only.
+	// Block-local consts (inside function bodies, case clauses,
+	// etc.) are bound dynamically by scopeWalker at the moment the
+	// *ast.DeclStmt is visited so statement-order semantics hold
+	// (Copilot r5 r5:518). Run until the table stabilizes so deep
+	// dependency chains of arbitrary depth converge (AGY r5 §I.a).
 	consts := map[string]string{}
 	for pass := 0; pass < 32; pass++ {
 		prev := len(consts)
@@ -1050,14 +1056,22 @@ func (M) Map(string) any { return nil }
 		},
 		{
 			name: "agy_r7_switch_case_shadow_bypass",
+			// Package-level chain (Go permits arbitrary
+			// declaration order at package scope, so inverted
+			// order is valid). The switch/case bodies are
+			// implicit scopes per Go spec; a local shadow in
+			// case 1 must NOT leak into the canary's evaluation
+			// of m.Map(chain3) in case 2 (which Go binds to the
+			// package-level chain3 = "userspace_fallback_stats").
 			src: `package x
+const chain3 = chain2 + "_stats"
+const chain2 = chain1 + "_fallback"
+const chain1 = "userspace"
 func F(x int, m M) {
-	const chain3 = chain2 + "_stats"
-	const chain2 = chain1 + "_fallback"
-	const chain1 = "userspace"
 	switch x {
 	case 1:
 		const chain1 = "innocuous"
+		_ = chain1
 	case 2:
 		_ = m.Map(chain3)
 	}
@@ -1066,6 +1080,59 @@ type M struct{}
 func (M) Map(string) any { return nil }
 `,
 			want: []string{"userspace_fallback_stats", "userspace_fallback"},
+		},
+		{
+			name: "copilot_r5_statement_order_false_positive",
+			// Copilot r5 r5:436 — without statement-order
+			// binding, a later-declared block-local const that
+			// happens to start with "userspace_" would replace
+			// the outer-scope value in the canary's symbol
+			// table, causing an INNOCUOUS m.Map(outer) earlier
+			// in the same block to be wrongly flagged. With
+			// statement-order binding, the call to m.Map(outer)
+			// at line 3 sees only the package-level value
+			// "innocuous_outer" and is correctly NOT flagged;
+			// the inner shadow at line 5 binds afterwards and
+			// affects only later expressions in the same block.
+			src: `package x
+const outer = "innocuous_outer"
+func F(m M) {
+	_ = m.Map(outer)
+	const outer = "userspace_evil"
+	_ = outer
+}
+type M struct{}
+func (M) Map(string) any { return nil }
+`,
+			// The shadow itself IS a forbidden literal at its
+			// declaration site (basic-lit walk catches it), so
+			// "userspace_evil" appears. But the earlier
+			// m.Map(outer) call must resolve to the outer
+			// package-level "innocuous_outer" — not to the
+			// later shadow.
+			want: []string{"userspace_evil"},
+		},
+		{
+			name: "copilot_r5_statement_order_false_negative",
+			// Copilot r5 r5:436 — converse case. Outer
+			// "userspace_real" is the value at the m.Map(outer)
+			// site. A later-declared block-local const shadows
+			// outer with an innocuous value. With pre-collect,
+			// the canary would have read "innocuous" at the call
+			// site and MISSED the violation. Statement-order
+			// binding correctly resolves the call to the outer
+			// value and flags it.
+			src: `package x
+const outer = "userspace_real"
+func F(m M) {
+	_ = m.Map(outer)
+	const outer = "innocuous"
+	_ = outer
+}
+type M struct{}
+func (M) Map(string) any { return nil }
+`,
+			want: []string{"userspace_real"},
 		},
 	}
 

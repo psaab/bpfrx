@@ -288,6 +288,44 @@
     Rebased onto current master (which now has #1536).
   - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
     `_Log.md`
+- **Timestamp**: 2026-05-25T18:30:00Z
+  - **Action**: #1521 Copilot r5 fixes + pre-rebase. Copilot r5
+    (review id 4357796234 on 5becd4fa) flagged 3 inline findings:
+    two doc-vs-impl drift comments (lines 240, 518) and one
+    correctness concern (line 436): `collectConstsFromStmtList`
+    pre-collected ALL block-local consts up-front, which violates
+    Go's "scope begins at end of ConstSpec" rule. Constructed
+    worked examples that prove the bug: a later-declared
+    block-local const shadowing an outer const used EARLIER in the
+    same block could cause both false-negatives (canary reads the
+    shadow value, misses the real outer-scope violation) and
+    false-positives (canary reads a later "userspace_*" shadow at
+    an earlier call site that semantically used an innocuous
+    outer). Fix: replaced pre-collect + collectLocalConstsForBlock
+    + collectConstsFromStmtList with a single bindConstSpec helper
+    that scopeWalker.Visit invokes WHEN a DeclStmt(CONST) is
+    visited — binding goes into the current top-of-stack scope
+    only at that moment, preserving statement order. BlockStmt /
+    CaseClause / CommClause still push an empty cloned-parent
+    scope on entry, popped on exit. Two new fixtures
+    copilot_r5_statement_order_false_positive (outer="innocuous_outer",
+    later shadow "userspace_evil" → only shadow is flagged) and
+    copilot_r5_statement_order_false_negative (outer="userspace_real",
+    later shadow "innocuous" → outer call site is flagged) lock
+    the correct semantics in place. Doc comments at lines 240 and
+    518 updated to match the new implementation.
+    Also retired the now-redundant agy_r7 fixture's invalid local
+    inverted chain (Go doesn't actually compile local
+    forward-referenced consts) and replaced with valid Go where
+    chain is at package scope and only chain1 is shadowed in
+    `case 1` — the canary must still resolve chain3 via package
+    scope to "userspace_fallback_stats".
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: 6 canary tests + 22 negative-fixture sub-cases
+    (2 new copilot_r5 cases) pass under `-count=2`; full
+    `go test ./...` green on this branch (pre-rebase).
+
 - **Timestamp**: 2026-05-25T17:30:00Z
   - **Action**: #1521 r7 review fix — AGY r7 CONCRETE KILL: switch
     or select case body acts as an implicit Go scope but is
