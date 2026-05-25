@@ -75,9 +75,11 @@ type cliUserspaceStatusProvider interface {
 }
 
 // cliUserspaceControlProvider extends the status provider with the
-// mutating control operations used by `request security flow ...`
-// and similar diag commands. Replaces the larger inline interface
-// probe in cli_helpers.go used by `requestSecurityFlow*` paths.
+// mutating control operations used by `request chassis cluster
+// data-plane userspace ...` (the sole CLI consumer, handled in
+// cli_request.go:handleRequestChassisClusterDataPlane). Replaces the
+// larger inline anonymous interface probe in cli_helpers.go's
+// userspaceDataplaneControl helper.
 type cliUserspaceControlProvider interface {
 	cliUserspaceStatusProvider
 	SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)

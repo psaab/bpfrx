@@ -2268,3 +2268,11 @@
   show chassis forwarding, request chassis cluster data-plane
   userspace) all work — the named provider-probe interfaces resolve
   correctly against the userspace LegacyDataPlaneAdapter.
+
+- **Timestamp**: 2026-05-25 (1517 code-review r1 minor folds)
+- **Action**: Folded Copilot inline finding on cliUserspaceControlProvider
+  doc comment — said "request security flow" but correct CLI path is
+  "request chassis cluster data-plane userspace" handled by
+  handleRequestChassisClusterDataPlane in cli_request.go. Recorded
+  reviewer-ids for code-review round 1.
+- **File(s)**: pkg/cli/runtime.go, docs/pr/1517-cli-migration/reviewer-ids.md
