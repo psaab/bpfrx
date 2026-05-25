@@ -2,6 +2,15 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T07:05:00Z
+  - **Action**: #1527 follow-up re-review fix — corrected
+    `NewDataPlane` unknown-type guidance in `pkg/dataplane/dataplane.go`
+    to stop advertising `userspace` as a valid legacy `DataPlane` type.
+    `userspace` is runtime-only through `NewRuntimeDataPlane`, so the old
+    message was misleading during operator/debug triage.
+    Baseline + post-change dataplane tests run clean.
+  - **File(s)**: `pkg/dataplane/dataplane.go`, `_Log.md`
+
 - **Timestamp**: 2026-05-25T05:55:15Z
   - **Action**: #1527 final Copilot re-review follow-up — resolved three
     remaining consistency nits from the latest Copilot inline pass:

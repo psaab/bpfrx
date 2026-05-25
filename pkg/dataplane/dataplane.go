@@ -157,7 +157,7 @@ func NewDataPlane(dpType string) (DataPlane, error) {
 		if ctor, ok := backendRegistry[dpType]; ok {
 			return ctor(), nil
 		}
-		return nil, fmt.Errorf("unknown dataplane type %q (valid: ebpf, userspace)", dpType)
+		return nil, fmt.Errorf("unknown dataplane type %q (valid built-in legacy type: ebpf)", dpType)
 	}
 }
 
