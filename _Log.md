@@ -2,6 +2,17 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T12:00:00Z
+  - **Action**: #1527 DPDK retirement Phase 2 (boot-path decouple) —
+    drafted plan v1 covering blank-import removal, init()
+    registration deletion, retirement-error returns from
+    NewDataPlane / NewRuntimeDataPlane factories, canary allowlist
+    shrink, Phase-1373 README DPDK-policy prose update, and
+    package-local test rewrite. Plan includes 8 open questions for
+    adversarial review and explicit out-of-scope list to keep
+    Chain A (#1526) and Chain C (#1528/#1529) lanes clean.
+  - **File(s)**: `docs/pr/1527-dpdk-boot-decouple/plan.md`
+
 - **Timestamp**: 2026-05-25T00:45:00Z
   - **Action**: PR #1512 review follow-up — tightened the positional
     `dataplane.Manager` literal canary on two axes. (a) Recurse into nested
