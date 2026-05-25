@@ -3508,7 +3508,6 @@
   go test ./... green (32 packages); retirement boundary canary updated
   with pkg/cluster/runtime.go allowlist entry + 1373 README + cluster
   README. Smoke + test-failover pending (HA-sensitive scope per CLAUDE.md).
-
 - **Timestamp**: 2026-05-25T15:31Z
   - **Action**: PR #1538 Copilot code-review round-2 — fix `want`
     variable shadowing in TestCompileSingleStrictErrorJoinPath and
@@ -3570,3 +3569,18 @@
 - **File(s)**: pkg/grpcapi/runtime_canary_test.go (new), _Log.md
 - **Validation**: go test ./pkg/grpcapi/... -count=1 green; full Go
   suite green.
+
+- **Timestamp**: 2026-05-25T09:00Z
+- **Action**: Draft Phase A #1477 final-validation capstone runbook
+- **File(s)**: docs/pr/1477-final-validation/runbook.md (NEW),
+  docs/pr/1477-final-validation/artifacts.md (NEW), _Log.md
+- **Why**: #1477 is the capstone validation artifact set for the eBPF
+  retirement umbrella #1373. Phase A drafts the operator runbook while
+  blocked on #1476's PR merge. The runbook composes the existing
+  smoke-gates.md gates with the dedicated #1374 SYN-cookie proof, the
+  #1376 port-mirror fidelity proof, and a runtime fallback-exclusion gate
+  into a single procedure that produces the artifact tree enforced by
+  retire_ebpf_artifact_schema.py.
+- **Validation**: docs-only on a worktree off origin/master; no code
+  changed. Phase B (execute the runbook against the #1476 merge SHA) is
+  blocked on #1476's PR opening + merging.
