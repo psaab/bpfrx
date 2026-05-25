@@ -1,11 +1,17 @@
 # #1517 — Migrate pkg/cli off legacy `dataplane.DataPlane` (sub-#1451 S2)
 
-**Status:** DRAFT v1 — pending adversarial plan review.
+**Status:** v2 — PLAN-READY per AGY adversarial-review-mpkuldhp-mnlp6x;
+Codex task-mpkukwfs-gl3fv4 PLAN-NEEDS-MINOR fixes folded in (LastApplyResultOf
+is already `any`-typed at `pkg/dataplane/apply.go:54`, so neither Option B
+nor Option C is required — Q1 reframed; scope-doc citation softened
+because the canonical doc lives on branch `1451-migration-scope`,
+commit `135ae0e0`, not yet on master).
 
 Refs: #1517 (this), #1451 (parent), #1373 (eBPF retirement). Sub-issue
-scope doc: `docs/pr/1451-migration-scope/scope.md`. Parallels sub-#1516
-(grpcapi) — sibling agent driving that PR in parallel; this branch
-touches **only** `pkg/cli/`.
+scope doc lives at commit `135ae0e0` on branch `1451-migration-scope`
+(`docs/pr/1451-migration-scope/scope.md`, not yet merged to master).
+Parallels sub-#1516 (grpcapi) — sibling agent driving that PR in
+parallel; this branch touches **only** `pkg/cli/`.
 
 ## 1. Issue framing
 
@@ -14,12 +20,14 @@ takes a `dataplane.DataPlane` parameter. The interactive Junos CLI is
 the second of two large operator surfaces still importing the full
 legacy interface directly (the first is `pkg/grpcapi`, sub-#1516).
 
-Per #1451 scope doc, the standard migration target is: replace the
-`dataplane.DataPlane` parameter/field with a narrow, domain-specific
-interface declared inside the consumer package, mirroring the pattern
-already shipped by `pkg/api` (`apiRuntimeDataPlane`),
-`pkg/fwdstatus` (`DataPlaneAccessor`), `pkg/monitoriface`
-(`RuntimeDataPlane`), and `pkg/conntrack` (`RuntimeDomainProvider`).
+Per the #1451 scope doc (commit `135ae0e0` on branch
+`1451-migration-scope`, §S2), the standard migration target is:
+replace the `dataplane.DataPlane` parameter/field with a narrow,
+domain-specific interface declared inside the consumer package,
+mirroring the pattern already shipped by `pkg/api`
+(`apiRuntimeDataPlane`), `pkg/fwdstatus` (`DataPlaneAccessor`),
+`pkg/monitoriface` (`RuntimeDataPlane`), and `pkg/conntrack`
+(`RuntimeDomainProvider`).
 
 Once this lands and S1/S3 are done, the daemon's `legacyDP()`
 accessor can shrink to the narrowest union and ultimately be removed
@@ -112,7 +120,7 @@ type cliRuntime interface {
     ReadPolicyCounters(ruleID uint32) (dataplane.CounterValue, error)
     ReadFilterConfig(filterID uint32) (dataplane.FilterConfig, error)
     ReadFilterCounters(filterID uint32) (dataplane.CounterValue, error)
-    ReadFloodCounters(zoneID uint16) (dataplane.FloodCounters, error)
+    ReadFloodCounters(zoneID uint16) (dataplane.FloodState, error)
     ReadNATPortCounter(id uint32) (uint64, error)
     ReadNATRuleCounter(id uint32) (dataplane.CounterValue, error)
 
@@ -253,21 +261,26 @@ out of scope for this PR.)
    returns either a non-nil adapter or interface-nil today — verified
    by reading `pkg/daemon/daemon.go:345-`.)
 3. **`dataplane.LastApplyResultOf(c.dp)` in `applyResult()`**
-   (`cli.go:139`) takes a `dataplane.DataPlane`. After the field
-   becomes `cliRuntime` this won't compile. Two options:
-   - **Option A (preferred):** widen `LastApplyResultOf` to take
-     `any` and runtime-detect. But that touches `pkg/dataplane`, out
-     of scope.
-   - **Option B (chosen):** keep `c.dp` typed as `cliRuntime`, but
-     **also** keep a `c.dpLegacy dataplane.DataPlane` field for the
-     one call site that needs it. Pass both at `New()`. This is a
-     pragmatic interim — `LastApplyResultOf` is itself slated for
-     refactor in S4 (`docs/pr/1451-migration-scope/scope.md`
-     identifies the legacy accessor cleanup as the same step).
-   - **Option C (alternative):** add `LastApplyResult() *ApplyResult`
-     to `cliRuntime`. The legacy DataPlane has this method (verify);
-     this is the cleanest fix. **Open question for review** —
-     §11 Q3.
+   (`cli.go:139`) — non-issue verified. `LastApplyResultOf` is
+   defined at `pkg/dataplane/apply.go:54` as
+   `func LastApplyResultOf(provider any) *ApplyResult`. It already
+   takes `any` and runtime-detects the optional
+   `ApplyResultReader` interface via type assertion on the
+   underlying concrete value. Both concrete dataplanes implement
+   `LastApplyResult()`:
+   `pkg/dataplane/userspace/legacy_dataplane.go:73` and
+   `pkg/dataplane/userspace/manager.go:182`. Therefore passing
+   `c.dp` (typed as `cliRuntime`) to `LastApplyResultOf` compiles
+   cleanly (interface→`any` widening) and the runtime assertion
+   succeeds against the concrete value behind the interface.
+   **No Option B (shadow field) is needed and no Option C (widen
+   cliRuntime) is needed.** This was the central question in
+   plan-v1 and is now settled.
+
+   Same reasoning applies to `dataplane.TelemetryOf(c.dp)` if it
+   exists (`pkg/dataplane/apply.go`: similar `any`-typed helper).
+   Confirmed by grep: no CLI callsite passes `c.dp` to a function
+   typed `dataplane.DataPlane`.
 4. **HA paths.** The CLI does not touch session-sync or HA itself.
    `cluster.Manager` is a separate field (`cli.cluster`). The
    `request chassis cluster failover` paths use `cm.*` not `dp.*`,
@@ -342,14 +355,13 @@ out of scope for this PR.)
 Each question is invitable to a **PLAN-KILL** verdict if the answer
 exposes a wrong-target architecture.
 
-1. **Q1: Is `Option C` (add `LastApplyResult()` to `cliRuntime`)
-   actually viable?** The CLI calls `dataplane.LastApplyResultOf(c.dp)`
-   in `applyResult()`. Either we add `LastApplyResult()` to
-   `cliRuntime` (clean — verify the underlying types expose it as a
-   method, not as a top-level free function), or we keep a
-   `c.dpLegacy dataplane.DataPlane` shadow field for that one call
-   site (ugly but localised). **Reviewers, please pick one before
-   PLAN-READY.**
+1. **Q1: RESOLVED (Codex r1).** `dataplane.LastApplyResultOf` is
+   defined as `func(provider any) *ApplyResult` and uses a runtime
+   type assertion on the concrete value. Both backends implement
+   `LastApplyResult()` as a method on the concrete type, so
+   passing a `cliRuntime`-typed value works at both compile and
+   run time without any Option B / Option C trickery. Plan §6.3
+   updated accordingly.
 2. **Q2: Is dropping the inline provider probes in favour of named
    interfaces actually behaviour-preserving?** Specifically: the
    `cli_show_chassis.go:108` probe is `Status() (...)` only, while
@@ -393,4 +405,14 @@ exposes a wrong-target architecture.
 
 ---
 
-End of plan v1.
+End of plan.
+
+## Revision history
+
+- **v1** (2026-05-24, commit 713997fc): initial draft.
+- **v2** (2026-05-24): folded Codex task-mpkukwfs-gl3fv4 PLAN-NEEDS-MINOR
+  findings — reframed §6.3/Q1 since `LastApplyResultOf` is already
+  `any`-typed; softened scope.md citation to point at branch
+  `1451-migration-scope` (not yet merged); fixed FloodCounters →
+  FloodState type in §4.1. AGY adversarial-review-mpkuldhp-mnlp6x
+  already PLAN-READY against v1; v2 is strictly tighter.

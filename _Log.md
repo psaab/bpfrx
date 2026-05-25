@@ -2235,3 +2235,14 @@
 - **File(s)**: docs/pr/1517-cli-migration/plan.md
 - **Why**: Triple-review methodology — plan first, code never first. Dispatch
   Codex + Antigravity adversarial plan review before any code touches.
+
+- **Timestamp**: 2026-05-24 (1517 plan v2 PLAN-READY)
+- **Action**: Folded Codex PLAN-NEEDS-MINOR findings into plan v2. AGY
+  PLAN-READY against v1 stands. Both reviewers now agree — proceeding to
+  implementation.
+- **File(s)**: docs/pr/1517-cli-migration/plan.md, reviewer-ids.md
+- **Why**: Codex r1 (task-mpkukwfs-gl3fv4) identified Q1 over-engineering
+  (LastApplyResultOf is already `any`-typed at apply.go:54, so neither
+  Option B shadow field nor Option C interface widening is needed) and a
+  scope-doc citation hygiene issue. AGY r1 (adversarial-review-mpkuldhp-mnlp6x)
+  was PLAN-READY across all seven hostile checks.
