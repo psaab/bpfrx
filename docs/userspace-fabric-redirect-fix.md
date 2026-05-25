@@ -121,8 +121,8 @@ flag is set.
 | `pkg/dataplane/userspace/protocol.go` | `Fabrics` field on ControlRequest |
 | `pkg/dataplane/dataplane.go` | `SyncFabricState()` interface method, pin path helpers |
 | `pkg/dataplane/maps.go` | `SyncFabricState()` no-op stub (eBPF) |
-| `pkg/dataplane/dpdk/dpdk_stub.go` | `SyncFabricState()` no-op stub |
-| `pkg/dataplane/dpdk/dpdk_cgo.go` | `SyncFabricState()` no-op stub |
+| `pkg/dataplane/dpdk/dpdk_stub.go` | `SyncFabricState()` no-op stub (retired #1525, deletion in #1528) |
+| `pkg/dataplane/dpdk/dpdk_cgo.go` | `SyncFabricState()` no-op stub (retired #1525, deletion in #1528) |
 | `pkg/daemon/daemon.go` | Call `SyncFabricState()` after `refreshFabricFwd` |
 
 ## Key Learnings

@@ -3,10 +3,15 @@
 Last updated: 2026-05-24
 
 > #1373 dataplane note: the Rust AF_XDP userspace dataplane is the
-> primary/default target for new dataplane work. Rows that mention only eBPF or
-> DPDK describe legacy/regression coverage unless userspace is explicitly named.
+> primary/default target for new dataplane work. Rows that mention only eBPF
+> describe legacy/regression coverage unless userspace is explicitly named.
 > The authoritative retirement gate for userspace-vs-legacy behavior is
 > [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
+
+> [!IMPORTANT]
+> DPDK retired in #1525. References below to "eBPF and DPDK" or
+> "eBPF, DPDK, and userspace" parity describe the pre-retirement
+> state; the DPDK backend is removed in #1527/#1528.
 
 ## Summary
 

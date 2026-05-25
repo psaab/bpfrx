@@ -1,5 +1,12 @@
 # VPP Dataplane Assessment for xpf
 
+> [!IMPORTANT]
+> DPDK dataplane retired in #1525; VPP is not under consideration.
+> This assessment is preserved as historical comparative analysis.
+> Userspace AF_XDP is the production dataplane. The companion
+> decision doc (`docs/dataplane-decision-dpdk-vs-vpp.md`) is being
+> rewritten as a retirement notice in #1531.
+
 Note: This is a deep VPP-focused assessment. For the current project-level
 decision and recommendation between DPDK and VPP, see
 `docs/dataplane-decision-dpdk-vs-vpp.md`.

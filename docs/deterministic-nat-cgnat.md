@@ -143,11 +143,12 @@ expanding into individual IP strings. Maximum 256 IPs per range.
 
 ## DPDK Parity
 
-All struct and constant changes are mirrored in `dpdk_worker/`:
-- `shared_mem.h`: `nat_pool_config` struct with deterministic fields
-- `tables.h`: `MAX_NAT_POOL_IPS_PER_POOL` = 256
-- `policy.c`: Inline deterministic v4 allocation in SNAT path
-- `nat64.c`: Inline deterministic v6 allocation in NAT64 translate path
+DPDK retired (#1525). The historical parity work mirrored deterministic
+NAT struct and constant changes in `dpdk_worker/` (`shared_mem.h`
+`nat_pool_config`, `tables.h` `MAX_NAT_POOL_IPS_PER_POOL=256`,
+`policy.c` inline v4 SNAT, `nat64.c` inline v6 NAT64). The DPDK
+backend is removed in #1527/#1528; no further DPDK parity work
+applies.
 
 ## Prometheus Metrics
 

@@ -10,7 +10,7 @@ Status: Implemented (Partial)
 - Parsed into config flag: `pkg/config/compiler.go` (`compileServices`)
 - Compiler now expands the broader app catalog when enabled: `pkg/dataplane/compiler.go`, `pkg/appid/runtime.go`
 - Session display/filtering now uses real stored `app_id` values: `pkg/cli/cli.go`, `pkg/grpcapi/server.go`
-- eBPF and DPDK now both preserve `session.app_id` and emit it in events/session state
+- eBPF and userspace now both preserve `session.app_id` and emit it in events/session state (DPDK retired #1525)
 - Still no full L7 DPI or signature package pipeline
 
 ## Problem

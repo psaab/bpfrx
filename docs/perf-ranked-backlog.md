@@ -46,7 +46,7 @@ Why it is first:
 Risk:
 - medium/high
 - collision-safe redesign required
-- touches eBPF, Go dataplane tooling, and DPDK shared structures
+- touches eBPF and Go dataplane tooling (DPDK retired #1525)
 
 ### 2. Split hot and cold IPv6 session state
 

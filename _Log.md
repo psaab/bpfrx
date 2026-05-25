@@ -1,5 +1,29 @@
 # Action Log
 
+## 2026-05-25 — #1529 implementation
+
+- **Timestamp**: 2026-05-25T06:00:00Z
+  - **Action**: Implemented the v3 plan. 25 files touched, all `*.md`.
+    Pure-text gate passes; no source files touched. Chain A boundary
+    confirmed (no overlap with `docs/dataplane-decision-dpdk-vs-vpp.md`
+    or `docs/dpdk-dataplane.md`). All three retirement-boundary doc
+    canaries pass: `TestRetirementBoundaryDocsMentionDPDKPolicy`,
+    `TestRetirementBoundaryDocsMentionShimEscapeAssumptions`,
+    `TestRetirementBoundaryDocsMentionLegacyImportAllowlist`. Full
+    `pkg/dataplane/...` Go test suite passes. Cargo sanity build
+    passes.
+  - **File(s)**: README.md, CLAUDE.md, docs/pr/1373-retire-ebpf-dataplane/{README.md,source-removal-manifest-1476.md},
+    docs/{active-active-new-connections.md, authoritative-backlog.md,
+    bugs.md, deterministic-nat-cgnat.md, fabric-bridge-tuning.md,
+    feature-gaps.md, memory.md, perf-ranked-backlog.md, phases.md,
+    refactoring-audit.md, userspace-dataplane-architecture.md,
+    userspace-dataplane-gaps.md, userspace-fabric-redirect-fix.md,
+    vpp-dataplane-assessment.md, xdp-io-uring-userspace-dataplane.md},
+    docs/next-features/{application-identification.md,
+    ha-session-ownership-and-fabric-failover.md,
+    ipv6-session-fast-path.md, pre-id-default-policy.md,
+    twice-nat.md, vsrx-fabric-fab0-fab1-syntax-compat.md}, _Log.md.
+
 ## 2026-05-25 — #1529 plan v3 (Antigravity r2 build-breaker fix)
 
 - **Timestamp**: 2026-05-25T05:30:00Z

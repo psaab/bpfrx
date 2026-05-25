@@ -1,5 +1,10 @@
 # HA Session Ownership And Fabric Failover
 
+> [!IMPORTANT]
+> DPDK retired in #1525. All DPDK-parity bullets/sections below are
+> obsolete — implementations should target only the userspace
+> AF_XDP backend and (transitionally) legacy eBPF.
+
 ## Summary
 
 This note captures the current HA failover analysis around active/active
@@ -124,8 +129,8 @@ Add `OwnerRGID` to the authoritative session value structs:
 
 - `pkg/dataplane/types.go`
 - `bpf/headers/xpf_conntrack.h`
-- `dpdk_worker/shared_mem.h`
-- `pkg/dataplane/dpdk/dpdk_cgo.go`
+- ~~`dpdk_worker/shared_mem.h`~~ (DPDK retired #1525)
+- ~~`pkg/dataplane/dpdk/dpdk_cgo.go`~~ (DPDK retired #1525)
 
 Guidelines:
 
@@ -146,7 +151,7 @@ Files:
 
 - `bpf/headers/xpf_common.h`
 - `bpf/xdp/xdp_zone.c`
-- DPDK equivalents in `dpdk_worker/zone.c` and metadata definitions
+- ~~DPDK equivalents in `dpdk_worker/zone.c` and metadata definitions~~ (DPDK retired #1525)
 
 Rule:
 
@@ -161,9 +166,9 @@ XDP:
 - `bpf/xdp/xdp_policy.c`
 - `bpf/tc/tc_conntrack.c`
 
-DPDK:
+~~DPDK:~~
 
-- `dpdk_worker/conntrack.c`
+- ~~`dpdk_worker/conntrack.c`~~ (DPDK retired #1525)
 
 The owner must be assigned at creation time, not reconstructed later from
 zones.
@@ -246,7 +251,7 @@ Keep the existing zone-based tests only as fallback compatibility coverage.
 Recommended implementation order:
 
 1. session structs + wire format + sync filtering + bulk reconciliation
-2. dataplane owner stamping in XDP / TC / DPDK
+2. dataplane owner stamping in XDP / TC (~~DPDK~~ retired #1525)
 3. GC per-owner expiry and delete behavior
 
 That keeps review scope narrow and makes rollback safer if HA regressions appear.

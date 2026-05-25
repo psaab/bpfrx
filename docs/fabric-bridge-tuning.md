@@ -119,9 +119,9 @@ No bridge, no MAC learning, no flooding. Requires incus raw device config.
 shared parent. Lower overhead than a full bridge but still has some
 MAC-level processing.
 
-**Option C: DPDK vhost-user** — eliminates kernel networking entirely for
-the fabric path. Requires significant code changes but achieves near line
-rate VM-to-VM throughput.
+**Option C:** ~~DPDK vhost-user~~ — no longer a candidate (DPDK
+retired #1525). The historical plan was to eliminate kernel
+networking entirely for the fabric path via DPDK vhost-user.
 
 Recommendation: start with veth pair (Option A) — simplest, biggest
 impact, no code changes beyond incus config.

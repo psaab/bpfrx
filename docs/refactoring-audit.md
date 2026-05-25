@@ -79,7 +79,7 @@ generated heatmap captures current state automatically.
 The 18-PR refactor stream that landed in early 2026 (closing #985,
 #988, #986, #1034, #1035, #957) drove most of the userspace-dp Rust
 production tree below the 2000 threshold; two Rust files (`afxdp/poll_descriptor.rs`, `protocol.rs`) remain `[REFACTOR]` candidates in the heatmap. The Go
-tree has multiple long-standing >2000 LOC files (`pkg/cluster/cluster.go`, `pkg/dataplane/dpdk/dpdk_cgo.go`, `pkg/api/handlers.go`, `pkg/dataplane/maps.go`, `pkg/routing/routing.go`, `pkg/dataplane/userspace/snapshot.go`) that have not yet
+tree has multiple long-standing >2000 LOC files (`pkg/cluster/cluster.go`, `pkg/dataplane/dpdk/dpdk_cgo.go` (retired #1525, pending deletion in #1528), `pkg/api/handlers.go`, `pkg/dataplane/maps.go`, `pkg/routing/routing.go`, `pkg/dataplane/userspace/snapshot.go`) that have not yet
 received the same treatment. The BPF C program `bpf/xdp/xdp_zone.c` (2215 L)
 is also `[REFACTOR]` tier; splitting it requires tail-call decomposition, not
 ordinary function extraction.
