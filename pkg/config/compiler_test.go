@@ -142,9 +142,10 @@ func TestCompileSingleStrictErrorJoinPath(t *testing.T) {
 
 	// Byte-identity assertion: errors.Join with exactly one
 	// non-nil child must emit the child's text verbatim.
-	if got, want := err.Error(), want.Error(); got != want {
+	gotStr, wantStr := err.Error(), want.Error()
+	if gotStr != wantStr {
 		t.Errorf("single-element errors.Join in compileExpanded produced framing drift:\n  got  = %q\n  want = %q",
-			got, want)
+			gotStr, wantStr)
 	}
 
 	// Defense-in-depth: no '\n' separator on the single-family
@@ -161,5 +162,75 @@ func TestCompileSingleStrictErrorJoinPath(t *testing.T) {
 	// join path.
 	if errors.Is(err, ErrDPDKDataplaneRetired) {
 		t.Errorf("errors.Is(err, ErrDPDKDataplaneRetired) = true; DPDK not in fixture: %q", err.Error())
+	}
+}
+
+// TestCompileAllThreeStrictValidatorsAccumulated closes the coverage
+// gap identified in the Copilot code review: the 2-family test
+// (TestCompileMultipleStrictErrorsAccumulated) does not exercise
+// validatePolicySchedulerReferencesStrict, so a silent removal of
+// that validator's append call from the accumulator would go
+// undetected. This test fires all three independent strict-validator
+// families simultaneously and pins the count of accumulated errors.
+//
+// Fixture:
+//   - CoS: equal-flow-enforcement without transmit-rate exact
+//     (validateClassOfServiceStrict).
+//   - Policer: single-rate color-blind with CIR=0
+//     (validateThreeColorPolicersStrict).
+//   - Scheduler-ref: a zone policy referencing a scheduler name not
+//     present in the compiled schedulers map
+//     (validatePolicySchedulerReferencesStrict).
+//
+// All three set commands are parser-reachable (same path as
+// the existing single-family tests in parser_ast_test.go).
+func TestCompileAllThreeStrictValidatorsAccumulated(t *testing.T) {
+	lines := []string{
+		"set system dataplane-type userspace",
+		// CoS family
+		"set class-of-service schedulers bad-sched equal-flow-enforcement",
+		// Policer family
+		"set firewall three-color-policer bad-pol single-rate color-blind",
+		"set firewall three-color-policer bad-pol then discard",
+		// Scheduler-reference family: zone policy referencing a
+		// scheduler that is not defined in the compiled config.
+		"set security policies from-zone trust to-zone untrust policy sched-test match source-address any",
+		"set security policies from-zone trust to-zone untrust policy sched-test match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy sched-test match application any",
+		"set security policies from-zone trust to-zone untrust policy sched-test then permit",
+		"set security policies from-zone trust to-zone untrust policy sched-test scheduler-name missing-sched",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig succeeded; expected all three strict-validator families to error")
+	}
+
+	errStr := err.Error()
+	if !strings.Contains(errStr, "equal-flow-enforcement") {
+		t.Errorf("error missing CoS-family substring 'equal-flow-enforcement': %q", errStr)
+	}
+	if !strings.Contains(errStr, "committed-information-rate") {
+		t.Errorf("error missing policer-family substring 'committed-information-rate': %q", errStr)
+	}
+	if !strings.Contains(errStr, "references undefined scheduler") {
+		t.Errorf("error missing scheduler-ref-family substring 'references undefined scheduler': %q", errStr)
+	}
+	// Three errors → two '\n' separators (N errors → N-1 newlines
+	// per errors.Join semantics). A regression that drops one
+	// append call reduces this to 1; a fail-fast regression reduces
+	// it to 0.
+	if nc := strings.Count(errStr, "\n"); nc != 2 {
+		t.Errorf("newline count = %d, want 2 (two '\\n' between three joined errors): %q", nc, errStr)
 	}
 }

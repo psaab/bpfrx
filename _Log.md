@@ -2820,3 +2820,11 @@
   go test ./... green (32 packages); retirement boundary canary updated
   with pkg/cluster/runtime.go allowlist entry + 1373 README + cluster
   README. Smoke + test-failover pending (HA-sensitive scope per CLAUDE.md).
+
+- **Timestamp**: 2026-05-25T15:31Z
+- **Action**: PR #1538 Copilot code-review round-2 — fix `want` variable
+  shadowing in TestCompileSingleStrictErrorJoinPath and add
+  TestCompileAllThreeStrictValidatorsAccumulated to close the
+  third-family (validatePolicySchedulerReferencesStrict) coverage gap
+  flagged in round-1 review.
+- **File(s)**: pkg/config/compiler_test.go
