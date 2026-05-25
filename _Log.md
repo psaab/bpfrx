@@ -231,6 +231,52 @@
     No `.go` / `.rs` / `.c` source, no build inputs, no test
     fixtures modified.
 
+- **Timestamp**: 2026-05-25T09:15:00Z
+  - **Action**: PR #1532 round-N — close all AGY-flagged bypass
+    vectors via two-pass walker. AGY KILL verdict on 78b8a38a
+    identified 5 trivial-bypass categories not in the documented
+    deferred list: package-level var, local var, closure param,
+    composite literal, type definition. Codex high finding also
+    flagged `[N]T` fixed array as undocumented. Fix:
+    (a) refactored the AST walker into a shared
+    `findLegacyDataPlaneOffenders(file, name)` helper invoked by
+    both the main canary AND the synthetic tests — addresses Codex
+    "tautological test" finding.
+    (b) added `*ast.ArrayType` arm (Len != nil for fixed arrays) to
+    `isLegacyDataPlaneType` — catches `[N]dataplane.DataPlane`.
+    (c) added pass-2 catch-all selector sweep that walks every
+    `*ast.SelectorExpr` and flags any `dataplane.DataPlane` not
+    already attributed by the structural pass. Closes
+    package-level var, local var, closure, composite literal, type
+    def, AND the previously #1548-deferred compound shapes (`[]T`,
+    `map[K]T`, `chan T`, `func(T)`). Tracked via token.Pos in a
+    structuralHits set so the sweep doesn't double-report.
+    (d) updated godoc scope block to reflect the two-pass design.
+    Only true #1548-deferred bypasses remain: generics, type
+    aliases (`type DPAlias = dataplane.DataPlane`), and import
+    renames — these require go/types-level resolution because the
+    selector either disappears (alias) or changes its package-side
+    identifier (rename).
+
+    New tests (33 total subcases): `TestLegacyDataPlaneTypeMatcher`
+    9 cases including new fixed-array + slice-deferred;
+    `TestProductionWalkerCatchesCanaryShapes` 12 structural-pass
+    fixtures parsed via `parser.ParseFile`;
+    `TestProductionWalkerIgnoresUnrelatedTypes` confirms
+    dataplane.SessionStore/Telemetry/Sessions/context.Context don't
+    trip the sweep; new
+    `TestProductionWalkerCatchAllSweepClosesAGYBypasses` 9 cases
+    proving every AGY-flagged bypass + compound type IS now caught.
+
+  - **File(s)**:
+    `pkg/conntrack/legacy_dataplane_canary_test.go`,
+    `docs/pr/1515-conntrack-gc-canary/plan.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/conntrack -count=1 -race` green
+    (33 new subcases pass);
+    `grep -rn 'dataplane\.DataPlane' pkg/conntrack/*.go` finds
+    only the canary test file itself, confirming production tree
+    still clean.
+
 - **Timestamp**: 2026-05-25T08:30:00Z
   - **Action**: PR #1532 round — address Copilot review on 77baa235.
     Copilot flagged that `method.Type` is `*ast.FuncType` and that

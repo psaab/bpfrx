@@ -40,19 +40,38 @@ This mirrors the existing canary at
 `pkg/dataplane/userspace/manager_coupling_test.go`. The conntrack
 canary uses an `isLegacyDataPlaneType()` matcher (switching on
 `*ast.SelectorExpr` / `*ast.StarExpr` / `*ast.Ellipsis` /
-`*ast.ParenExpr`) rather than the `exprString()` text-compare helper
-used by the userspace coupling test — both forms catch the same naive
-shapes; the matcher style was chosen for clearer per-shape rejection
-and easier extension. The canary skips `*_test.go` files intentionally
-— test code may still mention the type to assert non-implementation
-(similar to the coupling test in `pkg/dataplane/userspace`).
+`*ast.ParenExpr` / `*ast.ArrayType`) rather than the `exprString()`
+text-compare helper used by the userspace coupling test — both forms
+catch the same naive shapes; the matcher style was chosen for clearer
+per-shape rejection and easier extension. The canary skips `*_test.go`
+files intentionally — test code may still mention the type to assert
+non-implementation (similar to the coupling test in
+`pkg/dataplane/userspace`).
 
-The walker scans all production `.go` files in the package
-(excluding `*_test.go`), inspecting every `*ast.FuncDecl` (exported
-and unexported), every `*ast.StructType` field, and every
-`*ast.InterfaceType` method signature for the prohibited shapes. Test
-files already exercise the boundary; we want to fence the production
-surface.
+The walker has TWO passes (see `findLegacyDataPlaneOffenders`):
+
+1. **Structural pass**: inspects every `*ast.FuncDecl` (exported and
+   unexported), every `*ast.StructType` field, and every
+   `*ast.InterfaceType` method signature for the prohibited shapes.
+   Produces precise diagnostics that name the function / field /
+   method holding the prohibited type.
+2. **Catch-all selector sweep**: walks every `*ast.SelectorExpr` in
+   the file and flags any `dataplane.DataPlane` reference the
+   structural pass did not already attribute. This closes the bypass
+   categories AGY adversarial-review (#1532 round-N) identified:
+   package-level / local `var x dataplane.DataPlane`,
+   `&dataplane.DataPlane{}` composite literals, `func(dp
+   dataplane.DataPlane){}` closures, and `type X dataplane.DataPlane`
+   type definitions. The sweep also subsumes the compound types
+   (`[]T`, `map[K]T`, `chan T`, `func(T)`) previously documented as
+   `#1548-deferred` — they still contain a literal
+   `dataplane.DataPlane` selector in their AST.
+
+Only true `#1548-deferred` bypasses remain: generic constraints /
+instantiations, type aliases that erase the selector
+(`type DPAlias = dataplane.DataPlane`), and import renames
+(`import dp "github.com/psaab/xpf/pkg/dataplane"` causing the selector
+to read `dp.DataPlane`). These require `go/types`-level resolution.
 
 ## Files touched
 
