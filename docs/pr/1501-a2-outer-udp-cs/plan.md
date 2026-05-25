@@ -2,7 +2,26 @@
 
 ## Status
 
-DRAFT v1 — pending adversarial plan review (Codex + Antigravity).
+DRAFT v2 — Antigravity PLAN-NEEDS-MINOR addressed (sentinel buffer
+pre-fill so the regression gate proves the function *wrote* cs=0
+rather than relying on zero-initialized memory). Codex plan review
+still pending.
+
+## Round-1 plan-review verdicts
+
+- **Antigravity (job adversarial-review-mpkq2awd-e66pif):**
+  **PLAN-NEEDS-MINOR.** Confirmed RFC 768 / RFC 8200 accuracy, code
+  reality (outer.rs:103 writes 0; lines 57-69 hold the stale TODO),
+  caller analysis (test-only), receive-side analysis (try_decap
+  takes post-strip wg_record), and perf framing. Sole minor: the
+  proposed `udp_checksum_is_zero_on_ipv4_outer` test would silently
+  pass under regression because `let mut out = [0u8; 40]` is
+  already zero. Required correction: pre-fill the buffer with
+  non-zero sentinel bytes (e.g. `0xff`) so the assertion proves
+  the function actively wrote zero. v2 applies this discipline to
+  both the new test and the strengthened `ipv4_checksum_is_correct`
+  test.
+- **Codex:** pending.
 
 ## Issue framing
 
@@ -146,17 +165,50 @@ block at the bottom of `outer.rs`:
    This is the byte-level regression gate that fails if anyone
    "fixes" the TODO by adding a UDP checksum compute step.
 
-2. `ipv4_udp_cs_zero_round_trips_through_existing_tests` —
-   leave-or-strengthen the existing `ipv4_checksum_is_correct`
-   test by adding the same UDP cs assertion to it (so the
-   self-check covers both fields). Specifically: after the
-   IPv4-header self-check, also assert
-   `out[26..28] == [0, 0]`.
+   **CRITICAL: pre-fill the output buffer with non-zero
+   sentinel bytes (`0xff`) before the call.** Per Antigravity
+   plan-review v1: a zero-initialized buffer would silently
+   pass even if a future commit deleted the cs=0 write — the
+   sentinel forces the assertion to prove the function
+   *actively wrote* zero rather than left the bytes
+   pre-zeroed. Same discipline applies to the strengthened
+   `ipv4_checksum_is_correct` assertion below.
 
-If the reviewer wants the second test as a separate `#[test]`
-fn rather than as an extension of the existing self-check fn,
-that's a minor I'll accept; the byte-level assertion is what
-matters.
+   Test skeleton (note `[0xffu8; 40]`, NOT `[0u8; 40]`):
+
+   ```rust
+   #[test]
+   fn udp_checksum_is_zero_on_ipv4_outer() {
+       let mut out = [0xffu8; 40]; // sentinel — prove the
+                                   // function wrote zero,
+                                   // not that init left zero.
+       write_outer_ipv4_udp(
+           &mut out,
+           Ipv4Addr::new(10, 0, 0, 1),
+           Ipv4Addr::new(10, 0, 0, 2),
+           51820, 51820, 0, 64, 100,
+       ).unwrap();
+       assert_eq!(&out[26..28], &[0, 0]);
+   }
+   ```
+
+2. Strengthen the existing `ipv4_checksum_is_correct` test by
+   adding `out[26..28] == [0, 0]` as a second assertion, AND
+   change its buffer init from `[0u8; 28]` to `[0xffu8; 28]`
+   so the same sentinel discipline applies to the existing
+   self-check. The IPv4 header self-check still works under
+   sentinel init because the function overwrites every
+   IPv4-header byte; the UDP cs assertion is what needs the
+   sentinel.
+
+   Alternatively, the assertion can live in its own new
+   `#[test]` fn — what matters is that the wire-byte UDP cs
+   assertion exists with a non-zero pre-fill.
+
+If the reviewer wants the second assertion as a separate
+`#[test]` fn rather than as an extension of the existing
+self-check fn, that's a minor I'll accept; the byte-level
+assertion with sentinel pre-fill is what matters.
 
 ### What the PR does NOT change
 
