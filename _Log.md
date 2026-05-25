@@ -2,6 +2,15 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T15:25:00Z
+  - **Action**: PR #1520 follow-up doc fix after Copilot review request.
+    Updated `pkg/dataplane/README.md` and `pkg/daemon/README.md` so the
+    documented boot path matches the landed code: daemon startup now picks
+    `userspace.Boot()` directly for default / explicit userspace and keeps
+    `dataplane.NewRuntimeDataPlane()` only for the explicit legacy eBPF
+    rollback and the retired-DPDK sentinel path.
+  - **File(s)**: `pkg/dataplane/README.md`, `pkg/daemon/README.md`, `_Log.md`
+
 - **Timestamp**: 2026-05-25T22:30:00Z
   - **Action**: #1520 plan v4 + implementation. v2 added Claude SMR
     refinements (no-arg Boot, behavioral canaries). v3 addressed
