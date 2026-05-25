@@ -3439,6 +3439,7 @@
   handler path are `request chassis cluster data-plane userspace` via
   cli_request.go:handleRequestChassisClusterDataPlane. Updated plan snippet
   in lockstep so docs match implementation. No code change.
+<<<<<<< HEAD
 - **Timestamp**: 2026-05-25T07:30Z
 - **Action**: #1522 plan v2 — pruned bpf/xdp/, bpf/tc/, bpf/headers/ README banner edits per AGY PLAN-NEEDS-MINOR (adversarial-review-mpkub795-6e2gou)
 - **File(s)**: docs/pr/1522-readme-doc-drift/plan.md, docs/pr/1522-readme-doc-drift/reviewer-ids.md
@@ -3570,3 +3571,14 @@
 - **File(s)**: pkg/grpcapi/runtime_canary_test.go (new), _Log.md
 - **Validation**: go test ./pkg/grpcapi/... -count=1 green; full Go
   suite green.
+
+- **Timestamp**: 2026-05-25T08:30Z
+- **Action**: #1528 DPDK mechanical removal — plan v1 DRAFT
+- **File(s)**: docs/pr/1528-dpdk-mechanical-removal/plan.md
+- **Why**: Phase 3 of #1525 DPDK retirement. Single auditable diff that
+  deletes dpdk_worker/, pkg/dataplane/dpdk/, Makefile targets, and the
+  DPDKConfig schema. Plan documents the critical Option A (keep Phase 1
+  reject) vs Option B (generic reject) decision and recommends Option A
+  for operator-friendly migration message + stored-config rolling-upgrade
+  safety via daemon_run.go:247 soft-fallback. 10 hostile questions
+  surfaced for adversarial plan review. Pending Codex + Antigravity.
