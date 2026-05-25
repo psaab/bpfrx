@@ -2,6 +2,22 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-25T01:30:00Z
+  - **Action**: #1515 (#1451 S8) — add regression canary that fences
+    `pkg/conntrack` production code against future re-introduction of
+    `dataplane.DataPlane` as a parameter, result, struct field, or
+    interface method. Mirrors the AST canary pattern from
+    `pkg/dataplane/userspace/manager_coupling_test.go`. Confirmed
+    canary fires by hand-flipping a dummy `func _canaryNegativeTest(dp
+    dataplane.DataPlane) {}` into the package (revert verified clean).
+    No production code change; the conntrack GC is already migrated
+    to `RuntimeDomainProvider`.
+  - **File(s)**: `pkg/conntrack/legacy_dataplane_canary_test.go`
+    (new), `docs/pr/1515-conntrack-gc-canary/plan.md` (new), `_Log.md`
+  - **Validation**: `go test ./pkg/conntrack/ -count=1 -race` green;
+    `go vet ./pkg/conntrack/...` clean; negative-case hand-flip
+    confirms canary fires.
+
 - **Timestamp**: 2026-05-25T00:45:00Z
   - **Action**: PR #1512 review follow-up — tightened the positional
     `dataplane.Manager` literal canary on two axes. (a) Recurse into nested
