@@ -1,8 +1,8 @@
 # Action Log
 
-## 2026-05-24
+## 2026-05-25
 
-- **Timestamp**: 2026-05-24T07:00:00Z
+- **Timestamp**: 2026-05-25T05:30:00Z
   - **Action**: PR #1526 implementation v3 — added
     `validateDataplaneTypeStrict` in pkg/config/compiler.go (slotted
     BEFORE existing CoS / policer / scheduler strict validators per
@@ -51,13 +51,6 @@
     `pkg/configstore/store_test.go`,
     `docs/pr/1526-dpdk-reject/plan.md`
 
-- **Timestamp**: 2026-05-24T00:05:00Z
-  - **Action**: PR #1526 plan v1 drafted. Reject `system
-    dataplane-type dpdk` at commit-time via new strict
-    validator in pkg/config/compiler.go, with migration error
-    text per issue body.
-  - **File(s)**: `docs/pr/1526-dpdk-reject/plan.md`
-
 - **Timestamp**: 2026-05-25T00:45:00Z
   - **Action**: PR #1512 review follow-up — tightened the positional
     `dataplane.Manager` literal canary on two axes. (a) Recurse into nested
@@ -102,6 +95,8 @@
     clean (114 warnings, all pre-existing); `cargo test --release
     --bin xpf-userspace-dp afxdp::wg` — 78/78 pass; `go test
     ./pkg/dataplane/...` — 4/4 packages pass.
+
+## 2026-05-24
 
 - **Timestamp**: 2026-05-24T23:30:00Z
   - **Action**: PR #1499 r-final-5 step 4 — final mechanical sweep

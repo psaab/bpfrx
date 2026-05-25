@@ -59,8 +59,6 @@ DRAFT v3 — addressing round-2 Codex plan-review findings.
 
 ## Round-1 verdicts
 
-## Round-1 verdicts
-
 - Codex (`task-mpkqnvds-b7z0tu`): PLAN-NEEDS-MAJOR
   - Finding 1: validator ordering — DPDK reject should fire
     BEFORE the existing class-of-service / three-color-policer /
