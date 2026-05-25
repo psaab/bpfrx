@@ -308,7 +308,7 @@ the NAT module applies it:
   pool index. This is sticky within the current pool size and order; changing
   either can remap existing source IPs to different pool addresses.
   This is intentionally documented as a userspace-v1 algorithm, not
-  mixed-backend new-flow parity: legacy eBPF used C-word IPv4
+  mixed-backend new-flow parity: legacy eBPF uses C-word IPv4
   modulo and IPv6 lane-XOR selection (DPDK retired #1525). Active synced sessions carry the chosen
   translated tuple, but new allocations after backend rollback may choose a
   different pool address. Pool-mode rules with missing pools, empty pools,

@@ -1,5 +1,23 @@
 # Action Log
 
+## 2026-05-25 — #1529 Codex code-review finding follow-up
+
+- **Timestamp**: 2026-05-25T06:50:00Z
+  - **Action**: Codex code review NEEDS-MINOR with three findings,
+    all addressed:
+    (1) _Log.md said 25 files but commit had 26; corrected.
+    (2) `docs/pr/1373-retire-ebpf-dataplane/README.md` safe-delete
+        bullet said "#1475 section below" but #1475 is above the
+        safe-delete blockers list; corrected to "section in this
+        file".
+    (3) Tense mismatch in `docs/userspace-dataplane-gaps.md` and
+        `docs/userspace-dataplane-architecture.md`: changed
+        "legacy eBPF used" back to "legacy eBPF uses" since
+        legacy eBPF is still present during the staged retirement.
+  - **File(s)**: `docs/pr/1373-retire-ebpf-dataplane/README.md`,
+    `docs/userspace-dataplane-gaps.md`,
+    `docs/userspace-dataplane-architecture.md`, `_Log.md`
+
 ## 2026-05-25 — #1529 Antigravity code-review finding follow-up
 
 - **Timestamp**: 2026-05-25T06:30:00Z
@@ -18,7 +36,7 @@
 ## 2026-05-25 — #1529 implementation
 
 - **Timestamp**: 2026-05-25T06:00:00Z
-  - **Action**: Implemented the v3 plan. 25 files touched, all `*.md`.
+  - **Action**: Implemented the v3 plan. 26 files touched, all `*.md`.
     Pure-text gate passes; no source files touched. Chain A boundary
     confirmed (no overlap with `docs/dataplane-decision-dpdk-vs-vpp.md`
     or `docs/dpdk-dataplane.md`). All three retirement-boundary doc

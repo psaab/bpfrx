@@ -304,9 +304,9 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 - DPDK was retired in #1525. The pre-retirement contract — that DPDK
   implemented both `DataPlane` and `RuntimeDataPlane` and that the blank
   registration import lived at `cmd/xpfd/main.go` — is preserved in the
-  canary-pinned `#1475 DPDK Backend Policy` section below as a historical
-  anchor; #1527 removes the registration import and #1528 deletes the
-  backend package.
+  canary-pinned `#1475 DPDK Backend Policy` section in this file as a
+  historical anchor; #1527 removes the registration import and #1528
+  deletes the backend package.
 - Legacy BPF source and generated artifacts are not safe to delete in #1451
   canary work: `bpf/`, `pkg/dataplane/*_bpfel.go`,
   `pkg/dataplane/*_bpfel.o`, and the legacy side of the `Makefile generate`
