@@ -2,10 +2,11 @@
 
 ## Status
 
-DRAFT v2 — Antigravity PLAN-NEEDS-MINOR addressed (sentinel buffer
-pre-fill so the regression gate proves the function *wrote* cs=0
-rather than relying on zero-initialized memory). Codex plan review
-still pending.
+DRAFT v3 — Codex PLAN-NEEDS-MAJOR addressed (kernel WG claim was
+factually wrong + RFC wording tightened); Antigravity
+PLAN-NEEDS-MINOR addressed in v2 (sentinel buffer pre-fill). Both
+v3 changes are documentation-only — implementation surface area is
+unchanged.
 
 ## Round-1 plan-review verdicts
 
@@ -18,10 +19,48 @@ still pending.
   pass under regression because `let mut out = [0u8; 40]` is
   already zero. Required correction: pre-fill the buffer with
   non-zero sentinel bytes (e.g. `0xff`) so the assertion proves
-  the function actively wrote zero. v2 applies this discipline to
-  both the new test and the strengthened `ipv4_checksum_is_correct`
-  test.
-- **Codex:** pending.
+  the function actively wrote zero. v2 applied this discipline.
+- **Codex (job task-mpkq4ty9-0sn4c0):** **PLAN-NEEDS-MAJOR.**
+  Material finding: the v1/v2 proposed doc comment claims "kernel
+  WireGuard emits cs=0 on outer IPv4 — we match that". This is
+  **factually wrong**. Linux kernel WireGuard's IPv4 send path
+  calls `udp_tunnel_xmit_skb(..., nocheck: false)` and socket
+  init sets `port4.use_udp_checksums = true`; the kernel
+  *computes* the UDP checksum on outer IPv4. The issue body
+  (#1501 A2 paragraph 2) is the source of this claim and is
+  itself wrong on the kernel-WG behavior. Baking the false
+  claim into our doc would mislead future readers.
+
+  Secondary findings:
+  1. RFC 768 has no real section titled "UDP CHECKSUM IS NULL"
+     — that's an informal header in the spec body. Cite "the
+     checksum field semantics" / "all-zero checksum signals
+     no-checksum" instead of a fictitious section number.
+  2. RFC 8200 §8.1 has a tunnel-mode exception path (RFC 6935 /
+     6936) so "forbids cs=0" is too absolute. The v6 builder
+     should compute a checksum unless a separate
+     RFC6936-style zero-checksum tunnel design is explicitly
+     approved.
+
+  Codex confirmed all other A-G checks (code reality, callers,
+  try_decap, perf framing, no-KILL). PLAN-READY pending the
+  wording fixes.
+
+## v3 corrections vs v2
+
+1. Replace "matches kernel WireGuard" with the honest framing:
+   IPv4 cs=0 is RFC-legal, this engine *intentionally* defaults
+   to it, this *differs* from kernel WG / wireguard-go / typical
+   UDP stacks, and a midbox-compat config knob is the integration
+   PR's escape valve. The cs=0 choice trades cycles for a known
+   wire-interop risk that the integration layer can manage.
+2. Drop the fake RFC 768 section title; cite "RFC 768, UDP
+   checksum field semantics — an all-zero transmitted checksum
+   signals that no checksum was computed."
+3. Soften RFC 8200 wording: "RFC 8200 §8.1 requires a non-zero
+   UDP checksum on IPv6 by default; the RFC 6935 / 6936
+   zero-checksum tunnel exception requires an explicit deployment
+   design and is out of scope for this engine."
 
 ## Issue framing
 
@@ -57,11 +96,26 @@ What the file is internally inconsistent about:
   checksum or delegate to offload, citing "kernel WG and
   wireguard-go emit a non-zero UDP checksum on IPv4".
 
-The TODO's premise is contradicted by RFC 768 (cs=0 is legal IPv4
-UDP) AND by the issue body's own assertion that "kernel WG does
-[cs=0] for outer-IPv4 traffic" (#1501 A2 body, paragraph 2). The
-TODO is stale guidance left over from the #1499 r4 review
-discussion that subsequently resolved in favor of emitting cs=0.
+Reality check (per Codex plan-review v1):
+
+- **The TODO's kernel/wireguard-go claim is factually
+  correct.** Linux kernel WireGuard's IPv4 send path calls
+  `udp_tunnel_xmit_skb(..., nocheck: false)` with
+  `port4.use_udp_checksums = true`. Wireguard-go likewise
+  computes the outer UDP checksum.
+- **The issue body's claim that "kernel WG does [cs=0] for
+  outer-IPv4 traffic" (#1501 A2 body, paragraph 2) is
+  factually wrong** about kernel WG behavior. RFC 768 still
+  *permits* cs=0; the kernel just chooses not to use that
+  permission.
+- The contradiction in `outer.rs` is therefore not "TODO is
+  stale" but "doc and TODO encode two different design
+  positions, both internally consistent". The chosen runtime
+  behavior (cs=0) is intentional, RFC-legal, and *different*
+  from kernel WG / wireguard-go. The doc needs to say so
+  honestly: we are not "matching kernel WG"; we are diverging
+  for a per-packet cycle win, accepting a known midbox risk
+  the integration layer can manage.
 
 **Therefore the real A2 work is:**
 
@@ -124,13 +178,27 @@ Replace the 23-line comment block at lines 47-69 with a tighter,
 non-contradictory doc comment. The function body is unchanged
 (it already sets cs=0). The new comment explains:
 
-1. RFC 768 §"UDP CHECKSUM IS NULL" allows IPv4 UDP cs=0.
-2. Kernel WireGuard emits cs=0 on outer IPv4 — we match that.
-3. RFC 8200 §8.1 forbids cs=0 on IPv6 UDP; the v6 outer
-   builder (when it ships, separate follow-up) must NOT take
-   the same shortcut.
-4. The IPv4 header checksum (mandatory) is computed; the UDP
-   checksum (optional on IPv4) is zero.
+1. RFC 768 UDP checksum field semantics — an all-zero
+   transmitted checksum signals "no checksum computed";
+   this is legal for IPv4 UDP.
+2. This engine *intentionally* defaults to cs=0 on outer
+   IPv4 to save the per-packet pseudo-header + payload sum.
+   **This differs from kernel WireGuard and wireguard-go**,
+   both of which compute the outer UDP checksum on IPv4
+   (kernel WG: `udp_tunnel_xmit_skb(..., nocheck: false)`
+   with `port4.use_udp_checksums = true`).
+3. RFC 8200 §8.1 requires a non-zero UDP checksum on IPv6 by
+   default; the RFC 6935 / 6936 zero-checksum tunnel
+   exception requires an explicit deployment design and is
+   out of scope for this engine. The future v6 outer builder
+   MUST compute the UDP checksum.
+4. The IPv4 header checksum (mandatory per RFC 791) is
+   computed; the UDP checksum (optional on IPv4 per RFC 768)
+   is zero.
+5. Wire-interop risk: some commercial midboxes drop UDPv4
+   with cs=0. The integration layer can surface an
+   `outer-udp-checksum compute|zero` config knob — out of
+   scope for this engine-side PR.
 
 Proposed replacement comment:
 
@@ -140,19 +208,31 @@ Proposed replacement comment:
 /// `payload_len` is the length of the WG transport record
 /// (header + ciphertext + tag) that follows the UDP header.
 ///
-/// IPv4 header checksum: mandatory — computed here over the
-/// IPv4 header only.
+/// IPv4 header checksum: mandatory per RFC 791 — computed
+/// here over the IPv4 header only.
 ///
-/// UDP checksum: emitted as 0 ("not computed") per RFC 768
-/// §"UDP CHECKSUM IS NULL". This matches kernel WireGuard's
-/// behavior for outer-IPv4 traffic and saves the per-packet
-/// pseudo-header + payload sum. RFC 8200 §8.1 requires a
-/// non-zero UDP checksum on IPv6 — when the v6 outer builder
-/// ships it MUST compute the UDP checksum (cannot take this
-/// shortcut). Some commercial midboxes drop UDPv4 with cs=0;
-/// if a deployment encounters one, the integration layer can
+/// UDP checksum: emitted as 0 ("no checksum computed"),
+/// which RFC 768 permits for IPv4 UDP via the checksum
+/// field semantics ("an all-zero transmitted checksum value
+/// means that the transmitter generated no checksum").
+///
+/// This engine intentionally defaults to cs=0 to save the
+/// per-packet pseudo-header + payload sum. NOTE: this
+/// differs from kernel WireGuard and wireguard-go — both of
+/// those compute the outer UDP checksum on IPv4 (kernel WG
+/// uses `udp_tunnel_xmit_skb(..., nocheck: false)` with
+/// `use_udp_checksums = true`). Some commercial midboxes
+/// have been reported to drop UDPv4 datagrams with cs=0; if
+/// a deployment encounters one, the integration layer can
 /// surface an `outer-udp-checksum compute|zero` config knob
-/// — out of scope for this engine-side PR.
+/// (out of scope for this engine-side PR).
+///
+/// IPv6 outer (not yet implemented): RFC 8200 §8.1 requires
+/// a non-zero UDP checksum on IPv6 by default. The RFC 6935
+/// / 6936 zero-checksum tunnel exception requires an
+/// explicit deployment design and is out of scope. The
+/// future v6 outer builder MUST compute the UDP checksum
+/// and MUST NOT take the IPv4 shortcut.
 ```
 
 ### Test additions in the existing `outer_tests` mod
