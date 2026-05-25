@@ -145,6 +145,53 @@ The #1493 loader/bootstrap split keeps normal userspace startup on the
 userspace-only shim loader below. Source removal still waits for #1451's
 remaining operator/runtime surface migration and #1476's deletion candidate.
 
+## #1504 Userspace Shim Boundary Escape Assumptions
+
+The retained userspace shim boundary canary scans direct production files in
+`pkg/dataplane` and `pkg/dataplane/userspace`. It deliberately does not recurse
+into `pkg/dataplane/dpdk`; DPDK remains governed by the #1475 backend policy,
+including its `-tags dpdk` CGo files, and is not part of the userspace-only shim
+escape scan.
+
+Package-local `dataplane.Manager` construction must not use positional
+composite literals. The entry-program state lives in the unexported
+`xdpEntryProg` field, so positional `dataplane.Manager` literals can silently
+populate that field if the struct order changes or a local caller supplies all
+fields. Production code must use `dataplane.New()` plus the narrow
+userspace-shim selection/swap methods. Package-local tests may keep keyed
+literals when they intentionally need direct field setup.
+
+The same direct boundary packages must not add production `import "C"`,
+`//go:linkname`, `//go:cgo_*` compiler directives, `.s` / `.S` assembly files,
+or `.syso` precompiled object files. Those mechanisms can mutate Go state or
+hide alternate entry paths outside the AST selectors pinned by the entry-program
+canary. Production build constraints are also rejected unless they are
+explicitly allowlisted and documented here. The only current allowlist
+entries are the generated legacy bpf2go `*_bpfel.go` artifacts with the exact
+`//go:build 386 || amd64` architecture constraint, and
+`pkg/dataplane/loader_stub.go` with `//go:build ignore`, an ignored fallback
+stub for trees without generated legacy artifacts that is not part of normal
+builds. Any new boundary build tag, assembly or object file, CGo import, or Go
+compiler directive requires a matching canary allowlist rationale before it can
+land.
+
+Current generated legacy bpf2go build-tag allowlist:
+
+- `pkg/dataplane/xpftcconntrack_x86_bpfel.go`
+- `pkg/dataplane/xpftcforward_x86_bpfel.go`
+- `pkg/dataplane/xpftcmain_x86_bpfel.go`
+- `pkg/dataplane/xpftcnat_x86_bpfel.go`
+- `pkg/dataplane/xpftcscreenegress_x86_bpfel.go`
+- `pkg/dataplane/xpfxdpconntrack_x86_bpfel.go`
+- `pkg/dataplane/xpfxdpcpumap_x86_bpfel.go`
+- `pkg/dataplane/xpfxdpforward_x86_bpfel.go`
+- `pkg/dataplane/xpfxdpmain_x86_bpfel.go`
+- `pkg/dataplane/xpfxdpnat64_x86_bpfel.go`
+- `pkg/dataplane/xpfxdpnat_x86_bpfel.go`
+- `pkg/dataplane/xpfxdppolicy_x86_bpfel.go`
+- `pkg/dataplane/xpfxdpscreen_x86_bpfel.go`
+- `pkg/dataplane/xpfxdpzone_x86_bpfel.go`
+
 ## #1493 Userspace Shim Loader Split
 
 Normal AF_XDP userspace startup now enters `LoadUserspaceShim()` and

@@ -2,6 +2,21 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-25T00:45:00Z
+  - **Action**: PR #1512 review follow-up — tightened the positional
+    `dataplane.Manager` literal canary on two axes. (a) Recurse into nested
+    composite literals whose `Type` is nil when the enclosing slice / array /
+    map container's element/value type is a package-local Manager named type,
+    closing the `[]Manager{{false, nil, "..."}}` / array / map bypass.
+    (b) Only flag when the element at `xdpEntryProgIndex` is positional
+    (not `*ast.KeyValueExpr`), so fully-keyed and mixed-where-xdpEntryProg-
+    is-keyed literals stop producing empty-string false-positive violations.
+    Added six fixture sub-tests pinning each direction.
+  - **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/ -count=1`;
+    `go test ./pkg/dataplane/ -count=1 -run
+    'TestRetainedUserspaceShimBoundary|TestPositionalDataplaneManager' -v`
+
 - **Timestamp**: 2026-05-25T00:30:00Z
   - **Action**: PR #1499 r-final-6 fix — rebased onto current
     `origin/master` after PR #1511 merged. Resolved chronological
@@ -243,6 +258,22 @@
     `docs/pr/1373-retire-ebpf-dataplane/README.md`, `_Log.md`
   - **Validation**: `go test ./pkg/logging ./pkg/dataplane -count=1`;
     `go test ./pkg/daemon ./pkg/dataplane/userspace -count=1`;
+
+- **Timestamp**: 2026-05-24T19:29:17Z
+  - **Action**: Issue #1504 implementation — hardened the retained
+    userspace shim boundary canary against positional package-local
+    `dataplane.Manager` literals, production CGo imports, `go:linkname`,
+    `go:cgo_*` compiler directives, direct assembly and `.syso` object
+    files, and unallowlisted build tags while keeping DPDK CGo outside the
+    scanner. Documented the exact #1504 boundary
+    assumptions and allowlisted only generated legacy bpf2go architecture
+    tags plus the ignored loader stub.
+  - **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`,
+    `docs/pr/1373-retire-ebpf-dataplane/README.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane -run
+    'TestRetainedUserspaceShimBoundaryCanary|TestRetirementBoundaryDocsMentionShimEscapeAssumptions'
+    -count=1`; `go test ./pkg/dataplane -run
+    'Retirement|Canary|Userspace.*Entry|BPFShim' -count=1`;
     `git diff --check`
 
 - **Timestamp**: 2026-05-24T18:47:00Z
