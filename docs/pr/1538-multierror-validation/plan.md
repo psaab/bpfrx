@@ -305,7 +305,11 @@ similar.
 
 ## Test plan
 
-### New tests — three total
+### New tests — four total
+
+(The fourth, `TestCompileAllThreeStrictValidatorsAccumulated`, was
+added in the code-review round via a Copilot-bot follow-up to
+close third-family coverage. It is described under test #4 below.)
 
 **Fixture choice — parser-reachable strict-validator errors.**
 
@@ -420,6 +424,31 @@ against a direct validator call as the reference value.
    doing it via direct-handler call (not bufconn) matches the
    existing test style.
 
+4. **`TestCompileAllThreeStrictValidatorsAccumulated`** —
+   `pkg/config/compiler_test.go`. Added in the code-review round
+   via a Copilot-bot follow-up to close third-family coverage
+   (the original three planned tests covered two families plus
+   gRPC rendering; the third family —
+   `validatePolicySchedulerReferencesStrict` — was not exercised
+   by any of them). Same parser-driven `CompileConfig` style as
+   test 1, with a triple-family fixture:
+
+   ```
+   set system dataplane-type userspace
+   set class-of-service schedulers bad-sched equal-flow-enforcement
+   set firewall three-color-policer bad-pol single-rate color-blind
+   set firewall three-color-policer bad-pol then discard
+   set security policies from-zone trust to-zone untrust policy sched-test ...
+   set security policies from-zone trust to-zone untrust policy sched-test scheduler-name missing-sched
+   ```
+
+   Assertions:
+   - All three substrings present (`equal-flow-enforcement`,
+     `committed-information-rate`,
+     `references undefined scheduler`).
+   - `strings.Count(err.Error(), "\n") == 2` (three errors →
+     two newlines per `errors.Join` semantics).
+
 ### Existing test gates (must not regress)
 
 - `TestDataplaneTypeDPDKRejectedAtCommitFiresFirst`
@@ -438,9 +467,10 @@ against a direct validator call as the reference value.
 ### Flake check
 
 5× loop on `TestCompileMultipleStrictErrorsAccumulated`,
-`TestCompileSingleStrictErrorJoinPath`, and
-`TestCompileCheckMultiErrorRendersThroughGRPC` after
-implementation. Per standing rule.
+`TestCompileSingleStrictErrorJoinPath`,
+`TestCompileAllThreeStrictValidatorsAccumulated` (added in the
+code-review round), and `TestCompileCheckMultiErrorRendersThroughGRPC`
+after implementation. Per standing rule.
 
 ### Build / test cycle
 
