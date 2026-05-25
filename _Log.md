@@ -1,5 +1,23 @@
 # Action Log
 
+## 2026-05-25 — #1476 Phase A PLAN-READY at r4
+
+- **Timestamp**: 2026-05-25T (Phase A complete)
+  - **Action**: Round-4 reviews returned: Codex r4 PLAN-READY (all
+    r3 stale-text findings confirmed closed; no new issues); AGY
+    r4 PLAN-READY with one Phase-B critical implementation
+    requirement — `Store.SyncApply()` at `pkg/configstore/store.go:205`
+    bypasses the `Store.Load()` rewrite hook, so HA rolling upgrades
+    will sync-loop on `ErrEBPFDataplaneRetired`. Plan §4.6 extended
+    to require `rewriteRetiredDataplaneType(tree)` to run in BOTH
+    `Store.Load()` AND `Store.SyncApply()` paths, with a Phase-B
+    unit test mirroring #1528's `TestLoad_RewritesPersistedDPDKDataplaneType`.
+    Phase A complete. Polling for #1451 close (waiting on #1516 +
+    #1521).
+  - **File(s)**: `docs/pr/1476-mechanical-bpf-removal/plan.md` v4
+    (PLAN-READY at r4),
+    `docs/pr/1476-mechanical-bpf-removal/reviewer-ids.md`, `_Log.md`
+
 ## 2026-05-25 — #1476 Phase A v4 plan after r3 reviews
 
 - **Timestamp**: 2026-05-25T (Phase A v4 after r3 reviewer findings)

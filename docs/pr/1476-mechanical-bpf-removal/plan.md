@@ -1,13 +1,12 @@
 # #1476 — eBPF Retirement: Mechanical Source Removal
 
-**Status:** DRAFT v4 — addresses Codex r3 PLAN-NEEDS-MAJOR (6
-findings, all stale-text drift / doc-sweep gaps; no new operational
-issues). AGY r3 returned PLAN-READY with one cosmetic nit (line 721
-"4" → "5") already absorbed before this v4 draft. The #1373
-umbrella's mechanical-deletion phase. Blocked-on-merge by #1516
-(grpcapi migration) and #1521 (userspace maps_sync decouple), both
-sub-issues of #1451. #1473, #1493, #1494, #1518, #1522 already
-merged.
+**Status:** DRAFT v4 (PLAN-READY at r4) — Codex r4 PLAN-READY,
+AGY r4 PLAN-READY with one Phase-B implementation requirement
+absorbed into §4.6: `Store.SyncApply()` rewrite hook for HA rolling
+upgrades. The #1373 umbrella's mechanical-deletion phase.
+Blocked-on-merge by #1516 (grpcapi migration) and #1521 (userspace
+maps_sync decouple), both sub-issues of #1451. #1473, #1493, #1494,
+#1518, #1522 already merged.
 
 ## v4 changes from v3
 
@@ -576,6 +575,39 @@ two HA nodes booting with `ebpf` persisted both rewrite locally;
 if one node is un-upgraded and re-pushes the legacy config,
 the upgraded peer re-rewrites on each push and logs at WARN. Same
 "loud-log, defer deeper handling" stance.
+
+**(v4 — AGY r4 critical finding for Phase B)**: `Store.SyncApply()`
+in `pkg/configstore/store.go` (around line 205) is the HA peer-sync
+ingress path. It parses the peer's raw config text and calls
+`s.compileTree(tree)` directly, **bypassing the `Store.Load()`
+rewrite hook**. On a rolling upgrade where the un-upgraded primary
+pushes a configuration containing `system dataplane-type ebpf` to
+an upgraded standby, the standby's `SyncApply` will compile the raw
+tree, fire `validateDataplaneTypeStrictEBPF`, return
+`ErrEBPFDataplaneRetired`, and fail the sync with a wrapped error.
+The HA cluster will then alarm-loop on sync failures every retry.
+
+**Phase B implementation requirement**: extend the AST rewrite
+helper `rewriteRetiredDataplaneType(tree)` to run in BOTH places:
+
+1. `Store.Load()` — before `compileTree`, on local boot.
+2. `Store.SyncApply()` — immediately after parsing the received
+   tree, before `s.compileTree(tree)` is called. The standby
+   transparently rewrites the incoming legacy directive to default
+   (userspace), logs at WARN with a remediation hint pointing the
+   operator at the un-upgraded primary, and proceeds with normal
+   sync apply.
+
+This ensures rolling-upgrade safety symmetric to the local-boot
+path. Without the `SyncApply` hook, the operational blackout
+becomes a sync-loop instead of a daemon-startup blackout, which is
+arguably worse (the cluster is up but flaps health on every retry).
+
+Test plan: a Phase B unit test must construct a `Store` with the
+rewrite helper, call `SyncApply` with a peer-config blob containing
+`system dataplane-type ebpf`, and assert the resulting active
+config has `DataplaneType == ""` and the WARN log fires. Pattern
+mirrors `TestLoad_RewritesPersistedDPDKDataplaneType` from #1528.
 
 ### 4.7 Public API preservation
 
