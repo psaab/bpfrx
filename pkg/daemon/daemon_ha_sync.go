@@ -664,8 +664,26 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// fence via sync; on receive, disable all local RGs.
 			d.cluster.SetPeerFenceFunc(d.sessionSync.SendFence)
 			d.sessionSync.OnFenceReceived = func() {
-				slog.Warn("cluster: fence received from peer, disabling all RGs")
+				slog.Warn("cluster: fence received from peer")
+				// Guard d.dp: the daemon can run in config-only mode
+				// (d.dp == nil) when the runtime dataplane factory rejects
+				// the configured backend — for example, a stale
+				// "system dataplane-type dpdk" config triggers
+				// dataplane.ErrDPDKBackendRetired and daemon_run.go falls
+				// back to nil dp. Without this guard a peer fence would
+				// panic on a nil pointer dereference. The same applies to
+				// any future Start() failure that leaves d.dp == nil.
+				if d.dp == nil {
+					slog.Warn("cluster: fence received but dataplane is nil; skipping RG deactivation",
+						"mode", "config-only",
+						"action", "skip_rg_deactivation",
+						"remediation", "set system dataplane-type userspace and restart xpfd",
+					)
+					return
+				}
 				if cfg.Chassis.Cluster != nil {
+					slog.Warn("cluster: fence: disabling all RGs",
+						"rg_count", len(cfg.Chassis.Cluster.RedundancyGroups))
 					for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
 						if err := d.dp.HA().SetRGActive(commsCtx, rg.ID, false); err != nil {
 							slog.Warn("cluster: fence: failed to disable rg_active",

@@ -23,7 +23,7 @@ tracked by #1451 and the removal-phase child issues below.
 | Issue | Scope |
 |---|---|
 | #1451 | Migrate remaining legacy eBPF-shaped runtime and operator surfaces before source/generated artifact deletion. |
-| #1473 | Split the retained userspace XDP shim from legacy `xdp_main_prog` fallback. |
+| #1473 | Split the retained userspace XDP shim from legacy `xdp_main_prog` fallback. Closeout pending: implementation, link-cycle regressions, counter rename, and source/object/manager canaries already landed via #1493, #1498, #1512, #1513, #1514. See [plan-1473](../1473-xdp-shim-decouple/plan.md) for the per-AC evidence trail. |
 | #1493 | Split userspace shim loader/bootstrap from the legacy `loadAllObjects()` path. |
 | #1494 | Pin the retained userspace shim boundary with source/object/manager canaries before source deletion. |
 | #1476 | Remove legacy BPF source, generated artifacts, and build hooks after the blockers close. |

@@ -12,7 +12,6 @@ import (
 
 	"github.com/psaab/xpf/pkg/daemon"
 	"github.com/psaab/xpf/pkg/dataplane"
-	_ "github.com/psaab/xpf/pkg/dataplane/dpdk"
 	_ "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/frr"
 )
