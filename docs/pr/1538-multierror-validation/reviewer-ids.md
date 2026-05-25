@@ -89,4 +89,15 @@ plan-review (no PR yet) and code-review (PR #1556) phases.
 ### Round 5 (HEAD 135ac2dd — final test-count update)
 
 - Codex: `task-mpldgaxh-3uhgjm`
-  - Verdict: pending
+  - Verdict: NEEDS-MINOR ("New tests — three total" section
+    header + flake-check list still said three; addressed in
+    f16fd64e)
+- Antigravity: not dispatched (no code change, only doc;
+  r4 MERGE-READY still applies to the code)
+
+### Round 6 (HEAD f16fd64e — complete four-tests update)
+
+- Codex: `task-mpldivmf-wqx812`
+  - Verdict: NEEDS-MINOR (reviewer-ids.md r5 entry said
+    "pending"; addressed in this commit)
+- Antigravity: `adversarial-review-mpldix4e-vyjru7`
