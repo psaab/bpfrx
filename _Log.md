@@ -2,6 +2,183 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-25T00:30:00Z
+  - **Action**: PR #1499 r-final-6 fix — rebased onto current
+    `origin/master` after PR #1511 merged. Resolved chronological
+    `_Log.md` conflicts across two rebased PR commits (`d379c9d9`
+    r-final-3 and `95fc992f` r-final-4) by interleaving the new
+    `pkg/logging/binary_test.go` PR #1451 review-follow-up entries
+    from master with the existing PR #1499 entries. All other
+    commits replayed cleanly with no code conflicts. Mechanical
+    plan.md citation sweep on the rebased tree produced two residual
+    minor citation drifts (the same two Copilot flagged as non-
+    blocking on `183bc394`): (1)
+    `pkg/dataplane/userspace/protocol.go:250` cited
+    `afxdp/wg/engine.rs:271` for the `sessions_by_local_index`
+    field — actual field declaration is at line 275 (line 271 is
+    inside the `/// ` doc block that introduces it). Corrected
+    citation to `engine.rs:275`. (2) `docs/pr/wireguard-clean/plan.md`
+    cited `mod.rs:86-91` for "the engine constants" describing both
+    `WG_DATA_HEADER_LEN` and `POLY1305_TAG_LEN`; the cited range
+    only covers the data-header constant. `POLY1305_TAG_LEN` is at
+    line 84. Widened both citations (lines 76 and 444) to
+    `mod.rs:84-91` so the range covers both constants the
+    surrounding prose names. No code changes.
+  - **File(s)**: `pkg/dataplane/userspace/protocol.go`,
+    `docs/pr/wireguard-clean/plan.md`, `_Log.md`
+  - **Validation**: rebase clean after manual `_Log.md` resolution
+    on commits `d379c9d9` + `95fc992f`; `cargo build --release`
+    clean (114 warnings, all pre-existing); `cargo test --release
+    --bin xpf-userspace-dp afxdp::wg` — 78/78 pass; `go test
+    ./pkg/dataplane/...` — 4/4 packages pass.
+
+- **Timestamp**: 2026-05-24T23:30:00Z
+  - **Action**: PR #1499 r-final-5 step 4 — final mechanical sweep
+    pass. After the previous step's edits shifted lines in
+    engine.rs (+4 from the jumbo-MTU comment expansion), scratch.rs
+    (+2 from the doc-comment rewrite), and session.rs (+5 from the
+    local_index doc-comment rewrite), the plan's own line citations
+    that I had just "fixed" were already stale. Cross-grepped every
+    remaining plan.md file:line citation:
+    - `scratch.rs:17-21` → `scratch.rs:18-25` (struct field
+      definitions shifted by +1..+4 lines)
+    - `scratch.rs:25-30` → `scratch.rs:27-33` (constructor)
+    - `engine.rs:258` → `engine.rs:262` (`table: ArcSwap<PeerTable>`)
+    - `engine.rs:506-510` → `engine.rs:510-514` (`peer.current.read()`)
+    - `engine.rs:643-649` → `engine.rs:647-653`
+      (`sessions_by_local_index.read()` in try_decap)
+    - `engine.rs:671-676` → `engine.rs:675-680` (pre-AEAD replay
+      precheck-lock block)
+    - `engine.rs:695` → `engine.rs:699-718` (post-AEAD replay
+      update-lock block — now cites the actual block range)
+    - `session.rs:72` → `session.rs:77`
+      (`replay: Mutex<ReplayState>`)
+    All other citations (afxdp/mod.rs:175, mod.rs:86-91/95/98,
+    framing.rs:32-46, outer.rs:23-45, protocol.rs:417-450,
+    types/forwarding.rs:129-140, forwarding/mod.rs:751,
+    tx/dispatch.rs:430/785-792/1458-1459, frame/mod.rs:212,
+    frame/tcp_segmentation.rs:309, tunnel.rs:189) re-verified.
+  - **File(s)**: docs/pr/wireguard-clean/plan.md
+
+- **Timestamp**: 2026-05-24T23:15:00Z
+  - **Action**: PR #1499 r-final-5 fix step 3 — line-citation offsets
+    + stale field-name drift + scratch.rs MAX_FRAME doc-comment.
+    Updated plan.md:104 to spell out `wg_peer_pubkey_hex` (was the
+    pre-r4 stale `wg_peer_pubkey`) and added a `protocol.rs:437-438`
+    pointer. Updated plan.md hot-path lock-read citations from
+    `engine.rs:499-503` → `engine.rs:506-510` (encap-side
+    `peer.current.read()`) and `engine.rs:636-642` →
+    `engine.rs:643-649` (decap-side `sessions_by_local_index.read()`),
+    matching the actual line numbers after the truncated-record DoS
+    guard landed at engine.rs:664-666. Updated protocol.go:250 to
+    cite `engine.rs:271` instead of `engine.rs:264` for
+    `sessions_by_local_index`. Updated engine.rs:194 jumbo-MTU
+    comment to drop the fragile `engine.rs:539` line citation and
+    point at the `if padded_len > PADDED_PLAINTEXT_MAX` guard by
+    pattern instead (actual line 546). Rewrote session.rs:62-69
+    `local_index` doc comment so it no longer says inbound demux is
+    `(listen_port, local_index)` — the engine map is keyed by
+    `local_index` alone. Rewrote allowed_ips.rs:11-19 to spell out
+    `wg_peer_pubkey_hex` (was `wg_peer_pubkey`) and to drop the
+    false claim that the field lives on the runtime `TunnelEndpoint`
+    — the snapshot has it; the runtime type extension is integration-
+    PR scope. Rewrote scratch.rs:3-10 to drop the false
+    `MAX_FRAME = 2048` constant (no such constant exists — the
+    UMEM constant is `UMEM_FRAME_SIZE = 4096` in `afxdp/mod.rs:175`)
+    and to make the parameter-passed `max_frame` explicit.
+  - **File(s)**: docs/pr/wireguard-clean/plan.md,
+    userspace-dp/src/afxdp/wg/engine.rs,
+    userspace-dp/src/afxdp/wg/session.rs,
+    userspace-dp/src/afxdp/wg/allowed_ips.rs,
+    userspace-dp/src/afxdp/wg/scratch.rs,
+    pkg/dataplane/userspace/protocol.go
+
+- **Timestamp**: 2026-05-24T23:05:00Z
+  - **Action**: PR #1499 r-final-5 fix step 2 — integration-PR pointer
+    rewritten. plan.md "Encap call site" claimed dispatch.rs:430 was
+    the egress encap point that unconditionally called
+    `encapsulate_native_gre_frame`. Actual: dispatch.rs:430 only
+    computes the `uses_native_tunnel = tunnel_endpoint_id != 0` gate;
+    the real `encapsulate_native_gre_frame` calls live in
+    `frame/mod.rs:212` (copy path, invoked from dispatch at
+    `tx/dispatch.rs:785-792`), `frame/tcp_segmentation.rs:309`
+    (TCP segmentation), and `tunnel.rs:189` (local origination).
+    Rewrote the section to enumerate all three sites and clarified
+    that dispatch.rs:430 *computes the gate*, it does not itself
+    encap. Also updated the "What's OUT" bullet that referenced
+    `tx/dispatch.rs` activation to enumerate the same three sites.
+  - **File(s)**: docs/pr/wireguard-clean/plan.md
+
+- **Timestamp**: 2026-05-24T23:00:00Z
+  - **Action**: PR #1499 r-final-5 fix pass start — exhaustive mechanical
+    plan.md sweep against actual source. Step 1 fixed: WG data-record
+    header described as 20 bytes in plan.md:74-78 (handshake scope) and
+    plan.md:282-286 (MSS section). Actual is 16 bytes: 1B type + 3B
+    reserved + 4B receiver_index + 8B counter, as defined by
+    `WG_DATA_HEADER_LEN = 1 + 3 + 4 + 8` in
+    `userspace-dp/src/afxdp/wg/mod.rs:91` and the byte-exact layout in
+    `userspace-dp/src/afxdp/wg/framing.rs:32-46`. Rewrote the on-wire
+    framing description with explicit byte offsets and a per-row table;
+    updated the handshake-scope bullet to match; fixed the IPv4/IPv6
+    outer overhead breakdown to call out the `WG_DATA_HEADER_LEN` /
+    `POLY1305_TAG_LEN` constants directly.
+  - **File(s)**: docs/pr/wireguard-clean/plan.md
+
+- **Timestamp**: 2026-05-24T22:00:00Z
+  - **Action**: PR #1499 r-final-4 fix — closed Codex MAJOR (5 plan.md
+    drifts) and Copilot 2 inline findings on the r-final-3 commit
+    `d379c9d9`, plus a mechanical doc-sync sweep that tightened several
+    file:line citations. (1) plan.md hot-path layout `WgWorkerScratch`
+    bullet rewritten to describe `encap_out`/`decap_out:
+    RefCell<Vec<u8>>` (was `encap_buf: Vec<u8>`) per `scratch.rs:17-21`.
+    (2) plan.md hot-path "never under a lock on the hot path" claim
+    rewritten: engine peer routing is `ArcSwap<PeerTable>` (lock-free
+    load), but per-peer `current`/`previous` are `RwLock<Option<Arc<
+    WgSession>>>` and `sessions_by_local_index` is `RwLock<FxHashMap>`,
+    so encap takes `peer.current.read()` at `engine.rs:499-503` and
+    decap takes `sessions_by_local_index.read()` at `engine.rs:636-642`.
+    (3) plan.md protocol-extension field block: renamed `wg_local_privkey:
+    [u8; 32]` / `wg_peer_pubkey: [u8; 32]` to `wg_local_privkey_hex:
+    String` / `wg_peer_pubkey_hex: String` per `protocol.rs:417-450`
+    and deleted the false claim that the snapshot mirrors into the
+    runtime `TunnelEndpoint` in this PR — runtime mirror is integration-
+    PR scope (`afxdp/types/forwarding.rs:129-140` confirms no WG fields).
+    (4) plan.md MSS section: corrected the claim that `wg_tcp_mss` is
+    wired as a sibling of `native_gre_tcp_mss` and that `dispatch.rs:1458`
+    branches on `endpoint.mode`. Actual `dispatch.rs:1458-1459` short-
+    circuits TCP segmentation for ANY `tunnel_endpoint_id != 0`;
+    `wg_tcp_mss` exists only as a standalone helper in `afxdp/wg/mss.rs`.
+    Dispatch-side wiring is integration-PR scope. (5) plan.md VLAN-safety
+    section: reordered `write_outer_eth` arg list from `(out, src_mac,
+    dst_mac, vlan_id, ethertype)` to `(out, dst_mac, src_mac, vlan_id,
+    ethertype)` per `outer.rs:23-45`. (6) Copilot finding 1 (Go-side
+    comment): updated `pkg/dataplane/userspace/protocol.go` `WgListenPort`
+    comment that claimed WG demux is `(listen_port, receiver_index)` —
+    the engine demuxes by `receiver_index` alone, listen-port selection
+    is integration-layer UDP dispatch. (7) Copilot finding 2 (boundary
+    comment): tightened the `PADDED_PLAINTEXT_MAX` doc in `engine.rs:198`
+    to describe the actual `padded_len <= PADDED_PLAINTEXT_MAX` boundary
+    — accepted range is `inner_ip.len() ∈ [0, 4096]`, not "> 4080
+    rejected". A 4081..=4096-byte inner is ACCEPTED because
+    `pad_to_16(4096) == 4096 == PADDED_PLAINTEXT_MAX`. Mechanical-sweep
+    extras: (a) `allowed_ips.rs` "LPM trie" label corrected to flat
+    sorted-by-prefix-length-descending `Vec<Entry>` (LPM lookup, not LPM
+    trie). (b) `engine.rs:251` citation for `ArcSwap<PeerTable>` updated
+    to `engine.rs:258`. (c) Replay-lock citations updated from
+    `engine.rs:664`/`engine.rs:688` to `engine.rs:671-676` (pre-AEAD
+    precheck) and `engine.rs:695` onward (post-AEAD update). (d)
+    `protocol.rs:432-450` widened to `protocol.rs:417-450`. Verified by
+    `cargo build --release` (clean), 5×`cargo test ... afxdp::wg` runs
+    (78 pass each), and `go test ./pkg/dataplane/...` (all 4 packages
+    pass). One initial test flake on
+    `install_session_serializes_with_reconcile_removal` did not
+    reproduce on any of 5 follow-up runs — same class as the documented
+    pre-existing `reconcile_peers_snapshot_is_atomic_under_concurrent_load`
+    flake from `a5664f85`, not introduced by this fix.
+    - **File(s)**: `docs/pr/wireguard-clean/plan.md`,
+      `pkg/dataplane/userspace/protocol.go`,
+      `userspace-dp/src/afxdp/wg/engine.rs`, `_Log.md`.
+
 - **Timestamp**: 2026-05-24T20:58:00Z
   - **Action**: PR #1451 review follow-up — extended the RT_FLOW
     wire-offset canary across the full raw event layout and tightened
@@ -19,6 +196,40 @@
   - **File(s)**: `pkg/logging/binary_test.go`, `_Log.md`
   - **Validation**: `go test ./pkg/logging ./pkg/dataplane -count=1`;
     `git diff --check`
+
+- **Timestamp**: 2026-05-24T20:30:00Z
+  - **Action**: PR #1499 r-final-3 fix — rebased onto current
+    `origin/master` (resolved `_Log.md` conflicts chronologically across
+    four rebased PR commits) and closed the Codex MINOR finding from the
+    r-final-2 synthesis plus three residual plan.md drifts Codex did not
+    catch but a wider sweep surfaced. (1) `docs/pr/wireguard-clean/plan.md`
+    Performance Architecture (hot-path layout) replay-locking bullet:
+    rewrote to describe the as-shipped `std::sync::Mutex<ReplayState>` and
+    the unconditional pre-AEAD precheck-lock + post-AEAD update-lock
+    pattern at `engine.rs:664`/`engine.rs:688`. The earlier "AtomicU64
+    bitmap + counter", "parking_lot::Mutex", and "only on the
+    duplicate/out-of-window arms" wording is now flagged as the stale
+    pre-implementation sketch. (2) `Replay window` subsection: same
+    correction — replaced the `(highest: AtomicU64, bitmap: AtomicU64)`
+    description with `std::sync::Mutex<ReplayState>` and made the two
+    decap locks explicit. (3) `Engine keying` ingress demux: was
+    `(listen_port, receiver_index)`, actual implementation is
+    `sessions_by_local_index` keyed by `receiver_index` alone — fixed.
+    (4) `Hot-path layout` ephemerals bullet: claimed a slow-path SPSC
+    pre-generation ring exists; no such ring is implemented in this PR
+    (snow generates ephemerals inside `build_*_handshake` on the control
+    thread). Reworded to describe the actual control-thread-only ephemeral
+    generation and the unimplemented SPSC ring as a future-revisit. (5)
+    `VLAN safety` section: claimed `try_encap` takes `tx_vlan_id` and
+    emits 802.1Q outer L2; actual `try_encap` signature is `(peer_pubkey,
+    inner_ip, out)` and outer L2 (with VLAN) is built by
+    `outer.rs::write_outer_eth`. Rewrote to match the as-shipped split.
+  - **File(s)**: `docs/pr/wireguard-clean/plan.md`, `_Log.md`
+  - **Validation**: rebase clean after manual `_Log.md` merges (15/15
+    commits replayed); `cargo build --release` clean; `cargo test
+    --release --bin xpf-userspace-dp afxdp::wg` — 78/78 pass (same as
+    pre-rebase; doc-only changes for this commit on top of the rebased
+    crypto changes); `git diff --check` clean.
 
 - **Timestamp**: 2026-05-24T19:26:45Z
   - **Action**: #1451 logging boundary shrink — moved the logging event
@@ -131,6 +342,106 @@
     scripts/userspace-ha-validation.sh scripts/userspace-phase-cycle.sh`;
     `python3 -m unittest scripts.userspace_ha_validation_matrix_test`;
     `git diff --check`
+
+- **Timestamp**: 2026-05-24T18:00:00Z
+  - **Action**: PR #1499 r-final-2 fix — address every actionable
+    finding from the round-final triple-review on `62d2353c`. (1)
+    Truncated-record remote DoS in `try_decap`: a 16..31-byte UDP
+    datagram with a valid `receiver_index` could panic the AF_XDP
+    worker because `parse_data_header` accepted any record >= 16
+    bytes, leaving a sub-Poly1305-tag ciphertext that snow 0.10's
+    ChaCha decrypt cannot handle safely (`ciphertext.len() - TAGLEN`
+    underflow). Added `DecapError::ShortRecord`, a one-line guard
+    before `read_message`, and a regression test that walks
+    `ciphertext.len()` ∈ {0,1,8,14,15} plus a boundary check at
+    `ciphertext.len() == POLY1305_TAG_LEN` to assert the cutoff is
+    strict `<`. (2) Copilot inline #5: replay-lock comment claimed
+    decap "only takes the replay-window lock on cold arms"; the
+    precheck unconditionally locks. Updated the module docstring to
+    describe the actual two-lock pattern and explain why the
+    precheck is held (skip snow AEAD on already-stale counters,
+    bounded contention because each session is demuxed onto a
+    single worker). (3) Copilot inline #6: `established_pair`
+    installed the responder via `WgSession::new` (Initiator-role,
+    pre-confirmed); not faithful to the responder-role gate this PR
+    shipped. Converted `established_pair` to build the responder
+    session as `SessionRole::Responder` then explicitly
+    `mark_confirmed()` so existing round-trip tests still pass, and
+    added a new test
+    `established_pair_responder_confirmation_flips_via_decap_path`
+    that exercises the full handshake → install (unconfirmed) →
+    decap-flips-confirmation flow without any `mark_confirmed` test
+    helper. (4) Copilot inline #1..#4: plan.md doc drift — updated
+    to say `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` (PSK2 step
+    matters for WG wire framing), to acknowledge that `ring 0.17.x`
+    is pulled in transitively through snow's resolver (and is
+    clean of open RustSec advisories, not the
+    RUSTSEC-2025-0010 0.16.x version that boringtun dragged in),
+    to update the `try_encap` signature snippet to match the
+    `&mut [u8]` engine API, and to clarify that
+    `complete_handshake_*` is `build_initiator_handshake` /
+    `build_responder_handshake` + `install_session`. (5) Codex
+    scope item: the engine ships Noise sub-message bytes only; the
+    WG handshake outer framing (MessageInitiation/MessageResponse
+    + MAC1/MAC2 + TAI64N) is the integration PR's scope. Made the
+    boundary explicit in both the engine module docstring and a
+    new "On-wire handshake framing scope" section in plan.md plus
+    a new bullet in "What's OUT". The pre-existing
+    `snat_contract_documents_current_fail_closed_runtime`
+    integration-test failure on `userspace-dp/tests/snat_contract_doc_guard.rs`
+    is from `docs/userspace-dataplane-gaps.md` lacking the literal
+    string `fail-closed`; verified the test fails on origin/master
+    `0b837165` (the PR base) just as it does on the PR head, with
+    identical doc and test bytes — entirely unrelated to wg work
+    and out of scope for this PR. New tests: 78/78 wg tests pass
+    (was 76 — added 2 regression tests). All cargo --bin tests
+    pass; 5/5 flake check clean on both new tests. Go suite clean.
+  - **File(s)**: `userspace-dp/src/afxdp/wg/engine.rs`,
+    `userspace-dp/src/afxdp/wg/tests.rs`,
+    `docs/pr/wireguard-clean/plan.md`, `_Log.md`
+
+- **Timestamp**: 2026-05-24T19:30:00Z
+  - **Action**: PR #1499 r-final-fix — close the four findings Codex
+    final pre-merge review surfaced after nine prior review rounds
+    missed them, plus two Copilot inline findings that surfaced on
+    the same pass. (1) Set the WireGuard protocol prologue
+    "WireGuard v1 zx2c4 Jason@zx2c4.com" on both initiator and
+    responder Noise builders so the initial transcript hash matches
+    kernel WireGuard / wireguard-go; the engine was previously
+    "WireGuard-shaped" but not interoperable. (2) Added responder
+    key-confirmation gating: WgSession carries a SessionRole +
+    confirmed AtomicBool; responder sessions block try_encap until
+    a successful inbound try_decap flips the flag, restoring the WG
+    anti-reflection invariant. (3) Made Peer.endpoint and
+    persistent_keepalive interior-mutable (RwLock + AtomicU16) so
+    reconcile_peers updates an existing peer's config in place
+    instead of silently keeping stale values. (4) Clarified the
+    plan doc to scope the runtime TunnelEndpoint propagation
+    (forwarding.rs + forwarding_build.rs) into the integration PR;
+    only the wire surface TunnelEndpointSnapshot ships here.
+    (5) Strengthened inner_ip_len_after_decap to validate IPv4
+    IHL>=5 and total_length>=ihl*4 — Copilot inline finding.
+    (6) Made TunnelEndpointSnapshot.wg_local_privkey_hex
+    skip_serializing and gave the snapshot a manual Debug impl
+    that redacts the field; write_state used to leak the WG
+    private key into the on-disk state JSON — Copilot inline
+    finding. Added five regression tests covering the prologue
+    (counter-example proof), responder confirmation gating,
+    in-place peer reconcile, malformed IPv4 rejection, and the
+    privkey serialization/Debug contract.
+  - **File(s)**: `userspace-dp/src/afxdp/wg/mod.rs`,
+    `userspace-dp/src/afxdp/wg/engine.rs`,
+    `userspace-dp/src/afxdp/wg/session.rs`,
+    `userspace-dp/src/afxdp/wg/peer.rs`,
+    `userspace-dp/src/afxdp/wg/tests.rs`,
+    `userspace-dp/src/protocol.rs`,
+    `docs/pr/wireguard-clean/plan.md`, `_Log.md`
+  - **Validation**: `cargo build --release`: clean (114 pre-existing
+    warnings); `cargo test --release --bin xpf-userspace-dp
+    afxdp::wg`: 76/76 pass (was 71; +5 new regressions);
+    `cargo test --release --bin xpf-userspace-dp`: 1413/1413 pass
+    (was 1408; the same +5 new tests); each new test passes 5/5
+    runs in isolation.
 
 - **Timestamp**: 2026-05-24T15:14:30Z
   - **Action**: PR #1494 round-11 follow-up — collapsed the retained
@@ -304,6 +615,53 @@
   - **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`, `_Log.md`
   - **Validation**: `go test ./pkg/dataplane ./pkg/dataplane/userspace`;
     `git diff --check`
+## 2026-05-23
+
+- **Timestamp**: 2026-05-23T21:25:00Z
+  - **Action**: PR #1499 @copilot round-6 follow-up — serialized
+    WireGuard `install_session` with `reconcile_peers` using the
+    existing slow-path reconcile mutex to eliminate stale-Arc
+    orphaning when a peer is removed concurrently with session install.
+  - **File(s)**: `userspace-dp/src/afxdp/wg/engine.rs`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/userspace/...`;
+    `cargo test --release afxdp::wg::`
+    (fails in this runner as expected: missing `libelf`/`gelf` headers
+    for `libbpf-sys` build); `git diff --check`
+
+- **Timestamp**: 2026-05-23T07:07:56Z
+  - **Action**: PR #1499 @copilot review round-3 follow-up — corrected
+    WireGuard `REJECT_AFTER_MESSAGES` to the WG spec value, changed
+    TX counter reservation to atomic `fetch_update` so rejection does
+    not advance/wrap counters, restored demux-before-rotate install
+    ordering to eliminate the new-session decap gap, and clarified
+    replay precheck concurrency semantics.
+  - **File(s)**: `userspace-dp/src/afxdp/wg/session.rs`,
+    `userspace-dp/src/afxdp/wg/engine.rs`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/userspace/...`;
+    `cargo test --release afxdp::wg::`
+    (fails in this runner as expected: missing `libelf`/`gelf` headers
+    for `libbpf-sys` build); `git diff --check`
+
+- **Timestamp**: 2026-05-23T06:32:50Z
+  - **Action**: PR #1499 @copilot review follow-up — fixed WireGuard
+    engine conformance and robustness issues by switching to IKpsk2
+    with zero-PSK mixing, enforcing reject-after-messages on encap,
+    preserving overlapping AllowedIPs per-peer validation, pruning
+    stale demux sessions across rekeys, tightening the overlapping
+    cryptokey-routing test to exercise both live peers, and removing
+    the unused `rand` dependency.
+  - **File(s)**: `userspace-dp/src/afxdp/wg/mod.rs`,
+    `userspace-dp/src/afxdp/wg/engine.rs`,
+    `userspace-dp/src/afxdp/wg/session.rs`,
+    `userspace-dp/src/afxdp/wg/allowed_ips.rs`,
+    `userspace-dp/src/afxdp/wg/peer.rs`,
+    `userspace-dp/src/afxdp/wg/framing.rs`,
+    `userspace-dp/src/afxdp/wg/tests.rs`,
+    `userspace-dp/Cargo.toml`, `userspace-dp/Cargo.lock`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/userspace/...`;
+    `cargo test --release afxdp::wg::`
+    (fails in this runner as expected: missing `libelf`/`gelf` headers
+    for `libbpf-sys` build); `git diff --check`
 
 ## 2026-05-22
 
@@ -1313,3 +1671,30 @@
     retire_ebpf_artifact_schema_test.py`; `python3 -m py_compile
     test/incus/retire_ebpf_artifact_schema.py
     test/incus/retire_ebpf_artifact_schema_test.py`; `git diff --check`
+
+- **Timestamp**: 2026-05-23T21:30:00Z
+  - **Action**: Hoisted PADDED_PLAINTEXT_MAX guard above next_tx_counter + header write so encap-overflow returns BufferTooSmall without observable side effects; removed dead fn peer_index; pruned r5 leftover duplicate comment block in try_encap; added install_session_serializes_with_reconcile_removal and encap_padded_plaintext_overflow_leaves_counter_and_buffer_untouched regression tests.
+  - **File(s)**: userspace-dp/src/afxdp/wg/engine.rs
+
+- **Timestamp**: 2026-05-24T04:00:00Z
+  - **Action**: r8: strengthened install_session_serializes_with_reconcile_removal with an `ok > 0` gate so the race test cannot pass tautologically when the reconciler always wins (Codex r7 finding); added debug_assert! on duplicate peer pubkey in reconcile_peers so engine-side surface flags Go-control-plane validation gaps (r6 Claude nit 4 / Codex r7).
+  - **File(s)**: userspace-dp/src/afxdp/wg/engine.rs
+
+- **Timestamp**: 2026-05-24T21:30:12-07:00
+  - **Action**: PR #1499 final nit: corrected the nonce-layout comment
+    in `framing.rs` to match snow 0.10's default ChaCha20-Poly1305
+    resolver and the WireGuard whitepaper §5.4.6. The prior comment
+    stated `counter.to_le_bytes() || [0,0,0,0]` (counter first, zeros
+    trailing); snow actually builds `[0,0,0,0] || counter.to_le_bytes()`
+    (4 zero bytes prepended, counter LE in bytes [4..12]) per
+    `snow-0.10.0/src/resolvers/default.rs:380-381`. Wire behavior was
+    already correct — snow's u64 nonce parameter is passed straight
+    through — only the in-code rationalization was inverted. Added an
+    explicit "do not invert this" warning anchoring the snow source
+    citation so a future maintainer cannot regress to the wrong layout.
+    The deferred zeroize-at-construction for
+    `WgEngineConfig.local_private_key` remains an integration-PR
+    follow-up and is not addressed here.
+  - **File(s)**: `userspace-dp/src/afxdp/wg/framing.rs`, `_Log.md`
+  - **Validation**: cargo build --release; cargo test --release --bin
+    xpf-userspace-dp afxdp::wg.
