@@ -49,24 +49,34 @@ pub(crate) fn write_outer_eth(
 /// `payload_len` is the length of the WG transport record
 /// (header + ciphertext + tag) that follows the UDP header.
 ///
-/// The IPv4 checksum is computed over the IPv4 header only;
-/// per RFC 768 the UDP checksum on IPv4 is optional. We set it to
-/// zero (skip) for now — UDP checksum offload semantics differ
-/// across NICs and we want a known-baseline behavior.
+/// IPv4 header checksum: mandatory per RFC 791 — computed here over
+/// the IPv4 header only.
 ///
-/// TODO(#1499 r4 / udp-checksum): kernel WG and wireguard-go emit a
-/// non-zero UDP checksum on IPv4. Some commercial firewalls and
-/// midboxes silently drop UDPv4 with cs=0. The integration PR
-/// should:
-///   - Either compute the UDP checksum here (pseudo-header + UDP
-///     header + payload — ones-complement sum, like the IP checksum
-///     above), or
-///   - Delegate to a NIC TX checksum-offload flag in the AF_XDP
-///     descriptor and surface the option through `outer_l2_len` /
-///     metadata.
-/// This is the only outer-header gap that affects wire interop with
-/// commercial midboxes; tracked separately from the engine-correctness
-/// fixes in this PR.
+/// UDP checksum: emitted as 0 ("no checksum computed"), which RFC 768
+/// permits for IPv4 UDP via the checksum field semantics — an
+/// all-zero transmitted checksum signals that the transmitter
+/// generated no checksum.
+///
+/// This engine intentionally defaults to cs=0 on outer IPv4 to save
+/// the per-packet pseudo-header + payload sum. NOTE: this differs
+/// from kernel WireGuard and wireguard-go — both of those compute
+/// the outer UDP checksum on IPv4 (kernel WG uses
+/// `udp_tunnel_xmit_skb(..., nocheck: false)` with
+/// `port4.use_udp_checksums = true` in `drivers/net/wireguard/socket.c`).
+/// We accept the divergence: RFC 768 makes it legal, the cycle win
+/// is material at line rate, and the inner WG ciphertext is already
+/// AEAD-authenticated so the outer UDP checksum carries no
+/// integrity value over the inner construction. Some commercial
+/// midboxes have been reported to drop UDPv4 datagrams with cs=0; if
+/// a deployment encounters one, the integration layer can surface an
+/// `outer-udp-checksum compute|zero` config knob — out of scope for
+/// this engine-side code. See #1501 A2.
+///
+/// IPv6 outer (not yet implemented): RFC 8200 §8.1 requires a
+/// non-zero UDP checksum on IPv6 by default. The RFC 6935 / 6936
+/// zero-checksum tunnel exception requires an explicit deployment
+/// design and is out of scope. The future v6 outer builder MUST
+/// compute the UDP checksum and MUST NOT take the IPv4 shortcut.
 pub(crate) fn write_outer_ipv4_udp(
     out: &mut [u8],
     src: Ipv4Addr,
@@ -195,8 +205,13 @@ mod outer_tests {
         // Round-trip: the checksum field is set such that a fresh
         // checksum over the full header (with the checksum present)
         // is zero. This is the standard self-check for an IPv4
-        // header's correctness.
-        let mut out = [0u8; 28];
+        // header's correctness. Buffer is pre-filled with a non-zero
+        // sentinel so the assertion proves the function actively
+        // wrote the header bytes rather than left them zero-init.
+        // The UDP checksum field assertion below is the
+        // load-bearing regression gate — see
+        // `udp_checksum_is_zero_on_ipv4_outer` for rationale.
+        let mut out = [0xffu8; 28];
         write_outer_ipv4_udp(
             &mut out,
             Ipv4Addr::new(192, 0, 2, 1),
@@ -210,6 +225,53 @@ mod outer_tests {
         .unwrap();
         let cs = checksum_be(&out[..20]);
         assert_eq!(cs, 0, "header self-check failed (cs={:#06x})", cs);
+        // Wire-byte gate: UDP checksum field MUST be zero per
+        // RFC 768 / this engine's intentional cs=0 default. If a
+        // future commit deletes the cs=0 write at line ~103 of
+        // this file, this assertion fails. The 0xff pre-fill
+        // ensures the assertion proves the function *wrote* zero,
+        // not that the buffer was already zero-initialized.
+        assert_eq!(
+            &out[26..28],
+            &[0, 0],
+            "outer UDP checksum must be 0 (RFC 768; #1501 A2)"
+        );
+    }
+
+    #[test]
+    fn udp_checksum_is_zero_on_ipv4_outer() {
+        // Dedicated regression gate for the cs=0 default
+        // (#1501 A2). This is the wire-byte invariant that future
+        // contributors must not silently regress when "fixing" the
+        // checksum behavior to match kernel WireGuard. If you are
+        // adding outer UDP checksum compute, please update both
+        // this test AND the doc comment on `write_outer_ipv4_udp`,
+        // and surface a config knob — do not just delete the
+        // assertion.
+        //
+        // 0xff sentinel pre-fill (not 0): proves the function
+        // ACTIVELY wrote two zero bytes rather than left a
+        // zero-initialized field untouched. Without the sentinel
+        // this assertion would silently pass if the cs=0 write
+        // were removed.
+        let mut out = [0xffu8; 40];
+        let n = write_outer_ipv4_udp(
+            &mut out,
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            51820,
+            51820,
+            0,
+            64,
+            100,
+        )
+        .unwrap();
+        assert_eq!(n, 28);
+        assert_eq!(
+            &out[26..28],
+            &[0, 0],
+            "outer UDP checksum must be 0 (RFC 768; #1501 A2)"
+        );
     }
 
     #[test]

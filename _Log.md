@@ -1,5 +1,27 @@
 # Action Log
 
+## 2026-05-25
+
+- **Timestamp**: 2026-05-25T05:00:00Z
+  - **Action**: #1501 A2 — replaced the stale TODO + contradictory
+    doc comment on `write_outer_ipv4_udp` with an honest
+    RFC-grounded comment explaining that the engine intentionally
+    emits outer IPv4 UDP cs=0 (legal per RFC 768) and that this
+    DIFFERS from kernel WireGuard / wireguard-go which compute
+    the outer UDP checksum. Added two byte-level regression
+    assertions on `out[26..28] == [0, 0]` (one new dedicated
+    `udp_checksum_is_zero_on_ipv4_outer` test + a strengthened
+    `ipv4_checksum_is_correct`) with 0xff sentinel pre-fill so
+    the assertion proves the function wrote zero rather than
+    leaving the buffer zero-initialized. Triple-review:
+    Antigravity (round-1 PLAN-NEEDS-MINOR for sentinel pre-fill;
+    round-2 PLAN-READY) and Codex (round-1 PLAN-NEEDS-MAJOR for
+    factually-wrong "matches kernel WG" claim; round-2
+    PLAN-READY) both agreed before code touched.
+  - **File(s)**: `userspace-dp/src/afxdp/wg/outer.rs`,
+    `docs/pr/1501-a2-outer-udp-cs/plan.md`, `_Log.md`
+  - **Validation**: cargo build clean; cargo test pending.
+
 ## 2026-05-24
 
 - **Timestamp**: 2026-05-25T00:45:00Z
