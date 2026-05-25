@@ -10,10 +10,12 @@ Standalone Rust AF_XDP dataplane that mirrors the BPF pipeline
 Runs as a separate `xpf-userspace-dp` binary the Go daemon spawns over a
 Unix-socket control protocol.
 
-This crate is the primary AF_XDP backend for #1373. It is still selected with
-`system dataplane-type userspace` until a later cutover changes runtime
-defaults; the legacy eBPF backend (`pkg/dataplane`) remains available for
-compatibility and regression coverage.
+This crate is the primary AF_XDP backend for #1373 and is now the default
+runtime: an empty / omitted `system dataplane-type` resolves to userspace in
+`pkg/dataplane.EffectiveType`. Operators can still pin the selection
+explicitly with `set system dataplane-type userspace`. The legacy eBPF
+backend (`pkg/dataplane`) remains available for compatibility and regression
+coverage; the DPDK backend is retired under #1525.
 
 ## Crate entry
 

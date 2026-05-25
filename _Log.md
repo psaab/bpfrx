@@ -2,6 +2,66 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T05:30:00Z
+  - **Action**: Addressed Copilot's 4 nits on PR #1534 (DPDK
+    operator docs retirement, #1531). Harmonized retirement banners
+    in `docs/dataplane-decision-dpdk-vs-vpp.md` and
+    `docs/dpdk-dataplane.md` from "is being retired" to "is retired"
+    so banners and Current State sections agree. Converted bare
+    code span around `docs/vpp-dataplane-assessment.md` to a
+    proper markdown link in the Related Documents section.
+    Tightened the "underlay-NIC XSK" wording in the encrypted
+    tunnel revisit trigger to "userspace-dp's AF_XDP socket on
+    the physical NIC cannot see inner payloads of kernel-managed
+    tunnels", which avoids conflating the NIC XDP hook with the
+    AF_XDP socket. Folded the awkward "The previous header read:"
+    preamble in `docs/dpdk-dataplane.md` into a single narrative
+    paragraph describing the prior #1475 policy and noting it has
+    been superseded by #1525.
+  - **File(s)**: `docs/dataplane-decision-dpdk-vs-vpp.md`,
+    `docs/dpdk-dataplane.md`, `_Log.md`
+  - **Validation**: docs + log + userspace-dp README scope —
+    `git diff --stat origin/master..HEAD` touches `docs/` paths,
+    the root `_Log.md` action log, and `userspace-dp/README.md`
+    (the README wording fix is the only file outside `docs/`).
+    No `.go` / `.rs` / `.c` source, no build inputs, no test
+    fixtures modified.
+
+## 2026-05-24
+
+- **Timestamp**: 2026-05-24T06:35:00Z
+  - **Action**: PR #1531 implementation v2 — applied retirement
+    banner + Current State + reframed VPP revisit trigger +
+    [Retired] Historical block to both
+    `docs/dataplane-decision-dpdk-vs-vpp.md` and
+    `docs/dpdk-dataplane.md`; updated
+    `docs/vpp-dataplane-assessment.md` inbound-pointer header to
+    note DPDK / decision doc retirement and explicitly preserve
+    "still useful" architectural threads (encrypted-tunnel
+    reasoning + native Go VRRP decision). Then addressed Codex
+    plan-review v2 findings: (a) sharpened the VPP revisit
+    trigger in the decision doc to specify "physical NIC XDP /
+    AF_XDP hook sees only outer encrypted packets when kernel
+    WireGuard/XFRM performs crypto" plus post-crypto interface
+    hook options; (b) updated `userspace-dp/README.md` "still
+    selected ... until later cutover" wording to reflect that
+    `EffectiveType` now defaults to userspace today.
+    Historical sections kept verbatim under bold-block retired
+    banners with all original H2 headings demoted to H3 inside
+    the retired wrapper.
+  - **File(s)**: `docs/dataplane-decision-dpdk-vs-vpp.md`,
+    `docs/dpdk-dataplane.md`,
+    `docs/vpp-dataplane-assessment.md`,
+    `userspace-dp/README.md`
+
+- **Timestamp**: 2026-05-24T00:00:00Z
+  - **Action**: PR #1531 plan v1 drafted. Retire DPDK
+    recommendations in `docs/dataplane-decision-dpdk-vs-vpp.md`
+    and `docs/dpdk-dataplane.md`; rewrite both as short
+    retirement notices pointing at #1525.
+  - **File(s)**: `docs/pr/1531-dpdk-docs-retire/plan.md`
+
+## 2026-05-25 (earlier — prior PR follow-ups)
 - **Timestamp**: 2026-05-25T07:05:00Z
   - **Action**: #1527 round-7 Copilot follow-up. Copilot review on
     9b4e9e24 (COMMENTED, 5 inline comments) flagged two new
