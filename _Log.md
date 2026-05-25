@@ -570,6 +570,21 @@
   - **Validation**: go build ./... clean; go test
     ./pkg/dataplane/userspace/... ok; canaries 5/5 pass;
     go test ./... — all 30 packages green.
+- **Timestamp**: 2026-05-25T08:00:00Z
+  - **Action**: #1516 plan v1 — sub-#1451 S1 migration scope.
+    Drafted `docs/pr/1516-grpcapi-migration/plan.md`: new
+    `pkg/grpcapi/runtime.go` declaring `grpcRuntime` interface
+    (~25 methods) plus named provider interfaces
+    (`sessionCursorIterator`, `userspaceStatusProvider`,
+    `userspaceControlProvider`). `Config.DP` and `Server.dp`
+    move from `dataplane.DataPlane` to `grpcRuntime`. Issue
+    body's `ReadNATPortCounter` and `Compile` are stale — not
+    consumed on master @ fcd53beb. Pending Codex + AGY plan-
+    review.
+  - **File(s)**: `docs/pr/1516-grpcapi-migration/plan.md`,
+    `_Log.md`.
+
+## 2026-05-25
 
 - **Timestamp**: 2026-05-25T05:55:00Z
   - **Action**: PR #1536 round-3 cleanup — address Codex MAJOR
