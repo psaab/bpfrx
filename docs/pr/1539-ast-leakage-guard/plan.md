@@ -1,6 +1,8 @@
 # #1539 — Guard against AST leakage / shadow execution of retired DPDK sub-tree fields
 
-Status: DRAFT v2 — round-1 plan-review applied; pending round-2
+Status: PLAN-READY v3 — round-2 plan-review applied (Codex
+PLAN-MINOR + AGY PLAN-MINOR, both agree window-of-value KILL no
+longer operative; structural fixes folded in below).
 
 ## Round-1 plan-review summary
 
@@ -85,11 +87,13 @@ before #1528 lands.
   { case dataplaneTypeDPDK: ... }`.
 - `pkg/config/compiler.go:954-958` — `effectiveDataplaneType`
   canonical helper.
-- PR #1536 (`dpdk-retire/1526-reject`) adds
-  `validateDataplaneTypeStrict` at `pkg/config/compiler.go`.
-  **HARD PRECONDITION:** this PR must stack ATOP #1536.
-  Implementation will not merge until #1536 has merged into
-  master OR this PR rebases on top of the merged commit.
+- PR #1536 (`dpdk-retire/1526-reject`) added
+  `validateDataplaneTypeStrict` at `pkg/config/compiler.go:319` and
+  the call from `compileExpanded` at `pkg/config/compiler.go:241`.
+  **PR #1536 has MERGED into master at fcd53beb**, so the
+  precondition that prompted v1's stacking discipline is already
+  satisfied; this branch only needs to base on master at/after
+  fcd53beb.
 - `pkg/dataplane/retirement_boundary_canary_test.go` — 3442-line
   precedent for `go/parser` + `ast.Inspect` canaries. Note
   per Antigravity round-1: the precedent uses package-level
@@ -126,11 +130,11 @@ Specifically, right before `return cfg, nil` in the success
 path. If `compileExpanded` has multiple success-paths, the
 nil clear must precede ALL of them.
 
-**Why placement matters per Codex finding 3:** the strict
-validator on master today does NOT exist. Option A only makes
-sense AFTER `validateDataplaneTypeStrict` has run. The plan
-explicitly stacks atop #1536; the nil clear is placed in the
-same function and AFTER the same validator that #1536 added.
+**Why placement matters per Codex finding 3:** Option A only
+makes sense AFTER `validateDataplaneTypeStrict` has run. That
+validator is now on master at `pkg/config/compiler.go:319`,
+called from `compileExpanded` at line 241; the nil clear is
+placed in the same function and AFTER the same validator.
 
 **Edge case:** an internal compile path that bypasses
 `compileExpanded` and calls a lower helper directly would
@@ -159,11 +163,17 @@ Single new file: `pkg/config/dpdk_subtree_leakage_canary_test.go`.
      anchor (`// #1539 writer exception: typed-sub-tree
      population gated by switch effectiveDataplaneType`).
 
-2. **AST-structural gate recognition** (Codex finding 2):
+2. **AST-structural gate recognition** (Codex finding 2,
+   AGY round-2 HIGH + MEDIUM):
    - For each `SelectorExpr` of the form `<X>.DPDKDataplane`,
-     ascend to the nearest enclosing `*ast.IfStmt` OR
-     `*ast.SwitchStmt` (or `*ast.TypeSwitchStmt` — out of
-     scope, none today).
+     walk the parent-chain ALL THE WAY UP to the enclosing
+     `*ast.FuncDecl` (AGY round-2 MEDIUM). Accept the read iff
+     ANY ancestor `*ast.IfStmt` OR `*ast.SwitchStmt` is a valid
+     DPDK gate. Stopping at the "nearest" enclosing conditional
+     would false-positive on
+     `if effectiveDataplaneType(...) == dataplaneTypeDPDK { if x
+     { _ = sys.DPDKDataplane.Cores } }` where the inner `if x`
+     is the nearest but does not contain the gate.
    - For `IfStmt`: walk the `Cond` AST and require a
      `BinaryExpr{Op: ==, X: <call to effectiveDataplaneType>,
      Y: <Ident: dataplaneTypeDPDK> | <BasicLit: "dpdk">}` OR
@@ -172,19 +182,23 @@ Single new file: `pkg/config/dpdk_subtree_leakage_canary_test.go`.
    - For `SwitchStmt`: require the `Tag` to be a
      `CallExpr{Fun: effectiveDataplaneType, ...}`, then find
      the enclosing `*ast.CaseClause` of the selector and
-     require one of its `List` entries to be `dataplaneTypeDPDK`.
+     require BOTH (a) `len(CaseClause.List) == 1` AND (b) the
+     sole list entry is `dataplaneTypeDPDK` or `"dpdk"`. The
+     single-entry rule (AGY round-2 HIGH) blocks
+     `case dataplaneTypeDPDK, dataplaneTypeUserspace:`
+     which executes for userspace traffic but contains
+     `dataplaneTypeDPDK` in its list.
    - Reject the unsound recognizer that accepts
      `effectiveDataplaneType(...) == dataplaneTypeUserspace`
      followed by a DPDK read (Codex finding 2's counterexample).
-   - **Negation form:** `if effectiveDataplaneType(...) !=
-     dataplaneTypeDPDK { ... return ... }` followed by a
-     post-block read is also a valid gate. Implementation
-     detail: if the ascended IfStmt has body that ends in an
-     unconditional return/continue/break AND the read is
-     in the sibling/parent block, accept. Simpler v2 stance:
-     **do NOT support the early-return idiom in v2**; force
-     callers to use the positive `==` form OR fall through
-     to the allowlist. Document this as a known limitation.
+   - **Negation form is NOT a valid gate in v3.** A future
+     extension could accept
+     `if effectiveDataplaneType(...) != dataplaneTypeDPDK { return }`
+     followed by a post-block read, but the unconditional-exit
+     analysis adds AST surface for marginal value. Force callers
+     to use the positive `==` form OR `switch { case
+     dataplaneTypeDPDK: }`. Documented limitation; canary fires
+     on the negation idiom and the developer must convert.
 
 3. **Switch-statement support** (Codex finding 4, AGY finding 3):
    The writer's pattern at `compiler_system.go:228` IS the
@@ -197,16 +211,30 @@ Single new file: `pkg/config/dpdk_subtree_leakage_canary_test.go`.
 4. **Helper-function pass-through detection** (AGY finding 2):
    Additionally walk for `CallExpr` whose arg list contains
    a SelectorExpr matching `<X>.DPDKDataplane`. Apply the
-   same gate analysis to the call site. This catches:
+   same parent-chain gate analysis to the call site. This catches:
    ```go
    func useIt(d *DPDKConfig) { d.Cores }
    // ungated call site — canary fires:
    useIt(cfg.System.DPDKDataplane)
    ```
-   It does NOT catch the case where the pointer is
-   stored in a struct field and accessed later through that
-   field. Document this as a known limitation; mitigation
-   is Option A's nil guarantee.
+   It does NOT catch:
+   - Storage in a struct field then later access through that
+     field.
+   - Local-variable rebinding via assignment inside the gate
+     used outside the gate, e.g.:
+     ```go
+     var dpdkConf *DPDKConfig
+     if effectiveDataplaneType(...) == dataplaneTypeDPDK {
+         dpdkConf = cfg.System.DPDKDataplane // gated — canary
+                                              // passes
+     }
+     useIt(dpdkConf) // ungated use — canary cannot see
+     ```
+     (AGY round-2 LOW). Both are acceptable boundaries because
+     Option A's nil guarantee makes the intermediate
+     variable/field nil at runtime, so an ungated reader either
+     no-ops via `if d != nil { ... }` or panics safely rather
+     than executing shadow DPDK logic.
 
 5. **Empty allowlist by default** — `dpdkSubtreeReaderAllowlist`
    map is empty. The single in-package writer is recognized
@@ -236,6 +264,20 @@ the same pattern:
   Codex finding 2's counterexample: `if effectiveDataplaneType
   (...) == dataplaneTypeUserspace { _ = cfg.System.DPDKDataplane }`;
   assert canary fires.
+- `TestDPDKSubtreeLeakageCanary_NegativeRejectsSwitchMultipleCases`
+  (AGY round-2 HIGH) — fixture with
+  `switch effectiveDataplaneType(...) { case dataplaneTypeDPDK,
+  dataplaneTypeUserspace: _ = sys.DPDKDataplane.Cores }`;
+  assert canary fires.
+- `TestDPDKSubtreeLeakageCanary_PositiveAcceptsNestedGatedRead`
+  (AGY round-2 MEDIUM) — fixture with
+  `if effectiveDataplaneType(...) == dataplaneTypeDPDK { if x
+  { _ = sys.DPDKDataplane.Cores } }`; assert canary accepts.
+- `TestDPDKSubtreeLeakageCanary_NegativeRejectsNegationIdiom` —
+  fixture with `if effectiveDataplaneType(...) !=
+  dataplaneTypeDPDK { return }; _ = sys.DPDKDataplane.Cores`;
+  assert canary fires (we explicitly do not accept the
+  early-return negation form in v3).
 - `TestDPDKSubtreeLeakageCanary_RealRepoIsClean` — runs the
   walker against the real repo at `repoRoot = "../.."`; today
   asserts zero findings (writer is recognized; no other
@@ -355,8 +397,24 @@ Option B: zero API surface. New `*_test.go` file only.
    state cleared. Is the placement correct, or should it run
    even on validator failure (to harden against partial-state
    leakage in error paths)?
-7. **Stacking discipline.** v2 names #1536 as a hard
-   precondition. If #1536 is still iterating in review, we
-   either (a) wait, or (b) cherry-pick the validator into this
-   branch with a clear rebase commitment. Round-2 reviewer
-   preference?
+7. **Stacking discipline.** RESOLVED in v3 — PR #1536 merged at
+   fcd53beb on master. This branch rebases on master at/after
+   that commit; no special stacking required.
+
+## 11. Round-2 verdict summary (recorded for round-3 / merge)
+
+- Codex round-2: **PLAN-MINOR** — all four round-1 findings
+  materially addressed; stale #1536 process text and contradictory
+  negation-gate paragraph called out; window-of-value YES.
+- Antigravity round-2: **PLAN-MINOR** — KILL no longer
+  operative; HIGH (multi-case switch bypass), MEDIUM (nested
+  conditional false-positive) folded into section 4.2; LOW
+  (local-variable rebinding) documented in section 4.2 as a
+  bounded limitation mitigated by Option A.
+
+v3 changes from v2: section 4.2 walks parent-chain to FuncDecl;
+SwitchStmt CaseClause requires `len(List)==1`; negation idiom
+explicitly rejected (was contradictory in v2); two new fixtures
+(positive-nested, negative-multi-case, negative-negation);
+stale #1536 stacking and "validator on master today does NOT
+exist" wording corrected.

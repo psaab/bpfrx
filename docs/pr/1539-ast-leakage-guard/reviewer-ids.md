@@ -1,5 +1,39 @@
 # #1539 reviewer IDs
 
+## Plan v2 (commit 7f0cdacd) — round-2 verdicts
+
+- Codex round-2: session 019e5fa4-0552-7823-915d-79eaf79b1c55
+  (rerun after initial dispatch returned no agent message) —
+  **PLAN-MINOR**.
+  - F1 (pkg/config inclusion): ADDRESSED (line 151).
+  - F2 (AST-structural gate): ADDRESSED (lines 162/170, substring
+    matching explicitly forbidden).
+  - F3 (#1536 stacking): substantively ADDRESSED; stale wording at
+    lines 90 + 130 + 358-361 referring to #1536 as a precondition
+    or "iterating in review" — #1536 merged at fcd53beb on master.
+    Fix the wording.
+  - F4 (switch-statement): ADDRESSED (lines 189-194).
+  - New: contradictory negation-gate paragraph (lines 179 vs 185);
+    pick one stance.
+  - Window-of-value: YES, bridge defense justified.
+
+- Antigravity round-2: adversarial-review-mplbulo0-y014py —
+  **PLAN-MINOR**.
+  - Window-of-value: KILL no longer operative.
+  - HIGH: switch-statement multi-case bypass —
+    `case dataplaneTypeDPDK, dataplaneTypeUserspace:` would pass
+    the v2 recognizer. Require `len(CaseClause.List) == 1`.
+  - MEDIUM: nested-conditional false-positive — "nearest enclosing"
+    rejects a read inside `if effectiveDataplaneType(...) ==
+    dataplaneTypeDPDK { if x { _ = sys.DPDKDataplane.Cores } }`.
+    Walk parent chain to FuncDecl, accept if ANY ancestor gates.
+  - LOW: local-variable bypass — `dpdkConf = cfg.System.DPDKDataplane`
+    inside gate, used outside. Acceptable boundary because Option A
+    nil clears at runtime. Document explicitly.
+  - Two extra negative/positive fixtures recommended.
+
+## Plan v1 (commit cf9c1518)
+
 ## Plan v1 (commit cf9c1518)
 
 - Codex round-1: task-mpku5dam-crjpoi — PLAN-NEEDS-MAJOR
