@@ -764,6 +764,24 @@
     `DPDKDataplane` selector or helper pass-through at package
     scope is reported immediately instead of being skipped when
     no enclosing `FuncDecl` exists. Added
+- **Timestamp**: 2026-05-25T16:25:00Z
+  - **Action**: #1539 Copilot round-3 finding addressed. After
+    HEAD f90125b3 + docs commit 4a1c8726, Copilot's re-review
+    re-anchored the original 4 findings to the new SHA (all
+    already addressed) but issued ONE new finding (15:22:25Z,
+    inline at line 112 of the new tree): the
+    `dpdkSubtreeLeakageCanaryExcludeDirs["dpdk"]` bare-dirname
+    skip would silently hide a future `pkg/config/dpdk/...`
+    sub-directory — exactly the leakage class the canary is
+    supposed to catch. Fixed: the exclusion map now uses
+    paths RELATIVE to the walk root (computed via `filepath.Rel`
+    + `filepath.ToSlash`), and the v3 default is empty since
+    the production scan root is `pkg/config/` only and there
+    is no `pkg/config/dpdk/` today. Future canary scope
+    extensions add explicit relative paths (e.g.
+    `pkg/dataplane/dpdk`).
+  - **File(s)**: pkg/config/dpdk_subtree_leakage_canary_test.go,
+    _Log.md
 - **Timestamp**: 2026-05-25T16:00:00Z
   - **Action**: #1539 Copilot findings on PR #1553 — 5 valid
     findings on HEAD 12237f12 addressed across two commits

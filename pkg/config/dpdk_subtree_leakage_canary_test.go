@@ -102,14 +102,18 @@ var dpdkSubtreeLeakageCanaryScanRoots = []string{
 	".",
 }
 
-// dpdkSubtreeLeakageCanaryExcludeDirs are directory names that
-// the walker skips entirely. The DPDK backend manager reads its
-// own sub-tree; that is a backend-local internal coupling, not
-// an "AST leakage" event a future config-package commit would
-// introduce.
-var dpdkSubtreeLeakageCanaryExcludeDirs = map[string]struct{}{
-	"dpdk": {}, // pkg/dataplane/dpdk — backend-local
-}
+// dpdkSubtreeLeakageCanaryExcludeDirs maps a directory's path
+// RELATIVE to the walk root to a skip marker. Empty by default:
+// the v3 scan root is `pkg/config/` only, and there is no
+// `pkg/config/dpdk/` today — adding one (e.g.,
+// `pkg/config/dpdk/parser.go`) would be exactly the new ungated
+// reader the canary needs to fire on, so a bare dirname-based
+// skip like `"dpdk": {}` would hide the very class of leakage
+// this canary is supposed to catch (Copilot finding on PR #1553).
+// If a future canary iteration legitimately needs to skip a
+// backend-local directory (e.g., scope extends to
+// `pkg/dataplane/`), add the relative path here.
+var dpdkSubtreeLeakageCanaryExcludeDirs = map[string]struct{}{}
 
 // dpdkSubtreeLeakageCanaryFileAllowlist allows a small set of
 // files to read the sub-tree without a gate check. Today this is
@@ -171,8 +175,18 @@ func scanForDPDKSubtreeLeakage(t *testing.T, root string) []dpdkSubtreeLeakageFi
 			return walkErr
 		}
 		if d.IsDir() {
-			if _, skip := dpdkSubtreeLeakageCanaryExcludeDirs[d.Name()]; skip {
-				return filepath.SkipDir
+			// Skip directories by RELATIVE path (not bare
+			// dirname). A bare-dirname check like
+			// `d.Name() == "dpdk"` would silently skip a future
+			// `pkg/config/dpdk/parser.go` — exactly the leakage
+			// class the canary is supposed to catch (Copilot
+			// finding on PR #1553).
+			relDir, relErr := filepath.Rel(root, path)
+			if relErr == nil {
+				relDir = filepath.ToSlash(relDir)
+				if _, skip := dpdkSubtreeLeakageCanaryExcludeDirs[relDir]; skip {
+					return filepath.SkipDir
+				}
 			}
 			return nil
 		}
