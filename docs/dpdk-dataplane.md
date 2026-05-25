@@ -15,10 +15,11 @@
   (`userspace-dp/`) is the primary/default backend, and the legacy
   eBPF dataplane is being retired in parallel under #1373.
 - The DPDK source under `dpdk_worker/` and `pkg/dataplane/dpdk/`
-  remains in-tree until Phase 3 of #1525 deletes it. Builds with
-  `-tags dpdk` are not supported for production.
-- Commit-time rejection of `set system dataplane-type dpdk` lands
-  in Phase 1 (#1526). Operators should migrate with
+  remains in-tree until Phase 3 of #1525 deletes it. Per #1525,
+  builds with `-tags dpdk` are not supported for production.
+- Commit-time rejection of `set system dataplane-type dpdk` is
+  planned in Phase 1 (#1526; not yet on master). Operators
+  should migrate with
   `set system dataplane-type userspace`, or simply omit
   `system dataplane-type` entirely (userspace is the default).
 - For the project-level retirement context, see

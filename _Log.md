@@ -56,7 +56,7 @@
     retirement notices pointing at #1525.
   - **File(s)**: `docs/pr/1531-dpdk-docs-retire/plan.md`
 
-## 2026-05-24 (prior)
+## 2026-05-25
 
 - **Timestamp**: 2026-05-25T00:45:00Z
   - **Action**: PR #1512 review follow-up — tightened the positional

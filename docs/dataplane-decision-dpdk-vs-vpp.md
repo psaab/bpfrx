@@ -17,9 +17,9 @@
   #1373.
 - The DPDK source under `dpdk_worker/` and `pkg/dataplane/dpdk/`
   remains in-tree until Phase 3 of #1525 deletes it. Commit-time
-  rejection of `set system dataplane-type dpdk` lands in Phase 1
-  (#1526). Builds with `-tags dpdk` are not supported for
-  production.
+  rejection of `set system dataplane-type dpdk` is planned in
+  Phase 1 (#1526; not yet on master). Per #1525, builds with
+  `-tags dpdk` are not supported for production.
 - VPP was never implemented in xpf. There is no current plan to
   add a VPP backend. If one becomes interesting in the future, a
   fresh decision document will be filed at that time; the section
