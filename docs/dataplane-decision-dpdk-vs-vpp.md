@@ -1,6 +1,6 @@
 # Dataplane Decision: DPDK vs VPP
 
-> **Status: Retired.** The DPDK dataplane is being retired under
+> **Status: Retired.** The DPDK dataplane is retired under
 > umbrella issue #1525. The userspace AF_XDP dataplane
 > (`userspace-dp/`) is the primary/default backend. Migrate with
 > `set system dataplane-type userspace`, or simply omit
@@ -30,16 +30,15 @@
 Re-open VPP assessment if all are true:
 
 - Encrypted tunnel (IPsec / WireGuard) throughput becomes a
-  primary product driver. The physical NIC XDP / AF_XDP hook
-  sees only the outer encrypted packets when kernel
-  WireGuard/XFRM performs crypto, so the underlay-NIC XSK cannot
-  inspect inner payloads of kernel-managed IPsec or WireGuard
-  tunnels directly. xpf can still hook decrypted traffic via TC
-  BPF on the post-crypto interface (e.g. `wgN` or an XFRM
-  interface), or via XDP on a veth on the decrypted side, but
-  both add per-packet cost relative to VPP's userspace-crypto
-  pipeline. VPP terminates crypto in userspace and avoids the
-  underlay/inner-packet split entirely.
+  primary product driver. When kernel WireGuard/XFRM performs
+  crypto, userspace-dp's AF_XDP socket on the physical NIC
+  cannot see inner payloads of kernel-managed tunnels — it only
+  observes the outer encrypted packets. xpf can still hook
+  decrypted traffic via TC BPF on the post-crypto interface
+  (e.g. `wgN` or an XFRM interface), or via XDP on a veth on
+  the decrypted side, but both add per-packet cost relative to
+  VPP's userspace-crypto pipeline. VPP terminates crypto in
+  userspace and avoids the underlay/inner-packet split entirely.
 - Throughput goals materially exceed what the userspace AF_XDP
   backend can deliver on target hardware.
 - Team is willing to own VPP integration and long-term plugin /
@@ -51,7 +50,7 @@ Re-open VPP assessment if all are true:
   [`userspace-dp/README.md`](../userspace-dp/README.md).
 - Retirement umbrella: #1525.
 - VPP architectural reference (kept as historical analysis, not
-  current direction): `docs/vpp-dataplane-assessment.md`.
+  current direction): [`vpp-dataplane-assessment.md`](vpp-dataplane-assessment.md).
 
 ---
 

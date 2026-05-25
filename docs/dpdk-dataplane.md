@@ -1,8 +1,8 @@
 # DPDK Dataplane for xpf — Architecture Plan
 
 > **Status: Retired.** This document was an architecture plan for
-> a DPDK-based xpf dataplane. The DPDK dataplane is being retired
-> under umbrella issue #1525. The userspace AF_XDP dataplane
+> a DPDK-based xpf dataplane. The DPDK dataplane is retired under
+> umbrella issue #1525. The userspace AF_XDP dataplane
 > (`userspace-dp/`) is the primary/default backend. Migrate with
 > `set system dataplane-type userspace`, or simply omit
 > `system dataplane-type` (userspace is the default). See
@@ -39,20 +39,15 @@ and does not reflect current direction.
 > DPDK dataplane is retired under #1525; see the banner at the
 > top of this file for the active path.
 
-The previous header read:
-
-> Note: This is an architecture/planning document. For the current
-> project-level decision and recommendation between DPDK and VPP,
-> see `docs/dataplane-decision-dpdk-vs-vpp.md`.
->
-> Current #1475 policy: DPDK remains a separately supported
-> backend for binaries built with `-tags dpdk`, but it is outside
-> the #1373 eBPF source-removal path until it migrates off the
-> root `dataplane.DataPlane` interface. The legacy bridge is
-> confined to `pkg/dataplane/dpdk`, with only the blank
-> registration import in `cmd/xpfd/main.go` outside that package.
-> Non-DPDK builds reject DPDK startup explicitly instead of
-> running a no-op stub.
+At the time of writing, the active project policy (#1475) treated
+DPDK as a separately supported backend for binaries built with
+`-tags dpdk`, outside the #1373 eBPF source-removal path until it
+migrated off the root `dataplane.DataPlane` interface. The legacy
+bridge was confined to `pkg/dataplane/dpdk`, with only the blank
+registration import in `cmd/xpfd/main.go` outside that package,
+and non-DPDK builds rejected DPDK startup explicitly instead of
+running a no-op stub. That policy has since been superseded by the
+#1525 retirement.
 
 ### Overview
 
