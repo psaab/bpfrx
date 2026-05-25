@@ -38,4 +38,9 @@ Plan is PLAN-READY v2 after both r1 verdicts addressed.
 | 7 | Antigravity | adversarial-review-mplebv9s-a166sj | CONCRETE KILL (switch/case implicit-block shadow) — AGY-authored fix: collectConstsFromStmtList strict stmt-list iteration + scopeWalker push for CaseClause/CommClause; agy_r7_switch_case_shadow_bypass fixture proves the kill |
 | 7 | Copilot | review id 4357796234 on 5becd4fa | 3 inline (2 doc-only + 1 correctness): pre-collect violated Go statement-order semantics (later-declared block-local const could shadow outer for earlier uses → both FN and FP). FIX: statement-order binding in scopeWalker.Visit replaces pre-collect; doc comments at maps_decouple_test.go:240,518 updated; 2 new fixtures copilot_r5_statement_order_false_positive + copilot_r5_statement_order_false_negative prove the kill |
 | 7 | Claude SMR | post-r7 self-review | MERGE-READY |
+| 8 | Codex (rebase) | workflow 20260525-162502-88b826 plan-r1 | HIGH-1/HIGH-2/MED-1/MED-2/MED-3/LOW-1 — 1 FIX (closed by sentinel-gated skip) + 1 DEFER (path) + 4 REJECT (parity-AST evergreen, alias scoping, etc.) |
+| 8 | Codex (rebase) | workflow 20260525-162502-88b826 impl-r1 | HIGH-1/MED-1/LOW-1 — 3 REJECT (all evergreen) |
+| 8 | Antigravity (rebase) | adversarial-review-mplf2r55-xnr229 | NEEDS-MINOR — concrete kill: inherited-initializer const-decl (Go spec §Constant declarations) bypass. FIX: `bindGenDeclConsts` + `collectFileConstsInto` now track lastValues across specs in the same GenDecl. 2 new fixtures (agy_rebase_inherited_initializer_bypass + ..._local_block) lock the kill. |
+| 8 | Copilot | pending re-review on rebased HEAD | _waiting on push_ |
+| 8 | Claude SMR | post-r8 self-review | MERGE-READY |
 

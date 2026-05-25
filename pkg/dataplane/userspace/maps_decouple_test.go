@@ -372,25 +372,37 @@ func findForbiddenAliasesInFiles(fset *token.FileSet, files []*ast.File, fileNam
 // collectFileConstsInto records every const-declared string value
 // in file into out. Walks only top-level GenDecls (package scope).
 // Skips local block consts to avoid scope shadowing bugs (AGY r6).
+//
+// Per Go spec §Constant declarations, a parenthesized const block
+// may omit a subsequent spec's initializer expression list — in
+// that case the spec inherits the most recent preceding non-empty
+// expression list (the same iota/inherit rule used by iota chains).
+// Track lastValues across specs in the same GenDecl to honor that
+// rule; otherwise `const ( A = X; B )` would silently leave B
+// unbound and a m.Map(B) call would slip past the canary (AGY
+// r-rebase finding).
 func collectFileConstsInto(file *ast.File, out map[string]string) {
-	addSpec := func(vs *ast.ValueSpec) {
-		for i, name := range vs.Names {
-			if i >= len(vs.Values) {
-				continue
-			}
-			if v, ok := evalStringExpr(vs.Values[i], out); ok {
-				out[name.Name] = v
-			}
-		}
-	}
 	for _, decl := range file.Decls {
 		gd, ok := decl.(*ast.GenDecl)
 		if !ok || gd.Tok != token.CONST {
 			continue
 		}
+		var lastValues []ast.Expr
 		for _, spec := range gd.Specs {
-			if vs, ok := spec.(*ast.ValueSpec); ok {
-				addSpec(vs)
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			if len(vs.Values) > 0 {
+				lastValues = vs.Values
+			}
+			for i, name := range vs.Names {
+				if i >= len(lastValues) {
+					continue
+				}
+				if v, ok := evalStringExpr(lastValues[i], out); ok {
+					out[name.Name] = v
+				}
 			}
 		}
 	}
@@ -404,29 +416,37 @@ func cloneMap(m map[string]string) map[string]string {
 	return out
 }
 
-// bindConstSpec evaluates a *ast.ValueSpec from a CONST GenDecl and
-// installs its name→value bindings into scope. Used at the moment
-// the corresponding DeclStmt is visited so that statement-order
-// semantics are preserved: only consts declared earlier in the
-// block are visible to expressions later in the block (per Go spec
-// §Declarations and scope).
+// bindGenDeclConsts installs every name→value binding from a CONST
+// GenDecl's specs into scope. Used at the moment the corresponding
+// DeclStmt is visited so that statement-order semantics are
+// preserved (Copilot r5 r5:436): only consts declared earlier in
+// the block are visible to expressions later in the block.
 //
-// Closes Copilot r5 finding at maps_decouple_test.go:436 — the
-// previous pre-collect helper installed all of a block's consts
-// up-front, which violated the "scope begins at end of ConstSpec"
-// rule and could both miss real violations (when a later inner
-// const shadowed an outer const used earlier in the block, the
-// canary read the shadow value instead of the outer one) and emit
-// false positives (when a later inner const happened to begin with
-// "userspace_" but the earlier-in-block expression was actually
-// using an innocuous outer const).
-func bindConstSpec(vs *ast.ValueSpec, scope map[string]string) {
-	for i, name := range vs.Names {
-		if i >= len(vs.Values) {
+// Per Go spec §Constant declarations, a parenthesized const block
+// may omit a subsequent spec's initializer expression list — in
+// that case the spec inherits the most recent preceding non-empty
+// expression list (same rule as iota chains). Track lastValues
+// across specs in the same GenDecl to honor that rule; otherwise
+// `const ( A = "userspace_ctrl"; B )` would leave B unbound and a
+// later m.Map(B) lookup would silently bypass the canary (AGY
+// r-rebase finding).
+func bindGenDeclConsts(gd *ast.GenDecl, scope map[string]string) {
+	var lastValues []ast.Expr
+	for _, spec := range gd.Specs {
+		vs, ok := spec.(*ast.ValueSpec)
+		if !ok {
 			continue
 		}
-		if v, ok := evalStringExpr(vs.Values[i], scope); ok {
-			scope[name.Name] = v
+		if len(vs.Values) > 0 {
+			lastValues = vs.Values
+		}
+		for i, name := range vs.Names {
+			if i >= len(lastValues) {
+				continue
+			}
+			if v, ok := evalStringExpr(lastValues[i], scope); ok {
+				scope[name.Name] = v
+			}
 		}
 	}
 }
@@ -464,11 +484,7 @@ func (w *scopeWalker) Visit(node ast.Node) ast.Visitor {
 	if ds, ok := node.(*ast.DeclStmt); ok {
 		if gd, ok := ds.Decl.(*ast.GenDecl); ok && gd.Tok == token.CONST {
 			top := w.consts[len(w.consts)-1]
-			for _, spec := range gd.Specs {
-				if vs, ok := spec.(*ast.ValueSpec); ok {
-					bindConstSpec(vs, top)
-				}
-			}
+			bindGenDeclConsts(gd, top)
 		}
 	}
 
@@ -1133,6 +1149,43 @@ type M struct{}
 func (M) Map(string) any { return nil }
 `,
 			want: []string{"userspace_real"},
+		},
+		{
+			name: "agy_rebase_inherited_initializer_bypass",
+			// AGY post-rebase finding: a parenthesized const block
+			// where a subsequent spec omits its initializer
+			// expression inherits the previous spec's expression list
+			// per Go spec §Constant declarations. Without
+			// last-values tracking, B would be skipped by the binder
+			// and m.Map(B) would silently slip past the canary even
+			// though at compile time B == A == "userspace_ctrl".
+			src: `package x
+const (
+	A = "userspace_ctrl"
+	B
+)
+func F(m M) { _ = m.Map(B) }
+type M struct{}
+func (M) Map(string) any { return nil }
+`,
+			want: []string{"userspace_ctrl"},
+		},
+		{
+			name: "agy_rebase_inherited_initializer_local_block",
+			// Same pattern but in a local block, exercising
+			// bindGenDeclConsts via scopeWalker.Visit.
+			src: `package x
+func F(m M) {
+	const (
+		A = "userspace_ctrl"
+		B
+	)
+	_ = m.Map(B)
+}
+type M struct{}
+func (M) Map(string) any { return nil }
+`,
+			want: []string{"userspace_ctrl"},
 		},
 	}
 

@@ -2,6 +2,34 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T18:50:00Z
+  - **Action**: #1521 post-rebase + AGY r-rebase inherited-initializer
+    fix. Rebased branch onto master b7466f5d (8 sibling PRs merged
+    since the previous round; _Log.md conflicts resolved by concat).
+    AGY post-rebase review
+    (adversarial-review-mplf2r55-xnr229) flagged a compiling bypass
+    via Go spec §Constant declarations inherited initializers:
+    `const ( A = "userspace_ctrl"; B )` binds B to the same value
+    as A, but the AST sees `vs.Values` empty for B. The previous
+    binder skipped such specs, leaving B unbound and silently
+    allowing m.Map(B) to bypass the canary. FIX: retired
+    `bindConstSpec` and replaced with `bindGenDeclConsts(gd, scope)`
+    which walks the entire GenDecl tracking lastValues across
+    specs. Same lastValues pattern mirrored in
+    `collectFileConstsInto` for top-level const blocks. Two new
+    fixtures lock the kill: agy_rebase_inherited_initializer_bypass
+    (package-scope) and agy_rebase_inherited_initializer_local_block
+    (exercises scopeWalker via DeclStmt). Codex post-rebase
+    plan-r1 (workflow 20260525-162502-88b826): 6 findings — 1 FIX
+    (sentinel-gated skip already closed), 1 DEFER (relative path),
+    4 REJECT (recurring parity-AST and scoping rationales). Codex
+    impl-r1: 3 findings, all REJECT (recurring).
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md, _Log.md
+  - **Validation**: 6 canary tests + 24 alias-bypass sub-cases
+    pass; full `go test ./...` all 33 packages green on the
+    rebased branch.
+
 - **Timestamp**: 2026-05-25T15:45:00Z
   - **Action**: Addressed PR #1551 Copilot round-3 doc-comment nits by
     fully qualifying dataplane helper names in cluster session-sync
