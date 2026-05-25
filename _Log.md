@@ -2,6 +2,13 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T00:05:00Z
+  - **Action**: PR #1526 plan v1 drafted. Reject `system
+    dataplane-type dpdk` at commit-time via new strict
+    validator in pkg/config/compiler.go, with migration error
+    text per issue body.
+  - **File(s)**: `docs/pr/1526-dpdk-reject/plan.md`
+
 - **Timestamp**: 2026-05-25T00:45:00Z
   - **Action**: PR #1512 review follow-up — tightened the positional
     `dataplane.Manager` literal canary on two axes. (a) Recurse into nested
