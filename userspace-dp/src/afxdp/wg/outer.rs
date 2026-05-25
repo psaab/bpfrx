@@ -255,6 +255,15 @@ mod outer_tests {
         // zero-initialized field untouched. Without the sentinel
         // this assertion would silently pass if the cs=0 write
         // were removed.
+        //
+        // Layout contract assumed here: `write_outer_ipv4_udp`
+        // writes the outer IPv4 + UDP header starting at byte 0
+        // of `out` (NO preceding Ethernet header). With
+        // IP_HDR_LEN = 20 and UDP cs at UDP offset 6, the wire
+        // byte position of the UDP checksum is 20 + 6 = 26..28.
+        // If a future refactor prepends an Ethernet prefix to
+        // the same buffer, this assertion needs to shift to
+        // 40..42 (14-byte Ethernet) or 44..46 (18-byte 802.1Q).
         let mut out = [0xffu8; 40];
         let n = write_outer_ipv4_udp(
             &mut out,
@@ -267,7 +276,10 @@ mod outer_tests {
             100,
         )
         .unwrap();
-        assert_eq!(n, 28);
+        // The return value is the number of bytes written:
+        // IP_HDR_LEN + UDP_HDR_LEN = 28. This pins the layout
+        // contract for the assertion below.
+        assert_eq!(n, 28, "write_outer_ipv4_udp must write IP+UDP = 28 bytes");
         assert_eq!(
             &out[26..28],
             &[0, 0],
