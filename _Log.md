@@ -1773,3 +1773,13 @@
     `_Log.md`
   - **Validation**: `go test ./pkg/conntrack/ -count=1 -race`; `go vet
     ./pkg/conntrack/...`.
+
+- **Timestamp**: 2026-05-25T07:55Z
+- **Action**: PR #1532 — close Codex MINOR (ellipsis + paren bypasses)
+- **File(s)**: pkg/conntrack/legacy_dataplane_canary_test.go
+- **Why**: Codex task-mpktubkn-r9llzq flagged `...dataplane.DataPlane` (variadic
+  params, *ast.Ellipsis) and `(dataplane.DataPlane)` (paren-wrapped,
+  *ast.ParenExpr) as bypass vectors. Both are common Go AST disguises that
+  the prior matcher missed. Added two case arms to isLegacyDataPlaneType to
+  recursively unwrap each.
+- **Validation**: canary still passes on current pkg/conntrack/ production tree.

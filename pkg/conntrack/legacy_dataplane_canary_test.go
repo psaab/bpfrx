@@ -145,6 +145,9 @@ func TestConntrackHasNoLegacyDataPlaneDependency(t *testing.T) {
 // isLegacyDataPlaneType returns true when expr names dataplane.DataPlane
 // or *dataplane.DataPlane. Star-prefixed shapes are checked because
 // future migrations may introduce a pointer form before someone notices.
+// Ellipsis-prefixed (`...dataplane.DataPlane` for variadic params) and
+// parenthesized (`(dataplane.DataPlane)`) forms are also unwrapped so a
+// syntactic disguise can't bypass the fence.
 func isLegacyDataPlaneType(expr ast.Expr) bool {
 	switch e := expr.(type) {
 	case *ast.SelectorExpr:
@@ -154,6 +157,10 @@ func isLegacyDataPlaneType(expr ast.Expr) bool {
 		}
 		return pkg.Name == "dataplane" && e.Sel.Name == "DataPlane"
 	case *ast.StarExpr:
+		return isLegacyDataPlaneType(e.X)
+	case *ast.Ellipsis:
+		return isLegacyDataPlaneType(e.Elt)
+	case *ast.ParenExpr:
 		return isLegacyDataPlaneType(e.X)
 	default:
 		return false
