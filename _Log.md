@@ -1,5 +1,18 @@
 # Action Log
 
+## 2026-05-24 — #1529 plan v1 drafted
+
+- **Timestamp**: 2026-05-24T17:00:00Z
+  - **Action**: Drafted plan v1 for #1529 (DPDK retirement Phase 4 —
+    broad docs sweep). Per-file disposition table covers ~42 files
+    with DPDK references. Major scope adjustment: the
+    `#1475 DPDK Backend Policy` section in
+    `docs/pr/1373-retire-ebpf-dataplane/README.md` is canary-pinned
+    by `TestRetirementBoundaryDocsMentionDPDKPolicy` and the rewrite
+    is deferred to #1527/#1528. This PR adds a leading retirement
+    note above it instead.
+  - **File(s)**: `docs/pr/1529-dpdk-docs-sweep/plan.md`, `_Log.md`
+
 ## 2026-05-24
 
 - **Timestamp**: 2026-05-25T00:45:00Z
