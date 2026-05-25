@@ -92,10 +92,10 @@ Absolute scale of the win:
   single pass). For the upgrade scenario the issue body lays out
   explicitly, it's 2–3 (one error per family, capped at 3).
 - Surface area touched: ~6 lines of compile-driver code in
-  `compileExpanded` plus three new tests (accumulator multi-error,
-  single-element byte-identity, gRPC rendering). No new public
-  API, no new config knob, no change to individual validator
-  signatures or messages.
+  `compileExpanded` plus four new tests (two-family accumulator,
+  three-family accumulator, single-element byte-identity, gRPC
+  rendering). No new public API, no new config knob, no change
+  to individual validator signatures or messages.
 
 **Honest caveat on "one error per family."** Each existing
 strict validator still fail-fasts INTERNALLY (e.g.,
@@ -111,7 +111,7 @@ of scope (separate signatures + per-validator test rewrites).
 
 **If reviewers conclude the UX gain (one round-trip saved on a
 rare upgrade path) is too small to justify even ~6 LOC plus
-three tests, PLAN-KILL is an acceptable verdict.** The counter-position
+four tests, PLAN-KILL is an acceptable verdict.** The counter-position
 worth taking seriously: "fail-fast is simpler to reason about;
 trains the operator to fix one thing at a time; multi-error
 responses risk confusing operators about which finding is the
@@ -484,7 +484,10 @@ repeat), not a regression.
    rounds; plan v4 is the final).
 2. Edit `compileExpanded` per the design above (keep DPDK
    precheck; accumulate the remaining 3).
-3. Add the three new tests.
+3. Add the four new tests (two-family accumulator, three-family
+   accumulator, single-element byte-identity, gRPC rendering).
+   Note: the three-family accumulator test was added in the
+   code-review round via a Copilot-bot follow-up.
 4. `go test ./...` clean.
 5. 5× flake loop on the new tests.
 6. cargo build sanity.
