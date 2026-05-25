@@ -1,5 +1,27 @@
 # #1539 reviewer IDs
 
+## Code review (PR #1553)
+
+- HEAD at code-review: 8c5a4ced, then 6a7d0649 (linter fix +
+  multi-LHS bypass test).
+- Codex: session 019e5fa4-... (continued) — **MERGE-READY**.
+  Reasoning: "The nil clear is placed after strict dataplane
+  validation and before the successful compileExpanded return,
+  preserving the intended runtime invariant for committed
+  configs. The canary structurally scans production pkg/config
+  sources and has focused positive/negative fixtures for the
+  important gate shapes and known bypass classes from review."
+- Antigravity: adversarial-review-mplcczw9-21ub1p — initially
+  **MERGE-WITH-MAJOR** on HEAD 8c5a4ced with HIGH (multi-LHS
+  bypass in isLHSOfAssignToNil) + MEDIUM (hand-rolled itoa
+  out-of-bounds on >=12 digit input, MinInt overflow).
+  AGY then applied the fix in the worktree (same as my lint
+  pass had already produced); final verdict **MERGE-READY**
+  with all findings addressed in 6a7d0649.
+- Claude SMR: examined diff hostile-style, noted parenthesized
+  `&&` gate would be silently rejected (fail-closed style
+  choice, documented).
+
 ## Plan v2 (commit 7f0cdacd) — round-2 verdicts
 
 - Codex round-2: session 019e5fa4-0552-7823-915d-79eaf79b1c55
