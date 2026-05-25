@@ -346,22 +346,34 @@ management plane stays alive for recovery rather than crashing
 the daemon. v1's claim "daemon refuses to start" was wrong;
 v2 corrects it.
 
-Operational note: the operator should NOT panic when the
-upgraded daemon comes up "empty." The expected recovery flow is:
+Operational note (v3 correction): the operator should NOT panic
+when the upgraded daemon comes up "empty." Because
+`Store.Load()` returns at `store.go:96-99` BEFORE assigning
+`s.active = tree` if compile fails, the in-memory active config
+is empty AND the candidate (cloned from `s.active` by
+`EnterConfigure` at `store.go:260`) is also empty. The operator
+CANNOT just `delete system dataplane-type` against a candidate
+that already carries the previous config — there is no previous
+config in candidate to delete from.
+
+The correct recovery flow is to rebuild the candidate from the
+on-disk file (or from a saved-off copy) and then commit. For
+example:
 
 ```
 ssh fw-node
 cli
 configure
-delete system dataplane-type
+load merge replace /etc/xpf/xpf.conf      # or any sanitized copy
+delete system dataplane-type              # now operates on the loaded tree
 commit
 ```
 
-(or `set system dataplane-type userspace` if the operator wants
-to keep an explicit dataplane-type line.) The candidate config is
-already populated from the previously-active config because
-configstore loads candidate from disk separately from active —
-this needs verification in the manual sanity test.
+(or simpler: edit the on-disk file to set `dataplane-type
+userspace` or remove the line, then restart the daemon and let
+the bootstrap-from-file path load it.) The manual sanity test
+must verify that the candidate after a failed `Load()` is empty,
+not pre-populated — Codex round-2 finding 2.
 
 ### What does NOT change in this PR
 

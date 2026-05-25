@@ -2816,29 +2816,73 @@ func TestDataplaneTypeDPDKRejectedAtCommitHierarchical(t *testing.T) {
 	}
 }
 
-// TestDataplaneTypeDPDKRejectedAtCommitFiresBeforeCoS — locks in the
-// validator ordering decision (DPDK reject is the first strict
-// validator in compileExpanded). Without this ordering, an operator
-// fixing a retirement-blocked config also has to chase unrelated
-// CoS errors before they see the migration message; the documented
-// migration is the FIRST thing to do.
+// TestDataplaneTypeDPDKRejectedAtCommitFiresFirst — locks in the
+// validator ordering decision (DPDK reject is the FIRST strict
+// validator in compileExpanded). Without this ordering, an
+// operator fixing a retirement-blocked config also has to chase
+// unrelated structural errors before they see the migration
+// message; the documented migration is the FIRST thing to do.
 //
-// Brittle by design: if a future refactor moves validateDataplane-
-// TypeStrict after validateClassOfServiceStrict, this test fails
-// and forces an explicit re-justification.
-func TestDataplaneTypeDPDKRejectedAtCommitFiresBeforeCoS(t *testing.T) {
-	// Build a candidate that ALSO has a structurally malformed CoS
-	// scheduler-map (a buffer-size that exceeds 100%). The
-	// CoS-strict validator would reject this independently; the
-	// test asserts the DPDK message wins.
+// Negative-control approach: build a candidate that would
+// independently fail one of the OTHER strict validators after
+// validateDataplaneTypeStrict in compileExpanded. We use the
+// three-color-policer single-rate + two-rate conflict because
+// it is the simplest validator-failing fixture
+// (validateThreeColorPolicersStrict). We verify that:
+//   1. The DPDK retirement message wins (the policer error does
+//      NOT surface).
+//   2. The policer fixture in isolation DOES fail with its own
+//      strict-validator error (proves the negative control is
+//      live — otherwise removing the dpdk line would surface
+//      neither error and the test would silently pass).
+//
+// Brittle by design: if a future refactor moves
+// validateDataplaneTypeStrict after validateThreeColorPolicers-
+// Strict, the first assertion fails and forces an explicit
+// re-justification.
+func TestDataplaneTypeDPDKRejectedAtCommitFiresFirst(t *testing.T) {
+	// First: prove the negative-control fixture actually triggers
+	// the secondary strict validator on its own.
+	policerOnly := NewParser(`firewall {
+    three-color-policer bad-pol {
+        single-rate {
+            color-blind;
+        }
+        two-rate {
+            color-aware;
+        }
+        action {
+            loss-priority high then discard;
+        }
+    }
+}`)
+	tree1, errs := policerOnly.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("policer-only parse errors: %v", errs)
+	}
+	_, polErr := CompileConfig(tree1)
+	if polErr == nil {
+		t.Fatal("negative control failed: bad three-color-policer fixture should fail validateThreeColorPolicersStrict on its own — test cannot prove ordering")
+	}
+	if !strings.Contains(polErr.Error(), "three-color-policer") {
+		t.Fatalf("negative control surfaced unexpected error %q (want three-color-policer); fixture may need updating", polErr.Error())
+	}
+
+	// Now combine the dpdk type and the bad policer. The DPDK
+	// retirement reject must fire first.
 	parser := NewParser(`system {
     dataplane-type dpdk;
 }
-class-of-service {
-    schedulers {
-        bad-sched {
-            transmit-rate percent 50;
-            buffer-size percent 150;
+firewall {
+    three-color-policer bad-pol {
+        single-rate {
+            color-blind;
+        }
+        two-rate {
+            color-aware;
+        }
+        action {
+            loss-priority high then discard;
         }
     }
 }`)
@@ -2848,10 +2892,14 @@ class-of-service {
 	}
 	_, err := CompileConfig(tree)
 	if err == nil {
-		t.Fatal("CompileConfig succeeded for dpdk + malformed CoS candidate")
+		t.Fatal("CompileConfig succeeded for dpdk + malformed policer candidate")
 	}
 	if !strings.Contains(err.Error(), dpdkRetirementSubstr) {
-		t.Fatalf("CompileConfig error = %q, want DPDK retirement substring (CoS error should not win): %q", err.Error(), dpdkRetirementSubstr)
+		t.Fatalf("CompileConfig error = %q, want DPDK retirement substring (policer error should not win): %q", err.Error(), dpdkRetirementSubstr)
+	}
+	// Also confirm the policer error did NOT leak through.
+	if strings.Contains(err.Error(), "three-color-policer") {
+		t.Fatalf("policer error leaked through DPDK retirement reject: %q", err.Error())
 	}
 }
 
