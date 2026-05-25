@@ -27,10 +27,29 @@ v2 → v3 (Copilot inline review on PR #1535):
 5. Clean up stale plan v1 prose still referencing docs edits and
    token-list trims (Codex code review task-mpkrohgl-dow3kd).
 
+v3 → v4 (Codex + Antigravity hostile code reviews on a00d9111):
+6. Fix nil-pointer panic in `daemon_ha_sync.go::OnFenceReceived`.
+   The v3 soft-fallback path sets `d.dp = nil` but the peer-fence
+   callback at line 670 unconditionally called `d.dp.HA().SetRGActive(...)`.
+   A clustered node booted into config-only mode would panic on
+   the next peer fence (heartbeat-timeout-driven). Added a
+   `d.dp == nil` early-return with structured log.
+7. Acknowledge the docs-prose drift Codex v3 flagged.  After this
+   PR, `docs/pr/1373-retire-ebpf-dataplane/README.md` lines 64
+   and 85 contain factually stale claims about
+   `cmd/xpfd/main.go` keeping the DPDK blank import. The pinned
+   canary tokens still pass (the literal tokens remain in the
+   file), but the prose now describes a pre-#1527 reality. This
+   PR intentionally leaves docs untouched per Chain C (#1529)
+   scope boundary. The PR description and this plan flag the
+   drift as a Chain C TODO.
+
 Earlier verdicts preserved:
 - Antigravity plan review: adversarial-review-mpkqkzkm-qfa19j → PLAN-READY.
 - Codex plan review: task-mpkqsgf5-j2yag1 → PLAN-NEEDS-MINOR (resolved in v2).
 - Codex code review v2: task-mpkrohgl-dow3kd → MERGE-NEEDS-MINOR (resolved in v3).
+- Codex code review v3: task-mpkrwbtk-pd6nnw → MERGE-NEEDS-MAJOR (NPE + docs drift; NPE resolved in v4, docs drift acknowledged out-of-scope).
+- Antigravity code review v3: adversarial-review-mpkrwmkk-2k24v4 → MERGE-NEEDS-MAJOR (same NPE; resolved in v4).
 
 ## Issue framing
 

@@ -2,6 +2,31 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T06:40:00Z
+  - **Action**: #1527 v4 — Codex hostile code review v3
+    (task-mpkrwbtk-pd6nnw MERGE-NEEDS-MAJOR) and Antigravity
+    adversarial review v3 (adversarial-review-mpkrwmkk-2k24v4
+    MAJOR) both independently caught a nil-pointer crash exposed
+    by the v3 soft-fallback: `pkg/daemon/daemon_ha_sync.go:670`
+    `OnFenceReceived` callback unconditionally called
+    `d.dp.HA().SetRGActive(...)`. With `d.dp = nil` after the
+    `ErrDPDKBackendRetired` soft-fallback, the next peer-fence
+    message would panic the daemon. Pre-existing latent bug
+    (also reachable via Start() failure) but newly exposed by
+    v3's more-reachable nil-dp path. Added a `d.dp == nil`
+    early-return with structured log explaining the
+    config-only-mode rationale. Codex v3 also flagged that
+    `docs/pr/1373-retire-ebpf-dataplane/README.md` lines 64 and
+    85 contain factually stale claims about `cmd/xpfd/main.go`
+    keeping the DPDK blank import. The pinned canary tokens
+    still pass literally, but the prose now describes a
+    pre-#1527 reality. Intentionally left untouched per the
+    Chain C (#1529) scope boundary; flagged in plan v4 + PR
+    description as a Chain C TODO. Build clean, full Go test
+    suite clean.
+  - **File(s)**: `pkg/daemon/daemon_ha_sync.go`,
+    `docs/pr/1527-dpdk-boot-decouple/plan.md`
+
 - **Timestamp**: 2026-05-25T06:00:00Z
   - **Action**: #1527 Copilot review response — Copilot flagged on
     `47a4278c` that returning `ErrDPDKBackendRetired` at construction
