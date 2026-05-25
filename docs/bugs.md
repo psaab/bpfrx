@@ -1,5 +1,10 @@
 # Bugs Found During VM Testing
 
+> [!IMPORTANT]
+> DPDK retired in #1525. DPDK references in bug history below are
+> historical records of fixes that applied while the DPDK backend
+> was live; the backend is removed in #1527/#1528.
+
 ## Critical Bugs
 
 ### VRRP split-brain — resign re-election + missing RFC 5798 tie-breaking (FIXED)

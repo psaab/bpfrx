@@ -107,6 +107,11 @@ Or use `test/incus/cluster-setup.sh` directly with `BPFRX_CLUSTER_ENV` set:
 
 ## Architecture
 
+> [!IMPORTANT]
+> DPDK dataplane retired in #1525. Do not add new DPDK code. The
+> `dpdk_worker/` C tree and `pkg/dataplane/dpdk/` Go manager are
+> removed in #1527/#1528.
+
 The BPF pipeline below is legacy context during the #1373 retirement. Keep it
 working until the staged removal phases land, but do not start new dataplane
 features on this path unless a blocker explicitly requires compatibility or
@@ -165,8 +170,6 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 | `proto/xpf/v1/` | Protobuf service definition |
 | `cmd/xpfd/` | Daemon main binary |
 | `cmd/cli/` | Remote CLI client binary |
-| `dpdk_worker/` | DPDK C pipeline (single-pass packet processing, CGo bridge) |
-| `pkg/dataplane/dpdk/` | DPDK Go manager (CGo shared memory, FIB sync, port stats) |
 | `pkg/vrrp/` | Native VRRPv3 state machine (30ms RETH advertisements, AF_PACKET, IPv6 NODAD) |
 | `pkg/ra/` | Embedded RA sender (replaces radvd) |
 | `docs/` | Protocol docs, feature gaps, phase notes, test plans, memory backups |

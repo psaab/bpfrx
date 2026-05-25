@@ -1,5 +1,101 @@
 # Action Log
 
+## 2026-05-25 — #1529 Codex code-review finding follow-up
+
+- **Timestamp**: 2026-05-25T06:50:00Z
+  - **Action**: Codex code review NEEDS-MINOR with three findings,
+    all addressed:
+    (1) _Log.md said 25 files but commit had 26; corrected.
+    (2) `docs/pr/1373-retire-ebpf-dataplane/README.md` safe-delete
+        bullet said "#1475 section below" but #1475 is above the
+        safe-delete blockers list; corrected to "section in this
+        file".
+    (3) Tense mismatch in `docs/userspace-dataplane-gaps.md` and
+        `docs/userspace-dataplane-architecture.md`: changed
+        "legacy eBPF used" back to "legacy eBPF uses" since
+        legacy eBPF is still present during the staged retirement.
+  - **File(s)**: `docs/pr/1373-retire-ebpf-dataplane/README.md`,
+    `docs/userspace-dataplane-gaps.md`,
+    `docs/userspace-dataplane-architecture.md`, `_Log.md`
+
+## 2026-05-25 — #1529 Antigravity code-review finding follow-up
+
+- **Timestamp**: 2026-05-25T06:30:00Z
+  - **Action**: Antigravity code review MERGE-READY with one new
+    finding: `pkg/dataplane/README.md` and `pkg/daemon/README.md`
+    were missed by the original docs/ + root grep. The issue body
+    for #1529 explicitly names `pkg/dataplane/README.md` as part
+    of the retirement boundary, so this was a scope-coverage miss.
+    Edited `pkg/dataplane/README.md` and `pkg/daemon/README.md` to
+    reframe DPDK references past-tense; pointed at the canary-
+    pinned `#1475 DPDK Backend Policy` section as the historical
+    anchor.
+  - **File(s)**: `pkg/dataplane/README.md`, `pkg/daemon/README.md`,
+    `_Log.md`
+
+## 2026-05-25 — #1529 implementation
+
+- **Timestamp**: 2026-05-25T06:00:00Z
+  - **Action**: Implemented the v3 plan. 26 files touched, all `*.md`.
+    Pure-text gate passes; no source files touched. Chain A boundary
+    confirmed (no overlap with `docs/dataplane-decision-dpdk-vs-vpp.md`
+    or `docs/dpdk-dataplane.md`). All three retirement-boundary doc
+    canaries pass: `TestRetirementBoundaryDocsMentionDPDKPolicy`,
+    `TestRetirementBoundaryDocsMentionShimEscapeAssumptions`,
+    `TestRetirementBoundaryDocsMentionLegacyImportAllowlist`. Full
+    `pkg/dataplane/...` Go test suite passes. Cargo sanity build
+    passes.
+  - **File(s)**: README.md, CLAUDE.md, docs/pr/1373-retire-ebpf-dataplane/{README.md,source-removal-manifest-1476.md},
+    docs/{active-active-new-connections.md, authoritative-backlog.md,
+    bugs.md, deterministic-nat-cgnat.md, fabric-bridge-tuning.md,
+    feature-gaps.md, memory.md, perf-ranked-backlog.md, phases.md,
+    refactoring-audit.md, userspace-dataplane-architecture.md,
+    userspace-dataplane-gaps.md, userspace-fabric-redirect-fix.md,
+    vpp-dataplane-assessment.md, xdp-io-uring-userspace-dataplane.md},
+    docs/next-features/{application-identification.md,
+    ha-session-ownership-and-fabric-failover.md,
+    ipv6-session-fast-path.md, pre-id-default-policy.md,
+    twice-nat.md, vsrx-fabric-fab0-fab1-syntax-compat.md}, _Log.md.
+
+## 2026-05-25 — #1529 plan v3 (Antigravity r2 build-breaker fix)
+
+- **Timestamp**: 2026-05-25T05:30:00Z
+  - **Action**: v3 plan addresses Antigravity r2 PLAN-NEEDS-MINOR.
+    The §1504 paragraph in `docs/pr/1373-retire-ebpf-dataplane/README.md`
+    is ALSO canary-pinned by
+    `TestRetirementBoundaryDocsMentionShimEscapeAssumptions`
+    (pinned string "does not recurse"). v2's proposed rewrite
+    would have broken the build. v3 defers §1504 rewrite to
+    #1527/#1528 along with §1475. Only lines 65 and 292 (not
+    canary-pinned) are edited in-place; line 65 split into two
+    sentences to fix grammar, line 292 explicitly includes the
+    `- ` bullet marker.
+  - **File(s)**: `docs/pr/1529-dpdk-docs-sweep/plan.md`, `_Log.md`
+
+## 2026-05-24 — #1529 plan v2 (Codex r1 fixes)
+
+- **Timestamp**: 2026-05-25T05:00:00Z
+  - **Action**: v2 plan addresses Codex r1 PLAN-NEEDS-MAJOR six
+    findings: non-canary-pinned DPDK text now has explicit
+    rewrites; acceptance-criterion 4 deferral now documented as
+    staged exception; EDIT row ambiguity eliminated;
+    docs/refactoring-audit.md annotate (not drop);
+    historical-classification wording clarified; git diff gate
+    uses --name-only.
+  - **File(s)**: `docs/pr/1529-dpdk-docs-sweep/plan.md`
+
+## 2026-05-24 — #1529 plan v1 drafted
+
+- **Timestamp**: 2026-05-24T17:00:00Z
+  - **Action**: Drafted plan v1 for #1529 (DPDK retirement Phase 4 —
+    broad docs sweep). Per-file disposition table covers ~42 files
+    with DPDK references. Major scope adjustment: the
+    `#1475 DPDK Backend Policy` section in
+    `docs/pr/1373-retire-ebpf-dataplane/README.md` is canary-pinned
+    by `TestRetirementBoundaryDocsMentionDPDKPolicy` and the rewrite
+    is deferred to #1527/#1528. This PR adds a leading retirement
+    note above it instead.
+  - **File(s)**: `docs/pr/1529-dpdk-docs-sweep/plan.md`, `_Log.md`
 ## 2026-05-25
 
 - **Timestamp**: 2026-05-25T05:00:00Z
@@ -2012,6 +2108,20 @@
   - **Validation**: cargo build --release; cargo test --release --bin
     xpf-userspace-dp afxdp::wg.
 
+- **Timestamp**: 2026-05-25T05:41:23Z
+  - **Action**: Review fix (#1529) — inline DPDK annotation pass on
+    `docs/feature-gaps.md`. The initial sweep used a blanket header
+    note to cover all table rows, but several "Done" status cells still
+    contained present-tense DPDK language that implies the backend is
+    an active target. Fixed inline: line 169 (Twice NAT — "across eBPF,
+    DPDK, and userspace"), line 173 (Port Randomization — "XDP and DPDK
+    SNAT allocators"), lines 203/205 (TCP No-SYN-Check / TCP RST —
+    "eBPF + DPDK"), line 315 (Dual Fabric — "DPDK still lacks...parity"),
+    line 326 (Policer), line 327 (Three-Color Policer), line 407 (system
+    caps listing "DPDK config"), line 442 (policer tier list), line 516
+    (policer section). No source code changed; pure doc fixes.
+  - **File(s)**: `docs/feature-gaps.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/... -run 'TestRetirementBoundary|TestLegacyBPF' -count=1`
 - **Timestamp**: 2026-05-25T06:20Z
 - **Action**: Harmonize ErrDPDKBackendRetired + slog.Warn wording with config sentinel (AGY #1536 review finding)
 - **File(s)**: pkg/dataplane/dataplane.go, pkg/daemon/daemon_run.go

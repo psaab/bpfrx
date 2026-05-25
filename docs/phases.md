@@ -432,6 +432,12 @@ Gap audit: `docs/archived/userspace-forwarding-and-failover-gap-audit.md` (PR #3
 
 ## DPDK Dataplane Backend
 
+> [!IMPORTANT]
+> Historical sprint records below. The DPDK dataplane backend was
+> retired in #1525; the `dpdk_worker/` and `pkg/dataplane/dpdk/`
+> trees are removed in #1527/#1528. These sections are preserved
+> as the sprint history they were at the time of writing.
+
 ### DPDK Phase 1-5: Foundation (`0329a45`–`acec4c9`)
 - Extract `DataPlane` interface from concrete eBPF Manager
 - Config parsing for `dataplane-type dpdk`

@@ -185,8 +185,8 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **Always spawn:** Feature teammates + Test teammate (REQUIRED) + Docs teammate (REQUIRED)
 - Test teammate: `make test` + `make test-deploy` + connectivity tests; never stops until validated
 - Docs teammate: updates bugs.md, phases.md, optimizations.md, MEMORY.md continuously
-- **Testing focus:** eBPF only (not DPDK) until further notice
-- **Code for both:** Always implement for both eBPF and DPDK structs/code
+- **Testing focus:** userspace AF_XDP primary; legacy eBPF for regression coverage (DPDK retired #1525)
+- **Code for both:** Do not add new DPDK code (DPDK retired #1525; removed in #1527/#1528). New work targets userspace AF_XDP and, transitionally, legacy eBPF.
 
 ## Workflow
 - **Always commit and push** when finishing a task
