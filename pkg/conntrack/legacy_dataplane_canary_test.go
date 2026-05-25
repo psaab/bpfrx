@@ -104,12 +104,31 @@ func TestConntrackHasNoLegacyDataPlaneDependency(t *testing.T) {
 					return true
 				}
 				for _, method := range node.Methods.List {
-					if isLegacyDataPlaneType(method.Type) {
-						methodName := "<anonymous>"
-						if len(method.Names) > 0 {
-							methodName = method.Names[0].Name
+					methodName := "<anonymous>"
+					if len(method.Names) > 0 {
+						methodName = method.Names[0].Name
+					}
+
+					switch mt := method.Type.(type) {
+					case *ast.FuncType:
+						if mt.Params != nil {
+							for _, field := range mt.Params.List {
+								if isLegacyDataPlaneType(field.Type) {
+									offenders = append(offenders, name+": interface method "+methodName+" parameter is dataplane.DataPlane")
+								}
+							}
 						}
-						offenders = append(offenders, name+": interface method "+methodName+" mentions dataplane.DataPlane")
+						if mt.Results != nil {
+							for _, field := range mt.Results.List {
+								if isLegacyDataPlaneType(field.Type) {
+									offenders = append(offenders, name+": interface method "+methodName+" result is dataplane.DataPlane")
+								}
+							}
+						}
+					default:
+						if isLegacyDataPlaneType(method.Type) {
+							offenders = append(offenders, name+": interface embed "+methodName+" is dataplane.DataPlane")
+						}
 					}
 				}
 			}
