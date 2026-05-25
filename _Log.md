@@ -2276,3 +2276,12 @@
   handleRequestChassisClusterDataPlane in cli_request.go. Recorded
   reviewer-ids for code-review round 1.
 - **File(s)**: pkg/cli/runtime.go, docs/pr/1517-cli-migration/reviewer-ids.md
+
+- **Timestamp**: 2026-05-25 (1517 code review final verdicts)
+- **Action**: All three reviewers MERGE-READY. Recording verdicts;
+  not merging (per project policy).
+- **File(s)**: docs/pr/1517-cli-migration/reviewer-ids.md
+- **Validation**: Codex r3 task-mpkvl9cn-3we3in MERGE-READY (after two
+  sandbox-FS-blocked retries); AGY adversarial-review-mpkvctz4-xk8x46
+  MERGE-READY (exhaustive 10-check report with byte-for-byte evidence);
+  Copilot COMMENTED with 1 minor inline finding, addressed in 91e1da9f.
