@@ -4,6 +4,7 @@ package daemon
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -243,23 +244,44 @@ func (d *Daemon) Run(ctx context.Context) error {
 			dpType = cfg.System.DataplaneType
 		}
 		dp, err := dataplane.NewRuntimeDataPlane(dpType)
-		if err != nil {
+		if errors.Is(err, dataplane.ErrDPDKBackendRetired) {
+			// #1527 Phase 2 of the DPDK retirement (umbrella
+			// #1525): the runtime DPDK backend is gone, but a
+			// node may still have "set system dataplane-type
+			// dpdk" persisted in the active config from before
+			// Chain A (#1526) blocked the commit. Treat this
+			// the same way as a Start() failure: log a warning
+			// and fall through to config-only mode so the
+			// daemon stays up and the operator can fix the
+			// config from the CLI / gRPC. The hard fatal-at-
+			// startup branch is reserved for genuinely unknown
+			// dataplane types (the default branch below).
+			slog.Warn("the DPDK dataplane backend has been retired; running in config-only mode until config is updated",
+				"type", dpType,
+				"err", err,
+				"remediation", "set system dataplane-type userspace",
+			)
+			d.dp = nil
+		} else if err != nil {
 			slog.Error("failed to create dataplane", "type", dpType, "err", err)
 			return fmt.Errorf("create dataplane: %w", err)
-		}
-		d.dp = dp
-		if err := d.dp.Start(ctx); err != nil {
-			slog.Warn("failed to start dataplane, running in config-only mode",
-				"err", err)
-			d.dp = nil
 		} else {
-			if lp := d.legacyDP(); lp != nil {
-				lp.SeedNATPortCounters()
-				nodeID := 0
-				if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
-					nodeID = cfg.Chassis.Cluster.NodeID
+			d.dp = dp
+		}
+		if d.dp != nil {
+			if err := d.dp.Start(ctx); err != nil {
+				slog.Warn("failed to start dataplane, running in config-only mode",
+					"err", err)
+				d.dp = nil
+			} else {
+				if lp := d.legacyDP(); lp != nil {
+					lp.SeedNATPortCounters()
+					nodeID := 0
+					if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
+						nodeID = cfg.Chassis.Cluster.NodeID
+					}
+					lp.SeedSessionIDCounter(nodeID)
 				}
-				lp.SeedSessionIDCounter(nodeID)
 			}
 		}
 		// Apply current config — needed even in config-only mode so that
@@ -301,7 +323,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start background services if dataplane is loaded
 	var er *logging.EventReader
 	if d.dp != nil {
-		// Start FIB sync (DPDK: background route populator; eBPF: no-op)
+		// StartFIBSync is a no-op on every in-tree backend: eBPF
+		// resolves FIB queries via bpf_fib_lookup in-kernel and the
+		// userspace AF_XDP runtime wraps that no-op through the
+		// legacy adapter.  Call site retained for backends that
+		// need a userspace route populator (DPDK had one; retired
+		// in #1527 / #1525).
 		if lp := d.legacyDP(); lp != nil {
 			lp.StartFIBSync(ctx)
 		}
