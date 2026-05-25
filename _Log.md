@@ -1679,3 +1679,22 @@
 - **Timestamp**: 2026-05-24T04:00:00Z
   - **Action**: r8: strengthened install_session_serializes_with_reconcile_removal with an `ok > 0` gate so the race test cannot pass tautologically when the reconciler always wins (Codex r7 finding); added debug_assert! on duplicate peer pubkey in reconcile_peers so engine-side surface flags Go-control-plane validation gaps (r6 Claude nit 4 / Codex r7).
   - **File(s)**: userspace-dp/src/afxdp/wg/engine.rs
+
+- **Timestamp**: 2026-05-24T21:30:12-07:00
+  - **Action**: PR #1499 final nit: corrected the nonce-layout comment
+    in `framing.rs` to match snow 0.10's default ChaCha20-Poly1305
+    resolver and the WireGuard whitepaper §5.4.6. The prior comment
+    stated `counter.to_le_bytes() || [0,0,0,0]` (counter first, zeros
+    trailing); snow actually builds `[0,0,0,0] || counter.to_le_bytes()`
+    (4 zero bytes prepended, counter LE in bytes [4..12]) per
+    `snow-0.10.0/src/resolvers/default.rs:380-381`. Wire behavior was
+    already correct — snow's u64 nonce parameter is passed straight
+    through — only the in-code rationalization was inverted. Added an
+    explicit "do not invert this" warning anchoring the snow source
+    citation so a future maintainer cannot regress to the wrong layout.
+    The deferred zeroize-at-construction for
+    `WgEngineConfig.local_private_key` remains an integration-PR
+    follow-up and is not addressed here.
+  - **File(s)**: `userspace-dp/src/afxdp/wg/framing.rs`, `_Log.md`
+  - **Validation**: cargo build --release; cargo test --release --bin
+    xpf-userspace-dp afxdp::wg.

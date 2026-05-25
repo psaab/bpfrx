@@ -19,8 +19,23 @@
 //!
 //! `receiver_index` and `counter` are little-endian. The encrypted
 //! payload is ChaCha20-Poly1305 with a 96-bit nonce of
-//! `counter.to_le_bytes() || [0,0,0,0]`. snow's u64 nonce parameter
-//! produces this exact layout, so we pass `counter` straight through.
+//! `[0,0,0,0] || counter.to_le_bytes()` (4 zero bytes prepended,
+//! then the 64-bit counter little-endian in bytes [4..12]), per the
+//! WireGuard whitepaper §5.4.6 (`0^32 || counter_LE_64`). snow 0.10's
+//! default ChaCha20-Poly1305 resolver builds this exact layout from
+//! its u64 nonce parameter — see `snow-0.10.0/src/resolvers/default.rs`
+//! lines 380-381:
+//!
+//! ```text
+//!   let mut nonce_bytes = [0_u8; 12];
+//!   copy_slices!(nonce.to_le_bytes(), &mut nonce_bytes[4..]);
+//! ```
+//!
+//! so we pass `counter` straight through to snow without manual
+//! padding. A future maintainer must not "match what snow does" by
+//! constructing `counter_LE || [0,0,0,0]` — that order is the inverse
+//! of what snow and the WG whitepaper specify and would be silently
+//! non-interoperable.
 
 use super::{WG_DATA_HEADER_LEN, WG_TYPE_DATA};
 
