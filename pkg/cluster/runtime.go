@@ -8,11 +8,12 @@
 // matching boundary type so the public constructor signatures no
 // longer name the legacy bridge.
 //
-// Both pkg/dataplane.Manager (legacy eBPF) and the userspace
-// dataplane.LegacyDataPlaneAdapter satisfy clusterRuntime via their
-// existing Sessions()/Telemetry() methods, which already participate
-// in dataplane.RuntimeDataPlane. Keeping clusterRuntime package-
-// private (lower-case 'r') prevents accidental upward dependence and
+// Both *pkg/dataplane.Manager (legacy eBPF) and
+// *pkg/dataplane/userspace.LegacyDataPlaneAdapter (userspace) satisfy
+// clusterRuntime via their existing Sessions()/Telemetry() methods,
+// which already participate in dataplane.RuntimeDataPlane. Keeping
+// clusterRuntime package-private (lower-case 'r') prevents accidental
+// upward dependence and
 // matches the pattern used by pkg/cli/runtime.go (#1517) and
 // pkg/api / pkg/conntrack / pkg/fwdstatus / pkg/monitoriface earlier
 // in the #1451 migration sequence.

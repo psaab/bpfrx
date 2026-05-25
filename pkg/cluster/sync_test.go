@@ -700,12 +700,18 @@ func TestHandleMessageDeleteV6RemovesCompanions(t *testing.T) {
 // --- Sync sweep tests ---
 
 // mockSweepDP is the test mock backing the cluster session-sync suite.
-// It embeds the legacy dataplane.DataPlane interface so the few methods
-// this mock does not override fall through to a nil receiver, and
-// implements the surface the cluster hot path actually exercises:
+// It embeds the dataplane.DataPlane interface as a method-set
+// placeholder so the type satisfies dataplane.DataPlane at compile
+// time without spelling out every unused method; the embedded
+// interface field is left nil, so any method that is NOT overridden
+// below will panic with a nil-interface dispatch if invoked. In
+// practice the cluster sweep / install / iterate paths only call the
+// overridden subset, which this type implements explicitly:
 // Get/Set/Delete session, sync + batch Iterate for v4 and v6,
 // ReadGlobalCounter, and the cluster-DNAT delete tracking used by the
-// reverse-NAT teardown tests.
+// reverse-NAT teardown tests. Adding a sweep call-site that touches a
+// non-overridden method will fail-fast with a clear runtime panic on
+// the first test that exercises it.
 //
 // After #1518 (sub-#1451 S3) the cluster constructors take
 // clusterRuntime (Sessions()/Telemetry()) instead of dataplane.DataPlane.

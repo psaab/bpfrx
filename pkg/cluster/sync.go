@@ -347,11 +347,15 @@ const deleteJournalDefaultCap = 10000
 // In-tree callers either pass nil at construction time and wire the runtime
 // later via SetRuntime (the daemon's pattern, see daemon_ha_sync.go) or pass a
 // runtime that already implements Sessions()/Telemetry() — both
-// *dataplane.Manager and the userspace LegacyDataPlaneAdapter satisfy that
-// contract. Out-of-tree callers that still hold a value typed as
-// dataplane.DataPlane (which does NOT expose Sessions()/Telemetry() directly)
-// must pass nil here and use the deprecated SetDataPlane alias, which adapts
-// the legacy bridge via dataplane.SessionStoreOf / TelemetryOf.
+// *dataplane.Manager and *dataplane/userspace.LegacyDataPlaneAdapter satisfy
+// that contract. Callers that hold only a value typed as dataplane.DataPlane
+// (the legacy bridge does NOT expose Sessions()/Telemetry() directly) can
+// either: (a) wrap it in a small local type that adds Sessions() and
+// Telemetry() returning dataplane.SessionStoreOf(dp) / TelemetryOf(dp) and
+// pass that wrapper here — Go structural typing accepts any value with the
+// right method set even though clusterRuntime is package-private — or (b)
+// pass nil and use the deprecated SetDataPlane alias, which performs the
+// same adaptation internally.
 func NewSessionSync(localAddr, peerAddr string, rt clusterRuntime) *SessionSync {
 	s := &SessionSync{
 		localAddr:                  localAddr,
