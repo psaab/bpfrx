@@ -731,9 +731,14 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 
 				// Wire dataplane into session sync and start the sweep.
 				// Must happen here (not in Run) because d.sessionSync is
-				// created asynchronously in this goroutine.
+				// created asynchronously in this goroutine. d.dp is a
+				// dataplane.RuntimeDataPlane; both the legacy *Manager and
+				// the userspace LegacyDataPlaneAdapter implement
+				// Sessions()/Telemetry() so they satisfy the cluster
+				// package's narrow clusterRuntime contract directly. The
+				// legacyDP() cast is no longer required at this seam (#1518).
 				if d.dp != nil {
-					d.sessionSync.SetDataPlane(d.legacyDP())
+					d.sessionSync.SetRuntime(d.dp)
 					d.sessionSync.IsPrimaryFn = func() bool {
 						return d.cluster != nil && d.cluster.IsLocalPrimary(0)
 					}

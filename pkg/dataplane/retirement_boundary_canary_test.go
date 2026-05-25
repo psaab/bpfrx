@@ -40,6 +40,7 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"pkg/cli/cli_show_flow.go":                 "flow display still uses legacy session keys and values",
 	"pkg/cli/cli_show_nat.go":                  "NAT display still uses legacy NAT/session metadata",
 	"pkg/cli/cli_show_security.go":             "security display still uses legacy counters and filter types",
+	"pkg/cluster/runtime.go":                   "clusterRuntime interface still names dataplane.SessionStore/Telemetry domain types from pkg/dataplane (#1518)",
 	"pkg/cluster/sync.go":                      "session sync still installs sessions through the legacy bridge",
 	"pkg/cluster/sync_bulk.go":                 "bulk sync still serializes legacy session entries",
 	"pkg/cluster/sync_conn.go":                 "sync connection code still references legacy session types",
