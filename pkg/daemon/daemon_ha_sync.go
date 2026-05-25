@@ -664,7 +664,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// fence via sync; on receive, disable all local RGs.
 			d.cluster.SetPeerFenceFunc(d.sessionSync.SendFence)
 			d.sessionSync.OnFenceReceived = func() {
-				slog.Warn("cluster: fence received from peer, disabling all RGs")
+				slog.Warn("cluster: fence received from peer")
 				// Guard d.dp: the daemon can run in config-only mode
 				// (d.dp == nil) when the runtime dataplane factory rejects
 				// the configured backend — for example, a stale
@@ -681,6 +681,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 					)
 					return
 				}
+				slog.Warn("cluster: fence received from peer, disabling all RGs")
 				if cfg.Chassis.Cluster != nil {
 					for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
 						if err := d.dp.HA().SetRGActive(commsCtx, rg.ID, false); err != nil {

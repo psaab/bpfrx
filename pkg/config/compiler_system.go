@@ -379,7 +379,7 @@ func compileSystemDataplaneType(node *Node) (string, error) {
 		next := child.Keys[1]
 		if !validDataplaneType(next) {
 			return "", fmt.Errorf(
-				"unknown dataplane-type %q; dataplane-type %q is invalid; valid values are ebpf, userspace",
+				"unknown dataplane-type %q; dataplane-type %q is invalid; valid values are ebpf, dpdk, userspace",
 				next, next)
 		}
 		dpType = next

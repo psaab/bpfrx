@@ -2,6 +2,21 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T05:55:15Z
+  - **Action**: #1527 final Copilot re-review follow-up — resolved three
+    remaining consistency nits from the latest Copilot inline pass:
+    (1) `compiler_system.go` invalid dataplane-type guidance now
+    matches current parser acceptance (`ebpf, dpdk, userspace`);
+    (2) peer-fence logging in `daemon_ha_sync.go` now logs a neutral
+    receive message before the nil-dataplane guard and emits
+    "disabling all RGs" only when deactivation will actually run;
+    (3) plan status header in
+    `docs/pr/1527-dpdk-boot-decouple/plan.md` corrected from v3 to v4.
+    Ran focused package tests for dataplane/config/daemon.
+  - **File(s)**: `pkg/config/compiler_system.go`,
+    `pkg/daemon/daemon_ha_sync.go`,
+    `docs/pr/1527-dpdk-boot-decouple/plan.md`, `_Log.md`
+
 - **Timestamp**: 2026-05-25T06:50:00Z
   - **Action**: #1527 reviewer re-dispatch on 878bcbdd after my
     earlier v3 NPE-fix commit landed. Codex hostile re-review

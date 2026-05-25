@@ -2,7 +2,7 @@
 
 ## Status
 
-v3 — IMPLEMENTATION COMPLETE.
+v4 — IMPLEMENTATION COMPLETE.
 
 v1 → v2 (Codex plan review task-mpkqsgf5-j2yag1, PLAN-NEEDS-MINOR):
 1. Require Chain A (#1526) to land BEFORE this PR (sequencing
