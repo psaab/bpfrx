@@ -674,7 +674,11 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				// panic on a nil pointer dereference. The same applies to
 				// any future Start() failure that leaves d.dp == nil.
 				if d.dp == nil {
-					slog.Warn("cluster: fence: dataplane is nil (config-only mode); skipping RG deactivation")
+					slog.Warn("cluster: fence received but dataplane is nil; skipping RG deactivation",
+						"mode", "config-only",
+						"action", "skip_rg_deactivation",
+						"remediation", "set system dataplane-type userspace and restart xpfd",
+					)
 					return
 				}
 				if cfg.Chassis.Cluster != nil {
