@@ -275,7 +275,7 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/daemon/daemon_ha_userspace.go` | Userspace HA control still crosses the legacy bridge. |
 | `pkg/daemon/daemon_run.go` | Runtime wiring still passes `legacyDP()` to unmigrated services. |
 | `pkg/grpcapi/apply_result.go` | gRPC apply metadata still adapts legacy apply results. |
-| `pkg/grpcapi/server.go` | gRPC server construction still stores the legacy bridge. |
+| `pkg/grpcapi/runtime.go` | #1516 — `grpcRuntime` interface declares the narrow gRPC dataplane surface; still depends on root `pkg/dataplane` type names (`SessionKey`, `CounterValue`, etc.) until those types move to a domain package. |
 | `pkg/grpcapi/server_helpers.go` | gRPC helpers still format legacy dataplane types and bridge runtime accessors. |
 | `pkg/grpcapi/server_sessions.go` | gRPC session RPCs still use legacy session types. |
 | `pkg/grpcapi/server_show.go` | gRPC show dispatcher still reaches legacy dataplane state. |

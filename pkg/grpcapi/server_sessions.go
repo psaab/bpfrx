@@ -41,19 +41,17 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 	return s.getSessionsLegacy(ctx, req)
 }
 
-// sessionIteratorFrom is implemented by dataplane.Manager to support
-// cursor-based BPF map iteration.
-type sessionIteratorFrom interface {
-	IterateSessionsFrom(cursor *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error
-	IterateSessionsV6From(cursor *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
-}
-
 // getSessionsCursor implements cursor-based pagination.
 // It iterates only up to page_size matching entries, avoids full-table
 // scans for the total count (uses SessionCount instead), and skips
 // enrichment when no_enrich is set.
+//
+// The cursor-iteration provider interface (sessionCursorIterator)
+// lives in runtime.go alongside grpcRuntime and the userspace
+// provider probes; we fall through to the legacy full-table scan
+// when the underlying dataplane does not satisfy it.
 func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsRequest) (*pb.GetSessionsResponse, error) {
-	iterDP, ok := s.dp.(sessionIteratorFrom)
+	iterDP, ok := s.dp.(sessionCursorIterator)
 	if !ok {
 		// Dataplane doesn't support cursor iteration; fall back to legacy.
 		return s.getSessionsLegacy(ctx, req)

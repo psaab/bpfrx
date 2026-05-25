@@ -458,3 +458,28 @@ func (a *LegacyDataPlaneAdapter) TakeoverReady() (bool, []string) {
 	}
 	return m.TakeoverReady()
 }
+
+func (a *LegacyDataPlaneAdapter) IterateSessionsFrom(cursor *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	if a == nil || a.DataPlane == nil {
+		return errors.New("nil dataplane")
+	}
+	if iter, ok := a.DataPlane.(interface {
+		IterateSessionsFrom(*dataplane.SessionKey, func(dataplane.SessionKey, dataplane.SessionValue) bool) error
+	}); ok {
+		return iter.IterateSessionsFrom(cursor, fn)
+	}
+	return errors.New("underlying dataplane does not support IterateSessionsFrom")
+}
+
+func (a *LegacyDataPlaneAdapter) IterateSessionsV6From(cursor *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	if a == nil || a.DataPlane == nil {
+		return errors.New("nil dataplane")
+	}
+	if iter, ok := a.DataPlane.(interface {
+		IterateSessionsV6From(*dataplane.SessionKeyV6, func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
+	}); ok {
+		return iter.IterateSessionsV6From(cursor, fn)
+	}
+	return errors.New("underlying dataplane does not support IterateSessionsV6From")
+}
+

@@ -3132,3 +3132,34 @@
   registry so #1476 can retire legacy pinning without grep-and-pray. Plan
   preserves PR #1514's documented `userspace_fallback_stats` mixed-version
   compatibility exception verbatim. Pending Codex + AGY plan review.
+- **Timestamp**: 2026-05-25T15:10Z
+- **Action**: #1516 (sub-#1451 S1) — implement plan v2 migrating
+  pkg/grpcapi off legacy dataplane.DataPlane. New
+  pkg/grpcapi/runtime.go declares grpcRuntime narrow interface plus
+  userspaceStatusProvider/userspaceControlProvider/sessionCursorIterator
+  named providers. server.go field type Config.DP and Server.dp swap
+  dataplane.DataPlane → grpcRuntime; inline anonymous interface
+  assertions in server.go, server_show_forwarding.go, server_show.go
+  collapse to the named provider assertions. server_sessions.go
+  sessionIteratorFrom renamed to sessionCursorIterator and moved to
+  runtime.go. AGY r1 PLAN-NEEDS-MAJOR finding (userspace cursor
+  pagination silently degrades because LegacyDataPlaneAdapter does
+  not implement IterateSessionsFrom/V6From) addressed by adding
+  delegation methods on LegacyDataPlaneAdapter (assert embedded
+  a.DataPlane against cursor-iterator interface and forward to
+  bpfShim). Canary allowlist + retirement docs table updated:
+  pkg/grpcapi/runtime.go added, pkg/grpcapi/server.go removed (no
+  longer imports pkg/dataplane).
+- **File(s)**: pkg/grpcapi/runtime.go (new), pkg/grpcapi/server.go,
+  pkg/grpcapi/server_sessions.go, pkg/grpcapi/server_show.go,
+  pkg/grpcapi/server_show_forwarding.go,
+  pkg/dataplane/userspace/legacy_dataplane.go,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  docs/pr/1373-retire-ebpf-dataplane/README.md,
+  docs/pr/1516-grpcapi-migration/plan.md (v2).
+- **Validation**: GOCACHE/GOTMPDIR full Go suite green (30+ packages),
+  pkg/grpcapi 5/5 race flake check clean, cargo --release build
+  clean (114 pre-existing warnings only). Boundary canary tests
+  green. Smoke matrix delegated to serialized smoke-runner singleton
+  per feedback_smoke_serialized_single_agent rule (AWAITING-SMOKE
+  marker posted on PR).

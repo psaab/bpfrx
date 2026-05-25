@@ -1,6 +1,8 @@
 # #1516 plan — migrate `pkg/grpcapi` off legacy `dataplane.DataPlane`
 
-**Status:** DRAFT v1 — pending adversarial plan review.
+**Status:** v2 — folds AGY round-1 PLAN-NEEDS-MAJOR finding on
+userspace cursor pagination plus the omitted canary/docs touchpoint.
+Codex round-1 retry pending (`task-mplca3od-d7w9gy`).
 
 ## 1. Issue framing
 
@@ -203,6 +205,38 @@ type satisfies `grpcRuntime` plus the optional providers because
 `dataplane.DataPlane` is a strict superset of `grpcRuntime`'s method
 set. No daemon-side edit is needed. (Compile will catch it if I'm
 wrong about the superset claim.)
+
+### 4.5 Userspace cursor-pagination repair (AGY r1 finding)
+
+AGY r1 found that the cursor pagination type assertion at
+`server_sessions.go:56` silently fails under the userspace dataplane
+because `LegacyDataPlaneAdapter` embeds the `dataplane.DataPlane`
+interface, not the concrete `*dataplane.Manager`. `IterateSessionsFrom`
+and `IterateSessionsV6From` are concrete methods on `*Manager` that
+are NOT part of the `dataplane.DataPlane` interface, so Go's method
+promotion does not lift them onto `LegacyDataPlaneAdapter`. Today the
+gRPC server's cursor pagination handler in
+`server_sessions.go:getSessionsCursor` already falls through to the
+legacy full-table scan when the assertion fails — under userspace
+this is the silent default.
+
+For boundary tightening to be honest, this fallback should be
+visible-or-fixed. The plan now ships the fix: add
+`IterateSessionsFrom` and `IterateSessionsV6From` as delegation
+methods on `LegacyDataPlaneAdapter`, asserting the embedded
+`a.DataPlane` against the cursor-iterator interface and forwarding
+to `bpfShim`. If the embedded interface field is non-nil and the
+underlying concrete value is `*dataplane.Manager`, the assertion
+succeeds and the cursor path runs as designed. If it does not (e.g.
+the userspace manager is constructed without a bpfShim, as in some
+unit tests), the method returns a typed error and `getSessionsCursor`
+still falls through to `getSessionsLegacy`.
+
+The added methods are paint-by-numbers delegation; they do not
+introduce any new dataplane behavior. They are intentionally scoped
+to this sub-issue because the alternative (extending the
+`dataplane.DataPlane` interface) widens the very surface #1516 is
+narrowing.
 
 ## 5. Public API preservation
 

@@ -1727,9 +1727,7 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 
 	case "buffers":
 		if s.dp != nil {
-			if provider, ok := s.dp.(interface {
-				Status() (dpuserspace.ProcessStatus, error)
-			}); ok {
+			if provider, ok := s.dp.(userspaceStatusProvider); ok {
 				status, err := provider.Status()
 				if err != nil {
 					fmt.Fprintf(&buf, "Userspace buffer metrics unavailable: %v\n", err)
@@ -1783,9 +1781,7 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 
 	case "buffers-detail":
 		if s.dp != nil {
-			if provider, ok := s.dp.(interface {
-				Status() (dpuserspace.ProcessStatus, error)
-			}); ok {
+			if provider, ok := s.dp.(userspaceStatusProvider); ok {
 				status, err := provider.Status()
 				if err != nil {
 					fmt.Fprintf(&buf, "Userspace buffer metrics unavailable: %v\n", err)
