@@ -1,5 +1,32 @@
 # Action Log
 
+## 2026-05-25 — #1529 plan v3 (Antigravity r2 build-breaker fix)
+
+- **Timestamp**: 2026-05-25T05:30:00Z
+  - **Action**: v3 plan addresses Antigravity r2 PLAN-NEEDS-MINOR.
+    The §1504 paragraph in `docs/pr/1373-retire-ebpf-dataplane/README.md`
+    is ALSO canary-pinned by
+    `TestRetirementBoundaryDocsMentionShimEscapeAssumptions`
+    (pinned string "does not recurse"). v2's proposed rewrite
+    would have broken the build. v3 defers §1504 rewrite to
+    #1527/#1528 along with §1475. Only lines 65 and 292 (not
+    canary-pinned) are edited in-place; line 65 split into two
+    sentences to fix grammar, line 292 explicitly includes the
+    `- ` bullet marker.
+  - **File(s)**: `docs/pr/1529-dpdk-docs-sweep/plan.md`, `_Log.md`
+
+## 2026-05-24 — #1529 plan v2 (Codex r1 fixes)
+
+- **Timestamp**: 2026-05-25T05:00:00Z
+  - **Action**: v2 plan addresses Codex r1 PLAN-NEEDS-MAJOR six
+    findings: non-canary-pinned DPDK text now has explicit
+    rewrites; acceptance-criterion 4 deferral now documented as
+    staged exception; EDIT row ambiguity eliminated;
+    docs/refactoring-audit.md annotate (not drop);
+    historical-classification wording clarified; git diff gate
+    uses --name-only.
+  - **File(s)**: `docs/pr/1529-dpdk-docs-sweep/plan.md`
+
 ## 2026-05-24 — #1529 plan v1 drafted
 
 - **Timestamp**: 2026-05-24T17:00:00Z

@@ -1,8 +1,8 @@
 # #1529 — DPDK Docs Sweep (Phase 4 of #1525)
 
-**Status:** DRAFT v2 — addressing Codex r1 PLAN-NEEDS-MAJOR
-findings. Antigravity r1 PLAN-READY with two minor recommendations
-incorporated.
+**Status:** DRAFT v3 — addressing Antigravity r2 PLAN-NEEDS-MINOR
+findings (build-breaker fix + two prose-quality findings). Codex r2
+infra failure (sandbox cannot spawn); pending Codex r3 verification.
 
 ## Issue framing
 
@@ -84,7 +84,7 @@ Every file with DPDK references (grep result: 42 files in `docs/` +
 |------|-------------|-------|
 | `README.md` | EDIT | Line 327: remove "userspace/DPDK replacements exist" — change to "userspace replacements exist." DPDK is retired in #1525; replacement is not "pending." |
 | `CLAUDE.md` | EDIT | Lines 168-169: delete `dpdk_worker/` and `pkg/dataplane/dpdk/` rows from code-layout table. Add brief "Retired: DPDK dataplane retired in #1525" bullet near the dataplane discussion. |
-| `docs/pr/1373-retire-ebpf-dataplane/README.md` | **PARTIAL EDIT + DEFERRED canary section** | The retirement-boundary canary `TestRetirementBoundaryDocsMentionDPDKPolicy` in `pkg/dataplane/retirement_boundary_canary_test.go:1771-1798` **requires the following 7 exact strings to be present** in this file: `## #1475 DPDK Backend Policy`, `DPDK remains a separately supported backend`, `outside the eBPF source-removal path`, `` `pkg/dataplane/dpdk` ``, `` `cmd/xpfd/main.go` ``, `` `-tags dpdk` ``, ``root `DataPlane` ``. The `#1475 DPDK Backend Policy` section rewrite is **explicitly deferred to #1527/#1528** as a staged exception (see "Staged exception" subsection below); the issue's acceptance-criterion 4 cannot be satisfied in full inside this PR without coupling to a canary test edit, which violates this PR's pure-text scope. Non-canary-pinned DPDK text in the same file IS in scope: (a) **Line 65** ("the DPDK backend import stays limited to `cmd/xpfd/main.go` for backend registration") → rewrite to past tense annotation: "The DPDK backend import allowlist applied while the backend existed and is retired in #1525; #1527 removes the registration import." (b) **Lines 148-154** §1504 paragraph mentioning "DPDK remains governed by the #1475 backend policy" → rewrite to "DPDK is retired in #1525; the `#1475 DPDK Backend Policy` section below is preserved verbatim only because the retirement-boundary canary pins its text. The shim escape canary continues not to recurse into `pkg/dataplane/dpdk` because that package is being deleted in #1528." (c) **Lines 292-296** §1451 bullet about "DPDK still implements both `DataPlane` and `RuntimeDataPlane`" → rewrite to "DPDK was retired in #1525; the canary-pinned policy section below documents the pre-retirement contract." (d) **Line 333 "Shared Non-Goals"** bullet ("Do not use the DPDK worker as a correctness reference") — leave as-is; it remains a useful historical anchor for the parallel #1373 work that is still ongoing. The PR also adds a brief leading retirement note at the top of the file pointing at #1525. |
+| `docs/pr/1373-retire-ebpf-dataplane/README.md` | **PARTIAL EDIT + DEFERRED canary section** | The retirement-boundary canary `TestRetirementBoundaryDocsMentionDPDKPolicy` in `pkg/dataplane/retirement_boundary_canary_test.go:1771-1798` **requires 7 exact strings to be present** in this file (line 1781-1787): `## #1475 DPDK Backend Policy`, `DPDK remains a separately supported backend`, `outside the eBPF source-removal path`, `` `pkg/dataplane/dpdk` ``, `` `cmd/xpfd/main.go` ``, `` `-tags dpdk` ``, ``root `DataPlane` ``. A second canary `TestRetirementBoundaryDocsMentionShimEscapeAssumptions` (line 1800-1846) **pins additional strings** including `## #1504 Userspace Shim Boundary Escape Assumptions`, `does not recurse`, `` positional `dataplane.Manager` ``, `` `import "C"` ``, `` `//go:linkname` ``, `` `//go:cgo_*` ``, `` `.s` / `.S` ``, `` `.syso` ``, `` `*_bpfel.go` ``, `` `//go:build 386 \|\| amd64` ``, `` `pkg/dataplane/loader_stub.go` ``, `` `//go:build ignore` ``, plus iterated package roots and allowlist paths. A third canary `TestRetirementBoundaryDocsMentionLegacyImportAllowlist` (line 1848-1867) pins every key in `legacyDataplaneImportAllowlist`. **Both the `#1475 DPDK Backend Policy` and the `#1504 Userspace Shim Boundary Escape Assumptions` sections are deferred** to #1527/#1528 because rewriting either breaks a canary. Non-canary-pinned DPDK text in the same file IS in scope: <br><br>**(a) Line 65** (single sentence inside an existing paragraph reading "they may not import `` `github.com/cilium/ebpf` ``, and the DPDK backend import stays limited to `` `cmd/xpfd/main.go` `` for backend registration.") → split into two sentences and reframe past-tense: replace text after `` `github.com/cilium/ebpf` `` with: ". The DPDK backend import was historically allowed only at `` `cmd/xpfd/main.go` `` for backend registration; that backend is retired in #1525 and #1527 removes the registration import." The replacement keeps the surrounding paragraph fluent and avoids the v2 "and The..." grammar mistake Antigravity r2 flagged. <br><br>**(b) Line 292 bullet** ("- DPDK still implements both `` `DataPlane` `` and `` `RuntimeDataPlane` ``. That compatibility is intentionally confined to `` `pkg/dataplane/dpdk` ``, with the only direct DPDK backend import outside the package being the blank registration import in `` `cmd/xpfd/main.go` ``. Non-`` `-tags dpdk` `` binaries fail DPDK startup explicitly rather than running a no-op stub.") → replace **the entire 5-line bullet** with: "- DPDK was retired in #1525. The pre-retirement contract — that DPDK implemented both `` `DataPlane` `` and `` `RuntimeDataPlane` `` and that the blank registration import lived at `` `cmd/xpfd/main.go` `` — is preserved in the canary-pinned `` #1475 DPDK Backend Policy `` section below as a historical anchor; #1527 removes the registration import and #1528 deletes the backend package." Note the leading `- ` bullet marker (Antigravity r2 finding 3). <br><br>**(c) §1504 paragraph at lines 148-154** is NOT edited in this PR. The proposed v2 rewrite removed the canary-pinned string "does not recurse" — Antigravity r2 finding 1 (build-breaker). Defer this paragraph's rewrite to #1527/#1528 along with the #1475 section. <br><br>**(d) Line 333 "Shared Non-Goals"** bullet ("Do not use the DPDK worker as a correctness reference") — leave as-is; useful historical anchor. <br><br>**(e)** PR also adds a brief leading retirement note (Antigravity r1 recommended `> [!IMPORTANT]` blockquote) **above** the existing intro of the file, immediately under the file's H1 / first paragraph, pointing at #1525. |
 | `docs/dataplane-decision-dpdk-vs-vpp.md` | OUT OF SCOPE (Chain A #1531) | Do not touch. |
 | `docs/dpdk-dataplane.md` | OUT OF SCOPE (Chain A #1531) | Do not touch. |
 | `docs/engineering-style.md` | (not in scope) | grep returned no DPDK references; sanity-confirmed. |
@@ -318,8 +318,13 @@ file, the assumption is violated and the full smoke matrix runs per
    accidental touch broke anything. (Both should pass instantly since
    nothing changed.)
 6. **Go test sanity:** `go test ./pkg/dataplane/...` to confirm
-   retirement boundary canary still passes. This catches an
-   accidental break if a canary-pinned string was removed.
+   all three retirement-boundary canaries still pass:
+   `TestRetirementBoundaryDocsMentionDPDKPolicy`,
+   `TestRetirementBoundaryDocsMentionShimEscapeAssumptions`,
+   `TestRetirementBoundaryDocsMentionLegacyImportAllowlist`. This
+   catches an accidental break if a canary-pinned string was
+   removed. Antigravity r2 caught this exact regression in v2; v3
+   addresses it by deferring the §1504 paragraph rewrite as well.
 
 ### Smoke-skip rationale
 
@@ -338,6 +343,33 @@ Documentation correctness work has no runtime side effect.
 - Auto-generated `docs/refactoring-audit-current.txt`
 - Historical records: `docs/issues/*`, `docs/session-history.md`,
   merged-PR `docs/pr/*/plan.md` and `*-review.md`
+
+## Round 2 reviewer findings (response)
+
+**Antigravity r2: PLAN-NEEDS-MINOR.** Three findings, all addressed
+in v3:
+
+1. **Build-breaker.** v2's proposed §1504 rewrite removed the
+   canary-pinned string "does not recurse" from
+   `docs/pr/1373-retire-ebpf-dataplane/README.md`, which
+   `TestRetirementBoundaryDocsMentionShimEscapeAssumptions`
+   (`pkg/dataplane/retirement_boundary_canary_test.go:1809-1822`)
+   pins. **Fixed in v3:** the §1504 paragraph is now ALSO deferred
+   to #1527/#1528. The plan's per-file row now documents both the
+   `#1475` AND `#1504` deferrals plus the third canary
+   `TestRetirementBoundaryDocsMentionLegacyImportAllowlist`. Only
+   non-canary-pinned text (lines 65 and 292) is edited in-place.
+2. **Grammar in line-65 rewrite.** v2's verbatim insertion produced
+   "and The DPDK backend...". **Fixed in v3:** the rewrite splits
+   into two sentences before the DPDK clause.
+3. **Missing `- ` bullet marker for line 292.** v2's rewrite text
+   omitted the leading list bullet. **Fixed in v3:** the
+   replacement explicitly includes `- `.
+
+**Codex r2: REVIEW-BLOCKED (sandbox failure).** Codex could not
+spawn its read sandbox and explicitly refused to verdict without
+verification. A r3 dispatch will be made after this v3 push so
+Codex can verify the build-breaker fix.
 
 ## Round 1 reviewer findings (response)
 
