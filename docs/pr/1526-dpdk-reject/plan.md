@@ -2,7 +2,43 @@
 
 ## Status
 
-DRAFT v1 — pending adversarial plan review
+DRAFT v2 — addressing round-1 plan-review findings
+
+## Round-1 verdicts
+
+- Codex (`task-mpkqnvds-b7z0tu`): PLAN-NEEDS-MAJOR
+  - Finding 1: validator ordering — DPDK reject should fire
+    BEFORE the existing class-of-service / three-color-policer /
+    policy-scheduler strict validators so the operator's first
+    semantic error is the migration message, not an unrelated CoS
+    error.
+  - Finding 2: don't fold parse-success coverage and commit-time
+    rejection into one test. Keep `TestDPDKConfig` (or a renamed
+    parse-only variant) asserting the AST still maps DPDK schema;
+    add a separate commit/compile rejection test with the exact
+    error text.
+  - Finding 3: CLI completion question cannot remain open — must
+    be resolved before implementation. (Antigravity v1 confirms
+    the answer: no static `dpdk` completion in `pkg/cmdtree`. v2
+    closes this question.)
+- Antigravity (`adversarial-review-mpkqo8v5-2m53xh`): PLAN-NEEDS-MINOR
+  - Finding 1 (CRITICAL): daemon startup behavior is NOT "daemon
+    refuses to start." Per `pkg/daemon/daemon_run.go:85-88` and
+    `daemon_apply.go:32`, store-load errors are non-fatal: the
+    daemon logs a warning and proceeds with empty active config,
+    keeping the management plane alive so the operator can
+    `rollback` or hand-edit. v2 corrects this.
+  - Findings 2-10: confirm placement / single-error-site / apply-
+    groups / sub-stanza / error-wording / completion / ordering
+    decisions in v1 were correct; v2 carries them forward
+    unchanged.
+
+Both reviewers converge on: validator placement is right
+(compiler.go, not backend registration); single error site
+(`compileExpanded`) covers `CommitCheck` + `Commit` + daemon
+load; tab completion needs no change. The two findings v2 must
+address are: (a) validator ordering, (b) corrected daemon startup
+behavior. Plus the test-split refinement from Codex.
 
 ## Issue framing
 
@@ -22,78 +58,86 @@ Per issue body acceptance criteria:
 - `set system dataplane-type dpdk` MUST still parse (so a stored
   `load merge` / `load override` flat-set file does not syntax-error
   on a pre-retirement config).
-- Commit MUST return:
+- Commit MUST return the verbatim message:
   `"the DPDK dataplane backend has been retired; use 'set system
   dataplane-type userspace' (see #1525)"`.
-- The error surfaces through the same commit-validation path used
-  by other commit-time rejections, so CLI, gRPC, and REST all see
+- Error surfaces through the same commit-validation path used by
+  other commit-time rejections, so CLI, gRPC, and REST all see
   identical text.
 - Unit tests cover: clean parse + uncommitted dpdk config; commit
   error containing retirement text; no warning when `dpdk` does
   not appear in the config.
-- No source under `dpdk_worker/` or `pkg/dataplane/dpdk/` is
-  deleted. `cmd/xpfd/main.go` still blank-imports
-  `pkg/dataplane/dpdk` (that is Phase 2, #1527 — Chain B's surface).
+- No source under `dpdk_worker/` or `pkg/dataplane/dpdk/` deleted.
+- `cmd/xpfd/main.go` still blank-imports `pkg/dataplane/dpdk`
+  (Phase 2 / Chain B's surface).
 
 ## Honest scope/value framing
 
 Small Go-side config-compiler change. ~30 LOC of new code plus
-unit-test flips. Value is operator-experience correctness: when a
-binary built after this PR refuses DPDK, the operator sees the
-migration message at commit time rather than at daemon startup (or
-worse, after upgrade installs a binary that runs the DPDK stub
-backend that has been failing closed since #1475).
+test additions and a couple of test flips. Value is operator-
+experience correctness: when a binary built after this PR refuses
+DPDK, the operator sees the migration message at commit time
+rather than at daemon startup (or worse, after upgrade installs a
+binary that runs the DPDK stub backend that has been failing
+closed since #1475).
 
-If reviewers conclude the error message wording is wrong (e.g.
-should also link to `docs/dpdk-dataplane.md` for context after PR
-#1 rewrites it as a retirement notice), that is plan-NEEDS-MINOR.
-
-PLAN-KILL is appropriate if reviewers identify that the reject
-belongs in a different code site (e.g. at the dataplane backend
-registration layer in `pkg/dataplane/dataplane.go`, not in
-`pkg/config/compiler.go`). The current plan chooses the
-compiler-side reject because that is where commit-time validation
-lives and where the existing pattern (`validateClassOfServiceStrict`,
-`validateThreeColorPolicersStrict`,
-`validatePolicySchedulerReferencesStrict`) already runs.
+PLAN-KILL is appropriate if reviewers identify the reject belongs
+in a fundamentally different code site. v1 surfaced this; both
+reviewers agreed compiler-side reject is correct.
 
 ## What's already shipped / partially relevant
 
 - `pkg/config/compiler.go:949-963` defines `dataplaneTypeDPDK`,
   `effectiveDataplaneType()`, `validDataplaneType()`. The constant
-  stays; the validator accepts dpdk as a legal name (parse continues
-  to succeed); a new strict validator rejects it at compile time.
+  stays; the validator accepts dpdk as a legal name (parse
+  continues to succeed); a new strict validator rejects it at
+  compile time.
 - `pkg/config/compiler_system.go:236-242` parses `DPDKConfig`
-  sub-tree. This stays as-is. Parse must still succeed (acceptance
+  sub-tree. Stays as-is. Parse must still succeed (acceptance
   criterion).
 - `pkg/config/compiler_system.go:373-388` `compileSystemDataplaneType`
-  is where `validDataplaneType()` is currently called for the
-  unknown-value rejection (`vpp`, `mystery`). DPDK is a KNOWN value
-  in that sense — parse succeeds. The new strict reject runs
-  AFTER the full tree is compiled so the operator sees one clean
-  retirement message rather than a confusing "unknown" message.
-- Existing pattern: `CompileConfig` calls `validateXxxStrict(cfg)`
-  early (compiler.go:218-225). The new
-  `validateDataplaneTypeStrict(cfg)` slots in immediately after
-  those calls and returns a hard error if
-  `cfg.System.DataplaneType == "dpdk"`.
-- `pkg/configstore/store.go:653, 671` — `CommitCheck()` and
-  `Commit()` both call `compileTree()` which calls `CompileConfig()`.
-  A hard error from `CompileConfig` surfaces in both code paths.
-  No new wiring in configstore, grpcapi, cli — they already
-  propagate the error.
+  is where `validDataplaneType()` is called for unknown-value
+  rejection (`vpp`, `mystery`). DPDK is a KNOWN value here —
+  parse succeeds. The new strict reject runs after full tree
+  compile so the operator sees one clean retirement message
+  rather than a confusing "unknown" message.
+- Existing strict-validator pattern: `validateClassOfServiceStrict`,
+  `validateThreeColorPolicersStrict`,
+  `validatePolicySchedulerReferencesStrict` are called in
+  `compileExpanded`. The new `validateDataplaneTypeStrict(cfg)`
+  slots in BEFORE them (v2 change vs v1).
+- `pkg/configstore/store.go` `CommitCheck()` and `Commit()` both
+  call `compileTree()`, which routes to `CompileConfig()` /
+  `CompileConfigForNode()`, both of which call `compileExpanded()`
+  (per Antigravity v1 verification at compiler.go:31-54). A
+  hard error from `compileExpanded` surfaces in both code paths.
+- `pkg/daemon/daemon_run.go:85-88`: `d.store.Load()` errors are
+  logged as warnings and do NOT prevent daemon startup. Replay
+  of a stored DPDK config produces an empty-active-config running
+  daemon, NOT a refused startup (v2 correction vs v1).
+- `pkg/config/ast.go:1385`: `dataplane-type` has `args: 1` with
+  no `valueHint`. No static `dpdk` tab completion exists in
+  `pkg/cmdtree` (per Antigravity v1 verification). No CLI
+  completion change required.
 
-## Concrete design
+## Concrete design (v2)
 
 ### New strict validator
 
-In `pkg/config/compiler.go`, add:
+In `pkg/config/compiler.go`:
 
 ```go
 // validateDataplaneTypeStrict rejects retired dataplane backends
 // at commit time. The parse path accepts the value so a stored
 // pre-retirement config does not syntax-error on `load merge`;
 // the commit-time reject is what tells the operator to migrate.
+//
+// Placement: runs BEFORE the other strict validators in
+// compileExpanded so that an operator editing a candidate that
+// has BOTH a retired dataplane-type AND an unrelated malformed
+// CoS profile sees the retirement message first (it is the
+// documented migration path; the CoS error becomes relevant
+// after migration).
 func validateDataplaneTypeStrict(cfg *Config) error {
     if cfg == nil {
         return nil
@@ -108,132 +152,176 @@ func validateDataplaneTypeStrict(cfg *Config) error {
 }
 ```
 
-Call site, in `CompileConfig` after the existing strict validators:
+### Call-site ordering (v2 change from v1)
+
+`compileExpanded` (the shared function called by both
+`CompileConfig` and `CompileConfigForNode`) currently runs:
 
 ```go
-if err := validatePolicySchedulerReferencesStrict(cfg); err != nil {
-    return nil, err
-}
-if err := validateDataplaneTypeStrict(cfg); err != nil {  // new
-    return nil, err
-}
-if warnings := ValidateConfig(cfg); len(warnings) > 0 {
-    // ...
-}
+validateClassOfServiceStrict(cfg.ClassOfService)         // #1
+validateThreeColorPolicersStrict(cfg.Firewall.ThreeColorPolicers) // #2
+validatePolicySchedulerReferencesStrict(cfg)             // #3
+ValidateConfig(cfg)                                       // warnings, non-fatal
 ```
+
+v2 inserts the DPDK reject FIRST:
+
+```go
+if err := validateDataplaneTypeStrict(cfg); err != nil {
+    return nil, err  // first semantic error operator sees
+}
+if err := validateClassOfServiceStrict(...); err != nil {
+    return nil, err
+}
+// ... existing strict validators ...
+```
+
+Codex finding 1: this ordering ensures the operator gets the
+migration message before any unrelated structural errors. The
+DPDK reject is the documented migration; CoS errors become
+relevant only after migration.
 
 ### Error message wording
 
-Verbatim from #1526 acceptance criteria, with two punctuation
-cleanups:
+Verbatim from #1526 acceptance criteria:
 
 ```
 the DPDK dataplane backend has been retired; use 'set system dataplane-type userspace' (see #1525)
 ```
 
-Single-line, no trailing period, parenthetical issue ref — matches
-the style of the existing eBPF deprecation warning at
-compiler.go:386-391 (multiline string built via `+`).
+Single-line, no trailing period, parenthetical issue ref. Tests
+will compare the exact string (Codex finding: exact wording per
+acceptance text).
 
-The single-quoted `'set system dataplane-type userspace'` is a Junos
-CLI command verbatim and stays single-quoted (matches Junos error
-message style).
+### Test plan (split per Codex finding 2)
 
-### What `set system dataplane-type userspace` selects
+Five new tests under `pkg/config/`:
 
-The userspace AF_XDP dataplane (`userspace-dp/`). This is also the
-default — operators can either explicitly set it or simply remove
-the `dataplane-type` line. The error message recommends explicit
-set because:
+1. **TestDataplaneTypeDPDKParsesCleanly** — asserts pure parse
+   succeeds. Calls `ParseSetCommand` + `tree.SetPath` for
+   `set system dataplane-type dpdk` and confirms no error from
+   either. (Documents the "parse still succeeds" acceptance
+   criterion in a separate test from the compile rejection.
+   Codex finding 2 explicitly asks for this separation.)
 
-1. An operator currently running `dataplane-type dpdk` wants to be
-   sure their config still works after they edit it.
-2. Setting it explicitly is the most direct "do this" instruction.
-
-`dataplane-type ebpf` is also still valid (deprecated, warning,
-not error) but is NOT recommended in the error message because the
-operator's migration path is forward to userspace, not sideways to
-the legacy eBPF path. The eBPF deprecation message at
-compiler.go:386-391 already covers that case.
-
-### Test plan (new tests in pkg/config)
-
-1. **TestDataplaneTypeDPDKRejectedAtCommit** — flat-set form:
+2. **TestDataplaneTypeDPDKRejectedAtCommit** — flat-set form:
    ```
    set system dataplane-type dpdk
    set system dataplane cores 2-5
    ```
-   asserts `CompileConfig` returns an error and the error message
-   contains "the DPDK dataplane backend has been retired" AND
-   "set system dataplane-type userspace" AND "#1525".
+   builds a tree, calls `CompileConfig(tree)`, asserts the
+   returned error is non-nil and the message is BYTEWISE EQUAL to
+   the acceptance text (exact compare, not substring). This is
+   the operator-visible contract; we test it with the strongest
+   possible assertion.
 
-2. **TestDataplaneTypeDPDKRejectedAtCommitHierarchical** — same
-   assertion via `NewParser(`...`)` with hierarchical syntax,
-   confirming both AST shapes hit the reject.
+3. **TestDataplaneTypeDPDKRejectedAtCommitHierarchical** — same
+   assertion via `NewParser(`system { dataplane-type dpdk; }`)`
+   to confirm the hierarchical AST shape hits the same reject.
 
-3. **TestDataplaneTypeDPDKParsesCleanly** — asserts that parsing
-   alone succeeds (`tree.SetPath` does not error). The reject
-   fires at compile time, not at parse time. This documents the
-   "still parses" acceptance criterion explicitly.
+4. **TestDataplaneTypeDPDKRejectedAtCommitFiresBeforeCoS** —
+   builds a candidate with BOTH `dataplane-type dpdk` AND a
+   malformed CoS (e.g. a scheduler-map whose buffer-size percent
+   exceeds 100%). Asserts the returned error contains the DPDK
+   retirement text, NOT the CoS error. Documents the v2 ordering
+   choice (Codex finding 1).
 
-4. **TestDataplaneTypeUserspaceNoWarning** — asserts that an
-   explicit `dataplane-type userspace` config does NOT carry the
-   retirement warning in `cfg.Warnings`. (Existing test
-   `TestDataplaneTypeNonLegacyValuesDoNotWarnDeprecatedCompatibility`
-   covers `userspace` already; this is an additional explicit check.)
+5. **TestDataplaneTypeDPDKRejectedAtCommitViaApplyGroups** —
+   builds a candidate where an apply-groups stanza injects
+   `dataplane-type dpdk` into the resolved config. Calls
+   `CompileConfigForNode(tree, 0)`. Asserts the post-expansion
+   compile hits the same reject. Documents the apply-groups /
+   `${node}` interaction (open question 6 in v1 → closed in v2).
 
-5. **TestDataplaneTypeEBPFNotAffected** — asserts that an
-   explicit `dataplane-type ebpf` config still compiles cleanly
-   with only the eBPF deprecation warning, NOT the DPDK
-   retirement error. (Regression guard on the eBPF path.)
+Existing tests to flip / refine (Codex finding 2 ⇒ keep parse
+coverage):
 
-### Existing tests to flip
+- `TestDPDKConfig` at `pkg/config/parser_ast_test.go:2622` —
+  currently asserts BOTH that the lines parse AND that
+  `CompileConfig` succeeds with populated `cfg.System.DPDKDataplane`
+  fields. v2 splits this:
+  - **Rename** to `TestDPDKConfigParsesAndCompilesToSchema` —
+    drop the final `CompileConfig` call and the
+    `cfg.System.DataplaneType == "dpdk"` assertion (those would
+    fail post-rejection). Keep the parse loop (`tree.SetPath`
+    for every line) and the assertion that no parse error
+    occurs. This documents that flat-set parse of DPDK syntax
+    survives the retirement.
+  - Add a sibling `TestDPDKConfigCompileRejects` that takes the
+    same lines, builds the tree, calls `CompileConfig`, and
+    asserts the rejection. (Effectively the same as test #2
+    above but reusing the comprehensive DPDK schema fixture so
+    we keep coverage of the `compileDPDKDataplane` schema path
+    end-to-end through the new reject.)
 
-The issue body names two:
+- `TestDataplaneTypeNonLegacyValuesDoNotWarnDeprecatedCompatibility`
+  at `pkg/config/parser_system_test.go:1425` — currently loops
+  over `["userspace", "dpdk"]`. v2 drops `"dpdk"` from the loop
+  (it now hard-errors; the warning-check is unreachable for that
+  value). The DPDK rejection is covered by tests #2 and #3 above
+  and by `TestDPDKConfigCompileRejects`.
 
-- `pkg/config/parser_ast_test.go:2622` `TestDPDKConfig` —
-  currently expects `CompileConfig` to succeed with DPDK and
-  inspects `cfg.System.DPDKDataplane.Cores` etc. Flip to:
-  - either delete entirely (the DPDK schema is unobservable to
-    operators after this PR), OR
-  - rename to `TestDPDKConfigParsesButCommitRejects` and assert
-    that `tree.SetPath(...)` succeeds for every line then
-    `CompileConfig(tree)` returns an error containing the
-    retirement text.
-  - Plan picks the latter. It documents that flat-set parse
-    survives the retirement (which is the operator-visible
-    contract), and it preserves the test's coverage of the
-    `compileDPDKDataplane` parser. The `DPDKDataplane` field
-    assertions are dropped since `cfg` is nil on error.
+### Daemon startup replay (v2 correction)
 
-- `pkg/config/parser_system_test.go:1425`
-  `TestDataplaneTypeNonLegacyValuesDoNotWarnDeprecatedCompatibility`
-  — currently loops over `["userspace", "dpdk"]` and asserts
-  no eBPF deprecation warning. Flip: drop `"dpdk"` from the loop
-  (it now hard-errors, so the warning-check is no longer
-  reachable for that value). Add a separate
-  `TestDataplaneTypeDPDKRejectedAtCommit` (covered above).
+When a node carrying a stored active config with
+`dataplane-type dpdk` is upgraded to a binary built from this PR:
+
+1. `xpfd` starts.
+2. `d.store.Load()` at `pkg/daemon/daemon_run.go:85` calls
+   through to `compileTree` to validate the stored config.
+3. The new `validateDataplaneTypeStrict` rejects.
+4. Per the existing #127 design, `d.store.Load()` returns an
+   error which the daemon LOGS AS A WARNING and proceeds:
+   ```go
+   if err := d.store.Load(); err != nil {
+       slog.Warn("failed to load config from db", "err", err)
+   }
+   ```
+5. The daemon attempts to bootstrap from the text config file
+   (`daemon_apply.go:32`). If that also carries `dpdk`, same
+   warning, same proceed.
+6. The daemon comes up with NO active config: no interfaces
+   programmed, no firewall rules applied, no NAT, no policy.
+   The management plane (CLI / gRPC / REST) is reachable
+   because it does not depend on dataplane config.
+7. The operator connects via CLI, sees the rejection at next
+   `commit check`, hand-edits the candidate to remove
+   `dataplane-type dpdk`, commits, and the cluster is back.
+
+This is the desirable behavior per Antigravity finding: the
+management plane stays alive for recovery rather than crashing
+the daemon. v1's claim "daemon refuses to start" was wrong;
+v2 corrects it.
+
+Operational note: the operator should NOT panic when the
+upgraded daemon comes up "empty." The expected recovery flow is:
+
+```
+ssh fw-node
+cli
+configure
+delete system dataplane-type
+commit
+```
+
+(or `set system dataplane-type userspace` if the operator wants
+to keep an explicit dataplane-type line.) The candidate config is
+already populated from the previously-active config because
+configstore loads candidate from disk separately from active —
+this needs verification in the manual sanity test.
 
 ### What does NOT change in this PR
 
-- `pkg/dataplane/dpdk/manager.go` — unchanged. The package still
-  builds and still self-registers. Phase 2 (#1527) deletes the
-  registration.
-- `cmd/xpfd/main.go` — unchanged. Still blank-imports the dpdk
-  package. Phase 2 (#1527) deletes the import.
-- `dpdk_worker/` — unchanged. Phase 3 (separate sub-issue) deletes
-  the source.
-- `pkg/config/types.go` — `DPDKConfig`, `DPDKAdaptiveConfig`,
-  `DPDKPort` stay. Phase 3 deletes them.
-- `pkg/config/compiler_system.go:227-246` — the `case "dataplane":
-  ... case dataplaneTypeDPDK:` branch stays so a stored config
-  parses cleanly even if a `set system dataplane cores 2-5` line
-  is also present. The reject fires on the type, not on the
-  sub-stanza presence.
-- The retirement-boundary canary
-  `pkg/dataplane/retirement_boundary_canary_test.go` —
-  `dpdkBackendImportAllowlist` still allows the xpfd main blank
-  import. Phase 2 tightens this.
+(unchanged from v1):
+- `pkg/dataplane/dpdk/manager.go`, `cmd/xpfd/main.go` —
+  Phase 2 (Chain B).
+- `dpdk_worker/`, `pkg/dataplane/dpdk/`, `pkg/config/types.go`
+  `DPDKConfig`/`DPDKAdaptiveConfig`/`DPDKPort` — Phase 3.
+- `pkg/config/compiler_system.go:227-246` dpdk compile branch —
+  remains so parse-then-reject works for stored configs.
+- Retirement-boundary canary — Phase 2.
+- CLI tab completion in `pkg/cmdtree` — no change (Antigravity
+  confirms no static dpdk completion exists).
 
 ## Public API preservation
 
@@ -242,80 +330,81 @@ The issue body names two:
 | Parse `set system dataplane-type dpdk` | succeeds | succeeds |
 | `tree.SetPath(["system", "dataplane-type", "dpdk"])` | succeeds | succeeds |
 | `CompileConfig(tree)` with DPDK | succeeds, `cfg.System.DataplaneType == "dpdk"` | hard error |
+| `CompileConfigForNode(tree, n)` with DPDK | succeeds | hard error |
 | `Store.CommitCheck()` with DPDK candidate | succeeds | hard error |
-| `Store.Commit()` with DPDK candidate | succeeds (but daemon refuses load) | hard error at commit |
+| `Store.Commit()` with DPDK candidate | succeeds at validation; failed at apply | hard error at commit |
+| `Store.Load()` on startup with stored DPDK active | succeeds (validation passes; apply later fails) | error logged as warning; daemon proceeds with empty active config |
 | `dataplane-type userspace` (or omitted) | succeeds | succeeds — unchanged |
 | `dataplane-type ebpf` | succeeds + warning | succeeds + warning — unchanged |
 | `dataplane-type vpp` (or other unknown) | hard error at parse | hard error at parse — unchanged |
 
-The pre-retirement `Commit()` path with `dataplane-type dpdk`
-DID NOT actually run DPDK in any production build — it tried to
-load the dpdk backend, hit the `errDPDKBuildTagRequired` stub
-(unless built with `-tags dpdk`), and failed at daemon start.
+The pre-retirement `Commit()` path with `dataplane-type dpdk` DID
+NOT actually run DPDK in any production build — it tried to load
+the dpdk backend and hit the `errDPDKBuildTagRequired` stub
+(unless built with `-tags dpdk`), failing at daemon startup.
 This PR moves that failure from daemon-start to commit time,
 which is the operator-visible improvement #1526 asks for.
 
 ## Hidden invariants the change must preserve
 
-1. **No silent passthrough.** A candidate config that selects
-   DPDK MUST hard-error at commit, not warn-and-proceed. The
-   strict-validator pattern (returning `error` rather than
-   appending to `cfg.Warnings`) preserves this.
+1. **No silent passthrough.** Strict-validator pattern: returns
+   `error` rather than appending to `cfg.Warnings`.
 
-2. **Single error site.** The reject MUST be reachable from one
-   site (CompileConfig). Adding it to `Store.Commit()` directly
-   would miss `Store.CommitCheck()` and `compileTree()` direct
-   callers. Adding it at `compileSystemDataplaneType` would
-   conflate "unknown type" error (vpp) with "retired type" error
-   (dpdk), making the operator-visible message less specific.
+2. **Single error site.** Reject placed in `compileExpanded`
+   (the shared helper of `CompileConfig` and
+   `CompileConfigForNode`). Antigravity v1 verified at
+   compiler.go:31-54 that both call paths go through this.
 
 3. **`load merge` / `load override` / `load set` of a
-   pre-retirement config does not syntax-error.** Parse succeeds.
-   Operator only sees the rejection when they try to commit
-   (or `commit check`).
+   pre-retirement config does not syntax-error.** Parse
+   succeeds. Operator only sees the rejection when they try to
+   commit or `commit check`.
 
 4. **Stored active config containing dpdk does not panic on
-   daemon startup.** The reject path is at commit time, not at
-   load-from-disk time. If a tagged binary previously committed
-   with DPDK, that stored config will replay through the same
-   compile path on startup; if it still says DPDK it will be
-   rejected and the daemon should refuse to start (acceptable —
-   issue body says "deployments still carrying DPDK config can
-   roll forward to a binary that no longer ships the backend
-   without silently switching to a stub").
+   daemon startup.** Daemon logs a warning, comes up empty,
+   management plane stays alive. Verified against
+   `pkg/daemon/daemon_run.go:85-88` and `daemon_apply.go:32`.
 
-   The plan-review questions list calls out the startup-replay
-   case for verification — see open question 1 below.
-
-5. **Compile path purity.** The new validator must not mutate
-   `cfg`. Strict validators in this file are read-only by
-   convention.
+5. **Compile path purity.** `validateDataplaneTypeStrict` is
+   read-only on `cfg`.
 
 6. **No interference with the eBPF deprecation warning.**
    `cfg.System.DataplaneType == "ebpf"` continues to produce the
-   warning at compiler.go:386-391. The new check is for `"dpdk"`
-   only.
+   warning at compiler.go:386-391. The new check is for
+   `"dpdk"` only.
+
+7. **Validator ordering.** DPDK reject fires FIRST among strict
+   validators (v2 change). An operator editing a candidate with
+   both a retired type and an unrelated structural error sees
+   the migration message first.
+
+8. **apply-groups / `${node}` expansion runs BEFORE the new
+   validator.** Verified at compiler.go:19-31 / 49-54 (Antigravity
+   v1). A group-injected `dataplane-type dpdk` is caught.
 
 ## Risk assessment
 
 | Risk class | Level | Notes |
 |---|---|---|
-| Behavioral regression | LOW | A binary built before this PR with `-tags dpdk` would have run the DPDK backend on a `dataplane-type dpdk` config. A binary built without `-tags dpdk` would have hit `errDPDKBuildTagRequired` at daemon startup (#1475 behavior). The new commit-time reject is strictly tighter than the existing #1475 startup failure. |
+| Behavioral regression | LOW | Existing `-tags dpdk` builds fail at runtime today; new behavior is strictly tighter and fires earlier. |
 | Lifetime / borrow-checker | NONE | Go side, no Rust. |
 | Performance regression | NONE | Cold-path validator runs once per commit. |
-| Architectural mismatch | LOW | The plan places the reject in the existing strict-validator chain. Alternative sites (backend registration, daemon startup) would either duplicate the error message or fire too late. |
-| Cross-PR ordering | MEDIUM | This PR must merge AFTER PR #1531 (or the operator hits a daemon that points at docs still recommending DPDK). The Chain A driver enforces ordering by opening PRs in sequence. |
-| Replay of stored active config with `dataplane-type dpdk` after upgrade | MEDIUM | If an operator upgrades and their active config carries `dataplane-type dpdk`, daemon startup will replay the config through `compileTree` and hard-error. They must hand-edit the on-disk config to recover. Issue body explicitly accepts this. The error message tells them what to do. Plan-review open question 1. |
+| Architectural mismatch | LOW | Both reviewers concur compiler-side reject is correct. |
+| Cross-PR ordering | MEDIUM | This PR must merge AFTER PR #1531 (or operator hits daemon pointing at docs still recommending DPDK). Chain A driver enforces ordering. |
+| Stored active config replay on upgrade | LOW | Per Antigravity correction: daemon logs warning + comes up empty + keeps management plane alive. Operator can recover via CLI. Acceptable, documented. |
+| Daemon comes up unconfigured surprise | LOW | Documented; the `slog.Warn` line is plainly visible to anyone reading journal at startup. v2 adds a paragraph to release notes / commit message. |
 
 ## Test plan
 
 - `go build ./...` clean.
-- `go test ./pkg/config/...` — 5 new tests pass + existing
-  `TestDPDKConfig` + `TestDataplaneTypeNonLegacyValuesDoNotWarnDeprecatedCompatibility`
-  updated, all pass.
+- `go test ./pkg/config/...` — 5 new tests pass + 1 added sibling
+  test (`TestDPDKConfigCompileRejects`) + 2 existing tests
+  flipped (`TestDPDKConfig` renamed,
+  `TestDataplaneTypeNonLegacyValuesDoNotWarnDeprecatedCompatibility`
+  loop pruned), all pass.
 - `go test ./...` — full Go suite passes.
 - `cargo build` + `cargo test --release` — clean (Rust side
-  unchanged; gated for completeness).
+  unchanged; gated for completeness per skill discipline).
 - 5x flake check on `TestDataplaneTypeDPDKRejectedAtCommit`.
 - Deploy on `loss:xpf-userspace-fw0/fw1` (default test env, runs
   userspace dataplane — no DPDK reach).
@@ -324,104 +413,99 @@ which is the operator-visible improvement #1526 asks for.
   - v4 + v6 `-P 12 -R` multi-stream — line rate, 0 retrans.
 - Pass B (CoS re-applied):
   - Per-class 5201-5206 × v4/v6 × push/reverse = 24 measurements.
-- No retrans regressions vs master baseline (validation-time
-  change cannot reach the dataplane; smoke confirms no surprise
-  build/link regressions).
+- No retrans regressions vs master baseline.
 - Manual sanity in the deployed cluster:
   - `cli` → `configure` → `set system dataplane-type dpdk` →
-    `commit check` → confirm the retirement error text is
-    surfaced to the operator (one of: CLI prompt, journalctl).
+    `commit check` → confirm exact retirement error text.
   - Repeat with `commit` → confirm same error.
   - `rollback` → confirm clean.
+  - Verify upgrade-replay scenario: deploy node with stored
+    config containing `dataplane-type dpdk`, restart daemon,
+    confirm `journalctl -u xpfd` shows the warning + daemon is
+    up + `cli` is reachable + `show configuration | display
+    set` reflects the unconfigured state.
 
 ## Out of scope (explicitly)
 
 - Deleting the DPDK blank import from `cmd/xpfd/main.go` —
   Phase 2 (#1527, Chain B).
 - Removing `dataplane.RegisterBackend(TypeDPDK, ...)` and
-  `dataplane.RegisterRuntimeBackend(TypeDPDK, ...)` from
-  `pkg/dataplane/dpdk/manager.go` — Phase 2.
+  `dataplane.RegisterRuntimeBackend(TypeDPDK, ...)` —
+  Phase 2.
 - Deleting `dpdk_worker/`, `pkg/dataplane/dpdk/`,
-  `DPDKConfig`/`DPDKAdaptiveConfig`/`DPDKPort` from
-  `pkg/config/types.go`, `Makefile` `build-dpdk*` targets,
-  canary `dpdkEBPFImportAllowlist` cleanup — Phase 3.
+  `DPDKConfig`/`DPDKAdaptiveConfig`/`DPDKPort`,
+  `Makefile build-dpdk*`, canary cleanup — Phase 3.
 - Doc sweep beyond `docs/dpdk-dataplane.md` and
   `docs/dataplane-decision-dpdk-vs-vpp.md` — Phase 4 / Chain C.
 - README / CLAUDE.md updates — Phase 4 / Chain C.
-- Changing the existing `validDataplaneType()` to drop DPDK from
-  its accepted list. That would make parse hard-error too,
+- Changing the existing `validDataplaneType()` to drop DPDK
+  from its accepted list — would make parse hard-error too,
   which #1526 explicitly forbids.
+- Daemon-side graceful-degradation that auto-rewrites
+  `dataplane-type dpdk` to `userspace` on startup. Considered
+  and rejected: silent rewrite would mask the retirement signal
+  the operator needs to see. Manual rollback is correct.
 
-## Open questions for adversarial review
+## Open questions for adversarial review (round-2)
 
-1. **Daemon startup replay of an upgraded node's stored config.**
-   If a node was running with `dataplane-type dpdk` and an
-   operator deploys a binary built from this PR, the daemon
-   loads the saved active config from disk, compiles it via the
-   same `compileTree` path, and hard-errors. The daemon refuses
-   to come up. Is that acceptable? The issue body says yes
-   ("deployments still carrying DPDK config can roll forward to
-   a binary that no longer ships the backend without silently
-   switching to a stub"). But: is there a graceful degradation
-   path needed (e.g. log loud, force `dataplane-type userspace`
-   on the in-memory cfg, refuse to write back to disk)? The plan
-   says no — operator must hand-edit. Validate this.
+1. **Is the v2 validator ordering (DPDK first) actually right?**
+   Codex finding 1 says yes; v2 implements it. But consider:
+   if a candidate has multiple structural errors, the operator
+   may fix the DPDK type first and then surface the CoS error,
+   requiring two commit cycles to land. Is that worse UX than
+   surfacing CoS first (one cycle to fix migration AND CoS)?
+   v2 takes the position that "DPDK first" is correct because
+   the retirement IS the migration the operator must perform;
+   CoS errors are a normal continuous editing concern.
 
-2. **Error message wording.** Issue body specifies:
-   `the DPDK dataplane backend has been retired; use 'set
-   system dataplane-type userspace' (see #1525)`. The plan
-   uses that text verbatim. Should the message also link the
-   rewritten `docs/dpdk-dataplane.md` (after PR #1531)? Plan
-   currently does not; issue spec doesn't either; minimum-viable
-   answer is no.
+2. **Test count and split.** v2 has 5 new tests + 1 added
+   sibling + 2 flipped existing. Is that the right balance?
+   Specifically `TestDataplaneTypeDPDKRejectedAtCommitFiresBeforeCoS`
+   is a brittle test (depends on validator ordering which is
+   itself a v2 decision). If the ordering changes in a future
+   refactor, this test fails. Worth keeping anyway?
 
-3. **Test scope.** Is 5 new tests + 2 flipped existing tests
-   enough? Specifically, do we need a test that exercises the
-   reject path through `Store.CommitCheck()` and `Store.Commit()`
-   (not just `CompileConfig`)? Plan says no — `compileTree`
-   delegates to `CompileConfig` and any error propagates. A
-   reviewer may push back and demand an integration test that
-   exercises the store boundary.
+3. **Exact-match vs substring-match on the error text.** v2
+   asserts `err.Error() == "the DPDK dataplane backend has been
+   retired; use 'set system dataplane-type userspace' (see
+   #1525)"`. That's a strong contract — any future wording
+   change must update the test. Some reviewers prefer
+   substring-match for resilience. v2 picks exact-match because
+   the issue body specifies verbatim text; relaxing the test
+   makes the spec drift-detection weaker.
 
-4. **`compileDPDKDataplane` dead-code.** After this PR the dpdk
-   compile branch in `compiler_system.go:236-242` runs for any
-   candidate that is in the brief window between parse and the
-   strict-validator call. After the validator runs, `cfg` is
-   discarded. So the dpdk compile branch produces output that is
-   never read. Is that wasted work worth deleting (a behavior
-   change with risk) or worth leaving as-is (cleanest scope)?
-   Plan: leave as-is. Deleting it makes the dpdk schema
-   un-roundtrippable on `load merge` which interferes with the
-   "still parses" acceptance criterion.
+4. **Should the replay-on-upgrade behavior be DOCUMENTED in
+   user-facing docs (release notes), or is the warning-line
+   self-explanatory?** v2 plan says "documented in commit
+   message"; release notes are a separate concern.
 
-5. **CLI surface.** Does `pkg/cmdtree/` expose `dataplane-type`
-   completions that need updating? Plan: grep to find out before
-   final commit. If the completion lists "dpdk" as an option,
-   the operator's tab-completion experience contradicts the
-   reject. May need to remove dpdk from completion list (a
-   user-facing change worth surfacing) — but that's a separate
-   minor question.
+5. **The candidate-load-from-disk path.** Plan says "candidate
+   config is already populated from the previously-active
+   config." Is this verified? `pkg/configstore/store.go`
+   `Load()` should load BOTH active and candidate (candidate
+   may have unrelated in-flight edits). If candidate also
+   carries `dataplane-type dpdk`, does the same warn-and-proceed
+   apply? Plan assumes yes; verify in manual sanity test.
 
-6. **Interaction with `${node}` apply-groups expansion.** If a
-   config uses `apply-groups` and the resolved group contains
-   `dataplane-type dpdk`, does the reject fire on the
-   post-expansion config? The plan assumes yes —
-   `CompileConfigForNode` calls the same `CompileConfig`
-   internally. Verify.
+6. **Should the warning at startup be `slog.Error` instead of
+   `slog.Warn`?** A retirement-driven empty-config startup is
+   not a minor warning — it's a noisy failure. v2 does NOT
+   change the existing #127 design (load errors are warnings)
+   because that is a daemon-lifecycle policy that lives at a
+   different abstraction layer. A reviewer may push back.
 
-7. **The legacy eBPF deprecation warning.** It currently says
-   "Omitting system dataplane-type selects the userspace
-   dataplane." It is good. Does the DPDK retirement error need
-   to also mention that omitting selects userspace, in addition
-   to recommending explicit set? Plan says no — explicit is
-   cleaner for the migrator.
+7. **Is the migration command in the error text complete?**
+   `set system dataplane-type userspace` is one option. Another
+   is just deleting the line entirely (userspace is the
+   default). The acceptance criteria spec is verbatim; v2 honors
+   it. But for an operator with no doc in front of them, "use
+   set system dataplane-type userspace" is one direction and
+   "delete system dataplane-type" is another. PR #1531's
+   retirement notice will say both; the commit error text says
+   only one. Plan accepts this as honoring the spec.
 
-8. **Validator placement order.** Plan places the new validator
-   AFTER the existing class-of-service / three-color-policer /
-   policy-scheduler validators. If a candidate config has BOTH
-   a DPDK type AND a malformed CoS config, the operator sees
-   the CoS error first. Is that the right ordering? Plan: yes —
-   DPDK retirement is the documented migration; the CoS error
-   is the more actionable one to fix in the current edit.
-   A reviewer may argue the dpdk reject should fire first so
-   the operator doesn't fix two unrelated errors. Worth raising.
+8. **Will `commit confirmed` interact correctly?** If an
+   operator runs `set system dataplane-type dpdk` then
+   `commit confirmed 10`, the immediate commit-check rejects
+   and the confirmed-commit timer never starts. Verify in the
+   manual sanity test (or with a new unit test).
