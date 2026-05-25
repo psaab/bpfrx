@@ -2246,3 +2246,25 @@
   Option B shadow field nor Option C interface widening is needed) and a
   scope-doc citation hygiene issue. AGY r1 (adversarial-review-mpkuldhp-mnlp6x)
   was PLAN-READY across all seven hostile checks.
+
+- **Timestamp**: 2026-05-25 (1517 implementation)
+- **Action**: Implemented #1517 — added pkg/cli/runtime.go with cliRuntime
+  interface (25 methods), cliUserspaceStatusProvider, and
+  cliUserspaceControlProvider. Changed cli.dp from dataplane.DataPlane to
+  cliRuntime; cli.New parameter type updated. Five inline interface{}
+  provider probes consolidated into named interfaces.
+- **File(s)**: pkg/cli/runtime.go (new), pkg/cli/cli.go,
+  pkg/cli/cli_helpers.go, pkg/cli/cli_show_chassis.go,
+  pkg/cli/cli_show_system.go, pkg/dataplane/retirement_boundary_canary_test.go
+  (add runtime.go to legacy allowlist), docs/pr/1373-retire-ebpf-dataplane/README.md
+  (add runtime.go row to migration table).
+- **Validation**: cargo+go build clean; ./pkg/cli/... 5/5 flake pass;
+  full Go suite green. Deployed to loss userspace cluster:
+  Pass A 6/6 baseline cells 0 retrans, multi-stream -P 12 -R hit
+  22.6/20.3 Gbps with 0 retrans. Pass B all 24 cells passed; shaped
+  classes hit configured rates cleanly. Interactive CLI smoke
+  (show security flow session brief, show security flow statistics,
+  clear security flow session all, show system buffers,
+  show chassis forwarding, request chassis cluster data-plane
+  userspace) all work — the named provider-probe interfaces resolve
+  correctly against the userspace LegacyDataPlaneAdapter.

@@ -23,9 +23,7 @@ func (c *CLI) showSystemBuffers() error {
 		fmt.Println("Dataplane not loaded")
 		return nil
 	}
-	if provider, ok := c.dp.(interface {
-		Status() (dpuserspace.ProcessStatus, error)
-	}); ok {
+	if provider, ok := c.dp.(cliUserspaceStatusProvider); ok {
 		status, err := provider.Status()
 		if err != nil {
 			fmt.Printf("Userspace buffer metrics unavailable: %v\n", err)
@@ -85,9 +83,7 @@ func (c *CLI) showSystemBuffersDetail() error {
 		fmt.Println("Dataplane not loaded")
 		return nil
 	}
-	if provider, ok := c.dp.(interface {
-		Status() (dpuserspace.ProcessStatus, error)
-	}); ok {
+	if provider, ok := c.dp.(cliUserspaceStatusProvider); ok {
 		status, err := provider.Status()
 		if err != nil {
 			fmt.Printf("Userspace buffer metrics unavailable: %v\n", err)

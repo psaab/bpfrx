@@ -105,9 +105,7 @@ func (c *CLI) forwardingStatusDataplane() fwdstatus.DataPlaneAccessor {
 		return nil
 	}
 	base := forwardingStatusCLIDataPlane{cli: c}
-	if _, ok := c.dp.(interface {
-		Status() (dpuserspace.ProcessStatus, error)
-	}); ok {
+	if _, ok := c.dp.(cliUserspaceStatusProvider); ok {
 		return forwardingStatusCLIUserspaceDataPlane{forwardingStatusCLIDataPlane: base}
 	}
 	return base
