@@ -56,24 +56,26 @@ func TestCompileMultipleStrictErrorsAccumulated(t *testing.T) {
 		t.Fatal("CompileConfig succeeded; expected accumulated strict-validator errors")
 	}
 
-	got := err.Error()
-	if !strings.Contains(got, "equal-flow-enforcement") {
-		t.Errorf("error missing CoS-family substring 'equal-flow-enforcement': %q", got)
+	errStr := err.Error()
+	if !strings.Contains(errStr, "equal-flow-enforcement") {
+		t.Errorf("error missing CoS-family substring 'equal-flow-enforcement': %q", errStr)
 	}
-	if !strings.Contains(got, "committed-information-rate") {
-		t.Errorf("error missing policer-family substring 'committed-information-rate': %q", got)
+	if !strings.Contains(errStr, "committed-information-rate") {
+		t.Errorf("error missing policer-family substring 'committed-information-rate': %q", errStr)
 	}
-	// Exactly one '\n' separator → exactly two joined errors.
-	// A regression to fail-fast (or to leaking ALL family errors
-	// where none were intended) trips this gate.
-	if got, want := strings.Count(got, "\n"), 1; got != want {
-		t.Errorf("newline count = %d, want %d (one '\\n' between two joined errors): %q",
-			got, want, err.Error())
+	// Exactly one '\n' separator because this fixture fires exactly
+	// two validator families (CoS + policer). errors.Join places
+	// one '\n' between N joined errors, so N-errors → N-1 newlines.
+	// A regression to fail-fast (one family silently swallowed)
+	// drops the count to 0; full-accumulation leak (all sub-errors
+	// from inside a single family) raises it above 1.
+	if nc := strings.Count(errStr, "\n"); nc != 1 {
+		t.Errorf("newline count = %d, want 1 (one '\\n' between two joined errors): %q", nc, errStr)
 	}
 	// Defense-in-depth: DPDK sentinel must not surface — DPDK was
 	// not in the fixture, so the precheck cannot fire.
 	if errors.Is(err, ErrDPDKDataplaneRetired) {
-		t.Errorf("errors.Is(err, ErrDPDKDataplaneRetired) = true; DPDK was not in fixture: %q", got)
+		t.Errorf("errors.Is(err, ErrDPDKDataplaneRetired) = true; DPDK was not in fixture: %q", errStr)
 	}
 }
 
