@@ -288,6 +288,34 @@
     Rebased onto current master (which now has #1536).
   - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
     `_Log.md`
+- **Timestamp**: 2026-05-25T17:00:00Z
+  - **Action**: #1521 r5 review fixes — AGY r5 raised NEEDS-MINOR
+    with 4 issues; all addressed. (a) Inverted const dependency
+    chain depth > 2: replaced fixed 2-pass loop with convergence
+    until stable (cap 32 passes for safety). (d.1) Typed-conversion
+    concat (`type T string; const x = T("user") + T("space_ctrl")`):
+    evalStringExpr now unwraps single-arg *ast.CallExpr so type
+    conversions fold via the BasicLit operand. (d.2) Typo-padded
+    NEW map name: isMapNameSuspect now trims FIRST and checks
+    prefix on trimmed value — catches new userspace_* names even
+    when not yet registered. (b) Generated file filter:
+    astFileIsGenerated helper detects `// Code generated ... DO NOT
+    EDIT.` marker per Go convention; multi-file inspector skips
+    generated files.
+    Plus Copilot r3 wording nits: maps.go now points readers at
+    userspace-xdp/src/lib.rs as Rust map-name source; parity-canary
+    doc updated to describe sentinel-gated retirement; alias-canary
+    doc updated to describe current trim-first rules (no `%`
+    exemption).
+    3 new fixtures: agy_r5_ia_inverted_chain_depth3,
+    agy_r5_id1_typed_concat_conversion,
+    agy_r5_id2_typo_padded_new_name.
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    pkg/dataplane/userspace/maps.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: 6 canary tests + 18 negative-fixture sub-cases
+    all pass; go test ./... all 30 packages green.
+
 - **Timestamp**: 2026-05-25T16:35:00Z
   - **Action**: #1521 r4 review fixes — Copilot wording nits +
     Codex LOW-1 parseMapsGoRegistry hard-fail + AGY r4 §II.1

@@ -16,9 +16,10 @@
 //     concatenation folds, parenthesized selectors, method aliases,
 //     raw string literals, and Unicode-whitespace-padded forms.
 //   - Does NOT prevent drift against the Rust helper's BPF object
-//     names (those live in the BPF C source) or against the legacy
-//     loader's literals in pkg/dataplane/loader_ebpf.go (the loader
-//     side keeps its own duplicates until #1476 retires the loader).
+//     names (defined in userspace-xdp/src/lib.rs via #[map(name=
+//     "...")] attributes) or against the legacy loader's literals
+//     in pkg/dataplane/loader_ebpf.go (the loader side keeps its
+//     own duplicates until #1476 retires the loader).
 //   - The dup-loader parity canary in maps_decouple_test.go pins
 //     the two sides together during the #1476 window so a rename in
 //     either side is caught at test time, not at bringup time.

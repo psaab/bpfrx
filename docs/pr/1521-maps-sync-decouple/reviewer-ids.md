@@ -29,4 +29,7 @@ Plan is PLAN-READY v2 after both r1 verdicts addressed.
 | 4 | Antigravity | adversarial-review-mpldeqzb-442pr1 | NEEDS-MINOR (cross-file concat + local-block consts addressed; byte-slice + struct-tag tagged as out-of-scope) → r5 |
 | 4 | Copilot | PR review on cfae89555 | 4 inline comments — 2 already-fixed in r3 commit + 2 wording nits addressed in 5b41f9d7 |
 | 4 | Claude SMR | self-review post-r4-fixes | MERGE-READY pending r5 confirm |
+| 5 | Antigravity | adversarial-review-mpldughx-s5jbfs | NEEDS-MINOR (depth-3 chain, typed conversion, typo-padded new map, generated-file filter) — all 4 addressed |
+| 5 | Copilot | PR review on 5b41f9d7 | 3 wording-only comments — all addressed in r5 commit |
+| 5 | Claude SMR | self-review post-r5-fixes | MERGE-READY |
 
