@@ -261,7 +261,8 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/cli/cli_show_nat.go` | NAT display still uses legacy NAT/session metadata. |
 | `pkg/cli/cli_show_security.go` | Security display still uses legacy counters and filter types. |
 | `pkg/cli/runtime.go` | #1517 — `cliRuntime` interface declares the narrow CLI dataplane surface; still depends on root `pkg/dataplane` type names (`SessionKey`, `CounterValue`, etc.) until those types move to a domain package. |
-| `pkg/cluster/sync.go` | Session sync still installs sessions through the legacy bridge. |
+| `pkg/cluster/runtime.go` | `clusterRuntime` interface still names `dataplane.SessionStore`/`Telemetry` domain types from `pkg/dataplane`; no longer references `dataplane.DataPlane` after #1518. |
+| `pkg/cluster/sync.go` | Session sync still installs sessions through the legacy bridge (deprecated `SetDataPlane` alias retained one cycle per #1518; constructors now take the narrow `clusterRuntime` instead of `dataplane.DataPlane`). |
 | `pkg/cluster/sync_bulk.go` | Bulk sync still serializes legacy session entries. |
 | `pkg/cluster/sync_conn.go` | Sync connection code still references legacy session types. |
 | `pkg/cluster/sync_protocol.go` | Wire protocol still carries legacy session records. |

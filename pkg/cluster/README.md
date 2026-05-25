@@ -17,11 +17,16 @@ sync.
   `pkg/daemon/daemon_ha.go`, which fans events out (HA sync, status
   publish, etc.). `pkg/cluster/reth.go::HandleStateChange` is a
   state-handler method, not the event-channel consumer.
-- `SessionSync` — `sync.go`, `sync_conn.go`, `sync_bulk.go`. HA session
-  replication. Legacy constructors still accept a transitional
-  `dataplane.DataPlane`, but they immediately adapt it to `SessionStore` and
-  `Telemetry`. The receive, sweep, bulk export, and stale-reconcile paths must
-  stay on those runtime-domain interfaces.
+- `SessionSync` — `sync.go`, `sync_conn.go`, `sync_bulk.go`, `runtime.go`. HA
+  session replication. After #1518, `NewSessionSync`, `NewDualSessionSync`,
+  and `SetRuntime` accept the narrow `clusterRuntime` (see `runtime.go`) —
+  `Sessions() dataplane.SessionStore` plus `Telemetry() dataplane.Telemetry`.
+  Both the legacy `*dataplane.Manager` and the userspace
+  `LegacyDataPlaneAdapter` satisfy `clusterRuntime` directly. The deprecated
+  `SetDataPlane(dataplane.DataPlane)` setter is retained one release cycle
+  for any out-of-tree caller and routes through the same
+  `SessionStoreOf`/`TelemetryOf` adapters. The receive, sweep, bulk export,
+  and stale-reconcile paths must stay on those runtime-domain interfaces.
 
 ## Callers
 

@@ -522,6 +522,53 @@ func TestSetDataPlane(t *testing.T) {
 	}
 }
 
+// TestSetRuntime exercises the new clusterRuntime-shaped setter introduced
+// in #1518 (sub-#1451 S3). It covers three things:
+//
+//  1. SetRuntime(nil) clears both runtime domains and preserves the
+//     pre-existing nil-tolerance contract.
+//  2. SetRuntime with a clusterRuntime-implementing value populates both
+//     s.sessions and s.telemetry.
+//  3. The installed runtime actually receives sessions from the wire (the
+//     deprecated SetDataPlane alias has no functional regression).
+func TestSetRuntime(t *testing.T) {
+	ss := NewSessionSync(":4785", "10.0.0.2:4785", nil)
+	if ss.sessions != nil || ss.telemetry != nil {
+		t.Fatal("runtime domains should be nil initially")
+	}
+
+	dp := &mockSweepDP{v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{}}
+	ss.SetRuntime(dp)
+	if ss.sessions == nil || ss.telemetry == nil {
+		t.Fatal("SetRuntime should populate both runtime domains")
+	}
+
+	// Round-trip a session through the wire-decode path; the installed
+	// runtime should receive it.
+	key := dataplane.SessionKey{Protocol: 6, SrcIP: [4]byte{1, 2, 3, 4}, DstIP: [4]byte{5, 6, 7, 8}, SrcPort: 1000, DstPort: 2000}
+	val := dataplane.SessionValue{State: dataplane.SessStateEstablished}
+	payload := encodeSessionV4Payload(key, val)
+	ss.handleMessage(nil, syncMsgSessionV4, payload)
+	if ss.stats.SessionsInstalled.Load() != 1 {
+		t.Fatalf("SessionsInstalled = %d, want 1", ss.stats.SessionsInstalled.Load())
+	}
+	if _, ok := dp.v4sessions[key]; !ok {
+		t.Fatal("runtime should have received the installed session")
+	}
+
+	// nil clears both domains; subsequent installs must not crash and must
+	// not be counted as installed.
+	ss.SetRuntime(nil)
+	if ss.sessions != nil || ss.telemetry != nil {
+		t.Fatal("SetRuntime(nil) should clear both runtime domains")
+	}
+	before := ss.stats.SessionsInstalled.Load()
+	ss.handleMessage(nil, syncMsgSessionV4, payload)
+	if ss.stats.SessionsInstalled.Load() != before {
+		t.Fatal("SetRuntime(nil) should disable installs")
+	}
+}
+
 func TestInstallClusterSyncedV4DoesNotCountRolledBackCompanionFailure(t *testing.T) {
 	forward := dataplane.SessionKey{Protocol: 6, SrcIP: [4]byte{10, 0, 0, 1}, DstIP: [4]byte{10, 0, 0, 2}, SrcPort: 1234, DstPort: 80}
 	reverse := dataplane.SessionKey{Protocol: 6, SrcIP: [4]byte{10, 0, 0, 2}, DstIP: [4]byte{10, 0, 0, 1}, SrcPort: 80, DstPort: 1234}
@@ -652,8 +699,28 @@ func TestHandleMessageDeleteV6RemovesCompanions(t *testing.T) {
 
 // --- Sync sweep tests ---
 
-// mockSweepDP is a minimal mock for testing sync sweep.
-// Embeds DataPlane interface; only IterateSessions/V6 are implemented.
+// mockSweepDP is the test mock backing the cluster session-sync suite.
+// It embeds the dataplane.DataPlane interface as a method-set
+// placeholder so the type satisfies dataplane.DataPlane at compile
+// time without spelling out every unused method; the embedded
+// interface field is left nil, so any method that is NOT overridden
+// below will panic with a nil-interface dispatch if invoked. In
+// practice the cluster sweep / install / iterate paths only call the
+// overridden subset, which this type implements explicitly:
+// Get/Set/Delete session, sync + batch Iterate for v4 and v6,
+// ReadGlobalCounter, and the cluster-DNAT delete tracking used by the
+// reverse-NAT teardown tests. Adding a sweep call-site that touches a
+// non-overridden method will fail-fast with a clear runtime panic on
+// the first test that exercises it.
+//
+// After #1518 (sub-#1451 S3) the cluster constructors take
+// clusterRuntime (Sessions()/Telemetry()) instead of dataplane.DataPlane.
+// mockSweepDP satisfies clusterRuntime by adapting itself via
+// dataplane.NewDataPlaneSessionStore / dataplane.NewDataPlaneTelemetry — the
+// exact same adapter the legacy SetDataPlane path used. This keeps the
+// production wiring under test and exercises the same SessionStoreOf /
+// TelemetryOf adapter the deprecated alias still uses, so the existing
+// NewSessionSync(... dp) call-sites compile unchanged.
 type mockSweepDP struct {
 	dataplane.DataPlane
 	v4sessions     map[dataplane.SessionKey]dataplane.SessionValue
@@ -663,6 +730,20 @@ type mockSweepDP struct {
 	deletedDNATV6  []dataplane.DNATKeyV6
 	failSetV4      map[dataplane.SessionKey]error
 	failSetV6      map[dataplane.SessionKeyV6]error
+}
+
+// Sessions implements clusterRuntime by wrapping the mock in the same
+// session-store adapter the legacy SetDataPlane path used. Returning a
+// fresh adapter on each call mirrors the production cost (negligible —
+// only called once per SetRuntime).
+func (m *mockSweepDP) Sessions() dataplane.SessionStore {
+	return dataplane.NewDataPlaneSessionStore(m)
+}
+
+// Telemetry implements clusterRuntime by wrapping the mock in the same
+// telemetry adapter the legacy SetDataPlane path used.
+func (m *mockSweepDP) Telemetry() dataplane.Telemetry {
+	return dataplane.NewDataPlaneTelemetry(m)
 }
 
 func (m *mockSweepDP) ReadGlobalCounter(index uint32) (uint64, error) {

@@ -342,7 +342,22 @@ type clusterSyncedSessionInstaller interface {
 const deleteJournalDefaultCap = 10000
 
 // NewSessionSync creates a new single-fabric session synchronization manager.
-func NewSessionSync(localAddr, peerAddr string, dp dataplane.DataPlane) *SessionSync {
+//
+// The runtime parameter is backend-neutral (see clusterRuntime in runtime.go).
+// In-tree callers either pass nil at construction time and wire the runtime
+// later via SetRuntime (the daemon's pattern, see daemon_ha_sync.go) or pass a
+// runtime that already implements Sessions()/Telemetry() — both
+// *dataplane.Manager and *dataplane/userspace.LegacyDataPlaneAdapter satisfy
+// that contract. Callers that hold only a value typed as dataplane.DataPlane
+// (the legacy bridge does NOT expose Sessions()/Telemetry() directly) can
+// either: (a) wrap it in a small local type that adds Sessions() and
+// Telemetry() returning dataplane.SessionStoreOf(dp) /
+// dataplane.TelemetryOf(dp) and
+// pass that wrapper here — Go structural typing accepts any value with the
+// right method set even though clusterRuntime is package-private — or (b)
+// pass nil and use the deprecated SetDataPlane alias, which performs the
+// same adaptation internally.
+func NewSessionSync(localAddr, peerAddr string, rt clusterRuntime) *SessionSync {
 	s := &SessionSync{
 		localAddr:                  localAddr,
 		peerAddr:                   peerAddr,
@@ -353,13 +368,14 @@ func NewSessionSync(localAddr, peerAddr string, dp dataplane.DataPlane) *Session
 		failoverBatchWaiters:       make(map[string]failoverWaiter),
 		failoverBatchCommitWaiters: make(map[string]failoverWaiter),
 	}
-	s.SetDataPlane(dp)
+	s.SetRuntime(rt)
 	return s
 }
 
 // NewDualSessionSync creates a session sync manager with dual-fabric transport.
-// If local1 or peer1 is empty, it falls back to single-fabric behavior.
-func NewDualSessionSync(local, peer, local1, peer1 string, dp dataplane.DataPlane) *SessionSync {
+// If local1 or peer1 is empty, it falls back to single-fabric behavior. See
+// NewSessionSync for the runtime parameter contract.
+func NewDualSessionSync(local, peer, local1, peer1 string, rt clusterRuntime) *SessionSync {
 	s := &SessionSync{
 		localAddr:                  local,
 		peerAddr:                   peer,
@@ -372,7 +388,7 @@ func NewDualSessionSync(local, peer, local1, peer1 string, dp dataplane.DataPlan
 		failoverBatchWaiters:       make(map[string]failoverWaiter),
 		failoverBatchCommitWaiters: make(map[string]failoverWaiter),
 	}
-	s.SetDataPlane(dp)
+	s.SetRuntime(rt)
 	return s
 }
 
@@ -389,7 +405,29 @@ func (s *SessionSync) SetZoneRGMap(m map[uint16]int) {
 	s.zoneRGMu.Unlock()
 }
 
-// SetDataPlane sets the dataplane used for installing received sessions.
+// SetRuntime wires the backend-neutral runtime used by SessionSync.
+//
+// Passing nil clears both runtime domains, matching the existing nil-
+// tolerance contract (see SetRuntimeDomains and the sweep / bulk
+// reconcile paths in sync_conn.go and sync_bulk.go that check for
+// s.sessions == nil / s.telemetry == nil before touching the
+// dataplane).
+func (s *SessionSync) SetRuntime(rt clusterRuntime) {
+	if rt == nil {
+		s.SetRuntimeDomains(nil, nil)
+		return
+	}
+	s.SetRuntimeDomains(rt.Sessions(), rt.Telemetry())
+}
+
+// SetDataPlane is the deprecated alias for SetRuntime. It is kept for one
+// release cycle so any out-of-tree caller still passing the legacy
+// dataplane.DataPlane bridge continues to compile. In-tree callers were
+// migrated to SetRuntime as part of #1518.
+//
+// Deprecated: use SetRuntime. Both legacy *dataplane.Manager and the
+// userspace LegacyDataPlaneAdapter satisfy clusterRuntime via Sessions()/
+// Telemetry(); no adapter is needed.
 func (s *SessionSync) SetDataPlane(dp dataplane.DataPlane) {
 	if dp == nil {
 		s.SetRuntimeDomains(nil, nil)

@@ -2,6 +2,15 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T15:45:00Z
+  - **Action**: Addressed PR #1551 Copilot round-3 doc-comment nits by
+    fully qualifying dataplane helper names in cluster session-sync
+    comments (`dataplane.TelemetryOf`, `dataplane.NewDataPlaneTelemetry`).
+  - **File(s)**:
+    `pkg/cluster/sync.go`,
+    `pkg/cluster/sync_test.go`,
+    `_Log.md`
+
 - **Timestamp**: 2026-05-26T01:00:00Z
   - **Action**: Round-3 reviewer verdicts complete on PR #1550 HEAD
     444a1959. Codex MERGE-READY (no findings). AGY MERGE-READY
@@ -2590,3 +2599,31 @@
   validation outcome. All three are purely cosmetic; no diff to
   pkg/logging/README.md.
 - **Validation**: cosmetic-only; no test/build rerun needed.
+
+- **Timestamp**: 2026-05-24T12:00Z
+- **Action**: Draft #1518 plan v1 (cluster session-sync off legacy dataplane.DataPlane)
+- **File(s)**: docs/pr/1518-cluster-session-sync-migration/plan.md, reviewer-ids.md
+- **Why**: Sub-#1451 S3 — narrow pkg/cluster boundary to a backend-neutral
+  clusterRuntime interface; constructors + setter no longer name
+  dataplane.DataPlane. Keep SetDataPlane as a deprecated alias for one cycle.
+  HA-touching scope: must pass make test-failover.
+- **Validation**: pending Codex + Antigravity adversarial plan review.
+- **Timestamp**: 2026-05-25T08:05Z
+- **Action**: Implement #1518 (cluster session-sync off legacy dataplane.DataPlane)
+- **File(s)**: pkg/cluster/runtime.go (NEW), pkg/cluster/sync.go,
+  pkg/cluster/sync_test.go, pkg/daemon/daemon_ha_sync.go,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  docs/pr/1373-retire-ebpf-dataplane/README.md, pkg/cluster/README.md
+- **Why**: Sub-#1451 S3. Introduce narrow clusterRuntime interface
+  (Sessions/Telemetry); NewSessionSync, NewDualSessionSync now take
+  clusterRuntime instead of dataplane.DataPlane. New SetRuntime setter
+  populates both runtime domains via the same SessionStoreOf/TelemetryOf
+  adapters the legacy SetDataPlane uses. SetDataPlane kept as a
+  deprecated alias for one release cycle. Daemon call-site in
+  daemon_ha_sync.go now calls SetRuntime(d.dp) directly — no legacyDP()
+  cast required at this seam.
+- **Validation**: go build ./... clean; go test ./pkg/cluster/ green
+  (TestSetRuntime added); go test ./pkg/daemon/ green; full suite
+  go test ./... green (32 packages); retirement boundary canary updated
+  with pkg/cluster/runtime.go allowlist entry + 1373 README + cluster
+  README. Smoke + test-failover pending (HA-sensitive scope per CLAUDE.md).
