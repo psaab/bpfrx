@@ -355,7 +355,13 @@ type DataPlane interface {
 
 	// FIB
 	BumpFIBGeneration() uint32
-	StartFIBSync(ctx context.Context) // userspace: background route sync; eBPF: no-op
+	// StartFIBSync is a no-op on every in-tree backend: eBPF resolves
+	// FIB queries via bpf_fib_lookup in-kernel and the userspace
+	// AF_XDP runtime wraps the eBPF no-op through the legacy
+	// adapter.  The hook is retained on the interface for backends
+	// that need a userspace route populator (DPDK had one; retired
+	// in #1527 / #1525).
+	StartFIBSync(ctx context.Context)
 
 	// NotifyLinkCycle signals that data-plane interfaces were taken DOWN/UP
 	// (e.g. during RETH MAC programming).  The userspace dataplane uses this

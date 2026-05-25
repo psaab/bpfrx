@@ -164,21 +164,14 @@ perf claim — the value is discipline gate, not throughput.)
 
 ### Change 1 — Remove blank import in `cmd/xpfd/main.go`
 
-```diff
- import (
- 	"context"
- 	"flag"
- 	"fmt"
- 	"log/slog"
- 	"os"
+Delete line 15 of `cmd/xpfd/main.go`:
 
- 	"github.com/psaab/xpf/pkg/daemon"
- 	"github.com/psaab/xpf/pkg/dataplane"
--	_ "github.com/psaab/xpf/pkg/dataplane/dpdk"
- 	_ "github.com/psaab/xpf/pkg/dataplane/userspace"
- 	"github.com/psaab/xpf/pkg/frr"
- )
-```
+    _ "github.com/psaab/xpf/pkg/dataplane/dpdk"
+
+Leaves `_ "github.com/psaab/xpf/pkg/dataplane/userspace"` as the
+only blank backend-registration import. (Plain code snippet rather
+than a ```diff fence so the context lines don't carry a
+space-before-tab pattern that trips `git diff --check`.)
 
 ### Change 2 — Drop backend registration in `pkg/dataplane/dpdk/manager.go`
 

@@ -323,8 +323,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start background services if dataplane is loaded
 	var er *logging.EventReader
 	if d.dp != nil {
-		// Start FIB sync (userspace: background route populator; eBPF: no-op).
-		// The DPDK reference was retired in #1527 (Phase 2).
+		// StartFIBSync is a no-op on every in-tree backend: eBPF
+		// resolves FIB queries via bpf_fib_lookup in-kernel and the
+		// userspace AF_XDP runtime wraps that no-op through the
+		// legacy adapter.  Call site retained for backends that
+		// need a userspace route populator (DPDK had one; retired
+		// in #1527 / #1525).
 		if lp := d.legacyDP(); lp != nil {
 			lp.StartFIBSync(ctx)
 		}
