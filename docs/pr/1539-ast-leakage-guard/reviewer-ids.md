@@ -2,6 +2,21 @@
 
 ## Code review (PR #1553)
 
+- HEAD final: f90125b3 (rebased on top of 1e31242d Copilot SWE
+  bot commit that fixed findings 1+5).
+- Round-3 re-verify (HEAD f90125b3):
+  - Codex: session 019e5fa* — **MERGE-READY**.
+    "Diff is scoped, validated, and no blocking correctness or
+    test gaps remain."
+  - Antigravity: adversarial-review-mplcritr-oschjy —
+    **MERGE-READY**. "Package-scope AST leakage detection
+    successfully closes the initializer bypass; Option A write
+    correctly enclosed by func compileExpanded so isLHSOfAssignToNil
+    handles it; allowlist key drift resolved cleanly via
+    filepath.Rel + ToSlash."
+  - Copilot: re-review requested via @copilot review comment;
+    awaiting verdict on f90125b3.
+
 - HEAD at code-review: 8c5a4ced, then 6a7d0649 (linter fix +
   multi-LHS bypass test).
 - Codex: session 019e5fa4-... (continued) — **MERGE-READY**.
