@@ -20,6 +20,26 @@ import (
 // Test files are intentionally excluded — they may legitimately
 // reference dataplane.DataPlane to assert non-implementation, the
 // same pattern as pkg/dataplane/userspace/manager_coupling_test.go.
+//
+// Scope (minimum viable; bypass-hardening tracked in #1548):
+//
+// What this canary catches today:
+//   - Function parameters of `dataplane.DataPlane` or `*dataplane.DataPlane`
+//   - Function results of those types
+//   - Struct fields of those types
+//   - Embedded interfaces declaring `dataplane.DataPlane`
+//   - Interface method param/result of those types
+//
+// Known bypass vectors (see #1548 for hardening plan):
+//   - Compound types: `[]dataplane.DataPlane`, `map[...]dataplane.DataPlane`,
+//     `chan dataplane.DataPlane`, `func(dataplane.DataPlane) error`
+//   - Generic types: `T dataplane.DataPlane` constraints, `Generic[dataplane.DataPlane]`
+//   - Type aliases: `type DPAlias = dataplane.DataPlane`, transitive uses
+//   - Import renames: `import dp "github.com/psaab/xpf/pkg/dataplane"`
+//
+// The fence covers the most common naive-reintroduction mode; #1548
+// hardens it to cover the bypass vectors above using `go/types`-level
+// import resolution.
 func TestConntrackHasNoLegacyDataPlaneDependency(t *testing.T) {
 	t.Parallel()
 

@@ -1745,3 +1745,18 @@
   - **File(s)**: `userspace-dp/src/afxdp/wg/framing.rs`, `_Log.md`
   - **Validation**: cargo build --release; cargo test --release --bin
     xpf-userspace-dp afxdp::wg.
+
+- **Timestamp**: 2026-05-25T06:35Z
+- **Action**: PR #1532 — document known canary bypass vectors per AGY review; file #1548 hardening follow-up
+- **File(s)**: pkg/conntrack/legacy_dataplane_canary_test.go
+- **Why**: AGY adversarial review (adversarial-review-mpktubut-ogkp1e) flagged
+  five categories of bypass the current AST walker doesn't catch (compound
+  types, generics, type aliases, import renames, anonymous-struct context).
+  The canary as shipped catches the most common naive-reintroduction mode
+  (direct param/result/field/embed/interface-method of dataplane.DataPlane),
+  which is the realistic regression risk. Hardening for the bypasses is
+  tracked in #1548 (substantial work needing go/types-level import resolution).
+  Comment block updated to make the scope explicit so a future reader doesn't
+  mistake this for an exhaustive fence.
+- **Validation**: TestConntrackHasNoLegacyDataPlaneDependency still passes on
+  current pkg/conntrack/ production tree.
