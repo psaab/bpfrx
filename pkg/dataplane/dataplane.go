@@ -349,7 +349,7 @@ type DataPlane interface {
 
 	// FIB
 	BumpFIBGeneration() uint32
-	StartFIBSync(ctx context.Context) // DPDK: background route sync; eBPF/userspace: no-op
+	StartFIBSync(ctx context.Context) // userspace: background route sync; eBPF: no-op
 
 	// NotifyLinkCycle signals that data-plane interfaces were taken DOWN/UP
 	// (e.g. during RETH MAC programming).  The userspace dataplane uses this
