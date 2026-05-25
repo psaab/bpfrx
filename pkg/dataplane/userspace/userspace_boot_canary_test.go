@@ -9,14 +9,16 @@ import (
 
 // TestUserspaceBootReturnsAdapter asserts that Boot() returns an
 // adapter-wrapped userspace runtime that satisfies both
-// dataplane.DataPlane (the legacy compatibility surface still consumed
-// by pkg/cli, pkg/api, pkg/conntrack, pkg/fwdstatus) and
-// dataplane.RuntimeDataPlane (the daemon-facing runtime surface).
+// dataplane.DataPlane (the legacy compatibility surface still handed out
+// by daemon.legacyDP() to CLI, gRPC, and cluster session-sync call
+// sites) and dataplane.RuntimeDataPlane (the daemon-facing runtime
+// surface).
 //
 // This is the load-bearing invariant for #1520 (sub-#1451 S5): the
 // daemon's legacyDP() helper depends on the runtime dataplane being
 // type-assertable to dataplane.DataPlane. Without the adapter,
-// legacyDP() returns nil and CLI / API status paths silently degrade.
+// legacyDP() returns nil and those compatibility handoff paths silently
+// degrade.
 func TestUserspaceBootReturnsAdapter(t *testing.T) {
 	t.Parallel()
 

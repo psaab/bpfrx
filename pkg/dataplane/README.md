@@ -14,12 +14,14 @@ Pluggable: the legacy eBPF backend registers through `RegisterBackend` for
 the old `DataPlane` surface (DPDK retired #1525; removed in #1527/#1528).
 Runtime backends register through `RegisterRuntimeBackend`; daemon startup now
 selects `userspace.Boot()` directly for the default and explicit userspace
-paths and falls through to `NewRuntimeDataPlane` only for the explicit legacy
-eBPF rollback / retired-DPDK sentinel path. During the #1381 migration, the
-userspace runtime constructor returns `LegacyDataPlaneAdapter`: the userspace
-`Manager` itself still does not implement the BPF-shaped `DataPlane`, but
-daemon status, CLI, and cluster-sync callers that have not moved to domain
-interfaces still receive a temporary compatibility handle.
+paths and falls through to `NewRuntimeDataPlane` for every other effective
+type. Today the operator-facing cases on that branch are the explicit legacy
+eBPF rollback and retired-DPDK sentinel; unknown/custom types still surface the
+legacy factory's error path verbatim. During the #1381 migration, the userspace
+runtime constructor returns `LegacyDataPlaneAdapter`: the userspace `Manager`
+itself still does not implement the BPF-shaped `DataPlane`, but daemon status,
+CLI, and cluster-sync callers that have not moved to domain interfaces still
+receive a temporary compatibility handle.
 
 DPDK retirement (#1525): the historical #1475 policy that retained DPDK as
 a separately supported DPDK-build backend applied pre-retirement; the

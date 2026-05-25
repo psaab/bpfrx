@@ -2,6 +2,20 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T15:20:00Z
+  - **Action**: PR #1550 round-2 Copilot wording drift follow-up.
+    Updated the `userspace.Boot()` doc/canary comments to name the
+    actual remaining legacy `dataplane.DataPlane` consumers
+    (`daemon.legacyDP()` handoffs into CLI, gRPC, and cluster
+    session-sync) instead of stale pkg/api/pkg/conntrack/pkg/fwdstatus
+    examples. Also fixed `pkg/dataplane/README.md` so the
+    `NewRuntimeDataPlane` fall-through text matches the code's
+    non-userspace branch, including unknown/custom type error
+    propagation.
+  - **File(s)**: `pkg/dataplane/userspace/manager.go`,
+    `pkg/dataplane/userspace/userspace_boot_canary_test.go`,
+    `pkg/dataplane/README.md`, `_Log.md`
+
 - **Timestamp**: 2026-05-25T23:30:00Z
   - **Action**: PR #1550 round-1 doc + wording follow-ups merged.
     Copilot agent pushed be8a7b6d updating

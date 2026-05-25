@@ -87,11 +87,12 @@ func init() {
 // a bare *dataplane.Manager (legacy) via the legacy program loader.
 //
 // The returned value still implements dataplane.DataPlane via the
-// adapter, so unmigrated callers (pkg/cli, pkg/api, pkg/conntrack,
-// pkg/fwdstatus) continue to compile until #1451 finishes the surface
-// shrink. When #1521 / #1473 need to thread additional construction
-// configuration in, they should add a typed options argument here.
-// No empty options struct is added pre-emptively (YAGNI).
+// adapter, so daemon.legacyDP() can keep handing a compatibility handle
+// to the remaining CLI, gRPC, and cluster session-sync call sites until
+// #1451 finishes the surface shrink. When #1521 / #1473 need to thread
+// additional construction configuration in, they should add a typed
+// options argument here. No empty options struct is added pre-emptively
+// (YAGNI).
 func Boot() dataplane.RuntimeDataPlane {
 	return NewLegacyDataPlaneAdapter(New())
 }
