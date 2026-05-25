@@ -173,3 +173,128 @@ func funcDeclName(fn *ast.FuncDecl) string {
 	}
 	return fn.Name.Name
 }
+
+// TestLegacyDataPlaneTypeMatcher is a synthetic-AST sanity check that
+// `isLegacyDataPlaneType` matches the prohibited shapes (direct,
+// pointer, variadic, paren-wrapped) and rejects unrelated shapes. It
+// guards against accidental regressions in the matcher (e.g., dropping
+// an `*ast.Ellipsis` arm) without depending on the production tree
+// happening to contain a violating type.
+func TestLegacyDataPlaneTypeMatcher(t *testing.T) {
+	t.Parallel()
+
+	dpSel := &ast.SelectorExpr{
+		X:   &ast.Ident{Name: "dataplane"},
+		Sel: &ast.Ident{Name: "DataPlane"},
+	}
+	otherSel := &ast.SelectorExpr{
+		X:   &ast.Ident{Name: "context"},
+		Sel: &ast.Ident{Name: "Context"},
+	}
+
+	cases := []struct {
+		name string
+		expr ast.Expr
+		want bool
+	}{
+		{"direct", dpSel, true},
+		{"pointer", &ast.StarExpr{X: dpSel}, true},
+		{"variadic", &ast.Ellipsis{Elt: dpSel}, true},
+		{"paren", &ast.ParenExpr{X: dpSel}, true},
+		{"paren-pointer", &ast.ParenExpr{X: &ast.StarExpr{X: dpSel}}, true},
+		{"unrelated-selector", otherSel, false},
+		{"bare-ident", &ast.Ident{Name: "DataPlane"}, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isLegacyDataPlaneType(tc.expr); got != tc.want {
+				t.Fatalf("isLegacyDataPlaneType(%s) = %v, want %v",
+					tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestInterfaceMethodCanaryScansFuncTypeParamsAndResults proves the
+// AST walker in TestConntrackHasNoLegacyDataPlaneDependency actually
+// fires on `dataplane.DataPlane` mentioned as an interface-method
+// parameter or result type. The production scan switches on
+// `method.Type.(*ast.FuncType)` and dives into `Params`/`Results`;
+// this subtest builds a synthetic interface AST and runs the same
+// shape of inspection inline so a future regression that drops the
+// FuncType arm is caught here even when no real production file
+// happens to violate the rule.
+func TestInterfaceMethodCanaryScansFuncTypeParamsAndResults(t *testing.T) {
+	t.Parallel()
+
+	dpSel := &ast.SelectorExpr{
+		X:   &ast.Ident{Name: "dataplane"},
+		Sel: &ast.Ident{Name: "DataPlane"},
+	}
+
+	// Build: interface { Foo(dataplane.DataPlane); Bar() dataplane.DataPlane }
+	iface := &ast.InterfaceType{
+		Methods: &ast.FieldList{
+			List: []*ast.Field{
+				{
+					Names: []*ast.Ident{{Name: "Foo"}},
+					Type: &ast.FuncType{
+						Params: &ast.FieldList{
+							List: []*ast.Field{{Type: dpSel}},
+						},
+					},
+				},
+				{
+					Names: []*ast.Ident{{Name: "Bar"}},
+					Type: &ast.FuncType{
+						Results: &ast.FieldList{
+							List: []*ast.Field{{Type: dpSel}},
+						},
+					},
+				},
+				{
+					Names: []*ast.Ident{{Name: "Baz"}},
+					Type: &ast.FuncType{
+						Params: &ast.FieldList{
+							List: []*ast.Field{{Type: &ast.Ident{Name: "int"}}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	var hits []string
+	for _, method := range iface.Methods.List {
+		methodName := method.Names[0].Name
+		mt, ok := method.Type.(*ast.FuncType)
+		if !ok {
+			continue
+		}
+		if mt.Params != nil {
+			for _, field := range mt.Params.List {
+				if isLegacyDataPlaneType(field.Type) {
+					hits = append(hits, methodName+":param")
+				}
+			}
+		}
+		if mt.Results != nil {
+			for _, field := range mt.Results.List {
+				if isLegacyDataPlaneType(field.Type) {
+					hits = append(hits, methodName+":result")
+				}
+			}
+		}
+	}
+
+	wantSet := map[string]bool{"Foo:param": true, "Bar:result": true}
+	if len(hits) != len(wantSet) {
+		t.Fatalf("hits = %v, want exactly %v", hits, wantSet)
+	}
+	for _, h := range hits {
+		if !wantSet[h] {
+			t.Fatalf("unexpected hit %q (want only %v)", h, wantSet)
+		}
+	}
+}

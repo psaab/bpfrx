@@ -231,6 +231,32 @@
     No `.go` / `.rs` / `.c` source, no build inputs, no test
     fixtures modified.
 
+- **Timestamp**: 2026-05-25T08:30:00Z
+  - **Action**: PR #1532 round — address Copilot review on 77baa235.
+    Copilot flagged that `method.Type` is `*ast.FuncType` and that
+    `isLegacyDataPlaneType(method.Type)` could never detect interface
+    method param/result. The existing code at lines 102-132 already
+    type-switches on `*ast.FuncType` and extracts `mt.Params` and
+    `mt.Results` correctly — Copilot misread the implementation. To
+    refute the finding with code-level evidence, added
+    `TestLegacyDataPlaneTypeMatcher` and
+    `TestInterfaceMethodCanaryScansFuncTypeParamsAndResults`
+    subtests that build synthetic ASTs and confirm the walker fires
+    on (a) direct param, (b) pointer param, (c) variadic, (d)
+    paren-wrapped, (e) result; and that it ignores a clean
+    interface. Also addressed Copilot's plan-vs-implementation
+    wording mismatches in
+    `docs/pr/1515-conntrack-gc-canary/plan.md` (scope is all
+    FuncDecls not exported-only; matcher is
+    `isLegacyDataPlaneType()` not `exprString()`).
+  - **File(s)**:
+    `pkg/conntrack/legacy_dataplane_canary_test.go`,
+    `docs/pr/1515-conntrack-gc-canary/plan.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/conntrack -run
+    TestConntrackHasNoLegacyDataPlaneDependency -count=1 -race`
+    green; new subtests assert the interface-method scan against
+    synthetic AST fixtures.
+
 - **Timestamp**: 2026-05-25T01:30:00Z
   - **Action**: #1515 (#1451 S8) — add regression canary that fences
     `pkg/conntrack` production code against future re-introduction of
@@ -2233,17 +2259,20 @@
     ./pkg/conntrack/...`.
 
 - **Timestamp**: 2026-05-25T07:55Z
-- **Action**: PR #1532 — close Codex MINOR (ellipsis + paren bypasses)
-- **File(s)**: pkg/conntrack/legacy_dataplane_canary_test.go
-- **Why**: Codex task-mpktubkn-r9llzq flagged `...dataplane.DataPlane` (variadic
-  params, *ast.Ellipsis) and `(dataplane.DataPlane)` (paren-wrapped,
-  *ast.ParenExpr) as bypass vectors. Both are common Go AST disguises that
-  the prior matcher missed. Added two case arms to isLegacyDataPlaneType to
-  recursively unwrap each.
-- **Validation**: canary still passes on current pkg/conntrack/ production tree.
+  - **Action**: PR #1532 — close Codex MINOR (ellipsis + paren bypasses)
+  - **File(s)**: pkg/conntrack/legacy_dataplane_canary_test.go
+  - **Why**: Codex task-mpktubkn-r9llzq flagged `...dataplane.DataPlane`
+    (variadic params, *ast.Ellipsis) and `(dataplane.DataPlane)`
+    (paren-wrapped, *ast.ParenExpr) as bypass vectors. Both are common Go
+    AST disguises that the prior matcher missed. Added two case arms to
+    isLegacyDataPlaneType to recursively unwrap each.
+  - **Validation**: canary still passes on current pkg/conntrack/
+    production tree.
+
 - **Timestamp**: 2026-05-25T05:58Z
-- **Action**: PR #1536 — add ErrDPDKDataplaneRetired sentinel + errors.Is test (AGY round-N feedback)
-- **File(s)**: pkg/config/compiler.go, pkg/config/parser_ast_test.go
+  - **Action**: PR #1536 — add ErrDPDKDataplaneRetired sentinel +
+    errors.Is test (AGY round-N feedback)
+  - **File(s)**: pkg/config/compiler.go, pkg/config/parser_ast_test.go
 - **Why**: Antigravity adversarial-review-mpksjr0e-f3mjrn flagged the lack of a
   structured sentinel error as an API design gap. External consumers (gRPC
   orchestration, REST wrappers, CLI tooling) cannot programmatically match

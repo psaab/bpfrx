@@ -3,9 +3,11 @@
 ## Goal
 
 Add a regression canary to `pkg/conntrack/` that fails the build if any
-exported `pkg/conntrack` function reintroduces a parameter or return
-type of `dataplane.DataPlane`, or if any package-level type embeds
-`dataplane.DataPlane`. This is the smallest sub-issue of #1451.
+`pkg/conntrack` production function (exported or unexported)
+reintroduces a parameter or return type of `dataplane.DataPlane`, or
+if any package-level type embeds `dataplane.DataPlane`, or if any
+interface method signature mentions it. This is the smallest sub-issue
+of #1451.
 
 ## Current state (master @ da103d81)
 
@@ -35,15 +37,21 @@ and walks the AST. The canary fails if:
    `dataplane.DataPlane`.
 
 This mirrors the existing canary at
-`pkg/dataplane/userspace/manager_coupling_test.go` and uses the same
-`exprString()` helper pattern. The canary skips `*_test.go` files
-intentionally — test code may still mention the type to assert
-non-implementation (similar to the coupling test in
-`pkg/dataplane/userspace`).
+`pkg/dataplane/userspace/manager_coupling_test.go`. The conntrack
+canary uses an `isLegacyDataPlaneType()` matcher (switching on
+`*ast.SelectorExpr` / `*ast.StarExpr` / `*ast.Ellipsis` /
+`*ast.ParenExpr`) rather than the `exprString()` text-compare helper
+used by the userspace coupling test — both forms catch the same naive
+shapes; the matcher style was chosen for clearer per-shape rejection
+and easier extension. The canary skips `*_test.go` files intentionally
+— test code may still mention the type to assert non-implementation
+(similar to the coupling test in `pkg/dataplane/userspace`).
 
-Actually — the canary should scan the production `.go` files in the
-package (excluding `*_test.go`) for the prohibited shapes. Test files
-already exercise the boundary; we want to fence the production
+The walker scans all production `.go` files in the package
+(excluding `*_test.go`), inspecting every `*ast.FuncDecl` (exported
+and unexported), every `*ast.StructType` field, and every
+`*ast.InterfaceType` method signature for the prohibited shapes. Test
+files already exercise the boundary; we want to fence the production
 surface.
 
 ## Files touched
