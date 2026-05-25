@@ -182,6 +182,17 @@
     `pkg/dataplane/dataplane.go`,
     `pkg/dataplane/retirement_boundary_canary_test.go`,
     `pkg/dataplane/dpdk/dpdk_stub_test.go`
+- **Timestamp**: 2026-05-24T18:00:00Z
+  - **Action**: #1473 closeout plan. Added per-AC evidence document
+    citing the prior PRs that landed the runtime decouple (#1493,
+    #1498), the boundary canary (#1512), the link-cycle regressions
+    (#1513), and the counter rename (#1514). Marked #1473 as
+    closeout-pending in the #1373 README. No runtime code change
+    required; AC1-AC5 already proven on master at da103d81.
+  - **File(s)**: `docs/pr/1473-xdp-shim-decouple/plan.md`,
+    `docs/pr/1373-retire-ebpf-dataplane/README.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane ./pkg/dataplane/userspace`
+    targeted runs for the AC-pinned canary/regression test set.
 
 - **Timestamp**: 2026-05-25T00:45:00Z
   - **Action**: PR #1512 review follow-up — tightened the positional
