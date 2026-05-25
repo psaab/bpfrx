@@ -344,11 +344,14 @@ const deleteJournalDefaultCap = 10000
 // NewSessionSync creates a new single-fabric session synchronization manager.
 //
 // The runtime parameter is backend-neutral (see clusterRuntime in runtime.go).
-// Callers that still hold a legacy dataplane.DataPlane can either pass nil at
-// construction time and wire the runtime later via SetRuntime (the daemon's
-// pattern, see daemon_ha_sync.go), or pass any value that exposes
-// Sessions()/Telemetry() — both *dataplane.Manager and the userspace
-// LegacyDataPlaneAdapter satisfy this contract.
+// In-tree callers either pass nil at construction time and wire the runtime
+// later via SetRuntime (the daemon's pattern, see daemon_ha_sync.go) or pass a
+// runtime that already implements Sessions()/Telemetry() — both
+// *dataplane.Manager and the userspace LegacyDataPlaneAdapter satisfy that
+// contract. Out-of-tree callers that still hold a value typed as
+// dataplane.DataPlane (which does NOT expose Sessions()/Telemetry() directly)
+// must pass nil here and use the deprecated SetDataPlane alias, which adapts
+// the legacy bridge via dataplane.SessionStoreOf / TelemetryOf.
 func NewSessionSync(localAddr, peerAddr string, rt clusterRuntime) *SessionSync {
 	s := &SessionSync{
 		localAddr:                  localAddr,

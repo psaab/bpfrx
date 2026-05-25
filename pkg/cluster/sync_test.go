@@ -699,17 +699,22 @@ func TestHandleMessageDeleteV6RemovesCompanions(t *testing.T) {
 
 // --- Sync sweep tests ---
 
-// mockSweepDP is a minimal mock for testing sync sweep.
-// Embeds DataPlane interface; only IterateSessions/V6 are implemented.
+// mockSweepDP is the test mock backing the cluster session-sync suite.
+// It embeds the legacy dataplane.DataPlane interface so the few methods
+// this mock does not override fall through to a nil receiver, and
+// implements the surface the cluster hot path actually exercises:
+// Get/Set/Delete session, sync + batch Iterate for v4 and v6,
+// ReadGlobalCounter, and the cluster-DNAT delete tracking used by the
+// reverse-NAT teardown tests.
 //
-// After #1518 (sub-#1451 S3) the cluster constructors take clusterRuntime
-// (Sessions()/Telemetry()) instead of dataplane.DataPlane. mockSweepDP
-// satisfies clusterRuntime by adapting itself via
-// dataplane.NewDataPlaneSessionStore / NewDataPlaneTelemetry — the exact
-// same adapter the old SetDataPlane path used. This keeps the production
-// wiring under test and exercises the same SessionStoreOf / TelemetryOf
-// adapter the deprecated alias still uses, so we do not have to touch the
-// ~40 NewSessionSync(... dp) call-sites.
+// After #1518 (sub-#1451 S3) the cluster constructors take
+// clusterRuntime (Sessions()/Telemetry()) instead of dataplane.DataPlane.
+// mockSweepDP satisfies clusterRuntime by adapting itself via
+// dataplane.NewDataPlaneSessionStore / NewDataPlaneTelemetry — the
+// exact same adapter the legacy SetDataPlane path used. This keeps the
+// production wiring under test and exercises the same SessionStoreOf /
+// TelemetryOf adapter the deprecated alias still uses, so the existing
+// NewSessionSync(... dp) call-sites compile unchanged.
 type mockSweepDP struct {
 	dataplane.DataPlane
 	v4sessions     map[dataplane.SessionKey]dataplane.SessionValue
