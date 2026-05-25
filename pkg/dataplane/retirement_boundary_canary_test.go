@@ -717,6 +717,63 @@ func hostileDefinedType() Manager {
 			want: []string{"positional dataplane.Manager literal", "xdpEntryProg", "xdp_main_prog"},
 		},
 		{
+			name: "positional_dataplane_manager_in_slice_literal",
+			files: map[string]string{
+				"manager.go": `
+package dataplane
+
+type Manager struct {
+	loaded bool
+	programs map[string]any
+	xdpEntryProg string
+}
+
+func hostileSlice() []Manager {
+	return []Manager{{false, nil, "xdp_main_prog"}}
+}
+`,
+			},
+			want: []string{"positional dataplane.Manager literal", "xdpEntryProg", "xdp_main_prog"},
+		},
+		{
+			name: "positional_dataplane_manager_in_array_literal",
+			files: map[string]string{
+				"manager.go": `
+package dataplane
+
+type Manager struct {
+	loaded bool
+	programs map[string]any
+	xdpEntryProg string
+}
+
+func hostileArray() [1]Manager {
+	return [1]Manager{{false, nil, "xdp_main_prog"}}
+}
+`,
+			},
+			want: []string{"positional dataplane.Manager literal", "xdpEntryProg", "xdp_main_prog"},
+		},
+		{
+			name: "positional_dataplane_manager_in_map_literal",
+			files: map[string]string{
+				"manager.go": `
+package dataplane
+
+type Manager struct {
+	loaded bool
+	programs map[string]any
+	xdpEntryProg string
+}
+
+func hostileMap() map[string]Manager {
+	return map[string]Manager{"k": {false, nil, "xdp_main_prog"}}
+}
+`,
+			},
+			want: []string{"positional dataplane.Manager literal", "xdpEntryProg", "xdp_main_prog"},
+		},
+		{
 			name: "cgo_import",
 			files: map[string]string{
 				"cgo.go": `
@@ -797,6 +854,83 @@ package userspace
 			root := writeBoundaryFixture(t, tc.files)
 			violations := retainedUserspaceShimBoundaryViolations(t, []string{root}, false)
 			assertCanaryViolationContains(t, violations, tc.want...)
+		})
+	}
+}
+
+func TestPositionalDataplaneManagerLiteralCanaryAllowsKeyedFixtures(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		files map[string]string
+	}{
+		{
+			name: "fully_keyed_dataplane_manager_literal",
+			files: map[string]string{
+				"manager.go": `
+package dataplane
+
+type Manager struct {
+	loaded bool
+	programs map[string]any
+	xdpEntryProg string
+}
+
+func keyedFull() Manager {
+	return Manager{loaded: true, programs: nil, xdpEntryProg: "xdp_userspace_prog"}
+}
+`,
+			},
+		},
+		{
+			name: "mixed_keyed_xdp_entry_prog_keyed_dataplane_manager_literal",
+			files: map[string]string{
+				"manager.go": `
+package dataplane
+
+type Manager struct {
+	loaded bool
+	programs map[string]any
+	xdpEntryProg string
+}
+
+func keyedSparse() Manager {
+	return Manager{loaded: true, xdpEntryProg: "xdp_userspace_prog"}
+}
+`,
+			},
+		},
+		{
+			name: "keyed_dataplane_manager_in_slice_literal",
+			files: map[string]string{
+				"manager.go": `
+package dataplane
+
+type Manager struct {
+	loaded bool
+	programs map[string]any
+	xdpEntryProg string
+}
+
+func keyedSlice() []Manager {
+	return []Manager{{loaded: true, programs: nil, xdpEntryProg: "xdp_userspace_prog"}}
+}
+`,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := writeBoundaryFixture(t, tc.files)
+			violations := retainedUserspaceShimBoundaryViolations(t, []string{root}, false)
+			for _, v := range violations {
+				if strings.Contains(v, "positional dataplane.Manager literal") {
+					t.Fatalf("keyed Manager literal produced positional canary violation: %s\nall violations:\n%s",
+						v, strings.Join(violations, "\n"))
+				}
+			}
 		})
 	}
 }
@@ -1527,24 +1661,90 @@ func positionalDataplaneManagerLiteralViolations(t *testing.T, fset *token.FileS
 			continue
 		}
 		rel := repoRelativePath(t, parsed.path)
-		ast.Inspect(parsed.file, func(n ast.Node) bool {
-			lit, ok := n.(*ast.CompositeLit)
-			if !ok || !isPackageLocalDataplaneManagerLiteralType(lit.Type, managerTypeNames) {
-				return true
+		var walk func(node ast.Node, inferredManager bool)
+		walk = func(node ast.Node, inferredManager bool) {
+			if node == nil {
+				return
 			}
-			if len(lit.Elts) <= xdpEntryProgIndex || allCompositeLiteralElementsKeyed(lit) {
-				return true
+			lit, isLit := node.(*ast.CompositeLit)
+			if !isLit {
+				ast.Inspect(node, func(n ast.Node) bool {
+					if n == node {
+						return true
+					}
+					if inner, ok := n.(*ast.CompositeLit); ok {
+						walk(inner, false)
+						return false
+					}
+					return true
+				})
+				return
 			}
 
-			pos := fset.Position(lit.Pos())
-			violations = append(violations, fmt.Sprintf(
-				"%s:%d uses positional dataplane.Manager literal that can set xdpEntryProg from %q",
-				rel,
-				pos.Line,
-				canaryExprString(lit.Elts[xdpEntryProgIndex]),
-			))
-			return true
-		})
+			// Decide whether this CompositeLit's element type is a
+			// package-local dataplane.Manager. The explicit lit.Type form
+			// covers the common `Manager{...}` and `aliasManager{...}`
+			// shape; the inferred form covers nested literals inside a
+			// slice / array / map container whose element / value type is
+			// Manager, e.g. `[]Manager{{false, nil, "..."}}`. In the
+			// inferred case Go omits the inner literal's type and we have
+			// to propagate it from the enclosing container.
+			isManagerLit := false
+			switch {
+			case lit.Type != nil && isPackageLocalDataplaneManagerLiteralType(lit.Type, managerTypeNames):
+				isManagerLit = true
+			case lit.Type == nil && inferredManager:
+				isManagerLit = true
+			}
+
+			// Compute the inferred element / value type for nested literals
+			// inside this CompositeLit so the recursive walk can decide
+			// whether they should be treated as Manager literals.
+			childInferred := false
+			if lit.Type != nil {
+				switch ty := lit.Type.(type) {
+				case *ast.ArrayType:
+					childInferred = isPackageLocalDataplaneManagerLiteralType(ty.Elt, managerTypeNames)
+				case *ast.MapType:
+					childInferred = isPackageLocalDataplaneManagerLiteralType(ty.Value, managerTypeNames)
+				}
+			}
+
+			if isManagerLit && len(lit.Elts) > xdpEntryProgIndex {
+				target := lit.Elts[xdpEntryProgIndex]
+				// Only positional elements at xdpEntryProgIndex can leak
+				// the program name. A keyed element at that slot is by
+				// definition not setting xdpEntryProg positionally; if it
+				// is the xdpEntryProg= keyed form the per-field canary in
+				// userspaceXDPEntryProgramViolations catches it. Skipping
+				// here avoids confusing empty-string violations on mixed
+				// keyed / positional literals.
+				if _, keyed := target.(*ast.KeyValueExpr); !keyed {
+					pos := fset.Position(lit.Pos())
+					violations = append(violations, fmt.Sprintf(
+						"%s:%d uses positional dataplane.Manager literal that can set xdpEntryProg from %q",
+						rel,
+						pos.Line,
+						canaryExprString(target),
+					))
+				}
+			}
+
+			for _, elt := range lit.Elts {
+				switch e := elt.(type) {
+				case *ast.CompositeLit:
+					walk(e, childInferred)
+				case *ast.KeyValueExpr:
+					// Map-keyed: `"k": {...}` — value inherits container
+					// value type; key does not.
+					walk(e.Key, false)
+					walk(e.Value, childInferred)
+				default:
+					walk(elt, false)
+				}
+			}
+		}
+		walk(parsed.file, false)
 	}
 	return violations
 }
@@ -1630,18 +1830,6 @@ func typeIdentName(expr ast.Expr) string {
 
 func isPackageLocalDataplaneManagerLiteralType(expr ast.Expr, managerTypeNames map[string]bool) bool {
 	return managerTypeNames[typeIdentName(expr)]
-}
-
-func allCompositeLiteralElementsKeyed(lit *ast.CompositeLit) bool {
-	if lit == nil {
-		return false
-	}
-	for _, elt := range lit.Elts {
-		if _, ok := elt.(*ast.KeyValueExpr); !ok {
-			return false
-		}
-	}
-	return true
 }
 
 func userspaceXDPEntryProgramViolations(t *testing.T, roots []string) []string {

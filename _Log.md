@@ -2,6 +2,21 @@
 
 ## 2026-05-24
 
+- **Timestamp**: 2026-05-24T21:45:00Z
+  - **Action**: PR #1512 review follow-up — tightened the positional
+    `dataplane.Manager` literal canary on two axes. (a) Recurse into nested
+    composite literals whose `Type` is nil when the enclosing slice / array /
+    map container's element/value type is a package-local Manager named type,
+    closing the `[]Manager{{false, nil, "..."}}` / array / map bypass.
+    (b) Only flag when the element at `xdpEntryProgIndex` is positional
+    (not `*ast.KeyValueExpr`), so fully-keyed and mixed-where-xdpEntryProg-
+    is-keyed literals stop producing empty-string false-positive violations.
+    Added six fixture sub-tests pinning each direction.
+  - **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`, `_Log.md`
+  - **Validation**: `go test ./pkg/dataplane/ -count=1`;
+    `go test ./pkg/dataplane/ -count=1 -run
+    'TestRetainedUserspaceShimBoundary|TestPositionalDataplaneManager' -v`
+
 - **Timestamp**: 2026-05-24T20:58:00Z
   - **Action**: PR #1451 review follow-up — extended the RT_FLOW
     wire-offset canary across the full raw event layout and tightened
