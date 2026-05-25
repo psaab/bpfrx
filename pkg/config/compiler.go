@@ -237,17 +237,39 @@ func compileExpanded(tree *ConfigTree) (*Config, error) {
 	// an unrelated structural error (CoS, policers, scheduler-map)
 	// sees the migration message first. The retirement is the
 	// documented migration path; the other errors only become
-	// actionable after migration.
+	// actionable after migration. This precheck stays fail-fast
+	// (the no-leak contract is pinned by
+	// TestDataplaneTypeDPDKRejectedAtCommitFiresFirst in
+	// parser_ast_test.go).
 	if err := validateDataplaneTypeStrict(cfg); err != nil {
 		return nil, err
 	}
+
+	// #1538 — accumulate independent strict-validator families so
+	// `commit check` surfaces one error per family in a single
+	// response. This saves operator round-trips on first-touch
+	// upgrades from legacy candidates that carry several dormant
+	// structural findings at once. Validators in this group MUST
+	// remain independent: each reads its own typed sub-struct of
+	// *Config and does not depend on another's success. Each
+	// validator still fail-fasts INTERNALLY (one error per family
+	// in a single response), which is sufficient for the upgrade
+	// UX win; full intra-validator accumulation is deliberately
+	// out of scope. If a future validator depends on another's
+	// success it must be added as a separate post-accumulator
+	// step with its own guard rather than slotted in alongside
+	// the independent set.
+	var strictErrs []error
 	if err := validateClassOfServiceStrict(cfg.ClassOfService); err != nil {
-		return nil, err
+		strictErrs = append(strictErrs, err)
 	}
 	if err := validateThreeColorPolicersStrict(cfg.Firewall.ThreeColorPolicers); err != nil {
-		return nil, err
+		strictErrs = append(strictErrs, err)
 	}
 	if err := validatePolicySchedulerReferencesStrict(cfg); err != nil {
+		strictErrs = append(strictErrs, err)
+	}
+	if err := errors.Join(strictErrs...); err != nil {
 		return nil, err
 	}
 	if warnings := ValidateConfig(cfg); len(warnings) > 0 {

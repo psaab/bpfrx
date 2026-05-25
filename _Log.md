@@ -110,6 +110,184 @@
   - **File(s)**:
     `docs/pr/1520-userspace-boot-extraction/plan.md`,
     `docs/pr/1520-userspace-boot-extraction/reviewer-ids.md`
+- **Timestamp**: 2026-05-25T09:15:00Z
+  - **Action**: #1538 code-review round-2 doc cleanup —
+    Codex code review round 2 verdict was NEEDS-MINOR with
+    two doc-only findings (AGY round-2 was MERGE-READY,
+    Copilot pending):
+    1. plan.md still described the OLD
+       TestCompileSingleStrictErrorJoinPath design (hand-built
+       *Config / direct helper). Rewrote the description to
+       match the actual implementation (ParseSetCommand →
+       SetPath → CompileConfig path with single-CoS-only
+       fixture, byte-identity vs direct validator call as
+       reference, defense-in-depth zero-newline + wrap-chain
+       traversal assertions).
+    2. Many `file:line` citations remained in plan.md after
+       the first cleanup pass (compiler.go:244/247/250,
+       :363+, :241, :234-243, :262+, :82-153, store.go:681,
+       ast_edit.go:151-152, etc). Stripped all of them via
+       sed to use durable symbol references instead.
+    Also fixed a couple of leftover sed artifacts manually
+    (`/`:681`` artifact at line 414; the `at :363+`
+    construction at line 103).
+    Re-ran ./pkg/config/ + ./pkg/grpcapi/ tests: clean.
+  - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
+    `_Log.md`
+
+- **Timestamp**: 2026-05-25T09:00:00Z
+  - **Action**: #1538 code-review round-1 follow-up — addresses
+    Codex code-review NEEDS-MINOR (3 findings; AGY MERGE-READY,
+    Copilot PASS, Claude SMR PASS):
+    1. Rewrote `TestCompileSingleStrictErrorJoinPath` to drive
+       through `CompileConfig` rather than inline-duplicating
+       the accumulator pattern. New fixture uses ONLY the CoS
+       `equal-flow-enforcement` set line (no policer), so the
+       accumulator slice ends up length-1 and the test now
+       genuinely exercises the production path. Asserts
+       byte-identity vs a direct validator call on an
+       equivalent stub `*ClassOfServiceConfig`, zero '\n'
+       separators on the single-error path, and incidental
+       wrap-chain traversal (`errors.Is(err,
+       ErrDPDKDataplaneRetired) == false`).
+    2. Dropped stale `file:line` citations from compiler_test.go
+       and plan.md; switched to symbol references that survive
+       rebase drift.
+    3. Updated reviewer-ids.md with round-4 PLAN-READY
+       verdicts and recorded the code-review verdicts.
+    Re-ran the three new tests + the DPDK no-leak test
+    locally; all clean.
+  - **File(s)**: `pkg/config/compiler_test.go`,
+    `docs/pr/1538-multierror-validation/plan.md`,
+    `docs/pr/1538-multierror-validation/reviewer-ids.md`,
+    `_Log.md`
+
+- **Timestamp**: 2026-05-25T08:45:00Z
+  - **Action**: #1538 implementation (plan v4 PLAN-READY 4/4).
+    Plan-review summary: r1 Codex PLAN-NEEDS-MAJOR / AGY
+    PLAN-READY; r2 Codex PLAN-NEEDS-MINOR / AGY PLAN-READY;
+    r3 Codex PLAN-NEEDS-MINOR / AGY PLAN-NEEDS-MINOR; r4
+    Codex PLAN-READY / AGY PLAN-READY. v4 is the final plan.
+
+    Code change: `compileExpanded` in
+    `pkg/config/compiler.go:244-272` now accumulates the three
+    independent strict-validator family errors
+    (`validateClassOfServiceStrict`,
+    `validateThreeColorPolicersStrict`,
+    `validatePolicySchedulerReferencesStrict`) into a single
+    `errors.Join` return so `commit check` surfaces ONE error
+    per family in a single response. The
+    `validateDataplaneTypeStrict` precheck (added by #1536)
+    stays fail-fast and runs FIRST so the brittle-by-design
+    `TestDataplaneTypeDPDKRejectedAtCommitFiresFirst` no-leak
+    contract (parser_ast_test.go:2909+2913) keeps passing
+    byte-identically.
+
+    Tests added (3):
+    - `pkg/config/compiler_test.go::TestCompileMultipleStrictErrorsAccumulated`
+      — parser-driven via `CompileConfig` + `ParseSetCommand` /
+      `tree.SetPath` loop. Fixture: `equal-flow-enforcement`
+      on a scheduler without `transmit-rate exact` (parser-
+      reachable CoS error) + `single-rate color-blind` on a
+      three-color-policer without `committed-information-rate`
+      (parser-reachable policer error). Asserts both error
+      substrings present in the joined Error(), exactly one
+      '\n' separator, and `errors.Is(err,
+      ErrDPDKDataplaneRetired) == false` (defense-in-depth).
+    - `pkg/config/compiler_test.go::TestCompileSingleStrictErrorJoinPath`
+      — direct accumulator-pattern call with a hand-built
+      *Config that triggers only the CoS family. Pins
+      `errors.Join`'s single-element byte-identity semantics
+      (Go std lib pin at /usr/lib/go-1.24/src/errors/join.go:47-48
+      per Codex round-2 verification).
+    - `pkg/grpcapi/server_config_test.go::TestCompileCheckMultiErrorRendersThroughGRPC`
+      — exercises the actual operator-facing gRPC rendering
+      via `status.Errorf(codes.InvalidArgument, "%v", err)`
+      at `server_config.go:176`. Direct-handler style
+      (no bufconn) per existing pattern at lines 15-25.
+      Asserts `codes.InvalidArgument` + both substrings +
+      one '\n' separator on the rendered status.Message().
+
+    Local validation: `go build ./...` clean, `go test
+    ./...` clean (30 packages), 5× flake loop on the three
+    new tests + the DPDK no-leak test all clean.
+
+    Also tidied two cosmetic stale-wording items Codex r4
+    called out as non-blocking: "Land plan v2" → "Land plan
+    ... v4 is the final" and "Open questions ... (round 2)"
+    → "(historical)".
+  - **File(s)**: `pkg/config/compiler.go`,
+    `pkg/config/compiler_test.go` (new),
+    `pkg/grpcapi/server_config_test.go`,
+    `docs/pr/1538-multierror-validation/plan.md`,
+    `docs/pr/1538-multierror-validation/reviewer-ids.md` (new),
+    `_Log.md`
+
+- **Timestamp**: 2026-05-25T08:30:00Z
+  - **Action**: #1538 plan v4 — addresses Codex round-3
+    PLAN-NEEDS-MINOR (3 findings) + AGY round-3
+    PLAN-NEEDS-MINOR (1 finding). Changes:
+    (1) drop "REQUIRED" rationale for `set system
+        dataplane-type userspace` (no-op — unset == userspace
+        per `effectiveDataplaneType` and validateDataplaneTypeStrict
+        only rejects explicit `dpdk`); line stays as
+        self-documenting future-proof;
+    (2) fix test-count "two" → "three" throughout the plan;
+    (3) replace bad-syntax three-color-policer line
+        `action loss-priority high then discard` (parses via
+        schema-less fallback, silently ignored by compiler)
+        with schema-clean `then discard`;
+    (4) rewrite gRPC test plan to match existing
+        direct-handler style at server_config_test.go:15-25
+        (no bufconn; use `store.LoadSet` per existing
+        pattern, not nonexistent `LoadCandidate`/`Edit`).
+    Sanity-checked the fixture locally with a throw-away
+    test: under current fail-fast, only CoS error surfaces;
+    under accumulator both surface separated by one '\n'.
+  - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
+    `_Log.md`
+
+- **Timestamp**: 2026-05-25T08:15:00Z
+  - **Action**: #1538 plan v3 — addresses Codex round-2
+    PLAN-NEEDS-MINOR on plan v2. AGY round-2 was PLAN-READY.
+    Minor fix: v2's CoS fixture used "both buffer-size bytes
+    AND percent set" which is NOT parser-reachable
+    (`pkg/config/compiler_class_of_service.go:239` clears the
+    alternate field; validator at `pkg/config/compiler.go:386`
+    documents the state arises only from constructed configs).
+    v3 switches the parser-driven tests to use
+    `equal-flow-enforcement` without `transmit-rate exact` as
+    the parser-reachable CoS error and `single-rate
+    color-blind` without `committed-information-rate` as the
+    parser-reachable policer error. Also clarifies that there
+    are THREE new tests (not two) and splits fixture-build
+    technique per-test (parser for tests 1+3, direct-helper
+    for the byte-identity test 2).
+  - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
+    `_Log.md`
+
+- **Timestamp**: 2026-05-25T08:00:00Z
+  - **Action**: #1538 plan v2 — addresses Codex round-1
+    PLAN-NEEDS-MAJOR (4 findings) on plan v1. Changes:
+    (a) keep `validateDataplaneTypeStrict` as a separate
+    fail-fast precheck BEFORE the accumulator — preserves
+    #1536's DPDK-first / no-leak contract pinned by
+    `TestDataplaneTypeDPDKRejectedAtCommitFiresFirst`
+    (`pkg/config/parser_ast_test.go:2855,:2909,:2913`);
+    (b) drop the "matches Junos commit check" overclaim and
+    frame the change as an xpf UX choice grounded in
+    upgrade-friction reduction; (c) tighten wording from
+    "all structural errors" to "one error per validator
+    family" since each strict family still fail-fasts
+    internally; (d) add a third test
+    `TestCompileCheckMultiErrorRendersThroughGRPC` covering
+    the multi-line rendering through `pkg/grpcapi`.
+    AGY round-1 verdict was PLAN-READY; v2 preserves the
+    audit it confirmed (validator independence, substring
+    + sentinel preservation, wrap-chain mechanics).
+    Rebased onto current master (which now has #1536).
+  - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
+    `_Log.md`
 
 - **Timestamp**: 2026-05-25T05:55:00Z
   - **Action**: PR #1536 round-3 cleanup — address Codex MAJOR
@@ -283,7 +461,21 @@
     is deferred to #1527/#1528. This PR adds a leading retirement
     note above it instead.
   - **File(s)**: `docs/pr/1529-dpdk-docs-sweep/plan.md`, `_Log.md`
-## 2026-05-25
+
+- **Timestamp**: 2026-05-25T07:30:00Z
+  - **Action**: #1538 plan v1 (DRAFT) — accumulate strict validation
+    errors via `errors.Join` in `compileExpanded` so `commit check`
+    surfaces every dormant structural finding in one pass instead
+    of forcing whack-a-mole CLI round-trips. Plan composes with the
+    in-flight #1536 (validateDataplaneTypeStrict) under either merge
+    order. Walks Junos UX (Junos itself accumulates), validator
+    independence (each strict validator reads its own typed sub-
+    struct, all nil-safe), substring/sentinel contract preservation
+    (`strings.Contains` + `errors.Is` traverse `errors.Join`), and
+    risk table. Calls out 7 hostile reviewer questions including
+    PLAN-KILL grounds.
+  - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
+    `_Log.md`
 
 - **Timestamp**: 2026-05-25T05:00:00Z
   - **Action**: #1501 A2 — replaced the stale TODO + contradictory
@@ -2627,3 +2819,11 @@
   go test ./... green (32 packages); retirement boundary canary updated
   with pkg/cluster/runtime.go allowlist entry + 1373 README + cluster
   README. Smoke + test-failover pending (HA-sensitive scope per CLAUDE.md).
+
+- **Timestamp**: 2026-05-25T15:31Z
+  - **Action**: PR #1538 Copilot code-review round-2 — fix `want`
+    variable shadowing in TestCompileSingleStrictErrorJoinPath and
+    add TestCompileAllThreeStrictValidatorsAccumulated to close the
+    third-family (validatePolicySchedulerReferencesStrict) coverage
+    gap flagged in round-1 review.
+  - **File(s)**: `pkg/config/compiler_test.go`
