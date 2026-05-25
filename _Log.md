@@ -2590,3 +2590,12 @@
   validation outcome. All three are purely cosmetic; no diff to
   pkg/logging/README.md.
 - **Validation**: cosmetic-only; no test/build rerun needed.
+
+- **Timestamp**: 2026-05-24T12:00Z
+- **Action**: Draft #1518 plan v1 (cluster session-sync off legacy dataplane.DataPlane)
+- **File(s)**: docs/pr/1518-cluster-session-sync-migration/plan.md, reviewer-ids.md
+- **Why**: Sub-#1451 S3 — narrow pkg/cluster boundary to a backend-neutral
+  clusterRuntime interface; constructors + setter no longer name
+  dataplane.DataPlane. Keep SetDataPlane as a deprecated alias for one cycle.
+  HA-touching scope: must pass make test-failover.
+- **Validation**: pending Codex + Antigravity adversarial plan review.
