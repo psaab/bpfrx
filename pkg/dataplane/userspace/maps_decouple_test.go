@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode"
 )
 
 // TestNoLiteralMapNamesOutsideRegistry enforces that no .Map() call
@@ -205,80 +206,193 @@ func findForbiddenMapNameAliases(src string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	var hits []string
-	seen := make(map[ast.Node]bool)
 
-	// Track which BasicLit nodes are immediate operands of a
-	// string-concatenation we are about to evaluate as a folded
-	// whole, so we do not double-report them from the basic walk.
-	concatOperand := make(map[ast.Node]bool)
+	// Build a const-identifier symbol table by walking every
+	// top-level const decl. Values that are themselves foldable
+	// string expressions get a fully-resolved string. Identifiers
+	// in initializers are resolved against the partial table
+	// (Go forbids forward references between top-level consts so
+	// the source order is a topological order; walking decls in
+	// file order is sufficient).
+	consts := map[string]string{}
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for i, name := range vs.Names {
+				if i >= len(vs.Values) {
+					continue
+				}
+				if v, ok := evalStringExpr(vs.Values[i], consts); ok {
+					consts[name.Name] = v
+				}
+			}
+		}
+	}
+
+	// Track which AST nodes have already been reported as part of
+	// a folded concat so the basic-literal walk does not double-
+	// report.
+	concatOperand := map[ast.Node]bool{}
+
+	hitSet := map[string]struct{}{}
+	report := func(s string) {
+		// Permitted: known non-map operator-facing tokens, and
+		// the registry-internal exact strings (those are flagged
+		// only when they appear OUTSIDE maps.go; this helper has
+		// no visibility into file boundaries, so the file-walker
+		// caller already excludes maps.go).
+		if isKnownNonMapUserspaceLiteral(s) {
+			return
+		}
+		hitSet[s] = struct{}{}
+	}
+
+	// Pass 1: walk every CallExpr / *ast.Ident / BinaryExpr that
+	// evaluates to a static string starting with "userspace_".
+	// This catches concat folds (AGY r2 §D) and const-ident
+	// resolution (AGY r3 §ii).
 	ast.Inspect(file, func(n ast.Node) bool {
 		bin, ok := n.(*ast.BinaryExpr)
 		if !ok || bin.Op != token.ADD {
 			return true
 		}
-		if folded, fok := evalStringConcat(bin); fok {
-			if strings.HasPrefix(folded, "userspace_") {
-				trimmed := strings.Trim(folded, " \t%")
-				if !isKnownNonMapUserspaceLiteral(trimmed) {
-					hits = append(hits, folded)
-				}
-			}
+		folded, fok := evalStringExpr(bin, consts)
+		if !fok {
+			return true
+		}
+		if isMapNameSuspect(folded) {
+			report(folded)
 			markBasicLitOperands(bin, concatOperand)
-			seen[bin] = true
 		}
 		return true
 	})
 
+	// Pass 2: walk every CallExpr argument — when the argument
+	// resolves (via const-ident, concat, paren) to a static
+	// "userspace_*" string, report it. Catches the AGY r3 §ii
+	// const-ident bypass even when the const value is built from
+	// other const idents. Also applies the trim-padded check
+	// so AGY r3 §iii padded-const-ident bypasses are caught.
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		for _, arg := range call.Args {
+			if _, isLit := arg.(*ast.BasicLit); isLit {
+				// Basic literals are covered by Pass 3.
+				continue
+			}
+			s, ok := evalStringExpr(arg, consts)
+			if !ok {
+				continue
+			}
+			if isMapNameSuspect(s) {
+				report(s)
+				continue
+			}
+			// AGY r3 §iii: const value with non-ASCII whitespace
+			// padding. Trim and re-check against the exact
+			// registry.
+			trimmed := trimPaddingForBypass(s)
+			if trimmed != s && isExactRegistryMapName(trimmed) {
+				report(trimmed)
+			}
+		}
+		return true
+	})
+
+	// Pass 3: basic-literal walk for direct literals (including
+	// trim-padded bypasses, AGY r2 §A and AGY r3 §iii).
 	ast.Inspect(file, func(n ast.Node) bool {
 		lit, ok := n.(*ast.BasicLit)
 		if !ok || lit.Kind != token.STRING {
 			return true
 		}
 		if concatOperand[lit] {
-			// Already reported as part of a folded concat.
 			return true
 		}
 		s, err := strconv.Unquote(lit.Value)
 		if err != nil {
 			return true
 		}
-		// (D) covered by the concat pass above. This pass handles:
-		// (A) trimmed-match: a literal padded with whitespace/`%`
-		//     verbs that, when trimmed, equals a registered name.
-		// Standard: a literal that starts with "userspace_" and
-		// contains no whitespace.
-		trimmed := strings.Trim(s, " \t%")
-		switch {
-		case strings.HasPrefix(s, "userspace_") && !strings.ContainsAny(s, " \t"):
-			if !isKnownNonMapUserspaceLiteral(s) {
-				hits = append(hits, s)
-			}
-		case strings.HasPrefix(trimmed, "userspace_") && trimmed != s:
-			// Padding bypass: only flag if the trimmed value
-			// exactly matches a registered map name. This avoids
-			// flagging legitimate prose like
-			// "update userspace_local_v4 %08x: %w" which trims to
-			// "update userspace_local_v4" — does not start with
-			// "userspace_" after trim either side.
-			if isExactRegistryMapName(trimmed) {
-				hits = append(hits, s)
-			}
+		// Standard rule: starts with "userspace_" and contains no
+		// whitespace (unicode-aware so `\n`/`\r`/etc are caught).
+		if strings.HasPrefix(s, "userspace_") && !containsUnicodeSpace(s) {
+			report(s)
+			return true
+		}
+		// Trim-padded rule: a literal padded with whitespace
+		// (unicode-aware) or `%` verb characters whose trimmed
+		// value exactly equals a registered map name is a bypass.
+		trimmed := trimPaddingForBypass(s)
+		if trimmed != s && isExactRegistryMapName(trimmed) {
+			report(s)
 		}
 		return true
 	})
-	_ = seen
+	hits := make([]string, 0, len(hitSet))
+	for s := range hitSet {
+		hits = append(hits, s)
+	}
 	return hits, nil
 }
 
-// evalStringConcat folds a `+` BinaryExpr whose operands are all
-// string basic literals (recursively through nested +s and
-// parentheses). Returns the folded string and true if the whole
-// expression evaluates to a static string.
-func evalStringConcat(e ast.Expr) (string, bool) {
+// isMapNameSuspect returns true when s is a folded string that
+// looks like a forbidden map-name alias. It is the entry point for
+// the concat/ident passes; the basic-literal pass has additional
+// trim-padded handling because only it sees raw literal padding.
+func isMapNameSuspect(s string) bool {
+	if !strings.HasPrefix(s, "userspace_") {
+		return false
+	}
+	if containsUnicodeSpace(s) {
+		// A folded value with whitespace is prose-like and
+		// almost certainly not a map name. Real map names are
+		// snake_case ASCII.
+		return false
+	}
+	return true
+}
+
+// containsUnicodeSpace returns true if s contains any Unicode
+// whitespace rune — including the non-ASCII characters AGY r3 §iii
+// flagged as bypass material (e.g. \n, \r, NBSP).
+func containsUnicodeSpace(s string) bool {
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// trimPaddingForBypass strips any leading/trailing whitespace
+// (unicode-aware) and any `%` format-verb characters. Returns the
+// trimmed value. AGY r3 §iii: must include all whitespace runes,
+// not just space/tab.
+func trimPaddingForBypass(s string) string {
+	s = strings.TrimFunc(s, unicode.IsSpace)
+	s = strings.Trim(s, "%")
+	return s
+}
+
+// evalStringExpr folds an expression to a static string, walking
+// BinaryExpr `+`, ParenExpr, BasicLit, and *ast.Ident (resolved
+// against the supplied const symbol table). Returns the value and
+// true on success. AGY r3 §ii: ident resolution closes the
+// `const x = "a"; const y = "b"; const z = x + y` bypass.
+func evalStringExpr(e ast.Expr, consts map[string]string) (string, bool) {
 	switch n := e.(type) {
 	case *ast.ParenExpr:
-		return evalStringConcat(n.X)
+		return evalStringExpr(n.X, consts)
 	case *ast.BasicLit:
 		if n.Kind != token.STRING {
 			return "", false
@@ -288,15 +402,21 @@ func evalStringConcat(e ast.Expr) (string, bool) {
 			return "", false
 		}
 		return s, true
+	case *ast.Ident:
+		if consts == nil {
+			return "", false
+		}
+		v, ok := consts[n.Name]
+		return v, ok
 	case *ast.BinaryExpr:
 		if n.Op != token.ADD {
 			return "", false
 		}
-		l, lok := evalStringConcat(n.X)
+		l, lok := evalStringExpr(n.X, consts)
 		if !lok {
 			return "", false
 		}
-		r, rok := evalStringConcat(n.Y)
+		r, rok := evalStringExpr(n.Y, consts)
 		if !rok {
 			return "", false
 		}
@@ -426,7 +546,11 @@ func (M) Map(string) any { return nil }
 			// AGY r2 (A): a literal padded with a trailing space
 			// (would slip past the no-whitespace rule), but the
 			// trimmed value exactly matches a registered name.
-			want: []string{"userspace_ctrl "},
+			// Two hits expected: the raw padded literal (from
+			// Pass 3 trim check) AND the trimmed clean value
+			// (from Pass 2 call-arg trim check). Dedup keeps both
+			// because they are distinct strings.
+			want: []string{"userspace_ctrl ", "userspace_ctrl"},
 		},
 		{
 			name: "operator_log_prose_allowed",
@@ -447,6 +571,55 @@ func S() string { return "userspace_compat" }
 			name: "raw_string_literal_caught",
 			src: "package x\nfunc F(m M) { _ = m.Map(`userspace_raw_alias`) }\ntype M struct{}\nfunc (M) Map(string) any { return nil }\n",
 			want: []string{"userspace_raw_alias"},
+		},
+		{
+			name: "agy_r3_ii_const_ident_concat",
+			src: `package x
+const pfx = "user"
+const sfx = "space_ctrl"
+const bypass = pfx + sfx
+func F(m M) { _ = m.Map(bypass) }
+type M struct{}
+func (M) Map(string) any { return nil }
+`,
+			// AGY r3 §ii: const-ident resolution. Two leaf
+			// literals neither of which starts with "userspace_";
+			// the folded value does. The const-symbol table closes
+			// the bypass; reported on the const decl line.
+			want: []string{"userspace_ctrl"},
+		},
+		{
+			name: "agy_r3_ii_call_arg_via_ident",
+			src: `package x
+const bypass = "userspace_ctrl"
+func F(m M) { _ = m.Map(bypass) }
+type M struct{}
+func (M) Map(string) any { return nil }
+`,
+			// AGY r3 §ii: call-arg ident resolution. The basic
+			// literal in the const decl AND the call-arg via
+			// ident both resolve to the same value; dedup is the
+			// expected behaviour.
+			want: []string{"userspace_ctrl"},
+		},
+		{
+			name: "agy_r3_iii_newline_padding",
+			src: "package x\nconst bypass = \"userspace_ctrl\\n\\t\"\nfunc F(m M) { _ = m.Map(bypass) }\ntype M struct{}\nfunc (M) Map(string) any { return nil }\n",
+			// AGY r3 §iii: padding with non-space whitespace
+			// (newline + tab). The trim-padded check must use
+			// unicode.IsSpace; trimmed value equals
+			// "userspace_ctrl" which matches the registry.
+			// Reported on both the const decl literal and the
+			// call-arg via ident resolution.
+			want: []string{"userspace_ctrl\n\t", "userspace_ctrl"},
+		},
+		{
+			name: "agy_r3_iii_nbsp_padding",
+			src: "package x\nconst bypass = \"userspace_ctrl\\u00A0\"\nfunc F(m M) { _ = m.Map(bypass) }\ntype M struct{}\nfunc (M) Map(string) any { return nil }\n",
+			// AGY r3 §iii: NBSP (U+00A0) is whitespace by Unicode.
+			// trimPaddingForBypass uses unicode.IsSpace so NBSP is
+			// stripped; trimmed value equals "userspace_ctrl".
+			want: []string{"userspace_ctrl ", "userspace_ctrl"},
 		},
 	}
 
@@ -510,29 +683,72 @@ func TestRegistryParityWithLegacyLoader(t *testing.T) {
 			"or delete this canary)", loaderPath, err)
 	}
 
-	for _, tc := range []struct {
-		name  string
-		value string
-	}{
-		{"mapNameUserspaceCtrl", mapNameUserspaceCtrl},
-		{"mapNameUserspaceBindings", mapNameUserspaceBindings},
-		{"mapNameUserspaceHeartbeat", mapNameUserspaceHeartbeat},
-		{"mapNameUserspaceXSK", mapNameUserspaceXSK},
-		{"mapNameUserspaceCPUMap", mapNameUserspaceCPUMap},
-		{"mapNameUserspaceSessions", mapNameUserspaceSessions},
-		{"mapNameUserspaceIngressIfaces", mapNameUserspaceIngressIfaces},
-		{"mapNameUserspaceLocalV4", mapNameUserspaceLocalV4},
-		{"mapNameUserspaceLocalV6", mapNameUserspaceLocalV6},
-		{"mapNameUserspaceInterfaceNATv4", mapNameUserspaceInterfaceNATv4},
-		{"mapNameUserspaceInterfaceNATv6", mapNameUserspaceInterfaceNATv6},
-		{"mapNameUserspaceShimDegradedStats", mapNameUserspaceShimDegradedStats},
-	} {
-		quoted := []byte(`"` + tc.value + `"`)
+	// Dynamically discover every `mapName...` constant defined in
+	// maps.go via AST parse. AGY r3 §v: a hardcoded list goes stale
+	// when a new constant is added; using the AST keeps the parity
+	// check self-extending.
+	entries, err := parseMapsGoRegistry("maps.go")
+	if err != nil {
+		t.Fatalf("parse maps.go: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatalf("parseMapsGoRegistry returned no constants — maps.go shape changed?")
+	}
+	for _, e := range entries {
+		quoted := []byte(`"` + e.value + `"`)
 		if !bytes.Contains(body, quoted) {
 			t.Errorf(
 				"%s = %q not found as a quoted literal in %s — "+
 					"parity broken: rename both sides together or update this canary",
-				tc.name, tc.value, loaderPath)
+				e.name, e.value, loaderPath)
 		}
 	}
+}
+
+// registryEntry holds one constant from maps.go for parity checks.
+type registryEntry struct {
+	name  string
+	value string
+}
+
+// parseMapsGoRegistry parses maps.go and returns every top-level
+// `const mapName... = "..."` declaration. Skips comments, blank
+// identifiers, and non-string values.
+func parseMapsGoRegistry(path string) ([]registryEntry, error) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+	if err != nil {
+		return nil, err
+	}
+	var out []registryEntry
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for i, name := range vs.Names {
+				if i >= len(vs.Values) {
+					continue
+				}
+				if !strings.HasPrefix(name.Name, "mapName") {
+					continue
+				}
+				lit, ok := vs.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					continue
+				}
+				v, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					continue
+				}
+				out = append(out, registryEntry{name: name.Name, value: v})
+			}
+		}
+	}
+	return out, nil
 }

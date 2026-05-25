@@ -288,6 +288,31 @@
     Rebased onto current master (which now has #1536).
   - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
     `_Log.md`
+- **Timestamp**: 2026-05-25T16:15:00Z
+  - **Action**: #1521 r3 code-review fixes — AGY r3 found four
+    more bypass classes; all addressed: (i) deeply nested concat
+    confirmed SECURE — no change needed. (ii) Const-ident bypass
+    (`const pfx="user"; const sfx="space_ctrl"; const bypass=pfx+sfx`)
+    closed by adding a top-level const symbol table and recursive
+    `evalStringExpr` that resolves `*ast.Ident` against it; new
+    Pass 2 walks every CallExpr argument and reports ident-
+    resolved "userspace_*" values. (iii) Non-standard whitespace
+    padding (`"userspace_ctrl\n\t"`, NBSP) closed by switching
+    whitespace detection to `unicode.IsSpace`; trimPaddingForBypass
+    strips Unicode-defined whitespace. (iv) Removed orphan `seen`
+    map. (v) Parity canary now AST-parses maps.go via new
+    `parseMapsGoRegistry()` helper — no hardcoded list. Hits are
+    dedup'd via map[string]struct{}. 4 new negative-fixture sub-
+    cases (agy_r3_ii_const_ident_concat, agy_r3_ii_call_arg_via_
+    ident, agy_r3_iii_newline_padding, agy_r3_iii_nbsp_padding)
+    prove the kills.
+    Codex r3 review rejected as basis-error (codex ran against
+    pr-1494-head not the worktree HEAD); no substantive findings.
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md
+  - **Validation**: 4 canary tests + 14 alias-bypass sub-cases all
+    pass; go test ./... all 30 packages green.
+
 - **Timestamp**: 2026-05-25T15:50:00Z
   - **Action**: #1521 r2 code-review fixes — Codex LOW-2 (%
     exemption allows format-template bypass) + AGY r2 §A (trim-

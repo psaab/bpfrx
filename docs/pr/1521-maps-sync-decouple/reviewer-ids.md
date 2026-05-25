@@ -22,4 +22,7 @@ Plan is PLAN-READY v2 after both r1 verdicts addressed.
 | 2 | Codex | workflow 20260525-145416-0c2271 (impl r2) | LOW×2; 1 ACCEPT 1 REJECT → r3 |
 | 2 | Antigravity | adversarial-review-mplcnpph-45ufpf | CODE-NEEDS-MAJOR (concat fold + trim-bypass) → r3 |
 | 2 | Claude SMR | self-review post-r2-fixes | MERGE-READY pending r3 confirm |
+| 3 | Codex | workflow 20260525-145416-0c2271 (impl r3) | HIGH×2 MED×1 — REJECT all (review-basis error: Codex inspected wrong checkout) |
+| 3 | Antigravity | adversarial-review-mplczt4g-jjot6z | CODE-NEEDS-MAJOR (const-ident bypass + non-standard whitespace + seen orphan + parity hardcode) → r4 |
+| 3 | Claude SMR | self-review post-r3-fixes | MERGE-READY pending r4 confirm |
 
