@@ -12,8 +12,11 @@ unchanged.
 
 - **Antigravity (job adversarial-review-mpkq2awd-e66pif):**
   **PLAN-NEEDS-MINOR.** Confirmed RFC 768 / RFC 8200 accuracy, code
-  reality (outer.rs:103 writes 0; lines 57-69 hold the stale TODO),
-  caller analysis (test-only), receive-side analysis (try_decap
+  reality (the `hdr[26..28].copy_from_slice(&0u16.to_be_bytes())`
+  write at the end of `write_outer_ipv4_udp` writes 0; the doc
+  block immediately above holds the stale `TODO(#1499 r4 /
+  udp-checksum)`), caller analysis (test-only), receive-side
+  analysis (try_decap
   takes post-strip wg_record), and perf framing. Sole minor: the
   proposed `udp_checksum_is_zero_on_ipv4_outer` test would silently
   pass under regression because `let mut out = [0u8; 40]` is
@@ -79,19 +82,24 @@ follow-up:
 > `write_outer_ipv4_udp` plus 2 tests."
 
 The issue body is **wrong on a load-bearing fact**: the current
-code already emits `cs=0`. `userspace-dp/src/afxdp/wg/outer.rs:103`
-reads:
+code already emits `cs=0`. The bottom of `write_outer_ipv4_udp` in
+`userspace-dp/src/afxdp/wg/outer.rs` reads (writing zero into the
+UDP checksum field at bytes 26..27 of the emitted header):
 
 ```rust
 hdr[26..28].copy_from_slice(&0u16.to_be_bytes()); // checksum = 0
 ```
 
-What the file is internally inconsistent about:
+What the file is internally inconsistent about (at the pre-change
+HEAD of `master`, before this PR's edits — line numbers drifted
+once the doc comment was rewritten):
 
-- Lines 52-55: doc comment correctly explains we set UDP cs to 0
-  (RFC 768) and why — "UDP checksum offload semantics differ across
-  NICs and we want a known-baseline behavior".
-- Lines 57-69: a `TODO(#1499 r4 / udp-checksum)` block claims the
+- The inline doc comment immediately above the function correctly
+  explains we set UDP cs to 0 (RFC 768) and why — "UDP checksum
+  offload semantics differ across NICs and we want a
+  known-baseline behavior".
+- A `TODO(#1499 r4 / udp-checksum)` block immediately below that
+  comment claims the
   opposite — that the integration PR should compute the UDP
   checksum or delegate to offload, citing "kernel WG and
   wireguard-go emit a non-zero UDP checksum on IPv4".
@@ -137,14 +145,15 @@ emits `cs=0`. So the *runtime* perf delta of this PR is **zero**.
 
 The actual value is:
 
-- **Doc correctness.** Future contributors reading `outer.rs:57`
-  would see a TODO directing them to add UDP-checksum compute or
-  offload and might act on it, regressing the wire behavior we
-  intentionally have. The TODO is a landmine.
-- **Test coverage.** Today nothing asserts `cs==0` on the wire.
-  Anyone "fixing" the cs=0 to compute (the TODO's instruction)
-  would not trip any existing test. That's the silent-regression
-  surface this PR closes.
+- **Doc correctness.** Before this PR, the `TODO(#1499 r4 /
+  udp-checksum)` block on `write_outer_ipv4_udp` directed future
+  contributors to add UDP-checksum compute or NIC offload. Acting
+  on it would have regressed the wire behavior we intentionally
+  have. This PR removes the landmine.
+- **Test coverage.** Before this PR nothing asserts `cs==0` on the
+  wire. Anyone "fixing" the cs=0 to compute (the now-removed
+  TODO's instruction) would not have tripped any existing test.
+  That's the silent-regression surface this PR closes.
 - **#1501 close-out.** A2 is in the tracker; closing it via
   doc/test cleanup is the honest disposition since the code half
   already shipped.
@@ -157,8 +166,10 @@ with #1499 — this PR is documentation + a regression gate.
 
 ## What's already shipped / partially batched
 
-- #1499 merged with `write_outer_ipv4_udp` writing `cs=0` at
-  line 103. Both the inline comment at 52-55 (correct) and the
+- #1499 merged with `write_outer_ipv4_udp` writing `cs=0` (the
+  `hdr[26..28].copy_from_slice(&0u16.to_be_bytes())` statement at
+  the end of the function). Both the inline cs=0 doc comment
+  (correct) and the
   TODO at 57-69 (now stale) landed together.
 - IPv6 outer is not implemented at all — only IPv4 outer is
   supported in #1499 scope. RFC 8200 §8.1 (non-zero UDP cs
@@ -380,7 +391,8 @@ within `userspace-dp/src/afxdp/wg/`.
    doc/test cleanup) vs. closing the tracker item as "already
    shipped" with no PR? If the latter is preferred, PLAN-KILL is
    the right call and I'll comment on the issue.
-2. **Stale TODO removal.** Is the TODO at lines 57-69 truly
+2. **Stale TODO removal.** Is the `TODO(#1499 r4 /
+   udp-checksum)` block on `write_outer_ipv4_udp` truly
    stale, or is there a real wire-interop case in the test lab
    today (e.g., a known midbox path) where cs=0 has been
    observed to be dropped? If so, the TODO should stay (perhaps

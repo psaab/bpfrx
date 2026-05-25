@@ -227,10 +227,11 @@ mod outer_tests {
         assert_eq!(cs, 0, "header self-check failed (cs={:#06x})", cs);
         // Wire-byte gate: UDP checksum field MUST be zero per
         // RFC 768 / this engine's intentional cs=0 default. If a
-        // future commit deletes the cs=0 write at line ~103 of
-        // this file, this assertion fails. The 0xff pre-fill
-        // ensures the assertion proves the function *wrote* zero,
-        // not that the buffer was already zero-initialized.
+        // future commit deletes the `hdr[26..28]` zero-checksum
+        // write in `write_outer_ipv4_udp`, this assertion fails.
+        // The 0xff pre-fill ensures the assertion proves the
+        // function *wrote* zero, not that the buffer was already
+        // zero-initialized.
         assert_eq!(
             &out[26..28],
             &[0, 0],
