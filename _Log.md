@@ -2,6 +2,22 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-26T01:00:00Z
+  - **Action**: Round-3 reviewer verdicts complete on PR #1550 HEAD
+    444a1959. Codex MERGE-READY (no findings). AGY MERGE-READY
+    (8/8 invariants verified, 3 Copilot round-2 nits resolved).
+    Copilot round-3 COMMENTED with no new comments — implicit
+    MERGE-READY. 4-of-4 reviewers agree (including Claude SMR).
+    Smoke matrix on loss userspace cluster: PASS — per-class v4/v6
+    × push/-R matrix consistent and healthy. Best-effort port 5201
+    ~80 Mbps push is expected (low-priority CoS surplus floor
+    under concurrent class load). All other classes shaped
+    correctly per their CIR + surplus. Reverse direction 6-8 Gbps
+    across all classes. Smoke results posted as PR comment. PR
+    ready for author merge.
+  - **File(s)**: smoke matrix on loss:xpf-userspace-fw0/fw1; no
+    code changes.
+
 - **Timestamp**: 2026-05-26T00:30:00Z
   - **Action**: PR #1550 round-2 reviews landed. Codex MERGE-READY
     (no findings; all wording fixes confirmed). AGY MERGE-READY

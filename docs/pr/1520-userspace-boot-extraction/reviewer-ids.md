@@ -32,11 +32,19 @@ Per-round reviewer task / job IDs for the triple-review skill.
 - Antigravity job ID: `adversarial-review-mplcf05h-abqou8` — VERDICT MERGE-READY (8/8 invariants verified; clean rebase assessment)
 - Copilot review: COMMENTED — 3 doc nits (stale legacy-caller list in Boot() doc + canary test docstring; README "only" wording); all addressed in round-3 commit
 
-### Round 3 (after Copilot round-2 doc nits)
+### Round 3 (after Copilot round-2 doc nits, HEAD 444a1959)
 
-- Codex task ID: _pending re-dispatch_
-- Antigravity job ID: _pending re-dispatch_
-- Copilot review: triggered via `@copilot review` PR comment
+- Codex task ID: _bg task bzjreb3hv (codex exec)_ — VERDICT MERGE-READY (no findings; only docs/comments changed; targeted tests pass)
+- Antigravity job ID: `adversarial-review-mplcpbnz-5avtoo` — VERDICT MERGE-READY (3 Copilot round-2 nits resolved; 8/8 invariants intact; doc-only change scope)
+- Copilot review: COMMENTED with no new comments — implicit MERGE-READY
+
+## Smoke matrix outcome
+
+PASS — per-class v4/v6 × push/-R matrix on loss userspace cluster
+on HEAD 444a1959. Best-effort 5201 at ~80 Mbps push (expected
+low-priority CoS surplus floor); per-class shaping consistent
+across v4/v6; reverse direction 6-8 Gbps across all classes. No
+data-path regression observable.
 
 ## Notes
 
