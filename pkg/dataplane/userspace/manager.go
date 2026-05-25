@@ -58,9 +58,43 @@ func (m DataplaneMode) String() string {
 }
 
 func init() {
+	// RegisterRuntimeBackend retains the userspace runtime as a
+	// compatibility / test seam for callers that go through the legacy
+	// dataplane.NewRuntimeDataPlane(...) factory (and for the existing
+	// canaries that exercise the registry round-trip). Daemon startup
+	// prefers userspace.Boot() directly via the pkg/daemon helper, so
+	// this registry entry is no longer the canonical boot path.
+	// Removing it is out of scope for #1520; #1474 already permits its
+	// presence as the test / compatibility seam.
 	dataplane.RegisterRuntimeBackend(dataplane.TypeUserspace, func() dataplane.RuntimeDataPlane {
-		return NewLegacyDataPlaneAdapter(New())
+		return Boot()
 	})
+}
+
+// Boot constructs the userspace AF_XDP runtime and returns it as a
+// dataplane.RuntimeDataPlane wrapped in the legacy-compatible adapter.
+//
+// Daemon startup prefers Boot() over dataplane.NewRuntimeDataPlane(
+// TypeUserspace) for the default and explicit userspace selections.
+// The runtime backend registry entry for TypeUserspace (see init()
+// above) is retained as a compatibility / test seam — it remains
+// reachable via dataplane.NewRuntimeDataPlane(TypeUserspace) but is
+// no longer the canonical daemon boot path.
+//
+// The explicit "dataplane-type ebpf" rollback does NOT use the
+// userspace registry entry at all; it goes through the
+// dataplane.NewRuntimeDataPlane → TypeEBPF switch which constructs
+// a bare *dataplane.Manager (legacy) via the legacy program loader.
+//
+// The returned value still implements dataplane.DataPlane via the
+// adapter, so daemon.legacyDP() can keep handing a compatibility handle
+// to the remaining CLI, gRPC, and cluster session-sync call sites until
+// #1451 finishes the surface shrink. When #1521 / #1473 need to thread
+// additional construction configuration in, they should add a typed
+// options argument here. No empty options struct is added pre-emptively
+// (YAGNI).
+func Boot() dataplane.RuntimeDataPlane {
+	return NewLegacyDataPlaneAdapter(New())
 }
 
 type Manager struct {

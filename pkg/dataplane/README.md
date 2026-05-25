@@ -12,13 +12,16 @@ exposes session iteration to GC, the CLI, and the metrics surface.
 
 Pluggable: the legacy eBPF backend registers through `RegisterBackend` for
 the old `DataPlane` surface (DPDK retired #1525; removed in #1527/#1528).
-Runtime backends register through
-`RegisterRuntimeBackend`; the daemon uses `NewRuntimeDataPlane` so userspace
-AF_XDP starts through the runtime path. During the #1381 migration, the
-userspace runtime constructor returns `LegacyDataPlaneAdapter`: the userspace
-`Manager` itself still does not implement the BPF-shaped `DataPlane`, but
-daemon status, CLI, and cluster-sync callers that have not moved to domain
-interfaces still receive a temporary compatibility handle.
+Runtime backends register through `RegisterRuntimeBackend`; daemon startup now
+selects `userspace.Boot()` directly for the default and explicit userspace
+paths and falls through to `NewRuntimeDataPlane` for every other effective
+type. Today the operator-facing cases on that branch are the explicit legacy
+eBPF rollback and retired-DPDK sentinel; unknown/custom types still surface the
+legacy factory's error path verbatim. During the #1381 migration, the userspace
+runtime constructor returns `LegacyDataPlaneAdapter`: the userspace `Manager`
+itself still does not implement the BPF-shaped `DataPlane`, but daemon status,
+CLI, and cluster-sync callers that have not moved to domain interfaces still
+receive a temporary compatibility handle.
 
 DPDK retirement (#1525): the historical #1475 policy that retained DPDK as
 a separately supported DPDK-build backend applied pre-retirement; the
@@ -47,9 +50,11 @@ sent while exact queues were still backlogged.
   compile/config entry point; userspace AF_XDP does not need to implement the
   legacy BPF-shaped `Compile` method just to receive committed config.
 - `NewRuntimeDataPlane(dpType)` — `dataplane.go`. Runtime-domain constructor
-  used by `pkg/daemon`; an empty `dpType` now resolves to userspace instead
-  of silently selecting legacy eBPF. Userspace registers only on this path. The
-  current userspace constructor returns a compatibility adapter around
+  kept for the explicit legacy eBPF rollback, the retired-DPDK sentinel, and
+  compatibility/test seams such as the userspace runtime registry round-trip.
+  The daemon's default and explicit userspace boot path now goes through
+  `userspace.Boot()` via `pkg/daemon/buildRuntimeDataPlane()`. The current
+  userspace constructor still returns a compatibility adapter around
   `*userspace.Manager` until the remaining status/session-sync callers stop
   requiring `DataPlane`.
 - `Manager` — `loader.go`. eBPF implementation.

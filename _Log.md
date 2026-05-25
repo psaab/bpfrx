@@ -2,6 +2,106 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-26T01:00:00Z
+  - **Action**: Round-3 reviewer verdicts complete on PR #1550 HEAD
+    444a1959. Codex MERGE-READY (no findings). AGY MERGE-READY
+    (8/8 invariants verified, 3 Copilot round-2 nits resolved).
+    Copilot round-3 COMMENTED with no new comments — implicit
+    MERGE-READY. 4-of-4 reviewers agree (including Claude SMR).
+    Smoke matrix on loss userspace cluster: PASS — per-class v4/v6
+    × push/-R matrix consistent and healthy. Best-effort port 5201
+    ~80 Mbps push is expected (low-priority CoS surplus floor
+    under concurrent class load). All other classes shaped
+    correctly per their CIR + surplus. Reverse direction 6-8 Gbps
+    across all classes. Smoke results posted as PR comment. PR
+    ready for author merge.
+  - **File(s)**: smoke matrix on loss:xpf-userspace-fw0/fw1; no
+    code changes.
+
+- **Timestamp**: 2026-05-26T00:30:00Z
+  - **Action**: PR #1550 round-2 reviews landed. Codex MERGE-READY
+    (no findings; all wording fixes confirmed). AGY MERGE-READY
+    (8/8 invariants verified). Copilot round-2 surfaced 3 doc-only
+    nits: stale legacy-caller list (pkg/api/pkg/conntrack/
+    pkg/fwdstatus → actual: pkg/cli, pkg/grpcapi, pkg/cluster via
+    daemon.legacyDP()), in both Boot() docstring and
+    userspace_boot_canary_test.go; plus README "only ebpf/dpdk"
+    wording missing unknown-type pass-through. Copilot agent
+    pushed fffe3e41 ("docs: fix PR #1550 wording drift") with the
+    same fixes; rebased local 3ea74518 on top — same content, took
+    Copilot agent's version verbatim during rebase since the two
+    wordings are equivalent.
+  - **File(s)**:
+    `pkg/dataplane/userspace/manager.go`,
+    `pkg/dataplane/userspace/userspace_boot_canary_test.go`,
+    `pkg/dataplane/README.md`
+
+- **Timestamp**: 2026-05-25T23:30:00Z
+  - **Action**: PR #1550 round-1 doc + wording follow-ups merged.
+    Copilot agent pushed be8a7b6d updating
+    `pkg/dataplane/README.md` and `pkg/daemon/README.md` to align
+    doc text with the landed code (boot path via
+    `userspace.Boot()`; legacy factory only for ebpf rollback +
+    DPDK sentinel). Rebased local round-1 review fixes on top.
+  - **File(s)**: `pkg/dataplane/README.md`, `pkg/daemon/README.md`
+
+- **Timestamp**: 2026-05-25T23:00:00Z
+  - **Action**: PR #1550 round-1 code review feedback addressed.
+    Copilot inline nits: (1) Boot() doc misdescribed the userspace
+    registry path as "rollback" — clarified that the userspace
+    registry entry is the compatibility/test seam and the ebpf
+    rollback goes through the legacy factory's TypeEBPF switch,
+    not the userspace registry; (2) buildRuntimeDataPlane doc said
+    the default branch is "only" for ebpf/dpdk — rewrote to
+    acknowledge unknown/custom types also flow through and surface
+    the legacy factory's error verbatim. AGY minor coverage gap:
+    added TestBuildRuntimeDataPlaneUnknownTypePropagatesError to
+    lock in the unknown-type error propagation and to assert
+    ErrDPDKBackendRetired stays reserved for "dpdk". AGY code
+    review verdict: MERGE-READY (8 findings clean).
+  - **File(s)**:
+    `pkg/dataplane/userspace/manager.go`,
+    `pkg/daemon/daemon_run.go`,
+    `pkg/daemon/dataplane_boot_test.go`,
+    `docs/pr/1520-userspace-boot-extraction/reviewer-ids.md`
+
+- **Timestamp**: 2026-05-25T22:30:00Z
+  - **Action**: #1520 plan v4 + implementation. v2 added Claude SMR
+    refinements (no-arg Boot, behavioral canaries). v3 addressed
+    Codex round-2 PLAN-NEEDS-MAJOR (9 findings: structural value
+    statement, default-route invariant, dropped text-shape canary,
+    behavioral helper tests, BootOptions dropped, rollback/test-seam
+    wording). v4 addressed AGY round-2 CRITICAL: existing AST canary
+    `TestDaemonRuntimeEntryPointUsesRuntimeDataPlane` requires
+    `daemon_run.go` to literally reference
+    `dataplane.NewRuntimeDataPlane(...)`; pinned the helper inside
+    `daemon_run.go` and kept the non-userspace branch routed through
+    that factory call to preserve the canary. Codex round-3
+    PLAN-NEEDS-MINOR confirmed two stale strings ("BootOptions{}"
+    in §8.5 and "rollback" in §4.3 heading) — both fixed in v4.
+    Implementation: added `userspace.Boot()` + helper
+    `buildRuntimeDataPlane` in daemon_run.go + two canary test
+    files. Full Go suite green; 5x flake stable.
+  - **File(s)**:
+    `docs/pr/1520-userspace-boot-extraction/plan.md`,
+    `docs/pr/1520-userspace-boot-extraction/reviewer-ids.md`,
+    `pkg/dataplane/userspace/manager.go`,
+    `pkg/daemon/daemon_run.go`,
+    `pkg/dataplane/userspace/userspace_boot_canary_test.go`,
+    `pkg/daemon/dataplane_boot_test.go`
+
+- **Timestamp**: 2026-05-25T20:00:00Z
+  - **Action**: #1520 plan v1 DRAFT — extract userspace boot path
+    from legacy `dataplane.New()` (sub-#1451 S5). Adds
+    `userspace.Boot()` constructor + daemon `buildRuntimeDataPlane`
+    wrapper that fences the legacy registry off to the
+    `dataplane-type ebpf` rollback. Plan explicitly out-of-scopes
+    the `bpfShim` field rename (forbidden by existing AST canary)
+    and the `maps_sync.go` map-name decoupling (#1521 sibling work).
+  - **File(s)**:
+    `docs/pr/1520-userspace-boot-extraction/plan.md`,
+    `docs/pr/1520-userspace-boot-extraction/reviewer-ids.md`
+
 - **Timestamp**: 2026-05-25T05:55:00Z
   - **Action**: PR #1536 round-3 cleanup — address Codex MAJOR
     (load merge syntax in plan recovery) + 3 Copilot nits:

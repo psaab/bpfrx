@@ -19,6 +19,12 @@ are completed (DPDK retired #1525). Userspace currently reaches those old caller
 runtime-domain type, and the adapter is only the transition boundary for
 status, CLI, and cluster-sync paths that still call `legacyDP()`.
 
+Dataplane construction in `daemon_run.go` goes through
+`buildRuntimeDataPlane()`: omitted `system dataplane-type` and explicit
+`userspace` select `userspace.Boot()` directly, while explicit `ebpf` still
+falls through `dataplane.NewRuntimeDataPlane()` so the legacy rollback path
+and retired-DPDK sentinel handling stay unchanged.
+
 Config apply uses the runtime `ConfigSink.ApplyConfig` path. This is required
 for userspace AF_XDP, which is intentionally not exposed as a legacy
 `DataPlane`; apply-time callers must not reintroduce `legacyDP().Compile` as
