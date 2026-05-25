@@ -231,6 +231,30 @@
     No `.go` / `.rs` / `.c` source, no build inputs, no test
     fixtures modified.
 
+- **Timestamp**: 2026-05-25T09:45:00Z
+  - **Action**: PR #1532 — address Copilot review on 510fe7dd
+    (7 nits). Copilot caught a contradiction between the godoc /
+    plan / log claims (generics + type aliases "deferred") and the
+    actual catch-all sweep behaviour (those ARE caught when the
+    selector is spelled literally). True deferred bypasses are
+    only those where the selector vanishes from the AST: transitive
+    alias use, import renames, dot imports, external-package
+    wrappers. Updated godoc on the test func, on
+    findLegacyDataPlaneOffenders, on isLegacyDataPlaneType, and on
+    the *ast.ArrayType slice branch comment. Also added a
+    receiverTypeName helper so funcDeclName includes the receiver
+    on methods ("(*S).Foo parameter is dataplane.DataPlane")
+    addressing Copilot's ambiguity concern, with a new
+    method-receiver-named-in-offender test subcase to lock the
+    behaviour. plan.md got the same scope-clarification + the
+    stale "~80 LOC" claim updated to ~615 LOC.
+  - **File(s)**:
+    `pkg/conntrack/legacy_dataplane_canary_test.go`,
+    `docs/pr/1515-conntrack-gc-canary/plan.md`, `_Log.md`
+  - **Validation**: `go test ./pkg/conntrack -count=1 -race` green
+    (34 subcases now); new method-receiver test fixture asserts
+    "(*S).Foo parameter is dataplane.DataPlane" produced.
+
 - **Timestamp**: 2026-05-25T09:15:00Z
   - **Action**: PR #1532 round-N — close all AGY-flagged bypass
     vectors via two-pass walker. AGY KILL verdict on 78b8a38a
@@ -252,11 +276,13 @@
     `map[K]T`, `chan T`, `func(T)`). Tracked via token.Pos in a
     structuralHits set so the sweep doesn't double-report.
     (d) updated godoc scope block to reflect the two-pass design.
-    Only true #1548-deferred bypasses remain: generics, type
-    aliases (`type DPAlias = dataplane.DataPlane`), and import
-    renames — these require go/types-level resolution because the
-    selector either disappears (alias) or changes its package-side
-    identifier (rename).
+    Remaining #1548-deferred bypasses all share one property: the
+    `dataplane.DataPlane` selector disappears from the AST —
+    transitive alias use (`var x DPAlias` after the alias decl),
+    import renames (`dp.DataPlane`), dot imports (bare `DataPlane`
+    ident), and external-package wrapper types. Generic
+    constraints/instantiations are NOT deferred — the sweep
+    catches them because they still spell the selector literally.
 
     New tests (33 total subcases): `TestLegacyDataPlaneTypeMatcher`
     9 cases including new fixed-array + slice-deferred;

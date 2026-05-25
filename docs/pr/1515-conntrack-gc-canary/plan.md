@@ -67,16 +67,38 @@ The walker has TWO passes (see `findLegacyDataPlaneOffenders`):
    `#1548-deferred` — they still contain a literal
    `dataplane.DataPlane` selector in their AST.
 
-Only true `#1548-deferred` bypasses remain: generic constraints /
-instantiations, type aliases that erase the selector
-(`type DPAlias = dataplane.DataPlane`), and import renames
-(`import dp "github.com/psaab/xpf/pkg/dataplane"` causing the selector
-to read `dp.DataPlane`). These require `go/types`-level resolution.
+Only true `#1548-deferred` bypasses remain, all sharing one
+property — the `dataplane.DataPlane` selector disappears from the AST
+and only `go/types` can resolve the substitute name back to the
+original type:
+
+- **Transitive alias use** — `type DPAlias = dataplane.DataPlane`
+  declares the alias (whose RHS the sweep DOES catch), but a
+  downstream `var x DPAlias` parses as a bare `*ast.Ident`.
+- **Import renames** — `import dp "github.com/psaab/xpf/pkg/dataplane"`
+  causes the selector to read `dp.DataPlane`, which the sweep's
+  `pkg.Name == "dataplane"` check misses.
+- **Dot imports** — `import . "github.com/psaab/xpf/pkg/dataplane"`
+  erases the package qualifier entirely; references become bare
+  `DataPlane` idents.
+- **External-package wrapper types** — a type defined in another
+  package that wraps `dataplane.DataPlane` and is then imported
+  into pkg/conntrack as `otherpkg.Wrapper`.
+
+Compound types (`[]T`, `map[K]T`, `chan T`, `func(T)`), generic
+constraints (`func F[T dataplane.DataPlane]`), and generic
+instantiations (`Generic[dataplane.DataPlane]`) are NOT in the
+deferred set — the catch-all sweep flags them because they still
+contain a literal `dataplane.DataPlane` selector.
 
 ## Files touched
 
-- `pkg/conntrack/legacy_dataplane_canary_test.go` — new file, ~80 LOC.
-- `_Log.md` — log entry.
+- `pkg/conntrack/legacy_dataplane_canary_test.go` — new file,
+  ~615 LOC (matcher + two-pass walker + 4 test functions with
+  34 subcases covering structural shapes, catch-all sweep, false-
+  positive avoidance, and AGY-bypass closures).
+- `docs/pr/1515-conntrack-gc-canary/plan.md` — new file.
+- `_Log.md` — log entries.
 
 ## Files NOT touched (intentional)
 

@@ -42,17 +42,34 @@ import (
 //     context this canary's structural switch hasn't enumerated.
 //
 // Known #1548-deferred bypasses (require go/types-level resolution):
-//   - Generic types: `T dataplane.DataPlane` constraints,
-//     `Generic[dataplane.DataPlane]` instantiations
-//   - Type aliases: `type DPAlias = dataplane.DataPlane`, transitive
-//     uses where the alias is then referenced as a bare Ident
-//   - Import renames: `import dp "github.com/psaab/xpf/pkg/dataplane"`
-//     causing the selector to read `dp.DataPlane` not
-//     `dataplane.DataPlane`
+// The catch-all sweep flags ANY remaining direct
+// `dataplane.DataPlane` selector — compound shapes (`[]T`, `map[K]T`,
+// `chan T`, `func(T)`) AND generic instantiations
+// (`Generic[dataplane.DataPlane]`) are caught by the sweep because
+// they still contain a literal `dataplane.DataPlane` selector in
+// their AST. The remaining gaps all share one property: the
+// `dataplane.DataPlane` selector disappears from the AST, replaced
+// by a bare identifier or a differently-named selector that only
+// `go/types` can resolve back to the original type:
 //
-// Compound shapes (`[]T`, `map[K]T`, `chan T`, `func(T)`) are now
-// caught by the catch-all sweep because they still contain a literal
-// `dataplane.DataPlane` selector in their AST.
+//   - Transitive alias use: `type DPAlias = dataplane.DataPlane`
+//     declares the alias (whose RHS the sweep DOES catch), but a
+//     downstream `var x DPAlias` parses as a bare `*ast.Ident` —
+//     selector erasure.
+//   - Import renames: `import dp "github.com/psaab/xpf/pkg/dataplane"`
+//     causes the selector to read `dp.DataPlane`, which the sweep's
+//     `pkg.Name == "dataplane"` check misses.
+//   - Dot imports: `import . "github.com/psaab/xpf/pkg/dataplane"`
+//     erases the package qualifier entirely; references become bare
+//     `DataPlane` idents.
+//   - External-package indirection: a type defined in another
+//     package that wraps `dataplane.DataPlane` and is then imported
+//     into pkg/conntrack as `otherpkg.Wrapper`. The selector here
+//     reads `otherpkg.Wrapper`, not `dataplane.DataPlane`.
+//
+// Generic type-parameter constraints (`func F[T dataplane.DataPlane]
+// ...`) are NOT in the deferred set — they still spell the selector
+// literally and the sweep flags them.
 func TestConntrackHasNoLegacyDataPlaneDependency(t *testing.T) {
 	t.Parallel()
 
@@ -113,10 +130,15 @@ func TestConntrackHasNoLegacyDataPlaneDependency(t *testing.T) {
 //     `dataplane.DataPlane` anywhere in the file produces an
 //     offender, even if the structural pass missed it.
 //
-// Documented #1548-deferred bypasses (compound `[]T`, `map[K]T`,
-// `chan T`, `func(T)`, generics, type aliases, import renames)
-// remain out of scope because they require go/types-level import
-// resolution.
+// Remaining #1548-deferred bypasses all share one property: the
+// `dataplane.DataPlane` selector disappears from the AST and only
+// go/types can resolve the substitute name back to the original
+// type — transitive alias use (`var x DPAlias` after `type DPAlias =
+// dataplane.DataPlane`), import renames (`dp.DataPlane`), dot
+// imports (bare `DataPlane`), and external-package wrapper types
+// (`otherpkg.Wrapper`). Compound types, generic constraints, and
+// generic instantiations are NOT deferred — the catch-all sweep
+// catches them as long as the selector is spelled literally.
 func findLegacyDataPlaneOffenders(file *ast.File, name string) []string {
 	var offenders []string
 
@@ -247,16 +269,18 @@ func markSelectorPositions(expr ast.Expr, hits map[token.Pos]bool) {
 	})
 }
 
-// isLegacyDataPlaneType returns true when expr names dataplane.DataPlane
-// or *dataplane.DataPlane. Star-prefixed shapes are checked because
-// future migrations may introduce a pointer form before someone notices.
-// Ellipsis-prefixed (`...dataplane.DataPlane` for variadic params),
-// parenthesized (`(dataplane.DataPlane)`), and fixed-array
-// (`[N]dataplane.DataPlane`) forms are also unwrapped so a syntactic
-// disguise can't bypass the fence. Slice (`[]T`), map, chan, and
-// generic instantiations remain documented #1548-deferred bypasses
-// because matching them naively would also flag external compound
-// shapes that are out of scope for this canary.
+// isLegacyDataPlaneType returns true when expr names
+// dataplane.DataPlane in one of the structural-pass shapes the
+// canary attributes precisely: direct, pointer (`*T`), variadic
+// (`...T`), parenthesized (`(T)`), and fixed-array
+// (`[N]T`). Slice (`[]T`, ArrayType with Len == nil), map, chan,
+// func-type, and generic-instantiation compound shapes are
+// intentionally NOT matched here — those still contain a literal
+// `dataplane.DataPlane` selector elsewhere in their AST and are
+// caught by the pass-2 catch-all sweep in
+// findLegacyDataPlaneOffenders. Keeping this matcher narrow keeps
+// pass-1 diagnostics structurally accurate (only the type
+// expression IS the type, not a slice OF the type).
 func isLegacyDataPlaneType(expr ast.Expr) bool {
 	switch e := expr.(type) {
 	case *ast.SelectorExpr:
@@ -272,11 +296,15 @@ func isLegacyDataPlaneType(expr ast.Expr) bool {
 	case *ast.ParenExpr:
 		return isLegacyDataPlaneType(e.X)
 	case *ast.ArrayType:
-		// Fixed-size arrays (`[1]dataplane.DataPlane`) are unwrapped.
-		// Slices (`[]dataplane.DataPlane`, Len==nil) remain a
-		// documented #1548-deferred bypass — recognising slices here
-		// would entangle this canary with broader compound-type
-		// resolution that needs go/types.
+		// Fixed-size arrays (`[1]dataplane.DataPlane`) are unwrapped
+		// so the structural pass can attribute them precisely
+		// ("func Foo parameter is dataplane.DataPlane").
+		// Slices (`[]dataplane.DataPlane`, Len==nil) are NOT matched
+		// here intentionally — they're still caught by the pass-2
+		// catch-all sweep in findLegacyDataPlaneOffenders. Keeping
+		// slices out of the structural matcher avoids implying that
+		// `[]T` IS the prohibited type when it's actually a
+		// collection of it.
 		if e.Len == nil {
 			return false
 		}
@@ -286,11 +314,41 @@ func isLegacyDataPlaneType(expr ast.Expr) bool {
 	}
 }
 
+// funcDeclName returns a diagnostic name for fn. For methods, the
+// receiver type is included as "(Recv).Name" so the offender message
+// is unambiguous when multiple receiver types declare the same
+// method name.
 func funcDeclName(fn *ast.FuncDecl) string {
 	if fn == nil || fn.Name == nil {
 		return "<anonymous>"
 	}
+	if fn.Recv != nil && len(fn.Recv.List) > 0 {
+		recv := receiverTypeName(fn.Recv.List[0].Type)
+		if recv != "" {
+			return "(" + recv + ")." + fn.Name.Name
+		}
+	}
 	return fn.Name.Name
+}
+
+// receiverTypeName extracts the receiver type's textual name from a
+// FuncDecl receiver type expression. Handles bare *ast.Ident,
+// `*Recv` *ast.StarExpr, and `Recv[T]` generic instantiations.
+// Returns "" if the shape is unrecognised; the caller falls back to
+// the bare function name.
+func receiverTypeName(expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e.Name
+	case *ast.StarExpr:
+		return "*" + receiverTypeName(e.X)
+	case *ast.IndexExpr: // Recv[T]
+		return receiverTypeName(e.X)
+	case *ast.IndexListExpr: // Recv[T, U]
+		return receiverTypeName(e.X)
+	default:
+		return ""
+	}
 }
 
 // TestLegacyDataPlaneTypeMatcher is a synthetic-AST sanity check that
@@ -454,6 +512,15 @@ import "github.com/psaab/xpf/pkg/dataplane"
 type S struct { Dps [2]dataplane.DataPlane }
 `,
 			wantSubstr: "struct field Dps is dataplane.DataPlane",
+		},
+		{
+			name: "method-receiver-named-in-offender",
+			source: `package fixture
+import "github.com/psaab/xpf/pkg/dataplane"
+type S struct{}
+func (s *S) Foo(dp dataplane.DataPlane) {}
+`,
+			wantSubstr: "(*S).Foo parameter is dataplane.DataPlane",
 		},
 	}
 
