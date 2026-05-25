@@ -30,7 +30,9 @@ package config
 // CallExpr whose argument list contains such a SelectorExpr
 // (helper pass-through), unless the read sits under a valid
 // `effectiveDataplaneType(...)` gate somewhere on its AST
-// ancestor chain up to the enclosing function.
+// ancestor chain up to the enclosing function. Package-scope
+// initializers have no enclosing function and are therefore
+// always findings.
 //
 // "Valid gate" means one of:
 //
@@ -49,7 +51,10 @@ package config
 // Walking all the way up to the FuncDecl (not just the nearest
 // enclosing block) is deliberate: it lets a developer nest more
 // conditionals inside a valid outer gate without false-positive
-// canary failures. The negation idiom
+// canary failures. Package scope is treated separately: because
+// there is no enclosing FuncDecl, there is also no valid runtime
+// gate context, so a package-scope read/pass-through is always a
+// canary finding. The negation idiom
 // `if effectiveDataplaneType(...) != dataplaneTypeDPDK { return }`
 // is NOT a valid gate in v3 — the early-exit analysis adds AST
 // surface for marginal value; convert to the positive `==` form.
@@ -306,6 +311,14 @@ func scanFileForDPDKSubtreeLeakage(t *testing.T, path string) []dpdkSubtreeLeaka
 			// `_ = sys.DPDKDataplane.Cores`.
 			fn := enclosingFuncDecl(node)
 			if fn == nil {
+				pos := fset.Position(node.Pos())
+				findings = append(findings, dpdkSubtreeLeakageFinding{
+					path: pos.Filename,
+					line: pos.Line,
+					kind: "read",
+					why: "package-scope read of " +
+						dpdkSubtreeLeakageCanarySelectorName,
+				})
 				return true
 			}
 			if !isGatedByDPDK(node, fn) {
@@ -334,6 +347,14 @@ func scanFileForDPDKSubtreeLeakage(t *testing.T, path string) []dpdkSubtreeLeaka
 			}
 			fn := enclosingFuncDecl(node)
 			if fn == nil {
+				pos := fset.Position(passthroughArg.Pos())
+				findings = append(findings, dpdkSubtreeLeakageFinding{
+					path: pos.Filename,
+					line: pos.Line,
+					kind: "passthrough",
+					why: "package-scope helper pass-through of " +
+						dpdkSubtreeLeakageCanarySelectorName,
+				})
 				return true
 			}
 			if !isGatedByDPDK(node, fn) {
@@ -603,6 +624,18 @@ func TestDPDKSubtreeLeakageCanary_NegativeRejectsMultiVariableBypass(t *testing.
 	requireLeakageFindingKind(t, scanForDPDKSubtreeLeakage(t, root), "read")
 }
 
+// TestDPDKSubtreeLeakageCanary_NegativeRejectsPackageScopeInitializer
+// asserts the canary fires on package-scope reads and helper pass-throughs.
+// Package scope has no enclosing FuncDecl, so there is no valid gate context.
+func TestDPDKSubtreeLeakageCanary_NegativeRejectsPackageScopeInitializer(t *testing.T) {
+	root := writeLeakageCanaryFixture(t, map[string]string{
+		"a.go": negativePackageScopeInitializerFixture,
+	})
+	findings := scanForDPDKSubtreeLeakage(t, root)
+	requireLeakageFindingKind(t, findings, "read")
+	requireLeakageFindingKind(t, findings, "passthrough")
+}
+
 // Fixtures: each is a self-contained Go source file written to
 // a `t.TempDir()` directory and then walked by the canary. The
 // fixtures DO NOT compile against the real config package; the
@@ -776,6 +809,22 @@ func use(sys *sysT) {
 	var dummy *DPDKConfig
 	dummy, sys.DPDKDataplane = nil, &DPDKConfig{Cores: 4}
 }
+`
+
+const negativePackageScopeInitializerFixture = `package fixture
+
+type DPDKConfig struct{ Cores int }
+type sysT struct {
+	DataplaneType string
+	DPDKDataplane *DPDKConfig
+}
+
+var singleton = &sysT{}
+
+func useIt(d *DPDKConfig) int { return d.Cores }
+
+var _ = singleton.DPDKDataplane
+var _ = useIt(singleton.DPDKDataplane)
 `
 
 // writeLeakageCanaryFixture writes each fixture string to a

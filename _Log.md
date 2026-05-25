@@ -758,6 +758,19 @@
     PLAN-KILL grounds.
   - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
     `_Log.md`
+- **Timestamp**: 2026-05-25T15:15:18Z
+  - **Action**: #1539 Copilot follow-up on PR #1553. Tightened
+    `pkg/config/dpdk_subtree_leakage_canary_test.go` so a
+    `DPDKDataplane` selector or helper pass-through at package
+    scope is reported immediately instead of being skipped when
+    no enclosing `FuncDecl` exists. Added
+    `TestDPDKSubtreeLeakageCanary_NegativeRejectsPackageScopeInitializer`
+    with a fixture covering both a package-scope read and a
+    package-scope helper pass-through. Updated the canary's file
+    contract comments to document that package scope is always
+    ungated.
+  - **File(s)**: pkg/config/dpdk_subtree_leakage_canary_test.go,
+    _Log.md
 - **Timestamp**: 2026-05-25T15:50:00Z
   - **Action**: #1539 code-review on PR #1553 + lint fix
     (commit 6a7d0649). Codex MERGE-READY directly on 8c5a4ced
