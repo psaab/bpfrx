@@ -43,9 +43,9 @@ reports.
 - Userspace event-stream telemetry enters through
   `EventReader.ProcessRawEvent`, not by direct `EventBuffer.Add`, so it
   gets the same name resolution, callback fanout, local writers, and
-  syslog delivery as eBPF ring-buffer events. `DecodeRawEventRecord` is
-  decode-only and must not be used as a replacement for the full reader
-  path when audit delivery matters.
+  syslog delivery as the legacy eBPF ring-buffer events do.
+  `DecodeRawEventRecord` is decode-only and must not be used as a
+  replacement for the full reader path when audit delivery matters.
 - `pkg/dataplane/userspace/eventstream_test.go` owns the deterministic
   local syslog harness for userspace RT_FLOW policy-deny, screen-drop, and
   filter-log frames. It sends raw event-stream frames through
