@@ -22,7 +22,7 @@ import (
 // in pkg/dataplane/dpdk that guards against silent registry
 // resurrection.
 var ErrDPDKBackendRetired = errors.New(
-	"DPDK dataplane backend has been retired; use " +
+	"the DPDK dataplane backend has been retired; use " +
 		"'set system dataplane-type userspace' (see #1525)",
 )
 

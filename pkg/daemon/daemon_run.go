@@ -256,7 +256,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// config from the CLI / gRPC. The hard fatal-at-
 			// startup branch is reserved for genuinely unknown
 			// dataplane types (the default branch below).
-			slog.Warn("DPDK dataplane backend has been retired; running in config-only mode until config is updated",
+			slog.Warn("the DPDK dataplane backend has been retired; running in config-only mode until config is updated",
 				"type", dpType,
 				"err", err,
 				"remediation", "set system dataplane-type userspace",

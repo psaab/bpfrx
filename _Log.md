@@ -1910,3 +1910,16 @@
   - **File(s)**: `userspace-dp/src/afxdp/wg/framing.rs`, `_Log.md`
   - **Validation**: cargo build --release; cargo test --release --bin
     xpf-userspace-dp afxdp::wg.
+
+- **Timestamp**: 2026-05-25T06:20Z
+- **Action**: Harmonize ErrDPDKBackendRetired + slog.Warn wording with config sentinel (AGY #1536 review finding)
+- **File(s)**: pkg/dataplane/dataplane.go, pkg/daemon/daemon_run.go
+- **Why**: Antigravity adversarial-review-mpksyrj1-f1mid9 (against #1536) noted a
+  cross-PR consistency gap: the config-time sentinel ErrDPDKDataplaneRetired
+  starts with "the DPDK..." while the runtime-time ErrDPDKBackendRetired (this
+  PR) starts with "DPDK..." (no leading article). errors.Is matching is
+  unaffected but log monitoring tools using exact string matches across both
+  layers would mismatch. Aligned both the sentinel and the daemon_run.go
+  slog.Warn wording to "the DPDK dataplane backend has been retired".
+- **Validation**: pkg/dataplane test suite green; no other in-tree strings
+  pinned the old wording.
