@@ -84,6 +84,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -456,24 +457,25 @@ func isLHSOfAssignToNil(sel *ast.SelectorExpr, parents map[ast.Node]ast.Node) bo
 	if !ok {
 		return false
 	}
-	// LHS check: at least one LHS must equal `sel`.
-	onLHS := false
-	for _, lhs := range as.Lhs {
+	// Find which LHS index matches our selector.
+	lhsIndex := -1
+	for i, lhs := range as.Lhs {
 		if lhs == sel {
-			onLHS = true
+			lhsIndex = i
 			break
 		}
 	}
-	if !onLHS {
+	if lhsIndex == -1 {
 		return false
 	}
-	// RHS check: at least one RHS expression must be `nil`.
-	for _, rhs := range as.Rhs {
-		if ident, ok := rhs.(*ast.Ident); ok && ident.Name == "nil" {
-			return true
-		}
+	// In Go, if len(Rhs) != len(Lhs), it must be a multi-value expression (e.g. call or map read),
+	// which cannot be a bare 'nil'.
+	if len(as.Rhs) != len(as.Lhs) {
+		return false
 	}
-	return false
+	// Check if the corresponding RHS expression is exactly the identifier "nil".
+	ident, ok := as.Rhs[lhsIndex].(*ast.Ident)
+	return ok && ident.Name == "nil"
 }
 
 // TestDPDKSubtreeLeakageCanary_RealRepoIsClean asserts the
@@ -586,6 +588,17 @@ func TestDPDKSubtreeLeakageCanary_NegativeRejectsSwitchMultipleCases(t *testing.
 func TestDPDKSubtreeLeakageCanary_NegativeRejectsNegationIdiom(t *testing.T) {
 	root := writeLeakageCanaryFixture(t, map[string]string{
 		"a.go": negativeNegationIdiomFixture,
+	})
+	requireLeakageFindingKind(t, scanForDPDKSubtreeLeakage(t, root), "read")
+}
+
+// TestDPDKSubtreeLeakageCanary_NegativeRejectsMultiVariableBypass
+// asserts the canary fires when attempting to bypass the write-to-nil
+// exclusion using a multi-variable assignment where nil is not mapped to
+// DPDKDataplane.
+func TestDPDKSubtreeLeakageCanary_NegativeRejectsMultiVariableBypass(t *testing.T) {
+	root := writeLeakageCanaryFixture(t, map[string]string{
+		"a.go": negativeMultiVariableBypassFixture,
 	})
 	requireLeakageFindingKind(t, scanForDPDKSubtreeLeakage(t, root), "read")
 }
@@ -751,6 +764,20 @@ func use(sys *sysT) int {
 }
 `
 
+const negativeMultiVariableBypassFixture = `package fixture
+
+type DPDKConfig struct{ Cores int }
+type sysT struct {
+	DataplaneType string
+	DPDKDataplane *DPDKConfig
+}
+
+func use(sys *sysT) {
+	var dummy *DPDKConfig
+	dummy, sys.DPDKDataplane = nil, &DPDKConfig{Cores: 4}
+}
+`
+
 // writeLeakageCanaryFixture writes each fixture string to a
 // fresh temp dir and returns the dir path.
 func writeLeakageCanaryFixture(t *testing.T, files map[string]string) string {
@@ -794,29 +821,5 @@ func renderLeakageFindings(findings []dpdkSubtreeLeakageFinding) string {
 // formatLeakageFinding formats a single finding as
 // `file:line [kind] why`.
 func formatLeakageFinding(f dpdkSubtreeLeakageFinding) string {
-	return f.path + ":" + itoa(f.line) + " [" + f.kind + "] " + f.why
-}
-
-// itoa is a tiny local int-to-string so the canary does not need
-// to drag in strconv just to format a line number.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [12]byte
-	pos := len(buf)
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	for n > 0 {
-		pos--
-		buf[pos] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		pos--
-		buf[pos] = '-'
-	}
-	return string(buf[pos:])
+	return f.path + ":" + strconv.Itoa(f.line) + " [" + f.kind + "] " + f.why
 }
