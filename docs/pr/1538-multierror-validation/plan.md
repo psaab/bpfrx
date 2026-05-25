@@ -12,8 +12,9 @@ AGY round-3 PLAN-NEEDS-MINOR (1 finding):
   (pinned by `TestDataplaneTypeOmittedCompilesCleanly` at
   `pkg/config/parser_ast_test.go`). Line stays as
   self-documenting future-proofing.
-- Fix test-count to three throughout (was "two" at v3
-  plan.md:69 and :86).
+- Fix test-count to three throughout (was "two" in two spots in
+  the v3 plan body — surface-area paragraph and PLAN-KILL
+  paragraph).
 - Replace bad three-color-policer syntax
   `action loss-priority high then discard` with schema-clean
   `then discard` — the `action` form parses via the
@@ -326,7 +327,9 @@ drive through `CompileConfig` we use parser-reachable conditions:
   `firewall three-color-policer %q requires positive
   committed-information-rate` in `validateThreeColorPolicersStrict`.
 
-For the byte-identity test we call the helper directly (no parser).
+For the byte-identity test we also drive through `CompileConfig`
+with a single-family fixture (only the CoS line) and compare
+against a direct validator call as the reference value.
 
 ---
 
