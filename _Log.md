@@ -231,8 +231,6 @@
     No `.go` / `.rs` / `.c` source, no build inputs, no test
     fixtures modified.
 
-## 2026-05-24
-
 - **Timestamp**: 2026-05-25T01:30:00Z
   - **Action**: #1515 (#1451 S8) — add regression canary that fences
     `pkg/conntrack` production code against future re-introduction of
@@ -248,6 +246,9 @@
   - **Validation**: `go test ./pkg/conntrack/ -count=1 -race` green;
     `go vet ./pkg/conntrack/...` clean; negative-case hand-flip
     confirms canary fires.
+
+## 2026-05-24
+
 - **Timestamp**: 2026-05-24T06:35:00Z
   - **Action**: PR #1531 implementation v2 — applied retirement
     banner + Current State + reframed VPP revisit trigger +
