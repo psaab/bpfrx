@@ -41,6 +41,6 @@ Plan is PLAN-READY v2 after both r1 verdicts addressed.
 | 8 | Codex (rebase) | workflow 20260525-162502-88b826 plan-r1 | HIGH-1/HIGH-2/MED-1/MED-2/MED-3/LOW-1 — 1 FIX (closed by sentinel-gated skip) + 1 DEFER (path) + 4 REJECT (parity-AST evergreen, alias scoping, etc.) |
 | 8 | Codex (rebase) | workflow 20260525-162502-88b826 impl-r1 | HIGH-1/MED-1/LOW-1 — 3 REJECT (all evergreen) |
 | 8 | Antigravity (rebase) | adversarial-review-mplf2r55-xnr229 | NEEDS-MINOR — concrete kill: inherited-initializer const-decl (Go spec §Constant declarations) bypass. FIX: `bindGenDeclConsts` + `collectFileConstsInto` now track lastValues across specs in the same GenDecl. 2 new fixtures (agy_rebase_inherited_initializer_bypass + ..._local_block) lock the kill. |
-| 8 | Copilot | pending re-review on rebased HEAD | _waiting on push_ |
+| 8 | Copilot | review id 4357897741 on 5bc310fc | 2 inline comments — pos 487 correctness (bind-before-descend let inner shadow leak into its own initializer's child traversal) + pos 729 doc-vs-impl on trimPaddingForBypass. FIX: evalGenDeclConsts returns a pending-bindings map applied via postVisitor on DeclStmt EXIT so initializer expressions descended into during the visit see the OUTER scope. trimPaddingForBypass comment clarified to "leading/trailing only". New fixture copilot_rebase_shadow_initializer_refs_outer locks the kill. |
 | 8 | Claude SMR | post-r8 self-review | MERGE-READY |
 

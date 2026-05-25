@@ -416,11 +416,14 @@ func cloneMap(m map[string]string) map[string]string {
 	return out
 }
 
-// bindGenDeclConsts installs every name→value binding from a CONST
-// GenDecl's specs into scope. Used at the moment the corresponding
-// DeclStmt is visited so that statement-order semantics are
-// preserved (Copilot r5 r5:436): only consts declared earlier in
-// the block are visible to expressions later in the block.
+// evalGenDeclConsts evaluates every name→value binding from a
+// CONST GenDecl's specs against the provided pre-binding scope
+// without mutating it. Returns the new bindings as a map so the
+// caller can apply them at the correct point in the visitor
+// traversal — Copilot r-rebase pos 487 found that applying
+// in-place at DeclStmt entry made the just-bound inner name
+// visible to its own initializer's child traversal, violating
+// Go's "scope begins at end of ConstSpec" rule.
 //
 // Per Go spec §Constant declarations, a parenthesized const block
 // may omit a subsequent spec's initializer expression list — in
@@ -428,10 +431,17 @@ func cloneMap(m map[string]string) map[string]string {
 // expression list (same rule as iota chains). Track lastValues
 // across specs in the same GenDecl to honor that rule; otherwise
 // `const ( A = "userspace_ctrl"; B )` would leave B unbound and a
-// later m.Map(B) lookup would silently bypass the canary (AGY
-// r-rebase finding).
-func bindGenDeclConsts(gd *ast.GenDecl, scope map[string]string) {
+// later m.Map(B) lookup would silently bypass the canary.
+func evalGenDeclConsts(gd *ast.GenDecl, scope map[string]string) map[string]string {
 	var lastValues []ast.Expr
+	// Intermediate within-block scope: a spec later in the same
+	// GenDecl CAN reference a constant declared earlier in the
+	// same GenDecl (per Go spec — scope begins at end of ConstSpec,
+	// and the later spec's ConstSpec comes after the earlier one).
+	// So we evaluate against a fold of scope + already-evaluated
+	// bindings from this same GenDecl.
+	fold := cloneMap(scope)
+	out := map[string]string{}
 	for _, spec := range gd.Specs {
 		vs, ok := spec.(*ast.ValueSpec)
 		if !ok {
@@ -444,11 +454,13 @@ func bindGenDeclConsts(gd *ast.GenDecl, scope map[string]string) {
 			if i >= len(lastValues) {
 				continue
 			}
-			if v, ok := evalStringExpr(lastValues[i], scope); ok {
-				scope[name.Name] = v
+			if v, ok := evalStringExpr(lastValues[i], fold); ok {
+				fold[name.Name] = v
+				out[name.Name] = v
 			}
 		}
 	}
+	return out
 }
 
 type scopeWalker struct {
@@ -477,20 +489,38 @@ func (w *scopeWalker) Visit(node ast.Node) ast.Visitor {
 		hasNewScope = true
 	}
 
-	// Statement-order binding: when a DeclStmt(CONST) is visited,
-	// install its bindings into the current top-of-stack scope
-	// BEFORE descending so subsequent visitor calls see them, but
-	// earlier visitor calls in the same block do NOT.
+	// Deferred statement-order binding: when a DeclStmt(CONST) is
+	// visited, evaluate its specs against the CURRENT scope (which
+	// is the outer scope — the inner names are not yet in scope
+	// per Go spec §Declarations and scope: "the scope of an
+	// identifier denoting a constant ... declared inside a function
+	// begins at the end of the ConstSpec"). Apply the resulting
+	// bindings on DeclStmt EXIT (via postVisitor) so:
+	//
+	//   - Initializer expressions visited during the descent see
+	//     the outer scope (Copilot r-rebase pos 487 finding).
+	//   - Subsequent statements in the same block see the bindings
+	//     because they are applied before the next sibling visit.
+	//
+	// Pre-evaluating at entry honors the rule that each spec's
+	// initializer is evaluated with the scope as of its
+	// declaration site — which still has the outer values.
+	var pendingBindings map[string]string
 	if ds, ok := node.(*ast.DeclStmt); ok {
 		if gd, ok := ds.Decl.(*ast.GenDecl); ok && gd.Tok == token.CONST {
-			top := w.consts[len(w.consts)-1]
-			bindGenDeclConsts(gd, top)
+			pendingBindings = evalGenDeclConsts(gd, currentScope)
 		}
 	}
 
 	keepDescending := w.f(node, currentScope)
 
 	if !keepDescending {
+		if pendingBindings != nil {
+			top := w.consts[len(w.consts)-1]
+			for k, v := range pendingBindings {
+				top[k] = v
+			}
+		}
 		if hasNewScope {
 			w.consts = w.consts[:len(w.consts)-1]
 		}
@@ -498,18 +528,31 @@ func (w *scopeWalker) Visit(node ast.Node) ast.Visitor {
 	}
 
 	return &postVisitor{
-		walker:      w,
-		hasNewScope: hasNewScope,
+		walker:          w,
+		hasNewScope:     hasNewScope,
+		pendingBindings: pendingBindings,
 	}
 }
 
 type postVisitor struct {
-	walker      *scopeWalker
-	hasNewScope bool
+	walker          *scopeWalker
+	hasNewScope     bool
+	pendingBindings map[string]string
 }
 
 func (pv *postVisitor) Visit(node ast.Node) ast.Visitor {
 	if node == nil {
+		// Apply DeclStmt bindings BEFORE popping any new scope so
+		// the bindings land in the same scope frame that was
+		// active when the DeclStmt was entered. This makes them
+		// visible to siblings later in the same block but not to
+		// initializer expressions inside the DeclStmt itself.
+		if pv.pendingBindings != nil {
+			top := pv.walker.consts[len(pv.walker.consts)-1]
+			for k, v := range pv.pendingBindings {
+				top[k] = v
+			}
+		}
 		if pv.hasNewScope {
 			pv.walker.consts = pv.walker.consts[:len(pv.walker.consts)-1]
 		}
@@ -719,10 +762,18 @@ func containsUnicodeSpace(s string) bool {
 	return false
 }
 
-// trimPaddingForBypass strips any leading/trailing whitespace
-// (unicode-aware) and any `%` format-verb characters. Returns the
-// trimmed value. AGY r3 §iii: must include all whitespace runes,
-// not just space/tab.
+// trimPaddingForBypass strips LEADING and TRAILING whitespace
+// (unicode-aware) and LEADING/TRAILING `%` characters from s.
+// Internal whitespace and internal `%` characters are deliberately
+// preserved so that legitimate operator-facing format strings
+// like "update userspace_local_v4 %08x: %w" don't accidentally
+// trim down to a registered map name (which would create false
+// positives in the trim-padded check). Copilot r-rebase pos 729:
+// the comment previously said "any" which incorrectly suggested
+// internal stripping.
+//
+// AGY r3 §iii: must include all whitespace runes, not just
+// space/tab, when stripping leading/trailing padding.
 func trimPaddingForBypass(s string) string {
 	s = strings.TrimFunc(s, unicode.IsSpace)
 	s = strings.Trim(s, "%")
@@ -1186,6 +1237,35 @@ type M struct{}
 func (M) Map(string) any { return nil }
 `,
 			want: []string{"userspace_ctrl"},
+		},
+		{
+			name: "copilot_rebase_shadow_initializer_refs_outer",
+			// Copilot r-rebase pos 487 — a block-local const's
+			// initializer that references the outer same-name
+			// const should resolve via the OUTER scope per Go spec
+			// §Declarations and scope ("scope begins at end of
+			// ConstSpec"). If the binder applied the inner binding
+			// BEFORE the initializer was evaluated by the visitor,
+			// Pass 1's later BinaryExpr fold would compute the wrong
+			// folded value (double-shadowed). With deferred binding
+			// (apply on DeclStmt EXIT), the initializer fold sees
+			// only the outer scope.
+			src: `package x
+const outer = "userspace_outer"
+func F(m M) {
+	const outer = outer + "_shadow"
+	m.Map(outer)
+}
+type M struct{}
+func (M) Map(string) any { return nil }
+`,
+			// The inner const's compile-time value is
+			// "userspace_outer_shadow" (outer at RHS resolves to
+			// the package-level outer). m.Map call also sees the
+			// inner binding. Both should be flagged with the
+			// correct single-shadowed value, not a double-shadowed
+			// "userspace_outer_shadow_shadow".
+			want: []string{"userspace_outer", "userspace_outer_shadow"},
 		},
 	}
 

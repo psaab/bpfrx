@@ -2,6 +2,39 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T19:30:00Z
+  - **Action**: #1521 Copilot r-rebase (4357897741 on 5bc310fc)
+    fixes — 1 correctness finding + 1 doc nit. Correctness
+    (pos 487): scopeWalker bound DeclStmt(CONST) names into the
+    current scope BEFORE descending into the const declaration's
+    initializer AST. For a shadowing `const outer = outer +
+    "_shadow"`, this meant Pass 1's later BinaryExpr fold would
+    evaluate the RHS `outer` AFTER the inner binding was
+    installed, so Pass 1 reported a double-shadowed
+    "userspace_outer_shadow_shadow" instead of the compile-time
+    "userspace_outer_shadow". FIX: introduced
+    `evalGenDeclConsts(gd, scope) map[string]string` which
+    evaluates each spec against the pre-binding scope using a
+    rolling fold (so later specs in the same GenDecl can still
+    reference earlier specs in the same GenDecl, which IS Go-
+    legal). scopeWalker.Visit on DeclStmt(CONST) stores the
+    pending bindings on the postVisitor; postVisitor.Visit(nil)
+    applies them when the DeclStmt is exited (BEFORE popping any
+    new scope frame, so siblings later in the same block see
+    them). Doc nit (pos 729): trimPaddingForBypass comment said
+    "any `%` format-verb characters" but `strings.Trim(s, "%")`
+    only strips leading/trailing — comment updated to
+    "LEADING/TRAILING `%` characters" with rationale: internal
+    `%` must be preserved so legitimate format strings like
+    `"update userspace_local_v4 %08x: %w"` don't trim down to a
+    registered map name. New fixture
+    copilot_rebase_shadow_initializer_refs_outer locks the kill.
+  - **File(s)**: pkg/dataplane/userspace/maps_decouple_test.go,
+    docs/pr/1521-maps-sync-decouple/reviewer-ids.md, _Log.md
+  - **Validation**: 6 canary tests + 25 alias-bypass sub-cases
+    pass under `-count=2`; full `go test ./...` all 33 packages
+    green.
+
 - **Timestamp**: 2026-05-25T18:50:00Z
   - **Action**: #1521 post-rebase + AGY r-rebase inherited-initializer
     fix. Rebased branch onto master b7466f5d (8 sibling PRs merged
