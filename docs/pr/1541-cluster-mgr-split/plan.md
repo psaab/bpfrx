@@ -1,6 +1,34 @@
 # #1541 cluster manager split — plan
 
-**Status:** DRAFT v1 — pending adversarial plan review.
+**Status:** DRAFT v2 — addresses Codex r1 PLAN-NEEDS-MINOR and
+Gemini r1 PLAN-KILL.
+
+**Round 1 outcomes:**
+- Codex (task-mpmyrii6-pl9f0f): PLAN-NEEDS-MINOR. Three findings:
+  (1) transfer-out override + grace helpers are assigned to the
+  wrong homes; they belong in `failover.go`, not split between
+  `peer_state.go` and `heartbeat_manager.go`; (2) method count is
+  64 across the package, not 61 (3 batch methods in
+  `failover_batch.go` were not counted in v1); (3) `pkg/cluster/
+  README.md` currently names `cluster.go` as the home for several
+  types and needs a touch.
+- Gemini (task-mpmys3n8-wcaa7b): PLAN-KILL with a concrete
+  counter-example: the "committed-failover-suppresses-stale-
+  heartbeat" invariant under v1 forces a reviewer to walk
+  `failover.go` → `peer_state.go` → `heartbeat_manager.go` while
+  carrying `m.mu` write-lock context. Gemini argues this
+  *increases* cognitive load.
+
+**v2 response:** Codex's finding #1 and Gemini's PLAN-KILL
+counter-example are the same problem. Fix: put the entire
+transfer-commit state machine in `failover.go`. After v2,
+`handlePeerHeartbeat` (in `heartbeat_manager.go`) just *calls*
+`suppressPeerTimeoutForTransferCommitLocked` (defined in
+`failover.go`); it doesn't own any transfer-commit state. The
+"how does a committed failover suppress a stale heartbeat"
+invariant is now answerable by reading `failover.go` end-to-end —
+exactly one file, exactly one locking domain. Method count
+corrected to 64. README to be updated as part of the PR.
 
 ## 1. Issue framing
 
@@ -144,8 +172,11 @@ pkg/cluster/
   hooks.go                # Set*Hook / Set*Func methods.
   peer_state.go           # PeerAlive, PeerNodeID, PeerGroupStates,
                           #   software/protocol version accessors,
-                          #   PeerMonitorStatuses, transfer-out
-                          #   override helpers (Locked).
+                          #   PeerMonitorStatuses. (NO transfer-out
+                          #   override helpers — those live in
+                          #   failover.go alongside the protocol they
+                          #   serve. v2 fix for r1 Codex finding #1 +
+                          #   Gemini PLAN-KILL counter-example.)
   group_state.go          # RedundancyGroupState accessors:
                           #   GroupStates, DataGroupIDs, GroupState,
                           #   IsLocalPrimary, IsLocalPrimaryAny,
@@ -165,18 +196,34 @@ pkg/cluster/
                           #   RestartHeartbeat, buildHeartbeat,
                           #   handlePeerHeartbeat, handlePeerTimeout,
                           #   handlePeerNeverSeen, vrfListenConfig,
-                          #   HeartbeatStats, triggerGARP,
-                          #   transferCommitGracePeriodLocked,
-                          #   suppressPeerTimeoutForTransferCommitLocked.
-  failover.go             # NEW — single-RG manual failover and
-                          #   transfer protocol: ManualFailover,
-                          #   ForceSecondary, ResetFailover,
-                          #   RequestPeerFailover,
-                          #   commitRequestedPeerFailover,
-                          #   abortRequestedPeerFailover,
-                          #   notePeerTransferCommitted,
-                          #   FinalizePeerTransferOut, FenceStatus.
-                          #   (failover_batch.go is multi-RG variants.)
+                          #   HeartbeatStats, triggerGARP.
+                          #   (Transfer-commit state machine is NOT
+                          #   here — see failover.go. handlePeerTimeout
+                          #   calls suppressPeerTimeoutForTransferCommitLocked
+                          #   from failover.go as a regular cross-file
+                          #   private method call.)
+  failover.go             # NEW — single-RG manual failover protocol
+                          #   AND the transfer-commit state machine.
+                          #   Methods:
+                          #   - Manual failover: ManualFailover,
+                          #     ForceSecondary, ResetFailover.
+                          #   - Transfer protocol: RequestPeerFailover,
+                          #     commitRequestedPeerFailover,
+                          #     abortRequestedPeerFailover,
+                          #     notePeerTransferCommitted,
+                          #     FinalizePeerTransferOut, FenceStatus.
+                          #   - Transfer state helpers (moved here from
+                          #     v1's peer_state.go / heartbeat_manager.go
+                          #     to address Gemini r1 PLAN-KILL):
+                          #     applyPeerTransferOutOverrideLocked,
+                          #     clearPeerTransferOutOverrideLocked,
+                          #     restorePeerTransferOutOverrideLocked,
+                          #     transferCommitGracePeriodLocked,
+                          #     suppressPeerTimeoutForTransferCommitLocked.
+                          #   (failover_batch.go is multi-RG variants and
+                          #   stays unchanged — it already lives in its
+                          #   own sibling file and calls into the helpers
+                          #   here via package-private references.)
   events_log.go           # RecordEvent, EventHistoryFor.
                           #   (events.go holds types + EventHistory
                           #   struct; these are Manager methods.)
@@ -243,9 +290,13 @@ to resolve identically:
 - Free functions: `IsRetryablePreFailoverError`,
   `IsSupportedClusterNodeID`, `MarshalHeartbeat`,
   `UnmarshalHeartbeat`, `EffectivePriority`.
-- All 61 exported methods on `*Manager` (counted via
-  `grep '^func (m \*Manager) [A-Z]'` on cluster.go) keep their
-  current signatures.
+- All 61 exported methods on `*Manager` defined in `cluster.go`
+  (counted via `grep '^func (m \*Manager) [A-Z]' cluster.go`)
+  keep their current signatures after the move. The full package
+  exposes 64 `*Manager` methods because `failover_batch.go`
+  already defines `ManualFailoverBatch`,
+  `RequestPeerFailoverBatch`, and `FinalizePeerTransferOutBatch`
+  in a sibling file. Those three are not moved by this PR.
 
 `go test ./pkg/...` will reveal any accidental signature drift
 immediately.
@@ -345,8 +396,10 @@ immediately.
 - No method body edits, no signature changes, no field
   additions/removals.
 - No test file moves or renames.
-- No documentation churn beyond this plan and an updated `_Log.md`
-  entry.
+- Documentation: this plan, `_Log.md`, and a minimal touch to
+  `pkg/cluster/README.md` to update the "Files" section so it
+  no longer claims `cluster.go` is the home for `Manager` /
+  `NodeState` / `ClusterEvent`. No other doc churn.
 - No `pkg/cluster/sync*.go` touches — those are #1518's territory.
 - No `pkg/vrrp/` changes.
 
