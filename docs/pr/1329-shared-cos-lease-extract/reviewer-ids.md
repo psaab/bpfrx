@@ -10,5 +10,7 @@ Format: `<reviewer> <round> <task-id>`
 - codex r4 task-mpn3i92x-6y2i2t  (PLAN-READY)
 - agy r1 PLAN-READY held from v1
 
-## Code review
-- (pending PR open)
+## Code review (PR #1588 at f8ad9fe3)
+- codex r1 task-mpn54ow5-lcs0xr
+- agy  r1 adversarial-review-mpn550uw-5xlev1
+- copilot r1 awaiting (gh pr edit --add-reviewer + @copilot review comment posted)

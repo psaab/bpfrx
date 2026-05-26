@@ -1,9 +1,8 @@
-// #1329 Step 1: publish_equal_flow_epoch_v8 extracted from
-// shared_cos_lease/mod.rs as a pure code-motion split.
-// The function body is byte-identical to the master form at
-// shared_cos_lease.rs:L1713-L1854; atomic orderings, fail_open
-// branch wiring, smoothed-target math, and streak gating are
-// preserved exactly.
+// #1329: publish_equal_flow_epoch_v8 extracted from
+// shared_cos_lease/mod.rs as a pure code-motion split. The function
+// body is byte-identical to the pre-split form (see PR #1588 for the
+// move diff); atomic orderings, fail_open branch wiring,
+// smoothed-target math, and streak gating are preserved exactly.
 //
 // Visibility widens from file-private to `pub(super)` so the
 // rotation path in `rotate_epoch_v8.rs` can call this helper.

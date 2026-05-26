@@ -67,6 +67,13 @@
   not seqlock CAS rotation under contention as the plan required.
   Reran 5x flake on bypass_starvation_events_swap_at_rotation (true
   rotation ATOMIC-SWAP test): 5/5 pass. PR description updated.
+- **19:10 UTC** — AGY code r1 MERGE-READY. Codex code r2 MERGE-READY
+  on the _Log.md-only fix. Copilot review landed COMMENTED with 2
+  inline nits: header comments in rotate_epoch_v8.rs and
+  publish_equal_flow_epoch_v8.rs reference the pre-split path
+  `shared_cos_lease.rs:L1497-L1710` / `:L1713-L1854` which won't
+  exist on master post-merge. Reworded headers to reference "PR
+  #1588 for the move diff" instead. Build clean after edit.
 
 ## 2026-05-26 — #1325 implementation pushed
 
