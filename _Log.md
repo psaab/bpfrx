@@ -1,5 +1,17 @@
 # Action Log
 
+## 2026-05-26 — #1546 filter engine split plan v1 drafted
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Created worktree refactor/1546-filter-engine-split
+    off origin/master (3b1f56a8). Drafted plan v1 splitting
+    `userspace-dp/src/filter/engine.rs` (1247 LOC, 51 fns) into
+    five responsibility-scoped submodules: matching, eval,
+    tx_selection, cache_sensitive, policer. Pure code motion —
+    bodies byte-identical, `#[inline]` attributes preserved across
+    the new module boundaries.
+  - **File(s)**: docs/pr/1546-filter-engine-split/plan.md (NEW),
+    docs/pr/1546-filter-engine-split/reviewer-ids.md (NEW).
 ## 2026-05-26 — #1325 implementation pushed
 
 - **Timestamp**: 2026-05-26T (UTC)
