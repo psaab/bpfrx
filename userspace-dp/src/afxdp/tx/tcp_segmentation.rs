@@ -93,8 +93,6 @@ pub(super) fn segment_forwarded_tcp_frames_into_prepared(
             forwarding,
             worker_id,
             worker_commands_by_id,
-            cos_owner_worker_by_queue,
-            cos_owner_live_by_queue,
         );
     }
     if target_binding.tx_pipeline.free_tx_frames.len() < segment_count {

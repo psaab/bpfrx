@@ -179,6 +179,38 @@
 - **Posture**: AWAITING-BATCH-MERGE per user mandate (do not auto-merge).
 - **File(s)**: docs/pr/1355-cos-push-split/reviewer-ids.md, _Log.md
 
+## 2026-05-26 — #1350 implementation pushed (21:43 UTC)
+
+- **Timestamp**: 2026-05-26T21:43Z
+- **Action**: Split the 253-LOC `drain_pending_tx` orchestrator
+  in `userspace-dp/src/afxdp/tx/drain.rs` into six
+  `drain_phase_*` helpers plus a `DrainCtx<'_>` stack-built
+  context struct. Moved `tx/drain.rs` to `tx/drain/mod.rs`
+  and added `phase_trivial.rs` (reap/rekick/ingest/submit),
+  `phase_shaped.rs` (shaped initial + reingest budget),
+  `phase_backup.rs` (prepared + local backup + `BackupOutcome`
+  enum), `tests.rs` (renamed from `drain_tests.rs`). Deleted
+  the two unused `_cos_owner_*_by_queue` params from
+  `drain_pending_tx`/`drain_pending_tx_local_owner` signatures
+  and from their drain-call trailing args (in `worker/lifecycle.rs`,
+  `tx/dispatch.rs`, `tx/tcp_segmentation.rs`).
+- **Files**:
+  - userspace-dp/src/afxdp/tx/drain/mod.rs (renamed + edited)
+  - userspace-dp/src/afxdp/tx/drain/tests.rs (renamed from drain_tests.rs)
+  - userspace-dp/src/afxdp/tx/drain/phase_trivial.rs (new)
+  - userspace-dp/src/afxdp/tx/drain/phase_shaped.rs (new)
+  - userspace-dp/src/afxdp/tx/drain/phase_backup.rs (new)
+  - userspace-dp/src/afxdp/worker/lifecycle.rs (drop 2 trailing args at lines 66-67, 97-98)
+  - userspace-dp/src/afxdp/tx/dispatch.rs (drop 2 trailing args at 4 call sites)
+  - userspace-dp/src/afxdp/tx/tcp_segmentation.rs (drop 2 trailing args at 1 call site)
+- **Validation**: cargo build --release clean; cargo test
+  --release 1503/1504 pass (1 pre-existing master failure on
+  `snat_contract_doc_guard` unrelated to #1350); 5/5 flake
+  pass on `partition_cos_bound_local_scans_mixed_head_deque`;
+  go test ./... clean; objdump -d confirms zero `drain_phase_*`
+  symbols survived — all inlined by LLVM under `#[inline]` at
+  -O3.
+
 ## 2026-05-26 — #1325 implementation pushed
 
 - **Timestamp**: 2026-05-26T (UTC)

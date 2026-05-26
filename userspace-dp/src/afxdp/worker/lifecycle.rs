@@ -63,8 +63,6 @@ pub(super) fn poll_binding(
         forwarding,
         worker_id,
         worker_commands_by_id,
-        cos_owner_worker_by_queue,
-        cos_owner_live_by_queue,
     );
     apply_shared_recycles(
         left,
@@ -94,8 +92,6 @@ pub(super) fn poll_binding(
                 forwarding,
                 worker_id,
                 worker_commands_by_id,
-                cos_owner_worker_by_queue,
-                cos_owner_live_by_queue,
             );
             apply_shared_recycles(
                 left,

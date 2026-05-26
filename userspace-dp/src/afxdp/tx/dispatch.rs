@@ -319,8 +319,6 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                             forwarding,
                             worker_id,
                             worker_commands_by_id,
-                            cos_owner_worker_by_queue,
-                            cos_owner_live_by_queue,
                         );
                     }
                 } else if let Some(segmented) = segment_forwarded_tcp_frames_from_frame(
@@ -388,8 +386,6 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                             forwarding,
                             worker_id,
                             worker_commands_by_id,
-                            cos_owner_worker_by_queue,
-                            cos_owner_live_by_queue,
                         );
                     }
                 }
@@ -608,8 +604,6 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                             forwarding,
                             worker_id,
                             worker_commands_by_id,
-                            cos_owner_worker_by_queue,
-                            cos_owner_live_by_queue,
                         );
                         direct_tx_offset = target_binding.tx_pipeline.free_tx_frames.pop_front();
                     }
@@ -875,8 +869,6 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                     forwarding,
                     worker_id,
                     worker_commands_by_id,
-                    cos_owner_worker_by_queue,
-                    cos_owner_live_by_queue,
                 );
             }
         }
