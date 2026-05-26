@@ -371,19 +371,21 @@ pub(super) fn encapsulate_native_gre_frame(
                 _ => return None,
             };
             let total_len = u16::try_from(outer_ip_len + gre_len + inner_packet.len()).ok()?;
-            let ip = out.get_mut(outer_ip_start..outer_ip_start + 20)?;
-            ip[0] = 0x45;
-            ip[1] = 0;
-            ip[2..4].copy_from_slice(&total_len.to_be_bytes());
-            ip[4..6].copy_from_slice(&0u16.to_be_bytes());
-            ip[6..8].copy_from_slice(&0u16.to_be_bytes());
-            ip[8] = if endpoint.ttl == 0 { 64 } else { endpoint.ttl };
-            ip[9] = PROTO_GRE;
-            ip[10..12].copy_from_slice(&[0, 0]);
-            ip[12..16].copy_from_slice(&src.octets());
-            ip[16..20].copy_from_slice(&dst.octets());
-            let checksum = checksum16(ip);
-            ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+            // #1440: consolidated IPv4 outer builder. Sets DF=1
+            // (RFC 791 §3.1 / RFC 6864 §3 compliance) and computes
+            // the header checksum via the shared `checksum16`.
+            // Wire-byte change vs the previous open-code:
+            // ip[6..8] = 0x4000 (was 0x0000); IPv4 header checksum
+            // recomputes accordingly.
+            write_ipv4_header(
+                out.get_mut(outer_ip_start..outer_ip_start + 20)?,
+                src,
+                dst,
+                PROTO_GRE,
+                /* tos */ 0,
+                endpoint.ttl,
+                total_len,
+            )?;
         }
         libc::AF_INET6 => {
             let src = match endpoint.source {
@@ -395,16 +397,17 @@ pub(super) fn encapsulate_native_gre_frame(
                 _ => return None,
             };
             let payload_len = u16::try_from(gre_len + inner_packet.len()).ok()?;
-            let ip = out.get_mut(outer_ip_start..outer_ip_start + 40)?;
-            ip[0] = 0x60;
-            ip[1] = 0;
-            ip[2] = 0;
-            ip[3] = 0;
-            ip[4..6].copy_from_slice(&payload_len.to_be_bytes());
-            ip[6] = PROTO_GRE;
-            ip[7] = if endpoint.ttl == 0 { 64 } else { endpoint.ttl };
-            ip[8..24].copy_from_slice(&src.octets());
-            ip[24..40].copy_from_slice(&dst.octets());
+            // #1440: consolidated IPv6 outer builder.
+            write_ipv6_header(
+                out.get_mut(outer_ip_start..outer_ip_start + 40)?,
+                src,
+                dst,
+                PROTO_GRE,
+                /* traffic_class */ 0,
+                /* flow_label */ 0,
+                endpoint.ttl,
+                payload_len,
+            )?;
         }
         _ => return None,
     }

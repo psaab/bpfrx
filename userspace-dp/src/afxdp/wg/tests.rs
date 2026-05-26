@@ -10,7 +10,11 @@ use super::dscp::tos_from_dscp;
 use super::engine::{DecapError, EncapError, WgEngine, WgEngineConfig, WgPeerConfig};
 use super::framing::{encode_data_header, parse_data_header};
 use super::mss::wg_tcp_mss;
-use super::outer::{outer_l2_len, write_outer_eth, write_outer_ipv4_udp};
+// #1440: outer.rs DELETED. The two surviving smoke tests that
+// exercised the deleted wrappers (`outer_l2_with_vlan_when_set`
+// and `outer_ipv4_tos_propagates_dscp`) now call the consolidated
+// builders in `crate::afxdp::frame::headers` directly.
+use crate::afxdp::frame::{eth_header_len, write_eth_header_slice, write_ipv4_header};
 use super::scratch::WgWorkerScratch;
 use super::session::WgSession;
 use snow::Builder;
@@ -362,33 +366,40 @@ fn framing_layout_matches_spec() {
 #[test]
 fn outer_l2_with_vlan_when_set() {
     // VLAN-safe encap: when tx_vlan_id != 0, the outer L2 carries
-    // an 802.1Q tag. This was the #1492 VLAN-unsafe miss.
+    // an 802.1Q tag. This was the #1492 VLAN-unsafe miss. Now
+    // exercises the consolidated builder in
+    // `crate::afxdp::frame::headers` (#1440).
     let mut buf = [0u8; 64];
-    let n_no_vlan = write_outer_eth(&mut buf, [0; 6], [0; 6], 0, 0x0800).unwrap();
-    assert_eq!(n_no_vlan, 14);
-    let n_vlan = write_outer_eth(&mut buf, [0; 6], [0; 6], 100, 0x0800).unwrap();
-    assert_eq!(n_vlan, 18);
+    write_eth_header_slice(&mut buf, [0; 6], [0; 6], 0, 0x0800).unwrap();
+    // First 14 bytes are the no-VLAN eth header; assert byte 12..14 is
+    // the inner ethertype.
+    assert_eq!(&buf[12..14], &[0x08, 0x00]);
+    assert_eq!(eth_header_len(0), 14);
+
+    let mut buf = [0u8; 64];
+    write_eth_header_slice(&mut buf, [0; 6], [0; 6], 100, 0x0800).unwrap();
     assert_eq!(&buf[12..14], &[0x81, 0x00]);
-    assert_eq!(outer_l2_len(0), 14);
-    assert_eq!(outer_l2_len(100), 18);
+    assert_eq!(eth_header_len(100), 18);
 }
 
 #[test]
 fn outer_ipv4_tos_propagates_dscp() {
     // EF (DSCP 46) must show up in the outer TOS byte as 0xb8.
-    // ECN bits remain cleared.
-    let mut buf = [0u8; 64];
+    // ECN bits remain cleared. Now exercises the consolidated IPv4
+    // outer builder (#1440); the previous `write_outer_ipv4_udp`
+    // wrote IP+UDP into the same buffer — here we just gate the
+    // TOS byte on the IPv4 header.
+    let mut buf = [0u8; 20];
     let tos = tos_from_dscp(46);
     assert_eq!(tos, 0xb8);
-    let _ = write_outer_ipv4_udp(
+    write_ipv4_header(
         &mut buf,
         Ipv4Addr::new(10, 0, 0, 1),
         Ipv4Addr::new(10, 0, 0, 2),
-        51820,
-        51820,
+        17, // UDP
         tos,
         64,
-        100,
+        128,
     )
     .unwrap();
     assert_eq!(buf[1], 0xb8);
