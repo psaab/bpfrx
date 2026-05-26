@@ -1,6 +1,38 @@
 # #1540 — Modularize REST API handlers and Prometheus collectors
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** v2 PLAN-READY — Codex + AGY both returned PLAN-NEEDS-MINOR on v1; all required minors folded into implementation
+
+## Plan-review log
+
+- **v1 (commit `5ed3fdd3`)**: dispatched to Codex and AGY for hostile plan review.
+- **AGY review** (job `review-mpmuqzeo-dgl1z7`): **PLAN-NEEDS-MINOR**.
+  Required adjustments:
+  1. `config_handlers.go` → `config.go` (consistency with `nat.go`, `routing.go`, etc.) — applied.
+  2. `matchPolicy*` helpers belong in `security.go`, not `api.go` — already correct in implementation.
+  3. `newCollector` (~600 LOC) → `metrics_descriptors.go` so `metrics.go` is truly slim — applied.
+  4. `parseMemInfoKB` → `metrics_system.go` (only caller is `collectSystemMetrics`) — applied.
+  5. Mandate `go build` after every individual file extraction, not "every 2-3 files" — applied (single atomic move per source monolith, build after).
+- **Codex review** (foreground task on commit `5ed3fdd3`): **PLAN-NEEDS-MINOR**.
+  Required adjustments:
+  1. Same `config_handlers.go` → `config.go` rename — applied.
+  2. Same `newCollector` → `metrics_descriptors.go`, `parseMemInfoKB` → `metrics_system.go` — applied.
+  3. Tighten `api.go` scope so it doesn't become a junk drawer:
+     `policyActionStr`/`screenChecks` → `security.go`; `protoName` →
+     `sessions.go`; `configCommitResponse`/`commitResponseFromConfig` →
+     `config.go` — applied.
+  4. Fix mechanical procedure around imports — applied (atomic move per
+     source monolith with `goimports -w pkg/api/*.go` + `go build`
+     immediately after, not interleaved partial moves).
+
+Both reviewers explicitly note that the flat-package shape is correct
+(subpackage cannot define methods on `api.Server` without restructuring),
+that test compilation is unchanged (method-receiver calls), and that
+public API (Server/NewServer/Config/Run) is preserved.
+
+**Status changed to PLAN-READY for implementation** with all required
+minors folded in.
+
+
 
 ## Issue framing
 

@@ -30,9 +30,15 @@ const (
 
 var legacyDataplaneImportAllowlist = map[string]string{
 	"cmd/xpfd/main.go":                         "cleanup entry point (backend registration removed in #1527)",
-	"pkg/api/handlers.go":                      "REST handlers still reference legacy dataplane counters and types",
-	"pkg/api/handlers_sessions.go":             "REST session reads still use legacy session types",
+	"pkg/api/api.go":                           "shared REST helpers still reference legacy dataplane counters and types (#1540 split entry: apiRuntimeDataPlane interface, protoName, applyResult)",
 	"pkg/api/metrics.go":                       "Prometheus telemetry still reads legacy counters and metadata",
+	"pkg/api/metrics_counters.go":              "Prometheus map-counter collectors still call legacy dataplane reads (#1540 metrics split)",
+	"pkg/api/metrics_nat.go":                   "Prometheus NAT pool collector still reads legacy dataplane (#1540 metrics split)",
+	"pkg/api/metrics_sessions.go":              "Prometheus session gauge collector still iterates legacy session tables (#1540 metrics split)",
+	"pkg/api/nat.go":                           "REST NAT handlers still read legacy NAT counters and metadata (#1540 handlers split)",
+	"pkg/api/security.go":                      "REST security handlers still reference legacy policy/screen counter types (#1540 handlers split)",
+	"pkg/api/sessions.go":                      "REST session reads still use legacy session types (#1540 rename of handlers_sessions.go)",
+	"pkg/api/stats.go":                         "REST statistics handlers still read legacy global/interface/zone counters (#1540 handlers split)",
 	"pkg/cli/cli.go":                           "embedded CLI constructor still stores the legacy bridge",
 	"pkg/cli/cli_clear.go":                     "clear commands still delete legacy session entries",
 	"pkg/cli/runtime.go":                       "#1517 cliRuntime interface declares the narrow CLI surface; still depends on root pkg/dataplane type names (SessionKey, CounterValue, etc.) until those types move to a domain package",
