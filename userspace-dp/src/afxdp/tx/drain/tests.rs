@@ -1,7 +1,9 @@
-// Tests for afxdp/tx/drain.rs — relocated from inline
-// `#[cfg(test)] mod tests` to keep drain.rs under the modularity-discipline
-// LOC threshold. Loaded as a sibling submodule via
-// `#[path = "drain_tests.rs"]` from drain.rs.
+// Tests for `afxdp::tx::drain` — relocated from inline
+// `#[cfg(test)] mod tests` to keep `drain/mod.rs` under the
+// modularity-discipline LOC threshold. Loaded as a sibling
+// submodule via `#[cfg(test)] mod tests;` from `drain/mod.rs`
+// (no `#[path]` needed — `tests.rs` is a sibling of `mod.rs`
+// inside `drain/`).
 
 use super::*;
 
