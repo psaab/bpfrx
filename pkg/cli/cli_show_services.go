@@ -7,11 +7,63 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/appid"
+	"github.com/psaab/xpf/pkg/cmdtree"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/rpm"
 )
+
+// handleShowClassOfService dispatches `show class-of-service ...`
+// to the appropriate presenter.
+func (c *CLI) handleShowClassOfService(args []string) error {
+	if len(args) == 0 || args[0] != "interface" {
+		cmdtree.PrintTreeHelp("show class-of-service:", operationalTree, "show", "class-of-service")
+		return nil
+	}
+	selector := ""
+	if len(args) > 1 {
+		selector = args[1]
+	}
+	return c.showClassOfServiceInterface(selector)
+}
+
+// handleShowServices dispatches `show services ...` to the appropriate
+// presenter (RPM, application-identification, ...).
+func (c *CLI) handleShowServices(args []string) error {
+	if len(args) == 0 {
+		cmdtree.PrintTreeHelp("show services:", operationalTree, "show", "services")
+		return nil
+	}
+	switch args[0] {
+	case "rpm":
+		rest := args[1:]
+		if len(rest) > 0 && rest[0] == "probe-results" {
+			return c.showRPMProbeResults()
+		}
+		return c.showRPMProbeResults()
+	case "application-identification":
+		// #653: surface what xpf AppID actually does today vs the
+		// vSRX application-identification feature. Honest contract,
+		// not the catalog-completeness illusion. Per cmdtree the
+		// only valid leaf is `application-identification status`;
+		// reject anything else so typos surface as usage errors
+		// instead of being silently swallowed.
+		rest := args[1:]
+		if len(rest) == 0 {
+			cmdtree.PrintTreeHelp("show services application-identification:",
+				operationalTree, "show", "services", "application-identification")
+			return nil
+		}
+		if rest[0] != "status" {
+			return fmt.Errorf("unknown application-identification target: %s "+
+				"(expected `status`)", rest[0])
+		}
+		return c.showApplicationIdentificationStatus()
+	default:
+		return fmt.Errorf("unknown services target: %s", args[0])
+	}
+}
 
 func (c *CLI) showDHCPLeases() error {
 	if c.dhcp == nil {

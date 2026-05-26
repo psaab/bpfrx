@@ -3739,141 +3739,69 @@
 - **Action**: Fold Codex r-final MERGE-NEEDS-MINOR comment findings — update 2 stale comments. (1) ErrDPDKBackendRetired comment no longer references the deleted pkg/dataplane/dpdk package-local test; points to runtime/import_canary_test.go as defense-in-depth. (2) TestSchemaValidate_AcceptsLegacyDPDKSubStanza header clarifies it guards orphaned sub-stanzas that survive the rewrite bridge, not pre-bridge schema validation.
 - **File(s)**: pkg/dataplane/dataplane.go (ErrDPDKBackendRetired comment); pkg/cmdtree/schema_validate_test.go (test header).
 
+- **Timestamp**: 2026-05-26 16:25 UTC
+- **Action**: #1540 REST API split — plan v1 DRAFT; identifies sibling-file shape (`pkg/api/<aspect>.go`) per parent wave-1 instructions; lists target file decomposition for handlers.go (67 fns → 11 files) and metrics.go (33 fns → 6 files); flags 7 open questions for adversarial plan review including flat-package vs subdirectory shape decision.
+- **File(s)**: docs/pr/1540-rest-api-split/plan.md, docs/pr/1540-rest-api-split/reviewer-ids.md.
+
+- **Timestamp**: 2026-05-26 16:45 UTC
+- **Action**: #1540 REST API split — implementation. Split pkg/api/handlers.go (2223 LOC, 67 fns) into 13 sibling files (api/health/stats/security/nat/interfaces/routing/dhcp/ipsec/vrrp/system/config/show_text); split pkg/api/metrics.go (2033 LOC, 33 fns) into 7 sibling files (metrics/metrics_descriptors/metrics_userspace/metrics_counters/metrics_sessions/metrics_nat/metrics_system); renamed handlers_sessions.go to sessions.go. All plan-review minors from Codex + AGY folded: config.go (not config_handlers.go); newCollector moved to metrics_descriptors.go; parseMemInfoKB moved to metrics_system.go; api.go tightened (policyActionStr+screenChecks→security.go, protoName→sessions.go, configCommitResponse+commitResponseFromConfig→config.go); legacy import allowlist + retirement docs updated. Pure code motion. Full go test ./... clean.
+- **File(s)**: pkg/api/api.go, config.go, dhcp.go, health.go, interfaces.go, ipsec.go, metrics.go, metrics_counters.go, metrics_descriptors.go, metrics_nat.go, metrics_sessions.go, metrics_system.go, metrics_userspace.go, nat.go, routing.go, security.go, sessions.go, show_text.go, stats.go, system.go, vrrp.go; pkg/dataplane/retirement_boundary_canary_test.go; docs/pr/1373-retire-ebpf-dataplane/README.md; docs/pr/1540-rest-api-split/plan.md; docs/pr/1540-rest-api-split/reviewer-ids.md.
+
+- **Timestamp**: 2026-05-26 17:05 UTC
+- **Action**: #1540 PR #1564 — fold Codex code-review MERGE-NEEDS-MINOR doc-drift findings + Copilot review minors. (1) plan.md updated to reflect post-fold landed shape: config.go (not config_handlers.go), newCollector → metrics_descriptors.go, parseMemInfoKB → metrics_system.go, api.go-tightening (policyActionStr/screenChecks → security.go, protoName → sessions.go, configCommitResponse + commitResponseFromConfig → config.go). (2) canary allowlist + retirement README pkg/api/api.go blurb corrected: 'apiRuntimeDataPlane + protoName' → 'apiRuntimeDataPlane + applyResult adapter' (protoName moved to sessions.go). (3) _Log.md timestamps backfilled to HH:MM UTC for Copilot consistency. Copilot's 4 inline pre-existing `net.InterfaceByName(ifName)` Junos-name findings (interfaces.go, stats.go, metrics_counters.go) are NOT addressed in this PR — pure code motion contract; pre-existing bugs to be filed as separate issues.
+- **File(s)**: docs/pr/1540-rest-api-split/plan.md, pkg/dataplane/retirement_boundary_canary_test.go, docs/pr/1373-retire-ebpf-dataplane/README.md, _Log.md.
+
+- **Timestamp**: 2026-05-26 17:15 UTC
+- **Action**: #1540 PR #1564 — fold Codex round-2 MERGE-NEEDS-MINOR remaining doc-drift findings. (1) plan.md 'Open questions for adversarial review' v1 section refactored into 'Open questions — resolutions' that documents how each of the 7 v1 questions was answered across the two plan-review rounds. (2) reviewer-ids.md updated with actual round-1 verdicts (Codex MERGE-NEEDS-MINOR, AGY MERGE-READY, Copilot COMMENTED 8 inline, Claude SMR MERGE-READY) and adds round-2 entry. Doc-only fix.
+- **File(s)**: docs/pr/1540-rest-api-split/plan.md, docs/pr/1540-rest-api-split/reviewer-ids.md, _Log.md.
+
+- **Timestamp**: 2026-05-26 17:30 UTC
+- **Action**: #1444 — pure code-motion refactor de-monolithizing pkg/cli/cli.go from 1999 LOC to 418 LOC. Plan v1 → Codex (PLAN-NEEDS-MAJOR) + Gemini (PLAN-NEEDS-MINOR). Plan v2 addressing all 8 v1 findings → Gemini PLAN-READY r2; Codex sandbox infra failed twice, returned PLAN-NEEDS-MINOR on third retry with inline plan paste. v3 plan acknowledges Codex r2 ownership findings. Implementation: 9 new sibling files (cli_show_security_dispatch.go, peer.go, permissions.go, apply.go, session_filter.go, app_resolve.go, link.go, chrony.go, proto.go) + extensions to existing completion.go (completer engine merged in), cli_show_cluster.go (fabricRedirectCounters), cli_show_flow.go (topTalkerEntry), cli_show_nat.go (handleShowNAT), cli_show_routing.go (handleShowRoute+handleShowProtocols), cli_show_services.go (handleShowClassOfService+handleShowServices), cli_show_interfaces.go (dhcpLease). Updated #1373 retirement-boundary canary allowlist + docs table for 4 new pkg/cli files that retain legacy dataplane imports. go build clean, all 32 test packages pass.
+- **File(s)**: pkg/cli/cli.go (-1581 LOC), pkg/cli/completion.go (+218), pkg/cli/cli_show_security_dispatch.go (new), pkg/cli/peer.go (new), pkg/cli/permissions.go (new), pkg/cli/apply.go (new), pkg/cli/session_filter.go (new), pkg/cli/app_resolve.go (new), pkg/cli/link.go (new), pkg/cli/chrony.go (new), pkg/cli/proto.go (new), pkg/cli/cli_show_cluster.go, pkg/cli/cli_show_flow.go, pkg/cli/cli_show_nat.go, pkg/cli/cli_show_routing.go, pkg/cli/cli_show_services.go, pkg/cli/cli_show_interfaces.go, pkg/dataplane/retirement_boundary_canary_test.go, docs/pr/1373-retire-ebpf-dataplane/README.md, docs/pr/1444-cli-presenters/plan.md (new).
+
+- **Timestamp**: 2026-05-26 17:45 UTC
+- **Action**: #1444 PR #1566 — rebase onto origin/master @ 838657aa (post-#1564 #1540 REST API split). Conflict in _Log.md auto-resolved (keep both #1540 + #1444 chronological entries). Canary + docs README auto-merged cleanly (#1540 + #1444 modified non-overlapping table sections). Re-run go build + go test post-rebase: clean.
+- **File(s)**: _Log.md (conflict resolution).
+
+## 2026-05-26 — #1345 server/handlers.rs per-verb split
+
+- **Timestamp**: 2026-05-26T17:00Z
+- **Action**: Split 415-LOC handle_stream dispatcher into per-verb modules
+- **File(s)**: userspace-dp/src/server/handlers.rs → handlers/mod.rs (181 LOC slim dispatcher) + 12 per-verb files (snapshot, forwarding, ha, neighbors, queue, binding, inject_packet, sync_session, session_deltas, export, rebind, stop_workers). Trivial arms (ping/status, update_fabrics, clear_policy_counters, shutdown, catch-all) stay inline in mod.rs. Pure code motion; zero new clones; byte-identical eprintln strings. cargo build clean, all tests pass except pre-existing master flake snat_contract_documents_current_fail_closed_runtime (confirmed on origin/master independent of this branch).
 ## #1327 poll_descriptor stages — 2026-05-26
 
 - **Timestamp**: 2026-05-26
-  - **Action**: Worktree created from origin/master; baseline measured:
-    poll_descriptor.rs = 3292 LOC (issue body said 2343 — file has grown
-    since #1054 byte-for-byte extraction).
+  - **Action**: Worktree created from origin/master; #1327 Step 1 plan
+    review v1→v4 (PLAN-NEEDS-MAJOR → PLAN-NEEDS-MINOR → split → MERGE-READY).
   - **File(s)**: branch refactor/1327-poll-descriptor-stages
-
-- **Timestamp**: 2026-05-26
-  - **Action**: Wrote plan v1 — DRAFT. Conservative Step 1: directory
-    split + record_rx_descriptor_telemetry move + flow_cache_hit stage
-    extraction + PollCtx<'a> aggregation. Explicitly defers stages 12+
-    to follow-up Steps; explicitly does NOT propose #946 Phase 2
-    (PLAN-KILLED). 7 open questions invitable to PLAN-KILL.
-  - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
-
-- **Timestamp**: 2026-05-26
-  - **Action**: Round-1 plan reviews returned PLAN-NEEDS-MAJOR from both
-    Codex (task-mpmurvhf-galzxb) and AGY (review-mpmus86y-f87cd8).
-    Critical findings: (1) AGY caught recycle-semantics bug — L653 (ICMP
-    TE) and L876 (TX fallback) do NOT recycle; mapping all continues to
-    RecycleAndContinue would cause UMEM double-free. (2) Codex flagged
-    #[inline] as too weak — need #[inline(always)]. (3) Both flagged
-    PollCtx<'a> as premature. (4) Both confirmed stages 12+ unextractable
-    — Step 1 is the structural ceiling. (5) AGY caught wrong call sites
-    in v1 plan.
-  - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
-
-- **Timestamp**: 2026-05-26
-  - **Action**: Wrote plan v2 addressing all round-1 findings. Introduces
-    dedicated FlowCacheOutcome { Consumed, FallThrough } enum (helper
-    owns all pushes inline). Drops PollCtx. Mandates #[inline(always)]
-    with cargo asm gate. Fixes call sites. Commits to "Step 1 is the
-    structural ceiling" with 5-row extraction matrix demonstrating
-    stages 12+ are not cleanly extractable.
-  - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
-
-- **Timestamp**: 2026-05-26
-  - **Action**: Round-2 plan reviews returned PLAN-NEEDS-MINOR from both
-    Codex (task-mpmv3ywr-yeiqag retry — original attempt blocked by
-    sandbox infra) and AGY (review-mpmv1y38-oyj7ha). Critical AGY finding:
-    `&mut BindingWorker` signature won't compile because outer driver
-    holds `binding.xsk.rx.receive` mutable borrow; helper must take
-    disjoint sub-struct refs. Codex: signature missing
-    packet_fabric_ingress, call sites missing tests.rs:3520+3748, matrix
-    continue-counts imprecise, test-plan checkboxes should be required
-    gates not [x].
-  - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
-  - **Reviewer ids**: Codex task-mpmv3ywr-yeiqag, AGY review-mpmv1y38-oyj7ha
-
-- **Timestamp**: 2026-05-26
-  - **Action**: Wrote plan v3 applying all round-2 fixes. Helper signature
-    now passes 8 disjoint binding refs (flow_state, tx_pipeline,
-    tx_counters, scratch, mirror_sample_counter, live, slot, ifindex)
-    instead of &mut BindingWorker. Added packet_fabric_ingress. Field-
-    access audit confirmed only 7 binding sub-fields touched in the
-    548-879 line range. Test-plan changed to [ ] required gates.
-  - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
-
-- **Timestamp**: 2026-05-26
-  - **Action**: Round-3 plan reviews split: Codex PLAN-NEEDS-MAJOR
-    (task-mpmvbfiy-yehdyn) caught a real packet_frame/owned_packet_frame
-    borrow hazard — passing both `packet_frame: &[u8]` and
-    `&mut owned_packet_frame` to the helper violates borrow rules at the
-    call site. Inline code works because NLL sees take() only on
-    continue-terminated paths. AGY PLAN-READY (review-mpmvbnc1-l7248o)
-    ratified the v3 split-borrow fix on BindingWorker.
-  - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
-
-- **Timestamp**: 2026-05-26
-  - **Action**: Wrote plan v4 fixing Codex MAJOR finding. Helper no
-    longer takes packet_frame parameter; instead re-derives it
-    internally as first local from raw_frame + &owned_packet_frame.
-    Caller's L477 packet_frame binding ends via NLL at L546 (last
-    pre-flow-cache use), so the &mut owned_packet_frame to the helper
-    is borrow-safe. On FallThrough, caller re-binds packet_frame for
-    the slow path at L880+. Also dropped unused binding_ifindex.
-  - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
-
-- **Timestamp**: 2026-05-26
-  - **Action**: Round-4 plan reviews returned PLAN-READY (AGY) and
-    provisional PLAN-READY (Codex — sandbox infra blocked direct
-    filesystem access; summary verdict). Both reviewers ratified the v4
-    fixes: helper takes &mut owned_packet_frame and re-derives
-    packet_frame internally; caller re-binds packet_frame after the
-    helper for slow path. Plan PLAN-READY × 2.
-  - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
-  - **Reviewer ids**: Codex task-mpmvn6gb-dye2zd (provisional),
-    AGY review-mpmvjkp0-mb9xux
 
 - **Timestamp**: 2026-05-26
   - **Action**: Implemented Step 1. Converted flat poll_descriptor.rs to
     directory module (poll_descriptor/mod.rs). Extracted flow-cache fast
     path (verbatim translation of original L563-894) to flow_cache_hit.rs
     with #[inline(always)] + FlowCacheOutcome { Consumed, FallThrough }.
-    Helper signature uses 8 disjoint binding sub-struct refs +
-    re-derives packet_frame internally per AGY/Codex round-3+4 fixes.
     Moved record_rx_descriptor_telemetry verbatim to rx_telemetry.rs.
-    Fixed snat_contract_doc_guard test to accept directory layout.
+    Fixed snat_contract_doc_guard test (twice — initial extension + Copilot
+    review fix on assertion messages and required-doc tokens).
     Final: mod.rs 2806 LOC (was 3292), flow_cache_hit.rs 379 LOC,
     rx_telemetry.rs 220 LOC.
   - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/{mod,flow_cache_hit,rx_telemetry}.rs, userspace-dp/tests/snat_contract_doc_guard.rs
 
 - **Timestamp**: 2026-05-26
-  - **Action**: Validation gates.
-    - cargo build --release: clean (114 pre-existing warnings).
-    - cargo test --release: 1417/1417 main suite pass + 46+8+16 in test
-      bins. snat_contract_doc_guard: 1 pre-existing failure (master fails
-      too — docs/userspace-dataplane-gaps.md missing "fail-closed"
-      keyword, unrelated to #1327).
-    - 5x flake on afxdp::: same flake on master and branch
-      (2/10 fails on `wg::engine::engine_internal_tests::
-      reconcile_peers_snapshot_is_atomic_under_concurrent_load` — pre-
-      existing concurrent-load flake). Solo, this test passes 10/10
-      on both master and branch.
-    - cargo asm: `nm` + `objdump` confirm stage_flow_cache_hit symbol
-      DOES NOT appear in the release binary; #[inline(always)] fully
-      inlined it. No call edge to verify.
-    - Go suite: 30/30 packages pass.
-  - **File(s)**: _Log.md
-
-- **Timestamp**: 2026-05-26
-  - **Action**: Code reviews returned. Codex (task-mpmy2ylp-9i2fpy infra-
-    blocked → retry task-mpmy51lr-obxvpx) provisional MERGE-READY.
-    AGY (review-mpmy36hd-bddy5w) MERGE-READY with line-by-line semantic
-    verification via Python script (confirmed verbatim translation).
-    Copilot (review id 4366277997) COMMENTED with 1 inline finding:
-    snat_contract_doc_guard.rs hardcodes "poll_descriptor.rs" in
-    assertion messages and required-doc check after the directory layout
-    switch.
+  - **Action**: Validation gates. cargo build clean; cargo test 1417/1417
+    main suite pass; snat_contract_doc_guard pre-existing master flake
+    (docs/userspace-dataplane-gaps.md missing "fail-closed" keyword);
+    10× afxdp:: flake same as master 2/10 wg::engine concurrent-load
+    pre-existing flake; cargo asm gate confirmed via nm (no
+    stage_flow_cache_hit symbol in release binary); Go suite 30/30 pass.
   - **File(s)**: PR #1571
 
 - **Timestamp**: 2026-05-26
-  - **Action**: Applied Copilot inline review fix. Tests now derive
-    module label from poll_path for assertion messages; required-doc
-    + enumeration checks accept both flat (poll_descriptor.rs) and
-    directory (poll_descriptor/mod.rs) tokens.
-  - **File(s)**: userspace-dp/tests/snat_contract_doc_guard.rs
+  - **Action**: Code reviews — Codex provisional MERGE-READY (sandbox
+    infra-blocked, summary-based), AGY MERGE-READY with Python line-by-
+    line verification script, Copilot 1 inline finding (test path
+    hardcoding) fixed in fe176daa. Claude SMR review posted (#1571
+    comment 4547263769): AF_XDP UMEM ownership / CPU-arch inline gate /
+    zero allocation / HA epoch ordering / SW design pattern all verified
+    MERGE-READY. AWAITING-BATCH-MERGE marker posted.
+  - **File(s)**: PR #1571
