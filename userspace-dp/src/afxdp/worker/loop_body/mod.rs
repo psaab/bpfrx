@@ -48,7 +48,7 @@ pub(crate) fn worker_loop(
     cos_status: Arc<ArcSwap<Vec<crate::protocol::CoSInterfaceStatus>>>,
     // #869: worker-runtime telemetry publish slot.  Worker writes its
     // local counters here on a ~1s cadence; coordinator reads for status.
-    runtime_atomics: Arc<super::worker_runtime::WorkerRuntimeAtomics>,
+    runtime_atomics: Arc<crate::afxdp::worker_runtime::WorkerRuntimeAtomics>,
 ) {
     pin_current_thread(worker_id);
     const COS_STATUS_INTERVAL_NS: u64 = 100_000_000;
@@ -236,7 +236,7 @@ pub(crate) fn worker_loop(
     let mut last_cos_status_ns = monotonic_nanos();
     // #869: worker-runtime telemetry.  Local counters, published to
     // `runtime_atomics` on the ~1s cadence below.
-    use super::worker_runtime::{
+    use crate::afxdp::worker_runtime::{
         WorkerRuntimeCounters, WorkerRuntimeState, current_tid, sample_thread_cpu_ns,
     };
     let mut wr_counters = WorkerRuntimeCounters::default();
