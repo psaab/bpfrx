@@ -3797,3 +3797,23 @@
     access audit confirmed only 7 binding sub-fields touched in the
     548-879 line range. Test-plan changed to [ ] required gates.
   - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Round-3 plan reviews split: Codex PLAN-NEEDS-MAJOR
+    (task-mpmvbfiy-yehdyn) caught a real packet_frame/owned_packet_frame
+    borrow hazard — passing both `packet_frame: &[u8]` and
+    `&mut owned_packet_frame` to the helper violates borrow rules at the
+    call site. Inline code works because NLL sees take() only on
+    continue-terminated paths. AGY PLAN-READY (review-mpmvbnc1-l7248o)
+    ratified the v3 split-borrow fix on BindingWorker.
+  - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Wrote plan v4 fixing Codex MAJOR finding. Helper no
+    longer takes packet_frame parameter; instead re-derives it
+    internally as first local from raw_frame + &owned_packet_frame.
+    Caller's L477 packet_frame binding ends via NLL at L546 (last
+    pre-flow-cache use), so the &mut owned_packet_frame to the helper
+    is borrow-safe. On FallThrough, caller re-binds packet_frame for
+    the slow path at L880+. Also dropped unused binding_ifindex.
+  - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md

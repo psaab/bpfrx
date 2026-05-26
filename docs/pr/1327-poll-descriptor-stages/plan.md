@@ -1,7 +1,18 @@
 # #1327 Step 1 — poll_descriptor.rs: directory split + flow-cache stage extraction (Phase 1.5)
 
-**Status:** DRAFT v3 — addressing round-2 PLAN-NEEDS-MINOR from Codex
-(`task-mpmv3ywr-yeiqag`) and AGY (`review-mpmv1y38-oyj7ha`).
+**Status:** DRAFT v4 — addressing round-3 split verdicts: Codex
+PLAN-NEEDS-MAJOR (`task-mpmvbfiy-yehdyn`) caught a real
+`packet_frame`/`owned_packet_frame` borrow hazard; AGY
+PLAN-READY (`review-mpmvbnc1-l7248o`) ratified the v3 split-borrow
+fix.
+
+## v3 → v4 disposition
+
+| Round-3 finding | Disposition |
+|---|---|
+| **Codex MAJOR — `packet_frame` + `&mut owned_packet_frame` overlap at call site.** v3 helper takes both `packet_frame: &[u8]` (derived from `owned_packet_frame.as_deref().unwrap_or(raw_frame)` at L477) and `owned_packet_frame: &mut Option<Box<[u8]>>`. Inline code works because NLL proves `take()` only happens on `continue`-terminated paths within the same function body. Across the call boundary, the caller cannot prove that — so passing both is a borrow violation. | **APPLIED.** v4 helper does NOT take `packet_frame` as a parameter. It takes only `&mut owned_packet_frame` (plus `raw_frame: &[u8]`), and re-derives `let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);` as its first local. NLL inside the helper body works identically to the inline code. Caller does not need to rederive `packet_frame` on `FallThrough` because the original `packet_frame` binding at L477 of the caller is still valid (we never moved `owned_packet_frame` — `as_deref()` just produces a shared `&[u8]` borrow which ends before `&mut owned_packet_frame` is taken in the helper call). |
+| **Codex minor — `binding_ifindex` appears unused by L548-879 block.** | **APPLIED.** v4 removes `binding_ifindex` from the signature. The audit grep confirms no `binding.ifindex` access in 548-879. |
+
 
 ## v2 → v3 disposition
 
@@ -150,13 +161,16 @@ pub(super) fn stage_flow_cache_hit(
     mirror_sample_counter: &mut u64,         // bumped per cached hit when mirroring
     live: &Arc<BindingLiveState>,            // read-only Arc handle
     binding_slot: u32,                       // scalar, by value
-    binding_ifindex: i32,                    // scalar, by value
     // Per-descriptor context:
     binding_index: usize,
     desc: &Descriptor,
     area: *const MmapArea,
     raw_frame: &[u8],
-    packet_frame: &[u8],
+    // NOTE: helper takes &mut Option<Box<[u8]>>, NOT a separate
+    // packet_frame: &[u8]. The shared borrow `packet_frame` and
+    // the mutable borrow &mut owned_packet_frame cannot coexist
+    // at the call site (Codex round-3 fix). The helper re-derives
+    // packet_frame as its first local from `as_deref().unwrap_or(raw_frame)`.
     owned_packet_frame: &mut Option<Box<[u8]>>,
     meta: UserspaceDpMeta,
     flow: &SessionFlow,
@@ -168,12 +182,45 @@ pub(super) fn stage_flow_cache_hit(
     worker_ctx: &WorkerContext<'_>,
     telemetry: &mut TelemetryContext<'_>,
 ) -> FlowCacheOutcome {
+    // Re-derive packet_frame locally (matches L477 of the caller's
+    // pre-flow-cache code). NLL keeps this shared borrow alive only
+    // until the take() at L859 of the inline source, which is the
+    // last lexical use before either Consumed-return or FallThrough.
+    let packet_frame: &[u8] = owned_packet_frame.as_deref().unwrap_or(raw_frame);
+
     // Body lifted verbatim from poll_descriptor.rs:553-879
     // (the entire body of the outer `if FlowCacheEntry::packet_eligible(meta)
     // && let Some(flow) = flow.as_ref()` block, with the
     // outer-if/let already evaluated by the caller).
 }
 ```
+
+### Caller-side `packet_frame` lifecycle (Codex round-3 fix)
+
+The original `packet_frame` binding at L477 of the caller is:
+```rust
+let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);
+```
+This shared borrow is alive through stages 7-11 (parse_flow_and_learn,
+classify_fabric_ingress, screen_check, ipsec_passthrough_check), up to
+L546 (last `packet_frame` use before the flow-cache block at L548).
+
+Between L546 (last use) and the new helper call at L548 (start of
+the flow-cache block), `packet_frame` is NOT used. NLL therefore
+releases the shared borrow before the helper's `&mut owned_packet_frame`
+parameter is bound, so the borrow rules are satisfied.
+
+On `FallThrough`, the caller re-binds:
+```rust
+match stage_flow_cache_hit(...) {
+    FlowCacheOutcome::Consumed => continue,
+    FlowCacheOutcome::FallThrough => {}
+}
+// Re-bind packet_frame for the slow-path code at L880+.
+let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);
+```
+This re-bind is mandatory because the original L477 binding's
+lexical lifetime ended at L546 (NLL).
 
 The helper takes `flow: &SessionFlow`, not `Option<&SessionFlow>`.
 The `packet_eligible` + `flow.is_some()` guard stays in the
@@ -210,6 +257,10 @@ The fallback `PendingForward` branch at line 859 calls
 becomes:
 
 ```rust
+// packet_frame is the inline-source L477 binding, alive from L477
+// through L546 (last stage_ipsec_passthrough_check use). NLL ends
+// the shared borrow here.
+
 if FlowCacheEntry::packet_eligible(meta)
     && let Some(flow) = flow.as_ref()
 {
@@ -221,12 +272,10 @@ if FlowCacheEntry::packet_eligible(meta)
         &mut binding.mirror_sample_counter,
         &binding.live,
         binding.slot,
-        binding.ifindex,
         binding_index,
         desc,
         area,
         raw_frame,
-        packet_frame,
         &mut owned_packet_frame,
         meta,
         flow,
@@ -242,14 +291,21 @@ if FlowCacheEntry::packet_eligible(meta)
         FlowCacheOutcome::FallThrough => {}
     }
 }
-// fall through to slow-path session resolution at line 880
+
+// Re-bind packet_frame for the slow-path code at L880+.
+// (The L477 binding's NLL lifetime ended at L546.)
+let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);
+// fall through to slow-path session resolution
 ```
 
 The split borrows of `binding.flow / tx_pipeline / tx_counters /
-scratch / mirror_sample_counter / live / slot / ifindex` are
-disjoint from `binding.xsk.rx` (still held mutably by the `received`
-binding) — Rust's borrow checker accepts these alongside the
-outer `received.read()` call.
+scratch / mirror_sample_counter / live / slot` are disjoint from
+`binding.xsk.rx` (still held mutably by the `received` binding) —
+Rust's borrow checker accepts these alongside the outer
+`received.read()` call.
+
+`binding.ifindex` was in v3's signature but is NOT accessed inside
+the lifted L548-879 block; v4 removes it (Codex round-3 minor fix).
 
 ### `record_rx_descriptor_telemetry` move
 
