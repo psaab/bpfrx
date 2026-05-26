@@ -8,7 +8,7 @@ fetch by id.
 
 | Reviewer | Round | Task ID | Verdict |
 |----------|-------|---------|---------|
-| Codex    | v1 plan | (to be filled) | (to be filled) |
-| Gemini   | v1 plan | (to be filled) | (to be filled) |
-| AGY      | v1 plan | (to be filled) | (to be filled) |
-| Claude SMR | v1 plan | (in-conversation) | (to be filled) |
+| Codex    | v1 plan | task-mpmyvnpm-ge5fua | (pending) |
+| Gemini   | v1 plan | task-mpmywy00-x8qvzg | (pending) |
+| AGY      | v1 plan | adversarial-review-mpmyx4kr-8zsdfx | (pending) |
+| Claude SMR | v1 plan | (in-conversation) | (pending) |

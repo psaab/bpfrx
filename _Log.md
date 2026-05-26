@@ -4169,3 +4169,19 @@
     1-8 flagged for adversarial review; perf-irrelevance PLAN-KILL
     explicitly invited.
   - **File(s)**: docs/pr/1440-header-serialization-consolidate/{plan,reviewer-ids}.md
+
+- **Timestamp**: 2026-05-26
+  - **Action**: #1440 plan v2 — revised after round-1 4-way review.
+    Convergence findings incorporated: (1) DELETE wg/outer.rs
+    entirely [Gemini+AGY+Claude SMR], (2) UDP checksum API
+    u16 not Option<u16> [Codex+Gemini+Claude SMR], (3) Set IPv4
+    DF=1 to fix RFC 791/6864 compliance [Gemini+AGY], (4) Add
+    AVX2 length short-circuit in frame::checksum [Codex+Gemini+
+    AGY], (5) Remove §5.2 differential test in favor of permanent
+    golden vectors only [Codex+Gemini+AGY]. Reverted Gemini's
+    unauthorized worktree writes (headers.rs, headers_tests.rs,
+    checksum.rs short-circuit, eth/IP/icmp/wg edits) — Gemini went
+    rogue and wrote candidate impl, then cited its own writes in
+    findings. Substantive findings preserved; impl deferred to
+    after plan v2 PLAN-READY.
+  - **File(s)**: docs/pr/1440-header-serialization-consolidate/plan.md
