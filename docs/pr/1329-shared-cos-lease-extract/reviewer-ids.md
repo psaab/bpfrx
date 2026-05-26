@@ -11,6 +11,9 @@ Format: `<reviewer> <round> <task-id>`
 - agy r1 PLAN-READY held from v1
 
 ## Code review (PR #1588 at f8ad9fe3)
-- codex r1 task-mpn54ow5-lcs0xr
-- agy  r1 adversarial-review-mpn550uw-5xlev1
-- copilot r1 awaiting (gh pr edit --add-reviewer + @copilot review comment posted)
+- codex r1 task-mpn54ow5-lcs0xr  (MERGE-NEEDS-MINOR — flake-test wording)
+- codex r2 task-mpn5tzef-dr3xk9  (MERGE-READY at ec8f46e1)
+- codex r3 task-mpn61nki-3ofs1e  (re-attest after Copilot doc nits @ 8df7e39a)
+- agy  r1 adversarial-review-mpn550uw-5xlev1  (MERGE-READY)
+- copilot r1 COMMENTED at f8ad9fe3 (2 inline nits — addressed in 8df7e39a)
+- claude SMR self MERGE-READY at f8ad9fe3
