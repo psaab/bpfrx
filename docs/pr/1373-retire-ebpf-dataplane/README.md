@@ -178,31 +178,17 @@ The same direct boundary packages must not add production `import "C"`,
 or `.syso` precompiled object files. Those mechanisms can mutate Go state or
 hide alternate entry paths outside the AST selectors pinned by the entry-program
 canary. Production build constraints are also rejected unless they are
-explicitly allowlisted and documented here. The only current allowlist
-entries are the generated legacy bpf2go `*_bpfel.go` artifacts with the exact
-`//go:build 386 || amd64` architecture constraint, and
-`pkg/dataplane/loader_stub.go` with `//go:build ignore`, an ignored fallback
-stub for trees without generated legacy artifacts that is not part of normal
-builds. Any new boundary build tag, assembly or object file, CGo import, or Go
-compiler directive requires a matching canary allowlist rationale before it can
-land.
+explicitly allowlisted and documented here. After #1476 mechanical source
+removal the build-tag allowlist is empty: the legacy bpf2go-generated
+`xpf{Xdp,Tc}*_x86_bpfel.go` wrappers and the `//go:build ignore`
+`pkg/dataplane/loader_stub.go` placeholder are deleted along with the source
+they wrapped. Any new boundary build tag, assembly or object file, CGo
+import, or Go compiler directive requires a matching canary allowlist
+rationale before it can land.
 
-Current generated legacy bpf2go build-tag allowlist:
-
-- `pkg/dataplane/xpftcconntrack_x86_bpfel.go`
-- `pkg/dataplane/xpftcforward_x86_bpfel.go`
-- `pkg/dataplane/xpftcmain_x86_bpfel.go`
-- `pkg/dataplane/xpftcnat_x86_bpfel.go`
-- `pkg/dataplane/xpftcscreenegress_x86_bpfel.go`
-- `pkg/dataplane/xpfxdpconntrack_x86_bpfel.go`
-- `pkg/dataplane/xpfxdpcpumap_x86_bpfel.go`
-- `pkg/dataplane/xpfxdpforward_x86_bpfel.go`
-- `pkg/dataplane/xpfxdpmain_x86_bpfel.go`
-- `pkg/dataplane/xpfxdpnat64_x86_bpfel.go`
-- `pkg/dataplane/xpfxdpnat_x86_bpfel.go`
-- `pkg/dataplane/xpfxdppolicy_x86_bpfel.go`
-- `pkg/dataplane/xpfxdpscreen_x86_bpfel.go`
-- `pkg/dataplane/xpfxdpzone_x86_bpfel.go`
+The historical generated legacy bpf2go build-tag allowlist (deleted by
+#1476) is preserved in git history at the manifest's `## Delete Manifest`
+section in `docs/pr/1373-retire-ebpf-dataplane/source-removal-manifest-1476.md`.
 
 ## #1493 Userspace Shim Loader Split
 

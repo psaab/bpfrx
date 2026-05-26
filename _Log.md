@@ -1,5 +1,96 @@
 # Action Log
 
+## 2026-05-26 — #1476 Phase B implementation
+
+- **Timestamp**: 2026-05-26T (Phase B complete; awaiting code review)
+  - **Action**: #1451 closed (capstone PR #1557 merged as ee4b34bf).
+    Rebased plan branch onto current master ee4b34bf via /tmp/log-merge.py
+    union resolution on _Log.md conflict. Re-verified
+    `(*Daemon).legacyDP()` is gone from production code and
+    pkg/daemon/legacy_dataplane_canary_test.go is in place.
+    Executed the deletion per plan v4:
+    - Deleted bpf/xdp/*.c (9 files), bpf/tc/*.c (5 files),
+      bpf/xdp/README.md, bpf/tc/README.md, bpf/README.md.
+    - Deleted 14 generated bpf2go pairs
+      (pkg/dataplane/xpf{Xdp,Tc}*_x86_bpfel.{go,o}).
+    - Deleted pkg/dataplane/loader_ebpf.go and loader_stub.go.
+    - Preserved pkg/dataplane/userspace_xdp_bpfel.o and
+      userspace_xdp_rust.go; preserved bpf/headers/*.h, userspace-xdp/,
+      and test/xsk-repro/.
+    - Extracted retained Rust AF_XDP shim loader graph (16
+      functions + 5 constants + 1 type) from the deleted
+      loader_ebpf.go into new pkg/dataplane/loader_userspace_shim.go.
+    - Manager.Load() body rewritten to `return ErrEBPFBackendRetired`
+      (kept as retirement stub; DataPlane interface contract preserved).
+    - Added ErrEBPFBackendRetired sentinel (dataplane.go) and
+      ErrEBPFDataplaneRetired (config/compiler.go).
+    - Extended validateDataplaneTypeStrict to reject TypeEBPF.
+    - NewDataPlane(TypeEBPF) / NewRuntimeDataPlane(TypeEBPF) now
+      return the sentinel directly.
+    - Added daemon_run.go soft-fallback branch for
+      ErrEBPFBackendRetired, mirroring the existing DPDK arm.
+    - New pkg/configstore/dataplane_retire.go with
+      `rewriteRetiredDataplaneType` helper covering both `ebpf` and
+      `dpdk` retired values; wired into Store.Load() AND
+      Store.SyncApply() per AGY r4 finding for HA rolling-upgrade
+      safety.
+    - Removed ValidateConfig's EBPF deprecation warning (dead code
+      after strict reject).
+    - Narrowed Makefile clean glob from
+      `pkg/dataplane/*_bpfel.{go,o}` to `xpf*_bpfel.{go,o}` to
+      protect the retained shim object by name.
+    - Removed legacy `make generate-legacy-bpf` target and the now-empty
+      .PHONY arm; updated `make generate` header comment.
+    - Updated retirement-boundary canary:
+      retainedShimBoundaryBuildTagAllowlist now empty (was 14 bpf2go
+      entries + loader_stub.go); docs-pinned token block at line 1822
+      pruned of `*_bpfel.go`/`go:build 386 || amd64`/`loader_stub.go`/
+      `go:build ignore`. README.md narrative section also rewritten.
+    - Updated source-removal-manifest-1476.md: Build Hooks +
+      Tests/Docs subsections moved to separate H2 sections so the
+      manifest canary's section-scoped path scanner doesn't read
+      them as delete-list entries; Delete Manifest pruned to
+      narrative pointers only.
+    - Rewrote pkg/api/config_commit_test.go,
+      pkg/cli/cli_config_test.go, pkg/grpcapi/server_config_test.go,
+      pkg/config/parser_system_test.go ebpf-warning tests as
+      retirement-rejection assertions (5 test cases each surfacing
+      the verbatim retirement message via Contains, plus a
+      sentinel-match TestSentinelMatch in pkg/api).
+    - Rewrote TestBuildRuntimeDataPlaneEBPFRoutesToLegacyManager →
+      TestBuildRuntimeDataPlaneEBPFReturnsRetired in
+      pkg/daemon/dataplane_boot_test.go to assert ErrEBPFBackendRetired.
+    - Updated pkg/dataplane/userspace/shim_loader_boundary_test.go:45
+      and pkg/dataplane/userspace/maps_decouple_test.go:1320 to point
+      at loader_userspace_shim.go instead of the deleted loader_ebpf.go.
+    - Updated CLAUDE.md BPF Pipeline + Code Layout sections to past
+      tense; rewrote Quick Start `make generate` description.
+    - Updated docs/development-workflow.md, docs/testing.md,
+      docs/next-features/ipv6-session-fast-path.md,
+      pkg/dataplane/constants.go:14 doc comment to point at the
+      retained shim loader instead of the deleted loader_ebpf.go.
+    - New pkg/configstore/dataplane_retire_test.go with 5 tests:
+      TestRewriteRetiredDataplaneType_EBPF (rewrite, compile-clean,
+      DataplaneType empty); TestRewriteRetiredDataplaneType_DPDK;
+      TestRewriteRetiredDataplaneType_NoOpForUserspace;
+      TestRewriteRetiredDataplaneType_NoSystemNode;
+      TestStoreLoad_RewritesPersistedEBPFDataplaneType (end-to-end:
+      pre-#1476 persisted ebpf-tree → Load → ActiveConfig non-nil
+      with userspace default).
+
+    Test gates: `go build ./...` clean; `go test ./...` clean across
+    33 packages; 5x flake on retirement canaries clean. Grep proof:
+    `xpfXdp|xpfTc|loadXpfXdp|loadXpfTc|loadAllObjects` only appears
+    in (a) shim_loader_boundary_test.go negative-token list (intentional
+    drift-guard), (b) doc comments explaining the history. `bpf/xdp|bpf/tc/`
+    only appears in `retirement_boundary_canary_test.go` historical
+    context.
+  - **File(s)**: 51 files changed: 35 deletions (legacy source +
+    generated artifacts + loader_ebpf.go + loader_stub.go), 2 new files
+    (loader_userspace_shim.go, dataplane_retire.go +
+    dataplane_retire_test.go), 14 edited (sentinel wiring + test
+    rewrites + canary updates + doc sweeps + CLAUDE.md).
+
 ## 2026-05-25 — #1476 Phase A PLAN-READY at r4
 
 - **Timestamp**: 2026-05-25T (Phase A complete)

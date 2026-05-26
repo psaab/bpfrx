@@ -21,12 +21,10 @@ package userspace
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1302,31 +1300,25 @@ func equalStringSets(a, b []string) bool {
 
 // TestRegistryParityWithLegacyLoader asserts that every userspace
 // map-name constant matches a literal string still present in the
-// legacy loader at pkg/dataplane/loader_ebpf.go. The two sides
-// duplicate the names during the #1476 retirement window; this
-// canary keeps them in lockstep so a rename in either file is caught
-// at test time, not at helper bringup.
+// retained Rust AF_XDP shim loader at
+// pkg/dataplane/loader_userspace_shim.go. The two sides duplicate
+// the names; this canary keeps them in lockstep so a rename in
+// either file is caught at test time, not at helper bringup.
 //
-// The test self-retires (t.Skip) only when the explicit retirement
-// sentinel BPFRX_LEGACY_LOADER_RETIRED=1 is set. Without the
-// sentinel, a missing loader_ebpf.go is a hard failure — this is
-// deliberate per AGY r1 §2: a sibling PR that *moves* the loader
-// (e.g. to pkg/dataplane/ebpf/loader.go) must explicitly accept
-// retirement before this canary stands down. Otherwise drift
-// protection silently disappears.
+// History (#1476): pre-mechanical-removal this canary pointed at
+// pkg/dataplane/loader_ebpf.go, which held both the deleted legacy
+// XDP/TC graph AND the retained shim loader. After #1476 the
+// retained graph lives in loader_userspace_shim.go and the legacy
+// graph is gone; the parity check now policess only the retained
+// side. The function name keeps "WithLegacyLoader" suffix only for
+// git-blame continuity; rename in a separate PR.
 func TestRegistryParityWithLegacyLoader(t *testing.T) {
 	t.Parallel()
 
-	loaderPath := filepath.Join("..", "loader_ebpf.go")
+	loaderPath := filepath.Join("..", "loader_userspace_shim.go")
 	body, err := os.ReadFile(loaderPath)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) && os.Getenv("BPFRX_LEGACY_LOADER_RETIRED") == "1" {
-			t.Skipf("legacy loader absent and BPFRX_LEGACY_LOADER_RETIRED=1 — #1476 retired: %v", err)
-			return
-		}
-		t.Fatalf("read legacy loader %s: %v "+
-			"(if #1476 has retired the loader, set BPFRX_LEGACY_LOADER_RETIRED=1 "+
-			"or delete this canary)", loaderPath, err)
+		t.Fatalf("read retained shim loader %s: %v", loaderPath, err)
 	}
 
 	// Dynamically discover every `mapName...` constant defined in

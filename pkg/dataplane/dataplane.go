@@ -26,6 +26,24 @@ var ErrDPDKBackendRetired = errors.New(
 		"'set system dataplane-type userspace' (see #1525)",
 )
 
+// ErrEBPFBackendRetired is returned from NewDataPlane,
+// NewRuntimeDataPlane, and Manager.Load() when caller code still asks
+// for the legacy eBPF backend after the #1476 source-removal phase of
+// the #1373 eBPF retirement umbrella.  Operators must migrate to
+// "set system dataplane-type userspace" (or omit the directive
+// entirely for the default).
+//
+// Chain A (commit-time validator validateDataplaneTypeStrictEBPF in
+// pkg/config) handles user-facing rejection at commit time; this
+// sentinel covers the runtime factory path for callers that still
+// pass TypeEBPF through, the Manager.Load() interface contract method
+// that remains in tree for DataPlane assertion compatibility, and
+// stored-config rolling-upgrade paths surfaced by AGY r4.
+var ErrEBPFBackendRetired = errors.New(
+	"the legacy eBPF dataplane backend has been retired; use " +
+		"'set system dataplane-type userspace' (see #1373)",
+)
+
 // Compile-time assertion that Manager implements DataPlane.
 var _ DataPlane = (*Manager)(nil)
 var _ ConfigSink = (*Manager)(nil)
@@ -150,20 +168,24 @@ func NewDataPlane(dpType string) (DataPlane, error) {
 			TypeUserspace,
 		)
 	case TypeEBPF:
-		return New(), nil
+		// Phase 1 reject preservation (#1476): TypeEBPF is kept as a
+		// typed token so old configs still parse, but no production
+		// constructor for the legacy backend exists after source
+		// removal. Mirrors the DPDK retirement pattern.
+		return nil, ErrEBPFBackendRetired
 	case TypeDPDK:
 		return nil, ErrDPDKBackendRetired
 	default:
 		if ctor, ok := backendRegistry[dpType]; ok {
 			return ctor(), nil
 		}
-		// Legacy NewDataPlane only accepts TypeEBPF directly; TypeUserspace
-		// has no legacy DataPlane shape and must go through
-		// NewRuntimeDataPlane.  TypeDPDK is caught above as
-		// ErrDPDKBackendRetired.  Operators selecting userspace at the
-		// config layer never reach this branch because daemon startup
-		// uses NewRuntimeDataPlane.
-		return nil, fmt.Errorf("unknown dataplane type %q (valid via NewDataPlane: ebpf; use NewRuntimeDataPlane for userspace)", dpType)
+		// Legacy NewDataPlane retains TypeEBPF and TypeDPDK only as
+		// retirement-error tokens. TypeUserspace has no legacy
+		// DataPlane shape and must go through NewRuntimeDataPlane.
+		// Operators selecting userspace at the config layer never
+		// reach this branch because daemon startup uses
+		// NewRuntimeDataPlane.
+		return nil, fmt.Errorf("unknown dataplane type %q (use NewRuntimeDataPlane for userspace; ebpf and dpdk are retired)", dpType)
 	}
 }
 
@@ -174,7 +196,12 @@ func NewRuntimeDataPlane(dpType string) (RuntimeDataPlane, error) {
 	dpType = EffectiveType(dpType)
 	switch dpType {
 	case TypeEBPF:
-		return New(), nil
+		// Phase 1 reject preservation (#1476): the legacy eBPF
+		// backend is retired. The daemon_run.go soft-fallback
+		// catches ErrEBPFBackendRetired (alongside the existing
+		// ErrDPDKBackendRetired branch) and runs in config-only
+		// mode while the operator updates the persisted config.
+		return nil, ErrEBPFBackendRetired
 	case TypeDPDK:
 		// EffectiveType only rewrites empty -> userspace, never
 		// -> dpdk, so this branch cannot intercept legitimate

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
@@ -12,7 +13,11 @@ import (
 	"github.com/psaab/xpf/pkg/configstore"
 )
 
-func newAPICommitWarningStore(t *testing.T) *configstore.Store {
+// newAPIEBPFRejectStore stages a candidate with `system dataplane-type ebpf`
+// so the commit/commit-check handlers can exercise the retirement-reject
+// path. Prior to #1476 the same shape returned an EBPF deprecation
+// warning; after the strict-validator landed this is a hard reject.
+func newAPIEBPFRejectStore(t *testing.T) *configstore.Store {
 	t.Helper()
 
 	store := configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))
@@ -25,24 +30,36 @@ func newAPICommitWarningStore(t *testing.T) *configstore.Store {
 	return store
 }
 
-func TestConfigCommitCheckHandlerReturnsWarnings(t *testing.T) {
-	s := &Server{store: newAPICommitWarningStore(t)}
+// TestConfigCommitCheckHandlerRejectsRetiredEBPF asserts that
+// `commit check` against a candidate carrying the retired
+// `dataplane-type ebpf` returns the retirement-rejection error,
+// not a success-with-warning response. Mirrors the DPDK reject
+// pattern in pkg/config/parser_ast_test.go (#1526).
+func TestConfigCommitCheckHandlerRejectsRetiredEBPF(t *testing.T) {
+	s := &Server{store: newAPIEBPFRejectStore(t)}
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/v1/config/commit-check", nil)
 	s.configCommitCheckHandler(rr, req)
 
-	resp := decodeConfigCommitResponse(t, rr)
-	if !resp.Success {
-		t.Fatalf("success = false; body: %s", rr.Body.String())
+	body := rr.Body.String()
+	if rr.Code == 200 {
+		var resp struct {
+			Success bool `json:"success"`
+		}
+		if err := json.Unmarshal([]byte(body), &resp); err == nil && resp.Success {
+			t.Fatalf("commit-check unexpectedly succeeded on retired ebpf type; body: %s", body)
+		}
 	}
-	if !containsWarning(resp.Data.Warnings, "system dataplane-type ebpf selects") {
-		t.Fatalf("warnings = %v, want explicit ebpf warning", resp.Data.Warnings)
+	if !strings.Contains(body, "legacy eBPF dataplane backend has been retired") {
+		t.Fatalf("response missing eBPF retirement message; body: %s", body)
 	}
 }
 
-func TestConfigCommitHandlerReturnsWarnings(t *testing.T) {
-	store := newAPICommitWarningStore(t)
+// TestConfigCommitHandlerRejectsRetiredEBPF asserts that the commit
+// path surfaces the retirement-reject error sentinel.
+func TestConfigCommitHandlerRejectsRetiredEBPF(t *testing.T) {
+	store := newAPIEBPFRejectStore(t)
 	s := &Server{
 		store: store,
 		commitFn: func(context.Context, string) (*config.Config, error) {
@@ -54,17 +71,17 @@ func TestConfigCommitHandlerReturnsWarnings(t *testing.T) {
 	req := httptest.NewRequest("POST", "/api/v1/config/commit", nil)
 	s.configCommitHandler(rr, req)
 
-	resp := decodeConfigCommitResponse(t, rr)
-	if !resp.Success {
-		t.Fatalf("success = false; body: %s", rr.Body.String())
-	}
-	if !containsWarning(resp.Data.Warnings, "system dataplane-type ebpf selects") {
-		t.Fatalf("warnings = %v, want explicit ebpf warning", resp.Data.Warnings)
+	body := rr.Body.String()
+	if !strings.Contains(body, "legacy eBPF dataplane backend has been retired") {
+		t.Fatalf("response missing eBPF retirement message; body: %s", body)
 	}
 }
 
-func TestConfigCommitConfirmedHandlerReturnsWarnings(t *testing.T) {
-	store := newAPICommitWarningStore(t)
+// TestConfigCommitConfirmedHandlerRejectsRetiredEBPF asserts that
+// commit-confirmed surfaces the retirement-reject error too. The
+// candidate must not enter the rollback-timer flow on a retired type.
+func TestConfigCommitConfirmedHandlerRejectsRetiredEBPF(t *testing.T) {
+	store := newAPIEBPFRejectStore(t)
 	s := &Server{
 		store: store,
 		commitConfirmedFn: func(context.Context, int) (*config.Config, error) {
@@ -77,15 +94,32 @@ func TestConfigCommitConfirmedHandlerReturnsWarnings(t *testing.T) {
 		strings.NewReader(`{"minutes":10}`))
 	s.configCommitConfirmedHandler(rr, req)
 
-	resp := decodeConfigCommitResponse(t, rr)
-	if !resp.Success {
-		t.Fatalf("success = false; body: %s", rr.Body.String())
-	}
-	if !containsWarning(resp.Data.Warnings, "system dataplane-type ebpf selects") {
-		t.Fatalf("warnings = %v, want explicit ebpf warning", resp.Data.Warnings)
+	body := rr.Body.String()
+	if !strings.Contains(body, "legacy eBPF dataplane backend has been retired") {
+		t.Fatalf("response missing eBPF retirement message; body: %s", body)
 	}
 }
 
+// TestSentinelMatch documents that config.ErrEBPFDataplaneRetired is the
+// sentinel propagated through Store.Commit() / Store.CommitCheck() for
+// the retired EBPF type. Future API code that wraps the error should
+// keep errors.Is() resolvable. The two API tests above match the
+// verbatim message via Contains; this one is a sanity assertion on
+// the sentinel chain.
+func TestSentinelMatch(t *testing.T) {
+	store := newAPIEBPFRejectStore(t)
+	_, err := store.CommitCheck()
+	if err == nil {
+		t.Fatalf("CommitCheck unexpectedly succeeded on retired ebpf type")
+	}
+	if !errors.Is(err, config.ErrEBPFDataplaneRetired) {
+		t.Fatalf("err = %v; want errors.Is(config.ErrEBPFDataplaneRetired)", err)
+	}
+}
+
+// decodeConfigCommitResponse is kept for any successor test that
+// needs to inspect a successful commit response shape after the
+// rewrite.
 func decodeConfigCommitResponse(t *testing.T, rr *httptest.ResponseRecorder) struct {
 	Success bool                 `json:"success"`
 	Data    configCommitResponse `json:"data"`

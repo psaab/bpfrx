@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -1394,7 +1395,11 @@ func TestDataplaneWorkersOmittedTypeUsesUserspaceDefault(t *testing.T) {
 	}
 }
 
-func TestDataplaneTypeExplicitEBPFWarnsDeprecatedCompatibility(t *testing.T) {
+// TestDataplaneTypeExplicitEBPFRejectsRetiredCompile asserts that
+// `set system dataplane-type ebpf` now hard-errors at compile time
+// after the #1476 mechanical source removal. Mirrors the DPDK reject
+// pattern in TestDPDKConfigCompileRejects (#1526).
+func TestDataplaneTypeExplicitEBPFRejectsRetiredCompile(t *testing.T) {
 	tree := &ConfigTree{}
 	for _, cmd := range []string{
 		"set system dataplane-type ebpf",
@@ -1405,19 +1410,18 @@ func TestDataplaneTypeExplicitEBPFWarnsDeprecatedCompatibility(t *testing.T) {
 		}
 	}
 
-	cfg, err := CompileConfig(tree)
-	if err != nil {
-		t.Fatalf("CompileConfig: %v", err)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig succeeded; expected ErrEBPFDataplaneRetired")
 	}
-	if cfg.System.DataplaneType != "ebpf" {
-		t.Fatalf("DataplaneType = %q, want ebpf", cfg.System.DataplaneType)
+	if !errors.Is(err, ErrEBPFDataplaneRetired) {
+		t.Fatalf("CompileConfig err = %v; want errors.Is(ErrEBPFDataplaneRetired)", err)
 	}
-	warnings := strings.Join(cfg.Warnings, "\n")
-	if !strings.Contains(warnings, "system dataplane-type ebpf selects the deprecated legacy eBPF dataplane explicitly") {
-		t.Fatalf("missing explicit eBPF deprecation warning, got: %s", warnings)
+	if !strings.Contains(err.Error(), "legacy eBPF dataplane backend has been retired") {
+		t.Fatalf("err missing retirement message: %v", err)
 	}
-	if !strings.Contains(warnings, "Omitting system dataplane-type selects the userspace dataplane") {
-		t.Fatalf("missing userspace default note in explicit eBPF warning, got: %s", warnings)
+	if !strings.Contains(err.Error(), "use 'set system dataplane-type userspace'") {
+		t.Fatalf("err missing remediation: %v", err)
 	}
 }
 
