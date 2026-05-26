@@ -1,5 +1,25 @@
 # Action Log
 
+## 2026-05-26 — #1326 plan v3 (AGY r2 PLAN-NEEDS-MINOR addressed)
+
+- **Timestamp**: 2026-05-26T (AGY r2 result fetched, Codex r2 lost)
+  - **Action**: AGY r2 (review-mpmvbr0c-i8e6wh) returned
+    PLAN-NEEDS-MINOR with 4 actionable items. v3 addresses all four:
+    (1) bundle dbg/wr telemetry into DebugReportState nested in
+    LoopState so debug_report::maybe_emit no longer takes &mut state
+    wholesale, (2) shutdown signature fix — pass &Arc<ForwardingState>
+    so the final cos_status republish compiles (resolved by inlining
+    shutdown into the orchestrator), (3) hybrid inlining on
+    tick::arc_refresh — outer is #[inline(always)] but the cold
+    cos_fast_interfaces rebuild inner helper is #[inline(never)] +
+    #[cold] to protect L1i footprint, (4) collapse shutdown.rs +
+    idle.rs into mod.rs (6 → 4 files). Codex r2 task
+    task-mpmvbj5i-hw5hra LOST from the harness again (same
+    long-running session-state drop pattern). Re-dispatching Codex
+    + AGY in parallel on v3.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
 ## 2026-05-26 — #1326 plan v2 (AGY r1 PLAN-NEEDS-MAJOR addressed)
 
 - **Timestamp**: 2026-05-26T (AGY r1 result fetched)

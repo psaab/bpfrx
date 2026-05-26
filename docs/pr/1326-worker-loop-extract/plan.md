@@ -1,6 +1,48 @@
 # #1326 — Extract worker_loop body into worker/loop_body/
 
-**Status:** DRAFT v2 — addressing AGY r1 PLAN-NEEDS-MAJOR findings
+**Status:** DRAFT v3 — addressing AGY r2 PLAN-NEEDS-MINOR findings
+
+### v2→v3 changelog
+
+AGY r2 (review-mpmvbr0c-i8e6wh) returned PLAN-NEEDS-MINOR with 4
+fixable action items. v3 addresses all four:
+
+1. **Telemetry struct isolation.** AGY r2 found a hidden whole-struct
+   borrow leak at `debug_report::maybe_emit(&mut state, …)`. Fix:
+   bundle all dbg_*/wr_*/stall_* fields into a nested
+   `DebugReportState` struct inside `LoopState`. `maybe_emit` now
+   takes only `&mut state.dbg_state` + a small set of refs it needs
+   for binding live publishes and the worker-runtime cosmetic block.
+   This keeps `state.validation`, `state.forwarding`,
+   `state.sessions`, etc. completely untouched by the
+   debug-report ABI boundary — LLVM can keep them in registers
+   across the loop backedge regardless of how cold `emit_report` is.
+
+2. **Shutdown signature fix.** AGY r2 caught that
+   `shutdown::tear_down(&mut bindings, &cos_status, &heartbeat)`
+   cannot perform the final CoS-status republish because it lacks
+   `&ForwardingState`. Fix: signature becomes
+   `shutdown::tear_down(&mut bindings, &cos_status,
+   &state.forwarding, &heartbeat)`. Plus the per-binding CoS-lease
+   release block stays inside.
+
+3. **Hybrid inlining for arc_refresh.** AGY r2 flagged that
+   `#[inline(always)]` on the whole `tick::arc_refresh` would inline
+   the L1387-L1417 cos_fast_interfaces rebuild block (which builds
+   BTreeMaps) into the orchestrator's hot loop body, blowing the
+   L1i cache footprint. Fix: split `arc_refresh` into a hot outer
+   that runs only the `load_arc_if_changed` short-circuit checks,
+   plus a cold inner helper
+   `rebuild_cos_fast_interfaces_and_repub(...)` marked
+   `#[inline(never)]` + `#[cold]` that runs only when the
+   `rebuild_cos_fast_interfaces` flag is true.
+
+4. **File tree consolidation: 6 → 4 files.** Eliminate `shutdown.rs`
+   and `idle.rs`; fold their bodies directly into
+   `loop_body/mod.rs`. `shutdown::tear_down` is 11 LOC; `idle::handle`
+   is ~40 LOC and is tightly coupled with the orchestrator's
+   `did_work` + `poll_mode` control flow. Final tree:
+   `mod.rs`, `setup.rs`, `tick.rs`, `poll_drive.rs`, `debug_report.rs`.
 
 ### v1→v2 changelog
 
@@ -85,7 +127,30 @@ mitigatable — PLAN-KILL is an acceptable verdict.*
 
 ## Concrete design
 
-### File tree (post-split, v2)
+### File tree (post-split, v3)
+
+```
+userspace-dp/src/afxdp/worker/
+  mod.rs              # (unchanged from v2 description)
+  loop_body/
+    mod.rs            # pub(crate) fn worker_loop — orchestrator, the
+                      # idle handling block, and the post-loop
+                      # shutdown block. Defines pub(super) LoopState
+                      # and pub(super) DebugReportState.
+    setup.rs          # Pre-loop init. Returns
+                      # (Vec<BindingWorker>, LoopState).
+    tick.rs           # Per-tick helpers (all #[inline(always)] on
+                      # the hot outer; the inner cos_fast_interfaces
+                      # rebuild is #[inline(never)] + #[cold]):
+                      #   runtime_publish, arc_refresh,
+                      #   commands_drain, expiry, deltas.
+    poll_drive.rs     # The per-binding poll round; NOT inlined.
+    debug_report.rs   # maybe_emit (outer, #[inline(always)]) + the
+                      # cold emit_report inner. Takes only
+                      # &mut state.dbg_state and the bindings ref.
+```
+
+### File tree (rejected, v2)
 
 ```
 userspace-dp/src/afxdp/worker/
@@ -184,7 +249,7 @@ userspace-dp/src/afxdp/worker/
 Total module files: 6 (mod, setup, tick, poll_drive, debug_report,
 idle, shutdown — counted excluding optional tests.rs).
 
-### LoopState struct (the avoiding-16-param-fn pattern)
+### LoopState struct (v3 — DebugReportState bundle)
 
 worker_loop has ~20 mutable locals that persist across phases. Passing
 them all as `&mut` references through 7+ sub-fn calls every tick would
@@ -220,12 +285,15 @@ pub(super) struct LoopState {
     pub(super) poll_start: usize,
     pub(super) idle_iters: u32,
     pub(super) ha_startup_grace_until_secs: u64,
-    // #869 worker runtime telemetry
-    pub(super) wr_counters: WorkerRuntimeCounters,
-    pub(super) wr_state: WorkerRuntimeState,
-    pub(super) wr_last_loop_ns: u64,
-    pub(super) wr_last_publish_ns: u64,
-    // Debug report cadence + cumulative counters
+    // v3: all debug-report + worker-runtime telemetry nested in one
+    // sub-struct so debug_report::maybe_emit can take only
+    // `&mut state.dbg_state` without leaking the whole LoopState
+    // borrow across the (cold) emit_report ABI boundary.
+    pub(super) dbg_state: DebugReportState,
+}
+
+pub(super) struct DebugReportState {
+    // Always-on cumulative (kept across cfg(debug-log) boundary)
     pub(super) dbg_last_report_ns: u64,
     pub(super) dbg_rx_total: u64,
     pub(super) dbg_forward_total: u64,
@@ -233,10 +301,28 @@ pub(super) struct LoopState {
     pub(super) prev_fwd_total: u64,
     pub(super) stall_prev_fwd: u64,
     pub(super) stall_reported: bool,
+    // #869 worker-runtime telemetry — separate from debug-log because
+    // these counters publish on the 1s wr_publish gate (always-on),
+    // not the 1s dbg_report gate (debug-log-feature).
+    pub(super) wr_counters: WorkerRuntimeCounters,
+    pub(super) wr_state: WorkerRuntimeState,
+    pub(super) wr_last_loop_ns: u64,
+    pub(super) wr_last_publish_ns: u64,
+    // Debug-log feature: full per-direction / per-action / per-flag
+    // counter bundle. Wrapped in cfg so the field disappears entirely
+    // in non-debug-log builds (the public-facing release config).
     #[cfg(feature = "debug-log")]
-    pub(super) dbg_counters: DebugCounters,  // bundle of all `dbg_*` cfg counters
+    pub(super) dbg_counters: DebugCounters,
 }
 ```
+
+`wr_*` ends up in `DebugReportState` rather than the top-level
+LoopState because the wr-publish gate co-fires with the
+`dbg_last_report_ns` debug-report gate (both 1s cadence). Keeping
+them in the same nested struct means `tick::runtime_publish` and
+`debug_report::maybe_emit` can both take `&mut state.dbg_state` while
+the orchestrator's hot path (validation, forwarding, sessions,
+bindings) is never aliased to either.
 
 Builder: `setup::initialize_loop_state(&worker_ctx, &mut bindings)`
 returns `(Vec<BindingWorker>, LoopState)`.
@@ -271,12 +357,11 @@ pub(crate) fn worker_loop(
         let loop_now_ns = monotonic_nanos();
         let loop_now_secs = loop_now_ns / 1_000_000_000;
 
-        // #869 runtime telemetry publish (1s gate inside)
+        // #869 runtime telemetry publish (1s gate inside).
+        // Takes only &mut state.dbg_state — the orchestrator's
+        // hot fields stay untouched.
         tick::runtime_publish(
-            &mut state.wr_counters,
-            &mut state.wr_state,
-            &mut state.wr_last_loop_ns,
-            &mut state.wr_last_publish_ns,
+            &mut state.dbg_state,
             &state.sessions,           // for sessions.len()
             &bindings,                 // for cos queue lease counters
             &runtime_atomics,
@@ -402,26 +487,46 @@ pub(crate) fn worker_loop(
             loop_now_ns,
         );
 
+        // v3: maybe_emit takes only &mut state.dbg_state — the rest
+        // of LoopState stays untouched across this call site so LLVM
+        // can keep state.validation/forwarding/sessions in registers.
         debug_report::maybe_emit(
-            &mut state,           // takes &mut state because the cold
-                                  // path needs ALL fields — the gate
-                                  // is the only fast path and is
-                                  // inlined; the body is #[cold] +
-                                  // out-of-line so LLVM doesn't have
-                                  // to assume the fast path mutates
-                                  // anything.
+            &mut state.dbg_state,
             &mut bindings,
             worker_id, loop_now_ns,
         );
 
-        idle::handle(
-            &mut state.idle_iters,
-            &mut state.interrupt_poll_fds,
-            &mut state.wr_state,
-            did_work, poll_mode,
-        );
+        // v3: idle handling lives inline in the orchestrator (was
+        // idle::handle in v2). Keeps the BusyPoll spin path
+        // syntactically local to the loop body. AGY r2 asked for this.
+        if did_work {
+            state.idle_iters = 0;
+            state.dbg_state.wr_state = WorkerRuntimeState::Active;
+            state.dbg_state.wr_counters.work_loops =
+                state.dbg_state.wr_counters.work_loops.wrapping_add(1);
+            continue;
+        }
+        state.idle_iters = state.idle_iters.saturating_add(1);
+        state.dbg_state.wr_counters.idle_loops =
+            state.dbg_state.wr_counters.idle_loops.wrapping_add(1);
+        match poll_mode {
+            crate::PollMode::BusyPoll => { /* spin / sleep — identical to L2227 */ }
+            crate::PollMode::Interrupt => { /* poll() — identical to L2236 */ }
+        }
     }
-    shutdown::tear_down(&mut bindings, &cos_status, &heartbeat);
+    // v3: shutdown also lives inline in the orchestrator (was
+    // shutdown::tear_down in v2). 11 LOC, runs once.
+    crate::filter::flush_recorded_filter_counters();
+    for binding in bindings.iter_mut() {
+        clear_all_cos_exact_backlogs_for_binding(binding);
+        release_all_cos_root_leases(binding);
+        release_all_cos_queue_leases(binding);
+    }
+    cos_status.store(Arc::new(build_worker_cos_statuses(
+        &bindings,
+        state.forwarding.as_ref(),
+    )));
+    heartbeat.store(monotonic_nanos(), Ordering::Relaxed);
 }
 ```
 
@@ -464,7 +569,7 @@ Vec as today's `let mut shared_recycles = Vec::with_capacity(...)`,
 just rehomed onto LoopState (which is itself stack-allocated by the
 orchestrator and never cloned).
 
-### Cold-path annotation (v2)
+### Cold-path annotation (v3)
 
 - `debug_report::maybe_emit` — outer is
   `#[inline(always)] pub(super) fn maybe_emit(...)` and contains
@@ -483,7 +588,28 @@ orchestrator and never cloned).
 - The fabric-rebuild branch inside `tick::expiry` is also `#[cold]` —
   fires only when `live_fabrics != forwarding.fabrics`.
 
-### Hot-path inline annotation (v2)
+### Hot-path inline annotation (v3 — hybrid)
+
+v3 adds hybrid inlining to `tick::arc_refresh`: the outer fast-path
+(load_arc_if_changed short-circuit checks for forwarding + 8 CoS
+Arcs) is `#[inline(always)]`, but the cold inner
+`rebuild_cos_fast_interfaces_and_repub(...)` helper (the
+BTreeMap-rebuilding block at today's L1387-L1417) is
+`#[inline(never)]` + `#[cold]`. This keeps the loop body's L1i
+footprint compact while still inlining the Arc::ptr_eq fast-paths
+that dominate most ticks.
+
+Similarly:
+- `tick::commands_drain` outer empty-queue fast path is
+  `#[inline(always)]`; the inner `apply_non_empty_commands(...)` is
+  `#[cold]`.
+- `tick::expiry` outer is `#[inline(always)]`; the fabric-rebuild
+  branch is `#[cold]`.
+- `debug_report::maybe_emit` outer (elapsed-ns gate) is
+  `#[inline(always)]`; the inner `emit_report(...)` is `#[cold]` +
+  `#[inline(never)]`, taking `&mut state.dbg_state` ONLY.
+
+### Hot-path always-inline list (v3)
 
 All per-tick wrappers use `#[inline(always)]` — `#[inline]` is only
 a hint and LLVM may decline. `inline(always)` is a directive (modulo
