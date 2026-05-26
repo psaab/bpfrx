@@ -1,6 +1,66 @@
 # #1356 — Split `bpf_map.rs` 204-LOC `publish_bpf_conntrack_entry` into per-address-family helpers
 
-**Status:** DRAFT v1 — pending adversarial plan review.
+**Status:** v2 — addresses Codex r1 PLAN-NEEDS-MAJOR + AGY r1 PLAN-NEEDS-MINOR.
+Pending Codex r2 + AGY r2 plan-review.
+
+## Round-1 disposition
+
+### Codex r1 (task-mpmypz53-viyk24) — PLAN-NEEDS-MAJOR
+
+1. **"`pub(super) use` of `pub(super) fn` is compile-invalid."**
+   **ACCEPTED.** A child `pub(super)` item is only visible to `bpf_map`,
+   so re-exporting it wider to `afxdp` is rejected by Rust privacy.
+   **Fix:** keep the orchestrator (`pub(super) fn publish_bpf_conntrack_entry`)
+   in `bpf_map/mod.rs`. Only the two per-family **helpers** move into the
+   child `publish_conntrack.rs`. The orchestrator becomes a thin
+   dispatcher that calls into the child's helpers via `use
+   publish_conntrack::{publish_v4_session, publish_v6_session};`.
+   This sidesteps the privacy issue entirely — the orchestrator's
+   visibility doesn't change, and the helpers stay file-private to
+   the child module.
+
+2. **"Visibility bumps are unnecessary and widen encapsulation."**
+   **ACCEPTED.** Child submodules already have access to private parent
+   items. With the orchestrator staying in `mod.rs`, the helpers in
+   `publish_conntrack.rs` reach `BpfSessionKey/Value V4/V6` and `SESS_*`
+   via `use super::{BpfSessionKeyV4, BpfSessionValueV4, …};` — no
+   visibility bump needed. **Drop all `pub(super)` additions on those
+   items.** Keep them private at module scope.
+
+3. **"`#[path = \"bpf_map.rs\"]` in afxdp/mod.rs must change to
+   `bpf_map/mod.rs`."**
+   **ACCEPTED.** v2 updates `userspace-dp/src/afxdp/mod.rs:59-60` to
+   `#[path = "bpf_map/mod.rs"] mod bpf_map;` per the project's
+   explicit-path convention.
+
+4. **"`#[path = \"bpf_map_tests.rs\"]` in bpf_map.rs resolves to
+   `afxdp/bpf_map/bpf_map_tests.rs` after the move."**
+   **ACCEPTED.** v2 updates the test include at the new
+   `bpf_map/mod.rs` tail to `#[path = "../bpf_map_tests.rs"] mod tests;`
+   so the existing sibling file is found.
+
+5. **"5 call sites, not 4."**
+   **ACCEPTED.** v2 §Public API preservation lists all 5: 2 in
+   `bpf_map.rs` (839, 853) → become `bpf_map/mod.rs`; 3 in
+   `poll_descriptor.rs` (915, 1482, 2782).
+
+6. **"Don't claim sub-nanosecond / oversold `bpf_map_tests.rs:197`."**
+   **ACCEPTED.** v2 reframes the cost note as "extra call dwarfed by
+   `bpf_map_update_elem`" and the test as "byte-order verification
+   that manually constructs the key — adjacent coverage, not direct".
+
+### AGY r1 (review-mpmytock-qbgl6a) — PLAN-NEEDS-MINOR
+
+All three AGY findings overlap with Codex's:
+
+1. **Revert visibility bumps.** Same as Codex finding #2. Accepted.
+2. **Use `#[path = "bpf_map/mod.rs"] mod bpf_map;` styling.** Same as
+   Codex finding #3. Accepted.
+3. **Document early-return equivalence.** v2 §Hidden invariants #4
+   spells out: helper `return` exits the helper, control returns to
+   the orchestrator's `match` arm which is the final statement; the
+   observable effect (skip BPF write, no fallthrough) is byte-identical
+   to the original.
 
 ## Issue framing
 
@@ -94,12 +154,15 @@ in your verdict.
 
 ### Function shape
 
-```rust
-// publish_conntrack.rs
+The **orchestrator stays in `bpf_map/mod.rs`**. Only the per-family
+helpers move into the child `publish_conntrack.rs`. This sidesteps the
+`pub(super) use` privacy hazard Codex r1 flagged: the orchestrator's
+visibility never changes, and the helpers don't need to be re-exported.
 
-use super::*;
-use crate::session::{SessionDecision, SessionKey, SessionMetadata};
-use std::net::IpAddr;
+```rust
+// bpf_map/mod.rs — orchestrator (~25 LOC, unchanged signature)
+
+use publish_conntrack::{publish_v4_session, publish_v6_session};
 
 pub(super) fn publish_bpf_conntrack_entry(
     conntrack_v4_fd: c_int,
@@ -136,7 +199,23 @@ pub(super) fn publish_bpf_conntrack_entry(
     }
 }
 
-fn publish_v4_session(
+mod publish_conntrack;
+```
+
+```rust
+// bpf_map/publish_conntrack.rs
+
+use super::{
+    BpfSessionKeyV4, BpfSessionValueV4, BpfSessionKeyV6, BpfSessionValueV6,
+    SESS_FLAG_SNAT, SESS_FLAG_DNAT, SESS_STATE_ESTABLISHED,
+    reverse_session_key,
+};
+use crate::session::{SessionDecision, SessionKey, SessionMetadata};
+use std::ffi::{c_int, c_void};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+pub(super) fn publish_v4_session(
     conntrack_v4_fd: c_int,
     key: &SessionKey,
     src: Ipv4Addr,
@@ -148,15 +227,24 @@ fn publish_v4_session(
     egress_zone_id: u16,
     now_secs: u64,
 ) {
-    // exact body of the AF_INET arm, from line 474 onward
+    // exact body of the AF_INET arm from lines 474-562
 }
 
-fn publish_v6_session( /* same shape with v6 structs */ ) { ... }
+pub(super) fn publish_v6_session( /* same shape with v6 structs */ ) { ... }
 ```
 
-Per-family helpers are `fn` (module-private), not `pub(super)` —
-they have only one caller each (the orchestrator) and don't need
-to leak past the `publish_conntrack` module.
+The helpers are `pub(super)` so the parent `mod.rs` orchestrator can
+call them. They are NOT re-exported further — only the orchestrator's
+`pub(super) fn publish_bpf_conntrack_entry` reaches `afxdp` callers.
+The submodule's items remain scoped to `bpf_map`.
+
+Why `pub(super)` on helpers is safe here: the orchestrator lives in
+the **parent** of `publish_conntrack`, so the helpers must be visible
+to `bpf_map/mod.rs`. `pub(super)` is exactly the visibility that says
+"reachable from the parent module, no farther." This is structurally
+different from Codex's flagged hazard, which was about re-exporting
+a `pub(super)` item across module boundaries via `pub(super) use`.
+Here there is no re-export — the parent simply calls the child.
 
 ### Orchestrator size
 
@@ -166,39 +254,44 @@ each — well under the 100-LOC soft cap and the 200-LOC hard cap.
 
 ### Imports
 
-`publish_conntrack.rs` needs:
-- `super::*` to pick up `BpfSessionKeyV4` / `BpfSessionValueV4` /
-  `BpfSessionKeyV6` / `BpfSessionValueV6` / `SESS_FLAG_*` /
-  `SESS_STATE_ESTABLISHED` / `monotonic_nanos` / `reverse_session_key` /
-  `FastMap`. These are all crate-internal already; only the
-  `BpfSession*` structs and `SESS_*` constants need a visibility
-  bump (currently private at module scope, will become `pub(super)`
-  for the new module to reach them).
-- `std::net::{IpAddr, Ipv4Addr, Ipv6Addr}` explicitly (currently
-  `IpAddr` comes via `super::*`, `Ipv4Addr`/`Ipv6Addr` were not
-  imported because the previous code only matched on the variant
-  pattern).
-- `libc` / `libbpf_sys` / `c_int` / `c_void` — re-exported via
-  `super::*`.
+`publish_conntrack.rs` reaches the BPF struct types, `SESS_*`
+constants, and `reverse_session_key` via `use super::{…}`. Because
+`publish_conntrack` is a child module of `bpf_map`, it has implicit
+access to all private items in `bpf_map/mod.rs` — **no visibility
+bumps required**. The `use super::{…}` is just for ergonomic
+unqualified names.
 
-### `mod.rs` update
+Other needs:
+- `std::net::{IpAddr, Ipv4Addr, Ipv6Addr}` explicitly.
+- `std::ffi::{c_int, c_void}`, `std::io` for the `libbpf_sys` call sites.
+- `libbpf_sys` (workspace dep, already used by parent).
+- `libc` (workspace dep).
+- `crate::session::{SessionDecision, SessionKey, SessionMetadata}`.
 
-`bpf_map.rs` becomes `bpf_map/mod.rs` (verbatim move except the
-204-LOC function body removed and `pub mod publish_conntrack;` +
-`pub(super) use publish_conntrack::publish_bpf_conntrack_entry;`
-added at the top). All other call sites of
-`publish_bpf_conntrack_entry` (poll_descriptor.rs, bpf_map.rs's
-own callers inside `publish_session_map_entry_for_session_with_conntrack`)
-keep their existing import paths because `publish_bpf_conntrack_entry`
-is re-exported.
+### `mod.rs` + parent-module updates
 
-The struct/constant visibility bumps:
-- `BpfSessionKeyV4` / `BpfSessionValueV4` — private → `pub(super)`
-- `BpfSessionKeyV6` / `BpfSessionValueV6` — private → `pub(super)`
-- `SESS_FLAG_SNAT` / `SESS_FLAG_DNAT` — `const … = …;` → `pub(super) const`
-- `SESS_STATE_ESTABLISHED` — `const … = …;` → `pub(super) const`
+Three mechanical changes outside the new submodule:
 
-None of these escape the `afxdp` parent module.
+1. **`userspace-dp/src/afxdp/mod.rs:59-60`**: change
+   `#[path = "bpf_map.rs"] mod bpf_map;` →
+   `#[path = "bpf_map/mod.rs"] mod bpf_map;`. Matches the existing
+   `forwarding/mod.rs` and `frame/mod.rs` registrations at
+   lines 65-66 and 69-70.
+
+2. **`bpf_map.rs` → `bpf_map/mod.rs`** via `git mv` (verbatim move,
+   then the 204-LOC `publish_bpf_conntrack_entry` body shrinks to
+   the ~25-LOC orchestrator + `mod publish_conntrack;` declaration).
+
+3. **The `#[cfg(test)] #[path = "bpf_map_tests.rs"] mod tests;`
+   block at the new `bpf_map/mod.rs` tail** (was line 1189-1191)
+   becomes `#[path = "../bpf_map_tests.rs"] mod tests;`. After the
+   directory promotion, the relative path resolves up one level to
+   the sibling `afxdp/bpf_map_tests.rs`, which stays in place.
+
+**No visibility bumps.** `BpfSessionKey/Value V4/V6`, `SESS_FLAG_SNAT`,
+`SESS_FLAG_DNAT`, `SESS_STATE_ESTABLISHED` all stay private at
+`bpf_map/mod.rs` scope. The child `publish_conntrack` module reaches
+them via Rust's parent-private-item access rule.
 
 ## Public API preservation
 
@@ -208,14 +301,19 @@ descriptors, `SessionKey`, `SessionDecision`, `SessionMetadata`,
 keeps the symbol path identical (`super::publish_bpf_conntrack_entry`
 from the caller's perspective).
 
-Confirmed call sites (8):
-- `bpf_map.rs:839, 853` (will become `bpf_map/mod.rs`)
-- `poll_descriptor.rs:915, 1482, 2782`
-- `bpf_map_tests.rs:197` (comment reference only, no code)
+Confirmed call sites (**5 actual calls + 1 doc/comment reference**):
+- `bpf_map.rs:839` (becomes `bpf_map/mod.rs`)
+- `bpf_map.rs:853` (becomes `bpf_map/mod.rs`)
+- `poll_descriptor.rs:915`
+- `poll_descriptor.rs:1482`
+- `poll_descriptor.rs:2782`
+- `bpf_map_tests.rs:197` — **doc comment only, no code call**.
 
-The 4 actual callers (2 in mod.rs, 3 in poll_descriptor.rs) all
-use the same path `publish_bpf_conntrack_entry(...)` via
-`use super::*` or equivalent — none break.
+All 5 actual callers reach `publish_bpf_conntrack_entry` via
+`use super::*;` (poll_descriptor.rs:1 reads `use super::*;` which
+re-exports from `afxdp/mod.rs`). The orchestrator keeps its
+`pub(super)` visibility on the parent `bpf_map/mod.rs` — symbol
+resolution is identical pre/post split.
 
 ## Hidden invariants the change must preserve
 
@@ -232,12 +330,26 @@ use the same path `publish_bpf_conntrack_entry(...)` via
    zones `u16` directly in `SessionMetadata`). It stays in the
    signature for caller compat. Don't rename / remove in this PR.
 
-4. **Early-return path on cross-family reverse key.** Both arms
-   have `_ => return,` arms inside `match rev.src_ip { … }` and
-   `match rev.dst_ip { … }`. After extraction those returns now
-   exit the per-family helper instead of the orchestrator, which
-   is the same observable effect (skip the BPF write entirely).
-   No fallthrough to the other family — neither path tried that.
+4. **Early-return path on cross-family reverse key (equivalence
+   spelled out per AGY r1).** Both arms have `_ => return,` paths
+   inside `match rev.src_ip { … }` and `match rev.dst_ip { … }`
+   (v4: lines 489, 500; v6: lines 578, 589). After extraction
+   those `return` statements exit the per-family helper instead
+   of the orchestrator.
+
+   This is byte-identical in observable effect to the original.
+   Original semantics: skip the BPF map write entirely, fall
+   through to the closing `}` of the `match`, exit the function.
+   Post-split semantics: skip the BPF map write inside the helper,
+   `return` to the orchestrator's `match` arm, which is the final
+   statement in the orchestrator, so the orchestrator immediately
+   exits as well. **No fallthrough to the other family arm** —
+   the helpers are only entered when the address-family pattern
+   matched, and the original code didn't try the other family
+   either (the `match` arms are mutually exclusive). The
+   `_ => {}` catch-all in the orchestrator continues to handle
+   mixed-family edge cases (e.g., `addr_family=AF_INET` but
+   `IpAddr::V6` for source) by doing nothing, same as today.
 
 5. **`eprintln!("xpf-ha: …")` text is preserved verbatim.** The
    project memory `Rust helper: eprintln!("xpf-ha: ...") goes to
@@ -270,7 +382,7 @@ use the same path `publish_bpf_conntrack_entry(...)` via
 |---|---|---|
 | Behavioral regression | **LOW** | Pure code motion. Each helper's body is byte-identical to the corresponding match arm. Field order, byte order, flag bits, struct init all preserved. Compiler will catch any field-name mismatch. |
 | Lifetime / borrow-checker | **LOW** | Helpers take `&SessionKey`, copy `Ipv4Addr`/`Ipv6Addr`, take `SessionDecision` by value (already `Copy` per its definition), `&SessionMetadata`. No new lifetimes. |
-| Performance regression | **NONE** | Function fires on conntrack publish (session install path), not per-packet. Even if the compiler doesn't inline, the per-publish overhead of one extra call frame is sub-nanosecond. No new allocations. |
+| Performance regression | **NONE** | Function fires on conntrack publish (session install path), not per-packet. Even if the compiler doesn't inline, any per-publish overhead of one extra call frame is dwarfed by the `libbpf_sys::bpf_map_update_elem` syscall the helper already performs. No new allocations. |
 | Architectural mismatch (#961 / #946-Phase-2 pattern) | **LOW** | The issue is a Tier-1 hard-cap violation. The fix is a per-family fan-out — same cohesion principle as the wave-2 batch already merged. No premise to fail. The only architectural option-call is "single file with extracted helpers" vs "directory with submodule" — the directory route is what the wave-2 prompt asked for and matches recent merged PRs. |
 
 ## Test plan
@@ -278,9 +390,12 @@ use the same path `publish_bpf_conntrack_entry(...)` via
 - [ ] `cargo build --release` clean (no warnings, no errors)
 - [ ] `cargo test --release` — full suite passes (current count
       should match pre-refactor)
-- [ ] Named test 5/5 flake check: `publish_bpf_conntrack_entry`
-      has direct test coverage at `bpf_map_tests.rs:197` (byte-order
-      / port `to_be()` verification). Run that specific test 5×.
+- [ ] Named test 5/5 flake check: `bpf_map_tests.rs:197` is
+      **adjacent coverage**, not direct — it manually constructs the
+      `BpfSessionKeyV4` and verifies byte-order (`to_be()`). It does
+      not call `publish_bpf_conntrack_entry`. Still useful as a
+      regression net for the visibility and struct-import paths the
+      split touches. Run the containing test 5×.
 - [ ] Go suite — `make test` 30 packages pass (the Go conntrack
       bridge sits behind userspace-dp control socket, no direct
       coupling).
