@@ -1,10 +1,131 @@
 # #1352 Step 1 — Split `frame/mod.rs` 236-LOC `build_forwarded_frame_into_from_frame` + 223-LOC `apply_rewrite_descriptor` into `frame/{build,rewrite}/` by address family
 
-**Status:** v2 — addresses Codex r1 PLAN-NEEDS-MAJOR (codegen parity not
-established + deferred batch smoke insufficient) and AGY r1
-PLAN-NEEDS-MINOR (mandate `#[inline(always)]` + add codegen
-verification step + plan wording on `rewrite_apply_v4/v6` caller
-separation). Pending r2.
+**Status:** v3 — addresses Codex r2 PLAN-NEEDS-MAJOR (cargo command
+shape wrong + asm-grep necessary-but-not-sufficient + i-cache
+duplication risk from wrapper paths + stale `#[inline]` in code
+sketch) and AGY r2 PLAN-NEEDS-MINOR (codegen-units=16 default
+causes false positives + private-import scoping in nested
+modules + naming mismatch `expected_ports`/`enforced_ports` +
+`RewriteDescriptor` path + grep target should look for `call`
+instructions not symbols).
+
+## Round-2 review disposition
+
+Codex r2 ([task-mpmzar03-0i9jmr](reviewer-ids.md)) PLAN-NEEDS-MAJOR; AGY r2
+([adversarial-review-mpmzb3y8-hxt9tj](reviewer-ids.md))
+PLAN-NEEDS-MINOR. Combined findings:
+
+1. **Codex r2 Major #1 / AGY r2 HIGH-1+HIGH-2 — cargo command
+   shape is wrong.** Package name is `xpf-userspace-dp` (verified
+   `userspace-dp/Cargo.toml:2`). Repo has no root workspace —
+   `cargo metadata` from repo root fails. Asm glob mismatch:
+   compiler emits `xpf_userspace_dp-*.s`, not `userspace_dp-*.s`.
+   **Resolution:** v3 fixes the cargo invocation.
+
+2. **AGY r2 #3 — codegen-units=16 default false positives.**
+   `cargo --emit=asm` emits BEFORE ThinLTO; cross-codegen-unit
+   calls appear as `call` instructions in the `.s` even when
+   ThinLTO inlines them in the final linked binary. **Resolution:**
+   v3 forces `RUSTFLAGS="-C codegen-units=1"` for the codegen
+   verification step.
+
+3. **AGY r2 #1 — grep target should match `call` instructions,
+   not symbol names.** Symbol names appear in `.file` / `.asciz`
+   / `.loc` directives even when inlined. **Resolution:** v3
+   greps for `callq?\s+.*<helper>` and also adds `nm -C` on the
+   final compiled binary as the canonical canary.
+
+4. **Codex r2 Major #2 — asm-grep necessary but not sufficient.**
+   The grep can pass while register allocation, branch layout,
+   caller inlining, cold block placement regresses. **Resolution:**
+   v3 strengthens the gate. Required artifacts on the PR:
+   - `nm -C` against the final `target/release/xpf-userspace-dp`
+     binary: ZERO definitions of the per-family helper symbols.
+   - Asm slice (~80-120 lines) at each caller site from the `.s`
+     compiled with `-C codegen-units=1`: must match what's
+     present in baseline (origin/master) for THE SAME caller
+     site after subtracting the obvious symbol renames. A
+     `diff` of the two asm slices is included as a PR
+     attachment; reviewer reads it before MERGE-READY.
+   - The wave-end batch smoke remains the aggregate-perf gate.
+     The codegen artifacts are the per-PR isolation mechanism
+     (catch a missed inline) — not a perf proof on their own.
+
+5. **Codex r2 Major #3 — i-cache duplication risk from wrapper
+   transitive inlining.** `build_forwarded_frame_into_from_frame`
+   is called from 5 places: `frame/mod.rs:201` and `:480`
+   (internal wrappers) plus TX caller sites at
+   `tx/dispatch.rs:505`, `:651`, `:785`. If LLVM inlines the
+   orchestrator through ANY of those wrappers, the always-inlined
+   per-family helpers duplicate. **Resolution:** v3 reduces
+   `#[inline(always)]` only to the per-family helpers AND adds a
+   `#[inline(never)]` veto on `build_forwarded_frame_into_from_frame`
+   to prevent the orchestrator from being inlined into its caller
+   wrappers (and thus duplicating the helpers transitively).
+
+   Practical effect: ONE definition of the
+   `build_forwarded_frame_into_from_frame` body exists in the
+   binary. Each TX caller site sees ONE `call` to the orchestrator
+   (acceptable — these are NOT the per-packet inner loop, they're
+   the per-batch dispatch step). The per-family body is fully
+   folded into the orchestrator's body, no register-spill bleed.
+
+   For `apply_rewrite_descriptor` (which has fewer callers — just
+   `poll_descriptor.rs:746` and is itself called per-batch not
+   per-packet inside the SIMD descriptor loop), the same
+   `#[inline(never)]` veto is applied. Same rationale.
+
+   The codegen verification step is now: ZERO `nm -C` definitions
+   of `build_forwarded_frame_into_ipv4/6` /
+   `apply_rewrite_descriptor_ipv4/6` (per-family helpers fully
+   inlined), exactly ONE definition each of
+   `build_forwarded_frame_into_from_frame` /
+   `apply_rewrite_descriptor` (orchestrators NOT inlined into
+   wrappers).
+
+6. **Codex r2 Minor — stale `#[inline]` in code sketch + risk
+   table.** Two stale references at lines 283 and 547 of v2.
+   **Resolution:** v3 sweeps all `#[inline]` mentions in code
+   sketches + risk text to match the v3 attribute matrix.
+
+7. **AGY r2 HIGH-3 — private-import scoping.** `frame/mod.rs:59`
+   does `use tcp::clamp_tcp_mss_frame;` (private). Sub-modules
+   under `build/` and `rewrite/` cannot inherit private items
+   via `use super::super::*;`. Same applies to
+   `native_gre_tcp_mss` (a re-export from `crate::afxdp::*` via
+   the `super::*` in `frame/mod.rs:1`). **Resolution:** v3 adds
+   explicit imports at the top of each per-family file:
+
+   ```rust
+   // build/ipv4.rs / build/ipv6.rs
+   use super::super::tcp::clamp_tcp_mss_frame;
+   use crate::afxdp::native_gre_tcp_mss;  // if used in helper
+   use super::super::{
+       adjust_ipv4_header_checksum, apply_nat_ipv4, apply_nat_ipv6,
+       enforce_expected_ports_at, recompute_l4_checksum_ipv4,
+       recompute_l4_checksum_ipv6, restore_l4_tuple_from_meta,
+   };
+   ```
+
+   `native_gre_tcp_mss` is computed in the orchestrator (the
+   `tunnel_tcp_mss` value is passed into the per-family helper by
+   value), so per-family helpers do NOT need to import
+   `native_gre_tcp_mss` themselves. Only `clamp_tcp_mss_frame`
+   needs the explicit import.
+
+8. **AGY r2 HIGH-4 — `expected_ports` / `enforced_ports` naming
+   mismatch.** v2 sketch parameter named `expected_ports`; the
+   real body at mod.rs:229 stores `let enforced_ports =
+   expected_ports;` and then uses `enforced_ports`. **Resolution:**
+   v3 renames the sketch parameter to `expected_ports` AND keeps
+   the local `let enforced_ports = expected_ports;` rebinding
+   inside the per-family helper, byte-identical to today.
+
+9. **AGY r2 MED-1 — `RewriteDescriptor` path from `rewrite/mod.rs`.**
+   v2 uses `&super::RewriteDescriptor`; the correct path from
+   inside `rewrite/mod.rs` (where `super` is `frame`) is
+   `crate::afxdp::RewriteDescriptor`. **Resolution:** v3 uses
+   `crate::afxdp::RewriteDescriptor` explicitly.
 
 ## Round-1 review disposition
 
@@ -222,7 +343,7 @@ mod ipv6;
 pub(in crate::afxdp::frame) use ipv4::build_forwarded_frame_into_ipv4;
 pub(in crate::afxdp::frame) use ipv6::build_forwarded_frame_into_ipv6;
 
-#[inline]
+#[inline(never)]
 pub(in crate::afxdp) fn build_forwarded_frame_into_from_frame(
     out: &mut [u8],
     frame: &[u8],
@@ -276,11 +397,23 @@ pub(in crate::afxdp) fn build_forwarded_frame_into_from_frame(
 
 ### `build/ipv4.rs` shape
 
+Note v3 import shape: per AGY r2 HIGH-3, private items reached
+via `use tcp::clamp_tcp_mss_frame;` in `frame/mod.rs:59` are NOT
+inherited by `use super::super::*;` in nested modules, so each
+per-family file imports its direct dependencies explicitly.
+
 ```rust
 // frame/build/ipv4.rs
-use super::super::*;
+use super::super::tcp::clamp_tcp_mss_frame;
+use super::super::{
+    adjust_ipv4_header_checksum, apply_nat_ipv4,
+    enforce_expected_ports_at, recompute_l4_checksum_ipv4,
+    restore_l4_tuple_from_meta,
+};
+use crate::afxdp::{ForwardPacketMeta, SessionDecision};
+use std::net::Ipv4Addr;
 
-#[inline]
+#[inline(always)]
 pub(in crate::afxdp::frame) fn build_forwarded_frame_into_ipv4(
     out: &mut [u8],
     ip_start: usize,
@@ -294,17 +427,22 @@ pub(in crate::afxdp::frame) fn build_forwarded_frame_into_ipv4(
     // Body byte-identical to today's mod.rs:285..341 (the AF_INET arm
     // of the existing function), with `out` instead of `&mut out[..]`
     // and `ip_start` already resolved by the orchestrator.
+    // Note: preserves the existing `let enforced_ports = expected_ports;`
+    // rebinding at the top of the function so all interior references
+    // continue to use the `enforced_ports` name byte-identical to today.
+    let enforced_ports = expected_ports;
     if out.len() < ip_start + 20 {
         return None;
     }
     let ihl = ((out[ip_start] & 0x0f) as usize) * 4;
-    // ... rest of body byte-identical ...
+    // ... rest of body byte-identical to mod.rs:289..341 ...
     Some(())
 }
 ```
 
 (IPv6 mirrors the same shape — body byte-identical to today's
-mod.rs:342..380.)
+mod.rs:342..380. Imports drop `adjust_ipv4_header_checksum` and
+add `apply_nat_ipv6` + `recompute_l4_checksum_ipv6`.)
 
 ### `rewrite/mod.rs` orchestrator shape
 
@@ -316,12 +454,12 @@ mod ipv6;
 pub(in crate::afxdp::frame) use ipv4::apply_rewrite_descriptor_ipv4;
 pub(in crate::afxdp::frame) use ipv6::apply_rewrite_descriptor_ipv6;
 
-#[inline]
+#[inline(never)]
 pub(in crate::afxdp) fn apply_rewrite_descriptor(
     area: &MmapArea,
     desc: XdpDesc,
     meta: UserspaceDpMeta,
-    rd: &super::RewriteDescriptor,
+    rd: &crate::afxdp::RewriteDescriptor,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<InPlaceRewriteResult> {
     // NAT64 and NPTv6 use the generic path.
@@ -368,47 +506,96 @@ pub(in crate::afxdp) fn apply_rewrite_descriptor(
 
 ### Hot-path discipline (per-packet)
 
-**v2 codegen contract:** Per-family helpers
-(`build_forwarded_frame_into_ipv4/6`,
-`apply_rewrite_descriptor_ipv4/6`) get `#[inline(always)]`. Each
-helper has EXACTLY ONE call site (its orchestrator's match arm),
-so `#[inline(always)]` carries zero i-cache bloat from
-duplication while guaranteeing that the System V AMD64 ABI
-register-spill described in §Round-1 disposition is bypassed via
-SROA + SSA scalarization at the inlined site.
+**v3 codegen contract** (after Codex r2 Major #3 +
+i-cache-duplication finding):
 
-Orchestrators
-(`build_forwarded_frame_into_from_frame`,
-`apply_rewrite_descriptor`) get `#[inline]` (the standard hint,
-not `(always)`) so LLVM keeps discretion at the
-two-call-site `tx/dispatch.rs:651` / `poll_descriptor.rs:746`
-boundary. The orchestrator bodies are 50-60 LOC after the split,
-small enough for the standard inlining heuristic to fold through.
+| Symbol | Attribute | Rationale |
+|---|---|---|
+| `build_forwarded_frame_into_ipv4` | `#[inline(always)]` | One call site (orchestrator's match arm). Bypass SysV ABI register-spill via SROA + SSA at inlined site. |
+| `build_forwarded_frame_into_ipv6` | `#[inline(always)]` | Same. |
+| `apply_rewrite_descriptor_ipv4` | `#[inline(always)]` | Same. |
+| `apply_rewrite_descriptor_ipv6` | `#[inline(always)]` | Same. |
+| `build_forwarded_frame_into_from_frame` (orchestrator) | `#[inline(never)]` | Prevent transitive duplication through 5 caller wrappers: `frame/mod.rs:201`, `:480`, `tx/dispatch.rs:505`, `:651`, `:785`. ONE definition in the binary; each caller emits one `call` instruction. The orchestrator + folded-in per-family body is the unit of code that lives in i-cache. |
+| `apply_rewrite_descriptor` (orchestrator) | `#[inline(never)]` | Same rationale; only caller is `poll_descriptor.rs:746` but the SIMD descriptor loop above the call site is itself a tight per-packet inner loop and inlining the orchestrator into it would explode the loop body. ONE definition in binary. |
 
-**Verification step (per-PR codegen gate):**
+This is a deliberate inversion of the v2 "orchestrator `#[inline]`,
+helper `#[inline]`" symmetry: per-family helpers MUST be inlined
+(register-spill avoidance), orchestrators MUST NOT be inlined
+(i-cache duplication avoidance). The two attribute classes are
+the load-bearing codegen contract.
+
+**Verification step (per-PR codegen gate, v3):**
+
+The gate is intentionally tighter than v2: package name corrected
+(`xpf-userspace-dp`), codegen-units forced to 1 (so the asm
+emission reflects the same inlining decisions LLVM will make in
+the linked binary), grep targets only `call` instructions (not
+symbol references in `.file` / `.loc` directives), and `nm -C`
+on the final linked binary is the canonical canary.
 
 ```bash
-# In the worktree, after implementation:
+# === In the worktree, after implementation ===
+
+# Step A: Build the release binary normally and run the canonical
+# nm -C check. This is the load-bearing gate. The linked binary
+# reflects ThinLTO's final inlining decisions.
 TMPDIR=/dev/shm CARGO_TARGET_DIR=/dev/shm/cargo \
-  cargo rustc --release -p userspace-dp -- --emit=asm
-ASM=/dev/shm/cargo/release/deps/userspace_dp-*.s
-# Verify no per-family helper symbols are emitted as separate functions:
-grep -E "build_forwarded_frame_into_ipv4|build_forwarded_frame_into_ipv6|apply_rewrite_descriptor_ipv4|apply_rewrite_descriptor_ipv6" $ASM \
-  | grep -v "^;" | head
-# Expected: zero matches (helpers fully inlined into their orchestrators).
-# If matches present, the PR MUST NOT MERGE until codegen is restored
-# (likely a missing #[inline(always)] or LLVM-side bailout).
+  cargo build --release --manifest-path userspace-dp/Cargo.toml
+
+BIN=/dev/shm/cargo/release/xpf-userspace-dp
+nm -C "$BIN" | \
+  grep -E "build_forwarded_frame_into_ipv4|build_forwarded_frame_into_ipv6|apply_rewrite_descriptor_ipv4|apply_rewrite_descriptor_ipv6"
+# Expected: ZERO matches (per-family helpers fully inlined).
+# If any match, the PR MUST NOT MERGE until codegen is restored.
+
+# Also verify exactly ONE definition each of the orchestrators
+# (#[inline(never)] mandate from v3):
+nm -C "$BIN" | \
+  grep -E "build_forwarded_frame_into_from_frame|apply_rewrite_descriptor"
+# Expected: exactly ONE definition per orchestrator (no duplication
+# through caller wrappers).
+
+# Step B: Asm slice for the per-PR diff artifact. Force
+# codegen-units=1 so the .s file reflects ThinLTO's actual
+# inlining decisions (default codegen-units=16 emits cross-CGU
+# calls as `call` instructions even when ThinLTO inlines them).
+RUSTFLAGS="-C codegen-units=1" \
+  TMPDIR=/dev/shm CARGO_TARGET_DIR=/dev/shm/cargo-asm \
+  cargo rustc --release --manifest-path userspace-dp/Cargo.toml -- --emit=asm
+ASM=$(ls /dev/shm/cargo-asm/release/deps/xpf_userspace_dp-*.s | head -1)
+
+# Sanity-check that no `call` instructions to per-family helpers
+# leak into the final asm:
+grep -E "callq?\s+.*build_forwarded_frame_into_ipv[46]" "$ASM" || true
+grep -E "callq?\s+.*apply_rewrite_descriptor_ipv[46]" "$ASM" || true
+# Expected: zero output from each grep.
 ```
 
-The codegen verification artifact is posted as a PR comment with
-the grep result + a brief asm slice of the two call sites
-(`tx/dispatch.rs:651` and `poll_descriptor.rs:746`).
+**Required PR artifacts** (posted as comments on the PR):
 
-Code sketch of the orchestrator/helper layering (v2 attributes):
+1. `nm -C` output filtered to the 6 symbols above. ZERO
+   per-family helper definitions, exactly ONE orchestrator
+   definition each.
+2. The 80-120-line asm slice around each caller region
+   (`tx/dispatch.rs:651`, `poll_descriptor.rs:746`,
+   `frame/mod.rs:201`, `:480`, `tx/dispatch.rs:505`, `:785`),
+   captured BOTH for `origin/master` and the PR HEAD. A unified
+   diff of the two slices is attached. Reviewer reads the diff
+   before MERGE-READY.
+3. The grep results from Step B (zero output expected).
+
+**If any gate fails (nm finds a per-family helper symbol; nm
+finds duplicate orchestrators; asm grep finds a `call` to a
+per-family helper), the PR MUST NOT MERGE.** The attributes
+need adjustment OR an upstream wrapper at `frame/mod.rs:201` /
+`:480` needs its own attribute to keep ThinLTO from
+duplicating the orchestrator transitively.
+
+Code sketch of the orchestrator/helper layering (v3 attributes):
 
 ```rust
 // frame/build/mod.rs
-#[inline]                       // standard hint at the 2-call-site boundary
+#[inline(never)]                // veto: 5 caller wrappers; ONE binary definition
 pub(in crate::afxdp) fn build_forwarded_frame_into_from_frame(...) -> Option<usize> { ... }
 
 // frame/build/ipv4.rs
@@ -416,7 +603,7 @@ pub(in crate::afxdp) fn build_forwarded_frame_into_from_frame(...) -> Option<usi
 pub(in crate::afxdp::frame) fn build_forwarded_frame_into_ipv4(...) -> Option<()> { ... }
 
 // frame/rewrite/mod.rs
-#[inline]
+#[inline(never)]                // veto: per-packet SIMD descriptor loop above caller
 pub(in crate::afxdp) fn apply_rewrite_descriptor(...) -> Option<InPlaceRewriteResult> { ... }
 
 // frame/rewrite/ipv4.rs
@@ -544,12 +731,15 @@ pub(in crate::afxdp) fn apply_rewrite_descriptor(
     succeeds. Per-family helpers return `Option<()>` (success/fail
     only); the orchestrator owns the result-construction step.
 
-11. **`#[inline]` codegen parity.** Today both functions are
-    monomorphic and inlinable at their two call sites
-    (`tx/dispatch.rs:651` and `poll_descriptor.rs:746`). With
-    `#[inline]` on both the orchestrator and per-family helpers,
-    LLVM should produce equivalent codegen. **Smoke must verify
-    line rate.**
+11. **`#[inline(never)] orchestrators + #[inline(always)]
+    per-family helpers` codegen contract.** Today both functions
+    are monomorphic. Per the v3 contract above, per-family
+    helpers inline into their orchestrator (SROA/SSA bypass of
+    ABI register-spill); orchestrators stay non-inlined (no
+    transitive duplication through wrapper paths). **Codegen is
+    verified per-PR via the nm + asm-grep + asm-diff gate
+    (§Test plan step 5), NOT by an iperf smoke.** Wave-end
+    batch smoke remains the aggregate-perf gate.
 
 ## Risk assessment
 
@@ -557,7 +747,7 @@ pub(in crate::afxdp) fn apply_rewrite_descriptor(
 |---|---|---|
 | Behavioral regression | LOW | Pure code motion. Per-family bodies byte-identical to the existing AF_INET / AF_INET6 / 0x0800 / 0x86dd arms modulo the parameter list. Side-effect ordering preserved by keeping all steps inside the per-family helper. |
 | Lifetime / borrow-checker | LOW-MED | Per-family helpers take `&mut [u8]` + several `Copy` scalars + `&SessionDecision` (immutable). No new lifetime parameter; the helper signature uses one lifetime implicitly (the `&mut [u8]`). `apply_rewrite_descriptor_ipv4/6` takes `&mut [u8]` (the unsafe-borrowed UMEM slice) and `meta: UserspaceDpMeta` (Copy) and `rd: &RewriteDescriptor` — same shape as today's match arm. |
-| Performance regression | LOW-MED (verified by smoke) | The codegen-parity hazard is real. Mitigation: `#[inline]` on both layers + line-rate + 0-retrans smoke gate. If the smoke matrix shows <line rate or any retrans, the split is reverted to a single-file orchestrator + helper module shape OR the `#[inline]` attributes are reconsidered. |
+| Performance regression | LOW-MED (verified by asm-diff + wave-batch smoke) | The codegen-parity hazard is real. Mitigation: `#[inline(always)]` on per-family helpers + `#[inline(never)]` on orchestrators + per-PR nm/asm-grep/asm-diff gate (§Test plan step 5) + wave-end batch smoke. If the codegen gate fails (per-family helper symbol present in nm, orchestrator duplicated, or asm `call` to helper present), the PR does NOT merge. If the wave-end batch smoke shows <line rate or any retrans, the split is reverted to a single-file orchestrator + helper module shape OR the inline attributes are reconsidered. |
 | Architectural mismatch (#961 / #946 Phase 2) | LOW | Canonical address-family split mirroring the existing `frame/` sub-concern split. The wave-2 issue body specifies this exact layout. The alternative (per-protocol split inside each family) is explicitly out of scope; per-family cohesion is the chosen boundary. |
 | Cross-PR collision with #1347 | LOW | #1347 touches `frame/tcp_segmentation.rs` (segmentation helper consolidation); this PR touches `build_forwarded_frame_into_from_frame` and `apply_rewrite_descriptor` only. No file overlap. Either PR can land first. |
 | Test colocation drift | MEDIUM (documented) | `frame/tests.rs` is currently 5275 LOC and houses tests for both functions. The issue body suggests colocating per-file tests after the split. This PR does NOT move any test — the tests reach symbols via `frame::*` re-export and stay where they are. Test colocation is a deliberate out-of-scope follow-up. Reviewers may push back. |
@@ -578,19 +768,24 @@ pub(in crate::afxdp) fn apply_rewrite_descriptor(
    pick after Step 5 implementation reveals which test bundle is
    slowest / most senstitive).
 4. `go test ./...` — all 30 Go packages.
-5. **Codegen verification step (per-PR, v2 mandate).** After
-   `cargo build --release` in the worktree, run
-   `cargo rustc --release -p userspace-dp -- --emit=asm`, grep
-   the generated `.s` file for the per-family helper symbols
-   (`build_forwarded_frame_into_ipv4`,
-   `build_forwarded_frame_into_ipv6`,
-   `apply_rewrite_descriptor_ipv4`,
-   `apply_rewrite_descriptor_ipv6`), confirm ZERO matches
-   (helpers fully inlined into their orchestrators), and
-   attach the grep result + a brief asm slice of the two
-   call sites to the PR as a comment. **If any per-family
-   helper symbol is still emitted as a separate function, the
-   PR MUST NOT MERGE until codegen is restored.**
+5. **Codegen verification step (per-PR, v3 mandate).** Run the
+   commands in §Hot-path discipline (§Verification step,
+   reproduced here for ergonomics):
+   - `cargo build --release --manifest-path userspace-dp/Cargo.toml`
+   - `nm -C target/release/xpf-userspace-dp | grep` — ZERO
+     per-family helper definitions; exactly ONE orchestrator
+     definition.
+   - `RUSTFLAGS="-C codegen-units=1" cargo rustc --release
+     --manifest-path userspace-dp/Cargo.toml -- --emit=asm` →
+     grep generated `xpf_userspace_dp-*.s` for `callq?\s+.*<helper>`
+     — ZERO matches.
+   - Attach a unified diff of the asm slices at each of the 6
+     caller sites (`tx/dispatch.rs:505`, `:651`, `:785`,
+     `poll_descriptor.rs:746`, `frame/mod.rs:201`, `:480`) for
+     `origin/master` vs PR HEAD. Reviewer reads the diff before
+     MERGE-READY.
+   **If any gate fails the PR MUST NOT MERGE until codegen is
+   restored.**
 6. **Smoke matrix is wave-2 deferred.** Per the wave-2 rule
    (`<!-- AWAITING-BATCH-MERGE -->`), no per-PR iperf smoke runs.
    The batch smoke at the end of the wave runs the full v4+v6 ×
