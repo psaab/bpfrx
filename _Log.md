@@ -1,5 +1,32 @@
 # Action Log
 
+## 2026-05-26 — #1476 Phase B AWAITING-MERGE at f815c357
+
+- **Timestamp**: 2026-05-26T (r3 reviewers converged, posting marker)
+  - **Action**: Round-3 code reviews returned. Both AGY r3 and
+    Codex r3 MERGE-READY at HEAD f815c357. AGY r3 flagged an
+    out-of-scope observation: pkg/configstore/crypto.go has the
+    same FindChild first-match pattern in masterPasswordPRF (split
+    `system { master-password { ... } }` stanzas could miss the
+    master-password directive). Confirmed pre-existing pattern,
+    not introduced by #1476; deserves its own hardening issue.
+    Will be filed separately after #1476 merges.
+
+    Final reviewer state for the AWAITING-MERGE marker:
+    - Codex r3: MERGE-READY at f815c357
+    - AGY r3: MERGE-READY at f815c357
+    - Claude SMR: MERGE-READY (self-review at 04c0d19e, fixes
+      since then all addressed Codex r1/r2 findings)
+    - Copilot: STUCK ("exceeds maximum number of lines (20,000)")
+      → 3-of-4 Copilot-stuck exception applies per
+      feedback_copilot_two_bots policy.
+
+    Posting STANDALONE AWAITING-MERGE marker per
+    feedback_retirement_batch_smoke_at_end policy (no smoke marker;
+    smoke-runner singleton handles fast-merge).
+  - **File(s)**: docs/pr/1476-mechanical-bpf-removal/reviewer-ids.md,
+    _Log.md
+
 ## 2026-05-26 — #1476 Phase B r2 fixes (Codex MERGE-NEEDS-MAJOR)
 
 - **Timestamp**: 2026-05-26T (r2 fixes after Codex r2 MERGE-NEEDS-MAJOR)
