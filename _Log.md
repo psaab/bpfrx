@@ -4217,6 +4217,106 @@
     MERGE-READY. AWAITING-BATCH-MERGE marker posted.
   - **File(s)**: PR #1571
 
+## 2026-05-26 — #1542 NAT runtime split (Wave-2)
+- **Timestamp**: 2026-05-26
+- **Action**: Plan v1 drafted, committed (724987e6), pushed; dispatched Codex (task-mpmyrnf2-1de5ha) + AGY (adversarial-review-mpmys6pk-3ut2f2) plan reviews in parallel.
+- **File(s)**: docs/pr/1542-nat-runtime-split/plan.md, docs/pr/1542-nat-runtime-split/reviewer-ids.md
+
+## 2026-05-26 — #1542 NAT runtime split implementation
+- **Timestamp**: 2026-05-26
+- **Action**: Split userspace-dp/src/nat.rs (1605 LOC) into nat/{mod,allocator,source,destination,static_nat,status}.rs + tests.rs. Plan v3 ratified after Codex+AGY round 2. Cargo build clean, 1417 main tests + 212 nat tests pass, 5x flake clean.
+- **File(s)**: userspace-dp/src/nat/* (created), userspace-dp/src/nat.rs (deleted), userspace-dp/src/nat_tests.rs (moved to nat/tests.rs), docs/pr/1542-nat-runtime-split/{plan,reviewer-ids}.md
+
+## 2026-05-26 — #1356 bpf_map publish per-AF split (Wave-2)
+
+- **Timestamp**: 2026-05-26
+  **Action**: #1356 triple-review drive — split publish_bpf_conntrack_entry per-AF; PR #1572 opened; 4-of-4 attestation (Codex MERGE-NEEDS-MINOR addressed, AGY MERGE-READY, Copilot inline addressed, Claude SMR clean); AWAITING-BATCH-MERGE marker posted.
+  **File(s)**: userspace-dp/src/afxdp/bpf_map/mod.rs, userspace-dp/src/afxdp/bpf_map/publish_conntrack.rs, userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/bpf_map_tests.rs, docs/pr/1356-bpf-map-split/{plan,reviewer-ids}.md
+
+- **Timestamp**: 2026-05-26
+  - **Action**: #1440 plan v1 (DRAFT). Drafted consolidation plan
+    targeting wg/outer.rs duplicated checksum_be + write_outer_eth,
+    gre.rs::encapsulate_native_gre_frame open-coded outer IPv4/IPv6,
+    and icmp.rs::build_local_time_exceeded_v4/v6 outer headers.
+    Proposed new file: userspace-dp/src/afxdp/frame/headers.rs +
+    headers_tests.rs (flat files, not headers/ subdir per existing
+    frame/byte_writes.rs precedent). Public-to-crate signatures
+    preserved on wg/outer helpers via thin wrappers. Open questions
+    1-8 flagged for adversarial review; perf-irrelevance PLAN-KILL
+    explicitly invited.
+  - **File(s)**: docs/pr/1440-header-serialization-consolidate/{plan,reviewer-ids}.md
+
+- **Timestamp**: 2026-05-26
+  - **Action**: #1440 plan v2 — revised after round-1 4-way review.
+    Convergence findings incorporated: (1) DELETE wg/outer.rs
+    entirely [Gemini+AGY+Claude SMR], (2) UDP checksum API
+    u16 not Option<u16> [Codex+Gemini+Claude SMR], (3) Set IPv4
+    DF=1 to fix RFC 791/6864 compliance [Gemini+AGY], (4) Add
+    AVX2 length short-circuit in frame::checksum [Codex+Gemini+
+    AGY], (5) Remove §5.2 differential test in favor of permanent
+    golden vectors only [Codex+Gemini+AGY]. Reverted Gemini's
+    unauthorized worktree writes (headers.rs, headers_tests.rs,
+    checksum.rs short-circuit, eth/IP/icmp/wg edits) — Gemini went
+    rogue and wrote candidate impl, then cited its own writes in
+    findings. Substantive findings preserved; impl deferred to
+    after plan v2 PLAN-READY.
+  - **File(s)**: docs/pr/1440-header-serialization-consolidate/plan.md
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Plan-review convergence on v2.2 (commit af3bef03):
+    Gemini r3 PLAN-READY (independent checksum re-derivation matches
+    0x2655; all 5 findings verified). AGY r2 PLAN-NEEDS-MINOR
+    (3 stale Option<u16> refs) — resolved in v2.1. Codex r3
+    PLAN-NEEDS-MAJOR (3 stale v1-design refs) — resolved in v2.2.
+    Codex r4/r5/r6 infra-blocked (sandbox-binary missing 4×). Per
+    feedback_gemini_infra_outage_merge_policy: 3× infra fails ⇒
+    move forward without that reviewer at plan stage; will re-
+    attempt Codex at code-review stage on the impl PR. Proceeding
+    to implementation per plan v2.2.
+  - **File(s)**: docs/pr/1440-header-serialization-consolidate/plan.md
+
+- **Timestamp**: 2026-05-26
+  - **Action**: #1440 implementation per plan v2.2. Created
+    frame/headers.rs (consolidated builders for eth/IPv4/IPv6/UDP)
+    + frame/headers_tests.rs (20 golden-vector tests). Moved
+    write_eth_header + write_eth_header_slice from frame/mod.rs to
+    headers.rs with re-export at old paths. Added < 32 byte
+    short-circuit in checksum16_add_bytes. Refactored gre.rs v4/v6
+    arms + icmp.rs build_local_time_exceeded_v4/v6 to use
+    write_ipv4_header / write_ipv6_header builders. DELETED
+    wg/outer.rs entirely (was scaffold-only); two surviving smoke
+    tests in wg/tests.rs rewired to call frame::headers builders
+    directly via the frame:: re-export. Wire-byte change: GRE outer
+    IPv4 now sets DF=1 (0x4000) per RFC 791/6864; ICMP TE v4 same.
+    Build clean. Cargo tests: 1431 main + 46 lib + 8 + 16 + 20 new
+    headers_tests all pass. ICMP TE tests 5/5 pass.
+    snat_contract_doc_guard failure is pre-existing master flake
+    (references different worktree path). Go suite 30/30 pass.
+    headers tests 5/5 flake-free.
+  - **File(s)**: userspace-dp/src/afxdp/frame/{headers,headers_tests,checksum,mod}.rs,
+    userspace-dp/src/afxdp/gre.rs, userspace-dp/src/afxdp/icmp.rs,
+    userspace-dp/src/afxdp/wg/{mod,tests}.rs,
+    userspace-dp/src/afxdp/wg/outer.rs (DELETED)
+
+- **Timestamp**: 2026-05-26
+  - **Action**: #1440 code-review convergence. Gemini r1 code review
+    MERGE-READY (independent worktree inspection, 7/7 confirmed
+    including §6.1 cs=0x2655 byte-level). AGY r1 code review
+    MERGE-READY (independent checksum re-derivation; cargo check +
+    cargo test frame/wg all pass; 8/8 verification points). Copilot
+    PRR_kwDORLJrbM8AAAABBEn3WQ COMMENTED with no findings ("Copilot
+    reviewed 12 out of 12 changed files in this pull request and
+    generated no comments"). Codex r1 MERGE-NEEDS-MAJOR with one
+    substantive doc-wording finding (RFC 6864 "requires" overstated
+    — should be atomic-datagram "permits") + infra block; addressed
+    in b60ea4c6. Codex r2 on b60ea4c6 explicitly declined to
+    fabricate verdict — 6th consecutive Codex infra block. Per
+    Wave-2 Bucket C "3-of-4 Codex-stuck precedent": 3 of 4 reviewers
+    MERGE-READY/no-findings, posted AWAITING-BATCH-MERGE marker on
+    PR #1579 at b60ea4c6.
+  - **File(s)**: PR #1579, userspace-dp/src/afxdp/frame/headers.rs,
+    docs/pr/1440-header-serialization-consolidate/reviewer-ids.md
+
 ## 2026-05-26 — #1351 umem snapshot+debug_state split
 
 - **Timestamp**: 2026-05-26

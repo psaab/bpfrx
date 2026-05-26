@@ -248,8 +248,9 @@ impl BindingLiveState {
             // #812: owner-written TX submit-latency telemetry.
             // Copied bucket-by-bucket under Relaxed; read-side
             // tearing acceptable per the §3.6 R2 bounded-skew
-            // semantics and the drain-histogram precedent at
-            // umem.rs:1322-1329. The count/sum scalars are loaded
+            // semantics and the drain-histogram precedent earlier
+            // in this same `snapshot()` body (see `drain_latency_hist`
+            // a few lines above). The count/sum scalars are loaded
             // immediately after the bucket sweep so the snapshot
             // read window is tight (single owner cacheline).
             tx_submit_latency_hist: Self::snapshot_hist(
