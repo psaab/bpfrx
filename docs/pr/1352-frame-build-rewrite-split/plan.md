@@ -205,13 +205,18 @@ PLAN-NEEDS-MINOR. Combined findings:
    per-packet inside the SIMD descriptor loop), the same
    `#[inline(never)]` veto is applied. Same rationale.
 
-   The codegen verification step is now: ZERO `nm -C` definitions
-   of `build_forwarded_frame_into_ipv4/6` /
-   `apply_rewrite_descriptor_ipv4/6` (per-family helpers fully
-   inlined), exactly ONE definition each of
-   `build_forwarded_frame_into_from_frame` /
-   `apply_rewrite_descriptor` (orchestrators NOT inlined into
-   wrappers).
+   The codegen verification step is (v4-adjusted): ZERO `nm
+   -C` definitions of per-family helpers
+   (`build_forwarded_frame_into_ipv4/6` /
+   `apply_rewrite_descriptor_ipv4/6` — fully inlined). For
+   the orchestrators, **asymmetric**:
+   `build_forwarded_frame_into_from_frame` must have EXACTLY
+   ONE definition (`#[inline(never)]` + concrete meta).
+   `apply_rewrite_descriptor` may have ZERO OR ONE definition
+   (`#[inline]` hint at single-caller fast path — LLVM may
+   inline fully into `poll_descriptor.rs:746`, leaving no
+   standalone symbol; either ZERO or ONE is acceptable; > 1 is
+   a failure).
 
 6. **Codex r2 Minor — stale `#[inline]` in code sketch + risk
    table.** Two stale references at lines 283 and 547 of v2.
@@ -653,22 +658,37 @@ pub(in crate::afxdp::frame) fn apply_rewrite_descriptor_ipv6(
 — v4 needs to promote it to `pub(super) mod byte_writes;` to be
 reachable from descendants of `frame/rewrite/`.)
 
-### Visibility upgrades in `frame/mod.rs` (v4)
+### Visibility upgrades in `frame/mod.rs` (v4 — conditional)
+
+Codex r4 noted that Rust's privacy rule allows descendants
+(`frame::build::*` / `frame::rewrite::*`) to access
+ancestor-private items in `frame` without an explicit visibility
+upgrade. **Implementation MUST verify whether the upgrades below
+are actually needed at compile time** before applying them:
 
 ```rust
-// frame/mod.rs (modifications by this PR)
-pub(super) mod byte_writes;   // was: mod byte_writes;
-pub(super) mod tcp;           // was: mod tcp;
+// frame/mod.rs (modifications by this PR, conditional on compiler errors)
+pub(super) mod byte_writes;   // only if `mod byte_writes;` private blocks compile
+pub(super) mod tcp;           // only if `mod tcp;` private blocks compile
 
-pub(super) fn trim_l3_payload<'a>(...) -> &'a [u8] { ... }  // was: fn ...
-pub(super) fn rewrite_prepare_eth_from_parts(...) -> Option<...> { ... }  // was: fn ...
+pub(super) fn trim_l3_payload<'a>(...) -> &'a [u8] { ... }              // only if needed
+pub(super) fn rewrite_prepare_eth_from_parts(...) -> Option<...> { ... } // only if needed
 ```
 
-These visibility upgrades are the minimum needed for the
-descendants of `frame/build/` and `frame/rewrite/` to reach the
-helpers they call. Same-scope behavior is unchanged (no new
-external symbol surface — `pub(super)` from `frame/mod.rs` is
-"frame-private", same as before).)
+**Rule of thumb:** start with NO visibility changes; let `cargo
+build` surface only the imports that actually fail to resolve.
+For each failing import:
+1. Try to reach the item via the existing `pub(super) use ...`
+   re-exports in `frame/mod.rs` (e.g. `packet_rel_l4_offset` is
+   already re-exported at `pub(super)`).
+2. If the item is private and has no re-export, narrow the
+   visibility to the minimum scope that compiles. Prefer
+   `pub(in crate::afxdp::frame)` over `pub(super)`; prefer
+   `pub(super)` over `pub(in crate::afxdp)`.
+
+This is a no-op in the common case where Rust's descendant-access
+rule already covers the import. The visibility upgrades are a
+contingency, not a guaranteed change.
 
 ### `rewrite/mod.rs` orchestrator shape
 
@@ -782,33 +802,84 @@ nm -C "$BIN" | \
 # Expected: ZERO matches (per-family helpers fully inlined).
 # If any match, the PR MUST NOT MERGE until codegen is restored.
 
-# Also verify exactly ONE definition each of the orchestrators
-# (#[inline(never)] mandate from v3):
+# Orchestrator definitions (v4 codegen contract — asymmetric):
 nm -C "$BIN" | \
   grep -E "build_forwarded_frame_into_from_frame|apply_rewrite_descriptor"
-# Expected: exactly ONE definition per orchestrator (no duplication
-# through caller wrappers).
+# Expected:
+#   build_forwarded_frame_into_from_frame: exactly ONE definition
+#     (#[inline(never)] + concrete meta).
+#   apply_rewrite_descriptor: ZERO OR ONE definition.
+#     #[inline] hint may inline the body fully into
+#     poll_descriptor.rs:746; if so there's no standalone symbol.
+#     Either ZERO or ONE is acceptable; > 1 is a failure.
 
 # Step B: objdump disassembly of the canonical linked binary
-# at each caller region. This is the load-bearing asm-diff
-# artifact (Codex r3 Major #2). objdump operates on the final
+# at each region of interest. This is the load-bearing asm-diff
+# artifact (Codex r3 Major #2 + r4 finding #2 about
+# CARGO_TARGET_DIR isolation). objdump operates on the final
 # linked binary so ThinLTO's actual inlining decisions are
 # baked in.
-objdump -drwC "$BIN" \
-  | awk '/<[^>]*build_forwarded_frame_into_from_frame[^>]*>:/,/^$/ {print}' \
-  > /tmp/1352-orch-build.asm
-objdump -drwC "$BIN" \
-  | awk '/<[^>]*apply_rewrite_descriptor[^>]*>:/,/^$/ {print}' \
-  > /tmp/1352-orch-rewrite.asm
-# Baseline pair captured on origin/master:
-git worktree add -f /dev/shm/master-baseline origin/master \
-  && (cd /dev/shm/master-baseline && cargo build --release \
-      --manifest-path userspace-dp/Cargo.toml 2>/dev/null \
-      && objdump -drwC /dev/shm/cargo/release/xpf-userspace-dp \
-         | awk '/<[^>]*build_forwarded_frame_into_from_frame[^>]*>:/,/^$/ {print}' \
-         > /tmp/1352-master-orch-build.asm)
-# Reviewer attaches diff /tmp/1352-master-orch-build.asm
-# /tmp/1352-orch-build.asm as PR artifact (and same for rewrite).
+
+# B.1 — Capture PR-side artifacts. (Symbol address/size from
+# nm -S, then objdump by address range, avoids awk-substring
+# false positives on apply_rewrite_descriptor[_ipv4] names.)
+PR_BIN="$BIN"  # /dev/shm/cargo/release/xpf-userspace-dp
+ORCH_BUILD=$(nm -SC --defined-only "$PR_BIN" | \
+  grep -F " build_forwarded_frame_into_from_frame" | head -1)
+ORCH_REWRITE=$(nm -SC --defined-only "$PR_BIN" | \
+  grep -F " apply_rewrite_descriptor" | \
+  grep -vE "_ipv4|_ipv6" | head -1)
+# ORCH_BUILD must be non-empty (exactly ONE definition required).
+# ORCH_REWRITE may be empty in v4 (the standard #[inline] hint
+# may inline the body fully into poll_descriptor.rs:746 — this
+# is acceptable per the v4 codegen contract; see §codegen gate
+# semantics below).
+objdump -drwC "$PR_BIN" > /tmp/1352-pr-full-disasm.txt
+# Build-side: extract by symbol-bounded range. Substring-based
+# awk is acceptable here ONLY because build_forwarded_frame_into_from_frame
+# has no _ipv4/_ipv6 suffixed cousins in nm; no name-clash risk.
+awk '/<[^>]*build_forwarded_frame_into_from_frame[^>]*>:/,/^$/ {print}' \
+  /tmp/1352-pr-full-disasm.txt > /tmp/1352-pr-orch-build.asm
+# Rewrite-side: exact-symbol grep so apply_rewrite_descriptor
+# (orchestrator) is distinguished from apply_rewrite_descriptor_ipv4/6
+# (which should not exist as standalone symbols anyway).
+awk '/<[^>]*apply_rewrite_descriptor[^>]*>:/ && !/ipv[46]/, /^$/ {print}' \
+  /tmp/1352-pr-full-disasm.txt > /tmp/1352-pr-orch-rewrite.asm
+
+# B.2 — Capture baseline artifacts on origin/master with an
+# ISOLATED CARGO_TARGET_DIR so the build doesn't trample
+# /dev/shm/cargo (Codex r4 finding #2).
+git worktree add -f /dev/shm/master-baseline origin/master 2>/dev/null || true
+(cd /dev/shm/master-baseline && \
+   TMPDIR=/dev/shm CARGO_TARGET_DIR=/dev/shm/cargo-master \
+   cargo build --release --manifest-path userspace-dp/Cargo.toml)
+MASTER_BIN=/dev/shm/cargo-master/release/xpf-userspace-dp
+objdump -drwC "$MASTER_BIN" > /tmp/1352-master-full-disasm.txt
+awk '/<[^>]*build_forwarded_frame_into_from_frame[^>]*>:/,/^$/ {print}' \
+  /tmp/1352-master-full-disasm.txt > /tmp/1352-master-orch-build.asm
+awk '/<[^>]*apply_rewrite_descriptor[^>]*>:/ && !/ipv[46]/, /^$/ {print}' \
+  /tmp/1352-master-full-disasm.txt > /tmp/1352-master-orch-rewrite.asm
+
+# B.3 — Caller-region slices (Codex r4 finding #2 — the text
+# promised caller-region slices but v3/v4 commands sliced
+# callee symbols). Extract the disassembly of each of the 5
+# caller wrappers in tx/dispatch.rs and frame/mod.rs, plus
+# poll_descriptor.rs:746, on both binaries. These caller
+# regions show whether the orchestrator inlined or stayed
+# call-ed, which is the actual `apply_rewrite_descriptor`
+# inlining decision audit (since the standalone symbol may
+# not exist in v4).
+for caller in "tx::dispatch" "poll_descriptor" "frame::"; do
+  awk -v c="$caller" '$0 ~ c"::" && $0 ~ /<.*>:/, /^$/ {print}' \
+    /tmp/1352-pr-full-disasm.txt >> /tmp/1352-pr-callers.asm
+  awk -v c="$caller" '$0 ~ c"::" && $0 ~ /<.*>:/, /^$/ {print}' \
+    /tmp/1352-master-full-disasm.txt >> /tmp/1352-master-callers.asm
+done
+
+# Reviewer attaches the diffs as PR artifacts:
+#   diff -u /tmp/1352-master-orch-build.asm   /tmp/1352-pr-orch-build.asm
+#   diff -u /tmp/1352-master-orch-rewrite.asm /tmp/1352-pr-orch-rewrite.asm
+#   diff -u /tmp/1352-master-callers.asm      /tmp/1352-pr-callers.asm
 
 # Step C: supplementary --emit=asm grep for per-family helper
 # call instructions (AGY HIGH-1 + r2 #3). codegen-units=1 +
@@ -904,27 +975,68 @@ internal call) continue to surface the symbols at
 `crate::afxdp::frame::build_forwarded_frame_into_from_frame` and
 `crate::afxdp::frame::apply_rewrite_descriptor`.
 
-External signature byte-identical:
+External signature (v4):
+
+- `build_forwarded_frame_into_from_frame` changes from
+  `meta: impl Into<ForwardPacketMeta>` to concrete
+  `meta: ForwardPacketMeta` (Codex r3 Major #3 — close
+  monomorphization-duplication axis). The two wrappers
+  `build_forwarded_frame_from_frame` (mod.rs:191) and
+  `build_forwarded_frame_into` (mod.rs:470) keep their generic
+  `impl Into<...>` shape and convert via `.into()` before
+  invoking the orchestrator. External wrapper signature
+  byte-identical for both wrappers.
+- `apply_rewrite_descriptor` signature unchanged.
 
 ```rust
+// frame/build/mod.rs (orchestrator) — concrete meta in v4
 pub(in crate::afxdp) fn build_forwarded_frame_into_from_frame(
     out: &mut [u8],
     frame: &[u8],
-    meta: impl Into<ForwardPacketMeta>,
+    meta: ForwardPacketMeta,   // v4: concrete (was impl Into<...>)
     decision: &SessionDecision,
     forwarding: &ForwardingState,
     apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<usize>;
 
+// frame/mod.rs (wrapper, unchanged) — keeps generic shape
+pub(super) fn build_forwarded_frame_into(
+    area: &MmapArea,
+    tx_offset: u64,
+    frame: &[u8],
+    meta: impl Into<ForwardPacketMeta>,   // wrapper still generic
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+    apply_nat_on_fabric: bool,
+    expected_ports: Option<(u16, u16)>,
+) -> Option<usize> {
+    let meta = meta.into();   // monomorphize-then-forward
+    let out = unsafe { area.slice_mut_unchecked(tx_offset as usize, tx_frame_capacity())? };
+    build_forwarded_frame_into_from_frame(
+        out, frame, meta, decision, forwarding, apply_nat_on_fabric,
+        expected_ports,
+    )
+}
+
+// frame/rewrite/mod.rs (orchestrator) — unchanged
 pub(in crate::afxdp) fn apply_rewrite_descriptor(
     area: &MmapArea,
     desc: XdpDesc,
     meta: UserspaceDpMeta,
-    rd: &super::RewriteDescriptor,
+    rd: &crate::afxdp::RewriteDescriptor,   // v3 path fix
     expected_ports: Option<(u16, u16)>,
 ) -> Option<InPlaceRewriteResult>;
 ```
+
+Production caller at `tx/dispatch.rs:651` already passes
+`request.meta` which is `ForwardPacketMeta` (per
+`types/tx.rs:68`), so this caller is byte-identical to today
+(no `.into()` needed). The other two TX caller sites
+(`tx/dispatch.rs:505` and `:785`) call
+`build_forwarded_frame_from_frame` (the wrapper), not the
+orchestrator directly, so they pick up the `.into()` inside
+the wrapper.
 
 ## Hidden invariants the refactor must preserve
 
@@ -1035,12 +1147,14 @@ pub(in crate::afxdp) fn apply_rewrite_descriptor(
    commands in §Hot-path discipline (§Verification step). The
    load-bearing artifacts are:
    - `nm -C target/release/xpf-userspace-dp` — ZERO per-family
-     helper definitions; exactly ONE definition each of the two
-     orchestrators (canonical linked binary).
+     helper definitions; `build_forwarded_frame_into_from_frame`
+     exactly ONE definition; `apply_rewrite_descriptor` ZERO or
+     ONE definition (canonical linked binary).
    - `objdump -drwC target/release/xpf-userspace-dp` slices
-     around the orchestrator regions, baseline vs PR HEAD,
-     attached as a unified diff (Codex r3 Major #2 canonical
-     gate).
+     around the orchestrator regions AND the 5 caller wrapper
+     regions, baseline (origin/master, in an isolated
+     CARGO_TARGET_DIR) vs PR HEAD, attached as unified diffs
+     (Codex r3 Major #2 + r4 finding #2 canonical gate).
    - Supplementary: `RUSTFLAGS="-C codegen-units=1" cargo rustc
      --release --manifest-path userspace-dp/Cargo.toml --bin
      xpf-userspace-dp -- --emit=asm` followed by
