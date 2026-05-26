@@ -1,8 +1,11 @@
 package userspace
 
 import (
+	"errors"
 	"net"
 	"testing"
+
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 type legacyPolicySchedulerSeeder interface {
@@ -161,4 +164,66 @@ func TestLegacyDataPlaneAdapterOptionalInterfacesNilSafe(t *testing.T) {
 			}
 		})
 	}
+}
+
+// #1516 sub-#1451 S1 — verify the cursor-iteration delegation
+// methods (added so the gRPC pagination handler type assertion
+// against an unexported sessionCursorIterator interface succeeds on
+// userspace). Asserts both the production path (production bpfShim
+// is a *dataplane.Manager, so the underlying type satisfies the
+// cursor interface and the call delegates cleanly) and the
+// nil/edge fallback path (sentinel ErrCursorIterationUnsupported
+// is returned so the grpcapi handler can fall back to
+// getSessionsLegacy instead of surfacing codes.Internal).
+type legacyCursorIterator interface {
+	IterateSessionsFrom(cursor *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error
+	IterateSessionsV6From(cursor *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
+}
+
+var _ legacyCursorIterator = (*LegacyDataPlaneAdapter)(nil)
+
+func TestLegacyDataPlaneAdapterCursorIterationDelegation(t *testing.T) {
+	t.Run("production manager satisfies cursor interface", func(t *testing.T) {
+		m := New()
+		adapter := NewLegacyDataPlaneAdapter(m)
+		// The wrapped DataPlane is *dataplane.Manager which does
+		// implement IterateSessionsFrom/V6From — the delegation
+		// calls reach a real (unloaded) BPF manager and either
+		// succeed (empty iteration) or return a non-sentinel error
+		// from the underlying BPF map iter.  Either is acceptable;
+		// what matters is the sentinel is NOT what we get back
+		// when the wrapped manager DOES support cursor iteration.
+		err4 := adapter.IterateSessionsFrom(nil, func(dataplane.SessionKey, dataplane.SessionValue) bool { return true })
+		if errors.Is(err4, ErrCursorIterationUnsupported) {
+			t.Fatalf("IterateSessionsFrom returned sentinel %v even though wrapped DataPlane is *dataplane.Manager", err4)
+		}
+		err6 := adapter.IterateSessionsV6From(nil, func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool { return true })
+		if errors.Is(err6, ErrCursorIterationUnsupported) {
+			t.Fatalf("IterateSessionsV6From returned sentinel %v even though wrapped DataPlane is *dataplane.Manager", err6)
+		}
+	})
+
+	t.Run("nil manager returns sentinel", func(t *testing.T) {
+		adapter := NewLegacyDataPlaneAdapter(nil)
+		err4 := adapter.IterateSessionsFrom(nil, func(dataplane.SessionKey, dataplane.SessionValue) bool { return true })
+		if !errors.Is(err4, ErrCursorIterationUnsupported) {
+			t.Fatalf("IterateSessionsFrom on nil-manager adapter = %v, want ErrCursorIterationUnsupported", err4)
+		}
+		err6 := adapter.IterateSessionsV6From(nil, func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool { return true })
+		if !errors.Is(err6, ErrCursorIterationUnsupported) {
+			t.Fatalf("IterateSessionsV6From on nil-manager adapter = %v, want ErrCursorIterationUnsupported", err6)
+		}
+	})
+
+	t.Run("nil receiver returns sentinel", func(t *testing.T) {
+		var adapter *LegacyDataPlaneAdapter
+		err4 := adapter.IterateSessionsFrom(nil, func(dataplane.SessionKey, dataplane.SessionValue) bool { return true })
+		if !errors.Is(err4, ErrCursorIterationUnsupported) {
+			t.Fatalf("IterateSessionsFrom on nil receiver = %v, want ErrCursorIterationUnsupported", err4)
+		}
+		err6 := adapter.IterateSessionsV6From(nil, func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool { return true })
+		if !errors.Is(err6, ErrCursorIterationUnsupported) {
+			t.Fatalf("IterateSessionsV6From on nil receiver = %v, want ErrCursorIterationUnsupported", err6)
+		}
+	})
 }

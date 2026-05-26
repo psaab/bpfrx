@@ -17,7 +17,6 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/conntrack"
-	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcpserver"
@@ -37,7 +36,7 @@ import (
 // Config configures the gRPC server.
 type Config struct {
 	Store            *configstore.Store
-	DP               dataplane.DataPlane
+	DP               grpcRuntime
 	EventBuf         *logging.EventBuffer
 	GC               *conntrack.GC
 	Routing          *routing.Manager
@@ -69,7 +68,7 @@ type Config struct {
 type Server struct {
 	pb.UnimplementedBpfrxServiceServer
 	store              *configstore.Store
-	dp                 dataplane.DataPlane
+	dp                 grpcRuntime
 	eventBuf           *logging.EventBuffer
 	gc                 *conntrack.GC
 	routing            *routing.Manager
@@ -95,29 +94,15 @@ type Server struct {
 }
 
 func (s *Server) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
-	provider, ok := s.dp.(interface {
-		Status() (dpuserspace.ProcessStatus, error)
-	})
+	provider, ok := s.dp.(userspaceStatusProvider)
 	if !ok {
 		return dpuserspace.ProcessStatus{}, fmt.Errorf("userspace status unavailable")
 	}
 	return provider.Status()
 }
 
-func (s *Server) userspaceDataplaneControl() (interface {
-	Status() (dpuserspace.ProcessStatus, error)
-	SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
-	SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
-	SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
-	InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
-}, error) {
-	provider, ok := s.dp.(interface {
-		Status() (dpuserspace.ProcessStatus, error)
-		SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
-		SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
-		SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
-		InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
-	})
+func (s *Server) userspaceDataplaneControl() (userspaceControlProvider, error) {
+	provider, ok := s.dp.(userspaceControlProvider)
 	if !ok {
 		return nil, fmt.Errorf("userspace dataplane control unavailable")
 	}

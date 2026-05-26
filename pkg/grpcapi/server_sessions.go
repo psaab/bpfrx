@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
@@ -41,19 +43,17 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 	return s.getSessionsLegacy(ctx, req)
 }
 
-// sessionIteratorFrom is implemented by dataplane.Manager to support
-// cursor-based BPF map iteration.
-type sessionIteratorFrom interface {
-	IterateSessionsFrom(cursor *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error
-	IterateSessionsV6From(cursor *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
-}
-
 // getSessionsCursor implements cursor-based pagination.
 // It iterates only up to page_size matching entries, avoids full-table
 // scans for the total count (uses SessionCount instead), and skips
 // enrichment when no_enrich is set.
+//
+// The cursor-iteration provider interface (sessionCursorIterator)
+// lives in runtime.go alongside grpcRuntime and the userspace
+// provider probes; we fall through to the legacy full-table scan
+// when the underlying dataplane does not satisfy it.
 func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsRequest) (*pb.GetSessionsResponse, error) {
-	iterDP, ok := s.dp.(sessionIteratorFrom)
+	iterDP, ok := s.dp.(sessionCursorIterator)
 	if !ok {
 		// Dataplane doesn't support cursor iteration; fall back to legacy.
 		return s.getSessionsLegacy(ctx, req)
@@ -114,6 +114,16 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 	v6Exhausted := true // set to false when we start v6
 
 	// Phase 1: iterate v4 sessions from cursor.
+	//
+	// The adapter's cursor delegation can return
+	// dpuserspace.ErrCursorIterationUnsupported when the embedded
+	// dataplane is nil or does not implement cursor iteration
+	// (test/edge configurations only — production
+	// LegacyDataPlaneAdapter wraps a *dataplane.Manager which does
+	// implement it). Detecting that sentinel and falling back to
+	// the legacy offset/limit pagination preserves the master/
+	// pre-#1516 user-visible behavior in those edge cases instead
+	// of surfacing a codes.Internal to the client.
 	if startV4 {
 		if err := iterDP.IterateSessionsFrom(cursorV4, func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 			if len(all) >= pageSize {
@@ -138,6 +148,9 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 			lastV4Key = key
 			return true
 		}); err != nil {
+			if errors.Is(err, dpuserspace.ErrCursorIterationUnsupported) {
+				return s.getSessionsLegacy(ctx, req)
+			}
 			return nil, status.Errorf(codes.Internal, "v4 session iteration: %v", err)
 		}
 		if len(all) >= pageSize {
@@ -181,6 +194,9 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 			lastV6Key = key
 			return true
 		}); err != nil {
+			if errors.Is(err, dpuserspace.ErrCursorIterationUnsupported) {
+				return s.getSessionsLegacy(ctx, req)
+			}
 			return nil, status.Errorf(codes.Internal, "v6 session iteration: %v", err)
 		}
 		if len(all) >= pageSize {

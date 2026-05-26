@@ -14,6 +14,21 @@ import (
 var _ dataplane.DataPlane = (*LegacyDataPlaneAdapter)(nil)
 var _ dataplane.RuntimeDataPlane = (*LegacyDataPlaneAdapter)(nil)
 
+// #1516 sub-#1451 S1 — guard against signature drift on the
+// LegacyDataPlaneAdapter cursor-pagination delegation methods. The
+// gRPC server's session-pagination handler (server_sessions.go)
+// performs a runtime type assertion against an unexported
+// `sessionCursorIterator` interface declared in pkg/grpcapi. If
+// either of the signatures below drifts away from that interface,
+// the assertion would silently fail at runtime and the handler
+// would fall through to the full-table scan path under userspace —
+// exactly the silent-degradation hazard #1516 closed. This compile-
+// time assertion catches the drift at build time instead.
+var _ interface {
+	IterateSessionsFrom(cursor *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error
+	IterateSessionsV6From(cursor *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
+} = (*LegacyDataPlaneAdapter)(nil)
+
 // LegacyDataPlaneAdapter is the compatibility boundary for callers that still
 // depend on the old BPF-shaped dataplane.DataPlane interface.
 //
@@ -458,3 +473,46 @@ func (a *LegacyDataPlaneAdapter) TakeoverReady() (bool, []string) {
 	}
 	return m.TakeoverReady()
 }
+
+// ErrCursorIterationUnsupported is returned by
+// LegacyDataPlaneAdapter.IterateSessionsFrom and
+// IterateSessionsV6From when the underlying wrapped dataplane does
+// not expose cursor-based iteration. Callers that probe for cursor
+// support via type assertion (e.g. gRPC pagination) MUST detect
+// this error and fall back to non-cursor iteration so the user-
+// visible behavior matches the master/pre-#1516 path on
+// dataplanes that lack cursor support.
+//
+// In production the wrapped dataplane is a *dataplane.Manager (set
+// by NewLegacyDataPlaneAdapter from manager.bpfShim) which does
+// implement cursor iteration, so the production code path never
+// returns this sentinel. The sentinel guards test/edge
+// configurations where the adapter is constructed with a nil
+// manager or with an embedded DataPlane that does not implement
+// cursor iteration.
+var ErrCursorIterationUnsupported = errors.New("underlying dataplane does not support cursor iteration")
+
+func (a *LegacyDataPlaneAdapter) IterateSessionsFrom(cursor *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	if a == nil || a.DataPlane == nil {
+		return ErrCursorIterationUnsupported
+	}
+	if iter, ok := a.DataPlane.(interface {
+		IterateSessionsFrom(*dataplane.SessionKey, func(dataplane.SessionKey, dataplane.SessionValue) bool) error
+	}); ok {
+		return iter.IterateSessionsFrom(cursor, fn)
+	}
+	return ErrCursorIterationUnsupported
+}
+
+func (a *LegacyDataPlaneAdapter) IterateSessionsV6From(cursor *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	if a == nil || a.DataPlane == nil {
+		return ErrCursorIterationUnsupported
+	}
+	if iter, ok := a.DataPlane.(interface {
+		IterateSessionsV6From(*dataplane.SessionKeyV6, func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
+	}); ok {
+		return iter.IterateSessionsV6From(cursor, fn)
+	}
+	return ErrCursorIterationUnsupported
+}
+

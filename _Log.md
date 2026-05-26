@@ -570,6 +570,19 @@
   - **Validation**: go build ./... clean; go test
     ./pkg/dataplane/userspace/... ok; canaries 5/5 pass;
     go test ./... — all 30 packages green.
+- **Timestamp**: 2026-05-25T08:00:00Z
+  - **Action**: #1516 plan v1 — sub-#1451 S1 migration scope.
+    Drafted `docs/pr/1516-grpcapi-migration/plan.md`: new
+    `pkg/grpcapi/runtime.go` declaring `grpcRuntime` interface
+    (~25 methods) plus named provider interfaces
+    (`sessionCursorIterator`, `userspaceStatusProvider`,
+    `userspaceControlProvider`). `Config.DP` and `Server.dp`
+    move from `dataplane.DataPlane` to `grpcRuntime`. Issue
+    body's `ReadNATPortCounter` and `Compile` are stale — not
+    consumed on master @ fcd53beb. Pending Codex + AGY plan-
+    review.
+  - **File(s)**: `docs/pr/1516-grpcapi-migration/plan.md`,
+    `_Log.md`.
 
 - **Timestamp**: 2026-05-25T05:55:00Z
   - **Action**: PR #1536 round-3 cleanup — address Codex MAJOR
@@ -3117,3 +3130,49 @@
   registry so #1476 can retire legacy pinning without grep-and-pray. Plan
   preserves PR #1514's documented `userspace_fallback_stats` mixed-version
   compatibility exception verbatim. Pending Codex + AGY plan review.
+- **Timestamp**: 2026-05-25T15:10Z
+- **Action**: #1516 (sub-#1451 S1) — implement plan v2 migrating
+  pkg/grpcapi off legacy dataplane.DataPlane. New
+  pkg/grpcapi/runtime.go declares grpcRuntime narrow interface plus
+  userspaceStatusProvider/userspaceControlProvider/sessionCursorIterator
+  named providers. server.go field type Config.DP and Server.dp swap
+  dataplane.DataPlane → grpcRuntime; inline anonymous interface
+  assertions in server.go, server_show_forwarding.go, server_show.go
+  collapse to the named provider assertions. server_sessions.go
+  sessionIteratorFrom renamed to sessionCursorIterator and moved to
+  runtime.go. AGY r1 PLAN-NEEDS-MAJOR finding (userspace cursor
+  pagination silently degrades because LegacyDataPlaneAdapter does
+  not implement IterateSessionsFrom/V6From) addressed by adding
+  delegation methods on LegacyDataPlaneAdapter (assert embedded
+  a.DataPlane against cursor-iterator interface and forward to
+  bpfShim). Canary allowlist + retirement docs table updated:
+  pkg/grpcapi/runtime.go added, pkg/grpcapi/server.go removed (no
+  longer imports pkg/dataplane).
+- **File(s)**: pkg/grpcapi/runtime.go (new), pkg/grpcapi/server.go,
+  pkg/grpcapi/server_sessions.go, pkg/grpcapi/server_show.go,
+  pkg/grpcapi/server_show_forwarding.go,
+  pkg/dataplane/userspace/legacy_dataplane.go,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  docs/pr/1373-retire-ebpf-dataplane/README.md,
+  docs/pr/1516-grpcapi-migration/plan.md (v2).
+- **Validation**: GOCACHE/GOTMPDIR full Go suite green (30+ packages),
+  pkg/grpcapi 5/5 race flake check clean, cargo --release build
+  clean (114 pre-existing warnings only). Boundary canary tests
+  green. Smoke matrix delegated to serialized smoke-runner singleton
+  per feedback_smoke_serialized_single_agent rule (AWAITING-SMOKE
+  marker posted on PR).
+
+- **Timestamp**: 2026-05-25T16:05Z
+- **Action**: #1554 r3 Copilot finding fold — cross-package compile-time
+  interface-satisfaction guard. The userspace-side compile-time check
+  is method-shape-only (inline anonymous interface) and can't catch
+  drift if the unexported pkg/grpcapi interfaces (grpcRuntime,
+  sessionCursorIterator, userspaceStatusProvider,
+  userspaceControlProvider) acquire a new method. Adding the asymmetric
+  guard in pkg/grpcapi/runtime_canary_test.go: `var _ grpcRuntime =
+  (*dpuserspace.LegacyDataPlaneAdapter)(nil)` plus the same for each
+  named provider interface. _test.go scope keeps the assertions out
+  of the production binary.
+- **File(s)**: pkg/grpcapi/runtime_canary_test.go (new), _Log.md
+- **Validation**: go test ./pkg/grpcapi/... -count=1 green; full Go
+  suite green.
