@@ -47,8 +47,6 @@ pub(super) fn poll_binding(
     conntrack_v6_fd: c_int,
     dbg: &mut DebugPollCounters,
     rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
-    cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
-    cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
 ) -> bool {
     let (left, rest) = bindings.split_at_mut(binding_index);
     let Some((binding, right)) = rest.split_first_mut() else {
@@ -63,8 +61,6 @@ pub(super) fn poll_binding(
         forwarding,
         worker_id,
         worker_commands_by_id,
-        cos_owner_worker_by_queue,
-        cos_owner_live_by_queue,
     );
     apply_shared_recycles(
         left,
@@ -94,8 +90,6 @@ pub(super) fn poll_binding(
                 forwarding,
                 worker_id,
                 worker_commands_by_id,
-                cos_owner_worker_by_queue,
-                cos_owner_live_by_queue,
             );
             apply_shared_recycles(
                 left,
@@ -263,8 +257,6 @@ pub(super) fn poll_binding(
                 dbg,
                 worker_id,
                 worker_commands_by_id,
-                cos_owner_worker_by_queue,
-                cos_owner_live_by_queue,
             );
             binding.scratch.scratch_post_recycles = scratch_post_recycles;
         }

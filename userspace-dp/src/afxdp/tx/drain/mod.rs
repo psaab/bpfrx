@@ -3,6 +3,27 @@
 
 use super::*;
 
+mod phase_backup;
+mod phase_shaped;
+mod phase_trivial;
+
+use phase_backup::{BackupOutcome, drain_phase_drain_local_backup};
+use phase_shaped::drain_phase_drain_cos;
+use phase_trivial::{
+    drain_phase_ingest_cos, drain_phase_maybe_rekick, drain_phase_reap_completions,
+    drain_phase_submit_and_wake,
+};
+
+/// Per-tick drain context — references-only, stack-built once
+/// per drain call; passed to phase helpers by `&DrainCtx<'_>`.
+/// Hot-path allocation contract: zero new allocations.
+pub(in crate::afxdp) struct DrainCtx<'a> {
+    pub forwarding: &'a ForwardingState,
+    pub worker_id: u32,
+    pub worker_commands_by_id: &'a BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
+    pub now_ns: u64,
+}
+
 pub(in crate::afxdp) fn pending_tx_capacity(ring_entries: u32) -> usize {
     (ring_entries as usize)
         .saturating_mul(PENDING_TX_LIMIT_MULTIPLIER)
@@ -68,251 +89,33 @@ pub(in crate::afxdp) fn drain_pending_tx(
     forwarding: &ForwardingState,
     worker_id: u32,
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
-    _cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
-    _cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
 ) -> bool {
     if !binding_has_pending_tx_work(binding) {
         return false;
     }
-    let mut did_work = reap_tx_completions(binding, shared_recycles) > 0;
-    // In copy mode, the kernel needs sendto() to process TX ring entries.
-    // If outstanding entries remain after reaping (kernel didn't finish in
-    // the previous kick), re-kick now so they don't stall forever.
-    if binding.tx_pipeline.outstanding_tx > 0
-        && binding.tx_pipeline.pending_tx_prepared.is_empty()
-        && binding.tx_pipeline.pending_tx_local.is_empty()
-    {
-        maybe_wake_tx(binding, false, now_ns);
-    }
-    // First ingest pass — same structure as pre-#760. Moves
-    // pending_tx_local + inbox items into CoS queues where
-    // possible. Items that can't be CoS-enqueued (no CoS config
-    // for the egress, or cos_queue_id=None) stay in
-    // pending_tx_local and flow through the backup paths below —
-    // that's the expected non-CoS fast path and MUST stay fast.
-    ingest_cos_pending_tx(
-        binding,
+    let ctx = DrainCtx {
         forwarding,
-        now_ns,
         worker_id,
         worker_commands_by_id,
-        shared_recycles,
-    );
-    // Original #751 drain loop: service shaped queues until noop.
-    // Each shaped drain attributes latency + invocations to the
-    // specific queue via drain_shaped_tx's returned queue ref.
-    //
-    // #1318: skip the whole shaped-drain call path when this binding
-    // has no queued CoS work. `drain_shaped_tx` has its own defensive
-    // bail, but the caller would still pay monotonic_nanos(), one
-    // no-op call, and noop telemetry on every idle worker tick.
-    while should_enter_shaped_drain(binding) {
-        let start_ns = monotonic_nanos();
-        let serviced = drain_shaped_tx(binding, now_ns, shared_recycles);
-        if let Some(serviced) = serviced.as_ref() {
-            let delta = monotonic_nanos().saturating_sub(start_ns);
-            let bucket = bucket_index_for_ns(delta);
-            if let Some(root) = binding.cos.cos_interfaces.get(&serviced.root_ifindex) {
-                if let Some(queue) = root.queues.get(serviced.queue_idx) {
-                    if queue.queue_id() == serviced.queue_id {
-                        queue.telemetry.owner_profile.drain_latency_hist[bucket]
-                            .fetch_add(1, Ordering::Relaxed);
-                        queue
-                            .telemetry
-                            .owner_profile
-                            .drain_invocations
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-            did_work = true;
-        } else {
-            binding
-                .live
-                .owner_profile_owner
-                .drain_noop_invocations
-                .fetch_add(1, Ordering::Relaxed);
-            break;
+        now_ns,
+    };
+
+    let mut did_work = drain_phase_reap_completions(binding, shared_recycles);
+    drain_phase_maybe_rekick(binding, &ctx);
+    drain_phase_ingest_cos(binding, &ctx, shared_recycles);
+    drain_phase_drain_cos(binding, &ctx, shared_recycles, &mut did_work);
+    match drain_phase_drain_local_backup(binding, &ctx, shared_recycles, &mut did_work) {
+        BackupOutcome::Continue => {}
+        BackupOutcome::EarlyReturnRetry => return true,
+        BackupOutcome::EarlyReturnAfterDebugUpdate => {
+            update_binding_debug_state(binding);
+            return did_work || binding_has_pending_tx_work(binding);
+        }
+        BackupOutcome::EarlyReturnNoDebugUpdate => {
+            return did_work || binding_has_pending_tx_work(binding);
         }
     }
-    // #760: bounded re-ingest → drain_shaped_tx loop, but ONLY
-    // while the MPSC inbox has late peer arrivals AND CoS is
-    // configured on some egress. For non-CoS traffic
-    // (forwarding.cos.interfaces empty, or pending_tx_local
-    // items all have cos_queue_id=None), the first ingest is
-    // sufficient and re-ingesting does nothing useful — items
-    // in pending_tx_local that Err'd out of the first pass will
-    // Err the same way on every subsequent pass. The quiesce
-    // guard below is inbox-only because that is the only place
-    // peer workers can push new work after the first ingest.
-    //
-    // Perf note: without the inbox-only guard, a 25 Gbps non-CoS
-    // flow burns all 4 budget iterations per drain_pending_tx
-    // call because pending_tx_local never empties — observed as
-    // a severe throughput regression (25 Gbps → 3 Gbps). The
-    // inbox-only guard keeps the non-CoS fast path at exactly
-    // the pre-#760 cost.
-    if !forwarding.cos.interfaces.is_empty() {
-        const REINGEST_BUDGET: usize = 4;
-        for _ in 0..REINGEST_BUDGET {
-            if binding.live.pending_tx_empty() {
-                break;
-            }
-            ingest_cos_pending_tx_with_provenance(
-                binding,
-                forwarding,
-                now_ns,
-                worker_id,
-                worker_commands_by_id,
-                false,
-                shared_recycles,
-            );
-            let mut serviced_in_inner = false;
-            while should_enter_shaped_drain(binding) {
-                let start_ns = monotonic_nanos();
-                let serviced = drain_shaped_tx(binding, now_ns, shared_recycles);
-                if let Some(serviced) = serviced.as_ref() {
-                    let delta = monotonic_nanos().saturating_sub(start_ns);
-                    let bucket = bucket_index_for_ns(delta);
-                    if let Some(root) = binding.cos.cos_interfaces.get(&serviced.root_ifindex) {
-                        if let Some(queue) = root.queues.get(serviced.queue_idx) {
-                            if queue.queue_id() == serviced.queue_id {
-                                queue.telemetry.owner_profile.drain_latency_hist[bucket]
-                                    .fetch_add(1, Ordering::Relaxed);
-                                queue
-                                    .telemetry
-                                    .owner_profile
-                                    .drain_invocations
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    did_work = true;
-                    serviced_in_inner = true;
-                } else {
-                    break;
-                }
-            }
-            if !serviced_in_inner {
-                break;
-            }
-        }
-    }
-    // #760: drop CoS-bound items that reached this backup path
-    // instead of transmitting them unshaped. Fast-exit when no
-    // CoS is configured (no possible cos_queue_id.is_some() on
-    // any item) — keeps the non-CoS hot path allocation-free.
-    if !forwarding.cos.interfaces.is_empty() {
-        drop_cos_bound_prepared_leftovers(binding, forwarding, shared_recycles);
-    }
-    while !binding.tx_pipeline.pending_tx_prepared.is_empty() {
-        match transmit_prepared_batch(binding, now_ns, shared_recycles) {
-            Ok((packets, bytes)) => {
-                if packets == 0 {
-                    break;
-                }
-                did_work = true;
-                binding
-                    .live
-                    .tx_packets
-                    .fetch_add(packets, Ordering::Relaxed);
-                binding.live.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
-                // #760 instrumentation: these bytes went out via
-                // the post-CoS backup path in drain_pending_tx —
-                // they did NOT pass through any queue's token gate.
-                // Non-zero here is the direct fingerprint of the
-                // cap bypass we're hunting.
-                binding
-                    .live
-                    .owner_profile_owner
-                    .post_drain_backup_bytes
-                    .fetch_add(bytes, Ordering::Relaxed);
-            }
-            Err(TxError::Retry(err)) => {
-                binding.live.set_error(err);
-                return true;
-            }
-            Err(TxError::Drop(err)) => {
-                binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
-                // #710: frame-level submit error (capacity / slice /
-                // other `TxError::Drop`). Subset of tx_errors.
-                binding
-                    .live
-                    .tx_submit_error_drops
-                    .fetch_add(1, Ordering::Relaxed);
-                binding.live.set_error(err);
-            }
-        }
-    }
-    if binding.tx_pipeline.pending_tx_local.is_empty() && binding.live.pending_tx_empty() {
-        update_binding_debug_state(binding);
-        return did_work || binding_has_pending_tx_work(binding);
-    }
-    let mut pending = take_pending_tx_requests(binding);
-    if pending.is_empty() {
-        return did_work || binding_has_pending_tx_work(binding);
-    }
-    // #760: drop any CoS-bound items. Fast-exit if no CoS is
-    // configured at all — saves the O(n) scan + reallocation on
-    // the non-CoS hot path.
-    if !forwarding.cos.interfaces.is_empty() {
-        drop_cos_bound_local_leftovers(
-            binding,
-            forwarding,
-            now_ns,
-            &mut pending,
-            shared_recycles,
-        );
-    }
-    let mut retry = VecDeque::new();
-    while let Some(req) = pending.pop_front() {
-        retry.push_back(req);
-        if retry.len() >= TX_BATCH_SIZE
-            || binding.tx_pipeline.free_tx_frames.is_empty()
-            || pending.is_empty()
-        {
-            match transmit_batch(binding, &mut retry, now_ns, shared_recycles) {
-                Ok((packets, bytes)) => {
-                    if packets > 0 {
-                        did_work = true;
-                        binding
-                            .live
-                            .tx_packets
-                            .fetch_add(packets, Ordering::Relaxed);
-                        binding.live.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
-                        // #760 instrumentation: bytes that left via
-                        // the fallback transmit_batch WITHOUT going
-                        // through any CoS queue's token gate. See
-                        // the post_drain_backup_bytes field comment
-                        // for why this is the #760 smoking gun.
-                        binding
-                            .live
-                            .owner_profile_owner
-                            .post_drain_backup_bytes
-                            .fetch_add(bytes, Ordering::Relaxed);
-                    }
-                }
-                Err(TxError::Retry(err)) => {
-                    binding.live.set_error(err);
-                    retry.append(&mut pending);
-                    break;
-                }
-                Err(TxError::Drop(err)) => {
-                    binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
-                    binding
-                        .live
-                        .tx_submit_error_drops
-                        .fetch_add(1, Ordering::Relaxed);
-                    binding.live.set_error(err);
-                }
-            }
-        }
-    }
-    if !retry.is_empty() {
-        restore_pending_tx_requests(binding, retry);
-    }
-    update_binding_debug_state(binding);
-    did_work || binding_has_pending_tx_work(binding)
+    drain_phase_submit_and_wake(binding, did_work)
 }
 
 /// #760: drop any prepared TX requests whose `cos_queue_id` is
@@ -331,7 +134,7 @@ pub(in crate::afxdp) fn drain_pending_tx(
 /// counter should be interpreted as a leftover-after-reingest
 /// defense rather than only a narrow redirect-to-owner +
 /// local-enqueue failure.
-fn drop_cos_bound_prepared_leftovers(
+pub(super) fn drop_cos_bound_prepared_leftovers(
     binding: &mut BindingWorker,
     forwarding: &ForwardingState,
     shared_recycles: &mut Vec<(u32, u64)>,
@@ -461,7 +264,7 @@ where
     (dropped, dropped_bytes)
 }
 
-fn drop_cos_bound_local_leftovers(
+pub(super) fn drop_cos_bound_local_leftovers(
     binding: &mut BindingWorker,
     forwarding: &ForwardingState,
     now_ns: u64,
@@ -500,7 +303,7 @@ fn drop_cos_bound_local_leftovers(
     }
 }
 
-fn binding_has_pending_tx_work(binding: &BindingWorker) -> bool {
+pub(super) fn binding_has_pending_tx_work(binding: &BindingWorker) -> bool {
     binding.tx_pipeline.outstanding_tx > 0
         || !binding.tx_pipeline.pending_tx_prepared.is_empty()
         || !binding.tx_pipeline.pending_tx_local.is_empty()
@@ -509,7 +312,7 @@ fn binding_has_pending_tx_work(binding: &BindingWorker) -> bool {
 }
 
 #[inline]
-fn should_enter_shaped_drain(binding: &BindingWorker) -> bool {
+pub(super) fn should_enter_shaped_drain(binding: &BindingWorker) -> bool {
     has_queued_cos_work(
         binding.cos.cos_nonempty_interfaces,
         binding.cos.cos_interface_order.len(),
@@ -528,8 +331,6 @@ pub(in crate::afxdp) fn drain_pending_tx_local_owner(
     forwarding: &ForwardingState,
     worker_id: u32,
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
-    cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
-    cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
 ) -> bool {
     drain_pending_tx(
         binding,
@@ -538,12 +339,10 @@ pub(in crate::afxdp) fn drain_pending_tx_local_owner(
         forwarding,
         worker_id,
         worker_commands_by_id,
-        cos_owner_worker_by_queue,
-        cos_owner_live_by_queue,
     )
 }
 
-fn ingest_cos_pending_tx(
+pub(super) fn ingest_cos_pending_tx(
     binding: &mut BindingWorker,
     forwarding: &ForwardingState,
     now_ns: u64,
@@ -575,7 +374,7 @@ fn ingest_cos_pending_tx(
 /// peer requests as owner-local; inflates owner_pps, deflates
 /// peer_pps — exactly the wrong signal for diagnosing owner
 /// hotspots."
-fn ingest_cos_pending_tx_with_provenance(
+pub(super) fn ingest_cos_pending_tx_with_provenance(
     binding: &mut BindingWorker,
     forwarding: &ForwardingState,
     now_ns: u64,
@@ -779,7 +578,7 @@ where
     }
 }
 
-fn take_pending_tx_requests(binding: &mut BindingWorker) -> VecDeque<TxRequest> {
+pub(super) fn take_pending_tx_requests(binding: &mut BindingWorker) -> VecDeque<TxRequest> {
     // Reuse the worker-owned `pending_tx_local` buffer as the drain
     // target so the owner-worker hot path stays allocation-free. `pop`
     // from the lock-free inbox appends into the same buffer without a
@@ -789,12 +588,11 @@ fn take_pending_tx_requests(binding: &mut BindingWorker) -> VecDeque<TxRequest> 
     out
 }
 
-fn restore_pending_tx_requests(binding: &mut BindingWorker, mut retry: VecDeque<TxRequest>) {
+pub(super) fn restore_pending_tx_requests(binding: &mut BindingWorker, mut retry: VecDeque<TxRequest>) {
     retry.append(&mut binding.tx_pipeline.pending_tx_local);
     binding.tx_pipeline.pending_tx_local = retry;
     bound_pending_tx_local(binding);
 }
 
 #[cfg(test)]
-#[path = "drain_tests.rs"]
 mod tests;

@@ -603,8 +603,6 @@ pub(crate) fn worker_loop(
                 conntrack_v6_fd,
                 &mut dbg_poll,
                 &rg_epochs,
-                cos_owner_worker_by_queue.as_ref(),
-                cos_owner_live_by_queue.as_ref(),
             ) {
                 did_work = true;
             }
