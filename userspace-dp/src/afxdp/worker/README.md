@@ -2,8 +2,15 @@
 
 The per-worker hot path. One `BindingWorker` per RSS queue, owns
 its AF_XDP socket + UMEM + RX/TX/fill/completion rings + per-worker
-state. The `worker_loop` in this module's `mod.rs` calls
-`poll_binding` once per binding per tick.
+state. The `worker_loop` fn (defined in `loop_body/mod.rs`,
+re-exported from `worker/mod.rs`) calls `poll_binding` once per
+binding per tick.
+
+`worker_loop` was extracted out of `worker/mod.rs` into `loop_body/`
+in #1326 Phase 1 (PR #1569) when `worker/mod.rs` crossed the 2000-LOC
+modularity gate. The fn body sits in `loop_body/mod.rs` today; the
+per-tick sub-stage decomposition (`setup.rs` / `tick.rs` /
+`poll_drive.rs` / `debug_report.rs`) is queued as follow-up PRs.
 
 `BindingWorker` was decomposed into sub-structs in #959 (Phases 1–11).
 Each phase extracted one cluster of fields into a dedicated
@@ -14,7 +21,8 @@ each cluster has a clear ownership boundary.
 
 | File | Purpose |
 |------|---------|
-| `mod.rs` | `worker_loop` + `BindingWorker` struct. (Calls `pin_current_thread`, which is defined in `afxdp/neighbor.rs`.) |
+| `mod.rs` | `BindingWorker` struct + shared-binding helpers + `pub(crate) use loop_body::worker_loop` re-export. (Calls `pin_current_thread`, which is defined in `afxdp/neighbor.rs`.) |
+| `loop_body/mod.rs` | `worker_loop` body (extracted in #1326 Phase 1). Per-tick orchestrator; the sub-stage carve is a follow-up. |
 | `lifecycle.rs` | `poll_binding` — the per-poll RX/TX orchestrator. The "central function" extracted in Issue 73 step 2. |
 | `cos.rs` | Per-worker CoS runtime helpers + shared-exact threshold (the empirical sustained per-worker exact throughput ceiling — see comment block in the file for the evidence basis). |
 | `cos_state.rs` | `WorkerCos` (#959 Phase 3) — per-binding CoS-engine state. |

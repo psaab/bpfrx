@@ -35,3 +35,10 @@ re-dispatching.
 - AGY: r4 review-mpmw4xjc-92bdff — **PLAN-READY** (still valid on v3.4 since v3.3→v3.4 was wording-only)
 
 **Both reviewers PLAN-READY. Cleared to implement.**
+
+## Code review (round 1, on PR #1569 HEAD bdd551af)
+
+- Codex: task-mpmwyu0c-s5wj0p (background, dispatched 2026-05-26)
+- AGY: review-mpmwyzpy-2vbv5h (background, dispatched 2026-05-26)
+- Copilot: requested via `gh pr edit --add-reviewer Copilot` + `@copilot review` PR comment
+- Claude SMR: pending post-Copilot

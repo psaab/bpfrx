@@ -995,7 +995,6 @@ fn refresh_worker_cos_queue_lease_runtime_counters(
 mod loop_body;
 pub(crate) use loop_body::worker_loop;
 
-
 fn apply_worker_shaped_tx_requests(
     bindings: &mut [BindingWorker],
     forwarding: &ForwardingState,
