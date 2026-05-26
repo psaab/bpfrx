@@ -1,7 +1,64 @@
 # #1541 cluster manager split — plan
 
-**Status:** DRAFT v2 — addresses Codex r1 PLAN-NEEDS-MINOR and
-Gemini r1 PLAN-KILL.
+**Status:** DRAFT v3 — addresses Codex r2 PLAN-NEEDS-MAJOR and
+Gemini r2 PLAN-NEEDS-MINOR (Gemini explicitly acknowledged the
+r1 counter-example as resolved by v2).
+
+**Round 2 outcomes:**
+- Codex (task-mpmz1yi5-q7nath): PLAN-NEEDS-MAJOR. Finding:
+  `handlePeerHeartbeat` still applies transfer-grace state
+  (`peerTransferOutOverride`, `peerTransferCommitGraceUntil`)
+  while rebuilding `newPeerGroups` (cluster.go:1516), so the
+  "stale-heartbeat-content" invariant is NOT fully in failover.go.
+  Fix: extract a failover.go-owned helper (e.g.
+  `applyTransferCommitOverridesOnPeerStateLocked`) that
+  `handlePeerHeartbeat` calls. This is the one allowed deviation
+  from the "no method bodies edited" rule. Also one typo to fix
+  (v2 said handlePeerHeartbeat where it meant handlePeerTimeout).
+- Gemini (task-mpmz2j22-zfrgrf): PLAN-NEEDS-MINOR with explicit
+  acknowledgment that round-1 PLAN-KILL counter-example is
+  resolved. Two new findings: (a) `triggerGARP` is wrongly placed
+  in `heartbeat_manager.go`; the L2 VIP-takeover invariant belongs
+  in `garp.go` (where the burst sender already lives) or
+  `election.go`; (b) `failover_batch.go` should merge into
+  `failover.go` so that the entire manual-failover locking domain
+  (single-RG + batch) is one file with shared `*Locked` helpers.
+
+**v3 response:**
+1. **Codex finding (transfer-grace-on-heartbeat smear).** Extract
+   `applyTransferCommitOverridesOnPeerStateLocked(newPeerGroups,
+   now)` as a new helper owned by `failover.go`.
+   `handlePeerHeartbeat` calls it instead of inlining the override
+   logic. This is the ONLY behavior-preserving extraction
+   permitted by v3 — the helper body contains the exact same
+   statements that lived inline in handlePeerHeartbeat, just
+   relocated. No control-flow change, no field rename, no new
+   allocation. The plan's "no method bodies edited" rule gains an
+   explicit exception for "lift-then-call extractions when both
+   reviewers identify the same locking-invariant smear" — this
+   is the only one needed.
+2. **Codex typo.** Fixed below — the cross-file call from
+   heartbeat_manager.go to failover.go is `handlePeerTimeout` →
+   `suppressPeerTimeoutForTransferCommitLocked`, not
+   `handlePeerHeartbeat`.
+3. **Gemini GARP finding.** `triggerGARP` moves to `garp.go`, not
+   `heartbeat_manager.go`. It's a one-line `go sendGARP()` wrapper
+   already adjacent to the burst sender code; co-locating it with
+   `sendGARP` is the obvious home.
+4. **Gemini failover-merge finding.** `failover_batch.go` merges
+   into `failover.go`. The result is ~1000 LOC but the entire
+   manual-failover and transfer-commit locking domain — single-RG
+   AND batch — lives in one file with shared `*Locked` helpers.
+   No more cross-file references to `applyPeerTransferOutOverrideLocked`
+   / `clearPeerTransferOutOverrideLocked` /
+   `restorePeerTransferOutOverrideLocked` /
+   `transferCommitGracePeriodLocked` from a separate batch file.
+
+**v1 → v2 round 1 outcomes (preserved for audit):**
+- Codex r1 (task-mpmyrii6-pl9f0f): PLAN-NEEDS-MINOR (3 findings,
+  all addressed in v2 or v3).
+- Gemini r1 (task-mpmys3n8-wcaa7b): PLAN-KILL on transfer-commit
+  smear; resolved in v2.
 
 **Round 1 outcomes:**
 - Codex (task-mpmyrii6-pl9f0f): PLAN-NEEDS-MINOR. Three findings:
@@ -92,7 +149,8 @@ The package already has substantial domain-split files:
   `heartbeatReceiver` goroutines, `normalizeHAProtocolVersion`.
   Tests in `heartbeat_test.go` (544 LOC).
 - `failover_batch.go` (369 LOC) — multi-RG failover variants of the
-  manual/transfer/commit protocol.
+  manual/transfer/commit protocol. *Folded into the new `failover.go`
+  in v3 per Gemini r2 (shared `*Locked` state with single-RG).*
 - `events.go` (101 LOC) — `EventCategory`, `HistoryEvent`,
   `EventHistory`, drop counters.
 - `monitor.go` (491 LOC) — `Monitor` netlink-driven monitor.
@@ -196,34 +254,73 @@ pkg/cluster/
                           #   RestartHeartbeat, buildHeartbeat,
                           #   handlePeerHeartbeat, handlePeerTimeout,
                           #   handlePeerNeverSeen, vrfListenConfig,
-                          #   HeartbeatStats, triggerGARP.
+                          #   HeartbeatStats.
                           #   (Transfer-commit state machine is NOT
                           #   here — see failover.go. handlePeerTimeout
                           #   calls suppressPeerTimeoutForTransferCommitLocked
-                          #   from failover.go as a regular cross-file
-                          #   private method call.)
-  failover.go             # NEW — single-RG manual failover protocol
-                          #   AND the transfer-commit state machine.
-                          #   Methods:
-                          #   - Manual failover: ManualFailover,
-                          #     ForceSecondary, ResetFailover.
-                          #   - Transfer protocol: RequestPeerFailover,
+                          #   from failover.go; handlePeerHeartbeat calls
+                          #   applyTransferCommitOverridesOnPeerStateLocked
+                          #   from failover.go to apply transfer-out
+                          #   overrides while rebuilding newPeerGroups.
+                          #   Both are package-private cross-file calls.
+                          #   triggerGARP is NOT here — see garp.go.
+                          #   v3 fixes for Codex r2 PLAN-NEEDS-MAJOR
+                          #   and Gemini r2 GARP misplacement.)
+  failover.go             # NEW — single-RG and multi-RG (batch)
+                          #   manual failover protocol AND the
+                          #   transfer-commit state machine. v3 folds
+                          #   failover_batch.go into this file per
+                          #   Gemini r2: the entire manual-failover
+                          #   locking domain (single-RG + batch +
+                          #   transfer-commit *Locked helpers) lives
+                          #   in one file. Methods:
+                          #   - Manual failover (single-RG):
+                          #     ManualFailover, ForceSecondary,
+                          #     ResetFailover.
+                          #   - Manual failover (batch, from former
+                          #     failover_batch.go): ManualFailoverBatch,
+                          #     IsSupportedClusterNodeID,
+                          #     normalizeFailoverRGIDs,
+                          #     failoverBatchKey.
+                          #   - Transfer protocol (single-RG):
+                          #     RequestPeerFailover,
                           #     commitRequestedPeerFailover,
                           #     abortRequestedPeerFailover,
                           #     notePeerTransferCommitted,
                           #     FinalizePeerTransferOut, FenceStatus.
-                          #   - Transfer state helpers (moved here from
-                          #     v1's peer_state.go / heartbeat_manager.go
-                          #     to address Gemini r1 PLAN-KILL):
+                          #   - Transfer protocol (batch, from former
+                          #     failover_batch.go):
+                          #     RequestPeerFailoverBatch,
+                          #     commitRequestedPeerFailoverBatch,
+                          #     abortRequestedPeerFailoverBatch,
+                          #     notePeerTransferCommittedBatch,
+                          #     FinalizePeerTransferOutBatch.
+                          #   - Transfer state *Locked helpers:
                           #     applyPeerTransferOutOverrideLocked,
                           #     clearPeerTransferOutOverrideLocked,
                           #     restorePeerTransferOutOverrideLocked,
                           #     transferCommitGracePeriodLocked,
                           #     suppressPeerTimeoutForTransferCommitLocked.
-                          #   (failover_batch.go is multi-RG variants and
-                          #   stays unchanged — it already lives in its
-                          #   own sibling file and calls into the helpers
-                          #   here via package-private references.)
+                          #   - NEW v3 extraction (Codex r2 fix):
+                          #     applyTransferCommitOverridesOnPeerStateLocked(
+                          #       newPeerGroups map[int]PeerGroupState,
+                          #       now time.Time)
+                          #     called from heartbeat_manager.go::handlePeerHeartbeat.
+                          #     Body lifted verbatim from the inline override
+                          #     application loop in handlePeerHeartbeat
+                          #     (current cluster.go:1505-1520 region). The
+                          #     lift is a single behavior-preserving
+                          #     extraction; no control-flow or field-access
+                          #     changes.
+  garp.go                 # (existing 571 LOC, unchanged body) — now
+                          #   also gets triggerGARP method moved in from
+                          #   cluster.go. triggerGARP is the
+                          #   `go sendGARP(...)` wrapper that
+                          #   election.go and failover.go fire to
+                          #   broadcast L2 takeover, so co-locating it
+                          #   with sendGARP (the burst sender it wraps)
+                          #   keeps the L2 takeover invariant in one
+                          #   file. v3 fix for Gemini r2 GARP misplacement.
   events_log.go           # RecordEvent, EventHistoryFor.
                           #   (events.go holds types + EventHistory
                           #   struct; these are Manager methods.)
@@ -240,6 +337,17 @@ This is **pure code motion**. The rules:
    receiver, same doc comment.
 2. No method bodies are edited during the move. If a method needs
    fixing, it is fixed in a follow-up PR.
+   **Exception (v3, Codex r2):** ONE lift-extraction is permitted:
+   the inline transfer-out-override application loop in
+   `handlePeerHeartbeat` (cluster.go:1505-1520 region) is hoisted
+   to a new method
+   `applyTransferCommitOverridesOnPeerStateLocked(newPeerGroups
+   map[int]PeerGroupState, now time.Time)` owned by `failover.go`.
+   The hoisted statements are byte-for-byte the same; only the
+   enclosing function changes. This is the minimum behavior-
+   preserving extraction that closes Codex's r2 finding (and
+   Gemini's r1 counter-example fully). No other method bodies
+   are touched.
 3. No new types are introduced. No fields are added or removed on
    `Manager`. No locking is changed.
 4. Imports are pruned per-file to satisfy `goimports`, but no new
@@ -290,13 +398,15 @@ to resolve identically:
 - Free functions: `IsRetryablePreFailoverError`,
   `IsSupportedClusterNodeID`, `MarshalHeartbeat`,
   `UnmarshalHeartbeat`, `EffectivePriority`.
-- All 61 exported methods on `*Manager` defined in `cluster.go`
-  (counted via `grep '^func (m \*Manager) [A-Z]' cluster.go`)
-  keep their current signatures after the move. The full package
-  exposes 64 `*Manager` methods because `failover_batch.go`
-  already defines `ManualFailoverBatch`,
-  `RequestPeerFailoverBatch`, and `FinalizePeerTransferOutBatch`
-  in a sibling file. Those three are not moved by this PR.
+- All 64 exported `*Manager` methods in `pkg/cluster/` keep their
+  current signatures: 61 currently defined in `cluster.go` plus
+  3 currently in `failover_batch.go`
+  (`ManualFailoverBatch`, `RequestPeerFailoverBatch`,
+  `FinalizePeerTransferOutBatch`). After v3, all 64 are still
+  exported with identical signatures, just from new file homes.
+  The v3-introduced helper
+  `applyTransferCommitOverridesOnPeerStateLocked` is **private**
+  (lowercase) and so does not touch the public API surface.
 
 `go test ./pkg/...` will reveal any accidental signature drift
 immediately.
