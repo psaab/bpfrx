@@ -11,7 +11,7 @@ BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime=$(BUILD_TIME)
 
 # eBPF compilation flags
-.PHONY: all generate generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp proto install clean test test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity build-dpdk-worker build-dpdk clean-dpdk
+.PHONY: all generate generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp proto install clean test test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity
 
 all: generate build build-ctl
 
@@ -59,7 +59,7 @@ install: build build-ctl
 test:
 	$(GO) test ./...
 
-clean: clean-dpdk
+clean:
 	rm -f $(BINARY) cli xpf-userspace-dp
 	# Narrowed glob (#1476): the retained Rust shim object lives at
 	# pkg/dataplane/userspace_xdp_bpfel.o. Cleaning it would break
@@ -240,17 +240,3 @@ loss-cluster-stop:
 
 loss-cluster-restart:
 	$(LOSS_CLUSTER_SETUP) restart $(NODE)
-
-# --- DPDK targets (require dpdk-dev, meson, ninja) ---
-
-build-dpdk-worker:
-	@echo "==> Building DPDK worker..."
-	cd dpdk_worker && meson setup build --buildtype=release 2>/dev/null || true
-	cd dpdk_worker && meson compile -C build
-
-build-dpdk: build-dpdk-worker
-	@echo "==> Building xpfd with DPDK support..."
-	CGO_ENABLED=1 go build -tags dpdk -ldflags "$(LDFLAGS)" -o xpfd ./cmd/xpfd
-
-clean-dpdk:
-	rm -rf dpdk_worker/build

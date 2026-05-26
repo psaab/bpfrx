@@ -3439,7 +3439,7 @@
   handler path are `request chassis cluster data-plane userspace` via
   cli_request.go:handleRequestChassisClusterDataPlane. Updated plan snippet
   in lockstep so docs match implementation. No code change.
-<<<<<<< HEAD
+
 - **Timestamp**: 2026-05-25T07:30Z
 - **Action**: #1522 plan v2 — pruned bpf/xdp/, bpf/tc/, bpf/headers/ README banner edits per AGY PLAN-NEEDS-MINOR (adversarial-review-mpkub795-6e2gou)
 - **File(s)**: docs/pr/1522-readme-doc-drift/plan.md, docs/pr/1522-readme-doc-drift/reviewer-ids.md
@@ -3663,3 +3663,29 @@
   leaves prove ignored. The strengthened fixture catches BOTH the
   unconditional-validator regression class AND the cos-early-return-removal
   class. Pending re-dispatch.
+
+- **Timestamp**: 2026-05-26T02:15Z
+- **Action**: #1528 Phase B implementation — DPDK mechanical removal complete
+- **File(s)**:
+  - DELETED: dpdk_worker/ (entire tree — 17 C files + headers + meson + cached build/)
+  - DELETED: pkg/dataplane/dpdk/ (entire package — manager.go, dpdk_cgo.go, dpdk_stub.go, fib.go, dpdk_stub_test.go, dpdk_lookup_source_test.go)
+  - EDITED: Makefile (removed build-dpdk-worker, build-dpdk, clean-dpdk targets + .PHONY + clean: clean-dpdk)
+  - EDITED: pkg/config/types.go (deleted DPDKConfig, DPDKAdaptiveConfig, DPDKPort, SystemConfig.DPDKDataplane field)
+  - EDITED: pkg/config/compiler_system.go (deleted case dataplaneTypeDPDK that populated DPDKConfig + compileDPDKDataplane function; left case branch as silent-drop comment)
+  - EDITED: pkg/config/ast.go (rewrote socket-mem schema-node description: "Legacy DPDK socket memory (retired, ignored)")
+  - EDITED: pkg/config/compiler.go (added compileOpts{loadMode}; refactored CompileConfig/CompileConfigForNode to delegate via compileWithOpts; added CompileConfigForLoad + CompileConfigForNodeAndLoad public entry points; gated validateDataplaneTypeStrict on !opts.loadMode)
+  - EDITED: pkg/config/parser_system_test.go (removed DPDKDataplane != nil assertion at line 1382)
+  - EDITED: pkg/config/parser_ast_test.go (added TestCompileConfigForLoad_BypassesDPDKReject + TestCompileConfigForLoad_BypassesDPDKRejectViaApplyGroups; updated compileExpanded test calls to compileOpts{})
+  - EDITED: pkg/configstore/store.go (Store.Load uses new compileTreeForLoad; emits slog.Warn when DataplaneType=="dpdk")
+  - EDITED: pkg/configstore/store_test.go (added TestLoad_PersistedDPDKDataplaneTypeBootsConfigOnly + TestLoad_PersistedDPDKDataplaneTypeWithSubStanzaBootsConfigOnly)
+  - NEW: pkg/cmdtree/schema_validate_test.go (added TestSchemaValidate_AcceptsLegacyDPDKSubStanza with cos-populated fixture per Codex r6 v3.3 minor)
+  - EDITED: pkg/dataplane/retirement_boundary_canary_test.go (deleted dpdkBackendImportForCanary const, dpdkEBPFImportAllowlist, dpdkBackendImportAllowlist; deleted TestDPDKBackendImportStaysBackendLocal + TestDPDKEBPFArtifactImportsStayAtLegacyAdapter + TestRetirementBoundaryDocsMentionDPDKPolicy; removed dpdkBackendImportForCanary check from TestOperatorPackagesDoNotImportBPFArtifactsDirectly)
+  - EDITED: scripts/refactoring-audit.sh (removed dpdk_worker from find paths)
+  - EDITED: docs/pr/1373-retire-ebpf-dataplane/README.md (rewrote #1475 DPDK Backend Policy section as retirement note)
+  - EDITED: pkg/dataplane/README.md (rewrote DPDK retirement paragraph; removed crossed-out DPDK entry)
+  - KEPT: pkg/dataplane/dataplane.go TypeDPDK + ErrDPDKBackendRetired + RegisterBackend/RegisterRuntimeBackend panic guards + case TypeDPDK arms (Phase 1 reject preservation per plan §3 / §5)
+  - KEPT: pkg/config/compiler.go dataplaneTypeDPDK + ErrDPDKDataplaneRetired + validateDataplaneTypeStrict + validDataplaneType("dpdk")=true (Phase 1 reject)
+  - KEPT: pkg/configstore/store_test.go TestCommit_RejectsDPDKDataplaneType (gRPC/REST wrap contract)
+  - KEPT: pkg/dataplane/runtime/import_canary_test.go:47 dpdk forbidden-backend (defense-in-depth)
+  - KEPT: pkg/daemon/daemon_run.go:247 errors.Is(ErrDPDKBackendRetired) soft-fallback (now reachable for stored-config rolling-upgrade)
+- **Why**: Both Codex r7 (task-mpmbxohf-mft8dk) and AGY r5 (adversarial-review-mpmby226-tvzsfa) returned PLAN-READY on plan v3.3. Executed mechanical deletion + load-mode bypass per plan v3.3. All packages build clean (go build ./...). Full go test ./... passes. 5x flake check on all DPDK-related tests passes (25/25 runs). make build succeeds. make -n build-dpdk / clean-dpdk correctly report "no rule".

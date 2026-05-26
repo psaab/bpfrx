@@ -57,10 +57,10 @@
 - Antigravity r4: adversarial-review-mpm8dgta-xdoziu (completed) — **PLAN-READY**
   - Did not flag the fixture-strength minor
 
-### Round 5 — 2026-05-26, plan v3.3 (pending push)
+### Round 5 — 2026-05-26, plan v3.3 (3328cc49)
 
-- Codex r7: (to be dispatched on v3.3 HEAD — inline-content workaround)
-- Antigravity r5: (to be dispatched on v3.3 HEAD)
+- Codex r7: task-mpmbxohf-mft8dk (dispatched ~02:00Z, inline-content workaround)
+- Antigravity r5: adversarial-review-mpmby226-tvzsfa (dispatched ~02:00Z)
 
 ## Code review
 

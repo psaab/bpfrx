@@ -1386,7 +1386,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"dataplane": {desc: "Dataplane configuration", children: map[string]*schemaNode{
 			"cores":          {args: 1, desc: "Number of dataplane cores", children: nil},
 			"memory":         {args: 1, desc: "Dataplane memory allocation", children: nil},
-			"socket-mem":     {args: 1, desc: "DPDK socket memory", children: nil},
+			"socket-mem":     {args: 1, desc: "Legacy DPDK socket memory (retired, ignored)", children: nil},
 			"binary":         {args: 1, desc: "Userspace dataplane helper binary path", children: nil},
 			"control-socket": {args: 1, desc: "Unix control socket path", children: nil},
 			"state-file":     {args: 1, desc: "Helper state file path", children: nil},

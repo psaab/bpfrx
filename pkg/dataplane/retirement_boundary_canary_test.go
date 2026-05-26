@@ -23,7 +23,6 @@ const (
 	repoRootForBoundaryCanary       = "../.."
 	rootDataplaneImportForCanary    = "github.com/psaab/xpf/pkg/dataplane"
 	ciliumEBPFImportForCanary       = "github.com/cilium/ebpf"
-	dpdkBackendImportForCanary      = "github.com/psaab/xpf/pkg/dataplane/dpdk"
 	makefileForCanary               = "../../Makefile"
 	retirementBoundaryDocsForCanary = "../../docs/pr/1373-retire-ebpf-dataplane/README.md"
 	userspaceXDPEntryProgForCanary  = "xdp_userspace_prog"
@@ -67,24 +66,6 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"pkg/grpcapi/server_show_status.go":        "status output still reads legacy dataplane state",
 	"pkg/grpcapi/server_show_zones.go":         "zone output still uses legacy dataplane types",
 }
-
-var dpdkEBPFImportAllowlist = map[string]string{
-	// After #1527 (Phase 2) the DPDK package is no longer linked
-	// into the default xpfd binary and has no production callers
-	// outside test code.  Phase 3 (#1528) deletes the package
-	// entirely.  The retained allowlist entry covers the in-tree
-	// retired stub's legacy DataPlane Map(string) *ebpf.Map
-	// signature so the package still compiles cleanly until Phase
-	// 3 removes it.
-	"pkg/dataplane/dpdk/manager.go": "retired in-tree DPDK stub keeps legacy DataPlane Map() *ebpf.Map signature until Phase 3 (#1528) deletes the package",
-}
-
-// dpdkBackendImportAllowlist is intentionally empty after Phase 2
-// of the DPDK retirement (#1527, umbrella #1525).  The DPDK package
-// remains in-tree but no production package outside
-// pkg/dataplane/dpdk/ may import it.  Phase 3 (#1528) removes the
-// package entirely.
-var dpdkBackendImportAllowlist = map[string]string{}
 
 // retainedShimBoundaryBuildTagAllowlist enumerates files that may
 // carry non-default Go build constraints inside the retained shim
@@ -170,13 +151,6 @@ func TestOperatorPackagesDoNotImportBPFArtifactsDirectly(t *testing.T) {
 			if imp == ciliumEBPFImportForCanary || strings.HasPrefix(imp, ciliumEBPFImportForCanary+"/") {
 				violations = append(violations, rel+" imports "+imp)
 			}
-			if imp == dpdkBackendImportForCanary || strings.HasPrefix(imp, dpdkBackendImportForCanary+"/") {
-				// After Phase 2 of #1525 (boot-path decouple,
-				// #1527) no operator-runtime production file may
-				// import pkg/dataplane/dpdk.  The previous
-				// cmd/xpfd/main.go exemption is removed.
-				violations = append(violations, rel+" imports "+imp)
-			}
 		}
 	}
 
@@ -186,85 +160,19 @@ func TestOperatorPackagesDoNotImportBPFArtifactsDirectly(t *testing.T) {
 	}
 }
 
-func TestDPDKBackendImportStaysBackendLocal(t *testing.T) {
-	t.Parallel()
+// TestDPDKBackendImportStaysBackendLocal was deleted in #1528 along
+// with the pkg/dataplane/dpdk package itself. With the backend
+// package gone, the Go compiler enforces the "no DPDK import"
+// invariant directly — any operator-runtime file that tried to
+// import the deleted path would fail to build. The remaining
+// defense-in-depth canary lives at
+// pkg/dataplane/runtime/import_canary_test.go:47 which keeps
+// `github.com/psaab/xpf/pkg/dataplane/dpdk` in the forbidden-import
+// list for the runtime package, blocking accidental revival.
 
-	found := map[string]bool{}
-	var violations []string
-	for _, path := range productionGoFilesUnder(t, []string{
-		filepath.Join(repoRootForBoundaryCanary, "cmd"),
-		filepath.Join(repoRootForBoundaryCanary, "pkg"),
-	}) {
-		rel := repoRelativePath(t, path)
-		if strings.HasPrefix(rel, "pkg/dataplane/dpdk/") {
-			continue
-		}
-		for _, imp := range importPaths(t, path) {
-			if imp == dpdkBackendImportForCanary || strings.HasPrefix(imp, dpdkBackendImportForCanary+"/") {
-				if _, ok := dpdkBackendImportAllowlist[rel]; ok {
-					found[rel] = true
-				} else {
-					violations = append(violations, rel+" imports "+imp)
-				}
-			}
-		}
-	}
-
-	var stale []string
-	for rel := range dpdkBackendImportAllowlist {
-		if !found[rel] {
-			stale = append(stale, rel)
-		}
-	}
-
-	if len(violations) > 0 || len(stale) > 0 {
-		sort.Strings(violations)
-		sort.Strings(stale)
-		t.Fatalf(
-			"DPDK backend import allowlist drift\nunexpected imports: %v\nstale allowlist entries: %v",
-			violations,
-			stale,
-		)
-	}
-}
-
-func TestDPDKEBPFArtifactImportsStayAtLegacyAdapter(t *testing.T) {
-	t.Parallel()
-
-	found := map[string]bool{}
-	var unexpected []string
-	for _, path := range productionGoFilesUnder(t, []string{
-		filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "dpdk"),
-	}) {
-		rel := repoRelativePath(t, path)
-		for _, imp := range importPaths(t, path) {
-			if imp != ciliumEBPFImportForCanary && !strings.HasPrefix(imp, ciliumEBPFImportForCanary+"/") {
-				continue
-			}
-			found[rel] = true
-			if _, ok := dpdkEBPFImportAllowlist[rel]; !ok {
-				unexpected = append(unexpected, rel+" imports "+imp)
-			}
-		}
-	}
-
-	var stale []string
-	for rel := range dpdkEBPFImportAllowlist {
-		if !found[rel] {
-			stale = append(stale, rel)
-		}
-	}
-
-	if len(unexpected) > 0 || len(stale) > 0 {
-		sort.Strings(unexpected)
-		sort.Strings(stale)
-		t.Fatalf(
-			"DPDK eBPF artifact import policy drift\nunexpected imports: %v\nstale allowlist entries: %v",
-			unexpected,
-			stale,
-		)
-	}
-}
+// TestDPDKEBPFArtifactImportsStayAtLegacyAdapter was deleted in
+// #1528. The canary policed a package (pkg/dataplane/dpdk) that no
+// longer exists.
 
 func TestUserspaceXDPGenerateTargetStaysDecoupledFromLegacyBPF(t *testing.T) {
 	t.Parallel()
@@ -1772,34 +1680,12 @@ func TestDaemonRuntimeEntryPointUsesRuntimeDataPlane(t *testing.T) {
 	}
 }
 
-func TestRetirementBoundaryDocsMentionDPDKPolicy(t *testing.T) {
-	t.Parallel()
-
-	data, err := os.ReadFile(retirementBoundaryDocsForCanary)
-	if err != nil {
-		t.Fatalf("read retirement boundary docs: %v", err)
-	}
-	text := string(data)
-
-	want := []string{
-		"## #1475 DPDK Backend Policy",
-		"DPDK remains a separately supported backend",
-		"outside the eBPF source-removal path",
-		"`pkg/dataplane/dpdk`",
-		"`cmd/xpfd/main.go`",
-		"`-tags dpdk`",
-		"root `DataPlane`",
-	}
-	var missing []string
-	for _, token := range want {
-		if !strings.Contains(text, token) {
-			missing = append(missing, token)
-		}
-	}
-	if len(missing) > 0 {
-		t.Fatalf("retirement docs do not mention DPDK policy tokens: %v", missing)
-	}
-}
+// TestRetirementBoundaryDocsMentionDPDKPolicy was deleted in #1528.
+// The canary pinned a "DPDK remains a separately supported backend"
+// policy that is no longer true after the umbrella retirement in
+// #1525. The associated section in
+// docs/pr/1373-retire-ebpf-dataplane/README.md is rewritten as a
+// retirement note pointing at #1525.
 
 func TestRetirementBoundaryDocsMentionShimEscapeAssumptions(t *testing.T) {
 	t.Parallel()

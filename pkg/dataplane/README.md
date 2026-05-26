@@ -24,12 +24,15 @@ CLI, and cluster-sync callers that have not moved to domain interfaces still
 receive a temporary compatibility handle.
 
 DPDK retirement (#1525): the historical #1475 policy that retained DPDK as
-a separately supported DPDK-build backend applied pre-retirement; the
+a separately supported DPDK-build backend is no longer in force. The
 `pkg/dataplane/dpdk` bridge, the `cmd/xpfd/main.go` blank registration
-import, and the canary allowlist entries are removed in #1527/#1528. Until
-those PRs land, the canary-pinned `#1475 DPDK Backend Policy` section in
+import, and the canary allowlist entries were removed in #1527/#1528. The
 [`docs/pr/1373-retire-ebpf-dataplane/README.md`](../../docs/pr/1373-retire-ebpf-dataplane/README.md)
-preserves the pre-retirement contract verbatim as a historical anchor.
+"DPDK Backend Retired (#1525)" section now describes the remaining
+Phase 1 reject machinery (commit-time `ErrDPDKDataplaneRetired`,
+`TypeDPDK` sentinel, runtime `ErrDPDKBackendRetired`) which is kept
+for one release cycle to preserve the operator-friendly migration
+message for stored-config rolling upgrade.
 
 The userspace backend's status wire format is mirrored here for CLI/API
 consumers. CoS queue status includes queue-scoped drain-phase counters so
@@ -41,8 +44,8 @@ sent while exact queues were still backlogged.
 - `DataPlane` — `dataplane.go`. Legacy BPF-shaped interface kept for the
   legacy eBPF compiler and compatibility adapters (DPDK retired #1525). New
   daemon-facing code should not add methods here.
-- ~~`pkg/dataplane/dpdk.Manager` — DPDK implementation.~~ Retired in #1525;
-  the `pkg/dataplane/dpdk` package is deleted in #1528.
+- DPDK backend deleted in #1528 (umbrella #1525). The `pkg/dataplane/dpdk`
+  package no longer exists.
 - `RuntimeDataPlane`, `ConfigSink`, `SessionStore`, `Telemetry`,
   `HAController`, and `LinkController` — `apply.go` and `session_store.go`.
   These are the split-domain interfaces used by daemon startup and runtime

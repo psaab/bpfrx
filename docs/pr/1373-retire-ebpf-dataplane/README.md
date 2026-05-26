@@ -81,39 +81,39 @@ owning `dataplane.RuntimeDataPlane` and must call
 production-code canary; `_test.go` files may still import lower-level helpers
 when they need backend fixtures for regression coverage.
 
-## #1475 DPDK Backend Policy
+## #1475 DPDK Backend Retired (#1525)
 
-DPDK remains a separately supported backend for DPDK-specific binaries, but it
-is explicitly outside the eBPF source-removal path until it migrates off the
-root `DataPlane` interface. The current DPDK implementation still satisfies
-both `dataplane.DataPlane` and `dataplane.RuntimeDataPlane`; that is a
-backend-local compatibility exception, not a reason for userspace retirement
-work to grow new dependencies on the legacy BPF-shaped surface.
+The DPDK backend was retired in umbrella #1525. Phase 1 (#1526)
+shipped the commit-time reject; Phase 2 (#1527) removed the boot-path
+import and backend registration; Phase 3 (#1528) deleted the
+`dpdk_worker/` C tree, `pkg/dataplane/dpdk/` Go package, Makefile
+DPDK targets, and the `DPDKConfig` schema fields. Phase 4 (#1529)
+swept documentation surfaces.
 
-The allowed production boundary is narrow:
+After #1528, the only DPDK-related code that remains is:
 
-- `pkg/dataplane/dpdk` may import root `pkg/dataplane` types and helpers while
-  it owns the DPDK compatibility bridge.
-- `cmd/xpfd/main.go` may keep the blank DPDK import for backend registration.
-- No other production `cmd/*` or `pkg/*` package may import
-  `pkg/dataplane/dpdk`.
-- The only allowed DPDK import of `github.com/cilium/ebpf` is the existing
-  `pkg/dataplane/dpdk/manager.go` adapter for the legacy `Map(string)
-  *ebpf.Map` method. Adding more eBPF artifact imports to DPDK requires an
-  explicit backend-policy update.
+- The Phase 1 commit-time reject in `pkg/config/compiler.go`
+  (`dataplaneTypeDPDK`, `ErrDPDKDataplaneRetired`,
+  `validateDataplaneTypeStrict`) — kept for one release cycle so
+  `commit` produces the operator-friendly migration message rather
+  than a generic "unknown dataplane-type".
+- The runtime sentinel in `pkg/dataplane/dataplane.go` (`TypeDPDK`,
+  `ErrDPDKBackendRetired`, registry panic guards) — kept for the
+  same window.
+- A load-mode bypass on `validateDataplaneTypeStrict` in
+  `pkg/configstore/Store.Load` (#1528 §4.6) so a node booting with
+  a pre-#1526 persisted `system dataplane-type dpdk` config can
+  still load. The daemon then runs in config-only mode via the
+  existing `daemon_run.go:247` `errors.Is(err, ErrDPDKBackendRetired)`
+  soft-fallback.
+- A defense-in-depth forbidden-import entry in
+  `pkg/dataplane/runtime/import_canary_test.go:47` that blocks
+  re-introduction of `github.com/psaab/xpf/pkg/dataplane/dpdk` as
+  an import from the runtime package.
 
-The default non-DPDK build keeps the package present so registration and tests
-compile, but `system dataplane-type dpdk` does not silently start a stub
-dataplane: `pkg/dataplane/dpdk` returns a clear startup error unless the daemon
-binary was built with `-tags dpdk` and libdpdk support. Config validation still
-accepts `dpdk` as a valid backend name and rejects unknown backend names before
-daemon startup.
-
-The #1475 canaries in `pkg/dataplane/retirement_boundary_canary_test.go` enforce
-the import boundary above and require this policy text to stay present. DPDK
-builds remain blocked on migrating away from root `DataPlane`; userspace-only
-production source removal must not depend on solving that DPDK migration in the
-same PR.
+A future cleanup PR after the release-cycle window may delete the
+remaining Phase 1 reject machinery once the rolling-upgrade
+window is closed.
 
 ## #1473 Userspace XDP Shim Build Split
 

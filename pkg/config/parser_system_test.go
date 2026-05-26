@@ -1380,9 +1380,8 @@ func TestDataplaneWorkersOmittedTypeUsesUserspaceDefault(t *testing.T) {
 	if cfg.System.DataplaneType != "" {
 		t.Fatalf("DataplaneType = %q, want omitted empty value", cfg.System.DataplaneType)
 	}
-	if cfg.System.DPDKDataplane != nil {
-		t.Fatalf("DPDKDataplane = %+v, want nil for omitted dataplane-type", cfg.System.DPDKDataplane)
-	}
+	// The DPDKDataplane field was deleted in #1528. Omitted dataplane-type
+	// defaults to userspace; nothing else to assert about DPDK here.
 	if cfg.System.UserspaceDataplane == nil {
 		t.Fatal("expected UserspaceDataplane to be populated")
 	}
