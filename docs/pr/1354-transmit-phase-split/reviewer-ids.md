@@ -7,5 +7,11 @@
 
 ## Round 2 (code review)
 
-- Codex: `task-mpn40ay5-4tl4o0`
-- Gemini: `task-mpn410r1-956tp5`
+- Codex: `task-mpn40ay5-4tl4o0` — MERGE-NEEDS-MINOR (doc drift only)
+- Gemini: `task-mpn410r1-956tp5` — MERGE-READY
+- Copilot: COMMENTED with 2 inline notes (kernel-acknowledged wording + per-tick framing) — both addressed in commit 53fc7638
+
+## Round 3 (re-attestation after doc fixes)
+
+- Codex: `task-mpn4ghyj-plbftk`
+- Copilot: re-requested via `@copilot review` comment on PR #1586
