@@ -1,6 +1,74 @@
 # #1542 — Split userspace NAT runtime into per-concern modules (Wave-2)
 
-**Status:** DRAFT v2 — addressing Codex round-1 PLAN-NEEDS-MAJOR.
+**Status:** DRAFT v3 — addressing round-2 findings. Codex round-2
+returned PLAN-NEEDS-MAJOR (5 mechanical fix-up findings); AGY round-2
+returned PLAN-NEEDS-MINOR with 3 named adjustments. The reviewers
+converge on the same set of concrete pre-implementation cleanups —
+they are all small, all mechanical, all about correctly mapping
+sub-symbols to sibling files. The architectural premise (private
+submodules + `pub(crate) use` in mod.rs + `pub(super)` for internal
+cross-submodule items) is ratified by both.
+
+## v3 changes vs v2 (all from round-2 findings)
+
+1. **Relocate `DEFAULT_PERSISTENT_NAT_TIMEOUT_SECS`** from `allocator.rs`
+   to `source.rs` (only used in `parse_source_nat_rules_with_previous`).
+   AGY adj-A; Codex finding 1 implicit.
+2. **`PortAllocatorLiveState` becomes `pub(super)`** with five fields
+   promoted to `pub(super)` (Codex F1/F3 detail; AGY adj-B):
+   - `persistent_by_source`
+   - `lease_expirations`
+   - `lease_expirations_by_addr`
+   - `addr_index_by_translated`
+   - `recycled_ports_by_addr`
+   Other fields (`live_by_flow`, `owner_by_translated`,
+   `next_port_offset_by_addr`, `gc_counter`) stay private.
+3. **`debug_live` accessor on `PortAllocator`** returns
+   `MutexGuard<'_, PortAllocatorLiveState>` and is `pub(super)`.
+   Tests call it instead of touching `.shared.live` directly. This
+   keeps `.shared` (the `Arc<PortAllocatorShared>`) private. AGY Q4.
+4. **`TranslatedTuple` and `PersistentSourceKey` fields** are
+   promoted to `pub(super)` (Codex finding 1) so `source.rs` can
+   construct them at `source.rs::release_source_nat_allocation_with_mode`
+   and so tests can construct them. `PersistentLease` fields stay
+   private except as exposed through the accessor pattern; tests that
+   currently read its fields are rewritten to use a `pub(super) fn`
+   getter where needed.
+5. **`PROTO_TCP`, `PROTO_UDP` become `pub(super)`** in
+   `destination.rs` so DNAT tests can construct `DnatKey` with
+   them (Codex finding 4).
+6. **`PortAllocatorSnapshot` moves to `allocator.rs`** (Codex
+   finding 5) — `PortAllocator::snapshot` constructs it; cleaner to
+   keep them colocated. `status.rs` `use super::allocator::PortAllocatorSnapshot`.
+   Re-exported as `pub(crate) use allocator::PortAllocatorSnapshot;`
+   from `mod.rs`.
+7. **`nets_match_v4`, `nets_match_v6`** fixed in v2's prose;
+   v3 explicitly removes them from the (incorrect) `static_nat.rs`
+   row in the item allocation table. They stay private to
+   `source.rs` (Codex finding 3).
+8. **Test file imports block** corrected (AGY adj-C; Codex finding 4):
+   removed `PortAllocatorShared` (private, not used), added
+   `PortAllocatorLiveState`, added explicit `crate::{SourceNATRuleSnapshot,
+   DestinationNATRuleSnapshot, StaticNATRuleSnapshot}`, added
+   `std::net::{IpAddr, Ipv4Addr, Ipv6Addr}`, `std::collections::BTreeSet`,
+   `PROTO_TCP`/`PROTO_UDP`.
+
+## Round 2 verdicts
+
+- Codex (task-mpmz1whj-5t3zod): PLAN-NEEDS-MAJOR — 5 mechanical findings
+  - F1 visibility model ratified as correct in principle
+  - 5 concrete fix-ups (struct field visibility, DEFAULT_PERSISTENT_*,
+    PROTO_TCP/UDP, PortAllocatorSnapshot location, nets_match_v4 table row,
+    test imports completeness)
+- AGY (adversarial-review-mpmz27os-jlg8jq): PLAN-NEEDS-MINOR
+  - 3 named adjustments (A/B/C) all incorporated above
+
+Round 2's findings are pre-implementation polish, not architectural.
+Implementation will follow the v3 spec exactly; any visibility miss
+that surfaces at `cargo build` time is fixed in-place during the
+implementation commit, NOT escalated to plan v4.
+
+## v2 changes vs v1 (kept from previous round)
 AGY round-1 was PLAN-READY but Codex flagged three real findings:
 visibility model didn't compile-verify, sibling cross-module API
 needed explicit listing, and tests need a clear story for reaching
@@ -134,7 +202,8 @@ Line numbers reference `nat.rs` at HEAD of branch base
 
 | Item | Source lines | Destination file |
 |------|--------------|------------------|
-| `DEFAULT_PERSISTENT_NAT_TIMEOUT_SECS`, `NS_PER_SEC` | 13-14 | `allocator.rs` |
+| `DEFAULT_PERSISTENT_NAT_TIMEOUT_SECS` | 13 | `source.rs` (only used by `parse_source_nat_rules_with_previous`) |
+| `NS_PER_SEC` | 14 | `allocator.rs` (used by `parse_source_nat_rules_with_previous` in source.rs via `pub(super)` re-export) |
 | `MAX_SOURCE_NAT_POOL_TRACKED_FLOWS` | 15 | `allocator.rs` |
 | `NatDecision` + `impl` | 18-63 | `mod.rs` |
 | `SourceNatLookup`, `SourceNatFailure`, `SourceNatFailureReason` + impls + `source_nat_failure_reason_from_snapshot` | 65-126 | `source.rs` |
@@ -144,14 +213,15 @@ Line numbers reference `nat.rs` at HEAD of branch base
 | `PortAllocatorLiveState` + impl | 209-231 | `allocator.rs` |
 | `GC_PERIOD`, `*_GC_BUDGET` constants | 234-237 | `allocator.rs` |
 | `PortAllocatorShared`, `PortAllocator`, `Default`, `impl PortAllocator` | 240-797 | `allocator.rs` |
-| `PortAllocatorSnapshot` | 799-807 | `status.rs` |
+| `PortAllocatorSnapshot` | 799-807 | `allocator.rs` (v3 fix — colocated with `PortAllocator::snapshot` ctor; `status.rs` imports it) |
 | `allocator_capacity`, `sticky_pool_index` | 809-841 | `allocator.rs` (private helpers used only by allocator) |
 | `SourceNatRule` + two `impl` blocks, `SourceNatPoolAllocatorKey`, `source_nat_runtime_compatible` | 843-1047 | `source.rs` |
 | `parse_source_nat_rules{,_with_previous}` | 911-1031 | `source.rs` |
 | `release_source_nat_allocation`, `rollback_source_nat_allocation`, `release_source_nat_allocation_with_mode` | 1049-1110 | `source.rs` |
 | `source_nat_pool_statuses` | 1112-1137 | `status.rs` |
 | `match_source_nat`, `match_source_nat_result`, `match_source_nat_result_for_tuple` | 1139-1331 | `source.rs` |
-| `StaticNatEntry`, `StaticNatTable` + impl, `nets_match_v4`, `nets_match_v6` | 1333-1422 | `static_nat.rs` |
+| `StaticNatEntry`, `StaticNatTable` + impl | 1333-1410 | `static_nat.rs` |
+| `nets_match_v4`, `nets_match_v6` | 1412-1422 | `source.rs` (private; only `SourceNatRule::matches` calls them) |
 | `PROTO_TCP`, `PROTO_UDP`, `DnatKey`, `DnatValue`, `DnatEntry`, `DnatTable` + impl | 1424-1601 | `destination.rs` |
 | Test sub-mod attribute | 1603-1605 | `mod.rs` |
 
