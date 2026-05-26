@@ -1514,3 +1514,109 @@ func TestCommit_AcceptsUserspaceDataplaneType(t *testing.T) {
 		t.Fatalf("Commit for userspace dataplane-type: %v", err)
 	}
 }
+
+// TestLoad_PersistedDPDKDataplaneTypeRewrittenByLoad exercises the
+// rewriteRetiredDataplaneType bridge introduced by #1558 (eBPF
+// retirement) and re-confirmed for DPDK at #1528. A pre-#1526
+// persisted `set system dataplane-type dpdk` must survive
+// Store.Load() so the daemon can come up rather than failing to
+// load entirely (operational blackout). The rewrite strips the
+// retired leaf so the compiled config carries no DataplaneType
+// (defaulting to userspace); the operator's next commit persists
+// the cleanup. See pkg/configstore/dataplane_retire.go.
+func TestLoad_PersistedDPDKDataplaneTypeRewrittenByLoad(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config")
+
+	// Write a tree containing dataplane-type dpdk directly via
+	// the db API (commit path would reject it).
+	writer := New(cfgPath)
+	tree := &config.ConfigTree{}
+	path, err := config.ParseSetCommand("set system dataplane-type dpdk")
+	if err != nil {
+		t.Fatalf("ParseSetCommand: %v", err)
+	}
+	if err := tree.SetPath(path); err != nil {
+		t.Fatalf("SetPath: %v", err)
+	}
+	if err := writer.db.WriteActive(tree); err != nil {
+		t.Fatalf("db.WriteActive: %v", err)
+	}
+
+	// Fresh reader store on the same disk path. Load() must succeed
+	// because rewriteRetiredDataplaneType strips the dpdk leaf to
+	// empty before compile (#1558 / #1525). ActiveConfig must be
+	// non-nil with DataplaneType empty (defaults to userspace).
+	reader := New(cfgPath)
+	if err := reader.Load(); err != nil {
+		t.Fatalf("Load() rejected persisted dpdk dataplane-type: %v", err)
+	}
+	active := reader.ActiveConfig()
+	if active == nil {
+		t.Fatal("ActiveConfig() returned nil after Load with persisted dpdk")
+	}
+	if active.System.DataplaneType != "" {
+		t.Fatalf("ActiveConfig().System.DataplaneType = %q, want \"\" (rewritten by Load)",
+			active.System.DataplaneType)
+	}
+}
+
+// TestLoad_PersistedDPDKDataplaneTypeWithSubStanzaRewrittenByLoad
+// (Codex r5 lock-in from plan v3.2/v3.3) — exercises the full
+// comprehensive legacy DPDK shape (dataplane-type + cores + memory +
+// socket-mem + rx-mode + ports + adaptive sub-block) through
+// Store.Load to confirm:
+//
+//  1. rewriteRetiredDataplaneType strips `system dataplane-type dpdk`
+//     to empty so the compile path succeeds.
+//  2. The orphan sub-stanza (cores, memory, ports, etc) does not
+//     cause schemaValidateExpandedTree or compileExpanded to fail.
+//
+// If a future PR expands cmdtree.SchemaValidate to walk
+// `system dataplane`, this test fires and forces the author to
+// coordinate with rewriteRetiredDataplaneType.
+func TestLoad_PersistedDPDKDataplaneTypeWithSubStanzaRewrittenByLoad(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config")
+
+	writer := New(cfgPath)
+	tree := &config.ConfigTree{}
+	for _, line := range []string{
+		"set system dataplane-type dpdk",
+		"set system dataplane cores 2-5",
+		"set system dataplane memory 2048",
+		"set system dataplane socket-mem \"1024,1024\"",
+		"set system dataplane rx-mode adaptive",
+		"set system dataplane rx-mode idle-threshold 256",
+		"set system dataplane rx-mode resume-threshold 32",
+		"set system dataplane rx-mode sleep-timeout 100",
+		"set system dataplane ports 0000:03:00.0 interface wan0",
+		"set system dataplane ports 0000:03:00.0 rx-mode polling",
+		"set system dataplane ports 0000:03:00.0 cores 2-3",
+		"set system dataplane ports 0000:06:00.0 interface trust0",
+	} {
+		path, err := config.ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	if err := writer.db.WriteActive(tree); err != nil {
+		t.Fatalf("db.WriteActive: %v", err)
+	}
+
+	reader := New(cfgPath)
+	if err := reader.Load(); err != nil {
+		t.Fatalf("Load() rejected persisted full DPDK sub-stanza: %v", err)
+	}
+	active := reader.ActiveConfig()
+	if active == nil {
+		t.Fatal("ActiveConfig() returned nil after Load with persisted full DPDK sub-stanza")
+	}
+	if active.System.DataplaneType != "" {
+		t.Fatalf("ActiveConfig().System.DataplaneType = %q, want \"\" (rewritten by Load)",
+			active.System.DataplaneType)
+	}
+}

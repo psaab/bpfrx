@@ -58,7 +58,7 @@ categorize() {
 audit_rust() {
     # userspace-xdp/src: Aya/eBPF Rust programs (lib.rs is the sole entry point,
     # currently 1373 L but grows with each new protocol handler).
-    find userspace-dp/src userspace-xdp/src dpdk_worker -name '*.rs' 2>/dev/null \
+    find userspace-dp/src userspace-xdp/src -name '*.rs' 2>/dev/null \
         | grep -vE "$SKIP_RE" \
         | while read -r f; do
             loc=$(wc -l < "$f")
@@ -69,7 +69,7 @@ audit_rust() {
 }
 
 audit_go() {
-    find pkg cmd dpdk_worker -name '*.go' 2>/dev/null \
+    find pkg cmd -name '*.go' 2>/dev/null \
         | grep -vE "$SKIP_RE" \
         | while read -r f; do
             loc=$(wc -l < "$f")

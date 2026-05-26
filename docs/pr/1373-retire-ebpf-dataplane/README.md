@@ -81,39 +81,52 @@ owning `dataplane.RuntimeDataPlane` and must call
 production-code canary; `_test.go` files may still import lower-level helpers
 when they need backend fixtures for regression coverage.
 
-## #1475 DPDK Backend Policy
+## #1475 DPDK Backend Retired (#1525)
 
-DPDK remains a separately supported backend for DPDK-specific binaries, but it
-is explicitly outside the eBPF source-removal path until it migrates off the
-root `DataPlane` interface. The current DPDK implementation still satisfies
-both `dataplane.DataPlane` and `dataplane.RuntimeDataPlane`; that is a
-backend-local compatibility exception, not a reason for userspace retirement
-work to grow new dependencies on the legacy BPF-shaped surface.
+The DPDK backend was retired in umbrella #1525. The retirement
+shipped in four phases:
 
-The allowed production boundary is narrow:
+- Phase 1 (#1526, merged): commit-time reject for `set system
+  dataplane-type dpdk`.
+- Phase 2 (#1527, merged): boot-path decouple — removed the blank
+  registration import from `cmd/xpfd/main.go` and the backend
+  registration in `pkg/dataplane/dpdk/manager.go`.
+- Phase 4 (#1529, merged): documentation sweep across the doc tree
+  (landed before Phase 3 because the canary-pinned text strings
+  that pre-#1528 forbade direct rewrite are addressed here in
+  Phase 3 by deleting the canaries themselves).
+- Phase 3 (#1528, this PR): mechanical deletion of `dpdk_worker/`
+  C tree, `pkg/dataplane/dpdk/` Go package, Makefile DPDK
+  targets, `DPDKConfig`/`DPDKAdaptiveConfig`/`DPDKPort` schema
+  types, the `SystemConfig.DPDKDataplane` field, and the
+  retirement-boundary canary entries that policed the now-deleted
+  package.
 
-- `pkg/dataplane/dpdk` may import root `pkg/dataplane` types and helpers while
-  it owns the DPDK compatibility bridge.
-- `cmd/xpfd/main.go` may keep the blank DPDK import for backend registration.
-- No other production `cmd/*` or `pkg/*` package may import
-  `pkg/dataplane/dpdk`.
-- The only allowed DPDK import of `github.com/cilium/ebpf` is the existing
-  `pkg/dataplane/dpdk/manager.go` adapter for the legacy `Map(string)
-  *ebpf.Map` method. Adding more eBPF artifact imports to DPDK requires an
-  explicit backend-policy update.
+After #1528, the only DPDK-related code that remains is:
 
-The default non-DPDK build keeps the package present so registration and tests
-compile, but `system dataplane-type dpdk` does not silently start a stub
-dataplane: `pkg/dataplane/dpdk` returns a clear startup error unless the daemon
-binary was built with `-tags dpdk` and libdpdk support. Config validation still
-accepts `dpdk` as a valid backend name and rejects unknown backend names before
-daemon startup.
+- The Phase 1 commit-time reject in `pkg/config/compiler.go`
+  (`dataplaneTypeDPDK`, `ErrDPDKDataplaneRetired`,
+  `validateDataplaneTypeStrict`) — kept for one release cycle so
+  `commit` produces the operator-friendly migration message rather
+  than a generic "unknown dataplane-type".
+- The runtime sentinel in `pkg/dataplane/dataplane.go` (`TypeDPDK`,
+  `ErrDPDKBackendRetired`, registry panic guards) — kept for the
+  same window.
+- The `rewriteRetiredDataplaneType` bridge in
+  `pkg/configstore/dataplane_retire.go`, invoked from both
+  `Store.Load` and `Store.SyncApply` before compile, which strips
+  the `system dataplane-type dpdk` leaf so a node booting with a
+  pre-#1526 persisted DPDK config loads cleanly and runs as the
+  default `userspace` dataplane. (This replaces the pre-rebase
+  plan-v3 `compileTreeForLoad` load-mode bypass.)
+- A defense-in-depth forbidden-import entry in
+  `pkg/dataplane/runtime/import_canary_test.go:47` that blocks
+  re-introduction of `github.com/psaab/xpf/pkg/dataplane/dpdk` as
+  an import from the runtime package.
 
-The #1475 canaries in `pkg/dataplane/retirement_boundary_canary_test.go` enforce
-the import boundary above and require this policy text to stay present. DPDK
-builds remain blocked on migrating away from root `DataPlane`; userspace-only
-production source removal must not depend on solving that DPDK migration in the
-same PR.
+A future cleanup PR after the release-cycle window may delete the
+remaining Phase 1 reject machinery once the rolling-upgrade
+window is closed.
 
 ## #1473 Userspace XDP Shim Build Split
 

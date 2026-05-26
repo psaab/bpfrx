@@ -257,6 +257,12 @@ func compileExpanded(tree *ConfigTree) (*Config, error) {
 	// (the no-leak contract is pinned by
 	// TestDataplaneTypeDPDKRejectedAtCommitFiresFirst in
 	// parser_ast_test.go).
+	//
+	// Store.Load and Store.SyncApply tolerate retired-backend
+	// configs via rewriteRetiredDataplaneType which strips the
+	// retired leaf from the AST before compile (#1373 ebpf +
+	// #1525 dpdk handle both this way). See
+	// pkg/configstore/dataplane_retire.go.
 	if err := validateDataplaneTypeStrict(cfg); err != nil {
 		return nil, err
 	}
@@ -294,22 +300,14 @@ func compileExpanded(tree *ConfigTree) (*Config, error) {
 		}
 	}
 
-	// #1539: structural invariant against AST leakage / shadow
-	// execution of retired DPDK sub-tree fields.
-	// validateDataplaneTypeStrict above has already rejected every
-	// committed config that selects the retired DPDK backend; on the
-	// success path the only way cfg.System.DPDKDataplane could still
-	// be non-nil is if a future compiler entry path forgets to call
-	// the strict validator. Force the field to nil here so that any
-	// future helper / reader of the form
-	//   if cfg.System.DPDKDataplane != nil { /* DPDK-only logic */ }
-	// is statically dead on every committed config without requiring
-	// the caller to also gate on effectiveDataplaneType. This is dead
-	// code after #1528 (Phase 3) deletes the field entirely; remove
-	// this line in #1528. `cfg` is initialized via `cfg := &Config{...}`
-	// at the top of compileExpanded and never reassigned, so a nil
-	// guard would be dead defense (Copilot finding on PR #1553).
-	cfg.System.DPDKDataplane = nil
+	// #1539: the structural invariant `cfg.System.DPDKDataplane = nil`
+	// was added on master (PR #1553) as a runtime safeguard against
+	// AST leakage of retired DPDK sub-tree fields. After this PR
+	// deletes the DPDKDataplane field entirely (per #1539 author's
+	// explicit note: "This is dead code after #1528 (Phase 3) deletes
+	// the field entirely; remove this line in #1528"), the field no
+	// longer exists, so the Go compiler enforces the invariant at
+	// compile time — there is no value to nil out.
 
 	return cfg, nil
 }

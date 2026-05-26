@@ -233,16 +233,25 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 				if err := compileUserspaceDataplane(child, sys.UserspaceDataplane); err != nil {
 					return err
 				}
-			case dataplaneTypeDPDK:
-				if sys.DPDKDataplane == nil {
-					sys.DPDKDataplane = &DPDKConfig{}
-				}
-				if err := compileDPDKDataplane(child, sys.DPDKDataplane); err != nil {
-					return err
-				}
 			case dataplaneTypeEBPF:
-				// The legacy eBPF dataplane has no system dataplane
-				// sub-stanza. Do not route it through DPDK.
+				// The legacy eBPF dataplane has no system dataplane sub-stanza.
+			case dataplaneTypeDPDK:
+				// DPDK retired in #1525 / #1528. This branch is reachable
+				// only from a direct CompileConfig call on a tree that still
+				// carries a `dataplane-type dpdk` leaf — i.e., a commit-path
+				// candidate. Store.Load and Store.SyncApply both call
+				// rewriteRetiredDataplaneType before compile, which strips
+				// the `dataplane-type dpdk` leaf so sys.DataplaneType == ""
+				// (→ userspace) and this branch is never entered; the
+				// sub-stanza children hit compileUserspaceDataplane instead
+				// and are silently dropped there as unknown keys.
+				//
+				// For the direct-compile case the sub-stanza children
+				// (cores, memory, socket-mem, rx-mode, ports) are silently
+				// dropped here because the DPDKConfig type is deleted.
+				// validateDataplaneTypeStrict in compileExpanded fires
+				// immediately after compileSystem and returns
+				// ErrDPDKDataplaneRetired, so the no-op here is inconsequential.
 			}
 		case "syslog":
 			sys.Syslog = &SystemSyslogConfig{}
@@ -397,65 +406,6 @@ func hasDNSProxyChild(node *Node) bool {
 		}
 	}
 	return false
-}
-
-func compileDPDKDataplane(node *Node, cfg *DPDKConfig) error {
-	for _, child := range node.Children {
-		switch child.Name() {
-		case "cores":
-			if v := nodeVal(child); v != "" {
-				cfg.Cores = v
-			}
-		case "memory":
-			if v := nodeVal(child); v != "" {
-				cfg.Memory, _ = strconv.Atoi(v)
-			}
-		case "socket-mem":
-			if v := nodeVal(child); v != "" {
-				cfg.SocketMem = v
-			}
-		case "rx-mode":
-			// rx-mode can be a simple value ("polling") or a block ("adaptive { ... }")
-			if v := nodeVal(child); v != "" {
-				cfg.RXMode = v
-			}
-			if cfg.RXMode == "adaptive" {
-				cfg.AdaptiveConfig = &DPDKAdaptiveConfig{}
-				for _, ac := range child.Children {
-					switch ac.Name() {
-					case "idle-threshold":
-						if v := nodeVal(ac); v != "" {
-							cfg.AdaptiveConfig.IdleThreshold, _ = strconv.Atoi(v)
-						}
-					case "resume-threshold":
-						if v := nodeVal(ac); v != "" {
-							cfg.AdaptiveConfig.ResumeThreshold, _ = strconv.Atoi(v)
-						}
-					case "sleep-timeout":
-						if v := nodeVal(ac); v != "" {
-							cfg.AdaptiveConfig.SleepTimeout, _ = strconv.Atoi(v)
-						}
-					}
-				}
-			}
-		case "ports":
-			for _, portChild := range child.Children {
-				port := DPDKPort{PCIAddress: portChild.Name()}
-				for _, prop := range portChild.Children {
-					switch prop.Name() {
-					case "interface":
-						port.Interface = nodeVal(prop)
-					case "rx-mode":
-						port.RXMode = nodeVal(prop)
-					case "cores":
-						port.Cores = nodeVal(prop)
-					}
-				}
-				cfg.Ports = append(cfg.Ports, port)
-			}
-		}
-	}
-	return nil
 }
 
 func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {

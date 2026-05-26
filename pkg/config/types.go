@@ -433,8 +433,7 @@ type SystemConfig struct {
 	BackupRouterDst          string   // backup router destination prefix
 	Lo0FilterInputV4         string   // lo0 unit 0 family inet filter input (host-bound filtering)
 	Lo0FilterInputV6         string   // lo0 unit 0 family inet6 filter input (host-bound filtering)
-	DataplaneType            string   // empty defaults to "userspace"; explicit "ebpf" is legacy
-	DPDKDataplane            *DPDKConfig
+	DataplaneType            string   // empty defaults to "userspace"; explicit "ebpf" is legacy; "dpdk" is retired (#1525) and tolerated via rewriteRetiredDataplaneType (pkg/configstore/dataplane_retire.go) at both Store.Load and Store.SyncApply for stored-config rolling upgrade
 	UserspaceDataplane       *UserspaceConfig
 	InternetOptions          *InternetOptionsConfig
 	Services                 *SystemServicesConfig
@@ -448,31 +447,6 @@ type SystemConfig struct {
 	LicenseAutoUpdate        string   // license autoupdate URL
 	DisabledProcesses        []string // processes marked "disable"
 	PersistGroupsInheritance bool     // system commit persist-groups-inheritance (syntax accepted, runtime no-op)
-}
-
-// DPDKConfig holds DPDK dataplane-specific configuration.
-type DPDKConfig struct {
-	Cores          string // EAL core list (e.g. "2-5")
-	Memory         int    // Hugepages in MB
-	SocketMem      string // Per-NUMA socket memory (e.g. "1024,1024")
-	RXMode         string // "polling", "interrupt", "adaptive"
-	AdaptiveConfig *DPDKAdaptiveConfig
-	Ports          []DPDKPort
-}
-
-// DPDKAdaptiveConfig holds adaptive RX mode tuning parameters.
-type DPDKAdaptiveConfig struct {
-	IdleThreshold   int // Empty polls before sleep (default 256)
-	ResumeThreshold int // Burst size to resume polling (default 32)
-	SleepTimeout    int // Max sleep ms (default 100)
-}
-
-// DPDKPort maps a PCI address to a logical interface.
-type DPDKPort struct {
-	PCIAddress string // e.g. "0000:03:00.0"
-	Interface  string // logical interface name (e.g. "wan0")
-	RXMode     string // per-port RX mode override
-	Cores      string // per-port core list override
 }
 
 // UserspaceConfig holds separate-process userspace dataplane configuration.

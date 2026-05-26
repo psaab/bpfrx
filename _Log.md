@@ -3439,6 +3439,7 @@
   handler path are `request chassis cluster data-plane userspace` via
   cli_request.go:handleRequestChassisClusterDataPlane. Updated plan snippet
   in lockstep so docs match implementation. No code change.
+
 - **Timestamp**: 2026-05-25T07:30Z
 - **Action**: #1522 plan v2 — pruned bpf/xdp/, bpf/tc/, bpf/headers/ README banner edits per AGY PLAN-NEEDS-MINOR (adversarial-review-mpkub795-6e2gou)
 - **File(s)**: docs/pr/1522-readme-doc-drift/plan.md, docs/pr/1522-readme-doc-drift/reviewer-ids.md
@@ -3570,3 +3571,170 @@
 - **File(s)**: pkg/grpcapi/runtime_canary_test.go (new), _Log.md
 - **Validation**: go test ./pkg/grpcapi/... -count=1 green; full Go
   suite green.
+
+- **Timestamp**: 2026-05-25T08:30Z
+- **Action**: #1528 DPDK mechanical removal — plan v1 DRAFT
+- **File(s)**: docs/pr/1528-dpdk-mechanical-removal/plan.md
+- **Why**: Phase 3 of #1525 DPDK retirement. Single auditable diff that
+  deletes dpdk_worker/, pkg/dataplane/dpdk/, Makefile targets, and the
+  DPDKConfig schema. Plan documents the critical Option A (keep Phase 1
+  reject) vs Option B (generic reject) decision and recommends Option A
+  for operator-friendly migration message + stored-config rolling-upgrade
+  safety via daemon_run.go:247 soft-fallback. 10 hostile questions
+  surfaced for adversarial plan review. Pending Codex + Antigravity.
+
+- **Timestamp**: 2026-05-25T09:15Z
+- **Action**: #1528 plan v2 — addresses AGY r1 PLAN-NEEDS-MAJOR
+- **File(s)**: docs/pr/1528-dpdk-mechanical-removal/plan.md
+- **Why**: AGY round-1 verified that `validateDataplaneTypeStrict` fires inside
+  `Store.Load()` BEFORE the daemon_run.go:247 soft-fallback gets a chance to
+  catch `ErrDPDKBackendRetired`. The error is swallowed at daemon_run.go:87 as
+  "failed to load config from db"; ActiveConfig() returns nil; dpType resolves
+  to "" → userspace; the sentinel-Is check never fires. Node boots with empty
+  config = operational blackout. This is an inherited bug from Phase 1 (#1526)
+  that Phase 3 should fix. v2 adds §4.6 stored-config-tolerant Load path:
+  rewrite persisted `dataplane-type dpdk` to empty at Load with loud warning.
+  Also flipped socket-mem schema-node decision per AGY: keep with retirement-
+  marker description rather than delete (userspace path ignores unmapped
+  schema children gracefully). Added Q11 + Q12 for the v2 fix path and the
+  HA-sync edge case. Codex r1+r2 ENV-BLOCKED sandbox failure; AGY-only verdict
+  on v1.
+
+- **Timestamp**: 2026-05-25T09:50Z
+- **Action**: #1528 plan v3 — addresses Codex r3 PLAN-NEEDS-MAJOR
+- **File(s)**: docs/pr/1528-dpdk-mechanical-removal/plan.md, reviewer-ids.md
+- **Why**: Codex r3 (task-mpld4f7u-l7ixka) flagged 4 substantive findings on
+  v2's load-rewrite approach: (1) the rewrite walks the raw tree and would
+  MISS apply-groups + ${node} injected dpdk because group expansion happens
+  inside CompileConfig/CompileConfigForNode BEFORE compileExpanded;
+  (2) Q11 HA-sync claim was wrong — SyncApply does NOT use Store.Load() so
+  inbound DPDK sync is rejected with a compile error (verified at
+  daemon_ha_sync.go:566 → store.go:191); (3) ConfigTree.FindPath doesn't
+  exist publicly (only FindChild + DeletePath); (4) rewrite leaves orphan
+  DPDK sub-stanza (cores, memory, rx-mode, ports) which userspace compile
+  silently drops. v3 PIVOT to load-mode bypass: add compileOpts{loadMode}
+  on private compileExpanded plus CompileConfigForLoad + CompileConfigForNodeAndLoad
+  exported helpers called by Store.compileTreeForLoad. Bypass operates AFTER
+  group expansion (handles apply-groups), no AST mutation (no orphan concern),
+  and preserves DataplaneType=="dpdk" through to NewRuntimeDataPlane which
+  triggers the existing daemon_run.go:247 ErrDPDKBackendRetired soft-fallback.
+  Also acknowledged the runtime/import_canary_test.go:47 dpdk forbidden-import
+  entry as a KEEP (defense-in-depth). AGY r2 (adversarial-review-mpld4tso-19877w)
+  returned PLAN-READY on v2 but missed findings 1, 3, 4; v3 takes Codex's
+  strictly-superior feedback.
+
+- **Timestamp**: 2026-05-25T21:10Z
+- **Action**: #1528 plan v3.1 — fold AGY r3 PLAN-READY minor; Codex r5 retry
+- **File(s)**: docs/pr/1528-dpdk-mechanical-removal/plan.md, reviewer-ids.md
+- **Why**: AGY r3 (adversarial-review-mplgkdgz-ikpdw1) returned PLAN-READY on v3
+  with one minor: add TestCompileConfigForLoad_BypassesDPDKRejectViaApplyGroups
+  for explicit apply-groups + ${node} coverage under load-mode bypass. Folded
+  into §4.6 + test plan. Codex r4 (task-mplgjwea-goeioj) sandbox-failed and
+  expired from queue; per feedback_codex_infra_must_retry rule, dispatched r5
+  retry (task-mpm3bsbi-hsom0r). Awaiting verdict before proceeding to
+  implementation.
+
+- **Timestamp**: 2026-05-26T00:30Z
+- **Action**: #1528 plan v3.2 — schema-validate edge lock-in (Codex r5 PLAN-NEEDS-MINOR)
+- **File(s)**: docs/pr/1528-dpdk-mechanical-removal/plan.md, reviewer-ids.md
+- **Why**: Codex r5 (task-mpm7n2n2-ty9kjd) returned PLAN-NEEDS-MINOR with one
+  blocking concern: schemaValidateExpandedTree runs BEFORE compileTreeForLoad,
+  potentially rejecting legacy DPDK sub-stanza leaves before the load-mode
+  bypass can fire. Verified pkg/cmdtree/schema_validate.go:35-57 against
+  actual source: SchemaValidate is opt-in per subtree and currently scoped to
+  class-of-service schedulers only. The concern is unfounded TODAY. v3.2 adds
+  two explicit tests (TestLoad_PersistedDPDKDataplaneTypeWithSubStanzaBootsConfigOnly
+  in pkg/configstore + TestSchemaValidate_AcceptsLegacyDPDKSubStanza in
+  pkg/cmdtree) plus §4.7 contract to make the schema-validate scope an
+  explicit pinned surface for retirement work. Pending re-dispatch.
+
+- **Timestamp**: 2026-05-26T01:00Z
+- **Action**: #1528 plan v3.3 — strengthen TestSchemaValidate_AcceptsLegacyDPDKSubStanza fixture (Codex r6 PLAN-NEEDS-MINOR)
+- **File(s)**: docs/pr/1528-dpdk-mechanical-removal/plan.md, reviewer-ids.md
+- **Why**: Codex r6 (task-mpm8d1qz-9bj4nh) returned PLAN-NEEDS-MINOR: the v3.2
+  fixture has no class-of-service subtree, so SchemaValidate hits the
+  pkg/cmdtree/schema_validate.go:43-46 early return and the test only proves
+  current early-return behavior. A future PR that adds a top-level
+  system-dataplane walker independently of the cos early-return would silently
+  bypass the gate. v3.3 strengthens the fixture to include a valid
+  class-of-service schedulers block alongside the legacy DPDK shape, plus a
+  pre-condition assertion that tree.FindChild("class-of-service") != nil. The
+  cos block forces the walker to exercise the positive-path, and the DPDK
+  leaves prove ignored. The strengthened fixture catches BOTH the
+  unconditional-validator regression class AND the cos-early-return-removal
+  class. Pending re-dispatch.
+
+- **Timestamp**: 2026-05-26T02:15Z
+- **Action**: #1528 Phase B implementation — DPDK mechanical removal complete
+- **File(s)**:
+  - DELETED: dpdk_worker/ (entire tree — 17 C files + headers + meson + cached build/)
+  - DELETED: pkg/dataplane/dpdk/ (entire package — manager.go, dpdk_cgo.go, dpdk_stub.go, fib.go, dpdk_stub_test.go, dpdk_lookup_source_test.go)
+  - EDITED: Makefile (removed build-dpdk-worker, build-dpdk, clean-dpdk targets + .PHONY + clean: clean-dpdk)
+  - EDITED: pkg/config/types.go (deleted DPDKConfig, DPDKAdaptiveConfig, DPDKPort, SystemConfig.DPDKDataplane field)
+  - EDITED: pkg/config/compiler_system.go (deleted case dataplaneTypeDPDK that populated DPDKConfig + compileDPDKDataplane function; left case branch as silent-drop comment)
+  - EDITED: pkg/config/ast.go (rewrote socket-mem schema-node description: "Legacy DPDK socket memory (retired, ignored)")
+  - EDITED: pkg/config/compiler.go (added compileOpts{loadMode}; refactored CompileConfig/CompileConfigForNode to delegate via compileWithOpts; added CompileConfigForLoad + CompileConfigForNodeAndLoad public entry points; gated validateDataplaneTypeStrict on !opts.loadMode)
+  - EDITED: pkg/config/parser_system_test.go (removed DPDKDataplane != nil assertion at line 1382)
+  - EDITED: pkg/config/parser_ast_test.go (added TestCompileConfigForLoad_BypassesDPDKReject + TestCompileConfigForLoad_BypassesDPDKRejectViaApplyGroups; updated compileExpanded test calls to compileOpts{})
+  - EDITED: pkg/configstore/store.go (Store.Load uses new compileTreeForLoad; emits slog.Warn when DataplaneType=="dpdk")
+  - EDITED: pkg/configstore/store_test.go (added TestLoad_PersistedDPDKDataplaneTypeBootsConfigOnly + TestLoad_PersistedDPDKDataplaneTypeWithSubStanzaBootsConfigOnly)
+  - NEW: pkg/cmdtree/schema_validate_test.go (added TestSchemaValidate_AcceptsLegacyDPDKSubStanza with cos-populated fixture per Codex r6 v3.3 minor)
+  - EDITED: pkg/dataplane/retirement_boundary_canary_test.go (deleted dpdkBackendImportForCanary const, dpdkEBPFImportAllowlist, dpdkBackendImportAllowlist; deleted TestDPDKBackendImportStaysBackendLocal + TestDPDKEBPFArtifactImportsStayAtLegacyAdapter + TestRetirementBoundaryDocsMentionDPDKPolicy; removed dpdkBackendImportForCanary check from TestOperatorPackagesDoNotImportBPFArtifactsDirectly)
+  - EDITED: scripts/refactoring-audit.sh (removed dpdk_worker from find paths)
+  - EDITED: docs/pr/1373-retire-ebpf-dataplane/README.md (rewrote #1475 DPDK Backend Policy section as retirement note)
+  - EDITED: pkg/dataplane/README.md (rewrote DPDK retirement paragraph; removed crossed-out DPDK entry)
+  - KEPT: pkg/dataplane/dataplane.go TypeDPDK + ErrDPDKBackendRetired + RegisterBackend/RegisterRuntimeBackend panic guards + case TypeDPDK arms (Phase 1 reject preservation per plan §3 / §5)
+  - KEPT: pkg/config/compiler.go dataplaneTypeDPDK + ErrDPDKDataplaneRetired + validateDataplaneTypeStrict + validDataplaneType("dpdk")=true (Phase 1 reject)
+  - KEPT: pkg/configstore/store_test.go TestCommit_RejectsDPDKDataplaneType (gRPC/REST wrap contract)
+  - KEPT: pkg/dataplane/runtime/import_canary_test.go:47 dpdk forbidden-backend (defense-in-depth)
+  - KEPT: pkg/daemon/daemon_run.go:247 errors.Is(ErrDPDKBackendRetired) soft-fallback (now reachable for stored-config rolling-upgrade)
+- **Why**: Both Codex r7 (task-mpmbxohf-mft8dk) and AGY r5 (adversarial-review-mpmby226-tvzsfa) returned PLAN-READY on plan v3.3. Executed mechanical deletion + load-mode bypass per plan v3.3. All packages build clean (go build ./...). Full go test ./... passes. 5x flake check on all DPDK-related tests passes (25/25 runs). make build succeeds. make -n build-dpdk / clean-dpdk correctly report "no rule".
+
+- **Timestamp**: 2026-05-26T02:30Z
+- **Action**: #1528 PR #1560 opened; code-review cycle dispatched
+- **File(s)**: docs/pr/1528-dpdk-mechanical-removal/reviewer-ids.md
+- **Why**: PR #1560 (HEAD ecc4d5b8) opened with full plan v3.3 implementation.
+  Body contains `Closes #1528` per feedback_pr_body_close_keyword. Copilot
+  added via gh pr edit + @copilot review comment per feedback_copilot_two_bots.
+  Dispatched Codex hostile code review (task-mpmf8tph-0dwkmf, inline-content)
+  and AGY adversarial code review (adversarial-review-mpmf9e1k-p2wray) in
+  parallel. Posted Claude SMR adversarial review as PR comment per
+  feedback_triple_review_includes_claude_smr (MERGE-READY verdict). Awaiting
+  Codex + AGY + Copilot to reach 4-of-4 attestation, then will post
+  <!-- AWAITING-MERGE --> marker per feedback_retirement_batch_smoke_at_end.
+
+- **Timestamp**: 2026-05-26T02:45Z
+- **Action**: #1528 PR #1560 — address Copilot inline comment on phase-order wording
+- **File(s)**: docs/pr/1373-retire-ebpf-dataplane/README.md
+- **Why**: Copilot review COMMENTED with one inline comment on line 91 noting
+  that "Phase 4 (#1529) swept documentation surfaces" could read as if Phase
+  4 is complete while this PR is Phase 3 — but Phase 4 (#1529/#1537) DID
+  merge before this PR (commit 564ceba1 on master). Reworded the section to
+  make the phase order explicit and call out that Phase 4 landed before
+  Phase 3 because the canary-pinned text strings forbade direct rewrite
+  pre-Phase-3.
+
+- **Timestamp**: 2026-05-26T09:40Z
+- **Action**: #1528 — fix stale comment in pkg/config/compiler_system.go:238-244
+- **File(s)**: pkg/config/compiler_system.go
+- **Why**: After the rebase-to-master in 4f348ee, the `case dataplaneTypeDPDK:` comment
+  still referenced `compileTreeForLoad` (which was removed) and described the old
+  "config-only mode / ErrDPDKBackendRetired soft-fallback" behavior (also removed).
+  Updated to describe the actual post-rebase semantics: this branch is only reachable
+  from a direct CompileConfig call (commit path); Store.Load/SyncApply strip the dpdk
+  leaf via rewriteRetiredDataplaneType before compile so the sub-stanza goes through
+  compileUserspaceDataplane instead. validateDataplaneTypeStrict fires after
+  compileSystem in any case, making the silent-drop behavior in this branch moot.
+
+
+- **Action**: #1528 PR #1560 — rebase onto current master (post #1553, #1554, #1557, #1558)
+- **File(s)**: Makefile, _Log.md, pkg/config/compiler.go, pkg/config/dpdk_subtree_leakage_canary_test.go (deleted), pkg/configstore/store.go, pkg/configstore/store_test.go, pkg/dataplane/retirement_boundary_canary_test.go, pkg/config/parser_ast_test.go
+- **Why**: PR was DIRTY/CONFLICTING after #1558 merged (deleted bpfel files) and #1553 merged (added pkg/config/dpdk_subtree_leakage_canary_test.go with DPDKDataplane references). Rebase rewinds my plan-v3 load-mode bypass approach in favor of master's `rewriteRetiredDataplaneType` (introduced for the symmetric #1373 eBPF retirement in #1558) which strips the retired-type leaf from the AST at Load (and at SyncApply, which my bypass didn't cover). Master's rewrite already handles apply-groups + ${node} expansion paths via `groupsBlocksOf` walker — the same finding Codex r3 raised against my v2 rewrite-at-Load approach. End result: drops compileOpts{loadMode} + compileWithOpts + CompileConfigForLoad + CompileConfigForNodeAndLoad + compileTreeForLoad in favor of master's rewriteRetiredDataplaneType bridge. Net: PR is now a pure mechanical-deletion (dpdk_worker/, pkg/dataplane/dpdk/, Makefile targets, DPDKConfig/AdaptiveConfig/Port types, SystemConfig.DPDKDataplane field, compileDPDKDataplane fn, retirement-boundary canary DPDK entries). Also deletes pkg/config/dpdk_subtree_leakage_canary_test.go (PR #1553's leakage canary) since the field it polices is gone — per the canary's own comment ("This is dead code after #1528 (Phase 3) deletes the field entirely; remove this line in #1528"). Schema-validate scope contract + TestSchemaValidate_AcceptsLegacyDPDKSubStanza preserved as future-proofing for any expansion of SchemaValidate. Store.Load tests updated to assert DataplaneType=="" post-rewrite (was "dpdk" under the dropped bypass approach).
+
+- **Timestamp**: 2026-05-26 09:50 UTC
+- **Action**: Fold AGY r2 + Copilot r3 minor findings — update 3 stale comments referring to pre-rebase load-mode bypass / compileTreeForLoad to reference rewriteRetiredDataplaneType bridge (called from both Store.Load and Store.SyncApply per master post-#1558).
+- **File(s)**: pkg/config/types.go (SystemConfig.DataplaneType comment); docs/pr/1373-retire-ebpf-dataplane/README.md (remaining DPDK bullet); pkg/cmdtree/schema_validate_test.go (TestSchemaValidate_AcceptsLegacyDPDKSubStanza header). Fourth comment (pkg/config/compiler_system.go) already fixed in 66c4d711.
+
+- **Timestamp**: 2026-05-26 10:00 UTC
+- **Action**: Fold Codex r-final MERGE-NEEDS-MINOR comment findings — update 2 stale comments. (1) ErrDPDKBackendRetired comment no longer references the deleted pkg/dataplane/dpdk package-local test; points to runtime/import_canary_test.go as defense-in-depth. (2) TestSchemaValidate_AcceptsLegacyDPDKSubStanza header clarifies it guards orphaned sub-stanzas that survive the rewrite bridge, not pre-bridge schema validation.
+- **File(s)**: pkg/dataplane/dataplane.go (ErrDPDKBackendRetired comment); pkg/cmdtree/schema_validate_test.go (test header).
