@@ -1,5 +1,34 @@
 # Action Log
 
+## 2026-05-26 — #1325 implementation pushed
+
+- **Timestamp**: 2026-05-26T (UTC)
+- **Action**: Implemented protocol.rs domain split per v3 plan.
+  - Created protocol/{mod,snapshot,cos,nat,security,control,
+    binding,resolution}.rs with module/foo.rs layout.
+  - 631-LOC test block moved into protocol/tests.rs as a sibling
+    submodule (kept as single cohesive block at parent layer
+    since every test exercises ProcessStatus that aggregates
+    every leaf domain).
+  - u64_is_zero switched to absolute path
+    crate::protocol::u64_is_zero in HAGroupStatus.lease_until
+    attribute per Codex r1/r2 verified serde_derive semantics.
+  - mod.rs is slim (decls + glob re-exports only); zero call-site
+    edits required (5 use crate::protocol::X sites + 12 path
+    callers all resolve unchanged).
+  - Named-item count matches pre-split: 66 structs + 2 consts +
+    1 fn = 69 (binding=8, control=14, cos=14, nat=6, resolution=3,
+    security=11, snapshot=13).
+  - cargo build clean. cargo test --bin: 1417/1417 (was 1395
+    pre-split because protocol::tests now counts as 22 items in
+    the main bin); 5x flake check on protocol::tests passes.
+  - Pre-existing snat_contract_doc_guard test fails on both
+    master and this branch (unrelated to refactor).
+  - Go suite clean.
+- **File(s)**: userspace-dp/src/protocol/{mod,snapshot,cos,nat,
+  security,control,binding,resolution,tests}.rs (created);
+  userspace-dp/src/protocol.rs (deleted); _Log.md
+
 ## 2026-05-26 — #1325 plan v2 folds Codex+AGY r1
 
 - **Timestamp**: 2026-05-26T (UTC)
