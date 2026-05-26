@@ -35,6 +35,10 @@
 - **17:57 UTC** — Revised to v3: cleaned all three flagged sites,
   removed release-LTO crutch, added binary-size spot check #6 to
   test plan.
+- **18:08 UTC** — Codex r3 PLAN-NEEDS-MINOR (2 final stale text
+  bugs: one surviving 'pub(in crate::afxdp) use' at the
+  Cost: line, and the Open Question #4 'shortening from X to X'
+  self-contradiction). Revised to v4 fixing both.
 
 ## 2026-05-26 — #1325 implementation pushed
 

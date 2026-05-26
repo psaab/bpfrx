@@ -1,6 +1,10 @@
 # #1329 — shared_cos_lease.rs hot-fn extract — Plan
 
-**Status:** DRAFT v3 — addresses Codex r2 PLAN-NEEDS-MINOR cleanup
+**Status:** DRAFT v4 — Codex r3 PLAN-NEEDS-MINOR: one stale
+`pub(in crate::afxdp) use` reference at the Honest-scope `Cost:`
+line corrected to the actual `pub(super) use`; test-path open
+question reworded to drop the contradictory "shortening to itself"
+phrasing. v3 prior fixes preserved:
 (stale `#[inline] preserves codegen` text removed from risk table
 and Hidden invariants, release LTO claim removed because
 userspace-dp/Cargo.toml has no LTO setting, stale
@@ -79,7 +83,7 @@ stays inside the `shared_cos_lease` module tree (sibling
 submodules of `mod.rs`, not separate crates).
 
 Cost: zero allocations introduced, zero atomic-ordering edits,
-zero public-API surface change (the `pub(in crate::afxdp) use`
+zero public-API surface change (the `pub(super) use shared_cos_lease::{...}`
 re-export list in `types/mod.rs` is identical pre/post).
 
 ## What's already shipped / partially batched
@@ -393,10 +397,12 @@ exactly as on master.
 
 4. **Test file `#[path]` relocation** — moving the `mod tests`
    declaration from `shared_cos_lease.rs` (deleted) to
-   `shared_cos_lease/mod.rs` and shortening `#[path]` from
-   `"shared_cos_lease_tests.rs"` to `"shared_cos_lease_tests.rs"`
-   (now in the same dir) — any way this masks a stale path that
-   used to be load-bearing? rust-analyzer / cargo-test path
+   `shared_cos_lease/mod.rs` while keeping the `#[path]` string
+   `"shared_cos_lease_tests.rs"` (the file moves alongside
+   `mod.rs` into the new dir, so the same relative path string
+   now resolves dir-locally rather than as a sibling file). Any
+   way this masks a stale path that used to be load-bearing?
+   rust-analyzer / cargo-test path
    resolution edge case?
 
 5. **Atomic-ordering preservation across module boundary** —
