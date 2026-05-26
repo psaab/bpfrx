@@ -1,5 +1,33 @@
 # Action Log
 
+## 2026-05-26 — #1546 filter engine split implemented (plan v2)
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Implemented the 5-way split of
+    userspace-dp/src/filter/engine.rs (1247 LOC, 51 fns) into
+    userspace-dp/src/filter/engine/{mod,matching,eval,tx_selection,
+    cache_sensitive,policer}.rs per plan v2. Pure code motion —
+    function bodies byte-identical; #[inline]/#[inline(always)]
+    attributes preserved on the hot path; visibility tightened from
+    engine-wide pub(crate) to pub(super) for engine-local helpers,
+    pub(crate) re-exports at engine/mod.rs maintain the prior call
+    surface in the rest of the crate. Added 2 AC2 tests
+    (filter_added_to_interface, filter_removed_from_interface) to
+    close the add/remove gap; the other 3 AC2 scenarios
+    (same_ifindex content change, positional-ID stability,
+    three-color shape change) were already present in
+    filter/tests.rs. cargo build clean; full cargo test --release
+    1417/1417 pass (plus 38/38 filter:: 5x flake check); Go suite
+    clean.
+  - **File(s)**: userspace-dp/src/filter/engine.rs (DELETED),
+    userspace-dp/src/filter/engine/mod.rs (NEW, 35),
+    userspace-dp/src/filter/engine/matching.rs (NEW, 94),
+    userspace-dp/src/filter/engine/eval.rs (NEW, 681),
+    userspace-dp/src/filter/engine/tx_selection.rs (NEW, 297),
+    userspace-dp/src/filter/engine/cache_sensitive.rs (NEW, 208),
+    userspace-dp/src/filter/engine/policer.rs (NEW, 60),
+    userspace-dp/src/filter/tests.rs (added 2 AC2 tests).
+
 ## 2026-05-26 — #1546 filter engine split plan v1 drafted
 
 - **Timestamp**: 2026-05-26
