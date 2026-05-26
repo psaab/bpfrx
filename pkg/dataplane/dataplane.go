@@ -18,9 +18,11 @@ import (
 //
 // Chain A (#1526) handles user-facing rejection at commit time;
 // this sentinel covers the runtime factory path for callers that
-// still pass TypeDPDK through, including the package-local test
-// in pkg/dataplane/dpdk that guards against silent registry
-// resurrection.
+// still pass TypeDPDK through. Defense-in-depth against silent
+// registry resurrection lives in
+// pkg/dataplane/runtime/import_canary_test.go (forbidden-import
+// canary) after #1528 deleted pkg/dataplane/dpdk and its
+// package-local test.
 var ErrDPDKBackendRetired = errors.New(
 	"the DPDK dataplane backend has been retired; use " +
 		"'set system dataplane-type userspace' (see #1525)",

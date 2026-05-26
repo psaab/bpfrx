@@ -3734,3 +3734,7 @@
 - **Timestamp**: 2026-05-26 09:50 UTC
 - **Action**: Fold AGY r2 + Copilot r3 minor findings — update 3 stale comments referring to pre-rebase load-mode bypass / compileTreeForLoad to reference rewriteRetiredDataplaneType bridge (called from both Store.Load and Store.SyncApply per master post-#1558).
 - **File(s)**: pkg/config/types.go (SystemConfig.DataplaneType comment); docs/pr/1373-retire-ebpf-dataplane/README.md (remaining DPDK bullet); pkg/cmdtree/schema_validate_test.go (TestSchemaValidate_AcceptsLegacyDPDKSubStanza header). Fourth comment (pkg/config/compiler_system.go) already fixed in 66c4d711.
+
+- **Timestamp**: 2026-05-26 10:00 UTC
+- **Action**: Fold Codex r-final MERGE-NEEDS-MINOR comment findings — update 2 stale comments. (1) ErrDPDKBackendRetired comment no longer references the deleted pkg/dataplane/dpdk package-local test; points to runtime/import_canary_test.go as defense-in-depth. (2) TestSchemaValidate_AcceptsLegacyDPDKSubStanza header clarifies it guards orphaned sub-stanzas that survive the rewrite bridge, not pre-bridge schema validation.
+- **File(s)**: pkg/dataplane/dataplane.go (ErrDPDKBackendRetired comment); pkg/cmdtree/schema_validate_test.go (test header).

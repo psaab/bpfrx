@@ -9,12 +9,16 @@ import (
 // TestSchemaValidate_AcceptsLegacyDPDKSubStanza is the Codex r6 v3.3
 // fixture-strength regression gate for #1528. The plan v3.3 §4.7
 // contract requires that any future expansion of SchemaValidate
-// which walks `system dataplane` tolerates retired-backend leaves
-// — otherwise a node booting with a pre-#1526 persisted DPDK config
-// would fail schema validation before the `rewriteRetiredDataplaneType`
-// bridge (pkg/configstore/dataplane_retire.go, invoked from both
-// Store.Load and Store.SyncApply) gets a chance to strip the
-// retired leaf (operational blackout).
+// which walks `system dataplane` tolerates orphaned legacy DPDK
+// sub-stanzas that survive the `rewriteRetiredDataplaneType` bridge
+// (pkg/configstore/dataplane_retire.go, invoked from both Store.Load
+// and Store.SyncApply before compile + schema validation). The
+// bridge strips the `dataplane-type dpdk` leaf, but any nested
+// `system dataplane ...` sub-stanza remains; if a future
+// SchemaValidate walker rejects those orphaned leaves it would
+// preempt the operator-facing commit-time `ErrDPDKDataplaneRetired`
+// rejection AND break stored-config rolling upgrade (operational
+// blackout for pre-#1526 persisted DPDK configs).
 //
 // This test exercises the positive-path walker by including a valid
 // class-of-service schedulers block (defeating SchemaValidate's
