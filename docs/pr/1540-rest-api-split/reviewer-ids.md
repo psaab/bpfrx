@@ -15,3 +15,6 @@ results by id rather than re-dispatching.
 
 | Round | Reviewer | Task ID | Verdict | Notes |
 |-------|----------|---------|---------|-------|
+| 1     | Codex    | task-mpmv83ma-l37n0u | pending | PR #1564 b34ddc09 |
+| 1     | AGY      | review-mpmv8agw-9avq5l | pending | PR #1564 b34ddc09 |
+| 1     | Copilot  | @copilot review posted | pending | PR #1564 b34ddc09 |

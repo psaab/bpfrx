@@ -251,7 +251,7 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | File | Current blocker |
 |---|---|
 | `cmd/xpfd/main.go` | Backend selection, cleanup, and backend registration still cross the root package. |
-| `pkg/api/api.go` | Shared REST helpers still reference legacy dataplane counters and types (#1540 split entry: `apiRuntimeDataPlane` interface, `protoName`, `applyResult`). |
+| `pkg/api/api.go` | Shared REST helpers still reference legacy dataplane counters and types (#1540 split entry: `apiRuntimeDataPlane` interface, `applyResult` adapter). |
 | `pkg/api/metrics.go` | Prometheus telemetry still reads legacy counters and metadata. |
 | `pkg/api/metrics_counters.go` | Prometheus map-counter collectors still call legacy dataplane reads (#1540 metrics split). |
 | `pkg/api/metrics_nat.go` | Prometheus NAT pool collector still reads legacy dataplane (#1540 metrics split). |

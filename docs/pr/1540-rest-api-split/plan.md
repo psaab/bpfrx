@@ -109,22 +109,24 @@ Existing (unchanged):
 - Test files (`*_test.go`) untouched.
 
 Renamed:
-- `handlers_sessions.go` → `sessions.go` (no content change)
+- `handlers_sessions.go` → `sessions.go` (also receives `protoName`
+  helper moved from `handlers.go` since `protoName` is only used by
+  the session presenter path).
 
 New files split out of `handlers.go` (which is deleted):
 - `api.go` — package-level helpers shared across handler files:
-  `writeJSON`, `writeOK`, `writeError`, `commitResponseFromConfig`,
-  `queryInt`, `queryUint16`, `allInterfaceNames`, `policyActionStr`,
-  `protoName`, `screenChecks`, `applyResult`. Also the
-  `apiRuntimeDataPlane` interface and any package-internal type
-  decls currently at the top of `handlers.go`.
+  `writeJSON`, `writeOK`, `writeError`, `queryInt`, `queryUint16`,
+  `allInterfaceNames`, and the `applyResult` adapter on `*Server`.
+  Also the `apiRuntimeDataPlane` interface (the narrow runtime
+  surface declared at the top of the former `handlers.go`).
 - `health.go` — `healthHandler`, `statusHandler`.
 - `stats.go` — `globalStatsHandler`, `ifaceStatsHandler`,
   `zoneStatsHandler`, `clearCountersHandler`.
 - `security.go` — `zonesHandler`, `policiesHandler`,
   `screenHandler`, `eventsHandler`, `matchPoliciesHandler`,
   `matchPolicyAddr`, `matchPolicyAddrSet`, `matchPolicyApp`,
-  `matchSingleApp`.
+  `matchSingleApp`, plus the `policyActionStr` and `screenChecks`
+  helpers (only consumed by this domain).
 - `nat.go` — `natSourceHandler`, `natDestHandler`,
   `natPoolStatsHandler`, `natRuleStatsHandler`.
 - `interfaces.go` — `interfacesHandler`,
@@ -137,7 +139,7 @@ New files split out of `handlers.go` (which is deleted):
 - `vrrp.go` — `vrrpHandler`.
 - `system.go` — `systemInfoHandler`, `systemBuffersHandler`,
   `systemActionHandler`, `pingHandler`, `tracerouteHandler`.
-- `config_handlers.go` — `configHandler`, `configEnterHandler`,
+- `config.go` — `configHandler`, `configEnterHandler`,
   `configExitHandler`, `configStatusHandler`, `configSetHandler`,
   `configDeleteHandler`, `configLoadHandler`,
   `configCommitHandler`, `configCommitCheckHandler`,
@@ -145,16 +147,19 @@ New files split out of `handlers.go` (which is deleted):
   `configRollbackHandler`, `configShowHandler`,
   `configExportHandler`, `configShowRollbackHandler`,
   `configCompareHandler`, `configHistoryHandler`,
-  `configSearchHandler`, `configAnnotateHandler`.
+  `configSearchHandler`, `configAnnotateHandler`. Also the
+  `configCommitResponse` type and `commitResponseFromConfig`
+  helper (only used by the config-mode handlers).
 - `show_text.go` — `showTextHandler` (the largest single function
   at ~300 LOC; isolating it makes the rest of `system.go` smaller).
 
 New files split out of `metrics.go`:
-- `metrics.go` — slim entry: `xpfCollector` struct, `newCollector`
-  (the constructor with all descriptor allocations), `Describe`,
+- `metrics.go` — slim entry: `xpfCollector` struct, `Describe`,
   `Collect`, and the small helpers used across emitters
-  (`emitHistogram`, `bucketUpperBoundNs`, `policyCounterID`,
-  `parseMemInfoKB`).
+  (`emitHistogram`, `bucketUpperBoundNs`, `policyCounterID`).
+- `metrics_descriptors.go` — `newCollector` constructor (~600 LOC
+  of descriptor allocations carved out so `metrics.go` is truly
+  slim per Codex + AGY round-1 PLAN-NEEDS-MINOR findings).
 - `metrics_userspace.go` — all `emit*` methods that consume
   `dpuserspace.ProcessStatus`:
   `collectUserspaceStatus`, `emitThreeColorPolicerCounters`,
@@ -180,25 +185,34 @@ New files split out of `metrics.go`:
 - `metrics_sessions.go` — `collectSessionGauges`.
 - `metrics_nat.go` — `collectNATPoolMetrics`.
 - `metrics_system.go` — `collectDHCPMetrics`,
-  `collectSystemMetrics`.
+  `collectSystemMetrics`, plus the `parseMemInfoKB` helper
+  (only consumed by `collectSystemMetrics`).
 
 ### Mechanical procedure
 
-1. `git mv pkg/api/handlers_sessions.go pkg/api/sessions.go` (no
-   content change; pure rename).
-2. For each new file: create the file with the same `package api`
-   header and the minimal import list it needs. Move the function
-   bodies verbatim from `handlers.go` / `metrics.go`. Keep
-   comments and section-divider banners attached to their
-   functions.
-3. Once `handlers.go` is empty of moved content, delete the file.
-   `metrics.go` is **not** deleted; it retains the collector
-   struct + ctor + Describe + Collect + cross-cut helpers.
-4. Run `goimports -w pkg/api/*.go` to clean up per-file import
-   sets after the move.
-5. `go build ./pkg/api/...` and `go test ./pkg/api/...` after each
-   logical move (e.g. after every 2-3 files) so a regression is
-   localized.
+1. `git mv pkg/api/handlers_sessions.go pkg/api/sessions.go` (pure
+   rename; the `protoName` helper gets appended later when the
+   helpers are domain-tightened).
+2. Split `handlers.go` into all 13 target sibling files in a single
+   atomic pass: parse the source into function/type blocks, assign
+   each to its target file by domain, and write each new file with
+   a `package api` header. Run `goimports -w pkg/api/*.go` and
+   `go build ./pkg/api/...` immediately after to verify per-file
+   import sets and compilation. Delete `handlers.go` in the same
+   commit.
+3. Split `metrics.go` the same way: emit blocks to the slim
+   `metrics.go`, `metrics_descriptors.go`, `metrics_userspace.go`,
+   `metrics_counters.go`, `metrics_sessions.go`, `metrics_nat.go`,
+   `metrics_system.go`. Run `goimports -w` and `go build` again.
+4. Tighten `api.go` scope per Codex round-1 finding: move
+   `policyActionStr` + `screenChecks` to `security.go`,
+   `protoName` to `sessions.go`, `configCommitResponse` +
+   `commitResponseFromConfig` to `config.go`. Re-run goimports +
+   build + tests.
+5. Update `pkg/dataplane/retirement_boundary_canary_test.go`
+   `legacyDataplaneImportAllowlist` and the matching table in
+   `docs/pr/1373-retire-ebpf-dataplane/README.md` to enumerate the
+   new sibling files that still cross the legacy dataplane import.
 
 ### What this PR is NOT
 

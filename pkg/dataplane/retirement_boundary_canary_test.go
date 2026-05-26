@@ -30,7 +30,7 @@ const (
 
 var legacyDataplaneImportAllowlist = map[string]string{
 	"cmd/xpfd/main.go":                         "cleanup entry point (backend registration removed in #1527)",
-	"pkg/api/api.go":                           "shared REST helpers still reference legacy dataplane counters and types (#1540 split entry: apiRuntimeDataPlane interface, protoName, applyResult)",
+	"pkg/api/api.go":                           "shared REST helpers still reference legacy dataplane counters and types (#1540 split entry: apiRuntimeDataPlane interface, applyResult adapter)",
 	"pkg/api/metrics.go":                       "Prometheus telemetry still reads legacy counters and metadata",
 	"pkg/api/metrics_counters.go":              "Prometheus map-counter collectors still call legacy dataplane reads (#1540 metrics split)",
 	"pkg/api/metrics_nat.go":                   "Prometheus NAT pool collector still reads legacy dataplane (#1540 metrics split)",
