@@ -100,7 +100,7 @@ fn missing_neighbor_seed_install_stays_out_of_delta_stream() {
         SessionOrigin::MissingNeighborSeed,
         1_000_000_000,
         PROTO_TCP,
-        0x10
+        0x10,
     ));
     assert!(
         table.drain_deltas(8).is_empty(),
@@ -120,7 +120,7 @@ fn missing_neighbor_seed_expire_stays_out_of_delta_stream() {
         SessionOrigin::MissingNeighborSeed,
         then,
         PROTO_TCP,
-        0x10
+        0x10,
     ));
     assert!(table.drain_deltas(8).is_empty());
     table.last_gc_ns = then + 301_000_000_000;
@@ -919,15 +919,15 @@ fn promote_synced_forward_session_emits_open_delta() {
         false,
     );
     let promoted = metadata();
-    assert!(table.promote_synced_with_origin(
-        &key,
-        decision(),
-        promoted.clone(),
-        SessionOrigin::SharedPromote,
-        now + 1_000_000,
-        PROTO_TCP,
-        0x10,
-    ));
+    assert!(table.promote_synced_with_origin(SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: promoted.clone(),
+        origin: SessionOrigin::SharedPromote,
+        now_ns: now + 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
     let hit = table.lookup(&key, now + 2_000_000, 0x10);
     assert_eq!(
         hit,
@@ -961,15 +961,15 @@ fn promote_synced_reverse_session_stays_quiet() {
     );
     let mut promoted = metadata();
     promoted.is_reverse = true;
-    assert!(table.promote_synced_with_origin(
-        &key,
-        decision(),
-        promoted.clone(),
-        SessionOrigin::SharedPromote,
-        now + 1_000_000,
-        PROTO_TCP,
-        0x10,
-    ));
+    assert!(table.promote_synced_with_origin(SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: promoted.clone(),
+        origin: SessionOrigin::SharedPromote,
+        now_ns: now + 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
     let hit = table.lookup(&key, now + 2_000_000, 0x10);
     assert_eq!(
         hit,

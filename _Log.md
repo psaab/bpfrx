@@ -269,6 +269,50 @@
     - userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs (new)
     - userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs (new)
     - userspace-dp/src/afxdp/coordinator/tests.rs (test added)
+## 2026-05-26 — #1357 session context-struct refactor implemented (plan v3.1)
+
+- **Timestamp**: 2026-05-26T (round-3 reviewers PLAN-READY/PLAN-NEEDS-MINOR all minor addressed)
+  - **Action**: Implemented #1357 plan v3.1 — introduced
+    `userspace-dp/src/session/ctx.rs` with `SessionInstall` (owned
+    key) and `SessionUpdate<'a>` (borrowed key); rewrote
+    `install_with_protocol_with_origin`,
+    `upsert_synced_with_origin`, `update_session`,
+    `promote_synced_with_origin` to take the context structs;
+    migrated 10 production + 35 test call sites mechanically (Python
+    script `/tmp/migrate_1357.py`).
+  - **File(s)**: `userspace-dp/src/session/ctx.rs` (new),
+    `userspace-dp/src/session/mod.rs`,
+    `userspace-dp/src/afxdp/mod.rs` (export SessionInstall/Update),
+    `userspace-dp/src/afxdp/shared_ops.rs`,
+    `userspace-dp/src/afxdp/forwarding/mod.rs`,
+    `userspace-dp/src/afxdp/poll_descriptor/mod.rs`,
+    `userspace-dp/src/afxdp/session_glue/mod.rs`,
+    `userspace-dp/src/session/tests.rs`,
+    `userspace-dp/src/afxdp/tests.rs`,
+    `userspace-dp/src/afxdp/session_glue/tests.rs`,
+    `userspace-dp/src/afxdp/forwarding/tests.rs`.
+  - **Validation (after rollback per code-review)**:
+    - `cargo build` clean (production code).
+    - `cargo test --release` 1487 pass / 1 fail. The single
+      failure is `snat_contract_doc_guard` which is a pre-existing
+      master regression (verified by building origin/master cold:
+      same test fails on master). Not introduced by this change.
+    - 5/5 flake check on `session::tests` passed.
+    - Go suite green (`go test ./...` all `ok`).
+    - **Codegen sanity post-rollback**: binary +21 KB (5559256 →
+      5580008). Per-fn instruction counts: install +0.4%, upsert
+      +9.0%, update+promote fully inlined. All under the 10% gate.
+    - **Code-review rollback rationale**: round-1 Codex and Gemini
+      both returned MERGE-NEEDS-MAJOR with the same single finding:
+      the v3.1 plan's >10% rollback gate was triggered narrowly
+      for `install_with_protocol_with_origin` (274 → 357 insns,
+      +30%). Initial implementation tried to ship anyway citing
+      total binary shrink as a holistic win, but Gemini correctly
+      pointed out the 7 non-inlined callers pay the +83-insn
+      destructure prelude per invocation on the session-install
+      hot path. Reverted that fn to positional (originally planned
+      fallback). Kept the other three context-struct fns. Final
+      shape documented in `plan.md` "Rollback execution" section.
 
 ## 2026-05-26 — #1476 Phase B AWAITING-MERGE at f815c357
 
