@@ -2110,3 +2110,136 @@ fn cos_runtime_config_changed_detects_queue_rate_change() {
     assert!(cos_runtime_config_changed(&current, &next));
     assert!(!cos_runtime_config_changed(&current, &current));
 }
+
+/// #784 regression pin: `active_flow_buckets_peak` aggregates across
+/// worker instances of the same queue using MAX, not SUM. Codex
+/// round-1 PLAN-NEEDS-MAJOR finding #3 flagged that this invariant
+/// had no test coverage on the worker-status path. Two binding-less
+/// runtimes for the same ifindex/queue with distinct peaks (7, 11)
+/// must report 11 (max) in the merged status row, not 18 (sum).
+#[test]
+fn active_flow_buckets_peak_is_max_not_sum_across_workers() {
+    let mut forwarding = ForwardingState::default();
+    forwarding
+        .ifindex_to_config_name
+        .insert(80, "reth0.80".to_string());
+    forwarding.cos.interfaces.insert(
+        80,
+        CoSInterfaceConfig {
+            shaping_rate_bytes: 1_875_000,
+            burst_bytes: 64 * 1024,
+            default_queue: 0,
+            dscp_classifier: String::new(),
+            ieee8021_classifier: String::new(),
+            dscp_queue_by_dscp: [u8::MAX; 64],
+            ieee8021_queue_by_pcp: [u8::MAX; 8],
+            queue_by_forwarding_class: FastMap::default(),
+            queues: vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "bandwidth-10mb".to_string(),
+                priority: 1,
+                transmit_rate_bytes: 1_250_000,
+                guarantee_enabled: true,
+                exact: false,
+                surplus_sharing: false,
+                equal_flow_enforcement: false,
+                surplus_weight: 1,
+                buffer_bytes: 32 * 1024,
+                dscp_rewrite: None,
+            }],
+        },
+    );
+
+    let make_root = |peak: u16| {
+        let mut ff = crate::afxdp::types::FlowFairState::new(0);
+        ff.active_flow_buckets_peak = peak;
+        CoSInterfaceRuntime {
+            shaping_rate_bytes: 1_875_000,
+            burst_bytes: 64 * 1024,
+            tokens: 0,
+            nonexact_surplus_under_exact_tokens: 0,
+            nonexact_surplus_under_exact_last_refill_ns: 0,
+            default_queue: 0,
+            nonempty_queues: 0,
+            runnable_queues: 0,
+            exact_guarantee_rr: 0,
+            nonexact_guarantee_rr: 0,
+            #[cfg(test)]
+            legacy_guarantee_rr: 0,
+            queues: vec![CoSQueueRuntime {
+                config: crate::afxdp::types::CoSQueueConfigState {
+                    queue_id: 4,
+                    priority: 1,
+                    transmit_rate_bytes: 1_250_000,
+                    guarantee_enabled: true,
+                    exact: false,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    flow_fair: true,
+                    shared_exact: false,
+                    surplus_weight: 1,
+                    buffer_bytes: 32 * 1024,
+                    dscp_rewrite: None,
+                },
+                hot: crate::afxdp::types::CoSQueueHotState {
+                    surplus_deficit: 0,
+                    tokens: 0,
+                    last_refill_ns: 0,
+                    queued_bytes: 0,
+                    runnable: false,
+                    parked: false,
+                    next_wakeup_tick: 0,
+                    wheel_level: 0,
+                    wheel_slot: 0,
+                    items: VecDeque::new(),
+                    local_item_count: 0,
+                },
+                flow_fair_state: Some(Box::new(ff)),
+                v_min: crate::afxdp::types::VMinQueueState {
+                    vtime_floor: None,
+                    worker_id: 0,
+                    consecutive_v_min_skips: 0,
+                    v_min_suspended_remaining: 0,
+                    v_min_hard_cap_overrides_scratch: 0,
+                    v_min_throttles_scratch: 0,
+                },
+                telemetry: crate::afxdp::types::CoSQueueTelemetry {
+                    drop_counters: CoSQueueDropCounters::default(),
+                    owner_profile: CoSQueueOwnerProfile::new(),
+                },
+                queue_lease_v8: None,
+            }],
+            queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
+            rr_index_by_priority: [0; COS_PRIORITY_LEVELS],
+            timer_wheel: CoSTimerWheelRuntime {
+                current_tick: 0,
+                level0: std::array::from_fn(|_| Vec::new()),
+                level1: std::array::from_fn(|_| Vec::new()),
+            },
+        }
+    };
+
+    let mut first = FastMap::default();
+    first.insert(80, make_root(7));
+    let mut second = FastMap::default();
+    second.insert(80, make_root(11));
+
+    let statuses =
+        build_worker_cos_statuses_from_maps([(&first, None), (&second, None)], &forwarding);
+    assert_eq!(statuses.len(), 1);
+    let iface = &statuses[0];
+    assert_eq!(iface.queues.len(), 1);
+    let queue = &iface.queues[0];
+    assert_eq!(
+        queue.active_flow_buckets_peak, 11,
+        "active_flow_buckets_peak must aggregate by MAX across worker \
+         instances (#784): observed peaks {{7, 11}} must report 11, \
+         not 18 (sum). A regression that switches to saturating_add \
+         here silently doubles the on-wire collision count."
+    );
+    assert!(
+        queue.flow_fair,
+        "flow_fair must propagate from any contributing worker so \
+         operators can detect SFQ misconfiguration"
+    );
+}

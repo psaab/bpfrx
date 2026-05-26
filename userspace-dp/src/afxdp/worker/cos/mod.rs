@@ -62,6 +62,26 @@ use super::*;
 // All fns operate on per-binding CoS state; none touch the XSK fast
 // path or HA reconciliation directly.
 
+// #1349: per-row accumulators and the orchestrator for the
+// `build_worker_cos_statuses_*` status RPC path live in sibling
+// submodules. The 268-LOC orchestrator body that previously lived
+// here as `build_worker_cos_statuses_from_maps` now lives in
+// `status.rs`, with the per-interface / per-queue accumulation
+// delegated to `interface_row.rs` / `queue_row.rs`.
+mod interface_row;
+mod queue_row;
+mod status;
+
+pub(in crate::afxdp::worker) use status::build_worker_cos_statuses;
+
+// Test-only re-export of the orchestrator entry. Tests live in the
+// sibling `tests.rs` submodule (post-#1349 layout) and use the
+// `use super::*;` pattern, so reaching into `status::` directly would
+// require modifying every test call site. Keeping the re-export
+// preserves the test bodies as pure-code-motion.
+#[cfg(test)]
+pub(in crate::afxdp::worker) use status::build_worker_cos_statuses_from_maps;
+
 pub(super) fn build_worker_cos_owner_live_by_tx_ifindex<I>(
     bindings: I,
 ) -> FastMap<i32, Arc<BindingLiveState>>
@@ -168,21 +188,6 @@ pub(super) fn build_worker_cos_fast_interfaces(
         );
     }
     out
-}
-
-pub(super) fn build_worker_cos_statuses(
-    bindings: &[BindingWorker],
-    forwarding: &ForwardingState,
-) -> Vec<crate::protocol::CoSInterfaceStatus> {
-    // #709: pair each cos_map with its owner-binding's live state so the
-    // per-queue telemetry fields (drain_latency_hist, owner_pps, ...)
-    // can be populated from the binding that actually did the work.
-    build_worker_cos_statuses_from_maps(
-        bindings
-            .iter()
-            .map(|binding| (&binding.cos.cos_interfaces, Some(binding.live.as_ref()))),
-        forwarding,
-    )
 }
 
 /// Return the single `(ifindex, queue_id)` that can truthfully inherit
@@ -531,306 +536,5 @@ pub(in crate::afxdp) fn merge_binding_scoped_owner_profile(
         .drain_sent_bytes_shaped_unconditional
         .saturating_add(profile.drain_sent_bytes_shaped_unconditional);
 }
-
-fn build_worker_cos_statuses_from_maps<'a, I>(
-    cos_maps: I,
-    forwarding: &ForwardingState,
-) -> Vec<crate::protocol::CoSInterfaceStatus>
-where
-    I: IntoIterator<
-        Item = (
-            &'a FastMap<i32, CoSInterfaceRuntime>,
-            Option<&'a BindingLiveState>,
-        ),
-    >,
-{
-    let mut interfaces = BTreeMap::<i32, crate::protocol::CoSInterfaceStatus>::new();
-    let mut queue_maps = BTreeMap::<i32, BTreeMap<u8, crate::protocol::CoSQueueStatus>>::new();
-    for (cos_map, binding_live) in cos_maps {
-        // #709: snapshot the binding's owner-profile counters ONCE per
-        // binding per scrape. The source is binding-scoped, so we only
-        // surface it on an unambiguous queue row: exactly one owner-local
-        // exact queue ACROSS THE WHOLE BINDING (all interfaces it drains).
-        // Shared-exact, non-exact, and multi-owner-local exact shapes —
-        // whether within one interface or spread across interfaces —
-        // stay zero here until the telemetry becomes queue-scoped.
-        let binding_profile = binding_live.map(owner_profile_snapshot);
-        let owner_profile_row = unique_owner_profile_row(cos_map, forwarding);
-        for (&ifindex, root) in cos_map {
-            let entry = interfaces.entry(ifindex).or_default();
-            entry.ifindex = ifindex;
-            if entry.interface_name.is_empty() {
-                entry.interface_name = forwarding
-                    .ifindex_to_config_name
-                    .get(&ifindex)
-                    .cloned()
-                    .or_else(|| forwarding.ifindex_to_name.get(&ifindex).cloned())
-                    .unwrap_or_else(|| format!("ifindex-{ifindex}"));
-            }
-            entry.shaping_rate_bytes = entry.shaping_rate_bytes.max(root.shaping_rate_bytes);
-            entry.burst_bytes = entry.burst_bytes.max(root.burst_bytes);
-            entry.worker_instances = entry.worker_instances.saturating_add(1);
-            entry.timer_level0_sleepers = entry.timer_level0_sleepers.saturating_add(
-                root.timer_wheel
-                    .level0
-                    .iter()
-                    .map(std::vec::Vec::len)
-                    .sum::<usize>(),
-            );
-            entry.timer_level1_sleepers = entry.timer_level1_sleepers.saturating_add(
-                root.timer_wheel
-                    .level1
-                    .iter()
-                    .map(std::vec::Vec::len)
-                    .sum::<usize>(),
-            );
-            let interface_config = forwarding.cos.interfaces.get(&ifindex);
-            let queue_map = queue_maps.entry(ifindex).or_default();
-            for queue in &root.queues {
-                let status = queue_map.entry(queue.queue_id()).or_default();
-                status.queue_id = queue.queue_id();
-                let queue_config = interface_config.and_then(|cfg| {
-                    cfg.queues
-                        .iter()
-                        .find(|config| config.queue_id == queue.queue_id())
-                });
-                if let Some(config) = queue_config {
-                    if status.forwarding_class.is_empty() {
-                        status.forwarding_class = config.forwarding_class.clone();
-                    }
-                }
-                if status.worker_instances == 0 {
-                    status.priority = queue.config.priority;
-                }
-                status.exact = queue.config.exact;
-                status.guarantee_enabled = queue.config.guarantee_enabled;
-                status.transmit_rate_bytes =
-                    status.transmit_rate_bytes.max(queue.transmit_rate_bytes());
-                status.buffer_bytes = status
-                    .buffer_bytes
-                    .saturating_add(queue.config.buffer_bytes);
-                status.worker_instances = status.worker_instances.saturating_add(1);
-                status.queued_packets = status
-                    .queued_packets
-                    .saturating_add(cos_queue_len(queue) as u64);
-                status.queued_bytes = status.queued_bytes.saturating_add(queue.hot.queued_bytes);
-                if queue.hot.runnable {
-                    status.runnable_instances = status.runnable_instances.saturating_add(1);
-                }
-                if queue.hot.parked {
-                    status.parked_instances = status.parked_instances.saturating_add(1);
-                }
-                if status.next_wakeup_tick == 0
-                    || (queue.hot.next_wakeup_tick > 0
-                        && queue.hot.next_wakeup_tick < status.next_wakeup_tick)
-                {
-                    status.next_wakeup_tick = queue.hot.next_wakeup_tick;
-                }
-                status.surplus_deficit_bytes = status
-                    .surplus_deficit_bytes
-                    .saturating_add(queue.hot.surplus_deficit);
-                // #784: use MAX across worker instances (not sum) —
-                // the peak is per-worker observed; aggregating by
-                // max gives the worst-case collision visibility
-                // without inflating the number by double-counting.
-                let peak = queue
-                    .flow_fair_state
-                    .as_ref()
-                    .map_or(0, |ff| u64::from(ff.active_flow_buckets_peak));
-                if peak > status.active_flow_buckets_peak {
-                    status.active_flow_buckets_peak = peak;
-                }
-                // #784: surface flow_fair so we can detect queues
-                // that were expected to run SFQ but aren't.
-                if queue.flow_fair() {
-                    status.flow_fair = true;
-                }
-                // #710: aggregate drop-reason counters across worker
-                // instances for this queue. Each worker's per-queue
-                // runtime is single-writer (only the owner worker
-                // increments the counter for its own queue), so
-                // summing across workers gives the cluster-wide totals.
-                status.admission_flow_share_drops = status
-                    .admission_flow_share_drops
-                    .saturating_add(queue.telemetry.drop_counters.admission_flow_share_drops);
-                status.admission_buffer_drops = status
-                    .admission_buffer_drops
-                    .saturating_add(queue.telemetry.drop_counters.admission_buffer_drops);
-                // #718: aggregate ECN CE-mark counter across workers.
-                // Same single-writer invariant as the other admission
-                // counters — owner worker only.
-                status.admission_ecn_marked = status
-                    .admission_ecn_marked
-                    .saturating_add(queue.telemetry.drop_counters.admission_ecn_marked);
-                status.root_token_starvation_parks = status
-                    .root_token_starvation_parks
-                    .saturating_add(queue.telemetry.drop_counters.root_token_starvation_parks);
-                status.queue_token_starvation_parks = status
-                    .queue_token_starvation_parks
-                    .saturating_add(queue.telemetry.drop_counters.queue_token_starvation_parks);
-                status.tx_ring_full_submit_stalls = status
-                    .tx_ring_full_submit_stalls
-                    .saturating_add(queue.telemetry.drop_counters.tx_ring_full_submit_stalls);
-                // #751: the owner-side drain telemetry
-                // (drain_latency_hist + drain_invocations) now lives
-                // per-queue on CoSQueueTelemetry.owner_profile — each
-                // exact queue gets its OWN histogram populated
-                // directly from its own atomics, with no eligibility
-                // gate. Pre-#751 these came from a binding-wide
-                // rollup that was only surfaced on the single
-                // "unambiguous owner-local exact queue" row; as a
-                // result #732 showed every queue row of a
-                // multi-queue binding with identical values.
-                //
-                // HFT notes on the atomic loads below:
-                //   * Single-writer (owner worker thread) + cross-
-                //     thread read (snapshot path). Relaxed is the
-                //     correct ordering: the reader tolerates ~1
-                //     count of tearing between the hist buckets
-                //     and drain_invocations, and Prometheus scrape
-                //     semantics are "best effort at scrape time".
-                //   * The owner_profile atomics sit alongside the
-                //     plain u64 fields in CoSQueueRuntime that the
-                //     same owner also mutates each tick, so there is
-                //     no false-sharing cost internal to the worker.
-                //     The snapshot reader pulls the cache line
-                //     once per scrape — negligible.
-                //   * Load invocations first so an untouched queue
-                //     (zero counter) skips the histogram walk and
-                //     keeps the on-wire status vector empty — saves
-                //     the resize + 16 bucket copies plus the 128
-                //     bytes of serde overhead on queues that never
-                //     drained. The writer always bumps both hist and
-                //     invocations under Relaxed, so
-                //     invocations==0 ⇒ all buckets are zero; the
-                //     reverse may briefly be false due to tearing,
-                //     but a ~1-count under-report from a single
-                //     reader is within the tolerance documented on
-                //     CoSQueueOwnerProfile.
-                let queue_invocations = queue
-                    .telemetry
-                    .owner_profile
-                    .drain_invocations
-                    .load(Ordering::Relaxed);
-                if queue_invocations > 0 {
-                    if status.drain_latency_hist.len() < DRAIN_HIST_BUCKETS {
-                        status.drain_latency_hist.resize(DRAIN_HIST_BUCKETS, 0);
-                    }
-                    for i in 0..DRAIN_HIST_BUCKETS {
-                        let bucket_count = queue.telemetry.owner_profile.drain_latency_hist[i]
-                            .load(Ordering::Relaxed);
-                        status.drain_latency_hist[i] =
-                            status.drain_latency_hist[i].saturating_add(bucket_count);
-                    }
-                    status.drain_invocations =
-                        status.drain_invocations.saturating_add(queue_invocations);
-                }
-                // #760 overshoot-hunt instrumentation. Same Relaxed
-                // load pattern as drain_invocations — single writer
-                // (owner worker, at the queue-token decrement sites
-                // in tx.rs) + single reader (this snapshot path).
-                // drain_sent_bytes is the authoritative per-queue
-                // "bytes the scheduler actually shaped out"; pair it
-                // with `queue.transmit_rate_bytes` over a scrape
-                // window to detect a direct cap bypass on this row.
-                // The guarantee/surplus split and non-exact/exact-
-                // backlog counter diagnose whether root surplus or
-                // non-exact guarantee service is stealing service
-                // from exact queues. drain_park_root_tokens /
-                // drain_park_queue_tokens both rising with
-                // drain_sent_bytes sustaining above configured rate
-                // would mean the gate fires but refill/accounting is
-                // wrong; both near zero with drain_sent_bytes above
-                // rate means the gate never ran for this queue.
-                status.drain_sent_bytes = status.drain_sent_bytes.saturating_add(
-                    queue
-                        .telemetry
-                        .owner_profile
-                        .drain_sent_bytes
-                        .load(Ordering::Relaxed),
-                );
-                status.drain_guarantee_sent_bytes =
-                    status.drain_guarantee_sent_bytes.saturating_add(
-                        queue
-                            .telemetry
-                            .owner_profile
-                            .drain_guarantee_sent_bytes
-                            .load(Ordering::Relaxed),
-                    );
-                status.drain_surplus_sent_bytes = status.drain_surplus_sent_bytes.saturating_add(
-                    queue
-                        .telemetry
-                        .owner_profile
-                        .drain_surplus_sent_bytes
-                        .load(Ordering::Relaxed),
-                );
-                status.drain_nonexact_sent_bytes_while_exact_backlogged = status
-                    .drain_nonexact_sent_bytes_while_exact_backlogged
-                    .saturating_add(
-                        queue
-                            .telemetry
-                            .owner_profile
-                            .drain_nonexact_sent_bytes_while_exact_backlogged
-                            .load(Ordering::Relaxed),
-                    );
-                status.drain_park_root_tokens = status.drain_park_root_tokens.saturating_add(
-                    queue
-                        .telemetry
-                        .owner_profile
-                        .drain_park_root_tokens
-                        .load(Ordering::Relaxed),
-                );
-                status.drain_park_queue_tokens = status.drain_park_queue_tokens.saturating_add(
-                    queue
-                        .telemetry
-                        .owner_profile
-                        .drain_park_queue_tokens
-                        .load(Ordering::Relaxed),
-                );
-
-                // #709 / #748 / #751: the *binding-scoped* fields
-                // (redirect_acquire_hist, owner_pps, peer_pps,
-                // drain_noop_invocations) are surfaced only on the
-                // single unambiguous owner-local exact queue row on
-                // the whole binding. Producers don't know the target
-                // queue at redirect time so these fields cannot be
-                // queue-scoped and still stay truthful; any
-                // shared-exact, non-exact, or multi-owner-local
-                // shape keeps them at zero rather than surfacing a
-                // binding-wide mixed profile under an arbitrary row.
-                if owner_profile_row == Some((ifindex, queue.queue_id())) {
-                    if let Some(profile) = binding_profile.as_ref() {
-                        merge_binding_scoped_owner_profile(status, profile);
-                    }
-                }
-            }
-        }
-    }
-    let mut out = Vec::with_capacity(interfaces.len());
-    for (ifindex, mut iface) in interfaces {
-        if let Some(queue_map) = queue_maps.remove(&ifindex) {
-            iface.queues = queue_map.into_values().collect();
-            iface.nonempty_queues = iface
-                .queues
-                .iter()
-                .filter(|queue| queue.queued_packets > 0 || queue.queued_bytes > 0)
-                .count();
-            iface.runnable_queues = iface
-                .queues
-                .iter()
-                .filter(|queue| queue.runnable_instances > 0)
-                .count();
-        }
-        out.push(iface);
-    }
-    out.sort_by(|a, b| {
-        a.interface_name
-            .cmp(&b.interface_name)
-            .then(a.ifindex.cmp(&b.ifindex))
-    });
-    out
-}
-
 #[cfg(test)]
-#[path = "cos_tests.rs"]
 mod tests;

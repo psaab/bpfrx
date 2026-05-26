@@ -4535,3 +4535,21 @@
     marker is in the PR body for the refactor-chain batch.
   - **File(s)**: PR #1587 at 4ff0b6c1,
     docs/pr/1547-frr-split/reviewer-ids.md
+- **Timestamp**: 2026-05-26 21:28 UTC
+  - **Action**: #1349 split worker/cos/build_worker_cos_statuses_from_maps
+    (268 LOC) into interface_row/queue_row/status helpers under
+    worker/cos/ subdir. Plan-review rounds: Codex r1 PLAN-NEEDS-MAJOR,
+    Gemini r1 PLAN-KILL, AGY r1 PLAN-READY, Claude SMR PLAN-NEEDS-MINOR.
+    Plan v2 addressed Codex/SMR + Gemini's first counter-example
+    (dropped merge_binding_profile_if_target, inlined gated merge).
+    v2: Codex MAJOR (stale text + alloc wording + ifindex), Gemini KILL
+    (style preference), AGY READY. v3 mechanical cleanup; Codex r3
+    PLAN-READY pending metadata count fix. Per
+    feedback_gemini_low_signal_on_refactor, Gemini's KILL on a
+    refactor PR is not blocking when Codex+AGY+Claude SMR agree.
+    Implementation: pure code motion + new #784 MAX-not-sum test pin.
+    1434/1434 cargo bin tests pass; 24/24 cos tests pass; 5/5 flake
+    on named integration test.
+  - **File(s)**: userspace-dp/src/afxdp/worker/cos/{mod,interface_row,
+    queue_row,status,tests}.rs; docs/pr/1349-worker-cos-status-split/
+    {plan.md,reviewer-ids.md}
