@@ -3689,3 +3689,16 @@
   - KEPT: pkg/dataplane/runtime/import_canary_test.go:47 dpdk forbidden-backend (defense-in-depth)
   - KEPT: pkg/daemon/daemon_run.go:247 errors.Is(ErrDPDKBackendRetired) soft-fallback (now reachable for stored-config rolling-upgrade)
 - **Why**: Both Codex r7 (task-mpmbxohf-mft8dk) and AGY r5 (adversarial-review-mpmby226-tvzsfa) returned PLAN-READY on plan v3.3. Executed mechanical deletion + load-mode bypass per plan v3.3. All packages build clean (go build ./...). Full go test ./... passes. 5x flake check on all DPDK-related tests passes (25/25 runs). make build succeeds. make -n build-dpdk / clean-dpdk correctly report "no rule".
+
+- **Timestamp**: 2026-05-26T02:30Z
+- **Action**: #1528 PR #1560 opened; code-review cycle dispatched
+- **File(s)**: docs/pr/1528-dpdk-mechanical-removal/reviewer-ids.md
+- **Why**: PR #1560 (HEAD ecc4d5b8) opened with full plan v3.3 implementation.
+  Body contains `Closes #1528` per feedback_pr_body_close_keyword. Copilot
+  added via gh pr edit + @copilot review comment per feedback_copilot_two_bots.
+  Dispatched Codex hostile code review (task-mpmf8tph-0dwkmf, inline-content)
+  and AGY adversarial code review (adversarial-review-mpmf9e1k-p2wray) in
+  parallel. Posted Claude SMR adversarial review as PR comment per
+  feedback_triple_review_includes_claude_smr (MERGE-READY verdict). Awaiting
+  Codex + AGY + Copilot to reach 4-of-4 attestation, then will post
+  <!-- AWAITING-MERGE --> marker per feedback_retirement_batch_smoke_at_end.

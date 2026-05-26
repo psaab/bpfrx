@@ -60,8 +60,19 @@
 ### Round 5 — 2026-05-26, plan v3.3 (3328cc49)
 
 - Codex r7: task-mpmbxohf-mft8dk (dispatched ~02:00Z, inline-content workaround)
-- Antigravity r5: adversarial-review-mpmby226-tvzsfa (dispatched ~02:00Z)
+- Antigravity r5: adversarial-review-mpmby226-tvzsfa (completed) — **PLAN-READY**
 
 ## Code review
 
-(none yet)
+### PR #1560 (HEAD ecc4d5b8)
+
+- Codex: task-mpmf8tph-0dwkmf (dispatched ~02:25Z, inline-content workaround)
+- Antigravity: adversarial-review-mpmf9e1k-p2wray (dispatched ~02:25Z)
+- Copilot: requested via `gh pr edit --add-reviewer Copilot` + `@copilot review` comment (~02:24Z)
+- Claude SMR: posted as PR comment (https://github.com/psaab/xpf/pull/1560#issuecomment-4542722009) — **MERGE-READY**
+  - Verified load-mode bypass propagation discipline (called only from Store.Load; SyncApply/Commit/CommitCheck/Validate still use non-bypass compileTree)
+  - Verified CompileConfig / CompileConfigForNode behavior preservation under the compileWithOpts refactor
+  - Verified orphan sub-stanza silent-drop is consistent with load-mode bypass semantic
+  - Verified Phase 1 reject preservation across all tests
+  - Verified canary deletion is replaced by Go-compiler enforcement + runtime/import_canary_test.go:47 defense-in-depth
+  - Verified slog.Warn lifecycle (fires once at Load, doesn't repeat)
