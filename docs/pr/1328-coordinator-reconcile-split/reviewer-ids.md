@@ -1,9 +1,18 @@
 # Reviewer task IDs — #1328 Coordinator decompose Phase 2
 
+## Code review round 2 (HEAD 97b81739, PR #1570)
+- Codex: task-mpmxisuc-ni3rm3
+- AGY:   review-mpmxiv5r-ybhx29
+- Copilot: @copilot re-review requested via PR comment
+
 ## Code review round 1 (HEAD ffb57266, PR #1570)
-- Codex: task-mpmx943s-q3i3fg
-- AGY:   review-mpmx98v3-pit578
-- Copilot: @copilot review posted via PR comment
+- Codex: task-mpmx943s-q3i3fg (sandbox infra ENOENT) -> retry
+  task-mpmxbgch-2gp4px (also ENOENT) -> task-mpmxdjdu-6e25by
+  (summary-only best effort) MERGE-READY
+- AGY:   review-mpmx98v3-pit578 — MERGE-READY (full inspection)
+- Copilot: copilot-pull-request-reviewer COMMENTED with 2 findings
+  - zero_unbound_slot misses 3 tx_error subset counter zeros
+  - test name implies more coverage than the body asserts
 
 ## Plan round 4 (HEAD dab1ada3) — both PLAN-READY
 - Codex: task-mpmvh9at-ri87j9 — PLAN-READY (best effort; sandbox
