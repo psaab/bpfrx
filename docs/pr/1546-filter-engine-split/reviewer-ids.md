@@ -12,7 +12,11 @@ Codex/AGY session state evicts.
 - Codex retry: task-mpmzi3li-e6irdd
 - AGY:   adversarial-review-mpmz9ii5-50whwe — PLAN-READY
 
-## Code review round 1
-- Codex: <pending>
-- AGY:   <pending>
-- Copilot: <pending>
+## Plan review round 2 — Codex retry attempts
+- Codex retry 2 (task-mpmzi3li-e6irdd) — infra failure
+- Codex retry 3 (task-mpmznlfo-vjfrtm) — infra failure
+
+## Code review round 1 (PR #1574 head fde64872)
+- Codex: task-mpmzq56b-4gpf9v
+- AGY:   adversarial-review-mpmzqfwm-qgplfh
+- Copilot: requested via @copilot review

@@ -1,5 +1,25 @@
 # Action Log
 
+## 2026-05-26 — #1546 fix: centralize log-match helper + rustfmt
+
+- **Timestamp**: 2026-05-26 (PR #1574 head fde64872 -> next)
+  - **Action**: Address Codex code-review r1 MERGE-NEEDS-MAJOR.
+    Centralize the log-match helper: eliminate the
+    `tx_selection_log_match` and `cached_log_match` duplicates
+    introduced by v2 by making `eval::filter_log_match` `pub(super)`
+    and importing it from tx_selection.rs and cache_sensitive.rs.
+    Function count drops from 53 back to 51, matching the
+    pre-split engine.rs and the "pure code motion" attestation.
+    Also fix rustfmt on policer.rs:51. cargo build clean, 40/40
+    filter tests pass.
+  - **File(s)**: userspace-dp/src/filter/engine/tx_selection.rs
+    (removed tx_selection_log_match, import filter_log_match),
+    userspace-dp/src/filter/engine/cache_sensitive.rs (removed
+    cached_log_match, import filter_log_match),
+    userspace-dp/src/filter/engine/eval.rs (filter_log_match
+    already pub(super) — no change needed),
+    userspace-dp/src/filter/engine/policer.rs (rustfmt fix).
+
 ## 2026-05-26 — #1546 filter engine split implemented (plan v2)
 
 - **Timestamp**: 2026-05-26

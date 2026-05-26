@@ -14,6 +14,7 @@
 // configured rewrite.
 
 use super::super::*;
+use super::eval::filter_log_match;
 use super::matching::{term_matches_v4, term_matches_v6};
 use super::policer::apply_term_three_color_policer;
 
@@ -130,7 +131,7 @@ fn evaluate_filter_ref_tx_selection_counted_v4<'a>(
                 .then_some(term.forwarding_class.as_ref()),
             dscp_rewrite: policer_action.dscp_rewrite.or(term.dscp_rewrite),
             policer_drop: policer_action.drop,
-            log_match: tx_selection_log_match(filter, term),
+            log_match: filter_log_match(filter, term),
         };
     }
     TxSelectionFilterResult::default()
@@ -162,22 +163,10 @@ fn evaluate_filter_ref_tx_selection_counted_v6<'a>(
                 .then_some(term.forwarding_class.as_ref()),
             dscp_rewrite: policer_action.dscp_rewrite.or(term.dscp_rewrite),
             policer_drop: policer_action.drop,
-            log_match: tx_selection_log_match(filter, term),
+            log_match: filter_log_match(filter, term),
         };
     }
     TxSelectionFilterResult::default()
-}
-
-// Local clone of eval::filter_log_match used by the tx_selection result
-// construction. Kept here to avoid making eval::filter_log_match a
-// crate-wide name; semantics are byte-identical.
-#[inline]
-fn tx_selection_log_match(filter: &Filter, term: &FilterTerm) -> Option<FilterLogMatch> {
-    term.log.then_some(FilterLogMatch {
-        filter_id: filter.id,
-        term_id: term.id,
-        action: term.action,
-    })
 }
 
 pub(crate) fn evaluate_interface_filter_tx_selection_counted<'a>(

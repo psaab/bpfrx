@@ -48,10 +48,7 @@ pub(crate) fn apply_cached_three_color_policers(
     action
 }
 
-pub(crate) fn filter_state_has_input_three_color_policer(
-    state: &FilterState,
-    is_v6: bool,
-) -> bool {
+pub(crate) fn filter_state_has_input_three_color_policer(state: &FilterState, is_v6: bool) -> bool {
     if is_v6 {
         state.has_input_three_color_policer_v6
     } else {

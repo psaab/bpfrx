@@ -1,6 +1,19 @@
 # #1546 — Split filter engine into responsibility-scoped submodules
 
-**Status:** v2 — addresses Codex r1 NEEDS-MAJOR + AGY r1 NEEDS-MINOR. Pending r2.
+**Status:** v3 — addresses Codex code r1 NEEDS-MAJOR (centralize log helper + rustfmt). v2 plan-readied by AGY r2; Codex code r1 then asked to centralize the log-match helper to match the "pure code motion" claim. Plan moved to v3.
+
+### v2 -> v3 changes (Codex code r1 findings addressed)
+
+1. **Log-match helper centralized.** v2 introduced `tx_selection_log_match`
+   (in tx_selection.rs) and `cached_log_match` (in cache_sensitive.rs) —
+   byte-identical to the original `filter_log_match`, but counted as a
+   net +2 fns vs the pre-split engine.rs (53 vs 51). Codex flagged this
+   as breaking the "byte-identical bodies / pure code motion" claim. v3
+   eliminates the duplicates: `filter_log_match` is `pub(super)` in
+   eval.rs and imported by both tx_selection.rs and cache_sensitive.rs.
+   Function count now matches: 51.
+2. **rustfmt clean.** policer.rs:51 reformatted to put
+   `filter_state_has_input_three_color_policer` signature on one line.
 
 ### v1 -> v2 changes (round-1 findings addressed)
 

@@ -11,6 +11,7 @@
 // desynchronized cache predicates.
 
 use super::super::*;
+use super::eval::filter_log_match;
 use super::matching::{term_matches_v4, term_matches_v6};
 
 pub(crate) fn evaluate_filter_ref_tx_selection_cached(
@@ -55,7 +56,7 @@ fn evaluate_filter_ref_tx_selection_cached_v4(
             three_color_policers: CachedThreeColorPolicers::from_option(
                 term.three_color_policer.clone(),
             ),
-            log_match: cached_log_match(filter, term),
+            log_match: filter_log_match(filter, term),
         };
     }
     CachedTxSelectionFilterResult::default()
@@ -83,19 +84,10 @@ fn evaluate_filter_ref_tx_selection_cached_v6(
             three_color_policers: CachedThreeColorPolicers::from_option(
                 term.three_color_policer.clone(),
             ),
-            log_match: cached_log_match(filter, term),
+            log_match: filter_log_match(filter, term),
         };
     }
     CachedTxSelectionFilterResult::default()
-}
-
-#[inline]
-fn cached_log_match(filter: &Filter, term: &FilterTerm) -> Option<FilterLogMatch> {
-    term.log.then_some(FilterLogMatch {
-        filter_id: filter.id,
-        term_id: term.id,
-        action: term.action,
-    })
 }
 
 fn three_color_policer_semantics_match(
