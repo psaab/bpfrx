@@ -1,7 +1,76 @@
 ## Status
 
-DRAFT v2 — addresses Codex (task-mpn2upaq-qskyou) and Gemini
-(task-mpn2vhfn-fa69ga) round-1 PLAN-NEEDS-MAJOR findings.
+DRAFT v3 — addresses Codex round-2 PLAN-NEEDS-MINOR
+(task-mpn3550d-ulgt13) and Gemini round-2 PLAN-READY
+(task-mpn35qbw-y9m1ig). v2 closed all round-1 HIGH/MED;
+v3 addresses three Codex-round-2 doc/scope cleanups.
+
+## Round-2 reviewer findings + resolutions
+
+### Codex round-2 PLAN-NEEDS-MINOR (task-mpn3550d-ulgt13)
+
+Codex confirmed v2 closed round-1 findings 1, 3, 4 substantively
+and the main-loop sketch / did_work ownership are sound. Three
+doc/scope minors:
+
+**Codex-R2 Finding 1**: stale v1 text contradicts v2 deletion
+scope at `plan.md:147` and `plan.md:547`. Cascade is broader
+than the v2 "Public API changes (v2)" section listed: also
+`enqueue_pending_forwards` and
+`segment_forwarded_tcp_frames_into_prepared` carry the maps,
+which reaches `worker/lifecycle.rs:247`,
+`worker/loop_body/mod.rs:606`, `dispatch_tests.rs:440`.
+**v3 resolution**: re-scope the deletion to ONLY the drain-fn
+signatures and their direct forwarders. The `enqueue_*` /
+`segment_*` fns retain the maps because they're used by
+**other** code paths (`enqueue_local_request_to_target_or_owner`
+etc. genuinely need the maps for cross-binding routing).
+v3 implementation walk:
+
+- DELETE from: `drain_pending_tx`,
+  `drain_pending_tx_local_owner`, the call-chain hop inside
+  the drain-fn paths.
+- DROP arg-passing at: `worker/lifecycle.rs:66-67,97-98`
+  (drain call sites), `tx/dispatch.rs:322-323,391-392,
+  611-612,878-879` (drain_pending_tx_local_owner call sites),
+  `tx/tcp_segmentation.rs:96-97` (the
+  drain_pending_tx_local_owner call site).
+- KEEP at: `enqueue_pending_forwards`,
+  `segment_forwarded_tcp_frames_into_prepared`,
+  `worker/lifecycle.rs:247`, `worker/loop_body/mod.rs:606`,
+  `dispatch_tests.rs:440` — these legitimately need the maps
+  for non-drain logic.
+
+**Codex-R2 Finding 2**: v2 comment on `EarlyReturnRetry` at
+plan.md:35 falsely says "did_work was already mutated to true"
+— `drain.rs:231-233` returns `true` UNCONDITIONALLY on
+`TxError::Retry` (ignoring prior did_work). v3 corrects the
+comment.
+
+**Codex-R2 Finding 3**: Hidden-invariant wording at
+`plan.md:461` says "early-return points currently 2" but v2
+correctly models THREE. v3 rewrites that invariant as three
+exits: prepared retry, empty-after-prepared with debug
+update, empty-after-take without debug update.
+
+### Gemini round-2 PLAN-READY (task-mpn35qbw-y9m1ig)
+
+Gemini accepted v2. No new findings. Confirmed:
+- did_work via `&mut bool` correctly accumulates.
+- Three-variant BackupOutcome perfectly preserves
+  drain.rs:233 / drain.rs:247-249 / drain.rs:251-253 side-
+  effect distinction.
+- Phase 4 split into shaped_initial_drain +
+  shaped_reingest_budget bubbles updates correctly.
+- Phase 5 split: backup_drain_prepared returning
+  Some(EarlyReturnRetry) correctly skips backup_drain_local;
+  transmit_batch Retry inside backup_drain_local breaks loop
+  + executes restore_pending_tx_requests + returns Continue
+  (fall-through), matching drain.rs:295-298.
+- 5-file layout is the right compromise.
+- Codex's broader cascade observation also flagged by Gemini
+  (`enqueue_local_request_to_target_or_owner` in dispatch.rs).
+- `cargo asm` discipline preferred to runtime perf record.
 
 ## Round-1 reviewer findings + resolutions
 
@@ -32,9 +101,13 @@ enum MUST preserve that side-effect distinction.
 enum BackupOutcome {
     /// Normal completion — orchestrator continues to phase 6.
     Continue,
-    /// drain.rs:233 TxError::Retry path — orchestrator returns true.
-    /// (did_work was already mutated to true via the `did_work |= ...`
-    /// updates inside the phase; this variant just signals the return.)
+    /// drain.rs:231-233 TxError::Retry path — orchestrator
+    /// returns `true` UNCONDITIONALLY, ignoring prior
+    /// `did_work` accumulation. The current code at
+    /// `drain.rs:233` is `return true;` — bare literal, no
+    /// fold with `did_work`. v2 review caught a false claim
+    /// in v1 that this variant relied on `did_work` being
+    /// already-true; corrected here.
     EarlyReturnRetry,
     /// drain.rs:247-249 path — pending_tx_local + pending_tx_empty
     /// AFTER transmit_prepared loop. Orchestrator calls
@@ -144,12 +217,15 @@ all of which stay byte-identical. The win is purely structural:
   `tx/drain/tests.rs`, instead of every regression pin having to
   construct a full `BindingWorker` to exercise the orchestrator
   end-to-end.
-- The two trailing `_cos_owner_*_by_queue` params are routed
-  through `DrainCtx` and stay reserved (issue body asks the
-  question; this plan keeps them rather than deletes because
-  the public `drain_pending_tx_local_owner` wrapper at
-  `drain.rs:524` exists precisely to forward those params from
-  `worker/lifecycle.rs`. See "Open question 1").
+- The two trailing `_cos_owner_*_by_queue` params at
+  `drain.rs:71-72` are DELETED from the drain-fn signatures
+  and from their drain-call-chain forwarders (v2 resolution
+  of Codex round-1 finding 2 + Gemini OQ1; v3 narrowed scope
+  per Codex round-2 finding 1). Callers that retain the
+  maps for non-drain logic (`enqueue_pending_forwards`,
+  `segment_forwarded_tcp_frames_into_prepared`,
+  `worker/loop_body/mod.rs:606`) keep their own
+  parameterization. DrainCtx ends up with 4 fields.
 
 The win is operator-readability + test-decomposition, not
 cycles. **If reviewers conclude the perf-neutral churn is too
@@ -458,11 +534,32 @@ post-trim symbols).
    pending-empty-check → ingest-no-pps → inner-drain-loop →
    serviced-in-inner break. Both must stay byte-identical.
 
-3. **Early-return points** (currently 2): line 233
-   `return true;` on `TxError::Retry` from
-   `transmit_prepared_batch`, and lines 247-254
-   `update_binding_debug_state(binding); return did_work || ...`
-   on empty pending. Preserved via `BackupOutcome` enum.
+3. **Early-return points** (currently THREE distinct exits in
+   the backup-phase region — Codex round-2 finding 3
+   correction; v1 wrongly said "2"):
+
+   a. **Prepared retry** — `drain.rs:231-233` returns `true;`
+      bare literal on `TxError::Retry` from
+      `transmit_prepared_batch`. UNCONDITIONAL, ignores prior
+      `did_work`. Modeled by `BackupOutcome::EarlyReturnRetry`.
+
+   b. **Empty-after-prepared with debug update** —
+      `drain.rs:247-249`. After the `transmit_prepared_batch`
+      loop completes normally, if
+      `pending_tx_local.is_empty() && pending_tx_empty()`,
+      call `update_binding_debug_state(binding);` then
+      `return did_work || binding_has_pending_tx_work(binding);`.
+      Modeled by `BackupOutcome::EarlyReturnAfterDebugUpdate`.
+
+   c. **Empty-after-take without debug update** —
+      `drain.rs:251-253`. After
+      `take_pending_tx_requests`, if `pending.is_empty()`,
+      `return did_work || binding_has_pending_tx_work(binding);`
+      WITHOUT calling `update_binding_debug_state`. Modeled by
+      `BackupOutcome::EarlyReturnNoDebugUpdate`.
+
+   All three are preserved by the orchestrator's `match` on
+   `BackupOutcome` per the v2 main-loop sketch.
 
 4. **`did_work` accumulation** must remain equivalent: the
    final return is `did_work || binding_has_pending_tx_work(binding)`.
@@ -544,8 +641,13 @@ post-trim symbols).
   file, separate concern).
 - The wake / kick policy in `maybe_wake_tx`.
 - The `binding_has_pending_tx_work` top guard.
-- Deletion of the unused `_cos_owner_*_by_queue` params (see
-  Open question 1 — kept until plumbing decision is final).
+- ~~Deletion of the unused `_cos_owner_*_by_queue` params~~
+  (RESOLVED in v2 — deleted in-scope per Codex finding 2).
+  Per Codex round-2 finding 1, the deletion is narrowed to
+  the drain-fn signatures and direct forwarders only; the
+  maps remain in `enqueue_pending_forwards` /
+  `segment_forwarded_tcp_frames_into_prepared` because those
+  fns use them for cross-binding routing unrelated to drain.
 - Conversion of the `drop_cos_bound_*_leftovers` family to a
   phase-internal closure — kept as free functions in
   `drain/mod.rs` to preserve their unit-test surface.
