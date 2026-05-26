@@ -4335,3 +4335,26 @@
     preservation, risk table, and 7 open questions.
   - **File(s)**: `docs/pr/1342-forwarding-build-split/plan.md`,
     `docs/pr/1342-forwarding-build-split/reviewer-ids.md`.
+
+## 2026-05-26 — #1342 plan v2 (addressing r1 findings)
+
+- **Timestamp**: 2026-05-26T (plan v2)
+  - **Action**: Codex r1 returned PLAN-NEEDS-MAJOR (3 majors + 2
+    minors); AGY r1 returned PLAN-NEEDS-MINOR (5 action items).
+    Both agreed layout is correct. Revised plan to:
+    - Fix visibility: `pub(in crate::afxdp)` for cross-sibling
+      consumers; private `use cos::build_cos_state` (no API
+      widening); explicit re-export table.
+    - Add explicit `fib::sort_routes(&mut state)` call after
+      `fib::populate_routes` (was dropped from v1 sketch).
+    - Decompose `build_cos_state` internally into
+      `build_cos_classifier_tables` + `build_cos_iface_config` +
+      orchestrator (3 sub-100-LOC helpers).
+    - Relocate `forwarding_build_tests.rs` ->
+      `forwarding_build/tests.rs` (decision made, not deferred).
+    - Document static-NAT/DNAT local-delivery placement
+      constraint explicitly.
+    - Document `useful_cos_state` gate's queue-resolution
+      ordering invariant.
+  - **File(s)**:
+    `docs/pr/1342-forwarding-build-split/plan.md` v2.

@@ -1,6 +1,7 @@
 # #1342 — Split `forwarding_build.rs` by entity kind (plan v1)
 
-Status: DRAFT v1 — pending adversarial plan review (Codex + AGY).
+Status: v2 — addresses Codex r1 PLAN-NEEDS-MAJOR + AGY r1
+PLAN-NEEDS-MINOR. Pending r2 adversarial review.
 
 ## Issue framing
 
@@ -111,19 +112,69 @@ userspace-dp/src/afxdp/forwarding_build/
                     //   cos_surplus_weight + cos_priority_rank
 ```
 
-### Visibility
+### Visibility (revised after Codex r1 finding #1)
 
-Every helper currently `pub(super)` (visible to `afxdp::mod`) stays
-`pub(super)` so re-exports via `use self::forwarding_build::*;`
-in `afxdp/mod.rs` continue to work unchanged. Helpers that the
-orchestrator calls but external callers don't reach become
-`pub(super)` inside the new dir module (still re-exported one level
-up via `pub(super) use` in `forwarding_build/mod.rs`).
+`pub(super) use foo::bar` of a `pub(super) bar` item triggers
+**E0364** — see `userspace-dp/src/afxdp/tx/mod.rs:38-41` for the
+documented precedent (`drain.rs` reaches `enqueue_prepared_into_cos`
+through `use super::*;` precisely because of this).
+
+Correct visibility rules for this PR:
+
+| Symbol class | Where it lives | Visibility | How `afxdp/mod.rs` reaches it |
+|---|---|---|---|
+| Helpers re-exported via `use self::forwarding_build::*;` in `afxdp/mod.rs` (today `pub(super)`) | sibling file (e.g. `fib.rs`) | `pub(in crate::afxdp)` | Through a `pub(in crate::afxdp) use` line in `forwarding_build/mod.rs` |
+| Helpers called only inside the orchestrator (`build_cos_state`, sub-builders, gate evaluation) | sibling file (e.g. `cos.rs`) | `pub(super)` in the sibling | `use cos::{build_cos_state, ...};` (plain private `use`, NOT a `pub use`) in `forwarding_build/mod.rs` |
+| Helpers only used inside their own sibling file | sibling file | private (`fn`) | Not exported |
+| Tiny orchestrator-local helpers (`build_screen_profiles`, `parse_syn_cookie_master_key`) | `forwarding_build/mod.rs` itself | `pub(super)` if external use, else private | Reached via `use self::forwarding_build::*;` for `pub(super)` items |
+
+Explicit list of items moved that **must** be `pub(in crate::afxdp)`
+in their new sibling (these are reached by sibling modules of
+`forwarding_build` through `use self::forwarding_build::*;` in
+`afxdp/mod.rs`):
+
+- `pick_interface_v4`, `pick_interface_v6` (in `interfaces.rs`)
+- `resolve_route_target_v4`, `resolve_route_target_v6` (in `fib.rs`)
+- `parse_route_next_hop`, `parse_route_next_hop_v6` (in `fib.rs`)
+- `resolve_ifindex` (in `fib.rs`)
+- `infer_connected_route_target_v4`,
+  `infer_connected_route_target_v6` (in `fib.rs`)
+
+`forwarding_build/mod.rs` then writes:
+
+```rust
+mod zones;
+mod tunnels;
+mod interfaces;
+mod fib;
+mod cos;
+
+#[cfg(test)]
+mod tests;
+
+// Re-exports for cross-afxdp-sibling consumers reached via
+// `use self::forwarding_build::*;` in afxdp/mod.rs.
+pub(in crate::afxdp) use interfaces::{pick_interface_v4, pick_interface_v6};
+pub(in crate::afxdp) use fib::{
+    infer_connected_route_target_v4, infer_connected_route_target_v6,
+    parse_route_next_hop, parse_route_next_hop_v6,
+    resolve_ifindex,
+    resolve_route_target_v4, resolve_route_target_v6,
+};
+
+// Plain (private) `use` for orchestrator-local symbols. NOT a
+// `pub(super) use` of a `pub(super)` item — that triggers E0364.
+use cos::build_cos_state;
+use interfaces::IfaceIndex;
+```
+
+`build_cos_state` is brought in via private `use`, NOT made
+`pub(super)`. This preserves its current "module-private,
+test-reachable via `super::*`" surface. (Codex r1 finding #3.)
 
 Free functions that don't need cross-module visibility (e.g.
-`parse_syn_cookie_master_key` only called from
-`build_forwarding_state_with_policy_counters_and_previous`) move
-alongside their caller. They stay private to the new sub-module.
+`parse_syn_cookie_master_key`) stay in `forwarding_build/mod.rs`
+alongside their caller. They stay private to the file.
 
 ### Orchestrator shape (after split)
 
@@ -168,6 +219,9 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
 
     fib::sort_connected(&mut state);
     fib::populate_routes(snapshot, &mut state, &iface_ctx);
+    // (Codex r1 finding #2) explicit sort step preserves the
+    // forwarding_build.rs:345-350 sort-after-populate ordering.
+    fib::sort_routes(&mut state);
     fib::populate_neighbors(snapshot, &mut state);
     fib::populate_fabrics(snapshot, &mut state, &iface_ctx);
 
@@ -211,96 +265,229 @@ pub(super) struct IfaceIndex {
 walks borrow it. Zero new allocations — the maps already exist in
 the current code as locals.
 
-### `cos.rs` internal shape
+### `cos.rs` internal shape (revised after AGY r1 finding #6 + Codex r1 finding #5)
 
-`build_cos_state` is itself ~300 LOC and could split further into
-`build_cos_classifier_tables`, `build_cos_iface_queues`, and the
-`useful_cos_state` gate. **Out of scope for v1.** The win from
-moving the whole function into `cos.rs` (so `mod.rs` becomes a
-slim orchestrator) is already the primary deliverable. Further
-internal decomposition stays for a follow-up issue if the new
-file is still tier-1-hot.
+Both r1 reviewers correctly pushed back on deferring the internal
+cos decomposition. AGY: "Moving this 312-LOC function intact into
+cos.rs sweeps the god-function violation under the rug rather than
+resolving it." Codex: "Either split it now or explicitly track it
+as follow-up."
 
-If review pressure says "split cos.rs too", the natural cleavage
-is:
-- `build_cos_classifier_tables(cos)` — class_to_queue,
-  dscp_classifiers, ieee8021_classifiers, dscp_rewrite_rules
-- `build_cos_iface(...)` — the per-interface loop body with the
-  gate
-- `build_cos_state(snapshot)` — the orchestrator
+**v2 decision: split `build_cos_state` internally inside `cos.rs`.**
 
-I will accept that as a v1 deliverable if reviewers insist; the
-plan's preference is to defer.
+Three sub-100-LOC helpers (modulo the inevitable comment block on
+the gate):
 
-## Public API preservation
+1. **`build_cos_classifier_tables(cos) -> ClassifierTables`** —
+   class_to_queue (forwarding_classes → queue u8),
+   dscp_classifiers (name → CoSDSCPClassifierConfig),
+   ieee8021_classifiers (name → CoSIEEE8021ClassifierConfig),
+   dscp_rewrite_rules (name → CoSDSCPRewriteRuleConfig),
+   schedulers / scheduler_maps name-keyed lookup maps. Returns a
+   plain struct `ClassifierTables { class_to_queue, dscp_classifiers,
+   ieee8021_classifiers, dscp_rewrite_rules, schedulers,
+   scheduler_maps }` owned by the orchestrator.
+
+2. **`build_cos_iface_config(iface, &ClassifierTables) ->
+   Option<CoSInterfaceConfig>`** — per-interface loop body. Returns
+   `Some(config)` if the `useful_cos_state` gate admits the
+   interface, `None` if not. Internally:
+   - Resolves scheduler-map queues into `Vec<CoSQueueConfig>`.
+   - Computes `iface_queue_ids`, `iface_classes`.
+   - Evaluates the 5-input gate (early `return None`).
+   - Builds the synthetic best-effort fallback if `queues.is_empty()`.
+   - Sorts queues by `queue_id`.
+   - Builds `queue_by_forwarding_class` map.
+   - Selects `default_queue`.
+   - Constructs the `CoSInterfaceConfig`.
+   - **Returns**. The orchestrator does the `state.interfaces.insert`.
+
+   This contains the #1183 fix. **The gate evaluation happens
+   inside `build_cos_iface_config` immediately after queue
+   resolution and BEFORE the synthetic best-effort fallback.** (AGY
+   r1 finding #5.)
+
+3. **`build_cos_state(snapshot) -> CoSState`** — orchestrator. Slim:
+
+   ```rust
+   pub(super) fn build_cos_state(snapshot: &ConfigSnapshot)
+       -> CoSState
+   {
+       let Some(cos) = snapshot.class_of_service.as_ref() else {
+           return CoSState::default();
+       };
+       let tables = build_cos_classifier_tables(cos);
+       let mut state = CoSState::default();
+       for iface in &snapshot.interfaces {
+           if iface.ifindex <= 0 { continue; }
+           if let Some(cfg) =
+               build_cos_iface_config(iface, &tables)
+           {
+               state.interfaces.insert(iface.ifindex, cfg);
+           }
+       }
+       state.dscp_classifiers = tables.dscp_classifiers;
+       state.ieee8021_classifiers = tables.ieee8021_classifiers;
+       state.dscp_rewrite_rules = tables.dscp_rewrite_rules;
+       state
+   }
+   ```
+
+   Under 30 LOC. The whole orchestrator's structure is now visible
+   at a glance, and the per-iface logic + the #1183 gate are
+   isolated in `build_cos_iface_config` where they can be reasoned
+   about independently.
+
+`ClassifierTables` is a private struct inside `cos.rs`. Lifetime
+is straightforward: the orchestrator owns `tables`, the helper
+borrows `&tables` and `iface`. `schedulers` and `scheduler_maps`
+inside `tables` borrow from `cos` via `&CoSSchedulerSnapshot`
+references — same as today's locals. The struct holds those
+references explicitly:
+
+```rust
+struct ClassifierTables<'a> {
+    class_to_queue: FastMap<String, u8>,
+    dscp_classifiers: FastMap<String, CoSDSCPClassifierConfig>,
+    ieee8021_classifiers: FastMap<String, CoSIEEE8021ClassifierConfig>,
+    dscp_rewrite_rules: FastMap<String, CoSDSCPRewriteRuleConfig>,
+    schedulers: FastMap<String, &'a CoSSchedulerSnapshot>,
+    scheduler_maps: FastMap<String, &'a CoSSchedulerMapSnapshot>,
+}
+```
+
+The lifetime `'a` ties the struct to the `cos:
+&ClassOfServiceSnapshot` borrow. No new allocations beyond what
+the current code already makes (same four owned maps, plus two
+borrow-only maps that exist today too — the current code spells
+them inline as `cos.schedulers.iter()...collect::<FastMap<_, &_>>()`).
+
+## Public API preservation (revised after Codex r1 finding #3)
 
 All `pub(super)` symbols re-exported via
 `use self::forwarding_build::*;` in `afxdp/mod.rs` keep their
-existing names and signatures. The complete list (from
-`grep -n "pub(super)" forwarding_build.rs`):
+existing external visibility unchanged. The complete list and
+required `forwarding_build/mod.rs` re-export visibility:
 
-- `build_screen_profiles`
-- `build_forwarding_state`
-- `build_forwarding_state_with_policy_counters`
-- `build_forwarding_state_with_policy_counters_and_previous`
-- `pick_interface_v4`
-- `pick_interface_v6`
-- `resolve_route_target_v4`
-- `resolve_route_target_v6`
-- `parse_route_next_hop`
-- `parse_route_next_hop_v6`
-- `resolve_ifindex`
-- `infer_connected_route_target_v4`
-- `infer_connected_route_target_v6`
+| Symbol | Today | After PR | Re-export in mod.rs |
+|---|---|---|---|
+| `build_screen_profiles` | `pub(super)` in `forwarding_build.rs` | `pub(super)` in `mod.rs` (stays) | n/a, lives in mod.rs |
+| `build_forwarding_state` | `pub(super)` | `pub(super)` in mod.rs | n/a, lives in mod.rs |
+| `build_forwarding_state_with_policy_counters` | `pub(super)` | `pub(super)` in mod.rs | n/a |
+| `build_forwarding_state_with_policy_counters_and_previous` | `pub(super)` | `pub(super)` in mod.rs | n/a |
+| `pick_interface_v4` | `pub(super)` | `pub(in crate::afxdp)` in `interfaces.rs` | `pub(in crate::afxdp) use interfaces::pick_interface_v4;` |
+| `pick_interface_v6` | `pub(super)` | `pub(in crate::afxdp)` in `interfaces.rs` | `pub(in crate::afxdp) use interfaces::pick_interface_v6;` |
+| `resolve_route_target_v4` | `pub(super)` | `pub(in crate::afxdp)` in `fib.rs` | `pub(in crate::afxdp) use fib::resolve_route_target_v4;` |
+| `resolve_route_target_v6` | `pub(super)` | `pub(in crate::afxdp)` in `fib.rs` | `pub(in crate::afxdp) use fib::resolve_route_target_v6;` |
+| `parse_route_next_hop` | `pub(super)` | `pub(in crate::afxdp)` in `fib.rs` | `pub(in crate::afxdp) use fib::parse_route_next_hop;` |
+| `parse_route_next_hop_v6` | `pub(super)` | `pub(in crate::afxdp)` in `fib.rs` | `pub(in crate::afxdp) use fib::parse_route_next_hop_v6;` |
+| `resolve_ifindex` | `pub(super)` | `pub(in crate::afxdp)` in `fib.rs` | `pub(in crate::afxdp) use fib::resolve_ifindex;` |
+| `infer_connected_route_target_v4` | `pub(super)` | `pub(in crate::afxdp)` in `fib.rs` | `pub(in crate::afxdp) use fib::infer_connected_route_target_v4;` |
+| `infer_connected_route_target_v6` | `pub(super)` | `pub(in crate::afxdp)` in `fib.rs` | `pub(in crate::afxdp) use fib::infer_connected_route_target_v6;` |
+| `build_cos_state` | **private** (file-local) | `pub(super)` in `cos.rs` | **plain `use cos::build_cos_state;`** — NOT `pub use`. Test module reaches it via `super::*` from `forwarding_build/tests.rs` because `use` brings it into scope of `forwarding_build/mod.rs`. |
 
-`build_cos_state` is currently private to the file but referenced
-by the test module via `super::*;` — keep it `pub(super)` to
-preserve test imports.
+`build_cos_state` widening was a v1 mistake (Codex r1 #3). v2
+keeps it module-private to `forwarding_build/mod.rs` exactly as
+today: not exported beyond that module, but reachable from
+`tests.rs` via the parent's namespace.
 
-The test module include (`#[cfg(test)] #[path =
-"forwarding_build_tests.rs"] mod tests;`) moves into
-`forwarding_build/mod.rs`. The test file itself stays at
-`afxdp/forwarding_build_tests.rs` (or moves to
-`afxdp/forwarding_build/tests.rs` — see Open Q1).
+**Test file relocation.** The test file moves from
+`afxdp/forwarding_build_tests.rs` to
+`afxdp/forwarding_build/tests.rs`. The include in
+`forwarding_build/mod.rs` becomes:
+
+```rust
+#[cfg(test)]
+mod tests;
+```
+
+(no `#[path]` attribute). This matches the wave-2 colocation
+convention (`session_glue/tests.rs`, `forwarding/tests.rs`,
+`umem/tests.rs`, `frame/tests.rs`, `wg/tests.rs` precedents, all
+verified by AGY r1).
 
 ## Hidden invariants the change must preserve
 
-1. **Side-effect ordering.** `build_forwarding_state` runs:
-   zones → tunnels → interfaces (addresses pass) → interfaces
-   (egress pass) → sort connected → routes → sort routes →
-   neighbors → fabrics → policy → flow knobs → NAT tables →
-   screens → MSS → filter → CoS → flow-export → mirror →
-   static-NAT local-delivery → DNAT local-delivery → install RST
-   suppression. The orchestrator must preserve this order — `cos`
-   depends on `filter_state` being populated (for the
-   `has_cos_interfaces || filter_state.has_*` gate downstream), and
-   the static-NAT/DNAT local-delivery passes write back into
-   `state.local_v4` / `state.local_v6` AFTER all other writers.
+1. **Side-effect ordering.** `build_forwarding_state` runs (line
+   refs are forwarding_build.rs):
+   - zones (106-137) → tunnels (139-175) → interfaces addresses
+     (177-254) → interfaces egress (256-299) → sort connected
+     (301-306) → routes (308-344) → sort routes (345-350) →
+     neighbors (352-365) → fabrics (366-395) → policy (396-401) →
+     flow knobs / NAT tables / screens / MSS / filter (402-432) →
+     **CoS (433)** → tx_selection_v[46] derivation (434-450) →
+     flow_export (452-462) → mirror (463-474) → **static-NAT
+     local-delivery (476-487)** → **DNAT local-delivery (489-500)**
+     → debug-log block (502-583) → install RST suppression (593).
+   - The orchestrator MUST preserve this order. Three load-bearing
+     ordering rules:
+     - **`state.cos` must populate before `tx_selection_v[46]`** is
+       computed (433 vs 434-450). The boolean derivation reads
+       `state.cos.interfaces.is_empty()`.
+     - **`state.static_nat` / `state.dnat_table` must populate
+       before static-NAT/DNAT local-delivery** (413-414 vs
+       476-500). The local-delivery passes call
+       `state.static_nat.external_ips()` and
+       `state.dnat_table.destination_ips()`.
+     - **`state.local_v4` / `state.local_v6` writes split into
+       early (interfaces 232/244) and late (static-NAT 478-486,
+       DNAT 491-499) phases.** AGY r1 finding #2 flagged the risk
+       that a developer might move the late phases into
+       `interfaces.rs` "because they touch local_v[46]" — this
+       would empty NAT tables before insertion and silently break
+       inbound NAT delivery. **The static-NAT and DNAT local-
+       delivery loops MUST stay inside `forwarding_build/mod.rs`
+       at the late position. They are explicitly NOT moved to a
+       sibling file.**
 2. **`mac_by_ifindex` carry.** The interfaces (egress) pass and the
    fabrics pass both read `mac_by_ifindex` populated by the
-   interfaces (addresses) pass. Must remain available across all
-   three.
-3. **`tunnel_endpoint_by_ifindex` carry.** Populated by the tunnels
-   pass; read by the interfaces (addresses) pass for
-   `ConnectedRouteV4/V6.tunnel_endpoint_id`. Order matters.
-4. **`zone_name_to_id` carry.** Populated by the zones pass; read
-   by interfaces (addresses), interfaces (egress), and
-   parse_policy_state_with_counters.
+   interfaces (addresses) pass. Held by `IfaceIndex`.
+3. **`tunnel_endpoint_by_ifindex` carry.** Populated on `state` by
+   the tunnels pass; read by the interfaces (addresses) pass for
+   `ConnectedRouteV4/V6.tunnel_endpoint_id`. Lives on `state`, not
+   `IfaceIndex` — already correct.
+4. **`zone_name_to_id` carry.** Populated on `state` by the zones
+   pass; read by interfaces (addresses), interfaces (egress), and
+   `parse_policy_state_with_counters`. Lives on `state`.
 5. **Allocations on the config-apply path.** This is control plane,
    but a re-build per commit. The current code allocates the three
    `BTreeMap`s as locals; the `IfaceIndex` struct preserves that
    exactly (move, not clone). No new `Vec`/`String`/`HashMap`
-   allocations.
+   allocations. `ClassifierTables<'a>` in `cos.rs` mirrors the same
+   pattern (owned maps + borrow-only schedulers/scheduler_maps).
 6. **`useful_cos_state` gate semantics.** The interface-by-interface
    gate at `build_cos_state` lines 856..864 must be preserved bit
    for bit. Its rationale is the #1183 cross-binding-redirect
-   regression. The code-motion must not alter the gate logic, the
-   ordering of the five inputs, or the early-`continue`.
+   regression that caused ~10x reverse-throughput collapse. The
+   code-motion must not alter the gate logic, the ordering of the
+   five inputs, or the early-`continue`.
+   - **Gate ordering invariant** (AGY r1 finding #5): the gate
+     consumes `scheduler_map_resolved_to_queues`,
+     `iface_queue_ids`, `iface_classes`, and reads
+     `dscp_classifier`/`ieee8021_classifier`/`dscp_rewrite_rule`
+     from the classifier tables. ALL of these must be computed
+     INSIDE the per-iface helper BEFORE the gate runs, and the
+     gate runs BEFORE the synthetic best-effort fallback. The
+     v2 helper layout (`build_cos_iface_config`) encodes this
+     ordering as straight-line code: resolve queues → compute
+     iface_queue_ids/iface_classes → gate → fallback → finalize.
 7. **`debug-log` cfg-feature block.** The `#[cfg(feature =
    "debug-log")]` block at the end of `build_forwarding_state`
-   stays attached to the orchestrator, not pushed into sub-modules.
-8. **`#[cold]` annotation policy.** None of these are hot paths,
-   so `#[cold]` is not appropriate here.
+   (lines 502-583) stays attached to the orchestrator in
+   `forwarding_build/mod.rs`, NOT pushed into sub-modules. The
+   block reads `state.policy`, `state.local_v4`,
+   `state.interface_nat_v4`, etc., which only exist on the fully-
+   assembled `state`.
+8. **`install_kernel_rst_suppression` placement.** Final call (line
+   593) before `state` is returned. Stays at the end of
+   `forwarding_build/mod.rs`. Lives in `rst.rs` already; the
+   orchestrator's call site moves to mod.rs but the implementation
+   does not change.
+9. **`#[cold]` annotation policy.** None of these are hot paths,
+   so `#[cold]` is not appropriate here. Per CLAUDE.md wave-2 rule:
+   "`#[cold]` on rare paths" — but config-apply runs ON commit,
+   which is rare per-process but not "rare path" in the per-tick
+   sense. Skip `#[cold]`. (Will reject if a reviewer requests it.)
 
 ## Risk assessment
 
@@ -332,66 +519,67 @@ The test module include (`#[cfg(test)] #[path =
 
 ## Out of scope (explicitly)
 
-- Further internal decomposition of `cos.rs` (build_cos_classifier_tables /
-  build_cos_iface / orchestrator split). Tracked separately if
-  cos.rs ends up >300 LOC after this PR.
-- Any change to the gate semantics from #1183.
+- Any change to the gate semantics from #1183 (preserved bit-for-bit).
 - Any change to `nat_translated_local_exclusions` or
   `install_kernel_rst_suppression` (live in `rst.rs`, untouched).
 - Any change to `parse_policy_state_with_counters` (lives in
   `crate::policy`).
 - Renaming the public functions or changing signatures.
-- Moving the test file. Stays at the path it's at.
+- Splitting `build_forwarding_state` orchestrator further beyond
+  the per-entity helper calls. The orchestrator stays linear and
+  readable as a checklist.
 
-## Open questions for adversarial review
+**Brought INTO scope after r1 review:**
+- Internal split of `build_cos_state` into
+  `build_cos_classifier_tables` + `build_cos_iface_config` +
+  orchestrator (AGY r1 finding #6, Codex r1 finding #5).
+- Relocation of `forwarding_build_tests.rs` to
+  `forwarding_build/tests.rs` (Codex r1 finding #4, AGY r1
+  finding #7).
 
-1. **Test file path.** Keep `afxdp/forwarding_build_tests.rs` with
-   the existing `#[path = ...]` include relocated into
-   `forwarding_build/mod.rs`, or move the file to
-   `afxdp/forwarding_build/tests.rs` and drop the explicit `#[path]`?
-   The wave-2 colocation convention (per
-   feedback_refactor_module_dir_layout) favours the in-dir path —
-   confirm or reject. **Tentative answer**: move into the dir as
-   `forwarding_build/tests.rs` to match the convention; the include
-   becomes `#[cfg(test)] mod tests;` (no `#[path]`). PLAN-KILL if
-   this is wrong.
+## Open questions for adversarial review (v2)
 
-2. **`IfaceIndex` worth it?** The current call sites pass 2-3
-   `BTreeMap`s by reference. Three named-borrow params is under the
-   8-param cap. Is the struct overkill? Counter-argument: the
-   route walker also reads `state` and writes to it, pushing the
-   shadow param count back up. The struct keeps the orchestrator
-   readable.
+r1 closed Q1, Q4, Q5, Q6, Q7 of the v1 list. Remaining and new:
 
-3. **Order-sensitivity of the move.** Did I miss any field on
-   `ForwardingState` that's read by an *earlier* sub-builder than
-   the one that writes it? (e.g. `state.cos.interfaces.is_empty()`
-   feeds `tx_selection_enabled_v[46]` AFTER filter_state — chain
-   already correct, but the orchestrator's call-order has to be
-   verified line-by-line.)
+1. **`IfaceIndex` worth it after CoS internal split?** Three named
+   borrow params is still under the 8-param cap. But because
+   `populate_interfaces` now returns an `IfaceIndex` and three
+   passes consume it, the struct is clearly worth it (avoids
+   re-computing the maps; the maps are needed by every downstream
+   pass). Tentative: keep as planned.
 
-4. **Scope-creep guard.** Is `cos.rs` at ~300 LOC after the move
-   too big to leave un-split? Or is the v1 "move whole function as
-   a unit" the right increment? My read: leave it for a follow-up
-   because the win from extracting to a sibling file is already
-   the primary deliverable, and an internal cos split adds risk
-   without clear payoff.
+2. **`ClassifierTables<'a>` lifetime annotation drag.** The struct
+   needs a lifetime parameter for the `&'a CoSSchedulerSnapshot`
+   borrows of `schedulers` / `scheduler_maps`. If a reviewer
+   prefers the borrow-eliminated form (clone the snapshots into
+   the table) the cost is two extra `clone()` calls per scheduler-
+   map / scheduler entry on config-apply. **Tentative**: keep the
+   lifetime to match current code exactly (it already builds
+   borrow-only tables today). Reject the suggestion to clone
+   unless a reviewer cites a concrete compile/maintenance benefit.
 
-5. **Layout-convention check.** Wave-2 says `mod.rs` + siblings,
-   NOT `forwarding_build_zones.rs` flat. Confirm the
-   directory-module form is the correct target here vs the
-   alternative.
+3. **`build_screen_profiles` final placement.** v1 left it in
+   `mod.rs`. r1 both reviewers accepted that — leaving in mod.rs.
 
-6. **`build_screen_profiles` placement.** It's a small builder
-   (~30 LOC) currently in `forwarding_build.rs`. Move it to a new
-   `screens.rs` sibling for symmetry, or leave it in `mod.rs`
-   since it's tiny and used only by the orchestrator? Tentative:
-   leave in `mod.rs`. If reviewers want symmetry, split.
+4. **`parse_syn_cookie_master_key` final placement.** v1 left it
+   in `mod.rs`. r1 both reviewers accepted that — leaving.
 
-7. **`parse_syn_cookie_master_key` placement.** Same question.
-   Tentative: leave in `mod.rs` (it's parser glue, not a real
-   builder). If reviewers want symmetry, move to a new
-   `syn_cookie.rs`.
+5. **Is there a hidden field on `ForwardingState` that a sub-
+   builder writes which another sub-builder reads *before* it
+   exists?** Walk the orchestrator one more time. Risk area:
+   `tx_selection_enabled_v[46]` reads `state.cos`,
+   `state.filter_state`. `state.cos = build_cos_state(snapshot)`
+   at line 433. `state.filter_state = parse_filter_state_with_*`
+   at 424-432. tx_selection block at 435-450 reads BOTH. So
+   filter MUST run before cos, AND cos MUST run before tx_selection.
+   Current order: filter (424-432) → cos (433) → tx_selection
+   (435-450). Plan preserves this. ✓
+
+6. **Wave-2 module dir convention crosscheck.** AGY r1 cited
+   `session_glue/`, `wg/`, `frame/`, `forwarding/`, `umem/`. Codex
+   r1 cited `server/handlers/mod.rs`, #1325 `protocol/mod.rs`,
+   #1327 `poll_descriptor/mod.rs`, #1328 `coordinator/reconcile/`.
+   All wave-2. Layout is the right target.
 
 ## Methodology rounds
 
