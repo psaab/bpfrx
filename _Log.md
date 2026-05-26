@@ -1,5 +1,19 @@
 # Action Log
 
+## 2026-05-26 — #1325 protocol.rs split plan v1 DRAFT
+
+- **Timestamp**: 2026-05-26T (UTC)
+- **Action**: Wrote plan v1 (DRAFT) for #1325 protocol.rs domain
+  split. Target: module/foo.rs directory layout with 7 domain files
+  under `userspace-dp/src/protocol/` (mod.rs slim + binding /
+  control / cos / nat / resolution / security / snapshot). Pure
+  code motion, wire-format-preserving, public API unchanged.
+  Identified `u64_is_zero` string-path serde hazard and mitigated
+  by keeping the fn co-located with `HAGroupStatus` in
+  `binding.rs` plus a deliberate round-trip regression test.
+- **File(s)**: docs/pr/1325-protocol-split/plan.md,
+  docs/pr/1325-protocol-split/reviewer-ids.md
+
 ## 2026-05-26 — #1476 Phase B AWAITING-MERGE at f815c357
 
 - **Timestamp**: 2026-05-26T (r3 reviewers converged, posting marker)
