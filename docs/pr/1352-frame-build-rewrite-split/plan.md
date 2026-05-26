@@ -1,13 +1,143 @@
 # #1352 Step 1 — Split `frame/mod.rs` 236-LOC `build_forwarded_frame_into_from_frame` + 223-LOC `apply_rewrite_descriptor` into `frame/{build,rewrite}/` by address family
 
-**Status:** v3 — addresses Codex r2 PLAN-NEEDS-MAJOR (cargo command
-shape wrong + asm-grep necessary-but-not-sufficient + i-cache
-duplication risk from wrapper paths + stale `#[inline]` in code
-sketch) and AGY r2 PLAN-NEEDS-MINOR (codegen-units=16 default
-causes false positives + private-import scoping in nested
-modules + naming mismatch `expected_ports`/`enforced_ports` +
-`RewriteDescriptor` path + grep target should look for `call`
-instructions not symbols).
+**Status:** v4 — addresses Codex r3 PLAN-NEEDS-MAJOR (cargo
+`--bin xpf-userspace-dp` + objdump on canonical binary +
+**generic monomorphization axis: `impl Into<ForwardPacketMeta>`
+breaks the ONE-binary-definition invariant**) and AGY r3
+PLAN-NEEDS-MINOR (**`apply_rewrite_descriptor` `#[inline(never)]`
+hurts fast-path** because only one caller; `mod tcp;` is private
+and blocks `super::super::tcp::clamp_tcp_mss_frame`; missing
+imports in build/ipv6.rs and both rewrite per-family files;
+`trim_l3_payload` / `rewrite_prepare_eth_from_parts` private
+visibility blockers).
+
+## Round-3 review disposition
+
+Codex r3 ([task-mpmzkrop-r368rl](reviewer-ids.md)) PLAN-NEEDS-MAJOR;
+AGY r3 ([adversarial-review-mpmzl98h-i50fex](reviewer-ids.md))
+PLAN-NEEDS-MINOR. Combined findings:
+
+1. **Codex r3 Major #1 — cargo command needs `--bin
+   xpf-userspace-dp`.** This package has two bin targets
+   (`main.rs:52` → `xpf-userspace-dp`, `bin/fairness-eval.rs:15` →
+   `fairness-eval`). Cargo refuses `cargo rustc ... -- --emit=asm`
+   without an explicit `--bin`. **Resolution:** v4 adds
+   `--bin xpf-userspace-dp` to the rustc invocation.
+
+2. **Codex r3 Major #2 — asm-diff via `--emit=asm` doesn't
+   reflect canonical shipped binary.** Even with
+   `codegen-units=1`, `--emit=asm` runs without final ThinLTO
+   link-time inlining; register allocation, block layout,
+   wrapper call shape can differ from the linked binary.
+   **Resolution:** v4 adds `objdump -drwC
+   target/release/xpf-userspace-dp` slices at each caller
+   region as the canonical asm-diff artifact (baseline vs PR).
+   The `--emit=asm` step stays for the supplementary
+   helper-symbol grep but is no longer the primary asm diff.
+
+3. **Codex r3 Major #3 — generic monomorphization breaks
+   ONE-definition invariant.** The orchestrator signature
+   uses `meta: impl Into<ForwardPacketMeta>` (preserved from
+   today's `mod.rs:221`). `#[inline(never)]` prevents normal
+   inlining BUT does NOT prevent rustc from emitting one
+   non-inlined body per concrete monomorphization. In current
+   master, all callers pass `ForwardPacketMeta` itself
+   (`request.meta` is `ForwardPacketMeta`), so only one
+   monomorphization exists empirically. **But the invariant
+   "ONE binary definition" is not statically guaranteed by the
+   generic signature.**
+   **Resolution:** v4 changes the orchestrator signature from
+   `meta: impl Into<ForwardPacketMeta>` to `meta:
+   ForwardPacketMeta` (concrete). Callers either already pass
+   `ForwardPacketMeta` (dispatch.rs:654 passes `request.meta`
+   which IS `ForwardPacketMeta` per `types/tx.rs:68`) or
+   convert at the call site with `.into()`. The internal
+   `build_forwarded_frame_into` adapter at `mod.rs:470` and
+   `build_forwarded_frame_from_frame` at `mod.rs:191` keep
+   their generic `impl Into` for ergonomic test wrappers, but
+   they call `.into()` BEFORE invoking the concrete-typed
+   orchestrator. ONE binary definition of
+   `build_forwarded_frame_into_from_frame` is now structurally
+   guaranteed. Same for `apply_rewrite_descriptor` — already
+   takes concrete `UserspaceDpMeta` (mod.rs:909), no change
+   needed.
+
+4. **AGY r3 §3-A — `apply_rewrite_descriptor` `#[inline(never)]`
+   hurts fast-path.** AGY argued: `apply_rewrite_descriptor`
+   has exactly ONE caller (`poll_descriptor.rs:746`),
+   inside a per-packet SIMD descriptor loop. Forcing
+   `#[inline(never)]` causes a real call/ret + parameter spill
+   for every packet, blocking inter-procedural register
+   allocation across the loop. With one caller, transitive
+   i-cache duplication is impossible — there's nowhere to
+   duplicate INTO. The `#[inline(never)]` is over-conservative.
+   **Resolution:** v4 changes
+   `apply_rewrite_descriptor`'s attribute from `#[inline(never)]`
+   back to `#[inline]` (LLVM heuristic), while `apply_rewrite_descriptor_ipv4/6`
+   stays `#[inline(always)]`. This restores fast-path
+   inter-procedural register allocation while preserving the
+   per-family helper inlining.
+
+   For `build_forwarded_frame_into_from_frame` the
+   `#[inline(never)]` stays because it has 5 caller sites
+   (transitive duplication IS a real risk) AND because it's
+   on the slower scratch TX dispatch path (the per-packet
+   register-allocation latency cost is less critical there
+   than for the SIMD descriptor loop).
+
+5. **AGY r3 §3-B + §4-A — `mod tcp;` is private** in
+   `frame/mod.rs:6`. v3's sketch `use super::super::tcp::clamp_tcp_mss_frame;`
+   cannot traverse the private parent sibling module.
+   **Resolution:** v4 promotes `mod tcp;` to `pub(super) mod
+   tcp;` in `frame/mod.rs:6`. The sub-module visibility
+   widens by ONE step (from "frame-private" to "afxdp-private")
+   which is the minimum needed to let descendants of
+   `frame::build` and `frame::rewrite` traverse into `tcp`.
+   Alternative considered: re-export `clamp_tcp_mss_frame` at
+   `pub(super)` from `frame/mod.rs` and import via
+   `super::super::clamp_tcp_mss_frame`. Rejected because v4
+   would need similar re-exports for other helpers
+   (`packet_rel_l4_offset`, etc.); making `tcp` reachable is
+   the smaller change.
+
+6. **AGY r3 §3-B — `trim_l3_payload` (`mod.rs:849`) and
+   `rewrite_prepare_eth_from_parts` (`mod.rs:565`) are
+   private.** v3 keeps these in `frame/mod.rs`, but the
+   orchestrators in `frame/build/mod.rs` and
+   `frame/rewrite/mod.rs` need to call them.
+   **Resolution:** v4 upgrades both to `pub(super)` in
+   `frame/mod.rs`. They stay defined where they are; only
+   visibility changes so the orchestrator submodules can
+   reach them via `use super::super::{trim_l3_payload,
+   rewrite_prepare_eth_from_parts};`.
+
+7. **AGY r3 §4-B — `packet_rel_l4_offset` missing from
+   `build/ipv6.rs` imports.** The IPv6 build arm at
+   `mod.rs:355` calls `packet_rel_l4_offset(&out[ip_start..],
+   meta.addr_family)`. **Resolution:** v4 adds
+   `use super::super::packet_rel_l4_offset;` to `build/ipv6.rs`.
+
+8. **AGY r3 §4-C — `rewrite/ipv4.rs` + `rewrite/ipv6.rs`
+   import blocks missing.** The IPv4 rewrite arm calls
+   `write_ipv4_src/dst`, `write_l4_src/dst_port`, `PROTO_TCP/UDP`.
+   The IPv6 rewrite arm calls `packet_rel_l4_offset`,
+   `write_ipv6_src/dst`, `write_l4_src/dst_port`,
+   `PROTO_TCP/UDP/ICMPV6`. **Resolution:** v4 lists the
+   import blocks explicitly in the §rewrite/ipv4.rs and
+   §rewrite/ipv6.rs sketches (added below).
+
+9. **Codex r3 minor — stale wording at `plan.md:267`
+   (smoke-matrix line-rate gate) and at `plan.md:858`.**
+   **Resolution:** v4 sweeps remaining stale references.
+
+10. **AGY r3 §1 — confirmed v3 closes all r2 high-confidence
+    findings.** Accepted.
+
+11. **AGY r3 §2 — `#[inline(never)]` is structurally honored
+    by ThinLTO across CGUs.** Accepted; the attribute does
+    survive the ThinLTO boundary. The remaining concern is
+    the generic-monomorphization axis (Codex r3 Major #3),
+    addressed by §3 above.
 
 ## Round-2 review disposition
 
@@ -268,8 +398,13 @@ justify the churn, PLAN-KILL is an acceptable verdict.** The
 hot-path codegen-parity hazard is the dominant risk — pure code
 motion that breaks `#[inline]` boundaries can show up as 1-2%
 throughput regression at line rate. Plan addresses this with
-explicit `#[inline]` attribute mandates on the per-family helpers
-and a smoke-matrix line-rate-with-zero-retrans gate.
+the v4 codegen contract (§Hot-path discipline) — `#[inline(always)]`
+on per-family helpers + `#[inline(never)]` on
+`build_forwarded_frame_into_from_frame` + `#[inline]` on
+`apply_rewrite_descriptor` + concrete `ForwardPacketMeta`
+parameter type to prevent monomorphization duplication — plus
+the per-PR codegen-verification gate (nm + objdump + asm-grep,
+all on the canonical linked binary).
 
 ## What's already shipped / partially batched
 
@@ -347,13 +482,16 @@ pub(in crate::afxdp::frame) use ipv6::build_forwarded_frame_into_ipv6;
 pub(in crate::afxdp) fn build_forwarded_frame_into_from_frame(
     out: &mut [u8],
     frame: &[u8],
-    meta: impl Into<ForwardPacketMeta>,
+    meta: ForwardPacketMeta,   // v4: concrete (was `impl Into<...>`)
     decision: &SessionDecision,
     forwarding: &ForwardingState,
     apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<usize> {
-    let meta = meta.into();
+    // v4: meta arrives concrete; no .into() call here. The two
+    // wrappers at frame/mod.rs:201 and frame/mod.rs:480 still
+    // take `impl Into<ForwardPacketMeta>` and call .into() before
+    // forwarding the concrete value into this orchestrator.
     let dst_mac = decision.resolution.neighbor_mac?;
 
     // (L3 offset derivation, payload trim, src_mac/vlan_id resolution,
@@ -441,8 +579,96 @@ pub(in crate::afxdp::frame) fn build_forwarded_frame_into_ipv4(
 ```
 
 (IPv6 mirrors the same shape — body byte-identical to today's
-mod.rs:342..380. Imports drop `adjust_ipv4_header_checksum` and
-add `apply_nat_ipv6` + `recompute_l4_checksum_ipv6`.)
+mod.rs:342..380. Per-family v4 import block for `build/ipv6.rs`
+(AGY r3 §4-B `packet_rel_l4_offset` missing in v3):
+
+```rust
+// frame/build/ipv6.rs
+use super::super::tcp::clamp_tcp_mss_frame;
+use super::super::{
+    apply_nat_ipv6, enforce_expected_ports_at, packet_rel_l4_offset,
+    recompute_l4_checksum_ipv6, restore_l4_tuple_from_meta,
+};
+use crate::afxdp::{ForwardPacketMeta, SessionDecision};
+```
+
+### `rewrite/ipv4.rs` sketch (v4 — AGY r3 §4-C)
+
+```rust
+// frame/rewrite/ipv4.rs
+use super::super::byte_writes::{
+    write_ipv4_dst, write_ipv4_src, write_l4_dst_port, write_l4_src_port,
+};
+use crate::afxdp::{
+    RewriteDescriptor, UserspaceDpMeta, PROTO_TCP, PROTO_UDP,
+};
+use std::net::IpAddr;
+
+#[inline(always)]
+pub(in crate::afxdp::frame) fn apply_rewrite_descriptor_ipv4(
+    packet: &mut [u8],
+    ip: usize,
+    skip_ttl: bool,
+    apply_nat: bool,
+    meta: UserspaceDpMeta,
+    rd: &RewriteDescriptor,
+    expected_ports: Option<(u16, u16)>,
+) -> Option<()> {
+    // Body byte-identical to today's mod.rs:937..1037.
+    // ...
+    Some(())
+}
+```
+
+### `rewrite/ipv6.rs` sketch (v4 — AGY r3 §4-C)
+
+```rust
+// frame/rewrite/ipv6.rs
+use super::super::byte_writes::{
+    write_ipv6_dst, write_ipv6_src, write_l4_dst_port, write_l4_src_port,
+};
+use super::super::packet_rel_l4_offset;
+use crate::afxdp::{
+    RewriteDescriptor, UserspaceDpMeta, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP,
+};
+use std::net::IpAddr;
+
+#[inline(always)]
+pub(in crate::afxdp::frame) fn apply_rewrite_descriptor_ipv6(
+    packet: &mut [u8],
+    ip: usize,
+    skip_ttl: bool,
+    apply_nat: bool,
+    meta: UserspaceDpMeta,
+    rd: &RewriteDescriptor,
+    expected_ports: Option<(u16, u16)>,
+) -> Option<()> {
+    // Body byte-identical to today's mod.rs:1038..1115.
+    // ...
+    Some(())
+}
+```
+
+(`byte_writes` is already `mod byte_writes;` at `frame/mod.rs:3`
+— v4 needs to promote it to `pub(super) mod byte_writes;` to be
+reachable from descendants of `frame/rewrite/`.)
+
+### Visibility upgrades in `frame/mod.rs` (v4)
+
+```rust
+// frame/mod.rs (modifications by this PR)
+pub(super) mod byte_writes;   // was: mod byte_writes;
+pub(super) mod tcp;           // was: mod tcp;
+
+pub(super) fn trim_l3_payload<'a>(...) -> &'a [u8] { ... }  // was: fn ...
+pub(super) fn rewrite_prepare_eth_from_parts(...) -> Option<...> { ... }  // was: fn ...
+```
+
+These visibility upgrades are the minimum needed for the
+descendants of `frame/build/` and `frame/rewrite/` to reach the
+helpers they call. Same-scope behavior is unchanged (no new
+external symbol surface — `pub(super)` from `frame/mod.rs` is
+"frame-private", same as before).)
 
 ### `rewrite/mod.rs` orchestrator shape
 
@@ -454,7 +680,7 @@ mod ipv6;
 pub(in crate::afxdp::frame) use ipv4::apply_rewrite_descriptor_ipv4;
 pub(in crate::afxdp::frame) use ipv6::apply_rewrite_descriptor_ipv6;
 
-#[inline(never)]
+#[inline]   // v4: standard hint (was #[inline(never)]); AGY r3 §3-A
 pub(in crate::afxdp) fn apply_rewrite_descriptor(
     area: &MmapArea,
     desc: XdpDesc,
@@ -515,14 +741,22 @@ i-cache-duplication finding):
 | `build_forwarded_frame_into_ipv6` | `#[inline(always)]` | Same. |
 | `apply_rewrite_descriptor_ipv4` | `#[inline(always)]` | Same. |
 | `apply_rewrite_descriptor_ipv6` | `#[inline(always)]` | Same. |
-| `build_forwarded_frame_into_from_frame` (orchestrator) | `#[inline(never)]` | Prevent transitive duplication through 5 caller wrappers: `frame/mod.rs:201`, `:480`, `tx/dispatch.rs:505`, `:651`, `:785`. ONE definition in the binary; each caller emits one `call` instruction. The orchestrator + folded-in per-family body is the unit of code that lives in i-cache. |
-| `apply_rewrite_descriptor` (orchestrator) | `#[inline(never)]` | Same rationale; only caller is `poll_descriptor.rs:746` but the SIMD descriptor loop above the call site is itself a tight per-packet inner loop and inlining the orchestrator into it would explode the loop body. ONE definition in binary. |
+| `build_forwarded_frame_into_from_frame` (orchestrator) | `#[inline(never)]` + concrete `meta: ForwardPacketMeta` | Prevent transitive duplication through 5 caller wrappers: `frame/mod.rs:201`, `:480`, `tx/dispatch.rs:505`, `:651`, `:785`. Concrete `ForwardPacketMeta` parameter (v4 — was generic `impl Into<...>`) closes the monomorphization-duplication axis. ONE definition in the binary; each caller emits one `call` instruction. The orchestrator + folded-in per-family body is the unit of code that lives in i-cache. |
+| `apply_rewrite_descriptor` (orchestrator) | `#[inline]` (v4 — was `#[inline(never)]`) | Per-packet SIMD descriptor loop above caller (`poll_descriptor.rs:746`) is the production hot path. Has exactly ONE caller, so transitive i-cache duplication impossible. v4 lets LLVM heuristic inline at this call site to restore inter-procedural register allocation across the loop. AGY r3 §3-A finding. |
 
-This is a deliberate inversion of the v2 "orchestrator `#[inline]`,
-helper `#[inline]`" symmetry: per-family helpers MUST be inlined
-(register-spill avoidance), orchestrators MUST NOT be inlined
-(i-cache duplication avoidance). The two attribute classes are
-the load-bearing codegen contract.
+v4 attribute logic (asymmetric, derived from caller count):
+
+- Per-family helpers MUST be inlined (register-spill avoidance,
+  same for both functions — single call site).
+- Orchestrator with >1 caller (build) MUST NOT be inlined
+  (transitive duplication avoidance + slow-path tolerable
+  per-call latency).
+- Orchestrator with =1 caller (rewrite) gets standard `#[inline]`
+  hint (no duplication risk; LLVM optimizes for fast-path
+  inter-procedural register allocation).
+- Concrete (non-generic) `meta: ForwardPacketMeta` parameter on
+  the build orchestrator closes the monomorphization-duplication
+  axis. ONE definition structurally guaranteed.
 
 **Verification step (per-PR codegen gate, v3):**
 
@@ -555,13 +789,34 @@ nm -C "$BIN" | \
 # Expected: exactly ONE definition per orchestrator (no duplication
 # through caller wrappers).
 
-# Step B: Asm slice for the per-PR diff artifact. Force
-# codegen-units=1 so the .s file reflects ThinLTO's actual
-# inlining decisions (default codegen-units=16 emits cross-CGU
-# calls as `call` instructions even when ThinLTO inlines them).
+# Step B: objdump disassembly of the canonical linked binary
+# at each caller region. This is the load-bearing asm-diff
+# artifact (Codex r3 Major #2). objdump operates on the final
+# linked binary so ThinLTO's actual inlining decisions are
+# baked in.
+objdump -drwC "$BIN" \
+  | awk '/<[^>]*build_forwarded_frame_into_from_frame[^>]*>:/,/^$/ {print}' \
+  > /tmp/1352-orch-build.asm
+objdump -drwC "$BIN" \
+  | awk '/<[^>]*apply_rewrite_descriptor[^>]*>:/,/^$/ {print}' \
+  > /tmp/1352-orch-rewrite.asm
+# Baseline pair captured on origin/master:
+git worktree add -f /dev/shm/master-baseline origin/master \
+  && (cd /dev/shm/master-baseline && cargo build --release \
+      --manifest-path userspace-dp/Cargo.toml 2>/dev/null \
+      && objdump -drwC /dev/shm/cargo/release/xpf-userspace-dp \
+         | awk '/<[^>]*build_forwarded_frame_into_from_frame[^>]*>:/,/^$/ {print}' \
+         > /tmp/1352-master-orch-build.asm)
+# Reviewer attaches diff /tmp/1352-master-orch-build.asm
+# /tmp/1352-orch-build.asm as PR artifact (and same for rewrite).
+
+# Step C: supplementary --emit=asm grep for per-family helper
+# call instructions (AGY HIGH-1 + r2 #3). codegen-units=1 +
+# explicit --bin xpf-userspace-dp (Codex r3 Major #1).
 RUSTFLAGS="-C codegen-units=1" \
   TMPDIR=/dev/shm CARGO_TARGET_DIR=/dev/shm/cargo-asm \
-  cargo rustc --release --manifest-path userspace-dp/Cargo.toml -- --emit=asm
+  cargo rustc --release --manifest-path userspace-dp/Cargo.toml \
+    --bin xpf-userspace-dp -- --emit=asm
 ASM=$(ls /dev/shm/cargo-asm/release/deps/xpf_userspace_dp-*.s | head -1)
 
 # Sanity-check that no `call` instructions to per-family helpers
@@ -591,19 +846,24 @@ need adjustment OR an upstream wrapper at `frame/mod.rs:201` /
 `:480` needs its own attribute to keep ThinLTO from
 duplicating the orchestrator transitively.
 
-Code sketch of the orchestrator/helper layering (v3 attributes):
+Code sketch of the orchestrator/helper layering (v4 attributes):
 
 ```rust
 // frame/build/mod.rs
 #[inline(never)]                // veto: 5 caller wrappers; ONE binary definition
-pub(in crate::afxdp) fn build_forwarded_frame_into_from_frame(...) -> Option<usize> { ... }
+pub(in crate::afxdp) fn build_forwarded_frame_into_from_frame(
+    out: &mut [u8],
+    frame: &[u8],
+    meta: ForwardPacketMeta,    // v4: concrete (closes generic monomorphization axis)
+    ...
+) -> Option<usize> { ... }
 
 // frame/build/ipv4.rs
 #[inline(always)]               // mandate: single call site, bypass ABI spill
 pub(in crate::afxdp::frame) fn build_forwarded_frame_into_ipv4(...) -> Option<()> { ... }
 
 // frame/rewrite/mod.rs
-#[inline(never)]                // veto: per-packet SIMD descriptor loop above caller
+#[inline]                       // v4: standard hint (was inline(never)); single caller fast-path
 pub(in crate::afxdp) fn apply_rewrite_descriptor(...) -> Option<InPlaceRewriteResult> { ... }
 
 // frame/rewrite/ipv4.rs
@@ -731,13 +991,16 @@ pub(in crate::afxdp) fn apply_rewrite_descriptor(
     succeeds. Per-family helpers return `Option<()>` (success/fail
     only); the orchestrator owns the result-construction step.
 
-11. **`#[inline(never)] orchestrators + #[inline(always)]
-    per-family helpers` codegen contract.** Today both functions
-    are monomorphic. Per the v3 contract above, per-family
-    helpers inline into their orchestrator (SROA/SSA bypass of
-    ABI register-spill); orchestrators stay non-inlined (no
-    transitive duplication through wrapper paths). **Codegen is
-    verified per-PR via the nm + asm-grep + asm-diff gate
+11. **v4 codegen contract.** Per-family helpers inline into
+    their orchestrator (SROA/SSA bypass of ABI register-spill).
+    `build_forwarded_frame_into_from_frame` is non-inlined +
+    concrete-typed `ForwardPacketMeta` parameter (ONE definition
+    structurally guaranteed; no transitive duplication through
+    5 wrapper paths; no generic-monomorphization fanout).
+    `apply_rewrite_descriptor` gets standard `#[inline]` hint
+    (single caller, fast-path inter-procedural register
+    allocation across the SIMD descriptor loop). **Codegen is
+    verified per-PR via the nm + objdump + asm-grep gate
     (§Test plan step 5), NOT by an iperf smoke.** Wave-end
     batch smoke remains the aggregate-perf gate.
 
@@ -768,22 +1031,21 @@ pub(in crate::afxdp) fn apply_rewrite_descriptor(
    pick after Step 5 implementation reveals which test bundle is
    slowest / most senstitive).
 4. `go test ./...` — all 30 Go packages.
-5. **Codegen verification step (per-PR, v3 mandate).** Run the
-   commands in §Hot-path discipline (§Verification step,
-   reproduced here for ergonomics):
-   - `cargo build --release --manifest-path userspace-dp/Cargo.toml`
-   - `nm -C target/release/xpf-userspace-dp | grep` — ZERO
-     per-family helper definitions; exactly ONE orchestrator
-     definition.
-   - `RUSTFLAGS="-C codegen-units=1" cargo rustc --release
-     --manifest-path userspace-dp/Cargo.toml -- --emit=asm` →
-     grep generated `xpf_userspace_dp-*.s` for `callq?\s+.*<helper>`
-     — ZERO matches.
-   - Attach a unified diff of the asm slices at each of the 6
-     caller sites (`tx/dispatch.rs:505`, `:651`, `:785`,
-     `poll_descriptor.rs:746`, `frame/mod.rs:201`, `:480`) for
-     `origin/master` vs PR HEAD. Reviewer reads the diff before
-     MERGE-READY.
+5. **Codegen verification step (per-PR, v4 mandate).** Run the
+   commands in §Hot-path discipline (§Verification step). The
+   load-bearing artifacts are:
+   - `nm -C target/release/xpf-userspace-dp` — ZERO per-family
+     helper definitions; exactly ONE definition each of the two
+     orchestrators (canonical linked binary).
+   - `objdump -drwC target/release/xpf-userspace-dp` slices
+     around the orchestrator regions, baseline vs PR HEAD,
+     attached as a unified diff (Codex r3 Major #2 canonical
+     gate).
+   - Supplementary: `RUSTFLAGS="-C codegen-units=1" cargo rustc
+     --release --manifest-path userspace-dp/Cargo.toml --bin
+     xpf-userspace-dp -- --emit=asm` followed by
+     `grep "callq?\s+.*<helper>"` on the emitted
+     `xpf_userspace_dp-*.s` — ZERO matches.
    **If any gate fails the PR MUST NOT MERGE until codegen is
    restored.**
 6. **Smoke matrix is wave-2 deferred.** Per the wave-2 rule
