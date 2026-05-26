@@ -1,6 +1,50 @@
 # #1348 — icmp_embed.rs split + 10-param collapse (Wave-5)
 
-**Status:** v2 — addresses Codex r1 PLAN-NEEDS-MAJOR (E0364
+**Status:** v3 — addresses Codex r2 (sandbox-limited) findings on
+borrow checker, file ambiguity, and src_wire type-system framing.
+Codex r2 was PLAN-NEEDS-MAJOR pointing out:
+- (MAJOR) `.or_else(|| ...).map(...)` chain capturing `&mut ctx` may
+  hold a live borrow into `.map` if the Option carries references.
+- (Minor) Stale `icmp_embed.rs` must be deleted when adding
+  `icmp_embed/mod.rs`.
+- (Minor) `src_wire: Ipv6Addr` is naming, not a true type.
+
+Dispositions:
+
+- (MAJOR borrow check) `lookup_session_across_scopes` returns
+  `Option<ResolvedSessionLookup>` and `lookup_forward_nat_across_scopes`
+  returns `Option<ForwardSessionMatch>`. Both are OWNED structs
+  (`#[derive(Clone, Debug)] pub(super) struct ResolvedSessionLookup
+  { key, lookup, shared_entry, origin }` at
+  `userspace-dp/src/afxdp/shared_ops.rs:313`; `pub(crate) struct
+  ForwardSessionMatch { key, decision, metadata }` at
+  `userspace-dp/src/session/entry.rs:42`). They contain no
+  references to `SessionTable`. The `&mut sessions` mut borrow on
+  each lookup ends when the function returns; the returned
+  `Option` does not extend the borrow. The current code at
+  `icmp_embed.rs:288-322` already does exactly this pattern with
+  raw `sessions` and compiles cleanly. The v2 design substitutes
+  `ctx.sessions` for `sessions` — Rust's NLL + two-phase borrow
+  handles `.or_else(|| {...; ctx.sessions ...}).map(|resolved|
+  {...; ctx.sessions ...})` correctly because the `or_else`
+  closure's mut-borrow on `ctx` ends when the closure is dropped
+  before the `map` closure runs. APPLIED: no plan change needed;
+  borrow-check viability is grounded in the existing code's
+  identical pattern + owned return types.
+- (Minor file ambiguity) The old `userspace-dp/src/afxdp/icmp_embed.rs`
+  file IS deleted at the same time as `icmp_embed/mod.rs` is
+  added. Without the delete, Rust errors with "file for module
+  `icmp_embed` found at both...". APPLIED: implementation step
+  explicitly does `git mv icmp_embed.rs icmp_embed/mod.rs` (or
+  equivalent: delete + new file), no parallel `.rs` left over.
+- (Minor src_wire framing) Acknowledged. `EmbeddedV6Header.src_wire`
+  is a naming convention + doc comment, not a Rust newtype. A true
+  newtype like `struct WireIpv6(Ipv6Addr)` would add a layer of
+  ceremony but no real safety since the inner Ipv6Addr is freely
+  extractable. Plan keeps the naming + doc form. APPLIED via doc
+  clarification.
+
+Prior status: v2 addressed Codex r1 PLAN-NEEDS-MAJOR (E0364
 visibility trap, module declaration change, single-ctx design,
 NPTv6 parse-API safety). Gemini r1 verdict was PLAN-READY.
 
