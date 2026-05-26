@@ -1,5 +1,68 @@
 # Action Log
 
+## 2026-05-26 — #1325 implementation pushed
+
+- **Timestamp**: 2026-05-26T (UTC)
+- **Action**: Implemented protocol.rs domain split per v3 plan.
+  - Created protocol/{mod,snapshot,cos,nat,security,control,
+    binding,resolution}.rs with module/foo.rs layout.
+  - 631-LOC test block moved into protocol/tests.rs as a sibling
+    submodule (kept as single cohesive block at parent layer
+    since every test exercises ProcessStatus that aggregates
+    every leaf domain).
+  - u64_is_zero switched to absolute path
+    crate::protocol::u64_is_zero in HAGroupStatus.lease_until
+    attribute per Codex r1/r2 verified serde_derive semantics.
+  - mod.rs is slim (decls + glob re-exports only); zero call-site
+    edits required (5 use crate::protocol::X sites + 12 path
+    callers all resolve unchanged).
+  - Named-item count matches pre-split: 66 structs + 2 consts +
+    1 fn = 69 (binding=8, control=14, cos=14, nat=6, resolution=3,
+    security=11, snapshot=13).
+  - cargo build clean. cargo test --bin: 1417/1417 (was 1395
+    pre-split because protocol::tests now counts as 22 items in
+    the main bin); 5x flake check on protocol::tests passes.
+  - Pre-existing snat_contract_doc_guard test fails on both
+    master and this branch (unrelated to refactor).
+  - Go suite clean.
+- **File(s)**: userspace-dp/src/protocol/{mod,snapshot,cos,nat,
+  security,control,binding,resolution,tests}.rs (created);
+  userspace-dp/src/protocol.rs (deleted); _Log.md
+
+## 2026-05-26 — #1325 plan v2 folds Codex+AGY r1
+
+- **Timestamp**: 2026-05-26T (UTC)
+- **Action**: Folded both r1 reviews into plan v2.
+  - Codex r1 PLAN-KILL (5 blocking, all fixable): incremental-build
+    claim withdrawn; ProcessStatus dependency graph corrected to
+    enumerate every cross-domain ref (control depends on every
+    other module); per-test cross-domain placement table added;
+    `u64_is_zero` switched to absolute path
+    `crate::protocol::u64_is_zero` per serde_derive ExprPath
+    semantics; "comment-header-derived" framing dropped.
+  - AGY r1 PLAN-NEEDS-MINOR (4 items, fully overlapping with
+    Codex r1 except for one new recommendation): added
+    differential wire-format snapshot test
+    (wire_invariant_tests.rs vs checked-in fixture).
+  - Documented Codex/AGY disagreement on incremental-build claim;
+    resolved by keeping the conservative "modularity discipline
+    only" framing.
+- **File(s)**: docs/pr/1325-protocol-split/plan.md (v2 fold),
+  _Log.md
+
+## 2026-05-26 — #1325 protocol.rs split plan v1 DRAFT
+
+- **Timestamp**: 2026-05-26T (UTC)
+- **Action**: Wrote plan v1 (DRAFT) for #1325 protocol.rs domain
+  split. Target: module/foo.rs directory layout with 7 domain files
+  under `userspace-dp/src/protocol/` (mod.rs slim + binding /
+  control / cos / nat / resolution / security / snapshot). Pure
+  code motion, wire-format-preserving, public API unchanged.
+  Identified `u64_is_zero` string-path serde hazard and mitigated
+  by keeping the fn co-located with `HAGroupStatus` in
+  `binding.rs` plus a deliberate round-trip regression test.
+- **File(s)**: docs/pr/1325-protocol-split/plan.md,
+  docs/pr/1325-protocol-split/reviewer-ids.md
 ## 2026-05-26 — #1326 PR #1569 AWAITING-BATCH-MERGE at 18fd27f8
 
 - **Timestamp**: 2026-05-26T (4-of-4 MERGE-READY on 18fd27f8)
