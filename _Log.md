@@ -4608,3 +4608,19 @@
   - **File(s)**: userspace-dp/src/afxdp/worker/cos/{mod,interface_row,
     queue_row,status,tests}.rs; docs/pr/1349-worker-cos-status-split/
     {plan.md,reviewer-ids.md}
+
+## 2026-05-26 — 23:44 UTC — #1346 session_glue split: AWAITING-SMOKE+test-failover
+
+- **Action**: Drove #1346 (`userspace-dp/src/afxdp/session_glue/mod.rs` split + 16/10-param helper collapse) through triple+quad review and opened PR #1595.
+- **File(s)**:
+  - `userspace-dp/src/afxdp/session_glue/mod.rs` (1406 → 1103 LOC)
+  - `userspace-dp/src/afxdp/session_glue/promote.rs` (new)
+  - `userspace-dp/src/afxdp/session_glue/commands/{delete_synced,demote_owner_rgs,export_owner_rg_sessions,refresh_owner_rgs,upsert_synced,mod}.rs` (new)
+  - `userspace-dp/src/afxdp/session_glue/tests.rs` (+ new dispatcher dedup test, 2 call-site updates)
+  - `docs/pr/1346-session-glue-split/{plan,reviewer-ids}.md` (new)
+- **Status**: AWAITING-SMOKE + test-failover (HA-sensitive session-sync code)
+- **Attestation**: 3-of-4 with codex-stuck exception
+  - Gemini r2: MERGE-READY
+  - AGY r2: MERGE-READY
+  - Copilot r1: COMMENTED w/ 3 inline findings, all addressed in d013302748 + 0e2a88c8b
+  - Codex: 3 consecutive sandbox failures (`unified-exec` blocked)
