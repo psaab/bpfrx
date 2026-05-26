@@ -4157,18 +4157,15 @@
     MERGE-READY. AWAITING-BATCH-MERGE marker posted.
   - **File(s)**: PR #1571
 
-## 2026-05-26 — #1542 NAT runtime split (Wave-2)
 - **Timestamp**: 2026-05-26
-- **Action**: Plan v1 drafted, committed (724987e6), pushed; dispatched Codex (task-mpmyrnf2-1de5ha) + AGY (adversarial-review-mpmys6pk-3ut2f2) plan reviews in parallel.
-- **File(s)**: docs/pr/1542-nat-runtime-split/plan.md, docs/pr/1542-nat-runtime-split/reviewer-ids.md
-
-## 2026-05-26 — #1542 NAT runtime split implementation
-- **Timestamp**: 2026-05-26
-- **Action**: Split userspace-dp/src/nat.rs (1605 LOC) into nat/{mod,allocator,source,destination,static_nat,status}.rs + tests.rs. Plan v3 ratified after Codex+AGY round 2. Cargo build clean, 1417 main tests + 212 nat tests pass, 5x flake clean.
-- **File(s)**: userspace-dp/src/nat/* (created), userspace-dp/src/nat.rs (deleted), userspace-dp/src/nat_tests.rs (moved to nat/tests.rs), docs/pr/1542-nat-runtime-split/{plan,reviewer-ids}.md
-
-## 2026-05-26 — #1356 bpf_map publish per-AF split (Wave-2)
-
-- **Timestamp**: 2026-05-26
-  **Action**: #1356 triple-review drive — split publish_bpf_conntrack_entry per-AF; PR #1572 opened; 4-of-4 attestation (Codex MERGE-NEEDS-MINOR addressed, AGY MERGE-READY, Copilot inline addressed, Claude SMR clean); AWAITING-BATCH-MERGE marker posted.
-  **File(s)**: userspace-dp/src/afxdp/bpf_map/mod.rs, userspace-dp/src/afxdp/bpf_map/publish_conntrack.rs, userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/bpf_map_tests.rs, docs/pr/1356-bpf-map-split/{plan,reviewer-ids}.md
+  - **Action**: #1440 plan v1 (DRAFT). Drafted consolidation plan
+    targeting wg/outer.rs duplicated checksum_be + write_outer_eth,
+    gre.rs::encapsulate_native_gre_frame open-coded outer IPv4/IPv6,
+    and icmp.rs::build_local_time_exceeded_v4/v6 outer headers.
+    Proposed new file: userspace-dp/src/afxdp/frame/headers.rs +
+    headers_tests.rs (flat files, not headers/ subdir per existing
+    frame/byte_writes.rs precedent). Public-to-crate signatures
+    preserved on wg/outer helpers via thin wrappers. Open questions
+    1-8 flagged for adversarial review; perf-irrelevance PLAN-KILL
+    explicitly invited.
+  - **File(s)**: docs/pr/1440-header-serialization-consolidate/{plan,reviewer-ids}.md
