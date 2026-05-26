@@ -4157,6 +4157,22 @@
     MERGE-READY. AWAITING-BATCH-MERGE marker posted.
   - **File(s)**: PR #1571
 
+## 2026-05-26 — #1542 NAT runtime split (Wave-2)
+- **Timestamp**: 2026-05-26
+- **Action**: Plan v1 drafted, committed (724987e6), pushed; dispatched Codex (task-mpmyrnf2-1de5ha) + AGY (adversarial-review-mpmys6pk-3ut2f2) plan reviews in parallel.
+- **File(s)**: docs/pr/1542-nat-runtime-split/plan.md, docs/pr/1542-nat-runtime-split/reviewer-ids.md
+
+## 2026-05-26 — #1542 NAT runtime split implementation
+- **Timestamp**: 2026-05-26
+- **Action**: Split userspace-dp/src/nat.rs (1605 LOC) into nat/{mod,allocator,source,destination,static_nat,status}.rs + tests.rs. Plan v3 ratified after Codex+AGY round 2. Cargo build clean, 1417 main tests + 212 nat tests pass, 5x flake clean.
+- **File(s)**: userspace-dp/src/nat/* (created), userspace-dp/src/nat.rs (deleted), userspace-dp/src/nat_tests.rs (moved to nat/tests.rs), docs/pr/1542-nat-runtime-split/{plan,reviewer-ids}.md
+
+## 2026-05-26 — #1356 bpf_map publish per-AF split (Wave-2)
+
+- **Timestamp**: 2026-05-26
+  **Action**: #1356 triple-review drive — split publish_bpf_conntrack_entry per-AF; PR #1572 opened; 4-of-4 attestation (Codex MERGE-NEEDS-MINOR addressed, AGY MERGE-READY, Copilot inline addressed, Claude SMR clean); AWAITING-BATCH-MERGE marker posted.
+  **File(s)**: userspace-dp/src/afxdp/bpf_map/mod.rs, userspace-dp/src/afxdp/bpf_map/publish_conntrack.rs, userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/bpf_map_tests.rs, docs/pr/1356-bpf-map-split/{plan,reviewer-ids}.md
+
 - **Timestamp**: 2026-05-26
   - **Action**: #1440 plan v1 (DRAFT). Drafted consolidation plan
     targeting wg/outer.rs duplicated checksum_be + write_outer_eth,
@@ -4221,3 +4237,22 @@
     userspace-dp/src/afxdp/gre.rs, userspace-dp/src/afxdp/icmp.rs,
     userspace-dp/src/afxdp/wg/{mod,tests}.rs,
     userspace-dp/src/afxdp/wg/outer.rs (DELETED)
+
+- **Timestamp**: 2026-05-26
+  - **Action**: #1440 code-review convergence. Gemini r1 code review
+    MERGE-READY (independent worktree inspection, 7/7 confirmed
+    including §6.1 cs=0x2655 byte-level). AGY r1 code review
+    MERGE-READY (independent checksum re-derivation; cargo check +
+    cargo test frame/wg all pass; 8/8 verification points). Copilot
+    PRR_kwDORLJrbM8AAAABBEn3WQ COMMENTED with no findings ("Copilot
+    reviewed 12 out of 12 changed files in this pull request and
+    generated no comments"). Codex r1 MERGE-NEEDS-MAJOR with one
+    substantive doc-wording finding (RFC 6864 "requires" overstated
+    — should be atomic-datagram "permits") + infra block; addressed
+    in b60ea4c6. Codex r2 on b60ea4c6 explicitly declined to
+    fabricate verdict — 6th consecutive Codex infra block. Per
+    Wave-2 Bucket C "3-of-4 Codex-stuck precedent": 3 of 4 reviewers
+    MERGE-READY/no-findings, posted AWAITING-BATCH-MERGE marker on
+    PR #1579 at b60ea4c6.
+  - **File(s)**: PR #1579, userspace-dp/src/afxdp/frame/headers.rs,
+    docs/pr/1440-header-serialization-consolidate/reviewer-ids.md
