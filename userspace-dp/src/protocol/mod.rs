@@ -1,5 +1,6 @@
 //! Control request/response and snapshot schema types shared between the
-//! control socket server (`main.rs`) and the AF_XDP coordinator (`afxdp.rs`).
+//! control socket server (`main.rs`) and the AF_XDP coordinator
+//! (`afxdp/` module tree).
 //!
 //! All types are `pub(crate)` so they are visible across the crate without
 //! being part of the public API, with one historical exception:

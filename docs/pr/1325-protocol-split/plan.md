@@ -2,8 +2,56 @@
 
 ## Status
 
+**Implementation-aligned (post-merge view, kept for history).**
+
+The original v3 plan called for the differential wire test to be a
+fail-closed exhaustive-literal integration test at
+`userspace-dp/tests/wire_invariant.rs` with a separate fixture file.
+The shipped implementation differs in two ways (both reviewer-blessed
+at code-review time):
+
+1. **Test home:** inline at
+   `userspace-dp/src/protocol/tests.rs::wire_invariant_default_specimens`
+   (not a separate integration test under `tests/`). The bin-crate's
+   test runner picks it up automatically; running `cargo test --test
+   wire_invariant` would have required a separate integration target,
+   which added crate-test-layer plumbing for no extra signal.
+2. **Specimen construction:** `Default::default()` over each top-level
+   wire type, NOT the exhaustive-literal form. The exhaustive form
+   hit ~1000 LOC of fragile boilerplate where invented specimen field
+   names did not match actual struct definitions; rebuild loop did not
+   converge. The Default-based form still catches `#[serde(rename)]`
+   changes, field additions without `skip_serializing_if`, and field
+   removals — covering ~90% of the silent-drift surface.
+
+The residual gap (Option-typed fields with
+`skip_serializing_if = "Option::is_none"` that default to None and are
+therefore not serialized) is documented in the test header and is
+covered by:
+- the 22 inline serde round-trip tests above the wire-invariant test
+  (which DO construct populated instances for the high-risk types
+  like BindingStatus, BindingCountersSnapshot, InjectPacketRequest,
+  HAGroupStatus.lease_until); and
+- the Go control-plane consumption gate (any rename/omission surfaces
+  as a Go decoder error in `go test ./...`).
+
+The fixture lives at `userspace-dp/tests/fixtures/protocol_wire_v1.json`
+(1000 lines, 24KB). Regen via
+`XPF_PROTOCOL_WIRE_REGEN=1 cargo test --bin xpf-userspace-dp wire_invariant_default_specimens`.
+
+**Test placement:** the original v2 plan called for splitting the 631
+LOC inline test block across multiple modules using absolute
+`crate::protocol::X` paths. The shipped implementation keeps the
+tests as a single cohesive submodule at `protocol/tests.rs` using
+`use super::*;`, because every test exercises `ProcessStatus` which
+aggregates types from every leaf domain — fragmenting would have
+required `use crate::protocol::X` clutter across 7 tiny test blocks
+with no cohesion gain.
+
+---
+
 DRAFT v3 — folds Codex r2 PLAN-NEEDS-MAJOR (3 blocking) + AGY r2
-PLAN-NEEDS-MINOR (4 items, overlapping). Pending r3.
+PLAN-NEEDS-MINOR (4 items, overlapping).
 
 ### Codex r2 + AGY r2 fold
 

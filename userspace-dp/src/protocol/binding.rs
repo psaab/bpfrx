@@ -482,8 +482,9 @@ pub(crate) struct BindingStatus {
     // in the rich BindingStatus shape; also projected onto the focused
     // `BindingCountersSnapshot` via the `From` impl so the
     // step1-capture consumer can reach it without a second join.
-    // `drain_latency_hist` at protocol.rs:881 is the sibling wire
-    // contract this mirrors — histograms on the wire are Vec<u64> so
+    // `drain_latency_hist` on ProcessStatus (see control.rs) is
+    // the sibling wire contract this mirrors — histograms on the
+    // wire are Vec<u64> so
     // serde needs no schema for the fixed-cap array. Default on all
     // three preserves backward-compat for pre-#812 helper payloads
     // (fields absent → zero-valued).
@@ -737,7 +738,8 @@ impl From<&BindingStatus> for BindingCountersSnapshot {
             tx_submit_latency_sum_ns: b.tx_submit_latency_sum_ns,
             // #825: same discipline as #812 — owned clone of the
             // Vec<u64> and by-value scalars. The `'static + Send`
-            // assert at :1446 covers these mechanically (no
+            // assert (_ASSERT_BINDING_COUNTERS_SNAPSHOT_IS_OWNED_STATIC_SEND
+            // above this impl) covers these mechanically (no
             // borrowed fields; u64 and Vec<u64> are Send).
             tx_kick_latency_hist: b.tx_kick_latency_hist.clone(),
             tx_kick_latency_count: b.tx_kick_latency_count,
