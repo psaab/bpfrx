@@ -1740,15 +1740,15 @@ fn helper_local_session_on_miss_clears_stale_shared_aliases() {
 
     // Install with SyncImport origin so take_synced_local recognizes
     // this as a peer-synced session.
-    assert!(sessions.install_with_protocol_with_origin(
-        key.clone(),
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: key.clone(),
         decision,
         metadata,
-        SessionOrigin::SyncImport,
-        1_000_000,
-        PROTO_TCP,
-        0x10,
-    ));
+        origin: SessionOrigin::SyncImport,
+        now_ns: 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
     publish_shared_session(
         &shared_sessions,
         &shared_nat_sessions,

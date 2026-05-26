@@ -696,13 +696,15 @@ pub(super) fn apply_worker_commands(
 
                 let metadata = entry.metadata.clone();
                 if sessions.upsert_synced_with_origin(
-                    entry.key,
-                    entry.decision,
-                    entry.metadata,
-                    entry.origin,
-                    now_ns,
-                    entry.protocol,
-                    entry.tcp_flags,
+                    SessionInstall {
+                        key: entry.key,
+                        decision: entry.decision,
+                        metadata: entry.metadata,
+                        origin: entry.origin,
+                        now_ns,
+                        protocol: entry.protocol,
+                        tcp_flags: entry.tcp_flags,
+                    },
                     allow_replace_local,
                 ) {
                     publish_worker_session_map_entry(
@@ -717,15 +719,15 @@ pub(super) fn apply_worker_commands(
                 }
             }
             WorkerCommand::UpsertLocal(entry) => {
-                sessions.install_with_protocol_with_origin(
-                    entry.key,
-                    entry.decision,
-                    entry.metadata,
-                    entry.origin,
+                sessions.install_with_protocol_with_origin(SessionInstall {
+                    key: entry.key,
+                    decision: entry.decision,
+                    metadata: entry.metadata,
+                    origin: entry.origin,
                     now_ns,
-                    entry.protocol,
-                    entry.tcp_flags,
-                );
+                    protocol: entry.protocol,
+                    tcp_flags: entry.tcp_flags,
+                });
             }
             WorkerCommand::DeleteSynced(key) => {
                 let delete_alias = sessions.lookup(&key, now_ns, 0);
@@ -1020,13 +1022,15 @@ fn materialize_shared_session_hit(
     if let Some(shared) = resolved.shared_entry.take() {
         let replica = synced_replica_entry(&shared);
         sessions.upsert_synced_with_origin(
-            replica.key.clone(),
-            replica.decision,
-            replica.metadata.clone(),
-            shared.origin.materialized_shared_hit_origin(),
-            now_ns,
-            replica.protocol,
-            tcp_flags,
+            SessionInstall {
+                key: replica.key.clone(),
+                decision: replica.decision,
+                metadata: replica.metadata.clone(),
+                origin: shared.origin.materialized_shared_hit_origin(),
+                now_ns,
+                protocol: replica.protocol,
+                tcp_flags,
+            },
             false,
         );
         return SessionLookup {
@@ -1068,15 +1072,15 @@ fn maybe_promote_synced_session(
     if fabric_ingress {
         promoted.fabric_ingress = true;
     }
-    if sessions.promote_synced_with_origin(
+    if sessions.promote_synced_with_origin(SessionUpdate {
         key,
         decision,
-        promoted.clone(),
-        SessionOrigin::SharedPromote,
+        metadata: promoted.clone(),
+        origin: SessionOrigin::SharedPromote,
         now_ns,
         protocol,
         tcp_flags,
-    ) {
+    }) {
         let _ = publish_session_map_entry_for_session(session_map_fd, key, decision, &promoted);
         let promoted_entry = SyncedSessionEntry {
             key: key.clone(),

@@ -13,6 +13,8 @@ mod key;
 pub(crate) use key::*;
 mod entry;
 pub(crate) use entry::*;
+mod ctx;
+pub(crate) use ctx::*;
 mod wheel;
 use wheel::{
     FAR_FUTURE_OFFSET, SessionWheel, WHEEL_BUCKETS, WHEEL_TICK_NS, WheelEntry, bucket_for_tick,
@@ -633,27 +635,28 @@ impl SessionTable {
         protocol: u8,
         tcp_flags: u8,
     ) -> bool {
-        self.install_with_protocol_with_origin(
+        self.install_with_protocol_with_origin(SessionInstall {
             key,
             decision,
             metadata,
-            SessionOrigin::ForwardFlow,
+            origin: SessionOrigin::ForwardFlow,
             now_ns,
             protocol,
             tcp_flags,
-        )
+        })
     }
 
-    pub fn install_with_protocol_with_origin(
-        &mut self,
-        key: SessionKey,
-        decision: SessionDecision,
-        metadata: SessionMetadata,
-        origin: SessionOrigin,
-        now_ns: u64,
-        protocol: u8,
-        tcp_flags: u8,
-    ) -> bool {
+    #[inline]
+    pub fn install_with_protocol_with_origin(&mut self, req: SessionInstall) -> bool {
+        let SessionInstall {
+            key,
+            decision,
+            metadata,
+            origin,
+            now_ns,
+            protocol,
+            tcp_flags,
+        } = req;
         if self.len() >= self.max_sessions {
             self.create_drops = self.create_drops.saturating_add(1);
             return false;
@@ -716,28 +719,34 @@ impl SessionTable {
         allow_replace_local: bool,
     ) -> bool {
         self.upsert_synced_with_origin(
-            key,
-            decision,
-            metadata,
-            SessionOrigin::SyncImport,
-            now_ns,
-            protocol,
-            tcp_flags,
+            SessionInstall {
+                key,
+                decision,
+                metadata,
+                origin: SessionOrigin::SyncImport,
+                now_ns,
+                protocol,
+                tcp_flags,
+            },
             allow_replace_local,
         )
     }
 
+    #[inline]
     pub fn upsert_synced_with_origin(
         &mut self,
-        key: SessionKey,
-        decision: SessionDecision,
-        metadata: SessionMetadata,
-        origin: SessionOrigin,
-        now_ns: u64,
-        protocol: u8,
-        tcp_flags: u8,
+        req: SessionInstall,
         allow_replace_local: bool,
     ) -> bool {
+        let SessionInstall {
+            key,
+            decision,
+            metadata,
+            origin,
+            now_ns,
+            protocol,
+            tcp_flags,
+        } = req;
         // Reject peer data that would clobber a locally-owned session
         // unless explicitly allowed (e.g. during HA activation).
         if matches!(self.entry_by_key(&key), Some(existing) if !existing.origin.is_peer_synced())
@@ -784,17 +793,17 @@ impl SessionTable {
     /// - Peer-synced entries (origin.is_peer_synced()): local traffic can
     ///   promote them (sets new origin + emits delta)
     /// - Local entries (!origin.is_peer_synced()): rejects older peer data
-    pub fn update_session(
-        &mut self,
-        key: &SessionKey,
-        decision: SessionDecision,
-        metadata: SessionMetadata,
-        origin: SessionOrigin,
-        now_ns: u64,
-        protocol: u8,
-        tcp_flags: u8,
-        ha_activation: bool,
-    ) -> bool {
+    #[inline]
+    pub fn update_session(&mut self, req: SessionUpdate<'_>, ha_activation: bool) -> bool {
+        let SessionUpdate {
+            key,
+            decision,
+            metadata,
+            origin,
+            now_ns,
+            protocol,
+            tcp_flags,
+        } = req;
         let Some(mut entry) = self.remove_entry(key) else {
             return false;
         };
@@ -854,14 +863,17 @@ impl SessionTable {
             .entry_by_key(key)
             .map(|e| e.origin)
             .unwrap_or(SessionOrigin::ForwardFlow);
+        let protocol = key.protocol;
         self.update_session(
-            key,
-            decision,
-            metadata,
-            origin,
-            now_ns,
-            key.protocol,
-            tcp_flags,
+            SessionUpdate {
+                key,
+                decision,
+                metadata,
+                origin,
+                now_ns,
+                protocol,
+                tcp_flags,
+            },
             false,
         )
     }
@@ -880,14 +892,17 @@ impl SessionTable {
             .entry_by_key(key)
             .map(|e| e.origin)
             .unwrap_or(SessionOrigin::ForwardFlow);
+        let protocol = key.protocol;
         self.update_session(
-            key,
-            decision,
-            metadata,
-            origin,
-            now_ns,
-            key.protocol,
-            tcp_flags,
+            SessionUpdate {
+                key,
+                decision,
+                metadata,
+                origin,
+                now_ns,
+                protocol,
+                tcp_flags,
+            },
             true,
         )
     }
@@ -915,20 +930,11 @@ impl SessionTable {
     }
 
     /// Promote a peer-synced session to local ownership.
-    /// Convenience wrapper around update_session.
-    pub fn promote_synced_with_origin(
-        &mut self,
-        key: &SessionKey,
-        decision: SessionDecision,
-        metadata: SessionMetadata,
-        origin: SessionOrigin,
-        now_ns: u64,
-        protocol: u8,
-        tcp_flags: u8,
-    ) -> bool {
-        self.update_session(
-            key, decision, metadata, origin, now_ns, protocol, tcp_flags, false,
-        )
+    /// Convenience wrapper around update_session that hides the
+    /// `ha_activation` flag (always false on this path).
+    #[inline]
+    pub fn promote_synced_with_origin(&mut self, req: SessionUpdate<'_>) -> bool {
+        self.update_session(req, false)
     }
 
     pub fn emit_open_delta_with_origin(

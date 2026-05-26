@@ -161,15 +161,15 @@ fn republish_local_delivery_sessions_for_lo0_filter_selects_existing_hits() {
         dst_port: 5201,
     };
     let mut sessions = SessionTable::new();
-    assert!(sessions.install_with_protocol_with_origin(
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
         key,
-        test_local_delivery_decision(),
-        test_metadata(),
-        SessionOrigin::SyncImport,
-        1,
-        PROTO_TCP,
-        TCP_FLAG_SYN,
-    ));
+        decision: test_local_delivery_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        now_ns: 1,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_SYN,
+    }));
 
     assert_eq!(
         republish_local_delivery_sessions_for_lo0_filter(&sessions, -1, &forwarding),
@@ -196,24 +196,24 @@ fn purge_sessions_for_input_dscp_filter_revalidation_removes_family() {
         src_port: 12345,
         dst_port: 5201,
     };
-    assert!(sessions.install_with_protocol_with_origin(
-        v4_key.clone(),
-        test_decision(),
-        test_metadata(),
-        SessionOrigin::ForwardFlow,
-        1,
-        PROTO_TCP,
-        TCP_FLAG_ACK,
-    ));
-    assert!(sessions.install_with_protocol_with_origin(
-        v6_key.clone(),
-        test_decision(),
-        test_metadata(),
-        SessionOrigin::ForwardFlow,
-        1,
-        PROTO_TCP,
-        TCP_FLAG_ACK,
-    ));
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: v4_key.clone(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: 1,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_ACK,
+    }));
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: v6_key.clone(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: 1,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_ACK,
+    }));
     let _ = sessions.drain_deltas(16);
     let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -328,15 +328,15 @@ fn maybe_promote_synced_session_sets_fabric_ingress_on_fabric_hit() {
     let decision = test_decision();
     let metadata = test_metadata();
     // Install with SyncImport origin to mark as peer-synced
-    assert!(sessions.install_with_protocol_with_origin(
-        key.clone(),
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: key.clone(),
         decision,
-        metadata.clone(),
-        SessionOrigin::SyncImport,
-        1_000_000,
-        PROTO_TCP,
-        0x10,
-    ));
+        metadata: metadata.clone(),
+        origin: SessionOrigin::SyncImport,
+        now_ns: 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
 
     let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -373,15 +373,15 @@ fn maybe_promote_synced_session_skips_worker_local_import() {
     let key = test_key();
     let decision = test_decision();
     let metadata = test_metadata();
-    assert!(sessions.install_with_protocol_with_origin(
-        key.clone(),
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: key.clone(),
         decision,
-        metadata.clone(),
-        SessionOrigin::WorkerLocalImport,
-        1_000_000,
-        PROTO_TCP,
-        0x10,
-    ));
+        metadata: metadata.clone(),
+        origin: SessionOrigin::WorkerLocalImport,
+        now_ns: 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
 
     let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -562,15 +562,15 @@ fn lookup_session_across_scopes_returns_shared_entry() {
 fn lookup_session_across_scopes_preserves_local_synced_origin() {
     let mut sessions = SessionTable::new();
     let key = test_key();
-    assert!(sessions.install_with_protocol_with_origin(
-        key.clone(),
-        test_decision(),
-        test_metadata(),
-        SessionOrigin::SyncImport,
-        1,
-        PROTO_TCP,
-        0,
-    ));
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: key.clone(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        now_ns: 1,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    }));
     let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
 
@@ -644,15 +644,15 @@ fn lookup_session_across_scopes_preserves_local_forward_wire_synced_origin() {
             ..NatDecision::default()
         },
     };
-    assert!(sessions.install_with_protocol_with_origin(
-        key.clone(),
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: key.clone(),
         decision,
-        test_metadata(),
-        SessionOrigin::SyncImport,
-        1,
-        PROTO_TCP,
-        0,
-    ));
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        now_ns: 1,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    }));
     let translated_key = forward_wire_key(&key, decision.nat);
     let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -684,18 +684,18 @@ fn lookup_session_across_scopes_prefers_shared_entry_over_fabric_wire_placeholde
         },
     };
     let translated_key = forward_wire_key(&key, decision.nat);
-    assert!(sessions.install_with_protocol_with_origin(
-        translated_key.clone(),
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: translated_key.clone(),
         decision,
-        SessionMetadata {
+        metadata: SessionMetadata {
             fabric_ingress: true,
             ..test_metadata()
         },
-        SessionOrigin::ForwardFlow,
-        1,
-        PROTO_TCP,
-        0,
-    ));
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: 1,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    }));
     let shared_entry = SyncedSessionEntry {
         key: key.clone(),
         decision,
@@ -783,18 +783,18 @@ fn lookup_forward_nat_across_scopes_prefers_shared_entry_over_fabric_wire_placeh
         },
     };
     let translated_key = forward_wire_key(&key, decision.nat);
-    assert!(sessions.install_with_protocol_with_origin(
-        translated_key,
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: translated_key,
         decision,
-        SessionMetadata {
+        metadata: SessionMetadata {
             fabric_ingress: true,
             ..test_metadata()
         },
-        SessionOrigin::ForwardFlow,
-        1,
-        PROTO_TCP,
-        0,
-    ));
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: 1,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    }));
     let shared_entry = SyncedSessionEntry {
         key: key.clone(),
         decision,
@@ -830,18 +830,18 @@ fn lookup_forward_nat_across_scopes_ignores_fabric_wire_placeholder_without_shar
         },
     };
     let translated_key = forward_wire_key(&key, decision.nat);
-    assert!(sessions.install_with_protocol_with_origin(
-        translated_key,
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: translated_key,
         decision,
-        SessionMetadata {
+        metadata: SessionMetadata {
             fabric_ingress: true,
             ..test_metadata()
         },
-        SessionOrigin::ForwardFlow,
-        1,
-        PROTO_TCP,
-        0,
-    ));
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: 1,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    }));
     let reply_key = reverse_session_key(&key, decision.nat);
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
 
@@ -1364,15 +1364,15 @@ fn resolve_flow_session_decision_promotes_local_synced_translated_hit_on_active_
         },
     };
     let translated_key = forward_wire_key(&key, decision.nat);
-    assert!(sessions.install_with_protocol_with_origin(
-        translated_key.clone(),
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: translated_key.clone(),
         decision,
-        SessionMetadata { ..test_metadata() },
-        SessionOrigin::SyncImport,
-        1_000_000,
-        PROTO_TCP,
-        0x18,
-    ));
+        metadata: SessionMetadata { ..test_metadata() },
+        origin: SessionOrigin::SyncImport,
+        now_ns: 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x18,
+    }));
     let mut forwarding = test_forwarding_state_with_fabric();
     forwarding.connected_v4.push(ConnectedRouteV4 {
         prefix: PrefixV4::from_net(Ipv4Net::new(Ipv4Addr::new(172, 16, 80, 0), 24).unwrap()),
@@ -1610,15 +1610,15 @@ fn resolve_flow_session_decision_keeps_local_synced_translated_hit_transient_on_
         },
     };
     let translated_key = forward_wire_key(&key, decision.nat);
-    assert!(sessions.install_with_protocol_with_origin(
-        translated_key.clone(),
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: translated_key.clone(),
         decision,
-        SessionMetadata { ..test_metadata() },
-        SessionOrigin::SyncImport,
-        1_000_000,
-        PROTO_TCP,
-        0x18,
-    ));
+        metadata: SessionMetadata { ..test_metadata() },
+        origin: SessionOrigin::SyncImport,
+        now_ns: 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x18,
+    }));
     let mut forwarding = test_forwarding_state_with_fabric();
     forwarding.connected_v4.push(ConnectedRouteV4 {
         prefix: PrefixV4::from_net(Ipv4Net::new(Ipv4Addr::new(172, 16, 80, 0), 24).unwrap()),
@@ -2141,15 +2141,15 @@ fn apply_worker_commands_does_not_export_missing_neighbor_seed_sessions() {
         owner_rg_id: 1,
         ..test_metadata()
     };
-    assert!(sessions.install_with_protocol_with_origin(
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
         key,
-        test_decision(),
+        decision: test_decision(),
         metadata,
-        SessionOrigin::MissingNeighborSeed,
-        1_000_000,
-        PROTO_TCP,
-        0x10,
-    ));
+        origin: SessionOrigin::MissingNeighborSeed,
+        now_ns: 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
     assert!(
         sessions.drain_deltas(16).is_empty(),
         "missing-neighbor seed install should not emit open deltas"
@@ -2189,15 +2189,15 @@ fn apply_worker_commands_demote_owner_rg_returns_cancelled_keys() {
     let commands = Arc::new(Mutex::new(VecDeque::new()));
     let mut sessions = SessionTable::new();
     let key = test_key();
-    assert!(sessions.install_with_protocol_with_origin(
-        key.clone(),
-        test_decision(),
-        test_metadata(),
-        SessionOrigin::ForwardFlow,
-        1_000_000,
-        PROTO_TCP,
-        0x10,
-    ));
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: key.clone(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
     commands
         .lock()
         .expect("commands lock")
@@ -2422,15 +2422,15 @@ fn apply_worker_commands_demotes_local_owner_rg_sessions_and_cancels_keys() {
     let metadata = test_metadata();
     let now_ns = monotonic_nanos();
 
-    assert!(sessions.install_with_protocol_with_origin(
-        key.clone(),
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: key.clone(),
         decision,
         metadata,
-        SessionOrigin::ForwardFlow,
+        origin: SessionOrigin::ForwardFlow,
         now_ns,
-        PROTO_TCP,
-        0x10,
-    ));
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
 
     let results = apply_worker_commands(
         &commands,
@@ -2461,15 +2461,15 @@ fn apply_worker_commands_demote_owner_rg_rewrites_resolution_to_fabric_redirect(
     let metadata = test_metadata();
     let now_ns = monotonic_nanos();
 
-    assert!(sessions.install_with_protocol_with_origin(
-        key.clone(),
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: key.clone(),
         decision,
         metadata,
-        SessionOrigin::ForwardFlow,
+        origin: SessionOrigin::ForwardFlow,
         now_ns,
-        PROTO_TCP,
-        0x10,
-    ));
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
 
     let ha_state = BTreeMap::from([(1, inactive_ha_runtime(now_ns / 1_000_000_000))]);
     let results = apply_worker_commands(
@@ -2505,9 +2505,9 @@ fn apply_worker_commands_demote_split_reverse_owner_rg_rewrites_to_fabric_redire
     let reverse_key = reverse_session_key(&forward_key, test_decision().nat);
     let now_ns = monotonic_nanos();
 
-    assert!(sessions.install_with_protocol_with_origin(
-        reverse_key.clone(),
-        SessionDecision {
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: reverse_key.clone(),
+        decision: SessionDecision {
             resolution: ForwardingResolution {
                 disposition: ForwardingDisposition::ForwardCandidate,
                 local_ifindex: 0,
@@ -2526,7 +2526,7 @@ fn apply_worker_commands_demote_split_reverse_owner_rg_rewrites_to_fabric_redire
                 forward_key.dst_port,
             ),
         },
-        SessionMetadata {
+        metadata: SessionMetadata {
             ingress_zone: 2,
             egress_zone: 1,
             owner_rg_id: 2,
@@ -2534,11 +2534,11 @@ fn apply_worker_commands_demote_split_reverse_owner_rg_rewrites_to_fabric_redire
             is_reverse: true,
             nat64_reverse: None,
         },
-        SessionOrigin::SyncImport,
+        origin: SessionOrigin::SyncImport,
         now_ns,
-        PROTO_TCP,
-        0x10,
-    ));
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
 
     let ha_state = BTreeMap::from([(2, inactive_ha_runtime(now_ns / 1_000_000_000))]);
     let results = apply_worker_commands(
@@ -2576,9 +2576,9 @@ fn apply_worker_commands_refresh_split_reverse_owner_rg_rewrites_to_forward_cand
     let reverse_key = reverse_session_key(&forward_key, test_decision().nat);
     let now_ns = monotonic_nanos();
 
-    assert!(sessions.install_with_protocol_with_origin(
-        reverse_key.clone(),
-        SessionDecision {
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: reverse_key.clone(),
+        decision: SessionDecision {
             resolution: ForwardingResolution {
                 disposition: ForwardingDisposition::FabricRedirect,
                 local_ifindex: 0,
@@ -2597,7 +2597,7 @@ fn apply_worker_commands_refresh_split_reverse_owner_rg_rewrites_to_forward_cand
                 forward_key.dst_port,
             ),
         },
-        SessionMetadata {
+        metadata: SessionMetadata {
             ingress_zone: 2,
             egress_zone: 1,
             owner_rg_id: 2,
@@ -2605,11 +2605,11 @@ fn apply_worker_commands_refresh_split_reverse_owner_rg_rewrites_to_forward_cand
             is_reverse: true,
             nat64_reverse: None,
         },
-        SessionOrigin::SyncImport,
+        origin: SessionOrigin::SyncImport,
         now_ns,
-        PROTO_TCP,
-        0x10,
-    ));
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
 
     let ha_state = BTreeMap::from([(2, active_ha_runtime(now_ns / 1_000_000_000))]);
     let results = apply_worker_commands(
@@ -2652,9 +2652,9 @@ fn apply_worker_commands_refresh_split_reverse_owner_rg_updates_stale_indexed_se
     let reverse_key = reverse_session_key(&forward_key, test_decision().nat);
     let now_ns = monotonic_nanos();
 
-    assert!(sessions.install_with_protocol_with_origin(
-        reverse_key.clone(),
-        SessionDecision {
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: reverse_key.clone(),
+        decision: SessionDecision {
             resolution: ForwardingResolution {
                 disposition: ForwardingDisposition::FabricRedirect,
                 local_ifindex: 0,
@@ -2673,7 +2673,7 @@ fn apply_worker_commands_refresh_split_reverse_owner_rg_updates_stale_indexed_se
                 forward_key.dst_port,
             ),
         },
-        SessionMetadata {
+        metadata: SessionMetadata {
             ingress_zone: 2,
             egress_zone: 1,
             owner_rg_id: 1,
@@ -2681,11 +2681,11 @@ fn apply_worker_commands_refresh_split_reverse_owner_rg_updates_stale_indexed_se
             is_reverse: true,
             nat64_reverse: None,
         },
-        SessionOrigin::SyncImport,
+        origin: SessionOrigin::SyncImport,
         now_ns,
-        PROTO_TCP,
-        0x10,
-    ));
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
 
     let ha_state = BTreeMap::from([
         (1, inactive_ha_runtime(now_ns / 1_000_000_000)),
@@ -2731,9 +2731,9 @@ fn apply_worker_commands_refresh_owner_rg_updates_reverse_session_owned_by_other
     let reverse_key = reverse_session_key(&forward_key, test_decision().nat);
     let now_ns = monotonic_nanos();
 
-    assert!(sessions.install_with_protocol_with_origin(
-        reverse_key.clone(),
-        SessionDecision {
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: reverse_key.clone(),
+        decision: SessionDecision {
             resolution: ForwardingResolution {
                 disposition: ForwardingDisposition::FabricRedirect,
                 local_ifindex: 0,
@@ -2752,7 +2752,7 @@ fn apply_worker_commands_refresh_owner_rg_updates_reverse_session_owned_by_other
                 forward_key.dst_port,
             ),
         },
-        SessionMetadata {
+        metadata: SessionMetadata {
             ingress_zone: 2,
             egress_zone: 1,
             owner_rg_id: 2,
@@ -2760,11 +2760,11 @@ fn apply_worker_commands_refresh_owner_rg_updates_reverse_session_owned_by_other
             is_reverse: true,
             nat64_reverse: None,
         },
-        SessionOrigin::SharedPromote,
+        origin: SessionOrigin::SharedPromote,
         now_ns,
-        PROTO_TCP,
-        0x10,
-    ));
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
 
     let ha_state = BTreeMap::from([
         (1, active_ha_runtime(now_ns / 1_000_000_000)),
@@ -2810,9 +2810,9 @@ fn apply_worker_commands_refresh_owner_rg_rewrites_remote_reverse_session_on_pee
     let reverse_key = reverse_session_key(&forward_key, test_decision().nat);
     let now_ns = monotonic_nanos();
 
-    assert!(sessions.install_with_protocol_with_origin(
-        reverse_key.clone(),
-        SessionDecision {
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: reverse_key.clone(),
+        decision: SessionDecision {
             resolution: ForwardingResolution {
                 disposition: ForwardingDisposition::ForwardCandidate,
                 local_ifindex: 0,
@@ -2831,7 +2831,7 @@ fn apply_worker_commands_refresh_owner_rg_rewrites_remote_reverse_session_on_pee
                 forward_key.dst_port,
             ),
         },
-        SessionMetadata {
+        metadata: SessionMetadata {
             ingress_zone: 2,
             egress_zone: 1,
             owner_rg_id: 2,
@@ -2839,11 +2839,11 @@ fn apply_worker_commands_refresh_owner_rg_rewrites_remote_reverse_session_on_pee
             is_reverse: true,
             nat64_reverse: None,
         },
-        SessionOrigin::SyncImport,
+        origin: SessionOrigin::SyncImport,
         now_ns,
-        PROTO_TCP,
-        0x10,
-    ));
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
 
     let ha_state = BTreeMap::from([
         (1, active_ha_runtime(now_ns / 1_000_000_000)),
@@ -2884,9 +2884,9 @@ fn apply_worker_commands_refresh_owner_rg_rewrites_shared_promote_reverse_on_pee
     let reverse_key = reverse_session_key(&forward_key, test_decision().nat);
     let now_ns = monotonic_nanos();
 
-    assert!(sessions.install_with_protocol_with_origin(
-        reverse_key.clone(),
-        SessionDecision {
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
+        key: reverse_key.clone(),
+        decision: SessionDecision {
             resolution: ForwardingResolution {
                 disposition: ForwardingDisposition::ForwardCandidate,
                 local_ifindex: 0,
@@ -2905,7 +2905,7 @@ fn apply_worker_commands_refresh_owner_rg_rewrites_shared_promote_reverse_on_pee
                 forward_key.dst_port,
             ),
         },
-        SessionMetadata {
+        metadata: SessionMetadata {
             ingress_zone: 2,
             egress_zone: 1,
             owner_rg_id: 2,
@@ -2913,11 +2913,11 @@ fn apply_worker_commands_refresh_owner_rg_rewrites_shared_promote_reverse_on_pee
             is_reverse: true,
             nat64_reverse: None,
         },
-        SessionOrigin::SharedPromote,
+        origin: SessionOrigin::SharedPromote,
         now_ns,
-        PROTO_TCP,
-        0x10,
-    ));
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
 
     let ha_state = BTreeMap::from([
         (1, active_ha_runtime(now_ns / 1_000_000_000)),
@@ -2963,15 +2963,15 @@ fn export_owner_rg_sessions_skips_locally_demoted_entries() {
     let metadata = test_metadata();
     let now_ns = monotonic_nanos();
 
-    assert!(sessions.install_with_protocol_with_origin(
+    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
         key,
         decision,
         metadata,
-        SessionOrigin::ForwardFlow,
+        origin: SessionOrigin::ForwardFlow,
         now_ns,
-        PROTO_TCP,
-        0x10,
-    ));
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
     assert_eq!(sessions.drain_deltas(16).len(), 1);
 
     let results = apply_worker_commands(

@@ -15,9 +15,9 @@ use crate::policy::{
 use crate::prefix::{PrefixV4, PrefixV6};
 use crate::screen::{ScreenProfile, ScreenState, ScreenVerdict, extract_screen_info};
 use crate::session::{
-    ForwardSessionMatch, SessionDecision, SessionDelta, SessionDeltaKind, SessionKey,
-    SessionLookup, SessionMetadata, SessionOrigin, SessionTable, forward_wire_key,
-    reverse_canonical_key, reverse_session_key,
+    ForwardSessionMatch, SessionDecision, SessionDelta, SessionDeltaKind, SessionInstall,
+    SessionKey, SessionLookup, SessionMetadata, SessionOrigin, SessionTable, SessionUpdate,
+    forward_wire_key, reverse_canonical_key, reverse_session_key,
 };
 use crate::slowpath::{EnqueueOutcome, SlowPathReinjector, SlowPathStatus, open_tun};
 use crate::xsk_ffi::xdp::XdpDesc;

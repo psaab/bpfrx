@@ -93,15 +93,15 @@ fn session_lookup_hits_after_install() {
 fn missing_neighbor_seed_install_stays_out_of_delta_stream() {
     let mut table = SessionTable::new();
     let key = key_v4();
-    assert!(table.install_with_protocol_with_origin(
+    assert!(table.install_with_protocol_with_origin(SessionInstall {
         key,
-        decision(),
-        metadata(),
-        SessionOrigin::MissingNeighborSeed,
-        1_000_000_000,
-        PROTO_TCP,
-        0x10
-    ));
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::MissingNeighborSeed,
+        now_ns: 1_000_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
     assert!(
         table.drain_deltas(8).is_empty(),
         "transient missing-neighbor seeds must stay local"
@@ -113,15 +113,15 @@ fn missing_neighbor_seed_expire_stays_out_of_delta_stream() {
     let mut table = SessionTable::new();
     let key = key_v4();
     let then = 1_000_000_000u64;
-    assert!(table.install_with_protocol_with_origin(
-        key.clone(),
-        decision(),
-        metadata(),
-        SessionOrigin::MissingNeighborSeed,
-        then,
-        PROTO_TCP,
-        0x10
-    ));
+    assert!(table.install_with_protocol_with_origin(SessionInstall {
+        key: key.clone(),
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::MissingNeighborSeed,
+        now_ns: then,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
     assert!(table.drain_deltas(8).is_empty());
     table.last_gc_ns = then + 301_000_000_000;
     let expired = table.expire_stale_entries(then + 302_000_000_000);
@@ -709,15 +709,15 @@ fn expire_stale_entries_returns_helper_only_local_sessions() {
         nat: NatDecision::default(),
     };
     // Install with SyncImport origin to mark as peer-synced
-    assert!(table.install_with_protocol_with_origin(
-        key.clone(),
-        local_decision,
-        local_metadata.clone(),
-        SessionOrigin::SyncImport,
-        then,
-        PROTO_TCP,
-        0x10,
-    ));
+    assert!(table.install_with_protocol_with_origin(SessionInstall {
+        key: key.clone(),
+        decision: local_decision,
+        metadata: local_metadata.clone(),
+        origin: SessionOrigin::SyncImport,
+        now_ns: then,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
     table.last_gc_ns = then + 301_000_000_000;
     let expired = table.expire_stale_entries(then + 302_000_000_000);
     assert_eq!(expired.len(), 1);
@@ -741,15 +741,15 @@ fn take_synced_local_only_removes_helper_local_sessions() {
         nat: NatDecision::default(),
     };
     // Install with SyncImport origin so it's considered peer-synced
-    assert!(table.install_with_protocol_with_origin(
-        key.clone(),
-        local_decision,
-        local_metadata.clone(),
-        SessionOrigin::SyncImport,
-        now,
-        PROTO_TCP,
-        0x10,
-    ));
+    assert!(table.install_with_protocol_with_origin(SessionInstall {
+        key: key.clone(),
+        decision: local_decision,
+        metadata: local_metadata.clone(),
+        origin: SessionOrigin::SyncImport,
+        now_ns: now,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
     let removed = table
         .take_synced_local(&key)
         .expect("local session removed");
@@ -919,15 +919,15 @@ fn promote_synced_forward_session_emits_open_delta() {
         false,
     );
     let promoted = metadata();
-    assert!(table.promote_synced_with_origin(
-        &key,
-        decision(),
-        promoted.clone(),
-        SessionOrigin::SharedPromote,
-        now + 1_000_000,
-        PROTO_TCP,
-        0x10,
-    ));
+    assert!(table.promote_synced_with_origin(SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: promoted.clone(),
+        origin: SessionOrigin::SharedPromote,
+        now_ns: now + 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
     let hit = table.lookup(&key, now + 2_000_000, 0x10);
     assert_eq!(
         hit,
@@ -961,15 +961,15 @@ fn promote_synced_reverse_session_stays_quiet() {
     );
     let mut promoted = metadata();
     promoted.is_reverse = true;
-    assert!(table.promote_synced_with_origin(
-        &key,
-        decision(),
-        promoted.clone(),
-        SessionOrigin::SharedPromote,
-        now + 1_000_000,
-        PROTO_TCP,
-        0x10,
-    ));
+    assert!(table.promote_synced_with_origin(SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: promoted.clone(),
+        origin: SessionOrigin::SharedPromote,
+        now_ns: now + 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
     let hit = table.lookup(&key, now + 2_000_000, 0x10);
     assert_eq!(
         hit,
@@ -1063,15 +1063,15 @@ fn demote_owner_rg_returns_synced_entries_for_transition_refresh() {
     let key = key_v4();
     let mut metadata = metadata();
     metadata.owner_rg_id = 2;
-    assert!(table.install_with_protocol_with_origin(
-        key.clone(),
-        decision(),
-        metadata.clone(),
-        SessionOrigin::SyncImport,
-        now,
-        PROTO_TCP,
-        0x10,
-    ));
+    assert!(table.install_with_protocol_with_origin(SessionInstall {
+        key: key.clone(),
+        decision: decision(),
+        metadata: metadata.clone(),
+        origin: SessionOrigin::SyncImport,
+        now_ns: now,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
 
     let demoted = table.demote_owner_rg(2);
     assert_eq!(demoted, vec![key.clone()]);
@@ -1706,15 +1706,15 @@ fn refresh_local_skips_peer_synced_entries() {
     let mut table = SessionTable::new();
     let key = key_v4();
     // Install with SyncImport origin (peer-synced)
-    assert!(table.install_with_protocol_with_origin(
-        key.clone(),
-        decision(),
-        metadata(),
-        SessionOrigin::SyncImport,
-        1_000_000,
-        PROTO_TCP,
-        0x10,
-    ));
+    assert!(table.install_with_protocol_with_origin(SessionInstall {
+        key: key.clone(),
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::SyncImport,
+        now_ns: 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
     let new_decision = SessionDecision {
         resolution: ForwardingResolution {
             egress_ifindex: 99,
@@ -1735,15 +1735,15 @@ fn refresh_for_ha_activation_updates_peer_synced_entries() {
     let mut table = SessionTable::new();
     let key = key_v4();
     // Install with SyncImport origin (peer-synced)
-    assert!(table.install_with_protocol_with_origin(
-        key.clone(),
-        decision(),
-        metadata(),
-        SessionOrigin::SyncImport,
-        1_000_000,
-        PROTO_TCP,
-        0x10,
-    ));
+    assert!(table.install_with_protocol_with_origin(SessionInstall {
+        key: key.clone(),
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::SyncImport,
+        now_ns: 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
     let new_decision = SessionDecision {
         resolution: ForwardingResolution {
             egress_ifindex: 99,

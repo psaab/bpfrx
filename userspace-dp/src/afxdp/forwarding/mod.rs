@@ -1084,15 +1084,15 @@ pub(super) fn install_helper_local_session_on_miss(
             &previous.metadata,
         );
     }
-    if !sessions.install_with_protocol_with_origin(
-        key.clone(),
+    if !sessions.install_with_protocol_with_origin(SessionInstall {
+        key: key.clone(),
         decision,
-        metadata.clone(),
+        metadata: metadata.clone(),
         origin,
         now_ns,
         protocol,
         tcp_flags,
-    ) {
+    }) {
         return false;
     }
     let local_entry = SyncedSessionEntry {
