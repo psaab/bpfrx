@@ -1,6 +1,68 @@
-# #1547 — Split `pkg/frr/frr.go` (Plan v1)
+# #1547 — Split `pkg/frr/frr.go` (Plan v2)
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** DRAFT v2 — addresses Codex PLAN-NEEDS-MAJOR and Gemini
+PLAN-KILL feedback from round 1.
+
+## Round 1 outcomes
+
+- **Codex** (task `task-mpn2tga9-k9tqob`): PLAN-NEEDS-MAJOR.
+  Demands (1) vtyshExecutor interface in the same PR to satisfy
+  issue acceptance criterion 3; (2) `generateProtocols` moved
+  out of `policy_render.go` into a separate
+  `protocols_render.go`; (3) `ifaceNetwork` is actually called
+  from protocol rendering (line 689), not interface settings —
+  must move with protocols; (4) `ApplyFull` inline render
+  blocks extracted into named helpers; (5) README will go stale
+  and must be updated.
+- **Gemini** (task `task-mpn2twzv-dyoeha`): PLAN-KILL. Same two
+  blocking demands: (1) the cohesion claim that
+  `generateProtocols` and `generatePolicyOptions` share helpers
+  is **factually false** — `resolveRedistribute` and the BFD
+  profile dedup are only used by protocol rendering;
+  (2) vtyshExecutor interface is an issue acceptance criterion
+  and cannot be unilaterally deferred.
+
+## What v2 changes
+
+1. **`vtyshExecutor` interface added in this PR.** A narrow
+   private interface
+   (`type vtyshExecutor interface { exec(cmd string) (string,
+   error) }`) is introduced in `vtysh.go`. The `Manager` gains a
+   `vtysh vtyshExecutor` field initialized in `New()` to the
+   real `exec.Command` implementation; tests can inject a fake.
+   All public `Get*` methods and `ExecVtysh` route through
+   `m.vtysh.exec(cmd)` instead of the bare `vtyshCmd` free
+   function. This satisfies issue acceptance criterion 3.
+2. **File-grouping decision held to the user's mandate.** The
+   user's standing rule for this PR is **exactly five sibling
+   `.go` files**: `manager.go`, `config_render.go`, `vtysh.go`,
+   `status_parse.go`, `policy_render.go`. Both reviewers asked
+   for a sixth file (`protocols_render.go`). The user override
+   wins. To address the cohesion concern, `policy_render.go`
+   becomes "**protocols + policy rendering**" — it owns
+   `generateProtocols`, `generatePolicyOptions`,
+   `resolveRedistribute`, `knownRedistProtocols`,
+   `bfdProfile`, `bfdProfileName`, and `ifaceNetwork`. The file
+   name stays `policy_render.go` to honor the user's literal
+   list; the file header doc comment documents the actual
+   contents. If a future reviewer still considers this a
+   blocker after reading the user's standing rule, that is a
+   user-arbitration question and not a plan-revision one.
+3. **`ifaceNetwork` correctly placed.** Per Codex's
+   line-evidence at frr.go:689, `ifaceNetwork` is called from
+   OSPF rendering inside `generateProtocols`, not from
+   `generateInterfaceSettings`. Moves to `policy_render.go`
+   with the rest of protocol rendering.
+4. **Inline `ApplyFull` rendering blocks extracted to named
+   helpers in `config_render.go`.** Per Codex finding 4. New
+   helpers: `renderGenerateRoutes(b, fc)`,
+   `renderDHCPDefaults(b, fc)`, `renderBackupRouter(b, fc)`,
+   `renderClusterModeDefaults(b, fc)`. These are pure code
+   motion — call sites in `ApplyFull` become single function
+   calls. `ApplyFull` becomes the ordering glue and nothing
+   more.
+5. **README updated.** Entry-point list and file-location
+   citations updated to the new layout.
 
 ## Issue framing
 
@@ -74,52 +136,72 @@ sub-packages, no `frr_` prefixes.
 
 Owns the package-level types and the `Manager` lifecycle:
 
-- `Manager` struct + `New()` constructor.
+- `Manager` struct (now with the `vtysh vtyshExecutor` field)
+  + `New()` constructor (initializes `vtysh` to the real
+  exec.Command-backed implementation).
 - `markerBegin` / `markerEnd` / `DefaultFRRConf` constants.
 - `InstanceConfig`, `DHCPRoute`, `FullConfig` types.
 - `Apply`, `ApplyWithInstances`, `ApplyFull`, `Clear`,
-  `writeManagedSection`, `reload` (with the 15s context timeout
-  preserved verbatim).
-- Top-level orchestration in `ApplyFull` that calls into the
-  renderers in this package.
+  `writeManagedSection`, `reload` (with the 15s context
+  timeout preserved verbatim).
+- Top-level orchestration in `ApplyFull` that now delegates
+  every inline render block to a named helper in
+  `config_render.go`.
 
 ### `pkg/frr/config_render.go`
 
 Holds the non-protocol config rendering helpers:
 
-- `generateInterfaceSettings`
-- `generateStaticRoute`
-- Anything DHCP-route / generate-route / backup-router /
-  cluster-mode rendering that's currently inline in `ApplyFull`
-  stays in `manager.go` because it's part of the orchestrator;
-  the small pure helpers it calls move here.
-- `ifaceNetwork` (used by interface settings rendering).
+- `generateInterfaceSettings` (interface-block bandwidth +
+  point-to-point hints).
+- `generateStaticRoute` (per-prefix `ip route` / `ipv6 route`
+  emission with RETH name translation and IPv6 next-hop
+  interface resolution).
+- New named extractors that subsume the inline `ApplyFull`
+  rendering blocks: `renderGenerateRoutes(b *strings.Builder,
+  fc *FullConfig)`, `renderDHCPDefaults`, `renderBackupRouter`,
+  `renderClusterModeDefaults`. Each one is a pure builder-write
+  that preserves the existing emission order and exact byte
+  output. Calls in `ApplyFull` become single-line invocations.
 
 ### `pkg/frr/policy_render.go`
 
-Holds protocol + policy rendering:
+Holds **protocol + policy rendering** (despite the name — see
+v2 file-grouping note above for why the name stays
+`policy_render.go`):
 
 - `generateProtocols` (OSPF, OSPFv3, BGP, RIP, ISIS).
-- `generatePolicyOptions` (prefix-lists, route-maps, communities).
-- `resolveRedistribute`, `knownRedistProtocols` map.
-- `bfdProfile`, `bfdProfileName`.
+- `generatePolicyOptions` (prefix-lists, route-maps,
+  communities).
+- `resolveRedistribute`, `knownRedistProtocols` map (used
+  inside `generateProtocols`).
+- `bfdProfile`, `bfdProfileName` (BFD profile dedup used inside
+  `generateProtocols`).
+- `ifaceNetwork` (used inside OSPF rendering at the original
+  frr.go:689 call site).
 
-These are co-located because `generateProtocols` and
-`generatePolicyOptions` share `resolveRedistribute` and the BFD
-profile dedup logic.
+The file header doc comment will document that this is the
+"protocol + policy" rendering file. The user's literal file
+list is honored; the misleading "policy_render" name is
+documented in code.
 
 ### `pkg/frr/vtysh.go`
 
 Holds the vtysh execution surface (no parsing):
 
-- `vtyshCmd` (private free function).
-- `Manager.ExecVtysh`.
-- All thin shells that just shell out and return raw text:
-  `GetBFDPeers`, `GetRouteMapList`, `GetISISAdjacencyDetail`,
+- `vtyshExecutor` private interface with one method
+  `exec(command string) (string, error)`.
+- `realVtyshExecutor` private concrete type whose `exec`
+  shells out via `exec.Command("vtysh", "-c", command)` —
+  this is the byte-identical body of the existing `vtyshCmd`
+  free function, just moved behind the interface.
+- `Manager.ExecVtysh` (public) and all `GetBFDPeers`,
+  `GetRouteMapList`, `GetISISAdjacencyDetail`,
   `GetISISDatabase`, `GetISISRoutes`, `GetOSPFNeighborDetail`,
   `GetOSPFDatabase`, `GetOSPFInterface`, `GetOSPFRoutes`,
   `GetBGPNeighborReceivedRoutes`,
-  `GetBGPNeighborAdvertisedRoutes`, `GetBGPNeighborDetail`.
+  `GetBGPNeighborAdvertisedRoutes`, `GetBGPNeighborDetail` —
+  all routed through `m.vtysh.exec(...)`.
 
 ### `pkg/frr/status_parse.go`
 
