@@ -3805,3 +3805,13 @@
     zero allocation / HA epoch ordering / SW design pattern all verified
     MERGE-READY. AWAITING-BATCH-MERGE marker posted.
   - **File(s)**: PR #1571
+
+## 2026-05-26 — #1542 NAT runtime split (Wave-2)
+- **Timestamp**: 2026-05-26
+- **Action**: Plan v1 drafted, committed (724987e6), pushed; dispatched Codex (task-mpmyrnf2-1de5ha) + AGY (adversarial-review-mpmys6pk-3ut2f2) plan reviews in parallel.
+- **File(s)**: docs/pr/1542-nat-runtime-split/plan.md, docs/pr/1542-nat-runtime-split/reviewer-ids.md
+
+## 2026-05-26 — #1542 NAT runtime split implementation
+- **Timestamp**: 2026-05-26
+- **Action**: Split userspace-dp/src/nat.rs (1605 LOC) into nat/{mod,allocator,source,destination,static_nat,status}.rs + tests.rs. Plan v3 ratified after Codex+AGY round 2. Cargo build clean, 1417 main tests + 212 nat tests pass, 5x flake clean.
+- **File(s)**: userspace-dp/src/nat/* (created), userspace-dp/src/nat.rs (deleted), userspace-dp/src/nat_tests.rs (moved to nat/tests.rs), docs/pr/1542-nat-runtime-split/{plan,reviewer-ids}.md
