@@ -7,5 +7,10 @@
 
 ## Round 2 (plan v2, commit 07808a98)
 
-- Codex: task-mpmyw1lc-b5jxjk
-- AGY: review-mpmyw9wc-ehuok7
+- Codex: task-mpmyw1lc-b5jxjk (PLAN-NEEDS-MAJOR — pub(super) too narrow, caller audit incomplete)
+- AGY: review-mpmyw9wc-ehuok7 (PLAN-READY — but missed Codex's pub(super) finding)
+
+## Round 3 (plan v3, commit eca9aaec)
+
+- Codex: task-mpmz5gxe-dituof
+- AGY: review-mpmz5lcl-760i8j
