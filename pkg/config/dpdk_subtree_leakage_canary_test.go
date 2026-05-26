@@ -94,14 +94,6 @@ import (
 	"testing"
 )
 
-// dpdkSubtreeLeakageCanaryScanRoots are the directories the
-// canary walks for production Go source. Test files and the
-// DPDK backend itself (which legitimately reads its own
-// sub-tree) are excluded inside the walker.
-var dpdkSubtreeLeakageCanaryScanRoots = []string{
-	".",
-}
-
 // dpdkSubtreeLeakageCanaryExcludeDirs maps a directory's path
 // RELATIVE to the walk root to a skip marker. Empty by default:
 // the v3 scan root is `pkg/config/` only, and there is no

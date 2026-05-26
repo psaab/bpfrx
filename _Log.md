@@ -1,5 +1,29 @@
 # Action Log
 
+## 2026-05-26
+
+- **Timestamp**: 2026-05-26T02:50:00Z
+  - **Action**: #1539 PR #1553 — rebased onto origin/master (5
+    PRs ahead, including #1556 multierror refactor). Conflict
+    on `_Log.md` resolved via /tmp/log-merge.py (union of HEAD
+    + incoming on each conflict region). Conflict on
+    `pkg/config/compiler.go` auto-resolved by git's 3-way merge;
+    semantically verified by inspection: Option A's nil clear at
+    L281-294 now sits AFTER (a) `validateDataplaneTypeStrict`
+    (fail-fast on retired DPDK) AND (b) the new `errors.Join`
+    multierror accumulator added by #1556, so it only runs on
+    the full success path. Codex round-5 MERGE-READY (session
+    019e5fa*), AGY round-5 adversarial-review-mpm18y6x-ii447j
+    MERGE-READY. Formal copilot-pull-request-reviewer re-ran on
+    new HEAD 4d24d592 and flagged 3 LOW-priority items: (a)
+    unused `dpdkSubtreeLeakageCanaryScanRoots` declaration —
+    removed; (b) redundant `if cfg != nil` guard around Option
+    A's nil clear (cfg is always non-nil in compileExpanded) —
+    guard removed, comment updated; (c) truncated _Log entry
+    at line 766 ending with bare "Added" — completed.
+  - **File(s)**: pkg/config/compiler.go,
+    pkg/config/dpdk_subtree_leakage_canary_test.go, _Log.md
+
 ## 2026-05-25
 
 - **Timestamp**: 2026-05-25T19:30:00Z
@@ -764,6 +788,15 @@
     `DPDKDataplane` selector or helper pass-through at package
     scope is reported immediately instead of being skipped when
     no enclosing `FuncDecl` exists. Added
+    `TestDPDKSubtreeLeakageCanary_NegativeRejectsPackageScopeInitializer`
+    with `negativePackageScopeInitializerFixture` covering both a
+    package-scope read and a package-scope helper pass-through.
+    Closing-sentence truncation flagged in a later Copilot pass
+    is restored here (the previous trailing "Added" was an
+    artifact of an over-aggressive _Log.md rebase-union helper).
+  - **File(s)**: pkg/config/dpdk_subtree_leakage_canary_test.go,
+    _Log.md
+
 - **Timestamp**: 2026-05-25T16:25:00Z
   - **Action**: #1539 Copilot round-3 finding addressed. After
     HEAD f90125b3 + docs commit 4a1c8726, Copilot's re-review

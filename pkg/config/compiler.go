@@ -290,10 +290,10 @@ func compileExpanded(tree *ConfigTree) (*Config, error) {
 	// is statically dead on every committed config without requiring
 	// the caller to also gate on effectiveDataplaneType. This is dead
 	// code after #1528 (Phase 3) deletes the field entirely; remove
-	// this line in #1528.
-	if cfg != nil {
-		cfg.System.DPDKDataplane = nil
-	}
+	// this line in #1528. `cfg` is initialized via `cfg := &Config{...}`
+	// at the top of compileExpanded and never reassigned, so a nil
+	// guard would be dead defense (Copilot finding on PR #1553).
+	cfg.System.DPDKDataplane = nil
 
 	return cfg, nil
 }
