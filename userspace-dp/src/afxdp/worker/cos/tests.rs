@@ -1,7 +1,8 @@
-// Tests for afxdp/worker/cos.rs — relocated from inline
-// `#[cfg(test)] mod tests` to keep cos.rs under the modularity-discipline
-// LOC threshold. Loaded as a sibling submodule via
-// `#[path = "cos_tests.rs"]` from cos.rs.
+// Tests for afxdp/worker/cos — originally relocated out of cos.rs
+// to keep that file under the modularity-discipline LOC threshold.
+// Post-#1349 the parent module became a directory (`worker/cos/`)
+// and this file is now its standard sibling `tests.rs`, loaded via
+// `#[cfg(test)] mod tests;` from `cos/mod.rs`.
 
 use super::*;
 use crate::afxdp::cos::queue_ops::cos_queue_push_back;

@@ -380,9 +380,9 @@ outside `worker/cos.rs` and `worker/cos_tests.rs`.
 ## Test plan
 
 1. `cargo build --release` clean.
-2. `cargo test --release` — all 952+ tests pass (existing
-   `cos_tests.rs` covers the production path under both
-   single-owner-local and shared-exact shapes).
+2. `cargo test --release` — full cargo suite passes (1434+ bin
+   tests). The existing `cos/tests.rs` covers the production path
+   under both single-owner-local and shared-exact shapes.
 3. 5x flake check on `build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_local_exact_queue`
    (the 264-LOC integration test that hammers this exact code path).
 4. **New test: `active_flow_buckets_peak_is_max_not_sum_across_workers`**
