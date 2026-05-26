@@ -1,5 +1,55 @@
 # Action Log
 
+## 2026-05-26 — #1476 Phase B r1 fixes (Codex MERGE-NEEDS-MAJOR)
+
+- **Timestamp**: 2026-05-26T (r1 fixes after Codex MERGE-NEEDS-MAJOR)
+  - **Action**: Round-1 code reviews returned. AGY r1 MERGE-READY;
+    Codex r1 MERGE-NEEDS-MAJOR with 5 findings:
+    F1 MAJOR: rewriteRetiredDataplaneType only walks top-level `system`,
+      missing apply-groups-injected `dataplane-type ebpf`. The strict
+      validator inside compileExpanded fires against the
+      post-expansion tree, so a config like
+      `groups { legacy { system { dataplane-type ebpf; } } }
+       system { apply-groups legacy; }` slips through the rewrite and
+      strands the daemon.
+    F2 MINOR: SyncApply WARN message used the LoadCaller phrasing
+      ("review and commit after daemon comes up"), wrong audience for
+      the HA peer-sync path where the un-upgraded primary needs the
+      remediation.
+    F3 MINOR: TestCommitRejectsRetiredEBPF and
+      TestCommitConfirmedRejectsRetiredEBPF in pkg/grpcapi missed the
+      codes.InvalidArgument assertion (only the message was checked).
+    F4 MINOR: docs/userspace-dataplane-gaps.md and docs/memory.md still
+      described pre-#1476 behavior (eBPF deprecation warning at compile,
+      xdp_progs/tc_progs pinning required).
+    F5 NIT: pkg/dataplane/userspace/maps_decouple_test.go header
+      comment still referenced the BPFRX_LEGACY_LOADER_RETIRED escape
+      hatch that the canary no longer uses.
+
+    All 5 fixed in this commit:
+    - rewriteRetiredDataplaneType now walks BOTH top-level system AND
+      every `groups { <name> { system { ... } } }` definition. Two
+      new tests TestRewriteRetiredDataplaneType_ApplyGroups{EBPF,DPDK}
+      pin the regression. CompileConfigForNode after rewrite confirms
+      no strict-validator firing.
+    - New retireRewriteCaller enum (LoadCaller, SyncCaller) selects
+      the right warn message + remediation hint per entry point.
+      Store.Load passes LoadCaller; Store.SyncApply passes SyncCaller.
+    - Added codes.InvalidArgument assertion to both gRPC tests.
+    - Rewrote stale prose in userspace-dataplane-gaps.md (line 151)
+      and memory.md (line 164) to past tense / current state.
+    - Replaced the BPFRX_LEGACY_LOADER_RETIRED comment block in
+      maps_decouple_test.go header with the post-#1476 narrative.
+
+    Test gates: full go test ./... clean (33 packages); 7 rewrite
+    helper tests pass including the two new apply-groups regressions.
+  - **File(s)**: pkg/configstore/dataplane_retire.go,
+    pkg/configstore/dataplane_retire_test.go,
+    pkg/configstore/store.go,
+    pkg/grpcapi/server_config_test.go,
+    docs/userspace-dataplane-gaps.md, docs/memory.md,
+    pkg/dataplane/userspace/maps_decouple_test.go
+
 ## 2026-05-26 — #1476 Phase B implementation
 
 - **Timestamp**: 2026-05-26T (Phase B complete; awaiting code review)

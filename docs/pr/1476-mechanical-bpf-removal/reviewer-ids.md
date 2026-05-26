@@ -17,14 +17,15 @@ rounds. Append a row per dispatch.
 | r4 | AGY (adversarial) | adversarial-review-mplgsx14-bcoj2x | PLAN-READY | r3 findings all closed; one Phase-B critical: extend rewriteRetiredDataplaneType to run in Store.SyncApply() (absorbed into §4.6) |
 | r4 | Codex (gpt-5.5) | local pid 1251897 | PLAN-READY | all r3 findings closed; no new issues |
 
-## Code review (Phase B only)
+## Code review (Phase B)
 
 | Round | Reviewer | Task ID | Verdict | Notes |
 |-------|----------|---------|---------|-------|
-| (pending) |  |  |  |  |
+| r1 | AGY (adversarial) | adversarial-review-mpmacktl-2gvwd4 | pending | dispatched against SHA 04c0d19e (PR #1558) |
+| r1 | Codex (gpt-5.5) | local pid 1519323 | pending | dispatched against SHA 04c0d19e (PR #1558) |
 
 ## Copilot
 
 | Round | Comment URL | Status |
 |-------|-------------|--------|
-| (pending) |  |  |
+| r1 | https://github.com/psaab/xpf/pull/1558#pullrequestreview-4361330619 | STUCK — "exceeds maximum number of lines (20,000)"; 3-of-4 Copilot-stuck exception applies per `feedback_copilot_two_bots` |

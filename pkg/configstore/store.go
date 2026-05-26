@@ -101,7 +101,7 @@ func (s *Store) Load() error {
 	// gets nil active config, and bootstraps blind. Rewriting the
 	// leaf to absent (defaults to userspace) lets the daemon come
 	// up so the operator can fix the config from CLI.
-	rewriteRetiredDataplaneType(tree)
+	rewriteRetiredDataplaneType(tree, LoadCaller)
 
 	compiled, err := s.compileTree(tree)
 	if err != nil {
@@ -218,7 +218,7 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 	// sync rejection would alarm-loop the cluster. Rewrite the
 	// retired leaf so the standby boots through cleanly while the
 	// operator updates the primary.
-	rewriteRetiredDataplaneType(tree)
+	rewriteRetiredDataplaneType(tree, SyncCaller)
 
 	compiled, err := s.compileTree(tree)
 	if err != nil {

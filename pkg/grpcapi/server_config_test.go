@@ -74,6 +74,9 @@ func TestCommitRejectsRetiredEBPF(t *testing.T) {
 	if !ok {
 		t.Fatalf("Commit() error is not a *status.Status: %T (%v)", err, err)
 	}
+	if got, want := st.Code(), codes.InvalidArgument; got != want {
+		t.Errorf("status.Code() = %v, want %v", got, want)
+	}
 	if !strings.Contains(st.Message(), "legacy eBPF dataplane backend has been retired") {
 		t.Errorf("status.Message() missing eBPF retirement substring: %q", st.Message())
 	}
@@ -98,6 +101,9 @@ func TestCommitConfirmedRejectsRetiredEBPF(t *testing.T) {
 	st, ok := status.FromError(err)
 	if !ok {
 		t.Fatalf("CommitConfirmed() error is not a *status.Status: %T (%v)", err, err)
+	}
+	if got, want := st.Code(), codes.InvalidArgument; got != want {
+		t.Errorf("status.Code() = %v, want %v", got, want)
 	}
 	if !strings.Contains(st.Message(), "legacy eBPF dataplane backend has been retired") {
 		t.Errorf("status.Message() missing eBPF retirement substring: %q", st.Message())

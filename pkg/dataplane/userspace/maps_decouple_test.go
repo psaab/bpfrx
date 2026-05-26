@@ -9,14 +9,15 @@
 //     to mention map names by literal (errors.New, fmt.Errorf,
 //     comments) because those are not .Map() call arguments.
 //
-//  2. TestRegistryParityWithLegacyLoader — short-lived consistency
-//     canary that pins the registry constants against the literal map
-//     names used by the legacy loader at pkg/dataplane/loader_ebpf.go.
-//     When #1476 retires the loader, the canary self-retires only
-//     if the explicit sentinel BPFRX_LEGACY_LOADER_RETIRED=1 is set;
-//     a missing loader file without the sentinel is a hard failure
-//     so accidental loader-file moves can't silently disable parity
-//     protection.
+//  2. TestRegistryParityWithLegacyLoader — consistency canary that
+//     pins the registry constants against the literal map names
+//     used by the retained Rust AF_XDP shim loader at
+//     pkg/dataplane/loader_userspace_shim.go. Pre-#1476 it targeted
+//     loader_ebpf.go and self-retired under
+//     BPFRX_LEGACY_LOADER_RETIRED=1 once the file went away; the
+//     escape-hatch sentinel is gone now that the loader's retained
+//     side has a permanent home. The function name keeps
+//     "WithLegacyLoader" suffix only for git-blame continuity.
 package userspace
 
 import (

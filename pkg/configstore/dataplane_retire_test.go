@@ -17,7 +17,7 @@ func TestRewriteRetiredDataplaneType_EBPF(t *testing.T) {
 	t.Parallel()
 
 	tree := mustParseTree(t, "set system dataplane-type ebpf")
-	got := rewriteRetiredDataplaneType(tree)
+	got := rewriteRetiredDataplaneType(tree, LoadCaller)
 	if got != 1 {
 		t.Fatalf("rewriteRetiredDataplaneType = %d; want 1", got)
 	}
@@ -42,7 +42,7 @@ func TestRewriteRetiredDataplaneType_DPDK(t *testing.T) {
 	t.Parallel()
 
 	tree := mustParseTree(t, "set system dataplane-type dpdk")
-	got := rewriteRetiredDataplaneType(tree)
+	got := rewriteRetiredDataplaneType(tree, LoadCaller)
 	if got != 1 {
 		t.Fatalf("rewriteRetiredDataplaneType = %d; want 1", got)
 	}
@@ -59,7 +59,7 @@ func TestRewriteRetiredDataplaneType_NoOpForUserspace(t *testing.T) {
 	t.Parallel()
 
 	tree := mustParseTree(t, "set system dataplane-type userspace")
-	got := rewriteRetiredDataplaneType(tree)
+	got := rewriteRetiredDataplaneType(tree, LoadCaller)
 	if got != 0 {
 		t.Fatalf("rewriteRetiredDataplaneType = %d; want 0 (userspace is the default)", got)
 	}
@@ -73,12 +73,93 @@ func TestRewriteRetiredDataplaneType_NoOpForUserspace(t *testing.T) {
 func TestRewriteRetiredDataplaneType_NoSystemNode(t *testing.T) {
 	t.Parallel()
 
-	if got := rewriteRetiredDataplaneType(nil); got != 0 {
-		t.Fatalf("rewriteRetiredDataplaneType(nil) = %d; want 0", got)
+	if got := rewriteRetiredDataplaneType(nil, LoadCaller); got != 0 {
+		t.Fatalf("rewriteRetiredDataplaneType(nil, LoadCaller) = %d; want 0", got)
 	}
 	empty := &config.ConfigTree{}
-	if got := rewriteRetiredDataplaneType(empty); got != 0 {
-		t.Fatalf("rewriteRetiredDataplaneType(empty) = %d; want 0", got)
+	if got := rewriteRetiredDataplaneType(empty, LoadCaller); got != 0 {
+		t.Fatalf("rewriteRetiredDataplaneType(empty, LoadCaller) = %d; want 0", got)
+	}
+}
+
+// TestRewriteRetiredDataplaneType_ApplyGroupsEBPF covers the
+// Codex r1 (PR #1558) finding: a `dataplane-type ebpf` leaf hidden
+// inside a `groups { legacy { system { ... } } }` definition must
+// be rewritten too. Without the groups-aware second pass, the raw
+// tree looks clean (top-level `system` only carries `apply-groups`)
+// but `compileExpanded` expands the group and trips the strict
+// retirement validator, returning ErrEBPFDataplaneRetired and
+// stranding the daemon.
+func TestRewriteRetiredDataplaneType_ApplyGroupsEBPF(t *testing.T) {
+	t.Parallel()
+
+	const src = `groups {
+    legacy {
+        system {
+            dataplane-type ebpf;
+        }
+    }
+}
+system {
+    apply-groups legacy;
+    host-name fw1;
+}`
+	parser := config.NewParser(src)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	got := rewriteRetiredDataplaneType(tree, LoadCaller)
+	if got != 1 {
+		t.Fatalf("rewriteRetiredDataplaneType = %d; want 1 (apply-groups-nested ebpf)", got)
+	}
+
+	// After rewrite, compileExpanded must succeed without firing
+	// the retirement validator. CompileConfigForNode forces the
+	// node-aware expansion path used by HA-cluster boot.
+	cfg, err := config.CompileConfigForNode(tree, 0)
+	if err != nil {
+		t.Fatalf("CompileConfigForNode after rewrite (apply-groups ebpf): %v", err)
+	}
+	if cfg.System.DataplaneType != "" {
+		t.Fatalf("post-rewrite DataplaneType = %q; want empty (rewritten from group-injected ebpf)",
+			cfg.System.DataplaneType)
+	}
+}
+
+// TestRewriteRetiredDataplaneType_ApplyGroupsDPDK is the symmetric
+// DPDK case. Both retired values share the same group-walking code
+// path; this test prevents a future change from accidentally only
+// covering one arm.
+func TestRewriteRetiredDataplaneType_ApplyGroupsDPDK(t *testing.T) {
+	t.Parallel()
+
+	const src = `groups {
+    legacy {
+        system {
+            dataplane-type dpdk;
+        }
+    }
+}
+system {
+    apply-groups legacy;
+}`
+	parser := config.NewParser(src)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	got := rewriteRetiredDataplaneType(tree, SyncCaller)
+	if got != 1 {
+		t.Fatalf("rewriteRetiredDataplaneType = %d; want 1 (apply-groups-nested dpdk)", got)
+	}
+	cfg, err := config.CompileConfigForNode(tree, 0)
+	if err != nil {
+		t.Fatalf("CompileConfigForNode after rewrite (apply-groups dpdk): %v", err)
+	}
+	if cfg.System.DataplaneType != "" {
+		t.Fatalf("post-rewrite DataplaneType = %q; want empty (rewritten from group-injected dpdk)",
+			cfg.System.DataplaneType)
 	}
 }
 

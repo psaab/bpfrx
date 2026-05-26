@@ -52,41 +52,96 @@ var retiredDataplaneTypes = map[string]string{
 	"ebpf": "legacy eBPF dataplane retired (see #1373); rewriting to userspace default",
 }
 
-// rewriteRetiredDataplaneType walks tree looking for
-// `system { dataplane-type X; }` leaves whose X is a retired
+// rewriteRetiredDataplaneType walks tree looking for any
+// `system { dataplane-type X; }` leaf whose X is a retired
 // value. Each match is removed from the tree and a structured
 // WARN is logged with the operator-facing rationale.
 //
-// Returns the number of leaves rewritten so callers can decide
-// whether to commit-persist the cleanup. Note that the rewrite
-// is in-memory only; the persisted config on disk is unchanged
+// The walk inspects BOTH:
+//
+//  1. The top-level `system` node (the common case).
+//  2. Any `system { ... }` node nested inside a
+//     `groups { <groupName> { ... } }` definition. Without this
+//     second pass, a config that hides the retired value behind
+//     `apply-groups <name>` slips through the rewrite and trips
+//     `validateDataplaneTypeStrict` inside `compileExpanded`
+//     (which runs against the post-expansion tree). Codex r1 of
+//     PR #1558 surfaced this gap.
+//
+// Both passes are needed even though `compileTree` later expands
+// groups, because the rewrite runs BEFORE compile and the canary
+// is whether the rewritten tree compiles cleanly without firing
+// the retirement-strict validator.
+//
+// `caller` selects the log-message phrasing so operators see the
+// right remediation hint depending on which Store entry point
+// invoked the rewrite:
+//
+//   - LoadCaller ("Store.Load()"):       review and `commit` locally.
+//   - SyncCaller ("Store.SyncApply()"):  update the un-upgraded
+//     primary's config so HA sync converges cleanly.
+//
+// Returns the number of leaves rewritten. The rewrite is
+// in-memory only; the persisted config on disk is unchanged
 // until the next normal commit path runs.
 //
 // Safe to call with a nil tree (no-op).
 //
 // Tested by TestRewriteRetiredDataplaneType in this package.
-func rewriteRetiredDataplaneType(tree *config.ConfigTree) int {
+func rewriteRetiredDataplaneType(tree *config.ConfigTree, caller retireRewriteCaller) int {
 	if tree == nil {
 		return 0
 	}
-	system := tree.FindChild("system")
+	rewrites := 0
+
+	// Pass 1: top-level `system` node.
+	if system := tree.FindChild("system"); system != nil {
+		rewrites += rewriteRetiredLeavesIn(system, caller)
+	}
+
+	// Pass 2: every `system { ... }` block nested inside a
+	// `groups { <name> { ... } }` definition. The AST shape is:
+	//
+	//   tree.Children:
+	//     Node{Keys: ["groups"]}
+	//       .Children: [Node{Keys: ["legacy"]} ...]
+	//                     .Children: [Node{Keys: ["system"]}]
+	//                                   .Children: [Node{Keys: ["dataplane-type", "ebpf"]}]
+	//
+	// Walk into groups → group-name → system → leaf.
+	if groupsRoot := tree.FindChild("groups"); groupsRoot != nil {
+		for _, group := range groupsRoot.Children {
+			if group == nil {
+				continue
+			}
+			groupSystem := group.FindChild("system")
+			if groupSystem == nil {
+				continue
+			}
+			rewrites += rewriteRetiredLeavesIn(groupSystem, caller)
+		}
+	}
+
+	return rewrites
+}
+
+// rewriteRetiredLeavesIn drops every `dataplane-type X` leaf whose
+// X is in the retired set from the given system-shaped node, and
+// logs a WARN per match. Returns the count.
+func rewriteRetiredLeavesIn(system *config.Node, caller retireRewriteCaller) int {
 	if system == nil {
 		return 0
 	}
-	// Walk children, build a filtered list dropping every
-	// `dataplane-type X` whose X is retired. There can in
-	// principle be multiple such leaves if a config carries
-	// stray duplicates; remove all of them.
 	rewrites := 0
 	filtered := make([]*config.Node, 0, len(system.Children))
 	for _, child := range system.Children {
 		if isRetiredDataplaneLeaf(child) {
 			retired := child.Keys[1]
 			slog.Warn(
-				"persisted active-config selects retired dataplane backend; rewriting to userspace default",
+				caller.warnMessage(),
 				"dataplane_type", retired,
 				"rationale", retiredDataplaneTypes[retired],
-				"remediation", "review and `commit` after daemon comes up to persist the cleanup",
+				"remediation", caller.remediation(),
 			)
 			rewrites++
 			continue
@@ -110,4 +165,44 @@ func isRetiredDataplaneLeaf(child *config.Node) bool {
 	}
 	_, ok := retiredDataplaneTypes[child.Keys[1]]
 	return ok
+}
+
+// retireRewriteCaller tags which Store entry point invoked the
+// rewrite so the log message and remediation hint can address the
+// right operator audience. Codex r1 of PR #1558 flagged that a
+// generic "review and commit" message is wrong on the SyncApply
+// path: the upgraded standby cannot fix the persisted config of an
+// un-upgraded primary by committing locally.
+type retireRewriteCaller int
+
+const (
+	// LoadCaller: rewrite invoked from Store.Load() during local
+	// daemon boot. Operator remediation is local: `commit` after
+	// startup to persist the cleanup.
+	LoadCaller retireRewriteCaller = iota
+
+	// SyncCaller: rewrite invoked from Store.SyncApply() during
+	// HA peer-sync ingress. The retired value originated on the
+	// un-upgraded primary, so local `commit` is insufficient —
+	// the operator must update the primary's config so future
+	// sync rounds converge cleanly.
+	SyncCaller
+)
+
+func (c retireRewriteCaller) warnMessage() string {
+	switch c {
+	case SyncCaller:
+		return "HA peer-synced config selects retired dataplane backend; rewriting to userspace default before compile"
+	default:
+		return "persisted active-config selects retired dataplane backend; rewriting to userspace default"
+	}
+}
+
+func (c retireRewriteCaller) remediation() string {
+	switch c {
+	case SyncCaller:
+		return "the un-upgraded primary is still pushing the retired value; update its config and `commit` there so future sync rounds converge"
+	default:
+		return "review and `commit` after daemon comes up to persist the cleanup"
+	}
 }
