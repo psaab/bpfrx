@@ -7,5 +7,10 @@
 
 ## Round 2 (PLAN review on plan v2, commit e59c6f4e)
 
-- Codex: `task-mpmz1whj-5t3zod`
-- AGY: `adversarial-review-mpmz27os-jlg8jq`
+- Codex: `task-mpmz1whj-5t3zod` → PLAN-NEEDS-MAJOR (5 mechanical)
+- AGY: `adversarial-review-mpmz27os-jlg8jq` → PLAN-NEEDS-MINOR (3 named)
+
+## Code review (PR #1573, implementation commit a383cf23)
+
+- Codex: `task-mpmzpuvi-1mu1bx`
+- AGY: `adversarial-review-mpmzq8kd-ys1bws`

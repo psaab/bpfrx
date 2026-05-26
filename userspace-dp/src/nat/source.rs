@@ -10,7 +10,7 @@ use super::allocator::{
 };
 use super::NatDecision;
 use crate::prefix::{PrefixV4, PrefixV6};
-use crate::{SourceNATRuleSnapshot, SourceNatPoolStatus};
+use crate::SourceNATRuleSnapshot;
 use ipnet::IpNet;
 use rustc_hash::FxHashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

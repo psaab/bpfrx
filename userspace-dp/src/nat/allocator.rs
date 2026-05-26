@@ -27,7 +27,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::MutexGuard;
 
 pub(super) const NS_PER_SEC: u64 = 1_000_000_000;
 const MAX_SOURCE_NAT_POOL_TRACKED_FLOWS: usize = 262_144;
