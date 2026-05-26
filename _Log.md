@@ -3584,3 +3584,56 @@
 - **Validation**: docs-only on a worktree off origin/master; no code
   changed. Phase B (execute the runbook against the #1476 merge SHA) is
   blocked on #1476's PR opening + merging.
+- **Timestamp**: 2026-05-26T03:30Z
+- **Action**: Author #1477 Gate-3 SYN-cookie helper scripts/cookie-replay.py
+  (Phase A.5)
+- **File(s)**: scripts/cookie-replay.py (NEW),
+  scripts/cookie_replay_test.py (NEW)
+- **Why**: #1477 runbook Gate 3 (#1374 SYN-cookie proof) referenced
+  scripts/cookie-replay.py as a TODO. Implemented as a stdlib-only raw-
+  socket driver covering all six sub-gates: challenge / capture-cookie,
+  valid-ack (replays ISN+1 against captured cookie ⇒ expect RST),
+  retransmit-syn (consumes the SynCookieBypass), random-ack (advances
+  syn_cookie_ack_invalid), budget-exhaust (advances
+  syn_cookie_reply_budget_drops), and replay (failover sub-gate, cookie
+  minted on fw0 replayed on fw1). Token JSON persists across processes so
+  capture/replay can straddle a failover.
+- **Validation**: cookie_replay_test.py: 13 tests, all green
+  (checksum/_build_ipv4/_build_tcp/_build_packet/_parse_tcp/CookieToken
+  round-trip/CLI mode list/--token-file enforcement).
+
+- **Timestamp**: 2026-05-26T03:40Z
+- **Action**: Author #1477 Gate-7 port-mirror fidelity checker
+  scripts/mirror-pcap-fidelity.py (Phase A.5)
+- **File(s)**: scripts/mirror-pcap-fidelity.py (NEW),
+  scripts/mirror_pcap_fidelity_test.py (NEW)
+- **Why**: #1477 runbook Gate 7 (#1376 port-mirror) flagged a structured
+  byte-equality checker as an optional follow-up. Implemented as a
+  classic-libpcap reader (LE + BE magic) that SHA-256s each frame and
+  builds an ingress-side multiset; mirror-side frames must each find a
+  byte-equal match (with multiplicity respected). Fails on VLAN strip
+  (full L2 bytes must match), on any unmatched mirror frame, on
+  mirror_count outside ingress_count / rate +/- tolerance, on empty
+  pcaps, and rejects pcapng with a clear error.
+- **Validation**: mirror_pcap_fidelity_test.py: 10 tests, all green
+  (exact match, byte mismatch, VLAN bytes preserved, count out of
+  tolerance, rate=4 within tolerance, frame multiplicity, empty pcap,
+  pcapng rejection, big-endian magic, verdict-JSON shape).
+
+- **Timestamp**: 2026-05-26T03:45Z
+- **Action**: Wire in-tree helpers into #1477 runbook + align SYN-cookie
+  counter names with userspace-dp protocol (Phase A.5 doc sweep)
+- **File(s)**: docs/pr/1477-final-validation/runbook.md,
+  docs/pr/1477-final-validation/artifacts.md
+- **Why**: Phase A draft referenced TODO scripts and used wire-incorrect
+  plural counter names (syn_cookie_syn_acks_sent etc.). Aligned with
+  userspace-dp/src/protocol.rs + pkg/dataplane/userspace/protocol.go
+  (singular: syn_cookie_syn_ack_sent, syn_cookie_ack_valid,
+  syn_cookie_ack_rst_sent, syn_cookie_bypass, syn_cookie_ack_invalid,
+  syn_cookie_challenges). Rewrote snapshot_synpx_counters to sum
+  per-binding counters from /run/xpf/userspace-dp.json (Prometheus
+  doesn't carry these yet). Added snapshot_mirror_counters per the same
+  pattern and wired scripts/mirror-pcap-fidelity.py into Gate 7 with an
+  ingress-side tcpdump capture for byte-equality comparison.
+- **Validation**: Docs-only sweep on top of helper changes; helper test
+  suites re-run green (13 + 10 tests).

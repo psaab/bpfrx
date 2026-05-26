@@ -39,10 +39,17 @@ merge SHA.
 - #1477 closure: _pending_
 - #1373 umbrella closure: _pending_
 
-## Open follow-ups for the runbook
+## In-tree helpers (Phase A.5)
 
-- `scripts/cookie-replay.py` referenced by runbook §5 — author alongside
-  validation run; preserve script source under
-  `<artifact_root>/syn-cookie/cookie-replay.py`.
-- Port-mirror PCAP byte-equality checker (runbook §9.3) — optional, not a
-  #1477 blocker.
+Both runbook-referenced helpers are now in-tree on this branch:
+
+- `scripts/cookie-replay.py` — drives SYN-cookie sub-gates 5.4 - 5.8.
+  Unit-tested by `scripts/cookie_replay_test.py` (13 tests).
+- `scripts/mirror-pcap-fidelity.py` — structured port-mirror PCAP
+  byte-equality + count-tolerance check for runbook §9.3.
+  Unit-tested by `scripts/mirror_pcap_fidelity_test.py` (10 tests).
+
+Phase B preserves the cookie-replay script source under
+`<artifact_root>/syn-cookie/cookie-replay.py` (runbook §5.4 push step) so
+the evidence bundle remains reproducible against the exact source-removal
+candidate.

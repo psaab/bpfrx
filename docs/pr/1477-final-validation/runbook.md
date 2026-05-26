@@ -216,21 +216,29 @@ This is plumbing-only. SYN-cookie semantics are validated in Gate 3.
 Pass criteria (all required by #1374's "Exact Tests" integration row):
 
 1. Flood SYN traffic causes the dataplane to send SYN-ACK challenge replies
-   (`syn_cookie_syn_acks_sent` advances).
+   (`syn_cookie_challenges` and `syn_cookie_syn_ack_sent` advance).
 2. A returning valid ACK (carrying the encoded ISN) triggers a RST reply,
-   not a session install (`syn_cookie_valid_acks` and
-   `syn_cookie_ack_rsts_sent` advance; no new session entry).
+   not a session install (`syn_cookie_ack_valid` and
+   `syn_cookie_ack_rst_sent` advance; no new session entry).
 3. The retransmitted SYN from the same validated tuple admits normally via
-   the `SynCookieBypass` single-use cache (`syn_cookie_bypasses` advances by
+   the `SynCookieBypass` single-use cache (`syn_cookie_bypass` advances by
    1, then session is installed).
 4. Random ACKs from the same source IP but with wrong ISN are dropped and
-   `syn_cookie_invalid_acks` advances; no session installed.
+   `syn_cookie_ack_invalid` advances; no session installed.
 5. Reply-budget exhaustion is observable: when SYN rate exceeds the binding
    reserve, `syn_cookie_reply_budget_drops` advances and forwarding TX is
    unaffected (Gate 1 push/reverse still passes after the storm).
 6. RG failover during the active flood window leaves cookies minted by the
    former active node acceptable on the new active node within the
    current/previous/next-epoch tolerance.
+
+Counter names match the wire contract in
+`pkg/dataplane/userspace/protocol.go` and
+`userspace-dp/src/protocol.rs`; the daemon exposes them per-binding under
+`bindings[].syn_cookie_*` in `/run/xpf/userspace-dp.json` (and in `cli -c 'show
+security screen status'`). The Prometheus surface does NOT yet carry these
+counters; the counter snapshot helper below sums them from the helper status
+JSON.
 
 Required artifacts (per `final-validation/README.md`):
 
@@ -278,14 +286,46 @@ listed in `show security screen status` for `pr1477-sync`).
 
 ### 5.2 Counter snapshot helper
 
+The userspace SYN-cookie counters live in the helper status JSON at
+`/run/xpf/userspace-dp.json` under `bindings[].syn_cookie_*`. They are
+not on the Prometheus surface yet. This helper sums them across all
+bindings on a node so callers can read one number per counter.
+
 ```bash
 snapshot_synpx_counters() {
-  local out=$1
-  sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- cli -c 'show security screen status'" >"$out"
-  sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- curl -s http://127.0.0.1:8080/metrics" \
-    | grep -E '^xpf_userspace_(syn_cookie|screen_)' >>"$out"
+  local out=$1 node=${2:-xpf-userspace-fw0}
+  {
+    echo "# show security screen status on ${node}"
+    sg incus-admin -c "incus exec loss:${node} -- cli -c 'show security screen status'"
+    echo
+    echo "# per-binding syn_cookie_* counters from /run/xpf/userspace-dp.json on ${node}"
+    sg incus-admin -c "incus exec loss:${node} -- cat /run/xpf/userspace-dp.json" \
+      | python3 -c '
+import json, sys
+status = json.load(sys.stdin)
+keys = (
+  "syn_cookie_challenges",
+  "syn_cookie_secret_unavailable",
+  "syn_cookie_syn_ack_sent",
+  "syn_cookie_ack_rst_sent",
+  "syn_cookie_reply_budget_drops",
+  "syn_cookie_ack_valid",
+  "syn_cookie_ack_invalid",
+  "syn_cookie_bypass",
+)
+totals = {k: 0 for k in keys}
+for b in status.get("bindings", []):
+    for k in keys:
+        totals[k] += int(b.get(k, 0) or 0)
+for k in keys:
+    print(f"{k}={totals[k]}")
+'
+  } >"$out"
 }
 ```
+
+The snapshot helper is invoked before/after each sub-gate. Counter
+deltas are computed by subtracting matching `key=value` lines.
 
 ### 5.3 Challenge: SYN flood ⇒ SYN-ACK
 
@@ -308,39 +348,50 @@ sg incus-admin -c "incus exec loss:cluster-userspace-host -- tcpdump -r - -nn" \
 snapshot_synpx_counters "$ARTIFACT_ROOT/syn-cookie/challenge-counters-after.txt"
 ```
 
-Expected delta: `syn_cookie_challenges_selected` and
-`syn_cookie_syn_acks_sent` increase. `challenge-tcpdump.txt` shows
-firewall-sourced SYN-ACK frames whose destination port matches the flood
-source ports.
+Expected delta: `syn_cookie_challenges` and `syn_cookie_syn_ack_sent`
+increase. `challenge-tcpdump.txt` shows firewall-sourced SYN-ACK frames
+whose destination port matches the flood source ports.
 
 ### 5.4 Valid-ACK ⇒ RST proof (carry the encoded ISN)
 
-Use `scripts/cookie-replay.py` (helper to be authored — captures one
-SYN-ACK from the previous step, swaps src/dst, ACKs the ISN+1). If the
-script is not yet in-tree, capture this as a test gap and use a hand-crafted
-scapy run; record the script source under `syn-cookie/cookie-replay.py`.
+`scripts/cookie-replay.py` is the in-tree helper for sub-gates 5.4 - 5.8.
+Push it into the cluster host before running the sub-gates (and into the
+artifact bundle so evidence is reproducible):
+
+```bash
+sg incus-admin -c "incus file push scripts/cookie-replay.py loss:cluster-userspace-host/tmp/cookie-replay.py"
+cp scripts/cookie-replay.py "$ARTIFACT_ROOT/syn-cookie/cookie-replay.py"
+```
+
+This sub-gate captures a SYN-ACK from the firewall, then replays a
+valid cookie ACK; expectation is a RST from the firewall and no session
+install.
 
 ```bash
 snapshot_synpx_counters "$ARTIFACT_ROOT/syn-cookie/valid-ack-rst-counters-before.txt"
-# replay produces ONE valid ACK derived from a captured SYN-ACK
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- python3 /tmp/cookie-replay.py --mode valid" \
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- python3 /tmp/cookie-replay.py \
+    --mode capture-cookie --token-file /tmp/cookie-valid.json --flood 50" \
   > "$ARTIFACT_ROOT/syn-cookie/valid-ack-rst-tcpdump.txt" 2>&1
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- python3 /tmp/cookie-replay.py \
+    --mode valid-ack --token-file /tmp/cookie-valid.json" \
+  >> "$ARTIFACT_ROOT/syn-cookie/valid-ack-rst-tcpdump.txt" 2>&1
 snapshot_synpx_counters "$ARTIFACT_ROOT/syn-cookie/valid-ack-rst-counters-after.txt"
 ```
 
-Expected delta: `syn_cookie_valid_acks` += 1, `syn_cookie_ack_rsts_sent` += 1;
+Expected delta: `syn_cookie_ack_valid` += 1, `syn_cookie_ack_rst_sent` += 1;
 no new entry in `show security flow session`.
 
 ### 5.5 Retransmitted-SYN admission via single-use bypass
 
 ```bash
 snapshot_synpx_counters "$ARTIFACT_ROOT/syn-cookie/retransmitted-syn-admission-counters-before.txt"
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- python3 /tmp/cookie-replay.py --mode retransmit-syn" \
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- python3 /tmp/cookie-replay.py \
+    --mode retransmit-syn --token-file /tmp/cookie-valid.json" \
   > "$ARTIFACT_ROOT/syn-cookie/retransmitted-syn-admission-tcpdump.txt" 2>&1
 snapshot_synpx_counters "$ARTIFACT_ROOT/syn-cookie/retransmitted-syn-admission-counters-after.txt"
 ```
 
-Expected delta: `syn_cookie_bypasses` += 1; a new session installed; the SAME
+Expected delta: `syn_cookie_bypass` += 1; a new session installed; the SAME
 client tuple resending another SYN immediately after consumes the bypass
 exactly once (subsequent SYNs go through normal policy).
 
@@ -348,12 +399,13 @@ exactly once (subsequent SYNs go through normal policy).
 
 ```bash
 snapshot_synpx_counters "$ARTIFACT_ROOT/syn-cookie/random-ack-drop-counters-before.txt"
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- python3 /tmp/cookie-replay.py --mode random-ack --count 500" \
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- python3 /tmp/cookie-replay.py \
+    --mode random-ack --count 500" \
   > "$ARTIFACT_ROOT/syn-cookie/random-ack-drop-tcpdump.txt" 2>&1
 snapshot_synpx_counters "$ARTIFACT_ROOT/syn-cookie/random-ack-drop-counters-after.txt"
 ```
 
-Expected delta: `syn_cookie_invalid_acks` += 500 (approx); session table size
+Expected delta: `syn_cookie_ack_invalid` += 500 (approx); session table size
 unchanged.
 
 ### 5.7 Reply-budget exhaustion
@@ -362,7 +414,8 @@ Drive flood at a rate higher than the per-binding reply budget; confirm
 `syn_cookie_reply_budget_drops` advances while Gate 1 re-run still passes:
 
 ```bash
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- hping3 -S -p 5201 --flood -c 200000 -d 0 172.16.80.200" \
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- python3 /tmp/cookie-replay.py \
+    --mode budget-exhaust --duration 3.0" \
   >/dev/null 2>&1 || true
 snapshot_synpx_counters "$ARTIFACT_ROOT/syn-cookie/reply-budget-counters.txt"
 ```
@@ -373,23 +426,26 @@ snapshot_synpx_counters "$ARTIFACT_ROOT/syn-cookie/reply-budget-counters.txt"
 sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- cli -c 'show chassis cluster status'" \
   > "$ARTIFACT_ROOT/syn-cookie/failover-before-cluster-status.txt"
 
-# Capture a fresh SYN-ACK on fw0, then force RG0 to fw1, then replay the ACK
-# against the new active node.
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- python3 /tmp/cookie-replay.py --mode capture-cookie" \
-  > /tmp/cookie-token.txt
+# Capture a fresh cookie minted on fw0, then force RG0 to fw1, then
+# replay the ACK against the new active node.
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- python3 /tmp/cookie-replay.py \
+    --mode capture-cookie --token-file /tmp/cookie-failover.json --flood 50" \
+  > "$ARTIFACT_ROOT/syn-cookie/failover-cookie-ack-tcpdump.txt" 2>&1
 sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- cli -c 'request chassis cluster failover redundancy-group 0 node 1'" \
   >/dev/null
 sleep 2
 sg incus-admin -c "incus exec loss:xpf-userspace-fw1 -- cli -c 'show chassis cluster status'" \
   > "$ARTIFACT_ROOT/syn-cookie/failover-after-cluster-status.txt"
-sg incus-admin -c "incus exec loss:cluster-userspace-host -- python3 /tmp/cookie-replay.py --mode replay --token-file /tmp/cookie-token.txt" \
-  > "$ARTIFACT_ROOT/syn-cookie/failover-cookie-ack-tcpdump.txt" 2>&1
-snapshot_synpx_counters "$ARTIFACT_ROOT/syn-cookie/failover-counters-node1.txt"
+sg incus-admin -c "incus exec loss:cluster-userspace-host -- python3 /tmp/cookie-replay.py \
+    --mode replay --token-file /tmp/cookie-failover.json" \
+  >> "$ARTIFACT_ROOT/syn-cookie/failover-cookie-ack-tcpdump.txt" 2>&1
+snapshot_synpx_counters "$ARTIFACT_ROOT/syn-cookie/failover-counters-node1.txt" xpf-userspace-fw1
 ```
 
-Expected: replay on fw1 records `syn_cookie_valid_acks += 1` (cluster-synced
+Expected: replay on fw1 records `syn_cookie_ack_valid += 1` (cluster-synced
 master key + bounded wall-clock skew makes cookie minted on fw0 acceptable
-on fw1 within the current/previous/next epoch).
+on fw1 within the current/previous/next epoch). The
+`failover-counters-node1.txt` snapshot reads counters on fw1, not fw0.
 
 ### 5.9 Cleanup
 
@@ -478,8 +534,10 @@ Required artifacts:
 ```text
 $ARTIFACT_ROOT/port-mirror/
   applied-config.txt
+  ingress-tcpdump.pcap
   mirror-output-tcpdump.pcap
   mirror-output-tcpdump.txt
+  fidelity-verdict.json
   counters-before.txt
   counters-after.txt
   pressure-iperf.json
@@ -504,12 +562,42 @@ EOF
 
 ### 9.2 Capture mirror output + counters
 
-```bash
-sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- curl -s http://127.0.0.1:8080/metrics" \
-  | grep -E '^xpf_userspace_mirror_' \
-  > "$ARTIFACT_ROOT/port-mirror/counters-before.txt"
+The mirror counters live per-binding under `bindings[].mirrored_packets`,
+`bindings[].mirrored_bytes`, `bindings[].mirror_drops_no_frame`,
+`bindings[].mirror_drops_no_binding`, and
+`bindings[].mirror_drops_queue_full` in `/run/xpf/userspace-dp.json`.
 
-sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- timeout 10 tcpdump -i ge-0-0-3 -nn -c 500 -w -" \
+```bash
+snapshot_mirror_counters() {
+  local out=$1
+  sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- cat /run/xpf/userspace-dp.json" \
+    | python3 -c '
+import json, sys
+status = json.load(sys.stdin)
+keys = (
+  "mirrored_packets",
+  "mirrored_bytes",
+  "mirror_drops_no_frame",
+  "mirror_drops_no_binding",
+  "mirror_drops_queue_full",
+)
+totals = {k: 0 for k in keys}
+for b in status.get("bindings", []):
+    for k in keys:
+        totals[k] += int(b.get(k, 0) or 0)
+for k in keys:
+    print(f"{k}={totals[k]}")
+' >"$out"
+}
+
+snapshot_mirror_counters "$ARTIFACT_ROOT/port-mirror/counters-before.txt"
+
+# Capture BOTH the ingress stream (ground truth) and the mirror output
+# (mirror-side stream). Run in parallel so they overlap the iperf push.
+sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- timeout 12 tcpdump -i ge-0-0-1 -nn -s 0 -w -" \
+  > "$ARTIFACT_ROOT/port-mirror/ingress-tcpdump.pcap" 2>/dev/null &
+INGRESS_PID=$!
+sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- timeout 12 tcpdump -i ge-0-0-3 -nn -s 0 -w -" \
   > "$ARTIFACT_ROOT/port-mirror/mirror-output-tcpdump.pcap" 2>/dev/null &
 TCPDUMP_PID=$!
 
@@ -520,23 +608,43 @@ sg incus-admin -c "incus exec loss:cluster-userspace-host -- iperf3 -J --forcefl
   > "$ARTIFACT_ROOT/port-mirror/pressure-iperf.metrics.json"
 
 wait $TCPDUMP_PID 2>/dev/null || true
+wait $INGRESS_PID 2>/dev/null || true
+
 sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- tcpdump -r - -nn -e -v" \
   < "$ARTIFACT_ROOT/port-mirror/mirror-output-tcpdump.pcap" \
   > "$ARTIFACT_ROOT/port-mirror/mirror-output-tcpdump.txt"
 
-sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- curl -s http://127.0.0.1:8080/metrics" \
-  | grep -E '^xpf_userspace_mirror_' \
-  > "$ARTIFACT_ROOT/port-mirror/counters-after.txt"
+snapshot_mirror_counters "$ARTIFACT_ROOT/port-mirror/counters-after.txt"
 ```
 
 ### 9.3 Verify full-L2 fidelity + survival
 
-Inline checks (record verdict in summary.md):
+Run the in-tree byte-equality checker (`scripts/mirror-pcap-fidelity.py`)
+against the paired pcaps. The checker hashes each frame and confirms every
+mirror-side frame is byte-equal to an ingress-side frame (full L2, VLAN
+bytes preserved), and that the mirror count is within tolerance of
+`ingress_count / rate`:
+
+```bash
+./scripts/mirror-pcap-fidelity.py \
+    --ingress "$ARTIFACT_ROOT/port-mirror/ingress-tcpdump.pcap" \
+    --mirror "$ARTIFACT_ROOT/port-mirror/mirror-output-tcpdump.pcap" \
+    --rate 1 \
+    --output "$ARTIFACT_ROOT/port-mirror/fidelity-verdict.json"
+```
+
+`fidelity-verdict.json` MUST report `"pass": true` with `unmatched_mirror_frames
+== 0`. Per-binding sampling is bursty, so the default tolerance is
+`max(2, ceil(0.05 * expected))`; widen it explicitly only if a particular run
+captures a sampling burst boundary.
+
+Additional inline checks (record verdict in summary.md):
 
 - `mirror-output-tcpdump.txt` lines include Ethernet src/dst MACs and any
   configured VLAN tag (i.e. tcpdump `-e` output is non-empty and VLAN
   field present where applicable).
-- `mirrored_packets` delta (after - before) ≥ approximate sampled count.
+- `mirrored_packets` delta (after - before) is approximately equal to the
+  ingress frame count divided by the configured mirror rate.
 - `pressure-iperf.metrics.json` reports `avg_gbps >= MIN_GBPS` with zero
   retransmits.
 - `mirror_drops_queue_full` and `mirror_drops_no_frame` may be > 0 (lossy
@@ -700,13 +808,29 @@ posts evidence; an autonomous closure step is NOT part of this runbook.
 
 ---
 
-## 16. Open follow-ups recorded in this runbook (not blockers for #1477)
+## 16. In-tree helpers used by this runbook
 
-- `scripts/cookie-replay.py` referenced by §5 must be authored alongside the
-  source-removal candidate or as part of #1374's final evidence slice.
-  Record the script source under `syn-cookie/cookie-replay.py` in the
-  artifact bundle so the evidence is reproducible.
-- The port-mirror tcpdump field-coverage check (§9.3) is currently visual;
-  if a structured fidelity checker is added (e.g. PCAP byte-equality vs the
-  ingress stream), wire it into `port-mirror/` and reference it from
-  `summary.md`.
+The runbook depends on two helpers that ship in the validation branch:
+
+- `scripts/cookie-replay.py` (§5.4 - §5.8) — raw-socket SYN-cookie sub-gate
+  driver. Modes: `challenge` / `capture-cookie` / `valid-ack` /
+  `retransmit-syn` / `random-ack` / `budget-exhaust` / `replay`. Token JSON
+  is persisted via `--token-file` so the failover sub-gate can capture on
+  fw0 and replay on fw1. Unit-tested by
+  `scripts/cookie_replay_test.py` (13 tests; checksum/header/parser/CLI).
+- `scripts/mirror-pcap-fidelity.py` (§9.3) — SHA-256 multiset comparison
+  between the ingress pcap and the mirror-output pcap. Fails on any
+  byte-mismatched mirror frame, on VLAN strip, or on a mirror count outside
+  `ingress_count / rate +/- tolerance`. Unit-tested by
+  `scripts/mirror_pcap_fidelity_test.py` (10 tests; pcap reader, exact
+  match, byte mismatch, VLAN preservation, multiplicity, big-endian,
+  pcapng rejection, verdict-JSON shape).
+
+Both helpers use Python 3 stdlib only — no scapy, no extra deps — so they
+run in the loss cluster fixtures without provisioning. Both are exercised
+locally before each commit; re-run via:
+
+```bash
+python3 scripts/cookie_replay_test.py
+python3 scripts/mirror_pcap_fidelity_test.py
+```
