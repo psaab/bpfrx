@@ -74,6 +74,14 @@
   `shared_cos_lease.rs:L1497-L1710` / `:L1713-L1854` which won't
   exist on master post-merge. Reworded headers to reference "PR
   #1588 for the move diff" instead. Build clean after edit.
+- **19:20 UTC** — Codex code r3 MERGE-READY on 8df7e39a. Copilot
+  re-reviewed at 6c0d0061 COMMENTED with 4 more doc-nits:
+  Issue/PR labeling on the headers; mod.rs comment doesn't mention
+  the explicit `use` import; plan.md status header stale; reviewer-ids
+  still says "copilot r1 awaiting". Addressed all 4 in the next
+  commit — relabeled headers "Issue #1329 / PR #1588", added the
+  `use` import note to mod.rs, plan.md → PLAN-READY/IMPLEMENTED,
+  reviewer-ids updated.
 
 ## 2026-05-26 — #1325 implementation pushed
 

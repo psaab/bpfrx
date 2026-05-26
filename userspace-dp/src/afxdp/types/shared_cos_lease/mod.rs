@@ -1492,11 +1492,15 @@ impl SharedCoSQueueLease {
     }
 }
 
-// #1329 Step 1: hot-path epoch rotation submodules. Pure
+// Issue #1329 / PR #1588: hot-path epoch rotation submodules. Pure
 // code-motion extract of maybe_rotate_epoch_v8 and
 // publish_equal_flow_epoch_v8; bodies are byte-identical to the
-// pre-split form, only visibility widens to pub(super) and
-// #[inline] is added as a hint.
+// pre-split form, with three forced edits at the move boundary:
+// visibility widens to pub(super), #[inline] is added as a hint,
+// and rotate_epoch_v8.rs adds an explicit
+// `use super::publish_equal_flow_epoch_v8::publish_equal_flow_epoch_v8;`
+// so the rotation's call into the equal-flow helper resolves
+// across the sibling-submodule boundary.
 mod publish_equal_flow_epoch_v8;
 mod rotate_epoch_v8;
 

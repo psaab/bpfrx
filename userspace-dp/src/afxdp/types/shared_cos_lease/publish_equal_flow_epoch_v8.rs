@@ -1,4 +1,4 @@
-// #1329: publish_equal_flow_epoch_v8 extracted from
+// Issue #1329 / PR #1588: publish_equal_flow_epoch_v8 extracted from
 // shared_cos_lease/mod.rs as a pure code-motion split. The function
 // body is byte-identical to the pre-split form (see PR #1588 for the
 // move diff); atomic orderings, fail_open branch wiring,

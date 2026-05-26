@@ -1,8 +1,8 @@
-// #1329: maybe_rotate_epoch_v8 extracted from shared_cos_lease/mod.rs
-// as a pure code-motion split. The function body is byte-identical
-// to the pre-split form (see PR #1588 for the move diff); atomic
-// memory orderings, branch structure, and stack-scratch arrays are
-// preserved exactly.
+// Issue #1329 / PR #1588: maybe_rotate_epoch_v8 extracted from
+// shared_cos_lease/mod.rs as a pure code-motion split. The function
+// body is byte-identical to the pre-split form (see PR #1588 for the
+// move diff); atomic memory orderings, branch structure, and
+// stack-scratch arrays are preserved exactly.
 //
 // Visibility widens from inherent-private to `pub(super)` so the
 // rotation tick path in `mod.rs` continues to find it. `#[inline]`

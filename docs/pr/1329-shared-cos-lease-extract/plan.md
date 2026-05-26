@@ -1,10 +1,12 @@
 # #1329 — shared_cos_lease.rs hot-fn extract — Plan
 
-**Status:** DRAFT v4 — Codex r3 PLAN-NEEDS-MINOR: one stale
-`pub(in crate::afxdp) use` reference at the Honest-scope `Cost:`
-line corrected to the actual `pub(super) use`; test-path open
-question reworded to drop the contradictory "shortening to itself"
-phrasing. v3 prior fixes preserved:
+**Status:** PLAN-READY / IMPLEMENTED. Codex r4 PLAN-READY at v4
+(commit 5d31a42f), AGY r1 PLAN-READY at v1. Implementation
+shipped in PR #1588 starting at commit f8ad9fe3 (subsequent
+commits address Codex code r1 flake-test wording and Copilot
+inline doc nits).
+
+Plan revision history below preserves the per-round fixes:
 (stale `#[inline] preserves codegen` text removed from risk table
 and Hidden invariants, release LTO claim removed because
 userspace-dp/Cargo.toml has no LTO setting, stale
