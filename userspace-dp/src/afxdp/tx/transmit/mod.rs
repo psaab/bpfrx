@@ -303,7 +303,7 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
 
 /// Diagnostic-only: scan staged prepared frames for TCP RST and emit
 /// throttled RST_DETECT log lines. Behind `cfg!(feature = "debug-log")`
-/// at the call site; kept as an out-of-line helper so the per-tick
+/// at the call site; kept as an out-of-line helper so the per-batch
 /// orchestrator stays compact when debug-log is enabled.
 #[inline]
 fn log_rst_frames_prepared(binding: &mut BindingWorker) {

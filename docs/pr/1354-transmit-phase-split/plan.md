@@ -46,9 +46,11 @@
 ## Issue framing
 
 `userspace-dp/src/afxdp/tx/transmit.rs::transmit_prepared_queue()` is a
-230-LOC function on the hot TX path (one call per worker tick — not
-per packet). `docs/engineering-style.md` flags >100 LOC as a refactor
-cue; this is a Tier-1 modularity hit at 2.3× the cap.
+230-LOC function on the hot TX path (per-batch, not per-packet — each
+batch capped at `TX_BATCH_SIZE = 64`; can run multiple times per
+worker tick via the `drain_pending_tx` loop and CoS submit).
+`docs/engineering-style.md` flags >100 LOC as a refactor cue; this
+is a Tier-1 modularity hit at 2.3× the cap.
 
 The issue proposes splitting the body into four phases:
 
@@ -335,9 +337,9 @@ require zero edits.
    vs += len-1" differences. Preserve these byte-identical by
    choosing the helper variant carefully.
 
-5. **No new per-tick allocations.** No new `Vec::new()`,
+5. **No new per-batch allocations.** No new `Vec::new()`,
    `Box::new()`, `format!()`, `String::new()`, or `clone()` in the
-   hot path. The existing path has zero per-tick allocations on the
+   hot path. The existing path has zero per-batch allocations on the
    success branch (`scratch_prepared_tx` is reused; `retry_tail` is a
    `Vec` only allocated when there IS a retry tail). The phase split
    preserves this — the orchestrator passes mutable refs to scratch
@@ -368,7 +370,7 @@ require zero edits.
 |-------|---------|-----------|
 | Behavioral regression | LOW | Pure code motion; phase order preserved 1:1; orphan-recycle helper preserves asymmetric accounting verbatim. |
 | Lifetime / borrow-checker | LOW | All phases take `binding: &mut BindingWorker`. No nested mutable borrows of disjoint fields are needed. |
-| Performance regression | LOW | Function is called once per worker tick (not per packet). `#[inline]` on each helper preserves codegen shape. Zero new allocations. |
+| Performance regression | LOW | Function is called per-batch (TX_BATCH_SIZE=64, may run multiple times per tick via drain loop and CoS submit), not per packet. `#[inline]` on each helper preserves codegen shape. Zero new allocations. |
 | Architectural mismatch (#961 / #946 Phase 2 dead-end) | LOW | The phases were already commented out in the source; the file already lives in a `tx/` directory module; #1166 / #1189 / #1199 / #1200 set the pattern for this kind of split. No new architectural premise. |
 
 ## Test plan
@@ -424,17 +426,17 @@ require zero edits.
    should the refactor unify on one shape?
 
 4. **`#[inline]` vs `#[inline(always)]` on each phase helper?** The
-   function is called once per worker tick, not per packet. Reviewer
-   guidance from #1188, #1199, #1200 was `#[inline]` (the compiler
-   is free to skip it; on a per-tick call site it's harmless either
-   way). The plan defaults to `#[inline]`. Is that the right knob?
+   function is called per-batch, not per packet. Reviewer guidance
+   from #1188, #1199, #1200 was `#[inline]` (the compiler is free
+   to skip it; on a per-batch call site it's harmless either way).
+   The plan defaults to `#[inline]`. Is that the right knob?
 
 5. **Architectural mismatch risk vs #961 / #946 Phase 2?** This
    refactor is a 1:1 phase split of an existing pipeline with no
    reordering and no new types. It does not match the #961
    "PacketContext that wraps a packet" / #946 Phase 2 "batched
    per-stage iteration" patterns that got killed. But reviewers
-   should confirm: is there any way the per-tick batching here
+   should confirm: is there any way the per-batch batching here
    could be reorganized to batch ACROSS ticks, and if so, does
    this phase split foreclose that future direction?
 

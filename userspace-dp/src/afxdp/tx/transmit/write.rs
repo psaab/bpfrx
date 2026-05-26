@@ -1,7 +1,10 @@
 // #1354 phase split: WRITE — reserve XSK ring slots, populate XdpDesc
 // from staged scratch, commit writer, drop writer, then stamp
 // `tx_submit_ns` POST-COMMIT (#812 Codex round-1 HIGH #1 invariant).
-// Returns the kernel-acknowledged `inserted` count.
+// Returns the number of descriptors successfully inserted into and
+// committed to the TX ring. Note: this is the ring-level "submitted"
+// count, NOT a kernel completion-ring acknowledgement — kernel ack
+// arrives later via `reap_tx_completions` against the CQ.
 //
 // Keeping reserve+write+commit+stamp inside a single function
 // preserves the post-commit stamping invariant — the orchestrator
