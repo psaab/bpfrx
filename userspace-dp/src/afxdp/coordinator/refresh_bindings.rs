@@ -46,7 +46,7 @@ impl Coordinator {
 /// histograms are copied via `.resize() + .copy_from_slice()`
 /// against the existing `Vec<u64>` storage in `BindingStatus`
 /// to avoid reallocating when capacity already matches.
-pub(super) fn copy_live_snapshot(binding: &mut BindingStatus, snap: BindingLiveSnapshot) {
+fn copy_live_snapshot(binding: &mut BindingStatus, snap: BindingLiveSnapshot) {
     if snap.bound && !binding.bound {
         eprintln!(
             "refresh_bindings: slot={} transitioning bound=false->true fd={}",
@@ -234,7 +234,7 @@ pub(super) fn copy_live_snapshot(binding: &mut BindingStatus, snap: BindingLiveS
 /// `.clear()` on `Vec`/`String` fields to retain capacity —
 /// avoids per-poll allocation when the same slot transitions
 /// back to bound.
-pub(super) fn zero_unbound_slot(binding: &mut BindingStatus) {
+fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.bound = false;
     binding.xsk_registered = false;
     binding.xsk_bind_mode.clear();

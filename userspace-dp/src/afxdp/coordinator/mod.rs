@@ -314,7 +314,7 @@ impl Coordinator {
     }
 
 
-    pub(super) fn spawn_local_tunnel_sources(&mut self) {
+    fn spawn_local_tunnel_sources(&mut self) {
         let mut local_tunnel_deliveries = BTreeMap::new();
         for endpoint in self.forwarding.tunnel_endpoints.values() {
             if endpoint.mode != "gre" && endpoint.mode != "ip6gre" {
@@ -528,7 +528,7 @@ impl Coordinator {
         self.refresh_cos_runtime_maps(owner_map, active_shards_by_egress_ifindex);
     }
 
-    pub(super) fn refresh_cos_owner_worker_map_from_binding_statuses(&mut self, bindings: &[BindingStatus]) {
+    fn refresh_cos_owner_worker_map_from_binding_statuses(&mut self, bindings: &[BindingStatus]) {
         let ready_worker_binding_ifindexes = bindings.iter().filter(|binding| binding.ready).fold(
             BTreeMap::<u32, std::collections::BTreeSet<i32>>::new(),
             |mut out, binding| {
@@ -554,7 +554,7 @@ impl Coordinator {
         self.refresh_cos_runtime_maps(owner_map, active_shards_by_egress_ifindex);
     }
 
-    pub(super) fn refresh_cos_runtime_maps(
+    fn refresh_cos_runtime_maps(
         &mut self,
         owner_map: BTreeMap<(i32, u8), u32>,
         active_shards_by_egress_ifindex: BTreeMap<i32, usize>,
@@ -802,7 +802,7 @@ fn unique_interface_owner_worker_id(queues: &[crate::protocol::CoSQueueStatus]) 
     owner_worker_id
 }
 
-pub(super) fn build_cos_owner_worker_by_queue(
+fn build_cos_owner_worker_by_queue(
     forwarding: &ForwardingState,
     workers: &BTreeMap<u32, Vec<BindingPlan>>,
 ) -> BTreeMap<(i32, u8), u32> {
@@ -833,7 +833,7 @@ fn build_worker_binding_ifindexes_from_identities(
     out
 }
 
-pub(super) fn build_mirror_target_map(
+fn build_mirror_target_map(
     identities: &BTreeMap<u32, BindingIdentity>,
     live: &BTreeMap<u32, Arc<BindingLiveState>>,
 ) -> MirrorTargetMap {
@@ -906,7 +906,7 @@ fn build_cos_owner_worker_by_queue_with_fallback_ifindexes(
     owner_by_queue
 }
 
-pub(super) fn build_cos_active_shards_by_egress_ifindex_with_fallback_ifindexes(
+fn build_cos_active_shards_by_egress_ifindex_with_fallback_ifindexes(
     forwarding: &ForwardingState,
     preferred_worker_binding_ifindexes: &BTreeMap<u32, std::collections::BTreeSet<i32>>,
     fallback_worker_binding_ifindexes: &BTreeMap<u32, std::collections::BTreeSet<i32>>,

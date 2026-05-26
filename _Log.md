@@ -184,9 +184,14 @@
     mod.rs 1194 LOC (-832), refresh_bindings.rs 368 LOC,
     reconcile/{mod 96, teardown 40, reset 63, snapshot 172,
     bringup 333}.
-    Three helpers + three methods promoted to pub(super) to be
-    accessible from coordinator/reconcile/ children. New test
-    reconcile_with_none_snapshot_preserves_stage_sequence added.
+    New test reconcile_with_none_snapshot_reaches_no_snapshot_early_exit
+    added. (Initial implementation promoted 6 items to pub(super)
+    to make them accessible from coordinator/reconcile/ children;
+    Copilot review 2 correctly pointed out that child modules can
+    already access private parent items, so the promotions were
+    reverted to private — only the phase helpers inside
+    coordinator/reconcile/{teardown,reset,snapshot,bringup}.rs
+    remain pub(super) because reconcile/mod.rs is their parent.)
   - **Validation**: cargo build --release clean; cargo test
     --release --bins 1488 tests pass; 5x flake clean on 33
     coordinator tests; go test ./... 32 packages pass. Pre-existing
