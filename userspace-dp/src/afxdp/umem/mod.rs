@@ -3,7 +3,9 @@ use super::*;
 // file (the debug-state cadence helpers that used it moved to
 // `debug_state.rs`), but `umem/tests.rs` references it via
 // `use super::*;` at tests.rs:1384-1385 in `debug_state_test_timers`.
-// Keep the import here so the test's glob import still resolves.
+// Gate the import on `cfg(test)` so production builds stay
+// warning-free (per Copilot review on PR #1581).
+#[cfg(test)]
 use crate::afxdp::worker::WorkerTimers;
 
 mod debug_state;
