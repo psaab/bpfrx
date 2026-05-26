@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"log/slog"
+	"sort"
 	"time"
 )
 
@@ -275,5 +276,114 @@ func (m *Manager) runElection() {
 			}
 			m.sendEvent(rg.GroupID, oldState, rg.State, reason)
 		}
+	}
+}
+
+// electSingleNode performs election when no heartbeat peer is present.
+// In single-node mode, the local node is always primary if weight > 0.
+// Non-preempt exception: if the peer has never been seen (fresh boot),
+// stay secondary and wait for the heartbeat timeout to confirm the peer
+// is truly absent before claiming primary.
+func (m *Manager) electSingleNode() {
+	for _, rg := range m.groups {
+		if rg.State == StateDisabled || rg.ManualFailover {
+			continue
+		}
+		// Non-preempt in cluster mode: don't claim primary on fresh boot
+		// before hearing from the peer. The peer may be running as
+		// primary — wait for heartbeat timeout to confirm it's truly
+		// down. controlInterface != "" indicates cluster mode (heartbeat
+		// configured); standalone nodes always elect immediately.
+		if !rg.Preempt && !m.peerEverSeen && rg.State == StateSecondary && m.controlInterface != "" {
+			continue
+		}
+		// Readiness gate: block new promotions in cluster mode until
+		// interfaces + VRRP are confirmed ready for holdTime.
+		// Does not gate standalone mode (no controlInterface).
+		// Bypass when peer is dead: sync readiness is impossible without
+		// a peer, and the surviving node must take over immediately.
+		if rg.State != StatePrimary && rg.Weight > 0 && m.controlInterface != "" && m.peerAlive {
+			if !rg.IsReadyForTakeover(m.takeoverHoldTime) {
+				continue
+			}
+		}
+		oldState := rg.State
+		if rg.Weight > 0 {
+			rg.State = StatePrimary
+		} else {
+			rg.State = StateSecondary
+		}
+		if oldState != rg.State {
+			m.sendEvent(rg.GroupID, oldState, rg.State, "Only node present")
+		}
+	}
+}
+
+// SetMonitorWeight updates the weight contribution of an interface monitor.
+// down=true subtracts weight; down=false restores it.
+func (m *Manager) SetMonitorWeight(rgID int, iface string, down bool, weight int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	rg, ok := m.groups[rgID]
+	if !ok {
+		return
+	}
+
+	key := monitorKey{rgID: rgID, iface: iface}
+
+	if down {
+		// Record the monitor weight and add to failure list.
+		m.monitorWeights[key] = weight
+		found := false
+		for _, f := range rg.MonitorFails {
+			if f == iface {
+				found = true
+				break
+			}
+		}
+		if !found {
+			rg.MonitorFails = append(rg.MonitorFails, iface)
+			sort.Strings(rg.MonitorFails)
+			slog.Warn("cluster: interface monitor failure",
+				"rg", rgID, "interface", iface, "weight", weight)
+		}
+	} else {
+		// Remove from failures and delete stored weight.
+		delete(m.monitorWeights, key)
+		for i, f := range rg.MonitorFails {
+			if f == iface {
+				rg.MonitorFails = append(rg.MonitorFails[:i], rg.MonitorFails[i+1:]...)
+				slog.Info("cluster: interface monitor recovered",
+					"rg", rgID, "interface", iface)
+				break
+			}
+		}
+	}
+
+	m.recalcWeight(rg)
+}
+
+// recalcWeight recalculates the effective weight for a redundancy group
+// and triggers re-election if needed.
+func (m *Manager) recalcWeight(rg *RedundancyGroupState) {
+	totalLost := 0
+	for _, iface := range rg.MonitorFails {
+		key := monitorKey{rgID: rg.GroupID, iface: iface}
+		totalLost += m.monitorWeights[key]
+	}
+	oldWeight := rg.Weight
+	rg.Weight = 255 - totalLost
+	if rg.Weight < 0 {
+		rg.Weight = 0
+	}
+	if oldWeight != rg.Weight {
+		slog.Info("cluster: weight changed",
+			"rg", rg.GroupID, "old", oldWeight, "new", rg.Weight)
+	}
+	if m.peerAlive {
+		m.runElection()
+	} else {
+		m.electSingleNode()
 	}
 }

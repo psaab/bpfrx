@@ -569,3 +569,14 @@ func htons(v uint16) uint16 {
 	binary.BigEndian.PutUint16(b, v)
 	return binary.NativeEndian.Uint16(b)
 }
+
+// triggerGARP is called on transition to primary. Native VRRP handles
+// GARP for VRRP-backed RETH interfaces, so this is a no-op.
+//
+// Co-located with the gratuitous-ARP burst sender in this file so the GARP
+// surface area stays in one place. #1541 plan v3 — moved out of
+// cluster.go to keep the heartbeat manager file focused on heartbeat
+// orchestration, not L2 takeover hooks.
+func (m *Manager) triggerGARP(rgID int) {
+	slog.Info("cluster: primary transition", "rg", rgID)
+}
