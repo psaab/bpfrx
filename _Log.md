@@ -1,5 +1,17 @@
 # Action Log
 
+## 2026-05-26 — #1326 worker_loop extract plan v1 drafted
+
+- **Timestamp**: 2026-05-26T
+  - **Action**: Drafted plan v1 for #1326 — extracting ~1278-LOC
+    `worker_loop` body from `userspace-dp/src/afxdp/worker/mod.rs`
+    into `worker/loop_body/` directory module (8 phase files +
+    orchestrator). Wrote plan with allocation audit, cold-path
+    annotations, LoopState struct sketch, hidden invariants list,
+    risk table, and 7 open questions for adversarial review.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
 ## 2026-05-26 — #1476 Phase B AWAITING-MERGE at f815c357
 
 - **Timestamp**: 2026-05-26T (r3 reviewers converged, posting marker)
