@@ -78,6 +78,11 @@
 - **20:34 UTC 2026-05-26** — 5/5 flake check on `afxdp::cos::queue_service::*` (49 tests pass each iteration).
 - **20:35 UTC 2026-05-26** — Go suite passes (cached).
 - **20:35 UTC 2026-05-26** — mod.rs: 1536 → 1325 LOC (-211). submit_cos_batch: 221 → 43 LOC.
+- **20:36 UTC 2026-05-26** — pushed commit e01472f4 to refactor/1331-submit-cos-batch-per-variant.
+- **20:37 UTC 2026-05-26** — opened PR #1585 with `Closes #1331` in body; requested Copilot review; posted `@copilot review` comment.
+- **20:38 UTC 2026-05-26** — dispatched code review r1: Codex task-mpn3jnts-mw3vzg, AGY review-mpn3jx03-id3sv0, Gemini task-mpn3k17x-epxsa5.
+- **20:42 UTC 2026-05-26** — code review r1 results: Codex MERGE-READY, AGY MERGE-READY, Gemini MERGE-READY, Copilot COMMENTED (1 cosmetic false-positive nit on reviewer-ids.md table rendering — single-pipe Markdown is standard). Claude SMR MERGE-READY.
+- **20:43 UTC 2026-05-26** — posted 4-of-4 attestation + `<!-- AWAITING-BATCH-MERGE -->` marker on PR #1585.
 
 ## 2026-05-26 — #1325 implementation pushed
 
