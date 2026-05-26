@@ -23,6 +23,33 @@
     at line 766 ending with bare "Added" — completed.
   - **File(s)**: pkg/config/compiler.go,
     pkg/config/dpdk_subtree_leakage_canary_test.go, _Log.md
+- **Timestamp**: 2026-05-26T03:15:00Z
+  - **Action**: #1519 plan-impl v1.1 → v1.2 — AGY round-1
+    (review-mpm1pdkv-g1sycf) returned PLAN-READY with no new
+    findings. AGY hostile-verified against live codebase and the
+    in-flight refactor/1516-grpcapi-migration @ 0436f386: confirmed
+    16 call sites + 1 function deletion (17 total), confirmed
+    dead-code at daemon_scheduler.go:159-161 with both backends
+    satisfying policyScheduleStateUpdater, walked the
+    telemetry-after-Stop teardown trace
+    (d.cluster.Stop → sessionSync.Stop → logFinalStats →
+    dp.Close/Teardown, with bpfShim teardown only inside
+    manager.Close/Teardown), and confirmed all five probe shapes
+    satisfied by both backends. Open §10 questions ratified:
+    Q1=hybrid (promote cliRuntime to CLIRuntime public, keep
+    api/grpc probes daemon-local), Q2=grpcDataPlane shape locked-in
+    from AGY's inspection of pkg/grpcapi/runtime.go @ 0436f386,
+    Q3=keep both canaries, Q4=keep fibSyncStarter probe,
+    Q5=telemetry-after-Stop safe, Q6=rebase risk small, Q7=smoke
+    load OK. v1.2 pre-populates the grpcDataPlane probe in §2 with
+    the full grpcRuntime method set from the live #1554 branch
+    (verified by reading pkg/grpcapi/runtime.go directly). New §13
+    records both round-1 outcomes; new §14 is v1.2 changelog. Plan
+    locked at v1.2 pending #1554 close. No round-2 plan-review
+    dispatch (per repo policy when both reviewers PLAN-READY at
+    round-1).
+  - **File(s)**: docs/pr/1519-daemon-legacydp-shrink/plan-impl.md,
+    docs/pr/1519-daemon-legacydp-shrink/reviewer-ids-impl.md
 
 ## 2026-05-25
 

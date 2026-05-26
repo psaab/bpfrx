@@ -163,12 +163,49 @@ type apiDataPlane interface {
     GetMapStats() []dataplane.MapStats
 }
 
-// grpcDataPlane mirrors the (post-#1516) grpcapi.Config.DP surface.
-// The exact set is finalized after #1554 merges; this probe is
-// committed alongside the migrated call site so the daemon's local
-// shape matches the downstream contract.
+// grpcDataPlane mirrors grpcapi.grpcRuntime from PR #1554
+// (pkg/grpcapi/runtime.go on refactor/1516-grpcapi-migration @
+// 0436f386). Pre-populated here from the AGY round-1 inspection of
+// the in-flight branch so the daemon-side probe is locked-in before
+// #1554 closes. Re-verify against merged master in §5 step 2 —
+// fail loud if the merged shape differs.
 type grpcDataPlane interface {
-    // ... finalized after #1516 ships, mirrors grpcapi.Config.DP type.
+    // Liveness probe — guards every counter / iter call site.
+    IsLoaded() bool
+
+    // Counters (read).
+    ReadGlobalCounter(index uint32) (uint64, error)
+    ReadInterfaceCounters(ifindex int) (dataplane.InterfaceCounterValue, error)
+    ReadZoneCounters(zoneID uint16, direction int) (dataplane.CounterValue, error)
+    ReadPolicyCounters(policyID uint32) (dataplane.CounterValue, error)
+    ReadFilterConfig(filterID uint32) (dataplane.FilterConfig, error)
+    ReadFilterCounters(ruleIdx uint32) (dataplane.CounterValue, error)
+    ReadFloodCounters(zoneID uint16) (dataplane.FloodState, error)
+    ReadNATRuleCounter(counterID uint32) (dataplane.CounterValue, error)
+
+    // Counters (clear) — diag/clear paths.
+    ClearPolicyCounters() error
+    ClearFilterCounters() error
+    ClearNATRuleCounters() error
+    ClearAllCounters() error
+
+    // Session store (read).
+    IterateSessions(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error
+    IterateSessionsV6(fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
+    GetSessionV4(key dataplane.SessionKey) (dataplane.SessionValue, error)
+    GetSessionV6(key dataplane.SessionKeyV6) (dataplane.SessionValueV6, error)
+    SessionCount() (v4, v6 int)
+
+    // Session store (clear / delete).
+    ClearAllSessions() (v4 int, v6 int, err error)
+    DeleteSession(key dataplane.SessionKey) error
+    DeleteSessionV6(key dataplane.SessionKeyV6) error
+    DeleteDNATEntry(key dataplane.DNATKey) error
+    DeleteDNATEntryV6(key dataplane.DNATKeyV6) error
+
+    // NAT bindings / system buffers.
+    GetPersistentNAT() *dataplane.PersistentNATTable
+    GetMapStats() []dataplane.MapStats
 }
 
 // cliDataPlane mirrors pkg/cli/runtime.go's cliRuntime so daemon can
@@ -525,3 +562,112 @@ ratified for the post-sibling timeline. Expected verdicts:
 PLAN-KILL is unlikely barring a new architectural blocker discovered
 between v2 round-1 (which ratified the capstone path) and #1554
 merge.
+
+## 13. Round-1 reviewer outcomes (v1.2 — recorded after AGY response)
+
+### Codex round-1 (task `bvbk382ym`) — PLAN-NEEDS-MINOR
+
+Three findings, all addressed in v1.1:
+
+1. **P2 fictional-conntrack-names** — row 1 cited
+   `conntrack.PersistentNATProvider` / `SessionCountPublisher`
+   which do not exist. Real exported surface is
+   `conntrack.RuntimeDomainProvider` at `pkg/conntrack/gc.go:45`
+   (`SessionStoreProvider + TelemetryProvider`); the persistent /
+   sessionCount probes are package-private lowercase names internal
+   to gc.go (lines 33, 39). `conntrack.NewGC(provider, interval)`
+   at gc.go:104 already encodes the nil-tolerant type assertion.
+   Fixed: row 1 collapses
+   `NewGCWithDomains(sessions, telemetry, lp, lp, interval)` into
+   `NewGC(d.dp, interval)`.
+
+2. **P3 cliRuntime relationship** — §0 said cliRuntime is a strict
+   superset of `dataplane.RuntimeDataPlane`. Per
+   `pkg/cli/runtime.go:11` docstring it is a strict SUBSET of
+   `dataplane.DataPlane`; the two interfaces are disjoint. Fixed:
+   §0 now documents the disjointness; daemon must type-assert
+   against cliRuntime's shape even though d.dp is RuntimeDataPlane
+   (both backends satisfy both interfaces simultaneously).
+
+3. **P3 flake-loop syntax** — `for i in 1..5` is a single-token
+   literal in bash (body runs exactly once). Fixed to
+   `for i in 1 2 3 4 5`.
+
+### AGY round-1 (`review-mpm1pdkv-g1sycf`) — PLAN-READY
+
+AGY verified the v1.1 plan against the live codebase + the
+in-flight #1554 branch and returned a clean PLAN-READY with no
+new findings. Key ratifications:
+
+- **§1 migration matrix:** 16 call sites + 1 function deletion
+  count confirmed via direct grep against
+  `refactor/1519-daemon-legacydp-shrink-impl @ 49f91930`. All 16
+  rows structurally sound.
+- **§7 dead-code claim at `daemon_scheduler.go:159-161`:** verified
+  both backends satisfy `policyScheduleStateUpdater`. eBPF
+  Manager at `pkg/dataplane/maps.go:1497`; userspace adapter at
+  `pkg/dataplane/userspace/legacy_dataplane.go:161` routing
+  through inner Manager at
+  `pkg/dataplane/userspace/manager.go:663`. Fallback is safely
+  deletable.
+- **§7 telemetry-after-Stop teardown safety:** walked trace
+  confirmed:
+  1. `d.cluster.Stop()` → `d.sessionSync.Stop()` → `logFinalStats`
+     → `d.dp.Close()/Teardown()`.
+  2. `d.dp.Telemetry()` at the daemon level maps via
+     `legacy_dataplane.go:121` → `m.Telemetry()` in
+     `pkg/dataplane/userspace/manager.go:254` returning
+     `dataplane.NewDataPlaneTelemetry(NewLegacyDataPlaneAdapter(m))`.
+  3. `Telemetry().GlobalCounter(idx)` routes to inner
+     `manager.bpfShim.ReadGlobalCounter(idx)`.
+  4. `manager.bpfShim` is only torn down by `manager.Close()` /
+     `manager.Teardown()`, which run **after** `logFinalStats`.
+  Safe.
+- **§2 probe shapes:** all five probes
+  (`dataplaneReadyProbe`, `natSeeder`, `fibSyncStarter`,
+  `apiDataPlane`, `grpcDataPlane`) verified satisfied by both
+  backends.
+- **§10 Q1 probe visibility:** AGY ratifies the hybrid (promote
+  `cliRuntime` → `CLIRuntime` public for pkg/cli; keep
+  `apiRuntimeDataPlane` / `grpcRuntime` package-private and declare
+  daemon-local matching probes for pkg/api / pkg/grpcapi). Locking
+  the hybrid in.
+- **§10 Q2 grpcapi shape:** AGY inspected
+  `refactor/1516-grpcapi-migration @ 0436f386` and confirmed the
+  `grpcRuntime` shape (now pre-populated in v1.2 §2 as the
+  daemon-local `grpcDataPlane`).
+- **§10 Q3 canary belt-and-braces:** keep both (allowlist + AST).
+  ~50ms cost is worth defense-in-depth.
+- **§10 Q4 `fibSyncStarter` retention:** keep the probe rather
+  than delete the call site outright. Future-proofs for future
+  backends.
+
+No PLAN-KILL findings, no architecturally-unsound nits. Round-1
+verdict: **PLAN-READY** for both reviewers, contingent on the
+v1.1 Codex fixes being in place (they are).
+
+### Round-2 dispatch (not run)
+
+Both reviewers agree v1.1+v1.2 is mergeable. Re-dispatching for
+round-2 plan-review would be Codex+AGY churn for no architectural
+gain; per repo policy (#1217, #547) when both reviewers agree on
+PLAN-READY at round-1 the plan is locked and we proceed to code
+when #1554 closes.
+
+## 14. v1.2 changelog (post-AGY)
+
+- §0 sibling state already corrected from v1.1.
+- §2 `grpcDataPlane` populated from the in-flight #1554 branch
+  (`pkg/grpcapi/runtime.go @ 0436f386`).
+- §10 open questions ratified:
+  - Q1 → hybrid (promote `cliRuntime` to `CLIRuntime`; keep
+    api/grpcapi probes daemon-local).
+  - Q2 → grpcDataPlane locked-in; re-verify on rebase.
+  - Q3 → both canaries.
+  - Q4 → keep `fibSyncStarter`.
+  - Q5 → telemetry-after-Stop safe (walked trace recorded above).
+  - Q6 → rebase risk small; siblings preserved daemon-side calls.
+  - Q7 → smoke load accepted.
+- §13 records full Codex + AGY round-1 outcomes.
+
+Plan is locked at v1.2 pending #1554 close.
