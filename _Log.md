@@ -111,6 +111,73 @@
 - **22:05 UTC 2026-05-26** — 5/5 flake check on `afxdp::cos::queue_service::*` post-rebase (49 tests pass each iteration).
 - **22:05 UTC 2026-05-26** — force-pushed rebased branch; new HEAD 90e97b29994a.
 - **22:06 UTC 2026-05-26** — posted re-attestation marker on PR #1585 with prior 4-of-4 carry-forward (delta is _Log.md-only).
+## 2026-05-26 — #1355 cos_queue_push_front split kicked off
+
+- **Timestamp**: 2026-05-26 20:14 UTC
+- **Action**: Worktree off origin/master; plan v1 drafted at
+  docs/pr/1355-cos-push-split/plan.md; reviewer-ids tracker created.
+- **File(s)**: docs/pr/1355-cos-push-split/plan.md,
+  docs/pr/1355-cos-push-split/reviewer-ids.md
+
+## 2026-05-26 — #1355 plan v1 unanimous PLAN-KILL; v2 re-targeted
+
+- **Timestamp**: 2026-05-26 20:32 UTC
+- **Action**: Codex (task-mpn2tomp-5t6oam) and Gemini
+  (task-mpn2u791-tq1zkx) both PLAN-KILL on the flow_fair() axis.
+  Re-targeted plan v2 along the snapshot-present/absent axis with
+  seven extracted helpers; fixed v1 SessionKey-not-Copy defect by
+  pre-computing bucket via a short &ff borrow before item is moved.
+- **File(s)**: docs/pr/1355-cos-push-split/plan.md (rewrite),
+  docs/pr/1355-cos-push-split/reviewer-ids.md
+
+## 2026-05-26 — #1355 plan v2 PLAN-NEEDS-MINOR x2; implementation pushed
+
+- **Timestamp**: 2026-05-26 20:55 UTC
+- **Action**: Round-2 reviewers Codex (task-mpn35b09-ztxsth) and
+  Gemini (task-mpn35twr-zfl64q) both PLAN-NEEDS-MINOR with no
+  PLAN-KILL findings. Minor fixes (codegen-gate widened, panic-
+  message unicode arrow, was_idle short-circuit ack) rolled into
+  plan.md. Implementation: cos_queue_push_front decomposed into
+  seven #[inline] private helpers per plan §Concrete design.
+- **Validation**:
+  - `cargo build`: clean (122 pre-existing warnings, 0 new).
+  - `cargo test --release`: 1433+ tests pass; only pre-existing
+    failure is snat_contract_doc_guard which fails on origin/master
+    base 63dfe02a (docs/userspace-dataplane-gaps.md missing
+    "fail-closed" string — unrelated to this refactor; see #1476
+    follow-up).
+  - 5/5 flake check on `mqfq_push_front_*` family in pop_tests.rs
+    (the two named push_front tests): 2/2 pass per iteration.
+  - `go test ./...`: all packages pass.
+  - Codegen gate: `objdump -Cd xpf-userspace-dp` shows zero call
+    edges to push_front_flow_fair_v8, pop_matching_snapshot,
+    restore_queue_vtime, republish_worker_vtime_slot,
+    push_front_drained_bucket_{with,no}_snapshot,
+    mirror_lease_active_flow_increment, or
+    push_front_active_bucket_head_rebase. All seven helpers fully
+    inlined into cos_queue_push_front and other call sites. The 16
+    push_front-named call sites in the binary are all stdlib
+    `VecDeque::push_front_mut`.
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_ops/push.rs,
+  docs/pr/1355-cos-push-split/plan.md (round-2 minor fixes folded),
+  docs/pr/1355-cos-push-split/reviewer-ids.md
+
+## 2026-05-26 — #1355 PR #1590 4-of-4 MERGE-READY; AWAITING-BATCH-MERGE
+
+- **Timestamp**: 2026-05-26 21:50 UTC
+- **Action**: Code-review round 1 returned 4-of-4 MERGE-READY:
+  - Codex (task-mpn5jy3w-gq92x5): MERGE-READY, no blocking findings.
+    Confirmed byte-for-byte parity vs origin/master 63dfe02a, SessionKey
+    borrow fix, NLL re-borrow shape correct, state ordering preserved,
+    codegen-gate empty, snat_contract_doc_guard pre-existing.
+  - Gemini (task-mpn5kiig-rqk14a): MERGE-READY. Confirmed all invariants
+    + active-bucket-by-absence + was_idle short-circuit reorder
+    semantically identical.
+  - Copilot (PRR_kwDORLJrbM8AAAABBFVlLw): COMMENTED, 0 inline findings
+    on 4/4 files.
+  - Claude SMR: gates all pass; pre-existing failure documented.
+- **Posture**: AWAITING-BATCH-MERGE per user mandate (do not auto-merge).
+- **File(s)**: docs/pr/1355-cos-push-split/reviewer-ids.md, _Log.md
 
 ## 2026-05-26 — #1325 implementation pushed
 
