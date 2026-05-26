@@ -57,11 +57,14 @@ pub(super) fn accumulate_queue_row(
             status.forwarding_class = config.forwarding_class.clone();
         }
     }
-    // CRITICAL: read `worker_instances` BEFORE the saturating_add at
-    // the bottom of the helper. The original at cos.rs:602-604 sets
-    // `priority` only on the first worker's visit (the bump comes
-    // later at cos.rs:612). Re-ordering would corrupt the "first
-    // worker wins" semantic.
+    // CRITICAL ORDERING (not just position): read `worker_instances`
+    // BEFORE the saturating_add that bumps it (just below at line
+    // 74). The original at cos.rs:602-604 sets `priority` only on
+    // the first worker's visit (the bump came later at cos.rs:612).
+    // Re-ordering — moving the increment ahead of this gate — would
+    // corrupt the "first worker wins" semantic. The other field
+    // writes in this helper are independent saturating_add / MAX
+    // slots and can move freely; this one cannot.
     if status.worker_instances == 0 {
         status.priority = queue.config.priority;
     }
