@@ -82,6 +82,17 @@
   commit — relabeled headers "Issue #1329 / PR #1588", added the
   `use` import note to mod.rs, plan.md → PLAN-READY/IMPLEMENTED,
   reviewer-ids updated.
+- **22:00 UTC** — Codex code r4 MERGE-READY at 83e66dd0. Copilot
+  swe-agent comment confirms the 4 doc fixes in place at 83e66dd0
+  (formal copilot-pull-request-reviewer still at COMMENTED on
+  6c0d0061 — all its inline comments are addressed in 83e66dd0,
+  satisfying the merge gate per skill rule "Copilot has posted a
+  review (COMMENTED is fine; ensure every inline comment is
+  addressed").
+- **22:05 UTC** — 4-of-4 attestation complete (Codex r4, AGY r1,
+  Copilot r2 with all nits addressed, Claude SMR). Posted
+  <!-- AWAITING-BATCH-MERGE --> marker at PR #1588. Smoke deferred
+  per Wave-3 retirement-chain rule.
 
 ## 2026-05-26 — #1325 implementation pushed
 
