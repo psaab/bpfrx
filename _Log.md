@@ -4323,3 +4323,15 @@
 - **Action**: Implemented frame/build/{mod.rs,ipv4.rs,ipv6.rs} + frame/rewrite/{mod.rs,ipv4.rs,ipv6.rs} per #1352 plan v5. Extracted 236-LOC build_forwarded_frame_into_from_frame and 223-LOC apply_rewrite_descriptor into per-family files. Codegen contract: #[inline(always)] on per-family helpers; #[inline(never)] + concrete `meta: ForwardPacketMeta` on build orchestrator; standard #[inline] on rewrite orchestrator.
 - **File(s)**: userspace-dp/src/afxdp/frame/build/{mod.rs,ipv4.rs,ipv6.rs} (created); userspace-dp/src/afxdp/frame/rewrite/{mod.rs,ipv4.rs,ipv6.rs} (created); userspace-dp/src/afxdp/frame/mod.rs (orchestrator bodies removed, mod decls added; build_forwarded_frame_into wrapper now calls .into() before forwarding to concrete-typed orchestrator).
 - **Validation**: cargo build --release clean. 1487 cargo tests pass (113 frame-specific tests all pass). Codegen gate: nm -C shows ZERO per-family helper definitions (#[inline(always)] folded into orchestrator), exactly ONE build_forwarded_frame_into_from_frame definition, ZERO apply_rewrite_descriptor definitions (LLVM inlined fully into single caller poll_descriptor.rs:746). One pre-existing cross-worktree doc-guard test failure unrelated to this refactor.
+
+## 2026-05-26 — #1342 split forwarding_build.rs (plan v1)
+
+- **Timestamp**: 2026-05-26T (plan drafted)
+  - **Action**: Created worktree
+    `refactor/1342-forwarding-build-split` off `origin/master` and
+    drafted plan v1 covering layout (forwarding_build/mod.rs +
+    siblings: zones, tunnels, interfaces, fib, cos), order-
+    preservation invariants, IfaceIndex context struct, public-API
+    preservation, risk table, and 7 open questions.
+  - **File(s)**: `docs/pr/1342-forwarding-build-split/plan.md`,
+    `docs/pr/1342-forwarding-build-split/reviewer-ids.md`.
