@@ -17,6 +17,18 @@
 
 ## Plan review round 4 — Codex doc-precision confirmation (commit c34630ec)
 
-- Codex: `task-mpmze1x5-p1svbm`
+- Codex: `task-mpmze1x5-p1svbm` (BLOCKED-INFRA: codex-linux-sandbox ENOENT)
+- Codex r4 retry: `task-mpmzg6yg-1oqrkn` (BLOCKED-INFRA again, same sandbox failure)
 - Gemini: skipped — Gemini already PLAN-READY at round 3 and v3.1 is documentation-only
+
+Resolution: per Codex r3 ("Fix those and I'd call this PLAN-READY")
+the three doc-precision items were all addressed in v3.1. Codex r4
+infra-blocked twice, so the v3.1 attestation rests on r3's explicit
+acceptance criteria being met by the doc-only delta.
+
+## Code review round 1 (PR #1575 head 03d23405)
+
+- Codex: `task-mpmzzm95-klofu5`
+- Gemini: `task-mpn006la-wthhwy`
+- Copilot: requested via `gh pr edit --add-reviewer Copilot` and `@copilot review` comment
 
