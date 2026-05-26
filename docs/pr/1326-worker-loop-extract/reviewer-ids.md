@@ -38,7 +38,12 @@ re-dispatching.
 
 ## Code review (round 1, on PR #1569 HEAD bdd551af)
 
-- Codex: task-mpmwyu0c-s5wj0p (background, dispatched 2026-05-26)
-- AGY: review-mpmwyzpy-2vbv5h (background, dispatched 2026-05-26)
+- Codex: task-mpmwyu0c-s5wj0p — MERGE-NEEDS-MINOR (3 items: Closes vs Refs, README stale, rustfmt blank line)
+- AGY: review-mpmwyzpy-2vbv5h — MERGE-NEEDS-MINOR (Closes #1326 too strong — keep issue open)
 - Copilot: requested via `gh pr edit --add-reviewer Copilot` + `@copilot review` PR comment
 - Claude SMR: pending post-Copilot
+
+## Code review (round 2, on HEAD 0530e056)
+
+- Codex: task-mpmx84i5-c1yekq (background, dispatched 2026-05-26)
+- AGY: review-mpmx87ji-ajjgpn (background, dispatched 2026-05-26)

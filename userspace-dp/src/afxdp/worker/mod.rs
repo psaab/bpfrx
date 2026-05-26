@@ -74,6 +74,12 @@ use cos::{
     reset_worker_cos_runtimes, vacate_all_shared_exact_slots_for_binding,
 };
 
+// #1326 Phase 1: `worker_loop` body extracted into worker/loop_body/.
+// Re-exported here so external callers (`worker_runtime.rs`,
+// `coordinator/mod.rs`, `afxdp/mod.rs`) keep working unchanged.
+mod loop_body;
+pub(crate) use loop_body::worker_loop;
+
 // #956 Phase 4-5: explicit imports for items that moved out of tx.rs into
 // cos/token_bucket.rs (Phase 4) and cos/queue_ops.rs (Phase 5). Without
 // this, neither the local `use super::*;` glob nor afxdp.rs's
@@ -991,9 +997,6 @@ fn refresh_worker_cos_queue_lease_runtime_counters(
     counters.cos_queue_lease_acquire_v8_calls = calls;
     counters.cos_queue_lease_acquire_v8_granted_bytes = granted_bytes;
 }
-
-mod loop_body;
-pub(crate) use loop_body::worker_loop;
 
 fn apply_worker_shaped_tx_requests(
     bindings: &mut [BindingWorker],

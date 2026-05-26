@@ -3,7 +3,7 @@
 // function in worker/mod.rs (L995-L2273). It is moved here verbatim
 // as the first phase of the #1326 refactor; subsequent phases will
 // carve named tick sub-fns out of this file (setup/tick/poll_drive/
-// debug_report) per plan v3.4.
+// debug_report) per plan v4.0 (docs/pr/1326-worker-loop-extract/plan.md).
 //
 // `use super::*;` brings every type, helper, and sibling-submodule
 // item from worker/mod.rs into scope — the same pattern lifecycle.rs

@@ -68,8 +68,6 @@ re-confirmed sound. v3.3 just chases Codex's doc-consistency tail.
 
 ### v3→v3.2 changelog
 
-### v3→v3.2 changelog
-
 Codex r3 (replayed from log task-mpmvuetd-57y479) returned
 PLAN-NEEDS-MINOR with 6 specific findings. AGY r3
 (review-mpmvtaei-6yvid7) returned PLAN-NEEDS-MINOR with 1 finding
