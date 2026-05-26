@@ -268,17 +268,24 @@ func (d *Daemon) startSessionSyncPrimeRetry(gen uint64) {
 // callback into QueueSessionV4/V6). Falls back to the old BulkSync path
 // (iterating BPF maps from Go) when the event stream isn't available.
 func (d *Daemon) bulkSyncViaEventStreamOrFallback(ss *cluster.SessionSync) error {
-	if exporter, ok := d.legacyDP().(userspaceEventStreamExporter); ok {
-		slog.Info("cluster: using event stream export for bulk sync")
-		if err := exporter.ExportAllSessionsViaEventStream(); err != nil {
-			slog.Warn("cluster: event stream bulk export failed, falling back to BulkSync", "err", err)
-		} else {
-			slog.Info("cluster: exported sessions via event stream for bulk sync")
-			return nil
+	// userspaceEventStreamExporter is a local probe satisfied by
+	// *dataplane/userspace.LegacyDataPlaneAdapter via
+	// ExportAllSessionsViaEventStream (legacy_dataplane.go:422).
+	// Type-assertion target is d.dp directly — the legacyDP()
+	// round-trip retired in #1519 added no method-set coverage.
+	if d.dp != nil {
+		if exporter, ok := d.dp.(userspaceEventStreamExporter); ok {
+			slog.Info("cluster: using event stream export for bulk sync")
+			if err := exporter.ExportAllSessionsViaEventStream(); err != nil {
+				slog.Warn("cluster: event stream bulk export failed, falling back to BulkSync", "err", err)
+			} else {
+				slog.Info("cluster: exported sessions via event stream for bulk sync")
+				return nil
+			}
 		}
 	}
 	slog.Info("cluster: event stream export not available, falling back to BulkSync",
-		"dp_type", fmt.Sprintf("%T", d.legacyDP()))
+		"dp_type", fmt.Sprintf("%T", d.dp))
 	if ss == nil {
 		return fmt.Errorf("session sync not initialized")
 	}
@@ -697,7 +704,13 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			var streamProvider userspaceEventStreamProvider
 			streamCallbacksWired := false
 			if d.dp != nil {
-				if provider, ok := d.legacyDP().(userspaceEventStreamProvider); ok {
+				// userspaceEventStreamProvider is a local probe;
+				// userspace LegacyDataPlaneAdapter satisfies it via
+				// EventStream (legacy_dataplane.go:414). Type-
+				// assertion target is d.dp directly — the legacyDP()
+				// round-trip retired in #1519 added no method-set
+				// coverage.
+				if provider, ok := d.dp.(userspaceEventStreamProvider); ok {
 					streamProvider = provider
 					wireCtx, cancel := context.WithTimeout(commsCtx, 5*time.Second)
 					streamCallbacksWired = d.wireUserspaceEventStreamCallbacks(wireCtx, provider)
@@ -735,8 +748,8 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				// dataplane.RuntimeDataPlane; both the legacy *Manager and
 				// the userspace LegacyDataPlaneAdapter implement
 				// Sessions()/Telemetry() so they satisfy the cluster
-				// package's narrow clusterRuntime contract directly. The
-				// legacyDP() cast is no longer required at this seam (#1518).
+				// package's narrow clusterRuntime contract directly
+				// (#1518).
 				if d.dp != nil {
 					d.sessionSync.SetRuntime(d.dp)
 					d.sessionSync.IsPrimaryFn = func() bool {

@@ -267,13 +267,14 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/cluster/sync_conn.go` | Sync connection code still references legacy session types. |
 | `pkg/cluster/sync_protocol.go` | Wire protocol still carries legacy session records. |
 | `pkg/conntrack/gc.go` | GC still uses root package session-domain types until those move out of `pkg/dataplane`; constructors no longer accept `DataPlane`. |
-| `pkg/daemon/daemon.go` | Daemon owns `RuntimeDataPlane` and exposes `legacyDP()` for unmigrated callers. |
+| `pkg/daemon/daemon.go` | Daemon owns `dataplane.RuntimeDataPlane`; `legacyDP()` accessor was deleted in #1519 (sub-#1451 S4). Only the `RuntimeDataPlane` field and `LastApplyResultOf` adapter remain. |
 | `pkg/daemon/daemon_apply.go` | Apply path still adapts legacy compile/apply metadata. |
-| `pkg/daemon/daemon_flow.go` | Flow logging still formats legacy dataplane counters. |
+| `pkg/daemon/daemon_flow.go` | Flow logging still names legacy `dataplane.GlobalCtr*` counter indices read via `dataplane.Telemetry`. |
 | `pkg/daemon/daemon_ha.go` | HA state updates still call legacy bridge methods. |
 | `pkg/daemon/daemon_ha_fabric.go` | Fabric HA updates still call legacy bridge methods. |
 | `pkg/daemon/daemon_ha_userspace.go` | Userspace HA control still crosses the legacy bridge. |
-| `pkg/daemon/daemon_run.go` | Runtime wiring still passes `legacyDP()` to unmigrated services. |
+| `pkg/daemon/daemon_run.go` | Runtime wiring still uses the legacy `dataplane.ErrDPDKBackendRetired` sentinel and constructs `api`/`grpcapi`/`cli` configs against the daemon-local probes in `runtime_probes.go` (#1519 capstone). |
+| `pkg/daemon/runtime_probes.go` | #1519 daemon-local typed probes (`apiDataPlane`/`grpcDataPlane`/`cliDataPlane`/`dataplaneReadyProbe`/`natSeeder`/`fibSyncStarter`) mirror downstream package-private interfaces; still name root `pkg/dataplane` types (`SessionKey`, `CounterValue`, etc.) until those move to a domain package. |
 | `pkg/grpcapi/apply_result.go` | gRPC apply metadata still adapts legacy apply results. |
 | `pkg/grpcapi/runtime.go` | #1516 — `grpcRuntime` interface declares the narrow gRPC dataplane surface; still depends on root `pkg/dataplane` type names (`SessionKey`, `CounterValue`, etc.) until those types move to a domain package. |
 | `pkg/grpcapi/server_helpers.go` | gRPC helpers still format legacy dataplane types and bridge runtime accessors. |

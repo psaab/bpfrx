@@ -91,8 +91,25 @@ func (d *Daemon) applyMgmtVRFRoutes() {
 }
 
 // logFinalStats reads and logs global counter summary before shutdown.
-func logFinalStats(dp dataplane.DataPlane) {
-	if !dp.IsLoaded() {
+//
+// The signature uses the daemon-local dataplaneReadyProbe
+// (runtime_probes.go) + dataplane.Telemetry runtime domain so the
+// shutdown path no longer touches the legacy BPF-shaped DataPlane
+// surface (#1519). Telemetry().GlobalCounter is structurally
+// identical to the previous dp.ReadGlobalCounter call and routes
+// to the same underlying BPF map read on both backends.
+//
+// Ordering invariant (see daemon_run.go shutdown sequence): this
+// runs AFTER d.cluster.Stop() / d.sessionSync.Stop() and BEFORE
+// d.dp.Close()/d.dp.Teardown(), so the Telemetry provider is
+// still backed by a live bpfShim on the userspace path. AGY
+// round-1 walked-trace confirmation: manager.bpfShim teardown
+// only happens inside manager.Close()/Teardown().
+func logFinalStats(ready dataplaneReadyProbe, telemetry dataplane.Telemetry) {
+	if ready == nil || !ready.IsLoaded() {
+		return
+	}
+	if telemetry == nil {
 		return
 	}
 	indices := []struct {
@@ -110,7 +127,7 @@ func logFinalStats(dp dataplane.DataPlane) {
 
 	attrs := make([]any, 0, len(indices)*2)
 	for _, n := range indices {
-		v, err := dp.ReadGlobalCounter(n.idx)
+		v, err := telemetry.GlobalCounter(n.idx)
 		if err != nil {
 			continue
 		}

@@ -342,15 +342,8 @@ func New(opts Options) *Daemon {
 	}
 }
 
-// legacyDP returns the daemon's underlying dataplane.DataPlane for call sites
-// that have not yet migrated to RuntimeDataPlane domain interfaces.
-// Returns nil if d.dp is nil or the concrete type does not implement DataPlane.
-func (d *Daemon) legacyDP() dataplane.DataPlane {
-	if d.dp == nil {
-		return nil
-	}
-	if lp, ok := d.dp.(dataplane.DataPlane); ok {
-		return lp
-	}
-	return nil
-}
+// NOTE (#1519, sub-#1451 S4): the (*Daemon).legacyDP() escape hatch
+// previously declared here was removed when every daemon-internal
+// consumer migrated to a narrow typed probe in runtime_probes.go.
+// A regression-guard AST canary in legacy_dataplane_canary_test.go
+// keeps the symbol from being reintroduced without explicit review.

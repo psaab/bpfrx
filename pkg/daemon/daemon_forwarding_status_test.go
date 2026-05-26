@@ -33,6 +33,46 @@ func (f *forwardingStatusDaemonTestDP) GetMapStats() []dataplane.MapStats {
 	return f.mapStats
 }
 
+// Telemetry overrides runtimeOnlyApplyTestDP.Telemetry() so the
+// fixture's GetMapStats() surface reaches forwardingStatusDataplane
+// through the runtime Telemetry domain. The post-#1519 daemon path
+// reads map stats via d.dp.Telemetry().MapStats() rather than the
+// legacy DataPlane interface; this override keeps the existing
+// test cases (mapStats injected on f) green by routing through the
+// runtime domain.
+func (f *forwardingStatusDaemonTestDP) Telemetry() dataplane.Telemetry {
+	return forwardingStatusTestTelemetry{stats: f.mapStats}
+}
+
+type forwardingStatusTestTelemetry struct {
+	stats []dataplane.MapStats
+}
+
+func (t forwardingStatusTestTelemetry) NewEventSource() (dataplane.EventSource, error) {
+	return nil, nil
+}
+func (t forwardingStatusTestTelemetry) GlobalCounter(uint32) (uint64, error) { return 0, nil }
+func (t forwardingStatusTestTelemetry) InterfaceCounters(int) (dataplane.InterfaceCounterValue, error) {
+	return dataplane.InterfaceCounterValue{}, nil
+}
+func (t forwardingStatusTestTelemetry) ZoneCounters(uint16, int) (dataplane.CounterValue, error) {
+	return dataplane.CounterValue{}, nil
+}
+func (t forwardingStatusTestTelemetry) PolicyCounters(uint32) (dataplane.CounterValue, error) {
+	return dataplane.CounterValue{}, nil
+}
+func (t forwardingStatusTestTelemetry) FilterCounters(uint32) (dataplane.CounterValue, error) {
+	return dataplane.CounterValue{}, nil
+}
+func (t forwardingStatusTestTelemetry) NATRuleCounter(uint32) (dataplane.CounterValue, error) {
+	return dataplane.CounterValue{}, nil
+}
+func (t forwardingStatusTestTelemetry) NATPortCounter(uint32) (uint64, error) { return 0, nil }
+func (t forwardingStatusTestTelemetry) MapStats() []dataplane.MapStats        { return t.stats }
+func (t forwardingStatusTestTelemetry) ReadFloodCounters(uint16) (dataplane.FloodState, error) {
+	return dataplane.FloodState{}, nil
+}
+
 type forwardingStatusDaemonUserspaceTestDP struct {
 	*forwardingStatusDaemonTestDP
 

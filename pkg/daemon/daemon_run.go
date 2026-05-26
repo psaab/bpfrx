@@ -307,13 +307,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 					"err", err)
 				d.dp = nil
 			} else {
-				if lp := d.legacyDP(); lp != nil {
-					lp.SeedNATPortCounters()
+				// natSeeder is satisfied by both *dataplane.Manager
+				// (legacy eBPF — maps.go:1589/1611) and the userspace
+				// *LegacyDataPlaneAdapter (via embedded bpfShim). The
+				// seed methods are no-ops on the userspace fast path
+				// but harmless to invoke. The legacyDP() round-trip is
+				// no longer required (#1519).
+				if seeder, ok := d.dp.(natSeeder); ok {
+					seeder.SeedNATPortCounters()
 					nodeID := 0
 					if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
 						nodeID = cfg.Chassis.Cluster.NodeID
 					}
-					lp.SeedSessionIDCounter(nodeID)
+					seeder.SeedSessionIDCounter(nodeID)
 				}
 			}
 		}
@@ -362,8 +368,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// legacy adapter.  Call site retained for backends that
 		// need a userspace route populator (DPDK had one; retired
 		// in #1527 / #1525).
-		if lp := d.legacyDP(); lp != nil {
-			lp.StartFIBSync(ctx)
+		// fibSyncStarter is a no-op on both in-tree backends
+		// (kernel bpf_fib_lookup handles FIB resolution); the probe
+		// is retained for forward compatibility (a future backend
+		// may need a userspace route populator).
+		if starter, ok := d.dp.(fibSyncStarter); ok {
+			starter.StartFIBSync(ctx)
 		}
 
 		gc := d.newConntrackGC(10 * time.Second)
@@ -704,10 +714,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Start HTTP API server if configured.
 	if d.opts.APIAddr != "" {
+		// d.dp asserted against the local apiDataPlane probe
+		// (runtime_probes.go) — structurally identical to pkg/api's
+		// package-private apiRuntimeDataPlane. Go duck-types the
+		// assignment to api.Config.DP at this site; signature drift
+		// surfaces as a compile error here.
+		var apiDP apiDataPlane
+		if d.dp != nil {
+			if probe, ok := d.dp.(apiDataPlane); ok {
+				apiDP = probe
+			}
+		}
 		apiCfg := api.Config{
 			Addr:     d.opts.APIAddr,
 			Store:    d.store,
-			DP:       d.legacyDP(),
+			DP:       apiDP,
 			EventBuf: eventBuf,
 			GC:       d.gc,
 			Routing:  d.routing,
@@ -791,9 +812,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Start gRPC API server.
 	{
+		// d.dp asserted against the local grpcDataPlane probe
+		// (runtime_probes.go) — structurally identical to
+		// pkg/grpcapi's package-private grpcRuntime
+		// (pkg/grpcapi/runtime.go, #1516/#1554). Go duck-types the
+		// assignment to grpcapi.Config.DP at this site; signature
+		// drift surfaces as a compile error here.
+		var grpcDP grpcDataPlane
+		if d.dp != nil {
+			if probe, ok := d.dp.(grpcDataPlane); ok {
+				grpcDP = probe
+			}
+		}
 		grpcSrv := grpcapi.NewServer(d.opts.GRPCAddr, grpcapi.Config{
 			Store:      d.store,
-			DP:         d.legacyDP(),
+			DP:         grpcDP,
 			EventBuf:   eventBuf,
 			GC:         d.gc,
 			Routing:    d.routing,
@@ -879,7 +912,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start interactive CLI or block in daemon mode
 	var runErr error
 	if isInteractive() {
-		shell := cli.New(d.store, d.legacyDP(), eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp, d.dhcpRelay, d.cluster)
+		// d.dp asserted against the local cliDataPlane probe
+		// (runtime_probes.go) — structurally identical to pkg/cli's
+		// package-private cliRuntime (pkg/cli/runtime.go, #1517).
+		// Go duck-types the assignment to cli.New's dp parameter at
+		// this site; signature drift surfaces as a compile error.
+		var cliDP cliDataPlane
+		if d.dp != nil {
+			if probe, ok := d.dp.(cliDataPlane); ok {
+				cliDP = probe
+			}
+		}
+		shell := cli.New(d.store, cliDP, eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp, d.dhcpRelay, d.cluster)
 		shell.SetVersion(d.opts.Version)
 		shell.SetForwardingSampler(fwdSampler)
 		// #797 H2 / #846: route in-process CLI commits through the
@@ -1073,8 +1117,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	if d.dp != nil {
-		if lp := d.legacyDP(); lp != nil {
-			logFinalStats(lp)
+		// logFinalStats now reads through the runtime Telemetry
+		// domain (#1519); the dataplaneReadyProbe gate keeps the
+		// "no-op when dp not loaded" contract intact for both
+		// backends.
+		if ready, ok := d.dp.(dataplaneReadyProbe); ok {
+			logFinalStats(ready, d.dp.Telemetry())
 		}
 		if hitless {
 			// Hitless: close Go handles only — BPF programs keep running.
