@@ -1,6 +1,21 @@
 # #1349 — Split `build_worker_cos_statuses_from_maps` into focused helpers
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + Gemini Pro 3 + AGY + Claude SMR).
+**Status:** DRAFT v2 — addresses round-1 findings from Codex (PLAN-NEEDS-MAJOR), Gemini Pro 3 (PLAN-KILL), AGY (PLAN-READY), Claude SMR (PLAN-NEEDS-MINOR). Re-dispatching to all four.
+
+## Round-1 review summary
+
+- **AGY: PLAN-READY** — verified all 12 invariants, ratified directory layout choice, confirmed test-file rename preserves history. No findings.
+- **Codex: PLAN-NEEDS-MAJOR** — 5 concrete findings: (1) `queue_uses_shared_exact_service` missing from preserved-API list; tests at cos_tests.rs:1919+ call it directly; (2) "field-write order irrelevant" claim false — `priority` is gated by `worker_instances == 0` at cos.rs:602 BEFORE the increment; (3) #784 MAX-not-sum not test-covered in worker-status path; (4) `accumulate_queue_row` signature contradicts itself (one place lists `owner_profile_target` + `binding_profile`, another excludes them); (5) allocation wording sloppy.
+- **Gemini Pro 3: PLAN-KILL** — argues the function is a linear sequential mapper, no algorithmic complexity, the four "concerns" are strictly sequential not interleaved, and `merge_binding_profile_if_target` replacing a 3-line inline `if` is net-negative readability.
+- **Claude SMR: PLAN-NEEDS-MINOR** — same `queue_uses_shared_exact_service` cross-submodule visibility item Codex flagged; test-file `#[path]` directive note; clarification that `queue_uses_shared_exact_service` is module-private.
+
+## Round-2 response to Gemini PLAN-KILL
+
+Gemini's substantive point is that `merge_binding_profile_if_target` adds a call boundary around a 3-line inline `if`. **Accepted.** v2 drops that helper and inlines the gated merge directly in the orchestrator — it's already a 3-line conditional that reads fine, and the gating is documented by the comment that survives at cos.rs:791-805.
+
+Gemini's broader claim — "linear mapper, no value in splitting" — is rejected. The function is 268 LOC (2.68x the project's 100-LOC refactor cue) and roughly 40% of those lines are multi-paragraph comment blocks explaining #709/#710/#718/#748/#751/#760/#784. The body is sequential in mechanical terms but mentally interleaved: a reader has to hold the #709 binding-scoped attribution rule, the #751 per-queue source switch, the #784 MAX-not-sum invariant, the #760 overshoot-hunt accounting, and the #710/#718 single-writer drop counters all simultaneously to parse the inner queue loop. Splitting `accumulate_interface_root` and `accumulate_queue_row` lets a reader load one #N issue's worth of context at a time. AGY's review confirms this read of the function.
+
+The plan is not declaring a perf win; the trade-off is reviewer cycles vs diff size. v2 narrows the split (drops the binding-profile-merge helper) so the diff is smaller and the marginal call boundaries that Gemini objects to are gone.
 
 ## Issue framing
 
@@ -75,10 +90,15 @@ in the noise of even a 1 Mpps dataplane.
   name. Renaming it back to the longer form is optional; this plan
   keeps the existing name and exposes it from the new
   `cos/exact_classifier.rs` submodule.
-- Tests already live in `worker/cos_tests.rs` (2112 LOC). They will
-  follow `cos.rs` into the new `worker/cos/` directory as
-  `worker/cos/tests.rs` and be brought into the new `mod.rs` under
-  `#[cfg(test)]`. No test code changes in this PR.
+- Tests already live in `worker/cos_tests.rs` (2112 LOC),
+  included today via `#[cfg(test)] #[path = "cos_tests.rs"] mod tests;`
+  at `cos.rs:834-836`. They will follow `cos.rs` into the new
+  `worker/cos/` directory as `worker/cos/tests.rs`. The `#[path]`
+  directive is dropped in favor of standard `#[cfg(test)] mod tests;`
+  resolution to the sibling file (Claude SMR M2). Other than the
+  rename itself, no test bodies move in this PR — except for the
+  one new `active_flow_buckets_peak_is_max_not_sum_across_workers`
+  test added per Codex finding 3.
 
 ## Concrete design
 
@@ -159,20 +179,25 @@ pub(super) fn accumulate_queue_row(
   one `drain_latency_hist.resize(DRAIN_HIST_BUCKETS, 0)` already in
   the original code — guarded by the same `queue_invocations > 0`
   early-out so untouched queues still serialize as empty.
+- **Internal field-write ordering is NOT free** (Codex round-1
+  finding 2). The original at cos.rs:602-604 sets
+  `status.priority = queue.config.priority` only when
+  `status.worker_instances == 0`, BEFORE incrementing
+  `worker_instances` at cos.rs:612. `accumulate_queue_row` must
+  preserve this read-before-write order: check `worker_instances`
+  first, then increment. Other accumulators (saturating_add, max)
+  are independent slots and can be ordered freely, but the
+  priority gate is not. Re-stated in invariants list #1 below.
+- **Does NOT take `binding_profile` or `owner_profile_row`.** The
+  v2 orchestrator inlines the gated `merge_binding_scoped_owner_profile`
+  call directly after `accumulate_queue_row` returns. The two
+  concerns stay structurally separate (per-queue accumulation
+  vs binding-scoped attribution) without a redundant helper.
 
-```rust
-// cos/queue_row.rs  (kept colocated — same call frame)
-pub(super) fn merge_binding_profile_if_target(
-    status: &mut crate::protocol::CoSQueueStatus,
-    owner_profile_row: Option<(i32, u8)>,
-    ifindex: i32,
-    queue_id: u8,
-    binding_profile: Option<&OwnerProfileSnapshot>,
-);
-```
-- Owns the "is this the unambiguous owner-profile row?" check and the
-  `merge_binding_scoped_owner_profile` call. Keeps the producer rule
-  (#709 / #748 / #751) co-located with the consumer.
+**DROPPED in v2:** the `merge_binding_profile_if_target` helper. The
+gated merge stays inline in the orchestrator as a 3-line `if`. Gemini
+Pro 3's round-1 counter-example on this point is accepted: wrapping a
+3-line `if` with a 5-arg call is net-negative readability.
 
 ```rust
 // cos/status.rs
@@ -192,7 +217,7 @@ where
         ),
     >;
 ```
-- The orchestrator becomes:
+- The orchestrator becomes (v2 — inline binding-profile merge):
 
 ```rust
 let mut interfaces = BTreeMap::<i32, CoSInterfaceStatus>::new();
@@ -212,10 +237,16 @@ for (cos_map, binding_live) in cos_maps {
                 cfg.queues.iter().find(|c| c.queue_id == queue.queue_id())
             });
             accumulate_queue_row(status, queue, queue_config);
-            merge_binding_profile_if_target(
-                status, owner_profile_row, ifindex, queue.queue_id(),
-                binding_profile.as_ref(),
-            );
+            // #709/#748/#751: binding-scoped fields surface only on the
+            // single unambiguous owner-local exact queue row on the
+            // whole binding. Kept inline (not extracted to a helper)
+            // because the 3-line conditional reads cleaner than a
+            // 5-arg call.
+            if owner_profile_row == Some((ifindex, queue.queue_id())) {
+                if let Some(profile) = binding_profile.as_ref() {
+                    merge_binding_scoped_owner_profile(status, profile);
+                }
+            }
         }
     }
 }
@@ -258,8 +289,18 @@ via `pub(super)` / `pub(crate)` re-exports in `cos/mod.rs`:
 are module-private (`fn`) today and stay `pub(super)` within the new
 `cos/` submodule so tests can address them by the same import paths.
 
-External grep confirms zero callers outside `worker/cos.rs` and
-`worker/cos_tests.rs`.
+`queue_uses_shared_exact_service` is module-private at cos.rs:106
+**but is called directly by tests at `cos_tests.rs:1919, 1923, 1927,
+1938, ...`** (Codex round-1 finding 1). Under the v2 layout it
+lives in `cos/runtime.rs` and is also called by `cos/exact_classifier.rs`
+(cos.rs:237). It needs **`pub(super)`** visibility within `cos/` so:
+- `cos/exact_classifier.rs` (sibling) can call it,
+- `cos/tests.rs` (sibling under `#[cfg(test)] mod tests;`) can call it,
+- it stays invisible outside the `cos/` submodule (no escape into
+  `worker/mod.rs` or wider).
+
+External grep confirms zero callers of any of these three items
+outside `worker/cos.rs` and `worker/cos_tests.rs`.
 
 ## Hidden invariants the change must preserve
 
@@ -268,8 +309,14 @@ External grep confirms zero callers outside `worker/cos.rs` and
    reorder these accumulations across queues; the original
    `for (&ifindex, root) in cos_map { for queue in &root.queues { ... } }`
    nesting is preserved exactly. Inside one queue's accumulation,
-   field-write order is irrelevant (each field is an independent
-   accumulator slot) so the helpers reorder freely within one call.
+   **most** field writes are independent saturating-add / MAX slots
+   that can be reordered freely — **but the `priority` write at
+   cos.rs:602-604 is a special case** (Codex round-1 finding 2):
+   it is gated by `status.worker_instances == 0` and reads that
+   counter BEFORE the saturating_add increment at cos.rs:612. Any
+   reorder that moves the increment ahead of the gate breaks the
+   "first worker wins priority" semantic. The helper preserves the
+   read-then-increment order verbatim.
 2. **Owner-profile binding-scoped fields land on exactly one row
    per binding.** `unique_owner_profile_row` is called ONCE per
    binding-iteration; `merge_binding_profile_if_target` is called
@@ -296,10 +343,17 @@ External grep confirms zero callers outside `worker/cos.rs` and
    the helper returns before we re-borrow the map.
 7. **Sort order is stable and identical.** Final sort is
    `(interface_name, ifindex)`, lifted intact into `finalize_interface_vec`.
-8. **Allocation rule.** Status path, control-plane, allocates one
-   `Vec` and two `BTreeMap`s. No new allocations introduced; the only
-   allocation churn is the same `drain_latency_hist.resize` already
-   in master.
+8. **Allocation rule.** Status path, control-plane. The existing
+   function already allocates: two BTreeMaps (`interfaces`,
+   `queue_maps`), per-interface `queues` Vecs, output Vec
+   (`Vec::with_capacity(interfaces.len())`), string clones for
+   `interface_name` and `forwarding_class`, occasional
+   `format!("ifindex-{N}")` fallback, `drain_latency_hist.resize`
+   and `redirect_acquire_hist.resize` to DRAIN_HIST_BUCKETS, and the
+   per-`into_values().collect()`. The invariant the helpers must
+   preserve is: **no new allocations relative to the current
+   implementation.** Codex round-1 finding 5 corrected the
+   too-narrow "only `drain_latency_hist.resize`" wording.
 9. **No locking change.** The function does not take any lock. Atomic
    reads remain Relaxed. Helpers do not introduce any synchronization.
 10. **`OwnerProfileSnapshot` lifecycle.** `binding_live.map(owner_profile_snapshot)`
@@ -326,8 +380,13 @@ External grep confirms zero callers outside `worker/cos.rs` and
    single-owner-local and shared-exact shapes).
 3. 5x flake check on `build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_local_exact_queue`
    (the 264-LOC integration test that hammers this exact code path).
-4. Go suite (30 packages) — no Go change, but run for hygiene.
-5. **No per-PR smoke** per the issue's standing rule (#1349 batch
+4. **New test: `active_flow_buckets_peak_is_max_not_sum_across_workers`**
+   (Codex round-1 finding 3). Construct two `BindingWorker`s for
+   the same ifindex/queue with `active_flow_buckets_peak` = 7 and
+   = 11. Assert the merged status reports 11 (MAX), not 18 (sum).
+   This pin makes a future refactor that swaps MAX for sum fail.
+5. Go suite (30 packages) — no Go change, but run for hygiene.
+6. **No per-PR smoke** per the issue's standing rule (#1349 batch
    marker `AWAITING-BATCH-MERGE`). The retirement-style batch smoke
    covers this and the sibling refactor PRs at once. Status-RPC
    regressions are caught by `cargo test`, not by an iperf3 smoke.
@@ -351,6 +410,29 @@ External grep confirms zero callers outside `worker/cos.rs` and
   involved in the 268-LOC function (e.g. `merge_owner_profile_sum`,
   `merge_cos_queue_owner_profile_sum` keep their current paths and
   bodies).
+
+## Round-2 changes summary
+
+Compared to v1:
+- **Dropped** `merge_binding_profile_if_target` helper (Gemini
+  round-1 KILL counter-example accepted). The 3-line `if` stays
+  inline in the orchestrator.
+- **Added** `queue_uses_shared_exact_service` to the discussion of
+  cross-submodule visibility (Codex round-1 finding 1 + Claude SMR
+  M1). It moves to `cos/runtime.rs` and gets `pub(super)` so
+  `cos/exact_classifier.rs` and `cos/tests.rs` can both call it.
+- **Corrected** the "field-write order irrelevant" claim (Codex
+  round-1 finding 2). The `priority` write at cos.rs:602-604 is
+  order-coupled with the `worker_instances` increment at
+  cos.rs:612; `accumulate_queue_row` preserves the read-then-
+  increment order.
+- **Added** a new test
+  `active_flow_buckets_peak_is_max_not_sum_across_workers` to
+  pin the #784 MAX-not-sum invariant (Codex round-1 finding 3).
+- **Fixed** the allocation wording (Codex round-1 finding 5).
+- **Clarified** the test-file move drops the `#[path = "cos_tests.rs"]`
+  directive in favor of standard `mod tests;` resolution (Claude
+  SMR M2).
 
 ## Open questions for adversarial review
 
