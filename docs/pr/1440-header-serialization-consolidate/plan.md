@@ -328,91 +328,35 @@ This eliminates the v1 plan's "thin wrapper preserves signatures"
 section entirely — there is nothing to preserve because there is
 no production caller today.
 
-#### v2: `wg/outer.rs::write_outer_eth` — DELETED (v1 was "keep as thin wrapper")
+**[v2 supersession note]** The remainder of this subsection
+between this notice and "`gre.rs::encapsulate_native_gre_frame`"
+was v1 design (thin wrappers preserving wg/outer.rs signatures).
+v2 deleted `wg/outer.rs` entirely (see preceding "DELETE
+`wg/outer.rs` entirely" decision). The wrapper code below is
+**historical / superseded** and retained only so reviewers can
+audit the v1→v2 design migration. The authoritative v2 plan is:
+no wrappers; future WG integration calls `frame::headers::*`
+directly.
+
+<details>
+<summary>v1 (SUPERSEDED) wg/outer.rs wrapper sketches</summary>
 
 ```rust
+// v1 SUPERSEDED — kept for audit only.
 // BEFORE — wg/outer.rs:23-45 (23 LOC of duplicated eth-header layout)
-pub(crate) fn write_outer_eth(out: &mut [u8], dst_mac: [u8; 6],
-    src_mac: [u8; 6], vlan_id: u16, ethertype: u16) -> Option<usize> {
-    let len = outer_l2_len(vlan_id);
-    let hdr = out.get_mut(..len)?;
-    hdr[0..6].copy_from_slice(&dst_mac);
-    hdr[6..12].copy_from_slice(&src_mac);
-    if vlan_id != 0 { /* 4 lines of 802.1Q */ }
-    else { hdr[12..14].copy_from_slice(&ethertype.to_be_bytes()); }
-    Some(len)
-}
-pub(crate) fn outer_l2_len(vlan_id: u16) -> usize { ... }
-
-// AFTER — wg/outer.rs (delete the dup; thin wrapper preserves the
-// existing public signature so tests + future integration PR don't
-// need to rewrite call sites)
-pub(crate) fn outer_l2_len(vlan_id: u16) -> usize {
-    crate::afxdp::frame::headers::eth_header_len(vlan_id)
-}
-pub(crate) fn write_outer_eth(out: &mut [u8], dst_mac: [u8; 6],
-    src_mac: [u8; 6], vlan_id: u16, ethertype: u16) -> Option<usize> {
-    crate::afxdp::frame::headers::write_eth_header_slice(
-        out, dst_mac, src_mac, vlan_id, ethertype)
-        .map(|()| outer_l2_len(vlan_id))
-}
+// [...elided wrapper sketches for write_outer_eth, checksum_be,
+//  and write_outer_ipv4_udp. All three are obsolete in v2 because
+//  wg/outer.rs is deleted entirely. The byte-identity arguments
+//  these sketches established for the eth-header-slice + checksum16
+//  + ipv4-udp layout still hold for the corresponding calls in
+//  the future WG-encap integration PR.]
 ```
 
-Byte-identity: `write_eth_header_slice` produces the same wire
-layout (TPID 0x8100, VID-masked to 12 bits, inner ethertype). The
-*only* difference is the masking — `write_outer_eth` masks
-`vlan_id & 0x0FFF` while `write_eth_header_slice` does too at line
-1582. Identical.
+The two regression tests previously in `wg/outer.rs`
+(`udp_checksum_is_zero_on_ipv4_outer`, `ipv4_checksum_is_correct`)
+MOVE to `frame/headers_tests.rs` in v2.
 
-#### `wg/outer.rs::checksum_be` — DELETE
-
-```rust
-// BEFORE — wg/outer.rs:121-135 (15 LOC, no AVX2, allocates nothing
-// but loops byte-by-byte regardless of CPU)
-fn checksum_be(bytes: &[u8]) -> u16 { ... }
-
-// AFTER — call site uses crate::afxdp::frame::checksum::checksum16.
-// frame/checksum.rs::checksum16 already returns the !sum result
-// in host-byte-order ready to .to_be_bytes() into the wire field —
-// same shape as checksum_be. Mechanical sub.
-```
-
-Byte-identity: both fold to `!fold16(sum_of_be_u16_words(bytes))`.
-Already differentially tested in
-`frame/checksum.rs::checksum16_add_bytes_*` (SIMD vs scalar) so the
-existing test suite covers this drop-in.
-
-#### `wg/outer.rs::write_outer_ipv4_udp` — REFACTOR TO USE BUILDERS
-
-```rust
-// BEFORE — wg/outer.rs:80-115 (the full IPv4+UDP open-code, 35 LOC).
-// Critical wire-byte invariant: outer UDP cs = 0 (RFC 768 default;
-// #1501 A2). DO NOT regress.
-
-// AFTER
-pub(crate) fn write_outer_ipv4_udp(
-    out: &mut [u8], src: Ipv4Addr, dst: Ipv4Addr,
-    src_port: u16, dst_port: u16, tos: u8, ttl: u8,
-    payload_len: usize,
-) -> Option<usize> {
-    use crate::afxdp::frame::headers::{write_ipv4_header, write_udp_header};
-    const IP_HDR_LEN: usize = 20;
-    const UDP_HDR_LEN: usize = 8;
-    let total = IP_HDR_LEN + UDP_HDR_LEN + payload_len;
-    let total_len = u16::try_from(total).ok()?;
-    let udp_len = u16::try_from(UDP_HDR_LEN + payload_len).ok()?;
-    write_ipv4_header(out.get_mut(..IP_HDR_LEN)?, src, dst,
-        17 /* PROTO_UDP */, tos, ttl, total_len)?;
-    write_udp_header(out.get_mut(IP_HDR_LEN..IP_HDR_LEN+UDP_HDR_LEN)?,
-        src_port, dst_port, udp_len, /* cs */ 0 /* RFC 768 default */)?;
-    Some(IP_HDR_LEN + UDP_HDR_LEN)
-}
-```
-
-Byte-identity gates: the two regression tests already in
-`wg/outer.rs` (`udp_checksum_is_zero_on_ipv4_outer` and
-`ipv4_checksum_is_correct`) MUST continue to pass without
-modification.
+</details>
 
 #### `gre.rs::encapsulate_native_gre_frame` v4 arm — USE BUILDER
 
@@ -567,9 +511,10 @@ Inside the crate:
 - `frame::write_eth_header`, `frame::write_eth_header_slice`,
   `frame::checksum16`, `frame::checksum16_ipv4`, `frame::checksum16_ipv6`
   all keep their current paths (re-exported from `frame/mod.rs`).
-- `wg::outer::write_outer_eth`, `wg::outer::write_outer_ipv4_udp`,
-  `wg::outer::outer_l2_len` keep their public-to-crate signatures
-  unchanged (only the body changes — calls into `frame::headers`).
+- `wg::outer::*` — module DELETED in v2 (was: thin-wrapper plan in
+  v1). Zero production callers exist; tests move to
+  `frame/headers_tests.rs`. Future WG-encap integration PR calls
+  `frame::headers::*` directly.
 - New: `frame::headers::write_ipv4_header`,
   `frame::headers::write_ipv6_header`,
   `frame::headers::write_udp_header`,
@@ -778,15 +723,19 @@ to take the RFC 768 default.
 6. **`Option<usize>` length-out**. All `_slice` builders return
    `Option` and gate on `get_mut(..N)?` so truncated frames
    return `None` rather than panic.
-7. **AVX2 must remain the actual path for IPv4-header checksum
-   when AVX2 is detected**. Today, gre.rs's `checksum16` already
-   hits the AVX2 path; wg/outer.rs's `checksum_be` does not. The
-   consolidation FIXES the wg case (Codex/Gemini: please verify
-   `frame::checksum::checksum16(20-byte-slice)` actually goes
-   through `checksum16_add_bytes_avx2`. The 20-byte slice is
-   smaller than one 32-byte AVX2 chunk, so the implementation
-   falls through to the scalar remainder. The SIMD setup cost is
-   still paid — see §8 risk 3).
+7. **Sub-32-byte slices MUST take the scalar path** (v2 invariant,
+   supersedes v1's "AVX2 must remain the actual path" claim).
+   v1 incorrectly assumed AVX2 was the right path for 20-byte
+   IPv4 headers. Round-1 review showed the SIMD setup cost is
+   paid even when the chunked loop iterates zero times. §7a adds
+   `if bytes.len() < 32 { return scalar; }` to
+   `checksum16_add_bytes`, which is bit-identical to the current
+   behavior (the SIMD entry already falls through to the scalar
+   remainder for < 32 byte inputs) but skips the setup cost.
+   This invariant gates that all sub-32-byte builders pass
+   through the scalar path; the SIMD path continues to handle
+   larger payloads (TSO body checksum, full-frame verify on
+   jumbo MTU).
 8. **HA sync portability**. None of the touched builders are
    called from session-sync code paths. The HA wire image is
    serialized by `pkg/cluster`, not `frame::headers`. No change.
@@ -858,12 +807,12 @@ pass without modification.
 
 | Risk class | Severity | Notes |
 |------------|----------|-------|
-| Behavioral regression | **HIGH** | Touching outer IPv4/IPv6 byte layout for two production protocols (GRE) and one scaffold (WG) in one PR. Mitigated by §5.2 differential tests against the open-code on the same commit, plus the existing wg/outer.rs regression tests staying put. |
+| Behavioral regression | **HIGH** | Touching outer IPv4/IPv6 byte layout for one production protocol (GRE) + ICMP TE + deleted-scaffold WG outer in one PR. **NOTE: v2 deliberately changes wire bytes** — IPv4 `ip[6..8]` goes from `0x0000` to `0x4000` (DF=1) and the IPv4 header checksum recomputes accordingly (§6.1: 0x6655 → 0x2655). This is a deliberate RFC 791/6864 compliance fix; the golden vectors in §5.1 encode the NEW byte layout. Mitigated by per-builder golden-vector tests in §5.1. |
 | Lifetime / borrow-checker | **LOW** | All builders take `&mut [u8]`; no captured state, no lifetimes beyond the slice. No `Box<dyn Trait>`, no closures. |
-| Performance regression | **LOW** | The replaced open-code is per-packet on GRE encap but `vec![0u8; N]` + byte-copy dominates over the eliminated AVX2-detection cost. AVX2 fastpath on a 20-byte IPv4 header is a no-op (slice < 32 bytes, falls through to scalar). MAJOR RISK if AVX2 setup cost is non-zero — measured on cluster smoke. |
+| Performance regression | **LOW** | The replaced open-code is per-packet on GRE encap; `vec![0u8; N]` + byte-copy dominates the byte writes. §7a's AVX2 length short-circuit is a STRICT improvement (skips SIMD setup on sub-32-byte slices). The consolidated builders are `#[inline]` so the function-call hop folds at the call site. |
 | Architectural mismatch (#946 Phase 2 / #961) | **LOW** | The consolidation target is a real duplication that already exists in three files. The proposed shape (free functions, no trait, single new file) matches the existing `frame/checksum.rs` precedent. Not inventing a new abstraction. |
 | Scope creep | **MED** | Issue body floats "encapsulation trait" and a `headers/` directory; we reject both. Reviewers must verify the smaller scope is OK. |
-| Drift between open-code and builder during refactor | **LOW (gated)** | §5.2 differential test runs both code paths on the same input and asserts byte equality. Test stays in tree for one bake cycle, then removed. |
+| Drift between open-code and builder during refactor | **LOW** | v2 uses permanent golden-vector tests in §5.1 with hand-derived byte arrays (three independent reviewer recomputations agreed on the §6.1 checksum). No `legacy_encap` helper enters the tree; no shared-constant decay surface. |
 
 ## 9. Out of scope (explicitly)
 
