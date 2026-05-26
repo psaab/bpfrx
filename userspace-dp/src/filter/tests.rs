@@ -1917,3 +1917,82 @@ fn input_dscp_filter_families_changed_detects_three_color_shape_change() {
         (true, false)
     );
 }
+
+// AC2 coverage for #1546: add/remove of a DSCP-sensitive interface filter
+// must invalidate the affected family. The same_ifindex/positional/three-color
+// tests above cover the other three AC2 scenarios; these two close the gap.
+
+#[test]
+fn input_dscp_filter_families_changed_detects_filter_added_to_interface() {
+    let iface = crate::InterfaceSnapshot {
+        name: "reth1.0".into(),
+        ifindex: 10,
+        filter_input_v4: "dscp-filter".into(),
+        ..Default::default()
+    };
+    let filter = FirewallFilterSnapshot {
+        name: "dscp-filter".into(),
+        family: "inet".into(),
+        terms: vec![FirewallTermSnapshot {
+            name: "dscp-term".into(),
+            dscp_values: vec![46],
+            action: "discard".into(),
+            log: true,
+            ..Default::default()
+        }],
+    };
+
+    // `old` has no DSCP-sensitive filter bound to ifindex 10.
+    let bare_iface = crate::InterfaceSnapshot {
+        name: "reth1.0".into(),
+        ifindex: 10,
+        ..Default::default()
+    };
+    let old = make_filter_state_with_interfaces(&[], std::slice::from_ref(&bare_iface));
+    // `new` adds the DSCP-sensitive filter on the same interface — must trigger v4 family change.
+    let new = make_filter_state_with_interfaces(&[filter], &[iface]);
+
+    assert_eq!(
+        input_dscp_filter_families_changed(&old, &new),
+        (true, false)
+    );
+}
+
+#[test]
+fn input_dscp_filter_families_changed_detects_filter_removed_from_interface() {
+    let iface = crate::InterfaceSnapshot {
+        name: "reth1.0".into(),
+        ifindex: 10,
+        filter_input_v4: "dscp-filter".into(),
+        ..Default::default()
+    };
+    let filter = FirewallFilterSnapshot {
+        name: "dscp-filter".into(),
+        family: "inet".into(),
+        terms: vec![FirewallTermSnapshot {
+            name: "dscp-term".into(),
+            dscp_values: vec![46],
+            action: "discard".into(),
+            log: true,
+            ..Default::default()
+        }],
+    };
+
+    // `old` has the DSCP-sensitive filter bound to ifindex 10.
+    let old = make_filter_state_with_interfaces(
+        std::slice::from_ref(&filter),
+        std::slice::from_ref(&iface),
+    );
+    // `new` removes the filter binding — must trigger v4 family change.
+    let bare_iface = crate::InterfaceSnapshot {
+        name: "reth1.0".into(),
+        ifindex: 10,
+        ..Default::default()
+    };
+    let new = make_filter_state_with_interfaces(&[], &[bare_iface]);
+
+    assert_eq!(
+        input_dscp_filter_families_changed(&old, &new),
+        (true, false)
+    );
+}

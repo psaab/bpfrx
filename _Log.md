@@ -1,5 +1,65 @@
 # Action Log
 
+## 2026-05-26 — #1546 fix: centralize log-match helper + rustfmt
+
+- **Timestamp**: 2026-05-26 (PR #1574 head fde64872 -> next)
+  - **Action**: Address Codex code-review r1 MERGE-NEEDS-MAJOR.
+    Centralize the log-match helper: eliminate the
+    `tx_selection_log_match` and `cached_log_match` duplicates
+    introduced by v2 by making `eval::filter_log_match` `pub(super)`
+    and importing it from tx_selection.rs and cache_sensitive.rs.
+    Function count drops from 53 back to 51, matching the
+    pre-split engine.rs and the "pure code motion" attestation.
+    Also fix rustfmt on policer.rs:51. cargo build clean, 40/40
+    filter tests pass.
+  - **File(s)**: userspace-dp/src/filter/engine/tx_selection.rs
+    (removed tx_selection_log_match, import filter_log_match),
+    userspace-dp/src/filter/engine/cache_sensitive.rs (removed
+    cached_log_match, import filter_log_match),
+    userspace-dp/src/filter/engine/eval.rs (filter_log_match
+    already pub(super) — no change needed),
+    userspace-dp/src/filter/engine/policer.rs (rustfmt fix).
+
+## 2026-05-26 — #1546 filter engine split implemented (plan v2)
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Implemented the 5-way split of
+    userspace-dp/src/filter/engine.rs (1247 LOC, 51 fns) into
+    userspace-dp/src/filter/engine/{mod,matching,eval,tx_selection,
+    cache_sensitive,policer}.rs per plan v2. Pure code motion —
+    function bodies byte-identical; #[inline]/#[inline(always)]
+    attributes preserved on the hot path; visibility tightened from
+    engine-wide pub(crate) to pub(super) for engine-local helpers,
+    pub(crate) re-exports at engine/mod.rs maintain the prior call
+    surface in the rest of the crate. Added 2 AC2 tests
+    (filter_added_to_interface, filter_removed_from_interface) to
+    close the add/remove gap; the other 3 AC2 scenarios
+    (same_ifindex content change, positional-ID stability,
+    three-color shape change) were already present in
+    filter/tests.rs. cargo build clean; full cargo test --release
+    1417/1417 pass (plus 38/38 filter:: 5x flake check); Go suite
+    clean.
+  - **File(s)**: userspace-dp/src/filter/engine.rs (DELETED),
+    userspace-dp/src/filter/engine/mod.rs (NEW, 35),
+    userspace-dp/src/filter/engine/matching.rs (NEW, 94),
+    userspace-dp/src/filter/engine/eval.rs (NEW, 681),
+    userspace-dp/src/filter/engine/tx_selection.rs (NEW, 297),
+    userspace-dp/src/filter/engine/cache_sensitive.rs (NEW, 208),
+    userspace-dp/src/filter/engine/policer.rs (NEW, 60),
+    userspace-dp/src/filter/tests.rs (added 2 AC2 tests).
+
+## 2026-05-26 — #1546 filter engine split plan v1 drafted
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Created worktree refactor/1546-filter-engine-split
+    off origin/master (3b1f56a8). Drafted plan v1 splitting
+    `userspace-dp/src/filter/engine.rs` (1247 LOC, 51 fns) into
+    five responsibility-scoped submodules: matching, eval,
+    tx_selection, cache_sensitive, policer. Pure code motion —
+    bodies byte-identical, `#[inline]` attributes preserved across
+    the new module boundaries.
+  - **File(s)**: docs/pr/1546-filter-engine-split/plan.md (NEW),
+    docs/pr/1546-filter-engine-split/reviewer-ids.md (NEW).
 ## 2026-05-26 — #1325 implementation pushed
 
 - **Timestamp**: 2026-05-26T (UTC)
