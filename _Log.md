@@ -4373,3 +4373,15 @@
     — verified 5x clean on retry, unrelated subsystem). Go
     tests: clean.
   - **File(s)**: see above.
+
+## 2026-05-26 — #1342 4-of-4 attestation complete
+
+- **Timestamp**: 2026-05-26T (AWAITING-BATCH-MERGE posted)
+  - **Action**: Posted AWAITING-BATCH-MERGE marker on PR #1577
+    at SHA caf46afcdc88. 4-of-4 reviewer attestation: Codex r2
+    MERGE-READY (r1 minors addressed); AGY r1 MERGE-READY
+    (exhaustive AST byte-identity check across 22 functions);
+    Copilot COMMENTED (1 finding addressed, 1 _Log.md timestamp
+    format documented as preserving file convention); Claude
+    SMR MERGE-READY.
+  - **File(s)**: PR comment.
