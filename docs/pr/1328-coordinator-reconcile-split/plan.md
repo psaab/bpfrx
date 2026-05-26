@@ -40,7 +40,7 @@ Concrete v2 deltas:
 5. **Test plan:** drop the bogus `coordinator/tests.rs:1310`
    citation. `:1310` is a `refresh_bindings` zero-out test, not a
    `reconcile(None, ...)` test. Add a new
-   `coordinator::tests::reconcile_with_none_snapshot_preserves_invariants`
+   `coordinator::tests::reconcile_with_none_snapshot_preserves_stage_sequence`
    test that asserts the `start`→`stopped`→`no_snapshot` stage
    sequence and zero new bindings in `workers.live`.
 6. **`PreservedReconcileState`:** drop `had_live_workers`. The
@@ -89,11 +89,13 @@ for Phase 2.
 This is a **pure code-motion refactor**. There is no perf win on
 the wire — `reconcile()` runs on snapshot installs and HA role
 changes (occasional, not hot path); `refresh_bindings()` runs on
-the ~1Hz status poll plus once per `reconcile()`. Neither is
-allocation-sensitive in the steady state beyond the rule that a
-no-op reconcile must not allocate (the existing implementation
-already doesn't — the bringup work happens after the early
-returns that handle `None` snapshot and missing-map-pin cases).
+the ~1Hz status poll plus once per `reconcile()`. Neither path is
+on the packet hot loop. The refactor introduces **no additional
+allocations beyond the existing code-motion baseline**; the
+no-op `reconcile(None, …)` path retains its pre-existing
+`stop_inner`-driven `Arc::new(BTreeMap::new())` / `Arc::new(Vec::new())`
+stores (the refactor does not add or remove any). See the
+"Allocation discipline" section below for the exact inventory.
 
 The win is reviewability + future-feature locality. A snapshot-field
 addition (the most common reason these functions grow) currently
@@ -179,11 +181,10 @@ blocks across modules). The public method signature
 ### Orchestrator shape (per issue body)
 
 ```rust
-// in coordinator/reconcile.rs
+// in coordinator/reconcile/mod.rs
 pub(in crate::afxdp) struct PreservedReconcileState {
     pub synced_sessions: Vec<SyncedSessionEntry>,
     pub slow_path: Option<Arc<SlowPathReinjector>>,
-    pub had_live_workers: bool,
 }
 
 impl Coordinator {
@@ -373,9 +374,12 @@ methods on `Coordinator`. No callsite is touched.
    - **Snapshot apply finishes when:** validation/forwarding
      installed on self + shared_validation/ha.forwarding stored +
      slow_path re-armed + ha.fabrics published + xsk/heartbeat/session
-     map FDs open + optional conntrack/dnat FDs open +
-     `last_reconcile_stage` reflects the next phase's `planned:...`
-     (set in bringup).
+     map FDs open + optional conntrack/dnat FDs open. Snapshot
+     phase does NOT write `last_reconcile_stage` except on its
+     own error-leg failures (`missing_*_pin`, `open_*_failed`);
+     on success it leaves the stage set to the value written by
+     the preceding teardown phase (`stopped`). The `planned:...`
+     write belongs to the bringup phase, not snapshot apply.
    - **Bringup finishes when:** worker_plans assembled +
      shared-UMEM backfilled into bindings + cos_owner_worker_by_queue
      mapping installed + mirror_targets stored + replay_synced_sessions
@@ -458,7 +462,7 @@ methods on `Coordinator`. No callsite is touched.
 |------------|-------|------------|
 | Behavioral regression | MEDIUM | The teardown→reset→snapshot→bringup ordering is load-bearing for slow-path preservation across HA role changes. Mitigation: pure code motion verified by `git diff --stat` (line count ≈ 0 net delta excluding new file headers), 1089 LOC of existing `coordinator/tests.rs`, `make test-failover`, `make test-ha-crash`. |
 | Lifetime / borrow-checker | MEDIUM | `&mut self` plus `&mut [BindingStatus]` across phase boundaries means each new helper takes both. The two `Vec<…>` preserved fields (`synced_sessions`, `slow_path`) are passed by value through the `PreservedReconcileState`, so no lifetime extension is needed. Smoke: `cargo build --release` clean. |
-| Performance regression | LOW | Functions are off the packet hot path. The only concern is the no-op `reconcile(None, …)` allocation discipline; covered by the no-op test in `coordinator/tests.rs:1254` (refresh_bindings) and `1310` (a no-snapshot reconcile case if present — we will add one if missing). |
+| Performance regression | LOW | Functions are off the packet hot path. The only concern is the no-op `reconcile(None, …)` allocation discipline; covered by adding a new `coordinator::tests::reconcile_with_none_snapshot_preserves_stage_sequence` test (see Test plan §). |
 | Architectural mismatch (#961 / #946-Phase-2 dead-end) | LOW | Pure code motion has no architectural premise to fail. The decomposition target (per-phase sub-files matching the comment-block structure of the current function) is what the issue body explicitly proposes; no novel design. |
 
 ## Test plan
@@ -507,60 +511,53 @@ methods on `Coordinator`. No callsite is touched.
 - `refresh_runtime_snapshot()` (L940) and `bump_fib_generation()`
   (L1151) — these are short (~60 LOC and ~5 LOC) and not in scope.
 
-## Open questions for adversarial review
+## Open questions for adversarial review (v2 — round-2 resolved)
 
-1. **Is the perf justification sound at absolute scale?** Reconcile
-   runs on snapshot installs and HA role changes (occasional, not
-   hot path); refresh_bindings runs on the ~1Hz status poll. Pure
-   maintainability win. **Is this enough to justify the churn,
-   or is this a PLAN-KILL?**
+The following Round-1 questions are now decided. Listed here for
+audit, with the round-1 reviewer rulings.
 
-2. **Should the four new files be `coordinator/reconcile/{teardown,
-   reset, snapshot, bringup}.rs` (a sub-mod-dir) instead of flat
-   `reconcile_*.rs` siblings?** The issue body proposes a
-   sub-mod-dir (`coordinator/reconcile/mod.rs +
-   teardown.rs/binding_reset.rs/snapshot_apply.rs/panic_slot.rs/
-   binding_bringup.rs`). The plan above flattens that to top-level
-   `reconcile_*.rs` for shallower nesting. The wave-1 rules
-   directive says coordinator/ is already a dir and prefers
-   *sub-aspects as needed* — does that admit either shape?
+1. **Perf justification at absolute scale.** Reconcile runs on
+   snapshot installs / HA role changes (off hot path);
+   `refresh_bindings` runs at ~1 Hz. Round-1 verdict from both
+   reviewers: maintainability case is sound; not PLAN-KILL.
 
-3. **Is the `PreservedReconcileState` struct worth the type or
-   should the orchestrator stash the two preserved values in
-   locals?** A struct is more readable but adds 8 lines of type
-   definition for two fields used in two places.
+2. **Layout — sub-mod-dir vs flat siblings.** Decided
+   sub-mod-dir `coordinator/reconcile/{mod,teardown,reset,
+   snapshot,bringup}.rs` plus sibling `coordinator/refresh_bindings.rs`.
+   Both reviewers asked for this and it matches the issue body's
+   proposal.
 
-4. **`reconcile_apply_snapshot` returning `Option<ReconcileSnapshotFds>`
-   collapses four early-return error legs into one type. Is this
-   too clever — should each error leg stay its own `pub(super) fn`
-   to mirror the current code shape?**
+3. **`PreservedReconcileState` struct vs locals.** Decided keep
+   the struct (two fields: `synced_sessions` + `slow_path`) as a
+   typed contract documenting what survives teardown. Codex r1 #6
+   asked to drop `had_live_workers`; done.
 
-5. **Allocation discipline on the no-op `reconcile(None, …)` path.**
-   The plan claims zero new allocations. Is there a hidden allocation
-   in any of the helper-call boundaries (e.g., a struct field that
-   ends up cloned in a `format!` argument)?
+4. **`reconcile_apply_snapshot` collapsed error legs.** Decided
+   keep `Option<ReconcileSnapshotFds>` return. The helper body
+   keeps each explicit `missing_*_pin` / `open_*_failed` error
+   leg with its exact `last_reconcile_stage` string and
+   per-binding `last_error` write — only the return type
+   collapses. AGY r1 explicitly endorsed this shape.
 
-6. **`refresh_bindings` zero-out branch.** The current code writes
-   ~60 field assignments and clears two `Vec`s. The proposed
-   `zero_unbound_slot(binding: &mut BindingStatus)` is pure
-   code-motion of that block. Should it instead use
-   `BindingStatus::reset_for_unbound()` on the `BindingStatus`
-   type itself (which the issue body proposes for the
-   `reset_for_reconcile` case)? That would push the field list
-   into `protocol.rs`, but the issue body explicitly defers that
-   to a post-#1325 follow-up.
+5. **Allocation discipline on no-op path.** Decided "no
+   additional allocations beyond existing code motion". Existing
+   `stop_inner`-driven `Arc::new(BTreeMap::new())` stores at
+   L204–L246 are pre-existing and stay; the refactor adds none.
 
-7. **#925 panic-slot pairing.** The plan keeps the insert + spawn
-   + Err-remove inside a single helper. Is that helper's name
-   (`spawn_worker_with_panic_slot`) carrying its weight, or should
-   the panic-slot insert/remove be inlined into the spawn-loop in
-   `reconcile_bringup.rs` to reduce indirection?
+6. **`refresh_bindings` zero-out branch.** Decided keep
+   `zero_unbound_slot(binding)` local to `refresh_bindings.rs`
+   for now. Pushing the reset into `BindingStatus::reset_for_unbound()`
+   is blocked on #1325 (protocol.rs split) per issue body.
+
+7. **#925 panic-slot pairing.** Decided INLINE inside
+   `reconcile/bringup.rs` (no `spawn_worker_with_panic_slot`
+   wrapper). Codex r1 #7 + AGY r1 q7 both agreed: the spawn
+   closure captures ~30 worker-scoped Arcs; a helper would hide
+   more than it clarifies. One-line comment at the insert site
+   names the matching Err-arm remove.
 
 8. **Architectural mismatch test (#961 / #946-Phase-2 pattern).**
-   This is pure code motion of comment-block boundaries that
-   already exist in the function body. Are there any signs that
-   the comment-block boundaries don't match the *actual*
-   side-effect boundaries — i.e., is there a side effect in
-   "snapshot install" that depends on the binding-reset phase
-   having already run? (We claim no, based on the binding-reset
-   loop only touching counter fields.)
+   Decided NO mismatch. The phase boundaries are anchored to
+   the load-bearing side effects documented in the "Hidden
+   invariants" section, not to the comment-block formatting.
+   AGY r1 explicitly verified this.
