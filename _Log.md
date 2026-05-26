@@ -119,6 +119,17 @@
 - **File(s)**: docs/pr/1355-cos-push-split/plan.md,
   docs/pr/1355-cos-push-split/reviewer-ids.md
 
+## 2026-05-26 — #1355 plan v1 unanimous PLAN-KILL; v2 re-targeted
+
+- **Timestamp**: 2026-05-26 20:32 UTC
+- **Action**: Codex (task-mpn2tomp-5t6oam) and Gemini
+  (task-mpn2u791-tq1zkx) both PLAN-KILL on the flow_fair() axis.
+  Re-targeted plan v2 along the snapshot-present/absent axis with
+  seven extracted helpers; fixed v1 SessionKey-not-Copy defect by
+  pre-computing bucket via a short &ff borrow before item is moved.
+- **File(s)**: docs/pr/1355-cos-push-split/plan.md (rewrite),
+  docs/pr/1355-cos-push-split/reviewer-ids.md
+
 ## 2026-05-26 — #1325 implementation pushed
 
 - **Timestamp**: 2026-05-26T (UTC)
