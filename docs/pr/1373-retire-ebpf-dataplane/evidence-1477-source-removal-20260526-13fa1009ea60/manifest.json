@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "issues": [1373, 1477],
+  "candidate_commit": "13fa1009ea60563626281c3f5b3ff52685d296e4",
+  "candidate_branch": "1477-final-validation",
+  "artifact_created_at": "2026-05-26T08:15:00Z",
+  "notes": "Comprehensive retirement smoke at the #1476 source-removal merge SHA. BLOCKER on Gate 6 throughput dip (15.01 Gbps on cell 2 of cos-off-ipv4-push); Gate 1 same matrix passed at 23+ Gbps. Gates 4 / 7 / 8 / 9 not exercised in this run (deferred for budget). Full detail in summary.md.",
+  "cluster": {
+    "name": "loss-userspace",
+    "env_file": "test/incus/loss-userspace-cluster.env",
+    "config_files": [
+      "docs/ha-cluster-userspace.conf"
+    ]
+  },
+  "binaries": [
+    {
+      "name": "xpfd",
+      "path": "/usr/local/sbin/xpfd",
+      "sha256": "560f99ad8cf7da9908de58e0ac43acdedf7ee87b4eedb50c441d03f252ee295f"
+    },
+    {
+      "name": "xpf-userspace-dp",
+      "path": "/usr/local/sbin/xpf-userspace-dp",
+      "sha256": "975f6fe3e740fd24d79c7ff195ba1e7f78ebd8ae6f94ce6dfec604836a17a448"
+    },
+    {
+      "name": "cli",
+      "path": "/usr/local/sbin/cli",
+      "sha256": "fdcb9717b19431452fe4d9219b4686e45504b764921598d0d0b360d22fbd72bf"
+    }
+  ]
+}

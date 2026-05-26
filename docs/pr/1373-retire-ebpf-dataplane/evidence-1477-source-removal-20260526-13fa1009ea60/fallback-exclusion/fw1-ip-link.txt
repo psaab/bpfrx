@@ -1,0 +1,44 @@
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00 promiscuity 0 allmulti 0 minmtu 0 maxmtu 0 netns-immutable addrgenmode eui64 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 tso_max_size 524280 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 
+2: fxp0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq master vrf-mgmt state UP mode DEFAULT group default qlen 10000
+    link/ether 10:66:6a:9c:ee:98 brd ff:ff:ff:ff:ff:ff promiscuity 0 allmulti 0 minmtu 68 maxmtu 65535 
+    vrf_slave table 999 addrgenmode eui64 numtxqueues 6 numrxqueues 6 gso_max_size 65536 gso_max_segs 65535 tso_max_size 65536 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 parentbus virtio parentdev virtio11 
+3: em0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq master vrf-mgmt state UP mode DEFAULT group default qlen 10000
+    link/ether 10:66:6a:3f:5b:1b brd ff:ff:ff:ff:ff:ff promiscuity 0 allmulti 0 minmtu 68 maxmtu 65535 
+    vrf_slave table 999 addrgenmode eui64 numtxqueues 6 numrxqueues 6 gso_max_size 65536 gso_max_segs 65535 tso_max_size 65536 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 parentbus virtio parentdev virtio12 
+4: ge-7-0-0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 9000 xdpgeneric qdisc mq state UP mode DEFAULT group default qlen 10000
+    link/ether 10:66:6a:3f:67:60 brd ff:ff:ff:ff:ff:ff promiscuity 0 allmulti 0 minmtu 68 maxmtu 65535 addrgenmode eui64 numtxqueues 6 numrxqueues 6 gso_max_size 65536 gso_max_segs 65535 tso_max_size 65536 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 parentbus virtio parentdev virtio13 
+    prog/xdp id 12097 name xdp_userspace_p tag 0a9cb39208968d69 jited load_time 2819952196363782 created_by_uid 0 
+    altname enx10666a3f6760
+5: ge-7-0-1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 xdp qdisc mq state UP mode DEFAULT group default qlen 10000
+    link/ether 02:bf:72:16:02:01 brd ff:ff:ff:ff:ff:ff promiscuity 0 allmulti 0 minmtu 68 maxmtu 9978 addrgenmode none numtxqueues 56 numrxqueues 6 gso_max_size 65536 gso_max_segs 65535 tso_max_size 524280 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 parentbus pci parentdev 0000:08:00.0 
+    prog/xdp id 12097 name xdp_userspace_p tag 0a9cb39208968d69 jited load_time 2819952196363782 created_by_uid 0 
+6: ge-7-0-2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 xdp qdisc mq state UP mode DEFAULT group default qlen 10000
+    link/ether 02:bf:72:16:01:01 brd ff:ff:ff:ff:ff:ff promiscuity 0 allmulti 0 minmtu 68 maxmtu 9978 addrgenmode none numtxqueues 56 numrxqueues 6 gso_max_size 65536 gso_max_segs 65535 tso_max_size 524280 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 parentbus pci parentdev 0000:09:00.0 
+    prog/xdp id 12097 name xdp_userspace_p tag 0a9cb39208968d69 jited load_time 2819952196363782 created_by_uid 0 
+8: vrf-sfmix: <NOARP,MASTER,UP,LOWER_UP> mtu 65575 qdisc noqueue state UP mode DEFAULT group default 
+    link/ether f2:f6:a2:1b:20:38 brd ff:ff:ff:ff:ff:ff promiscuity 0 allmulti 0 minmtu 1280 maxmtu 65575 netns-immutable 
+    vrf table 100 addrgenmode eui64 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 tso_max_size 65536 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 
+9: vrf-mgmt: <NOARP,MASTER,UP,LOWER_UP> mtu 65575 qdisc noqueue state UP mode DEFAULT group default 
+    link/ether 32:4f:9a:7d:52:52 brd ff:ff:ff:ff:ff:ff promiscuity 0 allmulti 0 minmtu 1280 maxmtu 65575 netns-immutable 
+    vrf table 999 addrgenmode eui64 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 tso_max_size 65536 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 
+13: ge-7-0-2.50@ge-7-0-2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP mode DEFAULT group default 
+    link/ether 02:bf:72:16:01:01 brd ff:ff:ff:ff:ff:ff promiscuity 0 allmulti 0 minmtu 0 maxmtu 65535 
+    vlan protocol 802.1Q id 50 <REORDER_HDR> addrgenmode none numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 tso_max_size 524280 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 
+14: ge-7-0-2.80@ge-7-0-2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP mode DEFAULT group default 
+    link/ether 02:bf:72:16:01:01 brd ff:ff:ff:ff:ff:ff promiscuity 0 allmulti 0 minmtu 0 maxmtu 65535 
+    vlan protocol 802.1Q id 80 <REORDER_HDR> addrgenmode none numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 tso_max_size 524280 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 
+2288: fab1@ge-7-0-0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 9000 qdisc noqueue master vrf-mgmt state UNKNOWN mode DEFAULT group default 
+    link/ether 10:66:6a:3f:67:60 brd ff:ff:ff:ff:ff:ff promiscuity 0 allmulti 0 minmtu 68 maxmtu 65535 
+    ipvlan  mode l2 bridge 
+    vrf_slave table 999 addrgenmode eui64 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 tso_max_size 65536 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 
+2289: xpf-usp0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UNKNOWN mode DEFAULT group default qlen 500
+    link/none  promiscuity 0 allmulti 0 minmtu 68 maxmtu 65535 
+    tun type tun pi off vnet_hdr off persist off addrgenmode random numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 tso_max_size 65536 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 
+2292: gr-0-0-0: <NO-CARRIER,POINTOPOINT,MULTICAST,NOARP,UP> mtu 1500 qdisc fq_codel state DOWN mode DEFAULT group default qlen 10000
+    link/none  promiscuity 0 allmulti 0 minmtu 68 maxmtu 65535 
+    tun type tun pi off vnet_hdr off persist on user root group root addrgenmode eui64 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 tso_max_size 65536 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 
+2293: fab0: <NO-CARRIER,BROADCAST,MULTICAST,MASTER,UP> mtu 1500 qdisc noqueue master vrf-mgmt state DOWN mode DEFAULT group default qlen 10000
+    link/ether b2:e9:ec:f0:f0:94 brd ff:ff:ff:ff:ff:ff promiscuity 0 allmulti 0 minmtu 68 maxmtu 65535 netns-immutable 
+    bond mode active-backup miimon 0 updelay 0 downdelay 0 peer_notify_delay 0 use_carrier 1 arp_interval 0 arp_missed_max 2 arp_validate none arp_all_targets any primary_reselect always fail_over_mac none xmit_hash_policy layer2 resend_igmp 1 num_grat_arp 1 all_slaves_active 0 min_links 0 lp_interval 1 packets_per_slave 1 lacp_active on lacp_rate slow coupled_control on broadcast_neighbor off ad_select stable tlb_dynamic_lb 1 
+    vrf_slave table 999 addrgenmode eui64 numtxqueues 16 numrxqueues 16 gso_max_size 65536 gso_max_segs 65535 tso_max_size 65536 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 

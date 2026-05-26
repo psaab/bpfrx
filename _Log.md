@@ -3637,3 +3637,22 @@
   ingress-side tcpdump capture for byte-equality comparison.
 - **Validation**: Docs-only sweep on top of helper changes; helper test
   suites re-run green (13 + 10 tests).
+
+- **Timestamp**: 2026-05-26T08:20Z
+- **Action**: #1477 Phase B execution against #1476 source-removal candidate
+  13fa1009 — capture evidence bundle with BLOCKER finding on Gate 6
+- **File(s)**: docs/pr/1373-retire-ebpf-dataplane/evidence-1477-source-removal-20260526-13fa1009ea60/
+  (manifest.json, summary.md, metadata/, cos-off/, screen-flood/, syn-cookie/,
+   echo-6200-6211/, fallback-exclusion/, userspace-phase-cycle.log,
+   placeholder dirs for unexercised gates)
+- **Why**: #1476 (PR #1558) merged at 2026-05-26T07:36:43Z; ran Phase B
+  validation against the candidate. Build+test green at 13fa1009. Gates
+  1 / 2 / 3 (runtime path) / 5 / 10 PASS. Gate 6 (smoke matrix) hard-
+  failed on second iteration of cos-off-ipv4-push at 15.014 Gbps vs
+  18.000 Gbps threshold while iteration 1 passed at 21.580 Gbps. NOT a
+  code regression (Gate 1 same matrix ran 23+ Gbps on all four cells)
+  but a strict-threshold trip blocks #1477 closure per runbook.
+- **Validation**: 33 Go packages pass `make test` at 13fa1009; 41
+  cargo SYN-cookie tests pass; both HA peers carry only the retained
+  xdp_userspace_p shim (no legacy xdp_main_prog references). #1477
+  HELD; #1373 NOT closed. Posting BLOCKER comment on #1477.

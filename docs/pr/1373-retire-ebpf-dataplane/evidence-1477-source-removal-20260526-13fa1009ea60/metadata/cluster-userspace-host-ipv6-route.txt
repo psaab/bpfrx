@@ -1,0 +1,2 @@
+default via fe80::bf72:16:2 dev eth0 proto ra metric 1024 expires 169sec hoplimit 64 pref medium
+default nhid 1812832801 via fe80::bf72:16:2 dev eth0 proto ra metric 1024 expires 169sec pref medium

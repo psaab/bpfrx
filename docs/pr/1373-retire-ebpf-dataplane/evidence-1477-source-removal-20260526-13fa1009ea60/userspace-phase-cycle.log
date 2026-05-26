@@ -1,0 +1,26 @@
+==> waiting for xpfd gRPC/CLI readiness
+==> detecting userspace runtime mode
+==> runtime mode: supported
+==> supported userspace runtime detected
+==> pinning userspace validation to node0 for RGs:1 2
+==> waiting for userspace forwarding to auto-arm on the active node
+==> active userspace firewall: loss:xpf-userspace-fw0
+==> ensuring IPv6 default route via router advertisement
+==> ensuring IPv4/IPv6 WAN neighbor state on loss:xpf-userspace-fw0
+==> basic reachability checks
+==> validating IPv4 traceroute visibility via 1.1.1.1
+ipv4 ttl probe: ok
+ipv4 mtr: ok
+==> validating IPv6 traceroute visibility via 2607:f8b0:4005:814::200e
+ipv6 ttl probe: ok
+ipv6 mtr: warning destination unresolved:   9.|-- ???                       100.0     1    0.0   0.0   0.0   0.0   0.0
+smoke mode: matrix
+==> verifying CoS-off baseline before smoke matrix
+cos-off precheck: ok
+smoke cell start: cos-off-ipv4-push
+==> warming up cos-off-ipv4-push push path on iperf port 5201
+==> running cos-off-ipv4-push push iperf port 5201 iteration 1/3
+cos-off-ipv4-push run 1: 21.580 Gbps avg=21.580 peak=21.809 tail=21.676 ratio=0.994 retr=2 intervals=[21.28,21.68,21.72,21.54,21.81]
+==> running cos-off-ipv4-push push iperf port 5201 iteration 2/3
+cos-off-ipv4-push run 2: 15.014 Gbps avg=15.014 peak=15.196 tail=15.181 ratio=0.999 retr=0 intervals=[14.78,15.08,14.98,15.17,15.20]
+cos-off-ipv4-push run 2 below threshold: 15.014 < 18.000 Gbps

@@ -1,0 +1,8 @@
+Screen profile: pr1477-land
+  TCP LAND attack detection: enabled
+
+Screen profile: pr1477-syn
+  TCP SYN flood protection: attack-threshold 1
+  Applied to zones: lan
+
+Total screen drops: 41

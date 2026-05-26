@@ -1,0 +1,33 @@
+candidate_commit=13fa1009ea60563626281c3f5b3ff52685d296e4
+branch=1477-final-validation
+branch_tip=902a20edd0a56f6d683bafafc32dbaf92ce358d6
+branch_tip_msg=docs: wire #1477 runbook to in-tree helpers + fix SYN-cookie counter names
+
+# Note: branch_tip carries 4 docs/scripts-only commits on top of
+# 13fa1009 (the source-removal candidate).
+#   - 902a20ed docs: wire #1477 runbook to in-tree helpers
+#   - 47beb337 validation: add port-mirror PCAP fidelity checker
+#   - 36cecff2 validation: add SYN-cookie sub-gate driver
+#   - f5f1e33b validation: draft #1477 final-validation capstone runbook
+# All four are validation-tooling commits; none modify the dataplane,
+# loader, or any package whose binary is deployed to the cluster.
+# The xpfd, cli, and xpf-userspace-dp binaries hashed in
+# metadata/binary-sha256.txt are byte-equivalent to a build at 13fa1009.
+
+# Deployed binary hashes diverge from the local pre-deploy build because
+# the Makefile embeds -X main.buildTime=$(BUILD_TIME) (a wall-clock
+# timestamp) and the deploy script re-runs `make build` before pushing.
+# Both peers agree on the same set of hashes (fw0 == fw1), so the
+# cluster runs a single homogeneous build of the candidate commit:
+#   xpfd            560f99ad8cf7da9908de58e0ac43acdedf7ee87b4eedb50c441d03f252ee295f
+#   xpf-userspace-dp 975f6fe3e740fd24d79c7ff195ba1e7f78ebd8ae6f94ce6dfec604836a17a448
+#   cli             fdcb9717b19431452fe4d9219b4686e45504b764921598d0d0b360d22fbd72bf
+# xpf-userspace-dp and cli sources are unaffected by BUILD_TIME, so
+# their deployed hashes do match the local build (975f6fe3.../fdcb9717...).
+# xpfd is reproducible only modulo the embedded timestamp; the deploy
+# took place at the timestamp recorded above.
+#
+# xpfd has no --version flag (commit ID is embedded via -ldflags but
+# only exposed through `cli show system information` once the daemon is
+# running). The cli-side version readout is captured under
+# fallback-exclusion/*-userspace-dp.json (helper publishes its build).

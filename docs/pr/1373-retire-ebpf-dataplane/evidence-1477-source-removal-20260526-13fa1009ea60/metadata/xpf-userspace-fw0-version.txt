@@ -1,0 +1,12 @@
+flag provided but not defined: -version
+Usage of /usr/local/sbin/xpfd:
+  -api-addr string
+    	HTTP API listen address (empty to disable) (default "127.0.0.1:8080")
+  -config string
+    	configuration file path (default "/etc/xpf/xpf.conf")
+  -debug
+    	enable debug logging
+  -grpc-addr string
+    	gRPC API listen address (default "127.0.0.1:50051")
+  -no-dataplane
+    	run without a dataplane (config-only mode)

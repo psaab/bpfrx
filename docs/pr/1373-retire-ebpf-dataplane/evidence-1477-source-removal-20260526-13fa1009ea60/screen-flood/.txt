@@ -1,0 +1,5 @@
+Screen profile: pr1477-land
+  TCP LAND attack detection: enabled
+  Applied to zones: lan
+
+Total screen drops: 0

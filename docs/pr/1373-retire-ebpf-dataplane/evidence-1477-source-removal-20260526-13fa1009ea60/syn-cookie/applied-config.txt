@@ -1,0 +1,14 @@
+cli — connected to xpfd (uptime: 8s)
+Type '?' for help
+
+Entering configuration mode
+[edit]
+commit complete: 5 statement(s) changed (5 added, 0 removed)
+Exiting configuration mode
+cli — connected to xpfd (uptime: 3m0s)
+Type '?' for help
+
+Entering configuration mode
+[edit]
+commit complete: 7 statement(s) changed (4 added, 3 removed)
+Exiting configuration mode

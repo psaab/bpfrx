@@ -1,0 +1,19 @@
+# show security screen on xpf-userspace-fw1
+Screen profile: pr1477-sync
+  TCP SYN flood protection: attack-threshold 1
+  Applied to zones: lan
+
+Total screen drops: 430140
+
+# per-binding syn_cookie_* counters from /run/xpf/userspace-dp.json on xpf-userspace-fw1 (status.bindings[])
+syn_cookie_challenges=430140
+syn_cookie_secret_unavailable=0
+syn_cookie_syn_ack_sent=430140
+syn_cookie_ack_rst_sent=0
+syn_cookie_reply_budget_drops=0
+syn_cookie_ack_valid=0
+syn_cookie_ack_invalid=0
+syn_cookie_bypass=0
+
+# snapshot.syn_cookie_master_key on xpf-userspace-fw1
+master_key_present=True len=32

@@ -1,0 +1,72 @@
+## Static fallback-exclusion audit (post-#1476 / merge SHA 13fa1009)
+
+### Deleted legacy XDP program sources (must be absent)
+  absent (deleted by #1476): bpf/xdp/xdp_main.c
+  absent (deleted by #1476): bpf/xdp/xdp_conntrack.c
+  absent (deleted by #1476): bpf/xdp/xdp_forward.c
+  absent (deleted by #1476): bpf/xdp/xdp_nat.c
+  absent (deleted by #1476): bpf/xdp/xdp_nat64.c
+  absent (deleted by #1476): bpf/xdp/xdp_policy.c
+  absent (deleted by #1476): bpf/xdp/xdp_screen.c
+  absent (deleted by #1476): bpf/xdp/xdp_zone.c
+  absent (deleted by #1476): bpf/xdp/xdp_cpumap.c
+
+### Deleted legacy TC program sources (must be absent)
+  absent (deleted by #1476): bpf/tc/tc_main.c
+  absent (deleted by #1476): bpf/tc/tc_screen_egress.c
+  absent (deleted by #1476): bpf/tc/tc_conntrack.c
+  absent (deleted by #1476): bpf/tc/tc_nat.c
+  absent (deleted by #1476): bpf/tc/tc_forward.c
+
+### Retained-by-design (per CLAUDE.md): bpf/headers/*.h for Rust shim + parity tests
+-rw-rw-r-- 1 ps ps 30447 May 25 08:56 bpf/headers/xpf_common.h
+-rw-rw-r-- 1 ps ps  5664 May 25 08:56 bpf/headers/xpf_conntrack.h
+-rw-rw-r-- 1 ps ps 78255 May 25 08:56 bpf/headers/xpf_helpers.h
+-rw-rw-r-- 1 ps ps 28698 May 25 08:56 bpf/headers/xpf_maps.h
+-rw-rw-r-- 1 ps ps 17978 May 25 08:56 bpf/headers/xpf_nat.h
+-rw-rw-r-- 1 ps ps  5608 May 25 08:56 bpf/headers/xpf_trace.h
+
+### Generated bpf2go bindings (must be absent except sentinel canary)
+./pkg/dataplane/legacy_bpf_manifest_canary_test.go
+
+### xdp_main_prog references in live source (allowlist: retirement-boundary canaries + sentinels)
+pkg/dataplane/retirement_boundary_canary_test.go:565:		t.Fatalf("userspace link-cycle code must not reference legacy loader or xdp_main_prog controls: %v", violations)
+pkg/dataplane/retirement_boundary_canary_test.go:1069:	return &Manager{false, nil, "xdp_main_prog"}
+pkg/dataplane/retirement_boundary_canary_test.go:1073:			want: []string{"positional dataplane.Manager literal", "xdpEntryProg", "xdp_main_prog"},
+pkg/dataplane/retirement_boundary_canary_test.go:1090:	return managerAlias{false, nil, "xdp_main_prog"}
+pkg/dataplane/retirement_boundary_canary_test.go:1094:			want: []string{"positional dataplane.Manager literal", "xdpEntryProg", "xdp_main_prog"},
+pkg/dataplane/retirement_boundary_canary_test.go:1111:	return Manager(managerCopy{false, nil, "xdp_main_prog"})
+pkg/dataplane/retirement_boundary_canary_test.go:1115:			want: []string{"positional dataplane.Manager literal", "xdpEntryProg", "xdp_main_prog"},
+pkg/dataplane/retirement_boundary_canary_test.go:1130:	return []Manager{{false, nil, "xdp_main_prog"}}
+pkg/dataplane/retirement_boundary_canary_test.go:1134:			want: []string{"positional dataplane.Manager literal", "xdpEntryProg", "xdp_main_prog"},
+pkg/dataplane/retirement_boundary_canary_test.go:1149:	return [1]Manager{{false, nil, "xdp_main_prog"}}
+pkg/dataplane/retirement_boundary_canary_test.go:1153:			want: []string{"positional dataplane.Manager literal", "xdpEntryProg", "xdp_main_prog"},
+pkg/dataplane/retirement_boundary_canary_test.go:1168:	return map[string]Manager{"k": {false, nil, "xdp_main_prog"}}
+pkg/dataplane/retirement_boundary_canary_test.go:1172:			want: []string{"positional dataplane.Manager literal", "xdpEntryProg", "xdp_main_prog"},
+pkg/dataplane/retirement_boundary_canary_test.go:1394:	m.bpfShim.XDPEntryProg = "xdp_main_prog"
+pkg/dataplane/retirement_boundary_canary_test.go:1397:			want: []string{"assigns XDPEntryProg from", "xdp_main_prog"},
+pkg/dataplane/retirement_boundary_canary_test.go:1405:	userspaceXDPEntryProg := "xdp_main_prog"
+pkg/dataplane/retirement_boundary_canary_test.go:1463:	_ = m.bpfShim.SwapXDPEntryProg("xdp_main_prog")
+pkg/dataplane/retirement_boundary_canary_test.go:1466:			want: []string{"calls SwapXDPEntryProg with", "xdp_main_prog"},
+pkg/dataplane/retirement_boundary_canary_test.go:1474:	_ = (m.bpfShim.SwapXDPEntryProg)("xdp_main_prog")
+pkg/dataplane/retirement_boundary_canary_test.go:1477:			want: []string{"calls SwapXDPEntryProg with", "xdp_main_prog"},
+pkg/dataplane/retirement_boundary_canary_test.go:1485:	_ = ((*shim).SwapXDPEntryProg)(m.bpfShim, "xdp_main_prog")
+pkg/dataplane/retirement_boundary_canary_test.go:1488:			want: []string{"calls SwapXDPEntryProg with", "xdp_main_prog"},
+pkg/dataplane/retirement_boundary_canary_test.go:1496:	_ = m.bpfShim.SwapXDPEntryProg(` + "`xdp_main_prog`" + `)
+pkg/dataplane/retirement_boundary_canary_test.go:1499:			want: []string{"calls SwapXDPEntryProg with", "xdp_main_prog"},
+pkg/dataplane/retirement_boundary_canary_test.go:1507:	_ = ([]func(string) error{m.bpfShim.SwapXDPEntryProg})[0]("xdp_main_prog")
+pkg/dataplane/retirement_boundary_canary_test.go:1518:	_ = ((m.bpfShim.SwapXDPEntryProg))("xdp_main_prog")
+pkg/dataplane/retirement_boundary_canary_test.go:1521:			want: []string{"calls SwapXDPEntryProg with", "xdp_main_prog"},
+pkg/dataplane/userspace/shim_loader_boundary_test.go:73:		"xdp_main_prog",
+pkg/dataplane/loader.go:21:	defaultXDPEntryProg    = "xdp_main_prog"
+pkg/dataplane/userspace/manager.go:532:	// xdp_main_prog for unsupported capabilities or failed XSK liveness: the
+
+### Conclusion
+The legacy XDP and TC C source files listed above were deleted in #1476;
+bpf/headers/ remains because the retained Rust AF_XDP shim build and the
+userspace-dp parity tests still consume those structs (see CLAUDE.md Code
+Layout). All remaining xdp_main_prog references are retirement-boundary
+sentinels (pkg/dataplane/loader.go: defaultXDPEntryProg constant used by
+the retained Rust shim loader; shim_loader_boundary_test.go: canary that
+asserts the shim entry stays named xdp_main_prog; manager.go: log message
+referencing the historical name).

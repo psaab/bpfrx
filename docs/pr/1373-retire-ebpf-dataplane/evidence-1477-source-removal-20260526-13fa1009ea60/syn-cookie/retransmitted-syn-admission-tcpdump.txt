@@ -1,0 +1,1 @@
+see summary.md - retransmit-SYN sub-gate requires valid-ACK first (was not exercised in this harness)

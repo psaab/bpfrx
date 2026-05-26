@@ -1,0 +1,193 @@
+manifest.json missing required fields: commands
+manifest.json binaries[0] has unknown fields: name
+manifest.json binaries[0] missing required fields: host
+manifest.json binaries[0].host must be a non-empty string
+manifest.json binaries[1] has unknown fields: name
+manifest.json binaries[1] missing required fields: host
+manifest.json binaries[1].host must be a non-empty string
+manifest.json binaries[2] has unknown fields: name
+manifest.json binaries[2] missing required fields: host
+manifest.json binaries[2].host must be a non-empty string
+manifest.json commands must be a non-empty list
+missing required artifact: metadata/binary-sha256sums.txt
+summary.md missing required section: ## CoS-Off IPv4/IPv6 Push And Reverse
+summary.md missing required section: ## Screen/Flood Baseline
+summary.md missing required section: ## SYN-Cookie Proof
+summary.md missing required section: ## CoS 5200-5211 Sweeps
+summary.md missing required section: ## TCP Echo 6200-6211
+summary.md missing required section: ## HA Gates
+summary.md missing required section: ## Fallback Exclusion
+missing required artifact: screen-flood/land-before.txt
+syn-cookie/summary.md missing required section: ## Temporary Config
+syn-cookie/summary.md missing required section: ## SYN-ACK Challenge
+syn-cookie/summary.md missing required section: ## Valid ACK RST
+syn-cookie/summary.md missing required section: ## Random ACK Drop
+syn-cookie/summary.md missing required section: ## Retransmitted SYN Admission
+syn-cookie/summary.md missing required section: ## Reply Budget Accounting
+syn-cookie/summary.md missing required section: ## HA Failover Acceptance
+missing required artifact: syn-cookie/challenge-tcpdump.txt
+missing required artifact: cos-on-5200-5211-push/summary.tsv
+missing required artifact: cos-on-5200-5211-push/summary.md
+missing required artifact: cos-on-5200-5211-push/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-push/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-push/dataplane/counter-delta.json
+missing required artifact: cos-on-5200-5211-push/dataplane/journal-since.txt
+missing required artifact: cos-on-5200-5211-push/dataplane-summary.tsv
+missing required artifact: cos-on-5200-5211-push/equal-flow-summary.tsv
+missing required artifact: cos-on-5200-5211-push/q0-best-effort-root/wrapper.stdout
+missing required artifact: cos-on-5200-5211-push/q0-best-effort-root/wrapper.stderr
+missing required artifact: cos-on-5200-5211-push/q0-best-effort-root/samples/summary.json
+missing required artifact: cos-on-5200-5211-push/q0-best-effort-root/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-push/q0-best-effort-root/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-push/q0-best-effort-root/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-push/q1-iperf-100m/wrapper.stdout
+missing required artifact: cos-on-5200-5211-push/q1-iperf-100m/wrapper.stderr
+missing required artifact: cos-on-5200-5211-push/q1-iperf-100m/samples/summary.json
+missing required artifact: cos-on-5200-5211-push/q1-iperf-100m/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-push/q1-iperf-100m/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-push/q1-iperf-100m/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-push/q2-iperf-1g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-push/q2-iperf-1g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-push/q2-iperf-1g/samples/summary.json
+missing required artifact: cos-on-5200-5211-push/q2-iperf-1g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-push/q2-iperf-1g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-push/q2-iperf-1g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-push/q3-iperf-3g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-push/q3-iperf-3g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-push/q3-iperf-3g/samples/summary.json
+missing required artifact: cos-on-5200-5211-push/q3-iperf-3g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-push/q3-iperf-3g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-push/q3-iperf-3g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-push/q4-iperf-6g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-push/q4-iperf-6g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-push/q4-iperf-6g/samples/summary.json
+missing required artifact: cos-on-5200-5211-push/q4-iperf-6g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-push/q4-iperf-6g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-push/q4-iperf-6g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-push/q5-iperf-9g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-push/q5-iperf-9g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-push/q5-iperf-9g/samples/summary.json
+missing required artifact: cos-on-5200-5211-push/q5-iperf-9g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-push/q5-iperf-9g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-push/q5-iperf-9g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-push/q6-iperf-12g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-push/q6-iperf-12g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-push/q6-iperf-12g/samples/summary.json
+missing required artifact: cos-on-5200-5211-push/q6-iperf-12g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-push/q6-iperf-12g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-push/q6-iperf-12g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-push/q7-iperf-15g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-push/q7-iperf-15g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-push/q7-iperf-15g/samples/summary.json
+missing required artifact: cos-on-5200-5211-push/q7-iperf-15g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-push/q7-iperf-15g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-push/q7-iperf-15g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-push/q8-iperf-18g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-push/q8-iperf-18g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-push/q8-iperf-18g/samples/summary.json
+missing required artifact: cos-on-5200-5211-push/q8-iperf-18g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-push/q8-iperf-18g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-push/q8-iperf-18g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-push/q9-iperf-21g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-push/q9-iperf-21g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-push/q9-iperf-21g/samples/summary.json
+missing required artifact: cos-on-5200-5211-push/q9-iperf-21g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-push/q9-iperf-21g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-push/q9-iperf-21g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-push/q10-iperf-24g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-push/q10-iperf-24g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-push/q10-iperf-24g/samples/summary.json
+missing required artifact: cos-on-5200-5211-push/q10-iperf-24g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-push/q10-iperf-24g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-push/q10-iperf-24g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-push/q11-iperf-uncapped-root/wrapper.stdout
+missing required artifact: cos-on-5200-5211-push/q11-iperf-uncapped-root/wrapper.stderr
+missing required artifact: cos-on-5200-5211-push/q11-iperf-uncapped-root/samples/summary.json
+missing required artifact: cos-on-5200-5211-push/q11-iperf-uncapped-root/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-push/q11-iperf-uncapped-root/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-push/q11-iperf-uncapped-root/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-reverse/summary.tsv
+missing required artifact: cos-on-5200-5211-reverse/summary.md
+missing required artifact: cos-on-5200-5211-reverse/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-reverse/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-reverse/dataplane/counter-delta.json
+missing required artifact: cos-on-5200-5211-reverse/dataplane/journal-since.txt
+missing required artifact: cos-on-5200-5211-reverse/dataplane-summary.tsv
+missing required artifact: cos-on-5200-5211-reverse/equal-flow-summary.tsv
+missing required artifact: cos-on-5200-5211-reverse/q0-best-effort-root/wrapper.stdout
+missing required artifact: cos-on-5200-5211-reverse/q0-best-effort-root/wrapper.stderr
+missing required artifact: cos-on-5200-5211-reverse/q0-best-effort-root/samples/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q0-best-effort-root/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q0-best-effort-root/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-reverse/q0-best-effort-root/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-reverse/q1-iperf-100m/wrapper.stdout
+missing required artifact: cos-on-5200-5211-reverse/q1-iperf-100m/wrapper.stderr
+missing required artifact: cos-on-5200-5211-reverse/q1-iperf-100m/samples/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q1-iperf-100m/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q1-iperf-100m/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-reverse/q1-iperf-100m/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-reverse/q2-iperf-1g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-reverse/q2-iperf-1g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-reverse/q2-iperf-1g/samples/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q2-iperf-1g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q2-iperf-1g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-reverse/q2-iperf-1g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-reverse/q3-iperf-3g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-reverse/q3-iperf-3g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-reverse/q3-iperf-3g/samples/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q3-iperf-3g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q3-iperf-3g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-reverse/q3-iperf-3g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-reverse/q4-iperf-6g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-reverse/q4-iperf-6g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-reverse/q4-iperf-6g/samples/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q4-iperf-6g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q4-iperf-6g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-reverse/q4-iperf-6g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-reverse/q5-iperf-9g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-reverse/q5-iperf-9g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-reverse/q5-iperf-9g/samples/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q5-iperf-9g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q5-iperf-9g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-reverse/q5-iperf-9g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-reverse/q6-iperf-12g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-reverse/q6-iperf-12g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-reverse/q6-iperf-12g/samples/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q6-iperf-12g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q6-iperf-12g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-reverse/q6-iperf-12g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-reverse/q7-iperf-15g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-reverse/q7-iperf-15g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-reverse/q7-iperf-15g/samples/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q7-iperf-15g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q7-iperf-15g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-reverse/q7-iperf-15g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-reverse/q8-iperf-18g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-reverse/q8-iperf-18g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-reverse/q8-iperf-18g/samples/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q8-iperf-18g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q8-iperf-18g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-reverse/q8-iperf-18g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-reverse/q9-iperf-21g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-reverse/q9-iperf-21g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-reverse/q9-iperf-21g/samples/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q9-iperf-21g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q9-iperf-21g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-reverse/q9-iperf-21g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-reverse/q10-iperf-24g/wrapper.stdout
+missing required artifact: cos-on-5200-5211-reverse/q10-iperf-24g/wrapper.stderr
+missing required artifact: cos-on-5200-5211-reverse/q10-iperf-24g/samples/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q10-iperf-24g/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q10-iperf-24g/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-reverse/q10-iperf-24g/dataplane/status-after.json
+missing required artifact: cos-on-5200-5211-reverse/q11-iperf-uncapped-root/wrapper.stdout
+missing required artifact: cos-on-5200-5211-reverse/q11-iperf-uncapped-root/wrapper.stderr
+missing required artifact: cos-on-5200-5211-reverse/q11-iperf-uncapped-root/samples/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q11-iperf-uncapped-root/equal-flow/summary.json
+missing required artifact: cos-on-5200-5211-reverse/q11-iperf-uncapped-root/dataplane/status-before.json
+missing required artifact: cos-on-5200-5211-reverse/q11-iperf-uncapped-root/dataplane/status-after.json
+required artifact is empty: echo-6200-6211/6200.stdout
+artifact pattern has no non-empty files for HA failover dataplane stats: userspace-ha-failover/cycle*-failover-*-dp-stats.txt
+artifact pattern has no non-empty files for HA failback dataplane stats: userspace-ha-failover/cycle*-failback-*-dp-stats.txt
+artifact pattern has no non-empty files for HA failover dataplane interface stats: userspace-ha-failover/cycle*-failover-*-dp-interfaces.txt
+artifact pattern has no non-empty files for HA failback dataplane interface stats: userspace-ha-failover/cycle*-failback-*-dp-interfaces.txt

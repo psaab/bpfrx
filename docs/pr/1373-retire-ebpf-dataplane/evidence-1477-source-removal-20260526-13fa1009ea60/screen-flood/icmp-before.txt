@@ -1,0 +1,11 @@
+Screen profile: pr1477-icmp
+  ICMP flood protection: threshold 1
+  Applied to zones: lan
+
+Screen profile: pr1477-land
+  TCP LAND attack detection: enabled
+
+Screen profile: pr1477-syn
+  TCP SYN flood protection: attack-threshold 1
+
+Total screen drops: 41

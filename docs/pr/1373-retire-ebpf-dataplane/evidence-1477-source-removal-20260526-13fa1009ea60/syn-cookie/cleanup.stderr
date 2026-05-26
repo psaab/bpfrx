@@ -1,0 +1,6 @@
+error: rpc error: code = FailedPrecondition desc = node is not primary for RG0, configure on the primary node
+error: unknown command: delete
+error: unknown command: delete
+error: unknown command: delete
+error: unknown command: delete
+error: unknown command: commit

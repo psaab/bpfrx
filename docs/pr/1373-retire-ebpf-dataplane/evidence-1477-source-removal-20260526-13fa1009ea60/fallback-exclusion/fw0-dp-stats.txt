@@ -1,0 +1,130 @@
+Services Synchronized:
+    Service name                     Sent         Received
+    Session create                   83           0
+    Session close                    32           0
+    Config                           1            0
+    IPsec SA                         0            0
+    Bulk syncs                       1            1
+    Sessions installed                            0
+    Errors                           0            
+
+Userspace dataplane helper:
+  PID:                       298170
+  Helper mode:               rust-afxdp-bootstrap
+  io_uring active:           true
+  io_uring mode:             io_uring
+  Enabled:                   true
+  Forwarding armed:          true
+  Forwarding supported:      true
+  Workers:                   6
+  Ring entries:              16384
+  Last snapshot generation:  12
+  Last FIB generation:       1
+  Last snapshot age:         29.6s
+  Interface addresses:       41
+  Neighbor entries:          148
+  Session table entries:     295/786432
+  Flow cache capacity:       73728
+  Neighbor generation:       116
+  Route entries:             15
+  Local HA forwarding role:  active
+  HA groups:                 rg0 active=true watchdog=2292735; rg1 active=true watchdog=2292735; rg2 active=true watchdog=2292735; rg3 active=false watchdog=0; rg4 active=false watchdog=0; rg5 active=false watchdog=0; rg6 active=false watchdog=0; rg7 active=false watchdog=0; rg8 active=false watchdog=0; rg9 active=false watchdog=0; rg10 active=false watchdog=0; rg11 active=false watchdog=0; rg12 active=false watchdog=0; rg13 active=false watchdog=0; rg14 active=false watchdog=0; rg15 active=false watchdog=0
+  Fabric links:              fab0 parent=ge-0-0-0 peer=10.99.13.2
+  Degraded path counters:    ctrl_disabled=15 early_filter=1079 pass_to_kernel=1092 transit_drop=2
+  Last resolution:           missing_neighbor ingress-ifindex=6 egress-ifindex=5 next-hop=10.0.61.102 flow=172.16.80.200:6200->172.16.80.8:59654 zones=wan->lan
+  Bound bindings:            18/18
+  XSK-registered bindings:   18/18
+  Zerocopy bindings:         12/18
+  Shared UMEM bindings:      12/18
+  Armed queues:              6/6
+  Ready queues:              6/6
+  Armed bindings:            18/18
+  Ready bindings:            18/18
+  RX packets:                27145862
+  Validated packets:         27145862
+  Forward candidates:        27145845
+  Route misses:              0
+  Neighbor misses:           1
+  Exception packets:         0
+  Flow cache hits:           27144806
+  Flow cache misses:         8
+  Flow cache evictions:      0
+  Session hits:              996
+  Session misses:            60
+  Session creates:           83
+  Session expires:           117
+  Session delta pending:     0
+  Session delta generated:   57
+  Session delta dropped:     0
+  Session delta drained:     57
+  Event stream frames:       read=62 written=32 decode_errors=0 seq_gaps=0
+  Event stream producer:     sent=57 dropped=0
+  Event stream events:       policy_deny=0 screen_drop=0 filter_log=0 unknown_drops=0
+  Event stream drops:        policy_deny=0 screen_drop=0 filter_log=0
+  Policy denied packets:     0
+  Screen drops:              0
+  SNAT packets:              25906225
+  DNAT packets:              1239620
+  TX packets:                27145861
+  TX bytes:                  39399728399
+  TX errors:                 0
+  TX errors non-admission:   0
+  CoS queue drops lifetime:  0
+  CoS admission drops:       0
+  CoS flow-share drops:      0
+  CoS buffer drops:          0
+  CoS ECN marked:            0
+  TX shared recycle unk:     0
+  TX completions:            27145861
+  Mirrored packets:          0
+  Mirrored bytes:            0
+  Mirror drops:              no-frame=0 tx-frame-reserve=0 no-binding=0 queue-full=0 same-worker=0 cross-worker=0
+  Kernel RX dropped:         0
+  Kernel RX invalid descs:   0
+  Direct TX packets:         0
+  Copy-path TX packets:      22
+  In-place TX packets:       27145838
+  In-place VLAN push desc:   25906221
+  In-place VLAN pop desc:    1239617
+  In-place VLAN no-headroom: 0
+  In-place L2 memmove fb:    0
+  Direct TX no-frame fb:     0
+  Direct TX build-none fb:   0
+  Direct TX disallowed fb:   4
+  Pending fill frames:       0
+  Spare fill frames:         0
+  Free TX frames:            0
+  Pending TX prepared:       0
+  Pending TX local:          0
+  Outstanding TX:            0
+  In-flight recycles:        0
+  Slow path local-delivery:  32
+  Slow path missing-neigh:   1
+  Slow path no-route:        0
+  Slow path next-table:      0
+  Slow path forward-build:   4
+  Slow path active:          true
+  Slow path device:          xpf-usp0
+  Slow path mode:            io_uring
+  Slow path queued:          0
+  Slow path injected:        35 pkts / 3312 bytes
+  Slow path dropped:         0 pkts / 0 bytes
+  Slow path rate-limited:    0
+  Slow path queue-full:      0
+  Slow path write errors:    0
+  Slow path per-binding:     37 pkts / 0 drops
+  Recent exceptions:         6
+  Worker 0 heartbeat age:    17ms
+  Worker 1 heartbeat age:    16ms
+  Worker 2 heartbeat age:    16ms
+  Worker 3 heartbeat age:    17ms
+  Worker 4 heartbeat age:    16ms
+  Worker 5 heartbeat age:    16ms
+Worker runtime (cumulative since worker start; last column is rolling ~60s CPU window):
+  Worker TID      Active%  SpinIdle%  BlockIdle%  CPU%     CPU%60s  WorkLoops    IdleLoops   
+  0      298178   7.4      1.0      91.6       13.5     20.8     2034446      1784937     
+  1      298179   10.3     2.2      87.5       17.4     28.6     1318495      4266034     
+  2      298180   8.4      0.0      91.6       13.6     20.9     1346451      123524      
+  3      298181   6.3      3.9      89.8       15.3     24.2     1180540      7022890     
+  4      298182   9.7      2.0      88.3       16.6     27.1     1613344      3417229     
+  5      298183   7.6      4.4      88.0       17.1     27.9     2791093      8280818     
