@@ -27,7 +27,7 @@ the workers share.
 
 ## Where it sits
 
-- Above: `server/handlers.rs` calls into `Coordinator::*` for every
+- Above: `server/handlers/` modules call into `Coordinator::*` for every
   control-socket RPC.
 - Below: spawns and manages the per-worker poll loop in `worker/`.
 - Sideways: shares `BpfMaps` and `SharedCoSState` Arcs with workers.

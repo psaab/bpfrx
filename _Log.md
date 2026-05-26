@@ -3762,3 +3762,9 @@
 - **Timestamp**: 2026-05-26 17:45 UTC
 - **Action**: #1444 PR #1566 — rebase onto origin/master @ 838657aa (post-#1564 #1540 REST API split). Conflict in _Log.md auto-resolved (keep both #1540 + #1444 chronological entries). Canary + docs README auto-merged cleanly (#1540 + #1444 modified non-overlapping table sections). Re-run go build + go test post-rebase: clean.
 - **File(s)**: _Log.md (conflict resolution).
+
+## 2026-05-26 — #1345 server/handlers.rs per-verb split
+
+- **Timestamp**: 2026-05-26T17:00Z
+- **Action**: Split 415-LOC handle_stream dispatcher into per-verb modules
+- **File(s)**: userspace-dp/src/server/handlers.rs → handlers/mod.rs (181 LOC slim dispatcher) + 12 per-verb files (snapshot, forwarding, ha, neighbors, queue, binding, inject_packet, sync_session, session_deltas, export, rebind, stop_workers). Trivial arms (ping/status, update_fabrics, clear_policy_counters, shutdown, catch-all) stay inline in mod.rs. Pure code motion; zero new clones; byte-identical eprintln strings. cargo build clean, all tests pass except pre-existing master flake snat_contract_documents_current_fail_closed_runtime (confirmed on origin/master independent of this branch).
