@@ -23,7 +23,7 @@ returned PLAN-READY.
 **v3.1 response:** all three documentation precision fixes
 applied. triggerGARP description corrected (no-op/log hook, no
 goroutine), the lift-extraction now lists the exact three loops
-at cluster.go:1516-1541 with line counts, and the two stale
+at cluster.go:1516-1542 with line counts, and the two stale
 failover_batch.go mentions are corrected. No design changes.
 
 **Round 2 outcomes (preserved for audit):**
@@ -370,7 +370,7 @@ This is **pure code motion**. The rules:
    fixing, it is fixed in a follow-up PR.
    **Exception (v3, Codex r2):** ONE lift-extraction is permitted:
    the three back-to-back loops in `handlePeerHeartbeat` at
-   `cluster.go:1516-1541` are hoisted to a new method
+   `cluster.go:1516-1542` are hoisted to a new method
    `applyTransferCommitOverridesOnPeerStateLocked(newPeerGroups
    map[int]PeerGroupState, now time.Time)` owned by `failover.go`.
    The exact lifted block is:
