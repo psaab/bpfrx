@@ -1,7 +1,10 @@
 # #1356 — Split `bpf_map.rs` 204-LOC `publish_bpf_conntrack_entry` into per-address-family helpers
 
 **Status:** v2 — addresses Codex r1 PLAN-NEEDS-MAJOR + AGY r1 PLAN-NEEDS-MINOR.
-Pending Codex r2 + AGY r2 plan-review.
+Codex r2 returned PLAN-READY (provisional); AGY r2 retry returned PLAN-READY.
+Implementation shipped as commit c542c77b; Codex code-review MERGE-NEEDS-MINOR
+on plan/comment staleness against the implemented shape — addressed in commit
+4b23cdf4 and Copilot inline-comment delta (this commit).
 
 ## Round-1 disposition
 
@@ -376,9 +379,14 @@ resolution is identical pre/post split.
    `BpfSessionKey*` / `BpfSessionValueV*` structs (already true)
    and pass raw pointers to `libbpf_sys`. No `Box`, no `Vec`.
 
-10. **Helper visibility scoped to module.** `publish_v4_session`
-    and `publish_v6_session` are file-private (`fn`, not
-    `pub(super)`). Don't widen.
+10. **Helper visibility scoped to bpf_map.** `publish_v4_session`
+    and `publish_v6_session` are declared `pub(super)` in
+    `publish_conntrack.rs` so the parent `bpf_map/mod.rs`
+    orchestrator can call them. They are NOT re-exported further
+    and do NOT leak past the `bpf_map` module boundary. (v1
+    proposed file-private `fn`; v2 changed to `pub(super)` once
+    the orchestrator moved up to `mod.rs` and needed to call the
+    helpers from the parent.)
 
 ## Risk assessment
 
