@@ -210,10 +210,17 @@ PLAN-NEEDS-MINOR. Combined findings:
    the per-batch dispatch step). The per-family body is fully
    folded into the orchestrator's body, no register-spill bleed.
 
-   For `apply_rewrite_descriptor` (which has fewer callers — just
-   `poll_descriptor.rs:746` and is itself called per-batch not
-   per-packet inside the SIMD descriptor loop), the same
-   `#[inline(never)]` veto is applied. Same rationale.
+   For `apply_rewrite_descriptor` (which has exactly ONE caller
+   at `poll_descriptor.rs:746` inside the per-packet SIMD
+   descriptor loop), the v4/v5 attribute is **standard
+   `#[inline]`** (not `#[inline(never)]`). With one caller,
+   transitive duplication is mathematically impossible; the
+   standard `#[inline]` hint lets LLVM perform inter-procedural
+   register allocation across the per-packet loop. The standalone
+   symbol may therefore have 0 or 1 definitions in the linked
+   binary (LLVM may inline fully). Both are acceptable; > 1 is a
+   failure. (Superseded the v3 same-rationale text per AGY r3
+   §3-A.)
 
    The codegen verification step is (v4-adjusted): ZERO `nm
    -C` definitions of per-family helpers
@@ -664,9 +671,12 @@ pub(in crate::afxdp::frame) fn apply_rewrite_descriptor_ipv6(
 }
 ```
 
-(`byte_writes` is already `mod byte_writes;` at `frame/mod.rs:3`
-— v4 needs to promote it to `pub(super) mod byte_writes;` to be
-reachable from descendants of `frame/rewrite/`.)
+(`byte_writes` is `mod byte_writes;` at `frame/mod.rs:3`.
+Promote to `pub(super) mod byte_writes;` ONLY IF the compiler
+complains about descendants of `frame/rewrite/` being unable to
+reach it. Per the contingency-visibility rule (§Visibility
+upgrades), start with no changes and let cargo build surface
+which upgrades are actually required.)
 
 ### Visibility upgrades in `frame/mod.rs` (v4 — conditional)
 
@@ -962,10 +972,12 @@ pub(super) fn build_forwarded_frame_into(
     )
 }
 
-// Same shape for build_forwarded_frame_from_frame (mod.rs:191)
-// — see the body in the existing file. v5 only inserts the
-// `let meta = meta.into();` before invoking the
-// concrete-typed orchestrator.
+// build_forwarded_frame_from_frame (mod.rs:191..215) ALREADY
+// performs `let meta = meta.into();` today at mod.rs:199 and
+// reuses the concrete `meta` for the GRE encap path at
+// mod.rs:212. No source change to this wrapper — its existing
+// concrete-typed forwarding to the orchestrator already meets
+// the v4/v5 concrete-meta contract. Listed here for symmetry.
 
 // frame/rewrite/mod.rs (orchestrator) — unchanged
 pub(in crate::afxdp) fn apply_rewrite_descriptor(
