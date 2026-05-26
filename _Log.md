@@ -111,6 +111,13 @@
 - **22:05 UTC 2026-05-26** — 5/5 flake check on `afxdp::cos::queue_service::*` post-rebase (49 tests pass each iteration).
 - **22:05 UTC 2026-05-26** — force-pushed rebased branch; new HEAD 90e97b29994a.
 - **22:06 UTC 2026-05-26** — posted re-attestation marker on PR #1585 with prior 4-of-4 carry-forward (delta is _Log.md-only).
+## 2026-05-26 — #1355 cos_queue_push_front split kicked off
+
+- **Timestamp**: 2026-05-26 20:14 UTC
+- **Action**: Worktree off origin/master; plan v1 drafted at
+  docs/pr/1355-cos-push-split/plan.md; reviewer-ids tracker created.
+- **File(s)**: docs/pr/1355-cos-push-split/plan.md,
+  docs/pr/1355-cos-push-split/reviewer-ids.md
 
 ## 2026-05-26 — #1325 implementation pushed
 
