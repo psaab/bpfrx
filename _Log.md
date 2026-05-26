@@ -314,6 +314,43 @@
       fallback). Kept the other three context-struct fns. Final
       shape documented in `plan.md` "Rollback execution" section.
 
+## 2026-05-26 — #1541 cluster manager split (pure code-motion + lift)
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Split pkg/cluster/cluster.go (2429 LOC, 77 *Manager
+    methods) into cohesive sibling .go files in package cluster per
+    Wave-2 sibling-file rule (NOT sub-packages, NOT cluster_*.go
+    prefix). Three plan-review rounds with Codex + Gemini before
+    code touched; one v3.1 doc-precision round (Codex r3
+    PLAN-NEEDS-MINOR resolved; Gemini r3 PLAN-READY; Codex r4
+    BLOCKED-INFRA both attempts — proceeded per r3 acceptance
+    criteria already met by v3.1 since v3.1 is documentation-only).
+  - **Files (new)**: pkg/cluster/manager.go (slim lifecycle entry,
+    Manager struct, types, NewManager, Start/Stop/sendEvent),
+    heartbeat_manager.go (StartHeartbeat/StopHeartbeat/RestartHeartbeat/
+    buildHeartbeat/handlePeerHeartbeat/handlePeerTimeout/handlePeerNeverSeen/
+    HeartbeatStats), failover.go (single-RG + batch + transfer-commit
+    *Locked helpers + new applyTransferCommitOverridesOnPeerStateLocked
+    lift-extraction), status.go (all Format* methods), peer_state.go,
+    group_state.go, hooks.go, sync_state.go, readiness.go,
+    events_log.go.
+  - **Files (changed)**: election.go (gained electSingleNode +
+    SetMonitorWeight + recalcWeight), garp.go (gained triggerGARP
+    — verbatim move of the slog.Info no-op/log hook).
+  - **Files (deleted)**: cluster.go, failover_batch.go (folded into
+    failover.go per Gemini r2 — single locking domain).
+  - **Methods preserved**: 64 *Manager exported methods package-wide,
+    all signatures identical. One new private helper
+    applyTransferCommitOverridesOnPeerStateLocked introduced by the
+    plan's ONE allowed lift-extraction (Codex r2 fix). Helper body
+    is the three back-to-back loops at cluster.go:1516-1542 lifted
+    byte-for-byte; only the enclosing function changes.
+  - **Test results**: go build ./... clean; go vet ./pkg/cluster/...
+    clean; go test ./pkg/cluster/... 5/5 passes; full Go suite passes
+    (all packages, no failures).
+  - **Plan doc**: docs/pr/1541-cluster-mgr-split/plan.md (v3.1).
+  - **Reviewer task IDs**: docs/pr/1541-cluster-mgr-split/reviewer-ids.md.
+
 ## 2026-05-26 — #1476 Phase B AWAITING-MERGE at f815c357
 
 - **Timestamp**: 2026-05-26T (r3 reviewers converged, posting marker)
