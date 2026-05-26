@@ -139,7 +139,7 @@ test module enforces the coupling at the file level.
 ```
 userspace-dp/src/filter/engine.rs         (DELETED)
 userspace-dp/src/filter/engine/mod.rs     (NEW — re-export hub, no behavior)
-userspace-dp/src/filter/engine/r#match.rs (NEW — term_matches family)
+userspace-dp/src/filter/engine/matching.rs (NEW — term_matches family)
 userspace-dp/src/filter/engine/eval.rs    (NEW — filter evaluation,
                                                  input + output, non-tx)
 userspace-dp/src/filter/engine/tx_selection.rs   (NEW — tx_selection runtime)
@@ -230,18 +230,17 @@ through `mod.rs`):
 //! Per-packet filter evaluation engine. Split into responsibility-scoped
 //! submodules by #1546.
 
-use super::*;  // brings FilterState, Filter, FilterTerm, FilterResult,
-               // TxSelectionFilterResult, CachedTxSelectionFilterResult,
-               // FilterRoutingInstanceResult, FilterLogMatch,
-               // CachedThreeColorPolicers, ThreeColorPolicerRuntime,
-               // PacketColor, ThreeColorPolicerAction, record_filter_counter,
-               // FilterAction, std::net::*, Arc, etc.
+// Submodules import shared types via `use super::super::*;` from their own
+// file (filter/mod.rs re-exports the relevant snapshot/runtime types).
+// engine/mod.rs itself is a re-export hub with no `use super::*;` — the
+// `pub(crate) use` lines below name each re-exported symbol explicitly so
+// `cargo public-api` and rustdoc tooling do not have to walk a glob.
 
-mod matching;
-mod eval;
-mod tx_selection;
 mod cache_sensitive;
+mod eval;
+mod matching;
 mod policer;
+mod tx_selection;
 
 // Re-export the same surface engine.rs exposed.
 pub(crate) use eval::{
@@ -277,10 +276,12 @@ pub(crate) use policer::{
 };
 ```
 
-The shared imports (`use super::*`) bring every type each submodule
-needs because `filter/mod.rs` already re-exports the relevant symbols
-into the `filter::` namespace. Each submodule then does `use super::*`
-inside its own file to inherit them transitively.
+Each submodule (`engine/matching.rs`, `engine/eval.rs`, etc.) imports
+shared types from the parent `filter` module via `use super::super::*;`
+at its file head, since `filter/mod.rs` already re-exports the
+relevant snapshot/runtime symbols into the `filter::` namespace.
+`engine/mod.rs` does NOT do `use super::*;` — it is a pure re-export
+hub.
 
 ### Visibility model
 
@@ -404,7 +405,7 @@ above is the union of every existing `pub(crate) fn` in engine.rs.
 | Class                                    | Severity | Why |
 |------------------------------------------|----------|-----|
 | Behavioral regression                    | LOW      | Pure code motion; bodies byte-identical; tests unchanged. |
-| Lifetime / borrow-checker                | LOW      | Single `'a` already module-local; submodules inherit `use super::*` only. |
+| Lifetime / borrow-checker                | LOW      | Single `'a` already module-local; submodules import shared types via `use super::super::*;` only. |
 | Performance regression                   | LOW-MED  | Cross-module `#[inline]` is preserved by rustc within a crate; L1-i locality concern flagged in invariant 6 — needs reviewer attack. |
 | Architectural mismatch (#961 / #946 P2)  | LOW      | Issue explicitly requests this shape; no novel architecture; structural extraction along a boundary the codebase has been moving toward in #1325, #1326, #1327, #1328, #1342, #1356, #1444. |
 
