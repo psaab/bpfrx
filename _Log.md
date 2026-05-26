@@ -1,5 +1,29 @@
 # Action Log
 
+## 2026-05-26
+
+- **Timestamp**: 2026-05-26T02:50:00Z
+  - **Action**: #1539 PR #1553 — rebased onto origin/master (5
+    PRs ahead, including #1556 multierror refactor). Conflict
+    on `_Log.md` resolved via /tmp/log-merge.py (union of HEAD
+    + incoming on each conflict region). Conflict on
+    `pkg/config/compiler.go` auto-resolved by git's 3-way merge;
+    semantically verified by inspection: Option A's nil clear at
+    L281-294 now sits AFTER (a) `validateDataplaneTypeStrict`
+    (fail-fast on retired DPDK) AND (b) the new `errors.Join`
+    multierror accumulator added by #1556, so it only runs on
+    the full success path. Codex round-5 MERGE-READY (session
+    019e5fa*), AGY round-5 adversarial-review-mpm18y6x-ii447j
+    MERGE-READY. Formal copilot-pull-request-reviewer re-ran on
+    new HEAD 4d24d592 and flagged 3 LOW-priority items: (a)
+    unused `dpdkSubtreeLeakageCanaryScanRoots` declaration —
+    removed; (b) redundant `if cfg != nil` guard around Option
+    A's nil clear (cfg is always non-nil in compileExpanded) —
+    guard removed, comment updated; (c) truncated _Log entry
+    at line 766 ending with bare "Added" — completed.
+  - **File(s)**: pkg/config/compiler.go,
+    pkg/config/dpdk_subtree_leakage_canary_test.go, _Log.md
+
 ## 2026-05-25
 
 - **Timestamp**: 2026-05-25T19:30:00Z
@@ -771,6 +795,115 @@
     PLAN-KILL grounds.
   - **File(s)**: `docs/pr/1538-multierror-validation/plan.md`,
     `_Log.md`
+- **Timestamp**: 2026-05-25T15:15:18Z
+  - **Action**: #1539 Copilot follow-up on PR #1553. Tightened
+    `pkg/config/dpdk_subtree_leakage_canary_test.go` so a
+    `DPDKDataplane` selector or helper pass-through at package
+    scope is reported immediately instead of being skipped when
+    no enclosing `FuncDecl` exists. Added
+    `TestDPDKSubtreeLeakageCanary_NegativeRejectsPackageScopeInitializer`
+    with `negativePackageScopeInitializerFixture` covering both a
+    package-scope read and a package-scope helper pass-through.
+    Closing-sentence truncation flagged in a later Copilot pass
+    is restored here (the previous trailing "Added" was an
+    artifact of an over-aggressive _Log.md rebase-union helper).
+  - **File(s)**: pkg/config/dpdk_subtree_leakage_canary_test.go,
+    _Log.md
+
+- **Timestamp**: 2026-05-25T16:25:00Z
+  - **Action**: #1539 Copilot round-3 finding addressed. After
+    HEAD f90125b3 + docs commit 4a1c8726, Copilot's re-review
+    re-anchored the original 4 findings to the new SHA (all
+    already addressed) but issued ONE new finding (15:22:25Z,
+    inline at line 112 of the new tree): the
+    `dpdkSubtreeLeakageCanaryExcludeDirs["dpdk"]` bare-dirname
+    skip would silently hide a future `pkg/config/dpdk/...`
+    sub-directory — exactly the leakage class the canary is
+    supposed to catch. Fixed: the exclusion map now uses
+    paths RELATIVE to the walk root (computed via `filepath.Rel`
+    + `filepath.ToSlash`), and the v3 default is empty since
+    the production scan root is `pkg/config/` only and there
+    is no `pkg/config/dpdk/` today. Future canary scope
+    extensions add explicit relative paths (e.g.
+    `pkg/dataplane/dpdk`).
+  - **File(s)**: pkg/config/dpdk_subtree_leakage_canary_test.go,
+    _Log.md
+- **Timestamp**: 2026-05-25T16:00:00Z
+  - **Action**: #1539 Copilot findings on PR #1553 — 5 valid
+    findings on HEAD 12237f12 addressed across two commits
+    (Copilot SWE bot fixed findings 1/5 + I rebased on top
+    with findings 2/3/4). (1+5) package-scope init bypass:
+    SelectorExpr and CallExpr branches treated `fn == nil`
+    as silent skip — `var leaked = cfg.System.DPDKDataplane`
+    at file scope escaped the canary; both fixed by treating
+    nil enclosing FuncDecl as an automatic finding with
+    distinct `package-scope read/passthrough of ...` why
+    text. New
+    `TestDPDKSubtreeLeakageCanary_NegativeRejectsPackageScopeInitializer`
+    exercises both kinds.
+    (2) RepoRoot inconsistency: `dpdkSubtreeLeakageCanaryRepoRoot
+    = ".."` then joined with "config" was confusing; replaced
+    with `dpdkSubtreeLeakageCanaryProductionScanRoot = "."`.
+    (3) Allowlist key drift: comment said "strip leading ../"
+    but code didn't. Replaced with proper `filepath.Rel(root,
+    path)` normalization so future allowlist keys are
+    package-relative regardless of walk root.
+    (4) Duplicate "Plan v1" header in reviewer-ids.md removed.
+    All 11 canary tests pass; 5x flake-clean; full pkg/config
+    suite green.
+  - **File(s)**: pkg/config/dpdk_subtree_leakage_canary_test.go,
+    _Log.md
+    docs/pr/1539-ast-leakage-guard/reviewer-ids.md, _Log.md
+- **Timestamp**: 2026-05-25T15:50:00Z
+  - **Action**: #1539 code-review on PR #1553 + lint fix
+    (commit 6a7d0649). Codex MERGE-READY directly on 8c5a4ced
+    (session 019e5fa4 continued). AGY initially MERGE-WITH-MAJOR
+    flagging HIGH (multi-LHS bypass: `dummy, sys.DPDKDataplane
+    = nil, &cfg{}` would escape canary because original isLHSOfAssignToNil
+    checked "any RHS nil" not positional pairing) + MEDIUM
+    (hand-rolled itoa OOB for >=12 digits, MinInt negation
+    overflow). My local lint pass on the file produced the same
+    positional-LHS fix AGY recommended; committed as 6a7d0649
+    with the new TestDPDKSubtreeLeakageCanary_NegativeRejects
+    MultiVariableBypass test fixture. AGY final verdict MERGE-READY.
+    Both reviewers now MERGE-READY on 6a7d0649. Hand-rolled itoa
+    swapped for strconv.Itoa. All 10 canary tests pass; full
+    `go test ./...` clean.
+  - **File(s)**: pkg/config/dpdk_subtree_leakage_canary_test.go,
+    docs/pr/1539-ast-leakage-guard/reviewer-ids.md, _Log.md
+- **Timestamp**: 2026-05-25T15:25:00Z
+  - **Action**: #1539 implementation — Option A + Option B per
+    plan v3. Option A: `cfg.System.DPDKDataplane = nil` clear at
+    end of `compileExpanded` after `validateDataplaneTypeStrict`
+    succeeds and before `return cfg, nil`. Option B: new
+    pkg/config/dpdk_subtree_leakage_canary_test.go (~600 LOC
+    including ~200 LOC walker + fixtures + 9 tests). Canary uses
+    parent-stack maintained via ast.Inspect nil-callback
+    semantics, walks parent chain to enclosing FuncDecl (AGY
+    round-2 MEDIUM nested-conditional fix), recognizes IfStmt
+    `==` gates and switch single-entry case-clause gates (AGY
+    round-2 HIGH multi-case fix), and rejects negation idiom
+    (Codex round-2 contradictory-paragraph fix). LHS-of-assign-
+    to-nil is recognized so Option A's clear is not flagged.
+    Real-repo scan returns zero findings; 5x flake-clean on
+    named tests; `go test ./...` passes across all 30 packages.
+  - **File(s)**: pkg/config/compiler.go,
+    pkg/config/dpdk_subtree_leakage_canary_test.go, _Log.md
+- **Timestamp**: 2026-05-25T14:50:00Z
+  - **Action**: #1539 plan v3 — applied round-2 plan review
+    feedback. Codex round-2 PLAN-MINOR (session
+    019e5fa4-0552-7823-915d-79eaf79b1c55), AGY round-2 PLAN-MINOR
+    (adversarial-review-mplbulo0-y014py). Window-of-value KILL
+    no longer operative on both sides. v3 changes: section 4.2
+    walks parent chain to FuncDecl (AGY MEDIUM nested-conditional
+    fix); SwitchStmt CaseClause requires `len(List)==1` (AGY HIGH
+    multi-case bypass fix); negation idiom explicitly rejected
+    (Codex contradictory-paragraph fix); two new fixtures
+    (positive nested, negative multi-case, negative negation);
+    stale #1536 stacking text corrected — #1536 merged at
+    fcd53beb. Reviewer-IDs file updated.
+  - **File(s)**: docs/pr/1539-ast-leakage-guard/plan.md,
+    docs/pr/1539-ast-leakage-guard/reviewer-ids.md
 
 - **Timestamp**: 2026-05-25T05:00:00Z
   - **Action**: #1501 A2 — replaced the stale TODO + contradictory
@@ -826,120 +959,6 @@
     (the README wording fix is the only file outside `docs/`).
     No `.go` / `.rs` / `.c` source, no build inputs, no test
     fixtures modified.
-
-- **Timestamp**: 2026-05-25T09:45:00Z
-  - **Action**: PR #1532 — address Copilot review on 510fe7dd
-    (7 nits). Copilot caught a contradiction between the godoc /
-    plan / log claims (generics + type aliases "deferred") and the
-    actual catch-all sweep behaviour (those ARE caught when the
-    selector is spelled literally). True deferred bypasses are
-    only those where the selector vanishes from the AST: transitive
-    alias use, import renames, dot imports, external-package
-    wrappers. Updated godoc on the test func, on
-    findLegacyDataPlaneOffenders, on isLegacyDataPlaneType, and on
-    the *ast.ArrayType slice branch comment. Also added a
-    receiverTypeName helper so funcDeclName includes the receiver
-    on methods ("(*S).Foo parameter is dataplane.DataPlane")
-    addressing Copilot's ambiguity concern, with a new
-    method-receiver-named-in-offender test subcase to lock the
-    behaviour. plan.md got the same scope-clarification + the
-    stale "~80 LOC" claim updated to ~615 LOC.
-  - **File(s)**:
-    `pkg/conntrack/legacy_dataplane_canary_test.go`,
-    `docs/pr/1515-conntrack-gc-canary/plan.md`, `_Log.md`
-  - **Validation**: `go test ./pkg/conntrack -count=1 -race` green
-    (34 subcases now); new method-receiver test fixture asserts
-    "(*S).Foo parameter is dataplane.DataPlane" produced.
-
-- **Timestamp**: 2026-05-25T09:15:00Z
-  - **Action**: PR #1532 round-N — close all AGY-flagged bypass
-    vectors via two-pass walker. AGY KILL verdict on 78b8a38a
-    identified 5 trivial-bypass categories not in the documented
-    deferred list: package-level var, local var, closure param,
-    composite literal, type definition. Codex high finding also
-    flagged `[N]T` fixed array as undocumented. Fix:
-    (a) refactored the AST walker into a shared
-    `findLegacyDataPlaneOffenders(file, name)` helper invoked by
-    both the main canary AND the synthetic tests — addresses Codex
-    "tautological test" finding.
-    (b) added `*ast.ArrayType` arm (Len != nil for fixed arrays) to
-    `isLegacyDataPlaneType` — catches `[N]dataplane.DataPlane`.
-    (c) added pass-2 catch-all selector sweep that walks every
-    `*ast.SelectorExpr` and flags any `dataplane.DataPlane` not
-    already attributed by the structural pass. Closes
-    package-level var, local var, closure, composite literal, type
-    def, AND the previously #1548-deferred compound shapes (`[]T`,
-    `map[K]T`, `chan T`, `func(T)`). Tracked via token.Pos in a
-    structuralHits set so the sweep doesn't double-report.
-    (d) updated godoc scope block to reflect the two-pass design.
-    Remaining #1548-deferred bypasses all share one property: the
-    `dataplane.DataPlane` selector disappears from the AST —
-    transitive alias use (`var x DPAlias` after the alias decl),
-    import renames (`dp.DataPlane`), dot imports (bare `DataPlane`
-    ident), and external-package wrapper types. Generic
-    constraints/instantiations are NOT deferred — the sweep
-    catches them because they still spell the selector literally.
-
-    New tests (33 total subcases): `TestLegacyDataPlaneTypeMatcher`
-    9 cases including new fixed-array + slice-deferred;
-    `TestProductionWalkerCatchesCanaryShapes` 12 structural-pass
-    fixtures parsed via `parser.ParseFile`;
-    `TestProductionWalkerIgnoresUnrelatedTypes` confirms
-    dataplane.SessionStore/Telemetry/Sessions/context.Context don't
-    trip the sweep; new
-    `TestProductionWalkerCatchAllSweepClosesAGYBypasses` 9 cases
-    proving every AGY-flagged bypass + compound type IS now caught.
-
-  - **File(s)**:
-    `pkg/conntrack/legacy_dataplane_canary_test.go`,
-    `docs/pr/1515-conntrack-gc-canary/plan.md`, `_Log.md`
-  - **Validation**: `go test ./pkg/conntrack -count=1 -race` green
-    (33 new subcases pass);
-    `grep -rn 'dataplane\.DataPlane' pkg/conntrack/*.go` finds
-    only the canary test file itself, confirming production tree
-    still clean.
-
-- **Timestamp**: 2026-05-25T08:30:00Z
-  - **Action**: PR #1532 round — address Copilot review on 77baa235.
-    Copilot flagged that `method.Type` is `*ast.FuncType` and that
-    `isLegacyDataPlaneType(method.Type)` could never detect interface
-    method param/result. The existing code at lines 102-132 already
-    type-switches on `*ast.FuncType` and extracts `mt.Params` and
-    `mt.Results` correctly — Copilot misread the implementation. To
-    refute the finding with code-level evidence, added
-    `TestLegacyDataPlaneTypeMatcher` and
-    `TestInterfaceMethodCanaryScansFuncTypeParamsAndResults`
-    subtests that build synthetic ASTs and confirm the walker fires
-    on (a) direct param, (b) pointer param, (c) variadic, (d)
-    paren-wrapped, (e) result; and that it ignores a clean
-    interface. Also addressed Copilot's plan-vs-implementation
-    wording mismatches in
-    `docs/pr/1515-conntrack-gc-canary/plan.md` (scope is all
-    FuncDecls not exported-only; matcher is
-    `isLegacyDataPlaneType()` not `exprString()`).
-  - **File(s)**:
-    `pkg/conntrack/legacy_dataplane_canary_test.go`,
-    `docs/pr/1515-conntrack-gc-canary/plan.md`, `_Log.md`
-  - **Validation**: `go test ./pkg/conntrack -run
-    TestConntrackHasNoLegacyDataPlaneDependency -count=1 -race`
-    green; new subtests assert the interface-method scan against
-    synthetic AST fixtures.
-
-- **Timestamp**: 2026-05-25T01:30:00Z
-  - **Action**: #1515 (#1451 S8) — add regression canary that fences
-    `pkg/conntrack` production code against future re-introduction of
-    `dataplane.DataPlane` as a parameter, result, struct field, or
-    interface method. Mirrors the AST canary pattern from
-    `pkg/dataplane/userspace/manager_coupling_test.go`. Confirmed
-    canary fires by hand-flipping a dummy `func _canaryNegativeTest(dp
-    dataplane.DataPlane) {}` into the package (revert verified clean).
-    No production code change; the conntrack GC is already migrated
-    to `RuntimeDomainProvider`.
-  - **File(s)**: `pkg/conntrack/legacy_dataplane_canary_test.go`
-    (new), `docs/pr/1515-conntrack-gc-canary/plan.md` (new), `_Log.md`
-  - **Validation**: `go test ./pkg/conntrack/ -count=1 -race` green;
-    `go vet ./pkg/conntrack/...` clean; negative-case hand-flip
-    confirms canary fires.
 
 ## 2026-05-24
 
@@ -1212,8 +1231,6 @@
     clean (114 warnings, all pre-existing); `cargo test --release
     --bin xpf-userspace-dp afxdp::wg` — 78/78 pass; `go test
     ./pkg/dataplane/...` — 4/4 packages pass.
-
-## 2026-05-24
 
 - **Timestamp**: 2026-05-24T23:30:00Z
   - **Action**: PR #1499 r-final-5 step 4 — final mechanical sweep
@@ -2898,74 +2915,6 @@
   - **Validation**: cargo build --release; cargo test --release --bin
     xpf-userspace-dp afxdp::wg.
 
-- **Timestamp**: 2026-05-25T06:35Z
-  - **Action**: PR #1532 — document known canary bypass vectors per AGY
-    review; file #1548 hardening follow-up.
-  - **File(s)**: `pkg/conntrack/legacy_dataplane_canary_test.go`
-  - **Why**: AGY adversarial review
-    (`adversarial-review-mpktubut-ogkp1e`) flagged five categories of
-    bypass the current AST walker doesn't catch (compound types,
-    generics, type aliases, import renames, anonymous-struct context).
-    The canary as shipped catches the most common naive-reintroduction
-    mode (direct param/result/field/embed/interface-method of
-    dataplane.DataPlane), which is the realistic regression risk.
-    Hardening for the bypasses is tracked in #1548 (substantial work
-    needing go/types-level import resolution). Comment block updated to
-    make the scope explicit so a future reader doesn't mistake this for
-    an exhaustive fence.
-  - **Validation**:
-    `TestConntrackHasNoLegacyDataPlaneDependency` still passes on the
-    current `pkg/conntrack/` production tree.
-
-- **Timestamp**: 2026-05-25T06:47Z
-  - **Action**: PR #1532 follow-up — fix interface method signature
-    traversal in the conntrack legacy dataplane canary and normalize
-    malformed `_Log.md` list formatting flagged by review.
-  - **File(s)**: `pkg/conntrack/legacy_dataplane_canary_test.go`,
-    `_Log.md`
-  - **Validation**: `go test ./pkg/conntrack/ -count=1 -race`; `go vet
-    ./pkg/conntrack/...`.
-
-- **Timestamp**: 2026-05-25T07:55Z
-  - **Action**: PR #1532 — close Codex MINOR (ellipsis + paren bypasses)
-  - **File(s)**: pkg/conntrack/legacy_dataplane_canary_test.go
-  - **Why**: Codex task-mpktubkn-r9llzq flagged `...dataplane.DataPlane`
-    (variadic params, *ast.Ellipsis) and `(dataplane.DataPlane)`
-    (paren-wrapped, *ast.ParenExpr) as bypass vectors. Both are common Go
-    AST disguises that the prior matcher missed. Added two case arms to
-    isLegacyDataPlaneType to recursively unwrap each.
-  - **Validation**: canary still passes on current pkg/conntrack/
-    production tree.
-
-- **Timestamp**: 2026-05-25T05:58Z
-  - **Action**: PR #1536 — add ErrDPDKDataplaneRetired sentinel +
-    errors.Is test (AGY round-N feedback)
-  - **File(s)**: pkg/config/compiler.go, pkg/config/parser_ast_test.go
-- **Why**: Antigravity adversarial-review-mpksjr0e-f3mjrn flagged the lack of a
-  structured sentinel error as an API design gap. External consumers (gRPC
-  orchestration, REST wrappers, CLI tooling) cannot programmatically match
-  the DPDK retirement reject without substring-searching the error text.
-  Adding `var ErrDPDKDataplaneRetired = errors.New(...)` and returning it
-  from validateDataplaneTypeStrict preserves the verbatim message contract
-  (existing tests still pass via strings.Contains) and adds programmatic
-  matching via errors.Is. Mirrors the runtime-side
-  dataplane.ErrDPDKBackendRetired sentinel introduced by #1527 / PR #1535.
-- **Validation**: TestDPDKConfigCompileRejects extended with errors.Is
-  assertion; full pkg/config + pkg/configstore suites green.
-- **Timestamp**: 2026-05-25T05:41:23Z
-  - **Action**: Review fix (#1529) — inline DPDK annotation pass on
-    `docs/feature-gaps.md`. The initial sweep used a blanket header
-    note to cover all table rows, but several "Done" status cells still
-    contained present-tense DPDK language that implies the backend is
-    an active target. Fixed inline: line 169 (Twice NAT — "across eBPF,
-    DPDK, and userspace"), line 173 (Port Randomization — "XDP and DPDK
-    SNAT allocators"), lines 203/205 (TCP No-SYN-Check / TCP RST —
-    "eBPF + DPDK"), line 315 (Dual Fabric — "DPDK still lacks...parity"),
-    line 326 (Policer), line 327 (Three-Color Policer), line 407 (system
-    caps listing "DPDK config"), line 442 (policer tier list), line 516
-    (policer section). No source code changed; pure doc fixes.
-  - **File(s)**: `docs/feature-gaps.md`, `_Log.md`
-  - **Validation**: `go test ./pkg/dataplane/... -run 'TestRetirementBoundary|TestLegacyBPF' -count=1`
 - **Timestamp**: 2026-05-25T06:20Z
 - **Action**: Harmonize ErrDPDKBackendRetired + slog.Warn wording with config sentinel (AGY #1536 review finding)
 - **File(s)**: pkg/dataplane/dataplane.go, pkg/daemon/daemon_run.go
