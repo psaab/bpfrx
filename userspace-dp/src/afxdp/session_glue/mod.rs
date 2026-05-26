@@ -719,15 +719,15 @@ pub(super) fn apply_worker_commands(
                 }
             }
             WorkerCommand::UpsertLocal(entry) => {
-                sessions.install_with_protocol_with_origin(SessionInstall {
-                    key: entry.key,
-                    decision: entry.decision,
-                    metadata: entry.metadata,
-                    origin: entry.origin,
+                sessions.install_with_protocol_with_origin(
+                    entry.key,
+                    entry.decision,
+                    entry.metadata,
+                    entry.origin,
                     now_ns,
-                    protocol: entry.protocol,
-                    tcp_flags: entry.tcp_flags,
-                });
+                    entry.protocol,
+                    entry.tcp_flags,
+                );
             }
             WorkerCommand::DeleteSynced(key) => {
                 let delete_alias = sessions.lookup(&key, now_ns, 0);

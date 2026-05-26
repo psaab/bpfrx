@@ -838,15 +838,15 @@ pub(super) fn poll_binding_process_descriptor(
                                         .take()
                                         .map(PendingForwardFrame::Owned)
                                         .unwrap_or(PendingForwardFrame::Live);
-                                    if sessions.install_with_protocol_with_origin(SessionInstall {
-                                        key: flow.forward_key.clone(),
-                                        decision: fabric_return_decision,
-                                        metadata: fabric_return_metadata,
-                                        origin: SessionOrigin::ReverseFlow,
+                                    if sessions.install_with_protocol_with_origin(
+                                        flow.forward_key.clone(),
+                                        fabric_return_decision,
+                                        fabric_return_metadata,
+                                        SessionOrigin::ReverseFlow,
                                         now_ns,
-                                        protocol: meta.protocol,
-                                        tcp_flags: meta.tcp_flags,
-                                    }) {
+                                        meta.protocol,
+                                        meta.tcp_flags,
+                                    ) {
                                         let _ = publish_live_session_entry(
                                             binding.bpf_maps.session_map_fd,
                                             &flow.forward_key,
@@ -1546,15 +1546,13 @@ pub(super) fn poll_binding_process_descriptor(
                                         };
                                         let forward_installed = track_in_userspace
                                             && sessions.install_with_protocol_with_origin(
-                                                SessionInstall {
-                                                    key: flow.forward_key.clone(),
-                                                    decision,
-                                                    metadata: forward_metadata.clone(),
-                                                    origin: SessionOrigin::ForwardFlow,
-                                                    now_ns,
-                                                    protocol: meta.protocol,
-                                                    tcp_flags: meta.tcp_flags,
-                                                },
+                                                flow.forward_key.clone(),
+                                                decision,
+                                                forward_metadata.clone(),
+                                                SessionOrigin::ForwardFlow,
+                                                now_ns,
+                                                meta.protocol,
+                                                meta.tcp_flags,
                                             );
                                         if forward_installed {
                                             created += 1;
@@ -1698,15 +1696,13 @@ pub(super) fn poll_binding_process_descriptor(
                                         if track_in_userspace
                                             && install_local_reverse
                                             && sessions.install_with_protocol_with_origin(
-                                                SessionInstall {
-                                                    key: reverse_key.clone(),
-                                                    decision: reverse_decision,
-                                                    metadata: reverse_metadata.clone(),
-                                                    origin: SessionOrigin::ReverseFlow,
-                                                    now_ns,
-                                                    protocol: meta.protocol,
-                                                    tcp_flags: meta.tcp_flags,
-                                                },
+                                                reverse_key.clone(),
+                                                reverse_decision,
+                                                reverse_metadata.clone(),
+                                                SessionOrigin::ReverseFlow,
+                                                now_ns,
+                                                meta.protocol,
+                                                meta.tcp_flags,
                                             )
                                         {
                                             let _ = publish_live_session_key(
@@ -2477,15 +2473,15 @@ pub(super) fn poll_binding_process_descriptor(
                                         pending_decision,
                                     );
                                     let pending_installed =
-                                        sessions.install_with_protocol_with_origin(SessionInstall {
-                                            key: flow.forward_key.clone(),
-                                            decision: pending_decision,
-                                            metadata: sess_meta.clone(),
-                                            origin: SessionOrigin::MissingNeighborSeed,
+                                        sessions.install_with_protocol_with_origin(
+                                            flow.forward_key.clone(),
+                                            pending_decision,
+                                            sess_meta.clone(),
+                                            SessionOrigin::MissingNeighborSeed,
                                             now_ns,
-                                            protocol: meta.protocol,
-                                            tcp_flags: meta.tcp_flags,
-                                        });
+                                            meta.protocol,
+                                            meta.tcp_flags,
+                                        );
                                     if pending_installed {
                                         let entry = SyncedSessionEntry {
                                             key: flow.forward_key.clone(),

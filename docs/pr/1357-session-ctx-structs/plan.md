@@ -1,6 +1,6 @@
 # #1357 — collapse 9-param session pub fns into context structs
 
-**Status:** DRAFT v3 — addressing Codex round-2 PLAN-NEEDS-MAJOR + Gemini round-2 PLAN-NEEDS-MINOR
+**Status:** v3.1 + rollback (install_with_protocol_with_origin reverted to positional per Codex/Gemini code-review round-1 unanimous MERGE-NEEDS-MAJOR — see "Rollback execution" section at the bottom).
 
 ## Review history
 
@@ -396,3 +396,68 @@ it.
    deliberate scope choice. Adding a `SessionUpsertOpts { install,
    allow_replace_local }` wrapper would reintroduce the v1
    embedding pattern Codex round-1 PLAN-KILLed.
+
+## Rollback execution (post-code-review)
+
+Codex and Gemini code-review round-1 both returned MERGE-NEEDS-MAJOR
+unanimously on the same single finding: the >10% standalone-fn
+codegen rollback criterion from plan v3 was triggered for
+`install_with_protocol_with_origin` (274 → 357 insns, +30%) and
+Gemini correctly noted that the 7 non-inlined production callers
+pay the +83-insn destructure-prelude cost per invocation on the
+session-install hot path. The plan committed to this gate and the
+gate fired.
+
+**Action taken (commit pending):** reverted
+`install_with_protocol_with_origin` to its original 8-positional-arg
+signature; reverted all 8 production call sites and ~30 test call
+sites for that fn back to positional. Kept the three other fns
+(`upsert_synced_with_origin`, `update_session`,
+`promote_synced_with_origin`) with the context-struct API.
+
+**Final shipped API:**
+
+```rust
+pub fn install_with_protocol_with_origin(
+    &mut self,
+    key: SessionKey,
+    decision: SessionDecision,
+    metadata: SessionMetadata,
+    origin: SessionOrigin,
+    now_ns: u64,
+    protocol: u8,
+    tcp_flags: u8,
+) -> bool;  // POSITIONAL (unchanged from master)
+
+pub fn upsert_synced_with_origin(&mut self, req: SessionInstall, allow_replace_local: bool) -> bool;  // #[inline]
+pub fn update_session(&mut self, req: SessionUpdate<'_>, ha_activation: bool) -> bool;  // #[inline]
+pub fn promote_synced_with_origin(&mut self, req: SessionUpdate<'_>) -> bool;  // #[inline], body: self.update_session(req, false)
+```
+
+`SessionInstall` is still used (by `upsert_synced_with_origin` and
+its single `upsert_synced` wrapper); only `install_with_protocol`'s
+wrapper now constructs `(key, decision, metadata, ForwardFlow,
+now_ns, protocol, tcp_flags)` positionally again.
+
+**Post-rollback codegen** (re-measured against origin/master cold
+build):
+
+| Fn | master insns | shipped insns | delta |
+|---|---|---|---|
+| `install_with_protocol_with_origin` | 274 | 275 | +1 (+0.4%) |
+| `upsert_synced_with_origin` | 255 | 278 | +23 (+9.0%) |
+| `update_session` | inlined | inlined | n/a |
+| `promote_synced_with_origin` | inlined | inlined | n/a |
+
+All four under the 10% gate. Total binary +21 KB (5559256 →
+5580008) — a tiny static regression compensated by zero hot-path
+latency change on `install_with_protocol_with_origin`.
+
+Migration churn revised post-rollback: roughly 2 production + 5
+test call sites (the 3 remaining refactored fns:
+upsert_synced_with_origin at 2 prod + 0 test direct calls,
+update_session at 0 prod + 0 test direct calls — all via wrappers,
+promote_synced_with_origin at 1 prod + 4 test). Plus the
+`session/mod.rs` internal wrapper bodies. The original ~45-site
+churn was dominated by `install_with_protocol_with_origin` (~37 of
+them).

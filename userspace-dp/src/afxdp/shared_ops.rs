@@ -590,15 +590,15 @@ pub(super) fn install_reverse_session_from_forward_match(
         now_secs,
         ha_startup_grace_until_secs,
     );
-    if sessions.install_with_protocol_with_origin(SessionInstall {
-        key: reverse_key.clone(),
-        decision: reverse.decision,
-        metadata: reverse.metadata.clone(),
-        origin: SessionOrigin::ReverseFlow,
+    if sessions.install_with_protocol_with_origin(
+        reverse_key.clone(),
+        reverse.decision,
+        reverse.metadata.clone(),
+        SessionOrigin::ReverseFlow,
         now_ns,
         protocol,
         tcp_flags,
-    }) {
+    ) {
         let _ = publish_live_session_entry(session_map_fd, reverse_key, reverse.decision.nat, true);
         let reverse_entry = SyncedSessionEntry {
             key: reverse_key.clone(),

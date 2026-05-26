@@ -291,25 +291,28 @@
     `userspace-dp/src/afxdp/tests.rs`,
     `userspace-dp/src/afxdp/session_glue/tests.rs`,
     `userspace-dp/src/afxdp/forwarding/tests.rs`.
-  - **Validation**:
+  - **Validation (after rollback per code-review)**:
     - `cargo build` clean (production code).
     - `cargo test --release` 1487 pass / 1 fail. The single
       failure is `snat_contract_doc_guard` which is a pre-existing
       master regression (verified by building origin/master cold:
-      same test fails on master; the gaps doc writes "fail closed"
-      but the assertion wants "fail-closed"). Not introduced by
-      this change.
+      same test fails on master). Not introduced by this change.
     - 5/5 flake check on `session::tests` passed.
     - Go suite green (`go test ./...` all `ok`).
-    - **Codegen sanity**: binary size delta = **-660 KB** (5559256 →
-      4899856 bytes); the standalone copy of
-      `install_with_protocol_with_origin` grew 30% (274 → 357 insns)
-      because of the struct destructuring prelude, but the
-      whole-program inlining win dominates and the function is still
-      called from exactly 7 sites in both binaries (no new calls
-      escaped inlining). Plan's >10%-rollback criterion was triggered
-      narrowly on the standalone copy alone; holistic outcome is a
-      net codegen improvement so no rollback.
+    - **Codegen sanity post-rollback**: binary +21 KB (5559256 →
+      5580008). Per-fn instruction counts: install +0.4%, upsert
+      +9.0%, update+promote fully inlined. All under the 10% gate.
+    - **Code-review rollback rationale**: round-1 Codex and Gemini
+      both returned MERGE-NEEDS-MAJOR with the same single finding:
+      the v3.1 plan's >10% rollback gate was triggered narrowly
+      for `install_with_protocol_with_origin` (274 → 357 insns,
+      +30%). Initial implementation tried to ship anyway citing
+      total binary shrink as a holistic win, but Gemini correctly
+      pointed out the 7 non-inlined callers pay the +83-insn
+      destructure prelude per invocation on the session-install
+      hot path. Reverted that fn to positional (originally planned
+      fallback). Kept the other three context-struct fns. Final
+      shape documented in `plan.md` "Rollback execution" section.
 
 ## 2026-05-26 — #1476 Phase B AWAITING-MERGE at f815c357
 

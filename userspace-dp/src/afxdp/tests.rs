@@ -3331,15 +3331,15 @@ fn poll_descriptor_session_hit_rechecks_dscp_input_filter() {
         is_reverse: false,
         nat64_reverse: None,
     };
-    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
-        key: flow_key.clone(),
+    assert!(sessions.install_with_protocol_with_origin(
+        flow_key.clone(),
         decision,
         metadata,
-        origin: SessionOrigin::ForwardFlow,
-        now_ns: 123_000_000_000,
-        protocol: PROTO_TCP,
-        tcp_flags: 0x10,
-    }));
+        SessionOrigin::ForwardFlow,
+        123_000_000_000,
+        PROTO_TCP,
+        0x10,
+    ));
     assert_eq!(sessions.drain_deltas(16).len(), 1, "initial open delta");
     let mut screen = ScreenState::new();
     let mut batch = BatchCounters::default();
@@ -3711,15 +3711,15 @@ fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
         is_reverse: false,
         nat64_reverse: None,
     };
-    assert!(sessions.install_with_protocol_with_origin(SessionInstall {
-        key: flow_key.clone(),
-        decision: local_decision,
-        metadata: local_metadata.clone(),
-        origin: SessionOrigin::LocalMiss,
-        now_ns: 123_000_000_000,
-        protocol: PROTO_TCP,
-        tcp_flags: TCP_FLAG_SYN,
-    }));
+    assert!(sessions.install_with_protocol_with_origin(
+        flow_key.clone(),
+        local_decision,
+        local_metadata.clone(),
+        SessionOrigin::LocalMiss,
+        123_000_000_000,
+        PROTO_TCP,
+        TCP_FLAG_SYN,
+    ));
     let shared_entry = SyncedSessionEntry {
         key: flow_key.clone(),
         decision: local_decision,

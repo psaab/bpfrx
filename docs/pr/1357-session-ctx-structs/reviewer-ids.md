@@ -18,3 +18,9 @@
 ## Plan v3.1 (commit af6f581b) — IMPLEMENT
 
 Codex round-3 explicitly said "Remaining issues are accounting/doc precision, not design blockers" and the architecture is sound. v3.1 addresses all three precision points. Gemini round-3 said PLAN-READY. Proceeding to implementation per standing rule: "Both PLAN-READY (or NEEDS-MINOR with all minor fixed) → proceed".
+
+## Code review (PR #1576, head f76e2615)
+
+- Codex: `task-mpn092f3-7r11qk`
+- Gemini: `task-mpn09i0t-g0nbkc`
+- Copilot: requested via `gh pr edit --add-reviewer Copilot` + `@copilot review` comment

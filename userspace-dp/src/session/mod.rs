@@ -635,28 +635,34 @@ impl SessionTable {
         protocol: u8,
         tcp_flags: u8,
     ) -> bool {
-        self.install_with_protocol_with_origin(SessionInstall {
+        self.install_with_protocol_with_origin(
             key,
             decision,
             metadata,
-            origin: SessionOrigin::ForwardFlow,
+            SessionOrigin::ForwardFlow,
             now_ns,
             protocol,
             tcp_flags,
-        })
+        )
     }
 
-    #[inline]
-    pub fn install_with_protocol_with_origin(&mut self, req: SessionInstall) -> bool {
-        let SessionInstall {
-            key,
-            decision,
-            metadata,
-            origin,
-            now_ns,
-            protocol,
-            tcp_flags,
-        } = req;
+    // NOTE: this fn stays positional (NOT context-struct) per the
+    // #1357 plan v3.1 rollback criterion. Empirical codegen showed
+    // the struct destructuring prelude added ~30% standalone-copy
+    // instructions (274 -> 357), exceeding the plan's 10% gate. The
+    // 7 non-inlined production callers (forwarding, poll_descriptor,
+    // session_glue, shared_ops) are on the session-install hot path
+    // and cannot absorb that overhead.
+    pub fn install_with_protocol_with_origin(
+        &mut self,
+        key: SessionKey,
+        decision: SessionDecision,
+        metadata: SessionMetadata,
+        origin: SessionOrigin,
+        now_ns: u64,
+        protocol: u8,
+        tcp_flags: u8,
+    ) -> bool {
         if self.len() >= self.max_sessions {
             self.create_drops = self.create_drops.saturating_add(1);
             return false;
