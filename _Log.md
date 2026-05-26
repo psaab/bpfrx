@@ -65,6 +65,10 @@
 - **20:16 UTC 2026-05-26** — worktree created at refactor/1331-submit-cos-batch-per-variant off origin/master (63dfe02a)
 - **20:16 UTC 2026-05-26** — wrote `docs/pr/1331-submit-cos-batch-per-variant/plan.md` (DRAFT v1)
 - **20:16 UTC 2026-05-26** — wrote `docs/pr/1331-submit-cos-batch-per-variant/reviewer-ids.md` stub
+- **20:18 UTC 2026-05-26** — dispatched plan v1 round-1: Codex task-mpn2uc3f-bfc18j, Gemini task-mpn2v4xq-m9fqna, AGY review-mpn2vgin-13r8jz
+- **20:20 UTC 2026-05-26** — AGY round-1 PLAN-NEEDS-MAJOR (drop submit/ subdir, single-file extract)
+- **20:21 UTC 2026-05-26** — Codex round-1 PLAN-NEEDS-MAJOR (Local sidecar mirror_clone prefix invariant false; existing defect); Gemini PLAN-NEEDS-MINOR (drop submit/ subdir)
+- **20:22 UTC 2026-05-26** — wrote plan v2: flat-sibling layout (`submit_local.rs` + `submit_prepared.rs` under queue_service/), documented mirror_clone defect carry-over, no visibility bumps
 
 ## 2026-05-26 — #1325 implementation pushed
 

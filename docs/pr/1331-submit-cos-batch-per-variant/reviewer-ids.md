@@ -6,4 +6,4 @@ session state is lost (per `feedback_codex_session_loss_continuation`).
 
 | Round | Codex task-id | AGY task-id | Gemini task-id | Notes |
 |---|---|---|---|---|
-| PLAN v1 | _pending_ | _pending_ | _pending_ | |
+| PLAN v1 | task-mpn2uc3f-bfc18j | review-mpn2vgin-13r8jz | task-mpn2v4xq-m9fqna | dispatched 20:18 UTC 2026-05-26 |

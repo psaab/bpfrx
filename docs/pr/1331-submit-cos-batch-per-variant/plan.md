@@ -1,6 +1,53 @@
 # #1331 Step 1: extract 221-LOC `submit_cos_batch()` into per-variant handlers
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** DRAFT v2 — flat-sibling layout per round-1 reviewer findings (AGY PLAN-NEEDS-MAJOR, Codex PLAN-NEEDS-MAJOR, Gemini PLAN-NEEDS-MINOR, Claude SMR PLAN-READY-pending-revision). Round-1 task IDs in `reviewer-ids.md`.
+
+## Round-1 review findings folded into v2
+
+1. **AGY PLAN-NEEDS-MAJOR / Gemini PLAN-NEEDS-MINOR — drop the `submit/`
+   subdirectory.** Both reviewers (independently) flagged that fanning out
+   into a nested `submit/` directory with three files is overkill for a
+   1536-LOC parent module that's well below the 2000-LOC smell threshold.
+   The user's standing rule for this issue mandates flat sibling files
+   inside `queue_service/`, NOT a `submit/` subdir. v2 picks
+   `queue_service/submit_local.rs` and `queue_service/submit_prepared.rs`
+   as flat siblings of the existing `drain.rs` / `service.rs` /
+   `tests.rs`.
+
+2. **Codex PLAN-NEEDS-MAJOR — Local sidecar prefix invariant is false.**
+   `transmit_batch` (userspace-dp/src/afxdp/tx/transmit.rs:96-109) pops
+   from `pending`, can skip `mirror_clone` items under
+   `MIRROR_TX_FRAME_RESERVE` and `continue`. The successful sent prefix
+   is therefore a prefix of `scratch_local_tx`, **not** a prefix of the
+   original `items`. The existing sidecar at mod.rs:1256
+   `&sidecar[..packets as usize]` was built from
+   `items.iter().take(TX_BATCH_SIZE)` — so if a mirror_clone is dropped
+   ahead of a sent packet, the sidecar accounts the wrong original
+   item's bucket. This is an **existing accounting defect**, not
+   introduced by this refactor. v2 documents it as an explicit
+   carry-over hazard with a deferred-fix follow-up note, and the
+   extraction preserves the buggy-but-stable behavior verbatim.
+
+3. **Codex MINOR — shim path/visibility & assign_prepared_dscp_rewrite
+   visibility.** With flat-sibling layout the module path becomes
+   `submit_local::submit_local(...)` / `submit_prepared::submit_prepared(...)`,
+   no submodule re-export needed. Child modules can reach private
+   helpers in the parent via `super::`, so
+   `assign_prepared_dscp_rewrite` stays `fn` (private) — the visibility
+   bump in v1 was unnecessary. `restore_cos_{local,prepared}_items`
+   still move into their owning child since they have one caller each.
+
+4. **Claude SMR (in-conversation, hostile) — #1561 race surface
+   unchanged.** The null-deref crash is at the outer `CoSBatch` Self
+   pointer (`%rbx == NULL`), which can only happen when `CoSBatch` is
+   held behind an Arc whose inner pointer was published torn. The
+   `submit_cos_batch` consumer takes `CoSBatch` by value (the upstream
+   Arc has already been resolved). The refactor adds at most one extra
+   memcpy of the destructured `items: VecDeque<...>` header bytes when
+   moving caller→callee; that memcpy reads the same bytes the inline
+   match arm reads, so the race observability is identical.
+
+**Status of v1:** DRAFT v1 — superseded by v2.
 
 ## Issue framing
 
@@ -72,31 +119,36 @@ granularity, not throughput.
   Extraction preserves that symmetry by giving each variant its own
   file with the sidecar literal copied verbatim.
 
-## Concrete design
+## Concrete design (v2 — flat siblings)
 
 ### New file layout
 
 ```
 userspace-dp/src/afxdp/cos/queue_service/
-  mod.rs                  (existing)  — match shim only after extract
-  drain.rs                (existing)
-  service.rs              (existing)
-  tests.rs                (existing)
-  submit/
-    mod.rs                NEW — `pub(super) use` re-exports of the
-                          two per-variant handlers; no other code.
-    local.rs              NEW — `submit_local()` extracted verbatim
-                          from `submit_cos_batch`'s `CoSBatch::Local`
-                          arm.
-    prepared.rs           NEW — `submit_prepared()` extracted verbatim
-                          from `submit_cos_batch`'s `CoSBatch::Prepared`
-                          arm.
+  mod.rs              (existing)  — submit_cos_batch becomes a thin
+                                    match shim only.
+  drain.rs            (existing)
+  service.rs          (existing)
+  tests.rs            (existing)
+  submit_local.rs     NEW — pub(super) #[inline] fn submit_local(...),
+                            extracted verbatim from the
+                            CoSBatch::Local arm. Owns
+                            restore_cos_local_items (moved from mod.rs)
+                            as a private fn.
+  submit_prepared.rs  NEW — pub(super) #[inline] fn submit_prepared(...),
+                            extracted verbatim from the
+                            CoSBatch::Prepared arm. Owns
+                            restore_cos_prepared_items (moved from
+                            mod.rs) as a private fn.
 ```
+
+Same fan-out level as `drain.rs` / `service.rs`. No new directory. No
+`submit/mod.rs` re-export layer.
 
 ### Signatures
 
 ```rust
-// queue_service/submit/local.rs
+// queue_service/submit_local.rs
 #[inline]
 pub(super) fn submit_local(
     binding: &mut BindingWorker,
@@ -107,9 +159,9 @@ pub(super) fn submit_local(
     mut items: VecDeque<TxRequest>,
     now_ns: u64,
     shared_recycles: &mut Vec<(u32, u64)>,
-) -> bool { /* body verbatim from L1198-L1296 */ }
+) -> bool { /* body verbatim from mod.rs L1198-L1296 */ }
 
-// queue_service/submit/prepared.rs
+// queue_service/submit_prepared.rs
 #[inline]
 pub(super) fn submit_prepared(
     binding: &mut BindingWorker,
@@ -120,13 +172,22 @@ pub(super) fn submit_prepared(
     mut items: VecDeque<PreparedTxRequest>,
     now_ns: u64,
     shared_recycles: &mut Vec<(u32, u64)>,
-) -> bool { /* body verbatim from L1304-L1402 */ }
+) -> bool { /* body verbatim from mod.rs L1304-L1402 */ }
 ```
 
 The destructuring-by-value `mut items: VecDeque<...>` parameter
 preserves the ownership shape — the match arm moved `items` out of the
 batch, so the extracted fn owns it equivalently. `phase`, `batch_bytes`,
 `queue_idx` are `Copy`.
+
+### mod.rs additions (flat-sibling mod decls)
+
+```rust
+mod submit_local;
+mod submit_prepared;
+use submit_local::submit_local;
+use submit_prepared::submit_prepared;
+```
 
 ### mod.rs shim after extract
 
@@ -140,12 +201,12 @@ fn submit_cos_batch(
 ) -> bool {
     match batch {
         CoSBatch::Local { queue_idx, phase, batch_bytes, items } =>
-            submit::local::submit_local(
+            submit_local(
                 binding, root_ifindex, queue_idx, phase,
                 batch_bytes, items, now_ns, shared_recycles,
             ),
         CoSBatch::Prepared { queue_idx, phase, batch_bytes, items } =>
-            submit::prepared::submit_prepared(
+            submit_prepared(
                 binding, root_ifindex, queue_idx, phase,
                 batch_bytes, items, now_ns, shared_recycles,
             ),
@@ -157,42 +218,44 @@ fn submit_cos_batch(
 
 Each submodule needs:
 - `BindingWorker` from `crate::afxdp::worker`
-- `TxRequest` / `PreparedTxRequest` / `CoSPendingTxItem` from `crate::afxdp::types`
+- `TxRequest` / `PreparedTxRequest` from `crate::afxdp::types`
 - `TX_BATCH_SIZE` from `crate::afxdp`
 - `Ordering` from `std::sync::atomic`
 - `VecDeque` from `std::collections`
-- Hot-path helpers from `super::super`:
-  - `CoSServicePhase`, `apply_cos_send_result` / `apply_cos_prepared_result`,
-    `refresh_cos_interface_activity`, `restore_cos_local_items_inner` /
-    `restore_cos_prepared_items_inner`
-  - `cos_queue_dscp_rewrite`, `transmit_batch` / `transmit_prepared_queue`,
-    `TxError`
-  - `assign_local_dscp_rewrite` (already `pub(in crate::afxdp)`) /
-    `assign_prepared_dscp_rewrite` (currently `fn` — needs to become
-    `pub(super) fn`, otherwise visibility-shadowed by the move)
-  - `cos_flow_bucket_index`, `account_flow_bucket_tx`,
-    `cos_batch_tx_made_progress`
-  - `restore_cos_local_items`, `restore_cos_prepared_items` — currently
-    private `fn` at mod.rs L1488/L1511. Either:
-    (a) bump both to `pub(super) fn` so the new submodules can call them, OR
-    (b) move both helpers into the matching `submit/{local,prepared}.rs`
-        since each is only called from inside one extracted arm.
-    **Plan picks (b)** — restore helpers are tightly coupled to the
-    restore-on-error path and have no other caller. Moving them keeps the
-    submit module self-contained.
+- Hot-path helpers reached via `super::` (private parent access from
+  a child module is allowed in Rust; no visibility bumps needed):
+  - `super::CoSServicePhase`, `super::apply_cos_send_result` /
+    `super::apply_cos_prepared_result`,
+    `super::refresh_cos_interface_activity`,
+    `super::restore_cos_local_items_inner` /
+    `super::restore_cos_prepared_items_inner`
+  - `super::cos_queue_dscp_rewrite`, `super::transmit_batch` /
+    `super::transmit_prepared_queue`, `super::TxError`
+  - `super::assign_local_dscp_rewrite` (already
+    `pub(in crate::afxdp)`) — used by `submit_local`.
+  - `super::assign_prepared_dscp_rewrite` (stays private `fn` in mod.rs;
+    reachable from the child via `super::` per Rust's parent-access
+    rule). v1's `pub(super)` bump dropped per Codex finding #3.
+  - `super::cos_batch_tx_made_progress` (already
+    `pub(in crate::afxdp)`).
+  - `super::fairness::account_flow_bucket_tx`,
+    `super::flow_hash::cos_flow_bucket_index`.
 
-### Visibility adjustments required
+`restore_cos_local_items` / `restore_cos_prepared_items` **move**
+into their owning submodule as private `fn`s (each had exactly one
+caller — both call sites inside its own variant arm). The
+`*_inner` companions stay in `super` (they're used by other call
+chains).
 
-- `assign_prepared_dscp_rewrite`: `fn` → `pub(super) fn` (kept in mod.rs
-  because it's narrow and used only by `submit::prepared`).
-- `restore_cos_local_items`, `restore_cos_prepared_items`: **moved** into
-  `submit/local.rs` and `submit/prepared.rs` respectively as private
-  `fn`s within their owning submodule.
-- `cos_batch_tx_made_progress`: already `pub(in crate::afxdp)`, no change.
-- `account_flow_bucket_tx`: already imported via `super::fairness`,
-  re-imported in each submodule via `crate::afxdp::cos::fairness::...`.
-- `cos_flow_bucket_index`: already imported via `super::flow_hash`,
-  re-imported per submodule.
+### Visibility adjustments required (v2)
+
+- **None.** All extracted-fn callees stay at their current visibility.
+  Children read private parent items via `super::`.
+- `submit_local` / `submit_prepared` themselves are `pub(super) fn`
+  so the parent mod.rs can name them in the shim's `use` decls.
+- `restore_cos_local_items` / `restore_cos_prepared_items` move
+  into their owning child as private `fn`s (no visibility change since
+  the file boundary moves with the helper).
 
 ## Public API preservation
 
@@ -255,14 +318,38 @@ Each submodule needs:
    - Plan is hostile-validated against this in the open-questions
      section below.
 
-7. **`stamp_submits` / `transmit_batch` interior contract.** The
-   transmit fns may mutate `items` in place (consume the successful
-   prefix). The sidecar slice `&sidecar[..packets as usize]` indexes
-   into the **original** order. Since `transmit_batch` returns
-   `packets` as the count of items consumed from the head, and
-   `items.iter().take(TX_BATCH_SIZE)` walks in the same head-first
-   order at sidecar build time, the slice indexing is correct. Move is
-   verbatim so this holds.
+7. **`transmit_batch` / `transmit_prepared_queue` interior contract
+   (v2 correction per Codex MAJOR finding).**
+
+   - **Prepared path:** `transmit_prepared_queue` is prefix-preserving
+     on success — sent packets are a head-prefix of `items`. The
+     sidecar `&sidecar[..packets as usize]` indexes correctly into the
+     original order. ✓
+   - **Local path:** `transmit_batch` (transmit.rs:96-109) pops from
+     `pending` and can drop `mirror_clone` items under
+     `MIRROR_TX_FRAME_RESERVE` via `continue;`. The successful sent
+     count `packets` is a count of `scratch_local_tx` entries, **not**
+     a head-prefix of the original `items`. If a mirror_clone is
+     dropped ahead of a sent packet, the sidecar at mod.rs:1256
+     attributes that packet's bytes to the wrong original item's flow
+     bucket. **This is an existing accounting defect that pre-dates
+     this refactor** (added when the mirror-clone reserve was wired
+     in). The verbatim move preserves the defect — it does not
+     introduce it.
+
+   v2 explicitly does NOT fix this defect in scope. Follow-up issue
+   to be filed separately (the fix requires either (a) keeping a
+   mirror-clone-aware skip count alongside the sidecar build, or
+   (b) building the sidecar in `transmit_batch` itself from the
+   post-skip order rather than `items.iter()`). For Step 1 pure code
+   motion, the extracted `submit_local` must preserve the existing
+   sidecar build and indexing verbatim so it remains
+   bit-for-bit equivalent to the inline arm.
+
+   **Invariant for this PR:** the per-bucket TX bytes attribution on
+   the Local path is identical before and after the refactor under
+   all input sequences — including those that exercise mirror_clone
+   reserve drops.
 
 ## Risk assessment
 
@@ -295,12 +382,19 @@ Each submodule needs:
 - Any change to `transmit_batch` / `transmit_prepared_queue` /
   `apply_cos_*_result`.
 - Any change to flow-fair sidecar semantics or per-bucket accounting.
+- **Mirror-clone sidecar misalignment defect on the Local path**
+  (Codex round-1 MAJOR finding, see invariant #7). Existing bug.
+  Follow-up issue to be filed separately. Refactor preserves the
+  current buggy-but-stable behavior verbatim.
 - #1207 (`service.rs` consolidation) — separate issue.
 - #1206 (CoSQueueRuntime split) — orthogonal.
 - #1561 first-snapshot race — separate open issue; this refactor must
   not change behavior on that race path.
 
-## Open questions for adversarial review
+## Open questions for adversarial review (round-2)
+
+Round-1 reviewer findings are folded into v2 above. The following
+questions remain open for round-2 hostile-verify.
 
 1. **Is the perf/reviewability gain worth the file fan-out?** Two new
    files for ~220 LOC of body extracted. Modularity rule says yes
