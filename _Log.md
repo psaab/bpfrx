@@ -3768,3 +3768,40 @@
 - **Timestamp**: 2026-05-26T17:00Z
 - **Action**: Split 415-LOC handle_stream dispatcher into per-verb modules
 - **File(s)**: userspace-dp/src/server/handlers.rs → handlers/mod.rs (181 LOC slim dispatcher) + 12 per-verb files (snapshot, forwarding, ha, neighbors, queue, binding, inject_packet, sync_session, session_deltas, export, rebind, stop_workers). Trivial arms (ping/status, update_fabrics, clear_policy_counters, shutdown, catch-all) stay inline in mod.rs. Pure code motion; zero new clones; byte-identical eprintln strings. cargo build clean, all tests pass except pre-existing master flake snat_contract_documents_current_fail_closed_runtime (confirmed on origin/master independent of this branch).
+## #1327 poll_descriptor stages — 2026-05-26
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Worktree created from origin/master; #1327 Step 1 plan
+    review v1→v4 (PLAN-NEEDS-MAJOR → PLAN-NEEDS-MINOR → split → MERGE-READY).
+  - **File(s)**: branch refactor/1327-poll-descriptor-stages
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Implemented Step 1. Converted flat poll_descriptor.rs to
+    directory module (poll_descriptor/mod.rs). Extracted flow-cache fast
+    path (verbatim translation of original L563-894) to flow_cache_hit.rs
+    with #[inline(always)] + FlowCacheOutcome { Consumed, FallThrough }.
+    Moved record_rx_descriptor_telemetry verbatim to rx_telemetry.rs.
+    Fixed snat_contract_doc_guard test (twice — initial extension + Copilot
+    review fix on assertion messages and required-doc tokens).
+    Final: mod.rs 2806 LOC (was 3292), flow_cache_hit.rs 379 LOC,
+    rx_telemetry.rs 220 LOC.
+  - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/{mod,flow_cache_hit,rx_telemetry}.rs, userspace-dp/tests/snat_contract_doc_guard.rs
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Validation gates. cargo build clean; cargo test 1417/1417
+    main suite pass; snat_contract_doc_guard pre-existing master flake
+    (docs/userspace-dataplane-gaps.md missing "fail-closed" keyword);
+    10× afxdp:: flake same as master 2/10 wg::engine concurrent-load
+    pre-existing flake; cargo asm gate confirmed via nm (no
+    stage_flow_cache_hit symbol in release binary); Go suite 30/30 pass.
+  - **File(s)**: PR #1571
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Code reviews — Codex provisional MERGE-READY (sandbox
+    infra-blocked, summary-based), AGY MERGE-READY with Python line-by-
+    line verification script, Copilot 1 inline finding (test path
+    hardcoding) fixed in fe176daa. Claude SMR review posted (#1571
+    comment 4547263769): AF_XDP UMEM ownership / CPU-arch inline gate /
+    zero allocation / HA epoch ordering / SW design pattern all verified
+    MERGE-READY. AWAITING-BATCH-MERGE marker posted.
+  - **File(s)**: PR #1571
