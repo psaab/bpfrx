@@ -169,6 +169,39 @@
     dispatcher). Pure code motion; mod.rs shrinks ~830 LOC.
     8 open questions for adversarial review.
 
+- **Timestamp**: 2026-05-26 (plan v2.2 PLAN-READY after 4 rounds)
+  - **Action**: After 4 rounds of Codex+AGY adversarial review,
+    plan v2.2 at commit dab1ada3 cleared with PLAN-READY (Codex
+    best effort due to sandbox infra) + PLAN-READY (AGY). All
+    round-1 PLAN-NEEDS-MAJOR (Codex 8 findings) and PLAN-NEEDS-MINOR
+    (AGY layout ask) findings resolved. Layout: sub-mod-dir
+    coordinator/reconcile/{mod,teardown,reset,snapshot,bringup}.rs
+    plus sibling coordinator/refresh_bindings.rs.
+
+- **Timestamp**: 2026-05-26 (implementation complete)
+  - **Action**: Implemented #1328 coordinator decompose Phase 2.
+    Split userspace-dp/src/afxdp/coordinator/mod.rs (2026 LOC) into:
+    mod.rs 1194 LOC (-832), refresh_bindings.rs 368 LOC,
+    reconcile/{mod 96, teardown 40, reset 63, snapshot 172,
+    bringup 333}.
+    Three helpers + three methods promoted to pub(super) to be
+    accessible from coordinator/reconcile/ children. New test
+    reconcile_with_none_snapshot_preserves_stage_sequence added.
+  - **Validation**: cargo build --release clean; cargo test
+    --release --bins 1488 tests pass; 5x flake clean on 33
+    coordinator tests; go test ./... 32 packages pass. Pre-existing
+    upstream failure snat_contract_doc_guard ("fail-closed" doc
+    drift in master, AGY r4 noted as out of scope).
+  - **File(s)**:
+    - userspace-dp/src/afxdp/coordinator/mod.rs (extract + visibility)
+    - userspace-dp/src/afxdp/coordinator/refresh_bindings.rs (new)
+    - userspace-dp/src/afxdp/coordinator/reconcile/mod.rs (new)
+    - userspace-dp/src/afxdp/coordinator/reconcile/teardown.rs (new)
+    - userspace-dp/src/afxdp/coordinator/reconcile/reset.rs (new)
+    - userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs (new)
+    - userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs (new)
+    - userspace-dp/src/afxdp/coordinator/tests.rs (test added)
+
 ## 2026-05-26 — #1476 Phase B AWAITING-MERGE at f815c357
 
 - **Timestamp**: 2026-05-26T (r3 reviewers converged, posting marker)

@@ -1,8 +1,18 @@
 # Reviewer task IDs — #1328 Coordinator decompose Phase 2
 
+## Plan round 4 (HEAD dab1ada3) — both PLAN-READY
+- Codex: task-mpmvh9at-ri87j9 — PLAN-READY (best effort; sandbox
+  infrastructure was intermittently broken across attempts r3/r4)
+- AGY:   review-mpmvh0u7-jju520 — PLAN-READY
+  - Upstream-unrelated finding: docs/userspace-dataplane-gaps.md
+    uses "fail closed" but snat_contract_doc_guard.rs asserts
+    "fail-closed" — pre-existing master drift, not part of #1328.
+
 ## Plan round 3 (HEAD a349be37)
-- Codex: task-mpmv5brm-wiwof9 (running)
-- AGY:   review-mpmv5e8p-nlw1p8 (running)
+- Codex: task-mpmv5brm-wiwof9 / -mpmv7063-rfsgw9 / -mpmv8wav-4ph9hv
+  — PLAN-NEEDS-MINOR (5 findings: sub-file naming, mod-count,
+  stage-sequence test claim, LOC over/under, histogram wording)
+- AGY:   review-mpmv5e8p-nlw1p8 — PLAN-READY
 
 ## Plan round 2 (HEAD f273aff2)
 - Codex: task-mpmuziyj-tzmqo2 — PLAN-NEEDS-MAJOR

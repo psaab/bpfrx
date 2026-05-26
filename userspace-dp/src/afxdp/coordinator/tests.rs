@@ -1321,3 +1321,48 @@ fn refresh_bindings_zeroes_v_min_counters_when_worker_absent() {
     assert_eq!(bindings[0].syn_cookie_ack_invalid, 0);
     assert_eq!(bindings[0].syn_cookie_bypass, 0);
 }
+
+/// #1328 — verify `reconcile(None, ...)` reaches the
+/// `"no_snapshot"` early-exit cleanly, runs the teardown phase
+/// (resetting `slow_path` to None), zeros `workers.live`, and
+/// increments `reconcile_calls`.
+///
+/// `last_reconcile_stage` is a single field with no history, so
+/// the test asserts the final write only. The per-stage write
+/// ORDERING (start -> stopped -> no_snapshot) is verified by
+/// reading the diff against the inventory documented in
+/// `docs/pr/1328-coordinator-reconcile-split/plan.md`
+/// §"Hidden invariants" #2.
+#[test]
+fn reconcile_with_none_snapshot_preserves_stage_sequence() {
+    let mut coordinator = Coordinator::new();
+    let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
+        slot: 1,
+        worker_id: 0,
+        queue_id: 0,
+        interface: "ge-0-0-0".into(),
+        ifindex: 10,
+        registered: true,
+        bound: true,
+        xsk_registered: true,
+        ready: true,
+        rx_packets: 42,
+        ..BindingStatus::default()
+    }];
+    coordinator.reconcile(None, &mut bindings, 64);
+    assert_eq!(coordinator.last_reconcile_stage, "no_snapshot");
+    assert_eq!(coordinator.reconcile_calls, 1);
+    assert!(
+        coordinator.workers.live.is_empty(),
+        "no live workers expected on None snapshot"
+    );
+    assert!(
+        coordinator.slow_path.is_none(),
+        "slow_path should be None after teardown of an unbound coordinator"
+    );
+    // Reset phase zeroed counter / ready / bound flags.
+    assert!(!bindings[0].ready);
+    assert!(!bindings[0].bound);
+    assert!(!bindings[0].xsk_registered);
+    assert_eq!(bindings[0].rx_packets, 0);
+}
