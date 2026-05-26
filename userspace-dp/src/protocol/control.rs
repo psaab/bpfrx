@@ -292,10 +292,6 @@ pub(crate) struct HAStateUpdateRequest {
     pub groups: Vec<HAGroupStatus>,
 }
 
-/// #869: per-worker busy/idle runtime telemetry, published on the
-/// worker's ~1s cadence.  See `userspace-dp/src/afxdp/worker_runtime.rs`.
-/// All fields default to 0 for backward compatibility with daemons that
-
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub(crate) struct QueueControlRequest {
     #[serde(rename = "queue_id")]

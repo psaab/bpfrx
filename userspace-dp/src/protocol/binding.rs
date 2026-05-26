@@ -13,6 +13,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// #869: per-worker busy/idle runtime telemetry, published on the
+/// worker's ~1s cadence.  See `userspace-dp/src/afxdp/worker_runtime.rs`.
+/// All fields default to 0 for backward compatibility with daemons that
+/// predate this instrumentation.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct WorkerRuntimeStatus {
     #[serde(rename = "worker_id", default)]

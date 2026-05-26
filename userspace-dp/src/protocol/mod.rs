@@ -2,7 +2,10 @@
 //! control socket server (`main.rs`) and the AF_XDP coordinator (`afxdp.rs`).
 //!
 //! All types are `pub(crate)` so they are visible across the crate without
-//! being part of the public API.
+//! being part of the public API, with one historical exception:
+//! `WorkerRuntimeStatus` carries `pub` visibility (preserved from before
+//! the split for #869 instrumentation that surfaced it for external
+//! tooling). All other types stay `pub(crate)`.
 //!
 //! Split (#1325) into domain submodules:
 //!   - `snapshot`: config DTOs (ConfigSnapshot tree, interface/route/zone/
