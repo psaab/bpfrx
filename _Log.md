@@ -1,5 +1,21 @@
 # Action Log
 
+## 2026-05-26 — #1326 plan v2 (AGY r1 PLAN-NEEDS-MAJOR addressed)
+
+- **Timestamp**: 2026-05-26T (AGY r1 result fetched)
+  - **Action**: AGY r1 (review-mpmurh2n-sfmiks) returned
+    PLAN-NEEDS-MAJOR with 4 action items: (1) narrow phase-fn
+    signatures to avoid &mut LoopState whole-struct barrier at the
+    poll_drive boundary, (2) upgrade #[inline] → #[inline(always)],
+    (3) consolidate 10 files → 6 by folding non-poll tick phases
+    into tick.rs, (4) resolve missing runtime.rs discrepancy
+    (rolled into tick.rs as tick::runtime_publish). Codex r1 task
+    was lost from the harness (session-state drop on long-running
+    review batch); will be re-dispatched on v2 alongside AGY r2.
+    Plan revised; v2 published.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
 ## 2026-05-26 — #1326 worker_loop extract plan v1 drafted
 
 - **Timestamp**: 2026-05-26T

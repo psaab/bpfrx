@@ -1,6 +1,42 @@
 # #1326 — Extract worker_loop body into worker/loop_body/
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** DRAFT v2 — addressing AGY r1 PLAN-NEEDS-MAJOR findings
+
+### v1→v2 changelog
+
+AGY r1 (review-mpmurh2n-sfmiks) returned PLAN-NEEDS-MAJOR with 4
+action items. v2 addresses all four:
+
+1. **Borrow-shape barrier removed.** Phase fns no longer take
+   `&mut LoopState` wholesale. They take only the specific fields
+   they touch (e.g. `&mut state.shared_recycles`,
+   `&state.binding_lookup`, `&state.forwarding`). LLVM no longer
+   has to assume every call mutates all 25 fields. The orchestrator
+   is the sole owner of `&mut LoopState`; phase fns get
+   field-specific borrows. This particularly matters at the
+   non-inlined `poll_drive::drive_one_round` boundary where AGY
+   flagged spill-fill risk.
+
+2. **`#[inline]` → `#[inline(always)]`** on hot-path phase wrappers.
+   `#[inline]` is only a hint and LLVM can decline at large bodies;
+   `inline(always)` guarantees the hot per-tick branch budget.
+   Applies to: `tick::arc_refresh`, `tick::commands_drain`,
+   `tick::expiry`, `tick::deltas`, `tick::runtime_publish`,
+   `idle::handle`.
+
+3. **File tree consolidated** from 10 files to 6. Fold non-polling
+   tick sub-phases (arc_refresh + commands + expiry + deltas +
+   runtime publish) into a single `tick.rs` module with
+   `pub(super) fn` helpers, each `#[inline(always)]`. New tree:
+   setup, tick, poll_drive, debug_report, idle, shutdown.
+   poll_drive stays non-inlined (too big); debug_report cold; idle
+   inlined into orchestrator; shutdown cold post-loop.
+
+4. **runtime.rs discrepancy fixed.** The per-tick runtime-atomics
+   publish (#869 wr_counters / wr_state) lives in `tick.rs` as
+   `tick::runtime_publish(...)` — it shares LoopState fields with
+   the other tick helpers and is part of the same per-tick atomic
+   sequence. There is no separate `runtime.rs`.
 
 ## Issue framing
 
@@ -49,7 +85,7 @@ mitigatable — PLAN-KILL is an acceptable verdict.*
 
 ## Concrete design
 
-### File tree (post-split)
+### File tree (post-split, v2)
 
 ```
 userspace-dp/src/afxdp/worker/
@@ -63,78 +99,90 @@ userspace-dp/src/afxdp/worker/
                       #  create_private_binding_from_plan,
                       #  create_shared_binding_group, …);
                       #  inline `mod tests` (kept) — 10 tests
+                      #  pub(crate) use loop_body::worker_loop;
                       # Target: ~900-1100 LOC after extraction.
   loop_body/
     mod.rs            # pub(crate) fn worker_loop — top-level structure
-                      # ~280-340 LOC after split: pre-loop init + the
+                      # ~280-340 LOC: pre-loop init + the
                       # `while !stop.load(...)` orchestration with
-                      # delegated phase calls. Plus shutdown drain.
+                      # delegated phase calls. Defines pub(super)
+                      # LoopState. The orchestrator is the sole
+                      # holder of &mut LoopState — phase fns borrow
+                      # specific fields, never the whole struct.
     setup.rs          # Pre-loop initialization extracted from
-                      # L1023-L1228: validation/forwarding/CoS Arc
-                      # snapshot, SessionTable + ScreenState construction,
-                      # private/shared binding plan materialization,
-                      # binding sort, binding_lookup,
-                      # cos_owner_live_by_tx_ifindex build, initial
-                      # cos_fast_interfaces install onto every binding,
-                      # interrupt_poll_fds vector init, BPF map FD cache,
-                      # initial cos_status publish, wr_counters init.
-                      # Returns a `LoopState` typed struct (see below).
-    arc_refresh.rs    # #1188 per-tick Arc.load() short-circuit:
-                      # forwarding, mirror_targets, all 6 CoS Arcs,
-                      # ha_runtime sticky load. Updates LoopState in
-                      # place; returns `rebuild_cos_fast_interfaces`
-                      # flag + (purge_input_dscp_v4, purge_input_dscp_v6)
-                      # tuple from forwarding rotation (these drive the
-                      # session purge below).
-                      # Includes post-rotate flow: input-DSCP purge,
-                      # lo0 republish, cos_changed reset_worker_cos_runtimes
-                      # + apply_shared_recycles_to_bindings. Plus the
-                      # cos_fast_interfaces rebuild block at L1387-L1417.
-    commands.rs       # apply_worker_commands invocation + the empty-queue
-                      # `WorkerCommandResults` short-circuit (L1419-L1492).
-                      # Dispatch of #941 VacateAllSharedExactSlots flag.
-                      # Apply of shaped_tx_requests (calls helper that
-                      # stays in mod.rs).  Cancellation of queued flows
-                      # for cancelled_keys.  Returns `exported_sequences`
-                      # (Vec consumed later when draining session deltas).
-    expiry.rs         # heartbeat publish, session expire_stale_entries,
-                      # source-NAT allocation release, BPF session-map
-                      # delete, session_expires Live counter publish,
-                      # periodic BPF conntrack last_seen refresh,
-                      # fabric rebuild check (L1494-L1545).
+                      # L1023-L1228 of today's worker_loop:
+                      # validation/forwarding/CoS Arc snapshot,
+                      # SessionTable + ScreenState construction,
+                      # private/shared binding plan materialization
+                      # (returns Vec<BindingWorker>), binding sort,
+                      # binding_lookup, cos_owner_live_by_tx_ifindex
+                      # build, initial cos_fast_interfaces install
+                      # onto every binding, interrupt_poll_fds vector
+                      # init, BPF map FD cache, initial cos_status
+                      # publish, wr_counters init. Returns
+                      # (Vec<BindingWorker>, LoopState).
+    tick.rs           # Per-tick helpers (all #[inline(always)]):
+                      #   runtime_publish(&mut LoopState fields,
+                      #     &Arc<WorkerRuntimeAtomics>, bindings, now_ns)
+                      #   arc_refresh(&mut LoopState fields, &mut bindings,
+                      #     &shared_*…, &peer_worker_commands,
+                      #     &shared_sessions, …, worker_id, now_ns)
+                      #   commands_drain(&mut LoopState fields,
+                      #     &mut bindings, &commands, ha_runtime,
+                      #     &dynamic_neighbors, now_ns)
+                      #     → Vec<u64> exported_sequences
+                      #   expiry(&mut LoopState fields, &mut bindings,
+                      #     &shared_fabrics, now_ns)
+                      #   deltas(&mut LoopState fields, &mut bindings,
+                      #     &exported_sequences, &cos_status,
+                      #     &session_export_ack, &shared_*…, now_ns)
+                      # Each helper signature names only the fields it
+                      # touches — LLVM gets clean alias info. Includes
+                      # the cos_fast_interfaces rebuild block (only
+                      # reachable from arc_refresh's flag tally).
     poll_drive.rs     # The `for offset in 0..bindings.len()` loop that
                       # calls `poll_binding` for each binding, plus the
                       # `flush_recorded_filter_counters` call and the
-                      # `dbg_poll`→cumulative debug counter merge
-                      # (L1546-L1656).  Updates `did_work` flag.
-                      # Returns `did_work: bool`.
-    deltas.rs         # Periodic cos_status publish (100ms cadence,
-                      # L1657-L1663) + session-deltas drain/flush path
-                      # (L1664-L1723), including
-                      # purge_queued_flows_for_closed_deltas +
-                      # flush_session_deltas calls.
+                      # `dbg_poll`→cumulative debug counter merge.
+                      # Returns `did_work: bool`. NOT inlined — too
+                      # big. Signature takes only the specific
+                      # references it needs (&mut bindings,
+                      # &mut sessions, &mut screen_state,
+                      # &mut shared_recycles, &mut dbg_poll counters,
+                      # validation, forwarding, ha_runtime, etc.) —
+                      # NOT the whole LoopState. LLVM sees a clean
+                      # call boundary.
     debug_report.rs   # The DBG_REPORT_INTERVAL_NS-gated periodic
-                      # summary report (L1724-L2215). Mostly behind
-                      # `cfg!(feature = "debug-log")` / per-cfg flag.
-                      # Includes #802 per-binding live-state telemetry
-                      # publish, #878 UMEM in-flight gauge publish, and
-                      # the worker debug-counter reset block.  Marked
-                      # `#[cold]` — fires once per second at most.
-    idle.rs           # The post-tick idle handling block (L2217-L2260):
-                      # wr_state classify, spin/sleep/poll() branches
-                      # for BusyPoll vs Interrupt mode. Mutates
-                      # `idle_iters`, `interrupt_poll_fds`.
-    shutdown.rs       # The post-loop shutdown block (L2262-L2272):
-                      # flush filter counters, release per-binding CoS
-                      # leases, final cos_status republish, heartbeat
-                      # tombstone. Marked `#[cold]`.
-    tests.rs          # Colocated tests for any new helper logic
-                      # introduced during extraction (LoopState
-                      # invariants, etc.). If extraction is pure
-                      # code-motion no new tests are needed — this file
-                      # may be omitted; existing inline tests in
-                      # mod.rs stay.
+                      # summary report (today's L1724-L2215). Outer
+                      # wrapper `pub(super) fn maybe_emit(...)` is
+                      # `#[inline(always)]` and contains only the
+                      # elapsed-ns gate. Inner emitter
+                      # `fn emit_report(...)` is `#[cold]` and holds
+                      # the full body. Includes #802 per-binding
+                      # live-state telemetry publish, #878 UMEM
+                      # in-flight gauge publish, worker debug-counter
+                      # reset, and the worker-runtime publish
+                      # block. Stays cold — fires ≤1×/sec.
+    idle.rs           # The post-tick idle handling block (today's
+                      # L2217-L2260): wr_state classify, spin/sleep/
+                      # poll() branches for BusyPoll vs Interrupt
+                      # mode. Mutates `idle_iters`, `interrupt_poll_fds`.
+                      # Outer `pub(super) fn handle(...)` is
+                      # `#[inline(always)]` so the BusyPoll-spin fast
+                      # path is inlined into the orchestrator.
+    shutdown.rs       # The post-loop shutdown block (today's
+                      # L2262-L2272): flush filter counters, release
+                      # per-binding CoS leases, final cos_status
+                      # republish, heartbeat tombstone.
+                      # `#[cold]`.
+    tests.rs          # Colocated tests for any new helper logic.
+                      # If extraction is pure code-motion no new tests
+                      # are required — this file may be omitted;
+                      # existing inline tests in mod.rs stay.
 ```
+
+Total module files: 6 (mod, setup, tick, poll_drive, debug_report,
+idle, shutdown — counted excluding optional tests.rs).
 
 ### LoopState struct (the avoiding-16-param-fn pattern)
 
@@ -190,66 +238,198 @@ pub(super) struct LoopState {
 }
 ```
 
-Builder constructed by `setup::initialize_loop_state(&worker_ctx,
-&mut bindings)` after bindings are materialized.
+Builder: `setup::initialize_loop_state(&worker_ctx, &mut bindings)`
+returns `(Vec<BindingWorker>, LoopState)`.
 
-### Orchestrator (loop_body/mod.rs)
+### Orchestrator (loop_body/mod.rs) — v2 narrow-borrow shape
+
+Every phase fn takes only the LoopState fields it actually mutates +
+the orchestrator-local refs (Arc Guards, shared Arcs from the
+worker_loop signature). The orchestrator splat-borrows from
+`&mut state` at the call site so the compiler can see disjoint
+borrows. This is the same pattern the cilium/ebpf hot paths use and
+what AGY r1 asked for.
 
 ```rust
 pub(crate) fn worker_loop(
     /* same 38-param signature as today — unchanged */
 ) {
     pin_current_thread(worker_id);
-    let mut bindings = setup::materialize_bindings(binding_plans);
-    let mut state = setup::initialize_loop_state(
+    let (mut bindings, mut state) = setup::initialize(
+        binding_plans,
         &shared_validation, &shared_forwarding,
-        &shared_cos_owner_worker_by_queue, /* …all shared Arcs… */
-        &mut bindings, worker_id, &cos_status,
+        &shared_cos_owner_worker_by_queue,
+        &shared_cos_owner_live_by_queue,
+        &shared_cos_root_leases, &shared_cos_exact_backlogs,
+        &shared_cos_queue_leases, &shared_cos_queue_vtime_floors,
+        &shared_mirror_targets,
+        worker_id, poll_mode, &cos_status,
     );
     runtime_atomics.set_tid(super::worker_runtime::current_tid());
 
     while !stop.load(Ordering::Relaxed) {
         let loop_now_ns = monotonic_nanos();
         let loop_now_secs = loop_now_ns / 1_000_000_000;
-        runtime::tick_publish(
-            &mut state, &runtime_atomics, &bindings, loop_now_ns,
-        );
-        arc_refresh::refresh_per_tick(
-            &mut state, &mut bindings,
-            &shared_validation, &shared_forwarding, /* …shared Arcs… */
-            &peer_worker_commands, &shared_sessions,
-            &shared_nat_sessions, &shared_forward_wire_sessions,
-            &shared_owner_rg_indexes, loop_now_ns, worker_id,
-        );
-        let ha_runtime = ha_state.load();
-        let exported_sequences = commands::drain_pending(
-            &mut state, &mut bindings, &commands,
-            ha_runtime.as_ref(), &dynamic_neighbors,
+
+        // #869 runtime telemetry publish (1s gate inside)
+        tick::runtime_publish(
+            &mut state.wr_counters,
+            &mut state.wr_state,
+            &mut state.wr_last_loop_ns,
+            &mut state.wr_last_publish_ns,
+            &state.sessions,           // for sessions.len()
+            &bindings,                 // for cos queue lease counters
+            &runtime_atomics,
             loop_now_ns,
         );
-        heartbeat.store(loop_now_ns, Ordering::Relaxed);
-        expiry::tick(&mut state, &mut bindings, loop_now_ns, &shared_fabrics);
-        let did_work = poll_drive::drive_one_round(
-            &mut state, &mut bindings, ha_runtime.as_ref(),
-            loop_now_ns, loop_now_secs,
-            /* …all per-binding refs poll_binding needs… */
+
+        // #1188 Arc short-circuit refresh + cos_fast_interfaces rebuild
+        tick::arc_refresh(
+            &mut state.validation,
+            &mut state.forwarding,
+            &mut state.mirror_targets,
+            &mut state.cos_owner_worker_by_queue,
+            &mut state.cos_owner_live_by_queue,
+            &mut state.cos_shared_root_leases,
+            &mut state.cos_shared_exact_backlogs,
+            &mut state.cos_shared_queue_leases,
+            &mut state.cos_shared_queue_vtime_floors,
+            &mut state.sessions,
+            &mut state.screen_state,
+            &mut state.shared_recycles,
+            &mut bindings,
+            &state.binding_lookup,
+            state.session_map_fd,
+            state.conntrack_v4_fd,
+            state.conntrack_v6_fd,
+            &shared_validation, &shared_forwarding,
+            &shared_mirror_targets,
+            &shared_cos_owner_worker_by_queue,
+            &shared_cos_owner_live_by_queue,
+            &shared_cos_root_leases,
+            &shared_cos_exact_backlogs,
+            &shared_cos_queue_leases,
+            &shared_cos_queue_vtime_floors,
+            &shared_sessions, &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &peer_worker_commands,
+            worker_id, loop_now_ns,
         );
-        deltas::tick(
-            &mut state, &mut bindings, &exported_sequences,
+
+        let ha_runtime = ha_state.load();
+
+        let exported_sequences = tick::commands_drain(
+            &mut state.sessions,
+            &mut state.shared_recycles,
+            &mut bindings,
+            &state.binding_lookup,
+            &state.forwarding,
+            state.session_map_fd,
+            state.conntrack_v4_fd,
+            state.conntrack_v6_fd,
+            &commands,
+            ha_runtime.as_ref(),
+            &dynamic_neighbors,
+            loop_now_ns,
+        );
+
+        heartbeat.store(loop_now_ns, Ordering::Relaxed);
+
+        tick::expiry(
+            &mut state.sessions,
+            &mut state.forwarding,   // for fabric rebuild
+            &mut state.last_ct_refresh_ns,
+            &mut bindings,
+            state.session_map_fd,
+            state.conntrack_v4_fd,
+            state.conntrack_v6_fd,
+            &shared_fabrics,
+            loop_now_ns,
+        );
+
+        let did_work = poll_drive::drive_one_round(
+            &mut bindings,
+            &state.binding_lookup,
+            &mut state.sessions,
+            &mut state.screen_state,
+            &mut state.shared_recycles,
+            &mut state.poll_start,
+            state.validation,
+            &state.forwarding,
+            &state.mirror_targets,
+            state.cos_owner_worker_by_queue.as_ref(),
+            state.cos_owner_live_by_queue.as_ref(),
+            state.session_map_fd,
+            state.conntrack_v4_fd,
+            state.conntrack_v6_fd,
+            state.ha_startup_grace_until_secs,
+            ha_runtime.as_ref(),
+            &dynamic_neighbors,
+            &shared_sessions, &shared_nat_sessions,
+            &shared_forward_wire_sessions, &shared_owner_rg_indexes,
+            slow_path.as_ref(),
+            event_stream.as_ref(),
+            &local_tunnel_deliveries,
+            &recent_exceptions, &recent_session_deltas,
+            &last_resolution,
+            &peer_worker_commands,
+            worker_id,
+            worker_commands_by_id.as_ref(),
+            &dnat_fds,
+            &rg_epochs,
+            #[cfg(feature = "debug-log")]
+            &mut state.dbg_counters,
+            &mut state.dbg_rx_total,
+            &mut state.dbg_forward_total,
+            loop_now_ns, loop_now_secs,
+        );
+
+        tick::deltas(
+            &mut state.sessions,
+            &mut state.last_cos_status_ns,
+            &mut state.shared_recycles,
+            &mut bindings,
+            &state.binding_lookup,
+            &state.forwarding,
+            state.conntrack_v4_fd, state.conntrack_v6_fd,
+            &exported_sequences,
             &cos_status, &session_export_ack,
             &shared_sessions, &shared_nat_sessions,
             &shared_forward_wire_sessions, &shared_owner_rg_indexes,
             &recent_session_deltas, &peer_worker_commands,
-            &event_stream, loop_now_ns,
+            &event_stream,
+            loop_now_ns,
         );
+
         debug_report::maybe_emit(
-            &mut state, &mut bindings, worker_id, loop_now_ns,
+            &mut state,           // takes &mut state because the cold
+                                  // path needs ALL fields — the gate
+                                  // is the only fast path and is
+                                  // inlined; the body is #[cold] +
+                                  // out-of-line so LLVM doesn't have
+                                  // to assume the fast path mutates
+                                  // anything.
+            &mut bindings,
+            worker_id, loop_now_ns,
         );
-        idle::handle(&mut state, did_work, poll_mode);
+
+        idle::handle(
+            &mut state.idle_iters,
+            &mut state.interrupt_poll_fds,
+            &mut state.wr_state,
+            did_work, poll_mode,
+        );
     }
     shutdown::tear_down(&mut bindings, &cos_status, &heartbeat);
 }
 ```
+
+**Borrow shape note:** every phase fn takes disjoint `&mut` borrows
+of LoopState fields. The compiler can prove non-aliasing because the
+fields are distinct paths off `&mut state`. AGY r1 specifically
+flagged the alternative (`&mut state` whole-struct) as a LLVM
+optimization barrier; this signature shape mitigates it.
 
 ### Allocation audit (per-tick)
 
@@ -284,37 +464,52 @@ Vec as today's `let mut shared_recycles = Vec::with_capacity(...)`,
 just rehomed onto LoopState (which is itself stack-allocated by the
 orchestrator and never cloned).
 
-### Cold-path annotation
+### Cold-path annotation (v2)
 
-- `debug_report::maybe_emit` — `#[cold]` on the inner emitter
-  (entered ≤1×/sec). The outer wrapper is `#[inline]` and just checks
-  the elapsed nanos against `DBG_REPORT_INTERVAL_NS`; if not due,
-  returns immediately. This preserves the inliner's view that the
-  fast path is just an integer comparison and branch.
+- `debug_report::maybe_emit` — outer is
+  `#[inline(always)] pub(super) fn maybe_emit(...)` and contains
+  ONLY the elapsed-ns gate. Inner `fn emit_report(...)` is
+  `#[cold]` and `#[inline(never)]`, holding the full body. LLVM
+  sees: `if loop_now_ns - state.dbg_last_report_ns < 1e9 { return; }`
+  inlined into the orchestrator, with `emit_report(...)` left out-
+  of-line. This is the canonical Rust pattern for "1s gate + cold
+  body" and is what the codebase uses elsewhere
+  (`cilium/ebpf`-style rare-path emit).
 - `shutdown::tear_down` — `#[cold]`. Runs once on exit.
-- `commands::drain_pending`'s `apply_worker_commands` branch — the
-  empty-queue short-circuit returns the empty `WorkerCommandResults`
-  inline. The non-empty branch is `#[cold]` because most ticks have
-  no pending commands.
-- `idle::handle` — `#[inline]`. Sits between hot reads (poll round)
-  and the next tick's `monotonic_nanos`. Spin-loop and sleep paths
-  are the hot/cold of the inner branch; the dispatch itself stays
-  inlined.
+- The non-empty-queue branch inside `tick::commands_drain` — `#[cold]`
+  on the inner `apply_non_empty(...)` helper because most ticks have
+  no pending commands. The empty-queue short-circuit is the fast
+  path and stays inlined.
+- The fabric-rebuild branch inside `tick::expiry` is also `#[cold]` —
+  fires only when `live_fabrics != forwarding.fabrics`.
 
-### Hot-path inline annotation
+### Hot-path inline annotation (v2)
 
-- `arc_refresh::refresh_per_tick` — `#[inline]`. Per-tick path; the
-  short-circuit `Arc::ptr_eq` in `load_arc_if_changed` is the
-  bottleneck.
-- `expiry::tick` — `#[inline]`. heartbeat store + cheap branch are
-  the fast path.
-- `poll_drive::drive_one_round` — NOT `#[inline]`. Already a heavy fn
-  containing the per-binding poll loop; inlining into the orchestrator
-  re-balloons mod.rs's symbol size and defeats the perf-top observability
-  win. The compiler can decide.
-- `deltas::tick` — `#[inline]`. The 100ms cos_status gate is the only
-  non-trivial work most ticks; inlining keeps that branch local.
-- `runtime::tick_publish` — `#[inline]`. The 1s publish gate dominates.
+All per-tick wrappers use `#[inline(always)]` — `#[inline]` is only
+a hint and LLVM may decline. `inline(always)` is a directive (modulo
+recursion / variadic / interleaved-binding hazards, none of which
+apply here).
+
+- `tick::runtime_publish` — `#[inline(always)]`. 1s publish gate
+  dominates; the gate itself must be local.
+- `tick::arc_refresh` — `#[inline(always)]`. The `Arc::ptr_eq`
+  short-circuits are the bottleneck; LLVM needs to see them at the
+  call site to skip the `.load_full()` clone.
+- `tick::commands_drain` — `#[inline(always)]` on the outer empty-
+  queue fast-path; `#[cold]` on the inner non-empty body.
+- `tick::expiry` — `#[inline(always)]`. heartbeat semantics, BPF
+  conntrack refresh gate, and fabric rebuild are all branch-heavy
+  + cheap.
+- `tick::deltas` — `#[inline(always)]`. The 100ms cos_status gate is
+  the only non-trivial work most ticks.
+- `idle::handle` — `#[inline(always)]`. The BusyPoll-spin path is
+  ~3 instructions; inlining is essential.
+- `poll_drive::drive_one_round` — NOT inlined (no annotation, let
+  LLVM decide; expect inline-never given its size). This is the
+  perf-top observability win — a single fn symbol for the per-binding
+  poll round. AGY r1 explicitly called out the LoopState whole-struct
+  borrow as the spill-fill barrier at this boundary; v2 fixes that
+  by giving `drive_one_round` a narrow ref signature.
 
 ## Public API preservation
 
@@ -437,20 +632,25 @@ runs after the wave is merged.)
   items that remain in mod.rs (shared binding helpers and
   publish_tx_completion_ring_telemetry). They stay inline.
 
-## Open questions for adversarial review
+## Open questions for adversarial review (v2)
 
-1. **Inliner spill-fill.** Is splitting a 1278-LOC fn into 8 sub-fns
-   acceptable for hot-path code even with `#[inline]` annotations?
-   Or does the compiler refuse to inline things this large and we
-   pay a per-call cost ~12×1M times/sec? If the latter, PLAN-KILL —
-   the perf cost outweighs the maintainability win. Acceptance:
-   `cargo asm` spot-check + Pass A multi-stream within 1% of baseline.
+1. **Inliner spill-fill (v2).** With `#[inline(always)]` on all hot
+   phase wrappers AND narrow disjoint-field borrows on
+   `poll_drive::drive_one_round`, is the spill-fill barrier AGY r1
+   flagged adequately mitigated? Specifically: does LLVM still see
+   the per-tick loop body as roughly equivalent to today's monolith
+   after MIR optimization + LLVM inlining? Acceptance: `cargo asm`
+   spot-check on the orchestrator + Pass A multi-stream within 1%
+   of baseline. PLAN-KILL acceptable if reviewer believes the
+   answer is no and can show a counter-example.
 
-2. **LoopState borrow shape.** Does packing 25+ hot-path locals into
-   a `LoopState` struct introduce borrow-checker friction (e.g.
-   `&mut state.sessions` + `&mut state.shared_recycles` in the same
-   call) that forces awkward field-by-field splat in every phase fn?
-   Should the phases instead take 5-8 explicit `&mut` args each?
+2. **`#[inline(always)]` correctness.** Is there any pessimism
+   risk from forcing inline on the `tick::*` family — e.g. blowing
+   the orchestrator's stack frame, defeating tail-call optimization,
+   or forcing the compiler into a corner where it inlines a path
+   that would have been better left out-of-line under PGO? Rust's
+   `inline(always)` semantics differ from C's; please verify on this
+   per-tick path.
 
 3. **Phase boundary ordering.** Is there ANY current side-effect
    dependency I've missed across the L1229→L2261 sweep? Specifically
