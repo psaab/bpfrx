@@ -7,5 +7,10 @@ Plan review round 1 (plan v1, commit f9713e65):
 
 Plan review round 2 (plan v2, commit 71370dc7):
 
-- Codex: `task-mpn3es2s-6o96p3`
-- Gemini: `task-mpn3fedx-8nv5ky`
+- Codex: `task-mpn3es2s-6o96p3` — PLAN-NEEDS-MAJOR
+- Gemini: `task-mpn3fedx-8nv5ky` — PLAN-KILL
+
+Plan review round 3 (plan v3, commit 31238f3c):
+
+- Codex: `task-mpn49x98-7vfk2t` — PLAN-READY (minor: reload test should cover BOTH systemctl-success and fallback as a subtest pair)
+- Gemini: `task-mpn4adwg-n12h5i` — PLAN-READY
