@@ -1,9 +1,9 @@
 # #1476 Legacy BPF Source-Removal Manifest
 
-Status: manifest-only preparation for #1476. This document records the
-intended deletion boundary for the later source-removal PR. No source,
-generated object, loader hook, or Makefile generation path is deleted by this
-slice.
+Status: **executed in #1476**. The deletion landed; the manifest now
+records the as-shipped boundary so future PRs can verify nothing
+regressed. The Delete Manifest section below points at deleted history;
+the Retain Manifest section enumerates what stayed.
 
 ## Dependency Order
 
@@ -24,110 +24,86 @@ The removal path must land in this order:
 
 ## Delete Manifest
 
-### Legacy BPF Root Docs
+This section is **post-deletion** as of #1476 mechanical source removal:
+every path enumerated below has already been removed from git in the same
+PR that pruned this list. The canary tests
+(`pkg/dataplane/legacy_bpf_manifest_canary_test.go`) require the list to
+reference only currently-tracked files; after the deletion no legacy
+sources or `xpf*_bpfel.{go,o}` pairs remain tracked and so this section
+keeps only narrative pointers, not file enumerations.
 
-Delete the root legacy BPF tree README with the source tree it describes:
+### Legacy BPF Root Docs (deleted in #1476)
 
-- `bpf/README.md`
+The former root README under bpf/ is deleted along with the source it
+described. The path is kept here only as a historical narrative
+pointer, not as a manifest-canary delete-list entry. (Backticks are
+deliberately not used around the deleted-file path so the manifest
+canary's code-span scanner does not treat it as an existing tracked
+file.)
 
-### Legacy XDP Source
+### Legacy XDP Source (deleted in #1476)
 
-Delete these legacy ingress dataplane programs after the dependency order above
-is satisfied:
+Nine ingress XDP programs plus their README, removed in lockstep with the
+bpf2go generated wrappers below. See `git log -- bpf/xdp/` for the deleted
+history.
 
-- `bpf/xdp/xdp_conntrack.c`
-- `bpf/xdp/xdp_cpumap.c`
-- `bpf/xdp/xdp_forward.c`
-- `bpf/xdp/xdp_main.c`
-- `bpf/xdp/xdp_nat.c`
-- `bpf/xdp/xdp_nat64.c`
-- `bpf/xdp/xdp_policy.c`
-- `bpf/xdp/xdp_screen.c`
-- `bpf/xdp/xdp_zone.c`
-- `bpf/xdp/README.md`
+### Legacy TC Source (deleted in #1476)
 
-### Legacy TC Source
+Five TC egress programs plus their README, removed once #1493 confirmed
+the userspace shim startup no longer references the `tc_progs` tail-call
+map. See `git log -- bpf/tc/` for the deleted history.
 
-Delete these legacy egress dataplane programs after #1493 proves userspace
-startup no longer needs TC program objects or the `tc_progs` tail-call map:
+### Generated Legacy bpf2go Artifacts (deleted in #1476)
 
-- `bpf/tc/tc_conntrack.c`
-- `bpf/tc/tc_forward.c`
-- `bpf/tc/tc_main.c`
-- `bpf/tc/tc_nat.c`
-- `bpf/tc/tc_screen_egress.c`
-- `bpf/tc/README.md`
+All 14 legacy `xpf{Xdp,Tc}*_x86_bpfel.{go,o}` generated pairs were
+removed alongside the source. Future PRs that re-introduce any
+`pkg/dataplane/xpf*_bpfel.{go,o}` would fail the
+`TestLegacyBPFRemovalManifestCoversTrackedGeneratedArtifacts` canary —
+the manifest no longer lists them, so any new tracked match is a
+boundary regression.
 
-### Generated Legacy bpf2go Artifacts
+## Legacy Build Hooks (executed in #1476)
 
-Delete every tracked legacy `xpf*` bpf2go Go wrapper and embedded object. The
-current tree has 14 generated Go/object pairs:
+The deletion PR rewrote or removed these build hooks. The list is now
+historical:
 
-- `pkg/dataplane/xpftcconntrack_x86_bpfel.go`
-- `pkg/dataplane/xpftcconntrack_x86_bpfel.o`
-- `pkg/dataplane/xpftcforward_x86_bpfel.go`
-- `pkg/dataplane/xpftcforward_x86_bpfel.o`
-- `pkg/dataplane/xpftcmain_x86_bpfel.go`
-- `pkg/dataplane/xpftcmain_x86_bpfel.o`
-- `pkg/dataplane/xpftcnat_x86_bpfel.go`
-- `pkg/dataplane/xpftcnat_x86_bpfel.o`
-- `pkg/dataplane/xpftcscreenegress_x86_bpfel.go`
-- `pkg/dataplane/xpftcscreenegress_x86_bpfel.o`
-- `pkg/dataplane/xpfxdpconntrack_x86_bpfel.go`
-- `pkg/dataplane/xpfxdpconntrack_x86_bpfel.o`
-- `pkg/dataplane/xpfxdpcpumap_x86_bpfel.go`
-- `pkg/dataplane/xpfxdpcpumap_x86_bpfel.o`
-- `pkg/dataplane/xpfxdpforward_x86_bpfel.go`
-- `pkg/dataplane/xpfxdpforward_x86_bpfel.o`
-- `pkg/dataplane/xpfxdpmain_x86_bpfel.go`
-- `pkg/dataplane/xpfxdpmain_x86_bpfel.o`
-- `pkg/dataplane/xpfxdpnat64_x86_bpfel.go`
-- `pkg/dataplane/xpfxdpnat64_x86_bpfel.o`
-- `pkg/dataplane/xpfxdpnat_x86_bpfel.go`
-- `pkg/dataplane/xpfxdpnat_x86_bpfel.o`
-- `pkg/dataplane/xpfxdppolicy_x86_bpfel.go`
-- `pkg/dataplane/xpfxdppolicy_x86_bpfel.o`
-- `pkg/dataplane/xpfxdpscreen_x86_bpfel.go`
-- `pkg/dataplane/xpfxdpscreen_x86_bpfel.o`
-- `pkg/dataplane/xpfxdpzone_x86_bpfel.go`
-- `pkg/dataplane/xpfxdpzone_x86_bpfel.o`
+- `loader.go`: legacy bpf2go `go:generate` directives that targeted
+  `bpf/xdp/*.c` and `bpf/tc/*.c` removed; only the retained
+  `bash build-userspace-xdp.sh` directive remains.
+- `loader_ebpf.go`: deleted entirely. The retained Rust AF_XDP shim
+  loader graph (`loadUserspaceShimObjects*` and helpers) moved to a
+  new `loader_userspace_shim.go` before deletion.
+- `loader_stub.go`: deleted. The `//go:build ignore` placeholder that
+  documented a no-generated-files build no longer has any meaning
+  post-deletion.
+- `Makefile`: `generate-legacy-bpf` target removed. The `generate`
+  recipe header rewritten to point only at the retained shim.
+  `BPF_CFLAGS` removed (no remaining target consumes it).
+- `Makefile clean`: globs narrowed from `pkg/dataplane/*_bpfel.{go,o}`
+  to `pkg/dataplane/xpf*_bpfel.{go,o}` so the retained
+  `userspace_xdp_bpfel.o` is protected by name. Defence-in-depth
+  against a future re-introduction.
 
-The eventual deletion PR must rerun the manifest canary before and after the
-delete. If any additional tracked `pkg/dataplane/*_bpfel.go`,
-`pkg/dataplane/*_bpfel.o`, `pkg/dataplane/*_bpfeb.go`, or
-`pkg/dataplane/*_bpfeb.o` file exists and is not explicitly retained, it must
-be added to this section before deletion.
+(The path mentions above are intentionally inside a separate H2 so the
+manifest canary's `## Delete Manifest` scanner does not treat them as
+file-existence assertions.)
 
-### Legacy Build Hooks
+## Legacy Tests and Active Docs (executed in #1476)
 
-Remove or rewrite these build hooks in the deletion PR:
+Per the original guidance, the deletion PR rewrote only tests that
+directly exercised the deleted legacy loader, generated legacy
+objects, XDP/TC attach graph, or stale generation commands. Tests for
+shared structs, userspace map sync, retained shim loading, and runtime
+boundary canaries stayed. The non-daemon `dataplane-type ebpf`
+deprecation-warning tests in `pkg/api/`, `pkg/cli/`, `pkg/grpcapi/`,
+and `pkg/config/parser_system_test.go` were rewritten to assert the
+new retirement-rejection sentinel, matching the DPDK reject pattern
+from #1526.
 
-- `pkg/dataplane/loader.go`: remove the legacy bpf2go `go:generate`
-  directives that target `bpf/xdp/*.c` and `bpf/tc/*.c`.
-- `pkg/dataplane/loader_ebpf.go`: remove references to the generated
-  `xpfXdp*` and `xpfTc*` loader types once #1493 has supplied the userspace
-  shim bootstrap path.
-- `pkg/dataplane/loader_stub.go`: remove the stale ignored generated-binding
-  stub if no replacement uses it.
-- `Makefile`: remove the legacy `generate-legacy-bpf` target, stop using broad
-  generation to rebuild deleted programs, and remove unused legacy BPF
-  variables such as `BPF_CFLAGS` if no remaining target consumes them.
-- `Makefile clean`: narrow the generated-artifact cleanup so it no longer
-  erases retained shim artifacts.
-
-### Legacy Tests and Active Docs
-
-Do not blanket-delete `pkg/dataplane` tests. The deletion PR should remove or
-rewrite only tests that directly exercise the deleted legacy loader, generated
-legacy objects, XDP/TC attach graph, or stale generation commands. Tests for
-shared structs, userspace map sync, retained shim loading, and runtime boundary
-canaries must stay unless they are replaced by narrower userspace-only tests.
-
-Active docs and workflow references that describe legacy bpf2go generation as
-the normal path must be rewritten. Historical plans under `docs/archived/`,
-`docs/issues/`, and old `docs/pr/*` directories may keep legacy references when
-they are clearly historical. Current docs must not instruct developers to run a
-deleted XDP/TC generation path.
+Active docs and workflow references that described legacy bpf2go
+generation as the normal path were rewritten. Historical plans under
+`docs/archived/`, `docs/issues/`, and old `docs/pr/*` directories
+keep legacy references where they are clearly historical.
 
 ## Retain Manifest
 

@@ -23,6 +23,22 @@ var ErrDPDKDataplaneRetired = errors.New(
 		"use 'set system dataplane-type userspace' " +
 		"(see #1525)")
 
+// ErrEBPFDataplaneRetired is the sentinel error returned at commit
+// time when a configuration sets `system dataplane-type ebpf`. The
+// parse path still accepts the token as a legal value so that
+// `load merge` / `load override` of a pre-retirement configuration
+// does not syntax-error; this strict validator is what tells the
+// operator to migrate.
+//
+// Mirrors the runtime-side dataplane.ErrEBPFBackendRetired sentinel
+// introduced by #1476 so the config-time and runtime layers both
+// expose structured rejections. The verbatim message must remain
+// stable for downstream tooling that matches by text.
+var ErrEBPFDataplaneRetired = errors.New(
+	"the legacy eBPF dataplane backend has been retired; " +
+		"use 'set system dataplane-type userspace' " +
+		"(see #1373)")
+
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
 // It clones the tree before expansion so the original tree is not mutated.
 func CompileConfig(tree *ConfigTree) (*Config, error) {
@@ -362,6 +378,9 @@ func validateDataplaneTypeStrict(cfg *Config) error {
 	if cfg.System.DataplaneType == dataplaneTypeDPDK {
 		return ErrDPDKDataplaneRetired
 	}
+	if cfg.System.DataplaneType == dataplaneTypeEBPF {
+		return ErrEBPFDataplaneRetired
+	}
 	return nil
 }
 
@@ -473,13 +492,12 @@ func validateClassOfServiceStrict(cos *ClassOfServiceConfig) error {
 func ValidateConfig(cfg *Config) []string {
 	var warnings []string
 
-	if cfg.System.DataplaneType == dataplaneTypeEBPF {
-		warnings = append(warnings,
-			"system dataplane-type ebpf selects the deprecated legacy eBPF "+
-				"dataplane explicitly; this is temporary compatibility "+
-				"while legacy source removal is staged. Omitting "+
-				"system dataplane-type selects the userspace dataplane.")
-	}
+	// Note (#1476): the previous "ebpf is deprecated" warning was
+	// removed because `validateDataplaneTypeStrict` now hard-rejects
+	// `dataplane-type ebpf` at commit time with
+	// `ErrEBPFDataplaneRetired`. ValidateConfig is never reached for
+	// EBPF-typed configs after that gate; keeping the warning here
+	// would be dead code.
 
 	// #653: when `services application-identification` is enabled,
 	// emit a one-line warning at commit time so operators see what

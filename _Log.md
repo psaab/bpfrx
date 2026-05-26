@@ -1,5 +1,316 @@
 # Action Log
 
+## 2026-05-26 — #1476 Phase B AWAITING-MERGE at f815c357
+
+- **Timestamp**: 2026-05-26T (r3 reviewers converged, posting marker)
+  - **Action**: Round-3 code reviews returned. Both AGY r3 and
+    Codex r3 MERGE-READY at HEAD f815c357. AGY r3 flagged an
+    out-of-scope observation: pkg/configstore/crypto.go has the
+    same FindChild first-match pattern in masterPasswordPRF (split
+    `system { master-password { ... } }` stanzas could miss the
+    master-password directive). Confirmed pre-existing pattern,
+    not introduced by #1476; deserves its own hardening issue.
+    Will be filed separately after #1476 merges.
+
+    Final reviewer state for the AWAITING-MERGE marker:
+    - Codex r3: MERGE-READY at f815c357
+    - AGY r3: MERGE-READY at f815c357
+    - Claude SMR: MERGE-READY (self-review at 04c0d19e, fixes
+      since then all addressed Codex r1/r2 findings)
+    - Copilot: STUCK ("exceeds maximum number of lines (20,000)")
+      → 3-of-4 Copilot-stuck exception applies per
+      feedback_copilot_two_bots policy.
+
+    Posting STANDALONE AWAITING-MERGE marker per
+    feedback_retirement_batch_smoke_at_end policy (no smoke marker;
+    smoke-runner singleton handles fast-merge).
+  - **File(s)**: docs/pr/1476-mechanical-bpf-removal/reviewer-ids.md,
+    _Log.md
+
+## 2026-05-26 — #1476 Phase B r2 fixes (Codex MERGE-NEEDS-MAJOR)
+
+- **Timestamp**: 2026-05-26T (r2 fixes after Codex r2 MERGE-NEEDS-MAJOR)
+  - **Action**: Round-2 code reviews returned. AGY r2 pending; Codex r2
+    MERGE-NEEDS-MAJOR with 3 findings:
+    F1 MAJOR: the rewrite helper still used `FindChild` which returns
+      only the FIRST top-level `system` (or `groups`) block. The
+      hierarchical parser admits split stanzas — e.g.
+        `system { host-name fw1; }`
+        `system { dataplane-type ebpf; }`
+      produces two top-level `system` nodes; the same applies to
+      multiple top-level `groups { ... }` blocks. The pre-r2 walker
+      missed the second and beyond, reopening F1 of r1 for the
+      split-stanza shape.
+    F2 MINOR: nested-groups-inside-groups case (acknowledged as
+      "current ExpandGroups only treats top-level groups as group
+      definitions" — not a current bug, but worth noting).
+    F3 NIT: header comment in maps_decouple_test.go still mentioned
+      BPFRX_LEGACY_LOADER_RETIRED=1 verbatim despite r1's intent to
+      strip it.
+
+    All 3 addressed in this commit:
+    - rewriteRetiredDataplaneType now uses three explicit helpers
+      (systemBlocksOf, groupsBlocksOf, systemBlocksOfNode) that
+      iterate every matching child instead of returning only the
+      first. Two new regression tests
+      TestRewriteRetiredDataplaneType_SplitSystemStanzas and
+      TestRewriteRetiredDataplaneType_SplitGroupsStanzas pin the fix.
+      Both call CompileConfig/CompileConfigForNode after rewrite to
+      confirm no strict-validator firing.
+    - Stripped the BPFRX_LEGACY_LOADER_RETIRED mention from the
+      maps_decouple_test.go header comment block entirely.
+    - F2 nested-groups is intentionally NOT addressed in this PR: it
+      isn't reachable today because ExpandGroups only treats
+      top-level groups as group definitions. If future Junos-parity
+      work admits nested groups, the walker recursion-step is
+      trivial; flagged for the future cleanup PR.
+
+    Validation: full go test ./... clean across 33 packages. 9
+    rewrite-helper tests pass including the 2 new split-stanza
+    regressions. 5x flake on TestRewriteRetiredDataplaneType_(
+    ApplyGroups|SplitSystem|SplitGroups) clean.
+  - **File(s)**: pkg/configstore/dataplane_retire.go,
+    pkg/configstore/dataplane_retire_test.go,
+    pkg/dataplane/userspace/maps_decouple_test.go
+
+## 2026-05-26 — #1476 Phase B r1 fixes (Codex MERGE-NEEDS-MAJOR)
+
+- **Timestamp**: 2026-05-26T (r1 fixes after Codex MERGE-NEEDS-MAJOR)
+  - **Action**: Round-1 code reviews returned. AGY r1 MERGE-READY;
+    Codex r1 MERGE-NEEDS-MAJOR with 5 findings:
+    F1 MAJOR: rewriteRetiredDataplaneType only walks top-level `system`,
+      missing apply-groups-injected `dataplane-type ebpf`. The strict
+      validator inside compileExpanded fires against the
+      post-expansion tree, so a config like
+      `groups { legacy { system { dataplane-type ebpf; } } }
+       system { apply-groups legacy; }` slips through the rewrite and
+      strands the daemon.
+    F2 MINOR: SyncApply WARN message used the LoadCaller phrasing
+      ("review and commit after daemon comes up"), wrong audience for
+      the HA peer-sync path where the un-upgraded primary needs the
+      remediation.
+    F3 MINOR: TestCommitRejectsRetiredEBPF and
+      TestCommitConfirmedRejectsRetiredEBPF in pkg/grpcapi missed the
+      codes.InvalidArgument assertion (only the message was checked).
+    F4 MINOR: docs/userspace-dataplane-gaps.md and docs/memory.md still
+      described pre-#1476 behavior (eBPF deprecation warning at compile,
+      xdp_progs/tc_progs pinning required).
+    F5 NIT: pkg/dataplane/userspace/maps_decouple_test.go header
+      comment still referenced the BPFRX_LEGACY_LOADER_RETIRED escape
+      hatch that the canary no longer uses.
+
+    All 5 fixed in this commit:
+    - rewriteRetiredDataplaneType now walks BOTH top-level system AND
+      every `groups { <name> { system { ... } } }` definition. Two
+      new tests TestRewriteRetiredDataplaneType_ApplyGroups{EBPF,DPDK}
+      pin the regression. CompileConfigForNode after rewrite confirms
+      no strict-validator firing.
+    - New retireRewriteCaller enum (LoadCaller, SyncCaller) selects
+      the right warn message + remediation hint per entry point.
+      Store.Load passes LoadCaller; Store.SyncApply passes SyncCaller.
+    - Added codes.InvalidArgument assertion to both gRPC tests.
+    - Rewrote stale prose in userspace-dataplane-gaps.md (line 151)
+      and memory.md (line 164) to past tense / current state.
+    - Replaced the BPFRX_LEGACY_LOADER_RETIRED comment block in
+      maps_decouple_test.go header with the post-#1476 narrative.
+
+    Test gates: full go test ./... clean (33 packages); 7 rewrite
+    helper tests pass including the two new apply-groups regressions.
+  - **File(s)**: pkg/configstore/dataplane_retire.go,
+    pkg/configstore/dataplane_retire_test.go,
+    pkg/configstore/store.go,
+    pkg/grpcapi/server_config_test.go,
+    docs/userspace-dataplane-gaps.md, docs/memory.md,
+    pkg/dataplane/userspace/maps_decouple_test.go
+
+## 2026-05-26 — #1476 Phase B implementation
+
+- **Timestamp**: 2026-05-26T (Phase B complete; awaiting code review)
+  - **Action**: #1451 closed (capstone PR #1557 merged as ee4b34bf).
+    Rebased plan branch onto current master ee4b34bf via /tmp/log-merge.py
+    union resolution on _Log.md conflict. Re-verified
+    `(*Daemon).legacyDP()` is gone from production code and
+    pkg/daemon/legacy_dataplane_canary_test.go is in place.
+    Executed the deletion per plan v4:
+    - Deleted bpf/xdp/*.c (9 files), bpf/tc/*.c (5 files),
+      bpf/xdp/README.md, bpf/tc/README.md, bpf/README.md.
+    - Deleted 14 generated bpf2go pairs
+      (pkg/dataplane/xpf{Xdp,Tc}*_x86_bpfel.{go,o}).
+    - Deleted pkg/dataplane/loader_ebpf.go and loader_stub.go.
+    - Preserved pkg/dataplane/userspace_xdp_bpfel.o and
+      userspace_xdp_rust.go; preserved bpf/headers/*.h, userspace-xdp/,
+      and test/xsk-repro/.
+    - Extracted retained Rust AF_XDP shim loader graph (16
+      functions + 5 constants + 1 type) from the deleted
+      loader_ebpf.go into new pkg/dataplane/loader_userspace_shim.go.
+    - Manager.Load() body rewritten to `return ErrEBPFBackendRetired`
+      (kept as retirement stub; DataPlane interface contract preserved).
+    - Added ErrEBPFBackendRetired sentinel (dataplane.go) and
+      ErrEBPFDataplaneRetired (config/compiler.go).
+    - Extended validateDataplaneTypeStrict to reject TypeEBPF.
+    - NewDataPlane(TypeEBPF) / NewRuntimeDataPlane(TypeEBPF) now
+      return the sentinel directly.
+    - Added daemon_run.go soft-fallback branch for
+      ErrEBPFBackendRetired, mirroring the existing DPDK arm.
+    - New pkg/configstore/dataplane_retire.go with
+      `rewriteRetiredDataplaneType` helper covering both `ebpf` and
+      `dpdk` retired values; wired into Store.Load() AND
+      Store.SyncApply() per AGY r4 finding for HA rolling-upgrade
+      safety.
+    - Removed ValidateConfig's EBPF deprecation warning (dead code
+      after strict reject).
+    - Narrowed Makefile clean glob from
+      `pkg/dataplane/*_bpfel.{go,o}` to `xpf*_bpfel.{go,o}` to
+      protect the retained shim object by name.
+    - Removed legacy `make generate-legacy-bpf` target and the now-empty
+      .PHONY arm; updated `make generate` header comment.
+    - Updated retirement-boundary canary:
+      retainedShimBoundaryBuildTagAllowlist now empty (was 14 bpf2go
+      entries + loader_stub.go); docs-pinned token block at line 1822
+      pruned of `*_bpfel.go`/`go:build 386 || amd64`/`loader_stub.go`/
+      `go:build ignore`. README.md narrative section also rewritten.
+    - Updated source-removal-manifest-1476.md: Build Hooks +
+      Tests/Docs subsections moved to separate H2 sections so the
+      manifest canary's section-scoped path scanner doesn't read
+      them as delete-list entries; Delete Manifest pruned to
+      narrative pointers only.
+    - Rewrote pkg/api/config_commit_test.go,
+      pkg/cli/cli_config_test.go, pkg/grpcapi/server_config_test.go,
+      pkg/config/parser_system_test.go ebpf-warning tests as
+      retirement-rejection assertions (5 test cases each surfacing
+      the verbatim retirement message via Contains, plus a
+      sentinel-match TestSentinelMatch in pkg/api).
+    - Rewrote TestBuildRuntimeDataPlaneEBPFRoutesToLegacyManager →
+      TestBuildRuntimeDataPlaneEBPFReturnsRetired in
+      pkg/daemon/dataplane_boot_test.go to assert ErrEBPFBackendRetired.
+    - Updated pkg/dataplane/userspace/shim_loader_boundary_test.go:45
+      and pkg/dataplane/userspace/maps_decouple_test.go:1320 to point
+      at loader_userspace_shim.go instead of the deleted loader_ebpf.go.
+    - Updated CLAUDE.md BPF Pipeline + Code Layout sections to past
+      tense; rewrote Quick Start `make generate` description.
+    - Updated docs/development-workflow.md, docs/testing.md,
+      docs/next-features/ipv6-session-fast-path.md,
+      pkg/dataplane/constants.go:14 doc comment to point at the
+      retained shim loader instead of the deleted loader_ebpf.go.
+    - New pkg/configstore/dataplane_retire_test.go with 5 tests:
+      TestRewriteRetiredDataplaneType_EBPF (rewrite, compile-clean,
+      DataplaneType empty); TestRewriteRetiredDataplaneType_DPDK;
+      TestRewriteRetiredDataplaneType_NoOpForUserspace;
+      TestRewriteRetiredDataplaneType_NoSystemNode;
+      TestStoreLoad_RewritesPersistedEBPFDataplaneType (end-to-end:
+      pre-#1476 persisted ebpf-tree → Load → ActiveConfig non-nil
+      with userspace default).
+
+    Test gates: `go build ./...` clean; `go test ./...` clean across
+    33 packages; 5x flake on retirement canaries clean. Grep proof:
+    `xpfXdp|xpfTc|loadXpfXdp|loadXpfTc|loadAllObjects` only appears
+    in (a) shim_loader_boundary_test.go negative-token list (intentional
+    drift-guard), (b) doc comments explaining the history. `bpf/xdp|bpf/tc/`
+    only appears in `retirement_boundary_canary_test.go` historical
+    context.
+  - **File(s)**: 51 files changed: 35 deletions (legacy source +
+    generated artifacts + loader_ebpf.go + loader_stub.go), 2 new files
+    (loader_userspace_shim.go, dataplane_retire.go +
+    dataplane_retire_test.go), 14 edited (sentinel wiring + test
+    rewrites + canary updates + doc sweeps + CLAUDE.md).
+
+## 2026-05-25 — #1476 Phase A PLAN-READY at r4
+
+- **Timestamp**: 2026-05-25T (Phase A complete)
+  - **Action**: Round-4 reviews returned: Codex r4 PLAN-READY (all
+    r3 stale-text findings confirmed closed; no new issues); AGY
+    r4 PLAN-READY with one Phase-B critical implementation
+    requirement — `Store.SyncApply()` at `pkg/configstore/store.go:205`
+    bypasses the `Store.Load()` rewrite hook, so HA rolling upgrades
+    will sync-loop on `ErrEBPFDataplaneRetired`. Plan §4.6 extended
+    to require `rewriteRetiredDataplaneType(tree)` to run in BOTH
+    `Store.Load()` AND `Store.SyncApply()` paths, with a Phase-B
+    unit test mirroring #1528's `TestLoad_RewritesPersistedDPDKDataplaneType`.
+    Phase A complete. Polling for #1451 close (waiting on #1516 +
+    #1521).
+  - **File(s)**: `docs/pr/1476-mechanical-bpf-removal/plan.md` v4
+    (PLAN-READY at r4),
+    `docs/pr/1476-mechanical-bpf-removal/reviewer-ids.md`, `_Log.md`
+
+## 2026-05-25 — #1476 Phase A v4 plan after r3 reviews
+
+- **Timestamp**: 2026-05-25T (Phase A v4 after r3 reviewer findings)
+  - **Action**: Round-3 reviews returned: AGY r3 PLAN-READY with
+    one cosmetic nit (risk-table count "4" → "5"); Codex r3
+    PLAN-NEEDS-MAJOR with 6 findings, all stale-text drift from
+    v1 prose that v2/v3 header rewrites didn't reach (no new
+    operational issues). v4 fixes: §1 #2 stale Manager.Load()
+    "either deleted or stubbed" → "is kept as retirement stub";
+    §5 invariant 8 stale "boundary tests pass unchanged" →
+    rewritten to acknowledge §4.3's shim_loader_boundary path fix;
+    §8 Q2 stale "all four tests construct Manager" → corrected;
+    §4.3 doc-sweep adds rows for constants.go:14, docs/testing.md:281,
+    docs/next-features/ipv6-session-fast-path.md:16,38; closing
+    footer "End of plan v1" → "End of plan v4"; risk-table
+    "4 retirement-manifest canaries" → "5"; "all four" literals
+    in v3 change-log header rewritten without losing meaning.
+  - **File(s)**: `docs/pr/1476-mechanical-bpf-removal/plan.md` v4,
+    `docs/pr/1476-mechanical-bpf-removal/reviewer-ids.md`, `_Log.md`
+
+## 2026-05-25 — #1476 Phase A v3 plan after r2 reviews
+
+- **Timestamp**: 2026-05-25T (Phase A v3 after r2 reviewer findings)
+  - **Action**: Round-2 reviews returned: Codex r2 PLAN-NEEDS-MAJOR
+    (5 findings, mostly stale-text drift between v2 header changes
+    and unchanged v1 prose, plus 2 NEW: shim_loader_boundary_test
+    hardcoded path + non-daemon ebpf-warning tests); AGY r2
+    PLAN-NEEDS-MINOR (4 missing retained helpers — overlapped with
+    Codex F3). v3 fixes: §5 Manager.Load() table row, §4.8 adds 5
+    additional retained symbols (drift errors + size constants),
+    §4.3 adds shim_loader_boundary_test.go path-fix row and 4
+    non-daemon ebpf-warning test rewrite rows, §8 prose updates,
+    "four manifest tests" → "five" sweep.
+  - **File(s)**: `docs/pr/1476-mechanical-bpf-removal/plan.md` v3,
+    `docs/pr/1476-mechanical-bpf-removal/reviewer-ids.md`, `_Log.md`
+
+## 2026-05-25 — #1476 Phase A v2 plan after r1 reviews
+
+- **Timestamp**: 2026-05-25T (Phase A v2 after r1 reviewer findings)
+  - **Action**: Round-1 reviews returned: Codex r1b
+    PLAN-NEEDS-MAJOR (6 findings: Manager.Load() interface break,
+    make clean nukes shim, retained-helper under-listing,
+    nat_port_counters misclass, loader_stub canary gaps, TypeEBPF
+    test migration); AGY r1 PLAN-NEEDS-MINOR (Makefile clean +
+    dataplane_boot_test rewrite). v2 plan incorporates all findings:
+    keeps Manager.Load() as ErrEBPFBackendRetired stub (not deleted);
+    narrows Makefile clean globs to xpf*_bpfel.{go,o}; rewrites
+    TestBuildRuntimeDataPlaneEBPFRoutesToLegacyManager to assert
+    retirement-sentinel; enumerates full retained shim helper list;
+    keeps nat_port_counters in pinnedMaps; deletes loader_stub
+    allowlist entry + docs-pinned token; corrects manifest test
+    count to 5.
+  - **File(s)**: `docs/pr/1476-mechanical-bpf-removal/plan.md` v2,
+    `docs/pr/1476-mechanical-bpf-removal/reviewer-ids.md`, `_Log.md`
+
+## 2026-05-25 — #1476 Phase A v1 plan drafted
+
+- **Timestamp**: 2026-05-25T (Phase A v1 draft)
+  - **Action**: Created worktree `refactor/1476-mechanical-bpf-removal`
+    off origin/master. Drafted plan v1 for #1476 (eBPF retirement
+    Phase: mechanical source removal of legacy `bpf/xdp/*.c`,
+    `bpf/tc/*.c`, 14 bpf2go generated pairs, `loader_ebpf.go`, and
+    legacy Makefile hooks). Plan mirrors the DPDK retirement Phase 3
+    (#1528) template: keeps `TypeEBPF` as a retirement-error token,
+    adds `validateDataplaneTypeStrictEBPF` commit-time validator with
+    verbatim retirement message, extends the
+    `rewriteRetiredDataplaneType` Load-time rewrite to handle the
+    EBPF persistent-config case, deletes the bpf2go graph in lockstep
+    with the legacy build hooks. Retained: `bpf/headers/*.h`,
+    `userspace-xdp/`, `pkg/dataplane/userspace_xdp_bpfel.o`,
+    `pkg/dataplane/userspace_xdp_rust.go`,
+    `pkg/dataplane/build-userspace-xdp.sh`. Manifest discipline
+    enforced by the 4 `TestLegacyBPFRemovalManifest*` canaries
+    already in tree from #1494.
+    Blocked on #1451 (sub-issues #1516, #1521 still OPEN); Phase B
+    rebases onto master once #1451 closes.
+  - **File(s)**: `docs/pr/1476-mechanical-bpf-removal/plan.md`,
+    `docs/pr/1476-mechanical-bpf-removal/reviewer-ids.md`, `_Log.md`
+
 ## 2026-05-26
 
 - **Timestamp**: 2026-05-26T02:50:00Z

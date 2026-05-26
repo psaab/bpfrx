@@ -44,16 +44,18 @@ import (
 
 // buildRuntimeDataPlane selects the userspace-native Boot() path for the
 // default and explicit userspace selections, and falls through to
-// dataplane.NewRuntimeDataPlane for every other type. The two
-// operator-facing cases on the fall-through branch today are the
-// explicit legacy eBPF rollback ("dataplane-type ebpf") and the
-// retired-DPDK sentinel ("dataplane-type dpdk" → ErrDPDKBackendRetired).
-// Unknown/custom types and any future registry-backed types also flow
-// through the same default branch and surface the legacy factory's
-// error (including "unknown dataplane type") verbatim.
+// dataplane.NewRuntimeDataPlane for every other type. After #1476
+// (legacy eBPF retirement) and #1527 (DPDK Phase 2), the only
+// operator-facing cases on the fall-through branch are the two
+// retirement-error sentinels: explicit "dataplane-type ebpf" →
+// ErrEBPFBackendRetired, and "dataplane-type dpdk" →
+// ErrDPDKBackendRetired. Unknown/custom types and any future
+// registry-backed types also flow through the same default branch
+// and surface the legacy factory's error (including "unknown
+// dataplane type") verbatim.
 //
 // Keeping the legacy branch routed through the dataplane factory
-// preserves the ErrDPDKBackendRetired sentinel handling unchanged AND
+// preserves both retirement sentinel handlings unchanged AND
 // preserves the existing AST canary in
 // pkg/dataplane/retirement_boundary_canary_test.go
 // (TestDaemonRuntimeEntryPointUsesRuntimeDataPlane) that requires
@@ -289,7 +291,32 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// config from the CLI / gRPC. The hard fatal-at-
 			// startup branch is reserved for genuinely unknown
 			// dataplane types (the default branch below).
+			//
+			// Note: Store.Load() now also rewrites persisted
+			// `dataplane-type dpdk` to empty before compile, so
+			// the typical path through buildRuntimeDataPlane
+			// resolves to userspace and never reaches this
+			// branch. The branch stays as defence-in-depth for
+			// callers (config sync, REST/gRPC candidate apply)
+			// that bypass Store.Load() and pass the retired
+			// type through explicitly.
 			slog.Warn("the DPDK dataplane backend has been retired; running in config-only mode until config is updated",
+				"type", dpType,
+				"err", err,
+				"remediation", "set system dataplane-type userspace",
+			)
+			d.dp = nil
+		} else if errors.Is(err, dataplane.ErrEBPFBackendRetired) {
+			// #1476: mechanical source removal of the legacy
+			// eBPF dataplane. Behaviour mirrors the DPDK arm
+			// above. Store.Load() / Store.SyncApply() both
+			// rewrite persisted `dataplane-type ebpf` to
+			// empty before compile, so the typical path
+			// never reaches this branch — but a candidate
+			// apply through REST/gRPC that explicitly passes
+			// the retired type will, and the daemon must stay
+			// up so the operator can correct the candidate.
+			slog.Warn("the legacy eBPF dataplane backend has been retired; running in config-only mode until config is updated",
 				"type", dpType,
 				"err", err,
 				"remediation", "set system dataplane-type userspace",

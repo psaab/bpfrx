@@ -23,26 +23,13 @@ const (
 )
 
 // go:generate directives.
-// Run "make generate" with clang + libbpf-dev installed for the full legacy
-// XDP/TC bpf2go batch plus the retained Rust userspace XDP shim object.
-// Run "make generate-userspace-xdp" to rebuild only the retained shim without
-// invoking legacy xdp_main/tc bpf2go generation.
+// After the #1476 source-removal phase of the #1373 eBPF retirement
+// the only generator step here is the retained Rust AF_XDP shim.
+// Run "make generate" (or "make build-userspace-xdp" which calls
+// "make generate-userspace-xdp" internally) to rebuild the retained
+// shim object embedded by userspace_xdp_rust.go.
 //
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 xpfXdpMain ../../bpf/xdp/xdp_main.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 //go:generate bash build-userspace-xdp.sh
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 xpfXdpScreen ../../bpf/xdp/xdp_screen.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 xpfXdpZone ../../bpf/xdp/xdp_zone.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 xpfXdpConntrack ../../bpf/xdp/xdp_conntrack.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 xpfXdpPolicy ../../bpf/xdp/xdp_policy.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 xpfXdpNat ../../bpf/xdp/xdp_nat.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 xpfXdpForward ../../bpf/xdp/xdp_forward.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 xpfXdpNat64 ../../bpf/xdp/xdp_nat64.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 xpfXdpCpumap ../../bpf/xdp/xdp_cpumap.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 xpfTcMain ../../bpf/tc/tc_main.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 xpfTcConntrack ../../bpf/tc/tc_conntrack.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 xpfTcNat ../../bpf/tc/tc_nat.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 xpfTcScreenEgress ../../bpf/tc/tc_screen_egress.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -strip llvm-strip-21 -cflags "-O2 -g -Wall" -target amd64 xpfTcForward ../../bpf/tc/tc_forward.c -- -I../../bpf/headers -I/usr/include/x86_64-linux-gnu
 
 // Manager manages the eBPF dataplane: programs, maps, and attachments.
 type Manager struct {
@@ -109,20 +96,28 @@ func (m *Manager) UsingUserspaceXDPShimEntryProgram() bool {
 	return m.XDPEntryProgram() == userspaceShimEntryProg
 }
 
-// Load loads all eBPF programs and maps. Returns an error if eBPF
-// programs have not been generated yet (run "make generate" first).
+// Load is a retirement stub after the #1476 mechanical source removal.
+// The legacy XDP/TC dataplane source, generated bpf2go bindings, and
+// the loadAllObjects() loader graph are all gone. The method stays in
+// tree because the DataPlane interface (pkg/dataplane/dataplane.go:209)
+// requires Load() and Manager.Start() at apply.go calls m.Load() —
+// deleting the method would break the compile-time interface
+// assertion at dataplane.go:30 and any test that constructs a
+// Manager directly.
+//
+// Production callers reach Load() only through the explicit
+// "dataplane-type ebpf" rollback path, which is now itself retired:
+// NewDataPlane(TypeEBPF) and NewRuntimeDataPlane(TypeEBPF) return
+// ErrEBPFBackendRetired directly, and daemon_run.go's soft-fallback
+// branch catches it. The Store.Load() / Store.SyncApply() rewrite
+// helpers rewrite persisted `dataplane-type ebpf` to empty before
+// compile, so the daemon never reaches this method on a normal
+// rolling upgrade.
+//
+// The Manager's userspace shim path uses LoadUserspaceShim() instead;
+// see CompileUserspaceShim for the production attachment flow.
 func (m *Manager) Load() error {
-	slog.Info("loading eBPF programs")
-
-	// loadAllObjects is implemented in loader_ebpf.go (generated build)
-	// or returns an error in loader_stub.go (no generated files).
-	if err := m.loadAllObjects(); err != nil {
-		return err
-	}
-
-	m.loaded = true
-	slog.Info("eBPF programs loaded successfully")
-	return nil
+	return ErrEBPFBackendRetired
 }
 
 // LoadUserspaceShim loads only the retained AF_XDP userspace XDP shim and the

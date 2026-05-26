@@ -276,7 +276,14 @@ printf 'show security flow session\nexit\n' | \
 └── tc_7
 ```
 
-**Restart flow:**
+**Restart flow (legacy eBPF path, retired in #1476):**
+
+The flow below describes the pre-#1476 daemon-restart behaviour for the
+legacy XDP/TC dataplane. After the mechanical source removal, the
+userspace dataplane (`userspace-dp`) handles restart via shim-only
+loading (`loadUserspaceShimObjects`) and userspace-side session-state
+preservation. Kept here as historical reference.
+
 1. SIGTERM → close Go FD handles (pinned links/maps stay in kernel)
 2. New daemon starts → `loadAllObjects()` reuses pinned maps (sessions preserved)
 3. `AttachXDP()` loads pinned link → `link.Update(newProg)` atomically replaces program

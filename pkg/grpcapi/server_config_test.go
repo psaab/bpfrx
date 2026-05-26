@@ -14,7 +14,12 @@ import (
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
-func newGRPCCommitWarningStore(t *testing.T) *configstore.Store {
+// newGRPCEBPFRejectStore stages `set system dataplane-type ebpf` so
+// the gRPC commit/commit-check handlers can exercise the
+// retirement-reject path that #1476 introduced. Prior to that, the
+// same shape returned an EBPF deprecation warning with a success
+// response.
+func newGRPCEBPFRejectStore(t *testing.T) *configstore.Store {
 	t.Helper()
 
 	store := configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))
@@ -27,20 +32,33 @@ func newGRPCCommitWarningStore(t *testing.T) *configstore.Store {
 	return store
 }
 
-func TestCommitCheckReturnsValidationWarnings(t *testing.T) {
-	s := &Server{store: newGRPCCommitWarningStore(t)}
+// TestCommitCheckRejectsRetiredEBPF asserts that the gRPC
+// CommitCheck RPC returns a codes.InvalidArgument status carrying
+// the retirement-reject message, not a success response with a
+// deprecation warning.
+func TestCommitCheckRejectsRetiredEBPF(t *testing.T) {
+	s := &Server{store: newGRPCEBPFRejectStore(t)}
 
-	resp, err := s.CommitCheck(context.Background(), &pb.CommitCheckRequest{})
-	if err != nil {
-		t.Fatalf("CommitCheck() error = %v", err)
+	_, err := s.CommitCheck(context.Background(), &pb.CommitCheckRequest{})
+	if err == nil {
+		t.Fatal("CommitCheck() succeeded; expected retirement-reject error")
 	}
-	if !grpcWarningsContain(resp.GetWarnings(), "system dataplane-type ebpf selects") {
-		t.Fatalf("warnings = %v, want explicit ebpf warning", resp.GetWarnings())
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("CommitCheck() error is not a *status.Status: %T (%v)", err, err)
+	}
+	if got, want := st.Code(), codes.InvalidArgument; got != want {
+		t.Errorf("status.Code() = %v, want %v", got, want)
+	}
+	if !strings.Contains(st.Message(), "legacy eBPF dataplane backend has been retired") {
+		t.Errorf("status.Message() missing eBPF retirement substring: %q", st.Message())
 	}
 }
 
-func TestCommitReturnsValidationWarnings(t *testing.T) {
-	store := newGRPCCommitWarningStore(t)
+// TestCommitRejectsRetiredEBPF asserts the gRPC Commit RPC also
+// surfaces the retirement-reject error.
+func TestCommitRejectsRetiredEBPF(t *testing.T) {
+	store := newGRPCEBPFRejectStore(t)
 	s := &Server{
 		store: store,
 		commitFn: func(context.Context, string) (*config.Config, error) {
@@ -48,17 +66,27 @@ func TestCommitReturnsValidationWarnings(t *testing.T) {
 		},
 	}
 
-	resp, err := s.Commit(context.Background(), &pb.CommitRequest{})
-	if err != nil {
-		t.Fatalf("Commit() error = %v", err)
+	_, err := s.Commit(context.Background(), &pb.CommitRequest{})
+	if err == nil {
+		t.Fatal("Commit() succeeded; expected retirement-reject error")
 	}
-	if !grpcWarningsContain(resp.GetWarnings(), "system dataplane-type ebpf selects") {
-		t.Fatalf("warnings = %v, want explicit ebpf warning", resp.GetWarnings())
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("Commit() error is not a *status.Status: %T (%v)", err, err)
+	}
+	if got, want := st.Code(), codes.InvalidArgument; got != want {
+		t.Errorf("status.Code() = %v, want %v", got, want)
+	}
+	if !strings.Contains(st.Message(), "legacy eBPF dataplane backend has been retired") {
+		t.Errorf("status.Message() missing eBPF retirement substring: %q", st.Message())
 	}
 }
 
-func TestCommitConfirmedReturnsValidationWarnings(t *testing.T) {
-	store := newGRPCCommitWarningStore(t)
+// TestCommitConfirmedRejectsRetiredEBPF asserts that the gRPC
+// CommitConfirmed RPC must not enter the rollback-timer flow when
+// the candidate carries the retired EBPF type.
+func TestCommitConfirmedRejectsRetiredEBPF(t *testing.T) {
+	store := newGRPCEBPFRejectStore(t)
 	s := &Server{
 		store: store,
 		commitConfirmedFn: func(context.Context, int) (*config.Config, error) {
@@ -66,22 +94,20 @@ func TestCommitConfirmedReturnsValidationWarnings(t *testing.T) {
 		},
 	}
 
-	resp, err := s.CommitConfirmed(context.Background(), &pb.CommitConfirmedRequest{Minutes: 10})
-	if err != nil {
-		t.Fatalf("CommitConfirmed() error = %v", err)
+	_, err := s.CommitConfirmed(context.Background(), &pb.CommitConfirmedRequest{Minutes: 10})
+	if err == nil {
+		t.Fatal("CommitConfirmed() succeeded; expected retirement-reject error")
 	}
-	if !grpcWarningsContain(resp.GetWarnings(), "system dataplane-type ebpf selects") {
-		t.Fatalf("warnings = %v, want explicit ebpf warning", resp.GetWarnings())
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("CommitConfirmed() error is not a *status.Status: %T (%v)", err, err)
 	}
-}
-
-func grpcWarningsContain(warnings []string, needle string) bool {
-	for _, warning := range warnings {
-		if strings.Contains(warning, needle) {
-			return true
-		}
+	if got, want := st.Code(), codes.InvalidArgument; got != want {
+		t.Errorf("status.Code() = %v, want %v", got, want)
 	}
-	return false
+	if !strings.Contains(st.Message(), "legacy eBPF dataplane backend has been retired") {
+		t.Errorf("status.Message() missing eBPF retirement substring: %q", st.Message())
+	}
 }
 
 // TestCompileCheckMultiErrorRendersThroughGRPC verifies that

@@ -42,7 +42,11 @@ func TestUserspaceStartupUsesShimLoaderBoundary(t *testing.T) {
 func TestUserspaceShimLoaderDoesNotReferenceLegacyObjects(t *testing.T) {
 	t.Parallel()
 
-	loaderSrc := goFunctionSource(t, filepath.Join("..", "loader_ebpf.go"), "loadUserspaceShimObjectsOnce")
+	// Post-#1476 the retained shim loader graph lives in
+	// loader_userspace_shim.go. The pre-#1476 location at
+	// `../loader_ebpf.go` is deleted along with the legacy
+	// XDP/TC bpf2go batch it used to coexist with.
+	loaderSrc := goFunctionSource(t, filepath.Join("..", "loader_userspace_shim.go"), "loadUserspaceShimObjectsOnce")
 	if !strings.Contains(loaderSrc, "loadRustUserspaceXDP") {
 		t.Fatalf("userspace shim loader must load the retained Rust shim:\n%s", loaderSrc)
 	}

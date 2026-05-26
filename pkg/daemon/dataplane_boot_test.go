@@ -40,23 +40,26 @@ func TestBuildRuntimeDataPlaneUserspaceUsesUserspaceBoot(t *testing.T) {
 	}
 }
 
-// TestBuildRuntimeDataPlaneEBPFRoutesToLegacyManager asserts that the
-// explicit "ebpf" rollback selection still constructs the legacy
-// *dataplane.Manager via the dataplane factory, NOT the userspace
-// adapter. The rollback path must not silently land on the userspace
-// runtime.
-func TestBuildRuntimeDataPlaneEBPFRoutesToLegacyManager(t *testing.T) {
+// TestBuildRuntimeDataPlaneEBPFReturnsRetired asserts that the helper
+// propagates dataplane.ErrEBPFBackendRetired unchanged for the retired
+// legacy eBPF selection after #1476 mechanical source removal. The
+// daemon outer loop has an errors.Is branch that depends on this
+// sentinel (the soft-fallback at daemon_run.go that mirrors the DPDK
+// path). Pre-#1476 the same shape constructed a legacy *dataplane.Manager
+// for the explicit-rollback path; the rollback path is now retired in
+// lockstep with the source deletion.
+func TestBuildRuntimeDataPlaneEBPFReturnsRetired(t *testing.T) {
 	t.Parallel()
 
 	dp, err := buildRuntimeDataPlane(dataplane.TypeEBPF)
-	if err != nil {
-		t.Fatalf("buildRuntimeDataPlane(ebpf): %v", err)
+	if err == nil {
+		t.Fatalf("buildRuntimeDataPlane(ebpf) = %T, nil; want ErrEBPFBackendRetired", dp)
 	}
-	if _, ok := any(dp).(*dataplane.Manager); !ok {
-		t.Fatalf("buildRuntimeDataPlane(ebpf) = %T, want *dataplane.Manager (legacy rollback)", dp)
+	if !errors.Is(err, dataplane.ErrEBPFBackendRetired) {
+		t.Fatalf("buildRuntimeDataPlane(ebpf) err = %v; want errors.Is(ErrEBPFBackendRetired)", err)
 	}
-	if _, ok := any(dp).(*dpuserspace.LegacyDataPlaneAdapter); ok {
-		t.Fatal("buildRuntimeDataPlane(ebpf) returned userspace adapter; rollback path is broken")
+	if dp != nil {
+		t.Fatalf("buildRuntimeDataPlane(ebpf) returned non-nil dp = %T", dp)
 	}
 }
 
@@ -97,6 +100,9 @@ func TestBuildRuntimeDataPlaneUnknownTypePropagatesError(t *testing.T) {
 	}
 	if errors.Is(err, dataplane.ErrDPDKBackendRetired) {
 		t.Fatalf("buildRuntimeDataPlane(unknown) returned ErrDPDKBackendRetired; sentinel must be reserved for dpdk")
+	}
+	if errors.Is(err, dataplane.ErrEBPFBackendRetired) {
+		t.Fatalf("buildRuntimeDataPlane(unknown) returned ErrEBPFBackendRetired; sentinel must be reserved for ebpf")
 	}
 }
 

@@ -11,24 +11,22 @@ BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime=$(BUILD_TIME)
 
 # eBPF compilation flags
-BPF_CFLAGS := -O2 -g -Wall -Werror -target bpf
-
-.PHONY: all generate generate-legacy-bpf generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp proto install clean test test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity build-dpdk-worker build-dpdk clean-dpdk
+.PHONY: all generate generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp proto install clean test test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity build-dpdk-worker build-dpdk clean-dpdk
 
 all: generate build build-ctl
 
-# Generate all dataplane artifacts: legacy XDP/TC bpf2go outputs plus the
-# retained Rust userspace XDP shim object.
+# Generate dataplane artifacts. After the #1476 source-removal phase of
+# the #1373 eBPF retirement umbrella, the only generator step here is the
+# retained Rust AF_XDP shim object embedded by userspace_xdp_rust.go.
 generate:
 	$(GO) generate ./pkg/dataplane/...
 
-# Generate only legacy XDP/TC eBPF dataplane bindings, leaving the retained
-# Rust userspace XDP shim object untouched.
-generate-legacy-bpf:
-	$(GO) generate -skip '^//go:generate bash build-userspace-xdp\.sh$$' ./pkg/dataplane/...
-
-# Generate only the retained Rust userspace XDP shim object. This target is the
-# #1473 source-removal canary: it must not invoke legacy xdp_main/tc bpf2go.
+# Generate only the retained Rust userspace XDP shim object. The
+# `generate` target above runs the same single directive; this alias
+# stays for callers wired to the older name (e.g. build scripts that
+# only need the shim and not full code-gen). Originally introduced as
+# the #1473 source-removal canary that must not invoke legacy
+# xdp_main/tc bpf2go (now permanently true post-#1476).
 generate-userspace-xdp:
 	$(GO) generate -run '^//go:generate bash build-userspace-xdp\.sh$$' ./pkg/dataplane
 
@@ -63,8 +61,15 @@ test:
 
 clean: clean-dpdk
 	rm -f $(BINARY) cli xpf-userspace-dp
-	rm -f pkg/dataplane/*_bpfel.go pkg/dataplane/*_bpfeb.go
-	rm -f pkg/dataplane/*_bpfel.o pkg/dataplane/*_bpfeb.o
+	# Narrowed glob (#1476): the retained Rust shim object lives at
+	# pkg/dataplane/userspace_xdp_bpfel.o. Cleaning it would break
+	# `make build` because userspace_xdp_rust.go uses //go:embed.
+	# We restrict to the legacy bpf2go `xpf*` prefix even though
+	# every matching file is gone after the #1476 deletion — the
+	# pattern stays as defence-in-depth against accidental
+	# re-introduction by a future PR.
+	rm -f pkg/dataplane/xpf*_bpfel.go pkg/dataplane/xpf*_bpfeb.go
+	rm -f pkg/dataplane/xpf*_bpfel.o pkg/dataplane/xpf*_bpfeb.o
 	rm -rf userspace-dp/target
 
 # Legacy standalone test environment management (single Incus VM/container).

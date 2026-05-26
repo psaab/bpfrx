@@ -93,6 +93,16 @@ func (s *Store) Load() error {
 		return nil // start fresh with empty config
 	}
 
+	// Rolling-upgrade tolerance (#1373 / #1525): a node may boot
+	// with `system dataplane-type ebpf` or `... dpdk` persisted
+	// from before the retirement-strict validator landed. Without
+	// this rewrite, compileTree below returns
+	// ErrEBPFDataplaneRetired / ErrDPDKDataplaneRetired, the daemon
+	// gets nil active config, and bootstraps blind. Rewriting the
+	// leaf to absent (defaults to userspace) lets the daemon come
+	// up so the operator can fix the config from CLI.
+	rewriteRetiredDataplaneType(tree, LoadCaller)
+
 	compiled, err := s.compileTree(tree)
 	if err != nil {
 		return fmt.Errorf("compile config: %w", err)
@@ -201,6 +211,14 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 	if chassisPreserve != nil {
 		chassisPreserve(tree)
 	}
+
+	// Rolling-upgrade tolerance (AGY r4 finding on #1476): an
+	// un-upgraded primary may push a config that still selects
+	// the retired DPDK or eBPF dataplane. Strict-validator-driven
+	// sync rejection would alarm-loop the cluster. Rewrite the
+	// retired leaf so the standby boots through cleanly while the
+	// operator updates the primary.
+	rewriteRetiredDataplaneType(tree, SyncCaller)
 
 	compiled, err := s.compileTree(tree)
 	if err != nil {

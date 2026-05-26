@@ -161,7 +161,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - Non-destructive SIGTERM (no FRR/DHCP/VRF cleanup); full teardown via `xpfd cleanup`
 - DHCP uses `context.Background()` — prevents address removal on restart
 - Deferred `link.Update()` AFTER all compilation; stale pins need `xpfd cleanup` + fresh start
-- **PROG_ARRAY pinning (CRITICAL):** `xdp_progs`/`tc_progs` MUST be pinned to survive daemon exit
+- **PROG_ARRAY pinning (historical, pre-#1476):** `xdp_progs`/`tc_progs` had to be pinned to survive daemon exit on the legacy XDP/TC dataplane. After #1476 the retained Rust AF_XDP shim no longer uses PROG_ARRAY tail calls; only the userspace-shared maps (`sessions`, `dnat_table`, `nat_port_counters`, etc.) are pinned. The legacy pins are cleaned up on startup by `cleanupUserspaceShimLegacyOnlyMapPins`.
 - Deterministic IDs (sorted keys); populate-before-clear; dnat_table before sessions (`a030446`)
 - **Deploy restart:** `systemctl stop` → `xpfd cleanup` → push binary → start. SO_REUSEADDR+SO_REUSEPORT for rebind
 

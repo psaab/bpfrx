@@ -149,13 +149,16 @@ Those are separate questions. Use:
 There are two distinct fallback boundaries:
 
 1. **Compile-time / reconcile-time gate**
-   - The Go manager chooses the userspace runtime path by default. Explicit
-     legacy eBPF selection can still use `xdp_main_prog` while #1373 source
-     removal is staged, but config compile emits a deprecation warning for
-     that explicit selection.
+   - The Go manager chooses the userspace runtime path by default.
+     Explicit legacy eBPF selection (`set system dataplane-type ebpf`)
+     was retired in #1476: the strict commit validator now hard-rejects
+     it with `ErrEBPFDataplaneRetired`, and the runtime factory returns
+     `ErrEBPFBackendRetired`. The deprecation-warning surface that
+     preceded the hard reject is gone.
    - The Go manager keeps `xdp_userspace_prog` as the userspace-mode
      XDP entry. Capability gates disarm helper forwarding rather than
-     swapping userspace runtime traffic into `xdp_main_prog`.
+     swapping userspace runtime traffic into the (now-deleted)
+     `xdp_main_prog`.
 
 2. **Runtime XDP decision**
    - Even when `xdp_userspace_prog` is active, the XDP shim can still:

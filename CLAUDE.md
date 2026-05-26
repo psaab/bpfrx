@@ -52,7 +52,7 @@ while #1373 retirement blockers are being closed.
 
 ## Quick Start
 ```bash
-make generate        # Generate Go bindings from BPF C via bpf2go
+make generate        # Build retained Rust AF_XDP shim (post-#1476)
 make build           # Build xpfd daemon
 make build-ctl       # Build remote CLI client
 make build-userspace-dp # Build the primary Rust AF_XDP dataplane helper
@@ -112,25 +112,26 @@ Or use `test/incus/cluster-setup.sh` directly with `BPFRX_CLUSTER_ENV` set:
 > `dpdk_worker/` C tree and `pkg/dataplane/dpdk/` Go manager are
 > removed in #1527/#1528.
 
-The BPF pipeline below is legacy context during the #1373 retirement. Keep it
-working until the staged removal phases land, but do not start new dataplane
-features on this path unless a blocker explicitly requires compatibility or
-rollback work. New packet-forwarding work belongs in `userspace-dp` and its
-`userspace-xdp` shim.
+The legacy BPF pipeline source was deleted in #1476 (mechanical source
+removal phase of the #1373 eBPF retirement umbrella). All new
+packet-forwarding work happens in `userspace-dp` and its `userspace-xdp`
+AF_XDP shim. The historical 14-program tail-call pipeline (XDP ingress
+main → screen → zone → conntrack → policy → nat → nat64 → forward; TC
+egress main → screen_egress → conntrack → nat → forward) is preserved
+in git history; `git log -- bpf/xdp/ bpf/tc/` walks the deleted source.
 
-### BPF Pipeline (14 programs, tail calls)
-```
-XDP Ingress: main -> screen -> zone -> conntrack -> policy -> nat -> nat64 -> forward
-TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
-```
-
-### Key Design Patterns
-- **Per-CPU scratch map** passes metadata between tail-call stages
-- **Dual session entries** (forward + reverse) in conntrack HASH map
-- **NAT "meta as desired state"**: pipeline stages set meta fields, xdp_nat reconciles packet
-- **Three-phase config compilation**: Junos AST -> typed Go structs -> eBPF map entries
-- **FRR-managed routing**: all routes (static, DHCP, per-VRF) via managed section in `/etc/frr/frr.conf`
-- **Full interface management**: xpfd owns ALL interfaces on the firewall — renames them via `.link` files, configures addresses/DHCP via `.network` files, and brings down unconfigured interfaces
+### Key Design Patterns (retained Rust AF_XDP shim + userspace-dp)
+- **Userspace AF_XDP shim** (`userspace-xdp/src/lib.rs`): per-CPU
+  binding arrays steer packets from native XDP to userspace queues.
+- **Dual session entries** (forward + reverse) in the shared conntrack
+  HASH map continue to back HA session-sync.
+- **Three-phase config compilation**: Junos AST → typed Go structs →
+  userspace-dp control messages (no eBPF map writes after #1476).
+- **FRR-managed routing**: all routes (static, DHCP, per-VRF) via
+  managed section in `/etc/frr/frr.conf`.
+- **Full interface management**: xpfd owns ALL interfaces on the
+  firewall — renames them via `.link` files, configures addresses/DHCP
+  via `.network` files, and brings down unconfigured interfaces.
 
 ### APIs
 - **gRPC** on 127.0.0.1:50051 — 48+ RPCs (config, sessions, stats, routes, IPsec, DHCP, cluster)
@@ -142,13 +143,11 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 ## Code Layout
 | Path | Description |
 |------|-------------|
-| `bpf/headers/*.h` | Shared C structs (common, maps, helpers, conntrack, nat) |
-| `bpf/xdp/*.c` | 9 XDP ingress programs (includes cpumap entry) |
-| `bpf/tc/*.c` | 5 TC egress programs |
+| `bpf/headers/*.h` | Shared C structs (common, maps, helpers, conntrack, nat) consumed by the retained Rust AF_XDP shim build (`MAX_INTERFACES`) and userspace-dp parity tests. The legacy `bpf/xdp/*.c` and `bpf/tc/*.c` source were deleted in #1476. |
 | `pkg/config/` | Junos parser, AST, typed config, compiler |
 | `pkg/cmdtree/` | Single source of truth for all CLI command trees |
 | `pkg/configstore/` | Candidate/active/commit/rollback, atomic DB persistence, JSONL audit journal |
-| `pkg/dataplane/` | Legacy eBPF loader, map management, bpf2go bindings, shared dataplane interface |
+| `pkg/dataplane/` | Manager type (kept for Manager.LoadUserspaceShim + accessors), retained Rust AF_XDP shim loader in `loader_userspace_shim.go`, retirement-error sentinels (#1476). Legacy bpf2go bindings deleted in #1476. |
 | `pkg/dataplane/userspace/` | Go manager for the Rust AF_XDP userspace dataplane |
 | `pkg/daemon/` | Daemon lifecycle (TTY detection, signal handling) |
 | `pkg/cluster/` | Chassis cluster HA (state machine, session sync, config sync, IPsec SA sync) |

@@ -86,28 +86,17 @@ var dpdkEBPFImportAllowlist = map[string]string{
 // package entirely.
 var dpdkBackendImportAllowlist = map[string]string{}
 
-var retainedShimBoundaryBuildTagAllowlist = map[string][]string{
-	// Generated legacy bpf2go artifacts keep bpf2go's architecture constraint
-	// until #1476 removes the legacy source/generated artifact set.
-	"pkg/dataplane/xpftcconntrack_x86_bpfel.go":    {"//go:build 386 || amd64"},
-	"pkg/dataplane/xpftcforward_x86_bpfel.go":      {"//go:build 386 || amd64"},
-	"pkg/dataplane/xpftcmain_x86_bpfel.go":         {"//go:build 386 || amd64"},
-	"pkg/dataplane/xpftcnat_x86_bpfel.go":          {"//go:build 386 || amd64"},
-	"pkg/dataplane/xpftcscreenegress_x86_bpfel.go": {"//go:build 386 || amd64"},
-	"pkg/dataplane/xpfxdpconntrack_x86_bpfel.go":   {"//go:build 386 || amd64"},
-	"pkg/dataplane/xpfxdpcpumap_x86_bpfel.go":      {"//go:build 386 || amd64"},
-	"pkg/dataplane/xpfxdpforward_x86_bpfel.go":     {"//go:build 386 || amd64"},
-	"pkg/dataplane/xpfxdpmain_x86_bpfel.go":        {"//go:build 386 || amd64"},
-	"pkg/dataplane/xpfxdpnat64_x86_bpfel.go":       {"//go:build 386 || amd64"},
-	"pkg/dataplane/xpfxdpnat_x86_bpfel.go":         {"//go:build 386 || amd64"},
-	"pkg/dataplane/xpfxdppolicy_x86_bpfel.go":      {"//go:build 386 || amd64"},
-	"pkg/dataplane/xpfxdpscreen_x86_bpfel.go":      {"//go:build 386 || amd64"},
-	"pkg/dataplane/xpfxdpzone_x86_bpfel.go":        {"//go:build 386 || amd64"},
-
-	// Ignored fallback stub for trees without generated legacy artifacts; it is
-	// deliberately not part of any normal build.
-	"pkg/dataplane/loader_stub.go": {"//go:build ignore"},
-}
+// retainedShimBoundaryBuildTagAllowlist enumerates files that may
+// carry non-default Go build constraints inside the retained shim
+// boundary. Pre-#1476 this listed the 14 bpf2go-generated
+// xpf{Xdp,Tc}*_x86_bpfel.go wrappers and the //go:build ignore
+// `loader_stub.go` placeholder. #1476 deleted all of those, so the
+// allowlist is now empty by intent — no retained file legitimately
+// needs a non-default build constraint. The empty map is preserved
+// (rather than the variable being deleted) because canary tests
+// in this file still consult it and rely on the iteration shape;
+// a nil map and an empty map are not identical for those callers.
+var retainedShimBoundaryBuildTagAllowlist = map[string][]string{}
 
 var userspaceShimAllowedMapTypes = map[string]ebpf.MapType{
 	"dnat_table":                 ebpf.Hash,
@@ -1830,10 +1819,13 @@ func TestRetirementBoundaryDocsMentionShimEscapeAssumptions(t *testing.T) {
 		"`//go:cgo_*`",
 		"`.s` / `.S`",
 		"`.syso`",
-		"`*_bpfel.go`",
-		"`//go:build 386 || amd64`",
-		"`pkg/dataplane/loader_stub.go`",
-		"`//go:build ignore`",
+		// `*_bpfel.go` and the bpf2go x86 build-tag stayed pinned
+		// pre-#1476 to call out the legacy generated wrappers'
+		// architecture constraint. After #1476 those files are gone.
+		// `pkg/dataplane/loader_stub.go` and `//go:build ignore`
+		// likewise referred to a deleted file; the canary now policed
+		// emptiness rather than presence, so the tokens are dropped
+		// from the want list.
 	}
 	for _, root := range retainedUserspaceShimBoundaryPackageRoots() {
 		want = append(want, "`"+repoRelativePath(t, root)+"`")

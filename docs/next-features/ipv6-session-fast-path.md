@@ -3,6 +3,12 @@
 Date: 2026-03-06  
 Status: Phase 1 partially implemented in `perf-ipv6-flow-cache`
 
+> **#1476 retirement note**: the `xdp_zone.c` and other `bpf/xdp/*.c`
+> paths referenced below were deleted in the mechanical source-removal
+> phase of the #1373 eBPF retirement. The proposal stays as a useful
+> design reference for the equivalent userspace-dp implementation; the
+> linked paths now resolve only in git history (`git log -- bpf/xdp/`).
+
 ## Problem
 
 IPv6 throughput is close to IPv4, but CPU cost is materially higher.

@@ -19,14 +19,15 @@ XDP/TC dataplane programs:
   `pkg/dataplane/userspace_xdp_bpfel.o` through
   `go generate -run '^//go:generate bash build-userspace-xdp\.sh$' ./pkg/dataplane`.
 - `make build-userspace-xdp` is an alias for the shim-only generation target.
-- `make generate` remains the full compatibility path and still regenerates
-  the legacy bpf2go XDP/TC artifacts as well as the retained shim.
-- `make generate-legacy-bpf` runs the legacy XDP/TC bpf2go directives while
-  leaving the retained shim object untouched.
+- `make generate` only rebuilds the retained Rust AF_XDP shim after #1476.
+  The legacy bpf2go XDP/TC generators were deleted in lockstep with the
+  C source they wrapped. The `make generate-legacy-bpf` target is gone;
+  any tooling that referenced it needs to migrate to `make generate` (or
+  `make build-userspace-xdp` for the shim-only path).
 
 Do not treat the retained shim as evidence that legacy `xdp_main` or TC
-dataplane program generation is required. The shim-only target is the #1473
-canary for that boundary.
+dataplane program generation is required. After #1476 the shim is the
+only generated artifact in the tree.
 
 The workflow has two distinct review cycles — one on the plan, one
 on the code — each with the same rule: **land when both reviewers

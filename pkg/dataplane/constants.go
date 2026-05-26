@@ -11,9 +11,10 @@ package dataplane
 // Drift between these and the BPF objects is the exact recurrence #814
 // was filed for (fab0 at ifindex 2561 overflowing tx_ports sized at 2048
 // and USERSPACE_BINDINGS sized at 1024*16=16384). The load-time
-// MaxEntries assertion in loader_ebpf.go catches drift by comparing the
-// embedded bpf2go / userspace_xdp_bpfel.o maps' max_entries against
-// these Go constants before ebpf.NewCollectionWithOptions runs.
+// MaxEntries assertion in loader_userspace_shim.go (validateUserspaceShimSpec)
+// catches drift by comparing the embedded userspace_xdp_bpfel.o maps'
+// max_entries against these Go constants before
+// ebpf.NewCollectionWithOptions runs.
 const (
 	// MaxInterfaces mirrors MAX_INTERFACES in bpf/headers/xpf_common.h.
 	// This is the dense max_entries of the tx_ports DEVMAP and the
