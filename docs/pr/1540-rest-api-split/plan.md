@@ -324,69 +324,44 @@ after this first split is stable.
 - Changes to `server.go`, `sse.go`, `auth.go`, `types.go`,
   or any `*_test.go`.
 
-## Open questions for adversarial review
+## Open questions for adversarial review — resolutions
 
-1. **Is the flat-package shape acceptable, or does this PR need to
-   ship subdirectories per the issue body?** Parent's wave-1
-   instruction is explicit ("split `pkg/api/` monolith into
-   sibling `pkg/api/<aspect>.go` files in the same package")
-   and forbids `api_sessions.go` underscore prefix. Both
-   instructions can be satisfied with flat sibling files. But
-   the issue body explicitly says "Do not replace a monolith
-   with files named `handlers_nat.go` in the same flat
-   package if a directory-level domain boundary is practical."
-   Reviewers: which mandate wins? PLAN-KILL is acceptable if
-   you conclude this PR is shipping the wrong shape.
+The seven open questions raised by plan v1 were all addressed during
+plan-review rounds (Codex + AGY), and the resolutions are reflected in
+the final landed shape:
 
-2. **Should `apiRuntimeDataPlane` move out of the slim entry
-   into its own `interfaces.go`-style file?** It's currently
-   at `handlers.go:25-44` (44 LOC). Moving it to a new
-   `interfaces.go` would collide with the interface-handler
-   `interfaces.go` filename. The plan puts it in `api.go`
-   alongside `writeJSON`/`writeError`/etc. Reviewers: better
-   home? `runtime.go`? Or split into `interfaces_handler.go`
-   to free up `interfaces.go` for the type?
+1. **Flat-package vs subdirectory shape.** Both reviewers ratified
+   flat-package. Subdirectories would force exported wrappers because
+   subpackages cannot define methods on `api.Server`; that's
+   architectural restructuring, not the wave-1 scope. Issue body's
+   subdirectory preference is therefore overridden for this PR. A
+   later step can still promote to subdirectories once boundaries
+   are stable.
 
-3. **Is `xpfCollector` plus `newCollector` plus
-   `Describe`+`Collect` the right slim core for `metrics.go`,
-   or should `newCollector` (which spans ~600 LOC of
-   descriptor allocations) move to a separate
-   `metrics_descriptors.go`?** The descriptor block is the
-   single largest function in metrics.go. Splitting it would
-   make `metrics.go` truly slim (<200 LOC). Counter-argument:
-   the descriptor block is logically tied to the struct
-   definition; separating them adds a navigation hop without
-   reducing the largest file substantially.
+2. **`apiRuntimeDataPlane` interface placement.** Both reviewers
+   ratified placing it in `api.go` alongside the JSON/HTTP helpers.
+   `interfaces.go` belongs to the interface-handler family;
+   `dataplane.go` was suggested as an alternative but not required.
 
-4. **Does the `show_text.go` carve-out (~300 LOC) make sense,
-   or should `showTextHandler` live with `system.go`?**
-   Argument for separate file: it's a generic dispatcher that
-   touches every domain. Argument against: it's invoked under
-   `GET /api/v1/show-text` which is conceptually a system /
-   operational command.
+3. **`metrics.go` slim-core composition.** Both reviewers required
+   `newCollector` (~600 LOC) to move out to `metrics_descriptors.go`.
+   Applied. `metrics.go` is now 354 LOC: struct + Describe + Collect
+   + emitHistogram + bucketUpperBoundNs + policyCounterID only.
 
-5. **Does the `config_handlers.go` filename clash with
-   `pkg/config/`?** Go imports `package config`, file naming
-   within `pkg/api` doesn't conflict with that, but reviewers
-   may prefer `configmode.go` or `config_mode.go` for
-   clarity. (The issue body suggests `config.go` for the
-   config-mode handlers.) Trade-off: `pkg/api/config.go`
-   would conflict in human readers' minds with `pkg/config`
-   (the parser). Plan picks `config_handlers.go` — is that
-   wrong?
+4. **`show_text.go` carve-out.** Ratified as kept. The 300-LOC
+   generic dispatcher legitimately stands alone.
 
-6. **Test coverage for the move.** Every existing test should
-   pass unchanged. Are there file-internal references
-   (unexported function references across files) that the
-   move could subtly break? `policyActionStr`, `protoName`,
-   `screenChecks`, `queryInt`, `queryUint16`,
-   `allInterfaceNames`, `applyResult`, `commitResponseFromConfig`
-   are all package-private. They must land in a file that
-   stays compiled (e.g. `api.go`) so callers in other split
-   files keep resolving them.
+5. **`config_handlers.go` filename.** Both reviewers required rename
+   to `config.go` for consistency with `nat.go`/`routing.go`/etc.
+   Applied.
 
-7. **Per-class CoS smoke applicability.** This PR is
-   control-plane only; no dataplane code is touched. The
-   wave-1 parent instructions say "No per-PR smoke" for this
-   PR; AWAITING-BATCH-MERGE after 4-of-4. Reviewers: agree
-   smoke can be deferred to the batch?
+6. **File-internal references after the move.** Codex required
+   tightening `api.go` scope: `policyActionStr` + `screenChecks` →
+   `security.go`, `protoName` → `sessions.go`, `configCommitResponse`
+   + `commitResponseFromConfig` → `config.go`. Applied.
+   `queryInt`/`queryUint16`/`allInterfaceNames` stayed in `api.go`
+   as genuinely cross-cutting helpers.
+
+7. **Per-class CoS smoke applicability.** Ratified: control-plane
+   only, no dataplane code touched, AWAITING-BATCH-MERGE after
+   4-of-4 attestation is the right gate.
