@@ -4523,3 +4523,15 @@
     status_parse,executor_test}.go (NEW); pkg/frr/frr.go (DELETED);
     pkg/frr/README.md (UPDATED); docs/pr/1547-frr-split/plan.md (v1→v3);
     docs/pr/1547-frr-split/reviewer-ids.md
+
+- **Timestamp**: 2026-05-26 21:30 UTC
+  - **Action**: #1547 PR #1587 code-review convergence. Codex
+    MERGE-READY task-mpn50enm-s4lwd2 (no findings; sandbox could
+    not run go test but local 5/5 flake-clean + full Go suite
+    green). Gemini MERGE-READY task-mpn50uq3-0v3fgu (no blockers,
+    7/7 verification points). Copilot COMMENTED with no inline
+    findings (reviewed 11/11 files). 4-of-4 reviewer attestation
+    achieved on first code-review round. AWAITING-BATCH-MERGE
+    marker is in the PR body for the refactor-chain batch.
+  - **File(s)**: PR #1587 at 4ff0b6c1,
+    docs/pr/1547-frr-split/reviewer-ids.md
