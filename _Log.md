@@ -155,6 +155,19 @@
     risk table, and 7 open questions for adversarial review.
   - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
     docs/pr/1326-worker-loop-extract/reviewer-ids.md
+## 2026-05-26 — #1328 Coordinator decompose Phase 2
+
+- **Timestamp**: 2026-05-26 (plan v1 drafted)
+  - **Action**: Worktree created off origin/master at 936b076d
+    on branch refactor/1328-coordinator-reconcile-split. Plan v1
+    written at docs/pr/1328-coordinator-reconcile-split/plan.md.
+    Decomposes 506-LOC reconcile() into 4 phase sub-files
+    (reconcile.rs orchestrator + reconcile_teardown.rs +
+    reconcile_reset.rs + reconcile_snapshot.rs +
+    reconcile_bringup.rs) and 326-LOC refresh_bindings() into
+    refresh_bindings.rs (copy_live_snapshot + zero_unbound_slot
+    dispatcher). Pure code motion; mod.rs shrinks ~830 LOC.
+    8 open questions for adversarial review.
 
 ## 2026-05-26 — #1476 Phase B AWAITING-MERGE at f815c357
 
