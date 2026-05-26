@@ -1,10 +1,32 @@
 # #1541 cluster manager split — plan
 
-**Status:** DRAFT v3 — addresses Codex r2 PLAN-NEEDS-MAJOR and
-Gemini r2 PLAN-NEEDS-MINOR (Gemini explicitly acknowledged the
-r1 counter-example as resolved by v2).
+**Status:** DRAFT v3.1 — addresses Codex r3 PLAN-NEEDS-MINOR
+(documentation precision: triggerGARP description, stale
+failover_batch mentions, lift-extraction line range). Gemini r3
+returned PLAN-READY.
 
-**Round 2 outcomes:**
+**Round 3 outcomes:**
+- Codex r3 (task-mpmz7q2x-fb57wm): PLAN-NEEDS-MINOR. Two
+  documentation precision fixes: (a) triggerGARP is a no-op/log
+  hook (cluster.go:1673-1675), not a `go sendGARP()` wrapper —
+  the plan must say "move body verbatim" with no goroutine
+  implication; (b) two stale references to failover_batch.go
+  remaining (Section 4.1 "files unchanged" list and Open Question
+  3). Plus a request to tighten the lift-extraction's "1505-1520
+  region" to the exact lifted statements so an implementor
+  doesn't accidentally lift more or less. "Fix those and I'd
+  call this PLAN-READY."
+- Gemini r3 (task-mpmz87va-rr2xjb): PLAN-READY. All round-2
+  findings addressed; lift-extraction acceptable single-call
+  coupling; failover.go ~1000 LOC cohesive; no new smear.
+
+**v3.1 response:** all three documentation precision fixes
+applied. triggerGARP description corrected (no-op/log hook, no
+goroutine), the lift-extraction now lists the exact three loops
+at cluster.go:1516-1541 with line counts, and the two stale
+failover_batch.go mentions are corrected. No design changes.
+
+**Round 2 outcomes (preserved for audit):**
 - Codex (task-mpmz1yi5-q7nath): PLAN-NEEDS-MAJOR. Finding:
   `handlePeerHeartbeat` still applies transfer-grace state
   (`peerTransferOutOverride`, `peerTransferCommitGraceUntil`)
@@ -42,9 +64,14 @@ r1 counter-example as resolved by v2).
    `suppressPeerTimeoutForTransferCommitLocked`, not
    `handlePeerHeartbeat`.
 3. **Gemini GARP finding.** `triggerGARP` moves to `garp.go`, not
-   `heartbeat_manager.go`. It's a one-line `go sendGARP()` wrapper
-   already adjacent to the burst sender code; co-locating it with
-   `sendGARP` is the obvious home.
+   `heartbeat_manager.go`. Note: per
+   `cluster.go:1673-1675`, the current body is a single
+   `slog.Info("cluster: primary transition", ...)` call — native
+   VRRP owns GARP and the method is a no-op/log hook today. The
+   move is verbatim (no goroutine, no behavior change). garp.go
+   is the right home because it co-locates the GARP-related
+   surface area with the existing burst-sender code in that file
+   for future maintenance.
 4. **Gemini failover-merge finding.** `failover_batch.go` merges
    into `failover.go`. The result is ~1000 LOC but the entire
    manual-failover and transfer-commit locking domain — single-RG
@@ -314,19 +341,23 @@ pkg/cluster/
                           #     changes.
   garp.go                 # (existing 571 LOC, unchanged body) — now
                           #   also gets triggerGARP method moved in from
-                          #   cluster.go. triggerGARP is the
-                          #   `go sendGARP(...)` wrapper that
-                          #   election.go and failover.go fire to
-                          #   broadcast L2 takeover, so co-locating it
-                          #   with sendGARP (the burst sender it wraps)
-                          #   keeps the L2 takeover invariant in one
-                          #   file. v3 fix for Gemini r2 GARP misplacement.
+                          #   cluster.go (cluster.go:1673-1675). Current
+                          #   body is a single slog.Info no-op/log hook;
+                          #   native VRRP owns actual GARP transmission.
+                          #   Move is verbatim — no goroutine, no
+                          #   behavior change. garp.go is the right home
+                          #   because the GARP-related surface area
+                          #   (burst sender plus this hook) belongs
+                          #   together for future maintenance.
+                          #   v3 fix for Gemini r2 GARP misplacement.
   events_log.go           # RecordEvent, EventHistoryFor.
                           #   (events.go holds types + EventHistory
                           #   struct; these are Manager methods.)
   status.go               # ALL Format* methods.
-  ... (existing reth.go, garp.go, sync*.go, monitor.go,
-       failover_batch.go, events.go, runtime.go unchanged)
+  ... (existing reth.go, sync*.go, monitor.go, events.go,
+       runtime.go unchanged; garp.go gains triggerGARP;
+       failover_batch.go is DELETED — its contents fold into
+       failover.go per Gemini r2.)
 ```
 
 ### 4.2 Mechanical move discipline
@@ -338,16 +369,25 @@ This is **pure code motion**. The rules:
 2. No method bodies are edited during the move. If a method needs
    fixing, it is fixed in a follow-up PR.
    **Exception (v3, Codex r2):** ONE lift-extraction is permitted:
-   the inline transfer-out-override application loop in
-   `handlePeerHeartbeat` (cluster.go:1505-1520 region) is hoisted
-   to a new method
+   the three back-to-back loops in `handlePeerHeartbeat` at
+   `cluster.go:1516-1541` are hoisted to a new method
    `applyTransferCommitOverridesOnPeerStateLocked(newPeerGroups
    map[int]PeerGroupState, now time.Time)` owned by `failover.go`.
-   The hoisted statements are byte-for-byte the same; only the
-   enclosing function changes. This is the minimum behavior-
-   preserving extraction that closes Codex's r2 finding (and
-   Gemini's r1 counter-example fully). No other method bodies
-   are touched.
+   The exact lifted block is:
+   - the `for rgID := range m.peerTransferOutOverride` loop (8
+     lines) that re-applies StateSecondaryHold for RGs with an
+     active peer-transfer-out override;
+   - the `for rgID, until := range m.peerTransferCommitGraceUntil`
+     loop (12 lines) that expires the grace window and re-applies
+     StateSecondaryHold for in-window RGs;
+   - the `for rgID, until := range m.localTransferOutHoldUntil`
+     loop (5 lines) that expires the local hold window.
+   The hoisted statements are byte-for-byte identical; only the
+   enclosing function changes. The helper takes `newPeerGroups`
+   by reference (Go map = reference type) and `now` as a value;
+   `m.peerTransferOutOverride`, `m.peerTransferCommitGraceUntil`,
+   and `m.localTransferOutHoldUntil` are read/mutated via the
+   `m` receiver as before. No other method bodies are touched.
 3. No new types are introduced. No fields are added or removed on
    `Manager`. No locking is changed.
 4. Imports are pruned per-file to satisfy `goimports`, but no new
@@ -420,12 +460,14 @@ immediately.
    change the calling protocol; reviewers should verify each moved
    `*Locked` helper still has the same set of callers, all of which
    still hold the lock.
-2. **Goroutine ownership.** `hbSender`, `hbReceiver`, the
-   per-RG `holdTimer`, and the GARP burst goroutine are all
-   started/stopped from specific Manager methods. After the move,
+2. **Goroutine ownership.** `hbSender`, `hbReceiver`, and the
+   per-RG `holdTimer` are all started/stopped from specific
+   Manager methods. After the move,
    `StartHeartbeat`/`StopHeartbeat`/`RestartHeartbeat` still own
-   `hbSender`/`hbReceiver` lifecycle; `triggerGARP` still spawns
-   the burst goroutine. No method changes who owns what.
+   `hbSender`/`hbReceiver` lifecycle. `triggerGARP` is a
+   no-op/log hook today (native VRRP owns GARP) and is moved
+   verbatim — no goroutine ownership changes. No method changes
+   who owns what.
 3. **Event channel ordering.** `sendEvent` is the single writer to
    `eventCh`. Reviewers should verify all callers of `sendEvent`
    continue to call the same function (move does not change the
@@ -531,14 +573,11 @@ immediately.
    code clearly separate from Manager-coupled orchestration. Is
    this the right call?
 
-3. **`failover.go` vs renaming `failover_batch.go`.** Single-RG
-   manual failover and multi-RG batch failover share state
-   (`failoverInProgress`, `peerTransferOutOverride`,
-   `peerTransferCommitGraceUntil`). Plan keeps them in two files
-   on the principle that the batch protocol is functionally an
-   independent algorithm (multi-RG ordering, batch-key, partial
-   commit/abort) that just happens to share state. Should they be
-   merged into one larger `failover.go` instead?
+3. **`failover.go` vs renaming `failover_batch.go`.**
+   *RESOLVED in v3:* Gemini r2 argued correctly that the entire
+   manual-failover locking domain belongs in one file. v3 folds
+   `failover_batch.go` into `failover.go` (~1000 LOC total).
+   See §4.1. This question is no longer open.
 
 4. **`group_state.go` vs `manager.go`.** Several
    small accessors (`NodeID`, `ClusterID`, `IsLocalPrimary`,
