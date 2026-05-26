@@ -1,5 +1,161 @@
 # Action Log
 
+## 2026-05-26 — #1326 PR #1569 AWAITING-BATCH-MERGE at 18fd27f8
+
+- **Timestamp**: 2026-05-26T (4-of-4 MERGE-READY on 18fd27f8)
+  - **Action**: Drove PR #1569 through 6 code-review rounds. Final
+    SHA 18fd27f8 has 4-of-4 attestation: Codex MERGE-READY (final),
+    AGY MERGE-READY (final), Copilot r2 inline comment proposed
+    the explicit-path change that 18fd27f8 implements, Claude SMR
+    MERGE-READY (posted on PR). Posted AWAITING-BATCH-MERGE
+    marker. Smoke deferred per wave-1 rules.
+  - **Notes**: Codex r4 flagged rustfmt as failing — verified
+    locally as false positive (rustfmt 1.9.0-stable returns exit 0
+    on both touched files; cargo fmt --check noise is pre-existing
+    master drift in unrelated files). Copilot re-review did not
+    trigger on 18fd27f8 despite gh pr edit --add-reviewer Copilot
+    + @copilot review — but Copilot's r2 inline comment on
+    be71872c explicitly proposed the exact change in 18fd27f8, so
+    that stands as the formal attestation.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
+## 2026-05-26 — #1326 Phase 1 implementation + PR-prep
+
+- **Timestamp**: 2026-05-26T (round 6 PLAN-READY, then implementation)
+  - **Action**: Codex r5 returned PLAN-NEEDS-MINOR with one wording
+    fix at plan.md:697 ("&mut state.dbg_state ONLY" wording
+    inconsistent with the v3.3 changelog). Fixed in v3.4
+    (commit 6f384430). Codex r6 (task-mpmwdrx4-kpdreh) confirmed
+    PLAN-READY. AGY r4 already PLAN-READY since v3.2. Both
+    reviewers PLAN-READY on v3.4 — cleared to implement.
+  - **Implementation**: Phase-1 file-level extraction shipped. The
+    1278-LOC `worker_loop` body moved verbatim from worker/mod.rs
+    (L995-L2273) to a new `worker/loop_body/mod.rs`. `mod.rs` now
+    has `mod loop_body; pub(crate) use loop_body::worker_loop;` and
+    drops the body. mod.rs LOC: 2635 → 1359. Pure code motion;
+    cargo check clean; 1487 tests pass (one pre-existing master-
+    state doc-guard failure unrelated to this PR — same failure on
+    origin/master at 936b076d).
+  - **Deferred**: per-stage carve into setup.rs + tick.rs +
+    poll_drive.rs + debug_report.rs is the eventual target
+    architecture but deferred to follow-up PRs. Rationale documented
+    in plan.md "Deferred to follow-up tickets" section: risk
+    isolation (single-file move is provably semantic-equivalent),
+    reviewer concerns only apply to sub-fn extraction (not file-level),
+    and incremental landing matches #959/#1189 pattern.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md,
+    userspace-dp/src/afxdp/worker/mod.rs,
+    userspace-dp/src/afxdp/worker/loop_body/mod.rs (new)
+
+## 2026-05-26 — #1326 plan v3.3 — Codex r4 doc-consistency fixes
+
+- **Timestamp**: 2026-05-26T (round 4 reviews returned)
+  - **Action**: AGY r4 (review-mpmw4xjc-92bdff) returned PLAN-READY
+    independently — full substantive re-confirmation on every
+    dimension: borrow shape, hybrid inlining, allocation audit,
+    edition 2024, CoS rebuild predicate (all 7 sources), param count
+    (35). Codex r4 (task-mpmw4sj7-dxkyqo) returned PLAN-NEEDS-MINOR
+    with 3 doc-consistency issues only — substantive design rated
+    "close" and "Not ready until the stale conflicting directives
+    are cleaned." v3.3 cleanups: (a) propagated the &state.sessions
+    addition to debug_report::maybe_emit signature description in
+    BOTH the file tree section and the inline-annotation section,
+    (b) fixed the orchestrator pseudocode "/* same 38-param … */"
+    comment to "35-param", (c) cleaned stale topology refs
+    (arc_refresh.rs, shutdown::tear_down, idle::handle, "7+ files"
+    in risk table). Dispatching r5 to confirm.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
+## 2026-05-26 — #1326 plan v3.2 — Codex r3 PLAN-NEEDS-MINOR addressed
+
+- **Timestamp**: 2026-05-26T (Codex r3 verdict extracted from log)
+  - **Action**: Codex r3 (replayed via log capture from
+    task-mpmvuetd-57y479; harness lost the id but the file log
+    captured the full verdict) returned PLAN-NEEDS-MINOR with 6
+    items. AGY r3 issue #1 was the same as Codex #2 (nested-field
+    qualifier, fixed in v3.1). Remaining items addressed in v3.2:
+    (1) debug_report::maybe_emit signature adds &state.sessions
+    for sessions.len + stall-dump iterator; (3) toned down LLVM
+    "can keep in registers regardless" claim to a hint with cited
+    Rust Reference + LLVM LangRef caveat; (4) acknowledged
+    pre-existing Vec paths in expire_stale_entries (gated
+    short-circuit, no heap alloc) and drain_deltas(256)
+    (lifecycle-event triggered); (5) added
+    cos_shared_exact_backlogs to the cos_fast_interfaces rebuild
+    predicate (Codex caught I miscounted — it's 7 rotation sources
+    not 6); (6) corrected param count 38 → 35; (7) cleaned stale
+    "6/8 files" language to land on the final 5-file tree (mod +
+    setup + tick + poll_drive + debug_report). Both reviewers
+    arriving at PLAN-NEEDS-MINOR with all findings address-able by
+    plan-doc edits is the strongest signal yet that v3.2 will land
+    PLAN-READY on round-4.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
+## 2026-05-26 — #1326 plan v3.1 — AGY r3 nested-field qualifier fix
+
+- **Timestamp**: 2026-05-26T (AGY r3 result fetched)
+  - **Action**: AGY r3 (review-mpmvtaei-6yvid7) returned
+    PLAN-NEEDS-MINOR with 1 trivial compile-bug fix: the
+    drive_one_round call site in the v3 orchestrator sketch
+    references `&mut state.dbg_counters` / `dbg_rx_total` /
+    `dbg_forward_total` but v3 moved those fields under
+    `state.dbg_state`. AGY r3 verdict was PLAN-NEEDS-MINOR on all
+    other 6 dimensions (borrow shape, allocation audit, re-export,
+    hidden invariants, hybrid inlining, file tree, architectural
+    mismatch). Fixed addressing in plan.md; waiting on Codex r3.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md
+
+## 2026-05-26 — #1326 plan v3 (AGY r2 PLAN-NEEDS-MINOR addressed)
+
+- **Timestamp**: 2026-05-26T (AGY r2 result fetched, Codex r2 lost)
+  - **Action**: AGY r2 (review-mpmvbr0c-i8e6wh) returned
+    PLAN-NEEDS-MINOR with 4 actionable items. v3 addresses all four:
+    (1) bundle dbg/wr telemetry into DebugReportState nested in
+    LoopState so debug_report::maybe_emit no longer takes &mut state
+    wholesale, (2) shutdown signature fix — pass &Arc<ForwardingState>
+    so the final cos_status republish compiles (resolved by inlining
+    shutdown into the orchestrator), (3) hybrid inlining on
+    tick::arc_refresh — outer is #[inline(always)] but the cold
+    cos_fast_interfaces rebuild inner helper is #[inline(never)] +
+    #[cold] to protect L1i footprint, (4) collapse shutdown.rs +
+    idle.rs into mod.rs (6 → 4 files). Codex r2 task
+    task-mpmvbj5i-hw5hra LOST from the harness again (same
+    long-running session-state drop pattern). Re-dispatching Codex
+    + AGY in parallel on v3.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
+## 2026-05-26 — #1326 plan v2 (AGY r1 PLAN-NEEDS-MAJOR addressed)
+
+- **Timestamp**: 2026-05-26T (AGY r1 result fetched)
+  - **Action**: AGY r1 (review-mpmurh2n-sfmiks) returned
+    PLAN-NEEDS-MAJOR with 4 action items: (1) narrow phase-fn
+    signatures to avoid &mut LoopState whole-struct barrier at the
+    poll_drive boundary, (2) upgrade #[inline] → #[inline(always)],
+    (3) consolidate 10 files → 6 by folding non-poll tick phases
+    into tick.rs, (4) resolve missing runtime.rs discrepancy
+    (rolled into tick.rs as tick::runtime_publish). Codex r1 task
+    was lost from the harness (session-state drop on long-running
+    review batch); will be re-dispatched on v2 alongside AGY r2.
+    Plan revised; v2 published.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
+## 2026-05-26 — #1326 worker_loop extract plan v1 drafted
+
+- **Timestamp**: 2026-05-26T
+  - **Action**: Drafted plan v1 for #1326 — extracting ~1278-LOC
+    `worker_loop` body from `userspace-dp/src/afxdp/worker/mod.rs`
+    into `worker/loop_body/` directory module (8 phase files +
+    orchestrator). Wrote plan with allocation audit, cold-path
+    annotations, LoopState struct sketch, hidden invariants list,
+    risk table, and 7 open questions for adversarial review.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
 ## 2026-05-26 — #1476 Phase B AWAITING-MERGE at f815c357
 
 - **Timestamp**: 2026-05-26T (r3 reviewers converged, posting marker)
