@@ -4358,3 +4358,18 @@
       ordering invariant.
   - **File(s)**:
     `docs/pr/1342-forwarding-build-split/plan.md` v2.
+
+## 2026-05-26 — #1342 implementation complete
+
+- **Timestamp**: 2026-05-26T (implementation done, tests pass)
+  - **Action**: Implemented plan v2 layout. Created
+    forwarding_build/{mod.rs (345L), zones.rs (46L),
+    tunnels.rs (53L), interfaces.rs (215L), fib.rs (289L),
+    cos.rs (470L)}, moved tests to forwarding_build/tests.rs.
+    Updated afxdp/mod.rs include from `#[path] mod` to plain
+    `mod forwarding_build;`. Build clean (24 pre-existing
+    warnings unchanged). Cargo tests: 1416 pass + 1 pre-existing
+    flake (afxdp::wg::engine::reconcile_peers_snapshot_is_atomic
+    — verified 5x clean on retry, unrelated subsystem). Go
+    tests: clean.
+  - **File(s)**: see above.

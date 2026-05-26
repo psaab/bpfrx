@@ -64,7 +64,6 @@ mod checksum;
 mod flow_cache;
 #[path = "forwarding/mod.rs"]
 mod forwarding;
-#[path = "forwarding_build.rs"]
 mod forwarding_build;
 #[path = "frame/mod.rs"]
 mod frame;
