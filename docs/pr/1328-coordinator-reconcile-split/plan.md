@@ -41,8 +41,12 @@ Concrete v2 deltas:
    citation. `:1310` is a `refresh_bindings` zero-out test, not a
    `reconcile(None, ...)` test. Add a new
    `coordinator::tests::reconcile_with_none_snapshot_preserves_stage_sequence`
-   test that asserts the `start`→`stopped`→`no_snapshot` stage
-   sequence and zero new bindings in `workers.live`.
+   test that asserts the final state after `reconcile(None, ...)`:
+   `last_reconcile_stage == "no_snapshot"`, `reconcile_calls == 1`,
+   `workers.live` empty, `slow_path == None`. (`last_reconcile_stage`
+   is a single field with no history, so the test asserts the final
+   write only — the per-stage write ordering is reviewed by reading
+   the diff against the inventory in §Hidden invariants #2.)
 6. **`PreservedReconcileState`:** drop `had_live_workers`. The
    500ms quiesce check lives entirely inside the teardown helper;
    the orchestrator does not need to see the flag. Two fields:
@@ -63,7 +67,7 @@ Concrete v2 deltas:
 
 ## Issue framing
 
-`userspace-dp/src/afxdp/coordinator/mod.rs` is 2026 LOC of production
+`userspace-dp/src/afxdp/coordinator/mod.rs` is 2026 LOC of production (`wc -l`)
 code (zero inline tests — `coordinator/tests.rs` already holds the
 1089 LOC test suite from the #1046 P1 colocation pattern). Two
 functions dominate:
@@ -78,7 +82,7 @@ functions dominate:
   parallel zero-out branch for unregistered slots.
 
 Both exceed the `docs/engineering-style.md` god-function threshold
-(>100 LOC) by 3–5×. The file as a whole is ~26 LOC under the 2000
+(>100 LOC) by 3–5×. The file as a whole is ~26 LOC OVER the 2000
 LOC monolith threshold and accreting; the issue body cites #1189's
 established `coordinator/` mod-dir layout (Phase 1 pulled supervisor
 helpers into `coordinator/supervisor.rs`) as the natural template
@@ -197,8 +201,8 @@ impl Coordinator {
         self.reconcile_calls += 1;
         self.last_reconcile_stage = "start".to_string();
 
-        let preserved = self.reconcile_teardown(bindings);
-        self.reconcile_reset_bindings(bindings);
+        let preserved = reconcile::teardown::tear_down(self, bindings);
+        reconcile::reset::reset_binding_counters(bindings);
 
         let Some(snapshot) = snapshot else {
             self.policy_counters.reconcile_rules(&[]);
@@ -206,15 +210,15 @@ impl Coordinator {
             return;
         };
 
-        let Some(fds) = self.reconcile_apply_snapshot(
-            snapshot, bindings, preserved.slow_path,
+        let Some(fds) = reconcile::snapshot::apply_snapshot(
+            self, snapshot, bindings, preserved.slow_path,
         ) else {
             // last_reconcile_stage + binding.last_error already set
             return;
         };
 
-        self.reconcile_bringup_workers(
-            snapshot, bindings, fds, ring_entries,
+        reconcile::bringup::bring_up_workers(
+            self, snapshot, bindings, fds, ring_entries,
             preserved.synced_sessions,
         );
         self.refresh_bindings(bindings);
@@ -222,36 +226,41 @@ impl Coordinator {
 }
 ```
 
-Each phase is a `pub(super) fn` method on `Coordinator` defined in
-its own module. The free `mod` declarations in `coordinator/mod.rs`
-gain four new lines.
+Each phase helper is a `pub(super) fn` defined in its own module
+inside `coordinator/reconcile/`. `coordinator/mod.rs` gains exactly
+two new top-level `mod` declarations: `mod reconcile;` and
+`mod refresh_bindings;`. The four phase modules (`teardown`,
+`reset`, `snapshot`, `bringup`) are declared inside
+`coordinator/reconcile/mod.rs`, not at the top level.
 
 ### Sub-file contents (per phase)
 
-**`reconcile_teardown.rs`** — preserve synced sessions + healthy
-slow-path, call `stop_inner(false)`, sleep 500ms if there were
-live workers (the mlx5 quiesce). Returns a `PreservedReconcileState`.
+**`coordinator/reconcile/teardown.rs`** — preserve synced sessions
++ healthy slow-path, call `stop_inner(false)`, sleep 500ms if
+there were live workers (the mlx5 quiesce). Returns a
+`PreservedReconcileState`.
 
-**`reconcile_reset.rs`** — single function
+**`coordinator/reconcile/reset.rs`** — single function
 `reset_binding_counters(bindings: &mut [BindingStatus])`. Pure
 function over the binding slice; no `&mut self` dependency.
 
-**`reconcile_snapshot.rs`** — installs the
+**`coordinator/reconcile/snapshot.rs`** — installs the
 `ValidationState`/`ForwardingState`, re-arms the slow path, opens
 the required BPF map pins. The four early-return error legs (no
 xsk pin / no heartbeat pin / no session pin / open-fd failures)
-become a single `Option<DnatTableFds + OwnedFd handles>` return,
+become a single `Option<ReconcileSnapshotFds>` return,
 with the function itself setting `last_reconcile_stage` + per-binding
 `last_error` on failure. Caller gets `Option<ReconcileSnapshotFds>`
 and bails early when `None`.
 
-**`reconcile_bringup.rs`** — the worker-plan loop, shared-UMEM
-status backfill, mirror-target map publish, CoS runtime-map
-refresh, replay of preserved synced sessions, per-worker spawn
-loop (including the #925 panic slot insert/remove), and the
-neighbor-monitor + local-tunnel-source start. Ends without calling
-`refresh_bindings` — that call is moved up to the orchestrator so
-the order of operations is visible at one read.
+**`coordinator/reconcile/bringup.rs`** — the worker-plan loop,
+shared-UMEM status backfill, mirror-target map publish, CoS
+runtime-map refresh, replay of preserved synced sessions,
+per-worker spawn loop (including the #925 panic slot insert/remove
+inline), and the neighbor-monitor + local-tunnel-source start.
+Ends without calling `refresh_bindings` — that call is moved up
+to the orchestrator so the order of operations is visible at one
+read.
 
 **`refresh_bindings.rs`** — `refresh_bindings` becomes the
 dispatcher. **Codex r1 #1 correction:** take `BindingLiveSnapshot`
@@ -314,9 +323,14 @@ allocations stay as-is.
    is the `tx_submit_latency_hist.resize()` + `copy_from_slice()`
    pair (which only allocates if capacity is insufficient — steady
    state reuses the same backing buffer). After refactor, the
-   `copy_live_snapshot` helper must take the histogram by reference
-   to avoid a clone, and the unbound branch must continue to use
-   `.clear()` rather than `= Vec::new()`.
+   `copy_live_snapshot(binding, snap)` helper takes the
+   `BindingLiveSnapshot` **by value** (it owns `String` fields),
+   but the histogram copies use `&snap.tx_submit_latency_hist`
+   and `&snap.tx_kick_latency_hist` via `copy_from_slice` so the
+   backing `Vec<u64>` storage in `BindingStatus` is reused in
+   place — no `tx_*_latency_hist` clone, no per-status-poll
+   allocation. The unbound branch must continue to use
+   `.clear()` rather than `= Vec::new()` to retain capacity.
 
 The plan explicitly preserves these. No new `Box::new`,
 `Arc::new`, `String::from`, or `vec![]` calls are introduced on
