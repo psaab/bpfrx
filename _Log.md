@@ -82,6 +82,36 @@
     the new module boundaries.
   - **File(s)**: docs/pr/1546-filter-engine-split/plan.md (NEW),
     docs/pr/1546-filter-engine-split/reviewer-ids.md (NEW).
+## 2026-05-26 — #1331 submit_cos_batch per-variant extract
+
+- **20:16 UTC 2026-05-26** — worktree created at refactor/1331-submit-cos-batch-per-variant off origin/master (63dfe02a)
+- **20:16 UTC 2026-05-26** — wrote `docs/pr/1331-submit-cos-batch-per-variant/plan.md` (DRAFT v1)
+- **20:16 UTC 2026-05-26** — wrote `docs/pr/1331-submit-cos-batch-per-variant/reviewer-ids.md` stub
+- **20:18 UTC 2026-05-26** — dispatched plan v1 round-1: Codex task-mpn2uc3f-bfc18j, Gemini task-mpn2v4xq-m9fqna, AGY review-mpn2vgin-13r8jz
+- **20:20 UTC 2026-05-26** — AGY round-1 PLAN-NEEDS-MAJOR (drop submit/ subdir, single-file extract)
+- **20:21 UTC 2026-05-26** — Codex round-1 PLAN-NEEDS-MAJOR (Local sidecar mirror_clone prefix invariant false; existing defect); Gemini PLAN-NEEDS-MINOR (drop submit/ subdir)
+- **20:22 UTC 2026-05-26** — wrote plan v2: flat-sibling layout (`submit_local.rs` + `submit_prepared.rs` under queue_service/), documented mirror_clone defect carry-over, no visibility bumps
+- **20:24 UTC 2026-05-26** — dispatched plan v2 round-2: Codex task-mpn32ftd-8uza6f, AGY review-mpn32taj-4iawxl, Gemini task-mpn32wlj-v1nrhu
+- **20:28 UTC 2026-05-26** — round-2 results: AGY PLAN-READY, Gemini PLAN-READY, Codex PLAN-NEEDS-MINOR (doc-only stale v1 prose). Claude SMR PLAN-READY (hostile-verified #1561 race surface, cross-arm independence, borrow shape, mirror_clone carry-over)
+- **20:29 UTC 2026-05-26** — cleaned stale v1 doc references; plan v2 PLAN-READY across all four reviewers
+- **20:32 UTC 2026-05-26** — implemented: created submit_local.rs (145 LOC) + submit_prepared.rs (140 LOC); replaced 221-LOC submit_cos_batch with 43-LOC match shim; moved restore_cos_{local,prepared}_items into their owning child modules; dropped from mod.rs.
+- **20:34 UTC 2026-05-26** — cargo build clean (122 pre-existing warnings, 0 errors).
+- **20:34 UTC 2026-05-26** — 1503 cargo tests pass; 1 pre-existing master failure unrelated to this refactor: `snat_contract_documents_current_fail_closed_runtime` (asserts `docs/userspace-dataplane-gaps.md` contains "fail-closed" — file at master `b92198f8` does not contain that word; failure reproduces on stock master).
+- **20:34 UTC 2026-05-26** — 5/5 flake check on `afxdp::cos::queue_service::*` (49 tests pass each iteration).
+- **20:35 UTC 2026-05-26** — Go suite passes (cached).
+- **20:35 UTC 2026-05-26** — mod.rs: 1536 → 1325 LOC (-211). submit_cos_batch: 221 → 43 LOC.
+- **20:36 UTC 2026-05-26** — pushed commit e01472f4 to refactor/1331-submit-cos-batch-per-variant.
+- **20:37 UTC 2026-05-26** — opened PR #1585 with `Closes #1331` in body; requested Copilot review; posted `@copilot review` comment.
+- **20:38 UTC 2026-05-26** — dispatched code review r1: Codex task-mpn3jnts-mw3vzg, AGY review-mpn3jx03-id3sv0, Gemini task-mpn3k17x-epxsa5.
+- **20:42 UTC 2026-05-26** — code review r1 results: Codex MERGE-READY, AGY MERGE-READY, Gemini MERGE-READY, Copilot COMMENTED (1 cosmetic false-positive nit on reviewer-ids.md table rendering — single-pipe Markdown is standard). Claude SMR MERGE-READY.
+- **20:43 UTC 2026-05-26** — posted 4-of-4 attestation + `<!-- AWAITING-BATCH-MERGE -->` marker on PR #1585.
+- **21:30 UTC 2026-05-26** — smoke-runner declined; required rebase against post-#1581 master (b30b0704). Also flagged prompt-injection-style angle-bracket tags in the prior marker body.
+- **21:31 UTC 2026-05-26** — rebased onto origin/master b30b0704; resolved `_Log.md` conflict (kept master's #1546/#1574 entries + our #1331 entries side-by-side).
+- **21:50 UTC 2026-05-26** — cargo build --release clean post-rebase; full cargo test --release suite: 1503 pass + 1 pre-existing snat_contract_doc_guard failure (master-side) + 1 wg engine concurrent flake (not introduced by this refactor — diff against master in userspace-dp/src/afxdp/wg/ is empty; 5/5 pass when run in isolation).
+- **22:05 UTC 2026-05-26** — 5/5 flake check on `afxdp::cos::queue_service::*` post-rebase (49 tests pass each iteration).
+- **22:05 UTC 2026-05-26** — force-pushed rebased branch; new HEAD 90e97b29994a.
+- **22:06 UTC 2026-05-26** — posted re-attestation marker on PR #1585 with prior 4-of-4 carry-forward (delta is _Log.md-only).
+
 ## 2026-05-26 — #1325 implementation pushed
 
 - **Timestamp**: 2026-05-26T (UTC)
