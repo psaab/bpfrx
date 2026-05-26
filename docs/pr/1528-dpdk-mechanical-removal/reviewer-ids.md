@@ -28,7 +28,17 @@
 ### Round 3 — 2026-05-25, plan v3 (f8b4caf4)
 
 - Codex r4: task-mplgjwea-goeioj (dispatched 10:30Z, FAILED — sandbox missing, expired from job queue before result fetch)
-- Codex r5 retry: task-mpm3bsbi-hsom0r (dispatched 21:10Z, pending)
+- Codex r5 retry: task-mpm3bsbi-hsom0r (dispatched 21:10Z, LOST from companion job-history wipe — see feedback_codex_session_loss_continuation)
+- Codex r5 inline-diff retry: task-mpm7n2n2-ty9kjd (completed) — **PLAN-NEEDS-MINOR**
+  - Confirmed apply-groups + ${node} fix is correct (bypass after ExpandGroups)
+  - Confirmed 4-function API is appropriate for current scope
+  - **MINOR (blocking)**: schema-validate edge — Store.Load runs schemaValidateExpandedTree before compileTreeForLoad. If cmdtree.SchemaValidate ever expands to walk `system dataplane`, the load-blackout returns.
+  - Verified against actual source (pkg/cmdtree/schema_validate.go:35-57): SchemaValidate is currently scoped to class-of-service schedulers only, so the concern is unfounded TODAY. v3.2 adds explicit tests + §4.7 contract to lock in the scope.
+
+### Round 4 — 2026-05-26, plan v3.2 (pending push)
+
+- Codex r6: (to be dispatched on v3.2 HEAD)
+- Antigravity r4: (to be dispatched on v3.2 HEAD)
 - Antigravity r3: adversarial-review-mplgkdgz-ikpdw1 (completed 17:08Z) — **PLAN-READY**
   - All 4 Codex r3 findings correctly addressed by load-mode bypass
   - Confirmed only validateDataplaneTypeStrict is gated; siblings run regardless

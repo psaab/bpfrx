@@ -3633,3 +3633,17 @@
   expired from queue; per feedback_codex_infra_must_retry rule, dispatched r5
   retry (task-mpm3bsbi-hsom0r). Awaiting verdict before proceeding to
   implementation.
+
+- **Timestamp**: 2026-05-26T00:30Z
+- **Action**: #1528 plan v3.2 — schema-validate edge lock-in (Codex r5 PLAN-NEEDS-MINOR)
+- **File(s)**: docs/pr/1528-dpdk-mechanical-removal/plan.md, reviewer-ids.md
+- **Why**: Codex r5 (task-mpm7n2n2-ty9kjd) returned PLAN-NEEDS-MINOR with one
+  blocking concern: schemaValidateExpandedTree runs BEFORE compileTreeForLoad,
+  potentially rejecting legacy DPDK sub-stanza leaves before the load-mode
+  bypass can fire. Verified pkg/cmdtree/schema_validate.go:35-57 against
+  actual source: SchemaValidate is opt-in per subtree and currently scoped to
+  class-of-service schedulers only. The concern is unfounded TODAY. v3.2 adds
+  two explicit tests (TestLoad_PersistedDPDKDataplaneTypeWithSubStanzaBootsConfigOnly
+  in pkg/configstore + TestSchemaValidate_AcceptsLegacyDPDKSubStanza in
+  pkg/cmdtree) plus §4.7 contract to make the schema-validate scope an
+  explicit pinned surface for retirement work. Pending re-dispatch.

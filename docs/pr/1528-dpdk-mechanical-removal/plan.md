@@ -1,7 +1,73 @@
 # #1528 — DPDK Retirement Phase 3: Mechanical Source Removal
 
-**Status:** DRAFT v3 — addresses Codex r3 PLAN-NEEDS-MAJOR (4 findings)
-on v2's load-time rewrite approach + missed orphan sub-stanza
+**Status:** DRAFT v3.2 — addresses Codex r5 PLAN-NEEDS-MINOR on the
+schema-validation edge in Store.Load
+
+## v3.2 changes from v3.1
+
+Codex r5 inline-retry (task-mpm7n2n2-ty9kjd) returned PLAN-NEEDS-MINOR
+with ONE blocking concern: the load-mode bypass only gates
+`validateDataplaneTypeStrict` inside `compileExpanded`, but
+`Store.Load()` ALSO runs `schemaValidateExpandedTree(tree)` via
+`compileTreeForLoad`. If the cmdtree-side `SchemaValidate` rejects
+legacy DPDK sub-stanza leaves (cores, memory, ports, rx-mode,
+socket-mem), the load-blackout survives the bypass.
+
+**Verified against actual source — concern is unfounded for the
+current `SchemaValidate`, but locking in the behavior with an explicit
+test is required to prevent silent regression.** Trace:
+
+1. `pkg/cmdtree/schema_validate.go:35-57`: `SchemaValidate` is opt-in
+   per leaf and currently walks ONLY `class-of-service schedulers`.
+   Lines 39-46: if `tree.FindChild("class-of-service") == nil`, the
+   function returns nil immediately. The comment is explicit:
+   *"Walking the whole AST against the (still-mostly-untyped) cmdtree
+   ConfigTopLevel would be wasted work; restrict the walk to the
+   subtree we actually validate."*
+2. `pkg/cmdtree/tree.go:986-1003` `ConfigSetDataplaneKnobs` covers
+   only userspace tunables (`rss-indirection`, `cpu-governor`,
+   `netdev-budget`, `coalescence`). It does NOT enumerate DPDK leaves.
+   But this map is the `?` help surface, not a validator gate.
+3. The `pkg/config/ast.go` schema node `"dataplane"` is used for
+   tab completion only (`ast_edit.go:151` parses unmapped tokens as
+   flat leaves). The cmdtree schema does not REJECT unrecognized
+   children — it only governs `?` and tab completion.
+
+Net: an old persisted config with `set system dataplane-type dpdk`
+plus `set system dataplane cores 2-5` plus `set system dataplane ports
+0000:03:00.0 interface wan0` (etc) passes `SchemaValidate` cleanly
+because none of those leaves are under `class-of-service schedulers`.
+The load-mode bypass design in v3 is sufficient.
+
+**v3.2 lock-in:** add an explicit test
+`TestLoad_PersistedDPDKDataplaneTypeWithSubStanzaBootsConfigOnly` that
+exercises the full legacy DPDK shape (dataplane-type + cores + memory
++ socket-mem + rx-mode + ports + adaptive sub-block) through
+`Store.Load()` and asserts:
+- `Store.Load()` returns nil error
+- `ActiveConfig() != nil`
+- `ActiveConfig().System.DataplaneType == "dpdk"`
+- `ActiveConfig().System.DPDKDataplane` field doesn't exist on the
+  struct after this PR's type deletion (compile-time guarantee)
+- the soft-fallback at `daemon_run.go:247` fires (config-only mode)
+
+The test fixture mirrors `parser_ast_test.go:2632`'s comprehensive
+DPDK fixture but routes through `db.WriteActive` → `Store.Load()` →
+`compileTreeForLoad` to cover the realistic rolling-upgrade path.
+
+**§4.7 NEW**: documents the schema-validate scope check explicitly so
+a future `SchemaValidate` expansion doesn't silently break the
+load-mode bypass.
+
+Codex r5 also confirmed:
+- Apply-groups + ${node} fix is correct (bypass after `ExpandGroups`)
+- 4-function API is fine for current scope (don't introduce variadic
+  options pre-emptively)
+
+AGY r3 (adversarial-review-mplgkdgz-ikpdw1) returned PLAN-READY on v3
+with the apply-groups load-bypass test as one minor — folded into
+v3.1. AGY r3 missed the schema-validate edge; Codex r5 caught it. v3.2
+addresses Codex's strictly-superior finding.
 
 ## v3 changes from v2
 
@@ -492,6 +558,18 @@ Implementation scope (~70 LOC + tests):
 - `pkg/config/compiler_test.go` (existing file): pin that
   `CompileConfig("dataplane-type dpdk")` still fails (commit semantics
   unchanged); the load-mode entry point variant succeeds.
+- `pkg/configstore/store_test.go`: new test
+  `TestLoad_PersistedDPDKDataplaneTypeWithSubStanzaBootsConfigOnly`
+  (Codex r5 v3.2 minor) — exercises the full legacy DPDK fixture
+  (dataplane-type + cores + memory + socket-mem + rx-mode + ports +
+  adaptive) through `db.WriteActive` → `Store.Load()` →
+  `compileTreeForLoad` to lock in that schema-validate doesn't reject
+  legacy DPDK sub-stanza leaves.
+- `pkg/cmdtree/schema_validate_test.go` (new file): new test
+  `TestSchemaValidate_AcceptsLegacyDPDKSubStanza` (Codex r5 v3.2 minor)
+  — regression gate that fires if a future PR expands
+  `cmdtree.SchemaValidate` to walk `system dataplane`, forcing the
+  author to coordinate with the load-mode bypass per §4.7.
 - `pkg/daemon/daemon_run.go:247`: kept verbatim (defense-in-depth).
 
 This makes Phase 3 the right place to close the inherited bug because:
@@ -516,6 +594,62 @@ This makes Phase 3 the right place to close the inherited bug because:
 Bypass is operationally more honest: the daemon does NOT pretend the
 operator's `dataplane-type dpdk` request succeeded. It boots config-only
 and forces the operator to make an explicit migration commit.
+
+### 4.7 Schema-validate scope check (v3.2 — locks in Codex r5 finding)
+
+Codex r5 flagged that `Store.Load()` runs `schemaValidateExpandedTree`
+BEFORE `compileTreeForLoad`'s compile-mode bypass. If the cmdtree-side
+`SchemaValidate` (pkg/cmdtree/schema_validate.go) ever expands to walk
+`system dataplane`, it would reject legacy DPDK sub-stanza leaves
+(cores, memory, ports, rx-mode, socket-mem) and re-introduce the
+load-blackout.
+
+**Current state (verified pkg/cmdtree/schema_validate.go:35-57):**
+`SchemaValidate` is opt-in per subtree, scoped to `class-of-service
+schedulers` only. Anything outside that subtree returns nil. The
+load-mode bypass at the compile layer is therefore sufficient.
+
+**Lock-in (this PR):**
+
+1. Add `TestLoad_PersistedDPDKDataplaneTypeWithSubStanzaBootsConfigOnly`
+   in `pkg/configstore/store_test.go`. Test fixture writes:
+   ```
+   set system dataplane-type dpdk
+   set system dataplane cores 2-5
+   set system dataplane memory 2048
+   set system dataplane socket-mem "1024,1024"
+   set system dataplane rx-mode adaptive
+   set system dataplane rx-mode idle-threshold 256
+   set system dataplane rx-mode resume-threshold 32
+   set system dataplane rx-mode sleep-timeout 100
+   set system dataplane ports 0000:03:00.0 interface wan0
+   set system dataplane ports 0000:03:00.0 rx-mode polling
+   set system dataplane ports 0000:03:00.0 cores 2-3
+   set system dataplane ports 0000:06:00.0 interface trust0
+   ```
+   to disk via `db.WriteActive`. Then calls `Store.Load()` and asserts:
+   - `Store.Load()` returns nil error
+   - `ActiveConfig() != nil`
+   - `ActiveConfig().System.DataplaneType == "dpdk"`
+   - No panics, no compile errors surfaced to caller
+
+2. Add `TestSchemaValidate_AcceptsLegacyDPDKSubStanza` in
+   `pkg/cmdtree/schema_validate_test.go` (new file). Test fixture
+   passes the same comprehensive DPDK shape through
+   `cmdtree.SchemaValidate(tree, nil)` and asserts `err == nil`.
+   This is the **regression gate**: if a future PR expands
+   `SchemaValidate` to walk `system dataplane`, this test fires and
+   forces the author to address the load-mode bypass implication.
+
+3. Document in §4.7 (this section) the scope contract:
+   > *Any expansion of `cmdtree.SchemaValidate` that walks `system
+   > dataplane` MUST coordinate with `pkg/configstore.Store.Load`'s
+   > load-mode bypass — either widen the bypass to skip the relevant
+   > validators when `loadMode=true`, or rewrite the strict validators
+   > to tolerate retired-backend nodes during load.*
+
+This makes the schema-validate path an explicit pinned-contract surface
+for retirement work, not an implicit assumption.
 
 ## 5. Public API preservation
 
@@ -613,6 +747,14 @@ for i in 1 2 3 4 5; do
 done
 for i in 1 2 3 4 5; do
   GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test -run TestLoad_PersistedDPDKDataplaneTypeBootsConfigOnly ./pkg/configstore/ 2>&1 | grep -E "PASS|FAIL|ok " | tail -1
+done
+# v3.2 — Codex r5 minor: full-sub-stanza fixture through Store.Load
+for i in 1 2 3 4 5; do
+  GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test -run TestLoad_PersistedDPDKDataplaneTypeWithSubStanzaBootsConfigOnly ./pkg/configstore/ 2>&1 | grep -E "PASS|FAIL|ok " | tail -1
+done
+# v3.2 — Codex r5 minor: schema-validate scope regression gate
+for i in 1 2 3 4 5; do
+  GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test -run TestSchemaValidate_AcceptsLegacyDPDKSubStanza ./pkg/cmdtree/ 2>&1 | grep -E "PASS|FAIL|ok " | tail -1
 done
 
 # 4. Retirement-boundary canary tests
