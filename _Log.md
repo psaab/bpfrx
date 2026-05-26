@@ -3859,3 +3859,21 @@
       inlined it. No call edge to verify.
     - Go suite: 30/30 packages pass.
   - **File(s)**: _Log.md
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Code reviews returned. Codex (task-mpmy2ylp-9i2fpy infra-
+    blocked → retry task-mpmy51lr-obxvpx) provisional MERGE-READY.
+    AGY (review-mpmy36hd-bddy5w) MERGE-READY with line-by-line semantic
+    verification via Python script (confirmed verbatim translation).
+    Copilot (review id 4366277997) COMMENTED with 1 inline finding:
+    snat_contract_doc_guard.rs hardcodes "poll_descriptor.rs" in
+    assertion messages and required-doc check after the directory layout
+    switch.
+  - **File(s)**: PR #1571
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Applied Copilot inline review fix. Tests now derive
+    module label from poll_path for assertion messages; required-doc
+    + enumeration checks accept both flat (poll_descriptor.rs) and
+    directory (poll_descriptor/mod.rs) tokens.
+  - **File(s)**: userspace-dp/tests/snat_contract_doc_guard.rs
