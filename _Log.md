@@ -23,6 +23,71 @@
     at line 766 ending with bare "Added" — completed.
   - **File(s)**: pkg/config/compiler.go,
     pkg/config/dpdk_subtree_leakage_canary_test.go, _Log.md
+- **Timestamp**: 2026-05-26T04:50:00Z
+  - **Action**: #1519 Phase B implementation — #1516 (PR #1554)
+    merged as 265d6de7. Rebased
+    refactor/1519-daemon-legacydp-shrink-impl onto master 265d6de7.
+    Inspected merged pkg/grpcapi/runtime.go on master — grpcRuntime
+    shape matches the v1.2-locked grpcDataPlane (AGY's branch
+    inspection was accurate). Applied all 16 migrations plus the
+    capstone function deletion:
+      1. daemon_gc.go — collapsed NewGCWithDomains(sessions,
+         telemetry, lp, lp, interval) to NewGC(d.dp, interval).
+      2. daemon_scheduler.go:159-161 — deleted dead-code fallback.
+      3-6. daemon_forwarding_status.go — IsLoaded uses
+         dataplaneReadyProbe; GetMapStats reads via
+         d.dp.Telemetry().MapStats(); Status assertions on d.dp
+         via local userspaceStatusProbe.
+      7. daemon_run.go:310 — Seed* via natSeeder probe on d.dp.
+      8. daemon_run.go:365 — StartFIBSync via fibSyncStarter probe.
+      9. daemon_run.go:710 — api.Config.DP via local apiDataPlane
+         probe (matches package-private apiRuntimeDataPlane).
+      10. daemon_run.go:817 — grpcapi.Config.DP via local
+         grpcDataPlane probe (matches package-private grpcRuntime
+         from #1516/#1554).
+      11. daemon_run.go:903/915 — cli.New(...) via local
+         cliDataPlane probe (matches package-private cliRuntime).
+      12. daemon_run.go:1120 — logFinalStats(dp) → logFinalStats(
+         dataplaneReadyProbe, dataplane.Telemetry). Signature
+         change in daemon_flow.go uses Telemetry().GlobalCounter
+         instead of dp.ReadGlobalCounter.
+      13-15. daemon_ha_sync.go:271, 281, 700 — event-stream typed
+         probe assertions on d.dp directly (no legacyDP round-
+         trip).
+      16. daemon_ha_sync.go:739 — comment cleanup (drop historical
+         #1518 reference now that the migration shipped).
+      17. daemon.go:345-356 — deleted legacyDP() function +
+         docstring. Replaced with a 5-line note pointing at the
+         AST canary.
+    Added pkg/daemon/runtime_probes.go (5 typed probes:
+    dataplaneReadyProbe, natSeeder, fibSyncStarter, apiDataPlane,
+    grpcDataPlane, cliDataPlane) and
+    pkg/daemon/runtime_probes_test.go (12 compile-time var-decl
+    assertions: each probe satisfied by *dataplane.Manager and
+    *dataplane/userspace.LegacyDataPlaneAdapter). Added
+    pkg/daemon/legacy_dataplane_canary_test.go (AST canary that
+    fails if a future PR reintroduces FuncDecl (*Daemon).legacyDP
+    or any CallExpr .legacyDP()). Updated
+    pkg/dataplane/retirement_boundary_canary_test.go allowlist:
+    tightened daemon.go and daemon_run.go rationales, added
+    runtime_probes.go entry. Updated
+    docs/pr/1373-retire-ebpf-dataplane/README.md to mirror the
+    allowlist changes. Test results: full `go test ./...` clean;
+    5x flake loop on `./pkg/daemon` clean.
+  - **File(s)**: pkg/daemon/runtime_probes.go,
+    pkg/daemon/runtime_probes_test.go,
+    pkg/daemon/legacy_dataplane_canary_test.go,
+    pkg/daemon/daemon.go, pkg/daemon/daemon_gc.go,
+    pkg/daemon/daemon_scheduler.go,
+    pkg/daemon/daemon_forwarding_status.go,
+    pkg/daemon/daemon_forwarding_status_test.go,
+    pkg/daemon/daemon_run.go, pkg/daemon/daemon_ha_sync.go,
+    pkg/daemon/daemon_flow.go,
+    pkg/dataplane/retirement_boundary_canary_test.go,
+    docs/pr/1373-retire-ebpf-dataplane/README.md
+
+## 2026-05-26 (earlier)
+
 - **Timestamp**: 2026-05-26T03:15:00Z
   - **Action**: #1519 plan-impl v1.1 → v1.2 — AGY round-1
     (review-mpm1pdkv-g1sycf) returned PLAN-READY with no new
