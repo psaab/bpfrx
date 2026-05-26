@@ -1,6 +1,6 @@
 # #1351 — umem/mod.rs: extract snapshot + publish_binding_debug_state
 
-**Status:** DRAFT v2 — addresses AGY round-1 finding on constant visibility
+**Status:** DRAFT v3 — addresses Codex round-2 finding on `pub(super)` vs `pub(in crate::afxdp)` and corrects caller audit
 
 ## Issue framing
 
@@ -27,14 +27,27 @@ drops to ~1.2k LOC and reads as "UMEM lifecycle + BindingLiveState
 construction + hot-path push", while telemetry rendering lives in
 its own files where reviewers can find it.
 
-Both functions are cold paths:
+Cold-path classification (refined per Codex round-2):
 
-- `snapshot()` runs on operator queries (gRPC `show xpf userspace
-  status` and Prometheus scrape, ≤1/s).
-- `publish_binding_debug_state()` runs every ~65ms in the per-binding
-  worker loop (mask `0xFFFF` on poll count; idle path every 65ms via
-  wall-clock check). Both fall under the "rare" classification — not
-  per-packet, not per-batch.
+- `snapshot()` runs on operator queries via `coordinator.refresh_bindings`
+  (gRPC `show xpf userspace status` and Prometheus scrape, ≤1/s).
+  Pure cold.
+- `publish_binding_debug_state()` itself runs every ~65ms / 65k
+  poll ticks — pure cold. Pure cold.
+- BUT: `update_binding_debug_state()` (the wrapper that gates
+  `publish_binding_debug_state` behind the 0xFFFF poll mask) is
+  CALLED from hot worker/drain paths (`tx/dispatch.rs:925`,
+  `tx/drain.rs:248,314`, `tx/rings.rs:69,150`, `worker/lifecycle.rs:113,316`,
+  `session_glue/mod.rs:943`). The wrapper's hot cost is one
+  `wrapping_add(1)` + mask + branch — already minimal.
+
+This refactor does NOT change the wrapper's hot-call shape:
+`advance_debug_state_publish_counter` keeps `&mut WorkerTimers` and
+the gate evaluation is unchanged. Moving the wrapper into
+`debug_state.rs` does not introduce a function boundary that the
+optimizer would not already have crossed (the wrapper was always
+in a separate file from its callers; the call is via direct fn
+reference, not a vtable). Risk: LOW.
 
 If reviewers conclude that the readability win is too small to
 justify the churn or that the slow-path / cold-path classification
@@ -85,17 +98,38 @@ mod snapshot;
 pub(in crate::afxdp) use mmap::MmapArea;
 pub(in crate::afxdp) use profile::{OwnerProfileOwnerWrites, OwnerProfilePeerWrites};
 
-// Re-export so tests (super::*) and external callers
-// (tx::rings, tx::drain, worker::lifecycle, session_glue) keep
-// working unchanged.
+// CRITICAL VISIBILITY NOTE (Codex round-2 finding):
+//
+// `snapshot()` (called from `coordinator/mod.rs:1159`) and
+// `update_binding_debug_state` (called from `worker/mod.rs:444`,
+// `tx/dispatch.rs:925`, `tx/rings.rs:69,150`, `tx/drain.rs:248,314`,
+// `worker/lifecycle.rs:113,154,316`, `session_glue/mod.rs:943`) MUST
+// be visible across the `crate::afxdp` sibling-module tree. Today
+// they sit in `umem/mod.rs` with `pub(super) fn` — which from
+// `mod.rs`'s perspective means visible in `crate::afxdp`.
+//
+// After the move into `snapshot.rs` / `debug_state.rs`, `pub(super)`
+// would mean visible in `crate::afxdp::umem` only. That is too
+// narrow. The precedent established by `mmap::MmapArea` and
+// `profile::{Owner,Peer}` is `pub(in crate::afxdp)`. The same rule
+// applies here.
+//
+// Also: a `pub(super) use` of a `pub(super)` child triggers E0364
+// (documented in `userspace-dp/src/afxdp/tx/mod.rs:38`). The child
+// items therefore declare `pub(in crate::afxdp)` directly; `mod.rs`
+// only declares `mod snapshot; mod debug_state;` without an
+// explicit `use` line (inherent methods reach through the impl
+// declaration; free fns are reached via their fully-qualified
+// child path or via `use crate::afxdp::umem::debug_state::*` at the
+// caller — but the simpler form is `pub(in crate::afxdp) use
+// debug_state::{...}` from mod.rs because that matches the
+// existing mmap/profile pattern).
 //
 // Constants are re-exported alongside the free fns because
 // `umem/tests.rs` references DEBUG_STATE_PUBLISH_MASK at
 // tests.rs:1567,1575 and IDLE_DEBUG_STATE_PUBLISH_INTERVAL_NS at
 // tests.rs:1541,1550,1555,1558,1610,1625 through `use super::*;`.
-// They must remain visible at `umem::` after the move — file-private
-// in debug_state.rs would break test compilation.
-pub(super) use debug_state::{
+pub(in crate::afxdp) use debug_state::{
     advance_debug_state_publish_counter,
     flush_v_min_scratches_into,
     idle_debug_state_publish_due,
@@ -117,7 +151,7 @@ helper (private, `fn`) follows the method into the new file.
 use super::*;
 
 impl BindingLiveState {
-    pub(super) fn snapshot(&self) -> BindingLiveSnapshot { /* moved verbatim */ }
+    pub(in crate::afxdp) fn snapshot(&self) -> BindingLiveSnapshot { /* moved verbatim */ }
 
     #[inline]
     fn snapshot_hist(hist: &[AtomicU64; DRAIN_HIST_BUCKETS]) -> [u64; DRAIN_HIST_BUCKETS] {
@@ -125,6 +159,13 @@ impl BindingLiveState {
     }
 }
 ```
+
+Note: today `snapshot()` is declared `pub(super) fn snapshot` in
+`umem/mod.rs`. The `super` of `mod.rs` is `crate::afxdp`, so
+`pub(super)` there means `pub(in crate::afxdp)`. After the move
+into `snapshot.rs`, the same effective visibility is spelled
+`pub(in crate::afxdp)`. This is required for the
+`coordinator/mod.rs:1159` caller.
 
 Note: `snapshot_hist` is an associated function (no `&self`), but
 it's called via `Self::snapshot_hist(...)` from within `snapshot()`.
@@ -136,15 +177,15 @@ Moving both into the same `impl` block preserves that call shape.
 use super::*;
 use crate::afxdp::worker::WorkerTimers;
 
-pub(super) const DEBUG_STATE_PUBLISH_MASK: u32 = 0xFFFF;
-pub(super) const IDLE_DEBUG_STATE_PUBLISH_INTERVAL_NS: u64 = 65_000_000;
+pub(in crate::afxdp) const DEBUG_STATE_PUBLISH_MASK: u32 = 0xFFFF;
+pub(in crate::afxdp) const IDLE_DEBUG_STATE_PUBLISH_INTERVAL_NS: u64 = 65_000_000;
 
-pub(super) fn advance_debug_state_publish_counter(...) -> bool { /* moved */ }
-pub(super) fn idle_debug_state_publish_due(...) -> bool { /* moved */ }
-pub(super) fn update_binding_debug_state(...) { /* moved */ }
-pub(super) fn update_binding_idle_debug_state(...) { /* moved */ }
+pub(in crate::afxdp) fn advance_debug_state_publish_counter(...) -> bool { /* moved */ }
+pub(in crate::afxdp) fn idle_debug_state_publish_due(...) -> bool { /* moved */ }
+pub(in crate::afxdp) fn update_binding_debug_state(...) { /* moved */ }
+pub(in crate::afxdp) fn update_binding_idle_debug_state(...) { /* moved */ }
 fn publish_binding_debug_state(...) { /* moved, stays private to debug_state.rs */ }
-pub(super) fn flush_v_min_scratches_into<'a, I>(...) where I: IntoIterator<...> { /* moved */ }
+pub(in crate::afxdp) fn flush_v_min_scratches_into<'a, I>(...) where I: IntoIterator<...> { /* moved */ }
 ```
 
 Visibility changes: the originals are package-private (no
@@ -188,14 +229,21 @@ continues to compile unchanged.
 
 | Caller | Symbol | Visibility |
 | --- | --- | --- |
-| `slowpath.rs:237`, `slowpath.rs:481` | `BindingLiveState::snapshot` | inherent method (no path change) |
-| `tx/rings.rs:18,69,150` | `umem::update_binding_debug_state` | `pub(super) use` from `mod.rs` |
+| `coordinator/mod.rs:1159` | `live.snapshot()` (production hot caller — `refresh_bindings`) | inherent method; `pub(in crate::afxdp)` |
+| `coordinator/tests.rs:1086` | `live.snapshot()` | inherent method; `pub(in crate::afxdp)` |
+| `worker_runtime_tests.rs:25` | `atomics.snapshot()` | inherent method |
+| `tx/rings.rs:18,69,150` | `umem::update_binding_debug_state` | `pub(in crate::afxdp) use` from `mod.rs` |
 | `tx/drain.rs:248,314` | `umem::update_binding_debug_state` | same |
+| `tx/dispatch.rs:925` | `update_binding_debug_state` (missed in v2 audit) | same |
+| `worker/mod.rs:444` | `update_binding_debug_state` (missed in v2 audit) | same |
 | `worker/lifecycle.rs:113,154,316` | `update_binding_debug_state` + `update_binding_idle_debug_state` | same |
 | `session_glue/mod.rs:943` | `update_binding_debug_state` | same |
-| `umem/tests.rs:1316` | `crate::afxdp::umem::flush_v_min_scratches_into` | re-export ensures this absolute path resolves |
-| `umem/tests.rs:1541,1550,1558,1569,1574,1611,1626` | `idle_debug_state_publish_due`, `advance_debug_state_publish_counter`, `update_binding_idle_debug_state` | tests use `super::*` -> resolves through re-exports |
-| `coordinator/tests.rs:1086` | `live.snapshot()` | inherent method on `BindingLiveState` |
+| `umem/tests.rs:1316,1377` | `crate::afxdp::umem::flush_v_min_scratches_into` | absolute path resolves through `pub(in crate::afxdp) use` |
+| `umem/tests.rs:1541,1550,1555,1558,1567,1575,1610,1625` | constants + `idle_debug_state_publish_due` + `advance_debug_state_publish_counter` + `update_binding_idle_debug_state` | tests use `super::*` -> resolves through re-exports |
+
+NOTE: `slowpath.rs:237,481` cited in v2 was wrong — those are
+`SharedStatus::snapshot`, NOT `BindingLiveState::snapshot`. Codex
+caught this in round-2.
 
 ## Hidden invariants the change must preserve
 
@@ -268,13 +316,15 @@ continues to compile unchanged.
    either way. Counter-argument: it's the same readability win as
    keeping `mod.rs` under the modularity threshold; the engineering-
    style doc explicitly cites >100 LOC as a refactor cue.
-2. **Is `pub(super)` loosening on `advance_debug_state_publish_counter`
-   and `idle_debug_state_publish_due` justifiable?** The tests at
-   `umem/tests.rs:1541,1569` already reach them through `super::*`,
-   so visibility is effectively `pub(super)` today (via the same-
-   module loophole). The re-export form just makes it explicit. Is
-   this acceptable, or does the visibility loosening warrant
-   PLAN-NEEDS-MAJOR / KILL?
+2. **Resolved in v3:** visibility model uses `pub(in crate::afxdp)`
+   (matching the existing `mmap::MmapArea` / `profile::*`
+   precedent), not `pub(super)`. The two private fns plus two
+   constants gain `pub(in crate::afxdp)` visibility — same
+   effective reach as today's `pub(super) fn` in `mod.rs`. This is
+   a no-op visibility change: today they live in `mod.rs` where
+   `super = crate::afxdp`, so `pub(super)` there ≡ `pub(in
+   crate::afxdp)`. After the move into the child module the
+   spelling differs but the effective visibility is identical.
 3. **Is the helper-grouping deferral the right call?** Reviewers
    may demand the grouped helpers in the same PR. If they do, the
    estimate is +~50 LOC of intermediate structs and the snapshot
