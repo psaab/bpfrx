@@ -404,7 +404,7 @@ pub(crate) fn write_outer_ipv4_udp(
     write_ipv4_header(out.get_mut(..IP_HDR_LEN)?, src, dst,
         17 /* PROTO_UDP */, tos, ttl, total_len)?;
     write_udp_header(out.get_mut(IP_HDR_LEN..IP_HDR_LEN+UDP_HDR_LEN)?,
-        src_port, dst_port, udp_len, /* cs */ None /* RFC 768 default */)?;
+        src_port, dst_port, udp_len, /* cs */ 0 /* RFC 768 default */)?;
     Some(IP_HDR_LEN + UDP_HDR_LEN)
 }
 ```
@@ -593,7 +593,7 @@ golden vector**:
    golden array is INLINED into the test so a future drift is
    visible in the diff.
 2. **IPv4 outer / UDP pattern (WG)** — `write_ipv4_header` then
-   `write_udp_header(.., cs=None)` matches the existing
+   `write_udp_header(.., cs=0)` matches the existing
    `udp_checksum_is_zero_on_ipv4_outer` regression test in
    `wg/outer.rs`. Lift that test verbatim into
    `headers_tests.rs` so the wire-byte invariant is gated on the
@@ -746,9 +746,9 @@ support yet).
 
 ### 6.3 UDP checksum (RFC 768 / RFC 8200 §8.1)
 
-`write_udp_header` accepts `Option<u16>`:
-- `Some(cs)` → write `cs.to_be_bytes()` into bytes 6..8.
-- `None` → write `[0, 0]` (RFC 768 "no checksum computed",
+`write_udp_header` accepts a plain `u16` checksum (v2):
+- non-zero → write `cs.to_be_bytes()` into bytes 6..8.
+- `0` → write `[0, 0]` (RFC 768 "no checksum computed",
   legal for IPv4 UDP only; not legal for IPv6 UDP per RFC 8200
   §8.1).
 
@@ -756,7 +756,10 @@ This matches the current wg/outer.rs behavior exactly (cs=0
 default for IPv4 outer, with deployment-tunable a documented
 follow-up per `#1501 A2`). The caller is responsible for matching
 the legality — `write_udp_header` is a serializer, not a policy
-engine. The wg/outer.rs doc comment about RFC 8200 stays put.
+engine. v2 chose plain `u16` over `Option<u16>` after round-1
+review unanimously flagged the Option as a footgun (invites
+"None ⇒ auto-compute" misreading). Callers explicitly pass `0`
+to take the RFC 768 default.
 
 ## 7. Hidden invariants that must be preserved
 
@@ -901,6 +904,16 @@ Unchanged from v1:
 - Hot-path classification preserved.
 
 ## 10. Open questions for adversarial review
+
+> v2 NOTE: questions 1-6 were posed at v1. The round-1 hostile
+> review answered Q2 (delete outer.rs), Q3 (IPv4 ID-with-DF
+> compliance — fix now by setting DF=1), Q4 (UDP API → plain u16),
+> Q6 (drop the differential-test helper, golden vectors only).
+> Q1 is recast: AVX2 *was* a real cost; v2's §7a short-circuit
+> closes it. Q5 stands: tests move with the deletion of outer.rs
+> in v2.
+>
+> Remaining open: any new objections triggered by v2's design.
 
 1. **Is the AVX2 dedup actually material?** A 20-byte IPv4 header
    never executes the AVX2 chunked loop (one chunk is 32 bytes).
