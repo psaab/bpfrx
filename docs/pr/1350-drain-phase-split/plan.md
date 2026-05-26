@@ -653,7 +653,10 @@ post-trim symbols).
   `drain/mod.rs` to preserve their unit-test surface.
 - Touching `bound_pending_tx_local` /
   `bound_pending_tx_prepared` / `pending_tx_capacity`.
-- Touching `worker/lifecycle.rs` callers.
+- Touching `worker/lifecycle.rs` for anything OTHER than the
+  trailing-arg drop on the two `drain_pending_tx(...)` call
+  sites (lines 66-67 and 97-98). The non-drain caller at
+  line 247 stays untouched.
 
 ## Open questions — round-1 status
 
