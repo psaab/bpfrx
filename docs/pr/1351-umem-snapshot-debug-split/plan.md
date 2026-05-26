@@ -1,6 +1,6 @@
 # #1351 — umem/mod.rs: extract snapshot + publish_binding_debug_state
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** DRAFT v2 — addresses AGY round-1 finding on constant visibility
 
 ## Issue framing
 
@@ -87,13 +87,22 @@ pub(in crate::afxdp) use profile::{OwnerProfileOwnerWrites, OwnerProfilePeerWrit
 
 // Re-export so tests (super::*) and external callers
 // (tx::rings, tx::drain, worker::lifecycle, session_glue) keep
-// working unchanged:
+// working unchanged.
+//
+// Constants are re-exported alongside the free fns because
+// `umem/tests.rs` references DEBUG_STATE_PUBLISH_MASK at
+// tests.rs:1567,1575 and IDLE_DEBUG_STATE_PUBLISH_INTERVAL_NS at
+// tests.rs:1541,1550,1555,1558,1610,1625 through `use super::*;`.
+// They must remain visible at `umem::` after the move — file-private
+// in debug_state.rs would break test compilation.
 pub(super) use debug_state::{
     advance_debug_state_publish_counter,
     flush_v_min_scratches_into,
     idle_debug_state_publish_due,
     update_binding_debug_state,
     update_binding_idle_debug_state,
+    DEBUG_STATE_PUBLISH_MASK,
+    IDLE_DEBUG_STATE_PUBLISH_INTERVAL_NS,
 };
 ```
 
@@ -127,14 +136,14 @@ Moving both into the same `impl` block preserves that call shape.
 use super::*;
 use crate::afxdp::worker::WorkerTimers;
 
-const DEBUG_STATE_PUBLISH_MASK: u32 = 0xFFFF;
-const IDLE_DEBUG_STATE_PUBLISH_INTERVAL_NS: u64 = 65_000_000;
+pub(super) const DEBUG_STATE_PUBLISH_MASK: u32 = 0xFFFF;
+pub(super) const IDLE_DEBUG_STATE_PUBLISH_INTERVAL_NS: u64 = 65_000_000;
 
 pub(super) fn advance_debug_state_publish_counter(...) -> bool { /* moved */ }
 pub(super) fn idle_debug_state_publish_due(...) -> bool { /* moved */ }
 pub(super) fn update_binding_debug_state(...) { /* moved */ }
 pub(super) fn update_binding_idle_debug_state(...) { /* moved */ }
-fn publish_binding_debug_state(...) { /* moved, stays private */ }
+fn publish_binding_debug_state(...) { /* moved, stays private to debug_state.rs */ }
 pub(super) fn flush_v_min_scratches_into<'a, I>(...) where I: IntoIterator<...> { /* moved */ }
 ```
 
@@ -209,8 +218,10 @@ continues to compile unchanged.
    absolute path `crate::afxdp::umem::flush_v_min_scratches_into`
    must continue to resolve via re-export.
 5. **`DEBUG_STATE_PUBLISH_MASK` and `IDLE_DEBUG_STATE_PUBLISH_INTERVAL_NS`** —
-   crate-private constants. No external reference. Move with the
-   functions; no visibility change needed.
+   referenced by tests at `tests.rs:1541,1550,1555,1558,1567,1575,1610,1625`
+   via `use super::*;`. After the move they MUST gain `pub(super)`
+   visibility and be re-exported from `mod.rs` so tests still see
+   them at `umem::*` (AGY round-1 finding).
 6. **`use super::*;` at top of `tests.rs`** — `super` is the `umem`
    module. After split, any symbol previously visible in `umem::`
    must still be visible there via re-export.
@@ -279,13 +290,10 @@ continues to compile unchanged.
    surrounding `#[cfg(test)]` blocks — `mod.rs` only has the
    `#[path = "tests.rs"] mod tests;` declaration; no other
    `#[cfg(test)]` items live inside it.
-6. **Should `DEBUG_STATE_PUBLISH_MASK` / `IDLE_DEBUG_STATE_PUBLISH_INTERVAL_NS`
-   be `pub(super)` and re-exported, or stay file-private in
-   `debug_state.rs`?** Today they are file-private constants; only
-   the functions that reference them move. Tests reference the
-   names via `super::*` -> they must be `pub(super)` and
-   re-exported, OR the test file imports them through their new
-   path. Walk this carefully.
+6. **Resolved in v2** by AGY round-1: constants MUST be
+   `pub(super)` and explicitly re-exported. Plan now codifies the
+   re-export list with `DEBUG_STATE_PUBLISH_MASK` and
+   `IDLE_DEBUG_STATE_PUBLISH_INTERVAL_NS` included.
 7. **Architectural-mismatch sanity check:** is there any
    pre-existing PR-in-flight on `umem/mod.rs` that would conflict
    with this split? (e.g., a parallel refactor that touches
