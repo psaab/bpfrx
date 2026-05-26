@@ -31,4 +31,12 @@
 - Codex: `task-mpn0de57-aeipws`
 - AGY:   `adversarial-review-mpn0dmc8-fka8d5`
 
+## Code review round 1 (PR #1583 head fbb6f2f9)
+
+- Codex: `task-mpn2bd3l-l6xojp`
+- AGY:   `adversarial-review-mpn2boh2-fl9ycu`
+- Copilot: `gh pr edit 1583 --add-reviewer Copilot` + `@copilot review` comment
+- Claude SMR: in-conversation (this session)
+
+
 
