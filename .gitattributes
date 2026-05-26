@@ -1,0 +1,11 @@
+# Use the union merge driver for high-churn append-only logs so parallel
+# refactor PRs don't keep hitting trivial chronological-append conflicts
+# during rebase. Each PR's _Log.md entries are independent (no ordering
+# constraint between PRs), so union-merge (keep both sides verbatim) is
+# the semantically correct strategy.
+#
+# See feedback_smoke_serialized_single_agent §5 (carry-forward fast-path):
+# when the post-rebase delta is _Log.md-only, all 4 reviewer attestations
+# carry forward. With merge=union the conflict doesn't fire in the first
+# place, eliminating the rebase-loop drag during multi-PR waves.
+_Log.md merge=union

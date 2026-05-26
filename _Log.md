@@ -4256,3 +4256,6 @@
     PR #1579 at b60ea4c6.
   - **File(s)**: PR #1579, userspace-dp/src/afxdp/frame/headers.rs,
     docs/pr/1440-header-serialization-consolidate/reviewer-ids.md
+- **Timestamp**: 2026-05-26 19:55 UTC
+- **Action**: Add `_Log.md merge=union` gitattribute to eliminate the rebase-loop drag during multi-PR refactor waves. 3 consecutive Wave-2 PRs (#1575, #1572, #1579) hit `_Log.md` chronological-append conflicts requiring sub-agent rebase + reviewer carry-forward. The union merge driver keeps both sides verbatim, which is semantically correct since each PR's _Log entries are independent.
+- **File(s)**: .gitattributes (new), _Log.md (this entry)
