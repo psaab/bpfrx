@@ -4,12 +4,46 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/netip"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 )
+
+// handleShowNAT dispatches `show security nat ...` subcommands to the
+// per-NAT-mode presenters below.
+func (c *CLI) handleShowNAT(args []string) error {
+	cfg := c.store.ActiveConfig()
+
+	if len(args) == 0 {
+		fmt.Println("show security nat:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["show"].Children["security"].Children["nat"].Children))
+		return nil
+	}
+
+	switch args[0] {
+	case "source":
+		if len(args) >= 2 && args[1] == "persistent-nat-table" {
+			if len(args) >= 3 && args[2] == "detail" {
+				return c.showPersistentNATDetail()
+			}
+			return c.showPersistentNAT()
+		}
+		return c.showNATSource(cfg, args[1:])
+	case "destination":
+		return c.showNATDestination(cfg, args[1:])
+	case "static":
+		return c.showNATStatic(cfg)
+	case "nat64":
+		return c.showNAT64(cfg)
+	case "nptv6":
+		return c.showNPTv6(cfg)
+	default:
+		return fmt.Errorf("unknown show security nat target: %s", args[0])
+	}
+}
 
 func (c *CLI) showNATSource(cfg *config.Config, args []string) error {
 	// Sub-command dispatch: summary, pool <name>, rule-set <name>, rule all

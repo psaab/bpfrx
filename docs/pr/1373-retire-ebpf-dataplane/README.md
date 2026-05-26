@@ -262,9 +262,13 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/api/stats.go` | REST statistics handlers still read legacy global/interface/zone counters (#1540 handlers split). |
 | `pkg/cli/cli.go` | Embedded CLI construction still stores the legacy bridge. |
 | `pkg/cli/cli_clear.go` | Clear commands still delete legacy session entries. |
+| `pkg/cli/cli_show_cluster.go` | #1444 — `fabricRedirectCounters` type and `readFabricRedirectCounters` relocated from `cli.go`; still reads legacy `GlobalCtrFabric*` counter indices via `dataplane.Telemetry`. |
 | `pkg/cli/cli_show_flow.go` | Flow display still uses legacy session keys and values. |
 | `pkg/cli/cli_show_nat.go` | NAT display still uses legacy NAT/session metadata. |
 | `pkg/cli/cli_show_security.go` | Security display still uses legacy counters and filter types. |
+| `pkg/cli/cli_show_security_dispatch.go` | #1444 — `handleShowSecurity` dispatcher and security helpers relocated from `cli.go`; still uses legacy `MaxRulesPerPolicy` and policy-counter accessors. |
+| `pkg/cli/proto.go` | #1444 — shared session/proto helpers (`sessionStateName`, `ntohs`, `protoNameFromNum`, etc.) relocated from `cli.go`; still names `dataplane.SessState*` enum and `ProtoICMPv6` sentinel. |
+| `pkg/cli/session_filter.go` | #1444 — `sessionFilter` type, matcher methods, and peer-RPC fetchers relocated from `cli.go`; still uses legacy session key/value types and `SessFlag*`. |
 | `pkg/cli/runtime.go` | #1517 — `cliRuntime` interface declares the narrow CLI dataplane surface; still depends on root `pkg/dataplane` type names (`SessionKey`, `CounterValue`, etc.) until those types move to a domain package. |
 | `pkg/cluster/runtime.go` | `clusterRuntime` interface still names `dataplane.SessionStore`/`Telemetry` domain types from `pkg/dataplane`; no longer references `dataplane.DataPlane` after #1518. |
 | `pkg/cluster/sync.go` | Session sync still installs sessions through the legacy bridge (deprecated `SetDataPlane` alias retained one cycle per #1518; constructors now take the narrow `clusterRuntime` instead of `dataplane.DataPlane`). |

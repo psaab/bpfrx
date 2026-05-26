@@ -13,6 +13,16 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// dhcpLease returns the current DHCP lease for a managed interface, if any.
+// Consumed by `show interfaces` presenters when rendering DHCP-assigned
+// addresses; returns nil when no DHCP client is wired or no lease exists.
+func (c *CLI) dhcpLease(ifaceName string, af dhcp.AddressFamily) *dhcp.Lease {
+	if c.dhcp == nil {
+		return nil
+	}
+	return c.dhcp.LeaseFor(ifaceName, af)
+}
+
 func (c *CLI) showTunnelInterfaces() error {
 	if c.routing == nil {
 		fmt.Println("Routing manager not available")

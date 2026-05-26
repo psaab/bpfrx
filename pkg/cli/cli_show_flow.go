@@ -14,6 +14,14 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
+// topTalkerEntry holds a session's display info for sorting.
+type topTalkerEntry struct {
+	src, dst, proto, zone, state, app string
+	fwdPkts, revPkts                  uint64
+	fwdBytes, revBytes                uint64
+	age                               uint64
+}
+
 type sessionBriefRow struct {
 	ID          uint64
 	Source      string
