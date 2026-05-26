@@ -1,6 +1,9 @@
 # #1345 Step 1 — Split `server/handlers.rs` 415-LOC `handle_stream` dispatcher into per-verb modules
 
-**Status:** v2 — addressing AGY r1 PLAN-KILL findings. Pending Codex r2 + AGY r2 plan-review.
+**Status:** v3 — addresses AGY r1 PLAN-KILL (v2) + AGY r2 PLAN-NEEDS-MINOR
+(helper call substitution clarification) + Codex r2 PLAN-NEEDS-MAJOR
+findings on v1 (all already addressed in v2 by dropping HandlerCtx
+in favor of by-value moves). Pending Codex r3 plan-review on v3.
 
 ## Round-1 AGY findings — disposition
 
@@ -295,7 +298,14 @@ match arm in `handlers.rs`** modulo:
 - replace `guard` MutexGuard with `guard: &mut ServerState` parameter,
 - replace `response.foo = ...` with the parameter-passed version,
 - replace `persist_state = true` with `*persist_state = true;`,
-- early-return guards via `let Some(...) = field else { return; }`.
+- early-return guards via `let Some(...) = field else { return; }`,
+- **replace `&mut guard` in helper call sites with `guard` directly**
+  — since `guard` is now `&mut ServerState`, helpers that expect
+  `&mut ServerState` (e.g. `reconcile_status_bindings`,
+  `refresh_status`, `wait_for_binding_settle`) are called as
+  `helper(guard)` not `helper(&mut guard)`. AGY r2 flagged this as
+  a literal-substitution hazard; the snapshot::bump_fib example
+  above already models the correct shape.
 
 ### Public API preservation
 
@@ -310,16 +320,25 @@ match arm in `handlers.rs`** modulo:
 
 ## Hidden invariants the refactor must preserve
 
-1. **Single critical section per request.** `state.lock()` is taken
-   once at line 50, released after match block at line 448. Refactor
-   passes the deref target `&mut ServerState` through each handler
-   parameter list. No handler re-locks.
-2. **`refresh_status` call ordering.** Today the body has 17 eager
-   refresh_status calls inside arms PLUS a post-match call at line
-   445 gated by `!request.suppress_status`. Refactor preserves
-   **every site verbatim**: eager calls stay where they are inside
-   each per-verb body; the post-match call stays inline in
-   `mod.rs`'s shell.
+1. **Single dispatcher critical section.** `state.lock()` is taken
+   once at line 50 inside the dispatch shell, released when the
+   guard scope ends at line 448. `write_state` at line 451 then
+   re-locks via `helpers.rs:708` for the persistence step — that
+   is a SEPARATE, post-dispatch critical section. Refactor preserves
+   this two-phase shape: per-verb handlers take `&mut ServerState`
+   (the deref target of the dispatcher's guard) and never see the
+   `Arc<Mutex<ServerState>>` or `state_file` parameters. Only the
+   dispatch shell in `mod.rs` calls `write_state`.
+2. **`refresh_status` call ordering.** Today the body has 16 eager
+   `refresh_status(&mut guard)` calls inside arms (lines 105, 123,
+   148, 167, 183, 206, 220, 228, 254, 281, 296, 351, 362, 373, 401,
+   427) PLUS a post-match call at line 445 gated by
+   `!request.suppress_status` (line 444). Eager calls are NOT
+   gated by `suppress_status`. Successful arms (e.g. apply_snapshot)
+   do a double refresh when status isn't suppressed: eager + post.
+   Refactor preserves **every site verbatim**: eager calls stay
+   where they are inside each per-verb body; the post-match call
+   stays inline in `mod.rs`'s shell.
 3. **`persist_state` is sticky.** Confirmed by grep
    `persist_state = false` in handlers.rs: ONE occurrence, the
    initialization at line 47. No arm sets it to false. Refactor
