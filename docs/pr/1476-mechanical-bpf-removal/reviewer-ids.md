@@ -21,8 +21,10 @@ rounds. Append a row per dispatch.
 
 | Round | Reviewer | Task ID | Verdict | Notes |
 |-------|----------|---------|---------|-------|
-| r1 | AGY (adversarial) | adversarial-review-mpmacktl-2gvwd4 | pending | dispatched against SHA 04c0d19e (PR #1558) |
-| r1 | Codex (gpt-5.5) | local pid 1519323 | pending | dispatched against SHA 04c0d19e (PR #1558) |
+| r1 | AGY (adversarial) | adversarial-review-mpmacktl-2gvwd4 | MERGE-READY | r4 Store.SyncApply finding closed; loader extraction byte-for-byte correct; canaries pass |
+| r1 | Codex (gpt-5.5) | local pid 1519323 | MERGE-NEEDS-MAJOR | 5 findings (F1 apply-groups bypass MAJOR; F2-F4 MINOR caller-aware warn / gRPC code / stale prose; F5 NIT escape-hatch text). All fixed in 8c88cc38. |
+| r2 | AGY (adversarial) | adversarial-review-mpmawzis-qr062e | pending | dispatched against SHA 8c88cc38 |
+| r2 | Codex (gpt-5.5) | local pid 1546202 | pending | dispatched against SHA 8c88cc38 |
 
 ## Copilot
 

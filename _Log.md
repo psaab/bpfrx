@@ -1,5 +1,51 @@
 # Action Log
 
+## 2026-05-26 — #1476 Phase B r2 fixes (Codex MERGE-NEEDS-MAJOR)
+
+- **Timestamp**: 2026-05-26T (r2 fixes after Codex r2 MERGE-NEEDS-MAJOR)
+  - **Action**: Round-2 code reviews returned. AGY r2 pending; Codex r2
+    MERGE-NEEDS-MAJOR with 3 findings:
+    F1 MAJOR: the rewrite helper still used `FindChild` which returns
+      only the FIRST top-level `system` (or `groups`) block. The
+      hierarchical parser admits split stanzas — e.g.
+        `system { host-name fw1; }`
+        `system { dataplane-type ebpf; }`
+      produces two top-level `system` nodes; the same applies to
+      multiple top-level `groups { ... }` blocks. The pre-r2 walker
+      missed the second and beyond, reopening F1 of r1 for the
+      split-stanza shape.
+    F2 MINOR: nested-groups-inside-groups case (acknowledged as
+      "current ExpandGroups only treats top-level groups as group
+      definitions" — not a current bug, but worth noting).
+    F3 NIT: header comment in maps_decouple_test.go still mentioned
+      BPFRX_LEGACY_LOADER_RETIRED=1 verbatim despite r1's intent to
+      strip it.
+
+    All 3 addressed in this commit:
+    - rewriteRetiredDataplaneType now uses three explicit helpers
+      (systemBlocksOf, groupsBlocksOf, systemBlocksOfNode) that
+      iterate every matching child instead of returning only the
+      first. Two new regression tests
+      TestRewriteRetiredDataplaneType_SplitSystemStanzas and
+      TestRewriteRetiredDataplaneType_SplitGroupsStanzas pin the fix.
+      Both call CompileConfig/CompileConfigForNode after rewrite to
+      confirm no strict-validator firing.
+    - Stripped the BPFRX_LEGACY_LOADER_RETIRED mention from the
+      maps_decouple_test.go header comment block entirely.
+    - F2 nested-groups is intentionally NOT addressed in this PR: it
+      isn't reachable today because ExpandGroups only treats
+      top-level groups as group definitions. If future Junos-parity
+      work admits nested groups, the walker recursion-step is
+      trivial; flagged for the future cleanup PR.
+
+    Validation: full go test ./... clean across 33 packages. 9
+    rewrite-helper tests pass including the 2 new split-stanza
+    regressions. 5x flake on TestRewriteRetiredDataplaneType_(
+    ApplyGroups|SplitSystem|SplitGroups) clean.
+  - **File(s)**: pkg/configstore/dataplane_retire.go,
+    pkg/configstore/dataplane_retire_test.go,
+    pkg/dataplane/userspace/maps_decouple_test.go
+
 ## 2026-05-26 — #1476 Phase B r1 fixes (Codex MERGE-NEEDS-MAJOR)
 
 - **Timestamp**: 2026-05-26T (r1 fixes after Codex MERGE-NEEDS-MAJOR)

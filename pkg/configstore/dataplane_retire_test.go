@@ -163,6 +163,92 @@ system {
 	}
 }
 
+// TestRewriteRetiredDataplaneType_SplitSystemStanzas covers the
+// Codex r2 (PR #1558) finding: the hierarchical parser admits
+// multiple top-level `system { ... }` blocks. The pre-fix walker
+// used `tree.FindChild("system")` which returned only the FIRST
+// match, so a config like
+//
+//   system { host-name fw1; }
+//   system { dataplane-type ebpf; }
+//
+// slipped through the rewrite. The post-fix walker iterates over
+// every top-level child whose first key is "system" so all
+// stanzas are inspected.
+func TestRewriteRetiredDataplaneType_SplitSystemStanzas(t *testing.T) {
+	t.Parallel()
+
+	const src = `system {
+    host-name fw1;
+}
+system {
+    dataplane-type ebpf;
+}`
+	parser := config.NewParser(src)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	got := rewriteRetiredDataplaneType(tree, LoadCaller)
+	if got != 1 {
+		t.Fatalf("rewriteRetiredDataplaneType = %d; want 1 (split system stanzas)", got)
+	}
+	cfg, err := config.CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig after rewrite (split system): %v", err)
+	}
+	if cfg.System.DataplaneType != "" {
+		t.Fatalf("post-rewrite DataplaneType = %q; want empty (rewritten from split-stanza ebpf)",
+			cfg.System.DataplaneType)
+	}
+	if cfg.System.HostName != "fw1" {
+		t.Fatalf("post-rewrite HostName = %q; want fw1 (first stanza must survive)",
+			cfg.System.HostName)
+	}
+}
+
+// TestRewriteRetiredDataplaneType_SplitGroupsStanzas covers the
+// symmetric case for `groups { ... }`: the parser admits multiple
+// top-level `groups` blocks too, and the pre-fix walker missed
+// retired leaves inside the second (and beyond).
+func TestRewriteRetiredDataplaneType_SplitGroupsStanzas(t *testing.T) {
+	t.Parallel()
+
+	const src = `groups {
+    benign {
+        system {
+            host-name fw1;
+        }
+    }
+}
+groups {
+    legacy {
+        system {
+            dataplane-type ebpf;
+        }
+    }
+}
+system {
+    apply-groups legacy;
+}`
+	parser := config.NewParser(src)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	got := rewriteRetiredDataplaneType(tree, SyncCaller)
+	if got != 1 {
+		t.Fatalf("rewriteRetiredDataplaneType = %d; want 1 (split groups stanzas)", got)
+	}
+	cfg, err := config.CompileConfigForNode(tree, 0)
+	if err != nil {
+		t.Fatalf("CompileConfigForNode after rewrite (split groups): %v", err)
+	}
+	if cfg.System.DataplaneType != "" {
+		t.Fatalf("post-rewrite DataplaneType = %q; want empty", cfg.System.DataplaneType)
+	}
+}
+
 // TestStoreLoad_RewritesPersistedEBPFDataplaneType end-to-ends the
 // Store.Load() path: a persisted active config carrying
 // `dataplane-type ebpf` must come up cleanly (no strict-validator

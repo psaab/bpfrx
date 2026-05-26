@@ -12,12 +12,10 @@
 //  2. TestRegistryParityWithLegacyLoader — consistency canary that
 //     pins the registry constants against the literal map names
 //     used by the retained Rust AF_XDP shim loader at
-//     pkg/dataplane/loader_userspace_shim.go. Pre-#1476 it targeted
-//     loader_ebpf.go and self-retired under
-//     BPFRX_LEGACY_LOADER_RETIRED=1 once the file went away; the
-//     escape-hatch sentinel is gone now that the loader's retained
-//     side has a permanent home. The function name keeps
-//     "WithLegacyLoader" suffix only for git-blame continuity.
+//     pkg/dataplane/loader_userspace_shim.go. The function name
+//     keeps "WithLegacyLoader" suffix only for git-blame continuity
+//     with the pre-#1476 era when the canary targeted the (now
+//     deleted) loader_ebpf.go.
 package userspace
 
 import (

@@ -94,8 +94,16 @@ func rewriteRetiredDataplaneType(tree *config.ConfigTree, caller retireRewriteCa
 	}
 	rewrites := 0
 
-	// Pass 1: top-level `system` node.
-	if system := tree.FindChild("system"); system != nil {
+	// Pass 1: every top-level `system { ... }` block. The
+	// hierarchical parser admits split stanzas, so a config like
+	//
+	//   system { host-name fw1; }
+	//   system { dataplane-type ebpf; }
+	//
+	// produces TWO top-level `system` nodes. Both must be
+	// inspected. `FindChild` returns only the first match (Codex
+	// r2 F1); walk every match.
+	for _, system := range systemBlocksOf(tree) {
 		rewrites += rewriteRetiredLeavesIn(system, caller)
 	}
 
@@ -108,21 +116,69 @@ func rewriteRetiredDataplaneType(tree *config.ConfigTree, caller retireRewriteCa
 	//                     .Children: [Node{Keys: ["system"]}]
 	//                                   .Children: [Node{Keys: ["dataplane-type", "ebpf"]}]
 	//
-	// Walk into groups → group-name → system → leaf.
-	if groupsRoot := tree.FindChild("groups"); groupsRoot != nil {
+	// Multiple top-level `groups { ... }` blocks are also allowed
+	// (Codex r2 F1), so walk every match too.
+	for _, groupsRoot := range groupsBlocksOf(tree) {
 		for _, group := range groupsRoot.Children {
 			if group == nil {
 				continue
 			}
-			groupSystem := group.FindChild("system")
-			if groupSystem == nil {
-				continue
+			// A group may contain multiple `system { ... }` stanzas
+			// the same way a top-level config can.
+			for _, groupSystem := range systemBlocksOfNode(group) {
+				rewrites += rewriteRetiredLeavesIn(groupSystem, caller)
 			}
-			rewrites += rewriteRetiredLeavesIn(groupSystem, caller)
 		}
 	}
 
 	return rewrites
+}
+
+// systemBlocksOf returns every top-level child whose first key is
+// `system`. Mirrors tree.FindChild's matching rule but returns all
+// matches instead of the first.
+func systemBlocksOf(tree *config.ConfigTree) []*config.Node {
+	if tree == nil {
+		return nil
+	}
+	var out []*config.Node
+	for _, child := range tree.Children {
+		if child != nil && len(child.Keys) > 0 && child.Keys[0] == "system" {
+			out = append(out, child)
+		}
+	}
+	return out
+}
+
+// groupsBlocksOf returns every top-level child whose first key is
+// `groups`. Same rule as systemBlocksOf, walking the `groups` arm.
+func groupsBlocksOf(tree *config.ConfigTree) []*config.Node {
+	if tree == nil {
+		return nil
+	}
+	var out []*config.Node
+	for _, child := range tree.Children {
+		if child != nil && len(child.Keys) > 0 && child.Keys[0] == "groups" {
+			out = append(out, child)
+		}
+	}
+	return out
+}
+
+// systemBlocksOfNode returns every direct child of node whose first
+// key is `system`. Used to find split `system { ... }` stanzas
+// nested inside a single group definition.
+func systemBlocksOfNode(node *config.Node) []*config.Node {
+	if node == nil {
+		return nil
+	}
+	var out []*config.Node
+	for _, child := range node.Children {
+		if child != nil && len(child.Keys) > 0 && child.Keys[0] == "system" {
+			out = append(out, child)
+		}
+	}
+	return out
 }
 
 // rewriteRetiredLeavesIn drops every `dataplane-type X` leaf whose
