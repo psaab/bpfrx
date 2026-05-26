@@ -28,6 +28,28 @@
 
 **3-of-3 plan attestation reached. Proceeding to implementation.**
 
+## Code review round 1 (PR #1591 @ 484d1f6a)
+
+- Codex: task-mpn5zvu7-h1j20k → MERGE-NEEDS-MINOR (2 minors)
+- Gemini (gemini-3-pro-preview): task-mpn60og3-ofsn6r → MERGE-READY
+- Copilot (copilot-pull-request-reviewer): COMMENTED, 1 inline (tcp_segmentation.rs:92 dead params)
+- AGY: adversarial-review-mpn60vo8-u6rlz4 → succeeded, recommended underscore-prefix or delete the dead params
+- Claude SMR: in conversation
+
+All four converged on the same finding (dead owner-map params in segment_forwarded_tcp_frames_into_prepared).
+
+## Code review round 2 (PR #1591 @ c8982abd3 after rebase onto upstream c9ffafa19)
+
+Upstream commit c9ffafa19 (Copilot swe-agent: "fix: prune dead CoS owner parameter chain") deleted the param chain wholesale from tcp_segmentation.rs, dispatch.rs, lifecycle.rs, and loop_body/mod.rs. My commit on top fixes the stale tests.rs header comment.
+
+- Codex: task-mpn6q1xg-4of9a3 → MERGE-READY
+- Gemini: standing MERGE-READY from round 1 (no new findings since)
+- AGY: round-1 minor resolved by upstream
+- Copilot: inline comment resolved by upstream
+- Claude SMR: MERGE-READY (in conversation)
+
+**4-of-4 code-review attestation reached. AWAITING-BATCH-MERGE.**
+
 ## Implementation rounds
 
 (none yet)

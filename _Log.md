@@ -1,6 +1,5 @@
 # Action Log
 
-<<<<<<< HEAD
 ## 2026-05-26 21:07 UTC — #1354 transmit phase split AWAITING-BATCH-MERGE
 
 - **Timestamp**: 2026-05-26 21:07 UTC (PR #1586 head 2292b4a84b68)
