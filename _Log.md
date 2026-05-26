@@ -3754,3 +3754,24 @@
     to follow-up Steps; explicitly does NOT propose #946 Phase 2
     (PLAN-KILLED). 7 open questions invitable to PLAN-KILL.
   - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Round-1 plan reviews returned PLAN-NEEDS-MAJOR from both
+    Codex (task-mpmurvhf-galzxb) and AGY (review-mpmus86y-f87cd8).
+    Critical findings: (1) AGY caught recycle-semantics bug — L653 (ICMP
+    TE) and L876 (TX fallback) do NOT recycle; mapping all continues to
+    RecycleAndContinue would cause UMEM double-free. (2) Codex flagged
+    #[inline] as too weak — need #[inline(always)]. (3) Both flagged
+    PollCtx<'a> as premature. (4) Both confirmed stages 12+ unextractable
+    — Step 1 is the structural ceiling. (5) AGY caught wrong call sites
+    in v1 plan.
+  - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Wrote plan v2 addressing all round-1 findings. Introduces
+    dedicated FlowCacheOutcome { Consumed, FallThrough } enum (helper
+    owns all pushes inline). Drops PollCtx. Mandates #[inline(always)]
+    with cargo asm gate. Fixes call sites. Commits to "Step 1 is the
+    structural ceiling" with 5-row extraction matrix demonstrating
+    stages 12+ are not cleanly extractable.
+  - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
