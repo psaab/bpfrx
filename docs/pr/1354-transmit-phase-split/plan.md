@@ -1,6 +1,47 @@
 # #1354 — `tx/transmit.rs` 230-LOC `transmit_prepared_queue` phase split
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** DRAFT v2 — addressing Codex round-1 PLAN-NEEDS-MAJOR. Gemini round-1 was PLAN-READY.
+
+## Round-1 findings addressed
+
+1. **Tuple order in orchestrator sketch.** Codex caught a tuple
+   swap in §"Concrete design" — sketch read `(sent_bytes, sent_pkts)`
+   but the actual return type is `(sent_packets, sent_bytes)` per
+   `transmit.rs:485-503`. Fixed in §"Orchestrator signature" below
+   to match the real return type. Same-type tuple swap would have
+   silently corrupted counters at callers
+   (`queue_service/mod.rs:1333`, `drain.rs:209`).
+
+2. **Re-export list completeness.** Codex caught the plan
+   omitting `TxError` and
+   `recycle_cancelled_prepared_offset_with_shared` from the
+   `tx/mod.rs` re-export snippet. The real `tx/mod.rs:14-18`
+   re-exports those too; `queue_service/mod.rs:65` imports them.
+   Plan no longer claims byte-identical; it claims **unchanged**
+   (we do NOT touch `tx/mod.rs` at all — the re-export block stays
+   verbatim).
+
+3. **Perf framing.** Codex correctly objected to
+   "once per worker tick ~1kHz". The function is called per-batch
+   (each batch capped at `TX_BATCH_SIZE = 64` per `afxdp/mod.rs:215`),
+   driven by `drain_pending_tx` (`tx/drain.rs:208`) which loops while
+   prepared TX remains, and by CoS submit
+   (`queue_service/mod.rs:1333`). Per-batch (not per-packet, not
+   per-tick) is the right framing. `#[inline]` makes zero-overhead
+   plausible in release builds, but is not a hard guarantee.
+
+4. **Ring-full sub-order.** Codex correctly noted that current
+   code at `transmit.rs:473` kicks (`maybe_wake_tx`) BEFORE
+   restoring scratch to `pending`. Plan now documents this exact
+   order. The `finalise_prepared` helper preserves
+   `dbg_tx_ring_full++` → `maybe_wake_tx` → push-back loop →
+   `Err(Retry)`.
+
+5. **Orphan-recycle helper count.** Codex caught an internal
+   contradiction in v1 — §"Concrete design" suggested one shared
+   helper, §"Risk assessment" defaulted to two. v2 commits firmly
+   to **the two-helper asymmetry** preserved verbatim (no
+   refactoring of drop-counter math in this code-motion PR).
 
 ## Issue framing
 
@@ -29,11 +70,25 @@ The issue proposes splitting the body into four phases:
 5. `reserve_and_write_descriptors` — call `xsk.tx.transmit(N)`, populate
    `XdpDesc` from staged scratch, commit, drop writer, stamp submits
    post-commit (`#812` Codex round-1 HIGH #1 invariant).
-6. `finalise_kernel_kick_and_restore` — `inserted == 0` retry path
-   (push everything back to `pending` front), success path (count
-   sent bytes/packets, register prepared-recycle for kept entries,
-   push the un-inserted tail back to `pending` front in the right
-   order), then `maybe_wake_tx`.
+6. `finalise_prepared` — branches on `inserted`:
+   - **`inserted == 0` (ring full):**
+     1. `binding.telemetry.dbg_tx_ring_full += 1`
+     2. `maybe_wake_tx(binding, true, now_ns)` — kick BEFORE
+        restoring scratch (matches `transmit.rs:473-475`)
+     3. Pop scratch entries and push each back to `pending.front`
+        (preserves LIFO restore order — same as current code)
+     4. Return `Err(TxError::Retry(...))`
+   - **`inserted > 0` (success):**
+     1. `binding.telemetry.dbg_tx_ring_submitted += inserted as u64`
+     2. `binding.tx_pipeline.outstanding_tx += inserted` (saturating)
+     3. Drain scratch; for `idx < inserted` count bytes/packets and
+        call `remember_prepared_recycle`; for idx >= inserted push
+        to a local `retry_tail`
+     4. Push `retry_tail` (reversed) back to `pending.front` to
+        preserve original FIFO order at the head of `pending`
+     5. `maybe_wake_tx(binding, true, now_ns)` (the unconditional
+        cross-binding kick)
+     6. Return `Ok((sent_packets, sent_bytes))`
 
 The issue's sketch lists five helpers; the actual code has six
 phases when you count the DSCP rewrite + slice re-validation as
@@ -44,8 +99,14 @@ failure paths.
 ## Honest scope/value framing
 
 This is **pure code motion + readability**. The function is called
-once per worker tick (not per packet), so even a literal function
-call per phase would be invisible. The win is:
+**per batch** (not per packet) — each batch capped at
+`TX_BATCH_SIZE = 64` per `afxdp/mod.rs:215`. Callers are
+`drain_pending_tx` (`tx/drain.rs:208`, loops while prepared TX
+remains in the worker tick) and CoS submit
+(`queue_service/mod.rs:1333`). On steady state this is more than
+once per tick but still well under per-packet cost — even a literal
+function call per phase would be invisible in release builds with
+`#[inline]` on each helper. The win is:
 
 - File LOC: `tx/transmit.rs` drops below the engineering-style cue.
 - Phase isolation: each phase's failure mode and drop accounting is
@@ -137,11 +198,13 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
         log_rst_frames_prepared(binding);
     }
     let inserted = write::reserve_and_write_descriptors(binding);
-    let (sent_bytes, sent_pkts) = finalise::finalise_prepared(
-        binding, pending, now_ns, inserted,
-    )?;
-    Ok((sent_bytes, sent_pkts))
+    finalise::finalise_prepared(binding, pending, now_ns, inserted)
 }
+// finalise_prepared returns `Result<(u64, u64), TxError>` where the
+// tuple is `(sent_packets, sent_bytes)` — same order as the current
+// transmit.rs:485-503 returns. Callers (queue_service/mod.rs:1333,
+// drain.rs:209) bind `(packets, bytes)`; preserving the order is
+// mandatory.
 ```
 
 ### Phase signatures (all `#[inline]`)
@@ -185,27 +248,31 @@ pub(super) fn finalise_prepared(
 ) -> Result<(u64, u64), TxError>;
 ```
 
-The orphan-recycle drop path is currently inline three times; we
-extract a single shared private helper:
+The orphan-recycle drop path is **NOT** unified to a shared helper.
+The three existing call sites have intentionally asymmetric
+"+= len vs += len-1" accounting:
 
-```rust
-// transmit/mod.rs (private to transmit/)
-#[inline]
-fn drain_and_orphan_recycle_staged(
-    binding: &mut BindingWorker,
-    shared_recycles: &mut Vec<(u32, u64)>,
-) -> usize;     // returns orphan count for counter math
-```
+- **Site 1** (`transmit.rs:290-316`, stage phase): orphan list does
+  NOT include the offender; counter add is
+  `orphaned.len() as u64`. Reason: the size-check fails BEFORE the
+  offender is pushed to scratch (`req` is on the stack only).
+- **Sites 2 & 3** (`transmit.rs:322-355` rewrite, `:358-391`
+  verify): orphan list DOES include the offender (drain captures
+  everything in `scratch_prepared_tx`, including the entry the
+  current iteration is borrowing); counter add is
+  `orphan_count.saturating_sub(1) as u64`. Reason: the offender is
+  already in scratch when its slice-validation fails.
 
-This is the part where reviewers should push hardest — the three
-existing call sites have subtly different "+= 1 vs += len-1"
-accounting because two of them include `req` (the offender) in
-`orphaned` while one does not. The phase-split exposes this; we
-need to either (a) preserve the asymmetric accounting via two
-helpers, or (b) prove the asymmetry is wrong and fix it. **Default
-plan: preserve asymmetric accounting via two helpers.** Fixing the
-asymmetry is a behavior change and out of scope for this code-motion
-PR.
+In both cases the caller's post-return `+= 1` covers the offender.
+The drop-counter total is `orphaned_excluding_offender + 1` in
+both cases.
+
+The phase split keeps the three drop sites in their phase files
+(stage.rs, rewrite.rs, verify.rs) with **the exact prior code**
+verbatim — no shared helper, no behavior change, no risk of
+silently re-symmetrising the accounting. Fixing the asymmetry (if
+it is even wrong, which is not established) is a behavior change
+deserving its own issue + triple-review.
 
 ## Public API preservation
 
@@ -217,18 +284,28 @@ External callers (from grep above):
 - `afxdp/tx/drain.rs:209` — `transmit_prepared_batch(...)`
 - `afxdp/tx/drain.rs:274` — `transmit_batch(...)`
 
-The `tx/mod.rs` re-export list stays byte-identical:
+The `tx/mod.rs` re-export list is **not touched** at all by this
+refactor. The real current block (verified at `tx/mod.rs:12-18`) is:
 
 ```rust
+pub(super) mod transmit;
+use transmit::transmit_prepared_batch;
 pub(in crate::afxdp) use transmit::{
+    TxError, recycle_cancelled_prepared_offset_with_shared,
     recycle_prepared_immediately_with_shared, remember_prepared_recycle, transmit_batch,
     transmit_prepared_queue,
 };
-use transmit::transmit_prepared_batch;
 ```
 
-All four are still defined in (now) `transmit/mod.rs` and re-exported
-unchanged. Call sites and import paths require zero edits.
+Converting `transmit.rs` to `transmit/mod.rs` is transparent to this
+block. All six exported items (`TxError`,
+`recycle_cancelled_prepared_offset_with_shared`,
+`recycle_prepared_immediately_with_shared`,
+`remember_prepared_recycle`, `transmit_batch`,
+`transmit_prepared_queue`) remain defined in (now) `transmit/mod.rs`
+and re-exported unchanged. External callers
+(`queue_service/mod.rs:65`, `mirror.rs:1312`, `drain.rs:209/274/346`)
+require zero edits.
 
 ## Hidden invariants the change must preserve
 
