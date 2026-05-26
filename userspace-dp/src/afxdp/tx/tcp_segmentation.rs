@@ -16,8 +16,6 @@ pub(super) fn segment_forwarded_tcp_frames_into_prepared(
     post_recycles: &mut Vec<(u32, u64)>,
     worker_id: u32,
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
-    cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
-    cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
 ) -> Option<(u32, u64, u32)> {
     let meta = meta.into();
     if meta.protocol != PROTO_TCP || decision.resolution.tunnel_endpoint_id != 0 {

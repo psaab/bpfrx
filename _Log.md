@@ -1,5 +1,6 @@
 # Action Log
 
+<<<<<<< HEAD
 ## 2026-05-26 21:07 UTC — #1354 transmit phase split AWAITING-BATCH-MERGE
 
 - **Timestamp**: 2026-05-26 21:07 UTC (PR #1586 head 2292b4a84b68)
@@ -178,6 +179,21 @@
   - Claude SMR: gates all pass; pre-existing failure documented.
 - **Posture**: AWAITING-BATCH-MERGE per user mandate (do not auto-merge).
 - **File(s)**: docs/pr/1355-cos-push-split/reviewer-ids.md, _Log.md
+
+## 2026-05-26 — #1350 review-followup dead-param prune (22:00 UTC)
+
+- **Timestamp**: 2026-05-26T22:00Z
+- **Action**: Pruned the dead `cos_owner_*_by_queue` parameter chain
+  that the Copilot PR review flagged as still flowing only through
+  `enqueue_pending_forwards` and
+  `segment_forwarded_tcp_frames_into_prepared` without any remaining
+  use.
+- **Files**:
+  - `userspace-dp/src/afxdp/tx/tcp_segmentation.rs`
+  - `userspace-dp/src/afxdp/tx/dispatch.rs`
+  - `userspace-dp/src/afxdp/tx/dispatch_tests.rs`
+  - `userspace-dp/src/afxdp/worker/lifecycle.rs`
+  - `userspace-dp/src/afxdp/worker/loop_body/mod.rs`
 
 ## 2026-05-26 — #1350 implementation pushed (21:43 UTC)
 

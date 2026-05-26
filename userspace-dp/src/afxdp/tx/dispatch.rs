@@ -87,8 +87,6 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
     dbg: &mut DebugPollCounters,
     worker_id: u32,
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
-    cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
-    cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
 ) {
     if pending_forwards.is_empty() {
         return;
@@ -299,8 +297,6 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                         post_recycles,
                         worker_id,
                         worker_commands_by_id,
-                        cos_owner_worker_by_queue,
-                        cos_owner_live_by_queue,
                     )
                 {
                     dbg.enqueue_ok += segments as u64;

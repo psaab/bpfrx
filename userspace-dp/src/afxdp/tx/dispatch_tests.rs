@@ -437,8 +437,6 @@ fn enqueue_pending_forwards_mirrors_live_frame_and_records_counter() {
         Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
     let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
-    let cos_owner_worker_by_queue: BTreeMap<(i32, u8), u32> = BTreeMap::new();
-    let cos_owner_live_by_queue: BTreeMap<(i32, u8), Arc<BindingLiveState>> = BTreeMap::new();
     let mut dbg = DebugPollCounters::default();
     let (left, rest) = bindings.split_at_mut(0);
     let (ingress, right) = rest.split_first_mut().expect("ingress binding");
@@ -462,8 +460,6 @@ fn enqueue_pending_forwards_mirrors_live_frame_and_records_counter() {
         &mut dbg,
         0,
         &worker_commands_by_id,
-        &cos_owner_worker_by_queue,
-        &cos_owner_live_by_queue,
     );
 
     assert_eq!(bindings[0].live.mirrored_packets.load(Ordering::Relaxed), 1);
