@@ -4,7 +4,7 @@ Shared type definitions for the AF_XDP dataplane. Every long-lived
 struct that crosses module boundaries lives here so siblings can
 import them without circular module dependencies.
 
-Most files are definitions only, but `shared_cos_lease.rs` is an
+Most modules are definitions only, but `shared_cos_lease/` is an
 exception: it owns the hot-path lease acquisition / release / epoch
 rotation algorithm (tag-checked CAS, two-CAS-with-rollback) for the
 shared CoS lease. That algorithm lives with the type because it's
@@ -22,9 +22,11 @@ globs.
 | `cos.rs` | CoS shaper / queue / flow-fair / runtime types (`CoSInterfaceRuntime`, `CoSQueueRuntime`, `CoSPendingTxItem`, `FlowFairState`, `WorkerCoSQueueFastPath`, etc.). Issue 68.1 split. |
 | `forwarding.rs` | Routing / forwarding types (`ForwardingResolution`, `ForwardingDisposition`, `NeighborEntry`, etc.). Issue 68.2 split. Three forwarding types had wider-than-`pub(super)` visibility in the original `mod.rs` and stay re-exported at their original surface. (`PacketDisposition` is in `mod.rs`; `ValidationState` is in `runtime.rs`.) |
 | `runtime.rs` | Per-worker runtime atomics and shared status types. |
-| `shared_cos_lease.rs` | Shared per-CoS lease + V_min coordination types (#1035 P4): `SharedCoSQueueLease`, `SharedCoSRootLease`, `SharedCoSQueueVtimeFloor`, `SharedCoSExactBacklog`, `PaddedVtimeSlot`, `NOT_PARTICIPATING` sentinel. `SharedCoSExactBacklog` carries queued-byte telemetry, serviceable-byte telemetry, an exact-demand queue mask, and the shared residual-surplus token bucket used to keep best-effort/non-exact surplus inside the root rate left after exact guarantees. |
+| `shared_cos_lease/mod.rs` | Shared per-CoS lease + V_min coordination types (#1035 P4): `SharedCoSQueueLease`, `SharedCoSRootLease`, `SharedCoSQueueVtimeFloor`, `SharedCoSExactBacklog`, `PaddedVtimeSlot`, `NOT_PARTICIPATING` sentinel. `SharedCoSExactBacklog` carries queued-byte telemetry, serviceable-byte telemetry, an exact-demand queue mask, and the shared residual-surplus token bucket used to keep best-effort/non-exact surplus inside the root rate left after exact guarantees. |
+| `shared_cos_lease/rotate_epoch_v8.rs` | `SharedCoSQueueLease::maybe_rotate_epoch_v8` — per-tick seqlock rotation state machine (#1229 Phase 6 v8 + #1231 v5 + #1290 v2). Extracted in #1329 as pure code motion. |
+| `shared_cos_lease/publish_equal_flow_epoch_v8.rs` | `publish_equal_flow_epoch_v8` — conditional equal-flow-suppression publish branch of the rotation. Extracted in #1329 as pure code motion. |
 | `tx.rs` | TX request / prepared-request shapes (`TxRequest`, `PreparedTxRequest`, etc.). |
-| `shared_cos_lease_tests.rs` | Unit tests for the V_min lease coordination — pinned because the lease is the load-bearing primitive in #1229 v8. |
+| `shared_cos_lease/shared_cos_lease_tests.rs` | Unit tests for the V_min lease coordination — pinned because the lease is the load-bearing primitive in #1229 v8. |
 
 ## Notable
 

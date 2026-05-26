@@ -39,6 +39,23 @@
   bugs: one surviving 'pub(in crate::afxdp) use' at the
   Cost: line, and the Open Question #4 'shortening from X to X'
   self-contradiction). Revised to v4 fixing both.
+- **18:18 UTC** — Codex r4 PLAN-READY. Plan locked.
+- **18:25 UTC** — Implemented split:
+    - Created shared_cos_lease/ dir.
+    - git mv shared_cos_lease_tests.rs → shared_cos_lease/.
+    - rotate_epoch_v8.rs: maybe_rotate_epoch_v8 body byte-identical
+      (sed -n 1497,1710p), pub(super) + #[inline], explicit
+      `use super::publish_equal_flow_epoch_v8::publish_equal_flow_epoch_v8;`.
+    - publish_equal_flow_epoch_v8.rs: body byte-identical
+      (sed -n 1713,1854p), pub(super) + #[inline].
+    - mod.rs assembled from L1-L1492 + closing impl `}` +
+      mod decls + L1855-L1989 + relocated mod tests decl.
+    - README.md + test header doc-cleanup done.
+- **18:35 UTC** — Cargo build clean. Cargo test 1433/1433 pass.
+  5x flake check on equal_flow_epoch_payload_is_visible_after_tag_under_concurrent_readers
+  5/5 pass. Go suite 32 packages OK, 0 fails. Binary size delta:
+  5,539,856 (this branch) vs 5,546,888 (master) = -7,032 bytes
+  (-0.13%) — well below 0.5% threshold.
 
 ## 2026-05-26 — #1325 implementation pushed
 
