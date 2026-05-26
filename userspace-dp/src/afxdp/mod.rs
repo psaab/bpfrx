@@ -56,7 +56,7 @@ macro_rules! debug_log {
 
 #[path = "bind.rs"]
 mod bind;
-#[path = "bpf_map.rs"]
+#[path = "bpf_map/mod.rs"]
 mod bpf_map;
 #[path = "checksum.rs"]
 mod checksum;
