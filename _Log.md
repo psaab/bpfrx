@@ -1,5 +1,31 @@
 # Action Log
 
+## 2026-05-26 23:10 UTC — #1578 cluster perf root-cause (smoke target IP misalignment)
+
+- **Timestamp**: 2026-05-26 23:10 UTC
+  - **Action**: Investigated the "loss userspace cluster ~9 Gb/s
+    reverse P=12 ceiling" reported in #1578 / #1580 / #1593. Direct
+    empirical probing on `loss:xpf-userspace-fw0` against the
+    canonical AF_XDP fast path showed 23.4 Gb/s push P=12 and 23.1
+    Gb/s reverse P=12 with CoS off, and 19-23 Gb/s reverse P=12 on
+    every port 5201-5211 with CoS active. Confirmed all 11 per-class
+    iperf3 listeners are live on `172.16.80.200`. The prior 9.35
+    Gb/s numbers reproduce only when iperf3 targets `172.16.100.200`
+    — which `loss-userspace-cluster.env IPERF_TARGET4` inherited
+    from the legacy bpfrx-fw0/1 cluster — reaching a different
+    `loss:` uplink path capped at ~10 Gb/s. The port 5211 / CoS /
+    virtio_net-xdpgeneric-WAN theories are all empirically false:
+    port 5211 is iperf-uncapped, CoS doesn't cap reverse direction,
+    and WAN on the loss userspace cluster is `ge-0-0-2` on mlx5_core
+    native XDP, not `ge-0-0-0` (which is the fabric IPVLAN parent).
+    Repointed `IPERF_TARGET4/6` to `172.16.80.200` /
+    `2001:559:8585:80::200` so failover scripts share the same
+    canonical target as the triple-review SKILL.md smoke harness,
+    and added a loss-cluster topology block to CLAUDE.md to prevent
+    future "ge-0-0-0 is WAN" misdiagnoses.
+  - **File(s)**: test/incus/loss-userspace-cluster.env, CLAUDE.md,
+    _Log.md (this entry).
+
 ## 2026-05-26 22:46 UTC — #1439 snapshot.go split (rebase carry-forward)
 
 - **Timestamp**: 2026-05-26 22:46 UTC
