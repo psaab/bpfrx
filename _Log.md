@@ -1,5 +1,22 @@
 # Action Log
 
+## 2026-05-26 22:46 UTC — #1439 snapshot.go split (rebase carry-forward)
+
+- **Timestamp**: 2026-05-26 22:46 UTC
+  - **Action**: PR #1592 rebased onto fresh `origin/master`
+    (b84f46280) after GitHub's merge planner declined the prior
+    multi-commit head (CONFLICTING despite local 3-way being clean).
+    Re-applied the snapshot.go split as a single squashed commit on
+    top of master. Plan-review history (3 rounds: Codex+Gemini+AGY)
+    and code-review history (2 rounds: Codex+Gemini+AGY+Copilot all
+    MERGE-READY) preserved in plan.md + reviewer-ids.md. Function
+    bodies verified byte-equivalent to pre-split snapshot.go
+    (63/63 identical). go build + go vet + go test + 5x flake all
+    pass.
+  - **File(s)**: 14 sibling .go files in pkg/dataplane/userspace/,
+    snapshot.go deleted, docs/pr/1439-snapshot-builders/{plan,reviewer-ids}.md,
+    _Log.md (this entry).
+
 ## 2026-05-26 — #1329 shared_cos_lease extract
 
 - **17:18 UTC** — Created worktree refactor/1329-shared-cos-lease-extract
