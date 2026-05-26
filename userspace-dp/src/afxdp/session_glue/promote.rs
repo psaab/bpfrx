@@ -2,8 +2,11 @@ use super::*;
 
 /// Shared-session backing references that travel together at every
 /// site that touches synced sessions. Grouping them collapses the
-/// 17-param `maybe_promote_synced_session` and 11-param
+/// 16-param `maybe_promote_synced_session` and 10-param
 /// `purge_translated_synced_hit` signatures that triggered #1346.
+/// (Issue body rounded these to 17/11 by counting `&mut sessions`
+/// as a leading param; the actual `fn` declarations on
+/// `origin/master` carry 16 and 10 typed args respectively.)
 ///
 /// `Copy` because the struct is 4 `&`-references (= 32 bytes on
 /// x86-64) with no destructor. Passing it by value at the 3 call
@@ -64,7 +67,7 @@ pub(in crate::afxdp::session_glue) fn should_keep_synced_hit_transient(
 /// `SharedPromote` origin, and replicated to peer worker commands.
 ///
 /// Behavior unchanged from the pre-#1346 free function; only the
-/// signature changed (17 → 13 params via `SharedSessionRefs`).
+/// signature changed (16 → 13 params via `SharedSessionRefs`).
 pub(in crate::afxdp::session_glue) fn maybe_promote_synced_session(
     sessions: &mut SessionTable,
     session_map_fd: c_int,
@@ -130,7 +133,7 @@ pub(in crate::afxdp::session_glue) fn maybe_promote_synced_session(
 /// route traffic to the wrong node.
 ///
 /// Behavior unchanged from the pre-#1346 free function; only the
-/// signature changed (11 → 7 params via `SharedSessionRefs`).
+/// signature changed (10 → 7 params via `SharedSessionRefs`).
 pub(in crate::afxdp::session_glue) fn purge_translated_synced_hit(
     sessions: &mut SessionTable,
     session_map_fd: c_int,

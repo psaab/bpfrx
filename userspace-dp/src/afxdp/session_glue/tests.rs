@@ -3880,11 +3880,23 @@ fn apply_worker_commands_dispatch_order_pin_with_demote_dedup() {
     assert!(results.vacate_all_shared_exact_slots);
 
     // ── (d) DemoteOwnerRGS dedup contract preserved ────────────────────────
-    // Both keys appear exactly once even though Demote{[5,5]} ran with a
-    // duplicate inside one command AND a second Demote{[5]} could have
-    // re-cancelled key_rg5. (key_rg5 was already cleared by the first
-    // Demote so the second Demote sees an empty bucket — the dedup guard
-    // is the belt-and-braces contract that the lifted handler must keep.)
+    // Both keys appear exactly once. Two dedup guards are at work:
+    //
+    //   1. `seen_owner_rgs.insert` inside `handle_demote_owner_rgs`
+    //      skips the second `5` in `Demote{[5, 5]}`.
+    //   2. `!cancelled_keys.iter().any(|key| key == &demoted_key)`
+    //      skips key_rg5 the SECOND time it surfaces. This is NOT
+    //      belt-and-braces — `SessionTable::demote_owner_rg` only
+    //      flips the session's origin to `SyncImport`; it does NOT
+    //      remove the entry from `owner_rg_sessions[5]`. So the
+    //      second `Demote{[5]}` arm in the command stream re-discovers
+    //      key_rg5 in the bucket and would re-cancel it without this
+    //      guard.
+    //
+    // Per Gemini r1 code-review feedback: an earlier comment here
+    // claimed the bucket was cleared and the guard was belt-and-braces.
+    // That was empirically false — the `cancelled_keys.iter().any`
+    // guard is load-bearing.
     let rg5_count = results
         .cancelled_keys
         .iter()
