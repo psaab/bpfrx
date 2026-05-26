@@ -251,9 +251,15 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | File | Current blocker |
 |---|---|
 | `cmd/xpfd/main.go` | Backend selection, cleanup, and backend registration still cross the root package. |
-| `pkg/api/handlers.go` | REST handlers still reference legacy dataplane counters and types. |
-| `pkg/api/handlers_sessions.go` | REST session reads still use legacy session types. |
+| `pkg/api/api.go` | Shared REST helpers still reference legacy dataplane counters and types (#1540 split entry: `apiRuntimeDataPlane` interface, `applyResult` adapter). |
 | `pkg/api/metrics.go` | Prometheus telemetry still reads legacy counters and metadata. |
+| `pkg/api/metrics_counters.go` | Prometheus map-counter collectors still call legacy dataplane reads (#1540 metrics split). |
+| `pkg/api/metrics_nat.go` | Prometheus NAT pool collector still reads legacy dataplane (#1540 metrics split). |
+| `pkg/api/metrics_sessions.go` | Prometheus session gauge collector still iterates legacy session tables (#1540 metrics split). |
+| `pkg/api/nat.go` | REST NAT handlers still read legacy NAT counters and metadata (#1540 handlers split). |
+| `pkg/api/security.go` | REST security handlers still reference legacy policy/screen counter types (#1540 handlers split). |
+| `pkg/api/sessions.go` | REST session reads still use legacy session types (#1540 rename of `handlers_sessions.go`). |
+| `pkg/api/stats.go` | REST statistics handlers still read legacy global/interface/zone counters (#1540 handlers split). |
 | `pkg/cli/cli.go` | Embedded CLI construction still stores the legacy bridge. |
 | `pkg/cli/cli_clear.go` | Clear commands still delete legacy session entries. |
 | `pkg/cli/cli_show_flow.go` | Flow display still uses legacy session keys and values. |
