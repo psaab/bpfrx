@@ -16,10 +16,22 @@
 //
 // RFC compliance fix:
 //   - `write_ipv4_header` sets DF=1 (Flags+FragOffset = 0x4000) by
-//     default. The previous gre.rs open-code set DF=0 with ID=0,
-//     which RFC 791 §3.1 + RFC 6864 §3 prohibit (ID=0 requires
-//     DF=1; otherwise reassembly may mis-glue across packets when
-//     a middlebox fragments).
+//     default. The IPv4 Identification field is hard-coded to 0.
+//     RFC 6864 §4 / §5.3.1 splits IPv4 datagrams into "atomic"
+//     (DF=1, MF=0, FragOffset=0) and "non-atomic". For non-atomic
+//     datagrams the ID field MUST be unique over the maximum
+//     packet lifetime — repeating ID=0 across packets risks the
+//     receiver mis-gluing fragments from different datagrams.
+//     For atomic datagrams the ID field has no reassembly
+//     semantic and may be any value. Setting DF=1 promotes the
+//     outer datagram to atomic, which makes the constant ID=0
+//     RFC-compliant. The previous gre.rs open-code set DF=0
+//     with ID=0 — a silent RFC violation under any deployment
+//     where a middlebox between src and dst fragments the
+//     tunnel packet. (Codex code-review wording fix: the
+//     defensible claim is "DF=1 makes the packet atomic, which
+//     permits the constant ID=0 under RFC 6864", NOT "RFC 6864
+//     requires DF=1 for tunnel packets".)
 //   - `write_ipv6_header` writes the IPv6 fixed header with
 //     caller-supplied traffic-class / flow-label / hop-limit.
 //   - `write_udp_header` accepts a plain `u16` checksum (not
@@ -103,9 +115,13 @@ pub(in crate::afxdp) fn write_eth_header_slice(
 /// Defaults:
 ///   - Identification = 0.
 ///   - Flags = DF (0x4000); FragOffset = 0. Together written as
-///     `ip[6..8] = 0x4000`. RFC 791 §3.1 + RFC 6864 §3 require
-///     DF=1 when ID=0 to avoid reassembly mis-glue across packets
-///     under middlebox fragmentation.
+///     `ip[6..8] = 0x4000`. Setting DF=1 promotes the datagram to
+///     RFC 6864 "atomic" status (DF=1, MF=0, FragOffset=0), which
+///     makes the constant ID=0 RFC-compliant: under RFC 6864 §4 the
+///     ID field has no reassembly semantic on atomic datagrams.
+///     The previous gre.rs open-code set DF=0 + ID=0, which is a
+///     silent RFC violation if any middlebox between src and dst
+///     fragments the packet.
 ///   - `ttl == 0` ⇒ default 64 (matches the existing gre.rs idiom).
 ///
 /// Returns `Some(20)` (bytes written) on success, `None` if
