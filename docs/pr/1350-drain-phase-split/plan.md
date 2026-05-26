@@ -131,11 +131,18 @@ This preserves both the side-effect distinction at line 248 vs
 
 **MEDIUM — Delete `_cos_owner_*_by_queue` params end-to-end**
 (Codex finding 2). Gemini agreed in answer to OQ1. v2 deletes
-the two params from the `drain_pending_tx` signature, from
-`drain_pending_tx_local_owner`, and from the callers at
-`worker/lifecycle.rs:50-51,66-67,97-98`. Also delete the
-forwarding paths through `tx/dispatch.rs` and
-`tx/tcp_segmentation.rs` if they pass these maps through.
+the two params from the `drain_pending_tx` signature and from
+`drain_pending_tx_local_owner`, and DROPS the trailing args at
+the drain-fn call sites. v3 narrows the caller scope per Codex
+round-2 finding 1: the params at `worker/lifecycle.rs:50-51`
+STAY in `poll_binding`'s signature because they are also
+forwarded to `enqueue_pending_forwards` at line 266-267 (a
+non-drain caller that still needs them); v3 only DROPS the
+trailing args at the drain-fn call sites within
+`worker/lifecycle.rs` (lines 66-67 and 97-98). Same shape for
+`tx/dispatch.rs` and `tx/tcp_segmentation.rs`: keep their
+top-level signatures intact, only drop the trailing args at
+the `drain_pending_tx_local_owner` call sites.
 
 **MEDIUM — Eight files is over-modularized** (Codex finding 3).
 Gemini disagreed (accepted module/foo as project convention).
@@ -318,16 +325,23 @@ pub(in crate::afxdp) struct DrainCtx<'a> {
 }
 ```
 
-Per round-1 Codex finding 2 + Gemini answer to OQ1, the two
-unused `_cos_owner_*_by_queue` params are **deleted
-end-to-end** in v2:
+Per round-1 Codex finding 2 + Gemini answer to OQ1 (with v3
+scope-narrowing per Codex round-2 finding 1), the two
+`_cos_owner_*_by_queue` params are **removed from the drain
+signatures and from their trailing-arg call sites only**:
 
-- removed from `drain_pending_tx` signature
-- removed from `drain_pending_tx_local_owner` signature
-- removed from `worker/lifecycle.rs` call sites at lines
-  50-51, 66-67, 97-98
-- if `tx/dispatch.rs` or `tx/tcp_segmentation.rs` forward
-  them through, removed there too
+- DELETED from: `drain_pending_tx` signature,
+  `drain_pending_tx_local_owner` signature.
+- DROPPED at drain-call trailing args:
+  `worker/lifecycle.rs:66-67,97-98`,
+  `tx/dispatch.rs:322-323,391-392,611-612,878-879`,
+  `tx/tcp_segmentation.rs:96-97`.
+- KEPT in caller signatures: `poll_binding` at
+  `worker/lifecycle.rs:50-51` (still feeds
+  `enqueue_pending_forwards` at line 266-267),
+  the `enqueue_*` / `segment_*` top-level fns in dispatch.rs
+  and tcp_segmentation.rs (still used by other call paths
+  unrelated to drain).
 
 DrainCtx has FOUR fields, all immutable refs or `Copy`
 scalars. Stack-built once at the top of `drain_pending_tx`;
