@@ -10,7 +10,13 @@
 - Codex: `task-mpmz1whj-5t3zod` → PLAN-NEEDS-MAJOR (5 mechanical)
 - AGY: `adversarial-review-mpmz27os-jlg8jq` → PLAN-NEEDS-MINOR (3 named)
 
-## Code review (PR #1573, implementation commit a383cf23)
+## Code review (PR #1573, implementation commit a383cf23 → 3ae779e4)
 
-- Codex: `task-mpmzpuvi-1mu1bx`
-- AGY: `adversarial-review-mpmzq8kd-ys1bws`
+- Codex attempt 1: `task-mpmzpuvi-1mu1bx` → INFRA-BLOCKED
+- Codex attempt 2: `task-mpmzty83-b6m725` → INFRA-BLOCKED
+- Codex attempt 3: `task-mpmzxio7-8ho68h` → INFRA-BLOCKED
+- AGY: `adversarial-review-mpmzq8kd-ys1bws` → MERGE-READY
+- Copilot: COMMENTED (2 inline findings on `a383cf23`); both addressed in `3ae779e4`
+
+3-of-4 attestation: Claude (SMR) + AGY + Copilot green; Codex repeatedly
+sandbox-infra-blocked.
