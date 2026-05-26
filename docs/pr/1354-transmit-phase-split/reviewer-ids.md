@@ -13,5 +13,9 @@
 
 ## Round 3 (re-attestation after doc fixes)
 
-- Codex: `task-mpn4ghyj-plbftk`
-- Copilot: re-requested via `@copilot review` comment on PR #1586
+- Codex: `task-mpn4ghyj-plbftk` — **MERGE-READY**
+- Copilot: re-reviewed 2026-05-26 21:07 UTC — **COMMENTED, no new comments** (clean attestation)
+
+## Final state
+
+4-of-4 reviewer agreement; AWAITING-BATCH-MERGE marker posted on PR #1586 at 21:07 UTC (head 341fdcde0127).
