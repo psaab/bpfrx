@@ -125,10 +125,11 @@ userspace-dp/src/afxdp/worker/
 │   │                       #   list, including timer-wheel sleeper counts and
 │   │                       #   the name-resolution fallback chain
 │   ├── queue_row.rs        # accumulate_queue_row(&mut status, queue,
-│   │                       #   queue_config, owner_profile_target,
-│   │                       #   binding_profile) — items 3 of decomposition
+│   │                       #   queue_config) — items 3 of decomposition
 │   │                       #   list, including #751 per-queue drain hist,
 │   │                       #   #710 / #718 drop counters, #760 overshoot-hunt
+│   │                       #   (binding-scoped merge stays inline in the
+│   │                       #   orchestrator per Gemini round-1 KILL counter-example)
 │   ├── status.rs           # build_worker_cos_statuses + the orchestrator
 │   │                       #   build_worker_cos_statuses_from_maps
 │   └── tests.rs            # ex worker/cos_tests.rs, brought in via mod tests
@@ -154,6 +155,7 @@ pub(super) fn accumulate_interface_root(
     forwarding: &ForwardingState,
 );
 ```
+- Owns `entry.ifindex = ifindex` assignment (cos.rs:560-561).
 - Owns name resolution (ifindex_to_config_name → ifindex_to_name → "ifindex-N").
 - Owns `shaping_rate_bytes`, `burst_bytes`, `worker_instances` MAX/saturating_add accumulation.
 - Owns timer level0/level1 sleeper sum.
@@ -175,10 +177,11 @@ pub(super) fn accumulate_queue_row(
   drain telemetry from owner_profile (#751: drain_invocations,
   drain_latency_hist, drain_sent_bytes and the four #760
   overshoot-hunt counters).
-- Stays atomic-relaxed-load only. No I/O, no allocs except the
-  one `drain_latency_hist.resize(DRAIN_HIST_BUCKETS, 0)` already in
-  the original code — guarded by the same `queue_invocations > 0`
-  early-out so untouched queues still serialize as empty.
+- Stays atomic-relaxed-load only. No I/O. Same allocation profile as
+  today's inline block: the `forwarding_class.clone()` at cos.rs:599
+  and the `drain_latency_hist.resize(DRAIN_HIST_BUCKETS, 0)` guarded
+  by `queue_invocations > 0` (cos.rs:716-717) are preserved — no
+  net-new allocations introduced.
 - **Internal field-write ordering is NOT free** (Codex round-1
   finding 2). The original at cos.rs:602-604 sets
   `status.priority = queue.config.priority` only when
@@ -319,9 +322,10 @@ outside `worker/cos.rs` and `worker/cos_tests.rs`.
    read-then-increment order verbatim.
 2. **Owner-profile binding-scoped fields land on exactly one row
    per binding.** `unique_owner_profile_row` is called ONCE per
-   binding-iteration; `merge_binding_profile_if_target` is called
-   once per queue and checks `Some(target) == (ifindex, queue_id)`
-   before merging. This is the same control flow as today.
+   binding-iteration; the orchestrator's inline gated `if
+   owner_profile_row == Some((ifindex, queue.queue_id()))` runs once
+   per queue and only then calls `merge_binding_scoped_owner_profile`.
+   Same control flow as today.
 3. **`drain_latency_hist.resize` gate.** The vector grows from 0 →
    DRAIN_HIST_BUCKETS only when `queue_invocations > 0`; an untouched
    queue stays empty. Helper preserves this exactly so the wire
@@ -332,8 +336,8 @@ outside `worker/cos.rs` and `worker/cos_tests.rs`.
    profile (#751).** Verified — the per-queue block in
    `accumulate_queue_row` does the relaxed loads on
    `queue.telemetry.owner_profile.*`. The binding profile is consulted
-   only by `merge_binding_profile_if_target` for the binding-scoped
-   subset.
+   only by the orchestrator's inline gated call to
+   `merge_binding_scoped_owner_profile` for the binding-scoped subset.
 6. **Borrow shape: `interfaces` and `queue_maps` live for the full
    walk; `interface_config` is a re-fetched short borrow per
    ifindex.** Splitting the inner loop into helpers means the helpers
@@ -358,9 +362,10 @@ outside `worker/cos.rs` and `worker/cos_tests.rs`.
    reads remain Relaxed. Helpers do not introduce any synchronization.
 10. **`OwnerProfileSnapshot` lifecycle.** `binding_live.map(owner_profile_snapshot)`
     materializes a struct-local owned snapshot per binding; the snapshot
-    is borrowed (`binding_profile.as_ref()`) into `merge_binding_profile_if_target`
-    for the duration of the inner queue loop and dropped at the end of
-    the binding iteration. Helpers MUST NOT extend the snapshot's
+    is borrowed (`binding_profile.as_ref()`) by the orchestrator's
+    inline gated `merge_binding_scoped_owner_profile` call for the
+    duration of the inner queue loop and dropped at the end of the
+    binding iteration. The orchestrator MUST NOT extend the snapshot's
     lifetime past the binding loop.
 
 ## Risk assessment
@@ -443,12 +448,13 @@ Compared to v1:
    former keeps all worker CoS helpers in one place; the latter
    minimizes the diff. PLAN-KILL is appropriate if reviewers judge
    the cos.rs split itself unjustified.
-2. **Should `accumulate_queue_row` and `merge_binding_profile_if_target`
-   be one function instead of two?** They are called back-to-back at
-   the same call site. Splitting them keeps each helper aligned with
-   one decision domain (#710/#718/#751/#760 per-queue vs
-   #709/#748/#751 binding-scoped). Reviewers should challenge whether
-   the seam helps or just adds a call boundary.
+2. **Should the inline gated `merge_binding_scoped_owner_profile`
+   call live inside `accumulate_queue_row` instead of the
+   orchestrator?** v2 keeps it inline in the orchestrator after the
+   `accumulate_queue_row` call. Folding it inside the queue helper
+   would require passing `owner_profile_row` and `binding_profile`
+   into the helper — exactly the round-1 KILL counter-example.
+   v2 picks the inline form. Challenge it if you disagree.
 3. **`finalize_interface_vec` takes ownership of the two BTreeMaps —
    is that OK?** It avoids re-borrowing them in the orchestrator
    after the walk. Alternative is `&mut interfaces` + drain. The
