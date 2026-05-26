@@ -3738,3 +3738,7 @@
 - **Timestamp**: 2026-05-26 10:00 UTC
 - **Action**: Fold Codex r-final MERGE-NEEDS-MINOR comment findings — update 2 stale comments. (1) ErrDPDKBackendRetired comment no longer references the deleted pkg/dataplane/dpdk package-local test; points to runtime/import_canary_test.go as defense-in-depth. (2) TestSchemaValidate_AcceptsLegacyDPDKSubStanza header clarifies it guards orphaned sub-stanzas that survive the rewrite bridge, not pre-bridge schema validation.
 - **File(s)**: pkg/dataplane/dataplane.go (ErrDPDKBackendRetired comment); pkg/cmdtree/schema_validate_test.go (test header).
+
+- **Timestamp**: 2026-05-26 UTC
+- **Action**: #1540 REST API split — plan v1 DRAFT; identifies sibling-file shape (`pkg/api/<aspect>.go`) per parent wave-1 instructions; lists target file decomposition for handlers.go (67 fns → 11 files) and metrics.go (33 fns → 6 files); flags 7 open questions for adversarial plan review including flat-package vs subdirectory shape decision.
+- **File(s)**: docs/pr/1540-rest-api-split/plan.md, docs/pr/1540-rest-api-split/reviewer-ids.md.
