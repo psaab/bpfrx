@@ -5,6 +5,21 @@
 // type, constant, and helper from afxdp.rs into scope, including
 // the sibling submodules (parser, rst, sharded_neighbor, etc.)
 // that the extracted fn references.
+//
+// #1327 Step 1 (Phase 1.5 follow-up to #946): converted from flat
+// poll_descriptor.rs to a directory module. The flow-cache fast path
+// extraction (`flow_cache_hit::stage_flow_cache_hit`) and the
+// per-descriptor RX telemetry helper (`rx_telemetry::record_rx_descriptor_telemetry`)
+// live as sibling modules. The post-flow-cache slow path (stages 12+)
+// stays inline — see docs/pr/1327-poll-descriptor-stages/plan.md for
+// the architectural verdict that further extraction is blocked by
+// mutable-locals coupling.
+
+mod flow_cache_hit;
+mod rx_telemetry;
+
+use flow_cache_hit::{FlowCacheOutcome, stage_flow_cache_hit};
+use rx_telemetry::record_rx_descriptor_telemetry;
 
 use super::poll_stages::{
     FabricIngressOutcome, ScreenCheckOutcome, StageOutcome, SynCookieAckOutcome,
@@ -545,338 +560,48 @@ pub(super) fn poll_binding_process_descriptor(
                         binding.scratch.scratch_recycle.push(desc.addr);
                         continue;
                     }
-                    // ── Flow cache fast path ────────────────────────────
-                    // For established TCP (ACK-only) and UDP, check the per-
-                    // binding flow cache before the expensive session lookup
-                    // + policy + NAT + FIB path. TCP SYN/FIN/RST skip the
-                    // cache to ensure proper session lifecycle handling.
+                    // ── Flow cache fast path (#1327 Step 1) ────────────────
+                    // Extracted to poll_descriptor/flow_cache_hit.rs. The
+                    // helper owns ALL recycle/forward pushes on Consumed;
+                    // caller MUST `continue` without touching desc.addr.
+                    // The original L477 `packet_frame` binding's NLL
+                    // lifetime ends at the previous line (last use was
+                    // inside stage_ipsec_passthrough_check); it is rebound
+                    // below the helper call for the slow-path code.
                     if FlowCacheEntry::packet_eligible(meta)
                         && let Some(flow) = flow.as_ref()
                     {
-                        if let Some(cached) = binding.flow.flow_cache.lookup_counted(
-                            &flow.forward_key,
-                            FlowCacheLookup::for_packet(meta, validation),
+                        match stage_flow_cache_hit(
+                            &mut binding.flow,
+                            &mut binding.tx_pipeline,
+                            &mut binding.tx_counters,
+                            &mut binding.scratch,
+                            &mut binding.mirror_sample_counter,
+                            &binding.live,
+                            binding.slot,
+                            binding_index,
+                            desc,
+                            area,
+                            raw_frame,
+                            &mut owned_packet_frame,
+                            meta,
+                            flow,
+                            packet_fabric_ingress,
+                            validation,
+                            sessions,
+                            now_ns,
                             now_secs,
-                            &worker_ctx.rg_epochs,
-                            meta.pkt_len,
+                            worker_ctx,
+                            telemetry,
                         ) {
-                            if !cached_flow_decision_valid(
-                                worker_ctx.forwarding,
-                                worker_ctx.ha_state,
-                                worker_ctx.dynamic_neighbors,
-                                now_secs,
-                                cached.stamp.owner_rg_id,
-                                packet_fabric_ingress,
-                                resolution_target_for_session(flow, cached.decision),
-                                cached.decision.resolution,
-                            ) {
-                                binding.flow.flow_cache.invalidate_slot(
-                                    &flow.forward_key,
-                                    meta.ingress_ifindex as i32,
-                                );
-                                // Fall through to slow path for full
-                                // HA resolution → fabric redirect.
-                            } else {
-                                let cached_decision = cached.decision;
-                                let cached_descriptor = &cached.descriptor;
-                                let cached_metadata = &cached.metadata;
-                                if let Some(counter) =
-                                    cached_descriptor.tx_selection.filter_counter.as_ref()
-                                {
-                                    crate::filter::record_filter_counter(
-                                        counter,
-                                        meta.pkt_len as u64,
-                                    );
-                                }
-                                let policer_action =
-                                    crate::filter::apply_cached_three_color_policers(
-                                        &cached_descriptor.tx_selection.three_color_policers,
-                                        now_ns,
-                                        meta.pkt_len as u64,
-                                    );
-                                emit_cached_input_filter_log(
-                                    worker_ctx.event_stream,
-                                    flow,
-                                    meta,
-                                    cached_descriptor,
-                                    now_ns,
-                                );
-                                emit_cached_output_filter_log(
-                                    worker_ctx.forwarding,
-                                    worker_ctx.event_stream,
-                                    flow,
-                                    meta,
-                                    cached_decision,
-                                    cached_descriptor,
-                                    cached_metadata,
-                                    now_ns,
-                                );
-                                if cached_descriptor.tx_selection.drop || policer_action.drop {
-                                    binding.scratch.scratch_recycle.push(desc.addr);
-                                    continue;
-                                }
-                                let cached_queue_id = cached_descriptor.tx_selection.queue_id;
-                                let cached_dscp_rewrite = policer_action
-                                    .dscp_rewrite
-                                    .or(cached_descriptor.tx_selection.dscp_rewrite);
-                                // Amortize session timestamp touch — every 64 cache hits.
-                                binding.flow.flow_cache_session_touch += 1;
-                                if binding.flow.flow_cache_session_touch & 63 == 0 {
-                                    sessions.touch(&flow.forward_key, now_ns);
-                                }
-                                if matches!(
-                                    cached_decision.resolution.disposition,
-                                    ForwardingDisposition::ForwardCandidate
-                                        | ForwardingDisposition::FabricRedirect
-                                ) {
-                                    // TTL/hop-limit check on flow cache hit path:
-                                    // generate ICMP Time Exceeded for packets that
-                                    // would expire after decrement.
-                                    // #1145: reuse the line-50 raw_frame bind
-                                    // instead of re-slicing for the same packet.
-                                    let local_icmp_te = build_local_time_exceeded_request(
-                                        raw_frame,
-                                        desc,
-                                        meta,
-                                        &worker_ctx.ident,
-                                        flow,
-                                        worker_ctx.forwarding,
-                                        worker_ctx.dynamic_neighbors,
-                                        worker_ctx.ha_state,
-                                        now_secs,
-                                    );
-                                    if let Some(request) = local_icmp_te {
-                                        binding.scratch.scratch_forwards.push(request);
-                                        // Don't recycle here — enqueue_pending_forwards
-                                        // returns the frame via pending_fill_frames
-                                        // when processing the prebuilt TE response.
-                                        continue;
-                                    }
-                                    telemetry.counters.forward_candidate_packets += 1;
-                                    if cached_decision.nat.rewrite_src.is_some() {
-                                        telemetry.counters.snat_packets += 1;
-                                    }
-                                    if cached_decision.nat.rewrite_dst.is_some() {
-                                        telemetry.counters.dnat_packets += 1;
-                                    }
-                                    // ── Inline in-place rewrite fast path ──
-                                    // Skip PendingForwardRequest + enqueue_pending_forwards entirely.
-                                    // Resolve target binding, rewrite frame in UMEM, push PreparedTxRequest.
-                                    let target_ifindex =
-                                        if cached_decision.resolution.tx_ifindex > 0 {
-                                            cached_decision.resolution.tx_ifindex
-                                        } else {
-                                            resolve_tx_binding_ifindex(
-                                                worker_ctx.forwarding,
-                                                cached_decision.resolution.egress_ifindex,
-                                            )
-                                        };
-                                    let expected_ports =
-                                        authoritative_forward_ports(packet_frame, meta, Some(flow));
-                                    let target_bi =
-                                        cached_descriptor.target_binding_index.or_else(|| {
-                                            if cached_decision.resolution.disposition
-                                                == ForwardingDisposition::FabricRedirect
-                                            {
-                                                worker_ctx.binding_lookup.fabric_target_index(
-                                                    target_ifindex,
-                                                    fabric_queue_hash(
-                                                        Some(flow),
-                                                        expected_ports,
-                                                        meta,
-                                                    ),
-                                                )
-                                            } else {
-                                                worker_ctx.binding_lookup.target_index(
-                                                    binding_index,
-                                                    worker_ctx.ident.ifindex,
-                                                    worker_ctx.ident.queue_id,
-                                                    target_ifindex,
-                                                )
-                                            }
-                                        });
-                                    // Check if target is same binding (hairpin) or same-UMEM.
-                                    // For simplicity, only do in-place fast path when target == self.
-                                    let is_self_target = target_bi == Some(binding_index);
-                                    if is_self_target && owned_packet_frame.is_none() {
-                                        let ingress_slot = binding.slot;
-                                        let flow_key = flow.forward_key.clone();
-                                        let mirror_config = resolve_mirror_config(
-                                            worker_ctx.forwarding,
-                                            meta.ingress_ifindex as i32,
-                                            meta.ingress_vlan_id,
-                                        );
-                                        let mut mirror_next_counter = None;
-                                        let mut mirror_admission = mirror_config.and_then(|config| {
-                                            let admission = admit_mirror_clone_to_live(
-                                                worker_ctx.mirror_targets,
-                                                resolve_tx_binding_ifindex(
-                                                    worker_ctx.forwarding,
-                                                    config.output_ifindex,
-                                                ),
-                                                worker_ctx.ident.queue_id,
-                                                packet_frame.len(),
-                                            );
-                                            match admission {
-                                                Ok(admission) => {
-                                                    let mut next_counter =
-                                                        binding.mirror_sample_counter;
-                                                    if mirror_sample_allows(
-                                                        config.rate,
-                                                        &mut next_counter,
-                                                    ) {
-                                                        mirror_next_counter = Some(next_counter);
-                                                        Some((config, Ok(admission)))
-                                                    } else {
-                                                        mirror_next_counter = Some(next_counter);
-                                                        None
-                                                    }
-                                                }
-                                                Err(result) => Some((config, Err(result))),
-                                            }
-                                        });
-                                        let mirror_frame_len = packet_frame.len();
-                                        let mut mirror_frame = mirror_admission
-                                            .as_ref()
-                                            .and_then(|(_, admission)| admission.as_ref().ok())
-                                            .map(|_| packet_frame.to_vec());
-                                        // Try descriptor-based straight-line rewrite first (no branches
-                                        // for AF, NAT type, or checksum recomputation).  Falls back to
-                                        // generic rewrite on port mismatch, NAT64, or NPTv6.
-                                        let rewrite_result = apply_rewrite_descriptor(
-                                            unsafe { &*area },
-                                            desc,
-                                            meta,
-                                            &cached_descriptor,
-                                            expected_ports,
-                                        )
-                                        .or_else(|| {
-                                            rewrite_forwarded_frame_in_place(
-                                                unsafe { &*area },
-                                                desc,
-                                                meta,
-                                                &cached_decision,
-                                                cached_descriptor.apply_nat_on_fabric,
-                                                expected_ports,
-                                            )
-                                        });
-                                        if let Some(rewrite_result) = rewrite_result {
-                                            if let Some(next_counter) = mirror_next_counter {
-                                                binding.mirror_sample_counter = next_counter;
-                                            }
-                                            if let Some((mirror_config, admission)) =
-                                                mirror_admission.take()
-                                            {
-                                                let result = match admission {
-                                                    Ok(admission) => {
-                                                        if let Some(mirror_frame) =
-                                                            mirror_frame.take()
-                                                        {
-                                                            let cos_queue_id = mirror_cos_queue_id(
-                                                                worker_ctx.forwarding,
-                                                                mirror_config.output_ifindex,
-                                                                meta.into(),
-                                                                Some(&flow_key),
-                                                            );
-                                                            enqueue_admitted_mirror_clone_to_live(
-                                                                admission,
-                                                                mirror_config,
-                                                                mirror_frame,
-                                                                meta.into(),
-                                                                Some(&flow_key),
-                                                                cos_queue_id,
-                                                            )
-                                                        } else {
-                                                            MirrorCloneResult::NoFrame
-                                                        }
-                                                    }
-                                                    Err(result) => result,
-                                                };
-                                                record_mirror_clone_result(
-                                                    &binding.live,
-                                                    result,
-                                                    mirror_frame_len,
-                                                );
-                                            }
-                                            binding.tx_pipeline.pending_tx_prepared.push_back(
-                                                PreparedTxRequest {
-                                                    offset: rewrite_result.offset,
-                                                    len: rewrite_result.len,
-                                                    recycle: PreparedTxRecycle::fill_on_slot(
-                                                        ingress_slot,
-                                                        rewrite_result.offset,
-                                                        desc.addr,
-                                                    ),
-                                                    expected_ports,
-                                                    expected_addr_family: meta.addr_family,
-                                                    expected_protocol: meta.protocol,
-                                                    flow_key: Some(flow_key),
-                                                    egress_ifindex: cached_decision
-                                                        .resolution
-                                                        .egress_ifindex,
-                                                    cos_queue_id: cached_queue_id,
-                                                    dscp_rewrite: cached_dscp_rewrite,
-                                                    mirror_clone: false,
-                                                },
-                                            );
-                                            binding.tx_counters.pending_in_place_tx_packets += 1;
-                                            binding.tx_counters.record_in_place_l2_rewrite(
-                                                rewrite_result.l2_rewrite,
-                                            );
-                                            telemetry.dbg.forward += 1;
-                                            telemetry.dbg.tx += 1;
-                                            recycle_now = false;
-                                        }
-                                    }
-                                    // Fallback: use PendingForwardRequest path for cross-binding or failure.
-                                    if recycle_now {
-                                        let cached_precomputed_tx_selection =
-                                            CachedTxSelectionDescriptor {
-                                                queue_id: cached_queue_id,
-                                                dscp_rewrite: cached_dscp_rewrite,
-                                                drop: cached_descriptor.tx_selection.drop,
-                                                ..CachedTxSelectionDescriptor::default()
-                                            };
-                                        if let Some(mut request) =
-                                            build_live_forward_request_from_frame(
-                                                worker_ctx.binding_lookup,
-                                                binding_index,
-                                                worker_ctx.ident,
-                                                desc,
-                                                packet_frame,
-                                                meta,
-                                                &cached_decision,
-                                                worker_ctx.forwarding,
-                                                Some(flow),
-                                                Some(cached_metadata.ingress_zone),
-                                                cached_descriptor.apply_nat_on_fabric,
-                                                now_ns,
-                                                worker_ctx.event_stream,
-                                                Some(PendingForwardHints {
-                                                    expected_ports,
-                                                    target_binding_index: target_bi,
-                                                }),
-                                                Some(&cached_precomputed_tx_selection),
-                                            )
-                                        {
-                                            request.frame = owned_packet_frame
-                                                .take()
-                                                .map(PendingForwardFrame::Owned)
-                                                .unwrap_or(PendingForwardFrame::Live);
-                                            telemetry.dbg.forward += 1;
-                                            telemetry.dbg.tx += 1;
-                                            binding.scratch.scratch_forwards.push(request);
-                                            recycle_now = false;
-                                        }
-                                    }
-                                }
-                                if recycle_now {
-                                    binding.scratch.scratch_recycle.push(desc.addr);
-                                }
-                                continue;
-                            } // else: cached HA-valid — fast path above
+                            FlowCacheOutcome::Consumed => continue,
+                            FlowCacheOutcome::FallThrough => {}
                         }
                     }
+                    // Re-bind packet_frame for slow-path code below
+                    // (original L477 binding's NLL lifetime ended before
+                    // the helper call above).
+                    let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);
                     // ── End flow cache fast path ─────────────────────────
                     let mut debug = flow
                         .as_ref()
@@ -2912,217 +2637,6 @@ pub(super) fn poll_binding_process_descriptor(
         }
         received.release();
         drop(received);
-}
-
-// #1128: per-descriptor RX-side bookkeeping lifted out of the inner
-// loop in `poll_binding_process_descriptor`.
-//
-// The work here, in order, is:
-//   1. prefetch the metadata header (96 bytes, two cache lines) and
-//      the first 64 bytes of frame data into L1 (#909);
-//   2. bump the unconditional per-binding counters that drive
-//      `show interfaces` and the live status RPCs:
-//      `telemetry.counters.{touched, rx_packets, rx_bytes}` and
-//      `telemetry.dbg.{rx, rx_bytes_total, rx_max_frame}`;
-//   3. for desc.len > 1514, bump `telemetry.dbg.rx_oversized` and
-//      (only under `cfg!(feature = "debug-log")`) eprint up to 20
-//      oversized-frame breadcrumbs;
-//   4. under `cfg!(feature = "debug-log")` only: RX-side TCP flag
-//      census (FIN / SYN+ACK / zero-window / RST), poison-
-//      descriptor detection, and a per-binding first-10 frame dump.
-//
-// In release builds without `--features debug-log` every
-// `cfg!(...)` branch in steps 3 and 4 collapses to false and LLVM
-// eliminates the debug-only body, leaving just the prefetches plus
-// the unconditional counter increments in step 2. That residue is
-// small enough that LLVM will inline a single call site regardless
-// of any annotation. `#[inline]` (not `#[inline(always)]`) is
-// deliberate: with `--features debug-log` the body is ~200 LOC, and
-// forcing inline of that into the hot loop would bloat L1-i in
-// debug builds for no production gain. `#[inline]` lets the
-// compiler honor the body-size heuristic, which inlines tight
-// production builds and correctly declines on the bulky debug
-// path. The goal is *source-level* separation of housekeeping
-// noise from forwarding logic, per the modularity discipline in #1128.
-#[inline]
-fn record_rx_descriptor_telemetry(
-    desc: XdpDesc,
-    area: *const MmapArea,
-    telemetry: &mut TelemetryContext,
-    worker_ctx: &WorkerContext,
-) {
-    // Prefetch the userspace-dp metadata header (96 bytes) at
-    // desc.addr - meta_len. try_parse_metadata reads this
-    // first, on the magic/version/length compare; before this
-    // prefetch landed, that compare consumed ~33 % of
-    // poll_binding_process_descriptor self-time on a perf
-    // profile under iperf3 -P 128 / 25 Gb/s shaper (#909).
-    //
-    // The metadata is exactly 96 bytes (UserspaceDpMeta has a
-    // const-asserted size; first field is `magic`) and starts
-    // 96 bytes before the frame. UMEM frames are 4096-byte
-    // aligned with a 256-byte headroom, so desc.addr is
-    // 64-byte aligned by construction; the 96 bytes therefore
-    // straddle exactly two cache lines and we issue two
-    // prefetches.
-    #[cfg(target_arch = "x86_64")]
-    {
-        debug_assert!(
-            desc.addr.is_multiple_of(64),
-            "UMEM frame at desc.addr={} should be 64-byte aligned",
-            desc.addr,
-        );
-        let meta_len = std::mem::size_of::<UserspaceDpMeta>();
-        if (desc.addr as usize) >= meta_len {
-            let meta_offset = (desc.addr as usize) - meta_len;
-            if let Some(pf_meta) = unsafe { &*area }.slice(meta_offset, meta_len) {
-                unsafe {
-                    core::arch::x86_64::_mm_prefetch(
-                        pf_meta.as_ptr() as *const i8,
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
-                    core::arch::x86_64::_mm_prefetch(
-                        pf_meta.as_ptr().add(64) as *const i8,
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
-                }
-            }
-        }
-    }
-
-    // Prefetch frame data into L1 while processing telemetry.counters.
-    // UMEM frames are cold (last touched by NIC DMA); this hides
-    // ~100ns DRAM latency before metadata parse.
-    #[cfg(target_arch = "x86_64")]
-    if let Some(pf) = unsafe { &*area }.slice(desc.addr as usize, 64.min(desc.len as usize)) {
-        unsafe {
-            core::arch::x86_64::_mm_prefetch(
-                pf.as_ptr() as *const i8,
-                core::arch::x86_64::_MM_HINT_T0,
-            );
-        }
-    }
-    telemetry.counters.touched = true;
-    telemetry.counters.rx_packets += 1;
-    telemetry.counters.rx_bytes += desc.len as u64;
-    telemetry.dbg.rx += 1;
-    telemetry.dbg.rx_bytes_total += desc.len as u64;
-    if desc.len > telemetry.dbg.rx_max_frame {
-        telemetry.dbg.rx_max_frame = desc.len;
-    }
-    if desc.len > 1514 {
-        telemetry.dbg.rx_oversized += 1;
-        if cfg!(feature = "debug-log") {
-            thread_local! {
-                static OVERSIZED_RX_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-            }
-            OVERSIZED_RX_LOG.with(|c| {
-                let n = c.get();
-                if n < 20 {
-                    c.set(n + 1);
-                    eprintln!(
-                        "DBG OVERSIZED_RX[{}]: if={} q={} desc.len={} (exceeds ETH+MTU 1514)",
-                        n, worker_ctx.ident.ifindex, worker_ctx.ident.queue_id, desc.len,
-                    );
-                }
-            });
-        }
-    }
-    // TCP flag detection on RX
-    if cfg!(feature = "debug-log") {
-        if desc.len >= 54 {
-            if let Some(rx_frame) = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
-            {
-                // Check for FIN, SYN+ACK, zero-window
-                if let Some(tcp_info) = extract_tcp_flags_and_window(rx_frame) {
-                    if (tcp_info.0 & 0x01) != 0 {
-                        // FIN
-                        telemetry.dbg.rx_tcp_fin += 1;
-                    }
-                    if (tcp_info.0 & 0x12) == 0x12 {
-                        // SYN+ACK
-                        telemetry.dbg.rx_tcp_synack += 1;
-                    }
-                    if tcp_info.1 == 0 && (tcp_info.0 & 0x02) == 0 {
-                        // zero window, not SYN
-                        telemetry.dbg.rx_tcp_zero_window += 1;
-                        if telemetry.dbg.rx_tcp_zero_window <= 10 {
-                            eprintln!(
-                                "RX_TCP_ZERO_WIN[{}]: if={} q={} len={} flags=0x{:02x}",
-                                telemetry.dbg.rx_tcp_zero_window,
-                                worker_ctx.ident.ifindex,
-                                worker_ctx.ident.queue_id,
-                                desc.len,
-                                tcp_info.0,
-                            );
-                        }
-                    }
-                }
-                if frame_has_tcp_rst(rx_frame) {
-                    telemetry.dbg.rx_tcp_rst += 1;
-                    thread_local! {
-                        static RX_RST_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-                    }
-                    RX_RST_LOG_COUNT.with(|c| {
-                        let n = c.get();
-                        if n < 50 {
-                            c.set(n + 1);
-                            let summary = decode_frame_summary(rx_frame);
-                            eprintln!(
-                                "RST_DETECT RX[{}]: if={} q={} len={} {}",
-                                n, worker_ctx.ident.ifindex, worker_ctx.ident.queue_id, desc.len, summary,
-                            );
-                            if n < 5 {
-                                let hex_len = (desc.len as usize).min(rx_frame.len()).min(80);
-                                let hex: String = rx_frame[..hex_len]
-                                    .iter()
-                                    .map(|b| format!("{:02x}", b))
-                                    .collect::<Vec<_>>()
-                                    .join(" ");
-                                eprintln!("RST_DETECT RX_HEX[{n}]: {hex}");
-                            }
-                        }
-                    });
-                }
-            }
-        }
-    }
-    // Poison check: detect if kernel recycled descriptor without writing data
-    if cfg!(feature = "debug-log") {
-        if desc.len >= 8 {
-            if let Some(first8) = unsafe { &*area }.slice(desc.addr as usize, 8) {
-                if first8 == &0xDEAD_BEEF_DEAD_BEEFu64.to_ne_bytes() {
-                    eprintln!(
-                        "DBG POISON_DETECTED: if={} q={} desc.addr={:#x} desc.len={} — kernel returned poisoned frame!",
-                        worker_ctx.ident.ifindex, worker_ctx.ident.queue_id, desc.addr, desc.len,
-                    );
-                }
-            }
-        }
-    }
-    if cfg!(feature = "debug-log") {
-        if telemetry.dbg.rx <= 10 {
-            if let Some(rx_frame) = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
-            {
-                // Decode IP+TCP details from the frame
-                let pkt_detail = decode_frame_summary(rx_frame);
-                eprintln!(
-                    "DBG RX_ETH[{}]: if={} q={} len={} {}",
-                    telemetry.dbg.rx, worker_ctx.ident.ifindex, worker_ctx.ident.queue_id, desc.len, pkt_detail,
-                );
-                // Full hex dump for first 3 packets
-                if telemetry.dbg.rx <= 3 {
-                    let dump_len = (desc.len as usize).min(rx_frame.len()).min(80);
-                    let hex: String = rx_frame[..dump_len]
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    eprintln!("DBG RX_HEX[{}]: {}", telemetry.dbg.rx, hex);
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]

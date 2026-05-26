@@ -3817,3 +3817,45 @@
     is borrow-safe. On FallThrough, caller re-binds packet_frame for
     the slow path at L880+. Also dropped unused binding_ifindex.
   - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Round-4 plan reviews returned PLAN-READY (AGY) and
+    provisional PLAN-READY (Codex — sandbox infra blocked direct
+    filesystem access; summary verdict). Both reviewers ratified the v4
+    fixes: helper takes &mut owned_packet_frame and re-derives
+    packet_frame internally; caller re-binds packet_frame after the
+    helper for slow path. Plan PLAN-READY × 2.
+  - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
+  - **Reviewer ids**: Codex task-mpmvn6gb-dye2zd (provisional),
+    AGY review-mpmvjkp0-mb9xux
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Implemented Step 1. Converted flat poll_descriptor.rs to
+    directory module (poll_descriptor/mod.rs). Extracted flow-cache fast
+    path (verbatim translation of original L563-894) to flow_cache_hit.rs
+    with #[inline(always)] + FlowCacheOutcome { Consumed, FallThrough }.
+    Helper signature uses 8 disjoint binding sub-struct refs +
+    re-derives packet_frame internally per AGY/Codex round-3+4 fixes.
+    Moved record_rx_descriptor_telemetry verbatim to rx_telemetry.rs.
+    Fixed snat_contract_doc_guard test to accept directory layout.
+    Final: mod.rs 2806 LOC (was 3292), flow_cache_hit.rs 379 LOC,
+    rx_telemetry.rs 220 LOC.
+  - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/{mod,flow_cache_hit,rx_telemetry}.rs, userspace-dp/tests/snat_contract_doc_guard.rs
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Validation gates.
+    - cargo build --release: clean (114 pre-existing warnings).
+    - cargo test --release: 1417/1417 main suite pass + 46+8+16 in test
+      bins. snat_contract_doc_guard: 1 pre-existing failure (master fails
+      too — docs/userspace-dataplane-gaps.md missing "fail-closed"
+      keyword, unrelated to #1327).
+    - 5x flake on afxdp::: same flake on master and branch
+      (2/10 fails on `wg::engine::engine_internal_tests::
+      reconcile_peers_snapshot_is_atomic_under_concurrent_load` — pre-
+      existing concurrent-load flake). Solo, this test passes 10/10
+      on both master and branch.
+    - cargo asm: `nm` + `objdump` confirm stage_flow_cache_hit symbol
+      DOES NOT appear in the release binary; #[inline(always)] fully
+      inlined it. No call edge to verify.
+    - Go suite: 30/30 packages pass.
+  - **File(s)**: _Log.md

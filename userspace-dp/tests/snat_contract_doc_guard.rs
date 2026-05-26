@@ -12,7 +12,19 @@ fn snat_contract_documents_current_fail_closed_runtime() {
     let plan_path = repo_root.join("docs/pr/1373-retire-ebpf-dataplane/plan-1377-snat-pools.md");
     let architecture_path = repo_root.join("docs/userspace-dataplane-architecture.md");
     let gaps_path = repo_root.join("docs/userspace-dataplane-gaps.md");
-    let poll_path = manifest_dir.join("src/afxdp/poll_descriptor.rs");
+    // #1327 Step 1 converted the flat poll_descriptor.rs to a directory
+    // module. The four source_nat_decision_for_flow call sites all stay
+    // in mod.rs (slow-path session resolution, which Step 1 did not
+    // attempt to extract — see docs/pr/1327-poll-descriptor-stages/plan.md
+    // "Stages 12+ verdict"). Compatibility: keep accepting either layout.
+    let poll_path = {
+        let flat = manifest_dir.join("src/afxdp/poll_descriptor.rs");
+        if flat.exists() {
+            flat
+        } else {
+            manifest_dir.join("src/afxdp/poll_descriptor/mod.rs")
+        }
+    };
 
     let plan = fs::read_to_string(&plan_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {}", plan_path.display(), e));
