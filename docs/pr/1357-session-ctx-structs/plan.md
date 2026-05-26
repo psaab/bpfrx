@@ -27,13 +27,19 @@ Changes in v3:
    `allow_replace_local` treatment, `ha_activation` becomes a
    positional bool on `update_session`. `SessionUpdate<'a>` carries
    only the 7-field cluster shared by update and promote.
-2. **Final API (v3):**
+2. **Final API (v3).** Note: today's methods are spelled `pub fn` on
+   `pub(crate) struct SessionTable` — so the effective visibility is
+   already crate-internal (`SessionTable` cannot escape the crate,
+   therefore its methods cannot either). v3 keeps the existing
+   `pub fn` spelling for each method to minimise the diff; explicit
+   visibility narrowing is out of scope and would be a separate
+   audit.
 
    ```rust
-   pub(crate) fn install_with_protocol_with_origin(&mut self, req: SessionInstall) -> bool;
-   pub(crate) fn upsert_synced_with_origin(&mut self, req: SessionInstall, allow_replace_local: bool) -> bool;
-   pub(crate) fn update_session(&mut self, req: SessionUpdate<'_>, ha_activation: bool) -> bool;
-   pub(crate) fn promote_synced_with_origin(&mut self, req: SessionUpdate<'_>) -> bool;
+   pub fn install_with_protocol_with_origin(&mut self, req: SessionInstall) -> bool;
+   pub fn upsert_synced_with_origin(&mut self, req: SessionInstall, allow_replace_local: bool) -> bool;
+   pub fn update_session(&mut self, req: SessionUpdate<'_>, ha_activation: bool) -> bool;
+   pub fn promote_synced_with_origin(&mut self, req: SessionUpdate<'_>) -> bool;
        // body: self.update_session(req, false)
    ```
 
@@ -66,11 +72,13 @@ Changes in v3:
    is 2 more in-source edits but they are inside `session/mod.rs`
    itself so they don't show in the call-site churn.
 
-   **Effective churn: 10 prod + ~34 test = ~44 call sites
-   rewritten.** v2's "12 + 40" was indeed slightly off; the
-   accurate split is 10 + 34. Either way the win is anti-drift,
-   not call-site simplification — every call site grows roughly
-   from 1 line to 8-10 lines of struct-literal.
+   **Effective churn: 10 external prod + 35 test = 45 call sites
+   rewritten** (Codex round-3 corrected count). Including the
+   `session/mod.rs` internal wrapper-body call sites (which also
+   need to construct the new struct literal), the total in-source
+   edit count is **15 prod + 35 test = 50**. Either way the win is
+   anti-drift, not call-site simplification — every call site grows
+   roughly from 1 line to 8-10 lines of struct-literal.
 
 5. **`#[inline]` discussion sharpened.** Gemini round-2 correctly
    noted that the baseline is *already* passing `key`,
@@ -279,7 +287,7 @@ it.
 
 | API guarantee | Status |
 |---|---|
-| `pub(crate)` not `pub` | confirmed — `SessionTable` is crate-internal; verified by full-repo grep across `*.rs` and `*.go`. No Go FFI binding. |
+| Effective visibility | `SessionTable` is `pub(crate)` (`session/mod.rs:136`); its methods are spelled `pub fn` but cannot be reached outside the crate because the type itself cannot escape. Verified by full-repo grep across `*.rs` and `*.go`: zero Go FFI bindings, zero external Rust callers. The plan keeps `pub fn` to minimise the diff. |
 | Method names unchanged | yes — all four touched fns keep their names. |
 | Return types unchanged | yes — `bool` for all four. |
 | Behaviour unchanged | yes — bodies destructure the struct into local bindings, then continue with byte-identical code. |
@@ -373,11 +381,11 @@ it.
    type at the cost of an enum-tag bit at every access. Reviewer may
    prefer the symmetry.
 3. **`#[inline]` vs `#[inline(always)]`** — v3 picks `#[inline]` per
-   Gemini round-2. Codex round-2 recommended `#[inline(always)]` for
-   the hot install/upsert path. Reviewer is asked to land the call;
-   v3's position is that `#[inline]` is sufficient because the call
-   site is monomorphic and LLVM SROA aggressively elides struct
-   materialization for non-generic callees at LTO.
+   Gemini round-2/3 (both reviewers now agree). `#[inline(always)]`
+   on ~110-line fns risks icache bloat. `userspace-dp/Cargo.toml`
+   does NOT enable LTO, so v3 relies on intra-crate inlining (release
+   profile) + LLVM SROA to flatten the struct boundary at each call
+   site, with `cargo asm` verification at the implementation gate.
 4. **`promote_synced_with_origin` and `install_with_protocol_with_origin`
    compile-time distinctness.** v3 makes them take DIFFERENT structs
    (`SessionUpdate<'a>` vs `SessionInstall`), so a caller cannot
