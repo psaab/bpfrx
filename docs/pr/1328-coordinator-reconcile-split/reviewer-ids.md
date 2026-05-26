@@ -1,5 +1,10 @@
 # Reviewer task IDs — #1328 Coordinator decompose Phase 2
 
+## Code review round 1 (HEAD ffb57266, PR #1570)
+- Codex: task-mpmx943s-q3i3fg
+- AGY:   review-mpmx98v3-pit578
+- Copilot: @copilot review posted via PR comment
+
 ## Plan round 4 (HEAD dab1ada3) — both PLAN-READY
 - Codex: task-mpmvh9at-ri87j9 — PLAN-READY (best effort; sandbox
   infrastructure was intermittently broken across attempts r3/r4)

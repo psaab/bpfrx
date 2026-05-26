@@ -1334,7 +1334,7 @@ fn refresh_bindings_zeroes_v_min_counters_when_worker_absent() {
 /// `docs/pr/1328-coordinator-reconcile-split/plan.md`
 /// §"Hidden invariants" #2.
 #[test]
-fn reconcile_with_none_snapshot_preserves_stage_sequence() {
+fn reconcile_with_none_snapshot_reaches_no_snapshot_early_exit() {
     let mut coordinator = Coordinator::new();
     let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
         slot: 1,

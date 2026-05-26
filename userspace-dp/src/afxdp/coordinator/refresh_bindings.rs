@@ -305,6 +305,15 @@ pub(super) fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.tx_completions = 0;
     binding.tx_errors = 0;
     binding.tx_shared_recycle_unknown_slot_drops = 0;
+    // Copilot finding (PR #1570): these three are subsets of
+    // `tx_errors`. The pre-#1328 master `refresh_bindings` else-branch
+    // also did not zero them, but leaving them stale when a slot
+    // transitions to unbound produces inconsistent operator-visible
+    // status (subset > 0 while `tx_errors == 0`). Adding the zeros
+    // here as a consistency fix on top of pure code motion.
+    binding.redirect_inbox_overflow_drops = 0;
+    binding.pending_tx_local_overflow_drops = 0;
+    binding.tx_submit_error_drops = 0;
     binding.mirrored_packets = 0;
     binding.mirrored_bytes = 0;
     binding.mirror_drops_no_frame = 0;

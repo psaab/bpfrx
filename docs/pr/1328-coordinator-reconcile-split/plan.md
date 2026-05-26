@@ -40,7 +40,7 @@ Concrete v2 deltas:
 5. **Test plan:** drop the bogus `coordinator/tests.rs:1310`
    citation. `:1310` is a `refresh_bindings` zero-out test, not a
    `reconcile(None, ...)` test. Add a new
-   `coordinator::tests::reconcile_with_none_snapshot_preserves_stage_sequence`
+   `coordinator::tests::reconcile_with_none_snapshot_reaches_no_snapshot_early_exit`
    test that asserts the final state after `reconcile(None, ...)`:
    `last_reconcile_stage == "no_snapshot"`, `reconcile_calls == 1`,
    `workers.live` empty, `slow_path == None`. (`last_reconcile_stage`
@@ -476,7 +476,7 @@ methods on `Coordinator`. No callsite is touched.
 |------------|-------|------------|
 | Behavioral regression | MEDIUM | The teardown→reset→snapshot→bringup ordering is load-bearing for slow-path preservation across HA role changes. Mitigation: pure code motion verified by `git diff --stat` (line count ≈ 0 net delta excluding new file headers), 1089 LOC of existing `coordinator/tests.rs`, `make test-failover`, `make test-ha-crash`. |
 | Lifetime / borrow-checker | MEDIUM | `&mut self` plus `&mut [BindingStatus]` across phase boundaries means each new helper takes both. The two `Vec<…>` preserved fields (`synced_sessions`, `slow_path`) are passed by value through the `PreservedReconcileState`, so no lifetime extension is needed. Smoke: `cargo build --release` clean. |
-| Performance regression | LOW | Functions are off the packet hot path. The only concern is the no-op `reconcile(None, …)` allocation discipline; covered by adding a new `coordinator::tests::reconcile_with_none_snapshot_preserves_stage_sequence` test (see Test plan §). |
+| Performance regression | LOW | Functions are off the packet hot path. The only concern is the no-op `reconcile(None, …)` allocation discipline; covered by adding a new `coordinator::tests::reconcile_with_none_snapshot_reaches_no_snapshot_early_exit` test (see Test plan §). |
 | Architectural mismatch (#961 / #946-Phase-2 dead-end) | LOW | Pure code motion has no architectural premise to fail. The decomposition target (per-phase sub-files matching the comment-block structure of the current function) is what the issue body explicitly proposes; no novel design. |
 
 ## Test plan
@@ -486,7 +486,7 @@ methods on `Coordinator`. No callsite is touched.
    952+ tests pass).
 3. 5× flake check on the full `coordinator::tests` module.
 4. **Codex r1 #4 correction — new test:** add
-   `coordinator::tests::reconcile_with_none_snapshot_preserves_stage_sequence`
+   `coordinator::tests::reconcile_with_none_snapshot_reaches_no_snapshot_early_exit`
    that calls `reconcile(None, &mut bindings, 64)` and asserts:
    - final `last_reconcile_stage == "no_snapshot"`.
    - `reconcile_calls == 1` afterwards.
