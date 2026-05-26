@@ -1,0 +1,416 @@
+# #1348 — icmp_embed.rs split + 10-param collapse (Wave-5)
+
+**Status:** DRAFT v1 — pending adversarial plan review.
+
+## Issue framing
+
+`userspace-dp/src/afxdp/icmp_embed.rs` is 761 production LOC. Two
+specific items cross the engineering-style thresholds:
+
+- `try_embedded_icmp_nat_match_from_frame` (icmp_embed.rs:190) is a
+  269-LOC body — Tier-1 (>200 LOC), 2.7x the 100-LOC cap.
+- `embedded_icmp_return_resolution` (icmp_embed.rs:460) is a 10-param
+  free function — over the 8-param cap.
+
+Issue #1348 asks for two things:
+
+1. Split `try_embedded_icmp_nat_match_from_frame` along its natural
+   structural seams (v4 outer / v6 outer × parse / lookup / build
+   match) into a module-with-foo layout
+   (`icmp_embed/{mod,…}.rs`).
+2. Collapse the 10-param `embedded_icmp_return_resolution` into a
+   typed context struct.
+
+## Honest scope/value framing
+
+This is a pure code-motion + parameter-bundling refactor on the
+embedded-ICMP NAT-reversal path. The hot-path call is from
+`poll_descriptor/mod.rs:1221` — invoked only when the packet is an
+ICMP error (ICMP type 3/11/12/etc. or ICMPv6 type 1/2/3/4) AND we are
+on the NAT reversal path. That is a tiny minority of packets in
+steady-state iperf3 traffic. The perf win at absolute scale is
+essentially zero — the goal is **modularity and maintainability**, not
+throughput.
+
+The value is:
+
+- Each of the four cases (v4 outer / v6 outer × forward-NAT-by-reverse
+  / session-lookup-fallback) becomes individually readable.
+- The 10-param fn collapses to a single `&EmbeddedReturnCtx` borrow,
+  which is the same pattern already used in `forwarding/` and
+  `bpf_map/` submodules.
+- Future ICMP/ICMPv6 work (e.g. NPTv6 cross-family path, new ICMP
+  error subtypes for NAT64) gets a cleaner seam to land on.
+
+*If reviewers conclude the perf gain is too small to justify the
+churn, PLAN-KILL is an acceptable verdict.* The counter-argument is
+that the engineering-style doc explicitly lists the 100-LOC / 8-param
+gates as triggers, and #1348 is one of several Wave-5 split PRs being
+driven serially under that policy.
+
+## What's already shipped / partially batched
+
+- `icmp_embed.rs` itself is the post-#1476 retired-BPF-replacement
+  Rust path for embedded-ICMP NAT reversal. Build-side
+  `build_nat_reversed_icmp_error_v4/v6` and post-resolution
+  `finalize_embedded_icmp_resolution` already sit alongside it.
+- Sibling Wave-5 PRs are splitting other hot-path files
+  (`snapshot.go` #1592, etc.) using the same "module/foo" convention.
+- The afxdp module already uses the directory-with-`mod.rs` pattern
+  for `bpf_map/`, `coordinator/`, `forwarding/`, `frame/`,
+  `poll_descriptor/`, `cos/`. We follow that pattern.
+
+The `EmbeddedIcmpMatch` struct (icmp_embed.rs:7) and the four sibling
+`pub(super)` helpers (`try_embedded_icmp_session_match*`,
+`try_embedded_icmp_nat_match*`, `build_nat_reversed_icmp_error_v4/v6`,
+`finalize_embedded_icmp_resolution`) are imported by
+`afxdp/mod.rs:148-154` and called from `poll_descriptor/mod.rs:1221+`.
+Their `pub(super)` visibility plus exact signatures must be preserved
+under the new module layout.
+
+## Concrete design
+
+### Module layout
+
+```
+userspace-dp/src/afxdp/icmp_embed/
+├── mod.rs              // re-exports + thin dispatch (try_embedded_icmp_nat_match,
+│                       //   try_embedded_icmp_nat_match_from_frame,
+│                       //   try_embedded_icmp_session_match,
+│                       //   try_embedded_icmp_session_match_from_frame,
+│                       //   EmbeddedIcmpMatch struct)
+├── parse.rs            // embedded_reply_key, embedded_reply_ports,
+│                       //   parse helpers shared by v4 and v6 (e.g. an
+│                       //   EmbeddedHeader struct + parse fns)
+├── session_match.rs    // lookup_embedded_session +
+│                       //   try_embedded_icmp_session_match_from_frame impl
+│                       //   (the v4 + v6 session-only path, ~110 LOC today)
+├── nat_match_v4.rs     // v4-outer branch of try_embedded_icmp_nat_match_from_frame
+│                       //   (~120 LOC today, icmp_embed.rs:210-332)
+├── nat_match_v6.rs     // v6-outer branch (~125 LOC, icmp_embed.rs:333-455)
+├── return_resolution.rs // embedded_icmp_return_resolution + EmbeddedReturnCtx struct
+└── builders.rs         // build_nat_reversed_icmp_error_v4/v6 +
+                        //   finalize_embedded_icmp_resolution
+```
+
+`mod.rs` becomes the dispatch + public surface (~80 LOC):
+
+```rust
+use super::*;
+
+#[derive(Clone, Debug)]
+pub(super) struct EmbeddedIcmpMatch { … }
+
+mod parse;
+mod session_match;
+mod nat_match_v4;
+mod nat_match_v6;
+mod return_resolution;
+mod builders;
+
+pub(super) use builders::{
+    build_nat_reversed_icmp_error_v4,
+    build_nat_reversed_icmp_error_v6,
+    finalize_embedded_icmp_resolution,
+};
+pub(super) use session_match::{
+    try_embedded_icmp_session_match,
+    try_embedded_icmp_session_match_from_frame,
+};
+
+#[inline]
+pub(super) fn try_embedded_icmp_nat_match(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    sessions: &mut SessionTable,
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
+    shared_sessions:               &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions:           &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions:  &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    now_ns: u64,
+) -> Option<EmbeddedIcmpMatch> {
+    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    try_embedded_icmp_nat_match_from_frame(
+        frame, meta, sessions, forwarding, dynamic_neighbors,
+        shared_sessions, shared_nat_sessions, shared_forward_wire_sessions, now_ns,
+    )
+}
+
+pub(super) fn try_embedded_icmp_nat_match_from_frame(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    sessions: &mut SessionTable,
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
+    shared_sessions:               &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions:           &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions:  &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    now_ns: u64,
+) -> Option<EmbeddedIcmpMatch> {
+    let l4 = meta.l4_offset as usize;
+    let icmp_type = *frame.get(l4)?;
+    if !is_icmp_error(meta.protocol, icmp_type) {
+        return None;
+    }
+    let ctx = nat_match_v4::Ctx { /* refs bundled */ };  // see below
+    match meta.protocol {
+        PROTO_ICMP   => nat_match_v4::match_outer_v4(frame, meta, ctx, now_ns),
+        PROTO_ICMPV6 => nat_match_v6::match_outer_v6(frame, meta, ctx, now_ns),
+        _ => None,
+    }
+}
+```
+
+### Typed context for `embedded_icmp_return_resolution`
+
+`return_resolution.rs` collapses the 10-param fn behind a context
+struct. The original signature is:
+
+```rust
+fn embedded_icmp_return_resolution(
+    sessions: &mut SessionTable,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<ShardedNeighborMap>,
+    forward_key: &SessionKey,
+    forward_decision: SessionDecision,
+    original_src: IpAddr,
+    now_ns: u64,
+) -> ForwardingResolution
+```
+
+New shape:
+
+```rust
+pub(super) struct EmbeddedReturnCtx<'a> {
+    pub sessions: &'a mut SessionTable,
+    pub shared_sessions: &'a Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    pub shared_forward_wire_sessions:
+        &'a Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    pub forwarding: &'a ForwardingState,
+    pub dynamic_neighbors: &'a Arc<ShardedNeighborMap>,
+}
+
+#[inline]
+pub(super) fn embedded_icmp_return_resolution(
+    ctx: &mut EmbeddedReturnCtx<'_>,
+    forward_key: &SessionKey,
+    forward_decision: SessionDecision,
+    original_src: IpAddr,
+    now_ns: u64,
+) -> ForwardingResolution {
+    let reverse_key = reverse_session_key(forward_key, forward_decision.nat);
+    if let Some(reverse) = lookup_session_across_scopes(
+        ctx.sessions, ctx.shared_sessions, ctx.shared_forward_wire_sessions,
+        &reverse_key, now_ns, 0,
+    ) {
+        return reverse.lookup.decision.resolution;
+    }
+    lookup_forwarding_resolution_with_dynamic(
+        ctx.forwarding, ctx.dynamic_neighbors, original_src,
+    )
+}
+```
+
+The 5 borrow refs become a struct (one parameter), plus 4 by-value
+inputs (forward_key, decision, original_src, now_ns) → 5 params total.
+
+### `nat_match_v4` / `nat_match_v6` shape
+
+Each branch encapsulates:
+
+- Parse the embedded v4/v6 header (10-20 LOC) — could share via
+  `parse.rs::parse_embedded_v4_header` / `parse_embedded_v6_header`
+  returning `(proto, src, dst, l4_off)`.
+- Build embedded `SessionKey` + `reverse_key`.
+- Try `lookup_forward_nat_across_scopes` first → returns
+  `EmbeddedIcmpMatch` via `embedded_icmp_return_resolution`.
+- Fall back to `lookup_session_across_scopes` → builds
+  `EmbeddedIcmpMatch` (with NPTv6 lookup detour for v6).
+- Each function takes the same `Ctx { sessions, forwarding,
+  dynamic_neighbors, shared_*, … }` reference bundle.
+
+### Behavioral invariants (literal, NOT to be changed)
+
+- v6 outer path applies `forwarding.nptv6.translate_inbound(&mut
+  emb_src_lookup_v6)` on the embedded source BEFORE building the
+  embedded `SessionKey` (icmp_embed.rs:358-360). The `reverse_key`
+  uses the **wire** address (`emb_src_wire.into()`,
+  icmp_embed.rs:372), not the translated address. The
+  `shared_reverse_key` inside the fallback branch uses the
+  **translated** `emb_src_lookup` (icmp_embed.rs:415). Splitting must
+  preserve this asymmetry.
+- `embedded_reply_ports` swaps src/dst ports for TCP/UDP but NOT for
+  ICMP/ICMPv6 (where "ports" are echo id).
+- `lookup_forward_nat_across_scopes` is consulted FIRST, before the
+  `lookup_session_across_scopes` fallback. If both find a hit, the
+  first wins. Don't reorder.
+- `EmbeddedIcmpMatch.original_src_port` is set from the embedded src
+  port on the session-fallback path, but from `fwd.key.src_port` on
+  the forward-NAT path.
+- When `sl.metadata.is_reverse` is true, we use
+  `sl.decision.resolution` directly and DO NOT call
+  `embedded_icmp_return_resolution`. The call only happens on
+  forward-direction matches.
+
+### Public API preservation
+
+These 5 items keep their exact signatures and `pub(super)` visibility,
+imported the same way from `afxdp/mod.rs`:
+
+- `EmbeddedIcmpMatch` (struct, with all 6 fields)
+- `try_embedded_icmp_nat_match_from_frame(frame, meta, sessions,
+  forwarding, dynamic_neighbors, shared_sessions, shared_nat_sessions,
+  shared_forward_wire_sessions, now_ns)`
+- `try_embedded_icmp_nat_match(area, desc, meta, sessions, forwarding,
+  dynamic_neighbors, shared_sessions, shared_nat_sessions,
+  shared_forward_wire_sessions, now_ns)`
+- `try_embedded_icmp_session_match_from_frame(frame, meta, sessions,
+  now_ns)`
+- `try_embedded_icmp_session_match(area, desc, meta, sessions, now_ns)`
+- `build_nat_reversed_icmp_error_v4(frame, meta, icmp_match)`
+- `build_nat_reversed_icmp_error_v6(frame, meta, icmp_match)`
+- `finalize_embedded_icmp_resolution(forwarding, ha_state, now_secs,
+  ingress_ifindex, icmp_match)`
+
+`embedded_icmp_return_resolution`, `lookup_embedded_session`,
+`embedded_reply_key`, `embedded_reply_ports` are private; their
+signatures may change. Only `embedded_icmp_return_resolution` changes
+shape (typed ctx); the other three are pure code-motion.
+
+`afxdp/mod.rs:148-154` import block is untouched.
+
+## Hidden invariants the change must preserve
+
+- **Side-effect ordering**: `lookup_forward_nat_across_scopes`
+  consulted before `lookup_session_across_scopes` (both can mutate
+  `sessions` via internal `lookup`). The two ICMP types (v4-outer vs
+  v6-outer) MUST NOT cross-pollute lookups.
+- **NPTv6 translation gate**: applied ONLY on v6 outer, BEFORE
+  building `embedded_key`, NOT on the `reverse_key` for
+  `lookup_forward_nat_across_scopes`, and applied AGAIN on
+  `shared_reverse_key`. The original code is intentionally split
+  across two `embedded_reply_key` calls (wire vs lookup); the refactor
+  must keep both.
+- **Allocation rules**: ZERO new per-packet heap allocations. The
+  `EmbeddedReturnCtx` struct is a borrow bundle (no `Box`, no `Arc`
+  clones). `nat_match_v4::Ctx` similarly is a stack-local borrow
+  bundle. `#[inline]` on the dispatch fn ensures the compiler can
+  flatten the indirection.
+- **HA sync portability**: none of the maps' wire shapes change.
+  `EmbeddedIcmpMatch` is internal to userspace-dp; not serialized to
+  HA peer.
+- **Stale-handle hazards**: `&mut SessionTable` mutable borrow flows
+  through the context struct; cannot be split into two simultaneous
+  `&mut` paths. The plan keeps a single mut borrow on the context,
+  consistent with current behavior.
+- **Lifetime/borrow-checker shape**: `EmbeddedReturnCtx<'a>` holds
+  `&'a mut SessionTable` + 4× `&'a Arc<…>` / `&'a …`. Callers must
+  reborrow when calling within a branch. This pattern is used
+  elsewhere in afxdp (e.g. `forwarding_build`, `forwarding/`); no new
+  lifetime gymnastics.
+- **`#[inline]` hint preservation**: hot dispatch fn
+  (`try_embedded_icmp_nat_match_from_frame`) gets `#[inline]` so the
+  compiler can fold the family-dispatch back into the caller. Inner
+  `match_outer_v4` / `match_outer_v6` are NOT `#[inline]` — they're
+  cold-ish (only embedded-ICMP errors hit them) and inlining them
+  would bloat I-cache for code that runs on a rare path.
+
+## Risk assessment
+
+| Class | Severity | Notes |
+|---|---|---|
+| Behavioral regression | LOW | Pure code-motion + struct bundling; no logic change |
+| Lifetime/borrow-checker | LOW-MED | `EmbeddedReturnCtx<'a>` holds 5 borrow refs incl. `&mut SessionTable`. Must reborrow carefully across the two paths in each v4/v6 branch |
+| Performance regression | LOW | Hot path is ICMP-error only (rare); `#[inline]` on dispatch keeps it folded; ctx struct is stack |
+| Architectural mismatch (#961 / #946-P2) | LOW | Issue body already sketches the split; afxdp/ already uses dir-with-mod.rs pattern; this is not a re-architecture, just a sibling split |
+
+## Test plan
+
+- `cargo build` clean
+- `TMPDIR=/dev/shm CARGO_TARGET_DIR=/dev/shm/cargo cargo test --release`
+  — full 952+ test suite
+- Existing icmp_embed tests at `userspace-dp/src/afxdp/tests.rs:2279`,
+  `:2427`, `:2569`, `:2617` (4 known call sites of
+  `try_embedded_icmp_nat_match_from_frame`) MUST pass unchanged
+- 5/5 named-test flake check on the affected tests
+- Go suite: 30 packages pass
+- **No per-PR smoke** — per Wave-5 batch-merge rule. Post
+  `<!-- AWAITING-BATCH-MERGE -->` after 4-of-4 attestation.
+
+## Out of scope (explicitly)
+
+- Tightening the embedded-ICMP NAT reversal logic itself (deferred
+  to #867 follow-up).
+- Adding new tests for icmp_embed beyond what exists today.
+- Touching `lookup_forward_nat_across_scopes`,
+  `lookup_session_across_scopes`,
+  `lookup_forwarding_resolution_with_dynamic`,
+  `reverse_session_key`, or any shared session helper.
+- Merging the v4 + v6 branches into a generic family-parameterised
+  function (the asymmetry around NPTv6 and IPv6 reverse-key wire
+  semantics makes a generic merge unsafe in this PR).
+- Inline-test colocation under `icmp_embed/tests.rs`. The issue body
+  *mentions* this as a follow-up opportunity; we don't include it in
+  this PR to keep the diff pure code-motion.
+
+## Open questions for adversarial review
+
+1. **Is `#[inline]` on `try_embedded_icmp_nat_match_from_frame`
+   correct?** The function dispatches on `meta.protocol` (PROTO_ICMP
+   vs PROTO_ICMPV6) — inlining lets the compiler fold the match into
+   the caller, but inflates I-cache if the caller is itself cold.
+   PLAN-KILL-worthy if the call frequency at
+   `poll_descriptor/mod.rs:1221` is hot enough that I-cache pressure
+   matters. (Argument for: it's already on a rare path — only entered
+   when `parsed_icmp_error` is true.)
+
+2. **Does collapsing 10 params to a struct cause a measurable extra
+   indirection on a hot path?** The current 10-arg fn fits in
+   registers/spills cleanly; a `&EmbeddedReturnCtx` may force a
+   pointer dereference for each of the 5 refs. If the inliner doesn't
+   flatten this, we add ~5 loads per call. Argument for: the call
+   site is `is_icmp_error == true` only — cold path.
+
+3. **Is the v6 `embedded_reply_key` asymmetry (wire vs translated)
+   correctly preserved if v6 path is moved to `nat_match_v6.rs`?**
+   The current code calls `embedded_reply_key(…, emb_src_wire.into(),
+   …)` for the forward-NAT branch (icmp_embed.rs:369-376) but later
+   builds `shared_reverse_key` with `emb_src_lookup` (the
+   NPTv6-translated form, icmp_embed.rs:412-419). Splitting risks
+   accidentally unifying these.
+
+4. **Should `lookup_embedded_session` move to `parse.rs` or to
+   `session_match.rs`?** It's called only from
+   `try_embedded_icmp_session_match_from_frame`, so
+   `session_match.rs` is the natural home. But it's also one of the
+   few helpers that touches the slow-path forward-NAT match
+   (`sessions.find_forward_nat_match`) — does that argue for keeping
+   it next to `embedded_icmp_return_resolution`?
+
+5. **Module split granularity** — is 6 sibling files
+   (parse / session_match / nat_match_v4 / nat_match_v6 /
+   return_resolution / builders) too fine-grained for a 761-LOC
+   parent? Argument for fewer files: collapse `nat_match_v4` +
+   `nat_match_v6` + `return_resolution` into a single `nat_match.rs`
+   (~270 LOC) and drop `parse.rs`. Argument against: the explicit
+   "split by phase / address family" wording in #1348 prefers
+   separation.
+
+6. **Is the implicit `use super::*;` glob from `super::*` (inherited
+   in current `icmp_embed.rs`) safe to keep in each submodule?**
+   It pulls in everything from `afxdp::*` (which is itself
+   re-exporting half the userspace-dp surface). Tighter imports would
+   be more hygienic but would balloon the diff. Issue #1200's
+   "use super::*; glob anti-pattern" memo (recorded in MEMORY.md
+   under project_1189_done) was deferred. Reviewer: do we relitigate
+   here or defer again?
+
+7. **Wave-5 acceptance test** — does this PR materially reduce the
+   maintenance burden on the next person who has to touch
+   embedded-ICMP? Or does the 6-file split just spread the same
+   complexity across 6 files without making any single one
+   reviewable? Honest answer is needed.
