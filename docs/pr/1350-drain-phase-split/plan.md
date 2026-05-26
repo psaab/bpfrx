@@ -1,6 +1,125 @@
 ## Status
 
-DRAFT v1 — pending adversarial plan review.
+DRAFT v2 — addresses Codex (task-mpn2upaq-qskyou) and Gemini
+(task-mpn2vhfn-fa69ga) round-1 PLAN-NEEDS-MAJOR findings.
+
+## Round-1 reviewer findings + resolutions
+
+### Findings BOTH reviewers raised
+
+**HIGH — Phase 5 `BackupOutcome` loses prior `did_work`** (Codex
+finding 1, Gemini finding 3 & 4):
+
+The v1 sketch had `drain_phase_drain_local_backup` returning
+`BackupOutcome::EarlyReturn(v)` with `v` computed only from the
+phase's local state. But `drain.rs:249` and `drain.rs:253` both
+return `did_work || binding_has_pending_tx_work(binding)` —
+where `did_work` carries reap/shaped accumulation from
+`drain.rs:77`, `drain.rs:128`, and `drain.rs:190`. Phase 5
+cannot construct `v` without seeing the orchestrator's
+accumulated `did_work`.
+
+Additional subtlety: `drain.rs:248` calls
+`update_binding_debug_state(binding)` before the return; the
+other early-exit at `drain.rs:252-253` does NOT call it. The
+enum MUST preserve that side-effect distinction.
+
+**Resolution (v2)**: `drain_phase_drain_local_backup` accepts
+`did_work: &mut bool` and returns
+`BackupOutcome::{Continue, EarlyReturnAfterDebugUpdate, EarlyReturnNoDebugUpdate}`.
+
+```rust
+enum BackupOutcome {
+    /// Normal completion — orchestrator continues to phase 6.
+    Continue,
+    /// drain.rs:233 TxError::Retry path — orchestrator returns true.
+    /// (did_work was already mutated to true via the `did_work |= ...`
+    /// updates inside the phase; this variant just signals the return.)
+    EarlyReturnRetry,
+    /// drain.rs:247-249 path — pending_tx_local + pending_tx_empty
+    /// AFTER transmit_prepared loop. Orchestrator calls
+    /// update_binding_debug_state(binding) then returns
+    /// did_work || binding_has_pending_tx_work(binding).
+    EarlyReturnAfterDebugUpdate,
+    /// drain.rs:251-253 path — pending was empty when popped.
+    /// Orchestrator does NOT call update_binding_debug_state;
+    /// returns did_work || binding_has_pending_tx_work(binding).
+    EarlyReturnNoDebugUpdate,
+}
+```
+
+Phase 5 mutates `*did_work` as it does work (the same `|=`
+updates currently at lines 214 and 277). The orchestrator owns
+the final OR-fold and the `update_binding_debug_state` call.
+This preserves both the side-effect distinction at line 248 vs
+252 and the cumulative `did_work` flag.
+
+### Findings only Codex raised
+
+**MEDIUM — Delete `_cos_owner_*_by_queue` params end-to-end**
+(Codex finding 2). Gemini agreed in answer to OQ1. v2 deletes
+the two params from the `drain_pending_tx` signature, from
+`drain_pending_tx_local_owner`, and from the callers at
+`worker/lifecycle.rs:50-51,66-67,97-98`. Also delete the
+forwarding paths through `tx/dispatch.rs` and
+`tx/tcp_segmentation.rs` if they pass these maps through.
+
+**MEDIUM — Eight files is over-modularized** (Codex finding 3).
+Gemini disagreed (accepted module/foo as project convention).
+The skill standing rule 1 mandates the module/foo convention.
+v2 keeps the module/foo layout BUT collapses the four ≤5-LOC
+trivial phases (reap, rekick, ingest, submit) into a single
+`phase_trivial.rs` file. The two large phases (shaped, backup)
+each get their own file because they have non-trivial internal
+control flow worth filesystem-level separation:
+
+```
+userspace-dp/src/afxdp/tx/
+├── drain/
+│   ├── mod.rs            # DrainCtx, orchestrator, BackupOutcome, helpers (~250 LOC)
+│   ├── phase_trivial.rs  # reap_completions, maybe_rekick, ingest_cos, submit_and_wake (~50 LOC)
+│   ├── phase_shaped.rs   # drain_phase_drain_cos + helper split_into shaped_initial + shaped_reingest_budget (~95 LOC)
+│   ├── phase_backup.rs   # drain_phase_drain_local_backup + helpers (~95 LOC)
+│   └── tests.rs          # relocated from drain_tests.rs
+```
+
+Five files. This compromises between Codex's
+"≤3 files" push and Gemini's "8 is fine" accept, and matches
+the skill's module/foo standing rule.
+
+**MEDIUM — `#[inline]` is a hint, prove codegen** (Codex finding 4).
+Resolution: during implementation I will:
+1. Build with `cargo build --release` and dump
+   `drain_pending_tx` via `cargo asm --rust --release
+   userspace_dp::afxdp::tx::drain::drain_pending_tx`
+   (or `objdump -d` on the binary) before and after the
+   refactor.
+2. Compare instruction counts. If the post-refactor function
+   has new call edges to any `drain_phase_*` symbol, escalate
+   to `#[inline(always)]` on that phase.
+3. Report the comparison in the PR body before requesting
+   reviewers.
+
+**Codex specific call — split phase 4 internally**: split the
+shaped-drain phase into `shaped_initial_drain` and
+`shaped_reingest_budget` as private helpers inside
+`phase_shaped.rs`. Orchestrator still calls one phase fn
+(`drain_phase_drain_cos`); the internal split is for
+readability inside that file.
+
+**Codex specific call — split phase 5 internally**: same shape
+— `backup_drain_prepared` (lines 201-246) and
+`backup_drain_local` (lines 247-313) as private helpers inside
+`phase_backup.rs`. Orchestrator still calls one phase fn
+(`drain_phase_drain_local_backup`).
+
+### Findings only Gemini raised
+
+None novel; Gemini's answers to OQ1-7 either matched Codex or
+left the call to me. OQ4 (submit_and_wake signature): Gemini
+prefers `did_work: bool` in + bool out. v2 follows this.
+
+
 
 ## Issue framing (#1350)
 
@@ -75,30 +194,43 @@ outcome.
 
 ## Concrete design
 
-### Directory layout
+### Directory layout (v2 — 5 files per Codex finding 3)
 
 ```
 userspace-dp/src/afxdp/tx/
 ├── drain/
-│   ├── mod.rs              # DrainCtx, drain_pending_tx orchestrator + non-orch helpers
-│   ├── phase_reap.rs       # drain_phase_reap_completions
-│   ├── phase_rekick.rs     # drain_phase_maybe_rekick
-│   ├── phase_ingest.rs     # drain_phase_ingest_cos
-│   ├── phase_shaped.rs     # drain_phase_drain_cos (shaped-queue drain + reingest budget)
-│   ├── phase_backup.rs     # drain_phase_drain_local_backup (drop_cos_bound_* + transmit_prepared_batch + transmit_batch fallback)
-│   ├── phase_submit.rs     # drain_phase_submit_and_wake
-│   └── tests.rs            # relocated from drain_tests.rs
+│   ├── mod.rs            # DrainCtx, BackupOutcome, drain_pending_tx orchestrator,
+│   │                     # non-phase helpers (bound_pending_tx_*, partition_*,
+│   │                     # ingest_cos_*, etc.) — ~400 LOC
+│   ├── phase_trivial.rs  # 4 thin phases collapsed into one file:
+│   │                     #   drain_phase_reap_completions
+│   │                     #   drain_phase_maybe_rekick
+│   │                     #   drain_phase_ingest_cos
+│   │                     #   drain_phase_submit_and_wake
+│   │                     # ~50 LOC total
+│   ├── phase_shaped.rs   # drain_phase_drain_cos + private helpers
+│   │                     # shaped_initial_drain + shaped_reingest_budget — ~110 LOC
+│   ├── phase_backup.rs   # drain_phase_drain_local_backup + private helpers
+│   │                     # backup_drain_prepared + backup_drain_local — ~110 LOC
+│   └── tests.rs          # relocated from drain_tests.rs (193 LOC)
 ```
 
-The 5 helpers preserved alongside the orchestrator
+Five files, not eight. Trivial phases collapse to one
+`phase_trivial.rs` per Codex finding 3 push-back; the two
+LOC-heavy phases each keep their own file so the shaped/backup
+control flow is filesystem-visible.
+
+The 5+ helpers preserved alongside the orchestrator
 (`bound_pending_tx_*`, `binding_has_pending_tx_work`,
-`should_enter_shaped_drain`, the `ingest_cos_*` helpers, etc.)
-remain in `drain/mod.rs`. Phase files are tightly scoped: each
-file holds exactly one `drain_phase_*` plus any helper that is
-ONLY used by that phase. Helpers shared across phases stay in
+`should_enter_shaped_drain`, the `ingest_cos_*` helpers,
+`partition_cos_bound_local_with_rescue`,
+`tx_request_targets_cos_interface`, etc.) remain in
+`drain/mod.rs`. Phase files hold exactly one `drain_phase_*`
+(plus the trivial four colocated) and the private helpers
+used ONLY by that phase. Helpers shared across phases stay in
 `mod.rs`.
 
-### DrainCtx
+### DrainCtx (v2 — four fields; unused params deleted)
 
 ```rust
 pub(in crate::afxdp) struct DrainCtx<'a> {
@@ -107,17 +239,23 @@ pub(in crate::afxdp) struct DrainCtx<'a> {
     pub worker_commands_by_id:
         &'a BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
     pub now_ns: u64,
-    pub cos_owner_worker_by_queue: &'a BTreeMap<(i32, u8), u32>,
-    pub cos_owner_live_by_queue:
-        &'a BTreeMap<(i32, u8), Arc<BindingLiveState>>,
 }
 ```
 
-Six fields rather than the four shown in the issue sketch, because
-the two `_cos_owner_*_by_queue` params currently flagged unused
-are routed via `DrainCtx` as future-use plumbing (see Open
-question 1). All fields are immutable references or `Copy`
-scalars; `DrainCtx` itself is `Copy`-cheap to pass.
+Per round-1 Codex finding 2 + Gemini answer to OQ1, the two
+unused `_cos_owner_*_by_queue` params are **deleted
+end-to-end** in v2:
+
+- removed from `drain_pending_tx` signature
+- removed from `drain_pending_tx_local_owner` signature
+- removed from `worker/lifecycle.rs` call sites at lines
+  50-51, 66-67, 97-98
+- if `tx/dispatch.rs` or `tx/tcp_segmentation.rs` forward
+  them through, removed there too
+
+DrainCtx has FOUR fields, all immutable refs or `Copy`
+scalars. Stack-built once at the top of `drain_pending_tx`;
+not heap-allocated; not cloned across phases.
 
 DrainCtx is **stack-built once** at the top of
 `drain_pending_tx` from the original 8 params. It is NOT heap
@@ -130,7 +268,7 @@ Hot-path allocation impact: zero new allocations per drain
 tick (verified by constructing only `&` references and
 primitives).
 
-### Main loop transformation
+### Main loop transformation (v2 — six-param signature, three-variant BackupOutcome)
 
 `drain_pending_tx` becomes (with `#[inline]` on each phase):
 
@@ -142,8 +280,6 @@ pub(in crate::afxdp) fn drain_pending_tx(
     forwarding: &ForwardingState,
     worker_id: u32,
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
-    cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
-    cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
 ) -> bool {
     if !binding_has_pending_tx_work(binding) {
         return false;
@@ -153,8 +289,6 @@ pub(in crate::afxdp) fn drain_pending_tx(
         worker_id,
         worker_commands_by_id,
         now_ns,
-        cos_owner_worker_by_queue,
-        cos_owner_live_by_queue,
     };
 
     let mut did_work = false;
@@ -162,24 +296,38 @@ pub(in crate::afxdp) fn drain_pending_tx(
     drain_phase_maybe_rekick(binding, &ctx);
     drain_phase_ingest_cos(binding, &ctx, shared_recycles);
     did_work |= drain_phase_drain_cos(binding, &ctx, shared_recycles);
-    // Backup phase returns either `did_work` (Ok path) or a
-    // Retry sentinel that short-circuits the rest. Variant
-    // returns `BackupOutcome::EarlyReturn(true)` to faithfully
-    // model the existing `return true;` on TxError::Retry.
-    match drain_phase_drain_local_backup(binding, &ctx, shared_recycles) {
-        BackupOutcome::Continue { did_work: bw } => did_work |= bw,
-        BackupOutcome::EarlyReturn(v) => return v,
+
+    // Phase 5 takes &mut did_work so the prepared/local
+    // transmit loops can update it in place; the orchestrator
+    // owns the early-return semantics so the side-effect
+    // distinction at drain.rs:248 (calls update_binding_debug_state)
+    // vs drain.rs:252 (does NOT) is preserved exactly.
+    match drain_phase_drain_local_backup(binding, &ctx, shared_recycles, &mut did_work) {
+        BackupOutcome::Continue => {}
+        BackupOutcome::EarlyReturnRetry => return true,
+        BackupOutcome::EarlyReturnAfterDebugUpdate => {
+            update_binding_debug_state(binding);
+            return did_work || binding_has_pending_tx_work(binding);
+        }
+        BackupOutcome::EarlyReturnNoDebugUpdate => {
+            return did_work || binding_has_pending_tx_work(binding);
+        }
     }
-    drain_phase_submit_and_wake(binding, &ctx, shared_recycles, &mut did_work)
+    drain_phase_submit_and_wake(binding, did_work)
 }
 ```
 
-`BackupOutcome` preserves the two non-trivial early-return
-points (lines 233 and 249 of the current orchestrator) without
-flattening them into a fall-through that would change
-observable side-effect ordering.
+The three-variant `BackupOutcome` preserves the three exit
+semantics:
+- `EarlyReturnRetry` → `drain.rs:233` `return true;`
+- `EarlyReturnAfterDebugUpdate` → `drain.rs:247-249` (calls
+  `update_binding_debug_state` first)
+- `EarlyReturnNoDebugUpdate` → `drain.rs:251-253` (does NOT
+  call `update_binding_debug_state` — pending was empty when
+  popped, not after the transmit loop)
+- `Continue` → fall through to phase 6 submit/wake.
 
-### Per-phase scope (LOC budget per phase ≤55)
+### Per-phase scope (v2)
 
 1. **`drain_phase_reap_completions`** — wraps
    `reap_tx_completions(binding, shared_recycles) > 0`.
@@ -199,34 +347,55 @@ observable side-effect ordering.
 4. **`drain_phase_drain_cos`** — current lines 101-200.
    Holds BOTH the initial shaped-drain loop (lines 109-137)
    AND the bounded re-ingest budget loop (lines 155-200).
-   This is the largest phase by LOC. Reviewers should focus
-   here. ~95 LOC including the inner helpers — if this exceeds
-   the ≤55 cap I will split into `phase_shaped_initial` +
-   `phase_shaped_reingest_budget`, but keeping them together
-   keeps the shaped-drain control flow readable as one unit.
-   **Will measure during implementation and report in the PR.**
+   Lives in `phase_shaped.rs`. **Codex finding 3.1 split**:
+   Internally factored into two private helpers in the same
+   file:
+   - `shaped_initial_drain(binding, ctx, shared_recycles, did_work)`
+     wraps lines 109-137 (the first while-loop).
+   - `shaped_reingest_budget(binding, ctx, shared_recycles, did_work)`
+     wraps lines 155-200 (the bounded re-ingest loop, including
+     the `forwarding.cos.interfaces.is_empty()` guard at line
+     155).
+   `drain_phase_drain_cos` calls both in order. ~95 LOC total
+   in `phase_shaped.rs`. The two helpers take `did_work: &mut bool`
+   so the existing `did_work = true;` updates inside the loops
+   preserve cumulative semantics.
 
 5. **`drain_phase_drain_local_backup`** — current lines
    201-313. Contains:
-   - `drop_cos_bound_prepared_leftovers` call
-   - `transmit_prepared_batch` loop (with `TxError::Retry`
-     early-return)
+   - `drop_cos_bound_prepared_leftovers` call (line 206)
+   - `transmit_prepared_batch` loop with `TxError::Retry`
+     early-return at line 233
    - `pending_tx_local.is_empty() && pending_tx_empty()`
-     short-circuit (current line 247)
-   - `take_pending_tx_requests` + `drop_cos_bound_local_leftovers`
-   - `transmit_batch` retry loop
-   - `restore_pending_tx_requests`
-   Returns `BackupOutcome` enum to model the early-returns
-   without changing semantics. ~95 LOC. Same split-if-needed
-   note as phase 4.
+     short-circuit (current lines 247-249, calls
+     `update_binding_debug_state`)
+   - `take_pending_tx_requests` (current line 251) — if pending
+     is empty after that take, return without
+     `update_binding_debug_state` (lines 252-253)
+   - `drop_cos_bound_local_leftovers` (line 258)
+   - `transmit_batch` retry loop (lines 268-310)
+   - `restore_pending_tx_requests` (lines 311-313)
+   Returns `BackupOutcome` with three early-return variants
+   (per round-1 finding HIGH); takes `did_work: &mut bool`.
+   **Codex finding 3.2 split**: Internally factored into two
+   private helpers in the same file:
+   - `backup_drain_prepared(binding, ctx, shared_recycles, did_work) -> Option<BackupOutcome>`
+     wraps lines 201-246. Returns `Some(EarlyReturnRetry)` on
+     `TxError::Retry`; otherwise `None`.
+   - `backup_drain_local(binding, ctx, shared_recycles, did_work) -> BackupOutcome`
+     wraps lines 247-313.
+   `drain_phase_drain_local_backup` chains them, propagating
+   the prepared-side early-return. ~110 LOC total in
+   `phase_backup.rs`.
 
 6. **`drain_phase_submit_and_wake`** — current line 314-315
-   (`update_binding_debug_state` + return). Trivial.
-   ~5 LOC.
+   (`update_binding_debug_state(binding); did_work || binding_has_pending_tx_work(binding)`).
+   Takes `did_work: bool`, returns `bool`. Lives in
+   `phase_trivial.rs`. ~5 LOC.
 
-### Public API preservation
+### Public API changes (v2)
 
-Preserved verbatim (signatures and visibility):
+Preserved verbatim:
 
 ```rust
 pub(in crate::afxdp) fn pending_tx_capacity(ring_entries: u32) -> usize
@@ -235,6 +404,18 @@ pub(in crate::afxdp) fn bound_pending_tx_prepared(
     binding: &mut BindingWorker,
     mut shared_recycles: Option<&mut Vec<(u32, u64)>>,
 )
+pub(in crate::afxdp) const COS_GUARANTEE_VISIT_NS: u64 = 200_000;
+pub(in crate::afxdp) const COS_GUARANTEE_QUANTUM_MIN_BYTES: u64 = 1500;
+pub(in crate::afxdp) const COS_GUARANTEE_QUANTUM_MAX_BYTES: u64 = 512 * 1024;
+pub(in crate::afxdp) const COS_SURPLUS_ROUND_QUANTUM_BYTES: u64 = 1500;
+```
+
+**Changed** (round-1 Codex finding 2): two `_cos_owner_*_by_queue`
+params dropped from BOTH signatures and from all call sites.
+
+```rust
+// Before (v1): 8 params
+// After (v2):  6 params
 pub(in crate::afxdp) fn drain_pending_tx(
     binding: &mut BindingWorker,
     now_ns: u64,
@@ -242,23 +423,24 @@ pub(in crate::afxdp) fn drain_pending_tx(
     forwarding: &ForwardingState,
     worker_id: u32,
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
-    cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
-    cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
 ) -> bool
-pub(in crate::afxdp) fn drain_pending_tx_local_owner(/* same 8 params */) -> bool
-pub(in crate::afxdp) const COS_GUARANTEE_VISIT_NS: u64 = 200_000;
-pub(in crate::afxdp) const COS_GUARANTEE_QUANTUM_MIN_BYTES: u64 = 1500;
-pub(in crate::afxdp) const COS_GUARANTEE_QUANTUM_MAX_BYTES: u64 = 512 * 1024;
-pub(in crate::afxdp) const COS_SURPLUS_ROUND_QUANTUM_BYTES: u64 = 1500;
+pub(in crate::afxdp) fn drain_pending_tx_local_owner(/* same 6 params */) -> bool
 ```
 
-The 8-param signature of `drain_pending_tx` stays at the public
-boundary; the parameter-count refactor is **internal** (orchestrator
-constructs `DrainCtx` from those 8 args and passes the ctx to
-the six phases). The wrapper at
-`drain_pending_tx_local_owner` is unchanged.
+Caller updates required:
+- `worker/lifecycle.rs:59-68` (drop 2 trailing args)
+- `worker/lifecycle.rs:90-99` (drop 2 trailing args)
+- The 2 trailing args at `lifecycle.rs` are still LIVE at that
+  call point for OTHER calls (e.g. `drain_pending_tx_local_owner`
+  is called from `tx/dispatch.rs` and `tx/tcp_segmentation.rs`
+  via the worker_loop dispatch path). I will audit ALL call
+  sites during implementation and drop the args end-to-end OR
+  if a caller still needs them for a different fn (e.g.
+  `enqueue_local_into_cos`), keep them alive in that caller's
+  scope but stop forwarding them to drain.
 
-`tx/mod.rs:21-28` re-exports are preserved verbatim.
+`tx/mod.rs:21-28` re-exports preserved (still re-export the
+post-trim symbols).
 
 ### Hidden invariants the change MUST preserve
 
@@ -293,10 +475,17 @@ the six phases). The wrapper at
    The issue body explicitly notes this guard is "out of scope"
    and the early-exit must NOT pay any phase-call overhead.
 
-6. **`#[inline]` on every `drain_phase_*` function**. The
-   compiler will collapse most of them back to the existing
-   instruction sequence at -O3; this preserves hot-path codegen.
-   *Reviewers: this is the perf-neutrality contract.*
+6. **`#[inline]` on every `drain_phase_*` function**, with
+   `cargo asm`/`objdump` verification (per round-1 Codex
+   finding 4). The compiler usually inlines small static-call-site
+   fns at -O3 with just `#[inline]`. During implementation:
+   - Dump `drain_pending_tx` post-refactor and confirm no
+     CALL edges to any `drain_phase_*` symbol survive.
+   - If any phase remains as a real call edge, escalate to
+     `#[inline(always)]` on that phase.
+   - Report instruction-count comparison in the PR body.
+   This is the perf-neutrality contract; reviewers can demand
+   the asm dump if they want to verify.
 
 7. **`DrainCtx<'_>` is stack-built once per drain call** and
    passed by reference (`&DrainCtx<'_>`) to each phase. Codegen
@@ -364,69 +553,66 @@ the six phases). The wrapper at
   `bound_pending_tx_prepared` / `pending_tx_capacity`.
 - Touching `worker/lifecycle.rs` callers.
 
-## Open questions for adversarial review
+## Open questions — round-1 status
 
-1. **Should the two underscore-prefixed params be deleted now
-   or kept as DrainCtx fields?** The issue body says "drop them
-   or wire them" but does not pick. My current plan keeps them
-   in DrainCtx (forwarded but unused inside `drain_pending_tx`)
-   because `drain_pending_tx_local_owner` at `drain.rs:524` —
-   which is the path `worker/lifecycle.rs` calls — already
-   forwards these params from `worker/lifecycle.rs:50-51`. If
-   we delete them, the wrapper signature shrinks too, and the
-   caller in `worker/lifecycle.rs` has to drop the args from
-   both call sites (`drain.rs:534-543`). Reviewers: is the
-   simpler "delete the dead params end-to-end" the right
-   call here, or is the plumbing intentional and worth
-   preserving? PLAN-KILL is appropriate if either choice is
-   wrong.
+Round 1 (Codex task-mpn2upaq-qskyou, Gemini
+task-mpn2vhfn-fa69ga) both returned PLAN-NEEDS-MAJOR; all 7
+open questions resolved as follows:
 
-2. **Should phase 4 (shaped-drain) and phase 5 (backup) each
-   be a single file at ~95 LOC, or should they sub-split**
-   `phase_shaped_initial.rs` + `phase_shaped_reingest.rs` and
-   `phase_backup_prepared.rs` + `phase_backup_local.rs`?
-   Splitting smaller helps the file-LOC discipline; keeping
-   them whole preserves shaped-drain control-flow readability.
+1. **OQ1 (delete unused params?)** — RESOLVED: delete
+   end-to-end. Codex finding 2 + Gemini OQ1 answer concurred.
+2. **OQ2 (split phase 4/5?)** — RESOLVED: keep each as one
+   `drain_phase_*` entry point but factor into two private
+   helpers in the same file (Codex specific call). Gemini
+   accepted keep-whole; the internal split is a hair more
+   readable.
+3. **OQ3 (BackupOutcome shape?)** — RESOLVED: three-variant
+   enum + `&mut did_work` param, per Codex finding 1 / Gemini
+   finding 3-4. The v1 sketch was unsafe.
+4. **OQ4 (submit_and_wake signature?)** — RESOLVED: takes
+   `did_work: bool` in, returns `bool` (Gemini answer).
+5. **OQ5 (module-dir layout?)** — RESOLVED: keep module/foo
+   per skill rule, but collapse 4 trivial phases into one
+   `phase_trivial.rs`. Five files total.
+6. **OQ6 (phase-ordering invariants missed?)** — Both
+   reviewers confirmed: no phase-ordering invariants missed.
+   Both flagged the three independent `cos.interfaces.is_empty()`
+   guards at lines 155, 205, 258 as MUST NOT be hoisted —
+   v2 keeps them independent in their respective phases.
+7. **OQ7 (`#[inline]` vs `#[inline(always)]`?)** — Codex
+   finding 4: prove via `cargo asm` / `objdump`. v2
+   methodology section above incorporates this.
 
-3. **Is `BackupOutcome` the right shape**, or should phase 5
-   return `(bool, Option<bool>)` where the Option encodes the
-   early-return? The enum is a hair more explicit; the tuple
-   is more idiomatic Rust. Either way the semantics must be
-   that `TxError::Retry` short-circuits to `return true;`.
+## Round-2 open questions for reviewers
 
-4. **Should `drain_phase_submit_and_wake` take `&mut did_work`
-   or return `bool` and let the orchestrator OR-fold it?**
-   Currently the issue's sketch has `did_work |=` semantics
-   and the original function returns
-   `did_work || binding_has_pending_tx_work(binding)`. The
-   `&mut did_work` shape lets the phase do the final OR-fold
-   internally and return the actual value; passing `bool` and
-   folding in the orchestrator is more functional. Reviewers:
-   call.
+1. **Round-1 had no quoted PLAN-KILL grounds, but BackupOutcome
+   was caught as a HIGH semantic bug. v2's three-variant
+   BackupOutcome with `&mut did_work` is the agreed shape —
+   does either reviewer see a remaining did_work-aliasing or
+   side-effect-ordering hazard in the v2 main-loop sketch
+   above?**
 
-5. **Is the file layout `tx/drain/{mod,phase_*}.rs` correct vs
-   keeping everything in a flat `tx/drain.rs` with
-   `drain_phase_*` private fns?** The skill's standing rule 1
-   mandates the module/foo convention; the issue body's sketch
-   is just function decomposition without specifying. The
-   module-dir form makes the phase boundaries visible at the
-   filesystem; the flat-file form keeps blame less noisy.
-   Module-dir is the chosen form. PLAN-KILL is appropriate if
-   the file split is wrong.
+2. **Does collapsing the 4 trivial phases into `phase_trivial.rs`
+   preserve filesystem readability or does it muddy the phase
+   model?** Codex pushed against 8 files; Gemini accepted 8 files.
+   v2 lands at 5 — is that the right compromise?
 
-6. **Are there any phase-ordering invariants I've missed?**
-   The current orchestrator interleaves several "if CoS
-   configured" fast-exits (lines 155, 205, 258). My plan
-   preserves each fast-exit inside the corresponding phase
-   function. Reviewers: walk lines 64-316 and confirm I have
-   NOT silently combined two CoS-empty checks into one and NOT
-   reordered any side effect. The drain-cos phase + backup
-   phase both have their own `forwarding.cos.interfaces.is_empty()`
-   guards — these are independent and must NOT be hoisted.
+3. **`drain_pending_tx_local_owner` at `drain.rs:524` becomes
+   a no-op wrapper that just forwards the 6 remaining params
+   to `drain_pending_tx`. Should it be deleted entirely (call
+   sites switch to `drain_pending_tx` directly) or preserved
+   for symmetry with other `*_owner` wrappers?** Currently
+   it is the only call site `worker/lifecycle.rs:59` reaches.
+   PR scope creep risk if deletion balloons the diff.
 
-7. **`#[inline]` enough, or `#[inline(always)]` needed?** The
-   compiler usually inlines small static-call-site functions
-   at -O3 with just `#[inline]`. Adversarial reviewers should
-   challenge me to prove codegen identity. If they want the
-   `objdump -d` check on `drain_pending_tx`'s assembly before
-   and after, I'll run it during implementation.
+4. **`tx/dispatch.rs` and `tx/tcp_segmentation.rs` may forward
+   the two deleted params. Reviewer pre-check: grep these
+   files now and tell me whether removing the params from
+   the drain signature requires a cascade through other files.**
+   I will audit during implementation but a heads-up from
+   either reviewer saves a round.
+
+5. **Is the v2 inlining-verification plan (`cargo asm` +
+   `#[inline(always)]` escalation if call edges remain) the
+   right discipline, or is a `perf record` before/after on
+   the loss userspace cluster the only sufficient evidence?**
