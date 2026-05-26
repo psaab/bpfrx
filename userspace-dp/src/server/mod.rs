@@ -1,6 +1,7 @@
 // #1048 P2 step 2: server/ became a directory module so the
 // public-API state types and the handler dispatch can live in
-// separate sibling files (server/state.rs and server/handlers.rs).
+// separate sibling files (server/state.rs and server/handlers/).
+// (#1345: handlers became a directory module — see server/handlers/mod.rs.)
 //
 // This file is a thin index — declarations + re-exports only.
 

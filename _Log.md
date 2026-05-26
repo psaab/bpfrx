@@ -63,6 +63,161 @@
   `binding.rs` plus a deliberate round-trip regression test.
 - **File(s)**: docs/pr/1325-protocol-split/plan.md,
   docs/pr/1325-protocol-split/reviewer-ids.md
+## 2026-05-26 — #1326 PR #1569 AWAITING-BATCH-MERGE at 18fd27f8
+
+- **Timestamp**: 2026-05-26T (4-of-4 MERGE-READY on 18fd27f8)
+  - **Action**: Drove PR #1569 through 6 code-review rounds. Final
+    SHA 18fd27f8 has 4-of-4 attestation: Codex MERGE-READY (final),
+    AGY MERGE-READY (final), Copilot r2 inline comment proposed
+    the explicit-path change that 18fd27f8 implements, Claude SMR
+    MERGE-READY (posted on PR). Posted AWAITING-BATCH-MERGE
+    marker. Smoke deferred per wave-1 rules.
+  - **Notes**: Codex r4 flagged rustfmt as failing — verified
+    locally as false positive (rustfmt 1.9.0-stable returns exit 0
+    on both touched files; cargo fmt --check noise is pre-existing
+    master drift in unrelated files). Copilot re-review did not
+    trigger on 18fd27f8 despite gh pr edit --add-reviewer Copilot
+    + @copilot review — but Copilot's r2 inline comment on
+    be71872c explicitly proposed the exact change in 18fd27f8, so
+    that stands as the formal attestation.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
+## 2026-05-26 — #1326 Phase 1 implementation + PR-prep
+
+- **Timestamp**: 2026-05-26T (round 6 PLAN-READY, then implementation)
+  - **Action**: Codex r5 returned PLAN-NEEDS-MINOR with one wording
+    fix at plan.md:697 ("&mut state.dbg_state ONLY" wording
+    inconsistent with the v3.3 changelog). Fixed in v3.4
+    (commit 6f384430). Codex r6 (task-mpmwdrx4-kpdreh) confirmed
+    PLAN-READY. AGY r4 already PLAN-READY since v3.2. Both
+    reviewers PLAN-READY on v3.4 — cleared to implement.
+  - **Implementation**: Phase-1 file-level extraction shipped. The
+    1278-LOC `worker_loop` body moved verbatim from worker/mod.rs
+    (L995-L2273) to a new `worker/loop_body/mod.rs`. `mod.rs` now
+    has `mod loop_body; pub(crate) use loop_body::worker_loop;` and
+    drops the body. mod.rs LOC: 2635 → 1359. Pure code motion;
+    cargo check clean; 1487 tests pass (one pre-existing master-
+    state doc-guard failure unrelated to this PR — same failure on
+    origin/master at 936b076d).
+  - **Deferred**: per-stage carve into setup.rs + tick.rs +
+    poll_drive.rs + debug_report.rs is the eventual target
+    architecture but deferred to follow-up PRs. Rationale documented
+    in plan.md "Deferred to follow-up tickets" section: risk
+    isolation (single-file move is provably semantic-equivalent),
+    reviewer concerns only apply to sub-fn extraction (not file-level),
+    and incremental landing matches #959/#1189 pattern.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md,
+    userspace-dp/src/afxdp/worker/mod.rs,
+    userspace-dp/src/afxdp/worker/loop_body/mod.rs (new)
+
+## 2026-05-26 — #1326 plan v3.3 — Codex r4 doc-consistency fixes
+
+- **Timestamp**: 2026-05-26T (round 4 reviews returned)
+  - **Action**: AGY r4 (review-mpmw4xjc-92bdff) returned PLAN-READY
+    independently — full substantive re-confirmation on every
+    dimension: borrow shape, hybrid inlining, allocation audit,
+    edition 2024, CoS rebuild predicate (all 7 sources), param count
+    (35). Codex r4 (task-mpmw4sj7-dxkyqo) returned PLAN-NEEDS-MINOR
+    with 3 doc-consistency issues only — substantive design rated
+    "close" and "Not ready until the stale conflicting directives
+    are cleaned." v3.3 cleanups: (a) propagated the &state.sessions
+    addition to debug_report::maybe_emit signature description in
+    BOTH the file tree section and the inline-annotation section,
+    (b) fixed the orchestrator pseudocode "/* same 38-param … */"
+    comment to "35-param", (c) cleaned stale topology refs
+    (arc_refresh.rs, shutdown::tear_down, idle::handle, "7+ files"
+    in risk table). Dispatching r5 to confirm.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
+## 2026-05-26 — #1326 plan v3.2 — Codex r3 PLAN-NEEDS-MINOR addressed
+
+- **Timestamp**: 2026-05-26T (Codex r3 verdict extracted from log)
+  - **Action**: Codex r3 (replayed via log capture from
+    task-mpmvuetd-57y479; harness lost the id but the file log
+    captured the full verdict) returned PLAN-NEEDS-MINOR with 6
+    items. AGY r3 issue #1 was the same as Codex #2 (nested-field
+    qualifier, fixed in v3.1). Remaining items addressed in v3.2:
+    (1) debug_report::maybe_emit signature adds &state.sessions
+    for sessions.len + stall-dump iterator; (3) toned down LLVM
+    "can keep in registers regardless" claim to a hint with cited
+    Rust Reference + LLVM LangRef caveat; (4) acknowledged
+    pre-existing Vec paths in expire_stale_entries (gated
+    short-circuit, no heap alloc) and drain_deltas(256)
+    (lifecycle-event triggered); (5) added
+    cos_shared_exact_backlogs to the cos_fast_interfaces rebuild
+    predicate (Codex caught I miscounted — it's 7 rotation sources
+    not 6); (6) corrected param count 38 → 35; (7) cleaned stale
+    "6/8 files" language to land on the final 5-file tree (mod +
+    setup + tick + poll_drive + debug_report). Both reviewers
+    arriving at PLAN-NEEDS-MINOR with all findings address-able by
+    plan-doc edits is the strongest signal yet that v3.2 will land
+    PLAN-READY on round-4.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
+## 2026-05-26 — #1326 plan v3.1 — AGY r3 nested-field qualifier fix
+
+- **Timestamp**: 2026-05-26T (AGY r3 result fetched)
+  - **Action**: AGY r3 (review-mpmvtaei-6yvid7) returned
+    PLAN-NEEDS-MINOR with 1 trivial compile-bug fix: the
+    drive_one_round call site in the v3 orchestrator sketch
+    references `&mut state.dbg_counters` / `dbg_rx_total` /
+    `dbg_forward_total` but v3 moved those fields under
+    `state.dbg_state`. AGY r3 verdict was PLAN-NEEDS-MINOR on all
+    other 6 dimensions (borrow shape, allocation audit, re-export,
+    hidden invariants, hybrid inlining, file tree, architectural
+    mismatch). Fixed addressing in plan.md; waiting on Codex r3.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md
+
+## 2026-05-26 — #1326 plan v3 (AGY r2 PLAN-NEEDS-MINOR addressed)
+
+- **Timestamp**: 2026-05-26T (AGY r2 result fetched, Codex r2 lost)
+  - **Action**: AGY r2 (review-mpmvbr0c-i8e6wh) returned
+    PLAN-NEEDS-MINOR with 4 actionable items. v3 addresses all four:
+    (1) bundle dbg/wr telemetry into DebugReportState nested in
+    LoopState so debug_report::maybe_emit no longer takes &mut state
+    wholesale, (2) shutdown signature fix — pass &Arc<ForwardingState>
+    so the final cos_status republish compiles (resolved by inlining
+    shutdown into the orchestrator), (3) hybrid inlining on
+    tick::arc_refresh — outer is #[inline(always)] but the cold
+    cos_fast_interfaces rebuild inner helper is #[inline(never)] +
+    #[cold] to protect L1i footprint, (4) collapse shutdown.rs +
+    idle.rs into mod.rs (6 → 4 files). Codex r2 task
+    task-mpmvbj5i-hw5hra LOST from the harness again (same
+    long-running session-state drop pattern). Re-dispatching Codex
+    + AGY in parallel on v3.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
+## 2026-05-26 — #1326 plan v2 (AGY r1 PLAN-NEEDS-MAJOR addressed)
+
+- **Timestamp**: 2026-05-26T (AGY r1 result fetched)
+  - **Action**: AGY r1 (review-mpmurh2n-sfmiks) returned
+    PLAN-NEEDS-MAJOR with 4 action items: (1) narrow phase-fn
+    signatures to avoid &mut LoopState whole-struct barrier at the
+    poll_drive boundary, (2) upgrade #[inline] → #[inline(always)],
+    (3) consolidate 10 files → 6 by folding non-poll tick phases
+    into tick.rs, (4) resolve missing runtime.rs discrepancy
+    (rolled into tick.rs as tick::runtime_publish). Codex r1 task
+    was lost from the harness (session-state drop on long-running
+    review batch); will be re-dispatched on v2 alongside AGY r2.
+    Plan revised; v2 published.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
+## 2026-05-26 — #1326 worker_loop extract plan v1 drafted
+
+- **Timestamp**: 2026-05-26T
+  - **Action**: Drafted plan v1 for #1326 — extracting ~1278-LOC
+    `worker_loop` body from `userspace-dp/src/afxdp/worker/mod.rs`
+    into `worker/loop_body/` directory module (8 phase files +
+    orchestrator). Wrote plan with allocation audit, cold-path
+    annotations, LoopState struct sketch, hidden invariants list,
+    risk table, and 7 open questions for adversarial review.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md
 
 ## 2026-05-26 — #1476 Phase B AWAITING-MERGE at f815c357
 
@@ -3802,3 +3957,70 @@
 - **Timestamp**: 2026-05-26 10:00 UTC
 - **Action**: Fold Codex r-final MERGE-NEEDS-MINOR comment findings — update 2 stale comments. (1) ErrDPDKBackendRetired comment no longer references the deleted pkg/dataplane/dpdk package-local test; points to runtime/import_canary_test.go as defense-in-depth. (2) TestSchemaValidate_AcceptsLegacyDPDKSubStanza header clarifies it guards orphaned sub-stanzas that survive the rewrite bridge, not pre-bridge schema validation.
 - **File(s)**: pkg/dataplane/dataplane.go (ErrDPDKBackendRetired comment); pkg/cmdtree/schema_validate_test.go (test header).
+
+- **Timestamp**: 2026-05-26 16:25 UTC
+- **Action**: #1540 REST API split — plan v1 DRAFT; identifies sibling-file shape (`pkg/api/<aspect>.go`) per parent wave-1 instructions; lists target file decomposition for handlers.go (67 fns → 11 files) and metrics.go (33 fns → 6 files); flags 7 open questions for adversarial plan review including flat-package vs subdirectory shape decision.
+- **File(s)**: docs/pr/1540-rest-api-split/plan.md, docs/pr/1540-rest-api-split/reviewer-ids.md.
+
+- **Timestamp**: 2026-05-26 16:45 UTC
+- **Action**: #1540 REST API split — implementation. Split pkg/api/handlers.go (2223 LOC, 67 fns) into 13 sibling files (api/health/stats/security/nat/interfaces/routing/dhcp/ipsec/vrrp/system/config/show_text); split pkg/api/metrics.go (2033 LOC, 33 fns) into 7 sibling files (metrics/metrics_descriptors/metrics_userspace/metrics_counters/metrics_sessions/metrics_nat/metrics_system); renamed handlers_sessions.go to sessions.go. All plan-review minors from Codex + AGY folded: config.go (not config_handlers.go); newCollector moved to metrics_descriptors.go; parseMemInfoKB moved to metrics_system.go; api.go tightened (policyActionStr+screenChecks→security.go, protoName→sessions.go, configCommitResponse+commitResponseFromConfig→config.go); legacy import allowlist + retirement docs updated. Pure code motion. Full go test ./... clean.
+- **File(s)**: pkg/api/api.go, config.go, dhcp.go, health.go, interfaces.go, ipsec.go, metrics.go, metrics_counters.go, metrics_descriptors.go, metrics_nat.go, metrics_sessions.go, metrics_system.go, metrics_userspace.go, nat.go, routing.go, security.go, sessions.go, show_text.go, stats.go, system.go, vrrp.go; pkg/dataplane/retirement_boundary_canary_test.go; docs/pr/1373-retire-ebpf-dataplane/README.md; docs/pr/1540-rest-api-split/plan.md; docs/pr/1540-rest-api-split/reviewer-ids.md.
+
+- **Timestamp**: 2026-05-26 17:05 UTC
+- **Action**: #1540 PR #1564 — fold Codex code-review MERGE-NEEDS-MINOR doc-drift findings + Copilot review minors. (1) plan.md updated to reflect post-fold landed shape: config.go (not config_handlers.go), newCollector → metrics_descriptors.go, parseMemInfoKB → metrics_system.go, api.go-tightening (policyActionStr/screenChecks → security.go, protoName → sessions.go, configCommitResponse + commitResponseFromConfig → config.go). (2) canary allowlist + retirement README pkg/api/api.go blurb corrected: 'apiRuntimeDataPlane + protoName' → 'apiRuntimeDataPlane + applyResult adapter' (protoName moved to sessions.go). (3) _Log.md timestamps backfilled to HH:MM UTC for Copilot consistency. Copilot's 4 inline pre-existing `net.InterfaceByName(ifName)` Junos-name findings (interfaces.go, stats.go, metrics_counters.go) are NOT addressed in this PR — pure code motion contract; pre-existing bugs to be filed as separate issues.
+- **File(s)**: docs/pr/1540-rest-api-split/plan.md, pkg/dataplane/retirement_boundary_canary_test.go, docs/pr/1373-retire-ebpf-dataplane/README.md, _Log.md.
+
+- **Timestamp**: 2026-05-26 17:15 UTC
+- **Action**: #1540 PR #1564 — fold Codex round-2 MERGE-NEEDS-MINOR remaining doc-drift findings. (1) plan.md 'Open questions for adversarial review' v1 section refactored into 'Open questions — resolutions' that documents how each of the 7 v1 questions was answered across the two plan-review rounds. (2) reviewer-ids.md updated with actual round-1 verdicts (Codex MERGE-NEEDS-MINOR, AGY MERGE-READY, Copilot COMMENTED 8 inline, Claude SMR MERGE-READY) and adds round-2 entry. Doc-only fix.
+- **File(s)**: docs/pr/1540-rest-api-split/plan.md, docs/pr/1540-rest-api-split/reviewer-ids.md, _Log.md.
+
+- **Timestamp**: 2026-05-26 17:30 UTC
+- **Action**: #1444 — pure code-motion refactor de-monolithizing pkg/cli/cli.go from 1999 LOC to 418 LOC. Plan v1 → Codex (PLAN-NEEDS-MAJOR) + Gemini (PLAN-NEEDS-MINOR). Plan v2 addressing all 8 v1 findings → Gemini PLAN-READY r2; Codex sandbox infra failed twice, returned PLAN-NEEDS-MINOR on third retry with inline plan paste. v3 plan acknowledges Codex r2 ownership findings. Implementation: 9 new sibling files (cli_show_security_dispatch.go, peer.go, permissions.go, apply.go, session_filter.go, app_resolve.go, link.go, chrony.go, proto.go) + extensions to existing completion.go (completer engine merged in), cli_show_cluster.go (fabricRedirectCounters), cli_show_flow.go (topTalkerEntry), cli_show_nat.go (handleShowNAT), cli_show_routing.go (handleShowRoute+handleShowProtocols), cli_show_services.go (handleShowClassOfService+handleShowServices), cli_show_interfaces.go (dhcpLease). Updated #1373 retirement-boundary canary allowlist + docs table for 4 new pkg/cli files that retain legacy dataplane imports. go build clean, all 32 test packages pass.
+- **File(s)**: pkg/cli/cli.go (-1581 LOC), pkg/cli/completion.go (+218), pkg/cli/cli_show_security_dispatch.go (new), pkg/cli/peer.go (new), pkg/cli/permissions.go (new), pkg/cli/apply.go (new), pkg/cli/session_filter.go (new), pkg/cli/app_resolve.go (new), pkg/cli/link.go (new), pkg/cli/chrony.go (new), pkg/cli/proto.go (new), pkg/cli/cli_show_cluster.go, pkg/cli/cli_show_flow.go, pkg/cli/cli_show_nat.go, pkg/cli/cli_show_routing.go, pkg/cli/cli_show_services.go, pkg/cli/cli_show_interfaces.go, pkg/dataplane/retirement_boundary_canary_test.go, docs/pr/1373-retire-ebpf-dataplane/README.md, docs/pr/1444-cli-presenters/plan.md (new).
+
+- **Timestamp**: 2026-05-26 17:45 UTC
+- **Action**: #1444 PR #1566 — rebase onto origin/master @ 838657aa (post-#1564 #1540 REST API split). Conflict in _Log.md auto-resolved (keep both #1540 + #1444 chronological entries). Canary + docs README auto-merged cleanly (#1540 + #1444 modified non-overlapping table sections). Re-run go build + go test post-rebase: clean.
+- **File(s)**: _Log.md (conflict resolution).
+
+## 2026-05-26 — #1345 server/handlers.rs per-verb split
+
+- **Timestamp**: 2026-05-26T17:00Z
+- **Action**: Split 415-LOC handle_stream dispatcher into per-verb modules
+- **File(s)**: userspace-dp/src/server/handlers.rs → handlers/mod.rs (181 LOC slim dispatcher) + 12 per-verb files (snapshot, forwarding, ha, neighbors, queue, binding, inject_packet, sync_session, session_deltas, export, rebind, stop_workers). Trivial arms (ping/status, update_fabrics, clear_policy_counters, shutdown, catch-all) stay inline in mod.rs. Pure code motion; zero new clones; byte-identical eprintln strings. cargo build clean, all tests pass except pre-existing master flake snat_contract_documents_current_fail_closed_runtime (confirmed on origin/master independent of this branch).
+## #1327 poll_descriptor stages — 2026-05-26
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Worktree created from origin/master; #1327 Step 1 plan
+    review v1→v4 (PLAN-NEEDS-MAJOR → PLAN-NEEDS-MINOR → split → MERGE-READY).
+  - **File(s)**: branch refactor/1327-poll-descriptor-stages
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Implemented Step 1. Converted flat poll_descriptor.rs to
+    directory module (poll_descriptor/mod.rs). Extracted flow-cache fast
+    path (verbatim translation of original L563-894) to flow_cache_hit.rs
+    with #[inline(always)] + FlowCacheOutcome { Consumed, FallThrough }.
+    Moved record_rx_descriptor_telemetry verbatim to rx_telemetry.rs.
+    Fixed snat_contract_doc_guard test (twice — initial extension + Copilot
+    review fix on assertion messages and required-doc tokens).
+    Final: mod.rs 2806 LOC (was 3292), flow_cache_hit.rs 379 LOC,
+    rx_telemetry.rs 220 LOC.
+  - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/{mod,flow_cache_hit,rx_telemetry}.rs, userspace-dp/tests/snat_contract_doc_guard.rs
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Validation gates. cargo build clean; cargo test 1417/1417
+    main suite pass; snat_contract_doc_guard pre-existing master flake
+    (docs/userspace-dataplane-gaps.md missing "fail-closed" keyword);
+    10× afxdp:: flake same as master 2/10 wg::engine concurrent-load
+    pre-existing flake; cargo asm gate confirmed via nm (no
+    stage_flow_cache_hit symbol in release binary); Go suite 30/30 pass.
+  - **File(s)**: PR #1571
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Code reviews — Codex provisional MERGE-READY (sandbox
+    infra-blocked, summary-based), AGY MERGE-READY with Python line-by-
+    line verification script, Copilot 1 inline finding (test path
+    hardcoding) fixed in fe176daa. Claude SMR review posted (#1571
+    comment 4547263769): AF_XDP UMEM ownership / CPU-arch inline gate /
+    zero allocation / HA epoch ordering / SW design pattern all verified
+    MERGE-READY. AWAITING-BATCH-MERGE marker posted.
+  - **File(s)**: PR #1571

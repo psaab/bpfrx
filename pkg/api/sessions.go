@@ -314,3 +314,18 @@ func monotonicSeconds() uint64 {
 	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
 	return uint64(ts.Sec)
 }
+
+func protoName(p uint8) string {
+	switch p {
+	case 6:
+		return "TCP"
+	case 17:
+		return "UDP"
+	case 1:
+		return "ICMP"
+	case dataplane.ProtoICMPv6:
+		return "ICMPv6"
+	default:
+		return fmt.Sprintf("%d", p)
+	}
+}
