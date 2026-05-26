@@ -1,7 +1,8 @@
-// Tests for afxdp/forwarding_build.rs — relocated from inline
-// `#[cfg(test)] mod tests` to keep forwarding_build.rs under the modularity-discipline
-// LOC threshold. Loaded as a sibling submodule via
-// `#[path = "forwarding_build_tests.rs"]` from forwarding_build.rs.
+// Tests for afxdp/forwarding_build/. Moved from
+// afxdp/forwarding_build_tests.rs to the directory-module
+// colocated path in #1342 (split forwarding_build.rs by entity
+// kind). Loaded as a sibling sub-module via `#[cfg(test)] mod
+// tests;` in forwarding_build/mod.rs (no `#[path]` attribute).
 
 use super::*;
 use crate::filter::evaluate_filter_ref_tx_selection_runtime_counted;
@@ -1262,8 +1263,8 @@ fn build_cos_state_admits_each_cos_field_in_isolation() {
     // PR #1183 flagged this as coverage debt (Q5). The sixth `InterfaceSnapshot`
     // CoS field, `cos_shaping_burst_bytes`, is intentionally NOT a
     // standalone arm; see the dedicated burst-only-skip test below and
-    // the gate comment in `forwarding_build.rs::build_cos_state` for
-    // rationale.
+    // the gate comment in `forwarding_build/cos.rs::build_cos_iface_config`
+    // for rationale.
     let cos = ClassOfServiceSnapshot {
         forwarding_classes: vec![CoSForwardingClassSnapshot {
             name: "best-effort".into(),

@@ -4323,3 +4323,65 @@
 - **Action**: Implemented frame/build/{mod.rs,ipv4.rs,ipv6.rs} + frame/rewrite/{mod.rs,ipv4.rs,ipv6.rs} per #1352 plan v5. Extracted 236-LOC build_forwarded_frame_into_from_frame and 223-LOC apply_rewrite_descriptor into per-family files. Codegen contract: #[inline(always)] on per-family helpers; #[inline(never)] + concrete `meta: ForwardPacketMeta` on build orchestrator; standard #[inline] on rewrite orchestrator.
 - **File(s)**: userspace-dp/src/afxdp/frame/build/{mod.rs,ipv4.rs,ipv6.rs} (created); userspace-dp/src/afxdp/frame/rewrite/{mod.rs,ipv4.rs,ipv6.rs} (created); userspace-dp/src/afxdp/frame/mod.rs (orchestrator bodies removed, mod decls added; build_forwarded_frame_into wrapper now calls .into() before forwarding to concrete-typed orchestrator).
 - **Validation**: cargo build --release clean. 1487 cargo tests pass (113 frame-specific tests all pass). Codegen gate: nm -C shows ZERO per-family helper definitions (#[inline(always)] folded into orchestrator), exactly ONE build_forwarded_frame_into_from_frame definition, ZERO apply_rewrite_descriptor definitions (LLVM inlined fully into single caller poll_descriptor.rs:746). One pre-existing cross-worktree doc-guard test failure unrelated to this refactor.
+
+## 2026-05-26 — #1342 split forwarding_build.rs (plan v1)
+
+- **Timestamp**: 2026-05-26T (plan drafted)
+  - **Action**: Created worktree
+    `refactor/1342-forwarding-build-split` off `origin/master` and
+    drafted plan v1 covering layout (forwarding_build/mod.rs +
+    siblings: zones, tunnels, interfaces, fib, cos), order-
+    preservation invariants, IfaceIndex context struct, public-API
+    preservation, risk table, and 7 open questions.
+  - **File(s)**: `docs/pr/1342-forwarding-build-split/plan.md`,
+    `docs/pr/1342-forwarding-build-split/reviewer-ids.md`.
+
+## 2026-05-26 — #1342 plan v2 (addressing r1 findings)
+
+- **Timestamp**: 2026-05-26T (plan v2)
+  - **Action**: Codex r1 returned PLAN-NEEDS-MAJOR (3 majors + 2
+    minors); AGY r1 returned PLAN-NEEDS-MINOR (5 action items).
+    Both agreed layout is correct. Revised plan to:
+    - Fix visibility: `pub(in crate::afxdp)` for cross-sibling
+      consumers; private `use cos::build_cos_state` (no API
+      widening); explicit re-export table.
+    - Add explicit `fib::sort_routes(&mut state)` call after
+      `fib::populate_routes` (was dropped from v1 sketch).
+    - Decompose `build_cos_state` internally into
+      `build_cos_classifier_tables` + `build_cos_iface_config` +
+      orchestrator (3 sub-100-LOC helpers).
+    - Relocate `forwarding_build_tests.rs` ->
+      `forwarding_build/tests.rs` (decision made, not deferred).
+    - Document static-NAT/DNAT local-delivery placement
+      constraint explicitly.
+    - Document `useful_cos_state` gate's queue-resolution
+      ordering invariant.
+  - **File(s)**:
+    `docs/pr/1342-forwarding-build-split/plan.md` v2.
+
+## 2026-05-26 — #1342 implementation complete
+
+- **Timestamp**: 2026-05-26T (implementation done, tests pass)
+  - **Action**: Implemented plan v2 layout. Created
+    forwarding_build/{mod.rs (345L), zones.rs (46L),
+    tunnels.rs (53L), interfaces.rs (215L), fib.rs (289L),
+    cos.rs (470L)}, moved tests to forwarding_build/tests.rs.
+    Updated afxdp/mod.rs include from `#[path] mod` to plain
+    `mod forwarding_build;`. Build clean (24 pre-existing
+    warnings unchanged). Cargo tests: 1416 pass + 1 pre-existing
+    flake (afxdp::wg::engine::reconcile_peers_snapshot_is_atomic
+    — verified 5x clean on retry, unrelated subsystem). Go
+    tests: clean.
+  - **File(s)**: see above.
+
+## 2026-05-26 — #1342 4-of-4 attestation complete
+
+- **Timestamp**: 2026-05-26T (AWAITING-BATCH-MERGE posted)
+  - **Action**: Posted AWAITING-BATCH-MERGE marker on PR #1577
+    at SHA caf46afcdc88. 4-of-4 reviewer attestation: Codex r2
+    MERGE-READY (r1 minors addressed); AGY r1 MERGE-READY
+    (exhaustive AST byte-identity check across 22 functions);
+    Copilot COMMENTED (1 finding addressed, 1 _Log.md timestamp
+    format documented as preserving file convention); Claude
+    SMR MERGE-READY.
+  - **File(s)**: PR comment.
