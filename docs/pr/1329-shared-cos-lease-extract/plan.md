@@ -1,18 +1,32 @@
 # #1329 — shared_cos_lease.rs hot-fn extract — Plan
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** DRAFT v2 — addresses Codex r1 PLAN-NEEDS-MINOR fixes
+(#[inline] codegen claim softened, sibling-import import path made
+explicit, modularity-discipline LOC threshold corrected, public-API
+re-export list audit corrected to match `types/mod.rs` reality).
+AGY r1 PLAN-READY.
 
 ## Issue framing
 
 `userspace-dp/src/afxdp/types/shared_cos_lease.rs` is currently 1992
 prod LOC (issue body cites 1791; the file has grown since). Two hot
-functions are the LOC tentpoles and the modularity-discipline trigger:
+functions are the LOC tentpoles and trip the modularity-discipline
+god-function / API-shape cues in `docs/engineering-style.md` (>100
+LOC for a single fn, >8 params for a fn signature):
 
 - `SharedCoSQueueLease::maybe_rotate_epoch_v8(&self, now_ns: u64)`
-  at L1497–L1710 — **214 LOC**, single fn, exceeds the >200 LOC bar
-  in `docs/engineering-style.md`.
+  at L1497–L1710 — **214 LOC**, single fn, well over the >100-LOC
+  god-function cue.
 - `publish_equal_flow_epoch_v8(...)` at L1713–L1854 — **142 LOC**,
-  9-param free fn (close to the >8-param smell on the helper).
+  9-param free fn (over the >8-param API-shape cue on the helper).
+
+This PR addresses the **file/module reviewability** half of the
+modularity concern (move-only, file shrinks, two hot fns each get
+their own named file). The god-function / API-shape concerns above
+are **NOT closed** by this PR: the 214-LOC body and the 9-param
+signature both move byte-identical. A follow-up issue will track
+the actual decomposition (try_claim/snapshot/publish phases for
+the rotation; context-struct fold for the helper).
 
 Both functions form the CoS shared-lease epoch-rotation hot path:
 `maybe_rotate_epoch_v8` runs **per scheduler tick on RG-0 primary
@@ -50,8 +64,12 @@ ergonomics:
   is internal to the crate).
 
 There is **no runtime perf claim**. `#[inline]` annotations on
-moved fns preserve codegen. Codegen-unit boundary is the same
-because both moved fns are still inside the `shared_cos_lease` mod
+moved fns **strongly hint** inlining but are not a byte-equivalence
+proof — rustc/LLVM treats `#[inline]` as a hint, and codegen-unit
+partitioning can theoretically change. In practice both functions
+have exactly one call site each so the compiler-driven inlining
+decision is the same pre/post; release LTO further normalizes this.
+Codegen-unit boundary stays inside the `shared_cos_lease` module
 tree (sibling submodules of `mod.rs`, not separate crates).
 
 Cost: zero allocations introduced, zero atomic-ordering edits,
@@ -119,15 +137,32 @@ impl SharedCoSQueueLease {
   the only forced visibility delta.** The call sites of
   `maybe_rotate_epoch_v8` are all within the same crate, all already
   inside `mod.rs`.
-- `#[inline]` is **added** to preserve codegen. The original fn is
-  inherent-private with one call site (per-tick), so the compiler
-  already inlines it in practice; `#[inline]` makes that intent
-  explicit across the module boundary.
+- `#[inline]` is **added as an explicit hint** because the fn
+  goes from inherent-private + single call site (where rustc
+  inlining decisions are predictable) to a `pub(super)` sibling
+  submodule symbol (where the same decision is still expected but
+  the conservative thing is to make intent explicit). `#[inline]`
+  is a hint — not a byte-equivalence guarantee — and codegen-unit
+  partitioning can theoretically differ. Validation includes a
+  spot check on `cargo build --release` object sizes for the
+  `userspace-dp` binary and the per-class CoS smoke pass in the
+  batched wave smoke to catch any inlining regression.
 
 The body calls `publish_equal_flow_epoch_v8(...)` as a free fn —
-that call needs the helper visible to `rotate_epoch_v8.rs`. The
-helper file's `pub(super) fn` import path handles that (both
-sibling submodules under `shared_cos_lease`).
+that call needs the helper visible to `rotate_epoch_v8.rs`.
+`pub(super) fn` widens visibility but does NOT put the symbol in
+lexical scope. `rotate_epoch_v8.rs` adds an explicit import:
+
+```rust
+// rotate_epoch_v8.rs (top of file)
+use super::publish_equal_flow_epoch_v8::publish_equal_flow_epoch_v8;
+```
+
+Alternative (equivalent): `mod.rs` could `use
+publish_equal_flow_epoch_v8::publish_equal_flow_epoch_v8;` at
+module-private scope and rely on `use super::*;` in
+`rotate_epoch_v8.rs` to pick it up. The explicit per-file `use`
+above is preferred for diff localization.
 
 ### Move mechanics — `publish_equal_flow_epoch_v8`
 
@@ -205,21 +240,35 @@ edits.**
 
 ## Public API preservation
 
-- `SharedCoSQueueLease`, `SharedCoSRootLease`, `SharedCoSExactBacklog`,
-  `SharedCoSQueueVtimeFloor`, `PaddedVtimeSlot`, `V8RateMode`,
-  `V8EqualFlowFailOpenReason`, `V8EqualFlowSuppressState`,
-  `SharedCoSEpochState`, `SharedCoSLeaseConfig`, `SharedCoSLeaseState`,
-  `EPOCH_DURATION_NS`, `EQUAL_FLOW_VALID_STREAK_REQUIRED`,
-  `EQUAL_FLOW_MIN_WORKER_UTIL_NUM`, `EQUAL_FLOW_MIN_WORKER_UTIL_DEN`,
-  `compute_shared_cos_lease_config`, `pack_shared_cos_lease_credits`,
-  `unpack_shared_cos_lease_credits`, `shared_cos_lease_acquire`,
-  `shared_cos_lease_consume`, `shared_cos_lease_available_cap`,
-  `shared_cos_lease_release_unused`, `refill_shared_cos_lease_state`,
-  `try_bump_outstanding`, `bump_epoch_event`, `worker_grant_bump`,
-  `tag_checked_rollback`.
+The actual `pub(super) use` re-export list in
+`userspace-dp/src/afxdp/types/mod.rs` is narrower than the broad
+catalog of items defined inside `shared_cos_lease.rs`. The
+current re-export set is:
+
+```rust
+pub(super) use shared_cos_lease::{
+    NOT_PARTICIPATING, PaddedVtimeSlot, SharedCoSExactBacklog,
+    SharedCoSQueueLease, SharedCoSQueueVtimeFloor,
+    SharedCoSRootLease, V8RateMode,
+};
+```
+
+This 7-item list is preserved byte-identical. None of the
+moved-into-submodule items (`maybe_rotate_epoch_v8`,
+`publish_equal_flow_epoch_v8`) are in the re-export list — they
+are internal to the `shared_cos_lease` module tree. Items that
+remain in `shared_cos_lease/mod.rs` (the other types and free
+fns like `SharedCoSLeaseConfig`, `EPOCH_DURATION_NS`,
+`pack_shared_cos_lease_credits`, etc.) keep their
+`shared_cos_lease`-internal or `pub(in crate::afxdp)` visibility
+exactly as on master.
+
 - All inherent methods on `SharedCoSQueueLease` (including
-  `equal_flow_cap_v8`, `v8_equal_flow_fail_open_reason`, etc.):
-  signatures unchanged.
+  `equal_flow_cap_v8`, `v8_equal_flow_fail_open_reason`,
+  `maybe_rotate_epoch_v8` post-move): signatures unchanged.
+- The `pub(in crate::afxdp) const EPOCH_DURATION_NS: u64` and
+  similar `pub(in crate::afxdp)` items keep that exact visibility
+  in the new `mod.rs`.
 
 ## Hidden invariants the change must preserve
 
@@ -243,8 +292,10 @@ edits.**
    `publish_equal_flow_epoch_v8` both run per-tick when the lease
    is active. Neither must introduce `Box`/`Vec`/`String`/`format!`.
 
-5. **`#[inline]` on hot path** preserves the original codegen
-   shape (call-site inlining across the module boundary).
+5. **`#[inline]` on hot path** is an explicit hint. Original
+   codegen shape is *expected to* survive but is not a hard
+   invariant — confirmed by build+smoke matrix, not by the move
+   itself.
 
 6. **`bypass_grace_rotations_remaining` arm/decay** (#1290 v2) at
    L1652-1675 stays in `maybe_rotate_epoch_v8`. Splitting this
@@ -275,7 +326,13 @@ edits.**
    `shared_cos_lease_tests.rs` — pick the one that exercises seqlock
    rotation under contention.
 4. `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test ./...` — all 30 Go packages.
-5. **Smoke on loss userspace cluster** — deferred to AWAITING-BATCH-MERGE
+5. **Doc cleanup audit** — `userspace-dp/src/afxdp/types/README.md`
+   currently lists `shared_cos_lease.rs` and
+   `shared_cos_lease_tests.rs` as flat sibling files. The move
+   updates this table to the new directory layout in the same PR.
+   The `shared_cos_lease_tests.rs` header comment that references
+   the old sibling path is updated to the new in-dir path.
+6. **Smoke on loss userspace cluster** — deferred to AWAITING-BATCH-MERGE
    per Wave-3 retirement-chain rule. The PR records the build+test
    matrix; one comprehensive batch smoke runs at end of wave.
 

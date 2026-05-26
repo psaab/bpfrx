@@ -12,6 +12,20 @@
   per Wave-3 directory-layout standing rule. No algorithm or atomic
   ordering changes; both fns moved byte-identical body with
   pub(super) + #[inline]. tests file relocates into the dir.
+- **17:33 UTC** — Dispatched Codex (task-mpn2uvcy-65mg52) and AGY
+  (adversarial-review-mpn2xtqj-jj9kge) plan reviews in parallel.
+- **17:41 UTC** — Codex r1 PLAN-NEEDS-MINOR (4 fixes:
+  #[inline] codegen claim too strong, sibling-import path
+  underspecified, modularity-discipline LOC threshold wrong,
+  re-export list audit doesn't match types/mod.rs reality);
+  AGY r1 PLAN-READY.
+- **17:46 UTC** — Revised plan to v2: softened #[inline] claim,
+  added explicit `use super::publish_equal_flow_epoch_v8::*`
+  import, corrected LOC threshold to >100 god-function cue + >8
+  param cue and clarified PR doesn't close those concerns,
+  rewrote public-API section to match the narrow 7-item
+  pub(super) re-export in types/mod.rs verbatim, added README +
+  test header doc-cleanup to test plan.
 
 ## 2026-05-26 — #1325 implementation pushed
 
