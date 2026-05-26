@@ -272,6 +272,13 @@ pub(super) fn transmit_prepared_batch(
     result
 }
 
+/// Orchestrator: walks the prepared TX queue through six phases —
+/// stage → DSCP rewrite → UMEM slice re-verify → optional RST log →
+/// reserve+write+commit+stamp → finalise (success accounting / retry
+/// recovery / TX kick). See `transmit/{stage,rewrite,verify,write,
+/// finalise}.rs` for each phase's invariants. Pure code motion of
+/// the prior monolithic body (#1354); semantics, ordering, and drop
+/// accounting are byte-identical to the pre-split function.
 pub(in crate::afxdp) fn transmit_prepared_queue(
     binding: &mut BindingWorker,
     pending: &mut VecDeque<PreparedTxRequest>,
@@ -281,228 +288,71 @@ pub(in crate::afxdp) fn transmit_prepared_queue(
     if pending.is_empty() {
         return Ok((0, 0));
     }
-    let batch_size = pending.len().min(TX_BATCH_SIZE);
-    binding.scratch.scratch_prepared_tx.clear();
-    while binding.scratch.scratch_prepared_tx.len() < batch_size {
-        let Some(req) = pending.pop_front() else {
-            break;
-        };
-        if req.len as usize > tx_frame_capacity() {
-            let orphaned: Vec<_> = binding.scratch.scratch_prepared_tx.drain(..).collect();
-            recycle_prepared_immediately_with_shared(binding, &req, Some(shared_recycles));
-            for r in &orphaned {
-                recycle_prepared_immediately_with_shared(binding, r, Some(shared_recycles));
-            }
-            // #710: each orphan is a silently-recycled packet that will
-            // not reach the TX ring. The caller's post-return `+= 1`
-            // covers the offender (`req`); this accounts for the
-            // orphans so `tx_submit_error_drops` matches the actual
-            // packet count lost on this Drop return.
-            if !orphaned.is_empty() {
-                binding
-                    .live
-                    .tx_submit_error_drops
-                    .fetch_add(orphaned.len() as u64, Ordering::Relaxed);
-                binding
-                    .live
-                    .tx_errors
-                    .fetch_add(orphaned.len() as u64, Ordering::Relaxed);
-            }
-            return Err(TxError::Drop(format!(
-                "prepared tx frame exceeds UMEM frame capacity: len={} cap={}",
-                req.len,
-                tx_frame_capacity()
-            )));
-        }
-        binding.scratch.scratch_prepared_tx.push(req);
-    }
+    stage::stage_batch_into_scratch(binding, pending, shared_recycles)?;
     if binding.scratch.scratch_prepared_tx.is_empty() {
         return Ok((0, 0));
     }
-    for req in &binding.scratch.scratch_prepared_tx {
-        let Some(dscp_rewrite) = req.dscp_rewrite else {
-            continue;
-        };
-        let Some(frame) = (unsafe {
-            binding
-                .umem
-                .area()
-                .slice_mut_unchecked(req.offset as usize, req.len as usize)
-        }) else {
-            let err_offset = req.offset;
-            let err_len = req.len;
-            let orphaned: Vec<_> = binding.scratch.scratch_prepared_tx.drain(..).collect();
-            for r in &orphaned {
-                recycle_prepared_immediately_with_shared(binding, r, Some(shared_recycles));
-            }
-            // #710: each orphan is a silently-recycled packet. Caller
-            // will `+= 1` for the offender; this accounts for the rest.
-            let orphan_count = orphaned.len();
-            if orphan_count > 0 {
-                binding
-                    .live
-                    .tx_submit_error_drops
-                    .fetch_add(orphan_count.saturating_sub(1) as u64, Ordering::Relaxed);
-                binding
-                    .live
-                    .tx_errors
-                    .fetch_add(orphan_count.saturating_sub(1) as u64, Ordering::Relaxed);
-            }
-            return Err(TxError::Drop(format!(
-                "prepared tx frame slice out of range: offset={} len={}",
-                err_offset, err_len
-            )));
-        };
-        let _ = apply_dscp_rewrite_to_frame(frame, dscp_rewrite);
+    rewrite::apply_dscp_rewrites_to_staged(binding, shared_recycles)?;
+    verify::verify_umem_slices_for_staged(binding, shared_recycles)?;
+    if cfg!(feature = "debug-log") {
+        log_rst_frames_prepared(binding);
     }
+    let inserted = write::reserve_and_write_descriptors(binding);
+    finalise::finalise_prepared(binding, pending, now_ns, inserted)
+}
+
+/// Diagnostic-only: scan staged prepared frames for TCP RST and emit
+/// throttled RST_DETECT log lines. Behind `cfg!(feature = "debug-log")`
+/// at the call site; kept as an out-of-line helper so the per-batch
+/// orchestrator stays compact when debug-log is enabled.
+#[inline]
+fn log_rst_frames_prepared(binding: &mut BindingWorker) {
     for req in &binding.scratch.scratch_prepared_tx {
-        if binding
+        if let Some(frame_data) = binding
             .umem
             .area()
             .slice(req.offset as usize, req.len as usize)
-            .is_none()
         {
-            let err_offset = req.offset;
-            let err_len = req.len;
-            let orphaned: Vec<_> = binding.scratch.scratch_prepared_tx.drain(..).collect();
-            for r in &orphaned {
-                recycle_prepared_immediately_with_shared(binding, r, Some(shared_recycles));
-            }
-            // #710: same shape as the slice_mut_unchecked site above —
-            // `orphaned` drains EVERY entry including the offender.
-            // Caller adds 1 for the offender; we add (len-1) for the
-            // rest so `tx_submit_error_drops` matches the actual count.
-            let orphan_count = orphaned.len();
-            if orphan_count > 0 {
-                binding
-                    .live
-                    .tx_submit_error_drops
-                    .fetch_add(orphan_count.saturating_sub(1) as u64, Ordering::Relaxed);
-                binding
-                    .live
-                    .tx_errors
-                    .fetch_add(orphan_count.saturating_sub(1) as u64, Ordering::Relaxed);
-            }
-            return Err(TxError::Drop(format!(
-                "prepared tx frame slice out of range: offset={} len={}",
-                err_offset, err_len
-            )));
-        }
-    }
-
-    // RST detection on prepared TX path: check UMEM frames before submitting to TX ring
-    if cfg!(feature = "debug-log") {
-        for req in &binding.scratch.scratch_prepared_tx {
-            if let Some(frame_data) = binding
-                .umem
-                .area()
-                .slice(req.offset as usize, req.len as usize)
-            {
-                if frame_has_tcp_rst(frame_data) {
-                    binding.telemetry.dbg_tx_tcp_rst += 1;
-                    thread_local! {
-                        static PREP_TX_RST_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-                    }
-                    PREP_TX_RST_LOG_COUNT.with(|c| {
-                        let n = c.get();
-                        if n < 50 {
-                            c.set(n + 1);
-                            let summary = decode_frame_summary(frame_data);
-                            eprintln!(
-                                "RST_DETECT PREP_TX[{}]: if={} q={} len={} {}",
-                                n,
-                                binding.identity().ifindex,
-                                binding.identity().queue_id,
-                                req.len,
-                                summary,
-                            );
-                            if n < 5 {
-                                let hex_len = (req.len as usize).min(frame_data.len()).min(80);
-                                let hex: String = frame_data[..hex_len]
-                                    .iter()
-                                    .map(|b| format!("{:02x}", b))
-                                    .collect::<Vec<_>>()
-                                    .join(" ");
-                                eprintln!("RST_DETECT PREP_TX_HEX[{n}]: {hex}");
-                            }
-                        }
-                    });
+            if frame_has_tcp_rst(frame_data) {
+                binding.telemetry.dbg_tx_tcp_rst += 1;
+                thread_local! {
+                    static PREP_TX_RST_LOG_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
                 }
+                PREP_TX_RST_LOG_COUNT.with(|c| {
+                    let n = c.get();
+                    if n < 50 {
+                        c.set(n + 1);
+                        let summary = decode_frame_summary(frame_data);
+                        eprintln!(
+                            "RST_DETECT PREP_TX[{}]: if={} q={} len={} {}",
+                            n,
+                            binding.identity().ifindex,
+                            binding.identity().queue_id,
+                            req.len,
+                            summary,
+                        );
+                        if n < 5 {
+                            let hex_len = (req.len as usize).min(frame_data.len()).min(80);
+                            let hex: String = frame_data[..hex_len]
+                                .iter()
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            eprintln!("RST_DETECT PREP_TX_HEX[{n}]: {hex}");
+                        }
+                    }
+                });
             }
         }
     }
-
-    let mut writer = binding
-        .xsk
-        .tx
-        .transmit(binding.scratch.scratch_prepared_tx.len() as u32);
-    let inserted = writer.insert(
-        binding
-            .scratch
-            .scratch_prepared_tx
-            .iter()
-            .map(|req| XdpDesc {
-                addr: req.offset,
-                len: req.len,
-                options: 0,
-            }),
-    );
-    writer.commit();
-    drop(writer);
-    // #940: NO V_min publish here. transmit_prepared_queue is the
-    // post-CoS backup path; operates on
-    // `pending: VecDeque<PreparedTxRequest>` directly, never
-    // advances any queue_vtime. V_min applies only to traffic
-    // that flowed through a shared_exact CoS queue.
-    // #812 Codex round-1 HIGH #1: submit stamp AFTER commit — plan
-    // §3.1 submit-site table (the transmit_prepared_queue
-    // continuation variant). Post-commit stamping ensures we measure
-    // kernel-visible submit time, not the pre-submit planning window.
-    let ts_submit = monotonic_nanos();
-    stamp_submits(
-        &mut binding.tx_pipeline.tx_submit_ns,
-        binding
-            .scratch
-            .scratch_prepared_tx
-            .iter()
-            .take(inserted as usize)
-            .map(|req| req.offset),
-        ts_submit,
-    );
-
-    if inserted == 0 {
-        binding.telemetry.dbg_tx_ring_full += 1;
-        maybe_wake_tx(binding, true, now_ns);
-        while let Some(req) = binding.scratch.scratch_prepared_tx.pop() {
-            pending.push_front(req);
-        }
-        return Err(TxError::Retry("prepared tx ring insert failed".to_string()));
-    }
-    binding.telemetry.dbg_tx_ring_submitted += inserted as u64;
-    binding.tx_pipeline.outstanding_tx =
-        binding.tx_pipeline.outstanding_tx.saturating_add(inserted);
-
-    let mut sent_packets = 0u64;
-    let mut sent_bytes = 0u64;
-    let mut retry_tail = Vec::new();
-    for (idx, req) in binding.scratch.scratch_prepared_tx.drain(..).enumerate() {
-        if idx < inserted as usize {
-            remember_prepared_recycle(&mut binding.tx_pipeline.in_flight_prepared_recycles, &req);
-            sent_packets += 1;
-            sent_bytes += req.len as u64;
-        } else {
-            retry_tail.push(req);
-        }
-    }
-    for req in retry_tail.into_iter().rev() {
-        pending.push_front(req);
-    }
-
-    // Prepared cross-binding forwards need the same explicit TX kick.
-    maybe_wake_tx(binding, true, now_ns);
-    Ok((sent_packets, sent_bytes))
 }
 
+mod finalise;
+mod rewrite;
+mod stage;
+mod verify;
+mod write;
+
 #[cfg(test)]
-#[path = "transmit_tests.rs"]
+#[path = "../transmit_tests.rs"]
 mod tests;

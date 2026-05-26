@@ -1,5 +1,27 @@
 # Action Log
 
+## 2026-05-26 21:07 UTC — #1354 transmit phase split AWAITING-BATCH-MERGE
+
+- **Timestamp**: 2026-05-26 21:07 UTC (PR #1586 head 2292b4a84b68)
+  - **Action**: Split 230-LOC `transmit_prepared_queue()` into a
+    14-LOC orchestrator + 5 `#[inline]` phase helpers
+    (stage/rewrite/verify/write/finalise) under new
+    `tx/transmit/` submodule directory. Pure code motion.
+  - **File(s)**: `userspace-dp/src/afxdp/tx/transmit/{mod,stage,rewrite,verify,write,finalise}.rs`,
+    `docs/pr/1354-transmit-phase-split/{plan.md,reviewer-ids.md}`
+  - **Reviewers**:
+    - Codex r1 PLAN-NEEDS-MAJOR (5 findings, addressed in plan v2);
+      r2 MERGE-NEEDS-MINOR (doc drift); r3 MERGE-READY.
+    - Gemini r1 PLAN-READY; r2 MERGE-READY.
+    - Copilot r1 COMMENTED (2 inline comments: write.rs
+      "kernel-acknowledged" wording + plan.md "per-tick" framing);
+      both addressed in commit 53fc7638.
+    - Claude SMR self-attested via diff walk against master.
+  - **Tests**: cargo build clean; `cargo test --release` 1503 pass
+    (skipping pre-existing snat_contract guard); 5x flake check on
+    `afxdp::tx::transmit` — 3/3 pass every iteration; Go suite
+    clean.
+
 ## 2026-05-26 — #1546 fix: centralize log-match helper + rustfmt
 
 - **Timestamp**: 2026-05-26 (PR #1574 head fde64872 -> next)
