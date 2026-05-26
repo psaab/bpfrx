@@ -236,12 +236,22 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 			case dataplaneTypeEBPF:
 				// The legacy eBPF dataplane has no system dataplane sub-stanza.
 			case dataplaneTypeDPDK:
-				// DPDK retired in #1525 / #1528. compileTreeForLoad lets the
-				// dataplane-type leaf survive Store.Load so the daemon can
-				// reach the daemon_run.go ErrDPDKBackendRetired soft-fallback
-				// and run in config-only mode. The legacy sub-stanza children
+				// DPDK retired in #1525 / #1528. This branch is reachable
+				// only from a direct CompileConfig call on a tree that still
+				// carries a `dataplane-type dpdk` leaf — i.e., a commit-path
+				// candidate. Store.Load and Store.SyncApply both call
+				// rewriteRetiredDataplaneType before compile, which strips
+				// the `dataplane-type dpdk` leaf so sys.DataplaneType == ""
+				// (→ userspace) and this branch is never entered; the
+				// sub-stanza children hit compileUserspaceDataplane instead
+				// and are silently dropped there as unknown keys.
+				//
+				// For the direct-compile case the sub-stanza children
 				// (cores, memory, socket-mem, rx-mode, ports) are silently
 				// dropped here because the DPDKConfig type is deleted.
+				// validateDataplaneTypeStrict in compileExpanded fires
+				// immediately after compileSystem and returns
+				// ErrDPDKDataplaneRetired, so the no-op here is inconsequential.
 			}
 		case "syslog":
 			sys.Syslog = &SystemSyslogConfig{}
