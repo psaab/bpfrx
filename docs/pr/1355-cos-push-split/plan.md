@@ -1,6 +1,9 @@
 # #1355 — Split 218-LOC `cos_queue_push_front` along the snapshot-axis
 
-**Status:** DRAFT v2 — re-targeted after unanimous v1 PLAN-KILL
+**Status:** PLAN-READY (v2 — after Codex task-mpn35b09-ztxsth
+PLAN-NEEDS-MINOR and Gemini task-mpn35twr-zfl64q PLAN-NEEDS-MINOR;
+all minors recorded in §Round-2 minor fixes below and rolled into
+implementation). Re-targeted after unanimous v1 PLAN-KILL
 (Codex task-mpn2tomp-5t6oam, Gemini task-mpn2u791-tq1zkx).
 Both reviewers said the same thing: the `flow_fair()` config branch
 is the wrong axis. The cyclomatic complexity lives in the
@@ -216,7 +219,7 @@ fn pop_matching_snapshot(
                 "pop_snapshot_stack bucket mismatch on push_front: \
                  top entry's bucket {} != target bucket {}; a \
                  caller pop+dropped an item without §3.4 cleanup, \
-                 or violated the pop->push_front-same-item contract",
+                 or violated the pop→push_front-same-item contract",
                 top, bucket,
             );
             unreachable!()
@@ -408,14 +411,27 @@ pattern as the monolith, made explicit.
 
 - `cargo build` clean.
 - `cargo test --release` — full suite passes.
-- 5/5 flake check on `test_push_front_*` family in
-  `cos/queue_ops/tests.rs`.
+- 5/5 flake check on the push-front-touching tests in
+  `cos/queue_ops/pop_tests.rs` (e.g. line ~1230 — `pop_tests.rs`
+  carries the push_front pins by name) and
+  `cos/queue_ops/v_min_tests.rs:329` (republish slot test).
 - `go test ./...` — 30 Go packages pass.
-- **Codegen gate (Codex #4):** `objdump -d
-  /dev/shm/cargo/release/libuserspace_dp.so | awk
-  '/<.*cos_queue_push_front>:/,/^$/' | grep -E 'call +[0-9a-f]+
-  <push_front_'` should be empty (no call edges). If non-empty,
-  downgrade perf claim and rely on smoke.
+- **Codegen gate (Codex round-1 #4 + round-2 codegen finding):**
+  use `objdump -Cd` (demangled) so Rust-mangled symbol targets
+  aren't masked by the literal `<push_front_` grep, and grep the
+  WHOLE `.so` for call edges to the helpers, not just the block
+  scoped to `cos_queue_push_front`. The vacuous-pass scenario
+  (helper inlined into _other_ callers but still emitted as a
+  standalone symbol that nothing calls) is also covered by
+  grepping for any `call +[0-9a-f]+ +.*push_front_(flow_fair_v8|
+  drained_bucket|active_bucket|matching_snapshot|lease_active_
+  flow_increment|drained_bucket_no_snapshot|drained_bucket_with_
+  snapshot)` across the entire `.so`. Empty output ⇒ INLINED OK.
+  Non-empty ⇒ downgrade perf claim and rely on multi-stream
+  `-P 12 -R` smoke. Codex round-2 follow-up: also assert the
+  searched block exists (the `awk` extraction is not vacuous)
+  by sanity-checking the symbol is present in `nm -C` output
+  for the `.so` before running the grep.
 - Deploy on loss userspace cluster.
 - **Pass A — CoS disabled:** v4 + v6 × push + reverse; multi-stream
   `-P 12 -R` reproducers. Line rate, 0 retrans on multi-stream.
@@ -434,6 +450,34 @@ pattern as the monolith, made explicit.
   PLAN-KILL if test colocation is required.
 - Any change to snapshot stack contract, v8 epoch handoff, or
   head-finish rebase arithmetic.
+
+## Round-2 minor fixes folded into the implementation
+
+Both round-2 reviewers returned PLAN-NEEDS-MINOR; the minors below
+are rolled into the implementation, not deferred:
+
+- **Codex round-2 medium — codegen gate inadequate as written.**
+  Plan §Test plan now uses `objdump -Cd` (demangled) and greps the
+  whole `.so` for calls to any of the seven helper names. Vacuous
+  pass guarded by an `nm -C` symbol-presence assertion.
+- **Codex round-2 low — test-plan names wrong file.** Plan §Test
+  plan now points at `pop_tests.rs:1230` and `v_min_tests.rs:329`
+  (the actual push-front-pinned tests) instead of the imagined
+  `tests.rs::test_push_front_*` family.
+- **Both round-2 reviewers low — panic-message Unicode parity.**
+  The `pop_matching_snapshot` sketch in §Concrete design now uses
+  `→` (U+2192) instead of `->`, matching `push.rs:119` byte-for-
+  byte for operator-grep parity.
+- **Gemini round-2 acknowledgment — `was_idle` short-circuit
+  reorder.** The original code wraps `was_idle` inside the
+  `if let Some(lease)` block; v2 pre-computes `was_idle` as a
+  return value from `push_front_drained_bucket_no_snapshot` and
+  branches on it BEFORE the lease check at the call site. This
+  is harmless (potentially faster on non-v8 queues because we
+  skip the lease load entirely when `!was_idle`) but is
+  technically a reorder. Acknowledged; semantic identity
+  preserved because the lease bump only fires when `was_idle`
+  was already true under the original code path.
 
 ## Open questions for adversarial review
 

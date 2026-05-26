@@ -9,5 +9,5 @@
 
 ## Plan review round 2 — snapshot-axis re-target
 
-- Codex: pending (v2)
-- Gemini: pending (v2)
+- Codex: task-mpn35b09-ztxsth (dispatched 2026-05-26 20:35 UTC, v2 @ 509f1e0d)
+- Gemini: task-mpn35twr-zfl64q (dispatched 2026-05-26 20:35 UTC, v2 @ 509f1e0d)
