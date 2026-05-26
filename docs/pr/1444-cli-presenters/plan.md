@@ -1,8 +1,22 @@
 # #1444 De-monolithize `pkg/cli/cli.go` into Logical Operational Presenters
 
 ## Status
-DRAFT v2 — revised after Codex (PLAN-NEEDS-MAJOR) and Gemini (PLAN-NEEDS-MINOR)
-v1 reviews. Pending re-review.
+v3 — Gemini r2 PLAN-READY, Codex r2 PLAN-NEEDS-MINOR.
+
+v3 micro-adjustments after Codex r2 ownership findings:
+
+- `applyResult` and `dataplaneLoaded` STAY in cli.go (not apply.go). Both
+  are core accessors with consumers across cli_show_security.go,
+  cli_show_nat.go, cli_show_flow.go, cli_show_interfaces.go, and the
+  daemon side. They are not apply-domain helpers.
+- `dhcpLease` moves to `cli_show_interfaces.go` (only consumer is
+  cli_show_interfaces.go:311 and :322), NOT a new `link.go`.
+- `link.go` keeps only the sysfs link-speed/duplex helpers.
+- `session_filter.go` keeps `fetchPeerSessions` and
+  `fetchPeerSessionSummary`. Codex flagged the filename "undersells RPC
+  responsibility" but both RPC fetchers take `sessionFilter` as input
+  and translate filter fields to RPC request fields, so they are
+  filter-bound. We keep them co-located.
 
 ## v1 reviewer findings addressed
 

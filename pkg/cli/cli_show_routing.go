@@ -13,6 +13,66 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// handleShowRoute dispatches `show route ...` invocations to the
+// per-flavor presenters defined later in this file.
+func (c *CLI) handleShowRoute(args []string) error {
+	if len(args) >= 2 && args[0] == "instance" {
+		return c.showRoutesForInstance(args[1])
+	}
+	if len(args) >= 2 && args[0] == "table" {
+		return c.showRoutesForVRF(args[1])
+	}
+	if len(args) >= 2 && args[0] == "protocol" {
+		return c.showRoutesForProtocol(args[1])
+	}
+	if len(args) >= 1 && args[0] == "terse" {
+		return c.showRouteTerse()
+	}
+	if len(args) >= 1 && args[0] == "summary" {
+		return c.showRouteSummary()
+	}
+	if len(args) >= 1 && args[0] == "detail" {
+		return c.showRouteDetail()
+	}
+	// Treat first arg as prefix filter (e.g. "show route 10.0.1.0/24")
+	// Optional second arg is a modifier: exact, longer, orlonger
+	if len(args) >= 1 && (strings.Contains(args[0], "/") || strings.Contains(args[0], ".") || strings.Contains(args[0], ":")) {
+		modifier := ""
+		if len(args) >= 2 {
+			switch args[1] {
+			case "exact", "longer", "orlonger":
+				modifier = args[1]
+			}
+		}
+		return c.showRoutesForPrefix(args[0], modifier)
+	}
+	return c.showRoutes()
+}
+
+// handleShowProtocols dispatches `show protocols ...` invocations to the
+// per-protocol presenters defined later in this file.
+func (c *CLI) handleShowProtocols(args []string) error {
+	if len(args) == 0 {
+		cmdtree.PrintTreeHelp("show protocols:", operationalTree, "show", "protocols")
+		return nil
+	}
+
+	switch args[0] {
+	case "ospf":
+		return c.showOSPF(args[1:])
+	case "bgp":
+		return c.showBGP(args[1:])
+	case "bfd":
+		return c.showBFD(args[1:])
+	case "rip":
+		return c.showRIP()
+	case "isis":
+		return c.showISIS(args[1:])
+	default:
+		return fmt.Errorf("unknown show protocols target: %s", args[0])
+	}
+}
+
 func (c *CLI) showRoutes() error {
 	if c.routing == nil {
 		fmt.Println("Routing manager not available")

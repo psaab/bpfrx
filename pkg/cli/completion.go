@@ -10,10 +10,223 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
+// completionNode is an alias for the canonical cmdtree.Node type.
+type completionNode = cmdtree.Node
+
+// operationalTree references the canonical tree in pkg/cmdtree.
+var operationalTree = cmdtree.OperationalTree
+
+// configTopLevel references the canonical config tree in pkg/cmdtree.
+var configTopLevel = cmdtree.ConfigTopLevel
+
 // completionCandidate holds a command name and its description.
 type completionCandidate struct {
 	name string
 	desc string
+}
+
+// cliCompleter implements readline.AutoCompleter.
+type cliCompleter struct {
+	cli         *CLI
+	helpWritten bool // set by ? Listener to suppress duplicate help from Do()
+}
+
+func (cc *cliCompleter) Do(line []rune, pos int) ([][]rune, int) {
+	// If the ? Listener already wrote help, suppress duplicate output.
+	if cc.helpWritten {
+		cc.helpWritten = false
+		return nil, 0
+	}
+
+	text := string(line[:pos])
+
+	// Pipe filter completion: "show ... | <tab>"
+	if pipeCandidates, handled := completePipeFilter(text); handled {
+		if len(pipeCandidates) == 0 {
+			return nil, 0
+		}
+		// Determine partial (text after "| ")
+		idx := strings.LastIndex(text, "|")
+		after := strings.TrimLeft(text[idx+1:], " ")
+		partial := after
+
+		sort.Slice(pipeCandidates, func(i, j int) bool { return pipeCandidates[i].name < pipeCandidates[j].name })
+		if len(pipeCandidates) == 1 {
+			suffix := pipeCandidates[0].name[len(partial):]
+			return [][]rune{[]rune(suffix + " ")}, len(partial)
+		}
+		writeCompletionHelp(cc.cli.rl.Stdout(), pipeCandidates)
+		names := make([]string, len(pipeCandidates))
+		for i, c := range pipeCandidates {
+			names[i] = c.name
+		}
+		cp := commonPrefix(names)
+		suffix := cp[len(partial):]
+		if suffix == "" {
+			return nil, 0
+		}
+		return [][]rune{[]rune(suffix)}, len(partial)
+	}
+
+	words := strings.Fields(text)
+	trailingSpace := len(text) > 0 && text[len(text)-1] == ' '
+
+	var partial string
+	if !trailingSpace && len(words) > 0 {
+		partial = words[len(words)-1]
+		words = words[:len(words)-1]
+	}
+
+	var candidates []completionCandidate
+	if cc.cli.store.InConfigMode() {
+		candidates = cc.cli.completeConfigWithDesc(words, partial)
+	} else {
+		// "show configuration <path>" — delegate sub-path to config schema
+		if subPath, ok := showConfigurationSubPath(words); ok {
+			if resolvedPath, resolved := config.ResolveConsumedSetPathTokens(subPath); resolved {
+				subPath = resolvedPath
+			}
+			schemaCompletions := config.CompleteSetPathWithValues(subPath, cc.cli.valueProvider)
+			if schemaCompletions != nil {
+				for _, sc := range schemaCompletions {
+					if partial == "" || strings.HasPrefix(sc.Name, partial) {
+						candidates = append(candidates, completionCandidate{name: sc.Name, desc: sc.Desc})
+					}
+				}
+			}
+		}
+		if len(candidates) == 0 {
+			candidates = completeFromTreeWithDesc(operationalTree, words, partial, cc.cli.store.ActiveConfig())
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, 0
+	}
+
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].name < candidates[j].name })
+
+	if len(candidates) == 1 {
+		suffix := candidates[0].name[len(partial):]
+		return [][]rune{[]rune(suffix + " ")}, len(partial)
+	}
+
+	// Multiple matches: show descriptions above prompt.
+	writeCompletionHelp(cc.cli.rl.Stdout(), candidates)
+
+	// Complete common prefix.
+	names := make([]string, len(candidates))
+	for i, c := range candidates {
+		names[i] = c.name
+	}
+	cp := commonPrefix(names)
+	suffix := cp[len(partial):]
+	if suffix == "" {
+		return nil, 0
+	}
+	return [][]rune{[]rune(suffix)}, len(partial)
+}
+
+func (c *CLI) completeConfigWithDesc(words []string, partial string) []completionCandidate {
+	if len(words) == 0 {
+		return filterTreeCandidates(configTopLevel, partial)
+	}
+
+	resolvedTop, ok := resolveUniqueTreePrefix(configTopLevel, words[0])
+	if !ok {
+		if len(words) == 1 {
+			return filterTreeCandidates(configTopLevel, words[0])
+		}
+		return nil
+	}
+
+	switch resolvedTop {
+	case "set", "delete", "show", "edit":
+		pathWords := words[1:]
+		if resolvedPath, resolved := config.ResolveConsumedSetPathTokens(pathWords); resolved {
+			pathWords = resolvedPath
+		}
+		schemaCompletions := config.CompleteSetPathWithValues(pathWords, c.valueProvider)
+		if schemaCompletions == nil {
+			return nil
+		}
+		var candidates []completionCandidate
+		for _, sc := range schemaCompletions {
+			if strings.HasPrefix(sc.Name, partial) {
+				candidates = append(candidates, completionCandidate{name: sc.Name, desc: sc.Desc})
+			}
+		}
+		return candidates
+
+	case "run":
+		return completeFromTreeWithDesc(operationalTree, words[1:], partial, c.store.ActiveConfig())
+
+	case "commit", "load":
+		if len(words) == 1 {
+			node := configTopLevel[resolvedTop]
+			if node == nil || node.Children == nil {
+				return nil
+			}
+			var candidates []completionCandidate
+			for name, child := range node.Children {
+				if strings.HasPrefix(name, partial) {
+					candidates = append(candidates, completionCandidate{name: name, desc: child.Desc})
+				}
+			}
+			return candidates
+		}
+		return nil
+
+	default:
+		return nil
+	}
+}
+
+// resolveCommand performs Junos-style prefix matching.
+// Given a partial input and a list of valid commands, it returns:
+// - The full command name if exactly one match
+// - "" and an error if ambiguous (multiple matches)
+// - "" and an error if no match
+func resolveCommand(input string, validCommands []string) (string, error) {
+	if input == "" {
+		return "", fmt.Errorf("missing command")
+	}
+	// Exact match first
+	for _, cmd := range validCommands {
+		if cmd == input {
+			return cmd, nil
+		}
+	}
+	// Prefix match
+	var matches []string
+	for _, cmd := range validCommands {
+		if strings.HasPrefix(cmd, input) {
+			matches = append(matches, cmd)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("unknown command: %s", input)
+	case 1:
+		return matches[0], nil
+	default:
+		sort.Strings(matches)
+		return "", fmt.Errorf("'%s' is ambiguous.\nPossible completions:\n%s",
+			input, formatAmbiguousMatches(matches))
+	}
+}
+
+func formatAmbiguousMatches(matches []string) string {
+	var sb strings.Builder
+	maxWidth := 0
+	for _, m := range matches {
+		if len(m) > maxWidth {
+			maxWidth = len(m)
+		}
+	}
+	for _, m := range matches {
+		sb.WriteString(fmt.Sprintf("  %s\n", m))
+	}
+	return sb.String()
 }
 
 // completeFromTreeWithDesc mirrors completeFromTree but returns name+desc pairs.
