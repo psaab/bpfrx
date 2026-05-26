@@ -1,7 +1,44 @@
 # #1346 session_glue dispatcher split + parameter-cluster collapse
 
-**Status:** DRAFT v2 — addresses round-1 Codex PLAN-KILL + Gemini /
-AGY PLAN-NEEDS-MINOR findings.
+**Status:** DRAFT v2.1 — addresses round-2 Codex PLAN-NEEDS-MINOR
+(dispatcher dedup coverage + explicit asm gate criteria); Gemini r2
+PLAN-READY; AGY r2 PLAN-READY.
+
+## Round-2 reviewer findings → v2.1 disposition
+
+Round-2 verdicts (commit cf6580a0):
+- Codex: PLAN-NEEDS-MINOR (down from PLAN-KILL). Asked for (a) DemoteOwnerRGS duplicate coverage in the order-pin test, (b) explicit cargo-asm pass/fail criteria.
+- Gemini: PLAN-READY.
+- AGY: PLAN-READY.
+
+v2.1 closes Codex's two minor asks:
+
+(a) **Dispatcher test adds duplicate-DemoteOwnerRGS coverage.** The new test queues
+    `[Demote(rg=5), Upsert, Demote(rg=5), Export, Demote(rg=7), ShapedLocal, Refresh, Vacate]`
+    and asserts:
+    - The duplicate `Demote(rg=5)` is dedup-safe — `cancelled_keys` contains each
+      demoted key at most once across both invocations (existing dedup contract
+      from the original arm: `if !cancelled_keys.iter().any(|key| key == &demoted_key)`).
+    - The first-occurrence order is preserved: keys from the first `Demote(rg=5)`
+      come before keys from `Demote(rg=7)`, and the second `Demote(rg=5)` adds no
+      new keys (idempotent).
+    - `exported_sequences == vec![sequence]`, `shaped_tx_requests.len() == 1`,
+      `vacate_all_shared_exact_slots == true`.
+
+(b) **`cargo asm` pass/fail criteria — explicit.** The PR body records before/after
+    asm for `resolve_flow_session_decision` and `apply_worker_commands` built with
+    the same release profile, target, and `--features` set. The gate FAILS if:
+    - any new hot-path call appears (e.g. an extra `memcpy`, `Drop::drop`, or
+      `__rust_alloc`),
+    - the `SharedSessionRefs` struct triggers a visible stack copy at a call
+      site that the explicit-argument form did not,
+    - new register spills appear in the `resolve_flow_session_decision` hot path
+      that were not present before,
+    - the branch-shape of the `match cmd` / `if keep_transient` / `if let Some(hit)`
+      blocks changes.
+    The gate PASSES if the only diff is register allocation or instruction
+    reorderings that LLVM trivially produces from semantically equivalent code.
+    Reviewers can demand a tighter gate; PR body publishes the raw asm dumps.
 
 ## Round-1 reviewer findings → v2 disposition
 

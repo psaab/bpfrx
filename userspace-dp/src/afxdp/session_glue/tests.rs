@@ -344,14 +344,19 @@ fn maybe_promote_synced_session_sets_fabric_ingress_on_fabric_hit() {
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
     let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
     let forwarding = test_forwarding_state_with_fabric();
+    // #1346: wrap the four shared-map refs in `SharedSessionRefs`
+    // (Copy struct) to match the post-refactor signature.
+    let shared = super::SharedSessionRefs {
+        sessions: &shared_sessions,
+        nat_sessions: &shared_nat_sessions,
+        forward_wire_sessions: &shared_forward_wire_sessions,
+        owner_rg_indexes: &shared_owner_rg_indexes,
+    };
 
     let promoted = maybe_promote_synced_session(
         &mut sessions,
         -1,
-        &shared_sessions,
-        &shared_nat_sessions,
-        &shared_forward_wire_sessions,
-        &shared_owner_rg_indexes,
+        shared,
         &peer_worker_commands,
         &forwarding,
         &key,
@@ -389,14 +394,19 @@ fn maybe_promote_synced_session_skips_worker_local_import() {
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
     let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
     let forwarding = test_forwarding_state_with_fabric();
+    // #1346: wrap the four shared-map refs in `SharedSessionRefs`
+    // (Copy struct) to match the post-refactor signature.
+    let shared = super::SharedSessionRefs {
+        sessions: &shared_sessions,
+        nat_sessions: &shared_nat_sessions,
+        forward_wire_sessions: &shared_forward_wire_sessions,
+        owner_rg_indexes: &shared_owner_rg_indexes,
+    };
 
     let promoted = maybe_promote_synced_session(
         &mut sessions,
         -1,
-        &shared_sessions,
-        &shared_nat_sessions,
-        &shared_forward_wire_sessions,
-        &shared_owner_rg_indexes,
+        shared,
         &peer_worker_commands,
         &forwarding,
         &key,
@@ -3722,4 +3732,187 @@ fn synced_session_hit_recomputes_local_resolution_after_failover() {
     );
     assert_eq!(resolved.decision.resolution.egress_ifindex, 12);
     assert_eq!(resolved.decision.resolution.tx_ifindex, 11);
+}
+
+// === #1346 dispatcher order-pin + dedup test =================================
+//
+// Round-2 Codex review required two test additions:
+//   (a) An interleaved-variant dispatcher test that pins side-effect
+//       order across all four WorkerCommandResults fields.
+//   (b) Coverage for `DemoteOwnerRGS` duplicate / first-occurrence
+//       dedup (because the original dispatcher arm carried an
+//       `if !cancelled_keys.iter().any(|key| key == &demoted_key)`
+//       guard whose contract must outlive the lift to
+//       commands/demote_owner_rgs.rs).
+//
+// The test queues, in order:
+//   1. DemoteOwnerRGS { owner_rgs: [5] }    — demote RG5 (one session)
+//   2. UpsertSynced(s5b)                    — install a synced session
+//   3. DemoteOwnerRGS { owner_rgs: [5, 5] } — duplicate; dedup-safe
+//   4. ExportOwnerRGSessions { sequence: 7, owner_rgs: [5] }
+//   5. DemoteOwnerRGS { owner_rgs: [7] }    — second RG
+//   6. EnqueueShapedLocal(req)              — pushes onto shaped_tx_requests
+//   7. RefreshOwnerRGS { owner_rgs: [5] }   — exercise the wider scan
+//   8. VacateAllSharedExactSlots             — flag flip
+//
+// Asserts:
+//   - exported_sequences == [7]                        (single Export queued)
+//   - shaped_tx_requests.len() == 1                    (single ShapedLocal queued)
+//   - vacate_all_shared_exact_slots == true            (Vacate queued)
+//   - cancelled_keys contains the RG5 key once and the RG7 key once
+//     (no duplicates from the repeated Demote(rg=5) and no extra
+//     entries from the second Demote in the same command list).
+
+#[test]
+fn apply_worker_commands_dispatch_order_pin_with_demote_dedup() {
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    let mut sessions = SessionTable::new();
+
+    // Install two sessions on distinct owner RGs (5 and 7) so that
+    // DemoteOwnerRGS [5] and DemoteOwnerRGS [7] each produce one
+    // distinct cancelled key.
+    let key_rg5 = test_key();
+    let mut metadata_rg5 = test_metadata();
+    metadata_rg5.owner_rg_id = 5;
+    assert!(sessions.install_with_protocol_with_origin(
+        key_rg5.clone(),
+        test_decision(),
+        metadata_rg5.clone(),
+        SessionOrigin::ForwardFlow,
+        1_000_000,
+        PROTO_TCP,
+        0x10,
+    ));
+
+    let key_rg7 = SessionKey {
+        // distinct src_port → distinct key
+        src_port: 33333,
+        ..test_key()
+    };
+    let mut metadata_rg7 = test_metadata();
+    metadata_rg7.owner_rg_id = 7;
+    assert!(sessions.install_with_protocol_with_origin(
+        key_rg7.clone(),
+        test_decision(),
+        metadata_rg7.clone(),
+        SessionOrigin::ForwardFlow,
+        1_000_000,
+        PROTO_TCP,
+        0x10,
+    ));
+
+    // Synced entry for the UpsertSynced step.
+    let synced_entry = SyncedSessionEntry {
+        key: SessionKey {
+            src_port: 44444,
+            ..test_key()
+        },
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    };
+
+    // Build a minimal TxRequest for the EnqueueShapedLocal step.
+    let shaped_req = TxRequest {
+        bytes: Vec::new(),
+        expected_ports: None,
+        expected_addr_family: libc::AF_INET as u8,
+        expected_protocol: PROTO_TCP,
+        flow_key: None,
+        egress_ifindex: -1,
+        cos_queue_id: None,
+        dscp_rewrite: None,
+        mirror_clone: false,
+    };
+
+    {
+        let mut pending = commands.lock().expect("commands lock");
+        pending.push_back(WorkerCommand::DemoteOwnerRGS {
+            owner_rgs: vec![5],
+        });
+        pending.push_back(WorkerCommand::UpsertSynced(synced_entry.clone()));
+        pending.push_back(WorkerCommand::DemoteOwnerRGS {
+            owner_rgs: vec![5, 5], // duplicate within the same command
+        });
+        pending.push_back(WorkerCommand::ExportOwnerRGSessions {
+            sequence: 7,
+            owner_rgs: vec![5],
+        });
+        pending.push_back(WorkerCommand::DemoteOwnerRGS {
+            owner_rgs: vec![7],
+        });
+        pending.push_back(WorkerCommand::EnqueueShapedLocal(shaped_req));
+        pending.push_back(WorkerCommand::RefreshOwnerRGS {
+            owner_rgs: vec![5],
+        });
+        pending.push_back(WorkerCommand::VacateAllSharedExactSlots);
+    }
+
+    let forwarding = test_forwarding_state_with_fabric();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let mut ha_state = BTreeMap::new();
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    // Inactive on both RGs so DemoteOwnerRGS demotes them and HA enforcement
+    // doesn't elide the cancellations.
+    ha_state.insert(5, inactive_ha_runtime(now_secs));
+    ha_state.insert(7, inactive_ha_runtime(now_secs));
+
+    let results = apply_worker_commands(
+        &commands,
+        &mut sessions,
+        -1,
+        -1,
+        -1,
+        &forwarding,
+        &ha_state,
+        &dynamic_neighbors,
+    );
+
+    // ── (a) Exports preserved ───────────────────────────────────────────────
+    assert_eq!(results.exported_sequences, vec![7u64]);
+
+    // ── (b) ShapedLocal pushed exactly once ────────────────────────────────
+    assert_eq!(results.shaped_tx_requests.len(), 1);
+
+    // ── (c) Vacate flag flipped ─────────────────────────────────────────────
+    assert!(results.vacate_all_shared_exact_slots);
+
+    // ── (d) DemoteOwnerRGS dedup contract preserved ────────────────────────
+    // Both keys appear exactly once even though Demote{[5,5]} ran with a
+    // duplicate inside one command AND a second Demote{[5]} could have
+    // re-cancelled key_rg5. (key_rg5 was already cleared by the first
+    // Demote so the second Demote sees an empty bucket — the dedup guard
+    // is the belt-and-braces contract that the lifted handler must keep.)
+    let rg5_count = results
+        .cancelled_keys
+        .iter()
+        .filter(|k| **k == key_rg5)
+        .count();
+    let rg7_count = results
+        .cancelled_keys
+        .iter()
+        .filter(|k| **k == key_rg7)
+        .count();
+    assert_eq!(rg5_count, 1, "key_rg5 must appear exactly once in cancelled_keys");
+    assert_eq!(rg7_count, 1, "key_rg7 must appear exactly once in cancelled_keys");
+    // Nothing else got cancelled.
+    assert_eq!(results.cancelled_keys.len(), 2);
+
+    // ── (e) First-occurrence order: RG5 demote precedes RG7 demote ─────────
+    let pos_rg5 = results
+        .cancelled_keys
+        .iter()
+        .position(|k| *k == key_rg5)
+        .expect("rg5 key position");
+    let pos_rg7 = results
+        .cancelled_keys
+        .iter()
+        .position(|k| *k == key_rg7)
+        .expect("rg7 key position");
+    assert!(
+        pos_rg5 < pos_rg7,
+        "DemoteOwnerRGS first-occurrence order must be preserved"
+    );
 }
