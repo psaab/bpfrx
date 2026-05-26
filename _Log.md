@@ -162,6 +162,23 @@
   docs/pr/1355-cos-push-split/plan.md (round-2 minor fixes folded),
   docs/pr/1355-cos-push-split/reviewer-ids.md
 
+## 2026-05-26 — #1355 PR #1590 4-of-4 MERGE-READY; AWAITING-BATCH-MERGE
+
+- **Timestamp**: 2026-05-26 21:50 UTC
+- **Action**: Code-review round 1 returned 4-of-4 MERGE-READY:
+  - Codex (task-mpn5jy3w-gq92x5): MERGE-READY, no blocking findings.
+    Confirmed byte-for-byte parity vs origin/master 63dfe02a, SessionKey
+    borrow fix, NLL re-borrow shape correct, state ordering preserved,
+    codegen-gate empty, snat_contract_doc_guard pre-existing.
+  - Gemini (task-mpn5kiig-rqk14a): MERGE-READY. Confirmed all invariants
+    + active-bucket-by-absence + was_idle short-circuit reorder
+    semantically identical.
+  - Copilot (PRR_kwDORLJrbM8AAAABBFVlLw): COMMENTED, 0 inline findings
+    on 4/4 files.
+  - Claude SMR: gates all pass; pre-existing failure documented.
+- **Posture**: AWAITING-BATCH-MERGE per user mandate (do not auto-merge).
+- **File(s)**: docs/pr/1355-cos-push-split/reviewer-ids.md, _Log.md
+
 ## 2026-05-26 — #1325 implementation pushed
 
 - **Timestamp**: 2026-05-26T (UTC)
