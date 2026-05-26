@@ -1,6 +1,72 @@
 # #1357 — collapse 9-10-param session/flowexport pub fns into context structs
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** DRAFT v2 — addressing Codex round-1 PLAN-KILL findings + Gemini round-1 minor
+
+## v1→v2 changelog
+
+Codex round-1 verdict was PLAN-KILL; Gemini round-1 verdict was
+PLAN-READY-with-minor (`#[inline]` + drop `FlowFinalize`).
+
+Changes in v2:
+
+1. **`SessionUpsert` no longer embeds `SessionInstall`.** Codex flagged
+   the contradiction (v1 said `upsert_synced` takes `SessionUpsert`
+   while pre-filling `origin: SyncImport` inside the body — both
+   cannot be true). v2 drops `upsert_synced` from the refactor
+   entirely: it stays a positional wrapper at 8 params and below
+   threshold today (it does NOT take `&self` plus 7 — counting
+   carefully: `key, decision, metadata, now_ns, protocol, tcp_flags,
+   allow_replace_local` = 7 plus `&mut self` = 8). Since the issue
+   text counts it at 9 with `&mut self`, but engineering-style
+   says "9 params" includes `&self`, this is borderline. v2 keeps it
+   as a positional 8-param wrapper; reviewer may demand inclusion in
+   v3.
+2. **`promote_synced_with_origin` consumes `SessionUpdate`, not
+   `SessionInstall`.** Codex correctly noted that promotion takes
+   `&SessionKey` (borrowed) and delegates to `update_session`. v1
+   would have forced an owned `SessionKey` clone at the production
+   call site `session_glue/mod.rs:1071`. v2 uses the borrowed
+   `SessionUpdate<'a>` for `promote_synced_with_origin` (with
+   `ha_activation: false` baked in by the wrapper body).
+3. **`FlowFinalize` dropped.** Both reviewers say over-factored.
+   `finalize_flow` stays positional. Issue #1357 ramps will need a
+   separate PR if a production caller appears.
+4. **Distinct context structs for install vs update.** v2 defines
+   two structs (`SessionInstall`, `SessionUpdate<'a>`) — no embedding,
+   no shared "context" trap. Each is the input contract for exactly
+   one operation. `upsert_synced_with_origin` reuses `SessionInstall`
+   plus its existing `allow_replace_local` bool — *not* via embedding,
+   just a separate parameter that stays positional. Final API:
+
+   ```rust
+   pub(crate) fn install_with_protocol_with_origin(&mut self, req: SessionInstall) -> bool;
+   pub(crate) fn upsert_synced_with_origin(&mut self, req: SessionInstall, allow_replace_local: bool) -> bool;
+   pub(crate) fn update_session(&mut self, req: SessionUpdate<'_>) -> bool;
+   pub(crate) fn promote_synced_with_origin(&mut self, req: SessionUpdate<'_>) -> bool;
+   ```
+
+   That is 4 fns refactored (not 5). `upsert_synced` (wrapper) stays
+   positional. `finalize_flow` stays positional. Down from 6 fns in
+   v1 to 4 fns in v2.
+5. **`#[inline]` added.** Per Gemini's codegen note,
+   `SessionInstall` is >64 bytes (SessionKey ~37B + SessionMetadata
+   ~24B + scalars) and would otherwise be passed by hidden caller-
+   stack-slot pointer. Add `#[inline]` to all 4 refactored fns to
+   let LLVM SROA flatten the struct materialization at each call
+   site. v2 plan-review must confirm `#[inline]` is sufficient (or
+   upgrade to `#[inline(always)]` for the hot install path).
+6. **Churn count corrected.** v1 said ~42 production + ~25 test.
+   v2 verified: 12 production + 40 test call sites total across all
+   four target fns. Mostly test-call-site churn. PLAN-KILL is still
+   defensible on this basis alone; reviewers should weigh.
+7. **Hot install path scope.** Codex specifically called out
+   `install_with_protocol_with_origin` is per-packet on session open
+   (`afxdp/forwarding/mod.rs:1087`). v2 commits to a release-build
+   `cargo asm` / `objdump -d` check on that fn before/after as
+   part of the implementation gate. If lowering regresses, the
+   implementation rolls back the install fn refactor and keeps only
+   `update_session` + `promote_synced_with_origin` (slow-path) in
+   scope.
 
 ## Issue framing
 
@@ -17,14 +83,19 @@ contract. Five fns redeclaring the same 7-field tuple positionally is
 how field drift happens (issue #1357 cites engineering-style #3:
 "two code paths computing the same denominator WILL drift").
 
-This refactor:
+This refactor (v2 scope, per Codex round-1):
 
-1. introduces `session/ctx.rs` housing `SessionInstall`,
-   `SessionUpsert`, `SessionUpdate` (and `FlowFinalize` in
-   `flowexport.rs`),
-2. rewrites the five session pub fns + `finalize_flow` to take those
-   context structs by value (move),
-3. mechanically migrates ~42 production + ~25 test call sites.
+1. introduces `session/ctx.rs` housing **two** context structs:
+   `SessionInstall` (owned key) and `SessionUpdate<'a>` (borrowed
+   key) — distinct, non-embedding.
+2. rewrites **four** session pub(crate) fns to take those structs:
+   `install_with_protocol_with_origin` (SessionInstall),
+   `upsert_synced_with_origin` (SessionInstall + allow_replace_local),
+   `update_session` (SessionUpdate), and
+   `promote_synced_with_origin` (SessionUpdate). `upsert_synced`
+   (wrapper) and `finalize_flow` stay positional.
+3. mechanically migrates 12 production + 40 test call sites
+   (verified by full-repo grep across all four target fns).
 
 Behaviour is unchanged. No new allocations on the hot path — the
 context structs are plain field aggregates of the same owned values
@@ -83,20 +154,17 @@ verdict**.
 
 ```rust
 //! Context structs used by SessionTable::install/upsert/update
-//! family of fns. Encapsulates the previously-positional 7-9-arg
+//! family of fns. Encapsulates the previously-positional 7-arg
 //! cluster so callers don't drift fields. See #1357.
-//!
-//! Field ordering inside each struct is by *role* (identity →
-//! payload → origin → timing → protocol metadata) so call-site
-//! struct-literal ordering reads naturally.
 
 use super::entry::{SessionDecision, SessionMetadata, SessionOrigin};
 use super::key::SessionKey;
 
-/// Identity + payload + timing for a fresh session install or a
-/// peer-synced upsert. Used as-is by install_with_protocol_with_origin
-/// and promote_synced_with_origin; embedded in SessionUpsert /
-/// SessionUpdate for the variants that need a flag.
+/// Owned identity + payload + timing for a fresh session insert or
+/// a peer-synced upsert (where the caller has just constructed the
+/// key). Used by install_with_protocol_with_origin and
+/// upsert_synced_with_origin (alongside a positional
+/// `allow_replace_local: bool`).
 #[derive(Debug, Clone)]
 pub(crate) struct SessionInstall {
     pub(crate) key: SessionKey,
@@ -108,18 +176,11 @@ pub(crate) struct SessionInstall {
     pub(crate) tcp_flags: u8,
 }
 
-/// Peer-synced upsert: install + a flag that allows clobbering an
-/// existing locally-owned session (used during HA activation).
-#[derive(Debug, Clone)]
-pub(crate) struct SessionUpsert {
-    pub(crate) install: SessionInstall,
-    pub(crate) allow_replace_local: bool,
-}
-
-/// In-place update of an existing session. Differs from
-/// SessionInstall only in that `key` is borrowed (the caller already
-/// owns it for the rest of the upsert path), and the `ha_activation`
-/// flag selects collision-rule strictness.
+/// In-place update or promotion of an existing session. Carries a
+/// borrowed `&'a SessionKey` because the caller already owns the
+/// key on the surrounding update/promote path; cloning it into a
+/// `SessionInstall` would force an unnecessary owned copy at
+/// production call sites (session_glue/mod.rs:1071).
 #[derive(Debug, Clone)]
 pub(crate) struct SessionUpdate<'a> {
     pub(crate) key: &'a SessionKey,
@@ -137,34 +198,17 @@ pub(crate) struct SessionUpdate<'a> {
 
 | Fn | BEFORE (params incl `&mut self`) | AFTER |
 |---|---|---|
-| `install_with_protocol_with_origin` | 8 (`self, key, decision, metadata, origin, now_ns, protocol, tcp_flags`) | 2 (`self, req: SessionInstall`) |
-| `upsert_synced` | 8 (`self, key, decision, metadata, now_ns, protocol, tcp_flags, allow_replace_local`) | 2 (`self, req: SessionUpsert`) — origin pre-filled with `SyncImport` inside the body |
-| `upsert_synced_with_origin` | 9 (`self, key, decision, metadata, origin, now_ns, protocol, tcp_flags, allow_replace_local`) | 2 (`self, req: SessionUpsert`) |
-| `update_session` | 9 (`self, key, decision, metadata, origin, now_ns, protocol, tcp_flags, ha_activation`) | 2 (`self, req: SessionUpdate<'_>`) |
-| `promote_synced_with_origin` | 8 (`self, key, decision, metadata, origin, now_ns, protocol, tcp_flags`) | 2 (`self, req: SessionInstall`) — body wraps in `SessionUpdate{..., ha_activation: false}` and calls `update_session` |
+| `install_with_protocol_with_origin` | 8 (`self, key, decision, metadata, origin, now_ns, protocol, tcp_flags`) | 2 (`self, req: SessionInstall`) — `#[inline]` |
+| `upsert_synced_with_origin` | 9 (`self, key, decision, metadata, origin, now_ns, protocol, tcp_flags, allow_replace_local`) | 3 (`self, req: SessionInstall, allow_replace_local: bool`) — `#[inline]` |
+| `update_session` | 9 (`self, key, decision, metadata, origin, now_ns, protocol, tcp_flags, ha_activation`) | 2 (`self, req: SessionUpdate<'_>`) — `#[inline]` |
+| `promote_synced_with_origin` | 8 (`self, key, decision, metadata, origin, now_ns, protocol, tcp_flags`) — `key: &SessionKey` | 2 (`self, req: SessionUpdate<'_>`) — `#[inline]`; body forces `ha_activation: false` and calls `update_session` |
+| `upsert_synced` (wrapper) | 8 (`self, key, decision, metadata, now_ns, protocol, tcp_flags, allow_replace_local`) | **NOT TOUCHED** — wraps `upsert_synced_with_origin` by constructing the `SessionInstall` itself with `origin: SyncImport`. Stays a positional 8-param thin wrapper. |
 
-For `flowexport.rs::finalize_flow`:
-
-| Fn | BEFORE | AFTER |
-|---|---|---|
-| `finalize_flow` | 9 (`self, src_ip, dst_ip, src_port, dst_port, protocol, bytes, packets, last_seen_ms`) | 2 (`self, req: FlowFinalize`) |
-
-`FlowFinalize` lives **inline at the top of `flowexport.rs`** (it's
-the only file using it; a separate module would be over-factored):
-
-```rust
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct FlowFinalize {
-    pub(crate) src_ip: IpAddr,
-    pub(crate) dst_ip: IpAddr,
-    pub(crate) src_port: u16,
-    pub(crate) dst_port: u16,
-    pub(crate) protocol: u8,
-    pub(crate) bytes: u64,
-    pub(crate) packets: u64,
-    pub(crate) last_seen_ms: u32,
-}
-```
+**`flowexport.rs::finalize_flow` is dropped from this refactor.**
+Both reviewers (Codex round-1 + Gemini round-1) flagged it as
+over-factored — the fn has 1 test-only caller and zero production
+callers. A separate PR can context-struct it when a production
+caller appears.
 
 ### `install_with_protocol` (6-param non-origin wrapper at line 627)
 
