@@ -1,6 +1,29 @@
 # #1546 — Split filter engine into responsibility-scoped submodules
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + AGY).
+**Status:** v2 — addresses Codex r1 NEEDS-MAJOR + AGY r1 NEEDS-MINOR. Pending r2.
+
+### v1 -> v2 changes (round-1 findings addressed)
+
+1. **Rustc/inlining wording softened.** v1 claimed CGU-local inlining;
+   reality is `#[inline]` is a hint, CGU partitioning *is* per-source-
+   module, and rustc relies on ThinLTO + the inline attribute to fold
+   across modules. Wording updated in invariant 6 to reflect this.
+2. **Policer atomic-ordering invariant rewritten.**
+   `ThreeColorPolicerState::meter()` is `&mut self`, not atomic. The
+   shared wrapper `ThreeColorPolicerRuntime::meter()` is `&self` but
+   serializes via `Mutex`, with relaxed counters. Invariant 7 rewritten.
+3. **`interface_filter_affects_route_lookup` moved to `eval.rs`.**
+   Codex correctly identified this as a precheck for
+   `evaluate_interface_filter_routing_instance_event_counted` (called
+   together from `afxdp/forwarding/mod.rs:929` then `:936`). It is not
+   a cache-coherency predicate; it is part of the routing-instance
+   evaluation path. Placement table updated below.
+4. **Tests move to sibling `*_tests.rs` files.** Both reviewers
+   independently flagged that inline `#[cfg(test)] mod tests` violates
+   the project's modularity-discipline. The project pattern is
+   `userspace-dp/src/afxdp/forwarding_build_tests.rs`-style sibling
+   files loaded via `#[cfg(test)] #[path = "..._tests.rs"] mod tests;`.
+   Open question 6 resolved in favor of sibling files.
 
 ## Issue framing
 
@@ -149,6 +172,10 @@ through `mod.rs`):
 - `evaluate_interface_filter_log_match` *(pub(crate))*
 - `evaluate_interface_filter_routing_instance_counted` *(pub(crate))*
 - `evaluate_interface_filter_routing_instance_event_counted` *(pub(crate))*
+- `interface_filter_affects_route_lookup` *(pub(crate))* — moved from
+  cache_sensitive.rs per Codex r1 #4; this is the precheck paired with
+  `evaluate_interface_filter_routing_instance_event_counted`
+  (afxdp/forwarding/mod.rs:929 + :936). Not a cache predicate.
 - `evaluate_interface_output_filter` *(pub(crate))*
 - `evaluate_interface_output_filter_counted` *(pub(crate))*
 
@@ -176,7 +203,7 @@ through `mod.rs`):
 - `input_dscp_filter_families_changed` *(pub(crate))*
 - `interface_input_filter_has_dscp_match` *(pub(crate))*
 - `interface_output_filter_has_dscp_match` *(pub(crate))*
-- `interface_filter_affects_route_lookup` *(pub(crate))*
+(NOTE v2: `interface_filter_affects_route_lookup` moved to eval.rs.)
 
 **`engine/policer.rs`** (engine-internal three-color policer
 *application*; NOT the standalone runtime):
@@ -213,6 +240,7 @@ pub(crate) use eval::{
     evaluate_interface_filter_routing_instance_counted,
     evaluate_interface_filter_routing_instance_event_counted,
     evaluate_interface_output_filter, evaluate_interface_output_filter_counted,
+    interface_filter_affects_route_lookup,
 };
 pub(crate) use tx_selection::{
     evaluate_filter_ref_tx_selection_counted,
@@ -229,7 +257,6 @@ pub(crate) use cache_sensitive::{
     input_dscp_filter_families_changed,
     interface_input_filter_has_dscp_match,
     interface_output_filter_has_dscp_match,
-    interface_filter_affects_route_lookup,
 };
 pub(crate) use policer::{
     apply_cached_three_color_policers,
@@ -311,28 +338,53 @@ above is the union of every existing `pub(crate) fn` in engine.rs.
      → `term_matches_v{4,6}` (inner loop, `#[inline(always)]`)
      → `apply_term_three_color_policer` (`#[inline]`)
      → return `TxSelectionFilterResult`.
-   After the split, all four functions are in **different files**.
-   This concerns the user. Mitigation: `#[inline]` /
-   `#[inline(always)]` cross-module inlining is preserved by the
-   Rust compiler because (a) we keep the attributes verbatim, and
-   (b) the new `engine/*` files compile as part of the same crate
-   and same `cargo build` invocation. LTO is not required for
-   single-crate cross-module inlining of `#[inline]` items —
-   rustc's CGU mechanism inlines `#[inline]` items across modules
-   within a CGU, and `#[inline(always)]` is honored across CGUs.
+   After the split, all four functions live in different files.
+   The plan preserves `#[inline]` / `#[inline(always)]` attributes
+   verbatim on every moved function.
+
+   **Honest framing of the compiler guarantee (v2 correction):**
+   Per the [Rust Reference codegen attributes](https://doc.rust-lang.org/reference/attributes/codegen.html#the-inline-attribute),
+   `#[inline]` is a **hint**, not a guarantee. rustc's CGU
+   partitioner (per the [rustc dev guide on monomorphization](https://rustc-dev-guide.rust-lang.org/backend/monomorph.html))
+   creates CGUs per source-level module, so this split *does*
+   change CGU layout. However, by default rustc enables local
+   ThinLTO across CGUs in optimized builds (the project builds
+   with the default release profile), which lets LLVM fold
+   `#[inline]` items across CGU boundaries; `#[inline(always)]`
+   is honored across CGUs unconditionally because rustc serializes
+   the MIR into the importing CGU. v1's claim that the split was
+   "in the same CGU" was wrong; the correct claim is that
+   `#[inline(always)]` items are guaranteed inlineable cross-CGU
+   and `#[inline]` items are inlineable subject to ThinLTO
+   coverage, which the release profile enables.
+
    **Reviewers: please attack this.** If a reviewer can demonstrate
    a measurable I-cache miss spike from this split (perf
    `instructions:u` / `L1-icache-load-misses:u` on the userspace-dp
    binary's filter hot path), the right action is to either (a)
    collapse `matching.rs` into `eval.rs` and `tx_selection.rs`
    (duplicating the three small functions — they are 25-30 LOC
-   each) or (b) PLAN-KILL.
-7. **Policer atomic ordering.** `ThreeColorPolicerRuntime::meter()`
-   uses `compare_exchange_weak` with `AcqRel`/`Acquire` on the
-   token bucket atomic; that is **inside `filter/policer.rs`** and
-   unchanged. The engine helpers only call `meter()`; their move
-   to `engine/policer.rs` does not touch the runtime ordering.
-   **Reviewers: confirm `filter/policer.rs` is untouched.**
+   each) or (b) PLAN-KILL. AGY r1 explicitly verified no L1-i
+   regression risk based on the `#[inline(always)]` attributes
+   plus rustc's cross-crate inline serialization.
+7. **Policer concurrency invariant (v2 correction).**
+   `ThreeColorPolicerState::meter()` is `&mut self` (no atomics).
+   The shared wrapper `ThreeColorPolicerRuntime::meter()` is
+   `&self` but serializes via a `Mutex<ThreeColorPolicerState>`;
+   token-bucket invariants are protected by the Mutex, not by
+   atomic compare-exchange. Counter increments after `meter()`
+   are relaxed-ordering atomic increments on
+   `ThreeColorPolicerCounters`. v1 incorrectly described this as
+   atomic compare-exchange ordering. The engine helpers
+   (`apply_term_three_color_policer`, `apply_cached_three_color_policers`)
+   call `runtime.meter()` once per packet and then act on the
+   returned `ThreeColorDecision`; moving them to
+   `engine/policer.rs` does not change the lock-acquisition
+   pattern, the relaxed counter ordering, or the
+   `meter()`-then-counter-record sequence.
+   **Reviewers: confirm `filter/policer.rs` is untouched** and
+   that the only file declaring a `Mutex<ThreeColorPolicerState>`
+   remains `filter/mod.rs`.
 
 ## Risk assessment
 
@@ -364,12 +416,22 @@ above is the union of every existing `pub(crate) fn` in engine.rs.
   even though the new `engine/policer.rs` is namespace-adjacent.
   Rationale: existing import path stability + the two files have
   clearly distinct doc comments.
-- **No** test split. `filter/tests.rs` stays at 1919 LOC. Per-module
-  tests (per #1546 acceptance criterion 2) live as **new** modules
-  inside each `engine/*.rs` file with `#[cfg(test)]`, not as
-  separate files. This keeps the existing test suite untouched and
-  layers focused unit tests on top, which is the project's
-  established `mod tests { use super::*; }` pattern.
+- **No** edit to `filter/tests.rs`. It stays at 1919 LOC. Per-module
+  tests (per #1546 acceptance criterion 2) live as **sibling
+  `*_tests.rs` files** under `filter/engine/`, loaded via
+  `#[cfg(test)] #[path = "<name>_tests.rs"] mod tests;` from the
+  parent module. This matches the project's modularity-discipline
+  pattern (e.g. `userspace-dp/src/afxdp/forwarding_build_tests.rs`,
+  `userspace-dp/src/afxdp/bpf_map_tests.rs`,
+  `userspace-dp/src/afxdp/flow_cache_tests.rs`). v1's inline
+  `#[cfg(test)] mod tests` proposal was rejected by both Codex r1
+  and AGY r1 as a modularity-discipline violation. Concretely, the
+  initial PR will add an empty sibling test file alongside each new
+  module — actual test coverage for the acceptance-criterion-2
+  scenarios (add/remove/same-ifindex content change/positional-ID
+  stability/policer runtime-shape changes) is in scope; placeholder
+  empty files for the other modules are out of scope and added only
+  if the acceptance-criteria demand them.
 - **No** API surface reduction. Every `pub(crate) fn` in engine.rs
   remains `pub(crate)` after the split.
 - **No** change to `filter/compiler.rs` or `filter/mod.rs` data
@@ -416,15 +478,18 @@ above is the union of every existing `pub(crate) fn` in engine.rs.
    any DSCP-sensitive comparison itself. Counterargument: this is
    actually a pure predicate, belongs in `eval.rs` or `tx_selection.rs`.
    **Argue this.**
-6. **Per-module `#[cfg(test)]` test placement vs the existing
-   `tests.rs` aggregator.** Issue acceptance criterion 2 says
-   "Cache-sensitive comparison helpers live in one module with
-   tests covering [list]". We propose `#[cfg(test)] mod tests {
-   ... }` inside `engine/cache_sensitive.rs`. **Reviewers: argue
-   for a separate `engine/cache_sensitive_tests.rs` file** if the
-   `tests.rs` aggregator pattern is project-mandated; we did not
-   find a CLAUDE.md / engineering-style.md rule forbidding inline
-   `mod tests`.
+6. **Per-module test placement (v2: RESOLVED).** v1 proposed inline
+   `#[cfg(test)] mod tests { ... }` inside each `engine/*.rs`. Both
+   reviewers independently flagged that the project's modularity-
+   discipline standard uses sibling `*_tests.rs` files loaded via
+   `#[cfg(test)] #[path = "..._tests.rs"] mod tests;`. v2 adopts
+   the sibling-file pattern. Open for re-review: should this PR
+   create empty placeholder sibling files for each of matching,
+   eval, tx_selection, policer (which acceptance criterion 2 does
+   not explicitly require tests for), or only for cache_sensitive?
+   Default: only cache_sensitive, since that is the only module
+   with explicit AC-2 test coverage requirements; the others
+   continue to be covered by `filter/tests.rs`.
 7. **`policer_drop` action ordering.** When both
    `term.dscp_rewrite` and `policer_action.dscp_rewrite` are set,
    `evaluate_filter_ref_tx_selection_counted_v{4,6}` uses
