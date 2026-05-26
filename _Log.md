@@ -26,6 +26,15 @@
   rewrote public-API section to match the narrow 7-item
   pub(super) re-export in types/mod.rs verbatim, added README +
   test header doc-cleanup to test plan.
+- **17:53 UTC** — Codex r2 PLAN-NEEDS-MINOR (3 textual fixes:
+  stale '#[inline] preserves codegen' in risk table, release LTO
+  claim with no Cargo.toml backing, stale 'pub(in crate::afxdp)'
+  in mod.rs adjustments + non-re-exported items still listed as
+  examples, plus binary-size check promised but not in test
+  plan).
+- **17:57 UTC** — Revised to v3: cleaned all three flagged sites,
+  removed release-LTO crutch, added binary-size spot check #6 to
+  test plan.
 
 ## 2026-05-26 — #1325 implementation pushed
 

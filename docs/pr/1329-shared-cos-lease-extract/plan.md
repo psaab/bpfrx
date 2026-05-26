@@ -1,10 +1,13 @@
 # #1329 — shared_cos_lease.rs hot-fn extract — Plan
 
-**Status:** DRAFT v2 — addresses Codex r1 PLAN-NEEDS-MINOR fixes
-(#[inline] codegen claim softened, sibling-import import path made
-explicit, modularity-discipline LOC threshold corrected, public-API
-re-export list audit corrected to match `types/mod.rs` reality).
-AGY r1 PLAN-READY.
+**Status:** DRAFT v3 — addresses Codex r2 PLAN-NEEDS-MINOR cleanup
+(stale `#[inline] preserves codegen` text removed from risk table
+and Hidden invariants, release LTO claim removed because
+userspace-dp/Cargo.toml has no LTO setting, stale
+`pub(in crate::afxdp)` description of the re-export list and
+non-re-exported-items example list removed, binary-size spot
+check added to test plan). Codex r1+r2 are 4-of-4 textual cleanup
+rounds on a pure-move plan; AGY r1 PLAN-READY held since v1.
 
 ## Issue framing
 
@@ -68,9 +71,12 @@ moved fns **strongly hint** inlining but are not a byte-equivalence
 proof — rustc/LLVM treats `#[inline]` as a hint, and codegen-unit
 partitioning can theoretically change. In practice both functions
 have exactly one call site each so the compiler-driven inlining
-decision is the same pre/post; release LTO further normalizes this.
-Codegen-unit boundary stays inside the `shared_cos_lease` module
-tree (sibling submodules of `mod.rs`, not separate crates).
+decision is expected to stay the same pre/post. (`userspace-dp`
+`Cargo.toml` does not set explicit LTO, so there is no LTO crutch —
+the inlining decision rests entirely on rustc's intra-crate
+heuristics, which `#[inline]` only nudges.) Codegen-unit boundary
+stays inside the `shared_cos_lease` module tree (sibling
+submodules of `mod.rs`, not separate crates).
 
 Cost: zero allocations introduced, zero atomic-ordering edits,
 zero public-API surface change (the `pub(in crate::afxdp) use`
@@ -200,15 +206,26 @@ the move alone shouldn't bundle. The function as a whole is **hot**
 
 ### `mod.rs` adjustments
 
-The crate-private `pub(in crate::afxdp) use shared_cos_lease::{...}`
-re-export list in `userspace-dp/src/afxdp/types/mod.rs` stays
-byte-identical because:
+The narrow `pub(super) use shared_cos_lease::{...}` re-export list
+in `userspace-dp/src/afxdp/types/mod.rs` stays byte-identical:
 
-- Items currently re-exported (e.g. `SharedCosLease`, `SharedCoSRootLease`,
-  `V8RateMode`, `V8EqualFlowFailOpenReason`, `EPOCH_DURATION_NS`, etc.)
-  all live in `mod.rs` of the new dir module, not in the new submodules.
-- `maybe_rotate_epoch_v8` and `publish_equal_flow_epoch_v8` are NOT
-  in the re-export list (they are internal-only).
+```rust
+pub(super) use shared_cos_lease::{
+    NOT_PARTICIPATING, PaddedVtimeSlot, SharedCoSExactBacklog,
+    SharedCoSQueueLease, SharedCoSQueueVtimeFloor,
+    SharedCoSRootLease, V8RateMode,
+};
+```
+
+- All 7 items in that list live in `shared_cos_lease/mod.rs` of
+  the new dir module, not in either submodule.
+- `maybe_rotate_epoch_v8` and `publish_equal_flow_epoch_v8` are
+  NOT in this list (they are internal-only).
+- Items like `V8EqualFlowFailOpenReason`, `EPOCH_DURATION_NS`,
+  `SharedCoSEpochState`, etc. are **defined** in
+  `shared_cos_lease/mod.rs` post-move but are **not** in the
+  `pub(super) use` list above — their existing `pub(in crate::afxdp)`
+  / module-private visibility is preserved verbatim.
 
 The two `mod` declarations inside `mod.rs`:
 
@@ -313,9 +330,9 @@ exactly as on master.
 
 | Risk class | Verdict | Reasoning |
 |---|---|---|
-| Behavioral regression | **LOW** | Pure move; bodies byte-identical; ordering preserved; #[inline] preserves codegen. Test suite (1009 LOC) covers the rotation state machine and unchanged. |
+| Behavioral regression | **LOW** | Pure move; bodies byte-identical; atomic ordering preserved (constants and op sequence unchanged); `#[inline]` is a hint, not a codegen guarantee, but cannot affect behavior. Test suite (1009 LOC) covers the rotation state machine and is unchanged. |
 | Lifetime / borrow-checker | **LOW** | `&self`-method and free-fn signatures preserved; `pub(super)` visibility widening is the only change. No new references, no new lifetimes. |
-| Performance regression | **LOW** | `#[inline]` explicitly preserves the inlining that was implicit in master. No new allocations. No new atomic ops. No new branches. |
+| Performance regression | **LOW** | `#[inline]` hints at the same inlining decision the compiler made implicitly on master (single call site each). No new allocations. No new atomic ops. No new branches. Inlining drift is theoretically possible but caught by per-class CoS smoke + binary-size spot check. |
 | Architectural mismatch (#946 Phase 2 / #961 pattern) | **LOW** | This is NOT a state-machine redesign. This is NOT a control-flow split (we are moving the fns as opaque units, not splitting them into try_claim/snapshot/publish phases per the issue body's suggestion). The fn-split refactor the issue body sketches **is out of scope here**. |
 
 ## Test plan
@@ -332,7 +349,12 @@ exactly as on master.
    updates this table to the new directory layout in the same PR.
    The `shared_cos_lease_tests.rs` header comment that references
    the old sibling path is updated to the new in-dir path.
-6. **Smoke on loss userspace cluster** — deferred to AWAITING-BATCH-MERGE
+6. **Binary-size spot check.** Capture
+   `ls -la /dev/shm/cargo/release/userspace-dp` (or equivalent
+   release artifact) pre- and post-move. Any non-trivial size
+   delta (more than ~0.5%) is investigated as a potential
+   inlining-drift signal before merge.
+7. **Smoke on loss userspace cluster** — deferred to AWAITING-BATCH-MERGE
    per Wave-3 retirement-chain rule. The PR records the build+test
    matrix; one comprehensive batch smoke runs at end of wave.
 
