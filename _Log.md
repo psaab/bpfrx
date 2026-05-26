@@ -4185,3 +4185,16 @@
     findings. Substantive findings preserved; impl deferred to
     after plan v2 PLAN-READY.
   - **File(s)**: docs/pr/1440-header-serialization-consolidate/plan.md
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Plan-review convergence on v2.2 (commit af3bef03):
+    Gemini r3 PLAN-READY (independent checksum re-derivation matches
+    0x2655; all 5 findings verified). AGY r2 PLAN-NEEDS-MINOR
+    (3 stale Option<u16> refs) — resolved in v2.1. Codex r3
+    PLAN-NEEDS-MAJOR (3 stale v1-design refs) — resolved in v2.2.
+    Codex r4/r5/r6 infra-blocked (sandbox-binary missing 4×). Per
+    feedback_gemini_infra_outage_merge_policy: 3× infra fails ⇒
+    move forward without that reviewer at plan stage; will re-
+    attempt Codex at code-review stage on the impl PR. Proceeding
+    to implementation per plan v2.2.
+  - **File(s)**: docs/pr/1440-header-serialization-consolidate/plan.md
