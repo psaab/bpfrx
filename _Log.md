@@ -1,5 +1,34 @@
 # Action Log
 
+## 2026-05-26 — #1326 Phase 1 implementation + PR-prep
+
+- **Timestamp**: 2026-05-26T (round 6 PLAN-READY, then implementation)
+  - **Action**: Codex r5 returned PLAN-NEEDS-MINOR with one wording
+    fix at plan.md:697 ("&mut state.dbg_state ONLY" wording
+    inconsistent with the v3.3 changelog). Fixed in v3.4
+    (commit 6f384430). Codex r6 (task-mpmwdrx4-kpdreh) confirmed
+    PLAN-READY. AGY r4 already PLAN-READY since v3.2. Both
+    reviewers PLAN-READY on v3.4 — cleared to implement.
+  - **Implementation**: Phase-1 file-level extraction shipped. The
+    1278-LOC `worker_loop` body moved verbatim from worker/mod.rs
+    (L995-L2273) to a new `worker/loop_body/mod.rs`. `mod.rs` now
+    has `mod loop_body; pub(crate) use loop_body::worker_loop;` and
+    drops the body. mod.rs LOC: 2635 → 1359. Pure code motion;
+    cargo check clean; 1487 tests pass (one pre-existing master-
+    state doc-guard failure unrelated to this PR — same failure on
+    origin/master at 936b076d).
+  - **Deferred**: per-stage carve into setup.rs + tick.rs +
+    poll_drive.rs + debug_report.rs is the eventual target
+    architecture but deferred to follow-up PRs. Rationale documented
+    in plan.md "Deferred to follow-up tickets" section: risk
+    isolation (single-file move is provably semantic-equivalent),
+    reviewer concerns only apply to sub-fn extraction (not file-level),
+    and incremental landing matches #959/#1189 pattern.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md,
+    userspace-dp/src/afxdp/worker/mod.rs,
+    userspace-dp/src/afxdp/worker/loop_body/mod.rs (new)
+
 ## 2026-05-26 — #1326 plan v3.3 — Codex r4 doc-consistency fixes
 
 - **Timestamp**: 2026-05-26T (round 4 reviews returned)

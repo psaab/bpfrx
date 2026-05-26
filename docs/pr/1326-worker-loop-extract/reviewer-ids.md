@@ -24,7 +24,14 @@ re-dispatching.
 - Codex: task-mpmw4sj7-dxkyqo — completed, PLAN-NEEDS-MINOR (3 doc-consistency items addressed in v3.3)
 - AGY: review-mpmw4xjc-92bdff — completed, PLAN-READY
 
-## Plan review (round 5, on commit TBD — v3.3)
+## Plan review (round 5, on commit 586b3095 — v3.3)
 
-- Codex: pending dispatch
-- AGY: not strictly required (r4 already PLAN-READY); re-dispatching for re-confirmation on v3.3
+- Codex: task-mpmwas32-bbysnd — completed, PLAN-NEEDS-MINOR (1 final wording fix in v3.4)
+- AGY: not re-dispatched — r4 already PLAN-READY on substantive content
+
+## Plan review (round 6 — FINAL, on commit 6f384430 — v3.4)
+
+- Codex: task-mpmwdrx4-kpdreh — **PLAN-READY**
+- AGY: r4 review-mpmw4xjc-92bdff — **PLAN-READY** (still valid on v3.4 since v3.3→v3.4 was wording-only)
+
+**Both reviewers PLAN-READY. Cleared to implement.**

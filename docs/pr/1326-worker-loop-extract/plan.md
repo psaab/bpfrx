@@ -1,6 +1,48 @@
 # #1326 — Extract worker_loop body into worker/loop_body/
 
-**Status:** DRAFT v3.3 — Codex r4 doc-consistency findings addressed
+**Status:** v4.0 PLAN-READY (Codex r6 + AGY r4); SHIPPED as Phase 1 (file-level extraction). Per-stage carve-out (setup.rs / tick.rs / poll_drive.rs / debug_report.rs) deferred to follow-up tickets.
+
+### Shipped scope (this PR, #1326 Phase 1)
+
+The single-file extraction: `worker_loop` body moved verbatim from
+`userspace-dp/src/afxdp/worker/mod.rs` (L995-L2273) to a new
+`worker/loop_body/mod.rs`. `mod.rs` adds `mod loop_body;
+pub(crate) use loop_body::worker_loop;` and drops the body.
+
+This achieves:
+- mod.rs LOC: 2635 → 1359 (the headline modularity-gate concern)
+- Directory module layout established: `worker/loop_body/`
+- Pure code motion: zero behavioral changes
+- All 1487 cargo tests pass (one pre-existing master-state doc-guard
+  failure on `snat_contract_documents_current_fail_closed_runtime`
+  is unrelated to this PR — same failure occurs on origin/master at
+  commit 936b076d, confirmed by checkout).
+
+### Deferred to follow-up tickets
+
+The per-stage carve-out into `setup.rs` + `tick.rs` + `poll_drive.rs`
++ `debug_report.rs` (the eventual target architecture documented
+below) is intentionally deferred. Reasons:
+
+1. **Risk isolation.** The single-file move is provably semantic-
+   equivalent (literal text relocation). Each per-stage carve is a
+   real refactor that needs its own narrow-borrow / inlining review.
+2. **Reviewer concerns scoped.** All substantive findings from r1-r6
+   (LLVM borrow shape, DebugReportState bundle, hybrid inlining,
+   `#[inline(always)]` correctness, CoS rebuild predicate
+   completeness) apply only when sub-functions exist. The single-
+   file move has no sub-functions and thus no borrow / inline issues
+   — orthogonal to the issue body's modularity-gate concern, which
+   is now satisfied (mod.rs is under 2000 LOC).
+3. **Incremental landing.** This pattern matches #959 BindingWorker
+   decomposition (shipped across 11 phase PRs over months) and
+   #1189 Coordinator decompose Phase 1 (shipped 1 of N phases per
+   PR).
+
+The remainder of this plan documents the eventual 5-file target
+architecture for the deferred follow-up PRs.
+
+### v3.3 → v4.0 changelog
 
 ### v3.2→v3.3 changelog
 
