@@ -4259,3 +4259,7 @@
 - **Timestamp**: 2026-05-26 19:55 UTC
 - **Action**: Add `_Log.md merge=union` gitattribute to eliminate the rebase-loop drag during multi-PR refactor waves. 3 consecutive Wave-2 PRs (#1575, #1572, #1579) hit `_Log.md` chronological-append conflicts requiring sub-agent rebase + reviewer carry-forward. The union merge driver keeps both sides verbatim, which is semantically correct since each PR's _Log entries are independent.
 - **File(s)**: .gitattributes (new), _Log.md (this entry)
+
+- **Timestamp**: 2026-05-26 20:14 UTC
+- **Action**: Address AGY r1 NEEDS-MINOR on PR #1582 — git's `merge=union` deduplicates identical lines, so date-only timestamps could collide and produce malformed log entries. Updated CLAUDE.md Logging Rules to mandate `HH:MM UTC` minute-precision timestamps; strengthened .gitattributes comment with explicit deduplication warning + cross-reference.
+- **File(s)**: CLAUDE.md (Logging Rules section), .gitattributes (comment expansion), _Log.md (this entry)

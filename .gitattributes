@@ -4,6 +4,15 @@
 # constraint between PRs), so union-merge (keep both sides verbatim) is
 # the semantically correct strategy.
 #
+# IMPORTANT — Identical-line deduplication risk:
+# Git's built-in 'union' driver deduplicates IDENTICAL lines on both sides
+# of a 3-way merge. If two PRs both append entries starting with the EXACT
+# same line (e.g. a date-only timestamp `- **Timestamp**: 2026-05-26`), the
+# duplicate line is collapsed and the subsequent Action/File lines get
+# interleaved under one timestamp, producing a malformed entry. CLAUDE.md
+# Logging Rules now mandates `HH:MM UTC` minute-precision timestamps to
+# guarantee each entry's first line is unique, eliminating this risk.
+#
 # See feedback_smoke_serialized_single_agent §5 (carry-forward fast-path):
 # when the post-rebase delta is _Log.md-only, all 4 reviewer attestations
 # carry forward. With merge=union the conflict doesn't fire in the first

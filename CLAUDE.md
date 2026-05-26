@@ -34,9 +34,18 @@ gotchas that repeatedly bite (deploy wipes CoS, iperf3 target, etc.).
 ## Logging Rules
 - Maintain a log of all major actions in `_Log.md`.
 - Use YAML or Markdown bullet points for structure:
-    - **Timestamp**: [Time]
+    - **Timestamp**: YYYY-MM-DD HH:MM UTC (e.g. `2026-05-26 19:55 UTC`)
     - **Action**: [Brief Description]
     - **File(s)**: [Modified Files]
+- **Timestamp precision is mandatory**: `HH:MM UTC` (minute-precision) at minimum.
+  `_Log.md` is configured with `merge=union` (see `.gitattributes`) so parallel
+  PRs auto-resolve their _Log entries without rebase conflicts. The union merge
+  driver deduplicates IDENTICAL lines on both sides, which would silently
+  corrupt log entries if two PRs both used a date-only timestamp like
+  `2026-05-26`. Minute-precision (or PR-number-suffixed) timestamps make the
+  first line of each entry unique, ensuring union-merge keeps both entries
+  intact. Use seconds (`HH:MM:SS UTC`) or include the PR number on the
+  timestamp line if entries land within the same minute.
 - Log every `[Write|Edit]` action.
 - **Go**: Use `slog.Debug` for high-frequency/diagnostic messages (HA watchdog sync, per-session traces). Use `slog.Info` only for state transitions and one-time events. HA watchdog sync was flooding at 15 req/s with `slog.Info` — caused 35K+ log lines per session and drowned real diagnostics.
 - **Rust helper**: `eprintln!("xpf-ha: ...")` goes to journald via stderr. Use sparingly — remove debug eprints before committing. Keep per-worker `RefreshOwnerRGs`/`FlushFlowCaches` logs (they fire rarely, only on RG transitions).
