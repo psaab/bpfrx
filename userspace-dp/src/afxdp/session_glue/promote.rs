@@ -5,11 +5,15 @@ use super::*;
 /// 17-param `maybe_promote_synced_session` and 11-param
 /// `purge_translated_synced_hit` signatures that triggered #1346.
 ///
-/// `Copy` because the struct is 5 `&`-references (= 40 bytes on
+/// `Copy` because the struct is 4 `&`-references (= 32 bytes on
 /// x86-64) with no destructor. Passing it by value at the 3 call
-/// sites in `resolve_flow_session_decision` compiles to identical
-/// register/stack use vs. passing the 5 references individually.
-/// Verified with `cargo asm` (see PR body).
+/// sites in `resolve_flow_session_decision` should compile to the
+/// same register/stack use vs. passing the 4 references
+/// individually. Note: `cargo-asm 0.1.16` panics parsing this
+/// codebase's symbols, so a programmatic before/after asm diff was
+/// not produced. The zero-cost claim rests on the structural
+/// argument (Copy + pointer-sized fields + no Drop) and is
+/// empirically gated by the smoke-plus-test-failover pass in the PR.
 #[derive(Clone, Copy)]
 pub(in crate::afxdp::session_glue) struct SharedSessionRefs<'a> {
     pub sessions: &'a Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,

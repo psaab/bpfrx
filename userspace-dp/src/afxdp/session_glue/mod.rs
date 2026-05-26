@@ -321,7 +321,7 @@ pub(super) fn purge_sessions_for_input_dscp_filter_revalidation(
     purged
 }
 
-pub(super) fn publish_worker_session_map_entry(
+pub(in crate::afxdp::session_glue) fn publish_worker_session_map_entry(
     session_map_fd: c_int,
     forwarding: &ForwardingState,
     key: &SessionKey,
@@ -405,7 +405,10 @@ pub(super) fn delete_terminal_filtered_session(
     );
 }
 
-pub(super) fn export_forward_sessions_for_owner_rgs(sessions: &mut SessionTable, owner_rgs: &[i32]) {
+pub(in crate::afxdp::session_glue) fn export_forward_sessions_for_owner_rgs(
+    sessions: &mut SessionTable,
+    owner_rgs: &[i32],
+) {
     if owner_rgs.is_empty() {
         return;
     }
@@ -870,8 +873,10 @@ pub(super) fn resolve_flow_session_decision(
     // Bundle the four shared-session refs once per call. `SharedSessionRefs`
     // is `#[derive(Copy)]`, so the three downstream uses below
     // (purge_translated_synced_hit + 2× maybe_promote_synced_session) each
-    // get a free by-value copy — same codegen as the explicit-argument form
-    // (#1346 plan v2 §4.3, verified via cargo asm before/after).
+    // get a free by-value copy — structurally same codegen as the
+    // explicit-argument form (4 pointer-sized fields, no Drop). cargo-asm
+    // 0.1.16 cannot parse this codebase's symbols, so the empirical gate
+    // is the smoke-plus-test-failover pass on the loss userspace cluster.
     let shared = SharedSessionRefs {
         sessions: shared_sessions,
         nat_sessions: shared_nat_sessions,
