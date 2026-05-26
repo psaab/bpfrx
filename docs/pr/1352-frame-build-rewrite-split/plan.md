@@ -1,6 +1,80 @@
 # #1352 Step 1 — Split `frame/mod.rs` 236-LOC `build_forwarded_frame_into_from_frame` + 223-LOC `apply_rewrite_descriptor` into `frame/{build,rewrite}/` by address family
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + AGY).
+**Status:** v2 — addresses Codex r1 PLAN-NEEDS-MAJOR (codegen parity not
+established + deferred batch smoke insufficient) and AGY r1
+PLAN-NEEDS-MINOR (mandate `#[inline(always)]` + add codegen
+verification step + plan wording on `rewrite_apply_v4/v6` caller
+separation). Pending r2.
+
+## Round-1 review disposition
+
+Codex r1 ([task-mpmyvdz3-7x6rhd](docs/pr/1352-frame-build-rewrite-split/reviewer-ids.md)) returned PLAN-NEEDS-MAJOR with 2 major + 1 minor finding. AGY r1
+([adversarial-review-mpmz4yjh-gerhrw](docs/pr/1352-frame-build-rewrite-split/reviewer-ids.md)) returned PLAN-NEEDS-MINOR with the
+same two architectural axes flagged but ranked minor.
+
+1. **Codex Major #1 / AGY #1 — codegen parity not established by
+   `#[inline]`.** Both reviewers walked the System V AMD64 ABI for
+   the proposed 8-param signature and confirmed:
+   - `ForwardPacketMeta` is a 28-byte aggregate (AGY counted bytes
+     against `userspace-dp/src/afxdp/types/mod.rs:143-159`); passed
+     by value it consumes ~4 register slots OR spills to stack.
+   - At 8 flat params + the meta aggregate, two scalars
+     (`tunnel_tcp_mss`, `force_tunnel_l4_recompute`) AND the meta
+     spill to the stack when the helper is NOT inlined.
+   - `#[inline]` is a hint not a contract; LLVM may decline to
+     inline a ~85-LOC body that's called from a single dispatcher
+     site.
+   - **Resolution:** v2 mandates `#[inline(always)]` on the
+     per-family helpers. AGY's argument is decisive: each
+     per-family helper has exactly one call site (inside its
+     orchestrator), so `#[inline(always)]` carries zero i-cache
+     bloat from duplication. SROA + SSA at the inlined site
+     turns the flat-param list into independent register-class
+     scalars, bypassing the ABI register classification entirely.
+   - Plan keeps the flat-param signature (Option A, AGY §1) NOT
+     a `&FrameBuildCtx` (Option B). Reason: a by-reference ctx
+     forces LLVM to keep ctx-field loads behind a pointer
+     unless it can prove no-alias with the `&mut [u8] out`
+     buffer — which requires walking unsafe blocks in sibling
+     modules. Flat params + `#[inline(always)]` is the codegen
+     contract.
+
+2. **Codex Major #2 — deferred batch smoke insufficient for
+   hot-path codegen claim.** Both reviewers flagged that
+   wave-end batch smoke cannot isolate a 1-2% line-rate regression
+   to this PR. **Resolution:** v2 adds a per-PR codegen
+   verification step BEFORE merge:
+   - `cargo rustc --release -p userspace-dp -- --emit=asm`
+   - Verify the generated asm at the two call sites
+     (`tx/dispatch.rs:651`, `poll_descriptor.rs:746`) contains
+     NO `call` instruction to per-family helper symbols
+     (`build_forwarded_frame_into_ipv4/6`,
+     `apply_rewrite_descriptor_ipv4/6`).
+   - If a `call` IS present, the `#[inline(always)]` failed and
+     the PR MUST NOT MERGE until codegen is restored.
+   - The codegen-verification artifact is attached as a PR
+     comment with the relevant asm slice + the post-grep result.
+   - Wave-end batch smoke remains the final perf gate, but the
+     codegen verification step is the per-PR isolation
+     mechanism. **AWAITING-BATCH-MERGE marker stays** — the
+     wave-2 rule about deferred smoke is preserved; we add a
+     deterministic codegen check INSTEAD OF an iperf smoke,
+     not in addition to one.
+
+3. **Codex Minor #3 / AGY §6 — wording on `rewrite_apply_v4/v6`
+   caller separation.** v1 said "different TX caller"; Codex
+   noted `poll_descriptor.rs:746` actually tries
+   `apply_rewrite_descriptor` AND falls back to
+   `rewrite_forwarded_frame_in_place` (mod.rs:770) in the SAME
+   TX flow at `poll_descriptor.rs:754`. They are separate
+   implementation paths (descriptor-driven vs.
+   decision-driven), not separate caller sites. **Resolution:**
+   v2 fixes the wording in §Out of scope.
+
+4. **AGY §9 — test colocation TODO for follow-up.**
+   **Resolution:** v2 adds an explicit follow-up TODO
+   to schedule test colocation as a subsequent refactoring step
+   (likely a separate small PR).
 
 ## Issue framing
 
@@ -294,12 +368,61 @@ pub(in crate::afxdp) fn apply_rewrite_descriptor(
 
 ### Hot-path discipline (per-packet)
 
-Both per-family fns get `#[inline]` (NOT `#[inline(always)]` — let
-the compiler inline at call sites where it's beneficial, but allow
-the cold-path orchestrator to call them via the standard MIR-to-LLVM
-inlining heuristics). The orchestrators also get `#[inline]` so the
-single call site in `tx/dispatch.rs` / `poll_descriptor.rs` can
-fold through to the family-specific body.
+**v2 codegen contract:** Per-family helpers
+(`build_forwarded_frame_into_ipv4/6`,
+`apply_rewrite_descriptor_ipv4/6`) get `#[inline(always)]`. Each
+helper has EXACTLY ONE call site (its orchestrator's match arm),
+so `#[inline(always)]` carries zero i-cache bloat from
+duplication while guaranteeing that the System V AMD64 ABI
+register-spill described in §Round-1 disposition is bypassed via
+SROA + SSA scalarization at the inlined site.
+
+Orchestrators
+(`build_forwarded_frame_into_from_frame`,
+`apply_rewrite_descriptor`) get `#[inline]` (the standard hint,
+not `(always)`) so LLVM keeps discretion at the
+two-call-site `tx/dispatch.rs:651` / `poll_descriptor.rs:746`
+boundary. The orchestrator bodies are 50-60 LOC after the split,
+small enough for the standard inlining heuristic to fold through.
+
+**Verification step (per-PR codegen gate):**
+
+```bash
+# In the worktree, after implementation:
+TMPDIR=/dev/shm CARGO_TARGET_DIR=/dev/shm/cargo \
+  cargo rustc --release -p userspace-dp -- --emit=asm
+ASM=/dev/shm/cargo/release/deps/userspace_dp-*.s
+# Verify no per-family helper symbols are emitted as separate functions:
+grep -E "build_forwarded_frame_into_ipv4|build_forwarded_frame_into_ipv6|apply_rewrite_descriptor_ipv4|apply_rewrite_descriptor_ipv6" $ASM \
+  | grep -v "^;" | head
+# Expected: zero matches (helpers fully inlined into their orchestrators).
+# If matches present, the PR MUST NOT MERGE until codegen is restored
+# (likely a missing #[inline(always)] or LLVM-side bailout).
+```
+
+The codegen verification artifact is posted as a PR comment with
+the grep result + a brief asm slice of the two call sites
+(`tx/dispatch.rs:651` and `poll_descriptor.rs:746`).
+
+Code sketch of the orchestrator/helper layering (v2 attributes):
+
+```rust
+// frame/build/mod.rs
+#[inline]                       // standard hint at the 2-call-site boundary
+pub(in crate::afxdp) fn build_forwarded_frame_into_from_frame(...) -> Option<usize> { ... }
+
+// frame/build/ipv4.rs
+#[inline(always)]               // mandate: single call site, bypass ABI spill
+pub(in crate::afxdp::frame) fn build_forwarded_frame_into_ipv4(...) -> Option<()> { ... }
+
+// frame/rewrite/mod.rs
+#[inline]
+pub(in crate::afxdp) fn apply_rewrite_descriptor(...) -> Option<InPlaceRewriteResult> { ... }
+
+// frame/rewrite/ipv4.rs
+#[inline(always)]
+pub(in crate::afxdp::frame) fn apply_rewrite_descriptor_ipv4(...) -> Option<()> { ... }
+```
 
 The debug-only `#[cold]` candidate is the inner `BUILD_RST_CORRUPT_COUNT`
 block (mod.rs:417..451) — it runs only under `cfg!(feature =
@@ -455,12 +578,27 @@ pub(in crate::afxdp) fn apply_rewrite_descriptor(
    pick after Step 5 implementation reveals which test bundle is
    slowest / most senstitive).
 4. `go test ./...` — all 30 Go packages.
-5. **Smoke matrix is wave-2 deferred.** Per the wave-2 rule
-   (`<!-- AWAITING-BATCH-MERGE -->`), no per-PR smoke runs. The
-   batch smoke at the end of the wave runs the full v4+v6 ×
+5. **Codegen verification step (per-PR, v2 mandate).** After
+   `cargo build --release` in the worktree, run
+   `cargo rustc --release -p userspace-dp -- --emit=asm`, grep
+   the generated `.s` file for the per-family helper symbols
+   (`build_forwarded_frame_into_ipv4`,
+   `build_forwarded_frame_into_ipv6`,
+   `apply_rewrite_descriptor_ipv4`,
+   `apply_rewrite_descriptor_ipv6`), confirm ZERO matches
+   (helpers fully inlined into their orchestrators), and
+   attach the grep result + a brief asm slice of the two
+   call sites to the PR as a comment. **If any per-family
+   helper symbol is still emitted as a separate function, the
+   PR MUST NOT MERGE until codegen is restored.**
+6. **Smoke matrix is wave-2 deferred.** Per the wave-2 rule
+   (`<!-- AWAITING-BATCH-MERGE -->`), no per-PR iperf smoke runs.
+   The batch smoke at the end of the wave runs the full v4+v6 ×
    push+rev × CoS-off+on matrix, including line-rate `-P 12 -R`
    reproducers. **This PR's hot-path codegen-parity claim is
-   verified by that batch smoke, not by a per-PR smoke.**
+   verified per-PR by the asm grep (step 5), not by an iperf
+   smoke. The wave-end batch smoke is the final aggregate-perf
+   gate.**
 
 ## Out of scope (explicitly)
 
@@ -468,11 +606,26 @@ pub(in crate::afxdp) fn apply_rewrite_descriptor(
   test modules. Test colocation for the new build/ and rewrite/
   files is a deliberate follow-up; tests continue to reach the
   symbols via the `pub(in crate::afxdp::frame)` re-export.
+  **TODO follow-up:** schedule a separate small PR after the
+  build/rewrite split lands to colocate the build + rewrite tests
+  into `frame/build/{ipv4_tests.rs,ipv6_tests.rs}` and
+  `frame/rewrite/{ipv4_tests.rs,ipv6_tests.rs}`, leaving
+  `frame/tests.rs` as the home for tests that exercise other
+  parts of `frame/`.
 - Touching `rewrite_apply_v4` / `rewrite_apply_v6` / the larger
-  `rewrite_forwarded_frame_in_place` (mod.rs:770) — those are a
-  separate code path (in-place rewrite that does NOT use
-  `RewriteDescriptor`) and are not part of the wave-2 #1352
-  scope. They stay in `frame/mod.rs`.
+  `rewrite_forwarded_frame_in_place` (mod.rs:770). These are a
+  **separate implementation path** (decision-driven via
+  `&SessionDecision`, no precomputed `RewriteDescriptor` deltas).
+  They are NOT a "different caller" — `poll_descriptor.rs` calls
+  `apply_rewrite_descriptor` at line 746 AND falls back to
+  `rewrite_forwarded_frame_in_place` at line 754 in the same TX
+  flow when the descriptor path declines (e.g. NAT64). The split
+  is a separate-implementation-path split, not a separate-caller
+  split. Either path being unmoved by this PR is coherent because
+  the v4/v6 fan-out in `rewrite_apply_*` shares NO state with
+  `apply_rewrite_descriptor` (different input type, different
+  prepare step). Moving them is wave-2 follow-up work, not #1352
+  scope.
 - Per-protocol (TCP / UDP / ICMP) further split inside the
   per-family files. Cohesion is per-family at this step.
 - The `RewriteDescriptor` struct shape, `RewriteEthParams`, or
