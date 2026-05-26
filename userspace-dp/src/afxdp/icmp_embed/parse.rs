@@ -1,7 +1,10 @@
 use super::*;
 
 /// Parsed embedded inner IPv4 header + first 8 bytes of L4 (enough to
-/// recover ports / icmp echo id). The returned values are wire-form.
+/// recover ports / icmp echo id). IP address octets are recovered
+/// directly from the frame; L4 port fields are decoded from
+/// big-endian wire bytes into host-order `u16` for convenient
+/// comparison and key construction.
 pub(in crate::afxdp::icmp_embed) struct EmbeddedV4Header {
     pub proto: u8,
     pub src: Ipv4Addr,
@@ -13,9 +16,12 @@ pub(in crate::afxdp::icmp_embed) struct EmbeddedV4Header {
 
 /// Parsed embedded inner IPv6 header + first 8 bytes of L4.
 ///
-/// `src_wire` is the wire-form source — NPTv6 inbound translation, if
-/// any, MUST be applied at the call site (see `nat_match_v6.rs`,
-/// mirroring `icmp_embed.rs:358-360`). The parser does not translate.
+/// `src_wire` is the on-the-wire (untranslated) source address —
+/// NPTv6 inbound translation, if any, MUST be applied at the call
+/// site (see `nat_match_v6.rs`, mirroring `icmp_embed.rs:358-360`).
+/// The parser does not translate. L4 port fields are decoded from
+/// big-endian wire bytes into host-order `u16` like
+/// `EmbeddedV4Header`.
 pub(in crate::afxdp::icmp_embed) struct EmbeddedV6Header {
     pub proto: u8,
     pub src_wire: Ipv6Addr,
