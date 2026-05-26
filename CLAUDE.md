@@ -284,3 +284,29 @@ Test containers:
   untrust-host  10.0.2.102  (2001:559:8585:bf02::102)  — xpf-untrust bridge
   dmz-host      10.0.30.101 (2001:559:8585:bf03::101)  — xpf-dmz bridge
 ```
+
+**HA cluster on `loss:xpf-userspace-fw0/fw1`** — different topology from
+the standalone VM above. Do NOT extrapolate the standalone PCI map to
+the loss userspace cluster; the WAN interface there is `ge-0-0-2`, not
+`ge-0-0-3`, and `ge-0-0-0` is the fabric IPVLAN parent (not WAN). The
+per-cluster wiring is canonical in `docs/ha-cluster-userspace.conf` +
+`test/incus/loss-userspace-cluster.env`. Summary:
+
+```
+loss:xpf-userspace-fw{0,1} — node-id 0 / 1, /etc/xpf/node-id present:
+  Virtio (PCI bus 05-07, lower bus → lower vSRX name):
+    enp5s0  → fxp0       DHCP                          — mgmt zone (SSH + ping)
+    enp6s0  → em0        10.99.{0..12}.{1,2}           — cluster control plane / heartbeat
+    enp7s0  → ge-0-0-0   fab0 IPVLAN parent            — fabric (xdpgeneric — fabric path only)
+  mlx5 SR-IOV VF (PCI bus 08-09 — native XDP):
+    enp8s0  → ge-0-0-1   reth1.0 (LAN, 10.0.61.1/24)   — LAN-side, mlx5_core xdp native
+    enp9s0  → ge-0-0-2   reth0 (WAN; VLAN 50 + 80)     — WAN-side, mlx5_core xdp native
+                         reth0.50  172.16.50.8/24      —   transit
+                         reth0.80  172.16.80.8/24      —   data path target VLAN
+
+Smoke iperf3 target: 172.16.80.200 / 2001:559:8585:80::200 (on reth0.80
+WAN path, AF_XDP zero-copy fast path). Per-class iperf3 servers live on
+ports 5201-5211 matching `test/incus/cos-iperf-config.set`. Do NOT use
+172.16.100.x — that reaches a different `loss:` uplink path capped at
+~9-10 Gb/s and was the misdiagnosed "cluster ceiling" in #1578.
+```
