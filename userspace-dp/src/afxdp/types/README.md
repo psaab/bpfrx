@@ -47,5 +47,5 @@ globs.
   `pub(super) use shared_cos_lease::{...}`, a `pub(crate) use
   forwarding::{ForwardingDisposition, ForwardingResolution}` for
   callers in `crate::*` outside `afxdp/`, and the widest one,
-  `pub use forwarding::NeighborEntry`, used by `server/handlers.rs`
+  `pub use forwarding::NeighborEntry`, used by `server/handlers/neighbors.rs`
   to construct `afxdp::NeighborEntry` from outside the module.

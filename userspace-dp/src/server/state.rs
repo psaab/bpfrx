@@ -1,7 +1,7 @@
 // Server state types extracted from main.rs (#1048 P2 step 2).
 // `PollMode` was already pub at the crate root; `Args` and
 // `ServerState` were file-private — widened to pub(crate) here
-// (and likewise their fields) so server/handlers.rs and main.rs's
+// (and likewise their fields) so server/handlers/ and main.rs's
 // run() loop can both construct and destructure them.
 
 use crate::state_writer::StateWriter;
