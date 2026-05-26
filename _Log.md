@@ -1,5 +1,24 @@
 # Action Log
 
+## 2026-05-26 — #1326 PR #1569 AWAITING-BATCH-MERGE at 18fd27f8
+
+- **Timestamp**: 2026-05-26T (4-of-4 MERGE-READY on 18fd27f8)
+  - **Action**: Drove PR #1569 through 6 code-review rounds. Final
+    SHA 18fd27f8 has 4-of-4 attestation: Codex MERGE-READY (final),
+    AGY MERGE-READY (final), Copilot r2 inline comment proposed
+    the explicit-path change that 18fd27f8 implements, Claude SMR
+    MERGE-READY (posted on PR). Posted AWAITING-BATCH-MERGE
+    marker. Smoke deferred per wave-1 rules.
+  - **Notes**: Codex r4 flagged rustfmt as failing — verified
+    locally as false positive (rustfmt 1.9.0-stable returns exit 0
+    on both touched files; cargo fmt --check noise is pre-existing
+    master drift in unrelated files). Copilot re-review did not
+    trigger on 18fd27f8 despite gh pr edit --add-reviewer Copilot
+    + @copilot review — but Copilot's r2 inline comment on
+    be71872c explicitly proposed the exact change in 18fd27f8, so
+    that stands as the formal attestation.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
 ## 2026-05-26 — #1326 Phase 1 implementation + PR-prep
 
 - **Timestamp**: 2026-05-26T (round 6 PLAN-READY, then implementation)

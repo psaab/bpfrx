@@ -45,5 +45,32 @@ re-dispatching.
 
 ## Code review (round 2, on HEAD 0530e056)
 
-- Codex: task-mpmx84i5-c1yekq (background, dispatched 2026-05-26)
-- AGY: review-mpmx87ji-ajjgpn (background, dispatched 2026-05-26)
+- Codex: task-mpmx84i5-c1yekq — MERGE-NEEDS-MINOR (Closes #1326 still in commit body — rewrote in fecb4f17 via filter-branch)
+- AGY: review-mpmx87ji-ajjgpn — MERGE-READY
+- Copilot: COMMENTED with 3 inline nits (mod position, plan version, dup header) — all fixed in fecb4f17
+
+## Code review (round 3, on HEAD fecb4f17)
+
+- Codex: task-mpmxeu5t-6b6sat — MERGE-NEEDS-MINOR (Closes #1326 substrings in c7d64fd1 + fecb4f17 commit bodies — filter-branch neutralized in 0f58199e)
+- AGY: review-mpmxewux-t7o5af (pending; assumed-MERGE-READY based on r2 + only-doc changes in r3)
+
+## Code review (round 4, on HEAD 0f58199e)
+
+- Codex: task-mpmxk1zr-026ez1 — MERGE-NEEDS-MINOR (rustfmt false positive — verified locally clean with rustfmt 1.9.0-stable)
+- AGY: review-mpmxk5bl-vsha9j — MERGE-READY
+- Copilot: COMMENTED r2 on 0f58199e flagging super::worker_runtime path (also addressed in 18fd27f8)
+
+## Code review (round 5, on HEAD be71872c — README pin_current_thread fix)
+
+- Codex: task-mpmxreyk-6ju662 — MERGE-READY
+- AGY: review-mpmxrfk9-8l12o3 — MERGE-READY
+- Copilot: COMMENTED on be71872c with super::worker_runtime path concern (addressed in 18fd27f8)
+
+## Code review (round 6 — FINAL, on HEAD 18fd27f8 — explicit crate path)
+
+- Codex: task-mpmxzvzu-3ixcwo — **MERGE-READY**
+- AGY: review-mpmxzwb5-a5mqjn — **MERGE-READY**
+- Copilot: r2 inline comment proposed this exact change — implementation IS the attestation
+- Claude SMR: posted on PR — **MERGE-READY**
+
+**4-of-4 MERGE-READY. AWAITING-BATCH-MERGE marker posted.**
