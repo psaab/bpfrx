@@ -4497,3 +4497,41 @@
     format documented as preserving file convention); Claude
     SMR MERGE-READY.
   - **File(s)**: PR comment.
+
+- **Timestamp**: 2026-05-26 21:15 UTC
+  - **Action**: #1547 plan + implementation. Three plan-review rounds.
+    Round 1 (v1 f9713e65): Codex PLAN-NEEDS-MAJOR (vtyshExecutor
+    defer, ifaceNetwork mis-placed, ApplyFull inline blocks, README
+    stale), Gemini PLAN-KILL (false cohesion claim,
+    vtyshExecutor cannot be deferred).
+    Round 2 (v2 71370dc7): Codex PLAN-NEEDS-MAJOR (zero-value Manager
+    panic, parsing methods must also route through executor, stale
+    v1/v2 contradictions, no fake-executor tests, ECMP block omitted),
+    Gemini PLAN-KILL (single-method executor strands m.reload's
+    systemctl + vtysh -f path).
+    Round 3 (v3 31238f3c): both PLAN-READY (Codex with one minor —
+    reload test should cover both happy and fallback paths; addressed
+    in implementation with TestReloadUsesSystemctlHappyPath +
+    TestReloadFallsBackToVtyshLoad as separate tests).
+    Implementation: pkg/frr/frr.go (1606 LOC) → 5 sibling files
+    (manager.go 339, config_render.go 268, policy_render.go 503,
+    vtysh.go 153, status_parse.go 325) + executor_test.go (188 LOC of
+    new fake-executor tests). Public API preserved byte-identical;
+    pkg/frr existing tests pass; 5/5 flake-clean; full Go suite green.
+    README updated.
+  - **File(s)**: pkg/frr/{manager,config_render,policy_render,vtysh,
+    status_parse,executor_test}.go (NEW); pkg/frr/frr.go (DELETED);
+    pkg/frr/README.md (UPDATED); docs/pr/1547-frr-split/plan.md (v1→v3);
+    docs/pr/1547-frr-split/reviewer-ids.md
+
+- **Timestamp**: 2026-05-26 21:30 UTC
+  - **Action**: #1547 PR #1587 code-review convergence. Codex
+    MERGE-READY task-mpn50enm-s4lwd2 (no findings; sandbox could
+    not run go test but local 5/5 flake-clean + full Go suite
+    green). Gemini MERGE-READY task-mpn50uq3-0v3fgu (no blockers,
+    7/7 verification points). Copilot COMMENTED with no inline
+    findings (reviewed 11/11 files). 4-of-4 reviewer attestation
+    achieved on first code-review round. AWAITING-BATCH-MERGE
+    marker is in the PR body for the refactor-chain batch.
+  - **File(s)**: PR #1587 at 4ff0b6c1,
+    docs/pr/1547-frr-split/reviewer-ids.md
