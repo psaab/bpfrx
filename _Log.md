@@ -4257,8 +4257,9 @@
   - **File(s)**: PR #1579, userspace-dp/src/afxdp/frame/headers.rs,
     docs/pr/1440-header-serialization-consolidate/reviewer-ids.md
 ## 2026-05-26 #1352 frame/{build,rewrite}/ split
+## 2026-05-26 13:05 UTC #1352 frame/{build,rewrite}/ split
 
-- **Timestamp**: 2026-05-26
+- **Timestamp**: 2026-05-26 13:05 UTC
 - **Action**: Implemented frame/build/{mod.rs,ipv4.rs,ipv6.rs} + frame/rewrite/{mod.rs,ipv4.rs,ipv6.rs} per #1352 plan v5. Extracted 236-LOC build_forwarded_frame_into_from_frame and 223-LOC apply_rewrite_descriptor into per-family files. Codegen contract: #[inline(always)] on per-family helpers; #[inline(never)] + concrete `meta: ForwardPacketMeta` on build orchestrator; standard #[inline] on rewrite orchestrator.
 - **File(s)**: userspace-dp/src/afxdp/frame/build/{mod.rs,ipv4.rs,ipv6.rs} (created); userspace-dp/src/afxdp/frame/rewrite/{mod.rs,ipv4.rs,ipv6.rs} (created); userspace-dp/src/afxdp/frame/mod.rs (orchestrator bodies removed, mod decls added; build_forwarded_frame_into wrapper now calls .into() before forwarding to concrete-typed orchestrator).
 - **Validation**: cargo build --release clean. 1487 cargo tests pass (113 frame-specific tests all pass). Codegen gate: nm -C shows ZERO per-family helper definitions (#[inline(always)] folded into orchestrator), exactly ONE build_forwarded_frame_into_from_frame definition, ZERO apply_rewrite_descriptor definitions (LLVM inlined fully into single caller poll_descriptor.rs:746). One pre-existing cross-worktree doc-guard test failure unrelated to this refactor.
