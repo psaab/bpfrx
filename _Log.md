@@ -26,6 +26,25 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T20:00:00Z
+  - **Action**: #1519 Phase A — drafted capstone-delete plan
+    (plan-impl.md v1) on new branch
+    refactor/1519-daemon-legacydp-shrink-impl off origin/master
+    (1f39f79d). Issue #1519 was PLAN-KILL'd in round-1 because 4
+    of 16 legacyDP() call sites were blocked by #1516/#1517/#1518.
+    Now #1517 (PR #1549) and #1518 (PR #1551) are CLOSED; only
+    #1516 (PR #1554, 0436f386, MERGEABLE) remains in flight. Plan
+    enumerates 16 call sites + the accessor function and targets
+    17 deletions plus a new pkg/daemon/runtime_probes.go with 5
+    typed probes (dataplaneReadyProbe, natSeeder, fibSyncStarter,
+    apiDataPlane, cliDataPlane/CLIRuntime, grpcDataPlane). Canary
+    work: extend existing
+    pkg/dataplane/retirement_boundary_canary_test.go allowlist +
+    new pkg/daemon AST canary asserting legacyDP() method decl
+    and call expressions stay deleted. Dispatched to Codex + AGY
+    in parallel for plan-impl v1 review.
+  - **File(s)**: docs/pr/1519-daemon-legacydp-shrink/plan-impl.md
+
 - **Timestamp**: 2026-05-25T19:30:00Z
   - **Action**: #1521 Copilot r-rebase (4357897741 on 5bc310fc)
     fixes — 1 correctness finding + 1 doc nit. Correctness
