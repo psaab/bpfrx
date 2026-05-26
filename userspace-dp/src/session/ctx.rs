@@ -1,4 +1,4 @@
-//! Context structs used by `SessionTable::install/upsert/update` fns.
+//! Context structs used by `super::SessionTable`'s upsert/update fns.
 //!
 //! Encapsulates the previously-positional 7-field cluster so call
 //! sites do not drift fields. See #1357.
@@ -6,13 +6,15 @@
 //! Two structs, no embedding:
 //!
 //! - [`SessionInstall`] carries an owned [`SessionKey`]. Used by
-//!   [`SessionTable::install_with_protocol_with_origin`] and
-//!   [`SessionTable::upsert_synced_with_origin`] (the upsert variant
-//!   takes an additional positional `allow_replace_local: bool`).
+//!   [`super::SessionTable::upsert_synced_with_origin`] (with a
+//!   positional `allow_replace_local: bool`). The install fn
+//!   `install_with_protocol_with_origin` itself stays positional —
+//!   see plan "Rollback execution" — but its `upsert_synced` sibling
+//!   takes this struct.
 //! - [`SessionUpdate`] carries a borrowed `&'a SessionKey`. Used by
-//!   [`SessionTable::update_session`] (with an additional positional
+//!   [`super::SessionTable::update_session`] (with a positional
 //!   `ha_activation: bool`) and
-//!   [`SessionTable::promote_synced_with_origin`].
+//!   [`super::SessionTable::promote_synced_with_origin`].
 //!
 //! Operational control flags (`allow_replace_local`, `ha_activation`)
 //! intentionally stay positional — they are *not* part of the
