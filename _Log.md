@@ -26,6 +26,29 @@
 
 ## 2026-05-25
 
+- **Timestamp**: 2026-05-25T20:30:00Z
+  - **Action**: #1519 plan-impl v1 → v1.1 — Codex round-1 returned
+    3 findings (1×P2, 2×P3) on plan-impl.md. P2: row 1 of migration
+    matrix referenced fictional `conntrack.PersistentNATProvider`
+    and `conntrack.SessionCountPublisher`. The real exported
+    interface is `conntrack.RuntimeDomainProvider` at
+    pkg/conntrack/gc.go:45 (SessionStoreProvider+TelemetryProvider);
+    the persistent/sessionCount probes are package-private lowercase
+    names at gc.go:33/39. `conntrack.NewGC(provider, interval)` at
+    gc.go:104 already does the right thing. Rewrote row 1 to
+    collapse `NewGCWithDomains(...)` into `NewGC(d.dp, interval)`.
+    P3a: cliRuntime described as superset of RuntimeDataPlane, but
+    pkg/cli/runtime.go:11 docstring says SUBSET of DataPlane (and
+    omits Start/ApplyConfig/Link/HA/Sessions/Telemetry/Close/
+    Teardown). Rewrote sibling-state §0 to note RuntimeDataPlane
+    and cliRuntime are disjoint — daemon must type-assert against
+    cliRuntime's shape even though d.dp is RuntimeDataPlane (both
+    backends satisfy both interfaces simultaneously). P3b: flake
+    loop `for i in 1..5` is a single-token literal in bash (runs
+    once); fixed to `for i in 1 2 3 4 5`. AGY round-1 still
+    pending.
+  - **File(s)**: docs/pr/1519-daemon-legacydp-shrink/plan-impl.md
+
 - **Timestamp**: 2026-05-25T20:00:00Z
   - **Action**: #1519 Phase A — drafted capstone-delete plan
     (plan-impl.md v1) on new branch

@@ -21,13 +21,25 @@ PR also closes the S4 acceptance criterion of #1451 once landed.
   for #1554 to merge to master before the impl branch is rebased and
   the code changes begin.
 - #1517 — CLOSED via PR #1549. `pkg/cli` now exposes `cliRuntime` (a
-  strict superset of `dataplane.RuntimeDataPlane`, including
-  `IsLoaded`, `IterateSessions(V6)`, `GetMapStats`,
-  `GetPersistentNAT`, `ClearAllCounters`, `ClearAllSessions`, etc.)
-  declared in `pkg/cli/runtime.go`. `cli.New(...)` already takes
-  `cliRuntime`, **not** `dataplane.DataPlane`. Daemon side at
-  `daemon_run.go:882` still passes `d.legacyDP()` because the
-  daemon-side narrowing was deferred to this issue.
+  package-private **subset** of `dataplane.DataPlane` per the
+  docstring at `pkg/cli/runtime.go:11` — NOT a superset of
+  `dataplane.RuntimeDataPlane`; it lists exactly the cli-specific
+  call surface (IsLoaded, IterateSessions(V6), GetMapStats,
+  GetPersistentNAT, ClearAllCounters, ClearAllSessions, etc.) but
+  omits the RuntimeDataPlane lifecycle methods Start/ApplyConfig/
+  Link/HA/Sessions/Telemetry/Close/Teardown that the daemon never
+  invokes through the CLI seam) declared in `pkg/cli/runtime.go:28`.
+  `cli.New(...)` already takes `cliRuntime`, **not**
+  `dataplane.DataPlane`. Daemon side at `daemon_run.go:882` still
+  passes `d.legacyDP()` because the daemon-side narrowing was
+  deferred to this issue. The daemon's typed `d.dp` is
+  `dataplane.RuntimeDataPlane` which is **disjoint** from
+  `cliRuntime` (neither is a subset of the other), so the daemon
+  cannot pass `d.dp` directly — it must type-assert against a probe
+  matching `cliRuntime`'s shape (see §2). Both in-tree concrete
+  backends (the legacy `*dataplane.Manager` and the userspace
+  `*LegacyDataPlaneAdapter`) satisfy both `RuntimeDataPlane` AND
+  `cliRuntime` simultaneously, so the type assertion succeeds.
 - #1518 — CLOSED via PR #1551. `pkg/cluster` now exposes
   `clusterRuntime` (Sessions/Telemetry) declared in
   `pkg/cluster/runtime.go`, plus `SetRuntime(rt clusterRuntime)` and
@@ -72,7 +84,7 @@ x != nil { ... }` where today's code nil-checks.
 
 | # | Site | Current | Target |
 |---|---|---|---|
-| 1 | `daemon_gc.go:16` | `if lp := d.legacyDP(); lp != nil { ... NewGCWithDomains(..., lp, lp, ...) }` | Pass `d.dp` directly as the persistent-NAT + session-count provider via type assertion; both eBPF Manager and userspace LegacyDataPlaneAdapter satisfy `conntrack.PersistentNATProvider` and `conntrack.SessionCountPublisher` via the existing legacy interface. Verify with named probes declared in `pkg/conntrack/runtime.go` (existing) or local probes in `pkg/daemon`. |
+| 1 | `daemon_gc.go:16` | `if lp := d.legacyDP(); lp != nil { ... NewGCWithDomains(..., lp, lp, ...) }` | Switch to the existing exported constructor `conntrack.NewGC(provider RuntimeDomainProvider, interval time.Duration)` at `pkg/conntrack/gc.go:104`, passing `d.dp` directly. `NewGC` internally type-asserts the provider against the package-private `sessionCountPublisher` and `persistentNATProvider` interfaces defined at `pkg/conntrack/gc.go:33` and `:39` (both lowercase, never exported); when the assertions fail it falls through to nil providers, which is the same nil-tolerance contract `daemon_gc.go` currently encodes via the `legacyDP() != nil` branch. The exported `RuntimeDomainProvider` at `pkg/conntrack/gc.go:45` is the structural interface (`SessionStoreProvider + TelemetryProvider`) that `d.dp` already satisfies via `*dataplane.Manager.Sessions()/Telemetry()` and `*LegacyDataPlaneAdapter.Sessions()/Telemetry()`. No new conntrack exports needed; do NOT reference fictional `conntrack.PersistentNATProvider` / `conntrack.SessionCountPublisher` names. The current call to `NewGCWithDomains(sessions, telemetry, lp, lp, interval)` collapses into `NewGC(d.dp, interval)`. |
 | 2 | `daemon_scheduler.go:159-161` | `if lp := d.legacyDP(); lp != nil { lp.UpdatePolicyScheduleState(...) }` | **Delete dead fallback.** Both backends already satisfy the local `policyScheduleStateUpdater` probe at line 14, asserted on `d.dp` at line 155. Independently verified in v2 plan; AGY round-1 ratified. |
 | 3 | `daemon_forwarding_status.go:20` | `dp := a.daemon.legacyDP(); return dp != nil && dp.IsLoaded()` | New local probe `dataplaneReadyProbe interface { IsLoaded() bool }` declared in `pkg/daemon/runtime_probes.go` (new file). Assert against `a.daemon.dp`. |
 | 4 | `daemon_forwarding_status.go:28-32` | `dp := a.daemon.legacyDP(); ... dp.GetMapStats()` | Swap to `a.daemon.dp.Telemetry().MapStats()` — covered by `dataplane.Telemetry.MapStats()` (apply.go:154). |
@@ -425,7 +437,7 @@ GC, or HA event streaming. Caught by either the type-system probes
 | Vet | `go vet ./...` |
 | Unit | `make test` |
 | Focus | `GOCACHE=/dev/shm/gocache go test ./pkg/daemon/... ./pkg/conntrack/... ./pkg/cluster/... ./pkg/api/... ./pkg/grpcapi/... ./pkg/cli/... -count=1` |
-| Flake | `for i in 1..5; do go test ./pkg/daemon/... -count=1 || exit 1; done` |
+| Flake | `for i in 1 2 3 4 5; do GOCACHE=/dev/shm/gocache go test ./pkg/daemon/... -count=1 || exit 1; done` (5-iteration loop; do NOT use `for i in 1..5` — bash treats that as a single literal token and runs the body exactly once) |
 | Boundary canary | `go test ./pkg/dataplane -run TestRetirementBoundary -count=1` |
 | Legacy-DP canary | `go test ./pkg/daemon -run TestLegacyDPAccessorRemoved -count=1` (new) |
 | Failover | `make test-failover` (mandatory per issue body) |
