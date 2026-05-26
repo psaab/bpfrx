@@ -1,5 +1,25 @@
 # Action Log
 
+## 2026-05-26 — #1326 plan v3.3 — Codex r4 doc-consistency fixes
+
+- **Timestamp**: 2026-05-26T (round 4 reviews returned)
+  - **Action**: AGY r4 (review-mpmw4xjc-92bdff) returned PLAN-READY
+    independently — full substantive re-confirmation on every
+    dimension: borrow shape, hybrid inlining, allocation audit,
+    edition 2024, CoS rebuild predicate (all 7 sources), param count
+    (35). Codex r4 (task-mpmw4sj7-dxkyqo) returned PLAN-NEEDS-MINOR
+    with 3 doc-consistency issues only — substantive design rated
+    "close" and "Not ready until the stale conflicting directives
+    are cleaned." v3.3 cleanups: (a) propagated the &state.sessions
+    addition to debug_report::maybe_emit signature description in
+    BOTH the file tree section and the inline-annotation section,
+    (b) fixed the orchestrator pseudocode "/* same 38-param … */"
+    comment to "35-param", (c) cleaned stale topology refs
+    (arc_refresh.rs, shutdown::tear_down, idle::handle, "7+ files"
+    in risk table). Dispatching r5 to confirm.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
 ## 2026-05-26 — #1326 plan v3.2 — Codex r3 PLAN-NEEDS-MINOR addressed
 
 - **Timestamp**: 2026-05-26T (Codex r3 verdict extracted from log)

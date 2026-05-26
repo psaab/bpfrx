@@ -1,6 +1,30 @@
 # #1326 — Extract worker_loop body into worker/loop_body/
 
-**Status:** DRAFT v3.2 — Codex r3 + AGY r3 PLAN-NEEDS-MINOR addressed
+**Status:** DRAFT v3.3 — Codex r4 doc-consistency findings addressed
+
+### v3.2→v3.3 changelog
+
+Codex r4 (task-mpmw4sj7-dxkyqo) returned PLAN-NEEDS-MINOR with 3
+doc-consistency issues — substantive design rated "close" and all
+substantive items resolved. v3.3 cleanups:
+
+1. `debug_report.rs` description in the file tree + the inline
+   annotation section now both reflect that `maybe_emit` and inner
+   `emit_report` take `&state.sessions` in addition to `&mut state.dbg_state`.
+2. Orchestrator pseudocode signature comment fixed: 38 → 35 params
+   (the public-API-preservation section already said 35; only the
+   pseudocode comment was stale).
+3. Stale topology references cleaned: `arc_refresh.rs` → `tick::arc_refresh`,
+   `shutdown::tear_down` → "shutdown teardown lives inline in the
+   orchestrator", `idle::handle` → "idle handling lives inline in
+   the orchestrator", and the "7+ files" line in the risk table
+   → "5-file tree".
+
+AGY r4 (review-mpmw4xjc-92bdff) returned PLAN-READY independently —
+all substantive items including the LLVM register-retention reasoning
+re-confirmed sound. v3.3 just chases Codex's doc-consistency tail.
+
+### v3→v3.2 changelog
 
 ### v3→v3.2 changelog
 
@@ -161,7 +185,7 @@ mitigatable — PLAN-KILL is an acceptable verdict.*
   is no longer the LOC source — the long fn is.
 - **#1188 (merged)** — per-tick Arc short-circuit refresh via
   `load_arc_if_changed` (helper already in mod.rs at L970-L978).
-  Plan keeps this helper and references it from `arc_refresh.rs`.
+  Plan keeps this helper and references it from `tick::arc_refresh`.
 - **#1189 (merged)** — Coordinator decompose Phase 1 established the
   "lift body into named sibling file" pattern.
 - **lifecycle.rs already exists** with `poll_binding` — the per-binding
@@ -189,8 +213,11 @@ userspace-dp/src/afxdp/worker/
                       #   commands_drain, expiry, deltas.
     poll_drive.rs     # The per-binding poll round; NOT inlined.
     debug_report.rs   # maybe_emit (outer, #[inline(always)]) + the
-                      # cold emit_report inner. Takes only
-                      # &mut state.dbg_state and the bindings ref.
+                      # cold emit_report inner. Signature takes
+                      # &mut state.dbg_state, &state.sessions
+                      # (read-only — needed for sessions.len() at
+                      # today's L1730 and the stall-dump iterator at
+                      # L2054), &mut bindings, worker_id, loop_now_ns.
 ```
 
 ### File tree (rejected, v2)
@@ -382,7 +409,7 @@ what AGY r1 asked for.
 
 ```rust
 pub(crate) fn worker_loop(
-    /* same 38-param signature as today — unchanged */
+    /* same 35-param signature as today — unchanged */
 ) {
     pin_current_thread(worker_id);
     let (mut bindings, mut state) = setup::initialize(
@@ -640,7 +667,9 @@ orchestrator and never cloned).
   of-line. This is the canonical Rust pattern for "1s gate + cold
   body" and is what the codebase uses elsewhere
   (`cilium/ebpf`-style rare-path emit).
-- `shutdown::tear_down` — `#[cold]`. Runs once on exit.
+- Shutdown teardown — runs inline at the bottom of the orchestrator
+  (post-while). v3 collapsed it into mod.rs; no separate
+  `shutdown::tear_down` symbol exists in the final tree.
 - The non-empty-queue branch inside `tick::commands_drain` — `#[cold]`
   on the inner `apply_non_empty(...)` helper because most ticks have
   no pending commands. The empty-queue short-circuit is the fast
@@ -688,8 +717,9 @@ apply here).
   + cheap.
 - `tick::deltas` — `#[inline(always)]`. The 100ms cos_status gate is
   the only non-trivial work most ticks.
-- `idle::handle` — `#[inline(always)]`. The BusyPoll-spin path is
-  ~3 instructions; inlining is essential.
+- Idle handling — runs inline in the orchestrator (v3 collapsed
+  `idle::handle` into `loop_body/mod.rs`). The BusyPoll-spin path is
+  ~3 instructions and is part of the orchestrator's main control flow.
 - `poll_drive::drive_one_round` — NOT inlined (no annotation, let
   LLVM decide; expect inline-never given its size). This is the
   perf-top observability win — a single fn symbol for the per-binding
@@ -778,7 +808,7 @@ keeps working.
 
 | Risk | Class | Notes |
 |---|---|---|
-| Behavioral regression | **MED** | Pure code motion of 1278 LOC with 7+ files is high-mechanical-error surface. Mitigation: cargo test --release (~960 tests) + 5x flake + full smoke matrix. |
+| Behavioral regression | **MED** | Pure code motion of 1278 LOC across the 5-file tree (mod.rs orchestrator + setup + tick + poll_drive + debug_report) is high-mechanical-error surface. Mitigation: cargo test --release (~960 tests) + 5x flake + full smoke matrix. |
 | Lifetime / borrow-checker | **MED** | `&mut bindings` + `&mut state` must not alias (they don't — different fields). The Arc Guards (`ha_state.load()`) stay on the orchestrator stack. Risk that the compiler complains when `LoopState.sessions` and `&mut bindings` are borrowed simultaneously by `arc_refresh::refresh_per_tick` (the input-DSCP purge needs both). Mitigation: pass `&mut state.sessions` and `&mut bindings` as explicit separate params, not `&mut state`. |
 | Performance regression | **MED-HIGH** | Inliner spill-fill on phase-boundary fn calls. If the compiler refuses to inline the fast-path phases, the per-tick branch+call overhead adds up at 12-worker, ~100k/sec polls/worker scale. Mitigation: `#[inline]` annotations + cargo asm spot-check + smoke iperf3 multi-stream. |
 | Architectural mismatch (#961 / #946 Phase 2) | **LOW** | Issue is purely structural code-motion. No new abstractions, no new batched-iteration premise. Existing #959 and #1189 patterns are direct precedents. |
