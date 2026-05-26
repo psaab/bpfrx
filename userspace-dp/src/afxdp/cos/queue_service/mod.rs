@@ -52,6 +52,14 @@ pub(in crate::afxdp) use drain::{
 mod service;
 use service::{service_exact_local_queue_direct, service_exact_prepared_queue_direct};
 
+// #1331: per-variant submit handlers split into flat sibling files,
+// mirroring drain.rs / service.rs. submit_cos_batch below stays a
+// thin match shim that dispatches to these handlers.
+mod submit_local;
+mod submit_prepared;
+use submit_local::submit_local;
+use submit_prepared::submit_prepared;
+
 use super::tx_completion::{
     CoSServicePhase, ParkReason, apply_cos_prepared_result, apply_cos_send_result,
     apply_direct_exact_send_result, cos_root_can_service_after_prime, cos_tick_for_ns,
@@ -1180,6 +1188,8 @@ fn build_cos_batch_from_queue(
     }
 }
 
+// #1331: per-variant body extracted into submit_local /
+// submit_prepared sibling modules. This fn stays the dispatch shim.
 #[inline]
 fn submit_cos_batch(
     binding: &mut BindingWorker,
@@ -1193,213 +1203,32 @@ fn submit_cos_batch(
             queue_idx,
             phase,
             batch_bytes,
-            mut items,
-        } => {
-            assign_local_dscp_rewrite(
-                &mut items,
-                cos_queue_dscp_rewrite(binding, root_ifindex, queue_idx),
-            );
-            // #1229 v7: pre-transmit sidecar — record (bucket, bytes)
-            // for each item in submit order. transmit_batch consumes
-            // the successful prefix in-place; we slice the sidecar by
-            // returned `packets` to account only the bytes actually
-            // shipped (not retries).
-            //
-            // Stack-allocated array (TX_BATCH_SIZE × 10 bytes = 640 B)
-            // avoids per-batch heap allocation on the hot path. The
-            // Option<u64> seed acts as a presence flag: None means no
-            // flow_fair state → sidecar_len stays 0 and accounting is
-            // skipped entirely (no iteration, no branch inside the
-            // success block).
-            let local_seed_opt = binding
-                .cos
-                .cos_interfaces
-                .get(&root_ifindex)
-                .and_then(|root| root.queues.get(queue_idx))
-                .and_then(|q| q.flow_fair_state.as_ref())
-                .map(|ff| ff.flow_hash_seed);
-            let mut sidecar = [(0u16, 0u64); TX_BATCH_SIZE];
-            let sidecar_len = if let Some(seed) = local_seed_opt {
-                let mut n = 0usize;
-                for req in items.iter().take(TX_BATCH_SIZE) {
-                    sidecar[n] = (
-                        cos_flow_bucket_index(seed, req.flow_key.as_ref()) as u16,
-                        req.bytes.len() as u64,
-                    );
-                    n += 1;
-                }
-                n
-            } else {
-                0
-            };
-            match transmit_batch(binding, &mut items, now_ns, shared_recycles) {
-                Ok((packets, bytes)) => {
-                    apply_cos_send_result(
-                        binding,
-                        root_ifindex,
-                        queue_idx,
-                        phase,
-                        batch_bytes,
-                        bytes,
-                        items,
-                    );
-                    // #1229 v7: account per-bucket bytes for the sent
-                    // prefix. sidecar_len > 0 ↔ flow_fair is active.
-                    if packets > 0 && sidecar_len > 0 {
-                        if let Some(ff) = binding
-                            .cos
-                            .cos_interfaces
-                            .get_mut(&root_ifindex)
-                            .and_then(|root| root.queues.get_mut(queue_idx))
-                            .and_then(|q| q.flow_fair_state.as_mut())
-                        {
-                            for &(bucket, bytes) in &sidecar[..packets as usize] {
-                                account_flow_bucket_tx(ff, bucket, bytes, now_ns);
-                            }
-                        }
-                    }
-                    if packets > 0 {
-                        binding
-                            .live
-                            .tx_packets
-                            .fetch_add(packets, Ordering::Relaxed);
-                        binding.live.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
-                        // #760 instrumentation, non-exact / shared-exact
-                        // Local path. See umem.rs field comment.
-                        binding
-                            .live
-                            .owner_profile_owner
-                            .drain_sent_bytes_shaped_unconditional
-                            .fetch_add(bytes, Ordering::Relaxed);
-                    }
-                    cos_batch_tx_made_progress(Ok((packets, bytes)))
-                }
-                Err(TxError::Retry(err)) => {
-                    binding.live.set_error(err);
-                    restore_cos_local_items(binding, root_ifindex, queue_idx, batch_bytes, items);
-                    cos_batch_tx_made_progress(Err(TxError::Retry(String::new())))
-                }
-                Err(TxError::Drop(err)) => {
-                    binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
-                    // #710: frame-level submit drop during CoS batch
-                    // transmit; items are restored to the queue head,
-                    // so this counts the submit-attempt failure, not a
-                    // lost packet. Subset of tx_errors.
-                    binding
-                        .live
-                        .tx_submit_error_drops
-                        .fetch_add(1, Ordering::Relaxed);
-                    binding.live.set_error(err);
-                    restore_cos_local_items(binding, root_ifindex, queue_idx, batch_bytes, items);
-                    cos_batch_tx_made_progress(Err(TxError::Drop(String::new())))
-                }
-            }
-        }
+            items,
+        } => submit_local(
+            binding,
+            root_ifindex,
+            queue_idx,
+            phase,
+            batch_bytes,
+            items,
+            now_ns,
+            shared_recycles,
+        ),
         CoSBatch::Prepared {
             queue_idx,
             phase,
             batch_bytes,
-            mut items,
-        } => {
-            assign_prepared_dscp_rewrite(
-                &mut items,
-                cos_queue_dscp_rewrite(binding, root_ifindex, queue_idx),
-            );
-            // #1229 v7: pre-transmit sidecar (same shape as Local
-            // path above — transmit_prepared_queue consumes the
-            // successful prefix in-place). Stack array avoids
-            // per-batch allocation; only populated for flow-fair queues.
-            let prepared_seed_opt = binding
-                .cos
-                .cos_interfaces
-                .get(&root_ifindex)
-                .and_then(|root| root.queues.get(queue_idx))
-                .and_then(|q| q.flow_fair_state.as_ref())
-                .map(|ff| ff.flow_hash_seed);
-            let mut sidecar = [(0u16, 0u64); TX_BATCH_SIZE];
-            let sidecar_len = if let Some(seed) = prepared_seed_opt {
-                let mut n = 0usize;
-                for req in items.iter().take(TX_BATCH_SIZE) {
-                    sidecar[n] = (
-                        cos_flow_bucket_index(seed, req.flow_key.as_ref()) as u16,
-                        req.len as u64,
-                    );
-                    n += 1;
-                }
-                n
-            } else {
-                0
-            };
-            match transmit_prepared_queue(binding, &mut items, now_ns, shared_recycles) {
-                Ok((packets, bytes)) => {
-                    apply_cos_prepared_result(
-                        binding,
-                        root_ifindex,
-                        queue_idx,
-                        phase,
-                        batch_bytes,
-                        bytes,
-                        items,
-                    );
-                    if packets > 0 && sidecar_len > 0 {
-                        if let Some(ff) = binding
-                            .cos
-                            .cos_interfaces
-                            .get_mut(&root_ifindex)
-                            .and_then(|root| root.queues.get_mut(queue_idx))
-                            .and_then(|q| q.flow_fair_state.as_mut())
-                        {
-                            for &(bucket, bytes) in &sidecar[..packets as usize] {
-                                account_flow_bucket_tx(ff, bucket, bytes, now_ns);
-                            }
-                        }
-                    }
-                    if packets > 0 {
-                        binding
-                            .live
-                            .tx_packets
-                            .fetch_add(packets, Ordering::Relaxed);
-                        binding.live.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
-                        // #760 instrumentation, Prepared path (the
-                        // in-place-rewrite hot path). See umem.rs
-                        // field comment.
-                        binding
-                            .live
-                            .owner_profile_owner
-                            .drain_sent_bytes_shaped_unconditional
-                            .fetch_add(bytes, Ordering::Relaxed);
-                    }
-                    cos_batch_tx_made_progress(Ok((packets, bytes)))
-                }
-                Err(TxError::Retry(err)) => {
-                    binding.live.set_error(err);
-                    restore_cos_prepared_items(
-                        binding,
-                        root_ifindex,
-                        queue_idx,
-                        batch_bytes,
-                        items,
-                    );
-                    cos_batch_tx_made_progress(Err(TxError::Retry(String::new())))
-                }
-                Err(TxError::Drop(err)) => {
-                    binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
-                    binding
-                        .live
-                        .tx_submit_error_drops
-                        .fetch_add(1, Ordering::Relaxed);
-                    binding.live.set_error(err);
-                    restore_cos_prepared_items(
-                        binding,
-                        root_ifindex,
-                        queue_idx,
-                        batch_bytes,
-                        items,
-                    );
-                    cos_batch_tx_made_progress(Err(TxError::Drop(String::new())))
-                }
-            }
-        }
+            items,
+        } => submit_prepared(
+            binding,
+            root_ifindex,
+            queue_idx,
+            phase,
+            batch_bytes,
+            items,
+            now_ns,
+            shared_recycles,
+        ),
     }
 }
 
@@ -1485,51 +1314,11 @@ fn assign_prepared_dscp_rewrite(
     }
 }
 
-fn restore_cos_local_items(
-    binding: &mut BindingWorker,
-    root_ifindex: i32,
-    queue_idx: usize,
-    batch_bytes: u64,
-    retry: VecDeque<TxRequest>,
-) {
-    {
-        let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) else {
-            return;
-        };
-        if let Some(queue) = root.queues.get_mut(queue_idx) {
-            let retry_bytes = restore_cos_local_items_inner(queue, retry);
-            queue.hot.queued_bytes = queue
-                .hot
-                .queued_bytes
-                .saturating_sub(batch_bytes)
-                .saturating_add(retry_bytes);
-        }
-    }
-    refresh_cos_interface_activity(binding, root_ifindex);
-}
-
-fn restore_cos_prepared_items(
-    binding: &mut BindingWorker,
-    root_ifindex: i32,
-    queue_idx: usize,
-    batch_bytes: u64,
-    retry: VecDeque<PreparedTxRequest>,
-) {
-    {
-        let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) else {
-            return;
-        };
-        if let Some(queue) = root.queues.get_mut(queue_idx) {
-            let retry_bytes = restore_cos_prepared_items_inner(queue, retry);
-            queue.hot.queued_bytes = queue
-                .hot
-                .queued_bytes
-                .saturating_sub(batch_bytes)
-                .saturating_add(retry_bytes);
-        }
-    }
-    refresh_cos_interface_activity(binding, root_ifindex);
-}
+// #1331: restore_cos_local_items / restore_cos_prepared_items moved
+// into queue_service/submit_local.rs and submit_prepared.rs
+// respectively (each has exactly one caller, inside its owning
+// variant arm). The *_inner companions remain in tx_completion (used
+// by other call chains).
 
 #[cfg(test)]
 #[path = "tests.rs"]

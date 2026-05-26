@@ -74,10 +74,11 @@ sites (mod.rs L1131, L1172) — the arms have already been independent at
 the call site for some time. The match-dispatch is the only thing keeping
 the two bodies in one fn.
 
-This plan extracts each arm into a sibling file under
-`queue_service/submit/`, leaving `mod.rs` with a thin `match` shim that
-delegates to `submit::local` / `submit::prepared`. Pure code motion,
-no behavioral change.
+This plan extracts each arm into a flat sibling file under
+`queue_service/` (alongside the existing `drain.rs`, `service.rs`,
+`tests.rs`), leaving `mod.rs` with a thin `match` shim that delegates
+to `submit_local::submit_local` / `submit_prepared::submit_prepared`.
+Pure code motion, no behavioral change.
 
 ## Honest scope / value framing
 
@@ -107,8 +108,9 @@ granularity, not throughput.
   `Recycled`, etc.) — those do **not** exist on master. Plan must match
   current code, not the issue's speculative variant list.
 - `drain.rs` already houses the `drain_exact_*_to_scratch*` helpers
-  that **construct** the `CoSBatch` variants. The new `submit/` module
-  is the natural symmetric partner.
+  that **construct** the `CoSBatch` variants. The new `submit_local.rs`
+  / `submit_prepared.rs` flat siblings are the natural symmetric
+  partners.
 - `service.rs` exists at the same level and houses
   `service_exact_local_queue_direct` / `service_exact_prepared_queue_direct`.
   Those two callers are the **only** callsites of `submit_cos_batch`
@@ -444,11 +446,10 @@ questions remain open for round-2 hostile-verify.
    may flag this as "duplication you should fix now" — plan defends
    "verbatim move first, dedup later" as the safer order.
 
-7. **`assign_prepared_dscp_rewrite` visibility:** plan bumps it to
-   `pub(super) fn` so `submit::prepared` can import it. Reviewer should
-   confirm this is acceptable (vs moving the helper into
-   `submit/prepared.rs`, since it's only called from there now). Plan
-   picks visibility bump because `assign_*_dscp_rewrite` is a "fix-up
-   helper" the file groups together at the bottom — moving one without
-   the other splits the pair across files. Reviewer may prefer the
-   move for stronger locality.
+7. **`assign_prepared_dscp_rewrite` visibility (v2 resolution):** v2
+   keeps it as `fn` (private). Child modules
+   (`submit_local.rs` / `submit_prepared.rs`) reach private parent
+   items via `super::` per Rust's visibility rules. The v1 bump to
+   `pub(super)` was unnecessary and is dropped (Codex round-1 minor
+   finding). `assign_*_dscp_rewrite` is a "fix-up helper" pair that
+   stays grouped together at the bottom of `mod.rs`.

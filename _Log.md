@@ -69,6 +69,15 @@
 - **20:20 UTC 2026-05-26** — AGY round-1 PLAN-NEEDS-MAJOR (drop submit/ subdir, single-file extract)
 - **20:21 UTC 2026-05-26** — Codex round-1 PLAN-NEEDS-MAJOR (Local sidecar mirror_clone prefix invariant false; existing defect); Gemini PLAN-NEEDS-MINOR (drop submit/ subdir)
 - **20:22 UTC 2026-05-26** — wrote plan v2: flat-sibling layout (`submit_local.rs` + `submit_prepared.rs` under queue_service/), documented mirror_clone defect carry-over, no visibility bumps
+- **20:24 UTC 2026-05-26** — dispatched plan v2 round-2: Codex task-mpn32ftd-8uza6f, AGY review-mpn32taj-4iawxl, Gemini task-mpn32wlj-v1nrhu
+- **20:28 UTC 2026-05-26** — round-2 results: AGY PLAN-READY, Gemini PLAN-READY, Codex PLAN-NEEDS-MINOR (doc-only stale v1 prose). Claude SMR PLAN-READY (hostile-verified #1561 race surface, cross-arm independence, borrow shape, mirror_clone carry-over)
+- **20:29 UTC 2026-05-26** — cleaned stale v1 doc references; plan v2 PLAN-READY across all four reviewers
+- **20:32 UTC 2026-05-26** — implemented: created submit_local.rs (145 LOC) + submit_prepared.rs (140 LOC); replaced 221-LOC submit_cos_batch with 43-LOC match shim; moved restore_cos_{local,prepared}_items into their owning child modules; dropped from mod.rs.
+- **20:34 UTC 2026-05-26** — cargo build clean (122 pre-existing warnings, 0 errors).
+- **20:34 UTC 2026-05-26** — 1503 cargo tests pass; 1 pre-existing master failure unrelated to this refactor: `snat_contract_documents_current_fail_closed_runtime` (asserts `docs/userspace-dataplane-gaps.md` contains "fail-closed" — file at master `b92198f8` does not contain that word; failure reproduces on stock master).
+- **20:34 UTC 2026-05-26** — 5/5 flake check on `afxdp::cos::queue_service::*` (49 tests pass each iteration).
+- **20:35 UTC 2026-05-26** — Go suite passes (cached).
+- **20:35 UTC 2026-05-26** — mod.rs: 1536 → 1325 LOC (-211). submit_cos_batch: 221 → 43 LOC.
 
 ## 2026-05-26 — #1325 implementation pushed
 
