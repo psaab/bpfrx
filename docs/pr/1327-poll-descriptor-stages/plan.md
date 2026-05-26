@@ -1,7 +1,19 @@
 # #1327 Step 1 — poll_descriptor.rs: directory split + flow-cache stage extraction (Phase 1.5)
 
-**Status:** DRAFT v2 — addressing round-1 PLAN-NEEDS-MAJOR from Codex
-(`task-mpmurvhf-galzxb`) and AGY (`review-mpmus86y-f87cd8`).
+**Status:** DRAFT v3 — addressing round-2 PLAN-NEEDS-MINOR from Codex
+(`task-mpmv3ywr-yeiqag`) and AGY (`review-mpmv1y38-oyj7ha`).
+
+## v2 → v3 disposition
+
+| Round-2 finding | Disposition |
+|---|---|
+| **AGY critical — `&mut BindingWorker` won't compile.** The outer driver holds `let mut received = binding.xsk.rx.receive(available)` which mutably borrows `binding.xsk.rx`; passing `&mut binding` to the helper across the call boundary forces the compiler to assume the helper may touch `xsk.rx`, causing a borrow conflict. Today's inline code compiles because Rust's split-borrow analysis works *within* one function body but cannot span function call boundaries. | **APPLIED.** v3 signature passes disjoint sub-struct fields: `&mut binding.flow`, `&mut binding.tx_pipeline`, `&mut binding.tx_counters`, `&mut binding.scratch`, `&mut binding.mirror_sample_counter`, `&binding.live`, plus the scalar `binding.slot`, `binding.ifindex`. |
+| **Codex — signature missing `packet_fabric_ingress: bool`.** | **APPLIED.** Added — referenced at L569 of source. |
+| **Codex — call-site list incomplete: `tests.rs:3520, 3748` missing.** | **APPLIED.** Full list is now 6 test sites. |
+| **Codex — stages 12+ matrix `continue` counts inaccurate.** Example: L887-1156 has 6 continues, not 2. | **APPLIED.** v3 removes specific continue counts and frames the matrix as architectural verdict only ("blocked by mutable-locals coupling"), since precise per-stage counts are off by a few. The conclusion (all blocked) is ratified by AGY round 2. |
+| **Codex — test-plan checkboxes `[x]` before implementation.** | **APPLIED.** Changed to `[ ]` (required gates). |
+
+
 
 ## v1 → v2 disposition
 
@@ -114,7 +126,13 @@ userspace-dp/src/afxdp/
   poll_stages.rs            735 LOC — unchanged.
 ```
 
-### `stage_flow_cache_hit` signature
+### `stage_flow_cache_hit` signature (v3 — borrow-safe via disjoint fields)
+
+The helper takes individual disjoint sub-struct refs, NOT a
+`&mut BindingWorker`. This is mandatory because the outer driver
+holds `let mut received = binding.xsk.rx.receive(available)`
+which mutably borrows `binding.xsk.rx`; passing `&mut binding`
+across the function call boundary breaks split-borrow analysis.
 
 ```rust
 // poll_descriptor/flow_cache_hit.rs
@@ -124,7 +142,16 @@ pub(super) enum FlowCacheOutcome { Consumed, FallThrough }
 
 #[inline(always)]
 pub(super) fn stage_flow_cache_hit(
-    binding: &mut BindingWorker,
+    // Disjoint sub-struct refs (AGY round-2 fix):
+    flow_state: &mut WorkerFlowCacheState,   // .flow_cache, .flow_cache_session_touch
+    tx_pipeline: &mut WorkerTxPipeline,      // .pending_tx_prepared
+    tx_counters: &mut WorkerTxCounters,      // .pending_in_place_tx_packets, .record_in_place_l2_rewrite
+    scratch: &mut WorkerScratch,             // .scratch_recycle, .scratch_forwards
+    mirror_sample_counter: &mut u64,         // bumped per cached hit when mirroring
+    live: &Arc<BindingLiveState>,            // read-only Arc handle
+    binding_slot: u32,                       // scalar, by value
+    binding_ifindex: i32,                    // scalar, by value
+    // Per-descriptor context:
     binding_index: usize,
     desc: &Descriptor,
     area: *const MmapArea,
@@ -133,6 +160,7 @@ pub(super) fn stage_flow_cache_hit(
     owned_packet_frame: &mut Option<Box<[u8]>>,
     meta: UserspaceDpMeta,
     flow: &SessionFlow,
+    packet_fabric_ingress: bool,             // Codex round-2 fix; read at L569 of inline source
     validation: ValidationState,
     sessions: &mut SessionTable,
     now_ns: u64,
@@ -151,6 +179,25 @@ The helper takes `flow: &SessionFlow`, not `Option<&SessionFlow>`.
 The `packet_eligible` + `flow.is_some()` guard stays in the
 caller so the helper body has zero extra conditionals.
 
+The exact set of `binding.*` field accesses inside the lifted
+block (lines 548-879) is:
+
+- `binding.flow.flow_cache.lookup_counted(...)` (L556)
+- `binding.flow.flow_cache.invalidate_slot(...)` (L573)
+- `binding.scratch.scratch_recycle.push(...)` (L615, L874)
+- `binding.flow.flow_cache_session_touch` read+write (L623-624)
+- `binding.scratch.scratch_forwards.push(...)` (L649, L868)
+- `binding.slot` read (L702 — used as `ingress_slot`)
+- `binding.mirror_sample_counter` read+write (L723, L765)
+- `&binding.live` (L796)
+- `binding.tx_pipeline.pending_tx_prepared.push_back(...)` (L801)
+- `binding.tx_counters.pending_in_place_tx_packets += 1` (L822)
+- `binding.tx_counters.record_in_place_l2_rewrite(...)` (L823-825)
+
+`binding.bpf_maps`, `binding.xsk`, `binding.cos`, `binding.timers`,
+`binding.bind_meta` are NOT accessed by this block. Confirmed by
+grep on the line range.
+
 ### `owned_packet_frame` handling
 
 The fallback `PendingForward` branch at line 859 calls
@@ -167,9 +214,29 @@ if FlowCacheEntry::packet_eligible(meta)
     && let Some(flow) = flow.as_ref()
 {
     match stage_flow_cache_hit(
-        binding, binding_index, desc, area, raw_frame, packet_frame,
-        &mut owned_packet_frame, meta, flow, validation, sessions,
-        now_ns, now_secs, worker_ctx, telemetry,
+        &mut binding.flow,
+        &mut binding.tx_pipeline,
+        &mut binding.tx_counters,
+        &mut binding.scratch,
+        &mut binding.mirror_sample_counter,
+        &binding.live,
+        binding.slot,
+        binding.ifindex,
+        binding_index,
+        desc,
+        area,
+        raw_frame,
+        packet_frame,
+        &mut owned_packet_frame,
+        meta,
+        flow,
+        packet_fabric_ingress,
+        validation,
+        sessions,
+        now_ns,
+        now_secs,
+        worker_ctx,
+        telemetry,
     ) {
         FlowCacheOutcome::Consumed => continue,
         FlowCacheOutcome::FallThrough => {}
@@ -178,6 +245,12 @@ if FlowCacheEntry::packet_eligible(meta)
 // fall through to slow-path session resolution at line 880
 ```
 
+The split borrows of `binding.flow / tx_pipeline / tx_counters /
+scratch / mirror_sample_counter / live / slot / ifindex` are
+disjoint from `binding.xsk.rx` (still held mutably by the `received`
+binding) — Rust's borrow checker accepts these alongside the
+outer `received.read()` call.
+
 ### `record_rx_descriptor_telemetry` move
 
 Verbatim move from L2948-3126 → `poll_descriptor/rx_telemetry.rs`.
@@ -185,11 +258,11 @@ Call site at L447 imports from the new path; no signature change.
 
 ## Public API preservation
 
-Verified call sites:
+Verified call sites (6 total):
 - `userspace-dp/src/afxdp/mod.rs:514` — use-import.
 - `userspace-dp/src/afxdp/worker/lifecycle.rs:195` — production call.
-- `userspace-dp/src/afxdp/tests.rs:2793, 2978, 3145, 3353` — test
-  calls.
+- `userspace-dp/src/afxdp/tests.rs:2793, 2978, 3145, 3353, 3520, 3748` —
+  test calls (Codex round-2 fix: added 3520 + 3748).
 
 Signature of `pub(super) fn poll_binding_process_descriptor` is
 unchanged. Visibility unchanged. Module path
@@ -226,15 +299,17 @@ the same import path as a file module.
 
 ## Stages 12+ verdict (Codex #5 + AGY #5)
 
-Extraction matrix for `poll_descriptor.rs:880-2915`:
+Extraction matrix for `poll_descriptor.rs:880-2915` (architectural
+verdict only — precise per-stage `continue` counts are off by a
+few and not load-bearing; the conclusion is what matters):
 
-| Candidate | Mutable locals | continues | Verdict |
-|---|---|---|---|
-| `stage_resolve_session_or_create` (L887-L1156) | `debug`, `session_ingress_zone`, `flow_cache_owner_rg_id`, `apply_nat_on_fabric`, `decision`, plus `meta`/`owned_packet_frame` reads | 2 | BLOCKED — `decision` is threaded through next ~1700 LOC |
-| `stage_nat_preroute` (L1100-L1300) | DNAT/static-DNAT/NPTv6/NAT64 intermediates, `effective_resolution_target` | 0 | BLOCKED — outputs not a clean tuple |
-| `stage_policy_evaluate` (L1244-L1450) | `decision.nat`, log emit branches, `recycle_now` write | 5 | BLOCKED — modifies `decision.nat` in place |
-| `stage_fib_neighbor_resolve` (L1700-L2050) | `decision.resolution`, neighbor cache, MissingNeighbor enqueue | 4 | BLOCKED — MissingNeighbor side effect is the exact pattern that killed #946 Phase 2 |
-| `stage_session_install` (L2400-L2700) | `decision`, `session_ingress_zone`, conntrack publish, flow cache populate | 4 | BLOCKED — depends on outputs of all prior candidates |
+| Candidate | Mutable locals shared with rest of body | Verdict |
+|---|---|---|
+| `stage_resolve_session_or_create` (~L887-L1156) | `debug`, `session_ingress_zone`, `flow_cache_owner_rg_id`, `apply_nat_on_fabric`, `decision` (initialised here, threaded through ~1700 LOC), `meta` reads, `owned_packet_frame` reads | BLOCKED — `decision` is threaded through the next ~1700 LOC; extraction needs a `DescriptorState` struct that would tangle with `&mut binding` borrows. |
+| `stage_nat_preroute` (~L1100-L1300, nested in session-hit) | DNAT/static-DNAT/NPTv6/NAT64 intermediates, `effective_resolution_target` | BLOCKED — outputs not a clean tuple; intermediates threaded through later policy + FIB without a defensible interface boundary. |
+| `stage_policy_evaluate` (~L1244-L1450) | `decision.nat`, log emit branches, `recycle_now` write | BLOCKED — mutates `decision.nat` in place and writes the caller's `recycle_now`. Same `DescriptorState` problem. |
+| `stage_fib_neighbor_resolve` (~L1700-L2050) | `decision.resolution`, neighbor cache, MissingNeighbor enqueue | BLOCKED — MissingNeighbor side effect is the exact pattern that killed #946 Phase 2. |
+| `stage_session_install` (~L2400-L2700) | `decision`, `session_ingress_zone`, conntrack publish, flow cache populate | BLOCKED — depends on outputs of all previous candidates. |
 
 **Conclusion: Step 1 is the structural ceiling for #1327.** No
 further stages are cleanly extractable without first designing a
@@ -255,15 +330,15 @@ plan as the rationale.
 | Performance regression | **LOW** | `#[inline(always)]` removes call edge by construction. `cargo asm` is a hard gate. |
 | Architectural mismatch | **LOW** | No batched iteration (#946 Phase 2); no PollCtx; no extraction of order-coupled stages. |
 
-## Test plan
+## Test plan (required gates — Codex round-2 fix)
 
-- [x] `TMPDIR=/dev/shm CARGO_TARGET_DIR=/dev/shm/cargo cargo build --release`
-- [x] `cargo test --release` — full suite
-- [x] 5× flake on `cargo test --release -- afxdp::tests::` filter
-- [x] `cargo asm` spot-check confirming no `call` edge to
+- [ ] `TMPDIR=/dev/shm CARGO_TARGET_DIR=/dev/shm/cargo cargo build --release`
+- [ ] `cargo test --release` — full suite
+- [ ] 5× flake on `cargo test --release -- afxdp::tests::` filter
+- [ ] `cargo asm` spot-check confirming no `call` edge to
       `stage_flow_cache_hit`
-- [x] `go test ./...` — 30 Go packages
-- [x] **No per-PR smoke** — Wave-1 batch-merge rule
+- [ ] `go test ./...` — 30 Go packages
+- [ ] **No per-PR smoke** — Wave-1 batch-merge rule
 
 ## Out of scope (v2)
 

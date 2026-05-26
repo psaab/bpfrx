@@ -3775,3 +3775,25 @@
     structural ceiling" with 5-row extraction matrix demonstrating
     stages 12+ are not cleanly extractable.
   - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Round-2 plan reviews returned PLAN-NEEDS-MINOR from both
+    Codex (task-mpmv3ywr-yeiqag retry — original attempt blocked by
+    sandbox infra) and AGY (review-mpmv1y38-oyj7ha). Critical AGY finding:
+    `&mut BindingWorker` signature won't compile because outer driver
+    holds `binding.xsk.rx.receive` mutable borrow; helper must take
+    disjoint sub-struct refs. Codex: signature missing
+    packet_fabric_ingress, call sites missing tests.rs:3520+3748, matrix
+    continue-counts imprecise, test-plan checkboxes should be required
+    gates not [x].
+  - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
+  - **Reviewer ids**: Codex task-mpmv3ywr-yeiqag, AGY review-mpmv1y38-oyj7ha
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Wrote plan v3 applying all round-2 fixes. Helper signature
+    now passes 8 disjoint binding refs (flow_state, tx_pipeline,
+    tx_counters, scratch, mirror_sample_counter, live, slot, ifindex)
+    instead of &mut BindingWorker. Added packet_fabric_ingress. Field-
+    access audit confirmed only 7 binding sub-fields touched in the
+    548-879 line range. Test-plan changed to [ ] required gates.
+  - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
