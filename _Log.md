@@ -3702,3 +3702,14 @@
   feedback_triple_review_includes_claude_smr (MERGE-READY verdict). Awaiting
   Codex + AGY + Copilot to reach 4-of-4 attestation, then will post
   <!-- AWAITING-MERGE --> marker per feedback_retirement_batch_smoke_at_end.
+
+- **Timestamp**: 2026-05-26T02:45Z
+- **Action**: #1528 PR #1560 — address Copilot inline comment on phase-order wording
+- **File(s)**: docs/pr/1373-retire-ebpf-dataplane/README.md
+- **Why**: Copilot review COMMENTED with one inline comment on line 91 noting
+  that "Phase 4 (#1529) swept documentation surfaces" could read as if Phase
+  4 is complete while this PR is Phase 3 — but Phase 4 (#1529/#1537) DID
+  merge before this PR (commit 564ceba1 on master). Reworded the section to
+  make the phase order explicit and call out that Phase 4 landed before
+  Phase 3 because the canary-pinned text strings forbade direct rewrite
+  pre-Phase-3.

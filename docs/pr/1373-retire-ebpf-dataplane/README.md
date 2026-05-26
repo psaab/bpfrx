@@ -83,12 +83,24 @@ when they need backend fixtures for regression coverage.
 
 ## #1475 DPDK Backend Retired (#1525)
 
-The DPDK backend was retired in umbrella #1525. Phase 1 (#1526)
-shipped the commit-time reject; Phase 2 (#1527) removed the boot-path
-import and backend registration; Phase 3 (#1528) deleted the
-`dpdk_worker/` C tree, `pkg/dataplane/dpdk/` Go package, Makefile
-DPDK targets, and the `DPDKConfig` schema fields. Phase 4 (#1529)
-swept documentation surfaces.
+The DPDK backend was retired in umbrella #1525. The retirement
+shipped in four phases:
+
+- Phase 1 (#1526, merged): commit-time reject for `set system
+  dataplane-type dpdk`.
+- Phase 2 (#1527, merged): boot-path decouple — removed the blank
+  registration import from `cmd/xpfd/main.go` and the backend
+  registration in `pkg/dataplane/dpdk/manager.go`.
+- Phase 4 (#1529, merged): documentation sweep across the doc tree
+  (landed before Phase 3 because the canary-pinned text strings
+  that pre-#1528 forbade direct rewrite are addressed here in
+  Phase 3 by deleting the canaries themselves).
+- Phase 3 (#1528, this PR): mechanical deletion of `dpdk_worker/`
+  C tree, `pkg/dataplane/dpdk/` Go package, Makefile DPDK
+  targets, `DPDKConfig`/`DPDKAdaptiveConfig`/`DPDKPort` schema
+  types, the `SystemConfig.DPDKDataplane` field, and the
+  retirement-boundary canary entries that policed the now-deleted
+  package.
 
 After #1528, the only DPDK-related code that remains is:
 
