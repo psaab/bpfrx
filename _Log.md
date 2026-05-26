@@ -3622,3 +3622,14 @@
   entry as a KEEP (defense-in-depth). AGY r2 (adversarial-review-mpld4tso-19877w)
   returned PLAN-READY on v2 but missed findings 1, 3, 4; v3 takes Codex's
   strictly-superior feedback.
+
+- **Timestamp**: 2026-05-25T21:10Z
+- **Action**: #1528 plan v3.1 — fold AGY r3 PLAN-READY minor; Codex r5 retry
+- **File(s)**: docs/pr/1528-dpdk-mechanical-removal/plan.md, reviewer-ids.md
+- **Why**: AGY r3 (adversarial-review-mplgkdgz-ikpdw1) returned PLAN-READY on v3
+  with one minor: add TestCompileConfigForLoad_BypassesDPDKRejectViaApplyGroups
+  for explicit apply-groups + ${node} coverage under load-mode bypass. Folded
+  into §4.6 + test plan. Codex r4 (task-mplgjwea-goeioj) sandbox-failed and
+  expired from queue; per feedback_codex_infra_must_retry rule, dispatched r5
+  retry (task-mpm3bsbi-hsom0r). Awaiting verdict before proceeding to
+  implementation.

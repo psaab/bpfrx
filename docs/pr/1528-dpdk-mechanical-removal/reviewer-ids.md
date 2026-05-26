@@ -25,10 +25,19 @@
   - Self-corrected r1 Q10 hallucination (no master-side leakage canary file)
   - **Missed findings 1, 3, 4** — Codex r3 is strictly superior here
 
-### Round 3 — 2026-05-25, plan v3 (pending push)
+### Round 3 — 2026-05-25, plan v3 (f8b4caf4)
 
-- Codex r4: (to be dispatched on v3 HEAD)
-- Antigravity r3: (to be dispatched on v3 HEAD)
+- Codex r4: task-mplgjwea-goeioj (dispatched 10:30Z, FAILED — sandbox missing, expired from job queue before result fetch)
+- Codex r5 retry: task-mpm3bsbi-hsom0r (dispatched 21:10Z, pending)
+- Antigravity r3: adversarial-review-mplgkdgz-ikpdw1 (completed 17:08Z) — **PLAN-READY**
+  - All 4 Codex r3 findings correctly addressed by load-mode bypass
+  - Confirmed only validateDataplaneTypeStrict is gated; siblings run regardless
+  - Confirmed orphan sub-stanza walkthrough: effectiveDataplaneType("dpdk") returns "dpdk", no case matches in §4.3-deleted switch, sub-stanza silently dropped (consistent semantic)
+  - Confirmed daemon_run.go:247 sentinel-Is path now reachable
+  - Confirmed SyncApply rejects DPDK at compile (no flap)
+  - Confirmed four-function API > variadic options
+  - Minor: add TestCompileConfigForLoad_BypassesDPDKRejectViaApplyGroups for explicit apply-groups coverage (folded into plan)
+  - Self-corrected r2: didn't trace ExpandGroups + SyncApply paths separately; now done
 
 ## Code review
 

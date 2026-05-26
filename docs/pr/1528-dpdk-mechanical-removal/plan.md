@@ -483,7 +483,12 @@ Implementation scope (~70 LOC + tests):
   `Store.Load()`, assert `ActiveConfig() != nil` AND
   `ActiveConfig().System.DataplaneType == "dpdk"`. New test
   `TestCompileConfigForLoad_BypassesDPDKReject` — direct test on the
-  compiler entry point.
+  compiler entry point. New test
+  `TestCompileConfigForLoad_BypassesDPDKRejectViaApplyGroups` (AGY r3
+  minor) — explicit coverage of apply-groups + ${node} injected dpdk
+  under load-mode bypass, mirrors the existing
+  `TestDataplaneTypeDPDKRejectedAtCommitViaApplyGroups` shape but uses
+  `CompileConfigForNodeAndLoad` and asserts no error.
 - `pkg/config/compiler_test.go` (existing file): pin that
   `CompileConfig("dataplane-type dpdk")` still fails (commit semantics
   unchanged); the load-mode entry point variant succeeds.
@@ -601,6 +606,10 @@ for i in 1 2 3 4 5; do
 done
 for i in 1 2 3 4 5; do
   GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test -run TestCompileConfigForLoad_BypassesDPDKReject ./pkg/config/ 2>&1 | grep -E "PASS|FAIL|ok " | tail -1
+done
+# AGY r3 minor: explicit coverage of apply-groups + ${node} under load-mode bypass
+for i in 1 2 3 4 5; do
+  GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test -run TestCompileConfigForLoad_BypassesDPDKRejectViaApplyGroups ./pkg/config/ 2>&1 | grep -E "PASS|FAIL|ok " | tail -1
 done
 for i in 1 2 3 4 5; do
   GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test -run TestLoad_PersistedDPDKDataplaneTypeBootsConfigOnly ./pkg/configstore/ 2>&1 | grep -E "PASS|FAIL|ok " | tail -1
