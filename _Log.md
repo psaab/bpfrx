@@ -1,5 +1,31 @@
 # Action Log
 
+## 2026-05-26 — #1326 plan v3.2 — Codex r3 PLAN-NEEDS-MINOR addressed
+
+- **Timestamp**: 2026-05-26T (Codex r3 verdict extracted from log)
+  - **Action**: Codex r3 (replayed via log capture from
+    task-mpmvuetd-57y479; harness lost the id but the file log
+    captured the full verdict) returned PLAN-NEEDS-MINOR with 6
+    items. AGY r3 issue #1 was the same as Codex #2 (nested-field
+    qualifier, fixed in v3.1). Remaining items addressed in v3.2:
+    (1) debug_report::maybe_emit signature adds &state.sessions
+    for sessions.len + stall-dump iterator; (3) toned down LLVM
+    "can keep in registers regardless" claim to a hint with cited
+    Rust Reference + LLVM LangRef caveat; (4) acknowledged
+    pre-existing Vec paths in expire_stale_entries (gated
+    short-circuit, no heap alloc) and drain_deltas(256)
+    (lifecycle-event triggered); (5) added
+    cos_shared_exact_backlogs to the cos_fast_interfaces rebuild
+    predicate (Codex caught I miscounted — it's 7 rotation sources
+    not 6); (6) corrected param count 38 → 35; (7) cleaned stale
+    "6/8 files" language to land on the final 5-file tree (mod +
+    setup + tick + poll_drive + debug_report). Both reviewers
+    arriving at PLAN-NEEDS-MINOR with all findings address-able by
+    plan-doc edits is the strongest signal yet that v3.2 will land
+    PLAN-READY on round-4.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md,
+    docs/pr/1326-worker-loop-extract/reviewer-ids.md
+
 ## 2026-05-26 — #1326 plan v3.1 — AGY r3 nested-field qualifier fix
 
 - **Timestamp**: 2026-05-26T (AGY r3 result fetched)

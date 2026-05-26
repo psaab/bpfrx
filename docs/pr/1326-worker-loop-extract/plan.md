@@ -1,6 +1,42 @@
 # #1326 — Extract worker_loop body into worker/loop_body/
 
-**Status:** DRAFT v3 — addressing AGY r2 PLAN-NEEDS-MINOR findings
+**Status:** DRAFT v3.2 — Codex r3 + AGY r3 PLAN-NEEDS-MINOR addressed
+
+### v3→v3.2 changelog
+
+Codex r3 (replayed from log task-mpmvuetd-57y479) returned
+PLAN-NEEDS-MINOR with 6 specific findings. AGY r3
+(review-mpmvtaei-6yvid7) returned PLAN-NEEDS-MINOR with 1 finding
+that overlapped Codex's #2. All findings addressed:
+
+1. **`debug_report::maybe_emit` signature now passes `&state.sessions`**
+   (Codex r3 #1). The cold emit_report body reads `sessions.len()` at
+   today's L1730 and iterates sessions in the stall-dump at L2054.
+   Read-only shared borrow; disjoint from any &mut path.
+2. **`state.dbg_state.*` qualification fix at the drive_one_round
+   call site** (Codex r3 #2 / AGY r3 #1). Already patched in v3.1
+   commit 73700ea1.
+3. **LLVM language toned down** (Codex r3 #3). Replaced "can keep …
+   in registers regardless" with "is a hint, not a guarantee, but
+   the narrow-borrow shape removes the alias-analysis barrier that
+   would force pessimization." Cited Rust Reference + LLVM LangRef.
+4. **Allocation audit acknowledges pre-existing Vec paths**
+   (Codex r3 #4). Explicitly notes `expire_stale_entries`'s
+   short-circuit return at session/mod.rs:365 (returns empty Vec on
+   the gated fast path, no heap alloc) and `drain_deltas(256)` at
+   session/mod.rs:1035 (allocs a Vec only when deltas are pending —
+   not a per-tick path).
+5. **CoS rebuild predicate list now includes
+   `cos_shared_exact_backlogs`** (Codex r3 #5). Today's L1358-L1363
+   sets `rebuild_cos_fast_interfaces = true` on
+   `cos_shared_exact_backlogs` rotation too; previous plan version
+   miscounted the rebuild sites. Updated invariant #6.
+6. **Param count corrected 38 → 35** (Codex r3 #6). Today's
+   `worker_loop` signature actually has 35 params, not 38.
+7. **Stale "6/8 files" text removed** (Codex r3 #7). Cleaned up the
+   "rejected v2" section and the open-questions section to reference
+   only the current 5-file tree (mod.rs + setup + tick + poll_drive
+   + debug_report).
 
 ### v2→v3 changelog
 
@@ -15,8 +51,15 @@ fixable action items. v3 addresses all four:
    for binding live publishes and the worker-runtime cosmetic block.
    This keeps `state.validation`, `state.forwarding`,
    `state.sessions`, etc. completely untouched by the
-   debug-report ABI boundary — LLVM can keep them in registers
-   across the loop backedge regardless of how cold `emit_report` is.
+   debug-report ABI boundary. With those fields out of the
+   `&mut LoopState` alias set, LLVM's `noalias` analysis no longer
+   has to assume `emit_report` could mutate them, removing the
+   optimization barrier. Rust codegen attributes (`#[inline]`,
+   `#[cold]`) are hints; `#[inline(always)]` / `#[inline(never)]`
+   map to LLVM `alwaysinline` / `noinline` which are directives,
+   but final register placement still depends on the backend.
+   v3.2 (Codex r3) corrected the earlier overclaim that the change
+   "guarantees" register retention.
 
 2. **Shutdown signature fix.** AGY r2 caught that
    `shutdown::tear_down(&mut bindings, &cos_status, &heartbeat)`
@@ -246,8 +289,9 @@ userspace-dp/src/afxdp/worker/
                       # existing inline tests in mod.rs stay.
 ```
 
-Total module files: 6 (mod, setup, tick, poll_drive, debug_report,
-idle, shutdown — counted excluding optional tests.rs).
+**Final v3.2 tree: 5 files.** mod.rs (orchestrator + idle inline +
+shutdown inline), setup.rs, tick.rs, poll_drive.rs, debug_report.rs.
+The optional tests.rs is not needed for pure code motion.
 
 ### LoopState struct (v3 — DebugReportState bundle)
 
@@ -489,11 +533,16 @@ pub(crate) fn worker_loop(
             loop_now_ns,
         );
 
-        // v3: maybe_emit takes only &mut state.dbg_state — the rest
-        // of LoopState stays untouched across this call site so LLVM
-        // can keep state.validation/forwarding/sessions in registers.
+        // v3.2: maybe_emit takes &mut state.dbg_state PLUS read-only
+        // &state.sessions (sessions.len() at L1730 and the stall-dump
+        // iterator at L2054 need it). The borrow is shared+immutable,
+        // disjoint from any &mut path, so LLVM can still keep
+        // state.validation/forwarding in registers. LLVM register
+        // allocation here is a hint, not a guarantee — see codegen
+        // attribute caveat in the v3.2 changelog.
         debug_report::maybe_emit(
             &mut state.dbg_state,
+            &state.sessions,
             &mut bindings,
             worker_id, loop_now_ns,
         );
@@ -564,6 +613,15 @@ Findings:
 - `purge_queued_flows_for_closed_deltas` + `flush_session_deltas` —
   allocate inside `drain_deltas(256)` (Vec) at L1666/L1697. Pre-existing.
   Plan preserves call sites in `deltas.rs`.
+- **Pre-existing Vec paths inside `SessionTable`** (Codex r3 #4
+  caveat): `expire_stale_entries` at session/mod.rs:365 contains a
+  `Vec::new()` short-circuit on the gated fast path (returns the
+  zero-capacity Vec, no heap alloc — RawVec::NEW is a const). The
+  per-tick path hits the short-circuit on every tick that's within
+  `SESSION_GC_INTERVAL_NS` of the last GC. `drain_deltas(256)` at
+  session/mod.rs:1035 also allocates a Vec, but only when
+  `has_pending_deltas` is true — that's a non-tick path triggered
+  by session lifecycle events. Both are unchanged by this refactor.
 
 **Affirmation: zero NEW per-tick allocations introduced by this
 refactor.** The orchestrator's `state.shared_recycles` is the SAME
@@ -641,7 +699,7 @@ apply here).
 
 ## Public API preservation
 
-- `pub(crate) fn worker_loop(...)` — exact same 38-parameter signature
+- `pub(crate) fn worker_loop(...)` — exact same 35-parameter signature
   and exact same `use` site in `worker_runtime.rs` / coordinator. The
   fn body moves into `loop_body/mod.rs` and the original is replaced
   by a `pub(crate) use loop_body::worker_loop;` re-export.
@@ -681,13 +739,18 @@ keeps working.
 5. **interrupt_poll_fds reuse.** Same as above. Initialized once,
    reused. Plan keeps it on LoopState.
 6. **cos_fast_interfaces rebuild predicate.** The
-   `rebuild_cos_fast_interfaces` flag is OR'd across 5 different Arc
-   refresh sites (forwarding, owner_worker_by_queue, owner_live_by_queue,
-   root_leases, queue_leases, queue_vtime_floors). Plan computes the
-   flag inside `arc_refresh::refresh_per_tick` and the rebuild
-   happens in the SAME fn before return. Cannot be split across
-   phase boundaries because the rebuild needs `&mut bindings` AND
-   the freshly-loaded Arcs.
+   `rebuild_cos_fast_interfaces` flag is OR'd across 7 different Arc
+   refresh sites in today's code: forwarding (cos_changed branch at
+   L1324-L1332), owner_worker_by_queue (L1337-L1343),
+   owner_live_by_queue (L1344-L1349), root_leases (L1350-L1357),
+   **exact_backlogs (L1358-L1363)** — Codex r3 #5 caught that v3
+   missed this one, **queue_leases (L1364-L1371)**, and
+   queue_vtime_floors (L1372-L1386). Plan computes the flag inside
+   `tick::arc_refresh` and the rebuild (calling the cold
+   `rebuild_cos_fast_interfaces_and_repub` helper) happens in the
+   SAME fn before return. Cannot be split across phase boundaries
+   because the rebuild needs `&mut bindings` AND the freshly-loaded
+   Arcs.
 7. **HA load lifetime.** `let ha_runtime = ha_state.load();` is a
    `Guard` that must outlive the poll_drive call (passed as
    `ha_runtime.as_ref()`). Plan keeps `ha_runtime` on the
@@ -796,14 +859,14 @@ runs after the wave is merged.)
    persist across phase boundaries within a tick is identical to
    current behaviour.
 
-5. **Should this even be split into 8 files?** Alternative: collapse
-   debug_report + idle + shutdown into a single `tail.rs`, fold
-   expiry into commands. Net: 5 files instead of 8. Is the issue's
-   8-file sketch (init/arc_refresh/commands/bpf_refresh/
-   telemetry_publish/tx_apply/shared_binding/create) the right
-   granularity, or is finer/coarser better? Plan deviated to 8 files
-   organized by tick-phase rather than by struct-area — argue
-   against if appropriate.
+5. **5-file tree right granularity?** v3.2 lands on 5 files
+   (mod.rs + setup + tick + poll_drive + debug_report). v1 proposed
+   the issue body's 8-file struct-area sketch; AGY r1/r2 narrowed
+   to 6 by folding the non-poll tick helpers into tick.rs; Codex r3
+   collapsed shutdown + idle into mod.rs to land at 5. Any reason
+   to split further (e.g. splitting tick.rs into per-helper files)
+   or collapse further (folding setup back into mod.rs)? Both
+   reviewers signalled this is the right compromise on r3.
 
 6. **`pub(crate) use loop_body::worker_loop;` vs moving the fn entirely.**
    Either works. The re-export keeps the call site
