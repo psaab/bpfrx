@@ -21,8 +21,8 @@ each cluster has a clear ownership boundary.
 
 | File | Purpose |
 |------|---------|
-| `mod.rs` | `BindingWorker` struct + shared-binding helpers + `pub(crate) use loop_body::worker_loop` re-export. (Calls `pin_current_thread`, which is defined in `afxdp/neighbor.rs`.) |
-| `loop_body/mod.rs` | `worker_loop` body (extracted in #1326 Phase 1). Per-tick orchestrator; the sub-stage carve is a follow-up. |
+| `mod.rs` | `BindingWorker` struct + shared-binding helpers + `pub(crate) use loop_body::worker_loop` re-export. |
+| `loop_body/mod.rs` | `worker_loop` body (extracted in #1326 Phase 1). Per-tick orchestrator; calls `pin_current_thread` (defined in `afxdp/neighbor.rs`) at startup. The sub-stage carve into `setup.rs` / `tick.rs` / `poll_drive.rs` / `debug_report.rs` is a follow-up. |
 | `lifecycle.rs` | `poll_binding` — the per-poll RX/TX orchestrator. The "central function" extracted in Issue 73 step 2. |
 | `cos.rs` | Per-worker CoS runtime helpers + shared-exact threshold (the empirical sustained per-worker exact throughput ceiling — see comment block in the file for the evidence basis). |
 | `cos_state.rs` | `WorkerCos` (#959 Phase 3) — per-binding CoS-engine state. |
