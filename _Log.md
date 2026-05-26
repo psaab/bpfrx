@@ -53,9 +53,20 @@
     - README.md + test header doc-cleanup done.
 - **18:35 UTC** — Cargo build clean. Cargo test 1433/1433 pass.
   5x flake check on equal_flow_epoch_payload_is_visible_after_tag_under_concurrent_readers
-  5/5 pass. Go suite 32 packages OK, 0 fails. Binary size delta:
-  5,539,856 (this branch) vs 5,546,888 (master) = -7,032 bytes
-  (-0.13%) — well below 0.5% threshold.
+  5/5 pass (equal-flow payload visibility under concurrent reader,
+  not the seqlock CAS rotation itself). Go suite 32 packages OK,
+  0 fails. Binary size delta: 5,539,856 (this branch) vs
+  5,546,888 (master) = -7,032 bytes (-0.13%) — under 0.5% threshold.
+- **18:50 UTC** — PR #1588 opened f8ad9fe3. Codex+AGY hostile code
+  review dispatched. Claude SMR review: MERGE-READY (diff confirms
+  both fn bodies are 1-line different from master modulo visibility
+  prefix; impl block closes correctly; pub(super) does not leak
+  outside shared_cos_lease/ per grep).
+- **19:00 UTC** — Codex code r1 MERGE-NEEDS-MINOR: validation-wording
+  fix — the first 5x flake target tested equal-flow payload publish,
+  not seqlock CAS rotation under contention as the plan required.
+  Reran 5x flake on bypass_starvation_events_swap_at_rotation (true
+  rotation ATOMIC-SWAP test): 5/5 pass. PR description updated.
 
 ## 2026-05-26 — #1325 implementation pushed
 
