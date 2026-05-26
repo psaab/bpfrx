@@ -1,348 +1,390 @@
-# #1547 — Split `pkg/frr/frr.go` (Plan v2)
+# #1547 — Split `pkg/frr/frr.go` (Plan v3)
 
-**Status:** DRAFT v2 — addresses Codex PLAN-NEEDS-MAJOR and Gemini
-PLAN-KILL feedback from round 1.
+**Status:** DRAFT v3 — addresses round 2 findings from
+Codex (PLAN-NEEDS-MAJOR) and Gemini (PLAN-KILL on reload bypass).
 
-## Round 1 outcomes
+## Review history
 
-- **Codex** (task `task-mpn2tga9-k9tqob`): PLAN-NEEDS-MAJOR.
-  Demands (1) vtyshExecutor interface in the same PR to satisfy
-  issue acceptance criterion 3; (2) `generateProtocols` moved
-  out of `policy_render.go` into a separate
-  `protocols_render.go`; (3) `ifaceNetwork` is actually called
-  from protocol rendering (line 689), not interface settings —
-  must move with protocols; (4) `ApplyFull` inline render
-  blocks extracted into named helpers; (5) README will go stale
-  and must be updated.
-- **Gemini** (task `task-mpn2twzv-dyoeha`): PLAN-KILL. Same two
-  blocking demands: (1) the cohesion claim that
-  `generateProtocols` and `generatePolicyOptions` share helpers
-  is **factually false** — `resolveRedistribute` and the BFD
-  profile dedup are only used by protocol rendering;
-  (2) vtyshExecutor interface is an issue acceptance criterion
-  and cannot be unilaterally deferred.
+- **Round 1** (plan v1, commit `f9713e65`)
+  - Codex `task-mpn2tga9-k9tqob`: PLAN-NEEDS-MAJOR — defer of
+    vtyshExecutor, wrong grouping for `ifaceNetwork`,
+    `ApplyFull` inline blocks left in orchestrator, README
+    will go stale.
+  - Gemini `task-mpn2twzv-dyoeha`: PLAN-KILL — false cohesion
+    claim in `policy_render.go`, AC#3 cannot be deferred.
+- **Round 2** (plan v2, commit `71370dc7`)
+  - Codex `task-mpn3es2s-6o96p3`: PLAN-NEEDS-MAJOR —
+    zero-value Manager panic on `var m frr.Manager`;
+    parsing methods in `status_parse.go` must also route
+    through the executor; stale v1 text in plan contradicts
+    v2; no fake-executor tests required by plan; ECMP block
+    in `ApplyFull` not addressed (Gemini also flagged this).
+  - Gemini `task-mpn3fedx-8nv5ky`: PLAN-KILL — single-method
+    `exec(cmd)` executor signature does not cover `m.reload()`,
+    which itself shells out to `systemctl reload frr` (with
+    context timeout) and falls back to `vtysh -f m.frrConf`.
+    AC#3 is therefore still not satisfied: `ApplyFull` cannot
+    be mocked in tests because `reload()` still escapes the
+    executor.
 
-## What v2 changes
+## What v3 changes vs v2
 
-1. **`vtyshExecutor` interface added in this PR.** A narrow
-   private interface
-   (`type vtyshExecutor interface { exec(cmd string) (string,
-   error) }`) is introduced in `vtysh.go`. The `Manager` gains a
-   `vtysh vtyshExecutor` field initialized in `New()` to the
-   real `exec.Command` implementation; tests can inject a fake.
-   All public `Get*` methods and `ExecVtysh` route through
-   `m.vtysh.exec(cmd)` instead of the bare `vtyshCmd` free
-   function. This satisfies issue acceptance criterion 3.
-2. **File-grouping decision held to the user's mandate.** The
-   user's standing rule for this PR is **exactly five sibling
-   `.go` files**: `manager.go`, `config_render.go`, `vtysh.go`,
-   `status_parse.go`, `policy_render.go`. Both reviewers asked
-   for a sixth file (`protocols_render.go`). The user override
-   wins. To address the cohesion concern, `policy_render.go`
-   becomes "**protocols + policy rendering**" — it owns
-   `generateProtocols`, `generatePolicyOptions`,
-   `resolveRedistribute`, `knownRedistProtocols`,
-   `bfdProfile`, `bfdProfileName`, and `ifaceNetwork`. The file
-   name stays `policy_render.go` to honor the user's literal
-   list; the file header doc comment documents the actual
-   contents. If a future reviewer still considers this a
-   blocker after reading the user's standing rule, that is a
-   user-arbitration question and not a plan-revision one.
-3. **`ifaceNetwork` correctly placed.** Per Codex's
-   line-evidence at frr.go:689, `ifaceNetwork` is called from
-   OSPF rendering inside `generateProtocols`, not from
-   `generateInterfaceSettings`. Moves to `policy_render.go`
-   with the rest of protocol rendering.
-4. **Inline `ApplyFull` rendering blocks extracted to named
-   helpers in `config_render.go`.** Per Codex finding 4. New
-   helpers: `renderGenerateRoutes(b, fc)`,
-   `renderDHCPDefaults(b, fc)`, `renderBackupRouter(b, fc)`,
-   `renderClusterModeDefaults(b, fc)`. These are pure code
-   motion — call sites in `ApplyFull` become single function
-   calls. `ApplyFull` becomes the ordering glue and nothing
-   more.
-5. **README updated.** Entry-point list and file-location
-   citations updated to the new layout.
+1. **Broader `frrExecutor` interface** (renamed from
+   `vtyshExecutor` to reflect coverage of the systemctl + vtysh
+   reload path too). Three methods, all private to the
+   package:
+   ```go
+   type frrExecutor interface {
+       // Vtysh "-c" one-shot command. Used by ExecVtysh and all
+       // status query methods (parsed + raw).
+       Vtysh(command string) (string, error)
+       // systemctl reload frr with caller-supplied context for
+       // the 15s timeout invariant.
+       SystemctlReload(ctx context.Context) error
+       // vtysh -f <conf> fallback when systemctl reload fails.
+       VtyshLoad(ctx context.Context, conf string) ([]byte, error)
+   }
+   ```
+   `realExecutor` (private) wraps `exec.Command` /
+   `exec.CommandContext` for each method. The bodies are
+   byte-identical to the existing call sites
+   (`pkg/frr/frr.go:1056-1075` for reload,
+   `pkg/frr/frr.go:1597-1605` for vtysh).
+2. **Zero-value-safe accessor.** `Manager` gains an unexported
+   helper `func (m *Manager) executor() frrExecutor` that
+   returns `m.exec` if non-nil, otherwise the package-default
+   `realExecutor{}`. Every internal call site uses
+   `m.executor().Vtysh(...)` / `.SystemctlReload(ctx)` /
+   `.VtyshLoad(ctx, conf)`. This preserves the existing
+   contract that `var m frr.Manager; m.ExecVtysh(...)` does
+   not panic on a literal `Manager`.
+3. **All vtysh-shelling paths route through the executor**:
+   - Public `Manager.ExecVtysh` and all raw `Get*` methods
+     in `vtysh.go`.
+   - Parsed methods in `status_parse.go` (`GetRIPRoutes`,
+     `GetISISAdjacency`, `GetOSPFNeighbors`,
+     `GetBGPSummary`, `GetBGPRoutes`, `GetRouteDetailJSON`)
+     also call `m.executor().Vtysh(...)`. The parsers stay
+     in `status_parse.go`; only the exec call changes.
+   - `Manager.reload` in `manager.go` uses
+     `m.executor().SystemctlReload(ctx)` and
+     `m.executor().VtyshLoad(ctx, m.frrConf)`. The 15s
+     `context.WithTimeout(context.Background(), 15*time.Second)`
+     timeout stays in `reload()` exactly as today; only the
+     `exec.Command*` calls become method calls on the executor.
+4. **`ApplyFull` becomes pure ordering glue.** Per Codex
+   finding 4 (round 1) and Gemini ECMP finding (round 2),
+   every inline rendering and policy-resolution block moves
+   to a named helper in `config_render.go`:
+   - `renderGenerateRoutes(b *strings.Builder, fc *FullConfig)`
+   - `renderDHCPDefaults(b *strings.Builder, fc *FullConfig)`
+   - `renderBackupRouter(b *strings.Builder, fc *FullConfig)`
+   - `renderClusterModeDefaults(b *strings.Builder, fc *FullConfig)`
+   - `resolveECMP(fc *FullConfig) int` — returns the
+     `ecmpMaxPaths` value and **also mutates
+     `fc.ConsistentHash`** as today (this side-effect is
+     documented in the function doc comment because it's
+     unusual).
+5. **File grouping unchanged from v2.** Exactly 5 sibling
+   `.go` files per user mandate: `manager.go`,
+   `config_render.go`, `vtysh.go`, `status_parse.go`,
+   `policy_render.go`. `policy_render.go` is documented in
+   its file-header doc comment as "protocols + policy
+   rendering". The user override on the 5-file count is the
+   adjudicated answer; reviewers are not invited to
+   re-litigate.
+6. **README updated** to reflect the new layout (entry-point
+   list maps `Manager` to `manager.go`; the status-query
+   bullet maps to `status_parse.go` and `vtysh.go`).
+7. **Fake-executor tests added.** New `frr_executor_test.go`
+   (or appended to `frr_test.go` — pick whichever keeps
+   diffs cleanest) exercises:
+   - `Manager.ExecVtysh` with an injected fake (asserts
+     command string forwarded).
+   - One parsed method (`Manager.GetRIPRoutes`) with a
+     fake that returns a canned vtysh response.
+   - `Manager.reload` happy path (systemctl succeeds) and
+     fallback path (systemctl fails, vtysh -f succeeds)
+     with a fake executor.
 
 ## Issue framing
 
-`pkg/frr/frr.go` is 1606 LOC and mixes four distinct responsibilities:
+`pkg/frr/frr.go` is 1606 LOC and mixes four responsibilities:
 
-1. **Config rendering** — managed-section rendering, interface settings,
-   static-route emission, per-VRF rendering, top-level `Apply`/`ApplyFull`
-   orchestration, `writeManagedSection`, `reload`.
-2. **Vtysh execution** — `vtyshCmd`, `ExecVtysh`, and the thin per-feature
-   shells that wrap raw vtysh shell-outs (`GetBFDPeers`, `GetRouteMapList`,
-   `GetISISAdjacencyDetail`, `GetISISDatabase`, `GetISISRoutes`,
-   `GetOSPFNeighborDetail`, `GetOSPFDatabase`, `GetOSPFInterface`,
-   `GetOSPFRoutes`, `GetBGPNeighborReceivedRoutes`,
-   `GetBGPNeighborAdvertisedRoutes`, `GetBGPNeighborDetail`).
-3. **Status parsing** — `GetRIPRoutes`, `GetISISAdjacency`,
-   `GetOSPFNeighbors`, `GetBGPSummary`, `GetBGPRoutes`,
-   `GetRouteDetailJSON`, `parseRouteJSON`, `FormatRouteDetail`, the
-   `frrRouteJSON`/`frrNextHopJSON` decode types, and the public
-   `RIPRouteEntry`/`ISISAdjacency`/`OSPFNeighbor`/`BGPPeerSummary`/
-   `BGPRoute`/`FRRRouteDetail`/`FRRNextHop` types.
-4. **Protocol + policy rendering** — `generateProtocols` (OSPF, OSPFv3,
-   BGP, RIP, ISIS, BFD profile dedup), `generatePolicyOptions`
-   (prefix-lists, route-maps, communities), `resolveRedistribute`,
-   `knownRedistProtocols`, `bfdProfile`/`bfdProfileName`,
+1. **Config rendering** — managed-section, interface
+   settings, static-route emission, per-VRF rendering,
+   `Apply`/`ApplyFull` orchestration, `writeManagedSection`,
+   `reload`.
+2. **Vtysh execution** — `vtyshCmd`, `ExecVtysh`, and thin
+   per-feature raw-output shells.
+3. **Status parsing** — `Get*` methods that parse vtysh
+   output into typed `*Entry`/`*Neighbor`/`*Route` values.
+4. **Protocol + policy rendering** — `generateProtocols`
+   (OSPF/OSPFv3/BGP/RIP/ISIS), `generatePolicyOptions`
+   (prefix-lists, route-maps, communities),
+   `resolveRedistribute`, BFD profile dedup,
    `ifaceNetwork`.
 
-The issue's "preferred shape" calls for sub-packages
-(`pkg/frr/render/`, `pkg/frr/protocols/`, `pkg/frr/policy/`,
-`pkg/frr/vtysh/`, `pkg/frr/status/`, `pkg/frr/routes/`). The user's
-standing rules explicitly **forbid** that: the split must use
-**sibling `.go` files inside `pkg/frr/`** — no sub-packages, no
-filename prefixes (i.e. NOT `frr_config_render.go`).
+Issue acceptance criteria:
+
+1. Existing FRR output remains byte-for-byte identical for
+   current fixtures.
+2. Route-map / prefix-list rendering has focused tests.
+3. vtysh command execution is behind a narrow interface for
+   tests.
+4. `go test ./pkg/frr/...` passes.
+
+This plan covers AC1 (regression oracle is the existing
+`frr_test.go`), AC3 (via the `frrExecutor` interface), and
+AC4 (build + test gate). AC2 is partially covered: the
+existing rendering tests already lock prefix-list and
+route-map output byte-for-byte; introducing brand-new
+isolated tests for these is a deferred follow-up (the
+existing tests are not torn down, just renamed by call
+graph).
 
 ## Honest scope/value framing
 
-This is **pure code motion** within a single Go package. It does not
-change the FRR rendering output, the vtysh execution surface, or the
-public API of `frr.Manager`. The win is purely structural:
+Pure code motion within `package frr` plus one new private
+interface and zero-value-safe accessor. Public API and
+rendered output unchanged.
 
-- Future merge conflicts on `frr.go` get scoped to the file that
-  owns the affected concern.
-- The status-parse JSON/text helpers can be unit-tested in isolation
-  without dragging the rendering globals.
-- Adding a new protocol (e.g. EIGRP, BGP-EVPN) drops into
-  `policy_render.go` or a new file without touching the manager
-  lifecycle.
+Wins:
+- Future merge conflicts scoped to the file that owns the
+  affected concern.
+- vtysh-shelling can be faked for tests (AC#3), enabling
+  test coverage of `reload()` and `ApplyFull` that today
+  requires a real `vtysh` binary on the test host.
+- Adding a new protocol drops into `policy_render.go`
+  without touching manager lifecycle.
 
-No perf gain. No correctness change. *If reviewers conclude the
-structural win is too small to justify the churn, PLAN-KILL is an
-acceptable verdict.* The user has, however, set this as a standing
-mandate for #1547 alongside the larger refactor program.
+No perf gain. No correctness change.
+
+*If reviewers conclude the structural+testability win is
+too small to justify the churn, PLAN-KILL is acceptable.*
 
 ## What's already shipped
 
-- `pkg/frr/README.md` documents the existing module contract; it
-  does not need to change because the file *layout* changes are
-  internal to the package.
-- `pkg/frr/frr_test.go` (2311 LOC) covers rendering, parsing, and
-  vtysh-shape tests; moving the implementation to sibling files
-  must not change a single test outcome.
-- The 15s FRR reload context timeout in `m.reload()` is a known
-  shutdown-correctness invariant — it must move verbatim with
-  `Manager.reload` to whatever file owns `Manager`.
+- `pkg/frr/README.md` documents the existing module
+  contract; v3 plan updates it.
+- `pkg/frr/frr_test.go` (2311 LOC) is the byte-for-byte
+  regression oracle.
+- The 15s FRR reload context timeout is a documented
+  shutdown-correctness invariant
+  (CLAUDE.md / docs/engineering-style.md).
 
 ## Concrete design
 
-All files live at `pkg/frr/` and remain in `package frr`. No
-sub-packages, no `frr_` prefixes.
+All files live at `pkg/frr/` and remain in `package frr`.
 
 ### `pkg/frr/manager.go`
 
-Owns the package-level types and the `Manager` lifecycle:
+Owns package-level types and the `Manager` lifecycle:
 
-- `Manager` struct (now with the `vtysh vtyshExecutor` field)
-  + `New()` constructor (initializes `vtysh` to the real
-  exec.Command-backed implementation).
+- `Manager` struct (with the new unexported
+  `exec frrExecutor` field).
+- `New() *Manager` — initializes `frrConf` and `exec` to
+  the real implementation.
 - `markerBegin` / `markerEnd` / `DefaultFRRConf` constants.
 - `InstanceConfig`, `DHCPRoute`, `FullConfig` types.
 - `Apply`, `ApplyWithInstances`, `ApplyFull`, `Clear`,
-  `writeManagedSection`, `reload` (with the 15s context
-  timeout preserved verbatim).
-- Top-level orchestration in `ApplyFull` that now delegates
-  every inline render block to a named helper in
-  `config_render.go`.
+  `writeManagedSection`, `reload`.
+- `(*Manager).executor()` accessor (returns `m.exec` or
+  `realExecutor{}` if nil).
+- `ApplyFull` becomes pure ordering glue: every inline
+  rendering and policy-resolution block delegates to a
+  named helper in `config_render.go`. Comment block at the
+  top of `ApplyFull` lists the emission order as a contract.
 
 ### `pkg/frr/config_render.go`
 
-Holds the non-protocol config rendering helpers:
+Non-protocol config rendering helpers:
 
 - `generateInterfaceSettings` (interface-block bandwidth +
   point-to-point hints).
 - `generateStaticRoute` (per-prefix `ip route` / `ipv6 route`
   emission with RETH name translation and IPv6 next-hop
   interface resolution).
-- New named extractors that subsume the inline `ApplyFull`
-  rendering blocks: `renderGenerateRoutes(b *strings.Builder,
-  fc *FullConfig)`, `renderDHCPDefaults`, `renderBackupRouter`,
-  `renderClusterModeDefaults`. Each one is a pure builder-write
-  that preserves the existing emission order and exact byte
-  output. Calls in `ApplyFull` become single-line invocations.
+- New named extractors:
+  - `renderGenerateRoutes(b, fc)` — emits one blackhole
+    static per `GenerateRoute`, picking v4 vs v6 by `:`.
+  - `renderDHCPDefaults(b, fc)` — computes
+    `hasV4Default`/`hasV6Default` from `fc.StaticRoutes`
+    and `fc.Inet6StaticRoutes`, then iterates
+    `fc.DHCPRoutes` to emit AD-200 defaults that don't
+    collide with explicit static defaults.
+  - `renderBackupRouter(b, fc)` — emits AD-250 default.
+  - `renderClusterModeDefaults(b, fc)` — emits the dual-AF
+    blackhole AD-250 defaults.
+  - `resolveECMP(fc) int` — computes `ecmpMaxPaths` and
+    mutates `fc.ConsistentHash` (documented side-effect).
 
 ### `pkg/frr/policy_render.go`
 
-Holds **protocol + policy rendering** (despite the name — see
-v2 file-grouping note above for why the name stays
-`policy_render.go`):
+**Protocols + policy rendering** (per the file header doc
+comment — name kept for the user 5-file mandate):
 
 - `generateProtocols` (OSPF, OSPFv3, BGP, RIP, ISIS).
 - `generatePolicyOptions` (prefix-lists, route-maps,
   communities).
-- `resolveRedistribute`, `knownRedistProtocols` map (used
-  inside `generateProtocols`).
-- `bfdProfile`, `bfdProfileName` (BFD profile dedup used inside
-  `generateProtocols`).
-- `ifaceNetwork` (used inside OSPF rendering at the original
-  frr.go:689 call site).
-
-The file header doc comment will document that this is the
-"protocol + policy" rendering file. The user's literal file
-list is honored; the misleading "policy_render" name is
-documented in code.
+- `resolveRedistribute`, `knownRedistProtocols`.
+- `bfdProfile`, `bfdProfileName`.
+- `ifaceNetwork` (called from OSPF rendering at the
+  original `frr.go:689` site).
 
 ### `pkg/frr/vtysh.go`
 
-Holds the vtysh execution surface (no parsing):
+Vtysh execution surface and the `frrExecutor` interface:
 
-- `vtyshExecutor` private interface with one method
-  `exec(command string) (string, error)`.
-- `realVtyshExecutor` private concrete type whose `exec`
-  shells out via `exec.Command("vtysh", "-c", command)` —
-  this is the byte-identical body of the existing `vtyshCmd`
-  free function, just moved behind the interface.
-- `Manager.ExecVtysh` (public) and all `GetBFDPeers`,
-  `GetRouteMapList`, `GetISISAdjacencyDetail`,
-  `GetISISDatabase`, `GetISISRoutes`, `GetOSPFNeighborDetail`,
-  `GetOSPFDatabase`, `GetOSPFInterface`, `GetOSPFRoutes`,
-  `GetBGPNeighborReceivedRoutes`,
-  `GetBGPNeighborAdvertisedRoutes`, `GetBGPNeighborDetail` —
-  all routed through `m.vtysh.exec(...)`.
+- `frrExecutor` interface (Vtysh / SystemctlReload /
+  VtyshLoad) — see "What v3 changes" section.
+- `realExecutor` struct (zero-field, methods do the
+  `exec.Command*` calls byte-identical to today).
+- `Manager.ExecVtysh` and all raw `Get*` methods that
+  used to call `vtyshCmd` now call
+  `m.executor().Vtysh(...)`.
 
 ### `pkg/frr/status_parse.go`
 
-Holds the parsing helpers and their public types:
+Parsing helpers and their public types:
 
 - `RIPRouteEntry` + `Manager.GetRIPRoutes`.
 - `ISISAdjacency` + `Manager.GetISISAdjacency`.
 - `OSPFNeighbor` + `Manager.GetOSPFNeighbors`.
 - `BGPPeerSummary` + `Manager.GetBGPSummary`.
 - `BGPRoute` + `Manager.GetBGPRoutes`.
-- `FRRRouteDetail`, `FRRNextHop`, `frrRouteJSON`, `frrNextHopJSON`.
+- `FRRRouteDetail`, `FRRNextHop`, `frrRouteJSON`,
+  `frrNextHopJSON`.
 - `Manager.GetRouteDetailJSON`, `parseRouteJSON`,
   `FormatRouteDetail`.
 
+All `Get*` methods that shell out call
+`m.executor().Vtysh(...)` so they can be faked in tests.
+
 ## Public API preservation
 
-Every exported identifier on `frr.Manager`, every exported package
-type, every exported package function MUST keep its exact signature
-and exact package path (`pkg/frr`). The split is **file-level**, not
-**package-level**. External callers (`pkg/daemon`, `pkg/grpcapi`,
-`pkg/api`, `cmd/xpfd`) see zero import-path change.
+Every exported identifier on `frr.Manager`, every exported
+package type, every exported package function keeps its
+exact signature and exact package path `pkg/frr`. External
+callers (`pkg/daemon`, `pkg/grpcapi`, `pkg/api`,
+`cmd/xpfd`) see zero import-path change.
 
-Concretely:
+The only behavioural change is:
 
-- `frr.New()`
-- `(*frr.Manager).Apply` / `.ApplyWithInstances` / `.ApplyFull` /
-  `.Clear` / `.ExecVtysh` / `.GetBFDPeers` / `.GetRouteMapList` /
-  all `GetISIS*` / all `GetOSPF*` / all `GetBGP*` /
-  `.GetRIPRoutes` / `.GetRouteDetailJSON`
-- `frr.DefaultFRRConf`
-- `frr.InstanceConfig` / `frr.DHCPRoute` / `frr.FullConfig`
-- `frr.RIPRouteEntry` / `frr.ISISAdjacency` / `frr.OSPFNeighbor` /
-  `frr.BGPPeerSummary` / `frr.BGPRoute` / `frr.FRRRouteDetail` /
-  `frr.FRRNextHop`
-- `frr.FormatRouteDetail`
+- `var m frr.Manager; m.ExecVtysh(...)` continues to work
+  (zero-value-safe via `m.executor()`).
+- `frr.New()` continues to be the canonical constructor and
+  pre-populates `m.exec` with the real implementation.
 
 ## Hidden invariants the change must preserve
 
-1. **15s FRR reload context timeout** in `Manager.reload`. This is
-   the project's documented shutdown safety net to prevent hanging
-   on `systemctl reload frr`. Must move byte-identical into
+1. **15s FRR reload context timeout** in `Manager.reload`.
+   `ctx, cancel := context.WithTimeout(context.Background(),
+   15*time.Second)` stays in `reload()` byte-identical;
+   only the `exec.Command*` lines move into
+   `realExecutor.SystemctlReload` /
+   `realExecutor.VtyshLoad`. The ctx is passed through.
+2. **Managed-section markers** (`markerBegin` /
+   `markerEnd`): `writeManagedSection` does a literal
+   substring strip-and-replace; constants stay in
    `manager.go`.
-2. **Managed-section markers** (`markerBegin` / `markerEnd`):
-   `writeManagedSection` does a literal substring strip-and-replace
-   on the on-disk `/etc/frr/frr.conf`. The marker constants must
-   stay reachable from `writeManagedSection` (they live in
-   `manager.go` alongside it).
-3. **ApplyFull orchestration order** — current order is:
-   global statics → generate-routes → inet6 statics → DHCP-learned
-   defaults → backup-router → cluster-mode blackhole → per-VRF
+3. **ApplyFull emission order**: global statics →
+   generate-routes → inet6 statics → DHCP-learned defaults
+   → backup-router → cluster-mode blackhole → per-VRF
    statics → policy-options → interface-settings → global
-   protocols → per-VRF protocols. The order matters for FRR
-   parsing (interface settings before OSPF cost auto-derivation).
-   The split must preserve this order verbatim.
-4. **BFD profile dedup** in `generateProtocols` — keep adjacent
-   to `bfdProfile`/`bfdProfileName` in `policy_render.go`.
-5. **slog.Info calls** at FRR-write and reload sites stay where
-   they are (one-time events, not hot path — per project logging
-   rules).
-6. **Byte-for-byte rendered output** — the issue's first
-   acceptance criterion is "Existing FRR output remains
-   byte-for-byte identical for current fixtures." The 2311-LOC
-   `frr_test.go` is the regression oracle.
+   protocols → per-VRF protocols. Preserved verbatim. A
+   doc comment at the top of `ApplyFull` records the order
+   as a contract.
+4. **BFD profile dedup** in `generateProtocols` stays
+   adjacent to `bfdProfile` / `bfdProfileName` in
+   `policy_render.go`.
+5. **slog calls** stay at their exact lines (one-time
+   events at FRR-write and reload sites).
+6. **Byte-for-byte rendered output** — `frr_test.go` is
+   the regression oracle.
+7. **Zero-value `Manager` does not panic** —
+   `m.executor()` returns `realExecutor{}` when
+   `m.exec == nil`. Test verifies.
+8. **ECMP side-effect**: `resolveECMP(fc)` mutates
+   `fc.ConsistentHash`. Documented in the function
+   doc comment so future readers understand the
+   non-pure nature.
 
 ## Risk assessment
 
 | Risk class | Level | Reasoning |
 |---|---|---|
-| Behavioral regression | LOW | Pure code motion; no logic change. `frr_test.go` is the byte-for-byte regression oracle. |
-| Lifetime / borrow-checker | N/A | Go, not Rust. Method receivers move with their methods. |
-| Performance regression | NONE | Control plane only. FRR reload runs at config-commit time. |
-| Architectural mismatch | LOW | The issue's "preferred shape" was sub-packages; user override mandates sibling files. The risk is reviewer disagreement with the user-chosen shape, not architectural impossibility. |
+| Behavioral regression | LOW | Pure code motion + new executor indirection that preserves zero-value behavior. `frr_test.go` is the byte-for-byte regression oracle. |
+| Lifetime / borrow-checker | N/A | Go. |
+| Performance regression | NONE | Control plane only. The executor indirection is one interface dispatch per vtysh call (negligible). |
+| Architectural mismatch | LOW | 5-file shape is the adjudicated user override. The executor interface satisfies issue AC#3. |
+| Test-environment regression | LOW | Existing `frr_test.go` already runs with `_ = m.ApplyFull(fc)` (swallowing vtysh errors when the binary is absent). New fake-executor tests run without a vtysh binary. |
 
 ## Test plan
 
 - `go build ./...` clean.
-- `go test ./pkg/frr/...` — all existing tests pass with no change.
-- `go test ./...` — 30+ packages all green (downstream callers
-  unaffected).
-- Diff-check: `gofmt -d pkg/frr/*.go` clean.
-- No deploy / smoke required because:
-  - Control-plane-only change with zero behavior delta.
-  - The change does not touch the dataplane, HA, VRRP, session
-    sync, or any code path under load.
-  - Test suite covers rendered output byte-for-byte.
-  - However, per the user's standing batch-merge mandate for
-    refactor-chain PRs, the post-batch smoke will exercise this
-    change as part of the next comprehensive smoke.
+- `go test ./pkg/frr/...` — all existing tests pass with
+  no rendered-output change.
+- `go test ./...` — 30+ packages all green.
+- New fake-executor tests:
+  - `TestExecVtyshUsesExecutor` — injects fake, asserts
+    command string forwarded and result returned.
+  - `TestGetRIPRoutesUsesExecutor` — injects fake that
+    returns a canned `show ip rip` output, asserts parse.
+  - `TestReloadUsesSystemctlThenVtyshLoad` — fake fails
+    systemctl, succeeds VtyshLoad; asserts fallback is
+    taken. Verifies the 15s context is passed.
+  - `TestZeroValueManagerExecVtyshNoPanic` — zero-value
+    `frr.Manager{}` calls `ExecVtysh` and either returns a
+    real result or an exec error (no panic).
+- `gofmt -d pkg/frr/*.go` clean.
+- No deploy / smoke required (control-plane refactor; per
+  batch-merge mandate, post-batch smoke covers it).
 
 ## Out of scope (explicitly)
 
-- Carving out sub-packages (`pkg/frr/render/`, etc.) — explicitly
-  forbidden by user rules.
+- Carving out sub-packages — explicitly forbidden by user
+  rules.
 - Renaming any exported identifier.
-- Restructuring `frr_test.go` (the regression oracle stays intact;
-  follow-up issue can split it after the source split lands).
-- Adding new interfaces (`type Renderer interface`, etc.) — the
-  issue mentions "vtysh command execution is behind a narrow
-  interface for tests" but introducing an interface here is a
-  behavioral surface change, not pure code motion. Defer to a
-  follow-up if/when test mocking actually needs it.
-- Touching `pkg/frr/README.md` — module contract is unchanged.
+- Restructuring `frr_test.go` (regression oracle stays
+  intact).
+- Splitting `policy_render.go` into a separate
+  `protocols_render.go` — explicitly held back by user
+  5-file mandate.
+- Broadening the `frrExecutor` interface beyond what
+  current callers need (e.g. streaming output, custom
+  args) — defer to a follow-up when a concrete caller
+  requires it.
 
 ## Open questions for adversarial review (each invitable to PLAN-KILL)
 
-1. **Is sibling-file split sufficient value over a sub-package
-   split?** The issue *prefers* sub-packages. The user overrides
-   with sibling files. If you (the reviewer) think sibling files
-   inside `package frr` deliver too little structural separation
-   to justify the churn relative to the eventual ideal,
-   PLAN-KILL is fair.
-2. **Does `policy_render.go` hold the right grouping?** Should
-   `generateProtocols` (which is large and protocol-heavy) live
-   in its own `protocols_render.go`, with `policy_render.go`
-   carrying only `generatePolicyOptions`? The shared
-   `resolveRedistribute` + BFD-dedup pulls them together, but the
-   2-file alternative is a viable shape.
-3. **Should the inline static-route / DHCP-route / generate-route
-   / backup-router / cluster-mode rendering blocks in `ApplyFull`
-   be hoisted into named helpers in `config_render.go`?** Doing
-   so makes the manager method shorter but adds named helpers
-   that exist only for one caller. Status quo is also defensible.
-4. **Does keeping the public `*RouteEntry` / `*Neighbor` / etc.
-   types in `status_parse.go` create import-cycle hazards?** They
-   are package-level exports; no import-cycle risk inside the
-   package. But if a downstream caller imports a type from
-   `pkg/frr` *expecting* it to live with the manager (e.g. via
-   IDE jump-to-definition), this is a small ergonomic change.
-5. **Is the 15s context timeout in `Manager.reload` actually
-   safe to move?** It is. But verify the move is byte-identical
-   and no caller does `m.reload()` from a goroutine that would
-   now race with the file move. (None do — it's only called from
-   `ApplyFull`.)
-6. **Should we introduce a `vtyshExecutor` interface in
-   `vtysh.go`?** The issue says yes ("vtysh command execution is
-   behind a narrow interface for tests"). The plan defers this
-   to a follow-up because introducing an interface is behavioral
-   surface change, not code motion. Reviewer may push back on
-   that deferral.
-7. **Are we sure no currently-private helper becomes
-   `cross-file-private`-broken?** All Go package-private names
-   stay package-private; sibling files in the same package share
-   the namespace. No risk, but the reviewer should confirm by
-   reading the call graph.
+1. **Is the `frrExecutor` interface scoped correctly?**
+   Three methods cover the vtysh-c, systemctl-reload, and
+   vtysh-f-fallback call sites. Anything else in `pkg/frr`
+   shell out today? (Audit: only `vtyshCmd` and the two
+   `exec.CommandContext` calls in `reload()` shell out.)
+2. **Does the zero-value executor accessor introduce a
+   data race?** No — the field is initialized in `New()`
+   and never re-assigned. Tests that inject a fake do so
+   on a fresh `Manager` before any concurrent access.
+3. **Does `resolveECMP` mutating `fc.ConsistentHash`
+   surprise any caller?** Today the mutation happens
+   inline in `ApplyFull`. Hoisting it preserves the
+   behavior; the doc comment makes the side-effect
+   explicit. Reviewer should confirm no caller of
+   `ApplyFull` reads `fc.ConsistentHash` mid-call.
+4. **Should `realExecutor.Vtysh` take a `context.Context`
+   too, for symmetry with `SystemctlReload` /
+   `VtyshLoad`?** Today `vtyshCmd` does not use a context.
+   Adding one is an API change for the interface; can be
+   done in a follow-up if needed.
+5. **Are the new tests sufficient to claim AC#3 is met?**
+   Four tests (ExecVtysh, GetRIPRoutes, reload happy +
+   fallback, zero-value safe) cover the executor's three
+   methods plus the accessor. Reviewer may demand more
+   coverage (e.g. per-protocol parsed Get*).
+6. **Does any caller of `ApplyFull` rely on the inline
+   structure of the function (e.g. via test that monkeys
+   the internals)?** Audit of `frr_test.go` shows tests
+   only assert rendered output, not internal call order.
+   Safe.
