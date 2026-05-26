@@ -20,9 +20,12 @@ here so the next iteration can fetch results by ID.
 
 Both reviewers PLAN-READY on v2.
 
-## Implementation (after PLAN-READY × 2)
+## Implementation review (commit c542c77b → aff7285d)
 
-- Codex (code review): pending
-- AGY (code review): pending
-- Copilot: pending
-- Claude SMR: pending
+- **Codex code review:** task-mpmzg76r-jd3njd — MERGE-NEEDS-MINOR (doc staleness only); addressed in 4b23cdf4 + aff7285d.
+- **AGY adversarial code review:** adversarial-review-mpmzgct1-hbaawj — hung > 25min, cancelled.
+- **AGY adversarial code review (retry):** adversarial-review-mpn144mt-f9oawg — MERGE-READY.
+- **Copilot:** COMMENTED with 4 plan.md staleness inline comments; all addressed.
+- **Claude SMR:** clean diff-vs-master; build + test pass.
+
+4-of-4 attestation. AWAITING-BATCH-MERGE marker posted on PR #1572.

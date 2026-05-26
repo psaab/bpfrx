@@ -4166,3 +4166,9 @@
 - **Timestamp**: 2026-05-26
 - **Action**: Split userspace-dp/src/nat.rs (1605 LOC) into nat/{mod,allocator,source,destination,static_nat,status}.rs + tests.rs. Plan v3 ratified after Codex+AGY round 2. Cargo build clean, 1417 main tests + 212 nat tests pass, 5x flake clean.
 - **File(s)**: userspace-dp/src/nat/* (created), userspace-dp/src/nat.rs (deleted), userspace-dp/src/nat_tests.rs (moved to nat/tests.rs), docs/pr/1542-nat-runtime-split/{plan,reviewer-ids}.md
+
+## 2026-05-26 — #1356 bpf_map publish per-AF split (Wave-2)
+
+- **Timestamp**: 2026-05-26
+  **Action**: #1356 triple-review drive — split publish_bpf_conntrack_entry per-AF; PR #1572 opened; 4-of-4 attestation (Codex MERGE-NEEDS-MINOR addressed, AGY MERGE-READY, Copilot inline addressed, Claude SMR clean); AWAITING-BATCH-MERGE marker posted.
+  **File(s)**: userspace-dp/src/afxdp/bpf_map/mod.rs, userspace-dp/src/afxdp/bpf_map/publish_conntrack.rs, userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/bpf_map_tests.rs, docs/pr/1356-bpf-map-split/{plan,reviewer-ids}.md
