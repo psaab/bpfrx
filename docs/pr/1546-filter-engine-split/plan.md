@@ -412,9 +412,23 @@ above is the union of every existing `pub(crate) fn` in engine.rs.
 
 - `cargo build` clean on `userspace-dp`.
 - `cargo test --release` clean (currently passing on master).
-- Targeted filter tests in `filter/tests.rs` — all 1919 lines remain;
-  no test edits beyond the import path rewrite if any tests
-  imported via `super::engine::*`.
+- Targeted filter tests in `filter/tests.rs` — 1919 base lines plus
+  two new AC2 tests for filter add/remove (see "AC2 coverage"
+  table in the PR body). The remaining three AC2 scenarios
+  (same-ifindex content change, positional-ID stability,
+  three-color shape change) were already present pre-split in
+  `filter/tests.rs` and now exercise the relocated helpers via
+  the `pub(crate) use engine::*` re-export. v3 update: AC2 tests
+  live in `filter/tests.rs` alongside the existing 4 AC2 tests
+  rather than in a new `engine/cache_sensitive_tests.rs` sibling.
+  Rationale: the existing AC2 tests use the private
+  `make_filter_state_with_interfaces` helper in `tests.rs`; moving
+  only the two new tests into a sibling file under `engine/` would
+  duplicate the helper or require widening its visibility.
+  Co-locating with the existing AC2 tests keeps the helper module-
+  local. The sibling-file pattern remains available as a future
+  modularity-discipline option once test count or LOC pressure
+  justifies it.
 - `cargo test --release -p userspace-dp filter::` (filter scope) ×
   5 to flake-check the most coverage-dense module.
 - `cargo test --release` full suite — 952+ tests.
@@ -429,22 +443,20 @@ above is the union of every existing `pub(crate) fn` in engine.rs.
   even though the new `engine/policer.rs` is namespace-adjacent.
   Rationale: existing import path stability + the two files have
   clearly distinct doc comments.
-- **No** edit to `filter/tests.rs`. It stays at 1919 LOC. Per-module
-  tests (per #1546 acceptance criterion 2) live as **sibling
-  `*_tests.rs` files** under `filter/engine/`, loaded via
-  `#[cfg(test)] #[path = "<name>_tests.rs"] mod tests;` from the
-  parent module. This matches the project's modularity-discipline
-  pattern (e.g. `userspace-dp/src/afxdp/forwarding_build_tests.rs`,
-  `userspace-dp/src/afxdp/bpf_map_tests.rs`,
-  `userspace-dp/src/afxdp/flow_cache_tests.rs`). v1's inline
-  `#[cfg(test)] mod tests` proposal was rejected by both Codex r1
-  and AGY r1 as a modularity-discipline violation. Concretely, the
-  initial PR will add an empty sibling test file alongside each new
-  module — actual test coverage for the acceptance-criterion-2
-  scenarios (add/remove/same-ifindex content change/positional-ID
-  stability/policer runtime-shape changes) is in scope; placeholder
-  empty files for the other modules are out of scope and added only
-  if the acceptance-criteria demand them.
+- **AC2 tests added to `filter/tests.rs` (not a sibling file).**
+  v2 proposed sibling `*_tests.rs` files (matching the
+  `forwarding_build_tests.rs` pattern). The actual PR adds only
+  two new tests (filter added / filter removed) and co-locates
+  them with the existing four AC2 tests in `filter/tests.rs` to
+  avoid duplicating the private `make_filter_state_with_interfaces`
+  helper or widening its visibility for a 70-line sibling file.
+  The sibling-file pattern is preserved as a future option once
+  test count or LOC pressure on `filter/tests.rs` justifies the
+  split. v1's inline `#[cfg(test)] mod tests` was rejected by
+  both Codex r1 and AGY r1 as a modularity-discipline violation;
+  this implementation chooses the third path (extend the existing
+  sibling `tests.rs`) which both reviewers accepted in code review
+  r1.
 - **No** API surface reduction. Every `pub(crate) fn` in engine.rs
   remains `pub(crate)` after the split.
 - **No** change to `filter/compiler.rs` or `filter/mod.rs` data
