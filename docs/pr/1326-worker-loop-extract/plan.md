@@ -696,7 +696,10 @@ Similarly:
   branch is `#[cold]`.
 - `debug_report::maybe_emit` outer (elapsed-ns gate) is
   `#[inline(always)]`; the inner `emit_report(...)` is `#[cold]` +
-  `#[inline(never)]`, taking `&mut state.dbg_state` ONLY.
+  `#[inline(never)]`, taking `&mut state.dbg_state` plus read-only
+  `&state.sessions` (for sessions.len() and the stall-dump iterator)
+  plus `&mut bindings`. NOT `&mut LoopState` wholesale — disjoint
+  borrows only.
 
 ### Hot-path always-inline list (v3)
 
