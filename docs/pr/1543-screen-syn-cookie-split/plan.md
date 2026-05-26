@@ -1,6 +1,42 @@
 # #1543 — Decompose userspace screen + SYN-cookie runtime (Wave-5)
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + AGY).
+**Status:** DRAFT v2 — addressing AGY round-1 findings (PLAN-NEEDS-MINOR).
+Codex round-1 sandbox-blocked; retrying.
+
+## v2 changes vs v1 (all from AGY round-1 findings)
+
+AGY (adversarial-review-mpn8yaz6-hakwjl) returned **PLAN-NEEDS-MINOR**
+with three concrete pre-implementation cleanups, all verified by
+direct grep against `screen_tests.rs`:
+
+1. **Test-visible types**. The current test file at lines 966 and
+   1558/1583/1585/1695/1708 directly constructs `SipHash24::new(...)`
+   and `SynCookieValidatedCache::new(...)`. The v1 plan left both as
+   private to `syncookie.rs`, which would break the test compile.
+   Fix: both become `pub(super)` in `syncookie.rs`, and `mod.rs`
+   gets a `#[cfg(test)] pub(crate) use syncookie::{SipHash24,
+   SynCookieValidatedCache};` re-export so the relocated `tests.rs`
+   keeps working unchanged.
+2. **Item-mapping table line-number typo**. The doc-block /
+   constants row says lines 1–17 but actually includes lines 18–34
+   (the `use` statements, `PROTO_*`, and `TCP_*` constants). Row is
+   corrected to "1–34".
+3. **No architectural change** — every other PASS finding holds and
+   the audit-readability premise is ratified.
+
+## Round 1 verdicts (task IDs in reviewer-ids.md)
+
+- **AGY (adversarial-review-mpn8yaz6-hakwjl): PLAN-NEEDS-MINOR.** All
+  10 hostile checks audited: drop precedence preserved, side-effect
+  ordering preserved, hot-path codegen preserved, packet.rs deviation
+  ratified, SipHash24 private placement ratified, external call sites
+  covered, architectural alignment confirmed, hidden invariants
+  preserved. Only minor: test-visible types need `pub(super)` +
+  test re-export. Item-mapping table line-number typo noted.
+- **Codex (task-mpn8xu1e-hdklvq): infra-blocked.** Sandbox
+  `codex-linux-sandbox` binary missing — Codex correctly refused to
+  invent a review from the summary. Retrying per
+  feedback_codex_infra_must_retry.
 
 ## Issue framing
 
@@ -141,9 +177,23 @@ impl ScreenState { /* preserved method set */ }
 ```
 
 Submodules use `pub(super)` for items that must be reachable across
-siblings (e.g. `RateCounter::increment`, `SipHash24` if
-`syncookie.rs` needs to expose it for tests, the `PROTO_*` /
-`TCP_*` constants in `packet.rs`).
+siblings (e.g. `RateCounter::increment`, the `PROTO_*` / `TCP_*`
+constants in `packet.rs`).
+
+**Test-visible types (v2)**: `SipHash24` and `SynCookieValidatedCache`
+become `pub(super)` in `syncookie.rs` because the relocated
+`tests.rs` constructs them directly at lines 966 (`SipHash24::new`)
+and 1558/1583/1585/1695/1708 (`SynCookieValidatedCache::new`). Then
+`mod.rs` adds a test-only re-export block so `use super::*;` in
+`tests.rs` keeps importing them:
+
+```rust
+#[cfg(test)]
+pub(crate) use syncookie::{SipHash24, SynCookieValidatedCache};
+```
+
+This is the minimum surface that lets the test file move unchanged.
+Production builds never see these symbols outside `syncookie.rs`.
 
 The four external callers in `userspace-dp/src/afxdp/` keep their
 imports unchanged:
@@ -159,7 +209,7 @@ afxdp/poll_descriptor:  use crate::screen::SynCookieChallenge;
 
 | Old screen.rs lines | New location |
 |--------------------:|--------------|
-| 1-17 (doc comment, use, PROTO_*, TCP_*) | `packet.rs` (constants) + `mod.rs` (doc) |
+| 1-34 (doc comment, use, PROTO_*, TCP_*) | `packet.rs` (constants) + `mod.rs` (doc) |
 | 35-64 (SYN_COOKIE_* consts, SYN_COOKIE_MSS_VALUES) | `syncookie.rs` |
 | 66-86 (SynCookieTuple + impl) | `syncookie.rs` |
 | 87-108 (SynCookieValidation, SynCookieChallenge, SynCookieAckVerdict) | `syncookie.rs` |
