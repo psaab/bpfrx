@@ -3738,3 +3738,19 @@
 - **Timestamp**: 2026-05-26 10:00 UTC
 - **Action**: Fold Codex r-final MERGE-NEEDS-MINOR comment findings — update 2 stale comments. (1) ErrDPDKBackendRetired comment no longer references the deleted pkg/dataplane/dpdk package-local test; points to runtime/import_canary_test.go as defense-in-depth. (2) TestSchemaValidate_AcceptsLegacyDPDKSubStanza header clarifies it guards orphaned sub-stanzas that survive the rewrite bridge, not pre-bridge schema validation.
 - **File(s)**: pkg/dataplane/dataplane.go (ErrDPDKBackendRetired comment); pkg/cmdtree/schema_validate_test.go (test header).
+
+## #1327 poll_descriptor stages — 2026-05-26
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Worktree created from origin/master; baseline measured:
+    poll_descriptor.rs = 3292 LOC (issue body said 2343 — file has grown
+    since #1054 byte-for-byte extraction).
+  - **File(s)**: branch refactor/1327-poll-descriptor-stages
+
+- **Timestamp**: 2026-05-26
+  - **Action**: Wrote plan v1 — DRAFT. Conservative Step 1: directory
+    split + record_rx_descriptor_telemetry move + flow_cache_hit stage
+    extraction + PollCtx<'a> aggregation. Explicitly defers stages 12+
+    to follow-up Steps; explicitly does NOT propose #946 Phase 2
+    (PLAN-KILLED). 7 open questions invitable to PLAN-KILL.
+  - **File(s)**: docs/pr/1327-poll-descriptor-stages/plan.md
