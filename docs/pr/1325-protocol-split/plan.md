@@ -2,10 +2,52 @@
 
 ## Status
 
+DRAFT v3 — folds Codex r2 PLAN-NEEDS-MAJOR (3 blocking) + AGY r2
+PLAN-NEEDS-MINOR (4 items, overlapping). Pending r3.
+
+### Codex r2 + AGY r2 fold
+
+1. **`NeighborSnapshot` added to `control.rs` import list.**
+   Both r2 reviewers caught it: `ControlRequest.neighbors:
+   Option<Vec<NeighborSnapshot>>` at protocol.rs:803 means
+   `control.rs` imports `NeighborSnapshot` from `snapshot.rs`.
+   Added to v3's dependency enumeration.
+2. **Public API count corrected.** v2 said "67 named items"
+   (64 structs + 2 consts + 1 fn). Mechanically verified:
+   `grep -cE '^pub(\(crate\))?\s+(struct|enum)\s+\w'` gives 66;
+   `grep -cE '^pub(\(crate\))?\s+(const|fn)\s+\w'` gives 3
+   (CONFIG_SNAPSHOT_PROTOCOL_VERSION, INJECT_PACKET_TUPLE_PROTOCOL_VERSION,
+   u64_is_zero). **Total: 69 named items.** v3 uses 69.
+3. **Differential wire-format test made fail-closed.** v2 said
+   "construct fully-populated instances"; v3 makes this
+   mechanically enforced via Rust's exhaustive-struct-literal
+   rule:
+   - **No `..Default::default()`, no struct-update `..` syntax**
+     in `wire_invariant.rs`. Every field is explicitly
+     initialized. Adding a new field to any covered struct
+     breaks compilation of the wire test, forcing simultaneous
+     update of test + fixture.
+   - **Recursive population**: `Vec<T>` and `Option<T>` fields
+     get at least one non-default `T` constructed exhaustively.
+   - Fixture regeneration is gated by env var:
+     `XPF_PROTOCOL_WIRE_REGEN=1 cargo test --test wire_invariant`
+     overwrites the fixture in-place; default `cargo test --test
+     wire_invariant` runs the compare path and fails on any
+     byte diff.
+   - Fixture path:
+     `userspace-dp/tests/fixtures/protocol_wire_v1.json`.
+4. **Stale "247 LOC tests" claim corrected to 631 LOC** in
+   §"Issue framing" (Codex r2 noted v2's framing section still
+   said 247).
+5. **`u64_is_zero` directory-tree contradiction fixed.** v3's
+   directory tree puts `u64_is_zero` ONLY in `binding.rs`. v2
+   mentioned it in both `control.rs` (tree) and `binding.rs`
+   (narrative). v3 removes the `control.rs` reference.
+
 DRAFT v2 — folds Codex r1 PLAN-KILL findings (5 blocking, all
 mechanical corrections) and AGY r1 PLAN-NEEDS-MINOR findings (4
 items, fully overlapping with Codex r1 plus a differential
-wire-format test recommendation). Pending Codex r2 and AGY r2.
+wire-format test recommendation).
 
 ### AGY r1 fold (overlaps + new)
 
@@ -93,7 +135,8 @@ wire-format test recommendation). Pending Codex r2 and AGY r2.
 ## Issue framing
 
 `userspace-dp/src/protocol.rs` is a single 3042-line flat file
-(2073 production LOC + 247 LOC `#[cfg(test)] mod tests`) that
+(2411 production LOC + 631 LOC `#[cfg(test)] mod tests`, lines
+2412–3042) that
 holds the entire serde wire schema for the helper↔daemon control
 socket. Today it concentrates ~60 unrelated DTO families (snapshot
 config DTOs, control request/response, per-binding status, per-flow
@@ -189,24 +232,25 @@ userspace-dp/src/
     │                      # ForwardingControlRequest, HAStateUpdateRequest,
     │                      # QueueControlRequest, BindingControlRequest,
     │                      # InjectPacketRequest, SessionSyncRequest,
-    │                      # SessionDeltaDrainRequest, SessionExportRequest,
-    │                      # u64_is_zero (skip_serializing_if helper)
+    │                      # SessionDeltaDrainRequest, SessionExportRequest
     ├── binding.rs         # BindingStatus (huge — ~420 LOC),
     │                      # BindingCountersSnapshot (+ From<&BindingStatus>),
     │                      # QueueStatus, WorkerRuntimeStatus,
     │                      # ExceptionStatus, SessionDeltaInfo, HAGroupStatus,
+    │                      # u64_is_zero (skip_serializing_if helper —
+    │                      # consumed by HAGroupStatus.lease_until),
     │                      # plus _ASSERT_BINDING_COUNTERS_SNAPSHOT_IS_OWNED_STATIC_SEND
     │                      # compile-time invariant
     └── resolution.rs      # PacketResolution, FlowTupleStatus
                            # (+ from_session_key impl), FlowWorkerStatus
 ```
 
-Test policy: inline `#[cfg(test)] mod tests` (currently 247 LOC at
-the bottom of `protocol.rs`) moves into the module whose types it
-exercises. The existing tests cover roughly: ProcessStatus protocol-
-version fields (control), BindingCountersSnapshot/BindingStatus
-round-trip (binding), and a few PacketResolution / FlowWorkerStatus
-defaults (resolution). They split cleanly along the same boundary.
+Test policy: inline `#[cfg(test)] mod tests` (currently 631 LOC,
+lines 2412–3042) moves into the module whose types it
+exercises, per the v2 cross-domain placement rule (test lands in
+the module of the constructor type at the top of the test body).
+Cross-domain test imports use absolute `crate::protocol::X`
+paths.
 
 ### `protocol/mod.rs` shape
 
@@ -285,7 +329,10 @@ needs. Verified by walking type-field references in
   FlowExportSnapshot, PolicyRuleSnapshot, PolicyApplicationSnapshot}`
   (Vec fields in `ConfigSnapshot`).
 - **`control.rs`**: deepest. Depends on:
-  - `snapshot::{ConfigSnapshot, UserspaceCapabilities, FabricSnapshot}`
+  - `snapshot::{ConfigSnapshot, UserspaceCapabilities, FabricSnapshot, NeighborSnapshot}`
+    (NeighborSnapshot dep added per Codex r2 / AGY r2: see
+    `ControlRequest.neighbors: Option<Vec<NeighborSnapshot>>`
+    at protocol.rs:803.)
   - `binding::{BindingCountersSnapshot, BindingStatus, HAGroupStatus,
     QueueStatus, ExceptionStatus, SessionDeltaInfo,
     WorkerRuntimeStatus}`
@@ -337,7 +384,7 @@ noted):
   reachable as `crate::CONFIG_SNAPSHOT_PROTOCOL_VERSION` via the
   `use protocol::*;` glob in `main.rs`).
 - Free fns: `u64_is_zero`.
-- 64 struct types: every type listed in §"Concrete design" above is
+- 66 struct types: every type listed in §"Concrete design" above is
   preserved by name, field set, derives, and `#[serde(...)]`
   attributes (only file moves).
 - `WorkerRuntimeStatus` keeps its `pub struct` visibility (the only
@@ -349,8 +396,10 @@ noted):
 
 Verification approach: post-refactor `grep -rE "pub(\(crate\))?\s+
 (struct|enum|fn|const)" userspace-dp/src/protocol/` matches the
-pre-refactor count from `protocol.rs` exactly (64 structs + 2 consts
-+ 1 fn = 67 named items).
+pre-refactor count from `protocol.rs` exactly (**66 structs + 2 consts
++ 1 fn = 69 named items**; verified by separate
+`grep -cE '^pub(\(crate\))?\s+(struct|enum)\s+\w'` (66) and
+`grep -cE '^pub(\(crate\))?\s+(const|fn)\s+\w'` (3)).
 
 ## Hidden invariants this change must preserve
 
@@ -390,10 +439,15 @@ pre-refactor count from `protocol.rs` exactly (64 structs + 2 consts
      `nat::*`, `security::*` (these all appear as `Vec<...>` fields
      in `ConfigSnapshot`).
    - `binding.rs` depends on: nothing in sibling protocol modules
-     (uses only `chrono`, `serde`, `std`, `crate::slowpath`).
-   - `control.rs` depends on: `snapshot::ConfigSnapshot` (one field
-     in `ControlRequest`), `binding::ProcessStatus` /
-     `binding::SessionDeltaInfo` (in `ControlResponse`).
+     (uses only `chrono`, `serde`, `std`). The
+     `From<crate::slowpath::SlowPathStatus> for SlowPathStatus`
+     conversion lives in `control.rs`, not `binding.rs`.
+   - `control.rs` depends on every leaf + snapshot — see the
+     enumerated import list in §"Inter-module dependency graph"
+     above. `ProcessStatus` lives in `control.rs` (not `binding.rs`
+     as v2 erroneously bulleted); `SessionDeltaInfo` lives in
+     `binding.rs` and is reached from `control.rs` via
+     `use super::binding::SessionDeltaInfo;`.
    - `resolution.rs` depends on: nothing (chrono + std + `crate::session`).
    - `nat.rs`, `security.rs`, `cos.rs`: leaves (no cross-domain refs).
 
@@ -462,33 +516,65 @@ pre-refactor count from `protocol.rs` exactly (64 structs + 2 consts
   no `lease_until` key; encodes `lease_until: 99` and asserts it
   appears). This is a regression net for the only non-trivial
   hazard in §"Risk assessment".
-- **Differential wire-format invariant (AGY r1 recommendation).**
-  In a new test file
-  `userspace-dp/src/protocol/wire_invariant_tests.rs` (included
-  via `#[cfg(test)] mod wire_invariant_tests;` from `mod.rs`),
-  construct fully-populated instances of every top-level wire
-  type (`ConfigSnapshot`, `ControlRequest`, `ControlResponse`,
+- **Differential wire-format invariant (Codex r2 + AGY r2:
+  fail-closed).** New integration test at
+  `userspace-dp/tests/wire_invariant.rs` (crate-test layer, runs
+  via `cargo test --test wire_invariant`). Constructs
+  exhaustive, recursively-populated instances of every top-level
+  wire type:
+
+  `ConfigSnapshot`, `ControlRequest`, `ControlResponse`,
   `ProcessStatus`, `BindingStatus`, `BindingCountersSnapshot`,
   `ExceptionStatus`, `InjectPacketRequest`, `SessionSyncRequest`,
   `SessionDeltaInfo`, `PacketResolution`, `FlowWorkerStatus`,
   `HAGroupStatus`, `QueueStatus`, `WorkerRuntimeStatus`,
-  `CoSInterfaceStatus`, `SourceNatPoolStatus`,
-  `PolicyRuleCounterStatus`, `FirewallFilterTermCounterStatus`,
-  `ThreeColorPolicerStatus`, `SourceNATRuleSnapshot`,
-  `MirrorConfigSnapshot`, `TunnelEndpointSnapshot`), serialize to
-  JSON, and compare against a checked-in canonical fixture
-  (`userspace-dp/tests/fixtures/protocol_wire_v1.json`). The
-  fixture is generated from master once and never edited again;
-  any wire change has to either update it (explicit acknowledgment)
-  or break the test (catch). Codex r2 will get this as an
-  artifact to validate.
+  `CoSInterfaceStatus`, `CoSActiveFlowCountStatus`,
+  `SourceNatPoolStatus`, `PolicyRuleCounterStatus`,
+  `FirewallFilterTermCounterStatus`, `ThreeColorPolicerStatus`,
+  `MirrorConfigSnapshot`, `TunnelEndpointSnapshot`.
+
+  Fail-closed discipline (mechanically enforced):
+  - **No `..Default::default()` and no struct-update `..` syntax**
+    in the constructors. Every field is explicitly initialized.
+    Adding any new field to any covered struct breaks compilation
+    of the wire test, forcing simultaneous update of test + fixture.
+    Rust's exhaustive-struct-literal rule makes this a compile-
+    time gate, not a runtime one.
+  - **Recursive population**: every `Vec<T>` carries at least one
+    non-default `T` constructed exhaustively; every `Option<T>`
+    carries `Some(T { ... })` exhaustively.
+  - **Fixture regen gated by env var.** Default
+    `cargo test --test wire_invariant` runs the *compare* path
+    against the checked-in fixture and fails on any byte diff.
+    `XPF_PROTOCOL_WIRE_REGEN=1 cargo test --test wire_invariant`
+    overwrites the fixture in-place. Regen is run once on master
+    (pre-split) to seed `protocol_wire_v1.json`, then again post-
+    split to confirm zero diff. Future wire-evolution PRs add
+    `protocol_wire_v2.json` (a new test) rather than overwrite v1.
+  - **Fixture path:**
+    `userspace-dp/tests/fixtures/protocol_wire_v1.json`. The
+    file is committed alongside the wire-test source.
+  - **Generation workflow** for the implementor of this PR:
+    1. Stash the in-progress split.
+    2. Check out master, write `wire_invariant.rs` as the
+       compare path against a fixture that does not yet exist,
+       then run with `XPF_PROTOCOL_WIRE_REGEN=1` to generate
+       it. Commit fixture + test on master baseline.
+    3. Pop the stash. Re-run `cargo test --test wire_invariant`
+       post-split — must pass byte-for-byte.
+
+  This is the airtight defense against silent wire drift during
+  refactor. It is independent of inline round-trip tests and
+  exists at the integration-test layer so it survives any
+  internal module reshuffling.
 - Go suite: `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test ./...`
   — protocol JSON is consumed by the Go control plane; any wire-
   field rename or rename-omission would surface here.
 - `grep -F "pub(crate)" userspace-dp/src/protocol/ -r | wc -l` and
   `grep -E "^\s*pub(\(crate\))?\s+(struct|enum|fn|const)"
   userspace-dp/src/protocol/ -r | wc -l` match the pre-refactor
-  count from `protocol.rs` (67 named items).
+  count from `protocol.rs` (69 named items: 66 structs + 2 consts
+  + 1 fn).
 - **No per-PR smoke** per the Wave-1 retirement-batch rules: post
   `<!-- AWAITING-BATCH-MERGE -->` after 4-of-4 reviewer attestation;
   the smoke-runner singleton fires smoke every 10 merged PRs.
