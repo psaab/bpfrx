@@ -1,7 +1,100 @@
 # #1528 — DPDK Retirement Phase 3: Mechanical Source Removal
 
-**Status:** DRAFT v3.2 — addresses Codex r5 PLAN-NEEDS-MINOR on the
-schema-validation edge in Store.Load
+**Status:** DRAFT v3.3 — addresses Codex r6 PLAN-NEEDS-MINOR on the
+TestSchemaValidate_AcceptsLegacyDPDKSubStanza fixture strength
+
+## v3.3 changes from v3.2
+
+Codex r6 (task-mpm8d1qz-9bj4nh) returned PLAN-NEEDS-MINOR with one
+finding: the v3.2 test
+`TestSchemaValidate_AcceptsLegacyDPDKSubStanza` fixture has no
+`class-of-service` subtree. Because `pkg/cmdtree/schema_validate.go:43-46`
+early-returns nil when `tree.FindChild("class-of-service") == nil`,
+the test only proves the CURRENT early-return behavior. It would
+incorrectly pass under a future regression where SchemaValidate
+gains a new validator block that walks `system dataplane`
+INDEPENDENTLY of the `class-of-service` early return (e.g. a
+separate top-level walker that fires regardless of which other
+subtrees exist).
+
+**v3.3 fix:** strengthen the fixture in
+`TestSchemaValidate_AcceptsLegacyDPDKSubStanza` to ALSO include a
+valid `class-of-service schedulers` block. The cos block triggers
+the existing walker (so the test actually exercises the positive
+path), and the co-located legacy DPDK shape proves that the walker
+ignores `system dataplane` leaves. A future regression that adds an
+independent `system dataplane` validator now fires THIS test
+because the dpdk fixture is structurally invalid against any new
+validator that doesn't bypass retired backends.
+
+Strengthened fixture pseudocode:
+
+```go
+func TestSchemaValidate_AcceptsLegacyDPDKSubStanza(t *testing.T) {
+    tree := &config.ConfigTree{}
+    for _, line := range []string{
+        // class-of-service block — triggers the SchemaValidate walker.
+        "set class-of-service schedulers be-sched transmit-rate 1g",
+        "set class-of-service schedulers be-sched priority low",
+        "set class-of-service schedulers be-sched buffer-size 10%",
+        // Legacy DPDK shape — must NOT be rejected.
+        "set system dataplane-type dpdk",
+        "set system dataplane cores 2-5",
+        "set system dataplane memory 2048",
+        "set system dataplane socket-mem \"1024,1024\"",
+        "set system dataplane rx-mode adaptive",
+        "set system dataplane rx-mode idle-threshold 256",
+        "set system dataplane rx-mode resume-threshold 32",
+        "set system dataplane rx-mode sleep-timeout 100",
+        "set system dataplane ports 0000:03:00.0 interface wan0",
+        "set system dataplane ports 0000:03:00.0 rx-mode polling",
+        "set system dataplane ports 0000:03:00.0 cores 2-3",
+        "set system dataplane ports 0000:06:00.0 interface trust0",
+    } {
+        path, err := config.ParseSetCommand(line)
+        if err != nil {
+            t.Fatalf("ParseSetCommand(%q): %v", line, err)
+        }
+        if err := tree.SetPath(path); err != nil {
+            t.Fatalf("SetPath(%q): %v", line, err)
+        }
+    }
+    // Pre-condition: the walker MUST actually fire (cos node present).
+    if tree.FindChild("class-of-service") == nil {
+        t.Fatal("fixture invalid: class-of-service subtree missing — walker would early-return")
+    }
+    // Assertion: SchemaValidate walks the cos block AND ignores the
+    // legacy DPDK shape. If a future PR adds a top-level system-dataplane
+    // walker without retired-backend tolerance, this test fires.
+    if err := cmdtree.SchemaValidate(tree, nil); err != nil {
+        t.Fatalf("SchemaValidate rejected legacy DPDK sub-stanza alongside valid cos block: %v", err)
+    }
+}
+```
+
+Why this is strictly stronger:
+
+| Scenario | v3.2 fixture (cos-empty) | v3.3 fixture (cos-populated) |
+|---|---|---|
+| Current SchemaValidate (cos-only walker) | Passes via early-return | Passes via positive-path walk |
+| Future PR adds a `system dataplane` validator that fires when cos is empty | **MISSES** (test still hits early-return) | **CATCHES** (cos block forces walker to run; DPDK leaves get hit by new validator) |
+| Future PR adds a `system dataplane` validator that fires unconditionally | Catches (both fixtures fail) | Catches |
+| Future PR removes cos early-return entirely | **MISSES** (still no cos node to walk) | Catches (cos block exercises real walker; DPDK leaves get rejected) |
+
+The cos-empty fixture only catches the unconditional-validator
+regression class. The cos-populated fixture catches BOTH the
+unconditional-validator regression AND the early-return-removal
+regression, which is the more likely shape a future refactor would
+take. v3.3 takes the stronger gate.
+
+Codex r6 also confirmed:
+- Apply-groups + ${node} fix is correct
+- 4-function API is appropriate for current scope
+- Pure mechanical-removal scope unchanged from r3 — nothing new to flag
+
+AGY r4 (adversarial-review-mpm8dgta-xdoziu) returned PLAN-READY on
+v3.2; r4 did not flag the fixture-strength minor but did not
+contradict it either. v3.3 takes Codex r6's strictly-superior gate.
 
 ## v3.2 changes from v3.1
 
@@ -635,10 +728,19 @@ load-mode bypass at the compile layer is therefore sufficient.
 
 2. Add `TestSchemaValidate_AcceptsLegacyDPDKSubStanza` in
    `pkg/cmdtree/schema_validate_test.go` (new file). Test fixture
-   passes the same comprehensive DPDK shape through
-   `cmdtree.SchemaValidate(tree, nil)` and asserts `err == nil`.
+   includes BOTH a valid `class-of-service schedulers` block (forces
+   the existing walker to run) AND the comprehensive legacy DPDK
+   shape (must be ignored by the walker). The cos block defeats the
+   `pkg/cmdtree/schema_validate.go:43-46` early-return so the test
+   exercises the positive-path walker, not just the early-return
+   behavior (Codex r6 v3.3 minor — see v3.3 changes section above
+   for the strictly-stronger fixture rationale).
+   Assertions: a pre-condition check that `tree.FindChild("class-of-service") != nil`
+   (so the fixture stays valid even if a refactor changes the walker
+   shape), then `cmdtree.SchemaValidate(tree, nil)` returns nil error.
    This is the **regression gate**: if a future PR expands
-   `SchemaValidate` to walk `system dataplane`, this test fires and
+   `SchemaValidate` to walk `system dataplane` (either unconditionally
+   or after removing the cos early-return), this test fires and
    forces the author to address the load-mode bypass implication.
 
 3. Document in §4.7 (this section) the scope contract:

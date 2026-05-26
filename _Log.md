@@ -3647,3 +3647,19 @@
   in pkg/configstore + TestSchemaValidate_AcceptsLegacyDPDKSubStanza in
   pkg/cmdtree) plus §4.7 contract to make the schema-validate scope an
   explicit pinned surface for retirement work. Pending re-dispatch.
+
+- **Timestamp**: 2026-05-26T01:00Z
+- **Action**: #1528 plan v3.3 — strengthen TestSchemaValidate_AcceptsLegacyDPDKSubStanza fixture (Codex r6 PLAN-NEEDS-MINOR)
+- **File(s)**: docs/pr/1528-dpdk-mechanical-removal/plan.md, reviewer-ids.md
+- **Why**: Codex r6 (task-mpm8d1qz-9bj4nh) returned PLAN-NEEDS-MINOR: the v3.2
+  fixture has no class-of-service subtree, so SchemaValidate hits the
+  pkg/cmdtree/schema_validate.go:43-46 early return and the test only proves
+  current early-return behavior. A future PR that adds a top-level
+  system-dataplane walker independently of the cos early-return would silently
+  bypass the gate. v3.3 strengthens the fixture to include a valid
+  class-of-service schedulers block alongside the legacy DPDK shape, plus a
+  pre-condition assertion that tree.FindChild("class-of-service") != nil. The
+  cos block forces the walker to exercise the positive-path, and the DPDK
+  leaves prove ignored. The strengthened fixture catches BOTH the
+  unconditional-validator regression class AND the cos-early-return-removal
+  class. Pending re-dispatch.

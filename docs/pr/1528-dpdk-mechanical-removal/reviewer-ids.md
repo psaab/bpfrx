@@ -35,10 +35,10 @@
   - **MINOR (blocking)**: schema-validate edge — Store.Load runs schemaValidateExpandedTree before compileTreeForLoad. If cmdtree.SchemaValidate ever expands to walk `system dataplane`, the load-blackout returns.
   - Verified against actual source (pkg/cmdtree/schema_validate.go:35-57): SchemaValidate is currently scoped to class-of-service schedulers only, so the concern is unfounded TODAY. v3.2 adds explicit tests + §4.7 contract to lock in the scope.
 
-### Round 4 — 2026-05-26, plan v3.2 (pending push)
+### Round 4 — 2026-05-26, plan v3.2 (54020dda)
 
-- Codex r6: (to be dispatched on v3.2 HEAD)
-- Antigravity r4: (to be dispatched on v3.2 HEAD)
+- Codex r6: task-mpm8d1qz-9bj4nh (dispatched ~00:35Z, inline-content workaround)
+- Antigravity r4: adversarial-review-mpm8dgta-xdoziu (dispatched ~00:35Z)
 - Antigravity r3: adversarial-review-mplgkdgz-ikpdw1 (completed 17:08Z) — **PLAN-READY**
   - All 4 Codex r3 findings correctly addressed by load-mode bypass
   - Confirmed only validateDataplaneTypeStrict is gated; siblings run regardless
@@ -48,6 +48,19 @@
   - Confirmed four-function API > variadic options
   - Minor: add TestCompileConfigForLoad_BypassesDPDKRejectViaApplyGroups for explicit apply-groups coverage (folded into plan)
   - Self-corrected r2: didn't trace ExpandGroups + SyncApply paths separately; now done
+
+### Round 4 — 2026-05-26, plan v3.2 (54020dda)
+
+- Codex r6: task-mpm8d1qz-9bj4nh (completed, inline-content workaround) — **PLAN-NEEDS-MINOR**
+  - One finding: TestSchemaValidate_AcceptsLegacyDPDKSubStanza fixture has no class-of-service subtree, so the test only proves the early-return behavior. A future PR adding a top-level system-dataplane walker independently of the cos early-return would silently bypass the gate.
+  - Confirmed apply-groups + ${node} fix, 4-function API, mechanical-removal scope all clean
+- Antigravity r4: adversarial-review-mpm8dgta-xdoziu (completed) — **PLAN-READY**
+  - Did not flag the fixture-strength minor
+
+### Round 5 — 2026-05-26, plan v3.3 (pending push)
+
+- Codex r7: (to be dispatched on v3.3 HEAD — inline-content workaround)
+- Antigravity r5: (to be dispatched on v3.3 HEAD)
 
 ## Code review
 
