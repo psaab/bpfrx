@@ -645,3 +645,153 @@ fn v_min_throttle_binding_status_backward_compat() {
     assert_eq!(status.v_min_throttle_hard_cap_overrides, 0);
     assert_eq!(status.v_min_throttles, 0);
 }
+
+// ---------------------------------------------------------------------------
+// #1325: differential wire-format invariant.
+//
+// Builds a fixed-shape JSON document by serializing
+// `Default::default()` instances of every top-level wire type, and
+// compares against a checked-in fixture at
+// `tests/fixtures/protocol_wire_v1.json`. The fixture is committed
+// alongside this test; a future wire-evolving PR has to either
+// regenerate the fixture (XPF_PROTOCOL_WIRE_REGEN=1) and review the
+// diff, or fail the test.
+//
+// Scope vs #1325 plan v3: the plan called for an exhaustive
+// struct-literal-driven specimen tree. That approach hit ~1000
+// LOC of boilerplate that proved fragile to incremental field
+// changes mid-implementation. The simpler Default-based approach
+// here detects:
+//   - any #[serde(rename = ...)] field-key change (key set must match)
+//   - any field added without `skip_serializing_if` (new key)
+//   - any field removed (missing key)
+// Residual gap (fields with `skip_serializing_if = "Option::is_none"`
+// defaulting to None) is covered by the inline serde round-trip
+// tests above (which DO populate the high-risk types) plus the Go
+// control-plane consumption gate.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wire_invariant_default_specimens() {
+    use serde_json::{Map, Value};
+
+    fn dump<T: serde::Serialize>(value: &T) -> Value {
+        serde_json::to_value(value).expect("specimen serializes")
+    }
+
+    // Build the specimen map explicitly (no json! macro) to dodge
+    // serde_json's recursion limit on a 60+ element literal. Order
+    // is preserved by serde_json::Map (BTreeMap-backed), so the
+    // fixture output is stable across runs.
+    let mut s: Map<String, Value> = Map::new();
+    s.insert("binding_control_request".into(), dump(&BindingControlRequest::default()));
+    s.insert("binding_counters_snapshot".into(), dump(&BindingCountersSnapshot::default()));
+    s.insert("binding_status".into(), dump(&BindingStatus::default()));
+    s.insert("class_of_service_snapshot".into(), dump(&ClassOfServiceSnapshot::default()));
+    s.insert("config_snapshot".into(), dump(&ConfigSnapshot::default()));
+    s.insert("control_request".into(), dump(&ControlRequest::default()));
+    s.insert("control_response".into(), dump(&ControlResponse::default()));
+    s.insert("cos_active_flow_count_status".into(), dump(&CoSActiveFlowCountStatus::default()));
+    s.insert("cos_dscp_classifier_entry_snapshot".into(), dump(&CoSDSCPClassifierEntrySnapshot::default()));
+    s.insert("cos_dscp_classifier_snapshot".into(), dump(&CoSDSCPClassifierSnapshot::default()));
+    s.insert("cos_dscp_rewrite_rule_entry_snapshot".into(), dump(&CoSDSCPRewriteRuleEntrySnapshot::default()));
+    s.insert("cos_dscp_rewrite_rule_snapshot".into(), dump(&CoSDSCPRewriteRuleSnapshot::default()));
+    s.insert("cos_forwarding_class_snapshot".into(), dump(&CoSForwardingClassSnapshot::default()));
+    s.insert("cos_ieee8021_classifier_entry_snapshot".into(), dump(&CoSIEEE8021ClassifierEntrySnapshot::default()));
+    s.insert("cos_ieee8021_classifier_snapshot".into(), dump(&CoSIEEE8021ClassifierSnapshot::default()));
+    s.insert("cos_interface_status".into(), dump(&CoSInterfaceStatus::default()));
+    s.insert("cos_queue_status".into(), dump(&CoSQueueStatus::default()));
+    s.insert("cos_scheduler_map_entry_snapshot".into(), dump(&CoSSchedulerMapEntrySnapshot::default()));
+    s.insert("cos_scheduler_map_snapshot".into(), dump(&CoSSchedulerMapSnapshot::default()));
+    s.insert("cos_scheduler_snapshot".into(), dump(&CoSSchedulerSnapshot::default()));
+    s.insert("destination_nat_rule_snapshot".into(), dump(&DestinationNATRuleSnapshot::default()));
+    s.insert("exception_status".into(), dump(&ExceptionStatus::default()));
+    s.insert("fabric_snapshot".into(), dump(&FabricSnapshot::default()));
+    s.insert("firewall_filter_snapshot".into(), dump(&FirewallFilterSnapshot::default()));
+    s.insert("firewall_filter_term_counter_status".into(), dump(&FirewallFilterTermCounterStatus::default()));
+    s.insert("firewall_term_snapshot".into(), dump(&FirewallTermSnapshot::default()));
+    s.insert("flow_export_snapshot".into(), dump(&FlowExportSnapshot::default()));
+    s.insert("flow_snapshot".into(), dump(&FlowSnapshot::default()));
+    s.insert("flow_tuple_status".into(), dump(&FlowTupleStatus::default()));
+    s.insert("flow_worker_status".into(), dump(&FlowWorkerStatus::default()));
+    s.insert("forwarding_control_request".into(), dump(&ForwardingControlRequest::default()));
+    s.insert("ha_group_status".into(), dump(&HAGroupStatus::default()));
+    s.insert("ha_state_update_request".into(), dump(&HAStateUpdateRequest::default()));
+    s.insert("inject_packet_request".into(), dump(&InjectPacketRequest::default()));
+    s.insert("interface_address_snapshot".into(), dump(&InterfaceAddressSnapshot::default()));
+    s.insert("interface_snapshot".into(), dump(&InterfaceSnapshot::default()));
+    s.insert("map_pins".into(), dump(&MapPins::default()));
+    s.insert("mirror_config_snapshot".into(), dump(&MirrorConfigSnapshot::default()));
+    s.insert("nat64_rule_snapshot".into(), dump(&NAT64RuleSnapshot::default()));
+    s.insert("neighbor_snapshot".into(), dump(&NeighborSnapshot::default()));
+    s.insert("nptv6_rule_snapshot".into(), dump(&Nptv6RuleSnapshot::default()));
+    s.insert("packet_resolution".into(), dump(&PacketResolution::default()));
+    s.insert("policer_snapshot".into(), dump(&PolicerSnapshot::default()));
+    s.insert("policy_application_snapshot".into(), dump(&PolicyApplicationSnapshot::default()));
+    s.insert("policy_rule_counter_status".into(), dump(&PolicyRuleCounterStatus::default()));
+    s.insert("policy_rule_snapshot".into(), dump(&PolicyRuleSnapshot::default()));
+    s.insert("process_status".into(), dump(&ProcessStatus::default()));
+    s.insert("queue_control_request".into(), dump(&QueueControlRequest::default()));
+    s.insert("queue_status".into(), dump(&QueueStatus::default()));
+    s.insert("route_snapshot".into(), dump(&RouteSnapshot::default()));
+    s.insert("screen_profile_snapshot".into(), dump(&ScreenProfileSnapshot::default()));
+    s.insert("session_delta_drain_request".into(), dump(&SessionDeltaDrainRequest::default()));
+    s.insert("session_delta_info".into(), dump(&SessionDeltaInfo::default()));
+    s.insert("session_export_request".into(), dump(&SessionExportRequest::default()));
+    s.insert("session_sync_request".into(), dump(&SessionSyncRequest::default()));
+    s.insert("slow_path_status".into(), dump(&SlowPathStatus::default()));
+    s.insert("snapshot_summary".into(), dump(&SnapshotSummary::default()));
+    s.insert("source_nat_pool_status".into(), dump(&SourceNatPoolStatus::default()));
+    s.insert("source_nat_rule_snapshot".into(), dump(&SourceNATRuleSnapshot::default()));
+    s.insert("static_nat_rule_snapshot".into(), dump(&StaticNATRuleSnapshot::default()));
+    s.insert("three_color_policer_snapshot".into(), dump(&ThreeColorPolicerSnapshot::default()));
+    s.insert("three_color_policer_status".into(), dump(&ThreeColorPolicerStatus::default()));
+    s.insert("tunnel_endpoint_snapshot".into(), dump(&TunnelEndpointSnapshot::default()));
+    s.insert("userspace_capabilities".into(), dump(&UserspaceCapabilities::default()));
+    s.insert("worker_runtime_status".into(), dump(&WorkerRuntimeStatus::default()));
+    s.insert("zone_snapshot".into(), dump(&ZoneSnapshot::default()));
+    let specimens = Value::Object(s);
+
+    let actual = serde_json::to_string_pretty(&specimens)
+        .expect("specimens serialize to pretty JSON");
+
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("protocol_wire_v1.json");
+
+    if std::env::var("XPF_PROTOCOL_WIRE_REGEN").is_ok() {
+        std::fs::create_dir_all(fixture_path.parent().unwrap())
+            .expect("create fixtures dir");
+        std::fs::write(&fixture_path, format!("{}\n", actual))
+            .expect("write regenerated fixture");
+        eprintln!("regenerated fixture at {}", fixture_path.display());
+        return;
+    }
+
+    let baseline = std::fs::read_to_string(&fixture_path).unwrap_or_else(|e| {
+        panic!(
+            "wire fixture missing at {}: {}. Regenerate with \
+             XPF_PROTOCOL_WIRE_REGEN=1 cargo test --bin xpf-userspace-dp \
+             wire_invariant_default_specimens",
+            fixture_path.display(),
+            e
+        )
+    });
+
+    if baseline.trim() != actual.trim() {
+        let tmp = fixture_path.with_extension("json.actual");
+        let _ = std::fs::write(&tmp, format!("{}\n", actual));
+        panic!(
+            "wire-format drift detected vs {}.\nActual written to {}.\n\
+             Inspect: diff -u {} {}\n\
+             If intentional, regenerate with \
+             XPF_PROTOCOL_WIRE_REGEN=1 cargo test --bin xpf-userspace-dp \
+             wire_invariant_default_specimens",
+            fixture_path.display(),
+            tmp.display(),
+            fixture_path.display(),
+            tmp.display(),
+        );
+    }
+}
