@@ -1,7 +1,8 @@
-// Tests for afxdp/types/shared_cos_lease.rs — relocated from inline
-// `#[cfg(test)] mod tests` to keep shared_cos_lease.rs under the modularity-discipline
-// LOC threshold. Loaded as a sibling submodule via
-// `#[path = "shared_cos_lease_tests.rs"]` from shared_cos_lease.rs.
+// Tests for afxdp/types/shared_cos_lease/ — relocated from inline
+// `#[cfg(test)] mod tests` to keep mod.rs under the modularity-discipline
+// LOC threshold. Loaded as a dir-local submodule via
+// `#[path = "shared_cos_lease_tests.rs"]` from shared_cos_lease/mod.rs.
+// File moved in #1329 alongside mod.rs into the dir module layout.
 
 use super::*;
 use std::mem::align_of;
