@@ -112,12 +112,13 @@ After #1528, the only DPDK-related code that remains is:
 - The runtime sentinel in `pkg/dataplane/dataplane.go` (`TypeDPDK`,
   `ErrDPDKBackendRetired`, registry panic guards) — kept for the
   same window.
-- A load-mode bypass on `validateDataplaneTypeStrict` in
-  `pkg/configstore/Store.Load` (#1528 §4.6) so a node booting with
-  a pre-#1526 persisted `system dataplane-type dpdk` config can
-  still load. The daemon then runs in config-only mode via the
-  existing `daemon_run.go:247` `errors.Is(err, ErrDPDKBackendRetired)`
-  soft-fallback.
+- The `rewriteRetiredDataplaneType` bridge in
+  `pkg/configstore/dataplane_retire.go`, invoked from both
+  `Store.Load` and `Store.SyncApply` before compile, which strips
+  the `system dataplane-type dpdk` leaf so a node booting with a
+  pre-#1526 persisted DPDK config loads cleanly and runs as the
+  default `userspace` dataplane. (This replaces the pre-rebase
+  plan-v3 `compileTreeForLoad` load-mode bypass.)
 - A defense-in-depth forbidden-import entry in
   `pkg/dataplane/runtime/import_canary_test.go:47` that blocks
   re-introduction of `github.com/psaab/xpf/pkg/dataplane/dpdk` as

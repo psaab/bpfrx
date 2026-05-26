@@ -433,7 +433,7 @@ type SystemConfig struct {
 	BackupRouterDst          string   // backup router destination prefix
 	Lo0FilterInputV4         string   // lo0 unit 0 family inet filter input (host-bound filtering)
 	Lo0FilterInputV6         string   // lo0 unit 0 family inet6 filter input (host-bound filtering)
-	DataplaneType            string   // empty defaults to "userspace"; explicit "ebpf" is legacy; "dpdk" is retired (#1525) and tolerated only at Store.Load for stored-config rolling upgrade
+	DataplaneType            string   // empty defaults to "userspace"; explicit "ebpf" is legacy; "dpdk" is retired (#1525) and tolerated via rewriteRetiredDataplaneType (pkg/configstore/dataplane_retire.go) at both Store.Load and Store.SyncApply for stored-config rolling upgrade
 	UserspaceDataplane       *UserspaceConfig
 	InternetOptions          *InternetOptionsConfig
 	Services                 *SystemServicesConfig
