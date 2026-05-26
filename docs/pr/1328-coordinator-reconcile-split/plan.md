@@ -1,6 +1,65 @@
 # #1328 Coordinator decompose Phase 2 — split reconcile() + refresh_bindings()
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** v2 — round-1 review addressed (Codex PLAN-NEEDS-MAJOR + AGY PLAN-NEEDS-MINOR), re-dispatching adversarial review
+
+## Round-1 review summary
+
+- **Codex** (task `task-mpmuqp90-xi2crk`): PLAN-NEEDS-MAJOR. 8 findings,
+  all addressed below.
+- **AGY** (job `review-mpmuqxve-5cmvqa`): PLAN-NEEDS-MINOR. Main ask
+  (sub-mod-dir layout) addressed below.
+
+Concrete v2 deltas:
+
+1. **Layout:** flat `coordinator/reconcile_*.rs` siblings → sub-mod-dir
+   `coordinator/reconcile/{mod,teardown,reset,snapshot,bringup}.rs`
+   plus sibling `coordinator/refresh_bindings.rs`. Both reviewers
+   asked for this.
+2. **`copy_live_snapshot` signature:** take `BindingLiveSnapshot` **by
+   value**, not by reference. `BindingLiveSnapshot` owns `String`
+   fields (`xsk_bind_mode`, `shared_umem_*`, `last_error`) at
+   `userspace-dp/src/afxdp/worker/mod.rs:2373`; borrowing would
+   either fail to compile or force string clones. Plan v1 was wrong.
+3. **`last_reconcile_stage` write inventory:** add the indirect
+   `"stopped"` write from `stop_inner` at L281. Full sequence:
+   `start` (L321) → indirect `stopped` (L281, set by `stop_inner`) →
+   `no_snapshot` (L397) → `missing_xsk_pin` (L437) →
+   `missing_heartbeat_pin` (L446) → `missing_session_pin` (L455) →
+   `open_xsk_map_failed:{err}` (L466) → `open_heartbeat_map_failed:{err}`
+   (L478) → `open_session_map_failed:{err}` (L490) → `planned:...`
+   (L594) → optional `replayed_synced:...` (L652) →
+   `spawn_worker_failed:{worker_id}:{err}` (L777, overwritten by
+   final `spawned:...` write — operator-visible quirk that must be
+   preserved verbatim) → `spawned:...` (L795).
+4. **Allocation analysis:** rephrase from "no allocations" to
+   "no additional allocations beyond existing code motion".
+   `stop_inner(false)` already does `Arc::new(BTreeMap::new())`
+   stores at L204/L210/L217/L241 and similar; the refactor does not
+   add or remove any. The no-op claim is preserved for *new*
+   allocations only.
+5. **Test plan:** drop the bogus `coordinator/tests.rs:1310`
+   citation. `:1310` is a `refresh_bindings` zero-out test, not a
+   `reconcile(None, ...)` test. Add a new
+   `coordinator::tests::reconcile_with_none_snapshot_preserves_invariants`
+   test that asserts the `start`→`stopped`→`no_snapshot` stage
+   sequence and zero new bindings in `workers.live`.
+6. **`PreservedReconcileState`:** drop `had_live_workers`. The
+   500ms quiesce check lives entirely inside the teardown helper;
+   the orchestrator does not need to see the flag. Two fields:
+   `synced_sessions: Vec<SyncedSessionEntry>`,
+   `slow_path: Option<Arc<SlowPathReinjector>>`.
+7. **#925 panic-slot pairing:** keep insert+spawn+remove-on-Err
+   **inline inside `reconcile/bringup.rs`** rather than wrapping in
+   a `spawn_worker_with_panic_slot` helper. Codex flagged the
+   helper would have dozens of captured deps and hide more than
+   it clarifies. Adding a code comment at the insert site that
+   names the L777 Err-arm remove keeps the pairing one screen
+   from the spawn call.
+8. **Side-effect boundary documentation:** replaced the
+   "comment-block boundaries" framing with an explicit
+   load-bearing-side-effect inventory in the "Hidden invariants"
+   section. The four phase boundaries are anchored to the actual
+   state transitions, not the comment formatting.
 
 ## Issue framing
 
@@ -61,44 +120,61 @@ maintainability play and the issue body frames it that way.
 
 ## Concrete design
 
-### New layout
+### New layout (v2 — sub-mod-dir per both reviewers)
 
 ```
 userspace-dp/src/afxdp/coordinator/
-  mod.rs                 // Coordinator struct + thin public API
-                         // Target: ~1100 LOC after extraction
-                         // (helper free-fns at L1492+ stay here for
-                         // now — see "Out of scope" §)
-  reconcile.rs           // Top-level orchestrator (~150 LOC)
-                         //  - reconcile() public entry
-                         //  - PreservedState struct
-                         //  - dispatch helpers
-  reconcile_teardown.rs  // Phase 1: preserve state + stop_inner
-                         //  - snapshot_synced_sessions
-                         //  - preserve_healthy_slow_path
-                         //  - stop_and_quiesce (~60 LOC)
-  reconcile_reset.rs     // Phase 2: binding counter zero-pass
-                         //  - reset_binding_counters (~70 LOC,
-                         //    pure fn over `&mut BindingStatus`)
-  reconcile_snapshot.rs  // Phase 3: validation + forwarding state
-                         //  rebuild + slow-path re-init
-                         //  - apply_snapshot_state
-                         //  - rebuild_slow_path
-                         //  - open_required_bpf_maps (returns Result
-                         //    so early-error branches stay typed)
-  reconcile_bringup.rs   // Phase 4: per-worker plan + spawn loop
-                         //  - build_worker_plans
-                         //  - apply_shared_umem_status
-                         //  - spawn_worker (#925 panic slot included)
-                         //  - start_neighbor_monitor
-  refresh_bindings.rs    // pub fn refresh_bindings split into:
-                         //  - copy_live_snapshot (~140 LOC)
-                         //  - zero_unbound_slot (~120 LOC)
-                         //  Plus the public dispatcher that picks one
-                         //  per slot and calls
-                         //  refresh_cos_owner_worker_map_from_binding_statuses
-                         //  at the end.
+  mod.rs                       // Coordinator struct + thin public API
+                               // Target: ~1100 LOC after extraction
+                               // (helper free-fns at L1492+ stay here for
+                               // now — see "Out of scope" §)
+  refresh_bindings.rs          // sibling: copy_live_snapshot +
+                               // zero_unbound_slot + dispatcher
+  reconcile/
+    mod.rs                     // pub fn reconcile() orchestrator
+                               // (~80 LOC) + PreservedReconcileState
+                               // struct + ReconcileSnapshotFds struct
+    teardown.rs                // Phase 1: preserve state + stop_inner
+                               //  - snapshot synced sessions
+                               //  - preserve healthy slow path
+                               //  - call stop_inner(false)
+                               //  - 500ms mlx5 quiesce (when had
+                               //    live workers)
+                               //  Returns PreservedReconcileState
+    reset.rs                   // Phase 2: binding counter zero-pass
+                               //  - reset_binding_counters
+                               //    (pure fn over &mut [BindingStatus])
+    snapshot.rs                // Phase 3: validation + forwarding state
+                               //  rebuild + slow-path re-init + map opens
+                               //  - apply_snapshot_state
+                               //  - rebuild_slow_path
+                               //  - open_required_bpf_maps
+                               //    returns Option<ReconcileSnapshotFds>;
+                               //    sets last_reconcile_stage +
+                               //    per-binding last_error on failure
+    bringup.rs                 // Phase 4: per-worker plan + spawn loop
+                               //  - build_worker_plans
+                               //  - apply_shared_umem_status
+                               //  - replay_synced_sessions tail
+                               //  - per-worker spawn loop with
+                               //    #925 panic-slot insert+remove
+                               //    INLINE (no wrapper helper)
+                               //  - start_neighbor_monitor
+                               //  - spawn_local_tunnel_sources
 ```
+
+The new `coordinator/reconcile/` sub-mod-dir is added to
+`coordinator/mod.rs` with two new `mod` lines:
+
+```rust
+mod reconcile;
+mod refresh_bindings;
+```
+
+`reconcile::reconcile` is exposed via the `impl Coordinator` block
+that the `reconcile/mod.rs` file declares (Rust permits split impl
+blocks across modules). The public method signature
+`Coordinator::reconcile(&mut self, ...)` is preserved verbatim.
 
 ### Orchestrator shape (per issue body)
 
@@ -177,14 +253,26 @@ neighbor-monitor + local-tunnel-source start. Ends without calling
 the order of operations is visible at one read.
 
 **`refresh_bindings.rs`** — `refresh_bindings` becomes the
-dispatcher:
+dispatcher. **Codex r1 #1 correction:** take `BindingLiveSnapshot`
+**by value** (it owns `String` fields), and reuse the existing
+`.get()` (no `.cloned()` on the `Arc` — current code accesses the
+snapshot through `&Arc<BindingLiveState>` without a refcount bump):
 
 ```rust
+pub(super) fn copy_live_snapshot(
+    binding: &mut BindingStatus,
+    snap: BindingLiveSnapshot,
+);
+
+pub(super) fn zero_unbound_slot(binding: &mut BindingStatus);
+
 pub fn refresh_bindings(&mut self, bindings: &mut [BindingStatus]) {
     for binding in bindings.iter_mut() {
-        match self.workers.live.get(&binding.slot).cloned() {
-            Some(live) => copy_live_snapshot(binding, &live.snapshot()),
-            None => zero_unbound_slot(binding),
+        if let Some(live) = self.workers.live.get(&binding.slot) {
+            let snap = live.snapshot();
+            copy_live_snapshot(binding, snap);
+        } else {
+            zero_unbound_slot(binding);
         }
     }
     self.refresh_cos_owner_worker_map_from_binding_statuses(bindings);
@@ -192,23 +280,33 @@ pub fn refresh_bindings(&mut self, bindings: &mut [BindingStatus]) {
 ```
 
 `copy_live_snapshot` and `zero_unbound_slot` are pure functions
-over the binding + (for the first) `BindingLiveSnapshot`. The
-existing `eprintln!` on the `bound: false → true` transition stays
-inside `copy_live_snapshot` so the operator-visible log is
-preserved verbatim.
+over the binding + (for the first) `BindingLiveSnapshot` (by
+value). The existing `eprintln!` on the `bound: false → true`
+transition stays inside `copy_live_snapshot` so the operator-visible
+log is preserved verbatim. The `tx_submit_latency_hist` and
+`tx_kick_latency_hist` `Vec`s are *resized* in place via
+`.resize(new_len, 0) + .copy_from_slice(&snap.x)`, reusing the
+existing backing buffer when capacity is sufficient (steady state).
 
 ### Allocation discipline on the steady-state no-op path
 
-There are two no-op paths to verify:
+There are two no-op paths to verify. The refactor adds **zero new
+allocations beyond the existing code-motion baseline**. Existing
+allocations stay as-is.
 
 1. `reconcile(None, bindings, _)` — current code: writes
    `last_reconcile_stage = "start"` (allocation), calls
    `snapshot_shared_session_entries()` (allocates a Vec — but
    needed for the `preserve_healthy_slow_path` flow that follows),
-   calls `stop_inner(false)`, runs the binding reset loop (no
-   allocation), then writes `last_reconcile_stage = "no_snapshot"`
-   (allocation). Refactor must preserve this exact shape — *no
-   new* allocations in the None path.
+   calls `stop_inner(false)` which itself does several
+   `Arc::new(BTreeMap::new())` / `Arc::new(Vec::new())` / `.to_string()`
+   stores at L204/L210/L217/L223–L226/L241/L243/L245/L246/L281
+   (these are pre-existing — the refactor does not add or remove
+   any), runs the binding reset loop (no allocation), then writes
+   `last_reconcile_stage = "no_snapshot"` (allocation). Refactor
+   must preserve this exact shape — *no new* allocations introduced
+   in the None path, and the indirect `stop_inner` allocations stay
+   where they are.
 
 2. `refresh_bindings()` on a fully-bound binding set — current code
    copies live snapshots into `BindingStatus`, the only allocation
@@ -262,28 +360,86 @@ methods on `Coordinator`. No callsite is touched.
    verbatim. Each sub-file's body is a contiguous slice of the
    current function body — no reordering.
 
+   **Load-bearing side effects per phase boundary** (replaces v1's
+   comment-block framing per Codex r1 #5):
+   - **Teardown finishes when:** workers stopped + tunnel sources
+     joined + mirror_targets cleared + worker_panics cleared + CoS
+     ArcSwap fields reset + slow_path = None + bpf_maps cleared +
+     ha.forwarding/ha.fabrics/shared_validation reset + neighbors
+     cleared + `last_reconcile_stage = "stopped"` set by stop_inner.
+   - **Reset finishes when:** every binding's counter fields are
+     zero, `ready=false`, `last_error` cleared. No state writes to
+     `self`.
+   - **Snapshot apply finishes when:** validation/forwarding
+     installed on self + shared_validation/ha.forwarding stored +
+     slow_path re-armed + ha.fabrics published + xsk/heartbeat/session
+     map FDs open + optional conntrack/dnat FDs open +
+     `last_reconcile_stage` reflects the next phase's `planned:...`
+     (set in bringup).
+   - **Bringup finishes when:** worker_plans assembled +
+     shared-UMEM backfilled into bindings + cos_owner_worker_by_queue
+     mapping installed + mirror_targets stored + replay_synced_sessions
+     ran + per-worker spawn loop completed (panic-slot insert+remove
+     paired with spawn outcome) + neighbor monitor started +
+     local tunnel sources spawned + `last_reconcile_stage = "spawned:..."`.
+
 2. **`last_reconcile_stage` write ordering** is part of the
-   operator-visible contract (status poll exposes it). Every existing
-   write stays where it is. New helpers do not introduce new
+   operator-visible contract (status poll exposes it). **Codex r1 #2
+   correction:** the inventory includes the **indirect** `"stopped"`
+   write at L281 inside `stop_inner`, which is called from reconcile
+   at L335. The full sequence (line numbers vs current master):
+
+   - `start` (L321, in `reconcile/mod.rs`)
+   - `stopped` (L281 indirect via `stop_inner`, untouched by this PR)
+   - `no_snapshot` (L397, in `reconcile/mod.rs` early-return)
+   - `missing_xsk_pin` (L437, in `reconcile/snapshot.rs`)
+   - `missing_heartbeat_pin` (L446, in `reconcile/snapshot.rs`)
+   - `missing_session_pin` (L455, in `reconcile/snapshot.rs`)
+   - `open_xsk_map_failed:{err}` (L466, in `reconcile/snapshot.rs`)
+   - `open_heartbeat_map_failed:{err}` (L478, in `reconcile/snapshot.rs`)
+   - `open_session_map_failed:{err}` (L490, in `reconcile/snapshot.rs`)
+   - `planned:workers=N:bindings=M:live=K` (L594, in `reconcile/bringup.rs`)
+   - optional `replayed_synced:N:workers=M` (L652, in `reconcile/bringup.rs`)
+   - `spawn_worker_failed:{worker_id}:{err}` (L777, in `reconcile/bringup.rs`,
+     **overwritten by the final `spawned:...` write** — this is a
+     pre-existing operator-visible quirk and must be preserved
+     verbatim)
+   - `spawned:workers=N:identities=M:live=K` (L795, in `reconcile/bringup.rs`)
+
+   Every existing write stays at the equivalent logical position
+   inside the new sub-file. New helpers do not introduce new
    `last_reconcile_stage` writes.
 
 3. **#925 panic-slot insert/remove pairing.** The current
    spawn-loop inserts a panic slot into `self.worker_panics`
    *before* calling `spawn_supervised_worker`, and removes it on
-   the `Err(err)` arm. This pairing must stay. Plan keeps the
-   insert + spawn + Err-remove inside a single helper
-   `spawn_worker_with_panic_slot` so reviewers can verify the
-   pairing at one site.
+   the `Err(err)` arm. **Codex r1 #7 + AGY q7:** keep the
+   insert+spawn+remove **inline inside `reconcile/bringup.rs`**
+   rather than wrapping in a helper. The spawn closure captures
+   ~30 worker-scoped state Arcs; a helper signature with that
+   many parameters or a captured-state struct would hide more
+   than it clarifies. Mitigation: add a one-line comment at the
+   insert site that names the matching Err-arm remove ("paired
+   with `worker_panics.remove(&worker_id)` on the spawn-Err arm
+   below").
 
 4. **`preserved_synced_sessions` lifetime.** This `Vec` outlives
    `stop_inner(false)` and is consumed by `replay_synced_sessions`
-   after worker_command_queues exist. Refactor must thread it
-   through the orchestrator's return value, not store it on
-   `self`. Storing it on `self` would change ownership semantics
-   and risk a double-replay on a back-to-back reconcile.
+   inside `reconcile/bringup.rs`. Threaded as a field of
+   `PreservedReconcileState`, returned by
+   `reconcile/teardown.rs::tear_down(...)`, consumed by
+   `reconcile/bringup.rs::bring_up_workers(...)`. Not stored on
+   `self` (would risk double-replay on back-to-back reconciles).
 
-5. **`preserved_slow_path` lifetime.** Identical — `Option<Arc<…>>`
-   threaded through, not stored.
+5. **`preserved_slow_path` lifetime.** Identical pattern — second
+   field of `PreservedReconcileState`. Consumed inside
+   `reconcile/snapshot.rs::apply_snapshot_state(...)` (which is
+   the new home of L413–L430's slow-path re-init).
+
+   **Codex r1 #6 + AGY:** v2 drops `had_live_workers` from the
+   struct. The 500ms quiesce check belongs entirely inside
+   `reconcile/teardown.rs::tear_down(...)` — the orchestrator
+   does not need to see the flag.
 
 6. **`refresh_bindings` final callout.** The trailing
    `refresh_bindings(bindings)` inside `reconcile` is currently the
@@ -310,27 +466,25 @@ methods on `Coordinator`. No callsite is touched.
 1. `cargo build --release` clean.
 2. `cargo test --release` — full userspace-dp test suite (target:
    952+ tests pass).
-3. 5× flake check on the most affected named tests:
-   `cargo test --release coordinator::tests` (the full 1089-LOC
-   suite). Five consecutive clean runs required.
-4. `go test ./...` — Go side untouched, but run the suite to
-   confirm no protocol breakage (30 packages).
-5. **Smoke on loss userspace cluster (loss:xpf-userspace-fw0/fw1)**
-   — full matrix per `docs/engineering-style.md`:
-   - Pass A (CoS disabled): v4+v6 × push+reverse single-stream
-     baselines (4 cells, 0 retrans);
-     `iperf3 -P 12 -t 10 -R` multi-stream reverse v4 + v6 (line
-     rate, 0 retrans).
-   - Pass B (CoS enabled): per-class 5201–5206 × v4+v6 ×
-     push+reverse (24 cells).
-6. (Optional) `make test-failover` — this PR touches the reconcile
-   path, which is exactly what failover exercises. If smoke passes
-   cleanly we will run failover on the loss userspace cluster as a
-   confidence pass before requesting merge.
+3. 5× flake check on the full `coordinator::tests` module.
+4. **Codex r1 #4 correction — new test:** add
+   `coordinator::tests::reconcile_with_none_snapshot_preserves_stage_sequence`
+   that calls `reconcile(None, &mut bindings, 64)` and asserts:
+   - final `last_reconcile_stage == "no_snapshot"`.
+   - `reconcile_calls == 1` afterwards.
+   - `workers.live` empty.
+   - `slow_path` is `None`.
+   - The bindings the test passed in have their `ready=false` and
+     `bound=false` flags zeroed.
 
-**Per the standing batch-merge rule, smoke is deferred to the
-batch via `<!-- AWAITING-BATCH-MERGE -->`. PR will not run smoke
-itself — it ships on 4-of-4 reviewer attestation.**
+   v1's claim that `coordinator/tests.rs:1310` covered this case
+   was wrong — `:1310` is a `refresh_bindings` zero-out test.
+
+5. `go test ./...` — Go side untouched, but run the suite to
+   confirm no protocol breakage (30 packages).
+6. **Smoke** — deferred to batch per the standing
+   `<!-- AWAITING-BATCH-MERGE -->` rule. PR will not run smoke
+   itself — it ships on 4-of-4 reviewer attestation.
 
 ## Out of scope (explicitly)
 
