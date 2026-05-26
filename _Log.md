@@ -60,6 +60,12 @@
     the new module boundaries.
   - **File(s)**: docs/pr/1546-filter-engine-split/plan.md (NEW),
     docs/pr/1546-filter-engine-split/reviewer-ids.md (NEW).
+## 2026-05-26 — #1331 submit_cos_batch per-variant extract
+
+- **20:16 UTC 2026-05-26** — worktree created at refactor/1331-submit-cos-batch-per-variant off origin/master (63dfe02a)
+- **20:16 UTC 2026-05-26** — wrote `docs/pr/1331-submit-cos-batch-per-variant/plan.md` (DRAFT v1)
+- **20:16 UTC 2026-05-26** — wrote `docs/pr/1331-submit-cos-batch-per-variant/reviewer-ids.md` stub
+
 ## 2026-05-26 — #1325 implementation pushed
 
 - **Timestamp**: 2026-05-26T (UTC)
