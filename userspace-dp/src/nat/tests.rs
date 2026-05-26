@@ -1,9 +1,16 @@
-// Tests for nat.rs — relocated from inline
-// `#[cfg(test)] mod tests` to keep nat.rs under the modularity-discipline
-// LOC threshold. Loaded as a sibling submodule via
-// `#[path = "nat_tests.rs"]` from nat.rs.
+// Tests for the nat/ module. Moved into nat/tests.rs as part of the
+// #1542 split. White-box tests reach into allocator internals via the
+// `debug_live()` accessor and the `pub(super)` items promoted in
+// allocator.rs / destination.rs.
 
+use super::allocator::{
+    sticky_pool_index, PersistentLease, PersistentSourceKey, ALLOCATION_GC_BUDGET, NS_PER_SEC,
+};
+use super::destination::{PROTO_TCP, PROTO_UDP};
 use super::*;
+use crate::{DestinationNATRuleSnapshot, SourceNATRuleSnapshot, StaticNATRuleSnapshot};
+use std::collections::BTreeSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[test]
 fn interface_source_nat_matches_v4_rule() {
@@ -980,10 +987,7 @@ fn session_key_from_src(
 fn assert_persistent_expiry_indexes_consistent(rule: &SourceNatRule) {
     let live = rule
         .pool_allocator
-        .shared
-        .live
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .debug_live();
     let mut expected_global = BTreeSet::new();
     let mut expected_by_addr = vec![BTreeSet::new(); live.lease_expirations_by_addr.len()];
 
@@ -1397,10 +1401,7 @@ fn pool_snat_persistent_rollback_keeps_lease_reused_by_another_flow() {
     {
         let live = rules[0]
             .pool_allocator
-            .shared
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .debug_live();
         let lease = live.persistent_by_source.values().next().unwrap();
         assert_eq!(lease.active_flows, 1);
         assert!(live.lease_expirations.is_empty());
@@ -1429,10 +1430,7 @@ fn pool_snat_persistent_rollback_preserves_lease_after_reuser_release() {
     {
         let live = rules[0]
             .pool_allocator
-            .shared
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .debug_live();
         let lease = live.persistent_by_source.values().next().unwrap();
         assert_eq!(lease.active_flows, 0);
         assert_eq!(lease.completed_flows, 1);
@@ -1463,10 +1461,7 @@ fn pool_snat_persistent_double_rollback_removes_unused_lease() {
     {
         let live = rules[0]
             .pool_allocator
-            .shared
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .debug_live();
         assert!(live.persistent_by_source.is_empty());
         assert!(live.lease_expirations.is_empty());
         assert!(live.lease_expirations_by_addr[0].is_empty());
@@ -1491,10 +1486,7 @@ fn pool_snat_persistent_reactivation_uses_fresh_expiry_after_success() {
     {
         let live = rules[0]
             .pool_allocator
-            .shared
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .debug_live();
         let lease = live.persistent_by_source.values().next().unwrap();
         assert_eq!(lease.expires_at_ns, old_expiry);
         assert!(live
@@ -1530,10 +1522,7 @@ fn pool_snat_persistent_reactivation_uses_fresh_expiry_after_success() {
     {
         let live = rules[0]
             .pool_allocator
-            .shared
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .debug_live();
         let lease = live.persistent_by_source.values().next().unwrap();
         assert_eq!(lease.active_flows, 0);
         assert_eq!(lease.completed_flows, 2);
@@ -1565,10 +1554,7 @@ fn pool_snat_persistent_reactivation_completion_survives_saturated_counter() {
     {
         let mut live = rules[0]
             .pool_allocator
-            .shared
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .debug_live();
         let lease = live.persistent_by_source.values_mut().next().unwrap();
         lease.completed_flows = u64::MAX;
         assert_eq!(lease.expires_at_ns, old_expiry);
@@ -1598,10 +1584,7 @@ fn pool_snat_persistent_reactivation_completion_survives_saturated_counter() {
     {
         let live = rules[0]
             .pool_allocator
-            .shared
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .debug_live();
         let lease = live.persistent_by_source.values().next().unwrap();
         assert_eq!(lease.active_flows, 0);
         assert_eq!(lease.completed_flows, u64::MAX);
@@ -1656,10 +1639,7 @@ fn pool_snat_persistent_reactivation_double_rollback_restores_old_expiry() {
     {
         let live = rules[0]
             .pool_allocator
-            .shared
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .debug_live();
         let lease = live.persistent_by_source.values().next().unwrap();
         assert_eq!(lease.active_flows, 0);
         assert_eq!(lease.completed_flows, 1);
@@ -1712,10 +1692,7 @@ fn pool_snat_persistent_expiry_index_is_bounded_by_leases() {
 
     let live = rules[0]
         .pool_allocator
-        .shared
-        .live
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .debug_live();
     assert_eq!(live.persistent_by_source.len(), 1);
     assert_eq!(live.lease_expirations.len(), 1);
     assert_eq!(live.lease_expirations_by_addr[0].len(), 1);
@@ -1739,10 +1716,7 @@ fn pool_snat_expiry_invariant_rejects_stale_global_entry() {
     {
         let mut live = rules[0]
             .pool_allocator
-            .shared
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .debug_live();
         let (key, lease) = live
             .persistent_by_source
             .iter()
@@ -1772,10 +1746,7 @@ fn pool_snat_expiry_invariant_rejects_stale_per_address_entry() {
     {
         let mut live = rules[0]
             .pool_allocator
-            .shared
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .debug_live();
         let (key, lease) = live
             .persistent_by_source
             .iter()
@@ -1811,10 +1782,7 @@ fn pool_snat_expiry_invariant_rejects_wrong_addr_index() {
     {
         let mut live = rules[0]
             .pool_allocator
-            .shared
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .debug_live();
         let (key, lease) = live
             .persistent_by_source
             .iter()
@@ -1845,10 +1813,7 @@ fn pool_snat_persistent_release_replaces_stale_expiry_tuple() {
     let stale_expires_at_ns = {
         let mut live = rules[0]
             .pool_allocator
-            .shared
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .debug_live();
         let (key, lease) = live
             .persistent_by_source
             .iter()
@@ -1871,10 +1836,7 @@ fn pool_snat_persistent_release_replaces_stale_expiry_tuple() {
 
     let live = rules[0]
         .pool_allocator
-        .shared
-        .live
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .debug_live();
     let (key, lease) = live
         .persistent_by_source
         .iter()
@@ -1934,10 +1896,7 @@ fn pool_snat_allocation_gc_is_bounded_when_not_under_pressure() {
     );
     let live = rules[0]
         .pool_allocator
-        .shared
-        .live
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .debug_live();
     assert_eq!(
         live.lease_expirations.len(),
         expired_lease_count - ALLOCATION_GC_BUDGET
@@ -2004,10 +1963,7 @@ fn pool_snat_pressure_gc_reclaims_expired_lease_for_selected_address() {
     {
         let live = rules[0]
             .pool_allocator
-            .shared
-            .live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .debug_live();
         assert_eq!(
             live.lease_expirations_by_addr[0].len(),
             ALLOCATION_GC_BUDGET
@@ -2032,10 +1988,7 @@ fn pool_snat_pressure_gc_reclaims_expired_lease_for_selected_address() {
     assert!(matches!(decision.rewrite_src_port, Some(40000..=40007)));
     let live = rules[0]
         .pool_allocator
-        .shared
-        .live
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .debug_live();
     assert_eq!(live.lease_expirations_by_addr[0].len(), 0);
     assert!(live.lease_expirations_by_addr[1].len() < ALLOCATION_GC_BUDGET);
     drop(live);
