@@ -1,6 +1,47 @@
 # #1542 — Split userspace NAT runtime into per-concern modules (Wave-2)
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** DRAFT v2 — addressing Codex round-1 PLAN-NEEDS-MAJOR.
+AGY round-1 was PLAN-READY but Codex flagged three real findings:
+visibility model didn't compile-verify, sibling cross-module API
+needed explicit listing, and tests need a clear story for reaching
+allocator internals.
+
+## Round 1 verdicts (task IDs in reviewer-ids.md)
+
+- **Codex (task-mpmyrnf2-1de5ha): PLAN-NEEDS-MAJOR**, three MAJOR findings
+  - F1: `pub(super)` re-exported as `pub(crate) use` does not widen
+    visibility through `mod.rs`. Items must be `pub(crate)` at their
+    definition site.
+  - F2: Item allocation table hides types/helpers that sibling
+    modules must use (NS_PER_SEC, PoolAddressFamily, TranslatedTuple,
+    PersistentSourceKey, nets_match_v4/v6). Need an explicit internal
+    API list.
+  - F3: Test plan contradicts the visibility/locality goal —
+    `nat_tests.rs` is 2,704 LOC and inspects allocator internals
+    (`shared.live`, `persistent_by_source`, expiry indexes,
+    `PersistentLease`, GC constants, `sticky_pool_index`).
+- **AGY (adversarial-review-mpmys6pk-3ut2f2): PLAN-READY** with all
+  10 review questions answered. Codex's deeper visibility audit
+  overrides — we iterate.
+
+## v2 changes vs v1
+
+1. **Visibility model rewritten.** All currently-`pub(crate)` symbols
+   stay `pub(crate)` at their definition site in their new submodule.
+   `nat/mod.rs` re-exports them so `crate::nat::<symbol>` stays valid
+   for every external caller. Items that are *internal to nat* but
+   used across submodules are promoted to `pub(super)` (visible
+   inside the `nat` module tree but not at `crate::nat::*`).
+2. **Explicit internal API table** added for cross-submodule items
+   (Section "Internal cross-submodule API").
+3. **Test reachability story** made concrete: list private items the
+   tests touch and tag each with the new visibility
+   (Section "Test reachability of private items").
+4. **HA-portability wording corrected.** AGY pointed out that only
+   `NatDecision` is the wire-serialized type via session deltas;
+   `SourceNatFlowKey` is purely internal allocator key;
+   `SourceNatFailureReason` is exception/status text on a separate
+   wire path. v2 narrows the HA-portability claim accordingly.
 
 ## Issue framing
 
@@ -158,37 +199,97 @@ pub(crate) struct NatDecision { ... }
 impl NatDecision { ... }
 ```
 
-### Cross-module visibility
+### Cross-module visibility (v2)
 
-Each sibling file gets a focused `pub(super)` surface:
+Visibility rules (Codex F1 fix):
 
-- `allocator.rs`: `PortAllocator` is `pub(super)`; `try_next_port`,
-  `address_index`, `new`, `Default`, `allocate_translation`,
-  `release_flow`, `rollback_flow`, `snapshot` are `pub(super)` because
-  `source.rs` needs to drive the allocator from
-  `match_source_nat_result_for_tuple` and `release_source_nat_allocation`.
-  All `*_locked` helpers, `PortAllocatorLiveState`, `LiveAllocation`,
-  `PersistentLease`, `AllocationOwner`, `TranslatedTuple`,
-  `PoolAddressFamily`, `PersistentSourceKey`, the GC constants, and the
-  capacity/sticky helpers stay private (`pub(self)`/no qualifier) —
-  this is the locality win the issue asks for.
-- `source.rs`: `SourceNatRule` and all the lookup/parse/release entry
-  points are `pub(super)`. `SourceNatPoolAllocatorKey`,
+- **External-facing items keep `pub(crate)` at their definition site.**
+  `mod.rs` re-exports them with `pub(crate) use` so the path
+  `crate::nat::<symbol>` continues to resolve. The submodules
+  themselves stay private (`mod allocator;` not `pub mod allocator;`)
+  so that the only way outside callers reach the symbols is through
+  the curated `mod.rs` namespace.
+- **Cross-submodule internal items use `pub(super)`** at their
+  definition site. `pub(super)` from inside `allocator.rs` makes the
+  item visible to all of `nat/*` (i.e., `mod.rs` and every sibling
+  submodule plus `tests.rs`), but NOT outside `nat`. This is the
+  locality win the issue asks for.
+- **Wholly-private items get no visibility qualifier.** They are
+  visible only inside the file they are declared in.
+
+### Internal cross-submodule API (Codex F2 fix)
+
+These items have callers in more than one nat/ submodule. They must
+be `pub(super)` (visible inside `nat`, hidden outside):
+
+| Item | Lives in | Used by |
+|------|----------|---------|
+| `PoolAddressFamily<'a>` | `allocator.rs` | `source.rs::match_source_nat_result_for_tuple` (calls `allocate_translation` with `PoolAddressFamily::V4(...)` / `V6(...)`) |
+| `TranslatedTuple` | `allocator.rs` | `source.rs::release_source_nat_allocation_with_mode` (constructs one from the `NatDecision`'s `rewrite_src`/`rewrite_src_port`) |
+| `PersistentSourceKey` | `allocator.rs` | `source.rs::SourceNatFlowKey::persistent_source_key` returns one |
+| `SourceNatFlowKey` | `source.rs` | `allocator.rs::allocate_translation`, `release_flow`, `rollback_flow` take it; `live_by_flow` map is keyed by it |
+| `NS_PER_SEC` | `allocator.rs` | `source.rs::parse_source_nat_rules_with_previous` reads `timeout_secs * NS_PER_SEC` for `persistent_nat_timeout_ns` |
+| `nets_match_v4`, `nets_match_v6` | `source.rs` | `source.rs::SourceNatRule::matches` (currently the only callers — these are NOT cross-submodule, they stay in `source.rs` as private fns. v1 incorrectly suggested they might move to `static_nat.rs`; they don't.) |
+| `PortAllocator` | `allocator.rs` | `pub(crate)` because external callers (`afxdp/coordinator/status.rs`, `afxdp/mod.rs`) read pool statuses via `source_nat_pool_statuses` which traverses `SourceNatRule::pool_allocator: PortAllocator` |
+| `PortAllocator::snapshot` | `allocator.rs` | `pub(super)` — `status.rs::source_nat_pool_statuses` calls it; not exposed at `crate::nat::*` |
+| `PortAllocator::try_next_port`, `address_index`, `allocate_translation`, `release_flow`, `rollback_flow` | `allocator.rs` | `pub(super)` — `source.rs` lookup / release drive these |
+| `PortAllocator::new`, `Default` | `allocator.rs` | `pub(crate)` — `source.rs::parse_source_nat_rules_with_previous` constructs one. Also used in tests at `crate::nat::PortAllocator::new` indirectly via the `SourceNatRule` ctor. |
+
+Items that stay fully private to their file (no `pub` qualifier at
+all):
+
+- `allocator.rs`: `AllocationOwner`, `LiveAllocation`, `PersistentLease`,
+  `PortAllocatorLiveState`, `PortAllocatorShared`, `GC_PERIOD`,
+  `ALLOCATION_GC_BUDGET`, `RELEASE_GC_BUDGET`, `PRESSURE_GC_BUDGET`,
+  `DEFAULT_PERSISTENT_NAT_TIMEOUT_SECS`,
+  `MAX_SOURCE_NAT_POOL_TRACKED_FLOWS`, all `*_locked` helpers,
+  `allocator_capacity`, `sticky_pool_index`. **Exception:** the tests
+  table below will promote a handful of these to `pub(super)`.
+- `source.rs`: `SourceNatPoolAllocatorKey`,
   `source_nat_failure_reason_from_snapshot`,
-  `source_nat_runtime_compatible`, and `release_source_nat_allocation_with_mode`
-  stay private.
-- `destination.rs`: `DnatTable`, `DnatKey`, `DnatValue` are
-  `pub(super)`. `DnatEntry`, `match_entries`, `insert_entry`,
-  `PROTO_TCP`, `PROTO_UDP` stay private.
-- `static_nat.rs`: `StaticNatEntry`, `StaticNatTable` are
-  `pub(super)`. `nets_match_v4`, `nets_match_v6` stay private.
-- `status.rs`: `PortAllocatorSnapshot` is `pub(super)`;
-  `source_nat_pool_statuses` is `pub(super)`. `status.rs` needs to
-  call `PortAllocator::snapshot`, so `snapshot` on `PortAllocator`
-  stays `pub(super)`.
-- Test sub-mod uses `use super::*;` then `use super::allocator::*;`
-  etc., or — preferred — pulls in via specific imports from each
-  sub-module. (We will fix any breakage as it surfaces.)
+  `source_nat_runtime_compatible`,
+  `release_source_nat_allocation_with_mode`, `nets_match_v4`,
+  `nets_match_v6`.
+- `destination.rs`: `DnatEntry`, `PROTO_TCP`, `PROTO_UDP`,
+  `match_entries`, `insert_entry`.
+
+### Test reachability of private items (Codex F3 fix)
+
+`nat_tests.rs` (2,704 LOC) becomes `nat/tests.rs`. It uses
+`use super::*;` and currently reaches the following private items
+via that wildcard import. We promote each to `pub(super)` in its
+defining submodule so the test file (which lives at `nat/tests.rs`,
+parent = `nat/mod.rs`) can still see them through
+`super::allocator::*` / `super::source::*` imports.
+
+| Item | Where used in tests | New visibility |
+|------|---------------------|----------------|
+| `PortAllocator::release_flow` (private) | rollback/release race tests | `pub(super)` |
+| `SourceNatFlowKey::persistent_source_key` | persistent-key shape tests | `pub(super)` |
+| `PortAllocatorShared`, `live`, `persistent_by_source` | white-box lease tests | `pub(super)` on `PortAllocatorShared` + `pub(super)` fields, OR a `pub(super) fn debug_live(&self) -> MutexGuard<...>` accessor. Plan picks the accessor route — keeps the field private. |
+| `PersistentLease` | white-box lease assertion | `pub(super)` |
+| `sticky_pool_index` | sticky-mode unit tests | `pub(super)` |
+| GC_PERIOD, ALLOCATION_GC_BUDGET (if asserted) | GC budget tests | `pub(super)` |
+| `TranslatedTuple` | direct construction in white-box tests | `pub(super)` (already needed cross-submodule) |
+| `PersistentSourceKey` | direct construction in white-box tests | `pub(super)` (already needed cross-submodule) |
+
+The test file's top of file changes from a single `use super::*;` to:
+
+```rust
+use super::*;                       // NatDecision, re-exports
+use super::allocator::*;            // PortAllocator + pub(super) helpers
+use super::allocator::{PortAllocatorShared, PersistentLease, sticky_pool_index};
+use super::source::*;               // SourceNatRule, SourceNatFlowKey, etc.
+use super::destination::*;          // DnatTable, DnatKey
+use super::static_nat::*;           // StaticNatTable
+use super::status::*;               // PortAllocatorSnapshot
+```
+
+Implementation step: actually write the test file change as a single
+"adjust imports" hunk in the same commit as the code motion. No test
+logic changes; if any test fails to find a symbol after the imports
+adjustment, it is a visibility miss to be fixed inline — NOT a sign
+of behavior regression.
 
 ### Public re-export surface (verified callers preserved)
 
@@ -296,10 +397,14 @@ Specifically preserved:
     `num_addresses` and must stay that length. Index access at
     `addr_index` is a hot path. `PortAllocatorLiveState::new` is the
     sizing invariant; lives in `allocator.rs`.
-11. **HA sync portability.** `NatDecision`, `SourceNatFlowKey`,
-    `SourceNatFailureReason` are serialized over the HA fabric via
-    `event_stream`. Field shape, variant ordering, and `derive` traits
-    must be preserved bit-for-bit. Pure code motion preserves derives.
+11. **HA sync portability.** `NatDecision` is the wire-serialized
+    type via `SessionDecision`/`SessionDelta` over the HA fabric
+    (AGY confirmed; v1 over-stated the wire surface). Field shape,
+    variant ordering, and `derive` traits on `NatDecision` must be
+    preserved bit-for-bit. `SourceNatFlowKey` is internal allocator
+    key only; `SourceNatFailureReason` is exception/status text on
+    a separate non-HA wire path. Pure code motion preserves all
+    derives regardless.
 12. **Test reachability of private items.** `nat_tests.rs` uses
     `use super::*;` and reaches into `PortAllocator::release_flow`
     (private) and `SourceNatFlowKey::persistent_source_key` (private).
@@ -389,17 +494,17 @@ Specifically preserved:
    But the issue's modularity argument applies to tests too —
    reviewers may demand we split tests in the same PR. PLAN-NEEDS-MAJOR
    if so.
-6. **Pure-code-motion claim.** The only non-mechanical change is
-   visibility (`pub(crate)` → `pub(super)` inside the new module
-   tree). Are there subtle semantic implications of swapping
-   `pub(crate)` to `pub(super)` on items that the test sub-module
-   reaches through? `pub(super)` on `allocator::PortAllocator` means
-   `super` = `nat` = `nat/mod.rs`; `nat/mod.rs` then re-exports as
-   `pub(crate)`. From outside the `nat` module the symbol is still
-   reachable as `crate::nat::PortAllocator`. From `nat/tests.rs`
-   the symbol is reachable as `super::allocator::PortAllocator` or
-   `super::PortAllocator` via the re-export. We believe this is
-   safe; reviewers should confirm.
+6. **Pure-code-motion claim.** v2 fixed v1's incorrect
+   `pub(super) → pub(crate) use` widening claim (Codex F1).
+   Externally-reachable symbols stay `pub(crate)` at their definition
+   site; `mod.rs` re-exports them under the curated `crate::nat::*`
+   namespace. Internal cross-submodule items use `pub(super)`. The
+   `*_locked` helpers, GC constants, and most state-machine structs
+   stay fully private. Are there still subtle visibility hazards
+   (e.g. a `pub(super)` item leaking through a `pub(crate) use`
+   re-export and tripping rustc's `unreachable_pub` lint)? Reviewers
+   should sanity-check this by walking the re-export list in v2's
+   `mod.rs shape` block.
 7. **Build-time ordering / circular module deps.** `source.rs` needs
    `PortAllocator` (it calls `allocate_translation`,
    `release_flow`, `rollback_flow`). `allocator.rs` needs
