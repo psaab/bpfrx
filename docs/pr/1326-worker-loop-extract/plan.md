@@ -463,10 +463,12 @@ pub(crate) fn worker_loop(
             worker_commands_by_id.as_ref(),
             &dnat_fds,
             &rg_epochs,
+            // v3 nested addressing — these fields live under
+            // state.dbg_state per the DebugReportState bundle.
             #[cfg(feature = "debug-log")]
-            &mut state.dbg_counters,
-            &mut state.dbg_rx_total,
-            &mut state.dbg_forward_total,
+            &mut state.dbg_state.dbg_counters,
+            &mut state.dbg_state.dbg_rx_total,
+            &mut state.dbg_state.dbg_forward_total,
             loop_now_ns, loop_now_secs,
         );
 

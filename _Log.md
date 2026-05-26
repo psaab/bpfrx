@@ -1,5 +1,19 @@
 # Action Log
 
+## 2026-05-26 — #1326 plan v3.1 — AGY r3 nested-field qualifier fix
+
+- **Timestamp**: 2026-05-26T (AGY r3 result fetched)
+  - **Action**: AGY r3 (review-mpmvtaei-6yvid7) returned
+    PLAN-NEEDS-MINOR with 1 trivial compile-bug fix: the
+    drive_one_round call site in the v3 orchestrator sketch
+    references `&mut state.dbg_counters` / `dbg_rx_total` /
+    `dbg_forward_total` but v3 moved those fields under
+    `state.dbg_state`. AGY r3 verdict was PLAN-NEEDS-MINOR on all
+    other 6 dimensions (borrow shape, allocation audit, re-export,
+    hidden invariants, hybrid inlining, file tree, architectural
+    mismatch). Fixed addressing in plan.md; waiting on Codex r3.
+  - **File(s)**: docs/pr/1326-worker-loop-extract/plan.md
+
 ## 2026-05-26 — #1326 plan v3 (AGY r2 PLAN-NEEDS-MINOR addressed)
 
 - **Timestamp**: 2026-05-26T (AGY r2 result fetched, Codex r2 lost)
