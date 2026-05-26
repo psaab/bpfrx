@@ -64,15 +64,19 @@
 
 ## Code review
 
-### PR #1560 (HEAD ecc4d5b8)
+### PR #1560 (HEAD ecc4d5b8 — PRE-REBASE)
 
-- Codex: task-mpmf8tph-0dwkmf (dispatched ~02:25Z, inline-content workaround)
-- Antigravity: adversarial-review-mpmf9e1k-p2wray (dispatched ~02:25Z)
-- Copilot: requested via `gh pr edit --add-reviewer Copilot` + `@copilot review` comment (~02:24Z)
-- Claude SMR: posted as PR comment (https://github.com/psaab/xpf/pull/1560#issuecomment-4542722009) — **MERGE-READY**
-  - Verified load-mode bypass propagation discipline (called only from Store.Load; SyncApply/Commit/CommitCheck/Validate still use non-bypass compileTree)
-  - Verified CompileConfig / CompileConfigForNode behavior preservation under the compileWithOpts refactor
-  - Verified orphan sub-stanza silent-drop is consistent with load-mode bypass semantic
-  - Verified Phase 1 reject preservation across all tests
-  - Verified canary deletion is replaced by Go-compiler enforcement + runtime/import_canary_test.go:47 defense-in-depth
-  - Verified slog.Warn lifecycle (fires once at Load, doesn't repeat)
+- Codex: task-mpmf8tph-0dwkmf (FAILED sandbox)
+- Codex inline retry: task-mpmfed3l-q8pe15 (CANCELLED — rebase required)
+- Antigravity: adversarial-review-mpmf9e1k-p2wray (completed) — **MERGE-READY** (pre-rebase semantics; load-mode bypass)
+- Copilot: COMMENTED with one inline nit on retirement-phase wording (addressed in 90ef4637)
+- Claude SMR: posted as PR comment (issuecomment-4542722009) — **MERGE-READY** (pre-rebase semantics)
+
+### PR #1560 (HEAD 4f348ee9 — POST-REBASE onto master 13fa1009)
+
+Rebase folds master's `rewriteRetiredDataplaneType` (#1558) and removes this PR's load-mode bypass machinery in favor of the master-provided bridge. Also drops PR #1553's `cfg.System.DPDKDataplane = nil` runtime nil-clear + leakage canary file since the field is now compile-time gone.
+
+- Codex: task-mpmfvd7r-ez277q (dispatched ~03:30Z, inline-content workaround)
+- Antigravity: adversarial-review-mpmfusl5-is2lz8 (dispatched ~03:30Z)
+- Copilot: re-triggered via `@copilot review` comment after rebase (~03:30Z)
+- Claude SMR: posted as PR comment (issuecomment-4542908276) — **MERGE-READY** (post-rebase semantics; master rewrite path verified)
