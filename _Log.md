@@ -4198,3 +4198,26 @@
     attempt Codex at code-review stage on the impl PR. Proceeding
     to implementation per plan v2.2.
   - **File(s)**: docs/pr/1440-header-serialization-consolidate/plan.md
+
+- **Timestamp**: 2026-05-26
+  - **Action**: #1440 implementation per plan v2.2. Created
+    frame/headers.rs (consolidated builders for eth/IPv4/IPv6/UDP)
+    + frame/headers_tests.rs (20 golden-vector tests). Moved
+    write_eth_header + write_eth_header_slice from frame/mod.rs to
+    headers.rs with re-export at old paths. Added < 32 byte
+    short-circuit in checksum16_add_bytes. Refactored gre.rs v4/v6
+    arms + icmp.rs build_local_time_exceeded_v4/v6 to use
+    write_ipv4_header / write_ipv6_header builders. DELETED
+    wg/outer.rs entirely (was scaffold-only); two surviving smoke
+    tests in wg/tests.rs rewired to call frame::headers builders
+    directly via the frame:: re-export. Wire-byte change: GRE outer
+    IPv4 now sets DF=1 (0x4000) per RFC 791/6864; ICMP TE v4 same.
+    Build clean. Cargo tests: 1431 main + 46 lib + 8 + 16 + 20 new
+    headers_tests all pass. ICMP TE tests 5/5 pass.
+    snat_contract_doc_guard failure is pre-existing master flake
+    (references different worktree path). Go suite 30/30 pass.
+    headers tests 5/5 flake-free.
+  - **File(s)**: userspace-dp/src/afxdp/frame/{headers,headers_tests,checksum,mod}.rs,
+    userspace-dp/src/afxdp/gre.rs, userspace-dp/src/afxdp/icmp.rs,
+    userspace-dp/src/afxdp/wg/{mod,tests}.rs,
+    userspace-dp/src/afxdp/wg/outer.rs (DELETED)

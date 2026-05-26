@@ -2,8 +2,20 @@ use super::*;
 
 mod byte_writes;
 mod checksum;
+mod headers;
 mod inspect;
 mod tcp;
+
+// #1440 consolidated outer-header serializers. Re-exported at
+// `frame::write_eth_header`, `frame::write_eth_header_slice`, and
+// `frame::headers::*` to keep existing call sites in icmp.rs,
+// gre.rs, poll_stages.rs, tx/*, etc. importing from their current
+// paths. The previous in-place definitions in this file were
+// moved verbatim into headers.rs.
+pub(in crate::afxdp) use headers::{
+    eth_header_len, write_eth_header, write_eth_header_slice, write_ipv4_header,
+    write_ipv6_header, write_udp_header,
+};
 
 use byte_writes::{
     write_ipv4_dst, write_ipv4_src, write_ipv6_dst, write_ipv6_src, write_l4_dst_port,
@@ -1541,55 +1553,9 @@ pub(super) fn build_injected_ipv6(
     Ok(frame)
 }
 
-pub(super) fn write_eth_header(
-    buf: &mut Vec<u8>,
-    dst: [u8; 6],
-    src: [u8; 6],
-    vlan_id: u16,
-    ether_type: u16,
-) {
-    buf.extend_from_slice(&dst);
-    buf.extend_from_slice(&src);
-    if vlan_id > 0 {
-        buf.extend_from_slice(&0x8100u16.to_be_bytes());
-        buf.extend_from_slice(&(vlan_id & 0x0fff).to_be_bytes());
-    }
-    buf.extend_from_slice(&ether_type.to_be_bytes());
-}
-
-pub(super) fn write_eth_header_slice(
-    buf: &mut [u8],
-    dst: [u8; 6],
-    src: [u8; 6],
-    vlan_id: u16,
-    ether_type: u16,
-) -> Option<()> {
-    let eth_len = if vlan_id > 0 { 18 } else { 14 };
-    if buf.len() < eth_len {
-        return None;
-    }
-    let ether_type_bytes = ether_type.to_be_bytes();
-    // SAFETY: buf.len() >= eth_len is guaranteed by the guard above.
-    // eth_len is 14 (no VLAN) or 18 (VLAN), so all writes are in-bounds.
-    debug_assert!(buf.len() >= eth_len);
-    unsafe {
-        let ptr = buf.as_mut_ptr();
-        core::ptr::copy_nonoverlapping(dst.as_ptr(), ptr, 6);
-        core::ptr::copy_nonoverlapping(src.as_ptr(), ptr.add(6), 6);
-        if vlan_id > 0 {
-            core::ptr::copy_nonoverlapping(0x8100u16.to_be_bytes().as_ptr(), ptr.add(12), 2);
-            core::ptr::copy_nonoverlapping(
-                (vlan_id & 0x0fff).to_be_bytes().as_ptr(),
-                ptr.add(14),
-                2,
-            );
-            core::ptr::copy_nonoverlapping(ether_type_bytes.as_ptr(), ptr.add(16), 2);
-        } else {
-            core::ptr::copy_nonoverlapping(ether_type_bytes.as_ptr(), ptr.add(12), 2);
-        }
-    }
-    Some(())
-}
+// `write_eth_header` and `write_eth_header_slice` moved to
+// `frame/headers.rs` in #1440. Re-exported at the same path above so
+// existing call sites continue to work unchanged.
 
 /// Verify IP + TCP/UDP checksums on a fully-built forwarded frame.
 /// Returns (ip_ok, l4_ok). Logs mismatches for the first N frames.

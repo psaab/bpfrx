@@ -24,6 +24,21 @@ pub(in crate::afxdp) fn checksum16(bytes: &[u8]) -> u16 {
 }
 
 pub(in crate::afxdp) fn checksum16_add_bytes(sum: u32, bytes: &[u8]) -> u32 {
+    // #1440: short-circuit for sub-chunk inputs. The AVX2 path
+    // below uses `chunks_exact(32)`; for slices < 32 bytes (e.g.
+    // 20-byte IPv4 headers, 8-byte UDP headers, 8-byte TCP option
+    // fragments) the chunked loop iterates zero times and the input
+    // would go through the scalar remainder anyway — but the SIMD
+    // entry still pays the `is_x86_feature_detected!` query, the
+    // YMM accumulator init, the per-pair-swap mask materialization,
+    // and the horizontal sum. Bypass for known-small inputs.
+    // Bit-identical to the unguarded path because both paths
+    // ultimately fall through to `checksum16_add_bytes_scalar` for
+    // sub-32-byte inputs; the differential SIMD-vs-scalar test in
+    // this file already proves bit-identity of the two paths.
+    if bytes.len() < 32 {
+        return checksum16_add_bytes_scalar(sum, bytes);
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {

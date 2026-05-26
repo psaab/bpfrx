@@ -151,25 +151,20 @@ pub(super) fn build_local_time_exceeded_v4(
         vlan_id,
         0x0800,
     );
+    // #1440: consolidated IPv4 outer builder. Sets DF=1 + computes
+    // header checksum. Wire-byte change vs previous open-code:
+    // ip[6..8] = 0x4000 (was 0x0000).
     let ip_start = out.len();
-    out.extend_from_slice(&[
-        0x45,
-        0x00,
-        ((total_len as u16) >> 8) as u8,
-        (total_len as u16) as u8,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        64,
+    out.resize(ip_start + 20, 0);
+    write_ipv4_header(
+        &mut out[ip_start..ip_start + 20],
+        src_ip,
+        dst_ip,
         PROTO_ICMP,
-        0,
-        0,
-    ]);
-    out.extend_from_slice(&src_ip.octets());
-    out.extend_from_slice(&dst_ip.octets());
-    let ip_sum = checksum16(&out[ip_start..ip_start + 20]);
-    out[ip_start + 10..ip_start + 12].copy_from_slice(&ip_sum.to_be_bytes());
+        /* tos */ 0,
+        /* ttl */ 64,
+        total_len as u16,
+    )?;
     let icmp_start = out.len();
     out.extend_from_slice(&[11, 0, 0, 0, 0, 0, 0, 0]);
     out.extend_from_slice(packet.get(..quoted_len)?);
@@ -219,18 +214,19 @@ pub(super) fn build_local_time_exceeded_v6(
         vlan_id,
         0x86dd,
     );
-    out.extend_from_slice(&[
-        0x60,
-        0x00,
-        0x00,
-        0x00,
-        ((outer_payload_len as u16) >> 8) as u8,
-        (outer_payload_len as u16) as u8,
+    // #1440: consolidated IPv6 outer builder.
+    let ip_start = out.len();
+    out.resize(ip_start + 40, 0);
+    write_ipv6_header(
+        &mut out[ip_start..ip_start + 40],
+        src_ip,
+        dst_ip,
         PROTO_ICMPV6,
-        64,
-    ]);
-    out.extend_from_slice(&src_ip.octets());
-    out.extend_from_slice(&dst_ip.octets());
+        /* traffic_class */ 0,
+        /* flow_label */ 0,
+        /* hop_limit */ 64,
+        outer_payload_len as u16,
+    )?;
     let icmp_start = out.len();
     out.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0, 0]);
     out.extend_from_slice(packet.get(..quoted_len)?);

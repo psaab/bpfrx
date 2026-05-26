@@ -32,7 +32,14 @@ pub(crate) mod dscp;
 pub(crate) mod engine;
 pub(crate) mod framing;
 pub(crate) mod mss;
-pub(crate) mod outer;
+// `outer` module deleted in #1440. Its scaffold helpers
+// (write_outer_eth, write_outer_ipv4_udp, outer_l2_len,
+// checksum_be) were never wired into the production WG encap
+// path; the consolidated outer-header serializers now live in
+// `userspace-dp/src/afxdp/frame/headers.rs`. When the WG-encap
+// integration PR lands, its `try_encap` will call
+// `crate::afxdp::frame::headers::{write_eth_header_slice,
+// write_ipv4_header, write_udp_header}` directly.
 pub(crate) mod peer;
 pub(crate) mod scratch;
 pub(crate) mod session;
