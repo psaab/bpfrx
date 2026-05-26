@@ -44,11 +44,19 @@ pub(in crate::afxdp) use interfaces::{pick_interface_v4, pick_interface_v6};
 // Plain (private) `use` for orchestrator-local symbols. NOT a
 // `pub(super) use` of a `pub(super)` item — that triggers E0364
 // (see `tx/mod.rs:38` for the documented precedent).
-//
-// `default_cos_burst_bytes` is brought in so that the test module
-// (`forwarding_build/tests.rs`, loaded as a child via `mod tests;`)
-// can resolve it via `super::*`.
-use cos::{build_cos_classifier_tables, build_cos_iface_config, build_cos_state, default_cos_burst_bytes};
+use cos::build_cos_state;
+
+// Test-only imports. `default_cos_burst_bytes` is reached by
+// `forwarding_build/tests.rs` (loaded as `mod tests;` below) via
+// `use super::*;`. `build_cos_classifier_tables`,
+// `build_cos_iface_config`, and `IfaceIndex` are not referenced
+// outside their defining sub-modules in production but are
+// surfaced for test assertions and future intra-module use.
+#[cfg(test)]
+#[allow(unused_imports)]
+use cos::{build_cos_classifier_tables, build_cos_iface_config, default_cos_burst_bytes};
+#[cfg(test)]
+#[allow(unused_imports)]
 use interfaces::IfaceIndex;
 
 pub(super) fn build_screen_profiles(snapshot: &ConfigSnapshot) -> FxHashMap<String, ScreenProfile> {

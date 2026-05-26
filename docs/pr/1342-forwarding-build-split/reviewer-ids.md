@@ -15,7 +15,7 @@ instead of re-dispatching.
 
 ## Code review round 1
 
-- Codex: <pending>
-- AGY: <pending>
-- Copilot: <pending>
+- Codex: task-mpn15adv-8cfstv
+- AGY: adversarial-review-mpn15a2n-h7c0bb
+- Copilot: requested via @copilot review + gh pr edit --add-reviewer
 - Claude SMR: in-conversation
