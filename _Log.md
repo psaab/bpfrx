@@ -1,5 +1,26 @@
 # Action Log
 
+## 2026-05-26 — #1325 plan v2 folds Codex+AGY r1
+
+- **Timestamp**: 2026-05-26T (UTC)
+- **Action**: Folded both r1 reviews into plan v2.
+  - Codex r1 PLAN-KILL (5 blocking, all fixable): incremental-build
+    claim withdrawn; ProcessStatus dependency graph corrected to
+    enumerate every cross-domain ref (control depends on every
+    other module); per-test cross-domain placement table added;
+    `u64_is_zero` switched to absolute path
+    `crate::protocol::u64_is_zero` per serde_derive ExprPath
+    semantics; "comment-header-derived" framing dropped.
+  - AGY r1 PLAN-NEEDS-MINOR (4 items, fully overlapping with
+    Codex r1 except for one new recommendation): added
+    differential wire-format snapshot test
+    (wire_invariant_tests.rs vs checked-in fixture).
+  - Documented Codex/AGY disagreement on incremental-build claim;
+    resolved by keeping the conservative "modularity discipline
+    only" framing.
+- **File(s)**: docs/pr/1325-protocol-split/plan.md (v2 fold),
+  _Log.md
+
 ## 2026-05-26 — #1325 protocol.rs split plan v1 DRAFT
 
 - **Timestamp**: 2026-05-26T (UTC)
