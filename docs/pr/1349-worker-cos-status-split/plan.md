@@ -1,6 +1,6 @@
 # #1349 — Split `build_worker_cos_statuses_from_maps` into focused helpers
 
-**Status:** DRAFT v2 — addresses round-1 findings from Codex (PLAN-NEEDS-MAJOR), Gemini Pro 3 (PLAN-KILL), AGY (PLAN-READY), Claude SMR (PLAN-NEEDS-MINOR). Re-dispatching to all four.
+**Status:** PLAN-READY v3 — Codex round-3 MINOR (doc-metadata stale counts) addressed. AGY round-2 PLAN-READY, Claude SMR PLAN-READY, Codex round-3 PLAN-READY after MINOR fix. Gemini round-2 PLAN-KILL on style/premise grounds (linear-mapper-not-worth-fragmenting); per [[feedback_gemini_low_signal_on_refactor]] this refactor stream does not gate merges on Gemini's verdict alone when the other three reviewers agree.
 
 ## Round-1 review summary
 
@@ -372,7 +372,7 @@ outside `worker/cos.rs` and `worker/cos_tests.rs`.
 
 | Class | Risk | Justification |
 |---|---|---|
-| Behavioral regression | LOW | Pure code motion. No reordered accumulation, no algorithmic change. Existing 13-test suite in `cos_tests.rs` (including the 264-LOC integration test exercising the full path with both single-owner-local and shared-exact shapes) is the safety net. |
+| Behavioral regression | LOW | Pure code motion. No reordered accumulation, no algorithmic change. Existing 23-test suite in `cos_tests.rs` (including the 264-LOC integration test exercising the full path with both single-owner-local and shared-exact shapes) is the safety net. |
 | Lifetime / borrow-checker | LOW | The `&mut entry` / `&mut status` views into BTreeMap entries follow standard NLL-friendly patterns already used by the worker codebase. No `&mut self` recursion, no aliasing concerns. |
 | Performance regression | LOW | Control-plane only. Helpers take `&mut` references — no copies. The original tight inner loop is preserved at the call site; only the inner block contents are factored out. Inliner is expected to make the calls free; even if it doesn't, this path runs at 1Hz scrape. |
 | Architectural mismatch (#961 / #946-Phase-2 pattern) | LOW | This is a within-file decomposition, not a cross-cutting architectural change. The "cohesion principle: telemetry-rendering vs accounting" lives entirely inside the same compilation unit; there is no risk of forcing a wrong abstraction. The decomposition target is exactly the issue body's sketch. |
@@ -402,7 +402,7 @@ outside `worker/cos.rs` and `worker/cos_tests.rs`.
   `determine_unambiguous_owner_local_exact_queue` per the issue's
   test-name pun. Stays as-is to keep the diff pure code-motion.
 - Splitting `cos_tests.rs` (2112 LOC) into per-helper test modules.
-  The 2014-LOC test file is acknowledged as a secondary observation
+  The 2112-LOC test file is acknowledged as a secondary observation
   in the issue; the file moves in this PR but its contents do not.
 - Decomposing the 264-LOC mega-test
   `build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_local_exact_queue`
