@@ -1,7 +1,10 @@
-// Tests for afxdp/bpf_map.rs — relocated from inline
-// `#[cfg(test)] mod tests` to keep bpf_map.rs under the modularity-discipline
+// Tests for afxdp/bpf_map/ — relocated from inline
+// `#[cfg(test)] mod tests` to keep bpf_map under the modularity-discipline
 // LOC threshold. Loaded as a sibling submodule via
-// `#[path = "bpf_map_tests.rs"]` from bpf_map.rs.
+// `#[path = "../bpf_map_tests.rs"]` from bpf_map/mod.rs (#1356 split the
+// flat bpf_map.rs into a directory; this file stays at the parent
+// afxdp/ scope and is pulled back into the bpf_map namespace by the
+// path attribute).
 
 use super::*;
 use crate::test_zone_ids::*;

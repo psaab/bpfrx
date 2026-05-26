@@ -103,9 +103,12 @@ build). It is the next-smallest item in that audit.
 - The BPF map structs (`BpfSessionKeyV4`, `BpfSessionValueV4`,
   `BpfSessionKeyV6`, `BpfSessionValueV6`) are already defined at
   module scope (lines 342-436) and are `struct`-private to
-  `bpf_map.rs`. After the split, they need to be visible to the
-  per-family submodules — `pub(super)` on the structs and constants
-  is sufficient.
+  `bpf_map.rs`. After the split they **stay private** at
+  `bpf_map/mod.rs` scope; the child `publish_conntrack` submodule
+  reaches them via Rust's parent-private-item access rule
+  (`use super::{…}` for ergonomic unqualified names). **No
+  `pub(super)` bump is needed and v2 dropped that idea per Codex r1
+  + AGY r1 findings.**
 - `delete_bpf_conntrack_entry` (655-695) and
   `refresh_bpf_conntrack_last_seen` (709-787) also branch on
   `addr_family` with identical BPF-key construction. **They are
@@ -126,31 +129,32 @@ build). It is the next-smallest item in that audit.
 ```
 userspace-dp/src/afxdp/
 ├── bpf_map/
-│   ├── mod.rs              ← was bpf_map.rs (everything except publish_conntrack)
-│   ├── publish_conntrack.rs ← orchestrator + per-AF helpers
-└── bpf_map_tests.rs        (unchanged, still at afxdp/ scope)
+│   ├── mod.rs              ← was bpf_map.rs (orchestrator stays here)
+│   ├── publish_conntrack.rs ← per-AF helpers only (publish_v4_session, publish_v6_session)
+└── bpf_map_tests.rs        (unchanged, still at afxdp/ scope; bpf_map/mod.rs
+                             includes it via #[path = "../bpf_map_tests.rs"])
 ```
 
 The directory promotion mirrors the layout used in #1326, #1345,
 and #1352. Tests stay at the original `afxdp/` scope (parent of
-the new `bpf_map/` directory) — moving them is unnecessary churn
-and they already use `super::super::` paths via the existing
-`#[path = ...]` include.
+the new `bpf_map/` directory) — moving them is unnecessary churn;
+the test file's existing `use super::*;` keeps working because the
+`#[path = "../bpf_map_tests.rs"] mod tests;` include in `bpf_map/mod.rs`
+brings the test module back inside the `bpf_map` namespace.
 
 The wave-2 prompt suggested `bpf_map/{mod,publish_ipv4,publish_ipv6}.rs`.
-The plan instead consolidates the per-family helpers under a single
-`publish_conntrack.rs` because (a) the dispatch lives there alongside
-the helpers and (b) splitting **further** into per-family files
-gives two ~75-LOC files that are mirror images of each other —
-that's the kind of cohesion-violating fragmentation AGY r1 flagged
-on #1345. The cohesion line for this fan-out is "BPF conntrack
-publish" not "address family"; the per-family functions live
-together because they share the orchestrator and the flag/zone
-computation.
+v2 instead consolidates the per-family helpers under a single
+`publish_conntrack.rs` because (a) the dispatch lives in `mod.rs`
+alongside any shared zone/flag computation and (b) splitting
+**further** into per-family files gives two ~80-LOC files that are
+mirror images of each other — that's the kind of cohesion-violating
+fragmentation AGY r1 flagged on #1345. The cohesion line for this
+fan-out is "BPF conntrack publish" not "address family"; the
+per-family functions live together because they share the
+orchestrator and the flag/zone computation.
 
 If reviewers prefer the stricter per-AF layout the prompt sketched,
-that's a minor variant the implementer can ship — argue this point
-in your verdict.
+that's a minor variant — argue in the code review.
 
 ### Function shape
 
