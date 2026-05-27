@@ -1,10 +1,104 @@
 # #1443 — `tx/dispatch.rs::enqueue_pending_forwards` modular phase split
 
-**Status:** DRAFT v2 — addressing Codex + AGY round-1 PLAN-NEEDS-MAJOR
-findings (both reviewers agreed plan needed major revision; neither
-called PLAN-KILL).
+**Status:** DRAFT v3 — addressing AGY round-2 PLAN-NEEDS-MINOR
+findings. Codex round-2 was BLOCKED on infra (codex-linux-sandbox
+ENOENT); re-dispatch follows v3.
 
-## Round-1 findings addressed
+Round-1: both reviewers PLAN-NEEDS-MAJOR (handled in v2 changes
+below). Round-2 AGY: PLAN-NEEDS-MINOR with 4 concrete corrections
+(handled in v3 changes here).
+
+## Round-2 (AGY) findings addressed in v3
+
+AGY round-2 task-id `adversarial-review-mpna1lxa-o4ddp4` (verdict
+PLAN-NEEDS-MINOR). Codex round-2 task-id `task-mpna1dye-e5cpgu`
+(BLOCKED — infra failure; re-dispatched as `task-mpnasaad-cwdg9s`).
+
+### AGY round-2 finding A — `EnqueueFailed` is silently leaky (CRITICAL)
+
+AGY caught that v2's `Phase8Outcome::EnqueueFailed` mapping changed
+behaviour from `master`. Verified against dispatch.rs:557-563 and
+dispatch.rs:835-841 — both sites do:
+
+```rust
+if enqueue_local_request_to_target_or_owner(target_binding, req).is_err() {
+    build_failed = true;
+    fallback_to_slow_path = true;
+    continue;
+}
+```
+
+The `continue` returns to the top of the `for request in
+pending_forwards.iter_mut()` loop (verified by tracing the brace
+structure — these are NOT inside an inner loop). `build_failed` and
+`fallback_to_slow_path` are loop-local variables declared at
+dispatch.rs:271-272 and reset to `false` at the start of every
+iteration. Therefore the current code skips Phase 11
+(`handle_forward_build_failure`) AND skips the final ingress recycle
+at dispatch.rs:898 — silently **leaking** the ingress frame.
+
+This is almost certainly an existing bug, but **this PR is pure code
+motion**. v3 preserves the leak verbatim. A follow-up issue tracks
+the fix (filed separately so this PR doesn't carry an algorithmic
+change). v3 orchestrator dispatch:
+
+```rust
+Phase8Outcome::EnqueueFailed => {
+    // VERBATIM PRESERVATION of current master at
+    // dispatch.rs:557-563 / 835-841: skip Phase 9 + Phase 10 +
+    // Phase 11. The ingress frame is LEAKED (no recycle). This
+    // looks like a bug but is out of scope for #1443 — file
+    // follow-up issue with the leak class before merge.
+    continue;
+}
+```
+
+`BuildReturnedNone` is the ONLY variant that should reach Phase 11.
+The orchestrator's dispatch matrix changes accordingly. See
+§"Concrete design — Phase 8 outcome enum" v3 rewrite.
+
+### AGY round-2 finding B — `OversizedFrame` push-front myth (CORRECT DOCS)
+
+AGY caught that v2's Phase8Outcome::OversizedFrame doc-comment
+incorrectly described a `push_front` at dispatch.rs:544 / 822. There
+is no `push_front` at those sites:
+
+- dispatch.rs:534-545 (copy-fallback path): `frame` is a `Vec<u8>`
+  from `build_forwarded_frame_from_frame`. No `tx_offset` was popped
+  on this path. The `continue` just leaks the ingress frame.
+- dispatch.rs:812-823 (copy-fallback after direct-TX fallback):
+  same — `frame` is a `Vec<u8>` from copy-build. The
+  `direct_tx_offset` (if popped) was already pushed back at
+  dispatch.rs:609 / 617 / 688 / 737 BEFORE reaching this size check.
+
+v3 corrects the doc-comment on `Phase8Outcome::OversizedFrame`.
+
+### AGY round-2 finding C — `frame.rs` monolith risk
+
+AGY estimated `frame.rs` at ~680 LOC with `try_inplace_rewrite_or_build`
+alone at ~440 LOC. v3 splits Phase 8 out:
+
+- `frame.rs` keeps Phase 3 (prebuilt), Phase 4 (source-frame
+  extract), Phase 7 (TCP-seg dispatch glue), and the inline
+  predicates (~165 LOC estimated).
+- `inplace_dispatch.rs` (NEW) hosts Phase 8 entirely
+  (`try_inplace_rewrite_or_build` + `Phase8Outcome` enum + the
+  in-place / direct-TX / copy-fallback helpers). ~440 LOC.
+
+v3 submodule count: **5 + mod.rs** (cos, frame, inplace_dispatch,
+slow_path, shared_recycle).
+
+### AGY round-2 finding D — `#[cold]` does not prevent inlining
+
+AGY pointed out `#[cold]` advises LLVM the branch is unlikely BUT
+does not prevent inlining. With a single hot caller, LLVM may still
+inline a `#[cold]` function and pollute the i-cache. v3 adds
+`#[inline(never)]` alongside `#[cold]` on the slow-path family. This
+remains within Codex round-1 guidance (no `#[inline(always)]` added)
+— `#[inline(never)]` is the opposite of `#[inline(always)]`, used
+specifically to prevent inlining on cold paths.
+
+## Round-1 findings addressed in v2
 
 Codex round-1 task-id `task-mpn9fpo5-h6c0nu`. AGY round-1 task-id
 `adversarial-review-mpn90zjs-vntq8b`. Both verdicts captured in
@@ -191,7 +285,11 @@ borrow window): Phases 3, 5, 6, 7-prepared-branch, 8 entirely, 9,
 the orchestrator's loop body. Extract only the named helpers below.
 No hoisting upstream of dispatch (that's #1016's deferred half).
 
-## Layout v2 — four submodules + mod.rs
+## Layout v3 — five submodules + mod.rs
+
+(v2 had 4 submodules; AGY round-2 finding C added
+`inplace_dispatch.rs` to isolate the ~440 LOC Phase 8 from
+`frame.rs`.)
 
 Mirror the `tx/drain/` and `tx/transmit/` precedent. Move
 `tx/dispatch.rs` → `tx/dispatch/mod.rs` and split as follows:
@@ -213,13 +311,19 @@ userspace-dp/src/afxdp/tx/dispatch/
 ├── frame.rs                     — Phase 3 (prebuilt fast path),
 │                                  Phase 4 (source-frame extraction),
 │                                  Phase 7 (TCP-seg dispatch glue),
-│                                  Phase 8 (in-place + direct-TX +
-│                                  copy-fallback, with Phase8Outcome enum),
 │                                  inline predicates
 │                                  (count_forwarded_tcp_segmentation_miss_if_needed,
 │                                  forwarded_tcp_may_need_segmentation),
 │                                  recycle_ingress_frame,
 │                                  resolve_pending_forward_target_binding.
+│                                  Estimated ~165 LOC.
+├── inplace_dispatch.rs          — Phase 8 entirely (in-place rewrite
+│                                  + direct-TX + copy-fallback, with
+│                                  Phase8Outcome enum and
+│                                  try_inplace_rewrite_or_build).
+│                                  Estimated ~440 LOC. Split out from
+│                                  frame.rs per AGY round-2 finding C
+│                                  to isolate the monolith risk.
 ├── slow_path.rs                 — exception / reinjection / build-fail
 │                                  cold path: handle_forward_build_failure,
 │                                  maybe_reinject_slow_path,
@@ -279,6 +383,7 @@ Verbatim re-export block at the top of `dispatch/mod.rs`:
 ```rust
 mod cos;
 mod frame;
+mod inplace_dispatch;
 mod shared_recycle;
 mod slow_path;
 
@@ -313,7 +418,7 @@ per-binding invariant. This addresses AGY blocking #1 and Codex
 blocking #5.
 
 ```rust
-// frame.rs
+// inplace_dispatch.rs (v3 — was frame.rs in v2)
 #[inline]
 pub(super) fn try_inplace_rewrite_or_build(
     target_binding: &mut BindingWorker,
@@ -347,53 +452,71 @@ Addresses Codex blocking #2: every mid-body `continue` in current
 code maps to a named outcome.
 
 ```rust
-// frame.rs
+// inplace_dispatch.rs (v3 — was frame.rs in v2)
 pub(super) enum Phase8Outcome {
     /// In-place / direct-TX / copy-fallback succeeded.
     /// retained_source_frame=true iff in-place rewrite consumed the
-    /// ingress UMEM slot.
+    /// ingress UMEM slot (orchestrator skips the final ingress
+    /// recycle at Phase 11).
     Wrote { retained_source_frame: bool },
 
-    /// Oversized frame path at dispatch.rs:534-545 / 812-823. Current
-    /// code recycles via push_front of the popped tx_offset then
-    /// `continue`s, skipping Phases 9 + 10 + 11 entirely (no build
-    /// failure, no shared-recycle, no ingress recycle).
+    /// Oversized frame path at dispatch.rs:534-545 / 812-823.
+    /// `frame` was built but exceeds tx_frame_capacity. Current
+    /// code records an `oversized_forward_frame` exception and
+    /// `continue`s. **No `tx_offset` push-back happens at these
+    /// sites** (direct-TX path already pushed back at dispatch.rs:
+    /// 609 / 617 / 688 / 737 before the size check; the copy-path
+    /// site at 534-545 never popped a tx_offset). The `continue`
+    /// skips Phases 9 + 10 + 11. **The ingress frame is leaked**
+    /// (no recycle) — preserved verbatim as pure code motion.
     OversizedFrame,
 
     /// enqueue_local_request_to_target_or_owner returned Err at
-    /// dispatch.rs:557-562 / 835-840. Current code sets
-    /// build_failed=true + fallback_to_slow_path=true, then
-    /// `continue`s, skipping Phase 9 + 10, then runs Phase 11.
+    /// dispatch.rs:557-563 / 835-841. Current code sets
+    /// loop-local `build_failed = true` and `fallback_to_slow_path
+    /// = true` then `continue`s — but these are reset to `false`
+    /// at the top of every iteration, so Phase 11 is NEVER reached.
+    /// The ingress frame is silently LEAKED. Almost certainly an
+    /// existing bug — see follow-up issue (out of scope for #1443's
+    /// pure-code-motion framing). v3 preserves verbatim.
     EnqueueFailed,
 
-    /// build_forwarded_frame_* returned None on both direct-TX and
-    /// the copy fallback. Current code sets build_failed +
-    /// fallback_to_slow_path, falls through to Phase 11.
+    /// build_forwarded_frame_* returned None on BOTH direct-TX and
+    /// the copy fallback. Current code at dispatch.rs:572-575 /
+    /// 850-853 sets build_failed + fallback_to_slow_path (no
+    /// `continue`!), falls through to dispatch.rs:858-869 (Phase 9
+    /// drain trigger), 871-880 (Phase 10 shared-recycle), and
+    /// 881-901 (Phase 11 handle_forward_build_failure + ingress
+    /// recycle gated on !retained_source_frame).
     BuildReturnedNone,
 }
 ```
 
-Orchestrator per-iteration body becomes:
+Orchestrator per-iteration body (v3 corrected dispatch):
 
 ```rust
 match try_inplace_rewrite_or_build(...) {
     Phase8Outcome::Wrote { retained_source_frame: r } => {
         retained_source_frame = r;
-        // Fall through to Phases 9 + 10 + 11(no-fail)
+        // Fall through to Phases 9 + 10 + 11(no-fail).
     }
-    Phase8Outcome::OversizedFrame => {
-        continue; // matches current dispatch.rs:544 / 822 behaviour
-    }
-    Phase8Outcome::EnqueueFailed | Phase8Outcome::BuildReturnedNone => {
-        // Match current dispatch.rs:881-900: skip 9+10, run Phase 11.
-        handle_forward_build_failure(..., fallback_to_slow_path: true, ...);
-        if !retained_source_frame {
-            recycle_ingress_frame(ingress_binding, source_offset, now_ns);
-        }
+    Phase8Outcome::OversizedFrame | Phase8Outcome::EnqueueFailed => {
+        // VERBATIM preservation of current dispatch.rs:544 / 562 /
+        // 822 / 840: continue, skipping Phases 9 + 10 + 11.
+        // The ingress frame is LEAKED — out of scope for this PR.
         continue;
+    }
+    Phase8Outcome::BuildReturnedNone => {
+        // Fall through to Phases 9 + 10 + 11(build_failed=true).
+        build_failed = true;
+        fallback_to_slow_path = true;
+        // (Orchestrator's existing Phase 9/10/11 code runs.)
     }
 }
 ```
+
+This v3 dispatch matrix preserves master verbatim. Reviewers — please
+re-walk dispatch.rs:534-580 + 812-855 once more to verify.
 
 Reviewers — please verify against current dispatch.rs:534-905 that
 this outcome matrix preserves every disposition.
@@ -415,14 +538,14 @@ v2 compromise:
 | File / helper | Marker | Rationale |
 |---|---|---|
 | `cos.rs` per-request helpers | `#[inline]` | Per-request hot; one caller |
-| `frame.rs::try_inplace_rewrite_or_build` | `#[inline]` | Per-request hot; one caller; large body but one caller → release-build inlining reliable |
+| `inplace_dispatch.rs::try_inplace_rewrite_or_build` | `#[inline]` | Per-request hot; one caller; large body but one caller → release-build inlining reliable |
 | `frame.rs::try_handle_prebuilt_frame` | `#[inline]` | Per-request; cold-ish (only ICMP error NAT reversal) |
 | `frame.rs::forwarded_tcp_may_need_segmentation` | `#[inline(always)]` | Already is at dispatch.rs:1438; preserve verbatim |
 | `frame.rs::count_forwarded_tcp_segmentation_miss_if_needed` | `#[inline(always)]` | Already is at dispatch.rs:1425; preserve verbatim |
 | `frame.rs::recycle_ingress_frame` | `#[inline]` | Already is at dispatch.rs:60; preserve verbatim |
-| `slow_path.rs::handle_forward_build_failure` | `#[cold]` | Build-failure path |
-| `slow_path.rs::maybe_reinject_slow_path` | `#[cold]` | Reinjection path |
-| `slow_path.rs::maybe_reinject_slow_path_from_frame` | `#[cold]` | Reinjection path |
+| `slow_path.rs::handle_forward_build_failure` | `#[cold]` + `#[inline(never)]` | Build-failure path. v3 adds `#[inline(never)]` per AGY round-2 D: `#[cold]` alone does not prevent inlining |
+| `slow_path.rs::maybe_reinject_slow_path` | `#[cold]` + `#[inline(never)]` | Reinjection path |
+| `slow_path.rs::maybe_reinject_slow_path_from_frame` | `#[cold]` + `#[inline(never)]` | Reinjection path |
 | `slow_path.rs::extract_l3_packet*` | (no marker) | Called by both hot and cold paths; let LLVM decide |
 | `shared_recycle.rs::apply_shared_recycles` | (no marker) | Called per-iteration but loops over `post_recycles` — let LLVM see the body |
 | `shared_recycle.rs::resolve_tx_binding_ifindex` | (no marker) | 16+ external call sites; over-marking would conflict |
