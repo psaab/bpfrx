@@ -12,8 +12,7 @@ This PR's deliverable becomes:
   adversarial review and 4 patch cycles).
 - Cold-path flooder Cargo skeleton at
   `test/incus/cold-path-flooder/` (CLI surface + cohort validation +
-  CLI surface + cohort validation + cargo unit tests; runner body
-  deferred to step-2 #1611).
+  cargo unit tests; runner body deferred to step-2 #1611).
 - §4.6 Scale Target tables exist as TBD-marked contracts in the
   plan; populated in step-3 (#1612) after the runner body lands.
 

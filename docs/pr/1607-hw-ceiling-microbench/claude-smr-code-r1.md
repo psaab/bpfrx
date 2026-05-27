@@ -73,7 +73,7 @@ dataplane regression risk from this PR alone.
   unit tests, both positive + negative.
 - `frame_bytes_must_be_at_least_min_eth`: pin MIN_ETH_FRAME = 64.
 
-All six tests exercise the **stable** parts of the binary (parsing,
+All nine tests exercise the **stable** parts of the binary (parsing,
 constants); none of them depend on the deferred runner body. PASS.
 
 ### Documentation
