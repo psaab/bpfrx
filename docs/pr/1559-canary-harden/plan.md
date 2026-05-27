@@ -40,7 +40,7 @@ performance impact, no API surface change. The two new AST passes
 are O(file size) and run once per `go test ./pkg/daemon` invocation.
 
 If reviewers conclude the hardening is unnecessary (e.g. the
-retirement boundary canary at `pkg/daemon/retirement_boundary_canary_test.go`
+retirement boundary canary at `pkg/dataplane/retirement_boundary_canary_test.go`
 already catches this), PLAN-KILL is an acceptable verdict.
 
 ## What's already shipped / partially batched
