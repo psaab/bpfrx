@@ -57,6 +57,28 @@ pub(crate) struct FirewallFilterSnapshot {
     pub terms: Vec<FirewallTermSnapshot>,
 }
 
+// ============================================================
+// CACHE-KEY INVARIANT (#1431) — read before adding a match field
+//
+// Every match criterion on FirewallTermSnapshot (and its runtime
+// twin FilterTerm in userspace-dp/src/filter/mod.rs) MUST be
+// classified as either (a) IN cache key — extend SessionKey in
+// session/key.rs and prove key stability across HA sync, the
+// session-table reverse indices, flow-cache key derivation, and
+// reverse-NAT lookup — or (b) NOT in cache key (cache-sensitive),
+// which requires wiring the #1430 runbook (per-interface
+// has_<X>_match set, flow-cache insertion gate, established-session
+// re-evaluation, and forwarding-rotation purge).
+//
+// Skipping this classification SILENTLY breaks flow-cache: a
+// first-packet decision gets reused for later packets that can
+// differ on the new field.
+//
+// See userspace-dp/src/filter/README.md
+//   "Cache-key invariants for per-packet match fields (#1431)"
+// for the full classification table, recipe pointers, and
+// canonical reference tests.
+// ============================================================
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub(crate) struct FirewallTermSnapshot {
     pub name: String,

@@ -1,6 +1,6 @@
 # #1431 — userspace filters: preserve cache invariants for future per-packet match fields
 
-**Status:** DRAFT v3 — addressing Codex r2 PLAN-NEEDS-MINOR + AGY r2 PLAN-READY
+**Status:** PLAN-READY v5 — Codex r4 + AGY r4 PLAN-READY (round 4)
 
 **v2 verdict log (round 2):**
 

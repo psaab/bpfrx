@@ -4846,3 +4846,24 @@ top.
 - **File(s)**: `docs/pr/1431-filter-cache-invariants/plan.md`
 - **Fix**: §6 invariant #4 "new positional-ID-change test" →
   cite existing filter/tests.rs:1806.
+
+## 2026-05-26 — #1431 implementation commit
+
+- **Timestamp**: 04:08 UTC
+- **Action**: implemented per plan v5; both reviewers PLAN-READY
+- **File(s)**:
+  - `userspace-dp/src/filter/README.md` (+~120 lines:
+    Cache-key invariants section, classification table,
+    path (b) runbook, path (a) pointer, lo0 note)
+  - `userspace-dp/src/filter/mod.rs` (added in-source
+    CACHE-KEY INVARIANT block above FilterTerm)
+  - `userspace-dp/src/protocol/security.rs` (added mirror
+    block above FirewallTermSnapshot)
+  - `userspace-dp/src/afxdp/flow_cache_tests.rs` (+2 new
+    tests: dscp_input_gate_*_via_runbook_pattern and
+    dscp_output_gate_*_via_runbook_pattern, plus a section
+    comment block explaining the runbook reference role)
+- **Validation**: cargo build clean; new tests 5/5 pass; full
+  cargo --release passes except a pre-existing snat doc-guard
+  flake (master also fails this — unrelated to #1431).
+  Go suite clean.

@@ -744,6 +744,160 @@ fn from_forward_decision_skips_cache_for_dscp_matched_input_filter() {
     );
 }
 
+// ============================================================
+// #1431 cache-invariant runbook reference tests
+//
+// These two tests are the canonical "this is what a new
+// cache-sensitive per-packet match field's flow-cache gate test
+// should look like" references for the runbook in
+// userspace-dp/src/filter/README.md
+// "Cache-key invariants for per-packet match fields (#1431)".
+//
+// They re-exercise the DSCP gate (already covered by the bespoke
+// tests above at lines 644 and 696), but in an explicitly
+// runbook-shaped layout: build a snapshot with the cache-sensitive
+// match field on a terminal action, bind it to the relevant
+// interface direction, drive `FlowCacheEntry::from_forward_decision`,
+// and assert the cache declines insertion.
+//
+// When a future PR adds a new cache-sensitive match field
+// (tcp_flags, fragment, ihl, tos lower bits / ECN, icmp_type,
+// flex_match, etc.), clone the pattern below — substitute the
+// new match field's snapshot field and the per-interface
+// has_<X>_match set the snapshot compiler populated. The flow-
+// cache home is `afxdp/`, not `filter/`, because
+// `FlowCacheEntry::from_forward_decision` is `pub(super)`-scoped
+// to `afxdp::flow_cache`.
+// ============================================================
+
+#[test]
+fn dscp_input_gate_blocks_flow_cache_insertion_via_runbook_pattern() {
+    let rg_epochs = default_rg_epochs();
+    let (flow, mut meta, validation, decision, mut forwarding, ha_state) =
+        make_v4_round_trip_inputs();
+    // Step 1: pick a DSCP value the term will NOT match — the
+    // first-packet decision must be allowed to enter the cache
+    // path so the gate, not the term, is what blocks insertion.
+    meta.dscp = 0;
+    // Step 2: build a realistic snapshot whose terminal action
+    // depends on a per-packet field outside the cache key.
+    // For DSCP this is `dscp_values`; future fields would
+    // substitute their own snapshot field.
+    forwarding.filter_state = crate::filter::parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "lan-runbook-input".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-ef-web".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                dscp_values: vec![46],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &[InterfaceSnapshot {
+            name: "reth1.0".into(),
+            ifindex: meta.ingress_ifindex as i32,
+            // Step 3: bind the filter as an INPUT filter on the
+            // ingress interface. The snapshot compiler in
+            // userspace-dp/src/filter/compiler.rs populates the
+            // per-interface has_dscp_match set
+            // (FilterState.iface_filter_v4_has_dscp_match).
+            filter_input_v4: "lan-runbook-input".into(),
+            ..Default::default()
+        }],
+        "",
+        "",
+    );
+
+    // Step 4: drive FlowCacheEntry::from_forward_decision and
+    // confirm the gate at flow_cache.rs:297-309 declined
+    // insertion via interface_input_filter_has_dscp_match.
+    let entry = FlowCacheEntry::from_forward_decision(
+        &flow,
+        meta,
+        validation,
+        decision,
+        1,
+        Some(TEST_TRUST_ZONE_ID),
+        Some(7),
+        None,
+        &forwarding,
+        &ha_state,
+        false,
+        &rg_epochs,
+    );
+
+    assert!(
+        entry.is_none(),
+        "input-bound DSCP-matched filters must decline flow-cache \
+         insertion — see #1431 runbook in filter/README.md",
+    );
+}
+
+#[test]
+fn dscp_output_gate_blocks_flow_cache_insertion_via_runbook_pattern() {
+    let rg_epochs = default_rg_epochs();
+    let (flow, mut meta, validation, decision, mut forwarding, ha_state) =
+        make_v4_round_trip_inputs();
+    meta.dscp = 0;
+    // Step 1-2 identical to the input variant — build a
+    // snapshot whose terminal action depends on DSCP.
+    // Step 3 (changed from input): bind the filter as an
+    // OUTPUT filter on the egress interface. The compiler
+    // populates FilterState.iface_filter_out_v4_fast and the
+    // has_dscp_match aggregate is observed by
+    // interface_output_filter_has_dscp_match.
+    forwarding.filter_state = crate::filter::parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "wan-runbook-output".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-ef-web".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                dscp_values: vec![46],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &[InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: decision.resolution.egress_ifindex,
+            filter_output_v4: "wan-runbook-output".into(),
+            ..Default::default()
+        }],
+        "",
+        "",
+    );
+
+    // Step 4: same gate, different per-interface set
+    // (iface_filter_out_v4_fast.has_dscp_match_terms).
+    let entry = FlowCacheEntry::from_forward_decision(
+        &flow,
+        meta,
+        validation,
+        decision,
+        1,
+        Some(TEST_TRUST_ZONE_ID),
+        Some(7),
+        None,
+        &forwarding,
+        &ha_state,
+        false,
+        &rg_epochs,
+    );
+
+    assert!(
+        entry.is_none(),
+        "output-bound DSCP-matched filters must decline flow-cache \
+         insertion — see #1431 runbook in filter/README.md",
+    );
+}
+
 /// Build a self-consistent v6-meta + v6-NAT scenario for the
 /// mirror-image mismatch test (v4 rewrite_dst on v6 meta). Separate
 /// from `make_v4_round_trip_inputs` so the v6 test doesn't have to
