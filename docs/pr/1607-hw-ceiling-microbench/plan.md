@@ -39,15 +39,25 @@ v1 round-1 verdicts (verbatim references):
 v2 axes the reviewers MUST audit:
 
 1. UDP randomized-source-port flooder is now the **default** mode
-   (§4.2). No iperf3 in the default path. The flooder ships in this PR
-   as a `cargo`-built Rust binary at
-   `test/incus/cold-path-flooder/`. Smoke-only iperf3 sanity is a
-   `--mode=iperf3-sanity` flag whose sole purpose is to prove the
-   histogram increments at all.
+   (§4.2). No iperf3 in the default path. Step-1 of this PR ships the
+   `cargo`-built Rust binary at `test/incus/cold-path-flooder/` as a
+   CLI skeleton; the runner body that performs the actual flooding
+   lands in step-2 (#1611). The original draft of v2 mentioned a
+   `--mode=iperf3-sanity` flag for verifying the counter increments
+   at all; that smoke-only mode is **descoped** — Copilot code-r3
+   noted it does not match the step-1 CLI surface, and the bounded
+   diagnostic regime (§4.2.0 Regime B) already exercises the install
+   path under controlled conditions.
 2. True 64 B Ethernet frames on the wire (§4.2.3). UDP/IPv4 payload
-   = 22 B → 14 + 20 + 8 + 22 = 64 B. UDP/IPv6 payload = 2 B →
-   14 + 40 + 8 + 2 = 64 B. The harness reports packet rate against
-   true 64 B frames and stops calling iperf3 numbers "64 B".
+   = 22 B → 14 (DST/SRC/ethertype) + 20 (IPv4) + 8 (UDP) + 22 (payload)
+   = 64 B L2 + payload (excluding the 4 B FCS that the NIC appends in
+   hardware and the 8 B preamble + 12 B IFG that occupy wire bandwidth
+   but not packet bytes). UDP/IPv6 payload = 2 B → 14 + 40 + 8 + 2 =
+   64 B L2 + payload. The "64 B" figure here is the standard Ethernet
+   convention (L2 frame minus the hardware-managed FCS); on-wire bytes
+   including FCS are 68 B per frame, and the per-frame transmission
+   overhead at line rate is 84 B once preamble + IFG are added. The
+   harness reports packet rate against this convention.
 3. TSC-based sampling with 1-in-256 sample mask (§4.3.2). The wrapper
    on the non-sampled path is one branch + one xorshift step + one
    counter increment (~1 ns total). The sampled path is one `rdtscp`
@@ -67,11 +77,14 @@ v2 axes the reviewers MUST audit:
 5. Per-zone-pair latency histograms with bounded slot cardinality
    (§4.4). 16 zone-pair slots × 24 buckets × 8 B AtomicU64 per worker
    = 3.0 KB per worker. Slot selection: `(zone_pair_key.wrapping_mul(0x9E3779B97F4A7C15)
-   >> 60) as usize` (xxhash-style high-bit pick) so adjacent zone
-   pairs in id-space do not all collide on slot 0. Synthetic config
-   uses K_ZONE_PAIRS ≤ 16 by default so each zone-pair lands in a
-   unique slot; reviewers can override with `--zone-pairs N>16` to
-   exercise aliasing.
+   & 0xF) as usize` (Knuth golden-ratio low-4-bit pick — empirically
+   verified perfect bijection for K=16 diagonal and round-robin
+   patterns; see §4.3.4 for the audit trail. An earlier draft used
+   high-bit `>> 60`; AGY r2 axis 3 showed this clustered, and the
+   plan was patched to the low-bit pick). Synthetic config uses
+   K_ZONE_PAIRS ≤ 16 by default so each zone-pair lands in a unique
+   slot; reviewers can override with `--zone-pairs N>16` to exercise
+   aliasing.
 
 ## 1. Issue framing (unchanged from v1)
 
@@ -759,8 +772,10 @@ Prometheus scrape budget; comparable to existing
 - HA sync portability: no HA-touching code.
 - Counter overflow: u64 at 5 Mpps cold-path-saturated, ~117 years.
 - Wire-protocol both-sides: both `protocol/binding.rs` (Rust) and
-  `pkg/dataplane/userspace/protocol.go` (Go) updated in this PR. No
-  pkg/cluster sync wire changes.
+  `pkg/dataplane/userspace/protocol.go` (Go) will be updated in
+  step-3 (#1612 — counter wiring). The step-1 PR ships no wire-
+  protocol additions. No pkg/cluster sync wire changes are planned
+  at any step.
 - Bucket layout pinned: `pub(in crate::afxdp) const
   POLICY_COLD_PATH_HIST_BUCKETS: usize = 24;` with
   `const _: () = assert!(POLICY_COLD_PATH_HIST_BUCKETS == 24);`.
@@ -785,7 +800,9 @@ Prometheus scrape budget; comparable to existing
 - `cargo test --release` — full 952+ suite passes; new tests:
   - `userspace-dp/src/afxdp/cold_path_hist_tests.rs`:
     - `bucket_index_24_layout` — verify each bucket edge maps as
-      expected, including saturation at 2^33 ns.
+      expected, including saturation at 2^32 ns ≈ 4.295 s (the
+      24-bucket-layout edge, NOT 2^33 — Codex / AGY r4 axis 4
+      corrected this in v2-r4).
     - `zone_pair_slot_no_clustering` — empirically verify 100K
       random keys distribute within ±5 % of uniform across slots.
     - `sampler_one_in_256` — drive 1 M synthetic packets, assert
