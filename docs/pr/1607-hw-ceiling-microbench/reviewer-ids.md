@@ -14,6 +14,12 @@
 
 ## Plan review round 3 — v2 patched (commit 0b6eec937)
 
-- Codex: `task-mpoky7lt-5xx6oz`
-- Antigravity: `adversarial-review-mpoky7be-bsku4m`
-- Claude SMR: `docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r3.md` — PLAN-READY
+- Codex: `task-mpoky7lt-5xx6oz` (lost to infra)
+- Antigravity: `adversarial-review-mpoky7be-bsku4m` — PLAN-NEEDS-MAJOR (3 axes + 1 hazard)
+- Claude SMR: `docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r3.md` — PLAN-READY (retracted, see r4)
+
+## Plan review round 4 — v2-r3 (commit e64103b8a)
+
+- Codex: `task-mpol9qvc-a60wf4`
+- Antigravity: `adversarial-review-mpol9qlh-ivlrgr`
+- Claude SMR: `docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r4.md` — PLAN-READY
