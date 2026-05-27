@@ -1917,11 +1917,58 @@ fn test_exact_queue_at_rate(queue_id: u8, rate_bits: u64) -> CoSQueueConfig {
 }
 
 #[test]
-fn queue_uses_shared_exact_service_rejects_non_exact_queue() {
+fn queue_uses_shared_exact_service_admits_high_rate_non_exact_queue() {
+    // #1598: non-exact queues whose `transmit_rate_bytes` is at or
+    // above the per-worker UMEM ceiling
+    // (`COS_SHARED_EXACT_MIN_RATE_BYTES`) MUST get the shared_exact
+    // execution policy, otherwise the cross-binding redirect funnels
+    // all class traffic to a single owner_worker_id and the AF_XDP
+    // UMEM ceiling becomes the hard cap (~10 Gbps).
+    //
+    // For the production uncapped case (`scheduler-uncapped` with
+    // only `priority low` configured), `forwarding_build/cos.rs:269-274`
+    // sets `transmit_rate_bytes = iface.cos_shaping_rate_bytes_per_sec`
+    // AND `guarantee_enabled = false`. The gate must fire on
+    // `transmit_rate_bytes` alone, regardless of `guarantee_enabled`.
+    // Fixture mirrors the production shape:
+    //   - exact = false (no `transmit-rate exact`)
+    //   - guarantee_enabled = false (no explicit transmit-rate)
+    //   - transmit_rate_bytes = 10 Gbps (fallback from iface shaping)
     let iface = test_cos_iface_with_rate(10_000_000_000);
     let mut q = test_exact_queue_at_rate(4, 10_000_000_000);
     q.exact = false;
-    assert!(!queue_uses_shared_exact_service(&iface, &q));
+    q.guarantee_enabled = false;
+    assert!(
+        queue_uses_shared_exact_service(&iface, &q),
+        "#1598: non-exact, no-transmit-rate queue at 10 Gbps fallback \
+         rate must route via shared_exact to avoid the single-owner \
+         UMEM funnel"
+    );
+}
+
+#[test]
+fn queue_uses_shared_exact_service_keeps_low_rate_non_exact_single_owner() {
+    // #1598 regression-protection: non-exact queues BELOW the
+    // threshold (e.g. a forwarding-class assigned via firewall filter
+    // with no explicit transmit-rate, on a low-shape interface)
+    // should stay single-owner. The funnel is invisible at
+    // sub-ceiling rates and single-owner FIFO arbitration is
+    // desirable at low rates (#680/#690 design rationale). Threshold
+    // is 2.5 Gbps = 312 MB/s.
+    //
+    // Fixture mirrors the same uncapped-case shape as above
+    // (exact=false, guarantee_enabled=false), just on a 1 Gbps iface
+    // so the fallback rate sits below the threshold.
+    let iface = test_cos_iface_with_rate(1_000_000_000);
+    let mut q = test_exact_queue_at_rate(4, 1_000_000_000);
+    q.exact = false;
+    q.guarantee_enabled = false;
+    assert!(
+        !queue_uses_shared_exact_service(&iface, &q),
+        "#1598: non-exact, no-transmit-rate queue at 1 Gbps fallback \
+         rate must stay single-owner — below the per-worker UMEM \
+         ceiling, no funnel to escape"
+    );
 }
 
 #[test]

@@ -2,10 +2,10 @@
 // 1474-LOC `dispatch.rs` into cohesive submodules:
 //
 // - `cos`             — Phase 1 (CoS TX-selection resolve) +
-//                       the 4 COS fast-path helpers
+//                       the COS fast-path helpers
 //                       (cos_queue_fast_path_for_request,
 //                        cos_owner_live_for_request,
-//                        request_uses_shared_exact_queue_lease,
+//                        request_runs_under_shared_exact_policy,
 //                        enqueue_local_request_to_target_or_owner).
 // - `shared_recycle`  — Phase 10 + cross-tick recycle routing
 //                       (apply_shared_recycles*,
@@ -38,7 +38,7 @@ mod slow_path;
 
 use cos::{
     cos_owner_live_for_request, enqueue_local_request_to_target_or_owner,
-    pending_forward_needs_cos_tx_selection, request_uses_shared_exact_queue_lease,
+    pending_forward_needs_cos_tx_selection, request_runs_under_shared_exact_policy,
     resolve_pending_forward_cos_tx_selection,
 };
 pub(in crate::afxdp) use shared_recycle::{
@@ -423,7 +423,12 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                 // Always use copy path with NAT64-specific frame builder.
                 let is_nat64 = request.decision.nat.nat64;
                 let uses_native_tunnel = request.decision.resolution.tunnel_endpoint_id != 0;
-                let owner_matches_target = request_uses_shared_exact_queue_lease(
+                // #1598 secondary fix: gate on `shared_exact` policy
+                // (not on `shared_queue_lease.is_some()`), see the
+                // doc comment on `request_runs_under_shared_exact_policy`
+                // in dispatch/cos.rs. Non-exact uncapped queues now
+                // qualify for the local in-place rewrite path.
+                let owner_matches_target = request_runs_under_shared_exact_policy(
                     &target_binding.cos.cos_fast_interfaces,
                     request.decision.resolution.egress_ifindex,
                     request.cos_queue_id,

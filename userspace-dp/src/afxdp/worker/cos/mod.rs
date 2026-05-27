@@ -95,38 +95,76 @@ where
     out
 }
 
-/// Decide whether an exact queue runs under shared-worker execution.
+/// Decide whether a queue runs under shared-worker execution policy.
 ///
-/// Policy:
-/// - Non-exact queues are never shared (they run through the non-exact
-///   guarantee batch path regardless).
-/// - Exact queues below `COS_SHARED_EXACT_MIN_RATE_BYTES` route to a single
-///   owner worker (one FIFO arbitration domain, SFQ inside). See issue
-///   #690 for why low-rate exact queues want one arbitration domain rather
-///   than N racing worker-local FIFOs.
-/// - Exact queues at or above the threshold run sharded across every
-///   eligible worker with shared root/queue leases, avoiding the single-
-///   worker throughput collapse from PR #680.
+/// Policy (post-#1598):
+/// - Queues below `COS_SHARED_EXACT_MIN_RATE_BYTES` route to a single
+///   owner worker (one FIFO arbitration domain, SFQ inside for exact;
+///   per-class FIFO for non-exact). See issue #690 for why low-rate
+///   queues want one arbitration domain rather than N racing
+///   worker-local FIFOs.
+/// - Queues at or above the threshold (exact OR non-exact) run sharded
+///   across every eligible worker, avoiding the single-worker
+///   throughput collapse from PR #680.
 ///
-/// Before PR #697 the threshold was `max(iface_rate / 4, MIN)`. That scaled
-/// the threshold up with iface rate, which is the wrong direction: the
-/// single-worker drain ceiling is an absolute property of the loop, not a
-/// fraction of the iface. Once `iface_rate / 4` exceeded `MIN`, the policy
-/// would classify a genuinely high-rate queue (e.g. a 10g exact queue on a
-/// 100g iface) as single-owner — routing it straight back into the PR #680
-/// collapse shape. The `/ 4` term is now gone; the threshold is just the
-/// absolute per-worker ceiling.
+/// The exact/non-exact distinction does NOT live here — it lives in
+/// the lease/V_min allocation gates at `coordinator/mod.rs:1058`
+/// (`SharedCoSQueueLease`) and `coordinator/mod.rs:1145`
+/// (`SharedCoSQueueVtimeFloor`), both of which remain exact-only.
+/// Non-exact high-rate queues admitted here run via the
+/// `shared_exact` execution policy in `cross_binding.rs` (Step1 bail)
+/// and drain locally per worker, but they do NOT get a per-queue rate
+/// lease or V_min coordination — those are exact-queue-only concepts.
 ///
-/// The old and new policies classify queues identically whenever
-/// `iface_rate / 4 <= COS_SHARED_EXACT_MIN_RATE_BYTES` (both evaluate to
-/// `MIN`). Behavior diverges only in the `iface_rate / 4 > MIN` regime,
-/// which is the regime that previously mis-classified mid/high-rate exact
-/// queues as single-owner.
+/// Before PR #697 the threshold was `max(iface_rate / 4, MIN)`. That
+/// scaled with iface rate, which is the wrong direction: the
+/// single-worker drain ceiling is an absolute property of the loop,
+/// not a fraction of the iface. Once `iface_rate / 4` exceeded `MIN`,
+/// the policy would classify a genuinely high-rate queue (e.g. a 10g
+/// queue on a 100g iface) as single-owner — routing it back into the
+/// PR #680 collapse shape. The `/ 4` term is now gone; the threshold
+/// is just the absolute per-worker ceiling.
+///
+/// Before #1598 the gate also required `queue.exact`, which excluded
+/// non-exact uncapped queues from sharded service even when their
+/// effective rate (fallback to `iface.cos_shaping_rate_bytes_per_sec`
+/// in `forwarding_build/cos.rs:269-274`) exceeded the threshold.
+/// That kept the Junos `priority low` no-transmit-rate "uncapped"
+/// class single-owner and hard-capped at the per-worker AF_XDP UMEM
+/// ceiling (~6-10 Gbps). The fix admits non-exact queues to the
+/// same threshold-gated sharded service; see
+/// `docs/pr/1598-cos-uncapped-fix/plan.md` for the full rationale.
 #[inline]
 fn queue_uses_shared_exact_service(_iface: &CoSInterfaceConfig, queue: &CoSQueueConfig) -> bool {
-    if !queue.exact {
-        return false;
-    }
+    // #1598: previously the gate required `queue.exact`, which excluded
+    // non-exact queues (and in particular Junos `priority low` queues
+    // with no `transmit-rate` configured — the "uncapped" case) from
+    // sharded multi-worker drain. Those queues then got a single
+    // `owner_worker_id` via the round-robin in
+    // `build_cos_owner_worker_by_queue_with_fallback_ifindexes`, and the
+    // cross-binding redirect funneled 100% of class traffic to that one
+    // worker → per-worker AF_XDP UMEM ceiling (~6-10 Gbps) became the
+    // hard cap (see PR #680 / #690 history above and
+    // `docs/pr/1598-cos-uncapped-fix/plan.md` for the full root-cause
+    // walk).
+    //
+    // The exact-only restriction was a holdover from the original #680/#690
+    // design that targeted shared-exact V_min / per-queue-lease coordination
+    // (which DO require `queue.exact`). Those mechanisms remain
+    // exact-gated at coordinator/mod.rs:1058 (`SharedCoSQueueLease`) and
+    // ~1145 (`SharedCoSQueueVtimeFloor`), so the only effect of admitting
+    // non-exact queues to the `shared_exact` execution policy is to
+    // bypass the single-owner funnel in `resolve_local_routing_decision`.
+    //
+    // The rate threshold (`COS_SHARED_EXACT_MIN_RATE_BYTES`, 312 MB/s ≈
+    // 2.5 Gbps) is intentionally preserved: queues with a small explicit
+    // transmit-rate (e.g. iperf-1g) stay single-owner because the funnel
+    // is invisible at sub-UMEM-ceiling rates, and the single-owner FIFO
+    // arbitration is desirable at low rates. Queues with a fallback rate
+    // equal to the interface shaping rate (the uncapped case, where
+    // `transmit_rate_bytes = iface.cos_shaping_rate_bytes_per_sec` per
+    // `forwarding_build/cos.rs:269-274`) trip the threshold for any
+    // interface with a non-trivial shape and run sharded across workers.
     queue.transmit_rate_bytes >= COS_SHARED_EXACT_MIN_RATE_BYTES
 }
 

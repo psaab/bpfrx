@@ -1,5 +1,67 @@
 # Action Log
 
+## 2026-05-26 — #1598 secondary fix (TX-dispatch funnel)
+
+- **Action**: Post-merge smoke on PR #1600 caught a SECONDARY funnel:
+  primary fix at `worker/cos/mod.rs:126-131` correctly set
+  `WorkerCoSQueueFastPath.shared_exact = true` for the non-exact
+  uncapped queue, but the TX dispatch path at
+  `userspace-dp/src/afxdp/tx/dispatch/cos.rs:54` was gating "keep
+  local vs route to owner" on `shared_queue_lease.is_some()`, an
+  exact-only marker. For the iperf-uncapped class the lease is None
+  (filtered out at `coordinator/mod.rs:1058`), so the dispatch still
+  funneled the request to a single `owner_worker_id`. Smoke showed
+  port 5211 push P=12 stable at 9.08 Gbps with 2k-3.6k retr.
+  Added `request_runs_under_shared_exact_policy` helper that gates
+  on `queue_fast.shared_exact` directly (the routing-level shared
+  flag). Switched both call sites: `enqueue_local_request_to_target_or_owner`
+  (cos.rs:54) and the in-place-rewrite gate `owner_matches_target`
+  in `dispatch/mod.rs:426`. Retained the legacy
+  `request_uses_shared_exact_queue_lease` helper — it still correctly
+  identifies queues with a per-queue rate lease, which is a
+  different question. Added test fixture
+  `test_cos_fast_interfaces_decoupled` that decouples
+  `(shared_exact, has_lease)` so all four combinations can be tested.
+  Added 3 regression tests covering (shared_exact=true, lease=None)
+  + (shared_exact=false, lease=Some) + unknown-queue safety.
+- **Tests**: 1441 cargo tests pass (+3 new); Go suite clean across
+  all packages; pre-existing `snat_contract_doc_guard` failure
+  unchanged on master.
+- **File(s)**: `userspace-dp/src/afxdp/tx/dispatch/cos.rs`,
+  `userspace-dp/src/afxdp/tx/dispatch/mod.rs`,
+  `userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs`,
+  `docs/pr/1598-cos-uncapped-fix/plan.md`, `_Log.md`.
+
+Entries land at the top when added. Within a topic batch (same
+issue / PR), entries run reverse-chronological (newest first).
+Across topic batches the ordering is by add-time, not strict wall
+clock, so older topic batches push down when newer work lands on
+top.
+
+## 2026-05-27 01:30 UTC — #1598 Copilot review addressed
+
+- **Timestamp**: 2026-05-27 01:30 UTC
+- **Action**: For #1598, addressed four Copilot inline comments. (1) Rewrote the function-level doc above `queue_uses_shared_exact_service` so it no longer claims non-exact queues are never shared; new doc explains that the gate is now threshold-only, and that the exact/non-exact distinction lives at the lease + V_min allocation gates (coordinator/mod.rs:1058 and :1145). (2) Replaced `feedback_cross_binding_impossible in memory` reference in the inline comment with a stable in-repo reference (PR #680/#690 + the plan doc). (3) Updated both new test fixtures to set `guarantee_enabled=false` AND `exact=false`, so the fixtures actually mirror the production uncapped-class shape (no transmit-rate at all, not just non-exact-with-rate). (4) Restored reverse-chronological log ordering and added a header note explaining the convention.
+- **File(s)**: `userspace-dp/src/afxdp/worker/cos/mod.rs`, `userspace-dp/src/afxdp/worker/cos/tests.rs`, `_Log.md`
+
+## 2026-05-26 13:25 UTC — #1598 implementation + tests pass
+
+- **Timestamp**: 2026-05-26 13:25 UTC
+- **Action**: Implemented plan v2. Removed the `if !queue.exact { return false; }` early return in `queue_uses_shared_exact_service` at `userspace-dp/src/afxdp/worker/cos/mod.rs:126-131` so the rate-threshold check `transmit_rate_bytes >= COS_SHARED_EXACT_MIN_RATE_BYTES` admits non-exact queues that hit the threshold. Updated the test that previously pinned the rejection: renamed `queue_uses_shared_exact_service_rejects_non_exact_queue` → `queue_uses_shared_exact_service_admits_high_rate_non_exact_queue` + added a complementary regression test `queue_uses_shared_exact_service_keeps_low_rate_non_exact_single_owner` to lock the threshold-gated behavior. Updated doc comment at `coordinator/mod.rs:1145` to note the V_min floor filter is intentionally stricter than the routing gate. Build clean, 1438+10 cargo tests pass, Go suite clean, 5x flake check pass on `queue_uses_shared_exact_service` tests.
+- **File(s)**: `userspace-dp/src/afxdp/worker/cos/mod.rs`, `userspace-dp/src/afxdp/worker/cos/tests.rs`, `userspace-dp/src/afxdp/coordinator/mod.rs`
+
+## 2026-05-26 12:50 UTC — #1598 plan v2 (after round-1 reviewer split)
+
+- **Timestamp**: 2026-05-26 12:50 UTC
+- **Action**: Updated plan to v2 incorporating round-1 reviewer outcomes. Codex PLAN-KILL was infra-blocked (sandbox runner missing); AGY round-1 verdict PLAN-READY after walking the actual files. Added explicit trace of `build_worker_cos_owner_live_by_tx_ifindex` showing `tx_owner_live` is per-worker local (loop_body/mod.rs:91-95), so Step2 never funnels foreign-worker. Documented residual concern about non-binding workers (not applicable to the loss userspace cluster which has every worker bound to reth0.80 mlx5 VF). Re-dispatching Codex.
+- **File(s)**: `docs/pr/1598-cos-uncapped-fix/plan.md`
+
+## 2026-05-26 12:30 UTC — #1598 plan v1 (CoS iperf-uncapped caps at ~10 Gbps)
+
+- **Timestamp**: 2026-05-26 12:30 UTC
+- **Action**: Drafted plan v1 for #1598. Root-cause identified at `userspace-dp/src/afxdp/worker/cos/mod.rs:126-131` — `queue_uses_shared_exact_service` early-returns false on `!queue.exact`, excluding the uncapped non-exact queue from sharded multi-worker drain. This forces 100% of class-11 traffic through a single `owner_worker_id` (built at `coordinator/mod.rs:900-904`), hitting the per-worker AF_XDP UMEM ceiling. The 24g/exact queue escapes this because it trips the same gate with `exact=true && rate >= 312 MB/s`.
+- **File(s)**: `docs/pr/1598-cos-uncapped-fix/plan.md`
+
 ## 2026-05-26 23:10 UTC — #1578 cluster perf root-cause (smoke target IP misalignment)
 
 - **Timestamp**: 2026-05-26 23:10 UTC
