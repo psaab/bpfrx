@@ -111,3 +111,144 @@ Remaining limitations:
   trusted metadata.
 - Traffic-level integration, failover, and performance evidence remain
   production-hardening follow-ups for #1375, not active feature-gap blockers.
+
+## Cache-key invariants for per-packet match fields (#1431)
+
+PR #1430 closed the immediate filter-log enforcement gaps by treating
+DSCP as cache-sensitive metadata that lives outside the 5-tuple
+session/flow-cache key. #1431 codifies the contract going forward.
+
+**The invariant.** When a filter match depends on packet fields that
+are not part of the cache key, the dataplane must not reuse a
+first-packet forwarding decision for later packets that can differ
+on those fields.
+
+**The cache key.** `SessionKey`
+(`userspace-dp/src/session/key.rs`) is the standard 5-tuple
+(`protocol`, `src_ip`, `dst_ip`, `src_port`, `dst_port`) plus an
+`addr_family` byte. The `addr_family` byte is redundant with the
+`IpAddr` variant carried by `src_ip` / `dst_ip` but is materialized
+on the struct for cheap branchless checks on the hot path.
+For ICMP and ICMPv6 sessions, `parse_flow_ports`
+(`userspace-dp/src/afxdp/frame/inspect.rs:212-232`) unconditionally
+reads bytes 4-5 of the ICMP header into `src_port` (the ICMP
+identifier word — meaningful for Echo Request/Reply, opaque for
+other ICMP types) and stores zero in `dst_port`. ICMP **type**
+and **code** are NOT in the cache key — adding an explicit
+`icmp_type` or `icmp_code` filter match makes the filter
+cache-sensitive unless `SessionKey` or trusted per-session
+metadata is extended to carry those fields.
+
+**Classification table.** Every match criterion (not action /
+modifier) on the wire DTO `FirewallTermSnapshot`
+(`userspace-dp/src/protocol/security.rs`) and the runtime
+`FilterTerm` (`userspace-dp/src/filter/mod.rs`) must fall into
+exactly one of these two classes:
+
+| Match criterion | In cache key? | Notes |
+|-----------------|---------------|-------|
+| `source_addresses` / `source_v4` / `source_v6` | yes | `src_ip` in `SessionKey` |
+| `destination_addresses` / `dest_v4` / `dest_v6` | yes | `dst_ip` |
+| `protocols` / `protocol_bitmap` (+ `protocol_match_enabled`) | yes | `protocol` |
+| `source_ports` | yes (TCP/UDP); ICMP-special | `src_port` carries the ICMP identifier word from bytes 4-5 of the ICMP header (meaningful for Echo Request/Reply, opaque otherwise) |
+| `destination_ports` | yes (TCP/UDP); ICMP-zero | `dst_port` is 0 for ICMP |
+| `dscp_values` / `dscp_bitmap` (+ `dscp_match_enabled`) | NO — cache-sensitive | see #1430 pattern below |
+| (future) `tos_match` / ECN bits (non-DSCP TOS) | NO — cache-sensitive | TOS lower bits and ECN vary per packet |
+| (future) `tcp_flags_match` | NO — cache-sensitive | TCP flags vary per packet |
+| (future) `is_fragment` / fragment offset / MF | NO — cache-sensitive | only first fragment carries L4 |
+| (future) `ihl_match` / IP options | NO — cache-sensitive | IHL varies per packet |
+| (future) `icmp_type_match` / `icmp_code_match` | NO — cache-sensitive (today) | could be promoted to cache-key by adding (type, code) to `SessionKey` for ICMP |
+| (future) `flex_match` | NO — cache-sensitive | byte-offset match, fully per-packet |
+
+Fields like `action`, `count`, `log`, `policer`, `routing_instance`,
+`forwarding_class`, and `dscp_rewrite` are forwarding actions and
+modifiers, applied after a match has succeeded. They do not
+participate in match-time key lookup and are out of scope for the
+cache-key contract.
+
+### Path (b) runbook — cache-sensitive
+
+Adding a per-packet match field that is NOT in the cache key
+requires wiring all of these hooks. DSCP is the reference
+implementation (#1430); use it as the template:
+
+1. **Aggregate flag** on `Filter` —
+   `Filter.has_<X>_match_terms: bool`, computed during snapshot
+   compile. See `Filter.has_dscp_match_terms` in
+   `userspace-dp/src/filter/mod.rs`.
+2. **Per-interface sets** on `FilterState` —
+   `iface_filter_v4_has_<X>_match: FxHashSet<i32>` and the v6
+   sibling, populated during snapshot compile. See the
+   `iface_filter_v{4,6}_has_dscp_match` fields in
+   `userspace-dp/src/filter/mod.rs`.
+3. **Lookup helpers** in
+   `userspace-dp/src/filter/engine/cache_sensitive.rs` —
+   `interface_input_filter_has_<X>_match` and
+   `interface_output_filter_has_<X>_match` (or thread the new
+   flag through one general helper if the DSCP-specific
+   functions are generalized in a future PR).
+4. **Flow-cache insertion gate** —
+   `userspace-dp/src/afxdp/flow_cache.rs:297-309` calls the
+   input + output helpers and returns `None` if either fires.
+5. **Established-session re-evaluation** —
+   `userspace-dp/src/afxdp/poll_descriptor/mod.rs:217-244`
+   (`evaluate_dscp_sensitive_input_filter_on_session_hit`) is
+   the DSCP shape; mirror it.
+6. **Forwarding-rotation purge** —
+   `userspace-dp/src/afxdp/worker/loop_body/mod.rs:295-330`
+   uses `input_dscp_filter_families_changed` to decide whether
+   to purge sessions. Extend the semantics-match comparison in
+   `userspace-dp/src/filter/engine/cache_sensitive.rs:104-143`
+   to cover the new match field's aggregate flag and per-term
+   content. **Compare by content, never by compiler-positional
+   filter/term IDs** — `Filter.id` and `FilterTerm.id` are
+   stable only within a snapshot.
+7. **Tests** in `userspace-dp/src/afxdp/flow_cache_tests.rs`
+   following the DSCP runbook pattern in
+   `from_forward_decision_skips_cache_for_dscp_matched_input_filter`
+   /`_output_filter` (DSCP-bespoke regression tests) and the
+   #1431 references
+   `dscp_input_gate_blocks_flow_cache_insertion_via_runbook_pattern`
+   / `_output_*`. The flow-cache test home is `afxdp/` because
+   `FlowCacheEntry::from_forward_decision` is
+   `pub(super)`-scoped to `afxdp::flow_cache`.
+
+Reference tests (already in the tree, cite from new field PRs):
+
+- gate insertion: `afxdp/flow_cache_tests.rs` ::
+  `from_forward_decision_skips_cache_for_dscp_matched_input_filter`
+  / `_output_filter`
+- rotation purge positional-ID immunity:
+  `filter/tests.rs:1806`
+  (`input_dscp_filter_families_changed_ignores_positional_filter_id_change`)
+- session-hit re-eval: `afxdp/tests.rs:3184`
+
+### Path (a) — extend `SessionKey`
+
+Promoting a per-packet match field into the cache key requires
+extending `SessionKey` in `userspace-dp/src/session/key.rs` AND
+proving stability across:
+
+- HA session sync wire format (`pkg/cluster/`),
+- session-table reverse / NAT-translated / forward-wire indices
+  (`userspace-dp/src/session/mod.rs`),
+- flow-cache key derivation (`flow_cache.rs`),
+- session expiry hash bucket math,
+- reverse-NAT lookup keys.
+
+This is a significant cross-cutting refactor — file a tracker
+issue against `session/key.rs` before attempting it.
+
+### lo0 is not on the flow-cache path
+
+Host-bound traffic resolves to
+`ForwardingDisposition::LocalDelivery`, which
+`is_cacheable()` returns `false` for at
+`userspace-dp/src/afxdp/types/forwarding.rs:196`. Per-packet lo0
+filter evaluation runs at
+`userspace-dp/src/afxdp/poll_descriptor/mod.rs:700` (session-hit
+path) and `:1153` (miss path). lo0 filters therefore do NOT need
+a per-interface `has_<X>_match` set — the flow-cache never holds
+a lo0 decision in the first place. This is noted here so future
+readers do not repeat the v1 plan investigation that mistook lo0
+for a missing cache-sensitive gate.

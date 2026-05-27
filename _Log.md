@@ -4772,3 +4772,176 @@ top.
   - `docs/pr/1563-cli-c-nontty-fix/plan.md` (new)
 - **Status**: PR opened — AWAITING-BATCH-MERGE; smoke-runner
   picks up via `<!-- AWAITING-SMOKE -->` marker.
+
+## 2026-05-26 — #1431 plan v1 draft
+
+- **Timestamp**: 03:22 UTC
+- **Action**: drafted #1431 cache-invariant contract + harness plan v1
+- **File(s)**: `docs/pr/1431-filter-cache-invariants/plan.md` (new)
+- **Status**: DRAFT v1 — pending Codex + AGY adversarial plan review
+- **Scope**: contract + test harness for "future per-packet match
+  fields" so a hypothetical TCP-flags / fragment / IHL / IP-options
+  addition to `FilterTerm` cannot quietly bypass flow-cache. No
+  runtime change planned; PLAN-KILL acceptable if reviewers conclude
+  the harness is overkill versus disciplined PR review on the next
+  per-packet field addition.
+
+## 2026-05-26 — #1431 plan v2 (post-r1 reviews)
+
+- **Timestamp**: 03:35 UTC
+- **Action**: rewrote plan after Codex PLAN-KILL + AGY PLAN-NEEDS-MAJOR on v1
+- **File(s)**: `docs/pr/1431-filter-cache-invariants/plan.md` (v2)
+- **Changes from v1**:
+  - DELETED §4.2 PER_PACKET_MATCH_FIELDS constant list + trait
+    (Rust has no reflection; manual list is compile-time theater).
+  - DELETED §4.3 fake-field negative-case harness arm (cannot
+    synthesize without polluting FilterTerm).
+  - DELETED lo0 DSCP "gap" concern (verified: LocalDelivery is
+    !is_cacheable, lo0 evaluated per-packet on miss + hit paths).
+  - CORRECTED ICMP key claim (v1 said type/code live in ports;
+    actual: src_port = identifier, dst_port = 0).
+  - NEW: in-source doc-comment block on FilterTerm and
+    FirewallTermSnapshot as the loud reviewer-facing tripwire
+    (AGY's recommendation).
+  - SHRANK harness to 3 positive-case DSCP tests:
+    input/output gate + positional-ID-change-doesn't-fire.
+
+## 2026-05-26 — #1431 plan v3 (post-r2 reviews)
+
+- **Timestamp**: 03:42 UTC
+- **Action**: applied Codex r2 + AGY r2 PLAN-READY/MINOR feedback
+- **File(s)**: `docs/pr/1431-filter-cache-invariants/plan.md` (v3)
+- **Changes from v2**:
+  - Moved gate tests from `filter/cache_invariant_harness.rs` to
+    `userspace-dp/src/afxdp/flow_cache_tests.rs` (Codex r2 caught
+    `pub(super)` visibility issue on FlowCacheEntry).
+  - Dropped duplicate `dscp_rotation_does_not_fire_on_positional_id_change`
+    (both reviewers identified it duplicates filter/tests.rs:1806).
+  - Cited existing session-hit re-eval test at afxdp/tests.rs:3184
+    rather than adding a new one.
+  - README "every field" → "every match criterion"; added TOS/ECN
+    row; added `protocol_match_enabled`/`dscp_match_enabled` to
+    matching rows.
+  - lo0 README note now one paragraph with `is_cacheable` +
+    `poll_descriptor` line refs.
+  - Scope shrunk to 2 new tests + 4 cited existing tests.
+
+## 2026-05-26 — #1431 plan v4 (fix stale v3 leftovers)
+
+- **Timestamp**: 03:50 UTC
+- **Action**: AGY r3 flagged 3 stale v2 leftovers in v3; applied fixes
+- **File(s)**: `docs/pr/1431-filter-cache-invariants/plan.md`
+- **Fixes**:
+  - §4.1 #4 runbook bullet: stale `filter/cache_invariant_harness.rs`
+    path → `afxdp/flow_cache_tests.rs` per Codex r2 visibility note.
+  - §4.3 fully rewritten: was 3 tests in `filter/`, now 2 tests in
+    `afxdp/flow_cache_tests.rs`; explicit "dropped from v2" /
+    "cited from existing" subsections.
+  - Test names aligned with §8 (`_via_runbook_pattern` suffix).
+
+## 2026-05-26 — #1431 plan v5 (post-Codex r3)
+
+- **Timestamp**: 03:52 UTC
+- **Action**: Codex r3 PLAN-NEEDS-MINOR caught remaining §6 claim
+- **File(s)**: `docs/pr/1431-filter-cache-invariants/plan.md`
+- **Fix**: §6 invariant #4 "new positional-ID-change test" →
+  cite existing filter/tests.rs:1806.
+
+## 2026-05-26 — #1431 implementation commit
+
+- **Timestamp**: 04:08 UTC
+- **Action**: implemented per plan v5; both reviewers PLAN-READY
+- **File(s)**:
+  - `userspace-dp/src/filter/README.md` (+~120 lines:
+    Cache-key invariants section, classification table,
+    path (b) runbook, path (a) pointer, lo0 note)
+  - `userspace-dp/src/filter/mod.rs` (added in-source
+    CACHE-KEY INVARIANT block above FilterTerm)
+  - `userspace-dp/src/protocol/security.rs` (added mirror
+    block above FirewallTermSnapshot)
+  - `userspace-dp/src/afxdp/flow_cache_tests.rs` (+2 new
+    tests: dscp_input_gate_*_via_runbook_pattern and
+    dscp_output_gate_*_via_runbook_pattern, plus a section
+    comment block explaining the runbook reference role)
+- **Validation**: cargo build clean; new tests 5/5 pass; full
+  cargo --release passes except a pre-existing snat doc-guard
+  flake (master also fails this — unrelated to #1431).
+  Go suite clean.
+
+## 2026-05-26 — #1431 code-review r1 fixes + Claude SMR doc
+
+- **Timestamp**: 22:15 UTC
+- **Action**: addressed Codex r1 + Copilot r1 inline findings; wrote
+  Claude SMR code-review doc per skill Step 8.5
+- **File(s)**:
+  - `userspace-dp/src/protocol/security.rs` — harmonized
+    CACHE-KEY INVARIANT block with FilterTerm's block per Codex r1 #1
+  - `userspace-dp/src/afxdp/flow_cache_tests.rs` — fixed "per-interface
+    set" wording (Codex r1 #2) + replaced hard-coded line 644/696
+    refs with test names (Copilot inline #2)
+  - `userspace-dp/src/filter/README.md` — over-specifying "ICMP echo
+    identifier" reworded to match parse_flow_ports' actual behavior
+    (Copilot inline #1); hard-coded line refs replaced with test
+    names
+  - `docs/pr/1431-filter-cache-invariants/claude-smr-code-r1.md` (new) —
+    Claude SMR verdict MERGE-READY per Step 8.5
+- **Reviewer verdicts**:
+  - Codex r1: MERGE-NEEDS-MINOR → fixes applied
+  - AGY r1: MERGE-READY
+  - Copilot r1: COMMENTED with 2 inline findings → fixes applied
+  - Claude SMR: MERGE-READY (doc on branch)
+
+## 2026-05-27 — #1431 copilot re-review wording follow-up
+
+- **Timestamp**: 05:10 UTC
+- **Action**: corrected README wording from "bytes 4-6" to "bytes 4-5" for ICMP identifier extraction so docs match `parse_flow_ports` range `l4 + 4..l4 + 6` (two bytes).
+- **File(s)**:
+  - `userspace-dp/src/filter/README.md`
+  - `_Log.md` (this entry)
+
+## 2026-05-26 — #1431 Copilot r2 + Codex r2 cleanup
+
+- **Timestamp**: 22:35 UTC
+- **Action**: addressed Copilot r2 inline findings; Codex r2 MERGE-READY
+- **File(s)**:
+  - `userspace-dp/src/filter/README.md` — 5-tuple framing
+    (Copilot r2 inline #1)
+  - `docs/pr/1431-filter-cache-invariants/plan.md` — same
+    (Copilot r2 inline #2)
+  - `docs/pr/1431-filter-cache-invariants/claude-smr-code-r1.md`
+    — addendum recording the byte-range (1d669302d) and 5-tuple
+    drift corrections
+- **Reviewer verdicts at post-fix head**:
+  - Codex r2: MERGE-READY (verified at 778450f74; 933ee/this commit
+    are doc-only on top — Copilot's 1d6693 byte-range is a strict
+    improvement)
+  - AGY r1: MERGE-READY at 705d62f67 — no substantive code change
+    since
+  - Copilot r2: COMMENTED with 2 inline findings → fixes applied
+  - Claude SMR: MERGE-READY with addendum
+
+## 2026-05-26 — #1431 final 4-of-4 attestation at post-rebase HEAD
+
+- **Timestamp**: 22:55 UTC
+- **Action**: rebased onto current origin/master (ab812c6cf);
+  re-dispatched Codex + AGY + Copilot at rebased HEAD a5d06c424;
+  all four reviewer seats clean
+- **File(s)**:
+  - rebase: chronological _Log.md merge (both #1563 + #1431 entries preserved)
+  - docs/pr/1431-filter-cache-invariants/reviewer-ids.md (r3 task ids)
+- **Reviewer verdicts at HEAD a5d06c424c1eba3619b41b7560e7c4eee79ceb8c**:
+  - Codex r3 (task-mpnneefh-5ymtw3): MERGE-READY, no findings
+  - AGY r2 (review-mpnnemma-6ijk2d): MERGE-READY, no findings
+  - Copilot r3 (copilot-pull-request-reviewer[bot]): COMMENTED, no new comments
+  - Claude SMR: MERGE-READY with post-rebase addendum
+    (docs/pr/1431-filter-cache-invariants/claude-smr-code-r1.md)
+- **Hallucination check**: AGY misread flow_cache_tests.rs as "newly
+  added" (it pre-exists on master; PR only adds ~158 lines). All
+  substantive file:line citations from both reviewers verified
+  against actual HEAD code (CACHE-KEY INVARIANT blocks, README
+  table, is_cacheable, parse_flow_ports).
+- **Scope confirm**: 0 non-comment runtime lines added; only
+  comment blocks above FilterTerm + FirewallTermSnapshot, README,
+  cfg(test) tests, and doc files.
+- **Stale marker** at comment 4551276859 (posted on 705d62f67)
+  DELETED via gh api -X DELETE.
