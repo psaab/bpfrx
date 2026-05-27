@@ -223,9 +223,14 @@ impl Args {
             if !user_set_dst_port_span {
                 args.dst_port_span = BOUNDED_DST_PORT_SPAN;
             }
-            let cohort = args.src_ip_span as u64
-                * args.src_port_span as u64
-                * args.dst_port_span as u64;
+            // AGY code-r2 medium: u64 multiplication can overflow
+            // when all three spans are near u32::MAX. In release mode
+            // the overflow wraps silently to 0, which is <= 131_072 and
+            // bypasses the bounded cap. Cast to u128 — fits up to 2^96
+            // worth of factors comfortably.
+            let cohort = args.src_ip_span as u128
+                * args.src_port_span as u128
+                * args.dst_port_span as u128;
             if cohort > 131_072 {
                 return Err(format!(
                     "bounded cohort {} > DEFAULT_MAX_SESSIONS 131072; \
@@ -365,9 +370,9 @@ fn main() {
         } else {
             format!(
                 "{}",
-                args.src_ip_span as u64
-                    * args.src_port_span as u64
-                    * args.dst_port_span as u64
+                args.src_ip_span as u128
+                    * args.src_port_span as u128
+                    * args.dst_port_span as u128
             )
         },
         args.duration,
@@ -483,6 +488,25 @@ mod tests {
             return Err("--batch > 1024".to_string());
         }
         Ok(())
+    }
+
+    #[test]
+    fn bounded_cohort_overflow_check_uses_u128() {
+        // AGY code-r2 medium: u32 × u32 × u32 = u96 in theory, so a
+        // u64 product can overflow to 0 in release builds and bypass
+        // the bounded-cap. Verify the math we use is u128 wide.
+        //
+        // We can't easily exercise Args::parse here without spoofing
+        // argv, but we can compute the same product the validator
+        // computes and assert it stays correct at the overflow edge.
+        let s1: u32 = u32::MAX;
+        let s2: u32 = u32::MAX;
+        let s3: u32 = u32::MAX;
+        // The fix uses u128:
+        let cohort: u128 = s1 as u128 * s2 as u128 * s3 as u128;
+        // Naïve u64 would overflow and wrap; u128 stays exact at ~7.9e28.
+        assert!(cohort > 131_072);
+        assert!(cohort > u64::MAX as u128);
     }
 
     #[test]

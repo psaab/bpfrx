@@ -280,7 +280,12 @@ caught two problems with that choice:
 The remedy: promote Regime A to default; keep Regime B explicit for
 session-install measurement.
 
-**Fix details for Regime A**:
+**Fix details for Regime B (bounded diagnostic mode)**:
+
+The parameters listed below are the bounded-cohort sizing used when
+`--cohort=bounded` is opt-in. Regime A (the unbounded default) uses
+`src_ip_span = 65_536`, `src_port_span = 65_536`, `dst_port_span = 1`
+≈ 4.3 B unique 5-tuples per the §4.2 flag-surface table.
 
 ```
 src_ip_span      = 16384   (14 bits of IP randomization)
