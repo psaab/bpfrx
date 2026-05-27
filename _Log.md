@@ -4095,3 +4095,9 @@ top.
 - **Timestamp**: 2026-05-27 03:48 UTC
   - **Action**: Address Copilot inline comments (5 numbering inconsistencies, 2 'descendent'->'descendant' spellings). Pass numbering now consistent everywhere: 1=FuncDecl, 2=StructType.Fields, 3=CallExpr, 4=SelectorExpr, 5=bare Ident. All 8 canary tests still pass, 5/5 flake clean.
   - **File(s)**: pkg/daemon/legacy_dataplane_canary_test.go, pkg/daemon/legacy_dataplane_canary_synthetic_test.go
+
+## 2026-05-27 — #1607 plan v2 drafted (addresses all 5 v1 PLAN-KILL axes)
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Rewrote plan.md v2 addressing all 5 v1 fatal axes: UDP randomized-source-port flooder default (true 64 B Ethernet frames via AF_PACKET); TSC + 1-in-256 sampler replacing per-call clock_gettime; 24-bucket histogram + 16-slot splitmix-hashed per-zone-pair layout; CPU isolation recording (record-not-enforce) with explicit "approximate ceiling under contention" scoping. New cold-path-flooder Rust binary in test/incus/cold-path-flooder/. Dispatching Codex + AGY plan review.
+  - **File(s)**: docs/pr/1607-hw-ceiling-microbench/plan.md (v2)

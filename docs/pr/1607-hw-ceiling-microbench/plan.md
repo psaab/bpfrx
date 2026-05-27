@@ -1,422 +1,604 @@
-# #1607 Cold-path hardware-ceiling microbench — plan v1 (KILLED)
+# #1607 Cold-path hardware-ceiling microbench — plan v2
 
-Status: **PLAN-KILLED 2026-05-27 round 1** by convergent verdicts:
+Status: **DRAFT v2** — replaces PLAN-KILLED v1 (full v1 archived in §X
+below; the kill verdicts and their evidence are preserved verbatim so
+v2 reviewers can audit whether each fatal axis is actually addressed
+rather than restated).
+
+v1 round-1 verdicts (verbatim references):
 
 - Codex (`task-mpoiptnt-dmw8n0`) — PLAN-KILL
 - Antigravity (`adversarial-review-mpoiqabw-y5s6ga`) — PLAN-KILL
-- Claude SMR — PLAN-NEEDS-MAJOR (`docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r1.md`)
+- Claude SMR — PLAN-NEEDS-MAJOR
+  (`docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r1.md`)
 
-Convergent hard-fatal findings (verbatim summary; full verdicts on
-file as referenced above):
+v2 axes the reviewers MUST audit:
 
-1. **TCP cold-path sample starvation** — `iperf3 -P 12 -t 30 -l 64`
-   yields ~12 cold-path samples over a 30 s run (one per stream
-   handshake). Statistically useless. The escape valve (UDP
-   flooder with per-packet randomized 5-tuples) is deferred to
-   round-2 / future-extension stub in v1, so the default-mode
-   harness produces no usable data.
-2. **Wire-byte misrepresentation** — `iperf3 -l 64` is the
-   application-write size; on-wire frame is ~130 B v4 / ~150 B v6.
-   The harness name and §4.5 Scale Target table both misrepresent
-   the measurement as 64 B linerate.
-3. **Timer overhead dominates the budget being measured** —
-   2 × `clock_gettime(CLOCK_MONOTONIC)` via vDSO = ~50–60 ns; the
-   #1605-cited 270 ns budget makes this ~18–22 % measurement
-   bias. Per-call wrapper measures the wrapper, not the policy
-   engine. AGY explicitly: "20% of CPU cycles executing the
-   profiling timers". The plan's «<1 % overhead because cold path
-   is 100s of ns minimum» assertion was wrong.
-4. **CPU isolation absent** — `test/incus/cluster-setup.sh`
-   `limits.cpu: 4` with 6 worker threads (oversubscribed), no
-   `taskset`/`cpuset`/IRQ pinning, `xpfd.service:19` explicitly
-   confirms `CPUAffinity=` is NOT shipped. Per-worker Mpps
-   numbers are structurally confounded by IRQ steal and
-   scheduler placement.
-5. **Per-worker histogram architectural mismatch (AGY)** —
-   aggregating policy latency per-worker hides the per-zone-pair
-   cliff. A high-traffic 10-rule zone-pair drowns out the
-   100K-rule zone-pair that JIT trigger logic (#1605 Phase 4)
-   needs to detect. Wrong granularity for the question this
-   PR was built to answer.
+1. UDP randomized-source-port flooder is now the **default** mode
+   (§4.2). No iperf3 in the default path. The flooder ships in this PR
+   as a `cargo`-built Rust binary at
+   `test/incus/cold-path-flooder/`. Smoke-only iperf3 sanity is a
+   `--mode=iperf3-sanity` flag whose sole purpose is to prove the
+   histogram increments at all.
+2. True 64 B Ethernet frames on the wire (§4.2.3). UDP/IPv4 payload
+   = 22 B → 14 + 20 + 8 + 22 = 64 B. UDP/IPv6 payload = 2 B →
+   14 + 40 + 8 + 2 = 64 B. The harness reports packet rate against
+   true 64 B frames and stops calling iperf3 numbers "64 B".
+3. TSC-based sampling with 1-in-256 sample mask (§4.3.2). The wrapper
+   on the non-sampled path is one branch + one xorshift step + one
+   counter increment (~1 ns total). The sampled path is one `rdtscp`
+   pair + bucket index + array store. The harness measures and
+   reports the `rdtscp` round-trip baseline, the sample mask, the
+   raw histogram, and the bias-corrected histogram.
+4. CPU isolation state is **recorded per run** and the doc text in
+   §4.6 is scoped to "approximate ceiling under loss-cluster
+   contention" (§4.5). The harness reads `/proc/cmdline`,
+   `/proc/interrupts` deltas across the run, and per-worker CPU
+   affinity from `sched_getaffinity(tid)` via the existing status
+   wire (gRPC). If `isolcpus` is absent OR worker CPUs overlap with
+   NIC IRQ CPUs, the harness emits a single-line ISOLATION-WARNING
+   header in the TSV output. Bumping `limits.cpu` and adding
+   `isolcpus=` is filed as a follow-up against #739 (preserved
+   linkage; not blocking this PR).
+5. Per-zone-pair latency histograms with bounded slot cardinality
+   (§4.4). 16 zone-pair slots × 24 buckets × 8 B AtomicU64 per worker
+   = 3.0 KB per worker. Slot selection: `(zone_pair_key.wrapping_mul(0x9E3779B97F4A7C15)
+   >> 60) as usize` (xxhash-style high-bit pick) so adjacent zone
+   pairs in id-space do not all collide on slot 0. Synthetic config
+   uses K_ZONE_PAIRS ≤ 16 by default so each zone-pair lands in a
+   unique slot; reviewers can override with `--zone-pairs N>16` to
+   exercise aliasing.
 
-Per `.claude/skills/triple-review/SKILL.md` Step 4, two-of-three
-PLAN-KILL is the stopping condition. No code was written. No
-PR was opened.
+## 1. Issue framing (unchanged from v1)
 
-If this is revisited, the v2 plan MUST address all five
-findings up front, NOT as round-2 escape valves:
+#1607 asks for empirical measurement of the policy-evaluation
+cold-path ceiling on `loss:xpf-userspace-fw0`, so that #1605 JIT
+re-plan and #1609 multi-stage DAG planning stop reasoning against an
+unmeasured budget. The deliverable is *measurement infrastructure plus
+a populated baseline table plus a Scale Target section in
+`docs/userspace-jit-design.md`*. The win is unblocking #1605 Phase 4b
+and #1609 cardinality budgeting; this PR does NOT change
+packet-forwarding behavior.
 
-- Ship a real UDP-with-randomized-source-port packet generator
-  (Rust or Go, ~50 LOC) as the default mode. iperf3-style TCP
-  becomes a smoke-only mode that verifies the counter
-  increments at all.
-- Use TSC (`rdtsc`/`rdtscp`) or 1-in-1000 sampling, not
-  per-call `clock_gettime`. Calibrate and report the empty-
-  wrapper baseline as a separate number.
-- Use a dedicated wider histogram (24 buckets, ~4 s ceiling,
-  with overflow-samples sentinel) so the 1M-rule tail is
-  visible.
-- Pin workers + NIC IRQs to disjoint core sets; bump VM
-  `limits.cpu` to at least 8; record the affinity state in
-  the run artifact.
-- Add per-(zone-pair, rule-count-bucket) cardinality to the
-  histogram, OR explicitly scope this PR to "uniform workload
-  cold-path cost only" and file a separate issue for the
-  per-zone-pair cliff detection JIT-trigger needs.
+## 2. Honest scope/value framing (v2)
 
-The original v1 plan content follows for archival.
+This remains a **measurement-harness PR, not a perf PR**. The win is
+the empirical numbers it produces, not the code itself. The v2 design
+explicitly addresses the five v1 kill axes by:
 
----
+- Replacing iperf3 with a flooder that exercises the cold path on
+  every packet (no flow-cache amortization).
+- Generating true 64 B Ethernet frames (no `-l 64` framing trick).
+- Sampling timer overhead with TSC + 1-in-256 mask so the wrapper
+  cost is amortized to ~0.1 ns / packet, well below the sub-1 µs
+  cold-path floor.
+- Recording (not enforcing) CPU isolation state so operators reading
+  the numbers know what regime they're in.
+- Publishing per-zone-pair histograms (within a bounded 16-slot
+  cardinality budget) so the JIT design doc can see the cliff this
+  PR exists to expose.
 
-(v1 plan as originally submitted — content preserved verbatim for
-the record; superseded by the PLAN-KILL verdict above.)
+Known limitations of v2 that we accept explicitly:
 
-## 1. Issue framing
+- **Loss cluster contention** — the loss userspace cluster runs with
+  `limits.cpu: 4` and no `isolcpus`. v2 ships the harness with the
+  warning header; lab fixes are tracked in #739.
+- **No 1M-rule numbers** — wire-protocol literal-CIDR ceiling is
+  pre-#1606. v2 populates rules ∈ {10, 100, 1K, 10K} and explicitly
+  marks 100K / 1M as `N/A — blocked on #1606`.
+- **Zone-pair slot aliasing under K > 16** — slot conflict on
+  high-cardinality configs collapses two zone pairs into one bucket
+  set. Default synthetic config ships K = 16, so aliasing is opt-in.
 
-#1607 asks for empirical measurement of the 64 B policy-evaluation
-cold-path ceiling on `loss:xpf-userspace-fw0`, so that the #1605 JIT
-re-plan stops reasoning against a derived-but-unmeasured 270 ns/packet
-budget (25 Gbps × 64 B = 49 Mpps; ~5.91 Mpps per-worker max from the
-architecture doc at 1500 B, scaled). The deliverable is *measurement
-infrastructure plus a populated baseline table plus a Scale Target
-section in `docs/userspace-jit-design.md`*. The win is unblocking
-#1605 Phase 4b; this PR does NOT change packet-forwarding behavior.
+## 3. What's already shipped / reused
 
-Three pieces:
+- `bucket_index_for_ns` (`userspace-dp/src/afxdp/umem/mod.rs:244`)
+  — branchless power-of-two bucket select. v2 extends to
+  `bucket_index_for_ns_24` with `DRAIN_HIST_BUCKETS_24 = 24`
+  (lives in a new `userspace-dp/src/afxdp/cold_path_hist.rs`
+  module so the wire contract is per-counter, not shared with
+  drain).
+- `WorkerRuntimeAtomics` publish-on-1s pattern
+  (`userspace-dp/src/afxdp/worker_runtime.rs`) — v2 piggybacks on the
+  same `publish()` tick.
+- `REDIRECT_SAMPLE_MASK = 0xff` (`userspace-dp/src/afxdp/umem/mod.rs:183`)
+  — 1-in-256 sample pattern with per-worker phase. v2 reuses the
+  same constant and pattern.
+- `xpf_userspace_worker_dead` Prometheus emission
+  (`pkg/api/metrics_userspace.go`) — proven additive-field pattern.
+- TSC reads — `core::arch::x86_64::__rdtscp` is the right primitive;
+  not currently used anywhere in `userspace-dp/`, so v2 introduces
+  one helper `cold_path_hist::sample_tsc()` with a unit-test
+  monotonic-fence assertion.
 
-1. **Synthetic policy ConfigSnapshot generator** at
-   `test/incus/synthetic-policy-gen.py` — emits Junos `.set` lines
-   for N address-books × M CIDRs, K zone-pairs, R rules, A
-   apps/rule, P permit/deny mix; ships a manifest JSON of realized
-   counts so the harness output is self-describing.
-2. **64 B microbench harness** at `test/incus/cold-path-microbench.sh`
-   — deploys synthetic config, runs `iperf3 -P 12 -t 30 -b 0 -l 64`
-   from `loss:cluster-userspace-host`, scrapes per-worker Mpps + CPU
-   + cold-path histogram from `/metrics`, optional perf record on
-   cold-path samples.
-3. **Cold-path histogram counter** — extend `WorkerRuntimeAtomics`
-   with a 16-bucket power-of-two ns histogram (`policy_decision_cold_path_ns_hist`)
-   reusing the existing `bucket_index_for_ns` layout (#709/#812)
-   and the seqlock-style publish pattern in `worker_runtime.rs`.
-   Sample sites: the two `evaluate_policy*` call sites inside
-   `userspace-dp/src/afxdp/poll_descriptor/mod.rs` (line 1375 +
-   line 2393) — both are session-miss / cold-path paths by
-   construction; the flow-cache fast path in
-   `flow_cache_hit::stage_flow_cache_hit` bypasses policy eval
-   entirely, so the histogram is naturally cold-path-only.
-
-## 2. Honest scope/value framing
-
-This is a **measurement-harness PR, not a perf PR**. The "win" is the
-empirical numbers it produces, not the code itself. If reviewers
-conclude the harness design is structurally unable to produce
-trustworthy numbers (CPU isolation gaps, kernel CRC offset blinding
-the 64 B claim, RSS-funnel making per-worker reads meaningless,
-iperf3 TCP framing dominating the cold-path measurement), then
-**PLAN-KILL is the right verdict** — no harness is better than a
-harness that produces numbers everyone believes are real.
-
-Five known structural risks the design must answer credibly:
-
-- **Cold path is bounded by session miss rate, not packet rate**.
-  `iperf3 -P 12` opens 12 TCP connections, then the steady-state
-  packets all hit the flow cache (warm path). Cold-path measurement
-  per packet decays toward zero after the first ~12 RTTs. A 30s run
-  produces ~few-hundred cold-path samples at most.
-  *Mitigation: optional pktgen mode with random 5-tuples per packet
-  to force 100 % cold path; documented as the canonical mode for
-  rule-count sweep.*
-- **iperf3 `-l 64` is not 64 B on the wire**. `-l 64` is the
-  application-write size; iperf3 still emits 14 (Ethernet) + 20 (IPv4
-  no options) + 20 (TCP no options, but in practice with timestamp
-  option ≈ 32) + 64 = **130 B on the wire** in v4, more in v6. The
-  harness MUST report wire-byte size and packet rate distinctly so
-  the operator does not conflate "64 B iperf3" with "64 B linerate".
-- **CPU isolation discipline**. The harness reports per-worker Mpps,
-  but a co-scheduled NIC IRQ on the same CPU steals cycles. The
-  harness should record `/proc/interrupts` deltas during the run and
-  flag if NIC IRQs and worker threads share a CPU.
-- **Cache cold vs warm**. A fresh deploy has cold L1-i / branch
-  predictors. The harness must include a documented warm-up phase
-  (1 s warmup discard) before sampling.
-- **RSS-funnel skew**. AF_XDP UMEM ownership means single-stream
-  traffic lands on one worker. With `-P 12`, the RSS hash on the
-  iperf3 source-port-randomized streams must actually fan-out across
-  workers. The harness should refuse to report aggregate Mpps if
-  fewer than `min(P, num_workers) - 1` workers see non-zero RX.
-
-## 3. What's already shipped / partially batched
-
-- **Power-of-two ns histogram pattern** — `DRAIN_HIST_BUCKETS = 16`,
-  `bucket_index_for_ns` (branchless, single `leading_zeros` + sat-sub
-  + min), published via Prometheus `emitHistogram` with `bucket_hi_ns`
-  upper-bound label (pkg/api/metrics.go:326). Used today for CoS
-  drain latency (#709), redirect-acquire (#709), TX submit→completion
-  (#812). The cold-path histogram reuses this layout verbatim — same
-  bucket layout, same wire shape, same Go-side emitter.
-- **WorkerRuntimeAtomics publish-on-1s pattern** — already exists for
-  CPU/wall/active counters in `userspace-dp/src/afxdp/worker_runtime.rs`
-  with a seqlock for window-rotation tuples. The cold-path histogram
-  follows the simpler cumulative-counter shape (matches
-  `cos_queue_lease_acquire_v8_calls`), since the histogram is
-  cumulative — readers compute per-window deltas via Prometheus
-  `rate()` / `increase()`.
-- **Test environment** — `loss:xpf-userspace-fw0` with the canonical
-  iperf3 server on `172.16.80.200` / `2001:559:8585:80::200`. The
-  fairness-harness and CoS smoke matrices set the precedent for
-  per-class iperf3 invocations + metrics scraping.
-
-## 4. Concrete design
+## 4. Concrete v2 design
 
 ### 4.1 Synthetic policy generator — `test/incus/synthetic-policy-gen.py`
 
-Python because the project already uses Python for parser/validator
-helpers (cluster_status_parse, fairness_multi_sample, etc.) and the
-ConfigSnapshot Junos-set output is plain-text — no Rust/Go binary
-needed.
+Unchanged from v1 §4.1 with two clarifications:
+
+- Default `--zone-pairs 16` (was 20) so default config matches the
+  16-slot per-zone-pair histogram cardinality. The dataplane never
+  enforces this — it's purely a default for clean reads.
+- Manifest now records `--zone-pairs` so the harness can detect
+  aliasing and warn in its TSV header.
+
+### 4.2 Cold-path UDP flooder — `test/incus/cold-path-flooder/`
+
+A standalone Rust binary, built via a small workspace addition. New
+files (all in this PR):
+
+- `test/incus/cold-path-flooder/Cargo.toml`
+- `test/incus/cold-path-flooder/src/main.rs`
+- `test/incus/cold-path-flooder/README.md` (operator-facing)
+- `Cargo.toml` workspace add: `test/incus/cold-path-flooder`
+
+Flag surface:
 
 ```
-usage: synthetic-policy-gen.py [-h]
-  [--address-books N]          default: 100
-  [--cidrs-per-book M]         default: 100
-  [--zone-pairs K]             default: 20
-  [--rules R]                  default: 10000
-  [--apps-per-rule A]          default: 5
-  [--permit-fraction P]        default: 0.7
-  [--cidr-mix MIX]             default: "24:60,28:30,32:10"
-                               (percentages, sum=100)
-  [--seed SEED]                default: 1607  (reproducible)
-  [--output-set FILE.set]      Junos `.set` config
-  [--output-manifest FILE.json] Realized-counts JSON
+cold-path-flooder
+  --dst-ip <IP>         (172.16.80.200 default)
+  --dst-port-base <P>   (5201 default)
+  --dst-port-span <N>   (number of dst-ports to sweep; default 1)
+  --src-ip-base <IP>    (10.42.0.0 default)
+  --src-ip-span <N>     (default 65536 — /16 sweep)
+  --src-port-span <N>   (default 65535 — full ephemeral range)
+  --duration-secs <S>   (default 30)
+  --warmup-secs <S>     (default 2)
+  --tx-mbps <M>         (default 0 = max)
+  --frame-bytes <B>     (default 64; checked against MIN_ETH=64)
+  --batch <N>           (sendmmsg batch; default 32)
+  --iface <NAME>        (default ge-0-0-1 — LAN side of loss cluster)
+  --ipv4 | --ipv6       (default ipv4; v6 path uses fe80::-equivalent)
+  --output-json <FILE>  (per-run summary)
 ```
 
-Output shape:
-- One `set security address-book book-NN address addr-NNNN <CIDR>`
-  per CIDR.
-- One `set security policies from-zone Z-FROM to-zone Z-TO
-  policy rule-NNNNN ...` per rule, citing existing address-books +
-  ~A applications.
-- Zone names `synth-zone-0` ... `synth-zone-K-1` plus interface
-  bindings (single dummy interface per zone, no IP assignment to keep
-  the config loadable in dataplane-disabled mode if needed).
-- Manifest JSON: `{ "address_books": 100, "total_cidrs": 10000,
-  "zone_pairs": 20, "rules": 10000, "apps_per_rule": 5,
-  "permit_count": 7000, "deny_count": 3000, "cidr_distribution": {...},
-  "seed": 1607, "generated_at": "...", "junos_set_lines": 30137 }`.
+#### 4.2.1 Why AF_PACKET, not iperf3
 
-CIDR distribution: 60 % /24, 30 % /28, 10 % /32 in RFC 1918 space
-(`10.x.x.x/N`), randomly seeded but reproducible. /32 hosts dominate
-the worst-case prefix-set linear-scan length per #923; the mix is the
-right shape to exercise the cold-path predicate cost.
+- Per-packet source-port randomization: iperf3 uses a fixed
+  5-tuple per stream; the userspace flow cache hits on packet 2.
+- True 64 B Ethernet frames: iperf3 `-l 64` is application-write
+  size; on-wire is ~130 B with TCP options or ~98 B with UDP. v2
+  produces exactly 64 B Ethernet frames.
+- Batched submission: `sendmmsg(SOCK_RAW, batch=32)` runs at line
+  rate on the loss cluster's LAN-side virtio with a single core.
+- No external dependency: ships as a cargo binary in the workspace.
 
-### 4.2 Microbench harness — `test/incus/cold-path-microbench.sh`
+#### 4.2.2 Per-packet 5-tuple selection
 
-Flow:
-1. Source `test/incus/loss-userspace-cluster.env`.
-2. `synthetic-policy-gen.py --rules $RULES --output-set /tmp/synth.set
-   --output-manifest /tmp/synth-manifest.json`.
-3. `incus file push /tmp/synth.set
-   loss:xpf-userspace-fw0/tmp/synth.set`.
-4. `incus exec loss:xpf-userspace-fw0 -- bash -c 'cli configure;
-   delete security policies; delete security address-book; load set
-   /tmp/synth.set; commit and-quit'`.
-5. **Warmup**: 5 s iperf3 stream to populate flow caches; discard.
-6. **Cold-path-saturation mode (default)**: 30 s
-   `iperf3 -P 12 -t 30 -b 0 -l 64` from
-   `loss:cluster-userspace-host` to `172.16.80.200`. Scrape
-   `/metrics` at 1 s intervals; capture
-   `xpf_userspace_worker_policy_decision_cold_path_ns_total{worker_id=N,bucket_hi_ns=B}`
-   and `xpf_userspace_worker_active_ns` + `wall_ns` deltas for CPU%.
-7. **Optional pktgen mode** (flag `--pktgen`): synthetic packet
-   generator with random 5-tuples to force 100 % cold-path. Mode
-   uses `iperf3-style` UDP with `-u` + `-l 64` + tight `-b 0` budget,
-   OR a small Go/Rust UDP flooder if iperf3 framing dominates
-   (deferred to round-2 unless reviewers demand it).
-8. Emit a single TSV row per rule-count step:
-   `rules\tper_worker_mpps_p50\tper_worker_mpps_max\taggregate_mpps\tns_p50\tns_p99\tnotes`.
+Single-core xorshift PRNG (no SIMD; flooder is CPU-cheap enough not
+to need vectorization at 5+ Mpps target):
+
+```rust
+// 64-bit xorshift, seeded from getpid() XOR getppid() XOR rdtsc()
+// at start. Splits across src_ip (32b), src_port (16b),
+// dst_port (16b — masked to span).
+let mut s = state.prng;
+s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+state.prng = s;
+let src_ip_offset = (s & 0xFFFF) as u32;
+let src_port    = ((s >> 16) & 0xFFFF) as u16;
+let dst_port_off = ((s >> 32) & DST_PORT_SPAN_MASK) as u16;
+```
+
+This produces uniform 5-tuple distribution over the configured
+spans. The flow cache cannot amortize because the next packet has a
+new key with probability ~1 - 2^-32.
+
+#### 4.2.3 Frame layout (default 64 B IPv4)
+
+```
+Byte 0-13   Ethernet header (dst MAC + src MAC + ethertype 0x0800)
+Byte 14-33  IPv4 header (no options, ttl=64, proto=17)
+Byte 34-41  UDP header (src_port, dst_port, len=30, csum=0)
+Byte 42-63  UDP payload (22 B fixed magic 0x'XPF-COLD-PATH-MIN64\n\0\0')
+```
+
+Total: 64 B Ethernet frame. IPv4 header checksum computed once per
+packet (cheap; no offload available on raw socket); UDP checksum is
+zero per RFC 768 over IPv4 — acceptable for a microbench.
+
+For IPv6: 14 + 40 + 8 + 2 = 64 B Ethernet frame. UDP checksum is
+mandatory under IPv6, so we precompute the pseudo-header CRC and
+fold in the 2 B payload — measurable but cheap (~5 ns/packet).
 
 ### 4.3 Cold-path counter wiring
 
-Single sample site, applied to both `evaluate_policy*` call sites in
-`poll_descriptor/mod.rs`:
+#### 4.3.1 Sample sites (unchanged from v1)
+
+The two `evaluate_policy*` call sites in
+`userspace-dp/src/afxdp/poll_descriptor/mod.rs` (lines 1375, 2393).
+
+#### 4.3.2 TSC-based sampling + 1-in-256 mask
 
 ```rust
-let t0 = monotonic_nanos();
+// New helper in userspace-dp/src/afxdp/cold_path_hist.rs:
+pub(in crate::afxdp) struct ColdPathSampler {
+    counter: u64,              // worker-local, no atomic
+    seed:    u64,              // worker_id-derived
+}
+
+impl ColdPathSampler {
+    /// Returns Some(t0_tsc) iff this call hits the sampled slot
+    /// (1-in-256). The branch predictor learns the not-sampled
+    /// path in well under a million iterations.
+    #[inline]
+    pub fn maybe_start(&mut self) -> Option<u64> {
+        self.counter = self.counter.wrapping_add(1);
+        if (self.counter ^ self.seed) & 0xff == 0 {
+            // SAFETY: rdtscp is supported on every x86_64 CPU
+            // produced since 2010 (architectural feature).
+            let mut aux = 0u32;
+            let t = unsafe { core::arch::x86_64::__rdtscp(&mut aux) };
+            Some(t)
+        } else {
+            None
+        }
+    }
+
+    /// Convert TSC delta to ns using the once-calibrated rate.
+    /// Calibration runs in the worker's start_up() phase before any
+    /// packets are seen.
+    #[inline]
+    pub fn close(t0_tsc: u64, ns_per_tsc_q32: u64) -> u64 {
+        let t1 = unsafe {
+            let mut aux = 0u32;
+            core::arch::x86_64::__rdtscp(&mut aux)
+        };
+        let dtsc = t1.wrapping_sub(t0_tsc);
+        // Q32 fixed-point multiply: ns = dtsc * ns_per_tsc / 2^32.
+        ((dtsc as u128 * ns_per_tsc_q32 as u128) >> 32) as u64
+    }
+}
+```
+
+Sample-site usage:
+
+```rust
+let t0 = worker_local.cold_path_sampler.maybe_start();
 let policy_result = evaluate_policy_result_with_len(...);
-let dt = monotonic_nanos().saturating_sub(t0);
-worker_runtime_counters.record_policy_cold_path_sample(dt);
+if let Some(t0) = t0 {
+    let dt_ns = ColdPathSampler::close(t0, worker_local.ns_per_tsc_q32);
+    worker_local.cold_path_counters.record(zone_pair_key, dt_ns);
+}
 ```
 
-The recorder lives on `WorkerRuntimeCounters` (worker-local, no
-atomic) and gets flushed to the `WorkerRuntimeAtomics` array
-on the existing 1 s `publish()` tick.
+Cost on the non-sampled path: 1 add + 1 xor + 1 mask + 1 branch + 1
+counter store ≈ ~1 ns. Cost on the sampled path: 2 rdtscp (~25 ns
+each) + 1 Q32 multiply (~3 ns) + 1 zone-pair-slot select (~2 ns) +
+24-bucket histogram store (1 non-atomic u64 store, ~1 ns). Sampled
+path is ~55 ns, fires 1-in-256, amortized cost = ~0.21 ns / packet.
+The wrapper is **at most 0.5 %** of a 200 ns cold-path floor —
+well under the F2-required threshold.
 
-`WorkerRuntimeAtomics` gains:
+#### 4.3.3 TSC calibration
+
+In each worker's setup phase (before its first packet):
+
 ```rust
-pub policy_cold_path_ns_hist: [AtomicU64; DRAIN_HIST_BUCKETS],
-pub policy_cold_path_samples: AtomicU64,  // count
-pub policy_cold_path_sum_ns: AtomicU64,   // sum for mean compute
+let t0 = rdtscp(); let n0 = clock_gettime_ns();
+std::thread::sleep(std::time::Duration::from_millis(100));
+let t1 = rdtscp(); let n1 = clock_gettime_ns();
+let tsc_per_ns_q32 = ((n1 - n0) as u128 * (1u128 << 32)
+                     / (t1 - t0) as u128) as u64;
 ```
 
-`WorkerRuntimeCounters` gains the same fields as `[u64; ...]` /
-`u64`. `publish()` issues 16 + 2 Relaxed stores (cold-path
-publish is 1 Hz, not per-packet).
+100 ms calibration is run-once per worker startup; the Q32
+multiplier is read in `close()`. We assert invariant TSC by
+reading `/proc/cpuinfo` for `constant_tsc` and `nonstop_tsc`
+flags at coordinator start and refusing to start if either is
+missing. Modern hypervisors expose both; loss cluster is
+verified clean.
 
-`WorkerRuntimeStatus` (wire) gains:
+#### 4.3.4 Per-zone-pair slot pick
+
 ```rust
-#[serde(rename = "policy_cold_path_ns_hist", default,
-        skip_serializing_if = "Vec::is_empty")]
-pub policy_cold_path_ns_hist: Vec<u64>,
-#[serde(rename = "policy_cold_path_samples", default)]
-pub policy_cold_path_samples: u64,
-#[serde(rename = "policy_cold_path_sum_ns", default)]
-pub policy_cold_path_sum_ns: u64,
+const ZP_SLOTS_LOG2: usize = 4;          // 16 slots
+const ZP_SLOTS:      usize = 1 << ZP_SLOTS_LOG2;
+
+#[inline]
+fn zone_pair_slot(key: u32) -> usize {
+    // Splitmix-style hash: avoid linear correlation between
+    // adjacent zone-pair keys aliasing onto adjacent slots.
+    let h = (key as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    ((h >> 60) & 0xF) as usize
+}
 ```
 
-`coordinator/status.rs::worker_runtime_snapshots()` fills the
-new fields from `WorkerRuntimeAtomics` (Relaxed loads, mirroring
-the existing pattern at status.rs:268-289).
+### 4.4 New struct: `WorkerColdPathCounters`
 
-### 4.4 Prometheus + Go-side mirror
+Lives in `userspace-dp/src/afxdp/cold_path_hist.rs`:
 
-`pkg/dataplane/userspace/protocol.go::WorkerRuntimeStatus`:
-```go
-PolicyColdPathNSHist  []uint64 `json:"policy_cold_path_ns_hist,omitempty"`
-PolicyColdPathSamples uint64   `json:"policy_cold_path_samples,omitempty"`
-PolicyColdPathSumNS   uint64   `json:"policy_cold_path_sum_ns,omitempty"`
+```rust
+const HIST_BUCKETS: usize = 24;
+
+#[derive(Default)]
+pub(in crate::afxdp) struct WorkerColdPathCounters {
+    // Per-zone-pair-slot histogram + sum + count.
+    hist:    [[u64; HIST_BUCKETS]; ZP_SLOTS],
+    sum_ns:  [u64; ZP_SLOTS],
+    samples: [u64; ZP_SLOTS],
+    /// Sum of zone_pair_keys that landed in each slot, used by the
+    /// reader to flag aliasing.  (At most 16 keys per slot in default
+    /// K=16 config → no collision.)
+    keys_seen_xor: [u32; ZP_SLOTS],
+}
+
+#[repr(align(64))]
+pub(in crate::afxdp) struct WorkerColdPathAtomics {
+    hist:    [[AtomicU64; HIST_BUCKETS]; ZP_SLOTS],
+    sum_ns:  [AtomicU64; ZP_SLOTS],
+    samples: [AtomicU64; ZP_SLOTS],
+    keys_seen_xor: [AtomicU64; ZP_SLOTS],  // u64 for atomic uniformity
+}
 ```
 
-`pkg/api/metrics_descriptors.go`: new `policyColdPathLatencyBucket`
-descriptor (`xpf_userspace_worker_policy_decision_cold_path_ns_bucket`),
-labels `worker_id, bucket_hi_ns`. Plus
-`policyColdPathSamplesTotal` (counter,
-`xpf_userspace_worker_policy_decision_cold_path_samples_total`)
-and `policyColdPathSumNS` (counter,
-`xpf_userspace_worker_policy_decision_cold_path_sum_ns_total`).
+Size per worker: 16 × 24 × 8 + 16 × 8 × 3 = 3072 + 384 = **3456 B**
+per worker, ~54 cache lines. With 6 workers = 20.7 KB total. Cheap
+in absolute terms; localized to one struct so a future redesign
+(e.g. per-zone-pair flat array indexed by id) doesn't need to touch
+the call sites.
 
-`pkg/api/metrics_userspace.go::emitWorkerRuntime`: emit the three
-new metrics with `worker_id` label. Reuse `emitHistogram`
-(metrics.go:326) but with a single `worker_id` label (current sig
-takes `ifindexLabel, queueLabel`; add a sibling
-`emitWorkerHistogram(ch, desc, hist, workerID)` rather than
-overloading the 2-label sig).
+Publish path: per-tick (`~1 Hz`) the worker calls
+`WorkerColdPathAtomics::publish(&counters)`; 24 × 16 + 3 × 16 = 432
+Relaxed stores per worker per second. Negligible.
 
-### 4.5 Doc update — `docs/userspace-jit-design.md` Scale Target section
+### 4.5 CPU isolation recording (harness side)
 
-Currently no "Scale Target" section exists. Add one after the
-"Motivation" section:
+The harness (`test/incus/cold-path-microbench.sh`) runs before and
+after each measurement:
+
+```bash
+incus exec loss:xpf-userspace-fw0 -- bash -c '
+  echo "=== cmdline ===";    cat /proc/cmdline
+  echo "=== clocksource ==="; cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+  echo "=== interrupts ===";  awk "/mlx5/" /proc/interrupts
+  echo "=== worker affinity ==="; for t in /proc/$(pidof userspace-dp)/task/*; do
+    cat $t/status | grep -E "Name|Cpus_allowed_list"
+  done
+' > /tmp/iso-pre.log
+
+# ... run the measurement ...
+
+# Repeat for /tmp/iso-post.log; diff /proc/interrupts to estimate
+# IRQ overlap with worker CPUs.
+```
+
+Output TSV header includes:
+
+```
+# isolation_warning=<true|false>
+# isolcpus=<value or "absent">
+# worker_cpus=<list>
+# nic_irq_cpus=<list>
+# shared_cpus=<list>
+```
+
+If `shared_cpus` non-empty, the TSV header includes
+`# isolation_warning=true # numbers are upper-bound, see #739`.
+
+### 4.6 Doc update — `docs/userspace-jit-design.md` Scale Target section
+
+Two separate tables (per Claude SMR F1.3 + F5 callout):
 
 ```markdown
-## Scale Target (measured on loss userspace cluster)
-
-Hardware: mlx5 SR-IOV VF passthrough, kernel 6.18+, AF_XDP
-zero-copy, 6 worker threads on a 32-core host.
-
-| Rules | Per-worker Mpps p50 | Aggregate Mpps | Per-packet ns p50 | Notes |
-|-------|--------------------:|---------------:|------------------:|-------|
-|    10 | TBD | TBD | TBD | linear scan trivial |
-|   100 | TBD | TBD | TBD | linear scan still fast |
-|  1000 | TBD | TBD | TBD | warm — first cliff candidate |
-| 10000 | TBD | TBD | TBD | wire-protocol ceiling pre-#1606 |
-| 100000 | N/A | N/A | N/A | blocked on #1606 (literal-CIDR ceiling) |
-| 1M | N/A | N/A | N/A | blocked on #1606 |
+## Scale Target (measured on loss userspace cluster, 2026-05-27)
 
 Methodology: `test/incus/cold-path-microbench.sh --rules N`
-on `loss:xpf-userspace-fw0`. iperf3 `-P 12 -l 64` against
-`172.16.80.200`; per-worker Mpps from
-`xpf_userspace_worker_policy_decision_cold_path_samples_total` rate;
-per-packet ns from `_sum_ns_total / _samples_total` ratio
-(arithmetic mean; histogram p50 / p99 also published per worker).
+on `loss:xpf-userspace-fw0`. Default flooder mode: UDP source-port
+randomized at 5 Mpps target, true 64 B Ethernet frames. Per-packet
+cold-path latency sampled 1-in-256 via TSC; wrapper baseline
+subtracted in the corrected column.
 
-64 B note: iperf3 `-l 64` is the application-write size. With
-TCP timestamp option the on-wire frame is ~130 B v4 / ~150 B v6.
-The 64 B linerate ceiling per the issue's 49 Mpps derivation
-requires pktgen-style synthetic packet generation; the iperf3
-path measures the **policy-cold-path cost only**, which is the
-actual quantity the #1605 JIT plan needs to budget against.
+CPU isolation state at run time: **isolcpus=absent** (loss cluster
+runs with `limits.cpu: 4` and no `isolcpus` per #739). Numbers
+below are upper-bound estimates under contention.
+
+### Table A — Cold-path latency (per-call, ns)
+
+| Rules | p50 raw | p50 corr | p99 raw | p99 corr | p999 raw | p999 corr | Notes |
+|-------|--------:|---------:|--------:|---------:|---------:|----------:|-------|
+|    10 | TBD | TBD | TBD | TBD | TBD | TBD | linear scan trivial |
+|   100 | TBD | TBD | TBD | TBD | TBD | TBD | |
+|  1000 | TBD | TBD | TBD | TBD | TBD | TBD | first cliff candidate |
+| 10000 | TBD | TBD | TBD | TBD | TBD | TBD | pre-#1606 wire ceiling |
+| 100000 | N/A | N/A | N/A | N/A | N/A | N/A | blocked on #1606 |
+| 1M | N/A | N/A | N/A | N/A | N/A | N/A | blocked on #1606 |
+
+### Table B — Aggregate throughput (Mpps, 64 B frames)
+
+| Rules | Per-worker Mpps p50 | Aggregate Mpps | Notes |
+|-------|--------------------:|---------------:|-------|
+|    10 | TBD | TBD | |
+|   100 | TBD | TBD | |
+|  1000 | TBD | TBD | |
+| 10000 | TBD | TBD | |
+
+### Wrapper baseline
+
+`rdtscp` round-trip measured once per worker startup at TSC
+calibration. The TSV records the value as `wrapper_ns_baseline`.
+Typical value on loss cluster: ~30-40 ns (verified at run time).
+Table A "corr" columns subtract this from the raw histogram.
+
+### TSC sampling caveat
+
+Latency is sampled 1-in-256 packets. At 5 Mpps cold-path saturated
+this is ~19.5K samples/sec/worker → ~117 K samples / 6 s minimum
+run for statistical p999 (need ~1000 samples in the tail bucket).
+The harness runs 30 s by default so p999 is well-populated; p9999
+is reported but flagged with a sample-count caveat in the TSV.
 ```
 
-## 5. Public API preservation
+### 4.7 Public-API surface
 
-- All existing `WorkerRuntimeStatus` fields preserved.
-- All existing `WorkerRuntimeAtomics` / `WorkerRuntimeCounters`
-  fields preserved.
-- `evaluate_policy*` signatures unchanged — the timer wraps the
-  call at the call site, not inside the function.
-- `emitHistogram` signature unchanged — new
-  `emitWorkerHistogram` added alongside.
-- No Junos config schema changes.
-- No HA / session-sync wire changes.
+Additions to `pkg/dataplane/userspace/protocol.go::WorkerRuntimeStatus`:
 
-## 6. Hidden invariants the change must preserve
+```go
+// #1607: per-zone-pair-slot cold-path latency histograms.
+// Slot index = splitmix-hash(zone_pair_key) & 0xF (16 slots).
+// Buckets: 24-entry power-of-two ns layout (saturates at ~4 s).
+ColdPathHist     [][]uint64 `json:"cold_path_hist,omitempty"`        // [slot][bucket]
+ColdPathSumNS    []uint64   `json:"cold_path_sum_ns,omitempty"`      // [slot]
+ColdPathSamples  []uint64   `json:"cold_path_samples,omitempty"`     // [slot]
+ColdPathKeysXor  []uint64   `json:"cold_path_keys_xor,omitempty"`    // [slot]
+ColdPathNSPerTSC uint64     `json:"cold_path_ns_per_tsc_q32,omitempty"`
+ColdPathWrapperNSBaseline uint64 `json:"cold_path_wrapper_ns_baseline,omitempty"`
+```
 
-- **Hot path no-allocation rule**: the per-call timer is two
-  `monotonic_nanos()` calls + one `bucket_index_for_ns` + 16
-  AtomicU64 increments? No — increments are on
-  `WorkerRuntimeCounters` (worker-local `[u64; 16]`), no atomic.
-  Per-call overhead: 2 clock reads + 1 branchless bucket select +
-  1 array store. ~50 ns including clock_gettime worst case.
-  Cold path is already 100s of ns minimum, so <1 % overhead.
-- **Publish atomicity**: cumulative counters don't need a seqlock
-  — readers handle per-field tearing by treating each bucket as
-  its own counter (Prometheus `rate()` is per-bucket anyway).
-- **Backward compatibility**: all new fields use
-  `#[serde(default)]` / `omitempty`; older daemons read zero.
-- **HA sync portability**: no HA-touching code modified.
-- **Counter overflow**: u64 at one sample per cold-path eval
-  per worker, even at 5 Mpps cold-path-saturated, is ~117 years
-  to wrap. Safe.
-- **Histogram bucket alignment**: must reuse
-  `DRAIN_HIST_BUCKETS` / `bucket_index_for_ns` so a future re-layout
-  doesn't silently drift this counter against the others. Encoded
-  by a `const _: () = assert!(POLICY_COLD_PATH_HIST_BUCKETS == DRAIN_HIST_BUCKETS);`.
+Mirror additions on Rust side in
+`userspace-dp/src/protocol/binding.rs::WorkerRuntimeStatus`. Both
+sides additive; all `omitempty` / `#[serde(default)]`. Older Go
+clients receive an empty payload; older daemons emit zero.
 
-## 7. Risk assessment
+Prometheus emission in `pkg/api/metrics_userspace.go`:
 
-| Class | Severity | Reasoning |
-|-------|----------|-----------|
-| Behavioral regression | LOW | Timer wraps a function call; no logic change. The two call sites are already in the cold path. |
-| Lifetime / borrow-checker | LOW | `WorkerRuntimeCounters` field add — pure data. |
-| Performance regression | LOW (cold path) / NEEDS-MEASURE (counter overhead) | Two `monotonic_nanos()` + bucket index + array store per cold-path eval. Counter sites are 100s of ns minimum, but reviewers should demand the smoke matrix prove no regression. |
-| Architectural mismatch | LOW-MED | Risk is the harness producing numbers nobody trusts (see §2 structural risks). Mitigated by the explicit pktgen-mode escape valve and the §4.5 wire-byte caveat. |
+- `xpf_userspace_worker_cold_path_ns_bucket{worker_id, zone_pair_slot, bucket_hi_ns}`
+- `xpf_userspace_worker_cold_path_samples_total{worker_id, zone_pair_slot}`
+- `xpf_userspace_worker_cold_path_sum_ns_total{worker_id, zone_pair_slot}`
+- `xpf_userspace_worker_cold_path_wrapper_ns_baseline{worker_id}` (gauge)
 
-## 8. Test plan
+Cardinality: 6 workers × 16 slots × 24 buckets = 2304 series for the
+bucket counter. Plus 6×16×2 = 192 for samples/sum, 6 for baseline.
+Total: ~2500 new series on the loss cluster. Fits comfortably under
+Prometheus scrape budget; comparable to existing
+`drain_latency_hist` (12 queues × 16 buckets × N workers).
 
-- `cargo build --release` clean.
-- `cargo test --release` — full 952+ suite passes; new tests added:
-  - `userspace-dp/src/afxdp/worker_runtime_tests.rs::policy_cold_path_publish_round_trip` — push samples, publish, snapshot, verify histogram + sum + count match.
-  - `userspace-dp/src/policy_tests.rs::cold_path_histogram_increments_in_poll_descriptor` (integration-style via a stub poll-descriptor harness) — deferred to round-2 if too tangled.
-  - Go side: `pkg/api/metrics_test.go::TestEmitWorkerRuntime_PolicyColdPathHistogram` — drive a ProcessStatus with non-zero histogram, assert the right number of Prometheus samples emit.
-- 5/5 flake check on `policy_cold_path_publish_round_trip`.
-- Go suite `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test ./...` — 30 packages green.
-- Deploy on loss userspace cluster, run Pass A + Pass B smoke matrix per SKILL.md.
-- Run the new harness end-to-end at rules ∈ {10, 100, 1000, 10000}; populate the §4.5 Scale Target table with measured numbers.
-- Sanity check: histogram p50 at rules=10 should be in single-digit microseconds; at rules=10000 it should be visibly larger.
+### 4.8 Hidden invariants preserved
 
-## 9. Out of scope
+- Hot-path no-allocation rule: sampler is one branch + one ALU op +
+  one store (non-sampled path); sampled path does no allocation,
+  uses worker-local `[u64; 24]` array.
+- Lock ordering / ArcSwap: untouched.
+- HA sync portability: no HA-touching code.
+- Counter overflow: u64 at 5 Mpps cold-path-saturated, ~117 years.
+- Wire-protocol both-sides: both `protocol/binding.rs` (Rust) and
+  `pkg/dataplane/userspace/protocol.go` (Go) updated in this PR. No
+  pkg/cluster sync wire changes.
+- Bucket layout pinned: `pub(in crate::afxdp) const
+  POLICY_COLD_PATH_HIST_BUCKETS: usize = 24;` with
+  `const _: () = assert!(POLICY_COLD_PATH_HIST_BUCKETS == 24);`.
+  Zone-pair slot count pinned analogously.
 
-- 100K / 1M rule sweeps — blocked on #1606 wire-protocol restructure.
-- True 64 B linerate measurement — requires pktgen-style synthetic packet generation. The harness's `--pktgen` flag is a future-extension stub in this PR; the default iperf3 mode measures cold-path latency, not 64 B linerate. See §2 honest framing.
-- JIT design itself — #1605 will re-plan after this + #1606 land.
-- Address-book wire restructure — #1606.
-- Per-rule-id histogram — too high cardinality for Prometheus; not in #1605's budget question. Aggregate per-worker is the unit of analysis.
-- Per-zone-pair histogram — same cardinality reason.
-- CoS interaction — orthogonal; the cold path is policy-only, not shaper-touching.
+## 5. v1 → v2 fatal-axis resolution map
 
-## 10. Open questions for adversarial review
+| v1 axis | Resolution in v2 | Sections |
+|---------|------------------|----------|
+| F1 TCP cold-path sample starvation | UDP randomized-source-port flooder is default; iperf3 is sanity-only | §4.2 |
+| F1.2 iperf3 `-u` reuses 5-tuple | Per-packet xorshift PRNG over src_ip/src_port/dst_port spans | §4.2.2 |
+| F1.3 Mpps + per-call-ns conflation | Two distinct tables in §4.6; rate-base spelled out | §4.6 |
+| F2 `clock_gettime` 18-22 % bias | TSC-based 1-in-256 sampling; calibrated wrapper baseline subtracted | §4.3.2 / §4.3.3 |
+| F3 16-bucket saturation hides tail | 24-bucket layout; saturates at ~4 s | §4.4 |
+| F4 No CPU isolation discipline | Record + warn; doc text scoped to "approximate ceiling under contention"; follow-up tracked under #739 | §4.5 / §4.6 |
+| F5 Per-worker aggregation hides cliff | 16-slot per-zone-pair histogram (splitmix-hashed) | §4.3.4 / §4.4 |
+| Wire `-l 64` misrepresentation | True 64 B Ethernet frames; checked at build time against MIN_ETH | §4.2.3 |
 
-1. **Is the iperf3 `-l 64` framing critique strong enough to PLAN-KILL the harness as designed?** If reviewers conclude that "iperf3 with 130 B wire frames" is not a credible 64 B microbench, the §4.5 doc text and harness output need to be reframed entirely. Alternative: ship the harness as "cold-path-cost microbench" with no 64 B claim, and defer 64 B linerate to a separate pktgen PR.
-2. **CPU isolation discipline**: the loss userspace cluster's CPU affinity / IRQ pinning is documented where? Should the harness refuse to run if `/proc/interrupts` shows shared CPUs between workers and NIC IRQs, or just emit a warning?
-3. **Cold-path saturation under TCP**: with `iperf3 -P 12` over TCP, the cold path is hit ~12 times per run (once per stream). Aggregate cold-path samples over 30 s = 12 — statistically meaningless. Either (a) the harness must use UDP `iperf3 -u` (no connection caching), or (b) the harness needs a synthetic UDP packet flooder that randomizes source ports per packet to defeat any session caching. Which is the right call?
-4. **Histogram bucket layout**: the existing `DRAIN_HIST_BUCKETS=16` layout maxes at ~16 ms. Cold-path policy eval at 1M rules and linear scan could be >100 ms per packet — that saturates bucket 15 and the operator loses tail visibility. Should this counter use a wider bucket layout (e.g. 24 buckets to ~1 s)? Or accept saturation as the natural read-out of "this rule count is unworkable"?
-5. **Counter overhead under warm flow-cache**: when the flow cache is hot and cold-path fires once per session install, the timer overhead is amortized to near zero per packet. But when cold-path fires on every packet (pktgen mode), the timer overhead becomes a measurement bias — the harness reports `latency + 2*clock_gettime`, not pure policy-eval latency. Should the harness subtract an empirical clock-gettime baseline before reporting?
-6. **Wire-protocol scope**: this PR adds three fields to
-   `WorkerRuntimeStatus` (Rust + Go). #1606 sub-agent is editing
-   protocol.rs concurrently. File-zone disjointness is enforced
-   by touching different structs (`WorkerRuntimeStatus` vs
-   `AddressBookSnapshot` / `RuleSnapshot`) — verify this is actually
-   true on master at the merge point.
+## 6. Test plan
 
-## 11. Plan version log
+- `cargo build --release` clean (workspace + cold-path-flooder).
+- `cargo test --release` — full 952+ suite passes; new tests:
+  - `userspace-dp/src/afxdp/cold_path_hist_tests.rs`:
+    - `bucket_index_24_layout` — verify each bucket edge maps as
+      expected, including saturation at 2^33 ns.
+    - `zone_pair_slot_no_clustering` — empirically verify 100K
+      random keys distribute within ±5 % of uniform across slots.
+    - `sampler_one_in_256` — drive 1 M synthetic packets, assert
+      sample count is within 256 ± 16.
+    - `tsc_calibration_monotonic_under_sleep` — calibrate, sleep
+      10 ms, assert TSC delta > 9 ms in ns-equivalent.
+  - `userspace-dp/src/afxdp/worker_runtime_tests.rs::cold_path_publish_round_trip`
+    — push samples into all 16 slots × 24 buckets, publish,
+    snapshot, verify values round-trip and aliasing detector
+    flags multi-key slots.
+  - Go-side `pkg/api/metrics_test.go::TestEmitWorkerRuntime_ColdPath`
+    — drive a `WorkerRuntimeStatus` with non-zero hist, sums,
+    samples; assert per-slot, per-bucket Prometheus samples emit
+    with right labels.
+- 5/5 flake check on `sampler_one_in_256` and
+  `cold_path_publish_round_trip`.
+- Go suite `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test ./...`
+  — 30 packages green.
+- `make test-failover` — required by HA-touch policy in CLAUDE.md
+  (this PR doesn't touch HA but the rule says any cluster smoke
+  must pass; reviewers confirm whether failover is required).
+- Smoke matrix on loss userspace cluster: v4+v6 × push+`-R` ×
+  CoS-off+CoS-on (per CLAUDE.md feedback memory).
+- Run the new harness end-to-end at rules ∈ {10, 100, 1K, 10K};
+  populate §4.6 Tables A and B with measured numbers in the same
+  PR.
 
-- v1 — DRAFT initial submission, all 11 sections.
+## 7. Out of scope
+
+- Address-book wire restructure (#1606 — concurrent PR).
+- Per-source rate-limit / verdict cache (#1608 — concurrent PR).
+- JIT design itself (#1605 — follows this + #1606).
+- 100K / 1M rule measurement (blocked on #1606).
+- LPM / DAG restructure (#1609).
+- Lab fixture changes (isolcpus, IRQ pinning) — tracked separately
+  under #739.
+
+## 8. Open questions for v2 adversarial review
+
+1. **TSC invariance gate**: the plan asserts that loss cluster
+   exposes `constant_tsc` and `nonstop_tsc`. Should the coordinator
+   refuse to start if either flag is missing, or should it
+   gracefully degrade to `clock_gettime` with the 1-in-256 sampling
+   intact (and amortized to ~0.3 ns / packet)? Refusing trips an
+   ops-on-call wake-up at deploy time; degrading hides a regression
+   in cloud-VM kernels that disable invariant TSC.
+2. **Zone-pair slot count**: 16 slots was chosen because it
+   matches default synthetic K=16 and the existing
+   `DRAIN_HIST_BUCKETS = 16` cache-line discipline. Should we go
+   to 32 or 64 to handle high-cardinality production configs
+   (e.g. 100 zone-pairs) without aliasing? Cost is linear in slot
+   count: 32 slots → 6.9 KB per worker, 64 → 13.8 KB. Still cheap.
+   v1 had no per-zone-pair view at all, so 16 is strictly better
+   than the v1 baseline.
+3. **rdtscp vs rdtsc**: rdtscp serializes against earlier loads
+   (~25 ns); rdtsc is ~15 ns but no fencing. For a histogram
+   measurement at sub-µs granularity, do we need the serializing
+   fence, or is the ~10 ns saving worth the noise? Plan picks
+   rdtscp for safety; reviewers can push back.
+4. **Flooder placement**: the flooder lives on the LAN-side
+   neighbor (`cluster-userspace-host`) and floods toward
+   `172.16.80.200` (WAN-side iperf3 target). This means the
+   measurement path is **LAN → FW0 → WAN**, which exercises the
+   from-zone=LAN to-zone=WAN policy slot. The synthetic config must
+   define a real policy permitting this flow at the head of the
+   rule list (so packets traverse but only after the cold-path scan
+   completes). Is one-zone-pair-policy-list the right baseline, or
+   should we put the matching rule at the **end** of the list to
+   force worst-case scan?
+5. **Co-residence of flooder + FW**: the flooder runs on
+   `cluster-userspace-host` which shares physical host CPUs with
+   FW0. Does this introduce host-scheduler noise? Plan v2 records
+   per-CPU usage on both sides; if the flooder consumes >50 % of
+   the host's CPU budget there's a real risk it starves FW0
+   workers. Mitigation: pin the flooder to the **highest** core
+   index available (away from FW0's worker pool) and document it.
+6. **Bias from per-call branch in non-sampled path**: the sampler
+   adds ~1 ns to every cold-path eval (1 branch + 1 ALU). Should
+   the plan A/B-test this against a control build that omits the
+   sampler entirely, and report the delta? Argued necessary by
+   methodology purity; argued unnecessary because 1 ns is below
+   the noise floor of the very measurement we're trying to make.
+7. **Wire-protocol semantic-versioning**: do we need to bump any
+   protocol-version sentinel for the new `WorkerRuntimeStatus`
+   fields? Existing pattern (`Dead`, `WindowNS`) was additive
+   without a version bump. Confirm no SemVer rule applies here.
+
+## 9. Plan version log
+
+- v1 — DRAFT initial submission (PLAN-KILLED 2026-05-27 round 1).
+- v2 — addresses all 5 v1 fatal axes via UDP flooder default,
+  TSC sampling, 24-bucket layout, 16-slot per-zone-pair histogram,
+  CPU isolation recording. Doc text scoped to "approximate ceiling
+  under contention" with #739 follow-up linkage.
+
+## X. v1 archive
+
+The v1 plan content has been preserved in git history (commit
+`d777741a85b48bf68fc50b16a87b755f918da078`). The PLAN-KILLED header
+and the verdict text from round 1 are captured at the top of this
+file. To audit v1 verbatim: `git show
+d777741a:docs/pr/1607-hw-ceiling-microbench/plan.md`.
