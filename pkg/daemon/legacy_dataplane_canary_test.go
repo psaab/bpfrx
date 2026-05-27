@@ -10,31 +10,166 @@ import (
 	"testing"
 )
 
+// scanFileForLegacyDP performs the 5-pass AST scan that the
+// legacyDP canary contract documents. It is shared between the
+// production directory-walker test (TestLegacyDPAccessorRemoved)
+// and the synthetic negative-pattern tests in
+// legacy_dataplane_canary_synthetic_test.go, so any change to the
+// scan logic is exercised by both call sites — the synthetic tests
+// genuinely defend the production canary instead of a parallel
+// copy of it (Gemini #1559 code-review-round-1 finding).
+//
+// Passes (most-specific first; record-once dedup keyed on
+// (displayName, line) selects the surviving diagnostic):
+//
+//  1. *ast.FuncDecl named legacyDP (any receiver shape).
+//  2. *ast.StructType.Fields with Names[i] == "legacyDP".
+//  3. *ast.CallExpr whose Fun is *ast.SelectorExpr with Sel.Name
+//     == "legacyDP".
+//  4. *ast.SelectorExpr with Sel.Name == "legacyDP" (bare reads).
+//  5. *ast.Ident with Name == "legacyDP" (catch-all for
+//     `legacyDP(d)` callsites whose Fun is *ast.Ident).
+//
+// displayName is the prefix used in offender strings (typically the
+// scanned filename). The scan never recurses outside the supplied
+// *ast.File.
+func scanFileForLegacyDP(fset *token.FileSet, file *ast.File, displayName string) []string {
+	var offenders []string
+	recorded := make(map[string]bool)
+	record := func(pos token.Position, msg string) {
+		key := displayName + ":" + itoa(pos.Line)
+		if recorded[key] {
+			return
+		}
+		recorded[key] = true
+		offenders = append(offenders, key+": "+msg)
+	}
+
+	// Pass 1 — FuncDecl name match (receiver-agnostic).
+	// Closes the package-level `func legacyDP(d *Daemon)` bypass
+	// (Gemini #1559 plan-round-1). Record at fd.Name.Pos() so
+	// multiline func declarations land on the identifier line, not
+	// the `func` keyword (Codex #1559 plan-round-2).
+	for _, decl := range file.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if fd.Name == nil || fd.Name.Name != "legacyDP" {
+			continue
+		}
+		pos := fset.Position(fd.Name.Pos())
+		record(pos, "forbidden function/method declaration named "+
+			"legacyDP — removed in #1519, see "+
+			"docs/pr/1519-daemon-legacydp-shrink/plan-impl.md. "+
+			"The identifier is reserved within pkg/daemon "+
+			"production code.")
+	}
+
+	// Pass 3 — StructType.Fields name match. Catches a sibling
+	// `legacyDP T` field reintroduction on any struct in the file
+	// (not just Daemon — naming an unrelated struct's field
+	// legacyDP is also blocked; the diagnostic does NOT claim
+	// "Daemon field" because Pass 3 is struct-agnostic).
+	ast.Inspect(file, func(n ast.Node) bool {
+		st, ok := n.(*ast.StructType)
+		if !ok {
+			return true
+		}
+		if st.Fields == nil {
+			return true
+		}
+		for _, field := range st.Fields.List {
+			for _, fname := range field.Names {
+				if fname == nil || fname.Name != "legacyDP" {
+					continue
+				}
+				pos := fset.Position(fname.Pos())
+				record(pos, "forbidden struct field named "+
+					"legacyDP — removed in #1519; the "+
+					"identifier is reserved within pkg/daemon "+
+					"production code. Use a typed probe in "+
+					"runtime_probes.go instead.")
+			}
+		}
+		return true
+	})
+
+	// Pass 2 — CallExpr selector match. Existing v1 shape,
+	// preserved for its more actionable "forbidden call to
+	// .legacyDP()" diagnostic. Record at sel.Sel.Pos() so the
+	// line aligns with Pass 4 and Pass 5 for multiline
+	// d.\n  legacyDP() forms.
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if sel.Sel == nil || sel.Sel.Name != "legacyDP" {
+			return true
+		}
+		pos := fset.Position(sel.Sel.Pos())
+		record(pos, "forbidden call to .legacyDP() — removed "+
+			"in #1519; use a daemon-local typed probe from "+
+			"runtime_probes.go instead.")
+		return true
+	})
+
+	// Pass 4 — SelectorExpr name match. Catches bare reads
+	// `dp := d.legacyDP`, method-values `f := d.legacyDP`, and
+	// any other SelectorExpr ending in .legacyDP that is not
+	// wrapped in a CallExpr.
+	ast.Inspect(file, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if sel.Sel == nil || sel.Sel.Name != "legacyDP" {
+			return true
+		}
+		pos := fset.Position(sel.Sel.Pos())
+		record(pos, "forbidden selector .legacyDP — removed "+
+			"in #1519; do not re-introduce as a field, "+
+			"method, or accessor. Use a typed probe in "+
+			"runtime_probes.go instead.")
+		return true
+	})
+
+	// Pass 5 — bare *ast.Ident name match. Catch-all for any
+	// `legacyDP` token not already named by Pass 1-4. Closes
+	// the package-level callsite bypass: `legacyDP(d)` has
+	// Fun=*ast.Ident, not *ast.SelectorExpr, so Pass 2 and
+	// Pass 4 do not see it. ast.Inspect walks FuncDecl.Name,
+	// Field.Names, and SelectorExpr.Sel as ast.Ident, so Pass 5
+	// would otherwise duplicate the other passes — record-once
+	// dedup suppresses those duplicates.
+	ast.Inspect(file, func(n ast.Node) bool {
+		ident, ok := n.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if ident.Name != "legacyDP" {
+			return true
+		}
+		pos := fset.Position(ident.Pos())
+		record(pos, "forbidden identifier legacyDP — removed "+
+			"in #1519; the name is reserved within pkg/daemon "+
+			"production code (no field, method, function, "+
+			"selector, or bare identifier may use it).")
+		return true
+	})
+
+	return offenders
+}
+
 // TestLegacyDPAccessorRemoved is the #1519 (sub-#1451 S4)
 // regression-guard canary: it scans every non-test .go file in
 // pkg/daemon and fails if the identifier `legacyDP` reappears in
-// ANY of these AST surfaces:
-//
-//  1. *ast.FuncDecl named legacyDP (any receiver shape — Daemon
-//     method, package-level function, or any other).
-//  2. *ast.StructType.Fields.Names[i] == "legacyDP" (struct field
-//     reintroduction, e.g. a sibling field on Daemon).
-//  3. *ast.CallExpr whose Fun is *ast.SelectorExpr with Sel.Name ==
-//     "legacyDP" (call-shaped reintroduction, e.g. d.legacyDP()).
-//  4. *ast.SelectorExpr with Sel.Name == "legacyDP" not wrapped in
-//     a CallExpr (bare selector read, e.g. `dp := d.legacyDP`).
-//  5. *ast.Ident with Name == "legacyDP" (catch-all for package-
-//     level function callsites `legacyDP(d)`, local var decls,
-//     and any other bare-identifier usage).
-//
-// Passes share a record-once dedup keyed on (file, line); the
-// first pass to record a given line wins, so each reintroduction
-// line emits exactly one offender with the most specific diagnostic
-// available. The pass execution order is chosen so the most
-// specific message survives:
-//
-//	Pass 1 (FuncDecl) > Pass 3 (StructType.Field) > Pass 2 (CallExpr)
-//	> Pass 4 (SelectorExpr) > Pass 5 (bare Ident).
+// any of the AST surfaces documented on scanFileForLegacyDP.
 //
 // The pre-#1519 daemon used (*Daemon).legacyDP() as an escape
 // hatch that re-exposed the full BPF-shaped dataplane.DataPlane to
@@ -97,135 +232,7 @@ func TestLegacyDPAccessorRemoved(t *testing.T) {
 			t.Fatalf("parse %s: %v", name, err)
 		}
 
-		// record-once dedup: first pass to write a given (file, line)
-		// wins; later passes on the same line are suppressed.
-		recorded := make(map[string]bool)
-		record := func(pos token.Position, msg string) {
-			key := name + ":" + itoa(pos.Line)
-			if recorded[key] {
-				return
-			}
-			recorded[key] = true
-			offenders = append(offenders, key+": "+msg)
-		}
-
-		// Pass 1 — FuncDecl name match (receiver-agnostic).
-		// Closes the package-level `func legacyDP(d *Daemon)` bypass
-		// (Gemini #1559 round-1). Record at fd.Name.Pos() so multiline
-		// func declarations land on the identifier line, not the `func`
-		// keyword (Codex #1559 round-2).
-		for _, decl := range file.Decls {
-			fd, ok := decl.(*ast.FuncDecl)
-			if !ok {
-				continue
-			}
-			if fd.Name == nil || fd.Name.Name != "legacyDP" {
-				continue
-			}
-			pos := fset.Position(fd.Name.Pos())
-			record(pos, "forbidden function/method declaration named "+
-				"legacyDP — removed in #1519, see "+
-				"docs/pr/1519-daemon-legacydp-shrink/plan-impl.md. "+
-				"The identifier is reserved within pkg/daemon "+
-				"production code.")
-		}
-
-		// Pass 3 — StructType.Fields name match. Catches a sibling
-		// `legacyDP T` field reintroduction on any struct in the file
-		// (not just Daemon — naming an unrelated struct's field
-		// legacyDP is also blocked, by design; the diagnostic does
-		// NOT claim "Daemon field" because Pass 3 is struct-agnostic).
-		ast.Inspect(file, func(n ast.Node) bool {
-			st, ok := n.(*ast.StructType)
-			if !ok {
-				return true
-			}
-			if st.Fields == nil {
-				return true
-			}
-			for _, field := range st.Fields.List {
-				for _, fname := range field.Names {
-					if fname == nil || fname.Name != "legacyDP" {
-						continue
-					}
-					pos := fset.Position(fname.Pos())
-					record(pos, "forbidden struct field named "+
-						"legacyDP — removed in #1519; the "+
-						"identifier is reserved within pkg/daemon "+
-						"production code. Use a typed probe in "+
-						"runtime_probes.go instead.")
-				}
-			}
-			return true
-		})
-
-		// Pass 2 — CallExpr selector match. Existing v1 shape,
-		// preserved for its more actionable "forbidden call to
-		// .legacyDP()" diagnostic. Record at sel.Sel.Pos() so the
-		// line aligns with Pass 4 and Pass 5 for multiline
-		// d.\n  legacyDP() forms.
-		ast.Inspect(file, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-			if sel.Sel == nil || sel.Sel.Name != "legacyDP" {
-				return true
-			}
-			pos := fset.Position(sel.Sel.Pos())
-			record(pos, "forbidden call to .legacyDP() — removed "+
-				"in #1519; use a daemon-local typed probe from "+
-				"runtime_probes.go instead.")
-			return true
-		})
-
-		// Pass 4 — SelectorExpr name match. Catches bare reads
-		// `dp := d.legacyDP`, method-values `f := d.legacyDP`, and
-		// any other SelectorExpr ending in .legacyDP that is not
-		// wrapped in a CallExpr.
-		ast.Inspect(file, func(n ast.Node) bool {
-			sel, ok := n.(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-			if sel.Sel == nil || sel.Sel.Name != "legacyDP" {
-				return true
-			}
-			pos := fset.Position(sel.Sel.Pos())
-			record(pos, "forbidden selector .legacyDP — removed "+
-				"in #1519; do not re-introduce as a field, "+
-				"method, or accessor. Use a typed probe in "+
-				"runtime_probes.go instead.")
-			return true
-		})
-
-		// Pass 5 — bare *ast.Ident name match. Catch-all for any
-		// `legacyDP` token not already named by Pass 1-4. Closes
-		// the package-level callsite bypass: `legacyDP(d)` has
-		// Fun=*ast.Ident, not *ast.SelectorExpr, so Pass 2 and
-		// Pass 4 do not see it. ast.Inspect walks FuncDecl.Name,
-		// Field.Names, and SelectorExpr.Sel as ast.Ident, so Pass 5
-		// would otherwise duplicate the other passes — record-once
-		// dedup suppresses those duplicates.
-		ast.Inspect(file, func(n ast.Node) bool {
-			ident, ok := n.(*ast.Ident)
-			if !ok {
-				return true
-			}
-			if ident.Name != "legacyDP" {
-				return true
-			}
-			pos := fset.Position(ident.Pos())
-			record(pos, "forbidden identifier legacyDP — removed "+
-				"in #1519; the name is reserved within pkg/daemon "+
-				"production code (no field, method, function, "+
-				"selector, or bare identifier may use it).")
-			return true
-		})
+		offenders = append(offenders, scanFileForLegacyDP(fset, file, name)...)
 	}
 
 	if len(offenders) > 0 {

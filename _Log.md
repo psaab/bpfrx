@@ -4083,3 +4083,9 @@ top.
 - **Timestamp**: 2026-05-27 03:35 UTC
   - **Action**: Implemented v3 plan: rewrote pkg/daemon/legacy_dataplane_canary_test.go with 5-pass AST scan + record-once dedup; added pkg/daemon/legacy_dataplane_canary_synthetic_test.go with 7 negative-pattern tests. All 8 canary tests pass; 5/5 flake check clean; full Go suite (32 packages) green.
   - **File(s)**: pkg/daemon/legacy_dataplane_canary_test.go (rewritten), pkg/daemon/legacy_dataplane_canary_synthetic_test.go (new), docs/pr/1559-canary-harden/plan.md (v3)
+
+## 2026-05-27 03:42 — #1559 round-1 code review fix: extract shared scan helper
+
+- **Timestamp**: 2026-05-27 03:42 UTC
+  - **Action**: Address Gemini code-review-round-1 MAJOR finding (synthetic tests defended a parallel copy of production canary logic instead of the SUT). Extract scanFileForLegacyDP() helper; both TestLegacyDPAccessorRemoved and the synthetic negative tests now route through it. All 8 tests pass, 5/5 flake clean, full Go suite (32 packages) green.
+  - **File(s)**: pkg/daemon/legacy_dataplane_canary_test.go, pkg/daemon/legacy_dataplane_canary_synthetic_test.go
