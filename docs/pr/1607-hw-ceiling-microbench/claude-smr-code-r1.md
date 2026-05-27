@@ -10,7 +10,8 @@ plan-review chain converged on:
 - Rust flooder Cargo skeleton at `test/incus/cold-path-flooder/`
   with CLI surface, arg validation, bounded/unbounded regime
   handling, xorshift64 PRNG primitive, compile-time const-assertion
-  on BOUNDED cohort cap, 6/6 cargo unit tests.
+  on BOUNDED cohort cap, full cargo unit-test suite. (As of merge,
+  9 unit tests pass — count may grow in step-2/step-3 follow-ups.)
 
 No `userspace-dp/`, `userspace-xdp/`, or Go-side code touched. Zero
 dataplane regression risk from this PR alone.
@@ -39,7 +40,7 @@ dataplane regression risk from this PR alone.
   = 16_384 × 8 × 1 = 131_072 = DEFAULT_MAX_SESSIONS`. PASS —
   enforced by `const _: () = assert!(...)` at module scope; build
   fails if a future edit breaks the bijection.
-- `DEFAULT_SRC_IP_SPAN = 65_535`, `DEFAULT_SRC_PORT_SPAN = 65_535`,
+- `DEFAULT_SRC_IP_SPAN = 65_536`, `DEFAULT_SRC_PORT_SPAN = 65_536`,
   `DEFAULT_DST_PORT_SPAN = 1`. Unbounded default cardinality
   ≈ 4.295 B unique 5-tuples per AGY r3 axis 1 resolution. PASS.
 - `Args::parse()` tracks `user_set_src_ip_span`,
@@ -61,7 +62,7 @@ dataplane regression risk from this PR alone.
     successful run. Any shell script using `$?` will treat 71 as
     failure.
 
-### Tests (6/6 passing)
+### Tests (cargo test --release all passing)
 
 - `bounded_cohort_constants_fit_max_sessions`: runtime mirror of
   the compile-time assert; visible in `cargo test` output.
@@ -100,7 +101,8 @@ step-1" so the contradiction is removed. PASS post-fix.
 
 ## Adjudication vs PR description claims
 
-- "6/6 cargo tests pass": VERIFIED.
+- "Cargo unit tests pass": VERIFIED (9/9 as of 0c7a9e600 + later
+  fix-cycle additions for u128 overflow and zero/oversized-batch).
 - "No userspace-dp/ or userspace-xdp/ changes. NO Go changes":
   VERIFIED via `git diff origin/master..HEAD --name-only`:
   only `docs/pr/1607-hw-ceiling-microbench/*`,

@@ -27,12 +27,23 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// libc primitives (sockaddr_ll, CString, c_int/c_void, ptr) plus
+// std::time::Instant are reserved for the step-2 (#1611) runner
+// body but unused in step-1. We import them now so step-2's commit
+// stays focused on the runner logic, and use #[allow(unused_imports)]
+// to silence the dead-code warning instead of leaving placeholder
+// statements in main() (cleaner per Copilot code-r3).
+#[allow(unused_imports)]
 use std::ffi::CString;
-use std::mem::{size_of, zeroed};
+use std::mem::zeroed;
 use std::net::Ipv4Addr;
+#[allow(unused_imports)]
 use std::os::raw::{c_int, c_void};
+#[allow(unused_imports)]
 use std::ptr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[allow(unused_imports)]
+use std::time::Instant;
 
 const MIN_ETH_FRAME: usize = 64;
 const DEFAULT_DURATION_SECS: u64 = 30;
@@ -296,12 +307,12 @@ OPTIONS:
   --iface NAME            (default ge-0-0-1)
   --dst-ip IP             (default 172.16.80.200)
   --dst-mac MAC           (default broadcast; step-2 runner will ARP-resolve gateway unless --dst-mac is explicitly set)
-  --src-mac MAC           (default 0x000000000000; auto-fill from iface)
+  --src-mac MAC           (default 0x000000000000; step-2 runner will auto-fill from iface unless --src-mac is explicitly set)
   --dst-port-base N       (default 5201)
   --dst-port-span N       (default 1)
   --src-ip-base IP        (default 10.42.0.0)
-  --src-ip-span N         (default 65536 = full 2^16; bounded mode lowers to 16384 unless overridden)
-  --src-port-span N       (default 65536 = full 2^16; bounded mode lowers to 8 unless overridden)
+  --src-ip-span N         (cardinality, default 65536 = full 2^16; bounded mode lowers to 16384 unless overridden)
+  --src-port-span N       (cardinality, default 65536 = full 2^16; bounded mode lowers to 8 unless overridden)
   --duration-secs N       (default 30)
   --warmup-secs N         (default 2)
   --frame-bytes N         (default 64, min 64)
@@ -337,9 +348,17 @@ fn parse_mac(s: &str) -> Result<[u8; 6], String> {
 }
 
 /// 64-bit xorshift PRNG. Maximum-period (2^64 - 1).
+///
+/// The struct + method are kept on release builds (not gated to
+/// `#[cfg(test)]`) because the step-2 (#1611) runner body will
+/// consume both directly. Step-1 only exercises this primitive
+/// from unit tests; the `#[allow(dead_code)]` here silences the
+/// release-build warning until the runner ships.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct Xorshift64(u64);
 
+#[allow(dead_code)]
 impl Xorshift64 {
     #[inline(always)]
     fn next(&mut self) -> u64 {
@@ -379,38 +398,28 @@ fn main() {
         args.frame_bytes,
     );
 
-    // The AF_PACKET socket + frame assembly + sendmmsg loop is
-    // implemented in a sibling module; this main() body intentionally
-    // exercises the CLI surface (argument parsing + cohort
-    // validation) so it can be unit-tested without root privileges.
+    // The AF_PACKET socket + frame assembly + sendmmsg loop is NOT
+    // implemented in step-1; this main() body intentionally exercises
+    // only the CLI surface (argument parsing + cohort validation) so
+    // it can be unit-tested without CAP_NET_RAW. The runner body
+    // lands in step-2 (#1611) and will replace this stub tail with
+    // the real AF_PACKET / sendmmsg loop driven by the xorshift PRNG
+    // primitive defined above.
     //
-    // The packet-send loop requires CAP_NET_RAW + an actual interface,
-    // which is provided by the harness wrapper script (run inside
-    // loss:cluster-userspace-host). For now we stub the runner with a
-    // clear "not yet implemented" diagnostic so the build artifact
-    // exists and the cargo workspace compiles. The runner body lands
-    // in a follow-up implementation commit.
+    // Per AGY r4: a downstream harness must NOT mistake the stub for
+    // a successful run. We print a loud, unambiguous "STUB" tag on
+    // stderr AND exit with a distinctive non-zero status (71 =
+    // sysexits.h EX_OSERR, "internal software error"). Any harness
+    // shell script keying off `$?` will treat this as failure.
 
     let _seed = args.seed;
     let _prng = Xorshift64(args.seed);
-    // Per AGY r4: a downstream harness should NOT mistake the stub
-    // for a successful run. We print a loud, unambiguous "STUB" tag
-    // on stderr AND exit with a distinctive non-zero status (71 =
-    // sysexits.h EX_OSERR, "internal software error"). Any harness
-    // shell script keying off `$?` will treat this as failure, not
-    // success.  Replace this entire `main()` tail with the real
-    // AF_PACKET runner in the follow-up commit tracked by #1611.
     eprintln!(
         "cold-path-flooder: STUB — runner body deferred to #1611 (see plan v2-r4 §4.2)"
     );
     eprintln!(
         "cold-path-flooder: STUB — validated args + cohort cap; exit 71 to flag NOT-IMPLEMENTED"
     );
-
-    // Suppress unused warnings for libc primitives we'll need.
-    let _ = (size_of::<libc::sockaddr_ll>(), ptr::null::<c_void>() as *const _, 0 as c_int);
-    let _ = CString::new("placeholder").unwrap();
-    let _ = Instant::now();
 
     std::process::exit(71);
 }

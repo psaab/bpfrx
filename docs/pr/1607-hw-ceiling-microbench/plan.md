@@ -149,8 +149,10 @@ Unchanged from v1 §4.1 with two clarifications:
 
 ### 4.2 Cold-path UDP flooder — `test/incus/cold-path-flooder/`
 
-A standalone Rust binary, built via a small workspace addition. New
-files (all in this PR):
+A **standalone Rust binary outside the userspace-dp / userspace-xdp
+Cargo workspaces** (matches the existing `test/xsk-repro/` isolation
+pattern). Step-1 deliberately avoids Cargo workspace integration so a
+test-binary regression cannot block dataplane builds.
 
 Files actually shipped in step-1 (this PR):
 
@@ -158,7 +160,10 @@ Files actually shipped in step-1 (this PR):
 - `test/incus/cold-path-flooder/Cargo.lock` (tracked per repo
   convention; matches `userspace-dp/`, `userspace-xdp/`,
   `test/xsk-repro/`)
-- `test/incus/cold-path-flooder/src/main.rs` (CLI + 7 cargo tests)
+- `test/incus/cold-path-flooder/src/main.rs` (CLI surface + cargo
+  unit tests covering bounded-cohort bijection, unbounded default
+  spans, MAC parsing, xorshift progression, frame-size minimum,
+  zero/oversized-batch rejection, and u128 overflow safety)
 - `test/incus/cold-path-flooder/.gitignore` (excludes `/target`
   only; Cargo.lock is tracked)
 
@@ -297,11 +302,12 @@ unique 5-tuples  = 16384 × 8 × 1 = 131_072  (exactly DEFAULT_MAX_SESSIONS)
 This means:
 
 - Default mode is `--cohort=unbounded`. The harness in the default
-  invocation uses `--src-ip-span 65535 --src-port-span 65535
-  --dst-port-span 1` ≈ 4.3 B unique 5-tuples; all packets after
-  the 26 ms warm-up are cold-path-eligible (cache_miss → policy_eval →
-  install_rejected). Sample mask 1-in-256 → ~586 K samples / 30 s,
-  ample for p9999.
+  invocation uses `--src-ip-span 65536 --src-port-span 65536
+  --dst-port-span 1` ≈ 4.3 B unique 5-tuples (spans are cardinalities,
+  not max-values; using 65535 would systematically exclude one value
+  per axis); all packets after the 26 ms warm-up are cold-path-
+  eligible (cache_miss → policy_eval → install_rejected). Sample mask
+  1-in-256 → ~586 K samples / 30 s, ample for p9999.
 - Optional `--cohort=bounded` mode uses the 131 K-cohort sizing
   above. Sample mask drops to 1-in-1 because the cold-path sample
   count is hard-capped at 131 K (one per unique 5-tuple). p999 is
@@ -312,9 +318,10 @@ This means:
 
 **Alternative knobs the harness exposes**:
 
-- `--cohort {bounded,unbounded}` — `bounded` is default. `unbounded`
-  enables the AGY-flagged "policy-eval-only" regime explicitly; useful
-  for isolating the policy eval cost from session install cost. The
+- `--cohort {bounded,unbounded}` — **unbounded is the default** (post
+  AGY r3 axis 1 resolution); the JIT-planning Scale Target sources
+  from unbounded. `bounded` is opt-in and useful for isolating the
+  session install + replicate cost from the policy-eval cost. The
   TSV column `mode` records which regime was active.
 - `--cohort-size <N>` — override default `min(DEFAULT_MAX_SESSIONS,
   src_ip_span * src_port_span * dst_port_span)`. Reviewers can sweep.

@@ -3,8 +3,12 @@ name = "cold-path-flooder"
 version = "0.1.0"
 edition = "2021"
 
-# Standalone Rust binary used by test/incus/cold-path-microbench.sh
-# to flood the xpf userspace dataplane with cold-path-eligible packets.
+# Standalone Rust binary planned to be driven by a
+# test/incus/cold-path-microbench.sh harness (step-3 #1612). The
+# harness script does not yet exist in tree; step-1 ships only the
+# CLI skeleton + cohort validation.
+#
+# Floods the xpf userspace dataplane with cold-path-eligible packets.
 #
 # Default regime is `--cohort=unbounded` (per AGY r3 axis 1): sweeps a
 # full /16 source-IP × full 16-bit source-port space ≈ 4.3 B unique
