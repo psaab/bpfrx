@@ -128,7 +128,7 @@ on those fields.
 `addr_family`, `protocol`, `src_ip`, `dst_ip`, `src_port`, `dst_port`.
 For ICMP and ICMPv6 sessions, `parse_flow_ports`
 (`userspace-dp/src/afxdp/frame/inspect.rs:212-232`) unconditionally
-reads bytes 4-6 of the ICMP header into `src_port` (the ICMP
+reads bytes 4-5 of the ICMP header into `src_port` (the ICMP
 identifier word — meaningful for Echo Request/Reply, opaque for
 other ICMP types) and stores zero in `dst_port`. ICMP **type**
 and **code** are NOT in the cache key — adding an explicit
@@ -147,7 +147,7 @@ exactly one of these two classes:
 | `source_addresses` / `source_v4` / `source_v6` | yes | `src_ip` in `SessionKey` |
 | `destination_addresses` / `dest_v4` / `dest_v6` | yes | `dst_ip` |
 | `protocols` / `protocol_bitmap` (+ `protocol_match_enabled`) | yes | `protocol` |
-| `source_ports` | yes (TCP/UDP); ICMP-special | `src_port` carries the ICMP identifier word from bytes 4-6 of the ICMP header (meaningful for Echo Request/Reply, opaque otherwise) |
+| `source_ports` | yes (TCP/UDP); ICMP-special | `src_port` carries the ICMP identifier word from bytes 4-5 of the ICMP header (meaningful for Echo Request/Reply, opaque otherwise) |
 | `destination_ports` | yes (TCP/UDP); ICMP-zero | `dst_port` is 0 for ICMP |
 | `dscp_values` / `dscp_bitmap` (+ `dscp_match_enabled`) | NO — cache-sensitive | see #1430 pattern below |
 | (future) `tos_match` / ECN bits (non-DSCP TOS) | NO — cache-sensitive | TOS lower bits and ECN vary per packet |

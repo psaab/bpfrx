@@ -4890,3 +4890,11 @@ top.
   - AGY r1: MERGE-READY
   - Copilot r1: COMMENTED with 2 inline findings → fixes applied
   - Claude SMR: MERGE-READY (doc on branch)
+
+## 2026-05-27 — #1431 copilot re-review wording follow-up
+
+- **Timestamp**: 05:10 UTC
+- **Action**: corrected README wording from "bytes 4-6" to "bytes 4-5" for ICMP identifier extraction so docs match `parse_flow_ports` range `l4 + 4..l4 + 6` (two bytes).
+- **File(s)**:
+  - `userspace-dp/src/filter/README.md`
+  - `_Log.md` (this entry)
