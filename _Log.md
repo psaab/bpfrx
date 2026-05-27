@@ -4744,3 +4744,31 @@ top.
   - AGY r2: MERGE-READY
   - Copilot r1: COMMENTED w/ 3 inline findings, all addressed in d013302748 + 0e2a88c8b
   - Codex: 3 consecutive sandbox failures (`unified-exec` blocked)
+
+## 2026-05-27
+
+- **Timestamp**: 03:34 UTC
+- **Action**: #1563 fix — `cli -c` non-TTY segfault. Plan v1→v3
+  through Codex + AGY adversarial review (3 rounds). v1
+  nil-guarded the cosmetic SetPrompt sites; v2 added bufio
+  fallback for `load terminal` and quoted configLockInterceptor
+  to argue daemon self-cleanup; v3 converged on hard-erroring
+  `configure` in `-c` mode after both reviewers caught that
+  (a) configLockInterceptor is a Unary Interceptor and doesn't
+  fire on connection close (lock leak), (b) `load` is not in
+  operational dispatch so the bufio work was solving an
+  unreachable code path. Implementation: hard-error `configure`
+  when `c.rl == nil`, factored `confirmYes()` helper in
+  request.go for the three destructive prompt sites
+  (reboot/halt/zeroize/ISSU), defensive nil-guards in
+  dispatchConfig SetPrompt sites. Tests: 4 new tests in
+  `cmd/cli/nontty_test.go` using interface-embedding fake gRPC
+  client; full cmd/cli suite green (5/5 flake); full Go suite
+  green.
+- **File(s)**:
+  - `cmd/cli/shared.go` (configure hard-error + dispatchConfig defensive guards)
+  - `cmd/cli/request.go` (confirmYes helper + 3 site refactors)
+  - `cmd/cli/nontty_test.go` (new)
+  - `docs/pr/1563-cli-c-nontty-fix/plan.md` (new)
+- **Status**: PR opened — AWAITING-BATCH-MERGE; smoke-runner
+  picks up via `<!-- AWAITING-SMOKE -->` marker.

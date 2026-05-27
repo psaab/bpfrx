@@ -214,6 +214,25 @@ func (c *ctl) dispatchOperational(line string) error {
 
 	switch parts[0] {
 	case "configure":
+		// Hard-error when the readline instance is nil (i.e. `cli -c
+		// "configure"` from a non-TTY context). Entering configuration
+		// mode without a follow-up interactive command is useless: -c
+		// runs a single command and exits, so the configMode flag is
+		// immediately discarded. Worse, the daemon-side gRPC
+		// configLockInterceptor (pkg/grpcapi/server.go) is a UNARY
+		// interceptor — it only fires while an RPC is in flight, never
+		// on connection close. Issuing EnterConfigure here and exiting
+		// would leak the daemon-side config lock until daemon restart.
+		// Exclusive locks are especially bad: EnterConfigureExclusive
+		// sets `exclusiveHolder`, but ExitConfigureSession only
+		// releases when the session matches `configHolder`, so even
+		// an explicit teardown call wouldn't recover them.
+		// See #1563.
+		if c.rl == nil {
+			return fmt.Errorf(
+				"configuration mode requires an interactive terminal " +
+					"(TTY); not available in -c mode")
+		}
 		exclusive := len(parts) >= 2 && parts[1] == "exclusive"
 		_, err := c.client.EnterConfigure(c.ctx(), &pb.EnterConfigureRequest{
 			Exclusive: exclusive,
@@ -280,13 +299,17 @@ func (c *ctl) dispatchConfig(line string) error {
 			return nil
 		}
 		c.editPath = append(c.editPath, parts[1:]...)
-		c.rl.SetPrompt(c.configPrompt())
+		if c.rl != nil {
+			c.rl.SetPrompt(c.configPrompt())
+		}
 		fmt.Printf("[edit %s]\n", strings.Join(c.editPath, " "))
 		return nil
 
 	case "top":
 		c.editPath = nil
-		c.rl.SetPrompt(c.configPrompt())
+		if c.rl != nil {
+			c.rl.SetPrompt(c.configPrompt())
+		}
 		fmt.Println("[edit]")
 		return nil
 
@@ -294,7 +317,9 @@ func (c *ctl) dispatchConfig(line string) error {
 		if len(c.editPath) > 0 {
 			c.editPath = c.editPath[:len(c.editPath)-1]
 		}
-		c.rl.SetPrompt(c.configPrompt())
+		if c.rl != nil {
+			c.rl.SetPrompt(c.configPrompt())
+		}
 		if len(c.editPath) > 0 {
 			fmt.Printf("[edit %s]\n", strings.Join(c.editPath, " "))
 		} else {
@@ -411,7 +436,9 @@ func (c *ctl) dispatchConfig(line string) error {
 		_, _ = c.client.ExitConfigure(c.ctx(), &pb.ExitConfigureRequest{})
 		c.configMode = false
 		c.editPath = nil
-		c.rl.SetPrompt(c.operationalPrompt())
+		if c.rl != nil {
+			c.rl.SetPrompt(c.operationalPrompt())
+		}
 		fmt.Println("Exiting configuration mode")
 		return nil
 
