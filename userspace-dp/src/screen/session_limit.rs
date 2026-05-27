@@ -11,7 +11,11 @@ pub(super) struct SessionLimitTracker {
 }
 
 impl SessionLimitTracker {
-    /// Increment session count for a source IP. Returns true if limit exceeded.
+    /// Look up the current session count for a source IP and return true
+    /// if it already meets or exceeds `limit`. This does NOT increment —
+    /// the count is moved by [`session_created`] / [`session_expired`].
+    /// The orchestrator runs this BEFORE session creation so the
+    /// (limit+1)-th attempt is dropped.
     pub(super) fn check_src(&mut self, ip: IpAddr, limit: u32) -> bool {
         if limit == 0 {
             return false;
@@ -20,7 +24,9 @@ impl SessionLimitTracker {
         *count >= limit
     }
 
-    /// Increment session count for a destination IP. Returns true if limit exceeded.
+    /// Look up the current session count for a destination IP and return
+    /// true if it already meets or exceeds `limit`. Mirror of
+    /// [`check_src`]; does NOT increment the count.
     pub(super) fn check_dst(&mut self, ip: IpAddr, limit: u32) -> bool {
         if limit == 0 {
             return false;

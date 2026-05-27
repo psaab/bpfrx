@@ -65,6 +65,15 @@ pub(super) fn check_tcp_flag_screens(
 }
 
 /// Ping of Death: oversized ICMP (>65535 bytes total length).
+///
+/// Mirror of the BPF screen `SCREEN_PING_OF_DEATH` check. With the
+/// current `ScreenPacketInfo::pkt_len: u16` shape the cast-to-u32
+/// comparison `pkt.pkt_len as u32 > 65535` is structurally
+/// unreachable (the u16 maxes at 65535), but the predicate is kept
+/// intact for BPF parity and so the check fires automatically if a
+/// future widening of `pkt_len` (e.g. to track reassembled
+/// IPv6-jumbo payloads) restores the oversized case without a code
+/// change here.
 #[inline]
 pub(super) fn check_ping_of_death(
     profile: &ScreenProfile,

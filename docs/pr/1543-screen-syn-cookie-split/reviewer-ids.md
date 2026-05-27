@@ -19,4 +19,10 @@ Codex-stuck 3-of-4 exception in Wave-5 rules.
 
 | Round | Codex task-id | AGY task-id | Copilot? | Codex verdict | AGY verdict |
 |------:|---------------|-------------|----------|---------------|-------------|
-| 1     | TBD           | TBD         | TBD      | TBD           | TBD         |
+| 1     | task-mpnanp2y-1smbje | adversarial-review-mpnany1s-k6n3e5 | requested via @copilot review on PR #1597 | INFRA-BLOCKED | MERGE-READY |
+
+Codex code review also sandbox-infra-blocked (4th consecutive
+infra failure across this PR). Claude SMR code review: MERGE-READY
+(verified pure code motion, drop precedence, side-effect ordering,
+visibility, hot-path codegen, compile-time invariants, dead-code
+attributes, pre-existing test failure attribution).
