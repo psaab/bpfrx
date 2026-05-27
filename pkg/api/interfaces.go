@@ -29,7 +29,12 @@ func (s *Server) interfacesHandler(w http.ResponseWriter, _ *http.Request) {
 
 	var result []InterfaceStats
 	for ifName := range allInterfaceNames(cfg) {
-		iface, err := net.InterfaceByName(ifName)
+		// Translate Junos config name to Linux kernel ifname before
+		// the kernel lookup. Config names may contain '/' (e.g.
+		// "ge-0/0/0", forbidden by IFNAMSIZ) or be virtual aliases
+		// (reth0, fab0, irb.0, gr-0/0/0.0) that don't directly map
+		// to a kernel ifindex. See #1565.
+		iface, err := net.InterfaceByName(cfg.ResolveKernelIfName(ifName))
 		is := InterfaceStats{
 			Name: ifName,
 			Zone: ifZone[ifName],
@@ -207,7 +212,10 @@ func (s *Server) writeInterfacesDetail(w http.ResponseWriter, cfg *config.Config
 	sort.Strings(ifNames)
 
 	for _, ifName := range ifNames {
-		iface, err := net.InterfaceByName(ifName)
+		// Translate Junos config name to Linux kernel ifname before
+		// kernel lookups (#1565).
+		kernel := cfg.ResolveKernelIfName(ifName)
+		iface, err := net.InterfaceByName(kernel)
 		if err != nil {
 			fmt.Fprintf(&b, "Interface: %s, Not present\n\n", ifName)
 			continue
@@ -217,7 +225,7 @@ func (s *Server) writeInterfacesDetail(w http.ResponseWriter, cfg *config.Config
 		if iface.Flags&net.FlagUp != 0 {
 			linkUp = "Up"
 		}
-		if data, err := os.ReadFile("/sys/class/net/" + ifName + "/operstate"); err == nil {
+		if data, err := os.ReadFile("/sys/class/net/" + kernel + "/operstate"); err == nil {
 			if strings.TrimSpace(string(data)) == "up" {
 				linkUp = "Up"
 			}
@@ -248,13 +256,22 @@ func (s *Server) writeInterfacesDetail(w http.ResponseWriter, cfg *config.Config
 			}
 		}
 
-		// DHCP annotations
+		// DHCP annotations — key by the daemon's actual lease-key
+		// shape (LinuxIfName(configRef)+ ".VlanID" when > 0).
+		// This is distinct from the kernel link name (#1565).
 		if s.dhcp != nil {
-			if lease := s.dhcp.LeaseFor(ifName, dhcp.AFInet); lease != nil {
-				fmt.Fprintf(&b, "  DHCPv4: %s (gw %s)\n", lease.Address, lease.Gateway)
+			base := strings.SplitN(ifName, ".", 2)[0]
+			unitNum := 0
+			if parts := strings.SplitN(ifName, ".", 2); len(parts) == 2 {
+				fmt.Sscanf(parts[1], "%d", &unitNum)
 			}
-			if lease := s.dhcp.LeaseFor(ifName, dhcp.AFInet6); lease != nil {
-				fmt.Fprintf(&b, "  DHCPv6: %s (gw %s)\n", lease.Address, lease.Gateway)
+			if key, ok := cfg.DHCPLeaseKey(base, unitNum); ok {
+				if lease := s.dhcp.LeaseFor(key, dhcp.AFInet); lease != nil {
+					fmt.Fprintf(&b, "  DHCPv4: %s (gw %s)\n", lease.Address, lease.Gateway)
+				}
+				if lease := s.dhcp.LeaseFor(key, dhcp.AFInet6); lease != nil {
+					fmt.Fprintf(&b, "  DHCPv6: %s (gw %s)\n", lease.Address, lease.Gateway)
+				}
 			}
 		}
 

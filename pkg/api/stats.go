@@ -61,7 +61,8 @@ func (s *Server) ifaceStatsHandler(w http.ResponseWriter, _ *http.Request) {
 
 	var result []InterfaceStats
 	for ifName := range allInterfaceNames(cfg) {
-		iface, err := net.InterfaceByName(ifName)
+		// Translate Junos config name to Linux kernel ifname (#1565).
+		iface, err := net.InterfaceByName(cfg.ResolveKernelIfName(ifName))
 		if err != nil {
 			continue
 		}

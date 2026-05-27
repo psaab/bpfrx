@@ -4077,3 +4077,7 @@ top.
 - **Action**: Close 4 round-5 minors (stale fab text, drift-guard nil-unit + branch coverage, redundant-parent grammar, Atoi error fallback)
 - **File(s)**: docs/pr/1565-iface-name-translate/plan.md
 - **Verdict**: Codex r5 PLAN-NEEDS-MINOR (4 minors all closed in v6); AGY r5 PLAN-READY (one drift-guard test setup note also closed in v6). Plan moves to implementation.
+
+## 04:01 UTC — #1565 implementation complete
+- **Action**: Add (*Config).ResolveKernelIfName + DHCPLeaseKey; rewrite 4 pkg/api sites; add SeedLeaseForTesting; 12 unit + 2 handler + 1 drift-guard tests all pass 5/5; go vet clean on modified pkgs; full Go suite passes
+- **File(s)**: pkg/config/types.go, pkg/config/types_test.go, pkg/api/interfaces.go, pkg/api/stats.go, pkg/api/metrics_counters.go, pkg/api/iface_name_test.go, pkg/dhcp/test_seams.go, pkg/dataplane/userspace/interfaces.go, pkg/dataplane/userspace/interfaces_test.go, pkg/daemon/daemon_dhcp.go
