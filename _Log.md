@@ -4772,3 +4772,16 @@ top.
   - `docs/pr/1563-cli-c-nontty-fix/plan.md` (new)
 - **Status**: PR opened — AWAITING-BATCH-MERGE; smoke-runner
   picks up via `<!-- AWAITING-SMOKE -->` marker.
+
+## 2026-05-26 — #1431 plan v1 draft
+
+- **Timestamp**: 03:22 UTC
+- **Action**: drafted #1431 cache-invariant contract + harness plan v1
+- **File(s)**: `docs/pr/1431-filter-cache-invariants/plan.md` (new)
+- **Status**: DRAFT v1 — pending Codex + AGY adversarial plan review
+- **Scope**: contract + test harness for "future per-packet match
+  fields" so a hypothetical TCP-flags / fragment / IHL / IP-options
+  addition to `FilterTerm` cannot quietly bypass flow-cache. No
+  runtime change planned; PLAN-KILL acceptable if reviewers conclude
+  the harness is overkill versus disciplined PR review on the next
+  per-packet field addition.
