@@ -1,29 +1,72 @@
 # #1431 — userspace filters: preserve cache invariants for future per-packet match fields
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** DRAFT v2 — pending adversarial plan review round 2
 
-## 1. Issue framing
+**v1 verdict log (preserved verbatim):**
+
+- Codex r1 (`task-mpni1t2r-fmeyxk`): **PLAN-KILL** with salvage path.
+  Key findings (verbatim summary):
+  1. Existing #1430 hooks verified.
+  2. lo0 is NOT a flow-cache gap. `LocalDelivery` is non-cacheable
+     in `types/forwarding.rs:181`; `FlowCacheEntry::from_forward_decision`
+     refuses non-cacheable decisions at `flow_cache.rs:221`.
+     lo0 is evaluated per-packet on both miss and hit paths in
+     `poll_descriptor/mod.rs:700,1153`.
+  3. Q3 premise was wrong. ICMP `src_port` is the echo identifier
+     from `parse_flow_ports` at `inspect.rs:225`, NOT type/code. An
+     explicit ICMPType/ICMPCode filter field is cache-sensitive.
+  4. §4.2 was doc-by-code: Rust has no reflection; `size_of` cannot
+     count `FilterTerm` fields. A manual constant list only checks
+     fields already remembered by the author.
+  5. The failure mode is plausible, but the harness only catches
+     "field added to harness but gate forgotten" — it does NOT
+     catch "field added and harness/list forgotten," the actual
+     scary case.
+  6. Fake-field harness arm is unsound. `from_forward_decision`
+     only sees real `FilterState`/`FilterTerm`. A synthetic match
+     cannot drive real filter semantics without adding test-only
+     fields to production structs.
+  7. Do not parameterize `dscp_sensitive_filter_semantics_match`
+     today — premature with one consumer.
+  8. Policers orthogonal — keep runtime-shape comparison as-is.
+  9. Architectural cost net negative as written.
+  10. Do not touch legacy BPF helpers; settled rule per CLAUDE.md.
+  Codex salvage: "rewrite as a narrower README contract plus a
+  real DSCP harness instantiation, and explicitly drop the
+  fake-field proof and the 'automatic field inventory' claim."
+
+- AGY r1 (`review-mpni22am-c41y7k`): **PLAN-NEEDS-MAJOR** with
+  congruent rewrite path. Key findings:
+  1. Existing #1430 hooks verified.
+  2. lo0 confirmed non-cacheable; no scope shift needed.
+  3. ICMP type/code confirmed NOT in cache key (`parse_flow_ports`
+     stores `(ident, 0)` for ICMP); proposed mechanism's ICMP
+     premise was wrong.
+  4. §4.2 is compile-time theater; PLAN-KILL §4.2 specifically.
+  5. §4.3's negative-case arm "structurally impossible without
+     polluting `FilterTerm`."
+  6. Failure mode is real but disciplined PR review is the
+     defense, not the harness.
+  7. Lean: paste later for `dscp_sensitive_filter_semantics_match`.
+  8. Net negative maintenance.
+  Action plan: delete §4.2 entirely; delete §4.3 negative-case arm;
+  add an in-source contract comment block on `FilterTerm` itself;
+  keep the positive-case (DSCP) harness arm.
+
+Both reviewers converge on: keep README contract + add a real DSCP
+harness as the first instantiation, drop the speculative
+PER_PACKET_MATCH_FIELDS list and the fake-field test.
+
+## 1. Issue framing (UNCHANGED FROM v1)
 
 PR #1430 closed the immediate filter-log enforcement gaps by treating
-DSCP — the one per-packet match field currently representable in
-`FilterTerm` outside the 5-tuple — as cache-sensitive metadata:
-
-- DSCP-sensitive input/output filters decline flow-cache insertion.
-- Established session hits re-evaluate DSCP-sensitive input filters.
-- Forwarding rotations that add, remove, or semantically change
-  DSCP-sensitive input filters conservatively purge affected sessions.
-- The purge comparison uses stable filter/term names and three-color
-  policer shape, not compiler-positional IDs.
-
-#1431 carries the round-5 follow-up forward: TOS (non-DSCP bits),
-IPv4/IPv6 fragment fields, IPv4 IHL, IP options, TCP flags, ICMP
-type/code, and any other future per-packet match are NOT currently
-represented in `FilterTerm`. The Go config struct `FirewallFilterTerm`
-already names some of them (`TCPFlags`, `IsFragment`, `ICMPType`,
-`ICMPCode`, `FlexMatch`), but the wire DTO `FirewallTermSnapshot`
-and the Rust `FilterTerm` never carry them. The next time any of
-those fields lands in the userspace AST, the implementer must
-either add it to the session/flow-cache key or treat it as
+DSCP as cache-sensitive metadata. #1431 carries the round-5 follow-up
+forward: TOS (non-DSCP bits), IPv4/IPv6 fragment fields, IPv4 IHL,
+IP options, TCP flags, ICMP type/code, and any other future per-packet
+match are NOT currently represented in `FilterTerm`. The wire
+`FirewallTermSnapshot` and the Rust `FilterTerm` never carry them.
+When any of these fields lands in the userspace AST, the implementer
+must either add it to the session/flow-cache key or treat it as
 cache-sensitive — and the codebase must make the wrong choice loud
 rather than silent.
 
@@ -34,38 +77,75 @@ The required invariant from the issue, verbatim:
 > forwarding decision for later packets that can differ on those
 > fields.
 
-## 2. Honest scope/value framing
+## 2. Scope after v1 review
 
-This work is primarily a **contract + harness PR**, not a runtime
-change. No new per-packet match field is being added in this scope.
-The win is structural: when someone in a future PR adds
-`tcp_flags_match`, `fragment_offset_match`, `ihl_match`, or a
-`flex_match`, the codebase forces them to pick a side (cache-key vs
-cache-sensitive) and instruments tests that would fail if they
-silently picked neither.
+This v2 plan adopts the Codex / AGY salvage path:
 
-Absolute scale of the runtime perf hit if we get this wrong:
-the failure mode is a stale flow-cache hit for a packet that
-should have been dropped or rerouted. The user-visible symptom
-on a misconfigured filter is the same class of bug #1430
-already fixed for DSCP: a first-packet accept on `dscp 0` gets
-replayed for later packets with `dscp 46` and the EF-discard
-term is silently bypassed. The user-visible symptom on a
-forwarding rotation is stale session reuse against a changed
-filter. Both are correctness bugs, not perf bugs.
+1. **README contract section** in `userspace-dp/src/filter/README.md`
+   describing the cache-key invariant, listing every match field on
+   the wire DTO and `FilterTerm` with explicit "cache-key" vs
+   "cache-sensitive" classification, and pointing at the existing
+   #1430 hooks as the runbook for path (b) — including the
+   verified fact that `LocalDelivery` is non-cacheable so lo0
+   filters do not need their own cache-sensitive gate.
 
-If reviewers conclude the contract / harness can be replaced
-by a one-paragraph README addition and a single grep for new
-match fields, **PLAN-KILL is an acceptable verdict**. The
-question is whether the failure mode is plausible enough — and
-the codebase's existing #1430 helpers are centralized enough —
-to need a compile-time or test-time tripwire.
+2. **In-source contract block** as a doc comment on `FilterTerm`
+   itself in `userspace-dp/src/filter/mod.rs`. This is the loud
+   reviewer-facing tripwire — anyone adding a match field to
+   `FilterTerm` will read the comment in the diff. AGY's
+   recommendation: "place a loud, blocking comment right next to
+   the fields." Same comment block placed on
+   `FirewallTermSnapshot` in `protocol/security.rs` so the wire
+   DTO also carries the contract.
 
-## 3. What's already shipped / partially batched
+3. **A real DSCP harness** at
+   `userspace-dp/src/filter/cache_invariant_harness.rs` (cfg(test)
+   only). The harness exercises:
+   - flow-cache insertion gate via
+     `FlowCacheEntry::from_forward_decision` (positive case: cache
+     declined when DSCP-sensitive input or output filter is bound).
+   - established-session re-evaluation via the public
+     `evaluate_dscp_sensitive_input_filter_on_session_hit` path
+     (positive case: re-eval fires when DSCP-sensitive).
+   - forwarding rotation purge via the public
+     `input_dscp_filter_families_changed` predicate (positive case:
+     fires when sensitive content changes, does NOT fire on
+     positional-ID-only changes).
 
-PR #1430 landed the DSCP-specific implementation, which serves
-as the reference pattern. The relevant surface today (`master`
-@ `e07f733a6`):
+   The DSCP case becomes the first concrete instantiation of the
+   harness. The harness is built around real
+   `FirewallFilterSnapshot` / `FirewallTermSnapshot` snapshots — no
+   synthetic test-only fields are added to production structs.
+   No `PER_PACKET_MATCH_FIELDS` constant list, no `trait
+   PerPacketMatchField`, no fake-field negative-case test.
+
+4. **What is explicitly NOT in scope** (changed from v1):
+   - PER_PACKET_MATCH_FIELDS constant list — DELETED. Codex r1 and
+     AGY r1 both flagged it as compile-time theater. Manual list
+     plus `size_of` cannot count `FilterTerm` fields; Rust has no
+     reflection for this.
+   - Trait `PerPacketMatchField` — DELETED. Documentation in code,
+     not enforcement.
+   - Fake-field negative-case harness arm
+     (`cache_sensitive_harness_fake_field_uncovered_fails`) —
+     DELETED. AGY r1 and Codex r1 both pointed out: cannot
+     synthesize a per-packet match field without polluting
+     `FilterTerm` layout; if you mock the matching engine, you're
+     testing the harness, not the dataplane.
+   - lo0 DSCP "gap" closure — DELETED FROM CONCERN. Verified:
+     `LocalDelivery` is non-cacheable
+     (`types/forwarding.rs::is_cacheable` returns false for it),
+     and lo0 filter evaluation runs per-packet on both miss and
+     hit paths at `poll_descriptor/mod.rs:700,1153`. The README
+     contract documents this so a future reader does not chase
+     the same false alarm.
+   - Parameterizing `dscp_sensitive_filter_semantics_match`.
+     Both reviewers said "paste later when the second cache-
+     sensitive field actually lands."
+
+## 3. What's already shipped / partially batched (UNCHANGED)
+
+Reference call sites for the #1430 pattern:
 
 - `FilterTerm.dscp_match_enabled` / `dscp_bitmap` —
   `userspace-dp/src/filter/mod.rs:61-62`
@@ -87,14 +167,12 @@ as the reference pattern. The relevant surface today (`master`
 - `filter_term_semantics_match()` /
   `dscp_sensitive_filter_semantics_match()` —
   `userspace-dp/src/filter/engine/cache_sensitive.rs:104-143`
-- README cache-sensitive doc paragraph —
-  `userspace-dp/src/filter/README.md:31-38`
-- DSCP-specific flow-cache + filter tests —
-  `userspace-dp/src/afxdp/flow_cache_tests.rs:643-745`,
-  `userspace-dp/src/filter/tests.rs:1683+`,
+- DSCP flow-cache regression tests —
+  `userspace-dp/src/afxdp/flow_cache_tests.rs:643-745`
+- DSCP rotation tests —
   `userspace-dp/src/filter/tests.rs:1733-2000`
 
-The 5-tuple session/flow-cache key today —
+The 5-tuple session/flow-cache key —
 `userspace-dp/src/session/key.rs:9-17`:
 
 ```rust
@@ -108,367 +186,270 @@ pub(crate) struct SessionKey {
 }
 ```
 
-Per-packet fields not in the key today: DSCP (already cache-
-sensitive), TCP flags, fragment offset / MF bit, IHL, IPv6 ext
-headers, IP options, ICMP type/code (in the L4 layout but not
-in the key for non-ICMP / for ICMP-of-different-direction), the
-flex-match window. The wire `FirewallTermSnapshot`
-(`userspace-dp/src/protocol/security.rs:60-89`) names:
-`source_addresses`, `destination_addresses`, `protocols`,
-`source_ports`, `destination_ports`, `dscp_values`, `action`,
-`count`, `log`, `policer`, `routing_instance`,
-`forwarding_class`, `dscp_rewrite`. **None of the per-packet
-non-5-tuple non-DSCP fields are on the wire today**, confirming
-the issue's "intentionally deferred" framing.
+ICMP key derivation (corrected from v1) — for `PROTO_ICMP` and
+`PROTO_ICMPV6`, `parse_flow_ports` reads `frame[l4+4..l4+6]` and
+stores `(identifier, 0)` (`userspace-dp/src/afxdp/frame/inspect.rs:225`).
+ICMP type and code are NOT in the session key. An ICMPType /
+ICMPCode filter field would be cache-sensitive unless `SessionKey`
+or metadata are extended.
 
-## 4. Concrete design
+`LocalDelivery` cacheability (corrected from v1) —
+`userspace-dp/src/afxdp/types/forwarding.rs:196` shows
+`is_cacheable()` returns true only for `ForwardCandidate` and
+`FabricRedirect`. `LocalDelivery`-disposition packets do not enter
+the flow-cache and lo0 filter evaluation runs per-packet, so lo0
+filters do not need a per-interface `has_dscp_match` set.
 
-### 4.1 The contract (written, machine-checked where possible)
+## 4. Concrete design (v2)
 
-Add a new doc section to `userspace-dp/src/filter/README.md`
-titled **"Cache-key invariants for per-packet match fields"**.
-Required content for the doc:
+### 4.1 README contract section
 
-1. A table listing every match field on `FirewallTermSnapshot`
-   (wire) AND every match field on `FilterTerm` (runtime). For
-   each row: **in cache key?** (`src_ip`/`dst_ip`/`protocol`/
-   `src_port`/`dst_port`/`addr_family` ⇒ yes; DSCP ⇒ no, cache-
-   sensitive; future ⇒ must be filled in).
-2. A two-sentence rule: *"Adding a per-packet match field to
-   `FilterTerm` requires picking exactly one of (a) extending
-   `SessionKey` and all its consumers, or (b) treating the
-   filter as cache-sensitive via the #1430 pattern. The
-   compiler aggregate `Filter.has_X_match_terms` and the
-   per-interface `FilterState.iface_filter_v{4,6}_has_X_match`
-   set are the two structural hooks the cache-sensitive path
-   uses."*
-3. The list of files the implementer MUST update for path (b),
-   pointing at the existing DSCP-pattern call sites (the eight
-   bullets in §3 above). This is the runbook.
+Add a new section to `userspace-dp/src/filter/README.md` titled
+**"Cache-key invariants for per-packet match fields"**. Required
+content:
 
-### 4.2 The structural hooks (compile-time tripwire)
+1. **The invariant** (issue's wording verbatim):
+   *When a filter match depends on packet fields that are not part
+   of the cache key, the dataplane must not reuse a first-packet
+   forwarding decision for later packets that can differ on those
+   fields.*
 
-Introduce a single trait + per-field tag, replacing the
-informal "by convention" pattern with a structural type-level
-hook. Sketch:
+2. **The cache key**: cite the six fields of `SessionKey`
+   (`addr_family`, `protocol`, `src_ip`, `dst_ip`, `src_port`,
+   `dst_port`). For ICMP, document that `src_port` carries the
+   identifier and `dst_port` is zero — ICMP type and code are NOT
+   in the key.
+
+3. **The classification table** for every field on
+   `FirewallTermSnapshot` and `FilterTerm` today:
+
+   | Field | In cache key? | Notes |
+   |-------|---------------|-------|
+   | `source_addresses` / `source_v4` / `source_v6` | yes | `src_ip` in `SessionKey` |
+   | `destination_addresses` / `dest_v4` / `dest_v6` | yes | `dst_ip` |
+   | `protocols` / `protocol_bitmap` | yes | `protocol` |
+   | `source_ports` | yes (TCP/UDP); ICMP-special | `src_port` carries ICMP identifier |
+   | `destination_ports` | yes (TCP/UDP); ICMP-zero | `dst_port` is 0 for ICMP |
+   | `dscp_values` / `dscp_bitmap` | NO — cache-sensitive | see #1430 pattern below |
+   | (future) `tcp_flags_match` | NO — cache-sensitive | TCP flags vary per packet |
+   | (future) `is_fragment` / fragment offset / MF | NO — cache-sensitive | only first fragment carries L4 |
+   | (future) `ihl_match` / IP options | NO — cache-sensitive | IHL varies per packet |
+   | (future) `icmp_type_match` / `icmp_code_match` | NO — cache-sensitive (today) | could be promoted to cache-key by adding (type, code) to `SessionKey` for ICMP sessions |
+   | (future) `flex_match` | NO — cache-sensitive | byte-offset match, fully per-packet |
+
+4. **The runbook for path (b) — cache-sensitive**: list the eight
+   call sites in §3 above and the four-step recipe:
+   - extend the per-interface `iface_filter_v{4,6}_has_<X>_match`
+     set on `FilterState`;
+   - add a `Filter.has_<X>_match_terms` aggregate flag;
+   - add a `interface_input_filter_has_<X>_match` /
+     `_output_` helper (or thread the new flag through one
+     general helper if the existing DSCP one is generalized
+     later);
+   - wire the gate at `flow_cache.rs:297-309`, the re-eval at
+     `poll_descriptor/mod.rs:217-244`, and the rotation purge at
+     `worker/loop_body/mod.rs:295-330`;
+   - extend the existing positive-case harness in
+     `filter/cache_invariant_harness.rs` with a new
+     `harness_<X>_input_gate_test` and `_output_gate_test`.
+
+5. **The runbook for path (a) — extend `SessionKey`**: brief
+   pointer to the prerequisites — HA sync compatibility, session-
+   table reverse indices, flow_cache key derivation, session
+   expiry hash, key comparison cost. Path (a) requires a tracker
+   issue and review against `session/key.rs`.
+
+6. **lo0 reminder**: `LocalDelivery` is non-cacheable, lo0
+   filters are evaluated per-packet, so they do NOT need a
+   per-interface cache-sensitive set. Stated so a future reader
+   does not duplicate v1's false-alarm investigation.
+
+### 4.2 In-source contract block
+
+Add a doc-comment block on `FilterTerm` in
+`userspace-dp/src/filter/mod.rs` directly above the struct:
 
 ```rust
-// userspace-dp/src/filter/cache_contract.rs (new file)
-
-/// Marker for a packet field that participates in filter matching
-/// but is NOT in the 5-tuple `SessionKey`. Every such field MUST
-/// either be added to `SessionKey` (and prove stability for every
-/// consumer) or be treated as cache-sensitive — see
-/// `userspace-dp/src/filter/README.md` "Cache-key invariants".
-pub(crate) trait PerPacketMatchField {
-    /// Stable name used in the per-interface `has_X_match` set
-    /// names and in the README contract table.
-    const FIELD_NAME: &'static str;
-
-    /// Returns `true` iff this match field is part of `SessionKey`.
-    /// If `false`, the implementor MUST wire a cache-sensitive
-    /// per-interface set on `FilterState` AND a
-    /// `Filter.has_<field>_match_terms` aggregate AND a
-    /// `<field>_sensitive_filter_semantics_match()` predicate.
-    const IN_SESSION_KEY: bool;
-}
-
-/// Compile-time list of every per-packet match field the codebase
-/// is aware of. Adding a per-packet match field is a *deliberate*
-/// edit to this list — if you skip it, the
-/// `cache_contract_lists_all_fields` test fails by counting
-/// `FilterTerm` `*_match_enabled` flags vs entries here.
-pub(crate) const PER_PACKET_MATCH_FIELDS: &[(&str, bool)] = &[
-    ("src_ip",      true),
-    ("dst_ip",      true),
-    ("protocol",    true),
-    ("src_port",    true),
-    ("dst_port",    true),
-    ("dscp",        false), // cache-sensitive, see #1430
-    // Future entries land here. Picking `true` requires extending
-    // SessionKey and ALL its consumers. Picking `false` requires
-    // the cache-sensitive runbook in README.md.
-];
-
-#[cfg(test)]
-mod cache_contract_tests {
-    // Tripwire 1: count `*_match_enabled` flags on FilterTerm via a
-    //             tiny proc-macro-free derive (manual constant list
-    //             updated by hand; reviewers verify by diff).
-    // Tripwire 2: every cache-sensitive field has a matching
-    //             FilterState.iface_filter_v{4,6}_has_<name>_match
-    //             field — checked by a `compile_pass` test that
-    //             references each field by name.
-    // Tripwire 3: every cache-sensitive field has a matching
-    //             `Filter.has_<name>_match_terms` flag — same.
-    // Tripwire 4: a synthetic filter with an opt-in fake new
-    //             per-packet match field exercises the test
-    //             harness in §4.3 and FAILS the harness if the
-    //             implementer forgets to gate flow-cache insertion.
-}
+// ============================================================
+// CACHE-KEY INVARIANT (#1431)
+//
+// Every field on FilterTerm that participates in matching MUST
+// be classified:
+//
+//   (a) IN cache key — extend SessionKey in session/key.rs AND
+//       prove key stability for HA sync, session-table reverse
+//       indices, flow_cache key derivation, expiry hash, and
+//       reverse-NAT lookup. File a tracker issue.
+//
+//   (b) NOT in cache key (cache-sensitive) — wire the #1430
+//       runbook: per-interface has_<X>_match set, Filter
+//       aggregate flag, flow-cache insertion gate, established-
+//       session re-evaluation, and forwarding rotation purge.
+//       See userspace-dp/src/filter/README.md "Cache-key
+//       invariants for per-packet match fields."
+//
+// Skipping this classification SILENTLY breaks flow-cache: a
+// first-packet decision gets reused for later packets that
+// can differ on the new field. PR #1430 fixed this for DSCP;
+// the same class of bug applies to any future per-packet match.
+// ============================================================
 ```
 
-**Honest about the type-system limits:** Rust does not give us
-a "for every field on this struct, prove a trait is implemented"
-check without a proc-macro derive (which this repo intentionally
-avoids in `userspace-dp`). So tripwire 1 is a manual constant
-list plus a unit test that counts the `*_match_enabled` /
-`*_match` boolean flags on `FilterTerm` via `std::mem::size_of`
-or by a small `compile_error!` macro that fires when the count
-mismatches. The harness in §4.3 is the real enforcement; the
-trait is documentation in code.
+Mirror block placed above `FirewallTermSnapshot` in
+`userspace-dp/src/protocol/security.rs` so the wire DTO also
+carries the contract.
 
-### 4.3 The test harness (real enforcement)
+### 4.3 DSCP-positive harness
 
-A generic harness at
-`userspace-dp/src/filter/cache_invariant_harness.rs` (tests-only)
-that takes:
+Add `userspace-dp/src/filter/cache_invariant_harness.rs` (or
+co-locate at the bottom of `tests.rs` to avoid module noise;
+preferred location: bottom of `tests.rs` with a clear section
+comment, to avoid the maintenance cost of a new file for two
+tests). Three new tests:
 
-- A `FilterTerm` builder that opts a single per-packet match
-  field into the cache-sensitive class.
-- Two packets with the same 5-tuple but **different** values
-  for the chosen field.
-- The expected behavior on each: first-packet accept, second-
-  packet deny (or vice-versa).
+- `dscp_input_gate_blocks_flow_cache_insertion` — builds a
+  realistic `FirewallFilterSnapshot` with a DSCP match term,
+  binds it as v4 input filter on an interface, drives
+  `FlowCacheEntry::from_forward_decision`, asserts `None`.
+- `dscp_output_gate_blocks_flow_cache_insertion` — same for
+  output. (These extend coverage of the existing bespoke tests
+  at `flow_cache_tests.rs:643-745`; we keep the bespoke tests
+  and add these as the canonical "this is the harness pattern"
+  references.)
+- `dscp_rotation_does_not_fire_on_positional_id_change` —
+  parallel positive: rebuild two filter states whose content is
+  identical but whose filter / term positional IDs differ;
+  assert `input_dscp_filter_families_changed` returns
+  `(false, false)`. This is the regression for the round-5
+  carry-item rule "compare by content, not positional IDs."
 
-The harness then walks:
-
-1. `FlowCacheEntry::from_forward_decision()` with the first
-   packet — MUST return `None` if the field is declared cache-
-   sensitive.
-2. Established session hit path — MUST re-evaluate the input
-   filter against the second packet's field value.
-3. Rotation: swap the filter snapshot for one whose sensitive
-   field content has changed — `purge_sessions_for_input_*`
-   MUST fire.
-4. Negative parity: declare the field "in cache key" and verify
-   the cache DOES insert (proves the harness can distinguish
-   the two arms).
-
-The DSCP case becomes the first concrete instantiation of this
-harness, replacing the bespoke
-`from_forward_decision_skips_cache_for_dscp_matched_*` tests at
-`userspace-dp/src/afxdp/flow_cache_tests.rs:643-745` with a
-parameterized call — but only after parity is proven against
-the existing bespoke tests (keep them, add the harness on top).
-
-The harness is the **real** acceptance criterion: when a future
-PR adds e.g. TCP flags matching, the implementer extends
-`PER_PACKET_MATCH_FIELDS`, picks an arm, and adds one call to
-the harness. If they skip the cache-sensitive gates, the
-harness FAILS. If they extend `SessionKey` correctly, the
-"in cache key" arm of the harness PASSES.
-
-### 4.4 What about path (a) — extending `SessionKey`?
-
-Path (a) is the "add the field to the key" arm. It's
-inherently a much bigger refactor (HA sync, session_table
-indices, reverse-NAT lookup, key serialization). The plan does
-**not** preemptively add helpers for this arm — instead, the
-README contract requires the implementer to file an issue
-against `session/key.rs` enumerating: HA sync compatibility,
-session_table reverse indices, flow_cache key derivation,
-session expiry hash, key comparison cost. The cache-contract
-test for path (a) is: the field appears in `SessionKey`'s
-`Hash + Eq` derive — checked by a `compile_pass` test that
-references the field by name.
+That's three tests, all positive-case only. No fake field,
+no constant list, no trait.
 
 ## 5. Public API preservation
 
-- `FilterTerm` struct layout unchanged (only an additional doc
-  comment + an attached trait impl).
-- `Filter` struct gains no fields (the `has_X_match_terms` flag
-  is added per-field by future PRs; this PR ships only the
-  existing `has_dscp_match_terms`).
-- `FilterState` gains no fields.
+- `FilterTerm` struct layout — UNCHANGED. Only a new doc-comment
+  block above.
+- `Filter` — UNCHANGED.
+- `FilterState` — UNCHANGED.
 - `interface_input_filter_has_dscp_match` /
   `interface_output_filter_has_dscp_match` /
-  `input_dscp_filter_families_changed` — signatures unchanged.
-- `FlowCacheEntry::from_forward_decision` — signature unchanged;
-  body unchanged except possibly factoring the DSCP gate into a
-  helper named `flow_cache_can_insert_for_field` to make the
-  per-field gate visually consistent.
-- `purge_sessions_for_input_dscp_filter_revalidation` —
-  signature unchanged.
-- Wire DTO `FirewallTermSnapshot` — UNCHANGED. This PR adds no
-  wire fields.
+  `input_dscp_filter_families_changed` — signatures UNCHANGED.
+- `FlowCacheEntry::from_forward_decision` — body UNCHANGED.
+- `FirewallTermSnapshot` (wire DTO) — UNCHANGED. New doc-comment
+  block above.
 - `SessionKey` — UNCHANGED.
+
+This PR is documentation + tests. No runtime change.
 
 ## 6. Hidden invariants the change must preserve
 
-1. **Side-effect ordering on cached hits.** The cache-sensitive
-   gate runs BEFORE flow-cache insertion. Re-evaluation runs
-   BEFORE acting on a session hit. The rotation purge runs
-   BEFORE the new filter is applied to in-flight packets. The
-   harness must exercise all three orderings.
-2. **Allocation rules on the hot path.** No allocation in the
-   gate, the re-eval, or the rotation comparison. The existing
-   helpers are allocation-free; the harness must NOT
-   introduce hot-path allocation.
-3. **HA sync portability.** The contract states that path (a)
-   — adding to `SessionKey` — requires updating HA sync. The
-   harness for path (a) must include a smoke that the new key
-   bytes serialize and deserialize.
-4. **Stable-name purge comparison.** The existing
-   `dscp_sensitive_filter_semantics_match` ignores compiler-
-   positional `Filter.id` / `FilterTerm.id`. Any future per-
-   field equivalent MUST follow the same rule. The harness
-   provides a regression for "changing the term order without
-   changing content does not purge".
-5. **Three-color policer runtime shape.** Already in the
-   existing comparison helper — the contract preserves this.
-6. **lo0 filters.** lo0 input filters are evaluated against
-   host-bound traffic. The contract MUST list lo0 as a
-   participant — currently `FilterState.lo0_filter_v{4,6}_fast`
-   is NOT in the DSCP `has_dscp_match` per-interface set. If
-   lo0 filters can also be DSCP-sensitive (they can — they're
-   regular filters), the current implementation has a gap: a
-   lo0 input filter with DSCP match terms would NOT decline
-   flow-cache insertion. **Open question for reviewers — see
-   §11 Q1.**
-7. **Output filter family symmetry.** The DSCP gate handles
-   both input and output. Any future cache-sensitive field
-   MUST handle both arms.
+1. Side-effect ordering on cached hits, re-eval, and rotation
+   purge — already preserved by the #1430 hooks; harness only
+   exercises them.
+2. Allocation rules on the hot path — harness lives in
+   `#[cfg(test)]`, no hot-path impact.
+3. HA sync portability — out of scope; README documents path (a)
+   requires HA sync review.
+4. Stable-name purge comparison — exercised by the new positional-
+   ID-change-doesn't-fire test.
+5. Three-color policer runtime shape — already in
+   `dscp_sensitive_filter_semantics_match`; not regenerated.
+6. lo0 filters — documented as non-cacheable so future readers
+   don't redo the v1 false-alarm investigation.
 
 ## 7. Risk assessment
 
 | Class | Level | Notes |
 |-------|-------|-------|
-| Behavioral regression risk | LOW | No runtime path changes (harness + doc). DSCP gate still exercised by existing tests; the parameterized harness adds coverage, not replacement. |
-| Lifetime / borrow-checker risk | LOW | Harness consumes existing `pub(crate)` helpers; no new lifetimes introduced. |
-| Performance regression risk | NONE | No hot-path changes. Possibly a tiny refactor to a `flow_cache_can_insert_for_field` helper — measured `#[inline(always)]` to compile-out. |
-| Architectural mismatch risk | MEDIUM | The trait + constant-list "tripwire" is informal — Rust can't enforce "every per-packet field on FilterTerm is in the list" without a proc-macro. If reviewers conclude this is doc-by-another-name, PLAN-KILL is appropriate. The harness is the real enforcement. |
+| Behavioral regression risk | NONE | Doc + cfg(test) tests only. |
+| Lifetime / borrow-checker risk | NONE | New tests use existing pub(crate) helpers; no new lifetimes. |
+| Performance regression risk | NONE | No hot-path changes. |
+| Architectural mismatch risk | LOW | Both reviewers explicitly endorsed this salvage path. |
 
 ## 8. Test plan
 
-- `TMPDIR=/dev/shm CARGO_TARGET_DIR=/dev/shm/cargo cargo build` — clean.
-- `cargo test --release` — full cargo suite (952+ tests).
-- 5× flake check on
-  `from_forward_decision_skips_cache_for_dscp_matched_input_filter`
-  and `_output_filter` plus the new harness tests.
-- `go test ./...` — 30 Go packages (no Go-side code changes are
-  planned; this is regression coverage only).
+- `cargo build --release` clean.
+- `cargo test --release` — full suite passes; existing DSCP
+  flow-cache tests at `flow_cache_tests.rs:643-745` and DSCP
+  rotation tests at `filter/tests.rs:1733-2000` still pass.
+- New tests (three):
+  - `dscp_input_gate_blocks_flow_cache_insertion`
+  - `dscp_output_gate_blocks_flow_cache_insertion`
+  - `dscp_rotation_does_not_fire_on_positional_id_change`
+- 5× flake check on the three new tests.
+- `go test ./...` — no Go changes; regression coverage only.
 - Smoke on `loss:xpf-userspace-fw0/1` — v4+v6, push+reverse,
-  CoS-off + per-class. Strictly regression: no behavior change
-  is expected.
-- New tests added:
-  - `cache_contract_lists_all_known_match_fields` — counts
-    `*_match_enabled` flags on `FilterTerm` against the list.
-  - `cache_sensitive_harness_dscp_input` — reproduces #1430's
-    DSCP input gate via the parameterized harness.
-  - `cache_sensitive_harness_dscp_output` — same for output.
-  - `cache_sensitive_harness_rotation_purge` — exercises
-    rotation against a DSCP semantics change.
-  - `cache_sensitive_harness_fake_field_uncovered_fails` — uses
-    a synthetic test-only field tagged cache-sensitive but
-    deliberately not wired into the flow-cache gate; harness
-    must FAIL, proving it catches the future "implementer
-    forgot to wire it" case.
-  - `cache_contract_lo0_filter_is_listed` — if §11 Q1 resolves
-    "lo0 is in scope", proves the lo0 filter participates.
+  CoS-off + per-class. Pure regression — zero behavior delta is
+  expected.
 
-## 9. Out of scope (explicitly)
+## 9. Out of scope (UPDATED from v1)
 
-- Adding TCP flags / fragment / IHL / IP options matching to
-  the wire DTO or to `FilterTerm`. That's the next PR after
-  this one (or, more likely, the next several PRs — one per
-  field).
-- Adding any per-packet match field to `SessionKey`. Path (a)
-  in §1.3 of the issue body is documented but not exercised.
-- Removing the bespoke
-  `from_forward_decision_skips_cache_for_dscp_matched_*` tests
-  in favor of the harness — keep both for safety; remove
-  bespoke in a follow-up after the harness has soaked.
-- proc-macro derive of `PerPacketMatchField`. `userspace-dp`
-  avoids proc-macros to keep build times honest; the manual
-  constant list + tests are the chosen mechanism.
-- Lo0 filter DSCP gap closure (if §11 Q1 resolves to "yes, gap
-  exists"). That's a bug fix that should ship in its own PR
-  with `Closes #<new-bug>`, because it changes runtime
-  behavior. This PR documents the gap if it exists.
+- Adding any new per-packet match field to `FilterTerm` or the
+  wire DTO. Each such addition is a separate PR that satisfies
+  the issue's acceptance criteria against the README contract.
+- Extending `SessionKey`. Path (a) requires HA sync review and
+  a dedicated PR.
+- `PER_PACKET_MATCH_FIELDS` constant list, `PerPacketMatchField`
+  trait, fake-field harness arm — explicitly removed after v1
+  review.
+- lo0 filter "DSCP gap" — verified non-existent.
+- Parameterizing `dscp_sensitive_filter_semantics_match` —
+  defer to whenever the second cache-sensitive field lands.
 
 ## 10. Validation — pre-PR
 
 - `cargo build --release` clean.
 - `cargo test --release filter::` clean.
 - `cargo test --release flow_cache` clean.
-- `cargo test --release cache_contract` clean (new tests).
 - 5× flake on each new test.
 - Go suite clean.
-- Smoke matrix per CLAUDE.md (Pass A + Pass B).
+- Smoke matrix (Pass A + Pass B) per CLAUDE.md.
 
-## 11. Open questions for adversarial review
+## 11. Open questions for adversarial review round 2
 
-**Q1 — lo0 filter DSCP gap.** The existing #1430 implementation
-gates flow-cache on per-interface `iface_filter_v{4,6}_has_dscp_match`,
-but `lo0_filter_v{4,6}_fast` (host-bound traffic) is not in
-that set. Is this a real correctness gap that must be fixed
-before #1431 ships, or is host-bound traffic structurally
-exempt because it does not go through the flow-cache? Walk
-`userspace-dp/src/afxdp/poll_descriptor/` to verify the
-host-bound path. **PLAN-KILL the harness scope if Q1's answer
-forces the harness to also cover lo0 — that's a behavioral fix,
-not a contract.**
+**Q1 — is the in-source contract block actually loud enough?**
+AGY explicitly recommended "loud, blocking comment right next to
+the fields." A block doc-comment above `FilterTerm` (and
+`FirewallTermSnapshot`) is the proposed surface. Is that enough,
+or does the contract need a `// IMPORTANT: read this before
+adding a field` per-field marker? Reviewer's call.
 
-**Q2 — is the constant list `PER_PACKET_MATCH_FIELDS` doing
-real work?** It's a hand-maintained list. The "real
-enforcement" is the harness. Is the constant list bringing
-value over and above a one-paragraph README "when you add a
-per-packet match field, do X" runbook? If reviewers conclude
-"the list adds churn without enforcement", strip §4.2 and ship
-the harness + README alone. **PLAN-KILL §4.2 specifically is
-fine; it does not kill the whole PR.**
+**Q2 — should the harness sit in `tests.rs` or a new file?** Plan
+proposes bottom of `tests.rs`. Reviewer may prefer a dedicated
+`cache_invariant_harness.rs` for visibility — both are fine; the
+trade-off is module noise vs. discoverability.
 
-**Q3 — does the harness handle ICMP correctly?** ICMP packets
-use src_port/dst_port to carry type/code. Adding "ICMP type
-match" as a per-packet field is ambiguous — it might already
-be in the cache key (because type lives in the port field for
-ICMP sessions). The harness must NOT misclassify ICMP type as
-cache-sensitive. Reviewer must verify
-`userspace-dp/src/session/key.rs:28-...` (`forward_wire_key`
-ICMP branch).
+**Q3 — does the README table need an authoritative line on the
+"ICMP src_port is the identifier" gotcha?** v1 got this wrong;
+v2 lists it but reviewer should confirm wording is accurate
+against `parse_flow_ports` at `frame/inspect.rs:225`.
 
-**Q4 — is `dscp_sensitive_filter_semantics_match` generalizable?**
-It currently inlines DSCP-specific aggregate-flag comparisons
-(`old.has_dscp_match_terms == new.has_dscp_match_terms`). For
-TCP flags or IHL the equivalent flag would be
-`has_tcp_flags_match_terms` / `has_ihl_match_terms`. Should
-the helper be parameterized today (via a closure or a
-`CacheSensitiveFieldDescriptor` trait), or should each future
-field paste its own helper? Cost-benefit: parameterizing today
-adds churn for one consumer (DSCP); pasting later doubles the
-maintenance surface. **Lean: paste later. Reviewer feedback
-welcome.**
+**Q4 — does the positional-ID-change-doesn't-fire test add
+coverage over the existing `input_dscp_filter_families_changed_ignores_positional_filter_id_change`
+test at `filter/tests.rs:1806`?** If it's literally a duplicate,
+drop it. If it tests a different angle (e.g. it builds via the
+public snapshot API rather than constructing `Filter` directly),
+keep it as the canonical harness reference.
 
-**Q5 — is the trade-off honest?** This PR is contract +
-harness, no runtime change. Is the failure mode (silent flow-
-cache bypass when a future per-packet field is added) actually
-a plausible failure? PR #1430 round 4 caught the original DSCP
-gap; the same review discipline would catch the next one. If
-review discipline is the real defense, this PR is theater.
-**PLAN-KILL with this reasoning is welcome.** The
-counter-argument: #1430 went through 5 review rounds before
-the round-5 carry-item was acknowledged. A test-time tripwire
-catches the same class of bug without depending on a 5-round
-review.
+**Q5 — anything else that disciplined PR review would catch but
+this contract doesn't?** Reviewer is invited to PLAN-KILL v2 if
+the contract is still theater. The v2 minimum value: a single
+authoritative doc that a future reviewer can cite when they
+spot a per-packet match field landing without the cache-sensitive
+runbook.
 
-**Q6 — does this conflict with #1373 retirement work?** The
-eBPF dataplane is being retired (#1373 / #1476). Filter
-semantics moving forward live only in `userspace-dp`. So the
-contract is naturally Rust-side only. The README change is in
-`userspace-dp/src/filter/README.md`, not in any eBPF doc. No
-conflict expected. Reviewer should verify.
-
-**Q7 — performance.** Confirmed: no hot-path changes. If §4.2
-adds a `compile_error!` macro, it fires at build time, not
-runtime. The harness is `cfg(test)` only. No measurable
-runtime cost expected. Reviewer must verify that the (possibly)
-factored `flow_cache_can_insert_for_field` helper folds back to
-the existing two-call pattern at `#[inline(always)]` (we have
-seen the compiler fail to inline through a trait-bound generic
-in the past — keep this concrete).
+**Q6 — is the lo0 "verified non-existent" note useful, or noise?**
+v1's lo0 alarm cost real review cycles. v2 documents the
+resolution so future readers don't repeat the investigation. If
+reviewer prefers a leaner doc, the lo0 paragraph can move to a
+one-line "see types/forwarding.rs::is_cacheable" pointer.
 
 ---
 
-If reviewers conclude the perf gain is too small to justify
-the churn, **PLAN-KILL is an acceptable verdict.**
+If reviewers still conclude the contract is theater, **PLAN-KILL
+is an acceptable v2 verdict** — in which case the recommended
+follow-up is a one-line PR that just adds the doc-comment block
+on `FilterTerm` and `FirewallTermSnapshot`, no harness at all,
+and closes the issue with that as the "documents whether the new
+match field is in the cache key" acceptance criterion satisfied.

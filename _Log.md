@@ -4785,3 +4785,23 @@ top.
   runtime change planned; PLAN-KILL acceptable if reviewers conclude
   the harness is overkill versus disciplined PR review on the next
   per-packet field addition.
+
+## 2026-05-26 — #1431 plan v2 (post-r1 reviews)
+
+- **Timestamp**: 03:35 UTC
+- **Action**: rewrote plan after Codex PLAN-KILL + AGY PLAN-NEEDS-MAJOR on v1
+- **File(s)**: `docs/pr/1431-filter-cache-invariants/plan.md` (v2)
+- **Changes from v1**:
+  - DELETED §4.2 PER_PACKET_MATCH_FIELDS constant list + trait
+    (Rust has no reflection; manual list is compile-time theater).
+  - DELETED §4.3 fake-field negative-case harness arm (cannot
+    synthesize without polluting FilterTerm).
+  - DELETED lo0 DSCP "gap" concern (verified: LocalDelivery is
+    !is_cacheable, lo0 evaluated per-packet on miss + hit paths).
+  - CORRECTED ICMP key claim (v1 said type/code live in ports;
+    actual: src_port = identifier, dst_port = 0).
+  - NEW: in-source doc-comment block on FilterTerm and
+    FirewallTermSnapshot as the loud reviewer-facing tripwire
+    (AGY's recommendation).
+  - SHRANK harness to 3 positive-case DSCP tests:
+    input/output gate + positional-ID-change-doesn't-fire.
