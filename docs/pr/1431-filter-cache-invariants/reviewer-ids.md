@@ -31,3 +31,10 @@
 - **AGY r1**: already MERGE-READY at 705d62f67 — re-attestation not required for a doc-only fix on top.
 - **Copilot**: re-review requested via PR comment.
 - **Claude SMR**: `docs/pr/1431-filter-cache-invariants/claude-smr-code-r1.md` MERGE-READY (covers the fixed surface inline).
+
+## Code review round 3 — post-rebase + post-Copilot-r2 (head a5d06c424c1eba3619b41b7560e7c4eee79ceb8c)
+
+- **Codex r3**: `task-mpnneefh-5ymtw3` — re-confirm MERGE-READY after rebase + four doc tightenings.
+- **AGY r2**: `review-mpnnemma-6ijk2d` — same.
+- **Copilot r3**: `@copilot review` requested at this SHA — awaiting `copilot-pull-request-reviewer[bot]` formal review.
+- **Claude SMR**: `docs/pr/1431-filter-cache-invariants/claude-smr-code-r1.md` includes post-rebase addendum recording byte-range + 5-tuple corrections.

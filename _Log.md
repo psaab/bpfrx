@@ -4919,3 +4919,29 @@ top.
     since
   - Copilot r2: COMMENTED with 2 inline findings → fixes applied
   - Claude SMR: MERGE-READY with addendum
+
+## 2026-05-26 — #1431 final 4-of-4 attestation at post-rebase HEAD
+
+- **Timestamp**: 22:55 UTC
+- **Action**: rebased onto current origin/master (ab812c6cf);
+  re-dispatched Codex + AGY + Copilot at rebased HEAD a5d06c424;
+  all four reviewer seats clean
+- **File(s)**:
+  - rebase: chronological _Log.md merge (both #1563 + #1431 entries preserved)
+  - docs/pr/1431-filter-cache-invariants/reviewer-ids.md (r3 task ids)
+- **Reviewer verdicts at HEAD a5d06c424c1eba3619b41b7560e7c4eee79ceb8c**:
+  - Codex r3 (task-mpnneefh-5ymtw3): MERGE-READY, no findings
+  - AGY r2 (review-mpnnemma-6ijk2d): MERGE-READY, no findings
+  - Copilot r3 (copilot-pull-request-reviewer[bot]): COMMENTED, no new comments
+  - Claude SMR: MERGE-READY with post-rebase addendum
+    (docs/pr/1431-filter-cache-invariants/claude-smr-code-r1.md)
+- **Hallucination check**: AGY misread flow_cache_tests.rs as "newly
+  added" (it pre-exists on master; PR only adds ~158 lines). All
+  substantive file:line citations from both reviewers verified
+  against actual HEAD code (CACHE-KEY INVARIANT blocks, README
+  table, is_cacheable, parse_flow_ports).
+- **Scope confirm**: 0 non-comment runtime lines added; only
+  comment blocks above FilterTerm + FirewallTermSnapshot, README,
+  cfg(test) tests, and doc files.
+- **Stale marker** at comment 4551276859 (posted on 705d62f67)
+  DELETED via gh api -X DELETE.
