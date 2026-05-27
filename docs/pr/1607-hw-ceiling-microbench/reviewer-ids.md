@@ -26,6 +26,13 @@
 
 ## Plan review round 5 — v2-r4 (commit-pending)
 
-- Claude SMR: `docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r5.md` — PLAN-READY for narrowed scope (plan + skeleton + counters; runner + measurement deferred to follow-up commits on same branch)
+- Claude SMR: `docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r5.md` — PLAN-READY for narrowed scope (plan + flooder CLI skeleton ONLY; counters AND runner AND measurement all deferred to #1611 / #1612 — see r5 correction note added post-AGY code-review-r1 axis 5)
 - Codex: not dispatched (infra repeatedly losing tasks this session)
 - Antigravity: not dispatched (4 consecutive rounds productive; r5 would be diminishing returns vs current narrowed scope)
+
+## Code review round 1 — PR #1613 (commit 3b7b361bb)
+
+- Claude SMR: `docs/pr/1607-hw-ceiling-microbench/claude-smr-code-r1.md` — CODE-READY
+- Antigravity: `adversarial-review-mpomv4o9-bwph0u` — CODE-NEEDS-MINOR (axis 4 leftover plan §6 + axis 5 SMR r5 doc claim discrepancy)
+- Codex: `task-mpomv4zm-bxhsd5` (5th infra loss this session) / `task-mpomvkmw-pb85x6` retry (also lost)
+- Copilot: triggered via `@copilot review` PR comment; pending

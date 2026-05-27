@@ -13,18 +13,31 @@ This PR's deliverable becomes:
 - Cold-path flooder Cargo skeleton at
   `test/incus/cold-path-flooder/` (CLI surface + cohort validation +
   6/6 cargo tests; runner body deferred to follow-up).
-- `WorkerColdPathCounters` / `WorkerColdPathAtomics` /
-  `WorkerRuntimeStatus.cold_path_*` wire-protocol additions
-  (Rust + Go; reviewer-confirmed disjoint vs #1606/#1608).
-- §4.6 Scale Target tables exist but with TBD values; populated in a
-  follow-up commit on this same branch after the runner body lands
-  and a clean smoke runs.
+- §4.6 Scale Target tables exist as TBD-marked contracts in the
+  plan; populated in step-3 (#1612) after the runner body lands.
 
-What this PR explicitly does NOT include (AGY r4 axis 4 resolution):
+**Correction (post-AGY code-review-r1 axis 5)**: an earlier draft of
+this SMR doc listed wire-protocol additions
+(`WorkerColdPathCounters` / `WorkerColdPathAtomics` /
+`WorkerRuntimeStatus.cold_path_*` / `clock_source`) as shipping in
+this PR. That was inaccurate. Those wire-protocol additions are also
+deferred out of step-1, into step-2 (#1611, runner body) + step-3
+(#1612, counter wiring + measurement). The step-1 PR is **plan +
+flooder CLI skeleton only**; verified via `git diff
+origin/master...HEAD --name-only` shows only
+`docs/pr/1607-hw-ceiling-microbench/*`,
+`test/incus/cold-path-flooder/*`, and `_Log.md` touched.
+
+What this PR explicitly does NOT include (AGY r4 axis 4 resolution +
+AGY code-r1 axis 5 correction):
 - AF_PACKET runner body in the flooder. Plan §4.2 stays canonical;
-  follow-up commit ships it.
+  step-2 (#1611) ships it.
+- `WorkerColdPathCounters` / `WorkerColdPathAtomics` Rust types,
+  `WorkerRuntimeStatus.cold_path_*` + `clock_source` wire-protocol
+  additions (Rust + Go), Prometheus emitter in
+  `pkg/api/metrics_userspace.go`. All deferred to step-3 (#1612).
 - §4.6 Tables A1/A2/B1/B2 measured numbers. Plan §4.6 stays as the
-  measurement contract; follow-up commit fills in values.
+  measurement contract; step-3 (#1612) fills in values.
 
 ## Adjudication of AGY r4 findings
 
