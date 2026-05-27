@@ -1,6 +1,48 @@
 # Plan v1 — #1598 CoS `iperf-uncapped` capped at ~10 Gbps
 
-Status: DRAFT v2 — addresses round-1 Codex PLAN-KILL concern about Step2 `tx_owner_live` funnel by tracing `build_worker_cos_owner_live_by_tx_ifindex` and the per-worker binding topology of the loss userspace cluster. AGY round-1 verdict: PLAN-READY.
+Status: DRAFT v3 — secondary funnel found by post-merge smoke. Primary fix (worker/cos/mod.rs:126-131) was correct but insufficient: TX-dispatch path was gating "keep local vs route to owner" on `shared_queue_lease.is_some()` (an exact-only marker), so non-exact uncapped queues with `shared_exact=true` AND no lease still funneled. v3 adds a sibling helper `request_runs_under_shared_exact_policy` (in tx/dispatch/cos.rs) that gates on `queue_fast.shared_exact` directly, and switches both TX-dispatch call sites to it.
+
+## Smoke failure summary (post-primary-fix)
+
+After PR #1600 HEAD `0a1304fcffcf` deployed on `loss:xpf-userspace-fw0/fw1`:
+
+- Push P=12 on port 5211 (iperf-uncapped): 9.08 Gbps, 2k-3.6k retr (3 retries, stable)
+- Reverse P=12 on port 5211: 22.8 Gbps, 0 retr (cluster healthy)
+- Ports 5208/5209/5210 also showed -13% to -21% under-performance (graded scaling)
+
+The reverse path bypasses the push-side CoS pipeline (no bandwidth-output filter applies on `-R` mode), so reverse hitting 22.8 Gbps confirms the cluster is wire-rate-capable. The push direction through bandwidth-output → forwarding-class iperf-uncapped → scheduler-uncapped was STILL funneling to a single worker, despite the routing-side `shared_exact` flag being set on queue 11.
+
+## v3 root-cause walk
+
+The primary fix made `queue_uses_shared_exact_service` return `true` for non-exact queues whose `transmit_rate_bytes >= 2.5 Gbps`. That sets `WorkerCoSQueueFastPath.shared_exact = true` at `worker/cos/mod.rs:191-200`. But the per-queue lease allocation at `coordinator/mod.rs:1058` still gates on `queue.exact`, so for the iperf-uncapped queue (exact=false), `shared_queue_lease = None`.
+
+The TX-dispatch path in `userspace-dp/src/afxdp/tx/dispatch/cos.rs:40-47` and `enqueue_local_request_to_target_or_owner` at lines 50-76 used `shared_queue_lease.is_some()` as the "keep local vs route to owner" gate. Before #1598 those two predicates were coextensive on the production set (exact queues only). After #1598 they diverge: non-exact uncapped queues are `shared_exact=true` but `shared_queue_lease=None`.
+
+Code path for a non-exact uncapped class-11 request hitting the dispatch:
+1. `enqueue_local_request_to_target_or_owner` called with target_binding pointing at the request's primary target.
+2. `request_uses_shared_exact_queue_lease` → false (no lease for non-exact).
+3. Falls to `cos_owner_live_for_request` → returns the queue's owner_live (a different worker, set round-robin).
+4. `Arc::ptr_eq` against current target_binding.live → false.
+5. `owner_live.enqueue_tx_owned(req)` → request is HANDED TO THE OWNER WORKER. **Funnel.**
+
+The same mistake is in the in-place rewrite gate at `dispatch/mod.rs:426-436`: `owner_matches_target = lease_some || owner_live.is_none_or_ptr_eq`. For our non-exact uncapped case both clauses fail → `owner_matches_target = false` → in-place rewrite SKIPPED, copy path taken, then the dispatch funnels.
+
+## v3 fix
+
+Add a new helper `request_runs_under_shared_exact_policy` in `tx/dispatch/cos.rs` that checks `queue_fast.shared_exact` directly (the routing-level shared flag, set by `queue_uses_shared_exact_service`). Switch both TX-dispatch call sites:
+- `enqueue_local_request_to_target_or_owner` (cos.rs:54)
+- `owner_matches_target` (dispatch/mod.rs:426)
+
+The legacy `request_uses_shared_exact_queue_lease` helper is RETAINED — it correctly identifies queues that have a per-queue rate cap to enforce, which is a different semantic question. Any future caller that genuinely needs "does this queue have a lease?" (e.g. lease consumption accounting) still has the right helper.
+
+## v3 test coverage
+
+Added 3 tests in `userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs`:
+- `shared_exact_policy_admits_non_exact_uncapped_queue_without_lease` — the #1598 secondary regression: shared_exact=true + lease=None must keep traffic local
+- `shared_exact_policy_rejects_single_owner_queue` — shared_exact=false must funnel even if lease=Some (defensive symmetry)
+- `shared_exact_policy_handles_unknown_queue` — unknown queue_id / egress_ifindex returns false
+
+The test fixture `test_cos_fast_interfaces_decoupled` decouples shared_exact and shared_queue_lease so all four (shared_exact, has_lease) combinations can be exercised.
 
 ## Issue framing
 

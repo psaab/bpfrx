@@ -1,5 +1,37 @@
 # Action Log
 
+## 2026-05-26 — #1598 secondary fix (TX-dispatch funnel)
+
+- **Action**: Post-merge smoke on PR #1600 caught a SECONDARY funnel:
+  primary fix at `worker/cos/mod.rs:126-131` correctly set
+  `WorkerCoSQueueFastPath.shared_exact = true` for the non-exact
+  uncapped queue, but the TX dispatch path at
+  `userspace-dp/src/afxdp/tx/dispatch/cos.rs:54` was gating "keep
+  local vs route to owner" on `shared_queue_lease.is_some()`, an
+  exact-only marker. For the iperf-uncapped class the lease is None
+  (filtered out at `coordinator/mod.rs:1058`), so the dispatch still
+  funneled the request to a single `owner_worker_id`. Smoke showed
+  port 5211 push P=12 stable at 9.08 Gbps with 2k-3.6k retr.
+  Added `request_runs_under_shared_exact_policy` helper that gates
+  on `queue_fast.shared_exact` directly (the routing-level shared
+  flag). Switched both call sites: `enqueue_local_request_to_target_or_owner`
+  (cos.rs:54) and the in-place-rewrite gate `owner_matches_target`
+  in `dispatch/mod.rs:426`. Retained the legacy
+  `request_uses_shared_exact_queue_lease` helper — it still correctly
+  identifies queues with a per-queue rate lease, which is a
+  different question. Added test fixture
+  `test_cos_fast_interfaces_decoupled` that decouples
+  `(shared_exact, has_lease)` so all four combinations can be tested.
+  Added 3 regression tests covering (shared_exact=true, lease=None)
+  + (shared_exact=false, lease=Some) + unknown-queue safety.
+- **Tests**: 1441 cargo tests pass (+3 new); Go suite clean across
+  all packages; pre-existing `snat_contract_doc_guard` failure
+  unchanged on master.
+- **File(s)**: `userspace-dp/src/afxdp/tx/dispatch/cos.rs`,
+  `userspace-dp/src/afxdp/tx/dispatch/mod.rs`,
+  `userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs`,
+  `docs/pr/1598-cos-uncapped-fix/plan.md`, `_Log.md`.
+
 Entries land at the top when added. Within a topic batch (same
 issue / PR), entries run reverse-chronological (newest first).
 Across topic batches the ordering is by add-time, not strict wall

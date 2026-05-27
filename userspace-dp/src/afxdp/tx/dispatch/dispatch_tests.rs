@@ -131,15 +131,36 @@ fn test_cos_fast_interfaces(
     default_queue: u8,
     shared_exact_queues: &[(u8, bool)],
 ) -> FastMap<i32, WorkerCoSInterfaceFastPath> {
+    // Legacy fixture: shared_exact AND shared_queue_lease set together.
+    // For the post-#1598 decoupled case where a queue can be
+    // shared_exact=true with NO lease (non-exact uncapped class), use
+    // `test_cos_fast_interfaces_decoupled` below.
+    let decoupled: Vec<(u8, bool, bool)> = shared_exact_queues
+        .iter()
+        .copied()
+        .map(|(queue_id, shared_exact)| (queue_id, shared_exact, shared_exact))
+        .collect();
+    test_cos_fast_interfaces_decoupled(egress_ifindex, default_queue, &decoupled)
+}
+
+fn test_cos_fast_interfaces_decoupled(
+    egress_ifindex: i32,
+    default_queue: u8,
+    queues: &[(u8, bool, bool)],
+) -> FastMap<i32, WorkerCoSInterfaceFastPath> {
+    // Each tuple: (queue_id, shared_exact, has_lease).
+    // The pair (true, false) models the #1598 non-exact uncapped case:
+    // the routing-level shared_exact flag is set, but the
+    // exact-only `shared_queue_lease` is absent.
     let mut queue_index_by_id = [COS_FAST_QUEUE_INDEX_MISS; 256];
     let mut queue_fast_path = Vec::new();
-    for (idx, (queue_id, shared_exact)) in shared_exact_queues.iter().copied().enumerate() {
+    for (idx, (queue_id, shared_exact, has_lease)) in queues.iter().copied().enumerate() {
         queue_index_by_id[usize::from(queue_id)] = idx as u16;
         queue_fast_path.push(WorkerCoSQueueFastPath {
             shared_exact,
             owner_worker_id: 0,
             owner_live: None,
-            shared_queue_lease: shared_exact
+            shared_queue_lease: has_lease
                 .then(|| Arc::new(SharedCoSQueueLease::new(1_250_000_000, 256 * 1024, 2))),
             vtime_floor: None,
         });
@@ -515,4 +536,73 @@ fn shared_exact_queue_lease_uses_interface_default_queue() {
         80,
         None,
     ));
+}
+
+#[test]
+fn shared_exact_policy_admits_non_exact_uncapped_queue_without_lease() {
+    // #1598 secondary fix: non-exact uncapped queues run under
+    // `shared_exact = true` (from worker/cos/mod.rs:126-131) but have
+    // NO `shared_queue_lease` (filtered out at coordinator/mod.rs:1058
+    // because `!queue.exact`). The TX-dispatch path must keep these
+    // requests local rather than funneling them to a single
+    // owner_worker_id; that is precisely the failure mode that the
+    // smoke run caught (port 5211 push P=12 capped at ~9 Gbps even
+    // after the primary fix).
+    let cos_fast_interfaces = test_cos_fast_interfaces_decoupled(
+        80,
+        11,
+        // queue 11: shared_exact = true, has_lease = false (uncapped class)
+        &[(11, true, false)],
+    );
+
+    assert!(
+        request_runs_under_shared_exact_policy(&cos_fast_interfaces, 80, Some(11)),
+        "#1598: non-exact uncapped queue with shared_exact=true must \
+         signal 'stay local' to the TX dispatch, even with no lease"
+    );
+    // The lease-only helper continues to report `false` for this case —
+    // that's the WHOLE point of the divergence; the dispatch path must
+    // not rely on the lease as a proxy for the shared policy.
+    assert!(
+        !request_uses_shared_exact_queue_lease(&cos_fast_interfaces, 80, Some(11)),
+        "#1598: non-exact uncapped queue has no shared_queue_lease, so \
+         the lease-only helper correctly reports false"
+    );
+}
+
+#[test]
+fn shared_exact_policy_rejects_single_owner_queue() {
+    // Single-owner queue (low-rate exact or non-exact below threshold)
+    // has shared_exact = false. The policy helper must return false so
+    // the dispatch path routes to owner_worker_id (the intended
+    // single-FIFO arbitration domain for low-rate classes — #680/#690).
+    let cos_fast_interfaces = test_cos_fast_interfaces_decoupled(
+        80,
+        1,
+        // queue 1: shared_exact = false, has_lease = true (this would be
+        // a hypothetical legacy state — verify the helper still says no)
+        &[(1, false, true)],
+    );
+    assert!(
+        !request_runs_under_shared_exact_policy(&cos_fast_interfaces, 80, Some(1)),
+        "#1598: shared_exact=false must keep the request funnel-routed \
+         to the queue owner regardless of lease presence"
+    );
+}
+
+#[test]
+fn shared_exact_policy_handles_unknown_queue() {
+    // Defensive: a request whose `cos_queue_id` does not resolve in
+    // the fast-path table must return false (the dispatch path falls
+    // back to single-owner / local TX). This mirrors the existing
+    // is_some_and shape on the lease-only helper.
+    let cos_fast_interfaces = test_cos_fast_interfaces_decoupled(80, 5, &[(5, true, true)]);
+    assert!(
+        !request_runs_under_shared_exact_policy(&cos_fast_interfaces, 80, Some(42)),
+        "an unknown queue_id must not be reported as shared_exact policy"
+    );
+    assert!(
+        !request_runs_under_shared_exact_policy(&cos_fast_interfaces, 999, Some(5)),
+        "an unknown egress_ifindex must not be reported as shared_exact policy"
+    );
 }
