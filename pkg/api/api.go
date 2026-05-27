@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -73,6 +74,25 @@ func queryUint16(r *http.Request, key string, def uint16) uint16 {
 		return def
 	}
 	return uint16(n)
+}
+
+// parseRefBaseUnit splits a Junos interface ref into its base name
+// and unit number, returning ok=false for malformed (non-numeric)
+// suffixes. A bare ref returns (ref, 0, true). This matches the
+// stricter Atoi semantics used in (*Config).ResolveKernelIfName and
+// avoids the partial-numeric-prefix bug fmt.Sscanf has
+// (e.g. "80foo" parsing as 80).
+func parseRefBaseUnit(ref string) (base string, unitNum int, ok bool) {
+	parts := strings.SplitN(ref, ".", 2)
+	base = parts[0]
+	if len(parts) == 1 {
+		return base, 0, true
+	}
+	n, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return base, 0, false
+	}
+	return base, n, true
 }
 
 // allInterfaceNames returns a deduplicated set of interface names from

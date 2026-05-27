@@ -264,17 +264,14 @@ func (s *Server) writeInterfacesDetail(w http.ResponseWriter, cfg *config.Config
 		// shape (LinuxIfName(configRef)+ ".VlanID" when > 0).
 		// This is distinct from the kernel link name (#1565).
 		if s.dhcp != nil {
-			base := strings.SplitN(ifName, ".", 2)[0]
-			unitNum := 0
-			if parts := strings.SplitN(ifName, ".", 2); len(parts) == 2 {
-				fmt.Sscanf(parts[1], "%d", &unitNum)
-			}
-			if key, ok := cfg.DHCPLeaseKey(base, unitNum); ok {
-				if lease := s.dhcp.LeaseFor(key, dhcp.AFInet); lease != nil {
-					fmt.Fprintf(&b, "  DHCPv4: %s (gw %s)\n", lease.Address, lease.Gateway)
-				}
-				if lease := s.dhcp.LeaseFor(key, dhcp.AFInet6); lease != nil {
-					fmt.Fprintf(&b, "  DHCPv6: %s (gw %s)\n", lease.Address, lease.Gateway)
+			if base, unitNum, ok := parseRefBaseUnit(ifName); ok {
+				if key, ok := cfg.DHCPLeaseKey(base, unitNum); ok {
+					if lease := s.dhcp.LeaseFor(key, dhcp.AFInet); lease != nil {
+						fmt.Fprintf(&b, "  DHCPv4: %s (gw %s)\n", lease.Address, lease.Gateway)
+					}
+					if lease := s.dhcp.LeaseFor(key, dhcp.AFInet6); lease != nil {
+						fmt.Fprintf(&b, "  DHCPv6: %s (gw %s)\n", lease.Address, lease.Gateway)
+					}
 				}
 			}
 		}

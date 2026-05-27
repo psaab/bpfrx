@@ -221,19 +221,19 @@ func (c *Config) ResolveKernelIfName(ref string) string {
 // number. Mirrors the construction in
 // pkg/daemon/daemon_dhcp.go:56-95:
 //
-//	key = LinuxIfName(physRef) + ("." + strconv(unit.VlanID)) when > 0
+//	key = LinuxIfName(configRef) + ("." + strconv(unit.VlanID)) when > 0
 //
-// physRef is the CONFIG-LEVEL name (e.g. "reth0"), not the resolved
+// configRef is the CONFIG-LEVEL name (e.g. "reth0"), not the resolved
 // physical member — the daemon's DHCP Start() is invoked with the
 // config-level name.
 //
 // Returns ("", false) when the unit doesn't exist in cfg.
-func (c *Config) DHCPLeaseKey(physRef string, unitNum int) (string, bool) {
-	physRef = strings.SplitN(physRef, ".", 2)[0]
+func (c *Config) DHCPLeaseKey(configRef string, unitNum int) (string, bool) {
+	configRef = strings.SplitN(configRef, ".", 2)[0]
 	if c.Interfaces.Interfaces == nil {
 		return "", false
 	}
-	ifc, ok := c.Interfaces.Interfaces[physRef]
+	ifc, ok := c.Interfaces.Interfaces[configRef]
 	if !ok || ifc == nil {
 		return "", false
 	}
@@ -241,7 +241,7 @@ func (c *Config) DHCPLeaseKey(physRef string, unitNum int) (string, bool) {
 	if !ok || unit == nil {
 		return "", false
 	}
-	key := LinuxIfName(physRef)
+	key := LinuxIfName(configRef)
 	if unit.VlanID > 0 {
 		key = key + "." + strconv.Itoa(unit.VlanID)
 	}
