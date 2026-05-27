@@ -4064,3 +4064,7 @@ top.
 ## 03:35 UTC — #1565 plan v3 after round-2 Codex NEEDS-MAJOR
 - **Action**: Address VLAN-vs-unit conflation, IRB, tunnel collision, DHCP test mock design, smoke specificity
 - **File(s)**: docs/pr/1565-iface-name-translate/plan.md
+
+## 03:46 UTC — #1565 plan v4 after round-3 Codex NEEDS-MAJOR
+- **Action**: Drop ResolveFab from helper (fab0 is kernel device), add st* short-circuit, fix smoke gates to actual cfg, AGY minors (fmt import, test_seams.go, drift NOTE comments)
+- **File(s)**: docs/pr/1565-iface-name-translate/plan.md
