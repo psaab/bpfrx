@@ -126,24 +126,24 @@ func (c *Config) ResolveFab(ref string) string {
 //  1. Bare refs (no "." suffix):
 //     - reth* → ResolveReth → physical member, LinuxIfName.
 //     - all others (fxp0, em0, fab0, lo, ge-0/0/0, gr-0/0/0, st0):
-//       LinuxIfName(ref). Matches snapshotLinuxName for the no-unit
-//       case.
+//     LinuxIfName(ref). Matches snapshotLinuxName for the no-unit
+//     case.
 //  2. Dotted refs (e.g. "ge-0/0/0.80", "reth0.50", "gr-0/0/0.0",
 //     "irb.0", "st0.0"):
 //     a. st<N>.<M> short-circuit: kernel XFRM device is the full
-//        ref verbatim. Matches resolveInterfaceRef + XFRMIfNameAndID.
+//     ref verbatim. Matches resolveInterfaceRef + XFRMIfNameAndID.
 //     b. IRB: look up via IRBToBridge(cfg.BridgeDomains) and return
-//        the bridge device name (no suffix).
+//     the bridge device name (no suffix).
 //     c. Tunnel: if TunnelNameMap[ref] is set, return that name
-//        verbatim (covers gr-0/0/0.0 → gr-0-0-0 and
-//        gr-0/0/0.1 → gr-0-0-0u1).
+//     verbatim (covers gr-0/0/0.0 → gr-0-0-0 and
+//     gr-0/0/0.1 → gr-0-0-0u1).
 //     d. Otherwise look up cfg.Interfaces.Interfaces[base].Units[unit]:
-//        - If unit has tunnel.Name set, return that.
-//        - If unit.VlanID > 0, return
-//          LinuxIfName(ResolveReth(base)) + "." + VlanID.
-//        - If unit.Number == 0, return
-//          LinuxIfName(ResolveReth(base)) (unit-0 collapse).
-//        - Else return LinuxIfName(ResolveReth(base)) + "." + unit.Number.
+//     - If unit has tunnel.Name set, return that.
+//     - If unit.VlanID > 0, return
+//     LinuxIfName(ResolveReth(base)) + "." + VlanID.
+//     - If unit.Number == 0, return
+//     LinuxIfName(ResolveReth(base)) (unit-0 collapse).
+//     - Else return LinuxIfName(ResolveReth(base)) + "." + unit.Number.
 //     e. Fallback: LinuxIfName(ResolveReth(ref)) — preserves suffix.
 //
 // NOTE: Keep in sync with snapshotLinuxName in

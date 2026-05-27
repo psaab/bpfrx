@@ -116,7 +116,7 @@ func TestResolveKernelIfName_Plain(t *testing.T) {
 		{"fxp0", "fxp0"},
 		{"lo", "lo"},
 		{"ge-0/0/0", "ge-0-0-0"},
-		{"ge-0/0/0.0", "ge-0-0-0"},     // unit 0 with vlan-id 0 collapses
+		{"ge-0/0/0.0", "ge-0-0-0"},      // unit 0 with vlan-id 0 collapses
 		{"ge-0/0/0.80", "ge-0-0-0.180"}, // VLAN tag, NOT unit number
 	}
 	for _, tt := range tests {
@@ -147,9 +147,9 @@ func TestResolveKernelIfName_Reth(t *testing.T) {
 		in, want string
 	}{
 		{"reth0", "ge-0-0-2"},
-		{"reth0.0", "ge-0-0-2"},        // unit 0 collapse
-		{"reth0.50", "ge-0-0-2.50"},    // vlan-id == unit
-		{"reth0.80", "ge-0-0-2.180"},   // vlan-id != unit — the failure case
+		{"reth0.0", "ge-0-0-2"},      // unit 0 collapse
+		{"reth0.50", "ge-0-0-2.50"},  // vlan-id == unit
+		{"reth0.80", "ge-0-0-2.180"}, // vlan-id != unit — the failure case
 	}
 	for _, tt := range tests {
 		if got := cfg.ResolveKernelIfName(tt.in); got != tt.want {

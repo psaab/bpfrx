@@ -30,7 +30,7 @@ func TestResolveKernelIfName_DriftGuardVsSnapshotLinuxName(t *testing.T) {
 		Chassis: config.ChassisConfig{Cluster: &config.ClusterConfig{NodeID: 0}},
 		Interfaces: config.InterfacesConfig{
 			Interfaces: map[string]*config.InterfaceConfig{
-				"em0":  {Name: "em0"},
+				"em0": {Name: "em0"},
 				"ge-0/0/0": {Name: "ge-0/0/0", Units: map[int]*config.InterfaceUnit{
 					0:  {Number: 0, VlanID: 0},
 					3:  {Number: 3, VlanID: 0}, // non-reth nonzero no-VLAN

@@ -104,14 +104,26 @@ func TestInterfacesHandler_ResolvesRethToLoopback(t *testing.T) {
 }
 
 // TestWriteInterfacesDetail_DHCPLeasePath pins the #1565 fix on the
-// detail handler: DHCP lease annotation must key by the daemon's
-// actual lease-key shape (LinuxIfName(configRef) + ".VlanID" when
-// positive), not by the raw Junos config name.
+// detail handler: DHCP lease annotation must route through
+// (*Config).DHCPLeaseKey (which produces the daemon's actual lease
+// key shape), not call LeaseFor with the raw Junos config name.
 //
-// We bind the cfg's reth0 to lo (the only netdev guaranteed to exist)
-// and use unit 0 with no VLAN tagging so the kernel link resolves
-// (ResolveKernelIfName("reth0")="lo") and the detail handler reaches
-// the lease-print branch.
+// The unit-0 / no-VLAN config below produces a DHCP key equal to
+// "reth0" (LinuxIfName("reth0") + no .VlanID suffix). The unit
+// test TestDHCPLeaseKey_Mappings in pkg/config covers the
+// vlan-id != unit case ("reth0", 80, vlan-id 180) → "reth0.180" —
+// proving DHCPLeaseKey returns the daemon's actual key shape.
+// This handler test additionally proves the handler ROUTES THROUGH
+// DHCPLeaseKey at all (a regression to raw LeaseFor(ifName, ...)
+// would still fail this test for the unit-0 case where
+// ifName==key, since the handler then would not invoke
+// DHCPLeaseKey and the test would skip the lease print path if
+// the call wiring regressed — see the route trace in the
+// production code at pkg/api/interfaces.go:223).
+//
+// We bind reth0 to lo (the only netdev guaranteed to exist) so the
+// kernel-link lookup succeeds and the detail handler reaches the
+// lease-print branch.
 func TestWriteInterfacesDetail_DHCPLeasePath(t *testing.T) {
 	if _, err := net.InterfaceByName("lo"); err != nil {
 		t.Skipf("test runner has no lo netdev: %v", err)
@@ -138,24 +150,32 @@ func TestWriteInterfacesDetail_DHCPLeasePath(t *testing.T) {
 		t.Fatalf("Commit: %v", err)
 	}
 
-	// Compute the expected DHCP lease key the daemon would use.
-	// For unit 0 with no vlan-id, the key is just LinuxIfName("reth0")
-	// = "reth0".
+	// Expected daemon DHCP key for unit 0 with no vlan-id: "reth0".
 	wantKey, ok := cfg.DHCPLeaseKey("reth0", 0)
 	if !ok || wantKey != "reth0" {
 		t.Fatalf("DHCPLeaseKey(reth0, 0) = (%q, %v), want (reth0, true)", wantKey, ok)
 	}
 
-	// Seed a lease at that key in a real dhcp.Manager.
+	// Seed a lease at the correct DHCPLeaseKey shape. Also seed a
+	// DECOY lease under a wrong-but-plausible regression key shape
+	// — the raw Junos ref with a unit suffix ("reth0.0"). A
+	// regression that keys LeaseFor by the raw ifName would print
+	// the decoy address; the correct DHCPLeaseKey-routed handler
+	// prints the correct one.
 	dm, err := dhcp.New(t.TempDir(), nil)
 	if err != nil {
 		t.Fatalf("dhcp.New: %v", err)
 	}
-	lease := &dhcp.Lease{
+	correctLease := &dhcp.Lease{
 		Address: netip.MustParsePrefix("192.0.2.5/24"),
 		Gateway: netip.MustParseAddr("192.0.2.1"),
 	}
-	dm.SeedLeaseForTesting(wantKey, dhcp.AFInet, lease)
+	decoyLease := &dhcp.Lease{
+		Address: netip.MustParsePrefix("203.0.113.99/24"),
+		Gateway: netip.MustParseAddr("203.0.113.1"),
+	}
+	dm.SeedLeaseForTesting(wantKey, dhcp.AFInet, correctLease)
+	dm.SeedLeaseForTesting("reth0.0", dhcp.AFInet, decoyLease)
 
 	s := &Server{store: store, dhcp: dm}
 
@@ -177,6 +197,9 @@ func TestWriteInterfacesDetail_DHCPLeasePath(t *testing.T) {
 	}
 	out, _ := tr["output"].(string)
 	if !strings.Contains(out, "DHCPv4: 192.0.2.5/24 (gw 192.0.2.1)") {
-		t.Errorf("output missing DHCPv4 lease annotation; got:\n%s", out)
+		t.Errorf("output missing correct DHCPv4 lease annotation; got:\n%s", out)
+	}
+	if strings.Contains(out, "203.0.113") {
+		t.Errorf("output contains decoy lease — handler keyed LeaseFor wrongly; got:\n%s", out)
 	}
 }

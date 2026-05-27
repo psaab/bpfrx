@@ -163,8 +163,12 @@ func (s *Server) writeInterfacesTerse(w http.ResponseWriter, cfg *config.Config,
 			continue
 		}
 
-		// Normal interface: get addresses from kernel
-		kernelName := config.LinuxIfName(ifName)
+		// Normal interface: get addresses from kernel. Use the full
+		// ResolveKernelIfName helper so tunnel refs (gr-0/0/0.0 ->
+		// gr-0-0-0), IRB, and VLAN-tag-aware composition all resolve
+		// correctly. Plain LinuxIfName would mis-resolve gr-0/0/0.0
+		// to gr-0-0-0.0 (#1565).
+		kernelName := cfg.ResolveKernelIfName(ifName)
 		iface, err := net.InterfaceByName(kernelName)
 		admin, link := "down", "down"
 		var addrs []string
