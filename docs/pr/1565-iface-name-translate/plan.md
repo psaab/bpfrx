@@ -1,6 +1,6 @@
 # #1565 — pkg/api: translate Junos config names to Linux ifnames before net.InterfaceByName
 
-**Status:** DRAFT v5 — addressing Codex round-4 PLAN-NEEDS-MAJOR + AGY round-4 PLAN-NEEDS-MINOR
+**Status:** PLAN-READY v6 — Codex round-5 PLAN-NEEDS-MINOR, AGY round-5 PLAN-READY; v6 closes 4 minors (stale fab text, drift-guard nil-unit, redundant-parent grammar, Atoi error fallback)
 
 ## Round-4 verdicts
 
@@ -277,7 +277,12 @@ func (c *Config) ResolveKernelIfName(ref string) string {
     }
 
     // Look up the unit by parsed number on the base interface.
-    unitNum, _ := strconv.Atoi(parts[1])
+    // Bail to fallback if the suffix isn't numeric (malformed ref
+    // like "ge-0/0/0.foo" must not silently map to unit 0).
+    unitNum, err := strconv.Atoi(parts[1])
+    if err != nil {
+        return LinuxIfName(c.ResolveReth(ref))
+    }
     if c.Interfaces.Interfaces == nil {
         return LinuxIfName(c.ResolveReth(ref))
     }
@@ -568,9 +573,10 @@ CoS per-class smoke runs per protocol.
      `reth0.80` (unit 80 vlan-id 180) → `ge-0-0-2.180`.
      This is the case that distinguishes v3-broken from v4-fixed.
    Repeat node 1 with member `ge-7/0/2` → `ge-7-0-2`.
-3. `TestResolveKernelIfName_Fab` — `fab0`→`fab0`, `fab0.0`→`fab0.0`
-   (kernel IPVLAN devices, NOT resolved to parent). **Corrected
-   in v4** — v3 plan wrongly expected `ge-0-0-7`.
+3. `TestResolveKernelIfName_Fab` — `fab0`→`fab0`, `fab0.0`→`fab0`
+   (unit 0 collapses; kernel IPVLAN is the bare name). `fab1`→`fab1`.
+   Kernel IPVLAN devices are NOT resolved to parent. (v3→v4→v5
+   corrections; v6 is the consistent shape.)
 4. `TestResolveKernelIfName_Tunnel` — `gr-0/0/0.0`→`gr-0-0-0`,
    `gr-0/0/0.1`→`gr-0-0-0u1` (per-unit `unit.Tunnel.Name`).
 5. `TestResolveKernelIfName_TunnelOverridesVlan` — interface
@@ -608,9 +614,12 @@ shape (Codex round-3 follow-up):
 `pkg/api/interfaces_test.go`:
 
 12. `TestInterfacesHandler_ResolvesRethToLoopback` — synthesize a
-    Junos cfg where `reth0` has a `redundant-parent` from a
-    physical member literally named `lo` (e.g. configure
-    `lo { redundant-parent reth0; }` plus `reth0`). After
+    Junos cfg where `reth0` has a physical member literally named
+    `lo` (e.g. configure
+    `lo { gigether-options { redundant-parent reth0; } }` plus
+    `reth0`; bare `redundant-parent` does NOT populate
+    `InterfaceConfig.RedundantParent` — must be inside
+    `gigether-options`). After
     compilation, `cfg.ResolveReth("reth0")` returns `"lo"`. Call
     `interfacesHandler` and assert the JSON row for `name=reth0`
     has `ifindex == net.InterfaceByName("lo").Index` (the only
@@ -629,14 +638,42 @@ shape (Codex round-3 follow-up):
 `pkg/dataplane/userspace/interfaces_test.go` (AGY drift-guard):
 
 14. `TestResolveKernelIfName_DriftGuardVsSnapshotLinuxName` —
-    construct a Config covering RETH+VLAN, plain physical w/
-    vlan-id, interface-level + per-unit tunnels, IRB, bare
-    non-reth. For each case, iterate the cfg and call BOTH
-    `snapshotLinuxName(cfg, ifName, iface, unit)` and
-    `cfg.ResolveKernelIfName(fmt.Sprintf("%s.%d", ifName, unit.Number))`,
-    asserting equality. Lives in `userspace_test.go` so the
-    private helper is in scope. Permits explicit `t.Skipf` on
-    deliberate semantic deltas if any emerge later.
+    parity test between `snapshotLinuxName` and the new public
+    helper for matching inputs. Must cover every
+    `snapshotLinuxName` branch:
+      - `iface == nil` path (bare ref, no cfg entry).
+      - bare reth (reth0 only, no unit).
+      - bare non-reth (em0, ge-0/0/0).
+      - tunnel-map hit (gr-0/0/0.0 with interface-level tunnel).
+      - VLAN positive (reth0.50 with vlan-id 50; ge-0/0/0.80
+        with vlan-id 180).
+      - reth unit 0 (reth0.0 with no vlan).
+      - reth nonzero no-VLAN unit (synthetic).
+      - non-reth unit 0 (ge-0/0/0.0 with no vlan).
+      - non-reth nonzero no-VLAN unit.
+
+    **Test setup detail** (Codex+AGY catch — avoid nil panic):
+    ```go
+    var ref string
+    if unit == nil {
+        ref = ifName
+    } else {
+        ref = fmt.Sprintf("%s.%d", ifName, unit.Number)
+    }
+    got := cfg.ResolveKernelIfName(ref)
+    want := snapshotLinuxName(cfg, ifName, iface, unit)
+    if got != want {
+        t.Errorf("Mismatch for ref %q: got %q, want %q", ref, got, want)
+    }
+    ```
+
+    **IRB is EXCLUDED from this parity test.** `snapshotLinuxName`
+    does not implement IRB (returns `LinuxIfName("irb")` = `"irb"`),
+    but the new helper resolves via `IRBToBridge` to `br-bd0`.
+    IRB is covered by Test #6 against the new helper directly.
+
+    Lives in `pkg/dataplane/userspace/interfaces_test.go` so the
+    private `snapshotLinuxName` is in scope.
 
 5x flake check on the named tests.
 

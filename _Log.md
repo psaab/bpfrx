@@ -4072,3 +4072,8 @@ top.
 ## 03:53 UTC — #1565 plan v5 after round-4 (Codex MAJOR, AGY MINOR)
 - **Action**: Fix fab0.0 collapse expectation, drop ge-0/0/0 from gates (not in allInterfaceNames), redesign lo test as reth0->lo synthetic, add drift-guard test, nil-guard Interfaces.Interfaces
 - **File(s)**: docs/pr/1565-iface-name-translate/plan.md
+
+## 03:58 UTC — #1565 plan v6 PLAN-READY
+- **Action**: Close 4 round-5 minors (stale fab text, drift-guard nil-unit + branch coverage, redundant-parent grammar, Atoi error fallback)
+- **File(s)**: docs/pr/1565-iface-name-translate/plan.md
+- **Verdict**: Codex r5 PLAN-NEEDS-MINOR (4 minors all closed in v6); AGY r5 PLAN-READY (one drift-guard test setup note also closed in v6). Plan moves to implementation.
