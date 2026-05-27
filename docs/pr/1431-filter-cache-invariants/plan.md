@@ -324,9 +324,12 @@ content:
    - wire the gate at `flow_cache.rs:297-309`, the re-eval at
      `poll_descriptor/mod.rs:217-244`, and the rotation purge at
      `worker/loop_body/mod.rs:295-330`;
-   - extend the existing positive-case harness in
-     `filter/cache_invariant_harness.rs` with a new
-     `harness_<X>_input_gate_test` and `_output_gate_test`.
+   - extend the existing gate tests in
+     `userspace-dp/src/afxdp/flow_cache_tests.rs` with a new
+     `<X>_input_gate_blocks_flow_cache_insertion_via_runbook_pattern`
+     and `_output_gate_*` pair (Codex r2: `FlowCacheEntry` is
+     `pub(super)` inside `afxdp::flow_cache`, so tests must live
+     in `afxdp/`, not `filter/`).
 
 5. **The runbook for path (a) — extend `SessionKey`**: brief
    pointer to the prerequisites — HA sync compatibility, session-
@@ -380,32 +383,40 @@ Mirror block placed above `FirewallTermSnapshot` in
 `userspace-dp/src/protocol/security.rs` so the wire DTO also
 carries the contract.
 
-### 4.3 DSCP-positive harness
+### 4.3 DSCP-positive runbook tests
 
-Add `userspace-dp/src/filter/cache_invariant_harness.rs` (or
-co-locate at the bottom of `tests.rs` to avoid module noise;
-preferred location: bottom of `tests.rs` with a clear section
-comment, to avoid the maintenance cost of a new file for two
-tests). Three new tests:
+Add **two** new tests to
+`userspace-dp/src/afxdp/flow_cache_tests.rs` (the existing home
+of the bespoke DSCP gate tests at lines 643/695, and the only
+module where `FlowCacheEntry::from_forward_decision`'s
+`pub(super)` visibility is reachable — Codex r2 finding):
 
-- `dscp_input_gate_blocks_flow_cache_insertion` — builds a
-  realistic `FirewallFilterSnapshot` with a DSCP match term,
-  binds it as v4 input filter on an interface, drives
+- `dscp_input_gate_blocks_flow_cache_insertion_via_runbook_pattern` —
+  builds a realistic `FirewallFilterSnapshot` with a DSCP match
+  term, binds it as v4 input filter on an interface, drives
   `FlowCacheEntry::from_forward_decision`, asserts `None`.
-- `dscp_output_gate_blocks_flow_cache_insertion` — same for
-  output. (These extend coverage of the existing bespoke tests
-  at `flow_cache_tests.rs:643-745`; we keep the bespoke tests
-  and add these as the canonical "this is the harness pattern"
-  references.)
-- `dscp_rotation_does_not_fire_on_positional_id_change` —
-  parallel positive: rebuild two filter states whose content is
-  identical but whose filter / term positional IDs differ;
-  assert `input_dscp_filter_families_changed` returns
-  `(false, false)`. This is the regression for the round-5
-  carry-item rule "compare by content, not positional IDs."
+  Written in the explicit runbook style the new README section
+  cites — acts as the canonical "this is what a new-field
+  test should look like" reference.
+- `dscp_output_gate_blocks_flow_cache_insertion_via_runbook_pattern`
+  — same for output.
 
-That's three tests, all positive-case only. No fake field,
-no constant list, no trait.
+These two extend coverage of the existing bespoke tests at
+`flow_cache_tests.rs:643-745`; we keep the bespoke tests and
+add these as the runbook references.
+
+Dropped from v2 (per Codex r2 + AGY r2):
+- `dscp_rotation_does_not_fire_on_positional_id_change` —
+  duplicate of the existing
+  `input_dscp_filter_families_changed_ignores_positional_filter_id_change`
+  at `filter/tests.rs:1806`. Cite in the README runbook
+  instead.
+
+Cited from existing coverage (per Codex r2; no new test added):
+- session-hit DSCP re-evaluation: `afxdp/tests.rs:3184`.
+
+Two new tests total. All positive-case. No fake field, no
+constant list, no trait.
 
 ## 5. Public API preservation
 

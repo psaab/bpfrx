@@ -4825,3 +4825,16 @@ top.
   - lo0 README note now one paragraph with `is_cacheable` +
     `poll_descriptor` line refs.
   - Scope shrunk to 2 new tests + 4 cited existing tests.
+
+## 2026-05-26 — #1431 plan v4 (fix stale v3 leftovers)
+
+- **Timestamp**: 03:50 UTC
+- **Action**: AGY r3 flagged 3 stale v2 leftovers in v3; applied fixes
+- **File(s)**: `docs/pr/1431-filter-cache-invariants/plan.md`
+- **Fixes**:
+  - §4.1 #4 runbook bullet: stale `filter/cache_invariant_harness.rs`
+    path → `afxdp/flow_cache_tests.rs` per Codex r2 visibility note.
+  - §4.3 fully rewritten: was 3 tests in `filter/`, now 2 tests in
+    `afxdp/flow_cache_tests.rs`; explicit "dropped from v2" /
+    "cited from existing" subsections.
+  - Test names aligned with §8 (`_via_runbook_pattern` suffix).
