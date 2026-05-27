@@ -4060,3 +4060,7 @@ top.
 ## 03:25 UTC — #1565 plan v2 after round-1 NEEDS-MAJOR
 - **Action**: Revise plan addressing Codex+AGY findings (TunnelNameMap, DHCP key shape, helper centralization, drop CLI smoke claim)
 - **File(s)**: docs/pr/1565-iface-name-translate/plan.md
+
+## 03:35 UTC — #1565 plan v3 after round-2 Codex NEEDS-MAJOR
+- **Action**: Address VLAN-vs-unit conflation, IRB, tunnel collision, DHCP test mock design, smoke specificity
+- **File(s)**: docs/pr/1565-iface-name-translate/plan.md
