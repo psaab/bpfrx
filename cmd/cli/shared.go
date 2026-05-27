@@ -222,7 +222,11 @@ func (c *ctl) dispatchOperational(line string) error {
 		// configLockInterceptor (pkg/grpcapi/server.go) is a UNARY
 		// interceptor — it only fires while an RPC is in flight, never
 		// on connection close. Issuing EnterConfigure here and exiting
-		// would leak the exclusive config lock until daemon restart.
+		// would leak the daemon-side config lock until daemon restart.
+		// Exclusive locks are especially bad: EnterConfigureExclusive
+		// sets `exclusiveHolder`, but ExitConfigureSession only
+		// releases when the session matches `configHolder`, so even
+		// an explicit teardown call wouldn't recover them.
 		// See #1563.
 		if c.rl == nil {
 			return fmt.Errorf(
