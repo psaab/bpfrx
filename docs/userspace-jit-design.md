@@ -1,7 +1,28 @@
 # Userspace Dataplane JIT Compiler Design
 
 Date: 2026-03-17
-Updated: 2026-03-23
+Updated: 2026-05-26
+
+**Tracking issue:** [#1605](https://github.com/psaab/xpf/issues/1605)
+
+## Doc-coherency contract (load-bearing)
+
+This doc and issue #1605 are co-canonical for the userspace JIT
+architecture. **Any PR that changes JIT architecture MUST update
+both** in the same change set:
+
+- The status table immediately below
+- The relevant Phase section
+- A comment on #1605 summarizing the change and linking the PR
+
+Architecture for this purpose means: IR shape, compilation phase
+boundary, flow cache shape, config-invalidation protocol, dispatch
+boundary between cached and uncached paths, choice of code
+generator, or any phase-boundary decision (defer / kill / fold).
+
+Non-architectural changes (perf tuning within an existing phase,
+test additions, build hygiene) do not need a doc update — say so
+explicitly in the PR review notes.
 
 ## Current Status
 
