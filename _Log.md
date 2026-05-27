@@ -4101,3 +4101,9 @@ top.
 - **Timestamp**: 2026-05-27 (UTC)
   - **Action**: Rewrote plan.md v2 addressing all 5 v1 fatal axes: UDP randomized-source-port flooder default (true 64 B Ethernet frames via AF_PACKET); TSC + 1-in-256 sampler replacing per-call clock_gettime; 24-bucket histogram + 16-slot splitmix-hashed per-zone-pair layout; CPU isolation recording (record-not-enforce) with explicit "approximate ceiling under contention" scoping. New cold-path-flooder Rust binary in test/incus/cold-path-flooder/. Dispatching Codex + AGY plan review.
   - **File(s)**: docs/pr/1607-hw-ceiling-microbench/plan.md (v2)
+
+## 2026-05-27 — #1607 plan v2 Claude SMR r2 verdict PLAN-READY-WITH-NIT
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Wrote Claude SMR plan-review r2 verdict PLAN-READY-WITH-NIT. Audited all 5 v1 fatal axes; F1/F1.2/F1.3/F2/F3/F4/F5 all CLOSED. Six nit-class findings (N1-N6: splitmix high-bit defense, TSC calibration drift, keys_xor 3-collision false-negative, #1606/#1608 metrics file collision, flooder/FW co-residence, wrapper baseline subtraction floor). None block. Codex (task-mpoklpy1-tkrdqd) + AGY (adversarial-review-mpoklpnn-a24rwz) plan reviews running in parallel.
+  - **File(s)**: docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r2.md (new), docs/pr/1607-hw-ceiling-microbench/reviewer-ids.md
