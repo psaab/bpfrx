@@ -4089,3 +4089,9 @@ top.
 - **Timestamp**: 2026-05-27 03:42 UTC
   - **Action**: Address Gemini code-review-round-1 MAJOR finding (synthetic tests defended a parallel copy of production canary logic instead of the SUT). Extract scanFileForLegacyDP() helper; both TestLegacyDPAccessorRemoved and the synthetic negative tests now route through it. All 8 tests pass, 5/5 flake clean, full Go suite (32 packages) green.
   - **File(s)**: pkg/daemon/legacy_dataplane_canary_test.go, pkg/daemon/legacy_dataplane_canary_synthetic_test.go
+
+## 2026-05-27 03:48 — #1559 Copilot review: align pass numbering + spelling
+
+- **Timestamp**: 2026-05-27 03:48 UTC
+  - **Action**: Address Copilot inline comments (5 numbering inconsistencies, 2 'descendent'->'descendant' spellings). Pass numbering now consistent everywhere: 1=FuncDecl, 2=StructType.Fields, 3=CallExpr, 4=SelectorExpr, 5=bare Ident. All 8 canary tests still pass, 5/5 flake clean.
+  - **File(s)**: pkg/daemon/legacy_dataplane_canary_test.go, pkg/daemon/legacy_dataplane_canary_synthetic_test.go

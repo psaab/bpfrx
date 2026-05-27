@@ -66,11 +66,11 @@ func scanFileForLegacyDP(fset *token.FileSet, file *ast.File, displayName string
 			"production code.")
 	}
 
-	// Pass 3 — StructType.Fields name match. Catches a sibling
+	// Pass 2 — StructType.Fields name match. Catches a sibling
 	// `legacyDP T` field reintroduction on any struct in the file
 	// (not just Daemon — naming an unrelated struct's field
 	// legacyDP is also blocked; the diagnostic does NOT claim
-	// "Daemon field" because Pass 3 is struct-agnostic).
+	// "Daemon field" because Pass 2 is struct-agnostic).
 	ast.Inspect(file, func(n ast.Node) bool {
 		st, ok := n.(*ast.StructType)
 		if !ok {
@@ -95,7 +95,7 @@ func scanFileForLegacyDP(fset *token.FileSet, file *ast.File, displayName string
 		return true
 	})
 
-	// Pass 2 — CallExpr selector match. Existing v1 shape,
+	// Pass 3 — CallExpr selector match. Existing v1 shape,
 	// preserved for its more actionable "forbidden call to
 	// .legacyDP()" diagnostic. Record at sel.Sel.Pos() so the
 	// line aligns with Pass 4 and Pass 5 for multiline
@@ -142,7 +142,7 @@ func scanFileForLegacyDP(fset *token.FileSet, file *ast.File, displayName string
 	// Pass 5 — bare *ast.Ident name match. Catch-all for any
 	// `legacyDP` token not already named by Pass 1-4. Closes
 	// the package-level callsite bypass: `legacyDP(d)` has
-	// Fun=*ast.Ident, not *ast.SelectorExpr, so Pass 2 and
+	// Fun=*ast.Ident, not *ast.SelectorExpr, so Pass 3 and
 	// Pass 4 do not see it. ast.Inspect walks FuncDecl.Name,
 	// Field.Names, and SelectorExpr.Sel as ast.Ident, so Pass 5
 	// would otherwise duplicate the other passes — record-once
@@ -193,7 +193,7 @@ func scanFileForLegacyDP(fset *token.FileSet, file *ast.File, displayName string
 // parser.ParseComments, so the AST does not include *ast.Comment
 // nodes; mentions of legacyDP in // ... or /* ... */ blocks are
 // invisible to this canary. String literals are *ast.BasicLit
-// whose Value is a string, not descendent *ast.Ident — so string
+// whose Value is a string, not descendant *ast.Ident — so string
 // literals mentioning legacyDP are also safe.
 //
 // Out of scope:

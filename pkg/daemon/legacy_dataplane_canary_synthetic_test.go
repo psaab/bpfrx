@@ -44,7 +44,8 @@ func hasOffenderOnLine(offenders []string, line int) bool {
 }
 
 // TestCanarySyntheticStructFieldReintroduction — AGY P2 / #1559.
-// A sibling field on Daemon named legacyDP must trip Pass 3.
+// A sibling field on Daemon named legacyDP must trip Pass 2
+// (StructType.Fields).
 func TestCanarySyntheticStructFieldReintroduction(t *testing.T) {
 	t.Parallel()
 	src := `package daemon
@@ -81,7 +82,7 @@ func ExampleRead(d *Daemon) {
 }
 
 // TestCanarySyntheticCallSitePreserved — existing v1 behavior.
-// `d.legacyDP()` must still trip Pass 2.
+// `d.legacyDP()` must still trip Pass 3 (CallExpr).
 func TestCanarySyntheticCallSitePreserved(t *testing.T) {
 	t.Parallel()
 	src := `package daemon
@@ -152,7 +153,7 @@ func Caller(d *Daemon) {
 // `legacyDP` in comments and string literals must NOT trip the
 // canary, because parser.ParseFile without parser.ParseComments
 // drops *ast.Comment nodes and string literals are *ast.BasicLit
-// (whose Value field is a Go string, not descendent ast.Ident).
+// (whose Value field is a Go string, not descendant ast.Ident).
 func TestCanarySyntheticCommentsAndStringsSafe(t *testing.T) {
 	t.Parallel()
 	src := `package daemon
