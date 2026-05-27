@@ -1,6 +1,6 @@
 # #1559 plan — harden legacy_dataplane_canary against struct-field + selector reintroduction
 
-**Status:** DRAFT v2 — addresses Codex + Gemini PLAN-NEEDS-MINOR (round 1)
+**Status:** DRAFT v3 — addresses Codex round-2 PLAN-NEEDS-MINOR (position tokens + Pass-4 noise wording)
 
 ## Issue framing
 
@@ -89,7 +89,10 @@ for _, decl := range file.Decls {
     }
     // Receiver shape no longer narrows — Daemon method,
     // package-level function, or any other shape is forbidden.
-    pos := fset.Position(fd.Pos())
+    // Record at fd.Name.Pos() (not fd.Pos()) so multiline function
+    // declarations land the offender on the identifier's line, not
+    // the opening `func` keyword. Pairs with Pass 5's ident.Pos().
+    pos := fset.Position(fd.Name.Pos())
     msg := "forbidden function/method declaration named legacyDP — " +
         "removed in #1519, see plan-impl.md. The identifier is " +
         "reserved within pkg/daemon production code."
@@ -107,46 +110,16 @@ is `*ast.Ident` (no selector) needs to be caught by walking
 `legacyDP`, local var assignments `legacyDP := ...`, and any other
 bare identifier use.
 
-```go
-ast.Inspect(file, func(n ast.Node) bool {
-    ident, ok := n.(*ast.Ident)
-    if !ok {
-        return true
-    }
-    if ident.Name != "legacyDP" {
-        return true
-    }
-    // Skip occurrences inside SelectorExpr.Sel — those are caught
-    // by Pass 4 with a more specific selector-shaped message.
-    // We don't have parent-pointer info inside ast.Inspect's
-    // callback, so we instead suppress this pass when the parent
-    // is a SelectorExpr by checking inside the SelectorExpr walk
-    // and adding a sentinel — but that's overkill. Simpler:
-    // accept the duplicate offender entries (one from Pass 4 for
-    // the selector, one from Pass 5 for the bare ident embedded
-    // in the selector). The canary is already in fail-state when
-    // either fires; duplicate offenders just make the diagnostic
-    // louder.
-    pos := fset.Position(ident.Pos())
-    offenders = append(offenders,
-        name+":"+itoa(pos.Line)+": forbidden identifier legacyDP — "+
-            "removed in #1519; the name is reserved within pkg/daemon "+
-            "production code (no field, method, function, selector, "+
-            "or bare identifier may use it)")
-    return true
-})
-```
-
-Wait — `ast.Inspect` walks every node, including the `Sel` of every
-`SelectorExpr` and the `Name` of every `FuncDecl`. That means Pass 5
-will fire on the SAME identifier node that Pass 1's `fd.Name` and
-Pass 4's `sel.Sel` are checking. Duplicate offender entries on
-every match. That's not the fail mode we want — a single struct-field
+Because `ast.Inspect` walks every node — including the `Sel` of
+every `SelectorExpr`, the `Name` of every `FuncDecl`, and the `Names`
+of every `*ast.Field` — Pass 5 will fire on the SAME identifier node
+that Pass 1's `fd.Name`, Pass 3's field `Names[i]`, and Pass 4's
+`sel.Sel` are also checking. Without dedup, a single struct-field
 reintroduction would emit ~3-5 offenders for the same line.
 
-Better approach: keep a `set` of `(file, line)` already-recorded and
-only append an offender when not present. Implement as a
-`map[string]bool` keyed on `name + ":" + itoa(line)`:
+Solution: a record-once dedup keyed on `(file, line)`. First pass
+to record wins; later passes on the same line are suppressed. Pass
+order is chosen so the most specific diagnostic survives.
 
 ```go
 recorded := make(map[string]bool)
@@ -160,10 +133,33 @@ record := func(pos token.Position, msg string) {
 }
 ```
 
-Each pass calls `record(...)` instead of appending directly. First
-hit wins; later passes on the same line are suppressed. The order of
-passes determines which message survives — keep the most specific
-message first (FuncDecl > StructType.Field > SelectorExpr/CallExpr >
+Each pass calls `record(...)` instead of appending directly. With
+dedup in place, Pass 5 becomes:
+
+```go
+ast.Inspect(file, func(n ast.Node) bool {
+    ident, ok := n.(*ast.Ident)
+    if !ok {
+        return true
+    }
+    if ident.Name != "legacyDP" {
+        return true
+    }
+    // Pass 5 is the catch-all. Earlier passes (1, 3, 2, 4) record
+    // their more specific diagnostics first; this pass only writes
+    // when the (file, line) hasn't been recorded yet, e.g. a bare
+    // callsite `legacyDP(d)` whose Fun is *ast.Ident (no SelectorExpr).
+    pos := fset.Position(ident.Pos())
+    record(pos, "forbidden identifier legacyDP — removed in #1519; "+
+        "the name is reserved within pkg/daemon production code "+
+        "(no field, method, function, selector, or bare identifier "+
+        "may use it)")
+    return true
+})
+```
+
+Pass ordering invariants: most specific first
+(FuncDecl > StructType.Field > CallExpr > SelectorExpr >
 bare Ident).
 
 ### Pass 3 — struct-field reintroduction
@@ -219,6 +215,13 @@ reintroduction takes the call-shape (most common path). With the
 record-once deduplication in place, this fires first for any callsite
 and suppresses the SelectorExpr/Ident duplicates on the same line.
 
+Update Pass 2 to record at `sel.Sel.Pos()` (not `call.Pos()`) so the
+recorded line matches Pass 4 and Pass 5 for the multiline
+`d.\n  legacyDP()` case. Pairs with the record-once dedup so the same
+line that Pass 2 catches via the CallExpr is also the line Pass 4
+would have used for the selector and Pass 5 would have used for the
+bare ident.
+
 ### Pass 4 — SelectorExpr matching (catches bare selector reads)
 
 Walk every `*ast.SelectorExpr` (including those NOT wrapped in
@@ -240,7 +243,11 @@ ast.Inspect(file, func(n ast.Node) bool {
     if sel.Sel == nil || sel.Sel.Name != "legacyDP" {
         return true
     }
-    pos := fset.Position(sel.Pos())
+    // Record at sel.Sel.Pos() (not sel.Pos()) so multiline
+    // `d.\n  legacyDP` lands on the identifier's line, which
+    // matches the line Pass 5 would record. Pairs with the
+    // record-once dedup.
+    pos := fset.Position(sel.Sel.Pos())
     record(pos, "forbidden selector .legacyDP — removed in #1519; "+
         "do not re-introduce as a field, method, or accessor. "+
         "Use a typed probe in runtime_probes.go instead")
@@ -248,14 +255,15 @@ ast.Inspect(file, func(n ast.Node) bool {
 })
 ```
 
-Note: this pass subsumes the existing CallExpr check. The current
-CallExpr loop fires on `d.legacyDP()`; the new SelectorExpr loop
-fires on the inner `d.legacyDP` of the same expression — same line,
-same line number. To avoid double-reporting, we keep the CallExpr
-loop intact (it has a more specific, call-site-shaped message) and
-let the SelectorExpr loop ALSO fire — both emissions reference the
-same line; the unified offenders message is acceptable noise for
-the rare case where the canary actually trips.
+Note: this pass overlaps with the existing CallExpr check. The
+existing CallExpr loop fires on `d.legacyDP()`; the new SelectorExpr
+loop fires on the inner `d.legacyDP` of the same expression. Both
+record at `sel.Sel.Pos()` (same identifier token, same line). With
+the record-once dedup in place, Pass 2 (CallExpr) runs BEFORE Pass 4
+(SelectorExpr), so Pass 2's call-shaped diagnostic wins the
+`(file, line)` slot and Pass 4 is suppressed for that line. Pass 4
+still fires on its own when the offender is a bare selector read
+(no CallExpr wrap), which is the new shape it exists to catch.
 
 Alternative considered: replace the CallExpr loop entirely with
 just the SelectorExpr loop. Rejected because the existing call-shape
@@ -268,10 +276,12 @@ removing it would be a behavior change unrelated to this hardening.
 `legacyDP` field declarations don't appear as `*ast.SelectorExpr` —
 they live in `*ast.StructType.Fields`. So Pass 3 catches the
 *declaration*; Pass 4 catches the *use*. A struct-field reintroduction
-will trip both (declaration on one line, every consumer on its own
-line) — the test author will see a clear unified failure with multiple
-offender entries, all pointing at the same root cause. That's the
-right behavior: each line that needs to change is named.
+trips Pass 3 on the declaration line and Pass 4 on each consumer
+line. With record-once dedup the diagnostic on the declaration line
+is the StructType message (Pass 3 wins; Pass 5 is suppressed for that
+same line because `ast.Inspect` reaches the field's `*ast.Ident` and
+calls `record` for it AFTER Pass 3 has already inserted the key).
+Consumer lines get the SelectorExpr message from Pass 4.
 
 ### Pass execution order (record-once)
 
