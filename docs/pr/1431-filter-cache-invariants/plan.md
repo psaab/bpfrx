@@ -241,7 +241,9 @@ Reference call sites for the #1430 pattern:
 - DSCP rotation tests —
   `userspace-dp/src/filter/tests.rs:1733-2000`
 
-The 5-tuple session/flow-cache key —
+The session/flow-cache key (standard 5-tuple plus an `addr_family`
+byte that is redundant with `IpAddr` variant but materialized for
+cheap branchless checks) —
 `userspace-dp/src/session/key.rs:9-17`:
 
 ```rust

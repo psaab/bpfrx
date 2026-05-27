@@ -4898,3 +4898,24 @@ top.
 - **File(s)**:
   - `userspace-dp/src/filter/README.md`
   - `_Log.md` (this entry)
+
+## 2026-05-26 — #1431 Copilot r2 + Codex r2 cleanup
+
+- **Timestamp**: 22:35 UTC
+- **Action**: addressed Copilot r2 inline findings; Codex r2 MERGE-READY
+- **File(s)**:
+  - `userspace-dp/src/filter/README.md` — 5-tuple framing
+    (Copilot r2 inline #1)
+  - `docs/pr/1431-filter-cache-invariants/plan.md` — same
+    (Copilot r2 inline #2)
+  - `docs/pr/1431-filter-cache-invariants/claude-smr-code-r1.md`
+    — addendum recording the byte-range (1d669302d) and 5-tuple
+    drift corrections
+- **Reviewer verdicts at post-fix head**:
+  - Codex r2: MERGE-READY (verified at 778450f74; 933ee/this commit
+    are doc-only on top — Copilot's 1d6693 byte-range is a strict
+    improvement)
+  - AGY r1: MERGE-READY at 705d62f67 — no substantive code change
+    since
+  - Copilot r2: COMMENTED with 2 inline findings → fixes applied
+  - Claude SMR: MERGE-READY with addendum

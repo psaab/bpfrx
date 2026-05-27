@@ -292,3 +292,34 @@ and both prior plan rounds verified the alternatives
 trait, fake-field harness) are theater.
 
 MERGE-READY after Codex r1 minors pushed.
+
+---
+
+## Addendum (post-rebase corrections)
+
+After the Codex r1 + Copilot r1 fixes were pushed at `778450f74`,
+two further drift items were caught and resolved:
+
+1. **ICMP byte range (Copilot swe-agent commit `1d669302d`)** — my
+   fix for Copilot's first inline finding said `parse_flow_ports`
+   "reads bytes 4-6 of the ICMP header". The actual code is
+   `frame.get(l4 + 4..l4 + 6)?` — a Rust half-open range covering
+   exactly two bytes at offsets 4 and 5. Copilot's swe-agent
+   auto-corrected the README to "bytes 4-5"; the correction is
+   right and I missed it in the original SMR pass. Self-correction
+   noted.
+
+2. **5-tuple vs 6-tuple framing (Copilot r2 inline)** — my v5 plan
+   described `SessionKey` as a 6-tuple because the struct literally
+   has six fields. Copilot's second inline correctly noted this
+   conflicts with the standard 5-tuple language used elsewhere in
+   the codebase (e.g. `flow_cache.rs` comments). Both occurrences
+   (README §"The cache key" and plan §3) now describe the key as
+   "the standard 5-tuple plus an `addr_family` byte that is
+   redundant with `IpAddr` variant but materialized for cheap
+   branchless checks." This is the same information without the
+   terminology collision.
+
+Both corrections strictly tighten the doc. They do not change the
+runtime behavior, the in-source contract block, or the test
+shape. The verdict remains **MERGE-READY** at the post-fix SHA.

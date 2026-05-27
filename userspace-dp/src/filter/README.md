@@ -124,8 +124,11 @@ first-packet forwarding decision for later packets that can differ
 on those fields.
 
 **The cache key.** `SessionKey`
-(`userspace-dp/src/session/key.rs`) is a 6-tuple:
-`addr_family`, `protocol`, `src_ip`, `dst_ip`, `src_port`, `dst_port`.
+(`userspace-dp/src/session/key.rs`) is the standard 5-tuple
+(`protocol`, `src_ip`, `dst_ip`, `src_port`, `dst_port`) plus an
+`addr_family` byte. The `addr_family` byte is redundant with the
+`IpAddr` variant carried by `src_ip` / `dst_ip` but is materialized
+on the struct for cheap branchless checks on the hot path.
 For ICMP and ICMPv6 sessions, `parse_flow_ports`
 (`userspace-dp/src/afxdp/frame/inspect.rs:212-232`) unconditionally
 reads bytes 4-5 of the ICMP header into `src_port` (the ICMP
