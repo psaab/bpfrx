@@ -310,21 +310,27 @@ func expandBookNameToCIDRs(cfg *config.Config, name string) ([]string, []string)
 	return v4, v6
 }
 
-func expandBookNameRecursive(ab *config.AddressBook, name string, visited map[string]bool, depth int) []string {
-	if depth > 5 || visited[name] {
+// expandBookNameRecursive resolves named book references via
+// path-based cycle detection. No depth cap (matches the legacy
+// `resolveUserspaceAddressBookEntry` semantics — Copilot review C2).
+// `visited` is mutated on entry and unwound on exit so siblings
+// can share parents without false cycles.
+func expandBookNameRecursive(ab *config.AddressBook, name string, visited map[string]bool, _depth int) []string {
+	if visited[name] {
 		return nil
 	}
 	visited[name] = true
+	defer func() { delete(visited, name) }()
 	if addr, ok := ab.Addresses[name]; ok {
 		return []string{addr.Value}
 	}
 	if as, ok := ab.AddressSets[name]; ok {
 		var out []string
 		for _, member := range as.Addresses {
-			out = append(out, expandBookNameRecursive(ab, member, visited, depth+1)...)
+			out = append(out, expandBookNameRecursive(ab, member, visited, 0)...)
 		}
 		for _, nested := range as.AddressSets {
-			out = append(out, expandBookNameRecursive(ab, nested, visited, depth+1)...)
+			out = append(out, expandBookNameRecursive(ab, nested, visited, 0)...)
 		}
 		return out
 	}
