@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-05-26 12:50 UTC — #1598 plan v2 (after round-1 reviewer split)
+
+- **Timestamp**: 2026-05-26 12:50 UTC
+- **Action**: Updated plan to v2 incorporating round-1 reviewer outcomes. Codex PLAN-KILL was infra-blocked (sandbox runner missing); AGY round-1 verdict PLAN-READY after walking the actual files. Added explicit trace of `build_worker_cos_owner_live_by_tx_ifindex` showing `tx_owner_live` is per-worker local (loop_body/mod.rs:91-95), so Step2 never funnels foreign-worker. Documented residual concern about non-binding workers (not applicable to the loss userspace cluster which has every worker bound to reth0.80 mlx5 VF). Re-dispatching Codex (task task-mpnbpfz0-mz69n4).
+- **File(s)**: `docs/pr/1598-cos-uncapped-fix/plan.md`
+
 ## 2026-05-26 12:30 UTC — #1598 plan v1 (CoS iperf-uncapped caps at ~10 Gbps)
 
 - **Timestamp**: 2026-05-26 12:30 UTC

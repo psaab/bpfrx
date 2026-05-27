@@ -1,6 +1,6 @@
 # Plan v1 — #1598 CoS `iperf-uncapped` capped at ~10 Gbps
 
-Status: DRAFT v1 — pending adversarial plan review (Codex + AGY).
+Status: DRAFT v2 — addresses round-1 Codex PLAN-KILL concern about Step2 `tx_owner_live` funnel by tracing `build_worker_cos_owner_live_by_tx_ifindex` and the per-worker binding topology of the loss userspace cluster. AGY round-1 verdict: PLAN-READY.
 
 ## Issue framing
 
@@ -240,6 +240,65 @@ decision to honor non-exact-shared-exact as a Step1 + Step2 bail.
   property, not a code property).
 - We do NOT touch the `shared_queue_lease` / `vtime_floor` allocation
   filter — non-exact queues continue to skip those.
+- We do NOT harden `resolve_local_routing_decision` against the
+  hypothetical non-binding-worker case (Step1 bail without
+  `tx_owner_live.is_some()` for `shared_exact=true` queues). The
+  current loss userspace cluster has every worker bound to the
+  egress's tx_ifindex, so the threshold flip is sufficient. If a
+  future topology breaks that assumption, a follow-up PR can
+  un-gate the Step1 bail.
+
+## Round-1 review outcomes (preserved before re-dispatch)
+
+### Codex round 1 (task-mpnbg9oh-c7q5iu): PLAN-KILL (infra-blocked)
+
+Codex reported its sandbox runner was missing and could not perform
+verified file reads. Based on the supplied plan facts alone it would
+PLAN-KILL because the plan's open-question §2 left the Step2
+`tx_owner_live` funnel unresolved at file:line. Codex did not have
+access to walk the actual code that resolves the concern.
+
+### AGY round 1 (review-mpnbgnt3-l6tlm1): PLAN-READY
+
+AGY walked the actual files at the commit and verified every claim
+in the root-cause analysis. The key clarification on the Step2
+`tx_owner_live` question:
+
+* `tx_owner_live_by_tx_ifindex` is populated **per-worker, locally**
+  inside `userspace-dp/src/afxdp/worker/loop_body/mod.rs:91-95` by
+  iterating ONLY this worker's own bindings:
+  `bindings.iter().map(|b| (b.ifindex, b.live.clone()))`.
+* Consequently `iface_fast.tx_owner_live` is either `None` (worker
+  has no binding on the egress's tx_ifindex) or `Some(self.live)`
+  (worker is bound to that interface). In the latter case
+  `Arc::ptr_eq(owner_live, current_live)` is `true`, so `step2`
+  evaluates to `None`.
+* Step2 NEVER funnels to a foreign worker. Only Step1's
+  `owner_worker_id` clause funnels.
+
+### Residual concern from round 1: non-binding workers
+
+For workers WITHOUT a binding on the egress's tx_ifindex,
+`tx_owner_live = None`, so the Step1 bail clause
+`shared_exact && tx_owner_live.is_some()` is false (second AND
+operand fails). Such workers would still route to `owner_worker_id`
+even after the threshold flip, re-creating the funnel.
+
+The loss userspace cluster (`loss:xpf-userspace-fw0/fw1`) has every
+worker bound to reth0.80's underlying mlx5 VF tx_ifindex (one binding
+per worker per RSS queue), so this concern doesn't apply to the
+target cluster. But the general fix surface is still
+`queue_uses_shared_exact_service` — flipping `shared_exact=true` for
+the uncapped class fires the Step1 bail on every worker that has a
+binding on the egress, which is every worker in the production loss
+cluster.
+
+If a future deployment had non-binding workers (e.g., a worker that
+serves a different ingress NIC and only redirects to this egress), a
+follow-up patch may be needed to bail Step1 in
+`resolve_local_routing_decision` based on `shared_exact` alone (not
+gated on `tx_owner_live.is_some()`). That hardening is out of scope
+for this PR — see "Out of scope" below.
 
 ## Open questions for adversarial review
 
