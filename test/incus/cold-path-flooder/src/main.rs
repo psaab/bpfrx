@@ -347,13 +347,26 @@ fn main() {
 
     let _seed = args.seed;
     let _prng = Xorshift64(args.seed);
-    eprintln!("cold-path-flooder: runner stub — see plan v2 patched §4.2 (impl in follow-up commit)");
-    eprintln!("cold-path-flooder: validated args + cohort cap; exit 0.");
+    // Per AGY r4: a downstream harness should NOT mistake the stub
+    // for a successful run. We print a loud, unambiguous "STUB" tag
+    // on stderr AND exit with a distinctive non-zero status (71 =
+    // sysexits.h EX_OSERR, "internal software error"). Any harness
+    // shell script keying off `$?` will treat this as failure, not
+    // success.  Replace this entire `main()` tail with the real
+    // AF_PACKET runner in the follow-up commit tracked by #1611.
+    eprintln!(
+        "cold-path-flooder: STUB — runner body deferred to #1611 (see plan v2-r4 §4.2)"
+    );
+    eprintln!(
+        "cold-path-flooder: STUB — validated args + cohort cap; exit 71 to flag NOT-IMPLEMENTED"
+    );
 
     // Suppress unused warnings for libc primitives we'll need.
     let _ = (size_of::<libc::sockaddr_ll>(), ptr::null::<c_void>() as *const _, 0 as c_int);
     let _ = CString::new("placeholder").unwrap();
     let _ = Instant::now();
+
+    std::process::exit(71);
 }
 
 #[cfg(test)]

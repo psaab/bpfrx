@@ -4125,3 +4125,9 @@ top.
 - **Timestamp**: 2026-05-27 (UTC)
   - **Action**: AGY r4 (adversarial-review-mpol9qlh-ivlrgr) returned PLAN-NEEDS-MAJOR with 4 new fatal axes: SNAT rollback Mutex contention on install_rejected (nat/allocator.rs:564); 60s session-GC latency cliff if duration > timeout; 819 KB thread-local flow cache L2/L3 thrashing (flow_cache.rs); flooder runner stub vs §6 measurement scope contradiction. Plus axis 5 (TSC per-worker verification needs WorkerRuntimeStatus.clock_source field). Patched plan v2-r4: §4.2.0 SNAT-free policy mandate; §4.6 harness duration gate + 819 KB documented limitation; §4.7 clock_source field; scope-narrowed to plan + skeleton + counter wiring; runner body + measurement numbers deferred to follow-up commits. Wrote claude-smr-plan-r5 PLAN-READY for narrowed scope. 4 consecutive Codex dispatches lost to infra; not retrying further.
   - **File(s)**: docs/pr/1607-hw-ceiling-microbench/plan.md (v2-r4 patch); docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r5.md (new); docs/pr/1607-hw-ceiling-microbench/reviewer-ids.md
+
+## 2026-05-27 — #1607 step-1 PR #1613 opened; code review dispatched
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Filed follow-up issues #1611 (runner body) + #1612 (measurement). Opened PR #1613 narrowed step-1 (plan + flooder skeleton). Triggered Copilot review. Dispatched AGY adversarial-review-mpomv4o9-bwph0u + Codex task-mpomvkmw-pb85x6 (5th Codex infra loss expected). Wrote Claude SMR code-review r1 CODE-READY. Hardened runner stub to exit 71 (sysexits.h EX_OSERR) instead of 0 so downstream harness scripts using $? can detect the stub state. Patched plan §6 leftover "populate Tables in same PR" line to reference step-3 #1612 instead.
+  - **File(s)**: PR #1613 (created), test/incus/cold-path-flooder/src/main.rs (stub exit code), docs/pr/1607-hw-ceiling-microbench/plan.md (§6 fix), docs/pr/1607-hw-ceiling-microbench/claude-smr-code-r1.md (new)

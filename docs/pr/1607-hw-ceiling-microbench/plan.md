@@ -771,9 +771,11 @@ Prometheus scrape budget; comparable to existing
   must pass; reviewers confirm whether failover is required).
 - Smoke matrix on loss userspace cluster: v4+v6 × push+`-R` ×
   CoS-off+CoS-on (per CLAUDE.md feedback memory).
-- Run the new harness end-to-end at rules ∈ {10, 100, 1K, 10K};
-  populate §4.6 Tables A and B with measured numbers in the same
-  PR.
+- Run the new harness end-to-end at rules ∈ {10, 100, 1K, 10K}
+  and populate §4.6 Tables A1/A2/B1/B2 with measured numbers
+  **in the step-3 follow-up PR (#1612)**, not in step-1. The
+  step-1 PR scope intentionally stops at plan + flooder CLI
+  skeleton + counter wiring per AGY r4 axis 4 PLAN-NEEDS-MAJOR.
 
 ## 7. Out of scope
 
