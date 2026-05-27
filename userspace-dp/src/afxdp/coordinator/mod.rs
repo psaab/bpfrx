@@ -433,6 +433,24 @@ impl Coordinator {
     }
 
     pub fn refresh_runtime_snapshot(&mut self, snapshot: &crate::ConfigSnapshot) {
+        // #1606: preflight policy validation BEFORE any
+        // side-effecting mutation (neighbor manager keys,
+        // validation, policy_counters). If integrity errors fire,
+        // keep ALL existing state.
+        if let Err(err) = crate::policy::parse_policy_state_with_counters(
+            &snapshot.default_policy,
+            &snapshot.policies,
+            &self.forwarding.zone_name_to_id,
+            &snapshot.address_books,
+            &self.policy_counters,
+        ) {
+            eprintln!(
+                "xpf-userspace-dp: snapshot integrity error during refresh_runtime_snapshot preflight: {} — keeping previous state",
+                err
+            );
+            return;
+        }
+
         let next_manager_keys = snapshot
             .neighbors
             .iter()
@@ -474,12 +492,24 @@ impl Coordinator {
         // may not include them if the peer MAC wasn't resolved at
         // snapshot build time. Always keep the better-resolved set.
         let preserved_fabrics = self.forwarding.fabrics.clone();
-        self.policy_counters.reconcile_rules(&snapshot.policies);
-        self.forwarding = build_forwarding_state_with_policy_counters_and_previous(
+        // #1606: preflight policy build. If integrity errors fire,
+        // keep the existing forwarding state.
+        let new_forwarding = match build_forwarding_state_with_policy_counters_and_previous(
             snapshot,
             &self.policy_counters,
             Some(&self.forwarding),
-        );
+        ) {
+            Ok(fwd) => fwd,
+            Err(err) => {
+                eprintln!(
+                    "xpf-userspace-dp: snapshot integrity error during runtime-snapshot refresh: {} — keeping previous forwarding state",
+                    err
+                );
+                return;
+            }
+        };
+        self.policy_counters.reconcile_rules(&snapshot.policies);
+        self.forwarding = new_forwarding;
         if self.forwarding.fabrics.is_empty() && !preserved_fabrics.is_empty() {
             self.forwarding.fabrics = preserved_fabrics;
         } else if !preserved_fabrics.is_empty() {

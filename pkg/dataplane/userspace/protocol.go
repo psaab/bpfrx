@@ -68,9 +68,21 @@ type ConfigSnapshot struct {
 	ClassOfService     *ClassOfServiceSnapshot      `json:"class_of_service,omitempty"`
 	FlowExport         *FlowExportSnapshot          `json:"flow_export,omitempty"`
 	MirrorConfigs      []MirrorConfigSnapshot       `json:"mirror_configs,omitempty"`
+	AddressBooks       []AddressBookSnapshot        `json:"address_books,omitempty"`
 	Config             *config.Config               `json:"config,omitempty"`
 	Userspace          config.UserspaceConfig       `json:"userspace"`
 	DeferWorkers       bool                         `json:"defer_workers,omitempty"`
+}
+
+// AddressBookSnapshot is #1606: one row of the deduplicated address-book
+// table. Multiple Junos-declared names whose canonical CIDR sets are
+// identical share one row + one ID. Name is diagnostic-only
+// (lexicographically smallest declaring name).
+type AddressBookSnapshot struct {
+	ID         uint32   `json:"id"`
+	Name       string   `json:"name,omitempty"`
+	PrefixesV4 []string `json:"prefixes_v4,omitempty"`
+	PrefixesV6 []string `json:"prefixes_v6,omitempty"`
 }
 
 type FlowSnapshot struct {
@@ -421,18 +433,29 @@ type PolicyApplicationSnapshot struct {
 }
 
 type PolicyRuleSnapshot struct {
-	RuleID               string                      `json:"rule_id,omitempty"`
-	PolicyID             uint32                      `json:"policy_id,omitempty"`
-	Name                 string                      `json:"name"`
-	FromZone             string                      `json:"from_zone,omitempty"`
-	ToZone               string                      `json:"to_zone,omitempty"`
-	SchedulerName        string                      `json:"scheduler_name,omitempty"`
-	Inactive             bool                        `json:"inactive,omitempty"`
-	SourceAddresses      []string                    `json:"source_addresses,omitempty"`
-	DestinationAddresses []string                    `json:"destination_addresses,omitempty"`
-	Applications         []string                    `json:"applications,omitempty"`
-	ApplicationTerms     []PolicyApplicationSnapshot `json:"application_terms,omitempty"`
-	Action               string                      `json:"action,omitempty"`
+	RuleID        string `json:"rule_id,omitempty"`
+	PolicyID      uint32 `json:"policy_id,omitempty"`
+	Name          string `json:"name"`
+	FromZone      string `json:"from_zone,omitempty"`
+	ToZone        string `json:"to_zone,omitempty"`
+	SchedulerName string `json:"scheduler_name,omitempty"`
+	Inactive      bool   `json:"inactive,omitempty"`
+	// Legacy field (carries full expansion: literals ∪ book CIDRs).
+	// Used by old-Rust binaries reading new-Go snapshots. New-Rust
+	// IGNORES this field when the rule is v3-shaped.
+	SourceAddresses      []string `json:"source_addresses,omitempty"`
+	DestinationAddresses []string `json:"destination_addresses,omitempty"`
+	// #1606: dense u32 IDs of named address books cited by the
+	// rule.
+	SourceBookIDs      []uint32 `json:"source_book_ids,omitempty"`
+	DestinationBookIDs []uint32 `json:"destination_book_ids,omitempty"`
+	// #1606: free-form CIDR / "any" literals written inline in the
+	// rule (NOT a named address-book reference).
+	SourceLiterals      []string                    `json:"source_literals,omitempty"`
+	DestinationLiterals []string                    `json:"destination_literals,omitempty"`
+	Applications        []string                    `json:"applications,omitempty"`
+	ApplicationTerms    []PolicyApplicationSnapshot `json:"application_terms,omitempty"`
+	Action              string                      `json:"action,omitempty"`
 }
 
 type InterfaceAddressSnapshot struct {

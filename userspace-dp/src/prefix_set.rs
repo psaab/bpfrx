@@ -32,9 +32,16 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 pub(crate) const PREFIX_SET_LINEAR_MAX: usize = 16;
 
 /// IPv4 prefix membership set. See module docs.
+///
+/// `MatchNone` (#1606) is distinct from `MatchAny`: it means
+/// "no criteria specified; the address-side of the rule does not
+/// match any IP". `from_prefixes(empty)` returns `MatchAny`
+/// (legacy convention preserved for back-compat), while the new
+/// `from_v3_literals(empty)` returns `MatchNone`.
 #[derive(Debug, Clone)]
 pub(crate) enum PrefixSetV4 {
     MatchAny,
+    MatchNone,
     Linear(Vec<PrefixV4>),
     Trie(PrefixTrieV4),
 }
@@ -42,22 +49,40 @@ pub(crate) enum PrefixSetV4 {
 #[derive(Debug, Clone)]
 pub(crate) enum PrefixSetV6 {
     MatchAny,
+    MatchNone,
     Linear(Vec<PrefixV6>),
     Trie(PrefixTrieV6),
 }
 
 impl PrefixSetV4 {
-    /// Build a `PrefixSetV4` from a vector of prefixes.
-    ///
-    /// - Empty input → `MatchAny` (legacy behavior — `is_empty()`
-    ///   on the old `Vec<PrefixV4>` was treated as "match everything").
-    /// - Any prefix with length 0 (`0.0.0.0/0`) → `MatchAny`. The
-    ///   trie path never sets `covers` on the root, so we shortcut.
-    /// - Up to `PREFIX_SET_LINEAR_MAX` prefixes → `Linear`.
-    /// - More → `Trie`.
+    /// Legacy factory: empty input collapses to `MatchAny`. Used by
+    /// the non-v3-shaped fallback path that parses fully-expanded
+    /// `source_addresses` from old-Go snapshots.
     pub(crate) fn from_prefixes(prefixes: Vec<PrefixV4>) -> Self {
         if prefixes.is_empty() {
             return Self::MatchAny;
+        }
+        if prefixes.iter().any(|p| p.prefix_len() == 0) {
+            return Self::MatchAny;
+        }
+        if prefixes.len() <= PREFIX_SET_LINEAR_MAX {
+            Self::Linear(prefixes)
+        } else {
+            let mut trie = PrefixTrieV4::default();
+            for p in &prefixes {
+                trie.insert(p);
+            }
+            Self::Trie(trie)
+        }
+    }
+
+    /// #1606 v3 factory: empty input collapses to `MatchNone`,
+    /// breaking the legacy "empty Vec = MatchAny" coupling for
+    /// v3-shaped rule sides + book entries. Used when the rule
+    /// is v3-shaped on this side, and when building book entries.
+    pub(crate) fn from_v3_literals(prefixes: Vec<PrefixV4>) -> Self {
+        if prefixes.is_empty() {
+            return Self::MatchNone;
         }
         if prefixes.iter().any(|p| p.prefix_len() == 0) {
             return Self::MatchAny;
@@ -78,24 +103,26 @@ impl PrefixSetV4 {
     pub(crate) fn contains(&self, ip: Ipv4Addr) -> bool {
         match self {
             Self::MatchAny => true,
+            Self::MatchNone => false,
             Self::Linear(v) => v.iter().any(|p| p.contains(ip)),
             Self::Trie(t) => t.contains(ip),
         }
     }
 
-    /// Set cardinality (count of unique terminal prefixes), used
-    /// only for the `forwarding_build.rs:467` debug-log readout.
-    /// Two intentional changes vs the legacy `Vec::len()`:
-    /// - `MatchAny` reports 0 (matches the legacy "empty Vec ⇒ 0"
-    ///   read; new path is `["any"]` or all-malformed-input or any
-    ///   `/0` collapse).
-    /// - `Trie` reports the deduped count: inserting the same
-    ///   prefix N times yields size 1, not N. Linear preserves the
-    ///   raw input length.
-    /// Debug-only; not on any data-path.
+    #[inline]
+    pub(crate) fn is_match_any(&self) -> bool {
+        matches!(self, Self::MatchAny)
+    }
+
+    #[inline]
+    pub(crate) fn is_match_none(&self) -> bool {
+        matches!(self, Self::MatchNone)
+    }
+
+    /// Set cardinality. Debug-only.
     pub(crate) fn prefix_count(&self) -> usize {
         match self {
-            Self::MatchAny => 0,
+            Self::MatchAny | Self::MatchNone => 0,
             Self::Linear(v) => v.len(),
             Self::Trie(t) => t.size,
         }
@@ -121,18 +148,47 @@ impl PrefixSetV6 {
         }
     }
 
+    pub(crate) fn from_v3_literals(prefixes: Vec<PrefixV6>) -> Self {
+        if prefixes.is_empty() {
+            return Self::MatchNone;
+        }
+        if prefixes.iter().any(|p| p.prefix_len() == 0) {
+            return Self::MatchAny;
+        }
+        if prefixes.len() <= PREFIX_SET_LINEAR_MAX {
+            Self::Linear(prefixes)
+        } else {
+            let mut trie = PrefixTrieV6::default();
+            for p in &prefixes {
+                trie.insert(p);
+            }
+            Self::Trie(trie)
+        }
+    }
+
     #[inline]
     pub(crate) fn contains(&self, ip: Ipv6Addr) -> bool {
         match self {
             Self::MatchAny => true,
+            Self::MatchNone => false,
             Self::Linear(v) => v.iter().any(|p| p.contains(ip)),
             Self::Trie(t) => t.contains(ip),
         }
     }
 
+    #[inline]
+    pub(crate) fn is_match_any(&self) -> bool {
+        matches!(self, Self::MatchAny)
+    }
+
+    #[inline]
+    pub(crate) fn is_match_none(&self) -> bool {
+        matches!(self, Self::MatchNone)
+    }
+
     pub(crate) fn prefix_count(&self) -> usize {
         match self {
-            Self::MatchAny => 0,
+            Self::MatchAny | Self::MatchNone => 0,
             Self::Linear(v) => v.len(),
             Self::Trie(t) => t.size,
         }

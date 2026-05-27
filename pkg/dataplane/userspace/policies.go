@@ -1,7 +1,13 @@
 package userspace
 
 import (
+	"bytes"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"hash/fnv"
+	"net"
+	"sort"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -15,6 +21,7 @@ func buildPolicySnapshotsWithSchedulerState(cfg *config.Config, activeState map[
 	if cfg == nil || (len(cfg.Security.Policies) == 0 && len(cfg.Security.GlobalPolicies) == 0) {
 		return nil
 	}
+	_, nameToID := buildAddressBookTable(cfg)
 	out := make([]PolicyRuleSnapshot, 0)
 	policySetID := uint32(0)
 	for _, zpp := range cfg.Security.Policies {
@@ -28,75 +35,375 @@ func buildPolicySnapshotsWithSchedulerState(cfg *config.Config, activeState map[
 				continue
 			}
 			policyID := policySetID*dataplane.MaxRulesPerPolicy + ruleIndex
-			sourceAddresses, ok := expandUserspacePolicyAddresses(cfg, pol.Match.SourceAddresses)
-			if !ok {
-				sourceAddresses = append([]string(nil), pol.Match.SourceAddresses...)
-			}
-			destinationAddresses, ok := expandUserspacePolicyAddresses(cfg, pol.Match.DestinationAddresses)
-			if !ok {
-				destinationAddresses = append([]string(nil), pol.Match.DestinationAddresses...)
-			}
-			applicationTerms, ok := expandUserspacePolicyApplications(cfg, pol.Match.Applications)
-			if !ok {
-				applicationTerms = nil
-			}
-			schedulerName := pol.SchedulerName
-			out = append(out, PolicyRuleSnapshot{
-				RuleID:               stablePolicyRuleID(zpp.FromZone, zpp.ToZone, pol.Name),
-				PolicyID:             policyID,
-				Name:                 pol.Name,
-				FromZone:             zpp.FromZone,
-				ToZone:               zpp.ToZone,
-				SchedulerName:        schedulerName,
-				Inactive:             policyRuleInactive(schedulerName, activeState),
-				SourceAddresses:      sourceAddresses,
-				DestinationAddresses: destinationAddresses,
-				Applications:         append([]string(nil), pol.Match.Applications...),
-				ApplicationTerms:     applicationTerms,
-				Action:               policyActionString(pol.Action),
-			})
+			snap := buildOneRuleSnapshot(cfg, nameToID, pol, zpp.FromZone, zpp.ToZone, policyID, activeState)
+			out = append(out, snap)
 			ruleIndex += userspacePolicyRuleExpansionCount(cfg, pol.Match.Applications)
 		}
 		policySetID++
 	}
-	// Global policies match traffic regardless of zone pair.
 	globalRuleIndex := uint32(0)
 	for _, pol := range cfg.Security.GlobalPolicies {
 		if pol == nil {
 			continue
 		}
 		policyID := policySetID*dataplane.MaxRulesPerPolicy + globalRuleIndex
-		sourceAddresses, ok := expandUserspacePolicyAddresses(cfg, pol.Match.SourceAddresses)
-		if !ok {
-			sourceAddresses = append([]string(nil), pol.Match.SourceAddresses...)
-		}
-		destinationAddresses, ok := expandUserspacePolicyAddresses(cfg, pol.Match.DestinationAddresses)
-		if !ok {
-			destinationAddresses = append([]string(nil), pol.Match.DestinationAddresses...)
-		}
-		applicationTerms, ok := expandUserspacePolicyApplications(cfg, pol.Match.Applications)
-		if !ok {
-			applicationTerms = nil
-		}
-		schedulerName := pol.SchedulerName
-		out = append(out, PolicyRuleSnapshot{
-			RuleID:               stablePolicyRuleID("junos-global", "junos-global", pol.Name),
-			PolicyID:             policyID,
-			Name:                 pol.Name,
-			FromZone:             "junos-global",
-			ToZone:               "junos-global",
-			SchedulerName:        schedulerName,
-			Inactive:             policyRuleInactive(schedulerName, activeState),
-			SourceAddresses:      sourceAddresses,
-			DestinationAddresses: destinationAddresses,
-			Applications:         append([]string(nil), pol.Match.Applications...),
-			ApplicationTerms:     applicationTerms,
-			Action:               policyActionString(pol.Action),
-		})
+		snap := buildOneRuleSnapshot(cfg, nameToID, pol, "junos-global", "junos-global", policyID, activeState)
+		out = append(out, snap)
 		globalRuleIndex += userspacePolicyRuleExpansionCount(cfg, pol.Match.Applications)
 	}
 	return out
 }
+
+func buildOneRuleSnapshot(
+	cfg *config.Config,
+	nameToID map[string]uint32,
+	pol *config.Policy,
+	fromZone, toZone string,
+	policyID uint32,
+	activeState map[string]bool,
+) PolicyRuleSnapshot {
+	// Legacy back-compat field: full expansion. Same as today's
+	// behaviour for old-Rust readers.
+	sourceAddresses, okSrc := expandUserspacePolicyAddresses(cfg, pol.Match.SourceAddresses)
+	if !okSrc {
+		sourceAddresses = append([]string(nil), pol.Match.SourceAddresses...)
+	}
+	destinationAddresses, okDst := expandUserspacePolicyAddresses(cfg, pol.Match.DestinationAddresses)
+	if !okDst {
+		destinationAddresses = append([]string(nil), pol.Match.DestinationAddresses...)
+	}
+	applicationTerms, ok := expandUserspacePolicyApplications(cfg, pol.Match.Applications)
+	if !ok {
+		applicationTerms = nil
+	}
+	// #1606 v3 fields: classify each address token as "named book
+	// reference" vs "free-form literal".
+	srcBookIDs, srcLiterals := classifyPolicyAddresses(cfg, nameToID, pol.Match.SourceAddresses)
+	dstBookIDs, dstLiterals := classifyPolicyAddresses(cfg, nameToID, pol.Match.DestinationAddresses)
+	schedulerName := pol.SchedulerName
+	return PolicyRuleSnapshot{
+		RuleID:               stablePolicyRuleID(fromZone, toZone, pol.Name),
+		PolicyID:             policyID,
+		Name:                 pol.Name,
+		FromZone:             fromZone,
+		ToZone:               toZone,
+		SchedulerName:        schedulerName,
+		Inactive:             policyRuleInactive(schedulerName, activeState),
+		SourceAddresses:      sourceAddresses,
+		DestinationAddresses: destinationAddresses,
+		SourceBookIDs:        srcBookIDs,
+		DestinationBookIDs:   dstBookIDs,
+		SourceLiterals:       srcLiterals,
+		DestinationLiterals:  dstLiterals,
+		Applications:         append([]string(nil), pol.Match.Applications...),
+		ApplicationTerms:     applicationTerms,
+		Action:               policyActionString(pol.Action),
+	}
+}
+
+// classifyPolicyAddresses splits the policy's address-token list
+// into (book IDs, free-form CIDR literals). #1606. The returned
+// bookIDs are sorted + deduped.
+func classifyPolicyAddresses(cfg *config.Config, nameToID map[string]uint32, addrs []string) ([]uint32, []string) {
+	if len(addrs) == 0 {
+		return nil, nil
+	}
+	bookSet := make(map[uint32]struct{}, len(addrs))
+	literals := make([]string, 0, len(addrs))
+	seen := make(map[string]struct{}, len(addrs))
+	for _, tok := range addrs {
+		if tok == "" {
+			continue
+		}
+		if id, ok := nameToID[tok]; ok {
+			bookSet[id] = struct{}{}
+			continue
+		}
+		// Not a known book name → treat as a free-form literal.
+		// Includes "any", "any4", "any6", or a CIDR/IP literal.
+		if _, dup := seen[tok]; dup {
+			continue
+		}
+		seen[tok] = struct{}{}
+		literals = append(literals, tok)
+	}
+	if len(bookSet) == 0 {
+		return nil, literals
+	}
+	bookIDs := make([]uint32, 0, len(bookSet))
+	for id := range bookSet {
+		bookIDs = append(bookIDs, id)
+	}
+	sort.Slice(bookIDs, func(i, j int) bool { return bookIDs[i] < bookIDs[j] })
+	return bookIDs, literals
+}
+
+// buildAddressBookTable builds the deduplicated #1606 address-book
+// table for inclusion on the wire ConfigSnapshot. Returns the
+// table + a map from each declared address-book name (Addresses
+// and AddressSets) to its assigned u32 ID. Names that reference
+// the same canonical CIDR content share an ID.
+//
+// HA determinism: names are iterated in lexicographic sorted order
+// before any hashing/ID assignment. Content hashing buckets by
+// canonical bytes (not by hash), and the bucket sort key is
+// (hash64, canonical_bytes) so collision-resolution is fully
+// deterministic across HA peers.
+func buildAddressBookTable(cfg *config.Config) ([]AddressBookSnapshot, map[string]uint32) {
+	if cfg == nil || cfg.Security.AddressBook == nil {
+		return nil, nil
+	}
+	ab := cfg.Security.AddressBook
+
+	// Collect all unique names (Addresses + AddressSets) and sort.
+	allNames := make([]string, 0, len(ab.Addresses)+len(ab.AddressSets))
+	for name := range ab.Addresses {
+		allNames = append(allNames, name)
+	}
+	for name := range ab.AddressSets {
+		if _, dup := ab.Addresses[name]; !dup {
+			allNames = append(allNames, name)
+		}
+	}
+	sort.Strings(allNames)
+
+	type bucket struct {
+		canonical []byte
+		hash64    uint64
+		names     []string // declaring names in this bucket, sorted
+		v4        []string
+		v6        []string
+	}
+	contentToBucket := make(map[string]*bucket)
+	for _, name := range allNames {
+		v4, v6 := expandBookNameToCIDRs(cfg, name)
+		// Normalise "any" → 0.0.0.0/0 + ::/0 (Codex r6 refinement).
+		v4, v6 = normalizeAnyInCIDRs(v4, v6)
+		// Canonical sort within each family.
+		sortV4CIDRs(v4)
+		sortV6CIDRs(v6)
+		canon := canonicalizeAddressBookContent(v4, v6)
+		key := string(canon)
+		b, exists := contentToBucket[key]
+		if !exists {
+			h := fnv.New64a()
+			h.Write(canon)
+			b = &bucket{canonical: canon, hash64: h.Sum64(), v4: v4, v6: v6}
+			contentToBucket[key] = b
+		}
+		b.names = append(b.names, name) // already in sorted-name order
+	}
+
+	// Sort buckets by (hash64, canonical_bytes) for deterministic
+	// ID assignment.
+	buckets := make([]*bucket, 0, len(contentToBucket))
+	for _, b := range contentToBucket {
+		buckets = append(buckets, b)
+	}
+	sort.Slice(buckets, func(i, j int) bool {
+		if buckets[i].hash64 != buckets[j].hash64 {
+			return buckets[i].hash64 < buckets[j].hash64
+		}
+		return bytes.Compare(buckets[i].canonical, buckets[j].canonical) < 0
+	})
+
+	// Assign u32 IDs via deterministic linear probe. ID 0 is
+	// reserved.
+	used := make(map[uint32]struct{})
+	out := make([]AddressBookSnapshot, 0, len(buckets))
+	nameToID := make(map[string]uint32)
+	for _, b := range buckets {
+		id := uint32(b.hash64 & 0xFFFFFFFF)
+		if id == 0 {
+			id = 1
+		}
+		if _, dup := used[id]; dup {
+			// Linear probe (deterministic given bucket sort).
+			folded := uint32(b.hash64 ^ (b.hash64 >> 32))
+			probe := uint32(1)
+			for {
+				cand := folded + probe
+				if cand == 0 {
+					cand = 1
+				}
+				if _, dup := used[cand]; !dup {
+					id = cand
+					break
+				}
+				probe++
+				if probe > 256 {
+					// Hard-fail by panic — would indicate
+					// astronomically-unlikely 256 simultaneous
+					// collisions in a 2^32 ID space.
+					panic(fmt.Sprintf(
+						"address-book content hash collision could not be resolved within 256 probes (bucket count = %d)",
+						len(buckets)))
+				}
+			}
+		}
+		used[id] = struct{}{}
+		// Diagnostic name: smallest in this bucket.
+		diagName := ""
+		if len(b.names) > 0 {
+			diagName = b.names[0]
+		}
+		out = append(out, AddressBookSnapshot{
+			ID:         id,
+			Name:       diagName,
+			PrefixesV4: b.v4,
+			PrefixesV6: b.v6,
+		})
+		for _, n := range b.names {
+			nameToID[n] = id
+		}
+	}
+	return out, nameToID
+}
+
+// expandBookNameToCIDRs resolves a single address-book name
+// (Address or AddressSet, recursively) into its v4 + v6 CIDR
+// lists. Returns empty slices if name does not exist.
+func expandBookNameToCIDRs(cfg *config.Config, name string) ([]string, []string) {
+	ab := cfg.Security.AddressBook
+	if ab == nil {
+		return nil, nil
+	}
+	visited := make(map[string]bool)
+	values := expandBookNameRecursive(ab, name, visited, 0)
+	var v4, v6 []string
+	for _, value := range values {
+		if value == "" || value == "any" {
+			v4 = append(v4, "0.0.0.0/0")
+			v6 = append(v6, "::/0")
+			continue
+		}
+		if isV4CIDR(value) {
+			v4 = append(v4, value)
+		} else if isV6CIDR(value) {
+			v6 = append(v6, value)
+		}
+	}
+	return v4, v6
+}
+
+func expandBookNameRecursive(ab *config.AddressBook, name string, visited map[string]bool, depth int) []string {
+	if depth > 5 || visited[name] {
+		return nil
+	}
+	visited[name] = true
+	if addr, ok := ab.Addresses[name]; ok {
+		return []string{addr.Value}
+	}
+	if as, ok := ab.AddressSets[name]; ok {
+		var out []string
+		for _, member := range as.Addresses {
+			out = append(out, expandBookNameRecursive(ab, member, visited, depth+1)...)
+		}
+		for _, nested := range as.AddressSets {
+			out = append(out, expandBookNameRecursive(ab, nested, visited, depth+1)...)
+		}
+		return out
+	}
+	return nil
+}
+
+func normalizeAnyInCIDRs(v4, v6 []string) ([]string, []string) {
+	hasAny4 := false
+	hasAny6 := false
+	cleanV4 := v4[:0]
+	for _, s := range v4 {
+		if s == "0.0.0.0/0" {
+			hasAny4 = true
+		}
+		cleanV4 = append(cleanV4, s)
+	}
+	cleanV6 := v6[:0]
+	for _, s := range v6 {
+		if s == "::/0" {
+			hasAny6 = true
+		}
+		cleanV6 = append(cleanV6, s)
+	}
+	_ = hasAny4
+	_ = hasAny6
+	return cleanV4, cleanV6
+}
+
+func sortV4CIDRs(s []string) {
+	sort.Slice(s, func(i, j int) bool {
+		_, a, errA := net.ParseCIDR(s[i])
+		_, b, errB := net.ParseCIDR(s[j])
+		if errA != nil || errB != nil {
+			return s[i] < s[j]
+		}
+		if c := bytes.Compare(a.IP, b.IP); c != 0 {
+			return c < 0
+		}
+		ma, _ := a.Mask.Size()
+		mb, _ := b.Mask.Size()
+		return ma < mb
+	})
+}
+
+func sortV6CIDRs(s []string) {
+	sortV4CIDRs(s) // same logic; works on any net.IP
+}
+
+// canonicalizeAddressBookContent serializes the v4 + v6 CIDR
+// lists into a fixed byte stream with explicit family + count
+// framing (Codex r3 F4 fix).
+//
+// Layout:
+//   "V4" || u32_be(len(v4)) || (for each: u8(prefix_len) || u32_be(addr_bytes))
+//   "V6" || u32_be(len(v6)) || (for each: u8(prefix_len) || u128_be(addr_bytes))
+//
+// CIDR strings that fail to parse are skipped (defensive).
+func canonicalizeAddressBookContent(v4, v6 []string) []byte {
+	var buf bytes.Buffer
+	buf.WriteString("V4")
+	binary.Write(&buf, binary.BigEndian, uint32(len(v4)))
+	for _, s := range v4 {
+		_, ipnet, err := net.ParseCIDR(s)
+		if err != nil {
+			continue
+		}
+		ones, _ := ipnet.Mask.Size()
+		buf.WriteByte(byte(ones))
+		buf.Write(ipnet.IP.To4())
+	}
+	buf.WriteString("V6")
+	binary.Write(&buf, binary.BigEndian, uint32(len(v6)))
+	for _, s := range v6 {
+		_, ipnet, err := net.ParseCIDR(s)
+		if err != nil {
+			continue
+		}
+		ones, _ := ipnet.Mask.Size()
+		buf.WriteByte(byte(ones))
+		buf.Write(ipnet.IP.To16())
+	}
+	return buf.Bytes()
+}
+
+func isV4CIDR(s string) bool {
+	ip, _, err := net.ParseCIDR(s)
+	return err == nil && ip.To4() != nil
+}
+
+func isV6CIDR(s string) bool {
+	ip, ipnet, err := net.ParseCIDR(s)
+	if err != nil {
+		return false
+	}
+	// To4 returning non-nil means the string parsed as a 4-byte
+	// address (or v4-mapped); only return true if the underlying
+	// representation is 16 bytes (v6).
+	return ip.To4() == nil && len(ipnet.IP) == net.IPv6len
+}
+
+// Silence unused-import warnings when this build is ever stripped
+// of address-book content.
+var _ = hex.EncodeToString
 
 func stablePolicyRuleID(fromZone, toZone, ruleName string) string {
 	return fmt.Sprintf("%s->%s/%s", fromZone, toZone, ruleName)

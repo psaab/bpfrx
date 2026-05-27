@@ -695,6 +695,11 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 	next.GeneratedAt = time.Now().UTC()
 	next.Config = cfg
 	next.Policies = buildPolicySnapshotsWithSchedulerState(cfg, activeCopy)
+	// #1606: refresh the address-book table alongside the policies
+	// so book IDs cited in the new policies always resolve on the
+	// dataplane side.
+	books, _ := buildAddressBookTable(cfg)
+	next.AddressBooks = books
 
 	publishSnap := next
 	publishSnap.Neighbors = filterPublishableNeighbors(next.Neighbors)

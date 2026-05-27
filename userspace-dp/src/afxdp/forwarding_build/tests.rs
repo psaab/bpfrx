@@ -77,7 +77,8 @@ fn forwarding_state_refresh_preserves_three_color_runtime_state() {
         &snapshot,
         &policy_counters,
         Some(&state),
-    );
+    )
+    .expect("test snapshot must not produce integrity error");
     assert!(std::sync::Arc::ptr_eq(
         &state.filter_state.three_color_policers[0],
         &refreshed.filter_state.three_color_policers[0]

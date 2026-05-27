@@ -58,7 +58,11 @@ func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceCo
 		ClassOfService:     buildClassOfServiceSnapshot(cfg),
 		FlowExport:         buildFlowExportSnapshot(cfg),
 		MirrorConfigs:      buildMirrorConfigSnapshotsFailClosed(cfg, interfaces),
-		Config:             cfg,
+		AddressBooks: func() []AddressBookSnapshot {
+			books, _ := buildAddressBookTable(cfg)
+			return books
+		}(),
+		Config: cfg,
 		Summary: SnapshotSummary{
 			HostName:       cfg.System.HostName,
 			DataplaneType:  cfg.System.DataplaneType,

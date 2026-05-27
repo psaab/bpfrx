@@ -12,8 +12,8 @@ use super::nat::{
     StaticNATRuleSnapshot,
 };
 use super::security::{
-    FirewallFilterSnapshot, FlowExportSnapshot, PolicerSnapshot, PolicyRuleSnapshot,
-    ScreenProfileSnapshot, ThreeColorPolicerSnapshot,
+    AddressBookSnapshot, FirewallFilterSnapshot, FlowExportSnapshot, PolicerSnapshot,
+    PolicyRuleSnapshot, ScreenProfileSnapshot, ThreeColorPolicerSnapshot,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -189,6 +189,10 @@ pub(crate) struct ConfigSnapshot {
     pub default_policy: String,
     #[serde(default)]
     pub policies: Vec<PolicyRuleSnapshot>,
+    /// #1606: address-book table (content-hashed deduplication).
+    /// Empty on snapshots from old Go binaries (v3-additive field).
+    #[serde(rename = "address_books", default)]
+    pub address_books: Vec<AddressBookSnapshot>,
     #[serde(rename = "source_nat_rules", default)]
     pub source_nat_rules: Vec<SourceNATRuleSnapshot>,
     #[serde(rename = "static_nat_rules", default)]
