@@ -300,6 +300,10 @@ func coSUnitDSCPRewriteRule(unit *config.CoSInterfaceUnit) string {
 	return unit.DSCPRewriteRule
 }
 
+// NOTE: Keep in sync with (*Config).ResolveKernelIfName in
+// pkg/config/types.go. The two implementations have intentional
+// scope deltas (snapshotLinuxName does not implement IRB), but the
+// shared cases must match. See drift-guard test in this package.
 func snapshotLinuxName(cfg *config.Config, ifName string, iface *config.InterfaceConfig, unit *config.InterfaceUnit) string {
 	if iface == nil {
 		return config.LinuxIfName(ifName)

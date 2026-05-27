@@ -135,6 +135,11 @@ func (d *Daemon) dhcpLeaseChangeRequiresRecompile(cfg *config.Config) bool {
 // equivalent. It resolves RETH names to their physical members (e.g.
 // reth0.50 → ge-0/0/0.50) and converts Junos slashes to dashes (e.g.
 // ge-0/0/0 → ge-0-0-0).
+//
+// NOTE: Keep in sync with (*Config).ResolveKernelIfName in
+// pkg/config/types.go. This helper only does the bare-ref subset of
+// the public method; callers that already have unit/vlan context
+// build the .VLAN suffix themselves (see resolveConfigSubnetLinuxName).
 func resolveJunosIfName(cfg *config.Config, ifName string) string {
 	return config.LinuxIfName(cfg.ResolveReth(ifName))
 }
