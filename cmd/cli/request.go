@@ -8,6 +8,43 @@ import (
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
+// confirmYes prompts the operator with `prompt`, reads a line via
+// the readline instance, and returns true when the trimmed +
+// lowercased response is exactly "yes". Any other response (or a
+// read error) returns false with a nil error so callers can print
+// their "cancelled" message and return cleanly.
+//
+// When invoked without a readline instance (non-TTY `-c` mode) the
+// caller has no way to gather confirmation. Rather than silently
+// reading stdin and possibly executing a destructive action against
+// unintended input, hard-error so the script visibly fails. This
+// applies to reboot / halt / power-off / zeroize / in-service-upgrade
+// — operator-authored automation should drive these through the
+// gRPC SystemAction RPC directly, not via the interactive CLI
+// binary. See #1563.
+func (c *ctl) confirmYes(prompt string) (bool, error) {
+	if c.rl == nil {
+		return false, fmt.Errorf(
+			"this command requires interactive confirmation (TTY); " +
+				"not available in -c mode")
+	}
+	fmt.Print(prompt)
+	c.rl.SetPrompt("")
+	line, err := c.rl.Readline()
+	// Restore the correct prompt for the current mode so this
+	// helper composes with both `request system ...` (operational)
+	// and `run request system ...` (from configuration mode).
+	if c.configMode {
+		c.rl.SetPrompt(c.configPrompt())
+	} else {
+		c.rl.SetPrompt(c.operationalPrompt())
+	}
+	if err != nil {
+		return false, nil
+	}
+	return strings.TrimSpace(strings.ToLower(line)) == "yes", nil
+}
+
 func (c *ctl) handleRequest(args []string) error {
 	if len(args) == 0 {
 		printRemoteTreeHelp("request:", "request")
@@ -33,11 +70,12 @@ func (c *ctl) handleRequest(args []string) error {
 
 	switch args[1] {
 	case "reboot", "halt", "power-off":
-		fmt.Printf("%s the system? [yes,no] (no) ", strings.Title(args[1]))
-		c.rl.SetPrompt("")
-		line, err := c.rl.Readline()
-		c.rl.SetPrompt(c.operationalPrompt())
-		if err != nil || strings.TrimSpace(strings.ToLower(line)) != "yes" {
+		ok, err := c.confirmYes(fmt.Sprintf(
+			"%s the system? [yes,no] (no) ", strings.Title(args[1])))
+		if err != nil {
+			return err
+		}
+		if !ok {
 			fmt.Printf("%s cancelled\n", strings.Title(args[1]))
 			return nil
 		}
@@ -51,11 +89,11 @@ func (c *ctl) handleRequest(args []string) error {
 		return nil
 	case "zeroize":
 		fmt.Println("WARNING: This will erase all configuration and return to factory defaults.")
-		fmt.Print("Zeroize the system? [yes,no] (no) ")
-		c.rl.SetPrompt("")
-		line, err := c.rl.Readline()
-		c.rl.SetPrompt(c.operationalPrompt())
-		if err != nil || strings.TrimSpace(strings.ToLower(line)) != "yes" {
+		ok, err := c.confirmYes("Zeroize the system? [yes,no] (no) ")
+		if err != nil {
+			return err
+		}
+		if !ok {
 			fmt.Println("Zeroize cancelled")
 			return nil
 		}
@@ -73,11 +111,11 @@ func (c *ctl) handleRequest(args []string) error {
 			return nil
 		}
 		fmt.Println("WARNING: This will force this node to secondary for all redundancy groups.")
-		fmt.Print("Proceed with in-service upgrade? [yes,no] (no) ")
-		c.rl.SetPrompt("")
-		line, err := c.rl.Readline()
-		c.rl.SetPrompt(c.operationalPrompt())
-		if err != nil || strings.TrimSpace(strings.ToLower(line)) != "yes" {
+		ok, err := c.confirmYes("Proceed with in-service upgrade? [yes,no] (no) ")
+		if err != nil {
+			return err
+		}
+		if !ok {
 			fmt.Println("ISSU cancelled")
 			return nil
 		}
