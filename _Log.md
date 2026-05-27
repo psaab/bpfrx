@@ -4077,3 +4077,9 @@ top.
 - **Timestamp**: 2026-05-27 03:22 UTC
   - **Action**: #1559 plan v1 drafted + pushed; Codex task-mpnhxj2g-p4047b and Gemini task-mpnhy4io-gzc7jp dispatched for adversarial plan review.
   - **File(s)**: docs/pr/1559-canary-harden/plan.md (commit c2b77ea5)
+
+## 2026-05-27 03:35 — #1559 canary harden implementation + tests passing
+
+- **Timestamp**: 2026-05-27 03:35 UTC
+  - **Action**: Implemented v3 plan: rewrote pkg/daemon/legacy_dataplane_canary_test.go with 5-pass AST scan + record-once dedup; added pkg/daemon/legacy_dataplane_canary_synthetic_test.go with 7 negative-pattern tests. All 8 canary tests pass; 5/5 flake check clean; full Go suite (32 packages) green.
+  - **File(s)**: pkg/daemon/legacy_dataplane_canary_test.go (rewritten), pkg/daemon/legacy_dataplane_canary_synthetic_test.go (new), docs/pr/1559-canary-harden/plan.md (v3)
