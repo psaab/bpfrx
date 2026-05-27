@@ -1,12 +1,15 @@
 # Action Log
 
-Entries are loosely time-ordered; recent entries land at the top.
-Within a topic, entries run reverse-chronological (newest first).
+Entries land at the top when added. Within a topic batch (same
+issue / PR), entries run reverse-chronological (newest first).
+Across topic batches the ordering is by add-time, not strict wall
+clock, so older topic batches push down when newer work lands on
+top.
 
 ## 2026-05-27 01:30 UTC — #1598 Copilot review addressed
 
 - **Timestamp**: 2026-05-27 01:30 UTC
-- **Action**: Addressed four Copilot inline comments on PR #1600. (1) Rewrote the function-level doc above `queue_uses_shared_exact_service` so it no longer claims non-exact queues are never shared; new doc explains that the gate is now threshold-only, and that the exact/non-exact distinction lives at the lease + V_min allocation gates (coordinator/mod.rs:1058 and :1145). (2) Replaced `feedback_cross_binding_impossible in memory` reference in the inline comment with a stable in-repo reference (PR #680/#690 + the plan doc). (3) Updated both new test fixtures to set `guarantee_enabled=false` AND `exact=false`, so the fixtures actually mirror the production uncapped-class shape (no transmit-rate at all, not just non-exact-with-rate). (4) Restored reverse-chronological log ordering and added a header note explaining the convention.
+- **Action**: For #1598 (PR #1600), addressed four Copilot inline comments. (1) Rewrote the function-level doc above `queue_uses_shared_exact_service` so it no longer claims non-exact queues are never shared; new doc explains that the gate is now threshold-only, and that the exact/non-exact distinction lives at the lease + V_min allocation gates (coordinator/mod.rs:1058 and :1145). (2) Replaced `feedback_cross_binding_impossible in memory` reference in the inline comment with a stable in-repo reference (PR #680/#690 + the plan doc). (3) Updated both new test fixtures to set `guarantee_enabled=false` AND `exact=false`, so the fixtures actually mirror the production uncapped-class shape (no transmit-rate at all, not just non-exact-with-rate). (4) Restored reverse-chronological log ordering and added a header note explaining the convention.
 - **File(s)**: `userspace-dp/src/afxdp/worker/cos/mod.rs`, `userspace-dp/src/afxdp/worker/cos/tests.rs`, `_Log.md`
 
 ## 2026-05-26 13:25 UTC — #1598 implementation + tests pass

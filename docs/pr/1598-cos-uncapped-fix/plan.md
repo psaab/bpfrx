@@ -49,7 +49,9 @@ verdict and we should iterate the plan to address that.
    a queue runs under shared multi-worker drain (`shared_exact = true`,
    each worker drains its own enqueue locally) or single-owner drain
    (`shared_exact = false`, one owner worker is the funnel for the
-   whole queue). The gate is currently `queue.exact && rate >= 312 MB/s`.
+   whole queue). **Pre-fix** the gate was `queue.exact && rate >=
+   312 MB/s`. The fix this PR lands removes the `queue.exact`
+   conjunct so the gate becomes `rate >= 312 MB/s` alone.
 
 3. `userspace-dp/src/afxdp/coordinator/mod.rs:900-904` — every CoS
    queue gets a single `owner_worker_id` via round-robin across
@@ -72,14 +74,15 @@ verdict and we should iterate the plan to address that.
    interface itself has an owner binding that differs.
 
 The iperf-uncapped queue (`exact=false`, `guarantee_enabled=false`):
-- Hits the `!queue.exact` early-return in
+- Pre-fix: hit the `!queue.exact` early-return in
   `queue_uses_shared_exact_service` → `shared_exact = false`
-- Gets one `owner_worker_id` via the round-robin in
+- Got one `owner_worker_id` via the round-robin in
   `build_cos_owner_by_queue` (line 901)
-- Cross-binding redirect routes 100% of class-11 traffic to that
+- Cross-binding redirect routed 100% of class-11 traffic to that
   one worker → that worker's AF_XDP UMEM ceiling (~6-10 Gbps per
-  the [[feedback_cross_binding_impossible]] memory entry) is the
-  hard cap
+  PR #680 / #690 design notes; see `docs/per-5-tuple/state.md` for
+  the absolute-per-worker-ceiling characterization) was the hard
+  cap
 
 This explains the symptom exactly: P=12 push on port 5211 caps at
 ~10 Gbps because every stream's class-11 packets are funneled to a
