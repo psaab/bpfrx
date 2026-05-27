@@ -30,6 +30,32 @@ pub(super) fn apply(
         );
         return;
     }
+    // #1606 (AGY r2 finding 4.1): preflight policy-state validation
+    // BEFORE any guard.status mutation. If the snapshot has
+    // duplicate / zero / unknown book IDs, reject WITHOUT touching
+    // any guard fields. The existing snapshot + workers stay
+    // running on the previous good config.
+    //
+    // Uses a scratch counter store so we don't leak Arc entries on
+    // rejected snapshots.
+    {
+        let preflight_counters = crate::policy::PolicyCounterStore::default();
+        if let Err(err) = crate::policy::parse_policy_state_with_counters(
+            &snapshot.default_policy,
+            &snapshot.policies,
+            guard.afxdp.zone_name_to_id_ref(),
+            &snapshot.address_books,
+            &preflight_counters,
+        ) {
+            response.ok = false;
+            response.error = format!("snapshot integrity error: {}", err);
+            eprintln!(
+                "CTRL_REQ: apply_snapshot rejected (integrity preflight): {}",
+                err
+            );
+            return;
+        }
+    }
     eprintln!(
         "CTRL_REQ: apply_snapshot generation={} fib_generation={} forwarding_armed_before={}",
         snapshot.generation, snapshot.fib_generation, guard.status.forwarding_armed
