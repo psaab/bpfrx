@@ -152,35 +152,56 @@ Unchanged from v1 §4.1 with two clarifications:
 A standalone Rust binary, built via a small workspace addition. New
 files (all in this PR):
 
-- `test/incus/cold-path-flooder/Cargo.toml`
-- `test/incus/cold-path-flooder/src/main.rs`
-- `test/incus/cold-path-flooder/README.md` (operator-facing)
-- `Cargo.toml` workspace add: `test/incus/cold-path-flooder`
+Files actually shipped in step-1 (this PR):
 
-Flag surface:
+- `test/incus/cold-path-flooder/Cargo.toml`
+- `test/incus/cold-path-flooder/Cargo.lock` (tracked per repo
+  convention; matches `userspace-dp/`, `userspace-xdp/`,
+  `test/xsk-repro/`)
+- `test/incus/cold-path-flooder/src/main.rs` (CLI + 7 cargo tests)
+- `test/incus/cold-path-flooder/.gitignore` (excludes `/target`
+  only; Cargo.lock is tracked)
+
+Files NOT shipped in step-1 (tracked for step-2 #1611 / step-3
+#1612):
+
+- `test/incus/cold-path-flooder/README.md` (operator-facing
+  guide; step-2 #1611).
+- Cargo workspace integration: deferred. The flooder remains a
+  standalone crate, matching the existing `test/xsk-repro/`
+  isolation pattern. The original plan called for a workspace
+  add; we settled on standalone after Copilot code-r1 noted that
+  Cargo workspace integration would couple the test-binary build
+  to dataplane Cargo cycles.
+
+Flag surface (matches `Args::parse()` in `src/main.rs` exactly for
+step-1 rows; step-2 / step-3 rows are forward-looking contract):
 
 ```
 cold-path-flooder
-  --dst-ip <IP>         (172.16.80.200 default)
-  --dst-port-base <P>   (5201 default)
-  --dst-port-span <N>   (number of dst-ports to sweep; default 1)
-  --src-ip-base <IP>    (10.42.0.0 default)
-  --src-ip-span <N>     (default 16384 — see "5-tuple cardinality budget" below)
-  --src-port-span <N>   (default 8 — see "5-tuple cardinality budget" below)
-  --duration-secs <S>   (default 30)        [step-1 ✓]
-  --warmup-secs <S>     (default 2)         [step-1 ✓]
-  --frame-bytes <B>     (default 64; checked against MIN_ETH=64) [step-1 ✓]
-  --batch <N>           (sendmmsg batch; default 32) [step-1 ✓]
-  --iface <NAME>        (default ge-0-0-1 — LAN side of loss cluster) [step-1 ✓]
+  --dst-ip <IP>         (default 172.16.80.200) [step-1 ✓]
+  --dst-port-base <P>   (default 5201) [step-1 ✓]
+  --dst-port-span <N>   (default 1; bounded mode keeps 1) [step-1 ✓]
+  --src-ip-base <IP>    (default 10.42.0.0) [step-1 ✓]
+  --src-ip-span <N>     (default 65_536 = full /16; bounded narrows to 16_384) [step-1 ✓]
+  --src-port-span <N>   (default 65_536 = full 16-bit space; bounded narrows to 8) [step-1 ✓]
+  --duration-secs <S>   (default 30) [step-1 ✓]
+  --warmup-secs <S>     (default 2)  [step-1 ✓]
+  --frame-bytes <B>     (default 64, min 64) [step-1 ✓]
+  --batch <N>           (sendmmsg batch; default 32; min 1 max 1024) [step-1 ✓]
+  --iface <NAME>        (default ge-0-0-1) [step-1 ✓]
+  --dst-mac <MAC>       (default 0xff×6; runner ARP-resolves unless set) [step-1 ✓]
+  --src-mac <MAC>       (default zero; runner auto-fills from iface) [step-1 ✓]
+  --seed <N>            (default pid XOR clock) [step-1 ✓]
   --cohort bounded|unbounded  (default unbounded) [step-1 ✓]
-  --tx-mbps <M>         (default 0 = max)   [step-2 #1611 — runner-body knob]
-  --ipv4 | --ipv6       (default ipv4; v6 path uses fe80::-equivalent) [step-2 #1611 — runner-body knob]
-  --output-json <FILE>  (per-run summary)   [step-2 #1611 — runner-body knob]
+  --tx-mbps <M>         (default 0 = max) [step-2 #1611 — runner knob]
+  --ipv4 | --ipv6       (default ipv4) [step-2 #1611 — runner knob]
+  --output-json <FILE>  (per-run summary) [step-2 #1611 — runner knob]
 ```
 
-Step-1 ships the [step-1 ✓] flags only; the [step-2 #1611] flags
-are part of the runner-body follow-up. Step-1's CLI surface above
-maps to `Args::parse()` in `test/incus/cold-path-flooder/src/main.rs`.
+Step-1 ships the [step-1 ✓] rows only. Cargo-test pins the cardinality
+constants via `unbounded_default_uses_full_2_to_16_spans` and
+`bounded_cohort_constants_fit_max_sessions`.
 
 #### 4.2.0 5-tuple cardinality budget — dual-regime measurement
 

@@ -4,11 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 # Standalone Rust binary used by test/incus/cold-path-microbench.sh
-# to flood the xpf userspace dataplane with cold-path-eligible packets
-# (UDP, randomized source IP/port within a bounded cohort sized to
-# DEFAULT_MAX_SESSIONS=131_072). Lives outside the userspace-dp and
-# userspace-xdp workspaces by design — a regression in this test
-# binary must not block dataplane builds. See #1607.
+# to flood the xpf userspace dataplane with cold-path-eligible packets.
+#
+# Default regime is `--cohort=unbounded` (per AGY r3 axis 1): sweeps a
+# full /16 source-IP × full 16-bit source-port space ≈ 4.3 B unique
+# 5-tuples, so the session table fills in ~26 ms and the remaining
+# ~99.9% of the run measures the pure policy-eval cold path
+# (install_rejected_fast_return).
+#
+# Optional `--cohort=bounded` ships a 131_072-tuple cohort matching
+# DEFAULT_MAX_SESSIONS for diagnostic install + replicate measurement.
+#
+# Lives outside the userspace-dp and userspace-xdp workspaces by
+# design — a regression in this test binary must not block dataplane
+# builds. See #1607 + plan v2-r4 §4.2.
 
 [[bin]]
 name = "cold-path-flooder"
