@@ -25,6 +25,25 @@
     future "ge-0-0-0 is WAN" misdiagnoses.
   - **File(s)**: test/incus/loss-userspace-cluster.env, CLAUDE.md,
     _Log.md (this entry).
+## 2026-05-26 23:43 UTC — #1348 icmp_embed split (PR #1596, AWAITING-BATCH-MERGE)
+
+- **Timestamp**: 2026-05-26 23:43 UTC
+- **Action**: PR #1596 opened for #1348 (split
+  `userspace-dp/src/afxdp/icmp_embed.rs` 761 LOC into
+  `icmp_embed/{mod,parse,session_match,nat_match_v4,nat_match_v6,return_resolution,builders}.rs`,
+  collapse 10-param `embedded_icmp_return_resolution` behind
+  `NatMatchCtx<'a>` borrow bundle). Plan went through 3 rounds
+  (Codex r1 PLAN-NEEDS-MAJOR with 4 blockers → v2 → Codex r2
+  sandbox-limited PLAN-NEEDS-MAJOR borrow-check concern → v3).
+  Gemini r1 PLAN-READY. Implementation pure code motion; 1506
+  cargo tests pass incl 8 `embedded_icmp` tests; 5/5 flake; Go
+  suite clean; release build clean.
+- **File(s)**: `userspace-dp/src/afxdp/icmp_embed/{mod,parse,session_match,nat_match_v4,nat_match_v6,return_resolution,builders}.rs` (new); `userspace-dp/src/afxdp/icmp_embed.rs` (deleted); `userspace-dp/src/afxdp/mod.rs` (dropped `#[path]` attr); `docs/pr/1348-icmp-embed-split/{plan,reviewer-ids}.md`.
+- **Reviewers**: Gemini MERGE-READY (quote-grounded); Copilot 1
+  doc nit addressed; Claude SMR MERGE-READY; Codex BLOCKED across
+  4 sandbox-infra attempts. 3-of-4 attestation under Wave-5
+  Codex-stuck exception. `<!-- AWAITING-BATCH-MERGE -->` posted.
+- **Closes**: #1348.
 
 ## 2026-05-26 22:46 UTC — #1439 snapshot.go split (rebase carry-forward)
 

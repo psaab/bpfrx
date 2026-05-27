@@ -75,7 +75,6 @@ mod gre;
 mod ha;
 #[path = "icmp.rs"]
 mod icmp;
-#[path = "icmp_embed.rs"]
 mod icmp_embed;
 #[path = "ethernet.rs"]
 mod ethernet;
