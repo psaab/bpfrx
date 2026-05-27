@@ -28,17 +28,31 @@ Smoke deferred to batch-merge (`<!-- AWAITING-BATCH-MERGE -->`).
 | Codex R3 attempt 3 (inline excerpt) | task-mpnbo2uk-7lgwy4 | BLOCKED (infra); informally "directionally coherent" |
 | AGY R3 | adversarial-review-mpnavi4h-1rqg68 | **PLAN-READY** with quote-line verification |
 
+## Code review (PR #1599, head 52e6de8ba)
+
+| Reviewer | Task ID | Verdict |
+|---|---|---|
+| Codex code-review attempt 1 | task-mpnc5dol-qwpqwd | BLOCKED (infra) |
+| Codex code-review attempt 2 | task-mpncb3ec-xz9gs6 | INFRA-BLOCKED with partial MERGE-READY-WITH-CAVEAT (no concrete code findings) |
+| AGY code-review attempt 1 | adversarial-review-mpnc5lzy-d6lw1p | succeeded (MCP result fetch timed out — stale; re-dispatched as -mpncfkj4) |
+| AGY code-review attempt 2 | adversarial-review-mpncfkj4-79596i | **MERGE-READY** with quote-line verification of all 6 acceptance criteria + endorsement of the Phase 8 scope deviation |
+| Copilot | (PR review) | COMMENTED — clean summary, 0 inline comments |
+| Claude SMR (domain + CPU arch + SW design) | — | **MERGE-READY** — verbatim code motion, hot/cold inlining strategy correct, MPSC ordering preserved, scope deviation acceptable |
+
 ## Decision
 
 Codex R1 returned a substantive PLAN-NEEDS-MAJOR with 5 specific
-blocking findings; v2 + v3 addressed every one. Codex R2 + R3 were
-infra-blocked across 4 attempts total. Per
-[[feedback_codex_infra_must_retry]] retries were dispatched, but the
-infra outage persisted across 3 attempts in R3 alone.
+blocking findings; v2 + v3 addressed every one. Codex R2 + R3 and
+both code-review attempts were infra-blocked across 6 total
+attempts (codex-linux-sandbox ENOENT). Per
+[[feedback_codex_infra_must_retry]] retries were dispatched.
 
-Proceeding to implementation with AGY R3 PLAN-READY (quote-line
-verified) and Codex R1 blockers fully addressed. **Codex hostile
-code review post-PR will serve as the second-reviewer verification
-on the real diff** — Codex's static-analysis review path may not
-require the same sandbox subprocess that the plan-review path
-needed.
+**Wave-5 "Codex-stuck 3-of-4 exception" applies**: with Codex
+persistently infra-blocked, attestation from AGY (MERGE-READY,
+quote-line verified) + Copilot (clean) + Claude SMR (MERGE-READY)
+is sufficient for the merge gate. AGY's round-2 code review
+explicitly endorsed the Phase 8 scope deviation as "the correct,
+pragmatic choice for this PR to isolate module-level layout churn
+from sensitive borrow-checker workarounds."
+
+Posting `<!-- AWAITING-BATCH-MERGE -->` per Wave-5 rules.
