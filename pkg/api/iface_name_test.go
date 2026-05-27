@@ -133,12 +133,17 @@ func TestWriteInterfacesDetail_DHCPLeasePath(t *testing.T) {
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure: %v", err)
 	}
+	// Zone references reth0.0 (unit-suffixed Junos ref) — this is the
+	// asymmetric case: handler-visible ifName is "reth0.0" but the
+	// daemon's DHCP key is "reth0" (no .VlanID since unit 0 vlan-id 0).
+	// A regression to raw LeaseFor(ifName, ...) would call
+	// LeaseFor("reth0.0", ...) which hits the decoy.
 	sets := []string{
 		"set chassis cluster reth-count 1",
 		"set interfaces lo gigether-options redundant-parent reth0",
 		"set interfaces reth0 redundant-ether-options redundancy-group 1",
 		"set interfaces reth0 unit 0 family inet dhcp",
-		"set security zones security-zone trust interfaces reth0",
+		"set security zones security-zone trust interfaces reth0.0",
 	}
 	for _, s := range sets {
 		if _, err := store.LoadSet(s); err != nil {
