@@ -1,61 +1,64 @@
+// Dispatch module (#1443). Pure code-motion split of the original
+// 1474-LOC `dispatch.rs` into cohesive submodules:
+//
+// - `cos`             — Phase 1 (CoS TX-selection resolve) +
+//                       the 4 COS fast-path helpers
+//                       (cos_queue_fast_path_for_request,
+//                        cos_owner_live_for_request,
+//                        request_uses_shared_exact_queue_lease,
+//                        enqueue_local_request_to_target_or_owner).
+// - `shared_recycle`  — Phase 10 + cross-tick recycle routing
+//                       (apply_shared_recycles*,
+//                        resolve_tx_binding_ifindex,
+//                        and the slot-resolution helpers).
+// - `slow_path`       — handle_forward_build_failure,
+//                       maybe_reinject_slow_path*,
+//                       extract_l3_packet* family. All marked
+//                       #[cold] #[inline(never)] per AGY round-2
+//                       finding D.
+//
+// The orchestrator (`enqueue_pending_forwards`) and Phase 8
+// (try_inplace_rewrite_or_build) intentionally stay in `mod.rs` for
+// this PR — Phase 8 body extraction is deferred to a follow-up so
+// reviewers can compare the in-tree control flow against current
+// master without a body-shape diff. See plan.md §"Out of scope".
+//
+// External callers reach the re-exported symbols via the
+// `use self::tx::dispatch::*;` glob at `afxdp/mod.rs:140`. The
+// re-export block below preserves every `pub(in crate::afxdp)`
+// symbol verbatim.
+
 use super::*;
 
 use super::tcp_segmentation::segment_forwarded_tcp_frames_into_prepared;
 
-fn cos_queue_fast_path_for_request<'a>(
-    cos_fast_interfaces: &'a FastMap<i32, WorkerCoSInterfaceFastPath>,
-    egress_ifindex: i32,
-    requested_queue_id: Option<u8>,
-) -> Option<&'a WorkerCoSQueueFastPath> {
-    let iface = cos_fast_interfaces.get(&egress_ifindex)?;
-    iface.queue_fast_path(requested_queue_id)
-}
+mod cos;
+mod shared_recycle;
+mod slow_path;
 
-fn cos_owner_live_for_request(
-    cos_fast_interfaces: &FastMap<i32, WorkerCoSInterfaceFastPath>,
-    egress_ifindex: i32,
-    requested_queue_id: Option<u8>,
-) -> Option<Arc<BindingLiveState>> {
-    cos_queue_fast_path_for_request(cos_fast_interfaces, egress_ifindex, requested_queue_id)
-        .and_then(|queue_fast| queue_fast.owner_live.clone())
-}
-
-fn request_uses_shared_exact_queue_lease(
-    cos_fast_interfaces: &FastMap<i32, WorkerCoSInterfaceFastPath>,
-    egress_ifindex: i32,
-    requested_queue_id: Option<u8>,
-) -> bool {
-    cos_queue_fast_path_for_request(cos_fast_interfaces, egress_ifindex, requested_queue_id)
-        .is_some_and(|queue_fast| queue_fast.shared_queue_lease.is_some())
-}
-
-fn enqueue_local_request_to_target_or_owner(
-    target_binding: &mut BindingWorker,
-    req: TxRequest,
-) -> Result<(), TxRequest> {
-    if request_uses_shared_exact_queue_lease(
-        &target_binding.cos.cos_fast_interfaces,
-        req.egress_ifindex,
-        req.cos_queue_id,
-    ) {
-        target_binding.tx_pipeline.pending_tx_local.push_back(req);
-        bound_pending_tx_local(target_binding);
-        return Ok(());
-    }
-    let owner_live = cos_owner_live_for_request(
-        &target_binding.cos.cos_fast_interfaces,
-        req.egress_ifindex,
-        req.cos_queue_id,
-    );
-    if let Some(owner_live) = owner_live {
-        if !Arc::ptr_eq(&owner_live, &target_binding.live) {
-            return owner_live.enqueue_tx_owned(req);
-        }
-    }
-    target_binding.tx_pipeline.pending_tx_local.push_back(req);
-    bound_pending_tx_local(target_binding);
-    Ok(())
-}
+use cos::{
+    cos_owner_live_for_request, enqueue_local_request_to_target_or_owner,
+    pending_forward_needs_cos_tx_selection, request_uses_shared_exact_queue_lease,
+    resolve_pending_forward_cos_tx_selection,
+};
+pub(in crate::afxdp) use shared_recycle::{
+    apply_shared_recycles, apply_shared_recycles_to_bindings, resolve_tx_binding_ifindex,
+};
+// Test-only access to internal shared_recycle helpers from
+// dispatch_tests.rs (which is `mod tests` under this `mod.rs`).
+#[cfg(test)]
+use shared_recycle::{
+    record_shared_recycle_unknown_slot_drops, shared_recycle_target_index,
+    shared_recycle_target_index_for_split,
+};
+pub(in crate::afxdp) use slow_path::{
+    extract_l3_packet_with_nat, handle_forward_build_failure, maybe_reinject_slow_path,
+    maybe_reinject_slow_path_from_frame,
+};
+// pub(in crate::afxdp::tx) was previously pub(super) on the
+// extract_l3_packet[_from_frame] family; the re-export keeps the
+// pre-split sibling-tx/ visibility verbatim.
+pub(in crate::afxdp::tx) use slow_path::{extract_l3_packet, extract_l3_packet_from_frame};
 
 #[inline]
 fn recycle_ingress_frame(ingress_binding: &mut BindingWorker, source_offset: u64, now_ns: u64) {
@@ -938,489 +941,6 @@ fn resolve_pending_forward_target_binding<'a>(
     )
 }
 
-pub(in crate::afxdp) fn handle_forward_build_failure(
-    binding: &BindingIdentity,
-    live: &BindingLiveState,
-    slow_path: Option<&Arc<SlowPathReinjector>>,
-    local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
-    dbg: &mut DebugPollCounters,
-    _target_ifindex: i32,
-    packet_length: u32,
-    frame: &[u8],
-    meta: impl Into<UserspaceDpMeta>,
-    decision: SessionDecision,
-    fallback_to_slow_path: bool,
-    forwarding: &ForwardingState,
-) {
-    let meta = meta.into();
-    dbg.build_fail += 1;
-    #[cfg(feature = "debug-log")]
-    if dbg.build_fail <= 3 {
-        debug_log!(
-            "DBG BUILD_FAIL: target_ifindex={} len={} fallback_slow={}",
-            _target_ifindex,
-            packet_length,
-            fallback_to_slow_path,
-        );
-    }
-    record_exception(
-        recent_exceptions,
-        binding,
-        "forward_build_failed",
-        packet_length,
-        Some(meta),
-        None,
-        forwarding,
-    );
-    if fallback_to_slow_path {
-        maybe_reinject_slow_path_from_frame(
-            binding,
-            live,
-            slow_path,
-            local_tunnel_deliveries,
-            frame,
-            meta,
-            decision,
-            recent_exceptions,
-            "forward_build_slow_path",
-            forwarding,
-        );
-    }
-}
-
-pub(in crate::afxdp) fn apply_shared_recycles(
-    left: &mut [BindingWorker],
-    current_index: usize,
-    current: &mut BindingWorker,
-    right: &mut [BindingWorker],
-    binding_lookup: &WorkerBindingLookup,
-    shared_recycles: &mut Vec<(u32, u64)>,
-) {
-    if shared_recycles.is_empty() {
-        return;
-    }
-    let mut dropped = 0u64;
-    let mut first_drop = None;
-    for (slot, offset) in shared_recycles.drain(..) {
-        if route_shared_recycle_by_slot(
-            left,
-            current_index,
-            current,
-            right,
-            binding_lookup,
-            slot,
-            offset,
-        ) {
-            continue;
-        }
-        first_drop.get_or_insert((slot, offset));
-        dropped = dropped.saturating_add(1);
-    }
-    log_shared_recycle_unknown_slot_drops(dropped, first_drop);
-    record_shared_recycle_unknown_slot_drops(Some(&current.live), dropped);
-}
-
-fn route_shared_recycle_by_slot(
-    left: &mut [BindingWorker],
-    current_index: usize,
-    current: &mut BindingWorker,
-    right: &mut [BindingWorker],
-    binding_lookup: &WorkerBindingLookup,
-    slot: u32,
-    offset: u64,
-) -> bool {
-    let target_index = shared_recycle_target_index_for_split(
-        left.len(),
-        right.len(),
-        binding_lookup,
-        slot,
-        |idx| split_binding_slot_at(left, current_index, current, right, idx),
-    );
-    if let Some(target_index) = target_index
-        && let Some(binding) =
-            binding_by_index_mut(left, current_index, current, right, target_index)
-    {
-        binding.tx_pipeline.pending_fill_frames.push_back(offset);
-        return true;
-    }
-    false
-}
-
-fn shared_recycle_target_index_for_split<F>(
-    left_len: usize,
-    right_len: usize,
-    binding_lookup: &WorkerBindingLookup,
-    slot: u32,
-    slot_at: F,
-) -> Option<usize>
-where
-    F: FnMut(usize) -> Option<u32>,
-{
-    shared_recycle_target_index(
-        left_len.saturating_add(1).saturating_add(right_len),
-        binding_lookup,
-        slot,
-        slot_at,
-    )
-}
-
-fn split_binding_slot_at(
-    left: &[BindingWorker],
-    current_index: usize,
-    current: &BindingWorker,
-    right: &[BindingWorker],
-    target_index: usize,
-) -> Option<u32> {
-    if target_index == current_index {
-        return Some(current.slot);
-    }
-    if target_index < current_index {
-        return left.get(target_index).map(|binding| binding.slot);
-    }
-    right
-        .get(target_index.saturating_sub(current_index + 1))
-        .map(|binding| binding.slot)
-}
-
-fn shared_recycle_target_index<F>(
-    binding_count: usize,
-    binding_lookup: &WorkerBindingLookup,
-    slot: u32,
-    mut slot_at: F,
-) -> Option<usize>
-where
-    F: FnMut(usize) -> Option<u32>,
-{
-    if let Some(target_index) = binding_lookup.slot_index(slot)
-        && target_index < binding_count
-        && slot_at(target_index) == Some(slot)
-    {
-        return Some(target_index);
-    }
-    (0..binding_count).find(|&idx| slot_at(idx) == Some(slot))
-}
-
-fn record_shared_recycle_unknown_slot_drops(error_live: Option<&BindingLiveState>, dropped: u64) {
-    if dropped == 0 {
-        return;
-    }
-    if let Some(live) = error_live {
-        live.tx_errors.fetch_add(dropped, Ordering::Relaxed);
-        live.tx_shared_recycle_unknown_slot_drops
-            .fetch_add(dropped, Ordering::Relaxed);
-    }
-}
-
-fn log_shared_recycle_unknown_slot_drops(dropped: u64, first_drop: Option<(u32, u64)>) {
-    if dropped == 0 {
-        return;
-    }
-    if let Some((slot, offset)) = first_drop {
-        eprintln!(
-            "xpf-userspace-dp: dropping {} shared UMEM recycles for unknown slots \
-             (first slot {} offset {})",
-            dropped, slot, offset
-        );
-    } else {
-        eprintln!(
-            "xpf-userspace-dp: dropping {} shared UMEM recycles for unknown slots",
-            dropped
-        );
-    }
-}
-
-pub(in crate::afxdp) fn apply_shared_recycles_to_bindings(
-    bindings: &mut [BindingWorker],
-    binding_lookup: &WorkerBindingLookup,
-    shared_recycles: &mut Vec<(u32, u64)>,
-) -> u64 {
-    if shared_recycles.is_empty() {
-        return 0;
-    }
-    let mut dropped = 0u64;
-    let mut first_drop = None;
-    for (slot, offset) in shared_recycles.drain(..) {
-        let target_index =
-            shared_recycle_target_index(bindings.len(), binding_lookup, slot, |idx| {
-                bindings.get(idx).map(|binding| binding.slot)
-            });
-        if let Some(target_index) = target_index
-            && let Some(binding) = bindings.get_mut(target_index)
-        {
-            binding.tx_pipeline.pending_fill_frames.push_back(offset);
-            continue;
-        }
-        first_drop.get_or_insert((slot, offset));
-        dropped = dropped.saturating_add(1);
-    }
-    log_shared_recycle_unknown_slot_drops(dropped, first_drop);
-    record_shared_recycle_unknown_slot_drops(
-        bindings.first().map(|binding| binding.live.as_ref()),
-        dropped,
-    );
-    dropped
-}
-
-pub(in crate::afxdp) fn resolve_tx_binding_ifindex(
-    forwarding: &ForwardingState,
-    egress_ifindex: i32,
-) -> i32 {
-    if let Some(fabric) = forwarding
-        .fabrics
-        .iter()
-        .find(|fabric| fabric.parent_ifindex == egress_ifindex)
-    {
-        return fabric.parent_ifindex;
-    }
-    forwarding
-        .egress
-        .get(&egress_ifindex)
-        .map(|iface| iface.bind_ifindex)
-        .filter(|ifindex| *ifindex > 0)
-        .unwrap_or(egress_ifindex)
-}
-
-fn resolve_pending_forward_cos_tx_selection(
-    forwarding: &ForwardingState,
-    request: &PendingForwardRequest,
-    now_ns: u64,
-) -> CoSTxSelection {
-    resolve_cos_tx_selection_at(
-        forwarding,
-        request.decision.resolution.egress_ifindex,
-        request.meta,
-        request.flow_key.as_ref(),
-        now_ns,
-    )
-}
-
-fn pending_forward_needs_cos_tx_selection(
-    request: &PendingForwardRequest,
-    tx_selection_enabled_v4: bool,
-    tx_selection_enabled_v6: bool,
-) -> bool {
-    let tx_selection_enabled = if request.meta.addr_family as i32 == libc::AF_INET6 {
-        tx_selection_enabled_v6
-    } else {
-        tx_selection_enabled_v4
-    };
-    tx_selection_enabled && !request.cos_tx_selection_resolved
-}
-
-pub(in crate::afxdp) fn maybe_reinject_slow_path(
-    binding: &BindingIdentity,
-    live: &BindingLiveState,
-    slow_path: Option<&Arc<SlowPathReinjector>>,
-    local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
-    area: &MmapArea,
-    desc: XdpDesc,
-    meta: impl Into<UserspaceDpMeta>,
-    decision: SessionDecision,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
-    forwarding: &ForwardingState,
-) {
-    let meta = meta.into();
-    if !matches!(
-        decision.resolution.disposition,
-        ForwardingDisposition::LocalDelivery
-            | ForwardingDisposition::NoRoute
-            | ForwardingDisposition::MissingNeighbor
-            | ForwardingDisposition::NextTableUnsupported
-    ) {
-        return;
-    }
-    let Some(frame) = area.slice(desc.addr as usize, desc.len as usize) else {
-        live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
-        record_exception(
-            recent_exceptions,
-            binding,
-            "slow_path_extract_failed",
-            desc.len as u32,
-            Some(meta),
-            None,
-            forwarding,
-        );
-        return;
-    };
-    maybe_reinject_slow_path_from_frame(
-        binding,
-        live,
-        slow_path,
-        local_tunnel_deliveries,
-        frame,
-        meta,
-        decision,
-        recent_exceptions,
-        "slow_path",
-        forwarding,
-    );
-}
-
-pub(in crate::afxdp) fn maybe_reinject_slow_path_from_frame(
-    binding: &BindingIdentity,
-    live: &BindingLiveState,
-    slow_path: Option<&Arc<SlowPathReinjector>>,
-    local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
-    frame: &[u8],
-    meta: impl Into<UserspaceDpMeta>,
-    decision: SessionDecision,
-    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
-    reason: &str,
-    forwarding: &ForwardingState,
-) {
-    let meta = meta.into();
-    let Some(packet) = extract_l3_packet_with_nat(frame, meta, decision.nat) else {
-        live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
-        record_exception(
-            recent_exceptions,
-            binding,
-            "slow_path_prepare_failed",
-            frame.len() as u32,
-            Some(meta),
-            None,
-            forwarding,
-        );
-        return;
-    };
-    let packet_len = packet.len() as u64;
-    let tunnel_delivery = if decision.resolution.disposition == ForwardingDisposition::LocalDelivery
-        && decision.resolution.local_ifindex > 0
-    {
-        local_tunnel_deliveries
-            .load()
-            .get(&decision.resolution.local_ifindex)
-            .cloned()
-    } else {
-        None
-    };
-    if let Some(delivery) = tunnel_delivery {
-        match delivery.try_send(packet) {
-            Ok(()) => {
-                live.record_slow_path_accept(decision.resolution.disposition, reason, packet_len);
-            }
-            Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
-                record_exception(
-                    recent_exceptions,
-                    binding,
-                    "local_tunnel_delivery_queue_full",
-                    frame.len() as u32,
-                    Some(meta),
-                    None,
-                    forwarding,
-                );
-            }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
-                record_exception(
-                    recent_exceptions,
-                    binding,
-                    "local_tunnel_delivery_unavailable",
-                    frame.len() as u32,
-                    Some(meta),
-                    None,
-                    forwarding,
-                );
-            }
-        }
-        return;
-    }
-    let selected_path = slow_path.cloned();
-    let Some(slow_path) = selected_path else {
-        live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
-        record_exception(
-            recent_exceptions,
-            binding,
-            "slow_path_unavailable",
-            frame.len() as u32,
-            Some(meta),
-            None,
-            forwarding,
-        );
-        return;
-    };
-    match slow_path.enqueue(packet) {
-        Ok(EnqueueOutcome::Accepted) => {
-            live.record_slow_path_accept(decision.resolution.disposition, reason, packet_len);
-        }
-        Ok(EnqueueOutcome::RateLimited) => {
-            live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
-            live.slow_path_rate_limited.fetch_add(1, Ordering::Relaxed);
-            record_exception(
-                recent_exceptions,
-                binding,
-                &format!("{reason}_rate_limited"),
-                frame.len() as u32,
-                Some(meta),
-                None,
-                forwarding,
-            );
-        }
-        Ok(EnqueueOutcome::QueueFull) => {
-            live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
-            record_exception(
-                recent_exceptions,
-                binding,
-                &format!("{reason}_queue_full"),
-                frame.len() as u32,
-                Some(meta),
-                None,
-                forwarding,
-            );
-        }
-        Err(err) => {
-            live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
-            live.set_error(err);
-            record_exception(
-                recent_exceptions,
-                binding,
-                &format!("{reason}_enqueue_failed"),
-                frame.len() as u32,
-                Some(meta),
-                None,
-                forwarding,
-            );
-        }
-    }
-}
-
-#[allow(dead_code)]
-pub(super) fn extract_l3_packet(
-    area: &MmapArea,
-    desc: XdpDesc,
-    meta: UserspaceDpMeta,
-) -> Option<Vec<u8>> {
-    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
-    extract_l3_packet_from_frame(frame, meta)
-}
-
-pub(super) fn extract_l3_packet_from_frame(
-    frame: &[u8],
-    meta: impl Into<ForwardPacketMeta>,
-) -> Option<Vec<u8>> {
-    let meta = meta.into();
-    let l3 = meta.l3_offset as usize;
-    if l3 >= frame.len() {
-        return None;
-    }
-    Some(frame[l3..].to_vec())
-}
-
-pub(in crate::afxdp) fn extract_l3_packet_with_nat(
-    frame: &[u8],
-    meta: impl Into<ForwardPacketMeta>,
-    nat: NatDecision,
-) -> Option<Vec<u8>> {
-    let meta = meta.into();
-    let mut packet = extract_l3_packet_from_frame(frame, meta)?;
-    match meta.addr_family as i32 {
-        libc::AF_INET => apply_nat_ipv4(&mut packet, meta.protocol, nat)?,
-        libc::AF_INET6 => apply_nat_ipv6(&mut packet, meta.protocol, nat)?,
-        _ => return None,
-    }
-    Some(packet)
-}
 
 #[inline(always)]
 fn count_forwarded_tcp_segmentation_miss_if_needed(
