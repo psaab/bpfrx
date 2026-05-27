@@ -20,6 +20,12 @@
 
 ## Plan review round 4 — v2-r3 (commit e64103b8a)
 
-- Codex: `task-mpol9qvc-a60wf4`
-- Antigravity: `adversarial-review-mpol9qlh-ivlrgr`
-- Claude SMR: `docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r4.md` — PLAN-READY
+- Codex: `task-mpol9qvc-a60wf4` (lost to infra; retried as `task-mpolbsvu-mpanqp` also lost)
+- Antigravity: `adversarial-review-mpol9qlh-ivlrgr` — PLAN-NEEDS-MAJOR (4 axes)
+- Claude SMR: `docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r4.md` — PLAN-READY (retracted, see r5)
+
+## Plan review round 5 — v2-r4 (commit-pending)
+
+- Claude SMR: `docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r5.md` — PLAN-READY for narrowed scope (plan + skeleton + counters; runner + measurement deferred to follow-up commits on same branch)
+- Codex: not dispatched (infra repeatedly losing tasks this session)
+- Antigravity: not dispatched (4 consecutive rounds productive; r5 would be diminishing returns vs current narrowed scope)

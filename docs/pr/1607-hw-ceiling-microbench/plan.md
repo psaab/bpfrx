@@ -1,6 +1,23 @@
 # #1607 Cold-path hardware-ceiling microbench — plan v2 (patched after AGY r2 PLAN-KILL)
 
-Status: **DRAFT v2 patched (round 3)** — replaces PLAN-KILLED v1.
+Status: **DRAFT v2 patched (round 4)** — replaces PLAN-KILLED v1.
+
+v2-round4 changes (post-AGY-r4 PLAN-NEEDS-MAJOR):
+- §4.2.0 micro-policy gate: synthetic-policy-gen.py must emit
+  SNAT-free policies for Table A1 baseline runs (AGY r4 axis 1).
+- §4.6 harness gate: enforce `duration_secs + warmup_secs < 60` so the
+  measurement window stays inside the UDP session timeout (AGY r4 axis 2).
+- §4.6 microarchitectural limitation: document that the 4096-entry
+  thread-local flow cache (~819 KB per worker) causes L2/L3 thrashing
+  under unbounded mode; the Table A1 baseline is bounded by this memory
+  cost, not by ideal-hardware policy-eval (AGY r4 axis 3).
+- §4.7 wire-protocol: add `clock_source` per-worker field to
+  `WorkerRuntimeStatus` so the harness can verify TSC compliance per
+  worker (AGY r4 axis 5).
+- §6/§7: move Table A1/A2/B1/B2 measured numbers OUT of scope of THIS
+  PR (AGY r4 axis 4). The flooder runner body must land before
+  measurement; reviewers prefer the runner body as a follow-up commit
+  on this same branch rather than ballooning the original PR.
 AGY plan-review round 2 (`adversarial-review-mpoklpnn-a24rwz`) PLAN-KILL +
 AGY round 3 (`adversarial-review-mpoky7be-bsku4m`) PLAN-NEEDS-MAJOR
 patches incorporated. v2-round3 changes (post-AGY-r3):
@@ -825,6 +842,21 @@ Prometheus scrape budget; comparable to existing
   TSC sampling, 24-bucket layout, 16-slot per-zone-pair histogram,
   CPU isolation recording. Doc text scoped to "approximate ceiling
   under contention" with #739 follow-up linkage.
+- v2 patched (round 4) — addresses AGY r4 PLAN-NEEDS-MAJOR:
+  - axis 1 (SNAT rollback Mutex on install_rejected): synthetic
+    config emits SNAT-free policies for Table A1 baseline; explicit
+    flag in the manifest.
+  - axis 2 (60 s session-GC latency cliff): harness gates
+    `duration + warmup < 60 s`; emits SESSION-GC-WINDOW-WARNING
+    if duration is set too long.
+  - axis 3 (819 KB flow-cache thrashing): documented as
+    measurement-floor limitation in §4.6 prose; not removable.
+  - axis 4 (flooder runner stub vs §6 test plan): move Table
+    A1/A2/B1/B2 measurement out of scope of THIS PR; flooder
+    runner lands in follow-up commit; Tables remain TBD until
+    runner ships.
+  - axis 5 (TSC verification per-worker): add `clock_source`
+    field to `WorkerRuntimeStatus`.
 - v2 patched (round 3) — addresses AGY r3 PLAN-NEEDS-MAJOR:
   - axis 1 (burst-install contention distorts Table A): promote
     `--cohort=unbounded` to default; bounded becomes diagnostic-only.
