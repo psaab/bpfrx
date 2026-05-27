@@ -167,15 +167,20 @@ cold-path-flooder
   --src-ip-base <IP>    (10.42.0.0 default)
   --src-ip-span <N>     (default 16384 — see "5-tuple cardinality budget" below)
   --src-port-span <N>   (default 8 — see "5-tuple cardinality budget" below)
-  --duration-secs <S>   (default 30)
-  --warmup-secs <S>     (default 2)
-  --tx-mbps <M>         (default 0 = max)
-  --frame-bytes <B>     (default 64; checked against MIN_ETH=64)
-  --batch <N>           (sendmmsg batch; default 32)
-  --iface <NAME>        (default ge-0-0-1 — LAN side of loss cluster)
-  --ipv4 | --ipv6       (default ipv4; v6 path uses fe80::-equivalent)
-  --output-json <FILE>  (per-run summary)
+  --duration-secs <S>   (default 30)        [step-1 ✓]
+  --warmup-secs <S>     (default 2)         [step-1 ✓]
+  --frame-bytes <B>     (default 64; checked against MIN_ETH=64) [step-1 ✓]
+  --batch <N>           (sendmmsg batch; default 32) [step-1 ✓]
+  --iface <NAME>        (default ge-0-0-1 — LAN side of loss cluster) [step-1 ✓]
+  --cohort bounded|unbounded  (default unbounded) [step-1 ✓]
+  --tx-mbps <M>         (default 0 = max)   [step-2 #1611 — runner-body knob]
+  --ipv4 | --ipv6       (default ipv4; v6 path uses fe80::-equivalent) [step-2 #1611 — runner-body knob]
+  --output-json <FILE>  (per-run summary)   [step-2 #1611 — runner-body knob]
 ```
+
+Step-1 ships the [step-1 ✓] flags only; the [step-2 #1611] flags
+are part of the runner-body follow-up. Step-1's CLI surface above
+maps to `Args::parse()` in `test/incus/cold-path-flooder/src/main.rs`.
 
 #### 4.2.0 5-tuple cardinality budget — dual-regime measurement
 

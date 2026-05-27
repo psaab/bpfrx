@@ -1,19 +1,29 @@
 // #1607 cold-path-flooder
 //
 // Generates UDP traffic with randomized source IPs, source ports, and
-// (optionally) destination ports drawn from a *bounded* unique 5-tuple
-// cohort that fits the dataplane's session table (DEFAULT_MAX_SESSIONS
-// = 131_072). This is the default mode for cold-path measurement: each
-// new 5-tuple triggers a real session miss → policy eval → session
-// install → cross-worker replicate path. Once the table fills, the
-// remaining packets reuse existing 5-tuples and hit the warm path.
+// (optionally) destination ports.
+//
+// Two regimes:
+//   * `--cohort=unbounded` (DEFAULT, per AGY r3 axis 1 resolution):
+//     sweeps a /16 source-IP range × full ephemeral source-port range
+//     = ~4.3 B unique 5-tuples. Session table fills in ~26 ms; the
+//     remaining ~99.9% of the run measures the pure policy-eval cold
+//     path (cache_miss → policy_eval → install_rejected_fast_return),
+//     with the cross-worker replicate path bypassed. This is the
+//     primary JIT-planning target.
+//   * `--cohort=bounded` (DIAGNOSTIC opt-in): fits the session table
+//     (DEFAULT_MAX_SESSIONS = 131_072). Every cold-path sample
+//     measures real session miss → policy eval → session install →
+//     cross-worker replicate. Burst-install profile distorts steady-
+//     state latency, hence not the default; useful for isolating the
+//     install + replicate cost.
 //
 // True 64 B Ethernet frames on the wire (default): Ethernet 14 +
 // IPv4 20 + UDP 8 + UDP payload 22 = 64 B. (IPv6 path: 14 + 40 + 8
 // + 2 = 64 B.) AF_PACKET SOCK_RAW + sendmmsg batching.
 //
-// See plan v2 patched §4.2 for the design rationale and AGY r2 axis-1
-// resolution.
+// See plan v2-r4 §4.2 for the design rationale and the AGY r2/r3/r4
+// axis resolutions.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -31,13 +41,20 @@ const DEFAULT_BATCH: usize = 32;
 // Bounded-mode constants (used only when --cohort=bounded; see
 // plan v2 patched-r3 §4.2.0). Default mode is unbounded.
 const BOUNDED_SRC_IP_SPAN: u32 = 16_384; // 14 bits
-const BOUNDED_SRC_PORT_SPAN: u16 = 8; // 3 bits
-const BOUNDED_DST_PORT_SPAN: u16 = 1;
-// Unbounded mode defaults (sweeps a /16 + full ephemeral source-port
-// range; 4.3 B unique 5-tuples).
-const DEFAULT_SRC_IP_SPAN: u32 = 65_535;
-const DEFAULT_SRC_PORT_SPAN: u16 = 65_535;
-const DEFAULT_DST_PORT_SPAN: u16 = 1;
+const BOUNDED_SRC_PORT_SPAN: u32 = 8; // 3 bits
+const BOUNDED_DST_PORT_SPAN: u32 = 1;
+// Unbounded mode defaults (sweeps a full /16 + full 16-bit source-port
+// space). Spans are u64 cardinalities (NOT u16 max-value), so 65_536
+// here means "all 2^16 distinct values [0, 65_536) before modulo".
+// The runner body's modulo arithmetic (deferred to step-2 #1611) will
+// use `xorshift_word % src_port_span as u64` etc., so an off-by-one
+// span like 65_535 would systematically exclude one value per axis.
+// 65_536 × 65_536 × 1 = 4_294_967_296 unique 5-tuples; the session
+// table caps at DEFAULT_MAX_SESSIONS, so the install_rejected fast-
+// return path dominates after ~26 ms.
+const DEFAULT_SRC_IP_SPAN: u32 = 65_536;
+const DEFAULT_SRC_PORT_SPAN: u32 = 65_536;
+const DEFAULT_DST_PORT_SPAN: u32 = 1;
 const DEFAULT_DST_PORT_BASE: u16 = 5201;
 
 // Compile-time check: bounded cohort fits DEFAULT_MAX_SESSIONS.
@@ -59,10 +76,10 @@ struct Args {
     src_mac: [u8; 6],
     dst_ip: Ipv4Addr,
     dst_port_base: u16,
-    dst_port_span: u16,
+    dst_port_span: u32,
     src_ip_base: u32,
     src_ip_span: u32,
-    src_port_span: u16,
+    src_port_span: u32,
     duration: Duration,
     warmup: Duration,
     frame_bytes: usize,
@@ -219,6 +236,30 @@ impl Args {
             }
         }
 
+        // Copilot review r1: defensive validation against zero spans
+        // and zero batch. The runner body (step-2 #1611) will compute
+        // `xorshift_word % span` and `sendmmsg(batch)`, both of which
+        // crash or behave incorrectly when given 0.
+        if args.src_ip_span == 0 {
+            return Err("--src-ip-span must be >= 1".to_string());
+        }
+        if args.src_port_span == 0 {
+            return Err("--src-port-span must be >= 1".to_string());
+        }
+        if args.dst_port_span == 0 {
+            return Err("--dst-port-span must be >= 1".to_string());
+        }
+        if args.batch == 0 {
+            return Err("--batch must be >= 1".to_string());
+        }
+        if args.batch > 1024 {
+            return Err(format!(
+                "--batch {} > 1024; sendmmsg has practical limits — \
+                 keep batch <= 1024",
+                args.batch
+            ));
+        }
+
         if args.seed == 0 {
             // SAFETY: getpid/clock_gettime are always available
             // on Linux. We only call them to seed the PRNG; their
@@ -249,7 +290,7 @@ USAGE:
 OPTIONS:
   --iface NAME            (default ge-0-0-1)
   --dst-ip IP             (default 172.16.80.200)
-  --dst-mac MAC           (default broadcast; let the kernel ARP)
+  --dst-mac MAC           (default broadcast; step-2 runner will ARP-resolve gateway unless --dst-mac is explicitly set)
   --src-mac MAC           (default 0x000000000000; auto-fill from iface)
   --dst-port-base N       (default 5201)
   --dst-port-span N       (default 1)
@@ -418,6 +459,16 @@ mod tests {
     fn parse_mac_invalid_segments() {
         assert!(parse_mac("02:bf:72").is_err());
         assert!(parse_mac("02:bf:72:cc:00:0z").is_err());
+    }
+
+    #[test]
+    fn unbounded_default_uses_full_2_to_16_spans() {
+        // Copilot review r1 axis 2: spans are CARDINALITIES (count of
+        // values), not max-values. The full 16-bit space is 2^16 = 65_536
+        // distinct values, NOT 65_535.
+        assert_eq!(DEFAULT_SRC_IP_SPAN, 65_536);
+        assert_eq!(DEFAULT_SRC_PORT_SPAN, 65_536);
+        assert_eq!(DEFAULT_DST_PORT_SPAN, 1);
     }
 
     #[test]

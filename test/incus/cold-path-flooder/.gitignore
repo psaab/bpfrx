@@ -1,2 +1,4 @@
 /target
-Cargo.lock
+# Cargo.lock IS tracked — matches repo convention (test/xsk-repro,
+# userspace-dp, userspace-xdp all commit their lockfiles). Removed
+# from this .gitignore per Copilot code-review-r1 finding.

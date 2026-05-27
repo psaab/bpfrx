@@ -4131,3 +4131,9 @@ top.
 - **Timestamp**: 2026-05-27 (UTC)
   - **Action**: Filed follow-up issues #1611 (runner body) + #1612 (measurement). Opened PR #1613 narrowed step-1 (plan + flooder skeleton). Triggered Copilot review. Dispatched AGY adversarial-review-mpomv4o9-bwph0u + Codex task-mpomvkmw-pb85x6 (5th Codex infra loss expected). Wrote Claude SMR code-review r1 CODE-READY. Hardened runner stub to exit 71 (sysexits.h EX_OSERR) instead of 0 so downstream harness scripts using $? can detect the stub state. Patched plan §6 leftover "populate Tables in same PR" line to reference step-3 #1612 instead.
   - **File(s)**: PR #1613 (created), test/incus/cold-path-flooder/src/main.rs (stub exit code), docs/pr/1607-hw-ceiling-microbench/plan.md (§6 fix), docs/pr/1607-hw-ceiling-microbench/claude-smr-code-r1.md (new)
+
+## 2026-05-27 — #1613 address Copilot code-r1 6 findings
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Copilot code review on PR #1613 raised 6 inline findings: (1) file header comment said "bounded default" but code defaults to unbounded — fixed comment; (2) unbounded default spans 65535 exclude one value, switched to 65536 (cardinality semantics) + unified all span types to u32; (3) zero-span and zero/oversized-batch validation added; (4) --dst-mac help text now notes step-2 will do ARP-resolve; (5) removed Cargo.lock from .gitignore to match repo convention (xsk-repro, userspace-dp, userspace-xdp all commit lockfile); (6) plan.md flag surface now tagged with [step-1 ✓] vs [step-2 #1611] per-flag. Added new test unbounded_default_uses_full_2_to_16_spans (7/7 cargo tests pass).
+  - **File(s)**: test/incus/cold-path-flooder/src/main.rs, test/incus/cold-path-flooder/.gitignore, test/incus/cold-path-flooder/Cargo.lock (new — tracked), docs/pr/1607-hw-ceiling-microbench/plan.md
