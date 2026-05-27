@@ -1,10 +1,16 @@
 # #1607 Cold-path hardware-ceiling microbench — plan v2 (patched after AGY r2 PLAN-KILL)
 
-Status: **DRAFT v2 patched** — replaces PLAN-KILLED v1. AGY plan-review
-round 2 (`adversarial-review-mpoklpnn-a24rwz`) returned PLAN-KILL with
-four new fatal axes that v2 introduced; this patched v2 (commit-pending)
-addresses all four. Claude SMR r2 had voted PLAN-READY-WITH-NIT; that
-verdict is superseded by this patch — see §Y v2 patch log.
+Status: **DRAFT v2 patched (round 3)** — replaces PLAN-KILLED v1.
+AGY plan-review round 2 (`adversarial-review-mpoklpnn-a24rwz`) PLAN-KILL +
+AGY round 3 (`adversarial-review-mpoky7be-bsku4m`) PLAN-NEEDS-MAJOR
+patches incorporated. v2-round3 changes (post-AGY-r3):
+- Promote `--cohort=unbounded` to default for the JIT-planning Scale
+  Target. Bounded mode is diagnostic only.
+- Split §4.6 into four tables (A1 pure policy-eval, A2 install+replicate,
+  B1 warm-path-after-fill, B2 cold-saturated).
+- Drop p9999 from Table A2 (bounded mode); statistically thin.
+- TSC-only gate on Scale Target: clock_gettime fallback runs are stored
+  in raw TSVs but excluded from the published §4.6 table.
 
 v1 round-1 verdicts (verbatim references):
 
@@ -154,23 +160,84 @@ cold-path-flooder
   --output-json <FILE>  (per-run summary)
 ```
 
-#### 4.2.0 5-tuple cardinality budget — bounded sweep to match session table
+#### 4.2.0 5-tuple cardinality budget — dual-regime measurement
 
-AGY r2 axis 1 (FATAL): an unbounded random /16 sweep × full ephemeral
-port range generates ~4.3 billion distinct 5-tuples. The session table
-caps at `DEFAULT_MAX_SESSIONS = 131_072` per dataplane
-(`userspace-dp/src/session/mod.rs:25`). UDP timeout is 60 s
-(`session/mod.rs:28`). At 5 Mpps × 30 s = 150 M packets, the table
-fills in the first ~26 ms; for the next 29.97 s of the run, every
-`install_with_protocol_with_origin` call returns `false`
-(`session/mod.rs:666-668`). That changes what the benchmark measures
-from "real cold-path packet cost (cache miss → policy eval → session
-install → cross-worker replicate)" to "policy eval only with all the
-expensive install work bypassed". v2 numbers would mislead the JIT
-design doc into thinking the cold-path budget is half its real value.
+There are two legitimate cold-path measurement regimes, and the right
+JIT-planning answer needs **both** numbers, not one.
 
-**Fix**: default the flooder to a **bounded** unique-5-tuple cohort
-sized to fit the session table comfortably:
+**Regime A — Pure policy evaluation (`--cohort=unbounded`)**
+
+Random /16 sweep × full ephemeral source-port range generates
+~4.3 billion distinct 5-tuples. The session table caps at
+`DEFAULT_MAX_SESSIONS = 131_072` (`userspace-dp/src/session/mod.rs:25`).
+At 5 Mpps × 30 s, the table fills in the first ~26 ms; for the
+remaining 29.97 s, every `install_with_protocol_with_origin` call
+returns `false` fast (`session/mod.rs:666-668`), and
+`replicate_session_upsert` is bypassed entirely. The cold path
+degenerates to:
+`cache_miss → policy_eval → install_rejected_fast_return`.
+
+This is the right number for the JIT engine's worst-case linear-scan
+budget — it isolates the policy-eval cost without contamination from
+session install or cross-worker replicate lock contention.
+
+**Regime B — Real cold-path including session install (`--cohort=bounded`)**
+
+Bounded cohort sized exactly to the session table:
+
+```
+src_ip_span      = 16384   (14 bits of IP randomization)
+src_port_span    = 8       (3 bits of source-port — 8 ports per IP)
+dst_port_span    = 1       (single dst-port by default)
+unique 5-tuples  = 16384 × 8 × 1 = 131_072  (exactly DEFAULT_MAX_SESSIONS)
+```
+
+The cohort fills the session table to capacity during the first
+~26 ms of the run, with every install succeeding and triggering
+`replicate_session_upsert` (`session_glue/mod.rs:573-583`) — which
+acquires N (= worker_count) per-worker Mutex command queues and pushes
+a `WorkerCommand::UpsertSynced(replica.clone())`. With 6 workers at
+5 Mpps, that's 786 K Mutex acquisitions in 26 ms ≈ 30 M locks/s
+aggregated — a real measurement of cross-worker session-replicate
+contention, but a *burst* profile that's not representative of
+sustained 100 K new-flows/sec production traffic.
+
+This regime is useful for measuring the install + replicate cost as
+a separate concern from policy eval.
+
+**Default regime — Regime A (unbounded)**
+
+Per AGY r3 axis 1: bounded mode produces burst-install lock contention
+in the first 26 ms that distorts the latency histogram, AND only 131 K
+total cold-path samples per run (since flow cache hits all subsequent
+packets — p9999 has 13 samples, statistically noise-dominated).
+
+Unbounded mode, by contrast, runs cold-path continuously for the
+entire 30 s window:
+- 5 Mpps × 30 s = 150 M packets, all cold-path-eligible.
+- 1-in-256 sample mask → ~586 K samples per run. p9999 has ~58.6 K
+  tail samples — clean.
+
+**Both regimes are reported in §4.6:**
+- Table A1 (default): policy-eval-only cold-path latency under Regime A.
+- Table A2 (diagnostic): install + replicate cost under Regime B.
+- Table B1 (default): warm-path-after-fill aggregate Mpps under Regime B.
+- Table B2 (diagnostic): cold-path-saturated aggregate Mpps under Regime A.
+
+The TSV `mode` column records which regime is active. The Scale Target
+text in `docs/userspace-jit-design.md` cites both numbers with their
+regime tag, so the JIT design doc can budget cold-path policy eval
+(Regime A) independently from session install (Regime B).
+
+The previous v2-patched §4.2.0 made Regime B the default. AGY r3
+caught two problems with that choice:
+- The burst-install contention distorts the latency measurement.
+- 131 K samples is statistically thin for p9999.
+
+The remedy: promote Regime A to default; keep Regime B explicit for
+session-install measurement.
+
+**Fix details for Regime A**:
 
 ```
 src_ip_span      = 16384   (14 bits of IP randomization)
@@ -181,22 +248,19 @@ unique 5-tuples  = 16384 × 8 × 1 = 131_072  (exactly DEFAULT_MAX_SESSIONS)
 
 This means:
 
-- Every first-packet of each unique 5-tuple is a cold-path eval (session
-  miss → policy eval → session install). 131 K cold-path samples per
-  run.
-- After the session table is full (~26 ms into the run), subsequent
-  packets reuse existing 5-tuples → flow-cache hit → warm path. The
-  cold-path sample rate becomes ~ 0 from that point onward.
-- Net result: 131 K cold-path samples in 30 s. At 1-in-256 sampling
-  that's only ~512 histogram samples — too few for a clean p999. **So
-  we drop the sample mask when the cohort is bounded**: the harness
-  exposes `--sample-mask <N>` (default 1, i.e. 100 % sampling when
-  cohort ≤ 256 K; default 256 when cohort > 256 K). The 1-in-N
-  decision is per-run, recorded in the TSV header.
-- The wrapper-baseline subtraction (TSC pair ~25 ns × 2) still
-  applies; at 100 % sampling the per-packet wrapper cost is ~55 ns
-  per cold-path sample. The harness reports `wrapper_ns_baseline`
-  so reviewers can audit.
+- Default mode is `--cohort=unbounded`. The harness in the default
+  invocation uses `--src-ip-span 65535 --src-port-span 65535
+  --dst-port-span 1` ≈ 4.3 B unique 5-tuples; all packets after
+  the 26 ms warm-up are cold-path-eligible (cache_miss → policy_eval →
+  install_rejected). Sample mask 1-in-256 → ~586 K samples / 30 s,
+  ample for p9999.
+- Optional `--cohort=bounded` mode uses the 131 K-cohort sizing
+  above. Sample mask drops to 1-in-1 because the cold-path sample
+  count is hard-capped at 131 K (one per unique 5-tuple). p999 is
+  clean (131 tail samples); p9999 is NOT reported in bounded mode
+  per AGY r3 axis 3 (13 samples too few).
+- The wrapper-baseline subtraction (TSC pair ~25 ns × 2) applies to
+  both regimes; the harness reports `wrapper_ns_baseline`.
 
 **Alternative knobs the harness exposes**:
 
@@ -507,7 +571,8 @@ If `shared_cpus` non-empty, the TSV header includes
 
 ### 4.6 Doc update — `docs/userspace-jit-design.md` Scale Target section
 
-Two separate tables (per Claude SMR F1.3 + F5 callout):
+Four tables (per AGY r3 axis 2 — bounded-mode Table B is warm-path
+illusion, must label both regimes explicitly):
 
 ```markdown
 ## Scale Target (measured on loss userspace cluster, 2026-05-27)
@@ -515,47 +580,85 @@ Two separate tables (per Claude SMR F1.3 + F5 callout):
 Methodology: `test/incus/cold-path-microbench.sh --rules N`
 on `loss:xpf-userspace-fw0`. Default flooder mode: UDP source-port
 randomized at 5 Mpps target, true 64 B Ethernet frames. Per-packet
-cold-path latency sampled 1-in-256 via TSC; wrapper baseline
-subtracted in the corrected column.
+cold-path latency sampled 1-in-256 via TSC (Regime A) / 1-in-1 by
+TSC (Regime B); wrapper baseline subtracted in the corrected column.
 
 CPU isolation state at run time: **isolcpus=absent** (loss cluster
 runs with `limits.cpu: 4` and no `isolcpus` per #739). Numbers
 below are upper-bound estimates under contention.
 
-### Table A — Cold-path latency (per-call, ns)
+**TSC-only gate (AGY r3 hazard 1)**: Tables below publish only
+runs where `clock_source = tsc`. `clock_gettime` fallback runs
+(CI VMs without invariant TSC) are stored in raw TSVs but NOT
+copied into this scale target table; vDSO/hypervisor clock jitter
+on those runs would distort the budget.
+
+### Table A1 — Pure policy-eval cold-path latency (Regime A unbounded; per-call, ns)
+
+Default JIT-planning regime. cache_miss → policy_eval →
+install_rejected_fast_return. Cross-worker replicate bypassed.
+
+| Rules | p50 raw | p50 corr | p99 raw | p99 corr | p999 raw | p999 corr | p9999 raw | p9999 corr | Notes |
+|-------|--------:|---------:|--------:|---------:|---------:|----------:|----------:|-----------:|-------|
+|    10 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | linear scan trivial |
+|   100 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | |
+|  1000 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | first cliff candidate |
+| 10000 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | pre-#1606 wire ceiling |
+| 100000 | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | blocked on #1606 |
+| 1M | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | blocked on #1606 |
+
+### Table A2 — Install + replicate cold-path latency (Regime B bounded; per-call, ns)
+
+Diagnostic. cache_miss → policy_eval → install_succeeded →
+replicate_session_upsert × worker_count. 131 K cohort. Per AGY r3
+axis 3, **p9999 dropped** (13 samples — noise-dominated).
 
 | Rules | p50 raw | p50 corr | p99 raw | p99 corr | p999 raw | p999 corr | Notes |
 |-------|--------:|---------:|--------:|---------:|---------:|----------:|-------|
-|    10 | TBD | TBD | TBD | TBD | TBD | TBD | linear scan trivial |
+|    10 | TBD | TBD | TBD | TBD | TBD | TBD | burst install dominates |
 |   100 | TBD | TBD | TBD | TBD | TBD | TBD | |
-|  1000 | TBD | TBD | TBD | TBD | TBD | TBD | first cliff candidate |
-| 10000 | TBD | TBD | TBD | TBD | TBD | TBD | pre-#1606 wire ceiling |
-| 100000 | N/A | N/A | N/A | N/A | N/A | N/A | blocked on #1606 |
-| 1M | N/A | N/A | N/A | N/A | N/A | N/A | blocked on #1606 |
+|  1000 | TBD | TBD | TBD | TBD | TBD | TBD | |
+| 10000 | TBD | TBD | TBD | TBD | TBD | TBD | |
 
-### Table B — Aggregate throughput (Mpps, 64 B frames)
+### Table B1 — Warm-path-after-fill aggregate throughput (Regime B; Mpps, 64 B frames)
+
+Reflects steady-state warm-path Mpps after the bounded cohort's
+session table fills (~26 ms warm-up). NOT a cold-path-throughput
+measurement.
 
 | Rules | Per-worker Mpps p50 | Aggregate Mpps | Notes |
 |-------|--------------------:|---------------:|-------|
-|    10 | TBD | TBD | |
-|   100 | TBD | TBD | |
-|  1000 | TBD | TBD | |
-| 10000 | TBD | TBD | |
+|    10 | TBD | TBD | warm path |
+|   100 | TBD | TBD | warm path |
+|  1000 | TBD | TBD | warm path |
+| 10000 | TBD | TBD | warm path |
+
+### Table B2 — Cold-path-saturated aggregate throughput (Regime A; Mpps, 64 B frames)
+
+True cold-path Mpps when every packet exercises policy eval
+(install_rejected fast path). The cap of Table B1 vs Table B2
+shows the warm-path advantage the JIT planner can chase.
+
+| Rules | Per-worker Mpps p50 | Aggregate Mpps | Notes |
+|-------|--------------------:|---------------:|-------|
+|    10 | TBD | TBD | cold path |
+|   100 | TBD | TBD | cold path |
+|  1000 | TBD | TBD | cold path |
+| 10000 | TBD | TBD | cold path |
 
 ### Wrapper baseline
 
 `rdtscp` round-trip measured once per worker startup at TSC
 calibration. The TSV records the value as `wrapper_ns_baseline`.
 Typical value on loss cluster: ~30-40 ns (verified at run time).
-Table A "corr" columns subtract this from the raw histogram.
+Table A1/A2 "corr" columns subtract this from the raw histogram.
 
-### TSC sampling caveat
+### Sample-count budget
 
-Latency is sampled 1-in-256 packets. At 5 Mpps cold-path saturated
-this is ~19.5K samples/sec/worker → ~117 K samples / 6 s minimum
-run for statistical p999 (need ~1000 samples in the tail bucket).
-The harness runs 30 s by default so p999 is well-populated; p9999
-is reported but flagged with a sample-count caveat in the TSV.
+- Regime A (default): 1-in-256 sampling, ~586 K samples / 30 s,
+  ~58.6 K tail samples for p9999. Clean.
+- Regime B: 1-in-1 sampling, hard cap 131 K samples / run, ~131 tail
+  samples for p999. p9999 (13 samples) dropped per AGY r3 axis 3.
 ```
 
 ### 4.7 Public-API surface
@@ -722,7 +825,18 @@ Prometheus scrape budget; comparable to existing
   TSC sampling, 24-bucket layout, 16-slot per-zone-pair histogram,
   CPU isolation recording. Doc text scoped to "approximate ceiling
   under contention" with #739 follow-up linkage.
-- v2 patched — addresses AGY r2 PLAN-KILL findings:
+- v2 patched (round 3) — addresses AGY r3 PLAN-NEEDS-MAJOR:
+  - axis 1 (burst-install contention distorts Table A): promote
+    `--cohort=unbounded` to default; bounded becomes diagnostic-only.
+  - axis 2 (Table B warm-path illusion in bounded mode): split into
+    Table B1 (warm-after-fill, bounded) + Table B2 (cold-saturated,
+    unbounded).
+  - axis 3 (p9999 statistical starvation in bounded mode, 13 samples):
+    drop p9999 column from Table A2; add p9999 to Table A1 only.
+  - hazard 1 (clock_gettime VM jitter): TSC-only gate on Scale
+    Target; clock_gettime runs stored in raw TSVs but excluded from
+    §4.6 publication.
+- v2 patched (round 2) — addresses AGY r2 PLAN-KILL findings:
   - axis 1 (session table starvation): bound default unique-5-tuple
     cohort to 131_072 = `DEFAULT_MAX_SESSIONS`, so every cold-path
     sample measures real session install + policy eval cost; sample
@@ -743,6 +857,15 @@ Prometheus scrape budget; comparable to existing
     script; `FLOODER-PIN-WARNING` if host has < 4 cores.
   - hazard 3 (concurrent #1606/#1608 wire-protocol): unchanged from
     v2 — additive-only fields, expected mechanical merge.
+
+## Z. v2 patch round 3 (post-AGY r3) resolution map
+
+| AGY r3 axis/hazard | Resolution | Section |
+|--------------------|------------|---------|
+| Axis 1 — burst install contention distorts Table A | Promote `--cohort=unbounded` to default; cold path stays continuous for full 30 s; replicate_session_upsert bypassed | §4.2.0 |
+| Axis 2 — bounded Table B is warm-path illusion | Split into Table B1 (warm-path-after-fill, bounded) + Table B2 (cold-saturated, unbounded) with explicit labels | §4.6 |
+| Axis 3 — p9999 sample starvation in bounded mode | Drop p9999 from Table A2 (only 13 tail samples in bounded mode); p9999 still in Table A1 (unbounded ~58.6 K tail samples) | §4.6 |
+| Hazard 1 — clock_gettime VM jitter | TSC-only gate on Scale Target tables; clock_gettime runs in raw TSV only | §4.6 |
 
 ## Y. v2 patch round 2 (post-AGY-KILL) resolution map
 

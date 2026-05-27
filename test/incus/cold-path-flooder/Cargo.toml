@@ -1,0 +1,24 @@
+[package]
+name = "cold-path-flooder"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone Rust binary used by test/incus/cold-path-microbench.sh
+# to flood the xpf userspace dataplane with cold-path-eligible packets
+# (UDP, randomized source IP/port within a bounded cohort sized to
+# DEFAULT_MAX_SESSIONS=131_072). Lives outside the userspace-dp and
+# userspace-xdp workspaces by design — a regression in this test
+# binary must not block dataplane builds. See #1607.
+
+[[bin]]
+name = "cold-path-flooder"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
