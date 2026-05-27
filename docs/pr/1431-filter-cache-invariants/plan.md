@@ -1,6 +1,51 @@
 # #1431 — userspace filters: preserve cache invariants for future per-packet match fields
 
-**Status:** DRAFT v2 — pending adversarial plan review round 2
+**Status:** DRAFT v3 — addressing Codex r2 PLAN-NEEDS-MINOR + AGY r2 PLAN-READY
+
+**v2 verdict log (round 2):**
+
+- Codex r2 (`task-mpnic4wn-2f38fd`): **PLAN-NEEDS-MINOR**.
+  Findings (verbatim summary):
+  1. `FlowCacheEntry::from_forward_decision` is `pub(super)` in
+     `afxdp::flow_cache` (`flow_cache.rs:228`); a test under
+     `filter/` cannot call it without visibility churn. Either
+     move new tests to `afxdp/flow_cache_tests.rs` (where the
+     existing DSCP tests at `643-745` already live) or make
+     this PR doc-only.
+  2. `dscp_rotation_does_not_fire_on_positional_id_change` is a
+     duplicate of `input_dscp_filter_families_changed_ignores_positional_filter_id_change`
+     at `filter/tests.rs:1806`. Drop it.
+  3. Plan claims established-session re-eval test but §4.3 does
+     not add one. Existing coverage already exists at
+     `afxdp/tests.rs:3184`. Cite, don't duplicate.
+  4. README table: reword "every field" → "every match criterion";
+     include `protocol_match_enabled` / `dscp_match_enabled`
+     alongside their bitmaps; add a future-TOS/ECN row since §1
+     names TOS.
+  5. Contract block belongs above struct, not inline on every
+     field — confirmed.
+  6. Keep the lo0 note, but one paragraph / one line with
+     references to `is_cacheable()` and the per-packet lo0
+     paths — it is useful precisely because round 1 already
+     wasted review time on it.
+
+- AGY r2 (`review-mpnicccj-1jngkm`): **PLAN-READY** with one drop
+  (the duplicate positional-ID test). Confirmed:
+  - All 10 r1 findings addressed.
+  - In-source contract block above struct is the right surface;
+    diff-visibility on PR review is the defense; optional
+    one-line per-field tag like
+    `pub(crate) dscp_bitmap: u64, // CACHE-INVARIANT: path (b)`
+    is welcome but not required.
+  - 3-test harness is right-sized; doc-only would remove the
+    executable blueprint.
+  - README classification table is 100% complete and accurate
+    against `protocol/security.rs:60-89` and `filter/mod.rs:48-73`.
+  - Keep the lo0 note — link to `types/forwarding.rs::is_cacheable`.
+
+Both reviewers converge on dropping the positional-ID duplicate.
+Codex adds a visibility issue (`pub(super)`) that v3 must address
+by moving the two gate tests into `afxdp/flow_cache_tests.rs`.
 
 **v1 verdict log (preserved verbatim):**
 
@@ -98,24 +143,48 @@ This v2 plan adopts the Codex / AGY salvage path:
    `FirewallTermSnapshot` in `protocol/security.rs` so the wire
    DTO also carries the contract.
 
-3. **A real DSCP harness** at
-   `userspace-dp/src/filter/cache_invariant_harness.rs` (cfg(test)
-   only). The harness exercises:
-   - flow-cache insertion gate via
-     `FlowCacheEntry::from_forward_decision` (positive case: cache
-     declined when DSCP-sensitive input or output filter is bound).
-   - established-session re-evaluation via the public
-     `evaluate_dscp_sensitive_input_filter_on_session_hit` path
-     (positive case: re-eval fires when DSCP-sensitive).
-   - forwarding rotation purge via the public
-     `input_dscp_filter_families_changed` predicate (positive case:
-     fires when sensitive content changes, does NOT fire on
-     positional-ID-only changes).
+3. **Reference tests + citations** — NOT a new harness module.
 
-   The DSCP case becomes the first concrete instantiation of the
-   harness. The harness is built around real
-   `FirewallFilterSnapshot` / `FirewallTermSnapshot` snapshots — no
-   synthetic test-only fields are added to production structs.
+   `FlowCacheEntry::from_forward_decision` and `FlowCacheEntry`
+   itself are `pub(super)` inside `afxdp::flow_cache`
+   (`flow_cache.rs:134,228`), so a test under `filter/` cannot
+   reach them without visibility churn. Codex r2 flagged this;
+   v3 moves test additions into `afxdp/flow_cache_tests.rs` (the
+   home of the existing bespoke gate tests at lines 643-745) and
+   cites — not duplicates — the existing rotation + session-hit
+   regression coverage.
+
+   What the README runbook will cite as the canonical reference
+   tests for the cache-sensitive arm:
+
+   - Flow-cache insertion gate (input + output):
+     - `from_forward_decision_skips_cache_for_dscp_matched_input_filter`
+       at `userspace-dp/src/afxdp/flow_cache_tests.rs:695`
+     - `from_forward_decision_skips_cache_for_dscp_matched_output_filter`
+       at `userspace-dp/src/afxdp/flow_cache_tests.rs:643`
+   - Established-session re-evaluation:
+     - existing coverage at `userspace-dp/src/afxdp/tests.rs:3184`
+       (cited per Codex r2; v3 does not add a new test here).
+   - Forwarding-rotation positional-ID immunity:
+     - `input_dscp_filter_families_changed_ignores_positional_filter_id_change`
+       at `userspace-dp/src/filter/tests.rs:1806`
+       (cited per Codex r2 + AGY r2; v3 does not add a new test).
+
+   v3 ships **two new tests**, not three, both in
+   `userspace-dp/src/afxdp/flow_cache_tests.rs`:
+
+   - `dscp_input_gate_blocks_flow_cache_insertion_via_runbook_pattern`
+     — same as the existing input-gate test but written explicitly
+     in the runbook style the README cites. Acts as the "this is
+     what a new-field test should look like" reference.
+   - `dscp_output_gate_blocks_flow_cache_insertion_via_runbook_pattern`
+     — same for output.
+
+   If reviewers conclude even these two are redundant with the
+   existing `643/695` tests, they can be dropped and the README
+   simply cites the existing tests directly. **PLAN-MINOR**
+   choice — both options are acceptable.
+
    No `PER_PACKET_MATCH_FIELDS` constant list, no `trait
    PerPacketMatchField`, no fake-field negative-case test.
 
@@ -220,17 +289,23 @@ content:
    identifier and `dst_port` is zero — ICMP type and code are NOT
    in the key.
 
-3. **The classification table** for every field on
-   `FirewallTermSnapshot` and `FilterTerm` today:
+3. **The classification table** for every match criterion on
+   `FirewallTermSnapshot` and `FilterTerm` today (per Codex r2:
+   reword to "every match criterion," not "every field," because
+   `action`, `count`, `log`, `policer`, `routing_instance`,
+   `forwarding_class`, `dscp_rewrite` are forwarding actions and
+   modifiers — they do not participate in match-time key lookup
+   and so are out of scope for cache-key invariants):
 
-   | Field | In cache key? | Notes |
-   |-------|---------------|-------|
+   | Match criterion | In cache key? | Notes |
+   |-----------------|---------------|-------|
    | `source_addresses` / `source_v4` / `source_v6` | yes | `src_ip` in `SessionKey` |
    | `destination_addresses` / `dest_v4` / `dest_v6` | yes | `dst_ip` |
-   | `protocols` / `protocol_bitmap` | yes | `protocol` |
+   | `protocols` / `protocol_bitmap` (+ `protocol_match_enabled`) | yes | `protocol` |
    | `source_ports` | yes (TCP/UDP); ICMP-special | `src_port` carries ICMP identifier |
    | `destination_ports` | yes (TCP/UDP); ICMP-zero | `dst_port` is 0 for ICMP |
-   | `dscp_values` / `dscp_bitmap` | NO — cache-sensitive | see #1430 pattern below |
+   | `dscp_values` / `dscp_bitmap` (+ `dscp_match_enabled`) | NO — cache-sensitive | see #1430 pattern below |
+   | (future) `tos_match` / ECN bits (non-DSCP TOS) | NO — cache-sensitive | TOS lower bits and ECN vary per packet; #1431 names this |
    | (future) `tcp_flags_match` | NO — cache-sensitive | TCP flags vary per packet |
    | (future) `is_fragment` / fragment offset / MF | NO — cache-sensitive | only first fragment carries L4 |
    | (future) `ihl_match` / IP options | NO — cache-sensitive | IHL varies per packet |
@@ -259,10 +334,16 @@ content:
    expiry hash, key comparison cost. Path (a) requires a tracker
    issue and review against `session/key.rs`.
 
-6. **lo0 reminder**: `LocalDelivery` is non-cacheable, lo0
-   filters are evaluated per-packet, so they do NOT need a
-   per-interface cache-sensitive set. Stated so a future reader
-   does not duplicate v1's false-alarm investigation.
+6. **lo0 reminder** (one paragraph per Codex r2): host-bound
+   traffic resolves to `ForwardingDisposition::LocalDelivery`,
+   which `is_cacheable()` returns `false` for at
+   `userspace-dp/src/afxdp/types/forwarding.rs:196`. lo0 filter
+   evaluation runs per-packet at
+   `userspace-dp/src/afxdp/poll_descriptor/mod.rs:700` (session-
+   hit path) and `:1153` (miss path). lo0 filters therefore do
+   NOT need a per-interface cache-sensitive set — flow-cache
+   never holds a lo0 decision in the first place. Stated to save
+   future readers the false-alarm cycle that v1 spent.
 
 ### 4.2 In-source contract block
 
@@ -373,11 +454,15 @@ This PR is documentation + tests. No runtime change.
 - `cargo test --release` — full suite passes; existing DSCP
   flow-cache tests at `flow_cache_tests.rs:643-745` and DSCP
   rotation tests at `filter/tests.rs:1733-2000` still pass.
-- New tests (three):
-  - `dscp_input_gate_blocks_flow_cache_insertion`
-  - `dscp_output_gate_blocks_flow_cache_insertion`
-  - `dscp_rotation_does_not_fire_on_positional_id_change`
-- 5× flake check on the three new tests.
+- New tests (two, both in `userspace-dp/src/afxdp/flow_cache_tests.rs`
+  per Codex r2's visibility note):
+  - `dscp_input_gate_blocks_flow_cache_insertion_via_runbook_pattern`
+  - `dscp_output_gate_blocks_flow_cache_insertion_via_runbook_pattern`
+- Cited existing tests (no duplication added):
+  - rotation positional-ID immunity: `filter/tests.rs:1806`
+  - session-hit re-eval: `afxdp/tests.rs:3184`
+  - bespoke gate tests (already in tree): `afxdp/flow_cache_tests.rs:643,695`
+- 5× flake check on the two new tests.
 - `go test ./...` — no Go changes; regression coverage only.
 - Smoke on `loss:xpf-userspace-fw0/1` — v4+v6, push+reverse,
   CoS-off + per-class. Pure regression — zero behavior delta is
@@ -406,50 +491,39 @@ This PR is documentation + tests. No runtime change.
 - Go suite clean.
 - Smoke matrix (Pass A + Pass B) per CLAUDE.md.
 
-## 11. Open questions for adversarial review round 2
+## 11. Round-2 resolutions
 
-**Q1 — is the in-source contract block actually loud enough?**
-AGY explicitly recommended "loud, blocking comment right next to
-the fields." A block doc-comment above `FilterTerm` (and
-`FirewallTermSnapshot`) is the proposed surface. Is that enough,
-or does the contract need a `// IMPORTANT: read this before
-adding a field` per-field marker? Reviewer's call.
+- **Q1 in-source block surface** — resolved by both reviewers:
+  block doc-comment above struct is correct. Optional per-field
+  tag like `// CACHE-INVARIANT: path (b)` welcome but not
+  required.
+- **Q2 file location** — resolved: gate tests go in
+  `userspace-dp/src/afxdp/flow_cache_tests.rs` per Codex r2's
+  `pub(super)` visibility note (NOT `filter/tests.rs` or a new
+  `filter/cache_invariant_harness.rs`).
+- **Q3 ICMP wording** — both reviewers confirmed v2's table is
+  accurate against `frame/inspect.rs:225`.
+- **Q4 positional-ID duplicate** — both reviewers confirmed the
+  proposed test duplicates `filter/tests.rs:1806`; v3 drops it
+  and cites the existing test in the README runbook.
+- **Q5 theater check** — both reviewers (Codex r2 PLAN-NEEDS-MINOR,
+  AGY r2 PLAN-READY) accept v2 as not-theater conditional on
+  the v3 fixes.
+- **Q6 lo0 note** — keep, but one paragraph with explicit
+  `is_cacheable` + `poll_descriptor` line refs (v3 update
+  applied to §4.1 #6).
 
-**Q2 — should the harness sit in `tests.rs` or a new file?** Plan
-proposes bottom of `tests.rs`. Reviewer may prefer a dedicated
-`cache_invariant_harness.rs` for visibility — both are fine; the
-trade-off is module noise vs. discoverability.
+## 12. Residual risk (AGY r2 framing)
 
-**Q3 — does the README table need an authoritative line on the
-"ICMP src_port is the identifier" gotcha?** v1 got this wrong;
-v2 lists it but reviewer should confirm wording is accurate
-against `parse_flow_ports` at `frame/inspect.rs:225`.
+Rust does not support compile-time structural reflection over
+struct field lists. A developer adding a future match field could
+still ignore the in-source block AND the README. The defense is
+diff-visibility on PR review — placing the contract on both
+`FilterTerm` (in-memory) and `FirewallTermSnapshot` (wire DTO)
+maximizes the surface a reviewer sees in the diff.
 
-**Q4 — does the positional-ID-change-doesn't-fire test add
-coverage over the existing `input_dscp_filter_families_changed_ignores_positional_filter_id_change`
-test at `filter/tests.rs:1806`?** If it's literally a duplicate,
-drop it. If it tests a different angle (e.g. it builds via the
-public snapshot API rather than constructing `Filter` directly),
-keep it as the canonical harness reference.
-
-**Q5 — anything else that disciplined PR review would catch but
-this contract doesn't?** Reviewer is invited to PLAN-KILL v2 if
-the contract is still theater. The v2 minimum value: a single
-authoritative doc that a future reviewer can cite when they
-spot a per-packet match field landing without the cache-sensitive
-runbook.
-
-**Q6 — is the lo0 "verified non-existent" note useful, or noise?**
-v1's lo0 alarm cost real review cycles. v2 documents the
-resolution so future readers don't repeat the investigation. If
-reviewer prefers a leaner doc, the lo0 paragraph can move to a
-one-line "see types/forwarding.rs::is_cacheable" pointer.
-
----
-
-If reviewers still conclude the contract is theater, **PLAN-KILL
-is an acceptable v2 verdict** — in which case the recommended
-follow-up is a one-line PR that just adds the doc-comment block
-on `FilterTerm` and `FirewallTermSnapshot`, no harness at all,
-and closes the issue with that as the "documents whether the new
-match field is in the cache key" acceptance criterion satisfied.
+If reviewers conclude even v3 is theater, the minimum-viable
+fallback remains: ship the doc-comment block on `FilterTerm` +
+`FirewallTermSnapshot` only, no test changes, and close #1431
+with that as the "documents whether the new match field is in
+the cache key" acceptance criterion satisfied.

@@ -4805,3 +4805,23 @@ top.
     (AGY's recommendation).
   - SHRANK harness to 3 positive-case DSCP tests:
     input/output gate + positional-ID-change-doesn't-fire.
+
+## 2026-05-26 — #1431 plan v3 (post-r2 reviews)
+
+- **Timestamp**: 03:42 UTC
+- **Action**: applied Codex r2 + AGY r2 PLAN-READY/MINOR feedback
+- **File(s)**: `docs/pr/1431-filter-cache-invariants/plan.md` (v3)
+- **Changes from v2**:
+  - Moved gate tests from `filter/cache_invariant_harness.rs` to
+    `userspace-dp/src/afxdp/flow_cache_tests.rs` (Codex r2 caught
+    `pub(super)` visibility issue on FlowCacheEntry).
+  - Dropped duplicate `dscp_rotation_does_not_fire_on_positional_id_change`
+    (both reviewers identified it duplicates filter/tests.rs:1806).
+  - Cited existing session-hit re-eval test at afxdp/tests.rs:3184
+    rather than adding a new one.
+  - README "every field" → "every match criterion"; added TOS/ECN
+    row; added `protocol_match_enabled`/`dscp_match_enabled` to
+    matching rows.
+  - lo0 README note now one paragraph with `is_cacheable` +
+    `poll_descriptor` line refs.
+  - Scope shrunk to 2 new tests + 4 cited existing tests.
