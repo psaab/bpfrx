@@ -39,4 +39,22 @@ fetch results by ID rather than re-dispatch.
 - **Codex (--wait mode)**: ran inline; PLAN-NEEDS-MINOR. Two refinements: (1) bucket by canonical-bytes with (hash64, canonical_bytes) tie-break; (2) normalize "any" in address-book values to (0.0.0.0/0, ::/0) at Go buildAddressBookTable level.
 - **AGY**: not run (rate limiting risk + Codex sufficient for minor refinement round).
 - **Claude SMR**: `claude-smr-plan-r6.md` — PLAN-NEEDS-MINOR on v6 (convergent with Codex), PLAN-READY on v7.
-- **Claude SMR**: see `claude-smr-plan-r1.md` (this run)
+
+## Code review round 1 (PR #1610, SHA 0018eb42e)
+
+- **Codex**: ran inline; NEEDS-MAJOR. F1 bare-IP drop, F2 counter-store leak in refresh preflight, F3 CIDR multiset dedup. All fixed in commit 77e72f41f.
+- **Copilot**: formal review on 0018eb42e — 4 inline comments (C1 bare IPs, C2 depth-5 cap, C3 refresh_runtime_snapshot returns (), C4 guard.snapshot before reconcile).
+- **AGY**: not run at r1.
+- **Claude SMR**: `claude-smr-code-r1.md`.
+
+## Code review round 2 (PR #1610, SHA 77e72f41f)
+
+- **Codex (--wait)**: MERGE-READY at SHA 77e72f41f.
+- **AGY**: `adversarial-review-mpom8200-oa2t7m` — NEEDS-MAJOR. Findings 4.1 (handler mutates guard.status before validation), 4.2 (reconcile tears workers before validation), 4.3 counter leakage. All fixed in commit 68138b122.
+
+## Code review round 3 (PR #1610, SHA 8edb77c5b277 — current HEAD)
+
+- **Codex**: `task-mponbft1-cxjpa4` — re-dispatched at current HEAD after post-r2 commits (68138b122 + 8edb77c5b) landed.
+- **AGY**: `adversarial-review-mponboy5-seies9` — re-dispatched at current HEAD.
+- **Copilot**: re-trigger posted; awaiting formal copilot-pull-request-reviewer review at current HEAD (NOT swe-agent).
+- **Claude SMR**: `claude-smr-code-r2.md` — forthcoming.
