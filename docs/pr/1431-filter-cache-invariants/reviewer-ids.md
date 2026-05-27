@@ -19,3 +19,15 @@
 
 - **Codex**: `task-mpnjcswx-l02e6k` — confirm r3 stale leftovers fixed.
 - **AGY**: `review-mpnjcvjj-zvj9hv` — same.
+
+## Code review round 1 (PR #1604 @ head 705d62f6720d8fd512d5ffb36db4d946987f938c)
+
+- **Codex**: `task-mpnkbtew-5ayuov` — hostile code review.
+- **AGY**: `review-mpnkbzwi-6lhyzx` — hostile code review.
+
+## Code review round 2 (head 778450f74e4773872272bf4d782671e20c5d41e6)
+
+- **Codex r2**: `task-mpnlp6rw-8zl5ny` — confirm r1 findings + Copilot inline findings fixed.
+- **AGY r1**: already MERGE-READY at 705d62f67 — re-attestation not required for a doc-only fix on top.
+- **Copilot**: re-review requested via PR comment.
+- **Claude SMR**: `docs/pr/1431-filter-cache-invariants/claude-smr-code-r1.md` MERGE-READY (covers the fixed surface inline).
