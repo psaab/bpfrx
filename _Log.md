@@ -4068,3 +4068,7 @@ top.
 ## 03:46 UTC — #1565 plan v4 after round-3 Codex NEEDS-MAJOR
 - **Action**: Drop ResolveFab from helper (fab0 is kernel device), add st* short-circuit, fix smoke gates to actual cfg, AGY minors (fmt import, test_seams.go, drift NOTE comments)
 - **File(s)**: docs/pr/1565-iface-name-translate/plan.md
+
+## 03:53 UTC — #1565 plan v5 after round-4 (Codex MAJOR, AGY MINOR)
+- **Action**: Fix fab0.0 collapse expectation, drop ge-0/0/0 from gates (not in allInterfaceNames), redesign lo test as reth0->lo synthetic, add drift-guard test, nil-guard Interfaces.Interfaces
+- **File(s)**: docs/pr/1565-iface-name-translate/plan.md

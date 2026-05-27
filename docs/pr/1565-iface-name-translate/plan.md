@@ -1,6 +1,38 @@
 # #1565 — pkg/api: translate Junos config names to Linux ifnames before net.InterfaceByName
 
-**Status:** DRAFT v4 — addressing Codex round-3 PLAN-NEEDS-MAJOR (AGY round-3 returned PLAN-NEEDS-MINOR, overlapping fixes)
+**Status:** DRAFT v5 — addressing Codex round-4 PLAN-NEEDS-MAJOR + AGY round-4 PLAN-NEEDS-MINOR
+
+## Round-4 verdicts
+
+- **Codex** task-mpniviw3-vu39r2: PLAN-NEEDS-MAJOR. Remaining:
+  - `fab0.0` test expectation contradicts the helper. fab0 has
+    unit 0 in cfg; helper hits the `unit.Number == 0` collapse and
+    returns `fab0`, not `fab0.0`. `daemon_apply.go:317` creates
+    the bare IPVLAN `fab0` and assigns unit-0 addresses to that
+    bare name — kernel device IS `fab0`, not `fab0.0`. v5 fixes
+    the test expectation to `fab0 -> fab0` and `fab0.0 -> fab0`.
+  - Smoke gate `ge-0/0/0` is not iterated. In the cluster cfg
+    `ge-0/0/0` only appears as a `member-interfaces` entry under
+    fab0 — stored in `FabricMembers`, not in
+    `cfg.Interfaces.Interfaces`. v5 drops `ge-0/0/0` from gates;
+    swap in `fab0` (real kernel IPVLAN, in zones).
+  - Lo API test still too weak — pre-fix `lo` already resolves
+    via raw `net.InterfaceByName(ifName)`. Need a synthetic
+    `reth0 → lo` config so the helper translation is required
+    for ifindex>0. v5 redesigns Test #12 accordingly.
+  - Interface-level tunnel test should mirror cluster shape
+    (gr-0/0/0 has only unit 0); keep per-unit `.1 -> u1` as
+    separate test on a synthetic cfg.
+  - Plan text said `reth0.80 vlan-id 180` — cluster cfg uses
+    `vlan-id 80`. v5 fixes doc text.
+  - NOTE drift comments are not enforceable — recommended
+    PLAN-NEEDS-MINOR for a sync-test.
+- **AGY** review-mpnivrgz-5a90u7: PLAN-NEEDS-MINOR. Identical
+  ge-0/0/0/fab0 catch + dedicated drift-guard test
+  (`TestResolveKernelIfName_DriftGuard` in
+  `pkg/dataplane/userspace/interfaces_test.go` asserting parity
+  with `snapshotLinuxName` for core types) + nil-guard for
+  `c.Interfaces.Interfaces`.
 
 ## Round-3 verdicts (round-3 archived)
 
@@ -246,6 +278,9 @@ func (c *Config) ResolveKernelIfName(ref string) string {
 
     // Look up the unit by parsed number on the base interface.
     unitNum, _ := strconv.Atoi(parts[1])
+    if c.Interfaces.Interfaces == nil {
+        return LinuxIfName(c.ResolveReth(ref))
+    }
     if ifc, ok := c.Interfaces.Interfaces[base]; ok && ifc != nil {
         if unit, ok := ifc.Units[unitNum]; ok && unit != nil {
             if unit.Tunnel != nil && unit.Tunnel.Name != "" {
@@ -444,16 +479,22 @@ Cluster cfg names that flow through `allInterfaceNames`:
 - From zone `interfaces { ... }` lists: `fxp0`, `em0`, `fab0`, `fab1`,
   `reth0.50`, `reth0.80`, `gr-0/0/0.0`, `reth1`.
 
-Slash-or-virtual rows the fix must populate ifindex>0 for:
-`ge-0/0/0`, `ge-0/0/1`, `ge-0/0/2`, `reth0`, `reth0.50`, `reth0.80`,
-`reth1`, `gr-0/0/0.0`. (`reth1.0` is NOT in any zone/top-level
-iteration — drop from gate.)
+Slash-or-virtual rows the fix must populate ifindex>0 for. `ge-0/0/0`
+is NOT in this list because it only appears as fab0's
+`member-interfaces` in the cluster cfg — stored in `FabricMembers`,
+not as a `cfg.Interfaces.Interfaces` key (per
+`pkg/config/compiler_interfaces.go:111`), so `allInterfaceNames`
+doesn't iterate it. v5 gate uses `fab0` (real kernel IPVLAN, top-level
++ zone-listed) in its place.
+
+Gate names: `ge-0/0/1`, `ge-0/0/2`, `reth0`, `reth0.50`, `reth0.80`,
+`reth1`, `fab0`, `gr-0/0/0.0`.
 
 ```bash
 sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- bash -c '
   set -e
   J=$(curl -s http://127.0.0.1:8080/interfaces)
-  for n in ge-0/0/0 ge-0/0/1 ge-0/0/2 reth0 reth0.50 reth0.80 reth1 gr-0/0/0.0; do
+  for n in ge-0/0/1 ge-0/0/2 reth0 reth0.50 reth0.80 reth1 fab0 gr-0/0/0.0; do
     ix=$(echo \"$J\" | jq -r --arg n \"$n\" \".data | map(select(.name == \\$n)) | .[0].ifindex // 0\")
     if [ \"$ix\" = \"0\" ]; then
       echo \"FAIL: $n ifindex=0 post-fix\"; exit 1
@@ -467,7 +508,7 @@ sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- bash -c '
 sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- bash -c '
   set -e
   M=$(curl -s http://127.0.0.1:8080/metrics)
-  for n in ge-0/0/0 ge-0/0/1 ge-0/0/2 reth0 reth0.50 reth0.80 reth1; do
+  for n in ge-0/0/1 ge-0/0/2 reth0 reth0.50 reth0.80 reth1 fab0; do
     echo \"$M\" | grep -F \"xpf_iface_packets_total\" | grep -F \"interface=\\\"$n\\\"\" || {
       echo \"FAIL: no Prometheus series for $n\"; exit 1
     }
@@ -518,10 +559,15 @@ CoS per-class smoke runs per protocol.
 
 1. `TestResolveKernelIfName_Plain` — `em0`, `fxp0`, `lo`, `ge-0/0/0`,
    `ge-0/0/0.80` (vlan-id 180) → `ge-0-0-0.180`.
-2. `TestResolveKernelIfName_Reth` — node 0 `reth0`→`ge-0-0-2`,
-   `reth0.0` (unit 0 vlan-id 0) → `ge-0-0-2`,
-   `reth0.50` (unit 50 vlan-id 50) → `ge-0-0-2.50`,
-   `reth0.80` (unit 80 vlan-id 180) → `ge-0-0-2.180`. Repeat node 1.
+2. `TestResolveKernelIfName_Reth` — node 0:
+   - `reth0`→`ge-0-0-2`
+   - `reth0.0` (cfg unit 0 vlan-id 0) → `ge-0-0-2`
+   - `reth0.50` (unit 50 vlan-id 50, matching the real cluster
+     cfg) → `ge-0-0-2.50`
+   - **Asymmetric case (synthetic, not cluster cfg):**
+     `reth0.80` (unit 80 vlan-id 180) → `ge-0-0-2.180`.
+     This is the case that distinguishes v3-broken from v4-fixed.
+   Repeat node 1 with member `ge-7/0/2` → `ge-7-0-2`.
 3. `TestResolveKernelIfName_Fab` — `fab0`→`fab0`, `fab0.0`→`fab0.0`
    (kernel IPVLAN devices, NOT resolved to parent). **Corrected
    in v4** — v3 plan wrongly expected `ge-0-0-7`.
@@ -555,28 +601,42 @@ shape (Codex round-3 follow-up):
     `st0.5`, `st1`→`st1`. Confirms st* short-circuit.
 
 11. `TestResolveKernelIfName_FabIsKernelDevice` — `fab0`→`fab0`,
-    `fab0.0`→`fab0.0` (IPVLAN overlay names are real kernel
-    devices; do NOT resolve to parent).
+    `fab0.0`→`fab0` (unit 0 collapse: kernel IPVLAN device is the
+    bare `fab0` name per `daemon_apply.go:317`; do NOT resolve to
+    parent). `fab1`→`fab1`.
 
 `pkg/api/interfaces_test.go`:
 
-12. `TestInterfacesHandler_ResolvesSlashName` — cfg names
-    `lo-0/0/0` as a fake interface that we ALSO add to
-    cfg.Interfaces.Interfaces. Then assert: pre-fix-equivalent
-    behavior (raw lookup of `lo-0/0/0` fails, ifindex=0) vs
-    post-fix behavior (helper translates to `lo-0-0-0` which
-    also doesn't exist on the test runner → still ifindex=0).
-    Net: the test asserts the row is present with correct
-    `name` label whether or not ifindex resolves. **Stronger
-    coverage:** cfg.Interfaces.Interfaces with key `whatever`
-    where we KNOW the kernel has `lo`: declare the cfg key
-    as `lo` literally and verify ifindex matches the loopback
-    `net.InterfaceByName("lo").Index`. (Loopback is the only
-    interface guaranteed to exist on every Linux test runner.)
+12. `TestInterfacesHandler_ResolvesRethToLoopback` — synthesize a
+    Junos cfg where `reth0` has a `redundant-parent` from a
+    physical member literally named `lo` (e.g. configure
+    `lo { redundant-parent reth0; }` plus `reth0`). After
+    compilation, `cfg.ResolveReth("reth0")` returns `"lo"`. Call
+    `interfacesHandler` and assert the JSON row for `name=reth0`
+    has `ifindex == net.InterfaceByName("lo").Index` (the only
+    netdev guaranteed to exist on any Linux test runner). This
+    proves the translation is exercised — pre-fix the raw lookup
+    `net.InterfaceByName("reth0")` would fail and ifindex=0;
+    post-fix `ResolveKernelIfName("reth0") = "lo"` succeeds.
+    Existing pkg/api scaffolding (Server, configstore.New,
+    LoadOverride/Commit, httptest) supports this — see any
+    `pkg/api/*_test.go` for the pattern.
 13. `TestWriteInterfacesDetail_DHCPLeasePath` — seed a lease keyed
     `reth0.50`, cfg `reth0 { unit 50 { vlan-id 50; dhcp } }`,
     assert output contains `DHCPv4: <addr> (gw <gw>)`. This is the
     end-to-end test of the DHCPLeaseKey + LeaseFor + format path.
+
+`pkg/dataplane/userspace/interfaces_test.go` (AGY drift-guard):
+
+14. `TestResolveKernelIfName_DriftGuardVsSnapshotLinuxName` —
+    construct a Config covering RETH+VLAN, plain physical w/
+    vlan-id, interface-level + per-unit tunnels, IRB, bare
+    non-reth. For each case, iterate the cfg and call BOTH
+    `snapshotLinuxName(cfg, ifName, iface, unit)` and
+    `cfg.ResolveKernelIfName(fmt.Sprintf("%s.%d", ifName, unit.Number))`,
+    asserting equality. Lives in `userspace_test.go` so the
+    private helper is in scope. Permits explicit `t.Skipf` on
+    deliberate semantic deltas if any emerge later.
 
 5x flake check on the named tests.
 
@@ -624,5 +684,8 @@ shape (Codex round-3 follow-up):
 4. Add 11 helper unit tests in `pkg/config/types_test.go`.
 5. Rewrite the 4 pkg/api sites.
 6. Add 2 handler tests in `pkg/api/interfaces_test.go`.
-7. Smoke per protocol with v4 named-row gates.
-8. PR with `Closes #1565`.
+7. Add 1 drift-guard test in
+   `pkg/dataplane/userspace/interfaces_test.go` asserting parity
+   with `snapshotLinuxName`.
+8. Smoke per protocol with v5 named-row gates.
+9. PR with `Closes #1565`.
