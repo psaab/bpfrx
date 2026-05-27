@@ -4095,3 +4095,45 @@ top.
 - **Timestamp**: 2026-05-27 03:48 UTC
   - **Action**: Address Copilot inline comments (5 numbering inconsistencies, 2 'descendent'->'descendant' spellings). Pass numbering now consistent everywhere: 1=FuncDecl, 2=StructType.Fields, 3=CallExpr, 4=SelectorExpr, 5=bare Ident. All 8 canary tests still pass, 5/5 flake clean.
   - **File(s)**: pkg/daemon/legacy_dataplane_canary_test.go, pkg/daemon/legacy_dataplane_canary_synthetic_test.go
+
+## 2026-05-27 — #1607 plan v2 drafted (addresses all 5 v1 PLAN-KILL axes)
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Rewrote plan.md v2 addressing all 5 v1 fatal axes: UDP randomized-source-port flooder default (true 64 B Ethernet frames via AF_PACKET); TSC + 1-in-256 sampler replacing per-call clock_gettime; 24-bucket histogram + 16-slot splitmix-hashed per-zone-pair layout; CPU isolation recording (record-not-enforce) with explicit "approximate ceiling under contention" scoping. New cold-path-flooder Rust binary in test/incus/cold-path-flooder/. Dispatching Codex + AGY plan review.
+  - **File(s)**: docs/pr/1607-hw-ceiling-microbench/plan.md (v2)
+
+## 2026-05-27 — #1607 plan v2 Claude SMR r2 verdict PLAN-READY-WITH-NIT
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Wrote Claude SMR plan-review r2 verdict PLAN-READY-WITH-NIT. Audited all 5 v1 fatal axes; F1/F1.2/F1.3/F2/F3/F4/F5 all CLOSED. Six nit-class findings (N1-N6: splitmix high-bit defense, TSC calibration drift, keys_xor 3-collision false-negative, #1606/#1608 metrics file collision, flooder/FW co-residence, wrapper baseline subtraction floor). None block. Codex (task-mpoklpy1-tkrdqd) + AGY (adversarial-review-mpoklpnn-a24rwz) plan reviews running in parallel.
+  - **File(s)**: docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r2.md (new), docs/pr/1607-hw-ceiling-microbench/reviewer-ids.md
+
+## 2026-05-27 — #1607 v2 plan patched after AGY r2 PLAN-KILL
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: AGY r2 (adversarial-review-mpoklpnn-a24rwz) returned PLAN-KILL with 4 fatal axes: (1) session table exhaustion makes random /16 sweep measure policy-eval-only; (2) CoS Flow-Fair 4096 buckets all-active under random flooder; (3) splitmix high-bit pick clusters K=16 diagonal (3 collisions); (4) 24-bucket saturation prose off-by-one (2^32 not 2^33). Plus hazards: TSC refuse-start breaks CI, LAN_HOST/FW0 co-residence noise. Empirically verified each AGY claim (session/mod.rs:25,28,666-668; cos.rs:115; splitmix slot distribution via python; bucket math by hand). Patched plan v2: bounded 131K-tuple cohort matching DEFAULT_MAX_SESSIONS; default CoS-off; splitmix `& 0xF` (low-bit) perfect bijection for K=16; corrected 2^32-ns saturation prose; TSC graceful degrade; flooder taskset pin. Wrote claude-smr-plan-r3 verdict PLAN-READY (retracting r2 PLAN-READY-WITH-NIT which had missed axis 1).
+  - **File(s)**: docs/pr/1607-hw-ceiling-microbench/plan.md (v2 patched), docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r3.md (new)
+
+## 2026-05-27 — #1607 plan v2 round-3 patch (post-AGY-r3) + flooder skeleton
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: AGY r3 (adversarial-review-mpoky7be-bsku4m) returned PLAN-NEEDS-MAJOR with 3 axes + 1 hazard: (axis 1) burst-install contention in replicate_session_upsert distorts Table A latency under bounded mode; (axis 2) bounded Table B is warm-path-illusion not cold-path; (axis 3) p9999 has 13 samples in bounded mode — statistically thin; (hazard 1) clock_gettime VM jitter biases TSC-degrade samples by ~100 ns. Verified each at session_glue/mod.rs:573-583 (Mutex per-worker). Patched plan v2-r3: promote --cohort=unbounded to default; split §4.6 into Tables A1/A2/B1/B2; drop p9999 from bounded mode; TSC-only gate on Scale Target publication. Wrote claude-smr-plan-r4 PLAN-READY. Also wrote test/incus/cold-path-flooder/{Cargo.toml,src/main.rs} skeleton — 6/6 cargo tests pass. Codex r2+r3 dispatches lost to infra; r4 dispatch pending.
+  - **File(s)**: docs/pr/1607-hw-ceiling-microbench/plan.md (v2-r3), docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r4.md (new), test/incus/cold-path-flooder/Cargo.toml (new), test/incus/cold-path-flooder/src/main.rs (new)
+
+## 2026-05-27 — #1607 plan v2-r4 (post-AGY-r4) + narrowed-scope PLAN-READY
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: AGY r4 (adversarial-review-mpol9qlh-ivlrgr) returned PLAN-NEEDS-MAJOR with 4 new fatal axes: SNAT rollback Mutex contention on install_rejected (nat/allocator.rs:564); 60s session-GC latency cliff if duration > timeout; 819 KB thread-local flow cache L2/L3 thrashing (flow_cache.rs); flooder runner stub vs §6 measurement scope contradiction. Plus axis 5 (TSC per-worker verification needs WorkerRuntimeStatus.clock_source field). Patched plan v2-r4: §4.2.0 SNAT-free policy mandate; §4.6 harness duration gate + 819 KB documented limitation; §4.7 clock_source field; scope-narrowed to plan + skeleton + counter wiring; runner body + measurement numbers deferred to follow-up commits. Wrote claude-smr-plan-r5 PLAN-READY for narrowed scope. 4 consecutive Codex dispatches lost to infra; not retrying further.
+  - **File(s)**: docs/pr/1607-hw-ceiling-microbench/plan.md (v2-r4 patch); docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r5.md (new); docs/pr/1607-hw-ceiling-microbench/reviewer-ids.md
+
+## 2026-05-27 — #1607 step-1 PR #1613 opened; code review dispatched
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Filed follow-up issues #1611 (runner body) + #1612 (measurement). Opened PR #1613 narrowed step-1 (plan + flooder skeleton). Triggered Copilot review. Dispatched AGY adversarial-review-mpomv4o9-bwph0u + Codex task-mpomvkmw-pb85x6 (5th Codex infra loss expected). Wrote Claude SMR code-review r1 CODE-READY. Hardened runner stub to exit 71 (sysexits.h EX_OSERR) instead of 0 so downstream harness scripts using $? can detect the stub state. Patched plan §6 leftover "populate Tables in same PR" line to reference step-3 #1612 instead.
+  - **File(s)**: PR #1613 (created), test/incus/cold-path-flooder/src/main.rs (stub exit code), docs/pr/1607-hw-ceiling-microbench/plan.md (§6 fix), docs/pr/1607-hw-ceiling-microbench/claude-smr-code-r1.md (new)
+
+## 2026-05-27 — #1613 address Copilot code-r1 6 findings
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Copilot code review on PR #1613 raised 6 inline findings: (1) file header comment said "bounded default" but code defaults to unbounded — fixed comment; (2) unbounded default spans 65535 exclude one value, switched to 65536 (cardinality semantics) + unified all span types to u32; (3) zero-span and zero/oversized-batch validation added; (4) --dst-mac help text now notes step-2 will do ARP-resolve; (5) removed Cargo.lock from .gitignore to match repo convention (xsk-repro, userspace-dp, userspace-xdp all commit lockfile); (6) plan.md flag surface now tagged with [step-1 ✓] vs [step-2 #1611] per-flag. Added new test unbounded_default_uses_full_2_to_16_spans (7/7 cargo tests pass).
+  - **File(s)**: test/incus/cold-path-flooder/src/main.rs, test/incus/cold-path-flooder/.gitignore, test/incus/cold-path-flooder/Cargo.lock (new — tracked), docs/pr/1607-hw-ceiling-microbench/plan.md
