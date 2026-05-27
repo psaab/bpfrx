@@ -36,41 +36,36 @@ pub(super) fn cos_owner_live_for_request(
         .and_then(|queue_fast| queue_fast.owner_live.clone())
 }
 
-#[inline]
-pub(super) fn request_uses_shared_exact_queue_lease(
-    cos_fast_interfaces: &FastMap<i32, WorkerCoSInterfaceFastPath>,
-    egress_ifindex: i32,
-    requested_queue_id: Option<u8>,
-) -> bool {
-    cos_queue_fast_path_for_request(cos_fast_interfaces, egress_ifindex, requested_queue_id)
-        .is_some_and(|queue_fast| queue_fast.shared_queue_lease.is_some())
-}
-
 /// #1598 (secondary fix): does this request target a queue that runs
 /// under the shared multi-worker drain policy?
 ///
 /// This is the routing-level "stay local — don't funnel to one owner"
-/// signal. It is BROADER than `request_uses_shared_exact_queue_lease`:
+/// signal. It distinguishes three queue regimes:
 ///
 /// - Exact + high-rate queues: `shared_exact = true` AND
 ///   `shared_queue_lease = Some(...)` (lease holds the per-queue rate
-///   cap). Both helpers return `true`.
+///   cap). Returns `true`.
 /// - Non-exact + high-rate queues (e.g. Junos `priority low` uncapped
 ///   class with effective rate at the iface shaping rate): `shared_exact
 ///   = true` but `shared_queue_lease = None` (no per-queue rate cap to
-///   serve, see `coordinator/mod.rs:1058`). This helper returns `true`;
-///   the lease-only helper returns `false`.
-/// - Low-rate queues (exact or non-exact): `shared_exact = false`. Both
-///   helpers return `false`; the request funnels to `owner_worker_id`.
+///   serve, see `coordinator/mod.rs:1058`). Returns `true`.
+/// - Low-rate queues (exact or non-exact): `shared_exact = false`.
+///   Returns `false`; the request funnels to `owner_worker_id`.
 ///
-/// The TX dispatch path (`enqueue_local_request_to_target_or_owner` and
-/// the in-place-rewrite gate in `dispatch/mod.rs`) MUST consult this
-/// helper to decide "keep local vs route to owner" — using the
-/// lease-only helper there mis-classified non-exact shared_exact queues
-/// as "single-owner, route to owner", recreating the cross-worker
-/// funnel that the routing-side `queue_uses_shared_exact_service` fix
-/// at `worker/cos/mod.rs:126-131` was supposed to break (#1598
-/// primary smoke regression).
+/// The previous implementation of this gate consulted
+/// `shared_queue_lease.is_some()` as a proxy for the routing policy.
+/// That worked before #1598 (the two were coextensive on the production
+/// queue set, exact queues only), but diverged once non-exact uncapped
+/// queues were admitted to `shared_exact` — they have no lease, so the
+/// proxy mis-classified them as "single-owner, route to owner",
+/// recreating the cross-worker funnel that the routing-side
+/// `queue_uses_shared_exact_service` fix at `worker/cos/mod.rs:126-131`
+/// was supposed to break (#1598 primary smoke regression).
+///
+/// Lease-bookkeeping consumers (`token_bucket.rs`, `tx_completion.rs`)
+/// inspect `queue_fast.shared_queue_lease.as_ref()` directly via
+/// `if let Some(lease)`; they have never used a helper for the
+/// "is there a lease?" question, so no separate helper is needed.
 #[inline]
 pub(super) fn request_runs_under_shared_exact_policy(
     cos_fast_interfaces: &FastMap<i32, WorkerCoSInterfaceFastPath>,

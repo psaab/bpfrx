@@ -512,15 +512,15 @@ fn enqueue_pending_forwards_mirrors_live_frame_and_records_counter() {
 }
 
 #[test]
-fn shared_exact_queue_lease_uses_requested_queue_id() {
+fn shared_exact_policy_uses_requested_queue_id() {
     let cos_fast_interfaces = test_cos_fast_interfaces(80, 5, &[(5, true)]);
 
-    assert!(request_uses_shared_exact_queue_lease(
+    assert!(request_runs_under_shared_exact_policy(
         &cos_fast_interfaces,
         80,
         Some(5),
     ));
-    assert!(!request_uses_shared_exact_queue_lease(
+    assert!(!request_runs_under_shared_exact_policy(
         &cos_fast_interfaces,
         80,
         Some(4),
@@ -528,10 +528,10 @@ fn shared_exact_queue_lease_uses_requested_queue_id() {
 }
 
 #[test]
-fn shared_exact_queue_lease_uses_interface_default_queue() {
+fn shared_exact_policy_uses_interface_default_queue() {
     let cos_fast_interfaces = test_cos_fast_interfaces(80, 5, &[(5, true)]);
 
-    assert!(request_uses_shared_exact_queue_lease(
+    assert!(request_runs_under_shared_exact_policy(
         &cos_fast_interfaces,
         80,
         None,
@@ -560,13 +560,23 @@ fn shared_exact_policy_admits_non_exact_uncapped_queue_without_lease() {
         "#1598: non-exact uncapped queue with shared_exact=true must \
          signal 'stay local' to the TX dispatch, even with no lease"
     );
-    // The lease-only helper continues to report `false` for this case —
-    // that's the WHOLE point of the divergence; the dispatch path must
-    // not rely on the lease as a proxy for the shared policy.
+    // Verify the state divergence at the source — `shared_exact=true`
+    // AND `shared_queue_lease=None` is the post-#1598 production shape
+    // that the previous lease-as-proxy gate mis-classified. This pin
+    // ensures the test fixture actually models the failure mode (not
+    // a coincidental shape that happens to pass the new helper).
+    let iface_fast = cos_fast_interfaces.get(&80).expect("iface fixture");
+    let queue_fast = iface_fast
+        .queue_fast_path(Some(11))
+        .expect("queue 11 fixture");
     assert!(
-        !request_uses_shared_exact_queue_lease(&cos_fast_interfaces, 80, Some(11)),
-        "#1598: non-exact uncapped queue has no shared_queue_lease, so \
-         the lease-only helper correctly reports false"
+        queue_fast.shared_exact,
+        "#1598 fixture invariant: queue 11 must have shared_exact=true"
+    );
+    assert!(
+        queue_fast.shared_queue_lease.is_none(),
+        "#1598 fixture invariant: queue 11 must have shared_queue_lease=None \
+         to model the non-exact uncapped class"
     );
 }
 

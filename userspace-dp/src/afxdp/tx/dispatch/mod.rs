@@ -5,7 +5,6 @@
 //                       the COS fast-path helpers
 //                       (cos_queue_fast_path_for_request,
 //                        cos_owner_live_for_request,
-//                        request_uses_shared_exact_queue_lease,
 //                        request_runs_under_shared_exact_policy,
 //                        enqueue_local_request_to_target_or_owner).
 // - `shared_recycle`  — Phase 10 + cross-tick recycle routing
@@ -40,7 +39,7 @@ mod slow_path;
 use cos::{
     cos_owner_live_for_request, enqueue_local_request_to_target_or_owner,
     pending_forward_needs_cos_tx_selection, request_runs_under_shared_exact_policy,
-    request_uses_shared_exact_queue_lease, resolve_pending_forward_cos_tx_selection,
+    resolve_pending_forward_cos_tx_selection,
 };
 pub(in crate::afxdp) use shared_recycle::{
     apply_shared_recycles, apply_shared_recycles_to_bindings, resolve_tx_binding_ifindex,
