@@ -8,6 +8,12 @@
 
 ## Plan review round 2 — v2 (commit c97343fff)
 
-- Codex: `task-mpoklpy1-tkrdqd`
-- Antigravity: `adversarial-review-mpoklpnn-a24rwz`
-- Claude SMR: `docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r2.md` — PLAN-READY-WITH-NIT
+- Codex: `task-mpoklpy1-tkrdqd` (lost — re-dispatch as task-mpokqxeq-lv5w6w)
+- Antigravity: `adversarial-review-mpoklpnn-a24rwz` — PLAN-KILL (4 axes + 2 hazards)
+- Claude SMR: `docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r2.md` — PLAN-READY-WITH-NIT (RETRACTED — missed axis 1)
+
+## Plan review round 3 — v2 patched (commit 0b6eec937)
+
+- Codex: `task-mpoky7lt-5xx6oz`
+- Antigravity: `adversarial-review-mpoky7be-bsku4m`
+- Claude SMR: `docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r3.md` — PLAN-READY
