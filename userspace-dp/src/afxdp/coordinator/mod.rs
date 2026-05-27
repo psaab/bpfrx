@@ -437,12 +437,17 @@ impl Coordinator {
         // side-effecting mutation (neighbor manager keys,
         // validation, policy_counters). If integrity errors fire,
         // keep ALL existing state.
+        //
+        // CRITICAL (Codex code-review F2): use a SCRATCH counter
+        // store for the preflight so we don't leak counter
+        // registry entries on rejected snapshots.
+        let preflight_counters = crate::policy::PolicyCounterStore::default();
         if let Err(err) = crate::policy::parse_policy_state_with_counters(
             &snapshot.default_policy,
             &snapshot.policies,
             &self.forwarding.zone_name_to_id,
             &snapshot.address_books,
-            &self.policy_counters,
+            &preflight_counters,
         ) {
             eprintln!(
                 "xpf-userspace-dp: snapshot integrity error during refresh_runtime_snapshot preflight: {} — keeping previous state",

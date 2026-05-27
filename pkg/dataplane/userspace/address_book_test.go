@@ -108,6 +108,61 @@ func TestAddressBookContentDedup(t *testing.T) {
 	}
 }
 
+func TestAddressBookContainingBareIPNormalizesToSlash32Or128(t *testing.T) {
+	// Junos `set security address-book global address host1 10.0.0.1`
+	// produces a value of "10.0.0.1" (bare IP, NOT CIDR). The wire
+	// row must normalize this to "10.0.0.1/32" so the Rust side
+	// sees a concrete CIDR. (Codex code-review F1.)
+	cfg := newBookCfg(map[string]string{
+		"host1": "10.0.0.1",
+		"host2": "2001:db8::1",
+	})
+	books, _ := buildAddressBookTable(cfg)
+	if len(books) != 2 {
+		t.Fatalf("expected 2 books, got %d", len(books))
+	}
+	for _, b := range books {
+		if b.Name == "host1" {
+			if len(b.PrefixesV4) != 1 || b.PrefixesV4[0] != "10.0.0.1/32" {
+				t.Fatalf("host1 bare IP should normalize to 10.0.0.1/32, got %v", b.PrefixesV4)
+			}
+		}
+		if b.Name == "host2" {
+			if len(b.PrefixesV6) != 1 || b.PrefixesV6[0] != "2001:db8::1/128" {
+				t.Fatalf("host2 bare IP should normalize to 2001:db8::1/128, got %v", b.PrefixesV6)
+			}
+		}
+	}
+}
+
+func TestAddressBookDedupsCIDRSetByContent(t *testing.T) {
+	// Two books with the SAME effective CIDR set but one has a
+	// duplicate member entry — after dedup they should share an ID.
+	// (Codex code-review F3.)
+	cfg := &config.Config{
+		Security: config.SecurityConfig{
+			AddressBook: &config.AddressBook{
+				Addresses: map[string]*config.Address{
+					"plain": {Name: "plain", Value: "10.0.0.0/24"},
+				},
+				AddressSets: map[string]*config.AddressSet{
+					"dup-set": {
+						Name:      "dup-set",
+						Addresses: []string{"plain", "plain"},
+					},
+				},
+			},
+		},
+	}
+	books, nameToID := buildAddressBookTable(cfg)
+	if len(books) != 1 {
+		t.Fatalf("expected 1 deduped row, got %d (members: %+v)", len(books), books)
+	}
+	if nameToID["plain"] != nameToID["dup-set"] {
+		t.Fatalf("plain and dup-set should share id; got %d vs %d", nameToID["plain"], nameToID["dup-set"])
+	}
+}
+
 func TestAddressBookContainingAnyNormalizesToZeroSlash(t *testing.T) {
 	cfg := newBookCfg(map[string]string{"world": "any"})
 	books, _ := buildAddressBookTable(cfg)

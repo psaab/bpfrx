@@ -179,9 +179,14 @@ func buildAddressBookTable(cfg *config.Config) ([]AddressBookSnapshot, map[strin
 		v4, v6 := expandBookNameToCIDRs(cfg, name)
 		// Normalise "any" → 0.0.0.0/0 + ::/0 (Codex r6 refinement).
 		v4, v6 = normalizeAnyInCIDRs(v4, v6)
-		// Canonical sort within each family.
+		// Canonical sort + dedup within each family. Without
+		// dedup, two books that differ only by repeated members
+		// would canonicalize to different bytes and not share an
+		// ID (Codex code-review F3).
 		sortV4CIDRs(v4)
 		sortV6CIDRs(v6)
+		v4 = dedupSortedStrings(v4)
+		v6 = dedupSortedStrings(v6)
 		canon := canonicalizeAddressBookContent(v4, v6)
 		key := string(canon)
 		b, exists := contentToBucket[key]
@@ -263,6 +268,14 @@ func buildAddressBookTable(cfg *config.Config) ([]AddressBookSnapshot, map[strin
 // expandBookNameToCIDRs resolves a single address-book name
 // (Address or AddressSet, recursively) into its v4 + v6 CIDR
 // lists. Returns empty slices if name does not exist.
+//
+// Junos address-book values can be:
+//   - CIDR strings (10.0.0.0/24)
+//   - bare IPs (10.0.0.1, normalized to /32 or /128)
+//   - "any" → both 0.0.0.0/0 and ::/0
+//
+// All three forms are surfaced here as canonical CIDRs so the wire
+// row carries concrete prefixes.
 func expandBookNameToCIDRs(cfg *config.Config, name string) ([]string, []string) {
 	ab := cfg.Security.AddressBook
 	if ab == nil {
@@ -279,8 +292,19 @@ func expandBookNameToCIDRs(cfg *config.Config, name string) ([]string, []string)
 		}
 		if isV4CIDR(value) {
 			v4 = append(v4, value)
-		} else if isV6CIDR(value) {
+			continue
+		}
+		if isV6CIDR(value) {
 			v6 = append(v6, value)
+			continue
+		}
+		// Bare IP: normalize to /32 (v4) or /128 (v6).
+		if ip := net.ParseIP(value); ip != nil {
+			if ip.To4() != nil {
+				v4 = append(v4, ip.String()+"/32")
+			} else {
+				v6 = append(v6, ip.String()+"/128")
+			}
 		}
 	}
 	return v4, v6
@@ -383,6 +407,19 @@ func canonicalizeAddressBookContent(v4, v6 []string) []byte {
 		buf.Write(ipnet.IP.To16())
 	}
 	return buf.Bytes()
+}
+
+func dedupSortedStrings(s []string) []string {
+	if len(s) <= 1 {
+		return s
+	}
+	out := s[:1]
+	for i := 1; i < len(s); i++ {
+		if s[i] != out[len(out)-1] {
+			out = append(out, s[i])
+		}
+	}
+	return out
 }
 
 func isV4CIDR(s string) bool {
