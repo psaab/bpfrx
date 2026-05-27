@@ -1,346 +1,420 @@
 # #1565 — pkg/api: translate Junos config names to Linux ifnames before net.InterfaceByName
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** DRAFT v2 — addressing Codex + AGY round-1 PLAN-NEEDS-MAJOR
 
-## Issue framing
+## Round-1 verdicts (round-1 archived)
 
-Pre-existing bug surfaced by Copilot inline review on PR #1564 (the
-`#1540` REST API split). Four call sites in `pkg/api/` call
-`net.InterfaceByName(ifName)` directly with config-level interface
-names that may contain `/` (e.g. `ge-0/0/0`, `ge-0/0/0.80`) or be
-RETH aliases (`reth0`, `reth0.50`). Linux IFNAMSIZ forbids `/`, and
-RETH virtual names have no kernel ifindex, so these lookups fail
-silently and:
+- **Codex** task-mpnhxusx-4yz6hb: PLAN-NEEDS-MAJOR. Findings:
+  - Tunnel refs (`gr-0/0/0.0`, `gr-0/0/0.1`) are handled by
+    `(*Config).TunnelNameMap()` and do NOT round-trip through a naive
+    `LinuxIfName(ResolveReth(name))` composition. Unit 0 → base name,
+    unit N>0 → `<base>uN`.
+  - DHCP key claim was overbroad: keys are
+    `LinuxIfName(physName) + "." + strconv(unit.VlanID)` only when
+    `VlanID>0`, otherwise just `LinuxIfName(physName)`. The suffix in
+    the zone ref (`.80`, `.0`) does **not** necessarily equal the
+    VLAN tag. So `LeaseFor(kernelIfName(ifName))` only works when the
+    config name happens to end in the VLAN tag; for `ge-0/0/0.0` with
+    `vlan-id 80`, the lookup misses.
+  - grpcapi out-of-scope is defensible **only if** the plan stops
+    claiming any CLI smoke fix; CLI `show interfaces` routes through
+    grpcapi `ShowInterfaces`/`ShowInterfacesDetail`/`ShowText`.
+  - Tests are too thin for tunnel + VLAN-vs-unit-suffix cases.
+- **AGY** review-mpnhya9y-6rigyy: PLAN-NEEDS-MAJOR. Findings:
+  - Fold grpcapi sites in OR drop CLI smoke (same point as Codex).
+  - Centralize helper as `(*Config).ResolveJunosIfName(name)` in
+    `pkg/config/types.go` so `pkg/api` and `pkg/grpcapi` share it.
+  - Chain `ResolveFab` to cover `fab0[.unit]`.
+  - Add a `writeInterfacesDetail` integration test that mocks DHCP
+    manager + asserts the lease line is printed.
 
-1. Per-interface counters (`Ifindex`, RX/TX packets/bytes) come back
-   as zero in the REST `interfaces` view.
-2. `show interfaces` detail prints "Not present" for every
-   Junos-named interface, then skips MTU/MAC/addresses/DHCP lease.
-3. `/iface-stats` skips configured interfaces entirely (silent drop
-   from result set, not just zero counters).
-4. Per-interface Prometheus metrics (`xpf_iface_packets_total`,
-   `xpf_iface_bytes_total`) are simply not emitted for affected
-   interfaces — they appear missing from `/metrics` output.
+Round-1 verdicts and reviewer prompts are pinned at commit
+`e91b9650` (plan v1).
 
-The four sites are listed verbatim in the issue body:
+## Issue framing (unchanged from v1)
 
-- `pkg/api/interfaces.go:38` — `interfacesHandler` (JSON list)
-- `pkg/api/interfaces.go:224` — `writeInterfacesDetail` (text view)
-- `pkg/api/stats.go:70` — `ifaceStatsHandler` (typed JSON)
-- `pkg/api/metrics_counters.go:74` — Prometheus collector
+Pre-existing bug surfaced by Copilot inline review on PR #1564.
+Four call sites in `pkg/api/` call `net.InterfaceByName(ifName)`
+directly with config-level Junos interface names (`ge-0/0/0`,
+`reth0.50`, `fab0`, `gr-0/0/0.0`). These names violate Linux
+IFNAMSIZ (`/` is forbidden) or have no kernel ifindex
+(`reth`/`fab` are virtual config-only names). The lookups fail
+silently and break:
 
-The repo already ships the primitive: `config.LinuxIfName(name)`
-replaces `/` with `-`, and `cfg.ResolveReth(name)` resolves
-`reth0[.unit]` to the local physical member. Both are battle-tested
-in `pkg/config/compiler_interfaces.go`, `pkg/grpcapi/server_show_interfaces.go`,
-`pkg/grpcapi/server_cluster.go`, and the daemon's networkd path.
+1. Per-interface counters and `Ifindex` in the REST `interfaces`
+   view.
+2. `show interfaces` detail output (prints "Not present").
+3. `/iface-stats` typed JSON (rows silently dropped).
+4. Per-interface Prometheus metrics
+   (`xpf_iface_packets_total{interface="..."}` missing).
+
+Four sites verbatim from the issue body:
+
+- `pkg/api/interfaces.go:32` — `interfacesHandler`
+- `pkg/api/interfaces.go:210` — `writeInterfacesDetail`
+- `pkg/api/stats.go:64` — `ifaceStatsHandler`
+- `pkg/api/metrics_counters.go:68` — `collectInterfaceCounters`
+
+The three sites at `pkg/api/interfaces.go:107`, `:130`, `:163`
+inside `writeInterfacesTerse` are already correct — they call
+`config.LinuxIfName` on the physical-member name resolved
+through `RethToPhysical()`. Verified by read.
 
 ## Honest scope / value framing
 
-Bug fix on a control-plane observability surface. No hot-path
-cycles. No allocator pressure. No HA sync. No correctness risk
-to the dataplane. Win is qualitative: REST clients and Prometheus
-scrapers see real interface counters and the JSON Ifindex field is
-populated for every configured interface, not just for those whose
-Junos name happens to also be a valid Linux ifname (i.e. no `/`,
-not a reth alias).
+Control-plane observability bug fix. No hot path, no allocator,
+no HA sync, no dataplane correctness. Win is qualitative: REST
+clients and Prometheus scrapers see real counters; JSON
+`ifindex` is populated.
 
-If reviewers conclude the perf gain is too small to justify the
-churn, PLAN-KILL is an acceptable verdict. (The "perf gain" here
-is observability fidelity, not throughput — PLAN-KILL would
-amount to "leave the broken handlers broken", which seems wrong
-for a fix tagged on a Copilot reviewer finding.)
+If reviewers conclude the work isn't worth the churn, PLAN-KILL
+is acceptable. (The bug is real and operator-visible; PLAN-KILL
+seems wrong but the explicit hook stays.)
 
 ## What's already shipped / partially fixed
 
-The grpcapi peer of these handlers (`pkg/grpcapi/server_show_interfaces.go`)
-already uses `config.LinuxIfName(...)` and `cfg.ResolveReth(...)` in
-several places — see:
+- `pkg/api/interfaces.go::writeInterfacesTerse` (lines 100-188):
+  already uses `physToReth`, `rethToPhys`, and `config.LinuxIfName`.
+  Correct.
+- `pkg/grpcapi/server_show_interfaces.go` uses `config.LinuxIfName`
+  in lines 502, 547, 586, 623-632 — but not at the top-level
+  `GetInterfaces` (line 31) and `ShowInterfacesDetail` physical
+  lookup (line 129). Out of scope for this PR per issue body;
+  filing a follow-up issue is required (see Out of scope).
+- `pkg/daemon/daemon_dhcp.go:56-95` builds DHCP keys as
+  `LinuxIfName(physName)` plus `"." + strconv.Itoa(unit.VlanID)`
+  when `unit.VlanID > 0`. **This is the canonical key form.**
+- `(*Config).TunnelNameMap()` at `pkg/config/types.go:1763` maps
+  `gr-0/0/0.0` → `gr-0-0-0` and `gr-0/0/0.1` → `gr-0-0-0u1`.
+- `(*Config).ResolveReth(ref)` + `(*Config).ResolveFab(ref)` at
+  `types.go:80,95` resolve aliases (and preserve `.unit` suffix).
 
-- `pkg/grpcapi/server_show_interfaces.go:502` — `kernelIf := config.LinuxIfName(statusIf)`
-- `pkg/grpcapi/server_show_interfaces.go:547` — `kernelIf := config.LinuxIfName(u.physName)`
-- `pkg/grpcapi/server_show_interfaces.go:623-632` — VLAN-suffix composition
-- `pkg/grpcapi/server_cluster.go:45` — `linuxName := config.LinuxIfName(phys)`
-- `pkg/grpcapi/server_diag.go:312` — RETH/LinuxIfName composition
-- `pkg/grpcapi/server_sessions.go:325` — `cfg.ResolveReth(...)` + LinuxIfName
+## Concrete design (revised)
 
-`pkg/api/interfaces.go` is partially fixed: the `writeInterfacesTerse`
-function (lines 105-180) **already** uses `config.LinuxIfName` and
-`RethToPhysical()`. Only the non-terse `interfacesHandler` and
-`writeInterfacesDetail` halves regressed.
-
-The DHCP manager `LeaseFor()` keys by Linux name with VLAN suffix
-(`pkg/daemon/daemon_dhcp.go:56-95` builds `dhcpIface = LinuxIfName(ifName)` +
-optional `.VLAN`), so `LeaseFor(ifName, ...)` in `writeInterfacesDetail`
-also returns nil for any name with `/`. Same root cause.
-
-## Concrete design
-
-### Sites and fixes
-
-| File | Line | Current | Fix |
-|------|------|---------|-----|
-| `pkg/api/interfaces.go` | 32 | `iface, err := net.InterfaceByName(ifName)` | Compose `lookupName` via `config.LinuxIfName(cfg.ResolveReth(ifName))` (with VLAN-suffix preservation), then `net.InterfaceByName(lookupName)`. Print original `ifName` in JSON. |
-| `pkg/api/interfaces.go` | 210 | `iface, err := net.InterfaceByName(ifName)` | Same as above; also replace inline `/sys/class/net/`+`ifName` reads (line 220) with the resolved kernel name. DHCP lookup uses the LinuxIfName+VLAN form to match daemon's `dhcpIface` key. |
-| `pkg/api/stats.go` | 64 | `iface, err := net.InterfaceByName(ifName)` | Same translation. |
-| `pkg/api/metrics_counters.go` | 68 | `iface, err := net.InterfaceByName(ifName)` | Same translation. |
-
-### Helper
-
-Introduce one private helper in `pkg/api/api.go` next to
-`allInterfaceNames`:
+### Single new public helper in `pkg/config/types.go`
 
 ```go
-// kernelIfName returns the Linux kernel ifname for a config-level
-// interface name. It resolves reth aliases to the local physical
-// member (preserving any .unit suffix) then translates "/" to "-"
-// to satisfy IFNAMSIZ. The returned name is suitable for
-// net.InterfaceByName, /sys/class/net, and DHCP lease lookups (the
-// daemon DHCP client keys by this same form).
-func kernelIfName(cfg *config.Config, ifName string) string {
-    return config.LinuxIfName(cfg.ResolveReth(ifName))
+// ResolveJunosIfName converts a Junos-style config interface reference
+// (e.g. "ge-0/0/0.80", "reth0.50", "fab0.0", "gr-0/0/0.1") to the
+// Linux kernel ifname it should resolve to on the LOCAL node.
+//
+// Resolution order:
+//   1. Tunnel refs: if the ref is a key in TunnelNameMap(), return
+//      the tunnel's Linux name verbatim (covers "gr-0/0/0.0" → "gr-0-0-0"
+//      and "gr-0/0/0.1" → "gr-0-0-0u1"). Tunnel naming is per-unit and
+//      does NOT preserve the "." suffix, so this branch must short-circuit
+//      before LinuxIfName.
+//   2. RETH refs: ResolveReth(ref) maps "reth0[.unit]" → physical
+//      member "ge-X/0/Y[.unit]" using local-node scoring.
+//   3. Fabric refs: ResolveFab(ref) maps "fab0[.unit]" → the local
+//      fabric member from cfg.Interfaces.Interfaces[base].LocalFabricMember.
+//   4. LinuxIfName: replace "/" with "-".
+//
+// For all other refs (em0, fxp0, ge-0/0/0, ge-0/0/0.80) this reduces
+// to LinuxIfName(ref).
+//
+// Note: this returns the kernel link name. For DHCP lease lookups,
+// callers must instead build LinuxIfName(physName) + "." + VlanID,
+// which is the daemon's DHCP key form; that is NOT the same as the
+// link name. See DHCPLeaseKey below.
+func (c *Config) ResolveJunosIfName(ref string) string {
+    if tunMap := c.TunnelNameMap(); tunMap != nil {
+        if linuxName, ok := tunMap[ref]; ok {
+            return linuxName
+        }
+    }
+    resolved := c.ResolveReth(ref)
+    resolved = c.ResolveFab(resolved)
+    return LinuxIfName(resolved)
+}
+
+// DHCPLeaseKey returns the lease-lookup key that the DHCP manager
+// keys leases by for the given config interface name and unit number.
+// Mirrors the construction in pkg/daemon/daemon_dhcp.go: the key is
+// LinuxIfName(physName) plus ".<VlanID>" only when the unit's
+// VlanID > 0. Returns ("", false) when the config ref cannot be
+// resolved to a unit (caller should skip the lease line).
+func (c *Config) DHCPLeaseKey(ifName string, unitNum int) (string, bool) {
+    physRef := strings.SplitN(ifName, ".", 2)[0]
+    ifc, ok := c.Interfaces.Interfaces[physRef]
+    if !ok {
+        return "", false
+    }
+    unit, ok := ifc.Units[unitNum]
+    if !ok {
+        return "", false
+    }
+    key := LinuxIfName(physRef)
+    if unit.VlanID > 0 {
+        key = key + "." + strconv.Itoa(unit.VlanID)
+    }
+    return key, true
 }
 ```
 
-`ResolveReth` already preserves `.unit`, so a config name like
-`reth0.50` round-trips to e.g. `ge-0-0-2.50` on node-0 of the loss
-cluster. For non-reth names with VLAN units the input is already
-in `ge-0/0/0.80` form, which becomes `ge-0-0-0.80`.
+These two helpers exactly mirror the two distinct semantics that
+`pkg/daemon/daemon_dhcp.go:56-95` exposed:
 
-### Site rewrites
+- the **kernel link name** for `net.InterfaceByName` / sysfs;
+- the **DHCP lease key** for `dhcp.Manager.LeaseFor`.
 
-`interfacesHandler` (line 32):
+Conflating them was the round-1 plan's mistake.
+
+### Call-site rewrites
+
+The four pkg/api sites all need the kernel link name. They use the
+ref iterated from `allInterfaceNames(cfg)` (which contains raw cfg
+keys + raw zone refs).
+
+#### `pkg/api/interfaces.go:32` `interfacesHandler`
 
 ```go
 for ifName := range allInterfaceNames(cfg) {
-    iface, err := net.InterfaceByName(kernelIfName(cfg, ifName))
+    iface, err := net.InterfaceByName(cfg.ResolveJunosIfName(ifName))
     is := InterfaceStats{
-        Name: ifName,                // unchanged — Junos label
+        Name: ifName,                    // Junos label, unchanged
         Zone: ifZone[ifName],
     }
     if err == nil {
         is.Ifindex = iface.Index
-        // counters as before
+        if s.dp != nil && s.dp.IsLoaded() {
+            if ctrs, err := s.dp.ReadInterfaceCounters(iface.Index); err == nil {
+                is.RxPackets, is.RxBytes = ctrs.RxPackets, ctrs.RxBytes
+                is.TxPackets, is.TxBytes = ctrs.TxPackets, ctrs.TxBytes
+            }
+        }
     }
     result = append(result, is)
 }
 ```
 
-`writeInterfacesDetail` (line 210): same translation. Crucially,
-replace **all** subsequent uses of `ifName` as a kernel path —
-specifically the `/sys/class/net/<ifName>/operstate` read on
-line 220, and the DHCP `LeaseFor(ifName, ...)` calls on lines
-253 and 256.
+#### `pkg/api/interfaces.go:210` `writeInterfacesDetail`
 
-The DHCP key form is `dhcpIface` from `daemon_dhcp.go` line 59:
-`config.LinuxIfName(ifName)` plus `".%d"` when `unit.VlanID > 0`.
-So for a config name like `ge-0/0/0` with unit 0 vlan 80, the
-DHCP key is `ge-0-0-0.80`. The detail handler iterates
-`allInterfaceNames` which already returns the dotted form (e.g.
-`ge-0/0/0.80`) from zone references, so passing
-`kernelIfName(cfg, ifName)` is sufficient.
+Two distinct translations needed:
 
-`ifaceStatsHandler` (line 64) and `collectInterfaceCounters` (line
-68): identical translation. Both still `continue` on lookup
-failure (preserving current "skip unknown" semantics) — see the
-error-handling decision below.
+- **kernel link name** for `net.InterfaceByName` AND
+  `/sys/class/net/<name>/operstate`.
+- **DHCP lease key** for `s.dhcp.LeaseFor(...)`.
 
-### Error-handling semantics
+The current code uses `ifName` (the Junos ref) for both. The
+revised code computes:
 
-Three plausible behaviors when `net.InterfaceByName` fails:
+```go
+for _, ifName := range ifNames {
+    kernel := cfg.ResolveJunosIfName(ifName)
+    iface, err := net.InterfaceByName(kernel)
+    if err != nil {
+        fmt.Fprintf(&b, "Interface: %s, Not present\n\n", ifName)
+        continue
+    }
+    // ... print MTU/MAC/zone/BPF-counters as before, using `kernel`
+    //     for the /sys/class/net read.
 
-| Mode | interfacesHandler | writeInterfacesDetail | ifaceStatsHandler | metrics_counters |
-|------|--------------------|-----------------------|--------------------|------------------|
-| current | include with zero ifindex | print "Not present" | skip | skip |
-| log+skip | same + slog.Debug | same + slog.Debug | same + slog.Debug | same + slog.Debug |
-| 500 the handler | no | no | no | no |
+    // DHCP lease annotation — use the daemon's DHCP key shape.
+    if s.dhcp != nil {
+        base := strings.SplitN(ifName, ".", 2)[0]
+        unitNum := 0
+        if parts := strings.SplitN(ifName, ".", 2); len(parts) == 2 {
+            fmt.Sscanf(parts[1], "%d", &unitNum)
+        }
+        if key, ok := cfg.DHCPLeaseKey(base, unitNum); ok {
+            if lease := s.dhcp.LeaseFor(key, dhcp.AFInet); lease != nil {
+                fmt.Fprintf(&b, "  DHCPv4: %s (gw %s)\n", lease.Address, lease.Gateway)
+            }
+            if lease := s.dhcp.LeaseFor(key, dhcp.AFInet6); lease != nil {
+                fmt.Fprintf(&b, "  DHCPv6: %s (gw %s)\n", lease.Address, lease.Gateway)
+            }
+        }
+    }
+    b.WriteString("\n")
+}
+```
 
-**Decision:** keep current per-site semantics (each handler already
-made a deliberate choice — listing-style endpoints include the row
-with zero counters, stats endpoints drop unknown rows, Prometheus
-skips the metric). Add `slog.Debug` for visibility but never escalate
-to `slog.Info` or to a 500 — admin-down or not-yet-renamed interfaces
-are a normal transient on boot and on RETH member flips.
+This is the only site that needs the DHCP key shape. The other
+three pkg/api sites only need the kernel link name.
 
-This matches the grpcapi peer's behavior at
-`server_show_interfaces.go:31-46` (`err == nil` guards counters,
-ifindex stays unpopulated). No 500.
+#### `pkg/api/stats.go:64` and `pkg/api/metrics_counters.go:68`
 
-### Tests
+Identical 1-line translation: replace `net.InterfaceByName(ifName)`
+with `net.InterfaceByName(cfg.ResolveJunosIfName(ifName))`.
 
-Add a single new test file `pkg/api/iface_name_test.go`. Three tests:
+### Resolution-order rationale
 
-1. **`TestKernelIfName_TranslatesSlash`** — config name `ge-0/0/0`
-   produces `ge-0-0-0`; with unit/VLAN `.80` produces `ge-0-0-0.80`.
-   No live netlink — pure config helper test.
+Tunnel-first matters because `gr-0/0/0.1` is a key in TunnelNameMap
+but `.1` is the unit number (not a VLAN tag), and the Linux ifname
+is `gr-0-0-0u1` — neither LinuxIfName nor ResolveReth/ResolveFab
+would produce that. Putting tunnel resolution after the others
+would yield `gr-0-0-0.1`, which doesn't exist on the kernel.
 
-2. **`TestKernelIfName_ResolvesReth`** — given a cfg with
-   `interfaces { ge-0/0/0 { redundant-parent reth0 }; reth0; }`
-   on node 0, `kernelIfName(cfg, "reth0")` returns `ge-0-0-0`
-   and `kernelIfName(cfg, "reth0.50")` returns `ge-0-0-0.50`.
+RETH-then-Fab order matters because:
+- ResolveReth on a non-reth ref is identity.
+- ResolveFab on the (post-reth) ref is identity for non-fab refs.
 
-3. **`TestInterfacesHandler_PopulatesIfindexForLoopback`** —
-   spin up a Server with a cfg that names `lo` (a real Linux
-   ifname), call `interfacesHandler`, assert Ifindex > 0. Then
-   spin up a second Server with cfg-level name `ge-0/0/0` and
-   assert the JSON row is present with Ifindex == 0 (handler
-   doesn't 500, doesn't omit, and exercises the translation
-   code path even when the resolved name isn't present on the
-   test runner).
+LinuxIfName at the end is the catch-all `/` → `-` replacement.
 
-The third test exists to prove the **handler does not regress**
-on the no-such-interface path — not to assert positive ifindex
-for a name that won't be present in CI. Positive ifindex
-verification on real Junos names is the smoke step.
+### Error-handling semantics (unchanged)
+
+- listing-style handlers (`interfacesHandler`, `writeInterfacesDetail`):
+  include the row with ifindex=0 / "Not present", same as today.
+- stats/metrics handlers (`ifaceStatsHandler`, `collectInterfaceCounters`):
+  silently skip on lookup failure, same as today.
+- No 500s. Admin-down or peer-only refs are normal.
+
+### Tests (revised — 6 unit tests + 1 integration)
+
+`pkg/config/types_test.go` (helper unit tests):
+
+1. **`TestResolveJunosIfName_Plain`** — `em0`→`em0`, `fxp0`→`fxp0`,
+   `ge-0/0/0`→`ge-0-0-0`, `ge-0/0/0.80`→`ge-0-0-0.80`.
+2. **`TestResolveJunosIfName_Reth`** — given a cfg with
+   `reth0` and physical member `ge-0/0/2` on node 0,
+   `reth0`→`ge-0-0-2`, `reth0.50`→`ge-0-0-2.50`. Repeat for node 1
+   with `ge-7/0/2`.
+3. **`TestResolveJunosIfName_Fab`** — given a cfg with `fab0` whose
+   `LocalFabricMember="ge-0/0/0"`, `fab0`→`ge-0-0-0`,
+   `fab0.0`→`ge-0-0-0.0`.
+4. **`TestResolveJunosIfName_Tunnel`** — given a cfg with
+   interface-level tunnel on `gr-0/0/0` and units 0+1,
+   `gr-0/0/0.0`→`gr-0-0-0`, `gr-0/0/0.1`→`gr-0-0-0u1` (per-unit
+   tunnel with `unit.Tunnel.Name` set yields that name).
+5. **`TestDHCPLeaseKey_Mappings`** — cfg with `ge-0/0/0` unit 0
+   `vlan-id 0`, unit 1 `vlan-id 80`: `DHCPLeaseKey("ge-0/0/0", 0)` →
+   `("ge-0-0-0", true)`. `DHCPLeaseKey("ge-0/0/0", 1)` →
+   `("ge-0-0-0.80", true)`. `DHCPLeaseKey("ge-0/0/0", 99)` →
+   `("", false)`. Also exercises `reth0` cfg.
+
+`pkg/api/interfaces_test.go` (handler integration):
+
+6. **`TestInterfacesHandler_PopulatesIfindexForLoopback`** —
+   stand up a Server with cfg name `lo`; assert Ifindex > 0.
+7. **`TestWriteInterfacesDetail_DHCPLeasePath`** — stand up a
+   Server with a `dhcp.Manager` pre-populated with a lease
+   keyed `ge-0-0-0` (no VLAN); call `writeInterfacesDetail` for
+   cfg containing `ge-0/0/0`; assert output contains
+   `DHCPv4: <addr> (gw <gw>)`. This protects the DHCP lookup
+   path regression that prompted finding #2.
+
+`dhcp.Manager` is concrete: a test helper builds a `*Manager`
+with the lease pre-installed via the lowest-friction path
+(exported `New(...)` + a `setLeaseForTest` test-only setter
+or, if available, an existing constructor that accepts seeded
+leases). Implementation step will pick the minimum-touch route.
 
 ### Smoke verification
 
-Standard cluster smoke (loss userspace cluster). Plus one
-control-plane check that is targeted at this bug:
+Standard cluster smoke (loss userspace cluster) per protocol.
+
+**REST-only smoke targets** (no CLI claim — grpcapi is out of scope):
 
 ```bash
 sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- bash -c '
   curl -s http://127.0.0.1:8080/interfaces | \
-    jq -e \"map(select(.ifindex > 0)) | length >= 4\"
+    jq -e \"map(select(.ifindex > 0)) | length >= 3\"
 '"
+sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- bash -c '
+  curl -s http://127.0.0.1:8080/metrics | grep -E \"xpf_iface_packets_total.*ge-0/0/\"
+'" | head -3
 ```
 
-The cluster cfg names interfaces with `/` (`ge-0/0/0`, `reth0`,
-`reth0.50`, `reth0.80`), so `length >= 4` is a meaningful gate.
-Pre-fix, the JSON has every row but only `lo`-style rows (none
-in the cfg) would have ifindex > 0; post-fix all configured
-rows have ifindex > 0.
+The cluster cfg names: `ge-0/0/0` (fabric IPVLAN parent), `reth0`,
+`reth0.50`, `reth0.80`, `reth1`, `reth1.0`, etc. Length ≥ 3
+guarantees at least the slash-named base + reth aliases populate.
 
-Per-class CoS smoke is not affected by this change but still
-runs to satisfy refactor protocol.
+Pre-fix all slash-named rows have ifindex=0; post-fix
+`ge-0/0/0`, `reth0`, etc. have ifindex>0 (modulo peer-only
+members).
+
+CoS per-class smoke runs per protocol.
 
 ## Public API preservation
 
-- `interfacesHandler` JSON shape: unchanged. `name`, `ifindex`,
-  `zone`, counters — same fields, just correctly populated.
-- `writeInterfacesDetail` text output: unchanged for any interface
-  whose Junos name was already a valid Linux ifname (`em0`, `fxp0`,
-  `lo`). For names with `/` or RETH aliases, "Not present" is
-  replaced with the populated form — fixing the symptom.
-- `ifaceStatsHandler`: same JSON shape; rows that were previously
-  silently dropped now appear.
-- Prometheus metrics: `xpf_iface_packets_total{interface="ge-0/0/0",direction="rx"}`
-  is now emitted (was missing). Label is the **Junos** name (the
-  ifName from cfg loop). This matches existing label usage —
-  operators query by Junos name.
+- JSON `name` field: Junos config name (unchanged).
+- Prometheus `interface` label: Junos config name (unchanged —
+  operators query by Junos name).
+- `ifindex` field: was 0 for slash names, now populated. This is
+  the bug fix, not a regression.
+- `/iface-stats` rows: previously silently dropped slash-named
+  rows now appear. Same — bug fix.
+- "Not present" text in detail view: preserved for kernel-side
+  lookup failures (peer-only RETH member).
 
 ## Hidden invariants the change must preserve
 
-1. **JSON `name` label stays as the Junos config name.** Operators
-   query by `ge-0/0/0`, not `ge-0-0-0`. The kernel form is an
-   implementation detail used only for kernel-side lookups.
-2. **Prometheus label stays as Junos name.** Same reason. Changing
-   the label would break dashboards.
-3. **DHCP lease key form.** The daemon writes lease keys as
-   `LinuxIfName(ifName)[.VLAN]` (verified at
-   `pkg/daemon/daemon_dhcp.go:56-95`). The API lookup must use
-   the same form. `ResolveReth` is a no-op for non-RETH names
-   so it doesn't disturb the DHCP key on, say, `ge-0/0/0.80`.
-4. **No mutation of `allInterfaceNames` output.** That function
-   is shared with the terse handler; mutating its semantics would
-   ripple. The fix is confined to the per-iteration translation.
-5. **No new allocations on hot paths.** This is control plane —
-   irrelevant — but worth stating for the reviewer who checks.
-6. **Lookup failure must remain non-fatal** (no 500). Operators
-   bring interfaces up/down; transient absence is normal.
-7. **Behavior on names that happen to contain `/` but aren't reth
-   aliases** must still go through `LinuxIfName`. `ResolveReth`
-   returns input unchanged when no RETH match; then `LinuxIfName`
-   replaces `/` with `-`. Composition order matters and is
-   documented in the helper.
+1. JSON `name` and Prometheus label remain the Junos config name.
+2. DHCP lease key shape exactly matches `daemon_dhcp.go`:
+   `LinuxIfName(physName)[. VlanID-when-positive]`.
+3. Tunnel resolution short-circuits before LinuxIfName.
+4. RETH and Fabric resolution can compose without aliasing.
+5. Lookup failure stays non-fatal (no 500).
+6. `allInterfaceNames` output and shape unchanged.
+7. The helper is pure; no I/O, no kernel calls.
 
 ## Risk assessment
 
 | Class | Level | Notes |
 |-------|-------|-------|
-| Behavioral regression | LOW | Pure additive translation. Non-`/`, non-RETH names (e.g. `em0`, `fxp0`, `lo`) are unchanged by `LinuxIfName(ResolveReth(name))` — both helpers are identity for such names. |
-| Lifetime / borrow-checker | N/A | Go, no borrow checker. No new shared state. |
-| Performance regression | NIL | Control-plane code path. `LinuxIfName` is `strings.ReplaceAll`; `ResolveReth` builds a small map from `c.Interfaces.Interfaces` — already called by grpcapi peers many times per request. |
-| Architectural mismatch (#961/#946-Phase-2) | NIL | This is a 1-line-per-site bug fix using a pre-existing helper. No new abstraction. |
+| Behavioral regression | LOW | Pure additive translation; non-slash, non-RETH, non-fab, non-tunnel refs are identity. Tunnel resolution is short-circuit-by-map. |
+| Lifetime / borrow-checker | N/A | Go. |
+| Performance regression | NIL | Control plane only. TunnelNameMap allocates a small map each call — same cost as existing callers; cache out of scope. |
+| Architectural mismatch | LOW | Plan v2 centralizes the helper at pkg/config — the natural seam grpcapi already imports. |
 
 ## Test plan
 
 - [ ] `go vet ./...` clean
-- [ ] `go test ./pkg/api/... ./pkg/config/... ./pkg/grpcapi/...` pass
-- [ ] new `TestKernelIfName_*` pass (5x flake check)
-- [ ] full Go test suite: 30 packages pass
+- [ ] new `TestResolveJunosIfName_*` (4 tests) pass, 5x flake check
+- [ ] new `TestDHCPLeaseKey_Mappings` passes, 5x flake check
+- [ ] new `TestInterfacesHandler_PopulatesIfindexForLoopback` passes
+- [ ] new `TestWriteInterfacesDetail_DHCPLeasePath` passes
+- [ ] `go test ./pkg/api/... ./pkg/config/... ./pkg/grpcapi/... ./pkg/dhcp/...`
+- [ ] full Go suite passes
 - [ ] cluster deploy on loss userspace cluster
-- [ ] Pass A — CoS disabled — v4 + v6 × push + reverse + 12-stream reverse, 0 retrans
-- [ ] Pass B — Per-class CoS — 5201-5206 × v4/v6 × push/reverse
-- [ ] **Targeted check:** `curl /interfaces | jq` returns rows with
-      `ifindex > 0` for `ge-0/0/0`, `reth0`, `reth0.50`, `reth0.80`
-- [ ] **Targeted check:** `curl /metrics | grep xpf_iface_packets_total | grep 'ge-0/0/0'` returns lines (pre-fix: empty)
-- [ ] **Targeted check:** `cli> show interfaces detail ge-0/0/0`
-      does not print "Not present"
+- [ ] Pass A — CoS disabled v4/v6 × push/reverse + 12-stream reverse, 0 retrans
+- [ ] Pass B — Per-class CoS 5201-5206 × v4/v6 × push/reverse
+- [ ] REST `curl /interfaces | jq` returns ifindex>0 for ge-0/0/0 and reths
+- [ ] REST `curl /metrics | grep xpf_iface_packets_total | grep ge-0/0/` returns lines
 
 ## Out of scope (explicitly)
 
-- **grpcapi peer fixes.** The peer file `pkg/grpcapi/server_show_interfaces.go`
-  has a similar bug on lines 31-46 (the `ShowInterfaces` RPC), which
-  feeds the CLI `show interfaces` listing. The issue body lists only
-  the four `pkg/api/` sites. Fixing grpcapi belongs to a separate
-  issue — same translation pattern but different test surface (gRPC
-  vs HTTP). If the reviewers want it folded in, the diff is small
-  enough; opening the door but defaulting to scoped.
-- **DHCP key normalization.** Could push the `LinuxIfName` translation
-  inside `LeaseFor` so callers never have to think about it. Out of
-  scope — the daemon already writes keys consistently and other
-  callers (grpcapi) already translate at the call site. Centralizing
-  is a refactor, not a fix.
-- **Stats endpoint semantics change.** Whether `/iface-stats` should
-  include zero-counter rows for unrenamed interfaces vs. dropping
-  them silently is a UX call. Keep current (drop) — different change.
-- **Error-handling escalation.** No 500s, no log-spam. Same as now.
+- **grpcapi peer fixes** at `pkg/grpcapi/server_show_interfaces.go:31`
+  and `:129`. Same bug class, same helper would apply once shipped.
+  File a follow-up issue (and a one-paragraph note in this PR body).
+- **CLI smoke** for `show interfaces detail`. The grpcapi path is
+  out of scope; the CLI smoke claim was a v1 mistake.
+- **DHCP key centralization beyond `DHCPLeaseKey`**. Daemon callers
+  still construct the key inline. Follow-up.
+- **Caching TunnelNameMap on Config**. Out of scope.
+- **Error-handling escalation**. No 500s, no log spam.
 
 ## Open questions for adversarial review
 
-1. **Is `ResolveReth` correct for the cluster-peer case?** On node 0
-   `reth0` resolves to (e.g.) `ge-0/0/2`; on node 1 the same reth
-   resolves to `ge-7/0/2`. The peer node's physical member has no
-   kernel ifindex on this node. `kernelIfName(cfg, "reth0")` will
-   return e.g. `ge-7-0-2` on node 0 — which won't exist locally —
-   and the lookup will fail. Is "fail with ifindex=0" the right
-   behavior? (My answer: yes, same as today, but flag for review.)
-2. **VLAN suffix handling for non-RETH:** does
-   `LinuxIfName("ge-0/0/0.80")` actually produce `ge-0-0-0.80`?
-   (Quick check: yes — `ReplaceAll` only touches `/`, not `.`.)
-3. **Test coverage for `writeInterfacesDetail` DHCP lease path.**
-   Worth a Server-level integration test that runs a real DHCP
-   manager with a pre-installed lease and asserts the detail
-   output contains the lease? Or is the unit test of the helper
-   sufficient given the daemon's keying contract?
-4. **Should the fix also handle `fab0`/`fab1` overlay names?**
-   `ResolveFab` exists. Same bug class. The issue body doesn't
-   mention fabric — but operators may put fab names in
-   `interfaces { }`. Worth resolving in this PR or deferring?
-5. **Why not a centralized helper that returns ifindex directly?**
-   E.g. `cfg.IfindexFor(ifName) (int, bool)`. Cleaner caller code,
-   but adds API to `config` package. Asking reviewers whether the
-   indirection is worth it for 4 sites.
-6. **Should `interfacesHandler` skip the row when the kernel lookup
-   fails on a config name that doesn't exist locally** (e.g. peer's
-   RETH member) instead of returning ifindex=0? Today it includes.
-   Changing this is a JSON-shape regression I'd rather not gamble
-   on without operator input.
-7. **Are there other `pkg/api/` sites that should fold in?**
-   Quick grep: zone counters key by zoneName not ifName; policy
-   counters key by zone-pair; filter counters key by filter name.
-   No other `InterfaceByName` callers in `pkg/api/` per the grep
-   in step 1 above. Confirm.
+1. Is `DHCPLeaseKey(physRef, unitNum)` the right helper shape, or
+   should the helper take the full Junos ref and parse internally?
+2. Should `ResolveJunosIfName` short-circuit on `lo`, `lo0`, `fxp0`,
+   `em0`? Currently no — identity through LinuxIfName works.
+3. Tunnel resolution: should a bare `gr-0/0/0` (no unit) go through
+   TunnelNameMap? Map keys are `<name>.<unit>`, so bare falls
+   through to LinuxIfName → `gr-0-0-0`. Confirm this matches the
+   kernel link name (compiler creates `gr-0-0-0`, no suffix).
+4. Are there other ref shapes I'm missing? `st0.0` (xfrm),
+   `lo0.0`, `mt-`, `xe-`? `xe-` is LinuxIfName territory.
+   `st0` is xfrm; kernel device is `st0` directly. `lo0` has its
+   own quirks in Junos (loopback). Verify identity is correct.
+5. Should `writeInterfacesDetail` also print a `(kernel: ge-0-0-0)`
+   annotation for ops debugging? Out of scope but flagging.
+6. `*Config` method vs free function for `ResolveJunosIfName`?
+   Method matches ResolveReth/ResolveFab/TunnelNameMap convention.
+7. Should `interfacesHandler` skip rows for non-resolvable refs
+   (peer-only RETH members)? Today it lists them with ifindex=0.
+   Changing would be a JSON shape regression — keep.
 
-## Procedure (sketch)
+## Procedure
 
-1. Add `kernelIfName` helper in `pkg/api/api.go`.
-2. Rewrite the 4 sites.
-3. Replace bare `ifName` references in `/sys/class/net/...` and
-   `LeaseFor(...)` paths inside `writeInterfacesDetail` with the
-   resolved kernel name (for sys) and the `LinuxIfName(...)+.VLAN`
-   form (for DHCP — the daemon's exact construction).
-4. Add tests.
-5. Smoke per protocol. Per-class CoS smoke required.
-6. PR with `Closes #1565`.
+1. Add `(*Config).ResolveJunosIfName` and `(*Config).DHCPLeaseKey`
+   in `pkg/config/types.go`.
+2. Add 4 + 1 helper unit tests in `pkg/config/types_test.go`.
+3. Rewrite the 4 pkg/api sites.
+4. Add 2 handler tests in `pkg/api/interfaces_test.go` (or new
+   `pkg/api/iface_name_test.go`).
+5. Smoke per protocol.
+6. PR with `Closes #1565` body. Body includes a "Follow-up" note
+   pointing at the grpcapi peer.

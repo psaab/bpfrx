@@ -4056,3 +4056,7 @@ top.
 ## 03:17 UTC — #1565 plan v1 drafted
 - **Action**: Draft plan for pkg/api Junos→Linux ifname translation fix
 - **File(s)**: docs/pr/1565-iface-name-translate/plan.md
+
+## 03:25 UTC — #1565 plan v2 after round-1 NEEDS-MAJOR
+- **Action**: Revise plan addressing Codex+AGY findings (TunnelNameMap, DHCP key shape, helper centralization, drop CLI smoke claim)
+- **File(s)**: docs/pr/1565-iface-name-translate/plan.md
