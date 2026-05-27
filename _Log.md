@@ -4107,3 +4107,9 @@ top.
 - **Timestamp**: 2026-05-27 (UTC)
   - **Action**: Wrote Claude SMR plan-review r2 verdict PLAN-READY-WITH-NIT. Audited all 5 v1 fatal axes; F1/F1.2/F1.3/F2/F3/F4/F5 all CLOSED. Six nit-class findings (N1-N6: splitmix high-bit defense, TSC calibration drift, keys_xor 3-collision false-negative, #1606/#1608 metrics file collision, flooder/FW co-residence, wrapper baseline subtraction floor). None block. Codex (task-mpoklpy1-tkrdqd) + AGY (adversarial-review-mpoklpnn-a24rwz) plan reviews running in parallel.
   - **File(s)**: docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r2.md (new), docs/pr/1607-hw-ceiling-microbench/reviewer-ids.md
+
+## 2026-05-27 — #1607 v2 plan patched after AGY r2 PLAN-KILL
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: AGY r2 (adversarial-review-mpoklpnn-a24rwz) returned PLAN-KILL with 4 fatal axes: (1) session table exhaustion makes random /16 sweep measure policy-eval-only; (2) CoS Flow-Fair 4096 buckets all-active under random flooder; (3) splitmix high-bit pick clusters K=16 diagonal (3 collisions); (4) 24-bucket saturation prose off-by-one (2^32 not 2^33). Plus hazards: TSC refuse-start breaks CI, LAN_HOST/FW0 co-residence noise. Empirically verified each AGY claim (session/mod.rs:25,28,666-668; cos.rs:115; splitmix slot distribution via python; bucket math by hand). Patched plan v2: bounded 131K-tuple cohort matching DEFAULT_MAX_SESSIONS; default CoS-off; splitmix `& 0xF` (low-bit) perfect bijection for K=16; corrected 2^32-ns saturation prose; TSC graceful degrade; flooder taskset pin. Wrote claude-smr-plan-r3 verdict PLAN-READY (retracting r2 PLAN-READY-WITH-NIT which had missed axis 1).
+  - **File(s)**: docs/pr/1607-hw-ceiling-microbench/plan.md (v2 patched), docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r3.md (new)

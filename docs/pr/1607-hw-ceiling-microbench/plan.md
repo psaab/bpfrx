@@ -1,9 +1,10 @@
-# #1607 Cold-path hardware-ceiling microbench — plan v2
+# #1607 Cold-path hardware-ceiling microbench — plan v2 (patched after AGY r2 PLAN-KILL)
 
-Status: **DRAFT v2** — replaces PLAN-KILLED v1 (full v1 archived in §X
-below; the kill verdicts and their evidence are preserved verbatim so
-v2 reviewers can audit whether each fatal axis is actually addressed
-rather than restated).
+Status: **DRAFT v2 patched** — replaces PLAN-KILLED v1. AGY plan-review
+round 2 (`adversarial-review-mpoklpnn-a24rwz`) returned PLAN-KILL with
+four new fatal axes that v2 introduced; this patched v2 (commit-pending)
+addresses all four. Claude SMR r2 had voted PLAN-READY-WITH-NIT; that
+verdict is superseded by this patch — see §Y v2 patch log.
 
 v1 round-1 verdicts (verbatim references):
 
@@ -141,8 +142,8 @@ cold-path-flooder
   --dst-port-base <P>   (5201 default)
   --dst-port-span <N>   (number of dst-ports to sweep; default 1)
   --src-ip-base <IP>    (10.42.0.0 default)
-  --src-ip-span <N>     (default 65536 — /16 sweep)
-  --src-port-span <N>   (default 65535 — full ephemeral range)
+  --src-ip-span <N>     (default 16384 — see "5-tuple cardinality budget" below)
+  --src-port-span <N>   (default 8 — see "5-tuple cardinality budget" below)
   --duration-secs <S>   (default 30)
   --warmup-secs <S>     (default 2)
   --tx-mbps <M>         (default 0 = max)
@@ -152,6 +153,72 @@ cold-path-flooder
   --ipv4 | --ipv6       (default ipv4; v6 path uses fe80::-equivalent)
   --output-json <FILE>  (per-run summary)
 ```
+
+#### 4.2.0 5-tuple cardinality budget — bounded sweep to match session table
+
+AGY r2 axis 1 (FATAL): an unbounded random /16 sweep × full ephemeral
+port range generates ~4.3 billion distinct 5-tuples. The session table
+caps at `DEFAULT_MAX_SESSIONS = 131_072` per dataplane
+(`userspace-dp/src/session/mod.rs:25`). UDP timeout is 60 s
+(`session/mod.rs:28`). At 5 Mpps × 30 s = 150 M packets, the table
+fills in the first ~26 ms; for the next 29.97 s of the run, every
+`install_with_protocol_with_origin` call returns `false`
+(`session/mod.rs:666-668`). That changes what the benchmark measures
+from "real cold-path packet cost (cache miss → policy eval → session
+install → cross-worker replicate)" to "policy eval only with all the
+expensive install work bypassed". v2 numbers would mislead the JIT
+design doc into thinking the cold-path budget is half its real value.
+
+**Fix**: default the flooder to a **bounded** unique-5-tuple cohort
+sized to fit the session table comfortably:
+
+```
+src_ip_span      = 16384   (14 bits of IP randomization)
+src_port_span    = 8       (3 bits of source-port — 8 ports per IP)
+dst_port_span    = 1       (single dst-port by default)
+unique 5-tuples  = 16384 × 8 × 1 = 131_072  (exactly DEFAULT_MAX_SESSIONS)
+```
+
+This means:
+
+- Every first-packet of each unique 5-tuple is a cold-path eval (session
+  miss → policy eval → session install). 131 K cold-path samples per
+  run.
+- After the session table is full (~26 ms into the run), subsequent
+  packets reuse existing 5-tuples → flow-cache hit → warm path. The
+  cold-path sample rate becomes ~ 0 from that point onward.
+- Net result: 131 K cold-path samples in 30 s. At 1-in-256 sampling
+  that's only ~512 histogram samples — too few for a clean p999. **So
+  we drop the sample mask when the cohort is bounded**: the harness
+  exposes `--sample-mask <N>` (default 1, i.e. 100 % sampling when
+  cohort ≤ 256 K; default 256 when cohort > 256 K). The 1-in-N
+  decision is per-run, recorded in the TSV header.
+- The wrapper-baseline subtraction (TSC pair ~25 ns × 2) still
+  applies; at 100 % sampling the per-packet wrapper cost is ~55 ns
+  per cold-path sample. The harness reports `wrapper_ns_baseline`
+  so reviewers can audit.
+
+**Alternative knobs the harness exposes**:
+
+- `--cohort {bounded,unbounded}` — `bounded` is default. `unbounded`
+  enables the AGY-flagged "policy-eval-only" regime explicitly; useful
+  for isolating the policy eval cost from session install cost. The
+  TSV column `mode` records which regime was active.
+- `--cohort-size <N>` — override default `min(DEFAULT_MAX_SESSIONS,
+  src_ip_span * src_port_span * dst_port_span)`. Reviewers can sweep.
+- `--saturate-table-first` — fill the session table to capacity in a
+  fast pre-warm phase (no measurement), then run a separate
+  measurement phase where cold-path samples are dominated by
+  install-rejection rather than install-success. This is an explicit
+  diagnostic mode, not the default.
+
+**CoS interaction (AGY axis 2)**: 131 K unique 5-tuples hashed into
+`COS_FLOW_FAIR_BUCKETS = 4096` will activate ~100 % of buckets, which
+is unrealistic. The cold-path-microbench default is **CoS-off** for
+this reason. CoS-on is a separate sweep that uses a smaller cohort
+(default 32 streams) to keep ~32 of 4096 buckets active — closer to a
+production profile. The TSV header records `cos_mode = on/off` per
+run.
 
 #### 4.2.1 Why AF_PACKET, not iperf3
 
@@ -284,11 +351,24 @@ let tsc_per_ns_q32 = ((n1 - n0) as u128 * (1u128 << 32)
 ```
 
 100 ms calibration is run-once per worker startup; the Q32
-multiplier is read in `close()`. We assert invariant TSC by
-reading `/proc/cpuinfo` for `constant_tsc` and `nonstop_tsc`
-flags at coordinator start and refusing to start if either is
-missing. Modern hypervisors expose both; loss cluster is
-verified clean.
+multiplier is read in `close()`. We probe invariant TSC by reading
+`/proc/cpuinfo` for `constant_tsc` and `nonstop_tsc` flags at
+coordinator start. **Graceful degrade** (AGY r2 hazard 1): if either
+flag is missing, the worker logs a one-time warning and falls back to
+`clock_gettime(CLOCK_MONOTONIC)` for the sample-site clock. The
+1-in-256 sample mask amortizes the clock_gettime cost to ~0.18 ns /
+packet — still well below the cold-path floor. The TSV harness
+records `clock_source = tsc|clock_gettime` per run so downstream
+operators know which regime they're in. We do NOT refuse to start —
+that would break CI / nested-VM deployments without invariant TSC.
+
+Calibration sleep precision (Claude SMR r2 N2): the 100 ms
+`std::thread::sleep` can drift ±10 ms on contended systems. To
+mitigate, the calibration body uses a **spin-then-validate** pattern:
+sleep 100 ms, then spin in a tight `clock_gettime` loop until 100 ms
+wall has actually elapsed, capturing TSC delta over the validated
+wall window. Spin overhead is bounded by the drift and the next
+publish tick is unaffected.
 
 #### 4.3.4 Per-zone-pair slot pick
 
@@ -298,12 +378,30 @@ const ZP_SLOTS:      usize = 1 << ZP_SLOTS_LOG2;
 
 #[inline]
 fn zone_pair_slot(key: u32) -> usize {
-    // Splitmix-style hash: avoid linear correlation between
-    // adjacent zone-pair keys aliasing onto adjacent slots.
+    // Multiply by golden-ratio constant, then take LOW 4 bits.
+    // Empirically: for K=16 diagonal (from_id==to_id) zone-pair keys,
+    // the low-4-bit pick gives a PERFECT bijection [0..16) → [0..16).
+    // The earlier high-4-bit pick (>> 60) clustered: AGY r2 axis 3
+    // showed slot 0 with 2 keys and slot 11 with 2 keys for the
+    // diagonal case. low-4-bit avoids this because multiplication
+    // by the golden ratio is a maximum-period permutation on the
+    // low-order bits when the input is a small contiguous integer
+    // sequence (see Knuth Vol 3, §6.4).
     let h = (key as u64).wrapping_mul(0x9E3779B97F4A7C15);
-    ((h >> 60) & 0xF) as usize
+    (h & 0xF) as usize
 }
 ```
+
+Empirical distribution check (verified during plan-review r2):
+
+| Input pattern (K=16) | low `& 0xF` | high `>> 60` |
+|----------------------|------------|--------------|
+| Diagonal (i, i)      | perfect [1,1,1...×16] | [2,2,2,1,1...] |
+| Round-robin (i, i+1) | perfect [1,1,1...×16] | [2,2,2,1,1...] |
+| Random K=16 sample   | best-uniform | clustered |
+
+The `&0xF` pick is the correct choice; the plan's earlier `>> 60` was
+an error.
 
 ### 4.4 New struct: `WorkerColdPathCounters`
 
@@ -333,6 +431,14 @@ pub(in crate::afxdp) struct WorkerColdPathAtomics {
 }
 ```
 
+Bucket layout note: with 24 buckets, the saturation edge is **2^32 ns
+≈ 4.295 s** (any `ns ≥ 2^32` maps to bucket 23). AGY r2 axis 4 caught
+the earlier prose claim of "saturates at 2^33 ns" — that was wrong;
+the math is `b = (54 - clz(ns|1)).max(0).min(23)`. For our worst-case
+projection of 1M-rule linear scan at ~100 ns/rule = ~100 ms per packet
+(~10^8 ns ≈ 2^27 ns), the result lands in bucket ~17 — well below
+saturation. Tail is visible.
+
 Size per worker: 16 × 24 × 8 + 16 × 8 × 3 = 3072 + 384 = **3456 B**
 per worker, ~54 cache lines. With 6 workers = 20.7 KB total. Cheap
 in absolute terms; localized to one struct so a future redesign
@@ -344,6 +450,28 @@ Publish path: per-tick (`~1 Hz`) the worker calls
 Relaxed stores per worker per second. Negligible.
 
 ### 4.5 CPU isolation recording (harness side)
+
+AGY r2 hazard 2: the LAN_HOST container (`cluster-userspace-host`)
+runs on the same physical loss host as `xpf-userspace-fw0` with no
+explicit CPU pinning. Under heavy flooder load (5+ Mpps random-source
+generation) the host scheduler can co-locate flooder threads on the
+same physical cores as FW0 worker threads, introducing per-run
+scheduling jitter.
+
+The harness mitigates without changing the test fixture:
+
+```bash
+# Pin the flooder process to the highest core indexes on the host
+# (away from the typical [0..3] CPUs that incus places VM workers on).
+nproc_host=$(nproc)
+flooder_pin_first=$(( nproc_host - 2 ))
+taskset -c "${flooder_pin_first}-$(( nproc_host - 1 ))" \
+  incus exec loss:cluster-userspace-host -- /usr/local/bin/cold-path-flooder ...
+```
+
+This is best-effort: if `nproc` reports < 4, the pin reduces to "last
+core only" and we emit `FLOODER-PIN-WARNING: insufficient host cores`.
+The TSV header records `flooder_pin_cores=<list>`.
 
 The harness (`test/incus/cold-path-microbench.sh`) runs before and
 after each measurement:
@@ -594,6 +722,39 @@ Prometheus scrape budget; comparable to existing
   TSC sampling, 24-bucket layout, 16-slot per-zone-pair histogram,
   CPU isolation recording. Doc text scoped to "approximate ceiling
   under contention" with #739 follow-up linkage.
+- v2 patched — addresses AGY r2 PLAN-KILL findings:
+  - axis 1 (session table starvation): bound default unique-5-tuple
+    cohort to 131_072 = `DEFAULT_MAX_SESSIONS`, so every cold-path
+    sample measures real session install + policy eval cost; sample
+    mask becomes 1-in-1 by default when cohort ≤ 256 K.
+  - axis 2 (CoS 4096 buckets activated): default `cos_mode=off`; CoS
+    sweep uses a smaller 32-stream cohort to keep ~32 / 4096 buckets
+    active.
+  - axis 3 (splitmix slot clustering): switch to low-4-bit `&0xF`
+    pick which is a perfect bijection for K=16 diagonal and
+    round-robin patterns (empirically verified).
+  - axis 4 (bucket saturation prose): correct prose — 24-bucket
+    layout saturates at 2^32 ns ≈ 4.295 s, not 2^33 ns; verified
+    visible tail for 1M-rule worst case (~bucket 17).
+  - hazard 1 (TSC refuse-start): graceful degrade to
+    `clock_gettime` with one-time warning; never refuses to start.
+  - hazard 2 (LAN_HOST/FW0 co-residence): explicit
+    `taskset -c <last-2-cores>` pin for the flooder via the harness
+    script; `FLOODER-PIN-WARNING` if host has < 4 cores.
+  - hazard 3 (concurrent #1606/#1608 wire-protocol): unchanged from
+    v2 — additive-only fields, expected mechanical merge.
+
+## Y. v2 patch round 2 (post-AGY-KILL) resolution map
+
+| AGY r2 axis/hazard | Resolution | Section |
+|--------------------|------------|---------|
+| Axis 1 — session table exhaustion | Default cohort = 131_072 unique 5-tuples (= `DEFAULT_MAX_SESSIONS`); cold-path samples come from session installs in the warm-up phase, not from install-rejected packets | §4.2.0 |
+| Axis 2 — CoS 4096 buckets all-active | Default CoS-off; CoS-on uses small 32-stream cohort | §4.2.0 (CoS interaction) |
+| Axis 3 — splitmix `>> 60` clustering | Switch to `& 0xF` low-bit pick; perfect bijection for K=16 diagonal + round-robin | §4.3.4 |
+| Axis 4 — bucket saturation prose | Corrected: saturates at 2^32 ns ≈ 4.3 s, not 2^33 | §4.4 |
+| Hazard 1 — TSC refuse-start | Graceful degrade to `clock_gettime` with one-time warning; harness records `clock_source` | §4.3.3 |
+| Hazard 2 — LAN_HOST CPU pinning | `taskset -c <last-2-cores>` for flooder; `FLOODER-PIN-WARNING` when host has < 4 cores | §4.5 |
+| Hazard 3 — concurrent #1606/#1608 wire-protocol | Additive-only fields with `omitempty` / `#[serde(default)]`; expected mechanical merge | §4.7 (unchanged) |
 
 ## X. v1 archive
 
