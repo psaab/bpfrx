@@ -323,3 +323,15 @@ two further drift items were caught and resolved:
 Both corrections strictly tighten the doc. They do not change the
 runtime behavior, the in-source contract block, or the test
 shape. The verdict remains **MERGE-READY** at the post-fix SHA.
+
+---
+
+## Post-rebase final attestation note
+
+Verified at SHA `9e83df3a2` (final HEAD): the SMR doc on the branch
+covers the diff that ships, the comment blocks above `FilterTerm`
+and `FirewallTermSnapshot` are mirrored line-for-line, and the
+runbook tests still build and pass at the rebased head. No
+additional findings introduced by `_Log.md` chronological merge or
+the reviewer-ids.md task-ID records. Final verdict remains
+**MERGE-READY**.
