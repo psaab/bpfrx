@@ -1,6 +1,23 @@
 # #1563 cli -c segfault on readline.SetPrompt in non-TTY mode
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + AGY)
+**Status:** DRAFT v2 — addresses Codex PLAN-NEEDS-MAJOR + AGY PLAN-NEEDS-MINOR (round 1)
+
+## Round-1 review summary
+
+- **AGY (PLAN-NEEDS-MINOR):** call-site enumeration confirmed
+  complete; asked for bufio.NewScanner fallback on `load terminal`
+  instead of hard-error; asked for explicit fake gRPC client
+  pattern in test plan.
+- **Codex (PLAN-NEEDS-MAJOR):** flagged that `configure` mutates
+  daemon state (`EnterConfigure` RPC) before the cosmetic SetPrompt
+  fires, so nil-guarding the prompt risks leaving the daemon with
+  an exclusive config holder if the client disconnects without
+  ExitConfigure. Required: prove daemon cleanup on disconnect,
+  hard-error `configure` in -c, OR add guaranteed cleanup. Also
+  asked for actual recorded grep inventory + tests that exercise
+  real dispatch surface with a fake client.
+
+This v2 addresses both reviewers in full.
 
 ## Issue framing
 
@@ -11,91 +28,115 @@ because `c.rl == nil`.
 
 Root cause confirmed by reading `cmd/cli/main.go:67-76`: the `-c`
 fast path dispatches the command **before** `readline.NewEx()` runs
-(`c.rl = rl` is at line 132). Any code path inside dispatch that
+(`c.rl = rl` is at main.go:132). Any code path inside dispatch that
 touches `c.rl` will nil-deref.
 
-## All currently-broken `c.rl` call sites under `-c`
+## Codex's `configure` state-mutation concern — resolved
 
-Verified by `grep -n 'c\.rl' cmd/cli/*.go`:
+Codex flagged that `cli -c configure` calls `EnterConfigure` RPC
+before the SetPrompt panics, so a nil-guard would convert
+"crash-after-side-effect" to "success-after-side-effect" and
+could leave the daemon's config locked.
 
-| File:line | Code | Category |
-|-----------|------|----------|
-| shared.go:225 | `c.rl.SetPrompt(c.configPrompt())` (in `configure`) | cosmetic prompt update |
-| shared.go:283 | `c.rl.SetPrompt(c.configPrompt())` (in `edit`) | cosmetic prompt update |
-| shared.go:289 | `c.rl.SetPrompt(c.configPrompt())` (in `top`) | cosmetic prompt update |
-| shared.go:297 | `c.rl.SetPrompt(c.configPrompt())` (in `up`) | cosmetic prompt update |
-| shared.go:414 | `c.rl.SetPrompt(c.operationalPrompt())` (in config `exit`/`quit`) | cosmetic prompt update |
-| shared.go:437-442 | `if c.rl != nil { ... }` (refreshPrompt) | already guarded |
-| shared.go:530 | `cmdtree.WriteHelp(rc.ctl.rl.Stdout(), ...)` (Do completer) | unreachable in `-c` (no readline = no completer driven) |
-| main.go:105, 122 | `c.rl.Stdout()` inside readline Listener (`?` key) | unreachable in `-c` (Listener only fires inside Readline()) |
-| main.go:132 | `c.rl = rl` | init |
-| main.go:179 | `rl.SetPrompt(...)` (local `rl`, not `c.rl`) | unreachable in `-c` (in the read loop) |
-| request.go:37, 39 | `c.rl.SetPrompt("")` + `c.rl.Readline()` (reboot confirm) | **interactive input** |
-| request.go:55, 57 | same (zeroize confirm) | **interactive input** |
-| request.go:77, 79 | same (in-service upgrade confirm) | **interactive input** |
-| main.go (handleLoad):379 | `c.rl.Readline()` for `load <mode> terminal` | **interactive input** |
-
-Pipe-output pathway (`dispatchWithPipe` shared.go:133) doesn't touch
-`c.rl`, so `cli -c "show version | match foo"` would work if the
-underlying dispatch did.
-
-## Two fix candidates
-
-### Option A — guard `c.rl != nil` everywhere it's touched
-
-- Adds `if c.rl != nil { c.rl.SetPrompt(...) }` around the 5
-  cosmetic SetPrompt sites in shared.go.
-- For interactive-input sites (3 confirmation prompts in
-  request.go + 1 `load terminal` in main.go), return a clear error
-  in non-TTY mode: e.g.
-  `return fmt.Errorf("request system %s requires an interactive TTY; not available in -c mode", args[1])`.
-- Behaviour:
-  - `cli -c "show version"` works.
-  - `cli -c "configure"` flips `c.configMode = true` and prints
-    "Entering configuration mode" but the prompt is never shown so
-    the cosmetic SetPrompt being a no-op is invisible. Then `-c`
-    exits — the configMode state is discarded. Side-effect-free.
-  - `cli -c "request system reboot"` returns a clean error instead
-    of waiting on stdin for a yes/no that will never come (or
-    worse, crashing).
-
-### Option B — structural: `-c` rejects interactive commands up front
-
-Add a denylist in `main.go` before dispatch:
+**Verified resolution: the daemon already auto-releases on client
+disconnect.** Quote from `pkg/grpcapi/server.go:214-228`:
 
 ```go
-if isInteractiveOnly(*cmdFlag) {
-    fmt.Fprintln(os.Stderr, "error: this command requires an interactive TTY")
-    os.Exit(1)
+// configLockInterceptor auto-releases stale config locks when a gRPC client
+// disconnects (context cancelled) without calling ExitConfigure.
+func (s *Server) configLockInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+    resp, err := handler(ctx, req)
+    // If the client's context was cancelled (disconnect, Ctrl-C), release any
+    // config lock held by this connection.
+    if ctx.Err() != nil {
+        sessionID := peerSessionID(ctx)
+        if sessionID != "" {
+            if s.store.ExitConfigureSession(sessionID) {
+                slog.Info("auto-released config lock on client disconnect", "session", sessionID)
+            }
+        }
+    }
+    return resp, err
 }
 ```
 
-This sidesteps the question of what `configure`/`edit`/etc.
-"mean" in `-c` mode by forbidding them entirely.
+When `cli -c configure` exits, `defer conn.Close()` in
+`cmd/cli/main.go:37` closes the gRPC connection, the context
+cancels, and `configLockInterceptor` calls `ExitConfigureSession`.
+The lock is released cleanly.
 
-### Choice: **Option A**
+**Conclusion:** nil-guarding the SetPrompt in `configure` is safe.
+The "state leak" Codex worried about does not exist on master.
 
-Rationale:
+This also addresses the boundary-classification concern: the
+SetPrompt IS purely cosmetic because the daemon owns the canonical
+config-mode state and self-cleans.
 
-1. **Smaller blast radius.** Option A touches only the call sites
-   that today nil-deref. Option B requires a denylist that we'd
-   have to maintain alongside the dispatch tables.
-2. **Pipe-friendly.** Operators may legitimately want to do
-   `cli -c "configure; set X; commit"` once we add multi-command
-   `-c` support (separate issue, not in scope here). Option A
-   doesn't preclude that.
-3. **Consistent with existing pattern.** `refreshPrompt`
-   (shared.go:437) already uses `if c.rl != nil { ... }`. The five
-   shared.go cosmetic SetPrompt sites are simply missing the same
-   guard.
-4. **Confirmation prompts get a real error**, not a hang. Option B
-   would also error, but at the dispatch-table layer, away from
-   the specific reason (no stdin for confirmation), making the
-   error message less precise.
+## Recorded `c.rl` call-site inventory
 
-## Concrete design
+`grep -n 'c\.rl' cmd/cli/*.go` against worktree HEAD (dd05de380):
 
-### shared.go — five cosmetic SetPrompt sites
+```
+cmd/cli/main.go:105:    fmt.Fprintln(c.rl.Stdout(), "  (no help available)")
+cmd/cli/main.go:122:    cmdtree.WriteHelp(c.rl.Stdout(), candidates)
+cmd/cli/main.go:132:    c.rl = rl
+cmd/cli/main.go:379:    line, err := c.rl.Readline()
+cmd/cli/shared.go:225:  c.rl.SetPrompt(c.configPrompt())
+cmd/cli/shared.go:283:  c.rl.SetPrompt(c.configPrompt())
+cmd/cli/shared.go:289:  c.rl.SetPrompt(c.configPrompt())
+cmd/cli/shared.go:297:  c.rl.SetPrompt(c.configPrompt())
+cmd/cli/shared.go:414:  c.rl.SetPrompt(c.operationalPrompt())
+cmd/cli/shared.go:437:  if c.rl != nil {
+cmd/cli/shared.go:439:      c.rl.SetPrompt(c.configPrompt())
+cmd/cli/shared.go:441:      c.rl.SetPrompt(c.operationalPrompt())
+cmd/cli/shared.go:530:  cmdtree.WriteHelp(rc.ctl.rl.Stdout(), candidates)
+cmd/cli/request.go:37:  c.rl.SetPrompt("")
+cmd/cli/request.go:38:  line, err := c.rl.Readline()
+cmd/cli/request.go:39:  c.rl.SetPrompt(c.operationalPrompt())
+cmd/cli/request.go:55:  c.rl.SetPrompt("")
+cmd/cli/request.go:56:  line, err := c.rl.Readline()
+cmd/cli/request.go:57:  c.rl.SetPrompt(c.operationalPrompt())
+cmd/cli/request.go:77:  c.rl.SetPrompt("")
+cmd/cli/request.go:78:  line, err := c.rl.Readline()
+cmd/cli/request.go:79:  c.rl.SetPrompt(c.operationalPrompt())
+```
+
+Categorisation:
+
+| Site | Category | Action |
+|------|----------|--------|
+| main.go:105, 122 | inside readline Listener callback (`?` key) | unreachable in -c (Listener registered by readline.NewEx) — no change |
+| main.go:132 | init | no change |
+| main.go:379 | `load <mode> terminal` interactive read | switch to bufio.NewScanner(os.Stdin) when rl==nil |
+| shared.go:225, 283, 289, 297, 414 | cosmetic SetPrompt | nil-guard each call |
+| shared.go:437-442 | refreshPrompt (already guarded) | no change |
+| shared.go:530 | autocomplete WriteHelp via `rc.ctl.rl.Stdout()` | unreachable in -c (`Do()` driven by readline) — no change |
+| request.go:37-39, 55-57, 77-79 | yes/no confirmation prompts | factor `confirmYes()` helper that hard-errors when rl==nil |
+
+**Total touched sites:** 5 in shared.go + 3 in request.go + 1 in
+main.go = 9. All other references are init, the dual-guard pattern
+already in place, or fire only inside the readline read loop.
+
+## Two fix candidates
+
+### Option A — guard c.rl != nil at the existing call sites
+
+Adopted. Details below.
+
+### Option B — denylist interactive commands at -c entry
+
+Rejected for the same reasons as v1, now reinforced:
+
+- Codex agreed Option A is directionally right.
+- Option B would block future multi-command `-c`
+  (`cli -c "configure; set X; commit"`).
+- The boundary problem Codex raised (`configure` mutates state
+  before cosmetic call) is moot because the daemon self-cleans on
+  disconnect.
+
+## Concrete design (v2)
+
+### shared.go — 5 cosmetic SetPrompt sites
 
 Wrap each in the same nil-guard already used by `refreshPrompt`:
 
@@ -105,154 +146,227 @@ if c.rl != nil {
 }
 ```
 
-Sites: lines 225, 283, 289, 297, 414. All are pure UI updates; the
-in-memory `c.configMode` / `c.editPath` state is updated
-independently of the prompt.
+Sites: lines 225, 283, 289, 297, 414. All pure UI updates.
+`c.configMode` / `c.editPath` state is updated independently and
+is harmless when discarded at -c exit.
 
-### request.go — three confirmation sites
+### request.go — 3 confirmation sites
 
-The three `request system <action>` confirmations (`reboot`, `halt`,
-`power-off`, `zeroize`, `software in-service-upgrade`) need an
-interactive yes/no. In `-c` mode that input is impossible.
-
-Factor a small helper:
+Factor a `confirmYes` helper that hard-errors in non-TTY mode:
 
 ```go
 func (c *ctl) confirmYes(prompt string) (bool, error) {
     if c.rl == nil {
-        return false, fmt.Errorf("this command requires an interactive TTY (not available in -c mode); use the gRPC SystemAction RPC if scripting")
+        return false, fmt.Errorf(
+            "this command requires interactive confirmation (TTY); " +
+            "not available in -c mode")
     }
     fmt.Print(prompt)
     c.rl.SetPrompt("")
     line, err := c.rl.Readline()
     c.rl.SetPrompt(c.operationalPrompt())
     if err != nil {
-        return false, nil  // treat read error as "no"
+        return false, nil
     }
     return strings.TrimSpace(strings.ToLower(line)) == "yes", nil
 }
 ```
 
-Each of the three sites becomes:
+Each request.go confirmation becomes:
 
 ```go
-ok, err := c.confirmYes("Reboot the system? [yes,no] (no) ")
+ok, err := c.confirmYes(fmt.Sprintf("%s the system? [yes,no] (no) ", strings.Title(args[1])))
 if err != nil {
     return err
 }
 if !ok {
-    fmt.Println("Reboot cancelled")
+    fmt.Printf("%s cancelled\n", strings.Title(args[1]))
     return nil
 }
 ```
 
-### main.go handleLoad — terminal source
+Hard-error is correct here: `request system reboot` from a script
+without confirmation MUST NOT proceed silently. The clear error
+tells the operator to invoke `pb.BpfrxServiceClient.SystemAction`
+directly via gRPC if non-interactive operation is required.
 
-For `load <mode> terminal` with no `c.rl`, return:
+### main.go handleLoad — bufio.NewScanner fallback (per AGY)
+
+In `handleLoad`, when `source == "terminal"` and `c.rl == nil`,
+read stdin via bufio.NewScanner so the canonical pipe pattern
+works:
 
 ```go
-return fmt.Errorf("load %s terminal requires an interactive TTY; use 'load %s <file>' or pipe via gRPC", mode, mode)
+if source == "terminal" {
+    var lines []string
+    if c.rl != nil {
+        fmt.Println("[Type or paste configuration, then press Ctrl-D on an empty line]")
+        for {
+            line, err := c.rl.Readline()
+            if err != nil {
+                break
+            }
+            lines = append(lines, line)
+        }
+    } else {
+        // Non-TTY: read piped config directly from stdin.
+        scanner := bufio.NewScanner(os.Stdin)
+        // Default scanner buffer is 64 KiB which is too small for
+        // a Junos-style override. Bump to 1 MiB.
+        scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+        for scanner.Scan() {
+            lines = append(lines, scanner.Text())
+        }
+        if err := scanner.Err(); err != nil {
+            return fmt.Errorf("load %s: stdin read: %v", mode, err)
+        }
+    }
+    content = strings.Join(lines, "\n")
+}
 ```
 
-### `cli -c "configure"` — what happens
-
-After the fix:
-1. `configure` RPC succeeds (or fails — independent of TTY).
-2. `c.configMode = true`.
-3. SetPrompt is a no-op (rl is nil).
-4. Print messages go to stdout.
-5. `-c` path exits because there are no further commands.
-
-The in-memory configMode is discarded. The daemon-side
-EnterConfigure was issued; ExitConfigure is NOT issued in the `-c`
-path. **This is a pre-existing leak** unrelated to the segfault — a
-script that does `cli -c "configure"` would leave the daemon in
-exclusive-config mode held by the disconnected client. Out of
-scope for this fix (note in PR body); the segfault must come out
-either way.
+This unlocks `echo "set system hostname foo" | cli -c "load merge terminal"`.
 
 ## Public API preservation
 
-No public signatures change. `ctl` struct unchanged. `confirmYes`
-is an unexported helper. The `-c` flag semantics are unchanged
-externally — it just no longer crashes.
+- `ctl` struct: unchanged.
+- `confirmYes`: new unexported helper.
+- `-c` flag semantics: unchanged externally — it just no longer
+  crashes.
+- All other dispatch paths in TTY mode behave identically.
 
 ## Hidden invariants the change must preserve
 
 - Interactive `cli` (TTY) behaviour MUST be identical. Every
-  SetPrompt that fires today must still fire when `c.rl != nil`.
+  SetPrompt that fires today still fires when `c.rl != nil`.
   Verified by guard pattern: `if c.rl != nil { existing-call }`.
-- Confirmation prompts in TTY mode must still demand "yes" — the
-  `confirmYes` helper preserves that exactly.
-- Error-on-no-rl in interactive-input sites must surface a
-  non-zero exit so scripts can detect the failure: main.go's `-c`
-  path already does `os.Exit(1)` on dispatch error (line 73).
+- Confirmation prompts in TTY mode still demand "yes" — the
+  `confirmYes` helper preserves the exact existing logic
+  (read, compare lowercased+trimmed, exact match "yes").
+- Error-on-no-rl in interactive-input sites surfaces a non-zero
+  exit so scripts can detect the failure: main.go:71-74 already
+  does `os.Exit(1)` on dispatch error.
+- Daemon-side EnterConfigure cleanup is preserved by existing
+  configLockInterceptor (pkg/grpcapi/server.go:214-228).
 - No new goroutines, no new locks, no new allocations on the hot
-  path. (CLI is cold path anyway.)
+  path.
 
 ## Risk assessment
 
 | Risk class | Level | Notes |
 |------------|-------|-------|
 | Behavioural regression (TTY) | LOW | Each guard is `if rl != nil { existing-call }`; in TTY mode rl is non-nil so behaviour is unchanged. |
-| Lifetime / borrow-checker | N/A | Go, not Rust. No lifetime hazards. |
+| Lifetime / borrow-checker | N/A | Go, not Rust. |
 | Performance regression | NEGLIGIBLE | CLI is cold path; one nil-check per cosmetic SetPrompt. |
 | Architectural mismatch | LOW | Pattern already in use at shared.go:437; we're propagating it consistently. |
+| State leak via `cli -c configure` | LOW (verified) | Daemon auto-releases on conn close via configLockInterceptor. |
+| stdin-stream encoding for piped `load terminal` | LOW | bufio.NewScanner with 1 MiB buffer covers realistic configs; CRLF handled by Scanner.Text() stripping the trailing newline character. |
 
-## Test plan
+## Test plan (v2)
 
-1. **`go vet ./cmd/cli/...`** clean.
-2. **`go build ./cmd/cli`** clean.
-3. **`go test ./cmd/cli/...`** — existing tests pass. Add a new
-   table-driven test for the `-c` path: construct a `ctl` with
-   `rl == nil`, call `dispatchOperational("configure")`,
-   `dispatchConfig("edit X")`, `dispatchConfig("top")`,
-   `dispatchConfig("up")`, `dispatchConfig("exit")` — must not
-   panic, must return nil error (gRPC client can be a stub or
-   nil-checked path; use a fake client).
-4. **`go test ./...`** — full suite green.
-5. **Manual repro on cluster**: deploy and run
-   `incus exec loss:xpf-userspace-fw0 -- /usr/local/sbin/cli -c "show version"`
-   — must print version and exit 0, no segfault.
-6. **TTY regression check**: `make test-ssh` and run interactive
-   `cli`, verify `configure` / `edit foo` / `top` / `up` / `exit`
-   still update the prompt visually.
-7. **Confirmation-error path**: `cli -c "request system reboot"`
-   on the test VM — must return the clear-TTY error and exit
-   non-zero, NOT reboot.
+### Unit tests
+
+Add `cmd/cli/cdash_nontty_test.go` (or extend `main_test.go`)
+using the interface-embedding fake gRPC client pattern that AGY
+suggested:
+
+```go
+type fakeBpfrxClient struct {
+    pb.BpfrxServiceClient // embed interface; nil for unused methods
+}
+
+func (f *fakeBpfrxClient) EnterConfigure(
+    ctx context.Context, in *pb.EnterConfigureRequest, opts ...grpc.CallOption,
+) (*pb.EnterConfigureResponse, error) {
+    return &pb.EnterConfigureResponse{}, nil
+}
+func (f *fakeBpfrxClient) ExitConfigure(
+    ctx context.Context, in *pb.ExitConfigureRequest, opts ...grpc.CallOption,
+) (*pb.ExitConfigureResponse, error) {
+    return &pb.ExitConfigureResponse{}, nil
+}
+// ... other RPCs as needed, all returning the empty response.
+```
+
+Test cases (every site that nil-derefs today):
+
+1. `TestDispatchOperational_ConfigureNoTTY` — ctl{rl: nil} +
+   fakeBpfrxClient; call `dispatchOperational("configure")`; must
+   not panic, must return nil, must set `c.configMode = true`.
+2. `TestDispatchConfig_EditTopUpExitNoTTY` — ctl{rl: nil,
+   configMode: true}; call each of `edit foo`, `top`, `up`,
+   `exit`; must not panic, must return nil; verifies all four
+   shared.go SetPrompt sites (283, 289, 297, 414).
+3. `TestConfirmYes_NoTTYError` — ctl{rl: nil}; call
+   `confirmYes("?")`; must return (false, non-nil error).
+4. `TestHandleRequestSystem_NoTTY` — ctl{rl: nil}; call
+   `handleRequestSystem([]string{"system", "reboot"})`; must
+   return the no-TTY error, must NOT call SystemAction RPC
+   (verify with a fake that increments a counter and asserts
+   it's still zero).
+5. `TestHandleLoad_TerminalNoTTYReadsStdin` — ctl{rl: nil};
+   redirect os.Stdin to a pipe containing
+   `"set system hostname foo\n"`; call `handleLoad(
+   ["override", "terminal"])`; verify the fake's Load was called
+   with the piped content. Use `os.Pipe()` + `os.Stdin =
+   readEnd` (save/restore for cleanup).
+
+### Integration / smoke tests
+
+- `make build && make build-ctl`: clean.
+- `go vet ./cmd/cli/...`: clean.
+- `go test ./cmd/cli/...`: all green, including 5 new tests.
+- `go test ./...`: full Go suite green (30 packages).
+- Manual repro:
+  - `incus exec loss:xpf-userspace-fw0 -- /usr/local/sbin/cli -c "show version"` — must print version, exit 0.
+  - `incus exec loss:xpf-userspace-fw0 -- /usr/local/sbin/cli -c "configure"` — must succeed, exit 0, daemon auto-releases config lock.
+  - `incus exec loss:xpf-userspace-fw0 -- bash -c 'echo "set system hostname testxxx" | /usr/local/sbin/cli -c "load merge terminal"'` — must succeed, exit 0; check `cli -c "show configuration system"` confirms the hostname change.
+  - `incus exec loss:xpf-userspace-fw0 -- /usr/local/sbin/cli -c "request system reboot"` — must return error, exit non-zero, MUST NOT reboot.
+- TTY regression: `make test-ssh` and run interactive `cli`,
+  verify `configure` / `edit foo` / `top` / `up` / `exit` still
+  update the prompt visually.
+
+### Smoke matrix
+
+This is a CLI binary fix, not a dataplane change. The full Pass A +
+Pass B per-class CoS matrix from triple-review is not required.
+But we still run the standard userspace cluster smoke (v4 + v6,
+push + reverse, multi-stream) to confirm we haven't broken
+anything by linking against the modified `cli` binary.
 
 ## Out of scope
 
 - Multi-command `-c` support (e.g. `cli -c "configure; set X; commit"`).
-- The daemon-side EnterConfigure leak when `cli -c "configure"` is
-  issued without follow-up. Pre-existing; addressed in a separate
-  issue.
+  Separate issue.
 - Refactoring `request system <action>` confirmations to read
-  stdin directly (instead of via readline). Pre-existing coupling;
-  out of scope.
+  stdin directly. The hard-error in non-TTY mode is correct for
+  destructive operations; allowing piped "yes" input would
+  reduce the protection.
+- Adding a `--yes` / `--non-interactive` flag for destructive
+  actions. Separate issue.
 
-## Open questions for adversarial review
+## Open questions for adversarial review (round 2)
 
-1. **Is Option A really safer than Option B?** Could there be a
-   call site that touches `c.rl` and is NOT in our enumerated
-   list? `grep -n 'c\.rl' cmd/cli/*.go` ran on the worktree at
-   commit e07f733a6 — please re-grep against the head you review
-   to confirm coverage.
-2. **`cli -c "configure"` state leak** — is fixing the segfault
-   without fixing the leak acceptable for this PR, or should both
-   ship together? My read: segfault is a crash bug, leak is a
-   resource bug. Crash-fix should not be gated on leak-fix.
-3. **Confirmation-prompt error wording.** The proposed error
-   suggests "use the gRPC SystemAction RPC if scripting" — is that
-   the right pointer, or should it say "use REST POST
-   /api/v1/system" or "drop this command from the script"?
-4. **Should `load <mode> terminal` in `-c` mode be a hard error,
-   or silently fall back to reading from `os.Stdin`?** The pipe
-   shape `echo "config..." | cli -c "load merge terminal"` could
-   conceivably work if we used `bufio.NewReader(os.Stdin)` instead
-   of `c.rl.Readline()`. I propose hard error for now (smaller
-   blast radius) but note the alternative.
-5. **Test coverage** — should the new test exercise every shared.go
-   SetPrompt path or just one canary site? My read: hit every
-   path that today nil-derefs (5 sites in shared.go + 3 in
-   request.go + 1 in handleLoad). Cost is one table entry each.
+1. **`load terminal` stdin EOF handling.** bufio.NewScanner stops
+   on EOF. Is there any case where stdin is a pipe that never
+   closes (e.g. interactive heredoc)? My read: `cli -c "load merge
+   terminal"` users will pipe a finite payload; if they want
+   open-ended interactive, they don't pass `-c`. Acceptable?
+2. **Should the 1 MiB scanner buffer be tunable?** I picked 1 MiB
+   because Junos override configs are usually <100 KiB. Edge
+   case: someone pipes a multi-MB config. Should we bump to 16
+   MiB by default, or fail loudly when the buffer is exceeded?
+   Default scanner behaviour with buffer-exceeded is to fail with
+   `bufio.ErrTooLong`, which we'll surface as "load: stdin read".
+3. **Test pattern: interface embedding vs gomock vs full fake.**
+   AGY suggested embedding. Codex asked for "real dispatch
+   surface plus fake client". Embedding satisfies both —
+   confirmed acceptable?
+4. **Should `cli -c "configure"` emit an info note** that the
+   command has no effect at exit, since the daemon auto-releases?
+   My read: silence is correct because there's no follow-up
+   command anyway. Counter-argue?
+5. **`request system in-service-upgrade` shape.** Same confirmYes
+   treatment, but ISSU specifically is the kind of thing
+   automation might want to drive. The current "must use gRPC
+   SystemAction RPC" error message is accurate. Counter-argue?
