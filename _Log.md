@@ -4867,3 +4867,26 @@ top.
   cargo --release passes except a pre-existing snat doc-guard
   flake (master also fails this — unrelated to #1431).
   Go suite clean.
+
+## 2026-05-26 — #1431 code-review r1 fixes + Claude SMR doc
+
+- **Timestamp**: 22:15 UTC
+- **Action**: addressed Codex r1 + Copilot r1 inline findings; wrote
+  Claude SMR code-review doc per skill Step 8.5
+- **File(s)**:
+  - `userspace-dp/src/protocol/security.rs` — harmonized
+    CACHE-KEY INVARIANT block with FilterTerm's block per Codex r1 #1
+  - `userspace-dp/src/afxdp/flow_cache_tests.rs` — fixed "per-interface
+    set" wording (Codex r1 #2) + replaced hard-coded line 644/696
+    refs with test names (Copilot inline #2)
+  - `userspace-dp/src/filter/README.md` — over-specifying "ICMP echo
+    identifier" reworded to match parse_flow_ports' actual behavior
+    (Copilot inline #1); hard-coded line refs replaced with test
+    names
+  - `docs/pr/1431-filter-cache-invariants/claude-smr-code-r1.md` (new) —
+    Claude SMR verdict MERGE-READY per Step 8.5
+- **Reviewer verdicts**:
+  - Codex r1: MERGE-NEEDS-MINOR → fixes applied
+  - AGY r1: MERGE-READY
+  - Copilot r1: COMMENTED with 2 inline findings → fixes applied
+  - Claude SMR: MERGE-READY (doc on branch)

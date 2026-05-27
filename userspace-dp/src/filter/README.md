@@ -127,8 +127,10 @@ on those fields.
 (`userspace-dp/src/session/key.rs`) is a 6-tuple:
 `addr_family`, `protocol`, `src_ip`, `dst_ip`, `src_port`, `dst_port`.
 For ICMP and ICMPv6 sessions, `parse_flow_ports`
-(`userspace-dp/src/afxdp/frame/inspect.rs:225`) stores the ICMP
-echo identifier in `src_port` and zero in `dst_port`. ICMP **type**
+(`userspace-dp/src/afxdp/frame/inspect.rs:212-232`) unconditionally
+reads bytes 4-6 of the ICMP header into `src_port` (the ICMP
+identifier word — meaningful for Echo Request/Reply, opaque for
+other ICMP types) and stores zero in `dst_port`. ICMP **type**
 and **code** are NOT in the cache key — adding an explicit
 `icmp_type` or `icmp_code` filter match makes the filter
 cache-sensitive unless `SessionKey` or trusted per-session
@@ -145,7 +147,7 @@ exactly one of these two classes:
 | `source_addresses` / `source_v4` / `source_v6` | yes | `src_ip` in `SessionKey` |
 | `destination_addresses` / `dest_v4` / `dest_v6` | yes | `dst_ip` |
 | `protocols` / `protocol_bitmap` (+ `protocol_match_enabled`) | yes | `protocol` |
-| `source_ports` | yes (TCP/UDP); ICMP-special | `src_port` carries ICMP identifier |
+| `source_ports` | yes (TCP/UDP); ICMP-special | `src_port` carries the ICMP identifier word from bytes 4-6 of the ICMP header (meaningful for Echo Request/Reply, opaque otherwise) |
 | `destination_ports` | yes (TCP/UDP); ICMP-zero | `dst_port` is 0 for ICMP |
 | `dscp_values` / `dscp_bitmap` (+ `dscp_match_enabled`) | NO — cache-sensitive | see #1430 pattern below |
 | (future) `tos_match` / ECN bits (non-DSCP TOS) | NO — cache-sensitive | TOS lower bits and ECN vary per packet |
@@ -199,7 +201,9 @@ implementation (#1430); use it as the template:
    filter/term IDs** — `Filter.id` and `FilterTerm.id` are
    stable only within a snapshot.
 7. **Tests** in `userspace-dp/src/afxdp/flow_cache_tests.rs`
-   following the DSCP runbook pattern at lines 643/695 and the
+   following the DSCP runbook pattern in
+   `from_forward_decision_skips_cache_for_dscp_matched_input_filter`
+   /`_output_filter` (DSCP-bespoke regression tests) and the
    #1431 references
    `dscp_input_gate_blocks_flow_cache_insertion_via_runbook_pattern`
    / `_output_*`. The flow-cache test home is `afxdp/` because
@@ -208,7 +212,9 @@ implementation (#1430); use it as the template:
 
 Reference tests (already in the tree, cite from new field PRs):
 
-- gate insertion: `afxdp/flow_cache_tests.rs:643,695`
+- gate insertion: `afxdp/flow_cache_tests.rs` ::
+  `from_forward_decision_skips_cache_for_dscp_matched_input_filter`
+  / `_output_filter`
 - rotation purge positional-ID immunity:
   `filter/tests.rs:1806`
   (`input_dscp_filter_families_changed_ignores_positional_filter_id_change`)

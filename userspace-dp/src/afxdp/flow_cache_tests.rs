@@ -754,7 +754,9 @@ fn from_forward_decision_skips_cache_for_dscp_matched_input_filter() {
 // "Cache-key invariants for per-packet match fields (#1431)".
 //
 // They re-exercise the DSCP gate (already covered by the bespoke
-// tests above at lines 644 and 696), but in an explicitly
+// tests `from_forward_decision_skips_cache_for_dscp_matched_output_filter`
+// and `from_forward_decision_skips_cache_for_dscp_matched_input_filter`
+// above in this file), but in an explicitly
 // runbook-shaped layout: build a snapshot with the cache-sensitive
 // match field on a terminal action, bind it to the relevant
 // interface direction, drive `FlowCacheEntry::from_forward_decision`,
@@ -874,8 +876,10 @@ fn dscp_output_gate_blocks_flow_cache_insertion_via_runbook_pattern() {
         "",
     );
 
-    // Step 4: same gate, different per-interface set
-    // (iface_filter_out_v4_fast.has_dscp_match_terms).
+    // Step 4: same gate, different lookup —
+    // interface_output_filter_has_dscp_match consults
+    // iface_filter_out_v{4,6}_fast.has_dscp_match_terms (a fast
+    // map lookup plus aggregate flag, not a HashSet).
     let entry = FlowCacheEntry::from_forward_decision(
         &flow,
         meta,
