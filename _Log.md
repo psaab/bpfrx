@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-05-26 12:30 UTC — #1598 plan v1 (CoS iperf-uncapped caps at ~10 Gbps)
+
+- **Timestamp**: 2026-05-26 12:30 UTC
+- **Action**: Drafted plan v1 for #1598. Root-cause identified at `userspace-dp/src/afxdp/worker/cos/mod.rs:126-131` — `queue_uses_shared_exact_service` early-returns false on `!queue.exact`, excluding the uncapped non-exact queue from sharded multi-worker drain. This forces 100% of class-11 traffic through a single `owner_worker_id` (built at `coordinator/mod.rs:900-904`), hitting the per-worker AF_XDP UMEM ceiling (~6-10 Gbps per `feedback_cross_binding_impossible`). The 24g/exact queue escapes this because it trips the same gate with `exact=true && rate >= 312 MB/s`.
+- **File(s)**: `docs/pr/1598-cos-uncapped-fix/plan.md`
+
 ## 2026-05-26 23:10 UTC — #1578 cluster perf root-cause (smoke target IP misalignment)
 
 - **Timestamp**: 2026-05-26 23:10 UTC
