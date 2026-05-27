@@ -124,9 +124,33 @@ where
 /// queues as single-owner.
 #[inline]
 fn queue_uses_shared_exact_service(_iface: &CoSInterfaceConfig, queue: &CoSQueueConfig) -> bool {
-    if !queue.exact {
-        return false;
-    }
+    // #1598: previously the gate required `queue.exact`, which excluded
+    // non-exact queues (and in particular Junos `priority low` queues
+    // with no `transmit-rate` configured — the "uncapped" case) from
+    // sharded multi-worker drain. Those queues then got a single
+    // `owner_worker_id` via the round-robin in
+    // `build_cos_owner_worker_by_queue_with_fallback_ifindexes`, and the
+    // cross-binding redirect funneled 100% of class traffic to that one
+    // worker → per-worker AF_XDP UMEM ceiling (~6-10 Gbps) became the
+    // hard cap (see feedback_cross_binding_impossible in memory).
+    //
+    // The exact-only restriction was a holdover from the original #680/#690
+    // design that targeted shared-exact V_min / per-queue-lease coordination
+    // (which DO require `queue.exact`). Those mechanisms remain
+    // exact-gated at coordinator/mod.rs:1058 (`SharedCoSQueueLease`) and
+    // ~1145 (`SharedCoSQueueVtimeFloor`), so the only effect of admitting
+    // non-exact queues to the `shared_exact` execution policy is to
+    // bypass the single-owner funnel in `resolve_local_routing_decision`.
+    //
+    // The rate threshold (`COS_SHARED_EXACT_MIN_RATE_BYTES`, 312 MB/s ≈
+    // 2.5 Gbps) is intentionally preserved: queues with a small explicit
+    // transmit-rate (e.g. iperf-1g) stay single-owner because the funnel
+    // is invisible at sub-UMEM-ceiling rates, and the single-owner FIFO
+    // arbitration is desirable at low rates. Queues with a fallback rate
+    // equal to the interface shaping rate (the uncapped case, where
+    // `transmit_rate_bytes = iface.cos_shaping_rate_bytes_per_sec` per
+    // `forwarding_build/cos.rs:269-274`) trip the threshold for any
+    // interface with a non-trivial shape and run sharded across workers.
     queue.transmit_rate_bytes >= COS_SHARED_EXACT_MIN_RATE_BYTES
 }
 

@@ -1917,11 +1917,43 @@ fn test_exact_queue_at_rate(queue_id: u8, rate_bits: u64) -> CoSQueueConfig {
 }
 
 #[test]
-fn queue_uses_shared_exact_service_rejects_non_exact_queue() {
+fn queue_uses_shared_exact_service_admits_high_rate_non_exact_queue() {
+    // #1598: non-exact queues with effective rate above the per-worker
+    // UMEM ceiling (`COS_SHARED_EXACT_MIN_RATE_BYTES`) MUST get the
+    // shared_exact execution policy, otherwise the cross-binding
+    // redirect funnels all class traffic to a single owner_worker_id
+    // and the AF_XDP UMEM ceiling becomes the hard cap (~10 Gbps).
+    //
+    // The fallback rate for a non-exact "uncapped" queue is the
+    // interface shaping rate (see forwarding_build/cos.rs:269-274);
+    // when that exceeds the threshold the queue is sharded across
+    // workers.
     let iface = test_cos_iface_with_rate(10_000_000_000);
     let mut q = test_exact_queue_at_rate(4, 10_000_000_000);
     q.exact = false;
-    assert!(!queue_uses_shared_exact_service(&iface, &q));
+    assert!(
+        queue_uses_shared_exact_service(&iface, &q),
+        "#1598: non-exact queue at 10 Gbps must route via shared_exact \
+         to avoid the single-owner UMEM funnel"
+    );
+}
+
+#[test]
+fn queue_uses_shared_exact_service_keeps_low_rate_non_exact_single_owner() {
+    // #1598 regression-protection: non-exact queues BELOW the threshold
+    // (e.g. a forwarding-class assigned via firewall filter with no
+    // explicit transmit-rate, on a low-shape interface) should stay
+    // single-owner. The funnel is invisible at sub-ceiling rates and
+    // single-owner FIFO arbitration is desirable at low rates (#680/#690
+    // design rationale). Threshold is 2.5 Gbps = 312 MB/s.
+    let iface = test_cos_iface_with_rate(1_000_000_000);
+    let mut q = test_exact_queue_at_rate(4, 1_000_000_000);
+    q.exact = false;
+    assert!(
+        !queue_uses_shared_exact_service(&iface, &q),
+        "#1598: non-exact queue at 1 Gbps must stay single-owner — \
+         below the per-worker UMEM ceiling, no funnel to escape"
+    );
 }
 
 #[test]

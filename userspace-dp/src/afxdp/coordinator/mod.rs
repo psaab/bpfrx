@@ -1139,9 +1139,19 @@ fn build_shared_cos_queue_vtime_floors_reusing_existing(
             // (single-owner by definition); a floor on those
             // would only consume memory and risk false
             // throttling if the read-path gate ever
-            // regresses. The shared_exact promotion check
-            // mirrors `queue_uses_shared_exact_service` in
-            // worker.rs.
+            // regresses.
+            //
+            // #1598: this filter is intentionally STRICTER than the
+            // routing-side `queue_uses_shared_exact_service` gate in
+            // `worker/cos/mod.rs`. The routing-side gate admits
+            // high-rate non-exact queues (e.g. uncapped class with a
+            // fallback rate equal to the interface shaping rate) to
+            // sharded multi-worker drain. V_min coordination is an
+            // exact-only concept (per-queue lease serves the
+            // configured rate cap); allocating a floor for non-exact
+            // queues would be useless work. So both gates keep their
+            // own predicate: shared_exact-routing is broader,
+            // V_min-floor is exact-only.
             if !queue.exact
                 || queue.transmit_rate_bytes < super::worker::COS_SHARED_EXACT_MIN_RATE_BYTES
             {

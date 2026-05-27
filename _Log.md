@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-05-26 13:25 UTC — #1598 implementation + tests pass
+
+- **Timestamp**: 2026-05-26 13:25 UTC
+- **Action**: Implemented plan v2. Removed the `if !queue.exact { return false; }` early return in `queue_uses_shared_exact_service` at `userspace-dp/src/afxdp/worker/cos/mod.rs:126-131` so the rate-threshold check `transmit_rate_bytes >= COS_SHARED_EXACT_MIN_RATE_BYTES` admits non-exact queues that hit the threshold. Updated the test that previously pinned the rejection: renamed `queue_uses_shared_exact_service_rejects_non_exact_queue` → `queue_uses_shared_exact_service_admits_high_rate_non_exact_queue` + added a complementary regression test `queue_uses_shared_exact_service_keeps_low_rate_non_exact_single_owner` to lock the threshold-gated behavior. Updated doc comment at `coordinator/mod.rs:1145` to note the V_min floor filter is intentionally stricter than the routing gate. Build clean, 1438+10 cargo tests pass, Go suite clean, 5x flake check pass on `queue_uses_shared_exact_service` tests.
+- **File(s)**: `userspace-dp/src/afxdp/worker/cos/mod.rs`, `userspace-dp/src/afxdp/worker/cos/tests.rs`, `userspace-dp/src/afxdp/coordinator/mod.rs`
+
 ## 2026-05-26 12:50 UTC — #1598 plan v2 (after round-1 reviewer split)
 
 - **Timestamp**: 2026-05-26 12:50 UTC
