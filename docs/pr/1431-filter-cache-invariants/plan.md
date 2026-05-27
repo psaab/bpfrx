@@ -443,8 +443,10 @@ This PR is documentation + tests. No runtime change.
    `#[cfg(test)]`, no hot-path impact.
 3. HA sync portability — out of scope; README documents path (a)
    requires HA sync review.
-4. Stable-name purge comparison — exercised by the new positional-
-   ID-change-doesn't-fire test.
+4. Stable-name purge comparison — exercised by the existing
+   `input_dscp_filter_families_changed_ignores_positional_filter_id_change`
+   test at `userspace-dp/src/filter/tests.rs:1806` (cited from
+   the README runbook; no new test added).
 5. Three-color policer runtime shape — already in
    `dscp_sensitive_filter_semantics_match`; not regenerated.
 6. lo0 filters — documented as non-cacheable so future readers

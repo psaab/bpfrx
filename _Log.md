@@ -4838,3 +4838,11 @@ top.
     `afxdp/flow_cache_tests.rs`; explicit "dropped from v2" /
     "cited from existing" subsections.
   - Test names aligned with §8 (`_via_runbook_pattern` suffix).
+
+## 2026-05-26 — #1431 plan v5 (post-Codex r3)
+
+- **Timestamp**: 03:52 UTC
+- **Action**: Codex r3 PLAN-NEEDS-MINOR caught remaining §6 claim
+- **File(s)**: `docs/pr/1431-filter-cache-invariants/plan.md`
+- **Fix**: §6 invariant #4 "new positional-ID-change test" →
+  cite existing filter/tests.rs:1806.
