@@ -1,6 +1,75 @@
-# #1607 Cold-path hardware-ceiling microbench — plan v1
+# #1607 Cold-path hardware-ceiling microbench — plan v1 (KILLED)
 
-Status: DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR).
+Status: **PLAN-KILLED 2026-05-27 round 1** by convergent verdicts:
+
+- Codex (`task-mpoiptnt-dmw8n0`) — PLAN-KILL
+- Antigravity (`adversarial-review-mpoiqabw-y5s6ga`) — PLAN-KILL
+- Claude SMR — PLAN-NEEDS-MAJOR (`docs/pr/1607-hw-ceiling-microbench/claude-smr-plan-r1.md`)
+
+Convergent hard-fatal findings (verbatim summary; full verdicts on
+file as referenced above):
+
+1. **TCP cold-path sample starvation** — `iperf3 -P 12 -t 30 -l 64`
+   yields ~12 cold-path samples over a 30 s run (one per stream
+   handshake). Statistically useless. The escape valve (UDP
+   flooder with per-packet randomized 5-tuples) is deferred to
+   round-2 / future-extension stub in v1, so the default-mode
+   harness produces no usable data.
+2. **Wire-byte misrepresentation** — `iperf3 -l 64` is the
+   application-write size; on-wire frame is ~130 B v4 / ~150 B v6.
+   The harness name and §4.5 Scale Target table both misrepresent
+   the measurement as 64 B linerate.
+3. **Timer overhead dominates the budget being measured** —
+   2 × `clock_gettime(CLOCK_MONOTONIC)` via vDSO = ~50–60 ns; the
+   #1605-cited 270 ns budget makes this ~18–22 % measurement
+   bias. Per-call wrapper measures the wrapper, not the policy
+   engine. AGY explicitly: "20% of CPU cycles executing the
+   profiling timers". The plan's «<1 % overhead because cold path
+   is 100s of ns minimum» assertion was wrong.
+4. **CPU isolation absent** — `test/incus/cluster-setup.sh`
+   `limits.cpu: 4` with 6 worker threads (oversubscribed), no
+   `taskset`/`cpuset`/IRQ pinning, `xpfd.service:19` explicitly
+   confirms `CPUAffinity=` is NOT shipped. Per-worker Mpps
+   numbers are structurally confounded by IRQ steal and
+   scheduler placement.
+5. **Per-worker histogram architectural mismatch (AGY)** —
+   aggregating policy latency per-worker hides the per-zone-pair
+   cliff. A high-traffic 10-rule zone-pair drowns out the
+   100K-rule zone-pair that JIT trigger logic (#1605 Phase 4)
+   needs to detect. Wrong granularity for the question this
+   PR was built to answer.
+
+Per `.claude/skills/triple-review/SKILL.md` Step 4, two-of-three
+PLAN-KILL is the stopping condition. No code was written. No
+PR was opened.
+
+If this is revisited, the v2 plan MUST address all five
+findings up front, NOT as round-2 escape valves:
+
+- Ship a real UDP-with-randomized-source-port packet generator
+  (Rust or Go, ~50 LOC) as the default mode. iperf3-style TCP
+  becomes a smoke-only mode that verifies the counter
+  increments at all.
+- Use TSC (`rdtsc`/`rdtscp`) or 1-in-1000 sampling, not
+  per-call `clock_gettime`. Calibrate and report the empty-
+  wrapper baseline as a separate number.
+- Use a dedicated wider histogram (24 buckets, ~4 s ceiling,
+  with overflow-samples sentinel) so the 1M-rule tail is
+  visible.
+- Pin workers + NIC IRQs to disjoint core sets; bump VM
+  `limits.cpu` to at least 8; record the affinity state in
+  the run artifact.
+- Add per-(zone-pair, rule-count-bucket) cardinality to the
+  histogram, OR explicitly scope this PR to "uniform workload
+  cold-path cost only" and file a separate issue for the
+  per-zone-pair cliff detection JIT-trigger needs.
+
+The original v1 plan content follows for archival.
+
+---
+
+(v1 plan as originally submitted — content preserved verbatim for
+the record; superseded by the PLAN-KILL verdict above.)
 
 ## 1. Issue framing
 
