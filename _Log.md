@@ -45,6 +45,45 @@
   Codex-stuck exception. `<!-- AWAITING-BATCH-MERGE -->` posted.
 - **Closes**: #1348.
 
+## 2026-05-26 23:54 UTC — #1543 screen + SYN-cookie split (Wave-5)
+
+- **Timestamp**: 2026-05-26 23:54 UTC
+  - **Action**: Decomposed `userspace-dp/src/screen.rs` (1420 LOC) into
+    sibling submodules under `userspace-dp/src/screen/` per the
+    `module/foo.rs` convention (no `screen_` prefix). Pure code motion;
+    no behavior change. ScreenState orchestrator stays in `mod.rs`;
+    stateless free-fn helpers (LAND, TCP flag screens, ping-of-death,
+    teardrop, ICMP fragment, source-route) extracted to
+    `stateless.rs`; SYN-cookie crypto + cache + SipHash24 isolated
+    in `syncookie.rs`. AGY round-1 PLAN-NEEDS-MINOR fix-ups
+    incorporated as v2 (SipHash24 + SynCookieValidatedCache pub(crate)
+    re-exported under `#[cfg(test)]`; line-range typo fix). AGY
+    round-2 PLAN-READY. Codex sandbox infra-blocked across 3
+    rescue retries (`codex-linux-sandbox` binary path persistently
+    broken); proceeded under the Codex-stuck 3-of-4 exception per
+    Wave-5 rules with Claude SMR as the third independent
+    attestation.
+  - **Tests**: cargo build clean (release + dev); cargo test 1506/1507
+    pass (only failure is the pre-existing
+    `snat_contract_documents_current_fail_closed_runtime` integration
+    test which also fails on `origin/master`, unrelated to #1543);
+    screen module tests 83/83 pass 5x flake; Go suite passes on 30
+    packages.
+  - **File(s)**:
+    - userspace-dp/src/screen/mod.rs (new — orchestrator + ScreenState)
+    - userspace-dp/src/screen/packet.rs (new — ScreenPacketInfo, ScreenProfile, ScreenVerdict, PROTO_* / TCP_* constants)
+    - userspace-dp/src/screen/syncookie.rs (new — SynCookieCodec, SipHash24, SynCookieValidatedCache)
+    - userspace-dp/src/screen/rate.rs (new — RateCounter)
+    - userspace-dp/src/screen/stateless.rs (new — pure check helpers)
+    - userspace-dp/src/screen/scan.rs (new — PortScan / IpSweep trackers)
+    - userspace-dp/src/screen/session_limit.rs (new — SessionLimitTracker)
+    - userspace-dp/src/screen/extract.rs (new — extract_screen_info)
+    - userspace-dp/src/screen/tests.rs (renamed from userspace-dp/src/screen_tests.rs)
+    - userspace-dp/src/screen.rs (deleted — split across siblings)
+    - docs/pr/1543-screen-syn-cookie-split/plan.md (v2)
+    - docs/pr/1543-screen-syn-cookie-split/reviewer-ids.md
+    - _Log.md (this entry).
+
 ## 2026-05-26 22:46 UTC — #1439 snapshot.go split (rebase carry-forward)
 
 - **Timestamp**: 2026-05-26 22:46 UTC
