@@ -1,5 +1,14 @@
 # Action Log
 
+Entries are loosely time-ordered; recent entries land at the top.
+Within a topic, entries run reverse-chronological (newest first).
+
+## 2026-05-27 01:30 UTC — #1598 Copilot review addressed
+
+- **Timestamp**: 2026-05-27 01:30 UTC
+- **Action**: Addressed four Copilot inline comments on PR #1600. (1) Rewrote the function-level doc above `queue_uses_shared_exact_service` so it no longer claims non-exact queues are never shared; new doc explains that the gate is now threshold-only, and that the exact/non-exact distinction lives at the lease + V_min allocation gates (coordinator/mod.rs:1058 and :1145). (2) Replaced `feedback_cross_binding_impossible in memory` reference in the inline comment with a stable in-repo reference (PR #680/#690 + the plan doc). (3) Updated both new test fixtures to set `guarantee_enabled=false` AND `exact=false`, so the fixtures actually mirror the production uncapped-class shape (no transmit-rate at all, not just non-exact-with-rate). (4) Restored reverse-chronological log ordering and added a header note explaining the convention.
+- **File(s)**: `userspace-dp/src/afxdp/worker/cos/mod.rs`, `userspace-dp/src/afxdp/worker/cos/tests.rs`, `_Log.md`
+
 ## 2026-05-26 13:25 UTC — #1598 implementation + tests pass
 
 - **Timestamp**: 2026-05-26 13:25 UTC
@@ -9,13 +18,13 @@
 ## 2026-05-26 12:50 UTC — #1598 plan v2 (after round-1 reviewer split)
 
 - **Timestamp**: 2026-05-26 12:50 UTC
-- **Action**: Updated plan to v2 incorporating round-1 reviewer outcomes. Codex PLAN-KILL was infra-blocked (sandbox runner missing); AGY round-1 verdict PLAN-READY after walking the actual files. Added explicit trace of `build_worker_cos_owner_live_by_tx_ifindex` showing `tx_owner_live` is per-worker local (loop_body/mod.rs:91-95), so Step2 never funnels foreign-worker. Documented residual concern about non-binding workers (not applicable to the loss userspace cluster which has every worker bound to reth0.80 mlx5 VF). Re-dispatching Codex (task task-mpnbpfz0-mz69n4).
+- **Action**: Updated plan to v2 incorporating round-1 reviewer outcomes. Codex PLAN-KILL was infra-blocked (sandbox runner missing); AGY round-1 verdict PLAN-READY after walking the actual files. Added explicit trace of `build_worker_cos_owner_live_by_tx_ifindex` showing `tx_owner_live` is per-worker local (loop_body/mod.rs:91-95), so Step2 never funnels foreign-worker. Documented residual concern about non-binding workers (not applicable to the loss userspace cluster which has every worker bound to reth0.80 mlx5 VF). Re-dispatching Codex.
 - **File(s)**: `docs/pr/1598-cos-uncapped-fix/plan.md`
 
 ## 2026-05-26 12:30 UTC — #1598 plan v1 (CoS iperf-uncapped caps at ~10 Gbps)
 
 - **Timestamp**: 2026-05-26 12:30 UTC
-- **Action**: Drafted plan v1 for #1598. Root-cause identified at `userspace-dp/src/afxdp/worker/cos/mod.rs:126-131` — `queue_uses_shared_exact_service` early-returns false on `!queue.exact`, excluding the uncapped non-exact queue from sharded multi-worker drain. This forces 100% of class-11 traffic through a single `owner_worker_id` (built at `coordinator/mod.rs:900-904`), hitting the per-worker AF_XDP UMEM ceiling (~6-10 Gbps per `feedback_cross_binding_impossible`). The 24g/exact queue escapes this because it trips the same gate with `exact=true && rate >= 312 MB/s`.
+- **Action**: Drafted plan v1 for #1598. Root-cause identified at `userspace-dp/src/afxdp/worker/cos/mod.rs:126-131` — `queue_uses_shared_exact_service` early-returns false on `!queue.exact`, excluding the uncapped non-exact queue from sharded multi-worker drain. This forces 100% of class-11 traffic through a single `owner_worker_id` (built at `coordinator/mod.rs:900-904`), hitting the per-worker AF_XDP UMEM ceiling. The 24g/exact queue escapes this because it trips the same gate with `exact=true && rate >= 312 MB/s`.
 - **File(s)**: `docs/pr/1598-cos-uncapped-fix/plan.md`
 
 ## 2026-05-26 23:10 UTC — #1578 cluster perf root-cause (smoke target IP misalignment)
