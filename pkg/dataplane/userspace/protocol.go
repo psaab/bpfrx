@@ -840,6 +840,36 @@ type WorkerRuntimeStatus struct {
 	WallNS60s      uint64 `json:"wall_ns_60s,omitempty"`
 	ActiveNS60s    uint64 `json:"active_ns_60s,omitempty"`
 	WindowNS       uint64 `json:"window_ns,omitempty"`
+
+	// === #1621 cold-path histogram surface ===
+	//
+	// Mirrors the Rust WorkerColdPathCounters fields. All Vec fields
+	// use omitempty so an empty histogram (older Rust daemon, or
+	// worker that didn't get any cold-path samples this window)
+	// omits the field from the wire; the Go-side nil/empty values
+	// flow through to the Prometheus emitter which skips on empty.
+	// Per feedback_wire_protocol_both_sides.
+	//
+	// Aggregated PER WORKER: when a worker owns multiple bindings,
+	// the published values reflect the cross-binding merge performed
+	// at the publish tick (sum for histogram data, OR for alias_seen,
+	// first-non-zero for first_key).
+	ColdPathHist                  [][]uint64 `json:"cold_path_hist,omitempty"`
+	ColdPathSumNS                 []uint64   `json:"cold_path_sum_ns,omitempty"`
+	ColdPathSamples               []uint64   `json:"cold_path_samples,omitempty"`
+	ColdPathFirstKey              []uint64   `json:"cold_path_first_key,omitempty"`
+	ColdPathAliasSeen             []bool     `json:"cold_path_alias_seen,omitempty"`
+	ColdPathSamplePhase           uint64     `json:"cold_path_sample_phase,omitempty"`
+	ColdPathWrapperUnderflowCount uint64     `json:"cold_path_wrapper_underflow_count,omitempty"`
+	ColdPathNSPerTSCQ32           uint64     `json:"cold_path_ns_per_tsc_q32,omitempty"`
+	ColdPathWrapperNSBaseline     uint64     `json:"cold_path_wrapper_ns_baseline,omitempty"`
+	// "tsc" / "clock_gettime" / "" (Unset). Harness gates Table
+	// publication on == "tsc" for every worker.
+	ColdPathClockSource string `json:"cold_path_clock_source,omitempty"`
+	// #1621 plan v2: monotonic count of snapshot() calls at the
+	// coordinator status path that exhausted their retry budget.
+	// Surfaced as xpf_userspace_worker_cold_path_snapshot_failed_total.
+	ColdPathSnapshotFailed uint64 `json:"cold_path_snapshot_failed,omitempty"`
 }
 
 type HAGroupStatus struct {

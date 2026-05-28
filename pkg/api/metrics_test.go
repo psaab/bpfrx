@@ -58,9 +58,13 @@ func TestEmitWorkerRuntime_DeadGaugeReflectsDeadFlag(t *testing.T) {
 	got := collectFromEmitWorkerRuntime(t, c, status)
 
 	// Each worker emits 9 counters + 1 dead gauge + 1 last-60s gauge,
-	// 1 window-width gauge, and 2 session-table gauges = 14 metrics.
-	if len(got) != 3*14 {
-		t.Fatalf("emitWorkerRuntime: want 42 metrics for 3 workers, got %d", len(got))
+	// 1 window-width gauge, 2 session-table gauges = 14 metrics +
+	// #1621 cold-path always-emitted metrics (4 per-worker scalars
+	// + clock_source gauge + snapshot_failed counter = 6) = 20.
+	// Per-slot/per-bucket metrics need non-empty Vec fields which
+	// these test fixtures don't populate, so they're zero here.
+	if len(got) != 3*20 {
+		t.Fatalf("emitWorkerRuntime: want %d metrics for 3 workers, got %d", 3*20, len(got))
 	}
 
 	// Gather just the dead-gauge entries, keyed by worker_id label.
@@ -178,6 +182,20 @@ func newCollectorWithWorkerDescsOnly() *xpfCollector {
 	mk := func(name string) *prometheus.Desc {
 		return prometheus.NewDesc(name, name, []string{"worker_id"}, nil)
 	}
+	// #1621: cold-path emission requires per-(worker, slot[, le])
+	// descriptors with different label sets.
+	mkSlot := func(name string) *prometheus.Desc {
+		return prometheus.NewDesc(name, name,
+			[]string{"worker_id", "zone_pair_slot"}, nil)
+	}
+	mkBucket := func(name string) *prometheus.Desc {
+		return prometheus.NewDesc(name, name,
+			[]string{"worker_id", "zone_pair_slot", "le"}, nil)
+	}
+	mkSource := func(name string) *prometheus.Desc {
+		return prometheus.NewDesc(name, name,
+			[]string{"worker_id", "source"}, nil)
+	}
 	return &xpfCollector{
 		workerWallSecs:                           mk("xpf_userspace_worker_wall_seconds_total"),
 		workerActiveSecs:                         mk("xpf_userspace_worker_active_seconds_total"),
@@ -193,6 +211,17 @@ func newCollectorWithWorkerDescsOnly() *xpfCollector {
 		workerSessionTableEntries:                mk("xpf_userspace_worker_session_table_entries"),
 		workerSessionTableCapacity:               mk("xpf_userspace_worker_session_table_capacity"),
 		workerDead:                               mk("xpf_userspace_worker_dead"),
+		// #1621 cold-path descriptors.
+		workerColdPathBucket:              mkBucket("xpf_userspace_worker_cold_path_ns_bucket"),
+		workerColdPathSamples:             mkSlot("xpf_userspace_worker_cold_path_samples_total"),
+		workerColdPathSumNS:               mkSlot("xpf_userspace_worker_cold_path_sum_ns_total"),
+		workerColdPathAliasSeen:           mkSlot("xpf_userspace_worker_cold_path_alias_seen"),
+		workerColdPathSamplePhase:         mk("xpf_userspace_worker_cold_path_sample_phase_total"),
+		workerColdPathWrapperUnderflow:    mk("xpf_userspace_worker_cold_path_wrapper_underflow_count_total"),
+		workerColdPathWrapperNSBaseline:   mk("xpf_userspace_worker_cold_path_wrapper_ns_baseline"),
+		workerColdPathNSPerTSCQ32:         mk("xpf_userspace_worker_cold_path_ns_per_tsc_q32"),
+		workerColdPathClockSource:         mkSource("xpf_userspace_worker_cold_path_clock_source"),
+		workerColdPathSnapshotFailedTotal: mk("xpf_userspace_worker_cold_path_snapshot_failed_total"),
 	}
 }
 
@@ -237,6 +266,17 @@ func collectFromEmitWorkerRuntime(
 		c.workerSessionTableEntries:                {},
 		c.workerSessionTableCapacity:               {},
 		c.workerDead:                               {},
+		// #1621 cold-path descriptors.
+		c.workerColdPathBucket:                  {},
+		c.workerColdPathSamples:                 {},
+		c.workerColdPathSumNS:                   {},
+		c.workerColdPathAliasSeen:               {},
+		c.workerColdPathSamplePhase:             {},
+		c.workerColdPathWrapperUnderflow:        {},
+		c.workerColdPathWrapperNSBaseline:       {},
+		c.workerColdPathNSPerTSCQ32:             {},
+		c.workerColdPathClockSource:             {},
+		c.workerColdPathSnapshotFailedTotal:     {},
 	}
 	for _, m := range got {
 		if _, ok := expected[m.Desc()]; !ok {

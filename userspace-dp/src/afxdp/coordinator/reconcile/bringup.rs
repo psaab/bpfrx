@@ -214,6 +214,16 @@ pub(super) fn bring_up_workers(
             crate::afxdp::worker_runtime::WorkerRuntimeAtomics::new(),
         );
         let runtime_atomics_clone = runtime_atomics.clone();
+        // #1621: sibling per-worker WorkerColdPathAtomics, allocated
+        // alongside the runtime_atomics so the publish + snapshot
+        // contract is symmetric across the two seqlocks (window_gen +
+        // cold_window_gen). Worker thread writes via
+        // publish_from_local() each ~1s tick; coordinator status path
+        // reads via snapshot() at each /metrics scrape.
+        let cold_path_atomics = std::sync::Arc::new(
+            crate::afxdp::cold_path_hist::WorkerColdPathAtomics::new(),
+        );
+        let cold_path_atomics_clone = cold_path_atomics.clone();
         // #925 Phase 1: per-worker panic slot, keyed by worker_id.
         // Paired with `coord.worker_panics.remove(&worker_id)` on
         // the spawn-Err arm below — DO NOT split that pairing across
@@ -261,6 +271,7 @@ pub(super) fn bring_up_workers(
                     shared_mirror_targets,
                     cos_status_clone,
                     runtime_atomics_clone,
+                    cold_path_atomics_clone,
                 );
             },
         );
@@ -279,6 +290,7 @@ pub(super) fn bring_up_workers(
                         session_export_ack,
                         cos_status,
                         runtime_atomics,
+                        cold_path_atomics,
                         join: Some(join),
                     },
                 );

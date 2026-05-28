@@ -265,6 +265,28 @@ impl super::Coordinator {
                 } else {
                     String::new()
                 };
+                // #1621: snapshot the sibling cold_path_atomics under
+                // its cold_window_gen seqlock. When the retry budget
+                // exhausts (heavy concurrent publish contention) we
+                // emit empty fields rather than stale values, per
+                // #1619 AGY code-r2 finding 2. Per Claude SMR plan-r1
+                // F4: the clock_source GAUGE is still emitted by the
+                // Prometheus path even on snapshot None so dashboards
+                // can distinguish "tsc active" from "no data scrape".
+                let cold = handle
+                    .cold_path_atomics
+                    .snapshot()
+                    .unwrap_or_default();
+                // #1621 plan v2: read snapshot_failed AFTER snapshot()
+                // so the counter reflects whether THIS scrape exhausted
+                // its retry budget (incremented inside snapshot()).
+                let cold_snapshot_failed =
+                    handle.cold_path_atomics.snapshot_failed_count();
+                let cold_hist: Vec<Vec<u64>> = cold
+                    .buckets
+                    .iter()
+                    .map(|row| row.to_vec())
+                    .collect();
                 crate::protocol::WorkerRuntimeStatus {
                     worker_id: *worker_id,
                     tid: handle.runtime_atomics.tid(),
@@ -286,6 +308,19 @@ impl super::Coordinator {
                     wall_ns_60s: w.wall_ns,
                     active_ns_60s: w.active_ns,
                     window_ns: w.window_ns,
+                    // #1621 cold-path histogram fields.
+                    cold_path_hist: cold_hist,
+                    cold_path_sum_ns: cold.sum_ns.to_vec(),
+                    cold_path_samples: cold.samples.to_vec(),
+                    cold_path_first_key: cold.first_key.to_vec(),
+                    cold_path_alias_seen: cold.alias_seen.to_vec(),
+                    cold_path_sample_phase: cold.sample_phase,
+                    cold_path_wrapper_underflow_count: cold
+                        .wrapper_underflow_count,
+                    cold_path_ns_per_tsc_q32: cold.ns_per_tsc_q32,
+                    cold_path_wrapper_ns_baseline: cold.wrapper_ns_baseline,
+                    cold_path_clock_source: cold.clock_source.as_str().to_string(),
+                    cold_path_snapshot_failed: cold_snapshot_failed,
                 }
             })
             .collect()

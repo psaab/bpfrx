@@ -1,5 +1,37 @@
 # #1621 step-3 follow-up C: wire protocol (Rust + Go) + Prometheus emitter for cold-path histogram
 
+**Status**: DRAFT v2 — round-1 resolution. Codex r1 PLAN-NEEDS-MAJOR
+(5 blocking findings); AGY r1 PLAN-NEEDS-MINOR (5 findings); Claude
+SMR r1 PLAN-NEEDS-MINOR. Strong 3-way consensus on F2/F3/F4/F5 plus
+Codex's catch on omitempty + fixed-array (already implemented as Vec).
+
+## v1 → v2 fatal-axis resolution map
+
+| Reviewer / finding | v2 fix | Section |
+|--------------------|--------|---------|
+| Codex F1 + AGY: omitempty + fixed-array would never omit | v1 already specifies `Vec<Vec<u64>>` not `[[u64; 24]; 16]` — Codex misread the Rust shape. v2 makes this explicit: ALL `cold_path_*` Vec fields use `Vec<>` not fixed array, so an all-zero slot vector still ships unless explicitly emptied (which the harness sees as "data with all-zero buckets" not "no data"). The implementation populates Vec from `cold.buckets.to_vec()` etc. so a worker that's never been calibrated has zero-length Vec fields → omitempty omits. ✓ | §4.3 + §4.4 |
+| Codex F2 + AGY r1 F1: cross-binding merge first_key/alias_seen contract | v1 §4.2 pseudocode correctly handles the nonzero-mismatch case: `else if src.first_key[slot] != 0 && src.first_key[slot] != merged.first_key[slot] { merged.alias_seen[slot] = true }`. Codex misread; the case IS handled. v2 keeps the pseudocode and adds a 4-case test matrix to make it harder to misread. | §4.2 |
+| Codex F3 + AGY r1 F6 + Claude SMR F5: bucket_hi_ns label → le for PromQL | v2 switches to `le` (less-than-or-equal — Prometheus histogram convention). The metric name `xpf_userspace_worker_cold_path_ns_bucket{worker_id, zone_pair_slot, le}` is fully PromQL-compatible with `histogram_quantile(0.99, sum by (le) (rate(...[5m])))`. | §4.5 |
+| Codex F4 + AGY r1 F5 + Claude SMR F2: missing ns_per_tsc_q32 emission | v2 adds 9th metric `xpf_userspace_worker_cold_path_ns_per_tsc_q32{worker_id}` (Gauge). Cardinality: +6 series, trivial. | §4.5 |
+| Codex F5 + AGY r1 F3: snapshot None contract — silent emptying hides starvation | v2 adopts AGY's recommendation: add `snapshot_failed: AtomicU64` on `WorkerColdPathAtomics`; `snapshot()` increments it on retry-budget-exhaust and returns None; coordinator status path emits empty fields BUT the Prometheus path always emits `xpf_userspace_worker_cold_path_snapshot_failed_total{worker_id}` Counter so operators can detect starvation. 10th metric, +6 series. | §4.4 + §4.5 |
+| AGY r1 F1: scalar fields need `skip_serializing_if = "u64_is_zero"` | v2 adopts: `cold_path_sample_phase`, `cold_path_wrapper_underflow_count`, `cold_path_ns_per_tsc_q32`, `cold_path_wrapper_ns_baseline` all gain `skip_serializing_if = "crate::protocol::u64_is_zero"`. An uncalibrated worker emits ZERO cold-path fields on the wire (matches Go omitempty behavior). | §4.3 |
+| Claude SMR F4: clock_source gauge always-present | v2 §4.5 emits the clock_source gauge always (1.0 when "tsc"/"clock_gettime", 0.0 when ""). Operator dashboards distinguish "tsc active" from "no data this scrape". | §4.5 |
+| Claude SMR F3: clock_source omitempty truth table walk | v2 §4.3 adds explicit Go-side `omitempty` walk for `cold_path_clock_source: String`. Walk both directions, four daemon-version combinations. | §4.3 |
+
+Round-1 attestation:
+- **Codex** task-mppoxwhb-gv1uga: PLAN-NEEDS-MAJOR (CONCEPTUAL; sandbox-broken).
+  Five blocking findings, one of which (cross-binding merge) was a misread.
+- **AGY** adversarial-review-mppoygka-g7v9r9: PLAN-NEEDS-MINOR (5 axes
+  with concrete amendments + 5 axes verified clean).
+- **Claude SMR** claude-smr-plan-r1.md: PLAN-NEEDS-MINOR (F1-F5).
+
+Three-way + AGY convergence on:
+- bucket label → `le`
+- add ns_per_tsc_q32 gauge
+- snapshot_failed counter for starvation observability
+- clock_source always-present gauge
+- scalar fields with `u64_is_zero` skip
+
 **Status**: DRAFT v1 — pending adversarial plan review
 **Branch**: `refactor/1621-cold-path-wire-prometheus`
 **Parents**: #1612 step-3 scaffolding (#1619 merged), #1620 BindingWorker
