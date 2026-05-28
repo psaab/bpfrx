@@ -285,9 +285,16 @@ impl super::Coordinator {
                 // WorkerRuntimeStatus byte-identical to a pre-#1621
                 // daemon's output, validating the wire-invariant
                 // contract (and the protocol_wire_v1.json fixture).
+                // ORDER MATTERS (Claude SMR code-r1 catch): call
+                // snapshot() FIRST so any retry-exhaust fetch_add inside
+                // snapshot() is visible to the snapshot_failed_count()
+                // read below. Without this order, a failure on THIS
+                // scrape would only show up on the NEXT scrape (1-tick
+                // lag), making the operator's starvation-alert dashboard
+                // one cycle late.
+                let cold_opt = handle.cold_path_atomics.snapshot();
                 let cold_snapshot_failed =
                     handle.cold_path_atomics.snapshot_failed_count();
-                let cold_opt = handle.cold_path_atomics.snapshot();
                 let has_data = cold_opt
                     .as_ref()
                     .map(|c| {
