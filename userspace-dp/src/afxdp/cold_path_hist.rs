@@ -114,7 +114,17 @@ pub(in crate::afxdp) fn zone_pair_slot(from_zone_id: u16, to_zone_id: u16) -> us
 #[inline]
 #[cfg(target_arch = "x86_64")]
 pub(in crate::afxdp) fn sample_tsc() -> u64 {
+    // AGY r3 finding 3 fix: add hardware `lfence` before the
+    // `rdtscp` read to prevent CPU out-of-order execution from
+    // dispatching the TSC read before prior instrumented stores
+    // complete. `compiler_fence(SeqCst)` alone prevents compiler
+    // reordering but NOT hardware reordering — Intel SDM §17.17
+    // specifies `lfence; rdtsc` (or `rdtscp` which is partially
+    // serializing on the wait-for-prior-completion side) as the
+    // canonical recipe. We pair both: compiler_fence keeps the
+    // compiler honest, `_mm_lfence` keeps the CPU honest.
     compiler_fence(Ordering::SeqCst);
+    unsafe { core::arch::x86_64::_mm_lfence() };
     let mut _aux: u32 = 0;
     let tsc = unsafe { core::arch::x86_64::__rdtscp(&mut _aux) };
     compiler_fence(Ordering::SeqCst);

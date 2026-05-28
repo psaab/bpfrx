@@ -489,14 +489,41 @@ if self.first_key[slot] == 0 {
 }
 ```
 
-Publication gate: any slot with `alias_seen[slot] == true` is
-**excluded** from Tables A1/A2 for the run. The raw TSV retains
-all slot samples with the alias flag so re-analysis is possible.
+Publication gate (per-worker only): any slot with
+`alias_seen[slot] == true` for any worker is **excluded** from
+Tables A1/A2 for the run.
+
+**Cross-worker publication gate (AGY r3 finding 2)**: per-worker
+`alias_seen` is NOT sufficient on its own. AGY proved a
+cross-worker false-pass mode: if key K (e.g. trust→dmz) maps to
+slot 3 and is seen only by Worker 0, while key L (e.g.
+untrust→trust) also maps to slot 3 and is seen only by Worker 1,
+both workers' `alias_seen[3] == false` — but aggregating slot 3
+across all workers silently mixes K and L's latency distributions.
+
+The harness MUST also validate that for every slot S used in
+Tables A1/A2 publication, ALL workers reporting non-zero samples
+in slot S report the SAME `first_key[S]` value. If two workers
+disagree on `first_key[S]`, the slot is marked
+`cross_worker_aliased = true` and excluded from publication.
+Pseudo-code:
+
+```python
+def slot_safe_to_publish(slot, worker_snapshots):
+    keys_seen = {snap.first_key[slot] for snap in worker_snapshots
+                 if snap.samples[slot] > 0 and snap.first_key[slot] != 0}
+    any_alias = any(snap.alias_seen[slot] for snap in worker_snapshots)
+    return len(keys_seen) <= 1 and not any_alias
+```
+
+The raw TSV retains all slot samples with the alias flag so
+re-analysis is possible.
 
 The v1/v2 XOR-rolling design failed because XOR cancels: with
 `count(K)` odd and `count(L)` even, final XOR == K — false-pass.
-`first_key + alias_seen` is monotonic and provably cannot
-false-pass.
+`first_key + alias_seen` is monotonic per worker and provably
+cannot per-worker false-pass; the harness cross-worker key-set
+check closes the multi-worker collision gap.
 
 ### 3.5 Wire-protocol both-sides drift
 
