@@ -8,6 +8,12 @@
 
 ## Plan-review round 2 (plan v2)
 
-- Codex: task-mpoxxoi2-lcj5po
-- AGY:   adversarial-review-mpoxxv31-f1ylaj
+- Codex: task-mpoxxoi2-lcj5po (NEEDS-MAJOR)
+- AGY:   adversarial-review-mpoxxv31-f1ylaj (NEEDS-MINOR)
 - Claude SMR: claude-smr-plan-r2.md (PLAN-READY)
+
+## Plan-review round 3 (plan v3)
+
+- Codex: task-mpoyqsg3-kz70ue
+- AGY:   adversarial-review-mpoyqyps-lt2o4w
+- Claude SMR: claude-smr-plan-r3.md (PLAN-READY)
