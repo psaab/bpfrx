@@ -431,13 +431,16 @@ impl SysctlReader for RealSysctlReader {
 /// Fail-closed computation of the pending-neighbor drop timeout.
 ///
 /// Returns `PENDING_NEIGH_TIMEOUT_FAST_NS` (800ms) only if EVERY checked
-/// `retrans_time_ms` sysctl reads <= 250 (v4 AND v6, every dataplane
-/// interface plus the `default` template). Any read failure or any value
-/// > 250 falls back to `super::PENDING_NEIGH_TIMEOUT_NS` (2000ms) and
-/// emits a one-shot operator warning — if PR-1's sysctl never applied
-/// (restricted container, sysctl namespace, admin override), dropping at
-/// 800ms before the kernel's first 1000ms wire solicit would REGRESS the
-/// baseline, so we keep the safe default.
+/// `retrans_time_ms` sysctl reads <= `NEIGH_RETRANS_FAST_THRESHOLD_MS`
+/// (300ms; v4 AND v6, every dataplane interface plus the `default`
+/// template). The threshold is above the jiffy-rounded 252ms readback on
+/// HZ=100 hosts but far below the 1000ms default, so a correctly-applied
+/// sysctl is always admitted. Any read failure or any value above the
+/// threshold falls back to `super::PENDING_NEIGH_TIMEOUT_NS` (2000ms)
+/// and emits a per-snapshot operator warning — if PR-1's sysctl never
+/// applied (restricted container, sysctl namespace, admin override),
+/// dropping at 800ms before the kernel's first 1000ms wire solicit would
+/// REGRESS the baseline, so we keep the safe default.
 pub(in crate::afxdp) fn compute_pending_neigh_timeout_ns<R: SysctlReader>(
     ifindex_to_name: &FastMap<i32, String>,
     reader: &R,
