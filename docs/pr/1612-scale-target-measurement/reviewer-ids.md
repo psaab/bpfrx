@@ -48,9 +48,12 @@ here so continuations can fetch by ID.
 
 ## Round 5 — PR #1619 code review (STAGED scaffolding ship)
 
-| Reviewer | Task ID | Status | Verdict |
-|----------|---------|--------|---------|
-| Copilot | PR #1619 reviewer-bot | dispatched 2026-05-28 | pending |
-| Codex | (will dispatch on PR diff) | pending | pending |
-| AGY | (will dispatch on PR diff) | pending | pending |
-| Claude SMR | (in conversation) | done | CODE-READY for STAGED scaffolding scope |
+| Reviewer | Task ID / SHA | Verdict |
+|----------|---------------|---------|
+| Claude SMR code-r1 | `docs/pr/1612-scale-target-measurement/claude-smr-code-r1.md` @ `8f28b6badef7` | CODE-READY |
+| Codex code-r1 | foreground codex exec embedded-files @ `8f28b6badef7` | CODE-NEEDS-MAJOR (3 findings: lfence end-side, CPUID rdtscp probe, Instant docstring) — resolved in `c0c8a7e91065` |
+| Codex code-r2 | foreground codex exec embedded-files @ `c0c8a7e91065` | CODE-READY-WITH-NIT (2 NITs: stale clock_source doc, RDTSCP test gate) — resolved in `0b8a1bdba` |
+| AGY adversarial code-r1 | `adversarial-review-mpp3is8d-ann17h` @ `c0c8a7e91065` | CODE-READY-WITH-NIT (2 NITs: LFENCE+RDTSCP redundant [non-blocking], substring grep false-positive) — substring NIT resolved in `3bb1a0ae6` |
+| Copilot code-r1a | PR #1619 reviewer-bot @ `76dcecd5478a` | COMMENTED (multiple inline findings on stale keys_xor / payload counts / fence docs) — all resolved by `c0c8a7e91`/`0b8a1bdba`/`f55958b29` |
+| Copilot code-r1b | PR #1619 reviewer-bot @ `d2b41b9cfd03` | COMMENTED (additional inline findings on alias search domain msg, sample_tsc alias as foot-gun, snapshot test naming) — all resolved by `f55958b29` |
+| Copilot code-r2 | PR #1619 reviewer-bot @ `f55958b29651` (re-review requested) | pending |
