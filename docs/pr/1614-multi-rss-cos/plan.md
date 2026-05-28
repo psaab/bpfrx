@@ -1,21 +1,33 @@
-# #1614 CoS Scheduler Oversubscription Semantics — Plan v4
+# #1614 CoS Scheduler Oversubscription Semantics — Plan v5
 
 Status: DRAFT for plan-review round 3.
 Branch: `refactor/1614-multi-rss-cos`
 Base: `origin/master` @ `6c26c40e6` (#1611 cold-path-flooder runner body)
 
-v4 supersedes plan v3 (commit `8589fe9a4`) after Claude SMR r2
-identified a fatal algorithm inconsistency (F4 — v3 A1.4
-double-counted Phase 1 partial honor + Phase 2 share) plus two
-substantive findings (S8 phase-0 sequencing, S9 mode renaming).
-v4 specifies a clean two-phase guaranteed-rate allocator with a
-single operator-tunable `guarantee_fraction` parameter; renames
-`strict-exact` → `guarantee-rate` to match Junos documentation;
-and moves the R8 gate-8 sanity check to an explicit Phase 0
-before any A1 implementation.
+v5 supersedes plan v4 (commit `10cfa2128`) after AGY r2 identified
+three structural findings, all confirmed mechanical fixes:
 
-The v3 changelog (v1+v2+v3 history) is retained below for
-auditability.
+  1. **Proportional Mode Divergence**: v4's algorithm at
+     `fraction=0.0` was NOT bit-for-bit identical to current
+     scheduler — it changed RR cursor to sorted ascending and
+     dynamic-scaled per-visit budget. Fix: explicit branch — if
+     mode is `proportional` (default), bypass new allocator and
+     run legacy `select_exact_cos_guarantee_queue_with_lease_telemetry`
+     unchanged. If `guarantee-rate > 0`, run new waterfill.
+
+  2. **Priority-Low Min-Share Coupling**: v4 admitted priority-low
+     to Pass 1 — which is zero-sized under default `fraction=0.0`,
+     starving priority-low. Fix: subtract min-share from `cap`
+     FIRST (`cap_eff = cap - priority_low_min_share_bytes`), then
+     run allocator on `cap_eff`. Priority-low is reserved
+     orthogonally to oversubscription policy.
+
+  3. **CoDel target ≤ RTT collision**: v4's 5ms target collides
+     with cluster's 5-7ms feedback RTT, causing oscillation +
+     #1217 Cstruct contract risk. Fix: scale target with RTT —
+     `codel-target = max(5ms, 1.5 × measured_RTT)`.
+
+The v3 / v4 changelogs are retained below for auditability.
 
 ## 0. What changed since v3 (then v2)
 
@@ -184,9 +196,32 @@ break-then-distribute-to-unhonored rule. v4 specifies a clean
 two-phase algorithm with explicit operator-tunable Pass 1 budget
 fraction.
 
-#### A1.1 Algorithm (final, v4)
+#### A1.1 Algorithm (v5 — explicit branch + min-share-first)
 
-Per `drain_shaped_tx` invocation:
+**Explicit mode branch (AGY r2 #1 fix)**:
+```
+if root.config.oversubscription_policy == Proportional
+   OR root.config.guarantee_fraction == 0.0:
+    // BIT-FOR-BIT IDENTICAL to current scheduler.
+    return select_exact_cos_guarantee_queue_with_lease_telemetry(root, ...)
+// else: run the new waterfill allocator below.
+```
+
+This eliminates the bit-for-bit divergence AGY r2 #1 raised. The
+new code path only activates when an operator explicitly opts in.
+
+**Priority-low min-share subtracted from cap first (AGY r2 #2 fix)**:
+```
+cap_eff = root.tokens - priority_low_min_share_bytes_this_pass
+// (priority-low gets its reserved min-share OUTSIDE the
+// allocator; admitted to Phase 3 surplus path that runs
+// regardless of mode.)
+```
+
+This makes priority-low survivability orthogonal to the
+oversubscription policy choice.
+
+Per `drain_shaped_tx` invocation (when `guarantee_fraction > 0`):
 
 - Let `cap` = available exact-class budget for this pass
   (`root.tokens` at entry; replenishes from `shaping_rate`).
@@ -355,33 +390,37 @@ Codex r1 #2 concern about debt growing faster than service:
 debt is BOUNDED per pass by `pass1_budget`, not accumulated
 across passes.
 
-### A2. Priority-low minimum share (work-conserving)
+### A2. Priority-low minimum share (work-conserving, ORTHOGONAL to A1)
 
-Add a configurable minimum share for priority-low queues.
-Default **5% of `shaping-rate`** (AGY's rationale: control-plane
-preservation).
+Per AGY r2 #2: priority-low min-share is ORTHOGONAL to
+oversubscription policy. Implemented by subtracting min-share
+from `root.tokens` BEFORE the A1 allocator runs, and admitting
+the priority-low queue to the surplus phase up to the min-share
+rate.
 
-Configurable via:
+Mechanism:
+```
+priority_low_min_share_pass = priority_low_min_share_bytes × elapsed_ns / 1e9
+cap_eff = root.tokens - priority_low_min_share_pass
+// Priority-low queue is admitted to Phase 3 (surplus) up to
+// min_share_pass; remaining cap_eff goes to A1.
+```
+
+Default: `priority_low_min_share_bytes = 0` (no min-share —
+preserves current behaviour). The fixture-level recommended
+default is 5% of shaping-rate, applied by the Go config-compiler
+when `oversubscription-policy guarantee-rate <X>` (X > 0) is
+selected. Operators can override per-interface via:
+
 ```
 set class-of-service interfaces <iface> unit <u> priority-low-min-share <bps|percent>
 ```
 
-Mechanism: priority-low queue is admitted to **Pass 1 set**
-alongside exact-guarantee queues with `R_eff =
-priority_low_min_share_bytes`. Above its min-share, falls back
-to **Pass 2 surplus** as today.
-
-Wire-protocol both-sides:
-- Go: `pkg/dataplane/userspace/protocol.go` (or equivalent — the
-  `CoSInterfaceSnapshot` definition; confirm exact file at
-  implementation time) adds `priority_low_min_share_bytes uint64`.
-- Rust: `userspace-dp/src/protocol/` matching field with
-  `#[serde(default)]`.
-
-Default value `0` means "no min-share" (preserving current
-behaviour). The fixture-level default `5%` is applied at the
-Go config-compile stage from the `oversubscription-policy`
-setting if `guarantee-rate` is selected.
+Wire-protocol both-sides (verified per AGY r2):
+- Go: `pkg/dataplane/userspace/protocol.go` `InterfaceSnapshot`
+  (L118 — verified) gains `CoSPriorityLowMinShareBytes uint64`.
+- Rust: `userspace-dp/src/protocol/snapshot.rs` `InterfaceSnapshot`
+  (L38 — verified) gains matching field with `#[serde(default)]`.
 
 ### A3. CoDel-style time-based AQM (replaces v1 ECN-WRED)
 
@@ -401,15 +440,29 @@ Implementation:
 - `userspace-dp/src/afxdp/cos/queue_ops.rs`: each queued item
   carries `enqueue_ns: u64`.
 - Dequeue path computes `sojourn = now_ns - oldest.enqueue_ns`;
-  if `sojourn > CODEL_TARGET_NS`, drop (or mark CE if ECT).
-- New const `CODEL_TARGET_NS: u64 = 5_000_000`.
-- Configurable per-queue via Junos knob
+  if `sojourn > codel_target_ns`, drop (or mark CE if ECT).
+- New const `CODEL_DEFAULT_TARGET_NS: u64 = 5_000_000` (RFC 8290
+  baseline).
+- **Per-queue tunable via Junos knob** (AGY r2 #3 fix):
   `set class-of-service schedulers <name> codel-target <ms>`;
   default 5 ms; `0` disables CoDel for the queue.
 
-This affects iperf3 default flows (NOT-ECT → drops at 5 ms
-sojourn instead of waiting for full buffer). Expected retrans
-reduction: 1500-2000 → ≤100 per class per 30 s.
+**RTT-aware tuning advice (AGY r2 #3)**: the cluster's documented
+post-shaper feedback RTT is 5-7 ms. A 5 ms CoDel target
+collides with RTT and risks TCP cwnd oscillation that elevates
+per-flow CoV beyond the #1217 Cstruct + 0.05 gate. Operators
+SHOULD set `codel-target = max(5ms, 1.5 × measured_RTT)` for
+their deployment. The smoke harness will measure RTT during
+Phase 0 and surface a recommended target. `docs/cos-traffic-shaping.md`
+will document this RTT-aware tuning rule.
+
+The default 5 ms target stays at RFC 8290 baseline, but the
+warning is documented per-config.
+
+This affects iperf3 default flows (NOT-ECT → drops at sojourn
+target instead of waiting for full buffer). Expected retrans
+reduction: 1500-2000 → ≤100 per class per 30 s **conditional on
+correct codel-target tuning per the RTT-aware rule above**.
 
 The existing ECN 33% threshold path **remains in place** for
 ECT(0)/ECT(1) flows; CoDel adds a sojourn-time gate that
