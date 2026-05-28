@@ -1,0 +1,46 @@
+0      0      best-effort     5         no     no         -              178.81 MiB  0            -             0         0       -          -
+DrainShape:   sent_bytes=78  guarantee=0  surplus=78  nonexact_while_exact_backlogged=0  park_root=0  park_queue=0
+1      1      iperf-100m      5         yes    yes        100.00 Mb/s    2.86 MiB    0            -             0         0       -          -
+DrainShape:   sent_bytes=585902705  guarantee=585902705  surplus=0  nonexact_while_exact_backlogged=0  park_root=0  park_queue=657529
+2      2      iperf-1g        5         yes    yes        1.00 Gb/s      22.89 MiB   0            -             0         0       -          -
+DrainShape:   sent_bytes=7152646494  guarantee=7152646494  surplus=0  nonexact_while_exact_backlogged=0  park_root=0  park_queue=956566
+3      3      iperf-3g        5         yes    yes        3.00 Gb/s      21.46 MiB   0            -             0         0       -          -
+DrainShape:   sent_bytes=17755344218  guarantee=17755344218  surplus=0  nonexact_while_exact_backlogged=0  park_root=0  park_queue=3781555
+4      4      iperf-6g        5         yes    yes        6.00 Gb/s      42.92 MiB   0            -             0         0       -          -
+DrainShape:   sent_bytes=38186654015  guarantee=38186654015  surplus=0  nonexact_while_exact_backlogged=0  park_root=0  park_queue=3858006
+5      5      iperf-9g        5         yes    yes        9.00 Gb/s      64.37 MiB   0            -             0         0       -          -
+DrainShape:   sent_bytes=52913157600  guarantee=52913157600  surplus=0  nonexact_while_exact_backlogged=0  park_root=0  park_queue=1564813
+6      0      iperf-12g       5         yes    yes        12.00 Gb/s     85.83 MiB   0            -             0         0       -          -
+DrainShape:   sent_bytes=25798184896  guarantee=25798184896  surplus=0  nonexact_while_exact_backlogged=0  park_root=0  park_queue=761786
+7      1      iperf-15g       5         yes    yes        15.00 Gb/s     107.29 MiB  0            -             0         0       -          -
+DrainShape:   sent_bytes=18215660072  guarantee=18215660072  surplus=0  nonexact_while_exact_backlogged=0  park_root=0  park_queue=214529
+8      2      iperf-18g       5         yes    yes        18.00 Gb/s     128.75 MiB  0            -             0         0       -          -
+DrainShape:   sent_bytes=19343957236  guarantee=19343957236  surplus=0  nonexact_while_exact_backlogged=0  park_root=0  park_queue=176260
+9      3      iperf-21g       5         yes    yes        21.00 Gb/s     150.20 MiB  0            -             0         0       -          -
+DrainShape:   sent_bytes=16599785318  guarantee=16599785318  surplus=0  nonexact_while_exact_backlogged=0  park_root=0  park_queue=220952
+10     4      iperf-24g       5         yes    yes        24.00 Gb/s     171.66 MiB  0            -             0         0       -          -
+DrainShape:   sent_bytes=21126834323  guarantee=21126834323  surplus=0  nonexact_while_exact_backlogged=0  park_root=0  park_queue=208149
+11     5      iperf-uncapped  5         no     no         -              178.81 MiB  0            -             0         0       -          -
+DrainShape:   sent_bytes=104631574931  guarantee=0  surplus=104631574931  nonexact_while_exact_backlogged=3855104  park_root=0  park_queue=0
+
+=== small-four-alone A/B (demand 10.1G, zero large-class competition, 12 streams x 20s, v4) ===
+port 5201 iperf-100m: recv=0.069 G / 0.1  = 69%
+port 5202 iperf-1g:   recv=0.787 G / 1.0  = 79%
+port 5203 iperf-3g:   recv=2.606 G / 3.0  = 87%
+port 5204 iperf-6g:   recv=5.130 G / 6.0  = 86%
+
+DECISIVE FINDINGS:
+1. park_root=0 for EVERY exact class (and best-effort) -> the shared
+   root shaper (SharedCoSRootLease, 25G) is NEVER the throttle gate.
+   Falsifies the "flat root shaper proportional starvation" hypothesis
+   (plan v1 root cause (B)) AND the SMOKE-DECLINED-DIAGNOSIS root-pool
+   explanation.
+2. Every class parks on park_queue (its OWN per-class v8 lease/quantum).
+3. Small-four-alone (zero competition) still under 95%: 69/79/87/86%.
+   Efficiency RISES with configured rate -> exactly the per-visit
+   quantum-MTU rounding oscillation AGY proved (100m q=2500B -> 1 frame
+   -> ~60-69%; higher rates amortize the sub-frame remainder).
+4. Therefore: small-class-first / visibility / ownership are NOT the
+   binding mechanism. The binding mechanism is the per-visit guarantee
+   quantum wasting the sub-frame remainder with no carry-forward
+   (cos_guarantee_quantum_bytes clamp + drain.rs:70 break).

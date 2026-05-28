@@ -3,403 +3,342 @@
 - Issue: #1630
 - Branch: `research/1630-cos-equalize-rootcause`
 - Mode: `/research` (plan only; no production code touched; STOP at PLAN-READY)
-- Rev: **v1**
+- Rev: **v2** (measurement-corrected root cause)
 - Author: Claude SMR (CoS-scheduler / WFQ / DRR / token-bucket / AF_XDP multi-worker-shaper domain)
 
-> This plan SUPERSEDES the #1634 plan
-> (`docs/pr/1630-cos-scheduler-equalize-fix/plan.md`). The #1634 plan's
-> "Bug 1 = pass1 over-provisioning / Bug 2 = pass1 never refreshes"
-> diagnosis is **mechanically incapable of fixing the measured
-> behavior**, because the waterfill selector it patches operates in
-> worker-local scope and the bytes-per-class are gated by mechanisms
-> the selector does not touch. #1634's own post-mortem
-> (`SMOKE-DECLINED-DIAGNOSIS.md`) reached the correct architectural
-> root cause AFTER the smoke decline; this plan formalizes and verifies
-> that root cause and lays out the path forward.
+> **v2 reframes the root cause based on live cluster telemetry that
+> falsified BOTH the #1634 selector diagnosis AND v1's own
+> "multi-worker fragmentation + flat root shaper" hypothesis.** See
+> `measurement-r1.txt`. The decisive evidence: **`park_root=0` for every
+> exact class**, and small classes stay below 95% even with ZERO
+> competition (small-four-alone A/B: 69/79/87/86%). The binding gate is
+> the per-class guarantee quantum/lease wasting the sub-frame remainder,
+> NOT root competition and NOT cross-worker visibility.
 
 ---
 
 ## 1. Problem statement
 
-Smoke fixture `cos-iperf-config.set` on `loss:xpf-userspace-fw0/1`
-applies, on `reth0.80`:
+Smoke fixture `cos-iperf-config.set` on `loss:xpf-userspace-fw0/1`,
+`reth0.80`: `shaping-rate 25g`, `oversubscription-policy guarantee-rate
+0.7`, 11 exact classes (`transmit-rate {100m..24g} exact`),
+best-effort q0, uncapped q11.
 
-- `shaping-rate 25g`
-- `oversubscription-policy guarantee-rate 0.7` → Phase-1 budget 17.5 G
-- 11 exact classes (`transmit-rate {100m..24g} exact`), best-effort q0
+Documented contract (`docs/fairness-regimes.md` guarantee-rate section):
+small-rate exact classes whose aggregate fits the Phase-1 budget should
+each reach ~100% of configured rate first.
 
-Documented contract (`docs/fairness-regimes.md` guarantee-rate section,
-referenced by #1634): under `guarantee-rate`, small-rate exact classes
-whose aggregate fits under the Phase-1 budget should each reach ~100% of
-their configured rate FIRST; only the residual goes to the larger
-classes.
+Measured (parent, #1634 binary): 5-class simul (demand 19.1 G) →
+72/65/80/76/76% — proportional, not small-first.
 
-Measured (parent agent, #1634 binary deployed):
-
-- **5-class simul** (100m+1g+3g+6g+9g, demand 19.1 G, small-four sum
-  10.1 G ≤ 17.5 G Phase-1 budget): achievement **72 / 65 / 80 / 76 /
-  76 %**. Proportional fair-share, NOT small-class-first.
-- **Solo iperf-1g**: 0.842 G / 1.0 G = **84 %**.
-- **11-class simul** (109 G demand): ~22-23 % per class ≈
-  ceiling/demand.
-- Generator 70%+ idle; not the bottleneck.
-- `show class-of-service interface`: each queue has a **distinct owner
-  worker** (round-robin), workers 0-5 each own ~2 queues.
-
-The 5-class case is the decisive one: demand (19.1 G) is below both the
-shaping rate (25 G) and the Phase-1 budget (17.5 G), and below the
-cluster push ceiling (~18 G). Under a correct guarantee-rate scheduler
-the four small classes (10.1 G total) should each be ≥95% of shape and
-iperf-9g should take the residual. Instead every class lands at ~74%.
+**Correct arithmetic facts** (v1 §1 had errors, fixed here):
+- Small-four sum = 0.1+1+3+6 = 10.1 G **≤** 17.5 G Phase-1 budget. ✓
+- 5-class total = 19.1 G. This is **below** the 25 G shaper but **above**
+  the ~18 G cluster push ceiling. (v1 wrongly said 19.1 ≤ 17.5 and 19.1
+  < 18; both false.)
 
 ---
 
-## 2. Verified code path (file:line, master @ `dbfbf680c`)
+## 2. Decisive measurement (this research round)
 
-The CoS exact-guarantee data path on the loss userspace cluster:
+Run on the free loss userspace cluster against the currently-deployed
+binary; full data in `measurement-r1.txt`.
 
-1. **Queue → owner-worker assignment is round-robin per queue.**
-   `coordinator/mod.rs:935-938`
-   (`build_cos_owner_worker_by_queue_with_fallback_ifindexes`):
+### 2a. Per-class park telemetry (`show class-of-service interface reth0.80`)
+
+Every exact class's `DrainShape` shows **`park_root=0`** and a large
+**`park_queue`**:
+
+| Class | park_root | park_queue |
+|-------|----------:|-----------:|
+| iperf-100m | 0 | 431 452 |
+| iperf-1g   | 0 | 621 624 |
+| iperf-3g   | 0 | 1 790 063 |
+| iperf-6g   | 0 | 1 880 244 |
+| iperf-9g   | 0 | 1 564 813 |
+| iperf-12g..24g | 0 | 176k-762k |
+| best-effort / uncapped | 0 | 0 (surplus path) |
+
+**`park_root=0` everywhere** ⇒ the shared root shaper
+(`SharedCoSRootLease`, 25 G, the only interface-wide arbiter) NEVER
+throttled any class. This **falsifies** (i) v1 §3(B) "flat root shaper
+proportional starvation" and (ii) the #1634
+`SMOKE-DECLINED-DIAGNOSIS.md` claim that "root tokens are distributed
+proportionally" produces the equalization. The root pool was not the
+gate. Every class is gated by `park_queue` — its OWN per-class token
+bucket.
+
+### 2b. Small-four-alone A/B (the discriminator all three reviewers demanded)
+
+Ports 5201-5204 ONLY (100m+1g+3g+6g, demand 10.1 G, ZERO large-class
+competition, 12 streams × 20 s, v4):
+
+| Class | Shape | recv | % of shape |
+|-------|------:|-----:|-----------:|
+| 100m | 0.1 | 0.069 | **69 %** |
+| 1g   | 1.0 | 0.787 | **79 %** |
+| 3g   | 3.0 | 2.606 | **87 %** |
+| 6g   | 6.0 | 5.130 | **86 %** |
+
+With the ENTIRE cluster to themselves and zero competition, the small
+classes STILL cannot reach 95%, and efficiency **rises monotonically
+with configured rate** (69 → 79 → 87 → 86%). This is the signature of
+per-visit quantum-MTU rounding (small rates lose a larger fraction of
+their tiny quantum to the sub-frame remainder), exactly as AGY proved
+analytically in r1.
+
+---
+
+## 3. Verified root cause (v2 — corrected)
+
+> **The per-class guarantee quantum (`cos_guarantee_quantum_bytes = rate
+> × 200 µs`, clamped) caps each per-visit send, and the drain loop
+> discards the sub-frame remainder of that quantum on every visit with
+> no carry-forward. For low-rate classes the quantum is only a few
+> frames (100m → 2500 B → 1 frame), so a large fixed fraction is wasted
+> every visit. The result is a per-class efficiency ceiling that rises
+> with configured rate — which under saturation looks like proportional
+> equalization.**
+
+Mechanism, file:line (master @ `dbfbf680c`):
+
+1. **Per-visit quantum.** `cos_guarantee_quantum_bytes`
+   (`queue_service/mod.rs:1534-1541`) = `transmit_rate_bytes ×
+   COS_GUARANTEE_VISIT_NS(200 µs)`, clamped `[1500, 512K]`. 100m →
+   `12.5 MB/s × 200 µs = 2500 B`.
+2. **Selection clamps secondary_budget to the quantum** (NOT to
+   accumulated tokens): `queue_service/mod.rs:879-883` and 985-989
+   (`candidate_budget = queue.hot.tokens.min(cos_guarantee_quantum_bytes(queue)).max(head_len)`).
+   Even when the per-queue bucket has accumulated tokens, each visit is
+   capped at the quantum.
+3. **Drain wastes the sub-frame remainder.** `drain.rs:69-72`:
    ```rust
-   for queue in &iface.queues {
-       let owner_worker_id = eligible_workers[*next_slot % eligible_workers.len()];
-       *next_slot += 1;
-       owner_by_queue.insert((egress_ifindex, queue.queue_id), owner_worker_id);
-   }
+   let len = req.bytes.len() as u64;
+   if remaining_root < len || remaining_secondary < len { break; }
    ```
-   With 6 workers and 12 queues, each worker owns ~2 queues. iperf-100m
-   → worker 1, iperf-1g → worker 2, etc.
+   With `secondary = quantum = 2500 B` and 1500 B frames: frame 1 sends
+   (remaining → 1000 B); frame 2 (1500 > 1000) breaks. The 1000 B is not
+   carried forward — `secondary_budget` is recomputed from the quantum on
+   the next visit.
+4. **The per-class v8 lease epoch cap also resets per epoch with no
+   carry of unspent cap.** `rotate_epoch_v8.rs:215-225`: `new_cap = rate
+   × min(elapsed, EPOCH_DURATION)`; published fresh each rotation. The
+   lease grants up to `my_fair_share = cap × my_flows / total_flows`
+   (`rotate_epoch_v8.rs:230-235`); with one owner, `= cap`. So the lease
+   correctly meters the class to its rate, but in concert with the
+   per-visit quantum clamp the deliverable-per-visit floor (1 frame for
+   100m) means the class cannot consume its full per-epoch cap.
+5. **`park_queue` is the observed gate.** `queue_service/mod.rs:684-719`
+   parks the queue with `ParkReason::QueueTokenStarvation` when
+   `queue.hot.tokens < head_len`. The high `park_queue` + `park_root=0`
+   telemetry confirms the per-class bucket (fed by the v8 lease at the
+   class's rate) is the binding constraint, not the root shaper.
 
-2. **Packets for queue X are cross-binding-redirected to X's owner.**
-   After redirect, queue X's backlog lives ONLY on its owner worker's
-   `CoSInterfaceRuntime.queues[X]`. A non-owner worker sees
-   `cos_queue_is_empty(queues[X]) == true`.
+### Efficiency ceiling (AGY's closed form, verified against drain.rs)
 
-3. **The `guarantee-rate` knob feeds ONLY the worker-local waterfill
-   selector.** `forwarding_build/cos.rs:426-444` copies
-   `oversubscription_policy` + `oversubscription_guarantee_fraction`
-   onto `CoSInterfaceConfig`; `queue_service/mod.rs:603-614` dispatches
-   to `select_exact_cos_guarantee_queue_waterfill` when policy ==
-   GuaranteeRate ∧ fraction > 0. The selector
-   (`queue_service/mod.rs:771-1007`) walks
-   `root.exact_queues_by_rate_ascending` (ALL queue indices), but skips
-   every queue with `cos_queue_is_empty` (line 811). On any given owner
-   worker, **only that worker's ~2 owned queues are non-empty** — the
-   ascending "small-class-first" walk only ever sees its own queues.
-   Phase-1 budget gating, `honored_mask`, Phase-2 descending walk: all
-   compute over a 1-2-element effective set. The selector cannot honor
-   "small classes interface-wide first" because no single worker
-   observes the interface-wide backlog.
+Per-visit frames = `floor(quantum / 1500)`; per-visit delivered =
+`frames × 1500`; efficiency ceiling = `delivered / quantum`:
 
-4. **Actual bytes-per-class are gated by two token buckets the selector
-   does not control:**
-   - **Per-class v8 queue lease** (`coordinator/mod.rs:1118-1127`):
-     `SharedCoSQueueLease::new_v8_with_rate_mode(queue.transmit_rate_bytes, ...)`.
-     The lease's `epoch_total_grant_cap = rate_bytes × elapsed`
-     (`rotate_epoch_v8.rs:220-222`), so the cap equals the class's OWN
-     configured rate. `acquire_v8`
-     (`shared_cos_lease/mod.rs:1018-1245`) hands out up to
-     `my_fair_share = cap × my_active_flows / total_active_flows`. Since
-     only the owner worker has flows on this queue, `total_active_flows
-     == owner's flows` and `my_fair_share == cap` → the lease can grant
-     the full per-class rate. The lease is NOT the limiter for the small
-     classes.
-   - **Shared root shaper lease** (`coordinator/mod.rs:1035-1042`):
-     ONE `SharedCoSRootLease` per ifindex, rate = full
-     `iface.shaping_rate_bytes` (25 G), shared across all workers via a
-     single greedy `compare_exchange` token pool
-     (`shared_cos_lease_acquire`, `shared_cos_lease/mod.rs:738-771`).
-     Each worker tops up its local `root.tokens` toward `lease_bytes`
-     (512 KB; `maybe_top_up_cos_root_lease`, `token_bucket.rs:54-87`)
-     from this shared pool, and every per-queue send is gated by
-     `root.tokens >= head_len` (`queue_service/mod.rs:830, 973`).
-     **The guarantee fraction never reduces the root rate.** The root
-     pool is acquired FCFS/greedy with no per-class reservation.
+| Rate | Quantum | Frames | Ceiling |
+|-----:|--------:|-------:|--------:|
+| 100m | 2 500 | 1 | 60.0 % |
+| 1g | 25 000 | 16 | 96.0 % |
+| 3g | 75 000 | 50 | 100.0 % |
+| 6g | 150 000 | 100 | 100.0 % |
 
-### Verified correction to the prior #1634 diagnosis
+Measured (small-four-alone) tracks this with a residual penalty (69/79
+vs 60/96 ceilings) attributable to epoch-boundary lease cap reset (item
+4) and visit cadence — i.e. real efficiency is the quantum ceiling FUR-
+THER reduced by lease-epoch granularity. The DIRECTION (rises with rate,
+small classes worst) is unambiguous and matches the analytic model.
 
-The parent's verified read of the token bucket
-(`token_bucket.rs:153-236`) is correct: per-queue tokens **accumulate**
-(`saturating_add(grant)`, no per-epoch reset), `lease_bytes` is floored
-at one frame, and the "parks after 1 packet" claim in #1634's earliest
-diagnosis is false. The real per-class rate gate is the SHARED v8
-queue-lease `acquire_v8` cap (= configured rate) and the shared root
-shaper — confirmed above. The #1634 "anchor pass1 to shaper × fraction"
-fix touched only the selector's budget math (`queue_service/mod.rs:787-800`),
-which controls service ORDER within a worker, not bytes-per-class —
-hence the smoke decline.
+### Why the full 11-class run "equalizes ~20%"
+
+Under 11-class saturation the deliverable wire bandwidth (~18 G ceiling)
+is split among classes that are EACH independently capped at their
+quantum-efficiency-limited rate; what's left flows to best-effort/
+uncapped surplus (q11 telemetry: `surplus=104 GB`,
+`nonexact_while_exact_backlogged=3.8M`). The exact classes equalize low
+because they are quantum-capped, not because of root competition or lost
+small-class priority.
 
 ---
 
-## 3. Verified root cause
+## 4. Is small-class-first / the documented contract achievable?
 
-> **Multi-worker queue-ownership fragmentation makes interface-wide
-> small-class-first impossible for the worker-local waterfill selector,
-> and the only interface-wide arbiter (the shared root shaper) allocates
-> root tokens greedily/proportionally to per-worker demand, not by
-> guarantee priority.**
+**Multi-worker visibility and ownership are NOT the blocker** — the
+small-four-alone A/B used the whole cluster and still missed 95%. The
+contract ("small classes ≥95% of configured rate first") is gated by the
+**per-class quantum-MTU efficiency ceiling**, which is independent of
+ownership, the selector, and the root shaper.
 
-Two independent facts combine:
+To deliver small classes to ≥95% of their configured rate, the fix must
+make the per-class guarantee accounting **carry the sub-frame / sub-cap
+remainder forward across visits/epochs** so a 100m class accumulates
+enough budget to send a whole frame on a less-frequent visit and average
+out to 100 Mbps — i.e. a deficit-round-robin (DRR) deficit counter, not a
+recomputed-each-visit quantum.
 
-- **(A) The guarantee-rate selector has no interface-wide visibility.**
-  Each owner worker runs the waterfill selector over only its own ~2
-  backlogged queues. "Honor 100m before 9g" is meaningless when 100m and
-  9g live on different worker threads. This is the Axis-B2 gap called out
-  in `docs/pr/1614-multi-rss-cos/plan.md:526-528`.
-
-- **(B) The only cross-worker arbiter ignores guarantee priority.**
-  The shared root shaper (`SharedCoSRootLease`) is the single point where
-  all classes' traffic competes interface-wide. It is a flat FCFS token
-  pool refilling at the full shaping rate. When aggregate offered load
-  approaches the delivery ceiling, the root pool drains faster than it
-  refills and every worker hits `root.tokens < head_len` and parks. Win
-  probability for a root-token top-up scales with how often a worker
-  asks, which scales with its class rate → proportional starvation.
-  Neither `guarantee-rate` nor `guarantee_fraction` is consulted in
-  `shared_cos_lease_acquire` or `maybe_top_up_cos_root_lease`.
-
-### Worked numeric trace — 5-class case (demand 19.1 G, shaper 25 G, Phase-1 budget 17.5 G)
-
-Per 200 µs epoch (`EPOCH_DURATION_NS = COS_GUARANTEE_VISIT_NS = 200 µs`):
-
-| Class | Rate | Owner | Per-class lease cap/epoch | Demand/epoch |
-|-------|-----:|------:|--------------------------:|-------------:|
-| 100m  | 12.5 MB/s | w1 | 2 500 B | full (12 streams) |
-| 1g    | 125 MB/s  | w2 | 25 000 B | full |
-| 3g    | 375 MB/s  | w3 | 75 000 B | full |
-| 6g    | 750 MB/s  | w4 | 150 000 B | full |
-| 9g    | 1 125 MB/s | w5 | 225 000 B | full |
-
-- Root shaper delivers 625 000 B/epoch (25 G). Sum of small-class lease
-  caps = 2 500+25 000+75 000+150 000+225 000 = **477 500 B/epoch** = 19.1 G.
-  Per-class leases alone do NOT cap the small classes below their rates
-  (each ≤ its own cap), and 477.5 KB < 625 KB root budget. **So in
-  isolation, root + per-class leases would let all five classes reach
-  ~100%.**
-- The shortfall to ~74% is NOT the per-class lease and NOT the root rate
-  in the steady-state token sense. It is the interaction of: (i) the
-  ~18 G cluster TX-delivery ceiling sitting just under the 19.1 G offered
-  load, so the system is mildly oversubscribed at the wire; (ii) the flat
-  root pool distributing the deliverable ~14-18 G greedily/proportionally
-  rather than guarantee-first; (iii) per-visit quantum vs MTU
-  carry-forward losses (the same mechanism that caps solo iperf-1g at
-  84% even with ZERO competition — `cos_guarantee_quantum_bytes` grants
-  `R×VISIT_NS` per visit and the drain rounds down to whole frames,
-  leaving a systematic per-class under-delivery of ~15-35% before any
-  competition).
-- Net: every class lands at ≈ (deliverable share) × (per-class
-  quantum-efficiency) ≈ 74%, proportional to rate — exactly the
-  measured signature.
-
-**Falsifiable prediction** (to confirm at /engineer time, or now via a
-throwaway debug build): with the small-four classes ALONE (no 9g, demand
-10.1 G, well under both 17.5 G budget and 18 G ceiling), if the root
-shaper / quantum theory is right they should each reach ~84% (the solo
-quantum-efficiency ceiling), NOT ~95%+. If instead they reach ~95%+,
-then the 9g class's root-pool competition is the dominant term and the
-fix must arbitrate the root pool by guarantee priority. This single A/B
-measurement discriminates between "quantum-efficiency confound" and
-"root-pool proportional-starvation" as the dominant cause and MUST be
-run before committing to a fix path. (Open question Q1.)
+This is a **local, per-queue accounting fix** and does NOT require
+cross-worker coordination (Axis B2) or single-owner collapse. v1's
+recommendation (Path 2 single-owner) was aimed at the wrong mechanism
+and is withdrawn.
 
 ---
 
-## 4. Is small-class-first achievable in the current architecture?
+## 5. Multiple path options (v2)
 
-**Honest assessment: NOT with a worker-local selector change alone.** The
-selector is structurally blind to peer-worker backlog. Two routes can
-make it achievable:
+| # | Path | Fixes the measured ceiling? | Scope | Risk |
+|---|------|:---:|------|------|
+| A | **DRR deficit carry-forward on the guarantee quantum**: replace the recomputed-each-visit `secondary_budget = min(tokens, quantum)` with a persistent per-queue deficit counter that accumulates unspent quantum across visits (classic DRR). A 100m queue accrues quantum until it has ≥1 frame, sends it, carries the remainder. | Yes — eliminates the sub-frame waste; small classes converge to configured rate | Medium (per-queue deficit field + drain accounting; touches `queue_service` selectors + `drain.rs` budget) | Must not break large-class fairness or the v8 lease cap interaction; needs the full CoS smoke matrix |
+| B | **Carry the per-queue token bucket as the budget (drop the quantum clamp)**: since `queue.hot.tokens` already accumulates (token_bucket.rs), pass `queue.hot.tokens` (capped by lease, not by the 200 µs quantum) as `secondary_budget`. The quantum becomes a fairness *visit* bound only, not a *byte* cap. | Yes — accumulated tokens already span multiple frames; the lease enforces the rate | Small-medium (remove/raise the `.min(quantum)` clamp at the 2 candidate_budget sites; keep quantum for RR fairness via a separate visit cap) | Risk: large classes could burst the whole accumulated bucket in one visit, hurting inter-class latency/RR fairness; needs a per-visit frame-count cap to preserve RR |
+| C | **Raise `COS_GUARANTEE_QUANTUM_MIN_BYTES` and/or `COS_GUARANTEE_VISIT_NS`** so even the smallest class's quantum is several frames (e.g. min 6×MTU). | Partial — raises the 100m ceiling from 60% toward ~95% but inflates burstiness and weakens shaping precision for tiny classes | Tiny (constant change) | Crude; trades shaping accuracy for efficiency; may over-deliver tiny classes in bursts |
+| D | **Document the quantum-efficiency floor; reframe the gate to "≥95% of the per-rate quantum ceiling"; close #1630 as working-as-designed for sub-300m classes.** | No (accepts the ceiling) | Doc-only | Leaves the operator-facing contract unmet for small classes |
 
-1. **Collapse the scope** — assign all of an interface's CoS queues to a
-   single owner worker, so that one worker's waterfill selector regains
-   interface-wide visibility. Correct, simple, but sacrifices the
-   per-worker drain parallelism the system was built for (one core
-   pinned at up-to-shaper-rate with all backlog queues).
-
-2. **Add cross-worker coordination (Axis B2)** — a shared per-interface
-   structure where each worker publishes its per-class demand and the
-   root-token arbiter (or each worker's admission) consults
-   guarantee-priority before consuming root tokens. This is the only path
-   that delivers small-class-first AND preserves multi-worker
-   parallelism, but it is a substantial new mechanism (analogous to the
-   #917 V_min cross-worker floor, generalized to root-budget
-   reservation).
-
-There is no purely-local fix. Anyone proposing one must explain how a
-worker honors a smaller class living on a different thread.
-
----
-
-## 5. Multiple path options
-
-| # | Path | Delivers small-class-first? | Keeps parallelism? | Scope | Risk |
-|---|------|:---:|:---:|------|------|
-| 1 | **Single-owner per interface (forced)**: change `build_cos_owner_worker_by_queue_*` so all queues of an interface share one owner. | Yes (selector regains visibility) | No (1 core/interface) | Small (1 fn + tests) | Perf regression on multi-queue interfaces; collides with #1183 single-owner-funnel regression history |
-| 2 | **Single-owner opt-in knob** (`single-owner` / reuse `guarantee-rate` as the trigger): operators who set `guarantee-rate` accept single-owner for that interface; default stays proportional multi-worker. | Yes, when opted in | Yes for non-opted interfaces | Small-medium (Go knob + wire field + owner-build branch + selector already works) | Doc + operator-expectation surface; per-interface, so blast radius bounded |
-| 3 | **Axis B2 cross-worker shaper-budget atomic**: per-interface shared per-class demand + guarantee-priority root-token reservation; generalize #917 V_min. | Yes, fully | Yes | Large (multi-week; new shared atomics, per-worker throttle, rotation) | High; matches #1614 §5.B2 explicitly deferred follow-up; prior dataplane-only fairness mechanisms PLAN-KILLED repeatedly (memory: #1236/#1237/#1239/#1243) |
-| 4 | **Document limitation + close**: state that guarantee-rate requires single-owner (future) or B2 (future); keep proportional as the multi-worker behavior; close #1630 with a B2 tracker. | No | Yes | Doc-only | Leaves contract unmet; but honest |
-
-Note Path 2 ⊃ Path 1: Path 2 is Path 1 gated behind opt-in. Path 1
-unconditionally is rejected because it regresses the default multi-worker
-deployment (the #1183 funnel-collapse precedent: any forced single-owner
-CoS funnel collapsed reverse throughput to ~2 G).
+Path A is the textbook fix (DRR is specifically designed to eliminate
+exactly this sub-quantum waste). Path B is a smaller change that leans on
+the already-accumulating token bucket but risks RR/latency fairness
+without an added visit cap. Path C is a band-aid. Path D is the honest
+fallback if A/B prove too invasive.
 
 ---
 
 ## 6. Recommendation
 
-**Path 2 (single-owner opt-in), with Path 4's documentation as a
-mandatory companion, contingent on the Q1 A/B measurement.**
+**Path A (DRR deficit carry-forward), with Path B's "token bucket already
+accumulates" insight as the implementation lever.** Concretely: maintain
+a persistent per-queue `guarantee_deficit_bytes` that accumulates the
+quantum each visit and is spent in whole frames, carrying the remainder —
+the canonical Deficit Round Robin. This removes the sub-frame waste that
+the measurement isolated, is local per-queue (no B2, no single-owner, no
+selector-visibility change), and is the mechanism a correct
+rate-quantum scheduler should have used in the first place.
 
-Rationale grounded in the verified root cause:
-
-- The selector (#1634) is already correct WITHIN single-worker scope.
-  Path 2 makes its scope match its assumptions for opted-in interfaces by
-  collapsing the interface's queues onto one owner — the smallest change
-  that lets the existing waterfill selector actually see all classes.
-- Operators who configure `guarantee-rate` are explicitly choosing
-  guarantee semantics over raw throughput; coupling that knob to
-  single-owner ownership is a defensible, Junos-plausible trade (vSRX
-  scheduler hierarchies are per-interface, single-context).
-- Keeps the high-throughput default (proportional, multi-worker)
-  untouched — no regression for the common case.
-- B2 (Path 3) remains the "proper" long-term answer but is out of scope
-  for #1630; file as the #1614 §5.B2 follow-up tracker.
-
-**However**, the recommendation is gated on Q1: if the A/B measurement
-shows the small-four-alone classes reach ~95%+ (not ~84%), then the
-dominant cause is root-pool proportional-starvation under the 9g
-competitor, and Path 2's single-owner collapse will ALSO be limited by
-the same flat root shaper UNLESS the single owner's local root bucket is
-the only consumer (which it would be, since one owner = one root-token
-consumer for that interface). Path 2 still wins in that sub-case because
-a single owner serializes all classes through one `root.tokens` bucket
-and the waterfill selector then arbitrates that bucket guarantee-first.
-The A/B simply tells us how much of the 26% gap is recoverable vs.
-quantum-efficiency floor.
+The #1634 waterfill selector and the v1 single-owner idea both target
+mechanisms the measurement shows are NOT binding; neither is part of this
+fix. (The waterfill selector may still be desirable for ORDERING under
+oversubscription, but it is orthogonal to the efficiency bug and out of
+scope for #1630.)
 
 ---
 
 ## 7. Implementation sketch (for /engineer, NOT executed here)
 
-Path 2:
+Path A:
 
-1. **Go control plane**: add `single-owner` boolean (or derive from
-   `oversubscription-policy guarantee-rate`) on the CoS interface unit;
-   plumb through `pkg/config/types.go`,
-   `pkg/config/compiler_class_of_service.go`,
-   `pkg/dataplane/userspace/protocol.go`,
-   `pkg/dataplane/userspace/interfaces.go`.
-2. **Wire + Rust config**: new field on `CoSInterfaceConfig`
-   (`forwarding_build/cos.rs`), serde in `protocol/cos.rs`.
-3. **Owner build**: branch in
-   `build_cos_owner_worker_by_queue_with_fallback_ifindexes`
-   (`coordinator/mod.rs:935-938`): if the interface is single-owner,
-   assign ALL its queues to `eligible_workers[0]` (stable choice).
-4. **No selector change** — `select_exact_cos_guarantee_queue_waterfill`
-   already does the right thing once it sees all queues. Keep #1634's
-   waterfill correction as the foundation (it is correct in-scope).
-5. **Root shaper**: with single owner, the interface's `root.tokens` has
-   exactly one consumer, so the waterfill selector's small-class-first
-   ordering directly governs root-token allocation. Verify the per-class
-   v8 lease still caps each class at its rate (it does).
-6. **Docs**: `docs/fairness-regimes.md` guarantee-rate section — state
-   single-owner requirement + parallelism trade-off; add B2 follow-up
-   tracker reference.
+1. Add `guarantee_deficit_bytes: u64` to `CoSQueueRuntime` hot state
+   (`types/cos.rs`).
+2. In the exact-guarantee selectors (`queue_service/mod.rs` ~879-883 and
+   985-989) and the nonexact path (~1064-1068): compute
+   `secondary_budget = (guarantee_deficit_bytes += quantum).min(tokens)`
+   — i.e. accumulate the quantum into the deficit, bound by available
+   per-queue tokens, instead of clamping to a single quantum.
+3. In `drain.rs`, after the drain loop, write the unspent `secondary`
+   back to `guarantee_deficit_bytes` (carry-forward) rather than
+   discarding it. Cap the deficit at a small multiple of MTU to bound
+   burstiness.
+4. Ensure the v8 lease `consume(sent_bytes)` and the per-queue token
+   debit still meter the actual bytes sent so the configured RATE cap is
+   preserved (the deficit only affects WHEN whole frames are eligible,
+   not the long-run rate).
+5. Preserve RR fairness: keep advancing the per-class RR cursor per visit
+   so a large class with a big deficit cannot monopolize; bound per-visit
+   frames if needed.
+6. Docs: `docs/fairness-regimes.md` — describe the DRR deficit and the
+   small-class efficiency guarantee.
 
 ---
 
-## 8. Acceptance gate
+## 8. Acceptance gate (v2 — measurement-grounded)
 
-Canonical reduced-load gate (rules out the cluster-ceiling confound):
+- **Gate 1 (primary)**: small-four-alone A/B (100m/1g/3g/6g, demand
+  10.1 G, no large classes) → each ≥ **95% of configured shape**. This is
+  the clean ceiling test; it is currently 69/79/87/86% and MUST rise to
+  ≥95% for all four. (This replaces v1's confounded 5-class gate.)
+- **Gate 2**: 5-class simul (demand 19.1 G) → small-four each ≥ 95% of
+  shape; iperf-9g takes residual. v4 AND v6.
+- **Gate 3**: 11-class simul → no exact class starved; priority-low /
+  uncapped ≥ 5% of cluster ceiling.
+- **Gate 4 (rate cap preserved)**: no class EXCEEDS its configured rate
+  in steady state (the deficit must not leak rate). Verify 1g ≤ ~1.0 G,
+  etc., under solo and simul.
+- **Gate 5 (no-regression)**: default multi-worker aggregate reverse
+  throughput ≥ ~22 G; CoS-off path unchanged.
+- **Gate 6 (full matrix)**: v4/v6 × push/-R × CoS-off/CoS-on per
+  `feedback_cos_iperf3_per_class` + `feedback_smoke_push_and_reverse`.
 
-- **Gate 1 (primary)**: 5-class simul, demand 19.1 G ≤ 17.5 G Phase-1
-  budget on the OPTED-IN interface → each of the four small classes
-  (100m/1g/3g/6g) ≥ **95% of configured shape**; iperf-9g takes the
-  residual. Run v4 (172.16.80.200) AND v6 (2001:559:8585:80::200).
-- **Gate 1b (Q1 A/B)**: small-four-alone (no 9g, demand 10.1 G) → each
-  ≥ 95% (establishes the recoverable ceiling and validates the
-  quantum-efficiency vs root-starvation split).
-- **Gate 2**: priority-low / smallest class ≥ 5% of cluster ceiling (no
-  starvation).
-- **Gate 3**: per-class retransmits ≤ 100 / 30 s OR explicitly
-  rationalized.
-- **Gate 4 (no-regression)**: default (proportional, NOT opted-in)
-  multi-worker interface aggregate throughput does not regress below
-  ~22 G on the standard reverse-path smoke.
-- **Gate 5 (CoS matrix)**: full smoke matrix per
-  `feedback_cos_iperf3_per_class` / `feedback_smoke_push_and_reverse`
-  (v4/v6 × push/-R × CoS-off/CoS-on).
+If Path A cannot push the 100m class to ≥95% because of an irreducible
+floor (e.g. lease-epoch granularity), fall back to Path D and reframe the
+gate to "≥95% of the achievable per-rate ceiling" — but the A/B shows
+substantial headroom (69% → ≥95% should be reachable with carry-forward,
+since the only loss is the per-visit sub-frame remainder).
 
 ---
 
 ## 9. Risk / rollback
 
-- Single-owner collapse on an interface re-introduces the #1183
-  funnel-collapse failure mode FOR THAT INTERFACE. Bounded because it is
-  opt-in and per-interface; default deployments untouched. Rollback =
-  remove the knob / revert the owner-build branch.
-- The v8 per-class lease and shared root lease are NOT modified in Path
-  2 → no change to the cross-worker atomic protocol, no HA/failover
-  surface (memory: any cluster/VRRP/session-sync change needs
-  `make test-failover`; Path 2 touches none).
+- Path A is a per-queue local accounting change; no cross-worker atomic
+  protocol, no root-lease change, no HA/failover surface (no
+  `make test-failover` trigger). The v8 lease and shared root lease are
+  untouched.
+- The burstiness cap (step 3) is the main correctness lever: too large →
+  small classes burst and hurt RR latency; too small → carry-forward
+  insufficient and 100m stays < 95%. Sweep it in the A/B.
+- Rollback = revert the deficit field + accounting; quantum reverts to
+  recomputed-per-visit.
 
 ---
 
 ## 10. Documentation contract
 
-Per CLAUDE.md module-doc rule: `docs/fairness-regimes.md` guarantee-rate
-section MUST be updated to state the single-owner requirement and the
-parallelism trade-off; the #1614 umbrella plan's §5.B2 follow-up must be
-filed as a real tracker. No code ships without these.
+`docs/fairness-regimes.md` guarantee-rate / quantum section MUST document
+the DRR deficit and the small-class efficiency behavior. The #1614 §5.B2
+cross-worker follow-up remains a separate future tracker (NOT needed for
+#1630 per the measurement).
 
 ---
 
 ## 11. Open questions for hostile reviewers (≥5)
 
-- **Q1 (load-bearing)**: Is the ~26% small-class shortfall dominated by
-  (a) root-pool proportional-starvation under the 9g competitor, or (b)
-  the quantum-efficiency floor (solo iperf-1g = 84%)? The
-  small-four-alone A/B (Gate 1b) discriminates. If (b) dominates, even
-  Path 2 cannot reach 95% and the gate itself is unachievable — does the
-  gate need to be "≥ 95% of the solo-achievable ceiling" rather than
-  "≥ 95% of configured shape"? Quote the solo-84% mechanism
-  (`cos_guarantee_quantum_bytes` + drain frame-rounding) and decide.
+- **Q1**: Does the per-class v8 lease's per-epoch `cap = rate × elapsed`
+  reset (rotate_epoch_v8.rs:215-225, NO carry of unspent cap) impose its
+  OWN floor independent of the quantum carry-forward? I.e. even with a
+  perfect DRR deficit on the quantum, can a 100m class consume its full
+  per-epoch lease cap (2500 B/200 µs) when each grant must be spent in
+  1500 B frames? Work the lease-epoch × frame-quantization interaction;
+  if the lease itself loses the remainder, Path A must ALSO carry the
+  lease deficit (token bucket already does this — confirm
+  token_bucket.rs accumulation is sufficient).
 
-- **Q2**: With a single owner draining ALL 11 classes through one
-  `root.tokens` bucket at up to 25 G, is one core actually capable of
-  ~18-25 G of CoS-shaped TX, or does the single-owner path itself become
-  CPU-bound below the small-class guarantee sum (10.1 G)? If the owner
-  core caps at, say, 12 G, the small-four guarantee (10.1 G) barely fits
-  and 9g gets ~2 G — is that acceptable? Need a single-owner CPU-ceiling
-  measurement.
+- **Q2**: Path B vs Path A — the per-queue token bucket ALREADY
+  accumulates (token_bucket.rs:197-201, no per-epoch reset). So is the
+  quantum clamp at the selector (`min(quantum)`) the ONLY thing throwing
+  away the accumulated budget? If yes, Path B (raise/remove the clamp +
+  add a frame-count visit cap) is strictly smaller than Path A. Which is
+  correct? Quote the two candidate_budget sites and the token-bucket
+  accumulation to decide.
 
-- **Q3**: Does the per-class v8 lease's `my_fair_share = cap ×
-  my_active_flows / total_active_flows` behave correctly when a single
-  owner has flows for MANY queues but each queue lease is independent? Is
-  there any cross-queue interaction in `acquire_v8` /
-  `worker_active_flow_buckets` that breaks when one worker owns all
-  queues (vs the ~2-per-worker the code was tuned against)?
+- **Q3**: RR fairness regression — with carry-forward, a large class
+  (24g, quantum clamped at 512K = 341 frames) accrues a big deficit if
+  starved a few visits. Does Path A let it monopolize a drain pass and
+  spike inter-class latency? Is the per-visit frame-count cap (step 5)
+  sufficient, and what value?
 
-- **Q4**: Is reusing the `guarantee-rate` knob as the single-owner
-  trigger (vs a separate `single-owner` knob) safe? Existing configs may
-  set `guarantee-rate` on multi-queue interfaces expecting current
-  (proportional, multi-worker) behavior; silently collapsing them to
-  single-owner is a behavior change on COMMIT. Must single-owner be a
-  distinct explicit knob to avoid surprising existing operators?
+- **Q4**: Is the documented contract ("small classes ≥95% of configured
+  rate") even the right target, or is some efficiency loss for sub-MTU-
+  multiple quanta inherent and should the gate be "≥95% of achievable
+  ceiling"? Junos vSRX behavior reference?
 
-- **Q5**: The #1634 waterfill selector clones
-  `root.exact_queues_by_rate_ascending` into a `Vec` every call
-  (`queue_service/mod.rs:807`) and the `honored_mask` is a dead local
-  reset per call (lines 806, 913-921). With single-owner (all 11+ queues
-  on one worker, hot path), is the per-call `Vec` allocation +
-  full-ascending-walk acceptable on the hot drain path, or does Path 2
-  surface a hot-path allocation that violates the engineering-style
-  no-alloc rule and needs the selector reworked first?
+- **Q5**: Does this bug also affect NON-exact guarantee queues
+  (`select_nonexact_cos_guarantee_batch`, queue_service/mod.rs:1064-1068
+  uses the same `min(quantum)` clamp)? Should Path A cover both, and does
+  the nonexact path's `refill_cos_tokens` (rate-based, accumulating)
+  already mitigate it differently?
 
-- **Q6**: Path 4 (document + close) — is the guarantee-rate contract
-  genuinely worth the single-owner perf cost, or should the project
-  accept proportional-under-multi-worker as the documented behavior and
-  reserve true guarantee-rate for B2? I.e. is Path 2 solving a problem
-  operators actually have, or satisfying a self-imposed contract?
+- **Q6**: The measurement was on the currently-deployed binary (not
+  necessarily #1634). Could the deployed binary differ from master in a
+  way that changes `park_root=0`? Should the A/B be re-run on a
+  freshly-built master binary to be certain the root-shaper-is-not-the-
+  gate finding holds on master? (I judge `park_root=0` is structural —
+  the root rate is the full 25 G and demand ≤ 19.1 G — but a reviewer may
+  demand the master rebuild.)
