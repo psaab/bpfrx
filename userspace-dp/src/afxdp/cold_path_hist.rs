@@ -192,12 +192,14 @@ pub(in crate::afxdp) fn sample_tsc() -> u64 {
 
 /// Per-worker clock source for cold-path latency sampling.
 ///
-/// Worker startup probes `/proc/cpuinfo` for `constant_tsc +
-/// nonstop_tsc` AND
-/// `/sys/devices/system/clocksource/clocksource0/current_clocksource ==
-/// tsc`. If both pass, `Tsc` is selected; otherwise `ClockGettime`
-/// fallback. The harness gates Scale Target table publication on
-/// every worker reporting `Tsc`.
+/// Worker startup probes `/proc/cpuinfo` for ALL THREE flags
+/// `constant_tsc + nonstop_tsc + rdtscp` (Codex code-r1 finding 2:
+/// the first two attest TSC stability; the third attests the
+/// instruction is legal — x86_64 mandates SSE2 but NOT RDTSCP)
+/// AND `/sys/devices/system/clocksource/clocksource0/current_clocksource
+/// == tsc`. If ALL FOUR pass, `Tsc` is selected; otherwise
+/// `ClockGettime` fallback. The harness gates Scale Target table
+/// publication on every worker reporting `Tsc`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::afxdp) enum ClockSource {
     /// TSC unavailable, fall back to `clock_gettime(CLOCK_MONOTONIC_RAW)`.
@@ -825,9 +827,16 @@ mod tests {
     #[test]
     fn sample_tsc_monotonic_within_thread() {
         // On x86_64 with constant_tsc, back-to-back rdtscp must be
-        // monotonic non-decreasing.
+        // monotonic non-decreasing. Gate on `probe_clock_source` per
+        // Codex code-r2 NIT/portability: x86_64 does not imply
+        // RDTSCP — a probe-fallback host would #UD on these
+        // invocations.
         #[cfg(target_arch = "x86_64")]
         {
+            if probe_clock_source() != ClockSource::Tsc {
+                eprintln!("skipping sample_tsc_monotonic_within_thread: host lacks RDTSCP or invariant TSC");
+                return;
+            }
             let a = sample_tsc();
             let b = sample_tsc();
             let c = sample_tsc();
@@ -838,10 +847,16 @@ mod tests {
     /// Codex code-r1 finding 1: verify the start/end split exists and
     /// each variant returns a monotonic non-decreasing pair, matching
     /// the Intel SDM §17.17 measurement-window recipe.
+    ///
+    /// Gate on `probe_clock_source` per Codex code-r2 NIT/portability.
     #[test]
     fn sample_tsc_start_end_split_monotonic() {
         #[cfg(target_arch = "x86_64")]
         {
+            if probe_clock_source() != ClockSource::Tsc {
+                eprintln!("skipping sample_tsc_start_end_split_monotonic: host lacks RDTSCP or invariant TSC");
+                return;
+            }
             let a = sample_tsc_start();
             let b = sample_tsc_end();
             assert!(b >= a, "start={a} end={b} — not monotonic");
