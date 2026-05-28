@@ -20,5 +20,8 @@
 
 ## Code review
 
-### Round 1
-- (pending implementation)
+### Round 1 (PR #1632 HEAD 6b3592f81)
+- Codex: `task-mppnd2o4-os98id` (dispatched 2026-05-28)
+- AGY: `adversarial-review-mppndmyb-tdpk0w` (dispatched 2026-05-28)
+- Copilot: triggered via `@copilot review` PR comment
+- Claude SMR: (pending after Codex+AGY land)

@@ -111,8 +111,10 @@ but Codex r1 correctly notes the cardinality difference (books
   - ~8-16 B allocator block overhead (depends on jemalloc / glibc
     malloc rounding).
   - Payload: 12 B per `PrefixV4` element (u32 addr + u32 mask + u8
-    prefix_len + 3 B alignment pad). 40 B per `PrefixV6` element
-    (u128 addr + u128 mask + u8 prefix_len + 7 B alignment pad).
+    prefix_len + 3 B alignment pad). 48 B per `PrefixV6` element
+    (u128 addr + u128 mask + u8 prefix_len + 15 B alignment pad to
+    16-byte alignment — Codex r1-code 2026-05-28 corrected the
+    v5 estimate of 40 B).
 
   So a rule with 10 PrefixV4 entries in one Arc: ~24-32 B header
   + 120 B payload = ~144-152 B per Arc. Worst-case realistic 1M
@@ -388,15 +390,20 @@ captured Vec only when the factory is done) requires intrusive
 changes to `PrefixSetV{4,6}::from_v3_literals`. For the narrow
 foundation PR, the extra clone is acceptable.
 
-**Ordering note.** Both `lit_v4_vec` and the per-book
-`prefixes_v4` arrays carry their natural input ordering. The
-`source_book_idxs` SmallVec is already sorted ascending by dense
-index (via `resolve_book_idxs::sort_unstable() + dedup()`), so
-cited-book contributions appear in ascending dense-index order
-regardless of the operator's declared `source_book_ids` order.
-Final union order: literals first (in `snap.source_literals`
-parse order), then each cited book's `prefixes_v4` in
-dense-index-ascending order. No sort, no dedup at this layer.
+**Ordering note (CORRECTED per Codex r1-code MERGE-NEEDS-MINOR
+2026-05-28):** Both `lit_v4_vec` and the per-book `prefixes_v4`
+arrays carry their natural input ordering. The
+`source_book_idxs` SmallVec is "dense indices in ASCENDING
+EXTERNAL-ID ORDER" — NOT ascending dense-index order.
+`resolve_book_idxs::sort_unstable() + dedup()` sorts the INPUT
+u32 external IDs first, then maps each to its dense index. When
+address_books are declared in non-ID-ascending order, dense
+indices DIVERGE from external IDs and the walk order follows
+external IDs, not dense indices. Final union order: literals
+first (in `snap.source_literals` parse order), then each cited
+book's `prefixes_v4` in ASCENDING EXTERNAL-ID order. No sort,
+no dedup at this layer. Exposed by test 6
+(`test_policy_rule_v3_multiple_books_external_id_ascending_order`).
 
 ### 4.4 Default impl + parse constructor (AGY r2 D: drop `..default()` entirely)
 

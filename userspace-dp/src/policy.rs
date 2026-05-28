@@ -168,9 +168,13 @@ pub(crate) struct PolicyRule {
     /// match shape.
     ///
     /// Populated at parse-time as the union of (a) the rule's
-    /// own literal CIDRs and (b) each cited book's
-    /// `prefixes_v{4,6}`. NOT consumed by the hot path in this
-    /// PR (zero-touch on `evaluate_policy`).
+    /// own literal CIDRs (in `snap.source_literals` /
+    /// `snap.source_addresses` parse order) and (b) each cited
+    /// book's `prefixes_v{4,6}` walked in ASCENDING EXTERNAL
+    /// BOOK-ID ORDER (per `resolve_book_idxs` which
+    /// `sort_unstable()+dedup()`s the input u32 IDs before
+    /// mapping to dense indices). NOT consumed by the hot path
+    /// in this PR (zero-touch on `evaluate_policy`).
     pub(crate) source_prefixes_v4: Option<Arc<[PrefixV4]>>,
     pub(crate) source_prefixes_v6: Option<Arc<[PrefixV6]>>,
     pub(crate) destination_prefixes_v4: Option<Arc<[PrefixV4]>>,

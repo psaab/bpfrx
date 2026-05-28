@@ -1433,15 +1433,24 @@ fn test_policy_rule_v3_book_only_inherits_book_prefixes() {
 }
 
 #[test]
-fn test_policy_rule_v3_multiple_books_dense_index_order() {
-    // Test 6: rule with source_book_ids=[3, 1, 2] (declared
-    // out-of-order). resolve_book_idxs sort_unstable + dedup
-    // sorts to ascending dense indices. The parallel array
-    // walks the cited books in ascending dense-index order.
+fn test_policy_rule_v3_multiple_books_external_id_ascending_order() {
+    // Test 6 (revised per Codex r1-code MERGE-NEEDS-MINOR
+    // 2026-05-28): the actual invariant is "cited-book
+    // contributions appear in ASCENDING EXTERNAL-ID order"
+    // (NOT ascending dense-index order as plan v5 §4.3 wrongly
+    // claimed). resolve_book_idxs sort_unstable+dedups the
+    // INPUT u32 IDs, then maps each to its dense index via
+    // book_id_to_idx. So source_book_idxs[] = "dense indices in
+    // external-ID-ascending order". When declaration order ≠
+    // ID-ascending order, these two orderings DIVERGE.
+    //
+    // To expose the real invariant, declare books in REVERSE
+    // ID-ascending order so dense-index 0 = ID 303,
+    // dense-index 1 = ID 302, dense-index 2 = ID 301.
     let books = [
-        book(301, "a", &["10.1.0.0/16"], &[]),
-        book(302, "b", &["10.2.0.0/16"], &[]),
         book(303, "c", &["10.3.0.0/16"], &[]),
+        book(302, "b", &["10.2.0.0/16"], &[]),
+        book(301, "a", &["10.1.0.0/16"], &[]),
     ];
     let mut rule_snap = v3_rule("r-multi", &[], &[]);
     rule_snap.source_book_ids = vec![303, 301, 302];
@@ -1457,20 +1466,31 @@ fn test_policy_rule_v3_multiple_books_dense_index_order() {
     let rule = &state.rules[0];
     let arr = rule.source_prefixes_v4.as_deref().expect("Some");
     assert_eq!(arr.len(), 3, "3 books × 1 prefix each");
-    // Books were inserted in declared order [301, 302, 303] so
-    // dense indices are 0, 1, 2 respectively. After
-    // sort_unstable on source_book_ids: [301, 302, 303] -> dense
-    // [0, 1, 2]. Array walk visits each book once in ascending
-    // dense index, giving prefixes in order a, b, c.
-    assert_eq!(arr[0].prefix_len(), 16);
-    // Spot-check the first octet of the addresses (10.1, 10.2,
-    // 10.3): each address is in its respective book.
-    let book_a = &state.books[0];
-    let book_b = &state.books[1];
-    let book_c = &state.books[2];
-    assert!(book_a.v4.contains(arr[0].addr()));
-    assert!(book_b.v4.contains(arr[1].addr()));
-    assert!(book_c.v4.contains(arr[2].addr()));
+    // After resolve_book_idxs sorts ascending by ID:
+    //   [301, 302, 303] -> dense [2, 1, 0]
+    // Parallel array fetches each book's prefixes_v4 in that
+    // dense-index walk order, giving:
+    //   arr[0] = book(ID 301)/dense 2 = 10.1.0.0/16
+    //   arr[1] = book(ID 302)/dense 1 = 10.2.0.0/16
+    //   arr[2] = book(ID 303)/dense 0 = 10.3.0.0/16
+    let book_dense_303 = &state.books[0]; // first-declared = ID 303
+    let book_dense_302 = &state.books[1]; // second-declared = ID 302
+    let book_dense_301 = &state.books[2]; // third-declared = ID 301
+    assert!(
+        book_dense_301.v4.contains(arr[0].addr()),
+        "arr[0] should be from ID 301 (10.1.0.0/16): got {:?}",
+        arr[0]
+    );
+    assert!(
+        book_dense_302.v4.contains(arr[1].addr()),
+        "arr[1] should be from ID 302 (10.2.0.0/16): got {:?}",
+        arr[1]
+    );
+    assert!(
+        book_dense_303.v4.contains(arr[2].addr()),
+        "arr[2] should be from ID 303 (10.3.0.0/16): got {:?}",
+        arr[2]
+    );
 }
 
 #[test]
