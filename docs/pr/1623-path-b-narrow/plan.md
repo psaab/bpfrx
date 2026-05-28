@@ -1,14 +1,33 @@
 # #1623 Path B narrow — PolicyRule parallel-prefix arrays
 
-**Status:** DRAFT v2 — Claude SMR r1 self-review folded; pending Codex + AGY adversarial plan review
+**Status:** DRAFT v3 — Codex r1 PLAN-NEEDS-MAJOR + AGY r1 PLAN-NEEDS-MINOR + Claude SMR r2 folded; pending r2 adversarial review
 
 Revision history:
 - v1: initial draft.
-- v2: addresses Claude SMR r1 PLAN-NEEDS-MINOR findings F-SMR-r1-1
-  (document 1M-rule replication as accepted cost), F-SMR-r1-2
-  (Default impl uses `Arc::<[T]>::default()` to share global empty
-  Arc), F-SMR-r1-4 (quantitative `size_of` note), F-SMR-r1-6
-  (clarify book_idxs sort order).
+- v2: addresses Claude SMR r1 PLAN-NEEDS-MINOR findings.
+- v3: addresses Codex r1 PLAN-NEEDS-MAJOR (F1-F7) + AGY r1 PLAN-NEEDS-MINOR (F1-F4) + Claude SMR r2:
+  - **Shape change:** `Arc<[T]>` → `Option<Arc<[T]>>` (AGY F1).
+    Null-pointer optimization makes this zero-size-overhead vs
+    bare `Arc<[T]>` (still 16 B fat pointer) while eliminating
+    empty-Arc allocations entirely (~96 MB savings at 1M rules).
+  - **Helper strategy change:** reuse existing intermediate
+    `Vec<PrefixV{4,6}>` parsing rather than separate
+    `collect_rule_side_prefixes` helpers that re-parse the same
+    tokens (Codex F5).
+  - **Explicit field init:** drop reliance on
+    `..PolicyRule::default()` for the four new fields to remove
+    AGY F2 silent-omission hazard.
+  - **Test plan expansion:** 6 → 11 tests covering legacy
+    `source_addresses` shape, `any4`/`any6`, /0-preserved,
+    multiple books with dense-index ordering, duplicate
+    literal/book prefixes, destination-side coverage, clone
+    integrity, trie-variant, zero-plus-non-zero (Codex F7 + AGY F3).
+  - **Cache-line wording tightened** to drop the
+    "lands at the end" claim about rustc field placement (Codex F1).
+  - **Consumer contract clarification** in §4.2: the parallel
+    array is INPUT prefix shape, NOT a complete semantic match
+    set; future LPM builder MUST read it together with the
+    `..._match_any` flag (Codex F6).
 
 ## 1. Issue framing
 
@@ -20,57 +39,71 @@ indefinitely pending #1622 empirical numbers on 10K/100K/1M-rule
 cold-path latency.
 
 User has authorized a **narrow Path B**: extend `PolicyRule` with
-parallel-prefix arrays (`prefixes_v4: Arc<[PrefixV4]>` +
-`prefixes_v6: Arc<[PrefixV6]>`), populated at parse-time exactly the
-way #1624 (PR for #1609 Step 1) extended `BookEntry`. This is the
-AGY r2 #1 simplification line item from #1623 — "parallel
-`prefixes_v4/v6: Arc<[Prefix]>` on PolicyRule (same shape as
-BookEntry from #1609 Step 1)".
+parallel-prefix arrays (`source_prefixes_v4`, `source_prefixes_v6`,
+`destination_prefixes_v4`, `destination_prefixes_v6` — each of
+type `Option<Arc<[Prefix...]>>`), populated at parse-time. This is
+the AGY r2 #1 simplification line item from #1623, adjusted to
+`Option<Arc<[T]>>` per AGY r1 / Codex r1 / Claude SMR r2
+convergence on the empty-Arc cost issue.
 
-The scope is foundational scaffolding only. The fields are populated
-but consumed nowhere. A future #1623 v4 design round may consume them
-when (and if) the architectural axis converges.
+The scope is foundational scaffolding only. The fields are
+populated but consumed nowhere. A future #1623 v4 design round may
+consume them when (and if) the architectural axis converges.
 
 ## 2. Honest scope / value framing
 
 Absolute scale of the win at this PR: **zero runtime cycles, zero
 bytes saved, zero retransmits avoided**. The new fields:
 
-- Add 32 bytes per `PolicyRule` (two 16-byte `Arc<[T]>` fat pointers).
-- Allocate twice per parse pass per rule (`Arc::from(slice)` for each
-  family). Parse time scales O(rules × literals + rules × cited-book-prefixes).
+- Add 64 bytes per `PolicyRule` (four 16-byte `Option<Arc<[T]>>`
+  fat-pointer fields — NPO makes `Option<Arc<[T]>>` the same size
+  as `Arc<[T]>`).
+- Allocate **only for non-empty sides**. A rule with `source any`
+  contributes `source_prefixes_v4 = None` and
+  `source_prefixes_v6 = None` — zero allocations. A rule with
+  literal CIDRs or cited books allocates one Arc per family per
+  side that has actual content.
 - Are read by NO hot-path code in this PR.
 
 The value is purely structural — it materializes the per-rule
 canonical prefix list at parse time so a future LPM builder can
 consume it without re-walking trie-compressed `PrefixSet` values.
-This matches the exact shape `BookEntry` already carries since
-#1624 (`d339b69f8`).
 
 **If reviewers conclude that materializing dead-storage fields
 without a concrete consumer is not worth the parse-time cost and
-churn, PLAN-KILL is an acceptable verdict.** The #1624 BookEntry
-precedent shipped clean with a 4-of-4 attestation, so the prior is
-favorable, but this is still 32 bytes + two allocations per rule of
-pure foundation work.
++64 B/rule footprint, PLAN-KILL is an acceptable verdict.** The
+#1624 BookEntry precedent shipped clean with a 4-of-4 attestation,
+but Codex r1 correctly notes the cardinality difference (books
+~10s vs rules ~1M) — the precedent doesn't transfer cleanly.
 
-### 2.1 Accepted costs (per Claude SMR r1 F-SMR-r1-1)
+### 2.1 Accepted costs (Codex F2/F4 cardinality argument + Claude SMR r2 C5)
 
-- **1M-rule book-prefix replication (~80 MB at 1M cited-book-only
-  rules with a 10-prefix book).** A rule that cites a book today
-  references the book by dense index; with parallel arrays it
-  additionally carries a *copy* of the book's prefixes. The
-  alternative shape (`SmallVec<[Arc<[PrefixV4]>; 4]>` to share
-  storage with `BookEntry.prefixes_v4`) diverges from the #1624
-  flat-Arc contract and forces the future LPM builder to fan
-  out across multiple Arc refs. Plan v2 accepts the replication
-  cost as a deferred optimization to be revisited if #1622
-  measurements show parse-time allocation pressure or memory
-  footprint regression at 1M rules. This is foundation
-  scaffolding — the simple shape wins now, and the future LPM
-  builder + #1622 measurements decide the optimization later.
+- **Per-rule struct growth: +64 B.** With `Option<Arc<[T]>>`, four
+  fields × 16 B (NPO-collapsed) = 64 B. At 1M rules: ~430 B → ~494 B
+  → ~430 MB → ~494 MB resident rule table. Within 8-16 GB VM
+  budget. Codex F1 correctly notes the struct growth changes
+  Vec<PolicyRule> stride; this is accepted as the foundation cost.
+- **Book-prefix replication.** A rule that cites a 10-prefix
+  book materializes those 10 prefixes into its
+  `source_prefixes_v4` Arc rather than sharing the book's already-
+  allocated `Arc<[PrefixV4]>`. At 1M cited-book-only rules with
+  one 10-prefix book: ~80 MB of replication. **This is an
+  explicit deferred optimization.** A future shape change to
+  `Option<SmallVec<[Arc<[PrefixV4]>; 4]>>` (referencing each
+  contributing source's existing Arc) would eliminate the
+  replication at the cost of diverging from the #1624 BookEntry
+  flat-Arc contract. Decision deferred to #1623 v4 design round
+  once #1622 measurements quantify whether parse-time
+  allocation or memory footprint is actually the bottleneck.
+- **Empty-Arc cost: ELIMINATED.** Plan v2 → v3 shape change
+  (`Arc<[T]>` → `Option<Arc<[T]>>`) saves ~96 MB at 1M all-`any`
+  rules. NPO ensures zero per-field size overhead vs the bare
+  `Arc<[T]>` shape.
 
-## 3. Precedent — #1624 BookEntry parallel arrays
+If reviewers still find +64 B × 1M rules prohibitive,
+PLAN-KILL on the cardinality axis is acceptable.
+
+## 3. Precedent — #1624 BookEntry parallel arrays (and where this PR diverges)
 
 PR #1624 (squash `d339b69f8`) extended `BookEntry`:
 
@@ -78,63 +111,61 @@ PR #1624 (squash `d339b69f8`) extended `BookEntry`:
 pub(crate) struct BookEntry {
     pub(crate) v4: PrefixSetV4,
     pub(crate) v6: PrefixSetV6,
-    pub(crate) prefixes_v4: Arc<[PrefixV4]>,  // NEW
-    pub(crate) prefixes_v6: Arc<[PrefixV6]>,  // NEW
+    pub(crate) prefixes_v4: Arc<[PrefixV4]>,  // bare Arc<[T]>
+    pub(crate) prefixes_v6: Arc<[PrefixV6]>,
 }
 ```
 
-Population at `parse_policy_state_with_counters` after the literal
-parse loops, BEFORE moving the Vecs into `from_v3_literals`:
+**This PR diverges from the precedent in one specific way:**
+`Option<Arc<[T]>>` instead of bare `Arc<[T]>` on PolicyRule. The
+divergence is motivated by cardinality:
 
-```rust
-let prefixes_v4: Arc<[PrefixV4]> = Arc::from(v4.as_slice());
-let prefixes_v6: Arc<[PrefixV6]> = Arc::from(v6.as_slice());
-let entry = BookEntry {
-    v4: PrefixSetV4::from_v3_literals(v4),
-    v6: PrefixSetV6::from_v3_literals(v6),
-    prefixes_v4,
-    prefixes_v6,
-};
-```
+- BookEntry runs at ~10-100 entries; an empty-Arc footprint there
+  is ~2.4 KB (100 × 24 B), trivial.
+- PolicyRule runs at 1K-1M entries; an empty-Arc footprint at 1M
+  is ~96 MB (1M × 4 × 24 B). Structural problem.
 
-Six unit tests in `policy_tests.rs` lines 1015-1280 covering: empty
-book, v4-only, v6-only, dual-family, /0 preserved, trie-variant
-(17+ prefixes), /0-plus-non-/0 preserved.
+The future Multi-Book LPM builder reads BookEntry parallel arrays
+as `book.prefixes_v4.iter()` (bare Arc); for PolicyRule it reads
+`rule.source_prefixes_v4.as_deref().unwrap_or(&[]).iter()` (Option
+unwrap). The semantic of "rule with no source-side input
+prefixes" is communicated by `None`, equivalent to BookEntry's
+empty-Arc + `v4.is_match_none()` shape but cheaper.
 
-This PR mirrors that exact pattern for `PolicyRule`.
+The future LPM builder can also wrap BookEntry's parallel arrays
+into Some(book.prefixes_v4.clone()) for uniform handling if
+needed — Arc clones are cheap.
 
 ## 4. Concrete design
 
 ### 4.1 Struct extension
 
-Add two fields to `PolicyRule` (currently `userspace-dp/src/policy.rs`
+Add four fields to `PolicyRule` (currently `userspace-dp/src/policy.rs`
 lines 122-155):
 
 ```rust
 pub(crate) struct PolicyRule {
-    // ... existing fields ...
-    pub(crate) source_literal_v4: PrefixSetV4,
-    pub(crate) source_literal_v6: PrefixSetV6,
-    pub(crate) destination_literal_v4: PrefixSetV4,
-    pub(crate) destination_literal_v6: PrefixSetV6,
-    pub(crate) source_book_idxs: SmallVec<[u32; 8]>,
+    // ... existing fields through destination_book_idxs ...
     pub(crate) destination_book_idxs: SmallVec<[u32; 8]>,
 
     // #1623 Path B narrow — parallel canonical prefix arrays for
-    // the future Multi-Book LPM builder. NOT consumed by the
-    // hot path in this PR. Populated at parse-time mirroring the
-    // #1624 BookEntry precedent.
-    pub(crate) source_prefixes_v4: Arc<[PrefixV4]>,
-    pub(crate) source_prefixes_v6: Arc<[PrefixV6]>,
-    pub(crate) destination_prefixes_v4: Arc<[PrefixV4]>,
-    pub(crate) destination_prefixes_v6: Arc<[PrefixV6]>,
+    // a future Multi-Book LPM builder. NOT consumed by the hot
+    // path in this PR. `None` means "this side contributed no
+    // input prefixes" (typically: source-any rule); the existing
+    // source_v{4,6}_match_any / destination_v{4,6}_match_any
+    // booleans remain the SOLE signal for any-side semantics.
+    //
+    // Shape: Option<Arc<[T]>> (not bare Arc<[T]>) — NPO collapses
+    // this to one fat-pointer-sized field. Empty-Arc allocation
+    // for all-any rules is ELIMINATED.
+    pub(crate) source_prefixes_v4: Option<Arc<[PrefixV4]>>,
+    pub(crate) source_prefixes_v6: Option<Arc<[PrefixV6]>>,
+    pub(crate) destination_prefixes_v4: Option<Arc<[PrefixV4]>>,
+    pub(crate) destination_prefixes_v6: Option<Arc<[PrefixV6]>>,
 
-    // ... rest ...
+    // ... rest: match_any flags, applications, compiled_apps, action, hit_counter ...
 }
 ```
-
-`Default` and `Clone` impls extended to cover these. `Default` uses
-`Arc::from(&[][..])` (empty slice) for each.
 
 ### 4.2 Semantic contract for the parallel arrays
 
@@ -147,153 +178,212 @@ The arrays carry the union of:
    (`state.books[i].prefixes_v4` / `prefixes_v6` for each
    `i ∈ source_book_idxs`).
 
-A rule with `source any` (no literals, no books) gets an EMPTY
-array. The existing `source_v4_match_any` / `source_v6_match_any`
-boolean flags continue to signal "any" semantics; the parallel
-array does NOT carry an explicit `0.0.0.0/0` synthetic entry. This
-matches the #1624 BookEntry decision (parallel arrays preserve
-input, do not synthesize markers).
+`None` means "no input prefixes contributed on this side, for this
+family". This is the case for:
+- `source_literals: ["any"]` rules (no per-rule literal prefixes,
+  no cited books that contribute v4/v6 prefixes).
+- `source_addresses: ["any"]` legacy shape.
+- Rules where every cited book has an empty `prefixes_v4` for the
+  v4 case (similarly v6).
 
-**Why mirror the #1624 contract exactly:** synthesizing `[0.0.0.0/0]`
-for the any-side case would diverge from BookEntry semantics and
-require future LPM builder code to handle two conventions. Keeping
-the parallel array as the union of *input* prefixes (literal +
-cited-book) preserves the invariant "parallel arrays carry input
-prefix shape verbatim; MatchAny is communicated via the dedicated
-boolean flag". Per-rule `any` is structurally identical to
-"empty literal set + zero cited books" — the future LPM builder
-treats both via the MatchAny short-circuit per plan §2.1, NOT via
-a synthetic /0 entry.
+`Some(arr)` with `arr.len() == 0` is NEVER produced. The parse
+logic in §4.3 converts an empty union vector to `None`.
 
-### 4.3 Population at parse-time
+**Consumer contract (Codex F6 clarification).** A downstream LPM
+builder MUST read both `(source_prefixes_v4, source_v4_match_any)`
+together. The parallel array is INPUT prefix shape — it does NOT
+encode any semantic ("match any") by itself. The match-any flag
+remains the authoritative source of any-side semantics. If
+match_any is true AND the array is `Some(arr)`, the consumer is
+free to use `arr` to inform LPM build (the rule still matches all
+addresses, but the operator-stated CIDRs are recoverable for
+diagnostics or for §2.6 short-circuit routing).
 
-Inside `parse_policy_state_with_counters` (currently lines 477-560
-of `policy.rs`), after the literal parse and book-idx resolve but
-before the `PolicyRule { ... }` construction, materialize the
-union arrays:
+**Why NOT a synthetic `[0.0.0.0/0]`:** synthesizing /0 for the any
+case would fragment the contract: the same value `Some([0.0.0.0/0])`
+would mean two different things depending on whether the operator
+actually wrote `source 0.0.0.0/0` (literal) vs `source any` (no
+literal). Keeping `None == "no literal contribution"` preserves
+input fidelity.
+
+### 4.3 Population at parse-time (Codex F5: no helper re-parse)
+
+The existing parse loop at policy.rs:485-510 already materializes
+intermediate `Vec<PrefixV4>` + `Vec<PrefixV6>` for the literal
+CIDR side. Refactor to CAPTURE these intermediates before they're
+moved into the PrefixSet factories, then extend with cited-book
+prefixes to materialize the parallel array.
+
+The replacement structure:
 
 ```rust
-// #1623 Path B: materialize canonical per-rule prefix arrays.
-// Union of (literal CIDRs parsed for this side) + (every prefix
-// of every cited book on this side).
-let source_prefixes_v4 = collect_rule_side_prefixes_v4(
-    &snap.source_addresses,
-    &snap.source_literals,
-    source_is_v3_shaped,
+// Build literal prefix sets per side, capturing the intermediate
+// Vec for parallel-array reuse.
+let (
+    source_literal_v4,
+    source_literal_v6,
+    src_lit_v4_vec,
+    src_lit_v6_vec,
+    src_any_v4_literal,
+    src_any_v6_literal,
+) = if source_is_v3_shaped {
+    parse_v3_literal_set_capture(&snap.source_literals)
+} else {
+    let mut v4: Vec<PrefixV4> = Vec::new();
+    let mut v6: Vec<PrefixV6> = Vec::new();
+    for prefix in &snap.source_addresses {
+        parse_address(prefix, &mut v4, &mut v6);
+    }
+    // Legacy shape: empty -> MatchAny (per from_prefixes semantics).
+    let any_v4 = v4.is_empty();
+    let any_v6 = v6.is_empty();
+    (
+        PrefixSetV4::from_prefixes(v4.clone()),
+        PrefixSetV6::from_prefixes(v6.clone()),
+        v4,
+        v6,
+        any_v4,
+        any_v6,
+    )
+};
+// ... same for destination ...
+
+// Materialize the parallel arrays by extending the captured
+// literal vectors with each cited book's prefixes_v{4,6}.
+let source_prefixes_v4 = build_rule_side_arc(
+    src_lit_v4_vec,
     &source_book_idxs,
     &state.books,
+    |book| &book.prefixes_v4,
 );
-let source_prefixes_v6 = collect_rule_side_prefixes_v6(
-    &snap.source_addresses,
-    &snap.source_literals,
-    source_is_v3_shaped,
-    &source_book_idxs,
-    &state.books,
-);
-let destination_prefixes_v4 = collect_rule_side_prefixes_v4(
-    &snap.destination_addresses,
-    &snap.destination_literals,
-    destination_is_v3_shaped,
-    &destination_book_idxs,
-    &state.books,
-);
-let destination_prefixes_v6 = collect_rule_side_prefixes_v6(
-    &snap.destination_addresses,
-    &snap.destination_literals,
-    destination_is_v3_shaped,
-    &destination_book_idxs,
-    &state.books,
-);
+// ... symmetric for source_v6 / destination_v4 / destination_v6 ...
 ```
 
-Helper signatures (private to `policy.rs`):
+Where `build_rule_side_arc` is a small generic helper:
 
 ```rust
-fn collect_rule_side_prefixes_v4(
-    addresses: &[String],
-    literals: &[String],
-    is_v3_shaped: bool,
+fn build_rule_side_arc<T: Clone, F>(
+    mut lit_vec: Vec<T>,
     book_idxs: &SmallVec<[u32; 8]>,
     books: &[BookEntry],
-) -> Arc<[PrefixV4]> {
-    let mut v4: Vec<PrefixV4> = Vec::new();
-    let mut v6_scratch: Vec<PrefixV6> = Vec::new();
-    if is_v3_shaped {
-        for tok in literals {
-            match tok.as_str() {
-                // v3 "any" / "any4" / "any6" tokens do NOT contribute
-                // prefixes — match-any is communicated via the
-                // existing source_v{4,6}_match_any flags.
-                "any" | "any4" | "any6" | "" => {}
-                s => parse_literal_cidr_into(s, &mut v4, &mut v6_scratch),
-            }
-        }
-    } else {
-        for prefix in addresses {
-            parse_address(prefix, &mut v4, &mut v6_scratch);
-        }
-    }
+    extractor: F,
+) -> Option<Arc<[T]>>
+where
+    F: Fn(&BookEntry) -> &Arc<[T]>,
+{
     for &idx in book_idxs.iter() {
         let book = &books[idx as usize];
-        v4.extend_from_slice(&book.prefixes_v4);
+        lit_vec.extend_from_slice(extractor(book));
     }
-    Arc::from(v4.as_slice())
+    if lit_vec.is_empty() {
+        None
+    } else {
+        Some(Arc::from(lit_vec.as_slice()))
+    }
 }
-// Symmetric for v6 — drop v4 scratch, capture v6.
 ```
 
-**Ordering note (Claude SMR r1 F-SMR-r1-6 clarified):** The arrays
-are NOT sorted, NOT deduped. They carry "union of input prefixes in
-the following order:
-1. The rule's own literal CIDRs in `snap.source_literals` /
-   `snap.source_addresses` order (whichever shape applies).
-2. Each cited book's `BookEntry.prefixes_v4` (or `prefixes_v6`),
-   walked in the order of `source_book_idxs` /
-   `destination_book_idxs`. Note that `resolve_book_idxs()` already
-   `sort_unstable() + dedup()`s the input IDs into dense-index
-   ascending order, so cited-book contributions appear in
-   ascending dense-index order regardless of the operator's
-   declared `source_book_ids` order. This stability is asserted
-   by `test_policy_rule_book_only_rule_inherits_book_prefixes`.
+And `parse_v3_literal_set_capture` is `parse_v3_literal_set`
+refactored to ALSO return the captured Vec + the any-token flags:
 
-The future LPM builder is free to sort/dedup as needed. This PR
-makes no correctness claim about ordering beyond the above — it
-matches the #1624 BookEntry contract (which also does not sort).
+```rust
+fn parse_v3_literal_set_capture(
+    literals: &[String],
+) -> (PrefixSetV4, PrefixSetV6, Vec<PrefixV4>, Vec<PrefixV6>, bool, bool) {
+    let mut any_v4 = false;
+    let mut any_v6 = false;
+    let mut v4: Vec<PrefixV4> = Vec::new();
+    let mut v6: Vec<PrefixV6> = Vec::new();
+    for tok in literals {
+        match tok.as_str() {
+            "any" => { any_v4 = true; any_v6 = true; }
+            "any4" => any_v4 = true,
+            "any6" => any_v6 = true,
+            "" => {}
+            s => parse_literal_cidr_into(s, &mut v4, &mut v6),
+        }
+    }
+    let v4_set = if any_v4 {
+        PrefixSetV4::MatchAny
+    } else {
+        PrefixSetV4::from_v3_literals(v4.clone())
+    };
+    let v6_set = if any_v6 {
+        PrefixSetV6::MatchAny
+    } else {
+        PrefixSetV6::from_v3_literals(v6.clone())
+    };
+    (v4_set, v6_set, v4, v6, any_v4, any_v6)
+}
+```
 
-### 4.4 Default impl (Claude SMR r1 F-SMR-r1-2: share global empty Arc)
+Note: `v4.clone()` + `v6.clone()` inside `parse_v3_literal_set_capture`
+adds one Vec clone per side per rule on the parse path. This is
+cold path; the alternative (passing ownership and returning the
+captured Vec only when the factory is done) requires intrusive
+changes to `PrefixSetV{4,6}::from_v3_literals`. For the narrow
+foundation PR, the extra clone is acceptable.
+
+**Ordering note.** Both `lit_v4_vec` and the per-book
+`prefixes_v4` arrays carry their natural input ordering. The
+`source_book_idxs` SmallVec is already sorted ascending by dense
+index (via `resolve_book_idxs::sort_unstable() + dedup()`), so
+cited-book contributions appear in ascending dense-index order
+regardless of the operator's declared `source_book_ids` order.
+Final union order: literals first (in `snap.source_literals`
+parse order), then each cited book's `prefixes_v4` in
+dense-index-ascending order. No sort, no dedup at this layer.
+
+### 4.4 Default impl (AGY F2: explicit field assignment, no `..default()` reliance for new fields)
+
+`PolicyRule::default()` extended to set all four new fields to
+`None`:
 
 ```rust
 impl Default for PolicyRule {
     fn default() -> Self {
         Self {
             // ... existing fields ...
-            source_prefixes_v4: <Arc<[PrefixV4]>>::default(),
-            source_prefixes_v6: <Arc<[PrefixV6]>>::default(),
-            destination_prefixes_v4: <Arc<[PrefixV4]>>::default(),
-            destination_prefixes_v6: <Arc<[PrefixV6]>>::default(),
+            source_prefixes_v4: None,
+            source_prefixes_v6: None,
+            destination_prefixes_v4: None,
+            destination_prefixes_v6: None,
             // ...
         }
     }
 }
 ```
 
-`<Arc<[T]>>::default()` returns the canonical empty Arc — the
-implementation in `alloc::sync` returns an Arc constructed from an
-empty `Box<[T]>` (single allocation per `default()` call in
-current stable Rust; std does NOT yet share a single global empty
-Arc across all callers, but the allocation is a 24 B header with
-no payload). Using `default()` avoids the explicit
-`Arc::from(&[][..])` call site repeated four times and inherits
-whatever optimization std applies in the future.
+The existing `PolicyRule { ..PolicyRule::default() }` constructor
+at lines 540-560 is updated to assign all four new fields
+EXPLICITLY (NOT relying on the `..default()` fallback, per AGY
+F2):
 
-`BookEntry` derives `Default` via the field-level
-`Arc<[T]>: Default` blanket impl — same result. Mirrors the
-#1624 BookEntry precedent.
+```rust
+let mut rule = PolicyRule {
+    rule_id: rule_id.clone(),
+    policy_id: snap.policy_id,
+    // ... other explicitly-assigned fields ...
+    source_prefixes_v4,
+    source_prefixes_v6,
+    destination_prefixes_v4,
+    destination_prefixes_v6,
+    ..PolicyRule::default()
+};
+```
+
+The `..PolicyRule::default()` tail remains for the
+`applications: Vec::new()` + `compiled_apps: CompiledApplications { match_any: true, ... }`
+fields (currently filled in after the `..default()` via mutation
+on lines 561-562 — that pattern is preserved). The four new
+fields are NOT in the `..default()` tail; they are explicitly
+named, so adding any future field to PolicyRule cannot silently
+zero them.
 
 ### 4.5 Clone impl
 
 Add the four fields to the manual `Clone` impl (lines 187-212).
-Each is a single `Arc` ref-count bump:
+Each is a single `Arc` ref-count bump for `Some`, no-op for `None`:
 
 ```rust
 source_prefixes_v4: self.source_prefixes_v4.clone(),
@@ -302,41 +392,45 @@ destination_prefixes_v4: self.destination_prefixes_v4.clone(),
 destination_prefixes_v6: self.destination_prefixes_v6.clone(),
 ```
 
+`Option<Arc<[T]>>::clone()` does exactly this: `None.clone() ==
+None`, `Some(arc).clone() == Some(arc.clone())` (Arc::clone is
+one atomic increment).
+
 ## 5. Public API preservation
 
 `PolicyRule` is `pub(crate)`, so no public Rust API surface is
 touched. The wire protocol (`PolicyRuleSnapshot` in
-`protocol/security.rs`) is NOT modified — these fields are
-in-memory only, populated from the existing wire fields.
-
-`evaluate_policy()` (lines 670+) is NOT modified. The new fields
-are populated and dropped; the hot path reads only the existing
-`PrefixSetV{4,6}` + book table + match-any flags.
-
-No Go-side changes. The Go control plane already serializes the
-existing `source_book_ids` / `source_addresses` / `source_literals`
-fields, and that wire shape is unchanged.
+`protocol/security.rs`) is NOT modified. No Go-side changes.
+`evaluate_policy()` (lines 670+) is NOT modified.
 
 ## 6. Hidden invariants this change must preserve
 
 - **Hot path zero-touch.** `evaluate_policy()` and every function
-  called per packet must not reference the new fields. Verify with
-  `grep prefixes_v[46]` after implementation: hits only in
-  `parse_policy_state_with_counters` + struct definitions + tests.
-- **PolicyRule cloneability.** `PolicyState` clones rules on
-  reconcile_rules; the new Arc fields are clone-cheap (ref-count
-  bump) but must be in the manual `Clone` impl.
+  called per packet must not reference the new fields. Verified
+  post-impl via:
+  `grep -nE "(source|destination)_prefixes_v[46]" userspace-dp/src/`
+  — hits only in struct definition, parse loop, Default impl,
+  Clone impl, and tests.
+- **PolicyRule cloneability.** PolicyState clones rules on
+  reconcile_rules; the new Option<Arc> fields are clone-cheap
+  (None: no-op; Some: ref-count bump).
 - **MatchAny semantics unchanged.** The existing
   `source_v{4,6}_match_any` / `destination_v{4,6}_match_any`
   booleans are the SOLE signal for any-side semantics. Parallel
   arrays do NOT participate in policy evaluation.
 - **Default impl correctness.** `PolicyRule::default()` returns
-  rules with empty parallel arrays AND `..._match_any = true`
-  (existing). This is consistent — the default-constructed rule
-  matches any address but carries no canonical prefix shape.
-- **Parse-time allocation cost.** Each parse pass allocates 4 Arcs
-  per rule (4 sides × 4 family-arrays = 4 Arc headers + payload).
-  For 1K rules: 4K allocs at parse time, < 1MB total. Acceptable.
+  rules with `None` parallel arrays AND `..._match_any = true`
+  (existing). Consistent with the existing default-rule
+  semantics: default-constructed rule matches any address,
+  carries no operator-stated input prefixes.
+- **Constructor robustness.** The four new fields are EXPLICITLY
+  named in the `parse_policy_state_with_counters` constructor
+  (NOT relying on `..PolicyRule::default()`), so future field
+  additions cannot silently zero them.
+- **Parse-time allocation cost.** Each parse pass allocates at
+  most 4 Arcs per rule (one per non-empty Option). For 1K rules
+  where most cite a book + carry a few literals: ~4K allocs at
+  parse time. For 1M all-any rules: 0 allocs (Option = None).
   Hot path: zero new allocs.
 - **HA sync portability.** PolicyState is rebuilt from
   `PolicyRuleSnapshot` (wire format) on every reconcile; the new
@@ -348,55 +442,80 @@ fields, and that wire shape is unchanged.
 | Class | Risk | Reasoning |
 |-------|------|-----------|
 | Behavioral regression | LOW | Hot path untouched. New fields populated but read nowhere. |
-| Lifetime / borrow-checker | LOW | `Arc<[T]>` is `'static`, `Clone`, `Send + Sync`. Mirrors #1624 BookEntry. |
-| Performance regression | LOW–MED | Parse-time: O(rules × prefixes) extra work + 4 Arcs/rule. Cold path. Reconcile-on-config-change only. |
-| Architectural mismatch | LOW | This is foundation work the future LPM builder needs. If the builder never ships, the cost is 32B/rule + dead allocations — small. #1624 precedent already lives in master uncontested. |
-
-The non-trivial risk is the `Default` impl breaking codepaths that
-construct partial `PolicyRule { ..PolicyRule::default() }` and
-rely on parallel-array fields existing — but this only matters if
-something reads them, which is exactly what we're banning. Grep
-post-impl confirms.
+| Lifetime / borrow-checker | LOW | `Option<Arc<[T]>>` is `'static`, `Clone`, `Send + Sync`. Mirrors #1624 BookEntry up to the Option wrapper. |
+| Performance regression | LOW–MED | Parse-time: O(rules × prefixes) extra work + up to 4 Arcs/rule (only for non-empty sides). Cold path. Reconcile-on-config-change only. +64 B/rule struct growth. |
+| Architectural mismatch | LOW | Foundation work the future LPM builder needs. If the builder never ships, the cost is +64 B/rule + Arc allocations for populated rules — small. Codex F2 cardinality argument addressed by the Option<Arc<[T]>> shape change. |
 
 ## 8. Test plan
 
-### 8.1 New unit tests in `policy_tests.rs`
+### 8.1 New unit tests in `policy_tests.rs` (11 tests, Codex F7 + AGY F3 expansion)
 
-Six tests mirroring the #1624 BookEntry test suite:
-
-1. `test_policy_rule_carries_canonical_prefix_lists_v4` — rule
-   with three v4 literal CIDRs + one cited book (one v4 prefix);
-   assert `source_prefixes_v4.len() == 4` and every entry
-   "round-trips" through the matching `PrefixSet` (i.e.
-   `source_literal_v4.contains(p.addr()) ||
-    book.v4.contains(p.addr())`).
-2. `test_policy_rule_carries_canonical_prefix_lists_v6` — same
+1. `test_policy_rule_v3_carries_canonical_prefix_lists_v4` — rule
+   with three v4 literal CIDRs + one cited v4-only book. Assert
+   `source_prefixes_v4 = Some(arr)` with `arr.len() == 4` and
+   contents include all literals + all book prefixes; assert
+   `source_prefixes_v6 = None` and
+   `destination_prefixes_v4 = None` (destination is `any`).
+2. `test_policy_rule_v3_carries_canonical_prefix_lists_v6` — same
    shape, v6 only.
-3. `test_policy_rule_carries_canonical_prefix_lists_dual_family`
-   — both v4 + v6 literals, single book contributing both.
-4. `test_policy_rule_any_source_has_empty_parallel_arrays` —
-   rule with `source_literals: ["any"]`, no books, no
-   addresses. Assert `source_prefixes_v4.is_empty()` AND
-   `source_prefixes_v6.is_empty()` AND
-   `source_v4_match_any == true` AND
-   `source_v6_match_any == true`. Demonstrates the
-   "any communicated via flag, not synthetic /0" contract.
-5. `test_policy_rule_book_only_rule_inherits_book_prefixes` —
-   rule with `source_book_ids: [N]`, empty `source_literals`.
-   Assert the rule's `source_prefixes_v4` equals the book's
-   `prefixes_v4` in length AND content.
-6. `test_policy_rule_destination_side_independent_from_source` —
-   rule with different source vs destination shape (e.g. source
-   is `any`, destination is two literal CIDRs). Assert source
-   arrays are empty AND destination arrays carry the two
-   literals.
+3. `test_policy_rule_v3_dual_family` — rule with v4 + v6 literals
+   + a dual-family book. Assert both Some arrays populated
+   independently with correct content.
+4. `test_policy_rule_v3_any_source_yields_none` — rule with
+   `source_literals: ["any"]`, no books, no addresses. Assert
+   `source_prefixes_v4 == None` AND `source_prefixes_v6 == None`
+   AND `source_v4_match_any == true` AND
+   `source_v6_match_any == true`. **Critical:** demonstrates the
+   "any → None + flag" contract and the empty-Arc avoidance.
+5. `test_policy_rule_v3_book_only_inherits_book_prefixes` — rule
+   with `source_book_ids: [N]`, empty literals. Assert
+   `source_prefixes_v4` matches the cited book's `prefixes_v4`
+   exactly (same length, same contents in order).
+6. `test_policy_rule_v3_multiple_books_dense_index_order` — rule
+   with `source_book_ids: [3, 1, 2]` resolving to dense indices
+   in ascending order (assert ordering invariant from §4.3).
+   Each book contributes distinct prefixes; final array order
+   must reflect dense-index-ascending walk.
+7. `test_policy_rule_legacy_source_addresses_path` (Codex F7) —
+   non-v3-shaped rule (`source_addresses: ["10.0.0.0/8"]`, no
+   `source_literals`, no books). Assert
+   `source_prefixes_v4 = Some([10.0.0.0/8])` with one element.
+8. `test_policy_rule_v3_any4_any6_tokens` (Codex F7) — rule with
+   `source_literals: ["any4"]` (no any6). Assert
+   `source_prefixes_v4 = None` AND `source_v4_match_any == true`,
+   AND `source_prefixes_v6 = None` AND
+   `source_v6_match_any == false` (no any6 token, no v6 input).
+   Then second case `["any6"]`: symmetric.
+9. `test_policy_rule_v3_literal_zero_prefix_preserved` (AGY F3
+   mirror of BookEntry test 1112) — rule with
+   `source_literals: ["0.0.0.0/0"]` (LITERAL /0, NOT "any").
+   Assert `source_v4_match_any == true` (PrefixSet collapses /0
+   to MatchAny) AND `source_prefixes_v4 = Some(arr)` with
+   `arr.len() == 1` AND `arr[0].prefix_len() == 0`.
+   **Critical:** demonstrates `Some([0.0.0.0/0])` ≠ `None` and
+   preserves operator input fidelity for diagnostics.
+10. `test_policy_rule_v3_destination_side_independent` (Codex F7)
+    — rule with `source_literals: ["any"]`, `destination_literals:
+    ["10.0.0.0/8", "192.168.1.0/24"]`. Assert source side is
+    `None` for both families; destination_v4 is
+    `Some([10.0.0.0/8, 192.168.1.0/24])`, destination_v6 is `None`.
+11. `test_policy_rule_v3_trie_variant_preserves_array` (AGY F3
+    mirror of BookEntry test 1170) — rule with 17 literal CIDRs
+    (`10.0.{0..16}.0/24`). Assert
+    `source_literal_v4 == PrefixSetV4::Trie(_)` AND
+    `source_prefixes_v4 = Some(arr)` with all 17 entries
+    preserved (parallel array is variant-independent).
+12. `test_policy_rule_clone_preserves_arrays` (AGY F3) — build a
+    rule with both `Some(arr)` and `None` fields; clone it; assert
+    cloned values are equal (Arc ptr-equality for Some,
+    None preserved).
 
 ### 8.2 Cargo gates
 
 ```bash
 TMPDIR=/dev/shm CARGO_TARGET_DIR=/dev/shm/cargo cargo build --release 2>&1 | tail -3
 TMPDIR=/dev/shm CARGO_TARGET_DIR=/dev/shm/cargo cargo test --release 2>&1 | tail -3
-# 5x flake check on the broadest new test
+# 5x flake check on the new test module
 for i in 1 2 3 4 5; do
   TMPDIR=/dev/shm CARGO_TARGET_DIR=/dev/shm/cargo \
     cargo test --release test_policy_rule_ 2>&1 | grep "test result" | tail -1
@@ -425,107 +544,77 @@ both nodes independently from the same wire snapshot).
 
 ## 9. Out of scope (explicitly)
 
-- **NO Multi-Book LPM.** The whole DAG / Stage 2/3/4 / DIR-24-8 /
-  bounded multibit trie / galloping merge work is deferred to
-  #1623 v4 (which may never happen if #1622 numbers don't
-  motivate it).
-- **NO PseudoBook materialization.** The plan §2.2 PseudoBook
-  scheme is not implemented in this PR.
-- **NO feature flag.** There's no consumer; no flag needed.
-- **NO hot-path changes.** `evaluate_policy()` is byte-for-byte
-  identical.
-- **NO wire-protocol changes.** `PolicyRuleSnapshot` is unchanged.
-- **NO `pkg/cluster/`, `pkg/policy/`, or Go-side compiler
-  changes.** Pure Rust-side in-memory extension.
-- **NO sort / dedup of parallel arrays.** Order matches input
-  parse order (literals first, then cited-book prefixes in
-  book_idxs order), no dedup. Future LPM builder owns sort/dedup.
+- **NO Multi-Book LPM.** Whole DAG / Stage 2/3/4 / DIR-24-8 /
+  bounded multibit trie / galloping merge — deferred to #1623 v4.
+- **NO PseudoBook materialization.**
+- **NO feature flag.**
+- **NO hot-path changes.** `evaluate_policy()` byte-identical.
+- **NO wire-protocol changes.**
+- **NO `pkg/cluster/`, `pkg/policy/`, or Go-side compiler changes.**
+- **NO sort / dedup of parallel arrays.**
+- **NO shared-storage shape change to `Option<SmallVec<[Arc<[T]>; 4]>>`.**
+  Deferred optimization per §2.1 if #1622 shows replication is a
+  bottleneck.
 
-## 10. Open questions for adversarial review
+## 10. Open questions for adversarial r2 review
 
-1. **Construction-order semantics.** Should the parallel arrays
-   be sorted + deduped at parse-time (cheaper for the future LPM
-   builder), or kept as raw input concatenation (matches #1624
-   BookEntry semantics, which also does NOT sort)? Plan picks
-   raw input order to match #1624 — is that the wrong call?
-2. **`any` semantics.** When `source_literals: ["any"]`, should
-   `source_prefixes_v4` carry an explicit `[0.0.0.0/0]` synthetic
-   entry, or stay empty (with `source_v4_match_any` as the sole
-   signal)? Plan picks empty + flag (matches §4.2 invariant).
-   Is the synthetic-/0 approach actually preferable for an LPM
-   builder that needs to route /0 through a short-circuit?
-3. **Cache-line impact.** Approximate field-by-field accounting
-   on x86_64 (rustc stable):
-   - rule_id: 24 B (String)
-   - policy_id: 4 B (u32, +4 B pad)
-   - from_zone, to_zone, scheduler_name: 3 × 24 B = 72 B (Strings)
-   - inactive: 1 B (+ 7 B align pad)
-   - 4 × PrefixSet{V4,V6} enum: roughly 4 × ~32 B = 128 B (enum
-     tag + largest variant, depends on `PrefixSetV4` shape —
-     `Linear` carries Vec, `Trie` carries Box<...>, so ~24-32 B)
-   - 2 × SmallVec<[u32; 8]>: 2 × ~40 B = 80 B (8 inline u32 = 32 B
-     + len/cap discriminant header ~8 B)
-   - 4 × bool match_any: 4 B (+ 4 B pad)
-   - applications: Vec<ApplicationMatch> = 24 B
-   - compiled_apps: CompiledApplications = ~56 B (bool + FxHashMap)
-   - action: enum = 1 B (+ 7 B pad)
-   - hit_counter: Arc<...> = 8 B
+### Resolved in v2 → v3 transition:
 
-   Rough total before: ~430 B (≈ 7 cache lines on 64 B lines).
+- ~~Q1 (sorted/deduped vs raw input):~~ raw input order, per §4.3 final paragraph.
+- ~~Q2 (synthetic /0 vs empty + flag):~~ `None` + flag, per §4.2 contract. Literal /0 preserved as `Some([0/0])` for fidelity.
+- ~~Q3 (cache-line impact):~~ +64 B accepted in §2.1 + risk table.
+- ~~Q4 (1M-rule replication):~~ accepted deferred opt per §2.1 last bullet.
+- ~~Q5 (empty-Arc footprint):~~ resolved by Option<Arc<[T]>> shape — empty case allocates zero bytes.
 
-   **Post-change:** +4 × 16 B = +64 B → ~494 B (≈ 8 cache lines).
-   The struct already straddles multiple cache lines today.
-   `evaluate_policy()` reads (per call): action, applications +
-   compiled_apps, the four PrefixSet fields, the four match-any
-   bools. These are scattered across lines 1-6 today and will
-   remain so post-change. The new fields land at the end of the
-   struct (lines 7-8) and are NOT read by `evaluate_policy()` by
-   contract. Cache-line touch count for a policy hit: UNCHANGED.
+### New for r2:
 
-   The honest concern: a future LPM-builder consumer of these
-   fields would touch lines 7-8 once at LPM build time per
-   PolicyState reconcile — cold path, not packet path.
-4. **Allocation pressure on large rule sets.** At 1M rules
-   (#1622 target), this adds 4M Arc allocations per parse pass
-   PLUS the payload bytes (1M × N prefixes × 8 B v4 / 24 B v6).
-   For an all-cited-book rule with no literals and 1 cited
-   `internal` book (10 prefixes), that's 1M × (10 × 8) = 80 MB
-   for the v4 payload alone, replicated to every rule that
-   cites the book even though the Arc COULD have shared the
-   book's `prefixes_v4` directly. **Should the parallel array
-   instead be a `SmallVec<[Arc<[PrefixV4]>; 4]>` of references
-   to each contributing source (per-rule literals as one Arc,
-   each cited book's `prefixes_v4` as one Arc by clone)?** That
-   would share storage with the book table and avoid the 80 MB
-   replication at 1M rules. Plan picks the simpler #1624-mirror
-   shape because the future LPM builder semantics aren't pinned
-   yet, but this is an honest concern; PLAN-KILL is acceptable
-   on this axis.
-5. **Empty-arc footprint vs `Option<Arc<[T]>>`.** Empty
-   `Arc::from(&[][..])` still allocates the Arc header (24 B on
-   x86_64). For all-`any` rules that's 4 × 24 = 96 B of waste
-   per rule, times 1M rules = 96 MB. Should the field be
-   `Option<Arc<[PrefixV4]>>` with `None` meaning "use the
-   match-any flag", so the all-any rules pay zero allocations?
-   #1624 BookEntry chose `Arc<[T]>` not `Option<Arc<[T]>>` —
-   should this PR diverge from that precedent?
+Q6. **Helper signature `build_rule_side_arc`.** Generic over `T:
+Clone` + `F: Fn(&BookEntry) -> &Arc<T>`. Two instantiations
+(PrefixV4 / PrefixV6) generate two monomorphizations. Is the
+generic shape acceptable, or should this be two non-generic
+helpers `build_rule_side_v4` / `build_rule_side_v6`?
+
+Q7. **`parse_v3_literal_set_capture` clone cost.** The refactored
+helper calls `v4.clone()` + `v6.clone()` to keep ownership for
+the parallel array while still moving into `from_v3_literals`.
+Per-rule: 2 extra `Vec<Prefix*>::clone()` calls on the parse
+path. Cold path, but at 1M-rule snapshots this is 2M clones.
+Worst case: 1K-prefix rule × 1M rules = 1 G prefix-bytes of
+clone work. Is this acceptable? Alternative: thread an
+`out_parallel: &mut Vec<...>` parameter through
+`from_v3_literals` so the literal Vec is consumed without clone.
+
+Q8. **Constructor explicit-field shape.** Plan §4.4 keeps
+`..PolicyRule::default()` for applications/compiled_apps but
+names the four new fields explicitly. Is the residual `..default()`
+fallback acceptable, or should the constructor name EVERY field
+explicitly (a separate cleanup, but tightens the AGY F2 hazard
+fully)?
+
+Q9. **Test count and granularity.** 11 tests covers the matrix
+axes called out by Codex F7 + AGY F3. Are any axes still missing?
+(e.g., book that has /0 + non-/0 contributing to the rule —
+"zero-plus-non-zero" mirror in the *rule* context; rule that
+cites a book whose `prefixes_v4` is empty.)
+
+Q10. **PolicyRule cardinality vs precedent.** Codex F2's
+fundamental point — BookEntry runs at 10s of entries; PolicyRule
+at 1M — is partially mitigated by Option<Arc<[T]>> but not fully.
+At 1M rules, the rule table grows by 64 MB just for the four new
+fields. Is that 64 MB worth the foundation work? PLAN-KILL is
+still on the table on this axis.
 
 ## 11. Status / decision summary
 
-- **Author position:** Mirror #1624 BookEntry shape exactly,
-  including raw-input ordering and `Arc<[T]>` (not
-  `Option<Arc<[T]>>`). The #1624 precedent shipped clean
-  under adversarial quad-review and any divergence here would
-  fragment the parallel-arrays convention.
-- **Hostile axes Q4 and Q5 are the open architectural risks**
-  (1M-rule allocation pressure vs reference-shared shape;
-  empty-Arc footprint vs Option). Either could justify
-  PLAN-NEEDS-MAJOR; on the narrowest read of "match #1624
-  exactly", neither is a structural blocker because #1622
-  empirical numbers are not yet in and we cannot know whether
-  any consumer of these arrays will ship.
-- **PLAN-KILL pressure is low** because the change is small
-  (~50 LOC + tests) and the precedent is in master. But
-  PLAN-KILL is acceptable if reviewers conclude this is dead
-  storage with no path to a consumer.
+- **Author position (v3):** Option<Arc<[T]>> + explicit constructor
+  + capture-before-move parser refactor + 11 tests + accept the
+  +64 B/rule footprint as the foundation cost. PLAN-KILL remains
+  acceptable on the cardinality axis if reviewers think 64 MB at
+  1M rules is too much for a no-consumer scaffolding PR.
+- **Open architectural risks:** Q7 clone cost (parse-time), Q10
+  cardinality footprint. Both are honest about absolute numbers.
+- **Convergence path:** if Codex r2 accepts the cardinality
+  argument with Option fix and AGY r2 accepts the helper /
+  constructor structure, this ships. If either still PLAN-KILLs,
+  scope is small enough to absorb a clean fail.
 
