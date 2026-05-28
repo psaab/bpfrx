@@ -1344,6 +1344,8 @@ fn run_multi_threaded(
     }
 
     // If spawn failed, join whatever's running, then surface the error.
+    // A panicked worker here doesn't matter — we're already returning
+    // the spawn_error to the caller.
     if let Some(err) = spawn_error {
         for h in handles { let _ = h.join(); }
         return Err(err);
@@ -1383,8 +1385,19 @@ fn run_multi_threaded(
     // local clock check is mid-batch behind the deadline.
     shutdown_flag.store(true, Ordering::Relaxed);
 
-    // Join all workers.
-    for h in handles { let _ = h.join(); }
+    // Join all workers. A panicked worker would not have set
+    // first_fatal/shutdown_flag itself, so we surface the panic into
+    // first_fatal here so the summary path returns Err instead of
+    // silently reporting partial stats. (Copilot code-r1 finding 3.)
+    let mut panic_tids: Vec<u32> = Vec::new();
+    for (tid, h) in handles.into_iter().enumerate() {
+        if h.join().is_err() { panic_tids.push(tid as u32); }
+    }
+    if !panic_tids.is_empty() {
+        let msg = format!("worker(s) panicked: {:?}", panic_tids);
+        let mut slot = first_fatal.lock().unwrap();
+        if slot.is_none() { *slot = Some(msg); }
+    }
 
     // Check fatal-error slot.
     if let Some(msg) = first_fatal.lock().unwrap().clone() {
