@@ -65,10 +65,13 @@ Tracks task IDs across rounds for long-running session resumption.
 | Reviewer | Task ID | Verdict |
 |----------|---------|--------|
 | Claude SMR | (claude-smr-code-r1.md) | MERGE-READY |
-| Codex | (codex-companion task, session a8c1b014) | 6 findings (2 High, 3 Med, 1 Low) — addressed in r2 |
+| Codex r1 | (codex-companion task, session a8c1b014) | 6 findings (2 High, 3 Med, 1 Low) — addressed in r2 |
+| Codex r2 | (codex-companion re-review, session a8c1b014) | **MERGE-READY** — all 6 findings fixed/accepted; sole blocker (git diff --check trailing blank line in coordinator/tests.rs:1635) fixed |
 | AGY (adversarial) r1 | adversarial-review-mpq1z20f-7yc7mu | 5 findings (no KILL, wire clean) — addressed in r2 |
 | AGY (adversarial) r2 | adversarial-review-mpq2jl5d-sqd223 | **MERGE-READY** — all 4 fixes verified correct/complete, no new defect, ran Go+Rust suites clean |
-| Copilot | PR #1640 copilot-pull-request-reviewer | 4 findings — addressed in r2 |
+| Copilot (3 reviews) | PR #1640 copilot-pull-request-reviewer | r1: 4 code findings; r2: 3 doc-path nits; r3: 2 plan-deviation nits — ALL addressed; no outstanding actionable findings; PR CLEAN/MERGEABLE |
+
+**4-of-4 code-review convergence achieved.** Smoke matrix clean, cold-connect gate met, make test-failover 13/0 on the post-fix binary, warm telemetry 0/0.
 
 ### Round-2 fix disposition (commit after review)
 - Codex High #1 (tunnel route wrong-RG): FIX — skip routes with tunnel_endpoint_id != 0 (+ test).
