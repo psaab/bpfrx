@@ -54,6 +54,12 @@ type hostTunableFS interface {
 	// writeFile writes data to path. Failures are returned for the
 	// caller to log (we never want a fake that silently drops writes).
 	writeFile(path string, data []byte) error
+	// listNeighDirs returns the immediate sub-directory names under a
+	// /proc/sys/net/{ipv4,ipv6}/neigh directory (one per interface plus
+	// "default"). An empty slice means the directory could not be read
+	// (#1636). Distinct from a generic glob so the test fake can script
+	// an exact interface set.
+	listNeighDirs(dir string) []string
 }
 
 type realHostTunableFS struct{}
@@ -77,6 +83,21 @@ func (realHostTunableFS) writeFile(path string, data []byte) error {
 	// kernel's sysfs handler and ignore the mode, but setting it keeps
 	// this identical to `echo > ...`.
 	return os.WriteFile(path, data, 0644)
+}
+
+func (realHostTunableFS) listNeighDirs(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		// /proc/sys/net/{ipv4,ipv6}/neigh/<iface> are directories;
+		// IsDir() is unreliable on procfs symlinks, so accept any entry
+		// — the subsequent retrans_time_ms read/write tolerates a miss.
+		out = append(out, e.Name())
+	}
+	return out
 }
 
 // vmSkipLogOnce ensures the "no cpufreq sysfs — VM?" note is emitted at
@@ -320,6 +341,128 @@ func applyNetdevBudget(value int, fs hostTunableFS, capture *priorHostTunables) 
 	slog.Info("linksetup: netdev_budget applied", "value", value)
 }
 
+// Neighbor retransmit-time sysctls (#1636). Lowering these from the
+// 1000ms kernel default to 250ms is the dominant lever for cold-connect
+// recovery against an unknown next-hop: the kernel's own ARP/NDP
+// retransmit timer then fires every 250ms instead of every 1000ms, so a
+// dropped initial solicit is re-driven ~4× sooner. See
+// docs/pr/1636-cold-connect-mitigation/plan.md option B.
+//
+// Both the IPv4 and IPv6 "default" neighbor tables are written; "default"
+// is the template every newly-created interface inherits, so this covers
+// dataplane interfaces brought up after daemon start as well as those
+// already present. Per-interface tables created from a stale template are
+// re-evaluated by option D's runtime guard
+// (compute_pending_neigh_timeout_ns) on every snapshot apply.
+const (
+	sysctlNeighV4Dir = "/proc/sys/net/ipv4/neigh"
+	sysctlNeighV6Dir = "/proc/sys/net/ipv6/neigh"
+	// neighRetransTargetMs is the value the daemon writes. Option D's
+	// userspace guard (compute_pending_neigh_timeout_ns) admits the fast
+	// 800ms PENDING_NEIGH_TIMEOUT when every dataplane interface reads
+	// <= NEIGH_RETRANS_FAST_THRESHOLD_MS (300ms) — that threshold is
+	// deliberately above this target because the kernel rounds
+	// retrans_time_ms to its internal jiffy resolution (a write of 250
+	// reads back as 252 on HZ=100 hosts).
+	neighRetransTargetMs = 250
+)
+
+// applyNeighRetransTime lowers the kernel neighbor retrans_time_ms to
+// neighRetransTargetMs across BOTH IPv4 and IPv6 neighbor tables.
+//
+// CRITICAL: writing only the `default` template does NOT lower the value
+// on interfaces that already exist — the kernel seeds a per-interface
+// neighbor table from `default` only at table-creation time. By the time
+// xpfd runs, the dataplane interfaces already exist with the 1000ms
+// default. So this walks every per-interface table under
+// /proc/sys/net/{ipv4,ipv6}/neigh/<iface>/retrans_time_ms AND writes the
+// `default` template (so interfaces created later inherit the fast
+// value).
+//
+// Mirrors applyNetdevBudget: idempotent (skip-if-already-set per path),
+// best-effort (read-only /proc surfaces as a warning, never an error),
+// and captures the pre-xpfd value of each path once so restore can
+// revert it.
+//
+// Unlike the cpu-governor / netdev_budget knobs this is NOT gated behind
+// claim-host-tunables: retrans_time_ms is a neighbor-resolution timing
+// parameter, not a system-wide performance knob, and lowering it is
+// strictly beneficial for any forwarding deploy. It is still captured +
+// restored so a co-tenant's tuned value is put back on daemon stop.
+//
+// Known limitation (AGY r1 #3): only interface tables that exist at apply
+// time are captured for restore. An interface created AFTER apply inherits
+// 250ms from the lowered `default` template and is not reverted on stop
+// (its pre-xpfd value was never observed). This is benign — a 250ms
+// neighbor retransmit is a strict improvement on any interface — and
+// matches the best-effort, observed-value-only restore contract of the
+// host-global netdev_budget knob.
+func applyNeighRetransTime(fs hostTunableFS, capture *priorHostTunables) {
+	want := strconv.Itoa(neighRetransTargetMs)
+	applied, skipped, failed := 0, 0, 0
+	for _, path := range neighRetransPaths(fs) {
+		existing, err := fs.readFile(path)
+		liveVal := ""
+		if err == nil {
+			liveVal = strings.TrimSpace(string(existing))
+		}
+		if liveVal != "" {
+			capture.captureNeighRetrans(path, liveVal)
+		}
+		if liveVal == want {
+			skipped++
+			continue
+		}
+		if err := fs.writeFile(path, []byte(want)); err != nil {
+			failed++
+			if errors.Is(err, os.ErrPermission) {
+				slog.Warn("linksetup: neigh retrans_time_ms write denied (read-only /proc?)",
+					"path", path, "value", want, "err", err)
+				continue
+			}
+			slog.Warn("linksetup: neigh retrans_time_ms write failed",
+				"path", path, "value", want, "err", err)
+			continue
+		}
+		applied++
+	}
+	if applied > 0 {
+		slog.Info("linksetup: neigh retrans_time_ms applied",
+			"value", want, "applied", applied, "already_set", skipped, "failed", failed)
+	} else {
+		slog.Debug("linksetup: neigh retrans_time_ms unchanged",
+			"value", want, "already_set", skipped, "failed", failed)
+	}
+}
+
+// neighRetransPaths enumerates every retrans_time_ms sysctl path to
+// write: the `default` template plus every existing per-interface
+// neighbor table, for both IPv4 and IPv6. A directory listing failure
+// falls back to writing just the `default` template so the function is
+// never a hard no-op on a constrained host.
+func neighRetransPaths(fs hostTunableFS) []string {
+	var paths []string
+	for _, dir := range []string{sysctlNeighV4Dir, sysctlNeighV6Dir} {
+		entries := fs.listNeighDirs(dir)
+		if len(entries) == 0 {
+			// Fall back to the default template only.
+			paths = append(paths, dir+"/default/retrans_time_ms")
+			continue
+		}
+		seenDefault := false
+		for _, name := range entries {
+			if name == "default" {
+				seenDefault = true
+			}
+			paths = append(paths, dir+"/"+name+"/retrans_time_ms")
+		}
+		if !seenDefault {
+			paths = append(paths, dir+"/default/retrans_time_ms")
+		}
+	}
+	return paths
+}
+
 // resolvedHostTunables returns the effective governor + budget given
 // the config values and default substitution rules. Extracted as a
 // pure function so the daemon-wire code can unit-test the
@@ -424,6 +567,11 @@ type priorHostTunables struct {
 	// The value is a verbatim snapshot of the coalescence state so the
 	// restore call emits an identical `ethtool -C` invocation.
 	mlx5Adaptive map[string]mlx5CoalesceState
+	// neighRetrans maps a neighbor retrans_time_ms sysctl path → the
+	// original value (#1636). Absence of a key means xpfd never wrote
+	// that path; restore does nothing on it. Stored as a string so the
+	// exact byte form the kernel served is round-tripped on restore.
+	neighRetrans map[string]string
 }
 
 // mlx5CoalesceState captures the four fields xpfd writes via ethtool -C.
@@ -443,6 +591,7 @@ func newPriorHostTunables() *priorHostTunables {
 	return &priorHostTunables{
 		governors:    map[string]string{},
 		mlx5Adaptive: map[string]mlx5CoalesceState{},
+		neighRetrans: map[string]string{},
 	}
 }
 
@@ -470,6 +619,23 @@ func (p *priorHostTunables) captureBudget(value string) {
 		return
 	}
 	p.budget = strings.TrimSpace(value)
+}
+
+// captureNeighRetrans stores the pre-xpfd value of a neighbor
+// retrans_time_ms sysctl (#1636). No-op once captured for that path
+// (first-apply wins). Lazily allocates the map so a nil-map capture
+// (older newPriorHostTunables callers in tests) does not panic.
+func (p *priorHostTunables) captureNeighRetrans(path, value string) {
+	if p == nil {
+		return
+	}
+	if p.neighRetrans == nil {
+		p.neighRetrans = map[string]string{}
+	}
+	if _, already := p.neighRetrans[path]; already {
+		return
+	}
+	p.neighRetrans[path] = strings.TrimSpace(value)
 }
 
 // captureMlx5Coalesce stores the pre-xpfd coalescence state of a
@@ -556,6 +722,34 @@ func restoreHostScopeTunables(p *priorHostTunables, fs hostTunableFS) {
 			slog.Info("linksetup: netdev_budget restored to pre-xpfd value",
 				"value", p.budget)
 		}
+	}
+}
+
+// restoreNeighRetransTime writes every captured neighbor retrans_time_ms
+// value back to the kernel (#1636). Unlike the cpu-governor / netdev
+// knobs this is restored unconditionally on daemon stop (it applies
+// unconditionally, not behind claim-host-tunables), so a co-tenant's
+// tuned value is put back when xpfd exits. Errors are logged and
+// swallowed. Safe with a nil pointer or empty map (no-op).
+func restoreNeighRetransTime(p *priorHostTunables, fs hostTunableFS) {
+	if p == nil || len(p.neighRetrans) == 0 {
+		return
+	}
+	restored := 0
+	for path, value := range p.neighRetrans {
+		if value == "" {
+			continue
+		}
+		if err := fs.writeFile(path, []byte(value)); err != nil {
+			slog.Warn("linksetup: host tunable restore — neigh retrans_time_ms write failed",
+				"path", path, "want", value, "err", err)
+			continue
+		}
+		restored++
+	}
+	if restored > 0 {
+		slog.Info("linksetup: neigh retrans_time_ms restored to pre-xpfd value",
+			"restored", restored, "total", len(p.neighRetrans))
 	}
 }
 

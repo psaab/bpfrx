@@ -196,6 +196,10 @@ type xpfCollector struct {
 	fairnessEqualFlowWorkerCapBPS             *prometheus.Desc
 	fairnessEqualFlowWorkerSuppressedBPS      *prometheus.Desc
 	fairnessThroughputWindow                  *dpuserspace.FairnessThroughputWindow
+	// #1636 option C: proactive-neighbor-warm telemetry. The only
+	// operator-visible signal for the warmer in production builds.
+	neighborWarmDropsTotal        *prometheus.Desc
+	neighborWarmDisconnectedTotal *prometheus.Desc
 }
 
 func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -313,6 +317,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.fairnessEqualFlowWorkerObservedPerFlowBPS
 	ch <- c.fairnessEqualFlowWorkerCapBPS
 	ch <- c.fairnessEqualFlowWorkerSuppressedBPS
+	ch <- c.neighborWarmDropsTotal
+	ch <- c.neighborWarmDisconnectedTotal
 }
 
 func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {

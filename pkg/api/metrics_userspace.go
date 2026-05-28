@@ -37,6 +37,25 @@ func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp ap
 	c.emitUserspaceSourceNATPoolMetrics(ch, status)
 	c.emitFairnessRSSGauges(ch, status)
 	c.emitFairnessThroughputGauges(ch, status)
+	c.emitNeighborWarmCounters(ch, status)
+}
+
+// emitNeighborWarmCounters exposes the #1636 proactive-neighbor-warm
+// telemetry. These are the only operator-visible signal for the warmer
+// in production builds (the per-key debug eprintln is gated on the
+// debug-log feature). A non-zero `disconnected` series means the warmer
+// worker died and proactive warming is off until daemon restart.
+func (c *xpfCollector) emitNeighborWarmCounters(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborWarmDropsTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborWarmDropsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborWarmDisconnectedTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborWarmDisconnectedTotal),
+	)
 }
 
 func (c *xpfCollector) emitThreeColorPolicerCounters(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {

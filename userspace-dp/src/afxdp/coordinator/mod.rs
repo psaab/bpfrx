@@ -14,6 +14,11 @@ pub(crate) use bpf_maps::BpfMaps;
 pub(crate) use cos_state::SharedCoSState;
 pub(in crate::afxdp) use ha_state::HaState;
 pub(crate) use neighbor_manager::NeighborManager;
+pub(crate) use neighbor_manager::WarmItem;
+pub(in crate::afxdp) use neighbor_manager::{
+    WARM_GC_INTERVAL_NS, WARM_GC_MAX_AGE_NS, WARM_PER_KEY_RATE_LIMIT_NS, WARM_QUEUE_DEPTH,
+    WARM_SWEEP_RATE_LIMIT_NS,
+};
 pub(in crate::afxdp) use session_manager::SessionManager;
 use supervisor::spawn_supervised_aux;
 pub(in crate::afxdp) use worker_manager::WorkerManager;
@@ -194,6 +199,13 @@ impl Coordinator {
         if let Some(stop) = self.neighbors.monitor_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
+        // #1636: stop the neighbor warmer and drop the producer handle so
+        // the worker's recv side disconnects and it exits cleanly. The
+        // 500ms recv timeout bounds the join latency.
+        if let Some(warm_stop) = self.neighbors.warm_stop.take() {
+            warm_stop.store(true, Ordering::Relaxed);
+        }
+        self.neighbors.warm_queue = None;
         for handle in self.tunnel_sources.values_mut() {
             handle.stop.store(true, Ordering::Relaxed);
         }
@@ -256,6 +268,16 @@ impl Coordinator {
         if let Ok(mut manager_keys) = self.neighbors.manager_keys.lock() {
             manager_keys.clear();
         }
+        // #1636: reset warmer rate-limit + telemetry so a re-bind starts
+        // clean. The worker thread itself is torn down above; a fresh one
+        // is spawned on the next bring-up.
+        if let Ok(mut probed) = self.neighbors.last_probed_at.lock() {
+            probed.clear();
+        }
+        self.neighbors.last_warm_sweep_ns.store(0, Ordering::Relaxed);
+        self.neighbors
+            .warned_disconnect
+            .store(false, Ordering::Relaxed);
         if clear_synced_state {
             if let Ok(mut sessions) = self.sessions.synced.lock() {
                 sessions.clear();
@@ -537,7 +559,204 @@ impl Coordinator {
         self.ha
             .fabrics
             .store(Arc::new(self.forwarding.fabrics.clone()));
+        // #1636 option C: proactively warm configured next-hops so the
+        // neighbor cache is hot before the first user flow. Non-forced:
+        // the 1s snapshot-level rate-limit coalesces config storms.
+        self.queue_warm_pass(false);
     }
+
+    /// #1636 option C: proactive neighbor warm at config-apply.
+    ///
+    /// Walks the current forwarding state's configured next-hops (static
+    /// + dynamic routes, fabric peers) and enqueues a warm probe for each
+    /// `(egress_ifindex, hop)` that is NOT already resolved, NOT recently
+    /// probed, and whose owning RG is currently forwarding-active on this
+    /// node. The warmer worker fires the probes off the coordinator hot
+    /// path.
+    ///
+    /// `force = true` bypasses the 1s snapshot-level rate-limit (used by
+    /// the RG-promote path so a newly-active RG gets warmed immediately
+    /// without waiting for the next snapshot apply). Per-key 5s
+    /// rate-limit and per-RG gate always apply.
+    ///
+    /// Takes `&self` (not `&mut self`): `last_warm_sweep_ns` and
+    /// `warm_generation` are atomics so this can be called from both
+    /// `refresh_runtime_snapshot` (`&mut self`) and the RG-promote path.
+    pub(in crate::afxdp) fn queue_warm_pass(&self, force: bool) {
+        // Nothing to do until the warmer worker is spawned.
+        let Some(tx) = self.neighbors.warm_queue.as_ref() else {
+            return;
+        };
+        let now = monotonic_nanos();
+        if !force {
+            let last = self.neighbors.last_warm_sweep_ns.load(Ordering::Acquire);
+            if now.saturating_sub(last) < WARM_SWEEP_RATE_LIMIT_NS {
+                return;
+            }
+            // CAS to claim the sweep slot; if another caller raced us,
+            // let them run the sweep.
+            if self
+                .neighbors
+                .last_warm_sweep_ns
+                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+        } else {
+            self.neighbors
+                .last_warm_sweep_ns
+                .store(now, Ordering::Release);
+        }
+
+        // Generation bump only on ADMITTED sweeps. In-flight items from
+        // prior generations are dropped on dequeue by the warmer worker.
+        let sweep_gen = self
+            .neighbors
+            .warm_generation
+            .fetch_add(1, Ordering::Release)
+            + 1;
+
+        let snapshot = &self.forwarding;
+        let rg_runtime = self.ha.rg_runtime.load();
+        let now_secs = now / 1_000_000_000;
+        let mut seen: FastSet<(i32, IpAddr)> = FastSet::default();
+
+        let mut enqueue = |egress_ifindex: i32, hop: IpAddr| {
+            if egress_ifindex <= 0 {
+                return;
+            }
+            // Never warm broadcast/multicast/loopback/unspecified.
+            match hop {
+                IpAddr::V4(v4) => {
+                    if v4.is_unspecified()
+                        || v4.is_loopback()
+                        || v4.is_multicast()
+                        || v4.is_broadcast()
+                    {
+                        return;
+                    }
+                }
+                IpAddr::V6(v6) => {
+                    if v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() {
+                        return;
+                    }
+                }
+            }
+            let key = (egress_ifindex, hop);
+            if !seen.insert(key) {
+                return;
+            }
+            // Already resolved (static/manager neighbor or dynamic cache)?
+            if snapshot.neighbors.contains_key(&key) || self.neighbors.dynamic.contains_key(&key) {
+                return;
+            }
+            // Per-RG HA gate: only warm next-hops whose owning RG is
+            // forwarding-active on this node. Standby RGs are skipped.
+            let rg_id = owner_rg_for_flow(snapshot, egress_ifindex);
+            let rg_active = rg_runtime
+                .get(&rg_id)
+                .map(|group| group.is_forwarding_active(now_secs))
+                .unwrap_or(false);
+            if !rg_active {
+                return;
+            }
+            let Some(name) = snapshot.ifindex_to_name.get(&egress_ifindex) else {
+                return;
+            };
+            let item = WarmItem {
+                ifindex: egress_ifindex,
+                hop,
+                iface_name: name.clone(),
+                generation: sweep_gen,
+                rg_id,
+            };
+            match tx.try_send(item) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    self.neighbors.warm_drops.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "debug-log")]
+                    eprintln!(
+                        "xpf-userspace-dp: warm queue full (cap={}); dropping {:?}",
+                        WARM_QUEUE_DEPTH, key
+                    );
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.neighbors
+                        .warm_disconnected
+                        .fetch_add(1, Ordering::Relaxed);
+                    // Once-only operator-visible log (not debug-gated):
+                    // under route churn this would otherwise fire per key.
+                    if !self
+                        .neighbors
+                        .warned_disconnect
+                        .swap(true, Ordering::Relaxed)
+                    {
+                        eprintln!(
+                            "xpf-userspace-dp: ERROR: neighbor warmer worker disconnected; \
+                             proactive neighbor warming is DISABLED until restart"
+                        );
+                    }
+                }
+            }
+        };
+
+        // Static + dynamic (FRR-populated) route next-hops, both families.
+        // Tunnel routes (tunnel_endpoint_id != 0) are skipped: their HA
+        // ownership is the tunnel endpoint's RG, not the underlay egress
+        // RG (forwarding uses owner_rg_for_resolution, which switches on
+        // tunnel_endpoint_id) — gating them via owner_rg_for_flow(egress)
+        // here would warm on the wrong RG (Codex r1 High #1). Tunnel
+        // endpoints are also explicitly out of warm scope per the plan
+        // (AGY plan r1 #3); their underlay next-hops, if relevant, appear
+        // as ordinary (tunnel_endpoint_id == 0) routes.
+        for routes in snapshot.routes_v4.values() {
+            for route in routes {
+                if route.tunnel_endpoint_id != 0 {
+                    continue;
+                }
+                if let Some(hop) = route.next_hop {
+                    enqueue(route.ifindex, IpAddr::V4(hop));
+                }
+            }
+        }
+        for routes in snapshot.routes_v6.values() {
+            for route in routes {
+                if route.tunnel_endpoint_id != 0 {
+                    continue;
+                }
+                if let Some(hop) = route.next_hop {
+                    enqueue(route.ifindex, IpAddr::V6(hop));
+                }
+            }
+        }
+        // Fabric peers: warm the peer over the fabric parent ifindex
+        // (AGY r7 #3 — FabricLink.parent_ifindex is the egress ifindex).
+        for fabric in &snapshot.fabrics {
+            enqueue(fabric.parent_ifindex, fabric.peer_addr);
+        }
+    }
+
+    /// #1636: called from the cluster RG-promote path when an RG
+    /// transitions to forwarding-active on this node. Clears the
+    /// per-key rate-limit (so probes that failed during the transient
+    /// down state are not locked out for 5s) and triggers an immediate
+    /// forced warm pass for the newly-active RG's next-hops.
+    pub(in crate::afxdp) fn on_rg_promote_active(&self) {
+        if let Ok(mut map) = self.neighbors.last_probed_at.lock() {
+            map.clear();
+        }
+        self.queue_warm_pass(true);
+    }
+
+    // NOTE (#1636): a per-ifindex `last_probed_at` clear on link-UP was
+    // specified in the plan (AGY plan r3 #3) to drop probes fired during
+    // a link-negotiation window. It is NOT wired here: there is no
+    // userspace link-state (RTM_NEWLINK) monitor to call it from, and the
+    // RG-promote clear already covers the dominant failover case. Shipping
+    // an unwired helper would be a false guarantee (Copilot r1), so it is
+    // deferred until a link-state monitor exists. The 5s per-key window
+    // self-heals a transient-down lockout regardless.
 
     pub fn policy_rule_counters(&self) -> Vec<crate::protocol::PolicyRuleCounterStatus> {
         self.forwarding.policy.counter_snapshots()

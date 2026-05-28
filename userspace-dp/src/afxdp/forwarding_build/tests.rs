@@ -1781,3 +1781,105 @@ fn build_cos_state_admits_rewrite_only_mapping_to_materialized_class() {
         "DSCP rewrite-rule for the materialized best-effort class must admit"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1636 option D: compute_pending_neigh_timeout_ns tests.
+// ---------------------------------------------------------------------------
+
+/// Fake sysctl reader: maps a path to a u32, or None to simulate a read
+/// failure (missing file / permission / parse error).
+struct FakeSysctl {
+    values: std::collections::HashMap<String, Option<u32>>,
+    default_value: Option<u32>,
+}
+
+impl FakeSysctl {
+    fn all(v: u32) -> Self {
+        Self {
+            values: std::collections::HashMap::new(),
+            default_value: Some(v),
+        }
+    }
+    fn set(mut self, path: &str, v: Option<u32>) -> Self {
+        self.values.insert(path.to_string(), v);
+        self
+    }
+}
+
+impl SysctlReader for FakeSysctl {
+    fn read_u32(&self, path: &str) -> Option<u32> {
+        if let Some(v) = self.values.get(path) {
+            return *v;
+        }
+        self.default_value
+    }
+}
+
+fn one_iface_map() -> FastMap<i32, String> {
+    let mut m = FastMap::default();
+    m.insert(80, "ge-0-0-2".to_string());
+    m
+}
+
+#[test]
+fn pending_neigh_timeout_fast_when_all_retrans_le_250() {
+    let reader = FakeSysctl::all(250);
+    let got = compute_pending_neigh_timeout_ns(&one_iface_map(), &reader);
+    assert_eq!(got, PENDING_NEIGH_TIMEOUT_FAST_NS);
+}
+
+#[test]
+fn pending_neigh_timeout_fallback_when_iface_retrans_too_high() {
+    // Default is 250 (fast) but the v4 per-iface table is 1000ms.
+    let reader = FakeSysctl::all(250)
+        .set("/proc/sys/net/ipv4/neigh/ge-0-0-2/retrans_time_ms", Some(1000));
+    let got = compute_pending_neigh_timeout_ns(&one_iface_map(), &reader);
+    assert_eq!(got, super::super::PENDING_NEIGH_TIMEOUT_NS);
+}
+
+#[test]
+fn pending_neigh_timeout_fallback_when_v6_too_high() {
+    let reader = FakeSysctl::all(250)
+        .set("/proc/sys/net/ipv6/neigh/ge-0-0-2/retrans_time_ms", Some(900));
+    let got = compute_pending_neigh_timeout_ns(&one_iface_map(), &reader);
+    assert_eq!(got, super::super::PENDING_NEIGH_TIMEOUT_NS);
+}
+
+#[test]
+fn pending_neigh_timeout_fallback_when_default_template_too_high() {
+    // Per-iface tables fast, but the `default` template is still 1000ms
+    // (an interface created after the snapshot would inherit it).
+    let reader = FakeSysctl::all(250)
+        .set("/proc/sys/net/ipv4/neigh/default/retrans_time_ms", Some(1000));
+    let got = compute_pending_neigh_timeout_ns(&one_iface_map(), &reader);
+    assert_eq!(got, super::super::PENDING_NEIGH_TIMEOUT_NS);
+}
+
+#[test]
+fn pending_neigh_timeout_fails_closed_on_read_error() {
+    // A read failure (None) on any checked path must fail closed to the
+    // 2000ms default rather than optimistically assuming fast.
+    let reader = FakeSysctl::all(250)
+        .set("/proc/sys/net/ipv4/neigh/ge-0-0-2/retrans_time_ms", None);
+    let got = compute_pending_neigh_timeout_ns(&one_iface_map(), &reader);
+    assert_eq!(got, super::super::PENDING_NEIGH_TIMEOUT_NS);
+}
+
+#[test]
+fn pending_neigh_timeout_fast_with_no_dataplane_interfaces() {
+    // Empty iface map: only the `default` template is checked. If it is
+    // fast, the timeout is fast.
+    let reader = FakeSysctl::all(250);
+    let got = compute_pending_neigh_timeout_ns(&FastMap::default(), &reader);
+    assert_eq!(got, PENDING_NEIGH_TIMEOUT_FAST_NS);
+}
+
+#[test]
+fn pending_neigh_timeout_fast_with_jiffy_rounded_252() {
+    // The daemon writes 250 but the kernel rounds retrans_time_ms to its
+    // internal jiffy resolution and reads back 252 on HZ=100 hosts. The
+    // 300ms threshold must still admit the fast 800ms timeout.
+    let reader = FakeSysctl::all(252);
+    let got = compute_pending_neigh_timeout_ns(&one_iface_map(), &reader);
+    assert_eq!(got, PENDING_NEIGH_TIMEOUT_FAST_NS);
+}

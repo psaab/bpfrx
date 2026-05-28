@@ -679,5 +679,16 @@ func newCollector(srv *Server) *xpfCollector {
 			[]string{"ifindex", "queue_id", "worker_id"}, nil,
 		),
 		fairnessThroughputWindow: dpuserspace.NewFairnessThroughputWindow(30 * time.Second),
+		// #1636 option C: proactive-neighbor-warm telemetry.
+		neighborWarmDropsTotal: prometheus.NewDesc(
+			"xpf_userspace_neighbor_warm_drops_total",
+			"Proactive neighbor-warm requests dropped because the bounded warmer queue was full (transient saturation under route churn) (#1636).",
+			nil, nil,
+		),
+		neighborWarmDisconnectedTotal: prometheus.NewDesc(
+			"xpf_userspace_neighbor_warm_disconnected_total",
+			"Proactive neighbor-warm requests dropped because the warmer worker thread died; warming is disabled until daemon restart (#1636).",
+			nil, nil,
+		),
 	}
 }

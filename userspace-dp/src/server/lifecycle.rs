@@ -102,6 +102,8 @@ pub(crate) fn run() -> Result<(), String> {
             worker_heartbeats: Vec::new(),
             worker_runtime: Vec::new(),
             cos_no_owner_binding_drops_total: 0,
+            neighbor_warm_drops_total: 0,
+            neighbor_warm_disconnected_total: 0,
             per_binding: Vec::new(),
             flow_worker_map: Vec::new(),
             flow_worker_map_truncated: false,

@@ -418,6 +418,13 @@ net.ipv6.conf.all.forwarding=1
 net.ipv6.conf.all.accept_ra=0
 net.ipv6.conf.default.accept_ra=0
 EOF'
+	# #1636 option B: lower neighbor retrans_time_ms 1000ms->250ms so a
+	# dropped ARP/NDP solicit is re-driven ~4x sooner (cold-connect fix).
+	# xpfd also writes these at start; this persists across reboots.
+	incus exec "$rinst" -- bash -c 'cat > /etc/sysctl.d/99-xpf-neighbor.conf <<EOF
+net.ipv4.neigh.default.retrans_time_ms = 250
+net.ipv6.neigh.default.retrans_time_ms = 250
+EOF'
 	incus exec "$rinst" -- sysctl --system
 
 	info "Installing packages ($vm, this may take a few minutes)..."

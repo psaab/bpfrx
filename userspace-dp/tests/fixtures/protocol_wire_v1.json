@@ -726,6 +726,8 @@
     "neighbor_cache_capacity": 0,
     "neighbor_entries": 0,
     "neighbor_generation": 0,
+    "neighbor_warm_disconnected_total": 0,
+    "neighbor_warm_drops_total": 0,
     "pid": 0,
     "policy_rule_counters": [],
     "queues": [],

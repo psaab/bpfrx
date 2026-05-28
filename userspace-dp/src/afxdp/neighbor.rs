@@ -117,6 +117,97 @@ pub(super) fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
     }
 }
 
+/// Long-lived neighbor-warmer worker loop (#1636 option C). Spawned
+/// once at coordinator bring-up and fed `WarmItem`s via a bounded MPSC
+/// queue from `Coordinator::queue_warm_pass`. For each item it:
+///
+///   1. GCs `last_probed` once per `WARM_GC_INTERVAL_NS` (runs on EVERY
+///      loop iteration — idle timeout OR dequeue — so the prune is not
+///      bypassed under continuous load).
+///   2. Re-checks the item's owning RG is still forwarding-active on
+///      this node immediately before firing (per-RG HA gate; an item
+///      queued under an active RG but dequeued after demotion must NOT
+///      fire).
+///   3. Drops items tagged with a stale `warm_generation` (generation
+///      collapse — only the latest snapshot's keys are warmed).
+///   4. Skips keys probed within `WARM_PER_KEY_RATE_LIMIT_NS`.
+///   5. Fires exactly ONE `trigger_kernel_arp_probe()` per (key, gen);
+///      the kernel then runs its own retransmit schedule. No userspace
+///      retry loop.
+///
+/// `last_probed.lock().expect(...)` panics on a poisoned mutex: silently
+/// skipping forever would leave warming "alive but disabled" and
+/// invisible. Panicking kills the worker, breaking the MPSC channel; the
+/// next producer `try_send` hits `Disconnected`, increments
+/// `warm_disconnected`, and emits the once-only operator warning.
+pub(super) fn neighbor_warmer_loop(
+    rx: Receiver<WarmItem>,
+    last_probed: Arc<Mutex<FastMap<(i32, IpAddr), u64>>>,
+    warm_generation: Arc<AtomicU64>,
+    rg_runtime: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut last_gc_ns = monotonic_nanos();
+    while !stop.load(Ordering::Relaxed) {
+        // GC at the top of every iteration (idle OR dequeue path).
+        let now = monotonic_nanos();
+        if now.saturating_sub(last_gc_ns) >= WARM_GC_INTERVAL_NS {
+            if let Ok(mut map) = last_probed.lock() {
+                map.retain(|_k, &mut t| now.saturating_sub(t) < WARM_GC_MAX_AGE_NS);
+            }
+            last_gc_ns = now;
+        }
+        let item = match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(item) => item,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!(
+                    "xpf-userspace-dp: neighbor warmer worker: channel disconnected; exiting"
+                );
+                return;
+            }
+        };
+        // Re-check stop after dequeue: stop_inner sets `stop` and drops
+        // the sender, but an item already in the channel would otherwise
+        // be processed and fire one stray probe on a tearing-down
+        // dataplane (Codex r1 Medium). Bail before any side effect.
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        // Per-RG HA gate, re-checked immediately before firing.
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        let rg_active = rg_runtime
+            .load()
+            .get(&item.rg_id)
+            .map(|group| group.is_forwarding_active(now_secs))
+            .unwrap_or(false);
+        if !rg_active {
+            continue;
+        }
+        // Generation collapse: drop items from a superseded snapshot.
+        if item.generation != warm_generation.load(Ordering::Acquire) {
+            continue;
+        }
+        let key = (item.ifindex, item.hop);
+        let now = monotonic_nanos();
+        let skip = {
+            let mut map = last_probed
+                .lock()
+                .expect("last_probed mutex poisoned — neighbor warming forcibly disabled");
+            match map.get(&key) {
+                Some(&t) if now.saturating_sub(t) < WARM_PER_KEY_RATE_LIMIT_NS => true,
+                _ => {
+                    map.insert(key, now);
+                    false
+                }
+            }
+        };
+        if !skip {
+            trigger_kernel_arp_probe(&item.iface_name, item.hop);
+        }
+    }
+}
+
 /// Add a neighbor entry to the kernel's neighbor table via raw netlink.
 /// This ensures the kernel can forward IPv6 (and IPv4) traffic to hosts
 /// whose ARP/NDP replies were captured by XSK instead of reaching the kernel.
@@ -683,5 +774,164 @@ mod pin_tests {
         assert!(allowed_cpus.contains(&new_worker_1));
         assert_ne!(old_worker_0, new_worker_0);
         assert_ne!(old_worker_1, new_worker_1);
+    }
+}
+
+#[cfg(test)]
+mod warmer_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn active_rg(rg_id: i32) -> Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>> {
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
+            rg_id,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: now_secs,
+                lease: HAGroupRuntime::active_lease_until(now_secs, now_secs),
+            },
+        )])))
+    }
+
+    fn warm_item(generation: u64, rg_id: i32) -> WarmItem {
+        WarmItem {
+            // Use an interface name that will not resolve so
+            // trigger_kernel_arp_probe is a cheap no-op even without
+            // CAP_NET_RAW; the observable effect we assert is the
+            // last_probed_at insertion.
+            ifindex: 999,
+            hop: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            iface_name: "xpf-test-nodev".to_string(),
+            generation,
+            rg_id,
+        }
+    }
+
+    fn spawn_loop(
+        rx: Receiver<WarmItem>,
+        last_probed: Arc<Mutex<FastMap<(i32, IpAddr), u64>>>,
+        warm_generation: Arc<AtomicU64>,
+        rg_runtime: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
+        stop: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            neighbor_warmer_loop(rx, last_probed, warm_generation, rg_runtime, stop)
+        })
+    }
+
+    fn wait_for<F: Fn() -> bool>(pred: F) -> bool {
+        for _ in 0..200 {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    #[test]
+    fn warmer_processes_message_and_records_probe() {
+        let (tx, rx) = mpsc::sync_channel::<WarmItem>(8);
+        let last_probed = Arc::new(Mutex::new(FastMap::default()));
+        let warm_generation = Arc::new(AtomicU64::new(7));
+        let rg = active_rg(0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_loop(rx, last_probed.clone(), warm_generation.clone(), rg, stop.clone());
+
+        tx.try_send(warm_item(7, 0)).expect("send");
+        let key = (999, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)));
+        assert!(
+            wait_for(|| last_probed.lock().unwrap().contains_key(&key)),
+            "warmer must record the probed key in last_probed_at",
+        );
+        stop.store(true, Ordering::Relaxed);
+        drop(tx);
+        handle.join().expect("warmer join");
+    }
+
+    #[test]
+    fn warmer_drops_stale_generation_items() {
+        let (tx, rx) = mpsc::sync_channel::<WarmItem>(8);
+        let last_probed = Arc::new(Mutex::new(FastMap::default()));
+        let warm_generation = Arc::new(AtomicU64::new(10));
+        let rg = active_rg(0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_loop(rx, last_probed.clone(), warm_generation.clone(), rg, stop.clone());
+
+        // Item tagged with an OLD generation (current is 10).
+        tx.try_send(warm_item(3, 0)).expect("send stale");
+        // Then a current-gen item to act as a barrier we CAN observe.
+        tx.try_send(warm_item(10, 0)).expect("send current");
+        let key = (999, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)));
+        assert!(
+            wait_for(|| last_probed.lock().unwrap().contains_key(&key)),
+            "current-gen item must be processed",
+        );
+        // Exactly one insertion total (stale dropped, current recorded);
+        // the per-key 5s rate-limit also coalesces, so len stays 1.
+        assert_eq!(last_probed.lock().unwrap().len(), 1);
+        stop.store(true, Ordering::Relaxed);
+        drop(tx);
+        handle.join().expect("warmer join");
+    }
+
+    #[test]
+    fn warmer_skips_inactive_rg_items() {
+        let (tx, rx) = mpsc::sync_channel::<WarmItem>(8);
+        let last_probed = Arc::new(Mutex::new(FastMap::default()));
+        let warm_generation = Arc::new(AtomicU64::new(1));
+        // RG runtime has RG 0 active, but the item targets RG 5 (absent).
+        let rg = active_rg(0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_loop(rx, last_probed.clone(), warm_generation.clone(), rg, stop.clone());
+
+        tx.try_send(warm_item(1, 5)).expect("send inactive-rg");
+        // Give the worker time to process and discard it.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            last_probed.lock().unwrap().is_empty(),
+            "item for a non-forwarding-active RG must not be probed",
+        );
+        stop.store(true, Ordering::Relaxed);
+        drop(tx);
+        handle.join().expect("warmer join");
+    }
+
+    #[test]
+    fn warmer_exits_on_disconnect() {
+        let (tx, rx) = mpsc::sync_channel::<WarmItem>(8);
+        let last_probed = Arc::new(Mutex::new(FastMap::default()));
+        let warm_generation = Arc::new(AtomicU64::new(0));
+        let rg = active_rg(0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_loop(rx, last_probed, warm_generation, rg, stop);
+        // Drop the sender WITHOUT setting stop: the recv_timeout must see
+        // Disconnected and the loop must exit on its own.
+        drop(tx);
+        handle.join().expect("warmer must exit cleanly on channel disconnect");
+    }
+
+    #[test]
+    fn warmer_per_key_rate_limit_coalesces() {
+        let (tx, rx) = mpsc::sync_channel::<WarmItem>(8);
+        let last_probed = Arc::new(Mutex::new(FastMap::default()));
+        let warm_generation = Arc::new(AtomicU64::new(1));
+        let rg = active_rg(0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_loop(rx, last_probed.clone(), warm_generation.clone(), rg, stop.clone());
+
+        // Same key sent twice within the 5s window → one recorded probe.
+        tx.try_send(warm_item(1, 0)).expect("send 1");
+        tx.try_send(warm_item(1, 0)).expect("send 2");
+        let key = (999, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)));
+        assert!(wait_for(|| last_probed.lock().unwrap().contains_key(&key)));
+        // The recorded timestamp must not change on the second (rate-
+        // limited) item — assert the map stays at one entry.
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(last_probed.lock().unwrap().len(), 1);
+        stop.store(true, Ordering::Relaxed);
+        drop(tx);
+        handle.join().expect("warmer join");
     }
 }

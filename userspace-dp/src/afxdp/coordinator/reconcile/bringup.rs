@@ -341,5 +341,23 @@ pub(super) fn bring_up_workers(
         .ok();
         coord.neighbors.monitor_stop = Some(stop);
     }
+    // #1636 option C: spawn the long-lived neighbor-warmer worker. Fed
+    // by Coordinator::queue_warm_pass via a bounded MPSC queue; fires
+    // ARP/NDP solicits for configured next-hops off the hot path so the
+    // neighbor cache is warm before the first user flow.
+    if coord.neighbors.warm_queue.is_none() {
+        let (tx, rx) = mpsc::sync_channel::<WarmItem>(WARM_QUEUE_DEPTH);
+        let warm_stop = Arc::new(AtomicBool::new(false));
+        let warm_stop_clone = warm_stop.clone();
+        let last_probed = coord.neighbors.last_probed_at.clone();
+        let warm_generation = coord.neighbors.warm_generation.clone();
+        let rg_runtime = coord.ha.rg_runtime.clone();
+        spawn_supervised_aux("neigh-warmer", move || {
+            neighbor_warmer_loop(rx, last_probed, warm_generation, rg_runtime, warm_stop_clone)
+        })
+        .ok();
+        coord.neighbors.warm_queue = Some(tx);
+        coord.neighbors.warm_stop = Some(warm_stop);
+    }
     coord.spawn_local_tunnel_sources();
 }

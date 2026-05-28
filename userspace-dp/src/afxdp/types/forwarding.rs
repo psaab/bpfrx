@@ -67,6 +67,19 @@ pub(in crate::afxdp) struct ForwardingState {
     /// on the Go side). Read by the poll_descriptor pre-eval gate;
     /// updated atomically via ArcSwap on every snapshot apply.
     pub(in crate::afxdp) cold_path_sample_mask: u64,
+    /// #1636 option D: how long a queued packet with an unresolved
+    /// neighbor is held before being dropped + recycled. Computed per
+    /// snapshot in `build_forwarding_state_with_policy_counters_and_previous`
+    /// (`compute_pending_neigh_timeout_ns`): 800ms when the kernel
+    /// `retrans_time_ms` is <= NEIGH_RETRANS_FAST_THRESHOLD_MS (300ms —
+    /// the daemon writes 250 but the kernel jiffy-rounds it to 252 on
+    /// HZ=100) on all dataplane interfaces (v4 AND v6) so a dropped SYN is
+    /// re-driven before the client's first TCP RTO; otherwise the safe
+    /// 2000ms default (sysctl unapplied → fail closed). Re-evaluated every
+    /// snapshot so a mid-life sysctl change is picked up. `0` (the
+    /// Default) means "unset" — callers fall back to
+    /// `PENDING_NEIGH_TIMEOUT_NS`.
+    pub(in crate::afxdp) pending_neigh_timeout_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

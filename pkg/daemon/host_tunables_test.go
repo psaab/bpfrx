@@ -16,16 +16,18 @@ import (
 	"errors"
 	"io/fs"
 	"reflect"
+	"strings"
 	"testing"
 )
 
 // fakeHostFS records writes and optionally returns a scripted error.
 type fakeHostFS struct {
-	cpufreqPaths []string           // what listCPUGovernorPaths returns
-	files        map[string][]byte  // pre-populated read values
-	writeErrs    map[string]error   // per-path error on writeFile (nil = success)
-	writes       map[string]string  // recorded writeFile data
-	writeOrder   []string           // ordered log of writeFile paths
+	cpufreqPaths []string            // what listCPUGovernorPaths returns
+	files        map[string][]byte   // pre-populated read values
+	writeErrs    map[string]error    // per-path error on writeFile (nil = success)
+	writes       map[string]string   // recorded writeFile data
+	writeOrder   []string            // ordered log of writeFile paths
+	neighDirs    map[string][]string // per neigh-dir interface listing (#1636)
 }
 
 func newFakeHostFS() *fakeHostFS {
@@ -37,6 +39,13 @@ func newFakeHostFS() *fakeHostFS {
 }
 
 func (f *fakeHostFS) listCPUGovernorPaths() []string { return f.cpufreqPaths }
+
+func (f *fakeHostFS) listNeighDirs(dir string) []string {
+	if f.neighDirs == nil {
+		return nil
+	}
+	return f.neighDirs[dir]
+}
 
 func (f *fakeHostFS) readFile(path string) ([]byte, error) {
 	if data, ok := f.files[path]; ok {
@@ -237,6 +246,141 @@ func TestApplyNetdevBudget_ReadOnlyProc_LogsAndContinues(t *testing.T) {
 	applyNetdevBudget(600, f, nil)
 	if _, ok := f.writes[sysctlPathNetdevBudget]; ok {
 		t.Fatal("write recorded despite scripted EACCES")
+	}
+}
+
+// --- applyNeighRetransTime (#1636) ---------------------------------------
+
+// neighFSWithIfaces builds a fake whose neigh dirs list `default` plus
+// the named interfaces for both families, each pre-set to `initial`.
+func neighFSWithIfaces(initial string, ifaces ...string) *fakeHostFS {
+	f := newFakeHostFS()
+	f.neighDirs = map[string][]string{}
+	for _, dir := range []string{sysctlNeighV4Dir, sysctlNeighV6Dir} {
+		names := append([]string{"default"}, ifaces...)
+		f.neighDirs[dir] = names
+		for _, n := range names {
+			f.files[dir+"/"+n+"/retrans_time_ms"] = []byte(initial + "\n")
+		}
+	}
+	return f
+}
+
+func TestApplyNeighRetransTime_WritesEveryInterfaceAndDefault(t *testing.T) {
+	// The headline #1636 fix: existing interfaces (not just `default`)
+	// must be lowered, because the kernel only seeds new tables from
+	// `default`.
+	f := neighFSWithIfaces("1000", "em0", "ge-0-0-2")
+	applyNeighRetransTime(f, nil)
+	for _, dir := range []string{sysctlNeighV4Dir, sysctlNeighV6Dir} {
+		for _, n := range []string{"default", "em0", "ge-0-0-2"} {
+			path := dir + "/" + n + "/retrans_time_ms"
+			if f.writes[path] != "250" {
+				t.Fatalf("%s: want 250 written, got %q", path, f.writes[path])
+			}
+		}
+	}
+}
+
+func TestApplyNeighRetransTime_FallsBackToDefaultWhenDirUnreadable(t *testing.T) {
+	// No neighDirs scripted → listNeighDirs returns nil → only the
+	// `default` template is written for each family.
+	f := newFakeHostFS()
+	for _, dir := range []string{sysctlNeighV4Dir, sysctlNeighV6Dir} {
+		f.files[dir+"/default/retrans_time_ms"] = []byte("1000\n")
+	}
+	applyNeighRetransTime(f, nil)
+	for _, dir := range []string{sysctlNeighV4Dir, sysctlNeighV6Dir} {
+		if f.writes[dir+"/default/retrans_time_ms"] != "250" {
+			t.Fatalf("%s default: want 250, got %q", dir, f.writes[dir+"/default/retrans_time_ms"])
+		}
+	}
+}
+
+func TestApplyNeighRetransTime_IdempotentWhenAlreadySet(t *testing.T) {
+	f := neighFSWithIfaces("250", "em0")
+	applyNeighRetransTime(f, nil)
+	if len(f.writes) != 0 {
+		t.Fatalf("already-set must skip write, got %v", f.writes)
+	}
+}
+
+func TestApplyNeighRetransTime_ReadOnlyProc_LogsAndContinues(t *testing.T) {
+	// Restricted container surfaces as EACCES on write. Must log and
+	// continue; the other paths must still be attempted.
+	f := neighFSWithIfaces("1000", "em0")
+	denied := sysctlNeighV4Dir + "/em0/retrans_time_ms"
+	f.writeErrs[denied] = &fs.PathError{Op: "write", Path: denied, Err: fs.ErrPermission}
+	applyNeighRetransTime(f, nil)
+	if _, ok := f.writes[denied]; ok {
+		t.Fatal("denied path write recorded despite scripted EACCES")
+	}
+	if f.writes[sysctlNeighV4Dir+"/default/retrans_time_ms"] != "250" {
+		t.Fatal("default must still be written when one iface fails")
+	}
+}
+
+func TestApplyNeighRetransTime_CapturesPriorValueOnce(t *testing.T) {
+	f := neighFSWithIfaces("1000", "em0")
+	cap := newPriorHostTunables()
+	applyNeighRetransTime(f, cap)
+	v4def := sysctlNeighV4Dir + "/default/retrans_time_ms"
+	if cap.neighRetrans[v4def] != "1000" {
+		t.Fatalf("prior: want 1000, got %q", cap.neighRetrans[v4def])
+	}
+	// Reconcile must NOT overwrite the captured prior with 250.
+	applyNeighRetransTime(f, cap)
+	if cap.neighRetrans[v4def] != "1000" {
+		t.Fatalf("prior overwritten on reconcile: got %q", cap.neighRetrans[v4def])
+	}
+}
+
+func TestRestoreNeighRetransTime_RevertsToPrior(t *testing.T) {
+	f := neighFSWithIfaces("1000", "em0")
+	cap := newPriorHostTunables()
+	applyNeighRetransTime(f, cap)
+	restoreNeighRetransTime(cap, f)
+	for _, dir := range []string{sysctlNeighV4Dir, sysctlNeighV6Dir} {
+		for _, n := range []string{"default", "em0"} {
+			path := dir + "/" + n + "/retrans_time_ms"
+			if strings.TrimSpace(string(f.files[path])) != "1000" {
+				t.Fatalf("%s not restored to 1000, got %q", path, string(f.files[path]))
+			}
+		}
+	}
+}
+
+func TestApplyStep0_RuntimeDisable_RestoresNeighRetrans(t *testing.T) {
+	// Codex r1 / AGY r1 #3: userspace-dp disabled at runtime (no daemon
+	// stop) must restore the lowered neigh retrans_time_ms and clear the
+	// captures so a later re-enable re-captures cleanly.
+	d := &Daemon{}
+	f := neighFSWithIfaces("1000", "em0")
+	// Phase 1: userspace-dp on → lower + capture.
+	d.applyStep0TunablesWith(true, false, "", 0, false, false, 0, 0, nil, f, &fakeRSSExecutor{})
+	if f.writes[sysctlNeighV4Dir+"/em0/retrans_time_ms"] != "250" {
+		t.Fatalf("apply phase: em0 not lowered, got %q", f.writes[sysctlNeighV4Dir+"/em0/retrans_time_ms"])
+	}
+	// Phase 2: userspace-dp off → restore to 1000 + clear captures.
+	d.applyStep0TunablesWith(false, false, "", 0, false, false, 0, 0, nil, f, &fakeRSSExecutor{})
+	if strings.TrimSpace(string(f.files[sysctlNeighV4Dir+"/em0/retrans_time_ms"])) != "1000" {
+		t.Fatalf("runtime-disable: em0 not restored to 1000, got %q",
+			string(f.files[sysctlNeighV4Dir+"/em0/retrans_time_ms"]))
+	}
+	d.priorTunablesMu.Lock()
+	prior := d.priorTunables
+	d.priorTunablesMu.Unlock()
+	if prior != nil && len(prior.neighRetrans) != 0 {
+		t.Fatalf("runtime-disable: neighRetrans captures not cleared, got %v", prior.neighRetrans)
+	}
+}
+
+func TestRestoreNeighRetransTime_NilAndEmpty_NoOp(t *testing.T) {
+	f := newFakeHostFS()
+	restoreNeighRetransTime(nil, f)
+	restoreNeighRetransTime(newPriorHostTunables(), f)
+	if len(f.writes) != 0 {
+		t.Fatalf("nil/empty capture must be a no-op, got %v", f.writes)
 	}
 }
 

@@ -31,6 +31,11 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // drops. The per-binding increment site is mechanical; this is the
     // only operator-facing surface for the counter.
     state.status.cos_no_owner_binding_drops_total = state.afxdp.cos_no_owner_binding_drops_total();
+    // #1636 option C: proactive-neighbor-warm telemetry surfaced to the
+    // daemon's Prometheus collector.
+    let (warm_drops, warm_disconnected) = state.afxdp.neighbor_warm_counters();
+    state.status.neighbor_warm_drops_total = warm_drops;
+    state.status.neighbor_warm_disconnected_total = warm_disconnected;
     state.status.route_entries = state.snapshot.as_ref().map(|s| s.routes.len()).unwrap_or(0);
     state.status.fabrics = state
         .snapshot

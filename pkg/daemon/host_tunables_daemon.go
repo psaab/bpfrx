@@ -114,6 +114,20 @@ func (d *Daemon) applyStep0TunablesWith(userspaceDP, claimHostTunables bool,
 	// mlx5 interface outside xpfd's zone model.
 	if userspaceDP {
 		applyCoalescence(coalesceEnable, coalesceRX, coalesceTX, rssAllowed, execer, prior)
+		// #1636 option B: lower the kernel neighbor retrans_time_ms so a
+		// dropped ARP/NDP solicit is re-driven ~4× sooner. NOT gated on
+		// claim-host-tunables — it is a neighbor-resolution timing knob,
+		// strictly beneficial for forwarding, captured + restored on stop.
+		applyNeighRetransTime(fs, prior)
+	} else if len(prior.neighRetrans) > 0 {
+		// #1636 (Codex r1 / AGY r1 #3): userspace-dp was disabled at
+		// runtime (without a daemon stop). Restore the neighbor
+		// retrans_time_ms values we previously lowered and discard the
+		// captures so a later re-enable re-captures cleanly. Without this
+		// the lowered values would persist for the daemon lifetime even
+		// though the dataplane that wanted them is gone.
+		restoreNeighRetransTime(prior, fs)
+		prior.neighRetrans = map[string]string{}
 	}
 
 	// Host-scope restore path: previously claimed, now gated off.
@@ -194,12 +208,14 @@ func (d *Daemon) restoreStep0TunablesOnShutdown() {
 	// can tell a coalescence-only revert from a full host-scope revert.
 	hasHostScope := active && (len(prior.governors) > 0 || prior.budget != "")
 	hasCoalesce := len(prior.mlx5Adaptive) > 0
-	if !hasHostScope && !hasCoalesce {
+	hasNeighRetrans := len(prior.neighRetrans) > 0
+	if !hasHostScope && !hasCoalesce && !hasNeighRetrans {
 		slog.Debug("shutdown: host tunables restore skip (empty captures)")
 		return
 	}
 	slog.Info("shutdown: restoring tunables to pre-xpfd values",
-		"host_scope", hasHostScope, "coalesce_ifaces", len(prior.mlx5Adaptive))
+		"host_scope", hasHostScope, "coalesce_ifaces", len(prior.mlx5Adaptive),
+		"neigh_retrans", hasNeighRetrans)
 	// Host-scope restore is gated on `active`: if the opt-in was
 	// already flipped off during runtime, we already restored those
 	// fields in applyStep0TunablesWith; running the write again would
@@ -211,4 +227,8 @@ func (d *Daemon) restoreStep0TunablesOnShutdown() {
 	for iface, s := range prior.mlx5Adaptive {
 		restoreMlx5Coalesce(iface, s, realRSSExecutor{})
 	}
+	// #1636: neigh retrans_time_ms restore runs unconditionally (the
+	// apply was never gated on claim-host-tunables) so a co-tenant's
+	// tuned value is put back when xpfd exits.
+	restoreNeighRetransTime(prior, realHostTunableFS{})
 }
