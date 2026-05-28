@@ -15,3 +15,9 @@ continuations can fetch by id.
 - Codex plan-review: codex exec session 019e7007-9c30-7952-8a6e-a6404af8fe25 (PLAN-NEEDS-MAJOR)
 - AGY adversarial plan-review: adversarial-review-mppvn7jw-khzbbp (PLAN-NEEDS-MAJOR)
 - Claude SMR plan-review: `claude-smr-plan-r2.md` (this agent)
+
+## Round 3 (v3 — fix re-targeted to lease top-up watermark)
+
+- Codex plan-review: TBD
+- AGY adversarial plan-review: TBD
+- Claude SMR plan-review: `claude-smr-plan-r3.md` (this agent)
