@@ -2,7 +2,7 @@
 
 ## Plan review round 1 (on plan v1)
 
-- Codex: `task-mpozn5gq-qme3vi`
+- Codex: `task-mpozpa1o-wn29a2` (first dispatch `task-mpozn5gq-qme3vi` never registered — retried)
   - Output target: `docs/pr/1614-multi-rss-cos/codex-plan-r1.md`
 - AGY: `adversarial-review-mpoznmnc-qnusjo`
   - Output target: `docs/pr/1614-multi-rss-cos/agy-plan-r1.md`
