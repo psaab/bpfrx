@@ -59,3 +59,12 @@ Tracks task IDs across rounds for long-running session resumption.
 | Claude SMR | (claude-smr-plan-r7.md) | **PLAN-READY** |
 
 **3-of-3 convergence achieved.** Proceeding to issue comment + final return.
+
+## CODE review (PR impl phase, branch fix/1636-cold-connect-mitigation)
+
+| Reviewer | Task ID | Verdict |
+|----------|---------|--------|
+| Claude SMR | (claude-smr-code-r1.md) | MERGE-READY |
+| Codex | (pending dispatch) | — |
+| AGY (adversarial) | (pending dispatch) | — |
+| Copilot | (pending @copilot review on PR) | — |
