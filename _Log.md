@@ -4202,3 +4202,26 @@ top.
 - **Timestamp**: 2026-05-27 (UTC)
   - **Action**: Copilot r3 at HEAD 5dc6dc9d3 posted 2 inline comments: (1) `T: Copy` claim in Arc::from comment is misleading — standard impl is `T: Clone`. Fixed comment. (2) Missing test for /0 AND non-/0 prefixes case (the load-bearing motivation for the parallel array). Added test_book_entry_zero_plus_non_zero_prefixes_preserved covering both v4 and v6, asserting PrefixSet collapses to MatchAny but parallel array preserves both entries. 7 tests now pass; 5/5 flake clean; 1459 total tests pass.
   - **File(s)**: userspace-dp/src/policy.rs (T: Clone comment fix), userspace-dp/src/policy_tests.rs (+1 test)
+
+## 2026-05-28 — #1623 Path B narrow: PolicyRule parallel-prefix arrays
+
+- **Timestamp**: 2026-05-28
+  - **Action**: Implemented #1623 Path B narrow (PolicyRule
+    parallel-prefix arrays + 19 unit tests) per plan v5 after
+    three rounds of triple-review. Architectural shape:
+    `Option<Arc<[Prefix]>>` (NPO-collapsed to 16 B fat pointer)
+    on four PolicyRule fields source/destination prefixes_v4/v6,
+    populated at parse-time as union of literal CIDRs + cited-
+    book prefixes. Plan §4.4 refactor drops `..PolicyRule::default()`
+    from parse constructor (pre-declare applications +
+    compiled_apps locals, name every field explicitly) closing
+    the silent-omission hazard AGY r2 D raised. 19/19 tests pass;
+    5/5 flake clean; full cargo test suite 1508+ pass (one
+    pre-existing snat_contract_doc_guard failure unrelated to this
+    PR — fails on master too); Go suite clean.
+  - **File(s)**: userspace-dp/src/policy.rs (+170/-30 LOC: struct
+    extension, Default/Clone impls, parse_v3_literal_set_capture
+    helper, build_rule_side_arc helper, refactored parse
+    constructor), userspace-dp/src/policy_tests.rs (+~600 LOC:
+    19 new tests + compile-time const _ size_of guards +
+    v3_rule_full helper)
