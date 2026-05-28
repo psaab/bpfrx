@@ -26,3 +26,10 @@ results by ID if the Companion CLI session state is lost
 - **Copilot**: posts on PR creation; not applicable to plan reviews
 
 **Verdict**: 3-of-3 PLAN-NEEDS-MAJOR convergent. 6 fatals + 6 majors enumerated in r4. Architectural axis (Multi-Book LPM + sorted postings + galloping merge) remains sound; v2 concrete design has fatal patchable issues. Deferred to future planning session (ideally after #1612 lands measurement).
+
+### Round 5 (v3 round 1 — Multi-Book LPM 5-fix, memory budget RELAXED per user override)
+
+- **Codex**: pending (will dispatch with v3 SHA)
+- **AGY**: pending (will dispatch with v3 SHA)
+- **Claude SMR r5**: `docs/pr/1609-multistage-policy-dag/claude-smr-plan-r5.md` — PLAN-NEEDS-MINOR (4 residual issues F-r5-1 through F-r5-4 enumerated; hostile self-review to avoid r3-style soft-pass)
+- **Copilot**: posts on PR creation; not applicable to plan reviews
