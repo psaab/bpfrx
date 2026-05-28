@@ -33,7 +33,14 @@
 
 ## Code-review round 2 (PR #1617 after r1 fixes)
 
-- Codex: pending
-- AGY:   pending
+- Codex: task-mpp04elk-moz9oh (MERGE-READY)
+- AGY:   adversarial-review-mpp04lix-hs4f0o (MERGE-READY)
 - Claude SMR: claude-smr-code-r2.md (MERGE-READY — all 4 r1 findings fixed)
-- Copilot: TBD on push
+- Copilot: 2nd formal review on commit 4efdac9f — 4 inline comments: 3 real + 1 false-positive on dangling pointer
+
+## Code-review round 3 (PR #1617 after Copilot r2 fixes)
+
+- Codex: (no re-review needed — doc + drop() fix doesn't touch threading)
+- AGY:   (no re-review needed — same)
+- Claude SMR: claude-smr-code-r3.md (MERGE-READY — 3 of 4 Copilot fixed + 1 false-positive rebutted)
+- Copilot: re-review triggered post-8b9de5783; no 3rd formal review submitted (Copilot bot inferred no new substantive change)
