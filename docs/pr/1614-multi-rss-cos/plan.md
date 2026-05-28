@@ -200,28 +200,31 @@ fraction.
 
 #### A1.1 Algorithm (v5 — explicit branch + min-share-first)
 
-**Explicit mode branch (AGY r2 #1 fix)**:
+**Explicit mode branch (AGY r2 #1 fix + AGY r3 B fix)**:
 ```
+// Priority-low min-share subtraction is ORTHOGONAL to the mode
+// branch. Apply it FIRST so proportional-mode operators with a
+// configured min-share still get it (AGY r3 finding B).
+let cap_eff = root.tokens.saturating_sub(priority_low_min_share_pass);
+// Saturating subtraction guards against transient token-depletion
+// underflow (AGY r3 finding E1).
+
 if root.config.oversubscription_policy == Proportional
    OR root.config.guarantee_fraction == 0.0:
-    // BIT-FOR-BIT IDENTICAL to current scheduler.
-    return select_exact_cos_guarantee_queue_with_lease_telemetry(root, ...)
-// else: run the new waterfill allocator below.
-```
-
-This eliminates the bit-for-bit divergence AGY r2 #1 raised. The
-new code path only activates when an operator explicitly opts in.
-
-**Priority-low min-share subtracted from cap first (AGY r2 #2 fix)**:
-```
-cap_eff = root.tokens - priority_low_min_share_bytes_this_pass
-// (priority-low gets its reserved min-share OUTSIDE the
-// allocator; admitted to Phase 3 surplus path that runs
-// regardless of mode.)
+    // BIT-FOR-BIT IDENTICAL to current scheduler — but on cap_eff,
+    // not root.tokens. When priority_low_min_share_pass == 0 (the
+    // default), cap_eff == root.tokens and the scheduler is
+    // truly bit-for-bit identical.
+    return select_exact_cos_guarantee_queue_with_lease_telemetry(root, cap_eff, ...)
+// else: run the new waterfill allocator below over cap_eff.
 ```
 
 This makes priority-low survivability orthogonal to the
-oversubscription policy choice.
+oversubscription policy choice. When min-share is 0 (default),
+proportional mode is genuinely bit-for-bit unchanged. When
+min-share > 0 AND mode is proportional, the legacy selector
+still runs but on a slightly reduced cap; priority-low is
+guaranteed via Phase 3 surplus admission up to its min-share.
 
 Per `drain_shaped_tx` invocation (when `guarantee_fraction > 0`):
 
@@ -259,17 +262,25 @@ for queue_idx in root.exact_queues_by_rate_ascending:
         break
 
 # Phase 2: proportional residual across ALL queues NOT fully honored.
-# This includes the partial-honor queue from Phase 1 (which got some
-# bytes but less than its full Q_i).
-pass2_budget = cap - (pass1_budget - remaining_pass1)
-# = cap - actual_phase1_alloc
-unhonored_total_quantum = sum(Q_i for i NOT in honor_set)
-if unhonored_total_quantum > 0 and pass2_budget > 0:
+# This includes the partial-honor queue from Phase 1, which has
+# already received some bytes and must enter Phase 2 with its
+# REMAINING quantum weight, not its full Q_i (AGY r3 finding E2).
+pass2_budget = cap_eff - actual_phase1_alloc
+# Per-queue Phase 2 weight = remaining quantum after Phase 1:
+#   q_phase2_weight[i] = Q_i - alloc[i]  // for NOT-fully-honored
+# For fully NOT-honored queues, alloc[i] == 0 so weight == Q_i.
+# For the single partial-honor queue, weight == Q_i - phase1_partial.
+unhonored_remaining_quantum = sum(Q_i - alloc[i] for i NOT in honor_set)
+if unhonored_remaining_quantum > 0 and pass2_budget > 0:
     for queue_idx NOT in honor_set:
-        alloc[queue_idx] += pass2_budget * Q_i / unhonored_total_quantum
-        # No rate cap — Phase 2 share never exceeds the queue's
-        # per-pass quantum because pass2_budget ≤ pass2_quantum_sum
-        # in oversubscribed regime.
+        remaining_quantum_i = Q_i - alloc[queue_idx]
+        alloc[queue_idx] += pass2_budget * remaining_quantum_i
+                            / unhonored_remaining_quantum
+        # With remaining-quantum weighting, total alloc for ANY queue
+        # never exceeds Q_i (AGY r3 E2 proof: partial-honor queue
+        # with phase1 = 7.5 of Q_1 = 10 contributes weight 2.5 to
+        # Phase 2 denominator; with budget 7.5 across {Q_1=2.5, Q_2=10},
+        # Q_1 gets 7.5 * 2.5/12.5 = 1.5; total = 7.5 + 1.5 = 9.0 ≤ 10 ✓).
 
 # Phase 3 (after exact): non-exact + priority-low surplus
 # (existing select_cos_surplus_batch_filtered path unchanged)
