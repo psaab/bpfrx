@@ -89,11 +89,13 @@ In tree at end of PR:
      does not report `tsc`. Worker records its own clock source in
      `WorkerColdPathAtomics` so the harness can per-worker-gate on
      `clock_source = tsc`.
-   - `splitmix64(x: u64) -> u64` + `zone_pair_slot(from_zone_id: u16,
-     to_zone_id: u16) -> usize` — `splitmix64((from_zone_id as u64) << 32
-     | to_zone_id as u64) & 0xF`. Per parent §4.3.4 + AGY r3 axis 5
-     bijection audit. Pin `0xF` mask via
-     `assert!(POLICY_COLD_PATH_ZONE_PAIR_SLOTS == 16)`.
+   - `splitmix64(x: u64) -> u64` + `zone_pair_packed_key(from, to) ->
+     u64` returning `((from << 16) | to) + 1` (injective per Codex r3
+     finding 1; non-zero so `first_key == 0` is the "no sample"
+     sentinel) + `zone_pair_slot(from_zone_id, to_zone_id) -> usize`
+     returning `(splitmix64(zone_pair_packed_key(from, to)) & 0xF) as
+     usize`. Per parent §4.3.4 + AGY r3 axis 5 bijection audit. Pin
+     `0xF` mask via `assert!(POLICY_COLD_PATH_ZONE_PAIR_SLOTS == 16)`.
    - **Collision-detection contract** (Codex r1 finding 4 + Codex
      r2 finding 3): each slot stores a `first_key: u64` (the packed
      zone-pair key of the first sample to land in this slot during
@@ -468,7 +470,9 @@ land in bucket 0; tail buckets are populated above 1 µs.
 
 ### 3.4 Splitmix slot collision (Codex r1 finding 4)
 
-`splitmix64((from_zone_id << 32) | to_zone_id) & 0xF` — AGY r3 axis 5
+`(splitmix64(zone_pair_packed_key(from, to)) & 0xF)` where
+`zone_pair_packed_key(from, to) = ((from << 16) | to) + 1` (injective
+encoding per Codex r3 finding 1) — AGY r3 axis 5
 verified this is a perfect bijection over the K=16 diagonal +
 round-robin test patterns. **However, Codex r1 simulated the real
 loss-cluster zone set** (trust/untrust/dmz/wan/lan + global +
