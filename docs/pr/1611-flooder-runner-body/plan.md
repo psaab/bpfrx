@@ -1,8 +1,21 @@
 # #1611 — cold-path flooder runner body (AF_PACKET + sendmmsg)
 
-**Status**: DRAFT v1 patched — Claude SMR r1 PLAN-NEEDS-MINOR
-items inlined; Codex + AGY plan reviews in flight at commit
-0c491ad9831. Will mark as v2 in the next commit.
+**Status**: v3 — addresses Codex r1 PLAN-KILL findings (sendmmsg
+wording + 3 Mpps premise empirical-gate + CAP_NET_RAW smoke) and
+Claude SMR r1 PLAN-NEEDS-MINOR items. AGY r1 retry in flight.
+
+Codex r1 (task-mpovfie0-6vc58v) PLAN-KILL findings, addressed in
+v3:
+- BLOCKING (sendmmsg partial-retry off by one) — v2 reworked the
+  loop to "refill from scratch every iteration" so the off-by-one
+  question doesn't arise. Codex's alternative "retry from N" is
+  also acceptable; v3 documents both options below.
+- MAJOR (3+ Mpps premise not proven) — v3 adds PACKET_TX_RING
+  optional fallback knob `--use-tx-ring` and a BLOCKING smoke
+  gate at ≥3 Mpps (was best-effort in v2).
+- MAJOR (no integration syscall coverage) — v3 adds an `#[ignore]`
+  integration test `test_open_af_packet_raw_smoke` requiring
+  `CAP_NET_RAW`, gated by env var so unit-test runs skip it.
 
 ## Issue framing
 
@@ -269,6 +282,45 @@ into an AF_XDP socket on the same host as the dataplane.
      simulate `sendmmsg` returning N < batch, assert next iteration
      starts at offset 0 again with fresh frames.
 
+### 4.5 PACKET_TX_RING fallback (Codex r1 MAJOR — optional knob)
+
+Codex r1 challenged the "≥3 Mpps single-core via plain
+sendmmsg(32)" premise, citing kernel docs that point to
+`PACKET_TX_RING` + `PACKET_QDISC_BYPASS` for high-rate user-space
+flood generators (cf. trafgen / pktgen-style tools).
+
+This PR ships sendmmsg as the **default** path because (a) it is
+the simpler implementation that matches the plan v2-r4 §4.2 spec,
+(b) the loss userspace cluster's host VM is a Debian 13 KVM guest
+with virtio TX which typically clears 3-5 Mpps single-core for
+64-byte UDP frames at sendmmsg(32) rates per public Linux
+networking benchmarks. Confidence: medium — the smoke gate is
+the empirical truth-source.
+
+If the smoke gate fails the ≥3 Mpps threshold, the PR adds the
+`--use-tx-ring` opt-in flag:
+
+```rust
+// PACKET_TX_RING: pre-allocate a mmap'd ring of TX frame slots.
+// Skip the syscall per send — fill the slot, mark it ready, kick
+// once per epoch via send(fd, NULL, 0, 0).
+//   - setsockopt(fd, SOL_PACKET, PACKET_VERSION, &TPACKET_V2)
+//   - setsockopt(fd, SOL_PACKET, PACKET_TX_RING, &tpacket_req)
+//   - mmap(NULL, ring_bytes, PROT_RW, MAP_SHARED, fd, 0)
+//   - per slot: tpacket2_hdr.tp_status = TP_STATUS_SEND_REQUEST;
+//     fill payload; send(fd, NULL, 0, MSG_DONTWAIT)
+// Caveat: PACKET_QDISC_BYPASS (setsockopt) skips the qdisc which
+// gains an extra Mpps but loses fq/pfifo back-pressure visibility.
+```
+
+The `--use-tx-ring` path lands in this PR if and only if the
+sendmmsg smoke gate fails. If sendmmsg hits ≥3 Mpps on the loss
+host, the TX_RING path is filed as a follow-up issue.
+
+This keeps the v3 scope honest: ship sendmmsg first, add
+TX_RING only if measurement forces it. The blocking smoke gate
+is the decision-maker.
+
 ## Public API preservation
 
 The cold-path-flooder binary IS the public API surface. Step-1
@@ -334,14 +386,27 @@ or a specific errno on failure — DESIRED behavior shift.
 - **Real-traffic smoke** — additional gate beyond the standard
   matrix: build flooder on `loss:cluster-userspace-host`, run
   for 30 s against `172.16.80.200:5201`, confirm:
-  - Flooder achieves ≥3 Mpps single-core (best-effort threshold;
-    not blocking if loss host CPU is slow).
+  - Flooder achieves **≥3 Mpps single-core** — BLOCKING gate
+    per Codex r1 MAJOR (was best-effort in v2; v3 promotes to
+    blocking so the #1612 measurement program does not depend
+    on an unverified premise). If the standard `sendmmsg(32)`
+    path can't hit 3 Mpps on the loss cluster host, the PR is
+    BLOCKED until the `--use-tx-ring` PACKET_TX_RING fallback
+    knob lands or an alternative high-rate path is approved.
   - Dataplane does NOT crash, fail-closed, or OOM.
   - `journalctl -u xpfd` shows no new ERROR-level log lines
     during the flood.
   - Throughput on parallel iperf3 5201 (started 5 s into the
     flood) drops as expected (cold-path saturates), but reverts
     to baseline ≤2 s after the flood stops.
+- **`#[ignore]` CAP_NET_RAW integration smoke** (Codex r1 MAJOR):
+  a Rust `#[test] #[ignore]` test in the flooder crate that
+  opens `AF_PACKET / SOCK_RAW`, binds to `lo`, sends a single
+  64-byte frame, verifies clean exit + bytes counter ==
+  frame_bytes. Skipped by default (requires root + env var
+  `XPF_RUN_RAW_SOCKET_TESTS=1`); run manually via
+  `XPF_RUN_RAW_SOCKET_TESTS=1 sudo -E cargo test --release -- --ignored test_open_af_packet_raw_smoke`
+  on the cluster host alongside the real-traffic smoke.
 
 ## Out of scope (explicitly)
 
