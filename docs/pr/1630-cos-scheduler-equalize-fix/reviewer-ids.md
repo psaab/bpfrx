@@ -27,6 +27,12 @@
 
 ## Round 5 (plan-review v6 — cursor preserved on time-refresh)
 
-- Codex plan-r5: `task-mppqjkol-l4qvg4`
-- AGY plan-r5: `adversarial-review-mppqjkxy-xv5a2z`
+- Codex plan-r5: `task-mppqjkol-l4qvg4` — PLAN-NEEDS-MAJOR (test/doc nits; design agreed)
+- AGY plan-r5: `adversarial-review-mppqjkxy-xv5a2z` — PLAN-READY
 - Claude SMR plan-r6: in `claude-smr-plan-r6.md` — PLAN-READY
+
+## Code review (PR #1634, SHA 57b3552261dd)
+
+- Codex code-r1: `task-mppr9yzg-9kbwt7`
+- AGY code-r1: `adversarial-review-mppr9z9f-335u8d`
+- Copilot: triggered via `@copilot review` comment

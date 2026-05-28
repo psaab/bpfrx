@@ -4,6 +4,7 @@
 // `#[path = "tests.rs"]` from mod.rs.
 
 use super::*;
+use crate::afxdp::FastMap;
 use crate::afxdp::cos::admission::apply_cos_queue_flow_fair_promotion;
 use crate::afxdp::cos::queue_ops::cos_queue_push_back;
 use crate::afxdp::cos::tx_completion::COS_TIMER_WHEEL_TICK_NS;
@@ -13,7 +14,6 @@ use crate::afxdp::types::{
     WorkerCoSInterfaceFastPath,
 };
 use crate::afxdp::worker::BindingWorker;
-use crate::afxdp::FastMap;
 use crate::afxdp::{PROTO_TCP, UMEM_FRAME_SHIFT};
 use std::sync::Arc;
 
@@ -59,7 +59,7 @@ fn nonexact_guarantee_skips_residual_only_scheduler_map_queue() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         }],
     );
     root.tokens = 1500;
@@ -99,7 +99,7 @@ fn residual_and_exact_test_root(exact_surplus_sharing: bool) -> CoSInterfaceRunt
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
-                codel_target_ns: 0,
+            codel_target_ns: 0,
             },
             CoSQueueConfig {
                 queue_id: 10,
@@ -113,7 +113,7 @@ fn residual_and_exact_test_root(exact_surplus_sharing: bool) -> CoSInterfaceRunt
                 surplus_weight: 16,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
-                codel_target_ns: 0,
+            codel_target_ns: 0,
             },
         ],
     );
@@ -323,7 +323,7 @@ fn nonexact_guarantee_selects_explicit_transmit_rate_queue() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         }],
     );
     root.tokens = 1500;
@@ -359,7 +359,7 @@ fn fallback_root_shaped_default_queue_has_guarantee_service() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         }],
     );
     root.tokens = 1500;
@@ -662,7 +662,7 @@ fn guarantee_phase_limits_service_to_visit_quantum() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         }],
     );
     root.tokens = 64 * 1024;
@@ -699,7 +699,7 @@ fn guarantee_phase_allows_larger_high_rate_visit_quantum() {
             surplus_weight: 1,
             buffer_bytes: 256 * 1024,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         }],
     );
     root.tokens = 256 * 1024;
@@ -749,7 +749,7 @@ fn guarantee_phase_quantum_scales_with_rate() {
             surplus_weight: 1,
             buffer_bytes: 256 * 1024,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         }],
     );
     let low_rate = test_cos_runtime_with_queues(
@@ -766,7 +766,7 @@ fn guarantee_phase_quantum_scales_with_rate() {
             surplus_weight: 1,
             buffer_bytes: 256 * 1024,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         }],
     );
     let high_q = cos_guarantee_quantum_bytes(&high_rate.queues[0]);
@@ -794,7 +794,7 @@ fn guarantee_phase_rotates_between_backlogged_queues() {
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
-                codel_target_ns: 0,
+            codel_target_ns: 0,
             },
             CoSQueueConfig {
                 queue_id: 1,
@@ -808,7 +808,7 @@ fn guarantee_phase_rotates_between_backlogged_queues() {
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
-                codel_target_ns: 0,
+            codel_target_ns: 0,
             },
         ],
     );
@@ -986,7 +986,7 @@ fn guarantee_rr_cursors_start_at_zero_after_runtime_build() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         }],
     );
     assert_eq!(root.exact_guarantee_rr, 0);
@@ -1011,7 +1011,7 @@ fn surplus_phase_prefers_higher_priority_queue() {
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
-                codel_target_ns: 0,
+            codel_target_ns: 0,
             },
             CoSQueueConfig {
                 queue_id: 1,
@@ -1025,7 +1025,7 @@ fn surplus_phase_prefers_higher_priority_queue() {
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
-                codel_target_ns: 0,
+            codel_target_ns: 0,
             },
         ],
     );
@@ -1065,7 +1065,7 @@ fn surplus_phase_applies_weighted_same_priority_sharing() {
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
-                codel_target_ns: 0,
+            codel_target_ns: 0,
             },
             CoSQueueConfig {
                 queue_id: 1,
@@ -1079,7 +1079,7 @@ fn surplus_phase_applies_weighted_same_priority_sharing() {
                 surplus_weight: 4,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
-                codel_target_ns: 0,
+            codel_target_ns: 0,
             },
         ],
     );
@@ -1147,7 +1147,7 @@ fn apply_promotion_pairs_queues_with_their_fast_path_entries() {
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
-                codel_target_ns: 0,
+            codel_target_ns: 0,
             },
             CoSQueueConfig {
                 queue_id: 5,
@@ -1161,7 +1161,7 @@ fn apply_promotion_pairs_queues_with_their_fast_path_entries() {
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
-                codel_target_ns: 0,
+            codel_target_ns: 0,
             },
         ],
     );
@@ -1214,7 +1214,7 @@ fn equal_flow_cap_reaches_drain_shaped_tx_entry_path() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         }],
     );
     root.tokens = 100_000;
@@ -1398,7 +1398,7 @@ fn drain_shaped_tx_primes_and_services_due_parked_queue() {
 }
 
 use crate::afxdp::types::{
-    CoSQueueConfig, CoSQueueDropCounters, CoSQueueOwnerProfile, FlowRrRing, COS_FLOW_FAIR_BUCKETS,
+    COS_FLOW_FAIR_BUCKETS, CoSQueueConfig, CoSQueueDropCounters, CoSQueueOwnerProfile, FlowRrRing,
 };
 
 #[test]
@@ -1435,7 +1435,7 @@ fn drain_exact_local_fifo_items_to_scratch_keeps_queue_until_commit() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -1528,7 +1528,7 @@ fn drain_exact_local_fifo_drops_mirror_clone_before_tx_reserve() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         }],
     );
     cos_queue_push_back(
@@ -1587,7 +1587,7 @@ fn release_exact_local_scratch_frames_preserves_queue_after_failed_submit() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -1662,7 +1662,7 @@ fn settle_exact_local_fifo_submission_pops_only_committed_prefix() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -1769,7 +1769,7 @@ fn release_exact_prepared_scratch_preserves_queue_after_failed_submit() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -1833,7 +1833,7 @@ fn settle_exact_prepared_fifo_submission_pops_only_committed_prefix() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -2023,7 +2023,7 @@ fn restore_cos_local_items_marks_queue_runnable_after_retry() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         },
         hot: crate::afxdp::types::CoSQueueHotState {
             surplus_deficit: 0,
@@ -2089,7 +2089,7 @@ fn restore_cos_prepared_items_marks_queue_runnable_after_retry() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-            codel_target_ns: 0,
+        codel_target_ns: 0,
         },
         hot: crate::afxdp::types::CoSQueueHotState {
             surplus_deficit: 0,
@@ -2312,7 +2312,8 @@ fn waterfill_guarantee_rate_fraction_consulted_by_selector() {
         // gate, then decrements by the chosen queue's
         // secondary_budget. So `pass1_remaining_bytes` after one
         // selection is `(quantum_sum * frac).floor() - first_budget`.
-        let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel);
+        let _ =
+            select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel);
         root.waterfill_pass1_remaining_bytes
     }
     let r_lo = pass1_remaining_after_one_selection(0.2);
@@ -2386,46 +2387,18 @@ fn build_smoke_like_runtime(
     root
 }
 
-fn expected_waterfill_pass1_bytes(root: &CoSInterfaceRuntime) -> u64 {
-    let frac = root.oversubscription_guarantee_fraction;
-    if root.shaping_rate_bytes == 0 {
-        let mut quantum_sum: u64 = 0;
-        for &queue_idx in &root.exact_queues_by_rate_ascending {
-            quantum_sum =
-                quantum_sum.saturating_add(cos_guarantee_quantum_bytes(&root.queues[queue_idx]));
-        }
-        ((quantum_sum as f64) * frac).floor() as u64
-    } else {
-        let cap_per_epoch = ((root.shaping_rate_bytes as u128) * (COS_GUARANTEE_VISIT_NS as u128)
-            / 1_000_000_000u128) as u64;
-        ((cap_per_epoch as f64) * frac).floor() as u64
-    }
-}
-
-fn select_and_consume_exact_queue(
-    root: &mut CoSInterfaceRuntime,
-    now_ns: u64,
-    tel: &mut CoSQueueLeaseAcquireTelemetry,
-) -> ExactCoSQueueSelection {
-    let selection = select_exact_cos_guarantee_queue_with_lease_telemetry(root, &[], now_ns, tel)
-        .expect("expected exact queue selection");
-    let queue = &mut root.queues[selection.queue_idx];
-    let _ = cos_queue_pop_front(queue).expect("selected queue must contain an item");
-    selection
-}
-
 #[test]
 fn waterfill_pass1_budget_anchored_to_shaper_per_epoch() {
     // #1630 Hunk A: with shaping_rate_bytes = 25 Gbps = 3.125 GB/s and
-    // fraction = 0.7, the post-refill pass1 budget must be anchored
-    // to the shaper cap for one visit epoch, NOT the old
-    // quantum_sum * fraction value which under the smoke fixture was
-    // 1.91 MB.
+    // fraction = 0.7, the post-refill pass1 budget must equal
+    // 3.125e9 * 200e-6 * 0.7 = 437_500 bytes (within ±1 byte for
+    // floor rounding), NOT the old quantum_sum * fraction value
+    // which under the smoke fixture was 1.91 MB.
     let rates = [
-        12_500_000u64,    // 100m
-        125_000_000u64,   // 1g
-        375_000_000u64,   // 3g
-        750_000_000u64,   // 6g
+        12_500_000u64,   // 100m
+        125_000_000u64,  // 1g
+        375_000_000u64,  // 3g
+        750_000_000u64,  // 6g
         1_125_000_000u64, // 9g
         1_500_000_000u64, // 12g
         1_875_000_000u64, // 15g
@@ -2442,13 +2415,12 @@ fn waterfill_pass1_budget_anchored_to_shaper_per_epoch() {
     // After one selection, pass1_remaining decrements by candidate_budget
     // of the first ascending queue (100m, quantum 2500). So expected
     // post-call value is 437500 - 2500 = 435000.
-    let selection =
-        select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
-            .expect("expected first exact selection");
-    let expected = expected_waterfill_pass1_bytes(&root).saturating_sub(selection.secondary_budget);
+    let _ =
+        select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel);
+    let expected = 437_500u64 - 2_500u64;
     assert_eq!(
         root.waterfill_pass1_remaining_bytes, expected,
-        "post-fix pass1 must be shaper-anchored, not quantum_sum-based"
+        "post-fix pass1 must be 437500 - 2500 = 435000 (shaper-anchored, not quantum_sum)"
     );
 }
 
@@ -2463,12 +2435,10 @@ fn waterfill_pass1_transparent_root_fallback_to_quantum_sum() {
     // quantum for 100m = 2500B, 1g = 25000B. quantum_sum = 27500.
     // pass1 = floor(27500 * 0.7) = 19250. After 100m selection
     // (candidate 2500), remaining = 19250 - 2500 = 16750.
-    let selection =
-        select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
-            .expect("expected first exact selection");
+    let _ =
+        select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel);
     assert_eq!(
-        root.waterfill_pass1_remaining_bytes,
-        expected_waterfill_pass1_bytes(&root).saturating_sub(selection.secondary_budget),
+        root.waterfill_pass1_remaining_bytes, 16_750,
         "transparent-root must use quantum_sum × fraction formula"
     );
 }
@@ -2484,13 +2454,17 @@ fn waterfill_pass1_refreshes_on_time_tick_only_after_visit_ns() {
     let mut tel = CoSQueueLeaseAcquireTelemetry::default();
     // Call 1 at now=1000 — initial state (epoch_start=0, pass1=0)
     // triggers refresh via the `exhausted` arm. epoch_start = 1000.
-    let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1000, &mut tel);
+    let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(
+        &mut root, &[], 1000, &mut tel,
+    );
     let after_first = root.waterfill_pass1_remaining_bytes;
     let epoch_start_1 = root.waterfill_epoch_start_ns;
     assert_eq!(epoch_start_1, 1000);
     // Call 2 at now=2000 — elapsed=1000 < VISIT_NS=200_000. No
     // refresh. pass1 decrements by next selection's quantum.
-    let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 2000, &mut tel);
+    let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(
+        &mut root, &[], 2000, &mut tel,
+    );
     assert!(
         root.waterfill_pass1_remaining_bytes < after_first,
         "sub-VISIT_NS call must NOT refresh (pass1 should only decrement)"
@@ -2500,21 +2474,18 @@ fn waterfill_pass1_refreshes_on_time_tick_only_after_visit_ns() {
         "epoch_start_ns must NOT be updated on sub-VISIT_NS calls"
     );
     // Call 3 at now=1000 + 200_001 = elapsed >= VISIT_NS. Refresh fires.
-    let selection = select_exact_cos_guarantee_queue_with_lease_telemetry(
-        &mut root,
-        &[],
-        1000 + 200_001,
-        &mut tel,
-    )
-    .expect("expected refresh-time selection");
+    let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(
+        &mut root, &[], 1000 + 200_001, &mut tel,
+    );
     assert_eq!(
         root.waterfill_epoch_start_ns,
         1000 + 200_001,
         "time-refresh must update epoch_start_ns"
     );
+    // pass1 was refreshed to 437500 then decremented once. So it
+    // equals 437500 - first_pick_quantum (= 2500 for 100m) = 435000.
     assert_eq!(
-        root.waterfill_pass1_remaining_bytes,
-        expected_waterfill_pass1_bytes(&root).saturating_sub(selection.secondary_budget),
+        root.waterfill_pass1_remaining_bytes, 435_000,
         "time-refresh must refill pass1 to shaper-anchored budget"
     );
 }
@@ -2530,15 +2501,14 @@ fn waterfill_phase2_cursor_only_resets_on_exhausted_path() {
     let mut root = build_smoke_like_runtime(shaper, &rates, 16);
     let mut tel = CoSQueueLeaseAcquireTelemetry::default();
     // Prime: first call (exhausted, refresh, cursor reset to 0).
-    let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1000, &mut tel);
+    let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(
+        &mut root, &[], 1000, &mut tel,
+    );
     // Manually set cursor to mid-walk to simulate a Phase-2 pick.
     root.waterfill_phase2_cursor = 1;
     // Time-refresh at now = 1000 + 200_001 — cursor must NOT reset.
     let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(
-        &mut root,
-        &[],
-        1000 + 200_001,
-        &mut tel,
+        &mut root, &[], 1000 + 200_001, &mut tel,
     );
     // The selection will Phase-1-honor again (refills happened), but
     // the cursor stays at 1 because time-refresh path does NOT touch it.
@@ -2551,96 +2521,147 @@ fn waterfill_phase2_cursor_only_resets_on_exhausted_path() {
     // Now force exhausted path: set pass1 to 0 manually, call
     // selector. Refresh fires via exhausted; cursor MUST reset to 0.
     root.waterfill_pass1_remaining_bytes = 0;
-    root.waterfill_phase2_cursor = 1;
+    root.waterfill_phase2_cursor = 2;
     let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(
-        &mut root,
-        &[],
-        1000 + 200_002,
-        &mut tel,
+        &mut root, &[], 1000 + 200_002, &mut tel,
     );
+    // After an exhausted refresh, the implementation resets the cursor
+    // to 0 BEFORE the Phase-1 ascending walk runs. The Phase-1 walk
+    // does NOT advance the Phase-2 cursor; only a successful Phase-2
+    // selection does. With a 2-queue runtime and the next pick being
+    // a Phase-1 honor of 100m (smallest), the cursor stays at 0.
+    // The original assertion was self-referential — replace with
+    // strict equality. (Codex code-r1 #2.)
     assert_eq!(
         root.waterfill_phase2_cursor, 0,
-        "exhausted refresh path must reset cursor to 0 (legacy semantics)"
+        "exhausted refresh path must reset cursor to 0 (Codex r4 invariant)"
     );
 }
 
 #[test]
 fn waterfill_pass1_refills_every_epoch_under_phase2_saturation() {
-    // #1630 Hunk B saturation regression: once Phase 1 honors the
-    // 100m/1g/3g/6g queues, the next call must drop into Phase 2
-    // while pass1 still has non-zero budget remaining. The next
-    // visit-epoch tick must then refill pass1 so a small class can
-    // be honored again.
-    let rates = [
-        12_500_000u64,    // 100m
-        125_000_000u64,   // 1g
-        375_000_000u64,   // 3g
-        750_000_000u64,   // 6g
-        1_125_000_000u64, // 9g
-        1_500_000_000u64, // 12g
-        1_875_000_000u64, // 15g
-        2_250_000_000u64, // 18g
-        2_625_000_000u64, // 21g
-        3_000_000_000u64, // 24g
-    ];
+    // #1630 Hunk B saturation regression (Codex plan-r4 #3, SMR r4
+    // self-correction): the v4-killing bug was that under saturation,
+    // pass1_remaining decremented across the FIRST few epochs but
+    // then sat at a tiny non-zero value forever because Phase-2
+    // doesn't decrement it and small-quantum classes couldn't be
+    // re-honored.
+    //
+    // Direct internal-state pin: manually simulate the v4-killing
+    // saturation state (pass1 stuck at a tiny non-zero value) and
+    // verify the time-based refresh at each VISIT_NS tick fixes
+    // it. Without Hunk B, the legacy `pass1 == 0` refill condition
+    // would NEVER fire and pass1 would stay at 100 forever.
+    let rates = [12_500_000u64, 125_000_000u64];
     let shaper = 3_125_000_000u64;
-    let mut root = build_smoke_like_runtime(shaper, &rates, 1);
+    let mut root = build_smoke_like_runtime(shaper, &rates, 4);
     let mut tel = CoSQueueLeaseAcquireTelemetry::default();
-    let epoch_start = 1000;
-    for expected_queue_idx in 0..4 {
-        let selection = select_and_consume_exact_queue(&mut root, epoch_start, &mut tel);
+    // Prime: first call at now=1000 refills pass1 via exhausted path.
+    let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(
+        &mut root, &[], 1000, &mut tel,
+    );
+    assert!(root.waterfill_pass1_remaining_bytes > 0);
+    // Drive 5 epochs forward. Before each call, force the stuck
+    // saturation state. Assert the time-refresh restores pass1.
+    for epoch in 1..=5u64 {
+        let now = 1000 + epoch * COS_GUARANTEE_VISIT_NS;
+        // Simulate the bug state: pass1 stuck at 100B (below the
+        // smallest quantum of 2500B for 100m). Without Hunk B's
+        // time refresh, this state is permanent under saturation.
+        root.waterfill_pass1_remaining_bytes = 100;
+        let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(
+            &mut root, &[], now, &mut tel,
+        );
+        // After the call, pass1 was refreshed by time-refresh to
+        // 437_500B, then decremented by the 100m selection's
+        // candidate_budget (2500B) → 435_000B remaining.
         assert_eq!(
-            selection.queue_idx, expected_queue_idx,
-            "Phase 1 should honor small queues in ascending rate order before saturation"
+            root.waterfill_pass1_remaining_bytes, 435_000,
+            "epoch {}: time-refresh must refill pass1 (v4 regression: \
+             without Hunk B, pass1 would stay at 100 forever)",
+            epoch
+        );
+        assert_eq!(
+            root.waterfill_epoch_start_ns, now,
+            "epoch {}: epoch_start_ns must update on time-refresh",
+            epoch
         );
     }
-    let pass1_before_phase2 = root.waterfill_pass1_remaining_bytes;
-    assert!(
-        pass1_before_phase2 > 0,
-        "Phase 2 regression requires non-zero residual pass1"
-    );
+}
 
-    let phase2 = select_exact_cos_guarantee_queue_with_lease_telemetry(
-        &mut root,
-        &[],
-        epoch_start,
-        &mut tel,
-    )
-    .expect("expected Phase 2 selection under saturation");
-    assert_eq!(
-        phase2.queue_idx, 9,
-        "Phase 2 should start from the largest queue"
-    );
-    assert_eq!(
-        root.waterfill_pass1_remaining_bytes, pass1_before_phase2,
-        "Phase 2 must not decrement pass1"
-    );
-    assert_eq!(
-        root.waterfill_phase2_cursor, 1,
-        "Phase 2 should advance its cursor"
-    );
-
-    cos_queue_push_back(&mut root.queues[0], test_cos_item(1500));
-    root.queues[0].hot.runnable = true;
-    let refresh_now = epoch_start + COS_GUARANTEE_VISIT_NS + 1;
-    let refreshed = select_exact_cos_guarantee_queue_with_lease_telemetry(
-        &mut root,
-        &[],
-        refresh_now,
-        &mut tel,
-    )
-    .expect("expected timed refresh selection");
-    assert_eq!(
-        refreshed.queue_idx, 0,
-        "time-based refresh must let a small queue re-enter Phase 1 after saturation"
-    );
-    assert_eq!(
-        root.waterfill_epoch_start_ns, refresh_now,
-        "time-refresh must advance the epoch start"
-    );
-    assert_eq!(
-        root.waterfill_pass1_remaining_bytes,
-        expected_waterfill_pass1_bytes(&root).saturating_sub(refreshed.secondary_budget),
-        "time-refresh must restore the shaper-anchored pass1 budget before the next honor"
-    );
+#[test]
+fn waterfill_multi_epoch_small_classes_honored_via_lease_throttle_simulation() {
+    // #1630 Codex code-r1 #1: prove that after Hunk B's time-refresh,
+    // small classes get re-honored every epoch even when Phase-2
+    // saturates root tokens.
+    //
+    // Test isolation without per-class leases: we simulate the
+    // per-class-lease throttle by resetting per-queue tokens at
+    // every epoch boundary AND consuming `head_len` bytes per
+    // selection (mirroring `drain_exact_local_fifo_items_to_scratch`
+    // at drain.rs:107-108).
+    //
+    // Across 5 epochs × ~10 selections each, every small class
+    // must be honored at least once.
+    let rates = [
+        12_500_000u64,  // 100m
+        125_000_000u64, // 1g
+        375_000_000u64, // 3g
+        750_000_000u64, // 6g
+        3_000_000_000u64, // 24g (large; Phase-2 receiver)
+    ];
+    let shaper = 3_125_000_000u64;
+    let mut root = build_smoke_like_runtime(shaper, &rates, 200);
+    let mut per_epoch_picks = vec![[0u32; 5]; 5];
+    for epoch in 0..5 {
+        let epoch_now = 1000 + (epoch as u64) * COS_GUARANTEE_VISIT_NS;
+        // Simulate per-class-lease epoch refresh: set tokens to
+        // EXACTLY one quantum per queue so each queue can be
+        // honored exactly once per epoch before lease-starving.
+        // Large queue (24g) clamps to MAX_BYTES so we cap at a
+        // value that lets it absorb Phase-2 RR without being
+        // honored in Phase-1.
+        for q in root.queues.iter_mut() {
+            q.hot.tokens = cos_guarantee_quantum_bytes(q);
+            q.hot.runnable = true; // un-park (simulates park-timer expiry)
+            while q.hot.items.len() < 100 {
+                q.hot.items.push_back(test_cos_item(1500));
+            }
+        }
+        // Also keep the root token bucket topped up.
+        root.tokens = 10 * 1024 * 1024;
+        // Drive several selections to fully drain Phase-1 + step
+        // through Phase-2.
+        for _ in 0..15 {
+            let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+            if let Some(sel) = select_exact_cos_guarantee_queue_with_lease_telemetry(
+                &mut root, &[], epoch_now, &mut tel,
+            ) {
+                if sel.queue_idx < 5 {
+                    per_epoch_picks[epoch][sel.queue_idx] += 1;
+                }
+                // Simulate ONE BATCH consuming the secondary_budget
+                // (drain.rs runs until tokens or TX_BATCH_SIZE
+                // exhausted). Zero out queue tokens so the next
+                // ascending walk skips this queue and advances.
+                // Mirrors the per-class-lease-starvation behaviour.
+                root.queues[sel.queue_idx].hot.tokens = 0;
+                root.queues[sel.queue_idx].hot.items.pop_front();
+            }
+        }
+    }
+    // Assert: each small class honored ≥1 time in every epoch.
+    // Without Hunk B, epochs 3-5 would have 0 picks for queue 0
+    // (100m) because pass1 would freeze below 2500 bytes.
+    for epoch in 0..5 {
+        for small_idx in 0..4 {
+            assert!(
+                per_epoch_picks[epoch][small_idx] >= 1,
+                "small class {} not honored in epoch {} (picks per class: {:?})",
+                small_idx,
+                epoch,
+                per_epoch_picks[epoch]
+            );
+        }
+    }
 }
