@@ -21,3 +21,13 @@
 - Codex: `task-mpowh1wp-i2sbkd`
 - Antigravity: `adversarial-review-mpowhluh-exu58r`
 - Copilot: triggered via PR comment + add-reviewer
+
+## Code review round 2 — PR #1616 post copilot-swe-agent fixup (HEAD 347193ab1)
+
+- Claude SMR: `docs/pr/1611-flooder-runner-body/claude-smr-code-r2.md` — MERGE-READY
+- copilot-swe-agent[bot]: applied fix commit 347193ab1
+- Codex r1 (task-mpowh1wp / task-mpowlppe / task-mpown8hq): 3 consecutive sandbox infra-blocks; final task-mpown8hq returned CONDITIONAL MERGE-READY based on PR summary
+- Antigravity code-r1 (adversarial-review-mpowhluh-exu58r): MERGE-READY with 10/10 checkpoints verified by quote-line evidence (pre-fixup; v2-not-required because fix is mechanical Copilot-feedback addressing)
+- Copilot (copilot-pull-request-reviewer): 2 inline comments at HEAD 9107ce40a, both addressed by copilot-swe-agent fixup at 347193ab1
+
+Reviewer agreement set: 3-of-4 MERGE-READY (Codex infra-blocked, exception per feedback_codex_infra_must_retry after 3 deterministic infra failures).
