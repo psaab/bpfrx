@@ -401,9 +401,14 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
 pub(in crate::afxdp) const PENDING_NEIGH_TIMEOUT_FAST_NS: u64 = 800_000_000;
 
 /// Threshold (ms) at/below which the kernel retrans timer is fast enough
-/// to admit the 800ms timeout. Mirrors the daemon-side
-/// `neighRetransTargetMs` (pkg/daemon/host_tunables.go).
-const NEIGH_RETRANS_FAST_THRESHOLD_MS: u32 = 250;
+/// to admit the 800ms timeout. The daemon writes 250ms
+/// (neighRetransTargetMs in pkg/daemon/host_tunables.go) but the kernel
+/// rounds retrans_time_ms to its internal jiffy resolution — a write of
+/// 250 reads back as 252 on HZ=100 hosts. The threshold is therefore set
+/// above the rounded value while staying far below the 1000ms default,
+/// so the jiffy-rounded fast value is still admitted but a host left at
+/// the default fails closed.
+const NEIGH_RETRANS_FAST_THRESHOLD_MS: u32 = 300;
 
 /// Reads a u32 from a sysctl-style file path. Abstracted so the
 /// timeout-compute logic is unit-testable without touching real /proc.

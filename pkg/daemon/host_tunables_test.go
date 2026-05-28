@@ -22,11 +22,12 @@ import (
 
 // fakeHostFS records writes and optionally returns a scripted error.
 type fakeHostFS struct {
-	cpufreqPaths []string           // what listCPUGovernorPaths returns
-	files        map[string][]byte  // pre-populated read values
-	writeErrs    map[string]error   // per-path error on writeFile (nil = success)
-	writes       map[string]string  // recorded writeFile data
-	writeOrder   []string           // ordered log of writeFile paths
+	cpufreqPaths []string            // what listCPUGovernorPaths returns
+	files        map[string][]byte   // pre-populated read values
+	writeErrs    map[string]error    // per-path error on writeFile (nil = success)
+	writes       map[string]string   // recorded writeFile data
+	writeOrder   []string            // ordered log of writeFile paths
+	neighDirs    map[string][]string // per neigh-dir interface listing (#1636)
 }
 
 func newFakeHostFS() *fakeHostFS {
@@ -38,6 +39,13 @@ func newFakeHostFS() *fakeHostFS {
 }
 
 func (f *fakeHostFS) listCPUGovernorPaths() []string { return f.cpufreqPaths }
+
+func (f *fakeHostFS) listNeighDirs(dir string) []string {
+	if f.neighDirs == nil {
+		return nil
+	}
+	return f.neighDirs[dir]
+}
 
 func (f *fakeHostFS) readFile(path string) ([]byte, error) {
 	if data, ok := f.files[path]; ok {
@@ -243,23 +251,54 @@ func TestApplyNetdevBudget_ReadOnlyProc_LogsAndContinues(t *testing.T) {
 
 // --- applyNeighRetransTime (#1636) ---------------------------------------
 
-func TestApplyNeighRetransTime_WritesBothFamilies(t *testing.T) {
+// neighFSWithIfaces builds a fake whose neigh dirs list `default` plus
+// the named interfaces for both families, each pre-set to `initial`.
+func neighFSWithIfaces(initial string, ifaces ...string) *fakeHostFS {
 	f := newFakeHostFS()
-	f.files[sysctlPathNeighRetransV4] = []byte("1000\n")
-	f.files[sysctlPathNeighRetransV6] = []byte("1000\n")
-	applyNeighRetransTime(f, nil)
-	if f.writes[sysctlPathNeighRetransV4] != "250" {
-		t.Fatalf("v4: want 250 written, got %q", f.writes[sysctlPathNeighRetransV4])
+	f.neighDirs = map[string][]string{}
+	for _, dir := range []string{sysctlNeighV4Dir, sysctlNeighV6Dir} {
+		names := append([]string{"default"}, ifaces...)
+		f.neighDirs[dir] = names
+		for _, n := range names {
+			f.files[dir+"/"+n+"/retrans_time_ms"] = []byte(initial + "\n")
+		}
 	}
-	if f.writes[sysctlPathNeighRetransV6] != "250" {
-		t.Fatalf("v6: want 250 written, got %q", f.writes[sysctlPathNeighRetransV6])
+	return f
+}
+
+func TestApplyNeighRetransTime_WritesEveryInterfaceAndDefault(t *testing.T) {
+	// The headline #1636 fix: existing interfaces (not just `default`)
+	// must be lowered, because the kernel only seeds new tables from
+	// `default`.
+	f := neighFSWithIfaces("1000", "em0", "ge-0-0-2")
+	applyNeighRetransTime(f, nil)
+	for _, dir := range []string{sysctlNeighV4Dir, sysctlNeighV6Dir} {
+		for _, n := range []string{"default", "em0", "ge-0-0-2"} {
+			path := dir + "/" + n + "/retrans_time_ms"
+			if f.writes[path] != "250" {
+				t.Fatalf("%s: want 250 written, got %q", path, f.writes[path])
+			}
+		}
+	}
+}
+
+func TestApplyNeighRetransTime_FallsBackToDefaultWhenDirUnreadable(t *testing.T) {
+	// No neighDirs scripted → listNeighDirs returns nil → only the
+	// `default` template is written for each family.
+	f := newFakeHostFS()
+	for _, dir := range []string{sysctlNeighV4Dir, sysctlNeighV6Dir} {
+		f.files[dir+"/default/retrans_time_ms"] = []byte("1000\n")
+	}
+	applyNeighRetransTime(f, nil)
+	for _, dir := range []string{sysctlNeighV4Dir, sysctlNeighV6Dir} {
+		if f.writes[dir+"/default/retrans_time_ms"] != "250" {
+			t.Fatalf("%s default: want 250, got %q", dir, f.writes[dir+"/default/retrans_time_ms"])
+		}
 	}
 }
 
 func TestApplyNeighRetransTime_IdempotentWhenAlreadySet(t *testing.T) {
-	f := newFakeHostFS()
-	f.files[sysctlPathNeighRetransV4] = []byte("250\n")
-	f.files[sysctlPathNeighRetransV6] = []byte("250\n")
+	f := neighFSWithIfaces("250", "em0")
 	applyNeighRetransTime(f, nil)
 	if len(f.writes) != 0 {
 		t.Fatalf("already-set must skip write, got %v", f.writes)
@@ -267,60 +306,47 @@ func TestApplyNeighRetransTime_IdempotentWhenAlreadySet(t *testing.T) {
 }
 
 func TestApplyNeighRetransTime_ReadOnlyProc_LogsAndContinues(t *testing.T) {
-	// Restricted container / sysctl namespace surfaces as EACCES on
-	// write. Must log and continue (best-effort) without panic. The
-	// other family must still be attempted.
-	f := newFakeHostFS()
-	f.files[sysctlPathNeighRetransV4] = []byte("1000\n")
-	f.files[sysctlPathNeighRetransV6] = []byte("1000\n")
-	f.writeErrs[sysctlPathNeighRetransV4] = &fs.PathError{
-		Op: "write", Path: sysctlPathNeighRetransV4, Err: fs.ErrPermission,
-	}
+	// Restricted container surfaces as EACCES on write. Must log and
+	// continue; the other paths must still be attempted.
+	f := neighFSWithIfaces("1000", "em0")
+	denied := sysctlNeighV4Dir + "/em0/retrans_time_ms"
+	f.writeErrs[denied] = &fs.PathError{Op: "write", Path: denied, Err: fs.ErrPermission}
 	applyNeighRetransTime(f, nil)
-	if _, ok := f.writes[sysctlPathNeighRetransV4]; ok {
-		t.Fatal("v4 write recorded despite scripted EACCES")
+	if _, ok := f.writes[denied]; ok {
+		t.Fatal("denied path write recorded despite scripted EACCES")
 	}
-	if f.writes[sysctlPathNeighRetransV6] != "250" {
-		t.Fatalf("v6 must still be written when v4 fails, got %q",
-			f.writes[sysctlPathNeighRetransV6])
+	if f.writes[sysctlNeighV4Dir+"/default/retrans_time_ms"] != "250" {
+		t.Fatal("default must still be written when one iface fails")
 	}
 }
 
 func TestApplyNeighRetransTime_CapturesPriorValueOnce(t *testing.T) {
-	f := newFakeHostFS()
-	f.files[sysctlPathNeighRetransV4] = []byte("1000\n")
-	f.files[sysctlPathNeighRetransV6] = []byte("900\n")
+	f := neighFSWithIfaces("1000", "em0")
 	cap := newPriorHostTunables()
 	applyNeighRetransTime(f, cap)
-	if cap.neighRetrans[sysctlPathNeighRetransV4] != "1000" {
-		t.Fatalf("v4 prior: want 1000, got %q", cap.neighRetrans[sysctlPathNeighRetransV4])
+	v4def := sysctlNeighV4Dir + "/default/retrans_time_ms"
+	if cap.neighRetrans[v4def] != "1000" {
+		t.Fatalf("prior: want 1000, got %q", cap.neighRetrans[v4def])
 	}
-	if cap.neighRetrans[sysctlPathNeighRetransV6] != "900" {
-		t.Fatalf("v6 prior: want 900, got %q", cap.neighRetrans[sysctlPathNeighRetransV6])
-	}
-	// Second apply (reconcile) must NOT overwrite the captured prior
-	// value with the xpfd-written 250 (first-apply-wins).
+	// Reconcile must NOT overwrite the captured prior with 250.
 	applyNeighRetransTime(f, cap)
-	if cap.neighRetrans[sysctlPathNeighRetransV4] != "1000" {
-		t.Fatalf("v4 prior overwritten on reconcile: got %q",
-			cap.neighRetrans[sysctlPathNeighRetransV4])
+	if cap.neighRetrans[v4def] != "1000" {
+		t.Fatalf("prior overwritten on reconcile: got %q", cap.neighRetrans[v4def])
 	}
 }
 
 func TestRestoreNeighRetransTime_RevertsToPrior(t *testing.T) {
-	f := newFakeHostFS()
-	f.files[sysctlPathNeighRetransV4] = []byte("1000\n")
-	f.files[sysctlPathNeighRetransV6] = []byte("1000\n")
+	f := neighFSWithIfaces("1000", "em0")
 	cap := newPriorHostTunables()
 	applyNeighRetransTime(f, cap)
-	// After apply, live value is 250. Restore must put back 1000.
 	restoreNeighRetransTime(cap, f)
-	if f.files[sysctlPathNeighRetransV4] == nil ||
-		strings.TrimSpace(string(f.files[sysctlPathNeighRetransV4])) != "1000" {
-		t.Fatalf("v4 not restored to 1000, got %q", string(f.files[sysctlPathNeighRetransV4]))
-	}
-	if strings.TrimSpace(string(f.files[sysctlPathNeighRetransV6])) != "1000" {
-		t.Fatalf("v6 not restored to 1000, got %q", string(f.files[sysctlPathNeighRetransV6]))
+	for _, dir := range []string{sysctlNeighV4Dir, sysctlNeighV6Dir} {
+		for _, n := range []string{"default", "em0"} {
+			path := dir + "/" + n + "/retrans_time_ms"
+			if strings.TrimSpace(string(f.files[path])) != "1000" {
+				t.Fatalf("%s not restored to 1000, got %q", path, string(f.files[path]))
+			}
+		}
 	}
 }
 

@@ -1873,3 +1873,13 @@ fn pending_neigh_timeout_fast_with_no_dataplane_interfaces() {
     let got = compute_pending_neigh_timeout_ns(&FastMap::default(), &reader);
     assert_eq!(got, PENDING_NEIGH_TIMEOUT_FAST_NS);
 }
+
+#[test]
+fn pending_neigh_timeout_fast_with_jiffy_rounded_252() {
+    // The daemon writes 250 but the kernel rounds retrans_time_ms to its
+    // internal jiffy resolution and reads back 252 on HZ=100 hosts. The
+    // 300ms threshold must still admit the fast 800ms timeout.
+    let reader = FakeSysctl::all(252);
+    let got = compute_pending_neigh_timeout_ns(&one_iface_map(), &reader);
+    assert_eq!(got, PENDING_NEIGH_TIMEOUT_FAST_NS);
+}

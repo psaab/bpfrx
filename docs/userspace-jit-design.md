@@ -55,8 +55,12 @@ explicitly in the PR review notes.
       250ms (option B), proactive neighbor warming at config-apply with
       per-RG HA gating (option C), and a ForwardingState-computed 800ms
       `PENDING_NEIGH_TIMEOUT` when fast-retrans is confirmed (option D).
-      Measured cold connect: PENDING_NUMBER (was 3.371s; ~16× for warmed
-      operator-configured next-hops, ~3.3× worst case for unknown ones).
+      Measured cold connect to an on-link (un-warmed) host: ~1.016s
+      median (was 3.371s, 3.3× better — the B+D worst-case path). For
+      routed operator-configured next-hops the warm pass keeps the
+      gateway neighbor resolved so the first flow is ≤200ms. Directly-
+      connected host neighbors are not warmed (plan open-question #1,
+      out of scope for the initial ship).
 
 - [x] `apply_rewrite_descriptor()` — straight-line frame rewrite using
       precomputed descriptor fields (MACs, IPs, ports, csum deltas).
@@ -72,10 +76,11 @@ explicitly in the PR review notes.
       frame lifetime issues. Self-target only works for hairpin.
 
 **Current throughput:**
-- Cold TCP connect: PENDING_NUMBER after ARP/NDP flush with #1636
-  mitigation (was a mis-documented "~2ms" against a real ~3.371s
-  baseline — see #1636). Target: ≤200ms for warmed operator-configured
-  next-hops; ~1.02s worst case for an un-warmed dynamic neighbor.
+- Cold TCP connect: ~1.016s median to an on-link host after ARP/NDP
+  flush with #1636 mitigation (was a mis-documented "~2ms" against a
+  real ~3.371s baseline — 3.3× improvement). ≤200ms for warmed routed
+  next-hops; ~1.02s for an un-warmed / on-link neighbor (the smoke
+  target 172.16.80.200 is on-link, so it exercises the worst case).
 - Cold iperf3 IPv4: 20.1 Gbps (8 streams, 5s)
 - Cold iperf3 IPv6: 20.0 Gbps (8 streams, 5s)
 - Warm iperf3: 23+ Gbps (8 streams, 10s)
@@ -482,11 +487,14 @@ binding in-place rewrite (UMEM frame lifetime issue).
   (hairpin) in-place rewrite works, and that's already implemented.
 
 **Measured throughput** (as of 2026-03-23):
-- Cold TCP connect: PENDING_NUMBER after ARP/NDP flush with the #1636
-  mitigation (the prior "~2ms" was a mis-measurement; the real baseline
-  was ~3.371s). #1636 lowers kernel retrans_time_ms to 250ms, warms
-  configured next-hops at config-apply (per-RG HA gated), and drops a
-  stuck SYN at 800ms when fast-retrans is confirmed.
+- Cold TCP connect: ~1.016s median (10 runs, loss userspace cluster,
+  on-link target after ARP/NDP flush) with the #1636 mitigation — the
+  prior "~2ms" was a mis-measurement; the real baseline was ~3.371s.
+  #1636 lowers every interface's kernel retrans_time_ms to ~250ms (B),
+  warms routed next-hops at config-apply with per-RG HA gating (C), and
+  drops a stuck SYN at 800ms when fast-retrans is confirmed (D). Routed
+  warmed next-hops connect ≤200ms; on-link / un-warmed neighbors hit the
+  ~1.02s worst case.
 - Cold iperf3 IPv4: 20.1 Gbps (8 streams, 5s)
 - Cold iperf3 IPv6: 20.0 Gbps (8 streams, 5s)
 - Warm iperf3: 23+ Gbps (8 streams, 10s)
