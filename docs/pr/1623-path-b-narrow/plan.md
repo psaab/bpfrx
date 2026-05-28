@@ -1,12 +1,19 @@
 # #1623 Path B narrow — PolicyRule parallel-prefix arrays
 
-**Status:** DRAFT v4 — Codex r2 PLAN-NEEDS-MINOR + AGY r2 PLAN-NEEDS-MINOR + Claude SMR r3 folded; pending r3 adversarial review
+**Status:** DRAFT v5 — Codex r3 PLAN-NEEDS-MINOR + AGY r3 PLAN-READY + Claude SMR r4 folded; ready to implement
 
 Revision history:
 - v1: initial draft.
 - v2: addresses Claude SMR r1 PLAN-NEEDS-MINOR findings.
 - v3: addresses Codex r1 PLAN-NEEDS-MAJOR (F1-F7) + AGY r1 PLAN-NEEDS-MINOR (F1-F4) + Claude SMR r2.
-- v4: addresses Codex r2 PLAN-NEEDS-MINOR + AGY r2 PLAN-NEEDS-MINOR + Claude SMR r3:
+- v5: addresses Codex r3 PLAN-NEEDS-MINOR + AGY r3 PLAN-READY + Claude SMR r4:
+  - **Arc construction:** `Arc::from(lit_vec.into_boxed_slice())` → `Arc::from(lit_vec)`. Codex r3 correctly noted that `Arc<[T]>` allocates its own ref-counted allocation and moves elements out of the Vec; the `into_boxed_slice()` step adds a wasted shrink-to-fit realloc before Arc allocates. Direct `Arc::from(Vec<T>)` (impl since Rust 1.45) is correct.
+  - **Add test 18 literal-/0-plus-non-/0** (Codex r3 finding 1) — rule with `source_literals: ["0.0.0.0/0", "10.0.0.0/8"]` (LITERAL both, NOT `any` token). Assert `source_prefixes_v4 = Some([/0, /8])` AND `source_v4_match_any = true` (PrefixSet collapses to MatchAny due to /0 presence).
+  - **Add test 19 duplicate preservation** (Codex r3 finding 1) — rule with literal `10.0.0.0/8` AND a cited book that also contains `10.0.0.0/8`. Assert the parallel array contains the prefix TWICE (literal once + book once), confirming the "no dedup at this layer" invariant from §4.3.
+  - **Fix `PrefixV4` / `PrefixV6` size accounting** (Codex r3 finding 3): `PrefixV4` is `u32 addr + u32 mask + u8 prefix_len + pad = 12 B`. `PrefixV6` is `u128 addr + u128 mask + u8 prefix_len + pad = 40 B` (NOT 24 B as v4 §2.1 claimed). Update accounting.
+  - **`size_of` assertion implementation** (AGY r3 + Codex r3): use compile-time `const _: [(); 16] = [(); std::mem::size_of::<...>()];` pattern inside test 13 to avoid the static_assertions crate dependency.
+
+- v4: addressed Codex r2 PLAN-NEEDS-MINOR + AGY r2 PLAN-NEEDS-MINOR + Claude SMR r3:
   - **Drop `..PolicyRule::default()` from parse constructor** (AGY r2 D + Codex r2): pre-declare `applications` + `compiled_apps` locals; constructor names every field explicitly.
   - **Arc construction via `.into()` from Vec** (Codex r2 B): `Arc::from(lit_vec)` reuses the Vec's allocation; `Arc::from(lit_vec.as_slice())` would re-copy.
   - **Honest populated-rule cost accounting** (Codex r2 D): per Arc adds 16 B (strong+weak counters) + 8 B (slice length) + 8 B (allocator overhead) on top of the 8 B payload per PrefixV4. Realistic 1M-rule footprint estimate: +250-500 MB.
@@ -96,19 +103,23 @@ but Codex r1 correctly notes the cardinality difference (books
   Vec<PolicyRule> stride; this is accepted as the foundation cost.
   Both r2 reviewers REJECTED PLAN-KILL on this axis (Codex r2 D,
   AGY r2 G), so the cardinality argument is closed.
-- **Per-Arc overhead** (Codex r2 D honest accounting). Each
-  `Some(Arc<[T]>)` carries:
-  - 16 B Arc inner header (strong + weak ref counts)
-  - 8 B slice length
+- **Per-Arc overhead** (Codex r2 D + r3 finding 3 corrected
+  accounting). Each `Some(Arc<[T]>)` carries:
+  - 16 B Arc inner header (strong + weak ref counts) — the slice
+    length lives in the FAT POINTER (already counted in the +64 B
+    struct growth), NOT in a separate allocation field.
   - ~8-16 B allocator block overhead (depends on jemalloc / glibc
-    malloc rounding)
-  - Payload: 8 B per `PrefixV4` element, 24 B per `PrefixV6`
-    element (`PrefixV6` is u128 + u8 prefix_len + padding).
+    malloc rounding).
+  - Payload: 12 B per `PrefixV4` element (u32 addr + u32 mask + u8
+    prefix_len + 3 B alignment pad). 40 B per `PrefixV6` element
+    (u128 addr + u128 mask + u8 prefix_len + 7 B alignment pad).
 
-  So a rule with 10 PrefixV4 entries in one Arc: ~40 B overhead
-  + 80 B payload = ~120 B per Arc. Worst-case realistic 1M rules
-  × 2 populated Arcs average × ~120 B = +240 MB Arc allocations
-  on top of struct growth.
+  So a rule with 10 PrefixV4 entries in one Arc: ~24-32 B header
+  + 120 B payload = ~144-152 B per Arc. Worst-case realistic 1M
+  rules × 2 populated Arcs average × ~150 B = +300 MB Arc
+  allocations on top of struct growth (v4 estimate was +240 MB
+  but used the wrong PrefixV4 size; corrected estimate is
+  higher).
 - **Book-prefix replication.** A rule that cites a 10-prefix
   book materializes those 10 prefixes into its
   `source_prefixes_v4` Arc rather than sharing the book's already-
@@ -127,11 +138,13 @@ but Codex r1 correctly notes the cardinality difference (books
   rules. NPO ensures zero per-field size overhead vs the bare
   `Arc<[T]>` shape.
 
-**Realistic 1M-rule total memory cost:** +64 MB struct growth
-+ ~240 MB Arc allocations + ~80 MB book-prefix data replication =
-**~380-500 MB total**. Within 8-16 GB VM budget. PLAN-KILL on
-this axis was rejected by both r2 reviewers; foundation work
-shipped as-is is acceptable.
+**Realistic 1M-rule total memory cost (corrected):** +64 MB
+struct growth + ~300 MB Arc allocations + ~120 MB book-prefix
+data replication (10 prefixes × 12 B v4 + 40 B v6 mix × 1M rules)
+= **~450-600 MB total**. Within 8-16 GB VM budget. PLAN-KILL on
+this axis was rejected by both r2 reviewers (and r3 Codex
+explicitly approved as foundation cost); foundation work shipped
+as-is is acceptable.
 
 ## 3. Precedent — #1624 BookEntry parallel arrays (and where this PR diverges)
 
@@ -321,12 +334,15 @@ where
     if lit_vec.is_empty() {
         None
     } else {
-        // Codex r2 B: Arc::from(Vec<T>) reuses the Vec's heap
-        // allocation; Arc::from(&[T]) (the .as_slice() form)
-        // would clone all elements into a fresh allocation. Going
-        // via into_boxed_slice ensures a clean conversion that
-        // shrinks-to-fit if needed and avoids the slice-clone path.
-        Some(Arc::from(lit_vec.into_boxed_slice()))
+        // Codex r3 finding 2 correction: Arc::from(Vec<T>) (impl
+        // since Rust 1.45) is preferred. Arc<[T]> always
+        // allocates its own ref-counted slice and moves elements
+        // out of the Vec — it does NOT reuse the Vec's heap
+        // allocation, because Arc needs the Arc header layout.
+        // The previous .into_boxed_slice() intermediate added a
+        // wasted shrink-to-fit realloc before Arc's allocation.
+        // Direct Arc::from(Vec) is cleanest.
+        Some(Arc::from(lit_vec))
     }
 }
 ```
@@ -518,7 +534,7 @@ touched. The wire protocol (`PolicyRuleSnapshot` in
 
 ## 8. Test plan
 
-### 8.1 New unit tests in `policy_tests.rs` (17 tests, Codex r1 F7 + AGY r1 F3 + Codex r2 C + AGY r2 F expansion)
+### 8.1 New unit tests in `policy_tests.rs` (19 tests; Codex r1 F7 + AGY r1 F3 + Codex r2 C + AGY r2 F + Codex r3 finding 1 + AGY r3 expansion)
 
 1. `test_policy_rule_v3_carries_canonical_prefix_lists_v4` — rule
    with three v4 literal CIDRs + one cited v4-only book. Assert
@@ -579,12 +595,18 @@ touched. The wire protocol (`PolicyRuleSnapshot` in
     a rule with both `Some(arr)` and `None` fields; clone it; assert
     cloned values are equal (Arc ptr-equality for Some,
     None preserved).
-13. `test_policy_rule_size_of_option_arc` (Codex r2 C
-    static-assertion test) — assert
+13. `test_policy_rule_size_of_option_arc` (Codex r2 C + r3
+    finding 5 + AGY r3 recommendation) — uses zero-dependency
+    compile-time `const _: [(); 16] = [(); size_of::<...>()];`
+    pattern at module scope to assert
     `size_of::<Option<Arc<[PrefixV4]>>>() == 16` AND
     `size_of::<Option<Arc<[PrefixV6]>>>() == 16` AND
-    `size_of::<Arc<[PrefixV4]>>() == 16`. Validates the NPO claim
-    that backs the memory accounting in §2.1.
+    `size_of::<Arc<[PrefixV4]>>() == 16`. The `const _` blocks
+    fail compilation if NPO is ever broken. Wrapped in a `#[test]
+    fn test_policy_rule_size_of_option_arc()` shell that does
+    nothing (or runtime-asserts the same values) so it still
+    appears in cargo test output. Validates the NPO claim that
+    backs the memory accounting in §2.1.
 14. `test_policy_rule_v3_any_plus_book_match_any_with_some_arr`
     (Codex r2 C) — rule with `source_literals: ["any"]` AND a
     cited book containing prefixes. Assert
@@ -611,6 +633,20 @@ touched. The wire protocol (`PolicyRuleSnapshot` in
     preserves both entries) AND `source_v4_match_any == true`
     (book has /0 which propagates the match-any flag at rule
     construction).
+18. `test_policy_rule_v3_literal_zero_plus_non_zero` (Codex r3
+    finding 1) — rule with `source_literals: ["0.0.0.0/0",
+    "10.0.0.0/8"]` (LITERAL both, NOT `any` token). Assert
+    `source_prefixes_v4 == Some([0/0, 10.0.0.0/8])` (length 2)
+    AND `source_v4_match_any == true` (PrefixSet collapses /0 to
+    MatchAny). Rule-level mirror of test 17 and of BookEntry
+    test_book_entry_zero_plus_non_zero_prefixes_preserved.
+19. `test_policy_rule_v3_duplicate_preservation` (Codex r3
+    finding 1) — rule with `source_literals: ["10.0.0.0/8"]`
+    AND citing a book whose `prefixes_v4` also contains
+    `10.0.0.0/8`. Assert `source_prefixes_v4 == Some(arr)` with
+    `arr.len() == 2` AND both entries equal `10.0.0.0/8`.
+    Confirms the "no dedup at this layer; future LPM owns it"
+    invariant from §4.3.
 
 ### 8.2 Cargo gates
 
@@ -704,14 +740,14 @@ adding any future field forces a compile error in
 `parse_policy_state_with_counters` until the constructor is
 updated. Closes the silent-omission hazard completely.
 
-Q9. **Test count and granularity.** RESOLVED in v4: 17 tests (was
-11) now cover Codex r2 C + AGY r2 F additions: any+book
-match_any+Some, book v6-only yields v4 None, destination-book
-path, book /0+non-/0, size_of static assertion. Remaining
-explicit axis NOT tested: duplicate-prefix preservation across
-literal + book — call it out as an invariant in §4.3 ordering
-note but no positive assertion (deferred, since the documented
-contract is "no dedup at this layer; future LPM owns it").
+Q9. **Test count and granularity.** RESOLVED in v5: 19 tests
+total. v4 added 17; Codex r3 finding 1 surfaced two more axes
+explicitly: test 18 literal-/0+non-/0 (rule-level mirror of book
+test 17), test 19 duplicate preservation across literal + book.
+Matrix is now exhaustively populated. Future LPM consumer's
+duplicate-handling and dedup behavior is tested at the OUTPUT
+layer (the duplicate is preserved into the parallel array, per
+"no dedup at this layer" contract).
 
 Q10. **PolicyRule cardinality vs precedent.** RESOLVED in v3-v4
 review rounds: both Codex r2 D and AGY r2 G REJECTED PLAN-KILL
