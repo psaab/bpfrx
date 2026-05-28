@@ -37,10 +37,40 @@ impl std::fmt::Display for SnapshotIntegrityError {
 impl std::error::Error for SnapshotIntegrityError {}
 
 /// #1606: one row of the deduplicated address-book table.
+///
+/// #1609 v3.1 Step 1 (STAGED scaffolding — narrow scope): the
+/// parallel `prefixes_v4` / `prefixes_v6` fields carry the
+/// canonical original prefix list for THIS book. Build code (a
+/// future Multi-Book LPM construction step) reads these directly
+/// without walking the `PrefixSetV{4,6}` trie. Hot-path
+/// `contains()` continues to use the existing `v4` / `v6`
+/// PrefixSets — these parallel fields are config-apply-time helpers
+/// only.
+///
+/// The two views agree by construction: `prefixes_v{4,6}` is fed
+/// into `PrefixSetV{4,6}::from_v3_literals()` immediately after
+/// parsing the snapshot, so the PrefixSet's contained prefixes are
+/// exactly the parallel array's entries (modulo MatchAny / /0
+/// collapse semantics which the LPM build will handle separately
+/// per plan §2.6 /0 short-circuit). A unit test asserts this
+/// agreement on representative inputs.
+///
+/// #1609 v3.1 scope discipline: this PR adds the field + parse-
+/// time population + unit test ONLY. The Multi-Book LPM that
+/// consumes these fields ships in a follow-up issue once the v3.2
+/// design round closes the remaining round-2 review findings.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BookEntry {
     pub(crate) v4: PrefixSetV4,
     pub(crate) v6: PrefixSetV6,
+    /// #1609 v3.1: canonical original IPv4 prefix list. Empty when
+    /// the book has no v4 prefixes (incl. the v4 MatchNone case).
+    /// For books containing `0.0.0.0/0`, this includes the /0
+    /// entry (callers route /0 through the §2.6 short-circuit when
+    /// building the LPM).
+    pub(crate) prefixes_v4: Arc<[PrefixV4]>,
+    /// #1609 v3.1: canonical original IPv6 prefix list.
+    pub(crate) prefixes_v6: Arc<[PrefixV6]>,
 }
 
 /// #922: zone-pair key packed as u32 (`from_id << 16 | to_id`).
@@ -410,9 +440,18 @@ pub(crate) fn parse_policy_state_with_counters(
         for s in &snap.prefixes_v6 {
             parse_literal_cidr_into(s, &mut v4, &mut v6);
         }
+        // #1609 v3.1: capture the canonical prefix lists BEFORE
+        // moving them into `from_v3_literals`. The Arc<[PrefixV4/V6]>
+        // parallel fields carry the original prefix shape for the
+        // future Multi-Book LPM builder. Cheap clone: just bumps
+        // the Vec into a boxed slice + Arc header.
+        let prefixes_v4: Arc<[PrefixV4]> = Arc::from(v4.clone().into_boxed_slice());
+        let prefixes_v6: Arc<[PrefixV6]> = Arc::from(v6.clone().into_boxed_slice());
         let entry = BookEntry {
             v4: PrefixSetV4::from_v3_literals(v4),
             v6: PrefixSetV6::from_v3_literals(v6),
+            prefixes_v4,
+            prefixes_v6,
         };
         let dense_idx = state.books.len() as u32;
         state.books.push(entry);

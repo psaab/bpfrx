@@ -4172,3 +4172,9 @@ top.
 - **Timestamp**: 2026-05-27 (UTC)
   - **Action**: v3.1 SHA e7dd86ed5 dispatched. Codex r2 (task-mpp2jzhy-m057in): PLAN-NEEDS-MAJOR with 3 blocking + scenario walkthrough exposing P2 dst-pseudo-id leak into src lookup OOB. AGY r2 (adversarial-review-mpp2kcas-nksaq7): PLAN-NEEDS-MAJOR with 10 issues, including NEW CRITICAL security finding — Stage 4 master-fallback creates DoS amplification (scan all 1M rules instead of just emitted candidates). 3-of-3 convergence (Codex + AGY + SMR r7). Per user contract this is the THIRD major-iteration kill (v2 KILL, v3 NEEDS-MAJOR, v3.1 NEEDS-MAJOR); contract says "do NOT spawn v4 without user authorization". Wrote claude-smr-plan-r7.md with three viable paths (A v3.2 full-round, B STAGED narrow Step 1 to prefix scaffolding only, C user decides). Posting issue comment with convergence + paths.
   - **File(s)**: docs/pr/1609-multistage-policy-dag/claude-smr-plan-r7.md (new), docs/pr/1609-multistage-policy-dag/reviewer-ids.md (round 7 verdicts)
+
+## 2026-05-27 — #1609 STAGED Step 1 narrow scope implemented
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: After v3.1 r2 3-of-3 PLAN-NEEDS-MAJOR convergence escalated to user (third major-iteration kill), executed Path B per claude-smr-plan-r7.md recommendation: narrow Step 1 to BookEntry parallel-prefix scaffolding only. Added `prefixes_v4: Arc<[PrefixV4]>` + `prefixes_v6: Arc<[PrefixV6]>` fields on `BookEntry` populated at parse-time from canonical input vectors (BEFORE PrefixSet collapse). No LPM, no PseudoBooks, no MatchAny side-channel, no feature flag — those all defer to v3.2 + follow-up issue once design is fully ratified. 4 new tests (v4 / v6 / empty / /0-preservation) verifying parallel-array agrees with PrefixSet. 5/5 flake clean. 1456 existing tests pass. Go build clean.
+  - **File(s)**: userspace-dp/src/policy.rs (BookEntry extension + parse-time population), userspace-dp/src/policy_tests.rs (4 new tests appended)
