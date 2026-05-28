@@ -12,7 +12,7 @@ Plan v1 SHA at dispatch: `ccf651633`
 
 ## Plan review round 2 (on plan v4)
 
-- Codex: `task-mpp06lsc-exfqn9`
+- Codex: `task-mpp09hyh-7afxnl` (first dispatch `task-mpp06lsc-exfqn9` didn't register, retried)
   - Output target: `docs/pr/1614-multi-rss-cos/codex-plan-r2.md`
 - AGY: `adversarial-review-mpp070l0-jse7m1`
   - Output target: `docs/pr/1614-multi-rss-cos/agy-plan-r2.md`

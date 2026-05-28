@@ -155,21 +155,23 @@ Quantum table:
 | 21g   | 21.0 | **512 (CLAMPED)** |
 | 24g   | 24.0 | **512 (CLAMPED)** |
 
-Sum of quantums = 2400 KB. With 18 G ceiling, predicted
-`T_i = 18 × Q_i / 2400`:
+Sum of quantums = 2.5 + 25 + 75 + 150 + 225 + 300 + 375 + 450 +
+512 + 512 = **2626.5 KB** (Codex r2 found the v4 number "2400 KB"
+was arithmetically wrong). With 18 G ceiling, predicted
+`T_i = 18 × Q_i / 2626.5`:
 
 | Class | Predicted | Observed | Delta |
 |-------|-----------|----------|-------|
-| 100m | 19 Mbps | 20 Mbps | +5% |
-| 1g | 188 Mbps | 210 Mbps | +12% |
-| 3g | 562 Mbps | 770 Mbps | +37% (small-class quantum floor noise) |
-| 6g | 1.12 G | 1.43 G | +28% |
-| 9g | 1.69 G | 2.32 G | +37% |
-| 12g | 2.25 G | 2.84 G | +26% |
-| 15g | 2.81 G | 2.77 G | -1% |
-| 18g | 3.38 G | 2.83 G | -16% |
-| 21g | 3.84 G | 3.22 G | -16% |
-| 24g | 3.84 G | 3.62 G | -6% |
+| 100m | 17 Mbps | 20 Mbps | +18% |
+| 1g | 171 Mbps | 210 Mbps | +23% |
+| 3g | 514 Mbps | 770 Mbps | +50% (small-class quantum floor noise) |
+| 6g | 1.03 G | 1.43 G | +39% |
+| 9g | 1.54 G | 2.32 G | +51% |
+| 12g | 2.06 G | 2.84 G | +38% |
+| 15g | 2.57 G | 2.77 G | +8% |
+| 18g | 3.08 G | 2.83 G | -8% |
+| 21g | 3.51 G | 3.22 G | -8% |
+| 24g | 3.51 G | 3.62 G | +3% |
 
 The systematic positive deviation on small-mid classes
 (100m-12g) and negative on large (18g-24g) is the
@@ -179,13 +181,13 @@ scheduler reading; the §3 framing is solid.
 
 ## 4. Proposed mechanism — Axis A (scheduler semantics ONLY)
 
-> **Phase 0 (run BEFORE any A1 implementation): R8 reverse-simul
-> sanity check.** Plan §7 gate 8 is BLOCKING. The implementer
-> MUST run gate 8 first and confirm reverse-simul aggregate ≥ 22 G
-> before writing A1 code. If reverse-simul caps at ~18 G the
-> firewall isn't the bottleneck and the entire plan is
-> invalidated. File a separate follow-up to re-acquire baseline on
-> a beefier generator and STOP work on this plan.
+> **Phase 0 (R8 reverse-simul sanity check): PASSED** on
+> 2026-05-27. Reverse-simul aggregate at HEAD post-fresh CoS-
+> fixture: 22.72 G received (22.99 G sent), all 11 classes
+> running simultaneously, generator CPU has 20-58% idle across
+> 12 cores. The firewall is confirmed the bottleneck. The §1
+> problem statement is empirically grounded. v5 design is
+> safe to implement.
 
 ### A1. Two-phase guaranteed-rate allocator (Junos-style oversubscription)
 
@@ -463,6 +465,21 @@ This affects iperf3 default flows (NOT-ECT → drops at sojourn
 target instead of waiting for full buffer). Expected retrans
 reduction: 1500-2000 → ≤100 per class per 30 s **conditional on
 correct codel-target tuning per the RTT-aware rule above**.
+
+**A3 is an experimental gate, not a proven gate (Codex r2 #3).**
+The retransmit reduction claim is theoretical — RFC 8290 §6.3
+shows CoDel reduces tail-drop-induced retransmits by 1-2 orders
+of magnitude in published evaluations, but this is the first
+deployment of sojourn-time AQM in this codebase. Acceptance:
+- **If smoke Pass C demonstrates retrans ≤ 100/class/30s
+  under `guarantee-rate > 0`**, gate 3 is met.
+- **If smoke shows retrans 200-500/class/30s** (better than
+  baseline but missing target), file a follow-up tuning issue
+  and MERGE on the partial gain. The mechanism is still net
+  positive.
+- **If smoke shows retrans regression vs baseline** (CoDel
+  thrashing per AGY r2 #3), revert A3 and ship A1+A2+A4 only.
+  CoDel disabled by default (`codel-target 0`) is the fallback.
 
 The existing ECN 33% threshold path **remains in place** for
 ECT(0)/ECT(1) flows; CoDel adds a sojourn-time gate that
