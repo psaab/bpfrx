@@ -1,5 +1,10 @@
 # Action Log
 
+## 2026-05-28 03:07 UTC — #1611 Copilot review addressed
+- **Timestamp**: 2026-05-28 03:07 UTC
+- **Action**: For PR #1616 / issue #1611, addressed two Copilot review findings in `test/incus/cold-path-flooder/src/main.rs`. (1) Reworked the per-second stderr JSON helper so `pps` is derived from the real emit-window duration and the emitted counters are explicitly window deltas (`*_delta`) instead of mixed cumulative/window semantics. Added unit tests covering the computed rate and the zero-window clamp. (2) Reworked the ignored CAP_NET_RAW smoke test so it no longer binds to `lo`; it now uses `XPF_RAW_SOCKET_TEST_IFACE` when provided or auto-probes `/sys/class/net` for an `IFF_UP` Ethernet iface, validates `ARPHRD_ETHER`, and skips cleanly if no suitable iface is available. Updated the #1611 plan doc example/output accordingly.
+- **File(s)**: `test/incus/cold-path-flooder/src/main.rs`, `docs/pr/1611-flooder-runner-body/plan.md`, `_Log.md`
+
 ## 2026-05-26 — #1598 secondary fix (TX-dispatch funnel)
 - **Action**: Post-merge smoke on PR #1600 caught a SECONDARY funnel:
   primary fix at `worker/cos/mod.rs:126-131` correctly set
