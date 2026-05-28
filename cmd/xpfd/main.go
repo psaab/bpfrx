@@ -60,13 +60,17 @@ func main() {
 	// = 1-in-256 sampling. Powers-of-two-minus-one only. For 1-in-1
 	// sampling (256× CPU cost — bounded-cohort microbench only),
 	// also pass --enable-cold-path-1-in-1-sampling.
-	coldPathSampleMask := flag.Uint64("cold-path-sample-mask", 0xff,
+	const (
+		flagColdPathSampleMask  = "cold-path-sample-mask"
+		flagColdPath1in1        = "enable-cold-path-1-in-1-sampling"
+	)
+	coldPathSampleMask := flag.Uint64(flagColdPathSampleMask, 0xff,
 		"Cold-path latency histogram sample mask (powers-of-two minus one). "+
 			"Default 0xff = 1-in-256 sampling. Allowed values: 0x1, 0x3, 0x7, "+
 			"0xff, 0x3ff, ..., 0x7fffffffffffffff. For 1-in-1 sampling (256× "+
 			"CPU cost — bounded-cohort microbench only), use "+
 			"--enable-cold-path-1-in-1-sampling.")
-	enableColdPath1in1 := flag.Bool("enable-cold-path-1-in-1-sampling", false,
+	enableColdPath1in1 := flag.Bool(flagColdPath1in1, false,
 		"Enable 1-in-1 cold-path latency sampling (256× CPU cost). "+
 			"Required for bounded-cohort microbench (#1622); never use in "+
 			"production. Overrides --cold-path-sample-mask to 0.")
@@ -106,7 +110,7 @@ func main() {
 	// flag never accidentally serialize 0 and trigger 1-in-1 sampling.
 	var coldPathMaskPtr *uint64
 	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "cold-path-sample-mask" || f.Name == "enable-cold-path-1-in-1-sampling" {
+		if f.Name == flagColdPathSampleMask || f.Name == flagColdPath1in1 {
 			m := effectiveMask
 			coldPathMaskPtr = &m
 		}
