@@ -472,11 +472,12 @@ impl WorkerColdPathAtomics {
         self.cold_window_gen.fetch_add(1, Ordering::Release);
     }
 
-    /// Snapshot for status readers. Seqlock: spin until two
-    /// consecutive Acquire reads observe an even, equal generation
-    /// across all the payload Relaxed loads. Bounded retry count;
-    /// on giveup returns zeros (the harness sees the empty slot and
-    /// retries on next tick).
+    /// Snapshot for status readers. Seqlock protocol: Acquire-load
+    /// `cold_window_gen` (s1), Relaxed-load the full payload, issue
+    /// `fence(Acquire)` to seal the Relaxed loads, then Relaxed-load
+    /// `cold_window_gen` (s2). If s1 and s2 are equal and even the
+    /// payload is coherent. Bounded retry count; on giveup returns
+    /// zeros (the harness sees the empty slot and retries on next tick).
     pub(in crate::afxdp) fn snapshot(&self) -> WorkerColdPathCounters {
         for _ in 0..16 {
             let s1 = self.cold_window_gen.load(Ordering::Acquire);
