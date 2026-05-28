@@ -514,7 +514,8 @@ func newCollector(srv *Server) *xpfCollector {
 			"1 when this worker's clock source has the value of the "+
 				"`source` label. Operators gate Scale Target table "+
 				"publication on every worker reporting source='tsc'. "+
-				"Always emitted (even when uncalibrated → source='').",
+				"Always emitted (uncalibrated workers report "+
+				"source='unset').",
 			[]string{"worker_id", "source"}, nil,
 		),
 		workerColdPathSnapshotFailedTotal: prometheus.NewDesc(

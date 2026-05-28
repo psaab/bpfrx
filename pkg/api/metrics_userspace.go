@@ -561,12 +561,20 @@ func (c *xpfCollector) emitWorkerColdPath(
 		}
 		return strconv.FormatUint((uint64(1)<<uint(10+idx))-1, 10)
 	}
+	// Prometheus histogram `_bucket{le="N"}` convention requires
+	// CUMULATIVE counts (count of observations ≤ N), not the raw
+	// per-bucket count. Copilot code-r1 C1 caught this: the v1 plan
+	// said `_bucket` "counter" but didn't specify cumulative. Without
+	// cumulative semantics, `histogram_quantile()` computes wrong
+	// quantiles. Accumulate per-slot before emit.
 	for slot := 0; slot < len(w.ColdPathHist); slot++ {
 		slotLabel := strconv.Itoa(slot)
+		var running uint64
 		for b := 0; b < len(w.ColdPathHist[slot]); b++ {
+			running += w.ColdPathHist[slot][b]
 			ch <- prometheus.MustNewConstMetric(c.workerColdPathBucket,
 				prometheus.CounterValue,
-				float64(w.ColdPathHist[slot][b]),
+				float64(running),
 				label, slotLabel, bucketLe(b))
 		}
 	}
