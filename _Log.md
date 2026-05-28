@@ -1,5 +1,10 @@
 # Action Log
 
+## 2026-05-28 17:20 UTC — #1630 Copilot review follow-up
+- **Timestamp**: 2026-05-28 17:20 UTC
+- **Action**: Addressed Copilot PR review findings on #1630. Reworked the new waterfill regression tests so pass1 expectations are derived from the same refill math used by the scheduler (avoiding float-rounding off-by-one failures), made the exhausted-path cursor assertion concrete, and replaced the weak saturation test with a real small+large fixture that drives Phase 2 before verifying the timed refresh re-honors a small queue. Also fixed the `waterfill_epoch_start_ns` field doc typo in `types/cos.rs`.
+- **File(s)**: `userspace-dp/src/afxdp/cos/queue_service/tests.rs`, `userspace-dp/src/afxdp/types/cos.rs`, `_Log.md`
+
 ## 2026-05-28 03:07 UTC — #1611 Copilot review addressed
 - **Timestamp**: 2026-05-28 03:07 UTC
 - **Action**: For PR #1616 / issue #1611, addressed two Copilot review findings in `test/incus/cold-path-flooder/src/main.rs`. (1) Reworked the per-second stderr JSON helper so `pps` is derived from the real emit-window duration and the emitted counters are explicitly window deltas (`*_delta`) instead of mixed cumulative/window semantics. Added unit tests covering the computed rate and the zero-window clamp. (2) Reworked the ignored CAP_NET_RAW smoke test so it no longer binds to `lo`; it now uses `XPF_RAW_SOCKET_TEST_IFACE` when provided or auto-probes `/sys/class/net` for an `IFF_UP` Ethernet iface, validates `ARPHRD_ETHER`, and skips cleanly if no suitable iface is available. Updated the #1611 plan doc example/output accordingly.

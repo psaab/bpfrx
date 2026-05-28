@@ -424,8 +424,8 @@ pub(in crate::afxdp) struct CoSInterfaceRuntime {
     /// the legacy "refresh only on `pass1 == 0`" path stalls under
     /// saturation (Phase-2 selections don't decrement pass1), and
     /// small classes stop receiving Phase-1 honors after a few
-    /// epochs. Initialized to 0; first call refreshes
-    /// unconditionally because `now_ns >> VISIT_NS`.
+    /// epochs. Initialized to 0; the first call refreshes because
+    /// `waterfill_epoch_start_ns == 0` (and `pass1 == 0` initially).
     pub(in crate::afxdp) waterfill_epoch_start_ns: u64,
     // Round-robin cursors for the two guarantee service classes. Exact and
     // non-exact guarantee queues rotate independently — the scheduler gives
