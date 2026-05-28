@@ -432,27 +432,36 @@ impl SysctlReader for RealSysctlReader {
 ///
 /// Returns `PENDING_NEIGH_TIMEOUT_FAST_NS` (800ms) only if EVERY checked
 /// `retrans_time_ms` sysctl reads <= `NEIGH_RETRANS_FAST_THRESHOLD_MS`
-/// (300ms; v4 AND v6, every dataplane interface plus the `default`
-/// template). The threshold is above the jiffy-rounded 252ms readback on
-/// HZ=100 hosts but far below the 1000ms default, so a correctly-applied
-/// sysctl is always admitted. Any read failure or any value above the
-/// threshold falls back to `super::PENDING_NEIGH_TIMEOUT_NS` (2000ms)
-/// and emits a per-snapshot operator warning — if PR-1's sysctl never
-/// applied (restricted container, sysctl namespace, admin override),
-/// dropping at 800ms before the kernel's first 1000ms wire solicit would
-/// REGRESS the baseline, so we keep the safe default.
+/// (300ms — the daemon writes 250 but the kernel jiffy-rounds it to 252
+/// on HZ=100; v4 AND v6, every dataplane interface plus the `default`
+/// template). Any read failure or any value above the threshold falls
+/// back to `super::PENDING_NEIGH_TIMEOUT_NS` (2000ms) and emits a
+/// transition-gated operator warning — if the sysctl never applied
+/// (restricted container, sysctl namespace, admin override), dropping at
+/// 800ms before the kernel's first 1000ms wire solicit would REGRESS the
+/// baseline, so we keep the safe default.
 pub(in crate::afxdp) fn compute_pending_neigh_timeout_ns<R: SysctlReader>(
     ifindex_to_name: &FastMap<i32, String>,
     reader: &R,
 ) -> u64 {
+    // AGY r1 #4: this runs on EVERY snapshot build, so an un-gated
+    // eprintln in the fallback path would flood stderr on every route
+    // churn when option B is unapplied. Log only on the false->true
+    // transition into the fallback state (and re-arm on recovery so a
+    // revert→fix→revert cycle re-warns once). Process-global because the
+    // sysctl state is process-global.
+    static IN_FALLBACK: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     let fallback = || -> u64 {
-        eprintln!(
-            "xpf-userspace-dp: WARNING: kernel retrans_time_ms not <= {}ms on all dataplane \
-             interfaces (v4 AND v6) — using PENDING_NEIGH_TIMEOUT_NS={}ms (option D inactive). \
-             Apply the #1636 sysctl drop-in to enable.",
-            NEIGH_RETRANS_FAST_THRESHOLD_MS,
-            super::PENDING_NEIGH_TIMEOUT_NS / 1_000_000,
-        );
+        if !IN_FALLBACK.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "xpf-userspace-dp: WARNING: kernel retrans_time_ms not <= {}ms on all dataplane \
+                 interfaces (v4 AND v6) — using PENDING_NEIGH_TIMEOUT_NS={}ms (option D inactive). \
+                 Apply the #1636 sysctl drop-in to enable.",
+                NEIGH_RETRANS_FAST_THRESHOLD_MS,
+                super::PENDING_NEIGH_TIMEOUT_NS / 1_000_000,
+            );
+        }
         super::PENDING_NEIGH_TIMEOUT_NS
     };
     // Per-interface tables first (an interface created from a stale
@@ -474,5 +483,8 @@ pub(in crate::afxdp) fn compute_pending_neigh_timeout_ns<R: SysctlReader>(
             _ => return fallback(),
         }
     }
+    // Recovered (or always-fast): re-arm the warning so a later revert
+    // logs again exactly once.
+    IN_FALLBACK.store(false, Ordering::Relaxed);
     PENDING_NEIGH_TIMEOUT_FAST_NS
 }

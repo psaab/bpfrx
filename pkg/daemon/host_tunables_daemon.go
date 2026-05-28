@@ -119,6 +119,15 @@ func (d *Daemon) applyStep0TunablesWith(userspaceDP, claimHostTunables bool,
 		// claim-host-tunables — it is a neighbor-resolution timing knob,
 		// strictly beneficial for forwarding, captured + restored on stop.
 		applyNeighRetransTime(fs, prior)
+	} else if len(prior.neighRetrans) > 0 {
+		// #1636 (Codex r1 / AGY r1 #3): userspace-dp was disabled at
+		// runtime (without a daemon stop). Restore the neighbor
+		// retrans_time_ms values we previously lowered and discard the
+		// captures so a later re-enable re-captures cleanly. Without this
+		// the lowered values would persist for the daemon lifetime even
+		// though the dataplane that wanted them is gone.
+		restoreNeighRetransTime(prior, fs)
+		prior.neighRetrans = map[string]string{}
 	}
 
 	// Host-scope restore path: previously claimed, now gated off.

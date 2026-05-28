@@ -65,6 +65,20 @@ Tracks task IDs across rounds for long-running session resumption.
 | Reviewer | Task ID | Verdict |
 |----------|---------|--------|
 | Claude SMR | (claude-smr-code-r1.md) | MERGE-READY |
-| Codex | (pending dispatch) | — |
-| AGY (adversarial) | (pending dispatch) | — |
-| Copilot | (pending @copilot review on PR) | — |
+| Codex | (codex-companion task, session a8c1b014) | 6 findings (2 High, 3 Med, 1 Low) — addressed in r2 |
+| AGY (adversarial) | adversarial-review-mpq1z20f-7yc7mu | 5 findings (no KILL, wire clean) — addressed in r2 |
+| Copilot | PR #1640 copilot-pull-request-reviewer | 4 findings — addressed in r2 |
+
+### Round-2 fix disposition (commit after review)
+- Codex High #1 (tunnel route wrong-RG): FIX — skip routes with tunnel_endpoint_id != 0 (+ test).
+- Codex High #2 (forced warm lost when queue full of 4096 stale items): REJECT — requires 4096 in-flight; warmer drains in µs, queue realistically holds <100; force path stores last_warm_sweep_ns so a later sweep recovers.
+- Codex Med #3 / (warms all active RGs not just activated): REJECT — already-resolved neighbors are skipped (no-op); broader-than-needed but not a defect.
+- Codex Med #4 (one stale probe after stop): FIX — re-check stop after recv before any side effect.
+- Codex Med #5 / AGY #3 (Go: not restored on runtime userspaceDP→false): FIX — restore neigh retrans + clear captures in the runtime-disable branch (+ test).
+- Codex Low #6 / Copilot #2 / AGY #4 (log storm): FIX — transition-gated AtomicBool, re-arms on recovery.
+- Copilot #1 (on_link_up dead code): FIX — removed the unwired helper + test, documented deferral (no link-state monitor to call it).
+- Copilot #3/#4 (doc ≤250 vs 300 threshold): FIX — docstrings aligned to NEIGH_RETRANS_FAST_THRESHOLD_MS.
+- AGY #1 (coordinator silent poison skip): REJECT — poison is surfaced via the worker's .expect() → channel break → warm_disconnected; a coordinator-side panic is a worse failure mode and inconsistent with the coordinator's established if-let-Ok mutex discipline.
+- AGY #2 (generation/rate-limit race): REJECT — key is (ifindex,hop); a changed next-hop is a different key (not rate-limited); same-key re-warm is correct and the 5s window self-heals.
+- AGY #3 post-start iface leak: documented as benign known limitation (250ms is a strict improvement on any iface; matches netdev_budget observed-value-only restore).
+- AGY #5 transient drop on manual sysctl revert: accept — one-snapshot window on manual admin revert, inherent to per-snapshot recompute.

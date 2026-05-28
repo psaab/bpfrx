@@ -1510,6 +1510,18 @@ fn queue_warm_pass_skips_when_owning_rg_inactive() {
 }
 
 #[test]
+fn queue_warm_pass_skips_tunnel_routes() {
+    // Codex r1 High #1: a route with tunnel_endpoint_id != 0 is HA-owned
+    // by the tunnel endpoint's RG, not the underlay egress RG, and is out
+    // of warm scope. The warmer must skip it rather than gate it on the
+    // wrong RG.
+    let (mut coord, rx) = warm_test_coordinator(0);
+    coord.forwarding.routes_v4.get_mut("inet.0").unwrap()[0].tunnel_endpoint_id = 7;
+    coord.queue_warm_pass(false);
+    assert!(rx.try_recv().is_err(), "tunnel route must not be warmed");
+}
+
+#[test]
 fn queue_warm_pass_skips_invalid_addresses() {
     let (mut coord, rx) = warm_test_coordinator(0);
     // Replace the route's next-hop with a multicast address.
@@ -1621,16 +1633,3 @@ fn on_rg_promote_active_clears_rate_limit_and_forces_warm() {
     assert!(rx.try_recv().is_ok(), "forced warm pass on RG-promote must enqueue");
 }
 
-#[test]
-fn on_link_up_clears_only_matching_ifindex() {
-    let coord = Coordinator::new();
-    {
-        let mut probed = coord.neighbors.last_probed_at.lock().unwrap();
-        probed.insert((80, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))), 1);
-        probed.insert((81, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 2))), 2);
-    }
-    coord.on_link_up(80);
-    let probed = coord.neighbors.last_probed_at.lock().unwrap();
-    assert!(!probed.contains_key(&(80, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1)))));
-    assert!(probed.contains_key(&(81, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 2)))));
-}

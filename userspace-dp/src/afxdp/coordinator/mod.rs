@@ -702,8 +702,19 @@ impl Coordinator {
         };
 
         // Static + dynamic (FRR-populated) route next-hops, both families.
+        // Tunnel routes (tunnel_endpoint_id != 0) are skipped: their HA
+        // ownership is the tunnel endpoint's RG, not the underlay egress
+        // RG (forwarding uses owner_rg_for_resolution, which switches on
+        // tunnel_endpoint_id) — gating them via owner_rg_for_flow(egress)
+        // here would warm on the wrong RG (Codex r1 High #1). Tunnel
+        // endpoints are also explicitly out of warm scope per the plan
+        // (AGY plan r1 #3); their underlay next-hops, if relevant, appear
+        // as ordinary (tunnel_endpoint_id == 0) routes.
         for routes in snapshot.routes_v4.values() {
             for route in routes {
+                if route.tunnel_endpoint_id != 0 {
+                    continue;
+                }
                 if let Some(hop) = route.next_hop {
                     enqueue(route.ifindex, IpAddr::V4(hop));
                 }
@@ -711,6 +722,9 @@ impl Coordinator {
         }
         for routes in snapshot.routes_v6.values() {
             for route in routes {
+                if route.tunnel_endpoint_id != 0 {
+                    continue;
+                }
                 if let Some(hop) = route.next_hop {
                     enqueue(route.ifindex, IpAddr::V6(hop));
                 }
@@ -735,16 +749,14 @@ impl Coordinator {
         self.queue_warm_pass(true);
     }
 
-    /// #1636: called when an interface transitions DOWN→UP. Clears the
-    /// `last_probed_at` entries for that ifindex so probes fired during
-    /// the link-negotiation window (LACP/STP/VLAN, ~1-2s) are not
-    /// rate-limited once the link is actually up.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(in crate::afxdp) fn on_link_up(&self, ifindex: i32) {
-        if let Ok(mut map) = self.neighbors.last_probed_at.lock() {
-            map.retain(|&(ifx, _), _| ifx != ifindex);
-        }
-    }
+    // NOTE (#1636): a per-ifindex `last_probed_at` clear on link-UP was
+    // specified in the plan (AGY plan r3 #3) to drop probes fired during
+    // a link-negotiation window. It is NOT wired here: there is no
+    // userspace link-state (RTM_NEWLINK) monitor to call it from, and the
+    // RG-promote clear already covers the dominant failover case. Shipping
+    // an unwired helper would be a false guarantee (Copilot r1), so it is
+    // deferred until a link-state monitor exists. The 5s per-key window
+    // self-heals a transient-down lockout regardless.
 
     pub fn policy_rule_counters(&self) -> Vec<crate::protocol::PolicyRuleCounterStatus> {
         self.forwarding.policy.counter_snapshots()

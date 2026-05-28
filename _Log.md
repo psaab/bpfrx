@@ -4242,8 +4242,6 @@ top.
   **Action**: Prometheus telemetry — neighbor_warm_drops_total + neighbor_warm_disconnected_total wired Rust ProcessStatus -> Go ProcessStatus (matching json names) -> xpf_userspace_neighbor_warm_{drops,disconnected}_total counters. Regenerated protocol wire fixture. Updated docs/userspace-jit-design.md cold-connect lines.
   **File(s)**: userspace-dp/src/protocol/control.rs, afxdp/coordinator/status.rs, server/helpers.rs, server/lifecycle.rs, tests/fixtures/protocol_wire_v1.json, pkg/dataplane/userspace/protocol.go, pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go, docs/userspace-jit-design.md
 
-## #1636 code review docfix (2026-05-28)
-
 - **Timestamp**: 2026-05-28
-  **Action**: [Edit] Fix doc-code discrepancy and "one-shot" claim in compute_pending_neigh_timeout_ns docstring. Doc said threshold was <= 250 (the value written by the daemon) but actual constant NEIGH_RETRANS_FAST_THRESHOLD_MS=300 (widened for jiffy rounding). Also corrected "one-shot" to "per-snapshot" — the fallback closure has no AtomicBool gate so warns on every snapshot while the sysctl is unset.
-  **File(s)**: userspace-dp/src/afxdp/forwarding_build/mod.rs
+  **Action**: 4-way code review (Codex 6 / AGY 5 / Copilot 4 findings). Fixes: skip tunnel routes in warm pass (Codex High #1, +test); re-check stop after recv in warmer (Codex Med #4); restore neigh retrans on runtime userspaceDP->false (Codex Med #5 / AGY #3, +test); transition-gate option-D fallback log via AtomicBool (log storm, Codex Low #6 / Copilot #2 / AGY #4 — supersedes the interim Copilot-SWE "per-snapshot" docfix b463f1444); remove unwired on_link_up + test (Copilot #1); align ≤250→300 docstrings (Copilot #3/#4); doc post-start iface restore limitation (AGY #3). Rejected: Codex High #2 / Med #3, AGY #1 / #2 / #5 with rationale (reviewer-ids.md).
+  **File(s)**: userspace-dp/src/afxdp/coordinator/mod.rs, neighbor.rs, types/forwarding.rs, forwarding_build/mod.rs, coordinator/tests.rs, pkg/daemon/host_tunables.go, host_tunables_daemon.go, host_tunables_test.go, docs/pr/1636-cold-connect-mitigation/

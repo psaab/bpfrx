@@ -389,6 +389,14 @@ const (
 // parameter, not a system-wide performance knob, and lowering it is
 // strictly beneficial for any forwarding deploy. It is still captured +
 // restored so a co-tenant's tuned value is put back on daemon stop.
+//
+// Known limitation (AGY r1 #3): only interface tables that exist at apply
+// time are captured for restore. An interface created AFTER apply inherits
+// 250ms from the lowered `default` template and is not reverted on stop
+// (its pre-xpfd value was never observed). This is benign — a 250ms
+// neighbor retransmit is a strict improvement on any interface — and
+// matches the best-effort, observed-value-only restore contract of the
+// host-global netdev_budget knob.
 func applyNeighRetransTime(fs hostTunableFS, capture *priorHostTunables) {
 	want := strconv.Itoa(neighRetransTargetMs)
 	applied, skipped, failed := 0, 0, 0

@@ -71,12 +71,14 @@ pub(in crate::afxdp) struct ForwardingState {
     /// neighbor is held before being dropped + recycled. Computed per
     /// snapshot in `build_forwarding_state_with_policy_counters_and_previous`
     /// (`compute_pending_neigh_timeout_ns`): 800ms when the kernel
-    /// `retrans_time_ms` is <= 250 on all dataplane interfaces (v4 AND
-    /// v6) so a dropped SYN is re-driven before the client's first TCP
-    /// RTO; otherwise the safe 2000ms default (PR-1 sysctl unapplied →
-    /// fail closed). Re-evaluated every snapshot so a mid-life sysctl
-    /// change is picked up. `0` (the Default) means "unset" — callers
-    /// fall back to `PENDING_NEIGH_TIMEOUT_NS`.
+    /// `retrans_time_ms` is <= NEIGH_RETRANS_FAST_THRESHOLD_MS (300ms —
+    /// the daemon writes 250 but the kernel jiffy-rounds it to 252 on
+    /// HZ=100) on all dataplane interfaces (v4 AND v6) so a dropped SYN is
+    /// re-driven before the client's first TCP RTO; otherwise the safe
+    /// 2000ms default (sysctl unapplied → fail closed). Re-evaluated every
+    /// snapshot so a mid-life sysctl change is picked up. `0` (the
+    /// Default) means "unset" — callers fall back to
+    /// `PENDING_NEIGH_TIMEOUT_NS`.
     pub(in crate::afxdp) pending_neigh_timeout_ns: u64,
 }
 

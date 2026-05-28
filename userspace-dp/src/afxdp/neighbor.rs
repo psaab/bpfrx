@@ -167,6 +167,13 @@ pub(super) fn neighbor_warmer_loop(
                 return;
             }
         };
+        // Re-check stop after dequeue: stop_inner sets `stop` and drops
+        // the sender, but an item already in the channel would otherwise
+        // be processed and fire one stray probe on a tearing-down
+        // dataplane (Codex r1 Medium). Bail before any side effect.
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         // Per-RG HA gate, re-checked immediately before firing.
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let rg_active = rg_runtime

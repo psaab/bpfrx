@@ -350,6 +350,31 @@ func TestRestoreNeighRetransTime_RevertsToPrior(t *testing.T) {
 	}
 }
 
+func TestApplyStep0_RuntimeDisable_RestoresNeighRetrans(t *testing.T) {
+	// Codex r1 / AGY r1 #3: userspace-dp disabled at runtime (no daemon
+	// stop) must restore the lowered neigh retrans_time_ms and clear the
+	// captures so a later re-enable re-captures cleanly.
+	d := &Daemon{}
+	f := neighFSWithIfaces("1000", "em0")
+	// Phase 1: userspace-dp on → lower + capture.
+	d.applyStep0TunablesWith(true, false, "", 0, false, false, 0, 0, nil, f, &fakeRSSExecutor{})
+	if f.writes[sysctlNeighV4Dir+"/em0/retrans_time_ms"] != "250" {
+		t.Fatalf("apply phase: em0 not lowered, got %q", f.writes[sysctlNeighV4Dir+"/em0/retrans_time_ms"])
+	}
+	// Phase 2: userspace-dp off → restore to 1000 + clear captures.
+	d.applyStep0TunablesWith(false, false, "", 0, false, false, 0, 0, nil, f, &fakeRSSExecutor{})
+	if strings.TrimSpace(string(f.files[sysctlNeighV4Dir+"/em0/retrans_time_ms"])) != "1000" {
+		t.Fatalf("runtime-disable: em0 not restored to 1000, got %q",
+			string(f.files[sysctlNeighV4Dir+"/em0/retrans_time_ms"]))
+	}
+	d.priorTunablesMu.Lock()
+	prior := d.priorTunables
+	d.priorTunablesMu.Unlock()
+	if prior != nil && len(prior.neighRetrans) != 0 {
+		t.Fatalf("runtime-disable: neighRetrans captures not cleared, got %v", prior.neighRetrans)
+	}
+}
+
 func TestRestoreNeighRetransTime_NilAndEmpty_NoOp(t *testing.T) {
 	f := newFakeHostFS()
 	restoreNeighRetransTime(nil, f)
