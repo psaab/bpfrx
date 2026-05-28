@@ -1279,9 +1279,9 @@ fn run_multi_threaded(
     let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(n);
     let mut spawn_error: Option<String> = None;
 
-    // Spawn workers. Each consumes its WorkerFd via move. Pre-allocate
-    // the WorkerCtx structures by pop'ing from fds + pin_cpus reverse
-    // order so indexes line up.
+    // Spawn workers. Each consumes its WorkerFd via move. The fds +
+    // pin_cpus iterators are consumed in forward order; tid==0 gets
+    // fds[0], tid==1 gets fds[1], etc.
     let mut fds_iter = fds.into_iter();
     let mut pins_iter = pin_cpus.into_iter();
     for tid in 0..n {
@@ -1528,7 +1528,12 @@ fn main() {
             Ok(fd) => worker_fds.push(WorkerFd(fd)),
             Err(e) => {
                 eprintln!("error: open_socket for thread {} failed: {}", tid, e);
-                // WorkerFds dropped automatically by Vec drop.
+                // Explicitly close previously-opened fds before exit.
+                // process::exit bypasses Rust destructors so the Vec
+                // is NOT dropped automatically; the kernel reaps fds
+                // on process exit, but being explicit here keeps the
+                // ownership story correct. (Copilot code-r2 finding 3.)
+                drop(worker_fds);
                 std::process::exit(2);
             }
         }
