@@ -29,7 +29,13 @@ results by ID if the Companion CLI session state is lost
 
 ### Round 5 (v3 round 1 — Multi-Book LPM 5-fix, memory budget RELAXED per user override)
 
-- **Codex**: `task-mpp1zj9z-8wzlvi` (v3 hostile plan-review, dispatched 2026-05-27 against SHA 85f01d6de)
-- **AGY**: `adversarial-review-mpp1zyo9-5bwwnk` (v3 hostile plan-review, dispatched 2026-05-27 against SHA 85f01d6de)
-- **Claude SMR r5**: `docs/pr/1609-multistage-policy-dag/claude-smr-plan-r5.md` — PLAN-NEEDS-MINOR (4 residual issues F-r5-1 through F-r5-4 enumerated; hostile self-review to avoid r3-style soft-pass)
+- **Codex**: `task-mpp1zj9z-8wzlvi` (v3 hostile plan-review, dispatched against SHA 85f01d6de) — PLAN-NEEDS-MAJOR (5 majors M1-M5)
+- **AGY**: `adversarial-review-mpp1zyo9-5bwwnk` (v3 hostile plan-review against SHA 85f01d6de) — PLAN-READY-WITH-NITS (5 nits)
+- **Claude SMR r5**: `docs/pr/1609-multistage-policy-dag/claude-smr-plan-r5.md` — PLAN-NEEDS-MINOR (4 residual F-r5-1 through F-r5-4; hostile self-review to avoid r3-style soft-pass)
 - **Copilot**: posts on PR creation; not applicable to plan reviews
+
+### Round 6 (v3.1 post-patch hostile re-read)
+
+- **Claude SMR r6**: `docs/pr/1609-multistage-policy-dag/claude-smr-plan-r6.md` — PLAN-READY-WITH-NITS. v3.1 §13 P1-P10 patches close 13 of 15 round-1 findings (2 deferred — F-r5-2 galloping merge is Step 2 problem; F-r5-3 PseudoBook dedup optional Step 2). 5 residual nits N1-N5 are not Step-1-blocking.
+- **Codex r2**: pending (will dispatch with v3.1 SHA)
+- **AGY r2**: pending (will dispatch with v3.1 SHA)

@@ -1,6 +1,12 @@
-# Plan v3: Multi-Book LPM policy DAG (#1609)
+# Plan v3.1: Multi-Book LPM policy DAG (#1609)
 
-**Status**: v3 — starts from the v2 Multi-Book LPM architectural
+**Status**: v3.1 (in-place patch of v3) — addresses Codex r3 5
+majors + AGY r3 5 nits delivered against v3 SHA `85f01d6de`. Patch
+inline-edits §2.2 (PseudoBook builder splits iter_prefixes by
+purpose) + adds §13 v3.1 patches addendum capturing all other
+deltas. v3.1 supersedes v3 in place; the v3 design axis is unchanged.
+
+v3 — starts from the v2 Multi-Book LPM architectural
 axis (which remains sound) + the 5 fixable fatals the v2 round-1
 3-of-3 PLAN-NEEDS-MAJOR convergence identified. v1 is killed
 (per-/24 RuleBitSet → 320 GB memory bomb). v2 is killed (literal/any
@@ -186,12 +192,24 @@ struct PseudoBook {
     citing_rule: u32,
 }
 
+// v3.1 fix (Codex r3 finding #1): PseudoBook builder must SKIP
+// MatchAny on the literal set — `source any` is routed through the
+// MatchAny side-channel (§2.1), NOT injected into the LPM as a /0
+// pseudo-book. Use `iter_literal_prefixes_for_pseudobook` which
+// returns EMPTY for MatchAny (and MatchNone) and never emits /0.
+// Cf. `iter_prefixes_for_lpm` on real BookEntry (§2.4) which DOES
+// pass /0 through to the §2.6 short-circuit path.
 fn build_pseudo_books(state: &PolicyState) -> (Vec<PseudoBook>, Vec<PseudoBook>) {
     let mut src_pseudos = Vec::new();
     let mut dst_pseudos = Vec::new();
     for (rule_idx, rule) in state.rules.iter().enumerate() {
-        let lits_v4: Vec<_> = rule.source_literal_v4.iter_prefixes().collect();
-        let lits_v6: Vec<_> = rule.source_literal_v6.iter_prefixes().collect();
+        // iter_literal_prefixes_for_pseudobook returns EMPTY for
+        // MatchAny / MatchNone; only Linear/Trie variants emit
+        // non-empty results.
+        let lits_v4: Vec<_> = rule.source_literal_v4
+            .iter_literal_prefixes_for_pseudobook().collect();
+        let lits_v6: Vec<_> = rule.source_literal_v6
+            .iter_literal_prefixes_for_pseudobook().collect();
         if !lits_v4.is_empty() || !lits_v6.is_empty() {
             src_pseudos.push(PseudoBook {
                 prefixes_v4: lits_v4.into(),
@@ -812,6 +830,320 @@ plumbing + decouples Step 2 from wire compat.
 `policy/` directory move with the new modules in one PR. Should
 the refactor be a precursor PR? Position: keep one PR, two clean
 commits (refactor commit + new-modules commit).
+
+## 13. v3.1 patches (Codex r3 majors + AGY r3 nits)
+
+This addendum captures the targeted patches v3.1 applies to v3 in
+response to the round-1 hostile review (Codex `task-mpp1zj9z-8wzlvi`
+PLAN-NEEDS-MAJOR; AGY `adversarial-review-mpp1zyo9-5bwwnk`
+PLAN-READY-WITH-NITS; SMR r5 PLAN-NEEDS-MINOR).
+
+### P1 — PseudoBook builder must skip MatchAny (Codex M1)
+
+v3 §2.2 used `iter_prefixes()` uniformly. v3.1 splits the
+PrefixSet iteration API by purpose:
+
+```rust
+impl PrefixSetV4 {
+    /// For Multi-Book LPM construction on REAL BookEntry sets.
+    /// Returns `[PrefixV4(0.0.0.0/0)]` for MatchAny so the §2.6 /0
+    /// short-circuit handles it. Returns empty for MatchNone.
+    pub(crate) fn iter_prefixes_for_lpm(&self) -> impl Iterator<Item = PrefixV4> + '_ {
+        match self {
+            Self::MatchAny => once(PrefixV4::any()),
+            Self::MatchNone => empty(),
+            Self::Linear(v) => v.iter().copied(),
+            Self::Trie(t) => t.walk(),
+        }
+    }
+    /// For PseudoBook construction. Returns EMPTY for MatchAny and
+    /// MatchNone — those rules belong to the MatchAny side-channel
+    /// (§2.1), NOT the LPM. Codex r3 M1 fix.
+    pub(crate) fn iter_literal_prefixes_for_pseudobook(&self)
+        -> impl Iterator<Item = PrefixV4> + '_ {
+        match self {
+            Self::MatchAny | Self::MatchNone => empty(),
+            Self::Linear(v) => v.iter().copied(),
+            Self::Trie(t) => t.walk(),
+        }
+    }
+}
+```
+
+§2.2's `build_pseudo_books` is updated inline (above) to use
+`iter_literal_prefixes_for_pseudobook`. Real BookEntry construction
+in §2.6 keeps using the LPM-purpose variant; /0 is then routed
+through covers_all_v4.
+
+### P2 — Pseudo-book ID namespace (Codex M4)
+
+v3 was ambiguous about whether src_pseudos and dst_pseudos share an
+ID space and whether they ever collide with real `state.books`
+indices. v3.1 spec:
+
+- **ID layout**: `[0..real_book_count) = real BookEntry`,
+  `[real_book_count..real_book_count + src_pseudo_count) = src PseudoBooks`,
+  `[real_book_count + src_pseudo_count..end) = dst PseudoBooks`.
+- **BookCitations sizing**: `book_src_citations` has length
+  `real_book_count + src_pseudo_count` (dst pseudos contribute
+  nothing to src). `book_dst_citations` has length `real_book_count
+  + src_pseudo_count + dst_pseudo_count` (laid out at the SAME
+  indices, with dst pseudos pre-populated and src pseudos empty).
+- **Hard invariant**: real `state.books` is ONLY indexed by IDs in
+  `[0..real_book_count)`. PseudoBook IDs are NEVER passed to
+  `state.books[idx]`. Enforced by a `PseudoBookId(u32)` newtype that
+  cannot be cast back to a plain index without an explicit
+  `is_pseudo()` check.
+- The v4 LPM builder signature is `build_multi_book_lpm_v4(books:
+  &[BookEntry], src_pseudos: &[PseudoBook], dst_pseudos:
+  &[PseudoBook]) -> (MultiBookLpmV4, Vec<u32>)` — three params,
+  matching §3 call site.
+
+### P3 — v6 overflow path bounded (Codex M2)
+
+v3's `MAX_V6_LEAF_PREFIXES = 64` cap with fallback linear-scan was
+unbounded once overflow occurred. v3.1 spec: **commit-time reject
+on overflow**, not silent fallback.
+
+```rust
+const MAX_V6_LEAF_PREFIXES: usize = 64;
+
+fn finalize_v6_leaf(leaf: &mut MultiBookLpmV6Leaf48, subnet: PrefixV6)
+    -> Result<(), V6OverflowError>
+{
+    if leaf.longer_prefixes.len() > MAX_V6_LEAF_PREFIXES {
+        return Err(V6OverflowError {
+            subnet,
+            actual: leaf.longer_prefixes.len(),
+            cap: MAX_V6_LEAF_PREFIXES,
+        });
+    }
+    Ok(())
+}
+```
+
+`build_multi_book_lpm_v6` returns `Result<_, V6OverflowError>`. On
+overflow, `parse_policy_state_with_counters` returns
+`SnapshotIntegrityError::V6LeafOverflow { subnet, actual, cap }` —
+the snapshot apply hard-fails before any side effect. Operator
+warning + Prometheus counter
+`xpf_userspace_policy_dag_v6_leaf_overflow_total{subnet}` increments
+on the rejected apply.
+
+This is consistent with v3 §2.3's "no silent rule drops" goal AND
+the "fallback path is unbounded" Codex concern. Operator sees the
+overflow and either (a) reduces v6 prefix density per /48 or (b)
+raises `MAX_V6_LEAF_PREFIXES` (configurable per-snapshot via
+`PolicyDagLimitsSnapshot` field, defaults 64).
+
+### P4 — v6 node layout + memory math (Codex M3 + AGY V6Node nit)
+
+v3 §2.3 estimated 100K /48s × 6 KB ≈ 600 MB but ignored intermediate
+depth-1..=5 sub-tables. v3.1 spec:
+
+- **Sparse depth-1..=5 sub-tables only allocated when ≥1
+  descendant**: each `V6Node::Descend(Box<MultiBookLpmV6Sub>)`
+  pays for its 256-entry array (~6 KB).
+- **Real cost** at 100K random /48s: each /48 walk-up touches ~5
+  intermediate sub-tables (6 KB each); with Arc sharing on truly
+  identical subtrees (rare), realistic cost is ~3-5 GB
+  pathological, ~100-500 MB at 10K populated /48s realistic.
+- **Mitigation under relaxed memory budget**: acceptable on 8-16 GB
+  VMs. If #1612 measurement shows level-0 cold-cache thrash, swap
+  to **Poptrie compressed-trie** for v6 (per AGY F2 r1) — that's a
+  Step 2 tuning, not a Step 1 blocker.
+- **Explicit `V6Node::Leaf48(Box<MultiBookLpmV6Leaf48>)` variant
+  added** so depth-5 → depth-6 transition is explicit in the type
+  system (AGY nit).
+
+```rust
+enum V6Node {
+    Empty,
+    Leaf(Arc<[u32]>),                  // intermediate-depth coverage
+    Descend(Box<MultiBookLpmV6Sub>),
+    Leaf48(Box<MultiBookLpmV6Leaf48>), // depth-6 terminal
+}
+```
+
+v3.1 §6 budget table updated:
+
+- v6 bounded multibit trie: ~100-500 MB realistic, up to ~5 GB
+  pathological at 100K populated /48s (was ~60 MB / ~600 MB in
+  v3 — the v3 estimate was the AGY M3 finding).
+- Total per snapshot: ~400-1000 MB realistic; up to ~6 GB
+  pathological.
+
+Still within hardware capacity per relaxed budget.
+
+### P5 — iter_prefixes Trie walk cost (Codex M5)
+
+v3 §2.4 acknowledged "build-time only" but didn't quantify Trie
+DFS cost. v3.1 spec: for `BookEntry`, the `prefixes_v4 / v6:
+Arc<[Prefix]>` parallel field IS the canonical prefix list — Trie
+DFS is NEVER called on BookEntry. Trie DFS is only invoked for
+**rule literal prefix sets** via
+`iter_literal_prefixes_for_pseudobook` (P1), which is bounded by
+the rule's literal-set size (typically ≤ 16 prefixes → Linear
+variant; Trie variant only when ≥ 17 literals on one rule, which
+is rare in realistic configs).
+
+Total Trie DFS cost across all rules at 1M-rule scale: ≤ 1% of
+rules use Trie literal variant × DFS-cost ~5 µs each = ~50 ms total
+at 1M rules. Negligible.
+
+### P6 — /0 + non-/0 dedup in galloping merge (Codex M6)
+
+v3 §2.6 was silent on the corner where a book contains BOTH /0
+AND non-/0 prefixes (e.g. `set source-address [any 10.0.0.0/24]`).
+Build inserts the /24 into LPM AND appends the book to
+covers_all_v4.
+
+v3.1 spec: **galloping merge MUST dedup**. When LPM lookup returns
+`book_id = 42` AND covers_all_v4 contains `42`, the merged
+candidate slice list MUST emit only one copy of 42's citation
+array. The galloping-merge implementation skips duplicate book IDs
+on the input slices via the standard sorted-slice union dedup
+pattern.
+
+```rust
+fn union_with_dedup<'a>(lpm_books: &'a [u32], covers_all: &'a [u32])
+    -> impl Iterator<Item = u32> + 'a
+{
+    // Both inputs sorted ascending; emit each book_id once.
+    use std::iter::Peekable;
+    let mut a = lpm_books.iter().copied().peekable();
+    let mut b = covers_all.iter().copied().peekable();
+    std::iter::from_fn(move || match (a.peek().copied(), b.peek().copied()) {
+        (Some(x), Some(y)) if x < y => { a.next(); Some(x) }
+        (Some(x), Some(y)) if x > y => { b.next(); Some(y) }
+        (Some(x), Some(_)) => { a.next(); b.next(); Some(x) }  // dedup
+        (Some(_), None) => a.next(),
+        (None, Some(_)) => b.next(),
+        (None, None) => None,
+    })
+}
+```
+
+### P7 — BookCitations FxHashMap → sorted Box<[]> (SMR F-r5-4 + AGY nit)
+
+v3 §2.5 stored `per_zone_pair: Vec<FxHashMap<ZonePairKey,
+Arc<[u32]>>>`. Hot-path probe is HashMap lookup per LPM-hit book.
+
+v3.1 spec: **sorted Box<[(ZonePairKey, Arc<[u32]>)]> + binary
+search** (or linear if len < 8, cache-friendly):
+
+```rust
+struct BookCitations {
+    /// Per-(book_id, zone_pair) sorted by ZonePairKey. Use linear
+    /// scan for len < 8 (typical), binary search for larger.
+    per_zone_pair: Vec<Box<[(ZonePairKey, Arc<[u32]>)]>>,
+    global: Vec<Arc<[u32]>>,
+}
+```
+
+ZonePairKey set is small (~100); no DoS surface (operator-
+controlled); cache-line behavior wins over hashing.
+
+### P8 — Prefix propagation push-down at LPM build (AGY r3 nit #1)
+
+v3 §3 builder was silent on whether the LPM builder pushes parent
+prefixes down to children. For DIR-24-8 over /24-aligned prefixes
+this isn't an issue (no parent-child overlap inside /24 stride).
+But mixed /16 + /24 in the SAME book MUST propagate:
+
+```rust
+// Book has [10.0.0.0/16, 10.0.5.0/24].
+// Naive: LPM[10.0.0.x] for x != 5 has book_id=42.
+//        LPM[10.0.5.x]              has book_id=42 (via /24 insert).
+// Correct: same — /24 insert ONLY narrows; the /16 insert covers
+// all of 10.0.0.0/16 INCLUDING 10.0.5.0/24. The LPM leaf at
+// 10.0.5/24 sees BOTH /16 and /24 inserts and unions to
+// book_id=42 once (Arc dedup).
+```
+
+v3.1 spec: builder uses a **2-pass strategy**: pass 1 inserts all
+prefixes sorted by length ascending (broadest first), so /16
+populates entries 10.0.0..10.0.255 before /24 overwrites
+10.0.5/24. Pass 2 detects the /24 within a /16-already-covered
+range and unions the book_id at /24 (which is identical — same
+book_id — so dedup is a no-op for single-book overlaps; multi-book
+overlap produces the proper union).
+
+For **AGY's cross-book overlap case** (Book 1 has /24, Book 2 has
+/16): both books propagate to all /24 entries within /16, so the
+leaf at any /24 inside Book 2's /16 contains {Book 1, Book 2}
+sorted. This IS what DIR-24-8 with sorted Arc<[u32]> leaves does
+by construction — each `lpm.insert(prefix, book_id)` UNIONS into
+existing leaves, sorted dedup'd.
+
+### P9 — Arc interning pool (AGY r3 nit #2)
+
+v3 was silent on memory inflation from duplicate Arc<[u32]> leaves.
+At 16 MB level-0 with /24-uniform books, many adjacent leaves carry
+identical book_id sets — naive Arc::new per leaf wastes 100s of MB.
+
+v3.1 spec: **Arc-interning pool at LPM construction**:
+
+```rust
+struct LeafArcPool {
+    /// Content-hashed: key = (sorted Vec<u32>, hash), value = Arc<[u32]>.
+    pool: FxHashMap<u64, Vec<Arc<[u32]>>>,  // bucket by hash
+}
+
+impl LeafArcPool {
+    fn intern(&mut self, mut book_ids: Vec<u32>) -> Arc<[u32]> {
+        book_ids.sort();
+        book_ids.dedup();
+        let hash = fxhash::hash64(&book_ids);
+        let bucket = self.pool.entry(hash).or_default();
+        for existing in bucket.iter() {
+            if existing.as_ref() == book_ids.as_slice() {
+                return existing.clone();  // Arc::clone, refcount bump
+            }
+        }
+        let arc: Arc<[u32]> = book_ids.into_boxed_slice().into();
+        bucket.push(arc.clone());
+        arc
+    }
+}
+```
+
+Construction-time overhead: ~100 ns per leaf for hash+lookup.
+Memory savings: 10-100× depending on book overlap (typical /24-
+uniform configs save ~100 MB+).
+
+### P10 — Allocation-free hot path (AGY r3 nit #4 — restatement)
+
+AGY emphasized that the hot path must NEVER clone Arc<[u32]>; only
+borrow &[u32]. v3.1 spec: hot-path code is `&dag.book_src_citations
+[book_id][...].as_ref()` returning `&[u32]` — strictly borrow. The
+galloping-merge state machine holds slice pointers + indices in
+per-worker scratch; no Arc::clone on the hot path. Already implicit
+in v3 §2.7 but worth stating explicitly.
+
+### v3.1 acceptance criteria additions
+
+- [ ] `PrefixSetV4/V6::iter_prefixes_for_lpm()` and
+      `::iter_literal_prefixes_for_pseudobook()` methods landed
+      (P1).
+- [ ] `PseudoBookId(u32)` newtype + `is_pseudo()` check enforced
+      (P2).
+- [ ] `SnapshotIntegrityError::V6LeafOverflow` variant + apply
+      hard-fail (P3).
+- [ ] `V6Node::Leaf48` variant added (P4).
+- [ ] `BookCitations.per_zone_pair: Vec<Box<[(ZonePairKey,
+      Arc<[u32]>)]>>` (P7).
+- [ ] `LeafArcPool` interning at LPM construction (P9).
+- [ ] Property test covering AGY's `[Book1=/24, Book2=/16]`
+      overlap case (P8) — assert leaf at /24 inside /16 contains
+      `{B1, B2}` sorted.
+- [ ] Property test covering Codex M1 case (P1) — rule `source
+      any` does NOT appear as a PseudoBook entry in any LPM leaf.
+- [ ] Property test covering Codex M6 case (P6) — book with `[any
+      10.0.0.0/24]` produces ONE Stage 3 hit for an address in
+      10.0.0.0/24 after galloping-merge dedup.
+- [ ] Property test covering Codex M4 case (P2) — PseudoBook ID
+      never passed to `state.books[idx]`; type system enforces.
 
 ## v1/v2 historical record
 
