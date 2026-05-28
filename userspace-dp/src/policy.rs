@@ -47,13 +47,16 @@ impl std::error::Error for SnapshotIntegrityError {}
 /// PrefixSets — these parallel fields are config-apply-time helpers
 /// only.
 ///
-/// The two views agree by construction: `prefixes_v{4,6}` is fed
-/// into `PrefixSetV{4,6}::from_v3_literals()` immediately after
-/// parsing the snapshot, so the PrefixSet's contained prefixes are
-/// exactly the parallel array's entries (modulo MatchAny / /0
-/// collapse semantics which the LPM build will handle separately
-/// per plan §2.6 /0 short-circuit). A unit test asserts this
-/// agreement on representative inputs.
+/// The two views agree by construction at the SEMANTIC
+/// (membership) level: `prefixes_v{4,6}` is the input Vec fed into
+/// `PrefixSetV{4,6}::from_v3_literals()` immediately after parsing
+/// the snapshot, so every IP that falls under any entry in
+/// `prefixes_v{4,6}` is also matched by `v{4,6}.contains()`. The
+/// two views are NOT structurally identical: PrefixSet may collapse
+/// to `MatchAny` when a /0 is present (dropping the non-/0 entries
+/// from its internal representation), and may build a Trie above
+/// `PREFIX_SET_LINEAR_MAX`. Tests assert the membership-equivalence
+/// property on representative inputs.
 ///
 /// #1609 v3.1 scope discipline: this PR adds the field + parse-
 /// time population + unit test ONLY. The Multi-Book LPM that
@@ -445,19 +448,19 @@ pub(crate) fn parse_policy_state_with_counters(
         // parallel fields carry the original prefix shape for the
         // future Multi-Book LPM builder.
         //
-        // Cost: `v4.clone()` / `v6.clone()` allocate a fresh Vec and
-        // copy each `PrefixV4` / `PrefixV6` element — O(n) time and
-        // memory per book, where n is the prefix count.
-        // `Arc::from(Box<[T]>)` then allocates the Arc control block
-        // and moves the boxed slice into it (separate allocation, not
-        // free). This runs once per parse invocation — both the
-        // preflight integrity check and the actual apply build —
-        // never on the hot path, so the O(n) cost is acceptable here.
-        // `Prefix*` types are small (network address + prefix length),
-        // so the copy is cheap in absolute terms for realistic book
-        // sizes (≤ ~1K prefixes per book).
-        let prefixes_v4: Arc<[PrefixV4]> = Arc::from(v4.clone().into_boxed_slice());
-        let prefixes_v6: Arc<[PrefixV6]> = Arc::from(v6.clone().into_boxed_slice());
+        // Cost: `Arc::<[T]>::from(&[T])` (used here via the
+        // `From<&[T]> for Arc<[T]>` impl when `T: Copy`) performs a
+        // single fused allocation of the Arc header + slice payload,
+        // then copies the n elements in. O(n) time + one allocation
+        // per side per book, with no intermediate Vec/Box. This runs
+        // once per parse invocation — both the preflight integrity
+        // check and the actual apply build — never on the hot path,
+        // so the O(n) cost is acceptable. `Prefix*` types are small
+        // (network address + prefix length), so the copy is cheap in
+        // absolute terms for realistic book sizes (≤ ~1K prefixes
+        // per book).
+        let prefixes_v4: Arc<[PrefixV4]> = Arc::from(v4.as_slice());
+        let prefixes_v6: Arc<[PrefixV6]> = Arc::from(v6.as_slice());
         let entry = BookEntry {
             v4: PrefixSetV4::from_v3_literals(v4),
             v6: PrefixSetV6::from_v3_literals(v6),

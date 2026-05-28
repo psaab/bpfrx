@@ -4190,3 +4190,9 @@ top.
 - **Timestamp**: 2026-05-27 (UTC)
   - **Action**: Dispatched Codex (task-mpp38gl0-hyawf8) + AGY (adversarial-review-mpp38qy1-zayhr2) hostile code-reviews at HEAD 2cc07b450. Both returned CODE-READY-WITH-NITS, no blockers. Nits: Codex tightened the Arc cost comment (Arc::from allocates separately, parse runs on preflight + apply both); AGY proposed two test patches (dual-family book, large-book Trie variant). Applied Codex's comment tightening + both AGY tests. 6 unit tests now pass (was 4); 5/5 flake clean; 1458 total tests pass.
   - **File(s)**: userspace-dp/src/policy.rs (comment tighten), userspace-dp/src/policy_tests.rs (+2 tests)
+
+## 2026-05-27 — PR #1624 Copilot r2 inline findings (2) addressed
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Copilot re-reviewed at HEAD 3787f51ee and posted 2 NEW inline findings: (1) struct doc claim "PrefixSet's contained prefixes are exactly the parallel array's entries" is structurally wrong because /0 collapses to MatchAny — fixed by rewording to semantic-membership-equivalence; (2) Arc::from(v4.clone().into_boxed_slice()) allocates an intermediate Box — fixed by switching to Arc::from(v4.as_slice()) which uses the impl From<&[T]> for Arc<[T]> single-fused-allocation path (PrefixV4/V6 are Copy). 6 tests still pass; 5/5 flake clean; 1458 total tests pass.
+  - **File(s)**: userspace-dp/src/policy.rs (struct doc reword + Arc construction switch)
