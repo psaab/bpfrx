@@ -6,8 +6,9 @@
 - **AGY**: adversarial-review-mppoygka-g7v9r9 (PLAN-NEEDS-MINOR; 5 amendments, 5 axes clean)
 - **Claude SMR**: claude-smr-plan-r1.md (PLAN-NEEDS-MINOR; F1-F5)
 
-## Round 2 (plan v2 + code @ <pending push>)
+## Round 2 (plan v2 + code @ 69e54bb24 = PR #1633 HEAD)
 
-- **Codex**: <pending>
-- **AGY**: <pending>
-- **Claude SMR**: claude-smr-plan-r2.md (PLAN-READY)
+- **Codex**: task-mppq3by1-1e3eps (combined plan-v2 + code review)
+- **AGY**: adversarial-review-mppq3xzc-s8a69v
+- **Copilot**: COMMENTED at PR creation; nits will be addressed before merge
+- **Claude SMR**: claude-smr-plan-r2.md (PLAN-READY); claude-smr-code-r1.md (pending after r2 verdicts)
