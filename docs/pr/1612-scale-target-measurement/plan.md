@@ -71,8 +71,12 @@ In tree at end of PR:
      ≈ 4.295 s. Codex r1 finding 3 fix.
    - `POLICY_COLD_PATH_HIST_BUCKETS: usize = 24` + `const _: () = assert!`.
    - `POLICY_COLD_PATH_ZONE_PAIR_SLOTS: usize = 16` + `const _: () = assert!`.
-   - `sample_tsc() -> u64` wrapper around `__rdtscp` with `compiler_fence`
-     bracket on both sides per Intel SDM §17.17 + Joe Damato 2018 errata.
+   - `sample_tsc_start() -> u64` (LFENCE; RDTSCP) and
+     `sample_tsc_end() -> u64` (RDTSCP; LFENCE) — asymmetric pair
+     bracketing a measurement window per Intel SDM §17.17. The
+     prior `sample_tsc()` alias was removed in v3.2 to prevent
+     foot-gun usage at the end of a window (Copilot code-r1 +
+     Codex code-r1 finding 1).
    - `WrapperBaselineCalibration` newtype with `calibrate(samples: usize)`
      method that takes N=4096 rdtscp/rdtscp pairs, returns the median
      in ns (after Q32 multiplier applied) as the per-worker wrapper
@@ -141,7 +145,8 @@ In tree at end of PR:
      ```rust
      // 1. Bump cold gen even → odd.
      self.cold_window_gen.fetch_add(1, Ordering::AcqRel);
-     // 2. Relaxed-store the 2304 bucket entries + 48 metadata u64.
+     // 2. Relaxed-store 16 × 24 = 384 bucket entries + 16 × 4 = 64
+     //    metadata fields (sum_ns / samples / first_key / alias_seen).
      for slot in 0..16 {
          for b in 0..24 {
              self.buckets[slot][b].store(local.buckets[slot][b], Ordering::Relaxed);
@@ -154,18 +159,18 @@ In tree at end of PR:
      // 3. Bump cold gen odd → even with Release.
      self.cold_window_gen.fetch_add(1, Ordering::Release);
      ```
-     The seqlock pair-coverage holds across all 2304+48 atomic stores
+     The seqlock pair-coverage holds across all 384+64 = 448 atomic stores
      because the bracketing `AcqRel` + `Release` fences forbid any
      interior Relaxed store from being reordered outside the bracket.
      Same correctness argument as `WorkerRuntimeAtomics` rolling-
      window seqlock at `worker_runtime.rs:236-256` — proven via PR
-     #1311 round-2. Reader cost is bounded: 2304 + 48 = 2352 Relaxed
-     loads per snapshot, ~5 µs on the publish thread's owning core.
+     #1311 round-2. Reader cost is bounded: 384 + 64 = 448 Relaxed
+     loads per snapshot, ~0.8 µs on the publish thread's owning core.
 
      Atomic field layout (separate cacheline alignment per Codex r1
      finding 2; runtime + cold-path atomics do NOT share window_gen):
-     - `pub buckets: [[AtomicU64; 24]; 16]` (2304 atomics; layout
-       packed for sequential cacheline access).
+     - `pub buckets: [[AtomicU64; 24]; 16]` (16 × 24 = 384 atomics
+       per worker; layout packed for sequential cacheline access).
      - `pub sum_ns: [AtomicU64; 16]`.
      - `pub samples: [AtomicU64; 16]`.
      - `pub first_key: [AtomicU64; 16]` (per-slot first-observed
@@ -182,8 +187,11 @@ In tree at end of PR:
      - `pub cold_window_gen: AtomicU64` (per-tick seqlock counter,
        separate from `WorkerRuntimeAtomics.window_gen`).
 
-     **Note on cardinality**: 2304 + 16 + 16 + 16 + 3 = ~2360 atomics per
-     worker × 6 workers = ~14K atomics. ~112 KiB total per cluster node.
+     **Note on cardinality**: 384 (buckets) + 16 (sum_ns) + 16 (samples)
+     + 16 (first_key) + 16 (alias_seen) + 3 (calibration) = ~451 atomics
+     per worker × 6 workers = ~2706 atomics. ~22 KiB total per cluster
+     node. (Aggregated Prometheus series count is 6 × 16 × 24 = 2304
+     for the bucket counter alone — see §1.6 cardinality table.)
 
 3. **Cold-path sampling site in `poll_descriptor/mod.rs`** — exactly two
    single-line inserts. **Sample rate is regime-conditional per Codex
@@ -212,14 +220,14 @@ In tree at end of PR:
          .sample_phase.wrapping_add(1);
      let sample_tag = (binding.cold_path.sample_phase
          & worker_ctx.cold_path_sample_mask) == 0;
-     let t_in = if sample_tag { sample_tsc() } else { 0 };
+     let t_in = if sample_tag { sample_tsc_start() } else { 0 };
      ```
      `cold_path_sample_phase` is owned by the worker thread; no
      atomics on the hot path. Mask 0xff gives 1-in-256; mask 0
      gives 1-in-1.
    - **Sample-record exit**: immediately after line 1385 (the
      `evaluate_policy_result_with_len` returns), record
-     `t_out = sample_tsc()` only if `sample_tag`, compute
+     `t_out = sample_tsc_end()` only if `sample_tag`, compute
      `delta_ns = ((t_out - t_in) * ns_per_tsc_q32) >> 32`, bucket
      via `bucket_index_for_ns_24`, and
      `worker_cold_path.record_sample(zone_pair_slot, delta_ns,

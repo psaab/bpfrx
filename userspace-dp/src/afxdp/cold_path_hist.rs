@@ -296,6 +296,15 @@ pub(in crate::afxdp) fn probe_clock_source() -> ClockSource {
 pub(in crate::afxdp) fn calibrate_ns_per_tsc_q32() -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
+        // Copilot code-r2: guard against RDTSCP #UD on x86_64 hosts
+        // that don't expose the CPUID rdtscp feature. The probe is
+        // cheap (two file reads + token-set parse) and runs once per
+        // worker startup; returning 0 here makes the caller's
+        // ns_per_tsc_q32 zero, which downstream code treats as
+        // "TSC unavailable, use clock_gettime fallback".
+        if probe_clock_source() != ClockSource::Tsc {
+            return 0;
+        }
         use std::time::Instant;
         let start_tsc = sample_tsc_start();
         let start_inst = Instant::now();
@@ -331,6 +340,15 @@ pub(in crate::afxdp) fn calibrate_ns_per_tsc_q32() -> u64 {
 pub(in crate::afxdp) fn calibrate_wrapper_baseline_ns(ns_per_tsc_q32: u64) -> u64 {
     if ns_per_tsc_q32 == 0 {
         return 0;
+    }
+    // Copilot code-r2: same #UD guard as calibrate_ns_per_tsc_q32.
+    // A non-zero ns_per_tsc_q32 from a malformed caller (e.g. unit
+    // test passing 42) shouldn't bypass the RDTSCP availability gate.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if probe_clock_source() != ClockSource::Tsc {
+            return 0;
+        }
     }
     const N: usize = 4096;
     let mut deltas = Vec::with_capacity(N);
@@ -864,6 +882,18 @@ mod tests {
                 local.record_sample(3, 5, 1000 + (count & 0xff));
                 writer_atomics.publish_from_local(&local);
                 count += 1;
+                // The production writer publishes at ~1 Hz cadence
+                // (see worker_runtime.rs::publish). The test writer
+                // is much faster — drop to ~10 kHz with a 100 µs
+                // sleep so the reader has room to observe even-gen
+                // snapshots within its 16-retry budget. Without
+                // this, the writer keeps the seqlock perpetually
+                // odd and every reader snapshot exhausts retries
+                // → returns default(zero) → test fails the
+                // max_samples > 0 sanity assertion (Codex code-r3
+                // NIT: the weaker oracle would have falsely passed
+                // by accepting all zeros).
+                std::thread::sleep(std::time::Duration::from_micros(100));
             }
             count
         });
@@ -873,26 +903,56 @@ mod tests {
         // than a handful of times, which would fail the `writer_iters
         // > 10` sanity assertion below.
         std::thread::sleep(std::time::Duration::from_millis(20));
-        // Reader: take 1000 snapshots, assert monotonic samples per slot.
+        // Reader: take 1000 snapshots, assert monotonic samples per
+        // slot AND cross-field invariants (Codex code-r3 NIT: the
+        // weaker oracle would pass even if every snapshot returned
+        // default zero after retry-exhaustion).
         let slot = zone_pair_slot(3, 5);
         let mut last_samples = 0u64;
+        let mut max_samples = 0u64;
+        let mut at_least_one_observed_increase = false;
         for _ in 0..1000 {
             let snap = atomics.snapshot();
             let s = snap.samples[slot];
-            // Tear regime would be the seqlock returning a torn payload
-            // where samples[slot] reflects an old epoch but bucket
-            // counts reflect a new one. Provable check: samples is
-            // monotonic non-decreasing if the seqlock is honoring its
-            // epoch boundary.
+            // Tear-1: samples must be monotonic non-decreasing if the
+            // seqlock is honoring epoch boundaries.
             assert!(
                 s >= last_samples,
                 "samples regressed: {s} < {last_samples} — seqlock tore"
             );
+            if s > last_samples {
+                at_least_one_observed_increase = true;
+            }
+            // Tear-2: cross-field invariant — total bucket counts in
+            // this slot MUST equal samples count. If the seqlock tore
+            // and we observed samples from one epoch + buckets from
+            // another, this invariant would fail.
+            let bucket_sum: u64 = snap.buckets[slot].iter().sum();
+            assert_eq!(
+                bucket_sum, s,
+                "torn epoch: samples={s} != bucket_sum={bucket_sum} for slot {slot}"
+            );
             last_samples = s;
+            max_samples = max_samples.max(s);
         }
         stop.store(true, AOrd::Relaxed);
         let writer_iters = writer.join().expect("writer thread panicked");
-        // Sanity: the writer did actually publish (proves we exercised
+        // Sanity-1: at least one snapshot must have been nonzero (else
+        // the reader might be exhausting retries every time and the
+        // monotonic-samples assertion would trivially pass with all
+        // zeros — Codex code-r3 NIT).
+        assert!(
+            max_samples > 0,
+            "reader observed only zero snapshots — likely retry-exhaustion or default-on-give-up"
+        );
+        // Sanity-2: at least one snapshot must show an INCREASE over
+        // the prior one, proving we actually observed publishes
+        // arriving during the reader loop.
+        assert!(
+            at_least_one_observed_increase,
+            "reader observed only the same samples value — seqlock contention may have masked all writes"
+        );
+        // Sanity-3: the writer did actually publish (proves we exercised
         // the concurrent path, not just an idle reader).
         assert!(
             writer_iters > 10,
