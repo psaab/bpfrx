@@ -3,6 +3,16 @@
 **Date:** 2026-03-22
 **Commits:** `e0c01ac` through `2f818e8`
 
+> **Accuracy note (#1645):** The "~2ms" cold-connect figures below
+> describe the intended steady-state target, not the current measured
+> cost. Cold TCP connect is **currently measured ~3.371s** under a cold
+> neighbor cache (after `ip neigh flush all`), because of the gap
+> between the 260 ms userspace probe schedule and the 2000 ms pending-
+> neighbor timeout in `neighbor_dispatch.rs`. The mitigation is tracked
+> by **#1636**; once it lands these figures will be updated to the
+> post-fix measurement. Treat the "~2ms" values here as the design
+> goal, not a shipped result.
+
 ## Problem Statement
 
 After daemon restart or when encountering a new destination host, the
@@ -13,7 +23,9 @@ slow-path TUN, resulting in:
 
 - **Infinite timeout** for new TCP connections (initial state)
 - **~1.2s delay** after adding slow-path reinject (TCP SYN retransmit)
-- **~2ms delay** after all fixes (buffer-and-retry with ICMP probe)
+- **~2ms target** after all fixes (buffer-and-retry with ICMP probe)
+  — but cold connect is **currently measured ~3.371s** under a cold
+  neighbor cache; mitigation tracked by #1636 (see accuracy note above)
 
 ## Root Causes
 
@@ -182,18 +194,21 @@ SYN-ACK's reverse lookup finds it via `install_reverse_session_from_forward_matc
 12. ACK: session hit → TCP established → data flows at line rate
 ```
 
-**Total cold latency: ~2ms** (ARP/NDP roundtrip + netlink + retry)
+**Total cold latency target: ~2ms** (ARP/NDP roundtrip + netlink +
+retry) — **currently measured ~3.371s** under a cold neighbor cache
+because of the 260 ms-probe vs 2000 ms-timeout gap; mitigation tracked
+by #1636 (see accuracy note at the top of this file).
 
 ## Performance Results
 
 | Metric | Before | After |
 |--------|--------|-------|
-| Cold TCP connect (after ARP flush) | Infinite timeout | ~2ms |
+| Cold TCP connect (after ARP flush) | Infinite timeout | ~2ms target; **~3.371s measured** (#1636) |
 | Cold iperf3 IPv4 (8 streams, 5s) | 0 Gbps (timeout) | 20.1 Gbps |
 | Cold iperf3 IPv6 (8 streams, 5s) | 0 Gbps (broken) | 20.0 Gbps |
 | Warm iperf3 (8 streams, 10s) | 23+ Gbps | 23+ Gbps |
 | Fill ring bootstrap | Failed (0/12 queues) | 12/12 queues |
-| Neighbor resolution | 1-5s (Go snapshot) | ~2ms (netlink event) |
+| Neighbor resolution | 1-5s (Go snapshot) | ~2ms target; gated by 260 ms-probe/2000 ms-timeout gap, ~3.371s cold today (#1636) |
 
 ## Files Changed
 

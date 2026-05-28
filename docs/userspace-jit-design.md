@@ -33,7 +33,7 @@ explicitly in the PR review notes.
 | 3 | Address-book trie compilation | Not started | — |
 | 4 | Cranelift JIT | Not started | — |
 | 5 | Screen function specialization | **DONE** — zones without screen profiles return Pass immediately (O(1) HashMap miss); no further specialization needed | O(1) |
-| 6 | CoS scheduler oversubscription semantics (#1614) | **DONE** — operator-selectable `oversubscription-policy guarantee-rate <X>` two-phase waterfill allocator (default `proportional` preserves current behaviour bit-for-bit); `priority-low-min-share` orthogonal reserve; A3 CoDel sojourn-time AQM opt-in via `codel-target <ms>`. See `docs/fairness-regimes.md` "CoS oversubscription policy" + `docs/pr/1614-multi-rss-cos/plan.md` v5. | small-class guarantees honoured under 6× oversubscription; ~3-7× per-class throughput improvement on 100m/1g/3g/6g classes |
+| 6 | CoS scheduler oversubscription semantics (#1614) | **WIRED / NOT YET MEETING GATE** — the operator-selectable `oversubscription-policy guarantee-rate <X>` wire surface + commit warning shipped (#1618) and the smoke fixture activates the knob (#1629), but the scheduler does **not** yet honour small-class guarantees: under `guarantee-rate 0.7` it still equalizes ~20%/class instead of meeting the small-class ≥ 95% acceptance gate (#1630 measurement, see `docs/fairness-regimes.md` "CoS oversubscription policy"). Root cause proven — the v8 epoch-cap clamp discards lagged rate credit (`rotate_epoch_v8.rs`). The `proportional` default and `priority-low-min-share`/`codel-target` knobs parse as designed. See `docs/pr/1614-multi-rss-cos/plan.md` v5. | regression open, see #1630/#1614 |
 
 ### Phase 1 implementation details (as of `2f818e8`, 2026-03-22)
 

@@ -14,12 +14,16 @@
 - DPDK is retired under #1525. The userspace AF_XDP dataplane
   (`userspace-dp/`) is the primary/default backend, and the legacy
   eBPF dataplane is being retired in parallel under #1373.
-- The DPDK source under `dpdk_worker/` and `pkg/dataplane/dpdk/`
-  remains in-tree until Phase 3 of #1525 deletes it. Per #1525,
-  builds with `-tags dpdk` are not supported for production.
+- The DPDK retirement is **complete**. The DPDK source under
+  `dpdk_worker/` and `pkg/dataplane/dpdk/` has been **deleted from
+  master** by the mechanical-removal phase (#1528; boot decoupling
+  #1527). Only these retirement docs remain in-tree. Per #1525,
+  builds with `-tags dpdk` are not supported.
 - Commit-time rejection of `set system dataplane-type dpdk` is
-  planned in Phase 1 (#1526; not yet on master). Operators
-  should migrate with
+  **live on master** (#1526) — `compileSystemDataplaneType` in
+  `pkg/config/compiler_system.go` rejects `dpdk` at commit, citing
+  #1525, while still parsing the token for legacy-config
+  compatibility. Operators should migrate with
   `set system dataplane-type userspace`, or simply omit
   `system dataplane-type` entirely (userspace is the default).
 - For the project-level retirement context, see
