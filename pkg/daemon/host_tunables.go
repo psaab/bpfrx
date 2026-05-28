@@ -320,6 +320,69 @@ func applyNetdevBudget(value int, fs hostTunableFS, capture *priorHostTunables) 
 	slog.Info("linksetup: netdev_budget applied", "value", value)
 }
 
+// Neighbor retransmit-time sysctls (#1636). Lowering these from the
+// 1000ms kernel default to 250ms is the dominant lever for cold-connect
+// recovery against an unknown next-hop: the kernel's own ARP/NDP
+// retransmit timer then fires every 250ms instead of every 1000ms, so a
+// dropped initial solicit is re-driven ~4× sooner. See
+// docs/research/1636-cold-connect-mitigation/plan.md option B.
+//
+// Both the IPv4 and IPv6 "default" neighbor tables are written; "default"
+// is the template every newly-created interface inherits, so this covers
+// dataplane interfaces brought up after daemon start as well as those
+// already present. Per-interface tables created from a stale template are
+// re-evaluated by option D's runtime guard
+// (compute_pending_neigh_timeout_ns) on every snapshot apply.
+const (
+	sysctlPathNeighRetransV4 = "/proc/sys/net/ipv4/neigh/default/retrans_time_ms"
+	sysctlPathNeighRetransV6 = "/proc/sys/net/ipv6/neigh/default/retrans_time_ms"
+	// neighRetransTargetMs is the value option D's guard treats as the
+	// fast-recovery threshold: any interface whose retrans_time_ms is
+	// <= this admits the 800ms PENDING_NEIGH_TIMEOUT. Keep in sync with
+	// compute_pending_neigh_timeout_ns in userspace-dp.
+	neighRetransTargetMs = 250
+)
+
+// applyNeighRetransTime writes neighRetransTargetMs to the IPv4 and IPv6
+// default neighbor-table retrans_time_ms sysctls. Mirrors
+// applyNetdevBudget: idempotent (skip-if-already-set), best-effort
+// (read-only /proc surfaces as a warning, never an error), and captures
+// the pre-xpfd value once so restore can revert it.
+//
+// Unlike the cpu-governor / netdev_budget knobs this is NOT gated behind
+// claim-host-tunables: retrans_time_ms is a neighbor-resolution timing
+// parameter, not a system-wide performance knob, and lowering it is
+// strictly beneficial for any forwarding deploy. It is still captured +
+// restored so a co-tenant's tuned value is put back on daemon stop.
+func applyNeighRetransTime(fs hostTunableFS, capture *priorHostTunables) {
+	want := strconv.Itoa(neighRetransTargetMs)
+	for _, path := range []string{sysctlPathNeighRetransV4, sysctlPathNeighRetransV6} {
+		existing, err := fs.readFile(path)
+		liveVal := ""
+		if err == nil {
+			liveVal = strings.TrimSpace(string(existing))
+		}
+		if liveVal != "" {
+			capture.captureNeighRetrans(path, liveVal)
+		}
+		if liveVal == want {
+			slog.Debug("linksetup: neigh retrans_time_ms already set", "path", path, "value", want)
+			continue
+		}
+		if err := fs.writeFile(path, []byte(want)); err != nil {
+			if errors.Is(err, os.ErrPermission) {
+				slog.Warn("linksetup: neigh retrans_time_ms write denied (read-only /proc?)",
+					"path", path, "value", want, "err", err)
+				continue
+			}
+			slog.Warn("linksetup: neigh retrans_time_ms write failed",
+				"path", path, "value", want, "err", err)
+			continue
+		}
+		slog.Info("linksetup: neigh retrans_time_ms applied", "path", path, "value", want)
+	}
+}
+
 // resolvedHostTunables returns the effective governor + budget given
 // the config values and default substitution rules. Extracted as a
 // pure function so the daemon-wire code can unit-test the
@@ -424,6 +487,11 @@ type priorHostTunables struct {
 	// The value is a verbatim snapshot of the coalescence state so the
 	// restore call emits an identical `ethtool -C` invocation.
 	mlx5Adaptive map[string]mlx5CoalesceState
+	// neighRetrans maps a neighbor retrans_time_ms sysctl path → the
+	// original value (#1636). Absence of a key means xpfd never wrote
+	// that path; restore does nothing on it. Stored as a string so the
+	// exact byte form the kernel served is round-tripped on restore.
+	neighRetrans map[string]string
 }
 
 // mlx5CoalesceState captures the four fields xpfd writes via ethtool -C.
@@ -443,6 +511,7 @@ func newPriorHostTunables() *priorHostTunables {
 	return &priorHostTunables{
 		governors:    map[string]string{},
 		mlx5Adaptive: map[string]mlx5CoalesceState{},
+		neighRetrans: map[string]string{},
 	}
 }
 
@@ -470,6 +539,23 @@ func (p *priorHostTunables) captureBudget(value string) {
 		return
 	}
 	p.budget = strings.TrimSpace(value)
+}
+
+// captureNeighRetrans stores the pre-xpfd value of a neighbor
+// retrans_time_ms sysctl (#1636). No-op once captured for that path
+// (first-apply wins). Lazily allocates the map so a nil-map capture
+// (older newPriorHostTunables callers in tests) does not panic.
+func (p *priorHostTunables) captureNeighRetrans(path, value string) {
+	if p == nil {
+		return
+	}
+	if p.neighRetrans == nil {
+		p.neighRetrans = map[string]string{}
+	}
+	if _, already := p.neighRetrans[path]; already {
+		return
+	}
+	p.neighRetrans[path] = strings.TrimSpace(value)
 }
 
 // captureMlx5Coalesce stores the pre-xpfd coalescence state of a
@@ -556,6 +642,34 @@ func restoreHostScopeTunables(p *priorHostTunables, fs hostTunableFS) {
 			slog.Info("linksetup: netdev_budget restored to pre-xpfd value",
 				"value", p.budget)
 		}
+	}
+}
+
+// restoreNeighRetransTime writes every captured neighbor retrans_time_ms
+// value back to the kernel (#1636). Unlike the cpu-governor / netdev
+// knobs this is restored unconditionally on daemon stop (it applies
+// unconditionally, not behind claim-host-tunables), so a co-tenant's
+// tuned value is put back when xpfd exits. Errors are logged and
+// swallowed. Safe with a nil pointer or empty map (no-op).
+func restoreNeighRetransTime(p *priorHostTunables, fs hostTunableFS) {
+	if p == nil || len(p.neighRetrans) == 0 {
+		return
+	}
+	restored := 0
+	for path, value := range p.neighRetrans {
+		if value == "" {
+			continue
+		}
+		if err := fs.writeFile(path, []byte(value)); err != nil {
+			slog.Warn("linksetup: host tunable restore — neigh retrans_time_ms write failed",
+				"path", path, "want", value, "err", err)
+			continue
+		}
+		restored++
+	}
+	if restored > 0 {
+		slog.Info("linksetup: neigh retrans_time_ms restored to pre-xpfd value",
+			"restored", restored, "total", len(p.neighRetrans))
 	}
 }
 

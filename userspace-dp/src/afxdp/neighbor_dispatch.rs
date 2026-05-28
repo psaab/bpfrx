@@ -91,13 +91,23 @@ pub(super) fn retry_pending_neigh(
     // log-N insert dominates over hash setup for tiny N.
     let mut probed_this_sweep: std::collections::BTreeSet<(i32, IpAddr)> =
         std::collections::BTreeSet::new();
+    // #1636 option D: the drop timeout is computed per snapshot from the
+    // kernel retrans_time_ms sysctls (800ms when fast-retrans is
+    // confirmed, else 2000ms). `0` means a snapshot that predates the
+    // field (e.g. a test-built ForwardingState::default()) — fall back
+    // to the compile-time PENDING_NEIGH_TIMEOUT_NS.
+    let pending_neigh_timeout_ns = if forwarding.pending_neigh_timeout_ns != 0 {
+        forwarding.pending_neigh_timeout_ns
+    } else {
+        PENDING_NEIGH_TIMEOUT_NS
+    };
     for _ in 0..pending_len {
         let pkt = binding
             .pending_neigh
             .pop_front()
             .expect("pending_neigh shrank during retry sweep");
         // Timeout: recycle frame and drop.
-        if now_ns.saturating_sub(pkt.queued_ns) > PENDING_NEIGH_TIMEOUT_NS {
+        if now_ns.saturating_sub(pkt.queued_ns) > pending_neigh_timeout_ns {
             binding.tx_pipeline.pending_fill_frames.push_back(pkt.addr);
             continue;
         }
@@ -555,14 +565,21 @@ mod cold_start_probe_schedule_tests {
 
     #[test]
     fn schedule_total_window_under_pending_neigh_timeout() {
-        // The schedule must finish before PENDING_NEIGH_TIMEOUT_NS
-        // (2 s, see types/mod.rs) so all 3 retries fire while the
-        // packet is still queued. Otherwise the last retry is dead
-        // code: the packet will already be expired by then.
+        // The schedule must finish before the SMALLEST possible
+        // PENDING_NEIGH_TIMEOUT so all 3 retries fire while the packet
+        // is still queued, regardless of whether option D's fast 800ms
+        // timeout (kernel retrans confirmed <=250ms) or the 2000ms
+        // fallback is active (#1636). We gate on the 800ms fast value
+        // minus a 100ms margin so the assertion holds under both paths.
         let last = *PROBE_SCHEDULE_NS.last().expect("schedule non-empty");
+        let min_timeout = super::super::forwarding_build::PENDING_NEIGH_TIMEOUT_FAST_NS;
         assert!(
-            last < super::PENDING_NEIGH_TIMEOUT_NS,
-            "last probe slot {last}ns must be < PENDING_NEIGH_TIMEOUT_NS",
+            min_timeout < super::PENDING_NEIGH_TIMEOUT_NS,
+            "fast timeout must be below the 2s fallback",
+        );
+        assert!(
+            last < min_timeout.saturating_sub(100_000_000),
+            "last probe slot {last}ns must be < min PENDING_NEIGH_TIMEOUT ({min_timeout}ns) - 100ms",
         );
     }
 

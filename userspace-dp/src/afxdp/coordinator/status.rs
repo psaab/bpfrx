@@ -32,6 +32,17 @@ impl super::Coordinator {
             .sum()
     }
 
+    /// #1636 option C: proactive-neighbor-warm telemetry. `warm_drops`
+    /// is incremented when the bounded warmer queue is full (transient);
+    /// `warm_disconnected` when the warmer worker died (fatal). Both are
+    /// surfaced to the daemon's Prometheus collector.
+    pub fn neighbor_warm_counters(&self) -> (u64, u64) {
+        (
+            self.neighbors.warm_drops.load(Ordering::Relaxed),
+            self.neighbors.warm_disconnected.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn recent_exceptions(&self) -> Vec<ExceptionStatus> {
         self.recent_exceptions
             .lock()

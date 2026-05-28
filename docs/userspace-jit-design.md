@@ -47,9 +47,16 @@ explicitly in the PR review notes.
 - [x] Amortized session timestamp touch (every 64 hits)
 - [x] Zero-copy fill ring bootstrap (pre-bind prime)
 - [x] Netlink neighbor monitor (event-driven RTM_NEWNEIGH)
-- [x] Buffer-and-retry for MissingNeighbor (~2ms cold connect)
+- [x] Buffer-and-retry for MissingNeighbor (cold connect — see #1636
+      below; the original "~2ms" claim was wrong, real baseline ~3.371s)
 - [x] Session creation on MissingNeighbor (SYN-ACK reverse path)
 - [x] ICMP SOCK_RAW probe for ARP/NDP (dual-stack)
+- [x] #1636 cold-connect mitigation: kernel `retrans_time_ms` lowered to
+      250ms (option B), proactive neighbor warming at config-apply with
+      per-RG HA gating (option C), and a ForwardingState-computed 800ms
+      `PENDING_NEIGH_TIMEOUT` when fast-retrans is confirmed (option D).
+      Measured cold connect: PENDING_NUMBER (was 3.371s; ~16× for warmed
+      operator-configured next-hops, ~3.3× worst case for unknown ones).
 
 - [x] `apply_rewrite_descriptor()` — straight-line frame rewrite using
       precomputed descriptor fields (MACs, IPs, ports, csum deltas).
@@ -65,7 +72,10 @@ explicitly in the PR review notes.
       frame lifetime issues. Self-target only works for hairpin.
 
 **Current throughput:**
-- Cold TCP connect: ~2ms (after ARP/NDP flush)
+- Cold TCP connect: PENDING_NUMBER after ARP/NDP flush with #1636
+  mitigation (was a mis-documented "~2ms" against a real ~3.371s
+  baseline — see #1636). Target: ≤200ms for warmed operator-configured
+  next-hops; ~1.02s worst case for an un-warmed dynamic neighbor.
 - Cold iperf3 IPv4: 20.1 Gbps (8 streams, 5s)
 - Cold iperf3 IPv6: 20.0 Gbps (8 streams, 5s)
 - Warm iperf3: 23+ Gbps (8 streams, 10s)
@@ -437,7 +447,9 @@ binding in-place rewrite (UMEM frame lifetime issue).
 - [x] Self-target inline in-place rewrite (hairpin, 0 hits in practice)
 - [x] Zero-copy fill ring bootstrap (pre-bind prime, `8a05d52`)
 - [x] Netlink neighbor monitor (event-driven RTM_NEWNEIGH, `293b818`)
-- [x] Buffer-and-retry for MissingNeighbor (~2ms cold connect)
+- [x] Buffer-and-retry for MissingNeighbor (cold connect — the original
+      "~2ms" claim was a mis-measurement; real baseline ~3.371s, see
+      #1636 mitigation below)
 - [x] Session creation on MissingNeighbor for SYN-ACK reverse path (`9584447`)
 - [x] ICMP SOCK_RAW probe for ARP/NDP dual-stack (`fd53f19`, `2f818e8`)
 - [x] Retry pending neighbors on empty RX poll (`293b818`)
@@ -470,7 +482,11 @@ binding in-place rewrite (UMEM frame lifetime issue).
   (hairpin) in-place rewrite works, and that's already implemented.
 
 **Measured throughput** (as of 2026-03-23):
-- Cold TCP connect: ~2ms (after ARP/NDP flush)
+- Cold TCP connect: PENDING_NUMBER after ARP/NDP flush with the #1636
+  mitigation (the prior "~2ms" was a mis-measurement; the real baseline
+  was ~3.371s). #1636 lowers kernel retrans_time_ms to 250ms, warms
+  configured next-hops at config-apply (per-RG HA gated), and drops a
+  stuck SYN at 800ms when fast-retrans is confirmed.
 - Cold iperf3 IPv4: 20.1 Gbps (8 streams, 5s)
 - Cold iperf3 IPv6: 20.0 Gbps (8 streams, 5s)
 - Warm iperf3: 23+ Gbps (8 streams, 10s)

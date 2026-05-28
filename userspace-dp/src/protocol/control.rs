@@ -137,6 +137,18 @@ pub(crate) struct ProcessStatus {
     // is the operator-facing number.
     #[serde(rename = "cos_no_owner_binding_drops_total", default)]
     pub cos_no_owner_binding_drops_total: u64,
+    /// #1636 option C: proactive-neighbor-warm telemetry. `warm_drops`
+    /// counts warm requests dropped because the bounded warmer queue was
+    /// full (transient saturation under route churn); `warm_disconnected`
+    /// counts requests dropped because the warmer worker thread died
+    /// (fatal — warming disabled until restart). Both are the only
+    /// operator-visible signal in production builds (debug-log off) and
+    /// are surfaced as Prometheus counters by the Go collector. Additive
+    /// / defaulted for backward compatibility with older daemons.
+    #[serde(rename = "neighbor_warm_drops_total", default)]
+    pub neighbor_warm_drops_total: u64,
+    #[serde(rename = "neighbor_warm_disconnected_total", default)]
+    pub neighbor_warm_disconnected_total: u64,
     /// #802: focused per-binding ring-pressure view. Projected from the
     /// same `BindingLiveState` atomics that back `Self::bindings` — a
     /// compact snapshot of the counters an operator looks at first when

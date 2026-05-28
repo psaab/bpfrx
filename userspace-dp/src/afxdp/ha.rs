@@ -154,6 +154,14 @@ impl super::Coordinator {
                 );
             }
         }
+        // #1636 option C: an RG just became forwarding-active on this
+        // node. Repopulate the kernel neighbor cache for the now-active
+        // next-hops (entries may have aged to NUD_FAILED while this node
+        // was standby). Clears the per-key rate-limit and fires a forced
+        // warm pass so this does not wait for the next snapshot apply.
+        // queue_warm_pass re-checks each next-hop's RG via the freshly
+        // stored rg_runtime, so standby RGs are not warmed.
+        self.on_rg_promote_active();
     }
 
     pub fn export_owner_rg_sessions(

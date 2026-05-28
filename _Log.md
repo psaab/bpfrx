@@ -4225,3 +4225,19 @@ top.
     constructor), userspace-dp/src/policy_tests.rs (+~600 LOC:
     19 new tests + compile-time const _ size_of guards +
     v3_rule_full helper)
+
+## #1636 cold-connect mitigation (2026-05-28)
+
+- **Timestamp**: 2026-05-28
+  **Action**: Option B — daemon writes net.ipv{4,6}.neigh.default.retrans_time_ms=250 at start (applyNeighRetransTime), capture+restore on stop; ship /etc/sysctl.d/99-xpf-neighbor.conf drop-in; wire into cluster-setup.sh provisioning. Added 6 unit tests.
+  **File(s)**: pkg/daemon/host_tunables.go, pkg/daemon/host_tunables_daemon.go, pkg/daemon/host_tunables_test.go, etc/sysctl.d/99-xpf-neighbor.conf, test/incus/cluster-setup.sh
+
+- **Timestamp**: 2026-05-28
+  **Action**: Option C — proactive neighbor warm at config-apply. NeighborManager gains warm queue (std mpsc bounded 4096), last_probed_at (5s per-key), warm_generation, telemetry counters. Coordinator::queue_warm_pass(force) (1s snapshot rate-limit, per-RG HAGroupRuntime::is_forwarding_active gate, generation collapse, addr filtering, route+fabric next-hops), on_rg_promote_active, on_link_up. neighbor_warmer_loop (per-RG re-check, gen collapse, GC every iter). Spawned at bringup, stopped in stop_inner. Hooked into refresh_runtime_snapshot tail + handle_activated_rgs. 10 coordinator + 5 warmer unit tests.
+  **File(s)**: userspace-dp/src/afxdp/coordinator/neighbor_manager.rs, coordinator/mod.rs, neighbor.rs, coordinator/reconcile/bringup.rs, ha.rs, coordinator/tests.rs, mod.rs
+- **Timestamp**: 2026-05-28
+  **Action**: Option D — ForwardingState.pending_neigh_timeout_ns computed per snapshot in build fn (compute_pending_neigh_timeout_ns): 800ms when kernel retrans_time_ms<=250 on all dataplane ifaces + default template (v4+v6), else fail-closed 2000ms. retry_pending_neigh reads forwarding value (falls back to const on 0). Updated schedule test. 6 compute tests.
+  **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs, forwarding_build/mod.rs, neighbor_dispatch.rs, forwarding_build/tests.rs
+- **Timestamp**: 2026-05-28
+  **Action**: Prometheus telemetry — neighbor_warm_drops_total + neighbor_warm_disconnected_total wired Rust ProcessStatus -> Go ProcessStatus (matching json names) -> xpf_userspace_neighbor_warm_{drops,disconnected}_total counters. Regenerated protocol wire fixture. Updated docs/userspace-jit-design.md cold-connect lines.
+  **File(s)**: userspace-dp/src/protocol/control.rs, afxdp/coordinator/status.rs, server/helpers.rs, server/lifecycle.rs, tests/fixtures/protocol_wire_v1.json, pkg/dataplane/userspace/protocol.go, pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go, docs/userspace-jit-design.md

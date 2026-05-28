@@ -382,5 +382,89 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     // the DP handles all TCP state for those addresses.
     install_kernel_rst_suppression(&state);
 
+    // #1636 option D: compute the pending-neighbor drop timeout from the
+    // live kernel retrans_time_ms sysctls. Re-evaluated every snapshot so
+    // a runtime sysctl change (e.g. an admin reverting PR-1) is picked up
+    // on the next apply and propagated atomically via ha.forwarding.
+    state.pending_neigh_timeout_ns =
+        compute_pending_neigh_timeout_ns(&state.ifindex_to_name, &RealSysctlReader);
+
     Ok(state)
+}
+
+/// #1636 option D: PENDING_NEIGH_TIMEOUT value (ns) when the kernel
+/// `retrans_time_ms` is confirmed <= 250 on every dataplane interface
+/// (v4 AND v6) plus the `default` template. Dropping a queued SYN at
+/// 800ms re-drives it (via the client's first TCP RTO at ~1000ms)
+/// against a kernel that has already resolved or is one fast retransmit
+/// from resolving, instead of stalling to the 2000ms default.
+pub(in crate::afxdp) const PENDING_NEIGH_TIMEOUT_FAST_NS: u64 = 800_000_000;
+
+/// Threshold (ms) at/below which the kernel retrans timer is fast enough
+/// to admit the 800ms timeout. Mirrors the daemon-side
+/// `neighRetransTargetMs` (pkg/daemon/host_tunables.go).
+const NEIGH_RETRANS_FAST_THRESHOLD_MS: u32 = 250;
+
+/// Reads a u32 from a sysctl-style file path. Abstracted so the
+/// timeout-compute logic is unit-testable without touching real /proc.
+pub(in crate::afxdp) trait SysctlReader {
+    fn read_u32(&self, path: &str) -> Option<u32>;
+}
+
+struct RealSysctlReader;
+
+impl SysctlReader for RealSysctlReader {
+    fn read_u32(&self, path: &str) -> Option<u32> {
+        std::fs::read_to_string(path)
+            .ok()?
+            .trim()
+            .parse::<u32>()
+            .ok()
+    }
+}
+
+/// Fail-closed computation of the pending-neighbor drop timeout.
+///
+/// Returns `PENDING_NEIGH_TIMEOUT_FAST_NS` (800ms) only if EVERY checked
+/// `retrans_time_ms` sysctl reads <= 250 (v4 AND v6, every dataplane
+/// interface plus the `default` template). Any read failure or any value
+/// > 250 falls back to `super::PENDING_NEIGH_TIMEOUT_NS` (2000ms) and
+/// emits a one-shot operator warning — if PR-1's sysctl never applied
+/// (restricted container, sysctl namespace, admin override), dropping at
+/// 800ms before the kernel's first 1000ms wire solicit would REGRESS the
+/// baseline, so we keep the safe default.
+pub(in crate::afxdp) fn compute_pending_neigh_timeout_ns<R: SysctlReader>(
+    ifindex_to_name: &FastMap<i32, String>,
+    reader: &R,
+) -> u64 {
+    let fallback = || -> u64 {
+        eprintln!(
+            "xpf-userspace-dp: WARNING: kernel retrans_time_ms not <= {}ms on all dataplane \
+             interfaces (v4 AND v6) — using PENDING_NEIGH_TIMEOUT_NS={}ms (option D inactive). \
+             Apply the #1636 sysctl drop-in to enable.",
+            NEIGH_RETRANS_FAST_THRESHOLD_MS,
+            super::PENDING_NEIGH_TIMEOUT_NS / 1_000_000,
+        );
+        super::PENDING_NEIGH_TIMEOUT_NS
+    };
+    // Per-interface tables first (an interface created from a stale
+    // template before PR-1 applied could still carry the old 1000ms).
+    for name in ifindex_to_name.values() {
+        for family in ["ipv4", "ipv6"] {
+            let path = format!("/proc/sys/net/{family}/neigh/{name}/retrans_time_ms");
+            match reader.read_u32(&path) {
+                Some(v) if v <= NEIGH_RETRANS_FAST_THRESHOLD_MS => {}
+                _ => return fallback(),
+            }
+        }
+    }
+    // The `default` template covers interfaces created post-snapshot.
+    for family in ["ipv4", "ipv6"] {
+        let path = format!("/proc/sys/net/{family}/neigh/default/retrans_time_ms");
+        match reader.read_u32(&path) {
+            Some(v) if v <= NEIGH_RETRANS_FAST_THRESHOLD_MS => {}
+            _ => return fallback(),
+        }
+    }
+    PENDING_NEIGH_TIMEOUT_FAST_NS
 }

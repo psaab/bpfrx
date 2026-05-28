@@ -1407,3 +1407,230 @@ fn reconcile_with_none_snapshot_reaches_no_snapshot_early_exit() {
     assert!(!bindings[0].xsk_registered);
     assert_eq!(bindings[0].rx_packets, 0);
 }
+
+// ---------------------------------------------------------------------------
+// #1636 option C: proactive neighbor warm tests.
+// ---------------------------------------------------------------------------
+
+fn warm_active_ha_runtime(now_secs: u64) -> HAGroupRuntime {
+    HAGroupRuntime {
+        active: true,
+        watchdog_timestamp: now_secs,
+        lease: HAGroupRuntime::active_lease_until(now_secs, now_secs),
+    }
+}
+
+/// Build a coordinator with an installed warm queue (returning the
+/// receiver), one egress interface on RG `rg_id`, that RG marked
+/// forwarding-active, and a single static route whose next-hop is
+/// UNRESOLVED. The caller drains the receiver after queue_warm_pass.
+fn warm_test_coordinator(rg_id: i32) -> (Coordinator, Receiver<WarmItem>) {
+    let mut coord = Coordinator::new();
+    let (tx, rx) = mpsc::sync_channel::<WarmItem>(WARM_QUEUE_DEPTH);
+    coord.neighbors.warm_queue = Some(tx);
+
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    coord
+        .ha
+        .rg_runtime
+        .store(Arc::new(BTreeMap::from([(rg_id, warm_active_ha_runtime(now_secs))])));
+
+    let egress_ifindex = 80i32;
+    coord.forwarding.ifindex_to_name.insert(egress_ifindex, "ge-0-0-2".to_string());
+    coord.forwarding.egress.insert(
+        egress_ifindex,
+        EgressInterface {
+            bind_ifindex: egress_ifindex,
+            vlan_id: 0,
+            mtu: 1500,
+            src_mac: [0; 6],
+            zone_id: 0,
+            redundancy_group: rg_id,
+            primary_v4: None,
+            primary_v6: None,
+        },
+    );
+    coord.forwarding.routes_v4.insert(
+        "inet.0".to_string(),
+        vec![RouteEntryV4 {
+            prefix: PrefixV4::from_net("0.0.0.0/0".parse().unwrap()),
+            ifindex: egress_ifindex,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(Ipv4Addr::new(172, 16, 80, 1)),
+            discard: false,
+            next_table: String::new(),
+        }],
+    );
+    (coord, rx)
+}
+
+#[test]
+fn queue_warm_pass_fires_for_unresolved_next_hop() {
+    let (coord, rx) = warm_test_coordinator(0);
+    coord.queue_warm_pass(false);
+    let item = rx.try_recv().expect("one warm item for the unresolved next-hop");
+    assert_eq!(item.ifindex, 80);
+    assert_eq!(item.hop, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1)));
+    assert_eq!(item.iface_name, "ge-0-0-2");
+    assert_eq!(item.rg_id, 0);
+    assert!(rx.try_recv().is_err(), "exactly one item expected");
+}
+
+#[test]
+fn queue_warm_pass_skips_already_resolved_next_hop() {
+    let (mut coord, rx) = warm_test_coordinator(0);
+    // Resolve the next-hop in the forwarding neighbor map.
+    coord.forwarding.neighbors.insert(
+        (80, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))),
+        NeighborEntry { mac: [0xaa; 6] },
+    );
+    coord.queue_warm_pass(false);
+    assert!(rx.try_recv().is_err(), "resolved next-hop must not be warmed");
+}
+
+#[test]
+fn queue_warm_pass_skips_when_owning_rg_inactive() {
+    // Route is on RG 1 but RG 1 is NOT forwarding-active.
+    let (coord, rx) = warm_test_coordinator(1);
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    // Replace runtime: RG 1 inactive.
+    coord.ha.rg_runtime.store(Arc::new(BTreeMap::from([(
+        1i32,
+        HAGroupRuntime {
+            active: false,
+            watchdog_timestamp: now_secs,
+            lease: HAForwardingLease::Inactive,
+        },
+    )])));
+    coord.queue_warm_pass(false);
+    assert!(
+        rx.try_recv().is_err(),
+        "standby RG next-hop must not be warmed",
+    );
+}
+
+#[test]
+fn queue_warm_pass_skips_invalid_addresses() {
+    let (mut coord, rx) = warm_test_coordinator(0);
+    // Replace the route's next-hop with a multicast address.
+    coord.forwarding.routes_v4.get_mut("inet.0").unwrap()[0].next_hop =
+        Some(Ipv4Addr::new(224, 0, 0, 1));
+    coord.queue_warm_pass(false);
+    assert!(rx.try_recv().is_err(), "multicast next-hop must be filtered");
+}
+
+#[test]
+fn queue_warm_pass_dedups_within_one_call() {
+    let (mut coord, rx) = warm_test_coordinator(0);
+    // Two routes with the SAME (ifindex, next-hop) in different tables.
+    coord.forwarding.routes_v4.insert(
+        "vrf-a.inet.0".to_string(),
+        vec![RouteEntryV4 {
+            prefix: PrefixV4::from_net("0.0.0.0/0".parse().unwrap()),
+            ifindex: 80,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(Ipv4Addr::new(172, 16, 80, 1)),
+            discard: false,
+            next_table: String::new(),
+        }],
+    );
+    coord.queue_warm_pass(false);
+    assert!(rx.try_recv().is_ok(), "first item expected");
+    assert!(rx.try_recv().is_err(), "duplicate (ifindex, hop) must coalesce");
+}
+
+#[test]
+fn queue_warm_pass_respects_snapshot_rate_limit() {
+    let (coord, rx) = warm_test_coordinator(0);
+    coord.queue_warm_pass(false);
+    assert!(rx.try_recv().is_ok());
+    // Second non-forced sweep within 1s must be skipped wholesale.
+    coord.queue_warm_pass(false);
+    assert!(
+        rx.try_recv().is_err(),
+        "second sweep within 1s rate-limit must not enqueue",
+    );
+    // Forced sweep (RG-promote path) bypasses the snapshot rate-limit.
+    coord.queue_warm_pass(true);
+    assert!(rx.try_recv().is_ok(), "forced sweep must bypass snapshot rate-limit");
+}
+
+#[test]
+fn queue_warm_pass_warms_fabric_peer_over_parent_ifindex() {
+    let (mut coord, rx) = warm_test_coordinator(0);
+    // Drop the route so only the fabric is a candidate.
+    coord.forwarding.routes_v4.clear();
+    let parent = 80i32;
+    coord.forwarding.ifindex_to_name.insert(parent, "ge-0-0-0".to_string());
+    coord.forwarding.fabrics.push(FabricLink {
+        parent_ifindex: parent,
+        overlay_ifindex: 90,
+        peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 0, 2)),
+        peer_mac: [0; 6],
+        local_mac: [0; 6],
+    });
+    coord.queue_warm_pass(false);
+    let item = rx.try_recv().expect("fabric peer warm item");
+    assert_eq!(item.ifindex, parent, "fabric warms over parent_ifindex (AGY r7 #3)");
+    assert_eq!(item.hop, IpAddr::V4(Ipv4Addr::new(10, 99, 0, 2)));
+}
+
+#[test]
+fn queue_warm_pass_noop_without_worker_queue() {
+    // No warm_queue installed (worker not yet spawned) → no panic, no-op.
+    let mut coord = Coordinator::new();
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+    coord
+        .ha
+        .rg_runtime
+        .store(Arc::new(BTreeMap::from([(0i32, warm_active_ha_runtime(now_secs))])));
+    coord.forwarding.routes_v4.insert(
+        "inet.0".to_string(),
+        vec![RouteEntryV4 {
+            prefix: PrefixV4::from_net("0.0.0.0/0".parse().unwrap()),
+            ifindex: 80,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(Ipv4Addr::new(172, 16, 80, 1)),
+            discard: false,
+            next_table: String::new(),
+        }],
+    );
+    coord.queue_warm_pass(false); // must not panic
+}
+
+#[test]
+fn on_rg_promote_active_clears_rate_limit_and_forces_warm() {
+    let (coord, rx) = warm_test_coordinator(0);
+    // Pre-load a recent probe for the key so the per-key 5s rate-limit
+    // would normally suppress it.
+    {
+        let mut probed = coord.neighbors.last_probed_at.lock().unwrap();
+        probed.insert((80, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))), monotonic_nanos());
+    }
+    // First non-forced sweep enqueues (queue_warm_pass does not consult
+    // last_probed_at — that is the worker's job — so the item IS sent).
+    coord.queue_warm_pass(false);
+    assert!(rx.try_recv().is_ok());
+    // on_rg_promote_active clears last_probed_at AND forces a sweep that
+    // bypasses the snapshot rate-limit.
+    coord.on_rg_promote_active();
+    assert!(
+        coord.neighbors.last_probed_at.lock().unwrap().is_empty(),
+        "RG-promote must clear the per-key rate-limit map",
+    );
+    assert!(rx.try_recv().is_ok(), "forced warm pass on RG-promote must enqueue");
+}
+
+#[test]
+fn on_link_up_clears_only_matching_ifindex() {
+    let coord = Coordinator::new();
+    {
+        let mut probed = coord.neighbors.last_probed_at.lock().unwrap();
+        probed.insert((80, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))), 1);
+        probed.insert((81, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 2))), 2);
+    }
+    coord.on_link_up(80);
+    let probed = coord.neighbors.last_probed_at.lock().unwrap();
+    assert!(!probed.contains_key(&(80, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1)))));
+    assert!(probed.contains_key(&(81, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 2)))));
+}

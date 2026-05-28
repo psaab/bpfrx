@@ -325,6 +325,13 @@ mod worker;
 #[path = "worker_runtime.rs"]
 mod worker_runtime;
 pub use self::coordinator::Coordinator;
+// #1636: re-export the warmer types/consts into afxdp scope so the
+// neighbor-warmer loop in neighbor.rs (which uses `use super::*`) and
+// the unit tests can name them without a fully-qualified path.
+pub(crate) use self::coordinator::WarmItem;
+pub(in crate::afxdp) use self::coordinator::{
+    WARM_GC_INTERVAL_NS, WARM_GC_MAX_AGE_NS, WARM_PER_KEY_RATE_LIMIT_NS, WARM_QUEUE_DEPTH,
+};
 pub(crate) use self::worker::{
     BindingLiveSnapshot, BindingWorker, SyncedSessionEntry, XskBindMode, fabric_queue_hash,
     push_recent_exception, push_recent_session_delta, worker_loop,

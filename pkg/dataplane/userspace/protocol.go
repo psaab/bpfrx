@@ -601,6 +601,12 @@ type ProcessStatus struct {
 	ConfiguredMode               string                            `json:"configured_mode,omitempty"`        // Desired mode from config
 	EntryPrograms                map[int]string                    `json:"entry_programs,omitempty"`         // ifindex -> attached XDP program name
 	DegradedPathCounters         map[string]uint64                 `json:"degraded_path_counters,omitempty"` // reason_name -> count
+	// #1636 option C: proactive-neighbor-warm telemetry. WarmDrops counts
+	// warm requests dropped because the bounded warmer queue was full
+	// (transient); WarmDisconnected counts requests dropped because the
+	// warmer worker thread died (fatal — warming disabled until restart).
+	NeighborWarmDropsTotal        uint64 `json:"neighbor_warm_drops_total,omitempty"`
+	NeighborWarmDisconnectedTotal uint64 `json:"neighbor_warm_disconnected_total,omitempty"`
 }
 
 // MarshalJSON intentionally uses a value receiver so both ProcessStatus values

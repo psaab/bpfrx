@@ -16,6 +16,7 @@ import (
 	"errors"
 	"io/fs"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -237,6 +238,98 @@ func TestApplyNetdevBudget_ReadOnlyProc_LogsAndContinues(t *testing.T) {
 	applyNetdevBudget(600, f, nil)
 	if _, ok := f.writes[sysctlPathNetdevBudget]; ok {
 		t.Fatal("write recorded despite scripted EACCES")
+	}
+}
+
+// --- applyNeighRetransTime (#1636) ---------------------------------------
+
+func TestApplyNeighRetransTime_WritesBothFamilies(t *testing.T) {
+	f := newFakeHostFS()
+	f.files[sysctlPathNeighRetransV4] = []byte("1000\n")
+	f.files[sysctlPathNeighRetransV6] = []byte("1000\n")
+	applyNeighRetransTime(f, nil)
+	if f.writes[sysctlPathNeighRetransV4] != "250" {
+		t.Fatalf("v4: want 250 written, got %q", f.writes[sysctlPathNeighRetransV4])
+	}
+	if f.writes[sysctlPathNeighRetransV6] != "250" {
+		t.Fatalf("v6: want 250 written, got %q", f.writes[sysctlPathNeighRetransV6])
+	}
+}
+
+func TestApplyNeighRetransTime_IdempotentWhenAlreadySet(t *testing.T) {
+	f := newFakeHostFS()
+	f.files[sysctlPathNeighRetransV4] = []byte("250\n")
+	f.files[sysctlPathNeighRetransV6] = []byte("250\n")
+	applyNeighRetransTime(f, nil)
+	if len(f.writes) != 0 {
+		t.Fatalf("already-set must skip write, got %v", f.writes)
+	}
+}
+
+func TestApplyNeighRetransTime_ReadOnlyProc_LogsAndContinues(t *testing.T) {
+	// Restricted container / sysctl namespace surfaces as EACCES on
+	// write. Must log and continue (best-effort) without panic. The
+	// other family must still be attempted.
+	f := newFakeHostFS()
+	f.files[sysctlPathNeighRetransV4] = []byte("1000\n")
+	f.files[sysctlPathNeighRetransV6] = []byte("1000\n")
+	f.writeErrs[sysctlPathNeighRetransV4] = &fs.PathError{
+		Op: "write", Path: sysctlPathNeighRetransV4, Err: fs.ErrPermission,
+	}
+	applyNeighRetransTime(f, nil)
+	if _, ok := f.writes[sysctlPathNeighRetransV4]; ok {
+		t.Fatal("v4 write recorded despite scripted EACCES")
+	}
+	if f.writes[sysctlPathNeighRetransV6] != "250" {
+		t.Fatalf("v6 must still be written when v4 fails, got %q",
+			f.writes[sysctlPathNeighRetransV6])
+	}
+}
+
+func TestApplyNeighRetransTime_CapturesPriorValueOnce(t *testing.T) {
+	f := newFakeHostFS()
+	f.files[sysctlPathNeighRetransV4] = []byte("1000\n")
+	f.files[sysctlPathNeighRetransV6] = []byte("900\n")
+	cap := newPriorHostTunables()
+	applyNeighRetransTime(f, cap)
+	if cap.neighRetrans[sysctlPathNeighRetransV4] != "1000" {
+		t.Fatalf("v4 prior: want 1000, got %q", cap.neighRetrans[sysctlPathNeighRetransV4])
+	}
+	if cap.neighRetrans[sysctlPathNeighRetransV6] != "900" {
+		t.Fatalf("v6 prior: want 900, got %q", cap.neighRetrans[sysctlPathNeighRetransV6])
+	}
+	// Second apply (reconcile) must NOT overwrite the captured prior
+	// value with the xpfd-written 250 (first-apply-wins).
+	applyNeighRetransTime(f, cap)
+	if cap.neighRetrans[sysctlPathNeighRetransV4] != "1000" {
+		t.Fatalf("v4 prior overwritten on reconcile: got %q",
+			cap.neighRetrans[sysctlPathNeighRetransV4])
+	}
+}
+
+func TestRestoreNeighRetransTime_RevertsToPrior(t *testing.T) {
+	f := newFakeHostFS()
+	f.files[sysctlPathNeighRetransV4] = []byte("1000\n")
+	f.files[sysctlPathNeighRetransV6] = []byte("1000\n")
+	cap := newPriorHostTunables()
+	applyNeighRetransTime(f, cap)
+	// After apply, live value is 250. Restore must put back 1000.
+	restoreNeighRetransTime(cap, f)
+	if f.files[sysctlPathNeighRetransV4] == nil ||
+		strings.TrimSpace(string(f.files[sysctlPathNeighRetransV4])) != "1000" {
+		t.Fatalf("v4 not restored to 1000, got %q", string(f.files[sysctlPathNeighRetransV4]))
+	}
+	if strings.TrimSpace(string(f.files[sysctlPathNeighRetransV6])) != "1000" {
+		t.Fatalf("v6 not restored to 1000, got %q", string(f.files[sysctlPathNeighRetransV6]))
+	}
+}
+
+func TestRestoreNeighRetransTime_NilAndEmpty_NoOp(t *testing.T) {
+	f := newFakeHostFS()
+	restoreNeighRetransTime(nil, f)
+	restoreNeighRetransTime(newPriorHostTunables(), f)
+	if len(f.writes) != 0 {
+		t.Fatalf("nil/empty capture must be a no-op, got %v", f.writes)
 	}
 }
 
