@@ -1237,3 +1237,614 @@ fn test_book_entry_zero_plus_non_zero_prefixes_preserved() {
     assert!(v6_lens.contains(&0), "v6 parallel array must keep ::/0: got {v6_lens:?}");
     assert!(v6_lens.contains(&32), "v6 parallel array must keep /32: got {v6_lens:?}");
 }
+
+// -----------------------------------------------------------------
+// #1623 Path B narrow (STAGED scaffolding) — PolicyRule parallel
+// prefix arrays.
+//
+// These tests verify that the `source_prefixes_v{4,6}` /
+// `destination_prefixes_v{4,6}` Option<Arc<[T]>> fields on
+// `PolicyRule` are populated correctly at parse-time as the union
+// of (a) the rule's own literal CIDRs and (b) every cited address
+// book's prefixes_v{4,6}. `None` represents "no operator-stated
+// input prefixes for this side+family" — paired with the existing
+// `..._match_any` flag for semantic match shape (see the
+// dominance rule in plan §4.2).
+//
+// Mirrors the BookEntry parallel-prefix test pattern from #1624
+// (lines ~1015-1239 above) with the Option wrapper differences.
+// -----------------------------------------------------------------
+
+// Helper: build a v3-shaped rule with explicit destination side.
+fn v3_rule_full(
+    name: &str,
+    src_books: &[u32],
+    src_lits: &[&str],
+    dst_books: &[u32],
+    dst_lits: &[&str],
+) -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        name: name.to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_book_ids: src_books.to_vec(),
+        source_literals: src_lits.iter().map(|s| s.to_string()).collect(),
+        destination_book_ids: dst_books.to_vec(),
+        destination_literals: dst_lits.iter().map(|s| s.to_string()).collect(),
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_policy_rule_v3_carries_canonical_prefix_lists_v4() {
+    // Test 1: rule with three v4 literal CIDRs + one cited v4-only
+    // book (one v4 prefix). Assert source_prefixes_v4 = Some(4
+    // entries), source_prefixes_v6 = None, destination_*_v{4,6}
+    // = None (destination is "any").
+    let books = [book(200, "corp-v4", &["172.16.0.0/12"], &[])];
+    let rules = [v3_rule(
+        "r-v4",
+        &[200],
+        &["10.0.0.0/8", "192.168.0.0/16", "203.0.113.5/32"],
+    )];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    let arr = rule
+        .source_prefixes_v4
+        .as_deref()
+        .expect("source_prefixes_v4 must be Some");
+    assert_eq!(arr.len(), 4, "3 literals + 1 book prefix = 4");
+    assert!(rule.source_prefixes_v6.is_none());
+    // Destination side is "any" -> None.
+    assert!(rule.destination_prefixes_v4.is_none());
+    assert!(rule.destination_prefixes_v6.is_none());
+}
+
+#[test]
+fn test_policy_rule_v3_carries_canonical_prefix_lists_v6() {
+    // Test 2: same shape as v4, but v6 only.
+    let books = [book(201, "corp-v6", &[], &["2001:db8::/32"])];
+    let rules = [PolicyRuleSnapshot {
+        name: "r-v6".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_book_ids: vec![201],
+        source_literals: vec![
+            "fe80::/10".to_string(),
+            "::1/128".to_string(),
+        ],
+        destination_literals: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    }];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    let arr = rule
+        .source_prefixes_v6
+        .as_deref()
+        .expect("source_prefixes_v6 must be Some");
+    assert_eq!(arr.len(), 3, "2 literals + 1 book prefix = 3");
+    assert!(rule.source_prefixes_v4.is_none());
+}
+
+#[test]
+fn test_policy_rule_v3_dual_family() {
+    // Test 3: rule with v4 + v6 literals + a dual-family book.
+    let books = [book(
+        202,
+        "dual",
+        &["10.0.0.0/8"],
+        &["2001:db8::/32"],
+    )];
+    let rules = [v3_rule(
+        "r-dual",
+        &[202],
+        &["172.16.0.0/12", "fe80::/10"],
+    )];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    let v4 = rule.source_prefixes_v4.as_deref().expect("v4 Some");
+    let v6 = rule.source_prefixes_v6.as_deref().expect("v6 Some");
+    assert_eq!(v4.len(), 2, "v4: 1 literal + 1 book = 2");
+    assert_eq!(v6.len(), 2, "v6: 1 literal + 1 book = 2");
+}
+
+#[test]
+fn test_policy_rule_v3_any_source_yields_none() {
+    // Test 4: rule with source_literals=["any"], no books.
+    // Assert source_prefixes_v4 = None AND source_prefixes_v6 =
+    // None AND source_v{4,6}_match_any = true. Demonstrates the
+    // "any -> None + flag" contract and zero allocation for the
+    // common case.
+    let rules = [v3_rule("r-any", &[], &["any"])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    assert!(rule.source_prefixes_v4.is_none());
+    assert!(rule.source_prefixes_v6.is_none());
+    assert!(rule.source_v4_match_any);
+    assert!(rule.source_v6_match_any);
+}
+
+#[test]
+fn test_policy_rule_v3_book_only_inherits_book_prefixes() {
+    // Test 5: rule with source_book_ids=[N], empty literals.
+    // Assert rule's source_prefixes_v4 matches the book's
+    // prefixes_v4 exactly in length AND content.
+    let books = [book(
+        203,
+        "book-only",
+        &["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
+        &[],
+    )];
+    let rules = [v3_rule("r-book", &[203], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    let arr = rule.source_prefixes_v4.as_deref().expect("Some");
+    assert_eq!(arr.len(), 3);
+    // Rule's parallel array content matches book's: every entry
+    // round-trips through the book's PrefixSet.
+    let book_entry = &state.books[0];
+    for p in arr.iter() {
+        assert!(book_entry.v4.contains(p.addr()));
+    }
+}
+
+#[test]
+fn test_policy_rule_v3_multiple_books_dense_index_order() {
+    // Test 6: rule with source_book_ids=[3, 1, 2] (declared
+    // out-of-order). resolve_book_idxs sort_unstable + dedup
+    // sorts to ascending dense indices. The parallel array
+    // walks the cited books in ascending dense-index order.
+    let books = [
+        book(301, "a", &["10.1.0.0/16"], &[]),
+        book(302, "b", &["10.2.0.0/16"], &[]),
+        book(303, "c", &["10.3.0.0/16"], &[]),
+    ];
+    let mut rule_snap = v3_rule("r-multi", &[], &[]);
+    rule_snap.source_book_ids = vec![303, 301, 302];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &[rule_snap],
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    let arr = rule.source_prefixes_v4.as_deref().expect("Some");
+    assert_eq!(arr.len(), 3, "3 books × 1 prefix each");
+    // Books were inserted in declared order [301, 302, 303] so
+    // dense indices are 0, 1, 2 respectively. After
+    // sort_unstable on source_book_ids: [301, 302, 303] -> dense
+    // [0, 1, 2]. Array walk visits each book once in ascending
+    // dense index, giving prefixes in order a, b, c.
+    assert_eq!(arr[0].prefix_len(), 16);
+    // Spot-check the first octet of the addresses (10.1, 10.2,
+    // 10.3): each address is in its respective book.
+    let book_a = &state.books[0];
+    let book_b = &state.books[1];
+    let book_c = &state.books[2];
+    assert!(book_a.v4.contains(arr[0].addr()));
+    assert!(book_b.v4.contains(arr[1].addr()));
+    assert!(book_c.v4.contains(arr[2].addr()));
+}
+
+#[test]
+fn test_policy_rule_legacy_source_addresses_path() {
+    // Test 7: non-v3-shaped rule using source_addresses (legacy).
+    // No source_literals, no books, no destination_literals nor
+    // destination_book_ids. Assert source_prefixes_v4 = Some([
+    // 10.0.0.0/8]).
+    let rule_snap = PolicyRuleSnapshot {
+        name: "r-legacy".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["10.0.0.0/8".to_string()],
+        destination_addresses: vec![],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    };
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &[rule_snap],
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    let arr = rule.source_prefixes_v4.as_deref().expect("Some");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0].prefix_len(), 8);
+}
+
+#[test]
+fn test_policy_rule_v3_any4_any6_tokens() {
+    // Test 8: rule with source_literals=["any4"] — sets
+    // source_v4_match_any=true, parallel array still None
+    // (any token contributes no literal prefix). Then symmetric
+    // for ["any6"].
+    let rules = [
+        v3_rule("r-any4", &[], &["any4"]),
+        v3_rule("r-any6", &[], &["any6"]),
+    ];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    let r_any4 = &state.rules[0];
+    assert!(r_any4.source_v4_match_any, "any4 -> v4 match_any true");
+    assert!(!r_any4.source_v6_match_any, "any4 -> v6 match_any false");
+    assert!(r_any4.source_prefixes_v4.is_none());
+    assert!(r_any4.source_prefixes_v6.is_none());
+    let r_any6 = &state.rules[1];
+    assert!(!r_any6.source_v4_match_any);
+    assert!(r_any6.source_v6_match_any);
+    assert!(r_any6.source_prefixes_v4.is_none());
+    assert!(r_any6.source_prefixes_v6.is_none());
+}
+
+#[test]
+fn test_policy_rule_v3_literal_zero_prefix_preserved() {
+    // Test 9: rule with literal "0.0.0.0/0" (NOT "any" token).
+    // PrefixSet collapses to MatchAny because /0 is present, but
+    // parallel array preserves the /0 entry as
+    // Some([0.0.0.0/0]). Demonstrates the operator-input
+    // fidelity contract: Some([/0]) and None mean different
+    // things (operator literal /0 vs operator any).
+    let rules = [v3_rule("r-zero", &[], &["0.0.0.0/0"])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    assert!(rule.source_v4_match_any, "/0 collapses to MatchAny");
+    let arr = rule
+        .source_prefixes_v4
+        .as_deref()
+        .expect("literal /0 must be Some([/0]), NOT None");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0].prefix_len(), 0);
+}
+
+#[test]
+fn test_policy_rule_v3_destination_side_independent() {
+    // Test 10: rule with source="any", destination=[two literal
+    // CIDRs]. Assert source side is None for both families;
+    // destination_v4 has 2 entries, destination_v6 is None.
+    let rule_snap = v3_rule_full(
+        "r-dst",
+        &[],
+        &["any"],
+        &[],
+        &["10.0.0.0/8", "192.168.0.0/16"],
+    );
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &[rule_snap],
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    assert!(rule.source_prefixes_v4.is_none());
+    assert!(rule.source_prefixes_v6.is_none());
+    let arr = rule.destination_prefixes_v4.as_deref().expect("Some");
+    assert_eq!(arr.len(), 2);
+    assert!(rule.destination_prefixes_v6.is_none());
+}
+
+#[test]
+fn test_policy_rule_v3_trie_variant_preserves_array() {
+    // Test 11: rule with 17 literal CIDRs (triggers Trie variant
+    // since PREFIX_SET_LINEAR_MAX = 16). Parallel array preserves
+    // all 17 — variant-independent because it's captured before
+    // PrefixSet chooses Linear vs Trie.
+    let lits: Vec<String> = (0..17).map(|i| format!("10.0.{i}.0/24")).collect();
+    let lit_refs: Vec<&str> = lits.iter().map(|s| s.as_str()).collect();
+    let rules = [v3_rule("r-trie", &[], &lit_refs)];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    assert!(matches!(
+        rule.source_literal_v4,
+        crate::prefix_set::PrefixSetV4::Trie(_)
+    ));
+    let arr = rule.source_prefixes_v4.as_deref().expect("Some");
+    assert_eq!(arr.len(), 17);
+}
+
+#[test]
+fn test_policy_rule_clone_preserves_arrays() {
+    // Test 12: build a rule with Some(arr) AND None fields, clone
+    // it, assert ptr-equality for Some (Arc ref-count bump) and
+    // None preserved.
+    let books = [book(204, "for-clone", &["10.0.0.0/8"], &[])];
+    let rules = [v3_rule("r-clone", &[204], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    let cloned = rule.clone();
+    // Some side: same Arc data pointer (ref-count bump).
+    let orig = rule.source_prefixes_v4.as_ref().expect("Some");
+    let dup = cloned.source_prefixes_v4.as_ref().expect("Some");
+    assert!(
+        Arc::ptr_eq(orig, dup),
+        "Arc::ptr_eq must hold across clone"
+    );
+    // None side: still None.
+    assert!(cloned.source_prefixes_v6.is_none());
+    assert!(cloned.destination_prefixes_v4.is_none());
+    assert!(cloned.destination_prefixes_v6.is_none());
+}
+
+// Compile-time size_of guards (test 13). These const blocks fail
+// compilation if NPO is ever broken (which would tank the memory
+// accounting in plan §2.1). The const _ pattern avoids the
+// static_assertions crate dependency (per AGY r3 + Codex r3
+// alignment).
+const _: [(); 16] = [(); std::mem::size_of::<Option<Arc<[PrefixV4]>>>()];
+const _: [(); 16] = [(); std::mem::size_of::<Option<Arc<[PrefixV6]>>>()];
+const _: [(); 16] = [(); std::mem::size_of::<Arc<[PrefixV4]>>()];
+const _: [(); 16] = [(); std::mem::size_of::<Arc<[PrefixV6]>>()];
+
+#[test]
+fn test_policy_rule_size_of_option_arc() {
+    // Runtime mirror of the const _ guards above so the test
+    // appears in `cargo test` output. The const blocks are the
+    // load-bearing compile-time enforcement; the runtime
+    // assertions reaffirm for visibility.
+    assert_eq!(std::mem::size_of::<Option<Arc<[PrefixV4]>>>(), 16);
+    assert_eq!(std::mem::size_of::<Option<Arc<[PrefixV6]>>>(), 16);
+    assert_eq!(std::mem::size_of::<Arc<[PrefixV4]>>(), 16);
+    assert_eq!(std::mem::size_of::<Arc<[PrefixV6]>>(), 16);
+}
+
+#[test]
+fn test_policy_rule_v3_any_plus_book_match_any_with_some_arr() {
+    // Test 14: rule with source_literals=["any"] AND a cited
+    // book with v4 prefixes. source_v4_match_any becomes true
+    // via the "any" token. The parallel array still gets the
+    // book's prefixes (the "any" token contributes no literal,
+    // but the cited book contributes its prefixes_v4).
+    // Demonstrates dominance: match_any=true means the array is
+    // diagnostic only, never narrows the rule.
+    let books = [book(205, "any-plus", &["10.0.0.0/8"], &[])];
+    let rules = [v3_rule("r-any-plus", &[205], &["any"])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    assert!(rule.source_v4_match_any, "any token dominates");
+    assert!(rule.source_v6_match_any);
+    let arr = rule.source_prefixes_v4.as_deref().expect("Some");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0].prefix_len(), 8);
+    // v6: book has no v6 prefixes -> None per §4.3 invariant.
+    assert!(rule.source_prefixes_v6.is_none());
+}
+
+#[test]
+fn test_policy_rule_v3_book_v6_only_yields_v4_none() {
+    // Test 15: rule cites a v6-only book and has no v4 literals.
+    // Assert source_prefixes_v4 = None (not Some([])), since the
+    // empty union short-circuits to None in build_rule_side_arc.
+    let books = [book(206, "v6-only", &[], &["2001:db8::/32"])];
+    let rules = [v3_rule("r-v6-book", &[206], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    assert!(
+        rule.source_prefixes_v4.is_none(),
+        "v6-only book contributes no v4 -> None, not Some([])"
+    );
+    let v6 = rule.source_prefixes_v6.as_deref().expect("Some");
+    assert_eq!(v6.len(), 1);
+}
+
+#[test]
+fn test_policy_rule_v3_destination_book_path() {
+    // Test 16: rule with destination_book_ids=[N], empty
+    // destination_literals. Mirrors test 5 but on the destination
+    // side — asserts symmetric handling.
+    let books = [book(207, "dst-book", &["10.0.0.0/8", "172.16.0.0/12"], &[])];
+    let rule_snap = v3_rule_full(
+        "r-dst-book",
+        &[],
+        &["any"],
+        &[207],
+        &[],
+    );
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &[rule_snap],
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    let arr = rule.destination_prefixes_v4.as_deref().expect("Some");
+    assert_eq!(arr.len(), 2);
+    assert!(rule.destination_prefixes_v6.is_none());
+}
+
+#[test]
+fn test_policy_rule_v3_book_zero_plus_non_zero() {
+    // Test 17: rule cites a book containing both 0.0.0.0/0 AND
+    // 10.0.0.0/8 (book's prefixes_v4 carries both per #1624
+    // BookEntry contract). Rule's parallel array inherits BOTH;
+    // source_v4_match_any becomes true via the book's /0
+    // contribution (book.v4.is_match_any()).
+    let books = [book(
+        208,
+        "book-zero-plus",
+        &["0.0.0.0/0", "10.0.0.0/8"],
+        &[],
+    )];
+    let rules = [v3_rule("r-bzp", &[208], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    assert!(
+        rule.source_v4_match_any,
+        "book containing /0 propagates match_any"
+    );
+    let arr = rule.source_prefixes_v4.as_deref().expect("Some");
+    assert_eq!(arr.len(), 2, "preserve both /0 and /8 entries");
+    let lens: Vec<u8> = arr.iter().map(|p| p.prefix_len()).collect();
+    assert!(lens.contains(&0), "must include /0");
+    assert!(lens.contains(&8), "must include /8");
+}
+
+#[test]
+fn test_policy_rule_v3_literal_zero_plus_non_zero() {
+    // Test 18: rule with literal source_literals=["0.0.0.0/0",
+    // "10.0.0.0/8"]. Rule-level mirror of book test 17.
+    // Parallel array preserves both entries; match_any becomes
+    // true via the literal /0 (PrefixSet collapses to MatchAny).
+    let rules = [v3_rule(
+        "r-lit-zp",
+        &[],
+        &["0.0.0.0/0", "10.0.0.0/8"],
+    )];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    assert!(rule.source_v4_match_any);
+    let arr = rule.source_prefixes_v4.as_deref().expect("Some");
+    assert_eq!(arr.len(), 2);
+    let lens: Vec<u8> = arr.iter().map(|p| p.prefix_len()).collect();
+    assert!(lens.contains(&0));
+    assert!(lens.contains(&8));
+}
+
+#[test]
+fn test_policy_rule_v3_duplicate_preservation() {
+    // Test 19: rule with literal "10.0.0.0/8" AND citing a book
+    // that ALSO contains "10.0.0.0/8". Parallel array contains
+    // the prefix TWICE (literal + book). Confirms the "no dedup
+    // at this layer; future LPM owns it" invariant from §4.3.
+    let books = [book(209, "dup-book", &["10.0.0.0/8"], &[])];
+    let rules = [v3_rule("r-dup", &[209], &["10.0.0.0/8"])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let rule = &state.rules[0];
+    let arr = rule.source_prefixes_v4.as_deref().expect("Some");
+    assert_eq!(
+        arr.len(),
+        2,
+        "duplicate must be preserved (literal + book = 2)"
+    );
+    // Both entries are 10.0.0.0/8.
+    for p in arr.iter() {
+        assert_eq!(p.prefix_len(), 8);
+    }
+}

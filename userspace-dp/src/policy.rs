@@ -147,6 +147,34 @@ pub(crate) struct PolicyRule {
     pub(crate) source_v6_match_any: bool,
     pub(crate) destination_v4_match_any: bool,
     pub(crate) destination_v6_match_any: bool,
+    /// #1623 Path B narrow (STAGED scaffolding) — parallel
+    /// canonical prefix arrays for a future Multi-Book LPM
+    /// builder, mirroring the #1624 BookEntry shape but with the
+    /// `Option<Arc<[T]>>` wrapper to avoid empty-Arc allocations
+    /// at high rule cardinality (NPO collapses
+    /// `Option<Arc<[T]>>` to the same 16 B as bare `Arc<[T]>`).
+    ///
+    /// `None` means "this side contributed no input prefixes"
+    /// (typically: source-any rule with no cited books). The
+    /// existing `source_v{4,6}_match_any` /
+    /// `destination_v{4,6}_match_any` booleans remain the SOLE
+    /// signal for any-side semantics — the parallel array is
+    /// INPUT prefix shape, NOT a complete semantic match set.
+    ///
+    /// Consumer contract: when `..._match_any` is `true`, the
+    /// parallel array `Some(arr)` (or `None`) is purely
+    /// diagnostic / build-hint and MUST NOT be used to narrow
+    /// the rule. The match-any flag dominates the semantic
+    /// match shape.
+    ///
+    /// Populated at parse-time as the union of (a) the rule's
+    /// own literal CIDRs and (b) each cited book's
+    /// `prefixes_v{4,6}`. NOT consumed by the hot path in this
+    /// PR (zero-touch on `evaluate_policy`).
+    pub(crate) source_prefixes_v4: Option<Arc<[PrefixV4]>>,
+    pub(crate) source_prefixes_v6: Option<Arc<[PrefixV6]>>,
+    pub(crate) destination_prefixes_v4: Option<Arc<[PrefixV4]>>,
+    pub(crate) destination_prefixes_v6: Option<Arc<[PrefixV6]>>,
     pub(crate) applications: Vec<ApplicationMatch>,
     /// Precompiled application matcher (protocol-indexed, exact-port sets).
     compiled_apps: CompiledApplications,
@@ -173,6 +201,13 @@ impl Default for PolicyRule {
             source_v6_match_any: true,
             destination_v4_match_any: true,
             destination_v6_match_any: true,
+            // #1623 Path B narrow: None = no operator-stated
+            // input prefixes for this side/family. Default rule
+            // is any-source-any-dest so all four are None.
+            source_prefixes_v4: None,
+            source_prefixes_v6: None,
+            destination_prefixes_v4: None,
+            destination_prefixes_v6: None,
             applications: Vec::new(),
             compiled_apps: CompiledApplications {
                 match_any: true,
@@ -203,6 +238,12 @@ impl Clone for PolicyRule {
             source_v6_match_any: self.source_v6_match_any,
             destination_v4_match_any: self.destination_v4_match_any,
             destination_v6_match_any: self.destination_v6_match_any,
+            // #1623 Path B narrow: Option<Arc<[T]>>::clone is
+            // None.clone()==None or Arc ref-count bump. Cheap.
+            source_prefixes_v4: self.source_prefixes_v4.clone(),
+            source_prefixes_v6: self.source_prefixes_v6.clone(),
+            destination_prefixes_v4: self.destination_prefixes_v4.clone(),
+            destination_prefixes_v6: self.destination_prefixes_v6.clone(),
             applications: self.applications.clone(),
             compiled_apps: self.compiled_apps.clone(),
             action: self.action,
@@ -481,22 +522,31 @@ pub(crate) fn parse_policy_state_with_counters(
             || !snap.destination_literals.is_empty();
 
         // Build literal prefix sets per side using the appropriate
-        // factory.
-        let (source_literal_v4, source_literal_v6) = if source_is_v3_shaped {
-            parse_v3_literal_set(&snap.source_literals)
-        } else {
-            let mut v4: Vec<PrefixV4> = Vec::new();
-            let mut v6: Vec<PrefixV6> = Vec::new();
-            for prefix in &snap.source_addresses {
-                parse_address(prefix, &mut v4, &mut v6);
-            }
-            (
-                PrefixSetV4::from_prefixes(v4),
-                PrefixSetV6::from_prefixes(v6),
-            )
-        };
-        let (destination_literal_v4, destination_literal_v6) = if destination_is_v3_shaped {
-            parse_v3_literal_set(&snap.destination_literals)
+        // factory. #1623 Path B narrow: capture the intermediate
+        // Vec<PrefixV{4,6}> for parallel-array population below.
+        let (source_literal_v4, source_literal_v6, src_lit_v4_vec, src_lit_v6_vec) =
+            if source_is_v3_shaped {
+                parse_v3_literal_set_capture(&snap.source_literals)
+            } else {
+                let mut v4: Vec<PrefixV4> = Vec::new();
+                let mut v6: Vec<PrefixV6> = Vec::new();
+                for prefix in &snap.source_addresses {
+                    parse_address(prefix, &mut v4, &mut v6);
+                }
+                (
+                    PrefixSetV4::from_prefixes(v4.clone()),
+                    PrefixSetV6::from_prefixes(v6.clone()),
+                    v4,
+                    v6,
+                )
+            };
+        let (
+            destination_literal_v4,
+            destination_literal_v6,
+            dst_lit_v4_vec,
+            dst_lit_v6_vec,
+        ) = if destination_is_v3_shaped {
+            parse_v3_literal_set_capture(&snap.destination_literals)
         } else {
             let mut v4: Vec<PrefixV4> = Vec::new();
             let mut v6: Vec<PrefixV6> = Vec::new();
@@ -504,8 +554,10 @@ pub(crate) fn parse_policy_state_with_counters(
                 parse_address(prefix, &mut v4, &mut v6);
             }
             (
-                PrefixSetV4::from_prefixes(v4),
-                PrefixSetV6::from_prefixes(v6),
+                PrefixSetV4::from_prefixes(v4.clone()),
+                PrefixSetV6::from_prefixes(v6.clone()),
+                v4,
+                v6,
             )
         };
 
@@ -537,15 +589,52 @@ pub(crate) fn parse_policy_state_with_counters(
                 .iter()
                 .any(|&i| state.books[i as usize].v6.is_match_any());
 
-        let mut rule = PolicyRule {
+        // #1623 Path B narrow: materialize the parallel-prefix
+        // arrays. Each is the union of (a) the rule's own literal
+        // CIDRs and (b) every cited book's prefixes_v{4,6} on
+        // that side. Returns None when both sources are empty.
+        let source_prefixes_v4 = build_rule_side_arc(
+            src_lit_v4_vec,
+            &source_book_idxs,
+            &state.books,
+            |book| &book.prefixes_v4,
+        );
+        let source_prefixes_v6 = build_rule_side_arc(
+            src_lit_v6_vec,
+            &source_book_idxs,
+            &state.books,
+            |book| &book.prefixes_v6,
+        );
+        let destination_prefixes_v4 = build_rule_side_arc(
+            dst_lit_v4_vec,
+            &destination_book_idxs,
+            &state.books,
+            |book| &book.prefixes_v4,
+        );
+        let destination_prefixes_v6 = build_rule_side_arc(
+            dst_lit_v6_vec,
+            &destination_book_idxs,
+            &state.books,
+            |book| &book.prefixes_v6,
+        );
+
+        // #1623 Path B narrow: pre-declare applications +
+        // compiled_apps as locals so the struct literal can name
+        // every field explicitly — this drops the
+        // ..PolicyRule::default() tail entirely and forces a
+        // compile error on any future field addition until the
+        // constructor is updated, eliminating the silent-zero-
+        // default hazard AGY r2 D raised.
+        let applications = parse_applications(&snap.application_terms);
+        let compiled_apps = CompiledApplications::from_matches(&applications);
+
+        let rule = PolicyRule {
             rule_id: rule_id.clone(),
             policy_id: snap.policy_id,
             from_zone: snap.from_zone.clone(),
             to_zone: snap.to_zone.clone(),
             scheduler_name: snap.scheduler_name.clone(),
             inactive: snap.inactive,
-            action: parse_action(&snap.action),
-            hit_counter: counter_store.rule_hit_counter(&rule_id),
             source_literal_v4,
             source_literal_v6,
             destination_literal_v4,
@@ -556,10 +645,15 @@ pub(crate) fn parse_policy_state_with_counters(
             source_v6_match_any,
             destination_v4_match_any,
             destination_v6_match_any,
-            ..PolicyRule::default()
+            source_prefixes_v4,
+            source_prefixes_v6,
+            destination_prefixes_v4,
+            destination_prefixes_v6,
+            applications,
+            compiled_apps,
+            action: parse_action(&snap.action),
+            hit_counter: counter_store.rule_hit_counter(&rule_id),
         };
-        rule.applications = parse_applications(&snap.application_terms);
-        rule.compiled_apps = CompiledApplications::from_matches(&rule.applications);
         let idx = state.rules.len();
         let is_global = rule.from_zone == "junos-global" || rule.to_zone == "junos-global";
         state.rules.push(rule);
@@ -591,7 +685,18 @@ pub(crate) fn parse_policy_state_with_counters(
 /// field. "any" token forces MatchAny on BOTH families (Codex r5
 /// F-r5-1 fix); empty input or no-any → MatchNone (via
 /// `from_v3_literals`).
-fn parse_v3_literal_set(literals: &[String]) -> (PrefixSetV4, PrefixSetV6) {
+///
+/// #1623 Path B narrow: returns the captured intermediate
+/// `Vec<PrefixV{4,6}>` alongside the PrefixSet so the caller can
+/// reuse them when populating the per-rule parallel prefix arrays.
+/// Cost: 2× `Vec::clone()` per rule on the parse path (cold). The
+/// alternative — threading `&mut Vec<...>` parameters through
+/// `PrefixSetV{4,6}::from_v3_literals` — is intrusive to the
+/// factory contract; the clone is acceptable per Codex r2/r3 +
+/// AGY r2/r3 cold-path approval.
+fn parse_v3_literal_set_capture(
+    literals: &[String],
+) -> (PrefixSetV4, PrefixSetV6, Vec<PrefixV4>, Vec<PrefixV6>) {
     let mut any_v4 = false;
     let mut any_v6 = false;
     let mut v4: Vec<PrefixV4> = Vec::new();
@@ -611,14 +716,51 @@ fn parse_v3_literal_set(literals: &[String]) -> (PrefixSetV4, PrefixSetV6) {
     let v4_set = if any_v4 {
         PrefixSetV4::MatchAny
     } else {
-        PrefixSetV4::from_v3_literals(v4)
+        PrefixSetV4::from_v3_literals(v4.clone())
     };
     let v6_set = if any_v6 {
         PrefixSetV6::MatchAny
     } else {
-        PrefixSetV6::from_v3_literals(v6)
+        PrefixSetV6::from_v3_literals(v6.clone())
     };
-    (v4_set, v6_set)
+    (v4_set, v6_set, v4, v6)
+}
+
+/// #1623 Path B narrow: materialize a per-rule per-side
+/// `Option<Arc<[T]>>` parallel prefix array.
+///
+/// Composes (a) the literal CIDRs parsed for this side (passed in
+/// as `lit_vec`, already moved/owned) and (b) the prefixes from
+/// each cited address book on this side (looked up via the
+/// `extractor` closure that returns `&Arc<[T]>` for the
+/// appropriate family).
+///
+/// Returns `None` if and only if the union is empty (no literals,
+/// no cited-book contributions on this side+family). This is the
+/// canonical "any side" representation — paired with the existing
+/// `..._match_any` flag for semantic match shape.
+fn build_rule_side_arc<T: Clone, F>(
+    mut lit_vec: Vec<T>,
+    book_idxs: &SmallVec<[u32; 8]>,
+    books: &[BookEntry],
+    extractor: F,
+) -> Option<Arc<[T]>>
+where
+    F: Fn(&BookEntry) -> &Arc<[T]>,
+{
+    for &idx in book_idxs.iter() {
+        let book = &books[idx as usize];
+        lit_vec.extend_from_slice(extractor(book));
+    }
+    if lit_vec.is_empty() {
+        None
+    } else {
+        // Arc::from(Vec<T>) (impl since Rust 1.45) allocates a
+        // fresh Arc-headed slice and moves the items out of the
+        // Vec. Going via .into_boxed_slice() first would add a
+        // wasted shrink-to-fit realloc.
+        Some(Arc::from(lit_vec))
+    }
 }
 
 fn parse_literal_cidr_into(
