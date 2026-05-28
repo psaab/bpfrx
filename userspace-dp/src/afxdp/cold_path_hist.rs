@@ -236,13 +236,14 @@ impl ClockSource {
 /// and the harness will TSC-gate the run out of the published table.
 ///
 /// Called once per worker at thread spawn AFTER `pthread_setaffinity_np`
-/// has pinned the worker to its core (Claude SMR r1 NIT 2).
+/// has pinned the worker to its core (Claude SMR r1 NIT 2). The probe is
+/// conservative: it only enables `Tsc` when every `/proc/cpuinfo` block
+/// reports `constant_tsc`, `nonstop_tsc`, and `rdtscp`.
 pub(in crate::afxdp) fn probe_clock_source() -> ClockSource {
     #[cfg(target_arch = "x86_64")]
     {
         let cpuinfo_ok = std::fs::read_to_string("/proc/cpuinfo")
             .map(|s| {
-                let first_block = s.split("\n\n").next().unwrap_or(&s);
                 // Codex code-r1 finding 2: rdtscp instruction support
                 // is NOT implied by constant_tsc/nonstop_tsc. Check it
                 // explicitly. Linux exposes the CPUID rdtscp feature
@@ -254,21 +255,30 @@ pub(in crate::afxdp) fn probe_clock_source() -> ClockSource {
                 // admin who sets a custom CPU model name containing
                 // any of these tokens would otherwise yield a false-
                 // positive probe.
-                let flags_line = first_block
-                    .lines()
-                    .find(|l| {
-                        let trimmed = l.trim_start();
-                        trimmed.starts_with("flags") || trimmed.starts_with("Features")
-                    })
-                    .and_then(|l| l.split(':').nth(1));
-                let Some(flags) = flags_line else {
-                    return false;
-                };
-                let tokens: std::collections::HashSet<&str> =
-                    flags.split_ascii_whitespace().collect();
-                tokens.contains("constant_tsc")
-                    && tokens.contains("nonstop_tsc")
-                    && tokens.contains("rdtscp")
+                let mut saw_any_block = false;
+                for block in s.split("\n\n").filter(|b| !b.trim().is_empty()) {
+                    saw_any_block = true;
+                    let flags_line = block
+                        .lines()
+                        .find(|l| {
+                            let trimmed = l.trim_start();
+                            trimmed.starts_with("flags")
+                                || trimmed.starts_with("Features")
+                        })
+                        .and_then(|l| l.split(':').nth(1));
+                    let Some(flags) = flags_line else {
+                        return false;
+                    };
+                    let tokens: std::collections::HashSet<&str> =
+                        flags.split_ascii_whitespace().collect();
+                    if !(tokens.contains("constant_tsc")
+                        && tokens.contains("nonstop_tsc")
+                        && tokens.contains("rdtscp"))
+                    {
+                        return false;
+                    }
+                }
+                saw_any_block
             })
             .unwrap_or(false);
         let clocksource_ok = std::fs::read_to_string(
@@ -647,7 +657,7 @@ mod tests {
 
     #[test]
     fn bucket_formula_matches_existing_16_bucket_below_saturation() {
-        // Sanity: for ns up to 2^24, the 24-bucket formula matches the
+        // Sanity: for ns up to 2^23, the 24-bucket formula matches the
         // 16-bucket bucket_index_for_ns (which clamps at 15). The 16-
         // bucket fn lives in umem; we re-implement the math here only
         // to verify equivalence in the shared subrange.
@@ -656,13 +666,11 @@ mod tests {
             let b24 = bucket_index_for_ns_24(ns);
             let clz = (ns | 1).leading_zeros() as i32;
             let b16 = ((54 - clz).max(0) as usize).min(15);
-            if power <= 24 {
-                // The two formulas agree until the 16-bucket fn clamps.
-                let expected_unclamped = ((54 - clz).max(0) as usize).min(23);
-                assert_eq!(b24, expected_unclamped, "ns=2^{power}");
-                if expected_unclamped < 16 {
-                    assert_eq!(b16, b24);
-                }
+            // The two formulas agree until the 16-bucket fn clamps.
+            let expected_unclamped = ((54 - clz).max(0) as usize).min(23);
+            assert_eq!(b24, expected_unclamped, "ns=2^{power}");
+            if expected_unclamped < 16 {
+                assert_eq!(b16, b24);
             }
         }
     }
