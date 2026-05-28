@@ -37,5 +37,8 @@ results by ID if the Companion CLI session state is lost
 ### Round 6 (v3.1 post-patch hostile re-read)
 
 - **Claude SMR r6**: `docs/pr/1609-multistage-policy-dag/claude-smr-plan-r6.md` — PLAN-READY-WITH-NITS. v3.1 §13 P1-P10 patches close 13 of 15 round-1 findings (2 deferred — F-r5-2 galloping merge is Step 2 problem; F-r5-3 PseudoBook dedup optional Step 2). 5 residual nits N1-N5 are not Step-1-blocking.
-- **Codex r2**: `task-mpp2jzhy-m057in` (dispatched 2026-05-27 against SHA e7dd86ed5)
-- **AGY r2**: `adversarial-review-mpp2kcas-nksaq7` (dispatched 2026-05-27 against SHA e7dd86ed5)
+- **Codex r2**: `task-mpp2jzhy-m057in` — PLAN-NEEDS-MAJOR (3 blocking: P2 dst-pseudo-id leak into src lookup; v3.1 addendum contradicts stale v3 text; Step 1 scope incoherent vs acceptance criteria)
+- **AGY r2**: `adversarial-review-mpp2kcas-nksaq7` — PLAN-NEEDS-MAJOR (10 issues incl: NEW CRITICAL — Stage 4 master-fallback creates DoS amplification by scanning 1M rules instead of just emitted candidates; P8 push-down missing child propagation; P9 LeafArcPool unrealistic dedup claim; heap-fragmentation latency in V6 build)
+- **Claude SMR r7**: `docs/pr/1609-multistage-policy-dag/claude-smr-plan-r7.md` — PLAN-NEEDS-MAJOR (3-of-3 convergence)
+
+**Round-7 verdict**: 3-of-3 PLAN-NEEDS-MAJOR on v3.1. **Third major-iteration kill** per user contract (v2 KILL, v3 NEEDS-MAJOR, v3.1 NEEDS-MAJOR). Escalating to user per "do NOT spawn v4 without user authorization". Architectural axis remains sound; design surface depth requires more careful upfront work or scope reduction. Paths from here: (A) v3.2 + r3 closing all 13 round-2 findings; (B) STAGED — narrow Step 1 to BookEntry + iter_prefixes scaffolding only; (C) user decision.
