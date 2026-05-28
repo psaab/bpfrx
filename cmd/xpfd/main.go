@@ -100,13 +100,17 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	// Forward the validated mask to the daemon. Pass by pointer so the
-	// daemon (and userspace-dp) can distinguish "operator set this"
-	// (non-nil) from "use built-in default" (nil). Currently we always
-	// set the pointer because we always parsed the flag — but we use
-	// `effectiveMask` rather than `*coldPathSampleMask` so the 1-in-1
-	// override takes effect.
-	maskPtr := effectiveMask
+	// Forward the validated mask to the daemon only when the operator
+	// explicitly provided a cold-path flag. nil means "use the
+	// userspace-dp built-in default" so older daemons that omit the
+	// flag never accidentally serialize 0 and trigger 1-in-1 sampling.
+	var coldPathMaskPtr *uint64
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "cold-path-sample-mask" || f.Name == "enable-cold-path-1-in-1-sampling" {
+			m := effectiveMask
+			coldPathMaskPtr = &m
+		}
+	})
 
 	// Set up structured logging
 	logLevel := slog.LevelInfo
@@ -123,7 +127,7 @@ func main() {
 		APIAddr:            *apiAddr,
 		GRPCAddr:           *grpcAddr,
 		Version:            version,
-		ColdPathSampleMask: &maskPtr,
+		ColdPathSampleMask: coldPathMaskPtr,
 	})
 
 	if err := d.Run(context.Background()); err != nil {

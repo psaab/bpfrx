@@ -59,20 +59,23 @@ pub(crate) fn worker_loop(
     // pairs); workers calibrate concurrently across cores so the
     // wall-clock startup overhead stays at ~10 ms total.
     //
-    // Per plan v4 §4.6: probe_clock_source + per-worker calibrate
-    // run once at startup. The /proc/cpuinfo + /sys probes are
-    // cheap (~50 µs); the calibrate sleeps 10 ms for an Instant↔TSC
-    // ratio measurement plus ~80 µs of back-to-back rdtscp pairs
-    // for the wrapper baseline. Workers calibrate concurrently
-    // across cores so wall-clock startup stays at ~10 ms.
+    // Per plan v4 §4.6: probe_clock_source runs once; calibration is
+    // skipped (returning 0) when the clock source is not TSC, avoiding
+    // redundant /proc/cpuinfo + /sys probes inside the calibrators.
     let cp_clock_source =
         crate::afxdp::cold_path_hist::probe_clock_source();
-    let cp_ns_per_tsc_q32 =
-        crate::afxdp::cold_path_hist::calibrate_ns_per_tsc_q32();
-    let cp_wrapper_baseline =
-        crate::afxdp::cold_path_hist::calibrate_wrapper_baseline_ns(
-            cp_ns_per_tsc_q32,
-        );
+    let (cp_ns_per_tsc_q32, cp_wrapper_baseline) =
+        if cp_clock_source == crate::afxdp::cold_path_hist::ClockSource::Tsc {
+            let q32 =
+                crate::afxdp::cold_path_hist::calibrate_ns_per_tsc_q32();
+            let baseline =
+                crate::afxdp::cold_path_hist::calibrate_wrapper_baseline_ns(
+                    q32,
+                );
+            (q32, baseline)
+        } else {
+            (0, 0)
+        };
     // Single-line startup log per worker (~6 lines total per daemon
     // startup). Goes to journald via stderr per project logging rules.
     eprintln!(

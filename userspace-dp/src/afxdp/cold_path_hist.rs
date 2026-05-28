@@ -195,7 +195,7 @@ pub(in crate::afxdp) fn sample_tsc_end() -> u64 {
 /// (WorkerColdPathCounters) makes the offset of subsequent fields
 /// implementation-defined — the compiler may choose a 1, 2, or 4-byte
 /// representation. `#[repr(u8)]` pins this to 1 byte so the layout
-/// math in plan §4.1 (clock_source at offset 24, alias_seen at 25)
+/// math in plan §4.1 (clock_source at offset 32, alias_seen at 33)
 /// holds under the C ABI rules the rest of the struct relies on.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -606,18 +606,19 @@ impl WorkerColdPathAtomics {
 /// packing, which would destroy the hot-cacheline isolation.
 ///
 /// Verified layout (AGY r2 axis 2 + Claude SMR r3 cross-check):
-///   [0..7]     sample_phase
-///   [8..15]    ns_per_tsc_q32
-///   [16..23]   wrapper_ns_baseline
-///   [24]       clock_source (enum repr-default u8)
-///   [25..40]   alias_seen   [bool; 16] (alignment 1, no padding)
-///   [41..47]   PADDING                  (to align next u64 array)
-///   [48..175]  first_key    [u64; 16]
-///   [176..303] sum_ns       [u64; 16]
-///   [304..431] samples      [u64; 16]
-///   [432..3503] buckets     [[u64; 24]; 16]
+///   [0..7]      sample_phase
+///   [8..15]     ns_per_tsc_q32
+///   [16..23]    wrapper_ns_baseline
+///   [24..31]    wrapper_underflow_count
+///   [32]        clock_source (enum #[repr(u8)])
+///   [33..48]    alias_seen   [bool; 16] (alignment 1, no padding)
+///   [49..55]    PADDING                  (to align next u64 array)
+///   [56..183]   first_key    [u64; 16]
+///   [184..311]  sum_ns       [u64; 16]
+///   [312..439]  samples      [u64; 16]
+///   [440..3511] buckets      [[u64; 24]; 16]
 ///
-/// First 48 bytes fit in cacheline 0 ([0..63]).
+/// First 49 bytes fit in cacheline 0 ([0..63]).
 #[repr(C)]
 #[derive(Clone, Debug)]
 pub(in crate::afxdp) struct WorkerColdPathCounters {

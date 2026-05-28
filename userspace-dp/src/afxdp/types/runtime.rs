@@ -325,12 +325,13 @@ pub(in crate::afxdp) struct WorkerContext<'a> {
     pub(in crate::afxdp) peer_worker_commands: &'a [Arc<Mutex<VecDeque<WorkerCommand>>>],
     pub(in crate::afxdp) dnat_fds: &'a DnatTableFds,
     pub(in crate::afxdp) rg_epochs: &'a [AtomicU32; MAX_RG_EPOCHS],
-    /// #1620: cold-path latency histogram sample mask. Set once at
-    /// worker startup from `ConfigSnapshot.cold_path_sample_mask`.
-    /// `0xff` (1-in-256) by default; `0` (1-in-1) when operator
-    /// explicitly enables 1-in-1 sampling for the bounded-cohort
-    /// microbench. Read on every session-miss packet at the
-    /// poll_descriptor pre-eval gate.
+    /// #1620: cold-path latency histogram sample mask. Loaded once
+    /// per poll cycle from `ForwardingState.cold_path_sample_mask`
+    /// (via ArcSwap); can change across snapshot applies. `0xff`
+    /// (1-in-256) by default; `0` (1-in-1) when operator explicitly
+    /// enables 1-in-1 sampling for the bounded-cohort microbench.
+    /// Read on every session-miss packet at the poll_descriptor
+    /// pre-eval gate.
     pub(in crate::afxdp) cold_path_sample_mask: u64,
 }
 

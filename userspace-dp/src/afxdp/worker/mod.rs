@@ -148,9 +148,9 @@ pub(crate) struct BindingWorker {
     /// Co-located with `flow` because the policy-eval slow path
     /// already touches `binding.flow` — sharing cachelines avoids
     /// a compulsory L1 miss on `binding.cold_path.sample_phase`.
-    /// Touched only by the owning worker thread; published to the
-    /// sibling `WorkerColdPathAtomics` array on the ~1s tick via
-    /// `worker_runtime.rs::publish`.
+    /// Touched only by the owning worker thread. #1621 will add the
+    /// sibling `WorkerColdPathAtomics` array and the ~1s tick publish
+    /// hook in `worker_runtime.rs::publish`.
     pub(crate) cold_path: super::cold_path_hist::WorkerColdPathCounters,
     /// #1376: per-worker/per-binding mirror sampler. Reset on worker
     /// restart and intentionally not synchronized across workers.
