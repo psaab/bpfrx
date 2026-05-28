@@ -35,6 +35,13 @@ Persistent record per `feedback_codex_session_loss_continuation`.
 - **AGY**: adversarial-review-mppm7cic-qw93ab (PLAN-READY)
 - **Claude SMR**: claude-smr-plan-r4.md (PLAN-READY on v4)
 
+## Code review round 1 (PR #1631 @ 0bb5d9d83)
+
+- **Codex**: task-mppnbsnc-7h47ps (dispatched 2026-05-28)
+- **AGY**: adversarial-review-mppnchnm-x84qra (dispatched 2026-05-28)
+- **Copilot**: @copilot review triggered on PR comment
+- **Claude SMR**: claude-smr-code-r1.md (MERGE-READY)
+
 ## Round 5 (plan v4 + doc cleanup)
 
 - **Claude SMR**: claude-smr-plan-r5.md (PLAN-READY post doc cleanup)
