@@ -10,7 +10,7 @@ Revision history:
   - **Arc construction:** `Arc::from(lit_vec.into_boxed_slice())` → `Arc::from(lit_vec)`. Codex r3 correctly noted that `Arc<[T]>` allocates its own ref-counted allocation and moves elements out of the Vec; the `into_boxed_slice()` step adds a wasted shrink-to-fit realloc before Arc allocates. Direct `Arc::from(Vec<T>)` (impl since Rust 1.45) is correct.
   - **Add test 18 literal-/0-plus-non-/0** (Codex r3 finding 1) — rule with `source_literals: ["0.0.0.0/0", "10.0.0.0/8"]` (LITERAL both, NOT `any` token). Assert `source_prefixes_v4 = Some([/0, /8])` AND `source_v4_match_any = true` (PrefixSet collapses to MatchAny due to /0 presence).
   - **Add test 19 duplicate preservation** (Codex r3 finding 1) — rule with literal `10.0.0.0/8` AND a cited book that also contains `10.0.0.0/8`. Assert the parallel array contains the prefix TWICE (literal once + book once), confirming the "no dedup at this layer" invariant from §4.3.
-  - **Fix `PrefixV4` / `PrefixV6` size accounting** (Codex r3 finding 3): `PrefixV4` is `u32 addr + u32 mask + u8 prefix_len + pad = 12 B`. `PrefixV6` is `u128 addr + u128 mask + u8 prefix_len + pad = 40 B` (NOT 24 B as v4 §2.1 claimed). Update accounting.
+  - **Fix `PrefixV4` / `PrefixV6` size accounting** (Codex r3 finding 3 + Codex r2-code 2026-05-28 self-consistency correction): `PrefixV4` is `u32 addr + u32 mask + u8 prefix_len + pad = 12 B`. `PrefixV6` is `u128 addr + u128 mask + u8 prefix_len + pad = 48 B` (16-byte alignment; NOT 24 B as v4 §2.1 originally claimed; NOT 40 B as v5/v6 transitional estimates wrongly claimed). Update accounting.
   - **`size_of` assertion implementation** (AGY r3 + Codex r3): use compile-time `const _: [(); 16] = [(); std::mem::size_of::<...>()];` pattern inside test 13 to avoid the static_assertions crate dependency.
 
 - v4: addressed Codex r2 PLAN-NEEDS-MINOR + AGY r2 PLAN-NEEDS-MINOR + Claude SMR r3:
@@ -142,7 +142,7 @@ but Codex r1 correctly notes the cardinality difference (books
 
 **Realistic 1M-rule total memory cost (corrected):** +64 MB
 struct growth + ~300 MB Arc allocations + ~120 MB book-prefix
-data replication (10 prefixes × 12 B v4 + 40 B v6 mix × 1M rules)
+data replication (10 prefixes × 12 B v4 + 48 B v6 mix × 1M rules)
 = **~450-600 MB total**. Within 8-16 GB VM budget. PLAN-KILL on
 this axis was rejected by both r2 reviewers (and r3 Codex
 explicitly approved as foundation cost); foundation work shipped
