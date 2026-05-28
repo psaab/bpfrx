@@ -1,6 +1,8 @@
 # #1611 — cold-path flooder runner body (AF_PACKET + sendmmsg)
 
-**Status**: DRAFT v1 — pending adversarial plan review.
+**Status**: DRAFT v1 patched — Claude SMR r1 PLAN-NEEDS-MINOR
+items inlined; Codex + AGY plan reviews in flight at commit
+0c491ad9831. Will mark as v2 in the next commit.
 
 ## Issue framing
 
@@ -85,6 +87,14 @@ runner body.
 
 ### In scope for this PR
 
+**Topology note** (Claude SMR r1 axis 9): the flooder runs on
+`loss:cluster-userspace-host` and the AF_PACKET TX traffic
+arrives at the firewall via normal Ethernet. The firewall-side
+AF_XDP RX socket on `ge-0-0-1` sees every frame — AF_PACKET
+TX and AF_XDP RX live on independent kernel paths on the two
+ends of the wire. The flooder is NOT trying to inject directly
+into an AF_XDP socket on the same host as the dataplane.
+
 1. **AF_PACKET SOCK_RAW socket setup** on `--iface`:
    - `socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))` — caller
      needs `CAP_NET_RAW`; refuse to start otherwise with a
@@ -93,7 +103,10 @@ runner body.
      sll_protocol=htons(ETH_P_ALL), sll_ifindex=<idx> }`.
    - `SO_SNDBUF` set to `frame_bytes * batch * 256` to absorb
      burst submission.
-   - Resolve `--iface` to ifindex via `if_nametoindex(3)`.
+   - Resolve `--iface` to ifindex via `if_nametoindex(3)`. If
+     it returns 0 (the documented "not found" sentinel), fail
+     with `"interface '<name>' not found — check `ip link show`"`.
+     No implicit fallback (Claude SMR r1 MINOR-3).
    - Auto-fill `args.src_mac` from `ioctl(SIOCGIFHWADDR)` if the
      CLI default `[0; 6]` is in effect.
    - When `args.dst_mac` is still default `[0xff; 6]` (broadcast),
@@ -158,20 +171,31 @@ runner body.
    ```
    IPv4 header checksum: compute once per packet via folded 16-bit
    one's-complement sum over the 20-byte header. Cheap (~5 ns).
-   ID field randomized from the same xorshift stream — keeps
-   the IPv4 fragment-reassembly mid-layer from treating
-   identical-ID packets as fragment dupes.
+   ID field randomized from the same xorshift stream. With
+   IPv4 flags=DF (Don't Fragment) set, per RFC 6864 §4.2
+   "atomic datagram" semantics the ID field is unconstrained
+   — random is fine and no kernel reassembly / rate-limit path
+   keys off duplicates (Claude SMR r1 MINOR-2).
 
-4. **sendmmsg(batch=32)** loop:
+4. **sendmmsg(batch=32)** loop (Claude SMR r1 MINOR-1 wording):
    - One `mmsghdr` array of size `batch` allocated once, before the
      hot loop. Each `mmsghdr` points to a per-slot `iovec` pointing
      to a per-slot 64-byte frame buffer. Reuse buffer slots — only
      the variable fields (src IP, src/dst port, IPv4 csum) need
      mutation per packet.
-   - `sendmmsg(fd, msgs, batch, 0)` returns count of submitted
-     packets. Track partial submissions: if N < batch, advance the
-     PRNG counter by N (not batch) and resubmit from offset N+1
-     next iteration. EAGAIN ⇒ short retry; EINTR ⇒ resubmit.
+   - Per-iteration: PRNG-refill all `batch` slots; call
+     `sendmmsg(fd, msgs.as_mut_ptr(), batch as u32, 0)` which
+     returns N ∈ [0, batch] on success or -1 on hard error.
+   - Per `man 2 sendmmsg`: the first N messages in `msgvec` were
+     sent successfully; the kernel never partially-sends a single
+     message. On return value N:
+     `tx_packets += N; if N == batch { tx_batches += 1; } else { err_partial += 1; }`.
+     Refill from scratch on the next iteration — the per-packet
+     PRNG state already advanced N times during prepare, so no
+     "re-queue" is needed.
+   - EAGAIN ⇒ short retry (5ms backoff); EINTR ⇒ immediate
+     resubmit; EPERM ⇒ hard exit with the CAP_NET_RAW hint
+     message; other errno ⇒ log + count as `err_other`.
    - Bookkeeping per second on a separate thread? No — keep
      single-threaded; print a JSON-line every 1s from the same loop
      (cost: 1 `clock_gettime` per packet on the rate-check branch,
