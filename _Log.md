@@ -4142,3 +4142,9 @@ top.
 - **Timestamp**: 2026-05-27 (UTC)
   - **Action**: Copilot code review on PR #1613 raised 6 inline findings: (1) file header comment said "bounded default" but code defaults to unbounded — fixed comment; (2) unbounded default spans 65535 exclude one value, switched to 65536 (cardinality semantics) + unified all span types to u32; (3) zero-span and zero/oversized-batch validation added; (4) --dst-mac help text now notes step-2 will do ARP-resolve; (5) removed Cargo.lock from .gitignore to match repo convention (xsk-repro, userspace-dp, userspace-xdp all commit lockfile); (6) plan.md flag surface now tagged with [step-1 ✓] vs [step-2 #1611] per-flag. Added new test unbounded_default_uses_full_2_to_16_spans (7/7 cargo tests pass).
   - **File(s)**: test/incus/cold-path-flooder/src/main.rs, test/incus/cold-path-flooder/.gitignore, test/incus/cold-path-flooder/Cargo.lock (new — tracked), docs/pr/1607-hw-ceiling-microbench/plan.md
+
+## 2026-05-27 — #1609 v2 plan written (Multi-Book LPM architectural pivot)
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Wrote v2 plan from the Multi-Book LPM architectural pivot (AGY r1 + Codex r1 + Claude SMR r1+r2 convergence). v2 supersedes v1; v1 KILLED for 320 GB RuleBitSet memory blowup. Staged delivery: Step 1 (this PR) = Multi-Book LPM v4 primitive + feature-flag scaffold; Step 2 (follow-up) = full multi-stage hot path; Step 3 (follow-up) = Junos CLI knob + production default-flip gated on #1612. User override accepted: architecture ships now behind feature flag default-OFF; empirical ≥10× claim gated on #1612 measurement.
+  - **File(s)**: docs/pr/1609-multistage-policy-dag/plan.md (v2 rewrite)

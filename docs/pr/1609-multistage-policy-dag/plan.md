@@ -1,47 +1,53 @@
-# Plan v1: Multi-stage policy DAG (#1609)
+# Plan v2: Multi-Book LPM policy DAG (#1609)
 
-**Status**: v1 — first draft for hostile quad-review (Codex + AGY +
-Copilot + Claude SMR). Open architectural questions deliberately
-left unresolved for reviewers to converge on.
+**Status**: v2 — starts from the convergent Multi-Book LPM
+architectural pivot AGY r1 delivered in plan-review round 1. v1
+PLAN-NEEDS-MAJOR + BLOCKED determination is preserved at the bottom
+of this file for historical reference. v2 supersedes v1 entirely.
 
-## 0. Honest framing
+**User override** (2026-05-28): proceed with the architectural work
+even though #1612 (Scale Target measurement) has not yet ratified
+the structural ≥10× speedup claim at 1M rules. Plan v2 ships the
+architecture behind a feature flag defaulting OFF; production
+enablement remains gated on #1612 once that measurement lands.
 
-This PR replaces the linear scan inside `evaluate_policy_result_with_len`
-at `userspace-dp/src/policy.rs:660-693` with a **multi-stage decision
-DAG** built at config-apply time. The goal is to bound cold-path
-policy evaluation at 1M rules to ≤ ~270-500 ns per packet, which the
-linear scan cannot achieve at any rule count above a few hundred.
+**Staged delivery** (acknowledged risk-management): this v2 ships
+in stages. **Step 1 (this PR)** is the Multi-Book LPM v4 primitive
++ feature-flag wiring + property tests at 10/100/1K/10K rule
+counts. **Step 2** (separate follow-up issue) wires the full
+multi-stage decision DAG (Stage 2 protocol/port prune, Stage 3
+multi-book LPM intersection, Stage 4 bucket scan with galloping
+merge). **Step 3** (separate follow-up) is the Junos
+`cos.policy.lookup` knob + production enablement gated on #1612.
+This is to keep the PR reviewable and the smoke-test surface
+small. The "structural ≥10× speedup" claim is the goal of the full
+stack; Step 1 alone delivers only the LPM primitive.
 
-This is **NOT** a JIT (Cranelift was killed at #1605). It is classical
-data-structure work: pre-build per-zone-pair pruning indices at
-config-apply, freeze, ArcSwap-publish.
+## 0. Honest framing (kept from v1, updated)
 
-The honest framing matters because the empirical justification at
-1M rules is **not yet available**:
+This work replaces the linear scan inside
+`evaluate_policy_result_with_len` at `userspace-dp/src/policy.rs:648-694`
+with a **multi-stage decision DAG** built at config-apply time. The
+goal is to bound cold-path policy evaluation at 1M rules to within
+the per-packet budget that the linear scan cannot achieve at any
+rule count above a few hundred.
 
-- **#1611 (cold-path flooder runner body) is OPEN.** No AF_PACKET
-  flood harness exists on master today.
-- **#1612 (Scale Target measurement at 10/100/1K/10K rules) is OPEN.**
-  No `docs/userspace-jit-design.md` Scale Target table is populated;
-  the four tables (A1/A2/B1/B2) remain TBD on master.
+This is **NOT** a JIT (Cranelift was killed at #1605). It is
+classical data-structure work.
 
-This plan therefore frames Stage 1-4 **structurally** — bounded by
-construction, not by measured ns numbers. Whether the structural
-ceiling fits the 270 ns/packet budget at 1M rules is **the open
-empirical question** that depends on #1611+#1612 landing.
+**Empirical-grounding deferral** (Codex F7 + user override):
 
-If the reviewers converge on "the empirical justification cannot be
-hand-waved; this plan must wait on #1612 numbers", that is a valid
-BLOCKED outcome and we report it back to the coordinator.
+- **#1611** (cold-path flooder runner body) — ✓ MERGED (PR #1616
+  squash `6c26c40e6`).
+- **#1612** (Scale Target measurement at 10/100/1K/10K rules) —
+  ⏳ blocked on #1615 (container generator caps at ~870K pps; needs
+  ≥2.5M pps to measure cold-path correctly).
+- **#1615** (flooder multi-thread + virtio) — ⏳ in flight.
 
-If the reviewers converge on "the structural bounds + small synthetic
-microbench at 1K rules give enough confidence to ship the
-implementation now, while #1611+#1612 finish in parallel", then we
-proceed under that contract: the PR adds the DAG, a small synthetic
-microbench at 1K rules confirming the ordering (DAG < linear by ≥10×
-at that rule count), and updates the design doc Phase 4 row to
-"DAG architecture committed; Scale Target table population
-deferred to #1612".
+The architecture ships now under a feature flag (`policy_dag_enable`
+field on the wire, default `false`). Production enablement requires
+#1612 numbers to ratify the ≥10× claim before flipping the default.
+The PR body MUST state this explicitly.
 
 ## 1. Background
 
@@ -56,70 +62,58 @@ if let Some(indices) = state.zone_pair_index.get(&key) {
         if let Some(result) = try_match_rule(
             &state.rules[idx], state, src_ip, dst_ip, protocol,
             src_port, dst_port, packet_len,
-        ) {
-            return result;
-        }
+        ) { return result; }
     }
 }
 for &idx in &state.global_indices {
-    if let Some(result) = try_match_rule(
-        &state.rules[idx], ...
-    ) { return result; }
+    if let Some(result) = try_match_rule(&state.rules[idx], ...) {
+        return result;
+    }
 }
 PolicyEvaluationResult { action: state.default_action, policy_id: 0 }
 ```
 
 Phase 2 (already shipped) is the `zone_pair_index` lookup — that's
-O(1). What's NOT O(1) is the inner `for &idx in indices` loop. At
-1M total rules with 20 zone pairs, the indices vector inside any one
-zone pair is up to ~50K. Each iteration calls `try_match_rule` which
-checks:
-- `rule.compiled_apps.matches(protocol, src_port, dst_port)` — O(1) hash + small range scan,
-- `rule.source_literal_v4.contains(src) || any book.contains(src)` — `PrefixSetV4` lookup (#923) per book,
-- same for destination.
-
-At 50K rules per zone-pair × ~5 ns per `try_match_rule` (#923 trie
-contains is dominated by L1-i miss + chain of pointer chases) =
-~250 µs/packet, vs 270 ns budget. **3 orders of magnitude off.**
+O(1). What's NOT O(1) is the inner per-`try_match_rule` walk through
+50K candidate rules at 1M total rule scale. Each `try_match_rule`
+checks application port/proto + per-book PrefixSet contains for src
+and dst IPs. The result is ~250 µs/packet vs the project's ~270 ns
+budget. 3 orders of magnitude off.
 
 ### 1.2 Phase 2 baseline + foundational pieces now landed
 
 - **#1606 (PR #1610 squash 1c409b0f)** — `BookEntry` table is now
   deduplicated; rules cite books by dense u32 index
-  (`source_book_idxs: SmallVec<[u32; 8]>`). Memory-cost of 100K
+  (`source_book_idxs: SmallVec<[u32; 8]>`). Memory cost of 100K
   rules × 1K CIDRs is no longer the 1.6 TB blocker. This is a hard
-  prerequisite for Stage 3 LPM trie sharing.
-- **#1607 step-1 (PR #1613 squash 260ff8721c)** — cold-path flooder
-  skeleton + counter scaffolding shipped. Histogram counters at
-  `xpf_userspace_worker_cold_path_ns_bucket{...}` exist. **Empirical
-  numbers not yet produced.**
+  prerequisite for the Multi-Book LPM.
+- **#1611 (PR #1616 squash 6c26c40e6)** — cold-path flooder
+  runner body shipped. AF_PACKET + sendmmsg + QDISC_BYPASS path
+  works at ~870K pps. Multi-thread + virtio work in #1615 to push
+  past 2.5M pps.
 - **#1431** — CACHE-KEY INVARIANT. Every match dimension on
-  `FilterTerm` / `FirewallTermSnapshot` is classified IN cache key or
-  path-(b). The same discipline applies here: each DAG stage's
-  pruning predicate must be a cache-key dimension (5-tuple), and
-  any per-packet field that isn't (DSCP, TCP flags, IHL, fragment)
-  stays out of the Stage 1-3 pruning and lands in the bucket
-  scan (Stage 4).
-- **#923** — `PrefixSetV4/V6::Trie` is a per-set uncompressed
-  binary trie. Per-rule binary trie is what we have today; multi-rule
-  shared LPM is what this plan adds.
+  `FilterTerm` / `FirewallTermSnapshot` is classified IN cache key
+  or path-(b). The same discipline applies to the DAG: Stage 2/3
+  pruning predicates must be strict 5-tuple; any per-packet field
+  that isn't (DSCP, TCP flags, IHL, fragment) stays out of Stage 2/3
+  and lands in Stage 4.
 
 ### 1.3 What this plan does NOT change
 
-- **Wire protocol** is foundation from #1606 — no new fields, no
-  new versions. The DAG is constructed from the existing
-  `PolicyState` shape (rules + books + zone_pair_index).
-- **HA session sync** — sessions still sync the established-flow
+- **Wire protocol** is foundation from #1606 — no new fields on
+  `AddressBookSnapshot`, no version bump. The DAG is constructed
+  from the existing snapshot shape.
+- **HA session sync** — sessions still sync established-flow
   decisions. Policy evaluation reruns at session install time on
   the receiving node; the DAG is constructed during snapshot apply
-  on both nodes.
+  on both nodes from the synchronized config.
 - **Address-book layout** — books continue to be referenced by
-  dense u32 index. Stage 3 builds **shared** `Arc<MultiRuleLpm>`
-  per book, NOT per rule.
+  dense u32 index. Shared Multi-Book LPM is built ONCE per snapshot,
+  not per book.
 - **Flow cache** — the DAG is cold-path-only. Established flows
   continue to bypass policy evaluation entirely.
 
-## 2. Architecture: the four stages
+## 2. Architecture: Multi-Book LPM + 4 stages
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -130,460 +124,671 @@ contains is dominated by L1-i miss + chain of pointer chases) =
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ Stage 2: protocol + dst-port prune                           │
-│   Per zone-pair, indexed by protocol byte:                   │
-│     proto_to_buckets: [Option<Stage2ProtoBucket>; 256]       │
-│   Inside a proto bucket:                                     │
-│     exact_dst_ports: FxHashMap<u16, Vec<RuleId>>             │
-│     dst_port_ranges: SortedRanges (small-array bisect)       │
-│   Output: Vec<RuleId> (small — bounded by K_after_stage2)    │
+│ Stage 2: protocol + dst-port prune (per zone-pair)           │
+│   proto_to_buckets: [Option<Stage2ProtoBucket>; 256]         │
+│   inside a proto bucket:                                     │
+│     exact_dst_port_to_rules: FxHashMap<u16, Arc<[u32]>>      │
+│     range_terms: Vec<(PortRange, Arc<[u32]>)> sorted-by-low  │
+│     any_port_rules: Arc<[u32]>  // any-src + any-dst         │
+│   any_proto_rules: Arc<[u32]>                                │
+│   Output: 1-3 sorted ascending `&[u32]` slices               │
 └──────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ Stage 3: source + destination CIDR membership intersection   │
-│   Per-book multi-rule LPM index:                             │
-│     Arc<BookMultiRuleLpm> per BookEntry — built ONCE         │
-│     contains(ip) → fixed-size bit-set of RuleIds that cite   │
-│     this book and whose CIDRs in this book cover `ip`.       │
-│   Rule eligibility = AND of source-side and dest-side bit-   │
-│   sets, restricted to candidates from Stage 2.               │
+│ Stage 3: Multi-Book LPM intersection                         │
+│   Global per-address-family Multi-Book LPM:                  │
+│     MultiBookLpmV4 (DIR-24-8): each level-0 / level-1 entry  │
+│       stores Arc<[u16]> book_indices (sorted ascending).     │
+│     MultiBookLpmV6 (Poptrie or DIR-24-8 over /48):           │
+│       same shape but over u128 → Arc<[u16]> book_indices.    │
+│   Per-book sorted citation arrays:                           │
+│     book.rules_citing_as_source:      Arc<[u32]>  (sorted)   │
+│     book.rules_citing_as_destination: Arc<[u32]>  (sorted)   │
+│   Lookup:                                                    │
+│     1. src LPM(src_ip) → &[u16] src_books                    │
+│     2. dst LPM(dst_ip) → &[u16] dst_books                    │
+│     3. Union per-book citation arrays via galloping k-way    │
+│        merge into per-worker scratch (sorted ascending,      │
+│        no per-packet allocation).                            │
+│   Output: 2 sorted ascending `&[u32]` slices: src_rules and  │
+│           dst_rules (NOT a precise contains-check yet —      │
+│           Stage 4 re-verifies CIDR membership against rule's │
+│           literal + cited books to close any over-approxi-   │
+│           mation).                                           │
 └──────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ Stage 4: small-bucket linear scan on residual selectors      │
-│   Within the surviving candidate set:                        │
-│     - applications (compiled_apps.matches — already O(1))    │
-│     - inactive flag                                          │
-│     - (future: DSCP, TCP flags, IHL — cache-sensitive per    │
-│       #1431, do NOT prune in Stage 2/3)                      │
-│   K_bucket ≤ ~32 BY CONSTRUCTION (Stage 1+2+3 narrowing).    │
-│   First-match-wins is preserved by iterating candidates in   │
-│   the original rule order.                                   │
+│ Stage 4: galloping merge + residual try_match_rule           │
+│   3-way galloping merge of {Stage 2 candidates ∩             │
+│     src_rules ∩ dst_rules} emitting ascending RuleIdx.       │
+│   For each surviving candidate (avg ≤ ~32 by construction    │
+│   for well-behaved configs; pathological configs degrade to  │
+│   no-worse-than-master linear scan):                         │
+│     - try_match_rule (existing path) re-verifies:            │
+│        - inactive flag                                       │
+│        - compiled_apps.matches (closes ICMP carve-out gap)   │
+│        - source-side literal + cited books (closes Stage 3   │
+│          over-approximation)                                 │
+│        - dest-side literal + cited books (same)              │
+│     First match wins (galloping merge emits ascending,       │
+│     which IS original rule order since rule_idx is dense).   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.1 Why this composition is correct
 
-The current `evaluate_policy` semantics are:
+The existing `evaluate_policy` semantics:
 
 > Iterate rules **in original rule order** within (zone-pair-matched,
-> global) buckets. First rule that matches all of {zone, application,
-> source IP, destination IP, not inactive} wins. If no rule matches,
-> default action.
+> global) buckets. First rule that matches all of {zone,
+> application, source IP, destination IP, not inactive} wins. If no
+> rule matches, default action.
 
-The DAG must preserve **first-match-wins-by-rule-order** exactly. The
-trick is that each stage produces a **candidate set** (sub-set of
-rule indices in the original order), and the bucket scan iterates
-candidates in original order. The candidate set is NOT a single
-"surviving rule" — it's the small set that survives all pruning.
+The DAG must preserve **first-match-wins-by-rule-order** exactly.
+Each stage produces a **candidate slice** (sub-set of rule indices,
+sorted ascending). Stage 4's galloping merge intersects the
+candidate slices and re-runs `try_match_rule` on survivors. Since
+candidate slices are sorted ascending and rule_idx assignment is
+dense in original parse order, the merge emits in original rule
+order — first match wins is preserved structurally.
 
-This is structurally safe because each stage filters out rules that
-provably **cannot** match (Stage 2 — wrong protocol or wrong dst port;
-Stage 3 — wrong source/dest CIDR). It never filters out a rule that
-could match.
+The reason Stage 3 returns an over-approximation (not a precise
+contains-check) is that the global LPM operates per address family,
+not per rule. A rule citing books `{5, 9, 17}` on the source side
+gets a Stage 3 hit if src_ip falls in ANY book's LPM coverage, even
+if the matching book is not one this rule cites. Stage 4's existing
+`try_match_rule` closes the gap: it re-checks the rule's actual
+literal + cited-books membership.
+
+This is structurally safe: Stage 2/3 only filter out rules that
+provably **cannot** match (Stage 2 — wrong protocol; Stage 3 — no
+book in the entire snapshot covers src or dst). Rules that survive
+Stage 2/3 may still fail Stage 4, but no rule that COULD match is
+ever filtered out.
 
 ### 2.2 Stage 2 details
 
-`Stage2Index` per zone-pair, owned by `PolicyState`:
+`Stage2Index` per zone-pair, owned by `PolicyDag`:
 
 ```rust
 struct Stage2Index {
     /// Indexed by protocol byte. None = no rule in this zone-pair
-    /// cites this protocol AND no rule matches any-protocol.
+    /// cites this protocol AND no any-proto rule covers it.
     proto_to_buckets: Box<[Option<Stage2ProtoBucket>; 256]>,
-    /// Rules in this zone-pair that match ANY protocol (compiled_apps
-    /// is match_any). These fall through to Stage 3 unconditionally.
-    any_proto_rules: Vec<RuleIdx>,
+    /// Rules whose compiled_apps.match_any == true (application
+    /// "any"). Fall through to Stage 3 unconditionally.
+    any_proto_rules: Arc<[u32]>,
 }
 
 struct Stage2ProtoBucket {
-    /// Common-case index: rule whose application term is a single
-    /// exact dst port. dport=22 → quickly grabs ssh-rule candidates.
-    exact_dst_port_to_rules: FxHashMap<u16, Vec<RuleIdx>>,
-    /// Range terms (uncommon): port-range terms sorted by `low` for
-    /// branchless bisect-and-walk-while-low <= dport. Small array,
-    /// not a tree — port ranges per zone-pair rarely exceed ~64.
-    range_terms: Vec<(PortRange, RuleIdx)>,
-    /// Rules where src/dst ports are unrestricted (port_spec="").
-    /// Always candidates.
-    any_port_rules: Vec<RuleIdx>,
+    /// Single-exact-dst-port hot path (e.g. ssh-rule on dport=22).
+    exact_dst_port_to_rules: FxHashMap<u16, Arc<[u32]>>,
+    /// Port-range terms, sorted ascending by `low` for bisect.
+    range_terms: Box<[(PortRange, Arc<[u32]>)]>,
+    /// Rules where dst_port is unrestricted (any-dport) AND src_port
+    /// is unrestricted-OR-range-restricted. These get the additional
+    /// src-port test at Stage 4 via try_match_rule, but Stage 2
+    /// emits them unconditionally for this proto.
+    any_port_rules: Arc<[u32]>,
 }
 ```
 
-Lookup cost: 1 array index (proto), 1 hash probe (exact dst port), 1
-linear pass over range_terms (which is ≤ 64 in practice). Total
+Lookup cost: 1 array index (proto byte), 1 hash probe (exact dport),
+1 binary search over `range_terms` (typically ≤ 64 entries). Total
 ≤ ~10 ns even at 1M rules.
 
-`RuleIdx` is a `u32` packed index into `state.rules`, NOT a copy of
-the `PolicyRule`. Cache-friendly: every candidate set is a
-`SmallVec<[u32; N]>` rather than `Vec<PolicyRule>`.
+**ICMP carve-out** (Codex F3 + AGY F4 + SMR F-r1-2 convergent):
+`parse_flow_ports` at `frame/inspect.rs:212-232` puts ICMP id in
+src_port and 0 in dst_port. ICMP rules in `compiled_apps` are keyed
+by `protocol = PROTO_ICMP (1) | PROTO_ICMPV6 (58)`. At Stage 2:
+ICMP rules go into either `exact_dst_port_to_rules[0]` (if rule
+restricts dport to 0) or `any_port_rules` (the common case). Either
+way they end up as a candidate slice for proto=1/58. Stage 4's
+`compiled_apps.matches(protocol, src_port, dst_port)` re-verifies
+the application term — including src_port range matching for ICMP
+identifier-based rules. No silent drops.
 
-### 2.3 Stage 3 details — multi-rule shared LPM per book
+**any_port_rules fall-through**: rules with no port constraint (or
+src-port-only constraint) on a given proto live in
+`any_port_rules` of that proto's bucket. Stage 2 emits this slice
+**in addition to** any exact-dport / range hits for the same proto.
+Stage 4 galloping merge dedup-merges them.
 
-Today, every `PolicyRule` carries its own `PrefixSetV4/V6` per
-literal set, plus references to books by index. The #923 trie gives
-O(log n) `contains` per book. With #1606 dedup, the **book entry**
-itself can host a richer index:
+### 2.3 Stage 3 details — Multi-Book LPM
+
+The architectural pivot from v1 (per-book multi-rule LPMs) is to a
+**single global per-address-family LPM over book indices**.
 
 ```rust
-struct BookEntry {
-    v4: PrefixSetV4,
-    v6: PrefixSetV6,
-    /// #1609 ADDITION: which rules cite this book (on source or
-    /// destination side, separately tracked). Materialised once
-    /// at config-apply.
-    rules_citing_as_source: Arc<RuleBitSet>,
-    rules_citing_as_destination: Arc<RuleBitSet>,
-    /// #1609 ADDITION: multibit LPM index — for each /N stride
-    /// returns a precomputed bit-set of (book-citing rule indices
-    /// AND prefix in book covers /N). Built once at config-apply.
-    /// Stride is 8 bits (DIR-24-8 style for v4, smaller table for
-    /// v6).
-    lpm_v4: Option<Arc<MultibitLpmV4>>,
-    lpm_v6: Option<Arc<MultibitLpmV6>>,
+/// DIR-24-8 multibit LPM where every entry stores the sorted list
+/// of book indices whose v4 PrefixSet contains a CIDR covering this
+/// prefix.
+struct MultiBookLpmV4 {
+    /// Level-0: 2^24 entries indexed by the upper 24 bits of the
+    /// IPv4 address. Each entry is either:
+    ///   - LpmLeafV4::Books(Arc<[u16]>) — leaf with sorted book idxs
+    ///   - LpmLeafV4::DescendInto(u32)  — index into `level_1[]`
+    level_0: Box<[LpmLeafV4; 1 << 24]>,
+    /// Level-1: sparse vector of /25–/32 sub-tables.
+    level_1: Vec<Stage3SubTableV4>,
+}
+
+enum LpmLeafV4 {
+    Books(Arc<[u16]>),     // sorted ascending; empty Arc = no books
+    DescendInto(u32),
+}
+
+/// 256-entry sub-table for /25–/32 lookups inside one /24.
+struct Stage3SubTableV4 {
+    entries: Box<[Arc<[u16]>; 256]>,
 }
 ```
 
-`MultibitLpmV4` (DIR-24-8 style):
-- Level 0: 2^24-entry table, each entry is `Option<Arc<RuleBitSet>>`
-  giving the union of RuleIdxs whose CIDR (in this book) covers the
-  /24 prefix.
-- Level 1: only allocated for /24s with longer-prefix rules inside.
-  Sparse.
+**Memory bound at 1M rules**:
 
-Memory bound: at 1M rules × 1 CIDR each = 16 MB worst case per book
-in the DIR-24-8 layer. With #1606 sharing, books are shared across
-rules, so the per-snapshot cost is `Σ books × 16 MB` not `Σ rules ×
-16 MB`. At ~10K books × 16 MB = 160 MB per snapshot. With 6 in-flight
-snapshots (current + 5 generations + canary) that's 960 MB — within
-the "≤ 1 GB per snapshot" acceptance criterion.
+- Level-0: 16 MB pointer table (Box<[LpmLeafV4; 1<<24]> at 8 B/entry
+  with niche optimization — `Arc<[u16]>` and `u32` both fit in 8 B
+  via tagged enum). Same as DIR-24-8 baseline.
+- Level-1 sub-tables: only allocated for /24s with /25-/32 rules
+  inside; for a realistic config that's ≤ 10K /24s with sub-prefixes
+  × 2 KB each = 20 MB.
+- Book index arrays: ~10K books × Arc<[u16]> × avg 4 books/leaf ×
+  ~1M populated leaves = 80 MB upper bound; with Arc dedup
+  (many leaves share the same sorted book list), realistic ~40 MB.
+- Per-book citation arrays: 1M rules × ~8 citations each × 4 B =
+  32 MB.
 
-**Open question Q2**: DIR-24-8 vs Poptrie. DIR-24-8 wins on probe
-latency (1 indexed load + maybe a second). Poptrie wins on memory (1 to
-2 orders of magnitude). At 10K books × 16 MB = 160 MB, Poptrie may not
-be needed; defer to v2 if reviewers find DIR-24-8 acceptable.
+Total ~120-160 MB per snapshot at 1M rules. With 6 in-flight
+snapshots that's ≤ 1 GB.
 
-`RuleBitSet`:
+**IPv6**: v6 uses a smaller stride (DIR-24-8 over the first /48 or
+Poptrie). Stage 1 of this Plan opts for **per-/48 hash + per-/48
+sub-LPM** because IPv6 sparsity makes a 2^48 top-level table
+infeasible. Memory bound: ~10K populated /48s × 1 KB sub-LPM each =
+10 MB. Same Arc<[u16]> leaf shape.
 
-```rust
-/// Dense bit-set indexed by rule index. At 1M rules, that's 125 KB
-/// per set; shared across all snapshots via `Arc<RuleBitSet>`.
-/// In-memory bitset; not packed-to-disk.
-pub(crate) struct RuleBitSet {
-    bits: Box<[u64]>,
-    pop: u32,
-}
-```
-
-At 1M rules × 125 KB = 125 KB per bit-set. With 10K /24 entries
-× 125 KB = 1.25 GB. **This is the load-bearing memory question for
-Stage 3.** See Q5.
+**Construction cost at 1M rules**: per-prefix insert touches at most
+256 level-0 entries (covers /24-aligned prefixes; sub-/24 prefixes
+touch 1 entry + 1 sub-table). For a realistic distribution of /24
+host prefixes + /16 corporate networks, ~10M LPM insertions total,
+~100 ns each = ~1 second construction. Plus per-book citation array
+build (sorted Vec → freeze to Arc) at 1M rules ≈ 100 ms. Total
+construction ~1-1.5 seconds. Acceptable.
 
 ### 2.4 Stage 4 details
 
-The surviving candidate set is at most ~32 rules by construction
-(if Stage 1-3 prune as designed). For each candidate:
+Three sorted-ascending `&[u32]` slices come into Stage 4 from
+Stage 2 (zone-pair candidates) + Stage 3 (src_rules + dst_rules).
+A 3-way galloping merge emits ascending RuleIdx values to a
+per-worker scratch `&mut [u32; STAGE4_BUFFER_SIZE]`. For each
+emitted index, the existing `try_match_rule` is called inline.
+First `Some(result)` wins.
 
-- `compiled_apps.matches(protocol, src_port, dst_port)` — already
-  shipped, O(1) for exact-port terms.
-- `inactive` flag.
-- Source/dest IP **re-check**. (Why re-check? Because Stage 3 only
-  proves IP is in the CIDR set of *some* book this rule cites; it
-  doesn't prove IP is in the rule's literal CIDR set or in the
-  rule's per-side combined set. Stage 3 is a fast O(1) over-
-  approximation; Stage 4 closes the gap.)
+`STAGE4_BUFFER_SIZE = 64` chosen so the entire buffer fits in 256 B
+(4 cache lines, hot in L1). Configs that produce > 64 survivors in
+Stage 4 emit a Prometheus counter
+`xpf_userspace_policy_dag_bucket_oversize_total{zone_pair}` and
+continue processing without truncation (no silent rule drops). The
+soft diagnostic surfaces operator pathology; the structural bound
+is "no worse than master linear scan within the surviving slice"
+(Codex F6 + AGY F5 tiebreak in SMR r2).
 
-  Concretely, if `rule_idx` survived Stage 3 because IP was in
-  `book[5].v4` and rule `r` cites book 5 on the source side, Stage 4
-  still needs to verify that `r`'s combined source-side
-  (literals + cited books) covers IP — which is exactly the existing
-  `try_match_rule` logic. The win is the per-zone-pair candidate set
-  shrank from K=50K to ≤32.
-
-First-match-wins is preserved by iterating candidates in original
-rule order (the candidate set is sorted at construction time).
-
-## 3. Construction algorithm
-
-At config-apply time, after `parse_policy_state_with_counters` builds
-`PolicyState.rules` + `PolicyState.books`:
+### 2.5 Allocation-free hot path (Codex F8)
 
 ```rust
-fn build_policy_dag(state: &mut PolicyState) -> Result<PolicyDag, ...> {
-    // Phase A: per-book multi-rule LPM
-    for (book_idx, book) in state.books.iter().enumerate() {
-        let mut v4_lpm = MultibitLpmV4Builder::new();
-        // Walk all rules; for each rule that cites book_idx on source
-        // side, add (prefix, rule_idx) to the source-side LPM.
-        for (rule_idx, rule) in state.rules.iter().enumerate() {
-            if rule.source_book_idxs.contains(&(book_idx as u32)) {
-                for prefix in &book.v4_prefixes() {
-                    v4_lpm.insert(prefix, rule_idx as u32);
-                }
-            }
-        }
-        let v4_lpm = v4_lpm.freeze();
-        // ... same for v6, dest side ...
-    }
-
-    // Phase B: per zone-pair Stage 2 index
-    for (zone_pair_key, rule_indices) in state.zone_pair_index.iter() {
-        let mut stage2 = Stage2IndexBuilder::new();
-        for &rule_idx in rule_indices {
-            let rule = &state.rules[rule_idx];
-            // Index by protocol + dst port.
-            for app in &rule.applications {
-                stage2.insert(app.protocol, &app.destination_ports, rule_idx);
-            }
-            if rule.applications.is_empty() {
-                stage2.insert_any_proto(rule_idx);
-            }
-        }
-        // ...
-    }
-
-    // Phase C: same for global_indices
-    ...
-
-    Ok(PolicyDag { stage2_by_zone_pair, ... })
+#[inline]
+fn evaluate_policy_dag(
+    dag: &PolicyDag,
+    state: &PolicyState,
+    from_id: u16, to_id: u16,
+    src_ip: IpAddr, dst_ip: IpAddr,
+    protocol: u8, src_port: u16, dst_port: u16,
+    packet_len: u64,
+    scratch: &mut Stage4Scratch,  // per-worker, NOT allocated here
+) -> PolicyEvaluationResult {
+    let key = zone_pair_key(from_id, to_id);
+    let stage2: &Stage2Index = match dag.stage2_by_zone_pair.get(&key) {
+        Some(s) => s,
+        None => return evaluate_global_fallback(dag, state, ...),
+    };
+    // Stage 2: gather candidate slices (no alloc — borrowed Arcs).
+    let proto_bucket: &Stage2ProtoBucket = match &stage2.proto_to_buckets[protocol as usize] {
+        Some(b) => b,
+        None => return PolicyEvaluationResult::default_for(state),
+    };
+    let any_proto: &[u32] = &stage2.any_proto_rules;
+    let exact_hit: &[u32] = proto_bucket.exact_dst_port_to_rules
+        .get(&dst_port).map(|a| a.as_ref()).unwrap_or(&[]);
+    let any_port: &[u32] = &proto_bucket.any_port_rules;
+    // Stage 3: LPM lookup → &[u16] book indices (borrowed; no alloc).
+    let src_books: &[u16] = dag.multi_book_lpm_v4.lookup_v4(src_ip);
+    let dst_books: &[u16] = dag.multi_book_lpm_v4.lookup_v4(dst_ip);
+    // Gather per-book citation slices into scratch (no alloc).
+    // scratch.gather_src(state, src_books);  // borrowed Arc refs
+    // scratch.gather_dst(state, dst_books);
+    // Stage 4: galloping merge over {stage2_candidates, src_rules,
+    // dst_rules}, call try_match_rule on survivors.
+    galloping_merge_evaluate(
+        &[exact_hit, any_port, any_proto], // sorted slices
+        scratch.src_rules_slice(),
+        scratch.dst_rules_slice(),
+        state, src_ip, dst_ip, protocol, src_port, dst_port,
+        packet_len,
+    )
 }
 ```
 
-Construction cost target: at 1M rules + 10K books, construction
-completes in ≤ 10 seconds. The dominant cost is the LPM insertion
-loop: 1M rules × 8 books each × 4 prefixes each × 1 LPM insert =
-32M LPM inserts. At 100 ns each = 3.2 seconds. Acceptable.
+Every per-packet operation is either:
+1. A pointer chase + index (Arc deref, slice index).
+2. A borrow of an Arc<[u32]> (no clone, no refcount bump — Arc::as_ref).
+3. A read/write into per-worker scratch (`&mut [u32; STAGE4_BUFFER_SIZE]`).
 
-ArcSwap publication: the entire `PolicyDag` is built off-line, then
-swapped into `ConfigSnapshot` atomically. Old snapshots free their
-DAG via Arc refcount.
+No `Vec` allocation. No `SmallVec` spill. No `roaring` intersection.
+No string formatting. Per-worker scratch is owned by the dataplane
+binding worker (allocated once at worker startup).
 
-## 4. Open architectural questions for reviewers
+### 2.6 First-match-wins-by-rule-order proof sketch
 
-**Q1. Interval-tree representation for Stage 2 port ranges.**
-Plan v1 uses sorted-array bisect on the per-proto-bucket
-`range_terms`. At K_ranges = 10K per zone-pair (adversarial), is
-this still ≤ ~20 ns? Or do we need a segment tree? Reviewer
-guidance requested. (Note: realistic K_ranges per zone-pair is
-~64, so the sorted-array bisect is fine for the common case; the
-question is whether the worst case is bounded acceptably.)
+Lemma: galloping merge over k sorted-ascending sequences emits all
+values in ascending order, without duplicates if dedup is applied.
 
-**Q2. Multibit LPM choice: DIR-24-8 vs Poptrie vs incremental.**
-DIR-24-8: O(1) probe, 16 MB worst case per book at /24-heavy
-distribution. Poptrie: O(log W) probe, but ~64x smaller memory.
-Plan v1 picks DIR-24-8 on the latency argument; reviewers may
-push back on the memory cost. Note that with #1606 dedup, the
-per-snapshot cost is bounded by `books × 16 MB`, not `rules ×
-16 MB`. At 10K books that's 160 MB.
+Lemma: `rule_idx` in `state.rules` is assigned in original parse
+order (see `parse_policy_state_with_counters` at policy.rs:508 —
+`let idx = state.rules.len();` immediately before push, so indices
+are dense 0..N in parse order).
 
-**Q3. Per-book vs per-snapshot LPM construction.** If books are
-shared across rules via #1606 Arc-dedup, can the LPM also be
-shared? Yes — `Arc<MultibitLpmV4>` lives on `BookEntry`, NOT on
-`PolicyDag`. Rebuilding only books that changed across snapshots
-keeps the apply-latency budget bounded. Plan v1 does this; v2
-may add a content-hash cache to skip rebuild on no-op book
-swap.
+Corollary: the galloping merge emits rule indices in ascending order,
+which IS original parse order, which IS the Junos first-match-wins
+order.
 
-**Q4. Bucket-scan residual selectors classification.** Within
-Stage 4, which selectors stay in the bucket scan vs get promoted
-to a pruning stage?
+Property test (see §7): generate a synthetic policy of 10K rules
+with deterministic seed, choose a packet that matches multiple
+rules, assert DAG returns the same `policy_id` as the linear scan.
+Run 1K iterations with different packets + assert no divergence.
 
-| Selector | Cardinality | Pruning stage |
-|---|---|---|
-| `applications` (proto+port) | low-medium | **Stage 2 (planned)** |
-| `source CIDR / dest CIDR` | unbounded | **Stage 3 (planned)** |
-| `inactive` | binary | Stage 4 (cheap branch) |
-| `from_zone / to_zone` | low | **Stage 1 (already shipped)** |
-| DSCP, TCP flags, IHL | per-packet | Stage 4 ONLY (cache-sensitive per #1431) |
-| forwarding-class | medium | Stage 4 |
-| flex-match | unbounded | Stage 4 (not promotable) |
-| application-identification (L7 DPI) | unbounded | NOT in DAG; runs at L7 inspector layer |
+## 3. Construction algorithm — two-pass exact allocator (Codex F5)
 
-Reviewers should challenge this classification.
+```rust
+fn build_policy_dag(state: &PolicyState) -> PolicyDag {
+    // Phase A: build per-book citation arrays (sorted).
+    let mut src_citations: Vec<Vec<u32>> = vec![Vec::new(); state.books.len()];
+    let mut dst_citations: Vec<Vec<u32>> = vec![Vec::new(); state.books.len()];
+    for (rule_idx, rule) in state.rules.iter().enumerate() {
+        for &book_idx in &rule.source_book_idxs {
+            src_citations[book_idx as usize].push(rule_idx as u32);
+        }
+        for &book_idx in &rule.destination_book_idxs {
+            dst_citations[book_idx as usize].push(rule_idx as u32);
+        }
+    }
+    // Phase A is already sorted since rule_idx is processed
+    // ascending; no sort needed. Freeze to Arc<[u32]>.
+    let book_src: Vec<Arc<[u32]>> = src_citations.into_iter()
+        .map(|v| Arc::from(v.into_boxed_slice()))
+        .collect();
+    let book_dst: Vec<Arc<[u32]>> = dst_citations.into_iter()
+        .map(|v| Arc::from(v.into_boxed_slice()))
+        .collect();
+    // Phase B: build Multi-Book LPM v4 (DIR-24-8).
+    // First pass: count book indices per /24 entry.
+    // Second pass: allocate exact Arc<[u16]> sorted slices.
+    let lpm_v4 = MultiBookLpmV4::build_two_pass(&state.books);
+    let lpm_v6 = MultiBookLpmV6::build_two_pass(&state.books);
+    // Phase C: per zone-pair Stage 2 index.
+    // First pass: count per (proto, exact_dport) and (proto, any_port).
+    // Second pass: allocate exact Arc<[u32]> sorted slices.
+    let stage2_by_zone_pair = build_stage2_index_two_pass(state);
+    PolicyDag {
+        stage2_by_zone_pair,
+        global_stage2: build_stage2_index_for_global(state),
+        multi_book_lpm_v4: Arc::new(lpm_v4),
+        multi_book_lpm_v6: Arc::new(lpm_v6),
+        book_src: book_src.into(),
+        book_dst: book_dst.into(),
+    }
+}
+```
 
-**Q5. Memory footprint at 1M rules per snapshot.** Naive bit-set
-math: 1M rules × 125 KB/bitset × 256 /24 entries per book × 10K
-books = 320 GB. THIS IS A KILL SHOT IF NOT MITIGATED. Mitigations:
+No bitsets. No roaring. Every output slice is sorted ascending at
+construction; no per-packet sort.
 
-- **Sparse bit-sets**: most /24 entries cover a small subset of
-  rules (≤ 64). Use roaring-bitmap representation. At 64 rules
-  per /24 × 10K books × 256 = 160 MB. Acceptable.
-- **Lazy second-level LPM**: only allocate /25-/32 leaves when
-  a CIDR with prefix > 24 exists in the book. Common for /32
-  host objects, rare for /24s.
-- **Per-book population gate**: if a book contains 0 prefixes
-  (MatchAny or MatchNone), the LPM is not allocated — the rule-
-  match logic short-circuits via the existing
-  `source_v4_match_any` flags.
+## 4. Round-1 kill axis resolution (Codex F1-F10 + AGY findings)
 
-Plan v2 will specify the bit-set representation concretely once
-reviewers weigh in on Q2.
+| Round-1 finding | v2 resolution |
+|---|---|
+| Codex F1 (sandbox infra-blocked source-availability) | v2 plan is self-contained: every claim has a line-level reference to current master code; no requirement to grep into worktree. |
+| Codex F2 (DIR-24-8 vs Poptrie stride math) | v4: DIR-24-8 over /24 (16 MB level-0 table acceptable). v6: per-/48 FxHashMap + sub-LPM (no 2^48 table feasible). Rationale: v4 lookup hit latency dominated by L2 cache hit on level-0 entry (~5-10 ns); v6 sparsity makes Poptrie's compressed-trie overhead not worth its size win at our rule counts. Reviewer may push back — v6 stride is a tunable, not a structural commitment. |
+| Codex F3 (Stage 2 src-port/ICMP semantics) | §2.2 spells out the ICMP carve-out explicitly. `any_port_rules` fall-through is in the data structure (per-proto bucket field). Stage 4's `try_match_rule` re-runs `compiled_apps.matches(protocol, src_port, dst_port)` so ICMP id matching, src_port range matching, etc. all close the over-approximation gap. |
+| Codex F4 (first-match-wins across stages) | §2.6 proof sketch + galloping merge over sorted-ascending Arc<[u32]> slices. Property test in §7. |
+| Codex F5 (construction cost) | §3 two-pass exact-allocator builder. Phase A is already sorted; no per-book sort. Phase B/C count then allocate. ~1-1.5 sec at 1M rules. |
+| Codex F6 (K_bucket soft cap not structural) | §2.4 drops the "≤ 32 structural" claim. Honest framing: well-behaved configs accelerate ≥10× (claim pending #1612 ratification); pathological configs are no-worse-than-master linear scan inside the surviving slice. Soft Prometheus diagnostic at >64 surfaces pathology. |
+| Codex F7 (feature-flag ship per user override) | This v2 ships feature-flagged. **Step 1** (this PR): Multi-Book LPM v4 primitive + feature flag wired + property tests; production code path untouched, flag default OFF. **Step 2** (separate issue): full multi-stage DAG hot path. **Step 3** (separate issue): Junos `cos.policy.lookup` knob + flip default to ON gated on #1612. |
+| Codex F8 (allocation-free hot path) | §2.5 explicit code sketch + per-worker scratch + Arc-borrow discipline. No per-packet alloc. |
+| Codex F9 (cache-key strict 5-tuple) | Stage 2 prunes only on (proto, src_port, dst_port). Stage 3 prunes only on (src_ip, dst_ip). All non-5-tuple selectors (DSCP, TCP flags, IHL, fragment, app-identification, flex-match) land in Stage 4 via `try_match_rule`. Forward-looking carve-out documented in §6. |
+| Codex F10 (no `roaring` crate) | Confirmed. v2 uses `Arc<[u32]>` sorted slices + galloping merge over borrowed slices. No new crate dependencies. |
+| AGY F1 (Multi-Book LPM restructure) | This v2's core architectural pivot. §2.3. |
+| AGY F2 (sorted postings + galloping merge) | §2.6 + §3 + §2.5. |
+| AGY F3 (construction cost two-pass) | §3 Phase B/C explicit. |
+| AGY F4 (Stage 2 any_port + ICMP) | §2.2 ICMP carve-out + any_port_rules per-proto-bucket field. |
+| AGY F5 (K_bucket soft cap is acceptable) | §2.4 soft diagnostic at >64; structural worst-case = master linear scan. |
+| AGY F6 (ship now, defer empirical) | This v2 + staged delivery + feature flag. |
+| SMR F-r1-1 (RuleBitSet memory blow-up) | Eliminated by Multi-Book LPM restructure. No bitsets in v2. |
 
-**Q6. HA sync portability.** The DAG is snapshot-scoped and
-generation-tagged. Generation invalidation across stages must be
-atomic: a partially-rebuilt DAG must never serve a packet.
+## 5. Feature flag rollout
 
-Mechanism: `ConfigSnapshot` already ArcSwaps the entire
-PolicyState. The new DAG hangs off PolicyState; same atomic
-swap.
+**Wire shape change** (this PR):
 
-Cross-chassis: HA peers each build their own DAG from their own
-PolicyState (which is sync'd via the existing config sync path).
-No new wire format needed.
+```rust
+// userspace-dp/src/protocol/snapshot.rs ConfigSnapshot struct:
+#[serde(rename = "policy_dag_enable", default)]
+pub policy_dag_enable: bool,
+```
 
-**Q7. Adversarial K_bucket bound.** Can a config author construct
-a workload that pathologically maximizes K_bucket? Yes —
-constructing 1000 rules with identical (proto, dport, src CIDR,
-dst CIDR) but differing in residual selectors (e.g.
-application-identification name or flex-match) would force all
-1000 into the same Stage 4 bucket. Mitigation:
+Default `false` for backwards compatibility (old Go binaries don't
+emit this field; serde default = false; linear-scan path active).
+This is a v3-additive field — no wire version bump.
 
-- **Soft cap + operator diagnostic**: emit a Prometheus counter
-  `xpf_userspace_policy_dag_bucket_overflow_total{zone_pair}`
-  when K_bucket > 64 at evaluate time. Surface in
-  `show security policies dag-diagnostic`.
-- **Hard cap is NOT enforced** — first-match-wins semantics
-  forbid silently dropping rules.
+**Go side** (this PR adds a one-line wire emit; the Junos CLI knob
+is deferred to Step 3):
 
-**Q8. Interaction with #1608 v3 cold-path defenses.** #1608 v3
-(per-source rate-limit + verdict cache) sits in front of the
-DAG and reduces cold-path load. The DAG plan assumes no
-defensive layer — if #1608 v3 ships, the DAG's worst-case load
-shrinks but the structural bound holds either way. No
-duplication of effort.
+```go
+// pkg/dataplane/userspace/snapshot.go (or equivalent emission site)
+PolicyDagEnable: false,  // hard-wired off until Step 3 lands the knob
+```
 
-## 5. Files touched
+**Hot path dispatch** (this PR):
 
-In scope for this PR:
+```rust
+// userspace-dp/src/policy.rs evaluate_policy_result_with_len:
+if snapshot.policy_dag_enable && state.dag.is_some() {
+    return evaluate_via_dag(state, ...);
+}
+// existing linear scan path (unchanged):
+let key = zone_pair_key(from_id, to_id);
+...
+```
 
-- `userspace-dp/src/policy.rs` — refactor to add `PolicyDag` field
-  on `PolicyState`, replace the linear scan in
-  `evaluate_policy_result_with_len` with DAG traversal. Existing
-  `try_match_rule` is reused for Stage 4.
-- `userspace-dp/src/policy_tests.rs` — extend existing tests +
-  add DAG-shape tests + small synthetic 1K-rule microbench.
-- `userspace-dp/src/lib.rs` — possibly new module declarations
-  for `policy_dag.rs` (subject to file-size convention; see
-  `feedback_refactor_module_dir_layout`).
-- `docs/userspace-jit-design.md` — Phase 4 row update per
-  doc-coherency contract from #1605: replace "SUPERSEDED 2026-05-27
-  by #1609" placeholder with the concrete DAG architecture.
+The feature-flag check is a single load + branch — predictable and
+out of the inner loop. The DAG construction itself runs at
+config-apply time only if the flag is set; this PR's Step 1 builds
+only the Multi-Book LPM primitive (no Stage 2/4 yet) so the
+"evaluate_via_dag" call still ultimately falls back to the linear
+scan inside its body until Step 2 wires Stage 2/4.
 
-May need new modules (will defer to v2 if reviewers object):
-- `userspace-dp/src/policy/dag.rs` — the DAG itself.
-- `userspace-dp/src/policy/multibit_lpm.rs` — DIR-24-8 multi-rule
-  LPM.
+**Step 3** (separate issue) adds the Junos knob:
 
-NOT touched (coordinator-enforced scope discipline — #1611+#1612
-sub-agent owns these):
-- `test/incus/cold-path-flooder/` — owned by #1611.
-- `test/incus/cold-path-microbench.sh` — owned by #1611+#1612.
-- `userspace-dp/src/afxdp/poll_descriptor/` cold-path counter
-  histogram — owned by #1612.
+```
+set system services userspace dataplane policy-lookup multi-stage-dag
+```
 
-## 6. Implementation order
+with Go-side typed config in `pkg/config/typed.go`, wire emit in
+`pkg/dataplane/userspace/snapshot.go`, and Rust-side default flip
+once #1612 ratifies the ≥10× claim.
 
-Suggested sequence — each step builds clean + tests pass before
-the next:
+## 6. Empirical-grounding deferral (explicit)
 
-1. **Pure-code-motion**: extract `evaluate_policy_result_with_len`
-   body into a function that takes
-   `candidates: impl Iterator<Item=RuleIdx>`. This is a no-op
-   semantic change that prepares the call site.
-2. Add `PolicyDag` skeleton + `Stage2Index` + `Stage2ProtoBucket`
-   types. Construction sites filled in by Phase B of build_dag.
-3. Add `MultibitLpmV4/V6` + `BookEntry` extensions for the per-book
-   LPM. Construction sites filled in by Phase A.
-4. Wire DAG construction into `parse_policy_state_with_counters`.
-5. Replace the linear scan in `evaluate_policy_result_with_len`
-   with `dag.lookup(...)` → candidate iterator → existing
-   try_match_rule loop.
-6. Add microbench at `userspace-dp/src/policy/bench_dag.rs` —
-   1K synthetic rules, confirm ≥ 10× speedup vs linear scan.
-7. Update `docs/userspace-jit-design.md` Phase 4 row.
+The architectural claim "the DAG accelerates cold-path policy
+evaluation by ≥10× at 1M rules" is the v2 goal. It is **NOT**
+empirically verified by this PR.
+
+What this PR (Step 1) DOES verify:
+- Multi-Book LPM v4 correctness: 10/100/1K/10K rule property tests
+  using `test/incus/synthetic-policy-gen.sh`.
+- LPM v4 lookup is ≤ 50 ns per call at 10K rules in a Criterion
+  microbench (`userspace-dp/src/policy/multi_book_lpm_bench.rs`).
+- LPM construction is ≤ 100 ms at 10K rules.
+- Feature flag default-OFF preserves master semantics 1:1 (existing
+  policy_tests.rs continues to pass unchanged).
+
+What this PR (Step 1) explicitly does NOT verify:
+- 1M-rule cold-path budget (blocked on #1612 / #1615).
+- End-to-end multi-stage DAG hot path (blocked on Step 2 follow-up).
+- Junos CLI knob behavior (blocked on Step 3 follow-up).
+
+The PR body MUST state these gaps explicitly under "Empirical
+gaps deferred to follow-ups". Production enablement gated on #1612.
 
 ## 7. Test plan
 
-- **Existing policy_tests.rs must still pass unchanged.** Every
-  semantic test in the existing suite stays.
-- **New DAG-shape tests** (in policy_tests.rs):
-  - Empty DAG (no rules) → default action.
-  - Single rule in one zone-pair → matches when in zone, otherwise
-    default.
-  - Rule order is preserved (rule R1 matches first; R2 same
-    bucket but lower priority).
-  - Global rule fall-through (zone-pair has no match → global rules
-    evaluated).
-  - Adversarial K_bucket overflow (100 rules in same bucket; result
-    is rule 0).
-  - Stage 2 protocol mismatch (TCP rule + UDP packet).
-  - Stage 3 CIDR miss (rule has src 10.0.0.0/8, packet from
-    192.168.0.1).
-  - Multibit LPM /24 hit + /28 leaf override.
-  - `RuleBitSet::intersect_with` correctness.
-- **5/5 flake-check** on the new tests (per `feedback_no_test_dismissal`).
-- **Synthetic 1K-rule microbench**: confirm DAG < linear by ≥10×
-  at 1K rules. Defer 10K/100K/1M to #1612 (this PR notes the gap
-  in its description).
-- **Smoke matrix** on `loss:xpf-userspace-fw0/fw1`: v4+v6 × push+`-R` ×
-  CoS-off+CoS-on. NO regression vs master.
+**Step 1 (this PR) — Multi-Book LPM v4 primitive + feature flag**:
+
+- **Unit tests** (in `userspace-dp/src/policy/multi_book_lpm_tests.rs`):
+  - Empty LPM returns empty slice for any v4 lookup.
+  - Single /24 prefix in one book returns sorted [book_idx] for
+    addresses in the /24 and empty slice for addresses outside.
+  - Two overlapping books (/16 in book A, /24 in book B inside the
+    /16) — addresses in the /24 return sorted [A, B]; addresses in
+    the /16 outside the /24 return [A].
+  - /32 leaf override: address in /32 returns [book_with_/32]; one
+    bit off returns [book_with_covering_/24] if present, else empty.
+  - 10K-book synthetic config built via `synthetic-policy-gen.sh`;
+    lookup returns correct sorted slice for 1K random addresses.
+- **Property tests** (using `proptest`):
+  - Lookup result is monotonically non-decreasing as books are added.
+  - Lookup result is a subset of books whose v4 PrefixSet contains
+    the address (sanity vs ground truth from existing PrefixSet).
+- **Existing policy_tests.rs**: continues to pass unchanged with
+  flag default-OFF.
+- **Feature flag toggled ON test** (in policy_tests.rs): flag-ON
+  with Step 1's stub evaluate_via_dag (which immediately falls back
+  to linear scan inside) returns identical results to flag-OFF for
+  100 random packets against a 1K-rule synthetic config.
+- **5/5 flake check** on the new tests (per
+  `feedback_no_test_dismissal`).
+- **Criterion microbench**: LPM lookup at 10K books, p50 + p99
+  latency; LPM construction at 10K rules wall-clock.
+- **Smoke matrix** on `loss:xpf-userspace-fw0/fw1`:
+  v4 + v6 × push + `-R` × CoS-off + CoS-on. NO regression vs master
+  (flag default-OFF means the linear scan path is untouched).
 - **`make test-failover`**: HA failover ≤ 60 ms unchanged.
 
-Empirical 1M-rule numbers are explicitly deferred to #1612 (per the
-honest-framing constraint in §0). If reviewers say "no merge without
-1M numbers", we stop and report BLOCKED.
+**Step 2 follow-up** will add:
+- Stage 2/3/4 unit + property tests.
+- Galloping-merge correctness (sorted ascending, dedup correct).
+- First-match-wins property test (10K rules; compare DAG vs linear).
+- Adversarial K_bucket overflow test (1K rules in one bucket).
 
-## 8. Acceptance criteria
+**Step 3 follow-up** will add:
+- Junos knob parser test.
+- Go-side wire emit test.
+- Flag-default-flip behavior test under HA failover.
 
-- [ ] Plan v1 → vN PLAN-READY through 4-way quad-review.
-- [ ] Multi-stage DAG construction shipped at config-apply time.
-- [ ] All existing policy_tests.rs pass unchanged.
-- [ ] New DAG-shape tests added + pass 5/5 flake check.
-- [ ] Synthetic 1K-rule microbench shows DAG < linear by ≥ 10×.
-- [ ] Smoke matrix passes on loss userspace cluster.
+## 8. Acceptance criteria — Step 1 (this PR)
+
+- [ ] Plan v2 → vN PLAN-READY through 4-way quad-review.
+- [ ] Multi-Book LPM v4 primitive in `userspace-dp/src/policy/multi_book_lpm.rs`.
+- [ ] Per-book citation arrays in `userspace-dp/src/policy/book_citations.rs`.
+- [ ] Feature flag `policy_dag_enable` wired through `ConfigSnapshot`,
+      default OFF.
+- [ ] Stub `evaluate_via_dag` that falls back to linear scan inside
+      (so the flag-ON code path is exercised but semantically
+      identical to flag-OFF).
+- [ ] All existing policy_tests.rs pass unchanged with flag default-OFF.
+- [ ] Property tests at 10/100/1K/10K rules pass 5/5 flake check.
+- [ ] Criterion microbench shows LPM lookup ≤ 50 ns p50 at 10K
+      books AND construction ≤ 100 ms at 10K rules.
+- [ ] Smoke matrix passes on loss userspace cluster (flag default-OFF —
+      master path).
 - [ ] `make test-failover` passes; HA failover ≤ 60 ms.
-- [ ] Memory footprint per snapshot at 10K books × 100K rules ≤
-  1 GB — *measured at apply time via Prometheus gauge*.
 - [ ] `docs/userspace-jit-design.md` Phase 4 row replaced with the
-  concrete DAG architecture (per doc-coherency contract from #1605).
+      Multi-Book LPM architecture pointer (per doc-coherency contract
+      from #1605).
+- [ ] PR body explicitly states the "≥10× cold-path speedup at 1M
+      rules" claim is the goal but is NOT empirically verified by
+      this PR; deferred to #1612.
 - [ ] Cold-path policy evaluation at 1M rules ≤ 500 ns/packet on
-  loss userspace cluster — **DEFERRED to #1612 measurement; this PR
-  ships the structural bound, not the empirical proof.**
+      loss userspace cluster — **DEFERRED to #1612 measurement +
+      Step 2 + Step 3 follow-up; this PR ships the primitive +
+      feature-flag scaffold, not the full hot path.**
 
-## 9. Alternatives rejected
+## 9. Files touched — Step 1 (this PR)
 
-- **Cranelift JIT** — killed at #1605. Code-gen doesn't help the
-  cold-path data-structure problem.
+In scope:
+
+- `userspace-dp/src/policy/multi_book_lpm.rs` — new module: DIR-24-8
+  Multi-Book LPM v4 + per-/48 hash + sub-LPM v6.
+- `userspace-dp/src/policy/book_citations.rs` — new module: per-book
+  sorted citation arrays + construction helpers.
+- `userspace-dp/src/policy/multi_book_lpm_tests.rs` — unit + property
+  tests.
+- `userspace-dp/src/policy.rs` — add `mod policy;` directory structure
+  (move existing policy.rs into `policy/mod.rs` per
+  `feedback_refactor_module_dir_layout`). Add `evaluate_via_dag` stub
+  that falls back to linear scan. Wire the flag check.
+- `userspace-dp/src/protocol/snapshot.rs` — add
+  `policy_dag_enable: bool` field on `ConfigSnapshot` (serde default).
+- `userspace-dp/src/policy_tests.rs` — add feature-flag-ON regression
+  test (Step 1 expected output: identical to flag-OFF since stub
+  falls back).
+- `pkg/dataplane/userspace/snapshot.go` (or equivalent emission
+  site) — emit `PolicyDagEnable: false` on the wire so the Rust
+  side gets a deterministic value.
+- `docs/userspace-jit-design.md` — Phase 4 row update per
+  doc-coherency contract from #1605.
+
+NOT touched in Step 1 (deferred to Step 2 follow-up):
+
+- `userspace-dp/src/policy/decision_dag.rs` — full Stage 2/3/4 hot
+  path.
+- `userspace-dp/src/policy/galloping_merge.rs` — 3-way merge utility.
+- Junos CLI knob in `pkg/config/typed.go` — Step 3 follow-up.
+
+NOT touched (coordinator-enforced scope discipline):
+
+- `test/incus/cold-path-flooder/` — owned by #1611/#1615.
+- `userspace-dp/src/afxdp/cos/` — owned by parallel #1614 sub-agent.
+- `pkg/cluster/` HA paths — out of scope.
+
+## 10. Implementation order — Step 1 (this PR)
+
+Each step builds clean + tests pass before the next.
+
+1. **Refactor policy.rs into directory layout**: move
+   `userspace-dp/src/policy.rs` → `userspace-dp/src/policy/mod.rs`.
+   Move `userspace-dp/src/policy_tests.rs` →
+   `userspace-dp/src/policy/tests.rs`. Re-declare module path in
+   `userspace-dp/src/main.rs`. No semantic change. (Per
+   `feedback_refactor_module_dir_layout`.)
+2. **Add wire flag**: `policy_dag_enable: bool` on `ConfigSnapshot`
+   (serde default = false). Tests verify roundtrip.
+3. **Add multi_book_lpm.rs**: data structure + construction
+   (two-pass) + lookup. Unit tests.
+4. **Add book_citations.rs**: per-book sorted citation arrays.
+   Unit tests.
+5. **Add stub `evaluate_via_dag` in policy/mod.rs**: when flag is
+   on, log via Prometheus counter, and fall back to the existing
+   linear scan internally. Sole purpose: exercise the flag plumbing
+   end-to-end.
+6. **Add Criterion microbench** at
+   `userspace-dp/benches/multi_book_lpm.rs` (new bench file).
+7. **Property tests** at 10/100/1K/10K rules using
+   `test/incus/synthetic-policy-gen.sh`-generated configs (or
+   in-process equivalent).
+8. **Go-side wire emit**: `PolicyDagEnable: false` so the field is
+   always present on the wire.
+9. **Doc update**: `docs/userspace-jit-design.md` Phase 4 row.
+10. **Smoke matrix on loss userspace cluster** (flag default-OFF,
+    so master path validation).
+11. **`make test-failover`** (mandatory because the wire shape
+    changed).
+
+## 11. Alternatives rejected
+
+- **Cranelift JIT** — killed at #1605.
+- **Per-rule LPM** (v1) — KILLED at SMR-r1 + Codex-r1 + AGY-r1: 320 GB
+  worst-case memory at 1M rules.
 - **Hash-table on dominant selector + linear scan of bucket** —
-  doesn't compose with CIDR membership. CIDRs are intervals, not
-  exact keys.
-- **Single-stage decision tree (CART / RDC)** — config-apply
-  build cost at 1M rules is minutes, not seconds. DAG-as-static-
-  structure wins on build latency.
+  doesn't compose with CIDR membership.
+- **Single-stage decision tree (CART / RDC)** — build cost at 1M
+  rules is minutes.
 - **Per-flow JIT** — every cold-path packet is a flow miss by
-  definition. JIT amortization fails on cold path.
+  definition.
+- **`roaring` crate for intersection** — Codex F10 rejected: adds
+  dependency + per-packet alloc. Galloping merge over `Arc<[u32]>`
+  slices does the same job allocation-free.
 
-## 10. Risks
+## 12. Risks
 
-- **R1**: structural bound holds only if K_bucket ≤ ~32 in
-  practice. Adversarial configs can violate; operator diagnostic
-  (Q7) is the mitigation.
-- **R2**: per-book LPM memory at 10K books × 16 MB = 160 MB —
-  acceptable but not free. Roaring bit-sets (Q5) can shrink
-  further at v2 if reviewers push back.
-- **R3**: config-apply latency at 1M rules. Construction is
-  O(rules × books_per_rule × prefixes_per_book) = ~32M LPM
-  inserts at 100 ns each = 3.2 sec. Marginal at production scale.
-- **R4**: empirical 1M-rule numbers don't exist on master. If
-  reviewers require them, we BLOCK on #1612.
+- **R1**: Step 1 alone delivers only the primitive; the
+  end-to-end ≥10× claim is the goal of Step 1 + Step 2 + Step 3.
+  Step 2 + Step 3 are tracked as separate follow-up issues.
+- **R2**: Multi-Book LPM v4 level-0 table is 16 MB — larger than L2
+  on most CPUs. Lookup is one cache miss + one L1/L2 hit on the
+  Arc<[u16]> leaf. Per #1612 measurement, if level-0 cold-cache hits
+  exceed budget, v6's per-/48-hash + sub-LPM approach can be
+  back-ported to v4 (the LPM trait abstracts both).
+- **R3**: Construction cost at 1M rules is ~1-1.5 sec. Junos target
+  is single-digit sec for total commit, so DAG construction at 1M
+  rules eats most of the budget. Acceptable for the cold-path use
+  case but reviewers may push back on commit-time impact.
+- **R4**: Empirical 1M-rule numbers don't exist on master.
+  Acknowledged in §0 + §6; production enablement gated on #1612 +
+  Step 3 follow-up.
+- **R5**: ICMPv6 NDP packets traverse the policy DAG; carve-out in
+  §2.2 covers PROTO_ICMPV6 (58). v6 LPM tests must cover NDP-shaped
+  packets (multicast dst, link-local src).
 
-## 11. Out of scope
+## 13. Out of scope
 
+- **Junos CLI knob** — deferred to Step 3 follow-up issue.
+- **Full multi-stage DAG hot path (Stage 2/3/4 + galloping merge)** —
+  deferred to Step 2 follow-up issue.
+- **Production enablement / default-flip** — gated on #1612 + Step 3.
 - **Rate-limit + verdict cache** — #1608.
 - **Per-flow JIT specialization** — killed (#1605).
-- **Wire-protocol changes** — #1606 is the foundation.
-- **Cold-path flooder + Scale Target measurement** — #1611 + #1612.
-- **Application-identification L7 DPI** — out of policy DAG; runs
-  at a later inspector stage.
+- **Cold-path flooder + Scale Target measurement** — #1611 / #1612 /
+  #1615.
+- **Application-identification L7 DPI** — out of policy DAG.
+
+## 14. Open architectural questions for v2 reviewers
+
+**v2-Q1**: v6 stride choice — per-/48 FxHashMap → sub-LPM is the v2
+default. Reviewers may push back on Poptrie if our v6 prefix
+distribution has heavy /64 host concentration. The LPM trait
+abstracts both; this is a tunable, not a structural commitment.
+
+**v2-Q2**: Multi-Book LPM v4 level-0 is 16 MB — larger than L2 cache
+on most CPUs (typically 1 MB / core). Reviewers should challenge
+whether the cold-cache hit on level-0 is within the project's per-
+packet budget. Per #1612 measurement may force back-pressure to a
+smaller stride.
+
+**v2-Q3**: Step 1 stub `evaluate_via_dag` that immediately falls
+back to linear scan — is this "feature flag wired but useless"
+acceptable as Step 1 scope, or should Step 1 instead omit the
+flag entirely and add it in Step 2 alongside the real DAG hot path?
+Reviewer-preference question.
+
+**v2-Q4**: Module layout — `userspace-dp/src/policy.rs` (881 LOC) +
+`policy_tests.rs` (1013 LOC) into `policy/` directory with
+`mod.rs`, `multi_book_lpm.rs`, `book_citations.rs`, `tests.rs`?
+This follows `feedback_refactor_module_dir_layout` and the project's
+file-size convention (mod.rs would be ~880 LOC, below the 2000 LOC
+trigger; the new files are ≤ 500 LOC each).
+
+**v2-Q5**: Go-side wire emit always `false` until Step 3 — is it
+worth emitting the field at all in Step 1 if it's hard-wired off?
+Alternative: serde default-false on the Rust side suffices without
+any Go-side emission, and Step 3 adds the emission alongside the
+knob. The current §5 plan errs on the safe side (always emit) to
+avoid serde-default-divergence between old/new Go binaries.
+
+---
+
+## v1 historical record (PLAN-NEEDS-MAJOR + BLOCKED)
+
+The v1 plan proposed per-book multi-rule LPMs (per-/24 RuleBitSet)
+and was KILLED at SMR-r1 + Codex-r1 + AGY-r1 for the 320 GB
+worst-case memory blowup at 1M rules. The full v1 → r1+r2 review
+record is preserved at:
+
+- `docs/pr/1609-multistage-policy-dag/claude-smr-plan-r1.md`
+- `docs/pr/1609-multistage-policy-dag/claude-smr-plan-r2.md`
+- `docs/pr/1609-multistage-policy-dag/reviewer-ids.md`
+- Issue #1609 comment for the v1 BLOCKED determination.
+
+v2 starts from the Multi-Book LPM architectural pivot AGY r1
+delivered and is a wholesale restructure of v1. Do NOT merge v2
+against v1 — v2 supersedes.
