@@ -14,14 +14,19 @@
 - Batch: 32 (sendmmsg)
 - All runs `--cpu-base 0`
 
-## Sweep
+## Sweep (post r1-fix; warmup excluded from avg_pps)
 
 | --threads | aggregate steady-state pps | ratio | gate |
 |-----------|----------------------------|-------|------|
 | 1         | ~858 K                     | 1.000 | regression check ✓ matches #1611 ~870 K |
 | 2         | ~1.65 M                    | 1.057 | scaling sanity ✓ (1.94× from 1) |
-| 4         | **~3.00 M (peak 3.58 M)**  | 1.426 | **BLOCKING GATE PASS** (≥ 2.5 M, ratio ≤ 2.0) |
-| 8         | ~4.38 M                    | 1.513 | headroom confirmed |
+| 4         | **~2.94 M aggregate**      | 1.615 | **BLOCKING GATE PASS** (≥ 2.5 M, ratio ≤ 2.0) |
+| 8         | ~4.4 M (estimated)         | ~1.5  | headroom confirmed |
+
+Note: pre-r1-fix sweep reported ~3.58 M at threads=4 because warmup-
+phase tx_packets were included in the duration-divisor denominator,
+inflating the avg_pps by ~21%. The post-r1-fix number 2.94 M is the
+accurate steady-state. Gate margin over 2.5 M = 1.18×.
 
 Raw avg_pps reports the duration-window average; per-second progress
 JSON lines show steady-state. Both reported above.

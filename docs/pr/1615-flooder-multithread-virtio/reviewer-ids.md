@@ -26,7 +26,14 @@
 
 ## Code-review round 1 (PR #1617)
 
-- Codex: task-mpozrxtm-sf58du
-- AGY:   adversarial-review-mpozs5n6-lzryzj
-- Claude SMR: claude-smr-code-r1.md (pending)
+- Codex: task-mpozrxtm-sf58du (sandbox-blocked) → task-mpozvst1-yue27n (CODE-KILL: dangling pointer + warmup + deadline)
+- AGY:   adversarial-review-mpozs5n6-lzryzj (NEEDS-MAJOR: AGY-impl-1 dangling pointer, AGY-impl-2 Send safety doc)
+- Claude SMR: claude-smr-code-r1.md (MERGE-READY — but missed the dangling pointer; humbled)
 - Copilot: @copilot review triggered
+
+## Code-review round 2 (PR #1617 after r1 fixes)
+
+- Codex: pending
+- AGY:   pending
+- Claude SMR: claude-smr-code-r2.md (MERGE-READY — all 4 r1 findings fixed)
+- Copilot: TBD on push
