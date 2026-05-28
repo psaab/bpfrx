@@ -1,18 +1,23 @@
-# #1614 CoS Scheduler Oversubscription Semantics — Plan v3
+# #1614 CoS Scheduler Oversubscription Semantics — Plan v4
 
-Status: DRAFT for plan-review round 2 (this is plan v3 against
-the v1+v2 review rounds).
+Status: DRAFT for plan-review round 3.
 Branch: `refactor/1614-multi-rss-cos`
 Base: `origin/master` @ `6c26c40e6` (#1611 cold-path-flooder runner body)
 
-Supersedes plan v2 (commit `ef4012ba1`) after CONVERGENT NEEDS-MAJOR
-from Claude SMR r1, AGY r1, and Codex r1. v3 narrows scope to
-**Axis A only**, fully specifies the oversubscription allocation
-algorithm Codex r1 requested, and re-orients acceptance criteria
-around what the scheduler-semantics PR can actually deliver. Axis
-B (capacity scaling) is fully deferred to separate issues.
+v4 supersedes plan v3 (commit `8589fe9a4`) after Claude SMR r2
+identified a fatal algorithm inconsistency (F4 — v3 A1.4
+double-counted Phase 1 partial honor + Phase 2 share) plus two
+substantive findings (S8 phase-0 sequencing, S9 mode renaming).
+v4 specifies a clean two-phase guaranteed-rate allocator with a
+single operator-tunable `guarantee_fraction` parameter; renames
+`strict-exact` → `guarantee-rate` to match Junos documentation;
+and moves the R8 gate-8 sanity check to an explicit Phase 0
+before any A1 implementation.
 
-## 0. What changed since v2
+The v3 changelog (v1+v2+v3 history) is retained below for
+auditability.
+
+## 0. What changed since v3 (then v2)
 
 All three plan-reviewers (Claude SMR r1 NEEDS-MAJOR, AGY r1
 NEEDS-MAJOR, Codex r1 NEEDS-MAJOR) converged on a strict set of
@@ -162,261 +167,193 @@ scheduler reading; the §3 framing is solid.
 
 ## 4. Proposed mechanism — Axis A (scheduler semantics ONLY)
 
-### A1. Deficit-bounded waterfill exact allocator under oversubscription
+> **Phase 0 (run BEFORE any A1 implementation): R8 reverse-simul
+> sanity check.** Plan §7 gate 8 is BLOCKING. The implementer
+> MUST run gate 8 first and confirm reverse-simul aggregate ≥ 22 G
+> before writing A1 code. If reverse-simul caps at ~18 G the
+> firewall isn't the bottleneck and the entire plan is
+> invalidated. File a separate follow-up to re-acquire baseline on
+> a beefier generator and STOP work on this plan.
 
-Codex r1 finding #2 demanded this algorithm be fully
-specified. Here it is.
+### A1. Two-phase guaranteed-rate allocator (Junos-style oversubscription)
 
-#### A1.1 Algorithm
+v3's algorithm was internally inconsistent (Claude SMR r2 F4):
+the "weighted-honor" prediction table double-counted 9g class's
+Pass 1 partial + Pass 2 share, contradicting the algorithm's
+break-then-distribute-to-unhonored rule. v4 specifies a clean
+two-phase algorithm with explicit operator-tunable Pass 1 budget
+fraction.
 
-Define per-drain-pass (one `drain_shaped_tx` invocation):
+#### A1.1 Algorithm (final, v4)
+
+Per `drain_shaped_tx` invocation:
 
 - Let `cap` = available exact-class budget for this pass
   (`root.tokens` at entry; replenishes from `shaping_rate`).
 - Let `exact_queues = [q | q.exact, q.runnable, !empty]`.
 - Let `R_i` = `transmit_rate_bytes(q_i)`.
-- Sort `exact_queues` by `R_i` ascending (stable across
-  drain passes; precomputed at `ensure_cos_interface_runtime` time
-  and stored as `root.exact_queues_by_rate_ascending: Vec<usize>`).
-
-Allocate `cap` across exact queues using the **deficit-bounded
-waterfill** rule:
+- Let `Q_i` = `cos_guarantee_quantum_bytes(q_i)` (unchanged).
+- `root.exact_queues_by_rate_ascending: Vec<usize>` is a
+  precomputed-at-config-apply vector of queue indices sorted by
+  ascending `R_i`. Mutation only on config-apply; runtime is read-only.
 
 ```
-remaining = cap
-honored = []
-for q in exact_queues_by_rate_ascending:
-    quantum_i = cos_guarantee_quantum_bytes(q)  // unchanged
-    debt_i = quantum_i  // one quantum per pass
-    if remaining >= debt_i:
-        q.alloc = debt_i
-        remaining -= debt_i
-        honored.append(q)
-    else:
-        // Pass 1 boundary: this q is the FIRST not-fully-honored.
-        // Stop Pass 1.
+guarantee_fraction = root.config.pass1_guarantee_fraction  // 0.0..1.0
+pass1_budget = (cap * guarantee_fraction).floor()
+remaining_pass1 = pass1_budget
+honor_set = {}  // u64 bitmask of honored queue indices
+
+# Phase 1: greedy small-first honor up to Pass 1 budget
+for queue_idx in root.exact_queues_by_rate_ascending:
+    Q_i = quantum(queue_idx)
+    if remaining_pass1 >= Q_i:
+        alloc[queue_idx] += Q_i
+        remaining_pass1 -= Q_i
+        honor_set |= 1 << queue_idx
+    elif remaining_pass1 > 0:
+        # Partial honor — fits Q_i partially. Allocate exactly
+        # `remaining_pass1` bytes and stop Phase 1.
+        alloc[queue_idx] += remaining_pass1
+        remaining_pass1 = 0
+        # Note: queue_idx is NOT in honor_set; it will participate
+        # in Phase 2 with its remaining Q_i.
         break
-// Pass 2: distribute remaining among NOT-honored exact queues
-// proportionally to their quantum_i, capped by per-queue rate-bucket.
-unhonored = exact_queues - honored
-total_unhonored_quantum = sum(q.quantum_i for q in unhonored)
-if total_unhonored_quantum > 0 and remaining > 0:
-    for q in unhonored:
-        q.alloc = min(quantum_i, remaining * q.quantum_i / total_unhonored_quantum)
+    else:
+        break
+
+# Phase 2: proportional residual across ALL queues NOT fully honored.
+# This includes the partial-honor queue from Phase 1 (which got some
+# bytes but less than its full Q_i).
+pass2_budget = cap - (pass1_budget - remaining_pass1)
+# = cap - actual_phase1_alloc
+unhonored_total_quantum = sum(Q_i for i NOT in honor_set)
+if unhonored_total_quantum > 0 and pass2_budget > 0:
+    for queue_idx NOT in honor_set:
+        alloc[queue_idx] += pass2_budget * Q_i / unhonored_total_quantum
+        # No rate cap — Phase 2 share never exceeds the queue's
+        # per-pass quantum because pass2_budget ≤ pass2_quantum_sum
+        # in oversubscribed regime.
+
+# Phase 3 (after exact): non-exact + priority-low surplus
+# (existing select_cos_surplus_batch_filtered path unchanged)
 ```
 
-This is **O(N)** per drain pass with N ≤ 16 (typical). No
-sorting at runtime; sorted vector built once at config-apply.
+Where `pass1_guarantee_fraction` is a per-interface knob from
+the new `oversubscription-policy guarantee-rate <fraction>` Junos
+setting, default `0.0` (which makes Phase 1 a no-op and the
+algorithm collapses to current proportional behaviour for
+backward compatibility).
 
-#### A1.2 Predicted distribution under the 109 G / 18 G fixture
+This is **O(N)** per drain pass with N ≤ 16 (typical), no
+sorting at runtime.
 
-Per-drain budget = `shaping_rate × 200µs / 1e9 = 25e9 × 200e-6 =
-5 MB` (root token replenishment rate per drain). But the
-sustained per-second budget is the 18 G ceiling. Per pass, each
-queue is visited by its quantum:
+#### A1.2 Predicted distribution under 109/18 fixture, `guarantee-rate 0.7`
 
-Pass 1 (sorted ascending by rate):
-- 100m (Q=2.5 KB) honored
-- 1g (Q=25 KB) honored
-- 3g (Q=75 KB) honored
-- 6g (Q=150 KB) honored
-- 9g (Q=225 KB) honored → remaining = 477.5 KB
-- 12g (Q=300 KB) honored → remaining = 177.5 KB
-- 15g (Q=375 KB) NOT honored (375 > 177.5) → Pass 1 stops
+`pass1_budget = 0.7 × 18 = 12.6 G`
 
-Total Pass 1 honored per pass: 100m + 1g + 3g + 6g + 9g + 12g
-= 0.1 + 1 + 3 + 6 + 9 + 12 = 31 G of cumulative shape but only
-777.5 KB per pass = ~31 G/s × 200 µs / 5 (drain freq factor) =
-sustained throughput per queue equal to its rate. So under
-this allocation each of 100m, 1g, 3g, 6g, 9g, 12g hits its
-**full rate**.
+Phase 1 (sorted ascending by rate):
+- 100m honored (cumulative 0.1 G ≤ 12.6 G)
+- 1g honored (cumulative 1.1 G)
+- 3g honored (cumulative 4.1 G)
+- 6g honored (cumulative 10.1 G)
+- 9g: needs 9 G but only `12.6 - 10.1 = 2.5 G` remains → **partial
+  honor 2.5 G**; Phase 1 stops here. 9g is NOT in honor_set.
 
-Wait, that's wrong — Pass 1 honoring quantum_i once per pass at
-rate_i × 200 µs sustains throughput rate_i. So Pass 1 sustains:
+Phase 2 budget = `18 - (10.1 + 2.5) = 5.4 G`
+Phase 2 unhonored = {9g, 12g, 15g, 18g, 21g, 24g}
+Phase 2 total quantum = 225 + 300 + 375 + 450 + 512 + 512 = 2374 KB
+Phase 2 per-class allocation = `5.4 × Q_i / 2374`:
+- 9g: 5.4 × 225/2374 = 0.512 G
+- 12g: 5.4 × 300/2374 = 0.682 G
+- 15g: 5.4 × 375/2374 = 0.853 G
+- 18g: 5.4 × 450/2374 = 1.023 G
+- 21g: 5.4 × 512/2374 = 1.164 G
+- 24g: 5.4 × 512/2374 = 1.164 G
 
-- 100m: 100 M (full guarantee ✓)
-- 1g: 1 G (full guarantee ✓)
-- 3g: 3 G (full guarantee ✓)
-- 6g: 6 G (full guarantee ✓)
-- 9g: 9 G (full guarantee ✓)
-- 12g: 12 G (full guarantee ✓ at the boundary)
+Final per-class total:
 
-Cumulative = 31 G. But our cap is 18 G! So the algorithm runs
-out of budget at some pass during the cumulative honor sequence.
+| Class | Phase 1 | Phase 2 | Total | Today |
+|-------|---------|---------|-------|-------|
+| 100m | 100 M | 0 | 100 M ✓ | 20 M |
+| 1g | 1 G | 0 | 1 G ✓ | 210 M |
+| 3g | 3 G | 0 | 3 G ✓ | 770 M |
+| 6g | 6 G | 0 | 6 G ✓ | 1.43 G |
+| 9g | 2.5 G | 0.51 G | 3.01 G | 2.32 G (improvement) |
+| 12g | 0 | 0.68 G | 0.68 G | 2.84 G (REGRESSION) |
+| 15g | 0 | 0.85 G | 0.85 G | 2.77 G (REGRESSION) |
+| 18g | 0 | 1.02 G | 1.02 G | 2.83 G (REGRESSION) |
+| 21g | 0 | 1.16 G | 1.16 G | 3.22 G (REGRESSION) |
+| 24g | 0 | 1.16 G | 1.16 G | 3.62 G (REGRESSION) |
+| Sum  |       |        | 18 G  | 20 G |
 
-CORRECTED algorithm: Pass 1 honors classes in ascending rate
-order until cumulative `R_i × T` exceeds budget. Per-pass that's
-`cumulative Q_i` exceeds per-pass budget. So:
+Small classes (100m, 1g, 3g, 6g, 9g) honoured fully or
+near-fully; 9g class actually IMPROVES from 2.32 → 3.01 G.
+Larger classes (12g-24g) REGRESS — this is the operator-visible
+trade-off of `guarantee-rate`.
 
-Per-pass quantum budget = 18 G / sustained_pass_rate. With
-quantum honoring each queue at rate, per-pass capacity = sum of
-quantums of HONORED queues × passes_per_second = sum(rate_i).
-Cap = 18 G ⇒ honored cumulative `sum(rate_i) ≤ 18 G`.
+For operators who want NO regression, `guarantee_fraction = 0`
+preserves current behaviour bit-for-bit.
 
-Cumulative table:
-- After 100m: 0.1 G ≤ 18 G ✓
-- After 1g: 1.1 G ✓
-- After 3g: 4.1 G ✓
-- After 6g: 10.1 G ✓
-- After 9g: 19.1 G — **exceeds 18 G**
+For operators who want intermediate behaviour, e.g.
+`guarantee-rate 0.4`:
+- pass1_budget = 7.2 G
+- Honor 100m, 1g, 3g (cumulative 4.1 G), then 6g: needs 6 G but
+  only 3.1 G remains → partial 3.1 G; Phase 1 stops.
+- Phase 2 = 18 − 7.2 = 10.8 G across {6g, 9g, 12g, 15g, 18g, 21g, 24g}
+- Phase 2 total Q = 150 + 225 + 300 + 375 + 450 + 512 + 512 = 2524 KB
+- Each gets 10.8 × Q_i/2524 ≈ 4.28 × Q_i (KB → Gbps)
+- 6g: 0.642 G (Phase 2 only — Phase 1 partial 3.1 G already counted)
+  → wait, 6g gets Phase 1 partial 3.1 G + Phase 2 0.642 G = 3.74 G
+- 9g: 0 + 0.963 G = 0.963 G
+- 12g: 0 + 1.28 G
+- 15g: 0 + 1.61 G
+- 18g: 0 + 1.93 G
+- 21g: 0 + 2.19 G
+- 24g: 0 + 2.19 G
 
-So Pass 1 honors 100m+1g+3g+6g fully (cumulative 10.1 G), then
-9g class gets `remaining_cap = 18 - 10.1 = 7.9 G` (88% of 9 G
-guarantee).
+Sum = 100 M + 1 G + 3 G + 3.74 + 0.96 + 1.28 + 1.61 + 1.93 + 2.19 + 2.19 = 17.99 G ✓
 
-Pass 2: 9g (partial)+12g+15g+18g+21g+24g compete for the
-remaining 0 G ⇒ Pass 2 has nothing to distribute.
+This gives a smoother tradeoff. Operators choose the
+`guarantee-rate` fraction to balance small-class protection vs
+large-class throughput.
 
-That predicts:
-
-| Class | Pass 1 honored | Pass 2 share | Predicted | Today |
-|-------|----------------|--------------|-----------|-------|
-| 100m | 0.1 G | 0 | 0.1 G | 0.02 G |
-| 1g | 1.0 G | 0 | 1.0 G | 0.21 G |
-| 3g | 3.0 G | 0 | 3.0 G | 0.77 G |
-| 6g | 6.0 G | 0 | 6.0 G | 1.43 G |
-| 9g | 7.9 G | 0 | 7.9 G | 2.32 G |
-| 12g | 0 | 0 | 0 | 2.84 G |
-| 15g | 0 | 0 | 0 | 2.77 G |
-| 18g | 0 | 0 | 0 | 2.83 G |
-| 21g | 0 | 0 | 0 | 3.22 G |
-| 24g | 0 | 0 | 0 | 3.62 G |
-
-This is the "literal Pass 1 only" outcome Codex flagged as
-pathological. **Operators will not accept 12g-24g classes at 0
-Gbps.**
-
-#### A1.3 The actual algorithm: bounded-honor + proportional-residual
-
-Replace Pass 2 with a **floor on residual exact capacity**. The
-honored Pass 1 set is capped at `floor × cap` where `floor` is
-operator-tunable. Default `floor = 0.5` means at most 50% of
-exact capacity is consumed by Pass 1; the remaining ≥50% goes to
-Pass 2 proportionally across **all** exact queues (honored + not).
-
-Mathematically:
-```
-pass1_cap = floor × cap
-pass1_set = greedy ascending-rate honor until cumulative R reaches pass1_cap
-pass1_honored = sum(R_i for q_i in pass1_set, up to rate)
-pass2_budget = cap - pass1_honored
-pass2_quantum_sum = sum(Q_i for ALL exact q_i)
-for q in ALL exact queues:
-    pass2_alloc_i = pass2_budget × Q_i / pass2_quantum_sum
-    q.total_alloc = pass1_alloc_i + pass2_alloc_i
-    (capped at rate_i)
-```
-
-For the 109 / 18 / floor=0.5 fixture:
-- pass1_cap = 9 G
-- Pass 1 honored set (ascending rate, ≤9 G cumulative):
-  100m+1g+3g+6g (cumulative 10.1 G — slightly over, so honor
-  100m+1g+3g and partial 6g at 4.9 G). Or honor 100m+1g+3g+6g
-  fully if integer-rounded (10.1 ≤ 1.1 × 9 G; tolerance band).
-- pass2_budget = 18 - 9 = 9 G
-- pass2 distributed: each exact queue gets `9 × Q_i / 2400 = 9 ×
-  rate_i / 105` (since Q_i ∝ R_i for unclamped). So pass2_alloc:
-  - 100m: 9 × 0.1/105 = 8.6 Mbps (but already at 100 M from
-    Pass 1; cap.)
-  - 1g: 85.7 Mbps (capped at 1 G)
-  - 3g: 257 Mbps (capped at 3 G)
-  - 6g: 514 Mbps (capped at 6 G)
-  - 9g: 771 Mbps
-  - 12g: 1029 Mbps
-  - 15g: 1286 Mbps
-  - 18g: 1543 Mbps
-  - 21g: 1755 (clamped quantum gives slightly less)
-  - 24g: 1755
-
-Total Pass 2: ~9 G. Total predicted:
-- 100m: 100M (Pass 1 cap) ✓
-- 1g: 1 G ✓
-- 3g: 3 G ✓
-- 6g: 4.9 (Pass 1 partial) + 0.5 (Pass 2) = 5.4 G ≥ 90% of 6 G ✓
-- 9g: 0 + 0.77 = 0.77 G (worse than today's 2.32!)
-
-Hmm. This is the fundamental tension: protecting small classes
-absolutely costs the mid-range classes their proportional share.
-
-#### A1.4 Refined: weighted-honor algorithm (final v3 proposal)
-
-Replace `floor = 0.5` with a smarter rule: **honor each
-ascending class up to its rate OR up to its fair-share-under-
-pure-proportional, whichever is larger**.
+#### A1.3 Operator-selectable policy (Junos-style)
 
 ```
-proportional_share_i = cap × R_i / sum(R_j)  // current scheduler result
-honor_target_i = max(R_i, proportional_share_i)
-                  if cumulative honor remains ≤ cap; else stop
+set class-of-service interfaces <iface> unit <u>
+  oversubscription-policy guarantee-rate <fraction>
 ```
 
-Under 109/18/proportional fixture (sum R = 105 G, cap = 18 G,
-proportional_share = R_i × 18 / 105 = 0.171 × R_i):
+`fraction` is `0.0..1.0`. Default `0.0` preserves current
+behaviour bit-for-bit. Recommended values:
+- `0.0` (default): pure proportional — no behaviour change.
+- `0.4`: balanced — small classes honoured, large classes
+  receive ~70% of their previous share.
+- `0.7`: aggressive — small classes fully honoured, large
+  classes receive ~30-40% of their previous share.
+- `1.0`: full strict — small classes fully honoured, large
+  classes share only the remaining 0-9% of cap.
 
-| Class | Proportional | Rate | Honor target | Cumulative |
-|-------|--------------|------|--------------|------------|
-| 100m | 17.1 M | 100 M | **100 M** | 0.1 G |
-| 1g | 171 M | 1 G | **1 G** | 1.1 G |
-| 3g | 514 M | 3 G | **3 G** | 4.1 G |
-| 6g | 1.03 G | 6 G | **6 G** | 10.1 G |
-| 9g | 1.54 G | 9 G | rate (9 G) | 19.1 G OVER! |
-
-Cumulative honor at 9g exceeds cap. The 9g class is the
-boundary: its honor target reduces from "rate" to
-"proportional 1.54 G" (or any value between proportional and
-rate; pick proportional). Cumulative becomes 11.64 G; remaining
-= 6.36 G.
-
-For 12g-24g: each gets proportional 0.171 × R_i:
-- 12g: 2.06 G
-- 15g: 2.57 G
-- 18g: 3.09 G
-- 21g: 2.74 G (clamped quantum, would-be 3.6 G)
-- 24g: 2.74 G (clamped)
-
-Cumulative 12g-24g: 2.06+2.57+3.09+2.74+2.74 = 13.2 G. With
-6.36 G remaining, scale by 6.36/13.2 = 0.48. Final allocations:
-
-| Class | Final predicted |
-|-------|------------------|
-| 100m | 100 M ✓ (was 20) |
-| 1g | 1.0 G ✓ (was 210M) |
-| 3g | 3.0 G ✓ (was 770M) |
-| 6g | 6.0 G ✓ (was 1.43 G) |
-| 9g | 1.54 G (was 2.32 G — REGRESSION) |
-| 12g | 0.99 G (was 2.84 G — REGRESSION) |
-| 15g | 1.23 G (was 2.77 G — REGRESSION) |
-| 18g | 1.48 G (was 2.83 G — REGRESSION) |
-| 21g | 1.32 G (was 3.22 G — REGRESSION) |
-| 24g | 1.32 G (was 3.62 G — REGRESSION) |
-
-Small classes WIN BIG. Mid classes REGRESS. **This is the
-right Junos semantic** but operators must opt in.
-
-#### A1.5 Operator-selectable mode (Junos-style)
-
-Per Codex r1 finding #3 (criterion 1 conflicts with stated
-goal): add a Junos-style operator knob to select policy:
+Configuration-validator warning when `guarantee_fraction > 0`
+AND `sum_rates > shaping_rate`:
 
 ```
-set class-of-service interfaces <iface> unit <u> oversubscription-policy {strict-exact | proportional}
+warning: oversubscription-policy guarantee-rate <X> on
+<iface>.<u>: small classes will be honoured to their full rate;
+larger classes will see throughput reduced from
+(proportional ≈ R × shaping / sum_R) to ((1-X) of proportional).
+Set guarantee-rate 0.0 to preserve current proportional behaviour.
 ```
 
-- **`strict-exact`** (new, opt-in): A1.4 algorithm —
-  small-class guarantees honored absolutely; mid-large classes
-  share residual proportionally.
+#### A1.4 Why the algorithm is stable across drain passes
 
-- **`proportional`** (default, current behaviour): existing
-  scheduler unchanged.
-
-The default is `proportional` to avoid regressing existing
-deployments. Operators who want Junos `transmit-rate exact`
-semantics opt in.
-
-Configuration-validator warning when `strict-exact` is selected
-AND sum_rates > shaping_rate: "selected strict-exact under
-oversubscription; classes with rate above (rate × shaping_rate
-/ sum_rates) will see regression versus proportional".
+The algorithm is stateless across drain passes (no
+guarantee-debt accumulation). Each pass independently computes
+phase 1 + phase 2 over `root.tokens` (which is refilled by
+`refill_cos_tokens` per the shaping rate). This avoids the
+Codex r1 #2 concern about debt growing faster than service:
+debt is BOUNDED per pass by `pass1_budget`, not accumulated
+across passes.
 
 ### A2. Priority-low minimum share (work-conserving)
 
@@ -444,7 +381,7 @@ Wire-protocol both-sides:
 Default value `0` means "no min-share" (preserving current
 behaviour). The fixture-level default `5%` is applied at the
 Go config-compile stage from the `oversubscription-policy`
-setting if `strict-exact` is selected.
+setting if `guarantee-rate` is selected.
 
 ### A3. CoDel-style time-based AQM (replaces v1 ECN-WRED)
 
@@ -486,7 +423,7 @@ applies to all flows.
 ```
 warning: class-of-service interfaces <iface> unit <u> exact-rate sum
 (<N> G) exceeds shaping-rate (<M> G); selected
-oversubscription-policy=<mode> will produce <strict-exact: small
+oversubscription-policy=<mode> will produce <`guarantee-rate` (fraction>0): small
 classes honored, large classes reduced | proportional:
 proportional-share for all>.
 ```
@@ -522,7 +459,7 @@ baseline:
   arrive at same scheduler behaviour from same config.
 - **Cstruct (#1217) contract preservation**: per-flow CoV gate
   unchanged. New shape-achievement gates are additive.
-- **Junos compat**: `strict-exact` mode is opt-in; default
+- **Junos compat**: `guarantee-rate` mode is opt-in; default
   `proportional` preserves current behaviour bit-for-bit. No
   upgrade surprise.
 - **ECN-NOT-ECT protection** (RFC 3168 §6.1.1.1): unchanged.
@@ -537,7 +474,7 @@ baseline:
 Per Codex r1 finding #3 — criterion 1 of v1/v2 was already met
 by baseline. v3 criteria are honest about what Axis A delivers:
 
-1. **In `strict-exact` mode**: small classes (sum_rates ≤
+1. **In `guarantee-rate` mode**: small classes (sum_rates ≤
    ceiling) hit ≥ 95% of configured rate under simul-load.
    Specifically:
    - 100m class ≥ 95 Mbps (today: 20)
@@ -548,7 +485,7 @@ by baseline. v3 criteria are honest about what Axis A delivers:
      unfulfillable under 109/18 oversubscription; they get
      residual share per A1.4).
 
-2. **In `strict-exact` mode**: priority-low (iperf-uncapped) gets
+2. **In `guarantee-rate` mode**: priority-low (iperf-uncapped) gets
    ≥ 5% of cluster ceiling (today: 0 Gbps).
 
 3. **Aggregate retrans ≤ 100 per class per 30 s under simul**
@@ -639,10 +576,10 @@ Need confirmation of exact file paths at implementation time.
 Reviewers please flag if these are wrong.
 
 ### R5. A1.4 "weighted-honor" algorithm produces regressions on
-mid-rate classes under `strict-exact`
+mid-rate classes under `guarantee-rate`
 
 This is intentional and documented. Operators who want this
-behaviour opt in via `oversubscription-policy strict-exact`.
+behaviour opt in via `oversubscription-policy guarantee-rate <X>`.
 Default remains `proportional` (no regression).
 
 ### R6. CoDel interaction with shape-rate-based drops
@@ -691,7 +628,7 @@ Full `cargo test --workspace` green.
 - **NEW Pass C — simul-load all-11-class push**: 30 s, all 11
   classes parallel, push direction. Runs in BOTH modes:
   - C1: `proportional` (regression gate 6)
-  - C2: `strict-exact` (gates 1, 2, 3)
+  - C2: `guarantee-rate` (gates 1, 2, 3)
 - **NEW Pass D — simul-load all-11-class reverse (R8 gate 8)**:
   same fixture, reverse direction, with `mpstat` capture. Gate
   per §7 criterion 8.
@@ -702,7 +639,7 @@ reducer. Permanent member of smoke matrix.
 ### 10.3 HA failover
 
 `make test-failover` passes at ~60 ms median over 5 iterations
-in BOTH modes (proportional + strict-exact).
+in BOTH modes (proportional + `guarantee-rate`).
 
 ### 10.4 Backward-compat regression
 
@@ -736,7 +673,7 @@ distribution matches master HEAD within ±5% per-class.
   specified, terminating, and correct?
 - [ ] Does the `proportional` (default) preservation guarantee
   hold under all configurations?
-- [ ] Does the `strict-exact` opt-in mode honour Junos
+- [ ] Does the `guarantee-rate` opt-in mode honour Junos
   `transmit-rate exact` documented semantics?
 - [ ] Is the §7 gate 8 (R8 reverse-simul check) sufficient to
   rule out generator-bottleneck before implementation?
