@@ -1094,7 +1094,7 @@ func validateCoSOversubscriptionWarnings(cos *ClassOfServiceConfig) []string {
 			if sumExact <= unit.ShapingRateBytes {
 				continue
 			}
-			policyTail := "proportional (default): each class receives sumRate × shaping / sumExact (current behaviour)"
+			policyTail := "proportional (default): each class receives classRate × shaping / sumExact (current behaviour)"
 			if unit.OversubscriptionPolicy == "guarantee-rate" {
 				policyTail = fmt.Sprintf(
 					"guarantee-rate %g: small classes honoured to configured rate; larger classes share residual proportionally (see #1614)",

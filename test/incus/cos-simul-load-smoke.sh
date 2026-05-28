@@ -120,9 +120,15 @@ for port in ports:
         bps = ss.get("bits_per_second", 0)
         if bps > 0:
             rates.append(bps / 1e9)
-    end_sum = d.get("end", {}).get("sum_received") or d.get("end", {}).get("sum_sent") or {}
-    recv_gbps = end_sum.get("bits_per_second", 0) / 1e9
-    retr = end_sum.get("retransmits", 0) or 0
+    # Codex code-r1 #5 fix: read throughput from sum_received
+    # (the actual landed bytes) but retransmits from sum_sent
+    # (where the sender-side retransmit counter lives — sum_received
+    # is always zero for the retransmit field in iperf3 JSON).
+    sum_received = d.get("end", {}).get("sum_received") or {}
+    sum_sent = d.get("end", {}).get("sum_sent") or {}
+    recv_gbps = (sum_received.get("bits_per_second") or
+                 sum_sent.get("bits_per_second") or 0) / 1e9
+    retr = sum_sent.get("retransmits", 0) or 0
     cov = (statistics.stdev(rates) / statistics.mean(rates) * 100) if len(rates) > 1 and statistics.mean(rates) > 0 else 0
     spread = (max(rates) / min(rates)) if rates and min(rates) > 0 else float("inf")
     shape = shape_gbps[port]

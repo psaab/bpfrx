@@ -188,6 +188,8 @@ fn build_worker_cos_statuses_aggregates_runtime_by_interface_and_queue() {
             priority_low_reserved_tokens: 0,
             priority_low_last_refill_ns: 0,
             exact_queues_by_rate_ascending: Vec::new(),
+        waterfill_pass1_remaining_bytes: 0,
+        waterfill_phase2_cursor: 0,
             exact_guarantee_rr: 0,
             nonexact_guarantee_rr: 0,
             #[cfg(test)]
@@ -354,6 +356,8 @@ fn build_worker_cos_statuses_sums_owner_profile_without_breaking_hist_invariant(
         priority_low_reserved_tokens: 0,
         priority_low_last_refill_ns: 0,
         exact_queues_by_rate_ascending: Vec::new(),
+        waterfill_pass1_remaining_bytes: 0,
+        waterfill_phase2_cursor: 0,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -583,6 +587,8 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
         priority_low_reserved_tokens: 0,
         priority_low_last_refill_ns: 0,
         exact_queues_by_rate_ascending: Vec::new(),
+        waterfill_pass1_remaining_bytes: 0,
+        waterfill_phase2_cursor: 0,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -860,6 +866,8 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_exact_
         priority_low_reserved_tokens: 0,
         priority_low_last_refill_ns: 0,
         exact_queues_by_rate_ascending: Vec::new(),
+        waterfill_pass1_remaining_bytes: 0,
+        waterfill_phase2_cursor: 0,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -1054,6 +1062,8 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_interf
         priority_low_reserved_tokens: 0,
         priority_low_last_refill_ns: 0,
         exact_queues_by_rate_ascending: Vec::new(),
+        waterfill_pass1_remaining_bytes: 0,
+        waterfill_phase2_cursor: 0,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -1251,6 +1261,8 @@ fn build_worker_cos_statuses_surfaces_distinct_per_queue_drain_telemetry() {
         priority_low_reserved_tokens: 0,
         priority_low_last_refill_ns: 0,
         exact_queues_by_rate_ascending: Vec::new(),
+        waterfill_pass1_remaining_bytes: 0,
+        waterfill_phase2_cursor: 0,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -2324,6 +2336,8 @@ fn active_flow_buckets_peak_is_max_not_sum_across_workers() {
             priority_low_reserved_tokens: 0,
             priority_low_last_refill_ns: 0,
             exact_queues_by_rate_ascending: Vec::new(),
+        waterfill_pass1_remaining_bytes: 0,
+        waterfill_phase2_cursor: 0,
             exact_guarantee_rr: 0,
             nonexact_guarantee_rr: 0,
             #[cfg(test)]

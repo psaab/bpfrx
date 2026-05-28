@@ -153,8 +153,10 @@ type InterfaceSnapshot struct {
 	// the allocator a no-op even if the policy string is set.
 	CoSOversubscriptionGuaranteeFraction float64 `json:"cos_oversubscription_guarantee_fraction,omitempty"`
 	// #1614 A2: priority-low minimum share in bytes per second.
-	// Subtracted from effective scheduler cap before A1 runs
-	// (orthogonal to A1 policy choice). Default 0 (no min-share).
+	// WIRE SURFACE ONLY in PR #1618 — the per-pass cap_eff
+	// subtraction in the Rust selector is deferred to a focused
+	// follow-up. Default 0 (no min-share); no hot-path effect
+	// today.
 	CoSPriorityLowMinShareBytes uint64 `json:"cos_priority_low_min_share_bytes,omitempty"`
 }
 
@@ -222,9 +224,12 @@ type CoSSchedulerSnapshot struct {
 	// queue-lease equal-flow suppression on positive transmit-rate
 	// exact queues.
 	EqualFlowEnforcement bool `json:"equal_flow_enforcement,omitempty"`
-	// #1614 A3: per-queue CoDel target in nanoseconds. 0 disables
-	// CoDel for the queue (current default). Recommended >= 1.5x
-	// post-shaper RTT per AGY r2 finding #3.
+	// #1614 A3: per-queue CoDel target in nanoseconds. WIRE
+	// SURFACE ONLY in PR #1618 — the dequeue-time sojourn check
+	// is deferred to a focused follow-up. 0 disables CoDel for
+	// the queue (current default and the only behaviour-affecting
+	// value today). Recommended >= 1.5x post-shaper RTT per AGY
+	// r2 finding #3 when the sojourn check ships.
 	CodelTargetNS uint64 `json:"codel_target_ns,omitempty"`
 }
 

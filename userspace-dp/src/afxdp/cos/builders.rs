@@ -106,6 +106,8 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(
         priority_low_reserved_tokens: 0,
         priority_low_last_refill_ns: now_ns,
         exact_queues_by_rate_ascending,
+        waterfill_pass1_remaining_bytes: 0,
+        waterfill_phase2_cursor: 0,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]

@@ -102,8 +102,12 @@ pub(crate) struct InterfaceSnapshot {
     #[serde(rename = "cos_oversubscription_guarantee_fraction", default)]
     pub cos_oversubscription_guarantee_fraction: f64,
     /// #1614 A2: priority-low minimum share in bytes per second.
-    /// Subtracted from effective cap before A1 runs (orthogonal to
-    /// A1 policy choice). Default 0 (no min-share).
+    /// WIRE SURFACE ONLY in PR #1618 — the per-pass `cap_eff`
+    /// subtraction in the selector is deferred to a focused
+    /// follow-up issue. Default 0 (no min-share). The runtime
+    /// reads this field through `CoSInterfaceConfig` to plumb the
+    /// value into `CoSInterfaceRuntime`, but no hot-path code
+    /// consumes it yet.
     #[serde(rename = "cos_priority_low_min_share_bytes", default)]
     pub cos_priority_low_min_share_bytes: u64,
 }
