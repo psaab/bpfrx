@@ -20,6 +20,13 @@
 
 ## Plan-review round 4 (plan v4)
 
-- Codex: task-mpoyufgg-ccq66o
-- AGY:   adversarial-review-mpoyum3e-qx87bl
+- Codex: task-mpoyufgg-ccq66o (NEEDS-MINOR — 2 doc-consistency, scrubbed)
+- AGY:   adversarial-review-mpoyum3e-qx87bl (PLAN-READY w/ 4 minor impl follow-ups)
 - Claude SMR: claude-smr-plan-r4.md (PLAN-READY)
+
+## Code-review round 1 (PR #1617)
+
+- Codex: task-mpozrxtm-sf58du
+- AGY:   adversarial-review-mpozs5n6-lzryzj
+- Claude SMR: claude-smr-code-r1.md (pending)
+- Copilot: @copilot review triggered
