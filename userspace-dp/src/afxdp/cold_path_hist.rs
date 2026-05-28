@@ -257,9 +257,28 @@ pub(in crate::afxdp) fn probe_clock_source() -> ClockSource {
                 // is NOT implied by constant_tsc/nonstop_tsc. Check it
                 // explicitly. Linux exposes the CPUID rdtscp feature
                 // flag as the literal token "rdtscp" in the flags line.
-                first_block.contains("constant_tsc")
-                    && first_block.contains("nonstop_tsc")
-                    && first_block.contains("rdtscp")
+                //
+                // AGY code-r1 NIT 2: parse the `flags` line as
+                // whitespace-separated tokens rather than a free-text
+                // substring grep. A virtualized hypervisor or guest
+                // admin who sets a custom CPU model name containing
+                // any of these tokens would otherwise yield a false-
+                // positive probe.
+                let flags_line = first_block
+                    .lines()
+                    .find(|l| {
+                        let trimmed = l.trim_start();
+                        trimmed.starts_with("flags") || trimmed.starts_with("Features")
+                    })
+                    .and_then(|l| l.split(':').nth(1));
+                let Some(flags) = flags_line else {
+                    return false;
+                };
+                let tokens: std::collections::HashSet<&str> =
+                    flags.split_ascii_whitespace().collect();
+                tokens.contains("constant_tsc")
+                    && tokens.contains("nonstop_tsc")
+                    && tokens.contains("rdtscp")
             })
             .unwrap_or(false);
         let clocksource_ok = std::fs::read_to_string(
@@ -842,6 +861,58 @@ mod tests {
             let c = sample_tsc();
             assert!(b >= a && c >= b, "tsc not monotonic: a={a} b={b} c={c}");
         }
+    }
+
+    /// AGY code-r1 NIT 2: probe_clock_source must parse the `flags`
+    /// line as tokens to avoid false-positives from CPU model names
+    /// that contain the substring. We exercise the tokenizer in
+    /// isolation here because probe_clock_source itself reads
+    /// /proc/cpuinfo which is host-state-dependent.
+    #[test]
+    fn cpuinfo_tokenization_rejects_substring_false_positives() {
+        // A pathological "model name" line that contains all three
+        // tokens as substrings of the model name should NOT yield a
+        // positive match if the actual flags line lacks them.
+        let pathological = "\
+model name\t: AMD constant_tsc-nonstop_tsc-rdtscp Special Edition\n\
+flags\t\t: fpu vme de pse\n";
+        let block = pathological.split("\n\n").next().unwrap();
+        let flags_line = block
+            .lines()
+            .find(|l| {
+                let t = l.trim_start();
+                t.starts_with("flags") || t.starts_with("Features")
+            })
+            .and_then(|l| l.split(':').nth(1));
+        let flags = flags_line.expect("flags line must exist in fixture");
+        let tokens: std::collections::HashSet<&str> =
+            flags.split_ascii_whitespace().collect();
+        assert!(!tokens.contains("constant_tsc"));
+        assert!(!tokens.contains("nonstop_tsc"));
+        assert!(!tokens.contains("rdtscp"));
+    }
+
+    /// AGY code-r1 NIT 2: the positive case — a realistic flags line
+    /// with all three tokens must be detected.
+    #[test]
+    fn cpuinfo_tokenization_accepts_realistic_flags_line() {
+        let realistic = "\
+processor\t: 0\n\
+flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov constant_tsc rep_good nopl nonstop_tsc cpuid pni rdtscp\n";
+        let block = realistic.split("\n\n").next().unwrap();
+        let flags_line = block
+            .lines()
+            .find(|l| {
+                let t = l.trim_start();
+                t.starts_with("flags") || t.starts_with("Features")
+            })
+            .and_then(|l| l.split(':').nth(1))
+            .expect("flags line must exist");
+        let tokens: std::collections::HashSet<&str> =
+            flags_line.split_ascii_whitespace().collect();
+        assert!(tokens.contains("constant_tsc"));
+        assert!(tokens.contains("nonstop_tsc"));
+        assert!(tokens.contains("rdtscp"));
     }
 
     /// Codex code-r1 finding 1: verify the start/end split exists and
