@@ -246,6 +246,22 @@ pub(crate) struct ConfigSnapshot {
     pub config: serde_json::Value,
     #[serde(rename = "defer_workers", default)]
     pub defer_workers: bool,
+    /// #1620: cold-path latency histogram sample mask. `Some(mask)`
+    /// means an explicit operator setting; `None` means "use the
+    /// built-in default 0xff" (1-in-256 sampling). The wire shape is
+    /// `Option<u64>` per #1620 plan §4.3 to prevent the
+    /// default-skew bug where an older Go daemon serializes the
+    /// field absent and a `u64` deserializes to 0 (= 1-in-1, the
+    /// wrong default).
+    ///
+    /// Go-side mirror: `pkg/dataplane/userspace/protocol.go` carries
+    /// `ColdPathSampleMask *uint64 json:"cold_path_sample_mask,omitempty"`.
+    /// The Go-side CLI validates the mask is a power-of-two-minus-one
+    /// and rejects `mask == 0` unless `--enable-cold-path-1-in-1-sampling`
+    /// is explicitly set.
+    #[serde(rename = "cold_path_sample_mask", default,
+            skip_serializing_if = "Option::is_none")]
+    pub cold_path_sample_mask: Option<u64>,
 }
 
 

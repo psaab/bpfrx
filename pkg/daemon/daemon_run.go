@@ -328,6 +328,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 		} else {
 			d.dp = dp
 		}
+		// #1620: stamp the cold-path sample mask onto the userspace
+		// Manager so the next buildSnapshot includes it. Mask
+		// validation already happened in cmd/xpfd/main.go (two-flag
+		// scheme, pow-of-2-1, reject u64::MAX). nil pointer ⇒ no
+		// operator setting, userspace-dp defaults to 0xff.
+		if d.dp != nil && d.opts.ColdPathSampleMask != nil {
+			if adapter, ok := d.dp.(interface{ Manager() *dpuserspace.Manager }); ok {
+				if mgr := adapter.Manager(); mgr != nil {
+					mgr.SetColdPathSampleMask(d.opts.ColdPathSampleMask)
+				}
+			}
+		}
 		if d.dp != nil {
 			if err := d.dp.Start(ctx); err != nil {
 				slog.Warn("failed to start dataplane, running in config-only mode",

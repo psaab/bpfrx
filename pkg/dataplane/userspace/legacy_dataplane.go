@@ -61,6 +61,16 @@ func (a *LegacyDataPlaneAdapter) managerOrErr() (*Manager, error) {
 	return a.manager, nil
 }
 
+// #1620: Manager returns the underlying *Manager so the daemon can
+// call SetColdPathSampleMask after Boot(). Returns nil if the
+// adapter has no manager (test/null-adapter case).
+func (a *LegacyDataPlaneAdapter) Manager() *Manager {
+	if a == nil {
+		return nil
+	}
+	return a.manager
+}
+
 func (a *LegacyDataPlaneAdapter) IsLoaded() bool {
 	m, err := a.managerOrErr()
 	if err != nil || m.bpfShim == nil {

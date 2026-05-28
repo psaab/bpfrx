@@ -166,6 +166,23 @@ type Manager struct {
 	// Used by the daemon to defer IPVLAN creation until after XSK
 	// binds in zerocopy mode on fabric parents.
 	OnXSKBound func()
+
+	// #1620: cold-path latency histogram sample mask. Set by the
+	// daemon via SetColdPathSampleMask once at startup. Stamped onto
+	// every ConfigSnapshot built by buildSnapshotWithSchedulerState.
+	// nil pointer ⇒ omit the field from the wire (userspace-dp
+	// defaults to 0xff per #1620 plan §4.3).
+	coldPathSampleMask *uint64
+}
+
+// #1620: set the cold-path sample mask. Called by the daemon at
+// startup with the validated CLI flag value (powers-of-two-minus-one
+// or 0 with --enable-cold-path-1-in-1-sampling). nil means "no
+// operator setting; let userspace-dp use its default 0xff."
+func (m *Manager) SetColdPathSampleMask(mask *uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.coldPathSampleMask = mask
 }
 
 const rstSuppressionRetryBackoff = 5 * time.Second
@@ -539,6 +556,14 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	ucfg := deriveUserspaceConfig(cfg)
 	activeState := m.policySchedulerActiveStateSnapshot()
 	snap := buildSnapshotWithSchedulerState(cfg, ucfg, m.bumpGeneration(), m.readFIBGeneration(), activeState)
+	// #1620: stamp the cold-path sample mask onto the snapshot. The
+	// daemon called SetColdPathSampleMask once at startup with the
+	// validated CLI flag value (or nil for "use default"). A nil
+	// pointer here leaves the wire field absent (omitempty), which
+	// the Rust receiver unwrap_or-s to 0xff per plan §4.3.
+	m.mu.Lock()
+	snap.ColdPathSampleMask = m.coldPathSampleMask
+	m.mu.Unlock()
 	m.syncInterfaceAttachments(result, snap)
 
 	m.mu.Lock()

@@ -181,6 +181,12 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     state.tcp_mss_ipsec_vpn = snapshot.flow.tcp_mss_ipsec_vpn;
     state.tcp_mss_gre_in = snapshot.flow.tcp_mss_gre_in;
     state.tcp_mss_gre_out = snapshot.flow.tcp_mss_gre_out;
+    // #1620: cold-path latency histogram sample mask. Default to 0xff
+    // (1-in-256) when the field is absent on the wire (Option::None ⇒
+    // older Go daemon or daemon launched without --cold-path-sample-mask).
+    // The Go side validates the mask (powers-of-two minus one, plus
+    // explicit --enable-cold-path-1-in-1-sampling for mask=0).
+    state.cold_path_sample_mask = snapshot.cold_path_sample_mask.unwrap_or(0xff);
     // Build filter state from snapshot
     state.filter_state = crate::filter::parse_filter_state_with_three_color_preserving(
         &snapshot.filters,

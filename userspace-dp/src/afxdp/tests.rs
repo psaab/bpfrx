@@ -2779,6 +2779,7 @@ fn poll_descriptor_policy_deny_path_emits_rt_flow_event() {
         peer_worker_commands: &peer_worker_commands,
         dnat_fds: &dnat_fds,
         rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
     };
     let mut sessions = SessionTable::new();
     let mut screen = ScreenState::new();
@@ -2964,6 +2965,7 @@ fn poll_descriptor_input_filter_log_path_emits_rt_flow_event() {
         peer_worker_commands: &peer_worker_commands,
         dnat_fds: &dnat_fds,
         rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
     };
     let mut sessions = SessionTable::new();
     let mut screen = ScreenState::new();
@@ -3131,6 +3133,7 @@ fn poll_descriptor_input_filter_discard_drops_and_logs() {
         peer_worker_commands: &peer_worker_commands,
         dnat_fds: &dnat_fds,
         rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
     };
     let mut sessions = SessionTable::new();
     let mut screen = ScreenState::new();
@@ -3299,6 +3302,7 @@ fn poll_descriptor_session_hit_rechecks_dscp_input_filter() {
         peer_worker_commands: &peer_worker_commands,
         dnat_fds: &dnat_fds,
         rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
     };
     let mut sessions = SessionTable::new();
     let flow_key = SessionKey {
@@ -3506,6 +3510,7 @@ fn poll_descriptor_lo0_filter_discard_drops_without_reinject() {
         peer_worker_commands: &peer_worker_commands,
         dnat_fds: &dnat_fds,
         rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
     };
     let mut sessions = SessionTable::new();
     let mut screen = ScreenState::new();
@@ -3679,6 +3684,7 @@ fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
         peer_worker_commands: &peer_worker_commands,
         dnat_fds: &dnat_fds,
         rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
     };
     let mut sessions = SessionTable::new();
     let flow_key = SessionKey {

@@ -47,6 +47,13 @@ type Options struct {
 	APIAddr     string // HTTP API listen address (empty = disabled)
 	GRPCAddr    string // gRPC API listen address (empty = disabled)
 	Version     string // software version string
+	// #1620: cold-path latency histogram sample mask. nil pointer ⇒
+	// userspace-dp uses default 0xff (1-in-256). Non-nil pointer ⇒
+	// the operator explicitly set --cold-path-sample-mask (and, if
+	// the value is 0, also --enable-cold-path-1-in-1-sampling). The
+	// daemon forwards this verbatim to userspace-dp via the
+	// `cold_path_sample_mask` field on ConfigSnapshot.
+	ColdPathSampleMask *uint64
 }
 
 // nodeIDFile is the path to the cluster node ID file.

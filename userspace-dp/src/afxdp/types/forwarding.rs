@@ -60,6 +60,13 @@ pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) tcp_mss_ipsec_vpn: u16,
     pub(in crate::afxdp) tcp_mss_gre_in: u16,
     pub(in crate::afxdp) tcp_mss_gre_out: u16,
+    /// #1620: cold-path latency histogram sample mask delivered via
+    /// `ConfigSnapshot.cold_path_sample_mask`. `0xff` = 1-in-256
+    /// (default); `0` = 1-in-1 (bounded-cohort microbench only,
+    /// requires operator-explicit `--enable-cold-path-1-in-1-sampling`
+    /// on the Go side). Read by the poll_descriptor pre-eval gate;
+    /// updated atomically via ArcSwap on every snapshot apply.
+    pub(in crate::afxdp) cold_path_sample_mask: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
