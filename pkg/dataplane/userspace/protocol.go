@@ -72,6 +72,15 @@ type ConfigSnapshot struct {
 	Config             *config.Config               `json:"config,omitempty"`
 	Userspace          config.UserspaceConfig       `json:"userspace"`
 	DeferWorkers       bool                         `json:"defer_workers,omitempty"`
+	// #1620: cold-path latency histogram sample mask. *uint64 with
+	// omitempty so a nil pointer omits the field entirely from the
+	// wire (matching the Rust Option<u64>::None behavior). Default
+	// at the Rust receiver: unwrap_or(0xff) = 1-in-256 sampling.
+	// Powers-of-two-minus-one only (validated in cmd/xpfd/main.go).
+	// Setting to a non-nil pointer to 0 explicitly enables 1-in-1
+	// sampling (256× CPU cost) — operator must pass both
+	// --cold-path-sample-mask 0 and --enable-cold-path-1-in-1-sampling.
+	ColdPathSampleMask *uint64 `json:"cold_path_sample_mask,omitempty"`
 }
 
 // AddressBookSnapshot is #1606: one row of the deduplicated address-book

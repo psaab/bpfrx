@@ -136,7 +136,8 @@ Worth-the-churn check:
   record_sample ≈ 32 ns per session-miss packet. Bounded by
   flooder's 2.96 Mpps gate (per #1615) — not a regression of normal
   traffic.
-- ~451 atomics per worker × 6 workers = 22 KiB resident set delta.
+- ~453 atomics per worker × 6 workers ≈ 22 KiB resident set delta
+  (450 from #1619 + 2 new in v4: sample_phase + wrapper_underflow_count).
 - Default `--cold-path-sample-mask` is **0xff** (1-in-256) so the
   default-shipping behaviour is the cheap path. Operators only flip
   to mask 0 for the bounded-cohort microbench.
@@ -197,71 +198,73 @@ The `#[repr(C)]` annotation is **load-bearing**: under default
 optimize packing, which would destroy the hot-cacheline isolation.
 Reviewers explicitly flagged this in r2.
 
+**v4 final layout** (per AGY r3 [HIGH-1] + AXIS-6 amendments;
+matches code in cold_path_hist.rs):
+
 ```rust
 // userspace-dp/src/afxdp/cold_path_hist.rs
-#[repr(C)]
+#[repr(u8)]                          // v4 (AGY r3 [MED-1]): pin enum to 1 byte.
+pub(in crate::afxdp) enum ClockSource {
+    ClockGettime = 2,
+    Tsc = 1,
+    Unset = 0,
+}
+
+#[repr(C)]                           // v3 (AGY r2 + Codex r2): pin field order.
+#[derive(Clone, Debug)]
 pub(in crate::afxdp) struct WorkerColdPathCounters {
-    // === HOT FIELDS (read/written on every session-miss packet) ===
-    // First cacheline: ~32 bytes.
-    pub(in crate::afxdp) sample_phase: u64,
-    pub(in crate::afxdp) ns_per_tsc_q32: u64,
-    pub(in crate::afxdp) wrapper_ns_baseline: u64,
-    pub(in crate::afxdp) clock_source: ClockSource,
-    // === COLD FIELDS (written only on actual sample; ~3 KiB) ===
-    pub(in crate::afxdp) alias_seen: [bool; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    pub(in crate::afxdp) first_key: [u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    pub(in crate::afxdp) sum_ns: [u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    pub(in crate::afxdp) samples: [u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    pub(in crate::afxdp) buckets: [[u64; POLICY_COLD_PATH_HIST_BUCKETS];
-                                   POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+    // === HOT FIELDS (cacheline 0, read on every session-miss) ===
+    pub(in crate::afxdp) sample_phase: u64,             // [0..7]
+    pub(in crate::afxdp) ns_per_tsc_q32: u64,           // [8..15]
+    pub(in crate::afxdp) wrapper_ns_baseline: u64,      // [16..23]
+    pub(in crate::afxdp) wrapper_underflow_count: u64,  // [24..31] — v4 AXIS-6
+    pub(in crate::afxdp) clock_source: ClockSource,     // [32]
+    // === COLD FIELDS (written only on actual sample) ===
+    pub(in crate::afxdp) alias_seen: [bool; 16],        // [33..48]
+    // [49..55] PADDING (7 B to align next u64 array at 56)
+    pub(in crate::afxdp) first_key: [u64; 16],          // [56..183]
+    pub(in crate::afxdp) sum_ns: [u64; 16],             // [184..311]
+    pub(in crate::afxdp) samples: [u64; 16],            // [312..439]
+    pub(in crate::afxdp) buckets: [[u64; 24]; 16],      // [440..3511]
 }
 ```
 
-This is a mechanical reorder; the constructor (Default impl) is
-adjusted to match, but field semantics are unchanged. Tests in
-`cold_path_hist.rs` are field-order-agnostic and pass without
-modification.
-
-The same reorder + `#[repr(C, align(64))]` applies to
-`WorkerColdPathAtomics`. The `align(64)` keeps the cacheline-isolation
-invariant from #1619; the `C` enforces declared field order:
+The reorder + `#[repr(C, align(64))]` applies similarly to
+`WorkerColdPathAtomics`. `align(64)` keeps the cacheline-isolation
+invariant from #1619; `C` enforces field order.
 
 ```rust
 #[repr(C, align(64))]
 pub(in crate::afxdp) struct WorkerColdPathAtomics {
-    // === HOT FIELDS (read by publish_from_local each ~1s tick) ===
-    pub(in crate::afxdp) cold_window_gen: AtomicU64,
-    pub(in crate::afxdp) ns_per_tsc_q32: AtomicU64,
-    pub(in crate::afxdp) wrapper_ns_baseline: AtomicU64,
-    pub(in crate::afxdp) clock_source: AtomicU8,
-    // === COLD FIELDS (16 × 24 atomics ~3 KiB) ===
-    pub(in crate::afxdp) alias_seen: [AtomicBool; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    pub(in crate::afxdp) first_key: [AtomicU64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    pub(in crate::afxdp) sum_ns: [AtomicU64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    pub(in crate::afxdp) samples: [AtomicU64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    pub(in crate::afxdp) buckets:
-        [[AtomicU64; POLICY_COLD_PATH_HIST_BUCKETS]; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+    // === HOT FIELDS (cacheline 0; touched on every publish) ===
+    pub(in crate::afxdp) cold_window_gen: AtomicU64,        // [0..7]
+    pub(in crate::afxdp) sample_phase: AtomicU64,            // [8..15] — v4 [HIGH-1]
+    pub(in crate::afxdp) ns_per_tsc_q32: AtomicU64,          // [16..23]
+    pub(in crate::afxdp) wrapper_ns_baseline: AtomicU64,     // [24..31]
+    pub(in crate::afxdp) wrapper_underflow_count: AtomicU64, // [32..39] — v4 AXIS-6
+    pub(in crate::afxdp) clock_source: AtomicU8,             // [40]
+    // === COLD FIELDS (written by publish_from_local) ===
+    pub(in crate::afxdp) alias_seen: [AtomicBool; 16],
+    pub(in crate::afxdp) first_key: [AtomicU64; 16],
+    pub(in crate::afxdp) sum_ns: [AtomicU64; 16],
+    pub(in crate::afxdp) samples: [AtomicU64; 16],
+    pub(in crate::afxdp) buckets: [[AtomicU64; 24]; 16],
 }
 ```
 
-`#[repr(C, align(64))]` (was `#[repr(align(64))]` in #1619 — v3
-adds the `C` per AGY r2 + Codex r2 to forbid compiler field
-reordering).
-
-**Layout math verified by AGY r2 Axis 2** (assuming `#[repr(C)]`):
-- Offset 0: `sample_phase` u64 → [0..7]
-- Offset 8: `ns_per_tsc_q32` u64 → [8..15]
-- Offset 16: `wrapper_ns_baseline` u64 → [16..23]
-- Offset 24: `clock_source` (ClockSource, repr-default = u8) → [24]
-- Offset 25: `alias_seen` [bool; 16] → [25..40] (alignment 1, no padding)
-- Offset 41..47: 7 bytes padding to reach next 8-aligned offset
-- Offset 48: `first_key` [u64; 16] → [48..175]
-
-The first 48 bytes — all hot fields plus `alias_seen` and the
-padding gap — fit inside cacheline 0 ([0..63]). `first_key`'s
-element 0 lives at offset 48..55 inside the same cacheline. So
-the hot reads (`sample_phase`, `ns_per_tsc_q32`,
-`wrapper_ns_baseline`, `clock_source`) all land in one cacheline.
+**Layout math (verified by `offset_of!` tests in
+`cold_path_hist.rs`)**:
+- `WorkerColdPathCounters`:
+  - sample_phase @ 0, ns_per_tsc_q32 @ 8, wrapper_ns_baseline @ 16,
+    wrapper_underflow_count @ 24, clock_source @ 32,
+    alias_seen @ 33, first_key @ 56.
+  - First 33 bytes (all hot fields) fit in cacheline 0.
+  - alias_seen at [33..48] also lives in cacheline 0.
+- `WorkerColdPathAtomics`:
+  - cold_window_gen @ 0, sample_phase @ 8, ns_per_tsc_q32 @ 16,
+    wrapper_ns_baseline @ 24, wrapper_underflow_count @ 32,
+    clock_source @ 40.
+  - First 41 bytes (six hot fields) fit in cacheline 0.
 
 Default-initialized in `BindingWorker::create` (`worker/mod.rs`) via
 `cold_path: WorkerColdPathCounters::default()`. Memory cost per
@@ -647,7 +650,9 @@ thread per Codex LOW).
    Verified by inspection — the increment is the first statement
    inside the new if-block.
 3. **Seqlock pair coverage**: `cold_window_gen` increment-pair MUST
-   bracket all 448 atomic stores in `publish_from_local`. Verified
+   bracket all 450 atomic stores in `publish_from_local` (448 from
+   #1619 + 2 new in v4: `sample_phase` + `wrapper_underflow_count`).
+   Verified
    by `cold_path_hist.rs` existing tests.
 4. **Calibration-before-sample**: `ns_per_tsc_q32` MUST be installed
    BEFORE the worker enters its hot loop, otherwise the first samples
@@ -673,7 +678,9 @@ thread per Codex LOW).
 
 - [ ] `cargo build --release -p userspace-dp` clean.
 - [ ] `cargo test --release` full suite: ~952+ tests pass.
-- [ ] `cargo test --release cold_path_hist::` — existing 20 tests still pass.
+- [x] `cargo test --release cold_path_hist::` — 28 tests pass
+      (25 inherited from #1619 + 3 new in v4: two layout-offset
+      assertions + one sample_phase/underflow round-trip).
 - [ ] `cargo test --release ha_tests::` — HA path 5/5 flake check.
 - [ ] `go test ./...` — 30+ Go packages pass (CLI flag parse test).
 - [ ] Smoke matrix Pass A (CoS disabled): v4 + v6, push + reverse,

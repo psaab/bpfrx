@@ -56,7 +56,57 @@ func main() {
 	apiAddr := flag.String("api-addr", "127.0.0.1:8080", "HTTP API listen address (empty to disable)")
 	grpcAddr := flag.String("grpc-addr", "127.0.0.1:50051", "gRPC API listen address")
 	debug := flag.Bool("debug", false, "enable debug logging")
+	// #1620: cold-path latency histogram sample mask. Default 0xff
+	// = 1-in-256 sampling. Powers-of-two-minus-one only. For 1-in-1
+	// sampling (256× CPU cost — bounded-cohort microbench only),
+	// also pass --enable-cold-path-1-in-1-sampling.
+	coldPathSampleMask := flag.Uint64("cold-path-sample-mask", 0xff,
+		"Cold-path latency histogram sample mask (powers-of-two minus one). "+
+			"Default 0xff = 1-in-256 sampling. Allowed values: 0x1, 0x3, 0x7, "+
+			"0xff, 0x3ff, ..., 0x7fffffffffffffff. For 1-in-1 sampling (256× "+
+			"CPU cost — bounded-cohort microbench only), use "+
+			"--enable-cold-path-1-in-1-sampling.")
+	enableColdPath1in1 := flag.Bool("enable-cold-path-1-in-1-sampling", false,
+		"Enable 1-in-1 cold-path latency sampling (256× CPU cost). "+
+			"Required for bounded-cohort microbench (#1622); never use in "+
+			"production. Overrides --cold-path-sample-mask to 0.")
 	flag.Parse()
+
+	// #1620: validate the cold-path sample mask. Two-flag scheme per
+	// plan v4 §4.3.
+	effectiveMask := *coldPathSampleMask
+	if *enableColdPath1in1 {
+		effectiveMask = 0
+	}
+	// AGY r3 [MED-2] + Codex r3: reject mask=0 unless explicit 1-in-1.
+	if effectiveMask == 0 && !*enableColdPath1in1 {
+		fmt.Fprintf(os.Stderr,
+			"xpfd: --cold-path-sample-mask=0 requires explicit "+
+				"--enable-cold-path-1-in-1-sampling (256× CPU cost — "+
+				"bounded-cohort microbench only)\n")
+		os.Exit(1)
+	}
+	// Codex r2 MED + Codex r3 + AGY r3: validate pow-of-2-minus-1 for
+	// non-zero masks. u64::MAX (next wraps to 0) is rejected.
+	if effectiveMask != 0 {
+		next := effectiveMask + 1 // uint64; Go-defined wrap to 0 if MAX
+		if next == 0 || (effectiveMask&next) != 0 {
+			fmt.Fprintf(os.Stderr,
+				"xpfd: --cold-path-sample-mask=0x%x: must be a power-of-two "+
+					"minus one (0x1, 0x3, 0x7, 0xff, 0x3ff, ..., 0x7fff_ffff_ffff_ffff) "+
+					"or 0 with --enable-cold-path-1-in-1-sampling. Rejecting "+
+					"u64::MAX as ambiguous.\n",
+				effectiveMask)
+			os.Exit(1)
+		}
+	}
+	// Forward the validated mask to the daemon. Pass by pointer so the
+	// daemon (and userspace-dp) can distinguish "operator set this"
+	// (non-nil) from "use built-in default" (nil). Currently we always
+	// set the pointer because we always parsed the flag — but we use
+	// `effectiveMask` rather than `*coldPathSampleMask` so the 1-in-1
+	// override takes effect.
+	maskPtr := effectiveMask
 
 	// Set up structured logging
 	logLevel := slog.LevelInfo
@@ -68,11 +118,12 @@ func main() {
 	})))
 
 	d := daemon.New(daemon.Options{
-		ConfigFile:  *configFile,
-		NoDataplane: *noDataplane,
-		APIAddr:     *apiAddr,
-		GRPCAddr:    *grpcAddr,
-		Version:     version,
+		ConfigFile:         *configFile,
+		NoDataplane:        *noDataplane,
+		APIAddr:            *apiAddr,
+		GRPCAddr:           *grpcAddr,
+		Version:            version,
+		ColdPathSampleMask: &maskPtr,
 	})
 
 	if err := d.Run(context.Background()); err != nil {
