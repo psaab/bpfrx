@@ -676,19 +676,24 @@ mod tests {
     }
 
     #[test]
-    fn splitmix64_avalanche_low_bits_unique_for_zone_id_diagonal() {
-        // For diagonal (i, i) for i ∈ [0, 16), the 4-bit slot mask
-        // should produce 16 distinct slots.
+    fn splitmix64_avalanche_low_bits_distributes_zone_id_diagonal() {
+        // Copilot code-r3: prior test comment claimed 'should produce
+        // 16 distinct slots' which contradicted the actual >= 8
+        // assertion. Birthday-paradox on 16 uniform throws into 16
+        // bins gives ~10 distinct bins in expectation, never close
+        // to 16. The assertion is a statistical sanity check that
+        // splitmix is roughly uniform; the harness collision detector
+        // (first_key + alias_seen) handles aliasing semantics.
         let mut slots = std::collections::HashSet::new();
         for i in 0..16u16 {
             let s = zone_pair_slot(i, i);
             slots.insert(s);
         }
-        // We don't require all 16 distinct (no perfect bijection
-        // guarantee for splitmix at 4-bit output); we require *some*
-        // distribution. The harness collision detector handles aliasing
-        // explicitly.
-        assert!(slots.len() >= 8, "got slots={slots:?}");
+        assert!(
+            slots.len() >= 8,
+            "splitmix avalanche too tight: only {} distinct slots out of 16 throws into 16 bins (slots={slots:?})",
+            slots.len()
+        );
     }
 
     #[test]

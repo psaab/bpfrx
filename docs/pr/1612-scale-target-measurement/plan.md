@@ -77,13 +77,19 @@ In tree at end of PR:
      prior `sample_tsc()` alias was removed in v3.2 to prevent
      foot-gun usage at the end of a window (Copilot code-r1 +
      Codex code-r1 finding 1).
-   - `WrapperBaselineCalibration` newtype with `calibrate(samples: usize)`
-     method that takes N=4096 rdtscp/rdtscp pairs, returns the median
-     in ns (after Q32 multiplier applied) as the per-worker wrapper
-     baseline. Stored once at worker startup AFTER
+   - `calibrate_wrapper_baseline_ns(ns_per_tsc_q32: u64) -> u64`
+     free function (NOT a newtype as v3 plan v0 documented) that
+     takes N=4096 sample_tsc_start / sample_tsc_end pairs and returns
+     the median in ns (after Q32 multiplier applied) as the per-worker
+     wrapper baseline. Stored once at worker startup AFTER
      `pthread_setaffinity_np` has pinned the worker thread to its
-     core — never re-calibrated. (Claude SMR r1 NIT 2.)
-   - `ClockSource` enum `{ Tsc, ClockGettime }`. Per parent §4.3.2,
+     core — never re-calibrated. (Claude SMR r1 NIT 2 + Copilot
+     code-r3.)
+   - `ClockSource` enum `{ Unset = 0, Tsc = 1, ClockGettime = 2 }`
+     (Copilot code-r3: the v3 plan v0 documented only Tsc + ClockGettime;
+     the shipped code also includes Unset as the calibration default
+     wired into WorkerColdPathAtomics.clock_source: AtomicU8(0)).
+     Per parent §4.3.2,
      graceful degrade if `/proc/cpuinfo` lacks `constant_tsc` + `nonstop_tsc`
      flags OR `/sys/devices/system/clocksource/clocksource0/current_clocksource`
      does not report `tsc`. Worker records its own clock source in
