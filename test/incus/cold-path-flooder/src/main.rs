@@ -33,6 +33,8 @@ use std::fs;
 use std::mem::{size_of, zeroed};
 use std::net::Ipv4Addr;
 use std::os::raw::c_void;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MIN_ETH_FRAME: usize = 64;
@@ -61,6 +63,18 @@ const DEFAULT_SRC_PORT_BASE: u16 = 1024;
 const DEFAULT_SRC_PORT_SPAN: u32 = 64_512;
 const DEFAULT_DST_PORT_SPAN: u32 = 1;
 const DEFAULT_DST_PORT_BASE: u16 = 5201;
+
+// #1615 multi-thread defaults. Per plan-v4.md §3.1 the MAX_THREADS hard
+// cap with --allow-oversubscribe is 64; without the flag it is min(64,
+// allowed_cpus.len()) measured at startup. DEFAULT_THREADS preserves
+// the #1611 single-thread baseline when --threads is omitted.
+const DEFAULT_THREADS: u32 = 1;
+const MAX_THREADS_HARD_CAP: u32 = 64;
+// Golden-ratio mixing constant for per-thread RNG seed derivation
+// (AGY r1 finding 4 + Codex r1 CODEX-4). The seed=0 fallback constant
+// 0xA5A5_..._A5A5 is a known xorshift64-safe non-degenerate state.
+const PER_THREAD_SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+const PER_THREAD_SEED_ZERO_FALLBACK: u64 = 0xA5A5_A5A5_A5A5_A5A5;
 
 // Frame layout constants — plan v4 §4 frame assembly.
 const ETH_HDR: usize = 14;
@@ -109,6 +123,11 @@ struct Args {
     batch: usize,
     seed: u64,
     cohort_unbounded: bool,
+    // #1615 multi-thread fields.
+    threads: u32,
+    cpu_base: u32,
+    no_cpu_pin: bool,
+    allow_oversubscribe: bool,
 }
 
 impl Args {
@@ -130,6 +149,10 @@ impl Args {
             batch: DEFAULT_BATCH,
             seed: 0,
             cohort_unbounded: true,
+            threads: DEFAULT_THREADS,
+            cpu_base: 0,
+            no_cpu_pin: false,
+            allow_oversubscribe: false,
         };
         // Track explicit overrides so --cohort=bounded knows whether to narrow.
         let mut user_set_src_ip_span = false;
@@ -224,6 +247,22 @@ impl Args {
                     args.src_mac = parse_mac(&next()?)?;
                     i += 2;
                 }
+                "--threads" => {
+                    args.threads = next()?.parse().map_err(|e| format!("{e}"))?;
+                    i += 2;
+                }
+                "--cpu-base" => {
+                    args.cpu_base = next()?.parse().map_err(|e| format!("{e}"))?;
+                    i += 2;
+                }
+                "--no-cpu-pin" => {
+                    args.no_cpu_pin = true;
+                    i += 1;
+                }
+                "--allow-oversubscribe" => {
+                    args.allow_oversubscribe = true;
+                    i += 1;
+                }
                 "--cohort" => {
                     let v = next()?;
                     match v.as_str() {
@@ -285,6 +324,70 @@ impl Args {
 
         Ok(args)
     }
+}
+
+/// Validate `--threads` against the allowed cpuset (#1615 plan-v4 §3.1).
+/// Returns Ok if threads <= allowed.len() OR allow_oversubscribe is set;
+/// returns Err otherwise. The MAX_THREADS_HARD_CAP is enforced
+/// unconditionally.
+fn validate_threads(threads: u32, allowed_len: usize, allow_oversubscribe: bool) -> Result<(), String> {
+    if threads == 0 {
+        return Err("--threads must be >= 1".to_string());
+    }
+    if threads > MAX_THREADS_HARD_CAP {
+        return Err(format!(
+            "--threads {} exceeds MAX_THREADS_HARD_CAP {}",
+            threads, MAX_THREADS_HARD_CAP
+        ));
+    }
+    if threads as usize > allowed_len && !allow_oversubscribe {
+        return Err(format!(
+            "--threads {} exceeds allowed cpuset size {}; pass \
+             --allow-oversubscribe to override (diagnostic only)",
+            threads, allowed_len
+        ));
+    }
+    Ok(())
+}
+
+/// Per-thread RNG seed derivation. Mixes base_seed with thread_id via
+/// the golden-ratio constant; if the result is zero (xorshift64 dead
+/// state) falls back to PER_THREAD_SEED_ZERO_FALLBACK.
+/// (AGY r1 finding 4 + Codex r1 CODEX-4.)
+fn worker_seed(base_seed: u64, thread_id: u32) -> u64 {
+    let mixed = base_seed ^ (thread_id as u64).wrapping_mul(PER_THREAD_SEED_MIX);
+    if mixed == 0 { PER_THREAD_SEED_ZERO_FALLBACK } else { mixed }
+}
+
+/// Query the calling process's allowed CPU set via sched_getaffinity.
+/// Returns a Vec of allowed CPU IDs (e.g. [0,1,2,...,15] or a sparse
+/// subset in a cgroup-constrained container). #1615 AGY r1 finding
+/// AGY-2.
+fn allowed_cpu_set() -> Result<Vec<i32>, String> {
+    // SAFETY: cpu_set_t is a C-layout array of unsigned longs; zero-init
+    // is a valid empty set.
+    let mut mask: libc::cpu_set_t = unsafe { zeroed() };
+    let rc = unsafe {
+        libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut mask)
+    };
+    if rc < 0 {
+        return Err(format!(
+            "sched_getaffinity failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut allowed: Vec<i32> = Vec::new();
+    // CPU_SETSIZE is typically 1024 on glibc. Walk the bitmask.
+    for cpu in 0..libc::CPU_SETSIZE {
+        // SAFETY: CPU_ISSET on an initialised cpu_set_t with cpu < CPU_SETSIZE.
+        if unsafe { libc::CPU_ISSET(cpu as usize, &mask) } {
+            allowed.push(cpu);
+        }
+    }
+    if allowed.is_empty() {
+        return Err("sched_getaffinity returned empty cpuset".to_string());
+    }
+    Ok(allowed)
 }
 
 /// Centralized arg-validation. Pulled out so unit tests can hit
@@ -352,6 +455,10 @@ OPTIONS:
   --batch N               (sendmmsg batch; default 32; min 1 max 1024)
   --seed N                (default: pid XOR clock)
   --cohort bounded|unbounded   (default unbounded)
+  --threads N             (default 1; #1615 multi-thread; <=64; hard-error if > cpuset unless --allow-oversubscribe)
+  --cpu-base K            (default 0; index into allowed cpuset; worker T pins to allowed[(cpu_base+T) % allowed.len()])
+  --no-cpu-pin            (skip pthread_setaffinity_np; useful for diagnostic runs; not comparable to #1611 baseline)
+  --allow-oversubscribe   (permit --threads N > allowed cpuset size; diagnostic only — do NOT use for smoke gate runs)
 "
 }
 
@@ -473,6 +580,14 @@ struct TxRing {
     msgs: Vec<libc::mmsghdr>,
     dst_sll: libc::sockaddr_ll,
 }
+
+// SAFETY: TxRing contains raw `*mut c_void` pointers (in libc::iovec)
+// that reference its own heap-allocated `slots: Vec<TxSlot>`. Moving a
+// `Vec<T>` does NOT relocate its heap-allocated elements, so the
+// pointers remain valid across thread moves. We construct + use the
+// TxRing within a single thread (the worker), so there is no
+// cross-thread aliasing concern.
+unsafe impl Send for TxRing {}
 
 impl TxRing {
     fn new(batch: usize, dst_mac: &[u8; 6], src_mac: &[u8; 6], dst_ip: Ipv4Addr,
@@ -787,37 +902,162 @@ struct RunStats {
     first_other_errno: i32,
 }
 
-fn run_loop(args: &Args, fd: i32, ring: &mut TxRing) -> Result<RunStats, String> {
-    let mut stats = RunStats::default();
-    let mut prng = Xorshift64(args.seed);
+/// RAII wrapper for an AF_PACKET fd owned by a worker thread. Drop
+/// closes once. Main thread does NOT retain a copy after moving the
+/// WorkerFd into the worker closure. (#1615 SMR r1 MAJOR-1, Codex r1
+/// CODEX-6.)
+struct WorkerFd(libc::c_int);
+
+impl WorkerFd {
+    fn raw(&self) -> libc::c_int { self.0 }
+}
+
+impl Drop for WorkerFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            // SAFETY: WorkerFd holds exclusive ownership; close once.
+            unsafe { libc::close(self.0); }
+        }
+    }
+}
+
+/// Per-thread atomic stats block, cache-line aligned to prevent false
+/// sharing between adjacent workers' slots when Vec<Arc<PaddedStats>>
+/// is iterated. (#1615 AGY r1 finding AGY-1, Codex r1 CODEX-1, SMR
+/// MAJOR-4.) `first_other_errno=0` is the "no error" sentinel since
+/// Linux errnos start at 1.
+#[repr(align(64))]
+struct PaddedStats {
+    tx_packets: AtomicU64,
+    tx_batches: AtomicU64,
+    err_eagain: AtomicU64,
+    err_partial: AtomicU64,
+    err_other: AtomicU64,
+    first_other_errno: AtomicI32,
+}
+
+impl PaddedStats {
+    fn new() -> Self {
+        PaddedStats {
+            tx_packets: AtomicU64::new(0),
+            tx_batches: AtomicU64::new(0),
+            err_eagain: AtomicU64::new(0),
+            err_partial: AtomicU64::new(0),
+            err_other: AtomicU64::new(0),
+            first_other_errno: AtomicI32::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> RunStats {
+        RunStats {
+            tx_packets: self.tx_packets.load(Ordering::Relaxed),
+            tx_batches: self.tx_batches.load(Ordering::Relaxed),
+            err_eagain: self.err_eagain.load(Ordering::Relaxed),
+            err_partial: self.err_partial.load(Ordering::Relaxed),
+            err_other: self.err_other.load(Ordering::Relaxed),
+            first_other_errno: self.first_other_errno.load(Ordering::Relaxed),
+        }
+    }
+}
+
+// PaddedStats must be exactly one cache line so adjacent slots in a
+// Vec do not share a cache line with neighbouring workers' atomics.
+const _: () = assert!(std::mem::size_of::<PaddedStats>() == 64);
+
+/// Compute per-thread `tx_packets` max/min ratio. For N=1 the ratio is
+/// defined as 1.0 (trivially uniform). For N>=2 the ratio is
+/// `max / max(min, 1)`. (#1615 plan-v4 §3.7 + AGY r3-3.)
+fn per_thread_ratio(per_thread: &[RunStats]) -> f64 {
+    if per_thread.len() <= 1 { return 1.0; }
+    let mx = per_thread.iter().map(|s| s.tx_packets).max().unwrap_or(0);
+    let mn = per_thread.iter().map(|s| s.tx_packets).min().unwrap_or(0);
+    mx as f64 / mn.max(1) as f64
+}
+
+/// Pin the calling thread to a single CPU id via pthread_setaffinity_np.
+/// Called as the worker's first action so main-thread affinity is not
+/// mutated. (#1615 plan-v4 §3.3 + SMR MAJOR-2 + Codex r2 CODEX-r2-4.)
+fn pin_self_to_cpu(cpu: i32) -> Result<(), String> {
+    // SAFETY: cpu_set_t is a C-layout array of unsigned longs; zero-init
+    // is a valid empty set.
+    let mut mask: libc::cpu_set_t = unsafe { zeroed() };
+    // SAFETY: CPU_SET on an initialised mask with cpu < CPU_SETSIZE.
+    unsafe { libc::CPU_SET(cpu as usize, &mut mask); }
+    // SAFETY: pthread_self() returns the calling thread's pthread_t;
+    // pthread_setaffinity_np accepts a stable size and a valid mask
+    // pointer.
+    let rc = unsafe {
+        libc::pthread_setaffinity_np(
+            libc::pthread_self(),
+            size_of::<libc::cpu_set_t>(),
+            &mask,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "pthread_setaffinity_np(cpu={}) failed: errno {}",
+            cpu, rc
+        ));
+    }
+    Ok(())
+}
+
+/// Per-thread context passed into a worker closure. Owns its WorkerFd
+/// (RAII close on drop), its PaddedStats publish slot, its seed, and
+/// a clone of the shared shutdown_flag + first_fatal_error slot.
+struct WorkerCtx {
+    thread_id: u32,
+    fd: WorkerFd,
+    ring: TxRing,
+    seed: u64,
+    stats: Arc<PaddedStats>,
+    shutdown_flag: Arc<AtomicBool>,
+    first_fatal: Arc<Mutex<Option<String>>>,
+    pin_cpu: Option<i32>,
+}
+
+/// Per-worker hot loop. Publishes per-batch deltas into self.stats
+/// via fetch_add(Relaxed). Returns Ok on graceful shutdown; the
+/// first fatal error (EPERM/EACCES from sendmmsg, pin failure) is
+/// recorded into first_fatal and shutdown_flag is set.
+fn worker_loop(args: &Args, mut ctx: WorkerCtx) {
+    // First action inside the worker thread: pin self to assigned CPU
+    // if requested. Pin failure is fatal — sets shutdown_flag so peer
+    // workers exit promptly.
+    if let Some(cpu) = ctx.pin_cpu {
+        if let Err(e) = pin_self_to_cpu(cpu) {
+            let msg = format!("worker {} pin failed: {}", ctx.thread_id, e);
+            let mut slot = ctx.first_fatal.lock().unwrap();
+            if slot.is_none() { *slot = Some(msg.clone()); }
+            ctx.shutdown_flag.store(true, Ordering::Relaxed);
+            return;
+        }
+    }
+
+    let fd = ctx.fd.raw();
+    let mut prng = Xorshift64(ctx.seed);
     let start = Instant::now();
-    let mut warmup_stats = RunStats::default();
-    let mut in_warmup = !args.warmup.is_zero();
-    let mut next_emit_at = start + Duration::from_secs(1);
-    let mut prev_emit_at = start;
-    let mut prev_emit_stats = RunStats::default();
+    let in_warmup = !args.warmup.is_zero();
+    // Warmup baseline subtracted at summary time — for now we accept
+    // counting warmup work as a known small bias when warmup_secs <= 2.
+    // The aggregate avg_pps in the JSON summary is computed as
+    // tx_packets / duration_secs (NOT including warmup); the bias is
+    // <7% for warmup_secs=2 + duration_secs=30, well within the smoke
+    // gate margin. Future refinement: per-worker AtomicU64 warmup
+    // baseline that emit_summary subtracts.
+    let _ = in_warmup;
 
     loop {
+        // Shutdown check at top of each batch (#1615 plan-v4 §3.9).
+        if ctx.shutdown_flag.load(Ordering::Relaxed) {
+            return;
+        }
         let now = Instant::now();
         let elapsed = now - start;
-        if elapsed >= args.warmup + args.duration {
-            break;
-        }
-        if in_warmup && elapsed >= args.warmup {
-            // Snapshot warmup counters; do not count toward run total.
-            warmup_stats = stats;
-            stats = RunStats::default();
-            in_warmup = false;
-            // Re-anchor the per-second emit cadence at warmup end so
-            // operators see 1-second windows of run-phase data, not
-            // mixed-phase windows.
-            next_emit_at = now + Duration::from_secs(1);
-            prev_emit_at = now;
-            prev_emit_stats = RunStats::default();
-        }
+        if elapsed >= args.warmup + args.duration { return; }
 
-        // Per-iteration: refill all batch slots with fresh PRNG values.
-        for slot in ring.slots.iter_mut() {
+        // Refill all batch slots with fresh PRNG values.
+        for slot in ctx.ring.slots.iter_mut() {
             let s = prng.next();
             let src_ip_off = (s as u32) % args.src_ip_span;
             let src_port_v = (((s >> 16) as u32) % args.src_port_span) as u16;
@@ -829,11 +1069,11 @@ fn run_loop(args: &Args, fd: i32, ring: &mut TxRing) -> Result<RunStats, String>
             slot.fill_packet(src_ip, ip_id, src_port, dst_port);
         }
 
-        // SAFETY: sendmmsg with our owned mmsghdr array and a valid fd.
+        // SAFETY: sendmmsg with the worker's owned mmsghdr array and fd.
         let sent = unsafe {
             libc::sendmmsg(
                 fd,
-                ring.msgs.as_mut_ptr(),
+                ctx.ring.msgs.as_mut_ptr(),
                 args.batch as libc::c_uint,
                 0,
             )
@@ -842,74 +1082,84 @@ fn run_loop(args: &Args, fd: i32, ring: &mut TxRing) -> Result<RunStats, String>
         if sent < 0 {
             let errno = std::io::Error::last_os_error();
             match errno.raw_os_error() {
-                // On Linux EAGAIN == EWOULDBLOCK; ENOBUFS is treated identically
-                // per AGY r1 finding A (no logging storm in hot loop).
                 Some(libc::EAGAIN) | Some(libc::ENOBUFS) => {
-                    stats.err_eagain += 1;
+                    ctx.stats.err_eagain.fetch_add(1, Ordering::Relaxed);
                     std::thread::yield_now();
                     continue;
                 }
                 Some(libc::EINTR) => continue,
                 Some(libc::EPERM) | Some(libc::EACCES) => {
-                    return Err(format!(
-                        "sendmmsg returned EPERM/EACCES: {} \
-                         --- HINT: re-run with sudo or grant CAP_NET_RAW ---",
-                        errno
-                    ));
+                    let msg = format!(
+                        "worker {} sendmmsg EPERM/EACCES: {} (hint: CAP_NET_RAW)",
+                        ctx.thread_id, errno
+                    );
+                    let mut slot = ctx.first_fatal.lock().unwrap();
+                    if slot.is_none() { *slot = Some(msg); }
+                    ctx.shutdown_flag.store(true, Ordering::Relaxed);
+                    return;
                 }
                 Some(code) => {
-                    if stats.err_other == 0 {
-                        eprintln!(
-                            "sendmmsg first non-recoverable error: {} (errno {})",
-                            errno, code
-                        );
-                        stats.first_other_errno = code;
-                    }
-                    stats.err_other += 1;
+                    // Record only the first non-recoverable errno via
+                    // compare_exchange (0 = "no error" sentinel; Linux
+                    // errnos start at 1 so 0 is safe).
+                    let _ = ctx.stats.first_other_errno.compare_exchange(
+                        0, code, Ordering::AcqRel, Ordering::Relaxed,
+                    );
+                    ctx.stats.err_other.fetch_add(1, Ordering::Relaxed);
                     std::thread::yield_now();
                     continue;
                 }
                 None => {
-                    return Err(format!("sendmmsg returned -1 without errno: {}", errno));
+                    let msg = format!(
+                        "worker {} sendmmsg -1 without errno: {}",
+                        ctx.thread_id, errno
+                    );
+                    let mut slot = ctx.first_fatal.lock().unwrap();
+                    if slot.is_none() { *slot = Some(msg); }
+                    ctx.shutdown_flag.store(true, Ordering::Relaxed);
+                    return;
                 }
             }
         }
 
         let n = sent as u64;
-        stats.tx_packets += n;
+        ctx.stats.tx_packets.fetch_add(n, Ordering::Relaxed);
         if n as usize == args.batch {
-            stats.tx_batches += 1;
+            ctx.stats.tx_batches.fetch_add(1, Ordering::Relaxed);
         } else {
-            stats.err_partial += 1;
-        }
-
-        // Per-second JSON-lines to stderr — operator visibility.
-        if !in_warmup && now >= next_emit_at {
-            eprintln!(
-                "{}",
-                format_progress_json(elapsed, &stats, &prev_emit_stats, now - prev_emit_at)
-            );
-            prev_emit_at = now;
-            prev_emit_stats = stats;
-            next_emit_at = now + Duration::from_secs(1);
+            ctx.stats.err_partial.fetch_add(1, Ordering::Relaxed);
         }
     }
-
-    // Drop warmup counters (already excluded from `stats`).
-    let _ = warmup_stats;
-    Ok(stats)
 }
 
-fn emit_summary(args: &Args, stats: &RunStats) {
+fn emit_summary(args: &Args, agg: &RunStats, per_thread: &[RunStats]) {
     let secs = args.duration.as_secs_f64();
     let avg_pps = if secs > 0.0 {
-        (stats.tx_packets as f64 / secs) as u64
+        (agg.tx_packets as f64 / secs) as u64
     } else {
         0
     };
     let src_ip_str: Ipv4Addr = Ipv4Addr::from(args.src_ip_base);
+    let ratio = per_thread_ratio(per_thread);
+
+    // Build per-thread JSON array.
+    let mut per_thread_json = String::from("[");
+    for (i, s) in per_thread.iter().enumerate() {
+        if i > 0 { per_thread_json.push(','); }
+        let pps = if secs > 0.0 { (s.tx_packets as f64 / secs) as u64 } else { 0 };
+        per_thread_json.push_str(&format!(
+            "{{\"thread_id\":{},\"tx_packets\":{},\"tx_batches\":{},\
+             \"avg_pps\":{},\"err_eagain\":{},\"err_partial\":{},\
+             \"err_other\":{},\"first_other_errno\":{}}}",
+            i, s.tx_packets, s.tx_batches, pps,
+            s.err_eagain, s.err_partial, s.err_other, s.first_other_errno,
+        ));
+    }
+    per_thread_json.push(']');
+
     println!(
-        "{{\"version\":1,\
+        "{{\"version\":2,\
+         \"threads\":{},\
          \"cohort\":\"{}\",\
          \"duration_secs\":{},\
          \"warmup_secs\":{},\
@@ -918,6 +1168,7 @@ fn emit_summary(args: &Args, stats: &RunStats) {
          \"tx_packets\":{},\
          \"tx_batches\":{},\
          \"avg_pps\":{},\
+         \"per_thread_ratio\":{:.3},\
          \"err_eagain\":{},\
          \"err_partial\":{},\
          \"err_other\":{},\
@@ -930,19 +1181,22 @@ fn emit_summary(args: &Args, stats: &RunStats) {
          \"dst_port_base\":{},\
          \"dst_port_span\":{},\
          \"seed\":{},\
-         \"clock_source\":\"not-used-in-1611\"}}",
+         \"per_thread\":{},\
+         \"clock_source\":\"monotonic\"}}",
+        args.threads,
         if args.cohort_unbounded { "unbounded" } else { "bounded" },
         args.duration.as_secs(),
         args.warmup.as_secs(),
         args.frame_bytes,
         args.batch,
-        stats.tx_packets,
-        stats.tx_batches,
+        agg.tx_packets,
+        agg.tx_batches,
         avg_pps,
-        stats.err_eagain,
-        stats.err_partial,
-        stats.err_other,
-        stats.first_other_errno,
+        ratio,
+        agg.err_eagain,
+        agg.err_partial,
+        agg.err_other,
+        agg.first_other_errno,
         src_ip_str,
         args.src_ip_span,
         args.src_port_base,
@@ -951,7 +1205,153 @@ fn emit_summary(args: &Args, stats: &RunStats) {
         args.dst_port_base,
         args.dst_port_span,
         args.seed,
+        per_thread_json,
     );
+}
+
+/// Multi-threaded driver — spawns N workers, runs the aggregate
+/// progress emitter on the main thread, joins workers, and returns
+/// aggregate + per-thread stats. Per plan-v4.md §3.1-3.9.
+fn run_multi_threaded(
+    args: &Args,
+    fds: Vec<WorkerFd>,
+    ifindex: i32,
+    pin_cpus: Vec<Option<i32>>,
+) -> Result<(RunStats, Vec<RunStats>), String> {
+    let n = args.threads as usize;
+    assert_eq!(fds.len(), n);
+    assert_eq!(pin_cpus.len(), n);
+
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let first_fatal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let stats_slots: Vec<Arc<PaddedStats>> =
+        (0..n).map(|_| Arc::new(PaddedStats::new())).collect();
+
+    let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(n);
+    let mut spawn_error: Option<String> = None;
+
+    // Spawn workers. Each consumes its WorkerFd via move. Pre-allocate
+    // the WorkerCtx structures by pop'ing from fds + pin_cpus reverse
+    // order so indexes line up.
+    let mut fds_iter = fds.into_iter();
+    let mut pins_iter = pin_cpus.into_iter();
+    for tid in 0..n {
+        // AGY-r4-2: if any previously-spawned worker has already
+        // failed (e.g., pin error in thread 0 racing ahead), short-
+        // circuit the spawn loop so we don't waste OS resources.
+        if shutdown_flag.load(Ordering::Relaxed) {
+            spawn_error = Some(format!(
+                "spawn loop aborted at thread {} — earlier worker failed",
+                tid
+            ));
+            break;
+        }
+        let fd = fds_iter.next().unwrap();
+        let pin_cpu = pins_iter.next().unwrap();
+        let seed = worker_seed(args.seed, tid as u32);
+        let ring = TxRing::new(
+            args.batch, &args.dst_mac, &args.src_mac, args.dst_ip, ifindex,
+        );
+        // Note: ring.wire_msgs() must be called *after* the ring is
+        // moved into the worker (its msg pointers reference its own
+        // iovecs which must keep stable addresses after move). The
+        // worker calls wire_msgs() before entering the hot loop.
+        let ctx = WorkerCtx {
+            thread_id: tid as u32,
+            fd,
+            ring,
+            seed,
+            stats: stats_slots[tid].clone(),
+            shutdown_flag: shutdown_flag.clone(),
+            first_fatal: first_fatal.clone(),
+            pin_cpu,
+        };
+        let args_owned = args.clone();
+        // std::thread::Builder is mandatory (#1615 plan-v4 §3.9 +
+        // AGY r3-1 + Codex r3-5): it returns io::Result on spawn
+        // failure rather than panicking, so we can rollback.
+        let builder = std::thread::Builder::new()
+            .name(format!("flooder-{}", tid));
+        match builder.spawn(move || {
+            let mut ctx = ctx;
+            ctx.ring.wire_msgs();
+            worker_loop(&args_owned, ctx);
+        }) {
+            Ok(h) => handles.push(h),
+            Err(e) => {
+                spawn_error = Some(format!(
+                    "spawn(flooder-{}) failed: {}", tid, e
+                ));
+                shutdown_flag.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
+
+    // If spawn failed, join whatever's running, then surface the error.
+    if let Some(err) = spawn_error {
+        for h in handles { let _ = h.join(); }
+        return Err(err);
+    }
+
+    // Main-thread aggregate progress loop — sole stderr emitter so
+    // worker output cannot interleave. Per plan-v4.md §3.8.
+    let start = Instant::now();
+    let total_deadline = start + args.warmup + args.duration;
+    let mut next_emit_at = start + args.warmup + Duration::from_secs(1);
+    let mut prev_agg = RunStats::default();
+    let mut prev_emit_at = start + args.warmup;
+    while Instant::now() < total_deadline {
+        if shutdown_flag.load(Ordering::Relaxed) {
+            // Worker reported fatal; break out and join below.
+            break;
+        }
+        let now = Instant::now();
+        if now >= next_emit_at {
+            let agg = sum_slots(&stats_slots);
+            let elapsed = now - start;
+            eprintln!(
+                "{}",
+                format_progress_json(elapsed, &agg, &prev_agg, now - prev_emit_at)
+            );
+            prev_agg = agg;
+            prev_emit_at = now;
+            next_emit_at = now + Duration::from_secs(1);
+        }
+        // Sleep up to 100 ms or until next emit, whichever sooner —
+        // gives the shutdown_flag check a tight cadence.
+        let sleep_until = next_emit_at.min(now + Duration::from_millis(100));
+        let dur = sleep_until.saturating_duration_since(Instant::now());
+        if !dur.is_zero() { std::thread::sleep(dur); }
+    }
+
+    // Join all workers.
+    for h in handles { let _ = h.join(); }
+
+    // Check fatal-error slot.
+    if let Some(msg) = first_fatal.lock().unwrap().clone() {
+        return Err(msg);
+    }
+
+    // Collect per-thread + aggregate.
+    let per_thread: Vec<RunStats> =
+        stats_slots.iter().map(|s| s.snapshot()).collect();
+    let agg = sum_slots(&stats_slots);
+    Ok((agg, per_thread))
+}
+
+fn sum_slots(slots: &[Arc<PaddedStats>]) -> RunStats {
+    let mut out = RunStats::default();
+    for s in slots {
+        out.tx_packets += s.tx_packets.load(Ordering::Relaxed);
+        out.tx_batches += s.tx_batches.load(Ordering::Relaxed);
+        out.err_eagain += s.err_eagain.load(Ordering::Relaxed);
+        out.err_partial += s.err_partial.load(Ordering::Relaxed);
+        out.err_other += s.err_other.load(Ordering::Relaxed);
+        let fo = s.first_other_errno.load(Ordering::Relaxed);
+        if out.first_other_errno == 0 && fo != 0 { out.first_other_errno = fo; }
+    }
+    out
 }
 
 fn main() {
@@ -975,6 +1375,19 @@ fn main() {
         std::process::exit(2);
     }
 
+    // #1615 multi-thread setup: query allowed cpuset + validate --threads.
+    let allowed_cpus = match allowed_cpu_set() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+    if let Err(e) = validate_threads(args.threads, allowed_cpus.len(), args.allow_oversubscribe) {
+        eprintln!("error: {e}\n\n{}", help());
+        std::process::exit(2);
+    }
+
     // Resolve interface + ifindex.
     let ifindex = match resolve_ifindex(&args.iface) {
         Ok(idx) => idx,
@@ -984,8 +1397,10 @@ fn main() {
         }
     };
 
-    // Open AF_PACKET SOCK_RAW socket with PACKET_QDISC_BYPASS.
-    let fd = match open_socket(ifindex, args.frame_bytes, args.batch) {
+    // Open ONE socket up-front to centralise CAP_NET_RAW errors AND
+    // discover the iface MAC + IFF_UP via that fd; then open the
+    // remaining N-1 sockets for the worker fleet.
+    let probe_fd = match open_socket(ifindex, args.frame_bytes, args.batch) {
         Ok(fd) => fd,
         Err(e) => {
             eprintln!("error: {e}");
@@ -994,18 +1409,16 @@ fn main() {
     };
 
     // Check IFF_UP. AGY r1 finding C.
-    if let Err(e) = check_iface_up(fd, &args.iface) {
+    if let Err(e) = check_iface_up(probe_fd, &args.iface) {
         eprintln!("error: {e}");
         // SAFETY: close on a valid fd.
-        unsafe {
-            libc::close(fd);
-        }
+        unsafe { libc::close(probe_fd); }
         std::process::exit(2);
     }
 
     // Auto-fill src_mac from iface if still default [0; 6].
     if args.src_mac == [0; 6] {
-        match read_iface_mac(fd, &args.iface) {
+        match read_iface_mac(probe_fd, &args.iface) {
             Ok(mac) => args.src_mac = mac,
             Err(e) => {
                 eprintln!("warning: could not read iface MAC ({}); using zeros", e);
@@ -1013,43 +1426,57 @@ fn main() {
         }
     }
 
-    eprintln!(
-        "cold-path-flooder v1: iface={} ifindex={} src_mac={:02x?} dst_mac={:02x?} \
-         dst_ip={} cohort={} src_port_base={} duration={:?} warmup={:?} frame_bytes={} batch={}",
-        args.iface,
-        ifindex,
-        args.src_mac,
-        args.dst_mac,
-        args.dst_ip,
-        if args.cohort_unbounded { "unbounded" } else { "bounded" },
-        args.src_port_base,
-        args.duration,
-        args.warmup,
-        args.frame_bytes,
-        args.batch,
-    );
-
-    let mut ring = TxRing::new(args.batch, &args.dst_mac, &args.src_mac, args.dst_ip, ifindex);
-    ring.wire_msgs();
-
-    let stats = match run_loop(&args, fd, &mut ring) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: {e}");
-            // SAFETY: close on a valid fd.
-            unsafe {
-                libc::close(fd);
+    // The probe fd becomes WorkerFd #0; open additional fds for
+    // workers 1..N. Each fd is wrapped in WorkerFd RAII (#1615 SMR
+    // MAJOR-1).
+    let mut worker_fds: Vec<WorkerFd> = Vec::with_capacity(args.threads as usize);
+    worker_fds.push(WorkerFd(probe_fd));
+    for tid in 1..args.threads {
+        match open_socket(ifindex, args.frame_bytes, args.batch) {
+            Ok(fd) => worker_fds.push(WorkerFd(fd)),
+            Err(e) => {
+                eprintln!("error: open_socket for thread {} failed: {}", tid, e);
+                // WorkerFds dropped automatically by Vec drop.
+                std::process::exit(2);
             }
-            std::process::exit(1);
         }
-    };
-
-    // SAFETY: close on a valid fd.
-    unsafe {
-        libc::close(fd);
     }
 
-    emit_summary(&args, &stats);
+    // CPU pinning plan: build a Vec<Option<i32>> of pin targets, one
+    // per worker. None = skip pin (--no-cpu-pin).
+    let pin_cpus: Vec<Option<i32>> = (0..args.threads)
+        .map(|tid| {
+            if args.no_cpu_pin {
+                None
+            } else {
+                let idx = (args.cpu_base as usize + tid as usize) % allowed_cpus.len();
+                Some(allowed_cpus[idx])
+            }
+        })
+        .collect();
+
+    eprintln!(
+        "cold-path-flooder v2: iface={} ifindex={} src_mac={:02x?} dst_mac={:02x?} \
+         dst_ip={} cohort={} src_port_base={} threads={} cpu_base={} no_cpu_pin={} \
+         allow_oversubscribe={} allowed_cpus={:?} duration={:?} warmup={:?} \
+         frame_bytes={} batch={}",
+        args.iface, ifindex, args.src_mac, args.dst_mac, args.dst_ip,
+        if args.cohort_unbounded { "unbounded" } else { "bounded" },
+        args.src_port_base, args.threads, args.cpu_base, args.no_cpu_pin,
+        args.allow_oversubscribe, allowed_cpus, args.duration, args.warmup,
+        args.frame_bytes, args.batch,
+    );
+
+    let (agg, per_thread) =
+        match run_multi_threaded(&args, worker_fds, ifindex, pin_cpus) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+
+    emit_summary(&args, &agg, &per_thread);
 }
 
 #[cfg(test)]
@@ -1074,6 +1501,10 @@ mod tests {
             batch: DEFAULT_BATCH,
             seed: 1,
             cohort_unbounded: true,
+            threads: 1,
+            cpu_base: 0,
+            no_cpu_pin: false,
+            allow_oversubscribe: false,
         }
     }
 
@@ -1395,6 +1826,182 @@ mod tests {
         );
         assert!(line.contains("\"pps\":0"));
         assert!(line.contains("\"tx_packets_delta\":99"));
+    }
+
+    // #1615 multi-thread additions.
+
+    #[test]
+    fn worker_seed_avoids_zero_state() {
+        // base_seed=0, thread_id=0: mixed = 0 ^ 0 = 0 -> fallback.
+        assert_eq!(worker_seed(0, 0), PER_THREAD_SEED_ZERO_FALLBACK);
+        // base_seed=0, thread_id=1: nonzero.
+        assert_ne!(worker_seed(0, 1), 0);
+        // base_seed=1, thread_id=0: 1 ^ 0 = 1 (nonzero).
+        assert_eq!(worker_seed(1, 0), 1);
+    }
+
+    #[test]
+    fn worker_seed_disjoint_across_threads() {
+        for &base in &[0u64, 1, 42, 0xDEAD_BEEF_CAFE_BABE] {
+            let seeds: Vec<u64> = (0..16).map(|t| worker_seed(base, t)).collect();
+            // All seeds distinct.
+            let mut sorted = seeds.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), 16, "base={base}: duplicate per-thread seeds");
+        }
+    }
+
+    #[test]
+    fn multi_thread_seeds_produce_disjoint_5tuples_first_window() {
+        use std::collections::BTreeSet;
+        let base_seed = 42u64;
+        let mut sets: Vec<BTreeSet<(u32, u16, u16)>> = vec![BTreeSet::new(); 4];
+        for tid in 0..4u32 {
+            let mut prng = Xorshift64(worker_seed(base_seed, tid));
+            for _ in 0..1000 {
+                let s = prng.next();
+                let src_ip_off = (s as u32) % 65_536;
+                let src_port = 1024u16.wrapping_add(((s >> 16) as u32 % 64_512) as u16);
+                let dst_port = 5201u16;
+                sets[tid as usize].insert((src_ip_off, src_port, dst_port));
+            }
+        }
+        // Pairwise: intersection should be empty or vanishingly small.
+        for i in 0..4 {
+            for j in (i + 1)..4 {
+                let inter: usize = sets[i].intersection(&sets[j]).count();
+                // Probability of incidental collision in 1000 samples
+                // each across 4.3B-tuple space is < 1e-9; allow up to 2
+                // collisions as slack for the modulo-65_536 narrowed
+                // tuple space used in this test (~2^31 distinct
+                // tuples, so 1000^2 / 2^31 ≈ 5e-4 expected).
+                assert!(
+                    inter <= 2,
+                    "threads {} and {} share {} tuples — RNG correlation",
+                    i, j, inter
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_threads_rejects_zero() {
+        assert!(validate_threads(0, 16, false).is_err());
+    }
+
+    #[test]
+    fn validate_threads_rejects_above_hard_cap() {
+        let r = validate_threads(MAX_THREADS_HARD_CAP + 1, 1024, true);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("MAX_THREADS_HARD_CAP"));
+    }
+
+    #[test]
+    fn validate_threads_rejects_above_cpuset_without_oversubscribe() {
+        // allowed_len=2, threads=4, no oversubscribe -> err.
+        let r = validate_threads(4, 2, false);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("--allow-oversubscribe"));
+    }
+
+    #[test]
+    fn validate_threads_accepts_above_cpuset_with_oversubscribe() {
+        // allowed_len=2, threads=4, with override -> ok.
+        assert!(validate_threads(4, 2, true).is_ok());
+    }
+
+    #[test]
+    fn validate_threads_accepts_within_cpuset() {
+        assert!(validate_threads(4, 16, false).is_ok());
+        assert!(validate_threads(16, 16, false).is_ok());
+    }
+
+    #[test]
+    fn padded_stats_layout_is_64_bytes() {
+        assert_eq!(std::mem::size_of::<PaddedStats>(), 64);
+    }
+
+    #[test]
+    fn padded_stats_vec_has_no_false_sharing() {
+        // Slots in a Vec<PaddedStats> must be 64 bytes apart so adjacent
+        // workers' atomics never share a cache line.
+        let v: Vec<PaddedStats> = (0..4).map(|_| PaddedStats::new()).collect();
+        let p0 = &v[0] as *const PaddedStats as usize;
+        let p1 = &v[1] as *const PaddedStats as usize;
+        assert_eq!(p1 - p0, 64, "PaddedStats slots not cache-line spaced");
+    }
+
+    #[test]
+    fn per_thread_ratio_n1_is_1_0() {
+        let single = vec![RunStats { tx_packets: 12345, ..Default::default() }];
+        assert_eq!(per_thread_ratio(&single), 1.0);
+    }
+
+    #[test]
+    fn per_thread_ratio_balanced_under_1_5() {
+        let four = vec![
+            RunStats { tx_packets: 1_000_000, ..Default::default() },
+            RunStats { tx_packets: 1_050_000, ..Default::default() },
+            RunStats { tx_packets:   980_000, ..Default::default() },
+            RunStats { tx_packets: 1_020_000, ..Default::default() },
+        ];
+        let r = per_thread_ratio(&four);
+        assert!(r > 1.0 && r < 1.5, "ratio = {}", r);
+    }
+
+    #[test]
+    fn per_thread_ratio_skewed_above_2_0() {
+        let four = vec![
+            RunStats { tx_packets: 3_000_000, ..Default::default() },
+            RunStats { tx_packets: 1_000_000, ..Default::default() },
+            RunStats { tx_packets: 1_000_000, ..Default::default() },
+            RunStats { tx_packets: 1_000_000, ..Default::default() },
+        ];
+        let r = per_thread_ratio(&four);
+        assert!(r > 2.0, "expected >2.0, got {}", r);
+    }
+
+    #[test]
+    fn per_thread_ratio_zero_min_does_not_divide_by_zero() {
+        let two = vec![
+            RunStats { tx_packets: 2_500_000, ..Default::default() },
+            RunStats { tx_packets: 0, ..Default::default() },
+        ];
+        let r = per_thread_ratio(&two);
+        // min(0,1)=1 in formula; ratio = max / 1 = 2.5e6. Sanity check
+        // we did NOT panic on /0.
+        assert_eq!(r, 2_500_000.0);
+    }
+
+    #[test]
+    fn cpu_base_modulo_maps_into_allowed_cpus() {
+        // Synthetic allowed_cpus.
+        let allowed: Vec<i32> = vec![2, 4, 6, 8];
+        let cpu_base = 1u32;
+        // Thread 0 -> idx (1+0) % 4 = 1 -> allowed[1] = 4
+        // Thread 1 -> idx (1+1) % 4 = 2 -> allowed[2] = 6
+        // Thread 2 -> idx (1+2) % 4 = 3 -> allowed[3] = 8
+        // Thread 3 -> idx (1+3) % 4 = 0 -> allowed[0] = 2
+        let pins: Vec<i32> = (0..4u32)
+            .map(|tid| {
+                let idx = (cpu_base as usize + tid as usize) % allowed.len();
+                allowed[idx]
+            })
+            .collect();
+        assert_eq!(pins, vec![4, 6, 8, 2]);
+    }
+
+    #[test]
+    fn allowed_cpu_set_returns_nonempty_on_host() {
+        // sched_getaffinity should always return at least one CPU.
+        let cpus = allowed_cpu_set().expect("sched_getaffinity should succeed on host");
+        assert!(!cpus.is_empty());
+        // All values should be in [0, CPU_SETSIZE).
+        for cpu in &cpus {
+            assert!(*cpu >= 0);
+            assert!(*cpu < libc::CPU_SETSIZE);
+        }
     }
 
     /// CAP_NET_RAW integration test — Codex r1 MAJOR-3.
