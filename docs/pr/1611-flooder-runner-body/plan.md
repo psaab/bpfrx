@@ -256,7 +256,9 @@ into an AF_XDP socket on the same host as the dataplane.
    - **Per-second JSON-lines to stderr** during run (operator
      visibility):
      ```json
-     {"t":1.0,"pps":4892341,"batches":152886,"err_eagain":0,"err_other":0}
+     {"t":1.0,"pps":4892341,"tx_packets_delta":4892341,
+      "tx_batches_delta":152886,"err_eagain_delta":0,
+      "err_other_delta":0}
      ```
    - **Final summary JSON to stdout** (machine-readable, picked up
      by the #1612 harness):
@@ -444,11 +446,13 @@ or a specific errno on failure — DESIRED behavior shift.
     to baseline ≤2 s after the flood stops.
 - **`#[ignore]` CAP_NET_RAW integration smoke** (Codex r1 MAJOR):
   a Rust `#[test] #[ignore]` test in the flooder crate that
-  opens `AF_PACKET / SOCK_RAW`, binds to `lo`, sends a single
-  64-byte frame, verifies clean exit + bytes counter ==
-  frame_bytes. Skipped by default (requires root + env var
+  opens `AF_PACKET / SOCK_RAW`, binds to an `IFF_UP`
+  `ARPHRD_ETHER` iface (explicit via `XPF_RAW_SOCKET_TEST_IFACE`
+  or auto-probed from `/sys/class/net`), sends a single 64-byte
+  frame, verifies clean exit + bytes counter == frame_bytes.
+  Skipped by default (requires root + env var
   `XPF_RUN_RAW_SOCKET_TESTS=1`); run manually via
-  `XPF_RUN_RAW_SOCKET_TESTS=1 sudo -E cargo test --release -- --ignored test_open_af_packet_raw_smoke`
+  `XPF_RUN_RAW_SOCKET_TESTS=1 XPF_RAW_SOCKET_TEST_IFACE=eth0 sudo -E cargo test --release -- --ignored test_open_af_packet_raw_smoke`
   on the cluster host alongside the real-traffic smoke.
 
 ## Out of scope (explicitly)

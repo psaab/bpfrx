@@ -28,6 +28,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::ffi::CString;
+#[cfg(test)]
+use std::fs;
 use std::mem::{size_of, zeroed};
 use std::net::Ipv4Addr;
 use std::os::raw::c_void;
@@ -580,8 +582,8 @@ fn check_iface_up(fd: i32, iface: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Read iface MAC via SIOCGIFHWADDR.
-fn read_iface_mac(fd: i32, iface: &str) -> Result<[u8; 6], String> {
+/// Read iface hwaddr metadata via SIOCGIFHWADDR.
+fn read_iface_hwaddr(fd: i32, iface: &str) -> Result<(u16, [u8; 6]), String> {
     // SAFETY: ifreq is a C-layout POD union; zero-init before SIOCGIFHWADDR.
     let mut ifr: libc::ifreq = unsafe { zeroed() };
     let name_bytes = iface.as_bytes();
@@ -599,14 +601,93 @@ fn read_iface_mac(fd: i32, iface: &str) -> Result<[u8; 6], String> {
             std::io::Error::last_os_error()
         ));
     }
-    // SAFETY: SIOCGIFHWADDR writes ifr_hwaddr.sa_data[0..6] (well-defined union access).
+    // SAFETY: SIOCGIFHWADDR writes ifr_hwaddr.sa_family and
+    // ifr_hwaddr.sa_data[0..6] (well-defined union access).
+    let family = unsafe { ifr.ifr_ifru.ifru_hwaddr.sa_family as u16 };
     let mut mac = [0u8; 6];
     unsafe {
         for i in 0..6 {
             mac[i] = ifr.ifr_ifru.ifru_hwaddr.sa_data[i] as u8;
         }
     }
-    Ok(mac)
+    Ok((family, mac))
+}
+
+/// Read iface MAC via SIOCGIFHWADDR.
+fn read_iface_mac(fd: i32, iface: &str) -> Result<[u8; 6], String> {
+    read_iface_hwaddr(fd, iface).map(|(_, mac)| mac)
+}
+
+fn format_progress_json(
+    elapsed: Duration,
+    stats: &RunStats,
+    prev_emit_stats: &RunStats,
+    emit_window: Duration,
+) -> String {
+    let tx_packets_delta = stats.tx_packets.saturating_sub(prev_emit_stats.tx_packets);
+    let tx_batches_delta = stats.tx_batches.saturating_sub(prev_emit_stats.tx_batches);
+    let err_eagain_delta = stats.err_eagain.saturating_sub(prev_emit_stats.err_eagain);
+    let err_partial_delta = stats.err_partial.saturating_sub(prev_emit_stats.err_partial);
+    let err_other_delta = stats.err_other.saturating_sub(prev_emit_stats.err_other);
+    let pps = if emit_window.is_zero() {
+        0
+    } else {
+        (tx_packets_delta as f64 / emit_window.as_secs_f64()) as u64
+    };
+    format!(
+        "{{\"t\":{},\"pps\":{},\"tx_packets_delta\":{},\"tx_batches_delta\":{},\"err_eagain_delta\":{},\"err_partial_delta\":{},\"err_other_delta\":{}}}",
+        elapsed.as_secs_f64(),
+        pps,
+        tx_packets_delta,
+        tx_batches_delta,
+        err_eagain_delta,
+        err_partial_delta,
+        err_other_delta
+    )
+}
+
+#[cfg(test)]
+fn select_smoke_test_iface() -> Result<Option<String>, String> {
+    match std::env::var("XPF_RAW_SOCKET_TEST_IFACE") {
+        Ok(iface) => {
+            let iface = iface.trim();
+            if iface.is_empty() {
+                return Err("XPF_RAW_SOCKET_TEST_IFACE is empty".to_string());
+            }
+            return Ok(Some(iface.to_string()));
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("XPF_RAW_SOCKET_TEST_IFACE is not valid UTF-8".to_string());
+        }
+    }
+
+    let entries = fs::read_dir("/sys/class/net")
+        .map_err(|e| format!("read_dir('/sys/class/net') failed: {}", e))?;
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read_dir('/sys/class/net') entry failed: {}", e))?;
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+
+    let ethernet_type = libc::ARPHRD_ETHER.to_string();
+    for iface in names {
+        let hwtype_path = format!("/sys/class/net/{}/type", iface);
+        let operstate_path = format!("/sys/class/net/{}/operstate", iface);
+        let hwtype = match fs::read_to_string(&hwtype_path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let operstate = match fs::read_to_string(&operstate_path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if hwtype.trim() == ethernet_type && operstate.trim() == "up" {
+            return Ok(Some(iface));
+        }
+    }
+    Ok(None)
 }
 
 /// Open AF_PACKET SOCK_RAW + bind to iface ifindex + enable QDISC_BYPASS +
@@ -713,7 +794,8 @@ fn run_loop(args: &Args, fd: i32, ring: &mut TxRing) -> Result<RunStats, String>
     let mut warmup_stats = RunStats::default();
     let mut in_warmup = !args.warmup.is_zero();
     let mut next_emit_at = start + Duration::from_secs(1);
-    let mut prev_emit_tx_packets: u64 = 0;
+    let mut prev_emit_at = start;
+    let mut prev_emit_stats = RunStats::default();
 
     loop {
         let now = Instant::now();
@@ -730,7 +812,8 @@ fn run_loop(args: &Args, fd: i32, ring: &mut TxRing) -> Result<RunStats, String>
             // operators see 1-second windows of run-phase data, not
             // mixed-phase windows.
             next_emit_at = now + Duration::from_secs(1);
-            prev_emit_tx_packets = 0;
+            prev_emit_at = now;
+            prev_emit_stats = RunStats::default();
         }
 
         // Per-iteration: refill all batch slots with fresh PRNG values.
@@ -802,17 +885,12 @@ fn run_loop(args: &Args, fd: i32, ring: &mut TxRing) -> Result<RunStats, String>
 
         // Per-second JSON-lines to stderr — operator visibility.
         if !in_warmup && now >= next_emit_at {
-            let delta = stats.tx_packets - prev_emit_tx_packets;
             eprintln!(
-                "{{\"t\":{},\"pps\":{},\"batches\":{},\"err_eagain\":{},\"err_partial\":{},\"err_other\":{}}}",
-                elapsed.as_secs_f64(),
-                delta,
-                stats.tx_batches,
-                stats.err_eagain,
-                stats.err_partial,
-                stats.err_other
+                "{}",
+                format_progress_json(elapsed, &stats, &prev_emit_stats, now - prev_emit_at)
             );
-            prev_emit_tx_packets = stats.tx_packets;
+            prev_emit_at = now;
+            prev_emit_stats = stats;
             next_emit_at = now + Duration::from_secs(1);
         }
     }
@@ -1270,9 +1348,60 @@ mod tests {
         assert!(validate_args(&bad).is_err());
     }
 
+    #[test]
+    fn progress_json_reports_window_rate_and_deltas() {
+        let prev = RunStats {
+            tx_packets: 1_000,
+            tx_batches: 31,
+            err_eagain: 4,
+            err_partial: 1,
+            err_other: 2,
+            first_other_errno: 0,
+        };
+        let now = RunStats {
+            tx_packets: 3_000,
+            tx_batches: 63,
+            err_eagain: 7,
+            err_partial: 2,
+            err_other: 5,
+            first_other_errno: 0,
+        };
+        let line = format_progress_json(
+            Duration::from_millis(3500),
+            &now,
+            &prev,
+            Duration::from_millis(500),
+        );
+        assert!(line.contains("\"t\":3.5"));
+        assert!(line.contains("\"pps\":4000"));
+        assert!(line.contains("\"tx_packets_delta\":2000"));
+        assert!(line.contains("\"tx_batches_delta\":32"));
+        assert!(line.contains("\"err_eagain_delta\":3"));
+        assert!(line.contains("\"err_partial_delta\":1"));
+        assert!(line.contains("\"err_other_delta\":3"));
+    }
+
+    #[test]
+    fn progress_json_zero_window_clamps_pps_to_zero() {
+        let now = RunStats {
+            tx_packets: 99,
+            ..RunStats::default()
+        };
+        let line = format_progress_json(
+            Duration::from_secs(2),
+            &now,
+            &RunStats::default(),
+            Duration::ZERO,
+        );
+        assert!(line.contains("\"pps\":0"));
+        assert!(line.contains("\"tx_packets_delta\":99"));
+    }
+
     /// CAP_NET_RAW integration test — Codex r1 MAJOR-3.
     /// Skipped by default. Run via:
-    ///   XPF_RUN_RAW_SOCKET_TESTS=1 sudo -E cargo test --release \
+    ///   XPF_RUN_RAW_SOCKET_TESTS=1 \
+    ///   XPF_RAW_SOCKET_TEST_IFACE=eth0 \
+    ///   sudo -E cargo test --release \
     ///     -- --ignored test_open_af_packet_raw_smoke
     #[test]
     #[ignore]
@@ -1281,16 +1410,46 @@ mod tests {
             eprintln!("Skipped: set XPF_RUN_RAW_SOCKET_TESTS=1 to run.");
             return;
         }
-        // Resolve loopback ifindex.
-        let ifindex = resolve_ifindex("lo").expect("lo should exist");
+        let iface = match select_smoke_test_iface().expect("select_smoke_test_iface should work") {
+            Some(iface) => iface,
+            None => {
+                eprintln!(
+                    "Skipped: no IFF_UP ARPHRD_ETHER iface found; set XPF_RAW_SOCKET_TEST_IFACE."
+                );
+                return;
+            }
+        };
+        let ifindex = resolve_ifindex(&iface).expect("smoke-test iface should exist");
         // Open the socket.
-        let fd = open_socket(ifindex, 64, 1).expect("open_socket on lo should succeed");
+        let fd =
+            open_socket(ifindex, 64, 1).expect("open_socket on smoke-test iface should succeed");
         assert!(fd >= 0);
+        if let Err(err) = check_iface_up(fd, &iface) {
+            unsafe {
+                libc::close(fd);
+            }
+            eprintln!("Skipped: {}", err);
+            return;
+        }
+        let (hwaddr_family, iface_mac) =
+            read_iface_hwaddr(fd, &iface).expect("SIOCGIFHWADDR should succeed");
+        if hwaddr_family != libc::ARPHRD_ETHER as u16 {
+            unsafe {
+                libc::close(fd);
+            }
+            eprintln!(
+                "Skipped: iface '{}' has ARPHRD {} not ARPHRD_ETHER ({})",
+                iface,
+                hwaddr_family,
+                libc::ARPHRD_ETHER
+            );
+            return;
+        }
         // Build one packet and send.
         let mut ring = TxRing::new(
             1,
-            &[0x00; 6],
-            &[0x00; 6],
+            &iface_mac,
+            &iface_mac,
             Ipv4Addr::new(127, 0, 0, 1),
             ifindex,
         );
