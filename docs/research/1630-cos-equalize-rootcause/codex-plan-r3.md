@@ -29,3 +29,12 @@ Rejecting Path B is valid. Rotation currently deliberately resets epoch grant co
 Remaining changes before implementation: add the `max_total_leased` sizing requirement, scope Gate 4 to hard-cap exact guarantee traffic, and clarify that P2 covers non-exact guarantee, not surplus q0/q11 behavior.
 
 VERDICT: PLAN-NEEDS-MINOR
+
+---
+
+## Codex r3b confirmation pass on v3.1 (session 019e7012-f58f-78f3-9047-98f4d034e05c)
+
+All three r3 minors (max_total_leased sizing, Gate 4 scope to hard-cap
+exact, non-exact-vs-surplus clarity) confirmed resolved in v3.1.
+
+VERDICT: PLAN-READY
