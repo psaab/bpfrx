@@ -1,8 +1,12 @@
 # #1611 — cold-path flooder runner body (AF_PACKET + sendmmsg)
 
-**Status**: v3 — addresses Codex r1 PLAN-KILL findings (sendmmsg
-wording + 3 Mpps premise empirical-gate + CAP_NET_RAW smoke) and
-Claude SMR r1 PLAN-NEEDS-MINOR items. AGY r1 retry in flight.
+**Status**: v4 — Codex r1 PLAN-KILL findings addressed (sendmmsg
+wording + 3 Mpps premise via PACKET_QDISC_BYPASS + CAP_NET_RAW
+smoke). AGY r1 PLAN-NEEDS-MINOR items inlined (PACKET_QDISC_BYPASS,
+blocking smoke gate, ENOBUFS silent, yield_now backoff, IFF_UP
+check, frame buffer alignment). Claude SMR r1 PLAN-NEEDS-MINOR
+items inlined (sendmmsg wording, RFC 6864 ID note, ifindex-0
+failure, AF_PACKET TX → AF_XDP RX topology note).
 
 Codex r1 (task-mpovfie0-6vc58v) PLAN-KILL findings, addressed in
 v3:
@@ -112,6 +116,13 @@ into an AF_XDP socket on the same host as the dataplane.
    - `socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))` — caller
      needs `CAP_NET_RAW`; refuse to start otherwise with a
      specific errno-coded message.
+   - **`PACKET_QDISC_BYPASS` enabled** (AGY r1 finding 2): a
+     one-line `setsockopt(fd, SOL_PACKET, PACKET_QDISC_BYPASS,
+     &1u32, 4)` skips the kernel qdisc layer entirely. Per
+     `man 7 packet`: "available since Linux 3.14", which is far
+     below the loss cluster's kernel floor. This is the
+     "simple mitigation" path Codex r1 asked for without the
+     complexity of full PACKET_TX_RING + mmap.
    - `bind()` to `sockaddr_ll { sll_family=AF_PACKET,
      sll_protocol=htons(ETH_P_ALL), sll_ifindex=<idx> }`.
    - `SO_SNDBUF` set to `frame_bytes * batch * 256` to absorb
@@ -120,6 +131,11 @@ into an AF_XDP socket on the same host as the dataplane.
      it returns 0 (the documented "not found" sentinel), fail
      with `"interface '<name>' not found — check `ip link show`"`.
      No implicit fallback (Claude SMR r1 MINOR-3).
+   - **`IFF_UP` check** via `ioctl(SIOCGIFFLAGS)` (AGY r1
+     finding C): if the interface is DOWN, the kernel silently
+     accepts AF_PACKET TX and drops; the harness sees 0 pps.
+     Fail fast with `"interface '<name>' is DOWN — run 'ip link
+     set <name> up' first"`.
    - Auto-fill `args.src_mac` from `ioctl(SIOCGIFHWADDR)` if the
      CLI default `[0; 6]` is in effect.
    - When `args.dst_mac` is still default `[0xff; 6]` (broadcast),
@@ -190,25 +206,41 @@ into an AF_XDP socket on the same host as the dataplane.
    — random is fine and no kernel reassembly / rate-limit path
    keys off duplicates (Claude SMR r1 MINOR-2).
 
-4. **sendmmsg(batch=32)** loop (Claude SMR r1 MINOR-1 wording):
+4. **sendmmsg(batch=32)** loop (Claude SMR r1 MINOR-1 wording,
+   AGY r1 finding A/B):
    - One `mmsghdr` array of size `batch` allocated once, before the
-     hot loop. Each `mmsghdr` points to a per-slot `iovec` pointing
-     to a per-slot 64-byte frame buffer. Reuse buffer slots — only
-     the variable fields (src IP, src/dst port, IPv4 csum) need
-     mutation per packet.
-   - Per-iteration: PRNG-refill all `batch` slots; call
+     hot loop, **aligned to 64-byte cache line** (AGY r1 finding D)
+     via `#[repr(align(64))]` on the frame-buffer struct. Each
+     `mmsghdr` points to a per-slot `iovec` pointing to a per-slot
+     64-byte frame buffer. Reuse buffer slots — only the variable
+     fields (src IP, src/dst port, IPv4 csum) need mutation per
+     packet.
+   - Per-iteration: PRNG-refill all `batch` slots (PRNG advances
+     `batch` times during prepare, not N); call
      `sendmmsg(fd, msgs.as_mut_ptr(), batch as u32, 0)` which
      returns N ∈ [0, batch] on success or -1 on hard error.
    - Per `man 2 sendmmsg`: the first N messages in `msgvec` were
      sent successfully; the kernel never partially-sends a single
      message. On return value N:
      `tx_packets += N; if N == batch { tx_batches += 1; } else { err_partial += 1; }`.
-     Refill from scratch on the next iteration — the per-packet
-     PRNG state already advanced N times during prepare, so no
-     "re-queue" is needed.
-   - EAGAIN ⇒ short retry (5ms backoff); EINTR ⇒ immediate
-     resubmit; EPERM ⇒ hard exit with the CAP_NET_RAW hint
-     message; other errno ⇒ log + count as `err_other`.
+     Refill from scratch on the next iteration — the unsent
+     `batch - N` slots' PRNG values are safely discarded without
+     affecting downstream pseudorandom distribution (xorshift64 is
+     stateless modulo the 64-bit register).
+   - **Error handling — hot path** (AGY r1 finding A):
+     - `EAGAIN` ⇒ `std::thread::yield_now()` then resubmit
+       (AGY r1 finding B: 5ms sleep would drop ~15k packets of
+       TX opportunity). Increment `err_eagain` counter.
+     - `ENOBUFS` ⇒ treated IDENTICAL to EAGAIN (silent, no log,
+       yield_now, increment `err_eagain` counter). AGY r1 finding A:
+       a logging storm at 3 Mpps would collapse the hot loop.
+     - `EINTR` ⇒ immediate resubmit, no counter increment.
+     - `EPERM` ⇒ hard exit (1) with the CAP_NET_RAW hint message.
+     - Any other errno ⇒ **on first occurrence only**, log to
+       stderr; increment `err_other` counter for all
+       occurrences (rate-limit-by-first-log keeps stderr quiet
+       in the hot loop). After the run ends, the final summary
+       emits the count + the first observed errno code.
    - Bookkeeping per second on a separate thread? No — keep
      single-threaded; print a JSON-line every 1s from the same loop
      (cost: 1 `clock_gettime` per packet on the rate-check branch,
@@ -282,44 +314,55 @@ into an AF_XDP socket on the same host as the dataplane.
      simulate `sendmmsg` returning N < batch, assert next iteration
      starts at offset 0 again with fresh frames.
 
-### 4.5 PACKET_TX_RING fallback (Codex r1 MAJOR — optional knob)
+### 4.5 PACKET_QDISC_BYPASS (Codex r1 MAJOR + AGY r1 finding 2)
 
 Codex r1 challenged the "≥3 Mpps single-core via plain
 sendmmsg(32)" premise, citing kernel docs that point to
 `PACKET_TX_RING` + `PACKET_QDISC_BYPASS` for high-rate user-space
-flood generators (cf. trafgen / pktgen-style tools).
+flood generators. AGY r1 finding 2 ruled that
+`PACKET_TX_RING` is overkill for a test harness (hundreds of LOC
+of unsafe mmap state) but `PACKET_QDISC_BYPASS` is a clean
+one-line `setsockopt` that adds significant per-syscall headroom
+by skipping the kernel qdisc layer.
 
-This PR ships sendmmsg as the **default** path because (a) it is
-the simpler implementation that matches the plan v2-r4 §4.2 spec,
-(b) the loss userspace cluster's host VM is a Debian 13 KVM guest
-with virtio TX which typically clears 3-5 Mpps single-core for
-64-byte UDP frames at sendmmsg(32) rates per public Linux
-networking benchmarks. Confidence: medium — the smoke gate is
-the empirical truth-source.
-
-If the smoke gate fails the ≥3 Mpps threshold, the PR adds the
-`--use-tx-ring` opt-in flag:
+**v4 adopts `PACKET_QDISC_BYPASS` as the default** (no opt-in flag):
 
 ```rust
-// PACKET_TX_RING: pre-allocate a mmap'd ring of TX frame slots.
-// Skip the syscall per send — fill the slot, mark it ready, kick
-// once per epoch via send(fd, NULL, 0, 0).
-//   - setsockopt(fd, SOL_PACKET, PACKET_VERSION, &TPACKET_V2)
-//   - setsockopt(fd, SOL_PACKET, PACKET_TX_RING, &tpacket_req)
-//   - mmap(NULL, ring_bytes, PROT_RW, MAP_SHARED, fd, 0)
-//   - per slot: tpacket2_hdr.tp_status = TP_STATUS_SEND_REQUEST;
-//     fill payload; send(fd, NULL, 0, MSG_DONTWAIT)
-// Caveat: PACKET_QDISC_BYPASS (setsockopt) skips the qdisc which
-// gains an extra Mpps but loses fq/pfifo back-pressure visibility.
+unsafe {
+    let one: u32 = 1;
+    let ret = libc::setsockopt(
+        fd,
+        libc::SOL_PACKET,
+        libc::PACKET_QDISC_BYPASS,
+        &one as *const u32 as *const libc::c_void,
+        std::mem::size_of::<u32>() as libc::socklen_t,
+    );
+    if ret != 0 {
+        // Don't hard-fail — older kernels may not have the option.
+        // The harness still runs through the qdisc; the smoke gate
+        // will catch the rate shortfall.
+        eprintln!("warning: PACKET_QDISC_BYPASS setsockopt failed: {} \
+                   (kernel < 3.14?) — continuing through qdisc",
+                  std::io::Error::last_os_error());
+    }
+}
 ```
 
-The `--use-tx-ring` path lands in this PR if and only if the
-sendmmsg smoke gate fails. If sendmmsg hits ≥3 Mpps on the loss
-host, the TX_RING path is filed as a follow-up issue.
+Per `man 7 packet`:
+> `PACKET_QDISC_BYPASS (since Linux 3.14)` — By default, packets
+> sent through packet sockets go through the kernel's qdisc
+> layer. This option can be used to bypass the qdisc layer.
 
-This keeps the v3 scope honest: ship sendmmsg first, add
-TX_RING only if measurement forces it. The blocking smoke gate
-is the decision-maker.
+The loss userspace cluster runs kernels well above 3.14 so the
+setsockopt succeeds in normal operation.
+
+**PACKET_TX_RING** was considered and rejected in v4 per AGY r1
+finding 2: the mmap state machine adds significant unsafe-code
+risk for a test harness, and PACKET_QDISC_BYPASS provides the
+headroom Codex r1 was asking for at one line of code. If the
+≥3 Mpps blocking smoke gate fails even with PACKET_QDISC_BYPASS,
+PACKET_TX_RING is the documented follow-up (filed at PR merge
+time).
 
 ## Public API preservation
 
@@ -386,13 +429,13 @@ or a specific errno on failure — DESIRED behavior shift.
 - **Real-traffic smoke** — additional gate beyond the standard
   matrix: build flooder on `loss:cluster-userspace-host`, run
   for 30 s against `172.16.80.200:5201`, confirm:
-  - Flooder achieves **≥3 Mpps single-core** — BLOCKING gate
-    per Codex r1 MAJOR (was best-effort in v2; v3 promotes to
-    blocking so the #1612 measurement program does not depend
-    on an unverified premise). If the standard `sendmmsg(32)`
-    path can't hit 3 Mpps on the loss cluster host, the PR is
-    BLOCKED until the `--use-tx-ring` PACKET_TX_RING fallback
-    knob lands or an alternative high-rate path is approved.
+  - Flooder achieves **≥2.5 Mpps single-core** — BLOCKING gate
+    per Codex r1 MAJOR + AGY r1 finding 3. AGY r1 recommended
+    2.5 Mpps (vs Codex's 3 Mpps) as a realistic
+    virtio-VM-with-qdisc-bypass threshold; v4 adopts 2.5 Mpps.
+    If the sendmmsg + PACKET_QDISC_BYPASS path can't hit 2.5 Mpps,
+    the PR is BLOCKED — PACKET_TX_RING follow-up is filed and
+    measurement work on #1612 cannot begin.
   - Dataplane does NOT crash, fail-closed, or OOM.
   - `journalctl -u xpfd` shows no new ERROR-level log lines
     during the flood.
