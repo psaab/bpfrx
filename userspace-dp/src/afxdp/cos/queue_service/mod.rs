@@ -778,26 +778,60 @@ fn select_exact_cos_guarantee_queue_waterfill(
     if queue_count == 0 || root.exact_queues_by_rate_ascending.is_empty() {
         return None;
     }
-    // Phase 1 epoch refill: when `pass1_remaining` is zero we're
-    // either at first call OR just completed an epoch. Compute the
-    // new budget from `quantum_sum × fraction`. quantum_sum is
-    // taken over the current eligible set (runnable + nonempty)
-    // so a transiently empty queue doesn't inflate the budget
-    // it would consume.
-    if root.waterfill_pass1_remaining_bytes == 0 {
-        let mut quantum_sum: u64 = 0;
-        for &qi in &root.exact_queues_by_rate_ascending {
-            quantum_sum =
-                quantum_sum.saturating_add(cos_guarantee_quantum_bytes(&root.queues[qi]));
-        }
-        // fraction is clamped 0.0..1.0 at config-apply time; here
-        // we use f64 → u64 with saturating cast guarded by the
-        // multiplication via f64. The result fits in u64 because
-        // quantum_sum ≤ 512 KB × N_queues and fraction ≤ 1.0.
+    // #1630 Phase 1 epoch refresh: two trigger conditions —
+    //   (a) `pass1 == 0` (legacy "budget exhausted" path; preserved
+    //       semantics from the original waterfill design including
+    //       resetting the Phase-2 cursor to 0);
+    //   (b) `elapsed >= COS_GUARANTEE_VISIT_NS` since the last refresh
+    //       (the #1630 time-based path that fixes the saturation
+    //       stall — Phase-2 selections do NOT decrement `pass1`, so
+    //       without (b) the budget freezes at a tiny non-zero value
+    //       and small classes stop being honored after a few epochs).
+    //
+    // CRITICAL: only the exhausted (a) path resets the Phase-2 cursor.
+    // The time-based (b) path preserves cursor continuity so the
+    // descending RR walk advances through ALL large classes across
+    // epochs (Codex plan-r4 #1: resetting the cursor on every timed
+    // refresh starves classes deep in the descending order).
+    //
+    // #1630 Hunk A: pass1 budget is anchored to the shaper-delivered
+    // bytes per epoch × fraction (matches documented contract at
+    // docs/fairness-regimes.md:848-855 "fraction × cap" where cap =
+    // shaper × elapsed). The legacy formula used `quantum_sum ×
+    // fraction`, which for any oversubscribed config (Σ R_i > shaper)
+    // over-provisioned pass1 by 3-5×, so Phase 2 never fired and
+    // the algorithm degenerated to ascending RR over all classes.
+    //
+    // Transparent-root (shaping_rate_bytes == 0) preserves the
+    // legacy quantum_sum × fraction formula — there is no
+    // shaper-delivered cap to anchor against, and per-class leases
+    // still throttle each class independently.
+    let elapsed_since_refresh =
+        now_ns.saturating_sub(root.waterfill_epoch_start_ns);
+    let time_refresh = elapsed_since_refresh >= COS_GUARANTEE_VISIT_NS;
+    let exhausted = root.waterfill_pass1_remaining_bytes == 0;
+    if time_refresh || exhausted {
         let frac = root.oversubscription_guarantee_fraction;
-        let pass1 = ((quantum_sum as f64) * frac).floor() as u64;
+        let pass1 = if root.shaping_rate_bytes == 0 {
+            let mut quantum_sum: u64 = 0;
+            for &qi in &root.exact_queues_by_rate_ascending {
+                quantum_sum = quantum_sum
+                    .saturating_add(cos_guarantee_quantum_bytes(&root.queues[qi]));
+            }
+            ((quantum_sum as f64) * frac).floor() as u64
+        } else {
+            let cap_per_epoch = ((root.shaping_rate_bytes as u128)
+                * (COS_GUARANTEE_VISIT_NS as u128)
+                / 1_000_000_000u128) as u64;
+            ((cap_per_epoch as f64) * frac).floor() as u64
+        };
         root.waterfill_pass1_remaining_bytes = pass1;
-        root.waterfill_phase2_cursor = 0;
+        root.waterfill_epoch_start_ns = now_ns;
+        if exhausted {
+            // Legacy exhausted path: also resets the Phase-2 cursor
+            // to 0, matching pre-#1630 behaviour exactly.
+            root.waterfill_phase2_cursor = 0;
+        }
     }
     // Phase 1: ascending-rate walk. Pick the first runnable queue
     // whose secondary_budget ≤ pass1_remaining. Tracks honored

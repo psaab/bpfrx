@@ -417,6 +417,16 @@ pub(in crate::afxdp) struct CoSInterfaceRuntime {
     /// descending walk (largest-rate-first) the last Phase 2
     /// service event landed.
     pub(in crate::afxdp) waterfill_phase2_cursor: usize,
+    /// #1630: wall-clock start of the current Phase-1 waterfill
+    /// epoch. The selector refreshes `waterfill_pass1_remaining_bytes`
+    /// when `now_ns - waterfill_epoch_start_ns >= COS_GUARANTEE_VISIT_NS`
+    /// even if Phase-2 keeps consuming root tokens. Without this,
+    /// the legacy "refresh only on `pass1 == 0`" path stalls under
+    /// saturation (Phase-2 selections don't decrement pass1), and
+    /// small classes stop receiving Phase-1 honors after a few
+    /// epochs. Initialized to 0; first call refreshes
+    /// unconditionally because `now_ns >> VISIT_NS`.
+    pub(in crate::afxdp) waterfill_epoch_start_ns: u64,
     // Round-robin cursors for the two guarantee service classes. Exact and
     // non-exact guarantee queues rotate independently — the scheduler gives
     // exact queues strict priority over non-exact guarantee service (the
