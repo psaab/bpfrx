@@ -4,10 +4,12 @@
 order + data-structure algorithms + CPU microarchitecture + AF_XDP
 ZC cold-path budgets + HA snapshot publish discipline).
 
-**Target**: PR #1624 narrow STAGED Step 1 scope. HEAD at SHA to be
-re-evaluated after Copilot-finding patches (see commit chain).
+**Target**: PR #1624 narrow STAGED Step 1 scope at HEAD
+`9b2b8395a` (commit chain: 483a5db97 initial → 2cc07b450 Copilot r1
+fixes → 3787f51ee Codex+AGY nit fixes → 9b2b8395a Copilot r2 fixes).
 
-**Verdict (code-review round 1): CODE-READY.**
+**Verdict (code-review round 1, final at HEAD 9b2b8395a):
+CODE-READY.**
 
 ## Scope discipline
 
