@@ -4,10 +4,14 @@
 //! `worker_cold_path.rs` (counter aggregation) and the cold-path
 //! sampling site in `poll_descriptor/mod.rs`. Hot-path callers see:
 //!
-//! - `sample_tsc() -> u64` — single-instruction TSC read with
-//!   `compiler_fence` bracket. Wrapper baseline ~25-40 ns on the
-//!   loss cluster. `__rdtscp` serializes against prior in-order
-//!   stores per Intel SDM §17.17 + Joe Damato 2018 errata.
+//! - `sample_tsc_start() -> u64` / `sample_tsc_end() -> u64` —
+//!   asymmetric TSC read pair: start does `LFENCE; RDTSCP`, end does
+//!   `RDTSCP; LFENCE`, both with `compiler_fence` brackets. Per
+//!   Intel SDM §17.17 measurement-window recipe. Wrapper baseline
+//!   ~25-40 ns on the loss cluster. `sample_tsc()` is a back-compat
+//!   alias for `sample_tsc_start()` retained for older call sites
+//!   that don't distinguish start/end positions; new callers should
+//!   use the explicit pair (Codex code-r1 finding 1).
 //! - `bucket_index_for_ns_24(ns)` — branchless 24-bucket select. Same
 //!   formula family as `bucket_index_for_ns` at `umem/mod.rs:244`;
 //!   only the upper clamp changes (`.min(23)` vs `.min(15)`). Codex
@@ -37,9 +41,9 @@ const _: () = assert!(POLICY_COLD_PATH_HIST_BUCKETS == 24);
 /// Number of per-zone-pair slots in the histogram.
 ///
 /// Pinned at 16 (4-bit splitmix mask). The cluster's active zone-pair
-/// set may exceed 16, in which case the `keys_xor` collision detector
-/// triggers and the harness excludes aliased slots from publication
-/// (plan §3.4).
+/// set may exceed 16, in which case the `first_key + alias_seen`
+/// collision detector triggers and the harness excludes aliased
+/// slots from publication (plan §3.4).
 pub(in crate::afxdp) const POLICY_COLD_PATH_ZONE_PAIR_SLOTS: usize = 16;
 const _: () = assert!(POLICY_COLD_PATH_ZONE_PAIR_SLOTS == 16);
 const _: () = assert!(POLICY_COLD_PATH_ZONE_PAIR_SLOTS.is_power_of_two());
@@ -104,31 +108,80 @@ pub(in crate::afxdp) fn zone_pair_slot(from_zone_id: u16, to_zone_id: u16) -> us
     (splitmix64(key) & ZONE_PAIR_SLOT_MASK) as usize
 }
 
-/// Read the TSC via `rdtscp` with `compiler_fence` bracket on both
-/// sides. The fences keep the compiler from reordering instrumented
-/// stores around the read; the hardware-side serialization is
-/// `rdtscp`'s own guarantee (Intel SDM §17.17).
+/// Read the TSC at the **start** of a measurement window via
+/// `LFENCE; RDTSCP` per Intel SDM §17.17.
+///
+/// Recipe rationale (Codex code-r1 finding 1):
+/// - Leading `compiler_fence(SeqCst)` prevents rustc from reordering
+///   prior stores past the LFENCE.
+/// - `_mm_lfence` drains the load buffer so any preceding load
+///   (e.g. flow-cache key reads) commits before the TSC capture.
+/// - `__rdtscp` partially serializes on the prior-completion side
+///   (waits for all prior instructions to complete) and provides
+///   the timestamp.
+///
+/// **Use `sample_tsc_end()` for the closing timestamp** — RDTSCP
+/// alone does NOT prevent subsequent instructions from being
+/// dispatched before its retirement, so the end side needs a
+/// TRAILING `_mm_lfence()`.
 ///
 /// Returns 0 on non-x86_64 builds; the caller should branch on the
 /// `ClockSource` field before using the value.
 #[inline]
 #[cfg(target_arch = "x86_64")]
-pub(in crate::afxdp) fn sample_tsc() -> u64 {
-    // AGY r3 finding 3 fix: add hardware `lfence` before the
-    // `rdtscp` read to prevent CPU out-of-order execution from
-    // dispatching the TSC read before prior instrumented stores
-    // complete. `compiler_fence(SeqCst)` alone prevents compiler
-    // reordering but NOT hardware reordering — Intel SDM §17.17
-    // specifies `lfence; rdtsc` (or `rdtscp` which is partially
-    // serializing on the wait-for-prior-completion side) as the
-    // canonical recipe. We pair both: compiler_fence keeps the
-    // compiler honest, `_mm_lfence` keeps the CPU honest.
+pub(in crate::afxdp) fn sample_tsc_start() -> u64 {
     compiler_fence(Ordering::SeqCst);
     unsafe { core::arch::x86_64::_mm_lfence() };
     let mut _aux: u32 = 0;
     let tsc = unsafe { core::arch::x86_64::__rdtscp(&mut _aux) };
     compiler_fence(Ordering::SeqCst);
     tsc
+}
+
+/// Read the TSC at the **end** of a measurement window via
+/// `RDTSCP; LFENCE` per Intel SDM §17.17.
+///
+/// Codex code-r1 finding 1 fix: the end side needs a **hardware**
+/// `_mm_lfence` AFTER `__rdtscp` to prevent subsequent instructions
+/// (e.g. histogram-bucket updates) from being dispatched before the
+/// timestamp read retires. A `compiler_fence(SeqCst)` only keeps the
+/// compiler honest; aggressive OoO cores (Skylake-X / Ice Lake /
+/// Sapphire Rapids) can still hardware-reorder. Wrapper-baseline
+/// calibration cannot absorb this — calibration subtracts constant
+/// cost, not variable ordering noise.
+///
+/// Returns 0 on non-x86_64 builds.
+#[inline]
+#[cfg(target_arch = "x86_64")]
+pub(in crate::afxdp) fn sample_tsc_end() -> u64 {
+    compiler_fence(Ordering::SeqCst);
+    let mut _aux: u32 = 0;
+    let tsc = unsafe { core::arch::x86_64::__rdtscp(&mut _aux) };
+    unsafe { core::arch::x86_64::_mm_lfence() };
+    compiler_fence(Ordering::SeqCst);
+    tsc
+}
+
+/// Back-compat alias for callers that don't distinguish start/end
+/// timestamp positions. Equivalent to `sample_tsc_start()`.
+/// Prefer `sample_tsc_start()` + `sample_tsc_end()` for any new
+/// measurement-window pair.
+#[inline]
+#[cfg(target_arch = "x86_64")]
+pub(in crate::afxdp) fn sample_tsc() -> u64 {
+    sample_tsc_start()
+}
+
+#[inline]
+#[cfg(not(target_arch = "x86_64"))]
+pub(in crate::afxdp) fn sample_tsc_start() -> u64 {
+    0
+}
+
+#[inline]
+#[cfg(not(target_arch = "x86_64"))]
+pub(in crate::afxdp) fn sample_tsc_end() -> u64 {
+    0
 }
 
 #[inline]
@@ -179,9 +232,16 @@ impl ClockSource {
     }
 }
 
-/// Probe the host for TSC invariance. Returns `Tsc` only if BOTH
-/// CPU flags AND the active clocksource indicate invariant TSC is
-/// usable; otherwise `ClockGettime`.
+/// Probe the host for TSC invariance + RDTSCP availability. Returns
+/// `Tsc` only if ALL THREE conditions hold:
+/// - `/proc/cpuinfo` reports `constant_tsc` AND `nonstop_tsc` AND
+///   `rdtscp` (Codex code-r1 finding 2: the first two attest TSC
+///   stability; `rdtscp` attests the INSTRUCTION itself is legal —
+///   x86_64 mandates SSE2 but NOT rdtscp; #UD on missing).
+/// - `/sys/devices/system/clocksource/clocksource0/current_clocksource
+///   == tsc` (kernel agrees TSC is usable as the active clocksource).
+/// Otherwise `ClockGettime` — the sampler will skip RDTSCP entirely
+/// and the harness will TSC-gate the run out of the published table.
 ///
 /// Called once per worker at thread spawn AFTER `pthread_setaffinity_np`
 /// has pinned the worker to its core (Claude SMR r1 NIT 2).
@@ -191,7 +251,13 @@ pub(in crate::afxdp) fn probe_clock_source() -> ClockSource {
         let cpuinfo_ok = std::fs::read_to_string("/proc/cpuinfo")
             .map(|s| {
                 let first_block = s.split("\n\n").next().unwrap_or(&s);
-                first_block.contains("constant_tsc") && first_block.contains("nonstop_tsc")
+                // Codex code-r1 finding 2: rdtscp instruction support
+                // is NOT implied by constant_tsc/nonstop_tsc. Check it
+                // explicitly. Linux exposes the CPUID rdtscp feature
+                // flag as the literal token "rdtscp" in the flags line.
+                first_block.contains("constant_tsc")
+                    && first_block.contains("nonstop_tsc")
+                    && first_block.contains("rdtscp")
             })
             .unwrap_or(false);
         let clocksource_ok = std::fs::read_to_string(
@@ -209,18 +275,22 @@ pub(in crate::afxdp) fn probe_clock_source() -> ClockSource {
 /// Q32 fixed-point `ns_per_tsc_tick` multiplier.
 ///
 /// `delta_ns ≈ (delta_tsc * ns_per_tsc_q32) >> 32`. Computed once at
-/// worker startup by measuring TSC ticks against
-/// `clock_gettime(CLOCK_MONOTONIC_RAW)` over a 10 ms calibration
-/// window.
+/// worker startup by measuring TSC ticks against `std::time::Instant`
+/// over a 10 ms calibration window (Codex code-r1 finding 3: prior
+/// docstring claimed `CLOCK_MONOTONIC_RAW` but the impl uses Rust's
+/// `Instant` which is `CLOCK_MONOTONIC`, not raw). For a one-shot
+/// calibration on a constant-tsc invariant host the distinction is
+/// not measurable; we use `Instant` for portability + no external
+/// libc surface.
 pub(in crate::afxdp) fn calibrate_ns_per_tsc_q32() -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
         use std::time::Instant;
-        let start_tsc = sample_tsc();
+        let start_tsc = sample_tsc_start();
         let start_inst = Instant::now();
         std::thread::sleep(std::time::Duration::from_millis(10));
         let end_inst = Instant::now();
-        let end_tsc = sample_tsc();
+        let end_tsc = sample_tsc_end();
         let elapsed_ns = end_inst.duration_since(start_inst).as_nanos() as u64;
         let elapsed_tsc = end_tsc.saturating_sub(start_tsc);
         if elapsed_tsc == 0 || elapsed_ns == 0 {
@@ -254,8 +324,12 @@ pub(in crate::afxdp) fn calibrate_wrapper_baseline_ns(ns_per_tsc_q32: u64) -> u6
     const N: usize = 4096;
     let mut deltas = Vec::with_capacity(N);
     for _ in 0..N {
-        let a = sample_tsc();
-        let b = sample_tsc();
+        // Wrapper baseline measures the round-trip between a START
+        // timestamp and an END timestamp — the same fence recipe the
+        // hot path will use — so the calibration absorbs the correct
+        // ordering cost (Codex code-r1 finding 1).
+        let a = sample_tsc_start();
+        let b = sample_tsc_end();
         deltas.push(b.saturating_sub(a));
     }
     deltas.sort_unstable();
@@ -275,7 +349,8 @@ pub(in crate::afxdp) fn calibrate_wrapper_baseline_ns(ns_per_tsc_q32: u64) -> u6
 /// Publish protocol (every ~1 s; called from `publish()` regardless
 /// of whether the 60s rotation branch fires):
 ///   1. `cold_window_gen.fetch_add(1, AcqRel)` (even → odd).
-///   2. Relaxed-store 2304 bucket counts + 48 metadata u64.
+///   2. Relaxed-store 16 × 24 = 384 bucket counts + 16 × 4 = 64
+///      metadata fields (sum_ns / samples / first_key / alias_seen).
 ///   3. `cold_window_gen.fetch_add(1, Release)` (odd → even).
 ///
 /// Readers Acquire-load `cold_window_gen` (s1), Relaxed-load the
@@ -353,7 +428,8 @@ impl WorkerColdPathAtomics {
         // 1. Bump gen even → odd. AcqRel forbids subsequent Relaxed
         //    stores from being hoisted above this point.
         self.cold_window_gen.fetch_add(1, Ordering::AcqRel);
-        // 2. Relaxed-store the payload (2304 + 48 stores).
+        // 2. Relaxed-store the payload (16 slots × 24 buckets = 384
+        //    bucket stores + 16 × 4 metadata = 64; total 448 stores).
         for slot in 0..POLICY_COLD_PATH_ZONE_PAIR_SLOTS {
             for b in 0..POLICY_COLD_PATH_HIST_BUCKETS {
                 self.buckets[slot][b].store(local.buckets[slot][b], Ordering::Relaxed);
@@ -756,6 +832,25 @@ mod tests {
             let b = sample_tsc();
             let c = sample_tsc();
             assert!(b >= a && c >= b, "tsc not monotonic: a={a} b={b} c={c}");
+        }
+    }
+
+    /// Codex code-r1 finding 1: verify the start/end split exists and
+    /// each variant returns a monotonic non-decreasing pair, matching
+    /// the Intel SDM §17.17 measurement-window recipe.
+    #[test]
+    fn sample_tsc_start_end_split_monotonic() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let a = sample_tsc_start();
+            let b = sample_tsc_end();
+            assert!(b >= a, "start={a} end={b} — not monotonic");
+            // sample_tsc() is a back-compat alias for sample_tsc_start;
+            // assert the alias is still callable (regression guard if
+            // the alias is later removed).
+            let c = sample_tsc();
+            let d = sample_tsc_end();
+            assert!(d >= c, "alias-start={c} end={d} — not monotonic");
         }
     }
 }
