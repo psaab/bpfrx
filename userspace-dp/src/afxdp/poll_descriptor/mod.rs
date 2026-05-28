@@ -1372,6 +1372,24 @@ pub(super) fn poll_binding_process_descriptor(
                                 // the session-install step below is skipped only when
                                 // the knob matches AND no NAT is required (to avoid
                                 // orphan NAT state without a session anchor).
+                                //
+                                // #1620: cold-path latency histogram pre-eval gate.
+                                // Per plan v4 §4.4: open a scoped &mut binding.cold_path
+                                // borrow that ENDS before evaluate_policy_*, so no
+                                // mutable cold_path borrow overlaps the policy call.
+                                let (cp_sample_tag, cp_t_in) = {
+                                    let cp = &mut binding.cold_path;
+                                    cp.sample_phase = cp.sample_phase.wrapping_add(1);
+                                    let tag = (cp.sample_phase
+                                        & worker_ctx.cold_path_sample_mask)
+                                        == 0;
+                                    let t = if tag {
+                                        crate::afxdp::cold_path_hist::sample_tsc_start()
+                                    } else {
+                                        0
+                                    };
+                                    (tag, t)
+                                };
                                 let policy_result = evaluate_policy_result_with_len(
                                     &worker_ctx.forwarding.policy,
                                     from_zone_id,
@@ -1383,6 +1401,35 @@ pub(super) fn poll_binding_process_descriptor(
                                     flow.forward_key.dst_port,
                                     desc.len as u64,
                                 );
+                                // #1620: cold-path latency histogram post-eval record.
+                                // q32-skip + wrapper_underflow_count per plan v4 §4.4.
+                                if cp_sample_tag {
+                                    let t_out =
+                                        crate::afxdp::cold_path_hist::sample_tsc_end();
+                                    let q32 = binding.cold_path.ns_per_tsc_q32;
+                                    if q32 != 0 {
+                                        let delta_tsc = t_out.saturating_sub(cp_t_in);
+                                        let raw_ns =
+                                            ((delta_tsc as u128 * q32 as u128) >> 32) as u64;
+                                        let baseline =
+                                            binding.cold_path.wrapper_ns_baseline;
+                                        let delta_ns = if raw_ns < baseline {
+                                            binding.cold_path.wrapper_underflow_count =
+                                                binding
+                                                    .cold_path
+                                                    .wrapper_underflow_count
+                                                    .saturating_add(1);
+                                            0
+                                        } else {
+                                            raw_ns - baseline
+                                        };
+                                        binding.cold_path.record_sample(
+                                            from_zone_id,
+                                            to_zone_id,
+                                            delta_ns,
+                                        );
+                                    }
+                                }
                                 if let PolicyAction::Permit = policy_result.action {
                                     // NAT64: cross-family translation takes
                                     // priority over same-family SNAT.
@@ -2390,17 +2437,70 @@ pub(super) fn poll_binding_process_descriptor(
                                 let mut pending_decision = decision;
                                 let mut source_nat_release_key = None;
                                 if let Some(flow) = flow.as_ref() {
-                                    if let PolicyAction::Permit = evaluate_policy_with_len(
-                                        &worker_ctx.forwarding.policy,
-                                        from_zone_id,
-                                        to_zone_id,
-                                        flow.src_ip,
-                                        flow.dst_ip,
-                                        flow.forward_key.protocol,
-                                        flow.forward_key.src_port,
-                                        flow.forward_key.dst_port,
-                                        desc.len as u64,
-                                    ) {
+                                    // #1620: cold-path histogram pre-eval gate
+                                    // (session-install slow path). Per plan v4
+                                    // §4.4: scoped &mut borrow ends before eval.
+                                    let (cp_sample_tag, cp_t_in) = {
+                                        let cp = &mut binding.cold_path;
+                                        cp.sample_phase =
+                                            cp.sample_phase.wrapping_add(1);
+                                        let tag = (cp.sample_phase
+                                            & worker_ctx.cold_path_sample_mask)
+                                            == 0;
+                                        let t = if tag {
+                                            crate::afxdp::cold_path_hist::sample_tsc_start()
+                                        } else {
+                                            0
+                                        };
+                                        (tag, t)
+                                    };
+                                    let permit = matches!(
+                                        evaluate_policy_with_len(
+                                            &worker_ctx.forwarding.policy,
+                                            from_zone_id,
+                                            to_zone_id,
+                                            flow.src_ip,
+                                            flow.dst_ip,
+                                            flow.forward_key.protocol,
+                                            flow.forward_key.src_port,
+                                            flow.forward_key.dst_port,
+                                            desc.len as u64,
+                                        ),
+                                        PolicyAction::Permit
+                                    );
+                                    // #1620: cold-path histogram post-eval record.
+                                    if cp_sample_tag {
+                                        let t_out =
+                                            crate::afxdp::cold_path_hist::sample_tsc_end();
+                                        let q32 = binding.cold_path.ns_per_tsc_q32;
+                                        if q32 != 0 {
+                                            let delta_tsc =
+                                                t_out.saturating_sub(cp_t_in);
+                                            let raw_ns = ((delta_tsc as u128
+                                                * q32 as u128)
+                                                >> 32)
+                                                as u64;
+                                            let baseline =
+                                                binding.cold_path.wrapper_ns_baseline;
+                                            let delta_ns = if raw_ns < baseline {
+                                                binding
+                                                    .cold_path
+                                                    .wrapper_underflow_count = binding
+                                                    .cold_path
+                                                    .wrapper_underflow_count
+                                                    .saturating_add(1);
+                                                0
+                                            } else {
+                                                raw_ns - baseline
+                                            };
+                                            binding.cold_path.record_sample(
+                                                from_zone_id,
+                                                to_zone_id,
+                                                delta_ns,
+                                            );
+                                        }
+                                    }
+                                    if permit {
                                         let nat_match_flow = flow.with_destination(
                                             pending_decision.nat.rewrite_dst.unwrap_or(flow.dst_ip),
                                         );

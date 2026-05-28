@@ -591,6 +591,7 @@ mod tests {
             peer_worker_commands: &peer_worker_commands,
             dnat_fds: &dnat_fds,
             rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
         };
 
         let client = Ipv4Addr::new(192, 0, 2, 10);

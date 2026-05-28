@@ -51,6 +51,37 @@ pub(crate) fn worker_loop(
     runtime_atomics: Arc<crate::afxdp::worker_runtime::WorkerRuntimeAtomics>,
 ) {
     pin_current_thread(worker_id);
+    // #1620: per-worker cold-path TSC calibration. Runs ONCE at
+    // worker_loop entry, AFTER pin_current_thread has pinned the
+    // worker to its core (so the Instant↔TSC ratio reflects this
+    // core's clock). The probe + calibrate together take ~10 ms
+    // (one-shot 10 ms sleep window + ~80 µs of back-to-back rdtscp
+    // pairs); workers calibrate concurrently across cores so the
+    // wall-clock startup overhead stays at ~10 ms total.
+    //
+    // Per plan v4 §4.6: probe_clock_source + per-worker calibrate
+    // run once at startup. The /proc/cpuinfo + /sys probes are
+    // cheap (~50 µs); the calibrate sleeps 10 ms for an Instant↔TSC
+    // ratio measurement plus ~80 µs of back-to-back rdtscp pairs
+    // for the wrapper baseline. Workers calibrate concurrently
+    // across cores so wall-clock startup stays at ~10 ms.
+    let cp_clock_source =
+        crate::afxdp::cold_path_hist::probe_clock_source();
+    let cp_ns_per_tsc_q32 =
+        crate::afxdp::cold_path_hist::calibrate_ns_per_tsc_q32();
+    let cp_wrapper_baseline =
+        crate::afxdp::cold_path_hist::calibrate_wrapper_baseline_ns(
+            cp_ns_per_tsc_q32,
+        );
+    // Single-line startup log per worker (~6 lines total per daemon
+    // startup). Goes to journald via stderr per project logging rules.
+    eprintln!(
+        "xpf-cold-path: worker={} clock_source={} ns_per_tsc_q32={} wrapper_ns_baseline={}",
+        worker_id,
+        cp_clock_source.as_str(),
+        cp_ns_per_tsc_q32,
+        cp_wrapper_baseline,
+    );
     const COS_STATUS_INTERVAL_NS: u64 = 100_000_000;
     let ha_startup_grace_until_secs =
         (monotonic_nanos() / 1_000_000_000).saturating_add(TUNNEL_HA_STARTUP_GRACE_SECS);
@@ -87,6 +118,15 @@ pub(crate) fn worker_loop(
         }
     }
     bindings.sort_by_key(|binding| (binding.queue_id, binding.ifindex, binding.slot));
+    // #1620: install per-worker cold-path calibration into each
+    // binding's worker-local counters. The calibration values are
+    // shared across all bindings owned by this worker — they reflect
+    // the worker thread's pinned core, not the binding identity.
+    for binding in bindings.iter_mut() {
+        binding.cold_path.ns_per_tsc_q32 = cp_ns_per_tsc_q32;
+        binding.cold_path.wrapper_ns_baseline = cp_wrapper_baseline;
+        binding.cold_path.clock_source = cp_clock_source;
+    }
     let binding_lookup = WorkerBindingLookup::from_bindings(&bindings);
     let cos_owner_live_by_tx_ifindex = build_worker_cos_owner_live_by_tx_ifindex(
         bindings
@@ -564,6 +604,11 @@ pub(crate) fn worker_loop(
         }
         let mut did_work = false;
         let mut dbg_poll = DebugPollCounters::default();
+        // #1620: read the cold-path sample mask from forwarding state once
+        // per poll cycle (rather than per-binding) — it's a daemon-wide
+        // setting and rarely changes. Workers load the ArcSwap-protected
+        // forwarding state above so this is L1-hot.
+        let cold_path_sample_mask = forwarding.cold_path_sample_mask;
         for offset in 0..bindings.len() {
             let idx = if bindings.is_empty() {
                 0
@@ -603,6 +648,7 @@ pub(crate) fn worker_loop(
                 conntrack_v6_fd,
                 &mut dbg_poll,
                 &rg_epochs,
+                cold_path_sample_mask,
             ) {
                 did_work = true;
             }

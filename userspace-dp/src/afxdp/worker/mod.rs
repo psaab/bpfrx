@@ -144,6 +144,14 @@ pub(crate) struct BindingWorker {
     /// `WorkerFlowCacheState`. Field semantics unchanged; access
     /// via `binding.flow.flow_cache` and `binding.flow.flow_cache_session_touch`.
     pub(crate) flow: WorkerFlowCacheState,
+    /// #1620: cold-path latency histogram worker-local state.
+    /// Co-located with `flow` because the policy-eval slow path
+    /// already touches `binding.flow` — sharing cachelines avoids
+    /// a compulsory L1 miss on `binding.cold_path.sample_phase`.
+    /// Touched only by the owning worker thread; published to the
+    /// sibling `WorkerColdPathAtomics` array on the ~1s tick via
+    /// `worker_runtime.rs::publish`.
+    pub(crate) cold_path: super::cold_path_hist::WorkerColdPathCounters,
     /// #1376: per-worker/per-binding mirror sampler. Reset on worker
     /// restart and intentionally not synchronized across workers.
     pub(crate) mirror_sample_counter: u64,
@@ -430,6 +438,11 @@ impl BindingWorker {
                 flow_cache: FlowCache::new(),
                 flow_cache_session_touch: 0,
             },
+            // #1620: cold-path histogram worker-local state; default
+            // zero-initialized. ns_per_tsc_q32 / wrapper_ns_baseline /
+            // clock_source are populated by the per-worker calibrate
+            // in worker_loop entry (post-affinity).
+            cold_path: super::cold_path_hist::WorkerColdPathCounters::default(),
             mirror_sample_counter: 0,
             bind_meta: WorkerBindMeta {
                 bind_time_ns: {
@@ -558,6 +571,11 @@ impl BindingWorker {
                 flow_cache: FlowCache::new(),
                 flow_cache_session_touch: 0,
             },
+            // #1620: cold-path histogram worker-local state; default
+            // zero-initialized. ns_per_tsc_q32 / wrapper_ns_baseline /
+            // clock_source are populated by the per-worker calibrate
+            // in worker_loop entry (post-affinity).
+            cold_path: super::cold_path_hist::WorkerColdPathCounters::default(),
             mirror_sample_counter: 0,
             bind_meta: WorkerBindMeta {
                 bind_time_ns: init_now,
@@ -667,6 +685,11 @@ impl BindingWorker {
                 flow_cache: FlowCache::new(),
                 flow_cache_session_touch: 0,
             },
+            // #1620: cold-path histogram worker-local state; default
+            // zero-initialized. ns_per_tsc_q32 / wrapper_ns_baseline /
+            // clock_source are populated by the per-worker calibrate
+            // in worker_loop entry (post-affinity).
+            cold_path: super::cold_path_hist::WorkerColdPathCounters::default(),
             mirror_sample_counter: 0,
             bind_meta: WorkerBindMeta {
                 bind_time_ns: init_now,

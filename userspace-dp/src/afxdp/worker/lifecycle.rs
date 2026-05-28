@@ -47,6 +47,7 @@ pub(super) fn poll_binding(
     conntrack_v6_fd: c_int,
     dbg: &mut DebugPollCounters,
     rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
+    cold_path_sample_mask: u64,
 ) -> bool {
     let (left, rest) = bindings.split_at_mut(binding_index);
     let Some((binding, right)) = rest.split_first_mut() else {
@@ -181,6 +182,7 @@ pub(super) fn poll_binding(
             peer_worker_commands,
             dnat_fds,
             rg_epochs,
+            cold_path_sample_mask,
         };
         let mut telemetry = TelemetryContext {
             dbg,
