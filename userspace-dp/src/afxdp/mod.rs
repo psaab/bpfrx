@@ -110,6 +110,18 @@ mod tx;
 mod types;
 #[path = "umem/mod.rs"]
 mod umem;
+// #1612 step-3 STAGED scaffolding: cold-path latency histogram
+// primitives. Module-level `#[allow(dead_code)]` because every export
+// is intentionally unused at this PR — integration into BindingWorker,
+// the poll_descriptor hot path, and the wire protocol is deferred to
+// follow-up issues #1620, #1621, #1622 per
+// docs/pr/1612-scale-target-measurement/plan.md STAGED form. The
+// scaffolding lives in tree to (a) make the 11-finding plan-review
+// audit chain reviewable as compiled code and (b) provide the math
+// primitives the follow-ups will consume.
+#[allow(dead_code)]
+#[path = "cold_path_hist.rs"]
+mod cold_path_hist;
 // Clean-room WireGuard tunnel termination — see
 // docs/pr/wireguard-clean/plan.md. Engine + tests only in this PR;
 // hot-path activation lands in a follow-up.
