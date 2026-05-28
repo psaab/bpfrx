@@ -21,7 +21,20 @@
 ## Code review
 
 ### Round 1 (PR #1632 HEAD 6b3592f81)
-- Codex: `task-mppnd2o4-os98id` (dispatched 2026-05-28)
-- AGY: `adversarial-review-mppndmyb-tdpk0w` (dispatched 2026-05-28)
-- Copilot: triggered via `@copilot review` PR comment
-- Claude SMR: (pending after Codex+AGY land)
+- Codex: `task-mppnd2o4-os98id` (dispatched 2026-05-28) — MERGE-NEEDS-MINOR (test 6 false positive on ordering invariant; PrefixV6 size)
+- AGY: `adversarial-review-mppndmyb-tdpk0w` (dispatched 2026-05-28) — MERGE-READY (non-blocking future-PR PolicyPrefixes wrapper recommendation)
+- Copilot (`copilot-pull-request-reviewer`): COMMENTED with "encountered an error" at HEAD c32b5a6c1, 2026-05-28T15:53:46Z. Three `@copilot review` re-requests attempted at HEAD c32b5a6c1 and 76172e01f; no fresh successful review. Treated as infra-blocked.
+
+### Round 2 (PR #1632 HEAD c32b5a6c1, post-r1 Codex findings fixed)
+- Codex: `task-mppoz60o-ey5jt7` — MERGE-NEEDS-MINOR (two self-consistency findings: plan.md 40 B leftover + struct doc source-specific wording)
+
+### Round 3 (PR #1632 HEAD 76172e01f, FINAL verification)
+- Codex: `task-mppp6bog-f74lql` — MERGE-READY at 76172e01f
+- Claude SMR: `claude-smr-code-r1.md` — MERGE-READY at 76172e01f
+
+## Final reviewer attestation at HEAD 76172e01f
+
+- Codex (r3-code): MERGE-READY
+- AGY (r1-code): MERGE-READY
+- Claude SMR (code-r1): MERGE-READY
+- Copilot (`copilot-pull-request-reviewer`): infra-blocked; 3-of-4 attestation per `feedback_copilot_two_bots` + infra-outage merge policy
