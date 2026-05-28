@@ -72,6 +72,101 @@ fn process_status_buffer_capacity_fields_roundtrip() {
     assert_eq!(back.worker_runtime[0].max_sessions, 100);
 }
 
+// #1621 plan v2 + Copilot code-r1 C4: round-trip the new cold-path
+// histogram fields through serde to confirm:
+//   1. Default (zero / empty) WorkerRuntimeStatus omits every
+//      cold_path_* field from the wire (skip_serializing_if).
+//   2. Populated cold_path_* fields survive serialize → deserialize.
+//   3. clock_source String preserves "tsc" exactly.
+#[test]
+fn worker_runtime_status_cold_path_fields_roundtrip_default_omitted() {
+    let status = WorkerRuntimeStatus::default();
+    let value: serde_json::Value = serde_json::to_value(&status)
+        .expect("serialize default WorkerRuntimeStatus");
+    // Every cold_path_* field MUST be absent in the JSON for a
+    // default (uncalibrated) worker. This pins the wire-invariant
+    // contract that pre-#1621 daemons see byte-identical payloads.
+    let cold_keys = [
+        "cold_path_hist",
+        "cold_path_sum_ns",
+        "cold_path_samples",
+        "cold_path_first_key",
+        "cold_path_alias_seen",
+        "cold_path_sample_phase",
+        "cold_path_wrapper_underflow_count",
+        "cold_path_ns_per_tsc_q32",
+        "cold_path_wrapper_ns_baseline",
+        "cold_path_clock_source",
+        "cold_path_snapshot_failed",
+    ];
+    if let Some(obj) = value.as_object() {
+        for k in cold_keys {
+            assert!(
+                !obj.contains_key(k),
+                "default WorkerRuntimeStatus must omit {k} on wire; got {value}"
+            );
+        }
+    } else {
+        panic!("expected JSON object, got {value:?}");
+    }
+}
+
+#[test]
+fn worker_runtime_status_cold_path_fields_roundtrip_populated() {
+    let mut hist = vec![vec![0u64; 24]; 16];
+    hist[3][5] = 42;
+    hist[3][6] = 100;
+    let mut sum_ns = vec![0u64; 16];
+    sum_ns[3] = 12345;
+    let mut samples = vec![0u64; 16];
+    samples[3] = 142;
+    let mut first_key = vec![0u64; 16];
+    first_key[3] = 0x1234;
+    let mut alias_seen = vec![false; 16];
+    alias_seen[7] = true;
+
+    let status = WorkerRuntimeStatus {
+        worker_id: 2,
+        cold_path_hist: hist.clone(),
+        cold_path_sum_ns: sum_ns.clone(),
+        cold_path_samples: samples.clone(),
+        cold_path_first_key: first_key.clone(),
+        cold_path_alias_seen: alias_seen.clone(),
+        cold_path_sample_phase: 50_000,
+        cold_path_wrapper_underflow_count: 3,
+        cold_path_ns_per_tsc_q32: 1_871_674_289,
+        cold_path_wrapper_ns_baseline: 45,
+        cold_path_clock_source: "tsc".into(),
+        cold_path_snapshot_failed: 2,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize populated");
+    // Spot-check a few fields are present + correctly nested.
+    assert_eq!(value["cold_path_sample_phase"], 50_000);
+    assert_eq!(value["cold_path_clock_source"], "tsc");
+    assert_eq!(value["cold_path_snapshot_failed"], 2);
+    assert_eq!(value["cold_path_hist"][3][5], 42);
+    assert_eq!(value["cold_path_hist"][3][6], 100);
+    assert_eq!(value["cold_path_samples"][3], 142);
+    assert_eq!(value["cold_path_alias_seen"][7], true);
+
+    // Round-trip back.
+    let back: WorkerRuntimeStatus =
+        serde_json::from_value(value).expect("deserialize");
+    assert_eq!(back.cold_path_hist, hist);
+    assert_eq!(back.cold_path_sum_ns, sum_ns);
+    assert_eq!(back.cold_path_samples, samples);
+    assert_eq!(back.cold_path_first_key, first_key);
+    assert_eq!(back.cold_path_alias_seen, alias_seen);
+    assert_eq!(back.cold_path_sample_phase, 50_000);
+    assert_eq!(back.cold_path_wrapper_underflow_count, 3);
+    assert_eq!(back.cold_path_ns_per_tsc_q32, 1_871_674_289);
+    assert_eq!(back.cold_path_wrapper_ns_baseline, 45);
+    assert_eq!(back.cold_path_clock_source, "tsc");
+    assert_eq!(back.cold_path_snapshot_failed, 2);
+}
+
 #[test]
 fn source_nat_persistent_fields_roundtrip() {
     let rule = SourceNATRuleSnapshot {

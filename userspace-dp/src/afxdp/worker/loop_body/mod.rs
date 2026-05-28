@@ -49,6 +49,12 @@ pub(crate) fn worker_loop(
     // #869: worker-runtime telemetry publish slot.  Worker writes its
     // local counters here on a ~1s cadence; coordinator reads for status.
     runtime_atomics: Arc<crate::afxdp::worker_runtime::WorkerRuntimeAtomics>,
+    // #1621: sibling per-worker cold-path histogram publish slot.
+    // Worker calls publish_from_local() each ~1s tick alongside the
+    // runtime_atomics.publish(). Coordinator status path reads via
+    // snapshot() at each /metrics scrape.
+    cold_path_atomics:
+        Arc<crate::afxdp::cold_path_hist::WorkerColdPathAtomics>,
 ) {
     pin_current_thread(worker_id);
     // #1620: per-worker cold-path TSC calibration. Runs ONCE at
@@ -130,6 +136,16 @@ pub(crate) fn worker_loop(
         binding.cold_path.wrapper_ns_baseline = cp_wrapper_baseline;
         binding.cold_path.clock_source = cp_clock_source;
     }
+    // #1621: install the same calibration into the sibling atomics
+    // so the first /metrics scrape sees q32 + clock_source even
+    // before the first publish-tick fires. install_calibration writes
+    // outside the cold_window_gen seqlock (calibration is set-once;
+    // readers always observe a consistent value).
+    cold_path_atomics.install_calibration(
+        cp_ns_per_tsc_q32,
+        cp_wrapper_baseline,
+        cp_clock_source,
+    );
     let binding_lookup = WorkerBindingLookup::from_bindings(&bindings);
     let cos_owner_live_by_tx_ifindex = build_worker_cos_owner_live_by_tx_ifindex(
         bindings
@@ -319,6 +335,59 @@ pub(crate) fn worker_loop(
                 wr_counters.session_table_entries = sessions.len() as u64;
                 wr_counters.max_sessions = sessions.max_sessions() as u64;
                 runtime_atomics.publish(&wr_counters, loop_now_ns);
+                // #1621: alongside the runtime publish, merge each
+                // binding's cold-path worker-local counters into a
+                // single WorkerColdPathCounters and publish via the
+                // sibling atomics' own cold_window_gen seqlock.
+                //
+                // Per plan v1 §4.2: saturating_add buckets / sum_ns /
+                // samples / sample_phase / wrapper_underflow_count;
+                // OR alias_seen; first-non-zero first_key (cross-
+                // binding aliasing detected when bindings disagree).
+                {
+                    use crate::afxdp::cold_path_hist as cph;
+                    let mut merged = cph::WorkerColdPathCounters::default();
+                    for binding in bindings.iter() {
+                        let src = &binding.cold_path;
+                        merged.sample_phase = merged
+                            .sample_phase
+                            .saturating_add(src.sample_phase);
+                        merged.wrapper_underflow_count = merged
+                            .wrapper_underflow_count
+                            .saturating_add(src.wrapper_underflow_count);
+                        for slot in 0..cph::POLICY_COLD_PATH_ZONE_PAIR_SLOTS {
+                            merged.sum_ns[slot] = merged.sum_ns[slot]
+                                .saturating_add(src.sum_ns[slot]);
+                            merged.samples[slot] = merged.samples[slot]
+                                .saturating_add(src.samples[slot]);
+                            for b in 0..cph::POLICY_COLD_PATH_HIST_BUCKETS {
+                                merged.buckets[slot][b] = merged.buckets
+                                    [slot][b]
+                                    .saturating_add(src.buckets[slot][b]);
+                            }
+                            // first_key + alias_seen cross-binding merge.
+                            if merged.first_key[slot] == 0 {
+                                merged.first_key[slot] = src.first_key[slot];
+                            } else if src.first_key[slot] != 0
+                                && src.first_key[slot] != merged.first_key[slot]
+                            {
+                                merged.alias_seen[slot] = true;
+                            }
+                            merged.alias_seen[slot] |= src.alias_seen[slot];
+                        }
+                    }
+                    // All bindings on this worker share the same pinned
+                    // core ⇒ same TSC calibration. Take any binding's
+                    // value (default = 0 if no bindings — calibration
+                    // not yet installed).
+                    if let Some(first) = bindings.first() {
+                        merged.ns_per_tsc_q32 = first.cold_path.ns_per_tsc_q32;
+                        merged.wrapper_ns_baseline =
+                            first.cold_path.wrapper_ns_baseline;
+                        merged.clock_source = first.cold_path.clock_source;
+                    }
+                    cold_path_atomics.publish_from_local(&merged);
+                }
                 wr_last_publish_ns = loop_now_ns;
             }
         }

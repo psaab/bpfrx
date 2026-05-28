@@ -265,6 +265,50 @@ impl super::Coordinator {
                 } else {
                     String::new()
                 };
+                // #1621: snapshot the sibling cold_path_atomics under
+                // its cold_window_gen seqlock. Copilot code-r1 C2+C5
+                // catch: distinguishing snapshot=None from
+                // snapshot=Some(default) is load-bearing for the wire
+                // omitempty contract.
+                //
+                // Behavior:
+                //   - snapshot() = None (retry exhausted): emit EMPTY
+                //     Vec fields so Vec::is_empty omits them from the
+                //     wire entirely; clock_source = ""; STILL stamp
+                //     snapshot_failed (operator starvation signal).
+                //   - snapshot() = Some(snap) but never-sampled
+                //     (sample_phase == 0 AND all-zero samples/alias):
+                //     also emit empty Vecs — there's no data to expose.
+                //   - snapshot() = Some(snap) with data: populated Vecs.
+                //
+                // Result: a worker that has never sampled emits a
+                // WorkerRuntimeStatus byte-identical to a pre-#1621
+                // daemon's output, validating the wire-invariant
+                // contract (and the protocol_wire_v1.json fixture).
+                // ORDER MATTERS (Claude SMR code-r1 catch): call
+                // snapshot() FIRST so any retry-exhaust fetch_add inside
+                // snapshot() is visible to the snapshot_failed_count()
+                // read below. Without this order, a failure on THIS
+                // scrape would only show up on the NEXT scrape (1-tick
+                // lag), making the operator's starvation-alert dashboard
+                // one cycle late.
+                let cold_opt = handle.cold_path_atomics.snapshot();
+                let cold_snapshot_failed =
+                    handle.cold_path_atomics.snapshot_failed_count();
+                let has_data = cold_opt
+                    .as_ref()
+                    .map(|c| {
+                        c.sample_phase != 0
+                            || c.samples.iter().any(|&v| v != 0)
+                            || c.alias_seen.iter().any(|&v| v)
+                    })
+                    .unwrap_or(false);
+                let cold = cold_opt.unwrap_or_default();
+                let cold_hist: Vec<Vec<u64>> = if has_data {
+                    cold.buckets.iter().map(|row| row.to_vec()).collect()
+                } else {
+                    Vec::new()
+                };
                 crate::protocol::WorkerRuntimeStatus {
                     worker_id: *worker_id,
                     tid: handle.runtime_atomics.tid(),
@@ -286,6 +330,42 @@ impl super::Coordinator {
                     wall_ns_60s: w.wall_ns,
                     active_ns_60s: w.active_ns,
                     window_ns: w.window_ns,
+                    // #1621 cold-path histogram fields.
+                    // Vec fields gated on has_data so an uncalibrated
+                    // / never-sampled worker emits ZERO new fields on
+                    // the wire (Copilot code-r1 C2 + C5).
+                    cold_path_hist: cold_hist,
+                    cold_path_sum_ns: if has_data {
+                        cold.sum_ns.to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                    cold_path_samples: if has_data {
+                        cold.samples.to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                    cold_path_first_key: if has_data {
+                        cold.first_key.to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                    cold_path_alias_seen: if has_data {
+                        cold.alias_seen.to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                    // Scalars: u64_is_zero in serde skips them on
+                    // the wire when 0; safe to write the raw value
+                    // (clock_source.as_str() returns "" for Unset
+                    // which String::is_empty skip will also omit).
+                    cold_path_sample_phase: cold.sample_phase,
+                    cold_path_wrapper_underflow_count: cold
+                        .wrapper_underflow_count,
+                    cold_path_ns_per_tsc_q32: cold.ns_per_tsc_q32,
+                    cold_path_wrapper_ns_baseline: cold.wrapper_ns_baseline,
+                    cold_path_clock_source: cold.clock_source.as_str().to_string(),
+                    cold_path_snapshot_failed: cold_snapshot_failed,
                 }
             })
             .collect()

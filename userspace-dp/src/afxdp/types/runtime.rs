@@ -25,6 +25,14 @@ pub(in crate::afxdp) struct WorkerHandle {
     pub(in crate::afxdp) cos_status: Arc<ArcSwap<Vec<crate::protocol::CoSInterfaceStatus>>>,
     // #869: per-worker busy/idle runtime telemetry publish slot.
     pub(in crate::afxdp) runtime_atomics: Arc<super::worker_runtime::WorkerRuntimeAtomics>,
+    /// #1621: per-worker cold-path histogram publish slot. Separate
+    /// from runtime_atomics per #1619 plan v3 Codex r1 finding 2 —
+    /// the cold-path seqlock (cold_window_gen) is independent of the
+    /// runtime seqlock (window_gen). Worker thread writes via
+    /// publish_from_local() every ~1s tick; coordinator status path
+    /// reads via snapshot() at each /metrics scrape (~1 Hz default).
+    pub(in crate::afxdp) cold_path_atomics:
+        Arc<super::cold_path_hist::WorkerColdPathAtomics>,
     pub(in crate::afxdp) join: Option<JoinHandle<()>>,
 }
 

@@ -79,6 +79,81 @@ pub struct WorkerRuntimeStatus {
     pub active_ns_60s: u64,
     #[serde(rename = "window_ns", default)]
     pub window_ns: u64,
+
+    // === #1621 cold-path histogram surface ===
+    //
+    // Mirrors WorkerColdPathCounters from #1619's cold_path_hist.rs.
+    // The Vec fields use `skip_serializing_if = "Vec::is_empty"` so an
+    // older Rust daemon that doesn't populate them emits no wire bytes
+    // and an older Go reader sees nil. Scalar fields use
+    // `serde(default)` so a missing field deserializes to 0 / empty
+    // string. Per `feedback_wire_protocol_both_sides`.
+    //
+    // Aggregated PER WORKER (Claude SMR plan-r1 F1): when a worker owns
+    // multiple bindings, the published values reflect the cross-binding
+    // sum (buckets/sum_ns/samples/sample_phase/underflow_count) OR OR
+    // (alias_seen) or first-non-zero (first_key) merge performed at
+    // the publish tick. Per #1621 plan v1 §4.2.
+    /// Per-slot per-bucket histogram. Shape [16 zone-pair slots][24 ns buckets].
+    #[serde(rename = "cold_path_hist", default,
+            skip_serializing_if = "Vec::is_empty")]
+    pub cold_path_hist: Vec<Vec<u64>>,
+    /// Per-slot sum of sampled delta_ns. Shape [16].
+    #[serde(rename = "cold_path_sum_ns", default,
+            skip_serializing_if = "Vec::is_empty")]
+    pub cold_path_sum_ns: Vec<u64>,
+    /// Per-slot sample count. Shape [16].
+    #[serde(rename = "cold_path_samples", default,
+            skip_serializing_if = "Vec::is_empty")]
+    pub cold_path_samples: Vec<u64>,
+    /// Per-slot first packed (from_zone, to_zone) key. 0 = no sample.
+    /// Used by the harness §3.4 cross-worker key-set check. Shape [16].
+    #[serde(rename = "cold_path_first_key", default,
+            skip_serializing_if = "Vec::is_empty")]
+    pub cold_path_first_key: Vec<u64>,
+    /// Per-slot alias-detected flag. Shape [16].
+    #[serde(rename = "cold_path_alias_seen", default,
+            skip_serializing_if = "Vec::is_empty")]
+    pub cold_path_alias_seen: Vec<bool>,
+    /// Per-worker monotonic count of eligible cold-path sampling
+    /// attempts (incremented on every session-miss pass). Used by the
+    /// #1622 harness as the denominator for actual_sampling_rate =
+    /// sum(samples[]) / sample_phase. `u64_is_zero` skip keeps an
+    /// uncalibrated worker's wire payload identical to pre-#1621
+    /// daemons (AGY r1 F1).
+    #[serde(rename = "cold_path_sample_phase", default,
+            skip_serializing_if = "crate::protocol::u64_is_zero")]
+    pub cold_path_sample_phase: u64,
+    /// Per-worker monotonic count of samples where raw_ns <
+    /// wrapper_ns_baseline (frequency scaling / OoO jitter signal).
+    #[serde(rename = "cold_path_wrapper_underflow_count", default,
+            skip_serializing_if = "crate::protocol::u64_is_zero")]
+    pub cold_path_wrapper_underflow_count: u64,
+    /// Q32 fixed-point ns_per_tsc multiplier from worker startup
+    /// calibration. 0 when TSC unavailable.
+    #[serde(rename = "cold_path_ns_per_tsc_q32", default,
+            skip_serializing_if = "crate::protocol::u64_is_zero")]
+    pub cold_path_ns_per_tsc_q32: u64,
+    /// Wrapper-pair baseline (cost of sample_tsc_start + sample_tsc_end
+    /// itself) measured at worker startup. Subtracted from raw_ns on
+    /// the hot path.
+    #[serde(rename = "cold_path_wrapper_ns_baseline", default,
+            skip_serializing_if = "crate::protocol::u64_is_zero")]
+    pub cold_path_wrapper_ns_baseline: u64,
+    /// "tsc" / "clock_gettime" / "" (empty = Unset). Harness gates
+    /// Table A1/A2 publication on == "tsc" for every worker.
+    #[serde(rename = "cold_path_clock_source", default,
+            skip_serializing_if = "String::is_empty")]
+    pub cold_path_clock_source: String,
+    /// #1621 plan v2 (AGY r1 F3 + Codex r1 F5): monotonic count of
+    /// snapshot() calls that exhausted their retry budget at the
+    /// coordinator status path. Surfaced as
+    /// `xpf_userspace_worker_cold_path_snapshot_failed_total` so
+    /// operators can distinguish "no samples this window" from
+    /// "transient publish-contention starvation".
+    #[serde(rename = "cold_path_snapshot_failed", default,
+            skip_serializing_if = "crate::protocol::u64_is_zero")]
+    pub cold_path_snapshot_failed: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

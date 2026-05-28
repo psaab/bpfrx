@@ -418,6 +418,14 @@ pub(in crate::afxdp) struct WorkerColdPathAtomics {
     /// Per-tick seqlock generation. Separate from
     /// `WorkerRuntimeAtomics.window_gen` per Codex r1 finding 2.
     pub(in crate::afxdp) cold_window_gen: AtomicU64,
+    /// #1621 plan v2 (AGY r1 F3 + Codex r1 F5 + Claude SMR r1 F4):
+    /// monotonic count of snapshot() calls that exhausted their
+    /// retry budget. Incremented by snapshot() ON THE READER
+    /// THREAD before returning None. Surfaced as
+    /// `xpf_userspace_worker_cold_path_snapshot_failed_total` so
+    /// operators can distinguish "no data this scrape" from
+    /// "snapshot failed under publish contention".
+    pub(in crate::afxdp) snapshot_failed: AtomicU64,
     /// #1620 plan v4 (AGY r3 [HIGH-1]): per-worker monotonic
     /// session-miss counter mirrored from
     /// `WorkerColdPathCounters.sample_phase`. Without this published,
@@ -462,6 +470,7 @@ impl WorkerColdPathAtomics {
     pub(in crate::afxdp) fn new() -> Self {
         Self {
             cold_window_gen: AtomicU64::new(0),
+            snapshot_failed: AtomicU64::new(0),
             sample_phase: AtomicU64::new(0),
             ns_per_tsc_q32: AtomicU64::new(0),
             wrapper_ns_baseline: AtomicU64::new(0),
@@ -588,7 +597,20 @@ impl WorkerColdPathAtomics {
         // distinguish from a legitimately-empty worker (AGY code-r2
         // finding 2). A Prometheus scraper sees this as "stale", not
         // as "all zeros".
+        //
+        // #1621 plan v2 (AGY r1 F3 + Codex r1 F5): also bump the
+        // snapshot_failed counter so operators can DETECT this regime
+        // via `xpf_userspace_worker_cold_path_snapshot_failed_total`
+        // rather than only see an empty payload.
+        self.snapshot_failed.fetch_add(1, Ordering::Relaxed);
         None
+    }
+
+    /// #1621 plan v2: Counter accessor for the snapshot-failed counter.
+    /// Used by the coordinator status path to emit a Prometheus metric
+    /// even when `snapshot()` returns None.
+    pub(in crate::afxdp) fn snapshot_failed_count(&self) -> u64 {
+        self.snapshot_failed.load(Ordering::Relaxed)
     }
 }
 
@@ -732,13 +754,17 @@ mod tests {
         use std::mem::{align_of, offset_of};
         // align(64) preserved from #1619.
         assert_eq!(align_of::<WorkerColdPathAtomics>(), 64);
-        // Hot fields at top — cacheline 0.
+        // Hot fields at top — cacheline 0. v2 (#1621) inserts the
+        // snapshot_failed counter at offset 8 between cold_window_gen
+        // and sample_phase so the reader-thread Counter sits in
+        // cacheline 0 alongside the seqlock gen it accompanies.
         assert_eq!(offset_of!(WorkerColdPathAtomics, cold_window_gen), 0);
-        assert_eq!(offset_of!(WorkerColdPathAtomics, sample_phase), 8);
-        assert_eq!(offset_of!(WorkerColdPathAtomics, ns_per_tsc_q32), 16);
-        assert_eq!(offset_of!(WorkerColdPathAtomics, wrapper_ns_baseline), 24);
-        assert_eq!(offset_of!(WorkerColdPathAtomics, wrapper_underflow_count), 32);
-        assert_eq!(offset_of!(WorkerColdPathAtomics, clock_source), 40);
+        assert_eq!(offset_of!(WorkerColdPathAtomics, snapshot_failed), 8);
+        assert_eq!(offset_of!(WorkerColdPathAtomics, sample_phase), 16);
+        assert_eq!(offset_of!(WorkerColdPathAtomics, ns_per_tsc_q32), 24);
+        assert_eq!(offset_of!(WorkerColdPathAtomics, wrapper_ns_baseline), 32);
+        assert_eq!(offset_of!(WorkerColdPathAtomics, wrapper_underflow_count), 40);
+        assert_eq!(offset_of!(WorkerColdPathAtomics, clock_source), 48);
     }
 
     /// #1620 plan v4 (AGY r3 [HIGH-1]): publish_from_local /

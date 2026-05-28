@@ -449,6 +449,84 @@ func newCollector(srv *Server) *xpfCollector {
 				"daemon restart in Phase 1 (#925).",
 			[]string{"worker_id"}, nil,
 		),
+		// === #1621 cold-path histogram surface ===
+		workerColdPathBucket: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_ns_bucket",
+			"Cumulative cold-path policy-eval latency observations per "+
+				"worker / zone-pair-slot, bucketed into the #1619 24-bucket "+
+				"power-of-two ns histogram. Compatible with PromQL "+
+				"histogram_quantile() via the `le` label (#1612 step-3).",
+			[]string{"worker_id", "zone_pair_slot", "le"}, nil,
+		),
+		workerColdPathSamples: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_samples_total",
+			"Per-worker / zone-pair-slot count of cold-path latency "+
+				"samples actually recorded (post sample-mask gate + post "+
+				"q32-skip). Use as the denominator for actual sampling rate.",
+			[]string{"worker_id", "zone_pair_slot"}, nil,
+		),
+		workerColdPathSumNS: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_sum_ns_total",
+			"Per-worker / zone-pair-slot cumulative sum of recorded "+
+				"delta_ns values (post baseline subtraction).",
+			[]string{"worker_id", "zone_pair_slot"}, nil,
+		),
+		workerColdPathAliasSeen: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_alias_seen",
+			"1 if this zone-pair-slot saw two different packed "+
+				"(from_zone, to_zone) keys during the current publish "+
+				"window — the harness excludes aliased slots from Scale "+
+				"Target tables. 0 otherwise.",
+			[]string{"worker_id", "zone_pair_slot"}, nil,
+		),
+		workerColdPathSamplePhase: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_sample_phase_total",
+			"Per-worker monotonic count of eligible cold-path sampling "+
+				"attempts. Increment on every session-miss pass through "+
+				"the policy-eval pre-eval gate. Denominator for "+
+				"actual_sampling_rate = sum(samples[]) / sample_phase.",
+			[]string{"worker_id"}, nil,
+		),
+		workerColdPathWrapperUnderflow: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_wrapper_underflow_count_total",
+			"Per-worker monotonic count of samples where raw_ns < "+
+				"wrapper_ns_baseline. Indicates baseline drift "+
+				"(frequency scaling, OoO jitter, ultra-fast policy_eval).",
+			[]string{"worker_id"}, nil,
+		),
+		workerColdPathWrapperNSBaseline: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_wrapper_ns_baseline",
+			"Calibrated cost of the sample_tsc_start + sample_tsc_end "+
+				"fence pair, measured once per worker post pthread "+
+				"affinity at startup. Subtracted from every recorded "+
+				"delta_ns on the hot path.",
+			[]string{"worker_id"}, nil,
+		),
+		workerColdPathNSPerTSCQ32: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_ns_per_tsc_q32",
+			"Q32 fixed-point ns_per_tsc multiplier from worker startup "+
+				"calibration. 0 when TSC unavailable. Operators compare "+
+				"across workers to detect calibration anomalies.",
+			[]string{"worker_id"}, nil,
+		),
+		workerColdPathClockSource: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_clock_source",
+			"1 when this worker's clock source has the value of the "+
+				"`source` label. Operators gate Scale Target table "+
+				"publication on every worker reporting source='tsc'. "+
+				"Always emitted (uncalibrated workers report "+
+				"source='unset').",
+			[]string{"worker_id", "source"}, nil,
+		),
+		workerColdPathSnapshotFailedTotal: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_snapshot_failed_total",
+			"Per-worker monotonic count of snapshot() calls at the "+
+				"coordinator status path that exhausted their retry "+
+				"budget (publish contention / scheduler preemption). "+
+				"Distinguishes 'no data this scrape' from 'transient "+
+				"starvation'.",
+			[]string{"worker_id"}, nil,
+		),
 		bindingActiveFlowCount: prometheus.NewDesc(
 			"xpf_userspace_binding_active_flow_count",
 			"Distinct active flows observed in this binding's flow_cache "+

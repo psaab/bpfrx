@@ -519,7 +519,111 @@ func (c *xpfCollector) emitWorkerRuntime(ch chan<- prometheus.Metric, status dpu
 		}
 		ch <- prometheus.MustNewConstMetric(c.workerDead,
 			prometheus.GaugeValue, deadValue, label)
+		// #1621: cold-path histogram surface (#1612 step-3).
+		c.emitWorkerColdPath(ch, label, w)
 	}
+}
+
+// #1621: emit the cold-path histogram metric families for one worker.
+//
+// Per plan v2:
+//   - bucket counter family with PromQL `le` label so
+//     histogram_quantile() works natively (Codex r1 F3 + AGY r1 F6 +
+//     Claude SMR F5).
+//   - sum_ns + samples counters per (worker, slot).
+//   - alias_seen gauge per (worker, slot).
+//   - per-worker scalars: sample_phase + wrapper_underflow (counters);
+//     wrapper_ns_baseline + ns_per_tsc_q32 (gauges).
+//   - clock_source gauge always emitted (Claude SMR r1 F4) so
+//     dashboards distinguish "tsc active" from "no data this scrape".
+//   - snapshot_failed_total counter (AGY r1 F3 + Codex r1 F5) so
+//     operators detect publish-contention starvation.
+func (c *xpfCollector) emitWorkerColdPath(
+	ch chan<- prometheus.Metric,
+	label string,
+	w dpuserspace.WorkerRuntimeStatus,
+) {
+	// 24-bucket power-of-two histogram. Bucket 0 covers [0, 1024) ns;
+	// bucket i ∈ [1, 22] covers [2^(9+i), 2^(10+i)) ns; bucket 23
+	// saturates at any ns ≥ 2^32 (~4.295 s). Per #1619 plan v3 §1.1.
+	//
+	// The `le` (less-than-or-equal) label carries the upper inclusive
+	// boundary in nanoseconds, matching Prometheus histogram convention
+	// for histogram_quantile().
+	bucketLe := func(idx int) string {
+		// idx == 0 → le = 1023 (just under 1024); idx ∈ [1, 22] →
+		// le = 2^(10+idx) - 1; idx >= 23 → le = +Inf.
+		if idx == 0 {
+			return "1023"
+		}
+		if idx >= 23 || (10+idx) >= 64 {
+			return "+Inf"
+		}
+		return strconv.FormatUint((uint64(1)<<uint(10+idx))-1, 10)
+	}
+	// Prometheus histogram `_bucket{le="N"}` convention requires
+	// CUMULATIVE counts (count of observations ≤ N), not the raw
+	// per-bucket count. Copilot code-r1 C1 caught this: the v1 plan
+	// said `_bucket` "counter" but didn't specify cumulative. Without
+	// cumulative semantics, `histogram_quantile()` computes wrong
+	// quantiles. Accumulate per-slot before emit.
+	for slot := 0; slot < len(w.ColdPathHist); slot++ {
+		slotLabel := strconv.Itoa(slot)
+		var running uint64
+		for b := 0; b < len(w.ColdPathHist[slot]); b++ {
+			running += w.ColdPathHist[slot][b]
+			ch <- prometheus.MustNewConstMetric(c.workerColdPathBucket,
+				prometheus.CounterValue,
+				float64(running),
+				label, slotLabel, bucketLe(b))
+		}
+	}
+	for slot, samples := range w.ColdPathSamples {
+		slotLabel := strconv.Itoa(slot)
+		ch <- prometheus.MustNewConstMetric(c.workerColdPathSamples,
+			prometheus.CounterValue, float64(samples), label, slotLabel)
+		if slot < len(w.ColdPathSumNS) {
+			ch <- prometheus.MustNewConstMetric(c.workerColdPathSumNS,
+				prometheus.CounterValue,
+				float64(w.ColdPathSumNS[slot]),
+				label, slotLabel)
+		}
+		if slot < len(w.ColdPathAliasSeen) {
+			alias := 0.0
+			if w.ColdPathAliasSeen[slot] {
+				alias = 1.0
+			}
+			ch <- prometheus.MustNewConstMetric(c.workerColdPathAliasSeen,
+				prometheus.GaugeValue, alias, label, slotLabel)
+		}
+	}
+	// Per-worker scalars.
+	ch <- prometheus.MustNewConstMetric(c.workerColdPathSamplePhase,
+		prometheus.CounterValue,
+		float64(w.ColdPathSamplePhase), label)
+	ch <- prometheus.MustNewConstMetric(c.workerColdPathWrapperUnderflow,
+		prometheus.CounterValue,
+		float64(w.ColdPathWrapperUnderflowCount), label)
+	ch <- prometheus.MustNewConstMetric(c.workerColdPathWrapperNSBaseline,
+		prometheus.GaugeValue,
+		float64(w.ColdPathWrapperNSBaseline), label)
+	ch <- prometheus.MustNewConstMetric(c.workerColdPathNSPerTSCQ32,
+		prometheus.GaugeValue,
+		float64(w.ColdPathNSPerTSCQ32), label)
+	// clock_source gauge ALWAYS emitted (Claude SMR r1 F4): even
+	// when the worker is uncalibrated (source == ""), so dashboards
+	// can distinguish "tsc active" from "no data this scrape".
+	src := w.ColdPathClockSource
+	if src == "" {
+		src = "unset"
+	}
+	ch <- prometheus.MustNewConstMetric(c.workerColdPathClockSource,
+		prometheus.GaugeValue, 1.0, label, src)
+	// snapshot_failed counter always emitted so operators can detect
+	// transient publish-contention starvation.
+	ch <- prometheus.MustNewConstMetric(c.workerColdPathSnapshotFailedTotal,
+		prometheus.CounterValue,
+		float64(w.ColdPathSnapshotFailed), label)
 }
 
 func (c *xpfCollector) emitUserspaceEventStream(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
