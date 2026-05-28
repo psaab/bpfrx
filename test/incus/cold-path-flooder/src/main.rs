@@ -581,12 +581,27 @@ struct TxRing {
     dst_sll: libc::sockaddr_ll,
 }
 
-// SAFETY: TxRing contains raw `*mut c_void` pointers (in libc::iovec)
-// that reference its own heap-allocated `slots: Vec<TxSlot>`. Moving a
-// `Vec<T>` does NOT relocate its heap-allocated elements, so the
-// pointers remain valid across thread moves. We construct + use the
-// TxRing within a single thread (the worker), so there is no
-// cross-thread aliasing concern.
+// SAFETY: TxRing contains two classes of raw pointers in its `msgs`
+// field:
+//   1. `msg_hdr.msg_iov` -> `&iovecs[i]`: iovecs is a Vec, so its
+//      backing storage lives at a heap-stable address; Vec move
+//      does NOT relocate the underlying buffer, so these pointers
+//      stay valid across struct moves.
+//   2. `msg_hdr.msg_name` -> `&self.dst_sll`: dst_sll is an INLINE
+//      field of TxRing. Moving TxRing relocates dst_sll. This means
+//      `wire_msgs()` MUST be invoked at the TxRing's final stack
+//      location — calling wire_msgs() before a subsequent move
+//      leaves dangling pointers in msg_name and sendmmsg dereferences
+//      a relocated stack frame. Caller contract (enforced by
+//      run_multi_threaded + worker_loop): TxRing is moved into the
+//      worker closure → moved into worker_loop's stack frame →
+//      `ctx.ring.wire_msgs()` is then called as the worker's second
+//      action (after pin) at the final memory location. No move
+//      occurs after wire_msgs in the worker. (CODEX code-r1 finding
+//      1; AGY impl-r1 finding 1+2.)
+//
+// We construct + use TxRing within a single thread (the worker),
+// so there is no cross-thread aliasing concern.
 unsafe impl Send for TxRing {}
 
 impl TxRing {
@@ -1005,6 +1020,10 @@ fn pin_self_to_cpu(cpu: i32) -> Result<(), String> {
 /// Per-thread context passed into a worker closure. Owns its WorkerFd
 /// (RAII close on drop), its PaddedStats publish slot, its seed, and
 /// a clone of the shared shutdown_flag + first_fatal_error slot.
+/// `start_at` and `total_deadline` are computed once in main so every
+/// worker uses the SAME run window. Without this, late-scheduled
+/// workers would extend the run past the requested duration (CODEX
+/// code-r1 finding 3).
 struct WorkerCtx {
     thread_id: u32,
     fd: WorkerFd,
@@ -1014,6 +1033,19 @@ struct WorkerCtx {
     shutdown_flag: Arc<AtomicBool>,
     first_fatal: Arc<Mutex<Option<String>>>,
     pin_cpu: Option<i32>,
+    /// All workers share these deadlines (computed once in main) so
+    /// late-scheduled workers cannot extend the run past
+    /// `total_deadline`. `start_at` is kept for diagnostic logging
+    /// even though the hot loop only references `warmup_end` +
+    /// `total_deadline`. (CODEX code-r1 finding 3.)
+    #[allow(dead_code)]
+    start_at: Instant,
+    warmup_end: Instant,
+    total_deadline: Instant,
+    /// Atomic warmup baseline — set by the worker at warmup-end (one
+    /// store per worker), read by main at summary time to subtract
+    /// warmup work from final tx_packets. (CODEX code-r1 finding 2.)
+    warmup_baseline: Arc<AtomicU64>,
 }
 
 /// Per-worker hot loop. Publishes per-batch deltas into self.stats
@@ -1034,18 +1066,17 @@ fn worker_loop(args: &Args, mut ctx: WorkerCtx) {
         }
     }
 
+    // Wire the mmsghdr array AFTER ctx has reached its final stack
+    // location. wire_msgs() stores a raw pointer to ctx.ring.dst_sll
+    // (an inline TxRing field, not heap) into each msghdr.msg_name.
+    // If we called wire_msgs before the move into worker_loop, the
+    // pointer would dangle after the move and sendmmsg would dereference
+    // garbage. (CODEX code-r1 finding 1; AGY impl-r1 finding 1.)
+    ctx.ring.wire_msgs();
+
     let fd = ctx.fd.raw();
     let mut prng = Xorshift64(ctx.seed);
-    let start = Instant::now();
-    let in_warmup = !args.warmup.is_zero();
-    // Warmup baseline subtracted at summary time — for now we accept
-    // counting warmup work as a known small bias when warmup_secs <= 2.
-    // The aggregate avg_pps in the JSON summary is computed as
-    // tx_packets / duration_secs (NOT including warmup); the bias is
-    // <7% for warmup_secs=2 + duration_secs=30, well within the smoke
-    // gate margin. Future refinement: per-worker AtomicU64 warmup
-    // baseline that emit_summary subtracts.
-    let _ = in_warmup;
+    let mut warmup_baseline_published = false;
 
     loop {
         // Shutdown check at top of each batch (#1615 plan-v4 §3.9).
@@ -1053,8 +1084,18 @@ fn worker_loop(args: &Args, mut ctx: WorkerCtx) {
             return;
         }
         let now = Instant::now();
-        let elapsed = now - start;
-        if elapsed >= args.warmup + args.duration { return; }
+        // Shared deadline: all workers exit at the same `total_deadline`
+        // computed once in main. Prevents late-scheduled workers from
+        // extending the run. (CODEX code-r1 finding 3.)
+        if now >= ctx.total_deadline { return; }
+        // At warmup-end, publish baseline tx_packets so main can
+        // subtract warmup work from the final summary. (CODEX code-r1
+        // finding 2.) One store per worker.
+        if !warmup_baseline_published && now >= ctx.warmup_end {
+            let baseline = ctx.stats.tx_packets.load(Ordering::Relaxed);
+            ctx.warmup_baseline.store(baseline, Ordering::Relaxed);
+            warmup_baseline_published = true;
+        }
 
         // Refill all batch slots with fresh PRNG values.
         for slot in ctx.ring.slots.iter_mut() {
@@ -1226,6 +1267,14 @@ fn run_multi_threaded(
     let first_fatal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let stats_slots: Vec<Arc<PaddedStats>> =
         (0..n).map(|_| Arc::new(PaddedStats::new())).collect();
+    // Per-worker warmup baselines (initialised to 0 == no warmup
+    // observed yet; worker writes its baseline at warmup-end).
+    let warmup_baselines: Vec<Arc<AtomicU64>> =
+        (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    // Shared deadlines so every worker uses the same window.
+    let start_at = Instant::now() + Duration::from_millis(50);
+    let warmup_end = start_at + args.warmup;
+    let total_deadline = warmup_end + args.duration;
 
     let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(n);
     let mut spawn_error: Option<String> = None;
@@ -1265,6 +1314,10 @@ fn run_multi_threaded(
             shutdown_flag: shutdown_flag.clone(),
             first_fatal: first_fatal.clone(),
             pin_cpu,
+            start_at,
+            warmup_end,
+            total_deadline,
+            warmup_baseline: warmup_baselines[tid].clone(),
         };
         let args_owned = args.clone();
         // std::thread::Builder is mandatory (#1615 plan-v4 §3.9 +
@@ -1272,9 +1325,11 @@ fn run_multi_threaded(
         // failure rather than panicking, so we can rollback.
         let builder = std::thread::Builder::new()
             .name(format!("flooder-{}", tid));
+        // NOTE: wire_msgs() is called inside worker_loop AFTER the ctx
+        // move into worker_loop's stack frame, so the raw pointer to
+        // ctx.ring.dst_sll points at the final stack location.
+        // (CODEX code-r1 finding 1; AGY impl-r1 finding 1.)
         match builder.spawn(move || {
-            let mut ctx = ctx;
-            ctx.ring.wire_msgs();
             worker_loop(&args_owned, ctx);
         }) {
             Ok(h) => handles.push(h),
@@ -1295,12 +1350,13 @@ fn run_multi_threaded(
     }
 
     // Main-thread aggregate progress loop — sole stderr emitter so
-    // worker output cannot interleave. Per plan-v4.md §3.8.
-    let start = Instant::now();
-    let total_deadline = start + args.warmup + args.duration;
-    let mut next_emit_at = start + args.warmup + Duration::from_secs(1);
+    // worker output cannot interleave. Per plan-v4.md §3.8. Uses the
+    // SAME `total_deadline` that workers honour — when main reaches
+    // the deadline it also stores shutdown_flag so any worker still
+    // in mid-batch exits promptly. (CODEX code-r1 finding 3.)
+    let mut next_emit_at = warmup_end + Duration::from_secs(1);
     let mut prev_agg = RunStats::default();
-    let mut prev_emit_at = start + args.warmup;
+    let mut prev_emit_at = warmup_end;
     while Instant::now() < total_deadline {
         if shutdown_flag.load(Ordering::Relaxed) {
             // Worker reported fatal; break out and join below.
@@ -1309,7 +1365,7 @@ fn run_multi_threaded(
         let now = Instant::now();
         if now >= next_emit_at {
             let agg = sum_slots(&stats_slots);
-            let elapsed = now - start;
+            let elapsed = now - start_at;
             eprintln!(
                 "{}",
                 format_progress_json(elapsed, &agg, &prev_agg, now - prev_emit_at)
@@ -1318,12 +1374,14 @@ fn run_multi_threaded(
             prev_emit_at = now;
             next_emit_at = now + Duration::from_secs(1);
         }
-        // Sleep up to 100 ms or until next emit, whichever sooner —
-        // gives the shutdown_flag check a tight cadence.
+        // Sleep up to 100 ms or until next emit, whichever sooner.
         let sleep_until = next_emit_at.min(now + Duration::from_millis(100));
         let dur = sleep_until.saturating_duration_since(Instant::now());
         if !dur.is_zero() { std::thread::sleep(dur); }
     }
+    // Signal end-of-run so workers stop emitting packets even if their
+    // local clock check is mid-batch behind the deadline.
+    shutdown_flag.store(true, Ordering::Relaxed);
 
     // Join all workers.
     for h in handles { let _ = h.join(); }
@@ -1333,10 +1391,31 @@ fn run_multi_threaded(
         return Err(msg);
     }
 
-    // Collect per-thread + aggregate.
-    let per_thread: Vec<RunStats> =
-        stats_slots.iter().map(|s| s.snapshot()).collect();
-    let agg = sum_slots(&stats_slots);
+    // Collect per-thread snapshots and subtract warmup baselines so
+    // the reported tx_packets reflect only the run-phase work. (CODEX
+    // code-r1 finding 2.) The other counters (err_*) are NOT subtracted
+    // because warmup errors are a legitimate diagnostic signal — if
+    // EAGAIN was high during warmup it indicates the device backed up.
+    let mut per_thread: Vec<RunStats> = Vec::with_capacity(stats_slots.len());
+    for (i, s) in stats_slots.iter().enumerate() {
+        let mut snap = s.snapshot();
+        let baseline = warmup_baselines[i].load(Ordering::Relaxed);
+        snap.tx_packets = snap.tx_packets.saturating_sub(baseline);
+        per_thread.push(snap);
+    }
+    // Aggregate from the warmup-adjusted per-thread Vec to keep both
+    // views consistent.
+    let mut agg = RunStats::default();
+    for s in &per_thread {
+        agg.tx_packets += s.tx_packets;
+        agg.tx_batches += s.tx_batches;
+        agg.err_eagain += s.err_eagain;
+        agg.err_partial += s.err_partial;
+        agg.err_other += s.err_other;
+        if agg.first_other_errno == 0 && s.first_other_errno != 0 {
+            agg.first_other_errno = s.first_other_errno;
+        }
+    }
     Ok((agg, per_thread))
 }
 
