@@ -1,10 +1,13 @@
-# #1636 cold-connect / neighbor-resolution gap — research plan
+# #1636 cold-connect / neighbor-resolution gap — converged plan
 
-**Status**: DRAFT v7 — revised after round-6 AGY findings (warm trigger on RG-promote, ForwardingState placement, force flag, type names)
-**Convergence target**: Codex r6 PLAN-READY; AGY round-7 check pending; SMR r6 PLAN-READY contingent on v7 fold-in
+**Status**: CONVERGED v7 — 3-of-3 PLAN-READY (Codex r6, AGY r7, Claude
+SMR r7). This is the implemented plan of record; see PR #1640 for the
+implementation, the 4-way code review, and the empirical cluster
+validation (cold connect 3.371s → ~1.016s).
 **Base SHA**: `dbfbf680cc82` (origin/master @ 2026-05-28)
-**Branch**: `research/1636-cold-connect-mitigation`
-**Scope**: research-only, no production source edits, no PR
+**Research branch**: `research/1636-cold-connect-mitigation`;
+**implementation branch**: `fix/1636-cold-connect-mitigation`
+**Scope of this doc**: the converged plan-of-action that drove the PR.
 
 ## Changelog since v6
 

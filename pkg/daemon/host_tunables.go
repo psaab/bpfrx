@@ -346,7 +346,7 @@ func applyNetdevBudget(value int, fs hostTunableFS, capture *priorHostTunables) 
 // recovery against an unknown next-hop: the kernel's own ARP/NDP
 // retransmit timer then fires every 250ms instead of every 1000ms, so a
 // dropped initial solicit is re-driven ~4× sooner. See
-// docs/research/1636-cold-connect-mitigation/plan.md option B.
+// docs/pr/1636-cold-connect-mitigation/plan.md option B.
 //
 // Both the IPv4 and IPv6 "default" neighbor tables are written; "default"
 // is the template every newly-created interface inherits, so this covers
