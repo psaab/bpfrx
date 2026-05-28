@@ -232,4 +232,67 @@ EOF
 	exit 6
 fi
 
+# ---- Phase 3.5: oversubscription-policy round-trip verification ----
+#
+# #1626: PR #1618 shipped the #1614 step-1 wire surface (Junos
+# `oversubscription-policy guarantee-rate <X>`) but the
+# `cos-iperf-config.set` fixture forgot to enable the knob, so the
+# simul-load smoke harness was measuring the default `proportional`
+# mode the whole time. This phase guards against the same regression
+# class for any future fixture: if the applied fixture contains
+# `^set .*oversubscription-policy` lines, the running config tree
+# MUST round-trip with EACH such line present after commit.
+#
+# The check is dynamically gated on fixture content (NOT on
+# --same-class / --symmetric flags) so future fixtures that activate
+# the knob get verified unchanged, and fixtures that don't are
+# silently skipped.
+#
+# We use `show configuration class-of-service | display set` (the
+# flat-set rendering of the config tree) so a literal `grep -Fxq`
+# can match each fixture line verbatim. CRLF safety: strip trailing
+# \r from the expected line in case the fixture file picks up
+# Windows-style line endings on edit.
+if grep -qE '^set .*oversubscription-policy' "$CONFIG_FILE"; then
+	OVERSUB_OUT=$(mktemp)
+	trap "rm -f '$SETS_TMP' '$CHECK_OUT' '$APPLY_OUT' '$VERIFY_OUT' '$OVERSUB_OUT'" EXIT
+	incus exec "$TARGET" -- /usr/local/sbin/cli -c \
+		"show configuration class-of-service | display set" \
+		> "$OVERSUB_OUT" 2>&1 || true
+
+	MISSING=0
+	while IFS= read -r want; do
+		want="${want%$'\r'}"
+		if ! grep -Fxq "$want" "$OVERSUB_OUT"; then
+			echo "error: fixture line missing from running config:" >&2
+			echo "  expected: $want" >&2
+			MISSING=1
+		fi
+	done < <(grep -E '^set .*oversubscription-policy' "$CONFIG_FILE")
+
+	if [[ "$MISSING" -ne 0 ]]; then
+		echo "error: Phase-3.5 oversubscription-policy verification FAILED" >&2
+		echo "---- show configuration class-of-service | display set ----" >&2
+		cat "$OVERSUB_OUT" >&2
+		echo "---- end show output ----" >&2
+		echo "rolling forward with 'rollback 1 | commit' to restore the last good state..." >&2
+		ROLLBACK_OUT=$(mktemp)
+		trap "rm -f '$SETS_TMP' '$CHECK_OUT' '$APPLY_OUT' '$VERIFY_OUT' '$OVERSUB_OUT' '$ROLLBACK_OUT'" EXIT
+		if incus exec "$TARGET" -- /usr/local/sbin/cli > "$ROLLBACK_OUT" 2>&1 <<'EOF'
+configure
+rollback 1
+commit
+exit
+quit
+EOF
+		then
+			echo "rollback 1 committed — live state reverted" >&2
+		else
+			echo "WARN: rollback commit also failed — MANUAL INTERVENTION REQUIRED" >&2
+			cat "$ROLLBACK_OUT" >&2
+		fi
+		exit 7
+	fi
+fi
+
 echo "apply-cos-config: atomic commit + verification OK"

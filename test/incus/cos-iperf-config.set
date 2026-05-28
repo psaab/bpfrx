@@ -68,6 +68,7 @@ set class-of-service scheduler-maps bandwidth-limit forwarding-class iperf-uncap
 
 set class-of-service interfaces reth0 unit 80 scheduler-map bandwidth-limit
 set class-of-service interfaces reth0 unit 80 shaping-rate 25g
+set class-of-service interfaces reth0 unit 80 oversubscription-policy guarantee-rate 0.7
 
 set firewall family inet filter bandwidth-output term 0 from destination-port 5200
 set firewall family inet filter bandwidth-output term 0 from destination-port 6200
