@@ -826,6 +826,84 @@ source of truth for the contract. Updates require:
   `feedback_smoke_*` memory entries that reference numeric
   targets.
 
+## CoS oversubscription policy (#1614)
+
+When the sum of an interface unit's configured exact-class
+`transmit-rate` exceeds the unit's `shaping-rate`, the dataplane is
+in **oversubscription**. The pre-#1614 scheduler is a
+**rate-proportional DRR** — every exact class receives roughly
+`R_i × shaping_rate / sum(R_j)` bytes/sec under saturation. Math
+walk in `docs/pr/1614-multi-rss-cos/plan.md` §3 (committed v5.1)
+predicts the observed all-11-class distribution within
+quantum-floor noise.
+
+The #1614 v5 scheduler adds an operator-selectable per-interface-
+unit policy:
+
+- **`proportional`** (default): current scheduler unchanged
+  bit-for-bit. The new allocator code path is never reached when
+  this mode is selected AND `priority-low-min-share` is zero
+  (see "Bit-for-bit preservation" below).
+
+- **`guarantee-rate <fraction>`** (opt-in): two-phase waterfill
+  allocator. Phase 1 honours small-rate exact classes ascending
+  by `R_i` up to `fraction × cap`. Phase 2 distributes residual
+  proportionally across the queues NOT fully honoured in Phase 1
+  (with the partial-honour queue carrying its REMAINING quantum,
+  not its full quantum, so total alloc per queue ≤ Q_i).
+
+Junos configuration:
+
+```
+set class-of-service interfaces <iface> unit <u>
+  oversubscription-policy guarantee-rate <fraction>     # 0.0..1.0
+set class-of-service interfaces <iface> unit <u>
+  priority-low-min-share <bps>
+```
+
+### Acceptance gates under guarantee-rate mode
+
+In addition to the structural per-flow CoV gate above
+(`observed_CoV ≤ Cstruct + 0.05`), guarantee-rate runs assert:
+
+1. **Small-class absolute guarantee** (classes whose cumulative
+   `R_i` fits under the shaping ceiling): each class hits ≥ 95% of
+   its configured rate under all-class simul load.
+2. **Priority-low minimum share**: when configured, the
+   priority-low queue receives ≥ 95% of its configured
+   `priority-low-min-share`.
+3. **Retransmit floor**: per class ≤ 100 retransmits per 30 s
+   under all-class simul load (gate 3 of plan.md §7). Achieved by
+   the A3 CoDel-style sojourn-time AQM (default disabled; opt-in
+   via `set class-of-service schedulers <name> codel-target <ms>`).
+4. **Proportional regression preserved**: a config without the
+   new `oversubscription-policy` keys produces the same per-class
+   distribution as master HEAD on the `cos-iperf-config.set`
+   fixture (within ±5% per-class token-bucket noise).
+
+### Simul-load harness
+
+`test/incus/cos-simul-load-smoke.sh [push|reverse]` runs all 11
+canonical classes in parallel for 30 s and reduces a verdict.json
+with per-class achievement, CoV, retransmits, and gate booleans.
+This is now part of the canonical smoke matrix for any PR that
+touches CoS scheduling.
+
+### Bit-for-bit preservation of proportional mode
+
+When `oversubscription-policy` is unset (or set to `proportional`)
+AND `priority-low-min-share` is zero, the v5 selector hits an
+explicit early-return that routes to the legacy
+`select_exact_cos_guarantee_queue_with_lease_telemetry`
+unchanged. No round-robin cursor change, no quantum scaling, no
+new arithmetic. Existing deployments see no behaviour change.
+
+The Phase 0 sanity check that #1614 v5 was built upon ran on
+2026-05-27 against the loss userspace cluster: simul-load reverse
+direction (all 11 classes parallel) reached 22.72 G aggregate
+with generator CPU 20-58% idle, confirming the firewall (not the
+generator) is the bottleneck the work targets.
+
 ## Open questions for future contract iteration
 
 - Is `ε = 0.05` (5 percentage points implementation margin) the

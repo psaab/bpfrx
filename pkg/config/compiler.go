@@ -1046,8 +1046,67 @@ func ValidateConfig(cfg *Config) []string {
 		if hasCoSRuntimeConfig && effectiveDataplaneType(cfg.System.DataplaneType) != dataplaneTypeUserspace {
 			warnings = append(warnings, "class-of-service shaping, classifier attachment, and dscp rewrite-rule attachment are only implemented in the userspace dataplane; configuration is accepted but will not take effect on this dataplane")
 		}
+
+		// #1614 A4: operator-visible warning when the sum of an
+		// interface unit's exact-class transmit-rates exceeds the
+		// unit's shaping-rate. Under oversubscription, every class
+		// will receive less than its configured rate; the visible
+		// distribution depends on the unit's oversubscription-policy.
+		warnings = append(warnings, validateCoSOversubscriptionWarnings(cos)...)
 	}
 
+	return warnings
+}
+
+// validateCoSOversubscriptionWarnings emits commit-time warnings for
+// every CoS interface unit whose sum of exact-class transmit rates
+// exceeds the unit's configured shaping-rate. Warnings are non-fatal;
+// the runtime accepts the config and the new
+// oversubscription-policy knob (#1614 A1) governs distribution.
+func validateCoSOversubscriptionWarnings(cos *ClassOfServiceConfig) []string {
+	var warnings []string
+	if cos == nil {
+		return warnings
+	}
+	for ifaceName, iface := range cos.Interfaces {
+		if iface == nil {
+			continue
+		}
+		for unitID, unit := range iface.Units {
+			if unit == nil || unit.ShapingRateBytes == 0 || unit.SchedulerMap == "" {
+				continue
+			}
+			schedMap, ok := cos.SchedulerMaps[unit.SchedulerMap]
+			if !ok || schedMap == nil {
+				continue
+			}
+			var sumExact uint64
+			for _, entry := range schedMap.Entries {
+				if entry == nil || entry.Scheduler == "" {
+					continue
+				}
+				sched, ok := cos.Schedulers[entry.Scheduler]
+				if !ok || sched == nil || !sched.TransmitRateExact {
+					continue
+				}
+				sumExact += sched.TransmitRateBytes
+			}
+			if sumExact <= unit.ShapingRateBytes {
+				continue
+			}
+			policyTail := "proportional (default): each class receives classRate × shaping / sumExact (current behaviour)"
+			if unit.OversubscriptionPolicy == "guarantee-rate" {
+				policyTail = fmt.Sprintf(
+					"guarantee-rate %g: small classes honoured to configured rate; larger classes share residual proportionally (see #1614)",
+					unit.OversubscriptionGuaranteeFraction,
+				)
+			}
+			warnings = append(warnings, fmt.Sprintf(
+				"class-of-service interfaces %s unit %d: sum of exact-class transmit-rates (%d B/s) exceeds shaping-rate (%d B/s); under oversubscription the configured oversubscription-policy=%s",
+				ifaceName, unitID, sumExact, unit.ShapingRateBytes, policyTail,
+			))
+		}
+	}
 	return warnings
 }
 

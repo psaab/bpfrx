@@ -101,7 +101,11 @@ pub(in crate::afxdp) fn test_cos_interface_runtime(now_ns: u64) -> CoSInterfaceR
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             }],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
         now_ns,
     )
@@ -122,6 +126,7 @@ pub(in crate::afxdp) fn test_cos_runtime_with_exact(exact: bool) -> CoSInterface
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     )
 }
@@ -141,6 +146,9 @@ pub(in crate::afxdp) fn test_cos_runtime_with_queues(
             ieee8021_queue_by_pcp: [u8::MAX; 8],
             queue_by_forwarding_class: FastMap::default(),
             queues,
+            oversubscription_policy: crate::afxdp::types::CoSOversubscriptionPolicy::Proportional,
+            oversubscription_guarantee_fraction: 0.0,
+            priority_low_min_share_bytes: 0,
         },
         0,
     )
@@ -235,6 +243,7 @@ pub(in crate::afxdp) fn test_mixed_class_root_with_primed_queues() -> CoSInterfa
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
             CoSQueueConfig {
                 queue_id: 1,
@@ -248,6 +257,7 @@ pub(in crate::afxdp) fn test_mixed_class_root_with_primed_queues() -> CoSInterfa
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
             CoSQueueConfig {
                 queue_id: 2,
@@ -261,6 +271,7 @@ pub(in crate::afxdp) fn test_mixed_class_root_with_primed_queues() -> CoSInterfa
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
             CoSQueueConfig {
                 queue_id: 3,
@@ -274,6 +285,7 @@ pub(in crate::afxdp) fn test_mixed_class_root_with_primed_queues() -> CoSInterfa
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
         ],
     );
@@ -437,6 +449,7 @@ pub(in crate::afxdp) fn test_flow_fair_exact_queue_16_flows() -> CoSInterfaceRun
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];

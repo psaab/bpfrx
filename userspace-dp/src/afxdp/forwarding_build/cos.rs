@@ -312,6 +312,11 @@ pub(super) fn build_cos_iface_config(
                         .get(&entry.forwarding_class)
                         .copied()
                 }),
+                // #1614 A3: per-queue CoDel target from scheduler. 0
+                // disables CoDel for the queue (current default).
+                codel_target_ns: scheduler
+                    .map(|sched| sched.codel_target_ns)
+                    .unwrap_or(0),
             });
         }
     }
@@ -398,6 +403,9 @@ pub(super) fn build_cos_iface_config(
                     rewrite_rule.dscp_by_forwarding_class.get("best-effort")
                 })
                 .copied(),
+            // #1614 A3: synthetic best-effort queue has no scheduler;
+            // CoDel disabled by default (0 = off).
+            codel_target_ns: 0,
         });
     }
     queues.sort_by(|a, b| a.queue_id.cmp(&b.queue_id));
@@ -410,6 +418,18 @@ pub(super) fn build_cos_iface_config(
         .find(|queue| queue.forwarding_class == "best-effort")
         .map(|queue| queue.queue_id)
         .unwrap_or_else(|| queues[0].queue_id);
+    // #1614 A1: parse the operator-selectable oversubscription
+    // policy. "" or "proportional" (default) maps to Proportional
+    // (current scheduler unchanged); "guarantee-rate" activates the
+    // v5 two-phase waterfill allocator. The Go control plane is
+    // responsible for warn-and-clamping the fraction to 0.0..1.0.
+    let oversubscription_policy = match iface.cos_oversubscription_policy.as_str() {
+        "guarantee-rate" => CoSOversubscriptionPolicy::GuaranteeRate,
+        _ => CoSOversubscriptionPolicy::Proportional,
+    };
+    let oversubscription_guarantee_fraction = iface
+        .cos_oversubscription_guarantee_fraction
+        .clamp(0.0, 1.0);
     Some(CoSInterfaceConfig {
         shaping_rate_bytes: iface.cos_shaping_rate_bytes_per_sec,
         burst_bytes,
@@ -420,6 +440,9 @@ pub(super) fn build_cos_iface_config(
         ieee8021_queue_by_pcp,
         queue_by_forwarding_class,
         queues,
+        oversubscription_policy,
+        oversubscription_guarantee_fraction,
+        priority_low_min_share_bytes: iface.cos_priority_low_min_share_bytes,
     })
 }
 

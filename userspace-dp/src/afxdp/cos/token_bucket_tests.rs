@@ -68,6 +68,7 @@ fn exact_queue_without_shared_lease_does_not_locally_refill() {
             surplus_weight: 1,
             buffer_bytes: 125_000,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.tokens = 1500;
@@ -122,6 +123,7 @@ fn maybe_top_up_cos_root_lease_unblocks_large_frame_exceeding_lease_bytes() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let frame_len = tx_frame_capacity();
@@ -163,6 +165,7 @@ fn maybe_top_up_cos_queue_lease_unblocks_local_exact_queue_without_tokens() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.tokens = 1500;
@@ -216,6 +219,7 @@ fn maybe_top_up_cos_queue_lease_reports_v8_acquire_calls_and_grants() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0].hot.tokens = 0;
@@ -254,6 +258,7 @@ fn maybe_top_up_cos_queue_lease_enforces_equal_flow_cap() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0].hot.tokens = 0;
@@ -322,6 +327,7 @@ fn maybe_top_up_cos_root_lease_transparent_when_shaping_rate_zero() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     // Force tokens to 0 so the top-up has work to do.
@@ -361,6 +367,7 @@ fn maybe_top_up_cos_queue_lease_transparent_when_queue_rate_zero_exact_no_lease(
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0].hot.tokens = 0;
@@ -406,6 +413,7 @@ fn maybe_top_up_cos_queue_lease_transparent_non_exact_with_nonzero_last_refill()
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0].hot.tokens = 0;
@@ -453,6 +461,7 @@ fn transparent_root_preserves_per_queue_exact_cap() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0].hot.tokens = 0;

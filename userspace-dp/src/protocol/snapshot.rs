@@ -89,6 +89,27 @@ pub(crate) struct InterfaceSnapshot {
     pub cos_ieee8021_classifier: String,
     #[serde(rename = "cos_dscp_rewrite_rule", default)]
     pub cos_dscp_rewrite_rule: String,
+    /// #1614 A1: operator-selectable oversubscription policy.
+    /// "" or "proportional" (default) → current scheduler unchanged
+    /// bit-for-bit. "guarantee-rate" → two-phase waterfill allocator
+    /// using `cos_oversubscription_guarantee_fraction`.
+    #[serde(rename = "cos_oversubscription_policy", default)]
+    pub cos_oversubscription_policy: String,
+    /// #1614 A1: Phase 1 budget fraction (0.0..1.0) when
+    /// `cos_oversubscription_policy == "guarantee-rate"`. Default 0
+    /// (which makes the new allocator a no-op even if mode is set;
+    /// belt-and-suspenders).
+    #[serde(rename = "cos_oversubscription_guarantee_fraction", default)]
+    pub cos_oversubscription_guarantee_fraction: f64,
+    /// #1614 A2: priority-low minimum share in bytes per second.
+    /// WIRE SURFACE ONLY in PR #1618 — the per-pass `cap_eff`
+    /// subtraction in the selector is deferred to a focused
+    /// follow-up issue. Default 0 (no min-share). The runtime
+    /// reads this field through `CoSInterfaceConfig` to plumb the
+    /// value into `CoSInterfaceRuntime`, but no hot-path code
+    /// consumes it yet.
+    #[serde(rename = "cos_priority_low_min_share_bytes", default)]
+    pub cos_priority_low_min_share_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

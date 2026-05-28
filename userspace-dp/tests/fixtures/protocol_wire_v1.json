@@ -384,6 +384,7 @@
   "cos_scheduler_snapshot": {
     "buffer_size_bytes": 0,
     "buffer_size_percent": 0.0,
+    "codel_target_ns": 0,
     "equal_flow_enforcement": false,
     "name": "",
     "priority": "",
@@ -565,6 +566,9 @@
     "cos_dscp_classifier": "",
     "cos_dscp_rewrite_rule": "",
     "cos_ieee8021_classifier": "",
+    "cos_oversubscription_guarantee_fraction": 0.0,
+    "cos_oversubscription_policy": "",
+    "cos_priority_low_min_share_bytes": 0,
     "cos_scheduler_map": "",
     "cos_shaping_burst_bytes": 0,
     "cos_shaping_rate_bytes_per_sec": 0,

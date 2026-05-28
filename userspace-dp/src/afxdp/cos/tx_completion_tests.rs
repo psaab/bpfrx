@@ -526,6 +526,7 @@ fn normalize_cos_queue_state_repairs_nonempty_unparked_queue_to_runnable() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         },
         hot: crate::afxdp::types::CoSQueueHotState {
             surplus_deficit: 0,

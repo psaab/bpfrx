@@ -43,6 +43,7 @@ fn cos_queue_rejects_prepared_once_local_items_enter_queue() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     // #774: use cos_queue_push_back so local_item_count
@@ -99,6 +100,7 @@ fn exact_local_fifo_boundary_survives_partial_commit() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -219,6 +221,7 @@ fn drain_exact_prepared_items_to_scratch_recycles_dropped_prepared_frame() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -294,6 +297,7 @@ fn exact_prepared_fifo_boundary_survives_partial_commit() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -421,6 +425,7 @@ fn cos_queue_push_and_pop_track_flow_bucket_bytes() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -562,6 +567,7 @@ fn mqfq_finish_time_u64_has_decades_of_headroom() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -681,6 +687,7 @@ fn queue_flow_fair_enabled_on_shared_exact() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     assert!(!runtime.queues[0].flow_fair());
@@ -748,6 +755,7 @@ fn queue_flow_fair_enabled_on_owner_local_exact() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let fast_path = vec![test_queue_fast_path_for_promotion(false)];
@@ -797,6 +805,7 @@ fn queue_flow_fair_disabled_on_non_exact() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
 
@@ -934,6 +943,7 @@ fn cos_exact_drain_throughput_micro_bench() {
             surplus_weight: 1,
             buffer_bytes: 4 * 1024 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.tokens = u64::MAX;
@@ -1121,6 +1131,7 @@ fn bench_pop_commit_settle_publish() {
             surplus_weight: 1,
             buffer_bytes: 4 * 1024 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.tokens = u64::MAX;

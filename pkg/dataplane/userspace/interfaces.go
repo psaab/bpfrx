@@ -252,6 +252,12 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				CoSDSCPClassifier:         coSUnitDSCPClassifier(cosUnit),
 				CoSIEEE8021Classifier:     coSUnitIEEE8021Classifier(cosUnit),
 				CoSDSCPRewriteRule:        coSUnitDSCPRewriteRule(cosUnit),
+				// #1614 A1/A2: per-interface oversubscription policy
+				// + priority-low min-share. All default-zero/empty
+				// preserves current scheduler bit-for-bit.
+				CoSOversubscriptionPolicy:            coSUnitOversubscriptionPolicy(cosUnit),
+				CoSOversubscriptionGuaranteeFraction: coSUnitOversubscriptionFraction(cosUnit),
+				CoSPriorityLowMinShareBytes:          coSUnitPriorityLowMinShare(cosUnit),
 			})
 		}
 	}
@@ -277,6 +283,30 @@ func coSUnitSchedulerMap(unit *config.CoSInterfaceUnit) string {
 		return ""
 	}
 	return unit.SchedulerMap
+}
+
+// #1614 A1: oversubscription-policy snapshot helpers. Empty string
+// maps to Proportional (default) on the Rust side.
+func coSUnitOversubscriptionPolicy(unit *config.CoSInterfaceUnit) string {
+	if unit == nil {
+		return ""
+	}
+	return unit.OversubscriptionPolicy
+}
+
+func coSUnitOversubscriptionFraction(unit *config.CoSInterfaceUnit) float64 {
+	if unit == nil {
+		return 0
+	}
+	return unit.OversubscriptionGuaranteeFraction
+}
+
+// #1614 A2: priority-low min-share snapshot helper.
+func coSUnitPriorityLowMinShare(unit *config.CoSInterfaceUnit) uint64 {
+	if unit == nil {
+		return 0
+	}
+	return unit.PriorityLowMinShareBytes
 }
 
 func coSUnitDSCPClassifier(unit *config.CoSInterfaceUnit) string {

@@ -32,6 +32,7 @@ fn flow_share_limit_shared_exact_scales_with_rate() {
             surplus_weight: 1,
             buffer_bytes: 0,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -79,6 +80,7 @@ fn flow_share_limit_shared_exact_caps_at_aggregate_for_single_flow() {
             surplus_weight: 1,
             buffer_bytes: 0,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -118,6 +120,7 @@ fn flow_share_limit_shared_exact_clamps_to_buffer_at_low_n() {
             surplus_weight: 1,
             buffer_bytes: 0,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -162,6 +165,7 @@ fn flow_share_limit_shared_exact_protects_against_dominant_flow() {
             surplus_weight: 1,
             buffer_bytes: 0,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -207,6 +211,7 @@ fn flow_share_limit_owner_local_exact_unchanged() {
             surplus_weight: 1,
             buffer_bytes: 125_000,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -984,6 +989,7 @@ fn cos_flow_aware_buffer_limit_scales_with_prospective_active_flow_count() {
             // use the same units as the live system.
             buffer_bytes: 125_000,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1046,6 +1052,7 @@ fn cos_flow_aware_buffer_limit_matches_share_limit_at_new_flow_boundary() {
             // use the same units as the live system.
             buffer_bytes: 125_000,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1130,6 +1137,7 @@ fn cos_flow_aware_buffer_limit_respects_non_flow_fair_queues() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1166,6 +1174,7 @@ fn cos_queue_flow_share_limit_never_drops_below_fast_retransmit_floor() {
             // use the same units as the live system.
             buffer_bytes: 125_000,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1223,6 +1232,7 @@ fn cos_flow_aware_buffer_limit_clamps_high_flow_count_to_max_delay() {
             // config, not KiB.
             buffer_bytes: 125_000,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1286,6 +1296,7 @@ fn cos_flow_aware_buffer_limit_honours_operator_base_above_delay_cap() {
             surplus_weight: 1,
             buffer_bytes: operator_base,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1337,6 +1348,7 @@ fn cos_flow_aware_buffer_limit_honours_q4_fixture_override_above_delay_cap() {
             surplus_weight: 1,
             buffer_bytes: operator_base,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1388,6 +1400,7 @@ fn cos_flow_aware_buffer_limit_preserves_non_flow_fair_path_after_clamp() {
             // would be 625 KB, not 10 MB.
             buffer_bytes: 10 * 1_000_000,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1424,6 +1437,7 @@ fn cos_flow_aware_buffer_limit_delay_cap_scales_linearly_with_rate() {
                 // Small operator base so the delay cap dominates.
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             }],
         );
         let queue = &mut root.queues[0];

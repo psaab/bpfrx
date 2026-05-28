@@ -1284,6 +1284,7 @@ fn flush_v_min_scratches_sums_and_zeros_per_queue_counters() {
                 surplus_weight: 1,
                 buffer_bytes: 64 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
             crate::afxdp::types::CoSQueueConfig {
                 queue_id: 1,
@@ -1297,8 +1298,12 @@ fn flush_v_min_scratches_sums_and_zeros_per_queue_counters() {
                 surplus_weight: 1,
                 buffer_bytes: 64 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
         ],
+    oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+    oversubscription_guarantee_fraction: 0.0,
+    priority_low_min_share_bytes: 0,
     };
     let mut runtime = build_cos_interface_runtime(&cfg, 0);
 
@@ -1364,7 +1369,11 @@ fn flush_v_min_scratches_no_op_when_all_zero() {
             surplus_weight: 1,
             buffer_bytes: 64 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
+        oversubscription_policy: crate::afxdp::types::CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
     };
     let runtime = build_cos_interface_runtime(&cfg, 0);
     // Pre-load atomics with non-zero values to verify the flush
@@ -1405,6 +1414,7 @@ fn active_flow_debug_test_queue_config(queue_id: u8) -> crate::afxdp::types::CoS
         surplus_weight: 1,
         buffer_bytes: 64 * 1024,
         dscp_rewrite: None,
+    codel_target_ns: 0,
     }
 }
 

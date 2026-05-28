@@ -137,6 +137,7 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 				BufferSizePercent:    sched.BufferSizePercent,
 				SurplusSharing:       sched.SurplusSharing,
 				EqualFlowEnforcement: sched.EqualFlowEnforcement,
+				CodelTargetNS:        sched.CodelTargetNS,
 			})
 		}
 	}

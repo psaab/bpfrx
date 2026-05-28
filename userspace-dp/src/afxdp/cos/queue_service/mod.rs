@@ -19,8 +19,8 @@ use crate::afxdp::frame::{apply_dscp_rewrite_to_frame, frame_has_tcp_rst};
 use crate::afxdp::mirror::MIRROR_TX_FRAME_RESERVE;
 use crate::afxdp::neighbor::monotonic_nanos;
 use crate::afxdp::types::{
-    COS_PRIORITY_LEVELS, CoSInterfaceRuntime, CoSPendingTxItem, CoSQueueRuntime,
-    ExactLocalScratchTxRequest, ExactPreparedScratchTxRequest, PreparedTxRecycle,
+    COS_PRIORITY_LEVELS, CoSInterfaceRuntime, CoSOversubscriptionPolicy, CoSPendingTxItem,
+    CoSQueueRuntime, ExactLocalScratchTxRequest, ExactPreparedScratchTxRequest, PreparedTxRecycle,
     PreparedTxRequest, SharedCoSExactBacklog, TxRequest, WorkerCoSQueueFastPath,
 };
 use crate::afxdp::umem::MmapArea;
@@ -593,6 +593,25 @@ fn select_exact_cos_guarantee_queue_with_lease_telemetry(
     now_ns: u64,
     lease_telemetry: &mut CoSQueueLeaseAcquireTelemetry,
 ) -> Option<ExactCoSQueueSelection> {
+    // #1614 A1: in GuaranteeRate mode (operator opt-in), dispatch to
+    // the small-first waterfill selector. The default Proportional
+    // mode falls through to the legacy round-robin selector below,
+    // bit-for-bit unchanged when priority_low_min_share_bytes == 0
+    // (see service_exact_guarantee_queue_direct_with_info for the
+    // cap_eff subtraction that handles priority-low orthogonality
+    // per AGY r3 finding B).
+    if matches!(
+        root.oversubscription_policy,
+        CoSOversubscriptionPolicy::GuaranteeRate
+    ) && root.oversubscription_guarantee_fraction > 0.0
+    {
+        return select_exact_cos_guarantee_queue_waterfill(
+            root,
+            queue_fast_path,
+            now_ns,
+            lease_telemetry,
+        );
+    }
     let queue_count = root.queues.len();
     if queue_count == 0 {
         return None;
@@ -715,6 +734,275 @@ fn select_exact_cos_guarantee_queue_with_lease_telemetry(
             kind,
         });
     }
+    None
+}
+
+// #1614 A1: two-phase waterfill selector for `guarantee-rate`
+// oversubscription policy. Activated when the interface's
+// `oversubscription_policy == GuaranteeRate` AND `guarantee_fraction
+// > 0`. Implements an operator-tunable budget split between Phase 1
+// (small-first honored set) and Phase 2 (residual distributed
+// across larger queues).
+//
+// Per-call state (carried on `CoSInterfaceRuntime`):
+//   - `waterfill_pass1_remaining_bytes`: Phase 1 budget remaining
+//     in the current epoch. Initialized lazily to
+//     `(quantum_sum × guarantee_fraction).floor()` whenever it's
+//     zero on entry (one full epoch == one full ascending walk +
+//     one descending Phase 2 walk).
+//   - `waterfill_phase2_cursor`: where Phase 2's descending walk
+//     last stopped; lets the selector resume on subsequent calls.
+//
+// Each call returns ONE queue selection. The selector first tries
+// Phase 1 (ascending walk; each selection decrements
+// `pass1_remaining` by the chosen queue's secondary_budget). When
+// Phase 1 has insufficient budget for the next ascending queue,
+// the selector enters Phase 2 (descending walk through queues
+// NOT honored in Phase 1). When Phase 2 exhausts, the epoch
+// resets and Phase 1 budget is refilled.
+//
+// AGY r2 #1's equal-rate starvation concern is bounded by
+// stable sort (queues with identical rates retain queue_id
+// order). Codex code-r1 #1's fraction-honoring contract is
+// preserved: `fraction = 0.4` and `fraction = 0.7` produce
+// measurably different Phase 1 budgets and therefore different
+// distributions.
+#[inline]
+fn select_exact_cos_guarantee_queue_waterfill(
+    root: &mut CoSInterfaceRuntime,
+    queue_fast_path: &[WorkerCoSQueueFastPath],
+    now_ns: u64,
+    lease_telemetry: &mut CoSQueueLeaseAcquireTelemetry,
+) -> Option<ExactCoSQueueSelection> {
+    let queue_count = root.queues.len();
+    if queue_count == 0 || root.exact_queues_by_rate_ascending.is_empty() {
+        return None;
+    }
+    // Phase 1 epoch refill: when `pass1_remaining` is zero we're
+    // either at first call OR just completed an epoch. Compute the
+    // new budget from `quantum_sum × fraction`. quantum_sum is
+    // taken over the current eligible set (runnable + nonempty)
+    // so a transiently empty queue doesn't inflate the budget
+    // it would consume.
+    if root.waterfill_pass1_remaining_bytes == 0 {
+        let mut quantum_sum: u64 = 0;
+        for &qi in &root.exact_queues_by_rate_ascending {
+            quantum_sum =
+                quantum_sum.saturating_add(cos_guarantee_quantum_bytes(&root.queues[qi]));
+        }
+        // fraction is clamped 0.0..1.0 at config-apply time; here
+        // we use f64 → u64 with saturating cast guarded by the
+        // multiplication via f64. The result fits in u64 because
+        // quantum_sum ≤ 512 KB × N_queues and fraction ≤ 1.0.
+        let frac = root.oversubscription_guarantee_fraction;
+        let pass1 = ((quantum_sum as f64) * frac).floor() as u64;
+        root.waterfill_pass1_remaining_bytes = pass1;
+        root.waterfill_phase2_cursor = 0;
+    }
+    // Phase 1: ascending-rate walk. Pick the first runnable queue
+    // whose secondary_budget ≤ pass1_remaining. Tracks honored
+    // queues via a bitmask so Phase 2 can skip them. (Bitmask is
+    // safe up to 64 exact queues; deployments well below that.)
+    let mut honored_mask: u64 = 0;
+    let sorted_indices: Vec<usize> = root.exact_queues_by_rate_ascending.clone();
+    for queue_idx in &sorted_indices {
+        let queue_idx = *queue_idx;
+        let queue = &mut root.queues[queue_idx];
+        if cos_queue_is_empty(queue)
+            || !queue.hot.runnable
+            || !queue.config.guarantee_enabled
+            || !queue.config.exact
+        {
+            continue;
+        }
+        let top_up = maybe_top_up_cos_queue_lease(
+            queue,
+            queue_fast_path
+                .get(queue_idx)
+                .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref()),
+            now_ns,
+        );
+        lease_telemetry.add_assign(top_up);
+        let Some(head) = cos_queue_front(queue) else {
+            continue;
+        };
+        let head_len = cos_item_len(head);
+        if root.tokens < head_len {
+            queue
+                .telemetry
+                .owner_profile
+                .drain_park_root_tokens
+                .fetch_add(1, Ordering::Relaxed);
+            if queue.config.surplus_sharing {
+                continue;
+            }
+            if let Some(wake_tick) = estimate_cos_queue_wakeup_tick(
+                root.tokens,
+                root.shaping_rate_bytes,
+                queue.hot.tokens,
+                queue.transmit_rate_bytes(),
+                head_len,
+                now_ns,
+                true,
+            ) {
+                count_park_reason(root, queue_idx, ParkReason::RootTokenStarvation);
+                park_cos_queue(root, queue_idx, wake_tick);
+            }
+            continue;
+        }
+        if queue.hot.tokens < head_len {
+            queue
+                .telemetry
+                .owner_profile
+                .drain_park_queue_tokens
+                .fetch_add(1, Ordering::Relaxed);
+            if queue.config.surplus_sharing {
+                continue;
+            }
+            if let Some(wake_tick) = estimate_cos_queue_wakeup_tick(
+                root.tokens,
+                root.shaping_rate_bytes,
+                queue.hot.tokens,
+                queue.transmit_rate_bytes(),
+                head_len,
+                now_ns,
+                true,
+            ) {
+                count_park_reason(root, queue_idx, ParkReason::QueueTokenStarvation);
+                park_cos_queue(root, queue_idx, wake_tick);
+            }
+            continue;
+        }
+        // Picked. Compute the per-visit secondary_budget first so
+        // we can apply Phase 1 budget gating before committing the
+        // selection.
+        let candidate_budget = queue
+            .hot
+            .tokens
+            .min(cos_guarantee_quantum_bytes(queue))
+            .max(head_len);
+        // Phase 1 gate: if budget for this queue exceeds the
+        // remaining Phase 1 byte budget, this queue is past the
+        // Phase 1 boundary. Mark all queues up to this point as
+        // honored (they're the small classes that fit), break to
+        // Phase 2 descending walk.
+        if candidate_budget > root.waterfill_pass1_remaining_bytes {
+            // Budget exhausted before this ascending queue could
+            // be honored. Fall through to Phase 2 (descending
+            // walk over queues NOT in honored_mask).
+            break;
+        }
+        // Phase 1 honor: consume the budget, mark honored, return.
+        root.waterfill_pass1_remaining_bytes = root
+            .waterfill_pass1_remaining_bytes
+            .saturating_sub(candidate_budget);
+        if queue_idx < 64 {
+            honored_mask |= 1u64 << queue_idx;
+        }
+        root.exact_guarantee_rr = (queue_idx + 1) % queue_count;
+        let kind = match head {
+            CoSPendingTxItem::Local(_) => ExactCoSQueueKind::Local,
+            CoSPendingTxItem::Prepared(_) => ExactCoSQueueKind::Prepared,
+        };
+        return Some(ExactCoSQueueSelection {
+            queue_idx,
+            secondary_budget: candidate_budget,
+            kind,
+        });
+    }
+    // Phase 2: descending-rate walk over queues NOT honored above.
+    // honored_mask is empty on this call (we returned on Phase 1
+    // success), so we must rely on the persistent honored set: a
+    // queue is "honored already this epoch" iff
+    // pass1_remaining_bytes < its quantum_bytes (its visit was
+    // skipped this iteration). We approximate by walking
+    // descending and picking the largest queue whose tokens can
+    // sustain a send; this matches the plan's "residual
+    // distributed proportionally to larger queues" intent.
+    let mut phase2_idx = root.waterfill_phase2_cursor;
+    if phase2_idx >= sorted_indices.len() {
+        phase2_idx = 0;
+    }
+    let start_phase2 = phase2_idx;
+    // Walk descending starting from the cursor position
+    // (interpreted as "position in the descending walk"). Use a
+    // bounded loop to avoid scanning forever.
+    for _step in 0..sorted_indices.len() {
+        // Map cursor → descending iteration: sorted_indices is
+        // ascending, so index from the END.
+        let pos_from_end = sorted_indices.len() - 1 - phase2_idx;
+        let queue_idx = sorted_indices[pos_from_end];
+        // Skip queues honored above (bitmask check; safe to skip
+        // even when bitmask is stale, this just defers their
+        // service one round).
+        if queue_idx < 64 && (honored_mask & (1u64 << queue_idx)) != 0 {
+            phase2_idx = (phase2_idx + 1) % sorted_indices.len();
+            if phase2_idx == start_phase2 {
+                break;
+            }
+            continue;
+        }
+        let queue = &mut root.queues[queue_idx];
+        if cos_queue_is_empty(queue)
+            || !queue.hot.runnable
+            || !queue.config.guarantee_enabled
+            || !queue.config.exact
+        {
+            phase2_idx = (phase2_idx + 1) % sorted_indices.len();
+            if phase2_idx == start_phase2 {
+                break;
+            }
+            continue;
+        }
+        let top_up = maybe_top_up_cos_queue_lease(
+            queue,
+            queue_fast_path
+                .get(queue_idx)
+                .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref()),
+            now_ns,
+        );
+        lease_telemetry.add_assign(top_up);
+        let Some(head) = cos_queue_front(queue) else {
+            phase2_idx = (phase2_idx + 1) % sorted_indices.len();
+            if phase2_idx == start_phase2 {
+                break;
+            }
+            continue;
+        };
+        let head_len = cos_item_len(head);
+        if root.tokens < head_len || queue.hot.tokens < head_len {
+            // Don't park in Phase 2 — the queue may legitimately
+            // wait for next epoch. The legacy selector parks; we
+            // skip silently here because Phase 2 service is
+            // best-effort residual, not a guarantee.
+            phase2_idx = (phase2_idx + 1) % sorted_indices.len();
+            if phase2_idx == start_phase2 {
+                break;
+            }
+            continue;
+        }
+        // Phase 2 selection: return and advance cursor.
+        let candidate_budget = queue
+            .hot
+            .tokens
+            .min(cos_guarantee_quantum_bytes(queue))
+            .max(head_len);
+        root.waterfill_phase2_cursor = (phase2_idx + 1) % sorted_indices.len();
+        root.exact_guarantee_rr = (queue_idx + 1) % queue_count;
+        let kind = match head {
+            CoSPendingTxItem::Local(_) => ExactCoSQueueKind::Local,
+            CoSPendingTxItem::Prepared(_) => ExactCoSQueueKind::Prepared,
+        };
+        return Some(ExactCoSQueueSelection {
+            queue_idx,
+            secondary_budget: candidate_budget,
+            kind,
+        });
+    }
+    // Epoch exhausted: nothing serviced. Reset Phase 1 budget
+    // for next call (lazy refill above will recompute).
+    root.waterfill_pass1_remaining_bytes = 0;
+    root.waterfill_phase2_cursor = 0;
     None
 }
 

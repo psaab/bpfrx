@@ -9,10 +9,12 @@ use super::COS_MIN_BURST_BYTES;
 use super::admission::apply_cos_queue_flow_fair_promotion;
 use super::tx_completion::cos_tick_for_ns;
 use crate::afxdp::types::{
-    COS_PRIORITY_LEVELS, CoSInterfaceConfig, CoSInterfaceRuntime, CoSQueueConfigState,
-    CoSQueueDropCounters, CoSQueueHotState, CoSQueueOwnerProfile, CoSQueueRuntime,
-    CoSQueueTelemetry, CoSTimerWheelRuntime, ForwardingState, VMinQueueState,
+    COS_PRIORITY_LEVELS, CoSInterfaceConfig, CoSInterfaceRuntime, CoSOversubscriptionPolicy,
+    CoSQueueConfigState, CoSQueueDropCounters, CoSQueueHotState, CoSQueueOwnerProfile,
+    CoSQueueRuntime, CoSQueueTelemetry, CoSTimerWheelRuntime, ForwardingState, VMinQueueState,
 };
+#[allow(unused_imports)]
+use CoSOversubscriptionPolicy as _;
 use crate::afxdp::worker::BindingWorker;
 
 #[inline]
@@ -70,6 +72,16 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(
         let priority = usize::from(queue.priority).min(COS_PRIORITY_LEVELS - 1);
         queue_indices_by_priority[priority].push(idx);
     }
+    // #1614 A1: pre-sort exact queues by ascending `transmit_rate_bytes`
+    // for the GuaranteeRate waterfill phase-1 greedy honor loop. Built
+    // once at config-apply time; runtime is read-only. Stable sort so
+    // queues with identical rates retain their original (queue_id)
+    // order, eliminating AGY r2 #1's equal-rate starvation concern.
+    let mut exact_queues_by_rate_ascending: Vec<usize> = (0..config.queues.len())
+        .filter(|&idx| config.queues[idx].exact && config.queues[idx].guarantee_enabled)
+        .collect();
+    exact_queues_by_rate_ascending
+        .sort_by_key(|&idx| config.queues[idx].transmit_rate_bytes);
     // #916: transparent root. When `shaping_rate_bytes == 0` the root
     // bucket is bypassed by `maybe_top_up_cos_root_lease`; pre-fill
     // tokens to the burst cap so the very first packet doesn't see
@@ -88,6 +100,14 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(
         default_queue: config.default_queue,
         nonempty_queues: 0,
         runnable_queues: 0,
+        oversubscription_policy: config.oversubscription_policy,
+        oversubscription_guarantee_fraction: config.oversubscription_guarantee_fraction,
+        priority_low_min_share_bytes: config.priority_low_min_share_bytes,
+        priority_low_reserved_tokens: 0,
+        priority_low_last_refill_ns: now_ns,
+        exact_queues_by_rate_ascending,
+        waterfill_pass1_remaining_bytes: 0,
+        waterfill_phase2_cursor: 0,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -114,6 +134,10 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(
                     surplus_weight: queue.surplus_weight,
                     buffer_bytes: queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
                     dscp_rewrite: queue.dscp_rewrite,
+                    // #1614 A3: copy CoDel target from intermediate
+                    // CoSQueueConfig (populated in forwarding_build
+                    // /cos.rs from CoSSchedulerSnapshot.codel_target_ns).
+                    codel_target_ns: queue.codel_target_ns,
                 },
                 hot: CoSQueueHotState {
                     surplus_deficit: 0,
