@@ -2,8 +2,10 @@
 
 **Branch**: `perf/1612-scale-target-measurement`
 **Worktree**: `/home/ps/git/bpfrx/.claude/worktrees/1612-scale-target-measurement`
-**Plan version**: v2 (2026-05-28) — addresses Codex plan-r1 PLAN-NEEDS-MAJOR
-findings 1-5 inline. v1 archived under git history of this branch.
+**Plan version**: v3 (2026-05-28) — addresses Codex plan-r2 PLAN-NEEDS-MAJOR
+findings 1-3 inline (env override mechanism, sample-phase monotonicity,
+alias detector strengthening). v1 + v2 archived in git history of this
+branch.
 
 **Parent plan**: `docs/pr/1607-hw-ceiling-microbench/plan.md` v2-r4 (4 review
 rounds, AGY + Claude SMR + Copilot READY; Codex deterministically infra-blocked
@@ -23,9 +25,26 @@ slice and the empirical measurement run.
 | MED: splitmix64 collisions on real loss-cluster zone set | v1 §1.1 + §3.4 | Two-prong fix: (a) seed `zone_pair_slot` with the worker's salt to spread collisions across workers per-publish epoch; (b) publish only slots whose `keys_xor` is **stable** across two consecutive publishes — aliased slots reveal themselves as a non-monotonic `keys_xor` toggle. The harness post-filters per parent §4.6 publication gate. | §1.1 + §3.4 |
 | MED: STAGED ship contract gap on Tables + #1609 unblock | v1 §3.6 + §6 | STAGED mode now emits an **explicit disclaimer header** in `docs/userspace-jit-design.md`: "Scale Target measurement deferred — counter wiring shipped; cluster measurement scheduled under follow-up <issue#>. #1609 v2 acceptance criterion REMAINS unmet." | §1.9 + §3.6 + §6 |
 
-Codex cleared: `telemetry.dbg.session_miss` increments in release builds at
+Codex cleared (r1): `telemetry.dbg.session_miss` increments in release builds at
 poll_descriptor/mod.rs:763 (release-stable). TSC gating (CPU flags +
 `current_clocksource == tsc`) is directionally correct.
+
+## v2 → v3 fatal-axis resolution map (Codex r2)
+
+| Codex r2 finding | v2 source | v3 fix | Section |
+|------------------|-----------|--------|---------|
+| HIGH 1: `XPF_COLD_PATH_SAMPLE_MASK` env-override won't propagate through `systemctl restart` (no `Environment=` in xpfd.service) | v2 §1.3 | Replace env-override with a daemon CLI flag `--cold-path-sample-mask <N>` parsed by `cmd/xpfd/main.go` and threaded into the userspace-dp control-socket bootstrap. Harness sets it via `systemctl edit --force --full xpfd.service` drop-in OR via `cli configure` config knob (preferred — survives daemon restarts). | §1.3 + §7 |
+| MED 2: `telemetry.counters.session_misses` is per-poll `BatchCounters` accumulator (reset at flush); 1-in-256 undersamples partial polls | v2 §1.3 | New worker-local monotonic counter `cold_path_sample_phase: u64` on `WorkerColdPathCounters` (already added in scaffolding). Hot-path bumps it on every session-miss path. Mask check reads it; flush DOES NOT reset it. | §1.3 |
+| HIGH 3: `keys_xor` fails to detect aliases with `count(K) odd + count(L) even` final-state equal to K | v2 §3.4 | Replace `keys_xor` with `first_key + alias_seen` pair per slot: store the first key seen in the slot, set `alias_seen = true` if any subsequent sample's key differs. Harness publication gate excludes slots with `alias_seen = true`. | §1.1 + §3.4 |
+
+Also resolved as NIT-only:
+- Sentinel string consistency: pin to `MEASUREMENT DEFERRED` (with
+  space, not hyphen) everywhere. §1.9 + §6 + acceptance prose.
+- Reader Acquire fence between Relaxed loads and s2 generation
+  re-check: already implemented in `cold_path_hist.rs::snapshot`
+  (matches `worker_runtime.rs:323` template).
+- Bucket clamp tests cover 2^32 boundary (already in scaffolding
+  tests).
 
 ## 1. Scope this step-3 PR ships
 
@@ -67,27 +86,44 @@ In tree at end of PR:
      | to_zone_id as u64) & 0xF`. Per parent §4.3.4 + AGY r3 axis 5
      bijection audit. Pin `0xF` mask via
      `assert!(POLICY_COLD_PATH_ZONE_PAIR_SLOTS == 16)`.
-   - **Collision-tolerance contract** (Codex r1 finding 4): the
-     `keys_xor` slot field is updated by XOR-ing in the packed
-     `(from_zone_id << 32 | to_zone_id) | 1` value on each sample.
-     Two distinct zone-pair keys hashing to the same slot will
-     toggle `keys_xor` non-monotonically across publishes. The
-     harness post-filter inspects `keys_xor` stability across two
-     consecutive cumulative deltas: if a slot's `keys_xor` XOR
-     between two consecutive samples is non-zero, the slot is
-     marked `alias_detected=true` and **excluded** from Tables
-     A1/A2 publication for that rule-count run. The slot's
-     samples are still recorded in the raw TSV with a `alias` flag.
-     This is a publication gate, not a runtime constraint —
-     hot-path operations remain branch-free.
+   - **Collision-detection contract** (Codex r1 finding 4 + Codex
+     r2 finding 3): each slot stores a `first_key: u64` (the packed
+     zone-pair key of the first sample to land in this slot during
+     this publish window) and an `alias_seen: bool` (set true if
+     any subsequent sample's packed key differs from `first_key`).
+     Hot-path update on sample:
+     ```rust
+     let key = zone_pair_packed_key(from_zone_id, to_zone_id);
+     let slot = zone_pair_slot(from_zone_id, to_zone_id);
+     if self.first_key[slot] == 0 {
+         self.first_key[slot] = key;
+     } else if self.first_key[slot] != key {
+         self.alias_seen[slot] = true;
+     }
+     ```
+     Cost: 1 branch + 2 array loads + 1 conditional store. Same
+     order as `record_sample`'s existing array updates.
+     Harness publication gate: exclude any slot where
+     `alias_seen[slot] == true` from Tables A1/A2 for the run.
+     Raw TSV retains all slot samples with the `alias_seen` flag
+     so re-analysis is possible. This is a publication gate, not
+     a runtime constraint.
 
-2. **`userspace-dp/src/afxdp/worker_cold_path.rs`** — new module providing:
+     The earlier `keys_xor` design (v1 + v2) is RETIRED — Codex r2
+     proved a false-pass mode where `count(K)` odd + `count(L)`
+     even leaves the final XOR equal to K, falsely passing the
+     publication gate.
+
+2. **`userspace-dp/src/afxdp/worker_cold_path.rs`** — new module providing
+   (v3: scaffolded as `userspace-dp/src/afxdp/cold_path_hist.rs` in this
+   branch; final layout absorbs the integration-side glue):
    - `WorkerColdPathCounters` — per-worker mutable state (touched only by
      the owning worker thread; flat `[[u64; 24]; 16]` for buckets,
      `[u64; 16]` for sum_ns, `[u64; 16]` for sample counts, `[u64; 16]`
-     for keys_xor, single `u64` for wrapper baseline). Sized
-     `16 × 24 × 8 + 3 × 16 × 8 = 3456 B` per worker. Hot path operations
-     are array index + add — zero allocations. Per parent §4.3.4.
+     for `first_key`, `[bool; 16]` for `alias_seen`, plus single `u64`
+     monotonic `sample_phase`). Hot path operations are array index +
+     add + conditional store — zero allocations. Per parent §4.3.4
+     amended for v3.
    - `WorkerColdPathAtomics` — publish-side per-worker struct living
      **alongside** `WorkerRuntimeAtomics` in `worker_runtime.rs` but
      with its own dedicated `window_gen: AtomicU64`. The cold-path
@@ -108,7 +144,8 @@ In tree at end of PR:
          }
          self.sum_ns[slot].store(local.sum_ns[slot], Ordering::Relaxed);
          self.samples[slot].store(local.samples[slot], Ordering::Relaxed);
-         self.keys_xor[slot].store(local.keys_xor[slot], Ordering::Relaxed);
+         self.first_key[slot].store(local.first_key[slot], Ordering::Relaxed);
+         self.alias_seen[slot].store(local.alias_seen[slot], Ordering::Relaxed);
      }
      // 3. Bump cold gen odd → even with Release.
      self.cold_window_gen.fetch_add(1, Ordering::Release);
@@ -127,7 +164,10 @@ In tree at end of PR:
        packed for sequential cacheline access).
      - `pub sum_ns: [AtomicU64; 16]`.
      - `pub samples: [AtomicU64; 16]`.
-     - `pub keys_xor: [AtomicU64; 16]`.
+     - `pub first_key: [AtomicU64; 16]` (per-slot first-observed
+       packed zone-pair key; 0 = no sample).
+     - `pub alias_seen: [AtomicBool; 16]` (per-slot alias-detected
+       flag; mirrored from local state each publish).
      - `pub ns_per_tsc_q32: AtomicU64` (set once at calibration;
        never updated; outside the per-tick seqlock).
      - `pub wrapper_ns_baseline: AtomicU64` (set once at calibration;
@@ -143,27 +183,36 @@ In tree at end of PR:
 
 3. **Cold-path sampling site in `poll_descriptor/mod.rs`** — exactly two
    single-line inserts. **Sample rate is regime-conditional per Codex
-   r1 finding 1**: the runtime carries a `cold_path_sample_mask: u64`
-   field on `WorkerColdPathCounters` set once at worker startup from
-   environment (`XPF_COLD_PATH_SAMPLE_MASK`; default 0xff = 1-in-256
-   for unbounded regime, set to 0 = 1-in-1 by the harness when
-   running `--cohort=bounded` per parent §4.2.0 / §4.3.3 sample-
-   budget table). The bounded-mode override is set by the harness
-   exporting `XPF_COLD_PATH_SAMPLE_MASK=0` before invoking
-   `systemctl restart xpfd` on the loss VM. Mask is read once at
-   worker startup; never re-read on the hot path.
+   r1 finding 1 + r2 finding 1+2**:
+   - The sample mask is delivered via a daemon CLI flag
+     `--cold-path-sample-mask <N>` parsed by `cmd/xpfd/main.go` and
+     threaded into the userspace-dp control-socket bootstrap.
+     Defaults to `0xff` (1-in-256). Harness sets it to `0` for
+     bounded-cohort runs via `cli configure` (preferred — survives
+     daemon restarts) OR via `systemctl edit --force --full
+     xpfd.service` drop-in. Worker reads the mask once at startup
+     from the control-socket handshake; never re-read on the hot
+     path.
+   - The sample-gate counter source is a NEW worker-local
+     monotonic `cold_path_sample_phase: u64` on
+     `WorkerColdPathCounters` (NOT `telemetry.counters.session_misses`,
+     which is per-poll `BatchCounters` and resets at flush — Codex
+     r2 finding 2). Hot-path bumps `cold_path_sample_phase` on every
+     session-miss path through the policy-eval site, independent
+     of any per-poll counter.
 
    - **Sample-gate entry**: at line 1374 (right before
      `evaluate_policy_result_with_len(...)`), insert:
      ```rust
-     let sample_tag = (telemetry.counters.session_misses
+     binding.cold_path.sample_phase = binding.cold_path
+         .sample_phase.wrapping_add(1);
+     let sample_tag = (binding.cold_path.sample_phase
          & worker_ctx.cold_path_sample_mask) == 0;
      let t_in = if sample_tag { sample_tsc() } else { 0 };
      ```
-     `telemetry.counters.session_misses` (NOT `telemetry.dbg.session_miss`)
-     is the release-build-stable counter at
-     `poll_descriptor/mod.rs:763` (Codex r1 cleared this). Mask 0xff
-     gives 1-in-256; mask 0 gives 1-in-1.
+     `cold_path_sample_phase` is owned by the worker thread; no
+     atomics on the hot path. Mask 0xff gives 1-in-256; mask 0
+     gives 1-in-1.
    - **Sample-record exit**: immediately after line 1385 (the
      `evaluate_policy_result_with_len` returns), record
      `t_out = sample_tsc()` only if `sample_tag`, compute
@@ -200,8 +249,10 @@ In tree at end of PR:
    pub cold_path_sum_ns: Vec<u64>,           // [16]
    #[serde(rename = "cold_path_samples", default, skip_serializing_if = "Vec::is_empty")]
    pub cold_path_samples: Vec<u64>,          // [16]
-   #[serde(rename = "cold_path_keys_xor", default, skip_serializing_if = "Vec::is_empty")]
-   pub cold_path_keys_xor: Vec<u64>,         // [16]
+   #[serde(rename = "cold_path_first_key", default, skip_serializing_if = "Vec::is_empty")]
+   pub cold_path_first_key: Vec<u64>,        // [16]
+   #[serde(rename = "cold_path_alias_seen", default, skip_serializing_if = "Vec::is_empty")]
+   pub cold_path_alias_seen: Vec<bool>,      // [16]
    #[serde(rename = "cold_path_ns_per_tsc_q32", default)]
    pub cold_path_ns_per_tsc_q32: u64,
    #[serde(rename = "cold_path_wrapper_ns_baseline", default)]
@@ -215,7 +266,8 @@ In tree at end of PR:
    ColdPathHist            [][]uint64 `json:"cold_path_hist,omitempty"`
    ColdPathSumNS           []uint64   `json:"cold_path_sum_ns,omitempty"`
    ColdPathSamples         []uint64   `json:"cold_path_samples,omitempty"`
-   ColdPathKeysXor         []uint64   `json:"cold_path_keys_xor,omitempty"`
+   ColdPathFirstKey        []uint64   `json:"cold_path_first_key,omitempty"`
+   ColdPathAliasSeen       []bool     `json:"cold_path_alias_seen,omitempty"`
    ColdPathNSPerTSCQ32     uint64     `json:"cold_path_ns_per_tsc_q32,omitempty"`
    ColdPathWrapperNSBaseline uint64   `json:"cold_path_wrapper_ns_baseline,omitempty"`
    ColdPathClockSource     string     `json:"cold_path_clock_source,omitempty"`
@@ -414,40 +466,37 @@ lan→wan` both map to slot 4; `untrust→wan ⊕ global` both map to
 slot 11. These collisions are **inherent** to the 16-slot pigeonhole
 when the active zone-pair set exceeds 16 entries.
 
-The v2 fix is a **collision detector + publication gate**:
+The v3 fix replaces v2's `keys_xor` (Codex r2 finding 3 proved
+false-pass) with a **`first_key + alias_seen` pair per slot**:
 
-1. `keys_xor[slot]` is updated by XOR-ing in the packed
-   `(from_zone_id << 32 | to_zone_id) | 1` (the `| 1` prevents the
-   `(0,0)` sentinel from collapsing to zero) on each sample.
-2. A slot holding samples from **only one zone-pair key** keeps
-   `keys_xor[slot] == packed_key` (because XOR-ing the same value
-   twice cancels; XOR-ing it N times leaves the value if N is odd
-   and 0 if N is even). Across two consecutive publish snapshots,
-   a single-key slot's `keys_xor` toggles between two values
-   (`packed_key` and 0) deterministically as samples land.
-3. A slot holding samples from **multiple distinct zone-pair keys**
-   shows `keys_xor` traffic that does NOT match either single-key
-   pattern.
+1. `first_key[slot]: u64` — packed zone-pair key of the first
+   sample to land in this slot during the publish window. Zero
+   means no sample yet.
+2. `alias_seen[slot]: bool` — set true if any subsequent sample's
+   key differs from `first_key`. Once true, stays true for the
+   window.
 
-The harness implements a strict variant of this check: after the
-measurement window completes, the harness compares the `keys_xor`
-value across the run's snapshots. Any slot whose final `keys_xor`
-contains bits set that do NOT match the **expected packed-key
-pattern for the rule-count's expected dominant zone-pair** is
-flagged as `alias_detected=true` and **excluded** from Tables
-A1/A2 publication. (The expected dominant zone-pair for the
-synthetic-policy-gen.py default is `trust→wan` for unbounded mode
-since the flooder targets `172.16.80.200` on `reth0.80` from the
-LAN-side `ge-0-0-1`.)
+Hot-path update (per sample, 1 branch + 2 array loads + 1
+conditional store):
 
-This is a publication gate on the harness side, not a runtime
-constraint. Hot-path samples continue to land in their hashed
-slot regardless of aliasing; only the publication step filters.
+```rust
+let key = zone_pair_packed_key(from_zone_id, to_zone_id);
+let slot = zone_pair_slot(from_zone_id, to_zone_id);
+if self.first_key[slot] == 0 {
+    self.first_key[slot] = key;
+} else if self.first_key[slot] != key {
+    self.alias_seen[slot] = true;
+}
+```
 
-The raw TSV retains all slot samples with the `alias_detected`
-flag, so the underlying data is not lost. If reviewers later
-disagree with the collision-detection method, the raw TSV can be
-re-analyzed with a different filter.
+Publication gate: any slot with `alias_seen[slot] == true` is
+**excluded** from Tables A1/A2 for the run. The raw TSV retains
+all slot samples with the alias flag so re-analysis is possible.
+
+The v1/v2 XOR-rolling design failed because XOR cancels: with
+`count(K)` odd and `count(L)` even, final XOR == K — false-pass.
+`first_key + alias_seen` is monotonic and provably cannot
+false-pass.
 
 ### 3.5 Wire-protocol both-sides drift
 

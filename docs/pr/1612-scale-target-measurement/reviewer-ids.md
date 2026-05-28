@@ -23,7 +23,16 @@ here so continuations can fetch by ID.
 
 | Reviewer | Task ID | Status | Verdict |
 |----------|---------|--------|---------|
-| Codex | bvdlo8m8x (codex exec bg job) | dispatched 2026-05-28 | pending |
-| AGY | (will dispatch after r1.5 result lands) | pending | pending |
-| Claude SMR | docs/pr/1612-scale-target-measurement/claude-smr-plan-r2.md | done | PLAN-READY |
+| Codex | bvdlo8m8x (codex exec bg job) | done | PLAN-NEEDS-MAJOR (3 new findings: HIGH env-override, MED sample-phase, HIGH keys_xor false-pass) |
+| AGY | (skipped — running r1.5 still) | n/a | n/a |
+| Claude SMR | docs/pr/1612-scale-target-measurement/claude-smr-plan-r2.md | done | PLAN-READY (retracted: r2 found new issues) |
+| Copilot | n/a (post-PR) | n/a | n/a |
+
+## Round 3 — plan v3 (Codex r2 NEEDS-MAJOR resolved)
+
+| Reviewer | Task ID | Status | Verdict |
+|----------|---------|--------|---------|
+| Codex | (to dispatch) | pending | pending |
+| AGY | (to dispatch) | pending | pending |
+| Claude SMR | docs/pr/1612-scale-target-measurement/claude-smr-plan-r3.md | done | PLAN-READY (STAGED-ship form) |
 | Copilot | n/a (post-PR) | n/a | n/a |

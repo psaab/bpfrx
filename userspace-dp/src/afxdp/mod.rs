@@ -110,6 +110,8 @@ mod tx;
 mod types;
 #[path = "umem/mod.rs"]
 mod umem;
+#[path = "cold_path_hist.rs"]
+mod cold_path_hist;
 // Clean-room WireGuard tunnel termination — see
 // docs/pr/wireguard-clean/plan.md. Engine + tests only in this PR;
 // hot-path activation lands in a follow-up.
