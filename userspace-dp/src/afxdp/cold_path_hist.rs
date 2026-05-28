@@ -190,6 +190,14 @@ pub(in crate::afxdp) fn sample_tsc_end() -> u64 {
 /// == tsc`. If ALL FOUR pass, `Tsc` is selected; otherwise
 /// `ClockGettime` fallback. The harness gates Scale Target table
 /// publication on every worker reporting `Tsc`.
+/// #1620 plan v4 (AGY r3 [MED-1]): `#[repr(u8)]` is load-bearing.
+/// Embedding a `#[repr(Rust)]` enum inside a `#[repr(C)]` struct
+/// (WorkerColdPathCounters) makes the offset of subsequent fields
+/// implementation-defined — the compiler may choose a 1, 2, or 4-byte
+/// representation. `#[repr(u8)]` pins this to 1 byte so the layout
+/// math in plan §4.1 (clock_source at offset 24, alias_seen at 25)
+/// holds under the C ABI rules the rest of the struct relies on.
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::afxdp) enum ClockSource {
     /// TSC unavailable, fall back to `clock_gettime(CLOCK_MONOTONIC_RAW)`.
@@ -396,29 +404,52 @@ pub(in crate::afxdp) fn calibrate_wrapper_baseline_ns(ns_per_tsc_q32: u64) -> u6
 /// payload, `fence(Acquire)`, Relaxed-load `cold_window_gen` (s2).
 /// If `s2 == s1` and even, the payload was observed within a single
 /// committed epoch.
-#[repr(align(64))]
+///
+/// #1620 plan v3 Amendment A: `#[repr(C, align(64))]` is load-bearing.
+/// `align(64)` was already in #1619 (cacheline isolation). The `C` is
+/// added in #1620 so the hot fields (`cold_window_gen`,
+/// `ns_per_tsc_q32`, `wrapper_ns_baseline`, `clock_source`) stay at
+/// the top of the struct under the compiler's hand. Default
+/// `#[repr(Rust)]` is free to reorder fields and would defeat the
+/// cacheline-0 hot-set design.
+#[repr(C, align(64))]
 pub(in crate::afxdp) struct WorkerColdPathAtomics {
-    pub(in crate::afxdp) buckets: [[AtomicU64; POLICY_COLD_PATH_HIST_BUCKETS];
-        POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    pub(in crate::afxdp) sum_ns: [AtomicU64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    pub(in crate::afxdp) samples: [AtomicU64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    /// v3: first packed zone-pair key seen in this slot during the
-    /// current publish window. Zero = no sample yet.
-    pub(in crate::afxdp) first_key: [AtomicU64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+    // === HOT FIELDS (cacheline 0; touched on every publish) ===
+    /// Per-tick seqlock generation. Separate from
+    /// `WorkerRuntimeAtomics.window_gen` per Codex r1 finding 2.
+    pub(in crate::afxdp) cold_window_gen: AtomicU64,
+    /// #1620 plan v4 (AGY r3 [HIGH-1]): per-worker monotonic
+    /// session-miss counter mirrored from
+    /// `WorkerColdPathCounters.sample_phase`. Without this published,
+    /// #1621/Prometheus + #1622/harness cannot compute the actual
+    /// sampling rate (samples / sample_phase) and cannot validate
+    /// that the configured `sample_mask` is being respected.
+    pub(in crate::afxdp) sample_phase: AtomicU64,
+    /// Calibration: set once at worker startup. Outside the per-tick seqlock.
+    pub(in crate::afxdp) ns_per_tsc_q32: AtomicU64,
+    /// Calibration: set once at worker startup. Outside the per-tick seqlock.
+    pub(in crate::afxdp) wrapper_ns_baseline: AtomicU64,
+    /// #1620 plan v4 (AGY r3 AXIS 6 diagnostic): monotonic count of
+    /// samples where `raw_ns < wrapper_ns_baseline`. Without this,
+    /// `saturating_sub` silently absorbs persistent underflow
+    /// (frequency scaling, OoO jitter, ultra-fast policy_eval),
+    /// falsely skewing the histogram toward bucket 0.
+    pub(in crate::afxdp) wrapper_underflow_count: AtomicU64,
+    /// Calibration: set once at worker startup. Outside the per-tick seqlock.
+    pub(in crate::afxdp) clock_source: AtomicU8,
+    // === COLD FIELDS (written by publish_from_local) ===
     /// v3: set true if any sample's packed key differs from
     /// `first_key`. Once set, stays set for the window. The harness
     /// publication gate excludes slots with `alias_seen = true`
     /// from Tables A1/A2 per plan §3.4 (Codex r2 finding 3).
     pub(in crate::afxdp) alias_seen: [AtomicBool; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    /// Calibration: set once at worker startup. Outside the per-tick seqlock.
-    pub(in crate::afxdp) ns_per_tsc_q32: AtomicU64,
-    /// Calibration: set once at worker startup. Outside the per-tick seqlock.
-    pub(in crate::afxdp) wrapper_ns_baseline: AtomicU64,
-    /// Calibration: set once at worker startup. Outside the per-tick seqlock.
-    pub(in crate::afxdp) clock_source: AtomicU8,
-    /// Per-tick seqlock generation. Separate from
-    /// `WorkerRuntimeAtomics.window_gen` per Codex r1 finding 2.
-    pub(in crate::afxdp) cold_window_gen: AtomicU64,
+    /// v3: first packed zone-pair key seen in this slot during the
+    /// current publish window. Zero = no sample yet.
+    pub(in crate::afxdp) first_key: [AtomicU64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+    pub(in crate::afxdp) sum_ns: [AtomicU64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+    pub(in crate::afxdp) samples: [AtomicU64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+    pub(in crate::afxdp) buckets: [[AtomicU64; POLICY_COLD_PATH_HIST_BUCKETS];
+        POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
 }
 
 impl Default for WorkerColdPathAtomics {
@@ -430,17 +461,19 @@ impl Default for WorkerColdPathAtomics {
 impl WorkerColdPathAtomics {
     pub(in crate::afxdp) fn new() -> Self {
         Self {
+            cold_window_gen: AtomicU64::new(0),
+            sample_phase: AtomicU64::new(0),
+            ns_per_tsc_q32: AtomicU64::new(0),
+            wrapper_ns_baseline: AtomicU64::new(0),
+            wrapper_underflow_count: AtomicU64::new(0),
+            clock_source: AtomicU8::new(ClockSource::Unset.as_u8()),
+            alias_seen: std::array::from_fn(|_| AtomicBool::new(false)),
+            first_key: std::array::from_fn(|_| AtomicU64::new(0)),
+            sum_ns: std::array::from_fn(|_| AtomicU64::new(0)),
+            samples: std::array::from_fn(|_| AtomicU64::new(0)),
             buckets: std::array::from_fn(|_| {
                 std::array::from_fn(|_| AtomicU64::new(0))
             }),
-            sum_ns: std::array::from_fn(|_| AtomicU64::new(0)),
-            samples: std::array::from_fn(|_| AtomicU64::new(0)),
-            first_key: std::array::from_fn(|_| AtomicU64::new(0)),
-            alias_seen: std::array::from_fn(|_| AtomicBool::new(false)),
-            ns_per_tsc_q32: AtomicU64::new(0),
-            wrapper_ns_baseline: AtomicU64::new(0),
-            clock_source: AtomicU8::new(ClockSource::Unset.as_u8()),
-            cold_window_gen: AtomicU64::new(0),
         }
     }
 
@@ -463,12 +496,21 @@ impl WorkerColdPathAtomics {
 
     /// Publish a full snapshot of the worker's local cold-path
     /// counters under the per-tick seqlock.
+    ///
+    /// #1620 plan v4 (AGY r3 [HIGH-1]): also publishes `sample_phase`
+    /// and `wrapper_underflow_count` so external telemetry can
+    /// compute the sampling rate (samples / sample_phase) and
+    /// observe baseline drift.
     pub(in crate::afxdp) fn publish_from_local(&self, local: &WorkerColdPathCounters) {
         // 1. Bump gen even → odd. AcqRel forbids subsequent Relaxed
         //    stores from being hoisted above this point.
         self.cold_window_gen.fetch_add(1, Ordering::AcqRel);
         // 2. Relaxed-store the payload (16 slots × 24 buckets = 384
-        //    bucket stores + 16 × 4 metadata = 64; total 448 stores).
+        //    bucket stores + 16 × 4 metadata = 64 + 2 monotonic = 450).
+        self.sample_phase
+            .store(local.sample_phase, Ordering::Relaxed);
+        self.wrapper_underflow_count
+            .store(local.wrapper_underflow_count, Ordering::Relaxed);
         for slot in 0..POLICY_COLD_PATH_ZONE_PAIR_SLOTS {
             for b in 0..POLICY_COLD_PATH_HIST_BUCKETS {
                 self.buckets[slot][b].store(local.buckets[slot][b], Ordering::Relaxed);
@@ -515,6 +557,13 @@ impl WorkerColdPathAtomics {
                 continue;
             }
             let mut out = WorkerColdPathCounters::default();
+            // #1620 plan v4 (AGY r3 [HIGH-1]): load sample_phase +
+            // wrapper_underflow_count so external telemetry can
+            // compute sampling rate and observe baseline drift.
+            out.sample_phase = self.sample_phase.load(Ordering::Relaxed);
+            out.wrapper_underflow_count = self
+                .wrapper_underflow_count
+                .load(Ordering::Relaxed);
             for slot in 0..POLICY_COLD_PATH_ZONE_PAIR_SLOTS {
                 for b in 0..POLICY_COLD_PATH_HIST_BUCKETS {
                     out.buckets[slot][b] = self.buckets[slot][b].load(Ordering::Relaxed);
@@ -547,42 +596,76 @@ impl WorkerColdPathAtomics {
 /// owning worker thread on the hot path. The owner writes
 /// non-atomically; the publisher (same thread) `store(Relaxed)` into
 /// `WorkerColdPathAtomics` under the cold_window_gen seqlock.
+///
+/// #1620 plan v3 Amendment A: `#[repr(C)]` is load-bearing. The hot
+/// fields (`sample_phase`, `ns_per_tsc_q32`, `wrapper_ns_baseline`,
+/// `clock_source`) are declared FIRST so the hot-path read pattern
+/// (`sample_phase` + mask, `ns_per_tsc_q32` + `wrapper_ns_baseline`
+/// in the q32-skip block) hits cacheline 0. Without `#[repr(C)]` the
+/// default `#[repr(Rust)]` is free to reorder fields to optimize
+/// packing, which would destroy the hot-cacheline isolation.
+///
+/// Verified layout (AGY r2 axis 2 + Claude SMR r3 cross-check):
+///   [0..7]     sample_phase
+///   [8..15]    ns_per_tsc_q32
+///   [16..23]   wrapper_ns_baseline
+///   [24]       clock_source (enum repr-default u8)
+///   [25..40]   alias_seen   [bool; 16] (alignment 1, no padding)
+///   [41..47]   PADDING                  (to align next u64 array)
+///   [48..175]  first_key    [u64; 16]
+///   [176..303] sum_ns       [u64; 16]
+///   [304..431] samples      [u64; 16]
+///   [432..3503] buckets     [[u64; 24]; 16]
+///
+/// First 48 bytes fit in cacheline 0 ([0..63]).
+#[repr(C)]
 #[derive(Clone, Debug)]
 pub(in crate::afxdp) struct WorkerColdPathCounters {
-    pub(in crate::afxdp) buckets:
-        [[u64; POLICY_COLD_PATH_HIST_BUCKETS]; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    pub(in crate::afxdp) sum_ns: [u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    pub(in crate::afxdp) samples: [u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    /// v3 alias detector: first packed zone-pair key per slot (0 = none).
-    pub(in crate::afxdp) first_key: [u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    /// v3 alias detector: monotonic per-slot flag set when a sample
-    /// arrives with a key different from `first_key`. Once true,
-    /// stays true for the publish window.
-    pub(in crate::afxdp) alias_seen: [bool; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+    // === HOT FIELDS (cacheline 0, read on every session-miss) ===
     /// v3 sample-phase counter: worker-local monotonic counter
     /// incremented on every session-miss path through the policy-
     /// eval site. NOT a per-poll BatchCounters accumulator. The
     /// sample gate is `phase & sample_mask == 0`.
     pub(in crate::afxdp) sample_phase: u64,
-    /// Mirror of `WorkerColdPathAtomics.ns_per_tsc_q32` after snapshot;
-    /// not used on the hot path.
+    /// Mirror of `WorkerColdPathAtomics.ns_per_tsc_q32`. Read on
+    /// every sampled packet inside the q32-skip block.
     pub(in crate::afxdp) ns_per_tsc_q32: u64,
+    /// Calibrated wrapper baseline (sample_tsc_start/end pair cost).
+    /// Subtracted from `raw_ns` per #1620 plan v3 Amendment B so the
+    /// recorded delta reflects only the policy_eval body cost.
     pub(in crate::afxdp) wrapper_ns_baseline: u64,
+    /// #1620 plan v4 (AGY r3 AXIS 6 diagnostic): monotonic count of
+    /// samples where `raw_ns < wrapper_ns_baseline`. Worker-local
+    /// mirror of `WorkerColdPathAtomics.wrapper_underflow_count`.
+    pub(in crate::afxdp) wrapper_underflow_count: u64,
+    /// Per-worker clock source set once at startup.
     pub(in crate::afxdp) clock_source: ClockSource,
+    // === COLD FIELDS (written only when sample fires) ===
+    /// v3 alias detector: monotonic per-slot flag set when a sample
+    /// arrives with a key different from `first_key`. Once true,
+    /// stays true for the publish window.
+    pub(in crate::afxdp) alias_seen: [bool; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+    /// v3 alias detector: first packed zone-pair key per slot (0 = none).
+    pub(in crate::afxdp) first_key: [u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+    pub(in crate::afxdp) sum_ns: [u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+    pub(in crate::afxdp) samples: [u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+    pub(in crate::afxdp) buckets:
+        [[u64; POLICY_COLD_PATH_HIST_BUCKETS]; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
 }
 
 impl Default for WorkerColdPathCounters {
     fn default() -> Self {
         Self {
-            buckets: [[0u64; POLICY_COLD_PATH_HIST_BUCKETS]; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-            sum_ns: [0u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-            samples: [0u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-            first_key: [0u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-            alias_seen: [false; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
             sample_phase: 0,
             ns_per_tsc_q32: 0,
             wrapper_ns_baseline: 0,
+            wrapper_underflow_count: 0,
             clock_source: ClockSource::Unset,
+            alias_seen: [false; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+            first_key: [0u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+            sum_ns: [0u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+            samples: [0u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+            buckets: [[0u64; POLICY_COLD_PATH_HIST_BUCKETS]; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
         }
     }
 }
@@ -619,6 +702,57 @@ impl WorkerColdPathCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #1620 plan v4: pin the cacheline-0 layout of
+    // WorkerColdPathCounters so a future field reorder is caught
+    // by the test suite, not by a regression in the cold-path-flooder
+    // microbench. v4 absorbs AGY r3 [HIGH-1] (sample_phase published)
+    // + AXIS-6 diagnostic (wrapper_underflow_count).
+    #[test]
+    fn worker_cold_path_counters_hot_fields_fit_in_cacheline_0() {
+        use std::mem::{offset_of, size_of};
+        // Hot fields declared first; ClockSource is #[repr(u8)] so
+        // its size is 1 byte and the offset math is deterministic.
+        assert_eq!(offset_of!(WorkerColdPathCounters, sample_phase), 0);
+        assert_eq!(offset_of!(WorkerColdPathCounters, ns_per_tsc_q32), 8);
+        assert_eq!(offset_of!(WorkerColdPathCounters, wrapper_ns_baseline), 16);
+        assert_eq!(offset_of!(WorkerColdPathCounters, wrapper_underflow_count), 24);
+        assert_eq!(offset_of!(WorkerColdPathCounters, clock_source), 32);
+        // alias_seen [bool; 16] alignment 1: lives at [33..48], no padding.
+        assert_eq!(offset_of!(WorkerColdPathCounters, alias_seen), 33);
+        // first_key [u64; 16] alignment 8: padding to align at 56.
+        assert_eq!(offset_of!(WorkerColdPathCounters, first_key), 56);
+        // All hot reads land in cacheline 0 ([0..63]).
+        assert!(size_of::<WorkerColdPathCounters>() >= 432);
+    }
+
+    #[test]
+    fn worker_cold_path_atomics_hot_fields_at_top() {
+        use std::mem::{align_of, offset_of};
+        // align(64) preserved from #1619.
+        assert_eq!(align_of::<WorkerColdPathAtomics>(), 64);
+        // Hot fields at top — cacheline 0.
+        assert_eq!(offset_of!(WorkerColdPathAtomics, cold_window_gen), 0);
+        assert_eq!(offset_of!(WorkerColdPathAtomics, sample_phase), 8);
+        assert_eq!(offset_of!(WorkerColdPathAtomics, ns_per_tsc_q32), 16);
+        assert_eq!(offset_of!(WorkerColdPathAtomics, wrapper_ns_baseline), 24);
+        assert_eq!(offset_of!(WorkerColdPathAtomics, wrapper_underflow_count), 32);
+        assert_eq!(offset_of!(WorkerColdPathAtomics, clock_source), 40);
+    }
+
+    /// #1620 plan v4 (AGY r3 [HIGH-1]): publish_from_local /
+    /// snapshot must round-trip sample_phase + wrapper_underflow_count.
+    #[test]
+    fn sample_phase_and_underflow_round_trip_through_publish_snapshot() {
+        let atomics = WorkerColdPathAtomics::new();
+        let mut local = WorkerColdPathCounters::default();
+        local.sample_phase = 12345;
+        local.wrapper_underflow_count = 7;
+        atomics.publish_from_local(&local);
+        let snap = atomics.snapshot().expect("snapshot must succeed");
+        assert_eq!(snap.sample_phase, 12345);
+        assert_eq!(snap.wrapper_underflow_count, 7);
+    }
 
     #[test]
     fn bucket_zero_covers_sub_1024_ns() {

@@ -1,9 +1,9 @@
 # #1620 step-3 follow-up B: BindingWorker integration for cold-path latency histogram
 
-**Status**: DRAFT v3 — round-2 PLAN-NEEDS-MINOR resolution (Codex r2 +
-AGY r2 both PLAN-NEEDS-MINOR; absorbs `#[repr(C)]` layout
-enforcement on the cold-path structs + wrapper_baseline subtraction
-in the post-eval block + CLI validator overflow guard)
+**Status**: DRAFT v4 — round-3 PLAN-NEEDS-MINOR resolution
+(AGY r3 + Codex r3 converge on three new amendments:
+[HIGH-1] sample_phase publish gap, [MED-1] ClockSource needs
+`#[repr(u8)]`, [MED-2] Go CLI loophole on `mask=0 && !enable1in1`)
 **Branch**: `refactor/1620-binding-worker-hist-integration`
 **Parent**: #1612 scaffolding (PR #1619, merged as 4ac85e2fd). Sibling
 follow-up: #1621 (wire protocol + Prometheus).
@@ -12,6 +12,29 @@ v3.2 §1.3, §1.4, §3.1 from `docs/pr/1612-scale-target-measurement/plan.md`.
 All design decisions on bucket layout, alias detection, seqlock split,
 TSC fence positioning, and sample-phase semantics inherit from that
 plan and the #1619 scaffolding already in tree.
+
+## v3 → v4 fatal-axis resolution map
+
+| Reviewer / finding | v3 source | v4 fix | Section |
+|--------------------|-----------|--------|---------|
+| AGY r3 [HIGH-1] + Codex r3: `sample_phase` defined on `WorkerColdPathCounters` but absent from `WorkerColdPathAtomics`, `publish_from_local`, `snapshot`. External telemetry sees session-miss denominator = 0; harness cannot validate sampling rate (`samples / sample_phase`); #1621/Prometheus exposes only sampled events. | v3 §4.1 atomics struct + publish/snapshot impls | v4 adds `sample_phase: AtomicU64` to `WorkerColdPathAtomics` (cacheline 0, between `cold_window_gen` and `ns_per_tsc_q32`). `publish_from_local()` and `snapshot()` round-trip the field. New `sample_phase_and_underflow_round_trip_through_publish_snapshot` test pins the contract. | §4.1 + §4.5 |
+| AGY r3 [MED-1] + Codex r3: `ClockSource` enum without `#[repr(u8)]` makes the offset of subsequent fields implementation-defined under `#[repr(C)]` on the containing struct. | v3 §4.1 (ClockSource has no repr) | v4 annotates `enum ClockSource` with `#[repr(u8)]`. Layout math in §4.1 now holds deterministically; the `clock_source` field consumes exactly 1 byte. | §4.1 (ClockSource definition) |
+| AGY r3 [MED-2] + Codex r3: Go CLI validator skips the safety guard when `coldPathSampleMask == 0 && !enable1in1`. An operator passing `--cold-path-sample-mask 0` without the 1-in-1 enable flag silently activates 1-in-1 sampling. | v3 §4.3 `if !enable1in1 && coldPathSampleMask != 0 { ... }` | v4 adds explicit reject FIRST: `if coldPathSampleMask == 0 && !enable1in1 { return fmt.Errorf(...) }`, before the pow-of-2-minus-1 validation. | §4.3 |
+| AGY r3 AXIS 6 diagnostic recommendation: silent `saturating_sub` on `raw_ns < wrapper_ns_baseline` masks persistent underflow (frequency scaling, OoO jitter). | v3 §4.4 used `saturating_sub` only | v4 adds `wrapper_underflow_count` field on both `WorkerColdPathCounters` and `WorkerColdPathAtomics` (cacheline 0). §4.4 hot-path branches: if `raw_ns < wrapper_ns_baseline`, increment `wrapper_underflow_count` and record `delta_ns = 0`; else `delta_ns = raw_ns - wrapper_ns_baseline`. | §4.1 + §4.4 |
+
+Codex r3 also flagged: the plan should pin the **sample_phase
+semantics invariant** to prevent confusion between configured
+sampling interval (`sample_mask`) and observed sampling denominator
+(`sample_phase`). Added to §4.4 invariant block.
+
+Round-3 attestation:
+- **Codex** task-mpplze6q-dheeud: PLAN-NEEDS-MINOR (verbatim
+  confirmation of all three AGY r3 findings + the sample_phase
+  semantics-invariant addendum).
+- **AGY** adversarial-review-mpplrk9n-p3pjm0: PLAN-NEEDS-MINOR
+  (3 new findings: HIGH-1 + MED-1 + MED-2 + AXIS-6 diagnostic).
+- **Claude SMR** claude-smr-plan-r3.md: PLAN-READY on v3 — missed
+  the sample_phase publish gap (HIGH-1). v4 absorbs.
 
 ## v2 → v3 fatal-axis resolution map
 
@@ -309,13 +332,25 @@ Validation in `main.go` after `flag.Parse()`:
 if enable1in1 {
     coldPathSampleMask = 0
 }
+// v4 (AGY r3 [MED-2] + Codex r3): Reject mask=0 unless explicit
+// --enable-cold-path-1-in-1-sampling. v3 only validated pow-of-2-1
+// when mask != 0, leaving a loophole: an operator who passes
+// `--cold-path-sample-mask 0` without --enable-1-in-1 would silently
+// enable 1-in-1 sampling (256× CPU cost) at startup.
+if coldPathSampleMask == 0 && !enable1in1 {
+    return fmt.Errorf(
+        "--cold-path-sample-mask=0 requires explicit " +
+        "--enable-cold-path-1-in-1-sampling (256× CPU cost — " +
+        "bounded-cohort microbench only)",
+    )
+}
 // Validate: must be all-ones-below-some-bit (i.e. mask + 1 must be a
 // power of two). Codex r2 caught: in Rust, `mask + 1` on u64::MAX
 // would panic in debug builds. Go's uint64 +1 wraps silently to 0,
 // and `0 & u64::MAX == 0`, so `u64::MAX` would FALSELY pass the
 // validator below. Explicitly reject u64::MAX and use Go's
 // well-defined unsigned overflow (mask + 1 == 0 when mask == u64::MAX):
-if !enable1in1 && coldPathSampleMask != 0 {
+if coldPathSampleMask != 0 {
     next := coldPathSampleMask + 1  // u64; wraps to 0 if MAX
     if next == 0 || (coldPathSampleMask & next) != 0 {
         return fmt.Errorf(
@@ -425,20 +460,41 @@ if sample_tag {
     if q32 != 0 {  // AGY+Codex+SMR F3: skip on TSC-unavailable
         let delta_tsc = t_out.saturating_sub(t_in);
         let raw_ns = ((delta_tsc as u128 * q32 as u128) >> 32) as u64;
-        // AGY r2 Amendment B: subtract calibrated wrapper baseline
-        // (the cost of the two RDTSCP/LFENCE fences themselves) so
-        // the recorded delta reflects ONLY the policy_eval body
-        // cost, not the measurement-instrument cost. `saturating_sub`
-        // prevents debug-build panic on the rare case where raw_ns
-        // is below baseline (e.g. CPU pipeline OoO finishing
-        // policy_eval before all the fence work retired).
-        let delta_ns = raw_ns.saturating_sub(
-            binding.cold_path.wrapper_ns_baseline,
-        );
+        // AGY r2 Amendment B + AGY r3 AXIS 6: subtract calibrated
+        // wrapper baseline (the cost of the two RDTSCP/LFENCE
+        // fences themselves) so the recorded delta reflects ONLY
+        // the policy_eval body cost. Count underflows explicitly so
+        // a persistent frequency-scaling / OoO-jitter regime is
+        // visible in telemetry rather than silently absorbed by
+        // `saturating_sub`.
+        let baseline = binding.cold_path.wrapper_ns_baseline;
+        let delta_ns = if raw_ns < baseline {
+            binding.cold_path.wrapper_underflow_count =
+                binding.cold_path.wrapper_underflow_count.saturating_add(1);
+            0
+        } else {
+            raw_ns - baseline
+        };
         binding.cold_path.record_sample(from_zone_id, to_zone_id, delta_ns);
     }
 }
 ```
+
+**Sample_phase semantics invariant** (Codex r3 addendum):
+- `sample_phase` is the worker-local monotonic count of **eligible
+  cold-path sampling attempts** — incremented on every session-miss
+  pass through the §4.4 pre-eval block.
+- Published every ~1 s via `WorkerColdPathAtomics::publish_from_local()`
+  and read back by `snapshot()`.
+- Consumed by Prometheus (#1621) and the microbench harness (#1622)
+  as the denominator in `actual_sampling_rate = sum(samples[]) /
+  sample_phase`. Without `sample_phase` published, callers cannot
+  distinguish "configured 1-in-256 working as intended" from
+  "configured 1-in-256, but actual hit rate is 1-in-2048 due to a
+  bug in the AND-mask check."
+- The `sample_mask` is the **configured** sampling interval.
+  `sample_phase` is the **observed** denominator. Operators and the
+  harness MUST compare the two.
 
 **Borrow shape contract** (Codex MED): the pre-eval block opens a
 `&mut binding.cold_path` borrow that lifetime-ends at the close of
