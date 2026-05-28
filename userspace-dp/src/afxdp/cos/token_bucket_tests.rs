@@ -29,27 +29,35 @@ fn shared_cos_root_lease_bounds_total_outstanding_credit() {
 
 #[test]
 fn shared_cos_queue_lease_bounds_total_outstanding_credit() {
+    // #1630: the outstanding-credit cap is now floored at one N-frame
+    // burst bank (COS_EXACT_QUEUE_LEASE_BANK_BYTES) so a low-`active_shards`
+    // queue can bank the full watermark. At 10 Mbps / 128 KB burst / 2
+    // shards the bank floor (32 KB at N=8) dominates the old
+    // `max_frame_lease_bytes × active_shards` term (4096×2 = 8 KB) but
+    // stays under `burst/4` (32 KB) and the credit pool (128 KB).
     let lease = SharedCoSQueueLease::new(10_000_000, 128 * 1024, 2);
     let request = 2500;
+    let cap = COS_EXACT_QUEUE_LEASE_BANK_BYTES;
 
-    let first = lease.acquire(1, request);
-    let second = lease.acquire(1, request);
-    let third = lease.acquire(1, request);
-    let fourth = lease.acquire(1, request);
-    let fifth = lease.acquire(1, 1);
+    let mut total = 0u64;
+    // Drain the lease in `request`-sized chunks; the lease must hand out
+    // exactly `cap` bytes of outstanding credit before refusing more.
+    loop {
+        let granted = lease.acquire(1, request);
+        if granted == 0 {
+            break;
+        }
+        total += granted;
+        assert!(total <= cap, "outstanding credit exceeded the cap");
+    }
+    assert_eq!(total, cap, "lease must hand out exactly the bank cap");
+    // Further acquires are refused while the credit is outstanding.
+    assert_eq!(lease.acquire(1, 1), 0);
 
-    assert_eq!(first, request);
-    assert_eq!(second, request);
-    assert_eq!(third, request);
-    assert_eq!(
-        first + second + third + fourth,
-        (tx_frame_capacity() as u64) * 2
-    );
-    assert_eq!(fifth, 0);
-
+    // Releasing frees headroom for a subsequent acquire.
     lease.release_unused(request);
-    let sixth = lease.acquire(1, request);
-    assert_eq!(sixth, request);
+    let after_release = lease.acquire(1, request);
+    assert_eq!(after_release, request);
 }
 
 #[test]

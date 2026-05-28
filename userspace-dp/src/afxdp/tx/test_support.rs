@@ -215,19 +215,25 @@ pub(in crate::afxdp) fn test_session_key(src_port: u16, dst_port: u16) -> Sessio
 
 pub(in crate::afxdp) fn test_mixed_class_root_with_primed_queues() -> CoSInterfaceRuntime {
     // Four queues on the same iface: two exact (queue_id 0, 2),
-    // two non-exact (queue_id 1, 3). Per-queue rate is set low
-    // enough that `cos_guarantee_quantum_bytes` clamps to the
-    // minimum (1500 bytes). That means the non-exact batch-build
-    // path (`select_nonexact_cos_guarantee_batch`) dequeues exactly
-    // one 1500-byte item per call, while the exact fast-path
+    // two non-exact (queue_id 1, 3). The non-exact batch-build path
+    // (`select_nonexact_cos_guarantee_batch`) dequeues up to the
+    // available per-queue token budget, while the exact fast-path
     // selector (`select_exact_cos_guarantee_queue_with_fast_path`)
     // only picks a queue and advances its cursor — it does not
-    // dequeue. Eight primed items per queue keeps backlog available
-    // across every rotation round below without any test having to
-    // push additional items.
+    // dequeue.
+    //
+    // #1630: the per-visit budget is now a FRAME-count cap, not the
+    // rate-scaled quantum, so a queue with abundant tokens would drain
+    // many frames per visit. The #689 split-cursor regression tests
+    // care only about ROTATION ORDER, so each queue's token bucket is
+    // primed to exactly one frame and the refill clock is frozen at the
+    // tests' `now_ns` (1) — that keeps the non-exact build dequeuing
+    // exactly one 1500-byte item per call without depending on the
+    // removed quantum clamp. Eight primed items per queue keeps backlog
+    // available across every rotation round below.
     //
     // Shared by the #689 split-cursor regression tests.
-    let slow_rate = 1_000_000 / 8; // 1 Mbps → quantum clamps to MIN
+    let slow_rate = 1_000_000 / 8; // 1 Mbps
     let mut root = test_cos_runtime_with_queues(
         10_000_000_000 / 8,
         vec![
@@ -291,7 +297,12 @@ pub(in crate::afxdp) fn test_mixed_class_root_with_primed_queues() -> CoSInterfa
     );
     root.tokens = 1024 * 1024;
     for queue in &mut root.queues {
-        queue.hot.tokens = 64 * 1024;
+        // One frame of tokens + a frozen refill clock (last_refill_ns ==
+        // the tests' now_ns of 1) so each non-exact visit drains exactly
+        // one 1500-byte item, isolating the cursor-rotation contract from
+        // the #1630 per-visit frame-count cap.
+        queue.hot.tokens = 1500;
+        queue.hot.last_refill_ns = 1;
         queue.hot.runnable = true;
         // Eight items per queue covers the longest rotation test below
         // without any queue draining to empty.

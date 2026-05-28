@@ -4225,3 +4225,26 @@ top.
     constructor), userspace-dp/src/policy_tests.rs (+~600 LOC:
     19 new tests + compile-time const _ size_of guards +
     v3_rule_full helper)
+
+- **Timestamp**: 2026-05-28
+  **Action**: #1630 Path A — CoS exact-queue lease watermark (P1) +
+    per-visit frame-cap (P2). Raised the exact-queue token-bucket
+    top-up watermark from `lease_bytes` to
+    `lease_bytes.max(COS_EXACT_QUEUE_LEASE_BANK_BYTES=N×MTU, N=8)` so a
+    low-rate class banks N frames across epochs; raised the queue
+    lease `max_total_leased` outstanding cap in lock-step (bank_floor,
+    root lease unchanged); converted the guarantee per-visit budget
+    from the rate-scaled quantum (`cos_guarantee_quantum_bytes`) to a
+    per-visit FRAME-count cap (`cos_guarantee_visit_cap_bytes` =
+    TX_BATCH_SIZE×frame) at the legacy/exact/non-exact + waterfill
+    Phase-1(send)/Phase-2 sites (waterfill Phase-1 budget unit stays
+    rate-scaled). Updated 3 cos tests + 1 test helper for the new
+    drain-depth/cap behavior.
+  **File(s)**: userspace-dp/src/afxdp/mod.rs (new
+    COS_EXACT_QUEUE_LEASE_BANK_{FRAMES,BYTES}),
+    userspace-dp/src/afxdp/cos/token_bucket.rs (P1 watermark),
+    userspace-dp/src/afxdp/types/shared_cos_lease/mod.rs
+    (compute_shared_cos_lease_config_with_bank + queue-lease callers),
+    userspace-dp/src/afxdp/cos/queue_service/mod.rs (P2 visit cap +
+    waterfill decouple), token_bucket_tests.rs,
+    queue_service/tests.rs, tx/test_support.rs (test updates)

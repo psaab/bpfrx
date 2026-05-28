@@ -315,6 +315,36 @@ const fn tx_frame_capacity() -> usize {
     UMEM_FRAME_SIZE as usize
 }
 
+/// #1630: exact-queue lease top-up watermark expressed in UMEM frames.
+///
+/// The per-queue token bucket for a hard-cap exact guarantee class was
+/// previously watermarked at `lease_bytes` (= `rate × 200 µs`, floored
+/// at one frame). For a low-rate class (e.g. 100 Mbps → ~2.5 KB target,
+/// floored to 4 KB) the bucket could bank only ~1-2 frames and lost the
+/// unspent per-epoch lease cap at every rotation, pinning the class at
+/// ~60-70 % of its configured rate independent of competition (the
+/// small-four-alone A/B measured 69/79/87/86 %). Banking N frames lets a
+/// small class accrue enough to send whole frames at its full average
+/// rate and ride out drain-visit cadence jitter.
+///
+/// The long-run RATE is unchanged: the v8 `acquire_v8` per-epoch grant is
+/// still `rate × elapsed` and `consume(sent_bytes)` debits actual bytes
+/// (token_bucket.rs / tx_completion.rs). The watermark only widens the
+/// burst/accumulation window — it never raises the refill rate, so the
+/// hard-cap (Gate 4) holds.
+///
+/// N is the empirically-swept burst-window size from #1630's Gate 1
+/// sweep. `COS_EXACT_QUEUE_LEASE_BANK_BYTES` is consumed by
+/// `maybe_top_up_cos_queue_lease` (the bucket watermark) AND by
+/// `compute_shared_cos_lease_config` (the `max_total_leased`
+/// outstanding-credit cap), which MUST rise in lock-step or the v8 lease
+/// refuses grants past the old cap and defeats the watermark in low
+/// `active_shards` configurations (at active_shards=6, 4096×6=24 KB <
+/// the 32 KB bank).
+const COS_EXACT_QUEUE_LEASE_BANK_FRAMES: u64 = 8;
+const COS_EXACT_QUEUE_LEASE_BANK_BYTES: u64 =
+    COS_EXACT_QUEUE_LEASE_BANK_FRAMES * UMEM_FRAME_SIZE as u64;
+
 #[path = "coordinator/mod.rs"]
 mod coordinator;
 #[cfg(test)]
