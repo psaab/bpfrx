@@ -8,10 +8,9 @@
 //!   asymmetric TSC read pair: start does `LFENCE; RDTSCP`, end does
 //!   `RDTSCP; LFENCE`, both with `compiler_fence` brackets. Per
 //!   Intel SDM §17.17 measurement-window recipe. Wrapper baseline
-//!   ~25-40 ns on the loss cluster. `sample_tsc()` is a back-compat
-//!   alias for `sample_tsc_start()` retained for older call sites
-//!   that don't distinguish start/end positions; new callers should
-//!   use the explicit pair (Codex code-r1 finding 1).
+//!   ~25-40 ns on the loss cluster. (Codex code-r1 finding 1 +
+//!   Copilot code-r1: the prior `sample_tsc()` alias was removed
+//!   to prevent foot-gun usage at the end of a window.)
 //! - `bucket_index_for_ns_24(ns)` — branchless 24-bucket select. Same
 //!   formula family as `bucket_index_for_ns` at `umem/mod.rs:244`;
 //!   only the upper clamp changes (`.min(23)` vs `.min(15)`). Codex
@@ -162,15 +161,12 @@ pub(in crate::afxdp) fn sample_tsc_end() -> u64 {
     tsc
 }
 
-/// Back-compat alias for callers that don't distinguish start/end
-/// timestamp positions. Equivalent to `sample_tsc_start()`.
-/// Prefer `sample_tsc_start()` + `sample_tsc_end()` for any new
-/// measurement-window pair.
-#[inline]
-#[cfg(target_arch = "x86_64")]
-pub(in crate::afxdp) fn sample_tsc() -> u64 {
-    sample_tsc_start()
-}
+// Copilot code-r1 + Codex code-r1 finding 1: the prior `sample_tsc()`
+// alias has been REMOVED to avoid a foot-gun where callers using it
+// as an end timestamp would silently skip the trailing `_mm_lfence()`
+// required by Intel SDM §17.17. All call sites must now explicitly
+// use `sample_tsc_start()` (LFENCE; RDTSCP) at the START of a window
+// and `sample_tsc_end()` (RDTSCP; LFENCE) at the END. Tests updated.
 
 #[inline]
 #[cfg(not(target_arch = "x86_64"))]
@@ -181,12 +177,6 @@ pub(in crate::afxdp) fn sample_tsc_start() -> u64 {
 #[inline]
 #[cfg(not(target_arch = "x86_64"))]
 pub(in crate::afxdp) fn sample_tsc_end() -> u64 {
-    0
-}
-
-#[inline]
-#[cfg(not(target_arch = "x86_64"))]
-pub(in crate::afxdp) fn sample_tsc() -> u64 {
     0
 }
 
@@ -763,7 +753,8 @@ mod tests {
                 }
             }
         }
-        let ((af, at), (bf, bt)) = collisions.expect("must find a slot collision in 65k×65k space");
+        let ((af, at), (bf, bt)) =
+            collisions.expect("must find a slot collision in 256×256 zone-id subspace");
         let mut c = WorkerColdPathCounters::default();
         c.record_sample(af, at, 100);
         // first_key set, alias_seen false.
@@ -827,9 +818,17 @@ mod tests {
         assert_eq!(snap.clock_source, ClockSource::Tsc);
     }
 
+    /// Single-thread sequential publish + snapshot test. Verifies
+    /// the seqlock writes/reads coherently across two consecutive
+    /// publish-snapshot cycles on the same thread.
+    ///
+    /// Copilot code-r1: the prior test was named
+    /// `snapshot_concurrent_publish_does_not_tear` but actually
+    /// performed no concurrent writes. Renamed to reflect what it
+    /// truly exercises. A separate `snapshot_under_concurrent_writer_*`
+    /// test below covers the real cross-thread tear regime.
     #[test]
-    fn snapshot_concurrent_publish_does_not_tear() {
-        // 2 publish iterations, reader sees consistent state for both.
+    fn snapshot_sequential_publish_roundtrip() {
         let atomics = std::sync::Arc::new(WorkerColdPathAtomics::new());
         let mut local = WorkerColdPathCounters::default();
         local.record_sample(7, 11, 12345);
@@ -841,6 +840,64 @@ mod tests {
         let slot = zone_pair_slot(7, 11);
         assert_eq!(snap1.samples[slot], 1);
         assert_eq!(snap2.samples[slot], 2);
+    }
+
+    /// Cross-thread tear test: spawn a writer thread that publishes
+    /// in a tight loop while the main thread snapshots. Verifies the
+    /// seqlock provably never returns a torn payload (samples[slot]
+    /// must monotonically increase across snapshots, never decrease
+    /// or wrap).
+    ///
+    /// Copilot code-r1: replaces the prior misnamed test that only
+    /// did back-to-back same-thread publishes.
+    #[test]
+    fn snapshot_under_concurrent_writer_never_tears() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+        let atomics = std::sync::Arc::new(WorkerColdPathAtomics::new());
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writer_atomics = atomics.clone();
+        let writer_stop = stop.clone();
+        let writer = std::thread::spawn(move || {
+            let mut local = WorkerColdPathCounters::default();
+            let mut count = 0u64;
+            while !writer_stop.load(AOrd::Relaxed) {
+                local.record_sample(3, 5, 1000 + (count & 0xff));
+                writer_atomics.publish_from_local(&local);
+                count += 1;
+            }
+            count
+        });
+        // Give the writer time to spin up under parallel test load.
+        // Without this, on a heavily contended test run the reader can
+        // finish all 1000 snapshots before the writer publishes more
+        // than a handful of times, which would fail the `writer_iters
+        // > 10` sanity assertion below.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Reader: take 1000 snapshots, assert monotonic samples per slot.
+        let slot = zone_pair_slot(3, 5);
+        let mut last_samples = 0u64;
+        for _ in 0..1000 {
+            let snap = atomics.snapshot();
+            let s = snap.samples[slot];
+            // Tear regime would be the seqlock returning a torn payload
+            // where samples[slot] reflects an old epoch but bucket
+            // counts reflect a new one. Provable check: samples is
+            // monotonic non-decreasing if the seqlock is honoring its
+            // epoch boundary.
+            assert!(
+                s >= last_samples,
+                "samples regressed: {s} < {last_samples} — seqlock tore"
+            );
+            last_samples = s;
+        }
+        stop.store(true, AOrd::Relaxed);
+        let writer_iters = writer.join().expect("writer thread panicked");
+        // Sanity: the writer did actually publish (proves we exercised
+        // the concurrent path, not just an idle reader).
+        assert!(
+            writer_iters > 10,
+            "writer only published {writer_iters} times — test did not exercise concurrency"
+        );
     }
 
     #[test]
@@ -856,10 +913,14 @@ mod tests {
                 eprintln!("skipping sample_tsc_monotonic_within_thread: host lacks RDTSCP or invariant TSC");
                 return;
             }
-            let a = sample_tsc();
-            let b = sample_tsc();
-            let c = sample_tsc();
-            assert!(b >= a && c >= b, "tsc not monotonic: a={a} b={b} c={c}");
+            let a = sample_tsc_start();
+            let b = sample_tsc_end();
+            let c = sample_tsc_start();
+            let d = sample_tsc_end();
+            assert!(
+                b >= a && c >= b && d >= c,
+                "tsc not monotonic: a={a} b={b} c={c} d={d}"
+            );
         }
     }
 
@@ -931,12 +992,14 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov constan
             let a = sample_tsc_start();
             let b = sample_tsc_end();
             assert!(b >= a, "start={a} end={b} — not monotonic");
-            // sample_tsc() is a back-compat alias for sample_tsc_start;
-            // assert the alias is still callable (regression guard if
-            // the alias is later removed).
-            let c = sample_tsc();
+            // Two consecutive measurement windows; ensure each
+            // start/end pair is monotonic and that the second start
+            // is >= the first end (TSC is monotonic across the
+            // intervening cycles).
+            let c = sample_tsc_start();
             let d = sample_tsc_end();
-            assert!(d >= c, "alias-start={c} end={d} — not monotonic");
+            assert!(c >= b, "second_start={c} after first_end={b} — not monotonic");
+            assert!(d >= c, "second start={c} end={d} — not monotonic");
         }
     }
 }

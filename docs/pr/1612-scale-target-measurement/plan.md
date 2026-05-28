@@ -2,10 +2,14 @@
 
 **Branch**: `perf/1612-scale-target-measurement`
 **Worktree**: `/home/ps/git/bpfrx/.claude/worktrees/1612-scale-target-measurement`
-**Plan version**: v3 (2026-05-28) — addresses Codex plan-r2 PLAN-NEEDS-MAJOR
-findings 1-3 inline (env override mechanism, sample-phase monotonicity,
-alias detector strengthening). v1 + v2 archived in git history of this
-branch.
+**Plan version**: v3.2 (2026-05-28) — v3 addressed Codex plan-r2
+PLAN-NEEDS-MAJOR findings (env override mechanism, sample-phase
+monotonicity, alias detector strengthening); v3.1/v3.2 fold Codex
+code-r1/r2 findings on the scaffolding (packed-key injectivity,
+TSC fence positioning, /proc/cpuinfo token vs substring grep) and
+AGY adversarial code-r1 findings (cross-worker false-negative
+contract, RDTSCP CPUID probe). v1/v2/v3 archived in git history
+of this branch.
 
 **Parent plan**: `docs/pr/1607-hw-ceiling-microbench/plan.md` v2-r4 (4 review
 rounds, AGY + Claude SMR + Copilot READY; Codex deterministically infra-blocked
