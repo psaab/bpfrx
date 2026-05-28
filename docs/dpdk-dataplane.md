@@ -20,10 +20,11 @@
   #1527). Only these retirement docs remain in-tree. Per #1525,
   builds with `-tags dpdk` are not supported.
 - Commit-time rejection of `set system dataplane-type dpdk` is
-  **live on master** (#1526) — `compileSystemDataplaneType` in
-  `pkg/config/compiler_system.go` rejects `dpdk` at commit, citing
-  #1525, while still parsing the token for legacy-config
-  compatibility. Operators should migrate with
+  **live on master** (#1526) — `validateDataplaneTypeStrict` in
+  `pkg/config/compiler.go` returns `ErrDPDKDataplaneRetired` at
+  commit (citing #1525), while `compileSystemDataplaneType` still
+  parses the `dpdk` token for legacy-config compatibility.
+  Operators should migrate with
   `set system dataplane-type userspace`, or simply omit
   `system dataplane-type` entirely (userspace is the default).
 - For the project-level retirement context, see

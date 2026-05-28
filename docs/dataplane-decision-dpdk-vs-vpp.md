@@ -19,9 +19,10 @@
   `dpdk_worker/` and `pkg/dataplane/dpdk/` has been **deleted from
   master** (mechanical removal #1528; boot decoupling #1527); only
   the retirement docs remain. Commit-time rejection of `set system
-  dataplane-type dpdk` is **live on master** (#1526) in
-  `pkg/config/compiler_system.go` (`compileSystemDataplaneType`),
-  which rejects `dpdk` at commit while still parsing the token for
+  dataplane-type dpdk` is **live on master** (#1526):
+  `validateDataplaneTypeStrict` in `pkg/config/compiler.go` returns
+  `ErrDPDKDataplaneRetired` at commit, while
+  `compileSystemDataplaneType` still parses the `dpdk` token for
   legacy-config compatibility. Per #1525, builds with `-tags dpdk`
   are not supported.
 - VPP was never implemented in xpf. There is no current plan to

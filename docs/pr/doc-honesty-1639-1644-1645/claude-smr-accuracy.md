@@ -51,19 +51,32 @@ not yet on master)."
 
 **After (both):** retirement complete — source deleted from master
 (#1528 mechanical removal, #1527 boot decoupling), only docs remain;
-commit-rejection live on master (#1526) in
-`pkg/config/compiler_system.go` (`compileSystemDataplaneType`).
+commit-rejection live on master (#1526) via `validateDataplaneTypeStrict`
+in `pkg/config/compiler.go` (returns `ErrDPDKDataplaneRetired`), while
+`compileSystemDataplaneType` still parses the `dpdk` token for
+legacy-config compatibility.
 
 **Source of truth:**
 - `git ls-tree -r --name-only origin/master | grep -i dpdk` returns
   only `docs/...` paths — no `dpdk_worker/` or `pkg/dataplane/dpdk/`
   source. Confirms deletion.
+- `git show origin/master:pkg/config/compiler.go` shows
+  `validateDataplaneTypeStrict` (called from `compileExpanded` at
+  `compiler.go:266`) returning `ErrDPDKDataplaneRetired` when
+  `cfg.System.DataplaneType == dataplaneTypeDPDK` (`compiler.go:372-383`).
+  This is the actual hard commit-time rejection.
 - `git show origin/master:pkg/config/compiler_system.go` shows
-  `compileSystemDataplaneType` returning an error for invalid
-  dataplane-type and the validity gate that rejects `dpdk` at commit,
-  citing #1525, "dpdk parses for legacy-config compatibility but is
-  rejected at commit per #1525." Confirms live rejection + token still
-  parsed.
+  `compileSystemDataplaneType` *accepting* `dpdk` as a known type and
+  only parsing the token ("dpdk parses for legacy-config compatibility
+  but is rejected at commit per #1525"); the rejection itself is in
+  `validateDataplaneTypeStrict`, not here.
+
+**Correction (Copilot review, r1):** the first draft cited
+`compileSystemDataplaneType` as the rejecting function. Copilot
+correctly flagged that this function only parses the token — the hard
+rejection returning `ErrDPDKDataplaneRetired` is
+`validateDataplaneTypeStrict` in `pkg/config/compiler.go`. Both DPDK
+docs and this note were corrected to point at the right function/file.
 - PR refs #1526/#1527/#1528 are the retirement-chain PRs named in the
   #1644 issue body and confirmed CLOSED COMPLETED there.
 
