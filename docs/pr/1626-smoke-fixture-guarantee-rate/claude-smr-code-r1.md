@@ -1,4 +1,4 @@
-# Claude SMR code review r1 — PR #1629
+# Claude SMR code review r1 — PR #1629 (closes #1626)
 
 Reviewer profile: domain SMR for Junos CoS config syntax, smoke
 harness design, measurement validity, bash discipline.

@@ -1,4 +1,4 @@
-# Codex code review r1 — PR #1629
+# Codex code review r1 — PR #1629 (closes #1626)
 
 ## Findings
 

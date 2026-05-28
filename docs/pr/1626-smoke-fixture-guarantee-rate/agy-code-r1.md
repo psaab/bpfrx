@@ -1,4 +1,4 @@
-# AGY code review r1 — PR #1629
+# AGY code review r1 — PR #1629 (closes #1626)
 
 Job: review-mppmmo99-vhww42
 
