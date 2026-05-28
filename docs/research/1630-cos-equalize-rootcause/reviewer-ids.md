@@ -12,6 +12,6 @@ continuations can fetch by id.
 ## Round 2 (v2 — measurement-corrected root cause)
 
 - Measurement evidence: `measurement-r1.txt` (park_root=0 all classes; small-four-alone A/B 69/79/87/86%)
-- Codex plan-review: TBD
-- AGY adversarial plan-review: TBD
+- Codex plan-review: codex exec session 019e7007-9c30-7952-8a6e-a6404af8fe25 (PLAN-NEEDS-MAJOR)
+- AGY adversarial plan-review: adversarial-review-mppvn7jw-khzbbp (PLAN-NEEDS-MAJOR)
 - Claude SMR plan-review: `claude-smr-plan-r2.md` (this agent)
