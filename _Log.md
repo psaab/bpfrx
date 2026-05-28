@@ -4178,3 +4178,9 @@ top.
 - **Timestamp**: 2026-05-27 (UTC)
   - **Action**: After v3.1 r2 3-of-3 PLAN-NEEDS-MAJOR convergence escalated to user (third major-iteration kill), executed Path B per claude-smr-plan-r7.md recommendation: narrow Step 1 to BookEntry parallel-prefix scaffolding only. Added `prefixes_v4: Arc<[PrefixV4]>` + `prefixes_v6: Arc<[PrefixV6]>` fields on `BookEntry` populated at parse-time from canonical input vectors (BEFORE PrefixSet collapse). No LPM, no PseudoBooks, no MatchAny side-channel, no feature flag — those all defer to v3.2 + follow-up issue once design is fully ratified. 4 new tests (v4 / v6 / empty / /0-preservation) verifying parallel-array agrees with PrefixSet. 5/5 flake clean. 1456 existing tests pass. Go build clean.
   - **File(s)**: userspace-dp/src/policy.rs (BookEntry extension + parse-time population), userspace-dp/src/policy_tests.rs (4 new tests appended)
+
+## 2026-05-27 — PR #1624 Copilot inline review (3 findings addressed)
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Copilot reviewed at HEAD 483a5db97 and posted 3 inline comments: (1) policy.rs:449 "cheap clone" misnomer — actual cost is O(n) per book; (2) plan.md:34 status implies broader Step 1 is in this PR; (3) plan.md:592 "Step 1 (this PR) scope" heading describes deferred features. Fixed (1) by replacing the comment with an honest description of the O(n) parse-time cost + reasoning. Fixed (2) by adding a SUPERSEDED / HISTORICAL marker at the top of plan.md noting this is the design contract for FUTURE Sub-PRs (#1623) not for PR #1624. Fixed (3) by renaming §4 heading + adding a NOTE callout. Wrote claude-smr-code-r1.md hostile review of narrow scope: CODE-READY. 5/5 tests still pass.
+  - **File(s)**: userspace-dp/src/policy.rs (comment fix), docs/pr/1609-multistage-policy-dag/plan.md (SUPERSEDED markers), docs/pr/1609-multistage-policy-dag/claude-smr-code-r1.md (new)

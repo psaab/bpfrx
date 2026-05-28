@@ -1,10 +1,32 @@
-# Plan v3.1: Multi-Book LPM policy DAG (#1609)
+# Plan v3.1: Multi-Book LPM policy DAG (#1609) — HISTORICAL / SUPERSEDED
 
-**Status**: v3.1 (in-place patch of v3) — addresses Codex r3 5
-majors + AGY r3 5 nits delivered against v3 SHA `85f01d6de`. Patch
-inline-edits §2.2 (PseudoBook builder splits iter_prefixes by
-purpose) + adds §13 v3.1 patches addendum capturing all other
-deltas. v3.1 supersedes v3 in place; the v3 design axis is unchanged.
+**Status**: v3.1 is the HISTORICAL planning record of the
+broader Multi-Book LPM design. It was the in-place patch of v3
+addressing Codex r3 5 majors + AGY r3 5 nits delivered against v3
+SHA `85f01d6de`.
+
+**v3.1 then went to round-2 hostile plan-review and returned
+3-of-3 PLAN-NEEDS-MAJOR** (Codex r2 `task-mpp2jzhy-m057in` +
+AGY r2 `adversarial-review-mpp2kcas-nksaq7` + Claude SMR r7 in
+`claude-smr-plan-r7.md`). 13 new/residual findings including a
+critical security gap (Stage 4 master-fallback DoS amplification).
+
+**This is NOT the design that shipped.** The narrow STAGED Step 1
+that actually shipped in PR #1624 is JUST the BookEntry parallel-
+prefix scaffolding from v3.1 §2.4 P5 — see commit `483a5db97`.
+Everything else in this document — the LPM primitive, the
+PseudoBook builder, the MatchAny side-channel, the two-phase
+Stage 4 hot path, the feature flag, the Junos knob — is
+deferred to follow-up issue #1623 and a future v3.2 plan round
+that must close the 13 v3.1 r2 findings.
+
+References below to "Step 1 (this PR)" in §4 / §5 / §7 / §8 / §10
+describe the v3.1 INTENDED Step 1 scope. The actual shipped Step 1
+PR #1624 is narrower; treat any "Step 1 (this PR)" reference in
+this document as the v3.1 design contract for the FUTURE PR that
+follow-up issue #1623 tracks, NOT for PR #1624.
+
+---
 
 v3 — starts from the v2 Multi-Book LPM architectural
 axis (which remains sound) + the 5 fixable fatals the v2 round-1
@@ -584,11 +606,18 @@ Construction cost at 1M rules + 10K books (estimated):
 Total: ~3-5 sec at 1M rules. Inside Junos commit budget; #1612
 measurement will give the actual.
 
-## 4. Step 1 (this PR) scope
+## 4. Step 1 v3.1 INTENDED scope (SUPERSEDED — see top-of-file note)
 
-**Implement only the LPM primitive + helpers + feature-flag scaffold
-+ tests.** Step 2 wires the full hot path. Step 3 adds the Junos
-knob.
+> **NOTE**: this section describes the v3.1 INTENDED Step 1 scope
+> that was reviewed under v3.1 r2 and returned PLAN-NEEDS-MAJOR.
+> The PR that actually shipped (#1624) is narrower — it ships ONLY
+> the BookEntry parallel-prefix scaffolding from §2.4 P5. Treat
+> this §4 as the design contract for the FUTURE Sub-PRs B-G that
+> follow-up issue #1623 tracks, NOT for PR #1624.
+
+**v3.1 intended Step 1 scope**: implement the LPM primitive +
+helpers + feature-flag scaffold + tests. Step 2 wires the full hot
+path. Step 3 adds the Junos knob.
 
 In scope:
 - `userspace-dp/src/policy/mod.rs` (refactor from policy.rs).

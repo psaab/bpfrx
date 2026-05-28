@@ -443,8 +443,17 @@ pub(crate) fn parse_policy_state_with_counters(
         // #1609 v3.1: capture the canonical prefix lists BEFORE
         // moving them into `from_v3_literals`. The Arc<[PrefixV4/V6]>
         // parallel fields carry the original prefix shape for the
-        // future Multi-Book LPM builder. Cheap clone: just bumps
-        // the Vec into a boxed slice + Arc header.
+        // future Multi-Book LPM builder.
+        //
+        // Cost: `v4.clone()` / `v6.clone()` allocate a fresh Vec and
+        // copy each `PrefixV4` / `PrefixV6` element — O(n) time and
+        // memory per book, where n is the prefix count. `Arc::from`
+        // on the boxed slice is then a single header allocation +
+        // refcount, not a per-element copy. Both clones run ONCE at
+        // config-apply, never on the hot path, so the O(n) cost is
+        // acceptable here. `Prefix*` types are small (network address
+        // + prefix length), so the copy is cheap in absolute terms
+        // for realistic book sizes (≤ ~1K prefixes per book).
         let prefixes_v4: Arc<[PrefixV4]> = Arc::from(v4.clone().into_boxed_slice());
         let prefixes_v6: Arc<[PrefixV6]> = Arc::from(v6.clone().into_boxed_slice());
         let entry = BookEntry {
