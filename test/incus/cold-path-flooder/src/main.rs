@@ -480,6 +480,8 @@ impl TxRing {
             s.init_static(dst_mac, src_mac, dst_ip);
         }
         // Construct the sockaddr_ll once; sendmmsg per-msg msg_name points at it.
+        // SAFETY: sockaddr_ll is a C-layout POD struct; zero-init is valid
+        // before we populate sll_family / sll_protocol / sll_ifindex below.
         let mut sll: libc::sockaddr_ll = unsafe { zeroed() };
         sll.sll_family = libc::AF_PACKET as u16;
         sll.sll_protocol = (libc::ETH_P_IP as u16).to_be();
@@ -511,6 +513,8 @@ impl TxRing {
         let sll_len = size_of::<libc::sockaddr_ll>() as u32;
         self.msgs.clear();
         for iov in &mut self.iovecs {
+            // SAFETY: msghdr is a C-layout POD struct; zero-init is valid
+            // before we populate msg_name / msg_iov below.
             let mut hdr: libc::msghdr = unsafe { zeroed() };
             hdr.msg_name = sll_ptr;
             hdr.msg_namelen = sll_len;
@@ -528,6 +532,8 @@ impl TxRing {
 /// Claude SMR r1 MINOR-3.
 fn resolve_ifindex(iface: &str) -> Result<i32, String> {
     let c = CString::new(iface).map_err(|_| "iface name has nul byte".to_string())?;
+    // SAFETY: if_nametoindex takes a NUL-terminated C string; CString
+    // guarantees that. Return value 0 sentinel handled below.
     let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
     if idx == 0 {
         let errno = std::io::Error::last_os_error();
@@ -541,6 +547,8 @@ fn resolve_ifindex(iface: &str) -> Result<i32, String> {
 
 /// Verify the interface is IFF_UP via SIOCGIFFLAGS. AGY r1 finding C.
 fn check_iface_up(fd: i32, iface: &str) -> Result<(), String> {
+    // SAFETY: ifreq is a C-layout POD union; zero-init is the documented
+    // pattern for SIOCGIFFLAGS calls (kernel writes ifr_ifru.ifru_flags).
     let mut ifr: libc::ifreq = unsafe { zeroed() };
     let name_bytes = iface.as_bytes();
     if name_bytes.len() >= libc::IFNAMSIZ {
@@ -560,7 +568,8 @@ fn check_iface_up(fd: i32, iface: &str) -> Result<(), String> {
             std::io::Error::last_os_error()
         ));
     }
-    // SAFETY: ifru_flags is the first union member used here.
+    // SAFETY: SIOCGIFFLAGS is documented to write ifr_ifru.ifru_flags
+    // (man 7 netdevice). We never read any other ifr_ifru variant.
     let flags = unsafe { ifr.ifr_ifru.ifru_flags };
     if (flags as u32 & libc::IFF_UP as u32) == 0 {
         return Err(format!(
@@ -573,6 +582,7 @@ fn check_iface_up(fd: i32, iface: &str) -> Result<(), String> {
 
 /// Read iface MAC via SIOCGIFHWADDR.
 fn read_iface_mac(fd: i32, iface: &str) -> Result<[u8; 6], String> {
+    // SAFETY: ifreq is a C-layout POD union; zero-init before SIOCGIFHWADDR.
     let mut ifr: libc::ifreq = unsafe { zeroed() };
     let name_bytes = iface.as_bytes();
     if name_bytes.len() >= libc::IFNAMSIZ {
@@ -660,6 +670,8 @@ fn open_socket(ifindex: i32, frame_bytes: usize, batch: usize) -> Result<i32, St
     }
 
     // Bind to ifindex.
+    // SAFETY: sockaddr_ll is a C-layout POD struct; zero-init before
+    // populating sll_family / sll_protocol / sll_ifindex below.
     let mut sll: libc::sockaddr_ll = unsafe { zeroed() };
     sll.sll_family = libc::AF_PACKET as u16;
     sll.sll_protocol = (libc::ETH_P_IP as u16).to_be();

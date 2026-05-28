@@ -14,3 +14,10 @@
 - Antigravity: `adversarial-review-mpovrmah-4b35sc` — PLAN-NEEDS-MINOR
   (5 concrete findings, all inlined into v4).
 - Claude SMR: `docs/pr/1611-flooder-runner-body/claude-smr-plan-r2.md` — PLAN-READY
+
+## Code review round 1 — PR #1616
+
+- Claude SMR: `docs/pr/1611-flooder-runner-body/claude-smr-code-r1.md` — MERGE-READY
+- Codex: `task-mpowh1wp-i2sbkd`
+- Antigravity: `adversarial-review-mpowhluh-exu58r`
+- Copilot: triggered via PR comment + add-reviewer
