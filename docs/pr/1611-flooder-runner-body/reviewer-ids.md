@@ -8,11 +8,9 @@
 
 ## Plan review round 2 — v4 (commit pending)
 
-- Codex: not re-dispatched (r1 PLAN-KILL was fully addressed in v4
-  via PACKET_QDISC_BYPASS + blocking smoke gate + CAP_NET_RAW
-  integration test; AGY r1 retry produced PLAN-NEEDS-MINOR which
-  superseded Codex's PLAN-KILL once Codex's 3 majors were
-  addressed). The plan has converged on a single design path.
+- Codex: `task-mpovx5xk-9qztza` — PLAN-READY (conditional;
+  Codex sandbox couldn't open worktree but verified v4 delta
+  summary closes all r1 findings).
 - Antigravity: `adversarial-review-mpovrmah-4b35sc` — PLAN-NEEDS-MINOR
   (5 concrete findings, all inlined into v4).
 - Claude SMR: `docs/pr/1611-flooder-runner-body/claude-smr-plan-r2.md` — PLAN-READY

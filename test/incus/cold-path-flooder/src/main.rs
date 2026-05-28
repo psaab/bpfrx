@@ -1,84 +1,93 @@
-// #1607 cold-path-flooder
+// #1607 / #1611 cold-path-flooder — runner body
 //
-// Generates UDP traffic with randomized source IPs, source ports, and
-// (optionally) destination ports.
+// Generates UDP traffic with randomized source IPs, source ports,
+// and (optionally) destination ports against the loss userspace
+// cluster firewall. AF_PACKET SOCK_RAW + sendmmsg(batch=32) with
+// PACKET_QDISC_BYPASS for sustained ≥2.5 Mpps single-core on
+// virtio-VM hosts (per #1611 plan v4 §4.5 + AGY r1 finding 2).
 //
 // Two regimes:
-//   * `--cohort=unbounded` (DEFAULT, per AGY r3 axis 1 resolution):
-//     sweeps a /16 source-IP range × full ephemeral source-port range
-//     = ~4.3 B unique 5-tuples. Session table fills in ~26 ms; the
-//     remaining ~99.9% of the run measures the pure policy-eval cold
-//     path (cache_miss → policy_eval → install_rejected_fast_return),
-//     with the cross-worker replicate path bypassed. This is the
-//     primary JIT-planning target.
-//   * `--cohort=bounded` (DIAGNOSTIC opt-in): fits the session table
-//     (DEFAULT_MAX_SESSIONS = 131_072). Every cold-path sample
-//     measures real session miss → policy eval → session install →
-//     cross-worker replicate. Burst-install profile distorts steady-
-//     state latency, hence not the default; useful for isolating the
-//     install + replicate cost.
+//   * `--cohort=unbounded` (DEFAULT, AGY r3 axis 1): sweeps /16
+//     src-IP × full 16-bit src-port = ~4.3 B unique 5-tuples.
+//     Session table fills in ~26 ms; remaining ~99.9% measures
+//     the pure policy-eval cold path
+//     (cache_miss → policy_eval → install_rejected_fast_return),
+//     cross-worker replicate bypassed.
+//   * `--cohort=bounded` (DIAGNOSTIC opt-in): fits the session
+//     table (DEFAULT_MAX_SESSIONS = 131_072). Every cold-path
+//     sample measures real session miss → install → replicate.
 //
-// True 64 B Ethernet frames on the wire (default): Ethernet 14 +
-// IPv4 20 + UDP 8 + UDP payload 22 = 64 B. (IPv6 path: 14 + 40 + 8
-// + 2 = 64 B.) AF_PACKET SOCK_RAW + sendmmsg batching.
+// True 64 B Ethernet frames: 14 (Eth) + 20 (IPv4) + 8 (UDP) +
+// 22 (payload) = 64.
 //
-// See plan v2-r4 §4.2 for the design rationale and the AGY r2/r3/r4
-// axis resolutions.
+// Per #1611 plan v4 the runner runs on `loss:cluster-userspace-host`
+// (LAN-side neighbour) and the AF_PACKET TX traffic arrives at the
+// firewall's AF_XDP RX socket via normal Ethernet — AF_PACKET TX
+// and AF_XDP RX live on independent kernel paths on the two ends.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-// libc primitives (sockaddr_ll, CString, c_int/c_void, ptr) plus
-// std::time::Instant are reserved for the step-2 (#1611) runner
-// body but unused in step-1. We import them now so step-2's commit
-// stays focused on the runner logic, and use #[allow(unused_imports)]
-// to silence the dead-code warning instead of leaving placeholder
-// statements in main() (cleaner per Copilot code-r3).
-#[allow(unused_imports)]
 use std::ffi::CString;
-use std::mem::zeroed;
+use std::mem::{size_of, zeroed};
 use std::net::Ipv4Addr;
-#[allow(unused_imports)]
-use std::os::raw::{c_int, c_void};
-#[allow(unused_imports)]
-use std::ptr;
-use std::time::Duration;
-#[allow(unused_imports)]
-use std::time::Instant;
+use std::os::raw::c_void;
+use std::time::{Duration, Instant};
 
 const MIN_ETH_FRAME: usize = 64;
 const DEFAULT_DURATION_SECS: u64 = 30;
 const DEFAULT_WARMUP_SECS: u64 = 2;
 const DEFAULT_BATCH: usize = 32;
-// Bounded-mode constants (used only when --cohort=bounded; see
-// plan v2 patched-r3 §4.2.0). Default mode is unbounded.
+// Bounded-mode constants — see step-1 #1613 commit msg + plan v2-r4 §4.2.0.
 const BOUNDED_SRC_IP_SPAN: u32 = 16_384; // 14 bits
 const BOUNDED_SRC_PORT_SPAN: u32 = 8; // 3 bits
 const BOUNDED_DST_PORT_SPAN: u32 = 1;
-// Unbounded mode defaults (sweeps a full /16 + full 16-bit source-port
-// space). Spans are u64 cardinalities (NOT u16 max-value), so 65_536
-// here means "all 2^16 distinct values [0, 65_536) before modulo".
-// The runner body's modulo arithmetic (deferred to step-2 #1611) will
-// use `xorshift_word % src_port_span as u64` etc., so an off-by-one
-// span like 65_535 would systematically exclude one value per axis.
-// 65_536 × 65_536 × 1 = 4_294_967_296 unique 5-tuples; the session
-// table caps at DEFAULT_MAX_SESSIONS, so the install_rejected fast-
-// return path dominates after ~26 ms.
+// Unbounded mode defaults — sweeps a full /16 + full 16-bit source-port
+// space. 65_536 × 65_536 × 1 = 4_294_967_296 unique 5-tuples.
 const DEFAULT_SRC_IP_SPAN: u32 = 65_536;
-const DEFAULT_SRC_PORT_SPAN: u32 = 65_536;
+// Reserved-port-0 avoidance: per #1611 plan §4 + AGY r3 step-2 minor 2,
+// userspace-dp/src/afxdp/frame/inspect.rs:207 short-circuits TCP/UDP
+// flows with src_port==0 onto a different code path, which would skew
+// the cold-path histogram. Default src-port base = 1024 (start of
+// ephemeral range). `--src-port-base 0` is permitted opt-in.
+const DEFAULT_SRC_PORT_BASE: u16 = 1024;
+// Default src-port span = 65_536 - DEFAULT_SRC_PORT_BASE = 64_512. This
+// is the largest span that, combined with the default base, keeps every
+// generated port in [1024, 65_536) — guaranteed > 0, no u16 wrap. When
+// the operator passes `--src-port-base 0` explicitly, they can also pass
+// `--src-port-span 65536` to get the full /16. The validator rejects
+// base + span > 65_536 either way.
+const DEFAULT_SRC_PORT_SPAN: u32 = 64_512;
 const DEFAULT_DST_PORT_SPAN: u32 = 1;
 const DEFAULT_DST_PORT_BASE: u16 = 5201;
 
-// Compile-time check: bounded cohort fits DEFAULT_MAX_SESSIONS.
+// Frame layout constants — plan v4 §4 frame assembly.
+const ETH_HDR: usize = 14;
+const IPV4_HDR: usize = 20;
+const UDP_HDR: usize = 8;
+const UDP_PAYLOAD: usize = 22; // "XPF-COLD-PATH-MIN64\n\0\0"
+const FRAME_V4_TOTAL: usize = ETH_HDR + IPV4_HDR + UDP_HDR + UDP_PAYLOAD;
+const IPV4_TOTAL_LEN: u16 = (IPV4_HDR + UDP_HDR + UDP_PAYLOAD) as u16; // 50
+const UDP_LEN: u16 = (UDP_HDR + UDP_PAYLOAD) as u16; // 30
+
+// Compile-time wire-byte invariants — plan v4 §4 + hidden-invariants §2.
+const _: () = assert!(FRAME_V4_TOTAL == 64);
+const _: () = assert!(IPV4_TOTAL_LEN == 50);
+const _: () = assert!(UDP_LEN == 30);
+// Bounded cohort exactly fits DEFAULT_MAX_SESSIONS.
 const _: () = assert!(
     BOUNDED_SRC_IP_SPAN as usize
         * BOUNDED_SRC_PORT_SPAN as usize
         * BOUNDED_DST_PORT_SPAN as usize
         == 131_072
 );
-// userspace-dp/src/session/mod.rs:25 DEFAULT_MAX_SESSIONS = 131_072
-// AGY r2 axis-1 resolution: bounded cohort EXACTLY fills the table.
-// AGY r3 axis 1: unbounded is the new default to avoid burst-install
-// contention distorting the latency histogram.
+
+// PACKET_QDISC_BYPASS constant — not exposed by every libc version,
+// so define locally. Value 20 from include/uapi/linux/if_packet.h.
+const PACKET_QDISC_BYPASS_OPT: libc::c_int = 20;
+
+// Magic payload to make the 22-byte UDP payload easy to spot in
+// pcap. Plan v4 §4 frame assembly.
+const PAYLOAD_MAGIC: [u8; UDP_PAYLOAD] = *b"XPF-COLD-PATH-MIN64\n\0\0";
 
 #[derive(Debug, Clone)]
 struct Args {
@@ -90,6 +99,7 @@ struct Args {
     dst_port_span: u32,
     src_ip_base: u32,
     src_ip_span: u32,
+    src_port_base: u16,
     src_port_span: u32,
     duration: Duration,
     warmup: Duration,
@@ -101,19 +111,16 @@ struct Args {
 
 impl Args {
     fn parse() -> Result<Self, String> {
-        // Default to UNBOUNDED regime (AGY r3 axis 1). When the user
-        // explicitly passes --cohort bounded, the parser narrows the
-        // spans down to the bounded constants (unless the user also
-        // overrides them explicitly).
         let mut args = Args {
             iface: "ge-0-0-1".to_string(),
-            dst_mac: [0xff; 6], // gateway resolved at start
+            dst_mac: [0xff; 6],
             src_mac: [0; 6],
             dst_ip: Ipv4Addr::new(172, 16, 80, 200),
             dst_port_base: DEFAULT_DST_PORT_BASE,
             dst_port_span: DEFAULT_DST_PORT_SPAN,
             src_ip_base: u32::from_be_bytes([10, 42, 0, 0]),
             src_ip_span: DEFAULT_SRC_IP_SPAN,
+            src_port_base: DEFAULT_SRC_PORT_BASE,
             src_port_span: DEFAULT_SRC_PORT_SPAN,
             duration: Duration::from_secs(DEFAULT_DURATION_SECS),
             warmup: Duration::from_secs(DEFAULT_WARMUP_SECS),
@@ -122,8 +129,7 @@ impl Args {
             seed: 0,
             cohort_unbounded: true,
         };
-        // Track which span knobs the user has explicitly set so that
-        // a later --cohort=bounded knows whether to override.
+        // Track explicit overrides so --cohort=bounded knows whether to narrow.
         let mut user_set_src_ip_span = false;
         let mut user_set_src_port_span = false;
         let mut user_set_dst_port_span = false;
@@ -161,6 +167,10 @@ impl Args {
                     user_set_src_ip_span = true;
                     i += 2;
                 }
+                "--src-port-base" => {
+                    args.src_port_base = next()?.parse().map_err(|e| format!("{e}"))?;
+                    i += 2;
+                }
                 "--src-port-span" => {
                     args.src_port_span = next()?.parse().map_err(|e| format!("{e}"))?;
                     user_set_src_port_span = true;
@@ -182,6 +192,16 @@ impl Args {
                         return Err(format!(
                             "frame-bytes {} < MIN_ETH_FRAME {}",
                             args.frame_bytes, MIN_ETH_FRAME
+                        ));
+                    }
+                    // For now the runner only emits 64-byte frames.
+                    // Larger frames would need payload padding; defer.
+                    if args.frame_bytes != MIN_ETH_FRAME {
+                        return Err(format!(
+                            "--frame-bytes {} not yet supported; \
+                             this runner emits exactly 64-byte frames \
+                             (follow-up issue tracks variable-size frames)",
+                            args.frame_bytes
                         ));
                     }
                     i += 2;
@@ -219,11 +239,7 @@ impl Args {
             }
         }
 
-        // Default is unbounded per AGY r3 axis 1; bounded requires
-        // opt-in and is capped at DEFAULT_MAX_SESSIONS. When the
-        // user passes --cohort bounded without explicit span knobs,
-        // we narrow the spans to the bounded constants so the cohort
-        // fits the session table exactly.
+        // Default is unbounded (AGY r3 axis 1). Narrow when --cohort=bounded.
         if !args.cohort_unbounded {
             if !user_set_src_ip_span {
                 args.src_ip_span = BOUNDED_SRC_IP_SPAN;
@@ -234,11 +250,7 @@ impl Args {
             if !user_set_dst_port_span {
                 args.dst_port_span = BOUNDED_DST_PORT_SPAN;
             }
-            // AGY code-r2 medium: u64 multiplication can overflow
-            // when all three spans are near u32::MAX. In release mode
-            // the overflow wraps silently to 0, which is <= 131_072 and
-            // bypasses the bounded cap. Cast to u128 — fits up to 2^96
-            // worth of factors comfortably.
+            // Cohort multiplier u128 to avoid u64 overflow at 3×u32::MAX.
             let cohort = args.src_ip_span as u128
                 * args.src_port_span as u128
                 * args.dst_port_span as u128;
@@ -252,34 +264,10 @@ impl Args {
             }
         }
 
-        // Copilot review r1: defensive validation against zero spans
-        // and zero batch. The runner body (step-2 #1611) will compute
-        // `xorshift_word % span` and `sendmmsg(batch)`, both of which
-        // crash or behave incorrectly when given 0.
-        if args.src_ip_span == 0 {
-            return Err("--src-ip-span must be >= 1".to_string());
-        }
-        if args.src_port_span == 0 {
-            return Err("--src-port-span must be >= 1".to_string());
-        }
-        if args.dst_port_span == 0 {
-            return Err("--dst-port-span must be >= 1".to_string());
-        }
-        if args.batch == 0 {
-            return Err("--batch must be >= 1".to_string());
-        }
-        if args.batch > 1024 {
-            return Err(format!(
-                "--batch {} > 1024; sendmmsg has practical limits — \
-                 keep batch <= 1024",
-                args.batch
-            ));
-        }
+        validate_args(&args)?;
 
         if args.seed == 0 {
-            // SAFETY: getpid/clock_gettime are always available
-            // on Linux. We only call them to seed the PRNG; their
-            // value affects no other state.
+            // SAFETY: getpid/clock_gettime are always available on Linux.
             let pid = unsafe { libc::getpid() } as u64;
             let mut ts: libc::timespec = unsafe { zeroed() };
             unsafe {
@@ -297,8 +285,50 @@ impl Args {
     }
 }
 
+/// Centralized arg-validation. Pulled out so unit tests can hit
+/// every branch without spoofing argv.
+fn validate_args(a: &Args) -> Result<(), String> {
+    if a.src_ip_span == 0 {
+        return Err("--src-ip-span must be >= 1".to_string());
+    }
+    if a.src_port_span == 0 {
+        return Err("--src-port-span must be >= 1".to_string());
+    }
+    if a.dst_port_span == 0 {
+        return Err("--dst-port-span must be >= 1".to_string());
+    }
+    if a.batch == 0 {
+        return Err("--batch must be >= 1".to_string());
+    }
+    if a.batch > 1024 {
+        return Err(format!(
+            "--batch {} > 1024 (UIO_MAXIOV); keep batch <= 1024",
+            a.batch
+        ));
+    }
+    // AGY r3 step-2 minor 1: dst_port_base + dst_port_span <= 65536.
+    if a.dst_port_base as u32 + a.dst_port_span > 65_536 {
+        return Err(format!(
+            "--dst-port-base {} + --dst-port-span {} > 65536; \
+             generated dst port would silently u16-wrap into reserved \
+             range. Narrow the span or lower the base.",
+            a.dst_port_base, a.dst_port_span
+        ));
+    }
+    // Same overflow guard for src ports.
+    if a.src_port_base as u32 + a.src_port_span > 65_536 {
+        return Err(format!(
+            "--src-port-base {} + --src-port-span {} > 65536; \
+             generated src port would silently u16-wrap. Narrow the \
+             span or lower the base.",
+            a.src_port_base, a.src_port_span
+        ));
+    }
+    Ok(())
+}
+
 fn help() -> &'static str {
-    "cold-path-flooder — #1607 cold-path measurement helper
+    "cold-path-flooder — #1607/#1611 cold-path measurement helper
 
 USAGE:
   cold-path-flooder [OPTIONS]
@@ -306,32 +336,20 @@ USAGE:
 OPTIONS:
   --iface NAME            (default ge-0-0-1)
   --dst-ip IP             (default 172.16.80.200)
-  --dst-mac MAC           (default broadcast; step-2 runner will ARP-resolve gateway unless --dst-mac is explicitly set)
-  --src-mac MAC           (default 0x000000000000; step-2 runner will auto-fill from iface unless --src-mac is explicitly set)
-  --dst-port-base N       (default 5201)
+  --dst-mac MAC           (required; no ARP-resolve in this runner)
+  --src-mac MAC           (default auto-resolved from iface via SIOCGIFHWADDR)
+  --dst-port-base N       (default 5201; iperf-a class)
   --dst-port-span N       (default 1)
   --src-ip-base IP        (default 10.42.0.0)
-  --src-ip-span N         (cardinality, default 65536 = full 2^16; bounded mode lowers to 16384 unless overridden)
-  --src-port-span N       (cardinality, default 65536 = full 2^16; bounded mode lowers to 8 unless overridden)
+  --src-ip-span N         (default 65536; bounded: 16384)
+  --src-port-base N       (default 1024; --src-port-base 0 opts into reserved-port-0 sweep)
+  --src-port-span N       (default 64512 = 65536-base; bounded: 8)
   --duration-secs N       (default 30)
   --warmup-secs N         (default 2)
-  --frame-bytes N         (default 64, min 64)
-  --batch N               (sendmmsg batch; default 32)
+  --frame-bytes N         (default 64; only 64 supported in this runner)
+  --batch N               (sendmmsg batch; default 32; min 1 max 1024)
   --seed N                (default: pid XOR clock)
-  --cohort bounded|unbounded   (default unbounded — sweeps 4.3 B unique 5-tuples)
-
-NOTES:
-  Default UNBOUNDED mode (per plan v2 patched-r3 §4.2.0 / AGY r3 axis 1)
-  sweeps a full /16 source-IP range × full ephemeral source-port range
-  per packet. The session table fills in ~26 ms; subsequent packets are
-  cache_miss → policy_eval → install_rejected_fast_return — the pure
-  policy-eval cold path with no install/replicate contamination.
-
-  Optional BOUNDED mode (--cohort=bounded) ships exactly
-  src_ip_span × src_port_span × dst_port_span = 131_072 unique
-  5-tuples to match DEFAULT_MAX_SESSIONS in
-  userspace-dp/src/session/mod.rs. Every cold-path sample then
-  measures session install + policy eval + replicate.
+  --cohort bounded|unbounded   (default unbounded)
 "
 }
 
@@ -348,17 +366,9 @@ fn parse_mac(s: &str) -> Result<[u8; 6], String> {
 }
 
 /// 64-bit xorshift PRNG. Maximum-period (2^64 - 1).
-///
-/// The struct + method are kept on release builds (not gated to
-/// `#[cfg(test)]`) because the step-2 (#1611) runner body will
-/// consume both directly. Step-1 only exercises this primitive
-/// from unit tests; the `#[allow(dead_code)]` here silences the
-/// release-build warning until the runner ships.
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct Xorshift64(u64);
 
-#[allow(dead_code)]
 impl Xorshift64 {
     #[inline(always)]
     fn next(&mut self) -> u64 {
@@ -371,8 +381,491 @@ impl Xorshift64 {
     }
 }
 
+/// One transmit slot — a 64-byte frame + the iovec/msghdr that points at it.
+/// `#[repr(align(64))]` per AGY r1 finding D — cache-line aligned for the
+/// kernel copy path on the sendmmsg fast path.
+#[repr(align(64))]
+struct TxSlot {
+    frame: [u8; FRAME_V4_TOTAL],
+}
+
+impl TxSlot {
+    fn new() -> Self {
+        TxSlot {
+            frame: [0u8; FRAME_V4_TOTAL],
+        }
+    }
+
+    /// Initialise the static parts of the frame (dst MAC, src MAC, ethertype,
+    /// IPv4 fixed fields, UDP payload). Variable fields (src IP, src/dst port,
+    /// IPv4 csum, IPv4 ID) are mutated per packet.
+    fn init_static(&mut self, dst_mac: &[u8; 6], src_mac: &[u8; 6], dst_ip: Ipv4Addr) {
+        // Eth header
+        self.frame[0..6].copy_from_slice(dst_mac);
+        self.frame[6..12].copy_from_slice(src_mac);
+        self.frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes()); // IPv4
+
+        // IPv4 header (will fill mutable fields per-packet)
+        self.frame[14] = 0x45; // v=4, ihl=5
+        self.frame[15] = 0x00; // tos
+        self.frame[16..18].copy_from_slice(&IPV4_TOTAL_LEN.to_be_bytes()); // total_len = 50
+        self.frame[18..20].copy_from_slice(&0u16.to_be_bytes()); // id (mutated)
+        self.frame[20..22].copy_from_slice(&0x4000u16.to_be_bytes()); // flags=DF, frag_off=0
+        self.frame[22] = 64; // ttl
+        self.frame[23] = 17; // proto = UDP
+        self.frame[24..26].copy_from_slice(&0u16.to_be_bytes()); // csum (mutated)
+        self.frame[26..30].copy_from_slice(&[0; 4]); // src ip (mutated)
+        self.frame[30..34].copy_from_slice(&u32::from(dst_ip).to_be_bytes());
+
+        // UDP header
+        self.frame[34..36].copy_from_slice(&0u16.to_be_bytes()); // src port (mutated)
+        self.frame[36..38].copy_from_slice(&0u16.to_be_bytes()); // dst port (mutated)
+        self.frame[38..40].copy_from_slice(&UDP_LEN.to_be_bytes()); // len = 30
+        self.frame[40..42].copy_from_slice(&0u16.to_be_bytes()); // csum = 0 per RFC 768
+
+        // UDP payload — fixed magic.
+        self.frame[42..64].copy_from_slice(&PAYLOAD_MAGIC);
+    }
+
+    /// Mutate per-packet fields: src IP, IPv4 ID, src port, dst port.
+    /// Recompute the IPv4 header checksum.
+    #[inline(always)]
+    fn fill_packet(
+        &mut self,
+        src_ip: u32,
+        ip_id: u16,
+        src_port: u16,
+        dst_port: u16,
+    ) {
+        // IPv4 ID
+        self.frame[18..20].copy_from_slice(&ip_id.to_be_bytes());
+        // IPv4 csum field zero before computing
+        self.frame[24..26].copy_from_slice(&0u16.to_be_bytes());
+        // IPv4 src
+        self.frame[26..30].copy_from_slice(&src_ip.to_be_bytes());
+        // UDP src/dst port
+        self.frame[34..36].copy_from_slice(&src_port.to_be_bytes());
+        self.frame[36..38].copy_from_slice(&dst_port.to_be_bytes());
+
+        // IPv4 header checksum (one's-complement, RFC 1071).
+        let mut sum: u32 = 0;
+        let hdr = &self.frame[14..34]; // 20 bytes
+        for chunk in hdr.chunks_exact(2) {
+            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        let csum = (!sum as u16).to_be_bytes();
+        self.frame[24..26].copy_from_slice(&csum);
+    }
+}
+
+/// Per-iteration runner state. `slots` and `iovecs` are stable-address heap
+/// allocations sized once at startup; `msgs` references the iovecs by raw
+/// pointer. Lifetime: all three live for the entire run; nothing is freed
+/// or resized in the hot loop.
+struct TxRing {
+    slots: Vec<TxSlot>,
+    iovecs: Vec<libc::iovec>,
+    msgs: Vec<libc::mmsghdr>,
+    dst_sll: libc::sockaddr_ll,
+}
+
+impl TxRing {
+    fn new(batch: usize, dst_mac: &[u8; 6], src_mac: &[u8; 6], dst_ip: Ipv4Addr,
+           ifindex: i32) -> Self {
+        let mut slots: Vec<TxSlot> = (0..batch).map(|_| TxSlot::new()).collect();
+        for s in &mut slots {
+            s.init_static(dst_mac, src_mac, dst_ip);
+        }
+        // Construct the sockaddr_ll once; sendmmsg per-msg msg_name points at it.
+        let mut sll: libc::sockaddr_ll = unsafe { zeroed() };
+        sll.sll_family = libc::AF_PACKET as u16;
+        sll.sll_protocol = (libc::ETH_P_IP as u16).to_be();
+        sll.sll_ifindex = ifindex;
+        sll.sll_halen = 6;
+        sll.sll_addr[..6].copy_from_slice(dst_mac);
+
+        // Construct iovecs pointing at each frame.
+        let iovecs: Vec<libc::iovec> = slots
+            .iter_mut()
+            .map(|s| libc::iovec {
+                iov_base: s.frame.as_mut_ptr() as *mut c_void,
+                iov_len: FRAME_V4_TOTAL,
+            })
+            .collect();
+
+        TxRing {
+            slots,
+            iovecs,
+            msgs: Vec::with_capacity(batch),
+            dst_sll: sll,
+        }
+    }
+
+    /// Wire the mmsghdr array. Called once after `new()` so the
+    /// iovec / sockaddr pointers stay stable for the entire run.
+    fn wire_msgs(&mut self) {
+        let sll_ptr = (&self.dst_sll) as *const _ as *mut c_void;
+        let sll_len = size_of::<libc::sockaddr_ll>() as u32;
+        self.msgs.clear();
+        for iov in &mut self.iovecs {
+            let mut hdr: libc::msghdr = unsafe { zeroed() };
+            hdr.msg_name = sll_ptr;
+            hdr.msg_namelen = sll_len;
+            hdr.msg_iov = iov as *mut libc::iovec;
+            hdr.msg_iovlen = 1;
+            self.msgs.push(libc::mmsghdr {
+                msg_hdr: hdr,
+                msg_len: 0,
+            });
+        }
+    }
+}
+
+/// Resolve --iface to ifindex; fail loudly on 0 (not found).
+/// Claude SMR r1 MINOR-3.
+fn resolve_ifindex(iface: &str) -> Result<i32, String> {
+    let c = CString::new(iface).map_err(|_| "iface name has nul byte".to_string())?;
+    let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
+    if idx == 0 {
+        let errno = std::io::Error::last_os_error();
+        return Err(format!(
+            "interface '{}' not found — check `ip link show` ({})",
+            iface, errno
+        ));
+    }
+    Ok(idx as i32)
+}
+
+/// Verify the interface is IFF_UP via SIOCGIFFLAGS. AGY r1 finding C.
+fn check_iface_up(fd: i32, iface: &str) -> Result<(), String> {
+    let mut ifr: libc::ifreq = unsafe { zeroed() };
+    let name_bytes = iface.as_bytes();
+    if name_bytes.len() >= libc::IFNAMSIZ {
+        return Err(format!("iface '{}' name >= IFNAMSIZ", iface));
+    }
+    for (i, b) in name_bytes.iter().enumerate() {
+        ifr.ifr_name[i] = *b as libc::c_char;
+    }
+    // SAFETY: ifreq is a kernel-defined union; SIOCGIFFLAGS fills
+    // ifr_ifru.ifru_flags. We read it back below via a transmute that
+    // is well-defined because libc::ifreq is repr(C).
+    let ret = unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut ifr) };
+    if ret < 0 {
+        return Err(format!(
+            "SIOCGIFFLAGS on '{}': {}",
+            iface,
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: ifru_flags is the first union member used here.
+    let flags = unsafe { ifr.ifr_ifru.ifru_flags };
+    if (flags as u32 & libc::IFF_UP as u32) == 0 {
+        return Err(format!(
+            "interface '{}' is DOWN — run 'ip link set {} up' first",
+            iface, iface
+        ));
+    }
+    Ok(())
+}
+
+/// Read iface MAC via SIOCGIFHWADDR.
+fn read_iface_mac(fd: i32, iface: &str) -> Result<[u8; 6], String> {
+    let mut ifr: libc::ifreq = unsafe { zeroed() };
+    let name_bytes = iface.as_bytes();
+    if name_bytes.len() >= libc::IFNAMSIZ {
+        return Err(format!("iface '{}' name >= IFNAMSIZ", iface));
+    }
+    for (i, b) in name_bytes.iter().enumerate() {
+        ifr.ifr_name[i] = *b as libc::c_char;
+    }
+    let ret = unsafe { libc::ioctl(fd, libc::SIOCGIFHWADDR, &mut ifr) };
+    if ret < 0 {
+        return Err(format!(
+            "SIOCGIFHWADDR on '{}': {}",
+            iface,
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: SIOCGIFHWADDR writes ifr_hwaddr.sa_data[0..6] (well-defined union access).
+    let mut mac = [0u8; 6];
+    unsafe {
+        for i in 0..6 {
+            mac[i] = ifr.ifr_ifru.ifru_hwaddr.sa_data[i] as u8;
+        }
+    }
+    Ok(mac)
+}
+
+/// Open AF_PACKET SOCK_RAW + bind to iface ifindex + enable QDISC_BYPASS +
+/// SO_SNDBUF. Returns the fd. Caller drops fd on exit.
+fn open_socket(ifindex: i32, frame_bytes: usize, batch: usize) -> Result<i32, String> {
+    // SAFETY: socket() is always callable.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            (libc::ETH_P_IP as u16).to_be() as i32,
+        )
+    };
+    if fd < 0 {
+        let errno = std::io::Error::last_os_error();
+        if errno.raw_os_error() == Some(libc::EPERM)
+            || errno.raw_os_error() == Some(libc::EACCES)
+        {
+            return Err(format!(
+                "socket(AF_PACKET, SOCK_RAW) failed: {} \
+                 --- HINT: re-run with sudo or grant CAP_NET_RAW ---",
+                errno
+            ));
+        }
+        return Err(format!("socket(AF_PACKET, SOCK_RAW) failed: {}", errno));
+    }
+
+    // SO_SNDBUF — try setting; not fatal if it fails.
+    let sndbuf: libc::c_int = (frame_bytes * batch * 256) as libc::c_int;
+    // SAFETY: setsockopt with valid fd and value pointer.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &sndbuf as *const _ as *const c_void,
+            size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+
+    // PACKET_QDISC_BYPASS — plan v4 §4.5 + AGY r1 finding 2. Non-fatal
+    // on failure (older kernels) but the smoke gate will catch any
+    // resulting throughput shortfall.
+    let one: libc::c_int = 1;
+    // SAFETY: setsockopt with valid fd and value pointer.
+    let bypass_ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_PACKET,
+            PACKET_QDISC_BYPASS_OPT,
+            &one as *const _ as *const c_void,
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if bypass_ret != 0 {
+        eprintln!(
+            "warning: PACKET_QDISC_BYPASS setsockopt failed: {} \
+             (kernel < 3.14?) — continuing through qdisc",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // Bind to ifindex.
+    let mut sll: libc::sockaddr_ll = unsafe { zeroed() };
+    sll.sll_family = libc::AF_PACKET as u16;
+    sll.sll_protocol = (libc::ETH_P_IP as u16).to_be();
+    sll.sll_ifindex = ifindex;
+    // SAFETY: bind with valid fd, sockaddr_ll pointer, and correct len.
+    let ret = unsafe {
+        libc::bind(
+            fd,
+            &sll as *const _ as *const libc::sockaddr,
+            size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        let errno = std::io::Error::last_os_error();
+        // SAFETY: close on a valid fd.
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(format!("bind to ifindex {} failed: {}", ifindex, errno));
+    }
+
+    Ok(fd)
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+struct RunStats {
+    tx_packets: u64,
+    tx_batches: u64,
+    err_eagain: u64,
+    err_partial: u64,
+    err_other: u64,
+    first_other_errno: i32,
+}
+
+fn run_loop(args: &Args, fd: i32, ring: &mut TxRing) -> Result<RunStats, String> {
+    let mut stats = RunStats::default();
+    let mut prng = Xorshift64(args.seed);
+    let start = Instant::now();
+    let mut warmup_stats = RunStats::default();
+    let mut in_warmup = !args.warmup.is_zero();
+    let mut next_emit_at = start + Duration::from_secs(1);
+    let mut prev_emit_tx_packets: u64 = 0;
+
+    loop {
+        let now = Instant::now();
+        let elapsed = now - start;
+        if elapsed >= args.warmup + args.duration {
+            break;
+        }
+        if in_warmup && elapsed >= args.warmup {
+            // Snapshot warmup counters; do not count toward run total.
+            warmup_stats = stats;
+            stats = RunStats::default();
+            in_warmup = false;
+            // Re-anchor the per-second emit cadence at warmup end so
+            // operators see 1-second windows of run-phase data, not
+            // mixed-phase windows.
+            next_emit_at = now + Duration::from_secs(1);
+            prev_emit_tx_packets = 0;
+        }
+
+        // Per-iteration: refill all batch slots with fresh PRNG values.
+        for slot in ring.slots.iter_mut() {
+            let s = prng.next();
+            let src_ip_off = (s as u32) % args.src_ip_span;
+            let src_port_v = (((s >> 16) as u32) % args.src_port_span) as u16;
+            let src_port = args.src_port_base.wrapping_add(src_port_v);
+            let dst_port_v = (((s >> 32) as u32) % args.dst_port_span) as u16;
+            let dst_port = args.dst_port_base.wrapping_add(dst_port_v);
+            let src_ip = args.src_ip_base.wrapping_add(src_ip_off);
+            let ip_id = (s >> 48) as u16;
+            slot.fill_packet(src_ip, ip_id, src_port, dst_port);
+        }
+
+        // SAFETY: sendmmsg with our owned mmsghdr array and a valid fd.
+        let sent = unsafe {
+            libc::sendmmsg(
+                fd,
+                ring.msgs.as_mut_ptr(),
+                args.batch as libc::c_uint,
+                0,
+            )
+        };
+
+        if sent < 0 {
+            let errno = std::io::Error::last_os_error();
+            match errno.raw_os_error() {
+                // On Linux EAGAIN == EWOULDBLOCK; ENOBUFS is treated identically
+                // per AGY r1 finding A (no logging storm in hot loop).
+                Some(libc::EAGAIN) | Some(libc::ENOBUFS) => {
+                    stats.err_eagain += 1;
+                    std::thread::yield_now();
+                    continue;
+                }
+                Some(libc::EINTR) => continue,
+                Some(libc::EPERM) | Some(libc::EACCES) => {
+                    return Err(format!(
+                        "sendmmsg returned EPERM/EACCES: {} \
+                         --- HINT: re-run with sudo or grant CAP_NET_RAW ---",
+                        errno
+                    ));
+                }
+                Some(code) => {
+                    if stats.err_other == 0 {
+                        eprintln!(
+                            "sendmmsg first non-recoverable error: {} (errno {})",
+                            errno, code
+                        );
+                        stats.first_other_errno = code;
+                    }
+                    stats.err_other += 1;
+                    std::thread::yield_now();
+                    continue;
+                }
+                None => {
+                    return Err(format!("sendmmsg returned -1 without errno: {}", errno));
+                }
+            }
+        }
+
+        let n = sent as u64;
+        stats.tx_packets += n;
+        if n as usize == args.batch {
+            stats.tx_batches += 1;
+        } else {
+            stats.err_partial += 1;
+        }
+
+        // Per-second JSON-lines to stderr — operator visibility.
+        if !in_warmup && now >= next_emit_at {
+            let delta = stats.tx_packets - prev_emit_tx_packets;
+            eprintln!(
+                "{{\"t\":{},\"pps\":{},\"batches\":{},\"err_eagain\":{},\"err_partial\":{},\"err_other\":{}}}",
+                elapsed.as_secs_f64(),
+                delta,
+                stats.tx_batches,
+                stats.err_eagain,
+                stats.err_partial,
+                stats.err_other
+            );
+            prev_emit_tx_packets = stats.tx_packets;
+            next_emit_at = now + Duration::from_secs(1);
+        }
+    }
+
+    // Drop warmup counters (already excluded from `stats`).
+    let _ = warmup_stats;
+    Ok(stats)
+}
+
+fn emit_summary(args: &Args, stats: &RunStats) {
+    let secs = args.duration.as_secs_f64();
+    let avg_pps = if secs > 0.0 {
+        (stats.tx_packets as f64 / secs) as u64
+    } else {
+        0
+    };
+    let src_ip_str: Ipv4Addr = Ipv4Addr::from(args.src_ip_base);
+    println!(
+        "{{\"version\":1,\
+         \"cohort\":\"{}\",\
+         \"duration_secs\":{},\
+         \"warmup_secs\":{},\
+         \"frame_bytes\":{},\
+         \"batch\":{},\
+         \"tx_packets\":{},\
+         \"tx_batches\":{},\
+         \"avg_pps\":{},\
+         \"err_eagain\":{},\
+         \"err_partial\":{},\
+         \"err_other\":{},\
+         \"first_other_errno\":{},\
+         \"src_ip_base\":\"{}\",\
+         \"src_ip_span\":{},\
+         \"src_port_base\":{},\
+         \"src_port_span\":{},\
+         \"dst_ip\":\"{}\",\
+         \"dst_port_base\":{},\
+         \"dst_port_span\":{},\
+         \"seed\":{},\
+         \"clock_source\":\"not-used-in-1611\"}}",
+        if args.cohort_unbounded { "unbounded" } else { "bounded" },
+        args.duration.as_secs(),
+        args.warmup.as_secs(),
+        args.frame_bytes,
+        args.batch,
+        stats.tx_packets,
+        stats.tx_batches,
+        avg_pps,
+        stats.err_eagain,
+        stats.err_partial,
+        stats.err_other,
+        stats.first_other_errno,
+        src_ip_str,
+        args.src_ip_span,
+        args.src_port_base,
+        args.src_port_span,
+        args.dst_ip,
+        args.dst_port_base,
+        args.dst_port_span,
+        args.seed,
+    );
+}
+
 fn main() {
-    let args = match Args::parse() {
+    let mut args = match Args::parse() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}\n\n{}", help());
@@ -380,93 +873,110 @@ fn main() {
         }
     };
 
+    // dst_mac must be explicitly supplied — broadcast default is a sentinel
+    // for "operator forgot to pass --dst-mac". Per plan v4 §4 point 1.
+    if args.dst_mac == [0xff; 6] {
+        eprintln!(
+            "error: --dst-mac required; ARP-resolve is not implemented \
+             in this runner. On the loss userspace cluster, the peer \
+             firewall RETH MAC is stable — pass it explicitly. \
+             See docs/pr/1611-flooder-runner-body/plan.md §4."
+        );
+        std::process::exit(2);
+    }
+
+    // Resolve interface + ifindex.
+    let ifindex = match resolve_ifindex(&args.iface) {
+        Ok(idx) => idx,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // Open AF_PACKET SOCK_RAW socket with PACKET_QDISC_BYPASS.
+    let fd = match open_socket(ifindex, args.frame_bytes, args.batch) {
+        Ok(fd) => fd,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // Check IFF_UP. AGY r1 finding C.
+    if let Err(e) = check_iface_up(fd, &args.iface) {
+        eprintln!("error: {e}");
+        // SAFETY: close on a valid fd.
+        unsafe {
+            libc::close(fd);
+        }
+        std::process::exit(2);
+    }
+
+    // Auto-fill src_mac from iface if still default [0; 6].
+    if args.src_mac == [0; 6] {
+        match read_iface_mac(fd, &args.iface) {
+            Ok(mac) => args.src_mac = mac,
+            Err(e) => {
+                eprintln!("warning: could not read iface MAC ({}); using zeros", e);
+            }
+        }
+    }
+
     eprintln!(
-        "cold-path-flooder: iface={} dst_ip={} cohort={} duration={:?} frame_bytes={}",
+        "cold-path-flooder v1: iface={} ifindex={} src_mac={:02x?} dst_mac={:02x?} \
+         dst_ip={} cohort={} src_port_base={} duration={:?} warmup={:?} frame_bytes={} batch={}",
         args.iface,
+        ifindex,
+        args.src_mac,
+        args.dst_mac,
         args.dst_ip,
-        if args.cohort_unbounded {
-            "unbounded".to_string()
-        } else {
-            format!(
-                "{}",
-                args.src_ip_span as u128
-                    * args.src_port_span as u128
-                    * args.dst_port_span as u128
-            )
-        },
+        if args.cohort_unbounded { "unbounded" } else { "bounded" },
+        args.src_port_base,
         args.duration,
+        args.warmup,
         args.frame_bytes,
+        args.batch,
     );
 
-    // The AF_PACKET socket + frame assembly + sendmmsg loop is NOT
-    // implemented in step-1; this main() body intentionally exercises
-    // only the CLI surface (argument parsing + cohort validation) so
-    // it can be unit-tested without CAP_NET_RAW. The runner body
-    // lands in step-2 (#1611) and will replace this stub tail with
-    // the real AF_PACKET / sendmmsg loop driven by the xorshift PRNG
-    // primitive defined above.
-    //
-    // Per AGY r4: a downstream harness must NOT mistake the stub for
-    // a successful run. We print a loud, unambiguous "STUB" tag on
-    // stderr AND exit with a distinctive non-zero status (71 =
-    // sysexits.h EX_OSERR, "internal software error"). Any harness
-    // shell script keying off `$?` will treat this as failure.
+    let mut ring = TxRing::new(args.batch, &args.dst_mac, &args.src_mac, args.dst_ip, ifindex);
+    ring.wire_msgs();
 
-    let _seed = args.seed;
-    let _prng = Xorshift64(args.seed);
-    eprintln!(
-        "cold-path-flooder: STUB — runner body deferred to #1611 (see plan v2-r4 §4.2)"
-    );
-    eprintln!(
-        "cold-path-flooder: STUB — validated args + cohort cap; exit 71 to flag NOT-IMPLEMENTED"
-    );
+    let stats = match run_loop(&args, fd, &mut ring) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            // SAFETY: close on a valid fd.
+            unsafe {
+                libc::close(fd);
+            }
+            std::process::exit(1);
+        }
+    };
 
-    std::process::exit(71);
+    // SAFETY: close on a valid fd.
+    unsafe {
+        libc::close(fd);
+    }
+
+    emit_summary(&args, &stats);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn bounded_cohort_constants_fit_max_sessions() {
-        // Compile-time const _: () = assert!(... == 131_072) already
-        // gates this, but a runtime test makes the intent visible in
-        // `cargo test` output.
-        let cohort = BOUNDED_SRC_IP_SPAN as u64
-            * BOUNDED_SRC_PORT_SPAN as u64
-            * BOUNDED_DST_PORT_SPAN as u64;
-        assert_eq!(cohort, 131_072);
-    }
-
-    #[test]
-    fn unbounded_is_default_regime() {
-        // Per AGY r3 axis 1 resolution: the default cohort is
-        // unbounded; the JIT-planning Scale Target sources from
-        // this regime.
-        let default_cohort = DEFAULT_SRC_IP_SPAN as u64
-            * DEFAULT_SRC_PORT_SPAN as u64
-            * DEFAULT_DST_PORT_SPAN as u64;
-        // Default cohort > DEFAULT_MAX_SESSIONS (131_072) — that's
-        // the whole point, so install_rejected fast return kicks in
-        // after the table fills.
-        assert!(default_cohort > 131_072);
-    }
-
-    /// Build a parse() invocation by spoofing argv via env::set_var
-    /// is hard; we instead exercise the validator branches with a
-    /// hand-constructed Args struct. The struct fields are private
-    /// to the module, so this test lives inline.
     fn build_default_args() -> Args {
         Args {
             iface: "ge-0-0-1".to_string(),
-            dst_mac: [0xff; 6],
-            src_mac: [0; 6],
+            dst_mac: [0x02, 0xbf, 0x72, 0xcc, 0x00, 0x01],
+            src_mac: [0x02, 0xbf, 0x72, 0xcc, 0x00, 0x02],
             dst_ip: Ipv4Addr::new(172, 16, 80, 200),
             dst_port_base: DEFAULT_DST_PORT_BASE,
             dst_port_span: DEFAULT_DST_PORT_SPAN,
-            src_ip_base: 0,
+            src_ip_base: u32::from_be_bytes([10, 42, 0, 0]),
             src_ip_span: DEFAULT_SRC_IP_SPAN,
+            src_port_base: DEFAULT_SRC_PORT_BASE,
             src_port_span: DEFAULT_SRC_PORT_SPAN,
             duration: Duration::from_secs(DEFAULT_DURATION_SECS),
             warmup: Duration::from_secs(DEFAULT_WARMUP_SECS),
@@ -477,73 +987,85 @@ mod tests {
         }
     }
 
-    /// Mirror of the post-parse validation loop in Args::parse() so a
-    /// unit test can exercise each rejection branch without needing
-    /// to spoof argv (which is awkward in Rust unit tests).
-    fn validate(a: &Args) -> Result<(), String> {
-        if a.src_ip_span == 0 {
-            return Err("--src-ip-span must be >= 1".to_string());
-        }
-        if a.src_port_span == 0 {
-            return Err("--src-port-span must be >= 1".to_string());
-        }
-        if a.dst_port_span == 0 {
-            return Err("--dst-port-span must be >= 1".to_string());
-        }
-        if a.batch == 0 {
-            return Err("--batch must be >= 1".to_string());
-        }
-        if a.batch > 1024 {
-            return Err("--batch > 1024".to_string());
-        }
-        Ok(())
+    #[test]
+    fn bounded_cohort_constants_fit_max_sessions() {
+        let cohort = BOUNDED_SRC_IP_SPAN as u64
+            * BOUNDED_SRC_PORT_SPAN as u64
+            * BOUNDED_DST_PORT_SPAN as u64;
+        assert_eq!(cohort, 131_072);
+    }
+
+    #[test]
+    fn unbounded_is_default_regime() {
+        let default_cohort = DEFAULT_SRC_IP_SPAN as u64
+            * DEFAULT_SRC_PORT_SPAN as u64
+            * DEFAULT_DST_PORT_SPAN as u64;
+        assert!(default_cohort > 131_072);
     }
 
     #[test]
     fn bounded_cohort_overflow_check_uses_u128() {
-        // AGY code-r2 medium: u32 × u32 × u32 = u96 in theory, so a
-        // u64 product can overflow to 0 in release builds and bypass
-        // the bounded-cap. Verify the math we use is u128 wide.
-        //
-        // We can't easily exercise Args::parse here without spoofing
-        // argv, but we can compute the same product the validator
-        // computes and assert it stays correct at the overflow edge.
         let s1: u32 = u32::MAX;
         let s2: u32 = u32::MAX;
         let s3: u32 = u32::MAX;
-        // The fix uses u128:
         let cohort: u128 = s1 as u128 * s2 as u128 * s3 as u128;
-        // Naïve u64 would overflow and wrap; u128 stays exact at ~7.9e28.
         assert!(cohort > 131_072);
         assert!(cohort > u64::MAX as u128);
     }
 
     #[test]
     fn zero_spans_and_batch_rejected() {
-        // Copilot code-r1 axis 3 + Copilot code-r2 repeat: confirm the
-        // validator rejects all four zero values + the oversized batch.
         let mut a = build_default_args();
         a.src_ip_span = 0;
-        assert!(validate(&a).is_err());
+        assert!(validate_args(&a).is_err());
 
         a = build_default_args();
         a.src_port_span = 0;
-        assert!(validate(&a).is_err());
+        assert!(validate_args(&a).is_err());
 
         a = build_default_args();
         a.dst_port_span = 0;
-        assert!(validate(&a).is_err());
+        assert!(validate_args(&a).is_err());
 
         a = build_default_args();
         a.batch = 0;
-        assert!(validate(&a).is_err());
+        assert!(validate_args(&a).is_err());
 
         a = build_default_args();
         a.batch = 2048;
-        assert!(validate(&a).is_err());
+        assert!(validate_args(&a).is_err());
 
-        // Sanity: the default Args itself validates clean.
-        assert!(validate(&build_default_args()).is_ok());
+        assert!(validate_args(&build_default_args()).is_ok());
+    }
+
+    #[test]
+    fn dst_port_overflow_rejected_by_validator() {
+        // AGY r3 step-2 minor 1.
+        let mut a = build_default_args();
+        a.dst_port_base = 60_000;
+        a.dst_port_span = 10_000;
+        let err = validate_args(&a).unwrap_err();
+        assert!(err.contains("dst-port-base"));
+        assert!(err.contains("65536"));
+    }
+
+    #[test]
+    fn dst_port_base_plus_span_eq_65536_allowed() {
+        // Boundary case — dst_port_base + dst_port_span == 65536 is OK.
+        let mut a = build_default_args();
+        a.dst_port_base = 60_000;
+        a.dst_port_span = 5_536;
+        assert!(validate_args(&a).is_ok());
+    }
+
+    #[test]
+    fn src_port_overflow_rejected_by_validator() {
+        let mut a = build_default_args();
+        a.src_port_base = 60_000;
+        a.src_port_span = 10_000;
+        let err = validate_args(&a).unwrap_err();
+        assert!(err.contains("src-port-base"));
+        assert!(err.contains("65536"));
     }
 
     #[test]
@@ -569,26 +1091,205 @@ mod tests {
     }
 
     #[test]
-    fn unbounded_default_uses_full_2_to_16_spans() {
-        // Copilot review r1 axis 2: spans are CARDINALITIES (count of
-        // values), not max-values. The full 16-bit space is 2^16 = 65_536
-        // distinct values, NOT 65_535.
+    fn unbounded_default_spans_match_plan() {
         assert_eq!(DEFAULT_SRC_IP_SPAN, 65_536);
-        assert_eq!(DEFAULT_SRC_PORT_SPAN, 65_536);
+        // Plan §4 + reserved-port-0 protection: default src_port_span =
+        // 65_536 - DEFAULT_SRC_PORT_BASE = 64_512, so emitted ports stay
+        // in [1024, 65_536) without u16 wrap.
+        assert_eq!(DEFAULT_SRC_PORT_SPAN, 64_512);
+        assert_eq!(DEFAULT_SRC_PORT_BASE, 1024);
+        assert!(DEFAULT_SRC_PORT_BASE as u32 + DEFAULT_SRC_PORT_SPAN <= 65_536);
         assert_eq!(DEFAULT_DST_PORT_SPAN, 1);
     }
 
     #[test]
+    fn default_src_port_base_skips_reserved_zero() {
+        // #1611 plan §4: default src_port_base=1024 to avoid the
+        // metadata_tuple_complete short-circuit at
+        // userspace-dp/src/afxdp/frame/inspect.rs:207. Operators can
+        // opt into port-0 sweep via `--src-port-base 0`.
+        assert_eq!(DEFAULT_SRC_PORT_BASE, 1024);
+    }
+
+    #[test]
     fn frame_bytes_must_be_at_least_min_eth() {
-        // MIN_ETH_FRAME = 64; anything smaller is a UDP-without-pad
-        // mismatch that violates §4.2.3 wire-byte claim.
         assert_eq!(MIN_ETH_FRAME, 64);
         assert!(64 >= MIN_ETH_FRAME);
     }
-}
 
-// Drop the unused warnings the stub leaves behind.
-#[allow(dead_code)]
-const _UNUSED: () = {
-    let _ = MIN_ETH_FRAME;
-};
+    /// Plan v4 §4 — wire-byte invariants.
+    #[test]
+    fn frame_layout_constants_match_plan() {
+        assert_eq!(ETH_HDR, 14);
+        assert_eq!(IPV4_HDR, 20);
+        assert_eq!(UDP_HDR, 8);
+        assert_eq!(UDP_PAYLOAD, 22);
+        assert_eq!(FRAME_V4_TOTAL, 64);
+        assert_eq!(IPV4_TOTAL_LEN, 50);
+        assert_eq!(UDP_LEN, 30);
+        assert_eq!(PAYLOAD_MAGIC.len(), UDP_PAYLOAD);
+    }
+
+    #[test]
+    fn frame_assembly_default_v4_is_exactly_64_bytes() {
+        let mut slot = TxSlot::new();
+        slot.init_static(
+            &[0x02, 0xbf, 0x72, 0xcc, 0x00, 0x01],
+            &[0x02, 0xbf, 0x72, 0xcc, 0x00, 0x02],
+            Ipv4Addr::new(172, 16, 80, 200),
+        );
+        slot.fill_packet(u32::from_be_bytes([10, 42, 0, 5]), 0x1234, 1024, 5201);
+        assert_eq!(slot.frame.len(), 64);
+    }
+
+    #[test]
+    fn frame_assembly_ipv4_total_len_field_is_50() {
+        let mut slot = TxSlot::new();
+        slot.init_static(
+            &[0x02; 6],
+            &[0x03; 6],
+            Ipv4Addr::new(172, 16, 80, 200),
+        );
+        slot.fill_packet(0x0A2A0001, 0x4321, 1024, 5201);
+        let total_len = u16::from_be_bytes([slot.frame[16], slot.frame[17]]);
+        assert_eq!(total_len, 50);
+    }
+
+    #[test]
+    fn frame_assembly_udp_len_field_is_30() {
+        let mut slot = TxSlot::new();
+        slot.init_static(
+            &[0x02; 6],
+            &[0x03; 6],
+            Ipv4Addr::new(172, 16, 80, 200),
+        );
+        slot.fill_packet(0x0A2A0001, 0x4321, 1024, 5201);
+        let udp_len = u16::from_be_bytes([slot.frame[38], slot.frame[39]]);
+        assert_eq!(udp_len, 30);
+    }
+
+    #[test]
+    fn frame_assembly_udp_csum_is_zero_per_rfc768() {
+        let mut slot = TxSlot::new();
+        slot.init_static(
+            &[0x02; 6],
+            &[0x03; 6],
+            Ipv4Addr::new(172, 16, 80, 200),
+        );
+        slot.fill_packet(0x0A2A0001, 0x4321, 1024, 5201);
+        let udp_csum = u16::from_be_bytes([slot.frame[40], slot.frame[41]]);
+        assert_eq!(udp_csum, 0);
+    }
+
+    #[test]
+    fn frame_assembly_ipv4_csum_one_complement_fold() {
+        // Golden value: with the static header fields below + src_ip
+        // 10.42.0.5, ip_id 0x1234, the IPv4 csum is deterministic.
+        // Verify by recomputing externally.
+        //
+        //   v=4 ihl=5 tos=0      0x4500
+        //   total_len = 50       0x0032
+        //   id = 0x1234
+        //   flags=DF, frag=0     0x4000
+        //   ttl=64 proto=17      0x4011
+        //   csum (zero for computation)
+        //   src = 10.42.0.5      0x0A2A 0x0005
+        //   dst = 172.16.80.200  0xAC10 0x50C8
+        //
+        // 16-bit sum (carry-folded) of header words excluding csum:
+        //   0x4500 + 0x0032 + 0x1234 + 0x4000 + 0x4011 + 0x0000
+        //     + 0x0A2A + 0x0005 + 0xAC10 + 0x50C8 = 0x1DE7E
+        //   carry-fold: 0xDE7E + 0x0001 = 0xDE7F
+        //   one's complement: 0xFFFF - 0xDE7F = 0x2180
+        let mut slot = TxSlot::new();
+        slot.init_static(
+            &[0x02; 6],
+            &[0x03; 6],
+            Ipv4Addr::new(172, 16, 80, 200),
+        );
+        slot.fill_packet(u32::from_be_bytes([10, 42, 0, 5]), 0x1234, 1024, 5201);
+        let csum = u16::from_be_bytes([slot.frame[24], slot.frame[25]]);
+        assert_eq!(csum, 0x2180, "ipv4 csum mismatch: {:#06x}", csum);
+    }
+
+    #[test]
+    fn frame_assembly_payload_magic_matches_plan() {
+        // Plan v4 §4: payload b"XPF-COLD-PATH-MIN64\n\0\0" (22 bytes).
+        let mut slot = TxSlot::new();
+        slot.init_static(
+            &[0x02; 6],
+            &[0x03; 6],
+            Ipv4Addr::new(172, 16, 80, 200),
+        );
+        slot.fill_packet(0x0A2A0001, 0x4321, 1024, 5201);
+        assert_eq!(&slot.frame[42..64], PAYLOAD_MAGIC.as_slice());
+        assert_eq!(slot.frame[42..62], *b"XPF-COLD-PATH-MIN64\n");
+        assert_eq!(slot.frame[62], 0);
+        assert_eq!(slot.frame[63], 0);
+    }
+
+    #[test]
+    fn src_port_zero_never_emitted_with_default_base() {
+        // The default config (base=1024, span=64512) keeps every emitted
+        // src_port in [1024, 65_536) — strictly above the reserved-port-0
+        // short-circuit at userspace-dp/src/afxdp/frame/inspect.rs:207.
+        let args = build_default_args();
+        assert!(validate_args(&args).is_ok());
+
+        let mut prng = Xorshift64(args.seed);
+        for _ in 0..16_384 {
+            let s = prng.next();
+            let src_port_v = ((s >> 16) as u32 % args.src_port_span) as u16;
+            let src_port = args.src_port_base.wrapping_add(src_port_v);
+            assert!(
+                src_port >= 1024,
+                "src_port < 1024: {} (base {} + v {})",
+                src_port,
+                args.src_port_base,
+                src_port_v
+            );
+        }
+
+        // Confirm the validator hard-rejects a misconfig that would
+        // wrap into the reserved range.
+        let mut bad = build_default_args();
+        bad.src_port_base = 1024;
+        bad.src_port_span = 65_536;
+        assert!(validate_args(&bad).is_err());
+    }
+
+    /// CAP_NET_RAW integration test — Codex r1 MAJOR-3.
+    /// Skipped by default. Run via:
+    ///   XPF_RUN_RAW_SOCKET_TESTS=1 sudo -E cargo test --release \
+    ///     -- --ignored test_open_af_packet_raw_smoke
+    #[test]
+    #[ignore]
+    fn test_open_af_packet_raw_smoke() {
+        if std::env::var("XPF_RUN_RAW_SOCKET_TESTS").as_deref() != Ok("1") {
+            eprintln!("Skipped: set XPF_RUN_RAW_SOCKET_TESTS=1 to run.");
+            return;
+        }
+        // Resolve loopback ifindex.
+        let ifindex = resolve_ifindex("lo").expect("lo should exist");
+        // Open the socket.
+        let fd = open_socket(ifindex, 64, 1).expect("open_socket on lo should succeed");
+        assert!(fd >= 0);
+        // Build one packet and send.
+        let mut ring = TxRing::new(
+            1,
+            &[0x00; 6],
+            &[0x00; 6],
+            Ipv4Addr::new(127, 0, 0, 1),
+            ifindex,
+        );
+        ring.wire_msgs();
+        ring.slots[0].fill_packet(u32::from_be_bytes([127, 0, 0, 1]), 1, 1024, 5201);
+        let sent = unsafe {
+            libc::sendmmsg(fd, ring.msgs.as_mut_ptr(), 1, 0)
+        };
+        assert!(sent == 1, "expected sendmmsg to send 1, got {}", sent);
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
