@@ -4148,3 +4148,9 @@ top.
 - **Timestamp**: 2026-05-27 (UTC)
   - **Action**: Wrote v2 plan from the Multi-Book LPM architectural pivot (AGY r1 + Codex r1 + Claude SMR r1+r2 convergence). v2 supersedes v1; v1 KILLED for 320 GB RuleBitSet memory blowup. Staged delivery: Step 1 (this PR) = Multi-Book LPM v4 primitive + feature-flag scaffold; Step 2 (follow-up) = full multi-stage hot path; Step 3 (follow-up) = Junos CLI knob + production default-flip gated on #1612. User override accepted: architecture ships now behind feature flag default-OFF; empirical ≥10× claim gated on #1612 measurement.
   - **File(s)**: docs/pr/1609-multistage-policy-dag/plan.md (v2 rewrite)
+
+## 2026-05-27 — #1609 v2 plan-review r3 convergence: PLAN-NEEDS-MAJOR
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Dispatched Codex (task-mpp07r70-gr5xtw) + AGY (adversarial-review-mpp08612-zcapi3) hostile v2 plan-reviews. Both returned PLAN-NEEDS-MAJOR. Codex: 10 findings F1-F10. AGY: 4 Class-A fatals (F1.1-F1.4) + 2 Class-B nits. Convergent fatals: (1) level-0 memory math error 16 MB → actually 256 MiB w/ fat pointers; (2) literal/any rules dropped from Stage 3; (3) v6 FxHashMap DoS vector on attacker-controlled /48s; (4) global-vs-zone-rule ordering invariant violated by flat ascending rule_idx; (5) broad-prefix /0 build-time blow-up; (6) LPM cannot be built from current trie-compressed BookEntry. Plus 6 MAJORs. Wrote claude-smr-plan-r4.md REVERSING r3 PLAN-READY-WITH-NITS soft-pass; aligning to 3-of-3 PLAN-NEEDS-MAJOR. Architectural axis remains sound; v2 concrete design needs material v3 rewrite. NOT spawning v3 in this session per `feedback_difficult_path_pragmatism`. Posting issue comment + closing the engineer drive as BLOCKED on v3 redesign.
+  - **File(s)**: docs/pr/1609-multistage-policy-dag/claude-smr-plan-r4.md (new), docs/pr/1609-multistage-policy-dag/reviewer-ids.md (round 3 verdict update)

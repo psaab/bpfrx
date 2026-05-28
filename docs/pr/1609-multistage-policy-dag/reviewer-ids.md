@@ -19,7 +19,10 @@ results by ID if the Companion CLI session state is lost
 
 ### Round 3 (v2 round 1 — Multi-Book LPM + staged delivery, user override)
 
-- **Codex**: `task-mpp07r70-gr5xtw` (v2 hostile plan-review, dispatched 2026-05-27)
-- **AGY**: `adversarial-review-mpp08612-zcapi3` (v2 hostile plan-review, dispatched 2026-05-27)
-- **Claude SMR**: `docs/pr/1609-multistage-policy-dag/claude-smr-plan-r3.md` — PLAN-READY-WITH-NITS
+- **Codex**: `task-mpp07r70-gr5xtw` — PLAN-NEEDS-MAJOR (10 numbered findings F1-F10)
+- **AGY**: `adversarial-review-mpp08612-zcapi3` — PLAN-NEEDS-MAJOR (4 Class-A fatals F1.1-F1.4 + 2 Class-B nits)
+- **Claude SMR r3**: `docs/pr/1609-multistage-policy-dag/claude-smr-plan-r3.md` — PLAN-READY-WITH-NITS (soft-pass, REVERSED in r4)
+- **Claude SMR r4**: `docs/pr/1609-multistage-policy-dag/claude-smr-plan-r4.md` — PLAN-NEEDS-MAJOR (3-of-3 convergence with Codex + AGY)
 - **Copilot**: posts on PR creation; not applicable to plan reviews
+
+**Verdict**: 3-of-3 PLAN-NEEDS-MAJOR convergent. 6 fatals + 6 majors enumerated in r4. Architectural axis (Multi-Book LPM + sorted postings + galloping merge) remains sound; v2 concrete design has fatal patchable issues. Deferred to future planning session (ideally after #1612 lands measurement).
