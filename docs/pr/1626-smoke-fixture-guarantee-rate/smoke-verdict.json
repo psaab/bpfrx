@@ -1,0 +1,182 @@
+{
+  "direction": "push",
+  "aggregate_gbps": 19.783,
+  "rows": [
+    {
+      "port": 5201,
+      "class": "iperf-100m",
+      "shape_gbps": 0.1,
+      "recv_gbps": 0.019,
+      "cov_pct": 1.7,
+      "spread": 1.04,
+      "retransmits": 23
+    },
+    {
+      "port": 5202,
+      "class": "iperf-1g",
+      "shape_gbps": 1.0,
+      "recv_gbps": 0.2,
+      "cov_pct": 4.1,
+      "spread": 1.14,
+      "retransmits": 138
+    },
+    {
+      "port": 5203,
+      "class": "iperf-3g",
+      "shape_gbps": 3.0,
+      "recv_gbps": 0.672,
+      "cov_pct": 9.6,
+      "spread": 1.36,
+      "retransmits": 217
+    },
+    {
+      "port": 5204,
+      "class": "iperf-6g",
+      "shape_gbps": 6.0,
+      "recv_gbps": 1.364,
+      "cov_pct": 29.7,
+      "spread": 3.48,
+      "retransmits": 534
+    },
+    {
+      "port": 5205,
+      "class": "iperf-9g",
+      "shape_gbps": 9.0,
+      "recv_gbps": 2.004,
+      "cov_pct": 13.8,
+      "spread": 1.57,
+      "retransmits": 984
+    },
+    {
+      "port": 5206,
+      "class": "iperf-12g",
+      "shape_gbps": 12.0,
+      "recv_gbps": 2.809,
+      "cov_pct": 30.3,
+      "spread": 2.77,
+      "retransmits": 1294
+    },
+    {
+      "port": 5207,
+      "class": "iperf-15g",
+      "shape_gbps": 15.0,
+      "recv_gbps": 2.747,
+      "cov_pct": 46.7,
+      "spread": 5.09,
+      "retransmits": 1129
+    },
+    {
+      "port": 5208,
+      "class": "iperf-18g",
+      "shape_gbps": 18.0,
+      "recv_gbps": 3.567,
+      "cov_pct": 29.8,
+      "spread": 3.67,
+      "retransmits": 1404
+    },
+    {
+      "port": 5209,
+      "class": "iperf-21g",
+      "shape_gbps": 21.0,
+      "recv_gbps": 3.545,
+      "cov_pct": 34.5,
+      "spread": 3.99,
+      "retransmits": 1377
+    },
+    {
+      "port": 5210,
+      "class": "iperf-24g",
+      "shape_gbps": 24.0,
+      "recv_gbps": 2.854,
+      "cov_pct": 58.7,
+      "spread": 6.99,
+      "retransmits": 1267
+    },
+    {
+      "port": 5211,
+      "class": "iperf-uncapped",
+      "shape_gbps": 0.0,
+      "recv_gbps": 0.001,
+      "cov_pct": 75.8,
+      "spread": 10.5,
+      "retransmits": 87
+    }
+  ],
+  "gates": {
+    "gate_1_small_class_guarantees": {
+      "classes": [
+        {
+          "class": "iperf-100m",
+          "target": 0.095,
+          "actual": 0.019,
+          "pass": false
+        },
+        {
+          "class": "iperf-1g",
+          "target": 0.95,
+          "actual": 0.2,
+          "pass": false
+        },
+        {
+          "class": "iperf-3g",
+          "target": 2.8499999999999996,
+          "actual": 0.672,
+          "pass": false
+        },
+        {
+          "class": "iperf-6g",
+          "target": 5.699999999999999,
+          "actual": 1.364,
+          "pass": false
+        }
+      ],
+      "pass": false
+    },
+    "gate_2_priority_low_min_share": {
+      "target": 0.9,
+      "actual": 0.0010092108603814588,
+      "pass": false
+    },
+    "gate_3_retrans_floor": {
+      "high_retr_classes": [
+        {
+          "class": "iperf-1g",
+          "retr": 138
+        },
+        {
+          "class": "iperf-3g",
+          "retr": 217
+        },
+        {
+          "class": "iperf-6g",
+          "retr": 534
+        },
+        {
+          "class": "iperf-9g",
+          "retr": 984
+        },
+        {
+          "class": "iperf-12g",
+          "retr": 1294
+        },
+        {
+          "class": "iperf-15g",
+          "retr": 1129
+        },
+        {
+          "class": "iperf-18g",
+          "retr": 1404
+        },
+        {
+          "class": "iperf-21g",
+          "retr": 1377
+        },
+        {
+          "class": "iperf-24g",
+          "retr": 1267
+        }
+      ],
+      "pass": false
+    }
+  }
+}
