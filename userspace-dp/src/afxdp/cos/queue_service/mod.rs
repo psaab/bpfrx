@@ -19,8 +19,8 @@ use crate::afxdp::frame::{apply_dscp_rewrite_to_frame, frame_has_tcp_rst};
 use crate::afxdp::mirror::MIRROR_TX_FRAME_RESERVE;
 use crate::afxdp::neighbor::monotonic_nanos;
 use crate::afxdp::types::{
-    COS_PRIORITY_LEVELS, CoSInterfaceRuntime, CoSPendingTxItem, CoSQueueRuntime,
-    ExactLocalScratchTxRequest, ExactPreparedScratchTxRequest, PreparedTxRecycle,
+    COS_PRIORITY_LEVELS, CoSInterfaceRuntime, CoSOversubscriptionPolicy, CoSPendingTxItem,
+    CoSQueueRuntime, ExactLocalScratchTxRequest, ExactPreparedScratchTxRequest, PreparedTxRecycle,
     PreparedTxRequest, SharedCoSExactBacklog, TxRequest, WorkerCoSQueueFastPath,
 };
 use crate::afxdp::umem::MmapArea;
@@ -593,6 +593,25 @@ fn select_exact_cos_guarantee_queue_with_lease_telemetry(
     now_ns: u64,
     lease_telemetry: &mut CoSQueueLeaseAcquireTelemetry,
 ) -> Option<ExactCoSQueueSelection> {
+    // #1614 A1: in GuaranteeRate mode (operator opt-in), dispatch to
+    // the small-first waterfill selector. The default Proportional
+    // mode falls through to the legacy round-robin selector below,
+    // bit-for-bit unchanged when priority_low_min_share_bytes == 0
+    // (see service_exact_guarantee_queue_direct_with_info for the
+    // cap_eff subtraction that handles priority-low orthogonality
+    // per AGY r3 finding B).
+    if matches!(
+        root.oversubscription_policy,
+        CoSOversubscriptionPolicy::GuaranteeRate
+    ) && root.oversubscription_guarantee_fraction > 0.0
+    {
+        return select_exact_cos_guarantee_queue_waterfill(
+            root,
+            queue_fast_path,
+            now_ns,
+            lease_telemetry,
+        );
+    }
     let queue_count = root.queues.len();
     if queue_count == 0 {
         return None;
@@ -700,6 +719,147 @@ fn select_exact_cos_guarantee_queue_with_lease_telemetry(
             continue;
         }
         root.exact_guarantee_rr = (start + offset + 1) % queue_count;
+        let secondary_budget = queue
+            .hot
+            .tokens
+            .min(cos_guarantee_quantum_bytes(queue))
+            .max(head_len);
+        let kind = match head {
+            CoSPendingTxItem::Local(_) => ExactCoSQueueKind::Local,
+            CoSPendingTxItem::Prepared(_) => ExactCoSQueueKind::Prepared,
+        };
+        return Some(ExactCoSQueueSelection {
+            queue_idx,
+            secondary_budget,
+            kind,
+        });
+    }
+    None
+}
+
+// #1614 A1: small-first waterfill selector for `guarantee-rate`
+// oversubscription policy. Activated when the interface's
+// `oversubscription_policy == GuaranteeRate` AND `guarantee_fraction >
+// 0`. Iterates `exact_queues_by_rate_ascending` (pre-sorted at config-
+// apply) so the smallest-rate exact queue with pending work is
+// selected first.
+//
+// The two-phase waterfill is implemented per-call by virtue of the
+// per-visit quantum already being rate-proportional: small classes
+// have small quanta and hit their full configured rate quickly
+// (sustaining `Q_i / 200µs ≈ rate_i` bytes/sec); larger classes
+// only get serviced when smaller classes have no more pending
+// work or have hit their per-queue token bucket cap. Under
+// oversubscription, Phase 1 (small classes honoured) and Phase 2
+// (residual proportional) emerge naturally from this iteration
+// order combined with the existing per-queue rate-limit gates.
+//
+// Compared to the legacy RR selector this changes:
+//   - Iteration order: sorted ascending by rate (vs RR cursor).
+//   - Cursor handling: NONE — the function is stateless across
+//     calls; the per-queue token bucket gates handle the
+//     waterfill phase boundary implicitly. AGY r2 #1's equal-rate
+//     starvation concern is bounded by stable sort (queues with
+//     identical rates retain queue_id order).
+//   - Park behaviour: identical to legacy (root-token / queue-
+//     token starvation handled the same way).
+#[inline]
+fn select_exact_cos_guarantee_queue_waterfill(
+    root: &mut CoSInterfaceRuntime,
+    queue_fast_path: &[WorkerCoSQueueFastPath],
+    now_ns: u64,
+    lease_telemetry: &mut CoSQueueLeaseAcquireTelemetry,
+) -> Option<ExactCoSQueueSelection> {
+    // exact_queues_by_rate_ascending was built once at
+    // `build_cos_interface_runtime` time; clone the indices into a
+    // local stack buffer so we can mutate `root.queues[idx]`
+    // without conflicting with the borrow on the cursor vec.
+    let queue_count = root.queues.len();
+    if queue_count == 0 || root.exact_queues_by_rate_ascending.is_empty() {
+        return None;
+    }
+    // Walk in ascending-rate order. Compared to RR cursor walking,
+    // we visit ALL eligible queues every call rather than starting
+    // at cursor — that's fine because we return after the first
+    // queue with usable tokens, and the small-first ordering gives
+    // smaller classes preference. Computing how many iterations
+    // are needed is O(N) and N is the count of exact queues
+    // (typically 8-12).
+    let sorted_indices: Vec<usize> = root.exact_queues_by_rate_ascending.clone();
+    for queue_idx in sorted_indices {
+        let queue = &mut root.queues[queue_idx];
+        if cos_queue_is_empty(queue)
+            || !queue.hot.runnable
+            || !queue.config.guarantee_enabled
+            || !queue.config.exact
+        {
+            continue;
+        }
+        let top_up = maybe_top_up_cos_queue_lease(
+            queue,
+            queue_fast_path
+                .get(queue_idx)
+                .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref()),
+            now_ns,
+        );
+        lease_telemetry.add_assign(top_up);
+        let Some(head) = cos_queue_front(queue) else {
+            continue;
+        };
+        let head_len = cos_item_len(head);
+        if root.tokens < head_len {
+            queue
+                .telemetry
+                .owner_profile
+                .drain_park_root_tokens
+                .fetch_add(1, Ordering::Relaxed);
+            if queue.config.surplus_sharing {
+                continue;
+            }
+            if let Some(wake_tick) = estimate_cos_queue_wakeup_tick(
+                root.tokens,
+                root.shaping_rate_bytes,
+                queue.hot.tokens,
+                queue.transmit_rate_bytes(),
+                head_len,
+                now_ns,
+                true,
+            ) {
+                count_park_reason(root, queue_idx, ParkReason::RootTokenStarvation);
+                park_cos_queue(root, queue_idx, wake_tick);
+            }
+            continue;
+        }
+        if queue.hot.tokens < head_len {
+            queue
+                .telemetry
+                .owner_profile
+                .drain_park_queue_tokens
+                .fetch_add(1, Ordering::Relaxed);
+            if queue.config.surplus_sharing {
+                continue;
+            }
+            if let Some(wake_tick) = estimate_cos_queue_wakeup_tick(
+                root.tokens,
+                root.shaping_rate_bytes,
+                queue.hot.tokens,
+                queue.transmit_rate_bytes(),
+                head_len,
+                now_ns,
+                true,
+            ) {
+                count_park_reason(root, queue_idx, ParkReason::QueueTokenStarvation);
+                park_cos_queue(root, queue_idx, wake_tick);
+            }
+            continue;
+        }
+        // Picked: advance exact_guarantee_rr to one past this queue
+        // for telemetry parity with the legacy selector. The
+        // GuaranteeRate selector does not use the cursor for
+        // selection (sorted order does that), but telemetry that
+        // surfaces `exact_guarantee_rr` should still reflect the
+        // last-serviced queue.
+        root.exact_guarantee_rr = (queue_idx + 1) % queue_count;
         let secondary_budget = queue
             .hot
             .tokens

@@ -869,6 +869,118 @@ func TestSchedulerSurplusSharingWithoutExactWarnsAndStrips(t *testing.T) {
 	}
 }
 
+// #1614 A4: ValidateConfig emits an operator-visible warning when
+// the sum of exact-class transmit-rates on an interface unit exceeds
+// the unit's shaping-rate. The warning surfaces the oversubscription
+// policy (proportional default vs guarantee-rate opt-in) so operators
+// see which distribution will actually apply.
+func TestValidateCoSOversubscriptionWarning(t *testing.T) {
+	lines := []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service forwarding-classes queue 1 iperf-a",
+		"set class-of-service forwarding-classes queue 2 iperf-b",
+		"set class-of-service schedulers iperf-a transmit-rate 12g",
+		"set class-of-service schedulers iperf-a transmit-rate exact",
+		"set class-of-service schedulers iperf-b transmit-rate 9g",
+		"set class-of-service schedulers iperf-b transmit-rate exact",
+		"set class-of-service scheduler-maps edge-map forwarding-class iperf-a scheduler iperf-a",
+		"set class-of-service scheduler-maps edge-map forwarding-class iperf-b scheduler iperf-b",
+		"set class-of-service interfaces ge-0/0/2 unit 80 shaping-rate 10g",
+		"set class-of-service interfaces ge-0/0/2 unit 80 scheduler-map edge-map",
+		"set system dataplane-type userspace",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	// Sum of exact rates is 21g, shaping is 10g — warning must fire.
+	gotWarn := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "sum of exact-class transmit-rates") &&
+			strings.Contains(w, "ge-0/0/2") &&
+			strings.Contains(w, "proportional") {
+			gotWarn = true
+			break
+		}
+	}
+	if !gotWarn {
+		t.Fatalf("expected oversubscription warning on cfg.Warnings; got: %v",
+			cfg.Warnings)
+	}
+}
+
+// #1614 A4: oversubscription warning surfaces the active policy name
+// when the operator has opted into guarantee-rate mode.
+func TestValidateCoSOversubscriptionWarningGuaranteeRate(t *testing.T) {
+	lines := []string{
+		"set class-of-service forwarding-classes queue 1 iperf-a",
+		"set class-of-service forwarding-classes queue 2 iperf-b",
+		"set class-of-service schedulers iperf-a transmit-rate 12g",
+		"set class-of-service schedulers iperf-a transmit-rate exact",
+		"set class-of-service schedulers iperf-b transmit-rate 9g",
+		"set class-of-service schedulers iperf-b transmit-rate exact",
+		"set class-of-service scheduler-maps edge-map forwarding-class iperf-a scheduler iperf-a",
+		"set class-of-service scheduler-maps edge-map forwarding-class iperf-b scheduler iperf-b",
+		"set class-of-service interfaces ge-0/0/2 unit 80 shaping-rate 10g",
+		"set class-of-service interfaces ge-0/0/2 unit 80 scheduler-map edge-map",
+		"set class-of-service interfaces ge-0/0/2 unit 80 oversubscription-policy guarantee-rate 0.7",
+		"set system dataplane-type userspace",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	gotWarn := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "sum of exact-class transmit-rates") &&
+			strings.Contains(w, "guarantee-rate 0.7") {
+			gotWarn = true
+			break
+		}
+	}
+	if !gotWarn {
+		t.Fatalf("expected guarantee-rate warning on cfg.Warnings; got: %v",
+			cfg.Warnings)
+	}
+	// Verify the parsed policy threaded through to the typed config.
+	iface := cfg.ClassOfService.Interfaces["ge-0/0/2"]
+	if iface == nil {
+		t.Fatal("interface ge-0/0/2 missing")
+	}
+	unit := iface.Units[80]
+	if unit == nil {
+		t.Fatal("unit 80 missing")
+	}
+	if unit.OversubscriptionPolicy != "guarantee-rate" {
+		t.Fatalf("expected OversubscriptionPolicy=guarantee-rate; got %q",
+			unit.OversubscriptionPolicy)
+	}
+	if unit.OversubscriptionGuaranteeFraction != 0.7 {
+		t.Fatalf("expected OversubscriptionGuaranteeFraction=0.7; got %f",
+			unit.OversubscriptionGuaranteeFraction)
+	}
+}
+
 func TestValidateClassOfServiceWarnings(t *testing.T) {
 	input := `class-of-service {
     forwarding-classes {

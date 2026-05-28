@@ -41,6 +41,7 @@ fn vmin_pop_snapshot_does_not_publish() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -103,6 +104,7 @@ fn vmin_post_settle_publish_writes_committed_vtime() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -147,6 +149,7 @@ fn vmin_publish_helper_noop_when_floor_none() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -183,6 +186,7 @@ fn vmin_throttle_function_fires_on_lag_breach() {
             surplus_weight: 1,
             buffer_bytes: 4 * 1024 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -229,6 +233,7 @@ fn vmin_throttle_increments_v_min_throttles_scratch() {
             surplus_weight: 1,
             buffer_bytes: 4 * 1024 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -288,6 +293,7 @@ fn vmin_hard_cap_override_does_not_double_count_throttle() {
             surplus_weight: 1,
             buffer_bytes: 4 * 1024 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -341,6 +347,7 @@ fn vmin_pop_rollback_repop_postsettle_compose() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -433,6 +440,7 @@ fn vmin_demote_no_drain_all_leak() {
             surplus_weight: 1,
             buffer_bytes: 4 * 1024 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -514,6 +522,7 @@ fn vmin_vacate_on_bucket_empty() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -570,6 +579,7 @@ fn vmin_vacate_only_when_last_bucket_empties() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -631,6 +641,7 @@ fn vmin_hard_cap_force_continue_activates_suspension() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -684,6 +695,7 @@ fn vmin_consume_suspension_decrements_once() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -723,6 +735,7 @@ fn vmin_suspension_not_decremented_on_empty_tx_frames() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -768,6 +781,7 @@ fn vmin_hard_cap_counter_resets_on_success() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -807,6 +821,7 @@ fn vmin_no_first_enqueue_publish() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -847,6 +862,7 @@ fn vmin_prepared_flow_fair_throttle_and_suspension() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -926,6 +942,7 @@ fn vmin_prepared_no_suspension_burn_when_head_is_local() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -979,6 +996,7 @@ fn vmin_prepared_drain_arms_hard_cap_after_repeated_throttle() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1083,6 +1101,7 @@ fn vmin_prepared_drain_unblocks_when_peer_slot_vacates() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1168,6 +1187,7 @@ fn vmin_local_hard_cap_suspension_carries_into_prepared_drain() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];

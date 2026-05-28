@@ -206,7 +206,11 @@ fn build_cos_owner_worker_by_queue_prefers_lowest_worker_with_tx_binding() {
                 surplus_weight: 1,
                 buffer_bytes: 64 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             }],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
     forwarding.egress.insert(
@@ -262,6 +266,7 @@ fn build_cos_owner_worker_by_queue_spreads_queues_across_eligible_workers() {
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 CoSQueueConfig {
                     queue_id: 1,
@@ -275,6 +280,7 @@ fn build_cos_owner_worker_by_queue_spreads_queues_across_eligible_workers() {
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 CoSQueueConfig {
                     queue_id: 2,
@@ -288,8 +294,12 @@ fn build_cos_owner_worker_by_queue_spreads_queues_across_eligible_workers() {
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
             ],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
     forwarding.egress.insert(
@@ -347,6 +357,7 @@ fn build_cos_owner_worker_by_queue_prefers_ready_workers_when_available() {
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 CoSQueueConfig {
                     queue_id: 4,
@@ -360,8 +371,12 @@ fn build_cos_owner_worker_by_queue_prefers_ready_workers_when_available() {
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
             ],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
     forwarding.egress.insert(
@@ -417,7 +432,11 @@ fn build_cos_owner_worker_by_queue_falls_back_when_no_ready_workers_exist() {
                 surplus_weight: 1,
                 buffer_bytes: 64 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             }],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
     forwarding.egress.insert(
@@ -579,6 +598,7 @@ fn build_shared_cos_root_leases_uses_active_workers_per_interface() {
                     surplus_weight: 1,
                     buffer_bytes: 128 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 CoSQueueConfig {
                     queue_id: 1,
@@ -592,8 +612,12 @@ fn build_shared_cos_root_leases_uses_active_workers_per_interface() {
                     surplus_weight: 1,
                     buffer_bytes: 128 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
             ],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
     let active_shards_by_egress_ifindex = BTreeMap::from([(80, 2usize)]);
@@ -661,7 +685,11 @@ fn build_shared_cos_root_leases_reuses_existing_matching_lease_arc() {
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             }],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
     let active_shards_by_egress_ifindex = BTreeMap::from([(80, 1usize)]);
@@ -705,7 +733,11 @@ fn build_shared_cos_queue_leases_reuses_existing_matching_lease_arc() {
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             }],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
     let active_shards_by_egress_ifindex = BTreeMap::from([(80, 2usize)]);
@@ -755,7 +787,11 @@ fn build_shared_cos_queue_leases_rebuilds_when_equal_flow_mode_toggles() {
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             }],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
     let active_shards_by_egress_ifindex = BTreeMap::from([(80, 2usize)]);
@@ -816,6 +852,7 @@ fn refresh_cos_owner_worker_map_from_binding_statuses_keeps_shared_arcs_when_unc
                     surplus_weight: 1,
                     buffer_bytes: 128 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 CoSQueueConfig {
                     queue_id: 1,
@@ -829,8 +866,12 @@ fn refresh_cos_owner_worker_map_from_binding_statuses_keeps_shared_arcs_when_unc
                     surplus_weight: 1,
                     buffer_bytes: 128 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
             ],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
     coordinator.forwarding.egress.insert(

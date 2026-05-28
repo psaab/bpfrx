@@ -431,6 +431,9 @@ mod tests {
             ieee8021_queue_by_pcp: [u8::MAX; 8],
             queue_by_forwarding_class: FastMap::default(),
             queues: Vec::new(),
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         }
     }
 

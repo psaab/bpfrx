@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::afxdp::tx::test_support::*;
-use crate::afxdp::types::{CoSQueueConfig, FastMap};
+use crate::afxdp::types::{CoSOversubscriptionPolicy, CoSQueueConfig, FastMap};
 
 // #915: build_cos_interface_runtime must propagate the
 // surplus_sharing flag from CoSQueueConfig to the runtime.
@@ -35,6 +35,7 @@ fn build_cos_interface_runtime_propagates_surplus_sharing() {
                     surplus_weight: 1,
                     buffer_bytes: COS_MIN_BURST_BYTES,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 CoSQueueConfig {
                     queue_id: 5,
@@ -48,8 +49,12 @@ fn build_cos_interface_runtime_propagates_surplus_sharing() {
                     surplus_weight: 1,
                     buffer_bytes: COS_MIN_BURST_BYTES,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
             ],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
         1_000_000_000,
     );
@@ -99,7 +104,11 @@ fn build_cos_interface_runtime_starts_exact_queue_with_zero_local_tokens() {
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             }],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
         1_000_000_000,
     );
@@ -133,6 +142,7 @@ fn build_cos_interface_runtime_leaves_flow_hash_seed_zero_until_promotion() {
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
             CoSQueueConfig {
                 queue_id: 5,
@@ -146,6 +156,7 @@ fn build_cos_interface_runtime_leaves_flow_hash_seed_zero_until_promotion() {
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
         ],
     );
@@ -183,7 +194,11 @@ fn build_cos_interface_runtime_zero_shaping_rate_starts_with_full_root_tokens() 
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             }],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
         1_000_000_000,
     );
@@ -224,7 +239,11 @@ fn build_cos_interface_runtime_zero_queue_rate_starts_with_full_queue_tokens() {
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             }],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
         1_000_000_000,
     );

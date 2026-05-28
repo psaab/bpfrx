@@ -142,6 +142,20 @@ type InterfaceSnapshot struct {
 	CoSDSCPClassifier         string                     `json:"cos_dscp_classifier,omitempty"`
 	CoSIEEE8021Classifier     string                     `json:"cos_ieee8021_classifier,omitempty"`
 	CoSDSCPRewriteRule        string                     `json:"cos_dscp_rewrite_rule,omitempty"`
+	// #1614 A1: operator-selectable oversubscription policy. "" or
+	// "proportional" (default) preserves current scheduler bit-for-
+	// bit (when CoSPriorityLowMinShareBytes is also 0). "guarantee-
+	// rate" activates the two-phase waterfill allocator using
+	// CoSOversubscriptionGuaranteeFraction.
+	CoSOversubscriptionPolicy string `json:"cos_oversubscription_policy,omitempty"`
+	// #1614 A1: Phase 1 budget fraction (0.0..1.0). Only meaningful
+	// when CoSOversubscriptionPolicy == "guarantee-rate". 0.0 makes
+	// the allocator a no-op even if the policy string is set.
+	CoSOversubscriptionGuaranteeFraction float64 `json:"cos_oversubscription_guarantee_fraction,omitempty"`
+	// #1614 A2: priority-low minimum share in bytes per second.
+	// Subtracted from effective scheduler cap before A1 runs
+	// (orthogonal to A1 policy choice). Default 0 (no min-share).
+	CoSPriorityLowMinShareBytes uint64 `json:"cos_priority_low_min_share_bytes,omitempty"`
 }
 
 type ClassOfServiceSnapshot struct {
@@ -208,6 +222,10 @@ type CoSSchedulerSnapshot struct {
 	// queue-lease equal-flow suppression on positive transmit-rate
 	// exact queues.
 	EqualFlowEnforcement bool `json:"equal_flow_enforcement,omitempty"`
+	// #1614 A3: per-queue CoDel target in nanoseconds. 0 disables
+	// CoDel for the queue (current default). Recommended >= 1.5x
+	// post-shaper RTT per AGY r2 finding #3.
+	CodelTargetNS uint64 `json:"codel_target_ns,omitempty"`
 }
 
 type CoSSchedulerMapSnapshot struct {

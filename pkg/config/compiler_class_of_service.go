@@ -251,6 +251,14 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 				sched.SurplusSharing = true
 			case "equal-flow-enforcement":
 				sched.EqualFlowEnforcement = true
+			case "codel-target":
+				// #1614 A3: value in milliseconds; store as
+				// nanoseconds. Empty value = 0 = disabled.
+				if v := nodeVal(child); v != "" {
+					if ms, err := strconv.ParseUint(v, 10, 64); err == nil {
+						sched.CodelTargetNS = ms * 1_000_000
+					}
+				}
 			}
 		}
 		cos.Schedulers[sched.Name] = sched
@@ -320,7 +328,66 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 					unit.DSCPRewriteRule = nodeVal(dscpNode)
 				}
 			}
-			if unit.ShapingRateBytes > 0 || unit.BurstSizeBytes > 0 || unit.SchedulerMap != "" || unit.DSCPClassifier != "" || unit.IEEE8021Classifier != "" || unit.DSCPRewriteRule != "" {
+			// #1614 A1: oversubscription-policy { guarantee-rate <X> | proportional }
+			//
+			// Junos set syntax `set ... oversubscription-policy guarantee-rate 0.7`
+			// produces a flat-keys leaf node whose Keys are
+			// ["oversubscription-policy", "guarantee-rate", "0.7"]. The
+			// hierarchical text shape produces a parent node with a
+			// child sub-node for "guarantee-rate" carrying "0.7" as a
+			// trailing key or leaf value. Handle both forms.
+			if oversubNode := unitNode.FindChild("oversubscription-policy"); oversubNode != nil {
+				// Flat-keys path: Keys = [policy_name, value, ...] all on
+				// the parent node.
+				if len(oversubNode.Keys) >= 2 && oversubNode.Keys[1] == "guarantee-rate" {
+					unit.OversubscriptionPolicy = "guarantee-rate"
+					if len(oversubNode.Keys) >= 3 {
+						if f, err := strconv.ParseFloat(oversubNode.Keys[2], 64); err == nil {
+							if f < 0 {
+								f = 0
+							} else if f > 1 {
+								f = 1
+							}
+							unit.OversubscriptionGuaranteeFraction = f
+						}
+					}
+				} else if len(oversubNode.Keys) >= 2 && oversubNode.Keys[1] == "proportional" {
+					unit.OversubscriptionPolicy = "proportional"
+				} else if grNode := oversubNode.FindChild("guarantee-rate"); grNode != nil {
+					// Hierarchical child-node path.
+					unit.OversubscriptionPolicy = "guarantee-rate"
+					var raw string
+					if v := nodeVal(grNode); v != "" {
+						raw = v
+					} else if len(grNode.Keys) >= 2 {
+						raw = grNode.Keys[len(grNode.Keys)-1]
+					}
+					if raw != "" {
+						if f, err := strconv.ParseFloat(raw, 64); err == nil {
+							if f < 0 {
+								f = 0
+							} else if f > 1 {
+								f = 1
+							}
+							unit.OversubscriptionGuaranteeFraction = f
+						}
+					}
+				} else if oversubNode.FindChild("proportional") != nil {
+					unit.OversubscriptionPolicy = "proportional"
+				} else if v := nodeVal(oversubNode); v != "" {
+					unit.OversubscriptionPolicy = v
+				}
+			}
+			// #1614 A2: priority-low-min-share <bps>
+			if minShareNode := unitNode.FindChild("priority-low-min-share"); minShareNode != nil {
+				if v := nodeVal(minShareNode); v != "" {
+					unit.PriorityLowMinShareBytes = parseBandwidthLimit(v)
+				}
+			}
+			if unit.ShapingRateBytes > 0 || unit.BurstSizeBytes > 0 || unit.SchedulerMap != "" ||
+				unit.DSCPClassifier != "" || unit.IEEE8021Classifier != "" ||
+				unit.DSCPRewriteRule != "" || unit.OversubscriptionPolicy != "" ||
+				unit.PriorityLowMinShareBytes > 0 {
 				iface.Units[unitID] = unit
 			}
 		}

@@ -59,6 +59,7 @@ fn nonexact_guarantee_skips_residual_only_scheduler_map_queue() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.tokens = 1500;
@@ -98,6 +99,7 @@ fn residual_and_exact_test_root(exact_surplus_sharing: bool) -> CoSInterfaceRunt
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
             CoSQueueConfig {
                 queue_id: 10,
@@ -111,6 +113,7 @@ fn residual_and_exact_test_root(exact_surplus_sharing: bool) -> CoSInterfaceRunt
                 surplus_weight: 16,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
         ],
     );
@@ -320,6 +323,7 @@ fn nonexact_guarantee_selects_explicit_transmit_rate_queue() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.tokens = 1500;
@@ -355,6 +359,7 @@ fn fallback_root_shaped_default_queue_has_guarantee_service() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.tokens = 1500;
@@ -657,6 +662,7 @@ fn guarantee_phase_limits_service_to_visit_quantum() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.tokens = 64 * 1024;
@@ -693,6 +699,7 @@ fn guarantee_phase_allows_larger_high_rate_visit_quantum() {
             surplus_weight: 1,
             buffer_bytes: 256 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.tokens = 256 * 1024;
@@ -742,6 +749,7 @@ fn guarantee_phase_quantum_scales_with_rate() {
             surplus_weight: 1,
             buffer_bytes: 256 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let low_rate = test_cos_runtime_with_queues(
@@ -758,6 +766,7 @@ fn guarantee_phase_quantum_scales_with_rate() {
             surplus_weight: 1,
             buffer_bytes: 256 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let high_q = cos_guarantee_quantum_bytes(&high_rate.queues[0]);
@@ -785,6 +794,7 @@ fn guarantee_phase_rotates_between_backlogged_queues() {
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
             CoSQueueConfig {
                 queue_id: 1,
@@ -798,6 +808,7 @@ fn guarantee_phase_rotates_between_backlogged_queues() {
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
         ],
     );
@@ -975,6 +986,7 @@ fn guarantee_rr_cursors_start_at_zero_after_runtime_build() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     assert_eq!(root.exact_guarantee_rr, 0);
@@ -999,6 +1011,7 @@ fn surplus_phase_prefers_higher_priority_queue() {
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
             CoSQueueConfig {
                 queue_id: 1,
@@ -1012,6 +1025,7 @@ fn surplus_phase_prefers_higher_priority_queue() {
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
         ],
     );
@@ -1051,6 +1065,7 @@ fn surplus_phase_applies_weighted_same_priority_sharing() {
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
             CoSQueueConfig {
                 queue_id: 1,
@@ -1064,6 +1079,7 @@ fn surplus_phase_applies_weighted_same_priority_sharing() {
                 surplus_weight: 4,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
         ],
     );
@@ -1131,6 +1147,7 @@ fn apply_promotion_pairs_queues_with_their_fast_path_entries() {
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
             CoSQueueConfig {
                 queue_id: 5,
@@ -1144,6 +1161,7 @@ fn apply_promotion_pairs_queues_with_their_fast_path_entries() {
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
         ],
     );
@@ -1196,6 +1214,7 @@ fn equal_flow_cap_reaches_drain_shaped_tx_entry_path() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.tokens = 100_000;
@@ -1416,6 +1435,7 @@ fn drain_exact_local_fifo_items_to_scratch_keeps_queue_until_commit() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -1508,6 +1528,7 @@ fn drain_exact_local_fifo_drops_mirror_clone_before_tx_reserve() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     cos_queue_push_back(
@@ -1566,6 +1587,7 @@ fn release_exact_local_scratch_frames_preserves_queue_after_failed_submit() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -1640,6 +1662,7 @@ fn settle_exact_local_fifo_submission_pops_only_committed_prefix() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -1746,6 +1769,7 @@ fn release_exact_prepared_scratch_preserves_queue_after_failed_submit() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -1809,6 +1833,7 @@ fn settle_exact_prepared_fifo_submission_pops_only_committed_prefix() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -1998,6 +2023,7 @@ fn restore_cos_local_items_marks_queue_runnable_after_retry() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         },
         hot: crate::afxdp::types::CoSQueueHotState {
             surplus_deficit: 0,
@@ -2063,6 +2089,7 @@ fn restore_cos_prepared_items_marks_queue_runnable_after_retry() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         },
         hot: crate::afxdp::types::CoSQueueHotState {
             surplus_deficit: 0,
@@ -2161,4 +2188,88 @@ fn estimate_cos_queue_wakeup_tick_root_rate_zero_with_require_queue_false() {
         1500, 0, false,
     );
     assert!(wake_tick.is_some());
+}
+
+// #1614 A1: waterfill selector tests.
+
+#[test]
+fn waterfill_default_proportional_mode_uses_legacy_rr() {
+    // Default oversubscription_policy (Proportional) + fraction 0
+    // must bypass the new waterfill and use legacy RR cursor. The
+    // selector advances `exact_guarantee_rr` per call.
+    let mut root = test_mixed_class_root_with_primed_queues();
+    for queue in &mut root.queues {
+        if queue.config.exact {
+            queue.hot.tokens = 128 * 1024;
+        }
+    }
+    assert!(matches!(
+        root.oversubscription_policy,
+        CoSOversubscriptionPolicy::Proportional
+    ));
+    assert_eq!(root.oversubscription_guarantee_fraction, 0.0);
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+    let s1 = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("selection 1");
+    let s2 = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("selection 2");
+    // Legacy RR walks exact queues 0 → 2 → 0 → 2.
+    assert_eq!(s1.queue_idx, 0);
+    assert_eq!(s2.queue_idx, 2);
+}
+
+#[test]
+fn waterfill_guarantee_rate_mode_picks_smallest_rate_first() {
+    // GuaranteeRate mode with fraction > 0 routes to the waterfill
+    // selector which iterates `exact_queues_by_rate_ascending`.
+    // With two exact queues at SAME slow_rate (test_mixed_class
+    // fixture), sorted-stable preserves queue_id order so the
+    // smaller-queue_idx is selected first.
+    let mut root = test_mixed_class_root_with_primed_queues();
+    root.oversubscription_policy = CoSOversubscriptionPolicy::GuaranteeRate;
+    root.oversubscription_guarantee_fraction = 0.7;
+    // Build the sorted vector now (in production this happens at
+    // config-apply time).
+    root.exact_queues_by_rate_ascending = (0..root.queues.len())
+        .filter(|&idx| root.queues[idx].config.exact && root.queues[idx].config.guarantee_enabled)
+        .collect();
+    root.exact_queues_by_rate_ascending
+        .sort_by_key(|&idx| root.queues[idx].config.transmit_rate_bytes);
+    for queue in &mut root.queues {
+        if queue.config.exact {
+            queue.hot.tokens = 128 * 1024;
+        }
+    }
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+    let s1 = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("selection 1");
+    // Both exact queues have the same slow_rate; stable-sorted order
+    // preserves queue_idx ascending, so queue_idx 0 picks first.
+    assert_eq!(s1.queue_idx, 0);
+}
+
+#[test]
+fn waterfill_guarantee_rate_skips_non_exact_queues() {
+    // The waterfill iterates only over exact queues (via
+    // exact_queues_by_rate_ascending). Non-exact queues are
+    // unaffected.
+    let mut root = test_mixed_class_root_with_primed_queues();
+    root.oversubscription_policy = CoSOversubscriptionPolicy::GuaranteeRate;
+    root.oversubscription_guarantee_fraction = 0.5;
+    root.exact_queues_by_rate_ascending = (0..root.queues.len())
+        .filter(|&idx| root.queues[idx].config.exact && root.queues[idx].config.guarantee_enabled)
+        .collect();
+    for queue in &mut root.queues {
+        if queue.config.exact {
+            queue.hot.tokens = 128 * 1024;
+        }
+    }
+    // Drain both exact queues entirely.
+    for _ in 0..4 {
+        let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+        let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel);
+    }
+    // After draining exacts, non-exact selector still works.
+    let batch = select_nonexact_cos_guarantee_batch(&mut root, 1);
+    assert!(batch.is_some(), "non-exact RR must remain reachable");
 }

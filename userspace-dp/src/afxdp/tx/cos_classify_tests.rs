@@ -29,6 +29,7 @@ fn resolve_cos_queue_idx_rejects_explicit_queue_miss() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
 
@@ -52,6 +53,7 @@ fn enqueue_exact_queue_publishes_shared_backlog_slot() {
             surplus_weight: 1,
             buffer_bytes: 4_000_000,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let mut fast_interfaces = test_cos_fast_interfaces(
@@ -261,6 +263,7 @@ fn cos_queue_accepts_prepared_when_queue_is_prepared_only() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -307,6 +310,7 @@ fn demote_prepared_cos_queue_to_local_recycles_frames_and_blocks_prepared_append
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -404,6 +408,7 @@ fn demote_prepared_cos_queue_to_local_preserves_mqfq_frontier() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -556,6 +561,7 @@ fn demote_prepared_cos_queue_to_local_skips_non_exact_queue() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -665,6 +671,7 @@ fn resolve_cos_queue_id_prefers_egress_output_filter_forwarding_class() {
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -675,6 +682,7 @@ fn resolve_cos_queue_id_prefers_egress_output_filter_forwarding_class() {
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -768,6 +776,7 @@ fn resolve_cos_queue_id_uses_reverse_output_source_port_filter() {
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "scheduler-iperf-a".into(),
@@ -778,6 +787,7 @@ fn resolve_cos_queue_id_uses_reverse_output_source_port_filter() {
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -916,6 +926,7 @@ fn resolve_cached_cos_tx_selection_prefers_egress_output_filter_and_keeps_counte
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -926,6 +937,7 @@ fn resolve_cached_cos_tx_selection_prefers_egress_output_filter_and_keeps_counte
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -1033,6 +1045,7 @@ fn resolve_cos_queue_id_uses_ingress_input_filter_when_no_output_filter_exists()
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -1043,6 +1056,7 @@ fn resolve_cos_queue_id_uses_ingress_input_filter_when_no_output_filter_exists()
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -1146,6 +1160,7 @@ fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exis
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -1156,6 +1171,7 @@ fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exis
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -1243,6 +1259,7 @@ fn resolve_cached_cos_tx_selection_keeps_counter_only_output_filter_hits() {
                 buffer_size_percent: 0.0,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+            codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -1323,6 +1340,7 @@ fn resolve_cos_tx_selection_counts_counter_only_output_filter_hits() {
                 buffer_size_percent: 0.0,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+            codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -1534,6 +1552,7 @@ fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filt
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -1544,6 +1563,7 @@ fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filt
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -1641,6 +1661,7 @@ fn resolve_cos_tx_selection_skips_ingress_filter_without_tx_selection_effects() 
                 buffer_size_percent: 0.0,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+            codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -1784,6 +1805,7 @@ fn resolve_cos_queue_id_falls_back_to_default_queue_without_filter_match() {
                 buffer_size_percent: 0.0,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+            codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -1867,6 +1889,7 @@ fn resolve_cos_queue_id_uses_dscp_classifier_when_filters_do_not_set_class() {
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "voice-sched".into(),
@@ -1877,6 +1900,7 @@ fn resolve_cos_queue_id_uses_dscp_classifier_when_filters_do_not_set_class() {
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
             ],
         }),
@@ -1961,6 +1985,7 @@ fn resolve_cos_queue_id_uses_ieee8021_classifier_when_filters_do_not_set_class()
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "voice-sched".into(),
@@ -1971,6 +1996,7 @@ fn resolve_cos_queue_id_uses_ieee8021_classifier_when_filters_do_not_set_class()
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
             ],
             ..Default::default()
@@ -2057,6 +2083,7 @@ fn resolve_cos_queue_id_does_not_use_ieee8021_classifier_for_untagged_packets() 
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "bulk-sched".into(),
@@ -2067,6 +2094,7 @@ fn resolve_cos_queue_id_does_not_use_ieee8021_classifier_for_untagged_packets() 
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
             ],
             ..Default::default()
@@ -2180,6 +2208,7 @@ fn resolve_cos_queue_id_preserves_ingress_classification_when_output_filter_has_
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -2190,6 +2219,7 @@ fn resolve_cos_queue_id_preserves_ingress_classification_when_output_filter_has_
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -2279,6 +2309,7 @@ fn resolve_cos_tx_selection_preserves_output_filter_dscp_rewrite_without_forward
                 buffer_size_percent: 0.0,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+            codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),

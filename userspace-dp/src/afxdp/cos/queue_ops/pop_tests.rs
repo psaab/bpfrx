@@ -51,6 +51,7 @@ fn flow_fair_exact_queue_limits_dominant_flow_share() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -138,6 +139,7 @@ fn flow_fair_queue_pops_in_virtual_finish_order_local() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -221,6 +223,7 @@ fn flow_fair_queue_mqfq_bytes_rate_fair_on_mixed_packet_sizes() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -337,6 +340,7 @@ fn mqfq_golden_vector_pop_order_vs_drr() {
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             }],
         );
         let queue = &mut root.queues[0];
@@ -407,6 +411,7 @@ fn mqfq_idle_flow_reanchors_at_frontier_not_zero() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -466,6 +471,7 @@ fn flow_fair_queue_pops_in_virtual_finish_order_prepared() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -515,6 +521,7 @@ fn mqfq_enqueue_bumps_finish_time_by_byte_count() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -579,6 +586,7 @@ fn mqfq_bucket_drain_resets_finish_time() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -640,6 +648,7 @@ fn mqfq_queue_vtime_tracks_served_finish_time() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -708,6 +717,7 @@ fn mqfq_vtime_does_not_accumulate_across_flows() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -800,6 +810,7 @@ fn mqfq_scratch_drop_preserves_vtime_for_multi_survivor_restore() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -984,6 +995,7 @@ fn mqfq_same_bucket_multipop_drop_preserves_dropped_item_finish() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1070,6 +1082,7 @@ fn mqfq_drained_bucket_orphan_drop_preserves_served_finish() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1184,6 +1197,7 @@ fn mqfq_shared_exact_admission_downgrades_to_aggregate() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1242,6 +1256,7 @@ fn mqfq_push_front_is_finish_time_neutral_on_active_bucket() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1334,6 +1349,7 @@ fn mqfq_push_front_is_neutral_on_drained_bucket_round_trip() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1451,6 +1467,7 @@ fn mqfq_batched_rollback_restores_queue_vtime() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1595,6 +1612,7 @@ fn mqfq_batched_rollback_across_multiple_buckets() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1766,6 +1784,7 @@ fn mqfq_pop_snapshot_stack_bounded_to_tx_batch_size() {
             surplus_weight: 1,
             buffer_bytes: 8 * 1024 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1869,6 +1888,7 @@ fn mqfq_drain_all_teardown_clears_stack() {
             surplus_weight: 1,
             buffer_bytes: 8 * 1024 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -1944,6 +1964,7 @@ fn mqfq_brief_idle_reentry_exercises_both_max_arms() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];

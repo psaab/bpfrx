@@ -52,6 +52,7 @@ fn reset_binding_cos_runtime_mirrors_drops_to_binding_cos_counter() {
             surplus_weight: 1,
             buffer_bytes: 4_000_000,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     cos_queue_push_back(&mut root.queues[0], test_flow_cos_item(5201, 128));
@@ -101,6 +102,7 @@ fn reset_binding_cos_runtime_clears_shared_exact_backlog_slot() {
             surplus_weight: 1,
             buffer_bytes: 4_000_000,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
     );
     cos_queue_push_back(&mut root.queues[0], test_flow_cos_item(5201, 128));
@@ -162,7 +164,11 @@ fn build_worker_cos_statuses_aggregates_runtime_by_interface_and_queue() {
                 surplus_weight: 1,
                 buffer_bytes: 32 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             }],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
 
@@ -176,6 +182,12 @@ fn build_worker_cos_statuses_aggregates_runtime_by_interface_and_queue() {
             default_queue: 0,
             nonempty_queues: 1,
             runnable_queues: usize::from(runnable),
+            oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+            oversubscription_guarantee_fraction: 0.0,
+            priority_low_min_share_bytes: 0,
+            priority_low_reserved_tokens: 0,
+            priority_low_last_refill_ns: 0,
+            exact_queues_by_rate_ascending: Vec::new(),
             exact_guarantee_rr: 0,
             nonexact_guarantee_rr: 0,
             #[cfg(test)]
@@ -194,6 +206,7 @@ fn build_worker_cos_statuses_aggregates_runtime_by_interface_and_queue() {
                     surplus_weight: 1,
                     buffer_bytes: 32 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 hot: crate::afxdp::types::CoSQueueHotState {
                     surplus_deficit: 512,
@@ -318,7 +331,11 @@ fn build_worker_cos_statuses_sums_owner_profile_without_breaking_hist_invariant(
                 surplus_weight: 1,
                 buffer_bytes: 32 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             }],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
 
@@ -331,6 +348,12 @@ fn build_worker_cos_statuses_sums_owner_profile_without_breaking_hist_invariant(
         default_queue: 0,
         nonempty_queues: 1,
         runnable_queues: 1,
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
+        priority_low_reserved_tokens: 0,
+        priority_low_last_refill_ns: 0,
+        exact_queues_by_rate_ascending: Vec::new(),
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -349,6 +372,7 @@ fn build_worker_cos_statuses_sums_owner_profile_without_breaking_hist_invariant(
                 surplus_weight: 1,
                 buffer_bytes: 32 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
             hot: crate::afxdp::types::CoSQueueHotState {
                 surplus_deficit: 0,
@@ -507,6 +531,7 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
                     surplus_weight: 1,
                     buffer_bytes: 32 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 CoSQueueConfig {
                     queue_id: 4,
@@ -520,6 +545,7 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 CoSQueueConfig {
                     queue_id: 5,
@@ -533,8 +559,12 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
                     surplus_weight: 1,
                     buffer_bytes: 128 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
             ],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
 
@@ -547,6 +577,12 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
         default_queue: 0,
         nonempty_queues: 0,
         runnable_queues: 0,
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
+        priority_low_reserved_tokens: 0,
+        priority_low_last_refill_ns: 0,
+        exact_queues_by_rate_ascending: Vec::new(),
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -566,6 +602,7 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
                     surplus_weight: 1,
                     buffer_bytes: 32 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 hot: crate::afxdp::types::CoSQueueHotState {
                     surplus_deficit: 0,
@@ -609,6 +646,7 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 hot: crate::afxdp::types::CoSQueueHotState {
                     surplus_deficit: 0,
@@ -652,6 +690,7 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
                     surplus_weight: 1,
                     buffer_bytes: 128 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 hot: crate::afxdp::types::CoSQueueHotState {
                     surplus_deficit: 0,
@@ -781,6 +820,7 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_exact_
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 CoSQueueConfig {
                     queue_id: 6,
@@ -796,8 +836,12 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_exact_
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
             ],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
 
@@ -810,6 +854,12 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_exact_
         default_queue: 4,
         nonempty_queues: 0,
         runnable_queues: 0,
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
+        priority_low_reserved_tokens: 0,
+        priority_low_last_refill_ns: 0,
+        exact_queues_by_rate_ascending: Vec::new(),
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -829,6 +879,7 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_exact_
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 hot: crate::afxdp::types::CoSQueueHotState {
                     surplus_deficit: 0,
@@ -872,6 +923,7 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_exact_
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 hot: crate::afxdp::types::CoSQueueHotState {
                     surplus_deficit: 0,
@@ -978,7 +1030,11 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_interf
             surplus_weight: 1,
             buffer_bytes: 64 * 1024,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
+    oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+    oversubscription_guarantee_fraction: 0.0,
+    priority_low_min_share_bytes: 0,
     };
     forwarding.cos.interfaces.insert(80, make_iface_config());
     forwarding.cos.interfaces.insert(81, make_iface_config());
@@ -992,6 +1048,12 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_interf
         default_queue: 4,
         nonempty_queues: 0,
         runnable_queues: 0,
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
+        priority_low_reserved_tokens: 0,
+        priority_low_last_refill_ns: 0,
+        exact_queues_by_rate_ascending: Vec::new(),
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -1010,6 +1072,7 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_interf
                 surplus_weight: 1,
                 buffer_bytes: 64 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             },
             hot: crate::afxdp::types::CoSQueueHotState {
                 surplus_deficit: 0,
@@ -1148,6 +1211,7 @@ fn build_worker_cos_statuses_surfaces_distinct_per_queue_drain_telemetry() {
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 CoSQueueConfig {
                     queue_id: 6,
@@ -1163,8 +1227,12 @@ fn build_worker_cos_statuses_surfaces_distinct_per_queue_drain_telemetry() {
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
             ],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
 
@@ -1177,6 +1245,12 @@ fn build_worker_cos_statuses_surfaces_distinct_per_queue_drain_telemetry() {
         default_queue: 0,
         nonempty_queues: 0,
         runnable_queues: 0,
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
+        priority_low_reserved_tokens: 0,
+        priority_low_last_refill_ns: 0,
+        exact_queues_by_rate_ascending: Vec::new(),
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -1196,6 +1270,7 @@ fn build_worker_cos_statuses_surfaces_distinct_per_queue_drain_telemetry() {
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 hot: crate::afxdp::types::CoSQueueHotState {
                     surplus_deficit: 0,
@@ -1239,6 +1314,7 @@ fn build_worker_cos_statuses_surfaces_distinct_per_queue_drain_telemetry() {
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 hot: crate::afxdp::types::CoSQueueHotState {
                     surplus_deficit: 0,
@@ -1385,6 +1461,7 @@ fn build_worker_cos_fast_interfaces_flattens_owner_and_lease_state() {
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 CoSQueueConfig {
                     queue_id: 5,
@@ -1398,8 +1475,12 @@ fn build_worker_cos_fast_interfaces_flattens_owner_and_lease_state() {
                     surplus_weight: 1,
                     buffer_bytes: 128 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
             ],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
     forwarding.egress.insert(
@@ -1504,6 +1585,7 @@ fn build_worker_cos_fast_interfaces_keeps_low_rate_exact_queue_owner_local() {
                     surplus_weight: 1,
                     buffer_bytes: 128 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 CoSQueueConfig {
                     queue_id: 5,
@@ -1517,8 +1599,12 @@ fn build_worker_cos_fast_interfaces_keeps_low_rate_exact_queue_owner_local() {
                     surplus_weight: 1,
                     buffer_bytes: 128 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
             ],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
     forwarding.egress.insert(
@@ -1624,7 +1710,11 @@ fn build_worker_cos_fast_interfaces_high_iface_rate_shards_mid_rate_exact_queue(
                 surplus_weight: 1,
                 buffer_bytes: 256 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             }],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
     forwarding.egress.insert(
@@ -1741,6 +1831,7 @@ fn build_worker_cos_fast_interfaces_matches_live_loss_ha_3_queue_shape() {
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 CoSQueueConfig {
                     queue_id: 4,
@@ -1754,6 +1845,7 @@ fn build_worker_cos_fast_interfaces_matches_live_loss_ha_3_queue_shape() {
                     surplus_weight: 1,
                     buffer_bytes: 128 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 CoSQueueConfig {
                     queue_id: 5,
@@ -1767,8 +1859,12 @@ fn build_worker_cos_fast_interfaces_matches_live_loss_ha_3_queue_shape() {
                     surplus_weight: 1,
                     buffer_bytes: 256 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
             ],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
     forwarding.egress.insert(
@@ -1897,6 +1993,9 @@ fn test_cos_iface_with_rate(shaping_bits: u64) -> CoSInterfaceConfig {
         ieee8021_queue_by_pcp: [u8::MAX; 8],
         queue_by_forwarding_class: FastMap::default(),
         queues: Vec::new(),
+    oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+    oversubscription_guarantee_fraction: 0.0,
+    priority_low_min_share_bytes: 0,
     }
 }
 
@@ -1913,6 +2012,7 @@ fn test_exact_queue_at_rate(queue_id: u8, rate_bits: u64) -> CoSQueueConfig {
         surplus_weight: 1,
         buffer_bytes: 64 * 1024,
         dscp_rewrite: None,
+    codel_target_ns: 0,
     }
 }
 
@@ -2142,7 +2242,11 @@ fn cos_runtime_config_changed_detects_queue_rate_change() {
             surplus_weight: 1,
             buffer_bytes: 1_000_000,
             dscp_rewrite: None,
+        codel_target_ns: 0,
         }],
+    oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+    oversubscription_guarantee_fraction: 0.0,
+    priority_low_min_share_bytes: 0,
     };
     let mut current = ForwardingState::default();
     current.cos.interfaces.insert(12, iface.clone());
@@ -2194,7 +2298,11 @@ fn active_flow_buckets_peak_is_max_not_sum_across_workers() {
                 surplus_weight: 1,
                 buffer_bytes: 32 * 1024,
                 dscp_rewrite: None,
+            codel_target_ns: 0,
             }],
+        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+        oversubscription_guarantee_fraction: 0.0,
+        priority_low_min_share_bytes: 0,
         },
     );
 
@@ -2210,6 +2318,12 @@ fn active_flow_buckets_peak_is_max_not_sum_across_workers() {
             default_queue: 0,
             nonempty_queues: 0,
             runnable_queues: 0,
+            oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+            oversubscription_guarantee_fraction: 0.0,
+            priority_low_min_share_bytes: 0,
+            priority_low_reserved_tokens: 0,
+            priority_low_last_refill_ns: 0,
+            exact_queues_by_rate_ascending: Vec::new(),
             exact_guarantee_rr: 0,
             nonexact_guarantee_rr: 0,
             #[cfg(test)]
@@ -2228,6 +2342,7 @@ fn active_flow_buckets_peak_is_max_not_sum_across_workers() {
                     surplus_weight: 1,
                     buffer_bytes: 32 * 1024,
                     dscp_rewrite: None,
+                codel_target_ns: 0,
                 },
                 hot: crate::afxdp::types::CoSQueueHotState {
                     surplus_deficit: 0,

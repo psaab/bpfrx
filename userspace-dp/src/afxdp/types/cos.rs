@@ -10,7 +10,10 @@
 
 use super::*;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+// #1614: f64 in CoSInterfaceConfig (oversubscription_guarantee_fraction)
+// precludes Eq; drop Eq on the container type. PartialEq still permits
+// the existing reconcile diff path (which only needs `!=`).
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(in crate::afxdp) struct CoSState {
     pub(in crate::afxdp) interfaces: FastMap<i32, CoSInterfaceConfig>,
     pub(in crate::afxdp) dscp_classifiers: FastMap<String, CoSDSCPClassifierConfig>,
@@ -18,7 +21,18 @@ pub(in crate::afxdp) struct CoSState {
     pub(in crate::afxdp) dscp_rewrite_rules: FastMap<String, CoSDSCPRewriteRuleConfig>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(in crate::afxdp) enum CoSOversubscriptionPolicy {
+    /// #1614 default: current scheduler unchanged bit-for-bit (when
+    /// `priority_low_min_share_bytes == 0`).
+    #[default]
+    Proportional,
+    /// #1614 A1: two-phase waterfill allocator using
+    /// `guarantee_fraction` Pass 1 budget fraction.
+    GuaranteeRate,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(in crate::afxdp) struct CoSInterfaceConfig {
     pub(in crate::afxdp) shaping_rate_bytes: u64,
     pub(in crate::afxdp) burst_bytes: u64,
@@ -29,6 +43,18 @@ pub(in crate::afxdp) struct CoSInterfaceConfig {
     pub(in crate::afxdp) ieee8021_queue_by_pcp: [u8; 8],
     pub(in crate::afxdp) queue_by_forwarding_class: FastMap<String, u8>,
     pub(in crate::afxdp) queues: Vec<CoSQueueConfig>,
+    /// #1614 A1: operator-selectable oversubscription policy.
+    /// Default `Proportional` preserves current behaviour bit-for-
+    /// bit (when `priority_low_min_share_bytes == 0`).
+    pub(in crate::afxdp) oversubscription_policy: CoSOversubscriptionPolicy,
+    /// #1614 A1: Phase 1 budget fraction (0.0..1.0). Only meaningful
+    /// when `oversubscription_policy == GuaranteeRate`. 0.0 makes
+    /// the allocator a no-op even if the policy enum is set.
+    pub(in crate::afxdp) oversubscription_guarantee_fraction: f64,
+    /// #1614 A2: priority-low minimum share in bytes per second.
+    /// Subtracted from effective scheduler cap before A1 runs
+    /// (orthogonal to A1 policy choice).
+    pub(in crate::afxdp) priority_low_min_share_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -73,6 +99,11 @@ pub(in crate::afxdp) struct CoSQueueConfig {
     pub(in crate::afxdp) surplus_weight: u32,
     pub(in crate::afxdp) buffer_bytes: u64,
     pub(in crate::afxdp) dscp_rewrite: Option<u8>,
+    /// #1614 A3: per-queue CoDel target in nanoseconds. 0 disables
+    /// CoDel for the queue (current default). Dequeue path drops
+    /// the oldest packet when its sojourn time exceeds this target
+    /// (or marks CE if ECT-capable).
+    pub(in crate::afxdp) codel_target_ns: u64,
 }
 
 pub(in crate::afxdp) const COS_FAST_QUEUE_INDEX_MISS: u16 = u16::MAX;
@@ -342,6 +373,31 @@ pub(in crate::afxdp) struct CoSInterfaceRuntime {
     pub(in crate::afxdp) default_queue: u8,
     pub(in crate::afxdp) nonempty_queues: usize,
     pub(in crate::afxdp) runnable_queues: usize,
+    /// #1614 A1: copied from `CoSInterfaceConfig.oversubscription_policy`
+    /// at `build_cos_interface_runtime` time. Controls whether the
+    /// hot-path selector runs the legacy round-robin (`Proportional`)
+    /// or the v5 two-phase waterfill allocator (`GuaranteeRate`).
+    pub(in crate::afxdp) oversubscription_policy: CoSOversubscriptionPolicy,
+    /// #1614 A1: Phase 1 budget fraction (0.0..1.0). Honored only when
+    /// `oversubscription_policy == GuaranteeRate`.
+    pub(in crate::afxdp) oversubscription_guarantee_fraction: f64,
+    /// #1614 A2: priority-low minimum share in bytes per second.
+    /// Used to compute `cap_eff = root.tokens.saturating_sub(
+    /// min_share_pass)` before the A1 selector runs. Default 0
+    /// preserves current behaviour.
+    pub(in crate::afxdp) priority_low_min_share_bytes: u64,
+    /// #1614 A2 helper: per-pass priority-low min-share bytes
+    /// reserved before the A1 selector runs. Decremented per drain
+    /// as priority-low surplus admission consumes the reserve.
+    pub(in crate::afxdp) priority_low_reserved_tokens: u64,
+    /// #1614 A2 helper: last-refill timestamp for the reserved
+    /// priority-low tokens (refill cadence matches root token bucket).
+    pub(in crate::afxdp) priority_low_last_refill_ns: u64,
+    /// #1614 A1: pre-sorted queue indices ordered ascending by
+    /// `transmit_rate_bytes`. Built at `build_cos_interface_runtime`
+    /// time; runtime is read-only. Used by the GuaranteeRate
+    /// waterfill phase 1 greedy honor loop.
+    pub(in crate::afxdp) exact_queues_by_rate_ascending: Vec<usize>,
     // Round-robin cursors for the two guarantee service classes. Exact and
     // non-exact guarantee queues rotate independently — the scheduler gives
     // exact queues strict priority over non-exact guarantee service (the
@@ -516,6 +572,12 @@ pub(in crate::afxdp) struct CoSQueueConfigState {
     pub(in crate::afxdp) surplus_weight: u32,
     pub(in crate::afxdp) buffer_bytes: u64,
     pub(in crate::afxdp) dscp_rewrite: Option<u8>,
+    /// #1614 A3: per-queue CoDel target in nanoseconds. 0 disables
+    /// CoDel for the queue (current default). The dequeue path
+    /// drops the oldest packet when its sojourn time exceeds this
+    /// target (or marks CE if ECT-capable per
+    /// `apply_cos_admission_ecn_policy`).
+    pub(in crate::afxdp) codel_target_ns: u64,
 }
 
 /// Hot per-pop / per-push state: token bucket, FIFO storage, runnable

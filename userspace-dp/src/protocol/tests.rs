@@ -581,6 +581,7 @@ fn cos_scheduler_snapshot_surplus_sharing_round_trip_true() {
         buffer_size_percent: 0.0,
         surplus_sharing: true,
         equal_flow_enforcement: false,
+    codel_target_ns: 0,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
     let back: CoSSchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -598,6 +599,7 @@ fn cos_scheduler_snapshot_equal_flow_enforcement_round_trip_true() {
         buffer_size_percent: 0.0,
         surplus_sharing: false,
         equal_flow_enforcement: true,
+    codel_target_ns: 0,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
     let back: CoSSchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -615,6 +617,7 @@ fn cos_scheduler_snapshot_buffer_size_percent_round_trip() {
         buffer_size_percent: 10.0,
         surplus_sharing: false,
         equal_flow_enforcement: false,
+    codel_target_ns: 0,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
     assert!(

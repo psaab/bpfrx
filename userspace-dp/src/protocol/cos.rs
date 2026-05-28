@@ -110,6 +110,13 @@ pub(crate) struct CoSSchedulerSnapshot {
     /// equal-flow suppression.
     #[serde(rename = "equal_flow_enforcement", default)]
     pub equal_flow_enforcement: bool,
+    /// #1614 A3: per-queue CoDel target in nanoseconds. 0 disables
+    /// CoDel for the queue (current default). The userspace dequeue
+    /// path drops the oldest packet when its sojourn time exceeds
+    /// this target (or marks CE if ECT). Recommended >= 1.5x
+    /// post-shaper RTT per AGY r2 finding #3.
+    #[serde(rename = "codel_target_ns", default)]
+    pub codel_target_ns: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

@@ -517,6 +517,13 @@ type CoSScheduler struct {
 	// SurplusSharing, whose surplus phase intentionally bypasses the
 	// per-queue lease cap.
 	EqualFlowEnforcement bool
+	// CodelTargetNS (#1614 A3) is the per-queue CoDel sojourn-time
+	// AQM target in nanoseconds. 0 (default) disables CoDel for the
+	// queue. Recommended >= 1.5x post-shaper RTT (~5-7 ms on the
+	// loss userspace cluster, so 7.5-10 ms = 7_500_000-10_000_000 ns).
+	// RFC 8290 baseline is 5 ms; on this cluster 5 ms collides with
+	// RTT and may oscillate (see docs/cos-traffic-shaping.md).
+	CodelTargetNS uint64
 }
 
 // CoSSchedulerMap binds forwarding classes to named schedulers.
@@ -546,6 +553,23 @@ type CoSInterfaceUnit struct {
 	DSCPClassifier     string
 	IEEE8021Classifier string
 	DSCPRewriteRule    string
+	// OversubscriptionPolicy (#1614 A1) is the operator-selectable
+	// behaviour when sum of exact-class transmit-rates exceeds the
+	// interface's shaping-rate. Empty or "proportional" (default)
+	// preserves current scheduler bit-for-bit (when
+	// PriorityLowMinShareBytes is also 0). "guarantee-rate"
+	// activates the v5 two-phase waterfill allocator.
+	OversubscriptionPolicy string
+	// OversubscriptionGuaranteeFraction (#1614 A1) is the Phase 1
+	// budget fraction (0.0..1.0). Only meaningful when
+	// OversubscriptionPolicy == "guarantee-rate". 0.0 makes the
+	// allocator a no-op even if the policy is set.
+	OversubscriptionGuaranteeFraction float64
+	// PriorityLowMinShareBytes (#1614 A2) is the priority-low
+	// minimum share in bytes per second. Subtracted from effective
+	// scheduler cap before the A1 allocator runs (orthogonal to A1
+	// policy choice). Default 0 (no min-share).
+	PriorityLowMinShareBytes uint64
 }
 
 // CoSFairnessExpectation declares an opt-in RSS/workload expectation for
