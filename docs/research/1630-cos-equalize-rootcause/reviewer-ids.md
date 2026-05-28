@@ -18,6 +18,6 @@ continuations can fetch by id.
 
 ## Round 3 (v3 — fix re-targeted to lease top-up watermark)
 
-- Codex plan-review: TBD
-- AGY adversarial plan-review: TBD
+- Codex plan-review: codex exec session 019e700e-8add-7ac1-b2c6-184a67df32c6 (PLAN-NEEDS-MINOR; 3 minors folded into v3.1)
+- AGY adversarial plan-review: adversarial-review-mppvx6qs-lth0pl (PLAN-READY)
 - Claude SMR plan-review: `claude-smr-plan-r3.md` (this agent)

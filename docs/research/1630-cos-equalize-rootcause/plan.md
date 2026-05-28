@@ -3,7 +3,7 @@
 - Issue: #1630
 - Branch: `research/1630-cos-equalize-rootcause`
 - Mode: `/research` (plan only; no production code touched; STOP at PLAN-READY)
-- Rev: **v3** (fix re-targeted to the lease top-up watermark after r2 convergence)
+- Rev: **v3.1** (r3 minors folded: max_total_leased sizing, Gate 4 scope, non-exact-vs-surplus clarity)
 - Author: Claude SMR (CoS-scheduler / WFQ / DRR / token-bucket / AF_XDP multi-worker-shaper domain)
 
 > **v2 reframed the root cause from live cluster telemetry** (falsifying
@@ -282,19 +282,41 @@ Path A:
    `guarantee_deficit_bytes` on `CoSQueueRuntime` (`types/cos.rs`) for
    exactness, but the banked token bucket may make it unnecessary —
    decide during implementation (Q2).
-3. **Per-visit burst cap (mandatory, AGY/Codex r2)**: bound each visit to
+3. **`max_total_leased` sizing (Codex r3 MINOR — required)**: the v8
+   lease refuses grants above `max_total_leased` (the outstanding-credit
+   cap), computed as `burst/4 .min(max_frame_lease_bytes × active_shards)`
+   with `max_frame_lease_bytes = lease_bytes.max(tx_frame_capacity)`
+   (`shared_cos_lease/mod.rs:712-716`; enforced in `try_bump_outstanding`
+   ~1510). Raising ONLY the local token-bucket watermark is defeated in
+   low-`active_shards` cases because `acquire_v8` won't grant past
+   `max_total_leased`. The implementation MUST either raise
+   `max_frame_lease_bytes` to the new N×MTU watermark when computing
+   `max_total_leased`, or prove the cluster's `active_shards` makes the
+   effective cap already ≥ the intended bank. Verify on the loss cluster
+   (active_shards = number of workers binding the egress; ~6).
+4. **Per-visit burst cap (mandatory, AGY/Codex r2)**: bound each visit to
    a fixed frame count so a banked large class (24g, quantum clamp 512 KB
    = 341 frames) cannot transmit thousands of frames in one drain pass.
    `TX_BATCH_SIZE = 64` (afxdp/mod.rs:225) already caps the drain loop at
    64 frames/call; verify that cap is the binding per-visit bound and
    keep it.
-4. **Rate-safety**: confirm `consume(sent_bytes)` + per-queue debit meter
+5. **Rate-safety**: confirm `consume(sent_bytes)` + per-queue debit meter
    actual bytes; the v8 lease per-epoch grant (`rate × elapsed`) is what
    enforces the rate cap (Gate 4) — the watermark only changes burst.
-5. **Non-exact**: apply the P2 visit-cap fix to
-   `select_nonexact_cos_guarantee_batch` too (its bucket already
-   accumulates to `buffer_bytes`, so it needs only the P2 half).
-6. Docs: `docs/fairness-regimes.md` — describe the raised watermark / DRR
+   Gate 4 is scoped to **hard-cap exact guarantee queues** only;
+   transparent (`transmit_rate_bytes()==0`, token_bucket.rs:167) and
+   exact `surplus_sharing` queues (which bypass the per-queue exact lease
+   in Surplus phase, tx_completion.rs:343) are explicitly out of the
+   rate-cap assertion (Codex r3).
+6. **Non-exact GUARANTEE queues**: apply the P2 visit-cap fix to
+   `select_nonexact_cos_guarantee_batch` (queue_service/mod.rs:1064) too;
+   its bucket already accumulates to `buffer_bytes` via
+   `refill_cos_tokens`, so it needs only the P2 half. NOTE: best-effort
+   q0 / uncapped q11 in the fixture are SURPLUS-path (separate
+   surplus-deficit selector, queue_service/mod.rs:1147+), NOT non-exact
+   guarantee queues — P2 does not change their behavior and the plan does
+   not claim it does (Codex r3).
+7. Docs: `docs/fairness-regimes.md` — describe the raised watermark /
    burst window and the small-class efficiency behavior.
 
 ---
@@ -309,9 +331,11 @@ Path A:
   shape; iperf-9g takes residual. v4 AND v6.
 - **Gate 3**: 11-class simul → no exact class starved; priority-low /
   uncapped ≥ 5% of cluster ceiling.
-- **Gate 4 (rate cap preserved)**: no class EXCEEDS its configured rate
-  in steady state (the deficit must not leak rate). Verify 1g ≤ ~1.0 G,
-  etc., under solo and simul.
+- **Gate 4 (rate cap preserved — hard-cap exact queues only)**: no
+  hard-cap exact guarantee class EXCEEDS its configured rate in steady
+  state (the raised watermark must not leak rate). Verify 1g ≤ ~1.0 G,
+  etc., under solo and simul. Transparent and surplus-sharing queues are
+  out of scope for this assertion (Codex r3).
 - **Gate 5 (no-regression)**: default multi-worker aggregate reverse
   throughput ≥ ~22 G; CoS-off path unchanged.
 - **Gate 6 (full matrix)**: v4/v6 × push/-R × CoS-off/CoS-on per
