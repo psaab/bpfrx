@@ -4142,3 +4142,63 @@ top.
 - **Timestamp**: 2026-05-27 (UTC)
   - **Action**: Copilot code review on PR #1613 raised 6 inline findings: (1) file header comment said "bounded default" but code defaults to unbounded — fixed comment; (2) unbounded default spans 65535 exclude one value, switched to 65536 (cardinality semantics) + unified all span types to u32; (3) zero-span and zero/oversized-batch validation added; (4) --dst-mac help text now notes step-2 will do ARP-resolve; (5) removed Cargo.lock from .gitignore to match repo convention (xsk-repro, userspace-dp, userspace-xdp all commit lockfile); (6) plan.md flag surface now tagged with [step-1 ✓] vs [step-2 #1611] per-flag. Added new test unbounded_default_uses_full_2_to_16_spans (7/7 cargo tests pass).
   - **File(s)**: test/incus/cold-path-flooder/src/main.rs, test/incus/cold-path-flooder/.gitignore, test/incus/cold-path-flooder/Cargo.lock (new — tracked), docs/pr/1607-hw-ceiling-microbench/plan.md
+
+## 2026-05-27 — #1609 v2 plan written (Multi-Book LPM architectural pivot)
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Wrote v2 plan from the Multi-Book LPM architectural pivot (AGY r1 + Codex r1 + Claude SMR r1+r2 convergence). v2 supersedes v1; v1 KILLED for 320 GB RuleBitSet memory blowup. Staged delivery: Step 1 (this PR) = Multi-Book LPM v4 primitive + feature-flag scaffold; Step 2 (follow-up) = full multi-stage hot path; Step 3 (follow-up) = Junos CLI knob + production default-flip gated on #1612. User override accepted: architecture ships now behind feature flag default-OFF; empirical ≥10× claim gated on #1612 measurement.
+  - **File(s)**: docs/pr/1609-multistage-policy-dag/plan.md (v2 rewrite)
+
+## 2026-05-27 — #1609 v2 plan-review r3 convergence: PLAN-NEEDS-MAJOR
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Dispatched Codex (task-mpp07r70-gr5xtw) + AGY (adversarial-review-mpp08612-zcapi3) hostile v2 plan-reviews. Both returned PLAN-NEEDS-MAJOR. Codex: 10 findings F1-F10. AGY: 4 Class-A fatals (F1.1-F1.4) + 2 Class-B nits. Convergent fatals: (1) level-0 memory math error 16 MB → actually 256 MiB w/ fat pointers; (2) literal/any rules dropped from Stage 3; (3) v6 FxHashMap DoS vector on attacker-controlled /48s; (4) global-vs-zone-rule ordering invariant violated by flat ascending rule_idx; (5) broad-prefix /0 build-time blow-up; (6) LPM cannot be built from current trie-compressed BookEntry. Plus 6 MAJORs. Wrote claude-smr-plan-r4.md REVERSING r3 PLAN-READY-WITH-NITS soft-pass; aligning to 3-of-3 PLAN-NEEDS-MAJOR. Architectural axis remains sound; v2 concrete design needs material v3 rewrite. NOT spawning v3 in this session per `feedback_difficult_path_pragmatism`. Posting issue comment + closing the engineer drive as BLOCKED on v3 redesign.
+  - **File(s)**: docs/pr/1609-multistage-policy-dag/claude-smr-plan-r4.md (new), docs/pr/1609-multistage-policy-dag/reviewer-ids.md (round 3 verdict update)
+
+## 2026-05-27 — #1609 v3 plan written (5-fix, memory RELAXED)
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: User overrode v2 r4 memory fatal (1.5 GiB level-0 dismissed; production hardware 8-16 GB; constraint is CPU/cache/TLB not RSS). Wrote plan v3 addressing the 5 remaining fixable fatals from v2 r4 convergence: (F2) MatchAny side-channels + PseudoBooks for literal-only rules; (F3) v6 bounded multibit trie DIR-(8x6) replacing DoS-vulnerable FxHashMap; (F4) per-(zone-pair, local_rule_idx) composite key + explicit two-phase Stage 4 eval preserving global-after-zone-pair semantics; (F5) /0 short-circuit at build time + covers_all_v4 implicit merge at galloping merge; (F6) BookEntry extra prefixes_v4/v6 Arc<[Prefix]> alongside existing PrefixSet + PrefixSetV4/V6::iter_prefixes for PseudoBook construction. Plus 6 v2 r4 MAJORs addressed (u32 book idx, Stage 2 any_proto + all-overlapping-ranges, Stage 4 master-fallback on overflow, flag wiring placement on PolicyState, in-Rust synthetic generator instead of nonexistent shell script, module refactor in one PR with two commits). Wrote Claude SMR r5 with HOSTILE self-review per user instruction (r3 → r4 soft-pass reversal taught caution); verdict PLAN-NEEDS-MINOR with 4 residual issues F-r5-1 through F-r5-4 enumerated. Ready to dispatch Codex + AGY on v3.
+  - **File(s)**: docs/pr/1609-multistage-policy-dag/plan.md (v3 rewrite), docs/pr/1609-multistage-policy-dag/claude-smr-plan-r5.md (new), docs/pr/1609-multistage-policy-dag/reviewer-ids.md (round 5 entry)
+
+## 2026-05-27 — #1609 v3 round-1 returned + v3.1 patched
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: v3 SHA 85f01d6de dispatched to Codex (task-mpp1zj9z-8wzlvi) + AGY (adversarial-review-mpp1zyo9-5bwwnk). Codex: PLAN-NEEDS-MAJOR with 5 majors (M1 PseudoBook+MatchAny conflation, M2 v6 overflow unbounded fallback, M3 v6 memory math under-counted, M4 pseudo-book ID namespace inconsistent, M5 iter_prefixes Trie DFS cost). AGY: PLAN-READY-WITH-NITS with 5 nits (prefix propagation push-down, Arc interning, FxHashMap → sorted Box, allocation-free borrowing, V6Node Leaf48). Patched plan v3 → v3.1 in-place: edited §2.2 to split iter_prefixes by purpose (Codex M1); added §13 v3.1 patches addendum P1-P10 covering all 10 round-1 findings + 3 of 4 SMR r5 nits. Wrote claude-smr-plan-r6.md hostile self-pass: PLAN-READY-WITH-NITS (5 residual nits N1-N5; none Step-1-blocking).
+  - **File(s)**: docs/pr/1609-multistage-policy-dag/plan.md (v3.1 patch + §13 addendum), docs/pr/1609-multistage-policy-dag/claude-smr-plan-r6.md (new)
+
+## 2026-05-27 — #1609 v3.1 round-2 PLAN-NEEDS-MAJOR convergence (3-of-3)
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: v3.1 SHA e7dd86ed5 dispatched. Codex r2 (task-mpp2jzhy-m057in): PLAN-NEEDS-MAJOR with 3 blocking + scenario walkthrough exposing P2 dst-pseudo-id leak into src lookup OOB. AGY r2 (adversarial-review-mpp2kcas-nksaq7): PLAN-NEEDS-MAJOR with 10 issues, including NEW CRITICAL security finding — Stage 4 master-fallback creates DoS amplification (scan all 1M rules instead of just emitted candidates). 3-of-3 convergence (Codex + AGY + SMR r7). Per user contract this is the THIRD major-iteration kill (v2 KILL, v3 NEEDS-MAJOR, v3.1 NEEDS-MAJOR); contract says "do NOT spawn v4 without user authorization". Wrote claude-smr-plan-r7.md with three viable paths (A v3.2 full-round, B STAGED narrow Step 1 to prefix scaffolding only, C user decides). Posting issue comment with convergence + paths.
+  - **File(s)**: docs/pr/1609-multistage-policy-dag/claude-smr-plan-r7.md (new), docs/pr/1609-multistage-policy-dag/reviewer-ids.md (round 7 verdicts)
+
+## 2026-05-27 — #1609 STAGED Step 1 narrow scope implemented
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: After v3.1 r2 3-of-3 PLAN-NEEDS-MAJOR convergence escalated to user (third major-iteration kill), executed Path B per claude-smr-plan-r7.md recommendation: narrow Step 1 to BookEntry parallel-prefix scaffolding only. Added `prefixes_v4: Arc<[PrefixV4]>` + `prefixes_v6: Arc<[PrefixV6]>` fields on `BookEntry` populated at parse-time from canonical input vectors (BEFORE PrefixSet collapse). No LPM, no PseudoBooks, no MatchAny side-channel, no feature flag — those all defer to v3.2 + follow-up issue once design is fully ratified. 4 new tests (v4 / v6 / empty / /0-preservation) verifying parallel-array agrees with PrefixSet. 5/5 flake clean. 1456 existing tests pass. Go build clean.
+  - **File(s)**: userspace-dp/src/policy.rs (BookEntry extension + parse-time population), userspace-dp/src/policy_tests.rs (4 new tests appended)
+
+## 2026-05-27 — PR #1624 Copilot inline review (3 findings addressed)
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Copilot reviewed at HEAD 483a5db97 and posted 3 inline comments: (1) policy.rs:449 "cheap clone" misnomer — actual cost is O(n) per book; (2) plan.md:34 status implies broader Step 1 is in this PR; (3) plan.md:592 "Step 1 (this PR) scope" heading describes deferred features. Fixed (1) by replacing the comment with an honest description of the O(n) parse-time cost + reasoning. Fixed (2) by adding a SUPERSEDED / HISTORICAL marker at the top of plan.md noting this is the design contract for FUTURE Sub-PRs (#1623) not for PR #1624. Fixed (3) by renaming §4 heading + adding a NOTE callout. Wrote claude-smr-code-r1.md hostile review of narrow scope: CODE-READY. 5/5 tests still pass.
+  - **File(s)**: userspace-dp/src/policy.rs (comment fix), docs/pr/1609-multistage-policy-dag/plan.md (SUPERSEDED markers), docs/pr/1609-multistage-policy-dag/claude-smr-code-r1.md (new)
+
+## 2026-05-27 — PR #1624 Codex r1 + AGY r1 code-review (CODE-READY-WITH-NITS)
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Dispatched Codex (task-mpp38gl0-hyawf8) + AGY (adversarial-review-mpp38qy1-zayhr2) hostile code-reviews at HEAD 2cc07b450. Both returned CODE-READY-WITH-NITS, no blockers. Nits: Codex tightened the Arc cost comment (Arc::from allocates separately, parse runs on preflight + apply both); AGY proposed two test patches (dual-family book, large-book Trie variant). Applied Codex's comment tightening + both AGY tests. 6 unit tests now pass (was 4); 5/5 flake clean; 1458 total tests pass.
+  - **File(s)**: userspace-dp/src/policy.rs (comment tighten), userspace-dp/src/policy_tests.rs (+2 tests)
+
+## 2026-05-27 — PR #1624 Copilot r2 inline findings (2) addressed
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Copilot re-reviewed at HEAD 3787f51ee and posted 2 NEW inline findings: (1) struct doc claim "PrefixSet's contained prefixes are exactly the parallel array's entries" is structurally wrong because /0 collapses to MatchAny — fixed by rewording to semantic-membership-equivalence; (2) Arc::from(v4.clone().into_boxed_slice()) allocates an intermediate Box — fixed by switching to Arc::from(v4.as_slice()) which uses the impl From<&[T]> for Arc<[T]> single-fused-allocation path (PrefixV4/V6 are Copy). 6 tests still pass; 5/5 flake clean; 1458 total tests pass.
+  - **File(s)**: userspace-dp/src/policy.rs (struct doc reword + Arc construction switch)
+
+## 2026-05-27 — PR #1624 Copilot r3 inline findings (2) addressed
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Copilot r3 at HEAD 5dc6dc9d3 posted 2 inline comments: (1) `T: Copy` claim in Arc::from comment is misleading — standard impl is `T: Clone`. Fixed comment. (2) Missing test for /0 AND non-/0 prefixes case (the load-bearing motivation for the parallel array). Added test_book_entry_zero_plus_non_zero_prefixes_preserved covering both v4 and v6, asserting PrefixSet collapses to MatchAny but parallel array preserves both entries. 7 tests now pass; 5/5 flake clean; 1459 total tests pass.
+  - **File(s)**: userspace-dp/src/policy.rs (T: Clone comment fix), userspace-dp/src/policy_tests.rs (+1 test)

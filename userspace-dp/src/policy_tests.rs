@@ -1011,3 +1011,229 @@ fn test_non_v3_shaped_falls_through_to_legacy_field() {
         PolicyAction::Deny
     );
 }
+
+// -----------------------------------------------------------------
+// #1609 v3.1 Step 1 (STAGED narrow scope) — BookEntry parallel
+// prefix-list scaffolding.
+//
+// These tests verify that the `prefixes_v4` / `prefixes_v6` Arc
+// fields on `BookEntry` agree with the contents of the matching
+// PrefixSetV{4,6} on representative inputs. The future Multi-Book
+// LPM (deferred to a follow-up issue per the v3.1 r2
+// PLAN-NEEDS-MAJOR convergence) reads these parallel fields
+// directly rather than walking the trie-compressed PrefixSet.
+// -----------------------------------------------------------------
+
+#[test]
+fn test_book_entry_carries_canonical_prefix_lists_v4() {
+    let books = [book(
+        100,
+        "mixed-v4",
+        &["10.0.0.0/8", "192.168.1.0/24", "203.0.113.5/32"],
+        &[],
+    )];
+    let rules = [v3_rule("r", &[100], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    assert_eq!(state.books.len(), 1);
+    let entry = &state.books[0];
+    // Every parallel-array entry must be contained in the PrefixSet.
+    for p in entry.prefixes_v4.iter() {
+        // Use the IP at the network base to sample membership.
+        assert!(
+            entry.v4.contains(p.addr()),
+            "PrefixSet does not contain prefix from parallel array: {p:?}"
+        );
+    }
+    assert_eq!(entry.prefixes_v4.len(), 3);
+    assert!(entry.prefixes_v6.is_empty());
+}
+
+#[test]
+fn test_book_entry_canonical_prefix_lists_v6() {
+    let books = [book(
+        101,
+        "mixed-v6",
+        &[],
+        &["2001:db8::/32", "fe80::/10", "::1/128"],
+    )];
+    let rules = [v3_rule("r", &[101], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    assert_eq!(state.books.len(), 1);
+    let entry = &state.books[0];
+    for p in entry.prefixes_v6.iter() {
+        assert!(
+            entry.v6.contains(p.addr()),
+            "PrefixSet does not contain prefix from parallel array: {p:?}"
+        );
+    }
+    assert!(entry.prefixes_v4.is_empty());
+    assert_eq!(entry.prefixes_v6.len(), 3);
+}
+
+#[test]
+fn test_book_entry_empty_book_has_empty_parallel_arrays() {
+    // Book with no v4 + no v6 prefixes: PrefixSet collapses to
+    // MatchNone (v3 factory semantics); parallel arrays are empty.
+    let books = [book(102, "empty", &[], &[])];
+    let rules = [v3_rule("r", &[102], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let entry = &state.books[0];
+    assert!(entry.prefixes_v4.is_empty());
+    assert!(entry.prefixes_v6.is_empty());
+    assert!(entry.v4.is_match_none());
+    assert!(entry.v6.is_match_none());
+}
+
+#[test]
+fn test_book_entry_parallel_array_preserves_zero_prefix() {
+    // A book containing 0.0.0.0/0 collapses its PrefixSet to
+    // MatchAny — but the parallel prefix array MUST still carry
+    // the /0 entry so a future LPM builder can route it through
+    // the §2.6 short-circuit (books_covering_all_v4) rather than
+    // populate every level-0 entry.
+    let books = [book(103, "any-v4", &["0.0.0.0/0"], &[])];
+    let rules = [v3_rule("r", &[103], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let entry = &state.books[0];
+    // PrefixSet has collapsed to MatchAny per the /0 semantics.
+    assert!(entry.v4.is_match_any());
+    // But the parallel array preserves the /0 so a future LPM
+    // build can short-circuit per plan §2.6.
+    assert_eq!(entry.prefixes_v4.len(), 1);
+    assert_eq!(entry.prefixes_v4[0].prefix_len(), 0);
+}
+
+#[test]
+fn test_book_entry_canonical_prefix_lists_dual_family() {
+    // AGY r1 nit Patch A: a single book with BOTH v4 and v6
+    // prefixes — verifies parallel arrays are populated for each
+    // family independently.
+    let books = [book(
+        104,
+        "dual-family",
+        &["10.0.0.0/8", "192.168.1.0/24"],
+        &["2001:db8::/32", "fe80::/10"],
+    )];
+    let rules = [v3_rule("r", &[104], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let entry = &state.books[0];
+    assert_eq!(entry.prefixes_v4.len(), 2);
+    assert_eq!(entry.prefixes_v6.len(), 2);
+    for p in entry.prefixes_v4.iter() {
+        assert!(entry.v4.contains(p.addr()));
+    }
+    for p in entry.prefixes_v6.iter() {
+        assert!(entry.v6.contains(p.addr()));
+    }
+}
+
+#[test]
+fn test_book_entry_canonical_prefix_lists_trie_variant() {
+    // AGY r1 nit Patch B: 17 prefixes triggers the Trie variant
+    // (PREFIX_SET_LINEAR_MAX = 16). Verifies the parallel array
+    // is variant-independent — it's captured BEFORE PrefixSet
+    // chooses Linear vs Trie.
+    let prefix_strs: Vec<String> = (0..17).map(|i| format!("10.0.{i}.0/24")).collect();
+    let prefix_refs: Vec<&str> = prefix_strs.iter().map(|s| s.as_str()).collect();
+    let books = [book(105, "large-v4", &prefix_refs, &[])];
+    let rules = [v3_rule("r", &[105], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let entry = &state.books[0];
+    assert!(matches!(entry.v4, crate::prefix_set::PrefixSetV4::Trie(_)));
+    assert_eq!(entry.prefixes_v4.len(), 17);
+    for p in entry.prefixes_v4.iter() {
+        assert!(entry.v4.contains(p.addr()));
+    }
+}
+
+#[test]
+fn test_book_entry_zero_plus_non_zero_prefixes_preserved() {
+    // Copilot r3 nit: a book containing 0.0.0.0/0 AND 10.0.0.0/8
+    // (or analogous v6) — PrefixSet collapses to MatchAny (which
+    // drops the non-/0 entries from its internal Linear/Trie
+    // representation), but the parallel `prefixes_v{4,6}` array
+    // MUST retain BOTH entries so the future Multi-Book LPM build
+    // can route /0 through the §2.6 short-circuit while still
+    // inserting the /8 (and analogous) prefixes into the LPM
+    // proper. This is the load-bearing motivation for the parallel
+    // array.
+    let books = [book(
+        106,
+        "any-plus-net",
+        &["0.0.0.0/0", "10.0.0.0/8"],
+        &["::/0", "2001:db8::/32"],
+    )];
+    let rules = [v3_rule("r", &[106], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let entry = &state.books[0];
+    // PrefixSet collapses to MatchAny on both families due to /0.
+    assert!(entry.v4.is_match_any());
+    assert!(entry.v6.is_match_any());
+    // But the parallel arrays preserve BOTH the /0 and the non-/0
+    // entries — this is exactly what the future LPM builder needs.
+    assert_eq!(entry.prefixes_v4.len(), 2);
+    assert_eq!(entry.prefixes_v6.len(), 2);
+    // /0 and the non-/0 entry must both be present.
+    let v4_lens: Vec<u8> = entry.prefixes_v4.iter().map(|p| p.prefix_len()).collect();
+    assert!(v4_lens.contains(&0), "v4 parallel array must keep /0: got {v4_lens:?}");
+    assert!(v4_lens.contains(&8), "v4 parallel array must keep /8: got {v4_lens:?}");
+    let v6_lens: Vec<u8> = entry.prefixes_v6.iter().map(|p| p.prefix_len()).collect();
+    assert!(v6_lens.contains(&0), "v6 parallel array must keep ::/0: got {v6_lens:?}");
+    assert!(v6_lens.contains(&32), "v6 parallel array must keep /32: got {v6_lens:?}");
+}
