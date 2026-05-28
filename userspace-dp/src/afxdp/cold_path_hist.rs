@@ -476,13 +476,32 @@ impl WorkerColdPathAtomics {
     /// `cold_window_gen` (s1), Relaxed-load the full payload, issue
     /// `fence(Acquire)` to seal the Relaxed loads, then Relaxed-load
     /// `cold_window_gen` (s2). If s1 and s2 are equal and even the
-    /// payload is coherent. Bounded retry count; on giveup returns
-    /// zeros (the harness sees the empty slot and retries on next tick).
-    pub(in crate::afxdp) fn snapshot(&self) -> WorkerColdPathCounters {
-        for _ in 0..16 {
+    /// payload is coherent.
+    ///
+    /// AGY code-r2 finding 2: returns `Option<WorkerColdPathCounters>`.
+    /// `None` indicates the retry budget exhausted (caller should treat
+    /// as "stale, try again next tick"); `Some(_)` is a coherent
+    /// payload. Previously `snapshot()` returned `default()` on giveup,
+    /// which a Prometheus scraper or the harness could not distinguish
+    /// from a legitimately-empty worker, masking retry-starvation
+    /// regimes under heavy publish contention.
+    ///
+    /// AGY code-r2 finding 2 (continued): the retry budget is now 128
+    /// (up from 16) with an exponential `std::hint::spin_loop` backoff.
+    /// For a 448-field payload at ~5 ns per Relaxed load, one publish
+    /// cycle takes ~2.2 µs; 128 retries × spin_loop give the writer
+    /// ~10-50 µs to publish before the reader gives up.
+    pub(in crate::afxdp) fn snapshot(&self) -> Option<WorkerColdPathCounters> {
+        const RETRY_BUDGET: u32 = 128;
+        for attempt in 0..RETRY_BUDGET {
             let s1 = self.cold_window_gen.load(Ordering::Acquire);
             if s1 & 1 != 0 {
-                std::hint::spin_loop();
+                // Adaptive backoff: spin a few cycles on early
+                // retries, longer on later ones to give a contested
+                // writer time to complete its publish cycle.
+                for _ in 0..(1u32 << (attempt.min(6))) {
+                    std::hint::spin_loop();
+                }
                 continue;
             }
             let mut out = WorkerColdPathCounters::default();
@@ -502,11 +521,15 @@ impl WorkerColdPathAtomics {
                 out.ns_per_tsc_q32 = self.ns_per_tsc_q32.load(Ordering::Relaxed);
                 out.wrapper_ns_baseline = self.wrapper_ns_baseline.load(Ordering::Relaxed);
                 out.clock_source = ClockSource::from_u8(self.clock_source.load(Ordering::Relaxed));
-                return out;
+                return Some(out);
             }
             std::hint::spin_loop();
         }
-        WorkerColdPathCounters::default()
+        // Retry budget exhausted — return None so the caller can
+        // distinguish from a legitimately-empty worker (AGY code-r2
+        // finding 2). A Prometheus scraper sees this as "stale", not
+        // as "all zeros".
+        None
     }
 }
 
@@ -828,7 +851,7 @@ mod tests {
         local.record_sample(3, 5, 8000);
         atomics.install_calibration(42, 30, ClockSource::Tsc);
         atomics.publish_from_local(&local);
-        let snap = atomics.snapshot();
+        let snap = atomics.snapshot().expect("single-thread snapshot must succeed");
         let slot = zone_pair_slot(3, 5);
         assert_eq!(snap.samples[slot], 2);
         assert_eq!(snap.sum_ns[slot], 12000);
@@ -852,13 +875,32 @@ mod tests {
         let mut local = WorkerColdPathCounters::default();
         local.record_sample(7, 11, 12345);
         atomics.publish_from_local(&local);
-        let snap1 = atomics.snapshot();
+        let snap1 = atomics.snapshot().expect("seq snapshot 1 must succeed");
         local.record_sample(7, 11, 67890);
         atomics.publish_from_local(&local);
-        let snap2 = atomics.snapshot();
+        let snap2 = atomics.snapshot().expect("seq snapshot 2 must succeed");
         let slot = zone_pair_slot(7, 11);
         assert_eq!(snap1.samples[slot], 1);
         assert_eq!(snap2.samples[slot], 2);
+    }
+
+    /// AGY code-r2 finding 2: snapshot() now returns Option. Verify
+    /// that an in-flight publish (odd cold_window_gen) is detected
+    /// and the snapshot returns None on retry exhaustion — NOT a
+    /// silently-zero result that the harness would mistake for an
+    /// empty worker.
+    #[test]
+    fn snapshot_returns_none_on_perpetually_odd_gen() {
+        use std::sync::atomic::Ordering as AOrd;
+        let atomics = WorkerColdPathAtomics::new();
+        // Pin the seqlock at an odd generation. The snapshot retry
+        // loop should exhaust its budget and return None.
+        atomics.cold_window_gen.fetch_add(1, AOrd::AcqRel);
+        let snap = atomics.snapshot();
+        assert!(
+            snap.is_none(),
+            "snapshot must return None when cold_window_gen is perpetually odd"
+        );
     }
 
     /// Cross-thread tear test: spawn a writer thread that publishes
@@ -912,11 +954,27 @@ mod tests {
         let mut last_samples = 0u64;
         let mut max_samples = 0u64;
         let mut at_least_one_observed_increase = false;
+        let mut coherent_snapshots = 0u64;
+        let mut retry_exhausted_snapshots = 0u64;
         for _ in 0..1000 {
-            let snap = atomics.snapshot();
+            // AGY code-r2 finding 2: snapshot() returns Option<_>.
+            // None means retry budget exhausted — NOT a tear. The
+            // earlier oracle conflated these two regimes by checking
+            // `samples` against a zero-default that retry-exhaustion
+            // returned, producing false "seqlock tore" panics under
+            // heavy contention. The correct oracle skips None
+            // snapshots; tear detection runs only on coherent
+            // (Some) snapshots.
+            let Some(snap) = atomics.snapshot() else {
+                retry_exhausted_snapshots += 1;
+                continue;
+            };
+            coherent_snapshots += 1;
             let s = snap.samples[slot];
             // Tear-1: samples must be monotonic non-decreasing if the
-            // seqlock is honoring epoch boundaries.
+            // seqlock is honoring epoch boundaries. We compare only
+            // against the LAST COHERENT snapshot's samples; None
+            // snapshots in between don't reset the monotonicity check.
             assert!(
                 s >= last_samples,
                 "samples regressed: {s} < {last_samples} — seqlock tore"
@@ -938,13 +996,12 @@ mod tests {
         }
         stop.store(true, AOrd::Relaxed);
         let writer_iters = writer.join().expect("writer thread panicked");
-        // Sanity-1: at least one snapshot must have been nonzero (else
-        // the reader might be exhausting retries every time and the
-        // monotonic-samples assertion would trivially pass with all
-        // zeros — Codex code-r3 NIT).
+        // Sanity-1: at least one COHERENT snapshot must have been
+        // nonzero. None counts as "stale, retry" and is excluded.
         assert!(
             max_samples > 0,
-            "reader observed only zero snapshots — likely retry-exhaustion or default-on-give-up"
+            "reader observed only zero samples across {coherent_snapshots} coherent and \
+             {retry_exhausted_snapshots} retry-exhausted snapshots"
         );
         // Sanity-2: at least one snapshot must show an INCREASE over
         // the prior one, proving we actually observed publishes
@@ -958,6 +1015,12 @@ mod tests {
         assert!(
             writer_iters > 10,
             "writer only published {writer_iters} times — test did not exercise concurrency"
+        );
+        // Sanity-4: at least 10% of snapshots must have been coherent;
+        // if EVERY snapshot exhausted retries the test is meaningless.
+        assert!(
+            coherent_snapshots >= 100,
+            "only {coherent_snapshots}/1000 snapshots coherent — retry budget may be too low"
         );
     }
 
