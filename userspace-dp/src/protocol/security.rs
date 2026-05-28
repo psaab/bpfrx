@@ -178,16 +178,50 @@ pub(crate) struct PolicyRuleSnapshot {
     pub scheduler_name: String,
     #[serde(default)]
     pub inactive: bool,
+    /// Legacy back-compat field (kept on v3 wire). Carries the
+    /// FULLY EXPANDED literal CIDRs (union of book content + free
+    /// CIDRs). Old Rust uses ONLY this field. New Rust uses ONLY
+    /// `source_literals` / `source_book_ids` when the rule is
+    /// v3-shaped (see #1606).
     #[serde(rename = "source_addresses", default)]
     pub source_addresses: Vec<String>,
     #[serde(rename = "destination_addresses", default)]
     pub destination_addresses: Vec<String>,
+    /// #1606: dense u32 IDs of address books cited by this rule.
+    #[serde(rename = "source_book_ids", default)]
+    pub source_book_ids: Vec<u32>,
+    #[serde(rename = "destination_book_ids", default)]
+    pub destination_book_ids: Vec<u32>,
+    /// #1606: free-form CIDR / "any" literals the operator wrote
+    /// inline in the rule match (NOT via a named address book).
+    /// New Rust reads these via the v3-shaped predicate.
+    #[serde(rename = "source_literals", default)]
+    pub source_literals: Vec<String>,
+    #[serde(rename = "destination_literals", default)]
+    pub destination_literals: Vec<String>,
     #[serde(default)]
     pub applications: Vec<String>,
     #[serde(rename = "application_terms", default)]
     pub application_terms: Vec<PolicyApplicationSnapshot>,
     #[serde(default)]
     pub action: String,
+}
+
+/// #1606: snapshot row for a unique address-book content.
+/// Multiple Junos-declared book names whose canonical CIDR sets
+/// are identical share one row + one ID. `name` is diagnostic-
+/// only (lexicographically smallest declaring name).
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct AddressBookSnapshot {
+    /// Stable u32 ID assigned by content-only hashing on the Go
+    /// side. ID 0 is reserved as "unused" sentinel.
+    pub id: u32,
+    #[serde(default)]
+    pub name: String,
+    #[serde(rename = "prefixes_v4", default)]
+    pub prefixes_v4: Vec<String>,
+    #[serde(rename = "prefixes_v6", default)]
+    pub prefixes_v6: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

@@ -507,15 +507,35 @@ config apply time.
 **Expected gain**: O(1)-O(log N) policy evaluation vs O(N) linear scan.
 Significant for rulesets with 20+ rules per zone-pair.
 
-### Phase 3: Address-book trie compilation — NOT STARTED
+### Phase 3: Address-book trie compilation — WIRE FORMAT LANDED (#1606), TRIE COMPACTION DEFERRED TO #1608
 
-**Scope**: Replace linear CIDR matching with precomputed tries.
+**Wire format (done in #1606)**: ConfigSnapshot now carries a top-
+level `address_books: Vec<AddressBookSnapshot>` table. Multiple
+named books with identical canonical CIDR content share one row
+and one u32 ID (content-hashed). Each `PolicyRuleSnapshot` cites
+books by ID via `source_book_ids` / `destination_book_ids` and
+free-form CIDRs via `source_literals` / `destination_literals`.
+The legacy `source_addresses` field stays on the wire for one-
+release rolling-upgrade compatibility with old Rust binaries.
 
-1. At config compile time, build a compact IPv4/IPv6 trie for each
-   address-book entry
-2. Store tries in the ConfigSnapshot
-3. In Rust, deserialize into a flat array trie (cache-friendly)
-4. Replace `match_address()` linear scan with trie lookup
+The Rust side stores books in a flat dense `Vec<BookEntry>` on
+`PolicyState`; rules carry `SmallVec<[u32; 8]>` indices. No
+`Arc<BookEntry>` per rule; the table lifetime is tied to the
+ArcSwap-published `ForwardingState` snapshot.
+
+This delivers the **structural memory deduplication** prerequisite
+for the 1M-policy scale: prefix-table memory is now
+`O(book_count × per_book_size)` not
+`O(rule_count × avg_books_per_rule)`. A 10K-book × 100K-rule
+config with 3 books per rule averages 30× fewer prefix-set
+materializations than today.
+
+**Trie compaction (deferred to #1608)**: the per-book `PrefixSetV4`/
+`PrefixSetV6` is still the uncompressed binary trie introduced in
+#923. At 10K books × 1K CIDRs each, that's ~25 GB of trie node
+memory — usable but not optimal. #1608 will replace the binary
+trie with a DIR-24-8 or Patricia compressed structure to bring
+the per-book footprint down 10-100×.
 
 ### Phase 4: Cranelift JIT for flow rewrite functions — NOT STARTED
 

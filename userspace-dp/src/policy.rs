@@ -1,11 +1,47 @@
 use crate::prefix::{PrefixV4, PrefixV6};
 use crate::prefix_set::{PrefixSetV4, PrefixSetV6};
-use crate::{PolicyApplicationSnapshot, PolicyRuleCounterStatus, PolicyRuleSnapshot};
+use crate::{
+    AddressBookSnapshot, PolicyApplicationSnapshot, PolicyRuleCounterStatus, PolicyRuleSnapshot,
+};
 use ipnet::IpNet;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// #1606: snapshot integrity errors from the policy parser.
+#[derive(Debug, Clone)]
+pub(crate) enum SnapshotIntegrityError {
+    AddressBookIdZero,
+    DuplicateAddressBookId(u32),
+    UnknownAddressBookId { rule_id: String, book_id: u32 },
+}
+
+impl std::fmt::Display for SnapshotIntegrityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AddressBookIdZero => write!(f, "address book has reserved id=0"),
+            Self::DuplicateAddressBookId(id) => {
+                write!(f, "duplicate address_books.id={}", id)
+            }
+            Self::UnknownAddressBookId { rule_id, book_id } => write!(
+                f,
+                "rule {:?} references unknown address book id={}",
+                rule_id, book_id
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotIntegrityError {}
+
+/// #1606: one row of the deduplicated address-book table.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BookEntry {
+    pub(crate) v4: PrefixSetV4,
+    pub(crate) v6: PrefixSetV6,
+}
 
 /// #922: zone-pair key packed as u32 (`from_id << 16 | to_id`).
 /// Replaces the previous `(String, String)` key that allocated two
@@ -58,14 +94,26 @@ pub(crate) struct PolicyRule {
     pub(crate) to_zone: String,
     pub(crate) scheduler_name: String,
     pub(crate) inactive: bool,
-    /// #923: adaptive prefix set (MatchAny / Linear ≤16 / Trie >16).
-    /// Replaces the legacy `Vec<PrefixV*>` linear scan in
-    /// `nets_match_v4/v6`. Empty input collapses to `MatchAny`,
-    /// preserving the legacy `is_empty()` match-all behavior.
-    pub(crate) source_v4: PrefixSetV4,
-    pub(crate) source_v6: PrefixSetV6,
-    pub(crate) destination_v4: PrefixSetV4,
-    pub(crate) destination_v6: PrefixSetV6,
+    /// #1606: literal CIDRs inlined in the rule (renamed from
+    /// `source_v4`). For v3-shaped rules, built via
+    /// `PrefixSetV4::from_v3_literals` (empty → MatchNone). For
+    /// non-v3-shaped (legacy) rules, built via the legacy
+    /// `from_prefixes` (empty → MatchAny).
+    pub(crate) source_literal_v4: PrefixSetV4,
+    pub(crate) source_literal_v6: PrefixSetV6,
+    pub(crate) destination_literal_v4: PrefixSetV4,
+    pub(crate) destination_literal_v6: PrefixSetV6,
+    /// #1606: dense indices into `PolicyState::books`. Inline cap
+    /// of 8 covers the realistic case (≤8 books per rule); spills
+    /// to heap above that.
+    pub(crate) source_book_idxs: SmallVec<[u32; 8]>,
+    pub(crate) destination_book_idxs: SmallVec<[u32; 8]>,
+    /// #1606: precomputed match-any short-circuit flags. True iff
+    /// the union of literal + cited books matches every address.
+    pub(crate) source_v4_match_any: bool,
+    pub(crate) source_v6_match_any: bool,
+    pub(crate) destination_v4_match_any: bool,
+    pub(crate) destination_v6_match_any: bool,
     pub(crate) applications: Vec<ApplicationMatch>,
     /// Precompiled application matcher (protocol-indexed, exact-port sets).
     compiled_apps: CompiledApplications,
@@ -82,10 +130,16 @@ impl Default for PolicyRule {
             to_zone: String::new(),
             scheduler_name: String::new(),
             inactive: false,
-            source_v4: PrefixSetV4::default(),
-            source_v6: PrefixSetV6::default(),
-            destination_v4: PrefixSetV4::default(),
-            destination_v6: PrefixSetV6::default(),
+            source_literal_v4: PrefixSetV4::default(),
+            source_literal_v6: PrefixSetV6::default(),
+            destination_literal_v4: PrefixSetV4::default(),
+            destination_literal_v6: PrefixSetV6::default(),
+            source_book_idxs: SmallVec::new(),
+            destination_book_idxs: SmallVec::new(),
+            source_v4_match_any: true,
+            source_v6_match_any: true,
+            destination_v4_match_any: true,
+            destination_v6_match_any: true,
             applications: Vec::new(),
             compiled_apps: CompiledApplications {
                 match_any: true,
@@ -106,10 +160,16 @@ impl Clone for PolicyRule {
             to_zone: self.to_zone.clone(),
             scheduler_name: self.scheduler_name.clone(),
             inactive: self.inactive,
-            source_v4: self.source_v4.clone(),
-            source_v6: self.source_v6.clone(),
-            destination_v4: self.destination_v4.clone(),
-            destination_v6: self.destination_v6.clone(),
+            source_literal_v4: self.source_literal_v4.clone(),
+            source_literal_v6: self.source_literal_v6.clone(),
+            destination_literal_v4: self.destination_literal_v4.clone(),
+            destination_literal_v6: self.destination_literal_v6.clone(),
+            source_book_idxs: self.source_book_idxs.clone(),
+            destination_book_idxs: self.destination_book_idxs.clone(),
+            source_v4_match_any: self.source_v4_match_any,
+            source_v6_match_any: self.source_v6_match_any,
+            destination_v4_match_any: self.destination_v4_match_any,
+            destination_v6_match_any: self.destination_v6_match_any,
             applications: self.applications.clone(),
             compiled_apps: self.compiled_apps.clone(),
             action: self.action,
@@ -271,6 +331,11 @@ pub(crate) struct PolicyState {
     zone_pair_index: FxHashMap<ZonePairKey, Vec<usize>>,
     /// Indices of global rules (from_zone or to_zone = "junos-global").
     global_indices: Vec<usize>,
+    /// #1606: deduplicated address-book table. Rules reference
+    /// books by dense `u32` index (`PolicyRule::source_book_idxs`).
+    pub(crate) books: Vec<BookEntry>,
+    /// #1606: wire-ID → dense-index map used at parse time only.
+    book_id_to_idx: FxHashMap<u32, u32>,
 }
 
 impl Default for PolicyState {
@@ -280,6 +345,8 @@ impl Default for PolicyState {
             rules: Vec::new(),
             zone_pair_index: FxHashMap::default(),
             global_indices: Vec::new(),
+            books: Vec::new(),
+            book_id_to_idx: FxHashMap::default(),
         }
     }
 }
@@ -299,36 +366,122 @@ pub(crate) fn parse_policy_state(
     zone_name_to_id: &FxHashMap<String, u16>,
 ) -> PolicyState {
     let counter_store = PolicyCounterStore::default();
-    parse_policy_state_with_counters(default_policy, rules, zone_name_to_id, &counter_store)
+    parse_policy_state_with_counters(default_policy, rules, zone_name_to_id, &[], &counter_store)
+        .expect("legacy parse_policy_state called with no books — cannot raise integrity errors")
 }
 
+/// #1606: fallible policy-state parser. Returns
+/// `SnapshotIntegrityError` for duplicate/zero/unknown book IDs.
+/// Callers MUST run this as a preflight before any side-effecting
+/// snapshot mutation (see `server/handlers/snapshot.rs::apply`).
 pub(crate) fn parse_policy_state_with_counters(
     default_policy: &str,
     rules: &[PolicyRuleSnapshot],
     zone_name_to_id: &FxHashMap<String, u16>,
+    address_books: &[AddressBookSnapshot],
     counter_store: &PolicyCounterStore,
-) -> PolicyState {
+) -> Result<PolicyState, SnapshotIntegrityError> {
     let mut state = PolicyState {
         default_action: parse_action(default_policy),
         rules: Vec::with_capacity(rules.len()),
         zone_pair_index: FxHashMap::default(),
         global_indices: Vec::new(),
+        books: Vec::with_capacity(address_books.len()),
+        book_id_to_idx: FxHashMap::default(),
     };
+
+    // #1606: build the dense book table first. Hard-fail on
+    // integrity errors (id=0, duplicate ids).
+    for snap in address_books {
+        if snap.id == 0 {
+            return Err(SnapshotIntegrityError::AddressBookIdZero);
+        }
+        if state.book_id_to_idx.contains_key(&snap.id) {
+            return Err(SnapshotIntegrityError::DuplicateAddressBookId(snap.id));
+        }
+        // Parse v4 / v6 literals using the v3 factory: empty
+        // collapses to MatchNone (NOT MatchAny). A v4-only book
+        // gets entry.v6 = MatchNone, etc.
+        let mut v4: Vec<PrefixV4> = Vec::with_capacity(snap.prefixes_v4.len());
+        let mut v6: Vec<PrefixV6> = Vec::with_capacity(snap.prefixes_v6.len());
+        for s in &snap.prefixes_v4 {
+            parse_literal_cidr_into(s, &mut v4, &mut v6);
+        }
+        for s in &snap.prefixes_v6 {
+            parse_literal_cidr_into(s, &mut v4, &mut v6);
+        }
+        let entry = BookEntry {
+            v4: PrefixSetV4::from_v3_literals(v4),
+            v6: PrefixSetV6::from_v3_literals(v6),
+        };
+        let dense_idx = state.books.len() as u32;
+        state.books.push(entry);
+        state.book_id_to_idx.insert(snap.id, dense_idx);
+    }
+
     for snap in rules {
-        // #923: buffer prefixes in temporary Vecs, then collapse
-        // each side to a `PrefixSet*` (MatchAny / Linear / Trie)
-        // when the rule is fully parsed.
-        let mut src_v4: Vec<PrefixV4> = Vec::new();
-        let mut src_v6: Vec<PrefixV6> = Vec::new();
-        let mut dst_v4: Vec<PrefixV4> = Vec::new();
-        let mut dst_v6: Vec<PrefixV6> = Vec::new();
-        for prefix in &snap.source_addresses {
-            parse_address(prefix, &mut src_v4, &mut src_v6);
-        }
-        for prefix in &snap.destination_addresses {
-            parse_address(prefix, &mut dst_v4, &mut dst_v6);
-        }
+        let source_is_v3_shaped =
+            !snap.source_book_ids.is_empty() || !snap.source_literals.is_empty();
+        let destination_is_v3_shaped = !snap.destination_book_ids.is_empty()
+            || !snap.destination_literals.is_empty();
+
+        // Build literal prefix sets per side using the appropriate
+        // factory.
+        let (source_literal_v4, source_literal_v6) = if source_is_v3_shaped {
+            parse_v3_literal_set(&snap.source_literals)
+        } else {
+            let mut v4: Vec<PrefixV4> = Vec::new();
+            let mut v6: Vec<PrefixV6> = Vec::new();
+            for prefix in &snap.source_addresses {
+                parse_address(prefix, &mut v4, &mut v6);
+            }
+            (
+                PrefixSetV4::from_prefixes(v4),
+                PrefixSetV6::from_prefixes(v6),
+            )
+        };
+        let (destination_literal_v4, destination_literal_v6) = if destination_is_v3_shaped {
+            parse_v3_literal_set(&snap.destination_literals)
+        } else {
+            let mut v4: Vec<PrefixV4> = Vec::new();
+            let mut v6: Vec<PrefixV6> = Vec::new();
+            for prefix in &snap.destination_addresses {
+                parse_address(prefix, &mut v4, &mut v6);
+            }
+            (
+                PrefixSetV4::from_prefixes(v4),
+                PrefixSetV6::from_prefixes(v6),
+            )
+        };
+
         let rule_id = stable_policy_rule_id(snap);
+
+        // Resolve book IDs to dense indices. Sort + dedup + hard
+        // fail on unknown.
+        let source_book_idxs =
+            resolve_book_idxs(&state.book_id_to_idx, &snap.source_book_ids, &rule_id)?;
+        let destination_book_idxs =
+            resolve_book_idxs(&state.book_id_to_idx, &snap.destination_book_ids, &rule_id)?;
+
+        // Precompute match-any flags. True iff EITHER the literal
+        // set OR any cited book's v4/v6 is MatchAny.
+        let source_v4_match_any = source_literal_v4.is_match_any()
+            || source_book_idxs
+                .iter()
+                .any(|&i| state.books[i as usize].v4.is_match_any());
+        let source_v6_match_any = source_literal_v6.is_match_any()
+            || source_book_idxs
+                .iter()
+                .any(|&i| state.books[i as usize].v6.is_match_any());
+        let destination_v4_match_any = destination_literal_v4.is_match_any()
+            || destination_book_idxs
+                .iter()
+                .any(|&i| state.books[i as usize].v4.is_match_any());
+        let destination_v6_match_any = destination_literal_v6.is_match_any()
+            || destination_book_idxs
+                .iter()
+                .any(|&i| state.books[i as usize].v6.is_match_any());
+
         let mut rule = PolicyRule {
             rule_id: rule_id.clone(),
             policy_id: snap.policy_id,
@@ -338,10 +491,16 @@ pub(crate) fn parse_policy_state_with_counters(
             inactive: snap.inactive,
             action: parse_action(&snap.action),
             hit_counter: counter_store.rule_hit_counter(&rule_id),
-            source_v4: PrefixSetV4::from_prefixes(src_v4),
-            source_v6: PrefixSetV6::from_prefixes(src_v6),
-            destination_v4: PrefixSetV4::from_prefixes(dst_v4),
-            destination_v6: PrefixSetV6::from_prefixes(dst_v6),
+            source_literal_v4,
+            source_literal_v6,
+            destination_literal_v4,
+            destination_literal_v6,
+            source_book_idxs,
+            destination_book_idxs,
+            source_v4_match_any,
+            source_v6_match_any,
+            destination_v4_match_any,
+            destination_v6_match_any,
             ..PolicyRule::default()
         };
         rule.applications = parse_applications(&snap.application_terms);
@@ -353,11 +512,6 @@ pub(crate) fn parse_policy_state_with_counters(
         if is_global {
             state.global_indices.push(idx);
         } else {
-            // #922: translate zone names to IDs at config-load time.
-            // A rule referencing an unknown zone is kept in `rules`
-            // (so hit-counter reporting still works) but omitted from
-            // the index — it becomes a dead rule with the same
-            // semantics as today's "name not in any session" case.
             match (
                 zone_name_to_id.get(&snap.from_zone).copied(),
                 zone_name_to_id.get(&snap.to_zone).copied(),
@@ -375,7 +529,87 @@ pub(crate) fn parse_policy_state_with_counters(
             }
         }
     }
-    state
+    Ok(state)
+}
+
+/// #1606: parse the v3 `source_literals` / `destination_literals`
+/// field. "any" token forces MatchAny on BOTH families (Codex r5
+/// F-r5-1 fix); empty input or no-any → MatchNone (via
+/// `from_v3_literals`).
+fn parse_v3_literal_set(literals: &[String]) -> (PrefixSetV4, PrefixSetV6) {
+    let mut any_v4 = false;
+    let mut any_v6 = false;
+    let mut v4: Vec<PrefixV4> = Vec::new();
+    let mut v6: Vec<PrefixV6> = Vec::new();
+    for tok in literals {
+        match tok.as_str() {
+            "any" => {
+                any_v4 = true;
+                any_v6 = true;
+            }
+            "any4" => any_v4 = true,
+            "any6" => any_v6 = true,
+            "" => {}
+            s => parse_literal_cidr_into(s, &mut v4, &mut v6),
+        }
+    }
+    let v4_set = if any_v4 {
+        PrefixSetV4::MatchAny
+    } else {
+        PrefixSetV4::from_v3_literals(v4)
+    };
+    let v6_set = if any_v6 {
+        PrefixSetV6::MatchAny
+    } else {
+        PrefixSetV6::from_v3_literals(v6)
+    };
+    (v4_set, v6_set)
+}
+
+fn parse_literal_cidr_into(
+    prefix: &str,
+    out_v4: &mut Vec<PrefixV4>,
+    out_v6: &mut Vec<PrefixV6>,
+) {
+    if prefix.is_empty() || prefix == "any" {
+        return;
+    }
+    match prefix.parse::<IpNet>() {
+        Ok(IpNet::V4(net)) => out_v4.push(PrefixV4::from_net(net)),
+        Ok(IpNet::V6(net)) => out_v6.push(PrefixV6::from_net(net)),
+        Err(_) => {
+            if let Ok(ip) = prefix.parse::<Ipv4Addr>() {
+                out_v4.push(PrefixV4::from_net(
+                    ipnet::Ipv4Net::new(ip, 32).expect("v4 /32"),
+                ));
+            } else if let Ok(ip) = prefix.parse::<Ipv6Addr>() {
+                out_v6.push(PrefixV6::from_net(
+                    ipnet::Ipv6Net::new(ip, 128).expect("v6 /128"),
+                ));
+            }
+        }
+    }
+}
+
+fn resolve_book_idxs(
+    book_id_to_idx: &FxHashMap<u32, u32>,
+    ids: &[u32],
+    rule_id: &str,
+) -> Result<SmallVec<[u32; 8]>, SnapshotIntegrityError> {
+    let mut sorted = ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut out: SmallVec<[u32; 8]> = SmallVec::new();
+    for id in sorted {
+        let Some(&idx) = book_id_to_idx.get(&id) else {
+            return Err(SnapshotIntegrityError::UnknownAddressBookId {
+                rule_id: rule_id.to_string(),
+                book_id: id,
+            });
+        };
+        out.push(idx);
+    }
+    Ok(out)
 }
 
 pub(crate) fn evaluate_policy(
@@ -422,14 +656,12 @@ pub(crate) fn evaluate_policy_result_with_len(
     dst_port: u16,
     packet_len: u64,
 ) -> PolicyEvaluationResult {
-    // Phase 2 optimisation: look up only the rules for this zone-pair
-    // instead of scanning all rules. Global rules are checked afterward.
-    // #922: zero-allocation key (packed u32).
     let key = zone_pair_key(from_id, to_id);
     if let Some(indices) = state.zone_pair_index.get(&key) {
         for &idx in indices {
             if let Some(result) = try_match_rule(
                 &state.rules[idx],
+                state,
                 src_ip,
                 dst_ip,
                 protocol,
@@ -441,10 +673,10 @@ pub(crate) fn evaluate_policy_result_with_len(
             }
         }
     }
-    // Global policies (junos-global) apply to any zone-pair.
     for &idx in &state.global_indices {
         if let Some(result) = try_match_rule(
             &state.rules[idx],
+            state,
             src_ip,
             dst_ip,
             protocol,
@@ -462,10 +694,13 @@ pub(crate) fn evaluate_policy_result_with_len(
 }
 
 /// Try to match a single policy rule against packet fields.
-/// Returns the rule's action if all criteria match, None otherwise.
+/// #1606: walks the literal set + every cited book's dense entry
+/// via `state.books[idx]`. Match-any flags short-circuit the
+/// common "any" case.
 #[inline]
 fn try_match_rule(
     rule: &PolicyRule,
+    state: &PolicyState,
     src_ip: IpAddr,
     dst_ip: IpAddr,
     protocol: u8,
@@ -479,26 +714,47 @@ fn try_match_rule(
     if !rule.compiled_apps.matches(protocol, src_port, dst_port) {
         return None;
     }
-    match (src_ip, dst_ip) {
-        (IpAddr::V4(src), IpAddr::V4(dst))
-            if rule.source_v4.contains(src) && rule.destination_v4.contains(dst) =>
-        {
-            rule.hit_counter.add(packet_len);
-            Some(PolicyEvaluationResult {
-                action: rule.action,
-                policy_id: rule.policy_id,
-            })
+    let (src_ok, dst_ok) = match (src_ip, dst_ip) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            let s = rule.source_v4_match_any
+                || rule.source_literal_v4.contains(src)
+                || rule
+                    .source_book_idxs
+                    .iter()
+                    .any(|&i| state.books[i as usize].v4.contains(src));
+            let d = rule.destination_v4_match_any
+                || rule.destination_literal_v4.contains(dst)
+                || rule
+                    .destination_book_idxs
+                    .iter()
+                    .any(|&i| state.books[i as usize].v4.contains(dst));
+            (s, d)
         }
-        (IpAddr::V6(src), IpAddr::V6(dst))
-            if rule.source_v6.contains(src) && rule.destination_v6.contains(dst) =>
-        {
-            rule.hit_counter.add(packet_len);
-            Some(PolicyEvaluationResult {
-                action: rule.action,
-                policy_id: rule.policy_id,
-            })
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            let s = rule.source_v6_match_any
+                || rule.source_literal_v6.contains(src)
+                || rule
+                    .source_book_idxs
+                    .iter()
+                    .any(|&i| state.books[i as usize].v6.contains(src));
+            let d = rule.destination_v6_match_any
+                || rule.destination_literal_v6.contains(dst)
+                || rule
+                    .destination_book_idxs
+                    .iter()
+                    .any(|&i| state.books[i as usize].v6.contains(dst));
+            (s, d)
         }
-        _ => None,
+        _ => return None,
+    };
+    if src_ok && dst_ok {
+        rule.hit_counter.add(packet_len);
+        Some(PolicyEvaluationResult {
+            action: rule.action,
+            policy_id: rule.policy_id,
+        })
+    } else {
+        None
     }
 }
 

@@ -231,8 +231,9 @@ fn hit_counters_survive_scheduler_snapshot_rebuild() {
         "deny",
         &[scheduled_allow_snapshot(&rule_id, false)],
         &test_zone_name_to_id(),
+        &[],
         &counter_store,
-    );
+    ).expect("test snapshot must not produce integrity error");
 
     for _ in 0..2 {
         assert_eq!(
@@ -259,8 +260,9 @@ fn hit_counters_survive_scheduler_snapshot_rebuild() {
         "deny",
         &[scheduled_allow_snapshot(&rule_id, true)],
         &test_zone_name_to_id(),
+        &[],
         &counter_store,
-    );
+    ).expect("test snapshot must not produce integrity error");
     assert!(inactive.rules[0].inactive);
     assert_eq!(policy_counter(&inactive, &rule_id).packets, 2);
     assert_eq!(
@@ -285,8 +287,9 @@ fn hit_counters_survive_scheduler_snapshot_rebuild() {
         "deny",
         &[scheduled_allow_snapshot(&rule_id, false)],
         &test_zone_name_to_id(),
+        &[],
         &counter_store,
-    );
+    ).expect("test snapshot must not produce integrity error");
     assert_eq!(policy_counter(&active_again, &rule_id).packets, 2);
     assert_eq!(
         evaluate_policy(
@@ -313,8 +316,9 @@ fn hit_counters_reset_after_rule_absent_then_readded() {
         "deny",
         &[scheduled_allow_snapshot(&rule_id, false)],
         &test_zone_name_to_id(),
+        &[],
         &counter_store,
-    );
+    ).expect("test snapshot must not produce integrity error");
     assert_eq!(
         evaluate_policy_with_len(
             &active,
@@ -335,7 +339,13 @@ fn hit_counters_reset_after_rule_absent_then_readded() {
 
     counter_store.reconcile_rules(&[]);
     let deleted =
-        parse_policy_state_with_counters("deny", &[], &test_zone_name_to_id(), &counter_store);
+        parse_policy_state_with_counters(
+        "deny",
+        &[],
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    ).expect("test snapshot must not produce integrity error");
     assert!(deleted.counter_snapshots().is_empty());
 
     counter_store.reconcile_rules(&[scheduled_allow_snapshot(&rule_id, false)]);
@@ -343,8 +353,9 @@ fn hit_counters_reset_after_rule_absent_then_readded() {
         "deny",
         &[scheduled_allow_snapshot(&rule_id, false)],
         &test_zone_name_to_id(),
+        &[],
         &counter_store,
-    );
+    ).expect("test snapshot must not produce integrity error");
     let reset_counter = policy_counter(&active_again, &rule_id);
     assert_eq!(reset_counter.packets, 0);
     assert_eq!(reset_counter.bytes, 0);
@@ -663,5 +674,340 @@ fn malformed_only_input_yields_match_all_via_evaluate_policy() {
             80,
         ),
         PolicyAction::Permit
+    );
+}
+
+// #1606 — address-book wire-protocol tests.
+
+fn book(id: u32, name: &str, v4: &[&str], v6: &[&str]) -> AddressBookSnapshot {
+    AddressBookSnapshot {
+        id,
+        name: name.to_string(),
+        prefixes_v4: v4.iter().map(|s| s.to_string()).collect(),
+        prefixes_v6: v6.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn v3_rule(name: &str, src_books: &[u32], src_lits: &[&str]) -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        name: name.to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_book_ids: src_books.to_vec(),
+        source_literals: src_lits.iter().map(|s| s.to_string()).collect(),
+        destination_literals: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_book_table_dedup_by_index() {
+    // Two rules cite the same book ID. After parsing, both rules
+    // resolve to the same dense index → identical match path.
+    let books = [book(42, "corp-net", &["10.0.0.0/8"], &[])];
+    let rules = [
+        v3_rule("rule-a", &[42], &[]),
+        v3_rule("rule-b", &[42], &[]),
+    ];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    assert_eq!(state.books.len(), 1);
+    assert_eq!(state.rules[0].source_book_idxs[..], state.rules[1].source_book_idxs[..]);
+}
+
+#[test]
+fn test_book_only_rule_does_not_fail_open() {
+    // A rule citing only a book (empty source_literals) must
+    // match ONLY IPs covered by the book — NOT all v4 traffic.
+    // Without the MatchNone fix this rule would have
+    // source_literal_v4 = MatchAny (legacy from_prefixes(empty)
+    // semantics) and match-all.
+    let books = [book(7, "internal", &["10.0.0.0/8"], &[])];
+    let rules = [v3_rule("internal-only", &[7], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    // Inside the book → match (Permit).
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "10.5.5.5".parse().expect("src"),
+            "1.1.1.1".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            80,
+        ),
+        PolicyAction::Permit
+    );
+    // Outside the book → default Deny. If MatchNone is broken,
+    // this would be Permit (match-all).
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "8.8.8.8".parse().expect("src"),
+            "1.1.1.1".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            80,
+        ),
+        PolicyAction::Deny
+    );
+}
+
+#[test]
+fn test_v3_shaped_any_token_matches_all_v4_and_v6() {
+    // Codex r5 F-r5-1 regression test: a v3-shaped rule with
+    // source_literals=["any"] must match all v4 AND v6, NOT
+    // fail closed via MatchNone.
+    let rules = [PolicyRuleSnapshot {
+        name: "any-perm".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_literals: vec!["any".to_string()],
+        destination_literals: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    }];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "8.8.8.8".parse().expect("src"),
+            "1.1.1.1".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            80,
+        ),
+        PolicyAction::Permit
+    );
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "2001:db8::1".parse().expect("src"),
+            "2001:db8::2".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            80,
+        ),
+        PolicyAction::Permit
+    );
+}
+
+#[test]
+fn test_v4_only_book_does_not_match_v6_traffic() {
+    // Codex r4 family-incomplete-book test. A v4-only book has
+    // entry.v6 = MatchNone, so a v6 packet hitting a rule citing
+    // only this book MUST NOT match.
+    let books = [book(11, "v4-only", &["10.0.0.0/8"], &[])];
+    let rules = [v3_rule("v4-only-rule", &[11], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    // v6 packet → no match → default deny.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "2001:db8::1".parse().expect("src"),
+            "2001:db8::2".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            80,
+        ),
+        PolicyAction::Deny
+    );
+}
+
+#[test]
+fn test_v6_only_book_does_not_match_v4_traffic() {
+    let books = [book(12, "v6-only", &[], &["2001:db8::/32"])];
+    let rules = [v3_rule("v6-only-rule", &[12], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "8.8.8.8".parse().expect("src"),
+            "1.1.1.1".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            80,
+        ),
+        PolicyAction::Deny
+    );
+}
+
+#[test]
+fn test_unknown_book_id_hard_fails_snapshot() {
+    // Rule cites book ID 99 but address_books is empty → hard fail.
+    let rules = [v3_rule("missing-book", &[99], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let result = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    );
+    match result {
+        Err(SnapshotIntegrityError::UnknownAddressBookId { book_id, .. }) => {
+            assert_eq!(book_id, 99);
+        }
+        other => panic!("expected UnknownAddressBookId(99), got {:?}", other),
+    }
+}
+
+#[test]
+fn test_duplicate_address_book_id_hard_fails_snapshot() {
+    let books = [book(5, "a", &["10.0.0.0/24"], &[]), book(5, "b", &["10.1.0.0/24"], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let result = parse_policy_state_with_counters(
+        "deny",
+        &[],
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    );
+    match result {
+        Err(SnapshotIntegrityError::DuplicateAddressBookId(id)) => assert_eq!(id, 5),
+        other => panic!("expected DuplicateAddressBookId(5), got {:?}", other),
+    }
+}
+
+#[test]
+fn test_book_id_zero_hard_fails_snapshot() {
+    let books = [book(0, "reserved", &["10.0.0.0/24"], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let result = parse_policy_state_with_counters(
+        "deny",
+        &[],
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    );
+    assert!(
+        matches!(result, Err(SnapshotIntegrityError::AddressBookIdZero)),
+        "expected AddressBookIdZero, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_per_rule_duplicate_book_ids_are_deduped() {
+    let books = [book(8, "x", &["10.0.0.0/8"], &[])];
+    let rules = [v3_rule("dup-ids", &[8, 8, 8], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    // After sort+dedup, only one index is stored.
+    assert_eq!(state.rules[0].source_book_idxs.len(), 1);
+}
+
+#[test]
+fn test_non_v3_shaped_falls_through_to_legacy_field() {
+    // Rule has source_addresses populated (legacy emission) but
+    // NO source_book_ids or source_literals → non-v3-shaped → use
+    // legacy field via from_prefixes (empty → MatchAny). With a
+    // concrete CIDR in the legacy field, matching is correct.
+    let rules = [PolicyRuleSnapshot {
+        name: "legacy".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["10.0.0.0/8".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    }];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    // In the 10/8 range → match.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "10.5.5.5".parse().expect("src"),
+            "1.1.1.1".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            80,
+        ),
+        PolicyAction::Permit
+    );
+    // Outside 10/8 → no match.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "8.8.8.8".parse().expect("src"),
+            "1.1.1.1".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            80,
+        ),
+        PolicyAction::Deny
     );
 }

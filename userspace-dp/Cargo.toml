@@ -20,6 +20,7 @@ serde_json = "1.0"
 rustc-hash = "2.1"
 sha2 = "0.10"
 slab = "0.4"
+smallvec = "1.13"
 # WireGuard clean-room termination (docs/pr/wireguard-clean/plan.md):
 # snow provides Noise IK with explicit state machine and no hidden
 # output queues. The transitive crypto set includes

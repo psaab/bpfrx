@@ -105,14 +105,26 @@ fn parse_syn_cookie_master_key(key: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
+/// Test/legacy entry point — infallible; panics on snapshot
+/// integrity error (which test snapshots never hit). Production
+/// code uses `try_build_forwarding_state_*` instead.
 pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
-    build_forwarding_state_with_policy_counters(snapshot, &PolicyCounterStore::default())
+    try_build_forwarding_state_with_policy_counters(snapshot, &PolicyCounterStore::default())
+        .expect("test snapshot must not produce policy integrity error")
 }
 
 pub(super) fn build_forwarding_state_with_policy_counters(
     snapshot: &ConfigSnapshot,
     policy_counters: &PolicyCounterStore,
 ) -> ForwardingState {
+    try_build_forwarding_state_with_policy_counters(snapshot, policy_counters)
+        .expect("test snapshot must not produce policy integrity error")
+}
+
+pub(super) fn try_build_forwarding_state_with_policy_counters(
+    snapshot: &ConfigSnapshot,
+    policy_counters: &PolicyCounterStore,
+) -> Result<ForwardingState, crate::policy::SnapshotIntegrityError> {
     build_forwarding_state_with_policy_counters_and_previous(snapshot, policy_counters, None)
 }
 
@@ -120,7 +132,7 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     snapshot: &ConfigSnapshot,
     policy_counters: &PolicyCounterStore,
     previous: Option<&ForwardingState>,
-) -> ForwardingState {
+) -> Result<ForwardingState, crate::policy::SnapshotIntegrityError> {
     let mut state = ForwardingState::default();
     let (excluded_local_v4, excluded_local_v6) = nat_translated_local_exclusions(snapshot);
 
@@ -145,8 +157,9 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
         &snapshot.default_policy,
         &snapshot.policies,
         &state.zone_name_to_id,
+        &snapshot.address_books,
         policy_counters,
-    );
+    )?;
     state.allow_dns_reply = snapshot.flow.allow_dns_reply;
     state.allow_embedded_icmp = snapshot.flow.allow_embedded_icmp;
     state.session_timeouts = crate::session::SessionTimeouts::from_seconds(
@@ -300,14 +313,28 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
             state.policy.rules.len(),
         );
         for (i, rule) in state.policy.rules.iter().enumerate() {
+            // #1606: aggregate prefix count across the rule's
+            // literal set + every cited book's dense entry.
+            let src_v4_count = rule.source_literal_v4.prefix_count()
+                + rule
+                    .source_book_idxs
+                    .iter()
+                    .map(|&idx| state.policy.books[idx as usize].v4.prefix_count())
+                    .sum::<usize>();
+            let dst_v4_count = rule.destination_literal_v4.prefix_count()
+                + rule
+                    .destination_book_idxs
+                    .iter()
+                    .map(|&idx| state.policy.books[idx as usize].v4.prefix_count())
+                    .sum::<usize>();
             debug_log!(
                 "FWD_STATE: policy[{}] {}->{}  action={:?} src_v4={} dst_v4={} apps={}",
                 i,
                 rule.from_zone,
                 rule.to_zone,
                 rule.action,
-                rule.source_v4.prefix_count(),
-                rule.destination_v4.prefix_count(),
+                src_v4_count,
+                dst_v4_count,
                 rule.applications.len(),
             );
         }
@@ -349,5 +376,5 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     // the DP handles all TCP state for those addresses.
     install_kernel_rst_suppression(&state);
 
-    state
+    Ok(state)
 }

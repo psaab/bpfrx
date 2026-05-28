@@ -69,6 +69,32 @@ impl Coordinator {
     ) {
         self.reconcile_calls += 1;
         self.last_reconcile_stage = "start".to_string();
+        // #1606 (AGY r2 finding 4.2): policy-integrity preflight
+        // BEFORE tear_down. If the snapshot has duplicate / zero /
+        // unknown book IDs, reject WITHOUT tearing down the
+        // existing workers. Workers keep running on the previous
+        // good config until a valid snapshot arrives.
+        //
+        // Uses a scratch counter store (Codex r1 F2) so we don't
+        // leak Arc<PolicyRuleCounter> entries on rejected snapshots.
+        if let Some(snap) = snapshot {
+            let preflight_counters = crate::policy::PolicyCounterStore::default();
+            if let Err(err) = crate::policy::parse_policy_state_with_counters(
+                &snap.default_policy,
+                &snap.policies,
+                &self.forwarding.zone_name_to_id,
+                &snap.address_books,
+                &preflight_counters,
+            ) {
+                eprintln!(
+                    "xpf-userspace-dp: snapshot integrity error during reconcile preflight: {} — keeping previous workers + forwarding state",
+                    err
+                );
+                self.last_reconcile_stage =
+                    format!("snapshot_integrity_error: {}", err);
+                return;
+            }
+        }
         let preserved = teardown::tear_down(self);
         reset::reset_binding_counters(bindings);
         let Some(snapshot) = snapshot else {

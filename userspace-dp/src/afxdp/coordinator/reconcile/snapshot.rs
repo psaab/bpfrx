@@ -24,17 +24,33 @@ pub(super) fn apply_snapshot(
     bindings: &mut [BindingStatus],
     preserved_slow_path: Option<Arc<SlowPathReinjector>>,
 ) -> Option<ReconcileSnapshotFds> {
+    // #1606: preflight policy build BEFORE any side-effecting
+    // mutation. Surfaces address-book integrity errors (id=0,
+    // duplicate ids, unknown rule references) before
+    // ValidationState, policy_counters, or coord.forwarding is
+    // mutated.
+    let new_forwarding = match build_forwarding_state_with_policy_counters_and_previous(
+        snapshot,
+        &coord.policy_counters,
+        Some(&coord.forwarding),
+    ) {
+        Ok(fwd) => fwd,
+        Err(err) => {
+            eprintln!(
+                "xpf-userspace-dp: snapshot integrity error during reconcile: {} — keeping previous forwarding state",
+                err
+            );
+            return None;
+        }
+    };
+
     coord.validation = ValidationState {
         snapshot_installed: true,
         config_generation: snapshot.generation,
         fib_generation: snapshot.fib_generation,
     };
     coord.policy_counters.reconcile_rules(&snapshot.policies);
-    coord.forwarding = build_forwarding_state_with_policy_counters_and_previous(
-        snapshot,
-        &coord.policy_counters,
-        Some(&coord.forwarding),
-    );
+    coord.forwarding = new_forwarding;
     coord.shared_validation.store(Arc::new(coord.validation));
     coord
         .ha
