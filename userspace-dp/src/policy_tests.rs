@@ -1193,3 +1193,47 @@ fn test_book_entry_canonical_prefix_lists_trie_variant() {
         assert!(entry.v4.contains(p.addr()));
     }
 }
+
+#[test]
+fn test_book_entry_zero_plus_non_zero_prefixes_preserved() {
+    // Copilot r3 nit: a book containing 0.0.0.0/0 AND 10.0.0.0/8
+    // (or analogous v6) — PrefixSet collapses to MatchAny (which
+    // drops the non-/0 entries from its internal Linear/Trie
+    // representation), but the parallel `prefixes_v{4,6}` array
+    // MUST retain BOTH entries so the future Multi-Book LPM build
+    // can route /0 through the §2.6 short-circuit while still
+    // inserting the /8 (and analogous) prefixes into the LPM
+    // proper. This is the load-bearing motivation for the parallel
+    // array.
+    let books = [book(
+        106,
+        "any-plus-net",
+        &["0.0.0.0/0", "10.0.0.0/8"],
+        &["::/0", "2001:db8::/32"],
+    )];
+    let rules = [v3_rule("r", &[106], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let entry = &state.books[0];
+    // PrefixSet collapses to MatchAny on both families due to /0.
+    assert!(entry.v4.is_match_any());
+    assert!(entry.v6.is_match_any());
+    // But the parallel arrays preserve BOTH the /0 and the non-/0
+    // entries — this is exactly what the future LPM builder needs.
+    assert_eq!(entry.prefixes_v4.len(), 2);
+    assert_eq!(entry.prefixes_v6.len(), 2);
+    // /0 and the non-/0 entry must both be present.
+    let v4_lens: Vec<u8> = entry.prefixes_v4.iter().map(|p| p.prefix_len()).collect();
+    assert!(v4_lens.contains(&0), "v4 parallel array must keep /0: got {v4_lens:?}");
+    assert!(v4_lens.contains(&8), "v4 parallel array must keep /8: got {v4_lens:?}");
+    let v6_lens: Vec<u8> = entry.prefixes_v6.iter().map(|p| p.prefix_len()).collect();
+    assert!(v6_lens.contains(&0), "v6 parallel array must keep ::/0: got {v6_lens:?}");
+    assert!(v6_lens.contains(&32), "v6 parallel array must keep /32: got {v6_lens:?}");
+}

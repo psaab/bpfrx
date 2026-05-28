@@ -4196,3 +4196,9 @@ top.
 - **Timestamp**: 2026-05-27 (UTC)
   - **Action**: Copilot re-reviewed at HEAD 3787f51ee and posted 2 NEW inline findings: (1) struct doc claim "PrefixSet's contained prefixes are exactly the parallel array's entries" is structurally wrong because /0 collapses to MatchAny — fixed by rewording to semantic-membership-equivalence; (2) Arc::from(v4.clone().into_boxed_slice()) allocates an intermediate Box — fixed by switching to Arc::from(v4.as_slice()) which uses the impl From<&[T]> for Arc<[T]> single-fused-allocation path (PrefixV4/V6 are Copy). 6 tests still pass; 5/5 flake clean; 1458 total tests pass.
   - **File(s)**: userspace-dp/src/policy.rs (struct doc reword + Arc construction switch)
+
+## 2026-05-27 — PR #1624 Copilot r3 inline findings (2) addressed
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Copilot r3 at HEAD 5dc6dc9d3 posted 2 inline comments: (1) `T: Copy` claim in Arc::from comment is misleading — standard impl is `T: Clone`. Fixed comment. (2) Missing test for /0 AND non-/0 prefixes case (the load-bearing motivation for the parallel array). Added test_book_entry_zero_plus_non_zero_prefixes_preserved covering both v4 and v6, asserting PrefixSet collapses to MatchAny but parallel array preserves both entries. 7 tests now pass; 5/5 flake clean; 1459 total tests pass.
+  - **File(s)**: userspace-dp/src/policy.rs (T: Clone comment fix), userspace-dp/src/policy_tests.rs (+1 test)

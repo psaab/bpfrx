@@ -448,11 +448,13 @@ pub(crate) fn parse_policy_state_with_counters(
         // parallel fields carry the original prefix shape for the
         // future Multi-Book LPM builder.
         //
-        // Cost: `Arc::<[T]>::from(&[T])` (used here via the
-        // `From<&[T]> for Arc<[T]>` impl when `T: Copy`) performs a
-        // single fused allocation of the Arc header + slice payload,
-        // then copies the n elements in. O(n) time + one allocation
-        // per side per book, with no intermediate Vec/Box. This runs
+        // Cost: `Arc::<[T]>::from(&[T])` (the
+        // `impl<T: Clone> From<&[T]> for Arc<[T]>` blanket;
+        // `PrefixV{4,6}` happen to be `Copy` which makes the
+        // per-element clone trivial) performs a single fused
+        // allocation of the Arc header + slice payload, then copies
+        // the n elements in. O(n) time + one allocation per side
+        // per book, with no intermediate Vec/Box. This runs
         // once per parse invocation — both the preflight integrity
         // check and the actual apply build — never on the hot path,
         // so the O(n) cost is acceptable. `Prefix*` types are small
