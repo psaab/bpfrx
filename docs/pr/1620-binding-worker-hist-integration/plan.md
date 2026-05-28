@@ -1,6 +1,9 @@
 # #1620 step-3 follow-up B: BindingWorker integration for cold-path latency histogram
 
-**Status**: DRAFT v2 — round-1 PLAN-NEEDS-MAJOR resolution
+**Status**: DRAFT v3 — round-2 PLAN-NEEDS-MINOR resolution (Codex r2 +
+AGY r2 both PLAN-NEEDS-MINOR; absorbs `#[repr(C)]` layout
+enforcement on the cold-path structs + wrapper_baseline subtraction
+in the post-eval block + CLI validator overflow guard)
 **Branch**: `refactor/1620-binding-worker-hist-integration`
 **Parent**: #1612 scaffolding (PR #1619, merged as 4ac85e2fd). Sibling
 follow-up: #1621 (wire protocol + Prometheus).
@@ -9,6 +12,25 @@ v3.2 §1.3, §1.4, §3.1 from `docs/pr/1612-scale-target-measurement/plan.md`.
 All design decisions on bucket layout, alias detection, seqlock split,
 TSC fence positioning, and sample-phase semantics inherit from that
 plan and the #1619 scaffolding already in tree.
+
+## v2 → v3 fatal-axis resolution map
+
+| Reviewer / finding | v2 source | v3 fix | Section |
+|--------------------|-----------|--------|---------|
+| AGY r2 Amendment A + Codex r2 MED: `#[repr(C)]` missing | v2 §4.1 used `#[repr(align(64))]` only; default `#[repr(Rust)]` is free to reorder heterogeneous fields | v3 annotates `WorkerColdPathCounters` with `#[repr(C)]` and `WorkerColdPathAtomics` with `#[repr(C, align(64))]`. Layout math is now compiler-enforced: hot fields land in cacheline 0. | §4.1 |
+| AGY r2 Amendment B: missing wrapper_baseline subtraction | v2 §4.4 computed `delta_ns = (delta_tsc * q32) >> 32` but never subtracted `wrapper_ns_baseline` despite calibrating it | v3 inserts `let delta_ns = raw_ns.saturating_sub(binding.cold_path.wrapper_ns_baseline)` inside the q32-skip block. `saturating_sub` prevents debug-build panic if `raw_ns < baseline` (OoO retirement edge case). | §4.4 |
+| Codex r2 LOW/MED: CLI validator overflow on `u64::MAX + 1` | v2 §4.3 used `mask & (mask+1) == 0` directly | v3 explicitly handles the `u64::MAX` case: in Go `mask+1` wraps to 0 and `0 & u64::MAX == 0` would falsely pass. v3 short-circuits `if next == 0 { reject }` before the AND-check, with helpful error message. | §4.3 |
+
+Round-2 attestation:
+- **Codex** task-mppl7scr-w2unwz: PLAN-NEEDS-MINOR (sandbox-broken
+  prevented file-level grep, but conceptually approved with the same
+  two structural amendments + the CLI overflow MED).
+- **AGY** adversarial-review-mppl8c0b-ofyy0y: PLAN-NEEDS-MINOR (axes
+  1/3/4/5 all clean; axes 2 + 6 each flagged one structural
+  amendment).
+- **Claude SMR** claude-smr-plan-r2.md: PLAN-READY (F8/F9/F10 NIT
+  only; v3 absorbs no further changes from SMR — the SMR NITs were
+  meta-questions about implementation paths).
 
 ## v1 → v2 fatal-axis resolution map
 
@@ -143,11 +165,18 @@ pub(crate) struct BindingWorker {
 }
 ```
 
-**Hot-field reordering inside `WorkerColdPathCounters`** (AGY F2;
-mechanical edit of #1619's struct, justified below):
+**Hot-field reordering + `#[repr(C)]` enforcement inside
+`WorkerColdPathCounters`** (AGY F2 + AGY r2 Amendment A + Codex r2
+MED; mechanical edit of #1619's struct, justified below):
+
+The `#[repr(C)]` annotation is **load-bearing**: under default
+`#[repr(Rust)]` the compiler may reorder heterogeneous fields to
+optimize packing, which would destroy the hot-cacheline isolation.
+Reviewers explicitly flagged this in r2.
 
 ```rust
 // userspace-dp/src/afxdp/cold_path_hist.rs
+#[repr(C)]
 pub(in crate::afxdp) struct WorkerColdPathCounters {
     // === HOT FIELDS (read/written on every session-miss packet) ===
     // First cacheline: ~32 bytes.
@@ -170,9 +199,12 @@ adjusted to match, but field semantics are unchanged. Tests in
 `cold_path_hist.rs` are field-order-agnostic and pass without
 modification.
 
-The same reorder applies to `WorkerColdPathAtomics`:
+The same reorder + `#[repr(C, align(64))]` applies to
+`WorkerColdPathAtomics`. The `align(64)` keeps the cacheline-isolation
+invariant from #1619; the `C` enforces declared field order:
 
 ```rust
+#[repr(C, align(64))]
 pub(in crate::afxdp) struct WorkerColdPathAtomics {
     // === HOT FIELDS (read by publish_from_local each ~1s tick) ===
     pub(in crate::afxdp) cold_window_gen: AtomicU64,
@@ -189,7 +221,24 @@ pub(in crate::afxdp) struct WorkerColdPathAtomics {
 }
 ```
 
-`#[repr(align(64))]` preserved per #1619.
+`#[repr(C, align(64))]` (was `#[repr(align(64))]` in #1619 — v3
+adds the `C` per AGY r2 + Codex r2 to forbid compiler field
+reordering).
+
+**Layout math verified by AGY r2 Axis 2** (assuming `#[repr(C)]`):
+- Offset 0: `sample_phase` u64 → [0..7]
+- Offset 8: `ns_per_tsc_q32` u64 → [8..15]
+- Offset 16: `wrapper_ns_baseline` u64 → [16..23]
+- Offset 24: `clock_source` (ClockSource, repr-default = u8) → [24]
+- Offset 25: `alias_seen` [bool; 16] → [25..40] (alignment 1, no padding)
+- Offset 41..47: 7 bytes padding to reach next 8-aligned offset
+- Offset 48: `first_key` [u64; 16] → [48..175]
+
+The first 48 bytes — all hot fields plus `alias_seen` and the
+padding gap — fit inside cacheline 0 ([0..63]). `first_key`'s
+element 0 lives at offset 48..55 inside the same cacheline. So
+the hot reads (`sample_phase`, `ns_per_tsc_q32`,
+`wrapper_ns_baseline`, `clock_source`) all land in one cacheline.
 
 Default-initialized in `BindingWorker::create` (`worker/mod.rs`) via
 `cold_path: WorkerColdPathCounters::default()`. Memory cost per
@@ -260,12 +309,34 @@ Validation in `main.go` after `flag.Parse()`:
 if enable1in1 {
     coldPathSampleMask = 0
 }
-// Validate: must be all-ones-below-some-bit (i.e. mask + 1 must be a power of two).
-if !enable1in1 && coldPathSampleMask != 0 && (coldPathSampleMask & (coldPathSampleMask+1)) != 0 {
-    return fmt.Errorf("--cold-path-sample-mask=0x%x: must be a power-of-two minus one " +
-        "(0x1, 0x3, 0x7, 0xff, 0x3ff, ...) or 0 with --enable-cold-path-1-in-1-sampling", coldPathSampleMask)
+// Validate: must be all-ones-below-some-bit (i.e. mask + 1 must be a
+// power of two). Codex r2 caught: in Rust, `mask + 1` on u64::MAX
+// would panic in debug builds. Go's uint64 +1 wraps silently to 0,
+// and `0 & u64::MAX == 0`, so `u64::MAX` would FALSELY pass the
+// validator below. Explicitly reject u64::MAX and use Go's
+// well-defined unsigned overflow (mask + 1 == 0 when mask == u64::MAX):
+if !enable1in1 && coldPathSampleMask != 0 {
+    next := coldPathSampleMask + 1  // u64; wraps to 0 if MAX
+    if next == 0 || (coldPathSampleMask & next) != 0 {
+        return fmt.Errorf(
+            "--cold-path-sample-mask=0x%x: must be a power-of-two " +
+            "minus one (0x1, 0x3, 0x7, 0xff, 0x3ff, ...) or 0 with " +
+            "--enable-cold-path-1-in-1-sampling. Rejecting u64::MAX " +
+            "as it would mean a 1-in-2^64 sampling rate (functionally " +
+            "off, but ambiguous with --enable-1-in-1=false; use a " +
+            "specific power-of-2 minus one instead).",
+            coldPathSampleMask,
+        )
+    }
 }
 ```
+
+The Rust receiver does NOT re-validate (the Go side is authoritative
+on CLI surface); the receiver just `unwrap_or(0xff)`s the
+`Option<u64>` and uses the value directly in the AND-mask. A
+malformed mask that slipped past Go-side validation would still
+function (e.g. mask=0x5 = 1-in-2 sometimes / 1-in-4 sometimes); not
+ideal but not a security or correctness issue.
 
 **Option<u64> on the wire** (v2 absorbs Codex+AGY+Claude SMR HIGH on
 default-skew):
@@ -353,7 +424,17 @@ if sample_tag {
     let q32 = binding.cold_path.ns_per_tsc_q32;
     if q32 != 0 {  // AGY+Codex+SMR F3: skip on TSC-unavailable
         let delta_tsc = t_out.saturating_sub(t_in);
-        let delta_ns = ((delta_tsc as u128 * q32 as u128) >> 32) as u64;
+        let raw_ns = ((delta_tsc as u128 * q32 as u128) >> 32) as u64;
+        // AGY r2 Amendment B: subtract calibrated wrapper baseline
+        // (the cost of the two RDTSCP/LFENCE fences themselves) so
+        // the recorded delta reflects ONLY the policy_eval body
+        // cost, not the measurement-instrument cost. `saturating_sub`
+        // prevents debug-build panic on the rare case where raw_ns
+        // is below baseline (e.g. CPU pipeline OoO finishing
+        // policy_eval before all the fence work retired).
+        let delta_ns = raw_ns.saturating_sub(
+            binding.cold_path.wrapper_ns_baseline,
+        );
         binding.cold_path.record_sample(from_zone_id, to_zone_id, delta_ns);
     }
 }
