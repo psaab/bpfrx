@@ -3,232 +3,269 @@
 Branch: `fix/1626-smoke-fixture-guarantee-rate`
 Base: `origin/master` @ `4ac85e2fd`
 
+## Revision history
+
+- **v1** — initial plan; PLAN-NEEDS-MAJOR by AGY+Codex+Claude SMR.
+  Findings F1-F7 (see `agy-plan-r1.md`, `codex-plan-r1.md`,
+  `claude-smr-plan-r1.md`).
+- **v2** (this version) — addresses all 7 findings; tightens
+  assertion semantics, fixes math, gates by fixture content.
+
 ## 1. Problem statement
 
-The simul-load smoke harness shipped in PR #1618 (#1614 step-1) reports
-per-class equalization (~20%/class). I framed that as evidence the
-waterfill scaffold doesn't change distribution. The #1625 PLAN-KILL
-quad-review surfaced the real explanation: **the fixture itself
-doesn't activate the `guarantee-rate` knob it was supposed to test**.
+The simul-load smoke harness shipped in PR #1618 (#1614 step-1)
+reports per-class equalization (~20%/class). The #1625 PLAN-KILL
+quad-review surfaced the cause: **the fixture itself doesn't activate
+the `guarantee-rate` knob it was supposed to test**.
 
 Concrete bug — `test/incus/cos-iperf-config.set` on master:
 ```
 $ grep -n "oversubscription" test/incus/cos-iperf-config.set
-$ # empty — the line that opts the unit into guarantee-rate mode
-$ # is missing
+$ # empty — the policy line is missing
 ```
 
 Without `set class-of-service interfaces reth0 unit 80
 oversubscription-policy guarantee-rate <X>`, the compiler defaults to
-`proportional` mode (see `pkg/config/compiler_class_of_service.go:339`
-+ `pkg/config/compiler.go:1097-1108`). So the entire #1614 step-1
-measurement was testing the pre-existing proportional path — same as
-master before the wire surface shipped. The waterfill scaffold's
-runtime branch never executed under the smoke.
+`proportional` (see `pkg/config/compiler_class_of_service.go:339-380`
++ `pkg/config/compiler.go:1097-1108`). The #1614 step-1 smoke was
+measuring proportional mode — same as master before the wire surface
+shipped. The waterfill branch never executed under smoke.
 
 ## 2. Scope
 
-**In-scope (small surgical fixture+harness change):**
-1. Add one `set` line to `test/incus/cos-iperf-config.set` that
-   activates `guarantee-rate 0.7` on `reth0 unit 80` (the unit the
-   fixture already targets via `shaping-rate 25g` + `scheduler-map
-   bandwidth-limit`).
-2. Add a runtime-assertion in `apply-cos-config.sh` (post-apply) that
-   verifies the running config actually has `oversubscription-policy
-   guarantee-rate` set. Catches future regressions of "fixture forgot
-   the knob" + parser drops + dataplane fails to apply.
-3. Run the smoke and document the per-class distribution under the
-   activated knob in the PR body.
+**In-scope:**
+1. Add one line to `test/incus/cos-iperf-config.set` that activates
+   `guarantee-rate 0.7` on `reth0 unit 80`.
+2. Add a Phase-3.5 assertion to `test/incus/apply-cos-config.sh`:
+   - Use `show configuration class-of-service | display set` for flat
+     form (F1 fix).
+   - Gate the assertion on whether the chosen fixture actually
+     contains an `oversubscription-policy` line — fail loudly if so
+     (F5 fix).
+   - Assertion semantics: **the policy line MUST appear** in
+     post-commit flat-set output. That's the entire gate (F2/F3/F6
+     fix — drop the fragile compiler-warning grep).
+3. Run the smoke and document before/after per-class distribution
+   in the PR body.
 
 **Out of scope (per issue body + memory):**
 - `userspace-dp/src/afxdp/cos/queue_service/mod.rs` Phase-2 lock-in
   bug from #1625 kill — separate issue (file #1627 if needed).
-- `shared_cos_lease/rotate_epoch_v8.rs` lease scheduling.
-- Any new trace-counter instrumentation — that's #1628's territory.
-- Multi-RSS multi-core CoS architecture — #1614 umbrella.
-- Adding `oversubscription-policy` rendering to `show class-of-service
-  interface` (separate UX issue; we use `show configuration
-  class-of-service` or the commit warning for the assertion).
+- `shared_cos_lease/rotate_epoch_v8.rs`.
+- Trace-counter instrumentation (#1628 territory).
+- Multi-RSS multi-core CoS architecture (#1614 umbrella).
+- Adding oversubscription-policy rendering to `show class-of-service
+  interface` (separate UX issue).
 
 ## 3. Honest value framing
 
-- **LOC**: ~2 lines in `cos-iperf-config.set` (the policy line + maybe
-  a blank for grouping), ~6-10 lines in `apply-cos-config.sh` for the
-  verification step.
-- **Runtime code change**: 0 LOC. The wire surface, parser, compiler
-  warning, and runtime are unchanged.
-- **Diagnostic value**: HIGH. This is the gate that determines
-  whether the #1614 step-1 ship is a measurement bug (and the
-  algorithm works once the knob is on) OR the algorithm is broken in
-  the way #1625 reviewers suspected (Phase-2 lock-in at
-  queue_service/mod.rs:889-893; worker_fair_share math). The next-
-  priority bug fix (#1627) only makes sense after this fixture fix
-  produces a clean before/after measurement.
+- **LOC**: ~1 line in `cos-iperf-config.set`; ~15-25 lines in
+  `apply-cos-config.sh` for the gated assertion + helper.
+- **Runtime code change**: 0 LOC.
+- **Diagnostic value**: HIGH. Determines whether #1614 step-1 was a
+  measurement bug (algorithm works once knob is on) OR the algorithm
+  is broken (Phase-2 lock-in / worker_fair_share math).
 
 ## 4. Junos syntax — verified
 
-Confirmed against `pkg/config/parser_class_of_service_test.go:936`
-(`TestValidateCoSOversubscriptionWarningGuaranteeRate`):
+`pkg/config/parser_class_of_service_test.go:936`
+(`TestValidateCoSOversubscriptionWarningGuaranteeRate`) uses exactly:
 ```
 set class-of-service interfaces ge-0/0/2 unit 80 oversubscription-policy guarantee-rate 0.7
 ```
 
-Our fixture uses the RETH form (`reth0` not `ge-0/0/2`), unit 80.
-Compiler accepts both interface name forms (`reth0` literal lookup in
-`cos.Interfaces`).
-
-**Fraction choice**: 0.7 per the #1614 plan v5 worked example
-(`docs/pr/1614-multi-rss-cos/plan.md:300` — `pass1_budget = 0.7 × 18 =
-12.6 G`). This matches what the v5 acceptance criteria expects the
-distribution to look like, so the smoke harness gate 1 (small classes
-≥ 95% of configured rate) is the correct downstream check.
+Our fixture uses RETH form `reth0`. Interface lookup is by string
+key in `cos.Interfaces`; same code path.
 
 ## 5. Where the line goes in the fixture
 
-The existing fixture sets per-interface CoS on `reth0 unit 80`:
+Existing fixture sets per-interface CoS on `reth0 unit 80`:
 ```
 set class-of-service interfaces reth0 unit 80 scheduler-map bandwidth-limit
 set class-of-service interfaces reth0 unit 80 shaping-rate 25g
 ```
-I add the policy line directly after `shaping-rate 25g`:
+
+We add the policy line directly after `shaping-rate 25g`:
 ```
 set class-of-service interfaces reth0 unit 80 oversubscription-policy guarantee-rate 0.7
 ```
 
-This is the same unit/interface tuple the rest of the fixture targets,
-and the policy lives on the unit struct (`pkg/config/types.go:556`),
-so attaching it here is parser-correct.
+## 6. Fraction choice (F4 fix — math re-anchored to 25g shaping)
 
-## 6. Runtime assertion in `apply-cos-config.sh`
+**Fraction**: 0.7. Same numerical choice as v5 plan but the worked
+example must be re-anchored to the actual fixture parameters:
 
-Current Phase 3 verification (lines 167-180) greps `show
-class-of-service interface` for `shaper|scheduler|traffic-control-
-profile|output.*traffic`. That doesn't catch the missing-knob bug
-because the scheduler bindings still show up — the policy lives on a
-different (oversubscription) path that the show-interface presenter
-doesn't render today.
+- Fixture `shaping-rate = 25g` on `reth0.80` (NOT 18g — that was the
+  push-direction ceiling assumption from the v5 plan, not the
+  configured shaping-rate).
+- `pass1_budget = 0.7 × 25g = 17.5g` (NOT 12.6 G).
+- Sum of small-class rates (100m + 1g + 3g + 6g = 10.1 G) fits well
+  under 17.5 G → small classes fully honoured in Phase 1.
+- Sum of mid-class rates that fit under 17.5 G - 10.1 G = 7.4 G
+  residual: depending on order, 9g class might fit partially.
 
-Two viable assertion points:
+The push-direction ceiling under simul-load is ~18 G (NIC + waterfill
+overhead), but the configured shaper allows up to 25 G. The
+guarantee-rate algorithm computes budgets against the configured
+shaper (25 G), then the actual achieved throughput is bounded by the
+NIC + waterfill ceiling. So the Phase-1 budget calculation uses 25 G;
+the smoke's observed distribution will be bounded by ~18 G aggregate.
 
-A. **Grep `show configuration class-of-service`** — the canonical
-   round-trip serialization. The line we just set should appear
-   verbatim. Robust because it doesn't depend on any presenter
-   surface.
+What we expect at smoke time under guarantee-rate 0.7:
+- Small classes (100m, 1g, 3g, 6g) all sum to 10.1 G ≪ 17.5 G budget,
+  so each should be at or near its configured rate (gate 1: ≥ 95%).
+- Large classes (9g+) share residual ≈ (NIC ceiling 18 G - 10.1 G) =
+  7.9 G across remaining classes proportionally.
 
-B. **Grep the commit warning output** —
-   `pkg/config/compiler.go:1097-1108` emits a one-line warning of the
-   form `class-of-service interfaces reth0 unit 80: ... configured
-   oversubscription-policy=guarantee-rate 0.7: ...`. But this requires
-   capturing the commit transcript; the existing Phase-2 apply uses
-   `> "$APPLY_OUT" 2>&1` so the transcript is already on disk.
+This differs from the v5-plan A1.2 table (which presumed 18 G shaper)
+but the qualitative gate-1 outcome is preserved: under
+guarantee-rate, small classes are honoured.
 
-Choice: **(A) + (B) belt-and-suspenders**. (A) verifies the
-config-tree was set (catches parser/CLI bugs). (B) verifies the
-compiler accepted it and emitted the warning (catches compiler
-regressions). If either fails the apply rolls back per the existing
-Phase-3 rollback hook.
+## 7. Runtime assertion in `apply-cos-config.sh`
 
-The assertion is added as a new Phase-3.5 step after the existing
-`shaper|scheduler|traffic-control-profile` grep, so we don't
-regress the existing check. Skip the assertion for the `--same-class`
-and `--symmetric` fixtures which don't (yet) set guarantee-rate.
+Single-rule assertion (F2/F3/F6 fix — collapse to one durable check):
 
-## 7. Smoke flow and what we expect to see
+After Phase 3's existing `show class-of-service interface` grep:
 
-After deploy + apply with the fixed fixture:
+```bash
+# Phase 3.5: if the chosen fixture activates a guarantee-rate (or
+# other oversubscription-policy) line, the running config MUST round-
+# trip with that line present. Gate dynamically on the fixture
+# content; do NOT couple to flag names.
 
-1. **Pre-condition check** (in the apply script):
-   - `show configuration class-of-service` contains `oversubscription-
-     policy guarantee-rate 0.7`. PASS expected.
-   - Apply transcript contains the
-     `oversubscription-policy=guarantee-rate 0.7` compiler warning.
-     PASS expected (sum of exact-rates 109g > shaping-rate 25g per
-     existing fixture, so the warning ALWAYS fires).
+FIXTURE_HAS_OVERSUB=0
+if grep -qE '^set .*oversubscription-policy' "$CONFIG_FILE"; then
+  FIXTURE_HAS_OVERSUB=1
+fi
 
-2. **Smoke run**:
-   `./test/incus/cos-simul-load-smoke.sh push` →
-   capture `verdict.json`. Compare `recv_gbps` per class against the
-   broken-baseline measurement from PR #1618 (also ~20%/class).
+if [[ "$FIXTURE_HAS_OVERSUB" -eq 1 ]]; then
+  OVERSUB_OUT=$(mktemp)
+  trap "rm -f '$SETS_TMP' '$CHECK_OUT' '$APPLY_OUT' '$VERIFY_OUT' '$OVERSUB_OUT'" EXIT
+  incus exec "$TARGET" -- /usr/local/sbin/cli -c \
+    "show configuration class-of-service | display set" \
+    > "$OVERSUB_OUT" 2>&1 || true
 
-3. **Two possible outcomes:**
-   - **Algorithm works**: distribution shifts. Small classes (100m/1g/
-     3g/6g) honoured to ≥ 95% (gate 1 passes). Large classes share
-     residual proportionally. iperf-uncapped ≥ 5% of ceiling (gate 2).
-     → confirms #1625 kill was correct; no new scheduler mechanism
-     needed.
-   - **Algorithm still equalizes**: distribution unchanged. Small
-     classes still get their proportional ~20% share. → confirms one
-     of #1625's other findings (queue_service/mod.rs:889-893 Phase-2
-     lock-in OR worker_fair_share math). File #1627 with the
-     measurement evidence as the next-priority fix.
+  # Extract the canonical fixture lines that match
+  # ^set .*oversubscription-policy and confirm each appears in the
+  # running flat-set output. Strict line-match means parser drops,
+  # compiler regressions, and applied-but-not-persisted bugs all
+  # surface here.
+  MISSING=0
+  while IFS= read -r want; do
+    if ! grep -Fxq "$want" "$OVERSUB_OUT"; then
+      echo "error: fixture line missing from running config:" >&2
+      echo "  expected: $want" >&2
+      MISSING=1
+    fi
+  done < <(grep -E '^set .*oversubscription-policy' "$CONFIG_FILE")
 
-The PR body documents WHICHEVER outcome we get. The PR is
-"diagnostic-fixture-correctness" not "fix-the-scheduler", so we ship
-the fixture fix + measurement regardless of which outcome.
+  if [[ "$MISSING" -ne 0 ]]; then
+    echo "error: Phase-3.5 oversubscription-policy verification FAILED" >&2
+    echo "rolling forward with 'rollback 1 | commit'..." >&2
+    incus exec "$TARGET" -- /usr/local/sbin/cli > /dev/null 2>&1 <<'EOF' || true
+configure
+rollback 1
+commit
+exit
+quit
+EOF
+    exit 7
+  fi
+fi
+```
 
-## 8. Test plan
+Properties of this design:
 
-- **Go**: `go test ./pkg/config/...` — should be unaffected; we
-  already have `TestValidateCoSOversubscriptionWarningGuaranteeRate`
-  exercising the exact line we add.
-- **Rust**: `cargo build --release` in `userspace-dp/` — no Rust
-  changes; smoke check only.
-- **Apply script unit-ish**: run the modified
-  `apply-cos-config.sh` against the smoke cluster fw0 and confirm:
-  - Existing Phase-3 check still PASSes
-  - New Phase-3.5 check PASSes with the fixed fixture
-  - New Phase-3.5 check FAILs (and rolls back) if we temporarily
-    remove the new line from the fixture (manual sanity)
-- **Cluster smoke (loss userspace)**: deploy → apply → run
-  `cos-simul-load-smoke.sh push` → capture verdict.json → diff
-  per-class achievement vs broken-baseline.
+- **F1 fix**: uses `| display set` for flat-set form so a literal
+  `grep -Fxq` will match.
+- **F2/F6 fix**: single failure path — any missing fixture line
+  triggers rollback. No two-mode contradiction.
+- **F3 fix**: dropped the compiler-warning grep entirely. The
+  running config tree is the durable contract.
+- **F5 fix**: assertion is dynamically gated on whether
+  `$CONFIG_FILE` contains `oversubscription-policy` lines. So
+  `--same-class` (no such lines) skips automatically; if a future
+  operator adds the knob to symmetric/same-class, the gate fires
+  unchanged.
+- **No false positives on `--surplus-sharing`**: surplus-sharing
+  appends `set ... surplus-sharing` lines after the awk pass, but
+  this assertion only looks at `oversubscription-policy` lines —
+  surplus-sharing doesn't intersect.
 
-## 9. Risk assessment
+The gate uses `grep -Fxq` (fixed-string exact-line) so whitespace
+and partial matches can't false-pass.
 
-- **Rollback risk**: the new Phase-3.5 assertion adds a NEW
-  rollback trigger. If the assertion is wrong (false-positive),
-  we'd roll back a good config. Mitigation: belt-and-suspenders
-  (A+B); only roll back if BOTH fail. A literal `oversubscription-
-  policy guarantee-rate 0.7` grep against `show configuration` is
-  trivially correct.
-- **Fixture compatibility**: adding the line shouldn't break the
-  existing fixture for any other consumer. The line is OPT-IN and
-  only fires the warning + activates the guarantee-rate branch when
-  sum_exact > shaping_rate (already true here).
-- **Smoke harness gate drift**: the existing
-  `cos-simul-load-smoke.sh` push-direction gates 1+2 were written
-  for the guarantee-rate path. Activating the knob ENABLES them to
-  pass — not breaks them. If they don't pass, that's diagnostic
-  signal not regression.
+## 8. Test plan (F7 fix — explicit + consistent)
 
-## 10. Open questions for reviewers
+- **Go**:
+  - `go vet ./pkg/config/...` (consistent with §11)
+  - `go test ./pkg/config/...` — should be green unaffected; the
+    parser already has
+    `TestValidateCoSOversubscriptionWarningGuaranteeRate` covering
+    the syntax we add.
+- **Rust**: no Rust source changes. `cargo build --release` in
+  `userspace-dp/` is a sanity check only — the daemon must accept
+  the new snapshot field, which it already does (#1614 step-1
+  wire surface).
+- **Apply script bench**: manually run
+  `./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0` with
+  the v2 fixture; confirm:
+  - Existing Phase-3 grep still PASSes.
+  - New Phase-3.5 grep PASSes.
+  - Temporarily delete the oversubscription line from the fixture
+    and confirm the gate FAILs (rollback fires).
+- **Cluster smoke** (loss userspace): deploy → apply → run
+  `cos-simul-load-smoke.sh push` → diff per-class table against
+  PR #1618 broken-baseline.
 
-1. **Fraction value** — 0.7 per the v5 worked example, or different
-   number? 0.7 keeps small classes fully honoured and gives large
-   classes their fair share of residual. Lower (0.4) would be a
-   harsher test of the algorithm; higher (0.9) is less interesting.
-   Decision: **0.7** — matches plan v5 worked example, harness gate 1
-   thresholds, and the warning string the existing parser test
-   asserts.
-2. **Where to put the assertion** — apply script (entry point) vs
-   smoke harness (consumer)? Apply is better: it catches both
-   smoke-harness use AND any future use of the fixture by another
-   harness (failover, surplus-sharing diagnostic, etc.). Decision:
-   **apply script**.
-3. **Symmetric/same-class fixtures** — should they also activate
-   guarantee-rate? Out of scope for #1626. Those fixtures target
-   different test purposes (mirror-flow CoS coherence in #1250,
-   same-class echo override in #929). If/when their tests need
-   guarantee-rate they'll get their own fixture lines. The Phase-3.5
-   assertion gates on the chosen fixture, not all of them.
+## 9. Risk
+
+- **Phase-3.5 false-positive**: gated dynamically on fixture
+  content with strict exact-line `grep -Fxq`; the only way to
+  false-fail is if the running-config flat-set output drifts from
+  the fixture line (parser drops, compiler regression, daemon
+  apply failure). All three are real bugs we WANT to catch.
+- **Rollback safety**: assertion failure triggers the existing
+  `rollback 1 | commit` path, same as Phase-3.
+- **Fixture compatibility**: assertion is opt-in via fixture
+  content, so `--same-class`/`--symmetric` are not affected. If
+  `--surplus-sharing` is combined with this fixture, the
+  surplus-sharing awk pass appends NEW lines but doesn't remove
+  or transform the oversubscription line — the gate still passes
+  because the line is still present in `$CONFIG_FILE` and in the
+  running config.
+
+## 10. Open questions (now closed by v2)
+
+1. Fraction value → **0.7**, math re-anchored to 25g.
+2. Assertion location → **apply-cos-config.sh** (entry point).
+3. Symmetric/same-class fixtures → **auto-skipped via content gate**.
+4. Compiler warning grep → **dropped** (F3 fix).
+5. Rollback semantics → **single failure path** (F2/F6 fix).
 
 ## 11. Rollout / sequence
 
-- Implement: ~2 line .set + ~10 line apply assertion.
-- Build: `go vet ./...` + `go test ./pkg/config/...`.
-- Smoke: deploy + apply on loss:xpf-userspace-fw0 + run
+- Implement: 1-line `.set` change + ~25-line apply-script
+  assertion.
+- Build: `go vet ./pkg/config/... && go test ./pkg/config/...`
+  (consistency with §8).
+- Smoke: deploy + apply on `loss:xpf-userspace-fw0` + run
   `cos-simul-load-smoke.sh push` (+ optionally reverse). Capture
-  verdict.json + per-class table.
-- PR: body MUST include before/after per-class table and the verdict.
-- Auto-merge gate: 4-of-4 reviewer attestation (Codex + AGY + Copilot
-  + Claude SMR) + smoke pass on the loss userspace cluster.
+  `verdict.json` + per-class table.
+- PR: body MUST include before/after per-class table.
+- Auto-merge gate: 4-of-4 reviewer attestation (Codex + AGY +
+  Copilot + Claude SMR) + smoke pass on the loss userspace
+  cluster. Use `<!-- AWAITING-BATCH-MERGE -->` per
+  `feedback_smoke_every_10_batch`.
+
+## 12. Verified against r1 findings
+
+| Finding | Status | Where |
+|---------|--------|-------|
+| F1 hierarchical vs flat | FIXED | §7 uses `\| display set` |
+| F2 rollback contradiction | FIXED | §7 single failure path |
+| F3 warning-string coupling | FIXED | §7 no warning grep |
+| F4 18g vs 25g math | FIXED | §6 math re-anchored |
+| F5 hard-coded flag skip | FIXED | §7 fixture-content gate |
+| F6 belt-and-suspenders | FIXED | same as F2 (single path) |
+| F7 go vet vs go test | FIXED | §8/§11 consistent |
