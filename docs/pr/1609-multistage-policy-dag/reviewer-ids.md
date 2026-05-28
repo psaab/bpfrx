@@ -16,3 +16,10 @@ results by ID if the Companion CLI session state is lost
 ### Round 2 (convergence + BLOCKED determination)
 
 - **Claude SMR**: `docs/pr/1609-multistage-policy-dag/claude-smr-plan-r2.md` — PLAN-NEEDS-MAJOR + BLOCKED-on-#1612 for production framing
+
+### Round 3 (v2 round 1 — Multi-Book LPM + staged delivery, user override)
+
+- **Codex**: `task-mpp07r70-gr5xtw` (v2 hostile plan-review, dispatched 2026-05-27)
+- **AGY**: `adversarial-review-mpp08612-zcapi3` (v2 hostile plan-review, dispatched 2026-05-27)
+- **Claude SMR**: `docs/pr/1609-multistage-policy-dag/claude-smr-plan-r3.md` — PLAN-READY-WITH-NITS
+- **Copilot**: posts on PR creation; not applicable to plan reviews
