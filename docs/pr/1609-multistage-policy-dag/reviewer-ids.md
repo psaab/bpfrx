@@ -29,7 +29,7 @@ results by ID if the Companion CLI session state is lost
 
 ### Round 5 (v3 round 1 — Multi-Book LPM 5-fix, memory budget RELAXED per user override)
 
-- **Codex**: pending (will dispatch with v3 SHA)
-- **AGY**: pending (will dispatch with v3 SHA)
+- **Codex**: `task-mpp1zj9z-8wzlvi` (v3 hostile plan-review, dispatched 2026-05-27 against SHA 85f01d6de)
+- **AGY**: `adversarial-review-mpp1zyo9-5bwwnk` (v3 hostile plan-review, dispatched 2026-05-27 against SHA 85f01d6de)
 - **Claude SMR r5**: `docs/pr/1609-multistage-policy-dag/claude-smr-plan-r5.md` — PLAN-NEEDS-MINOR (4 residual issues F-r5-1 through F-r5-4 enumerated; hostile self-review to avoid r3-style soft-pass)
 - **Copilot**: posts on PR creation; not applicable to plan reviews
