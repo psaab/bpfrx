@@ -76,14 +76,24 @@ pub(in crate::afxdp) fn splitmix64(x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Pack zone IDs into a u64 key suitable for hashing or XOR-rolling.
+/// Pack zone IDs into a u64 key suitable for hashing or comparison.
 ///
-/// The `| 1` at the end prevents the `(0, 0)` sentinel from collapsing
-/// to zero, which would make the slot's `keys_xor` indistinguishable
-/// from "no samples yet" (plan §3.4).
+/// **Injective encoding** (Codex r3 finding 1): `+ 1` instead of `| 1`
+/// — `| 1` collapses adjacent `to_zone_id` values that share the same
+/// odd parity into the same key (e.g. `(1,2)` and `(1,3)` both become
+/// `65539` under `| 1`). The `+ 1` form preserves injectivity by
+/// shifting the entire 32-bit packed key range by +1, which keeps
+/// `(0, 0)` from collapsing to zero while keeping all other pairs
+/// distinct.
+///
+/// The non-zero invariant is needed so that `first_key[slot] == 0`
+/// remains a reliable "no sample yet" sentinel (plan §3.4).
 #[inline]
 pub(in crate::afxdp) fn zone_pair_packed_key(from_zone_id: u16, to_zone_id: u16) -> u64 {
-    (((from_zone_id as u64) << 16) | (to_zone_id as u64)) | 1
+    // (from << 16) | to fits in 32 bits and is injective over distinct
+    // (u16, u16) pairs. Adding 1 keeps zero free as the "no sample"
+    // sentinel without breaking injectivity.
+    (((from_zone_id as u64) << 16) | (to_zone_id as u64)) + 1
 }
 
 /// Map a `(from_zone_id, to_zone_id)` pair to a slot index in
@@ -207,7 +217,13 @@ pub(in crate::afxdp) fn calibrate_ns_per_tsc_q32() -> u64 {
             return 0;
         }
         // ns_per_tsc_q32 = (elapsed_ns << 32) / elapsed_tsc
-        ((elapsed_ns as u128) << 32 / (elapsed_tsc as u128)) as u64
+        //
+        // Operator precedence trap (Codex r3 finding 2): `<<` binds
+        // LOWER than `/` in Rust, so `(elapsed_ns as u128) << 32 /
+        // (elapsed_tsc as u128)` parses as `elapsed_ns << (32 /
+        // elapsed_tsc)`, not as the intended `(elapsed_ns << 32) /
+        // elapsed_tsc`. Parenthesize the shift explicitly.
+        (((elapsed_ns as u128) << 32) / (elapsed_tsc as u128)) as u64
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -530,8 +546,9 @@ mod tests {
 
     #[test]
     fn zone_pair_packed_key_nonzero_for_zero_inputs() {
-        // (0, 0) must not collapse to zero per plan §3.4 keys_xor
-        // collision detection.
+        // (0, 0) must not collapse to zero per plan §3.4 first_key/
+        // alias_seen collision detection (zero is the "no sample"
+        // sentinel).
         assert_ne!(zone_pair_packed_key(0, 0), 0);
         assert_eq!(zone_pair_packed_key(0, 0), 1);
     }
@@ -543,6 +560,34 @@ mod tests {
             zone_pair_packed_key(2, 1),
             "(1,2) and (2,1) must hash to distinct packed keys"
         );
+    }
+
+    /// Codex r3 finding 1: `| 1` collapsed (1,2) and (1,3) to the
+    /// same packed key, breaking injectivity. v3 fix uses `+ 1`
+    /// instead. This test pins the injective semantics by exhaustively
+    /// checking the small (8x8) zone-id box for distinct keys per
+    /// distinct pair.
+    #[test]
+    fn zone_pair_packed_key_is_injective_over_small_box() {
+        use std::collections::HashSet;
+        let mut keys = HashSet::new();
+        for f in 0..8u16 {
+            for t in 0..8u16 {
+                let k = zone_pair_packed_key(f, t);
+                assert!(keys.insert(k), "duplicate packed key for ({f},{t}) -> {k}");
+            }
+        }
+        assert_eq!(keys.len(), 8 * 8);
+    }
+
+    /// Codex r3 finding 1 explicit counter-example: (1,2) and (1,3)
+    /// MUST have distinct packed keys; the v1/v2 `| 1` form collapsed
+    /// them both to 65539.
+    #[test]
+    fn zone_pair_packed_key_distinguishes_adjacent_to_zone_ids() {
+        let k12 = zone_pair_packed_key(1, 2);
+        let k13 = zone_pair_packed_key(1, 3);
+        assert_ne!(k12, k13, "(1,2)={k12} (1,3)={k13} — must be distinct (Codex r3 finding 1)");
     }
 
     #[test]

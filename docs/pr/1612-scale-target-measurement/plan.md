@@ -22,7 +22,7 @@ slice and the empirical measurement run.
 | HIGH: bounded-mode 1-in-256 violates parent contract | v1 §1.3 | Sample rate becomes regime-conditional: `unbounded → 0xff` (1-in-256); `bounded → 0` (1-in-1). | §1.3 |
 | HIGH: seqlock pair coverage broken if reusing `WorkerRuntimeAtomics.window_gen` | v1 §1.4 | `WorkerColdPathAtomics` carries its OWN `window_gen` field. Publish flips its own gen odd, stores, flips even — independent of `WorkerRuntimeAtomics` 60s-rotation gen. | §1.2 + §1.4 |
 | MED: bucket layout self-contradicts existing `bucket_index_for_ns` | v1 §3.3 + §1.1 | Pin exact 24-bucket formula `b = (54 - clz(ns\|1)).max(0).min(23)` — bucket 0 = `[0, 1024)` ns, bucket 23 saturates at 2^32 ns ≈ 4.295 s. Same math as 16-bucket, just `.min(23)` instead of `.min(15)`. | §1.1 + §3.3 |
-| MED: splitmix64 collisions on real loss-cluster zone set | v1 §1.1 + §3.4 | Two-prong fix: (a) seed `zone_pair_slot` with the worker's salt to spread collisions across workers per-publish epoch; (b) publish only slots whose `keys_xor` is **stable** across two consecutive publishes — aliased slots reveal themselves as a non-monotonic `keys_xor` toggle. The harness post-filters per parent §4.6 publication gate. | §1.1 + §3.4 |
+| MED: splitmix64 collisions on real loss-cluster zone set | v1 §1.1 + §3.4 | Two-prong fix: (a) seed `zone_pair_slot` with the worker's salt to spread collisions across workers per-publish epoch; (b) publish only slots whose `keys_xor` is **stable** across two consecutive publishes — aliased slots reveal themselves as a non-monotonic `keys_xor` toggle. The harness post-filters per parent §4.6 publication gate. *(v2 keys_xor RETIRED in v3 per Codex r2 finding 3 — replaced with first_key + alias_seen; this row preserved for historical context.)* | §1.1 + §3.4 |
 | MED: STAGED ship contract gap on Tables + #1609 unblock | v1 §3.6 + §6 | STAGED mode now emits an **explicit disclaimer header** in `docs/userspace-jit-design.md`: "Scale Target measurement deferred — counter wiring shipped; cluster measurement scheduled under follow-up <issue#>. #1609 v2 acceptance criterion REMAINS unmet." | §1.9 + §3.6 + §6 |
 
 Codex cleared (r1): `telemetry.dbg.session_miss` increments in release builds at
@@ -603,10 +603,13 @@ contested, STAGED ship.
 
 4. **Per-zone-pair slot count** — 16 splitmix64 slots. With more
    than 16 distinct zone pairs in flight (loss cluster has 5+
-   zones: trust/untrust/dmz/wan/lan), aliasing is expected. Slot
-   `keys_xor` exposes alias detection. Should the harness reject
-   rows with > N aliased slots? Plan picks: harness emits
-   `alias_warning` in TSV; doesn't gate Scale Target publication.
+   zones: trust/untrust/dmz/wan/lan), aliasing is expected. The
+   per-slot `first_key` + `alias_seen` pair (v3, replacing the
+   retired keys_xor) exposes alias detection monotonically. The
+   harness publication gate **excludes** any slot with
+   `alias_seen = true` from Tables A1/A2 publication for that
+   rule-count run; the raw TSV retains all slots with the alias
+   flag.
 
 5. **TSV vs Prometheus storage** — TSV is the canonical artifact.
    Prometheus is "live observability only". Should the doc cite
@@ -649,7 +652,7 @@ contested, STAGED ship.
     Tables A1/A2/B1/B2 rows are non-TBD; #1609 v2 acceptance criterion
     UNBLOCKED.
   - **STAGED form**: Tables remain TBD with the explicit
-    MEASUREMENT-DEFERRED disclaimer per §1.9; follow-up issue
+    MEASUREMENT DEFERRED disclaimer per §1.9; follow-up issue
     filed referencing this PR's counter-wiring contract; PR
     description explicitly notes `#1609 v2 acceptance REMAINS
     UNMET`.
