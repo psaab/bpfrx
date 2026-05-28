@@ -9,6 +9,29 @@ validation (cold connect 3.371s → ~1.016s).
 **implementation branch**: `fix/1636-cold-connect-mitigation`
 **Scope of this doc**: the converged plan-of-action that drove the PR.
 
+### Implementation deviations from this plan (as shipped in PR #1640)
+
+This document is the pre-implementation converged design. Two details
+changed during implementation + 4-way code review; the code is
+authoritative where they differ:
+
+1. **Link-UP cache clear (§7 / §9 invariant 10) — DEFERRED, not shipped.**
+   The `on_link_up()` per-ifindex `last_probed_at` clear is not wired:
+   there is no userspace RTM_NEWLINK link-state monitor to call it, and
+   shipping an unwired helper is a false guarantee (Copilot). The
+   RG-promote clear plus the 5s per-key self-heal cover the dominant
+   case. Re-introduce when a link-state monitor exists.
+2. **Option-D fast threshold is 300ms, not 250ms (§7 / §12).** The kernel
+   jiffy-rounds a written `retrans_time_ms` of 250 up to 252 on HZ=100
+   hosts, so `compute_pending_neigh_timeout_ns` admits the 800ms timeout
+   when every checked sysctl reads `<= NEIGH_RETRANS_FAST_THRESHOLD_MS`
+   (300ms) — above the rounded value, far below the 1000ms default. The
+   `<= 250` figures in the §7/§12 pseudocode predate this discovery.
+3. **Option B writes every per-interface table, not just `default`**
+   (§7 PR-1). The kernel seeds a per-interface neighbor table from
+   `default` only at creation time, so existing dataplane interfaces kept
+   1000ms; the daemon now enumerates and writes each interface table.
+
 ## Changelog since v6
 
 | # | Round-6 finding | Resolution |

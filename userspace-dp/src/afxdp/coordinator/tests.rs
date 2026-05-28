@@ -1632,4 +1632,3 @@ fn on_rg_promote_active_clears_rate_limit_and_forces_warm() {
     );
     assert!(rx.try_recv().is_ok(), "forced warm pass on RG-promote must enqueue");
 }
-
