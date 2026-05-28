@@ -14,6 +14,12 @@
 
 ## Plan-review round 3 (plan v3)
 
-- Codex: task-mpoyqsg3-kz70ue
-- AGY:   adversarial-review-mpoyqyps-lt2o4w
+- Codex: task-mpoyqsg3-kz70ue (NEEDS-MAJOR — 6 doc-consistency findings)
+- AGY:   adversarial-review-mpoyqyps-lt2o4w (NEEDS-MINOR — 3 findings)
 - Claude SMR: claude-smr-plan-r3.md (PLAN-READY)
+
+## Plan-review round 4 (plan v4)
+
+- Codex: task-mpoyufgg-ccq66o
+- AGY:   adversarial-review-mpoyum3e-qx87bl
+- Claude SMR: claude-smr-plan-r4.md (PLAN-READY)

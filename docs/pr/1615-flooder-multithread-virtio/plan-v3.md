@@ -67,19 +67,16 @@ Spec:
   `tx_batches`, `err_eagain` per thread.
 - The smoke runner computes
   `ratio = max(per_thread[].tx_packets) / max(min(...), 1)`.
-- Hard fail if `ratio > 1.5` (or `> 2.0` with a warning gate at 1.5).
-- Document threshold rationale: with 4 threads over 11 mlx5 TX queues
-  and disjoint 5-tuple per-thread streams, kernel hash distribution
-  should keep per-thread tx_packets within 1.5× modulo small RNG/skew.
-- If `ratio > 2.0`, that's evidence of queue collision (multiple
-  threads' skb-hash modulo 11 colliding on one queue) and the design
-  is rejected; v4 needs explicit XPS configuration on the host or
-  PACKET_TX_RING (option 3).
+- See plan-v4.md §3.7 for the single hard threshold (>2.0 fail,
+  (1.5, 2.0] warn band) and the caveat that per-thread parity is
+  necessary but not sufficient — aggregate pps gate catches the
+  collision-collapse case. The v3 inline threshold text above is
+  superseded by plan-v4.md.
 
-CODEX-r2-3 (queue distribution probabilistic, not guaranteed) is
-resolved by this check: if the kernel hash happens to collide all
-4 threads onto one TX queue, max/min ratio will be 4× and the gate
-hard-fails — design rejected. Not a hidden risk; it's now measured.
+(v3 paragraph on 4-on-1 collision producing 4× ratio is superseded
+by plan-v4.md §3.7 caveat — that scenario can actually produce
+near-equal per-thread counts under HARD_TX_LOCK serialization;
+aggregate pps gate catches it.)
 
 The smoke runner records the threshold check in the measurements
 markdown file and the gate decision is determinate.
@@ -109,8 +106,10 @@ checklist item with:
 > - sum `err_eagain`
 >
 > Pass criteria for the BLOCKING gate (threads=4 row):
-> - aggregate `avg_pps` ≥ 2_500_000
-> - per-thread max/min ratio ≤ 1.5 (warn at 1.5-2.0; fail at >2.0)
+> - aggregate `avg_pps` ≥ 2_500_000 (hard fail if below)
+> - per-thread max/min ratio: hard fail if > 2.0; warn band (1.5, 2.0]
+>   (single threshold per plan-v4.md §3.7 — the previous "≤ 1.5"
+>   pass-only language was ambiguous)
 > - sum `err_eagain` < 0.1% of total tx_packets
 
 Optionally (informational, not gating), capture
