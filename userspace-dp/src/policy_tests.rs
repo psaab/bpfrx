@@ -1134,3 +1134,62 @@ fn test_book_entry_parallel_array_preserves_zero_prefix() {
     assert_eq!(entry.prefixes_v4.len(), 1);
     assert_eq!(entry.prefixes_v4[0].prefix_len(), 0);
 }
+
+#[test]
+fn test_book_entry_canonical_prefix_lists_dual_family() {
+    // AGY r1 nit Patch A: a single book with BOTH v4 and v6
+    // prefixes — verifies parallel arrays are populated for each
+    // family independently.
+    let books = [book(
+        104,
+        "dual-family",
+        &["10.0.0.0/8", "192.168.1.0/24"],
+        &["2001:db8::/32", "fe80::/10"],
+    )];
+    let rules = [v3_rule("r", &[104], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let entry = &state.books[0];
+    assert_eq!(entry.prefixes_v4.len(), 2);
+    assert_eq!(entry.prefixes_v6.len(), 2);
+    for p in entry.prefixes_v4.iter() {
+        assert!(entry.v4.contains(p.addr()));
+    }
+    for p in entry.prefixes_v6.iter() {
+        assert!(entry.v6.contains(p.addr()));
+    }
+}
+
+#[test]
+fn test_book_entry_canonical_prefix_lists_trie_variant() {
+    // AGY r1 nit Patch B: 17 prefixes triggers the Trie variant
+    // (PREFIX_SET_LINEAR_MAX = 16). Verifies the parallel array
+    // is variant-independent — it's captured BEFORE PrefixSet
+    // chooses Linear vs Trie.
+    let prefix_strs: Vec<String> = (0..17).map(|i| format!("10.0.{i}.0/24")).collect();
+    let prefix_refs: Vec<&str> = prefix_strs.iter().map(|s| s.as_str()).collect();
+    let books = [book(105, "large-v4", &prefix_refs, &[])];
+    let rules = [v3_rule("r", &[105], &[])];
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        &rules,
+        &test_zone_name_to_id(),
+        &books,
+        &counter_store,
+    )
+    .expect("parse");
+    let entry = &state.books[0];
+    assert!(matches!(entry.v4, crate::prefix_set::PrefixSetV4::Trie(_)));
+    assert_eq!(entry.prefixes_v4.len(), 17);
+    for p in entry.prefixes_v4.iter() {
+        assert!(entry.v4.contains(p.addr()));
+    }
+}

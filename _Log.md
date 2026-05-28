@@ -4184,3 +4184,9 @@ top.
 - **Timestamp**: 2026-05-27 (UTC)
   - **Action**: Copilot reviewed at HEAD 483a5db97 and posted 3 inline comments: (1) policy.rs:449 "cheap clone" misnomer — actual cost is O(n) per book; (2) plan.md:34 status implies broader Step 1 is in this PR; (3) plan.md:592 "Step 1 (this PR) scope" heading describes deferred features. Fixed (1) by replacing the comment with an honest description of the O(n) parse-time cost + reasoning. Fixed (2) by adding a SUPERSEDED / HISTORICAL marker at the top of plan.md noting this is the design contract for FUTURE Sub-PRs (#1623) not for PR #1624. Fixed (3) by renaming §4 heading + adding a NOTE callout. Wrote claude-smr-code-r1.md hostile review of narrow scope: CODE-READY. 5/5 tests still pass.
   - **File(s)**: userspace-dp/src/policy.rs (comment fix), docs/pr/1609-multistage-policy-dag/plan.md (SUPERSEDED markers), docs/pr/1609-multistage-policy-dag/claude-smr-code-r1.md (new)
+
+## 2026-05-27 — PR #1624 Codex r1 + AGY r1 code-review (CODE-READY-WITH-NITS)
+
+- **Timestamp**: 2026-05-27 (UTC)
+  - **Action**: Dispatched Codex (task-mpp38gl0-hyawf8) + AGY (adversarial-review-mpp38qy1-zayhr2) hostile code-reviews at HEAD 2cc07b450. Both returned CODE-READY-WITH-NITS, no blockers. Nits: Codex tightened the Arc cost comment (Arc::from allocates separately, parse runs on preflight + apply both); AGY proposed two test patches (dual-family book, large-book Trie variant). Applied Codex's comment tightening + both AGY tests. 6 unit tests now pass (was 4); 5/5 flake clean; 1458 total tests pass.
+  - **File(s)**: userspace-dp/src/policy.rs (comment tighten), userspace-dp/src/policy_tests.rs (+2 tests)

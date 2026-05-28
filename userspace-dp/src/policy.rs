@@ -447,13 +447,15 @@ pub(crate) fn parse_policy_state_with_counters(
         //
         // Cost: `v4.clone()` / `v6.clone()` allocate a fresh Vec and
         // copy each `PrefixV4` / `PrefixV6` element — O(n) time and
-        // memory per book, where n is the prefix count. `Arc::from`
-        // on the boxed slice is then a single header allocation +
-        // refcount, not a per-element copy. Both clones run ONCE at
-        // config-apply, never on the hot path, so the O(n) cost is
-        // acceptable here. `Prefix*` types are small (network address
-        // + prefix length), so the copy is cheap in absolute terms
-        // for realistic book sizes (≤ ~1K prefixes per book).
+        // memory per book, where n is the prefix count.
+        // `Arc::from(Box<[T]>)` then allocates the Arc control block
+        // and moves the boxed slice into it (separate allocation, not
+        // free). This runs once per parse invocation — both the
+        // preflight integrity check and the actual apply build —
+        // never on the hot path, so the O(n) cost is acceptable here.
+        // `Prefix*` types are small (network address + prefix length),
+        // so the copy is cheap in absolute terms for realistic book
+        // sizes (≤ ~1K prefixes per book).
         let prefixes_v4: Arc<[PrefixV4]> = Arc::from(v4.clone().into_boxed_slice());
         let prefixes_v6: Arc<[PrefixV6]> = Arc::from(v6.clone().into_boxed_slice());
         let entry = BookEntry {
