@@ -2,6 +2,9 @@
 
 **Branch**: `perf/1612-scale-target-measurement`
 **Worktree**: `/home/ps/git/bpfrx/.claude/worktrees/1612-scale-target-measurement`
+**Plan version**: v2 (2026-05-28) — addresses Codex plan-r1 PLAN-NEEDS-MAJOR
+findings 1-5 inline. v1 archived under git history of this branch.
+
 **Parent plan**: `docs/pr/1607-hw-ceiling-microbench/plan.md` v2-r4 (4 review
 rounds, AGY + Claude SMR + Copilot READY; Codex deterministically infra-blocked
 across 5 dispatches). This step-3 PR is the implementation half of §4.3 –
@@ -10,13 +13,39 @@ This plan inherits the parent's measurement strategy and contract verbatim and
 documents only the deltas/scope-narrowing decisions for the step-3 implementation
 slice and the empirical measurement run.
 
+## v1 → v2 fatal-axis resolution map (Codex r1)
+
+| Codex r1 finding | v1 source | v2 fix | Section |
+|------------------|-----------|--------|---------|
+| HIGH: bounded-mode 1-in-256 violates parent contract | v1 §1.3 | Sample rate becomes regime-conditional: `unbounded → 0xff` (1-in-256); `bounded → 0` (1-in-1). | §1.3 |
+| HIGH: seqlock pair coverage broken if reusing `WorkerRuntimeAtomics.window_gen` | v1 §1.4 | `WorkerColdPathAtomics` carries its OWN `window_gen` field. Publish flips its own gen odd, stores, flips even — independent of `WorkerRuntimeAtomics` 60s-rotation gen. | §1.2 + §1.4 |
+| MED: bucket layout self-contradicts existing `bucket_index_for_ns` | v1 §3.3 + §1.1 | Pin exact 24-bucket formula `b = (54 - clz(ns\|1)).max(0).min(23)` — bucket 0 = `[0, 1024)` ns, bucket 23 saturates at 2^32 ns ≈ 4.295 s. Same math as 16-bucket, just `.min(23)` instead of `.min(15)`. | §1.1 + §3.3 |
+| MED: splitmix64 collisions on real loss-cluster zone set | v1 §1.1 + §3.4 | Two-prong fix: (a) seed `zone_pair_slot` with the worker's salt to spread collisions across workers per-publish epoch; (b) publish only slots whose `keys_xor` is **stable** across two consecutive publishes — aliased slots reveal themselves as a non-monotonic `keys_xor` toggle. The harness post-filters per parent §4.6 publication gate. | §1.1 + §3.4 |
+| MED: STAGED ship contract gap on Tables + #1609 unblock | v1 §3.6 + §6 | STAGED mode now emits an **explicit disclaimer header** in `docs/userspace-jit-design.md`: "Scale Target measurement deferred — counter wiring shipped; cluster measurement scheduled under follow-up <issue#>. #1609 v2 acceptance criterion REMAINS unmet." | §1.9 + §3.6 + §6 |
+
+Codex cleared: `telemetry.dbg.session_miss` increments in release builds at
+poll_descriptor/mod.rs:763 (release-stable). TSC gating (CPU flags +
+`current_clocksource == tsc`) is directionally correct.
+
 ## 1. Scope this step-3 PR ships
 
 In tree at end of PR:
 
 1. **`userspace-dp/src/afxdp/cold_path_hist.rs`** — new module providing:
-   - `bucket_index_for_ns_24(ns: u64) -> usize` (extends existing
-     `bucket_index_for_ns` to 24 buckets per parent §3 / §4.4).
+   - `bucket_index_for_ns_24(ns: u64) -> usize` — **pinned formula**:
+     ```rust
+     #[inline]
+     pub(super) fn bucket_index_for_ns_24(ns: u64) -> usize {
+         let clz = (ns | 1).leading_zeros() as i32;
+         let b = (54 - clz).max(0) as usize;
+         b.min(POLICY_COLD_PATH_HIST_BUCKETS - 1)
+     }
+     ```
+     Same math as the 16-bucket `bucket_index_for_ns` at
+     `umem/mod.rs:244`, only the `.min()` clamp changes. Bucket 0
+     covers `[0, 1024)` ns; bucket[i] covers `[2^(9+i), 2^(10+i))`
+     ns for i ∈ [1, 22]; bucket 23 saturates at any `ns ≥ 2^32`
+     ≈ 4.295 s. Codex r1 finding 3 fix.
    - `POLICY_COLD_PATH_HIST_BUCKETS: usize = 24` + `const _: () = assert!`.
    - `POLICY_COLD_PATH_ZONE_PAIR_SLOTS: usize = 16` + `const _: () = assert!`.
    - `sample_tsc() -> u64` wrapper around `__rdtscp` with `compiler_fence`
@@ -24,15 +53,33 @@ In tree at end of PR:
    - `WrapperBaselineCalibration` newtype with `calibrate(samples: usize)`
      method that takes N=4096 rdtscp/rdtscp pairs, returns the median
      in ns (after Q32 multiplier applied) as the per-worker wrapper
-     baseline. Stored once at worker startup; never re-calibrated.
+     baseline. Stored once at worker startup AFTER
+     `pthread_setaffinity_np` has pinned the worker thread to its
+     core — never re-calibrated. (Claude SMR r1 NIT 2.)
    - `ClockSource` enum `{ Tsc, ClockGettime }`. Per parent §4.3.2,
      graceful degrade if `/proc/cpuinfo` lacks `constant_tsc` + `nonstop_tsc`
-     flags. Worker records its own clock source in `WorkerColdPathAtomics`
-     so the harness can per-worker-gate on `clock_source = tsc`.
+     flags OR `/sys/devices/system/clocksource/clocksource0/current_clocksource`
+     does not report `tsc`. Worker records its own clock source in
+     `WorkerColdPathAtomics` so the harness can per-worker-gate on
+     `clock_source = tsc`.
    - `splitmix64(x: u64) -> u64` + `zone_pair_slot(from_zone_id: u16,
      to_zone_id: u16) -> usize` — `splitmix64((from_zone_id as u64) << 32
-     | to_zone_id as u64) & 0xF`. Per parent §4.3.4 + AGY r3 axis 5 bijection
-     audit. Pin `0xF` mask via `assert!(POLICY_COLD_PATH_ZONE_PAIR_SLOTS == 16)`.
+     | to_zone_id as u64) & 0xF`. Per parent §4.3.4 + AGY r3 axis 5
+     bijection audit. Pin `0xF` mask via
+     `assert!(POLICY_COLD_PATH_ZONE_PAIR_SLOTS == 16)`.
+   - **Collision-tolerance contract** (Codex r1 finding 4): the
+     `keys_xor` slot field is updated by XOR-ing in the packed
+     `(from_zone_id << 32 | to_zone_id) | 1` value on each sample.
+     Two distinct zone-pair keys hashing to the same slot will
+     toggle `keys_xor` non-monotonically across publishes. The
+     harness post-filter inspects `keys_xor` stability across two
+     consecutive cumulative deltas: if a slot's `keys_xor` XOR
+     between two consecutive samples is non-zero, the slot is
+     marked `alias_detected=true` and **excluded** from Tables
+     A1/A2 publication for that rule-count run. The slot's
+     samples are still recorded in the raw TSV with a `alias` flag.
+     This is a publication gate, not a runtime constraint —
+     hot-path operations remain branch-free.
 
 2. **`userspace-dp/src/afxdp/worker_cold_path.rs`** — new module providing:
    - `WorkerColdPathCounters` — per-worker mutable state (touched only by
@@ -41,38 +88,87 @@ In tree at end of PR:
      for keys_xor, single `u64` for wrapper baseline). Sized
      `16 × 24 × 8 + 3 × 16 × 8 = 3456 B` per worker. Hot path operations
      are array index + add — zero allocations. Per parent §4.3.4.
-   - `WorkerColdPathAtomics` — publish-side per-worker struct sitting next
-     to `WorkerRuntimeAtomics` in `worker_runtime.rs`. Same seqlock-style
-     `window_gen` publish pattern (`fetch_add(AcqRel)` to odd, store the
-     2304-bucket payload + 16+16+16 metadata, `fetch_add(Release)` back to
-     even). Per parent §4.8 hidden invariants — same memory-ordering
-     contract as `WorkerRuntimeAtomics` per PR #1311 round-2.
+   - `WorkerColdPathAtomics` — publish-side per-worker struct living
+     **alongside** `WorkerRuntimeAtomics` in `worker_runtime.rs` but
+     with its own dedicated `window_gen: AtomicU64`. The cold-path
+     seqlock is INDEPENDENT of the runtime seqlock because the
+     runtime's even-flip only fires inside the 60s window-rotation
+     branch (`worker_runtime.rs:227`), while cold-path counters
+     must publish every ~1 s tick. Codex r1 finding 2 fix.
 
-     Atomic field layout:
-     - `pub buckets: [[AtomicU64; 24]; 16]` (2304 atomics; one cacheline-
-       aligned).
+     Publish protocol (every ~1 s; called from `publish()` regardless
+     of whether the 60s rotation branch fires):
+     ```rust
+     // 1. Bump cold gen even → odd.
+     self.cold_window_gen.fetch_add(1, Ordering::AcqRel);
+     // 2. Relaxed-store the 2304 bucket entries + 48 metadata u64.
+     for slot in 0..16 {
+         for b in 0..24 {
+             self.buckets[slot][b].store(local.buckets[slot][b], Ordering::Relaxed);
+         }
+         self.sum_ns[slot].store(local.sum_ns[slot], Ordering::Relaxed);
+         self.samples[slot].store(local.samples[slot], Ordering::Relaxed);
+         self.keys_xor[slot].store(local.keys_xor[slot], Ordering::Relaxed);
+     }
+     // 3. Bump cold gen odd → even with Release.
+     self.cold_window_gen.fetch_add(1, Ordering::Release);
+     ```
+     The seqlock pair-coverage holds across all 2304+48 atomic stores
+     because the bracketing `AcqRel` + `Release` fences forbid any
+     interior Relaxed store from being reordered outside the bracket.
+     Same correctness argument as `WorkerRuntimeAtomics` rolling-
+     window seqlock at `worker_runtime.rs:236-256` — proven via PR
+     #1311 round-2. Reader cost is bounded: 2304 + 48 = 2352 Relaxed
+     loads per snapshot, ~5 µs on the publish thread's owning core.
+
+     Atomic field layout (separate cacheline alignment per Codex r1
+     finding 2; runtime + cold-path atomics do NOT share window_gen):
+     - `pub buckets: [[AtomicU64; 24]; 16]` (2304 atomics; layout
+       packed for sequential cacheline access).
      - `pub sum_ns: [AtomicU64; 16]`.
      - `pub samples: [AtomicU64; 16]`.
      - `pub keys_xor: [AtomicU64; 16]`.
-     - `pub ns_per_tsc_q32: AtomicU64` (set once at calibration; never updated).
-     - `pub wrapper_ns_baseline: AtomicU64` (set once at calibration).
-     - `pub clock_source: AtomicU8` (0 = unset, 1 = TSC, 2 = clock_gettime).
-     - `pub window_gen: AtomicU64`.
+     - `pub ns_per_tsc_q32: AtomicU64` (set once at calibration;
+       never updated; outside the per-tick seqlock).
+     - `pub wrapper_ns_baseline: AtomicU64` (set once at calibration;
+       outside the per-tick seqlock).
+     - `pub clock_source: AtomicU8` (0 = unset, 1 = TSC, 2 =
+       clock_gettime; set once at calibration; outside the per-tick
+       seqlock).
+     - `pub cold_window_gen: AtomicU64` (per-tick seqlock counter,
+       separate from `WorkerRuntimeAtomics.window_gen`).
 
      **Note on cardinality**: 2304 + 16 + 16 + 16 + 3 = ~2360 atomics per
      worker × 6 workers = ~14K atomics. ~112 KiB total per cluster node.
 
 3. **Cold-path sampling site in `poll_descriptor/mod.rs`** — exactly two
-   single-line inserts:
+   single-line inserts. **Sample rate is regime-conditional per Codex
+   r1 finding 1**: the runtime carries a `cold_path_sample_mask: u64`
+   field on `WorkerColdPathCounters` set once at worker startup from
+   environment (`XPF_COLD_PATH_SAMPLE_MASK`; default 0xff = 1-in-256
+   for unbounded regime, set to 0 = 1-in-1 by the harness when
+   running `--cohort=bounded` per parent §4.2.0 / §4.3.3 sample-
+   budget table). The bounded-mode override is set by the harness
+   exporting `XPF_COLD_PATH_SAMPLE_MASK=0` before invoking
+   `systemctl restart xpfd` on the loss VM. Mask is read once at
+   worker startup; never re-read on the hot path.
+
    - **Sample-gate entry**: at line 1374 (right before
-     `evaluate_policy_result_with_len(...)`), insert a `sample_tag` bool
-     computed from the existing per-worker counter `telemetry.dbg.session_miss
-     & 0xff == 0` (matches REDIRECT_SAMPLE_MASK pattern at umem.rs:923, same
-     1-in-256 rate). When `sample_tag`, record `t_in = sample_tsc()`.
+     `evaluate_policy_result_with_len(...)`), insert:
+     ```rust
+     let sample_tag = (telemetry.counters.session_misses
+         & worker_ctx.cold_path_sample_mask) == 0;
+     let t_in = if sample_tag { sample_tsc() } else { 0 };
+     ```
+     `telemetry.counters.session_misses` (NOT `telemetry.dbg.session_miss`)
+     is the release-build-stable counter at
+     `poll_descriptor/mod.rs:763` (Codex r1 cleared this). Mask 0xff
+     gives 1-in-256; mask 0 gives 1-in-1.
    - **Sample-record exit**: immediately after line 1385 (the
      `evaluate_policy_result_with_len` returns), record
-     `t_out = sample_tsc()`, compute `delta_ns = (t_out - t_in) *
-     ns_per_tsc_q32 >> 32`, bucket via `bucket_index_for_ns_24`, and
+     `t_out = sample_tsc()` only if `sample_tag`, compute
+     `delta_ns = ((t_out - t_in) * ns_per_tsc_q32) >> 32`, bucket
+     via `bucket_index_for_ns_24`, and
      `worker_cold_path.record_sample(zone_pair_slot, delta_ns,
      forward_key_hash)`.
 
@@ -82,12 +178,15 @@ In tree at end of PR:
    work is a separate `#[cold]` function call). Per parent §4.3.3
    sampling-cost budget.
 
-4. **Per-tick publish** — extend the existing publish site in
-   `worker_runtime.rs::publish` to also write the cold-path histograms
-   under the **same seqlock generation** as the runtime atomics. New
-   publish entry point: `WorkerColdPathAtomics::publish_from_local(&self,
-   local: &WorkerColdPathCounters)`. Called from `publish()` after the
-   runtime fields are stored, before the final `window_gen` even-flip.
+4. **Per-tick publish** — `WorkerColdPathAtomics::publish_from_local(
+   &self, local: &WorkerColdPathCounters)` is invoked at the end of
+   the existing `WorkerRuntimeAtomics::publish()` (~1 s cadence)
+   using its OWN `cold_window_gen` seqlock — independent of the
+   runtime atomics' `window_gen` per Codex r1 finding 2. This means
+   the cold-path publish fires every publish tick, NOT only when the
+   60s rotation branch executes. Concretely: in `worker_runtime.rs`
+   the `publish()` end gets a `cold_path_atomics.publish_from_local(
+   &counters.cold_path)` call after the runtime stores complete.
 
 5. **Wire protocol additions** — six new fields on
    `WorkerRuntimeStatus` (Rust + Go), all `#[serde(default)]` /
@@ -205,7 +304,24 @@ In tree at end of PR:
    step-3 harness run. If the loss cluster is contested by parallel
    sub-agents and the measurement cannot be serialized within this
    PR's window, the section is checked in with `TBD-PENDING-MEASUREMENT`
-   placeholders and a follow-up issue is filed; STAGED ship in that case.
+   placeholders **and the following explicit STAGED-ship disclaimer is
+   prepended to the section per Codex r1 finding 5**:
+
+   ```markdown
+   > **MEASUREMENT DEFERRED**: The Scale Target tables below are
+   > scaffolded but NOT POPULATED with measured numbers in this
+   > release of `userspace-dp`. Counter wiring (cold-path latency
+   > histogram, TSC sampler, per-zone-pair slot) shipped in #1612
+   > step-3. The cluster measurement run is gated on
+   > smoke-runner serialization and is scheduled under follow-up
+   > issue **#NNNN** (filed when this PR merges in STAGED form).
+   > **#1609 v2 multi-stage policy DAG acceptance criterion
+   > REMAINS UNMET** until #NNNN closes — downstream consumers
+   > MUST NOT cite TBD rows as empirical bounds.
+   ```
+
+   A STAGED-ship PR description also adds a `Refs #1609 v2` line
+   noting that #1609 v2 acceptance is still gated.
 
 ## 2. Out of scope (deferred to follow-ups)
 
@@ -272,18 +388,66 @@ hazard 1 + #1607-step-3 acceptance criterion:
 
 ### 3.3 Histogram-bucket saturation
 
-24 power-of-two buckets per parent §4.4: bucket[i] covers
-`[2^(i-1), 2^i)` ns for i ≥ 1; bucket[0] is `[0, 1)` ns. At i=23
-the upper bound is 2^23 = 8_388_608 ns ≈ 8.4 ms. Per parent §4.4 +
-plan v1 F3 fix: 24 buckets saturate at 4.3 s, comfortably above any
-realistic per-call cold-path latency.
+Codex r1 finding 3 fix: v2 pins the exact 24-bucket formula. With
+`b = (54 - clz(ns|1)).max(0).min(23)`:
 
-### 3.4 Splitmix slot collision
+- Bucket 0 covers `[0, 1024)` ns (any `ns < 1024` → `clz ≥ 54` →
+  `b ≤ 0` → clamped to 0).
+- Bucket i (for i ∈ [1, 22]) covers `[2^(9+i), 2^(10+i))` ns.
+- Bucket 23 covers `[2^32, ∞)` ns (any `ns ≥ 2^32 ≈ 4.295 s` saturates).
+
+Worst-case projection of 1M-rule linear scan at ~100 ns/rule =
+~100 ms per packet (~10^8 ns ≈ 2^27 ns), the result lands in
+bucket ~17 — well below saturation. Tail is visible. Sub-1024 ns
+samples (typical for 10/100-rule cold path on modern CPUs) all
+land in bucket 0; tail buckets are populated above 1 µs.
+
+### 3.4 Splitmix slot collision (Codex r1 finding 4)
 
 `splitmix64((from_zone_id << 32) | to_zone_id) & 0xF` — AGY r3 axis 5
 verified this is a perfect bijection over the K=16 diagonal +
-round-robin test patterns. Same 16-slot hash key contract: pinned via
-`POLICY_COLD_PATH_ZONE_PAIR_SLOTS == 16` const assertion.
+round-robin test patterns. **However, Codex r1 simulated the real
+loss-cluster zone set** (trust/untrust/dmz/wan/lan + global +
+fabric variants) and found multiple slot collisions:
+`trust→dmz ⊕ untrust→trust` both map to slot 3; `trust→wan ⊕
+lan→wan` both map to slot 4; `untrust→wan ⊕ global` both map to
+slot 11. These collisions are **inherent** to the 16-slot pigeonhole
+when the active zone-pair set exceeds 16 entries.
+
+The v2 fix is a **collision detector + publication gate**:
+
+1. `keys_xor[slot]` is updated by XOR-ing in the packed
+   `(from_zone_id << 32 | to_zone_id) | 1` (the `| 1` prevents the
+   `(0,0)` sentinel from collapsing to zero) on each sample.
+2. A slot holding samples from **only one zone-pair key** keeps
+   `keys_xor[slot] == packed_key` (because XOR-ing the same value
+   twice cancels; XOR-ing it N times leaves the value if N is odd
+   and 0 if N is even). Across two consecutive publish snapshots,
+   a single-key slot's `keys_xor` toggles between two values
+   (`packed_key` and 0) deterministically as samples land.
+3. A slot holding samples from **multiple distinct zone-pair keys**
+   shows `keys_xor` traffic that does NOT match either single-key
+   pattern.
+
+The harness implements a strict variant of this check: after the
+measurement window completes, the harness compares the `keys_xor`
+value across the run's snapshots. Any slot whose final `keys_xor`
+contains bits set that do NOT match the **expected packed-key
+pattern for the rule-count's expected dominant zone-pair** is
+flagged as `alias_detected=true` and **excluded** from Tables
+A1/A2 publication. (The expected dominant zone-pair for the
+synthetic-policy-gen.py default is `trust→wan` for unbounded mode
+since the flooder targets `172.16.80.200` on `reth0.80` from the
+LAN-side `ge-0-0-1`.)
+
+This is a publication gate on the harness side, not a runtime
+constraint. Hot-path samples continue to land in their hashed
+slot regardless of aliasing; only the publication step filters.
+
+The raw TSV retains all slot samples with the `alias_detected`
+flag, so the underlying data is not lost. If reviewers later
+disagree with the collision-detection method, the raw TSV can be
+re-analyzed with a different filter.
 
 ### 3.5 Wire-protocol both-sides drift
 
@@ -430,10 +594,16 @@ contested, STAGED ship.
 - New `synthetic-policy-gen.py` + `cold-path-microbench.sh` are
   checked in with shellcheck/pylint clean (where lints exist).
 - Smoke matrix Pass A + Pass B match master ± 5 %.
-- Scale Target table in `docs/userspace-jit-design.md` is
-  populated with measured numbers from clean TSC-gated runs (or
-  STAGED with TBD placeholders if cluster contention prevents
-  measurement; follow-up issue filed).
+- Either:
+  - **FULL form**: Scale Target table in `docs/userspace-jit-design.md`
+    is populated with measured numbers from clean TSC-gated runs;
+    Tables A1/A2/B1/B2 rows are non-TBD; #1609 v2 acceptance criterion
+    UNBLOCKED.
+  - **STAGED form**: Tables remain TBD with the explicit
+    MEASUREMENT-DEFERRED disclaimer per §1.9; follow-up issue
+    filed referencing this PR's counter-wiring contract; PR
+    description explicitly notes `#1609 v2 acceptance REMAINS
+    UNMET`.
 
 ## 7. Doc-coherency contract
 
