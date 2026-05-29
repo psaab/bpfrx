@@ -881,6 +881,47 @@ In addition to the structural per-flow CoV gate above
    distribution as master HEAD on the `cos-iperf-config.set`
    fixture (within ±5% per-class token-bucket noise).
 
+### Small-class per-class rate-metering floor (#1630 cause-1)
+
+Even SOLO (one class, one port, zero competition) the lowest-rate exact
+classes could not reach their configured shape — a per-class floor in the
+v8 epoch rate-meter, independent of cross-class competition. Two distinct
+root causes were isolated by a SOLO A/B; #1630 (cause-1) fixes the lower-
+rate one (100m, 1g). A mid-rate ~6 % residual on 3g/6g is a separate root
+cause (cause-2) tracked under #1630 and is NOT addressed here.
+
+Cause-1 has two composing parts:
+
+- **Bounded rotation credit carry** (`rotate_epoch_v8`). The epoch
+  rotation is purely lazy — a low-rate class is only rotated when the
+  scheduler next visits its queue, so the gap (`lag`) between two
+  rotations of the same queue routinely exceeds one epoch. The previous
+  clamp computed `elapsed = min(lag, EPOCH)` and reset
+  `epoch_start := now`, permanently discarding `rate × (lag − EPOCH)` of
+  grant. The replacement bounds `elapsed` by `K × EPOCH`
+  (`MAX_ROTATION_LAG_EPOCHS = 8`) to recover the lagged credit, banks any
+  residual beyond `K` into a clamped per-class carry deficit drained on
+  the next visit, and COLD-RESUMES to a single epoch (dropping carry) for
+  any lag beyond `STALL_THRESHOLD_EPOCHS = 256` so a stalled or
+  HA-failed-back worker (reused lease, stale `epoch_start`) cannot emit a
+  multi-epoch burst. The per-rotation grant is hard-bounded by
+  `(K + (K−1)) × rate × EPOCH`, preserving the burst bound (Gate 4) the
+  old clamp protected.
+- **Per-visit frame-count cap + N-frame token bank** (P2 + P1). The
+  guarantee selectors clamped each visit's send budget to the rate-scaled
+  quantum (`rate × 200 µs`), below two MTUs for a low-rate class, so the
+  drain sent one frame and discarded the sub-frame remainder every visit.
+  The send budget is now `cos_guarantee_visit_cap_bytes`
+  (`TX_BATCH_SIZE × frame`) while the Phase-1 budget gate keeps the
+  rate-scaled quantum (`phase1_cost`) so small-first ordering is
+  preserved; the exact-queue token bucket banks an N-frame burst
+  (`COS_EXACT_QUEUE_LEASE_BANK_BYTES`, N = 8) with the outstanding-credit
+  cap raised in lock-step. The long-run rate is still metered by the v8
+  per-epoch grant and the actual-byte debit, so the hard-cap holds.
+
+The scoped acceptance gate is `cos-gate1-small-four-alone.sh` SOLO: 100m
+and 1g each ≥ 95 % of shape under `guarantee-rate 0.7`.
+
 ### Simul-load harness
 
 `test/incus/cos-simul-load-smoke.sh [push|reverse]` runs all 11

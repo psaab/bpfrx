@@ -240,6 +240,56 @@ impl SharedCoSExactBacklog {
 /// Epoch duration. Picked to match existing refill cadence.
 pub(in crate::afxdp) const EPOCH_DURATION_NS: u64 = 200_000;
 
+/// #1630 (cause-1): rate-recovery width for the rotation credit carry.
+///
+/// `maybe_rotate_epoch_v8` is purely lazy — a low-rate exact class is
+/// only rotated when the scheduler next visits its queue, so the gap
+/// (`lag = now − epoch_start`) between two rotations of the SAME queue
+/// routinely exceeds one epoch under round-robin across 11+ classes. The
+/// pre-#1630 clamp computed `elapsed = min(lag, EPOCH)` and then reset
+/// `epoch_start := now`, permanently discarding `rate × (lag − EPOCH)` of
+/// grant per lagged rotation. That pinned the lowest-rate classes well
+/// below shape even SOLO (100m 81 %, 1g 84 %).
+///
+/// `MAX_ROTATION_LAG_EPOCHS` (K) is the number of epochs of lag a single
+/// rotation recovers in full. It is the bounded relaxation of the clamp:
+/// a single rotation can grant at most `K × rate × EPOCH` of base credit,
+/// so the per-class post-stall burst is hard-bounded (the invariant the
+/// old clamp protected). K = 8 matches the diagnostic probe that lifted
+/// the SOLO ceilings; the §3.6 SOLO A/B confirmed small-K + P2 clears the
+/// scoped Gate-1 (100m/1g) without an aggregate-burst hazard (Fork A).
+const MAX_ROTATION_LAG_EPOCHS: u64 = 8;
+
+/// #1630 (cause-1): cold-resume cutoff for the rotation credit carry,
+/// DECOUPLED from `MAX_ROTATION_LAG_EPOCHS`.
+///
+/// A lag beyond `STALL_THRESHOLD_EPOCHS` is not a legitimate intermittent
+/// visit gap — it is a worker/RG stall (GC pause, scheduler starvation)
+/// or an HA demote→promote gap on a REUSED lease (leases are reused when
+/// config matches, so `epoch_start` survives across a failover and the
+/// first post-promotion rotation sees `lag ≈ demotion_duration`). In that
+/// regime the rotation cold-resumes to a single-epoch grant and DROPS any
+/// banked carry, so a long-stalled or just-promoted worker cannot emit a
+/// `K`-epoch (let alone a stall-duration) burst. STALL must sit ABOVE any
+/// legitimate visit-lag tail and BELOW a failback gap: the failback path
+/// is ≥100 ms (≥500 epochs, CLAUDE.md "Failback timing ~130 ms"), so
+/// STALL = 256 epochs ≈ 51 ms has margin on both sides.
+const STALL_THRESHOLD_EPOCHS: u64 = 256;
+
+/// #1630 (cause-1): reservoir cap for the rotation credit carry — the
+/// MAXIMUM unbanked rate credit a class can ever owe, regardless of stall
+/// length. Bounds the post-stall catch-up burst. Sized at `K` epochs of
+/// rate (`MAX_ROTATION_LAG_EPOCHS × rate × EPOCH`, computed per-lease from
+/// `rate_bytes` in the rotation), matching the per-rotation K-epoch grant
+/// ceiling so the carry can never push a single rotation above the bound.
+///
+/// Per-epoch carry DRAIN is additionally capped at `(K − 1) × rate ×
+/// EPOCH` so a normal-recovery rotation that drains a full reservoir
+/// grants `base_cap + (K−1) × base_cap = K × base_cap` — the same K-epoch
+/// ceiling, never more.
+const CARRY_MAX_EPOCHS: u64 = MAX_ROTATION_LAG_EPOCHS;
+const CARRY_DRAIN_MAX_EPOCHS: u64 = MAX_ROTATION_LAG_EPOCHS - 1;
+
 /// Bound on seqlock-snapshot retries.
 const MAX_SEQ_SPINS: u32 = 64;
 
@@ -279,9 +329,26 @@ struct SharedCoSEpochState {
     /// epoch_tag = (seq >> 1) as u32.
     epoch_seq: AtomicU64,
     epoch_start_ns: AtomicU64,
-    /// Capped at u32::MAX. Computed as
-    /// `rate × min(elapsed, EPOCH_DURATION_NS)` per rotation.
+    /// Capped at u32::MAX. Computed as `rate × elapsed + carry_draw` per
+    /// rotation, where `elapsed` is bounded by `K × EPOCH_DURATION_NS`
+    /// (#1630 cause-1 credit carry — was `rate × min(elapsed, EPOCH)`).
     epoch_total_grant_cap: AtomicU64,
+    /// #1630 (cause-1): ROTATION-PRIVATE bounded credit deficit (bytes).
+    ///
+    /// Holds the rate credit a lagged rotation could not grant in full
+    /// (`rate × (lag − K×EPOCH)`), banked for the next visit and clamped
+    /// at `CARRY_MAX_EPOCHS × rate × EPOCH`. Read AND written ONLY by the
+    /// rotation winner, entirely inside the seqlock ODD critical section
+    /// (between the EVEN→ODD CAS and the ODD→EVEN publish in
+    /// `maybe_rotate_epoch_v8`). It is deliberately NOT part of the
+    /// `snapshot_epoch_v8` published payload — acquirers never read it —
+    /// so it adds no new reader-visible seqlock surface (would otherwise
+    /// be the #1619 tearing class). This privacy is ENFORCED by a grep
+    /// test in `shared_cos_lease_tests.rs`; do NOT add a `pub` accessor or
+    /// read it from `acquire_v8`/`snapshot_epoch_v8`/`coordinator/status`.
+    /// Reset to 0 on cold-resume (lag > STALL or start==0) so it cannot
+    /// leak a stale deficit across an HA demote→promote gap.
+    epoch_carry_bytes: AtomicU64,
     epoch_grace_expires_ns: AtomicU64,
     /// Packed (epoch_tag, total_granted_this_epoch).
     packed_granted: PackedEpochGrant,
@@ -315,6 +382,7 @@ impl SharedCoSEpochState {
             epoch_seq: AtomicU64::new(0),
             epoch_start_ns: AtomicU64::new(0),
             epoch_total_grant_cap: AtomicU64::new(0),
+            epoch_carry_bytes: AtomicU64::new(0),
             epoch_grace_expires_ns: AtomicU64::new(0),
             packed_granted: PackedEpochGrant::new(),
             rollback_retry_exceeded: AtomicU64::new(0),
@@ -691,10 +759,25 @@ const COS_ROOT_LEASE_TARGET_US: u64 = 200;
 const COS_ROOT_LEASE_MIN_BYTES: u64 = 1500;
 const COS_ROOT_LEASE_MAX_BYTES: u64 = 512 * 1024;
 
+/// #1630 (P1): per-queue exact leases bank an N-frame burst
+/// (`COS_EXACT_QUEUE_LEASE_BANK_BYTES`); the root lease does not. The
+/// `bank_floor` flag selects whether the outstanding-credit cap is
+/// floored at the bank. It MUST be the same for a given lease across
+/// rebuilds (it is fixed by the lease kind), so `matches_config*` passes
+/// the same value the constructor did.
 fn compute_shared_cos_lease_config(
     rate_bytes: u64,
     burst_bytes: u64,
     active_shards: usize,
+) -> SharedCoSLeaseConfig {
+    compute_shared_cos_lease_config_with_bank(rate_bytes, burst_bytes, active_shards, false)
+}
+
+fn compute_shared_cos_lease_config_with_bank(
+    rate_bytes: u64,
+    burst_bytes: u64,
+    active_shards: usize,
+    bank_floor: bool,
 ) -> SharedCoSLeaseConfig {
     let burst_bytes = burst_bytes
         .max(COS_ROOT_LEASE_MIN_BYTES)
@@ -709,10 +792,40 @@ fn compute_shared_cos_lease_config(
     let lease_bytes = target_lease_bytes
         .max(COS_ROOT_LEASE_MIN_BYTES)
         .min(lease_ceiling);
-    let max_frame_lease_bytes = lease_bytes.max(tx_frame_capacity() as u64);
+    // #1630 (P1): the per-queue exact lease token bucket is watermarked at
+    // an N-frame burst bank (COS_EXACT_QUEUE_LEASE_BANK_BYTES, see
+    // afxdp::mod / maybe_top_up_cos_queue_lease). The v8/legacy QUEUE
+    // lease refuses grants once outstanding credit reaches
+    // `max_total_leased`, so the outstanding-credit cap must rise in
+    // lock-step or a low-`active_shards` queue can never bank the full N
+    // frames (at active_shards=6 the old floor was 4096×6=24 KB < the 32
+    // KB bank). The ROOT lease is NOT bank-watermarked (its top-up uses
+    // `lease_bytes.max(tx_frame_capacity)`), so `bank_floor` is false for
+    // it and its cap is unchanged. Raising the per-frame floor only widens
+    // the outstanding window; the rate is still metered by the refill rate
+    // (`rate_bytes`) and the actual-byte `consume`, so the hard-cap
+    // (Gate 4) is preserved.
+    let bank_bytes = if bank_floor {
+        COS_EXACT_QUEUE_LEASE_BANK_BYTES
+    } else {
+        0
+    };
+    let max_frame_lease_bytes = lease_bytes
+        .max(tx_frame_capacity() as u64)
+        .max(bank_bytes);
+    // The base cap keeps the lease from handing out more than a quarter of
+    // the burst pool. #1630: that `burst/4` term (≈24 KB at the 96 KB
+    // burst floor) is BELOW the N-frame bank (32 KB at N=8), so the cap
+    // alone defeats the watermark even though `max_frame_lease_bytes` was
+    // raised. For queue leases, floor the outstanding cap at one full bank
+    // so a single shard can hold N frames of credit, but never exceed the
+    // credit pool (`burst_bytes`) — outstanding credit can never exceed
+    // available tokens, so flooring at the bank only relaxes the safety
+    // margin, it does not raise the steady-state rate.
     let max_total_leased = burst_bytes
         .saturating_div(4)
-        .min(max_frame_lease_bytes.saturating_mul(active_shards as u64));
+        .min(max_frame_lease_bytes.saturating_mul(active_shards as u64))
+        .max(bank_bytes.min(burst_bytes));
     debug_assert!(max_total_leased <= u32::MAX as u64);
     SharedCoSLeaseConfig {
         rate_bytes,
@@ -888,7 +1001,10 @@ fn refill_shared_cos_lease_state(
 
 impl SharedCoSQueueLease {
     pub(in crate::afxdp) fn new(rate_bytes: u64, burst_bytes: u64, active_shards: usize) -> Self {
-        let config = compute_shared_cos_lease_config(rate_bytes, burst_bytes, active_shards);
+        // #1630 (P1): queue leases bank an N-frame burst, so the
+        // outstanding-credit cap is floored at the bank (bank_floor = true).
+        let config =
+            compute_shared_cos_lease_config_with_bank(rate_bytes, burst_bytes, active_shards, true);
         Self {
             config,
             state: SharedCoSLeaseState {
@@ -927,7 +1043,9 @@ impl SharedCoSQueueLease {
         max_worker_id: usize,
         rate_mode: V8RateMode,
     ) -> Self {
-        let config = compute_shared_cos_lease_config(rate_bytes, burst_bytes, active_shards);
+        // #1630 (P1): queue leases bank an N-frame burst (bank_floor = true).
+        let config =
+            compute_shared_cos_lease_config_with_bank(rate_bytes, burst_bytes, active_shards, true);
         let len = max_worker_id + 1;
         let worker_grants = (0..len)
             .map(|_| PackedEpochGrant::new())
@@ -985,7 +1103,15 @@ impl SharedCoSQueueLease {
         active_shards: usize,
     ) -> bool {
         // Legacy match: ignores v8 mode. v8 callers use `matches_config_v8`.
-        self.config == compute_shared_cos_lease_config(rate_bytes, burst_bytes, active_shards)
+        // #1630 (P1): queue leases use the bank-floored config
+        // (bank_floor = true) — must match what `new`/`new_v8*` built.
+        self.config
+            == compute_shared_cos_lease_config_with_bank(
+                rate_bytes,
+                burst_bytes,
+                active_shards,
+                true,
+            )
             && self.v8.is_none()
     }
 
@@ -1002,7 +1128,15 @@ impl SharedCoSQueueLease {
         let Some(v8) = self.v8.as_ref() else {
             return false;
         };
-        self.config == compute_shared_cos_lease_config(rate_bytes, burst_bytes, active_shards)
+        // #1630 (P1): queue leases use the bank-floored config
+        // (bank_floor = true) — must match what `new_v8*` built.
+        self.config
+            == compute_shared_cos_lease_config_with_bank(
+                rate_bytes,
+                burst_bytes,
+                active_shards,
+                true,
+            )
             && v8.worker_grants.len() == max_worker_id + 1
             && v8.rate_mode == rate_mode
     }
@@ -1437,14 +1571,28 @@ impl SharedCoSQueueLease {
                 std::hint::spin_loop();
                 continue;
             }
-            let cap = v8.epoch.epoch_total_grant_cap.load(Ordering::Acquire);
+            // #1643: seqlock reader payload loads are Relaxed and SEALED
+            // by an explicit `fence(Acquire)` before the trailing
+            // `seq_after` re-read. The previous `Acquire` loads only
+            // prevented LATER ops from hoisting above each load; they did
+            // NOT pin these payload reads ABOVE the `seq_after` read, so on
+            // a weakly-ordered CPU (ARM/POWER) `seq_after` could retire
+            // before the payload loads and the even-equal validation could
+            // pass against torn cross-epoch data (the #1619 tearing class).
+            // The fence guarantees all payload loads complete before
+            // `seq_after` is read, matching the verified-correct
+            // `cold_path_hist.rs::snapshot` reference. Latent on the
+            // x86-TSO i40e/mlx5 deploy targets but a real hazard on any
+            // weakly-ordered CPU.
+            let cap = v8.epoch.epoch_total_grant_cap.load(Ordering::Relaxed);
             let share = v8
                 .worker_fair_share
                 .get(worker_id)
-                .map(|a| a.load(Ordering::Acquire))
+                .map(|a| a.load(Ordering::Relaxed))
                 .unwrap_or(0);
-            let grace = v8.epoch.epoch_grace_expires_ns.load(Ordering::Acquire);
-            let seq_after = v8.epoch.epoch_seq.load(Ordering::Acquire);
+            let grace = v8.epoch.epoch_grace_expires_ns.load(Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::Acquire);
+            let seq_after = v8.epoch.epoch_seq.load(Ordering::Relaxed);
             if seq_after == seq_before {
                 return Some((cap, share, grace, (seq_before >> 1) as u32));
             }

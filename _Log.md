@@ -1,5 +1,43 @@
 # Action Log
 
+## 2026-05-28 — #1630 cause-1 rotation credit carry + #1643 seqlock fence
+- **Timestamp**: 2026-05-28 UTC
+- **Action**: Implemented the scoped #1630 cause-1 fix (CoS small-class
+  shape loss) on fresh branch `fix/1630-cause1-credit-carry` off
+  origin/master. (1) Bounded rotation credit carry in
+  `rotate_epoch_v8` STEP 6: new rotation-private `epoch_carry_bytes`
+  atomic + three-regime rotation (normal recovery ≤K, bank-residual
+  K<lag≤STALL, cold-resume >STALL or start==0), `K=8`, `STALL=256`,
+  carry clamped at `K×rate×EPOCH`, drain ≤ `(K−1)×rate×EPOCH`. Recovers
+  the `rate×(lag−EPOCH)` the old `.min(EPOCH)` clamp discarded; burst
+  hard-bounded; cold-resume drops stale carry across HA reused-lease
+  failback. (2) #1643 acquire-fence in `snapshot_epoch_v8`: payload
+  loads → Relaxed, added `fence(Acquire)` before `seq_after` re-read,
+  writer payload stores → Relaxed (single Release on epoch_seq);
+  mirrors the verified `cold_path_hist::snapshot` reference. (3) P2
+  per-visit frame cap (`cos_guarantee_visit_cap_bytes`) + P1 N-frame
+  token bank (`COS_EXACT_QUEUE_LEASE_BANK_BYTES`, bank-floored
+  `max_total_leased`) brought over from `fix/1630-cos-lease-watermark`
+  @ b29fdb344. Added 8 carry unit tests (recovery, no-cliff, drain,
+  burst-bound, per-rotation ceiling, HA failback cold-resume,
+  reader-private grep guard) + updated 4 P2-affected existing tests +
+  test_support helper. Brought in `cos-gate1-small-four-alone.sh`. Full
+  `cargo test` 1542 passed / 0 failed. Docs: fairness-regimes.md
+  cause-1 section, worker/README.md + mod.rs const-assert comment.
+- **File(s)**: `userspace-dp/src/afxdp/types/shared_cos_lease/mod.rs`,
+  `userspace-dp/src/afxdp/types/shared_cos_lease/rotate_epoch_v8.rs`,
+  `userspace-dp/src/afxdp/types/shared_cos_lease/shared_cos_lease_tests.rs`,
+  `userspace-dp/src/afxdp/cos/token_bucket.rs`,
+  `userspace-dp/src/afxdp/cos/token_bucket_tests.rs`,
+  `userspace-dp/src/afxdp/cos/queue_service/mod.rs`,
+  `userspace-dp/src/afxdp/cos/queue_service/tests.rs`,
+  `userspace-dp/src/afxdp/tx/test_support.rs`,
+  `userspace-dp/src/afxdp/mod.rs`,
+  `userspace-dp/src/afxdp/worker/README.md`,
+  `docs/fairness-regimes.md`,
+  `test/incus/cos-gate1-small-four-alone.sh`,
+  `docs/pr/1630-cause1-credit-carry/plan.md`
+
 ## 2026-05-28 03:07 UTC — #1611 Copilot review addressed
 - **Timestamp**: 2026-05-28 03:07 UTC
 - **Action**: For PR #1616 / issue #1611, addressed two Copilot review findings in `test/incus/cold-path-flooder/src/main.rs`. (1) Reworked the per-second stderr JSON helper so `pps` is derived from the real emit-window duration and the emitted counters are explicitly window deltas (`*_delta`) instead of mixed cumulative/window semantics. Added unit tests covering the computed rate and the zero-window clamp. (2) Reworked the ignored CAP_NET_RAW smoke test so it no longer binds to `lo`; it now uses `XPF_RAW_SOCKET_TEST_IFACE` when provided or auto-probes `/sys/class/net` for an `IFF_UP` Ethernet iface, validates `ARPHRD_ETHER`, and skips cleanly if no suitable iface is available. Updated the #1611 plan doc example/output accordingly.

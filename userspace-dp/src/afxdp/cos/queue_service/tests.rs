@@ -646,8 +646,17 @@ fn guarantee_phase_parks_non_exact_queue_on_root_only_wakeup() {
     assert_eq!(root.queues[0].hot.next_wakeup_tick, 30);
 }
 
+/// #1630 (P2): a low-rate queue with banked tokens drains its queued
+/// frames whole in one visit, bounded by the per-visit FRAME-count cap
+/// (`cos_guarantee_visit_cap_bytes` = TX_BATCH_SIZE × frame), NOT the
+/// rate-scaled quantum. Before #1630 the 1 Mbps quantum (clamped to
+/// 1500 B) limited the visit to a single frame and discarded the
+/// sub-frame remainder, pinning the class near 60 % of its rate. Now
+/// the rate is metered by `queue.hot.tokens` (refilled at the configured
+/// rate) and the actual-byte debit, so a queue that has accumulated
+/// tokens for several frames sends them in one pass.
 #[test]
-fn guarantee_phase_limits_service_to_visit_quantum() {
+fn guarantee_phase_visit_cap_drains_banked_frames() {
     let mut root = test_cos_runtime_with_queues(
         100_000_000,
         vec![CoSQueueConfig {
@@ -666,6 +675,7 @@ fn guarantee_phase_limits_service_to_visit_quantum() {
         }],
     );
     root.tokens = 64 * 1024;
+    // Bank enough tokens for all four queued frames.
     root.queues[0].hot.tokens = 64 * 1024;
     root.queues[0].hot.runnable = true;
     for _ in 0..4 {
@@ -677,10 +687,10 @@ fn guarantee_phase_limits_service_to_visit_quantum() {
 
     let batch = select_cos_guarantee_batch(&mut root, 1).expect("guarantee batch");
     match batch {
-        CoSBatch::Local { items, .. } => assert_eq!(items.len(), 1),
+        CoSBatch::Local { items, .. } => assert_eq!(items.len(), 4),
         CoSBatch::Prepared { .. } => panic!("expected local batch"),
     }
-    assert_eq!(root.queues[0].hot.items.len(), 3);
+    assert_eq!(root.queues[0].hot.items.len(), 0);
 }
 
 #[test]
@@ -1287,7 +1297,25 @@ fn equal_flow_cap_reaches_drain_shaped_tx_entry_path() {
         root.queues[0].hot.queued_bytes,
         queued_before.saturating_sub(sent_bytes)
     );
-    assert_eq!(root.tokens, root_tokens_before.saturating_sub(sent_bytes));
+    // #1630 (P2): the per-visit budget is now a FRAME-count cap rather
+    // than the rate-scaled quantum (which clamped a 100 Mbps class to a
+    // single frame per visit). The four equal-flow frames drain in one
+    // pass, leaving the queue empty. `refresh_cos_interface_activity`
+    // then sees `nonempty_queues == 0` and calls `release_cos_root_lease`,
+    // which returns the worker's unused root credit to the shared pool
+    // (`core::mem::take(&mut root.tokens)`). So after a drain that empties
+    // the interface, root.tokens is 0 — the unspent root tokens were not
+    // leaked, they were released. (Pre-#1630 the queue stayed backlogged
+    // after one frame, so the release path did not fire and root.tokens
+    // was `root_tokens_before - sent_bytes`.)
+    assert!(
+        root.queues[0].hot.items.is_empty(),
+        "all four equal-flow frames must drain in one visit under the P2 frame-cap"
+    );
+    assert_eq!(
+        root.tokens, 0,
+        "emptying the interface releases the unused root lease to the shared pool"
+    );
     assert_eq!(
         root.queues[0]
             .telemetry

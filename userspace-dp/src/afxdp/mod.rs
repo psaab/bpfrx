@@ -211,10 +211,11 @@ const UMEM_HEADROOM: u32 = 256;
 //
 // Future bumps require re-validating: (a) L1d footprint vs
 // per-batch allocation; (b) per-poll budget interaction with
-// `MAX_RX_BATCHES_PER_POLL`; (c) the rate-quantum test
-// `guarantee_phase_*_visit_quantum` in tx.rs. The const_asserts
-// below force the change to fail compilation rather than silently
-// regress the validation surface.
+// `MAX_RX_BATCHES_PER_POLL`; (c) the guarantee-phase per-visit budget
+// tests in `cos/queue_service/tests.rs` (#1630 P2 ties the per-visit
+// send cap `cos_guarantee_visit_cap_bytes` to `TX_BATCH_SIZE × frame`).
+// The const_asserts below force the change to fail compilation rather
+// than silently regress the validation surface.
 const RX_BATCH_SIZE: u32 = 64;
 const _: () = assert!(
     RX_BATCH_SIZE == 64,
@@ -230,6 +231,36 @@ const _: () = assert!(
 const PENDING_TX_LIMIT_MULTIPLIER: usize = 2;
 const FILL_BATCH_SIZE: usize = 1024;
 const MAX_RX_BATCHES_PER_POLL: usize = 4;
+
+/// #1630 (P1): exact-queue token-bucket burst bank.
+///
+/// The per-queue token bucket for a hard-cap exact guarantee class was
+/// previously watermarked at `lease_bytes` (= `rate × 200 µs`, floored
+/// at one frame). For a low-rate class (e.g. 100 Mbps → ~2.5 KB target,
+/// floored to 4 KB) the bucket could bank only ~1-2 frames and lost the
+/// unspent per-epoch lease cap at every rotation, pinning the class well
+/// below its configured rate independent of competition (the
+/// small-four-alone SOLO A/B measured 100m/1g far under shape). Banking N
+/// frames lets a small class accrue enough to send whole frames at its
+/// full average rate and ride out drain-visit cadence jitter.
+///
+/// The long-run RATE is unchanged: the v8 `acquire_v8` per-epoch grant is
+/// still rate-metered (now `rate × elapsed` with the #1630 cause-1 carry)
+/// and `consume(sent_bytes)` debits actual bytes
+/// (token_bucket.rs / tx_completion.rs). The watermark only widens the
+/// burst/accumulation window — it never raises the refill rate, so the
+/// hard-cap (Gate 4) holds.
+///
+/// `COS_EXACT_QUEUE_LEASE_BANK_BYTES` is consumed by
+/// `maybe_top_up_cos_queue_lease` (the bucket watermark) AND by
+/// `compute_shared_cos_lease_config` (the `max_total_leased`
+/// outstanding-credit cap), which MUST rise in lock-step or the v8 lease
+/// refuses grants past the old cap and defeats the watermark in low
+/// `active_shards` configurations (at active_shards=6, 4096×6=24 KB <
+/// the 32 KB bank).
+const COS_EXACT_QUEUE_LEASE_BANK_FRAMES: u64 = 8;
+const COS_EXACT_QUEUE_LEASE_BANK_BYTES: u64 =
+    COS_EXACT_QUEUE_LEASE_BANK_FRAMES * UMEM_FRAME_SIZE as u64;
 /*
  * Force XDP_COPY mode for AF_XDP sockets. In zero-copy mode on mlx5, XDP_PASS
  * (used for ARP, host-bound management traffic, and fallback paths) permanently

@@ -212,30 +212,102 @@ impl SharedCoSQueueLease {
             .map(|c| c.load(Ordering::Relaxed) as u64)
             .sum::<u64>()
             .max(1);
-        let elapsed_ns = if start == 0 {
-            EPOCH_DURATION_NS
+        // #1630 (cause-1): bounded rotation credit carry. The cap this
+        // rotation grants is `rate × elapsed + carry_draw`, where:
+        //   * `elapsed` is the wall-clock lag bounded by `K × EPOCH`
+        //     (`MAX_ROTATION_LAG_EPOCHS`) — recovers the rate credit the
+        //     old `.min(EPOCH)` clamp discarded for a low-rate class that
+        //     is only visited intermittently, while keeping the per-class
+        //     post-stall burst hard-bounded to `K × rate × EPOCH`;
+        //   * `carry_draw` releases a bounded slice of the banked deficit
+        //     accrued when a single lag exceeded `K × EPOCH`.
+        //
+        // Three regimes (DECOUPLED stall cutoff so a legitimate heavy-tail
+        // visit lag is never penalised as a stall):
+        //   1. lag ≤ K          — normal recovery: grant raw lag, drain a
+        //                         bounded carry slice.
+        //   2. K < lag ≤ STALL  — bank-residual: grant the K-epoch ceiling
+        //                         now, bank `rate × (lag − K×EPOCH)` into
+        //                         carry (clamped) for the next visit.
+        //   3. lag > STALL or
+        //      start == 0       — cold-resume: grant exactly one epoch and
+        //                         DROP carry. Bounds the post-stall /
+        //                         post-failback burst to `rate × EPOCH` and
+        //                         prevents carry leaking across an HA
+        //                         demote→promote gap on a reused lease.
+        //
+        // `epoch_carry_bytes` is rotation-private (single-writer, inside
+        // the seqlock ODD section); the Acquire/Release on it are redundant
+        // with the surrounding CAS fence but self-documenting. See the
+        // struct doc-comment for the enforced reader-private invariant.
+        let rate_bytes = self.config.rate_bytes as u128;
+        let carry_max = ((rate_bytes
+            * CARRY_MAX_EPOCHS as u128
+            * EPOCH_DURATION_NS as u128)
+            / 1_000_000_000u128) as u64;
+        let carry_drain_max = ((rate_bytes
+            * CARRY_DRAIN_MAX_EPOCHS as u128
+            * EPOCH_DURATION_NS as u128)
+            / 1_000_000_000u128) as u64;
+
+        let raw_elapsed_ns = now_ns.saturating_sub(start);
+        let lag_epochs = if start == 0 {
+            0
         } else {
-            (now_ns - start).min(EPOCH_DURATION_NS)
+            raw_elapsed_ns / EPOCH_DURATION_NS
         };
-        let new_cap_raw =
+
+        let (elapsed_ns, carry_draw) = if start == 0 || lag_epochs > STALL_THRESHOLD_EPOCHS {
+            // REGIME 3 — cold-resume. One epoch, drop any stale carry.
+            if start != 0 {
+                v8.epoch.epoch_carry_bytes.store(0, Ordering::Release);
+            }
+            (EPOCH_DURATION_NS, 0u64)
+        } else if lag_epochs > MAX_ROTATION_LAG_EPOCHS {
+            // REGIME 2 — bank residual beyond the K-epoch ceiling.
+            let k_window_ns = EPOCH_DURATION_NS * MAX_ROTATION_LAG_EPOCHS;
+            let overshoot_ns = raw_elapsed_ns.saturating_sub(k_window_ns) as u128;
+            let new_owed = ((rate_bytes * overshoot_ns) / 1_000_000_000u128) as u64;
+            let prev_carry = v8.epoch.epoch_carry_bytes.load(Ordering::Acquire);
+            let carry = prev_carry.saturating_add(new_owed).min(carry_max);
+            v8.epoch.epoch_carry_bytes.store(carry, Ordering::Release);
+            (k_window_ns, 0u64)
+        } else {
+            // REGIME 1 — normal recovery. Grant the raw lag (bounded by K
+            // here) and drain a bounded carry slice.
+            let prev_carry = v8.epoch.epoch_carry_bytes.load(Ordering::Acquire);
+            let draw = prev_carry.min(carry_drain_max);
+            v8.epoch
+                .epoch_carry_bytes
+                .store(prev_carry - draw, Ordering::Release);
+            (raw_elapsed_ns, draw)
+        };
+
+        let base_cap =
             ((self.config.rate_bytes as u128) * (elapsed_ns as u128) / 1_000_000_000u128) as u64;
-        let new_cap = new_cap_raw.min(u32::MAX as u64);
+        let new_cap = base_cap.saturating_add(carry_draw).min(u32::MAX as u64);
+        // #1643: payload store downgraded to Relaxed — the single Release
+        // on `epoch_seq` below is the sole publish the fenced-Acquire reader
+        // synchronizes-with (matching the cold_path_hist reference writer).
         v8.epoch
             .epoch_total_grant_cap
-            .store(new_cap, Ordering::Release);
+            .store(new_cap, Ordering::Relaxed);
         let grace_ns = now_ns.saturating_add(EPOCH_DURATION_NS / 2);
         v8.epoch
             .epoch_grace_expires_ns
-            .store(grace_ns, Ordering::Release);
+            .store(grace_ns, Ordering::Relaxed);
         for (id, count_atom) in v8.worker_active_flow_buckets.iter().enumerate() {
             let my_count = count_atom.load(Ordering::Relaxed) as u64;
             let my_share = ((new_cap as u128) * (my_count as u128) / (total_flows as u128)) as u64;
             if let Some(share_atom) = v8.worker_fair_share.get(id) {
-                share_atom.store(my_share, Ordering::Release);
+                share_atom.store(my_share, Ordering::Relaxed);
             }
         }
-        v8.epoch.epoch_start_ns.store(now_ns, Ordering::Release);
-        // Publish completion: seq ODD→EVEN.
+        v8.epoch.epoch_start_ns.store(now_ns, Ordering::Relaxed);
+        // Publish completion: seq ODD→EVEN. This Release is the seqlock
+        // publish that synchronizes-with the reader's fenced-Acquire
+        // re-read (#1643); all payload stores above happen-before it in
+        // this single rotation-winner thread's program order.
         v8.epoch.epoch_seq.store(seq + 2, Ordering::Release);
     }
 }
