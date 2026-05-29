@@ -739,14 +739,14 @@ impl WorkerColdPathAtomics {
     /// from a legitimately-empty worker, masking retry-starvation
     /// regimes under heavy publish contention.
     ///
-    /// AGY code-r2 finding 2 (continued): the retry budget is now 2048
+    /// AGY code-r2 finding 2 (continued): the retry budget is now 8192
     /// with an exponential `std::hint::spin_loop` backoff. #1635 grew
     /// the payload from the old 16×24 dense surface to 256 slots × 48
     /// buckets, so one publish now writes ~13k atomics instead of ~450.
     /// The larger budget keeps status-path snapshots coherent under a
     /// concurrent publish without changing the hot path.
     pub(in crate::afxdp) fn snapshot(&self) -> Option<WorkerColdPathCounters> {
-        const RETRY_BUDGET: u32 = 2048;
+        const RETRY_BUDGET: u32 = 8192;
         for attempt in 0..RETRY_BUDGET {
             let s1 = self.cold_window_gen.load(Ordering::Acquire);
             if s1 & 1 != 0 {
