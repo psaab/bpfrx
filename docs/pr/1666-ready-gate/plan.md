@@ -1,8 +1,11 @@
 # #1666 — Gate the BPF READY write on helper-reported binding liveness
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + AGY +
-Claude SMR). PLAN-KILL is an acceptable verdict and is explicitly on
-the table for this work (see §11).
+**Status:** v2 — PLAN-READY (AGY) + NEEDS-MAJOR findings from Codex/SMR
+applied. Round-1 verdicts: AGY PLAN-READY, Codex PLAN-NEEDS-MAJOR
+(framing corrections), Claude SMR NEEDS-MAJOR (self-corrected magnitude).
+All three converge: the gate is correct, deadlock-free, strictly safer;
+NOT a kill. v2 fixes the two framing errors and adopts the faster `Dead`
+crash signal. See §13 for the round-1 dispositions.
 
 ## 1. Issue framing
 
@@ -130,20 +133,27 @@ coordinator status path.
 - **Lower bound today:** READY=1 may be written ~1 poll cycle before the
   socket can actually receive (FD not yet in XSKMAP). In that sub-window
   today's behaviour is itself a micro-blackhole — the shim steers to a
-  slot whose FD isn't in the XSKMAP. The gate *removes* that sub-window.
+  slot whose FD isn't in the XSKMAP and `bpf_redirect_map` fails
+  (`USERSPACE_XSK_MAP.redirect(binding.slot, 0)`, lib.rs:635). The gate
+  *removes* that sub-window.
 - **Upper bound under the gate:** READY is withheld until `xsk_registered`
   + one fresh heartbeat are observed — bounded by worker bringup latency
   + one helper status-poll interval (sub-second in practice). It cannot
   be withheld forever for a legitimately-live binding because none of the
   three sub-conditions depend on the flag.
 
-This window is the crux reviewers must weigh: it is **strictly safer**
-(READY now means "a worker can actually receive"), at the cost of a
-sub-second-longer "transit fail-closed" startup window. Because transit
-is *already* fail-closed until `xskLivenessProven` (which itself needs
-RX, which needs the flag), the practical net change to first-transit
-latency is near zero — the flag must be set before RX can be proven
-either way.
+**Honest first-transit-latency framing (Codex round-1 finding #1 — the v1
+"near zero" claim was WRONG).** Transit is NOT fail-closed until
+`xskLivenessProven`. The shim has no liveness gate: once ctrl is enabled
+(maps_sync.go:389, on `Registered && Armed`), READY is set, and the
+heartbeat is fresh, the shim redirects transit at lib.rs:635 —
+*before* Go observes `xskLivenessProven` (which is set only later, after
+RX moves, at maps_sync.go:396). So gating on `Ready` adds a real
+first-transit delay of up to the next Go status/apply cycle after the
+worker becomes XSK-ready (sub-second to ~1 poll interval). That delay is
+acceptable — it is precisely the interval during which steering would
+otherwise hit a not-yet-registered FD — but it is NOT zero, and the plan
+states it as a real (small) cost rather than a wash.
 
 ## 5. Crash-detection → READY-clear (Open question #3)
 
@@ -151,7 +161,36 @@ The blackhole the issue targets is the **mid-life** crash: a worker that
 was Ready, then panics. This plan must define how READY is *cleared*, not
 just gated at write time.
 
-**An existing signal already drives the clear — no new mechanism needed:**
+### 5.0 What "blackhole" actually means today (corrected magnitude)
+
+Round-1 reviews (Codex finding #2, AGY finding #2, SMR self-correction)
+established that the mid-life crash is **NOT a permanent blackhole** — it
+is a **~30s** one, and the control plane actively keeps it open:
+
+- The XDP shim independently fail-closes transit to a slot whose
+  heartbeat is stale: lib.rs:425 reads `USERSPACE_HEARTBEAT`, lib.rs:449
+  compares against `ctrl.heartbeat_timeout_ms`, and on staleness calls
+  `drop_degraded_transit` → `XDP_DROP` (lib.rs:463, 939–946; transit
+  drops in both compat and strict). **But** Go programs
+  `HeartbeatTimeoutMS: 30000` (maps_sync.go:98/223/291), so the shim's
+  in-band clear is **~30s**, not the 5s the shim default would give.
+- Worse, the Go control plane keeps the binding-array READY=1 the whole
+  time: on master site 1 writes READY from `Registered && Armed`
+  (maps_sync.go:596), which stay true after a worker panic, and the
+  watchdog (verifyBindingsMapLocked) *re-asserts* READY=1 for any zeroed
+  slot whose helper status still shows `Registered && Armed`
+  (maps_sync.go:1076 + 1101) — so even if something cleared the flag,
+  the watchdog would fight it back to 1. The system cannot fail the slot
+  out of the blackhole.
+
+**So the honest win is: reduce dead-worker transit exposure from ~30s
+(shim heartbeat timeout, with the watchdog pinning READY=1) to ~5s — or
+near-instant with the `Dead` signal below.** This is a real correctness
+improvement, NOT redundant; the v1 "permanent → bounded" framing was an
+overstatement and the SMR "redundant on same 5s timescale" conclusion was
+based on the wrong (5s) shim timeout.
+
+### 5.1 The clear mechanisms this plan installs
 
 1. On panic, `spawn_supervised_worker` (`coordinator/supervisor.rs:98`)
    catches the unwind, sets `runtime_atomics.dead = true`, and the
@@ -177,30 +216,83 @@ Caveat to surface for review: the explicit rebind/stop_workers handlers
 (`server/handlers/rebind.rs`, `stop_workers.rs`,
 `coordinator/reconcile/reset.rs`) already clear `ready=false`
 synchronously, so orchestrated teardown clears the flag immediately;
-only an *unorchestrated panic with no respawn* relies on the 5s
+only an *unorchestrated panic with no respawn* relies on the
 heartbeat-staleness path. (#925 explicitly deferred worker respawn.)
+
+### 5.2 Faster crash signal: gate also on `!Dead` (Codex round-1 finding #3)
+
+There is an immediate, already-parsed crash signal that beats the ~5s
+heartbeat path. On panic, `spawn_supervised_worker` sets
+`runtime_atomics.dead = true` synchronously (supervisor.rs:114). This is
+published per-worker in `ProcessStatus.WorkerRuntime[]` as
+`WorkerRuntimeStatus.Dead` (protocol.go:858; surfaced as the
+`xpf_userspace_worker_dead` Prometheus gauge, #925 Phase 2). Go already
+parses it.
+
+v2 therefore gates the four sites on **`binding.Ready` AND the binding's
+worker is not Dead** — `binding.Ready && !deadWorkerIDs[binding.WorkerID]`,
+where `deadWorkerIDs` is built once per apply from
+`status.WorkerRuntime[]`. `WorkerRuntimeStatus` is keyed by `WorkerID`
+(protocol.go:835) and `BindingStatus.WorkerID` (protocol.go:1009) joins
+them; multiple bindings may share a worker, so a dead worker clears all
+its bindings at once. This collapses the unorchestrated-panic clear from
+~5s (heartbeat staleness) to one status-poll cycle (~1s).
+
+`!Dead` is a latency optimization layered on the correctness gate
+(`Ready` self-clears in ~5s regardless), but it reuses an already-shipped,
+already-parsed field at near-zero cost and directly addresses the
+"mid-life crash still blackholes" concern, so it is folded into this PR
+rather than deferred. `Dead` is set-only until daemon restart (#925), so
+it can never *spuriously* withhold READY from a live binding — it only
+ever fires for a worker that genuinely panicked.
 
 ## 6. Concrete design
 
-Single-line gate change at each of the four sites — replace the
-liveness predicate with `binding.Ready`:
+A small helper computes the gate once per apply/watchdog pass:
+
+```go
+// bindingForwardingLive reports whether a binding is safe to mark
+// READY in the XDP binding array: the helper derived it Ready
+// (registered && bound && xsk_registered && heartbeat_fresh) AND its
+// worker has not panicked. deadWorkers is built once per pass from
+// status.WorkerRuntime[] (keyed by WorkerID).
+func bindingForwardingLive(b BindingStatus, deadWorkers map[uint32]bool) bool {
+    return b.Ready && !deadWorkers[b.WorkerID]
+}
+```
+
+`deadWorkers` is assembled at the top of `applyHelperStatusLocked` and
+`verifyBindingsMapLocked` from `status.WorkerRuntime` / `m.lastStatus.
+WorkerRuntime` (a few entries; cheap). Then at each site:
 
 - **Site 1** (maps_sync.go:596): `if binding.Registered && binding.Armed`
-  → `if binding.Ready`. Replace the now-stale anti-deadlock comment with
-  a comment documenting the #1648/#1666 finding (Ready already implies
-  bound+xsk_registered+heartbeat-fresh; this is the crash-clear gate).
+  → `if bindingForwardingLive(binding, deadWorkers)`. Replace the
+  now-stale anti-deadlock comment with one documenting the #1648/#1666
+  finding (Ready already implies bound+xsk_registered+heartbeat-fresh;
+  `!Dead` adds the fast panic clear).
 - **Site 2** (maps_sync.go:633): `if binding.Registered && binding.Armed
-  && binding.Bound` → `if binding.Ready`. Tightens (adds xsk_registered
-  + heartbeat) and unifies with site 1.
+  && binding.Bound` → `if bindingForwardingLive(binding, deadWorkers)`.
+  Tightens and unifies with site 1.
 - **Site 3** (maps_sync.go:1076 guard): `if !binding.Registered ||
-  !binding.Armed { continue }` → `if !binding.Ready { continue }`. The
-  flag literal at :1101 is unchanged.
+  !binding.Armed { continue }` → `if !bindingForwardingLive(binding,
+  deadWorkers) { continue }`. Flag literal at :1101 unchanged.
 - **Site 4** (maps_sync.go:1122 guard): `if !binding.Registered ||
-  !binding.Armed || !binding.Bound { continue }` → `if !binding.Ready {
-  continue }`.
+  !binding.Armed || !binding.Bound { continue }` → `if
+  !bindingForwardingLive(binding, deadWorkers) { continue }`.
 
 No new fields, no protocol change, no Rust change. The gate reuses the
-already-shipped, already-wire-exposed `BindingStatus.Ready`.
+already-shipped, already-wire-exposed `BindingStatus.Ready`,
+`BindingStatus.WorkerID`, and `WorkerRuntimeStatus.Dead`.
+
+**Crash-clear is apply-driven, not watchdog-driven (Codex finding #4).**
+`verifyBindingsMapLocked` only *repairs zeroed* entries (it skips entries
+where `Flags != 0 || Slot != 0`, maps_sync.go:1095); it never zeros a
+populated slot. The actual READY=0 write for a dead worker comes from
+`applyHelperStatusLocked`, which writes `Flags: flags` for *every*
+binding each pass (maps_sync.go:616/649) with `flags` computed from the
+gate. Tightening site 3/4 prevents the watchdog from *re-asserting*
+READY=1 for a dead slot (the watchdog-fighting problem in §5.0); the
+clear itself is the next `applyHelperStatusLocked` pass.
 
 ## 7. Public API preservation
 
@@ -249,10 +341,16 @@ write.
 - **New unit tests:**
   - READY withheld when `Registered && Armed` but `!Ready` (e.g.
     `XSKRegistered:false`) → array flag stays 0 at site 1.
-  - READY written when `Ready:true` → array flag == `userspaceBindingReady`.
-  - Watchdog (site 3) does NOT repair/re-assert a slot with `!Ready`.
-  - Crash-clear: a binding that was Ready then reports `Ready:false`
-    (heartbeat-stale proxy) → next apply writes flags=0.
+  - READY written when `Ready:true` and worker not Dead → array flag ==
+    `userspaceBindingReady`.
+  - READY withheld when `Ready:true` but the binding's worker is Dead
+    (`WorkerRuntime[WorkerID].Dead == true`) → array flag stays 0
+    (the fast panic clear).
+  - Watchdog (site 3) does NOT repair/re-assert a slot with `!Ready` or a
+    Dead worker.
+  - Crash-clear via apply: a binding previously written READY=1, whose
+    worker is now Dead (or `Ready:false`), gets flags=0 on the next
+    `applyHelperStatusLocked` pass.
 - **`make test-failover` — HARD GATE** (touches HA forwarding-ready
   path). VRRP ~60ms, zero-drop failover.
 - **Full smoke matrix** on loss userspace cluster: v4+v6 × push+reverse ×
@@ -280,50 +378,40 @@ Kill this plan if any reviewer establishes:
   and no faster signal exists, making the "mid-life crash" half of the
   win illusory while the startup window is a real (if small) cost.
 
-## 11a. Claude SMR plan review (round 1) — trending PLAN-KILL on criterion (b)
+## 13. Round-1 plan-review verdicts and dispositions
 
-Reviewing my own plan adversarially as domain SMR, I found a decisive
-fact the issue body **and** plan §5 both missed: **the XDP shim already
-guards the crash-blind blackhole in-band via the per-slot heartbeat
-map.** Evidence (whole-function-verified in `userspace-xdp/src/lib.rs`):
+**AGY (`review-mpre0wvf-wq0j4q`): PLAN-READY.** Verified all function
+bodies; confirmed no deadlock, live-Arc-stays-after-panic, watchdog would
+fight an out-of-band clear (hence gating site 3/4 is mandatory), and the
+gate is strictly safer (avoids steering to a not-yet-registered FD).
+Confirmed the shim's in-band timeout is the Go-configured **30s**, so the
+fix is real (not mitigated today).
 
-- The shim reads `USERSPACE_HEARTBEAT` per packet (lib.rs:425) and, if
-  `now_ns - last_heartbeat > timeout_ns` where `timeout_ms` defaults to
-  `USERSPACE_DEFAULT_HEARTBEAT_TIMEOUT_MS = 5000` (lib.rs:16, 442–447),
-  it does NOT steer transit — it calls `drop_degraded_transit`
-  (lib.rs:449→463). `drop_degraded_transit` returns `XDP_DROP` for
-  transit in both compat and strict modes (lib.rs:939–946); only
-  local/control may `pass_local_control`.
-- The heartbeat map is the same per-slot value the worker touches every
-  poll tick (`maybe_touch_heartbeat` → `touch_heartbeat` →
-  `update_heartbeat_slot`, bpf_map/mod.rs:204). A crashed worker stops
-  touching it; within ≤5s the shim stops steering transit to that slot.
+**Codex (`task-mpre0hw1-i0d2rj`): PLAN-NEEDS-MAJOR.** No deadlock, no
+existing Go clear path. Four findings, all applied:
+- *#1 (applied, §4.3):* v1's "near-zero first-transit latency" was wrong —
+  transit is not fail-closed until `xskLivenessProven`; the shim
+  redirects at lib.rs:635 once ctrl+READY+heartbeat hold. Reframed as a
+  real sub-second/poll-cycle delay.
+- *#2 (applied, §5.0):* reframe win as 30s (shim heartbeat) → ~5s
+  (`Ready`), not "permanent → bounded."
+- *#3 (applied, §5.2, §6):* use the faster `WorkerRuntimeStatus.Dead`
+  signal; gate on `Ready && !Dead`.
+- *#4 (applied, §6):* crash-clear is apply-driven, not watchdog-driven;
+  watchdog only repairs zeroed entries.
 
-**Implication for the issue's headline:** the mid-life-crash blackhole
-is **neither latent nor permanent** — it self-heals in the dataplane
-within the same ~5s heartbeat window the plan proposes to enforce from
-the Go side via `binding.Ready` (whose `heartbeat_fresh` is the SAME 5s
-`HEARTBEAT_STALE_AFTER`). For the mid-life crash the Go `binding.Ready`
-gate is therefore **redundant** with an already-shipped per-packet guard.
+**Claude SMR (in-conversation): NEEDS-MAJOR, self-corrected.** Initially
+trended KILL on the belief the shim self-heals in 5s (criterion b), which
+would make the gate redundant. Codex's verification that Go programs the
+shim timeout to **30s** (maps_sync.go:291) invalidated that: the in-band
+clear is ~30s and the watchdog pins READY=1 the whole time, so the
+~5s/`!Dead` Go gate is a genuine improvement. SMR kill withdrawn.
 
-**Residual incremental coverage:** only the ≤5s *startup* sub-window
-where a worker created its socket, touched the init heartbeat
-(worker/mod.rs:355), then died or failed `register_binding_xsk`
-(worker/mod.rs:472) before its heartbeat went stale — during which
-site 1 has written READY=1 (on `Registered && Armed`) and the heartbeat
-is still fresh. The shim would steer to that dead slot for ≤5s. The gate
-closes exactly this narrow window, at the cost of the §4.3 startup-delay
-window on *every normal bringup* plus modification of the sensitive
-fail-closed path.
-
-**SMR verdict:** PLAN-NEEDS-MAJOR trending PLAN-KILL on criterion (b).
-The motivating "latent crash-blind blackhole" is already mitigated
-in-dataplane on the same timescale. What remains is a ≤5s startup-only
-edge that must be re-justified on its own merits (and may itself be
-covered if the never-registered worker also fails `probeBindingsReady`
-elsewhere — reviewers to confirm). Awaiting Codex + AGY independent
-verification of the lib.rs:449 heartbeat-staleness finding before
-finalizing the kill.
+**Convergence:** NOT a PLAN-KILL. The PLAN-KILL criteria in §11 are
+recorded but none fired — (a) no deadlock exists, (b) the blackhole is
+NOT already mitigated on a comparable timescale (30s + watchdog-pinned),
+(c) the crash-clear is real and `!Dead` makes it near-instant. v2 is
+PLAN-READY pending a confirmation pass on the two framing fixes.
 
 ## 12. Out of scope
 
