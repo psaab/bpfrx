@@ -52,8 +52,8 @@ layout_version_unknown_total→layout_version_unknown (GaugeValue state indicato
 
 | Reviewer   | Task / job id                      | Verdict   |
 |------------|------------------------------------|-----------|
-| Codex      | task-mprf0sdn-tkln60               | running (confirm) |
-| AGY        | adversarial-review-mprf115e-ujupbb  | running (confirm) |
+| Codex      | task-mprf0sdn-tkln60               | MERGE-READY (range-diff patch-equivalent; rename consistent; types unchanged) |
+| AGY        | adversarial-review-mprf115e-ujupbb  | MERGE-READY (rebase clean; doc-guard GREEN; 1613 cargo tests pass) |
 | Claude SMR | in-conversation                    | MERGE-READY (rebase clean + rename verified) |
 | Copilot    | re-review @ 328beaeb4 requested; polling | r4 (3 naming) addressed |
 
