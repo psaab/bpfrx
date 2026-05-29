@@ -462,6 +462,103 @@ pub(super) fn initial_neighbor_dump(
     Ok(if changed { 1 } else { 0 })
 }
 
+/// Requested receive-buffer size for the neighbor-monitor netlink socket
+/// (#1658). Under an RTM_NEWNEIGH/DELNEIGH multicast burst (HA failover,
+/// large neighbor churn) the default rcvbuf can overflow and the kernel
+/// drops notifications + returns ENOBUFS; the steady-state loop swallows
+/// `recv() <= 0` so the loss is silent and `dynamic_neighbors` can
+/// permanently desync (the full dump is startup-only). 4 MiB holds many
+/// thousands of small (~80-200 B wire, larger skb truesize) events —
+/// enough headroom to absorb a full large-L2-domain neighbor flush while
+/// the thread is stalled up to one 500 ms SO_RCVTIMEO tick.
+const NEIGH_RCVBUF_BYTES: libc::c_int = 4 * 1024 * 1024; // 4 MiB
+
+// Compile-time floor: a future edit must not silently shrink the monitor
+// buffer below the burst-absorbing target.
+const _: () = assert!(NEIGH_RCVBUF_BYTES >= (1 << 20));
+
+/// Enlarge the netlink monitor receive buffer to `request` bytes.
+///
+/// Best-effort: tries `SO_RCVBUFFORCE` first (bypasses
+/// `net.core.rmem_max`, requires CAP_NET_ADMIN — held because the helper
+/// runs as root for AF_XDP/BPF), falling back to plain `SO_RCVBUF`
+/// (clamped to `rmem_max`). FORCE makes the buffer guarantee
+/// self-contained instead of depending on the Go-side `tuneSocketBuffers`
+/// `rmem_max` bump (a cross-process side effect that is silently
+/// swallowed on failure).
+///
+/// Returns the effective buffer size read back via `getsockopt`. The
+/// kernel doubles the request for bookkeeping and may clamp the plain
+/// `SO_RCVBUF` path to `rmem_max`, so the `setsockopt` return alone hides
+/// a silent clamp — the readback is the ground truth and is logged. A
+/// tuning failure is logged and tolerated (the monitor still works with
+/// the default buffer); crashing the thread over a socket-buffer knob
+/// would be a worse outcome.
+fn set_neigh_monitor_rcvbuf(fd: libc::c_int, request: libc::c_int) -> libc::c_int {
+    // Stack local so &-of-value is well-defined for the FFI pointer.
+    let want: libc::c_int = request;
+    let optlen = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let forced = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUFFORCE,
+            &want as *const libc::c_int as *const libc::c_void,
+            optlen,
+        )
+    };
+    let mut via = "SO_RCVBUFFORCE";
+    if forced < 0 {
+        let force_err = std::io::Error::last_os_error();
+        let set = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &want as *const libc::c_int as *const libc::c_void,
+                optlen,
+            )
+        };
+        via = "SO_RCVBUF";
+        if set < 0 {
+            eprintln!(
+                "neigh_monitor: SO_RCVBUFFORCE({want}) and SO_RCVBUF({want}) \
+                 both failed (force: {force_err}, set: {}); using kernel \
+                 default receive buffer",
+                std::io::Error::last_os_error()
+            );
+            via = "default";
+        }
+    }
+    // Read back the effective size: a plain SO_RCVBUF set can succeed
+    // while silently clamping to rmem_max, so the setsockopt return is
+    // not enough to confirm the preventive buffer is active.
+    let mut eff: libc::c_int = 0;
+    let mut len = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &mut eff as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        eprintln!(
+            "neigh_monitor: rcvbuf set via {via}: requested {want}, \
+             effective {eff} bytes"
+        );
+    } else {
+        eprintln!(
+            "neigh_monitor: rcvbuf set via {via}: requested {want}, \
+             getsockopt readback failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    eff
+}
+
 pub(super) fn neigh_monitor_thread(
     stop: Arc<AtomicBool>,
     dynamic_neighbors: Arc<ShardedNeighborMap>,
@@ -495,6 +592,11 @@ pub(super) fn neigh_monitor_thread(
         unsafe { libc::close(fd) };
         return;
     }
+    // Enlarge the receive buffer before the dump + steady-state loop so a
+    // burst of RTM_NEWNEIGH/DELNEIGH multicast notifications does not
+    // overflow the default rcvbuf and silently drop adverts (#1658). Same
+    // fd used by initial_neighbor_dump() and the recv() loop below.
+    set_neigh_monitor_rcvbuf(fd, NEIGH_RCVBUF_BYTES);
     // Set 500ms receive timeout for periodic stop check.
     // Neighbor events arrive instantly via the multicast group —
     // recv() returns immediately when the kernel pushes an update.
@@ -690,6 +792,66 @@ mod pin_tests {
         let mut buf = [0u16; 16];
         assert_eq!(nth_allowed_cpu(0, is_set, &mut buf), None);
         assert_eq!(nth_allowed_cpu(7, is_set, &mut buf), None);
+    }
+
+    /// #1658: setting SO_RCVBUF[FORCE] on a NETLINK_ROUTE socket must
+    /// actually enlarge the effective receive buffer, and the helper must
+    /// return the read-back size (the surrounding production recv() loop
+    /// ignores its return; this knob must not). Uses a deliberately small
+    /// request (256 KiB) so the test does not depend on running as root:
+    /// the kernel sets buf = 2 * min(request, rmem_max). On a typical host
+    /// rmem_max far exceeds 256 KiB, so the effective size is ~512 KiB; the
+    /// assertion below uses a conservative floor (min(2*req, rmem_max),
+    /// which is always <= the kernel value) so it stays flake-proof across
+    /// privilege levels and any host rmem_max.
+    #[test]
+    fn neigh_monitor_rcvbuf_enlarges_effective_buffer() {
+        const TEST_REQ: libc::c_int = 256 * 1024; // well below typical rmem_max
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::NETLINK_ROUTE,
+            )
+        };
+        assert!(fd >= 0, "failed to create NETLINK_ROUTE socket for test");
+
+        let effective = super::set_neigh_monitor_rcvbuf(fd, TEST_REQ);
+
+        // Conservative floor: the kernel sets buf = 2 * min(request,
+        // rmem_max) (the non-root SO_RCVBUF fallback clamps to rmem_max,
+        // NOT 2*rmem_max). min(2*req, rmem_max) is always <= that value,
+        // so asserting >= it never false-fails. Fall back to the weaker
+        // "grew to at least the request" check if rmem_max is unreadable.
+        let rmem_max = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok());
+        match rmem_max {
+            Some(max) => {
+                let doubled = 2i64 * TEST_REQ as i64;
+                let expected_floor = doubled.min(max);
+                assert!(
+                    effective as i64 >= expected_floor,
+                    "effective {effective} < expected floor {expected_floor} \
+                     (request {TEST_REQ}, rmem_max {max})"
+                );
+                // Confirm the buffer actually grew past the ~208 KB default
+                // (unless this host's rmem_max is pathologically small).
+                assert!(
+                    effective > 212992 || max <= TEST_REQ as i64,
+                    "effective {effective} did not exceed the 208 KB default \
+                     (rmem_max {max})"
+                );
+            }
+            None => {
+                assert!(
+                    effective >= TEST_REQ,
+                    "effective {effective} < requested {TEST_REQ}"
+                );
+            }
+        }
+
+        unsafe { libc::close(fd) };
     }
 
     #[test]
