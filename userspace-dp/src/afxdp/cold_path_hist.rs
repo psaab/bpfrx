@@ -719,13 +719,14 @@ impl WorkerColdPathAtomics {
     /// from a legitimately-empty worker, masking retry-starvation
     /// regimes under heavy publish contention.
     ///
-    /// AGY code-r2 finding 2 (continued): the retry budget is now 128
-    /// (up from 16) with an exponential `std::hint::spin_loop` backoff.
-    /// For a 448-field payload at ~5 ns per Relaxed load, one publish
-    /// cycle takes ~2.2 µs; 128 retries × spin_loop give the writer
-    /// ~10-50 µs to publish before the reader gives up.
+    /// AGY code-r2 finding 2 (continued): the retry budget is now 2048
+    /// with an exponential `std::hint::spin_loop` backoff. #1635 grew
+    /// the payload from the old 16×24 dense surface to 256 slots × 48
+    /// buckets, so one publish now writes ~13k atomics instead of ~450.
+    /// The larger budget keeps status-path snapshots coherent under a
+    /// concurrent publish without changing the hot path.
     pub(in crate::afxdp) fn snapshot(&self) -> Option<WorkerColdPathCounters> {
-        const RETRY_BUDGET: u32 = 128;
+        const RETRY_BUDGET: u32 = 2048;
         for attempt in 0..RETRY_BUDGET {
             let s1 = self.cold_window_gen.load(Ordering::Acquire);
             if s1 & 1 != 0 {
