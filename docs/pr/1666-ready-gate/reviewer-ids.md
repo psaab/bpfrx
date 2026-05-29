@@ -13,9 +13,9 @@ Ledger for resuming reviewer sessions across context loss
 
 - Codex: task-mpre9ku1-e5pvs2 (NEEDS-MAJOR: Ready !imply Armed — fixed)
 
-## Code review round 1
+## Code review round 1 (PR #1672)
 
-- Codex: task-mpreidym-m4vmgs (round-3 confirm + code review @ 2321c4219)
-- AGY: review-mpref... (dispatching)
-- Copilot: <pending PR open>
-- Claude SMR: in-conversation (this thread)
+- Codex: task-mpreidym-m4vmgs — MERGE-READY (@ 2321c4219, nits fixed in dc8ba33b8)
+- AGY: review-mpreiq7i-3zz00p (timed out mid-run); re-dispatched code-only review-mpreyrkg-zjq2bq
+- Copilot: requested via @copilot review on PR #1672
+- Claude SMR: in-conversation (this thread) — MERGE-READY
