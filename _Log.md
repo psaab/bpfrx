@@ -4388,3 +4388,18 @@ top.
 - **Timestamp**: 2026-05-29
 - **Action**: Implement per-binding short-TTL negative cache; fast-fail at MissingNeighbor buffer site; record at pending_neigh drop site; resolved-wins + TTL invalidation.
 - **File(s)**: userspace-dp/src/afxdp/{mod.rs,neg_neigh.rs (new),neighbor_dispatch.rs,poll_descriptor/mod.rs,types/runtime.rs,worker/mod.rs}
+
+## #1667 SNAT doc-guard fail-closed token restore
+- **Timestamp**: 2026-05-29
+- **Action**: Doc-drift fix — restored the hyphenated `fail-closed`
+  token in the Source NAT (pool mode) row of
+  docs/userspace-dataplane-gaps.md so the
+  snat_contract_documents_current_fail_closed_runtime guard
+  (userspace-dp/tests/snat_contract_doc_guard.rs) passes. The reword in
+  c0a047ea2 had dropped the hyphen ("fail closed") while the SNAT
+  runtime stayed fail-closed; restoring the hyphen re-aligns the doc
+  with the runtime and the parallel architecture.md / plan-1377 wording.
+  No code or guard change.
+- **File(s)**: docs/userspace-dataplane-gaps.md,
+  docs/pr/1667-snat-docguard/plan.md,
+  docs/pr/1667-snat-docguard/reviewer-ids.md, _Log.md
