@@ -1,6 +1,8 @@
 # #1673 — Refresh top-level README after eBPF source-removal closeout
 
-Status: DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR)
+Status: v2 — AGY PLAN-NEEDS-MAJOR findings folded in; Codex sandbox
+infra-blocked (3 attempts, `codex-linux-sandbox` cannot spawn);
+Claude SMR concurs with AGY's in-scope findings.
 
 ## Issue framing
 
@@ -88,6 +90,53 @@ here is "every retained README claim matches verified code".
    as pending.
 
 ## Concrete design (rewrite, not delete)
+
+### v2 additions from AGY PLAN-NEEDS-MAJOR (all verified against code)
+
+- **README:49-50** "fail closed rather than silently falling back to
+  legacy eBPF" → there is no eBPF to fall back to; reframe to "fail
+  closed rather than bypassing policy/NAT/conntrack".
+- **README:51-53** names `xdp_main_prog`, deleted in #1476. Reframe the
+  degraded-mode sentence to describe behavior (keeps the legacy
+  in-kernel forwarding program out of the path) without naming the
+  deleted program.
+- **README:163** "legacy BPF pins remain for explicitly selected eBPF
+  compatibility" → eBPF cannot be selected; drop the clause. The real
+  remediation is daemon config-only mode
+  (`pkg/daemon/daemon_run.go:309-324` catches `ErrEBPFBackendRetired`).
+- **README:175** "BPF map occupancy on eBPF" → userspace-only buffer
+  view (already in v1 design, restated).
+- **README:390** clang/llvm "for legacy BPF compilation" → for the
+  retained userspace XDP shim object only (already in v1, restated).
+- **gaps.md:15-16** "No BPF source, bpf2go bindings, loader code, test
+  targets, or CLI surfaces are removed in this phase." is now
+  blatantly false post-#1476. Replace with: the #1476 source-removal
+  phase deleted legacy BPF source, bpf2go bindings, and legacy loader
+  targets, retaining only the userspace AF_XDP shim + `bpf/headers`
+  bootstrap. (This is the in-tree fix AGY HIGH-2 requires.)
+
+### CLAUDE.md disposition (AGY CRITICAL-1)
+
+AGY is correct that `CLAUDE.md:5-9` and `:50` still say "the legacy
+eBPF dataplane remains in-tree … remains as the legacy compatibility
+and regression path" — stale post-#1476. However, the #1673 task scope
+explicitly constrains this PR to `README.md` + `docs/userspace-
+dataplane-gaps.md` + this plan doc (disjoint from #1635/#1666/#1661).
+Pulling `CLAUDE.md` in would cross that boundary. Disposition: leave
+`CLAUDE.md` out of this PR and record the residual `CLAUDE.md:5-9/50`
+drift as an explicit follow-up note in the PR body so it is not lost.
+The README + gaps.md become internally consistent and code-accurate;
+CLAUDE.md remains a separately-tracked follow-up.
+
+### Parser-leniency nuance (confirmed)
+
+`pkg/config/compiler.go:1126-1133` (`validDataplaneType`) returns true
+for `ebpf`, so `load merge`/`load override` of a pre-retirement config
+parses cleanly; the hard reject fires at compile/commit
+(`validateDataplaneTypeStrict`). The README/gaps.md should state this
+so operators doing rolling upgrades understand: old configs parse, but
+`commit check` hard-fails with `ErrEBPFDataplaneRetired` and the
+remediation is `set system dataplane-type userspace`.
 
 README:
 - **Banner (5-10):** replace "remains in-tree … emits a compile
@@ -218,7 +267,9 @@ flake on both touched guards.
 
 ## Out of scope
 
-- CLAUDE.md (already says #1476 deleted the BPF pipeline — accurate).
+- CLAUDE.md (`:5-9` / `:50` are stale per AGY CRITICAL-1, but the
+  #1673 task scope is README.md + gaps.md only; recorded as a PR-body
+  follow-up note instead of edited here).
 - The `docs/pr/1373-retire-ebpf-dataplane/README.md` retirement doc.
 - Any code change. Any cluster smoke (doc-only, no dataplane code).
 - #1635 (histogram), #1666 (maps_sync.go), #1661-item8 (audit/scripts).
