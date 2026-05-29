@@ -168,9 +168,11 @@ i.i.d. uniform hashing) and confirmed against closed form:
 - **Live per-flow throughput CoV** in the **observed skewed case**
   (`-P 6 -p 5210`, ~17%) is lower than the 0.87 occupancy CoV
   because TCP cwnd dynamics and the per-worker scheduler partially
-  smooth the count unevenness, and because the most common `N = 6`
-  realizations are "4 solo + 1 pair" rather than a worst-case
-  pile-up. The ~17% is one such favorable realization, mapped
+  smooth the count unevenness, and because the common `N = 6`
+  realizations are mild — e.g. two-pairs `[2,2,1,1,0,0]` (≈35%) or
+  "4 solo + 1 pair" `[2,1,1,1,1,0]` (≈23%) — rather than a
+  worst-case pile-up. The ~17% is one such favorable realization,
+  mapped
   through `Cstruct` for its `{aᵢ}`. Do not conflate the two
   numbers: 0.87 is the *occupancy* CoV of the multinomial; ~17% is
   the *throughput* CoV of one observed placement. (The
@@ -231,12 +233,18 @@ is a re-steer.
 
 ### What this means operationally
 
-- **Aggregate throughput is unaffected.** A class still fills its
-  share of the ceiling regardless of how its flows distribute
-  across workers; only the *per-flow distribution within the class*
-  is uneven. The structural-throughput gate (Gate 3) and the
-  Cstruct-relative per-flow gate (Gate 2) both already account for
-  this.
+- **This is primarily a per-flow distribution effect, not an
+  aggregate-throughput defect.** The unevenness lives in *which
+  worker* gets each flow; aggregate is evaluated against the
+  existing structural cap, not assumed flat. Where the RSS draw
+  leaves workers idle (`Nₐ < Nᵥ`), Gate 3's `Nₐ/Nᵥ`-scaled cap and
+  the saturation detection already account for the reduced
+  achievable aggregate — so idle-worker draws can lower saturated
+  aggregate, and the gate does not penalize that. The favorable
+  `-P 6 -p 5210` observation happened to sit near its push ceiling,
+  but that is a property of that draw, not a general guarantee. The
+  Cstruct-relative per-flow gate (Gate 2) handles the
+  distribution side.
 - **It is a transport/RSS-architecture floor, not a scheduler
   bug.** When an operator or test sees bimodal per-flow rates at
   low parallelism, the correct response is to read off the floor
@@ -248,9 +256,10 @@ is a re-steer.
   at low parallelism). Those are CoS scheduler-internal floors on a
   class hitting its *configured shape*; the RSS multinomial floor
   here is about how *unshaped best-effort flows distribute across
-  workers*. Different mechanism, different layer — see the
-  "Small-class per-class rate-metering floor (#1630)" section for
-  the CoS-shaping floors.
+  workers*. Different mechanism, different layer. The CoS-shaping
+  floors are documented separately under #1630 (a
+  "Small-class per-class rate-metering floor" section is added by
+  the #1630 cause-1 PR #1650; until it lands, see issue #1630).
 
 ## Acceptance gates
 

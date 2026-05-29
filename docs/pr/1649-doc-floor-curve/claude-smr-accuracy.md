@@ -115,9 +115,32 @@ These corrections are exactly the #1647 failure mode the brief warned about
 (a wrong doc *correction*); Copilot caught the occupancy/share metric mix-up
 before merge.
 
+## Copilot round-2 findings and resolutions
+
+Copilot returned 3 comments on the round-1 fix (SHA `cda06b31b`); all 3
+addressed:
+
+1. **"most common N=6 realization is 4 solo + 1 pair" is wrong.** Correct.
+   Partition probabilities for N=6 into M=6 (Monte-Carlo 500k): two-pairs
+   `[2,2,1,1,0,0]` ≈ 35% is most common; "4 solo + 1 pair" `[2,1,1,1,1,0]`
+   ≈ 23% is second. FIXED: reworded to "common realizations are mild — e.g.
+   two-pairs (≈35%) or 4-solo+1-pair (≈23%)" instead of claiming the latter is
+   most common.
+2. **"Aggregate throughput is unaffected" overstates it.** Correct — the
+   doc's own Gate 3 scales the cap by `Nₐ/Nᵥ`, so idle-worker RSS draws reduce
+   saturated aggregate. FIXED: restated as "primarily a per-flow distribution
+   effect," explicitly noting idle-worker draws can lower saturated aggregate
+   and that Gate 3's scaled cap already accounts for it; the `-P 6` near-ceiling
+   observation is called out as a property of that draw, not a guarantee.
+3. **Dangling in-file cross-reference to the #1650 section.** Correct — the
+   "Small-class per-class rate-metering floor" section only exists after PR
+   #1650 merges, so if this PR lands first the reference dangles. FIXED:
+   qualified it as a future/open-PR reference ("added by the #1630 cause-1 PR
+   #1650; until it lands, see issue #1630") instead of an in-file section link.
+
 ## Verdict
 
-ACCURACY-CLEAN (post round-1). Every claim traces to the #1649 research plan (commit `36fcd1b8`),
+ACCURACY-CLEAN (post round-2). Every claim traces to the #1649 research plan (commit `36fcd1b8`),
 PR #1650 / issue #1630 for the cause-1/cause-2 split, issue #1649 for the
 3-reviewer kill, or my own reproduced Monte-Carlo (anchored to the research's
 published 0.87 / 1.54% values). The CLAUDE.md edit ADDS a scoped note and does
