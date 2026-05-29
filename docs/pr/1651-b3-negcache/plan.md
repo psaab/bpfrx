@@ -1,7 +1,30 @@
 # Plan — #1651 Path B3: dead-host negative cache
 
-- **Status:** DRAFT v1 — pending adversarial plan review (B3 already
-  design-blessed in the research plan; this is the IMPLEMENTATION plan).
+- **Status:** PLAN-READY v2 — Codex r1 PLAN-NEEDS-MINOR (4 minors folded
+  below), AGY r1 PLAN-READY, Claude SMR PLAN-READY. B3 design-blessed by
+  the research triple-review; this is the IMPLEMENTATION plan.
+
+### Plan-review dispositions (round 1)
+
+- **Codex #1 / Claude SMR (recycle channel):** drop the redundant
+  `recycle_now = false`; use bare `scratch_recycle.push(desc.addr);
+  continue;` matching the source-NAT-failure paths (`:2532`/`:2562`).
+  APPLIED in §4.4 below.
+- **Codex #2 (probe-exhaustion wording):** the drop branch
+  (`neighbor_dispatch.rs:110`) runs BEFORE the probe block (`:136`), so a
+  delayed sweep can drop after <3 probes. Reworded: "timed out after
+  best-effort probes" rather than "exhausted all 3". The record condition
+  is the timeout itself (the dst never resolved within the window), which
+  is the right signal regardless of probe count. APPLIED §4.5.
+- **Codex #3 (resolved-wins race):** correct as a steady-state rule, not a
+  race-free absolute. A RTM_NEWNEIGH landing between the resolved-check
+  and the fast-fail costs AT MOST one stale fast-fail (one extra cold
+  connect attempt) — never a persistent shadow. Wording softened from
+  "never" to "never persistently". APPLIED §6.
+- **Codex #4 (telemetry target):** the `missing_neigh`/`no_route` counters
+  live in `DebugPollCounters` accessed via `telemetry.dbg`
+  (`types/runtime.rs:239`), NOT `WorkerTelemetry`. The new counter goes on
+  `DebugPollCounters` as `neg_neigh_fast_fail`. APPLIED §4.7.
 - **Branch:** `pr/1651-b3-negcache`
 - **Base:** origin/master @ `a107e7489`
 - **Issue:** #1651 (reopened) — Path B3 ONLY. Path A (active resolution)
@@ -180,10 +203,9 @@ if let Some(next_hop) = decision.resolution.next_hop {
         // Dead-host fast-fail: recycle the frame, do NOT buffer, do NOT
         // probe, do NOT consume a pending_neigh slot. This is what frees
         // the queue for live cold connects under a dead-host storm.
-        telemetry.dbg.<new_counter> += 1;   // see §4.6
+        telemetry.dbg.neg_neigh_fast_fail += 1;   // §4.7
         binding.scratch.scratch_recycle.push(desc.addr);
-        recycle_now = false;                 // we recycled explicitly
-        continue;                            // skip buffer + session-seed
+        continue;  // recycled explicitly; skips epilogue + session-seed
     }
 }
 ```
@@ -204,9 +226,11 @@ the correct recycle channel here (the source-NAT-failure path uses exactly
 
 ```rust
 if now_ns.saturating_sub(pkt.queued_ns) > pending_neigh_timeout_ns {
-    // #1651 B3: this dst exhausted all re-probes and never resolved —
-    // negatively cache it so subsequent cold packets fast-fail instead
-    // of re-buffering for another 800 ms.
+    // #1651 B3: this dst timed out after best-effort probes and never
+    // resolved — negatively cache it so subsequent cold packets fast-fail
+    // instead of re-buffering for another 800 ms. (The timeout, not the
+    // probe count, is the signal: the dst never landed in the neighbor
+    // maps within the window.)
     if let Some(hop) = pkt.decision.resolution.next_hop {
         neg_neigh_record(
             &mut binding.neg_neigh_cache,
@@ -240,10 +264,10 @@ if now_ns.saturating_sub(pkt.queued_ns) > pending_neigh_timeout_ns {
 
 ### 4.7 Telemetry
 
-Add `neg_neigh_fast_fail: u64` to `WorkerTelemetry.dbg` (debug counter
-cluster) bumped at the fast-fail site. Cheap, matches the existing
-`missing_neigh` / `no_route` debug counters. (No new Prometheus surface in
-this PR — keep scope narrow; a follow-up can export it if ops wants it.)
+Add `neg_neigh_fast_fail: u64` to `DebugPollCounters` (`types/runtime.rs`,
+the struct behind `telemetry.dbg` — same home as `missing_neigh`/
+`no_route`), bumped at the fast-fail site. Cheap; no new Prometheus
+surface in this PR (follow-up can export it).
 
 ## §5. Public API preservation
 
