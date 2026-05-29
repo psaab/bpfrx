@@ -74,11 +74,22 @@ pub(in crate::afxdp) const COLD_PATH_ASSIGNABLE_SLOTS: usize =
 const _: () = assert!(COLD_PATH_ASSIGNABLE_SLOTS == 255);
 
 /// Maximum zone-id (exclusive) the direct slot-map lookup table
-/// indexes. Junos vSRX deployments use small named zone counts
-/// (typically 4-20); xpf's historical `MAX_ZONES` is 32. Pairs where
-/// either zone-id ≥ 32 land in `None` and are counted out-of-range so
-/// operators see when a deployment outgrows the static limit.
-pub(in crate::afxdp) const COLD_PATH_ZONE_ID_CEILING: u16 = 32;
+/// indexes. MUST cover the full configurable zone space: the Go
+/// compiler assigns sequential 1-based zone-ids and `MAX_ZONES` is 64
+/// (`bpf/headers/xpf_common.h` + `pkg/dataplane/types.go MaxZones`), so
+/// the ceiling is 64 (Codex code-r1 finding 2: a 32 ceiling silently
+/// dropped valid zone-ids 32-63). Zone-ids are 1..=64, so a 64×64 table
+/// covers every assignable pair. Pairs at/above the ceiling land in
+/// `None` — a defensive guard for the reserved `junos-global` sentinel
+/// (`u16::MAX`), not an expected case.
+pub(in crate::afxdp) const COLD_PATH_ZONE_ID_CEILING: u16 = 64;
+/// Bit-shift for the flat-table row stride = `log2(COLD_PATH_ZONE_ID_CEILING)`.
+const COLD_PATH_ZONE_SHIFT: usize = 6;
+const _: () = assert!(1usize << COLD_PATH_ZONE_SHIFT == COLD_PATH_ZONE_ID_CEILING as usize);
+/// Flat lookup-table length = `CEILING²` = 64×64 = 4096 bytes (L1d-resident).
+const COLD_PATH_FLAT_TABLE_LEN: usize =
+    (COLD_PATH_ZONE_ID_CEILING as usize) * (COLD_PATH_ZONE_ID_CEILING as usize);
+const _: () = assert!(COLD_PATH_FLAT_TABLE_LEN == 4096);
 
 /// Wire/layout version stamped into the status payload (#1635).
 pub(in crate::afxdp) const COLD_PATH_LAYOUT_VERSION: u32 = 3;
@@ -136,22 +147,22 @@ pub(in crate::afxdp) fn zone_pair_packed_key(from_zone_id: u16, to_zone_id: u16)
 /// collided at 88.2% with 8 active zone-pairs (birthday paradox), the
 /// F2 finding in the #1622 PLAN-KILL.
 ///
-/// Lookup is a bounded 2D table indexed by `(from & 0x1F, to & 0x1F)`
-/// (32×32 = 1024 entries, L1d-resident). A miss (entry == `u8::MAX`)
-/// means the pair has no slot assigned (capacity exhausted or zone-id
-/// ≥ 32); the sample is dropped at the hot path.
+/// Lookup is a bounded 2D table indexed by `(from, to)` with
+/// `from, to < 64` (64×64 = 4096 entries, L1d-resident). A miss
+/// (entry == `u8::MAX`) means the pair has no slot assigned (capacity
+/// exhausted or zone-id ≥ 64); the sample is dropped at the hot path.
 ///
 /// `inverse[slot]` is the reverse map used by the status path to emit
 /// per-zone-pair labels for the sparse wire encoding.
 #[derive(Clone, Debug)]
 pub(in crate::afxdp) struct ColdPathSlotMap {
-    /// 32×32 flat table indexed by `((from & 0x1F) << 5) | (to & 0x1F)`.
-    /// `u8::MAX` = unassigned.
-    pub(in crate::afxdp) flat_table: Box<[u8; 1024]>,
+    /// 64×64 flat table indexed by `(from << 6) | to`. `u8::MAX` =
+    /// unassigned.
+    pub(in crate::afxdp) flat_table: Box<[u8; COLD_PATH_FLAT_TABLE_LEN]>,
     /// `slot → Some((from, to))` for assigned slots, `None` for free.
     pub(in crate::afxdp) inverse: Vec<Option<(u16, u16)>>,
     /// True if some configured zone-pair could not be assigned a slot
-    /// because the 256-slot capacity was exhausted.
+    /// because the 255-slot capacity was exhausted.
     pub(in crate::afxdp) overflow_active: bool,
 }
 
@@ -165,7 +176,7 @@ impl ColdPathSlotMap {
     /// An empty map: every lookup misses.
     pub(in crate::afxdp) fn empty() -> Self {
         Self {
-            flat_table: Box::new([u8::MAX; 1024]),
+            flat_table: Box::new([u8::MAX; COLD_PATH_FLAT_TABLE_LEN]),
             inverse: vec![None; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
             overflow_active: false,
         }
@@ -176,11 +187,18 @@ impl ColdPathSlotMap {
     /// pairs keep their slot (and their accumulated histogram) across a
     /// config apply.
     ///
-    /// Returns the new map plus the list of slots whose assignment
-    /// CHANGED (freed-then-reused, or newly assigned over a previously
-    /// occupied slot). The worker zeroes these slots' accumulators
-    /// before recording into them so a reused slot never carries the
-    /// previous zone-pair's counts (plan §2.4 / F4).
+    /// Returns the new map plus the list of slots that received a NEW
+    /// zone-pair (every Pass-2 assignment). The worker zeroes these
+    /// slots' accumulators before recording into them so a slot never
+    /// carries an EARLIER zone-pair's counts (plan §2.4 / F4).
+    ///
+    /// Codex code-r1 finding 1: zero-out MUST cover every newly-assigned
+    /// slot, not just slots the *immediately previous* map showed as
+    /// occupied. The worker-local accumulator can carry stale counts
+    /// from ANY earlier config generation (e.g. A assigns slot 0, B
+    /// frees it without reuse, C reassigns slot 0 — B's map shows slot 0
+    /// free, but the worker never cleared A's counts). Zeroing a
+    /// genuinely-fresh slot is a harmless no-op (it is already zero).
     ///
     /// `pairs` should be deduplicated and in a stable order (the caller
     /// passes a `BTreeSet`-derived `Vec`) so slot assignment is
@@ -189,7 +207,7 @@ impl ColdPathSlotMap {
         previous: Option<&ColdPathSlotMap>,
         pairs: &[(u16, u16)],
     ) -> (Self, Vec<u8>) {
-        let mut flat_table = Box::new([u8::MAX; 1024]);
+        let mut flat_table = Box::new([u8::MAX; COLD_PATH_FLAT_TABLE_LEN]);
         let mut inverse: Vec<Option<(u16, u16)>> =
             vec![None; POLICY_COLD_PATH_ZONE_PAIR_SLOTS];
         let mut used = [false; POLICY_COLD_PATH_ZONE_PAIR_SLOTS];
@@ -201,12 +219,12 @@ impl ColdPathSlotMap {
         let mut pending: Vec<(u16, u16)> = Vec::with_capacity(pairs.len());
         for &(from, to) in pairs {
             if from >= COLD_PATH_ZONE_ID_CEILING || to >= COLD_PATH_ZONE_ID_CEILING {
-                // Unrepresentable in the 32×32 table; never assigned a
-                // slot. Counted as out-of-range at the hot path.
+                // Unrepresentable in the 64×64 table; never assigned a
+                // slot. Defensive (zone-ids are 1..=64); not expected.
                 continue;
             }
             let retained = previous.and_then(|p| {
-                let idx = ((from as usize) << 5) | (to as usize);
+                let idx = ((from as usize) << COLD_PATH_ZONE_SHIFT) | (to as usize);
                 let s = p.flat_table[idx];
                 if s != u8::MAX && p.inverse[s as usize] == Some((from, to)) {
                     Some(s)
@@ -218,15 +236,16 @@ impl ColdPathSlotMap {
                 Some(s) => {
                     used[s as usize] = true;
                     inverse[s as usize] = Some((from, to));
-                    flat_table[((from as usize) << 5) | (to as usize)] = s;
+                    flat_table[((from as usize) << COLD_PATH_ZONE_SHIFT) | (to as usize)] = s;
                 }
                 None => pending.push((from, to)),
             }
         }
 
-        // Pass 2: assign the lowest free slot to each new pair. A slot
-        // that was occupied by a DIFFERENT pair in `previous` (now
-        // reused) is queued for zero-out.
+        // Pass 2: assign the lowest free slot to each new pair. EVERY
+        // newly-assigned slot is queued for zero-out (Codex finding 1) —
+        // the worker-local accumulator may carry stale counts from an
+        // earlier generation regardless of what `previous` shows.
         let mut next_free = 0usize;
         for &(from, to) in &pending {
             while next_free < COLD_PATH_ASSIGNABLE_SLOTS && used[next_free] {
@@ -239,13 +258,14 @@ impl ColdPathSlotMap {
             let s = next_free;
             used[s] = true;
             inverse[s] = Some((from, to));
-            flat_table[((from as usize) << 5) | (to as usize)] = s as u8;
-            // If the previous map had any (different) pair in this slot,
-            // the accumulator carries stale counts; queue zero-out.
-            let prev_occupied = previous
-                .map(|p| p.inverse.get(s).copied().flatten().is_some())
-                .unwrap_or(false);
-            if prev_occupied {
+            flat_table[((from as usize) << COLD_PATH_ZONE_SHIFT) | (to as usize)] = s as u8;
+            // Queue zero-out for every newly-assigned slot when a
+            // PREVIOUS map existed — the worker may have accumulated
+            // counts for an earlier pair in this slot during any prior
+            // generation (Codex finding 1). On the very first build
+            // (previous == None) the worker's accumulators are still
+            // default-zero, so no zero-out is needed.
+            if previous.is_some() {
                 slots_to_zero.push(s as u8);
             }
         }
@@ -262,7 +282,7 @@ impl ColdPathSlotMap {
 }
 
 /// Look up the slot for `(from, to)` in the direct map. Returns `None`
-/// for unmapped pairs (capacity exhausted) or zone-ids ≥ 32. Hot-path
+/// for unmapped pairs (capacity exhausted) or zone-ids ≥ 64. Hot-path
 /// cost: one bound check, one shift, one L1d-resident array index, one
 /// `!= u8::MAX` predicate.
 #[inline]
@@ -270,7 +290,7 @@ pub(in crate::afxdp) fn lookup_slot(map: &ColdPathSlotMap, from: u16, to: u16) -
     if from >= COLD_PATH_ZONE_ID_CEILING || to >= COLD_PATH_ZONE_ID_CEILING {
         return None;
     }
-    let entry = map.flat_table[((from as usize) << 5) | (to as usize)];
+    let entry = map.flat_table[((from as usize) << COLD_PATH_ZONE_SHIFT) | (to as usize)];
     if entry == u8::MAX {
         None
     } else {
@@ -1216,18 +1236,45 @@ mod tests {
                 lookup_slot(&map_a, from, to),
                 "surviving pair {from}->{to} kept its slot"
             );
+            // Retained pairs must NOT be zeroed (keep their histogram).
+            let s = lookup_slot(&map_b, from, to).unwrap();
+            assert!(
+                !zeroed.contains(&s),
+                "retained pair {from}->{to} (slot {s}) must NOT be zeroed"
+            );
         }
-        // (7,8) takes a fresh slot that was free in A ⇒ no zero-out.
-        assert!(zeroed.is_empty(), "no slot reused ⇒ nothing to zero");
-        assert!(lookup_slot(&map_b, 7, 8).is_some());
+        // (7,8) is a NEW pair ⇒ its slot IS queued for zero-out (every
+        // newly-assigned slot is zeroed per Codex finding 1).
+        let slot_78 = lookup_slot(&map_b, 7, 8).expect("(7,8) assigned");
+        assert!(
+            zeroed.contains(&slot_78),
+            "new pair (7,8) slot {slot_78} must be zeroed; zeroed={zeroed:?}"
+        );
     }
 
     #[test]
-    fn lookup_slot_returns_none_for_zone_id_ge_32() {
+    fn lookup_slot_returns_none_for_zone_id_ge_ceiling() {
         let (map, _) = ColdPathSlotMap::build(None, &[(1u16, 2u16)]);
-        assert_eq!(lookup_slot(&map, 33, 2), None);
-        assert_eq!(lookup_slot(&map, 2, 33), None);
-        assert_eq!(lookup_slot(&map, 32, 32), None);
+        // Ceiling is 64 (MAX_ZONES). Zone-ids 32-63 are now VALID and
+        // covered by the table (Codex code-r1 finding 2 fix); only
+        // ids >= 64 miss.
+        assert_eq!(lookup_slot(&map, 64, 2), None);
+        assert_eq!(lookup_slot(&map, 2, 64), None);
+        assert_eq!(lookup_slot(&map, 64, 64), None);
+        assert_eq!(lookup_slot(&map, u16::MAX, 1), None);
+    }
+
+    #[test]
+    fn build_assigns_slots_for_zone_ids_32_to_63() {
+        // Regression for Codex code-r1 finding 2: ids 32-63 were
+        // silently dropped under the old 32 ceiling. They must now get
+        // slots.
+        let pairs = [(32u16, 33u16), (63, 1), (1, 63)];
+        let (map, _) = ColdPathSlotMap::build(None, &pairs);
+        assert!(lookup_slot(&map, 32, 33).is_some());
+        assert!(lookup_slot(&map, 63, 1).is_some());
+        assert!(lookup_slot(&map, 1, 63).is_some());
+        assert!(!map.overflow_active);
     }
 
     #[test]
@@ -1238,15 +1285,41 @@ mod tests {
 
     #[test]
     fn build_skips_out_of_range_pairs() {
-        // A pair with a zone-id ≥ 32 is never assigned a slot.
-        let pairs = [(1u16, 2u16), (40, 5), (3, 4)];
+        // A pair with a zone-id >= 64 (e.g. the junos-global sentinel)
+        // is never assigned a slot.
+        let pairs = [(1u16, 2u16), (200, 5), (3, 4)];
         let (map, _) = ColdPathSlotMap::build(None, &pairs);
-        assert_eq!(lookup_slot(&map, 40, 5), None);
+        assert_eq!(lookup_slot(&map, 200, 5), None);
         // The two in-range pairs still get slots 0 and 1.
         assert!(lookup_slot(&map, 1, 2).is_some());
         assert!(lookup_slot(&map, 3, 4).is_some());
         let occupied = map.inverse.iter().filter(|s| s.is_some()).count();
         assert_eq!(occupied, 2);
+    }
+
+    /// Codex code-r1 finding 1: A assigns slot 0; B frees it (no reuse);
+    /// C reassigns slot 0 to a NEW pair. C's `previous` (= B) shows
+    /// slot 0 free, but the worker-local accumulator may still carry
+    /// A's counts — so C MUST queue slot 0 for zero-out.
+    #[test]
+    fn build_zeros_slot_reassigned_after_intermediate_free() {
+        // A: slot 0 = (1,2), slot 1 = (3,4).
+        let (map_a, za) = ColdPathSlotMap::build(None, &[(1u16, 2u16), (3, 4)]);
+        assert!(za.is_empty());
+        let slot_12 = lookup_slot(&map_a, 1, 2).unwrap();
+        // B: drop (1,2); keep (3,4). Slot for (1,2) is now free.
+        let (map_b, _zb) = ColdPathSlotMap::build(Some(&map_a), &[(3u16, 4u16)]);
+        assert_eq!(lookup_slot(&map_b, 1, 2), None);
+        // C: keep (3,4); add NEW (5,6). It takes the lowest free slot,
+        // which is the slot A used for (1,2).
+        let (map_c, zc) = ColdPathSlotMap::build(Some(&map_b), &[(3u16, 4u16), (5, 6)]);
+        let slot_56 = lookup_slot(&map_c, 5, 6).unwrap();
+        assert_eq!(slot_56, slot_12, "(5,6) reuses the slot A gave (1,2)");
+        assert!(
+            zc.contains(&slot_56),
+            "reassigned slot must be queued for zero-out even though B showed it free \
+             (Codex finding 1) — slots_to_zero={zc:?}"
+        );
     }
 
     #[test]

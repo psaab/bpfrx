@@ -597,3 +597,33 @@ deviations, each justified below:
   reused slot. The next publish merge overwrites the sibling atomics
   from the freshly-zeroed local accumulators, so no separate atomic
   zero-out path is needed on the hot tick.
+
+### §IMPL.r2 Code-review round-1 fixes (Codex MERGE-NEEDS-MAJOR → resolved)
+
+Codex code-r1 raised three MAJOR findings against the consumer criteria;
+all three are fixed in the implementation:
+
+1. **Delayed slot reuse across an intermediate free could mix old/new
+   counts.** The original `build` queued zero-out only when the
+   *immediately previous* map showed the slot occupied. The A→B(free,
+   no reuse)→C(reassign) path left A's stale worker-local counts in the
+   slot. **Fix:** `build` now queues EVERY newly-assigned (Pass-2) slot
+   for zero-out whenever a previous map exists (the worker may carry
+   stale counts from any earlier generation). Regression test
+   `build_zeros_slot_reassigned_after_intermediate_free`.
+
+2. **Zone-id ceiling 32 silently dropped valid zone-ids 32-63.** The
+   real limit is `MAX_ZONES = 64` (`bpf/headers/xpf_common.h`,
+   `pkg/dataplane/types.go MaxZones`; Go assigns sequential 1-based
+   ids). **Fix:** `COLD_PATH_ZONE_ID_CEILING = 64`, flat table 64×64 =
+   4096 bytes (still L1d-resident), row shift `<< 6`. Regression tests
+   `build_assigns_slots_for_zone_ids_32_to_63`,
+   `lookup_slot_returns_none_for_zone_id_ge_ceiling`.
+
+3. **Status could relabel stale reused-slot samples as the new pair**
+   for up to one publish tick (coordinator publishes the new slot-map
+   before workers zero reused slots). **Fix:** `status.rs` validates
+   `cold.first_key[slot] == zone_pair_packed_key(from, to)` before
+   emitting; on mismatch the counts belong to the old pair and are
+   skipped (not relabeled). Closes the 1-tick transient the Claude SMR
+   review had flagged as a NIT.

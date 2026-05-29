@@ -343,6 +343,23 @@ impl super::Coordinator {
                             // tick clears it.
                             continue;
                         };
+                        // Codex code-r1 finding 3: the coordinator
+                        // publishes the new slot-map BEFORE workers
+                        // necessarily load it and zero reused slots, so
+                        // for up to one publish tick the atomics can
+                        // carry the PREVIOUS pair's counts under the
+                        // NEW slot. Validate the recorded first_key
+                        // against the live mapping; on mismatch the
+                        // counts belong to the old pair — skip them
+                        // rather than relabel stale samples as the new
+                        // (from_zone, to_zone).
+                        let expected_key =
+                            crate::afxdp::cold_path_hist::zone_pair_packed_key(from, to);
+                        if cold.first_key[slot] != 0
+                            && cold.first_key[slot] != expected_key
+                        {
+                            continue;
+                        }
                         active_slot_ids.push(slot as u32);
                         active_zone_from.push(from as u32);
                         active_zone_to.push(to as u32);
