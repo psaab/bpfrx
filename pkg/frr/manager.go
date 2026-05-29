@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -361,7 +362,29 @@ func (m *Manager) writeManagedSection(section string) error {
 // path and renames it into place. The rename is atomic within a filesystem,
 // so a reader (or a crash) never observes a partially written file. The temp
 // file is removed on any error before the rename completes.
+//
+// Because rename replaces the inode, the mode (and ownership) of any existing
+// target would otherwise be lost. The previous direct os.WriteFile path
+// preserved the mode of an existing file (it only applied perm on creation),
+// so frr.conf deployed as e.g. 0640 must stay 0640. We therefore stat the
+// target first and reuse its mode/ownership when it exists, falling back to
+// the supplied perm only when creating a brand-new file.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	// Preserve the mode/ownership of an existing target across the rename.
+	mode := perm
+	var (
+		preserveOwner bool
+		uid, gid      int
+	)
+	if fi, statErr := os.Stat(path); statErr == nil {
+		mode = fi.Mode().Perm()
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			preserveOwner = true
+			uid = int(st.Uid)
+			gid = int(st.Gid)
+		}
+	}
+
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".frr.conf.tmp-*")
 	if err != nil {
@@ -389,8 +412,15 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp file: %w", err)
 	}
-	if err := os.Chmod(tmpName, perm); err != nil {
+	if err := os.Chmod(tmpName, mode); err != nil {
 		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	// Restore ownership if the target existed and we are privileged enough.
+	// A best-effort failure (EPERM when not root) must not abort the write —
+	// CreateTemp already created the file owned by the current process, which
+	// matches the common case where xpfd runs as the frr.conf owner.
+	if preserveOwner {
+		_ = os.Chown(tmpName, uid, gid)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("rename temp file: %w", err)

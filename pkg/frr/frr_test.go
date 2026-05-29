@@ -486,6 +486,54 @@ func TestWriteManagedSection_OrphanedBeginMarker(t *testing.T) {
 	}
 }
 
+// TestWriteManagedSection_PreservesExistingMode guards the Copilot finding on
+// #1646: the atomic temp-file + rename write replaces the inode, so it must
+// reuse the existing file's mode rather than unconditionally applying 0644.
+// frr.conf is commonly deployed 0640; making it world-readable on the next
+// apply would be a permission regression vs the old os.WriteFile path (which
+// preserved the mode of an existing file).
+func TestWriteManagedSection_PreservesExistingMode(t *testing.T) {
+	dir := t.TempDir()
+	confPath := filepath.Join(dir, "frr.conf")
+
+	m := &Manager{frrConf: confPath}
+
+	initial := "log syslog informational\n"
+	if err := os.WriteFile(confPath, []byte(initial), 0640); err != nil {
+		t.Fatal(err)
+	}
+	// Chmod explicitly in case the umask masked bits at create time.
+	if err := os.Chmod(confPath, 0640); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.writeManagedSection("ip route 10.0.0.0/8 192.168.1.1\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	fi, err := os.Stat(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0640 {
+		t.Errorf("mode not preserved across atomic write: got %o, want 0640", got)
+	}
+
+	// A brand-new file (no existing target) uses the default 0644.
+	freshPath := filepath.Join(dir, "fresh.conf")
+	mf := &Manager{frrConf: freshPath}
+	if err := mf.writeManagedSection("ip route 10.0.0.0/8 Null0\n"); err != nil {
+		t.Fatal(err)
+	}
+	fi, err = os.Stat(freshPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0644 {
+		t.Errorf("new file mode: got %o, want 0644", got)
+	}
+}
+
 func TestGeneratePolicyOptions(t *testing.T) {
 	m := &Manager{frrConf: "/dev/null"}
 	po := &config.PolicyOptionsConfig{
