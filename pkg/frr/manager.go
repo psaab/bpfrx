@@ -363,20 +363,38 @@ func (m *Manager) writeManagedSection(section string) error {
 // so a reader (or a crash) never observes a partially written file. The temp
 // file is removed on any error before the rename completes.
 //
-// Because rename replaces the inode, the mode (and ownership) of any existing
-// target would otherwise be lost. The previous direct os.WriteFile path
-// preserved the mode of an existing file (it only applied perm on creation),
-// so frr.conf deployed as e.g. 0640 must stay 0640. We therefore stat the
-// target first and reuse its mode/ownership when it exists, falling back to
-// the supplied perm only when creating a brand-new file.
+// Behavioral parity with the previous direct os.WriteFile path:
+//   - Mode/ownership: rename replaces the inode, so the mode (and ownership)
+//     of an existing target would otherwise be lost. os.WriteFile only applied
+//     perm on creation and preserved the mode of an existing file, so frr.conf
+//     deployed as e.g. 0640 must stay 0640. We stat the target and reuse its
+//     mode/ownership when it exists, falling back to perm for a new file.
+//   - Symlinks: os.WriteFile follows a symlink and writes through to its
+//     target. A naive rename onto the link path would instead destroy the
+//     link and leave a regular file. We resolve the symlink and create the
+//     temp file in the resolved target's directory, then rename onto the
+//     resolved path — preserving the operator's symlink.
+//
+// chmod/chown are applied to the temp file's open fd before close (and before
+// rename), so the file is never world-visible at the final path with a
+// transient mode, and there is no path-based TOCTOU on the temp name.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	// Resolve a symlink target so the rename replaces the real file, not the
+	// link. EvalSymlinks fails if the final path does not exist yet; in that
+	// case (new file, possibly via a dangling link) fall back to the path
+	// as given.
+	target := path
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		target = resolved
+	}
+
 	// Preserve the mode/ownership of an existing target across the rename.
 	mode := perm
 	var (
 		preserveOwner bool
 		uid, gid      int
 	)
-	if fi, statErr := os.Stat(path); statErr == nil {
+	if fi, statErr := os.Stat(target); statErr == nil {
 		mode = fi.Mode().Perm()
 		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 			preserveOwner = true
@@ -385,7 +403,7 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		}
 	}
 
-	dir := filepath.Dir(path)
+	dir := filepath.Dir(target)
 	tmp, err := os.CreateTemp(dir, ".frr.conf.tmp-*")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
@@ -403,6 +421,19 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		_ = tmp.Close()
 		return fmt.Errorf("write temp file: %w", err)
 	}
+	// Apply mode/ownership on the open fd (fchmod/fchown) before rename, so the
+	// final path never appears with a transient mode and there is no path-race
+	// on the temp name. Ownership restore is best-effort: an EPERM when xpfd is
+	// not root must not abort the write, since CreateTemp already created the
+	// file owned by the running process (the common case where xpfd owns
+	// frr.conf).
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	if preserveOwner {
+		_ = tmp.Chown(uid, gid)
+	}
 	// fsync the data before rename so the rename does not point at a file
 	// whose contents are still only in the page cache after a power loss.
 	if err := tmp.Sync(); err != nil {
@@ -412,17 +443,7 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp file: %w", err)
 	}
-	if err := os.Chmod(tmpName, mode); err != nil {
-		return fmt.Errorf("chmod temp file: %w", err)
-	}
-	// Restore ownership if the target existed and we are privileged enough.
-	// A best-effort failure (EPERM when not root) must not abort the write —
-	// CreateTemp already created the file owned by the current process, which
-	// matches the common case where xpfd runs as the frr.conf owner.
-	if preserveOwner {
-		_ = os.Chown(tmpName, uid, gid)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := os.Rename(tmpName, target); err != nil {
 		return fmt.Errorf("rename temp file: %w", err)
 	}
 	cleanup = false

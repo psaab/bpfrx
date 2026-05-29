@@ -534,6 +534,58 @@ func TestWriteManagedSection_PreservesExistingMode(t *testing.T) {
 	}
 }
 
+// TestWriteManagedSection_PreservesSymlink guards the AGY adversarial-review
+// finding on #1646: the old os.WriteFile path followed a symlink and wrote
+// through to its target, whereas a naive rename onto the link path would
+// destroy the link and leave a regular file. xpfd is sometimes pointed at
+// /etc/frr/frr.conf via a symlink; the atomic write must resolve and preserve
+// it.
+func TestWriteManagedSection_PreservesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	realPath := filepath.Join(dir, "real-frr.conf")
+	linkPath := filepath.Join(dir, "frr.conf")
+
+	if err := os.WriteFile(realPath, []byte("log syslog informational\n"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realPath, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{frrConf: linkPath}
+	if err := m.writeManagedSection("ip route 10.0.0.0/8 192.168.1.1\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	// frr.conf must still be a symlink pointing at the real file.
+	fi, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("symlink was replaced by a regular file")
+	}
+	// The managed section must have landed in the real target, through the link.
+	data, err := os.ReadFile(realPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "192.168.1.1") {
+		t.Errorf("write did not reach the symlink target:\n%s", string(data))
+	}
+	if !strings.Contains(string(data), "log syslog informational") {
+		t.Errorf("existing content in symlink target lost:\n%s", string(data))
+	}
+	// Mode of the real target preserved.
+	rfi, err := os.Stat(realPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rfi.Mode().Perm(); got != 0640 {
+		t.Errorf("symlink target mode not preserved: got %o, want 0640", got)
+	}
+}
+
 func TestGeneratePolicyOptions(t *testing.T) {
 	m := &Manager{frrConf: "/dev/null"}
 	po := &config.PolicyOptionsConfig{
