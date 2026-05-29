@@ -68,7 +68,7 @@ zone_id_out_of_range_total in plan §2.5. Both fixed in 207e01c64.
 
 | Reviewer   | Task / job id                      | Verdict   |
 |------------|------------------------------------|-----------|
-| Codex      | task-mprfc9u2-ahfcxq               | running (final confirm) |
-| AGY        | adversarial-review-mprfcg9v-z1rvm5  | running (final confirm) |
+| Codex      | task-mprfc9u2-ahfcxq               | MERGE-READY (overflow gated to ids>=65; retained-pair handling unchanged; no drift) |
+| AGY        | adversarial-review-mprfcg9v-z1rvm5  | MERGE-READY (overflow isolated; regression test passes; 1638 cargo tests green) |
 | Claude SMR | in-conversation                    | MERGE-READY (overflow fix verified; in-range unaffected) |
 | Copilot    | re-review @ 207e01c64 requested; polling | r5 findings addressed |
