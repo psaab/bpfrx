@@ -1,6 +1,8 @@
 # #1667 — Fix red doc-guard `snat_contract_documents_current_fail_closed_runtime`
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR)
+**Status:** PLAN-READY v1 — Codex + AGY + Claude SMR all PLAN-READY
+(plan-review round 1). Implemented; guard RED→GREEN, full cargo + Go
+suites green; code review PR #1670.
 
 ## Issue framing
 
