@@ -16,7 +16,7 @@ Edited files:
 | Loss cluster NIC exposes M=6 combined RX queues bound one-per-worker | #1649 research plan (commit `36fcd1b8`) §2.1 (`ethtool -l ge-0-0-2` → `Combined: 6`) + §3 (`select_userspace_queue()` queue-bound delivery, `userspace-xdp/src/lib.rs:371-635`) | GROUNDED |
 | RX queue N → worker bound to queue N (`select_userspace_queue`) | research plan §3, cites `userspace-xdp/src/lib.rs:371-635` and `:1322` queue-bound delivery | GROUNDED — I cite the function name, not a line number, to avoid line drift |
 | RSS hashes 5-tuple → one of 6 queues; N flows = multinomial draw | research plan §1, §7.0 ("N flows hashed into M RX queues do not distribute one-per-queue") | GROUNDED |
-| E[CoV of `{aᵢ}`] table: N=6→0.87, N=12→0.62, N=18→0.53, N=24→0.50 | My own Monte-Carlo (200k trials, M=6, i.i.d. uniform), reproduced this session. N=6 value 0.874 matches research plan's stated "CoV ≈ 0.87 (RSS uniform)" exactly. Single-bucket closed form `sqrt(N·(1/M)(1−1/M))/(N/M)` gives 0.913 at N=6 (per-bucket, slightly higher than whole-vector E[CoV] — consistent) | GROUNDED — values are mine, cross-checked against research's 0.87 anchor |
+| E[CoV of `{aᵢ}`] table: N=2→1.55, N=6→0.87, N=12→0.62, N=18→0.50, N=24→0.44 | My own occupancy-count Monte-Carlo (400k trials, M=6, i.i.d. uniform), reproduced this session. N=6 value 0.875 matches research plan's stated "CoV ≈ 0.87 (RSS uniform)" exactly. **Copilot round-1 corrected** an earlier draft that listed N=2→0.00 and N=18/24 from a per-flow-share script instead of the occupancy-count model; the table now uses the correct occupancy CoV and is monotonically decreasing | GROUNDED (corrected) — occupancy-count values, cross-checked against research's 0.87 anchor |
 | P(perfect 1-per-queue spread at N=6) = 6!/6⁶ ≈ 1.54% | research plan §7.0 / §11 ("P = 6!/6⁶ ≈ 1.54% perfect spread", AGY-verified); my Monte-Carlo gave 1.54% | GROUNDED — closed form + two independent computations agree |
 | P(≥1 idle worker) column (98.5% at N=6, etc.) | My own Monte-Carlo this session. Sanity: at N=6 a perfect spread (no idle) is only 1.54%, so P(idle) ≈ 98.5% is consistent with that | GROUNDED |
 | ~17% live throughput CoV is one favorable realization, distinct from the 0.87 occupancy CoV | research plan §1 ("~17% CoV at 6 flows ... 2 flows pinned slow ... 4 flows solo ... ≥1 worker idle"). The distinction occupancy-CoV vs throughput-CoV is my analysis: 0.87 is the multinomial *count* CoV, 17% is a measured *throughput* CoV. I explicitly warn against conflating them | GROUNDED + flagged as the one place I add interpretation; the two numbers measure different quantities, which is exactly why I separate them |
@@ -71,21 +71,53 @@ correct. I did not weaken or contradict the iavf bullet.
 ## Residual uncertainties (disclosed)
 
 1. The E[CoV of `{aᵢ}`] and P(idle) table rows for N ∈ {2,12,18,24} are my
-   Monte-Carlo, not lifted from the research doc (which published only the
-   N=6 anchor 0.87 and the 1.54% perfect-spread figure). The N=6 row matches
-   the published anchor to 3 significant figures, which validates the model;
-   the other rows follow from the same simulation. They are rounded to 2 dp
-   and labeled "Monte-Carlo" in the text, not presented as measured live
-   data. The N=2 row was corrected from 0.00 to 1.55 following code review
-   (closed form: E[CoV] = (5/6)√2 + (1/6)√5 ≈ 1.55).
+   occupancy-count Monte-Carlo, not lifted from the research doc (which
+   published only the N=6 anchor 0.87 and the 1.54% perfect-spread figure).
+   The N=6 row matches the published anchor to 3 significant figures, which
+   validates the model; the other rows follow from the same simulation. They
+   are rounded to 2 dp and labeled "Monte-Carlo" in the text, not presented as
+   measured live data. The N=2/18/24 rows were corrected after Copilot
+   round-1 (N=2 from 0.00 to 1.55, closed form E[CoV] = (5/6)√2 + (1/6)√5 ≈
+   1.55) — see the round-1 section below.
 2. The "~17% throughput CoV" is a single live observation from the research
    §1, not a distribution. I present it as one realization, not a curve
    point, precisely to avoid implying it is the expected per-flow CoV (which
    would be higher).
 
+## Copilot round-1 findings and resolutions
+
+Copilot returned 5 comments on the first push (SHA `782c5aa3f151`); all 5
+addressed:
+
+1. **N=2 occupancy CoV = 0.00 is wrong (fairness-regimes.md table).** Correct.
+   The first draft used the per-flow-*share* CoV (0 when 2 flows sit on 2
+   distinct workers) in a table labeled *occupancy-count* CoV. With N=2 over
+   M=6 the count vector is mostly zeros → E[CoV] = (5/6)√2 + (1/6)√5 ≈ 1.55
+   (matches Monte-Carlo 400k). FIXED: re-ran the occupancy-count Monte-Carlo
+   for all rows — N=2→1.55, N=18→0.50, N=24→0.44 (the latter two were also off
+   in the draft, from the same wrong script). The curve is now correctly
+   monotonically decreasing and the prose explains why small N is high
+   (`N < M` forces `M − N` idle queues).
+2. **Throughput-CoV "lower for every realization" overstates it.** Correct —
+   a perfect 1-per-queue placement has occupancy CoV 0 but can show nonzero
+   throughput variance. FIXED: narrowed to the observed skewed `N=6` case;
+   added the explicit caveat that the correspondence does not hold universally.
+3/4/5. **`docs/research/1649-initial-placement/plan.md` is not on master**
+   (it lives on branch `research/1649-initial-placement`), so the citation
+   would be a dead in-tree path after merge. Correct merge-quality defect.
+   FIXED: replaced the in-tree path with a stable reference — "issue #1649,
+   research plan at commit `36fcd1b8`" — in fairness-regimes.md, CLAUDE.md, and
+   this doc. (The branch + commit are the durable provenance; readers fetch the
+   plan via `git show 36fcd1b8:docs/research/1649-initial-placement/plan.md` or
+   the issue.)
+
+These corrections are exactly the #1647 failure mode the brief warned about
+(a wrong doc *correction*); Copilot caught the occupancy/share metric mix-up
+before merge.
+
 ## Verdict
 
-ACCURACY-CLEAN. Every claim traces to the #1649 research plan (commit `36fcd1b8`),
+ACCURACY-CLEAN (post round-1). Every claim traces to the #1649 research plan (commit `36fcd1b8`),
 PR #1650 / issue #1630 for the cause-1/cause-2 split, issue #1649 for the
 3-reviewer kill, or my own reproduced Monte-Carlo (anchored to the research's
 published 0.87 / 1.54% values). The CLAUDE.md edit ADDS a scoped note and does

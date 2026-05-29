@@ -152,16 +152,18 @@ i.i.d. uniform hashing) and confirmed against closed form:
   | N flows (M=6) | E[CoV of `{aᵢ}`] | P(≥1 idle worker) |
   |---:|---:|---:|
   | 2  | 1.55 | 100%  |
-  | 6  | 0.87 | 98.5% |
+  | 6  | 0.87 | 98%   |
   | 12 | 0.62 | 56%   |
-  | 18 | 0.53 | 21%   |
-  | 24 | 0.50 | 7.6%  |
+  | 18 | 0.50 | 21%   |
+  | 24 | 0.44 | 8%    |
 
   At `N = 6` the count-CoV is ≈ **0.87** and the chance of a
   perfect one-flow-per-queue spread is only
-  `6!/6⁶ ≈ 1.54%`. The curve is high at small `N` (bins are
-  sparsely and unevenly filled) and decreases as `N` grows and the
-  law of large numbers flattens the bins.
+  `6!/6⁶ ≈ 1.54%`. The curve is **monotonically decreasing**:
+  highest at small `N` (with `N < M` at least `M − N` queues are
+  guaranteed idle, so the occupancy vector is mostly zeros and its
+  CoV is very high — ≈ 1.55 at `N = 2`), falling as `N` grows and
+  the law of large numbers flattens the bins.
 
 - **Live per-flow throughput CoV** in the **observed skewed case**
   (`-P 6 -p 5210`, ~17%) is lower than the 0.87 occupancy CoV

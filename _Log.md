@@ -38,6 +38,17 @@
   `test/incus/cos-gate1-small-four-alone.sh`,
   `docs/pr/1630-cause1-credit-carry/plan.md`
 
+## 2026-05-28 — #1649 floor-curve Copilot round-1 follow-up
+- **Timestamp**: 2026-05-28
+- **Action**: Addressed Copilot round-1 (5 findings) on PR #1652. Fixed the
+  occupancy-count table rows the copilot-swe-agent auto-commit missed
+  (N=18 0.53→0.50, N=24 0.50→0.44; N=2 0.00→1.55 already fixed by the bot),
+  restored the monotonic-decreasing prose, corrected the SMR accuracy
+  table-row claim + residual-uncertainties to occupancy-count semantics, and
+  added a Copilot round-1 resolution section. Kept the bot's stable
+  commit-ref citation approach (36fcd1b8) over an in-tree plan copy.
+- **File(s)**: `docs/fairness-regimes.md`, `docs/pr/1649-doc-floor-curve/claude-smr-accuracy.md`, `_Log.md`
+
 ## 2026-05-28 — #1649 per-flow CoV floor-curve docs (PLAN-KILL deliverable)
 - **Timestamp**: 2026-05-28
 - **Action**: Docs-only PR closing #1649 (per-flow CoV floor PLAN-KILL).
