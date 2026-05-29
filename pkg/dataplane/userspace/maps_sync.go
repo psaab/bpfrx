@@ -65,13 +65,18 @@ func deadWorkerIDSet(runtime []WorkerRuntimeStatus) map[uint32]bool {
 // bindingForwardingLive reports whether a binding is safe to mark READY
 // (userspaceBindingReady) in the XDP userspace_bindings array.
 //
-// #1666: the gate is the helper-derived binding.Ready — which is
+// #1666: the gate keeps the historical (Registered && Armed)
+// admission AND adds the helper-derived binding.Ready — which is
 // (registered && bound && xsk_registered && heartbeat_fresh), computed in
 // userspace-dp coordinator/refresh_bindings.rs — ANDed with the binding's
-// worker not being Dead. This is strictly stronger than the historical
-// (Registered && Armed) predicate: it withholds READY until the worker
-// has actually created its socket, registered the FD in the XSKMAP, and
-// shown a fresh heartbeat, and it clears READY when the worker panics.
+// worker not being Dead.
+//
+// Registered && Armed must stay in the predicate: the Rust Ready
+// derivation does NOT include Armed (armed = armed_req && registered is a
+// separate control-plane flag), so a Ready-but-disarmed binding must not
+// forward. The Ready + !Dead legs are what newly withhold/clear READY for
+// a worker that crashed or never finished XSK registration (the
+// crash-blind blackhole).
 //
 // All of Ready's sub-conditions are flipped true by worker bringup alone
 // (socket create -> set_bound, XSKMAP register -> set_xsk_registered,
@@ -79,7 +84,7 @@ func deadWorkerIDSet(runtime []WorkerRuntimeStatus) map[uint32]bool {
 // cannot deadlock a legitimately-live binding (see
 // docs/pr/1666-ready-gate/plan.md §4).
 func bindingForwardingLive(b BindingStatus, deadWorkers map[uint32]bool) bool {
-	return b.Ready && !deadWorkers[b.WorkerID]
+	return b.Registered && b.Armed && b.Ready && !deadWorkers[b.WorkerID]
 }
 
 type userspaceBindingKey struct {

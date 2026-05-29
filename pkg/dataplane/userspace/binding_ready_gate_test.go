@@ -30,6 +30,20 @@ func TestBindingForwardingLiveRequiresReady(t *testing.T) {
 			want:    true,
 		},
 		{
+			name: "ready but disarmed is withheld",
+			// The Rust Ready derivation does NOT include Armed, so a
+			// Ready:true / Armed:false binding (disarmed by the control
+			// plane while otherwise live) must NOT forward — the gate keeps
+			// the Registered && Armed admission alongside Ready.
+			binding: BindingStatus{WorkerID: 2, Registered: true, Armed: false, Bound: true, XSKRegistered: true, Ready: true},
+			want:    false,
+		},
+		{
+			name: "ready but unregistered is withheld",
+			binding: BindingStatus{WorkerID: 2, Registered: false, Armed: true, Bound: true, XSKRegistered: true, Ready: true},
+			want:    false,
+		},
+		{
 			name: "ready but worker dead is withheld (fast panic clear)",
 			// Ready is still true in this snapshot (heartbeat not yet
 			// stale), but the supervisor flagged the worker dead — the
@@ -41,13 +55,13 @@ func TestBindingForwardingLiveRequiresReady(t *testing.T) {
 		},
 		{
 			name:    "ready, a different worker is dead does not affect this binding",
-			binding: BindingStatus{WorkerID: 4, Ready: true},
+			binding: BindingStatus{WorkerID: 4, Registered: true, Armed: true, Ready: true},
 			dead:    map[uint32]bool{9: true},
 			want:    true,
 		},
 		{
 			name:    "not ready and not dead is withheld",
-			binding: BindingStatus{WorkerID: 1, Ready: false},
+			binding: BindingStatus{WorkerID: 1, Registered: true, Armed: true, Ready: false},
 			want:    false,
 		},
 	}
@@ -88,10 +102,10 @@ func TestDeadWorkerIDSet(t *testing.T) {
 // from an otherwise-Ready binding. Guards against a nil-map regression in
 // bindingForwardingLive.
 func TestBindingForwardingLiveNilDeadSetHonoursReady(t *testing.T) {
-	if !bindingForwardingLive(BindingStatus{WorkerID: 7, Ready: true}, nil) {
-		t.Fatal("a Ready binding with a nil dead-set must be forwarding-live")
+	if !bindingForwardingLive(BindingStatus{WorkerID: 7, Registered: true, Armed: true, Ready: true}, nil) {
+		t.Fatal("a Ready+armed binding with a nil dead-set must be forwarding-live")
 	}
-	if bindingForwardingLive(BindingStatus{WorkerID: 7, Ready: false}, nil) {
+	if bindingForwardingLive(BindingStatus{WorkerID: 7, Registered: true, Armed: true, Ready: false}, nil) {
 		t.Fatal("a non-Ready binding must not be forwarding-live")
 	}
 }

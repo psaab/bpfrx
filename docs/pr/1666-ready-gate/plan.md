@@ -51,14 +51,19 @@ binding.ready = binding.registered
 
 Consequences:
 
-- `Ready` already implies `Bound` **and** `XSKRegistered` **and** a
+- `Ready` already implies `Registered`, `Bound`, `XSKRegistered`, and a
   fresh heartbeat. The issue's proposed `Ready && XSKRegistered` is
-  redundant — `Ready` alone is the right and complete gate. The plan
-  uses **`binding.Ready`** as the single gate at all four sites.
-- Gating sites 1/3 on `Ready` is strictly more conservative than the
-  current `Registered && Armed`, and strictly more conservative than
-  the alias sites' `Registered && Armed && Bound` (it adds
-  `xsk_registered` + heartbeat freshness on top of `Bound`).
+  redundant in the XSKRegistered leg.
+- **But `Ready` does NOT imply `Armed`** (Codex round-2 finding). The
+  Rust derivation omits `armed`; `armed = armed_req && registered` is a
+  separate control-plane flag (server/handlers/binding.rs:29). A
+  Ready-but-disarmed binding (control plane disarmed it while it is
+  otherwise live) must NOT forward, and the historical sites required
+  `Armed`. So the gate must keep `Registered && Armed` AND add `Ready`
+  — it is **`Registered && Armed && Ready && !Dead`**, NOT `Ready`
+  alone. With `Armed` retained, the gate is then strictly stronger than
+  the historical `Registered && Armed` predicate (adds bound +
+  xsk_registered + heartbeat-fresh + not-dead).
 
 ## 4. Deadlock analysis (Open question #1 — the gating risk)
 
@@ -257,7 +262,8 @@ A small helper computes the gate once per apply/watchdog pass:
 // worker has not panicked. deadWorkers is built once per pass from
 // status.WorkerRuntime[] (keyed by WorkerID).
 func bindingForwardingLive(b BindingStatus, deadWorkers map[uint32]bool) bool {
-    return b.Ready && !deadWorkers[b.WorkerID]
+    // Registered && Armed retained: Ready does not imply Armed.
+    return b.Registered && b.Armed && b.Ready && !deadWorkers[b.WorkerID]
 }
 ```
 
@@ -323,7 +329,7 @@ write.
 
 | Class | Level | Notes |
 |---|---|---|
-| Behavioural regression | LOW–MED | Only change is the §4.3 sub-second startup window; transit is already fail-closed there. Reviewer judgement needed on whether that window is acceptable. |
+| Behavioural regression | LOW–MED | Main change is the §4.3 sub-second startup delay before READY is first written (transit is NOT fail-closed there — the gate adds a real, poll-cycle-bounded first-transit delay, see corrected §4.3). Reviewer judgement needed on whether that window is acceptable. |
 | Lifetime / borrow | N/A | Go-side predicate swap; no Rust change. |
 | Performance | NONE | One bool read replaces two/three bool reads per binding per poll. |
 | Architectural mismatch | LOW | Reuses shipped `Ready` derivation; no new abstraction. The risk is that the issue is solving an already-mitigated problem (Open question #2). |
