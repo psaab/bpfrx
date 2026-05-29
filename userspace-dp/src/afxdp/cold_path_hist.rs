@@ -230,8 +230,15 @@ impl ColdPathSlotMap {
         let mut pending: Vec<(u16, u16)> = Vec::with_capacity(pairs.len());
         for &(from, to) in pairs {
             let Some(idx) = cold_path_flat_index(from, to) else {
-                // Unrepresentable in the 65×65 table (id ≥ 65); never
-                // assigned a slot. Defensive (zone-ids are 1..=64).
+                // Unrepresentable in the 65×65 table (zone-id ≥ 65). The
+                // Go compiler assigns 1-based ids up to MaxZones=64, but
+                // the Rust snapshot path accepts ids up to u8::MAX (255)
+                // — so a deployment (or non-Go producer) with an id in
+                // 65..=255 lands here. Surface it via `overflow_active`
+                // rather than silently dropping the pair, so operators
+                // see that a configured zone-pair was not measured
+                // (Copilot code-r4 finding).
+                overflow_active = true;
                 continue;
             };
             let retained = previous.and_then(|p| {
@@ -1305,12 +1312,19 @@ mod tests {
     }
 
     #[test]
-    fn build_skips_out_of_range_pairs() {
-        // A pair with a zone-id >= 64 (e.g. the junos-global sentinel)
-        // is never assigned a slot.
+    fn build_skips_out_of_range_pairs_and_flags_overflow() {
+        // A pair with a zone-id >= 65 (the Rust path accepts ids up to
+        // 255 even though the table covers 0..=64) is not assignable.
+        // Copilot code-r4: such a pair MUST set overflow_active so the
+        // operator sees a configured pair went unmeasured — not vanish
+        // silently.
         let pairs = [(1u16, 2u16), (200, 5), (3, 4)];
         let (map, _) = ColdPathSlotMap::build(None, &pairs);
         assert_eq!(lookup_slot(&map, 200, 5), None);
+        assert!(
+            map.overflow_active,
+            "an out-of-range (id >= 65) configured pair must trip overflow_active"
+        );
         // The two in-range pairs still get slots 0 and 1.
         assert!(lookup_slot(&map, 1, 2).is_some());
         assert!(lookup_slot(&map, 3, 4).is_some());

@@ -262,8 +262,8 @@ xpf_userspace_worker_cold_path_samples_v3_total{worker_id, from_zone, to_zone}
 xpf_userspace_worker_cold_path_sum_ns_v3_total{worker_id, from_zone, to_zone}
 xpf_userspace_worker_cold_path_builder_collision_v3{worker_id, from_zone, to_zone}
 xpf_userspace_worker_cold_path_overflow_active{worker_id}
-xpf_userspace_worker_cold_path_zone_id_out_of_range_total{worker_id}
 xpf_userspace_worker_cold_path_layout_version{worker_id, version}
+xpf_userspace_worker_cold_path_layout_version_unknown{worker_id, version}
 ```
 
 The `_v3` suffix replaces v2's `_v2` and the existing v1 names. Operators querying
@@ -680,3 +680,22 @@ metric-name convention issues (no functional change):
 The `_ns_bucket_v3` family keeps its name — it carries the `le` label
 and is a histogram bucket (not a `_total` counter), so the `_v3`
 placement is unambiguous.
+
+### §IMPL.r5 Code-review round-5 fixes (Copilot, fresh review at rebased HEAD)
+
+1. **Out-of-range zone-pairs now set `overflow_active`.** The 65×65
+   table covers zone-ids `0..=64` (the Go compiler assigns 1-based ids
+   up to MaxZones=64), but the Rust snapshot path accepts ids up to
+   `u8::MAX` (255). A configured pair with an id in `65..=255` was
+   silently dropped by `ColdPathSlotMap::build` with no signal. It now
+   trips `overflow_active`, so operators see a configured pair went
+   unmeasured. Regression: `build_skips_out_of_range_pairs_and_flags_overflow`.
+
+2. **Dropped the never-emitted `zone_id_out_of_range_total` metric from
+   the §2.5 plan list.** The implementation represents out-of-range and
+   capacity-exhaustion uniformly via `cold_path_overflow_active`; there
+   is no separate out-of-range counter. The plan's §2.5 metric list now
+   matches the emitted surface (and adds the
+   `cold_path_layout_version_unknown` gauge that IS emitted). The §2.3
+   design-prose mention of a hypothetical out-of-range counter is
+   historical narrative; `overflow_active` is the shipped signal.
