@@ -577,11 +577,23 @@ func TestColdPathDescriptorsAreDescribed(t *testing.T) {
 		hist[i] = make([]uint64, 24)
 	}
 	hist[3][5] = 1
+	// Populate ALL v1 per-slot families so workerColdPathSumNS and
+	// workerColdPathAliasSeen are actually emitted (Codex code-r7: the
+	// earlier fixture left these empty, so the test would not catch
+	// their removal from Describe()).
+	v1Samples := make([]uint64, 16)
+	v1Samples[3] = 1
+	v1SumNS := make([]uint64, 16)
+	v1SumNS[3] = 100
+	v1AliasSeen := make([]bool, 16)
+	v1AliasSeen[3] = true
 	workers = append(workers, dpuserspace.WorkerRuntimeStatus{
-		WorkerID:        2,
+		WorkerID:              2,
 		ColdPathLayoutVersion: 1,
-		ColdPathHist:    hist,
-		ColdPathSamples: make([]uint64, 16),
+		ColdPathHist:          hist,
+		ColdPathSamples:       v1Samples,
+		ColdPathSumNS:         v1SumNS,
+		ColdPathAliasSeen:     v1AliasSeen,
 	})
 
 	metricCh := make(chan prometheus.Metric, 1024)
@@ -606,9 +618,25 @@ func TestColdPathDescriptorsAreDescribed(t *testing.T) {
 		t.Fatalf("emitWorkerColdPath emitted %d undeclared descriptors (checked-collector "+
 			"contract violation — add them to Describe()): %v", len(undeclared), undeclared)
 	}
-	// Sanity: we actually exercised the v3 + v1 + scalar families.
-	if len(emitted) < 10 {
-		t.Fatalf("expected the test to exercise the full cold-path family; only %d distinct "+
-			"descs emitted", len(emitted))
+	// Sanity (Codex code-r7): the fixtures above exercise EVERY cold-path
+	// descriptor exactly once across the family — 4 v1 (bucket, samples,
+	// sum_ns, alias_seen) + 6 scalars (sample_phase, wrapper_underflow,
+	// wrapper_ns_baseline, ns_per_tsc_q32, clock_source, snapshot_failed)
+	// + 4 v3 (bucket, samples, sum_ns, builder_collision) + overflow +
+	// layout_version + layout_version_unknown = 17. Asserting the exact
+	// count means removing ANY cold-path desc from Describe() is caught
+	// here (the undeclared check above catches additions; this catches
+	// the test silently under-exercising the family).
+	const wantColdPathDescs = 17
+	coldPathEmitted := 0
+	for d := range emitted {
+		if strings.Contains(descName(d), "cold_path") {
+			coldPathEmitted++
+		}
+	}
+	if coldPathEmitted != wantColdPathDescs {
+		t.Fatalf("test exercised %d distinct cold-path descriptors, want exactly %d "+
+			"(fixtures must emit every family so removal of any desc is caught)",
+			coldPathEmitted, wantColdPathDescs)
 	}
 }

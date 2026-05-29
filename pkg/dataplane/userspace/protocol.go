@@ -906,11 +906,11 @@ type WorkerRuntimeStatus struct {
 	// True if a configured zone-pair could not be assigned a slot —
 	// either the 255-slot capacity was exhausted OR the pair references
 	// a zone-id outside the 0..=64 direct-table range.
-	ColdPathOverflowActive bool   `json:"cold_path_overflow_active,omitempty"`
-	ColdPathSamplePhase    uint64 `json:"cold_path_sample_phase,omitempty"`
-	ColdPathWrapperUnderflowCount uint64     `json:"cold_path_wrapper_underflow_count,omitempty"`
-	ColdPathNSPerTSCQ32           uint64     `json:"cold_path_ns_per_tsc_q32,omitempty"`
-	ColdPathWrapperNSBaseline     uint64     `json:"cold_path_wrapper_ns_baseline,omitempty"`
+	ColdPathOverflowActive        bool   `json:"cold_path_overflow_active,omitempty"`
+	ColdPathSamplePhase           uint64 `json:"cold_path_sample_phase,omitempty"`
+	ColdPathWrapperUnderflowCount uint64 `json:"cold_path_wrapper_underflow_count,omitempty"`
+	ColdPathNSPerTSCQ32           uint64 `json:"cold_path_ns_per_tsc_q32,omitempty"`
+	ColdPathWrapperNSBaseline     uint64 `json:"cold_path_wrapper_ns_baseline,omitempty"`
 	// "tsc" / "clock_gettime" / "" (Unset). Harness gates Table
 	// publication on == "tsc" for every worker.
 	ColdPathClockSource string `json:"cold_path_clock_source,omitempty"`
