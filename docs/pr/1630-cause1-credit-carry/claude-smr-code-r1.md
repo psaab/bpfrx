@@ -150,3 +150,33 @@ enforced guard, not a comment.
   proving it is ACK-clocked single-flow token-bucket fill, not a
   fair-share bug. Documented in fairness-regimes.md; PR now
   `Closes #1630` + `Closes #1643`.
+
+## r2 addenda (post-validation)
+
+- **Codex r2 RE-CONFIRM** (fresh thread `019e7204`, checked out
+  f9563b9a8 directly): **MERGE-READY**. Verified with quoted lines that
+  the exact-ns thresholds resolve its boundary Major, the
+  `(2K−1)×rate×EPOCH` per-rotation bound holds at BOTH boundaries and for
+  repeated regime-2-bank → regime-1-drain sequences (carry clamped at
+  `carry_max`, drain ≤ K−1 epochs), and the worst-case ceiling test
+  exercises the tight maximum. No remaining counter-example.
+- **`copilot-swe-agent` push `c1e6ee237` "Fix carry cold-resume cleanup"**
+  (NOT the formal review seat). Reviewed on merits: regime-3 now stores
+  `epoch_carry_bytes = 0` UNCONDITIONALLY (was guarded by `if start != 0`).
+  This is a harmless defensive hardening — when `start == 0` the
+  constructor already initializes carry to 0, so the store is redundant,
+  never wrong. The regime-1/2 logic and ALL burst bounds are byte-
+  identical to the Codex-verified f9563b9a8, so the Codex r2 verdict
+  carries forward over this delta. It adds
+  `v8_carry_first_rotation_drops_stale_carry_even_with_zero_start`
+  (injects carry then does a `start==0` rotation, asserts carry dropped).
+  Full carry suite 10/10 green.
+- **Flaky pre-existing test** `tx_latency_hist_cross_thread_snapshot_skew_within_bound`
+  (#812, TX latency histogram sidecar — UNRELATED to carry/seqlock):
+  failed twice while the build host was under concurrent load (its
+  `K_skew` bound is computed from observed wall-clock rates, so reader-
+  thread starvation under CPU oversubscription transiently exceeds it).
+  Proven a load artifact, not a regression: passes 5/5 isolated, branch
+  full-suite 3/3 and master full-suite 3/3 on a quiet box; last touched
+  by #1614/#1618, not this branch. File-and-move-past per
+  feedback_retirement_blocker_keep_going.
