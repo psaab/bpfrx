@@ -143,7 +143,7 @@ RSS hashes each TCP flow's 5-tuple to one of those 6 queues, so
 `N` flows land as a **multinomial draw** over `M = 6` bins.
 
 The unevenness of that draw is a pure function of `N` and `M`. Two
-useful summaries, both computed by Monte-Carlo (200k trials,
+useful summaries, both computed by Monte-Carlo (200k–400k trials,
 i.i.d. uniform hashing) and confirmed against closed form:
 
 - **CoV of the per-queue occupancy counts** `{aᵢ}` (how skewed the
