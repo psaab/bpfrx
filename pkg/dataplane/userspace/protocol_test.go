@@ -1169,3 +1169,183 @@ func TestProcessStatusPolicyRuleCountersRoundTrip(t *testing.T) {
 		t.Fatalf("PolicyRuleCounters mismatch: got %+v, want %+v", back.PolicyRuleCounters, in.PolicyRuleCounters)
 	}
 }
+
+// #1642: the Rust helper serialized several status fields the Go side had
+// no matching json: tag for, so json.Unmarshal silently dropped them and
+// the operator-facing telemetry stayed zero. These tests decode the exact
+// wire JSON the Rust structs emit (serde rename strings verified against
+// userspace-dp/src/protocol/{binding,cos,control}.rs at the same revision)
+// and assert the Go side now observes every field. A Rust rename without a
+// matching Go update will land in the field as zero rather than erroring,
+// so feeding the Rust-shaped JSON literal is the real regression gate — a
+// pure Go marshal round-trip would not have caught the dropped fields,
+// since the Go struct lacked them entirely.
+
+func TestHAGroupStatusLeaseFieldsParity1642(t *testing.T) {
+	// Wire JSON exactly as Rust HAGroupStatus (protocol/binding.rs) emits.
+	const rustJSON = `{
+		"rg_id": 1,
+		"active": true,
+		"watchdog_timestamp": 1234567890,
+		"forwarding_active": true,
+		"lease_state": "owner",
+		"lease_until": 9876543210
+	}`
+	var got HAGroupStatus
+	if err := json.Unmarshal([]byte(rustJSON), &got); err != nil {
+		t.Fatalf("unmarshal Rust HAGroupStatus JSON: %v", err)
+	}
+	if !got.ForwardingActive {
+		t.Errorf("forwarding_active dropped: got false")
+	}
+	if got.LeaseState != "owner" {
+		t.Errorf("lease_state dropped: got %q, want %q", got.LeaseState, "owner")
+	}
+	if got.LeaseUntil != 9876543210 {
+		t.Errorf("lease_until dropped: got %d, want %d", got.LeaseUntil, uint64(9876543210))
+	}
+
+	// Wire-key presence on the Go marshal side (the contract is symmetric).
+	raw, err := json.Marshal(&HAGroupStatus{ForwardingActive: true, LeaseState: "owner", LeaseUntil: 1})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	for _, key := range []string{"forwarding_active", "lease_state", "lease_until"} {
+		if _, ok := obj[key]; !ok {
+			t.Errorf("wire key %q missing from HAGroupStatus JSON: %s", key, string(raw))
+		}
+	}
+}
+
+func TestCoSQueueStatusStarvationCountersParity1642(t *testing.T) {
+	// Wire JSON exactly as Rust CoSQueueStatus (protocol/cos.rs) emits for
+	// the shaper-starvation / ring-pressure diagnostics.
+	const rustJSON = `{
+		"queue_id": 3,
+		"root_token_starvation_parks": 11,
+		"queue_token_starvation_parks": 22,
+		"tx_ring_full_submit_stalls": 33
+	}`
+	var got CoSQueueStatus
+	if err := json.Unmarshal([]byte(rustJSON), &got); err != nil {
+		t.Fatalf("unmarshal Rust CoSQueueStatus JSON: %v", err)
+	}
+	if got.RootTokenStarvationParks != 11 {
+		t.Errorf("root_token_starvation_parks dropped: got %d, want 11", got.RootTokenStarvationParks)
+	}
+	if got.QueueTokenStarvationParks != 22 {
+		t.Errorf("queue_token_starvation_parks dropped: got %d, want 22", got.QueueTokenStarvationParks)
+	}
+	if got.TxRingFullSubmitStalls != 33 {
+		t.Errorf("tx_ring_full_submit_stalls dropped: got %d, want 33", got.TxRingFullSubmitStalls)
+	}
+
+	raw, _ := json.Marshal(&CoSQueueStatus{
+		RootTokenStarvationParks:  1,
+		QueueTokenStarvationParks: 1,
+		TxRingFullSubmitStalls:    1,
+	})
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	for _, key := range []string{
+		"root_token_starvation_parks",
+		"queue_token_starvation_parks",
+		"tx_ring_full_submit_stalls",
+	} {
+		if _, ok := obj[key]; !ok {
+			t.Errorf("wire key %q missing from CoSQueueStatus JSON: %s", key, string(raw))
+		}
+	}
+}
+
+func TestBindingStatusPostDrainBackupCosDropsParity1642(t *testing.T) {
+	// Rust serializes post_drain_backup_cos_drops / _cos_drop_bytes on
+	// BindingStatus (protocol/binding.rs), NOT on CoSQueueStatus. Feed
+	// binding-level wire JSON and assert the Go BindingStatus now reads it.
+	const rustJSON = `{
+		"slot": 4,
+		"queue_id": 0,
+		"worker_id": 2,
+		"registered": true,
+		"armed": true,
+		"ready": true,
+		"bound": true,
+		"xsk_registered": true,
+		"post_drain_backup_cos_drops": 7,
+		"post_drain_backup_cos_drop_bytes": 4096
+	}`
+	var got BindingStatus
+	if err := json.Unmarshal([]byte(rustJSON), &got); err != nil {
+		t.Fatalf("unmarshal Rust BindingStatus JSON: %v", err)
+	}
+	if got.PostDrainBackupCosDrops != 7 {
+		t.Errorf("post_drain_backup_cos_drops dropped: got %d, want 7", got.PostDrainBackupCosDrops)
+	}
+	if got.PostDrainBackupCosDropBytes != 4096 {
+		t.Errorf("post_drain_backup_cos_drop_bytes dropped: got %d, want 4096", got.PostDrainBackupCosDropBytes)
+	}
+
+	// Guard against re-introducing the wrong-level bug: CoSQueueStatus must
+	// NOT declare these keys (post_drain_backup_bytes is the only legitimate
+	// post_drain key on CoSQueueStatus).
+	cosRaw, _ := json.Marshal(&CoSQueueStatus{PostDrainBackupBytes: 1})
+	var cosObj map[string]json.RawMessage
+	if err := json.Unmarshal(cosRaw, &cosObj); err != nil {
+		t.Fatalf("unmarshal cos obj: %v", err)
+	}
+	for _, key := range []string{"post_drain_backup_cos_drops", "post_drain_backup_cos_drop_bytes"} {
+		if _, ok := cosObj[key]; ok {
+			t.Errorf("CoSQueueStatus must not carry binding-scoped key %q: %s", key, string(cosRaw))
+		}
+	}
+	if _, ok := cosObj["post_drain_backup_bytes"]; !ok {
+		t.Errorf("post_drain_backup_bytes must remain on CoSQueueStatus: %s", string(cosRaw))
+	}
+}
+
+func TestProcessStatusEventStreamFieldsParity1642(t *testing.T) {
+	// Rust ProcessStatus (protocol/control.rs) emits flat event_stream_*
+	// fields. _sent / _dropped already matched; connected / seq / acked
+	// were dropped on the Go side.
+	const rustJSON = `{
+		"event_stream_connected": true,
+		"event_stream_seq": 4242,
+		"event_stream_acked": 4200,
+		"event_stream_sent": 5000,
+		"event_stream_dropped": 3
+	}`
+	var got ProcessStatus
+	if err := json.Unmarshal([]byte(rustJSON), &got); err != nil {
+		t.Fatalf("unmarshal Rust ProcessStatus JSON: %v", err)
+	}
+	if !got.EventStreamConnected {
+		t.Errorf("event_stream_connected dropped: got false")
+	}
+	if got.EventStreamSeq != 4242 {
+		t.Errorf("event_stream_seq dropped: got %d, want 4242", got.EventStreamSeq)
+	}
+	if got.EventStreamAcked != 4200 {
+		t.Errorf("event_stream_acked dropped: got %d, want 4200", got.EventStreamAcked)
+	}
+	// Sanity: the previously-matching fields still decode.
+	if got.EventStreamSent != 5000 || got.EventStreamDropped != 3 {
+		t.Errorf("event_stream_sent/dropped regressed: sent=%d dropped=%d", got.EventStreamSent, got.EventStreamDropped)
+	}
+
+	raw, _ := json.Marshal(&ProcessStatus{EventStreamConnected: true, EventStreamSeq: 1, EventStreamAcked: 1})
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	for _, key := range []string{"event_stream_connected", "event_stream_seq", "event_stream_acked"} {
+		if _, ok := obj[key]; !ok {
+			t.Errorf("wire key %q missing from ProcessStatus JSON: %s", key, string(raw))
+		}
+	}
+}

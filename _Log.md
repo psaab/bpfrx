@@ -1,5 +1,25 @@
 # Action Log
 
+## 2026-05-29 — #1642 Rust→Go status-field parity drift
+- **Timestamp**: 2026-05-29 UTC
+- **Action**: Fixed 4 field-level JSON parity gaps where the Rust helper
+  serialized status fields the Go side dropped on unmarshal (observability,
+  not HA behavior). Added to Go protocol.go: HAGroupStatus
+  {forwarding_active, lease_state, lease_until}; CoSQueueStatus
+  {root_token_starvation_parks, queue_token_starvation_parks,
+  tx_ring_full_submit_stalls}; ProcessStatus {event_stream_connected,
+  event_stream_seq, event_stream_acked}. Moved post_drain_backup_cos_drops /
+  _cos_drop_bytes from Go CoSQueueStatus to Go BindingStatus to match the
+  Rust source struct level (left post_drain_backup_bytes on CoSQueueStatus —
+  it is correctly there). Verified no existing Go consumers of the moved
+  fields. Added cross-language parity tests: Go decodes Rust-shaped JSON
+  literals (protocol_test.go *Parity1642), Rust serde wire-key pins
+  (protocol/tests.rs *_1642). 5/5 flake both sides; wire-invariant fixture
+  unaffected (no Rust fields changed).
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/protocol_test.go,
+  userspace-dp/src/protocol/tests.rs
+
 ## 2026-05-28 — #1630 cause-1 rotation credit carry + #1643 seqlock fence
 - **Timestamp**: 2026-05-28 UTC
 - **Action**: Implemented the scoped #1630 cause-1 fix (CoS small-class
