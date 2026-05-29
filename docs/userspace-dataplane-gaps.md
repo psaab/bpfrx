@@ -167,15 +167,12 @@ There are two distinct fallback boundaries:
 
 ## Priority Work
 
-The highest-value remaining work on current `master` is:
-
-1. complete #1451's runtime-surface migration so source removal no longer
-   depends on legacy `dataplane.DataPlane` callers.
-2. complete #1473's userspace XDP shim split.
-3. land #1476 only after those blockers close, then attach the #1477
-   userspace-only validation artifact set to the exact source-removal
-   candidate.
-4. continue correctness and performance hardening on the active AF_XDP fast path
+The #1373 retirement (including the #1451 runtime-surface migration, the
+#1473/#1493 userspace XDP shim split, the #1476 source removal, and the
+#1477 validation artifact set) is complete. The highest-value remaining
+work on `master` is correctness, operational hardening, and performance
+optimization on the active AF_XDP userspace forwarding path — for example
+CoS regression work (#1614) and cold-path hardening (#1608).
 
 Keep #1377, #1448, #1449, and #1450 closed. SNAT helper-restart reset
 behavior, HA persistent-lease gating, and cross-backend selector divergence
