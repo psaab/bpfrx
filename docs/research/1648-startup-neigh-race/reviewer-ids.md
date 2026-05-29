@@ -28,9 +28,16 @@ here so a continuation can re-fetch by id rather than re-dispatch.
 ## Round 4 (v4)
 | Reviewer | Task ID | Verdict | Doc |
 |---|---|---|---|
-| Codex | task-mpr1hywo-cxrf47 | (pending) | codex-plan-r4.md |
-| AGY | adversarial-review-mpr1hhma-hbycu7 | (pending) | agy-plan-r4.md |
-| Claude SMR | n/a (in-conversation, parent took over after sub-agent 529) | PLAN-READY (2 NITs for /engineer) | claude-smr-plan-r4.md |
+| Codex | task-mpr1hywo-cxrf47 | PLAN-NEEDS-MINOR (Window-3 narrowing, NIT-2 unsound, stale R3 cell) | codex-plan-r4.md |
+| AGY | adversarial-review-mpr1hhma-hbycu7 | PLAN-NEEDS-REVISION (stale-entry leak, key-collapsed staging, respawn, both-signal bar) | agy-plan-r4.md |
+| Claude SMR | n/a (in-conversation) | PLAN-READY (2 NITs; NIT-2 self-corrected as unsound) | claude-smr-plan-r4.md |
+
+## Round 5 (v5)
+| Reviewer | Task ID | Verdict | Doc |
+|---|---|---|---|
+| Codex | (pending dispatch) | (pending) | codex-plan-r5.md |
+| AGY | (pending dispatch) | (pending) | agy-plan-r5.md |
+| Claude SMR | n/a (in-conversation) | PLAN-READY | claude-smr-plan-r5.md |
 
 ## Notes
 - Gate-R is a CLUSTER measurement (loss:xpf-userspace-fw0/fw1), FIFO with the
