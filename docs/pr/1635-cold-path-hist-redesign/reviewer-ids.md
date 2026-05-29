@@ -72,3 +72,15 @@ zone_id_out_of_range_total in plan §2.5. Both fixed in 207e01c64.
 | AGY        | adversarial-review-mprfcg9v-z1rvm5  | MERGE-READY (overflow isolated; regression test passes; 1638 cargo tests green) |
 | Claude SMR | in-conversation                    | MERGE-READY (overflow fix verified; in-range unaffected) |
 | Copilot    | re-review @ 207e01c64 requested; polling | r5 findings addressed |
+
+## Round 6 — overflow_active comment doc-drift fix (HEAD 16b9dfa7d, COMMENT-ONLY)
+Copilot review 4392934810 @ 18d634f84 (21:24) found the overflow_active describing
+comments at 3 sites still said "capacity-only" after the 207e01c64 broadening (now
+also fires on out-of-range zone-ids). Fixed all 3 comments. NO behavior/binary change.
+
+| Reviewer   | Verdict   |
+|------------|-----------|
+| Codex      | MERGE-READY carries forward (comment-only delta; binary unchanged from 207e01c64) |
+| AGY        | MERGE-READY carries forward (comment-only delta) |
+| Claude SMR | MERGE-READY (verified: only doc comments in metrics_descriptors.go / protocol.go / binding.rs changed; cargo+go green) |
+| Copilot    | review @ 16b9dfa7d requested; polling (task bt3l1e6xb) |
