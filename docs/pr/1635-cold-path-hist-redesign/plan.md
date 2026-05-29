@@ -627,3 +627,32 @@ all three are fixed in the implementation:
    emitting; on mismatch the counts belong to the old pair and are
    skipped (not relabeled). Closes the 1-tick transient the Claude SMR
    review had flagged as a NIT.
+
+### §IMPL.r3 Code-review round-2 fixes (Copilot formal review)
+
+Copilot's formal re-review found three deeper issues; all fixed:
+
+1. **Zone-id off-by-one (id 64 dropped).** Zone-ids are 1-based with
+   `MaxZones = 64`, so the highest assignable id is 64; the exclusive
+   ceiling of 64 dropped it. **Fix:** the table now indexes ids `0..=64`
+   (`COLD_PATH_ZONE_DIM = 65`, 65×65 = 4225 B), with a MULTIPLY index
+   (`from * 65 + to`) since 65 is not a power of two. New regression
+   `build_assigns_slots_for_zone_ids_up_to_64` (covers id 64) +
+   `lookup_slot_returns_none_for_zone_id_out_of_range` (id 65+).
+
+2. **Missed-generation slot zero-out gap.** The worker only ever loads
+   the LATEST `ForwardingState` from ArcSwap and can skip intermediate
+   config generations; the coordinator-computed `slots_to_zero` was
+   relative to its immediately-previous map, so a slot reassigned in a
+   skipped generation could be absent from the latest list. **Fix:** the
+   worker now derives its zero-set by diffing ITS OWN old slot-map
+   inverse against the new one at the swap (`worker/loop_body/mod.rs`) —
+   generation-independent. `ForwardingState.cold_path_slots_to_zero` is
+   removed; `build`'s returned list is kept for unit tests only.
+
+3. **Overflow-with-no-samples hid the overflow gauge.** A v3 payload
+   with `overflow_active=true` but no samples stamped
+   `cold_path_layout_version=0`, routing the Go collector to the v1
+   emitter so the overflow gauge never appeared. **Fix:** `status.rs`
+   stamps v3 when `has_data || overflow_active`. Go regression
+   `TestEmitWorkerColdPath_V3_OverflowNoSamples`.

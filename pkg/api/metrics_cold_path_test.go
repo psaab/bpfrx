@@ -490,3 +490,40 @@ func TestEmitWorkerColdPath_V3_SparseEmitsOnlyActiveSlots(t *testing.T) {
 		t.Fatalf("sparse encoding must emit %d samples_v3 series, got %d", n, count)
 	}
 }
+
+// #1635 (Copilot code-r2): a v3 payload with overflow_active=true but
+// no sampled slots must still emit the overflow gauge (version stamped
+// v3 even with empty active arrays), and must not panic on the empty
+// parallel arrays.
+func TestEmitWorkerColdPath_V3_OverflowNoSamples(t *testing.T) {
+	c := newCollectorWithWorkerDescsOnly()
+	status := dpuserspace.ProcessStatus{
+		WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{
+			{
+				WorkerID:               0,
+				ColdPathLayoutVersion:  3,
+				ColdPathOverflowActive: true,
+				// All active arrays empty.
+			},
+		},
+	}
+	got := collectFromEmitWorkerRuntime(t, c, status)
+	var sawOverflow1, sawV3Bucket bool
+	for _, m := range got {
+		switch descName(m.Desc()) {
+		case "xpf_userspace_worker_cold_path_overflow_active":
+			if valueOf(t, m) == 1.0 {
+				sawOverflow1 = true
+			}
+		case "xpf_userspace_worker_cold_path_ns_bucket_v3",
+			"xpf_userspace_worker_cold_path_samples_total_v3":
+			sawV3Bucket = true
+		}
+	}
+	if !sawOverflow1 {
+		t.Error("overflow gauge=1 must emit even with no sampled slots")
+	}
+	if sawV3Bucket {
+		t.Error("no active slots ⇒ no per-zone-pair v3 series")
+	}
+}

@@ -419,21 +419,46 @@ pub(crate) fn worker_loop(
             screen_state.update_syn_cookie_master_key(new_forwarding.syn_cookie_master_key);
             sessions.set_timeouts(new_forwarding.session_timeouts);
 
-            forwarding = new_forwarding;
             // #1635 (plan §2.4): a config apply may have reassigned
             // cold-path histogram slots to new zone-pairs. Zero those
             // slots in every binding's worker-local accumulator BEFORE
             // any record_sample into the reused slot, so a reused slot
-            // never carries the previous zone-pair's counts. The
-            // sibling atomics are zeroed at the next publish merge (a
-            // freshly-zeroed local accumulator overwrites the published
-            // value), so no separate atomic zero-out is needed here.
-            for &slot in forwarding.cold_path_slots_to_zero.iter() {
-                let slot = slot as usize;
-                for binding in bindings.iter_mut() {
-                    binding.cold_path.zero_slot(slot);
+            // never carries the previous zone-pair's counts.
+            //
+            // Copilot code-r2: derive the zero-set from THIS WORKER's
+            // OWN old map vs the new map, NOT from the coordinator's
+            // `slots_to_zero` list. A worker can skip intermediate
+            // ForwardingState generations (ArcSwap only ever delivers
+            // the latest), and the coordinator computes `slots_to_zero`
+            // relative to its immediately-previous map — so a slot
+            // reassigned in a skipped generation would be absent from
+            // the latest list (it now looks "retained"). Comparing the
+            // worker's actual old slot-map inverse against the new one
+            // is generation-independent: any slot whose mapping changed
+            // since the worker last observed it gets zeroed. The
+            // sibling atomics are overwritten at the next publish merge
+            // from the freshly-zeroed local accumulator.
+            {
+                let old_inverse = &forwarding.cold_path_slot_map.inverse;
+                let new_inverse = &new_forwarding.cold_path_slot_map.inverse;
+                for slot in 0..crate::afxdp::cold_path_hist::POLICY_COLD_PATH_ZONE_PAIR_SLOTS {
+                    let new_pair = new_inverse.get(slot).copied().flatten();
+                    // Zero when the slot now maps to a pair that differs
+                    // from what the worker last saw there. A freed slot
+                    // (new == None) keeps its stale local data harmlessly
+                    // — it is unmapped, never sampled, and gets zeroed
+                    // when next reassigned.
+                    if new_pair.is_some()
+                        && new_pair != old_inverse.get(slot).copied().flatten()
+                    {
+                        for binding in bindings.iter_mut() {
+                            binding.cold_path.zero_slot(slot);
+                        }
+                    }
                 }
             }
+
+            forwarding = new_forwarding;
             let purged_input_dscp = purge_sessions_for_input_dscp_filter_revalidation(
                 &mut sessions,
                 session_map_fd,

@@ -87,11 +87,6 @@ pub(in crate::afxdp) struct ForwardingState {
     /// via `lookup_slot`. Rotated via the ForwardingState ArcSwap.
     pub(in crate::afxdp) cold_path_slot_map:
         std::sync::Arc<crate::afxdp::cold_path_hist::ColdPathSlotMap>,
-    /// #1635 (plan §2.4): slots whose zone-pair assignment CHANGED in
-    /// this build relative to the previous one. The worker zeroes these
-    /// slots' local accumulators on the swap so a reused slot never
-    /// carries the previous pair's counts.
-    pub(in crate::afxdp) cold_path_slots_to_zero: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

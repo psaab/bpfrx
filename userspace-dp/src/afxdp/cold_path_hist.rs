@@ -73,23 +73,33 @@ pub(in crate::afxdp) const COLD_PATH_ASSIGNABLE_SLOTS: usize =
     POLICY_COLD_PATH_ZONE_PAIR_SLOTS - 1;
 const _: () = assert!(COLD_PATH_ASSIGNABLE_SLOTS == 255);
 
-/// Maximum zone-id (exclusive) the direct slot-map lookup table
-/// indexes. MUST cover the full configurable zone space: the Go
-/// compiler assigns sequential 1-based zone-ids and `MAX_ZONES` is 64
-/// (`bpf/headers/xpf_common.h` + `pkg/dataplane/types.go MaxZones`), so
-/// the ceiling is 64 (Codex code-r1 finding 2: a 32 ceiling silently
-/// dropped valid zone-ids 32-63). Zone-ids are 1..=64, so a 64×64 table
-/// covers every assignable pair. Pairs at/above the ceiling land in
-/// `None` — a defensive guard for the reserved `junos-global` sentinel
-/// (`u16::MAX`), not an expected case.
-pub(in crate::afxdp) const COLD_PATH_ZONE_ID_CEILING: u16 = 64;
-/// Bit-shift for the flat-table row stride = `log2(COLD_PATH_ZONE_ID_CEILING)`.
-const COLD_PATH_ZONE_SHIFT: usize = 6;
-const _: () = assert!(1usize << COLD_PATH_ZONE_SHIFT == COLD_PATH_ZONE_ID_CEILING as usize);
-/// Flat lookup-table length = `CEILING²` = 64×64 = 4096 bytes (L1d-resident).
-const COLD_PATH_FLAT_TABLE_LEN: usize =
-    (COLD_PATH_ZONE_ID_CEILING as usize) * (COLD_PATH_ZONE_ID_CEILING as usize);
-const _: () = assert!(COLD_PATH_FLAT_TABLE_LEN == 4096);
+/// Number of distinct zone-id values the direct slot-map lookup table
+/// indexes. MUST cover the full configurable zone space INCLUSIVELY:
+/// the Go compiler assigns sequential 1-based zone-ids and `MAX_ZONES`
+/// is 64 (`bpf/headers/xpf_common.h` + `pkg/dataplane/types.go
+/// MaxZones`), so the highest assignable id is 64. The table indexes
+/// ids `0..=64` = 65 rows/cols (Copilot code-r2: a ceiling of 64 used
+/// as an EXCLUSIVE bound dropped the valid 64th zone; Codex code-r1: a
+/// ceiling of 32 dropped 32-63). The index is a MULTIPLY
+/// (`from * 65 + to`), not a bit-shift, since 65 is not a power of two.
+/// Pairs with either id ≥ 65 (e.g. the `junos-global` `u16::MAX`
+/// sentinel) land in `None` — a defensive guard, not an expected case.
+pub(in crate::afxdp) const COLD_PATH_ZONE_DIM: usize = 65;
+const _: () = assert!(COLD_PATH_ZONE_DIM == 65);
+/// Flat lookup-table length = `DIM²` = 65×65 = 4225 bytes (L1d-resident).
+const COLD_PATH_FLAT_TABLE_LEN: usize = COLD_PATH_ZONE_DIM * COLD_PATH_ZONE_DIM;
+const _: () = assert!(COLD_PATH_FLAT_TABLE_LEN == 4225);
+
+/// Flat-table index for `(from, to)`; `None` if either id is out of
+/// range (≥ 65). `from * 65 + to` is injective over the in-range box.
+#[inline]
+fn cold_path_flat_index(from: u16, to: u16) -> Option<usize> {
+    let (from, to) = (from as usize, to as usize);
+    if from >= COLD_PATH_ZONE_DIM || to >= COLD_PATH_ZONE_DIM {
+        return None;
+    }
+    Some(from * COLD_PATH_ZONE_DIM + to)
+}
 
 /// Wire/layout version stamped into the status payload (#1635).
 pub(in crate::afxdp) const COLD_PATH_LAYOUT_VERSION: u32 = 3;
@@ -218,13 +228,12 @@ impl ColdPathSlotMap {
         // the previous map (so their accumulated histogram is kept).
         let mut pending: Vec<(u16, u16)> = Vec::with_capacity(pairs.len());
         for &(from, to) in pairs {
-            if from >= COLD_PATH_ZONE_ID_CEILING || to >= COLD_PATH_ZONE_ID_CEILING {
-                // Unrepresentable in the 64×64 table; never assigned a
-                // slot. Defensive (zone-ids are 1..=64); not expected.
+            let Some(idx) = cold_path_flat_index(from, to) else {
+                // Unrepresentable in the 65×65 table (id ≥ 65); never
+                // assigned a slot. Defensive (zone-ids are 1..=64).
                 continue;
-            }
+            };
             let retained = previous.and_then(|p| {
-                let idx = ((from as usize) << COLD_PATH_ZONE_SHIFT) | (to as usize);
                 let s = p.flat_table[idx];
                 if s != u8::MAX && p.inverse[s as usize] == Some((from, to)) {
                     Some(s)
@@ -236,7 +245,7 @@ impl ColdPathSlotMap {
                 Some(s) => {
                     used[s as usize] = true;
                     inverse[s as usize] = Some((from, to));
-                    flat_table[((from as usize) << COLD_PATH_ZONE_SHIFT) | (to as usize)] = s;
+                    flat_table[idx] = s;
                 }
                 None => pending.push((from, to)),
             }
@@ -258,7 +267,11 @@ impl ColdPathSlotMap {
             let s = next_free;
             used[s] = true;
             inverse[s] = Some((from, to));
-            flat_table[((from as usize) << COLD_PATH_ZONE_SHIFT) | (to as usize)] = s as u8;
+            // `from`/`to` are in-range here (only in-range pairs reach
+            // `pending`), so the index is always Some.
+            if let Some(idx) = cold_path_flat_index(from, to) {
+                flat_table[idx] = s as u8;
+            }
             // Queue zero-out for every newly-assigned slot when a
             // PREVIOUS map existed — the worker may have accumulated
             // counts for an earlier pair in this slot during any prior
@@ -282,15 +295,13 @@ impl ColdPathSlotMap {
 }
 
 /// Look up the slot for `(from, to)` in the direct map. Returns `None`
-/// for unmapped pairs (capacity exhausted) or zone-ids ≥ 64. Hot-path
-/// cost: one bound check, one shift, one L1d-resident array index, one
-/// `!= u8::MAX` predicate.
+/// for unmapped pairs (capacity exhausted) or zone-ids ≥ 65. Hot-path
+/// cost: one bound check, one multiply-add, one L1d-resident array
+/// index, one `!= u8::MAX` predicate.
 #[inline]
 pub(in crate::afxdp) fn lookup_slot(map: &ColdPathSlotMap, from: u16, to: u16) -> Option<u8> {
-    if from >= COLD_PATH_ZONE_ID_CEILING || to >= COLD_PATH_ZONE_ID_CEILING {
-        return None;
-    }
-    let entry = map.flat_table[((from as usize) << COLD_PATH_ZONE_SHIFT) | (to as usize)];
+    let idx = cold_path_flat_index(from, to)?;
+    let entry = map.flat_table[idx];
     if entry == u8::MAX {
         None
     } else {
@@ -1253,28 +1264,37 @@ mod tests {
     }
 
     #[test]
-    fn lookup_slot_returns_none_for_zone_id_ge_ceiling() {
-        let (map, _) = ColdPathSlotMap::build(None, &[(1u16, 2u16)]);
-        // Ceiling is 64 (MAX_ZONES). Zone-ids 32-63 are now VALID and
-        // covered by the table (Codex code-r1 finding 2 fix); only
-        // ids >= 64 miss.
-        assert_eq!(lookup_slot(&map, 64, 2), None);
-        assert_eq!(lookup_slot(&map, 2, 64), None);
-        assert_eq!(lookup_slot(&map, 64, 64), None);
+    fn lookup_slot_returns_none_for_zone_id_out_of_range() {
+        // The table indexes ids 0..=64 (DIM=65). Id 65+ (and the
+        // junos-global u16::MAX sentinel) is out of range and misses
+        // even when built — Copilot code-r2: the 64th zone (id 64) must
+        // NOT be treated as out of range.
+        let (map, _) = ColdPathSlotMap::build(None, &[(65u16, 2u16), (1, 2)]);
+        assert_eq!(lookup_slot(&map, 65, 2), None);
+        assert_eq!(lookup_slot(&map, 2, 65), None);
         assert_eq!(lookup_slot(&map, u16::MAX, 1), None);
+        // (1,2) is in-range and was built ⇒ Some.
+        assert!(lookup_slot(&map, 1, 2).is_some());
     }
 
     #[test]
-    fn build_assigns_slots_for_zone_ids_32_to_63() {
-        // Regression for Codex code-r1 finding 2: ids 32-63 were
-        // silently dropped under the old 32 ceiling. They must now get
-        // slots.
-        let pairs = [(32u16, 33u16), (63, 1), (1, 63)];
+    fn build_assigns_slots_for_zone_ids_up_to_64() {
+        // Regression for Codex code-r1 finding 2 (ids 32-63 dropped at
+        // ceiling 32) AND Copilot code-r2 (id 64 dropped at exclusive
+        // ceiling 64). The 1-based MAX_ZONES=64 means the 64th zone has
+        // id 64; it MUST get a slot.
+        let pairs = [(32u16, 33u16), (63, 1), (1, 63), (64, 64), (1, 64), (64, 1)];
         let (map, _) = ColdPathSlotMap::build(None, &pairs);
-        assert!(lookup_slot(&map, 32, 33).is_some());
-        assert!(lookup_slot(&map, 63, 1).is_some());
-        assert!(lookup_slot(&map, 1, 63).is_some());
+        for &(from, to) in &pairs {
+            assert!(
+                lookup_slot(&map, from, to).is_some(),
+                "in-range pair {from}->{to} must get a slot"
+            );
+        }
         assert!(!map.overflow_active);
+        // (64,64) and (1,2)-style pairs must not collide.
+        assert_ne!(lookup_slot(&map, 64, 64), lookup_slot(&map, 1, 64));
+        assert_ne!(lookup_slot(&map, 1, 64), lookup_slot(&map, 64, 1));
     }
 
     #[test]

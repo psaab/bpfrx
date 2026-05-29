@@ -394,7 +394,13 @@ impl super::Coordinator {
                     // active-slot-only encoding (Vec::is_empty omits an
                     // empty worker's fields, preserving wire-compat with
                     // pre-#1635 Go readers per feedback_wire_protocol_both_sides).
-                    cold_path_layout_version: if has_data {
+                    // Stamp v3 when there is data OR when the slot map
+                    // overflowed (Copilot code-r2: an overflow with no
+                    // samples yet must still route the Go collector to
+                    // the v3 emitter so the overflow gauge is visible —
+                    // version 0 would route to the legacy v1 path and
+                    // hide it).
+                    cold_path_layout_version: if has_data || slot_map.overflow_active {
                         crate::afxdp::cold_path_hist::COLD_PATH_LAYOUT_VERSION
                     } else {
                         0
