@@ -1,0 +1,733 @@
+// Colocated unit tests for the server/ control-plane handlers and
+// helpers (#1653 Tier B / §3.1). Prior to this module `server/` had
+// zero tests of its own — the only handler coverage lived in
+// main_tests.rs and exercised apply_snapshot / queue-planner /
+// session-sync paths. The #1642 status-field-parity drift lived in
+// exactly this untested glue, so these tests assert handler behavior
+// at the real `handle_stream` call site (not trivial getters): error
+// arms, status-field population, HA gating, and the pure helper
+// predicates.
+
+use super::helpers::{
+    bindings_settled, forwarding_unsupported_error, parse_session_sync_mac,
+    set_bindings_forwarding_armed, should_run_afxdp,
+};
+use super::{handle_stream, ServerState};
+use crate::state_writer::StateWriter;
+use crate::{
+    afxdp, BindingControlRequest, BindingStatus, ControlRequest, ControlResponse, ForwardingControlRequest,
+    HAGroupStatus, HAStateUpdateRequest, ProcessStatus, QueueControlRequest, SessionSyncRequest,
+    UserspaceCapabilities,
+};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+
+// --- harness ------------------------------------------------------------
+
+fn unique_state_file(tag: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}/xpf-server-test-{}-{}-{}.json",
+        std::env::temp_dir().display(),
+        tag,
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn new_state(status: ProcessStatus) -> Arc<Mutex<ServerState>> {
+    Arc::new(Mutex::new(ServerState {
+        status,
+        snapshot: None,
+        afxdp: afxdp::Coordinator::new(),
+        state_writer: Arc::new(StateWriter::new()),
+    }))
+}
+
+/// Drive a single control request through the real `handle_stream`
+/// dispatcher over a socketpair, exactly as the daemon's accept loop
+/// does. Returns the decoded `ControlResponse`.
+fn run_request(state: Arc<Mutex<ServerState>>, request: ControlRequest) -> ControlResponse {
+    let state_file = unique_state_file(&request.request_type);
+    let (mut client, server) =
+        std::os::unix::net::UnixStream::pair().expect("control socket pair");
+    let running = Arc::new(AtomicBool::new(true));
+    let handle = {
+        let state_file = state_file.clone();
+        std::thread::spawn(move || handle_stream(server, &state_file, state, running))
+    };
+
+    serde_json::to_writer(&mut client, &request).expect("write request");
+    std::io::Write::write_all(&mut client, b"\n").expect("newline");
+
+    let response: ControlResponse =
+        serde_json::from_reader(std::io::BufReader::new(client)).expect("read response");
+    handle
+        .join()
+        .expect("handler thread")
+        .expect("handler result");
+    let _ = std::fs::remove_file(&state_file);
+    response
+}
+
+fn req(request_type: &str) -> ControlRequest {
+    ControlRequest {
+        request_type: request_type.to_string(),
+        ..ControlRequest::default()
+    }
+}
+
+// --- dispatcher: ping / status / unknown --------------------------------
+
+#[test]
+fn ping_returns_ok_and_attaches_status() {
+    let response = run_request(new_state(ProcessStatus::default()), req("ping"));
+    assert!(response.ok, "ping should succeed: {}", response.error);
+    assert!(
+        response.status.is_some(),
+        "ping must attach status when suppress_status is false"
+    );
+}
+
+#[test]
+fn unknown_request_type_is_rejected_with_message() {
+    let response = run_request(new_state(ProcessStatus::default()), req("does_not_exist"));
+    assert!(!response.ok);
+    assert!(
+        response.error.contains("unknown request type does_not_exist"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+#[test]
+fn suppress_status_omits_status_payload() {
+    let mut request = req("ping");
+    request.suppress_status = true;
+    let response = run_request(new_state(ProcessStatus::default()), request);
+    assert!(response.ok);
+    assert!(
+        response.status.is_none(),
+        "suppress_status=true must not attach a status payload"
+    );
+}
+
+// --- update_ha_state (handler glue; coordinator logic is in ha_tests) ---
+
+#[test]
+fn update_ha_state_missing_payload_is_rejected() {
+    let response = run_request(new_state(ProcessStatus::default()), req("update_ha_state"));
+    assert!(!response.ok);
+    assert!(
+        response.error.contains("missing HA state"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+#[test]
+fn update_ha_state_populates_status_ha_groups() {
+    let groups = vec![HAGroupStatus {
+        rg_id: 1,
+        active: true,
+        ..HAGroupStatus::default()
+    }];
+    let mut request = req("update_ha_state");
+    request.ha_state = Some(HAStateUpdateRequest {
+        groups: groups.clone(),
+    });
+    let response = run_request(new_state(ProcessStatus::default()), request);
+    assert!(response.ok, "unexpected error: {}", response.error);
+    let status = response.status.expect("status payload");
+    // The handler copies the request groups into status.ha_groups, then
+    // refresh_status re-reads ha_groups() from the coordinator. The
+    // operator-facing rg_id must survive that round-trip — this is the
+    // exact status-field-parity surface #1642 regressed in.
+    assert_eq!(status.ha_groups.len(), 1, "expected one HA group");
+    assert_eq!(status.ha_groups[0].rg_id, 1);
+}
+
+// --- set_forwarding_state ----------------------------------------------
+
+#[test]
+fn set_forwarding_state_missing_payload_is_rejected() {
+    let response = run_request(
+        new_state(ProcessStatus::default()),
+        req("set_forwarding_state"),
+    );
+    assert!(!response.ok);
+    assert!(
+        response.error.contains("missing forwarding state"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+#[test]
+fn set_forwarding_state_arm_without_support_is_rejected() {
+    // forwarding_supported defaults false; arming must be refused and
+    // forwarding_armed must NOT flip.
+    let mut request = req("set_forwarding_state");
+    request.forwarding = Some(ForwardingControlRequest { armed: true });
+    let state = new_state(ProcessStatus::default());
+    let response = run_request(state.clone(), request);
+    assert!(!response.ok);
+    assert!(
+        response.error.contains("not supported"),
+        "unexpected error: {}",
+        response.error
+    );
+    assert!(
+        !state.lock().expect("state").status.forwarding_armed,
+        "rejected arm must not flip forwarding_armed"
+    );
+}
+
+#[test]
+fn set_forwarding_state_unarm_clears_armed_flag() {
+    let state = new_state(ProcessStatus {
+        forwarding_armed: true,
+        capabilities: UserspaceCapabilities {
+            forwarding_supported: true,
+            unsupported_reasons: Vec::new(),
+        },
+        ..ProcessStatus::default()
+    });
+    let mut request = req("set_forwarding_state");
+    request.forwarding = Some(ForwardingControlRequest { armed: false });
+    let response = run_request(state.clone(), request);
+    assert!(response.ok, "unexpected error: {}", response.error);
+    assert!(
+        !state.lock().expect("state").status.forwarding_armed,
+        "unarm must clear forwarding_armed"
+    );
+}
+
+// --- sync_session -------------------------------------------------------
+
+#[test]
+fn sync_session_missing_request_is_rejected() {
+    let response = run_request(new_state(ProcessStatus::default()), req("sync_session"));
+    assert!(!response.ok);
+    assert!(
+        response.error.contains("missing session sync request"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+#[test]
+fn sync_session_unknown_operation_is_rejected() {
+    let mut request = req("sync_session");
+    request.session_sync = Some(SessionSyncRequest {
+        operation: "frobnicate".to_string(),
+        ..SessionSyncRequest::default()
+    });
+    let response = run_request(new_state(ProcessStatus::default()), request);
+    assert!(!response.ok);
+    assert!(
+        response
+            .error
+            .contains("unknown session sync operation frobnicate"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+#[test]
+fn sync_session_delete_with_valid_key_succeeds() {
+    let mut request = req("sync_session");
+    request.session_sync = Some(SessionSyncRequest {
+        operation: "delete".to_string(),
+        addr_family: 2, // AF_INET
+        protocol: 6,    // TCP
+        src_ip: "10.0.0.1".to_string(),
+        dst_ip: "10.0.0.2".to_string(),
+        src_port: 1234,
+        dst_port: 80,
+        ..SessionSyncRequest::default()
+    });
+    let response = run_request(new_state(ProcessStatus::default()), request);
+    assert!(response.ok, "unexpected error: {}", response.error);
+}
+
+#[test]
+fn sync_session_upsert_with_valid_entry_succeeds() {
+    let mut request = req("sync_session");
+    request.session_sync = Some(SessionSyncRequest {
+        operation: "upsert".to_string(),
+        addr_family: 2,
+        protocol: 6,
+        src_ip: "10.0.0.1".to_string(),
+        dst_ip: "10.0.0.2".to_string(),
+        src_port: 1234,
+        dst_port: 80,
+        egress_ifindex: 7,
+        neighbor_mac: "02:bf:72:01:02:03".to_string(),
+        src_mac: "02:bf:72:0a:0b:0c".to_string(),
+        ..SessionSyncRequest::default()
+    });
+    let response = run_request(new_state(ProcessStatus::default()), request);
+    assert!(response.ok, "unexpected error: {}", response.error);
+}
+
+#[test]
+fn sync_session_upsert_with_malformed_mac_is_rejected() {
+    let mut request = req("sync_session");
+    request.session_sync = Some(SessionSyncRequest {
+        operation: "upsert".to_string(),
+        addr_family: 2,
+        protocol: 6,
+        src_ip: "10.0.0.1".to_string(),
+        dst_ip: "10.0.0.2".to_string(),
+        neighbor_mac: "zz:zz:zz:zz:zz:zz".to_string(),
+        ..SessionSyncRequest::default()
+    });
+    let response = run_request(new_state(ProcessStatus::default()), request);
+    assert!(!response.ok);
+    assert!(
+        response.error.contains("parse neighbor_mac"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+#[test]
+fn sync_session_delete_with_unparseable_ip_is_rejected() {
+    let mut request = req("sync_session");
+    request.session_sync = Some(SessionSyncRequest {
+        operation: "delete".to_string(),
+        addr_family: 2,
+        protocol: 6,
+        src_ip: "not-an-ip".to_string(),
+        dst_ip: "10.0.0.2".to_string(),
+        ..SessionSyncRequest::default()
+    });
+    let response = run_request(new_state(ProcessStatus::default()), request);
+    assert!(!response.ok);
+    assert!(
+        response.error.contains("parse src_ip"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+// --- bump_fib_generation ------------------------------------------------
+
+#[test]
+fn bump_fib_generation_missing_snapshot_is_rejected() {
+    let response = run_request(
+        new_state(ProcessStatus::default()),
+        req("bump_fib_generation"),
+    );
+    assert!(!response.ok);
+    assert!(
+        response.error.contains("missing snapshot"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+#[test]
+fn bump_fib_generation_updates_status_and_stored_snapshot() {
+    use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+    let state = new_state(ProcessStatus::default());
+    // Seed a stored snapshot via apply_snapshot first.
+    {
+        let mut request = req("apply_snapshot");
+        request.snapshot = Some(ConfigSnapshot {
+            version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+            generation: 1,
+            fib_generation: 1,
+            generated_at: chrono::Utc::now(),
+            ..ConfigSnapshot::default()
+        });
+        let response = run_request(state.clone(), request);
+        assert!(response.ok, "seed apply_snapshot: {}", response.error);
+    }
+    let mut request = req("bump_fib_generation");
+    request.snapshot = Some(ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        fib_generation: 7,
+        generated_at: chrono::Utc::now(),
+        ..ConfigSnapshot::default()
+    });
+    let response = run_request(state.clone(), request);
+    assert!(response.ok, "unexpected error: {}", response.error);
+    let status = response.status.expect("status payload");
+    assert_eq!(status.last_fib_generation, 7);
+    assert_eq!(
+        state
+            .lock()
+            .expect("state")
+            .snapshot
+            .as_ref()
+            .expect("stored snapshot")
+            .fib_generation,
+        7,
+        "bump must rewrite the stored snapshot's fib_generation"
+    );
+}
+
+// --- apply_snapshot integrity preflight (#1606 / #1642 class) -----------
+
+#[test]
+fn apply_snapshot_missing_payload_is_rejected() {
+    let response = run_request(new_state(ProcessStatus::default()), req("apply_snapshot"));
+    assert!(!response.ok);
+    assert!(
+        response.error.contains("missing snapshot"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+#[test]
+fn apply_snapshot_integrity_preflight_rejects_without_mutating_state() {
+    use crate::{AddressBookSnapshot, ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+    // A reserved-sentinel address-book id (0) must fail the #1606
+    // integrity preflight BEFORE any guard.status / guard.snapshot
+    // mutation. The previous good config must survive intact.
+    let state = new_state(ProcessStatus::default());
+    let mut request = req("apply_snapshot");
+    request.snapshot = Some(ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 5,
+        fib_generation: 5,
+        generated_at: chrono::Utc::now(),
+        address_books: vec![AddressBookSnapshot {
+            id: 0, // reserved sentinel -> AddressBookIdZero
+            name: "bad".to_string(),
+            ..AddressBookSnapshot::default()
+        }],
+        ..ConfigSnapshot::default()
+    });
+    let response = run_request(state.clone(), request);
+    assert!(!response.ok);
+    assert!(
+        response.error.contains("snapshot integrity error"),
+        "unexpected error: {}",
+        response.error
+    );
+    let guard = state.lock().expect("state");
+    assert!(
+        guard.snapshot.is_none(),
+        "rejected snapshot must not be stored"
+    );
+    assert_eq!(
+        guard.status.last_snapshot_generation, 0,
+        "rejected snapshot must not bump last_snapshot_generation"
+    );
+    assert_eq!(
+        guard.status.last_fib_generation, 0,
+        "rejected snapshot must not bump last_fib_generation"
+    );
+}
+
+// --- set_binding_state / set_queue_state error arms ---------------------
+
+#[test]
+fn set_binding_state_missing_payload_is_rejected() {
+    let response = run_request(new_state(ProcessStatus::default()), req("set_binding_state"));
+    assert!(!response.ok);
+    assert!(
+        response.error.contains("missing binding state"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+#[test]
+fn set_binding_state_unknown_slot_is_rejected() {
+    let mut request = req("set_binding_state");
+    request.binding = Some(BindingControlRequest {
+        slot: 999,
+        registered: true,
+        armed: false,
+    });
+    let response = run_request(new_state(ProcessStatus::default()), request);
+    assert!(!response.ok);
+    assert!(
+        response.error.contains("unknown binding slot 999"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+#[test]
+fn set_binding_state_toggles_registered_and_armed_on_known_slot() {
+    // Seed one registered binding; arm it via set_binding_state and
+    // assert the success arm flips armed (forwarding unarmed so the
+    // reconcile is a safe no-op teardown).
+    let state = new_state(ProcessStatus {
+        bindings: vec![BindingStatus {
+            slot: 3,
+            registered: true,
+            armed: false,
+            ..BindingStatus::default()
+        }],
+        ..ProcessStatus::default()
+    });
+    let mut request = req("set_binding_state");
+    request.binding = Some(BindingControlRequest {
+        slot: 3,
+        registered: true,
+        armed: true,
+    });
+    let response = run_request(state.clone(), request);
+    assert!(response.ok, "unexpected error: {}", response.error);
+    let guard = state.lock().expect("state");
+    let binding = guard
+        .status
+        .bindings
+        .iter()
+        .find(|b| b.slot == 3)
+        .expect("seeded slot 3");
+    assert!(binding.registered);
+    assert!(binding.armed, "armed flag must flip on the known slot");
+}
+
+#[test]
+fn set_queue_state_missing_payload_is_rejected() {
+    let response = run_request(new_state(ProcessStatus::default()), req("set_queue_state"));
+    assert!(!response.ok);
+    assert!(
+        response.error.contains("missing queue state"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+#[test]
+fn set_queue_state_unknown_queue_is_rejected() {
+    let mut request = req("set_queue_state");
+    request.queue = Some(QueueControlRequest {
+        queue_id: 42,
+        registered: true,
+        armed: false,
+    });
+    let response = run_request(new_state(ProcessStatus::default()), request);
+    assert!(!response.ok);
+    assert!(
+        response.error.contains("unknown queue 42"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+#[test]
+fn set_queue_state_toggles_armed_on_known_queue() {
+    let state = new_state(ProcessStatus {
+        bindings: vec![BindingStatus {
+            slot: 0,
+            queue_id: 2,
+            registered: true,
+            armed: false,
+            ..BindingStatus::default()
+        }],
+        ..ProcessStatus::default()
+    });
+    let mut request = req("set_queue_state");
+    request.queue = Some(QueueControlRequest {
+        queue_id: 2,
+        registered: true,
+        armed: true,
+    });
+    let response = run_request(state.clone(), request);
+    assert!(response.ok, "unexpected error: {}", response.error);
+    let guard = state.lock().expect("state");
+    assert!(
+        guard
+            .status
+            .bindings
+            .iter()
+            .find(|b| b.queue_id == 2)
+            .expect("seeded queue 2")
+            .armed,
+        "armed flag must flip on the known queue"
+    );
+}
+
+#[test]
+fn stop_workers_clears_socket_fields_on_all_bindings() {
+    // stop_workers must tear down per-binding socket state so the
+    // subsequent rebind recreates fresh AF_XDP sockets.
+    let mut seeded = BindingStatus {
+        slot: 0,
+        registered: true,
+        bound: true,
+        xsk_registered: true,
+        zero_copy: true,
+        socket_fd: 42,
+        ready: true,
+        ..BindingStatus::default()
+    };
+    seeded.xsk_bind_mode = "zerocopy".to_string();
+    seeded.last_error = "stale".to_string();
+    let state = new_state(ProcessStatus {
+        bindings: vec![seeded],
+        ..ProcessStatus::default()
+    });
+    let response = run_request(state.clone(), req("stop_workers"));
+    assert!(response.ok, "unexpected error: {}", response.error);
+    let guard = state.lock().expect("state");
+    let binding = &guard.status.bindings[0];
+    assert!(!binding.bound);
+    assert!(!binding.xsk_registered);
+    assert!(binding.xsk_bind_mode.is_empty());
+    assert!(!binding.zero_copy);
+    assert_eq!(binding.socket_fd, 0);
+    assert!(!binding.ready);
+    assert!(binding.last_error.is_empty());
+}
+
+#[test]
+fn inject_packet_missing_payload_is_rejected() {
+    let response = run_request(new_state(ProcessStatus::default()), req("inject_packet"));
+    assert!(!response.ok);
+    assert!(
+        response.error.contains("missing packet injection request"),
+        "unexpected error: {}",
+        response.error
+    );
+}
+
+// --- pure helper predicates --------------------------------------------
+
+#[test]
+fn forwarding_unsupported_error_uses_generic_text_without_reasons() {
+    let cap = UserspaceCapabilities {
+        forwarding_supported: false,
+        unsupported_reasons: Vec::new(),
+    };
+    let msg = forwarding_unsupported_error(&cap);
+    assert_eq!(
+        msg,
+        "userspace live forwarding is not supported for the current configuration"
+    );
+}
+
+#[test]
+fn forwarding_unsupported_error_joins_reasons() {
+    let cap = UserspaceCapabilities {
+        forwarding_supported: false,
+        unsupported_reasons: vec!["reason a".to_string(), "reason b".to_string()],
+    };
+    let msg = forwarding_unsupported_error(&cap);
+    assert!(msg.contains("reason a; reason b"), "got: {msg}");
+}
+
+#[test]
+fn parse_session_sync_mac_round_trips_valid_mac() {
+    let parsed = parse_session_sync_mac("02:bf:72:01:02:03").expect("valid mac");
+    assert_eq!(parsed, Some([0x02, 0xbf, 0x72, 0x01, 0x02, 0x03]));
+}
+
+#[test]
+fn parse_session_sync_mac_empty_is_none() {
+    assert_eq!(parse_session_sync_mac("").expect("empty ok"), None);
+}
+
+#[test]
+fn parse_session_sync_mac_rejects_short_mac() {
+    assert!(parse_session_sync_mac("02:bf:72").is_err());
+}
+
+#[test]
+fn parse_session_sync_mac_rejects_long_mac() {
+    assert!(parse_session_sync_mac("02:bf:72:01:02:03:04").is_err());
+}
+
+#[test]
+fn parse_session_sync_mac_rejects_non_hex() {
+    assert!(parse_session_sync_mac("zz:bf:72:01:02:03").is_err());
+}
+
+#[test]
+fn should_run_afxdp_requires_armed_and_supported() {
+    let mut status = ProcessStatus {
+        forwarding_armed: true,
+        ..ProcessStatus::default()
+    };
+    status.capabilities.forwarding_supported = false;
+    assert!(!should_run_afxdp(&status), "unsupported must not run");
+    status.capabilities.forwarding_supported = true;
+    assert!(should_run_afxdp(&status), "armed + supported must run");
+    status.forwarding_armed = false;
+    assert!(!should_run_afxdp(&status), "unarmed must not run");
+}
+
+#[test]
+fn set_bindings_forwarding_armed_only_arms_registered_bindings() {
+    let mut status = ProcessStatus {
+        bindings: vec![
+            BindingStatus {
+                slot: 0,
+                registered: true,
+                ..BindingStatus::default()
+            },
+            BindingStatus {
+                slot: 1,
+                registered: false,
+                ..BindingStatus::default()
+            },
+        ],
+        ..ProcessStatus::default()
+    };
+    set_bindings_forwarding_armed(&mut status, true);
+    assert!(status.bindings[0].armed, "registered binding must arm");
+    assert!(
+        !status.bindings[1].armed,
+        "unregistered binding must not arm"
+    );
+}
+
+#[test]
+fn bindings_settled_unregistered_settled_only_when_torn_down() {
+    let settled = vec![BindingStatus {
+        registered: false,
+        bound: false,
+        xsk_registered: false,
+        ..BindingStatus::default()
+    }];
+    assert!(bindings_settled(&settled));
+
+    let unsettled = vec![BindingStatus {
+        registered: false,
+        bound: true,
+        ..BindingStatus::default()
+    }];
+    assert!(
+        !bindings_settled(&unsettled),
+        "unregistered-but-still-bound is not settled"
+    );
+}
+
+#[test]
+fn bindings_settled_registered_needs_ready_or_error() {
+    let pending = vec![BindingStatus {
+        registered: true,
+        ready: false,
+        ..BindingStatus::default()
+    }];
+    assert!(!bindings_settled(&pending), "registered + not ready is pending");
+
+    let ready = vec![BindingStatus {
+        registered: true,
+        ready: true,
+        ..BindingStatus::default()
+    }];
+    assert!(bindings_settled(&ready));
+
+    let mut errored = BindingStatus {
+        registered: true,
+        ready: false,
+        ..BindingStatus::default()
+    };
+    errored.last_error = "bind failed".to_string();
+    assert!(
+        bindings_settled(&[errored]),
+        "registered with a terminal error counts as settled"
+    );
+}
