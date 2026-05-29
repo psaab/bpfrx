@@ -4388,3 +4388,7 @@ top.
 - **Timestamp**: 2026-05-29
 - **Action**: Implement per-binding short-TTL negative cache; fast-fail at MissingNeighbor buffer site; record at pending_neigh drop site; resolved-wins + TTL invalidation.
 - **File(s)**: userspace-dp/src/afxdp/{mod.rs,neg_neigh.rs (new),neighbor_dispatch.rs,poll_descriptor/mod.rs,types/runtime.rs,worker/mod.rs}
+
+- **Timestamp**: 2026-05-29
+  **Action**: #1667 doc-drift fix — restored hyphenated `fail-closed` token in SNAT pool-mode row to satisfy snat_contract_doc_guard
+  **File(s)**: docs/userspace-dataplane-gaps.md, docs/pr/1667-snat-docguard/plan.md
