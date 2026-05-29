@@ -63,8 +63,13 @@ each cluster has a clear ownership boundary.
   there with a `const _: () = assert!(MAX_RX_BATCHES_PER_POLL >= 1);`
   compile-time guard in `worker/lifecycle.rs`. The guard pins the
   lower bound only — there is no compile-time pin on the value 4
-  itself; change it deliberately and re-run the
-  `guarantee_phase_*_visit_quantum` tests.
+  itself; change it deliberately and re-run the guarantee-phase
+  per-visit budget tests (`guarantee_phase_visit_cap_drains_banked_frames`
+  and `guarantee_phase_allows_larger_high_rate_visit_quantum`). #1630 (P2)
+  split the per-visit budget into a rate-scaled Phase-1 cost
+  (`cos_guarantee_quantum_bytes`) and a FRAME-count send cap
+  (`cos_guarantee_visit_cap_bytes` = `TX_BATCH_SIZE × frame`); the
+  `TX_BATCH_SIZE` const-assert covers the latter.
 - Binding creation must publish the selected shared-UMEM mode/group/role
   into `BindingLiveState` for both private and shared paths before the
   first coordinator refresh. The coordinator treats the live snapshot as

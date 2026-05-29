@@ -1008,3 +1008,361 @@ fn bypass_starvation_events_swap_at_rotation() {
     assert!(new_tag > tag, "rotation incremented tag");
     assert_eq!(count, 0, "rotation reset count to 0");
 }
+
+// === #1630 (cause-1): bounded rotation credit carry ===
+//
+// `maybe_rotate_epoch_v8` is purely lazy — a low-rate exact class is only
+// rotated when the scheduler next visits its queue, so the gap between two
+// rotations of the SAME queue routinely exceeds one epoch. The pre-#1630
+// clamp computed `elapsed = min(lag, EPOCH)` and reset `epoch_start := now`,
+// permanently discarding `rate × (lag − EPOCH)` of grant per lagged
+// rotation and pinning the lowest-rate classes below shape. These tests
+// pin the bounded-carry replacement and the burst bound (the invariant the
+// clamp protected) so a future refactor that re-clamps, removes a regime,
+// or unbounds the carry fails loudly in CI.
+//
+// All tests drive the rotation through the public `acquire_v8` entrypoint
+// (it rotates then snapshots) and read the published `epoch_total_grant_cap`
+// directly — the cap is the rate-meter the carry enlarges. 100 Mbps =
+// 12.5 MB/s, so `rate × EPOCH = 12_500_000 × 200µs = 2500 B`.
+
+const RATE_100M: u64 = 12_500_000;
+const CAP_PER_EPOCH_100M: u64 = 2_500; // rate × EPOCH_DURATION_NS
+
+fn carry_test_lease() -> SharedCoSQueueLease {
+    // active_shards/burst chosen large enough that the per-class cap, not
+    // the outstanding-credit cap, is the binding limiter for these reads.
+    let lease = SharedCoSQueueLease::new_v8(RATE_100M, 4_000_000, 8, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    lease
+}
+
+fn published_cap(lease: &SharedCoSQueueLease) -> u64 {
+    lease
+        .v8
+        .as_ref()
+        .unwrap()
+        .epoch
+        .epoch_total_grant_cap
+        .load(Ordering::Acquire)
+}
+
+fn published_carry(lease: &SharedCoSQueueLease) -> u64 {
+    lease
+        .v8
+        .as_ref()
+        .unwrap()
+        .epoch
+        .epoch_carry_bytes
+        .load(Ordering::Acquire)
+}
+
+#[test]
+fn v8_carry_first_rotation_is_cold_resume_single_epoch() {
+    // start == 0 → regime 3 cold-resume → exactly one epoch of grant,
+    // identical to the pre-#1630 first-rotation behavior. No carry banked.
+    let lease = carry_test_lease();
+    let _ = lease.acquire_v8(0, EPOCH_DURATION_NS, u64::MAX);
+    assert_eq!(
+        published_cap(&lease),
+        CAP_PER_EPOCH_100M,
+        "first (start==0) rotation grants exactly one epoch"
+    );
+    assert_eq!(published_carry(&lease), 0, "cold-resume banks no carry");
+}
+
+#[test]
+fn v8_carry_first_rotation_drops_stale_carry_even_with_zero_start() {
+    let lease = carry_test_lease();
+    lease
+        .v8
+        .as_ref()
+        .unwrap()
+        .epoch
+        .epoch_carry_bytes
+        .store(CAP_PER_EPOCH_100M, Ordering::Release);
+
+    let _ = lease.acquire_v8(0, EPOCH_DURATION_NS, u64::MAX);
+
+    assert_eq!(published_cap(&lease), CAP_PER_EPOCH_100M);
+    assert_eq!(published_carry(&lease), 0, "start==0 cold-resume drops stale carry");
+}
+
+#[test]
+fn v8_carry_normal_recovery_recovers_lagged_credit() {
+    // THE cause-1 fix. A lag within K epochs (regime 1) must grant the
+    // FULL lagged credit (`rate × lag`), not the clamped single epoch the
+    // old code gave. This is exactly the per-class shape loss being fixed.
+    let lease = carry_test_lease();
+    let t0 = EPOCH_DURATION_NS;
+    let _ = lease.acquire_v8(0, t0, u64::MAX); // cold-resume, start := t0
+    // Second visit 5 epochs later (lag = 5 ≤ K=8 → regime 1).
+    let lag_epochs = 5u64;
+    let _ = lease.acquire_v8(0, t0 + lag_epochs * EPOCH_DURATION_NS, u64::MAX);
+    assert_eq!(
+        published_cap(&lease),
+        lag_epochs * CAP_PER_EPOCH_100M,
+        "regime-1 recovery grants the full lagged credit (was clamped to 1 epoch pre-#1630)"
+    );
+}
+
+#[test]
+fn v8_carry_bank_residual_no_cliff_at_k_plus_one() {
+    // Gate 5d: a lag just beyond K (regime 2) must NOT drop to a single
+    // epoch (the v2 cliff). It grants the K-epoch ceiling NOW and banks
+    // the residual `rate × (lag − K×EPOCH)` for the next visit.
+    let lease = carry_test_lease();
+    let t0 = EPOCH_DURATION_NS;
+    let _ = lease.acquire_v8(0, t0, u64::MAX);
+    let lag_epochs = MAX_ROTATION_LAG_EPOCHS + 4; // 12 epochs at K=8
+    let _ = lease.acquire_v8(0, t0 + lag_epochs * EPOCH_DURATION_NS, u64::MAX);
+    assert_eq!(
+        published_cap(&lease),
+        MAX_ROTATION_LAG_EPOCHS * CAP_PER_EPOCH_100M,
+        "regime-2 grants exactly the K-epoch ceiling (no cliff to 1 epoch)"
+    );
+    // Residual = (lag − K) epochs of rate, banked.
+    let residual = (lag_epochs - MAX_ROTATION_LAG_EPOCHS) * CAP_PER_EPOCH_100M;
+    assert_eq!(
+        published_carry(&lease),
+        residual,
+        "regime-2 banks the residual beyond the K-epoch window"
+    );
+}
+
+#[test]
+fn v8_carry_banked_residual_drains_on_next_visit() {
+    // The banked residual (regime 2) must be released on the next
+    // on-time visit (regime 1 draw), bounded by the per-epoch drain cap.
+    let lease = carry_test_lease();
+    let t0 = EPOCH_DURATION_NS;
+    let _ = lease.acquire_v8(0, t0, u64::MAX);
+    // Bank a residual: lag K+2 → banks 2 epochs of rate.
+    let lag1 = MAX_ROTATION_LAG_EPOCHS + 2;
+    let t1 = t0 + lag1 * EPOCH_DURATION_NS;
+    let _ = lease.acquire_v8(0, t1, u64::MAX);
+    let banked = published_carry(&lease);
+    assert_eq!(banked, 2 * CAP_PER_EPOCH_100M, "2 epochs banked");
+    // Next on-time visit (lag = 1 epoch → regime 1) drains the carry on
+    // top of the base epoch grant.
+    let t2 = t1 + EPOCH_DURATION_NS;
+    let _ = lease.acquire_v8(0, t2, u64::MAX);
+    assert!(
+        published_cap(&lease) > CAP_PER_EPOCH_100M,
+        "next visit drains banked carry on top of base epoch grant"
+    );
+    assert!(
+        published_carry(&lease) < banked,
+        "carry reservoir shrinks as it drains"
+    );
+}
+
+#[test]
+fn v8_carry_burst_bound_holds_after_two_second_stall() {
+    // Gate 5 (burst bound) — the invariant the old clamp protected. A
+    // worker stalled 2 s then resumed must NOT receive a `rate × 2s`
+    // one-shot grant (= 25 MB). lag = 2s ≫ STALL → regime-3 cold-resume
+    // → exactly one epoch. This is the burst the unclamped probe risked.
+    let lease = carry_test_lease();
+    let t0 = EPOCH_DURATION_NS;
+    let _ = lease.acquire_v8(0, t0, u64::MAX);
+    let two_seconds = 2_000_000_000u64;
+    let _ = lease.acquire_v8(0, t0 + two_seconds, u64::MAX);
+    assert_eq!(
+        published_cap(&lease),
+        CAP_PER_EPOCH_100M,
+        "2 s stall cold-resumes to ONE epoch, not rate × 2 s"
+    );
+    // Sanity: rate × 2 s would have been 25 MB — assert we are far below.
+    assert!(
+        published_cap(&lease) < RATE_100M * 2,
+        "cap must be nowhere near the unbounded rate × stall grant"
+    );
+}
+
+#[test]
+fn v8_carry_per_rotation_grant_never_exceeds_k_epoch_ceiling() {
+    // Stronger burst bound: across ANY single rotation, including one
+    // that drains a full reservoir in regime 1, the published cap is
+    // bounded by `(2K − 1) × rate × EPOCH`. Drive the worst case: bank a
+    // full reservoir (regime 2 with a huge-but-below-STALL lag), then a
+    // single on-time visit that drains the reservoir.
+    let lease = carry_test_lease();
+    let t0 = EPOCH_DURATION_NS;
+    let _ = lease.acquire_v8(0, t0, u64::MAX);
+    // Lag below STALL but large enough to fill the reservoir to its cap.
+    let lag = STALL_THRESHOLD_EPOCHS - 1;
+    let t1 = t0 + lag * EPOCH_DURATION_NS;
+    let _ = lease.acquire_v8(0, t1, u64::MAX);
+    // Reservoir is clamped at CARRY_MAX_EPOCHS × rate × EPOCH.
+    assert_eq!(
+        published_carry(&lease),
+        CARRY_MAX_EPOCHS * CAP_PER_EPOCH_100M,
+        "reservoir clamps at CARRY_MAX_EPOCHS even for a near-STALL lag"
+    );
+    // WORST-CASE regime-1 drain: a lag of EXACTLY K×EPOCH is the largest
+    // raw lag that still selects regime 1 (regime 2 is `raw > K×EPOCH`), so
+    // base = K epochs AND the full reservoir drain adds (K−1) epochs — the
+    // tight `(2K−1)×rate×EPOCH` per-rotation maximum.
+    let t2 = t1 + MAX_ROTATION_LAG_EPOCHS * EPOCH_DURATION_NS;
+    let _ = lease.acquire_v8(0, t2, u64::MAX);
+    let ceiling = (MAX_ROTATION_LAG_EPOCHS + CARRY_DRAIN_MAX_EPOCHS) * CAP_PER_EPOCH_100M;
+    assert_eq!(
+        published_cap(&lease),
+        ceiling,
+        "worst-case regime-1 grant equals exactly the (2K−1)-epoch ceiling"
+    );
+    assert!(
+        published_cap(&lease) <= ceiling,
+        "single-rotation grant {} must not exceed (2K−1) ceiling {}",
+        published_cap(&lease),
+        ceiling
+    );
+}
+
+#[test]
+fn v8_carry_regime_boundaries_use_exact_nanoseconds_not_floored_epochs() {
+    // Codex r1 Major/Medium: regime selection must compare EXACT wall-clock
+    // nanoseconds, not a floored epoch count. A floored `lag = raw/EPOCH`
+    // would (a) admit a regime-1 lag up to `(K+1)×EPOCH − 1ns` (breaching
+    // the per-rotation burst bound by one epoch), and (b) skip regime-3
+    // cold-resume for a raw lag of `STALL×EPOCH + 1ns` (floors to STALL),
+    // banking instead of dropping stale carry across an HA gap.
+    //
+    // (a) K-window upper edge: raw lag = (K+1)×EPOCH − 1ns must be REGIME 2
+    // (grants exactly the K-epoch ceiling), NOT regime 1 with a near-(K+1)
+    // base grant.
+    {
+        let lease = carry_test_lease();
+        let t0 = EPOCH_DURATION_NS;
+        let _ = lease.acquire_v8(0, t0, u64::MAX);
+        let raw = (MAX_ROTATION_LAG_EPOCHS + 1) * EPOCH_DURATION_NS - 1;
+        let _ = lease.acquire_v8(0, t0 + raw, u64::MAX);
+        assert_eq!(
+            published_cap(&lease),
+            MAX_ROTATION_LAG_EPOCHS * CAP_PER_EPOCH_100M,
+            "raw lag just under (K+1) epochs is regime 2 (K-epoch ceiling), not a near-(K+1) regime-1 grant"
+        );
+    }
+    // (b) STALL upper edge: raw lag = STALL×EPOCH + 1ns must be REGIME 3
+    // (cold-resume, drop carry), NOT regime 2 (bank).
+    {
+        let lease = carry_test_lease();
+        let t0 = EPOCH_DURATION_NS;
+        let _ = lease.acquire_v8(0, t0, u64::MAX);
+        // First bank a residual so there is carry to (not) preserve.
+        let t1 = t0 + (MAX_ROTATION_LAG_EPOCHS + 3) * EPOCH_DURATION_NS;
+        let _ = lease.acquire_v8(0, t1, u64::MAX);
+        assert!(published_carry(&lease) > 0, "carry banked");
+        let raw = STALL_THRESHOLD_EPOCHS * EPOCH_DURATION_NS + 1;
+        let _ = lease.acquire_v8(0, t1 + raw, u64::MAX);
+        assert_eq!(
+            published_cap(&lease),
+            CAP_PER_EPOCH_100M,
+            "raw lag just over STALL is regime-3 cold-resume (one epoch)"
+        );
+        assert_eq!(
+            published_carry(&lease),
+            0,
+            "regime-3 at the exact STALL+1ns boundary drops stale carry"
+        );
+    }
+    // Lower edge of regime 3 / upper edge of regime 2: raw lag = exactly
+    // STALL×EPOCH must still be REGIME 2 (banks), proving the `>` is strict.
+    {
+        let lease = carry_test_lease();
+        let t0 = EPOCH_DURATION_NS;
+        let _ = lease.acquire_v8(0, t0, u64::MAX);
+        let raw = STALL_THRESHOLD_EPOCHS * EPOCH_DURATION_NS;
+        let _ = lease.acquire_v8(0, t0 + raw, u64::MAX);
+        assert_eq!(
+            published_cap(&lease),
+            MAX_ROTATION_LAG_EPOCHS * CAP_PER_EPOCH_100M,
+            "raw lag of exactly STALL epochs is still regime 2 (banks), not regime 3"
+        );
+        assert!(
+            published_carry(&lease) > 0,
+            "exactly-STALL lag banks the residual (not a cold-resume drop)"
+        );
+    }
+}
+
+#[test]
+fn v8_carry_cold_resume_drops_stale_carry_for_ha_failback() {
+    // Gate 6 (HA): leases are REUSED across an HA demote→promote when the
+    // config matches, so `epoch_start` survives. A long demotion gap on a
+    // reused lease must NOT replay a banked deficit or a multi-epoch
+    // burst. Bank a residual, then simulate a >STALL failback gap and
+    // assert the next grant is a single epoch with the stale carry dropped.
+    let lease = carry_test_lease();
+    let t0 = EPOCH_DURATION_NS;
+    let _ = lease.acquire_v8(0, t0, u64::MAX);
+    // Bank a residual via a regime-2 lag.
+    let t1 = t0 + (MAX_ROTATION_LAG_EPOCHS + 3) * EPOCH_DURATION_NS;
+    let _ = lease.acquire_v8(0, t1, u64::MAX);
+    assert!(published_carry(&lease) > 0, "carry banked before failback");
+    // Demotion gap well beyond STALL (failback ≥ 500 epochs).
+    let t2 = t1 + (STALL_THRESHOLD_EPOCHS + 1000) * EPOCH_DURATION_NS;
+    let _ = lease.acquire_v8(0, t2, u64::MAX);
+    assert_eq!(
+        published_cap(&lease),
+        CAP_PER_EPOCH_100M,
+        "post-failback first grant on a REUSED lease is one epoch (no K-epoch burst)"
+    );
+    assert_eq!(
+        published_carry(&lease),
+        0,
+        "cold-resume drops the stale carry so it cannot replay across the gap"
+    );
+}
+
+#[test]
+fn v8_carry_field_is_reader_private() {
+    // Gate 5b (carry-reader-private guard). `epoch_carry_bytes` must be
+    // written/read ONLY by the rotation winner inside the seqlock ODD
+    // section. If it ever leaks into the acquire/snapshot reader path or
+    // the coordinator status path it re-introduces the #1619 seqlock
+    // tearing class for the carry. Grep the crate source: the only
+    // references allowed are the field definition + its initializer in
+    // mod.rs, and the rotation read/write in rotate_epoch_v8.rs, and this
+    // test file. Any reference in acquire_v8 / snapshot_epoch_v8 /
+    // coordinator/status.rs is a regression.
+    use std::path::Path;
+    let crate_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let allowed = [
+        // field def + initializer + doc live in the lease mod.rs
+        "afxdp/types/shared_cos_lease/mod.rs",
+        // the single legitimate writer/reader: the rotation winner
+        "afxdp/types/shared_cos_lease/rotate_epoch_v8.rs",
+        // this test file
+        "afxdp/types/shared_cos_lease/shared_cos_lease_tests.rs",
+    ];
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&crate_src, &mut files);
+    for f in files {
+        let rel = f.strip_prefix(&crate_src).unwrap().to_string_lossy().replace('\\', "/");
+        if allowed.iter().any(|a| rel == *a) {
+            continue;
+        }
+        let body = std::fs::read_to_string(&f).unwrap();
+        if body.contains("epoch_carry_bytes") {
+            offenders.push(rel);
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "epoch_carry_bytes is rotation-private; unexpected references in: {:?}",
+        offenders
+    );
+}

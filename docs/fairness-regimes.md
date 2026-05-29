@@ -881,6 +881,81 @@ In addition to the structural per-flow CoV gate above
    distribution as master HEAD on the `cos-iperf-config.set`
    fixture (within ±5% per-class token-bucket noise).
 
+### Small-class per-class rate-metering floor (#1630 cause-1)
+
+Even SOLO (one class, one port, zero competition) the lowest-rate exact
+classes could not reach their configured shape — a per-class floor in the
+v8 epoch rate-meter, independent of cross-class competition. A SOLO A/B
+isolated TWO distinct root causes:
+
+- **cause-1** (fixed here): the rotation rate-meter clamp + sub-frame
+  selector discard, which pinned 100m at ~81 % and 1g at ~84 % of shape;
+- **cause-2** (a transport-physics floor, NOT a scheduler defect, see
+  below): a `K`-independent mid-rate residual on 3g/6g.
+
+Cause-1 has two composing parts:
+
+- **Bounded rotation credit carry** (`rotate_epoch_v8`). The epoch
+  rotation is purely lazy — a low-rate class is only rotated when the
+  scheduler next visits its queue, so the gap (`lag`) between two
+  rotations of the same queue routinely exceeds one epoch. The previous
+  clamp computed `elapsed = min(lag, EPOCH)` and reset
+  `epoch_start := now`, permanently discarding `rate × (lag − EPOCH)` of
+  grant. The replacement bounds `elapsed` by `K × EPOCH`
+  (`MAX_ROTATION_LAG_EPOCHS = 8`) to recover the lagged credit, banks any
+  residual beyond `K` into a clamped per-class carry deficit drained on
+  the next visit, and COLD-RESUMES to a single epoch (dropping carry) for
+  any lag beyond `STALL_THRESHOLD_EPOCHS = 256` so a stalled or
+  HA-failed-back worker (reused lease, stale `epoch_start`) cannot emit a
+  multi-epoch burst. The per-rotation grant is hard-bounded by
+  `(K + (K−1)) × rate × EPOCH`, preserving the burst bound (Gate 4) the
+  old clamp protected.
+- **Per-visit frame-count cap + N-frame token bank** (P2 + P1). The
+  guarantee selectors clamped each visit's send budget to the rate-scaled
+  quantum (`rate × 200 µs`), below two MTUs for a low-rate class, so the
+  drain sent one frame and discarded the sub-frame remainder every visit.
+  The send budget is now `cos_guarantee_visit_cap_bytes`
+  (`TX_BATCH_SIZE × frame`) while the Phase-1 budget gate keeps the
+  rate-scaled quantum (`phase1_cost`) so small-first ordering is
+  preserved; the exact-queue token bucket banks an N-frame burst
+  (`COS_EXACT_QUEUE_LEASE_BANK_BYTES`, N = 8) with the outstanding-credit
+  cap raised in lock-step. The long-run rate is still metered by the v8
+  per-epoch grant and the actual-byte debit, so the hard-cap holds.
+
+Measured effect of cause-1 (loss userspace cluster, reth0.80,
+`guarantee-rate 0.7`, 12 streams, push, v4, SOLO one class at a time):
+
+| Class | master baseline | cause-1 (this fix) SOLO |
+|-------|----------------:|------------------------:|
+| 100m  | ~81 %           | **95.0 %** |
+| 1g    | ~84 %           | **95.3 %** |
+
+The scoped acceptance gate is 100m and 1g each ≥ 95 % of shape **SOLO**
+(`cos-gate1-small-four-alone.sh` run one class at a time, or the per-port
+SOLO loop). The four-classes-in-parallel variant of that harness and the
+IPv6 path land 1-3 pp lower (parallel cross-class contention + the v6
+per-packet header overhead push the small classes onto the cause-2
+physics floor below); those are reported for the record, not as the
+pass/fail bar.
+
+### Mid-rate transport-physics floor (#1630 cause-2 — documented, not fixed)
+
+The mid-rate exact classes (3g/6g) carry a `K`-independent ~6 % shape
+residual that **no scheduler change recovers** — it is single-TCP-flow-
+bundle, ACK-clocked bursty delivery that cannot keep one worker's
+per-CPU AF_XDP token bucket continuously full (measured queue park
+19-117K/s, root never throttling, `parkR = 0`). The decisive
+discriminator (cause-2 §5 measurement on #1630): drain-sent / shape is
+WORST at `-P1` (single worker, whole-class cap ≈ 0.878) and RECOVERS with
+parallelism (`-P4` ≈ 0.918, `-P12` ≈ 0.949). A cross-worker fair-share
+bug would WORSEN with more workers; this IMPROVES — so it is transport
+physics, not a fairness defect. At high parallelism (`-P12`) the mid-rate
+classes reach ~93-95 % of shape; at low parallelism they sit lower,
+bounded by the token-bucket fill rate a bursty single flow can sustain.
+This floor is therefore a documented characteristic of the per-CPU
+AF_XDP + token-bucket transport, NOT a `guarantee-rate` Gate failure, and
+is intentionally not a pass/fail bar.
+
 ### Simul-load harness
 
 `test/incus/cos-simul-load-smoke.sh [push|reverse]` runs all 11
