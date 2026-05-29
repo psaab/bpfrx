@@ -236,11 +236,11 @@ pub(crate) fn translate_v4_to_v6(
     // total_len is attacker/driver-controlled, so clamp safely: a malformed
     // header could advertise a length shorter than the IPv4 header or longer
     // than the bytes we actually received.
-    let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
-    if total_len < ihl || total_len > packet.len() {
+    let ipv4_total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    if ipv4_total_len < ihl || ipv4_total_len > packet.len() {
         return None;
     }
-    let l4_payload = packet.get(ihl..total_len)?;
+    let l4_payload = packet.get(ihl..ipv4_total_len)?;
 
     // Map protocol.
     let next_header = match protocol {
@@ -251,8 +251,8 @@ pub(crate) fn translate_v4_to_v6(
 
     let new_hop_limit = ttl - 1;
     let ipv6_payload_len = l4_payload.len() as u16;
-    let total_len = 40 + l4_payload.len();
-    let mut out = vec![0u8; total_len];
+    let ipv6_total_len = 40 + l4_payload.len();
+    let mut out = vec![0u8; ipv6_total_len];
 
     // Build IPv6 header.
     out[0] = 0x60; // version=6

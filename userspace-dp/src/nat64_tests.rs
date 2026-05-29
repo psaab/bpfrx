@@ -450,11 +450,13 @@ fn translate_v4_to_v6_trims_ethernet_padding_tcp() {
     let src_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
     let dst_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
 
-    // A bare TCP ACK: 20B IP + 20B TCP, no L4 payload = 40B on the wire. The
-    // NIC/driver pads the frame to the 60-byte L2 minimum, so the L3-onward
-    // slice the caller hands us is 46 bytes (40B real + 6B zero padding).
+    // A minimal TCP segment with no L4 payload: 20B IP + 20B TCP = 40B on the
+    // wire (make_ipv4_tcp_packet sets SYN+ACK flags; the exact flag bits are
+    // irrelevant to the padding bug). The NIC/driver pads the frame to the
+    // 60-byte L2 minimum, so the L3-onward slice the caller hands us is 46
+    // bytes (40B real + 6B zero padding).
     let mut packet = make_ipv4_tcp_packet(src_v4, dst_v4, 80, 12345, b"");
-    assert_eq!(packet.len(), 40, "unpadded ACK should be 40 bytes");
+    assert_eq!(packet.len(), 40, "unpadded segment should be 40 bytes");
     let real_len = packet.len();
     packet.extend_from_slice(&[0u8; 6]); // simulate trailing Ethernet padding
     assert_eq!(packet.len(), 46);
