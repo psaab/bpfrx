@@ -39,11 +39,11 @@ here so a continuation can re-fetch by id rather than re-dispatch.
 | AGY | adversarial-review-mpr237k0-7t384z | PLAN-READY (but re-affirmed false H-E; superseded by Codex r5) | agy-plan-r5.md |
 | Claude SMR | n/a (in-conversation) | PLAN-READY (predated Codex r5; superseded) | claude-smr-plan-r5.md |
 
-## Round 6 (v6 @ 8ca9a0dc5105)
+## Round 6 (v6 @ 8ca9a0dc5105) — 3-WAY CONVERGED
 | Reviewer | Task ID | Verdict | Doc |
 |---|---|---|---|
-| Codex | task-mpr2vojj-dwcoaf | (pending) | codex-plan-r6.md |
-| AGY | adversarial-review-mpr2w010-96oqpb | (pending) | agy-plan-r6.md |
+| Codex | task-mpr2vojj-dwcoaf | PLAN-READY (no new blocker) | codex-plan-r6.md |
+| AGY | adversarial-review-mpr2w010-96oqpb | PLAN-READY (conceded H-E was wrong) | agy-plan-r6.md |
 | Claude SMR | n/a (in-conversation) | PLAN-READY | claude-smr-plan-r6.md |
 
 ## Notes

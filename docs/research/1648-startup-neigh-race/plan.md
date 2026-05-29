@@ -1,16 +1,17 @@
 # #1648 — Startup/failover neighbor-dump race: first cold connect ~1s
 
-**Status:** v6 (research-only; /research, not /engineer) — r5 closed with AGY
-PLAN-READY but Codex PLAN-NEEDS-REVISION (two verified blockers: (1) the v5
-full-clear swap would ERASE worker-learned neighbors written during the dump
-window — workers write `dynamic_neighbors` directly via ARP/NA/L3; (2) the AGY r4
-"stale-entry leak" H-E is FALSE — `stop_inner` already clears the full map at
-`coordinator/mod.rs:261`). v6 **reverts the full-clear swap** back to a
+**Status:** v6 — **PLAN-READY for Gate-R (3-way CONVERGED at r6:
+Codex PLAN-READY + AGY PLAN-READY + Claude SMR PLAN-READY).** Research-only
+(/research, not /engineer). v6 reverted the v5 full-clear swap (Codex r5: it would
+ERASE worker-learned neighbors written during the dump window) back to a
 **staged-replay that upserts into the live (empty-at-bringup) map** — fixing the
-seq=0 drop (H-0) with the staging-replay alone, with NO blanket clear. Retains the
+seq=0 drop (H-0) with NO blanket clear. The AGY-r4 "stale-entry leak" H-E was
+RETRACTED (Codex r5: `stop_inner` already clears the full map at
+`coordinator/mod.rs:261`, AGY r6 re-verified and conceded). Retains the
 Key-Collapsed Staging Map, bounded re-dump fallback, respawn-on-panic, both-signal
-kill bar, Window-3 BINDING-reconcile narrowing, and the rebuilt R3 matrix. H-E
-retracted. Pending r6 convergence.
+kill bar, Window-3 BINDING-reconcile narrowing, the rebuilt R3 matrix, and the
+§5.E per-key-diff (not blanket-clear) ENOBUFS resync. **Awaiting manual approval —
+`/engineer 1648` to proceed; Copilot joins as the 4th reviewer at /engineer.**
 
 > **v3 KEY CORRECTION (AGY r2, verified):** `initial_neighbor_dump` runs **only
 > once at daemon startup** (`neighbor.rs:514`, inside the detached
@@ -670,7 +671,8 @@ flow re-probes and re-buffers, and there is no recovery short of a daemon restar
 - **Fix:** give the neighbor monitor a respawn-on-panic/exit policy (bounded
   restart loop with backoff, or convert `spawn_supervised_aux` to a respawning
   supervisor for this specific thread). The respawned monitor re-runs
-  `initial_neighbor_dump` (now the 5.A.2 swap, so no stale leak / no seq=0 drop).
+  `initial_neighbor_dump` (now the 5.A.2 staged-replay, so no seq=0 drop; the map
+  was already cleared at the prior teardown so the re-seed is clean).
 - **Ordering vs persistent-error busy-loop (OQ-6):** the respawn loop must back
   off on a tight crash loop (e.g. an unrecoverable EBADF) rather than respawn at
   100% CPU — pair this with the OQ-6 persistent-errno break/recreate.
@@ -1041,8 +1043,27 @@ See `reviewer-ids.md` for task IDs. Per-round verdicts appended below.
     + §10 + status header updated; the v5 full-clear swap is now explicitly
     REJECTED.
 
-- **r6:** v6 reverts the harmful full-clear swap and retracts H-E. Awaiting r6
-  confirmation (Codex + AGY) that the staged-replay-into-live-map (a) fixes H-0
-  without erasing worker-learned entries, (b) is last-writer-correct for the
-  staged DEL/NEW orders, (c) leaves no remaining blanket-clear anywhere except the
-  gated 5.E per-key-diff resync, and (d) no new blocker remains.
+- **r6:** v6 reviewed — **3-WAY CONVERGED.**
+  - **Codex r6** (`codex-plan-r6.md`, `task-mpr2vojj-dwcoaf`): **PLAN-READY, no
+    new blocker.** Verified: (1) v6 does not erase worker-learned entries —
+    per-key insert/remove, no clear; bringup map empty (`coordinator/mod.rs:220`
+    stop + `:263` clear; `bringup.rs:233` workers before `:338` monitor). (2)
+    worker-write paths real, untouched keys preserved. (3) DEL/NEW key-collapsed
+    correct; staged-DEL-vs-worker-write is transient (re-probe at
+    `neighbor_dispatch.rs:136/150`). (4) H-E retraction accurate. (5) §5.E no
+    blanket-clear hazard. One editorial nit (`plan.md:673` "5.A.2 swap" wording) —
+    fixed post-r6.
+  - **AGY r6** (`agy-plan-r6.md`, `adversarial-review-mpr2w010-96oqpb`):
+    **PLAN-READY.** Re-read `coordinator/mod.rs:198-268` in full and **conceded its
+    r4/r5 H-E claim was incorrect** (`stop_inner` clears at `:263-267` after
+    `:220`). Verified worker-entry preservation, last-writer-wins + transient
+    staged-DEL race (~5ms self-heal), §5.E per-key-diff resync, and no
+    4th-window / deadlock / republish-staleness. Three /engineer recommendations
+    (chronological steady-state drain post-replay; persistent-error hardening;
+    honor the kill bar + target-B absence in R2) — all non-blocking.
+  - **Claude SMR r6** (`claude-smr-plan-r6.md`): **PLAN-READY.** Independently
+    verified both Codex r5 blockers against code before accepting the reversion;
+    found no new hole; flagged the staged-DEL-vs-worker-write transient and the
+    5.E "worker-owned" fuzziness as /engineer notes, not blockers.
+  - **Outcome:** CONVERGED. v6 is PLAN-READY for Gate-R. Stops here per /research;
+    awaiting manual `/engineer 1648`.
