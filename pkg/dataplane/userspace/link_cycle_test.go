@@ -95,13 +95,19 @@ func TestNotifyLinkCycleRebindsAndAppliesHelperStatusCompat(t *testing.T) {
 		LastFIBGeneration:      13,
 		NeighborGeneration:     21,
 		Bindings: []BindingStatus{{
-			Slot:       5,
-			Ifindex:    2,
-			QueueID:    1,
-			Registered: true,
-			Armed:      true,
-			Bound:      true,
-			RXPackets:  17,
+			Slot:          5,
+			Ifindex:       2,
+			QueueID:       1,
+			Registered:    true,
+			Armed:         true,
+			Bound:         true,
+			XSKRegistered: true,
+			// #1666: the binding-array READY write now gates on the
+			// helper-derived Ready (registered && bound && xsk_registered
+			// && heartbeat_fresh), so a genuinely-live binding fixture must
+			// set Ready to keep asserting Flags == userspaceBindingReady.
+			Ready:     true,
+			RXPackets: 17,
 		}},
 	}
 	events := startLinkCycleControlServer(t, controlSock, ctrlMap, []ProcessStatus{rebindStatus})
