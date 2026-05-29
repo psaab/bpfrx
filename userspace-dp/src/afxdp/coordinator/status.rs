@@ -311,15 +311,64 @@ impl super::Coordinator {
                     .map(|c| {
                         c.sample_phase != 0
                             || c.samples.iter().any(|&v| v != 0)
-                            || c.alias_seen.iter().any(|&v| v)
+                            || c.builder_collision.iter().any(|&v| v)
                     })
                     .unwrap_or(false);
                 let cold = cold_opt.unwrap_or_default();
-                let cold_hist: Vec<Vec<u64>> = if has_data {
-                    cold.buckets.iter().map(|row| row.to_vec()).collect()
-                } else {
-                    Vec::new()
-                };
+                // #1635: SPARSE wire encoding. Only slots with a live
+                // zone-pair assignment AND samples > 0 ride the wire.
+                // The slot→(from,to) mapping comes from the per-config
+                // slot map's inverse table; the worker's local buckets
+                // index by slot. A worker that never sampled emits zero
+                // new wire bytes (Vec::is_empty omits the fields).
+                let slot_map = &self.forwarding.cold_path_slot_map;
+                let mut active_slot_ids: Vec<u32> = Vec::new();
+                let mut active_zone_from: Vec<u32> = Vec::new();
+                let mut active_zone_to: Vec<u32> = Vec::new();
+                let mut active_samples: Vec<u64> = Vec::new();
+                let mut active_sum_ns: Vec<u64> = Vec::new();
+                let mut active_buckets: Vec<Vec<u64>> = Vec::new();
+                let mut active_builder_collision: Vec<bool> = Vec::new();
+                if has_data {
+                    for slot in 0..crate::afxdp::cold_path_hist::POLICY_COLD_PATH_ZONE_PAIR_SLOTS {
+                        if cold.samples[slot] == 0 {
+                            continue;
+                        }
+                        let Some((from, to)) =
+                            slot_map.inverse.get(slot).copied().flatten()
+                        else {
+                            // Sampled into a slot with no live mapping
+                            // (config rotated mid-window). Skip — the
+                            // next publish after the worker's zero-out
+                            // tick clears it.
+                            continue;
+                        };
+                        // Codex code-r1 finding 3: the coordinator
+                        // publishes the new slot-map BEFORE workers
+                        // necessarily load it and zero reused slots, so
+                        // for up to one publish tick the atomics can
+                        // carry the PREVIOUS pair's counts under the
+                        // NEW slot. Validate the recorded first_key
+                        // against the live mapping; on mismatch the
+                        // counts belong to the old pair — skip them
+                        // rather than relabel stale samples as the new
+                        // (from_zone, to_zone).
+                        let expected_key =
+                            crate::afxdp::cold_path_hist::zone_pair_packed_key(from, to);
+                        if cold.first_key[slot] != 0
+                            && cold.first_key[slot] != expected_key
+                        {
+                            continue;
+                        }
+                        active_slot_ids.push(slot as u32);
+                        active_zone_from.push(from as u32);
+                        active_zone_to.push(to as u32);
+                        active_samples.push(cold.samples[slot]);
+                        active_sum_ns.push(cold.sum_ns[slot]);
+                        active_buckets.push(cold.buckets[slot].to_vec());
+                        active_builder_collision.push(cold.builder_collision[slot]);
+                    }
+                }
                 crate::protocol::WorkerRuntimeStatus {
                     worker_id: *worker_id,
                     tid: handle.runtime_atomics.tid(),
@@ -341,31 +390,29 @@ impl super::Coordinator {
                     wall_ns_60s: w.wall_ns,
                     active_ns_60s: w.active_ns,
                     window_ns: w.window_ns,
-                    // #1621 cold-path histogram fields.
-                    // Vec fields gated on has_data so an uncalibrated
-                    // / never-sampled worker emits ZERO new fields on
-                    // the wire (Copilot code-r1 C2 + C5).
-                    cold_path_hist: cold_hist,
-                    cold_path_sum_ns: if has_data {
-                        cold.sum_ns.to_vec()
+                    // #1635 cold-path histogram fields: SPARSE
+                    // active-slot-only encoding (Vec::is_empty omits an
+                    // empty worker's fields, preserving wire-compat with
+                    // pre-#1635 Go readers per feedback_wire_protocol_both_sides).
+                    // Stamp v3 when there is data OR when the slot map
+                    // overflowed (Copilot code-r2: an overflow with no
+                    // samples yet must still route the Go collector to
+                    // the v3 emitter so the overflow gauge is visible —
+                    // version 0 would route to the legacy v1 path and
+                    // hide it).
+                    cold_path_layout_version: if has_data || slot_map.overflow_active {
+                        crate::afxdp::cold_path_hist::COLD_PATH_LAYOUT_VERSION
                     } else {
-                        Vec::new()
+                        0
                     },
-                    cold_path_samples: if has_data {
-                        cold.samples.to_vec()
-                    } else {
-                        Vec::new()
-                    },
-                    cold_path_first_key: if has_data {
-                        cold.first_key.to_vec()
-                    } else {
-                        Vec::new()
-                    },
-                    cold_path_alias_seen: if has_data {
-                        cold.alias_seen.to_vec()
-                    } else {
-                        Vec::new()
-                    },
+                    cold_path_active_slot_ids: active_slot_ids,
+                    cold_path_active_zone_from: active_zone_from,
+                    cold_path_active_zone_to: active_zone_to,
+                    cold_path_active_samples: active_samples,
+                    cold_path_active_sum_ns: active_sum_ns,
+                    cold_path_active_buckets: active_buckets,
+                    cold_path_active_builder_collision: active_builder_collision,
+                    cold_path_overflow_active: slot_map.overflow_active,
                     // Scalars: u64_is_zero in serde skips them on
                     // the wire when 0; safe to write the raw value
                     // (clock_source.as_str() returns "" for Unset

@@ -562,16 +562,37 @@ func (c *xpfCollector) emitWorkerColdPath(
 	label string,
 	w dpuserspace.WorkerRuntimeStatus,
 ) {
+	// #1635: branch on the wire layout version. 0 (or absent) = either
+	// no data this scrape OR a pre-#1635 daemon emitting the v1 dense
+	// fields; 3 = sparse log-linear per-zone-pair encoding; anything
+	// else = forward-compat unknown.
+	switch w.ColdPathLayoutVersion {
+	case 0, 1:
+		c.emitColdPathV1(ch, label, w)
+	case 3:
+		c.emitColdPathV3(ch, label, w)
+		ch <- prometheus.MustNewConstMetric(c.workerColdPathLayoutVersion,
+			prometheus.GaugeValue, 1.0, label, "3")
+	default:
+		ch <- prometheus.MustNewConstMetric(c.workerColdPathLayoutUnknownTotal,
+			prometheus.GaugeValue, 1.0, label,
+			strconv.FormatUint(uint64(w.ColdPathLayoutVersion), 10))
+	}
+	c.emitWorkerColdPathScalars(ch, label, w)
+}
+
+// emitColdPathV1 emits the legacy 24-bucket pow-2 per-slot metrics from
+// the dense v1 fields. Reached only when paired with a pre-#1635 Rust
+// daemon (current daemons leave the dense fields empty and emit v3).
+func (c *xpfCollector) emitColdPathV1(
+	ch chan<- prometheus.Metric,
+	label string,
+	w dpuserspace.WorkerRuntimeStatus,
+) {
 	// 24-bucket power-of-two histogram. Bucket 0 covers [0, 1024) ns;
 	// bucket i ∈ [1, 22] covers [2^(9+i), 2^(10+i)) ns; bucket 23
-	// saturates at any ns ≥ 2^32 (~4.295 s). Per #1619 plan v3 §1.1.
-	//
-	// The `le` (less-than-or-equal) label carries the upper inclusive
-	// boundary in nanoseconds, matching Prometheus histogram convention
-	// for histogram_quantile().
+	// saturates at any ns ≥ 2^32.
 	bucketLe := func(idx int) string {
-		// idx == 0 → le = 1023 (just under 1024); idx ∈ [1, 22] →
-		// le = 2^(10+idx) - 1; idx >= 23 → le = +Inf.
 		if idx == 0 {
 			return "1023"
 		}
@@ -580,12 +601,6 @@ func (c *xpfCollector) emitWorkerColdPath(
 		}
 		return strconv.FormatUint((uint64(1)<<uint(10+idx))-1, 10)
 	}
-	// Prometheus histogram `_bucket{le="N"}` convention requires
-	// CUMULATIVE counts (count of observations ≤ N), not the raw
-	// per-bucket count. Copilot code-r1 C1 caught this: the v1 plan
-	// said `_bucket` "counter" but didn't specify cumulative. Without
-	// cumulative semantics, `histogram_quantile()` computes wrong
-	// quantiles. Accumulate per-slot before emit.
 	for slot := 0; slot < len(w.ColdPathHist); slot++ {
 		slotLabel := strconv.Itoa(slot)
 		var running uint64
@@ -616,6 +631,66 @@ func (c *xpfCollector) emitWorkerColdPath(
 				prometheus.GaugeValue, alias, label, slotLabel)
 		}
 	}
+}
+
+// emitColdPathV3 emits the #1635 sparse per-zone-pair metrics. The
+// payload is parallel arrays (one entry per active zone-pair); the
+// `from_zone` / `to_zone` labels carry the zone-ids so every active
+// pair publishes a SEPARABLE latency distribution with no collision
+// exclusion (fixes #1622 F2 + F3). `le` boundaries follow the
+// 48-bucket log-linear layout (bucketLeV3).
+func (c *xpfCollector) emitColdPathV3(
+	ch chan<- prometheus.Metric,
+	label string,
+	w dpuserspace.WorkerRuntimeStatus,
+) {
+	n := len(w.ColdPathActiveSamples)
+	for i := 0; i < n; i++ {
+		fromZone := zoneIDLabel(w.ColdPathActiveZoneFrom, i)
+		toZone := zoneIDLabel(w.ColdPathActiveZoneTo, i)
+		// Cumulative bucket counts for histogram_quantile().
+		if i < len(w.ColdPathActiveBuckets) {
+			var running uint64
+			buckets := w.ColdPathActiveBuckets[i]
+			for b := 0; b < len(buckets); b++ {
+				running += buckets[b]
+				ch <- prometheus.MustNewConstMetric(c.workerColdPathBucketV3,
+					prometheus.CounterValue, float64(running),
+					label, fromZone, toZone, bucketLeV3(b))
+			}
+		}
+		ch <- prometheus.MustNewConstMetric(c.workerColdPathSamplesV3,
+			prometheus.CounterValue, float64(w.ColdPathActiveSamples[i]),
+			label, fromZone, toZone)
+		if i < len(w.ColdPathActiveSumNS) {
+			ch <- prometheus.MustNewConstMetric(c.workerColdPathSumNSV3,
+				prometheus.CounterValue, float64(w.ColdPathActiveSumNS[i]),
+				label, fromZone, toZone)
+		}
+		if i < len(w.ColdPathActiveBuilderCollision) {
+			col := 0.0
+			if w.ColdPathActiveBuilderCollision[i] {
+				col = 1.0
+			}
+			ch <- prometheus.MustNewConstMetric(c.workerColdPathBuilderCollisionV3,
+				prometheus.GaugeValue, col, label, fromZone, toZone)
+		}
+	}
+	overflow := 0.0
+	if w.ColdPathOverflowActive {
+		overflow = 1.0
+	}
+	ch <- prometheus.MustNewConstMetric(c.workerColdPathOverflowActive,
+		prometheus.GaugeValue, overflow, label)
+}
+
+// emitWorkerColdPathScalars emits the per-worker scalar families shared
+// across all layout versions.
+func (c *xpfCollector) emitWorkerColdPathScalars(
+	ch chan<- prometheus.Metric,
+	label string,
+	w dpuserspace.WorkerRuntimeStatus,
+) {
 	// Per-worker scalars.
 	ch <- prometheus.MustNewConstMetric(c.workerColdPathSamplePhase,
 		prometheus.CounterValue,
@@ -643,6 +718,35 @@ func (c *xpfCollector) emitWorkerColdPath(
 	ch <- prometheus.MustNewConstMetric(c.workerColdPathSnapshotFailedTotal,
 		prometheus.CounterValue,
 		float64(w.ColdPathSnapshotFailed), label)
+}
+
+// bucketLeV3 returns the inclusive upper boundary (Prometheus `le`
+// label) for #1635 48-bucket log-linear histogram bucket idx:
+//   - idx < 32        → (idx+1)*16 - 1   (15, 31, …, 511) — linear band.
+//   - 32 ≤ idx ≤ 46   → 2^(10+idx-32) - 1 (1023, 2047, …) — exp band.
+//   - idx ≥ 47        → "+Inf"            — saturate band.
+//
+// Mirrors bucket_upper_bound_ns_48 / bucket_index_for_ns_48 on the Rust
+// side; the two MUST agree or histogram_quantile() reads wrong values.
+func bucketLeV3(idx int) string {
+	const linear = 32
+	if idx < linear {
+		return strconv.FormatUint(uint64((idx+1)*16-1), 10)
+	}
+	if idx >= 47 {
+		return "+Inf"
+	}
+	return strconv.FormatUint((uint64(1)<<uint(10+idx-linear))-1, 10)
+}
+
+// zoneIDLabel renders the i-th zone-id of a parallel sparse array as a
+// label string, or "unknown" if the array is too short (defensive
+// against a truncated/mismatched payload).
+func zoneIDLabel(ids []uint32, i int) string {
+	if i >= len(ids) {
+		return "unknown"
+	}
+	return strconv.FormatUint(uint64(ids[i]), 10)
 }
 
 func (c *xpfCollector) emitUserspaceEventStream(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {

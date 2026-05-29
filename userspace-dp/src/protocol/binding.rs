@@ -94,27 +94,55 @@ pub struct WorkerRuntimeStatus {
     // sum (buckets/sum_ns/samples/sample_phase/underflow_count) OR OR
     // (alias_seen) or first-non-zero (first_key) merge performed at
     // the publish tick. Per #1621 plan v1 §4.2.
-    /// Per-slot per-bucket histogram. Shape [16 zone-pair slots][24 ns buckets].
-    #[serde(rename = "cold_path_hist", default,
+    /// #1635 wire layout version. 0/absent = pre-#1635 (old dense v1
+    /// fields, no longer emitted by this daemon); 3 = sparse
+    /// active-slot encoding below. Go switches emission on this.
+    #[serde(rename = "cold_path_layout_version", default,
+            skip_serializing_if = "crate::protocol::u32_is_zero")]
+    pub cold_path_layout_version: u32,
+    /// #1635 SPARSE encoding — parallel arrays, one entry per ACTIVE
+    /// zone-pair slot (samples > 0 AND a live slot-map assignment).
+    /// Empty when the worker has never sampled, so its wire payload is
+    /// byte-identical to a pre-#1635 daemon (forward-compat with old Go
+    /// readers, per feedback_wire_protocol_both_sides).
+    ///
+    /// Slot index (for cross-reference / debugging).
+    #[serde(rename = "cold_path_active_slot_ids", default,
             skip_serializing_if = "Vec::is_empty")]
-    pub cold_path_hist: Vec<Vec<u64>>,
-    /// Per-slot sum of sampled delta_ns. Shape [16].
-    #[serde(rename = "cold_path_sum_ns", default,
+    pub cold_path_active_slot_ids: Vec<u32>,
+    /// Parallel: from_zone_id per active slot.
+    #[serde(rename = "cold_path_active_zone_from", default,
             skip_serializing_if = "Vec::is_empty")]
-    pub cold_path_sum_ns: Vec<u64>,
-    /// Per-slot sample count. Shape [16].
-    #[serde(rename = "cold_path_samples", default,
+    pub cold_path_active_zone_from: Vec<u32>,
+    /// Parallel: to_zone_id per active slot.
+    #[serde(rename = "cold_path_active_zone_to", default,
             skip_serializing_if = "Vec::is_empty")]
-    pub cold_path_samples: Vec<u64>,
-    /// Per-slot first packed (from_zone, to_zone) key. 0 = no sample.
-    /// Used by the harness §3.4 cross-worker key-set check. Shape [16].
-    #[serde(rename = "cold_path_first_key", default,
+    pub cold_path_active_zone_to: Vec<u32>,
+    /// Parallel: sample count per active slot.
+    #[serde(rename = "cold_path_active_samples", default,
             skip_serializing_if = "Vec::is_empty")]
-    pub cold_path_first_key: Vec<u64>,
-    /// Per-slot alias-detected flag. Shape [16].
-    #[serde(rename = "cold_path_alias_seen", default,
+    pub cold_path_active_samples: Vec<u64>,
+    /// Parallel: sum of sampled delta_ns per active slot.
+    #[serde(rename = "cold_path_active_sum_ns", default,
             skip_serializing_if = "Vec::is_empty")]
-    pub cold_path_alias_seen: Vec<bool>,
+    pub cold_path_active_sum_ns: Vec<u64>,
+    /// Parallel: 48-bucket histogram per active slot.
+    #[serde(rename = "cold_path_active_buckets", default,
+            skip_serializing_if = "Vec::is_empty")]
+    pub cold_path_active_buckets: Vec<Vec<u64>>,
+    /// Parallel: builder-collision flag per active slot (should always
+    /// be false with the direct slot map; true = builder bug).
+    #[serde(rename = "cold_path_active_builder_collision", default,
+            skip_serializing_if = "Vec::is_empty")]
+    pub cold_path_active_builder_collision: Vec<bool>,
+    /// True if some configured zone-pair could not be assigned a slot —
+    /// either the 255-slot capacity was exhausted (slot 255 is the
+    /// u8::MAX sentinel) OR the pair references a zone-id outside the
+    /// 0..=64 direct-table range. Surfaced so operators see when a
+    /// configured pair goes unmeasured.
+    #[serde(rename = "cold_path_overflow_active", default,
+            skip_serializing_if = "crate::protocol::bool_is_false")]
+    pub cold_path_overflow_active: bool,
     /// Per-worker monotonic count of eligible cold-path sampling
     /// attempts (incremented on every session-miss pass). Used by the
     /// #1622 harness as the denominator for actual_sampling_rate =
@@ -182,6 +210,14 @@ pub(crate) struct HAGroupStatus {
 
 pub(crate) fn u64_is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+pub(crate) fn u32_is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+pub(crate) fn bool_is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

@@ -368,15 +368,15 @@ pub(crate) fn worker_loop(
                                     [slot][b]
                                     .saturating_add(src.buckets[slot][b]);
                             }
-                            // first_key + alias_seen cross-binding merge.
+                            // first_key + builder_collision cross-binding merge.
                             if merged.first_key[slot] == 0 {
                                 merged.first_key[slot] = src.first_key[slot];
                             } else if src.first_key[slot] != 0
                                 && src.first_key[slot] != merged.first_key[slot]
                             {
-                                merged.alias_seen[slot] = true;
+                                merged.builder_collision[slot] = true;
                             }
-                            merged.alias_seen[slot] |= src.alias_seen[slot];
+                            merged.builder_collision[slot] |= src.builder_collision[slot];
                         }
                     }
                     // All bindings on this worker share the same pinned
@@ -418,6 +418,45 @@ pub(crate) fn worker_loop(
             screen_state.update_profiles(new_forwarding.screen_profiles.clone());
             screen_state.update_syn_cookie_master_key(new_forwarding.syn_cookie_master_key);
             sessions.set_timeouts(new_forwarding.session_timeouts);
+
+            // #1635 (plan §2.4): a config apply may have reassigned
+            // cold-path histogram slots to new zone-pairs. Zero those
+            // slots in every binding's worker-local accumulator BEFORE
+            // any record_sample into the reused slot, so a reused slot
+            // never carries the previous zone-pair's counts.
+            //
+            // Copilot code-r2: derive the zero-set from THIS WORKER's
+            // OWN old map vs the new map, NOT from the coordinator's
+            // `slots_to_zero` list. A worker can skip intermediate
+            // ForwardingState generations (ArcSwap only ever delivers
+            // the latest), and the coordinator computes `slots_to_zero`
+            // relative to its immediately-previous map — so a slot
+            // reassigned in a skipped generation would be absent from
+            // the latest list (it now looks "retained"). Comparing the
+            // worker's actual old slot-map inverse against the new one
+            // is generation-independent: any slot whose mapping changed
+            // since the worker last observed it gets zeroed. The
+            // sibling atomics are overwritten at the next publish merge
+            // from the freshly-zeroed local accumulator.
+            {
+                let old_inverse = &forwarding.cold_path_slot_map.inverse;
+                let new_inverse = &new_forwarding.cold_path_slot_map.inverse;
+                for slot in 0..crate::afxdp::cold_path_hist::POLICY_COLD_PATH_ZONE_PAIR_SLOTS {
+                    let new_pair = new_inverse.get(slot).copied().flatten();
+                    // Zero when the slot now maps to a pair that differs
+                    // from what the worker last saw there. A freed slot
+                    // (new == None) keeps its stale local data harmlessly
+                    // — it is unmapped, never sampled, and gets zeroed
+                    // when next reassigned.
+                    if new_pair.is_some()
+                        && new_pair != old_inverse.get(slot).copied().flatten()
+                    {
+                        for binding in bindings.iter_mut() {
+                            binding.cold_path.zero_slot(slot);
+                        }
+                    }
+                }
+            }
 
             forwarding = new_forwarding;
             let purged_input_dscp = purge_sessions_for_input_dscp_filter_revalidation(

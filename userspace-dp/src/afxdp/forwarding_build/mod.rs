@@ -187,6 +187,21 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     // The Go side validates the mask (powers-of-two minus one, plus
     // explicit --enable-cold-path-1-in-1-sampling for mask=0).
     state.cold_path_sample_mask = snapshot.cold_path_sample_mask.unwrap_or(0xff);
+    // #1635: build the direct cold-path histogram slot map from the
+    // configured policy zone-pairs, reusing the previous map's slot
+    // assignments so retained pairs keep their accumulated histogram.
+    // The worker derives its own slot zero-out set by diffing the old
+    // and new map inverses at the ArcSwap point (Copilot code-r2:
+    // generation-independent, unlike a coordinator-computed list), so
+    // the build's `slots_to_zero` return is unused here — only the map
+    // is stored.
+    {
+        use crate::afxdp::cold_path_hist::ColdPathSlotMap;
+        let pairs = state.policy.configured_zone_pairs();
+        let prev_map = previous.map(|p| p.cold_path_slot_map.as_ref());
+        let (slot_map, _slots_to_zero) = ColdPathSlotMap::build(prev_map, &pairs);
+        state.cold_path_slot_map = std::sync::Arc::new(slot_map);
+    }
     // Build filter state from snapshot
     state.filter_state = crate::filter::parse_filter_state_with_three_color_preserving(
         &snapshot.filters,

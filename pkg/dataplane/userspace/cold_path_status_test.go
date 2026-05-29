@@ -26,11 +26,23 @@ func TestWorkerRuntimeStatus_DefaultOmitsAllColdPathFields(t *testing.T) {
 	}
 	body := string(payload)
 	coldKeys := []string{
+		// legacy dense v1 (retained read-only).
 		"cold_path_hist",
 		"cold_path_sum_ns",
 		"cold_path_samples",
 		"cold_path_first_key",
 		"cold_path_alias_seen",
+		// #1635 sparse v3.
+		"cold_path_layout_version",
+		"cold_path_active_slot_ids",
+		"cold_path_active_zone_from",
+		"cold_path_active_zone_to",
+		"cold_path_active_samples",
+		"cold_path_active_sum_ns",
+		"cold_path_active_buckets",
+		"cold_path_active_builder_collision",
+		"cold_path_overflow_active",
+		// shared scalars.
 		"cold_path_sample_phase",
 		"cold_path_wrapper_underflow_count",
 		"cold_path_ns_per_tsc_q32",
@@ -162,5 +174,83 @@ func TestWorkerRuntimeStatus_RustEmittedJSONDecodes(t *testing.T) {
 	}
 	if got.ColdPathHist[0][3] != 5 {
 		t.Errorf("hist[0][3]: want 5 got %d", got.ColdPathHist[0][3])
+	}
+}
+
+// #1635 (Copilot code-r3 finding 4): pin the sparse v3 wire contract on
+// the Go side. Decodes a hand-crafted JSON payload using the exact
+// field names the Rust serializer emits (userspace-dp/src/protocol/
+// binding.rs cold_path_active_* + cold_path_layout_version +
+// cold_path_overflow_active), then re-encodes and re-decodes to confirm
+// the Go struct tags round-trip. A wrong/missing tag here would silently
+// drop sparse cold-path data from the v3 Prometheus emitter.
+func TestWorkerRuntimeStatus_SparseV3FieldsDecodeFromRustWire(t *testing.T) {
+	// Field names MUST match the Rust serde renames exactly.
+	rustJSON := `{
+		"worker_id": 4,
+		"cold_path_layout_version": 3,
+		"cold_path_active_slot_ids": [0, 5],
+		"cold_path_active_zone_from": [1, 2],
+		"cold_path_active_zone_to": [3, 4],
+		"cold_path_active_samples": [142, 7],
+		"cold_path_active_sum_ns": [12345, 700],
+		"cold_path_active_buckets": [[0,0,0,0,0,1], [9]],
+		"cold_path_active_builder_collision": [false, true],
+		"cold_path_overflow_active": true,
+		"cold_path_clock_source": "tsc"
+	}`
+	var got WorkerRuntimeStatus
+	if err := json.Unmarshal([]byte(rustJSON), &got); err != nil {
+		t.Fatalf("decode Rust-shaped sparse v3 JSON: %v", err)
+	}
+	if got.ColdPathLayoutVersion != 3 {
+		t.Errorf("layout_version: want 3 got %d", got.ColdPathLayoutVersion)
+	}
+	if len(got.ColdPathActiveSlotIDs) != 2 || got.ColdPathActiveSlotIDs[1] != 5 {
+		t.Errorf("active_slot_ids decode mismatch: %v", got.ColdPathActiveSlotIDs)
+	}
+	if len(got.ColdPathActiveZoneFrom) != 2 || got.ColdPathActiveZoneFrom[0] != 1 {
+		t.Errorf("active_zone_from decode mismatch: %v", got.ColdPathActiveZoneFrom)
+	}
+	if got.ColdPathActiveZoneTo[1] != 4 {
+		t.Errorf("active_zone_to decode mismatch: %v", got.ColdPathActiveZoneTo)
+	}
+	if got.ColdPathActiveSamples[0] != 142 || got.ColdPathActiveSumNS[1] != 700 {
+		t.Errorf("active samples/sum_ns decode mismatch: %v / %v",
+			got.ColdPathActiveSamples, got.ColdPathActiveSumNS)
+	}
+	if len(got.ColdPathActiveBuckets) != 2 || got.ColdPathActiveBuckets[0][5] != 1 {
+		t.Errorf("active_buckets decode mismatch: %v", got.ColdPathActiveBuckets)
+	}
+	if !got.ColdPathActiveBuilderCollision[1] {
+		t.Errorf("active_builder_collision decode mismatch: %v", got.ColdPathActiveBuilderCollision)
+	}
+	if !got.ColdPathOverflowActive {
+		t.Errorf("overflow_active: want true")
+	}
+
+	// Re-encode and re-decode to confirm Go's own tags round-trip and
+	// keep the same wire names.
+	payload, err := json.Marshal(&got)
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+	for _, k := range []string{
+		"cold_path_layout_version", "cold_path_active_slot_ids",
+		"cold_path_active_zone_from", "cold_path_active_zone_to",
+		"cold_path_active_samples", "cold_path_active_sum_ns",
+		"cold_path_active_buckets", "cold_path_active_builder_collision",
+		"cold_path_overflow_active",
+	} {
+		if !strings.Contains(string(payload), k) {
+			t.Errorf("re-encoded payload missing wire key %q: %s", k, payload)
+		}
+	}
+	var back WorkerRuntimeStatus
+	if err := json.Unmarshal(payload, &back); err != nil {
+		t.Fatalf("re-decode: %v", err)
+	}
+	if back.ColdPathActiveZoneTo[1] != 4 || !back.ColdPathOverflowActive {
+		t.Errorf("round-trip lost data: %+v", back)
 	}
 }

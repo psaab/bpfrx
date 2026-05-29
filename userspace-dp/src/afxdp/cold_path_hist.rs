@@ -11,100 +11,310 @@
 //!   ~25-40 ns on the loss cluster. (Codex code-r1 finding 1 +
 //!   Copilot code-r1: the prior `sample_tsc()` alias was removed
 //!   to prevent foot-gun usage at the end of a window.)
-//! - `bucket_index_for_ns_24(ns)` — branchless 24-bucket select. Same
-//!   formula family as `bucket_index_for_ns` at `umem/mod.rs:244`;
-//!   only the upper clamp changes (`.min(23)` vs `.min(15)`). Codex
-//!   plan-r1 finding 3 pinned the exact formula.
-//! - `splitmix64(x) -> u64` and `zone_pair_slot(from, to)` — 16-slot
-//!   per-zone-pair hash. Pinned via `POLICY_COLD_PATH_ZONE_PAIR_SLOTS
-//!   == 16` const assertion.
+//! - `bucket_index_for_ns_48(ns)` — #1635 log-linear 48-bucket select:
+//!   32 linear 16-ns buckets over `[0, 512)` ns + 15 pow-2 buckets over
+//!   `[512, 2^24)` ns + 1 saturate bucket. Fixes the #1622 F1
+//!   bucket-0 resolution floor (a 5-10× p50 error at low rule counts).
+//! - `ColdPathSlotMap` + `lookup_slot(map, from, to)` — #1635 DIRECT
+//!   `(from_zone_id, to_zone_id) → slot` map (256 slots) built at
+//!   config apply. Replaces the splitmix64 16-slot hash that collided
+//!   at 88.2% with 8 active zone-pairs (#1622 F2).
 //!
-//! Slot collision detection lives at the harness side per plan §3.4
-//! (v3): the dataplane keeps a `first_key` + `alias_seen` pair per
-//! slot. The hot path records the first packed key seen, and flips
-//! `alias_seen = true` on any subsequent sample with a different
-//! key. The harness publication gate excludes slots with
-//! `alias_seen == true`. v1/v2 used `keys_xor` but Codex r2 proved
-//! a false-pass mode (count(K) odd + count(L) even leaves
-//! `keys_xor == K`), so v3 retires XOR for first_key + alias_seen.
+//! Each slot keeps a `first_key` + `builder_collision` pair (renamed
+//! from `alias_seen` per AGY r1 [1.6]). With the direct map a
+//! `builder_collision` should NEVER fire — it indicates the snapshot
+//! builder produced two distinct keys for one slot and is treated as a
+//! hard error in operator dashboards.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering, compiler_fence};
 
 /// Number of histogram buckets per zone-pair slot.
 ///
-/// Pinned at 24 — bucket 0 covers `[0, 1024)` ns, bucket 23 saturates
-/// at any `ns ≥ 2^32` ≈ 4.295 s.
-pub(in crate::afxdp) const POLICY_COLD_PATH_HIST_BUCKETS: usize = 24;
-const _: () = assert!(POLICY_COLD_PATH_HIST_BUCKETS == 24);
+/// #1635: pinned at 48 (was 24). The layout is log-linear:
+///   - 32 LINEAR buckets of 16-ns stride covering `[0, 512)` ns
+///     (bucket `b` covers `[b*16, (b+1)*16)` for `0 ≤ b ≤ 31`).
+///   - 15 EXPONENTIAL buckets covering `[512, 2^24)` ns
+///     (bucket `32+i` covers `[2^(9+i), 2^(10+i))` for `0 ≤ i ≤ 14`).
+///   - 1 SATURATE bucket (index 47) for `ns ≥ 2^24` (≈16.8 ms).
+///
+/// The linear band gives ~16-ns resolution in the operator-critical
+/// 50-150 ns range that the old pow-2-from-0 layout collapsed into a
+/// single 1024-ns bucket-0 (a 5-10× p50 reporting error). See #1622
+/// PLAN-KILL finding F1.
+pub(in crate::afxdp) const POLICY_COLD_PATH_HIST_BUCKETS: usize = 48;
+const _: () = assert!(POLICY_COLD_PATH_HIST_BUCKETS == 48);
+
+/// Number of LINEAR buckets at the low end (16-ns stride, `[0, 512)` ns).
+pub(in crate::afxdp) const COLD_PATH_LINEAR_BUCKETS: usize = 32;
+/// Linear-band stride in nanoseconds.
+pub(in crate::afxdp) const COLD_PATH_LINEAR_STRIDE_NS: u64 = 16;
+/// Pivot: first nanosecond value handled by the exponential band.
+pub(in crate::afxdp) const COLD_PATH_PIVOT_NS: u64 =
+    (COLD_PATH_LINEAR_BUCKETS as u64) * COLD_PATH_LINEAR_STRIDE_NS; // 512
+const _: () = assert!(COLD_PATH_PIVOT_NS == 512);
 
 /// Number of per-zone-pair slots in the histogram.
 ///
-/// Pinned at 16 (4-bit splitmix mask). The cluster's active zone-pair
-/// set may exceed 16, in which case the `first_key + alias_seen`
-/// collision detector triggers and the harness excludes aliased
-/// slots from publication (plan §3.4).
-pub(in crate::afxdp) const POLICY_COLD_PATH_ZONE_PAIR_SLOTS: usize = 16;
-const _: () = assert!(POLICY_COLD_PATH_ZONE_PAIR_SLOTS == 16);
-const _: () = assert!(POLICY_COLD_PATH_ZONE_PAIR_SLOTS.is_power_of_two());
+/// #1635: pinned at 256 (was 16). The slot map is now a DIRECT
+/// `(from_zone_id, to_zone_id) → slot` assignment built at config
+/// apply (see [`ColdPathSlotMap`]). 256 gives ~21× headroom over the
+/// largest known deployment; wire cost is bounded by SPARSE
+/// serialization (only slots with `samples > 0` ride the wire), so
+/// the static cap does not impose a per-scrape byte cost.
+pub(in crate::afxdp) const POLICY_COLD_PATH_ZONE_PAIR_SLOTS: usize = 256;
+const _: () = assert!(POLICY_COLD_PATH_ZONE_PAIR_SLOTS == 256);
 
-/// Slot index mask = `POLICY_COLD_PATH_ZONE_PAIR_SLOTS - 1`.
-pub(in crate::afxdp) const ZONE_PAIR_SLOT_MASK: u64 =
-    (POLICY_COLD_PATH_ZONE_PAIR_SLOTS - 1) as u64;
+/// Maximum number of ASSIGNABLE slots. `u8::MAX` (255) is reserved as
+/// the `flat_table` "unassigned" sentinel, so slot index 255 can never
+/// be handed out; the accumulator arrays are still 256 wide for
+/// alignment and to keep slot indices identity-mapped. Capacity is
+/// therefore 255 active zone-pairs (~21× the largest known deployment).
+pub(in crate::afxdp) const COLD_PATH_ASSIGNABLE_SLOTS: usize =
+    POLICY_COLD_PATH_ZONE_PAIR_SLOTS - 1;
+const _: () = assert!(COLD_PATH_ASSIGNABLE_SLOTS == 255);
 
-/// 24-bucket power-of-two ns histogram bucket selector. Branchless.
-///
-/// Same math family as `bucket_index_for_ns` at
-/// `userspace-dp/src/afxdp/umem/mod.rs:244`; only the upper clamp
-/// changes from 15 → 23. Bucket 0 covers `[0, 1024)` ns; bucket[i]
-/// for i ∈ [1, 22] covers `[2^(9+i), 2^(10+i))` ns; bucket 23
-/// saturates at any `ns ≥ 2^32` ≈ 4.295 s.
+/// Number of distinct zone-id values the direct slot-map lookup table
+/// indexes. MUST cover the full configurable zone space INCLUSIVELY:
+/// the Go compiler assigns sequential 1-based zone-ids and `MAX_ZONES`
+/// is 64 (`bpf/headers/xpf_common.h` + `pkg/dataplane/types.go
+/// MaxZones`), so the highest assignable id is 64. The table indexes
+/// ids `0..=64` = 65 rows/cols (Copilot code-r2: a ceiling of 64 used
+/// as an EXCLUSIVE bound dropped the valid 64th zone; Codex code-r1: a
+/// ceiling of 32 dropped 32-63). The index is a MULTIPLY
+/// (`from * 65 + to`), not a bit-shift, since 65 is not a power of two.
+/// Pairs with either id ≥ 65 (e.g. the `junos-global` `u16::MAX`
+/// sentinel) land in `None` — a defensive guard, not an expected case.
+pub(in crate::afxdp) const COLD_PATH_ZONE_DIM: usize = 65;
+const _: () = assert!(COLD_PATH_ZONE_DIM == 65);
+/// Flat lookup-table length = `DIM²` = 65×65 = 4225 bytes (L1d-resident).
+const COLD_PATH_FLAT_TABLE_LEN: usize = COLD_PATH_ZONE_DIM * COLD_PATH_ZONE_DIM;
+const _: () = assert!(COLD_PATH_FLAT_TABLE_LEN == 4225);
+
+/// Flat-table index for `(from, to)`; `None` if either id is out of
+/// range (≥ 65). `from * 65 + to` is injective over the in-range box.
 #[inline]
-pub(in crate::afxdp) fn bucket_index_for_ns_24(ns: u64) -> usize {
-    let clz = (ns | 1).leading_zeros() as i32;
-    let b = (54 - clz).max(0) as usize;
-    b.min(POLICY_COLD_PATH_HIST_BUCKETS - 1)
+fn cold_path_flat_index(from: u16, to: u16) -> Option<usize> {
+    let (from, to) = (from as usize, to as usize);
+    if from >= COLD_PATH_ZONE_DIM || to >= COLD_PATH_ZONE_DIM {
+        return None;
+    }
+    Some(from * COLD_PATH_ZONE_DIM + to)
 }
 
-/// 64-bit splitmix scrambler. Single-step variant used to hash a
-/// packed `(from_zone_id, to_zone_id)` key into a 4-bit slot index.
+/// Wire/layout version stamped into the status payload (#1635).
+pub(in crate::afxdp) const COLD_PATH_LAYOUT_VERSION: u32 = 3;
+
+/// 48-bucket log-linear ns histogram bucket selector.
 ///
-/// Same constants as the public splitmix64 (Steele/Vigna), one
-/// xor-shift-multiply round; sufficient avalanche for the 16-slot
-/// pigeonhole. NOT a cryptographic hash.
+/// #1635 (replaces `bucket_index_for_ns_24`):
+///   - `ns < 512`            → linear: `ns / 16` ∈ `[0, 32)`.
+///   - `512 ≤ ns < 2^24`     → exponential: `32 + (floor(log2(ns)) - 9)`
+///                             ∈ `[32, 47)`.
+///   - `ns ≥ 2^24`           → saturate: `47`.
+///
+/// Branchless within each band; one predicate selects the band.
 #[inline]
-pub(in crate::afxdp) fn splitmix64(x: u64) -> u64 {
-    let mut z = x.wrapping_add(0x9E3779B97F4A7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^ (z >> 31)
+pub(in crate::afxdp) fn bucket_index_for_ns_48(ns: u64) -> usize {
+    if ns < COLD_PATH_PIVOT_NS {
+        // Linear band: 16-ns stride, indices [0, 32).
+        (ns / COLD_PATH_LINEAR_STRIDE_NS) as usize
+    } else {
+        // Exponential band: floor(log2(ns)) ∈ [9, +) for ns ≥ 512.
+        // log2 = 63 - clz(ns); bucket = 32 + (log2 - 9).
+        let log2 = (63 - ns.leading_zeros()) as usize;
+        let b = COLD_PATH_LINEAR_BUCKETS + (log2 - 9);
+        b.min(POLICY_COLD_PATH_HIST_BUCKETS - 1)
+    }
 }
 
-/// Pack zone IDs into a u64 key suitable for hashing or comparison.
-///
-/// **Injective encoding** (Codex r3 finding 1): `+ 1` instead of `| 1`
-/// — `| 1` collapses adjacent `to_zone_id` values that share the same
-/// odd parity into the same key (e.g. `(1,2)` and `(1,3)` both become
-/// `65539` under `| 1`). The `+ 1` form preserves injectivity by
-/// shifting the entire 32-bit packed key range by +1, which keeps
-/// `(0, 0)` from collapsing to zero while keeping all other pairs
-/// distinct.
-///
-/// The non-zero invariant is needed so that `first_key[slot] == 0`
-/// remains a reliable "no sample yet" sentinel (plan §3.4).
+/// Inclusive upper boundary in nanoseconds for histogram bucket `idx`,
+/// for the Prometheus `le` label. Mirrors [`bucket_index_for_ns_48`]:
+///   - `idx < 32`        → `(idx + 1) * 16 - 1`  (15, 31, …, 511).
+///   - `32 ≤ idx ≤ 46`   → `2^(10 + idx - 32) - 1` (1023, 2047, …).
+///   - `idx ≥ 47`        → `u64::MAX` (rendered as `+Inf` on the wire).
+#[inline]
+pub(in crate::afxdp) fn bucket_upper_bound_ns_48(idx: usize) -> u64 {
+    if idx < COLD_PATH_LINEAR_BUCKETS {
+        (idx as u64 + 1) * COLD_PATH_LINEAR_STRIDE_NS - 1
+    } else if idx >= POLICY_COLD_PATH_HIST_BUCKETS - 1 {
+        u64::MAX
+    } else {
+        (1u64 << (10 + idx - COLD_PATH_LINEAR_BUCKETS)) - 1
+    }
+}
+
+/// Pack zone IDs into a u64 key suitable for the slot-map `first_key`
+/// collision sentinel. `+ 1` keeps `(0, 0)` from collapsing to the
+/// zero "no sample yet" sentinel while preserving injectivity over
+/// distinct `(u16, u16)` pairs (Codex r3 finding 1).
 #[inline]
 pub(in crate::afxdp) fn zone_pair_packed_key(from_zone_id: u16, to_zone_id: u16) -> u64 {
-    // (from << 16) | to fits in 32 bits and is injective over distinct
-    // (u16, u16) pairs. Adding 1 keeps zero free as the "no sample"
-    // sentinel without breaking injectivity.
     (((from_zone_id as u64) << 16) | (to_zone_id as u64)) + 1
 }
 
-/// Map a `(from_zone_id, to_zone_id)` pair to a slot index in
-/// `[0, POLICY_COLD_PATH_ZONE_PAIR_SLOTS)`.
+/// #1635: direct `(from_zone_id, to_zone_id) → slot` map built at
+/// config-apply time. Replaces the splitmix64 16-slot hash that
+/// collided at 88.2% with 8 active zone-pairs (birthday paradox), the
+/// F2 finding in the #1622 PLAN-KILL.
+///
+/// Lookup is a bounded 2D table indexed by `cold_path_flat_index`
+/// (`from * 65 + to`, ids `0..=64`; 65×65 = 4225 entries, L1d-resident).
+/// A miss (entry == `u8::MAX`) means the pair has no slot assigned
+/// (capacity exhausted or zone-id ≥ 65); the sample is dropped at the
+/// hot path.
+///
+/// `inverse[slot]` is the reverse map used by the status path to emit
+/// per-zone-pair labels for the sparse wire encoding.
+#[derive(Clone, Debug)]
+pub(in crate::afxdp) struct ColdPathSlotMap {
+    /// 65×65 flat table indexed by `from * 65 + to`. `u8::MAX` =
+    /// unassigned.
+    pub(in crate::afxdp) flat_table: Box<[u8; COLD_PATH_FLAT_TABLE_LEN]>,
+    /// `slot → Some((from, to))` for assigned slots, `None` for free.
+    pub(in crate::afxdp) inverse: Vec<Option<(u16, u16)>>,
+    /// True if some configured zone-pair could not be assigned a slot
+    /// because the 255-slot capacity was exhausted.
+    pub(in crate::afxdp) overflow_active: bool,
+}
+
+impl Default for ColdPathSlotMap {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl ColdPathSlotMap {
+    /// An empty map: every lookup misses.
+    pub(in crate::afxdp) fn empty() -> Self {
+        Self {
+            flat_table: Box::new([u8::MAX; COLD_PATH_FLAT_TABLE_LEN]),
+            inverse: vec![None; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+            overflow_active: false,
+        }
+    }
+
+    /// Build a direct slot map from a set of configured zone-pairs,
+    /// optionally reusing a previous map's slot assignments so retained
+    /// pairs keep their slot (and their accumulated histogram) across a
+    /// config apply.
+    ///
+    /// Returns the new map plus the list of slots that received a NEW
+    /// zone-pair (every Pass-2 assignment). The worker zeroes these
+    /// slots' accumulators before recording into them so a slot never
+    /// carries an EARLIER zone-pair's counts (plan §2.4 / F4).
+    ///
+    /// Codex code-r1 finding 1: zero-out MUST cover every newly-assigned
+    /// slot, not just slots the *immediately previous* map showed as
+    /// occupied. The worker-local accumulator can carry stale counts
+    /// from ANY earlier config generation (e.g. A assigns slot 0, B
+    /// frees it without reuse, C reassigns slot 0 — B's map shows slot 0
+    /// free, but the worker never cleared A's counts). Zeroing a
+    /// genuinely-fresh slot is a harmless no-op (it is already zero).
+    ///
+    /// `pairs` should be deduplicated and in a stable order (the caller
+    /// passes a `BTreeSet`-derived `Vec`) so slot assignment is
+    /// deterministic for a given config.
+    pub(in crate::afxdp) fn build(
+        previous: Option<&ColdPathSlotMap>,
+        pairs: &[(u16, u16)],
+    ) -> (Self, Vec<u8>) {
+        let mut flat_table = Box::new([u8::MAX; COLD_PATH_FLAT_TABLE_LEN]);
+        let mut inverse: Vec<Option<(u16, u16)>> =
+            vec![None; POLICY_COLD_PATH_ZONE_PAIR_SLOTS];
+        let mut used = [false; POLICY_COLD_PATH_ZONE_PAIR_SLOTS];
+        let mut slots_to_zero: Vec<u8> = Vec::new();
+        let mut overflow_active = false;
+
+        // Pass 1: retain slot assignments for pairs that survive from
+        // the previous map (so their accumulated histogram is kept).
+        let mut pending: Vec<(u16, u16)> = Vec::with_capacity(pairs.len());
+        for &(from, to) in pairs {
+            let Some(idx) = cold_path_flat_index(from, to) else {
+                // Unrepresentable in the 65×65 table (zone-id ≥ 65). The
+                // Go compiler assigns 1-based ids up to MaxZones=64, but
+                // the Rust snapshot path accepts ids up to u8::MAX (255)
+                // — so a deployment (or non-Go producer) with an id in
+                // 65..=255 lands here. Surface it via `overflow_active`
+                // rather than silently dropping the pair, so operators
+                // see that a configured zone-pair was not measured
+                // (Copilot code-r4 finding).
+                overflow_active = true;
+                continue;
+            };
+            let retained = previous.and_then(|p| {
+                let s = p.flat_table[idx];
+                if s != u8::MAX && p.inverse[s as usize] == Some((from, to)) {
+                    Some(s)
+                } else {
+                    None
+                }
+            });
+            match retained {
+                Some(s) => {
+                    used[s as usize] = true;
+                    inverse[s as usize] = Some((from, to));
+                    flat_table[idx] = s;
+                }
+                None => pending.push((from, to)),
+            }
+        }
+
+        // Pass 2: assign the lowest free slot to each new pair. EVERY
+        // newly-assigned slot is queued for zero-out (Codex finding 1) —
+        // the worker-local accumulator may carry stale counts from an
+        // earlier generation regardless of what `previous` shows.
+        let mut next_free = 0usize;
+        for &(from, to) in &pending {
+            while next_free < COLD_PATH_ASSIGNABLE_SLOTS && used[next_free] {
+                next_free += 1;
+            }
+            if next_free >= COLD_PATH_ASSIGNABLE_SLOTS {
+                overflow_active = true;
+                break;
+            }
+            let s = next_free;
+            used[s] = true;
+            inverse[s] = Some((from, to));
+            // `from`/`to` are in-range here (only in-range pairs reach
+            // `pending`), so the index is always Some.
+            if let Some(idx) = cold_path_flat_index(from, to) {
+                flat_table[idx] = s as u8;
+            }
+            // Queue zero-out for every newly-assigned slot when a
+            // PREVIOUS map existed — the worker may have accumulated
+            // counts for an earlier pair in this slot during any prior
+            // generation (Codex finding 1). On the very first build
+            // (previous == None) the worker's accumulators are still
+            // default-zero, so no zero-out is needed.
+            if previous.is_some() {
+                slots_to_zero.push(s as u8);
+            }
+        }
+
+        (
+            Self {
+                flat_table,
+                inverse,
+                overflow_active,
+            },
+            slots_to_zero,
+        )
+    }
+}
+
+/// Look up the slot for `(from, to)` in the direct map. Returns `None`
+/// for unmapped pairs (capacity exhausted) or zone-ids ≥ 65. Hot-path
+/// cost: one bound check, one multiply-add, one L1d-resident array
+/// index, one `!= u8::MAX` predicate.
 #[inline]
-pub(in crate::afxdp) fn zone_pair_slot(from_zone_id: u16, to_zone_id: u16) -> usize {
-    let key = zone_pair_packed_key(from_zone_id, to_zone_id);
-    (splitmix64(key) & ZONE_PAIR_SLOT_MASK) as usize
+pub(in crate::afxdp) fn lookup_slot(map: &ColdPathSlotMap, from: u16, to: u16) -> Option<u8> {
+    let idx = cold_path_flat_index(from, to)?;
+    let entry = map.flat_table[idx];
+    if entry == u8::MAX {
+        None
+    } else {
+        Some(entry)
+    }
 }
 
 /// Read the TSC at the **start** of a measurement window via
@@ -446,13 +656,13 @@ pub(in crate::afxdp) struct WorkerColdPathAtomics {
     /// Calibration: set once at worker startup. Outside the per-tick seqlock.
     pub(in crate::afxdp) clock_source: AtomicU8,
     // === COLD FIELDS (written by publish_from_local) ===
-    /// v3: set true if any sample's packed key differs from
-    /// `first_key`. Once set, stays set for the window. The harness
-    /// publication gate excludes slots with `alias_seen = true`
-    /// from Tables A1/A2 per plan §3.4 (Codex r2 finding 3).
-    pub(in crate::afxdp) alias_seen: [AtomicBool; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    /// v3: first packed zone-pair key seen in this slot during the
-    /// current publish window. Zero = no sample yet.
+    /// #1635 (renamed from `alias_seen`): set true if a sample's packed
+    /// key differs from the slot's `first_key`. With the direct slot
+    /// map this should NEVER fire; a set bit means the snapshot builder
+    /// mapped two distinct zone-pairs to one slot (AGY r1 [1.6]).
+    pub(in crate::afxdp) builder_collision: [AtomicBool; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+    /// First packed zone-pair key seen in this slot during the current
+    /// publish window. Zero = no sample yet.
     pub(in crate::afxdp) first_key: [AtomicU64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
     pub(in crate::afxdp) sum_ns: [AtomicU64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
     pub(in crate::afxdp) samples: [AtomicU64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
@@ -476,7 +686,7 @@ impl WorkerColdPathAtomics {
             wrapper_ns_baseline: AtomicU64::new(0),
             wrapper_underflow_count: AtomicU64::new(0),
             clock_source: AtomicU8::new(ClockSource::Unset.as_u8()),
-            alias_seen: std::array::from_fn(|_| AtomicBool::new(false)),
+            builder_collision: std::array::from_fn(|_| AtomicBool::new(false)),
             first_key: std::array::from_fn(|_| AtomicU64::new(0)),
             sum_ns: std::array::from_fn(|_| AtomicU64::new(0)),
             samples: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -527,7 +737,8 @@ impl WorkerColdPathAtomics {
             self.sum_ns[slot].store(local.sum_ns[slot], Ordering::Relaxed);
             self.samples[slot].store(local.samples[slot], Ordering::Relaxed);
             self.first_key[slot].store(local.first_key[slot], Ordering::Relaxed);
-            self.alias_seen[slot].store(local.alias_seen[slot], Ordering::Relaxed);
+            self.builder_collision[slot]
+                .store(local.builder_collision[slot], Ordering::Relaxed);
         }
         // 3. Bump gen odd → even with Release.
         self.cold_window_gen.fetch_add(1, Ordering::Release);
@@ -547,13 +758,14 @@ impl WorkerColdPathAtomics {
     /// from a legitimately-empty worker, masking retry-starvation
     /// regimes under heavy publish contention.
     ///
-    /// AGY code-r2 finding 2 (continued): the retry budget is now 128
-    /// (up from 16) with an exponential `std::hint::spin_loop` backoff.
-    /// For a 448-field payload at ~5 ns per Relaxed load, one publish
-    /// cycle takes ~2.2 µs; 128 retries × spin_loop give the writer
-    /// ~10-50 µs to publish before the reader gives up.
+    /// AGY code-r2 finding 2 (continued): the retry budget is now 8192
+    /// with an exponential `std::hint::spin_loop` backoff. #1635 grew
+    /// the payload from the old 16×24 dense surface to 256 slots × 48
+    /// buckets, so one publish now writes ~13k atomics instead of ~450.
+    /// The larger budget keeps status-path snapshots coherent under a
+    /// concurrent publish without changing the hot path.
     pub(in crate::afxdp) fn snapshot(&self) -> Option<WorkerColdPathCounters> {
-        const RETRY_BUDGET: u32 = 128;
+        const RETRY_BUDGET: u32 = 8192;
         for attempt in 0..RETRY_BUDGET {
             let s1 = self.cold_window_gen.load(Ordering::Acquire);
             if s1 & 1 != 0 {
@@ -580,7 +792,8 @@ impl WorkerColdPathAtomics {
                 out.sum_ns[slot] = self.sum_ns[slot].load(Ordering::Relaxed);
                 out.samples[slot] = self.samples[slot].load(Ordering::Relaxed);
                 out.first_key[slot] = self.first_key[slot].load(Ordering::Relaxed);
-                out.alias_seen[slot] = self.alias_seen[slot].load(Ordering::Relaxed);
+                out.builder_collision[slot] =
+                    self.builder_collision[slot].load(Ordering::Relaxed);
             }
             // Seal Relaxed loads before s2 re-check.
             std::sync::atomic::fence(Ordering::Acquire);
@@ -612,6 +825,24 @@ impl WorkerColdPathAtomics {
     pub(in crate::afxdp) fn snapshot_failed_count(&self) -> u64 {
         self.snapshot_failed.load(Ordering::Relaxed)
     }
+
+    /// #1635 (plan §2.4): atomically zero one slot's accumulator
+    /// fields. Called by the owning worker on its next tick after a
+    /// config apply reassigns the slot to a new zone-pair, so the
+    /// reused slot never carries the previous pair's counts. Stores are
+    /// Relaxed under the same single-writer discipline as
+    /// `publish_from_local`; the caller runs this inside the worker's
+    /// publish path so the seqlock brackets it.
+    pub(in crate::afxdp) fn zero_slot(&self, idx: usize) {
+        debug_assert!(idx < POLICY_COLD_PATH_ZONE_PAIR_SLOTS);
+        for b in 0..POLICY_COLD_PATH_HIST_BUCKETS {
+            self.buckets[idx][b].store(0, Ordering::Relaxed);
+        }
+        self.sum_ns[idx].store(0, Ordering::Relaxed);
+        self.samples[idx].store(0, Ordering::Relaxed);
+        self.first_key[idx].store(0, Ordering::Relaxed);
+        self.builder_collision[idx].store(false, Ordering::Relaxed);
+    }
 }
 
 /// Worker-local mutable cold-path counters. Touched only by the
@@ -627,20 +858,20 @@ impl WorkerColdPathAtomics {
 /// default `#[repr(Rust)]` is free to reorder fields to optimize
 /// packing, which would destroy the hot-cacheline isolation.
 ///
-/// Verified layout (AGY r2 axis 2 + Claude SMR r3 cross-check):
+/// Verified layout (AGY r2 axis 2 + Claude SMR r3 cross-check; offsets
+/// re-derived for the #1635 256-slot / 48-bucket sizes):
 ///   [0..7]      sample_phase
 ///   [8..15]     ns_per_tsc_q32
 ///   [16..23]    wrapper_ns_baseline
 ///   [24..31]    wrapper_underflow_count
 ///   [32]        clock_source (enum #[repr(u8)])
-///   [33..48]    alias_seen   [bool; 16] (alignment 1, no padding)
-///   [49..55]    PADDING                  (to align next u64 array)
-///   [56..183]   first_key    [u64; 16]
-///   [184..311]  sum_ns       [u64; 16]
-///   [312..439]  samples      [u64; 16]
-///   [440..3511] buckets      [[u64; 24]; 16]
+///   [33..288]   builder_collision [bool; 256] (alignment 1, no padding)
+///   [288..295]  PADDING                       (to align next u64 array)
+///   first_key / sum_ns / samples / buckets follow as [_; 256] arrays.
 ///
-/// First 49 bytes fit in cacheline 0 ([0..63]).
+/// The hot-path read set (sample_phase, ns_per_tsc_q32,
+/// wrapper_ns_baseline, clock_source) still lands in cacheline 0
+/// ([0..63]); the cold per-slot arrays start at offset 33.
 #[repr(C)]
 #[derive(Clone, Debug)]
 pub(in crate::afxdp) struct WorkerColdPathCounters {
@@ -664,11 +895,12 @@ pub(in crate::afxdp) struct WorkerColdPathCounters {
     /// Per-worker clock source set once at startup.
     pub(in crate::afxdp) clock_source: ClockSource,
     // === COLD FIELDS (written only when sample fires) ===
-    /// v3 alias detector: monotonic per-slot flag set when a sample
-    /// arrives with a key different from `first_key`. Once true,
-    /// stays true for the publish window.
-    pub(in crate::afxdp) alias_seen: [bool; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
-    /// v3 alias detector: first packed zone-pair key per slot (0 = none).
+    /// #1635 (renamed from `alias_seen`): per-slot flag set when a
+    /// sample arrives with a key different from `first_key`. With the
+    /// direct slot map this is a builder-bug signal, not an aliasing
+    /// gate. Once true, stays true for the publish window.
+    pub(in crate::afxdp) builder_collision: [bool; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+    /// First packed zone-pair key per slot (0 = none).
     pub(in crate::afxdp) first_key: [u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
     pub(in crate::afxdp) sum_ns: [u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
     pub(in crate::afxdp) samples: [u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
@@ -684,7 +916,7 @@ impl Default for WorkerColdPathCounters {
             wrapper_ns_baseline: 0,
             wrapper_underflow_count: 0,
             clock_source: ClockSource::Unset,
-            alias_seen: [false; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
+            builder_collision: [false; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
             first_key: [0u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
             sum_ns: [0u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
             samples: [0u64; POLICY_COLD_PATH_ZONE_PAIR_SLOTS],
@@ -694,31 +926,49 @@ impl Default for WorkerColdPathCounters {
 }
 
 impl WorkerColdPathCounters {
-    /// Hot-path-friendly sample record. Inlined to keep the call site
-    /// in `poll_descriptor/mod.rs` cheap. NOT branchless — but the
-    /// caller already gated on `sample_tag` so this fn is only invoked
-    /// at the sampling rate (1-in-256 unbounded; 1-in-1 bounded).
+    /// #1635 hot-path sample record. The caller resolves `slot` via
+    /// [`lookup_slot`] against the per-config `ColdPathSlotMap` and
+    /// skips the call entirely on a miss, so this fn never needs to
+    /// hash. `from_zone_id` / `to_zone_id` are still passed so the
+    /// `first_key` / `builder_collision` invariant can detect a builder
+    /// bug (two distinct pairs mapped to one slot). Inlined; only
+    /// invoked at the sampling rate.
     #[inline]
     pub(in crate::afxdp) fn record_sample(
         &mut self,
+        slot: u8,
         from_zone_id: u16,
         to_zone_id: u16,
         delta_ns: u64,
     ) {
-        let slot = zone_pair_slot(from_zone_id, to_zone_id);
-        let bucket = bucket_index_for_ns_24(delta_ns);
+        let slot = slot as usize;
+        debug_assert!(slot < POLICY_COLD_PATH_ZONE_PAIR_SLOTS);
+        let bucket = bucket_index_for_ns_48(delta_ns);
         self.buckets[slot][bucket] = self.buckets[slot][bucket].saturating_add(1);
         self.sum_ns[slot] = self.sum_ns[slot].saturating_add(delta_ns);
         self.samples[slot] = self.samples[slot].saturating_add(1);
-        // v3 alias detector: first_key + alias_seen (Codex r2 finding 3
-        // retired the v1/v2 XOR-rolling design which false-passes on
-        // count(K) odd + count(L) even).
+        // builder_collision invariant: with the direct slot map every
+        // sample in a slot MUST carry the same packed key. A mismatch
+        // means the snapshot builder mapped two pairs to one slot.
         let key = zone_pair_packed_key(from_zone_id, to_zone_id);
         if self.first_key[slot] == 0 {
             self.first_key[slot] = key;
         } else if self.first_key[slot] != key {
-            self.alias_seen[slot] = true;
+            self.builder_collision[slot] = true;
         }
+    }
+
+    /// #1635 (plan §2.4): zero one slot's local accumulator. Called by
+    /// the owning worker when a config apply reassigns the slot, before
+    /// the first `record_sample` into the new zone-pair.
+    #[inline]
+    pub(in crate::afxdp) fn zero_slot(&mut self, slot: usize) {
+        debug_assert!(slot < POLICY_COLD_PATH_ZONE_PAIR_SLOTS);
+        self.buckets[slot] = [0u64; POLICY_COLD_PATH_HIST_BUCKETS];
+        self.sum_ns[slot] = 0;
+        self.samples[slot] = 0;
+        self.first_key[slot] = 0;
+        self.builder_collision[slot] = false;
     }
 }
 
@@ -733,7 +983,7 @@ mod tests {
     // + AXIS-6 diagnostic (wrapper_underflow_count).
     #[test]
     fn worker_cold_path_counters_hot_fields_fit_in_cacheline_0() {
-        use std::mem::{offset_of, size_of};
+        use std::mem::offset_of;
         // Hot fields declared first; ClockSource is #[repr(u8)] so
         // its size is 1 byte and the offset math is deterministic.
         assert_eq!(offset_of!(WorkerColdPathCounters, sample_phase), 0);
@@ -741,12 +991,12 @@ mod tests {
         assert_eq!(offset_of!(WorkerColdPathCounters, wrapper_ns_baseline), 16);
         assert_eq!(offset_of!(WorkerColdPathCounters, wrapper_underflow_count), 24);
         assert_eq!(offset_of!(WorkerColdPathCounters, clock_source), 32);
-        // alias_seen [bool; 16] alignment 1: lives at [33..48], no padding.
-        assert_eq!(offset_of!(WorkerColdPathCounters, alias_seen), 33);
-        // first_key [u64; 16] alignment 8: padding to align at 56.
-        assert_eq!(offset_of!(WorkerColdPathCounters, first_key), 56);
-        // All hot reads land in cacheline 0 ([0..63]).
-        assert!(size_of::<WorkerColdPathCounters>() >= 432);
+        // #1635: builder_collision [bool; 256] alignment 1: lives at
+        // [33..289], no padding. All hot reads (sample_phase ..
+        // clock_source) still land in cacheline 0 ([0..63]).
+        assert_eq!(offset_of!(WorkerColdPathCounters, builder_collision), 33);
+        // first_key [u64; 256] alignment 8: padded from 33+256=289 to 296.
+        assert_eq!(offset_of!(WorkerColdPathCounters, first_key), 296);
     }
 
     #[test]
@@ -781,79 +1031,329 @@ mod tests {
         assert_eq!(snap.wrapper_underflow_count, 7);
     }
 
+    // === #1635 log-linear 48-bucket layout ===
+
     #[test]
-    fn bucket_zero_covers_sub_1024_ns() {
-        for ns in [0u64, 1, 100, 500, 1000, 1023] {
-            assert_eq!(bucket_index_for_ns_24(ns), 0, "ns={ns}");
+    fn bucket_index_for_ns_48_linear_band() {
+        // Linear band: 16-ns stride, indices [0, 32).
+        assert_eq!(bucket_index_for_ns_48(0), 0);
+        assert_eq!(bucket_index_for_ns_48(15), 0);
+        assert_eq!(bucket_index_for_ns_48(16), 1);
+        assert_eq!(bucket_index_for_ns_48(31), 1);
+        assert_eq!(bucket_index_for_ns_48(100), 6); // 100/16 = 6
+        assert_eq!(bucket_index_for_ns_48(496), 31);
+        assert_eq!(bucket_index_for_ns_48(511), 31);
+    }
+
+    #[test]
+    fn bucket_index_for_ns_48_pivots_at_512() {
+        assert_eq!(bucket_index_for_ns_48(511), 31, "last linear bucket");
+        assert_eq!(bucket_index_for_ns_48(512), 32, "first exponential bucket");
+    }
+
+    #[test]
+    fn bucket_index_for_ns_48_exponential_band() {
+        // bucket 32 covers [512, 1024); 33 covers [1024, 2048); ...
+        assert_eq!(bucket_index_for_ns_48(512), 32);
+        assert_eq!(bucket_index_for_ns_48(1023), 32);
+        assert_eq!(bucket_index_for_ns_48(1024), 33);
+        assert_eq!(bucket_index_for_ns_48(2047), 33);
+        assert_eq!(bucket_index_for_ns_48(2048), 34);
+        // i=14 → bucket 46 covers [2^23, 2^24).
+        assert_eq!(bucket_index_for_ns_48(1u64 << 23), 46);
+        assert_eq!(bucket_index_for_ns_48((1u64 << 24) - 1), 46);
+    }
+
+    #[test]
+    fn bucket_index_for_ns_48_saturates() {
+        // ns ≥ 2^24 lands in bucket 47.
+        assert_eq!(bucket_index_for_ns_48(1u64 << 24), 47);
+        assert_eq!(bucket_index_for_ns_48(1u64 << 33), 47);
+        assert_eq!(bucket_index_for_ns_48(u64::MAX), 47);
+    }
+
+    #[test]
+    fn bucket_upper_bound_ns_48_matches_layout() {
+        // Linear band inclusive upper boundaries.
+        assert_eq!(bucket_upper_bound_ns_48(0), 15);
+        assert_eq!(bucket_upper_bound_ns_48(1), 31);
+        assert_eq!(bucket_upper_bound_ns_48(31), 511);
+        // Exponential band.
+        assert_eq!(bucket_upper_bound_ns_48(32), 1023);
+        assert_eq!(bucket_upper_bound_ns_48(33), 2047);
+        assert_eq!(bucket_upper_bound_ns_48(46), (1u64 << 24) - 1);
+        // Saturate bucket.
+        assert_eq!(bucket_upper_bound_ns_48(47), u64::MAX);
+    }
+
+    /// Consumer criterion (#1622 F1 / plan §X): a 10-rule cold-path
+    /// distribution centered at ~50-150 ns must read back a p50 within
+    /// 2× of truth, NOT collapsed to the old bucket-0 512-ns midpoint.
+    /// This test FAILS on the old 24-bucket pow-2-from-0 layout (which
+    /// puts all of [0,1024) ns into one bucket whose midpoint is 512)
+    /// and PASSES on the new log-linear layout.
+    #[test]
+    fn bucket_layout_resolves_low_end_within_2x() {
+        // For each true latency, the bucket's INCLUSIVE upper bound is
+        // the worst-case reported value for a histogram_quantile read
+        // landing in that bucket. Assert it is within 2× of truth (and
+        // that the lower edge is ≥ truth/2), i.e. relative error ≤ 1.0.
+        for truth in [50u64, 75, 100, 125, 150, 1000, 5000, 50000] {
+            let idx = bucket_index_for_ns_48(truth);
+            let upper = bucket_upper_bound_ns_48(idx);
+            let lower = if idx == 0 {
+                0
+            } else {
+                bucket_upper_bound_ns_48(idx - 1) + 1
+            };
+            // Reported value (bucket boundary) within 2× of truth.
+            assert!(
+                upper <= truth.saturating_mul(2),
+                "truth={truth} upper={upper} exceeds 2x (idx={idx})"
+            );
+            assert!(
+                lower <= truth,
+                "truth={truth} lower={lower} above truth (idx={idx})"
+            );
         }
     }
 
+    /// Adversarial demonstration that the OLD pow-2-from-0 layout
+    /// FAILS the consumer criterion the new layout passes: a true
+    /// 100 ns p50 reads as 1023 ns (>10× error) under the old bucket-0.
     #[test]
-    fn bucket_one_starts_at_1024_ns() {
-        assert_eq!(bucket_index_for_ns_24(1024), 1);
-        assert_eq!(bucket_index_for_ns_24(2047), 1);
-    }
-
-    #[test]
-    fn bucket_two_starts_at_2048_ns() {
-        assert_eq!(bucket_index_for_ns_24(2048), 2);
-        assert_eq!(bucket_index_for_ns_24(4095), 2);
-    }
-
-    #[test]
-    fn bucket_23_saturates_at_2_pow_32_ns() {
-        // Lower edge of bucket 23 is 2^(9+23) = 2^32.
-        assert_eq!(bucket_index_for_ns_24(1u64 << 32), 23);
-        // Upper saturation: anything ≥ 2^32 lands in bucket 23.
-        assert_eq!(bucket_index_for_ns_24(u64::MAX), 23);
-        assert_eq!(bucket_index_for_ns_24(1u64 << 33), 23);
-        assert_eq!(bucket_index_for_ns_24(1u64 << 40), 23);
-    }
-
-    #[test]
-    fn bucket_22_lower_edge_is_2_pow_31_ns() {
-        assert_eq!(bucket_index_for_ns_24(1u64 << 31), 22);
-        assert_eq!(bucket_index_for_ns_24((1u64 << 32) - 1), 22);
-    }
-
-    #[test]
-    fn bucket_formula_matches_existing_16_bucket_below_saturation() {
-        // Sanity: for ns up to 2^23, the 24-bucket formula matches the
-        // 16-bucket bucket_index_for_ns (which clamps at 15). The 16-
-        // bucket fn lives in umem; we re-implement the math here only
-        // to verify equivalence in the shared subrange.
-        for power in 10..=23u32 {
-            let ns = 1u64 << power;
-            let b24 = bucket_index_for_ns_24(ns);
+    fn old_pow2_layout_would_fail_low_end_resolution() {
+        // Re-implement the retired 24-bucket formula inline to prove
+        // the regression it caused.
+        fn old_bucket_index_for_ns_24(ns: u64) -> usize {
             let clz = (ns | 1).leading_zeros() as i32;
-            let b16 = ((54 - clz).max(0) as usize).min(15);
-            // The two formulas agree until the 16-bucket fn clamps.
-            let expected_unclamped = ((54 - clz).max(0) as usize).min(23);
-            assert_eq!(b24, expected_unclamped, "ns=2^{power}");
-            if expected_unclamped < 16 {
-                assert_eq!(b16, b24);
+            let b = (54 - clz).max(0) as usize;
+            b.min(23)
+        }
+        // 50, 100, 150 ns all collapse into old bucket 0 = [0, 1024).
+        assert_eq!(old_bucket_index_for_ns_24(50), 0);
+        assert_eq!(old_bucket_index_for_ns_24(100), 0);
+        assert_eq!(old_bucket_index_for_ns_24(150), 0);
+        // Old bucket-0 upper bound is 1023 ns ⇒ a true 100 ns p50
+        // reads up to 1023 ns: > 10× error. The new layout keeps it
+        // ≤ 2× (covered by bucket_layout_resolves_low_end_within_2x).
+        let old_upper = 1023u64;
+        assert!(old_upper > 100 * 2, "old layout error must exceed 2x");
+        // New layout: 100 ns → bucket 6 → upper 111 ns ⇒ 1.11×.
+        assert_eq!(bucket_index_for_ns_48(100), 6);
+        assert_eq!(bucket_upper_bound_ns_48(6), 111);
+    }
+
+    // === #1635 direct slot map ===
+
+    #[test]
+    fn direct_slot_map_assigns_sequential() {
+        let pairs = [(1u16, 2u16), (3, 4), (5, 6), (7, 8), (9, 10)];
+        let (map, zeroed) = ColdPathSlotMap::build(None, &pairs);
+        assert!(zeroed.is_empty(), "fresh build zeroes nothing");
+        // Sorted/dedup input ⇒ slots assigned 0..5 in pair order.
+        for (i, &(from, to)) in pairs.iter().enumerate() {
+            assert_eq!(lookup_slot(&map, from, to), Some(i as u8), "pair {from}->{to}");
+            assert_eq!(map.inverse[i], Some((from, to)));
+        }
+        assert!(!map.overflow_active);
+    }
+
+    #[test]
+    fn direct_slot_map_no_collisions_at_capacity() {
+        // 255 distinct in-range pairs ⇒ unique slots [0,255), no
+        // overflow. (Slot 255 is reserved as the u8::MAX sentinel.)
+        let mut pairs = Vec::new();
+        'outer: for from in 0u16..8 {
+            for to in 0u16..32 {
+                pairs.push((from, to));
+                if pairs.len() == COLD_PATH_ASSIGNABLE_SLOTS {
+                    break 'outer;
+                }
             }
         }
+        assert_eq!(pairs.len(), 255);
+        let (map, _) = ColdPathSlotMap::build(None, &pairs);
+        assert!(!map.overflow_active);
+        let mut seen = std::collections::HashSet::new();
+        for &(from, to) in &pairs {
+            let s = lookup_slot(&map, from, to).expect("all 255 pairs assigned");
+            assert!(s != u8::MAX, "slot 255 sentinel must never be handed out");
+            assert!(seen.insert(s), "slot {s} assigned twice");
+        }
+        assert_eq!(seen.len(), 255);
     }
 
     #[test]
-    fn splitmix64_avalanche_low_bits_distributes_zone_id_diagonal() {
-        // Copilot code-r3: prior test comment claimed 'should produce
-        // 16 distinct slots' which contradicted the actual >= 8
-        // assertion. Birthday-paradox on 16 uniform throws into 16
-        // bins gives ~10 distinct bins in expectation, never close
-        // to 16. The assertion is a statistical sanity check that
-        // splitmix is roughly uniform; the harness collision detector
-        // (first_key + alias_seen) handles aliasing semantics.
-        let mut slots = std::collections::HashSet::new();
-        for i in 0..16u16 {
-            let s = zone_pair_slot(i, i);
-            slots.insert(s);
+    fn direct_slot_map_overflow_past_capacity() {
+        // 256 in-range pairs: one more than the 255 assignable slots.
+        let mut pairs = Vec::new();
+        'outer: for from in 0u16..16 {
+            for to in 0u16..17 {
+                pairs.push((from, to));
+                if pairs.len() == 256 {
+                    break 'outer;
+                }
+            }
         }
+        assert_eq!(pairs.len(), 256);
+        let (map, _) = ColdPathSlotMap::build(None, &pairs);
         assert!(
-            slots.len() >= 8,
-            "splitmix avalanche too tight: only {} distinct slots out of 16 throws into 16 bins (slots={slots:?})",
-            slots.len()
+            map.overflow_active,
+            "the 256th pair must overflow the 255-slot capacity"
+        );
+        // Exactly 255 slots occupied.
+        let occupied = map.inverse.iter().filter(|s| s.is_some()).count();
+        assert_eq!(occupied, 255);
+    }
+
+    #[test]
+    fn direct_slot_map_immediate_reuse_after_removal_zeros_atomics() {
+        // Build A with {(1,2),(3,4)}; record into both.
+        let pairs_a = [(1u16, 2u16), (3, 4)];
+        let (map_a, _) = ColdPathSlotMap::build(None, &pairs_a);
+        let slot_34 = lookup_slot(&map_a, 3, 4).unwrap();
+        // Build B with {(1,2),(5,6)} — drop (3,4), add (5,6).
+        let pairs_b = [(1u16, 2u16), (5, 6)];
+        let (map_b, zeroed) = ColdPathSlotMap::build(Some(&map_a), &pairs_b);
+        // (1,2) retains its slot; (5,6) takes the freed (3,4) slot.
+        assert_eq!(lookup_slot(&map_b, 1, 2), lookup_slot(&map_a, 1, 2));
+        let slot_56 = lookup_slot(&map_b, 5, 6).unwrap();
+        assert_eq!(slot_56, slot_34, "reused freed slot");
+        assert_eq!(lookup_slot(&map_b, 3, 4), None, "(3,4) no longer mapped");
+        // The reused slot is queued for zero-out.
+        assert!(zeroed.contains(&slot_56), "reused slot must be zeroed");
+
+        // Verify zero_slot actually clears local + atomic accumulators.
+        let mut local = WorkerColdPathCounters::default();
+        local.record_sample(slot_34, 3, 4, 5000);
+        assert_eq!(local.samples[slot_34 as usize], 1);
+        local.zero_slot(slot_34 as usize);
+        assert_eq!(local.samples[slot_34 as usize], 0);
+        assert_eq!(local.sum_ns[slot_34 as usize], 0);
+        assert_eq!(local.first_key[slot_34 as usize], 0);
+
+        let atomics = WorkerColdPathAtomics::new();
+        let mut l2 = WorkerColdPathCounters::default();
+        l2.record_sample(slot_34, 3, 4, 5000);
+        atomics.publish_from_local(&l2);
+        atomics.zero_slot(slot_34 as usize);
+        let snap = atomics.snapshot().expect("snapshot");
+        assert_eq!(snap.samples[slot_34 as usize], 0);
+    }
+
+    #[test]
+    fn direct_slot_map_retains_assignment_for_surviving_pairs() {
+        let pairs_a = [(1u16, 2u16), (3, 4), (5, 6)];
+        let (map_a, _) = ColdPathSlotMap::build(None, &pairs_a);
+        // Add a new pair; all original pairs survive.
+        let pairs_b = [(1u16, 2u16), (3, 4), (5, 6), (7, 8)];
+        let (map_b, zeroed) = ColdPathSlotMap::build(Some(&map_a), &pairs_b);
+        for &(from, to) in &pairs_a {
+            assert_eq!(
+                lookup_slot(&map_b, from, to),
+                lookup_slot(&map_a, from, to),
+                "surviving pair {from}->{to} kept its slot"
+            );
+            // Retained pairs must NOT be zeroed (keep their histogram).
+            let s = lookup_slot(&map_b, from, to).unwrap();
+            assert!(
+                !zeroed.contains(&s),
+                "retained pair {from}->{to} (slot {s}) must NOT be zeroed"
+            );
+        }
+        // (7,8) is a NEW pair ⇒ its slot IS queued for zero-out (every
+        // newly-assigned slot is zeroed per Codex finding 1).
+        let slot_78 = lookup_slot(&map_b, 7, 8).expect("(7,8) assigned");
+        assert!(
+            zeroed.contains(&slot_78),
+            "new pair (7,8) slot {slot_78} must be zeroed; zeroed={zeroed:?}"
+        );
+    }
+
+    #[test]
+    fn lookup_slot_returns_none_for_zone_id_out_of_range() {
+        // The table indexes ids 0..=64 (DIM=65). Id 65+ (and the
+        // junos-global u16::MAX sentinel) is out of range and misses
+        // even when built — Copilot code-r2: the 64th zone (id 64) must
+        // NOT be treated as out of range.
+        let (map, _) = ColdPathSlotMap::build(None, &[(65u16, 2u16), (1, 2)]);
+        assert_eq!(lookup_slot(&map, 65, 2), None);
+        assert_eq!(lookup_slot(&map, 2, 65), None);
+        assert_eq!(lookup_slot(&map, u16::MAX, 1), None);
+        // (1,2) is in-range and was built ⇒ Some.
+        assert!(lookup_slot(&map, 1, 2).is_some());
+    }
+
+    #[test]
+    fn build_assigns_slots_for_zone_ids_up_to_64() {
+        // Regression for Codex code-r1 finding 2 (ids 32-63 dropped at
+        // ceiling 32) AND Copilot code-r2 (id 64 dropped at exclusive
+        // ceiling 64). The 1-based MAX_ZONES=64 means the 64th zone has
+        // id 64; it MUST get a slot.
+        let pairs = [(32u16, 33u16), (63, 1), (1, 63), (64, 64), (1, 64), (64, 1)];
+        let (map, _) = ColdPathSlotMap::build(None, &pairs);
+        for &(from, to) in &pairs {
+            assert!(
+                lookup_slot(&map, from, to).is_some(),
+                "in-range pair {from}->{to} must get a slot"
+            );
+        }
+        assert!(!map.overflow_active);
+        // (64,64) and (1,2)-style pairs must not collide.
+        assert_ne!(lookup_slot(&map, 64, 64), lookup_slot(&map, 1, 64));
+        assert_ne!(lookup_slot(&map, 1, 64), lookup_slot(&map, 64, 1));
+    }
+
+    #[test]
+    fn lookup_slot_returns_none_for_unmapped_pair() {
+        let (map, _) = ColdPathSlotMap::build(None, &[(1u16, 2u16)]);
+        assert_eq!(lookup_slot(&map, 9, 9), None);
+    }
+
+    #[test]
+    fn build_skips_out_of_range_pairs_and_flags_overflow() {
+        // A pair with a zone-id >= 65 (the Rust path accepts ids up to
+        // 255 even though the table covers 0..=64) is not assignable.
+        // Copilot code-r4: such a pair MUST set overflow_active so the
+        // operator sees a configured pair went unmeasured — not vanish
+        // silently.
+        let pairs = [(1u16, 2u16), (200, 5), (3, 4)];
+        let (map, _) = ColdPathSlotMap::build(None, &pairs);
+        assert_eq!(lookup_slot(&map, 200, 5), None);
+        assert!(
+            map.overflow_active,
+            "an out-of-range (id >= 65) configured pair must trip overflow_active"
+        );
+        // The two in-range pairs still get slots 0 and 1.
+        assert!(lookup_slot(&map, 1, 2).is_some());
+        assert!(lookup_slot(&map, 3, 4).is_some());
+        let occupied = map.inverse.iter().filter(|s| s.is_some()).count();
+        assert_eq!(occupied, 2);
+    }
+
+    /// Codex code-r1 finding 1: A assigns slot 0; B frees it (no reuse);
+    /// C reassigns slot 0 to a NEW pair. C's `previous` (= B) shows
+    /// slot 0 free, but the worker-local accumulator may still carry
+    /// A's counts — so C MUST queue slot 0 for zero-out.
+    #[test]
+    fn build_zeros_slot_reassigned_after_intermediate_free() {
+        // A: slot 0 = (1,2), slot 1 = (3,4).
+        let (map_a, za) = ColdPathSlotMap::build(None, &[(1u16, 2u16), (3, 4)]);
+        assert!(za.is_empty());
+        let slot_12 = lookup_slot(&map_a, 1, 2).unwrap();
+        // B: drop (1,2); keep (3,4). Slot for (1,2) is now free.
+        let (map_b, _zb) = ColdPathSlotMap::build(Some(&map_a), &[(3u16, 4u16)]);
+        assert_eq!(lookup_slot(&map_b, 1, 2), None);
+        // C: keep (3,4); add NEW (5,6). It takes the lowest free slot,
+        // which is the slot A used for (1,2).
+        let (map_c, zc) = ColdPathSlotMap::build(Some(&map_b), &[(3u16, 4u16), (5, 6)]);
+        let slot_56 = lookup_slot(&map_c, 5, 6).unwrap();
+        assert_eq!(slot_56, slot_12, "(5,6) reuses the slot A gave (1,2)");
+        assert!(
+            zc.contains(&slot_56),
+            "reassigned slot must be queued for zero-out even though B showed it free \
+             (Codex finding 1) — slots_to_zero={zc:?}"
         );
     }
 
@@ -920,115 +1420,57 @@ mod tests {
     #[test]
     fn record_sample_updates_all_fields() {
         let mut c = WorkerColdPathCounters::default();
-        c.record_sample(1, 2, 1500);
-        let slot = zone_pair_slot(1, 2);
-        let bucket = bucket_index_for_ns_24(1500);
-        assert_eq!(c.buckets[slot][bucket], 1);
-        assert_eq!(c.sum_ns[slot], 1500);
-        assert_eq!(c.samples[slot], 1);
-        // v3 alias detector: first sample sets first_key, alias_seen
-        // remains false.
-        assert_eq!(c.first_key[slot], zone_pair_packed_key(1, 2));
-        assert!(!c.alias_seen[slot]);
+        let slot = 0u8;
+        c.record_sample(slot, 1, 2, 1500);
+        let bucket = bucket_index_for_ns_48(1500);
+        assert_eq!(c.buckets[slot as usize][bucket], 1);
+        assert_eq!(c.sum_ns[slot as usize], 1500);
+        assert_eq!(c.samples[slot as usize], 1);
+        // First sample sets first_key, builder_collision stays false.
+        assert_eq!(c.first_key[slot as usize], zone_pair_packed_key(1, 2));
+        assert!(!c.builder_collision[slot as usize]);
     }
 
     #[test]
-    fn record_sample_same_key_twice_no_alias() {
+    fn record_sample_same_key_twice_no_collision() {
         let mut c = WorkerColdPathCounters::default();
-        c.record_sample(1, 2, 100);
-        c.record_sample(1, 2, 100);
-        let slot = zone_pair_slot(1, 2);
-        // Two samples with the same key: first_key set, alias_seen still false.
-        assert_eq!(c.first_key[slot], zone_pair_packed_key(1, 2));
-        assert!(!c.alias_seen[slot]);
-        assert_eq!(c.samples[slot], 2);
+        let slot = 0u8;
+        c.record_sample(slot, 1, 2, 100);
+        c.record_sample(slot, 1, 2, 100);
+        assert_eq!(c.first_key[slot as usize], zone_pair_packed_key(1, 2));
+        assert!(!c.builder_collision[slot as usize]);
+        assert_eq!(c.samples[slot as usize], 2);
     }
 
     #[test]
-    fn record_sample_detects_alias() {
-        // Find two zone-pair keys that hash to the same slot.
-        let mut collisions: Option<((u16, u16), (u16, u16))> = None;
-        'outer: for a_from in 0..256u16 {
-            for a_to in 0..256u16 {
-                if a_from == 0 && a_to == 0 {
-                    continue;
-                }
-                let slot_a = zone_pair_slot(a_from, a_to);
-                for b_from in 0..256u16 {
-                    for b_to in 0..256u16 {
-                        if (b_from, b_to) == (a_from, a_to)
-                            || (b_from == 0 && b_to == 0)
-                        {
-                            continue;
-                        }
-                        if zone_pair_slot(b_from, b_to) == slot_a {
-                            collisions = Some(((a_from, a_to), (b_from, b_to)));
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-        }
-        let ((af, at), (bf, bt)) =
-            collisions.expect("must find a slot collision in 256×256 zone-id subspace");
+    fn record_sample_detects_builder_collision() {
+        // With the direct slot map a slot should only ever see one
+        // zone-pair. If the builder mistakenly maps two pairs to the
+        // same slot, builder_collision must fire — this is a builder
+        // bug detector, not an aliasing gate.
         let mut c = WorkerColdPathCounters::default();
-        c.record_sample(af, at, 100);
-        // first_key set, alias_seen false.
-        let slot = zone_pair_slot(af, at);
-        assert!(!c.alias_seen[slot]);
-        c.record_sample(bf, bt, 200);
-        // alias_seen MUST be true now (different key in same slot).
-        assert!(c.alias_seen[slot], "alias detector must fire on slot collision");
-    }
-
-    #[test]
-    fn record_sample_codex_r2_false_pass_counter_example() {
-        // Codex r2 finding 3: with XOR-rolling, count(K)=odd + count(L)=even
-        // leaves final keys_xor == K, false-passing the gate. v3 first_key
-        // + alias_seen MUST detect this.
-        let mut collisions: Option<((u16, u16), (u16, u16))> = None;
-        'outer: for k_from in 1..32u16 {
-            for k_to in 1..32u16 {
-                let slot_k = zone_pair_slot(k_from, k_to);
-                for l_from in 1..32u16 {
-                    for l_to in 1..32u16 {
-                        if (l_from, l_to) == (k_from, k_to) {
-                            continue;
-                        }
-                        if zone_pair_slot(l_from, l_to) == slot_k {
-                            collisions = Some(((k_from, k_to), (l_from, l_to)));
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-        }
-        let ((kf, kt), (lf, lt)) = collisions.expect("must find K/L collision in 1..32 space");
-        let mut c = WorkerColdPathCounters::default();
-        // count(K) = 3 (odd), count(L) = 2 (even).
-        c.record_sample(kf, kt, 100);
-        c.record_sample(kf, kt, 100);
-        c.record_sample(kf, kt, 100);
-        c.record_sample(lf, lt, 100);
-        c.record_sample(lf, lt, 100);
-        let slot = zone_pair_slot(kf, kt);
-        // v3 alias_seen MUST be true (would have been false-passed by
-        // the retired XOR-rolling design).
-        assert!(c.alias_seen[slot], "alias_seen must fire on Codex r2 false-pass counter-example");
+        let slot = 4u8;
+        c.record_sample(slot, 1, 2, 100);
+        assert!(!c.builder_collision[slot as usize]);
+        c.record_sample(slot, 3, 4, 200); // different key, same slot
+        assert!(
+            c.builder_collision[slot as usize],
+            "builder_collision must fire when two distinct keys share a slot"
+        );
     }
 
     #[test]
     fn snapshot_roundtrip() {
         let atomics = WorkerColdPathAtomics::new();
         let mut local = WorkerColdPathCounters::default();
-        local.record_sample(3, 5, 4000);
-        local.record_sample(3, 5, 8000);
+        let slot = 9u8;
+        local.record_sample(slot, 3, 5, 4000);
+        local.record_sample(slot, 3, 5, 8000);
         atomics.install_calibration(42, 30, ClockSource::Tsc);
         atomics.publish_from_local(&local);
         let snap = atomics.snapshot().expect("single-thread snapshot must succeed");
-        let slot = zone_pair_slot(3, 5);
-        assert_eq!(snap.samples[slot], 2);
-        assert_eq!(snap.sum_ns[slot], 12000);
+        assert_eq!(snap.samples[slot as usize], 2);
+        assert_eq!(snap.sum_ns[slot as usize], 12000);
         assert_eq!(snap.ns_per_tsc_q32, 42);
         assert_eq!(snap.wrapper_ns_baseline, 30);
         assert_eq!(snap.clock_source, ClockSource::Tsc);
@@ -1047,15 +1489,15 @@ mod tests {
     fn snapshot_sequential_publish_roundtrip() {
         let atomics = std::sync::Arc::new(WorkerColdPathAtomics::new());
         let mut local = WorkerColdPathCounters::default();
-        local.record_sample(7, 11, 12345);
+        let slot = 11u8;
+        local.record_sample(slot, 7, 11, 12345);
         atomics.publish_from_local(&local);
         let snap1 = atomics.snapshot().expect("seq snapshot 1 must succeed");
-        local.record_sample(7, 11, 67890);
+        local.record_sample(slot, 7, 11, 67890);
         atomics.publish_from_local(&local);
         let snap2 = atomics.snapshot().expect("seq snapshot 2 must succeed");
-        let slot = zone_pair_slot(7, 11);
-        assert_eq!(snap1.samples[slot], 1);
-        assert_eq!(snap2.samples[slot], 2);
+        assert_eq!(snap1.samples[slot as usize], 1);
+        assert_eq!(snap2.samples[slot as usize], 2);
     }
 
     /// AGY code-r2 finding 2: snapshot() now returns Option. Verify
@@ -1096,7 +1538,7 @@ mod tests {
             let mut local = WorkerColdPathCounters::default();
             let mut count = 0u64;
             while !writer_stop.load(AOrd::Relaxed) {
-                local.record_sample(3, 5, 1000 + (count & 0xff));
+                local.record_sample(5, 3, 5, 1000 + (count & 0xff));
                 writer_atomics.publish_from_local(&local);
                 count += 1;
                 // The production writer publishes at ~1 Hz cadence
@@ -1124,7 +1566,7 @@ mod tests {
         // slot AND cross-field invariants (Codex code-r3 NIT: the
         // weaker oracle would pass even if every snapshot returned
         // default zero after retry-exhaustion).
-        let slot = zone_pair_slot(3, 5);
+        let slot = 5usize;
         let mut last_samples = 0u64;
         let mut max_samples = 0u64;
         let mut at_least_one_observed_increase = false;

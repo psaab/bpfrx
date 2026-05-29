@@ -1,6 +1,7 @@
 package api
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -262,4 +263,380 @@ func descName(d *prometheus.Desc) string {
 		return rest
 	}
 	return rest[:end]
+}
+
+// === #1635 sparse v3 cold-path emission tests ===
+
+// labelsOf reads a metric's labels into a map.
+func labelsOf(t *testing.T, m prometheus.Metric) map[string]string {
+	t.Helper()
+	var pb dto.Metric
+	if err := m.Write(&pb); err != nil {
+		t.Fatalf("metric.Write: %v", err)
+	}
+	out := map[string]string{}
+	for _, l := range pb.Label {
+		out[l.GetName()] = l.GetValue()
+	}
+	return out
+}
+
+func valueOf(t *testing.T, m prometheus.Metric) float64 {
+	t.Helper()
+	var pb dto.Metric
+	if err := m.Write(&pb); err != nil {
+		t.Fatalf("metric.Write: %v", err)
+	}
+	if pb.Counter != nil {
+		return pb.Counter.GetValue()
+	}
+	if pb.Gauge != nil {
+		return pb.Gauge.GetValue()
+	}
+	return 0
+}
+
+// #1635: layout version 1 (or 0) routes to the v1 dense emit path; the
+// v3 per-zone-pair families must NOT appear.
+func TestEmitWorkerColdPath_LayoutVersion1_EmitsV1(t *testing.T) {
+	c := newCollectorWithWorkerDescsOnly()
+	hist := make([][]uint64, 16)
+	for i := range hist {
+		hist[i] = make([]uint64, 24)
+	}
+	hist[3][5] = 7
+	status := dpuserspace.ProcessStatus{
+		WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{
+			{
+				WorkerID:              0,
+				ColdPathLayoutVersion: 1,
+				ColdPathHist:          hist,
+				ColdPathSamples:       make([]uint64, 16),
+			},
+		},
+	}
+	got := collectFromEmitWorkerRuntime(t, c, status)
+	var sawV1Bucket, sawV3Bucket bool
+	for _, m := range got {
+		switch descName(m.Desc()) {
+		case "xpf_userspace_worker_cold_path_ns_bucket":
+			sawV1Bucket = true
+		case "xpf_userspace_worker_cold_path_ns_bucket_v3":
+			sawV3Bucket = true
+		}
+	}
+	if !sawV1Bucket {
+		t.Error("version 1 must emit the v1 bucket family")
+	}
+	if sawV3Bucket {
+		t.Error("version 1 must NOT emit the v3 bucket family")
+	}
+}
+
+// #1635: layout version 3 routes to the sparse per-zone-pair path with
+// from_zone/to_zone labels and the 48-bucket log-linear `le` boundaries.
+func TestEmitWorkerColdPath_LayoutVersion3_EmitsV3WithZoneLabels(t *testing.T) {
+	c := newCollectorWithWorkerDescsOnly()
+	buckets := make([]uint64, 48)
+	buckets[6] = 5 // 100 ns lands in linear bucket 6 (le=111)
+	status := dpuserspace.ProcessStatus{
+		WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{
+			{
+				WorkerID:                       0,
+				ColdPathLayoutVersion:          3,
+				ColdPathActiveSlotIDs:          []uint32{0},
+				ColdPathActiveZoneFrom:         []uint32{2},
+				ColdPathActiveZoneTo:           []uint32{5},
+				ColdPathActiveSamples:          []uint64{5},
+				ColdPathActiveSumNS:            []uint64{500},
+				ColdPathActiveBuckets:          [][]uint64{buckets},
+				ColdPathActiveBuilderCollision: []bool{false},
+			},
+		},
+	}
+	got := collectFromEmitWorkerRuntime(t, c, status)
+	var sawSamplesV3, sawBucketLE111, sawVersionGauge bool
+	for _, m := range got {
+		switch descName(m.Desc()) {
+		case "xpf_userspace_worker_cold_path_samples_v3_total":
+			lbl := labelsOf(t, m)
+			if lbl["from_zone"] == "2" && lbl["to_zone"] == "5" &&
+				valueOf(t, m) == 5 {
+				sawSamplesV3 = true
+			}
+		case "xpf_userspace_worker_cold_path_ns_bucket_v3":
+			lbl := labelsOf(t, m)
+			if lbl["le"] == "111" && valueOf(t, m) == 5 {
+				sawBucketLE111 = true
+			}
+		case "xpf_userspace_worker_cold_path_layout_version":
+			if labelsOf(t, m)["version"] == "3" {
+				sawVersionGauge = true
+			}
+		}
+	}
+	if !sawSamplesV3 {
+		t.Error("v3 samples metric with from_zone=2/to_zone=5/value=5 not emitted")
+	}
+	if !sawBucketLE111 {
+		t.Error("v3 cumulative bucket le=111 (100 ns) not emitted — log-linear le mismatch")
+	}
+	if !sawVersionGauge {
+		t.Error("layout_version gauge {version=3} not emitted")
+	}
+}
+
+// #1635: an unknown layout version emits no v1/v3 metrics, only the
+// forward-compat unknown gauge.
+func TestEmitWorkerColdPath_LayoutVersionUnknown_EmitsWarning(t *testing.T) {
+	c := newCollectorWithWorkerDescsOnly()
+	status := dpuserspace.ProcessStatus{
+		WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{
+			{WorkerID: 0, ColdPathLayoutVersion: 99},
+		},
+	}
+	got := collectFromEmitWorkerRuntime(t, c, status)
+	var sawUnknown, sawV1, sawV3 bool
+	for _, m := range got {
+		switch descName(m.Desc()) {
+		case "xpf_userspace_worker_cold_path_layout_version_unknown":
+			if labelsOf(t, m)["version"] == "99" {
+				sawUnknown = true
+			}
+		case "xpf_userspace_worker_cold_path_ns_bucket":
+			sawV1 = true
+		case "xpf_userspace_worker_cold_path_ns_bucket_v3":
+			sawV3 = true
+		}
+	}
+	if !sawUnknown {
+		t.Error("unknown version must emit the unknown-version gauge")
+	}
+	if sawV1 || sawV3 {
+		t.Error("unknown version must NOT emit v1/v3 histogram families")
+	}
+}
+
+// #1635 CONSUMER CRITERION (per-zone-pair separability): a 20-zone-pair
+// workload must report 20 DISTINCT latency distributions with no
+// collision-exclusion artifact. With the direct slot map every active
+// pair publishes its own (from_zone, to_zone) series; none is excluded.
+func TestEmitWorkerColdPath_V3_TwentyZonePairsSeparable(t *testing.T) {
+	c := newCollectorWithWorkerDescsOnly()
+	const n = 20
+	w := dpuserspace.WorkerRuntimeStatus{
+		WorkerID:              0,
+		ColdPathLayoutVersion: 3,
+	}
+	for i := 0; i < n; i++ {
+		buckets := make([]uint64, 48)
+		buckets[i%48] = uint64(i + 1)
+		w.ColdPathActiveSlotIDs = append(w.ColdPathActiveSlotIDs, uint32(i))
+		w.ColdPathActiveZoneFrom = append(w.ColdPathActiveZoneFrom, uint32(i))
+		w.ColdPathActiveZoneTo = append(w.ColdPathActiveZoneTo, uint32(i+1))
+		w.ColdPathActiveSamples = append(w.ColdPathActiveSamples, uint64(i+1))
+		w.ColdPathActiveSumNS = append(w.ColdPathActiveSumNS, uint64((i+1)*100))
+		w.ColdPathActiveBuckets = append(w.ColdPathActiveBuckets, buckets)
+		w.ColdPathActiveBuilderCollision = append(w.ColdPathActiveBuilderCollision, false)
+	}
+	status := dpuserspace.ProcessStatus{WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{w}}
+	got := collectFromEmitWorkerRuntime(t, c, status)
+
+	distinctPairs := map[string]float64{}
+	for _, m := range got {
+		if descName(m.Desc()) != "xpf_userspace_worker_cold_path_samples_v3_total" {
+			continue
+		}
+		lbl := labelsOf(t, m)
+		distinctPairs[lbl["from_zone"]+"->"+lbl["to_zone"]] = valueOf(t, m)
+	}
+	if len(distinctPairs) != n {
+		t.Fatalf("expected %d separable zone-pair series, got %d (collision exclusion?)",
+			n, len(distinctPairs))
+	}
+	for i := 0; i < n; i++ {
+		key := strconv.Itoa(i) + "->" + strconv.Itoa(i+1)
+		if distinctPairs[key] != float64(i+1) {
+			t.Errorf("pair %s: want samples %d got %v", key, i+1, distinctPairs[key])
+		}
+	}
+}
+
+// #1635: the sparse encoding emits exactly one series per ACTIVE slot,
+// not POLICY_COLD_PATH_ZONE_PAIR_SLOTS (256) series. 12 active slots ⇒
+// 12 samples_v3 series.
+func TestEmitWorkerColdPath_V3_SparseEmitsOnlyActiveSlots(t *testing.T) {
+	c := newCollectorWithWorkerDescsOnly()
+	const n = 12
+	w := dpuserspace.WorkerRuntimeStatus{WorkerID: 0, ColdPathLayoutVersion: 3}
+	for i := 0; i < n; i++ {
+		w.ColdPathActiveSlotIDs = append(w.ColdPathActiveSlotIDs, uint32(i))
+		w.ColdPathActiveZoneFrom = append(w.ColdPathActiveZoneFrom, uint32(i))
+		w.ColdPathActiveZoneTo = append(w.ColdPathActiveZoneTo, uint32(31-i))
+		w.ColdPathActiveSamples = append(w.ColdPathActiveSamples, uint64(i+1))
+		w.ColdPathActiveSumNS = append(w.ColdPathActiveSumNS, 1)
+		w.ColdPathActiveBuckets = append(w.ColdPathActiveBuckets, make([]uint64, 48))
+		w.ColdPathActiveBuilderCollision = append(w.ColdPathActiveBuilderCollision, false)
+	}
+	status := dpuserspace.ProcessStatus{WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{w}}
+	got := collectFromEmitWorkerRuntime(t, c, status)
+	count := 0
+	for _, m := range got {
+		if descName(m.Desc()) == "xpf_userspace_worker_cold_path_samples_v3_total" {
+			count++
+		}
+	}
+	if count != n {
+		t.Fatalf("sparse encoding must emit %d samples_v3 series, got %d", n, count)
+	}
+}
+
+// #1635 (Copilot code-r2): a v3 payload with overflow_active=true but
+// no sampled slots must still emit the overflow gauge (version stamped
+// v3 even with empty active arrays), and must not panic on the empty
+// parallel arrays.
+func TestEmitWorkerColdPath_V3_OverflowNoSamples(t *testing.T) {
+	c := newCollectorWithWorkerDescsOnly()
+	status := dpuserspace.ProcessStatus{
+		WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{
+			{
+				WorkerID:               0,
+				ColdPathLayoutVersion:  3,
+				ColdPathOverflowActive: true,
+				// All active arrays empty.
+			},
+		},
+	}
+	got := collectFromEmitWorkerRuntime(t, c, status)
+	var sawOverflow1, sawV3Bucket bool
+	for _, m := range got {
+		switch descName(m.Desc()) {
+		case "xpf_userspace_worker_cold_path_overflow_active":
+			if valueOf(t, m) == 1.0 {
+				sawOverflow1 = true
+			}
+		case "xpf_userspace_worker_cold_path_ns_bucket_v3",
+			"xpf_userspace_worker_cold_path_samples_v3_total":
+			sawV3Bucket = true
+		}
+	}
+	if !sawOverflow1 {
+		t.Error("overflow gauge=1 must emit even with no sampled slots")
+	}
+	if sawV3Bucket {
+		t.Error("no active slots ⇒ no per-zone-pair v3 series")
+	}
+}
+
+// #1635 (Copilot code-r7 finding 1): xpfCollector is a CHECKED
+// collector — every Desc emitted by Collect()/emitWorkerColdPath MUST
+// be declared in Describe(), or promhttp logs a Gather error on every
+// scrape and a HTTPErrorOnError registry returns 500. This test builds
+// the REAL collector (newCollector(nil) — Describe and emitWorkerColdPath
+// don't touch srv), captures the Describe() desc set, then drives
+// emitWorkerColdPath over a fully-populated v3 worker and asserts every
+// emitted Desc is declared. It FAILS if any cold-path desc (v1, scalar,
+// or v3) is emitted but undeclared — the registration-contract bug.
+func TestColdPathDescriptorsAreDescribed(t *testing.T) {
+	c := newCollector(nil)
+
+	// Capture the full Describe() desc set.
+	descCh := make(chan *prometheus.Desc, 256)
+	c.Describe(descCh)
+	close(descCh)
+	declared := map[*prometheus.Desc]struct{}{}
+	for d := range descCh {
+		declared[d] = struct{}{}
+	}
+
+	// Drive emitWorkerColdPath over a worker that exercises BOTH a
+	// populated v3 sparse slot AND the overflow/version/unknown paths,
+	// so every cold-path desc family is emitted at least once. Two
+	// workers: one v3-with-data, one unknown-version.
+	buckets := make([]uint64, 48)
+	buckets[6] = 3
+	workers := []dpuserspace.WorkerRuntimeStatus{
+		{
+			WorkerID:                       0,
+			ColdPathLayoutVersion:          3,
+			ColdPathActiveSlotIDs:          []uint32{0},
+			ColdPathActiveZoneFrom:         []uint32{1},
+			ColdPathActiveZoneTo:           []uint32{2},
+			ColdPathActiveSamples:          []uint64{3},
+			ColdPathActiveSumNS:            []uint64{300},
+			ColdPathActiveBuckets:          [][]uint64{buckets},
+			ColdPathActiveBuilderCollision: []bool{false},
+			ColdPathOverflowActive:         true,
+			ColdPathClockSource:            "tsc",
+		},
+		{WorkerID: 1, ColdPathLayoutVersion: 99}, // unknown-version path
+	}
+	// Also emit a v1 worker so the legacy dense families are exercised.
+	hist := make([][]uint64, 16)
+	for i := range hist {
+		hist[i] = make([]uint64, 24)
+	}
+	hist[3][5] = 1
+	// Populate ALL v1 per-slot families so workerColdPathSumNS and
+	// workerColdPathAliasSeen are actually emitted (Codex code-r7: the
+	// earlier fixture left these empty, so the test would not catch
+	// their removal from Describe()).
+	v1Samples := make([]uint64, 16)
+	v1Samples[3] = 1
+	v1SumNS := make([]uint64, 16)
+	v1SumNS[3] = 100
+	v1AliasSeen := make([]bool, 16)
+	v1AliasSeen[3] = true
+	workers = append(workers, dpuserspace.WorkerRuntimeStatus{
+		WorkerID:              2,
+		ColdPathLayoutVersion: 1,
+		ColdPathHist:          hist,
+		ColdPathSamples:       v1Samples,
+		ColdPathSumNS:         v1SumNS,
+		ColdPathAliasSeen:     v1AliasSeen,
+	})
+
+	metricCh := make(chan prometheus.Metric, 1024)
+	go func() {
+		for _, w := range workers {
+			label := strconv.FormatUint(uint64(w.WorkerID), 10)
+			c.emitWorkerColdPath(metricCh, label, w)
+		}
+		close(metricCh)
+	}()
+
+	var undeclared []string
+	emitted := map[*prometheus.Desc]struct{}{}
+	for m := range metricCh {
+		d := m.Desc()
+		emitted[d] = struct{}{}
+		if _, ok := declared[d]; !ok {
+			undeclared = append(undeclared, descName(d))
+		}
+	}
+	if len(undeclared) > 0 {
+		t.Fatalf("emitWorkerColdPath emitted %d undeclared descriptors (checked-collector "+
+			"contract violation — add them to Describe()): %v", len(undeclared), undeclared)
+	}
+	// Sanity (Codex code-r7): the fixtures above exercise EVERY cold-path
+	// descriptor exactly once across the family — 4 v1 (bucket, samples,
+	// sum_ns, alias_seen) + 6 scalars (sample_phase, wrapper_underflow,
+	// wrapper_ns_baseline, ns_per_tsc_q32, clock_source, snapshot_failed)
+	// + 4 v3 (bucket, samples, sum_ns, builder_collision) + overflow +
+	// layout_version + layout_version_unknown = 17. Asserting the exact
+	// count means removing ANY cold-path desc from Describe() is caught
+	// here (the undeclared check above catches additions; this catches
+	// the test silently under-exercising the family).
+	const wantColdPathDescs = 17
+	coldPathEmitted := 0
+	for d := range emitted {
+		if strings.Contains(descName(d), "cold_path") {
+			coldPathEmitted++
+		}
+	}
+	if coldPathEmitted != wantColdPathDescs {
+		t.Fatalf("test exercised %d distinct cold-path descriptors, want exactly %d "+
+			"(fixtures must emit every family so removal of any desc is caught)",
+			coldPathEmitted, wantColdPathDescs)
+	}
 }

@@ -258,12 +258,12 @@ naturally bounded by active-pair cardinality.
 
 ```
 xpf_userspace_worker_cold_path_ns_bucket_v3{worker_id, from_zone, to_zone, le}
-xpf_userspace_worker_cold_path_samples_total_v3{worker_id, from_zone, to_zone}
-xpf_userspace_worker_cold_path_sum_ns_total_v3{worker_id, from_zone, to_zone}
+xpf_userspace_worker_cold_path_samples_v3_total{worker_id, from_zone, to_zone}
+xpf_userspace_worker_cold_path_sum_ns_v3_total{worker_id, from_zone, to_zone}
 xpf_userspace_worker_cold_path_builder_collision_v3{worker_id, from_zone, to_zone}
 xpf_userspace_worker_cold_path_overflow_active{worker_id}
-xpf_userspace_worker_cold_path_zone_id_out_of_range_total{worker_id}
 xpf_userspace_worker_cold_path_layout_version{worker_id, version}
+xpf_userspace_worker_cold_path_layout_version_unknown{worker_id, version}
 ```
 
 The `_v3` suffix replaces v2's `_v2` and the existing v1 names. Operators querying
@@ -407,7 +407,10 @@ Mirror the sparse fields. Add `ColdPathLayoutVersion uint32` and the seven
   series with `from_zone` / `to_zone` labels resolved from the
   `ColdPathActiveZoneFrom` / `ColdPathActiveZoneTo` indices through the snapshot's
   zone-name table.
-- other → emit `cold_path_layout_version_unknown_total` increment + warn.
+- other → emit the `cold_path_layout_version_unknown{worker_id, version}`
+  gauge with value 1 (a state indicator; the implementation does NOT log a
+  warning and does NOT increment a counter — it is a per-scrape gauge so
+  operators can alert on its presence).
 
 `bucketLeV3(idx int) string` returns:
 - `idx < 32` → `strconv.FormatUint(uint64((idx+1)*16-1), 10)` (linear, 15, 31, ..., 511).
@@ -453,7 +456,8 @@ Run 5/5 flake check.
 - `metrics_userspace_layout_version_3_emits_v3_with_zone_labels`: synthetic v3
   status (sparse active arrays) → v3 metrics + zone labels.
 - `metrics_userspace_layout_version_unknown_emits_warning`: synthetic v=99 →
-  no v1/v3 metrics; warning gauge increments.
+  no v1/v3 metrics; the `cold_path_layout_version_unknown{version="99"}`
+  gauge is emitted with value 1 (no log warning, no counter increment).
 - `metrics_userspace_v3_sparse_emits_only_active_slots`: 12 active slots out of
   256 → 12 series per family, not 256.
 
@@ -546,3 +550,176 @@ aggregate emission, #1622's plan proposes it; not this PR's surface.
   1M-rule (~5000-50000 ns) target.
 
 After this lands → #1622 reopens with the redesigned foundation in place.
+
+---
+
+## §IMPL Implementation deviations from plan v3 (recorded at code time)
+
+The implementation follows plan v3 faithfully with three bounded
+deviations, each justified below:
+
+1. **Slot capacity is 255 assignable, not 256.** `flat_table` uses
+   `u8::MAX` (255) as the "unassigned" sentinel, so slot index 255 can
+   never be handed out (it would be indistinguishable from a miss in
+   `lookup_slot`). The accumulator arrays are still 256-wide for layout
+   identity; `COLD_PATH_ASSIGNABLE_SLOTS = 255` bounds assignment and
+   `overflow_active` trips on the 256th distinct in-range zone-pair.
+   255 is still ~21× the largest known deployment.
+
+2. **Prometheus `from_zone` / `to_zone` labels carry zone-IDs, not
+   zone-names.** The sparse wire payload carries zone-ids; resolving
+   them to names would require plumbing a per-scrape zone-id→name table
+   into the Go collector. Zone-id labels fully satisfy the consumer
+   separability criterion (20 zone-pairs → 20 distinct, non-aliased
+   series). Name resolution can be a follow-up if operators want it.
+
+3. **The §5.5 feature-gated TSC-injection accuracy harness is realized
+   as deterministic unit tests** (`bucket_layout_resolves_low_end_within_2x`
+   + `old_pow2_layout_would_fail_low_end_resolution`) that exercise the
+   real `bucket_index_for_ns_48` / `bucket_upper_bound_ns_48` path and
+   prove the ≤2× per-bucket error at the 10-rule (~50-150 ns) and
+   1M-rule (~5000-50000 ns) targets, plus a fail-before demonstration
+   against the retired 24-bucket layout. This is stronger than a mocked
+   TSC harness for the bucket-resolution criterion and avoids a new
+   cargo feature; an end-to-end TSC-injection harness remains available
+   as a future addition if record→snapshot calibration regressions need
+   coverage.
+
+### Wire-protocol both-sides confirmation (feedback_wire_protocol_both_sides)
+- Rust: `userspace-dp/src/protocol/binding.rs` (sparse `cold_path_active_*`
+  + `cold_path_layout_version` + `cold_path_overflow_active`).
+- Go: `pkg/dataplane/userspace/protocol.go` (mirrored fields; legacy
+  dense v1 fields retained READ-ONLY so a new Go collector still emits
+  correct v1 metrics against a pre-#1635 Rust daemon — plan §3.2 row
+  "v1 Rust / v3 Go").
+
+### Slot zero-out (plan §2.4) realization
+> SUPERSEDED by §IMPL.r3 finding 2 — the worker no longer consumes a
+> coordinator-stashed `slots_to_zero`; it derives the zero-set by
+> diffing its OWN old slot-map inverse against the new one at the
+> ArcSwap point (generation-independent). `ForwardingState` carries no
+> `slots_to_zero` field. The text below describes the initial
+> (superseded) realization.
+- `forwarding_build` returns `(slot_map, slots_to_zero)`; the worker
+  zeroes affected slots in each binding's local accumulator at the
+  ForwardingState ArcSwap point (`worker/loop_body/mod.rs`), BEFORE any
+  `record_sample` into the reused slot. The next publish merge
+  overwrites the sibling atomics from the freshly-zeroed local
+  accumulators, so no separate atomic zero-out path is needed on the
+  hot tick.
+
+### §IMPL.r2 Code-review round-1 fixes (Codex MERGE-NEEDS-MAJOR → resolved)
+
+Codex code-r1 raised three MAJOR findings against the consumer criteria;
+all three are fixed in the implementation:
+
+1. **Delayed slot reuse across an intermediate free could mix old/new
+   counts.** The original `build` queued zero-out only when the
+   *immediately previous* map showed the slot occupied. The A→B(free,
+   no reuse)→C(reassign) path left A's stale worker-local counts in the
+   slot. **Fix:** `build` now queues EVERY newly-assigned (Pass-2) slot
+   for zero-out whenever a previous map exists (the worker may carry
+   stale counts from any earlier generation). Regression test
+   `build_zeros_slot_reassigned_after_intermediate_free`.
+
+2. **Zone-id ceiling 32 silently dropped valid zone-ids 32-63.** The
+   real limit is `MAX_ZONES = 64` (`bpf/headers/xpf_common.h`,
+   `pkg/dataplane/types.go MaxZones`; Go assigns sequential 1-based
+   ids). **Fix:** `COLD_PATH_ZONE_ID_CEILING = 64`, flat table 64×64 =
+   4096 bytes (still L1d-resident), row shift `<< 6`. Regression tests
+   `build_assigns_slots_for_zone_ids_32_to_63`,
+   `lookup_slot_returns_none_for_zone_id_ge_ceiling`.
+
+3. **Status could relabel stale reused-slot samples as the new pair**
+   for up to one publish tick (coordinator publishes the new slot-map
+   before workers zero reused slots). **Fix:** `status.rs` validates
+   `cold.first_key[slot] == zone_pair_packed_key(from, to)` before
+   emitting; on mismatch the counts belong to the old pair and are
+   skipped (not relabeled). Closes the 1-tick transient the Claude SMR
+   review had flagged as a NIT.
+
+### §IMPL.r3 Code-review round-2 fixes (Copilot formal review)
+
+Copilot's formal re-review found three deeper issues; all fixed:
+
+1. **Zone-id off-by-one (id 64 dropped).** Zone-ids are 1-based with
+   `MaxZones = 64`, so the highest assignable id is 64; the exclusive
+   ceiling of 64 dropped it. **Fix:** the table now indexes ids `0..=64`
+   (`COLD_PATH_ZONE_DIM = 65`, 65×65 = 4225 B), with a MULTIPLY index
+   (`from * 65 + to`) since 65 is not a power of two. New regression
+   `build_assigns_slots_for_zone_ids_up_to_64` (covers id 64) +
+   `lookup_slot_returns_none_for_zone_id_out_of_range` (id 65+).
+
+2. **Missed-generation slot zero-out gap.** The worker only ever loads
+   the LATEST `ForwardingState` from ArcSwap and can skip intermediate
+   config generations; the coordinator-computed `slots_to_zero` was
+   relative to its immediately-previous map, so a slot reassigned in a
+   skipped generation could be absent from the latest list. **Fix:** the
+   worker now derives its zero-set by diffing ITS OWN old slot-map
+   inverse against the new one at the swap (`worker/loop_body/mod.rs`) —
+   generation-independent. `ForwardingState.cold_path_slots_to_zero` is
+   removed; `build`'s returned list is kept for unit tests only.
+
+3. **Overflow-with-no-samples hid the overflow gauge.** A v3 payload
+   with `overflow_active=true` but no samples stamped
+   `cold_path_layout_version=0`, routing the Go collector to the v1
+   emitter so the overflow gauge never appeared. **Fix:** `status.rs`
+   stamps v3 when `has_data || overflow_active`. Go regression
+   `TestEmitWorkerColdPath_V3_OverflowNoSamples`.
+
+### §IMPL.r4 Code-review round-4 fixes (Copilot Prometheus naming)
+
+Copilot's review at the rebased HEAD flagged three Prometheus
+metric-name convention issues (no functional change):
+
+1. `..._samples_total_v3` → `..._samples_v3_total`: a `CounterValue`
+   metric must end in `_total`; the `_v3` suffix after `_total` broke
+   the convention used by the rest of the file.
+2. `..._sum_ns_total_v3` → `..._sum_ns_v3_total`: same fix.
+3. `..._layout_version_unknown_total` → `..._layout_version_unknown`:
+   this is a `GaugeValue=1` state indicator, not a counter, so the
+   `_total` suffix was misleading (operators might `rate()` it). The
+   name now omits `_total`.
+
+The `_ns_bucket_v3` family keeps its name — it carries the `le` label
+and is a histogram bucket (not a `_total` counter), so the `_v3`
+placement is unambiguous.
+
+### §IMPL.r5 Code-review round-5 fixes (Copilot, fresh review at rebased HEAD)
+
+1. **Out-of-range zone-pairs now set `overflow_active`.** The 65×65
+   table covers zone-ids `0..=64` (the Go compiler assigns 1-based ids
+   up to MaxZones=64), but the Rust snapshot path accepts ids up to
+   `u8::MAX` (255). A configured pair with an id in `65..=255` was
+   silently dropped by `ColdPathSlotMap::build` with no signal. It now
+   trips `overflow_active`, so operators see a configured pair went
+   unmeasured. Regression: `build_skips_out_of_range_pairs_and_flags_overflow`.
+
+2. **Dropped the never-emitted `zone_id_out_of_range_total` metric from
+   the §2.5 plan list.** The implementation represents out-of-range and
+   capacity-exhaustion uniformly via `cold_path_overflow_active`; there
+   is no separate out-of-range counter. The plan's §2.5 metric list now
+   matches the emitted surface (and adds the
+   `cold_path_layout_version_unknown` gauge that IS emitted). The §2.3
+   design-prose mention of a hypothetical out-of-range counter is
+   historical narrative; `overflow_active` is the shipped signal.
+
+### §IMPL.r7 Code-review round-7 fixes (Copilot, at the comment-fix HEAD)
+
+1. **Describe() registration-contract violation (SUBSTANTIVE).** All 17
+   cold-path descriptors were emitted by `Collect()`
+   (`emitWorkerColdPath`) but NONE were sent in
+   `xpfCollector.Describe()`. `xpfCollector` is a CHECKED collector, so
+   emitting undeclared `Desc`s makes promhttp log a Gather error on
+   every scrape and a `HTTPErrorOnError` registry return 500. The v1 +
+   scalar descs were already missing (latent gap from #1619/#1621); the
+   v3 descs added in #1635 widened it. Fix: declare the whole cold-path
+   family (v1 bucket/samples/sum_ns/alias_seen, the scalars, and the v3
+   bucket/samples/sum_ns/builder_collision + overflow_active +
+   layout_version + layout_version_unknown) in `Describe()`. Proof: a
+   metrics scrape now produces no registry/Gather error.
+
+2. **Plan text drift on the unknown-version metric (doc NIT).** The plan
+   said it "increments + warns", but the impl emits a `GaugeValue=1`
+   state indicator with no log warning and no counter increment. Plan
+   §4.8 + §5.2 text corrected to match the shipped behavior.

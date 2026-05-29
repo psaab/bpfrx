@@ -87,11 +87,16 @@ fn worker_runtime_status_cold_path_fields_roundtrip_default_omitted() {
     // default (uncalibrated) worker. This pins the wire-invariant
     // contract that pre-#1621 daemons see byte-identical payloads.
     let cold_keys = [
-        "cold_path_hist",
-        "cold_path_sum_ns",
-        "cold_path_samples",
-        "cold_path_first_key",
-        "cold_path_alias_seen",
+        // #1635 sparse v3 fields.
+        "cold_path_layout_version",
+        "cold_path_active_slot_ids",
+        "cold_path_active_zone_from",
+        "cold_path_active_zone_to",
+        "cold_path_active_samples",
+        "cold_path_active_sum_ns",
+        "cold_path_active_buckets",
+        "cold_path_active_builder_collision",
+        "cold_path_overflow_active",
         "cold_path_sample_phase",
         "cold_path_wrapper_underflow_count",
         "cold_path_ns_per_tsc_q32",
@@ -113,25 +118,30 @@ fn worker_runtime_status_cold_path_fields_roundtrip_default_omitted() {
 
 #[test]
 fn worker_runtime_status_cold_path_fields_roundtrip_populated() {
-    let mut hist = vec![vec![0u64; 24]; 16];
-    hist[3][5] = 42;
-    hist[3][6] = 100;
-    let mut sum_ns = vec![0u64; 16];
-    sum_ns[3] = 12345;
-    let mut samples = vec![0u64; 16];
-    samples[3] = 142;
-    let mut first_key = vec![0u64; 16];
-    first_key[3] = 0x1234;
-    let mut alias_seen = vec![false; 16];
-    alias_seen[7] = true;
+    // #1635 sparse v3 encoding: two active zone-pair slots.
+    let buckets_a = {
+        let mut b = vec![0u64; 48];
+        b[5] = 42;
+        b[6] = 100;
+        b
+    };
+    let buckets_b = {
+        let mut b = vec![0u64; 48];
+        b[0] = 7;
+        b
+    };
 
     let status = WorkerRuntimeStatus {
         worker_id: 2,
-        cold_path_hist: hist.clone(),
-        cold_path_sum_ns: sum_ns.clone(),
-        cold_path_samples: samples.clone(),
-        cold_path_first_key: first_key.clone(),
-        cold_path_alias_seen: alias_seen.clone(),
+        cold_path_layout_version: 3,
+        cold_path_active_slot_ids: vec![0, 5],
+        cold_path_active_zone_from: vec![1, 2],
+        cold_path_active_zone_to: vec![3, 4],
+        cold_path_active_samples: vec![142, 7],
+        cold_path_active_sum_ns: vec![12345, 700],
+        cold_path_active_buckets: vec![buckets_a.clone(), buckets_b.clone()],
+        cold_path_active_builder_collision: vec![false, false],
+        cold_path_overflow_active: true,
         cold_path_sample_phase: 50_000,
         cold_path_wrapper_underflow_count: 3,
         cold_path_ns_per_tsc_q32: 1_871_674_289,
@@ -143,22 +153,29 @@ fn worker_runtime_status_cold_path_fields_roundtrip_populated() {
     let value: serde_json::Value =
         serde_json::to_value(&status).expect("serialize populated");
     // Spot-check a few fields are present + correctly nested.
+    assert_eq!(value["cold_path_layout_version"], 3);
     assert_eq!(value["cold_path_sample_phase"], 50_000);
     assert_eq!(value["cold_path_clock_source"], "tsc");
     assert_eq!(value["cold_path_snapshot_failed"], 2);
-    assert_eq!(value["cold_path_hist"][3][5], 42);
-    assert_eq!(value["cold_path_hist"][3][6], 100);
-    assert_eq!(value["cold_path_samples"][3], 142);
-    assert_eq!(value["cold_path_alias_seen"][7], true);
+    assert_eq!(value["cold_path_active_zone_from"][0], 1);
+    assert_eq!(value["cold_path_active_zone_to"][1], 4);
+    assert_eq!(value["cold_path_active_samples"][0], 142);
+    assert_eq!(value["cold_path_active_buckets"][0][5], 42);
+    assert_eq!(value["cold_path_active_buckets"][0][6], 100);
+    assert_eq!(value["cold_path_overflow_active"], true);
 
     // Round-trip back.
     let back: WorkerRuntimeStatus =
         serde_json::from_value(value).expect("deserialize");
-    assert_eq!(back.cold_path_hist, hist);
-    assert_eq!(back.cold_path_sum_ns, sum_ns);
-    assert_eq!(back.cold_path_samples, samples);
-    assert_eq!(back.cold_path_first_key, first_key);
-    assert_eq!(back.cold_path_alias_seen, alias_seen);
+    assert_eq!(back.cold_path_layout_version, 3);
+    assert_eq!(back.cold_path_active_slot_ids, vec![0, 5]);
+    assert_eq!(back.cold_path_active_zone_from, vec![1, 2]);
+    assert_eq!(back.cold_path_active_zone_to, vec![3, 4]);
+    assert_eq!(back.cold_path_active_samples, vec![142, 7]);
+    assert_eq!(back.cold_path_active_sum_ns, vec![12345, 700]);
+    assert_eq!(back.cold_path_active_buckets, vec![buckets_a, buckets_b]);
+    assert_eq!(back.cold_path_active_builder_collision, vec![false, false]);
+    assert!(back.cold_path_overflow_active);
     assert_eq!(back.cold_path_sample_phase, 50_000);
     assert_eq!(back.cold_path_wrapper_underflow_count, 3);
     assert_eq!(back.cold_path_ns_per_tsc_q32, 1_871_674_289);

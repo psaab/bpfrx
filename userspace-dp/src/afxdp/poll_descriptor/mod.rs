@@ -1423,11 +1423,24 @@ pub(super) fn poll_binding_process_descriptor(
                                         } else {
                                             raw_ns - baseline
                                         };
-                                        binding.cold_path.record_sample(
-                                            from_zone_id,
-                                            to_zone_id,
-                                            delta_ns,
-                                        );
+                                        // #1635: direct slot map lookup;
+                                        // skip the sample on a miss
+                                        // (capacity exhausted or zone-id
+                                        // ≥ 65).
+                                        if let Some(slot) =
+                                            crate::afxdp::cold_path_hist::lookup_slot(
+                                                &worker_ctx.forwarding.cold_path_slot_map,
+                                                from_zone_id,
+                                                to_zone_id,
+                                            )
+                                        {
+                                            binding.cold_path.record_sample(
+                                                slot,
+                                                from_zone_id,
+                                                to_zone_id,
+                                                delta_ns,
+                                            );
+                                        }
                                     }
                                 }
                                 if let PolicyAction::Permit = policy_result.action {
@@ -2544,11 +2557,24 @@ pub(super) fn poll_binding_process_descriptor(
                                             } else {
                                                 raw_ns - baseline
                                             };
-                                            binding.cold_path.record_sample(
-                                                from_zone_id,
-                                                to_zone_id,
-                                                delta_ns,
-                                            );
+                                            // #1635: direct slot map lookup;
+                                            // skip the sample on a miss.
+                                            if let Some(slot) =
+                                                crate::afxdp::cold_path_hist::lookup_slot(
+                                                    &worker_ctx
+                                                        .forwarding
+                                                        .cold_path_slot_map,
+                                                    from_zone_id,
+                                                    to_zone_id,
+                                                )
+                                            {
+                                                binding.cold_path.record_sample(
+                                                    slot,
+                                                    from_zone_id,
+                                                    to_zone_id,
+                                                    delta_ns,
+                                                );
+                                            }
                                         }
                                     }
                                     if permit {

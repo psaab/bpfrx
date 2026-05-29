@@ -869,28 +869,48 @@ type WorkerRuntimeStatus struct {
 	ActiveNS60s    uint64 `json:"active_ns_60s,omitempty"`
 	WindowNS       uint64 `json:"window_ns,omitempty"`
 
-	// === #1621 cold-path histogram surface ===
+	// === #1635 cold-path histogram surface (sparse v3) ===
 	//
-	// Mirrors the Rust WorkerColdPathCounters fields. All Vec fields
-	// use omitempty so an empty histogram (older Rust daemon, or
-	// worker that didn't get any cold-path samples this window)
-	// omits the field from the wire; the Go-side nil/empty values
-	// flow through to the Prometheus emitter which skips on empty.
-	// Per feedback_wire_protocol_both_sides.
+	// Mirrors the Rust WorkerRuntimeStatus cold_path_* fields. All
+	// slice fields use omitempty so an empty histogram (older Rust
+	// daemon, or a worker with no samples this window) omits the field
+	// from the wire; the Go emitter skips on empty. Per
+	// feedback_wire_protocol_both_sides.
 	//
-	// Aggregated PER WORKER: when a worker owns multiple bindings,
-	// the published values reflect the cross-binding merge performed
-	// at the publish tick (sum for histogram data, OR for alias_seen,
-	// first-non-zero for first_key).
-	ColdPathHist                  [][]uint64 `json:"cold_path_hist,omitempty"`
-	ColdPathSumNS                 []uint64   `json:"cold_path_sum_ns,omitempty"`
-	ColdPathSamples               []uint64   `json:"cold_path_samples,omitempty"`
-	ColdPathFirstKey              []uint64   `json:"cold_path_first_key,omitempty"`
-	ColdPathAliasSeen             []bool     `json:"cold_path_alias_seen,omitempty"`
-	ColdPathSamplePhase           uint64     `json:"cold_path_sample_phase,omitempty"`
-	ColdPathWrapperUnderflowCount uint64     `json:"cold_path_wrapper_underflow_count,omitempty"`
-	ColdPathNSPerTSCQ32           uint64     `json:"cold_path_ns_per_tsc_q32,omitempty"`
-	ColdPathWrapperNSBaseline     uint64     `json:"cold_path_wrapper_ns_baseline,omitempty"`
+	// #1635 replaces the v1 dense [16-slot] arrays with a SPARSE
+	// active-slot encoding: parallel arrays, one entry per active
+	// (from_zone, to_zone) pair. ColdPathLayoutVersion selects the
+	// emission path (0/absent = no data / pre-#1635; 3 = sparse).
+	//
+	// Aggregated PER WORKER: when a worker owns multiple bindings, the
+	// published values reflect the cross-binding merge performed at the
+	// publish tick (sum for histogram data, OR for builder_collision).
+	ColdPathLayoutVersion uint32 `json:"cold_path_layout_version,omitempty"`
+	// Legacy v1 dense fields, retained READ-ONLY so a new Go collector
+	// still emits correct v1 metrics when paired with a pre-#1635 Rust
+	// daemon (plan §3.2 row "v1 Rust / v3 Go"). Current daemons leave
+	// these empty. Per feedback_wire_protocol_both_sides.
+	ColdPathHist      [][]uint64 `json:"cold_path_hist,omitempty"`
+	ColdPathSumNS     []uint64   `json:"cold_path_sum_ns,omitempty"`
+	ColdPathSamples   []uint64   `json:"cold_path_samples,omitempty"`
+	ColdPathFirstKey  []uint64   `json:"cold_path_first_key,omitempty"`
+	ColdPathAliasSeen []bool     `json:"cold_path_alias_seen,omitempty"`
+	// Parallel sparse arrays (index i describes one active zone-pair).
+	ColdPathActiveSlotIDs          []uint32   `json:"cold_path_active_slot_ids,omitempty"`
+	ColdPathActiveZoneFrom         []uint32   `json:"cold_path_active_zone_from,omitempty"`
+	ColdPathActiveZoneTo           []uint32   `json:"cold_path_active_zone_to,omitempty"`
+	ColdPathActiveSamples          []uint64   `json:"cold_path_active_samples,omitempty"`
+	ColdPathActiveSumNS            []uint64   `json:"cold_path_active_sum_ns,omitempty"`
+	ColdPathActiveBuckets          [][]uint64 `json:"cold_path_active_buckets,omitempty"`
+	ColdPathActiveBuilderCollision []bool     `json:"cold_path_active_builder_collision,omitempty"`
+	// True if a configured zone-pair could not be assigned a slot —
+	// either the 255-slot capacity was exhausted OR the pair references
+	// a zone-id outside the 0..=64 direct-table range.
+	ColdPathOverflowActive        bool   `json:"cold_path_overflow_active,omitempty"`
+	ColdPathSamplePhase           uint64 `json:"cold_path_sample_phase,omitempty"`
+	ColdPathWrapperUnderflowCount uint64 `json:"cold_path_wrapper_underflow_count,omitempty"`
+	ColdPathNSPerTSCQ32           uint64 `json:"cold_path_ns_per_tsc_q32,omitempty"`
+	ColdPathWrapperNSBaseline     uint64 `json:"cold_path_wrapper_ns_baseline,omitempty"`
 	// "tsc" / "clock_gettime" / "" (Unset). Harness gates Table
 	// publication on == "tsc" for every worker.
 	ColdPathClockSource string `json:"cold_path_clock_source,omitempty"`

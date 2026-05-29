@@ -440,6 +440,26 @@ impl PolicyState {
             .map(|rule| rule.hit_counter.snapshot(&rule.rule_id))
             .collect()
     }
+
+    /// #1635: the set of concrete `(from_zone_id, to_zone_id)` pairs the
+    /// configured policy distinguishes, used to build the cold-path
+    /// histogram's direct slot map. Returns a deduplicated, sorted Vec
+    /// for deterministic slot assignment. Pairs that reference the
+    /// `junos-global` sentinel zone-id are excluded — global rules don't
+    /// name a concrete zone-pair and would over-broaden the slot map.
+    pub(crate) fn configured_zone_pairs(&self) -> Vec<(u16, u16)> {
+        let mut pairs: Vec<(u16, u16)> = self
+            .zone_pair_index
+            .keys()
+            .map(|&key| (((key >> 16) & 0xffff) as u16, (key & 0xffff) as u16))
+            .filter(|&(from, to)| {
+                from < ZONE_ID_RESERVED_MIN && to < ZONE_ID_RESERVED_MIN
+            })
+            .collect();
+        pairs.sort_unstable();
+        pairs.dedup();
+        pairs
+    }
 }
 
 pub(crate) fn parse_policy_state(
