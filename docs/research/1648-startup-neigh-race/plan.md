@@ -1,6 +1,7 @@
 # #1648 — Startup/failover neighbor-dump race: first cold connect ~1s
 
-**Status:** DRAFT v1 (research-only; /research, not /engineer)
+**Status:** v2 (research-only; /research, not /engineer) — 3-way converged on
+mechanism + fix shape pending Gate-R
 **Branch:** `research/1648-startup-neigh-race`
 **Reviewers:** Codex + AGY + Claude SMR (3-way at /research; Copilot joins at /engineer)
 **Scope:** root-cause the residual ~1s first-connect after daemon restart /
@@ -115,6 +116,43 @@ inferred.
 Two distinct sub-windows. The plan must measure which one (or both) produces
 the ~1.7s.
 
+### H-0 (LEAD, 3-way converged): seq=0 multicast-drop inside `initial_neighbor_dump`
+All three reviewers (Codex CRITICAL-1, AGY Q4, SMR-revised CRITICAL-1) converge
+on this verified structural defect as the most likely 1.7s mechanism:
+
+- The monitor socket is bound to `RTMGRP_NEIGH` (`neighbor.rs:485`) **before**
+  `initial_neighbor_dump` runs (`neighbor.rs:514`). So kernel multicast adverts
+  (RTM_NEWNEIGH) are delivered to this socket *during* the dump.
+- Kernel-pushed multicast adverts carry **`nlmsg_seq == 0`**, while the dump
+  request uses `next_seq` = 1 (AF_INET) then 2 (AF_INET6).
+- `initial_neighbor_dump` **discards** any message whose seq doesn't match the
+  in-flight dump request: `if nlmsg_seq != next_seq { offset += …; continue; }`
+  (`neighbor.rs:434-437`). So a live multicast RESOLVED advert that arrives
+  mid-dump — including the resolution of the cold flow's *own* on-demand probe —
+  is **permanently dropped**, not applied to `dynamic_neighbors`.
+- Worked trace (the candidate 1.7s): worker goes live (T0) before the dump
+  completes; cold SYN misses → `MissingNeighbor` → buffered into `pending_neigh`
+  (`poll_descriptor/mod.rs:2652`) + `trigger_kernel_arp_probe` fires; kernel
+  resolves in ~5ms and emits a seq=0 RTM_NEWNEIGH; that advert lands on the
+  monitor socket *while the thread is still in the dump loop* → dropped by the
+  seq-skip. The probe schedule (10/60/260ms) refires, but each resolution advert
+  is again a seq=0 multicast dropped during the dump. After 260ms the schedule
+  is exhausted; the SYN sits to `pending_neigh_timeout_ns` (800ms fast / 2000ms
+  fallback) → drop + recycle (`neighbor_dispatch.rs:110-112`) → client TCP RTO
+  (~1s) → **~1.7s observed**.
+- **Why this is the lead and not §3 H-A/H-B:** it explains the full 1.7s without
+  requiring a slow dump — the dump can be fast; what matters is that the
+  resolution arrives *as a seq=0 multicast during the dump window* and is
+  dropped, so the in-flight probe never resolves until after `NLMSG_DONE`.
+- **Open uncertainty (Gate-R must resolve):** does the resolution advert
+  *always* arrive during the dump (small empty-table dump → narrow window, so
+  the probe's reply at +5ms might arrive *after* `NLMSG_DONE` and be caught by
+  the steady loop), or is the dump long enough (or the probe fast enough) that
+  the seq=0 advert reliably lands inside the window? If the window is too narrow
+  to catch the probe reply, H-0 cannot fire and the 1.7s is from elsewhere
+  (single dropped SYN never buffered — Codex HIGH-1). **R1 daemon-side counters
+  for "seq-mismatch skipped during dump" decide this.**
+
 ### H-A: "empty-map + slow re-drive" startup window (daemon restart)
 At daemon start the worker threads begin polling **before**
 `initial_neighbor_dump` completes (§2.1: workers spawned first; monitor thread
@@ -177,38 +215,75 @@ ships from /research; Gate-R may use throwaway instrumentation (reverted after,
 per the #1651 precedent).
 
 ### R1 — daemon-restart reproduction + window pinning
-On fw0:
+**Codex CRITICAL-1: external `ip monitor` cannot see what the daemon socket
+skipped — add DAEMON-SIDE throwaway counters.** On fw0:
 1. `ip neigh flush all` on fw0 and on the client; `systemctl restart xpfd`.
-2. Run `ip -ts monitor neigh` on fw0 (capture the RTM_NEWNEIGH stream the
-   monitor consumes) AND timestamp:
+2. Add throwaway daemon instrumentation (reverted after, per #1651 precedent):
+   - counter A: "seq-mismatch NEW/DEL skipped during `initial_neighbor_dump`"
+     (the `neighbor.rs:434` continue branch),
+   - counter B: "NEW/DEL applied during dump",
+   - the effective `pending_neigh_timeout_ns` for the run (Codex HIGH-4),
+   - "first cold SYN queued vs recycled" (Codex HIGH-1) at
+     `poll_descriptor/mod.rs:2644/2652`,
+   - SO_RCVBUF size + any ENOBUFS/overflow on the monitor socket (Codex
+     MEDIUM-1: netlink overflow is a competing explanation).
+3. Also run `ip -ts monitor neigh` on fw0 (separate socket — corroboration only,
+   NOT the daemon's view) AND timestamp:
    - T0: worker threads go live (first poll),
    - T1: `neigh_monitor: initial kernel neighbor dump complete` log,
    - T2: first cold SYN observed (xpf debug),
    - T3: `trigger_kernel_arp_probe` fired,
    - T4: kernel RESOLVED advert for the target,
    - T5: buffered SYN forwarded (or dropped at timeout).
-3. Immediately (within the window) connect once to `172.16.80.200`. Measure
+4. **Client-side SYN capture (SMR HIGH-1):** `tcpdump` the client's SYNs. Two
+   SYNs ~1s apart = exactly one dropped SYN → RTO; this is the RTO signature
+   that confirms the 1.7s = single dropped SYN + connect overhead.
+5. Immediately (within the window) connect once to `172.16.80.200`. Measure
    connect latency. Repeat 5× with varying delay-after-restart (0ms, 50ms,
    200ms, 500ms, 2s) to map where the ~1.7s lives vs where it has decayed to
    ~ms.
-4. **Pin: how long is `initial_neighbor_dump` (T1−T0)?** Is T4 (kernel resolved)
-   consumed by the monitor before or after T1? Is the buffered SYN re-driven at
-   the 10/60/260ms schedule, or does it sit to the 800ms timeout → drop?
+6. **Pin the decisive question (H-0):** does counter A increment for the cold
+   target's resolution advert (seq=0 multicast dropped during dump)? How long is
+   `initial_neighbor_dump` (T1−T0)? Is T4 inside or after the [T0,T1] window? Is
+   the buffered SYN re-driven at the 10/60/260ms schedule, or does it sit to the
+   timeout → drop? **If counter A is 0 for the target, H-0 is refuted and the
+   1.7s must be the never-buffered single-SYN path (Codex HIGH-1).**
+7. **XDP-readiness check (SMR HIGH-3):** confirm the first slow SYN is actually
+   processed by the dataplane (in `pending_neigh`), not XDP_PASS'd to the kernel
+   because the per-CPU binding array wasn't steered yet.
 
 ### R2 — RG-promote (failover) reproduction — THE DECIDER
-1. Settle both nodes. fw0 active, fw1 standby. Ensure fw1's kernel neighbor
-   table state for the on-link target is in its **natural** post-standby state
-   (do NOT artificially flush fw1 — we want the production condition).
-2. Trigger a clean VRRP failover (priority-0 burst, or `request chassis cluster
+**Codex HIGH-2 / AGY Q2: control for standby passive-learn contamination.** The
+passive learn path (`poll_stages.rs:183`, `neighbor_dispatch.rs:320`) has no
+forwarding-active guard, so a standby node populates `dynamic_neighbors` from any
+RX frame. AGY's refinement: standby only RX's broadcast/multicast (L2 unicast MAC
+learning means an idle cold target is never seen), and NUD aging + RTM_DELNEIGH
+cools the cache — so an idle target's neighbor is likely cold at promote (World
+1). R2 must measure both:
+1. Settle both nodes. fw0 active, fw1 standby. Inspect fw1's `dynamic_neighbors`
+   AND kernel neighbor table for the target BEFORE failover (throwaway dump) —
+   record warm/cold/stale. Do NOT artificially flush fw1 (production condition).
+2. **Two targets (Codex MEDIUM-2):** target A = `172.16.80.200` (may be
+   incidentally warm if fw1 saw its broadcast ARP); target B = a *second* on-link
+   host fw1 has provably NOT seen any frame from (verify fw1's map has no entry).
+3. Trigger a clean VRRP failover (priority-0 burst, or `request chassis cluster
    failover`), so fw1 promotes.
-3. Measure: (a) VRRP failover time (must stay ~60ms), (b) first cold connect to
-   `172.16.80.200` through the *new* primary fw1, both v4 and v6, both push and
-   `-R`.
-4. Capture `ip -ts monitor neigh` on fw1 across the promote: did the on-link
-   target's neighbor already exist (warm) at promote, or was it MISSING and
-   re-resolved from scratch?
-5. Repeat the standby-aged case: let fw1 sit standby long enough for its kernel
-   neighbor for the target to age to STALE/FAILED, then failover and measure.
+4. Measure: (a) VRRP failover time (must stay ~60ms), (b) first cold connect to
+   A and B through the *new* primary fw1, both v4 and v6, both push and `-R`,
+   with client-side SYN capture for the RTO signature.
+5. Capture `ip -ts monitor neigh` on fw1 across the promote: did each target's
+   neighbor already exist (warm) at promote, or was it MISSING and re-resolved
+   from scratch?
+6. **Aged-standby case (the production worst case):** let fw1 sit standby long
+   enough for its `dynamic_neighbors` + kernel neighbor for the targets to age to
+   STALE/FAILED (NUD aging + RTM_DELNEIGH propagation), then failover and
+   measure. This is the case AGY argues makes World 1 real.
+
+### Quantitative kill bar (SMR CRITICAL-2)
+If R2 first-connect for the on-link targets after a clean failover (including
+the aged-standby case) is **≤200ms in ≥4 of 5 trials, both v4 and v6**, then
+failover is NOT affected → PLAN-KILL (deploy-restart-only artifact). If any
+target reliably hits ~1s post-failover, World 1 is confirmed → ship the fix.
 
 ### R3 — decision matrix
 | Outcome | Interpretation | Disposition |
@@ -222,6 +297,35 @@ On fw0:
 ---
 
 ## 5. Fix candidates (verify/refute at /engineer against Gate-R outcome)
+
+### 5.A.2 — Process (don't drop) mid-dump multicast adverts — THE ROOT FIX (3-way)
+**Converged lead fix.** In `initial_neighbor_dump`, do NOT `continue` past a
+NEW/DEL message whose `nlmsg_seq` doesn't match the dump request
+(`neighbor.rs:434-437`). Instead, apply NEW/DEL messages with `nlmsg_seq == 0`
+(kernel multicast adverts) into `dynamic_neighbors` during the dump, and only
+skip messages whose seq matches a *different* in-flight dump request (there is
+only one at a time here). This lets the cold flow's on-demand probe resolution
+self-heal in ~5-15ms even while the dump is in progress — making proactive
+on-link warming (5.C) unnecessary for the daemon-restart case.
+- **Correctness (SMR OQ-4, Codex/AGY verified):** `parse_neighbor_msg`
+  (`neighbor.rs:297`) is idempotent — NEW upserts by NUD state, DEL removes only
+  INCOMPLETE/FAILED. Applying a seq=0 NEW during the dump cannot corrupt a
+  dump-seq entry; worst case it applies the same resolved MAC twice. A seq=0 DEL
+  for a not-yet-dumped entry is a no-op. **Must still verify at /engineer** that
+  a stale seq=0 DEL can't remove a freshly-dumped REACHABLE entry — the NUD
+  guard at `neighbor.rs:349-353` (DEL only on INCOMPLETE|FAILED) makes this
+  safe, but pin it with a unit test.
+- **Cost:** ~5-15 LOC in the dump parser. No new threads, no promote-path
+  change, driver-agnostic.
+
+### 5.A.3 — Dual-socket design (Codex MEDIUM-3 alternative to 5.A.2)
+Use **two** netlink sockets: one for the one-shot RTM_GETNEIGH dump (closed
+after `NLMSG_DONE`), one bound to RTMGRP_NEIGH for steady-state multicast — with
+the multicast socket bound BEFORE the dump so no advert is missed and no seq
+mixing occurs. Eliminates the seq-skip hazard structurally rather than
+patching the filter. Slightly more code (two fds, two recv loops or a poll set)
+but arguably cleaner and easier to prove correct. **Compare against 5.A.2 at
+/engineer; pick one.** 5.A.2 is the minimal patch; 5.A.3 is the clean redesign.
 
 ### 5.A — Order dump-before-admit / fix monitor ordering (targets H-A)
 Make the initial neighbor seed complete (or be reliably re-drivable) before
@@ -243,14 +347,14 @@ workers admit cold flows. Sub-options:
   doesn't match the dump request (line 434–437), which would silently drop a
   live multicast RESOLVED advert that arrives mid-dump.
 
-### 5.B — Gate cold-flow admission until seeded (targets H-A, HA-risky)
-Hold cold-flow neighbor resolution (NOT all forwarding) until
-`neighbor_generation >= 1` (dump done). Fall the cold SYN to buffer-and-retry
-(already happens) but ensure the retry re-drives aggressively. **HA risk:** must
-NOT gate VRRP or established/synced-session forwarding — only the
-`MissingNeighbor` cold path. Since cold flows already buffer, this is largely a
-no-op vs 5.A unless it adds a faster re-drive trigger keyed on the
-generation-bump. Low marginal value; likely folded into 5.A.
+### 5.B — Gate cold-flow admission until seeded — REJECTED as written
+**Codex CRITICAL-2 / SMR MEDIUM-1: unsound.** `neighbor_generation` is stored
+`1` on both dump **success** (`neighbor.rs:516`) AND **failure**
+(`neighbor.rs:520`), so gating cold-flow admission on `generation >= 1` would
+admit flows even when the seed FAILED — it is a liar-flag for "seeded". Any
+seed-complete gate must key on an explicit dump-*success* state, not generation.
+Even fixed, this is largely a no-op vs 5.A.2 (cold flows already buffer), so
+**drop 5.B**; the value is in 5.A.2's self-heal, not in gating.
 
 ### 5.C — On-link warm at config-apply AND at RG-promote (targets H-C, the prize)
 Extend `queue_warm_pass` to also warm on-link destinations. The hard part (per
@@ -259,24 +363,29 @@ the old #1648 body): on-link hosts are not enumerable from config. Options:
   interface's own subnet anchors (the gateway, any statically-configured
   neighbors, DHCP server, VRRP peers) — NOT every /24 host. Low cost, but does
   NOT warm the arbitrary iperf3 target.
-- **5.C.2 Warm observed/recently-active on-link peers at promote.** At
-  RG-promote, re-warm the on-link hosts that had live sessions before failover
-  (drawn from the synced session table's on-link destinations). This directly
-  warms the hosts that matter post-failover. **Strong candidate if R2 shows
-  on-link failover hits the ~1s.** Bounded cardinality (active sessions), per-RG
-  gated, fired off the hot path via the existing warmer worker.
+- **5.C.2 Warm observed/recently-active on-link peers at promote — REJECTED
+  (3-way).** Codex HIGH-3 / AGY Q3 / SMR CRITICAL-3 converge: a *cold-connect*
+  target by definition has **no prior session**, so warming prior-session peers
+  warms exactly the hosts that don't need it and misses the one that does.
+  Worse, `prewarm_reverse_synced_sessions_for_owner_rgs` (`shared_ops.rs:72`,
+  called from `ha.rs:130`) already re-derives synced-session neighbors at
+  promote, so 5.C.2 is largely redundant. **Drop 5.C.2.** The only mechanisms
+  that help the no-prior-session cold target are (a) fast first-touch self-heal
+  (5.A.2) and (b) the steady-state probe path (already ~5ms per Gate-M).
 - **5.C.3 First-packet fast-warm (already exists).** The probe schedule
   10/60/260ms is already the first-packet fast-warm. The only lever left is
   lowering the floor — but Gate-M shows steady-state is already ~5ms, so there's
   nothing to gain here outside the startup window.
 
-### 5.D — Combination (likely answer)
-If R1 confirms H-A (dump-window re-drive broken) AND R2 confirms on-link
-failover hits ~1s: ship **5.A.2** (process mid-dump multicast adverts so the
-startup window self-heals in ~5ms) + **5.C.2** (warm prior-session on-link peers
-at promote). If R2 shows failover does NOT hit it: ship only **5.A.2** as a
-small deploy-restart polish, or PLAN-KILL if the startup window is also already
-<200ms.
+### 5.D — Likely answer (3-way converged)
+**Ship 5.A.2 (or 5.A.3) — the mid-dump multicast self-heal — as the root fix
+for BOTH daemon-restart and failover-restart windows.** It is driver-agnostic,
+off the promote critical path, and resolves the cold flow in ~5-15ms regardless
+of whether the destination is on-link or routed. 5.C (on-link proactive warm),
+5.B (admission gate), 5.A.1 (blocking pre-dump) are all rejected or
+unnecessary. The failover and daemon-restart windows share the SAME root cause
+(seq=0 multicast drop during the per-restart `initial_neighbor_dump`), so one
+fix covers both — *if* Gate-R confirms H-0.
 
 ---
 
@@ -380,22 +489,32 @@ must be run before any code.
 
 ---
 
-## 10. Recommendation (provisional, pre-Gate-R)
+## 10. Recommendation (3-way converged, pre-Gate-R)
 
-**PLAN-READY for Gate-R; fix shape conditional on R1/R2.** Do NOT ship code
-until R2 decides production-relevance:
-- **If R2 = World 1** (failover hits ~1s for on-link): ship **§5.D** = 5.A.2
-  (mid-dump multicast drain so the startup window self-heals) **+** 5.C.2
-  (warm prior-session on-link peers at RG-promote, off the hot path, per-RG
-  gated, bounded). Expected: failover first-connect ~1s → ≤200ms; VRRP
-  unchanged at ~60ms.
-- **If R2 = World 2** (failover already ~ms; only deploy-restart hits ~1s):
-  **PLAN-KILL** as a deploy-testing artifact, OR ship only the cheap 5.A.2
-  startup polish if R1 shows a clear dropped-SYN bug. Document the measurement.
+**PLAN-READY for Gate-R.** The fix shape is converged; Gate-R confirms the
+mechanism (H-0) and decides production-relevance (R2):
+- **Primary fix (both worlds): 5.A.2** (or 5.A.3 dual-socket) — process seq=0
+  multicast adverts during `initial_neighbor_dump` so the cold flow's probe
+  resolution self-heals in ~5-15ms. ~5-15 LOC, driver-agnostic, off the promote
+  critical path, no VRRP impact. This fixes the daemon-restart window
+  unconditionally and the failover window if R2 = World 1.
+- **If R1 refutes H-0** (counter A = 0 for the target; resolution advert arrives
+  *after* `NLMSG_DONE`): the 1.7s is a never-buffered single-SYN drop (Codex
+  HIGH-1) — investigate the recycle/XDP-readiness path; the fix target shifts
+  but the plan's instrumentation still pins it.
+- **If R2 = World 2** (failover ≤200ms in ≥4/5, both v4+v6, including aged
+  standby): failover is NOT affected → the residual is a `systemctl restart`
+  deploy artifact. Still ship 5.A.2 (cheap, correct, fixes deploy-testing), OR
+  PLAN-KILL if the restart window is also already <200ms. Document the
+  measurement either way.
+- **Rejected:** 5.B (liar-flag gate), 5.C.1/5.C.2 (on-link warm misses the
+  no-prior-session cold target; 5.C.2 redundant with existing prewarm),
+  5.A.1 (blocking pre-dump risks forwarding-arm/failback latency).
 
-The single most important deliverable is the **R2 failover measurement** — it
-is the difference between a real production fix and gold-plating a deploy
-artifact.
+The single most important Gate-R deliverables: (1) **R1 daemon-side counter A**
+(seq-mismatch-skipped-during-dump for the target) — confirms/refutes H-0;
+(2) **R2 failover measurement on an aged, never-seen target** — decides World 1
+vs World 2. Both are cheap and must run before any code.
 
 ---
 
@@ -403,4 +522,30 @@ artifact.
 
 See `reviewer-ids.md` for task IDs. Per-round verdicts appended below.
 
-- **r1 (draft):** pending Codex + AGY + Claude SMR.
+- **r1:** 3-way HOSTILE round complete.
+  - **Codex** (`codex-plan-r1.md`): "Not PLAN-READY for Gate-R yet … risks a
+    wrong root-cause decision because the core measurements do not directly
+    observe daemon-side netlink behavior." 2 CRITICAL / 4 HIGH / 3 MEDIUM / 1
+    LOW — all ACCEPTED into v2 (`plan-findings-r1.md`). Key: CRITICAL-1
+    (external `ip monitor` blind to daemon seq-skip → add daemon counters),
+    CRITICAL-2 (5.B generation liar-flag), HIGH-1 (first SYN may be dropped not
+    buffered), HIGH-3 (5.C.2 misses no-prior-session class), MEDIUM-3
+    (dual-socket alternative → 5.A.3).
+  - **AGY** (`agy-plan-r1.md`): "Plan READY for the Gate-R measurement" with a
+    decisive verified finding: the 1.7s is the seq=0 multicast-drop during
+    `initial_neighbor_dump` (`neighbor.rs:434-437`) → buffered SYN to 800ms
+    timeout → client 1s RTO. World 1 (failover affected) likely — standby only
+    learns from broadcast/multicast + NUD aging cools the cache. Reject 5.C.2;
+    ship 5.A.2.
+  - **Claude SMR** (`claude-smr-plan-r1.md`): PLAN-NEEDS-REVISION (r1) →
+    addressed in v2. CRITICAL-1 (hypothesis ordering — AGY's seq=0 trace is the
+    correction: dump-ordering CAN produce 1.7s via the dropped resolution
+    advert), CRITICAL-2 (passive-standby-learn + quantitative kill bar),
+    CRITICAL-3 (5.C.2 self-defeating). All folded into v2.
+  - **Convergence:** all three converge on (a) 5.A.2 mid-dump multicast
+    self-heal as the root fix, (b) reject 5.B/5.C.2, (c) Gate-R needs
+    daemon-side counters + aged-never-seen-target failover measurement. v2 is
+    PLAN-READY pending the Gate-R run at /engineer.
+
+- **r2:** v2 addresses every r1 finding. Awaiting r2 confirmation from Codex +
+  AGY that v2 is PLAN-READY (no new blockers).
