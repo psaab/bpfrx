@@ -11,7 +11,7 @@ BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime=$(BUILD_TIME)
 
 # eBPF compilation flags
-.PHONY: all generate generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp proto install clean test test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity
+.PHONY: all generate generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp proto install clean test audit-check test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity
 
 all: generate build build-ctl
 
@@ -58,6 +58,30 @@ install: build build-ctl
 
 test:
 	$(GO) test ./...
+
+# Drift guard for the committed refactoring heatmap (#1661 item 8).
+# Regenerates scripts/refactoring-audit.sh output to a temp file and
+# diffs it against the committed docs/refactoring-audit-current.txt.
+# Fails if they differ OR if the generator itself fails. Standalone by
+# design — deliberately NOT a dependency of `test`/`all`, so a PR that
+# legitimately grows a large file is not blocked until someone
+# regenerates the artifact (run this target, then commit the result).
+#
+# Recipe notes: Make runs the recipe in one shell without `set -e`, so
+# the generator is `&&`-chained to `diff` to make a generator failure
+# (not just a diff mismatch) take the error path. `trap ... EXIT`
+# guarantees the temp file is removed on every exit path.
+.PHONY: audit-check
+audit-check:
+	@tmp=$$(mktemp); \
+	trap 'rm -f "$$tmp"' EXIT; \
+	bash scripts/refactoring-audit.sh > "$$tmp" && \
+	diff -u docs/refactoring-audit-current.txt "$$tmp" || { \
+		echo "ERROR: docs/refactoring-audit-current.txt is stale or the audit script failed."; \
+		echo "Run: bash scripts/refactoring-audit.sh > docs/refactoring-audit-current.txt"; \
+		exit 1; \
+	}; \
+	echo "audit-check: refactoring-audit-current.txt is up to date"
 
 clean:
 	rm -f $(BINARY) cli xpf-userspace-dp

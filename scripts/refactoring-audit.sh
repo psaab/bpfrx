@@ -55,10 +55,43 @@ categorize() {
     if [ "$loc" -ge 2000 ]; then echo "[REFACTOR]"; else echo "[WATCH]   "; fi
 }
 
+# Echo the subset of the given paths that are existing directories, one
+# per line. Used to avoid feeding a deleted root (e.g. bpf/xdp / bpf/tc
+# after #1476) to `find`: under `set -euo pipefail` a `find` on a missing
+# path exits non-zero and aborts the script — silencing stderr with
+# `2>/dev/null` does NOT suppress the exit status. This was the #1661
+# item 8 drift root cause. The audit roots are fixed literal names with
+# no whitespace, so the caller can safely word-split the result.
+#
+# Do NOT rewrite a caller as `find ... || true | while ...`: `|` binds
+# tighter than `||`, so that parses as `find || (true | while ...)` and
+# the loop never runs on the success path.
+audit_existing_dirs() {
+    local d
+    for d in "$@"; do
+        [ -d "$d" ] && printf '%s\n' "$d"
+    done
+    # Always succeed. The loop's last `[ -d "$d" ] && printf` leaves a
+    # non-zero status when the final path is absent; with `set -e` a
+    # caller's `dirs=$(audit_existing_dirs ...)` assignment would inherit
+    # that status and abort the script — the same class of bug this
+    # helper exists to prevent.
+    return 0
+}
+
 audit_rust() {
     # userspace-xdp/src: Aya/eBPF Rust programs (lib.rs is the sole entry point,
     # currently 1373 L but grows with each new protocol handler).
-    find userspace-dp/src userspace-xdp/src -name '*.rs' 2>/dev/null \
+    #
+    # Build the dir list defensively (see audit_existing_dirs): a missing
+    # root would make `find` exit non-zero and abort the whole script under
+    # `set -e`, which is exactly the drift bug #1661 item 8 fixed.
+    local dirs
+    dirs=$(audit_existing_dirs userspace-dp/src userspace-xdp/src)
+    [ -z "$dirs" ] && return 0
+    # shellcheck disable=SC2086 # word-split intentional: $dirs is a
+    # newline/space-separated list of validated directory paths.
+    find $dirs -name '*.rs' 2>/dev/null \
         | grep -vE "$SKIP_RE" \
         | while read -r f; do
             loc=$(wc -l < "$f")
@@ -69,7 +102,11 @@ audit_rust() {
 }
 
 audit_go() {
-    find pkg cmd -name '*.go' 2>/dev/null \
+    local dirs
+    dirs=$(audit_existing_dirs pkg cmd)
+    [ -z "$dirs" ] && return 0
+    # shellcheck disable=SC2086 # see audit_rust.
+    find $dirs -name '*.go' 2>/dev/null \
         | grep -vE "$SKIP_RE" \
         | while read -r f; do
             loc=$(wc -l < "$f")
@@ -83,8 +120,20 @@ audit_go() {
 # not per-program refactor units). bpf/tc/*.c and bpf/xdp/*.c are each
 # loaded as separate BPF programs; >2000 L in one program file is a verifier
 # complexity hazard on top of a modularity smell.
+#
+# #1476 deleted the bpf/xdp and bpf/tc source trees; only bpf/headers
+# remains. audit_existing_dirs drops the absent roots so this is a no-op
+# instead of a `set -e` abort (the #1661 item 8 drift root cause: the old
+# `find bpf/xdp bpf/tc ... 2>/dev/null` silenced the stderr message but
+# NOT the non-zero exit, which aborted the script after it had already
+# printed correct output — so regeneration was skipped and the committed
+# heatmap drifted).
 audit_bpf() {
-    find bpf/xdp bpf/tc -name '*.c' 2>/dev/null \
+    local dirs
+    dirs=$(audit_existing_dirs bpf/xdp bpf/tc)
+    [ -z "$dirs" ] && return 0
+    # shellcheck disable=SC2086 # see audit_rust.
+    find $dirs -name '*.c' 2>/dev/null \
         | while read -r f; do
             loc=$(wc -l < "$f")
             if [ "$loc" -ge 1500 ]; then
