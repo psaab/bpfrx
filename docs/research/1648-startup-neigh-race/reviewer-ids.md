@@ -32,11 +32,11 @@ here so a continuation can re-fetch by id rather than re-dispatch.
 | AGY | adversarial-review-mpr1hhma-hbycu7 | PLAN-NEEDS-REVISION (stale-entry leak, key-collapsed staging, respawn, both-signal bar) | agy-plan-r4.md |
 | Claude SMR | n/a (in-conversation) | PLAN-READY (2 NITs; NIT-2 self-corrected as unsound) | claude-smr-plan-r4.md |
 
-## Round 5 (v5)
+## Round 5 (v5 @ 2f0b60bf39a5)
 | Reviewer | Task ID | Verdict | Doc |
 |---|---|---|---|
-| Codex | (pending dispatch) | (pending) | codex-plan-r5.md |
-| AGY | (pending dispatch) | (pending) | agy-plan-r5.md |
+| Codex | task-mpr22uqg-4pb4ea | (pending) | codex-plan-r5.md |
+| AGY | adversarial-review-mpr237k0-7t384z | (pending) | agy-plan-r5.md |
 | Claude SMR | n/a (in-conversation) | PLAN-READY | claude-smr-plan-r5.md |
 
 ## Notes
