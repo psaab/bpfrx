@@ -137,11 +137,11 @@ admission boundary is documented in
 - **Zone-based policies** with stateful inspection, address books, application matching, global policies
 - **NAT**: source (interface + pool, userspace-v1 address-persistent), destination (with hit counters), static 1:1, NAT64, NPTv6 (RFC 6296 stateless prefix translation)
 - **Dual-stack**: IPv4 + IPv6, DHCPv4/v6 clients, embedded Router Advertisement sender (replaces radvd), SLAAC
-- **Screen/IDS**: 11 checks (land, SYN flood, ping of death, teardrop, SYN-FIN, no-flag, winnuke, FIN-no-ACK, rate-limiting), SYN cookie flood protection (XDP-generated SYN-ACK cookies)
+- **Screen/IDS**: 11 checks (land, SYN flood, ping of death, teardrop, SYN-FIN, no-flag, winnuke, FIN-no-ACK, rate-limiting), SYN cookie flood protection (userspace-minted/validated SYN-ACK cookies replied through the AF_XDP TX path)
 - **Firewall filters**: policer (token bucket + three-color), lo0 filter, flexible match, port ranges, hit counters, logging, forwarding-class DSCP rewrite
 
 ### Flow Processing
-- **TCP MSS clamping** (ingress XDP + egress TC, including GRE-specific gre-in/gre-out)
+- **TCP MSS clamping** in the userspace AF_XDP dataplane (all-tcp, ipsec-vpn, and GRE gre-in/gre-out)
 - **ALG control**, allow-dns-reply, allow-embedded-icmp
 - **Configurable timeouts** (per-application inactivity)
 - **Session management**: filtered clearing, idle time tracking, brief tabular view, aggregation reporting
