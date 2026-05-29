@@ -527,3 +527,88 @@ func TestEmitWorkerColdPath_V3_OverflowNoSamples(t *testing.T) {
 		t.Error("no active slots ⇒ no per-zone-pair v3 series")
 	}
 }
+
+// #1635 (Copilot code-r7 finding 1): xpfCollector is a CHECKED
+// collector — every Desc emitted by Collect()/emitWorkerColdPath MUST
+// be declared in Describe(), or promhttp logs a Gather error on every
+// scrape and a HTTPErrorOnError registry returns 500. This test builds
+// the REAL collector (newCollector(nil) — Describe and emitWorkerColdPath
+// don't touch srv), captures the Describe() desc set, then drives
+// emitWorkerColdPath over a fully-populated v3 worker and asserts every
+// emitted Desc is declared. It FAILS if any cold-path desc (v1, scalar,
+// or v3) is emitted but undeclared — the registration-contract bug.
+func TestColdPathDescriptorsAreDescribed(t *testing.T) {
+	c := newCollector(nil)
+
+	// Capture the full Describe() desc set.
+	descCh := make(chan *prometheus.Desc, 256)
+	c.Describe(descCh)
+	close(descCh)
+	declared := map[*prometheus.Desc]struct{}{}
+	for d := range descCh {
+		declared[d] = struct{}{}
+	}
+
+	// Drive emitWorkerColdPath over a worker that exercises BOTH a
+	// populated v3 sparse slot AND the overflow/version/unknown paths,
+	// so every cold-path desc family is emitted at least once. Two
+	// workers: one v3-with-data, one unknown-version.
+	buckets := make([]uint64, 48)
+	buckets[6] = 3
+	workers := []dpuserspace.WorkerRuntimeStatus{
+		{
+			WorkerID:                       0,
+			ColdPathLayoutVersion:          3,
+			ColdPathActiveSlotIDs:          []uint32{0},
+			ColdPathActiveZoneFrom:         []uint32{1},
+			ColdPathActiveZoneTo:           []uint32{2},
+			ColdPathActiveSamples:          []uint64{3},
+			ColdPathActiveSumNS:            []uint64{300},
+			ColdPathActiveBuckets:          [][]uint64{buckets},
+			ColdPathActiveBuilderCollision: []bool{false},
+			ColdPathOverflowActive:         true,
+			ColdPathClockSource:            "tsc",
+		},
+		{WorkerID: 1, ColdPathLayoutVersion: 99}, // unknown-version path
+	}
+	// Also emit a v1 worker so the legacy dense families are exercised.
+	hist := make([][]uint64, 16)
+	for i := range hist {
+		hist[i] = make([]uint64, 24)
+	}
+	hist[3][5] = 1
+	workers = append(workers, dpuserspace.WorkerRuntimeStatus{
+		WorkerID:        2,
+		ColdPathLayoutVersion: 1,
+		ColdPathHist:    hist,
+		ColdPathSamples: make([]uint64, 16),
+	})
+
+	metricCh := make(chan prometheus.Metric, 1024)
+	go func() {
+		for _, w := range workers {
+			label := strconv.FormatUint(uint64(w.WorkerID), 10)
+			c.emitWorkerColdPath(metricCh, label, w)
+		}
+		close(metricCh)
+	}()
+
+	var undeclared []string
+	emitted := map[*prometheus.Desc]struct{}{}
+	for m := range metricCh {
+		d := m.Desc()
+		emitted[d] = struct{}{}
+		if _, ok := declared[d]; !ok {
+			undeclared = append(undeclared, descName(d))
+		}
+	}
+	if len(undeclared) > 0 {
+		t.Fatalf("emitWorkerColdPath emitted %d undeclared descriptors (checked-collector "+
+			"contract violation — add them to Describe()): %v", len(undeclared), undeclared)
+	}
+	// Sanity: we actually exercised the v3 + v1 + scalar families.
+	if len(emitted) < 10 {
+		t.Fatalf("expected the test to exercise the full cold-path family; only %d distinct "+
+			"descs emitted", len(emitted))
+	}
+}

@@ -296,6 +296,29 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceEventStreamDataplaneDropsTotal
 	ch <- c.userspaceEventStreamUnknownDropsTotal
 	ch <- c.workerDead
+	// #1635: cold-path histogram descriptors. xpfCollector is a CHECKED
+	// collector — every Desc emitted by Collect() (via emitWorkerColdPath)
+	// MUST be declared here, or promhttp logs a Gather error on every
+	// scrape and a HTTPErrorOnError registry returns 500. The v1 +
+	// scalar descs were never declared (a latent gap from #1619/#1621);
+	// the v3 descs added in #1635 widened it. Declare the whole family.
+	ch <- c.workerColdPathBucket
+	ch <- c.workerColdPathSamples
+	ch <- c.workerColdPathSumNS
+	ch <- c.workerColdPathAliasSeen
+	ch <- c.workerColdPathSamplePhase
+	ch <- c.workerColdPathWrapperUnderflow
+	ch <- c.workerColdPathWrapperNSBaseline
+	ch <- c.workerColdPathNSPerTSCQ32
+	ch <- c.workerColdPathClockSource
+	ch <- c.workerColdPathSnapshotFailedTotal
+	ch <- c.workerColdPathBucketV3
+	ch <- c.workerColdPathSamplesV3
+	ch <- c.workerColdPathSumNSV3
+	ch <- c.workerColdPathBuilderCollisionV3
+	ch <- c.workerColdPathOverflowActive
+	ch <- c.workerColdPathLayoutVersion
+	ch <- c.workerColdPathLayoutUnknownTotal
 	ch <- c.bindingActiveFlowCount
 	ch <- c.bindingFlowCacheCapacity
 	ch <- c.bindingTXCompletions

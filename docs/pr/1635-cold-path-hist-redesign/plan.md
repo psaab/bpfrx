@@ -407,7 +407,10 @@ Mirror the sparse fields. Add `ColdPathLayoutVersion uint32` and the seven
   series with `from_zone` / `to_zone` labels resolved from the
   `ColdPathActiveZoneFrom` / `ColdPathActiveZoneTo` indices through the snapshot's
   zone-name table.
-- other → emit `cold_path_layout_version_unknown` increment + warn.
+- other → emit the `cold_path_layout_version_unknown{worker_id, version}`
+  gauge with value 1 (a state indicator; the implementation does NOT log a
+  warning and does NOT increment a counter — it is a per-scrape gauge so
+  operators can alert on its presence).
 
 `bucketLeV3(idx int) string` returns:
 - `idx < 32` → `strconv.FormatUint(uint64((idx+1)*16-1), 10)` (linear, 15, 31, ..., 511).
@@ -453,7 +456,8 @@ Run 5/5 flake check.
 - `metrics_userspace_layout_version_3_emits_v3_with_zone_labels`: synthetic v3
   status (sparse active arrays) → v3 metrics + zone labels.
 - `metrics_userspace_layout_version_unknown_emits_warning`: synthetic v=99 →
-  no v1/v3 metrics; warning gauge increments.
+  no v1/v3 metrics; the `cold_path_layout_version_unknown{version="99"}`
+  gauge is emitted with value 1 (no log warning, no counter increment).
 - `metrics_userspace_v3_sparse_emits_only_active_slots`: 12 active slots out of
   256 → 12 series per family, not 256.
 
@@ -699,3 +703,23 @@ placement is unambiguous.
    `cold_path_layout_version_unknown` gauge that IS emitted). The §2.3
    design-prose mention of a hypothetical out-of-range counter is
    historical narrative; `overflow_active` is the shipped signal.
+
+### §IMPL.r7 Code-review round-7 fixes (Copilot, at the comment-fix HEAD)
+
+1. **Describe() registration-contract violation (SUBSTANTIVE).** All 17
+   cold-path descriptors were emitted by `Collect()`
+   (`emitWorkerColdPath`) but NONE were sent in
+   `xpfCollector.Describe()`. `xpfCollector` is a CHECKED collector, so
+   emitting undeclared `Desc`s makes promhttp log a Gather error on
+   every scrape and a `HTTPErrorOnError` registry return 500. The v1 +
+   scalar descs were already missing (latent gap from #1619/#1621); the
+   v3 descs added in #1635 widened it. Fix: declare the whole cold-path
+   family (v1 bucket/samples/sum_ns/alias_seen, the scalars, and the v3
+   bucket/samples/sum_ns/builder_collision + overflow_active +
+   layout_version + layout_version_unknown) in `Describe()`. Proof: a
+   metrics scrape now produces no registry/Gather error.
+
+2. **Plan text drift on the unknown-version metric (doc NIT).** The plan
+   said it "increments + warns", but the impl emits a `GaugeValue=1`
+   state indicator with no log warning and no counter increment. Plan
+   §4.8 + §5.2 text corrected to match the shipped behavior.
