@@ -16,3 +16,9 @@
 - AGY: adversarial-review-mpr5spiq-lcavkt
 - Copilot: requested via @copilot review on PR #1660
 - Claude SMR: in-conversation hostile review (below)
+
+## Code review (round 2 — follow-up on a4b9322bf after addressing Codex minors)
+- Codex: task-mpr66mkq-t86yph — MERGE-READY (both minors addressed, 53 placeholders=53 args, refactor behavior-identical)
+- AGY: adversarial-review-mpr5spiq-lcavkt — MERGE-READY (round 1; delta is review-fixes only)
+- Copilot: COMMENTED on b215c201e, zero inline comments (clean); did not re-fire on a4b9322bf
+- Claude SMR: MERGE-READY
