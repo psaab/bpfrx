@@ -1,14 +1,16 @@
 # #1648 — Startup/failover neighbor-dump race: first cold connect ~1s
 
-**Status:** v5 (research-only; /research, not /engineer) — r4 closed with Codex
-PLAN-NEEDS-MINOR + AGY PLAN-NEEDS-REVISION (verified NEW Window-3 stale-entry
-leak; staging-overflow fallback unsound). v5 upgrades 5.A.2 to a **Double-Buffered
-Atomic Swap** (fixes seq=0 drop AND the stale-entry leak in one mechanism),
-adopts a **Key-Collapsed Staging Map**, replaces the steady-state-converge
-fallback with a **bounded re-dump**, mandates monitor **respawn-on-panic**,
-tightens the kill bar to **RTO-signature AND daemon-counter**, narrows Window-3 to
-**binding reconcile / worker rebuild** (not policy-only commit), and fixes the
-stale R3 clean-failover matrix cell. Pending r5 convergence.
+**Status:** v6 (research-only; /research, not /engineer) — r5 closed with AGY
+PLAN-READY but Codex PLAN-NEEDS-REVISION (two verified blockers: (1) the v5
+full-clear swap would ERASE worker-learned neighbors written during the dump
+window — workers write `dynamic_neighbors` directly via ARP/NA/L3; (2) the AGY r4
+"stale-entry leak" H-E is FALSE — `stop_inner` already clears the full map at
+`coordinator/mod.rs:261`). v6 **reverts the full-clear swap** back to a
+**staged-replay that upserts into the live (empty-at-bringup) map** — fixing the
+seq=0 drop (H-0) with the staging-replay alone, with NO blanket clear. Retains the
+Key-Collapsed Staging Map, bounded re-dump fallback, respawn-on-panic, both-signal
+kill bar, Window-3 BINDING-reconcile narrowing, and the rebuilt R3 matrix. H-E
+retracted. Pending r6 convergence.
 
 > **v3 KEY CORRECTION (AGY r2, verified):** `initial_neighbor_dump` runs **only
 > once at daemon startup** (`neighbor.rs:514`, inside the detached
@@ -268,35 +270,30 @@ mechanism is one of:
   change re-opens it), so 5.A.2 is production-relevant independent of the
   failover question.
 
-### H-E (AGY r4, VERIFIED): Window-3 stale-entry cache leak (pre-existing bug)
-**Distinct from the latency race — a correctness/security bug AGY r4 found while
-verifying the dump path. It exists on `master` today, independent of this plan.**
+### H-E (AGY r4 → RETRACTED at r5): Window-3 stale-entry leak does NOT exist
+**AGY r4 claimed a "CRITICAL NEW BUG" — a Window-3 stale-entry cache leak — and
+v5 built the Double-Buffered Atomic Swap partly to fix it. Codex r5 refuted this
+against the active code, and the parent verified the refutation. H-E is RETRACTED.
+There is no stale-entry leak on master.**
 
-- `dynamic_neighbors` (`ShardedNeighborMap`) is a **long-lived** structure owned
-  by `Coordinator` and shared with workers.
-- On a Window-3 BINDING reconcile, `teardown::tear_down` (`teardown.rs:28`) →
-  `stop_inner` clears `monitor_stop` / `warm_stop` / `warm_queue`
-  (`coordinator/mod.rs:199+`) but **never clears or resets
-  `self.neighbors.dynamic`** (verified by parent: stop_inner touches the stop
-  flags and the warm queue only).
-- When `bring_up_workers` respawns the monitor, `initial_neighbor_dump` runs
-  against the **same dirty map** (`bringup.rs:338`). The dump's `28 | 29`
-  (NEW/DEL) path **only upserts** (`neighbor.rs:446`); it never removes entries
-  the dump didn't see.
-- **Consequence:** any neighbor that was **deleted in the kernel** during the
-  teardown/reload window (e.g. an IP reallocation, a host that left, NUD aging to
-  FAILED+GC) **remains in `dynamic_neighbors` permanently** — a stale `(ifindex,
-  IP) → MAC` mapping that survives every subsequent reload. If that IP is later
-  reassigned to a different host, the dataplane forwards to the **stale MAC** → an
-  **L2 traffic leak / blackhole**. This is a latent correctness/security defect,
-  not a latency defect.
-- **Why this matters for the fix selection:** the v5 root fix (5.A.2 Double-
-  Buffered Atomic Swap) **replaces** the active map atomically rather than
-  upserting into it, so it fixes H-E (stale-entry leak) **and** H-0 (seq=0 drop)
-  with one mechanism. H-E is called out so /engineer knows the swap is doing
-  double duty — and so the unit/cluster tests cover the leak, not just the
-  latency. (Gate-R does not need to *prove* H-E to justify the fix — it is a
-  code-verified pre-existing bug; Gate-R proves H-0.)
+- AGY's premise was that `stop_inner` never clears `self.neighbors.dynamic`, so a
+  config-reload's respawned upsert-only dump would let kernel-deleted neighbors
+  persist forever.
+- **This is false.** `stop_inner` DOES clear the entire dynamic map at
+  `coordinator/mod.rs:261-267`:
+  ```
+  // #949: clear all shards atomically vs readers.
+  self.neighbors.dynamic.with_all_shards(|bulk| {
+      for shard in bulk.each_shard_mut() { shard.clear(); }
+  });
+  ```
+  (AGY r4/r5 read only `stop_inner` lines 199-208 and stopped before line 261.)
+- **Consequence for the design:** on every teardown (Window-1/3), the map is
+  **fully cleared while workers are already stopped** (`workers.stop_and_clear` at
+  `coordinator/mod.rs:221`, before the clear at :261). So at the next bringup the
+  map starts **empty** — there is nothing stale to purge, and no leak.
+- **This also REMOVES the justification for a full-clear swap** (and exposes a NEW
+  blocker that the full-clear swap *introduces*) — see §5.A.2 v6.
 
 ### H-C: failover does NOT hit the ~1s (the KILL hypothesis)
 On RG-promote, `on_rg_promote_active` already fires a forced warm pass — but
@@ -442,7 +439,7 @@ names the specific fix justified by that signal (Codex r4 finding 6).**
 | Outcome | Interpretation | Disposition |
 |---|---|---|
 | R2 first-connect ≤ ~tens of ms, target-B warm at promote (kernel + `dynamic_neighbors`) | failover does NOT hit the ~1s; only restart/binding-reconcile does | **PLAN-KILL the failover scope** (deploy/restart-only artifact); restart/W3 scope decided separately by R1 |
-| **Crash promote** both-signal World-1 (fw1 daemon rebooted → fresh `initial_neighbor_dump`) | startup-window seq=0 drop on the new primary | ship **5.A.2** (Double-Buffered Atomic Swap) — it is a startup window |
+| **Crash promote** both-signal World-1 (fw1 daemon rebooted → fresh `initial_neighbor_dump`) | startup-window seq=0 drop on the new primary | ship **5.A.2** (staged-replay into the live map) — it is a startup window |
 | **Clean failover** both-signal World-1 **AND** ENOBUFS observed on fw1's steady-state monitor (H-D.1) | netlink overflow desynced the standby map | ship **5.E** (ENOBUFS resync + socket-recreation), which depends on 5.A.2 |
 | **Clean failover** both-signal World-1 **but ENOBUFS == 0** (Codex r4 finding 3) | UNKNOWN H-D / first-packet path — neither 5.A.2 (no dump at clean promote) nor 5.E (no overflow) applies | **do NOT ship either fix; escalate** — re-instrument the steady-state loop + standby map aging path; this cell is unresolved by the current hypotheses |
 | R1 counter A increments for the target's resolution advert (seq=0 dropped during dump) | restart-window seq=0 drop confirmed (H-0) | ship **5.A.2** for the restart/W3 scope |
@@ -453,75 +450,82 @@ names the specific fix justified by that signal (Codex r4 finding 6).**
 
 ## 5. Fix candidates (verify/refute at /engineer against Gate-R outcome)
 
-### 5.A.2 — Double-Buffered Atomic Swap — THE ROOT FIX (3-way, upgraded v5)
-**Converged lead fix, upgraded at r4 from "patch the dump-parser seq-skip in
-place" to a full double-buffered atomic swap. This single mechanism fixes BOTH
-the H-0 seq=0 multicast drop AND the H-E Window-3 stale-entry leak.**
+### 5.A.2 — Staged-Replay into the live (empty-at-bringup) map — THE ROOT FIX (v6)
+**v6 reverts the v5 full-clear "Double-Buffered Atomic Swap" — Codex r5 verified
+it is BOTH unnecessary AND actively harmful — back to a staged-replay that upserts
+into the live map. The fix is the seq=0 staging-replay alone; no full clear.**
 
-The old v4 shape ("apply seq=0 NEW/DEL into `dynamic_neighbors` during the dump,
-staging-then-replay") fixes H-0 but does NOT fix H-E: it still *upserts* into the
-long-lived map and never removes entries the new dump didn't see, so kernel-
-deleted neighbors leak forever (§3 H-E). AGY r4's verified fix is to build the
-new neighbor table **off to the side** and **atomically replace** the active map.
+**Why the v5 full-clear swap is wrong (Codex r5 blockers 1 + 3, verified):**
+- It is **unnecessary**: the map is already fully cleared at teardown
+  (`coordinator/mod.rs:261-267`, while workers are stopped), so at bringup the
+  map starts **empty**. There are no stale entries to purge (H-E retracted, §3).
+- It is **actively harmful**: workers go live and serve traffic *before* the
+  monitor's `initial_neighbor_dump` runs (workers spawned at `bringup.rs:233`,
+  monitor at `bringup.rs:338`). Live workers **write directly** into
+  `dynamic_neighbors` outside the netlink stream — ARP reply insert
+  (`poll_stages.rs:80`), NDP NA insert (`poll_stages.rs:103`), and L3 source
+  learning → `learn_dynamic_neighbor` bulk insert (`poll_stages.rs:189` →
+  `neighbor_dispatch.rs:340`). A full clear+copy that contains only dump rows +
+  staged netlink deltas would **erase any neighbor a worker learned during the
+  dump window** — a regression the #949 manager path avoids (it removes only
+  *tracked* manager keys, never a blanket clear of worker-learned entries,
+  `coordinator/mod.rs:165-178`).
 
-**Mechanism (the precise patch shape):**
-1. `initial_neighbor_dump` builds a **thread-local, empty temporary map**
-   `FastMap<(i32, IpAddr), NeighborEntry>` (or equivalent) — NOT the live map.
-2. Populate the local map from the GETNEIGH dump rows (the existing `28 | 29`
-   parse path at `neighbor.rs:446`, retargeted at the local map).
-3. **Stage** every `seq == 0` (multicast) NEW/DEL into a **Key-Collapsed Staging
-   Map** (see below) instead of `continue`-skipping it (`neighbor.rs:434-437`).
-4. After `NLMSG_DONE`, **replay** the staged deltas onto the local map (dump rows
-   first, then live deltas → last-writer-wins is correct).
-5. **Atomic swap:** lock the active `dynamic_neighbors` via `with_all_shards`
-   (`sharded_neighbor.rs:135`), **clear every shard**, then copy the local map
-   into the shards — all under the single bulk lock. Readers (workers) see either
-   the entire pre-swap set or the entire post-swap set, never a half-replaced
-   one.
-- **This is an established in-tree pattern, not a new primitive.** The #949
-  manager-key path at `coordinator/mod.rs:169` already does exactly
-  "replace + insert under a single `with_all_shards` bulk acquisition so readers
-  see either the pre-replace or post-replace state, never a half-replaced set …
-  locks all 64 shards in shard-index order (deadlock-free invariant)." 5.A.2
-  reuses that pattern for the full-table swap. The clear-then-copy variant is the
-  natural extension of the existing `replace`-branch remove+insert.
+**v6 mechanism (the precise patch shape):**
+1. `initial_neighbor_dump` **upserts dump rows directly into the live
+   `dynamic_neighbors`** as they arrive — the existing `28 | 29` path at
+   `neighbor.rs:446` is unchanged (the map is empty at bringup, so this is a clean
+   seed; each insert/remove is atomic per-key under the shard lock and composes
+   with concurrent worker writes — a worker-learned entry is preserved unless a
+   later dump row or seq=0 delta for the *same key* overwrites it, which is
+   correct last-writer-wins).
+2. **Stage** every `seq == 0` (multicast) NEW/DEL into a **Key-Collapsed Staging
+   Map** (see below) instead of `continue`-skipping it (`neighbor.rs:434-437`) —
+   this is the H-0 fix.
+3. After `NLMSG_DONE`, **replay** the staged seq=0 deltas onto the live map via
+   per-key `insert`/`remove` (the resolution adverts that were dropped during the
+   dump are now applied). NO clear; NO blanket copy.
+- **Net change vs master:** ~10-20 LOC — add a staging map, stage seq=0 type-28/29
+  during the dump, replay after NLMSG_DONE. The dump's existing upsert-into-live
+  behavior is retained.
 
-**Key-Collapsed Staging Map (replaces the v4 FIFO-Vec; AGY r4 finding 3 + Codex
-r4 check 1 + SMR r4 NIT-1):**
+**Key-Collapsed Staging Map (AGY r4 finding 3 + Codex r4/r5 check + SMR r4 NIT-1):**
 - Stage seq=0 deltas in a map keyed by `(ifindex, IP)` storing only the **latest
-  state** for each key (NEW overwrites; DEL records a tombstone/removal-intent).
-- This is **order-independent on replay** — each key has exactly one final entry,
-  so the map's iteration order is irrelevant and last-writer-wins holds naturally.
-  It supersedes the FIFO-Vec, which required strict arrival-order replay to be
-  correct (SMR r4 NIT-1's concern is dissolved: there is no ordering contract to
-  get wrong because each key collapses to its final state as it is staged).
-- **DEL-then-NEW vs NEW-then-DEL on the same key:** both resolve correctly because
-  staging is applied *in arrival order as messages are read* (each incoming seq=0
-  message overwrites that key's staged state), so the staged map already holds the
-  last-writer state before replay begins. The replay then applies that single
-  final state. (Verify at /engineer: the stage step must overwrite on each
-  message; a DEL after a staged NEW must replace the NEW with the removal-intent,
-  and vice-versa.)
-- **Memory bound:** naturally bounded by the number of unique neighbor IPs (kernel
-  neigh table size, already capped by `gc_thresh*`). No unbounded growth.
+  state** per key (NEW overwrites with `Present(MAC)`; DEL overwrites with an
+  explicit `Tombstone` — NOT "remove the key from the staging map").
+- **Order-independent on replay** — each key has exactly one final entry, so map
+  iteration order is irrelevant; last-writer-wins holds naturally (dissolves SMR
+  r4 NIT-1's FIFO-replay contract). The collapse happens at *stage time* (each
+  incoming seq=0 message overwrites that key's staged state, in socket arrival
+  order), so the staged map holds the final state before replay begins.
+- **DEL-then-NEW vs NEW-then-DEL on the same key (Codex r5 + AGY r5 verified):**
+  DEL-then-NEW → staged `Tombstone`→`Present` → replay inserts → **present** ✓;
+  NEW-then-DEL → staged `Present`→`Tombstone` → replay removes the key →
+  **removed** ✓. (Verify at /engineer: DEL must be an explicit tombstone so replay
+  *actively removes*; modeling DEL as "absent from staging map" is a bug — it
+  would leave a dump-row entry for that key un-removed.)
+- **Memory bound:** naturally bounded by unique neighbor IPs (kernel `gc_thresh*`).
+  No unbounded growth.
 
 - **MANDATORY guard (AGY r2 (a), verified at `neighbor.rs:438-444`):** NLMSG_DONE
   / NLMSG_ERROR handling MUST stay gated on `nlmsg_seq == next_seq`. The fix
   stages **only type-28/29 (NEW/DEL)** for seq=0; DONE/ERROR remain seq-matched.
   A seq=0 NLMSG_DONE/ERROR must NOT terminate or fail the dump. Not "process all
   seq=0".
-- **Concurrency correctness (r5 review target):** the swap holds all 64 shards
-  (`with_all_shards`, shard-index order, deadlock-free per the #949 invariant)
-  for the clear+copy. A worker doing `lookup_neighbor_entry` mid-swap blocks on
-  the shard lock and then sees the post-swap state. There is **no lookup-miss
-  window** that wasn't already present in the #949 replace path — and crucially
-  the swap is a one-shot at dump-completion, not per-packet, so the brief bulk-
-  lock hold (copy of ≤ kernel-neigh-table entries) is off the hot path.
-- **Cost:** moderate — a thread-local map + staging map + the swap. No new
-  threads, no promote-path change, driver-agnostic. Fixes daemon-restart +
-  crash-promote (fw1 reboot) windows (H-0) AND the Window-3 stale-entry leak
-  (H-E) in one mechanism. Does NOT fix clean-failover-without-restart (see
-  H-D / 5.E) — but 5.E reuses this same swap for its resync dump.
+- **Concurrency correctness (Codex r5 + AGY r5 verified):** each per-key
+  `insert`/`remove` during the dump and during replay takes the single target
+  shard lock (`sharded_neighbor.rs:87-90`); workers reading via
+  `lookup_neighbor_entry` (`forwarding/mod.rs:1529`) or writing via the ARP/NA/L3
+  paths block on the same shard lock. Because v6 does **per-key** ops (not a
+  blanket clear), a worker-learned entry for a key the dump/staging never touches
+  is **preserved** — this is the fix vs the v5 full-clear blocker. Workers read
+  the `Arc<ShardedNeighborMap>` **directly** (`worker/loop_body/mod.rs:20`), NOT a
+  cloned `ForwardingState` ArcSwap (AGY r5), so the replayed deltas are
+  immediately visible with no republish needed.
+- **Cost:** small — staging map + replay, no clear, no new threads, no
+  promote-path change, driver-agnostic. Fixes daemon-restart + crash-promote (fw1
+  reboot) + Window-3 BINDING-reconcile windows (H-0). Does NOT fix clean-failover
+  (see H-D / 5.E); 5.E reuses this same staged-replay dump for its resync.
 
 ### 5.A.3 — Dual-socket design (Codex MEDIUM-3 alternative to 5.A.2)
 Use **two** netlink sockets: one for the one-shot RTM_GETNEIGH dump (closed
@@ -541,13 +545,13 @@ workers admit cold flows. Sub-options:
   forwarding-arm critical path (measured in R1 as dump duration — if <50ms,
   acceptable; this directly competes with the ~60ms VRRP budget at promote, so
   it must NOT be on the promote path — see §6).
-- **5.A.2 (the lead) — Double-Buffered Atomic Swap.** See the full §5.A.2
+- **5.A.2 (the lead) — staged-replay into the live map.** See the full §5.A.2
   sub-section above. In short: the dump's `nlmsg_seq != next_seq` skip at
   `neighbor.rs:434-437` currently silently drops live multicast RESOLVED adverts
-  that arrive mid-dump; the fix builds the table off to the side (dump rows +
-  key-collapsed staged seq=0 deltas), then atomically swaps it into
-  `dynamic_neighbors` under `with_all_shards`. This both stops the seq=0 drop
-  (H-0) and clears the stale-entry leak (H-E).
+  that arrive mid-dump; the fix stages seq=0 NEW/DEL into a key-collapsed map
+  during the dump and replays them onto the live `dynamic_neighbors` (per-key
+  insert/remove) after `NLMSG_DONE`. No blanket clear (which would erase
+  worker-learned entries). Stops the seq=0 drop (H-0).
 
 ### 5.B — Gate cold-flow admission until seeded — REJECTED as written
 **Codex CRITICAL-2 / SMR MEDIUM-1: unsound.** `neighbor_generation` is stored
@@ -579,18 +583,18 @@ the old #1648 body): on-link hosts are not enumerable from config. Options:
   lowering the floor — but Gate-M shows steady-state is already ~5ms, so there's
   nothing to gain here outside the startup window.
 
-### 5.D — Likely answer (3-way converged, v5)
-**Ship 5.A.2 (Double-Buffered Atomic Swap; 5.A.3 dual-socket as the alternative
-to weigh at /engineer) as the root fix for BOTH daemon-restart and
-failover-restart (crash-promote) windows AND the Window-3 BINDING-reconcile
-window.** It is driver-agnostic, off the promote critical path, resolves the cold
-flow in ~5-15ms regardless of on-link vs routed, and additionally fixes the
-verified H-E stale-entry leak in the same swap. 5.C (on-link proactive warm),
-5.B (admission gate), 5.A.1 (blocking pre-dump) are all rejected or unnecessary.
+### 5.D — Likely answer (3-way converged, v6)
+**Ship 5.A.2 (staged-replay into the live map; 5.A.3 dual-socket as the
+alternative to weigh at /engineer) as the root fix for daemon-restart,
+failover-restart (crash-promote), AND Window-3 BINDING-reconcile windows.** It is
+driver-agnostic, off the promote critical path, resolves the cold flow in
+~5-15ms regardless of on-link vs routed. 5.C (on-link proactive warm),
+5.B (admission gate), 5.A.1 (blocking pre-dump) are all rejected or unnecessary;
+the v5 full-clear swap is rejected (erases worker-learned entries — Codex r5).
 The daemon-restart, crash-promote (fw1 reboot), and Window-3 BINDING-reconcile
-windows share the SAME root cause (seq=0 multicast drop + stale-entry leak during
-the per-respawn `initial_neighbor_dump`), so 5.A.2 covers all three — *if* Gate-R
-confirms H-0 (H-E needs no Gate-R; it is code-verified). Ship 5.F
+windows share the SAME root cause (seq=0 multicast drop during the per-respawn
+`initial_neighbor_dump`), so 5.A.2 covers all three — *if* Gate-R confirms H-0.
+Ship 5.F
 (respawn-on-panic) as hardening alongside.
 **A clean VRRP failover (no restart) is a SEPARATE window with a different
 mechanism (H-D); if R2 shows clean-failover both-signal World-1 WITH ENOBUFS, the
@@ -617,12 +621,21 @@ not on `on_rg_promote_active`). **Verify at Gate-R that ENOBUFS actually occurs
 before building this — it may be theoretical.**
 - **5.E DEPENDS ON 5.A.2:** the ENOBUFS resync re-runs a dump on a socket that is
   still receiving multicast adverts — so it re-introduces the exact seq=0-drop H-0
-  describes unless the resync uses the 5.A.2 double-buffered swap (stage seq=0
-  NEW/DEL, keep DONE/ERROR seq-matched, atomic clear+copy) or a 5.A.3 dual-socket.
+  describes unless the resync uses the 5.A.2 staged-replay (stage seq=0 NEW/DEL,
+  keep DONE/ERROR seq-matched, replay after NLMSG_DONE) or a 5.A.3 dual-socket.
   5.E is therefore not independent of 5.A.2 — ship 5.A.2 first, then 5.E reuses
-  the swap. This also means **5.A.2 has standalone value even if Window-1 is ruled
-  World 2** (it is a prerequisite for any future resync, and independently it
-  fixes the H-E stale-entry leak that exists on master today).
+  the staged-replay. This means **5.A.2 has standalone value even if Window-1 is
+  ruled World 2** (it is a prerequisite for any future resync).
+- **5.E resync purge nuance (/engineer):** unlike the bringup dump (map empty
+  after teardown), an ENOBUFS resync runs on a **live standby with a populated
+  map**. After an ENOBUFS overflow some entries may be stale (kernel-deleted while
+  the socket was congested). A plain staged-replay-upsert will NOT remove them. So
+  the resync DOES need a reconcile-style purge — but it must be a **per-key diff
+  against the fresh dump** (remove keys present in the map but absent from the
+  dump set AND not worker-owned), NOT a blanket clear (which would erase
+  worker-learned entries, the same Codex-r5 blocker). This is the one place a
+  side-table + targeted removal is justified; it is /engineer-time detail, gated
+  on ENOBUFS actually being observed (H-D.1).
 
 ### 5.E.1 — Staging-overflow fallback: bounded re-dump (NOT steady-state-converge)
 **Retraction (Codex r4 finding 2 + AGY r4 finding 4 — both confirm; SMR r4 NIT-2
@@ -716,31 +729,29 @@ must be run before any code.
 ## 8. Test plan (at /engineer, if a fix ships)
 
 **(5.C.2 is REJECTED — no test for it; Codex r3 HIGH-3 removed the contradiction.)**
-- Unit (5.A.2 swap): `initial_neighbor_dump` builds a side table and atomically
-  swaps it in. A seq=0 type-28 NEW arriving during the dump is **staged
-  (key-collapsed) then replayed onto the local table** and lands in
-  `dynamic_neighbors` after the swap; a seq=0 NLMSG_DONE/NLMSG_ERROR is NOT
-  treated as dump-terminating (stays seq-matched).
+- Unit (5.A.2 staged-replay): a seq=0 type-28 NEW arriving during the dump is
+  **staged (key-collapsed) then replayed onto the live map** after `NLMSG_DONE`
+  and lands in `dynamic_neighbors`; a seq=0 NLMSG_DONE/NLMSG_ERROR is NOT treated
+  as dump-terminating (stays seq-matched).
 - Unit (5.A.2 last-writer-wins): for the **same key**, DEL-then-NEW ⇒ entry
-  **present** after swap; NEW-then-DEL ⇒ entry **removed** after swap (the
-  key-collapsed staging map holds the last-writer state; replay applies it once).
-- Unit (5.A.2 stale-entry leak / H-E): an entry present in `dynamic_neighbors`
-  before the dump but ABSENT from the dump rows (kernel-deleted) is **gone after
-  the swap** (the clear+copy removes it). This is the regression test for the
-  pre-existing leak.
-- Unit (5.A.2 atomicity): a concurrent reader either sees the full pre-swap set
-  or the full post-swap set — never a partial set (exercise via the
-  `with_all_shards` bulk-lock path, mirroring the #949 invariant).
+  **present**; NEW-then-DEL ⇒ entry **removed** (the key-collapsed staging map
+  holds the last-writer state; DEL is an explicit tombstone so replay actively
+  removes).
+- Unit (5.A.2 preserves worker writes — the Codex-r5 regression): an entry a
+  worker inserted directly (ARP/NA/L3 path) into `dynamic_neighbors` during the
+  dump window, for a key the dump and staging never touch, is **still present
+  after replay**. This is the regression test against the rejected v5 full-clear
+  swap. (No blanket clear: the dump/replay must use per-key insert/remove.)
 - Unit (5.E.1 overflow fallback): staging overflow marks dirty + schedules ≤1
   re-dump; a second overflow stops re-dumping and increments the degraded metric
   (NO unbounded re-dump; NO silent discard-and-converge).
 - Unit (5.F respawn): a panic in the monitor body respawns the monitor (bounded
-  backoff), and the respawned monitor re-runs the dump/swap.
+  backoff), and the respawned monitor re-runs the dump/staged-replay.
 - Unit (5.A.3, if chosen instead): dual-socket — multicast socket bound before
   the dump captures the resolution advert; dump socket closed after NLMSG_DONE.
 - Unit (5.E, only if H-D.1 confirmed): ENOBUFS on the steady-state loop triggers
-  socket recreation + resync (via the 5.A.2 swap); the permanent ENOBUFS counter
-  increments.
+  socket recreation + per-key-diff resync (NOT a blanket clear); the permanent
+  ENOBUFS counter increments.
 - Cluster smoke (full matrix): v4+v6 × push+`-R` × CoS-off+CoS-on first-connect
   after restart ≤200ms; after BINDING-reconcile commit ≤200ms; after clean +
   crash failover ≤200ms — zero both-signal World-1 condition on the cold target.
@@ -804,38 +815,45 @@ must be run before any code.
     does NOT respawn → a panic permanently freezes the neighbor cache. §5.F
     mandates a bounded respawn-on-panic with backoff (paired with OQ-6's
     persistent-errno break/recreate to avoid a 100%-CPU crash loop).
-11. **Double-buffered swap concurrency (r5 review target):** does the
-    clear+copy-under-`with_all_shards` swap (`sharded_neighbor.rs:135`) introduce
-    a lookup-miss window for workers mid-swap, or does the bulk lock make the swap
-    atomic to readers as the #949 path claims (`coordinator/mod.rs:169`)? The swap
-    is one-shot at dump completion (not per-packet), so the brief bulk-lock hold
-    is off the hot path — but /engineer must confirm no reader path bypasses the
-    shard lock.
+11. **Staged-replay vs concurrent worker writes (RESOLVED at r5/v6):** Codex r5
+    proved a full-clear swap would erase worker-learned neighbors (workers write
+    `dynamic_neighbors` directly via ARP/NA/L3 at `poll_stages.rs:80/103/189` →
+    `neighbor_dispatch.rs:340` during the dump window). v6 therefore uses per-key
+    `insert`/`remove` into the live map (no blanket clear), each atomic under the
+    target shard lock (`sharded_neighbor.rs:87-90`); workers read the
+    `Arc<ShardedNeighborMap>` directly (`worker/loop_body/mod.rs:20`, AGY r5) so
+    replayed deltas are visible immediately. /engineer must keep the per-key
+    discipline (no clear) and confirm DEL is an explicit tombstone.
+12. **H-E retraction (RESOLVED at r5):** the AGY-r4 "stale-entry leak" does NOT
+    exist — `stop_inner` already clears the full map at `coordinator/mod.rs:261`
+    (Codex r5). The bringup map is empty; there is nothing to purge. The 5.E
+    resync (live populated map) is the only place needing a purge, and that must
+    be a per-key diff, NOT a blanket clear (§5.E).
 
 ---
 
-## 10. Recommendation (3-way converged, v5, pre-Gate-R)
+## 10. Recommendation (3-way converged, v6, pre-Gate-R)
 
 **PLAN-READY for Gate-R.** Gate-R confirms the latency mechanism per window and
 decides which fix (if any) ships for the failover scope. The fix shape is now
-fixed (the Double-Buffered Atomic Swap); Gate-R decides *scope*, not *mechanism*.
+fixed (the **staged-replay into the live map**, NOT a full-clear swap); Gate-R
+decides *scope*, not *mechanism*.
 
 - **Daemon-restart + crash-promote (fw1 reboots) + Window-3 BINDING reconcile:**
   if R1 counter A confirms H-0 (seq=0 resolution advert dropped during
-  `initial_neighbor_dump`), ship **5.A.2 — the Double-Buffered Atomic Swap**
-  (5.A.3 dual-socket is the alternative to weigh at /engineer): build the table
-  off to the side from dump rows + key-collapsed staged seq=0 deltas, keep
-  NLMSG_DONE/ERROR seq-matched (AGY r2 (a) guard), then atomically clear+copy
-  under `with_all_shards` (the established #949 pattern at
-  `coordinator/mod.rs:169`). This fixes H-0 (seq=0 drop) AND the **verified H-E
-  stale-entry leak** in one mechanism, driver-agnostic, off the promote / VRRP
-  path. Ship **5.F (respawn-on-panic)** as hardening alongside, and **5.E.1
-  bounded-re-dump** overflow fallback.
+  `initial_neighbor_dump`), ship **5.A.2 — the staged-replay** (5.A.3 dual-socket
+  is the alternative to weigh at /engineer): stage seq=0 type-28/29 into a
+  key-collapsed map during the dump, keep NLMSG_DONE/ERROR seq-matched (AGY r2 (a)
+  guard), then replay the staged deltas onto the **live** `dynamic_neighbors` via
+  per-key insert/remove after `NLMSG_DONE`. **No blanket clear** — that would
+  erase worker-learned entries (Codex r5 blocker 1). Fixes H-0 (seq=0 drop),
+  driver-agnostic, off the promote / VRRP path. Ship **5.F (respawn-on-panic)** as
+  hardening alongside, and **5.E.1 bounded-re-dump** overflow fallback.
 - **Clean VRRP failover (fw1 daemon stays up):** H-0 cannot apply (no dump at
   promote). The fix depends on what R2 shows (R3 matrix):
   - both-signal World-1 **WITH** ENOBUFS → ship **5.E** (ENOBUFS resync via the
-    5.A.2 swap + socket-recreation + larger SO_RCVBUF). Build 5.E only if ENOBUFS
-    is actually observed (H-D.1).
+    5.A.2 staged-replay + per-key-diff purge + socket-recreation + larger
+    SO_RCVBUF). Build 5.E only if ENOBUFS is actually observed (H-D.1).
   - both-signal World-1 **with ENOBUFS==0** → **UNKNOWN path; escalate, ship
     neither** (Codex r4 finding 3).
 - **If R1 refutes H-0** (counter A == 0; resolution arrives after `NLMSG_DONE`):
@@ -848,14 +866,16 @@ fixed (the Double-Buffered Atomic Swap); Gate-R decides *scope*, not *mechanism*
   the *failover* scope. Separately, if Window-1 (restart) OR Window-3
   (BINDING-reconcile) shows the both-signal condition → ship 5.A.2 for that scope
   (NOT "ship anyway after a kill" — a distinct, independently-justified scope).
-- **H-E (stale-entry leak) is independent of Gate-R:** it is a code-verified
-  pre-existing correctness bug on master, fixed opportunistically by the same
-  swap. Even if every latency scope turned World 2, the swap is still justified to
-  close H-E (and as the 5.E prerequisite).
+- **H-E (stale-entry leak) RETRACTED:** Codex r5 verified `stop_inner` already
+  clears the full map (`coordinator/mod.rs:261`); there is no leak on master and
+  no stale-entry justification for the fix. 5.A.2 is justified solely by H-0 (the
+  seq=0 drop) and as the 5.E prerequisite.
 - **Rejected:** 5.B (liar-flag gate, `neighbor.rs:516/520`), 5.C.1/5.C.2
   (on-link warm misses the no-prior-session cold target; 5.C.2 redundant with
   prewarm), 5.A.1 (blocking pre-dump risks forwarding-arm/failback latency),
-  SMR r4 NIT-2 steady-state-converge fallback (unsound — retracted in §5.E.1).
+  the v5 **full-clear Double-Buffered Atomic Swap** (erases worker-learned
+  entries — Codex r5 blocker 1), SMR r4 NIT-2 steady-state-converge fallback
+  (unsound — retracted in §5.E.1).
 
 The decisive Gate-R deliverables: (1) **R1 daemon counter A** + dump duration —
 confirms/refutes H-0 for the restart/crash-promote/Window-3 scope; (2) **R2 on an
@@ -973,11 +993,12 @@ See `reviewer-ids.md` for task IDs. Per-round verdicts appended below.
     (dump consumes the messages). Window-3 re-verified unconditional *once
     reconcile is called*, but Codex's same-plan-bypass narrowing is the precise
     scope.
-  - **Outcome:** NOT converged at r4. Parent verified AGY's stale-leak
-    (CONFIRMED: `stop_inner` at `coordinator/mod.rs:199` clears stop flags + warm
-    queue but NOT `self.neighbors.dynamic`), the #949 swap primitive already
-    exists at `coordinator/mod.rs:169` (`with_all_shards` clear+copy), and Codex's
-    same-plan bypass. **v5 changes:** §1/§3 Window-3 narrowed to BINDING
+  - **Outcome:** NOT converged at r4. Parent *believed* it verified AGY's
+    stale-leak (read only `stop_inner` lines 199-208) — **this was WRONG; Codex r5
+    refuted it: `stop_inner` DOES clear the full map at `coordinator/mod.rs:261`.**
+    The #949 `with_all_shards` clear+copy primitive does exist at
+    `coordinator/mod.rs:169`, and Codex's same-plan bypass is correct.
+    **v5 changes (some later reverted at v6):** §1/§3 Window-3 narrowed to BINDING
     reconcile + same-plan-bypass citation; §3 new **H-E** stale-entry-leak
     sub-section (pre-existing master bug); §5.A.2 upgraded to the **Double-Buffered
     Atomic Swap** (fixes H-0 + H-E) with **Key-Collapsed Staging Map**; new
@@ -986,8 +1007,42 @@ See `reviewer-ids.md` for task IDs. Per-round verdicts appended below.
     verified-absent**; §4 R3 matrix rebuilt (per-row named fix + ENOBUFS=0
     escalate cell); §8 tests + §9 OQ-9/10/11 + §10 recommendation updated.
 
-- **r5:** v5 addresses every r4 finding. Awaiting r5 confirmation (Codex + AGY)
-  that the Double-Buffered Atomic Swap is correct under concurrent worker reads,
-  the key-collapsed staging is last-writer-correct for DEL/NEW both orders, the
-  bounded re-dump fallback + respawn-on-panic + both-signal kill bar are sound,
-  and no stale matrix/World wording or new blocker remains.
+- **r5:** v5 reviewed.
+  - **AGY r5** (`agy-plan-r5.md`, `adversarial-review-mpr237k0-7t384z`):
+    **PLAN-READY.** Verified the swap read-atomicity, key-collapsed tombstone
+    semantics, no 4th window, no deadlock, and — usefully — that workers read the
+    `Arc<ShardedNeighborMap>` directly (`worker/loop_body/mod.rs:20`), NOT a cloned
+    `ForwardingState` ArcSwap, so the swap is immediately visible. **BUT AGY again
+    affirmed the stale-leak H-E (reading only `stop_inner` 199-208) — wrong, see
+    Codex r5.**
+  - **Codex r5** (`codex-plan-r5.md`, `task-mpr2hb2t-i7cnmy`):
+    **PLAN-NEEDS-REVISION** with two verified blockers: (1) **the full-clear swap
+    would ERASE worker-learned neighbors** — workers write `dynamic_neighbors`
+    directly via ARP reply (`poll_stages.rs:80`), NDP NA (`:103`), and L3 source
+    learning (`:189` → `neighbor_dispatch.rs:340`) during the dump window; a
+    clear+copy from only dump rows + staged netlink deltas erases entries learned
+    after the side-table build. (2) **H-E is FALSE** — `stop_inner` already clears
+    the full map at `coordinator/mod.rs:261-267` (`with_all_shards` +
+    `shard.clear()`); no leak on master. Confirmed: Window-3 narrowing correct,
+    R3 matrix clean, key-collapsed staging last-writer-correct.
+  - **Claude SMR r5** (`claude-smr-plan-r5.md`): PLAN-READY — but this predated
+    Codex r5; the parent verified Codex's two blockers against the code
+    (`coordinator/mod.rs:261` clear CONFIRMED; `poll_stages.rs:80/103/189`
+    worker-write paths CONFIRMED). SMR's r5 "swap is correct" conclusion is
+    superseded.
+  - **Outcome:** NOT converged at r5 (Codex blockers verified). **v6 changes:**
+    §3 H-E RETRACTED (stop_inner clears the map; the bringup map is empty —
+    nothing to purge); §5.A.2 reverted from the full-clear Double-Buffered Atomic
+    Swap to a **staged-replay that upserts into the live map** (per-key
+    insert/remove, no blanket clear → preserves worker-learned entries); §5.E
+    resync gains a per-key-diff purge nuance (the only place a side-table+targeted
+    removal is justified, gated on ENOBUFS); §8 tests swap the "stale-leak"
+    regression test for a "preserves worker writes" regression test; §9 OQ-11/12
+    + §10 + status header updated; the v5 full-clear swap is now explicitly
+    REJECTED.
+
+- **r6:** v6 reverts the harmful full-clear swap and retracts H-E. Awaiting r6
+  confirmation (Codex + AGY) that the staged-replay-into-live-map (a) fixes H-0
+  without erasing worker-learned entries, (b) is last-writer-correct for the
+  staged DEL/NEW orders, (c) leaves no remaining blanket-clear anywhere except the
+  gated 5.E per-key-diff resync, and (d) no new blocker remains.

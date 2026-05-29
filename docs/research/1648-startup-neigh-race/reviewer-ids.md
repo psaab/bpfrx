@@ -35,9 +35,16 @@ here so a continuation can re-fetch by id rather than re-dispatch.
 ## Round 5 (v5 @ 2f0b60bf39a5)
 | Reviewer | Task ID | Verdict | Doc |
 |---|---|---|---|
-| Codex | task-mpr22uqg-4pb4ea | (pending) | codex-plan-r5.md |
-| AGY | adversarial-review-mpr237k0-7t384z | (pending) | agy-plan-r5.md |
-| Claude SMR | n/a (in-conversation) | PLAN-READY | claude-smr-plan-r5.md |
+| Codex | task-mpr22uqg-4pb4ea (FAILED: gpt-5.4-codex unsupported) → task-mpr2hb2t-i7cnmy | PLAN-NEEDS-REVISION (full-clear swap erases worker writes; H-E false) | codex-plan-r5.md |
+| AGY | adversarial-review-mpr237k0-7t384z | PLAN-READY (but re-affirmed false H-E; superseded by Codex r5) | agy-plan-r5.md |
+| Claude SMR | n/a (in-conversation) | PLAN-READY (predated Codex r5; superseded) | claude-smr-plan-r5.md |
+
+## Round 6 (v6)
+| Reviewer | Task ID | Verdict | Doc |
+|---|---|---|---|
+| Codex | (pending dispatch) | (pending) | codex-plan-r6.md |
+| AGY | (pending dispatch) | (pending) | agy-plan-r6.md |
+| Claude SMR | n/a (in-conversation) | PLAN-READY | claude-smr-plan-r6.md |
 
 ## Notes
 - Gate-R is a CLUSTER measurement (loss:xpf-userspace-fw0/fw1), FIFO with the
