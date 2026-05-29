@@ -38,17 +38,16 @@
   `test/incus/cos-gate1-small-four-alone.sh`,
   `docs/pr/1630-cause1-credit-carry/plan.md`
 
-## 2026-05-29 — #1649 floor-curve Copilot round-2 follow-up
+## 2026-05-29 — #1649 floor-curve Copilot round-2 + rebase follow-up
 - **Timestamp**: 2026-05-29
-- **Action**: Addressed Copilot round-2 on PR #1652. Narrowed the N=6
-  throughput-CoV prose so it no longer calls a favorable placement the
-  "most common" realization, and tightened the operational bullet to frame
-  aggregate against the existing Gate-3 structural cap instead of a
-  universal "unaffected" claim. The #1650 cross-reference was briefly
-  qualified as a future/open-PR pointer, but after the subsequent rebase
-  onto merged master (#1650 = 2723c401b) it was restored to a direct
-  in-file "section below" link, since the Small-class rate-metering section
-  is now present in this file. Updated the SMR accuracy note for both.
+- **Action**: Addressed Copilot round-2 on PR #1652 and rebased onto master
+  (which now includes #1650 = 2723c401b). Narrowed the N=6 throughput-CoV
+  prose so it no longer calls a favorable placement the "most common"
+  realization; tightened the operational bullet to frame aggregate against
+  the existing Gate-3 structural cap instead of a universal "unaffected"
+  claim; restored the #1650 cross-reference to a direct in-file "section
+  below" link (the Small-class rate-metering section is now present after
+  the rebase). Updated the SMR accuracy note for all three corrections.
 - **File(s)**: `docs/fairness-regimes.md`,
   `docs/pr/1649-doc-floor-curve/claude-smr-accuracy.md`, `_Log.md`
 
