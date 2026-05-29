@@ -5,19 +5,23 @@ AF_XDP userspace dataplane. It is not a full bug tracker and it is not a
 historical branch plan. For active debugging entry points, use
 [`userspace-debug-map.md`](userspace-debug-map.md).
 
-Last updated: 2026-05-22
+Last updated: 2026-05-29
 
 ## Deprecation Context
 
-Issue #1373 retires the legacy eBPF dataplane in staged phases. The Rust
-AF_XDP userspace dataplane is now the effective runtime default when
-`system dataplane-type` is omitted, and it remains the primary target for
-dataplane development and routine validation. No BPF source, bpf2go bindings,
-loader code, test targets, or CLI surfaces are removed in this phase. The
-legacy eBPF dataplane remains present only for explicit compatibility and
-regression use while the source-removal blockers close. Explicit
-`system dataplane-type ebpf` is accepted only with a compile warning; it is not
-the omitted/default dataplane path.
+Issue #1373 retired the legacy eBPF dataplane; the staged retirement is
+complete. The Rust AF_XDP userspace dataplane is the only runtime forwarding
+path and the effective default when `system dataplane-type` is omitted. The
+#1476 source-removal phase deleted the legacy BPF source (`bpf/xdp/*.c`,
+`bpf/tc/*.c`), the bpf2go bindings, and the legacy loader targets; the only
+retained eBPF artifacts are the userspace XDP shim and the shared
+`bpf/headers/*.h` map/struct bootstrap. Explicit `system dataplane-type ebpf`
+is hard-rejected: the strict commit validator returns `ErrEBPFDataplaneRetired`
+and the runtime factory returns `ErrEBPFBackendRetired`. The parser still
+accepts the `ebpf` token so that `load merge`/`load override` of a
+pre-retirement config does not syntax-error during a rolling upgrade, but
+`commit check` then fails and the remediation is
+`set system dataplane-type userspace`.
 
 DPDK is retired (#1525). The DPDK backend, `dpdk_worker/`, and
 `pkg/dataplane/dpdk/` are removed in #1527/#1528. The historical
@@ -53,19 +57,20 @@ These capabilities exist in the current Rust userspace dataplane code path:
 | HA state ingestion | Implemented | Helper receives RG active/watchdog state |
 | Session delta export | Implemented | Rust helper exports open/close deltas back to Go |
 
-## Gated Or Evidence-Only Before BPF Source Removal
+## Remaining Explicit Configuration Gates
 
-These are the remaining explicit configuration gates, plus the runtime-admitted
-features that still need operator evidence before BPF source removal. The
-explicit gates live in
+These are the explicit configuration gates that still hold after the
+feature-gap closeout. The earlier source-removal evidence caveats are
+retrospective: the #1373 feature-gap audit (#1374-#1381) and the #1477
+final-validation artifact set are closed. The explicit gates live in
 [`pkg/dataplane/userspace/manager.go`](../pkg/dataplane/userspace/manager.go).
 
 | Feature/config shape | Userspace status | Tracker / disposition |
 |----------------------|-------------|--------------------|
 | Unsupported policy shapes | Gated | Address/application expansion must succeed for userspace |
-| Screen behavior requiring SYN cookies | Supported; final source-removal evidence, if required, belongs with #1477 | Closed feature-gap; #1477 final validation |
+| Screen behavior requiring SYN cookies | Supported | Closed feature-gap (#1374); #1477 final validation closed |
 | HA with per-pool source NAT `persistent-nat` | Gated | Closed/documented contract: helper-memory persistent-NAT leases are not HA-synchronized, so HA configs that reference persistent source-NAT pools are not admitted |
-| Port mirroring | Supported; final source-removal evidence, if required, belongs with #1477 | Closed feature-gap; #1477 final validation |
+| Port mirroring | Supported | Closed feature-gap (#1376); #1477 final validation closed |
 
 Port mirroring now has snapshot/wire plumbing plus a bounded runtime slice
 that samples and queues discardable full-L2 mirror clones with drop counters.
@@ -73,9 +78,9 @@ Runtime coverage includes the pending-forward path, self-target flow-cache
 mirror surface, deferred neighbor-resolution retry path, CoS-bound reserve
 handling, and mirror-specific counter attribution. The
 `deriveUserspaceCapabilities()` gate has been removed; #1376 is closed for the
-feature-gap audit. If source removal needs final mirror-fidelity and
-pressure-survival artifacts, they belong with the #1477 validation set for the
-exact removal candidate.
+feature-gap audit, and the #1477 final-validation artifact set is closed.
+Any further mirror-fidelity and pressure-survival work is production hardening,
+not a retirement blocker.
 
 ## Features That Still Use A Mixed Boundary
 
@@ -92,41 +97,31 @@ These are not "missing", but they are not pure userspace forwarding either:
 | Dataplane event logging | Session open/close/update are emitted by userspace. Policy-deny, screen-drop, logged routing-instance filter hits, non-PBR input filter logs, output filter logs, cached output-filter hits, and lo0 filter logs now enqueue RT_FLOW frames through the non-blocking Rust event-stream producer with existing per-event rate-limit/loss accounting. Go decode/status handling feeds raw userspace RT_FLOW frames through the same `EventReader.ProcessRawEvent` syslog/local-log path as eBPF, with a deterministic UDP syslog fanout harness for policy deny, screen drop, and filter log. Policy-deny events now carry the snapshot's compiled numeric policy ID; filter-log events carry filter/term/action identity from the matched compiled term. #1379 is closed for the feature-gap audit; any final live cluster syslog proof belongs with #1477 if the source-removal candidate requires it. |
 | `show system buffers` | Userspace helper-status rendering covers AF_XDP UMEM/TX capacity, CoS queued-byte capacity, helper-published session-table and flow-cache capacity, active-session footer, neighbor counts, and worker queue pressure counters. The Phase 5 denominator decision is explicit: session-table and flow-cache values become fill percentages only from Rust-owned helper fields; neighbor-cache entries remain counters until Rust owns a bounded neighbor-cache capacity. Formatter tests pin that dynamic counts cannot move into the utilization table without real denominators. |
 
-## Current Retirement Work After Feature-Gap Closeout
+## Retirement History (closed)
 
-The original #1374-#1381 feature-gap audit is closed. The remaining #1373 work
-is no longer "implement missing userspace feature parity"; it is the removal
-phase that migrates or deletes the legacy eBPF runtime surfaces safely.
+The #1373 eBPF retirement is complete. This section is a record of the closed
+removal phases, not pending work.
 
-#1377 is also closed for source-NAT pool retirement. Its SNAT follow-ups
-#1448, #1449, and #1450 are closed as documented contracts: helper restart
-resets helper-local persistent-NAT leases, HA configurations with persistent
-source-NAT pools are gated because leases are not synchronized, and new-flow
-pool-address parity is not promised across retained backend changes.
+The #1374-#1381 feature-gap audit is closed. #1377 closed source-NAT pool
+retirement; its SNAT follow-ups #1448, #1449, and #1450 are closed as
+documented contracts: helper restart resets helper-local persistent-NAT
+leases, HA configurations with persistent source-NAT pools are gated because
+leases are not synchronized, and new-flow pool-address parity is not promised.
 
-The current tracked removal work is:
-
-| Issue | Removal-phase role |
+| Issue | Removal phase (closed) |
 |-------|--------------------|
-| #1451 | Migrate remaining API, gRPC, CLI, status, metrics, session, GC, cluster, daemon-control, and userspace shim callers away from the legacy eBPF-shaped `dataplane.DataPlane` surface before deleting source/generated artifacts. |
-| #1473 / #1493 | Runtime fallback, shim-only generation, and userspace shim loader/bootstrap are split from legacy `xdp_main_prog` / `loadAllObjects()` so the retained shim can remain while legacy XDP/TC programs are removed. |
-| #1476 | Remove legacy BPF source, generated artifacts, and build hooks after the migration blockers close, while preserving the retained AF_XDP userspace shim path. |
-| #1477 | Publish final userspace-only validation artifacts for the exact source-removal candidate, including cluster, screen/flood, CoS, HA, and fallback-proof evidence. |
+| #1451 | Migrated remaining API, gRPC, CLI, status, metrics, session, GC, cluster, daemon-control, and userspace shim callers off the legacy eBPF-shaped `dataplane.DataPlane` surface. |
+| #1473 / #1493 | Split shim-only generation and the userspace shim loader/bootstrap from the legacy in-kernel forwarding loader so the retained shim survives while the legacy XDP/TC programs were removed. |
+| #1476 | Removed legacy BPF source, generated artifacts, and build hooks, preserving the retained AF_XDP userspace shim path. |
+| #1477 | Published the final userspace-only validation artifact set (cluster, screen/flood, CoS, HA, degraded-path evidence). |
 
 #1474 is closed: omitted `system dataplane-type` selects userspace, and
-explicit `system dataplane-type ebpf` emits an operator-visible compile warning
-while legacy source removal is staged.
+explicit `system dataplane-type ebpf` is now hard-rejected (commit-time
+`ErrEBPFDataplaneRetired`, runtime `ErrEBPFBackendRetired`); the
+deprecation-warning surface that preceded the hard reject is gone.
 
-Recommended dependency order:
-
-1. #1451 first, because it defines the runtime and operator interface boundary
-   that every source-removal slice depends on.
-2. Keep the #1473/#1493/#1494 retained-shim boundary pinned while #1451
-   finishes moving remaining runtime/operator surfaces off legacy bridges.
-3. #1476 after #1451 and #1473 close, as the auditable source/generated-artifact
-   removal PR.
-4. #1477 on the exact #1476 candidate, so the final validation artifacts match
-   the code that removes the legacy eBPF path.
+The current canonical fallback contract is in the "Actual Fallback Mechanisms"
+section below, which already reflects the post-#1476 hard reject.
 
 ## What This Document Does Not Mean
 
