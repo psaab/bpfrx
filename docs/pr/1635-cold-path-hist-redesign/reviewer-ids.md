@@ -42,3 +42,21 @@ Continuations:
 Note: AGY + Codex independently confirmed the lone failing test
 (snat_contract_doc_guard) is unrelated pre-existing master drift
 ("fail closed" vs "fail-closed" on docs/userspace-dataplane-gaps.md:40).
+
+## Round 4 — rebased onto origin/master (HEAD 328beaeb4) + Prometheus metric rename
+Rebase: clean replay of 9 commits onto origin/master; picks up #1670 (doc-guard
+fix → snat_contract_doc_guard now GREEN), #1658, #1662. Disjoint files, no conflicts.
+Rename (Copilot r4, no logic change): samples_total_v3→samples_v3_total,
+sum_ns_total_v3→sum_ns_v3_total (CounterValue, _total final),
+layout_version_unknown_total→layout_version_unknown (GaugeValue state indicator).
+
+| Reviewer   | Task / job id                      | Verdict   |
+|------------|------------------------------------|-----------|
+| Codex      | task-mprf0sdn-tkln60               | running (confirm) |
+| AGY        | adversarial-review-mprf115e-ujupbb  | running (confirm) |
+| Claude SMR | in-conversation                    | MERGE-READY (rebase clean + rename verified) |
+| Copilot    | re-review @ 328beaeb4 requested; polling | r4 (3 naming) addressed |
+
+Continuations:
+  node /home/ps/.claude/plugins/cache/openai-codex/codex/1.0.4/scripts/codex-companion.mjs status task-mprf0sdn-tkln60
+  /agy:result adversarial-review-mprf115e-ujupbb
