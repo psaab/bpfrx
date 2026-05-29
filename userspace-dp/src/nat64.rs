@@ -225,7 +225,22 @@ pub(crate) fn translate_v4_to_v6(
         return None; // TTL expired
     }
     let protocol = packet[9];
-    let l4_payload = packet.get(ihl..)?;
+    // Trim the L4 payload to the IPv4 Total Length field rather than the end
+    // of the slice. The caller passes the whole L3-onward frame, which may
+    // include Ethernet padding appended to reach the 60/64-byte minimum frame
+    // size (common for TCP ACKs, DNS replies, short HTTP). Copying that padding
+    // into the IPv6 packet inflates payload_len and poisons the recomputed L4
+    // checksum, so the receiver drops the reply. This mirrors the forward path
+    // (translate_v6_to_v4) which trims to the IPv6 payload_len field.
+    //
+    // total_len is attacker/driver-controlled, so clamp safely: a malformed
+    // header could advertise a length shorter than the IPv4 header or longer
+    // than the bytes we actually received.
+    let ipv4_total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    if ipv4_total_len < ihl || ipv4_total_len > packet.len() {
+        return None;
+    }
+    let l4_payload = packet.get(ihl..ipv4_total_len)?;
 
     // Map protocol.
     let next_header = match protocol {
@@ -236,8 +251,8 @@ pub(crate) fn translate_v4_to_v6(
 
     let new_hop_limit = ttl - 1;
     let ipv6_payload_len = l4_payload.len() as u16;
-    let total_len = 40 + l4_payload.len();
-    let mut out = vec![0u8; total_len];
+    let ipv6_total_len = 40 + l4_payload.len();
+    let mut out = vec![0u8; ipv6_total_len];
 
     // Build IPv6 header.
     out[0] = 0x60; // version=6

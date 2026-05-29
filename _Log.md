@@ -1,5 +1,19 @@
 # Action Log
 
+## 2026-05-29 — #1641 NAT64 reverse-path Ethernet padding fix
+- **Timestamp**: 2026-05-29 UTC
+- **Action**: Fixed `translate_v4_to_v6` in the userspace-dp NAT64
+  reverse path to trim the L4 payload to the IPv4 Total Length field
+  instead of the end of the (possibly Ethernet-padded) input slice.
+  Padding had been inflating IPv6 `payload_len` and poisoning the
+  recomputed L4 checksum, dropping every padded reply. Clamp rejects
+  malformed `total_len` (< ihl or > slice). Added 4 regression tests in
+  `nat64_tests.rs` (padded payload-less TCP segment, padded UDP/DNS reply,
+  oversized and undersized total_len). Verified fail-before (payload_len
+  26 vs 20) / pass-after. Documented in docs/bugs.md.
+- **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
+  docs/bugs.md
+
 ## 2026-05-29 — #1646 frr writeManagedSection torn-write hardening
 - **Timestamp**: 2026-05-29 UTC
 - **Action**: Hardened `writeManagedSection` in pkg/frr/manager.go against
