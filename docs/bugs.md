@@ -127,6 +127,31 @@
 - **Fix:** Added `else if (orig_proto == PROTO_ICMPV6) { old_sport = meta->dst_port; }` — `meta->dst_port` retains original echo ID since policy only changes `src_port`
 - **File:** `bpf/xdp/xdp_nat64.c` line 282
 
+### NAT64 reverse path copies Ethernet padding into IPv6 payload (#1641)
+- **Severity:** MAJOR — reverse-path packet corruption / L4 checksum failure
+- **Symptom:** Every TCP/UDP/ICMPv6 NAT64 reply whose original IPv4
+  packet was Ethernet-padded (< 64B on the wire: ACKs, DNS replies,
+  short HTTP responses) is dropped by the IPv6 client
+- **Root cause:** `translate_v4_to_v6` (userspace-dp Rust path) read
+  `l4_payload = packet.get(ihl..)` — every byte from the IPv4 header to
+  the end of the slice. The caller passes the whole L3-onward frame,
+  including any Ethernet padding the NIC/driver added to reach the
+  60-byte minimum. That padding inflated the IPv6 `payload_len` and was
+  fed into the recomputed L4 checksum (wrong pseudo-header length), so
+  the receiver's checksum verification failed
+- **Fix:** Trim the L4 slice to the IPv4 Total Length field
+  (`packet[2..4]`), mirroring the forward path which trims to the IPv6
+  `payload_len`. Clamp safely: reject `total_len < ihl` or
+  `total_len > packet.len()` (malformed/oversized header) before
+  slicing, so a crafted header cannot panic or read OOB
+- **Regression test:** `nat64_tests.rs`
+  `translate_v4_to_v6_trims_ethernet_padding_{tcp,udp_dns}` feed a
+  zero-padded 46B L3 slice and assert the translated IPv6 `payload_len`
+  excludes the padding and the L4 checksum verifies; plus
+  `translate_v4_to_v6_total_len_{larger_than_slice,below_ihl}_returns_none`
+  for the malformed-length clamp
+- **File:** `userspace-dp/src/nat64.rs`
+
 ### ipToUint32BE byte order
 - `binary.BigEndian.Uint32(ip4)` produced wrong bytes when cilium/ebpf serializes as native-endian
 - **Fix:** Use `binary.NativeEndian.Uint32(ip4)` so bytes match raw network order BPF writes to `__be32`

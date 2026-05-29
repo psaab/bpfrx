@@ -433,3 +433,138 @@ fn frame_building_v6_to_v4_with_vlan() {
     assert_eq!(u16::from_be_bytes([result[12], result[13]]), 0x8100);
     assert_eq!(u16::from_be_bytes([result[16], result[17]]), 0x0800);
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for #1641: translate_v4_to_v6 must trim the L4 payload to
+// the IPv4 Total Length field, not the end of the input slice. The caller
+// passes the whole L3-onward frame, which can carry Ethernet padding when the
+// reply is shorter than the 60/64-byte minimum frame size. Before the fix the
+// padding was copied into the IPv6 packet, inflating payload_len and poisoning
+// the L4 checksum so the receiver dropped the reply.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn translate_v4_to_v6_trims_ethernet_padding_tcp() {
+    let src_v4 = Ipv4Addr::new(198, 51, 100, 50);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let src_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+
+    // A bare TCP ACK: 20B IP + 20B TCP, no L4 payload = 40B on the wire. The
+    // NIC/driver pads the frame to the 60-byte L2 minimum, so the L3-onward
+    // slice the caller hands us is 46 bytes (40B real + 6B zero padding).
+    let mut packet = make_ipv4_tcp_packet(src_v4, dst_v4, 80, 12345, b"");
+    assert_eq!(packet.len(), 40, "unpadded ACK should be 40 bytes");
+    let real_len = packet.len();
+    packet.extend_from_slice(&[0u8; 6]); // simulate trailing Ethernet padding
+    assert_eq!(packet.len(), 46);
+
+    let ipv6_pkt = translate_v4_to_v6(&packet, src_v6, dst_v6).expect("translate");
+
+    // payload_len must reflect the real L4 length (20B TCP), NOT the padded
+    // slice length. Before the fix this was 26 (20 + 6 padding bytes).
+    let payload_len = u16::from_be_bytes([ipv6_pkt[4], ipv6_pkt[5]]) as usize;
+    assert_eq!(payload_len, 20, "payload_len must exclude Ethernet padding");
+    // Total translated length = 40B IPv6 header + 20B TCP, with no padding.
+    assert_eq!(ipv6_pkt.len(), 40 + (real_len - 20));
+    assert_eq!(ipv6_pkt.len(), 60);
+
+    // The L4 checksum must verify over the trimmed payload. A padding-poisoned
+    // checksum (the pre-fix bug) leaves a non-zero residual here.
+    let src6 = Ipv6Addr::from(<[u8; 16]>::try_from(&ipv6_pkt[8..24]).unwrap());
+    let dst6 = Ipv6Addr::from(<[u8; 16]>::try_from(&ipv6_pkt[24..40]).unwrap());
+    assert_eq!(
+        checksum16_ipv6_pseudo(src6, dst6, PROTO_TCP, &ipv6_pkt[40..]),
+        0,
+        "TCP checksum must verify over the unpadded payload"
+    );
+}
+
+#[test]
+fn translate_v4_to_v6_trims_ethernet_padding_udp_dns() {
+    // Short UDP/DNS reply (the canonical Ethernet-padded case). Build a 12B
+    // DNS-ish payload: 20B IP + 8B UDP + 12B = 40B real, padded to 46B.
+    let src_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let src_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+
+    let dns = b"\x00\x01\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00";
+    let udp_len = 8 + dns.len();
+    let total_len = 20 + udp_len;
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    packet[8] = 64;
+    packet[9] = PROTO_UDP;
+    packet[12..16].copy_from_slice(&src_v4.octets());
+    packet[16..20].copy_from_slice(&dst_v4.octets());
+    packet[10..12].copy_from_slice(&[0, 0]);
+    let ip_sum = checksum16(&packet[..20]);
+    packet[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+    packet[20..22].copy_from_slice(&53u16.to_be_bytes()); // src port
+    packet[22..24].copy_from_slice(&12345u16.to_be_bytes()); // dst port
+    packet[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    packet[28..28 + dns.len()].copy_from_slice(dns);
+    packet[26..28].copy_from_slice(&[0, 0]);
+    let udp_sum = checksum16_ipv4_pseudo(src_v4, dst_v4, PROTO_UDP, &packet[20..]);
+    packet[26..28].copy_from_slice(&udp_sum.to_be_bytes());
+
+    assert_eq!(packet.len(), 40);
+    packet.extend_from_slice(&[0u8; 6]); // Ethernet padding to 46B L3 slice
+
+    let v6 = translate_v4_to_v6(&packet, src_v6, dst_v6).expect("translate");
+    let payload_len = u16::from_be_bytes([v6[4], v6[5]]) as usize;
+    assert_eq!(payload_len, udp_len, "payload_len must exclude padding");
+    assert_eq!(v6.len(), 40 + udp_len);
+
+    let s6 = Ipv6Addr::from(<[u8; 16]>::try_from(&v6[8..24]).unwrap());
+    let d6 = Ipv6Addr::from(<[u8; 16]>::try_from(&v6[24..40]).unwrap());
+    assert_eq!(
+        checksum16_ipv6_pseudo(s6, d6, PROTO_UDP, &v6[40..]),
+        0,
+        "UDP checksum must verify over the unpadded payload"
+    );
+}
+
+#[test]
+fn translate_v4_to_v6_total_len_larger_than_slice_returns_none() {
+    // Malformed Total Length advertising more bytes than we received: must be
+    // rejected safely (no panic, no out-of-bounds), not trusted.
+    let src_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let mut packet = make_ipv4_tcp_packet(
+        Ipv4Addr::new(198, 51, 100, 50),
+        Ipv4Addr::new(198, 51, 100, 1),
+        80,
+        12345,
+        b"hi",
+    );
+    // Advertise a Total Length 100 bytes beyond the actual slice.
+    let bogus = (packet.len() + 100) as u16;
+    packet[2..4].copy_from_slice(&bogus.to_be_bytes());
+    assert!(
+        translate_v4_to_v6(&packet, src_v6, dst_v6).is_none(),
+        "oversized total_len must be rejected"
+    );
+}
+
+#[test]
+fn translate_v4_to_v6_total_len_below_ihl_returns_none() {
+    // Total Length shorter than the IPv4 header is nonsensical: reject it.
+    let src_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let mut packet = make_ipv4_tcp_packet(
+        Ipv4Addr::new(198, 51, 100, 50),
+        Ipv4Addr::new(198, 51, 100, 1),
+        80,
+        12345,
+        b"hi",
+    );
+    packet[2..4].copy_from_slice(&10u16.to_be_bytes()); // < 20B IHL
+    assert!(
+        translate_v4_to_v6(&packet, src_v6, dst_v6).is_none(),
+        "total_len below the IPv4 header length must be rejected"
+    );
+}
