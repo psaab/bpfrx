@@ -41,6 +41,47 @@ const bindingQueuesPerIface = 16 // must match BINDING_QUEUES_PER_IFACE in BPF
 
 const userspaceBindingReady = 1
 
+// deadWorkerIDSet builds the set of worker IDs whose worker_loop has
+// panicked, from the helper's per-worker runtime status. On panic the
+// supervisor (coordinator/supervisor.rs) sets runtime_atomics.dead which
+// surfaces as WorkerRuntimeStatus.Dead (#925). Dead is set-only until
+// daemon restart, so it never spuriously fires for a live worker.
+func deadWorkerIDSet(runtime []WorkerRuntimeStatus) map[uint32]bool {
+	if len(runtime) == 0 {
+		return nil
+	}
+	var dead map[uint32]bool
+	for _, w := range runtime {
+		if w.Dead {
+			if dead == nil {
+				dead = make(map[uint32]bool, len(runtime))
+			}
+			dead[w.WorkerID] = true
+		}
+	}
+	return dead
+}
+
+// bindingForwardingLive reports whether a binding is safe to mark READY
+// (userspaceBindingReady) in the XDP userspace_bindings array.
+//
+// #1666: the gate is the helper-derived binding.Ready — which is
+// (registered && bound && xsk_registered && heartbeat_fresh), computed in
+// userspace-dp coordinator/refresh_bindings.rs — ANDed with the binding's
+// worker not being Dead. This is strictly stronger than the historical
+// (Registered && Armed) predicate: it withholds READY until the worker
+// has actually created its socket, registered the FD in the XSKMAP, and
+// shown a fresh heartbeat, and it clears READY when the worker panics.
+//
+// All of Ready's sub-conditions are flipped true by worker bringup alone
+// (socket create -> set_bound, XSKMAP register -> set_xsk_registered,
+// per-poll-tick heartbeat), independent of inbound traffic, so this gate
+// cannot deadlock a legitimately-live binding (see
+// docs/pr/1666-ready-gate/plan.md §4).
+func bindingForwardingLive(b BindingStatus, deadWorkers map[uint32]bool) bool {
+	return b.Ready && !deadWorkers[b.WorkerID]
+}
+
 type userspaceBindingKey struct {
 	Ifindex uint32
 	QueueID uint32
@@ -588,17 +629,21 @@ ctrlReady:
 		m.ctrlWasEnabled = false
 	}
 
+	deadWorkers := deadWorkerIDSet(status.WorkerRuntime)
 	for _, binding := range status.Bindings {
 		if binding.Ifindex <= 0 {
 			continue
 		}
 		flags := uint32(0)
-		if binding.Registered && binding.Armed {
-			// Mark ready once registered + armed. Don't wait for Bound:
-			// the Bound flag is set asynchronously by worker threads
-			// after XSK socket creation. Waiting creates a chicken-and-egg
-			// where the XDP shim drops packets (flags=0) preventing the
-			// XSK socket from ever receiving (so Bound never becomes true).
+		if bindingForwardingLive(binding, deadWorkers) {
+			// #1666: mark forwarding-ready only when the helper derives
+			// the binding Ready (registered && bound && xsk_registered &&
+			// heartbeat_fresh) and the worker has not panicked. The prior
+			// (Registered && Armed) predicate let the XDP shim steer
+			// transit to a slot whose worker had crashed or never finished
+			// XSK registration (crash-blind blackhole). Ready's
+			// sub-conditions are all set by worker bringup independent of
+			// RX, so this does not deadlock startup (plan §4).
 			flags = userspaceBindingReady
 		}
 		idx := uint32(binding.Ifindex)*bindingQueuesPerIface + binding.QueueID
@@ -631,7 +676,8 @@ ctrlReady:
 				continue
 			}
 			flags := uint32(0)
-			if binding.Registered && binding.Armed && binding.Bound {
+			if bindingForwardingLive(binding, deadWorkers) {
+				// #1666: unify the VLAN-alias child with the primary gate.
 				flags = userspaceBindingReady
 			}
 			idx := childIfindex*bindingQueuesPerIface + binding.QueueID
@@ -1068,12 +1114,17 @@ func (m *Manager) verifyBindingsMapLocked() bool {
 		return false
 	}
 
+	deadWorkers := deadWorkerIDSet(m.lastStatus.WorkerRuntime)
 	repaired := 0
 	for _, binding := range bindings {
 		if binding.Ifindex <= 0 {
 			continue
 		}
-		if !binding.Registered || !binding.Armed {
+		// #1666: only repair (re-assert READY for) slots whose worker is
+		// actually forwarding-live. Repairing on (Registered && Armed)
+		// would let the watchdog fight the crash-clear by rewriting
+		// READY=1 for a dead worker.
+		if !bindingForwardingLive(binding, deadWorkers) {
 			continue
 		}
 		idx := uint32(binding.Ifindex)*bindingQueuesPerIface + binding.QueueID
@@ -1119,7 +1170,8 @@ func (m *Manager) verifyBindingsMapLocked() bool {
 				if binding.Ifindex != int(parentIfindex) {
 					continue
 				}
-				if !binding.Registered || !binding.Armed || !binding.Bound {
+				// #1666: same forwarding-live gate as the primary repair.
+				if !bindingForwardingLive(binding, deadWorkers) {
 					continue
 				}
 				idx := childIfindex*bindingQueuesPerIface + binding.QueueID
