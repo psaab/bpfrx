@@ -590,13 +590,19 @@ deviations, each justified below:
   "v1 Rust / v3 Go").
 
 ### Slot zero-out (plan §2.4) realization
-- `forwarding_build` returns `(slot_map, slots_to_zero)`; `slots_to_zero`
-  is stashed on `ForwardingState`. The worker zeroes those slots in each
-  binding's local accumulator at the ForwardingState ArcSwap point
-  (`worker/loop_body/mod.rs`), BEFORE any `record_sample` into the
-  reused slot. The next publish merge overwrites the sibling atomics
-  from the freshly-zeroed local accumulators, so no separate atomic
-  zero-out path is needed on the hot tick.
+> SUPERSEDED by §IMPL.r3 finding 2 — the worker no longer consumes a
+> coordinator-stashed `slots_to_zero`; it derives the zero-set by
+> diffing its OWN old slot-map inverse against the new one at the
+> ArcSwap point (generation-independent). `ForwardingState` carries no
+> `slots_to_zero` field. The text below describes the initial
+> (superseded) realization.
+- `forwarding_build` returns `(slot_map, slots_to_zero)`; the worker
+  zeroes affected slots in each binding's local accumulator at the
+  ForwardingState ArcSwap point (`worker/loop_body/mod.rs`), BEFORE any
+  `record_sample` into the reused slot. The next publish merge
+  overwrites the sibling atomics from the freshly-zeroed local
+  accumulators, so no separate atomic zero-out path is needed on the
+  hot tick.
 
 ### §IMPL.r2 Code-review round-1 fixes (Codex MERGE-NEEDS-MAJOR → resolved)
 

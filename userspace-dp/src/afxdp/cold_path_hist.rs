@@ -157,16 +157,17 @@ pub(in crate::afxdp) fn zone_pair_packed_key(from_zone_id: u16, to_zone_id: u16)
 /// collided at 88.2% with 8 active zone-pairs (birthday paradox), the
 /// F2 finding in the #1622 PLAN-KILL.
 ///
-/// Lookup is a bounded 2D table indexed by `(from, to)` with
-/// `from, to < 64` (64×64 = 4096 entries, L1d-resident). A miss
-/// (entry == `u8::MAX`) means the pair has no slot assigned (capacity
-/// exhausted or zone-id ≥ 64); the sample is dropped at the hot path.
+/// Lookup is a bounded 2D table indexed by `cold_path_flat_index`
+/// (`from * 65 + to`, ids `0..=64`; 65×65 = 4225 entries, L1d-resident).
+/// A miss (entry == `u8::MAX`) means the pair has no slot assigned
+/// (capacity exhausted or zone-id ≥ 65); the sample is dropped at the
+/// hot path.
 ///
 /// `inverse[slot]` is the reverse map used by the status path to emit
 /// per-zone-pair labels for the sparse wire encoding.
 #[derive(Clone, Debug)]
 pub(in crate::afxdp) struct ColdPathSlotMap {
-    /// 64×64 flat table indexed by `(from << 6) | to`. `u8::MAX` =
+    /// 65×65 flat table indexed by `from * 65 + to`. `u8::MAX` =
     /// unassigned.
     pub(in crate::afxdp) flat_table: Box<[u8; COLD_PATH_FLAT_TABLE_LEN]>,
     /// `slot → Some((from, to))` for assigned slots, `None` for free.

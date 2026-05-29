@@ -1426,7 +1426,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         // #1635: direct slot map lookup;
                                         // skip the sample on a miss
                                         // (capacity exhausted or zone-id
-                                        // ≥ 32).
+                                        // ≥ 65).
                                         if let Some(slot) =
                                             crate::afxdp::cold_path_hist::lookup_slot(
                                                 &worker_ctx.forwarding.cold_path_slot_map,

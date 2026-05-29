@@ -136,8 +136,8 @@ pub struct WorkerRuntimeStatus {
             skip_serializing_if = "Vec::is_empty")]
     pub cold_path_active_builder_collision: Vec<bool>,
     /// True if some configured zone-pair could not be assigned a slot
-    /// (256-slot capacity exhausted). Surfaced so operators see when a
-    /// deployment outgrows the static cap.
+    /// (255-slot capacity exhausted; slot 255 is the u8::MAX sentinel).
+    /// Surfaced so operators see when a deployment outgrows the cap.
     #[serde(rename = "cold_path_overflow_active", default,
             skip_serializing_if = "crate::protocol::bool_is_false")]
     pub cold_path_overflow_active: bool,
