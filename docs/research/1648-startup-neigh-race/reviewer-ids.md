@@ -14,9 +14,23 @@ here so a continuation can re-fetch by id rather than re-dispatch.
 ## Round 2 (v2)
 | Reviewer | Task ID | Verdict | Doc |
 |---|---|---|---|
-| Codex | (pending r2) | (pending) | codex-plan-r2.md |
-| AGY | (pending r2) | (pending) | agy-plan-r2.md |
-| Claude SMR | n/a | (pending) | claude-smr-plan-r2.md |
+| Codex | workflow 20260529-074550-6bad9c (plan r2) | Not-PLAN-READY; 1C/4H/2M/1L ACCEPTED | codex-plan-r2.md |
+| AGY | adversarial-review-mpqmob0t-c2m30p | PLAN-NEEDS-REVISION (startup-only finding) | agy-plan-r2.md |
+| Claude SMR | n/a | PLAN-READY on v2 scope (superseded by AGY r2) | claude-smr-plan-r2.md |
+
+## Round 3 (v3.1)
+| Reviewer | Task ID | Verdict | Doc |
+|---|---|---|---|
+| Codex | workflow 20260529-074550-6bad9c (plan r3) | Not-PLAN-READY; 2C/3H/2M ACCEPTED | codex-plan-r3.md |
+| AGY | adversarial-review-mpqn25qc-6ejm3r | PLAN-NEEDS-REVISION (Window-3 counter-example) | agy-plan-r3.md |
+| Claude SMR | n/a | PLAN-NEEDS-REVISION (concur; missed Window-3) | claude-smr-plan-r3.md |
+
+## Round 4 (v4)
+| Reviewer | Task ID | Verdict | Doc |
+|---|---|---|---|
+| Codex | (pending r4) | (pending) | codex-plan-r4.md |
+| AGY | (pending r4) | (pending) | agy-plan-r4.md |
+| Claude SMR | n/a | (pending) | claude-smr-plan-r4.md |
 
 ## Notes
 - Gate-R is a CLUSTER measurement (loss:xpf-userspace-fw0/fw1), FIFO with the

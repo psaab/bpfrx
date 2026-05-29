@@ -1,7 +1,7 @@
 # #1648 — Startup/failover neighbor-dump race: first cold connect ~1s
 
-**Status:** v3 (research-only; /research, not /engineer) — AGY r2 split the
-analysis into two windows with DIFFERENT mechanisms; pending r3 convergence
+**Status:** v4 (research-only; /research, not /engineer) — AGY r3 found a THIRD
+H-0 window (config-reload/ISSU reconcile); pending r4 convergence
 
 > **v3 KEY CORRECTION (AGY r2, verified):** `initial_neighbor_dump` runs **only
 > once at daemon startup** (`neighbor.rs:514`, inside the detached
@@ -42,14 +42,21 @@ leaving the dataplane neighbor map empty until the dump lands.
 window, and (c) decide whether failover actually hits the ~1s or whether it is a
 deploy-restart-only artifact** — the latter would justify PLAN-KILL.
 
-**Two distinct windows (v3, per AGY r2):**
+**Three distinct windows (v4):**
 1. **Restart / crash-promote** (xpfd (re)starts → runs `initial_neighbor_dump`):
    candidate mechanism H-0 (seq=0 multicast drop during the dump); fix 5.A.2.
 2. **Clean VRRP failover** (xpfd stays up → NO dump): H-0 cannot apply; if a ~1s
    exists here the mechanism is H-D (ENOBUFS desync / standby map aging); fix
-   5.E. The production-relevant failover is BOTH — `make test-failover` uses an
-   unclean reboot (crash-promote, window 1), while a manual `request chassis
-   cluster failover` is clean (window 2). Gate-R measures both.
+   5.E.
+3. **Config-reload / ISSU reconcile** (AGY r3, verified): `reconcile` →
+   `teardown::tear_down` → `stop_inner` sets `monitor_stop = None`
+   (`coordinator/mod.rs:199`) → `bring_up_workers` respawns the monitor
+   (`bringup.rs:330`) → a FRESH `initial_neighbor_dump`. So **every commit /
+   config-reload is another H-0 window** — and these are far more frequent than
+   daemon restart, so H-0/5.A.2 is production-relevant even if BOTH failover
+   modes turn out World 2. `make test-failover` uses an unclean reboot
+   (crash-promote = window 1); a manual `request chassis cluster failover` is
+   clean (window 2); any `commit` is window 3. Gate-R measures all three.
 
 ---
 
@@ -231,12 +238,15 @@ mechanism is one of:
   5.A.2. Crash-promote World 1 (fw1 reboots) → fix IS 5.A.2 (it's a startup
   window). Gate-R R2 must label which failover mode reproduces, so /engineer
   targets the right mechanism.
-- **No third window (verified):** the monitor thread is spawned exactly once,
-  gated on `monitor_stop.is_none()` (`bringup.rs:330`), and torn down only in
-  `stop_inner` (`coordinator/mod.rs:199`, full shutdown). A config-reload /
-  reconcile does NOT respawn it, so there is no additional `initial_neighbor_dump`
-  window from config churn or ISSU short of a full daemon restart. The
-  restart-spawn vs steady-state-loop split is complete.
+- **Window 3 — config-reload / ISSU reconcile (AGY r3, VERIFIED — corrects v3's
+  "no third window" error):** `reconcile` (`reconcile/mod.rs:98`) calls
+  `teardown::tear_down` (`teardown.rs:28`) → `stop_inner(false)` which does
+  `self.neighbors.monitor_stop.take()` (`coordinator/mod.rs:199`) setting it to
+  `None`, then `bring_up_workers` re-spawns the monitor because
+  `monitor_stop.is_none()` (`bringup.rs:330`) → a fresh `initial_neighbor_dump`
+  (`neighbor.rs:514`). So **every commit / config-reload re-opens the H-0
+  window**. This is the most frequent H-0 occurrence (commits >> restarts), and
+  it makes 5.A.2 production-relevant independent of the failover question.
 
 ### H-C: failover does NOT hit the ~1s (the KILL hypothesis)
 On RG-promote, `on_rg_promote_active` already fires a forced warm pass — but
@@ -395,6 +405,16 @@ on-link warming (5.C) unnecessary for the daemon-restart case.
   or fail the dump. The fix processes **only type-28/29 (NEW/DEL)** for seq=0;
   DONE/ERROR remain seq-matched. This is the precise patch shape — not "process
   all seq=0".
+- **MANDATORY ordering design (Codex r3 CRITICAL-2):** processing a live seq=0
+  RTM_DELNEIGH (unconditional remove, `neighbor.rs:359`) inline, interleaved
+  with older dump rows, can resurrect-then-delete or delete-then-stale depending
+  on arrival order. The /engineer implementation MUST either: (i) **stage**
+  seq=0 NEW/DEL into a side buffer during the dump and **replay it AFTER
+  NLMSG_DONE** (dump rows applied first, then live deltas — last-writer-wins is
+  then correct), OR (ii) adopt **5.A.3 dual-socket** where the multicast
+  socket's stream is naturally ordered and never mixed with the dump. "Process
+  seq=0 immediately inline" is NOT acceptable. This is the gating
+  implementation-correctness item.
 - **Cost:** ~5-15 LOC in the dump parser. No new threads, no promote-path
   change, driver-agnostic. Fixes daemon-restart + crash-promote (fw1 reboot)
   windows. Does NOT fix clean-failover (see H-D / 5.E).
@@ -476,12 +496,15 @@ steady-state monitor loop (`neighbor.rs:526-556`) treats every `recv() <= 0` as
 `continue` with no error inspection. A netlink multicast buffer overflow
 (ENOBUFS) silently and permanently desyncs `dynamic_neighbors` (the dump is
 startup-only, so there is no resync). Fix:
-- inspect the `recv()` errno; on **ENOBUFS**, re-issue an
-  `initial_neighbor_dump`-style resync (refactor the dump into a callable resync,
-  not startup-only),
+- inspect the `recv()` errno; on **ENOBUFS** (or persistent error), **RECREATE
+  the socket (AGY r3 #3):** close the corrupted fd, open+bind+subscribe a fresh
+  RTMGRP_NEIGH socket, and dump on the clean socket. Re-dumping on the SAME
+  congested socket re-introduces the H-0 seq-mix AND may keep hitting ENOBUFS
+  inside the dump loop → permanent desync. Socket-recreation, not reuse.
 - set a larger `SO_RCVBUF` on the monitor socket to reduce overflow probability,
-- add throwaway ENOBUFS counting to Gate-R R1 (AGY r2 (d)) to confirm whether the
-  standby actually overflows in practice.
+- the resync dump MUST use the 5.A.2-fixed/staged parser (5.E depends on 5.A.2),
+- add a **permanent** ENOBUFS counter/log (Codex r3 MEDIUM-1) so overflow-induced
+  desync is detectable in production, plus throwaway counting in Gate-R R1.
 This is off the promote critical path (the resync runs in the monitor thread,
 not on `on_rg_promote_active`). **Verify at Gate-R that ENOBUFS actually occurs
 before building this — it may be theoretical.**
@@ -544,14 +567,21 @@ must be run before any code.
 
 ## 8. Test plan (at /engineer, if a fix ships)
 
-- Unit: extend `queue_warm_pass` tests (`coordinator/tests.rs:1468+`) for the
-  on-link / connected-route enqueue path; add a test that
-  `on_rg_promote_active` warms prior-session on-link peers (5.C.2).
-- Unit: `initial_neighbor_dump` mid-dump multicast handling (5.A.2) — a test
-  that a NEW advert with non-matching seq during a dump is applied, not skipped.
+**(5.C.2 is REJECTED — no test for it; Codex r3 HIGH-3 removed the contradiction.)**
+- Unit (5.A.2): `initial_neighbor_dump` mid-dump multicast handling — a seq=0
+  type-28 NEW arriving during the dump is **staged then replayed after
+  NLMSG_DONE** and lands in `dynamic_neighbors`; a seq=0 NLMSG_DONE/NLMSG_ERROR
+  is NOT treated as dump-terminating (stays seq-matched); a staged seq=0 DEL
+  does not remove a dump REACHABLE row applied earlier in replay order
+  (last-writer-wins on the replay).
+- Unit (5.A.3, if chosen instead): dual-socket — multicast socket bound before
+  the dump captures the resolution advert; dump socket closed after NLMSG_DONE.
+- Unit (5.E, only if H-D.1 confirmed): ENOBUFS on the steady-state loop triggers
+  socket recreation + resync; the permanent ENOBUFS counter increments.
 - Cluster smoke (full matrix): v4+v6 × push+`-R` × CoS-off+CoS-on first-connect
-  after restart ≤200ms; after failover ≤200ms.
-- `make test-failover`: zero-drop, VRRP ~60ms unchanged.
+  after restart ≤200ms; after config-reload (commit) ≤200ms; after clean +
+  crash failover ≤200ms — zero RTO-signature on the cold target.
+- `make test-failover`: zero-drop, VRRP ~60ms unchanged (CLAUDE.md hard gate).
 
 ---
 
@@ -579,19 +609,28 @@ must be run before any code.
    entries vs multicast? Could processing them cause a stale DEL to remove a
    just-dumped entry? Must verify the NUD-state guard in `parse_neighbor_msg`
    makes this idempotent.
-5. **5.C.2 cardinality & cost:** warming all prior-session on-link peers at
-   promote — under a large session table, how many probes does that fire? Must
-   be bounded + rate-limited + per-RG gated; otherwise promote triggers a probe
-   storm that itself delays the warmer queue. Reuses `WARM_QUEUE_DEPTH` bound —
-   verify it's adequate.
-6. **mlx5/native-XDP specificity:** Gate-M ran on mlx5 VFs. Does the standalone
+5. **Window-3 frequency:** every `commit` re-opens the H-0 window (AGY r3). Does
+   a commit during active traffic actually drop the first cold flow's resolution
+   advert, or is the commit-time quiesce (`teardown` 500ms sleep) long enough
+   that no cold flow arrives during the new dump? Gate-R should reproduce a
+   commit-during-cold-connect, not just a restart.
+6. **Persistent-errno busy loop (AGY r3 #2):** the steady-state loop
+   (`neighbor.rs:528`) and dump loop (`neighbor.rs:407-414`) `continue` on
+   non-WouldBlock errors with no errno inspection — EBADF/EINVAL → 100% CPU
+   spin. Any 5.E touching this path MUST add a persistent-error break/recreate.
+7. **Silent CAP_NET_RAW failure (AGY r3 #4):** `trigger_kernel_arp_probe`
+   (`neighbor.rs:36-118`) opens SOCK_RAW; if CAP_NET_RAW is dropped (hardened
+   containers) the probe silently no-ops → cold resolution never fires. Not the
+   ~1.7s cause on the cluster (the daemon has the cap), but a latent ops hazard;
+   log on EACCES/EPERM + document the requirement. Out of scope for the fix but
+   noted.
+8. **mlx5/native-XDP specificity:** Gate-M ran on mlx5 VFs. Does the standalone
    i40e PF-passthrough env behave differently for the dump-window race? The fix
-   must not be mlx5-specific (the connected-route warm gap is driver-agnostic).
-7. **Is `connected_v4`/`connected_v6` even populated with the data needed to
-   warm on-link?** §2.3 says `queue_warm_pass` never reads it; verify it carries
-   the egress ifindex + subnet but NOT individual hosts (so 5.C.1 can warm the
-   gateway but not arbitrary hosts — confirming on-link host warm needs the
-   session-derived list of 5.C.2).
+   must not be mlx5-specific (the seq=0 drop is driver-agnostic).
+9. **5.A.2 staging memory bound:** the staging buffer for seq=0 deltas during a
+   dump must be bounded (a long dump under heavy neighbor churn could accumulate
+   many staged deltas). Cap it; on overflow, fall back to a post-dump full
+   re-dump rather than unbounded growth.
 
 ---
 
@@ -612,10 +651,14 @@ which fix (if any) ships. The two windows are now distinct (AGY r2):
 - **If R1 refutes H-0** (counter A = 0; resolution arrives after `NLMSG_DONE`):
   the restart 1.7s is a never-buffered single-SYN drop (Codex HIGH-1) →
   investigate the recycle / XDP-readiness path.
-- **If the cold target shows ZERO RTO-signature trials in all modes** (AGY r2
-  (b) zero-tolerance bar): failover + restart are not affected → PLAN-KILL the
-  failover scope; still ship 5.A.2 if R1 shows the restart-window drop (cheap,
-  correct deploy fix), or full PLAN-KILL if restart is also clean.
+- **Disposition is per-scope (Codex r3 MEDIUM-2):** the failover scope and the
+  restart/config-reload scope are decided independently. If the cold target
+  shows ZERO RTO-signature trials in BOTH failover modes → PLAN-KILL the
+  *failover* scope. Separately, if Window-1 (restart) OR Window-3 (config-reload)
+  shows the RTO signature → ship 5.A.2 for that scope (this is NOT "ship anyway
+  after a kill" — it is a distinct, independently-justified scope). Given AGY
+  r3's Window-3 finding (every commit re-opens H-0), 5.A.2 is very likely
+  justified on the config-reload scope alone, independent of failover.
 - **Rejected:** 5.B (liar-flag gate, `neighbor.rs:516/520`), 5.C.1/5.C.2
   (on-link warm misses the no-prior-session cold target; 5.C.2 redundant with
   prewarm), 5.A.1 (blocking pre-dump risks forwarding-arm/failback latency).
@@ -678,5 +721,29 @@ See `reviewer-ids.md` for task IDs. Per-round verdicts appended below.
     5.A.2 DONE/ERROR guard, the zero-tolerance kill bar, crash-promote coverage,
     and ENOBUFS instrumentation + the 5.E fix.
 
-- **r3:** v3 addresses AGY r2 + Codex r2. Awaiting r3 confirmation that the
-  two-window split + 5.E + guards are correct (no new blockers).
+- **r3:** v3.1 reviewed.
+  - **Codex r3** (`codex-plan-r3.md`): 2C/3H/2M. CRITICAL-1 independently
+    confirms the restart-vs-failover split (already in v3). CRITICAL-2 (NEW): 5.A.2
+    needs an explicit ordering/replay design, not "process seq=0 inline" — a live
+    DEL interleaved with dump rows can resurrect/remove by arrival order. HIGH-3
+    (NEW): §8 still had a rejected-5.C.2 test (internal contradiction). All
+    ACCEPTED (`codex-findings-r3.md`); folded into v4.
+  - **AGY r3** (`agy-plan-r3.md`): **PLAN-NEEDS-REVISION** with a verified
+    counter-example to v3's "no third window" claim: `reconcile` →
+    `teardown::tear_down` → `stop_inner` (`coordinator/mod.rs:199`, sets
+    monitor_stop None) → `bring_up_workers` respawns the monitor
+    (`bringup.rs:330`) → fresh `initial_neighbor_dump`. **Every config-reload is
+    a third H-0 window.** Plus: persistent-errno busy loop (#2), 5.E must recreate
+    the socket not reuse it (#3), silent CAP_NET_RAW (#4). Endorsed the
+    zero-tolerance kill bar (#5).
+  - **Claude SMR:** I had ALSO missed Window-3; AGY r3's trace is verified
+    correct. v3's "no third window" was my error (Codex r3 echoed it as
+    confirmation). Corrected in v4.
+  - **Outcome:** NOT converged at r3. v4 adds Window-3 (config-reload), the 5.A.2
+    staging-replay ordering design (Codex r3 C-2), socket-recreation for 5.E (AGY
+    r3 #3), removes the 5.C.2 test contradiction (Codex r3 H-3), and adds
+    busy-loop / CAP_NET_RAW / staging-bound hardening (AGY r3 #2/#4 + new OQ-9).
+
+- **r4:** v4 addresses every r3 finding. Awaiting r4 confirmation (Codex + AGY)
+  that Window-3 + the 5.A.2 ordering design + 5.E socket-recreation are correct
+  with no new blockers.
