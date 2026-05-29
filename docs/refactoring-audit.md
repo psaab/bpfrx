@@ -19,7 +19,9 @@ three language families:
 - **Rust** — `userspace-dp/src/`, `userspace-xdp/src/`
 - **BPF C programs** — `bpf/xdp/*.c`, `bpf/tc/*.c` (not headers;
   shared header size is an include-time artifact, not a per-program
-  refactor unit)
+  refactor unit). These roots were deleted in #1476 and are currently
+  absent; the script tolerates that (a no-op) and will pick them up
+  again if the directories ever return.
 
 Test files (`tests.rs`, `*_tests.rs`, `*_test.go`) and generated code
 (`*.pb.go`, `*_grpc.pb.go`, `*_bpfel.go`, `*_bpfeb.go`, `zz_generated_*`)
@@ -91,10 +93,13 @@ generated heatmap captures current state automatically.
 
 The 18-PR refactor stream that landed in early 2026 (closing #985,
 #988, #986, #1034, #1035, #957) drove most of the userspace-dp Rust
-production tree below the 2000 threshold; two Rust files (`afxdp/poll_descriptor.rs`, `protocol.rs`) remain `[REFACTOR]` candidates in the heatmap. The Go
-tree has multiple long-standing >2000 LOC files (`pkg/cluster/cluster.go`, `pkg/dataplane/dpdk/dpdk_cgo.go` (retired #1525, pending deletion in #1528), `pkg/api/handlers.go`, `pkg/dataplane/maps.go`, `pkg/routing/routing.go`, `pkg/dataplane/userspace/snapshot.go`) that have not yet
-received the same treatment. The BPF C program `bpf/xdp/xdp_zone.c` (2215 L)
-is also `[REFACTOR]` tier; splitting it requires tail-call decomposition, not
-ordinary function extraction.
+production tree below the 2000 threshold. Since then the tree has moved
+on: the legacy `bpf/xdp/*.c` and `bpf/tc/*.c` programs were deleted in
+#1476, and `pkg/dataplane/dpdk/dpdk_cgo.go` was deleted with the rest of
+the DPDK dataplane in #1525/#1528 — so the old narrative's per-file
+candidate lists are no longer current. **Do not read specific file names
+out of this section; it is historical.** The committed heatmap is the
+single source of truth for which files are `[REFACTOR]`/`[WATCH]` tier.
 
-See `docs/refactoring-audit-current.txt` for the current heatmap.
+See `docs/refactoring-audit-current.txt` for the current heatmap, and
+run `make audit-check` to confirm it is in sync with the tree.
