@@ -98,3 +98,22 @@ Plus plan §4.8/§5.2 doc fix (unknown-version metric is a gauge, not increment+
 | AGY        | adversarial-review-mprgn840-ti0gac  | running (re-confirm) |
 | Claude SMR | in-conversation                    | MERGE-READY (Describe completeness verified; fail-before/pass-after proven) |
 | Copilot    | re-review @ 0f0db4db3 requested; polling | findings 1+2 addressed |
+
+## Round 7 verdicts + round 8 (test robustness, HEAD e490e846d)
+Codex r7 (task-mprgn0r3-oida5z): MERGE-NEEDS-MINOR — production Describe() fix
+verified complete (17 declared == 17 emitted; broader 133==133 across all collector
+descs; regression real at 207e01c64). MINOR: the new test's v1 fixture under-exercised
+SumNS/AliasSeen. ADDRESSED at e490e846d: v1 fixture now emits all 4 v1 families +
+exact-17-count assertion; verified removing SumNS+AliasSeen from Describe fails the
+test (32 undeclared). Test-only change.
+AGY r7 (adversarial-review-mprgn840-ti0gac): MERGE-READY — 17/17 declared verified,
+test fail-before(472)/pass-after(0) efficacy confirmed, invariants intact, suites green.
+Claude SMR: MERGE-READY — Describe 17==17 exact match; strengthened test catches
+single-desc removal.
+
+| Reviewer   | Verdict @ HEAD e490e846d |
+|------------|--------------------------|
+| Codex      | MERGE-READY (r7 MINOR addressed; production fix verified complete) |
+| AGY        | MERGE-READY (r7, at Describe-fix HEAD; test-only delta since) |
+| Claude SMR | MERGE-READY |
+| Copilot    | findings 1+2 fixed; re-review @ e490e846d requested; polling (task bk8ev5c6m) |
