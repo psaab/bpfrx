@@ -10,3 +10,9 @@
 - AGY: TBD
 - Copilot: TBD
 - Claude SMR: inline
+
+## Code review round (PR #1674 @ 3085e4085)
+- Codex: task-mprflsx5-ji4376 (full-access retry; prior plan attempts infra-blocked)
+- AGY: adversarial-review-mprfm2fi-6wailn
+- Copilot: @copilot review posted (comment 4580001899) + reviewer requested
+- Claude SMR: inline
