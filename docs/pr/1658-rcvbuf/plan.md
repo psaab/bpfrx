@@ -1,5 +1,55 @@
 # #1658 — neigh_monitor netlink socket SO_RCVBUF bump
 
+Status: v2 — Codex PLAN-NEEDS-MAJOR (task-mpraz4ey-2t7j92) + AGY PLAN-READY
+(review-mprazbiq-ikscx2) + Claude SMR. v2 incorporates all Codex/AGY
+findings; ready for implementation.
+
+## Reviewer dispositions (v1 → v2)
+
+- **Codex #1 / AGY #1 — ENOBUFS premise correct.** Verified: netlink
+  multicast overflow calls `netlink_overrun()` → sets `sk->sk_err =
+  ENOBUFS`; next `recvmsg()` returns -1/ENOBUFS. The `recv()<=0 ->
+  continue` at `:528` silently swallows it. NOT a kill. Kept.
+- **Codex #2 — 4 MiB under-justified.** FIXED: explicit burst target
+  stated below (survive ~20k queued events ≈ a full large-L2-domain
+  neighbor flush while the thread is stalled up to the 500 ms
+  SO_RCVTIMEO tick). AGY #2 independently endorses 4 MiB and notes
+  1/128 KiB would *shrink* below the 208 KiB default.
+- **Codex #3 vs AGY #3 — FORCE-first vs RCVBUF-first (reviewers
+  disagree).** RESOLVED toward FORCE-first: AGY verified the helper
+  holds CAP_NET_ADMIN (root, needs it for AF_XDP/BPF), so FORCE has no
+  added dependency cost in production, and it makes the 4 MiB guarantee
+  self-contained rather than dependent on the cross-process `rmem_max`
+  bump (which Go swallows on failure). Codex's substantive concern was
+  observability ("noisy failure for little benefit" + #4 "setsockopt
+  return is insufficient"); both are addressed by the runtime
+  getsockopt readback + effective-size log added in v2. FORCE failure
+  is logged once at start, not noisy. Keep FORCE primary, RCVBUF
+  fallback.
+- **Codex #4 — checking setsockopt return is insufficient (clamp is
+  silent).** FIXED: v2 adds a `getsockopt(SO_RCVBUF)` readback after
+  the set and logs the effective size + which option succeeded, so an
+  operator can see whether the preventive buffer is actually active.
+- **Codex #5 / AGY #4 — readback test flaky under non-root /
+  rmem_max.** FIXED + verified on this host: cargo-test here runs as
+  **uid 1000 (non-root)** and `rmem_max == 4194304` (exactly 4 MiB).
+  Requesting 4 MiB non-root would clamp to exactly `rmem_max` (kernel
+  doubles *then* clamps), so a `>= 2*requested` assert would FAIL. v2
+  test requests a small 256 KiB (well below any realistic `rmem_max`),
+  reads `/proc/sys/net/core/rmem_max`, and asserts
+  `readback >= min(2*256KiB, rmem_max)` with a graceful fallback if
+  `rmem_max` is unreadable. AGY corrected my v1 formula: non-root clamp
+  is `min(2*req, rmem_max)`, NOT `2*rmem_max`.
+- **Codex #6 / AGY #5 — logged-continue not fatal.** Kept; both agree.
+- **Codex #7 / AGY #7 — same single fd, set before dump.** AGY verified
+  exactly one fd in `neigh_monitor_thread` (`:471`), placement after
+  `bind()` (`:492`) and before `initial_neighbor_dump` (`:514`). Kept.
+- **AGY codegen nit — promote const to a stack local before taking
+  `&`.** Applied: bind `let rcvbuf_val: libc::c_int = ...;` and pass
+  `&rcvbuf_val`.
+
+---
+
 Status: DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR)
 
 ## Issue framing
@@ -33,17 +83,24 @@ acceptable verdict.
 
 ## Buffer size + setsockopt choice
 
-### Size: 4 MiB requested
+### Size: 4 MiB requested — explicit burst target
 
-Each neighbor event netlink message is small (~80-200 B with the
-`ndmsg` header + `NDA_DST`/`NDA_LLADDR`/`NDA_CACHEINFO` attributes). A
-4 MiB receive buffer holds on the order of 20k-50k queued events, which
-comfortably absorbs a full neighbor-table churn burst (a cluster RETH
-failover re-resolves at most a few hundred neighbors; a large L2 domain
-flush is thousands). 4 MiB is the same order as typical netlink-monitor
-tooling (`ip monitor` uses ~1 MiB; routing daemons use 1-8 MiB). We pick
-4 MiB as a conservative headroom choice with negligible memory cost
-(one socket, charged once).
+**Burst target: survive ~20,000 queued neighbor notifications while the
+monitor thread is stalled up to one 500 ms `SO_RCVTIMEO` tick** (the
+worst-case latency between `recv()` calls, since the loop blocks up to
+500 ms per iteration). That covers a full large-L2-domain neighbor-table
+flush (a cluster RETH failover re-resolves a few hundred neighbors; a
+domain-wide flush is low thousands), with headroom.
+
+Sizing note (Codex #2): receive-buffer accounting charges skb
+`truesize`, not just the nlmsg payload, so the per-event cost is larger
+than the 80-200 B wire size. Using a conservative ~200 B *effective*
+charge per small event, 4 MiB ≈ 20k events of headroom; with realistic
+truesize inflation it is still many thousands — comfortably above the
+burst target. 4 MiB is the same order as `ip monitor` / routing-daemon
+netlink buffers (1-8 MiB). `SO_RCVBUF` is an upper bound on dynamically
+allocated `sk_buff` memory, so idle cost is ~0; only a real burst
+materializes the memory, capped at the doubled value (≤ 8 MiB).
 
 ### setsockopt: SO_RCVBUFFORCE primary, SO_RCVBUF fallback
 
@@ -99,51 +156,78 @@ existing `SO_RCVTIMEO` block (creation-time, on the SAME `fd` the
 steady-state loop uses — there is only one fd in this function;
 `initial_neighbor_dump(fd, ...)` and the loop both use it):
 
+Logic is extracted into a free helper so the readback can be unit-tested
+on an independent socket (see test plan). The helper sets FORCE first,
+falls back to plain `SO_RCVBUF`, then does a `getsockopt` readback and
+logs the *effective* buffer (addresses Codex #4 — a plain `SO_RCVBUF`
+can return success while silently clamping, so the setsockopt return is
+not enough; the readback is the ground truth).
+
 ```rust
-// Enlarge the receive buffer so a burst of RTM_NEWNEIGH/DELNEIGH
-// multicast notifications (HA failover, large neighbor churn) does not
-// overflow the default rcvbuf and drop adverts (which would silently
-// desync dynamic_neighbors — the full dump is startup-only). #1658.
-//
-// SO_RCVBUFFORCE bypasses net.core.rmem_max and requires CAP_NET_ADMIN,
-// which xpfd/the helper hold (run as root). Fall back to plain
-// SO_RCVBUF (clamped to rmem_max) if FORCE is unavailable.
-const NEIGH_RCVBUF_BYTES: libc::c_int = 4 * 1024 * 1024; // 4 MiB
-let forced = unsafe {
-    libc::setsockopt(
-        fd,
-        libc::SOL_SOCKET,
-        libc::SO_RCVBUFFORCE,
-        &NEIGH_RCVBUF_BYTES as *const libc::c_int as *const libc::c_void,
-        core::mem::size_of::<libc::c_int>() as libc::socklen_t,
-    )
-};
-if forced < 0 {
-    eprintln!(
-        "neigh_monitor: SO_RCVBUFFORCE({NEIGH_RCVBUF_BYTES}) failed, \
-         falling back to SO_RCVBUF"
-    );
-    let set = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &NEIGH_RCVBUF_BYTES as *const libc::c_int as *const libc::c_void,
-            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
+const NEIGH_RCVBUF_BYTES: libc::c_int = 4 * 1024 * 1024; // 4 MiB, #1658
+
+const _: () = assert!(NEIGH_RCVBUF_BYTES >= (1 << 20)); // ≥1 MiB floor
+
+/// Enlarge the netlink monitor receive buffer so an RTM_NEWNEIGH/
+/// DELNEIGH multicast burst does not overflow the default rcvbuf and
+/// silently drop adverts (which would desync dynamic_neighbors — the
+/// full dump is startup-only). Best-effort: logs and continues on
+/// failure. Returns the effective rcvbuf bytes read back via getsockopt
+/// (the kernel doubles the request and may clamp to rmem_max).
+fn set_neigh_monitor_rcvbuf(fd: RawFd, request: libc::c_int) -> libc::c_int {
+    // Promote to a stack local so &-of-const is well-defined (AGY nit).
+    let want: libc::c_int = request;
+    // SO_RCVBUFFORCE bypasses net.core.rmem_max; needs CAP_NET_ADMIN,
+    // held because xpfd/the helper run as root for AF_XDP/BPF. Make the
+    // 4 MiB guarantee self-contained rather than depend on the Go-side
+    // tuneSocketBuffers() rmem_max bump (cross-process, swallowed on
+    // failure). Fall back to plain SO_RCVBUF (rmem_max-clamped).
+    let forced = unsafe {
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUFFORCE,
+            &want as *const _ as *const libc::c_void,
+            core::mem::size_of::<libc::c_int>() as libc::socklen_t)
     };
-    if set < 0 {
-        eprintln!(
-            "neigh_monitor: SO_RCVBUF({NEIGH_RCVBUF_BYTES}) also failed; \
-             using kernel default receive buffer"
-        );
+    let mut via = "SO_RCVBUFFORCE";
+    if forced < 0 {
+        let err = std::io::Error::last_os_error();
+        let set = unsafe {
+            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+                &want as *const _ as *const libc::c_void,
+                core::mem::size_of::<libc::c_int>() as libc::socklen_t)
+        };
+        via = "SO_RCVBUF";
+        if set < 0 {
+            eprintln!("neigh_monitor: SO_RCVBUFFORCE({want}) and \
+                SO_RCVBUF({want}) both failed (force: {err}, set: {}); \
+                using kernel default receive buffer",
+                std::io::Error::last_os_error());
+            via = "default";
+        }
     }
+    // Read back the effective size (Codex #4: setsockopt return alone
+    // hides the silent rmem_max clamp on the SO_RCVBUF fallback path).
+    let mut eff: libc::c_int = 0;
+    let mut len = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+            &mut eff as *mut _ as *mut libc::c_void, &mut len)
+    };
+    if rc == 0 {
+        eprintln!("neigh_monitor: rcvbuf set via {via}: requested \
+            {want}, effective {eff} bytes");
+    }
+    eff
 }
 ```
 
-(Final wording / ordering relative to the `SO_RCVTIMEO` block decided
-during implementation; placement is after `bind()` succeeds, before
-`initial_neighbor_dump`.)
+Call site in `neigh_monitor_thread`, after `bind()` succeeds and before
+the existing `SO_RCVTIMEO` block / `initial_neighbor_dump`:
+
+```rust
+set_neigh_monitor_rcvbuf(fd, NEIGH_RCVBUF_BYTES);
+```
+
+(`RawFd` import / exact log wording finalized during implementation.)
 
 ## Test plan
 
@@ -151,29 +235,38 @@ A pure socket-option change on a raw netlink fd is hard to fully
 unit-test, but the size constant and the setsockopt/getsockopt contract
 can be pinned:
 
-1. **Compile-time guard** on the constant — `const _: () =
-   assert!(NEIGH_RCVBUF_BYTES >= 1 << 20)` (≥ 1 MiB) so a future edit
-   can't silently shrink it below the burst-absorbing floor. (Module
-   const, so it must live at module scope or be re-derived in the test;
-   see below.)
-2. **getsockopt readback test** — create a `NETLINK_ROUTE` socket in the
-   test, apply the same `SO_RCVBUFFORCE`/`SO_RCVBUF` logic via a small
-   extracted helper `set_neigh_rcvbuf(fd) -> io::Result<()>` /
-   `-> bool`, then `getsockopt(SO_RCVBUF)` and assert the readback is
-   `>= NEIGH_RCVBUF_BYTES` (the kernel doubles, so readback is ~2× the
-   request; assert `>= requested`, not `== requested`). The test runs as
-   whatever user `cargo test` runs as — if not root, `SO_RCVBUFFORCE`
-   fails and we fall back to `SO_RCVBUF` clamped to the runner's
-   `rmem_max`; in that case assert `readback >= min(requested,
-   2*rmem_max)` OR simply that the helper returned without erroring and
-   readback > default. The test asserts the **return is checked**
-   (helper returns a status) and the buffer grew above the 208 KB
-   default when permitted. Mark `#[ignore]`-free but tolerant of the
-   non-root clamp.
+1. **Compile-time guard** on the constant —
+   `const _: () = assert!(NEIGH_RCVBUF_BYTES >= (1 << 20))` (≥ 1 MiB)
+   at module scope, so a future edit can't silently shrink it below the
+   burst-absorbing floor (runs on every `cargo build`, not just test).
+2. **getsockopt readback test (flake-proof, verified on this host).**
+   The test creates its own `NETLINK_ROUTE` `SOCK_RAW` socket and calls
+   `set_neigh_monitor_rcvbuf(fd, TEST_REQ)` with **`TEST_REQ =
+   256 * 1024`** — deliberately small, well below any realistic
+   `rmem_max`, so it does not depend on root. The helper returns the
+   `getsockopt` readback. Expected floor:
+   - kernel doubles the request, then (non-root) clamps to `rmem_max`:
+     `expected = min(2*TEST_REQ, rmem_max)` (AGY #4 — the clamp is
+     `rmem_max`, NOT `2*rmem_max`).
+   - read `/proc/sys/net/core/rmem_max`; if unreadable, fall back to
+     asserting `readback >= TEST_REQ` (still true in every case since
+     `TEST_REQ < rmem_max` on any sane host and the kernel never
+     returns *less* than the doubled-or-clamped value, both ≥ TEST_REQ
+     when TEST_REQ ≤ rmem_max).
+   Concretely: `assert!(readback >= min(2*TEST_REQ, rmem_max))`. On this
+   host (uid 1000 non-root, `rmem_max == 4194304`): `2*256K = 512K <
+   4 MiB` → no clamp → readback `== 512K` → passes. The test also
+   asserts the helper **returned a value** (return is checked, not
+   silently dropped like the surrounding `recv()`), satisfying the
+   "don't ignore the return" contract. No `#[ignore]`; tolerant of both
+   root and non-root.
+   - A second assertion proves the buffer actually grew above the
+     208 KB default: `assert!(readback > 212992 || rmem_max <= TEST_REQ)`
+     (the `||` guards the pathological tiny-rmem_max CI host).
 3. **5/5 flake** on the new test.
-4. `cargo build` clean, full `cargo test --release`.
-5. Go suite unaffected (no Go change) — run `go test ./...` for the
-   userspace package as a sanity check.
+4. `cargo build` clean (also exercises the `const _: ()` guard), full
+   `cargo test --release`.
+5. Go suite unaffected (no Go change) — `go test ./...` sanity check.
 6. Smoke (v4+v6 × push+reverse × CoS off/on) — **owned by the PARENT**
    per the cluster rule; this agent does not deploy.
 
