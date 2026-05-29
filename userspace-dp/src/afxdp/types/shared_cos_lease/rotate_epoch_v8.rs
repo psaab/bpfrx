@@ -250,31 +250,41 @@ impl SharedCoSQueueLease {
             * EPOCH_DURATION_NS as u128)
             / 1_000_000_000u128) as u64;
 
+        // Regime boundaries are compared on EXACT wall-clock nanoseconds,
+        // NOT a floored epoch count: a floored `lag = raw / EPOCH` would
+        // admit a regime-1 lag of up to `(K+1)×EPOCH − 1ns` (floors to K),
+        // so the regime-1 base grant could reach almost `(K+1)×rate×EPOCH`
+        // and, with a full carry drain, breach the `(2K−1)×rate×EPOCH`
+        // per-rotation bound by one epoch; and a raw lag of
+        // `STALL×EPOCH + 1ns` (floors to STALL) would skip the regime-3
+        // cold-resume and bank instead of dropping stale carry across an
+        // HA gap. Comparing raw nanoseconds against the exact `K×EPOCH`
+        // and `STALL×EPOCH` thresholds closes both boundary holes.
         let raw_elapsed_ns = now_ns.saturating_sub(start);
-        let lag_epochs = if start == 0 {
-            0
-        } else {
-            raw_elapsed_ns / EPOCH_DURATION_NS
-        };
+        let k_window_ns = EPOCH_DURATION_NS * MAX_ROTATION_LAG_EPOCHS;
+        let stall_window_ns = EPOCH_DURATION_NS * STALL_THRESHOLD_EPOCHS;
 
-        let (elapsed_ns, carry_draw) = if start == 0 || lag_epochs > STALL_THRESHOLD_EPOCHS {
+        let (elapsed_ns, carry_draw) = if start == 0 || raw_elapsed_ns > stall_window_ns {
             // REGIME 3 — cold-resume. One epoch, drop any stale carry.
             if start != 0 {
                 v8.epoch.epoch_carry_bytes.store(0, Ordering::Release);
             }
             (EPOCH_DURATION_NS, 0u64)
-        } else if lag_epochs > MAX_ROTATION_LAG_EPOCHS {
-            // REGIME 2 — bank residual beyond the K-epoch ceiling.
-            let k_window_ns = EPOCH_DURATION_NS * MAX_ROTATION_LAG_EPOCHS;
-            let overshoot_ns = raw_elapsed_ns.saturating_sub(k_window_ns) as u128;
+        } else if raw_elapsed_ns > k_window_ns {
+            // REGIME 2 — bank residual beyond the K-epoch ceiling. Grant
+            // exactly `K×EPOCH` now; bank `rate × (raw − K×EPOCH)`.
+            let overshoot_ns = (raw_elapsed_ns - k_window_ns) as u128;
             let new_owed = ((rate_bytes * overshoot_ns) / 1_000_000_000u128) as u64;
             let prev_carry = v8.epoch.epoch_carry_bytes.load(Ordering::Acquire);
             let carry = prev_carry.saturating_add(new_owed).min(carry_max);
             v8.epoch.epoch_carry_bytes.store(carry, Ordering::Release);
             (k_window_ns, 0u64)
         } else {
-            // REGIME 1 — normal recovery. Grant the raw lag (bounded by K
-            // here) and drain a bounded carry slice.
+            // REGIME 1 — normal recovery. `raw_elapsed_ns ≤ K×EPOCH` here
+            // (regime 2 caught anything above), so the base grant is
+            // bounded by `K×rate×EPOCH`; the carry drain adds at most
+            // `(K−1)×rate×EPOCH`, keeping the per-rotation grant ≤
+            // `(2K−1)×rate×EPOCH`.
             let prev_carry = v8.epoch.epoch_carry_bytes.load(Ordering::Acquire);
             let draw = prev_carry.min(carry_drain_max);
             v8.epoch

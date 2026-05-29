@@ -1183,16 +1183,91 @@ fn v8_carry_per_rotation_grant_never_exceeds_k_epoch_ceiling() {
         CARRY_MAX_EPOCHS * CAP_PER_EPOCH_100M,
         "reservoir clamps at CARRY_MAX_EPOCHS even for a near-STALL lag"
     );
-    // Single on-time visit drains the bounded slice.
-    let t2 = t1 + EPOCH_DURATION_NS;
+    // WORST-CASE regime-1 drain: a lag of EXACTLY K×EPOCH is the largest
+    // raw lag that still selects regime 1 (regime 2 is `raw > K×EPOCH`), so
+    // base = K epochs AND the full reservoir drain adds (K−1) epochs — the
+    // tight `(2K−1)×rate×EPOCH` per-rotation maximum.
+    let t2 = t1 + MAX_ROTATION_LAG_EPOCHS * EPOCH_DURATION_NS;
     let _ = lease.acquire_v8(0, t2, u64::MAX);
     let ceiling = (MAX_ROTATION_LAG_EPOCHS + CARRY_DRAIN_MAX_EPOCHS) * CAP_PER_EPOCH_100M;
+    assert_eq!(
+        published_cap(&lease),
+        ceiling,
+        "worst-case regime-1 grant equals exactly the (2K−1)-epoch ceiling"
+    );
     assert!(
         published_cap(&lease) <= ceiling,
-        "single-rotation grant {} must not exceed (K + drain) ceiling {}",
+        "single-rotation grant {} must not exceed (2K−1) ceiling {}",
         published_cap(&lease),
         ceiling
     );
+}
+
+#[test]
+fn v8_carry_regime_boundaries_use_exact_nanoseconds_not_floored_epochs() {
+    // Codex r1 Major/Medium: regime selection must compare EXACT wall-clock
+    // nanoseconds, not a floored epoch count. A floored `lag = raw/EPOCH`
+    // would (a) admit a regime-1 lag up to `(K+1)×EPOCH − 1ns` (breaching
+    // the per-rotation burst bound by one epoch), and (b) skip regime-3
+    // cold-resume for a raw lag of `STALL×EPOCH + 1ns` (floors to STALL),
+    // banking instead of dropping stale carry across an HA gap.
+    //
+    // (a) K-window upper edge: raw lag = (K+1)×EPOCH − 1ns must be REGIME 2
+    // (grants exactly the K-epoch ceiling), NOT regime 1 with a near-(K+1)
+    // base grant.
+    {
+        let lease = carry_test_lease();
+        let t0 = EPOCH_DURATION_NS;
+        let _ = lease.acquire_v8(0, t0, u64::MAX);
+        let raw = (MAX_ROTATION_LAG_EPOCHS + 1) * EPOCH_DURATION_NS - 1;
+        let _ = lease.acquire_v8(0, t0 + raw, u64::MAX);
+        assert_eq!(
+            published_cap(&lease),
+            MAX_ROTATION_LAG_EPOCHS * CAP_PER_EPOCH_100M,
+            "raw lag just under (K+1) epochs is regime 2 (K-epoch ceiling), not a near-(K+1) regime-1 grant"
+        );
+    }
+    // (b) STALL upper edge: raw lag = STALL×EPOCH + 1ns must be REGIME 3
+    // (cold-resume, drop carry), NOT regime 2 (bank).
+    {
+        let lease = carry_test_lease();
+        let t0 = EPOCH_DURATION_NS;
+        let _ = lease.acquire_v8(0, t0, u64::MAX);
+        // First bank a residual so there is carry to (not) preserve.
+        let t1 = t0 + (MAX_ROTATION_LAG_EPOCHS + 3) * EPOCH_DURATION_NS;
+        let _ = lease.acquire_v8(0, t1, u64::MAX);
+        assert!(published_carry(&lease) > 0, "carry banked");
+        let raw = STALL_THRESHOLD_EPOCHS * EPOCH_DURATION_NS + 1;
+        let _ = lease.acquire_v8(0, t1 + raw, u64::MAX);
+        assert_eq!(
+            published_cap(&lease),
+            CAP_PER_EPOCH_100M,
+            "raw lag just over STALL is regime-3 cold-resume (one epoch)"
+        );
+        assert_eq!(
+            published_carry(&lease),
+            0,
+            "regime-3 at the exact STALL+1ns boundary drops stale carry"
+        );
+    }
+    // Lower edge of regime 3 / upper edge of regime 2: raw lag = exactly
+    // STALL×EPOCH must still be REGIME 2 (banks), proving the `>` is strict.
+    {
+        let lease = carry_test_lease();
+        let t0 = EPOCH_DURATION_NS;
+        let _ = lease.acquire_v8(0, t0, u64::MAX);
+        let raw = STALL_THRESHOLD_EPOCHS * EPOCH_DURATION_NS;
+        let _ = lease.acquire_v8(0, t0 + raw, u64::MAX);
+        assert_eq!(
+            published_cap(&lease),
+            MAX_ROTATION_LAG_EPOCHS * CAP_PER_EPOCH_100M,
+            "raw lag of exactly STALL epochs is still regime 2 (banks), not regime 3"
+        );
+        assert!(
+            published_carry(&lease) > 0,
+            "exactly-STALL lag banks the residual (not a cold-resume drop)"
+        );
+    }
 }
 
 #[test]

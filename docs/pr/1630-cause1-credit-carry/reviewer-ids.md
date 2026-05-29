@@ -1,7 +1,8 @@
 # #1630 cause-1 credit carry — reviewer task IDs
 
 Branch: `fix/1630-cause1-credit-carry` (off origin/master)
-PR: (filled after `gh pr create`)
+PR: #1650
+Head SHA: 3662ecbde
 
 4-way code review seats:
 - **Claude SMR**: `docs/pr/1630-cause1-credit-carry/claude-smr-code-r1.md`
